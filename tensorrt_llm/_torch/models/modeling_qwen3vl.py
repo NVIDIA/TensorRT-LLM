@@ -677,13 +677,6 @@ class Qwen3VisionModel(torch.nn.Module):
 
         head_dim = self.config.hidden_size // self.config.num_heads
         self.rotary_pos_emb = HFQwen3VLVisionRotaryEmbedding(head_dim // 2)
-        # self.config.num_attention_heads = self.config.num_heads
-        # self.config.head_dim = self.config.hidden_size // self.config.num_heads // 2
-        # self.config.max_position_embeddings = 8192
-        # rope_params = RopeParams.from_config(self.config)
-        # self.rotary_pos_emb = RotaryEmbedding(rope_params,
-        #     head_dim=self.config.hidden_size // self.config.num_attention_heads,
-        #     is_neox=True)
 
         self.blocks = nn.ModuleList(
             [
@@ -751,55 +744,6 @@ class Qwen3VisionModel(torch.nn.Module):
         embeddings = freq_table[pos_ids]  # lookup rotary embeddings
         embeddings = embeddings.flatten(1)
         return embeddings
-
-    # @property
-    # def device(self) -> torch.device:
-    #     return self.patch_embed.proj.weight.device
-
-    # @staticmethod
-    # @lru_cache(maxsize=1024)
-    # def rot_pos_ids(h: int, w: int, spatial_merge_size: int) -> torch.Tensor:
-    #     hpos_ids = np.broadcast_to(np.arange(h).reshape(h, 1), (h, w))
-    #     h_div = h // spatial_merge_size
-    #     w_div = w // spatial_merge_size
-    #     hpos_ids = hpos_ids.reshape(
-    #         h_div,
-    #         spatial_merge_size,
-    #         w_div,
-    #         spatial_merge_size,
-    #     )
-    #     hpos_ids = hpos_ids.transpose(0, 2, 1, 3)
-    #     hpos_ids = hpos_ids.flatten()
-
-    #     wpos_ids = np.broadcast_to(np.arange(w).reshape(1, w), (h, w))
-    #     wpos_ids = wpos_ids.reshape(
-    #         h_div,
-    #         spatial_merge_size,
-    #         w_div,
-    #         spatial_merge_size,
-    #     )
-    #     wpos_ids = wpos_ids.transpose(0, 2, 1, 3)
-    #     wpos_ids = wpos_ids.flatten()
-
-    #     return torch.from_numpy(np.stack([hpos_ids, wpos_ids], axis=-1))
-
-    # def rot_pos_emb(self, grid_thw: torch.Tensor):
-    #     max_grid_size = max(max(h, w) for _, h, w in grid_thw)
-    #     pos_ids = [
-    #         self.rot_pos_ids(h, w, self.spatial_merge_size)
-    #         if t == 1
-    #         else self.rot_pos_ids(h, w, self.spatial_merge_size).repeat(t, 1)
-    #         for t, h, w in grid_thw
-    #     ]
-    #     pos_ids = torch.cat(pos_ids, dim=0).to(self.device, non_blocking=True)
-
-    #     # Use pre-computed cos_sin_cache from RotaryEmbedding
-    #     cos, sin = self.rotary_pos_emb.rotary_cos_sin[:max_grid_size].chunk(2, dim=-1)
-
-    #     cos_combined = cos[pos_ids].flatten(1)
-    #     sin_combined = sin[pos_ids].flatten(1)
-    #     # print(f"[TRT-LLM DEBUG] cos_combined: {cos_combined.shape}, sin_combined: {sin_combined.shape}")
-    #     return (cos_combined, sin_combined)
 
     # Adopted from https://github.com/vllm-project/vllm/blob/21eb2c3372fb6447ef36bee44ff7af79a330ffec/vllm/model_executor/models/qwen3_vl.py#L470)
     def fast_pos_embed_interpolate(self, grid_thw: list[list[int]]) -> torch.Tensor:
