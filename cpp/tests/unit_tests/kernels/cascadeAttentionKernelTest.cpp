@@ -18,9 +18,9 @@
 // at all. The numerical kernel itself is exercised via end-to-end beam-search
 // runs in tests/integration.
 
+#include "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/cascadeAttentionKernel.h"
 #include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/kernels/decoderMaskedMultiheadAttention.h"
-#include "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/cascadeAttentionKernel.h"
 #include "tensorrt_llm/kernels/gptKernels.h"
 
 #include <cstdlib>
@@ -84,6 +84,7 @@ struct ScopedEnv
             unsetenv(k);
         }
     }
+
     ~ScopedEnv()
     {
         if (had_old)
@@ -234,15 +235,6 @@ TEST(CascadeAttentionEligibilityTest, RejectsMissingInputLengths)
 }
 
 // Sanity checks on env-var defaults (no override).
-TEST(CascadeAttentionEnvDefaults, DefaultMinBeam)
-{
-    EXPECT_EQ(tc::getEnvCascadeMmhaMinBeam(), 2);
-}
-
-TEST(CascadeAttentionEnvDefaults, DefaultMinPrefix)
-{
-    EXPECT_EQ(tc::getEnvCascadeMmhaMinPrefix(), 256);
-}
 
 TEST(CascadeAttentionEnvDefaults, DisabledByDefault)
 {

@@ -280,8 +280,6 @@ bool getEnvEnableCascadeMmha()
     return enable;
 }
 
-
-
 bool getEnvEnableTrtllmgenMoeRoutingRenormPDL()
 {
     static std::once_flag flag;
