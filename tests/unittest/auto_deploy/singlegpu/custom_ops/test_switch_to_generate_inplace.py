@@ -342,9 +342,9 @@ class TestSwitchToGenerateHostArgHandling:
             cu_seqlen=[0, 1, 2],
             input_pos=[5, 10],
             batch_info=[0, 0, 0, 0, 2, 2],
-            cache_loc=[10, 11, 20, 21, 22],
-            cu_num_pages=[0, 2, 5],
-            extra_page_per_seq=[-1, -1],
+            cache_loc_per_pool=[[10, 11, 20, 21, 22]],
+            cu_num_pages_per_pool=[[0, 2, 5]],
+            extra_page_per_seq_per_pool=[[-1, -1]],
         )
 
         assert not _has_active_host_arg(si)
