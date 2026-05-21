@@ -281,7 +281,7 @@ class _KVCache:
         input_tokens: Sequence[TokenIdExt] | None,
         id: Any,
         custom_priority_callback: Callable[[int, Any], Priority],
-        cache_salt_id: int | None,
+        cache_salt_id: int | None = None,
     ) -> None: ...
     def set_base_page_index_buf(
         self, beam_idx: BeamIndex, layer_group_id: LayerGroupId, buf: memoryview | None
