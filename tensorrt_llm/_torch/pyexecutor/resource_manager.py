@@ -3354,6 +3354,22 @@ class KVCacheManagerV2(BaseResourceManager):
 
         return requests
 
+    def release_index_slot(self, request_id: int) -> None:
+        """Release IndexMapper slot early while keeping KV cache blocks allocated.
+
+        After prefill completes on a context-only worker, the IndexMapper slot
+        (used for host_kv_cache_block_offsets during model forward) is no longer
+        needed.  Releasing it early allows new requests to be scheduled while
+        the KV cache blocks are still being transferred via NIXL/UCX.
+        """
+        kv_cache = self.kv_cache_map.get(request_id)
+        if kv_cache is not None:
+            for i in range(self.max_beam_width):
+                for pool_idx in range(self.num_pools):
+                    kv_cache.set_base_page_index_buf(i, pool_idx, None)
+        self.index_mapper.remove_sequence(request_id)
+        self._early_freed_index_requests.add(request_id)
+
     def try_commit_blocks_for_reuse(self, request: LlmRequest,
                                     kv_cache) -> None:
         if (self.enable_block_reuse and not self.is_draft
@@ -3367,17 +3383,6 @@ class KVCacheManagerV2(BaseResourceManager):
                 end=request.context_current_position)
             kv_cache.commit(tokens)
             kv_cache.stop_committing()
-
-    def release_index_slot(self, request_id: int) -> None:
-        """Release IndexMapper slot early while keeping KV cache blocks allocated.
-
-        After prefill completes on a context-only worker, the IndexMapper slot
-        (used for host_kv_cache_block_offsets during model forward) is no longer
-        needed.  Releasing it early allows new requests to be scheduled while
-        the KV cache blocks are still being transferred via NIXL/UCX.
-        """
-        self.index_mapper.remove_sequence(request_id)
-        self._early_freed_index_requests.add(request_id)
 
     def free_resources(self, request: LlmRequest, pin_on_release: bool = False):
         self._allocated_draft_lens.pop(request.py_request_id, None)
