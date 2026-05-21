@@ -1581,6 +1581,8 @@ class KimiK25ForConditionalGeneration(PreTrainedModel):
         model_config.pretrained_config = self.llm.config
         model_config._frozen = True
 
+    # Forward spec-dec / weight-loading attrs to self.llm: this wrapper is not
+    # itself a spec-dec model but is the outer model that those paths see.
     @property
     def draft_config(self):
         return self.llm.draft_config
@@ -1590,8 +1592,15 @@ class KimiK25ForConditionalGeneration(PreTrainedModel):
         return self.llm.draft_model
 
     @property
-    def load_draft_weights(self):
-        return self.llm.load_draft_weights
+    def model(self):
+        return self.llm.model
+
+    @property
+    def lm_head(self):
+        return self.llm.lm_head
+
+    def load_draft_weights(self, *args, **kwargs):
+        return self.llm.load_draft_weights(*args, **kwargs)
 
     @property
     def multimodal_data_device_paths(self) -> List[str]:
@@ -1650,6 +1659,12 @@ class KimiK25ForConditionalGeneration(PreTrainedModel):
         if len(multimodal_params) > 0:
             if DISAGG:
                 raise NotImplementedError("Disaggregated inference not yet supported for K2.5.")
+            # fuse_input_embeds doesn't accept the mm_*_indices kwargs.
+            fuse_kwargs = {
+                k: v
+                for k, v in kwargs.items()
+                if k not in ("mm_token_indices", "text_token_indices")
+            }
             mm_ctx_params = multimodal_params[: attn_metadata.num_contexts]
             mm_embeds = get_multimodal_embeddings(
                 encoder_forward_fn=self.mm_encoder.forward,
@@ -1671,12 +1686,6 @@ class KimiK25ForConditionalGeneration(PreTrainedModel):
                         dtype=input_ids.dtype,
                         device=input_ids.device,
                     )
-                    # fuse_input_embeds doesn't accept the mm_*_indices kwargs.
-                    fuse_kwargs = {
-                        k: v
-                        for k, v in kwargs.items()
-                        if k not in ("mm_token_indices", "text_token_indices")
-                    }
 
         input_ids, inputs_embeds = fuse_input_embeds(
             self.llm.model.embed_tokens,
