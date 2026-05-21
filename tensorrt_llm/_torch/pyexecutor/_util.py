@@ -1672,6 +1672,8 @@ def create_py_executor_instance(
         dist=dist,
         max_num_sequences=max_num_sequences,
         disable_overlap_scheduler=llm_args.disable_overlap_scheduler,
+        enable_early_first_token_response=llm_args.
+        enable_early_first_token_response,
         max_batch_size=max_batch_size,
         max_beam_width=max_beam_width,
         max_draft_len=spec_config.max_draft_len
@@ -1703,6 +1705,7 @@ def create_torch_sampler_args(
     disable_overlap_scheduler: bool,
     disable_flashinfer_sampling: bool,
     enable_async_worker: bool,
+    enable_speculative_beam_history_d2h: bool,
 ):
     max_num_sequences = max_batch_size * mapping.pp_size
     max_draft_len = (0 if speculative_config is None else
@@ -1718,7 +1721,9 @@ def create_torch_sampler_args(
         max_beam_width=max_beam_width,
         disable_flashinfer_sampling=disable_flashinfer_sampling,
         disable_overlap_scheduler=disable_overlap_scheduler,
-        enable_async_worker=enable_async_worker)
+        enable_async_worker=enable_async_worker,
+        enable_speculative_beam_history_d2h=enable_speculative_beam_history_d2h,
+    )
 
 
 def instantiate_sampler(
@@ -1747,6 +1752,8 @@ def instantiate_sampler(
         disable_overlap_scheduler=llm_args.disable_overlap_scheduler,
         disable_flashinfer_sampling=disable_flashinfer_sampling,
         enable_async_worker=enable_async_worker,
+        enable_speculative_beam_history_d2h=llm_args.
+        enable_speculative_beam_history_d2h,
     )
     decoding_mode = get_decoding_mode(decoding_config=decoding_config,
                                       max_beam_width=max_beam_width)

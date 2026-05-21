@@ -282,39 +282,105 @@ def get_hf_config(ckpt_path):
         return AutoConfig.from_pretrained(ckpt_path, trust_remote_code=True)
 
 
-class _FusedExpertLinearView(nn.Module):
-    # Linear-like module whose weight is a view into a shared 3D MoE tensor.
-    # Used by _unfuse_mixtral_for_modelopt to present the per-expert structure
-    # that modelopt's exporter iterates, without copying weights.
-    def __init__(self, weight_view: torch.Tensor):
+class _MixtralBlockSparseTop2MLPCompat(nn.Module):
+    # Per-expert 4.x-style MLP using zero-copy parameter views into the
+    # transformers-5.x fused MoE tensors. Uses real nn.Linear modules so
+    # modelopt's quantizer wrapping (which keys off type name "Linear")
+    # produces per-expert weight scaling factors during calibration.
+    def __init__(self, hidden_dim, intermediate_dim, w1_view, w2_view, w3_view,
+                 act_fn):
         super().__init__()
-        self.weight = nn.Parameter(weight_view, requires_grad=False)
-        self.bias = None
+        self.w1 = nn.Linear(hidden_dim, intermediate_dim, bias=False)
+        self.w2 = nn.Linear(intermediate_dim, hidden_dim, bias=False)
+        self.w3 = nn.Linear(hidden_dim, intermediate_dim, bias=False)
+        self.w1.weight = nn.Parameter(w1_view, requires_grad=False)
+        self.w2.weight = nn.Parameter(w2_view, requires_grad=False)
+        self.w3.weight = nn.Parameter(w3_view, requires_grad=False)
+        self.act_fn = act_fn
 
-    def forward(self, x):
-        return torch.nn.functional.linear(x, self.weight, self.bias)
-
-
-class _MixtralExpertShim(nn.Module):
-    pass
-
-
-class _MixtralSparseMoeBlockShim(nn.Module):
-    # Name kept as "MixtralSparseMoeBlock" via __init__ override so that
-    # modelopt's `"mixtral" in type(experts).__name__.lower()` checks match.
-    pass
+    def forward(self, hidden_states):
+        return self.w2(
+            self.act_fn(self.w1(hidden_states)) * self.w3(hidden_states))
 
 
-_MixtralSparseMoeBlockShim.__name__ = "MixtralSparseMoeBlock"
+class _MixtralSparseMoeBlockCompat(nn.Module):
+    # Drop-in replacement for transformers-5.x MixtralSparseMoeBlock that
+    # restores the pre-5.x ModuleList(MixtralBlockSparseTop2MLP) layout that
+    # nvidia-modelopt 0.37 iterates (len(experts), experts[i].{w1,w2,w3}.weight),
+    # while sharing weight storage with the 5.x fused tensors via parameter
+    # views (zero-copy). The class name contains "MixtralSparseMoeBlock" so
+    # modelopt's is_moe substring check still matches.
+    def __init__(self, mlp):
+        super().__init__()
+        experts = mlp.experts  # MixtralExperts
+        self.top_k = mlp.top_k
+        self.jitter_noise = mlp.jitter_noise
+        self.num_experts = experts.num_experts
+        self.hidden_dim = experts.hidden_dim
+        self.intermediate_dim = experts.intermediate_dim
+        self.gate = mlp.gate  # MixtralTopKRouter, returns (logits, scores, indices)
+
+        gate_up = experts.gate_up_proj  # [N, 2*I, H]
+        down = experts.down_proj  # [N, H, I]
+        act_fn = experts.act_fn
+
+        new_experts = nn.ModuleList()
+        for i in range(self.num_experts):
+            new_experts.append(
+                _MixtralBlockSparseTop2MLPCompat(
+                    self.hidden_dim,
+                    self.intermediate_dim,
+                    gate_up[i, :self.intermediate_dim, :],  # w1: gate
+                    down[i],  # w2: down
+                    gate_up[i, self.intermediate_dim:, :],  # w3: up
+                    act_fn,
+                ))
+        self.experts = new_experts
+
+    def forward(self, hidden_states):
+        batch_size, sequence_length, hidden_dim = hidden_states.shape
+        if self.training and self.jitter_noise > 0:
+            hidden_states = hidden_states * torch.empty_like(
+                hidden_states).uniform_(1.0 - self.jitter_noise,
+                                        1.0 + self.jitter_noise)
+        hidden_states_flat = hidden_states.view(-1, hidden_dim)
+        _, top_k_weights, top_k_index = self.gate(hidden_states_flat)
+
+        final_hidden_states = torch.zeros_like(hidden_states_flat)
+        expert_mask = torch.nn.functional.one_hot(
+            top_k_index, num_classes=self.num_experts).permute(2, 1, 0)
+        expert_hit = (expert_mask.sum(dim=(-1, -2)) > 0).nonzero()
+
+        for expert_idx in expert_hit:
+            expert_idx = expert_idx[0]
+            if expert_idx == self.num_experts:
+                continue
+            top_k_pos, token_idx = torch.where(expert_mask[expert_idx])
+            current_state = hidden_states_flat[token_idx]
+            current_hidden_states = self.experts[expert_idx](current_state)
+            current_hidden_states = current_hidden_states * top_k_weights[
+                token_idx, top_k_pos, None]
+            final_hidden_states.index_add_(
+                0, token_idx,
+                current_hidden_states.to(final_hidden_states.dtype))
+
+        return final_hidden_states.reshape(batch_size, sequence_length,
+                                           hidden_dim)
 
 
 def _unfuse_mixtral_for_modelopt(model: nn.Module) -> None:
     # transformers 5.x stores Mixtral experts as a single MixtralExperts module
-    # with 3D fused tensors (`gate_up_proj`, `down_proj`) under `layer.mlp`,
-    # and dropped the per-expert ModuleList layout that nvidia-modelopt 0.37
-    # iterates. This shim synthesizes the old-style `layer.block_sparse_moe`
-    # with `experts[i].{w1,w2,w3}.weight` as zero-copy views into the fused
-    # tensors so modelopt's MoE exporter works unmodified.
+    # with 3D fused tensors (gate_up_proj, down_proj) under layer.mlp, replacing
+    # the per-expert ModuleList layout that nvidia-modelopt 0.37 iterates
+    # (len(experts), experts[i].w1.weight, ...). Without this swap, the export
+    # call fails with: TypeError: object of type 'MixtralExperts' has no len().
+    #
+    # An earlier attempt added a sibling layer.block_sparse_moe with the legacy
+    # layout, but modelopt iterates decoder_layer.named_children() and hits the
+    # original layer.mlp (a MixtralSparseMoeBlock matching is_moe) first, so the
+    # exception still triggered. Replace layer.mlp in place so calibration uses
+    # per-expert nn.Linear modules (allowing modelopt to attach quantizers) and
+    # export reads the per-expert ModuleList layout.
     try:
         from transformers.models.mixtral.modeling_mixtral import MixtralExperts
     except ImportError:
@@ -325,29 +391,15 @@ def _unfuse_mixtral_for_modelopt(model: nn.Module) -> None:
 
     for layer in model.model.layers:
         mlp = getattr(layer, "mlp", None)
-        if mlp is None:
+        if mlp is None or not isinstance(getattr(mlp, "experts", None),
+                                         MixtralExperts):
             continue
-        experts = getattr(mlp, "experts", None)
-        if not isinstance(experts, MixtralExperts):
-            continue
-
-        num_experts = experts.num_experts
-        intermediate = experts.intermediate_dim
-        gate_up = experts.gate_up_proj  # [N, 2*I, H]
-        down = experts.down_proj  # [N, H, I]
-
-        new_experts = nn.ModuleList()
-        for i in range(num_experts):
-            shim = _MixtralExpertShim()
-            shim.w1 = _FusedExpertLinearView(gate_up[i, :intermediate, :])
-            shim.w3 = _FusedExpertLinearView(gate_up[i, intermediate:, :])
-            shim.w2 = _FusedExpertLinearView(down[i])
-            new_experts.append(shim)
-
-        new_block = _MixtralSparseMoeBlockShim()
-        new_block.experts = new_experts
-        new_block.gate = mlp.gate
-        layer.block_sparse_moe = new_block
+        # nn.Module() defaults to training=True; mirror the original mlp's
+        # mode so a prior model.eval() is preserved (avoids re-enabling the
+        # router-input jitter during calibration/export).
+        compat_mlp = _MixtralSparseMoeBlockCompat(mlp)
+        compat_mlp.train(mlp.training)
+        layer.mlp = compat_mlp
 
 
 def _get_llava_qwen_model(model_dir, dtype, device):
@@ -423,8 +475,8 @@ def get_model(ckpt_path: str,
     model.eval()
 
     # transformers 5.x changed Mixtral MoE to a fused 3D layout that
-    # nvidia-modelopt 0.37 cannot iterate. Restructure into per-expert
-    # block_sparse_moe layout using zero-copy tensor views.
+    # nvidia-modelopt 0.37 cannot iterate. Restore the per-expert layout
+    # so both calibration and export work; see _unfuse_mixtral_for_modelopt.
     if hf_config.model_type == "mixtral":
         _unfuse_mixtral_for_modelopt(model)
 

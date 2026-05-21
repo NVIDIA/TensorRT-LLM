@@ -288,6 +288,7 @@ python visual_gen_ltx2.py \
 | `--enable_sage_attention` | ✓ | ✓ | — | False | SageAttention (requires `TRTLLM` attention backend) |
 | `--cfg_size` | — | ✓ | — | 1 | CFG parallelism |
 | `--ulysses_size` | ✓ | ✓ | — | 1 | Ulysses parallelism |
+| `--parallel_vae_size` | - | ✓ | — | 1 | Parallelism used for VAE |
 | `--attn2d_row_size` | ✓ | ✓ | ✓ | 1 | Attention2D mesh row size |
 | `--attn2d_col_size` | ✓ | ✓ | ✓ | 1 | Attention2D mesh column size |
 | `--linear_type` | ✓ | ✓ | — | default | Quantization type |

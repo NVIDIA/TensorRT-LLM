@@ -1,0 +1,15 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Configuration for granite-4.0-h-small (GraniteMoeHybrid with Mamba+MoE)
+# Uses flashinfer attention backend (trtllm backend produces garbled output with muP scaling)
+# Attention-DP + EP mode: Mamba/Attention layers replicated (not TP-sharded),
+# MoE experts distributed via EP across 4 GPUs. This avoids the TP incompatibility
+# where n_groups=1 makes Mamba B/C SSM dimensions non-shardable.
+attn_backend: flashinfer
+max_batch_size: 16
+kv_cache_config:
+  free_gpu_memory_fraction: 0.5
+transforms:
+  detect_sharding:
+    enable_attention_dp: true

@@ -306,8 +306,9 @@ class ModelLoader:
                 applied_defaults = apply_model_defaults_to_llm_args(
                     llm_args, model_defaults)
                 if applied_defaults:
-                    logger.info("Applied model defaults for %s: %s",
-                                model_cls.__name__, applied_defaults)
+                    logger.info(
+                        f"Applied model defaults for {model_cls.__name__}: {applied_defaults}"
+                    )
 
         return llm_args
 

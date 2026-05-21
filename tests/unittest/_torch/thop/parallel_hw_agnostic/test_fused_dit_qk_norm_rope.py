@@ -465,3 +465,270 @@ def test_per_head_v_unchanged(head_dim):
         -1,
     )
     torch.testing.assert_close(qkv[:, -v_size:], v_original, rtol=0, atol=0)
+
+
+# ============================================================================
+# Cross-head norm reference implementation
+# ============================================================================
+
+
+@torch.inference_mode()
+def torch_ref_cross_head(
+    qkv,
+    num_heads_q,
+    num_heads_k,
+    num_heads_v,
+    head_dim,
+    eps,
+    q_weight,
+    k_weight,
+    cos_emb,
+    sin_emb,
+    interleave,
+):
+    """Reference: cross-head (full-dim) RMSNorm + RoPE (WAN pattern)."""
+    num_tokens = qkv.shape[0]
+    q_size = num_heads_q * head_dim
+    k_size = num_heads_k * head_dim
+
+    q = qkv[:, :q_size].clone()
+    k = qkv[:, q_size : q_size + k_size].clone()
+    v = qkv[:, q_size + k_size :].clone()
+
+    # Cross-head RMSNorm: norm over the full q_dim / k_dim dimension
+    q = F.rms_norm(q.float(), (q_size,), q_weight.float(), eps).to(qkv.dtype)
+    k = F.rms_norm(k.float(), (k_size,), k_weight.float(), eps).to(qkv.dtype)
+
+    # Expand cos/sin per head for RoPE
+    cos_q = cos_emb.unsqueeze(1).expand(-1, num_heads_q, -1).reshape(num_tokens, q_size)
+    sin_q = sin_emb.unsqueeze(1).expand(-1, num_heads_q, -1).reshape(num_tokens, q_size)
+    cos_k = cos_emb.unsqueeze(1).expand(-1, num_heads_k, -1).reshape(num_tokens, k_size)
+    sin_k = sin_emb.unsqueeze(1).expand(-1, num_heads_k, -1).reshape(num_tokens, k_size)
+
+    if interleave:
+        q = _apply_interleaved_rope(q, cos_q, sin_q)
+        k = _apply_interleaved_rope(k, cos_k, sin_k)
+    else:
+        q = _apply_rotate_half_rope(q, cos_q, sin_q, head_dim, num_heads_q)
+        k = _apply_rotate_half_rope(k, cos_k, sin_k, head_dim, num_heads_k)
+
+    return torch.cat([q.to(qkv.dtype), k.to(qkv.dtype), v], dim=1)
+
+
+def _call_cross_head_kernel(
+    qkv,
+    num_heads_q,
+    num_heads_k,
+    num_heads_v,
+    head_dim,
+    eps,
+    q_weight,
+    k_weight,
+    cos_emb,
+    sin_emb,
+    interleave=True,
+):
+    """Call the fused DiT cross-head QK Norm + RoPE kernel."""
+    torch.ops.trtllm.fused_dit_cross_head_qk_norm_rope(
+        qkv,
+        num_heads_q,
+        num_heads_k,
+        num_heads_v,
+        head_dim,
+        eps,
+        q_weight,
+        k_weight,
+        cos_emb,
+        sin_emb,
+        interleave,
+    )
+
+
+# ============================================================================
+# Cross-head norm tests (WAN pattern)
+# ============================================================================
+
+
+@pytest.mark.parametrize(
+    "num_heads,head_dim",
+    [
+        (12, 128),  # WAN 1.3B: hidden_size=1536
+        (40, 128),  # WAN 14B: hidden_size=5120
+    ],
+)
+@pytest.mark.parametrize("num_tokens", [1, 64, 512])
+def test_cross_head_interleaved(num_heads, head_dim, num_tokens):
+    """Cross-head norm + interleaved RoPE (WAN pattern)."""
+    device = "cuda"
+    torch.random.manual_seed(42)
+
+    hidden_size = 3 * num_heads * head_dim
+    qkv = torch.randn(num_tokens, hidden_size, dtype=torch.bfloat16, device=device)
+    qkv_copy = qkv.clone()
+
+    q_dim = num_heads * head_dim
+    q_weight = torch.randn(q_dim, dtype=torch.bfloat16, device=device) * 5.0
+    k_weight = torch.randn(q_dim, dtype=torch.bfloat16, device=device) * 5.0
+    cos_emb, sin_emb = _generate_cos_sin(num_tokens, head_dim, device)
+
+    _call_cross_head_kernel(
+        qkv,
+        num_heads,
+        num_heads,
+        num_heads,
+        head_dim,
+        1e-6,
+        q_weight,
+        k_weight,
+        cos_emb,
+        sin_emb,
+        interleave=True,
+    )
+
+    ref = torch_ref_cross_head(
+        qkv_copy,
+        num_heads,
+        num_heads,
+        num_heads,
+        head_dim,
+        1e-6,
+        q_weight,
+        k_weight,
+        cos_emb,
+        sin_emb,
+        True,
+    )
+    torch.testing.assert_close(qkv, ref, rtol=5e-2, atol=1e-1)
+
+
+@pytest.mark.parametrize("num_heads", [12, 40])
+@pytest.mark.parametrize("num_tokens", [1, 64, 512])
+def test_cross_head_rotate_half(num_heads, num_tokens):
+    """Cross-head norm + rotate_half RoPE."""
+    device = "cuda"
+    head_dim = 128
+    torch.random.manual_seed(42)
+
+    hidden_size = 3 * num_heads * head_dim
+    qkv = torch.randn(num_tokens, hidden_size, dtype=torch.bfloat16, device=device)
+    qkv_copy = qkv.clone()
+
+    q_dim = num_heads * head_dim
+    q_weight = torch.randn(q_dim, dtype=torch.bfloat16, device=device) * 5.0
+    k_weight = torch.randn(q_dim, dtype=torch.bfloat16, device=device) * 5.0
+    cos_emb, sin_emb = _generate_cos_sin(num_tokens, head_dim, device)
+
+    _call_cross_head_kernel(
+        qkv,
+        num_heads,
+        num_heads,
+        num_heads,
+        head_dim,
+        1e-6,
+        q_weight,
+        k_weight,
+        cos_emb,
+        sin_emb,
+        interleave=False,
+    )
+
+    ref = torch_ref_cross_head(
+        qkv_copy,
+        num_heads,
+        num_heads,
+        num_heads,
+        head_dim,
+        1e-6,
+        q_weight,
+        k_weight,
+        cos_emb,
+        sin_emb,
+        False,
+    )
+    torch.testing.assert_close(qkv, ref, rtol=5e-2, atol=1e-1)
+
+
+@pytest.mark.parametrize("num_heads", [12, 40])
+def test_cross_head_v_unchanged(num_heads):
+    """Verify V is not modified by cross-head kernel."""
+    device = "cuda"
+    head_dim = 128
+    num_tokens = 64
+    hidden_size = 3 * num_heads * head_dim
+
+    torch.random.manual_seed(0)
+    qkv = torch.randn(num_tokens, hidden_size, dtype=torch.bfloat16, device=device)
+    v_size = num_heads * head_dim
+    v_original = qkv[:, -v_size:].clone()
+
+    q_dim = num_heads * head_dim
+    q_weight = torch.randn(q_dim, dtype=torch.bfloat16, device=device)
+    k_weight = torch.randn(q_dim, dtype=torch.bfloat16, device=device)
+    cos_emb, sin_emb = _generate_cos_sin(num_tokens, head_dim, device)
+
+    _call_cross_head_kernel(
+        qkv,
+        num_heads,
+        num_heads,
+        num_heads,
+        head_dim,
+        1e-6,
+        q_weight,
+        k_weight,
+        cos_emb,
+        sin_emb,
+    )
+    torch.testing.assert_close(qkv[:, -v_size:], v_original, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("batch_size", [2, 4])
+def test_cross_head_batched(batch_size):
+    """Cross-head norm + interleaved RoPE with batch_size > 1.
+
+    Simulates the batch-flattening done by Attention.apply_qk_norm_rope.
+    """
+    device = "cuda"
+    num_heads = 12
+    head_dim = 128
+    num_tokens = 256
+
+    torch.random.manual_seed(42)
+    total_tokens = batch_size * num_tokens
+    hidden_size = 3 * num_heads * head_dim
+    qkv = torch.randn(total_tokens, hidden_size, dtype=torch.bfloat16, device=device)
+    qkv_copy = qkv.clone()
+
+    q_dim = num_heads * head_dim
+    q_weight = torch.randn(q_dim, dtype=torch.bfloat16, device=device) * 5.0
+    k_weight = torch.randn(q_dim, dtype=torch.bfloat16, device=device) * 5.0
+    cos_single, sin_single = _generate_cos_sin(num_tokens, head_dim, device)
+    cos_emb = cos_single.repeat(batch_size, 1)
+    sin_emb = sin_single.repeat(batch_size, 1)
+
+    _call_cross_head_kernel(
+        qkv,
+        num_heads,
+        num_heads,
+        num_heads,
+        head_dim,
+        1e-6,
+        q_weight,
+        k_weight,
+        cos_emb,
+        sin_emb,
+    )
+
+    ref = torch_ref_cross_head(
+        qkv_copy,
+        num_heads,
+        num_heads,
+        num_heads,
+        head_dim,
+        1e-6,
+        q_weight,
+        k_weight,
+        cos_emb,
+        sin_emb,
+        True,
+    )
+    torch.testing.assert_close(qkv, ref, rtol=5e-2, atol=1e-1)

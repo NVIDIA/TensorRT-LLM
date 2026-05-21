@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import Any, Dict, List, Literal, Tuple, Type
+from typing import Any, Dict, List, Literal, Optional, Tuple, Type
 
 import torch
 import torch.distributed as dist
@@ -30,6 +30,7 @@ class ParallelVAEBase(nn.Module):
         vae_backend: nn.Module,
         pg: dist.ProcessGroup,
         spec: SplitSpec,
+        adj_groups: List[Optional[dist.ProcessGroup]],
     ) -> None:
         super().__init__()
         self.vae_backend = vae_backend
@@ -37,7 +38,7 @@ class ParallelVAEBase(nn.Module):
         self.spec = spec
         self.rank = dist.get_rank(pg)
         self.world_size = dist.get_world_size(pg)
-        self._adj_groups = self._build_adj_groups(pg)
+        self._adj_groups = adj_groups
         self._parallelize_modules()
 
     # ------------------------------------------------------------------
@@ -120,30 +121,6 @@ class ParallelVAEBase(nn.Module):
             parent = getattr(parent, attr)
         setattr(parent, attrs[-1], new_module)
 
-    # ------------------------------------------------------------------
-    # Process-group helpers
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def _build_adj_groups(pg: dist.ProcessGroup) -> List[dist.ProcessGroup]:
-        """Create pairwise adjacent-rank groups from *pg*.
-
-        Returns a list where ``adj_groups[i]`` is a group containing global
-        ranks ``ranks[i]`` and ``ranks[i+1]`` from *pg*.
-        """
-        world_size = dist.get_world_size(pg)
-        ranks = list(range(world_size))
-
-        adj_groups: List[dist.ProcessGroup] = []
-        for i in range(world_size - 1):
-            adj_groups.append(
-                dist.new_group(
-                    [ranks[i], ranks[i + 1]],
-                    use_local_synchronization=False,
-                )
-            )
-        return adj_groups
-
 
 class ParallelVAEFactory:
     """Factory that maps VAE classes to their parallel wrappers via lazy imports.
@@ -162,11 +139,22 @@ class ParallelVAEFactory:
     }
 
     @classmethod
+    def supports(cls, vae_type: type) -> bool:
+        """Return True if a parallel wrapper is registered for ``vae_type``.
+
+        Pure capability check — deterministic and identical on every rank, so
+        callers can use it to make globally-consistent decisions (e.g. whether
+        parallel-VAE decode mode is active across the world).
+        """
+        return cls._resolve(vae_type) is not None
+
+    @classmethod
     def from_vae(
         cls,
         vae: nn.Module,
         split_dim: Literal["height", "width"],
         pg: dist.ProcessGroup,
+        adj_groups: List[Optional[dist.ProcessGroup]],
     ) -> ParallelVAEBase:
         parallel_cls = cls._resolve(type(vae))
         if parallel_cls is None:
@@ -175,7 +163,7 @@ class ParallelVAEFactory:
                 f"Known VAE types: {list(cls._LAZY_REGISTRY.keys())}"
             )
         spec = parallel_cls.make_spec(split_dim)
-        return parallel_cls(vae, pg, spec)
+        return parallel_cls(vae, pg, spec, adj_groups)
 
     @classmethod
     def _resolve(cls, vae_type: type) -> Type[ParallelVAEBase] | None:

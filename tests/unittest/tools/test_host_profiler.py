@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -17,7 +17,8 @@
 Tests cover:
 1. Core API functionality (add_*, clear_targets, chaining)
 2. Line profiler integration with report validation
-3. E2E test with actual model inference
+3. TLLM_LINE_PROFILER_FUNCTIONS env var override semantics
+4. E2E test with actual model inference
 """
 
 import os
@@ -31,7 +32,13 @@ import pytest
 sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
 from utils.llm_data import llm_models_root
 
-from tensorrt_llm.tools.profiler.host_profile_tools.host_profiler import HostProfiler, ProfileTarget
+from tensorrt_llm.tools.profiler.host_profile_tools.host_profiler import (
+    LINE_PROFILER_FUNCTIONS_ENV_VAR,
+    PROFILE_START_STOP_ENV_VAR,
+    HostProfiler,
+    ProfileTarget,
+    host_profiler_context,
+)
 
 
 def _sample_function_to_profile(n: int) -> int:
@@ -194,6 +201,135 @@ def test_profiling_cycle_and_report_validation():
     finally:
         if os.path.exists(output_path):
             os.unlink(output_path)
+
+
+# ---------------------------------------------------------------------------
+# TLLM_LINE_PROFILER_FUNCTIONS env var override tests
+# ---------------------------------------------------------------------------
+
+
+def test_env_functions_replaces_defaults():
+    """Test TLLM_LINE_PROFILER_FUNCTIONS replaces default targets.
+
+    When set, host_profiler_context should disable defaults and only profile
+    the env-var specified functions.
+    """
+    try:
+        import line_profiler  # noqa: F401
+    except ImportError:
+        pytest.skip("line_profiler not installed")
+
+    with tempfile.NamedTemporaryFile(suffix=".txt", delete=False) as f:
+        output_path = f.name
+
+    try:
+        # Set TLLM_LINE_PROFILER_FUNCTIONS — this should replace defaults
+        func_path = f"{__name__}::_sample_function_to_profile"
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setenv(LINE_PROFILER_FUNCTIONS_ENV_VAR, func_path)
+            mp.setenv("TLLM_LINE_PROFILER_PATH", output_path)
+
+            with host_profiler_context() as profiler:
+                assert profiler is not None
+                # Only env-var targets in profiler.targets (no defaults)
+                assert len(profiler.targets) == 1
+                assert profiler.targets[0].method_name == "_sample_function_to_profile"
+
+                for _ in range(50):
+                    _sample_function_to_profile(10)
+
+        with open(output_path) as f:
+            content = f.read()
+
+        assert "Timer unit:" in content
+        # Env-var target appears
+        assert "_sample_function_to_profile" in content
+        # Default targets like _forward_step should NOT appear
+        assert "_forward_step" not in content
+    finally:
+        if os.path.exists(output_path):
+            os.unlink(output_path)
+
+
+def test_iteration_aware_profiling():
+    """Test iteration-aware profiling using TLLM_PROFILE_START_STOP.
+
+    Covers both cases:
+    1. With TLLM_PROFILE_START_STOP set: only specified iterations are profiled.
+    2. Without TLLM_PROFILE_START_STOP: all iterations are profiled.
+    """
+    try:
+        import line_profiler  # noqa: F401
+    except ImportError:
+        pytest.skip("line_profiler not installed")
+
+    with tempfile.NamedTemporaryFile(suffix=".txt", delete=False) as f:
+        range_output = f.name
+    with tempfile.NamedTemporaryFile(suffix=".txt", delete=False) as f:
+        full_output = f.name
+
+    try:
+        # --- Case 1: iteration range set (profile iterations 5-9 only) ---
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setenv(PROFILE_START_STOP_ENV_VAR, "5-10")
+            mp.setenv("TLLM_LINE_PROFILER_PATH", range_output)
+
+            profiler = HostProfiler(output_path=range_output, use_defaults=False)
+            profiler.add_standalone_function(__name__, "_sample_function_to_profile")
+            assert profiler.start() is True
+            assert profiler._iteration_aware is True
+            assert profiler._tracing_active is False
+
+            for i in range(20):
+                profiler.notify_iteration(i)
+                _sample_function_to_profile(10)
+
+            assert profiler.stop() is True
+
+        with open(range_output) as f:
+            range_content = f.read()
+
+        assert "Timer unit:" in range_content
+        assert "_sample_function_to_profile" in range_content
+        range_hits = re.findall(r"^\s+\d+\s+(\d+)\s+", range_content, re.MULTILINE)
+        range_max = max(int(h) for h in range_hits if int(h) > 0)
+        assert range_max <= 6, (
+            f"Expected hits ~5 (iterations 5-9), got max {range_max}. "
+            "Iteration filtering may not be working."
+        )
+
+        # --- Case 2: no iteration range (profiles everything) ---
+        with pytest.MonkeyPatch.context() as mp:
+            mp.delenv(PROFILE_START_STOP_ENV_VAR, raising=False)
+            mp.setenv("TLLM_LINE_PROFILER_PATH", full_output)
+
+            profiler = HostProfiler(output_path=full_output, use_defaults=False)
+            profiler.add_standalone_function(__name__, "_sample_function_to_profile")
+            assert profiler.start() is True
+            assert profiler._iteration_aware is False
+            assert profiler._tracing_active is True
+
+            # notify_iteration is a no-op when not iteration-aware
+            for i in range(20):
+                profiler.notify_iteration(i)
+                _sample_function_to_profile(10)
+
+            assert profiler.stop() is True
+
+        with open(full_output) as f:
+            full_content = f.read()
+
+        assert "_sample_function_to_profile" in full_content
+        full_hits = re.findall(r"^\s+\d+\s+(\d+)\s+", full_content, re.MULTILINE)
+        full_max = max(int(h) for h in full_hits if int(h) > 0)
+        assert full_max >= 20, f"Expected hits >= 20 (all iterations), got {full_max}"
+
+        # Sanity: iteration-ranged hits should be much less than full
+        assert range_max < full_max
+    finally:
+        for p in (range_output, full_output):
+            if os.path.exists(p):
+                os.unlink(p)
 
 
 # Core PyExecutor methods that are always executed during inference.
