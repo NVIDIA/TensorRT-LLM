@@ -27,12 +27,15 @@ if TYPE_CHECKING:
     from ._page import CommittedPage
 
 BlockKey = bytes
-_ROOT_KEY_LORA_TASK_ID_TAG = b"trtllm_kv_cache_v2_root_lora_task_id"
-_ROOT_KEY_CACHE_SALT_ID_TAG = b"trtllm_kv_cache_v2_root_cache_salt_id"
+
+# Per-request seed for the radix tree's root-block hash. Accepts ``int | None``
+# for the plain LoRA-id path, or a pre-hashed ``bytes`` digest when callers
+# need to mix additional context (e.g. ``cache_salt_id``) into the root.
+TreeTaskId = int | bytes | None
 
 
 class ReuseScope(NamedTuple):
-    """Per-request namespace for prefix reuse."""
+    """Compatibility namespace for callers that still pass lora/salt together."""
 
     lora_id: int | None = None
     salt: int | None = None
@@ -119,19 +122,16 @@ class Hasher:
 TokenBlock = list[TokenIdExt]
 
 
-def _make_root_key(lora_task_id: int | None, cache_salt_id: int | None = None) -> BlockKey:
-    hasher = Hasher()
-    if lora_task_id is not None:
-        hasher.update(_ROOT_KEY_LORA_TASK_ID_TAG).update(lora_task_id)
-    if cache_salt_id is not None:
-        hasher.update(_ROOT_KEY_CACHE_SALT_ID_TAG).update(cache_salt_id)
-    return hasher.digest
+def _tree_task_hash_seed(tree_task_id: TreeTaskId | ReuseScope) -> int | bytes | None:
+    if isinstance(tree_task_id, ReuseScope):
+        return tree_task_id.to_bytes()
+    return tree_task_id
 
 
 def sequence_to_blockchain_keys(
-    tokens_per_block: int, reuse_scope: ReuseScope, tokens: Sequence[TokenIdExt]
+    tokens_per_block: int, tree_task_id: TreeTaskId | ReuseScope, tokens: Sequence[TokenIdExt]
 ) -> Iterator[tuple[TokenBlock, BlockKey]]:
-    digest = Hasher(reuse_scope.to_bytes()).digest
+    digest = Hasher(_tree_task_hash_seed(tree_task_id)).digest
     yield [], digest
     for token_block in chunked(tokens, tokens_per_block):
         digest = Hasher(digest).update(token_block).digest
@@ -267,17 +267,17 @@ def _add_or_get_existing(
 
 
 class RootBlock:
-    __slots__ = ("_prev", "key", "next", "reuse_scope", "__rawref__")
+    __slots__ = ("_prev", "key", "next", "tree_task_id", "__rawref__")
     key: BlockKey
-    reuse_scope: ReuseScope
+    tree_task_id: TreeTaskId
     _prev: rawref.ref["BlockRadixTree"]
     next: Children["Block"]
     __rawref__: rawref.ref["RootBlock"]
 
-    def __init__(self, reuse_scope: ReuseScope, prev: "BlockRadixTree") -> None:
-        self.key = self.make_key(reuse_scope)
+    def __init__(self, tree_task_id: TreeTaskId, prev: "BlockRadixTree") -> None:
+        self.key = self.make_key(tree_task_id)
         assert self.key not in prev.next, "Root block already exists"
-        self.reuse_scope = reuse_scope
+        self.tree_task_id = tree_task_id
         self._prev = rawref.ref(prev)
         self.next = {}
         self.__rawref__ = rawref.NULL
@@ -303,8 +303,8 @@ class RootBlock:
         return self.prev.tokens_per_block
 
     @staticmethod
-    def make_key(reuse_scope: ReuseScope) -> BlockKey:
-        return Hasher(reuse_scope.to_bytes()).digest
+    def make_key(tree_task_id: TreeTaskId | ReuseScope) -> BlockKey:
+        return Hasher(_tree_task_hash_seed(tree_task_id)).digest
 
 
 class Block:
@@ -464,11 +464,11 @@ class BlockRadixTree:
     def __del__(self) -> None:
         self.__rawref__.invalidate()
 
-    def add_or_get_existing(self, reuse_scope: ReuseScope) -> RootBlock:
-        key = RootBlock.make_key(reuse_scope)
+    def add_or_get_existing(self, tree_task_id: TreeTaskId) -> RootBlock:
+        key = RootBlock.make_key(tree_task_id)
         if key in self.next:
             return self.next[key]
-        return RootBlock(reuse_scope, self)
+        return RootBlock(tree_task_id, self)
 
     @property
     def tokens_per_block(self) -> int:
@@ -513,14 +513,14 @@ class BlockRadixTree:
     # tokens_per_block except the last one.
     def _match_token_path(
         self,
-        reuse_scope: ReuseScope,
+        tree_task_id: TreeTaskId,
         tokens: Sequence[TokenIdExt],
         enable_partial_match: bool = False,
     ) -> Iterator[tuple[Block, int]]:
         block: Block | RootBlock | BlockRadixTree = self
         mismatched_token_block: TokenBlock = []
         for token_block, key in sequence_to_blockchain_keys(
-            self._tokens_per_block, reuse_scope, tokens
+            self._tokens_per_block, tree_task_id, tokens
         ):
             if key in block.next:
                 block = block.next[key]
@@ -613,7 +613,7 @@ class BlockRadixTree:
 
     def match(
         self,
-        reuse_scope: ReuseScope,
+        tree_task_id: TreeTaskId,
         tokens: Sequence[TokenIdExt],
         enable_partial_match: bool = False,
     ) -> ReuseMatch:
@@ -624,7 +624,7 @@ class BlockRadixTree:
         acquire ownership of the pages before depending on them.
         """
         matched = self._prune_match(
-            list(self._match_token_path(reuse_scope, tokens, enable_partial_match))
+            list(self._match_token_path(tree_task_id, tokens, enable_partial_match))
         )
         return ReuseMatch([block for block, _ in matched], self._num_matched_tokens(matched))
 

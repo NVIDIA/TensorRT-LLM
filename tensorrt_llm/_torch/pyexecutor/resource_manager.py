@@ -38,7 +38,7 @@ from tensorrt_llm.runtime.kv_cache_hash import (
 from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     DEFAULT_BEAM_INDEX, AttentionLayerConfig, BufferConfig, CacheTierConfig,
     DiskCacheTierConfig, GpuCacheTierConfig, HostCacheTierConfig,
-    PageIndexMode, ReuseScope)
+    PageIndexMode)
 # isort: on
 from tensorrt_llm.runtime.kv_cache_manager_v2 import KVCacheIterationStatsDelta
 from tensorrt_llm.runtime.kv_cache_manager_v2 import \
@@ -4408,9 +4408,10 @@ class KVCacheManagerV2(BaseResourceManager):
                 request_id, self.index_mapper.size(), self.index_mapper.size())
             return None
         kv_cache = self.impl.create_kv_cache(
-            ReuseScope(lora_id=lora_task_id, salt=cache_salt_id),
+            lora_task_id,
             input_tokens,
             id=request_id,
+            cache_salt_id=cache_salt_id,
             expected_prompt_length=expected_prompt_length,
         )
         self.kv_cache_map[request_id] = kv_cache

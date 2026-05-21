@@ -296,7 +296,7 @@ class _KVCache:
         reuse_match: Any | None,
         id: Any,
         custom_priority_callback: Callable[[int, Any], Priority],
-        cache_salt_id: int | None,
+        cache_salt_id: int | None = None,
     ) -> None: ...
     def set_base_page_index_buf(
         self, beam_idx: BeamIndex, layer_group_id: LayerGroupId, buf: memoryview | None
@@ -434,15 +434,16 @@ class KVCacheManager:
     ) -> PageIndexConverter: ...
     def create_kv_cache(
         self,
-        reuse_scope: ReuseScope | None = None,
+        lora_task_id: int | ReuseScope | None = None,
         input_tokens: Sequence[TokenIdExt] | None = None,
         id: Any = None,
         custom_priority_callback: Callable[[int, Any], Priority] = ...,
+        cache_salt_id: int | None = None,
         expected_prompt_length: int | None = None,
     ) -> _KVCache: ...
     def probe_reuse(
         self,
-        reuse_scope: ReuseScope | None = None,
+        lora_task_id: int | ReuseScope | None = None,
         input_tokens: Sequence[TokenIdExt] | None = None,
     ) -> int: ...
     def resize(self, cache_level: CacheLevel, quota: int, best_efforts: bool = False) -> bool: ...
