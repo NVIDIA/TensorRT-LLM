@@ -76,6 +76,7 @@ modules = [
     "kv_cache_manager_v2/_config.py",
     "kv_cache_manager_v2/_copy_engine.py",
     "kv_cache_manager_v2/_cuda_virt_mem.py",
+    "kv_cache_manager_v2/_event_manager.py",
     "kv_cache_manager_v2/_exceptions.py",
     "kv_cache_manager_v2/_life_cycle_registry.py",
     "kv_cache_manager_v2/_page.py",

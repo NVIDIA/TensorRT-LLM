@@ -19,7 +19,7 @@ import warnings
 from collections import deque
 from dataclasses import dataclass
 from fractions import Fraction
-from typing import Iterator, Sequence, cast
+from typing import TYPE_CHECKING, Iterator, Sequence, cast
 
 from . import rawref
 from ._common import (
@@ -42,10 +42,11 @@ from ._config import (
     SwaScratchReuseConfig,
 )
 from ._copy_engine import CopyTask, batched_copy
+from ._event_manager import KVCacheEventDiff
 from ._eviction_controller import EvictablePage, PerLevelEvictionController
 from ._exceptions import OutOfPagesError
 from ._life_cycle_registry import LifeCycleId, LifeCycleRegistry, compute_scratch_range
-from ._page import Page
+from ._page import CommittedPage, Page
 from ._storage import CacheLevelStorage
 from ._storage._config import BufferAttr, BufferId, LayerAttr, SlotDesc, StorageConfig
 from ._storage._core import (
@@ -79,6 +80,9 @@ from ._utils import (
     typed_map,
     typed_range,
 )
+
+if TYPE_CHECKING:
+    from ._event_manager import KVCacheEventManager
 
 
 class CacheLevelManager:
@@ -177,6 +181,8 @@ class StorageManager:
         "_slot_desc_list",
         "_levels",
         "_min_slots",
+        "_execution_stream",
+        "_event_manager",
         "__rawref__",
     )
     _life_cycles: LifeCycleRegistry
@@ -189,6 +195,8 @@ class StorageManager:
     _slot_desc_list: TypedIndexList[PoolGroupIndex, SlotDesc]
     _levels: TypedIndexList[CacheLevel, CacheLevelManager]
     _min_slots: TypedIndexList[PoolGroupIndex, int]
+    _execution_stream: CudaStream | None
+    _event_manager: "KVCacheEventManager | None"
     __rawref__: rawref.ref["StorageManager"]
 
     def __init__(
@@ -199,8 +207,11 @@ class StorageManager:
         swa_scratch_reuse: SwaScratchReuseConfig | None,
         typical_batch: BatchDesc | None = None,
         constraints: list[BatchDesc] | None = None,
+        event_manager: "KVCacheEventManager | None" = None,
     ) -> None:
         self.__rawref__ = rawref.NULL
+        self._execution_stream: CudaStream | None = None
+        self._event_manager = event_manager
         assert config.cache_tiers[GPU_LEVEL].tier == CacheTier.GPU_MEM, (
             "The first cache tier must be GPU memory"
         )
@@ -528,6 +539,13 @@ class StorageManager:
                 for pool_idx, tasks in typed_enumerate(tasks_per_pool):
                     batched_copy(dst_tier, src_tier, slot_sizes[pool_idx], tasks, stream.get())
             finish_event = stream.take_finish_event()
+            emit_cache_level_updates = (
+                update_src
+                and not defrag
+                and src_level != dst_level
+                and self._event_manager is not None
+            )
+            emitted_update_keys: set[tuple[bytes, LifeCycleId]] = set()
             for src, dst in zip(src_pages, dst_slots):
                 dst.ready_event = finish_event
                 src.ready_event = (
@@ -540,6 +558,10 @@ class StorageManager:
                     src_pool_group.release(src)
                     src.set_slot(dst)
                     src.cache_level = dst_level
+                    if emit_cache_level_updates:
+                        self._emit_cache_level_updated_event(
+                            src, src_level, dst_level, emitted_update_keys
+                        )
                     if scheduled_for_eviction:
                         self.schedule_for_eviction(src)
             return None if update_src else dst_slots
@@ -547,6 +569,34 @@ class StorageManager:
             for s in dst_slots:
                 dst_pool_group.release(s)
             raise
+
+    def _emit_cache_level_updated_event(
+        self,
+        page: Page,
+        old_level: CacheLevel,
+        new_level: CacheLevel,
+        emitted_keys: set[tuple[bytes, LifeCycleId]],
+    ) -> None:
+        if self._event_manager is None or not isinstance(page, CommittedPage):
+            return
+
+        block = page.block()
+        if block is None or block.is_orphan:
+            return
+
+        event_key = (block.key, page.life_cycle)
+        if event_key in emitted_keys:
+            return
+
+        emitted_keys.add(event_key)
+        self._event_manager.add_updated_event(
+            block.key,
+            cache_level=KVCacheEventDiff(
+                old_value=int(old_level),
+                new_value=int(new_level),
+            ),
+            layer_group_id=int(page.life_cycle),
+        )
 
     def _pool_group(
         self, cache_level: CacheLevel, pool_group_index: PoolGroupIndex
