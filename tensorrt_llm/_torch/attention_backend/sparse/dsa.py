@@ -124,11 +124,10 @@ _DG_SCHEDULE_BLOCK_KV = 64
 
 def _pick_dsl_expand(
     next_n: int,
+    num_sms: int,
     batch_size: int = 0,
     max_ctx: int = 0,
-    num_sms: int = 148,
-    kernel_atoms: Tuple[int, ...] = (1, 2, 3)
-) -> Tuple[int, int]:
+    kernel_atoms: Tuple[int, ...] = (1, 2, 3)) -> Tuple[int, int]:
     """Pick (expand_factor, effective_next_n) for the DSL paged kernel
     using a wave-aware strategy. Used by both FP4 and FP8 DSL paths.
 
@@ -149,7 +148,7 @@ def _pick_dsl_expand(
     back to the legacy HBM-minimizing heuristic: largest effective_next_n
     that divides next_n cleanly (still constrained to ``kernel_atoms``).
 
-    Examples (wave-aware, num_sms=148, SPLIT_KV=256 tokens):
+    Examples (wave-aware, num_sms=148 [B200], SPLIT_KV=256 tokens):
         FP4, next_n=4, B=1,  ctx=4096   -> (4, 1): ntask=64<148, 1 wave, max factor
         FP4, next_n=4, B=32, ctx=4096   -> (2, 2): ntask=1024>148, multi-wave, min factor
         FP4, next_n=2, B=1,  ctx=4096   -> (2, 1): wave-tie, larger factor
@@ -459,12 +458,12 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
     skip_indexer_for_gen_reqs: bool = False
     # Whether to use the expanded buffers for MTP support
     use_expanded_buffers_for_mtp: bool = False
-    # Whether to reshape the DSL FP4 paged MQA logits Q tensor into
-    # supported next_n ∈ {1, 2, 3} via caller-side atom-split (see
-    # `_pick_dsl_expand`). Reuses `kv_lens_expanded_cuda` /
-    # `block_table_expanded` / `scheduler_metadata_buffer_expanded`; runtime
-    # mutually exclusive with `use_expanded_buffers_for_mtp` (the latter
-    # requires `not _use_dsl`).
+    # Whether to reshape the DSL paged MQA logits Q tensor into a kernel-
+    # supported `effective_next_n` via caller-side atom-split (FP4: {1,2,3};
+    # FP8: {1,2,3,4}; see `_pick_dsl_expand`). Reuses
+    # `kv_lens_expanded_cuda` / `block_table_expanded` /
+    # `scheduler_metadata_buffer_expanded`; runtime mutually exclusive with
+    # `use_expanded_buffers_for_mtp` (the latter requires `not _use_dsl`).
     expand_for_dsl: bool = False
     # Cached (expand_factor, atom) decision from the wave-aware picker. Set at
     # `prepare()` time and read by forward call sites — avoids re-running the

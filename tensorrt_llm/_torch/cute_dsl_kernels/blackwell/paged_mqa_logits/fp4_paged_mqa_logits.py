@@ -405,11 +405,6 @@ class FP4MQALogitsKernel:
         # for phys_block_kv=128 (1 phys block = 1 UTCCP atom). Q SF transpose
         # is NOT affected by this flag (deferred to a separate phase).
         if remove_online_sf_transpose and phys_block_kv != 128:
-            print(
-                f"[FP4MQALogitsKernel] remove_online_sf_transpose=True ignored: "
-                f"requires phys_block_kv=128 (1 phys block = 1 UTCCP atom), "
-                f"got phys_block_kv={phys_block_kv}. Falling back to False."
-            )
             remove_online_sf_transpose = False
         self.remove_online_sf_transpose = remove_online_sf_transpose
         # When True, defer per-t STG to register array and emit all STGs in
@@ -642,7 +637,6 @@ class FP4MQALogitsKernel:
         #                              [SF   phys_block_kv*4         bytes (= phys_block_kv int32)]
         phys_block_kv = self.phys_block_kv
         half_head_dim = self.head_dim // 2  # FP4 packed bytes per row
-        # phys_block_bytes = phys_block_kv * (half_head_dim + 4)
         scale_offset_bytes = phys_block_kv * half_head_dim  # to SF region of each phys block
 
         # Recast the fused buffer to FP4. Each uint8 byte becomes 2 FP4 elements,
