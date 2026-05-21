@@ -53,6 +53,8 @@ class Attention(nn.Module):
         config: Optional[DiffusionModelConfig] = None,
         layer_idx: Optional[int] = None,
         enable_sequence_parallel: bool = True,
+        enable_ulysses: bool = True,
+        async_ulysses: bool = False,
     ):
         super().__init__()
 
@@ -160,9 +162,24 @@ class Attention(nn.Module):
             ]
         )
 
-        # Ulysses shards heads across workers; inner backend sees sharded head count.
-        # Attention2D gathers sequence (not heads); see wrap_parallel_attention for nesting.
-        use_ulysses = ulysses_size > 1 and enable_sequence_parallel
+        # TODO: Support combined Ulysses + CP. Ulysses shards heads while CP shards sequence.
+        # Currently kept as mutually exclusive.
+        attn2d_size = (vgm.attn2d_row_size * vgm.attn2d_col_size) if vgm else 1
+        use_attn2d = attn2d_size > 1 and self.qkv_mode != QKVMode.SEPARATE_QKV
+        # Ulysses auto-wrap normally skips SEPARATE_QKV (cross-attention).
+        # The async-ulysses path uses SEPARATE_QKV for stream-pipelined
+        # V/Q/K projections AND still needs the head-sharding wrap — opt in
+        # via async_ulysses=True.
+        use_ulysses = (
+            ulysses_size > 1
+            and enable_sequence_parallel
+            and enable_ulysses
+            and (self.qkv_mode != QKVMode.SEPARATE_QKV or async_ulysses)
+        )
+
+        # Compute head counts for the backend
+        # Ulysses shards heads across workers; inner backend sees sharded count
+        # Attention2D gathers sequence (not heads); inner backend sees full count
         if use_ulysses:
             backend_num_heads = self.local_num_attention_heads // ulysses_size
             backend_num_kv_heads = self.local_num_key_value_heads // ulysses_size
@@ -215,6 +232,8 @@ class Attention(nn.Module):
             visual_gen_mapping=vgm,
             enable_sequence_parallel=enable_sequence_parallel,
         )
+        if use_ulysses and async_ulysses and hasattr(self.attn, "setup_async_pipeline"):
+            self.attn.setup_async_pipeline()
 
     def _init_qkv_proj(self) -> None:
         tp_mode = TensorParallelMode.COLUMN if self.tp_size > 1 else None

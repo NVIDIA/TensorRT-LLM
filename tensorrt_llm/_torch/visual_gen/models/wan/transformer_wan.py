@@ -12,7 +12,7 @@ from tensorrt_llm._torch.modules.layer_norm import LayerNorm
 from tensorrt_llm._torch.modules.linear import Linear, TensorParallelMode
 from tensorrt_llm._torch.modules.mlp import MLP
 from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
-from tensorrt_llm._torch.visual_gen.modules.attention import Attention, QKVMode
+from tensorrt_llm._torch.visual_gen.modules.attention import Attention, QKVMode, apply_rotary_emb
 from tensorrt_llm._torch.visual_gen.modules.rms_norm import RMSNormTPAware
 from tensorrt_llm._torch.visual_gen.quantization.loader import DynamicLinearWeightLoader
 from tensorrt_llm._torch.visual_gen.utils import SequenceSharder
@@ -26,7 +26,6 @@ except ImportError:
     # Removed in transformers>=5
     def get_parameter_device(module):
         return next(module.parameters()).device
-
 
 # =========================================================================
 # 1. Rotary Positional Embeddings
@@ -290,17 +289,26 @@ class WanBlock(nn.Module):
         # However, this kernel does not support TP due to the cross-head
         # normalization being a collective op. Thus, we must disable it if
         # using TP.
+        # When ulysses_size > 1 AND parallel.async_ulysses is set, switch
+        # to SEPARATE_QKV so V/Q/K projections can stream-pipeline through
+        # the async ulysses A2A path.
         tp_size = model_config.mapping.tp_size if model_config.mapping else 1
+        vgm_self = model_config.visual_gen_mapping
+        ulysses_size_self = vgm_self.ulysses_size if vgm_self is not None else 1
+        _async_a2a = model_config.parallel.async_ulysses if model_config is not None else False
+        self._use_async_ulysses = bool(ulysses_size_self > 1) and _async_a2a
+        _qkv_mode_self = QKVMode.SEPARATE_QKV if self._use_async_ulysses else QKVMode.FUSE_QKV
         self.attn1 = Attention(
             hidden_size=hidden_size,
             num_attention_heads=num_heads,
             head_dim=head_dim,
-            qkv_mode=QKVMode.FUSE_QKV,
+            qkv_mode=_qkv_mode_self,
             qk_norm=True,
             eps=eps,
             fuse_qk_norm_rope=(tp_size == 1),
             config=model_config,
             layer_idx=_layer_idx,
+            async_ulysses=self._use_async_ulysses,
         )
 
         # Cross-attention with separate Q, K, V
@@ -414,15 +422,45 @@ class WanBlock(nn.Module):
         # Prepare frequencies for Attention
         freqs = (freqs_cos, freqs_sin) if freqs_cos is not None and freqs_sin is not None else None
 
-        # Self-attention with RoPE
-        x = (
-            x.float()
-            + self.attn1(
-                normed,
-                freqs=freqs,
-            ).float()
-            * gate_msa
-        ).to(x.dtype)
+        # Self-attention with RoPE. Async ulysses path drives V/Q/K closures
+        # through forward_async so each GEMM+norm+RoPE overlaps with the
+        # peer push on the side stream.
+        if self._use_async_ulysses:
+            attn1 = self.attn1
+            B_, Sp = normed.shape[0], normed.shape[1]
+            num_heads = attn1.num_attention_heads
+            num_kv_heads = attn1.num_key_value_heads
+            head_dim = attn1.head_dim
+
+            def compute_q():
+                q = attn1.to_q(normed)
+                if attn1.qk_norm:
+                    q = attn1.norm_q(q)
+                q = q.view(B_, Sp, num_heads, head_dim)
+                if freqs is not None:
+                    q = apply_rotary_emb(q, freqs[0], freqs[1])
+                return q
+
+            def compute_k():
+                k = attn1.to_k(normed)
+                if attn1.qk_norm:
+                    k = attn1.norm_k(k)
+                k = k.view(B_, Sp, num_kv_heads, head_dim)
+                if freqs is not None:
+                    k = apply_rotary_emb(k, freqs[0], freqs[1])
+                return k
+
+            def compute_v():
+                return attn1.to_v(normed).view(B_, Sp, num_kv_heads, head_dim)
+
+            attn1_out_4d = attn1.attn.forward_async(compute_q, compute_k, compute_v)
+            T_ = attn1_out_4d.shape[1]
+            attn1_out = attn1_out_4d.reshape(B_, T_, num_heads * head_dim)
+            attn1_out = attn1.to_out[0](attn1_out)
+        else:
+            attn1_out = self.attn1(normed, freqs=freqs)
+
+        x = (x.float() + attn1_out.float() * gate_msa).to(x.dtype)
 
         norm_x = self.norm2(x.float()).to(x.dtype)
 

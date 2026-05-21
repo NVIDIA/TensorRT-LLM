@@ -20,7 +20,7 @@ backend — compose around a real backend (VANILLA/TRTLLM/FA4/CUTEDSL).
 
 """
 
-from typing import TYPE_CHECKING, Callable, Optional
+from typing import TYPE_CHECKING, Callable, ClassVar, Dict, Optional
 
 import torch
 import torch.distributed as dist
@@ -42,72 +42,25 @@ except (ImportError, OSError) as e:
     _flash_attn_combine_import_error = e
 
 
-# -----------------------------------------------------------------------------
-# Pre-/post-alltoall compute functions for split-QKV pipeline.
-# Each pre-compute fn fuses GEMM + (norm + rope) + 4D-view + 5D-view + permute
-# + contiguous into a single inductor compile region (matching bench
-# `_pV/_pQ/_pK`). inductor fuses permute+contig into the GEMM/norm/rope
-# epilogue stores → 1 fused triton kernel per V/Q/K path under torch.compile.
-#
-# Free functions (not methods) so dynamo can trace cleanly without `self`.
-# Wrapped via `torch.compile` in `UlyssesAttention.attach_compiled_pre_compute`.
-# -----------------------------------------------------------------------------
-
-def v_pre_all_to_all_comp(to_v, x, B, Sp, P, num_kv_heads, head_dim):
-    """V path: GEMM + 4D view + 5D permute + contiguous.
-    Returns 5D [P, B, Sp, num_kv_heads/P, head_dim] ready for v11 alltoall."""
-    v = to_v(x)
-    v = v.view(B, Sp, num_kv_heads, head_dim)
-    return (v.view(B, Sp, P, num_kv_heads // P, head_dim)
-              .permute(2, 0, 1, 3, 4)
-              .contiguous())
-
-
-def q_pre_all_to_all_comp(to_q, norm_q, apply_rotary_emb_fn,
-                          x, B, Sp, P, num_heads, head_dim, pe, rope_type):
-    """Q path: GEMM + RMSNorm + RoPE + 4D view + 5D permute + contiguous.
-    NOTE: `apply_rotary_emb_fn` is wrapped with @torch.compiler.disable in
-    rope.py — under inductor compile its FMA-fused mul-add diverges by ~4 ULPs
-    from eager (verified by per-stage dump). With @disable, GEMM + RMSNorm
-    still get fused into the inductor graph; only the RoPE math runs eager."""
-    q = to_q(x)
-    if norm_q is not None:
-        q = norm_q(q)
-    if pe is not None:
-        q = apply_rotary_emb_fn(q, pe, rope_type)
-    q = q.view(B, Sp, num_heads, head_dim)
-    return (q.view(B, Sp, P, num_heads // P, head_dim)
-              .permute(2, 0, 1, 3, 4)
-              .contiguous())
-
-
-def k_pre_all_to_all_comp(to_k, norm_k, apply_rotary_emb_fn,
-                          x, B, Sp, P, num_kv_heads, head_dim, k_pe, rope_type):
-    """K path: GEMM + RMSNorm + RoPE + 4D view + 5D permute + contiguous.
-    See note in `q_pre_all_to_all_comp` — RoPE eager-only via @disable."""
-    k = to_k(x)
-    if norm_k is not None:
-        k = norm_k(k)
-    if k_pe is not None:
-        k = apply_rotary_emb_fn(k, k_pe, rope_type)
-    k = k.view(B, Sp, num_kv_heads, head_dim)
-    return (k.view(B, Sp, P, num_kv_heads // P, head_dim)
-              .permute(2, 0, 1, 3, 4)
-              .contiguous())
-
-
 def post_permute_5d_to_4d(out_5d, P):
     """5D [P, B, Sp, H/P, D] → 4D [B, P*Sp, H/P, D] (block-by-rank gather).
     .contiguous() copies slot data out (layout-normalize for SDPA, decoupling
     from IPC slot lifetime). Inductor fuses permute+contig with downstream
     SDPA input prep."""
     _P, Bt, Spt, HpP, Dt = out_5d.shape
-    return (out_5d.permute(1, 0, 2, 3, 4)
-                  .contiguous()
-                  .view(Bt, _P * Spt, HpP, Dt))
+    return out_5d.permute(1, 0, 2, 3, 4).contiguous().view(Bt, _P * Spt, HpP, Dt)
 
 
-_ULYSSES_ATTN_INSTANCE_COUNT = 0
+def _can_use_fused_post_unscatter(H: int, D: int) -> bool:
+    """The fused kernel requires D % 8 == 0 (uint4 vec) and threads/block
+    H * (D / 8) <= 1024 (CUDA hw limit). Other shapes fall back to the
+    inductor-fused permute+reshape+contiguous+transpose+contig chain."""
+    return D % 8 == 0 and H * (D // 8) <= 1024
+
+
+def _ulysses_post_unscatter_to_hnd(q_5d, k_5d, v_5d):
+    """One-launch fused replacement for the post-A2A 5D -> 4D HND chain."""
+    return torch.ops.trtllm.ulysses_post_unscatter_qkv(q_5d, k_5d, v_5d)
 
 
 class UlyssesAttention(AttentionBackend):
@@ -138,10 +91,6 @@ class UlyssesAttention(AttentionBackend):
         inner_backend: AttentionBackend,
         process_group: torch.distributed.ProcessGroup,
     ):
-        global _ULYSSES_ATTN_INSTANCE_COUNT
-        self._dbg_idx = _ULYSSES_ATTN_INSTANCE_COUNT
-        _ULYSSES_ATTN_INSTANCE_COUNT += 1
-
         self.inner_backend = inner_backend
         self.process_group = process_group
         self._preferred_layout = AttentionTensorLayout.NHD
@@ -155,74 +104,32 @@ class UlyssesAttention(AttentionBackend):
         self.num_heads = self.sharded_num_heads * self.world_size
         self.num_kv_heads = self.sharded_num_kv_heads * self.world_size
 
-        # GC streams populated by `attach_pipeline_streams()` at module
-        # construction time (before any traced forward). Pipeline body runs
-        # eager Python under `@torch.compiler.disable(recursive=False)` so
-        # plain instance attributes work (no need for ctypes-backed singleton
-        # lookups or workarounds for dynamo tracing).
-        self.pri_comm_stream: Optional[torch.cuda.Stream] = None
-        self.gc_comp_stream: Optional[torch.cuda.Stream] = None
-        self.gc_selfcopy_stream: Optional[torch.cuda.Stream] = None
-        self.gc_selfcopy_handle: int = 0
-
-        # Cached for direct cpp op call (v11 alltoall). Populated lazily on
-        # first attach since process_group is required. pg.boxed() returns a
-        # ScriptObject that's expensive to recreate — caching it avoids ~100us
-        # per alltoall call (3 calls per attention iter).
+        # pg.boxed() is expensive to recreate (~100us); cache on first attach.
         self._pg_boxed = None
         self._group_ranks = None
+        # Side stream for the async A2A pipeline; set by setup_async_pipeline.
+        self._async_side_stream: Optional[torch.cuda.Stream] = None
 
-        # Compiled pre-alltoall fns (set by `attach_compiled_pre_compute`).
-        # Each is its own inductor compile region — fuses GEMM+norm+rope+
-        # permute+contig per V/Q/K path.
-        self._v_pre_compiled = None
-        self._q_pre_compiled = None
-        self._k_pre_compiled = None
+    # One side stream shared across all UlyssesAttention instances on the
+    # same device. Per-layer streams inflate the stream count and break
+    # cuda_graph capture.
+    _SIDE_STREAM_BY_DEVICE: ClassVar[Dict[int, "torch.cuda.Stream"]] = {}
 
-    def _emit_barrier(self):
-        """Cross-rank barrier between alltoall slot writes. Emits an NCCL
-        device-API `ncclLsaBarrierSession` release fence — pri_comm's preceding
-        peer-copies and self-copy completion are fenced before the slot ring
-        is reused."""
-        torch.ops.trtllm.ulysses_lsa_barrier(
-            self._group_ranks, self._pg_boxed)
-
-    def _alltoall_v11_issue(self, perm: torch.Tensor, gc_self_handle: int) -> torch.Tensor:
-        """Issue-only hybrid SM(self)+CE(peer) alltoall on `perm`. Uses
-        `ncclMemAlloc + ncclCommWindowRegister(NCCL_WIN_COLL_SYMMETRIC)` for
-        the slot ring and `ncclGetPeerDevicePointer` for the peer VA mapping.
-        Caller pairs each call with `_emit_barrier()` for the cross-rank fence."""
-        return torch.ops.trtllm.ulysses_alltoall_hybrid_symm(
-            perm, self._group_ranks, self._pg_boxed, gc_self_handle)
-
-    def attach_pipeline_streams(self, streams) -> None:
-        """Inject pre-created GC partition streams + handles. Caller is
-        responsible for ensuring `streams` is the per-device singleton from
-        `UlyssesPipelineStreams.get(device_id)` — created BEFORE any
-        torch.compile-traced forward runs.
-
-        Also caches `pg_boxed` and `group_ranks` for direct cpp op calls in
-        `_pre_attn_alltoall_pipeline` body (which runs eager under @disable),
-        avoiding per-iter PG resolve + boxify overhead (~127us/iter)."""
-        self.pri_comm_stream = streams.pri_comm_stream
-        self.gc_comp_stream = streams.gc_comp_stream
-        self.gc_selfcopy_stream = getattr(streams, "gc_selfcopy_stream", None)
-        self.gc_selfcopy_handle = streams.gc_selfcopy_handle
+    def setup_async_pipeline(self) -> None:
+        """Set up the async A2A pipeline: per-device singleton side stream +
+        cached process-group handles. Callers drive `forward_async` with their
+        own GEMM+norm+RoPE closures; no per-instance torch.compile state is
+        kept here (the outer compile region of the caller's block forward fuses
+        the closure bodies)."""
+        device = torch.cuda.current_device()
+        if device not in UlyssesAttention._SIDE_STREAM_BY_DEVICE:
+            UlyssesAttention._SIDE_STREAM_BY_DEVICE[device] = torch.cuda.Stream(device=device)
+        self._async_side_stream = UlyssesAttention._SIDE_STREAM_BY_DEVICE[device]
         if self.process_group is not None:
             self._pg_boxed = self.process_group.boxed()
             self._group_ranks = sorted(
-                torch.distributed.get_process_group_ranks(self.process_group))
-
-    def attach_compiled_pre_compute(self) -> None:
-        """torch.compile each pre-alltoall fn so inductor fuses GEMM + RMSNorm
-        + RoPE + 4D-view + 5D-permute + .contiguous() into one Triton kernel
-        per V/Q/K path. Each compile() return is its own compile region; they
-        re-enter inductor when called from inside the @disable'd
-        `_pre_attn_alltoall_pipeline` (which uses `recursive=False`)."""
-        _C = lambda fn: torch.compile(fn, mode="default", dynamic=False, fullgraph=False)
-        self._v_pre_compiled = _C(v_pre_all_to_all_comp)
-        self._q_pre_compiled = _C(q_pre_all_to_all_comp)
-        self._k_pre_compiled = _C(k_pre_all_to_all_comp)
+                torch.distributed.get_process_group_ranks(self.process_group)
+            )
 
     def forward(
         self,
@@ -308,154 +215,113 @@ class UlyssesAttention(AttentionBackend):
         return self._output_a2a(output, batch_size, seq_len_full)
 
     # ------------------------------------------------------------------
-    # Bench v11_split_hybrid_batched-style 4-stream pipeline (split QKV).
-    # This method is invoked from inside the `ltx2_split_qkv_pipeline` custom_op
-    # implementation (registered in distributed/ops.py), which is opaque to
-    # dynamo via register_fake — so stream switches inside execute eagerly
-    # without triggering graph break in the surrounding torch.compile graph.
+    # Split-QKV async A2A pipeline. `_issue_async` and `_join_async` are
+    # the only stream-switch boundaries and are @torch.compiler.disable'd;
+    # the caller's compiled forward fuses each compute_{q,k,v} closure.
     # ------------------------------------------------------------------
+
     @torch.compiler.disable(recursive=False)
-    def _pre_attn_alltoall_pipeline(
-        self,
-        x: torch.Tensor,
-        to_q: torch.nn.Module,
-        to_k: torch.nn.Module,
-        to_v: torch.nn.Module,
-        norm_q: Optional[torch.nn.Module],
-        norm_k: Optional[torch.nn.Module],
-        num_heads: int,
-        num_kv_heads: int,
-        head_dim: int,
-        pe: Optional[tuple],
-        k_pe: Optional[tuple],
-        rope_type,
-        apply_rotary_emb_fn: Callable,
-    ):
-        """4-stream pre-alltoall pipeline. `@torch.compiler.disable(recursive=False)`:
-        outer block compile region treats this as opaque (boxify) — body runs
-        eager Python so `with torch.cuda.stream()` propagates to C++
-        at::cuda::CUDAStream (PyTorch issue #92804 workaround). recursive=False
-        allows nested torch.compile regions (the _v/q/k_pre_compiled fns) to
-        re-enter inductor — preserving fusion + autotune for leaf GEMMs.
+    def _issue_async(self, perm_4d: torch.Tensor) -> torch.Tensor:
+        """Issue one V/Q/K async a2a.
+        Phase 1 (acquire slot + CUDA C permute+scatter) runs on the CURRENT
+        (default) stream. Phase 2 (cudaMemcpyBatchAsync peer push + LSA
+        barrier) is queued on the comm side stream, gated by an event so it
+        waits for Phase 1 to complete. Returns the 5D recv-buf view.
 
-        Streams (issue order Q -> V -> K; heaviest compute on full SMs first,
-        lightest gc_comp work issued early to overlap comm with K compute):
-            default      : Q GEMM + qk_norm + rope (heaviest, full 148 SMs)
-            gc_comp      : V GEMM (light, finishes first), then K GEMM + norm + rope
-            pri_comm     : Q/V/K alltoall peer copies + merged barrier
-            gc_selfcopy  : Q/V alltoall self copies (K self via op-internal
-                           opSelfStream — K is last so its op carries the
-                           merged 2stream_final barrier)
+        Comm-stream FIFO serializes consecutive V/Q/K pushes in caller order;
+        no explicit chain event is needed between them. The default stream
+        is free to immediately begin the next V/Q/K compute — that's where
+        the V_push ∥ Q_compute ∥ K_compute overlap comes from."""
+        recv, send_h = torch.ops.trtllm.ulysses_a2a_async_prepare(
+            perm_4d, self._group_ranks, self._pg_boxed
+        )
+        ev = torch.cuda.Event()
+        ev.record()
+        with torch.cuda.stream(self._async_side_stream):
+            ev.wait()
+            torch.ops.trtllm.ulysses_a2a_async(send_h, self._group_ranks, self._pg_boxed)
+        return recv
 
-        Returns 5D `[P, B, Sp, H/P, D]` slot views for V/Q/K, AFTER the merged
-        Q+K+V signal/wait barrier completes (default stream waits ev_done).
-        Caller MUST do `post_permute_5d_to_4d` (with .contiguous()) in outer
-        compile region to copy slot data out to fresh buffer for SDPA — slot
-        is reused on next iter."""
-        P = self.world_size
-        pri_comm = self.pri_comm_stream
-        gc_comp = self.gc_comp_stream
-        gc_self_handle = self.gc_selfcopy_handle
-        pg_boxed = self._pg_boxed
-        group_ranks = self._group_ranks
-
-        B = x.shape[0]
-        Sp = x.shape[1]
-
-        ev_v = torch.cuda.Event()
-        ev_q = torch.cuda.Event()
-        ev_k = torch.cuda.Event()
+    @torch.compiler.disable(recursive=False)
+    def _join_async(self) -> None:
+        """Default stream waits on the comm side stream's tail. Because comm
+        is FIFO, an event recorded after the last `_issue_async`'s push+barrier
+        also covers all prior issues."""
         ev_done = torch.cuda.Event()
-
-        # [BISECT #1] entry-drain reverted — testing whether 3x SymMem barrier
-        # V on default (full SMs, lightest: GEMM + 5D permute + contig fused).
-        # Issued first so V's alltoall is in flight on pri_comm while Q (heavier)
-        # computes on gc_comp — overlapping V's CE-bound peer copies with Q's
-        # SM-bound RMS+RoPE compute. Pipeline order: V → Q → K.
-        v_perm = self._v_pre_compiled(to_v, x, B, Sp, P, num_kv_heads, head_dim)
-        ev_v.record()
-
-        with torch.cuda.stream(pri_comm):
-            ev_v.wait()
-            v_5d = self._alltoall_v11_issue(v_perm, gc_self_handle)
-            self._emit_barrier()
-
-        # Q on gc_comp (~136 SMs): GEMM + norm + rope + 5D permute + contig fused
-        with torch.cuda.stream(gc_comp):
-            ev_v.wait()
-            q_perm = self._q_pre_compiled(
-                to_q, norm_q, apply_rotary_emb_fn,
-                x, B, Sp, P, num_heads, head_dim, pe, rope_type)
-            ev_q.record()
-
-        with torch.cuda.stream(pri_comm):
-            ev_q.wait()
-            q_5d = self._alltoall_v11_issue(q_perm, gc_self_handle)
-            self._emit_barrier()
-
-        # K on gc_comp (last, carries barrier): GEMM + norm + rope + 5D permute + contig fused
-        with torch.cuda.stream(gc_comp):
-            k_pe_use = k_pe if k_pe is not None else pe
-            k_perm = self._k_pre_compiled(
-                to_k, norm_k, apply_rotary_emb_fn,
-                x, B, Sp, P, num_kv_heads, head_dim, k_pe_use, rope_type)
-            ev_k.record()
-
-        with torch.cuda.stream(pri_comm):
-            ev_k.wait()
-            k_5d = self._alltoall_v11_issue(k_perm, gc_self_handle)
-            self._emit_barrier()
+        with torch.cuda.stream(self._async_side_stream):
             ev_done.record()
-
         torch.cuda.current_stream().wait_event(ev_done)
-        return q_5d, k_5d, v_5d
 
-    def forward_with_pipeline(
+    def forward_async(
         self,
-        x: torch.Tensor,
-        to_q: torch.nn.Module,
-        to_k: torch.nn.Module,
-        to_v: torch.nn.Module,
-        norm_q: Optional[torch.nn.Module],
-        norm_k: Optional[torch.nn.Module],
-        num_heads: int,
-        num_kv_heads: int,
-        head_dim: int,
-        pe: Optional[tuple],
-        k_pe: Optional[tuple],
-        rope_type,
-        apply_rotary_emb_fn: Callable,
+        compute_q: Callable[[], torch.Tensor],
+        compute_k: Callable[[], torch.Tensor],
+        compute_v: Callable[[], torch.Tensor],
         **attn_kwargs,
     ) -> torch.Tensor:
-        """Thin outer-compile-eligible wrapper around the @disable'd pre-attn
-        pipeline. After `_pre_attn_alltoall_pipeline` returns, post_permute +
-        transpose + contiguous + SDPA + output_a2a run in OUTER compile region
-        (block forward re-traces here) — these get inductor fusion + autotune."""
+        """Run the async ulysses attention path (V/Q/K rolling A2A).
+
+        Args:
+            compute_q / compute_k / compute_v : caller-provided closures that
+                each return a 4D tensor `[B, S_local, H, D]`. The closure
+                typically does `GEMM → (RMSNorm) → (RoPE) → view(4D)`; closures
+                live in the caller's compiled forward so inductor fuses each
+                into a single Triton kernel.
+            **attn_kwargs : forwarded to the wrapped inner attention backend
+                (mask, scale, etc.).
+
+        Returns:
+            output tensor in the caller's sharded layout `[B, S/P, H, D]`.
+
+        Pipeline: V/Q/K computed in V→Q→K order on the default stream; each
+        compute's output is fed to `_issue_async` which queues push+barrier on
+        the comm side stream. Default stream proceeds to the next compute
+        immediately, so V's push overlaps with Q's compute, Q's push overlaps
+        with K's compute. `_join_async` makes default wait on the last push.
+        Post-attention permute / SDPA / reverse A2A run in the caller's outer
+        compile region for additional inductor fusion."""
         P = self.world_size
-        q_5d, k_5d, v_5d = self._pre_attn_alltoall_pipeline(
-            x, to_q, to_k, to_v, norm_q, norm_k,
-            num_heads, num_kv_heads, head_dim,
-            pe, k_pe, rope_type, apply_rotary_emb_fn,
+
+        v_4d = compute_v()
+        v_5d = self._issue_async(v_4d)
+
+        q_4d = compute_q()
+        q_5d = self._issue_async(q_4d)
+
+        k_4d = compute_k()
+        k_5d = self._issue_async(k_4d)
+
+        self._join_async()
+
+        # Fast path: one fused kernel replaces the 6-kernel HND chain (3
+        # permute+reshape+contig + 3 transpose+contig). Falls back to the
+        # eager chain when the kernel's shape constraints aren't met.
+        _, B_q, Sp_q, HpP_q, D_q = q_5d.shape
+        use_fused_op = (
+            self.inner_backend.preferred_layout == AttentionTensorLayout.HND
+            and q_5d.dtype == torch.bfloat16
+            and _can_use_fused_post_unscatter(HpP_q, D_q)
         )
-        v_out = post_permute_5d_to_4d(v_5d, P)
-        q_out = post_permute_5d_to_4d(q_5d, P)
-        k_out = post_permute_5d_to_4d(k_5d, P)
+        if use_fused_op:
+            q_out, k_out, v_out = _ulysses_post_unscatter_to_hnd(q_5d, k_5d, v_5d)
+            B = B_q
+            seq_len_full = P * Sp_q
+        else:
+            v_out = post_permute_5d_to_4d(v_5d, P)
+            q_out = post_permute_5d_to_4d(q_5d, P)
+            k_out = post_permute_5d_to_4d(k_5d, P)
 
-        B = q_out.shape[0]
-        seq_len_full = q_out.shape[1]
-        if self.inner_backend.preferred_layout == AttentionTensorLayout.HND:
-            q_out = q_out.transpose(1, 2).contiguous()
-            k_out = k_out.transpose(1, 2).contiguous()
-            v_out = v_out.transpose(1, 2).contiguous()
+            B = q_out.shape[0]
+            seq_len_full = q_out.shape[1]
+            if self.inner_backend.preferred_layout == AttentionTensorLayout.HND:
+                q_out = q_out.transpose(1, 2).contiguous()
+                k_out = k_out.transpose(1, 2).contiguous()
+                v_out = v_out.transpose(1, 2).contiguous()
 
-        # Caller passed pre-A2A (sharded) seq_lens; the inner backend reshapes
-        # by them, so hand it the post-A2A length instead (matches _forward_fused).
         attn_kwargs["seq_len"] = seq_len_full
         attn_kwargs["seq_len_kv"] = seq_len_full
-
-        sdpa_out = self.inner_backend.forward(
-            q=q_out, k=k_out, v=v_out, **attn_kwargs)
-        return self._output_a2a(sdpa_out, B, seq_len_full)
+        output = self.inner_backend.forward(q=q_out, k=k_out, v=v_out, **attn_kwargs)
+        return self._output_a2a(output, B, seq_len_full)
 
     def _output_a2a(
         self,

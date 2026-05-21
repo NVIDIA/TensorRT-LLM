@@ -18,7 +18,6 @@
 from __future__ import annotations
 
 import fnmatch
-import os
 from dataclasses import dataclass, replace
 from enum import Enum
 from typing import TYPE_CHECKING, Any, Optional
@@ -89,7 +88,7 @@ class LTX2Attention(Attention):
         layer_idx: int = 0,
         enable_sequence_parallel: bool = False,
         use_ulysses: bool = False,
-        ulysses_async_a2a: bool = False,
+        async_ulysses: bool = False,
     ):
         from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
 
@@ -101,24 +100,21 @@ class LTX2Attention(Attention):
         self.rope_type = rope_type
         self._is_cross_attn = context_dim is not None
 
-        ulysses_size = vgm.ulysses_size if vgm is not None else 1
-        # Async A2A pipeline gate: when enabled, this attention runs the
-        # split-QKV pipeline that interleaves V/Q/K GEMMs with alltoall on
-        # separate streams via a hybrid SM(self) + CE(peer) data path and an
-        # NCCL device-API LSA barrier. Requires SEPARATE_QKV so the 3 GEMMs
-        # can be issued independently.
-        self._use_split_qkv_pipeline = bool(
+        # Async ulysses opt-in: V/Q/K GEMMs interleave with the all-to-all on a
+        # side stream. Forces SEPARATE_QKV so the 3 projections can issue
+        # independently.
+        self._use_async_ulysses = bool(
             use_ulysses
             and not self._is_cross_attn
-            and ulysses_size > 1
-            and ulysses_async_a2a
+            and async_ulysses
+            and vgm is not None
+            and vgm.ulysses_size > 1
         )
 
-        # Self-attention default: FUSE_QKV enables the optimized backend +
-        # auto Ulysses wrapping from the base class.
-        # Cross-attention: SEPARATE_QKV since K/V come from a different source.
-        # Async A2A pipeline: SEPARATE_QKV so V/Q/K GEMMs run on separate streams.
-        if self._is_cross_attn or self._use_split_qkv_pipeline:
+        # Self-attention: FUSE_QKV enables the optimized backend + auto Ulysses
+        # wrapping from the base class.
+        # Cross-attention or async ulysses: SEPARATE_QKV.
+        if self._is_cross_attn or self._use_async_ulysses:
             qkv_mode = QKVMode.SEPARATE_QKV
         else:
             qkv_mode = QKVMode.FUSE_QKV
@@ -152,13 +148,11 @@ class LTX2Attention(Attention):
             config=config,
             layer_idx=layer_idx,
             enable_sequence_parallel=enable_sp,
+            enable_ulysses=use_ulysses,
+            async_ulysses=self._use_async_ulysses,
         )
 
-        # Build a runtime-toggleable Ulysses ↔ plain pair.
-        # Self-attn: audio length isn't always divisible by ulysses_size, so
-        # we need a plain fallback. Cross-attn (v2a): same need — audio Q is
-        # padded when divisible, plain backend is used otherwise. Plain has
-        # to be built with the full (unsharded) head count.
+        # Validate Ulysses head divisibility (from main).
         self._has_dual_attn = False
         if enable_sp and ulysses_size > 1:
             U = ulysses_size
@@ -173,53 +167,10 @@ class LTX2Attention(Attention):
             # (sharded inner backend + UlyssesAttention) for both self-attn and
             # cross-attn paths.
 
-        # If split-QKV pipeline is active, the base class created the backend
-        # with FULL head count (SEPARATE_QKV path is *not* sharded by base
-        # class in modules/attention.py) and skipped the auto-Ulysses wrap.
-        # We need: sharded backend (post-alltoall has H/P heads per rank) +
-        # UlyssesAttention wrapper for forward_with_pipeline.
-        if self._use_split_qkv_pipeline:
-            assert vgm is not None
-            from tensorrt_llm._torch.visual_gen.attention_backend.parallel import (
-                UlyssesAttention,
-            )
-            sharded_backend = create_attention(
-                backend=self.attn_backend,
-                layer_idx=self.layer_idx,
-                num_heads=heads // ulysses_size,
-                head_dim=dim_head,
-                num_kv_heads=heads // ulysses_size,  # MHA: q == kv
-                quant_config=self.quant_config,
-                dtype=self.dtype,
-            )
-            self._modules.pop("attn", None)
-            self.attn = UlyssesAttention(
-                inner_backend=sharded_backend,
-                process_group=vgm.ulysses_group,
-            )
-
-        if self._use_split_qkv_pipeline:
-            # Pre-create the GC partition + streams (raw ctypes calls happen
-            # here, OUTSIDE any traced region) and inject them as instance
-            # attributes on UlyssesAttention. forward_with_pipeline then
-            # reads them as plain attributes — dynamo sees constant Python
-            # objects, equivalent to bench's module-level globals.
-            from tensorrt_llm._torch.distributed._ulysses_gc import (
-                UlyssesPipelineStreams,
-            )
-            streams = UlyssesPipelineStreams.get(torch.cuda.current_device())
-            self.attn.attach_pipeline_streams(streams)
-            # Compile leaf pre-compute fns (V/Q/K pre-alltoall: GEMM+norm+rope
-            # +permute+contig fused per path). Each is its own inner inductor
-            # region; called from the @disable'd `_pre_attn_alltoall_pipeline`
-            # body — recursive=False allows re-entry, preserving fusion +
-            # autotune on leaf GEMMs even though the pipeline orchestration
-            # itself is eager.
-            self.attn.attach_compiled_pre_compute()
-
         # For audio self-attention that may need a runtime Ulysses toggle
         # (sequence length not always divisible by ulysses_size), create a
-        # plain backend as fallback.
+        # plain backend as fallback.  The base class already set self.attn
+        # to UlyssesAttention(inner_backend=sharded_backend).
         if use_ulysses and not self._is_cross_attn and ulysses_size > 1:
             self._ulysses_attn = self.attn
             self._plain_attn = create_attention(
@@ -443,31 +394,43 @@ class LTX2Attention(Attention):
         ([B, T, H, D] for SPLIT rope, [B, T, D] for INTERLEAVED). The fused
         kernel's 2D form is not compatible with the naive ``apply_rotary_emb``.
         """
-        # Pipeline routing: split-QKV pipeline self-attn under Ulysses.
+        # Pipeline routing: async ulysses self-attn (V/Q/K rolling A2A).
         # `hasattr` guard: when audio seq len is not divisible by ulysses_size,
         # `set_ulysses_active(False)` swaps `self.attn` to plain `VanillaAttention`
-        # which lacks `forward_with_pipeline`. Fall through in that case.
+        # which lacks `forward_async`. Fall through in that case.
         if (
-            self._use_split_qkv_pipeline
+            self._use_async_ulysses
             and context is None
             and pre_projected_kv is None
-            and hasattr(self.attn, "forward_with_pipeline")
+            and hasattr(self.attn, "forward_async")
         ):
-            attn_out_4d = self.attn.forward_with_pipeline(
-                x=x,
-                to_q=self.to_q,
-                to_k=self.to_k,
-                to_v=self.to_v,
-                norm_q=self.norm_q if self.qk_norm else None,
-                norm_k=self.norm_k if self.qk_norm else None,
-                num_heads=self.num_attention_heads,
-                num_kv_heads=self.num_key_value_heads,
-                head_dim=self.head_dim,
-                pe=pe,
-                k_pe=k_pe,
-                rope_type=self.rope_type,
-                apply_rotary_emb_fn=apply_rotary_emb,
-            )
+            B, Sp = x.shape[0], x.shape[1]
+            num_heads = self.num_attention_heads
+            num_kv_heads = self.num_key_value_heads
+            head_dim = self.head_dim
+            rope_type = self.rope_type
+            k_pe_use = k_pe if k_pe is not None else pe
+
+            def compute_q():
+                q = self.to_q(x)
+                if self.qk_norm:
+                    q = self.norm_q(q)
+                if pe is not None:
+                    q = apply_rotary_emb(q, pe, rope_type)
+                return q.view(B, Sp, num_heads, head_dim)
+
+            def compute_k():
+                k = self.to_k(x)
+                if self.qk_norm:
+                    k = self.norm_k(k)
+                if k_pe_use is not None:
+                    k = apply_rotary_emb(k, k_pe_use, rope_type)
+                return k.view(B, Sp, num_kv_heads, head_dim)
+
+            def compute_v():
+                return self.to_v(x).view(B, Sp, num_kv_heads, head_dim)
+
+            attn_out_4d = self.attn.forward_async(compute_q, compute_k, compute_v)
             b, t = attn_out_4d.shape[0], attn_out_4d.shape[1]
             if self.to_gate_logits is not None:
                 gate_logits = self.to_gate_logits(x)
@@ -573,6 +536,9 @@ class BasicAVTransformerBlock(nn.Module):
         )
 
     def _init_video_modules(self, cfg, rope_type, eps, model_config, idx):
+        _async_ulysses = (
+            model_config.parallel.async_ulysses if model_config is not None else False
+        )
         self.attn1 = LTX2Attention(
             query_dim=cfg.dim,
             heads=cfg.heads,
@@ -585,7 +551,7 @@ class BasicAVTransformerBlock(nn.Module):
             layer_idx=idx,
             enable_sequence_parallel=True,
             use_ulysses=True,
-            ulysses_async_a2a=True,
+            async_ulysses=_async_ulysses,
         )
         self.attn2 = LTX2Attention(
             query_dim=cfg.dim,
@@ -786,13 +752,11 @@ class BasicAVTransformerBlock(nn.Module):
                         PerturbationType.SKIP_VIDEO_SELF_ATTN, self.idx, v_self_out
                     )
                 vx = vx + v_self_out
-            attn2_in = rms_norm(vx, eps=self.norm_eps)
-            attn2_out = self.attn2(
-                attn2_in,
+            vx = vx + self.attn2(
+                rms_norm(vx, eps=self.norm_eps),
                 context=video.context,
                 pre_projected_kv=text_kv_video,
             )
-            vx = vx + attn2_out
             del vshift_msa, vscale_msa, vgate_msa
 
         # --- Audio self-attention + text cross-attention ---

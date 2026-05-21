@@ -205,6 +205,15 @@ class ParallelConfig(StrictBaseModel):
         status="prototype",
         description=("Ulysses head-sharding degree. Heads are sharded across ulysses_size GPUs."),
     )
+    async_ulysses: bool = Field(
+        False,
+        status="prototype",
+        description=(
+            "Enable the async Ulysses A2A pipeline: overlap per-rank V/Q/K projection compute "
+            "with cross-rank symm-mem all-to-all on a dedicated side stream. "
+            "Requires ulysses_size > 1. Defaults to False."
+        ),
+    )
     ring_size: int = Field(
         1,
         ge=1,
