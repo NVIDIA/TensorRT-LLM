@@ -21,19 +21,6 @@ import torch
 
 from tensorrt_llm._utils import get_sm_version
 
-# Cache sm version (call once).
-_SM_VERSION: Optional[int] = None
-
-
-def _sm_version() -> int:
-    global _SM_VERSION
-    if _SM_VERSION is None:
-        try:
-            _SM_VERSION = get_sm_version()
-        except Exception:
-            _SM_VERSION = 0
-    return _SM_VERSION
-
 
 @torch.library.custom_op("auto_deploy::torch_linear_simple", mutates_args=())
 def simple(
@@ -85,7 +72,7 @@ def simple(
     # split-K + reduce + zero-fill for small-M (decode) projection GEMMs.
     # (Same trick PT introduced for GPT-OSS via use_custom_cublas_mm in
     # modeling_gpt_oss.py; we apply it model-agnostically based on dtype + SM.)
-    if _sm_version() >= 100 and input.dtype == torch.bfloat16 and weight.dtype == torch.bfloat16:
+    if get_sm_version() >= 100 and input.dtype == torch.bfloat16 and weight.dtype == torch.bfloat16:
         # cublas_mm requires 2D mat_a/mat_b. Flatten leading dims and unflatten on exit.
         in_shape = input.shape
         input_2d = input.reshape(-1, in_shape[-1])
