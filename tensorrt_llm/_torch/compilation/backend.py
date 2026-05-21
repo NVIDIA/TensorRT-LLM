@@ -4,7 +4,7 @@ from typing import List, Optional
 import torch
 import torch._inductor.config as inductor_config
 from torch._functorch.aot_autograd import aot_module_simplified
-from torch._inductor.compile_fx import compile_fx, select_decomp_table
+from torch._inductor.compile_fx import compile_fx_inner, select_decomp_table
 from torch._inductor.pattern_matcher import PatternMatcherPass
 from torch._subclasses import FakeTensor
 from torch.fx import GraphModule
@@ -137,7 +137,7 @@ class Backend:
             self.generate_events(num_events)
             return gm
         elif self.enable_inductor:
-            return compile_fx(gm, example_inputs)
+            return compile_fx_inner(gm, example_inputs)
         else:
             return gm
 
