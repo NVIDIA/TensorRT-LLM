@@ -2449,15 +2449,21 @@ class KVCacheManagerV2(BaseResourceManager):
             if self.kv_cache_type != CacheTypeCpp.SELFKONLY:
                 buffer_type.append(Role.VALUE_BLOCK_SCALE)
 
+        scratch_reuse_config = None
+        if self.enable_swa_scratch_reuse:
+            # Context requests will allocate num_extra_kv_tokens tokens for spec decoding.
+            # Cache manager should not take them into account when calculating scratch range.
+            # Therefore set max_rewind_len to num_extra_kv_tokens.
+            scratch_reuse_config = SwaScratchReuseConfig(
+                max_rewind_len=self.num_extra_kv_tokens)
+
         return KVCacheManagerConfigPy(
             tokens_per_block=tokens_per_block,
             vocab_size=vocab_size,
             cache_tiers=cache_tiers,
             max_util_for_resume=kv_cache_config.max_util_for_resume,
             enable_stats=self.enable_stats,
-            swa_scratch_reuse=(SwaScratchReuseConfig(
-                max_rewind_len=self.max_draft_len)
-                               if self.enable_swa_scratch_reuse else None),
+            swa_scratch_reuse=scratch_reuse_config,
             layers=[
                 AttentionLayerConfig(
                     layer_id=layer_id,

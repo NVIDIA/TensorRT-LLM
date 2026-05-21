@@ -799,17 +799,20 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
         if max_num_tokens is not None:
             constraints.append(BatchDesc([KVCacheDesc(capacity=max_num_tokens, history_length=0)]))
 
+        scratch_reuse_config = None
+        if self.enable_swa_scratch_reuse:
+            # Context requests will allocate num_extra_kv_tokens tokens for spec decoding.
+            # Cache manager should not take them into account when calculating scratch range.
+            # Therefore set max_rewind_len to num_extra_kv_tokens.
+            scratch_reuse_config = SwaScratchReuseConfig(max_rewind_len=self.num_extra_kv_tokens)
+
         return KVCacheManagerConfigPy(
             tokens_per_block=tokens_per_block,
             vocab_size=vocab_size,
             cache_tiers=cache_tiers,
             max_util_for_resume=kv_cache_config.max_util_for_resume,
             enable_stats=self.enable_stats,
-            swa_scratch_reuse=(
-                SwaScratchReuseConfig(max_rewind_len=self._max_draft_len)
-                if self.enable_swa_scratch_reuse
-                else None
-            ),
+            swa_scratch_reuse=scratch_reuse_config,
             layers=layers,
             typical_step=typical_step,
             constraints=constraints,
