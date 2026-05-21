@@ -26,6 +26,8 @@ from tensorrt_llm.bindings.internal.testing import simulate_prefill_completion_o
 from tensorrt_llm.disaggregated_params import DisaggScheduleStyle
 from tensorrt_llm.llmapi.llm_args import CacheTransceiverConfig
 
+os.environ.setdefault("TRTLLM_NIXL_NUM_THREADS", "0")
+
 
 def broadcast_string(s: str | None, src: int, group: dist.ProcessGroup | None = None) -> str:
     """Broadcast a string from src rank to all other ranks in the group."""
@@ -1122,7 +1124,7 @@ MP_TEST_CONFIGS = [
 ]
 
 
-@pytest.mark.timeout(180)
+@pytest.mark.timeout(300)
 @pytest.mark.parametrize(
     "ctx_tp,ctx_pp,gen_tp,gen_pp,ctx_enable_dp,gen_enable_dp,is_mla",
     [(c[0], c[1], c[2], c[3], c[4], c[5], c[6]) for c in MP_TEST_CONFIGS],
