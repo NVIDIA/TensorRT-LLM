@@ -61,8 +61,8 @@ def _read_tokenizer_class_from_config(
 
 
 def try_load_dynamic_slow_tokenizer(
-        model_dir: Union[str, Path],
-        **kwargs) -> Optional[PreTrainedTokenizerBase]:
+        model_dir: Union[str,
+                         Path], **kwargs) -> Optional[PreTrainedTokenizerBase]:
     """Load a slow tokenizer instance via ``get_class_from_dynamic_module``
     for classes listed in :data:`DYNAMIC_SLOW_TOKENIZER_MAP`.
 
@@ -75,8 +75,8 @@ def try_load_dynamic_slow_tokenizer(
     if dynamic_ref is None:
         return None
     try:
-        from transformers.dynamic_module_utils import (
-            get_class_from_dynamic_module)
+        from transformers.dynamic_module_utils import \
+            get_class_from_dynamic_module
         tok_cls = get_class_from_dynamic_module(dynamic_ref, str(model_dir))
         # ``trust_remote_code`` is not accepted by ``from_pretrained`` on
         # every slow tokenizer base; pop it so we don't pass an unknown kwarg.
@@ -87,6 +87,7 @@ def try_load_dynamic_slow_tokenizer(
             f"Dynamic slow-tokenizer load of '{detected_class}' from "
             f"{model_dir} failed: {e!r}. Falling back to AutoTokenizer.")
         return None
+
 
 TLLM_INCREMENTAL_DETOKENIZATION_BACKEND = os.environ.get(
     "TLLM_INCREMENTAL_DETOKENIZATION_BACKEND", "HF")
