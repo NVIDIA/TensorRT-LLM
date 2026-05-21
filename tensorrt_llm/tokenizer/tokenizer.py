@@ -34,8 +34,11 @@ DYNAMIC_SLOW_TOKENIZER_MAP = {
 
 def _read_tokenizer_class_from_config(
         model_dir: Union[str, Path]) -> Optional[str]:
-    """Read ``tokenizer_class`` from ``tokenizer_config.json`` without
-    instantiating the tokenizer. Returns ``None`` if unavailable."""
+    """Read ``tokenizer_class`` from a model's ``tokenizer_config.json``.
+
+    The lookup does not instantiate the tokenizer. Returns ``None`` if the
+    config file is unavailable or the field is missing.
+    """
     cfg_path: Optional[str] = None
     model_dir_str = str(model_dir)
     if os.path.isdir(model_dir_str):
@@ -63,12 +66,13 @@ def _read_tokenizer_class_from_config(
 def try_load_dynamic_slow_tokenizer(
         model_dir: Union[str,
                          Path], **kwargs) -> Optional[PreTrainedTokenizerBase]:
-    """Load a slow tokenizer instance via ``get_class_from_dynamic_module``
-    for classes listed in :data:`DYNAMIC_SLOW_TOKENIZER_MAP`.
+    """Load a slow tokenizer via the model repo's ``auto_map`` remote code.
 
-    Returns the loaded HF tokenizer, or ``None`` if no entry matches or the
-    dynamic load fails. Callers should fall back to ``AutoTokenizer`` on
-    ``None``.
+    Used for classes listed in :data:`DYNAMIC_SLOW_TOKENIZER_MAP` whose
+    ``AutoTokenizer.from_pretrained`` path mis-converts them to Fast under
+    transformers >= 5. Returns the loaded HF tokenizer, or ``None`` if no
+    entry matches or the dynamic load fails; callers should fall back to
+    ``AutoTokenizer`` on ``None``.
     """
     detected_class = _read_tokenizer_class_from_config(model_dir)
     dynamic_ref = DYNAMIC_SLOW_TOKENIZER_MAP.get(detected_class)
