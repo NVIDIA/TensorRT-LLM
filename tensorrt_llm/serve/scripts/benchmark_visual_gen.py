@@ -366,7 +366,7 @@ def load_prompts(args: argparse.Namespace) -> list[VisualGenSampleRequest]:
 def _resolve_num_gpus(args: argparse.Namespace) -> int:
     """Determine the number of GPUs from explicit arg or server config YAML.
 
-    Priority: --num-gpus (explicit) > --extra-visual-gen-options YAML > default 1.
+    Priority: --num-gpus (explicit) > --visual-gen-args YAML > default 1.
     """
     if args.num_gpus is not None:
         return args.num_gpus
@@ -627,7 +627,7 @@ if __name__ == "__main__":
         type=int,
         default=None,
         help="Number of GPUs used by the server. Overrides the value inferred "
-        "from --extra-visual-gen-options. Defaults to 1 if neither is given.",
+        "from --visual-gen-args. Defaults to 1 if neither is given.",
     )
 
     output_group = parser.add_argument_group("Output")

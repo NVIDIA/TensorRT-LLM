@@ -440,7 +440,7 @@ class VisualGenPerfSanityTestConfig:
             host,
             "--port",
             str(port),
-            "--extra-visual-gen-options",
+            "--visual-gen-args",
             server_config_path,
             "--save-result",
             "--result-dir",
