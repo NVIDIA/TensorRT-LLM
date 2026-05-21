@@ -31,6 +31,7 @@ are NOT duplicated.
 import os
 import socket
 from contextlib import contextmanager
+from dataclasses import dataclass
 from enum import IntEnum
 from functools import lru_cache
 from typing import List, Optional
@@ -67,6 +68,36 @@ else:
         Geglu = 6
         SwigluBias = 7
         Relu2 = 8
+
+
+# ---------------------------------------------------------------------------
+# MultimodalInput  (used by standalone multimodal input processors)
+# ---------------------------------------------------------------------------
+if TRTLLM_AVAILABLE:
+    from tensorrt_llm.inputs.multimodal import MultimodalInput
+else:
+
+    @dataclass
+    class MultimodalInput:
+        """Standalone subset of TensorRT-LLM's multimodal request metadata."""
+
+        multimodal_hashes: List[List[int]]
+        multimodal_positions: List[int]
+        multimodal_lengths: List[int]
+
+        @classmethod
+        def from_components(
+            cls,
+            mm_hashes: List[List[int]],
+            mm_positions: List[int],
+            mm_lengths: List[int],
+            **_: object,
+        ) -> "MultimodalInput":
+            return cls(
+                multimodal_hashes=mm_hashes,
+                multimodal_positions=mm_positions,
+                multimodal_lengths=mm_lengths,
+            )
 
 
 # ---------------------------------------------------------------------------

@@ -70,7 +70,7 @@ except ModuleNotFoundError:
     MULTIMODAL_PLACEHOLDER_REGISTRY = None
     MultimodalPlaceholderMetadata = None
 
-from ..._compat import ActivationType
+from ..._compat import ActivationType, MultimodalInput
 from ...custom_ops.semantic_mask_registry import SemanticMaskLoweringSpec, SemanticMaskRegistry
 from ..factory import ModelFactoryRegistry
 from ..hf import (
@@ -2081,7 +2081,11 @@ class Gemma4Model(Gemma4PreTrainedModel):
                 llm_input_ids,
             )
             inputs_embeds = self.get_input_embeddings()(llm_input_ids)
-            per_layer_inputs = self.language_model.get_per_layer_inputs(llm_input_ids)
+            # Exported text graphs do not carry helper methods; only configs
+            # with per-layer input embeddings need this optional side input.
+            get_per_layer_inputs = getattr(self.language_model, "get_per_layer_inputs", None)
+            if get_per_layer_inputs is not None:
+                per_layer_inputs = get_per_layer_inputs(llm_input_ids)
         else:
             image_mask = self.get_placeholder_mask(inputs_embeds=inputs_embeds)
 
@@ -2876,8 +2880,6 @@ class Gemma4ADInputProcessor:
         if "multimodal_input" not in extra:
             positions, lengths = self._find_image_spans(token_ids)
             if positions:
-                from tensorrt_llm.inputs.multimodal import MultimodalInput
-
                 # Dummy hashes — KV-cache reuse for images is not yet supported.
                 dummy_hashes = [[0] * 8 for _ in positions]
                 extra["multimodal_input"] = MultimodalInput.from_components(
