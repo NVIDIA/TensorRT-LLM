@@ -1,3 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 from collections import defaultdict
 from typing import Dict, List, Optional, Tuple
 
@@ -21,6 +36,7 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     AttentionLayerConfig,
     BatchDesc,
     BufferConfig,
+    DataRole,
     GpuCacheTierConfig,
     HostCacheTierConfig,
     KVCacheDesc,
@@ -229,6 +245,22 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
             device="cpu",
         )
 
+    def _format_kv_cache_pool_lifecycle_entry(self, layer_id: LayerId, role: DataRole) -> str:
+        layer_semantics = self._manager_layer_id_to_layer_attn.get(layer_id)
+        if layer_semantics is None:
+            return super()._format_kv_cache_pool_lifecycle_entry(layer_id, role)
+
+        model_layer_idx, attn_type = layer_semantics
+        attr = self.impl._storage.get_buffer_attr(layer_id, role)
+        pool_group_id = self.impl._storage.get_pool_group_index(attr.life_cycle_id)
+        lifecycle = self.impl._life_cycles.get_life_cycle(attr.life_cycle_id)
+        return (
+            f"deepseek_role={attn_type.name}, "
+            f"compress_ratio={self._compress_ratios[model_layer_idx]}, "
+            f"pool_group_id={int(pool_group_id)}, "
+            f"lifecycle_id={int(attr.life_cycle_id)}, lifecycle={lifecycle}"
+        )
+
     def get_buffers(self, layer_idx: int, attn_type: DeepseekV4AttentionType) -> torch.Tensor:
         """
         Get the buffers for a specific layer and attention type.
@@ -365,6 +397,7 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
         """
         layers: List[AttentionLayerConfig] = []
         layer_attn_to_layer_id: Dict[Tuple[int, DeepseekV4AttentionType], LayerId] = {}
+        manager_layer_id_to_layer_attn: Dict[LayerId, Tuple[int, DeepseekV4AttentionType]] = {}
 
         def _add_layer(
             layer_idx: int, attn_type: DeepseekV4AttentionType, sliding_window_size: int | None
@@ -373,6 +406,7 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
             layer_id = LayerId(len(layers))
             # update the mapping from layer index and attention type to layer id
             layer_attn_to_layer_id[layer_idx, attn_type] = layer_id
+            manager_layer_id_to_layer_attn[layer_id] = (layer_idx, attn_type)
             # add the layer to the layers list
             layer_config = AttentionLayerConfig(
                 layer_id=layer_id,
@@ -433,6 +467,7 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
                 )
         # the mapping from layer index and attention type to layer id
         self._layer_attn_to_layer_id = layer_attn_to_layer_id
+        self._manager_layer_id_to_layer_attn = manager_layer_id_to_layer_attn
         # number of layers in the KVCacheManagerPy
         self._num_manager_layers = len(layers)
 
@@ -476,6 +511,7 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
             vocab_size=vocab_size,
             cache_tiers=cache_tiers,
             max_util_for_resume=kv_cache_config.max_util_for_resume,
+            enable_stats=self.enable_stats,
             layers=layers,
             typical_step=typical_step,
             constraints=constraints,
