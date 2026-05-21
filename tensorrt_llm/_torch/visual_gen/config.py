@@ -526,24 +526,6 @@ class VisualGenArgs(StrictBaseModel):
     # Skip warmup inference after loading (useful for testing or fast startup)
     skip_warmup: bool = False
 
-    # Path to a pre-computed fixed latent tensor (.pt file).
-    # When set, the pipeline replaces sampled latents with this tensor at
-    # request time (lazy-loaded on first inference). Used for MLPerf
-    # deterministic generation across runs.
-    fixed_latent_path: Optional[str] = PydanticField(
-        None,
-        description=(
-            "Path to a pre-computed fixed latent tensor file (.pt). "
-            "When set, the pipeline bypasses random latent sampling and "
-            "uses this tensor for all real inference calls (warmup uses "
-            "random latents to avoid shape-mismatch when the warmup grid "
-            "differs from the latent shape). The env var "
-            "`TLLM_MLPERF_FIXED_LATENT_PATH` takes precedence over this "
-            "field so the path can be overridden per-run without editing "
-            "YAML configs."
-        ),
-    )
-
     # Sub-configs (dict input for quant_config is coerced to QuantConfig in model_validator)
     quant_config: QuantConfig = PydanticField(default_factory=QuantConfig)
     compilation: CompilationConfig = PydanticField(default_factory=CompilationConfig)
@@ -968,8 +950,6 @@ class DiffusionModelConfig(BaseModel):
                 extra_attrs["spatial_upsampler_path"] = args.spatial_upsampler_path
             if args.distilled_lora_path:
                 extra_attrs["distilled_lora_path"] = args.distilled_lora_path
-            if args.fixed_latent_path:
-                extra_attrs["fixed_latent_path"] = args.fixed_latent_path
 
         # Discover pipeline components (diffusers layout)
         components = discover_pipeline_components(checkpoint_path)

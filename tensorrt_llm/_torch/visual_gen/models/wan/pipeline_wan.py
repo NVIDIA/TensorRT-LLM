@@ -101,15 +101,9 @@ class WanPipeline(BasePipeline):
         # MLPerf-deterministic fixed latent (lazy-loaded on first real inference).
         # __init__ runs under MetaInitMode where torch.load triggers aten.set_ on
         # a meta tensor and raises MetaInitException, so we only stash the path.
-        # Env var TLLM_MLPERF_FIXED_LATENT_PATH takes precedence over the config
-        # field so the path can be overridden per-run without editing YAML.
-        env_fixed_latent_path = os.environ.get("TLLM_MLPERF_FIXED_LATENT_PATH")
-        cfg_fixed_latent_path = (
-            model_config.extra_attrs.get("fixed_latent_path")
-            if hasattr(model_config, "extra_attrs")
-            else None
-        )
-        self.fixed_latent_path: Optional[str] = env_fixed_latent_path or cfg_fixed_latent_path
+        # Path is sourced exclusively from the TLLM_MLPERF_FIXED_LATENT_PATH env
+        # var (debug/benchmark knob; not a serving-config field).
+        self.fixed_latent_path: Optional[str] = os.environ.get("TLLM_MLPERF_FIXED_LATENT_PATH")
         self.fixed_latent: Optional[torch.Tensor] = None
 
         super().__init__(model_config)
