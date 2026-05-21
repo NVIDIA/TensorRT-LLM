@@ -295,6 +295,19 @@ def extract_disagg_cluster_config(
     return cluster_config
 
 
+def allgather_hostnames() -> List[str]:
+    """Return MPI_COMM_WORLD hostnames in rank order.
+
+    Pickle-stable helper for the multi-instance multi-node disagg test path,
+    which needs to learn per-rank hostnames so the test process can build a
+    combined config with explicit ctx/gen worker URLs.
+    """
+    import socket
+
+    from tensorrt_llm._utils import mpi_allgather
+    return list(mpi_allgather(socket.gethostname()))
+
+
 def split_world_comm(
         server_configs: List[CtxGenServerConfig]) -> Tuple[bool, int, Comm]:
 
