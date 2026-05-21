@@ -66,6 +66,7 @@ def test_multimodal_embedding_lengths_exclude_special_tokens():
 
 
 def test_disagg_prefill_multimodal_inputs_builds_typed_handoff():
+    """Typed EPD handoff converts back to legacy MultimodalInput fields."""
     handoff = DisaggPrefillMultimodalInputs(
         prompt_token_ids=[10, 1001, 1002, 2000, 1003, 20],
         multimodal_lengths=[4],
@@ -91,6 +92,7 @@ def test_disagg_prefill_multimodal_inputs_builds_typed_handoff():
 
 
 def test_multimodal_input_rejects_invalid_prompt_spans():
+    """Prompt span validation rejects negative starts and zero lengths."""
     with pytest.raises(ValueError, match="multimodal_positions must be non-negative"):
         MultimodalInput.from_components([[1, 2, 3, 4]], [-1], [1])
 

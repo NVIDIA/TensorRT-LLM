@@ -158,6 +158,7 @@ class DisaggregatedParams(OpenAIBaseModel):
     schedule_style: Optional[DisaggScheduleStyle] = None
     conversation_id: Optional[str] = None
     ctx_usage: Optional[UsageInfo] = None
+    # TODO: MM E/PD needs handles+hashes here and in converters.
 
 
 class ErrorResponse(OpenAIBaseModel):

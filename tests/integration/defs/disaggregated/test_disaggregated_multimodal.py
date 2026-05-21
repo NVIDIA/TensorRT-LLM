@@ -130,6 +130,7 @@ def _make_qwen3vl_epd_config(model_path: str) -> dict[str, Any]:
     "model_relative_path", ["Qwen3/Qwen3-VL-8B-Instruct"], ids=["Qwen3-VL-8B-Instruct"]
 )
 def test_qwen3vl_epd_video_split_item_runs(model_relative_path: str, llm_venv, tmp_path):
+    """Smoke-test a Qwen3-VL split-video request through real EPD serving."""
     models_root = llm_models_root()
     model_path = _find_model_path(models_root, model_relative_path)
     video_path = _find_split_video_path(models_root)

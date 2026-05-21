@@ -39,6 +39,7 @@ from tensorrt_llm.bindings.executor import FinishReason
     ],
 )
 def test_multimodal_embedding_lengths_returns_top_level_metadata(req, expected):
+    """Getter reads top-level lengths and ignores layout metadata."""
     assert get_multimodal_embedding_lengths(req) == expected
 
 
@@ -98,6 +99,7 @@ def test_multimodal_embedding_lengths_returns_top_level_metadata(req, expected):
     ],
 )
 def test_multimodal_embedding_lengths_rejects_invalid_metadata(req, exception, match):
+    """Bad length metadata is rejected by the getter."""
     with pytest.raises(exception, match=match):
         get_multimodal_embedding_lengths(req)
 
@@ -122,6 +124,7 @@ class _FakeRequest:
 
 
 def test_mm_encoder_sampler_aligns_mixed_batch_by_request_index():
+    """Sparse MM encoder outputs attach to the original request index."""
     text_request = _FakeRequest()
     mm_request = _FakeRequest(multimodal_lengths=[4])
     sampler = EarlyStopWithMMResult()
@@ -158,6 +161,7 @@ class _FakeScheduledRequests:
 
 
 def test_mm_encoder_sampler_builds_typed_result_from_model_outputs():
+    """Sampler converts raw model-output dicts into typed MM results."""
     sampler = EarlyStopWithMMResult()
     state = sampler.sample_async(
         _FakeScheduledRequests(2),
@@ -176,6 +180,7 @@ def test_mm_encoder_sampler_builds_typed_result_from_model_outputs():
 
 
 def test_mm_encoder_sampler_rejects_typed_result_batch_mismatch():
+    """MM embedding arrays must stay length-aligned with request indices."""
     sampler = EarlyStopWithMMResult()
 
     with pytest.raises(ValueError, match="batch size"):
@@ -191,6 +196,7 @@ def test_mm_encoder_sampler_rejects_typed_result_batch_mismatch():
 
 
 def test_mm_encoder_sampler_rejects_invalid_request_index():
+    """MM encoder output cannot target a request outside the scheduled batch."""
     sampler = EarlyStopWithMMResult()
 
     with pytest.raises(ValueError, match="invalid request index"):
@@ -206,6 +212,7 @@ def test_mm_encoder_sampler_rejects_invalid_request_index():
 
 
 def test_multimodal_result_rejects_embedding_shape_mismatch():
+    """Per-item lengths must sum to the attached embedding rows."""
     with pytest.raises(ValueError, match="shape mismatch"):
         MultimodalResult(
             mm_embeddings=[torch.ones(4, 2)],

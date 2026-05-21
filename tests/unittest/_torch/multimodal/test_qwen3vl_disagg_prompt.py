@@ -23,6 +23,7 @@ class _FakeTokenizer:
 
 
 def test_qwen3vl_disagg_video_prompt_expands_video_placeholder():
+    """Video placeholder expands to one token per encoder embedding."""
     vision_start_token_id = 151652
     vision_end_token_id = 151653
     image_token_id = 151655
@@ -66,6 +67,7 @@ def test_qwen3vl_disagg_video_prompt_expands_video_placeholder():
 
 
 def test_qwen3vl_disagg_mixed_prompt_layout_preserves_item_order():
+    """Image and video handoff metadata follows prompt order."""
     vision_start_token_id = 151652
     vision_end_token_id = 151653
     image_token_id = 151655
@@ -115,6 +117,7 @@ def test_qwen3vl_disagg_mixed_prompt_layout_preserves_item_order():
 
 
 def test_qwen3vl_disagg_prompt_layout_requires_handle_per_placeholder():
+    """Each prompt placeholder must have a matching MM handle."""
     with pytest.raises(ValueError, match="placeholders=1, mm_handles=0"):
         _expand_prompt_token_ids_for_mm_handoff(
             torch.tensor([1, 2, 3]),
