@@ -2072,8 +2072,8 @@ class TestNemotron3Super120B(LlmapiAccuracyTestHarness):
 
     @pytest.mark.skip_less_device(8)
     def test_nixl_backend(self):
-        ctx_cfg, gen_cfg, disagg_cfg = self._make_configs("NIXL",
-                                                          use_py_runtime=True)
+        ctx_cfg, gen_cfg, disagg_cfg = self._make_configs(
+            "NIXL", use_python_runtime=True)
         with launch_disaggregated_llm(disagg_cfg, ctx_cfg, gen_cfg,
                                       self.MODEL_PATH) as llm:
             run_accuracy_test(llm, self.MODEL_NAME, ["GSM8K"])
