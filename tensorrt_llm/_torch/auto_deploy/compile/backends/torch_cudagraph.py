@@ -174,6 +174,12 @@ class CapturedGraph(nn.Module):
         self._in_spec = None
         self._out_spec = None
 
+        # When True, forward() short-circuits to eager (self.model). Toggled by
+        # ad_executor.maybe_pad_for_cuda_graph under attention-DP mixed mode so
+        # all ranks run eager and read kwargs (e.g. batch_info_host slot 13)
+        # consistently instead of using stale capture-time scalar kernel args.
+        self._bypass_captured_graphs: bool = False
+
     def _get_hash(self, flat_args: List[Any]) -> Tuple[int, ...]:
         return tuple(hash(a) for a in flat_args)
 
@@ -350,6 +356,10 @@ class CapturedGraph(nn.Module):
 
     def forward(self, *args, **kwargs) -> Any:
         """Run the compiled graph."""
+        # Bypass replay (attn-DP mixed-mode); see _bypass_captured_graphs docstring.
+        if self._bypass_captured_graphs:
+            return self.model(*args, **kwargs)
+
         args, kwargs = self._normalize_args_kwargs(args, kwargs)
         assert self.num_batched_inputs is not None, "Graphs must be captured before replay."
 
@@ -447,6 +457,10 @@ class PiecewiseCapturedGraph(nn.Module):
         # Output tree spec for reconstructing structured outputs (e.g.
         # ModelOutput) from flat tuples returned by split_gm.
         self._out_spec = out_spec
+
+        # When True, forward() short-circuits to eager (self.original_model).
+        # See CapturedGraph._bypass_captured_graphs for rationale.
+        self._bypass_captured_graphs: bool = False
 
     def prepare(self) -> None:
         """Split the model, wrap static segments in runners, wrap Group 3 dynamic ops."""
@@ -814,6 +828,9 @@ class PiecewiseCapturedGraph(nn.Module):
         **kwargs,
     ) -> Any:
         """Forward pass: static segments replay graphs, dynamic segments run eagerly."""
+        # Bypass replay (attn-DP mixed-mode); see _bypass_captured_graphs docstring.
+        if self._bypass_captured_graphs:
+            return self.original_model(*args, **kwargs)
         if self.split_gm is not None:
             self._copy_to_static_buffers(kwargs)
             ADPiecewiseRunner.set_current_num_tokens(num_tokens)
@@ -866,6 +883,10 @@ class DualModeCapturedGraph(nn.Module):
 
         # Sorted list of pre-captured bucket sizes for nearest-bucket lookup
         self._captured_num_tokens_sorted: List[int] = sorted(piecewise.piecewise_num_tokens)
+
+        # When True, forward() short-circuits to eager (the original FX model
+        # behind the piecewise wrapper). See CapturedGraph._bypass_captured_graphs.
+        self._bypass_captured_graphs: bool = False
 
     def __getattr__(self, name: str):
         """Proxy attribute lookups to the underlying model.
@@ -962,6 +983,10 @@ class DualModeCapturedGraph(nn.Module):
 
     def forward(self, *args, **kwargs) -> Any:
         # NOTE: AD calls model(**named_args) so everything is in kwargs, args is empty
+        # Bypass replay (attn-DP mixed-mode); see _bypass_captured_graphs docstring.
+        if self._bypass_captured_graphs:
+            ADPiecewiseRunner.set_current_num_tokens(None)
+            return self.piecewise.original_model(*args, **kwargs)
         if self._is_decode_only(**kwargs):
             ADPiecewiseRunner.set_current_num_tokens(None)
             return self.monolithic(*args, **kwargs)
