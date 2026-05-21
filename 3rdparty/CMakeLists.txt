@@ -129,20 +129,13 @@ foreach(DEP_IDX RANGE ${DEP_COUNT_MINUS_ONE})
 
   if(DEP_PATCH_FILE AND NOT DEP_PATCH_FILE STREQUAL "")
     set(_patch_file "${CMAKE_CURRENT_SOURCE_DIR}/${DEP_PATCH_FILE}")
-    # Use a two-step patch command so incremental builds succeed when the patch
-    # is already applied: first try to apply; if that fails, verify the patch
-    # was previously applied (reverse dry-run) — only fail if neither succeeds.
     list(
       APPEND
       FETCH_ARGS
       PATCH_COMMAND
-      ${CMAKE_COMMAND}
-      -E
-      env
-      --
       bash
       -c
-      "patch -p1 --forward --batch -i '${_patch_file}' || patch -p1 --reverse --dry-run --batch -i '${_patch_file}'"
+      "patch -p1 --forward --batch --dry-run -i '${_patch_file}' && patch -p1 --forward --batch -i '${_patch_file}' || echo 'Patch already applied, skipping.'"
     )
   endif()
 

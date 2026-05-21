@@ -436,8 +436,8 @@ class ModelLoader:
                     raise ValueError(
                         "Pre-quantized checkpoint must have quant_algo.")
             else:
-                self._apply_modelopt_quant_config(
-                    normalized, explicit_kv_cache_quant_algo)
+                self._apply_modelopt_quant_config(normalized,
+                                                  explicit_kv_cache_quant_algo)
                 return True
 
         hf_config_path = f"{self._model_dir}/config.json"

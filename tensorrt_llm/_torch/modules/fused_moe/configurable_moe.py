@@ -559,7 +559,7 @@ class ConfigurableMoE(MoE):
 
         DP-padding handling and chunking live in the scheduler.
         """
-        del kwargs
+        input_ids = kwargs.get("input_ids")
 
         if isinstance(x, Fp4QuantizedTensor):
             assert output_dtype is not None
@@ -580,6 +580,7 @@ class ConfigurableMoE(MoE):
             output_dtype=output_dtype,
             all_rank_num_tokens=all_rank_num_tokens,
             use_dp_padding=use_dp_padding,
+            input_ids=input_ids,
             lora_params=lora_params,
         )
 

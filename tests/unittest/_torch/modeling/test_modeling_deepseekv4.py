@@ -41,7 +41,11 @@ from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, SamplingConfi
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm._torch.utils import AuxStreamType, model_extra_attrs
 from tensorrt_llm.functional import PositionEmbeddingType, RotaryScalingType
-from tensorrt_llm.llmapi.llm_args import DeepSeekV4SparseAttentionConfig, KvCacheConfig
+from tensorrt_llm.llmapi.llm_args import (
+    DeepSeekV4SparseAttentionConfig,
+    KvCacheConfig,
+    MTPDecodingConfig,
+)
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
@@ -405,6 +409,13 @@ def test_deepseek_v4_attention_forward_injects_attn_sink(monkeypatch):
     assert DeepseekV4TrtllmAttention.forward(attn, "q") == "ok"
     assert captured["attention_sinks"].data_ptr() == sink.data_ptr()
 
+    captured.clear()
+    forward_args = AttentionForwardArgs()
+    assert DeepseekV4TrtllmAttention.forward(attn, "q", forward_args=forward_args) == "ok"
+    assert "attention_sinks" not in captured
+    assert captured["forward_args"].attention_sinks.data_ptr() == sink.data_ptr()
+    assert forward_args.attention_sinks is None
+
 
 def test_deepseek_v4_moe_auto_backend_on_blackwell(monkeypatch):
     monkeypatch.setattr("tensorrt_llm._torch.model_config.get_sm_version", lambda: 100)
@@ -683,7 +694,7 @@ def test_deepseek_v4_sparse_ratios_resolve_mtp_layers_from_checkpoint(tmp_path, 
 
 def test_deepseek_v4_sanity():
     config_dict = deepcopy(DEEPSEEK_V4_TINY_CONFIG)
-    config = PretrainedConfig(**config_dict)
+    config = DeepseekV4Config(**config_dict)
     config.dtype = torch.bfloat16
     config.mapping = Mapping(world_size=1, tp_size=1, rank=0)
     config.tie_word_embeddings = False

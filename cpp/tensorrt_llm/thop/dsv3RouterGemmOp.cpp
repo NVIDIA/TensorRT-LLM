@@ -86,9 +86,9 @@ th::Tensor dsv3_router_gemm_op(th::Tensor const& mat_a, th::Tensor const& mat_b,
     TORCH_CHECK(mat_a.strides()[1] == 1 && out.strides()[1] == 1); // Row-major
     TORCH_CHECK(mat_b.strides()[0] == 1);                          // Column-major
     auto stream = at::cuda::getCurrentCUDAStream(mat_a.get_device());
-    bool const shape_ok = (num_tokens >= 1 && num_tokens <= 16 && num_experts == kNumExperts
-        && mat_b.sizes()[0] == hidden_dim && data_type == torch::kBFloat16 && out_dtype_ == torch::kFloat32
-        && !bias.has_value());
+    bool const shape_ok
+        = (num_tokens >= 1 && num_tokens <= 16 && num_experts == kNumExperts && mat_b.sizes()[0] == hidden_dim
+            && data_type == torch::kBFloat16 && out_dtype_ == torch::kFloat32 && !bias.has_value());
 
     if (shape_ok && hidden_dim == kHiddenDim7168)
     {

@@ -780,6 +780,8 @@ class AttentionForwardArgs:
     mla_bmm2_scale: Optional[torch.Tensor] = None
     quant_q_buffer: Optional[torch.Tensor] = None
 
+    is_generation: Optional[bool] = None
+
     sage_attn_num_elts_per_blk_q: int = 0
     sage_attn_num_elts_per_blk_k: int = 0
     sage_attn_num_elts_per_blk_v: int = 0

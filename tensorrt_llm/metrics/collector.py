@@ -807,6 +807,10 @@ class MetricsCollector:
         if kv_iter or kv_iter_by_lifecycle or kv_iter_by_pool_group:
             reuse_stats = kv_iter_by_lifecycle or kv_iter or {}
             pool_group_stats = kv_iter_by_pool_group or kv_iter or {}
+
+            def stat_value(stats, key):
+                return stats.get(key) or 0
+
             total_secondary_max = 0
             total_secondary_used = 0
             total_reused = 0
@@ -819,19 +823,22 @@ class MetricsCollector:
             total_intra_device_copy_bytes = 0
 
             for stats in reuse_stats.values():
-                total_reused += stats.get("iterReusedBlocks", 0)
-                total_full_reused += stats.get("iterFullReusedBlocks", 0)
-                total_partial_reused += stats.get("iterPartialReusedBlocks", 0)
-                total_missed += stats.get("iterMissedBlocks", 0)
+                total_reused += stat_value(stats, "iterReusedBlocks")
+                total_full_reused += stat_value(stats, "iterFullReusedBlocks")
+                total_partial_reused += stat_value(stats,
+                                                   "iterPartialReusedBlocks")
+                total_missed += stat_value(stats, "iterMissedBlocks")
 
             for stats in pool_group_stats.values():
-                total_secondary_max += stats.get("secondaryMaxNumBlocks", 0)
-                total_secondary_used += stats.get("secondaryUsedNumBlocks", 0)
-                total_gen_alloc += stats.get("iterGenAllocBlocks", 0)
-                total_onboard_bytes += stats.get("iterOnboardBytes", 0)
-                total_offload_bytes += stats.get("iterOffloadBytes", 0)
-                total_intra_device_copy_bytes += stats.get(
-                    "iterIntraDeviceCopyBytes", 0)
+                total_secondary_max += stat_value(stats,
+                                                  "secondaryMaxNumBlocks")
+                total_secondary_used += stat_value(stats,
+                                                   "secondaryUsedNumBlocks")
+                total_gen_alloc += stat_value(stats, "iterGenAllocBlocks")
+                total_onboard_bytes += stat_value(stats, "iterOnboardBytes")
+                total_offload_bytes += stat_value(stats, "iterOffloadBytes")
+                total_intra_device_copy_bytes += stat_value(
+                    stats, "iterIntraDeviceCopyBytes")
 
             # Gauges
             if total_secondary_max > 0:

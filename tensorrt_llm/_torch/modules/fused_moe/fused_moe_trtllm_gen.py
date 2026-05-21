@@ -28,7 +28,8 @@ from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.logger import logger
 from tensorrt_llm.models.modeling_utils import QuantAlgo
 
-from ...custom_ops.trtllm_gen_custom_ops import fp4_block_scale_fake_output_without_finalize
+from ...custom_ops.trtllm_gen_custom_ops import \
+    fp4_block_scale_fake_output_without_finalize
 from ...distributed import allgather
 from ...expert_statistic import ExpertStatistic
 from ...model_config import ModelConfig
@@ -43,13 +44,9 @@ from .quantization import (
     W4A8MXFP4FP8TRTLLMGenFusedMoEMethod, W4A8MXFP4MXFP8TRTLLMGenFusedMoEMethod,
     W4A8NVFP4FP8TRTLLMGenFusedMoEMethod, W4A16MXFP4TRTLLMGenFusedMoEMethod)
 # isort: on
-from .routing import (
-    BaseMoeRoutingMethod,
-    DeepSeekV3MoeRoutingMethod,
-    DeepSeekV4MoeRoutingMethod,
-    DefaultMoeRoutingMethod,
-    MiniMaxM2MoeRoutingMethod,
-)
+from .routing import (BaseMoeRoutingMethod, DeepSeekV3MoeRoutingMethod,
+                      DeepSeekV4MoeRoutingMethod, DefaultMoeRoutingMethod,
+                      MiniMaxM2MoeRoutingMethod)
 
 
 @dataclass
@@ -103,19 +100,15 @@ class TRTLLMGenFusedMoE(MoE):
         QuantAlgo.W4A8_MXFP4_MXFP8,
     }
 
-    # Quantization algorithms that support swiglu_gptoss_style
-    # FP8_BLOCK_SCALES is included for swiglu_limit only via the
-    # DeepSeek FP8 separate-activation path
-    # (DevKernel.cu::activationDeepSeekKernel reads gemm1_clamp_limit
-    # when MoERunnerArgs supplies it). bias and swiglu_alpha/beta still
-    # require GEMM-fused activation cubins, which are NVFP4/MXFP4 only
-    # — _check_configs gates those separately.
+    # Quantization algorithms that support full swiglu_gptoss_style.
+    # FP8_BLOCK_SCALES supports the DSV4-style uniform swiglu_limit_scalar
+    # through the DeepSeek FP8 separate-activation path, but not bias or
+    # swiglu_alpha/beta.
     _GPTOSS_SUPPORTED_ALGOS = {
         QuantAlgo.NVFP4,
         QuantAlgo.W4A16_MXFP4,
         QuantAlgo.W4A8_MXFP4_FP8,
         QuantAlgo.W4A8_MXFP4_MXFP8,
-        QuantAlgo.FP8_BLOCK_SCALES,
     }
 
     # Activations supported by the FlashInfer BF16 kernels: Swiglu and Relu2.

@@ -533,6 +533,10 @@ class ADEngine(ModelEngine):
             PyTorchModelEngine._execute_logit_post_processors, self
         )
 
+    def wait_for_input_copy(self) -> None:
+        """Keep PyExecutor overlap scheduling compatible with ADEngine."""
+        return
+
     def _release_cuda_graphs(self) -> None:
         def _reset_cuda_graph(graph: object) -> None:
             if isinstance(graph, torch.cuda.CUDAGraph):

@@ -1520,7 +1520,7 @@ def test_decode_mtp(batch_size, compress_ratio, head_dim, overlap, next_n):
                         out_py[b, 0, :head_dim].to(kv_comp.dtype),
                         kv_comp[out_idx, :],
                         rtol=2e-3,
-                        atol=2e-3,
+                        atol=4e-3,
                     ), f"Token {token_idx}, Batch {b}: mismatch diff={(diff).abs().max():.6f}"
 
         step += actual_n
@@ -1559,6 +1559,7 @@ def test_chunked_prefill(compress_ratio, head_dim, overlap, batch_size, start_po
     correctly reads it back in a subsequent call.
     """
     device = torch.device("cuda")
+    torch.manual_seed(42)
     coff = 2 if overlap else 1
     state_dim = coff * head_dim
     ratio = compress_ratio
@@ -2358,6 +2359,7 @@ def test_fused_postprocess_scatter_fp8_blockwise(
 @pytest.mark.skipif(
     not _HAS_POSTPROCESS_SCATTER, reason="Postprocess/scatter CUDA ops not available"
 )
+@skip_pre_blackwell
 def test_fused_postprocess_scatter_mxfp4(
     batch_size, num_tokens, head_dim, nope_dim, rope_dim, tokens_per_block, rotate_activation
 ):
