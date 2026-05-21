@@ -1468,6 +1468,13 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                                 and not forward_args.update_kv_cache
                                 and k is None and v is None)
         assert has_fused_qkv or has_unfused_kv or uses_cached_cross_kv
+        # `quant_scale_qkv` only makes sense paired with `quant_q_buffer`: the
+        # C++ op interprets the buffer as the destination of a pre-quantized
+        # FP8 Q for the DSv4 fused norm+RoPE path. `quant_q_buffer` alone is
+        # still valid for the regular FP8-KV-cache path.
+        assert (forward_args.quant_scale_qkv is None
+                or forward_args.quant_q_buffer is not None), (
+                    "quant_scale_qkv requires quant_q_buffer to be set")
         if forward_args.cu_q_seqlens is None:
             forward_args.cu_q_seqlens = metadata.cu_q_seqlens
         if forward_args.cu_kv_seqlens is None:

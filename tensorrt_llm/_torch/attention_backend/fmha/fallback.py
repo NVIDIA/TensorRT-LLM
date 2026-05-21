@@ -137,6 +137,7 @@ class FallbackFmha(Fmha):
             mla_bmm1_scale=forward_args.mla_bmm1_scale,
             mla_bmm2_scale=forward_args.mla_bmm2_scale,
             quant_q_buffer=forward_args.quant_q_buffer,
+            quant_scale_qkv=forward_args.quant_scale_qkv,
             sage_attn_num_elts_per_blk_q=forward_args.sage_attn_num_elts_per_blk_q,
             sage_attn_num_elts_per_blk_k=forward_args.sage_attn_num_elts_per_blk_k,
             sage_attn_num_elts_per_blk_v=forward_args.sage_attn_num_elts_per_blk_v,

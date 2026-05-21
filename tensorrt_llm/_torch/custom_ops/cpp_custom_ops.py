@@ -140,6 +140,13 @@ def _register_fake():
     def _(q: torch.Tensor, num_heads: int, head_dim: int, eps: float):
         return torch.empty_like(q)
 
+    @torch.library.register_fake("trtllm::deepseek_v4_q_norm_fused_fp8")
+    def _(q: torch.Tensor, quant_q_out: torch.Tensor, q_pe_out: torch.Tensor,
+          num_heads: int, head_dim: int, nope_dim: int, eps: float,
+          quant_scale_qkv: Optional[torch.Tensor]):
+        # In-place op: writes to quant_q_out and q_pe_out, returns nothing.
+        return None
+
     @torch.library.register_fake("trtllm::allgather")
     def allgather(input, sizes, group):
         if sizes is None:
