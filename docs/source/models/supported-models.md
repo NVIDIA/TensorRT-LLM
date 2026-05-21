@@ -27,6 +27,7 @@ The following is a table of supported models for the PyTorch backend:
 | `HunYuanMoEForCausalLM` [^5]         | Hunyuan MoE                        | `tencent/Hunyuan-A13B-Instruct`              |
 | `InternLM3ForCausalLM` [^5]          | InternLM3                          | `internlm/internlm3-8b-instruct`             |
 | `KimiK25ForConditionalGeneration`    | Kimi-K2.5                          | `moonshotai/Kimi-K2.5`                       |
+| `LagunaForCausalLM`                  | Laguna-XS                          | `poolside/laguna-XS.2`                       |
 | `LlamaForCausalLM`                   | Llama 3.1, Llama 3, Llama 2, LLaMA | `meta-llama/Meta-Llama-3.1-70B`              |
 | `Llama4ForConditionalGeneration`     | Llama 4                            | `meta-llama/Llama-4-Scout-17B-16E-Instruct`  |
 | `MiniMaxM2ForCausalLM` [^5]          | MiniMax M2/M2.1/M2.7              | `MiniMaxAI/MiniMax-M2.7`                    |

@@ -21,6 +21,7 @@ from .modeling_hunyuan_dense import HunYuanDenseV1ForCausalLM
 from .modeling_hunyuan_moe import HunYuanMoEV1ForCausalLM
 from .modeling_hyperclovax import HCXVisionForCausalLM
 from .modeling_kimi_k25 import KimiK25ForConditionalGeneration
+from .modeling_laguna import LagunaForCausalLM
 from .modeling_llama import LlamaForCausalLM
 from .modeling_llava_next import LlavaNextModel
 from .modeling_minimaxm2 import MiniMaxM2ForCausalLM
@@ -61,6 +62,7 @@ __all__ = [
     "Gemma3ForCausalLM",
     "Gemma3VLM",
     "HCXVisionForCausalLM",
+    "LagunaForCausalLM",
     "HunYuanDenseV1ForCausalLM",
     "HunYuanMoEV1ForCausalLM",
     "KimiK25ForConditionalGeneration",
