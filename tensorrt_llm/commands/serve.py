@@ -1326,20 +1326,25 @@ def set_cuda_device():
     torch.cuda.set_device(device_id)
 
 
-@click.command("disaggregated_mpi_worker")
-@click.option("-c",
-              "--config",
-              "--config_file",
-              "config_file",
-              type=str,
-              default=None,
-              help="Path to the disaggregated serving configuration YAML file.")
-@click.option('--log_level',
-              type=click.Choice(severity_map.keys()),
-              default='info',
-              help="The logging level.")
-def disaggregated_mpi_worker(config_file: Optional[str], log_level: str):
-    """Launching disaggregated MPI worker"""
+def disaggregated_mpi_worker_main(config_file: Optional[str],
+                                  log_level: str = "info"):
+    """Body of the ``disaggregated_mpi_worker`` CLI command.
+
+    Exposed as a plain Python function so it can also be dispatched as a task
+    to an existing MPI pool (e.g. by integration tests that need to reuse the
+    mgmn proxy set up by ``trtllm-llmapi-launch``).
+    """
+    # `_launch_disaggregated_leader` re-Popens ``python3 sys.argv[0]
+    # disaggregated_mpi_worker -c <cfg>``. The CLI entrypoint sets
+    # sys.argv[0] = /usr/local/bin/trtllm-serve, but when this function is
+    # called from a non-CLI context (e.g. dispatched into an MPI worker via
+    # MPIPoolExecutor) sys.argv[0] points at the worker bootstrap script.
+    # Repoint it at the real trtllm-serve console script so the child Popen
+    # succeeds in both cases.
+    import shutil as _shutil
+    _bin = _shutil.which("trtllm-serve")
+    if _bin and sys.argv and sys.argv[0] != _bin:
+        sys.argv[0] = _bin
 
     from tensorrt_llm._utils import mpi_rank
     if os.environ.get(DisaggLauncherEnvs.
@@ -1397,6 +1402,23 @@ def disaggregated_mpi_worker(config_file: Optional[str], log_level: str):
             if not is_leader and executor is not None:
                 raise RuntimeError(
                     f"rank{global_mpi_rank()} should not have executor")
+
+
+@click.command("disaggregated_mpi_worker")
+@click.option("-c",
+              "--config",
+              "--config_file",
+              "config_file",
+              type=str,
+              default=None,
+              help="Path to the disaggregated serving configuration YAML file.")
+@click.option('--log_level',
+              type=click.Choice(severity_map.keys()),
+              default='info',
+              help="The logging level.")
+def disaggregated_mpi_worker(config_file: Optional[str], log_level: str):
+    """Launching disaggregated MPI worker"""
+    disaggregated_mpi_worker_main(config_file, log_level)
 
 
 class DisaggLauncherEnvs(StrEnum):

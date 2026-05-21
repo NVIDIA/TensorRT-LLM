@@ -38,6 +38,8 @@ from defs.trt_test_alternative import check_call, check_output, print_info
 from disagg_test_utils import (ProcessWrapper, run_ctx_worker,
                                run_disagg_server, run_gen_worker, terminate,
                                wait_for_disagg_server_ready)
+from multi_instance_disagg_helper import (setup_multi_instance_disagg_cluster,
+                                          should_use_multi_instance_path)
 from test_common.perf_metrics_utils import (get_timing_metrics,
                                             validate_timing_metrics)
 
@@ -625,6 +627,17 @@ def setup_disagg_cluster(
     """
     with open(config_file, 'r') as f:
         config = yaml.safe_load(f)
+
+    # Multi-instance multi-node disagg requires partitioning the MPI pool via
+    # split_world_comm; see multi_instance_disagg_helper for details.
+    if should_use_multi_instance_path(config):
+        return setup_multi_instance_disagg_cluster(
+            config_file=config_file,
+            model_name=model_name,
+            env=env,
+            cwd=cwd,
+            server_start_timeout=server_start_timeout,
+        )
 
     disagg_cluster = get_default_disagg_cluster_config()
     server_host = config.get("hostname", "localhost")
