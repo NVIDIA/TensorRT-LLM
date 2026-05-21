@@ -50,6 +50,12 @@ LayerGroupId: TypeAlias = LifeCycleId
 CacheLevel = NewType("CacheLevel", int)
 TokenId = NewType("TokenId", int)
 TokenIdExt = Union[TokenId, bytes]
+
+class ReuseScope(NamedTuple):
+    lora_id: int | None = None
+    salt: int | None = None
+    def to_bytes(self) -> bytes: ...
+
 LayerId = NewType("LayerId", int)
 CudaStream = NewType("CudaStream", int)
 BeamIndex = NewType("BeamIndex", int)
@@ -277,7 +283,7 @@ class _KVCache:
     def __init__(
         self,
         manager: "KVCacheManager",
-        lora_task_id: int | None,
+        reuse_scope: ReuseScope,
         input_tokens: Sequence[TokenIdExt] | None,
         id: Any,
         custom_priority_callback: Callable[[int, Any], Priority],
@@ -418,11 +424,10 @@ class KVCacheManager:
     ) -> PageIndexConverter: ...
     def create_kv_cache(
         self,
-        lora_task_id: int | None = None,
+        reuse_scope: ReuseScope | None = None,
         input_tokens: Sequence[TokenIdExt] | None = None,
         id: Any = None,
         custom_priority_callback: Callable[[int, Any], Priority] = ...,
-        cache_salt_id: int | None = None,
     ) -> _KVCache: ...
     def resize(self, cache_level: CacheLevel, quota: int, best_efforts: bool = False) -> bool: ...
     def get_quota(self, cache_level: CacheLevel) -> int: ...
