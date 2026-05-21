@@ -90,6 +90,12 @@ WAN22_LPIPS_PARALLEL_VARIANTS = [
     ("ulysses2_ring2", {"dit_ulysses_size": 2, "dit_ring_size": 2}),
     ("attn2d_2x1_ulysses2", {"dit_attn2d_row_size": 2, "dit_ulysses_size": 2}),
     ("attn2d_2x2", {"dit_attn2d_row_size": 2, "dit_attn2d_col_size": 2}),
+    ("cfg2_ulysses4", {"dit_cfg_size": 2, "dit_ulysses_size": 4}),
+    ("cfg2_ulysses2_ring2", {"dit_cfg_size": 2, "dit_ulysses_size": 2, "dit_ring_size": 2}),
+    (
+        "attn2d_2x2_ulysses2",
+        {"dit_attn2d_row_size": 2, "dit_attn2d_col_size": 2, "dit_ulysses_size": 2},
+    ),
 ]
 
 # LTX-2 configuration
