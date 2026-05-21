@@ -183,9 +183,9 @@ __global__ void fp8_quantize_1x128_packed_kernel_impl(__nv_fp8_e4m3* __restrict_
     }
 
     // Always write the packed scale — `packed` is 0 for padded rows. The grid
-    // covers m_idx ∈ [0, m_blocks * WarpsPerBlock), i.e. exactly the physical
-    // [0, m_aligned) extent of packed_scale_output, so the STG is in bounds.
-    if (lane_id == 0)
+    // covers the full [0, scale_leading_dim_uint32) leading dim (rounded up to
+    // WarpsPerBlock), and the m_idx guard drops the few rows past the buffer end.
+    if (lane_id == 0 && m_idx < scale_leading_dim_uint32)
     {
         packed_scale_output[static_cast<int64_t>(packed_sf_k_idx) * scale_leading_dim_uint32 + m_idx] = packed;
     }
@@ -202,7 +202,10 @@ void launch_fp8_quantize_1x128_packed_bf16_e4m3(__nv_fp8_e4m3* fp8_output, int32
 {
     constexpr int kWarpsPerBlock = 4;
     int const num_packed_sf_k = (((k + 127) / 128) + 3) / 4;
-    int const m_blocks = (m + kWarpsPerBlock - 1) / kWarpsPerBlock;
+    // Cover the full TMA-padded leading dim so the entire [0, scale_leading_dim_uint32)
+    // extent of packed_scale_output is written (in-kernel zero for rows past `m`),
+    // regardless of how the caller padded the input.
+    int const m_blocks = (scale_leading_dim_uint32 + kWarpsPerBlock - 1) / kWarpsPerBlock;
     dim3 const grid(num_packed_sf_k, m_blocks, 1);
     dim3 const block(kWarpsPerBlock * 32, 1, 1);
 
