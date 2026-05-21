@@ -156,6 +156,9 @@ class GvrTopKKernel:
         top_k: int,
         next_n: int = 1,
         num_threads: int = BLOCK_SIZE,
+        enable_unroll_4: Optional[bool] = None,
+        enable_unroll_2: Optional[bool] = None,
+        use_strided_layout: bool = True,
     ):
         # cutlass.Numeric enum: cutlass.Float32 / cutlass.BFloat16 / cutlass.Float16
         self.dtype = dtype
@@ -163,6 +166,21 @@ class GvrTopKKernel:
         self.next_n = next_n
         self.num_threads = num_threads
         self.num_warps = num_threads // WARP_SIZE
+        # Vec-loop unrolling switches for block_count_ge.
+        #   * enable_unroll_4: 4-way unrolled fast path (4 LDG.E.128 in flight)
+        #   * enable_unroll_2: 2-way unrolled medium path (2 LDG.E.128 in flight)
+        #   * use_strided_layout: True → single make_ptr + (UNROLL, vec_w)
+        #       strided layout (cute emits shared base + imm offsets); False →
+        #       UNROLL separate make_ptr calls (cute emits 4 independent base
+        #       regs, matches the b459a8ff2 commit style). A/B knob to isolate
+        #       whether strided causes fp32 large-grid regressions.
+        if enable_unroll_4 is None:
+            enable_unroll_4 = True
+        if enable_unroll_2 is None:
+            enable_unroll_2 = dtype != cutlass.Float32
+        self.enable_unroll_4 = enable_unroll_4
+        self.enable_unroll_2 = enable_unroll_2
+        self.use_strided_layout = use_strided_layout
 
         # Map cutlass dtype → GvrParams lookup name
         if dtype == cutlass.Float32:
@@ -383,48 +401,127 @@ class GvrTopKKernel:
         # 4-way unrolled fast path: issue 4 independent LDG.E.128 per round
         # to engage LSU pipelining. Mirrors nvcc/ptxas auto-partial-unroll
         # on the CUDA side (LDG.E.128.CONSTANT R8/R12/R16/R20 with
-        # +0x2000/+0x4000/+0x6000 strides). Separate fragments are needed
-        # so cute schedules the 4 LDGs concurrently rather than serializing
-        # on a single destination register set.
+        # +0x2000/+0x4000/+0x6000 strides).
+        #
+        # Strided-layout trick: instead of 4 separate cute.make_ptr calls
+        # (which produce 4 independent base registers in SASS), use a
+        # single base ptr + (UNROLL, vec_w) layout with stride=(step, 1).
+        # cute can then emit 4 LDG.E.128 sharing one base register with
+        # constexpr immediate offsets — matching the CUDA SASS pattern.
         UNROLL = 4
+        UNROLL_MID = 2
+        # Unrolling switches (read from self, set in __init__). Both gates
+        # are Python-level (NOT cutlass.const_expr) so when disabled the
+        # entire code block is invisible to cute's IR — no reg pressure or
+        # SASS bloat. See __init__ docstring for default policy.
+
         step_elem = cutlass.const_expr(num_threads * vec_w)
-        frag0 = cute.make_fragment((vec_w,), self.dtype)
-        frag1 = cute.make_fragment((vec_w,), self.dtype)
-        frag2 = cute.make_fragment((vec_w,), self.dtype)
-        frag3 = cute.make_fragment((vec_w,), self.dtype)
-        frags = (frag0, frag1, frag2, frag3)
 
         row_addr = input_row.iterator.toint()
         n_aligned = (N // cutlass.Int32(vec_w)) * cutlass.Int32(vec_w)
         i = tidx * cutlass.Int32(vec_w)
         step = cutlass.Int32(step_elem)
-        # Entry guard: last element of the last unrolled iter must fit.
-        fast_last_offset = cutlass.const_expr((UNROLL - 1) * step_elem + (vec_w - 1))
 
-        # Fast path: 4 LDG.E.128 in flight per round.
-        while i + cutlass.Int32(fast_last_offset) < N:
-            for u in cutlass.range_constexpr(UNROLL):
-                u_offset = cutlass.const_expr(u * step_elem)
-                src_ptr = cute.make_ptr(
+        # Fast path: 4-way unroll for LSU-pipelining ILP.
+        # Two layout choices controlled by self.use_strided_layout:
+        #   * True  (strided): single make_ptr + (UNROLL, vec_w) layout with
+        #     stride=(step, 1) → cute emits 4 LDG.E.128 sharing base reg with
+        #     +0x2000/+0x4000/+0x6000 imm offsets (CUDA __ldg pattern).
+        #   * False (separate-ptrs): 4 independent make_ptr calls + 4 frags →
+        #     cute emits 4 LDG.E.128 with 4 independent base regs (matches
+        #     the b459a8ff2 commit's behavior). A/B knob for fp32 large-grid.
+        if self.enable_unroll_4:
+            # Entry guard: last element of the last unrolled iter must fit.
+            fast_last_offset = cutlass.const_expr((UNROLL - 1) * step_elem + (vec_w - 1))
+            if self.use_strided_layout:
+                big_layout = cute.make_layout((UNROLL, vec_w), stride=(step_elem, 1))
+                big_frag = cute.make_fragment(big_layout, self.dtype)
+                while i + cutlass.Int32(fast_last_offset) < N:
+                    big_src_ptr = cute.make_ptr(
+                        self.dtype,
+                        row_addr + cutlass.Int64(i) * cutlass.Int64(elem_bytes),
+                        cute.AddressSpace.gmem,
+                        assumed_align=16,
+                    )
+                    big_src = cute.make_tensor(big_src_ptr, big_layout)
+                    for u in cutlass.range_constexpr(UNROLL):
+                        src_u = big_src[u, None]
+                        frag_u = big_frag[u, None]
+                        cute.copy(copy_atom, src_u, frag_u)
+                    for u in cutlass.range_constexpr(UNROLL):
+                        for j in cutlass.range_constexpr(vec_w):
+                            if cutlass.const_expr(self.dtype == cutlass.Float32):
+                                vj = big_frag[u, j]
+                            else:
+                                vj = cutlass.Float32(big_frag[u, j])
+                            if vj >= threshold:
+                                c = c + cutlass.Int32(1)
+                    i = i + cutlass.Int32(UNROLL * step_elem)
+            else:
+                # Separate-ptrs path: matches the b459a8ff2 commit's writing.
+                frag_a = cute.make_fragment((vec_w,), self.dtype)
+                frag_b = cute.make_fragment((vec_w,), self.dtype)
+                frag_c = cute.make_fragment((vec_w,), self.dtype)
+                frag_d = cute.make_fragment((vec_w,), self.dtype)
+                frags_sep = (frag_a, frag_b, frag_c, frag_d)
+                while i + cutlass.Int32(fast_last_offset) < N:
+                    for u in cutlass.range_constexpr(UNROLL):
+                        u_off = cutlass.const_expr(u * step_elem)
+                        src_ptr_u = cute.make_ptr(
+                            self.dtype,
+                            row_addr
+                            + cutlass.Int64(i + cutlass.Int32(u_off)) * cutlass.Int64(elem_bytes),
+                            cute.AddressSpace.gmem,
+                            assumed_align=16,
+                        )
+                        src_u = cute.make_tensor(src_ptr_u, cute.make_layout((vec_w,)))
+                        cute.copy(copy_atom, src_u, frags_sep[u])
+                    for u in cutlass.range_constexpr(UNROLL):
+                        for j in cutlass.range_constexpr(vec_w):
+                            if cutlass.const_expr(self.dtype == cutlass.Float32):
+                                vj = frags_sep[u][j]
+                            else:
+                                vj = cutlass.Float32(frags_sep[u][j])
+                            if vj >= threshold:
+                                c = c + cutlass.Int32(1)
+                    i = i + cutlass.Int32(UNROLL * step_elem)
+
+        # Medium path: 2-way unroll for the case where fast-path remainder is
+        # in [2*step, 4*step). Runs at most once (after this iter, remainder
+        # is < 2*step). Same strided-layout trick as fast path → 2 LDG.E.128
+        # in flight sharing base register. Skipped entirely when fast path
+        # exits with remainder < 2*step (e.g., N=16384 → fast 1, mid 0).
+        # Python-level gate: when False, the entire block is absent from
+        # the cute IR — no reg pressure or SASS bloat.
+        if self.enable_unroll_2:
+            mid_layout = cute.make_layout((UNROLL_MID, vec_w), stride=(step_elem, 1))
+            mid_frag = cute.make_fragment(mid_layout, self.dtype)
+            mid_last_offset = cutlass.const_expr((UNROLL_MID - 1) * step_elem + (vec_w - 1))
+            while i + cutlass.Int32(mid_last_offset) < N:
+                mid_src_ptr = cute.make_ptr(
                     self.dtype,
-                    row_addr
-                    + cutlass.Int64(i + cutlass.Int32(u_offset)) * cutlass.Int64(elem_bytes),
+                    row_addr + cutlass.Int64(i) * cutlass.Int64(elem_bytes),
                     cute.AddressSpace.gmem,
                     assumed_align=16,
                 )
-                src = cute.make_tensor(src_ptr, cute.make_layout((vec_w,)))
-                cute.copy(copy_atom, src, frags[u])
-            for u in cutlass.range_constexpr(UNROLL):
-                for j in cutlass.range_constexpr(vec_w):
-                    if cutlass.const_expr(self.dtype == cutlass.Float32):
-                        vj = frags[u][j]
-                    else:
-                        vj = cutlass.Float32(frags[u][j])
-                    if vj >= threshold:
-                        c = c + cutlass.Int32(1)
-            i = i + cutlass.Int32(UNROLL * step_elem)
+                mid_src = cute.make_tensor(mid_src_ptr, mid_layout)
+                for u in cutlass.range_constexpr(UNROLL_MID):
+                    src_u = mid_src[u, None]
+                    frag_u = mid_frag[u, None]
+                    cute.copy(copy_atom, src_u, frag_u)
+                for u in cutlass.range_constexpr(UNROLL_MID):
+                    for j in cutlass.range_constexpr(vec_w):
+                        if cutlass.const_expr(self.dtype == cutlass.Float32):
+                            vj = mid_frag[u, j]
+                        else:
+                            vj = cutlass.Float32(mid_frag[u, j])
+                        if vj >= threshold:
+                            c = c + cutlass.Int32(1)
+                i = i + cutlass.Int32(UNROLL_MID * step_elem)
 
-        # Tail vec loop: 1-way, handles N not divisible by UNROLL*step.
+        # Tail vec loop: 1-way, handles remainder < 2*step (= remaining 1
+        # full vec_w-stride or less).
+        tail_frag = cute.make_fragment((vec_w,), self.dtype)
         while i + cutlass.Int32(vec_w - 1) < N:
             src_ptr = cute.make_ptr(
                 self.dtype,
@@ -433,12 +530,12 @@ class GvrTopKKernel:
                 assumed_align=16,
             )
             src = cute.make_tensor(src_ptr, cute.make_layout((vec_w,)))
-            cute.copy(copy_atom, src, frag0)
+            cute.copy(copy_atom, src, tail_frag)
             for j in cutlass.range_constexpr(vec_w):
                 if cutlass.const_expr(self.dtype == cutlass.Float32):
-                    vj = frag0[j]
+                    vj = tail_frag[j]
                 else:
-                    vj = cutlass.Float32(frag0[j])
+                    vj = cutlass.Float32(tail_frag[j])
                 if vj >= threshold:
                     c = c + cutlass.Int32(1)
             i = i + step
@@ -1453,6 +1550,9 @@ def gvr_topk_decode(
     next_n: int = 1,
     out_values: Optional[torch.Tensor] = None,
     out_indices: Optional[torch.Tensor] = None,
+    enable_unroll_4: Optional[bool] = None,
+    enable_unroll_2: Optional[bool] = None,
+    use_strided_layout: Optional[bool] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """cuTe DSL GVR Top-K, drop-in for ``torch.ops.trtllm.indexer_topk_decode``.
 
@@ -1487,12 +1587,31 @@ def gvr_topk_decode(
     if out_indices is None:
         out_indices = torch.empty((num_rows, top_k), dtype=torch.int32, device=logits.device)
 
-    # Cache key is only the truly static config — (dtype, top_k, next_n).
-    # Shapes (num_rows, num_tokens, batch) are made dynamic via `sym_int`
-    # placeholders on fake tensors at compile, so one compiled kernel
-    # serves any shape at call time. Pattern mirrors
-    # ``CuteDSLTopKDecodeSingleCTARunner._compile`` (cute_dsl_custom_ops.py).
-    key = (cute_dtype, top_k, next_n)
+    # Resolve defaults (must be concrete for cache key).
+    # Dtype-based policy validated via A/B testing on B200:
+    #   * bf16/fp16: strided layout + cascade (unroll_4 + unroll_2) gives
+    #     consistent wins across all grid sizes (small +1pp, large +6pp).
+    #   * fp32: strided layout REGRESSES large-grid configs by 30-60pp
+    #     (worst: K=1024 BS=128 → 0.753 vs 1.364 separate-ptrs). Default
+    #     to separate-ptrs unroll-4 without cascade.
+    if enable_unroll_4 is None:
+        enable_unroll_4 = True
+    if enable_unroll_2 is None:
+        enable_unroll_2 = cute_dtype != cutlass.Float32
+    if use_strided_layout is None:
+        use_strided_layout = cute_dtype != cutlass.Float32
+
+    # Cache key includes the unrolling + layout switches so different
+    # settings share separate compiled kernels. Shapes (num_rows, num_tokens,
+    # batch) are made dynamic via `sym_int` placeholders.
+    key = (
+        cute_dtype,
+        top_k,
+        next_n,
+        enable_unroll_4,
+        enable_unroll_2,
+        use_strided_layout,
+    )
     if key not in _gvr_topk_compile_cache:
         n_rows = cute.sym_int()
         n_cols = cute.sym_int()
@@ -1514,7 +1633,14 @@ def gvr_topk_decode(
         )
         fake_stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
 
-        kernel = GvrTopKKernel(dtype=cute_dtype, top_k=top_k, next_n=next_n)
+        kernel = GvrTopKKernel(
+            dtype=cute_dtype,
+            top_k=top_k,
+            next_n=next_n,
+            enable_unroll_4=enable_unroll_4,
+            enable_unroll_2=enable_unroll_2,
+            use_strided_layout=use_strided_layout,
+        )
         _gvr_topk_compile_cache[key] = cute.compile(
             kernel,
             input_fake,
