@@ -1191,7 +1191,7 @@ __global__ void postProcessScatterKernel(void const* __restrict__ kv_comp, // [t
     int cache_stride_blk_bytes, int total_tokens, int num_scale_blocks, void* __restrict__ quant_output,
     void* __restrict__ scale_output)
 {
-    using ElemT = typename std::conditional<ELEM_BYTES == 2, __nv_bfloat16, float>::type;
+    using ElementT = typename std::conditional<ELEM_BYTES == 2, __nv_bfloat16, float>::type;
     constexpr int MAX_VEC = 16 / ELEM_BYTES;
     constexpr int VEC = (HEAD_DIM / MAX_VEC >= 32) ? MAX_VEC : (HEAD_DIM / 32);
     constexpr int NTHRD = HEAD_DIM / VEC;
@@ -1243,9 +1243,9 @@ __global__ void postProcessScatterKernel(void const* __restrict__ kv_comp, // [t
     // Step 1: Vectorized load from kv_comp
     // ================================================================
     auto const* src = reinterpret_cast<VecT const*>(
-        reinterpret_cast<ElemT const*>(kv_comp) + static_cast<int64_t>(token_idx) * HEAD_DIM);
+        reinterpret_cast<ElementT const*>(kv_comp) + static_cast<int64_t>(token_idx) * HEAD_DIM);
     VecT raw_in = src[tid];
-    ElemT const* in_elems = reinterpret_cast<ElemT const*>(&raw_in);
+    ElementT const* in_elems = reinterpret_cast<ElementT const*>(&raw_in);
 
     float v[VEC];
 #pragma unroll
@@ -1284,9 +1284,9 @@ __global__ void postProcessScatterKernel(void const* __restrict__ kv_comp, // [t
     // ================================================================
     // Step 3: Load weight, apply RMSNorm
     // ================================================================
-    auto const* wt_src = reinterpret_cast<VecT const*>(reinterpret_cast<ElemT const*>(rms_weight));
+    auto const* wt_src = reinterpret_cast<VecT const*>(reinterpret_cast<ElementT const*>(rms_weight));
     VecT raw_w = wt_src[tid];
-    ElemT const* w_elems = reinterpret_cast<ElemT const*>(&raw_w);
+    ElementT const* w_elems = reinterpret_cast<ElementT const*>(&raw_w);
 
 #pragma unroll
     for (int i = 0; i < VEC; i++)
@@ -1424,13 +1424,13 @@ __global__ void postProcessScatterKernel(void const* __restrict__ kv_comp, // [t
     if (kv_out != nullptr)
     {
         VecT raw_out;
-        ElemT* out_elems = reinterpret_cast<ElemT*>(&raw_out);
+        ElementT* out_elems = reinterpret_cast<ElementT*>(&raw_out);
 #pragma unroll
         for (int i = 0; i < VEC; i++)
-            out_elems[i] = static_cast<ElemT>(v[i]);
+            out_elems[i] = static_cast<ElementT>(v[i]);
 
         auto* dst
-            = reinterpret_cast<VecT*>(reinterpret_cast<ElemT*>(kv_out) + static_cast<int64_t>(token_idx) * HEAD_DIM);
+            = reinterpret_cast<VecT*>(reinterpret_cast<ElementT*>(kv_out) + static_cast<int64_t>(token_idx) * HEAD_DIM);
         dst[tid] = raw_out;
     }
 
@@ -1458,14 +1458,14 @@ __global__ void postProcessScatterKernel(void const* __restrict__ kv_comp, // [t
     if constexpr (SCALE_TYPE == CacheScaleType::kNone)
     {
         // Default mode: float→bf16/fp32 pack + vectorized store.
-        // Cache layout per block: [tokens_per_block * HEAD_DIM] elements of ElemT.
+        // Cache layout per block: [tokens_per_block * HEAD_DIM] elements of ElementT.
         VecT raw_out;
-        ElemT* out_elems = reinterpret_cast<ElemT*>(&raw_out);
+        ElementT* out_elems = reinterpret_cast<ElementT*>(&raw_out);
 #pragma unroll
         for (int i = 0; i < VEC; i++)
-            out_elems[i] = static_cast<ElemT>(v[i]);
+            out_elems[i] = static_cast<ElementT>(v[i]);
 
-        ElemT* row_base = reinterpret_cast<ElemT*>(block_base) + token_offset * HEAD_DIM;
+        ElementT* row_base = reinterpret_cast<ElementT*>(block_base) + token_offset * HEAD_DIM;
         reinterpret_cast<VecT*>(row_base)[tid] = raw_out;
     }
     else if constexpr (SCALE_TYPE == CacheScaleType::kFP8PerTensor)

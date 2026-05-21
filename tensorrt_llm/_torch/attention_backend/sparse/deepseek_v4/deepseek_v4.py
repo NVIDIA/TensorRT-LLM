@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import math
+from dataclasses import replace
 from enum import Enum
 from typing import TYPE_CHECKING, Dict, Optional, Set, Tuple
 
@@ -1232,8 +1233,20 @@ class DeepseekV4TrtllmAttention(TrtllmAttention):
 
     def forward(self, *args, **kwargs):
         attn_sink = getattr(self, "attn_sink", None)
-        if attn_sink is not None and kwargs.get("attention_sinks") is None:
-            kwargs["attention_sinks"] = attn_sink.data
+        if attn_sink is not None:
+            forward_args = kwargs.get("forward_args")
+            has_positional_forward_args = forward_args is None and len(args) >= 5
+            if has_positional_forward_args:
+                forward_args = args[4]
+            if forward_args is not None:
+                if forward_args.attention_sinks is None:
+                    forward_args = replace(forward_args, attention_sinks=attn_sink.data)
+                    if has_positional_forward_args:
+                        args = args[:4] + (forward_args,) + args[5:]
+                    else:
+                        kwargs["forward_args"] = forward_args
+            elif kwargs.get("attention_sinks") is None:
+                kwargs["attention_sinks"] = attn_sink.data
         return super().forward(*args, **kwargs)
 
     def sparse_attn_predict(

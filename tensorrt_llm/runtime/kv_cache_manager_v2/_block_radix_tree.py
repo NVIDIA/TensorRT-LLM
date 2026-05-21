@@ -282,7 +282,9 @@ class RootBlock:
         return self.prev.tokens_per_block
 
     @staticmethod
-    def make_key(reuse_scope: ReuseScope) -> BlockKey:
+    def make_key(reuse_scope: ReuseScope | None) -> BlockKey:
+        if reuse_scope is None:
+            reuse_scope = ReuseScope()
         return Hasher(reuse_scope.to_bytes()).digest
 
 

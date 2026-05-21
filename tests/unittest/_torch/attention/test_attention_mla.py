@@ -468,6 +468,10 @@ def test_attention_mla(scenario: Scenario, context_sequence_lengths: List[int],
                        generation_seq_len_q: int,
                        num_generation_steps: List[int], v2_kv_cache: bool):
     """Test MLA computation for both context and generation phases"""
+    if torch.cuda.get_device_capability() == (12, 0):
+        pytest.skip(
+            "TRTLLM MLA attention backend is not supported on SM120 in this branch."
+        )
 
     num_heads = scenario.num_heads
     num_kv_heads = scenario.num_kv_heads

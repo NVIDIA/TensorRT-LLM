@@ -109,7 +109,24 @@ def _init_gb10_nccl_symmetric_workaround() -> bool:
     return True
 
 
-deep_gemm.set_pdl(get_env_enable_pdl())
+def _init_deep_gemm_pdl() -> None:
+    try:
+        cuda_available = torch.cuda.is_available()
+    except RuntimeError as err:
+        logger.warning(
+            f"Failed to query CUDA availability for DeepGEMM PDL: {err}")
+        return
+
+    if not cuda_available:
+        return
+
+    try:
+        deep_gemm.set_pdl(get_env_enable_pdl())
+    except RuntimeError as err:
+        logger.warning(f"Failed to initialize DeepGEMM PDL: {err}")
+
+
+_init_deep_gemm_pdl()
 
 
 # Used to WAR an issue in torch.bmm that it would break the graph when the out is not contiguous.

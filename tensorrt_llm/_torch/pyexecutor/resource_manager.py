@@ -26,6 +26,8 @@ from tensorrt_llm.llmapi.llm_args import KvCacheConfig, PeftCacheConfig
 from tensorrt_llm.lora_helper import LoraConfig
 from tensorrt_llm.lora_manager import LoraManager, LoraModelConfig
 from tensorrt_llm.runtime import ModelConfig as ModelConfigPython
+from tensorrt_llm.runtime.kv_cache_hash import (KV_CACHE_HASH_ALGO_AUTO,
+                                                KV_CACHE_HASH_ALGO_V1)
 
 # isort: off
 # isort: on
@@ -87,6 +89,17 @@ class ResourceManagerType(enum.Enum):
 
 def compute_page_count(token_count: int, tokens_per_page: int) -> int:
     return (token_count + tokens_per_page) // tokens_per_page
+
+
+def _warn_if_unsupported_v1_kv_cache_event_hash_algo(
+        kv_cache_event_hash_algo: str) -> None:
+    if kv_cache_event_hash_algo in (KV_CACHE_HASH_ALGO_AUTO,
+                                    KV_CACHE_HASH_ALGO_V1):
+        return
+    logger.warning(
+        "KV cache manager V1 only supports kv_cache_event_hash_algo "
+        f"{KV_CACHE_HASH_ALGO_V1} or {KV_CACHE_HASH_ALGO_AUTO}, but got "
+        f"{kv_cache_event_hash_algo}. Falling back to {KV_CACHE_HASH_ALGO_V1}.")
 
 
 class BaseResourceManager(ABC):
@@ -2430,3 +2443,11 @@ class PeftCacheManager(BaseResourceManager):
 
     def is_task_cached_device(self, task_id: int) -> bool:
         return self.impl.is_task_cached_device(task_id)
+
+
+def __getattr__(name: str):
+    if name in ("KVCacheManagerV2", "Role"):
+        from .kv_cache_manager_v2 import KVCacheManagerV2, Role
+
+        return {"KVCacheManagerV2": KVCacheManagerV2, "Role": Role}[name]
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

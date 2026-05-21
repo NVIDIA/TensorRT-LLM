@@ -975,6 +975,7 @@ def test_torch_sampler_args_overlap_doubles_slot_pool():
         disable_overlap_scheduler=False,
         disable_flashinfer_sampling=False,
         enable_async_worker=False,
+        enable_speculative_beam_history_d2h=False,
     )
     assert overlap_args.max_num_sequences == 4
 
@@ -987,6 +988,7 @@ def test_torch_sampler_args_overlap_doubles_slot_pool():
         disable_overlap_scheduler=True,
         disable_flashinfer_sampling=False,
         enable_async_worker=False,
+        enable_speculative_beam_history_d2h=False,
     )
     assert no_overlap_args.max_num_sequences == 2
 

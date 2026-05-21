@@ -231,7 +231,7 @@ public:
             return false;
         }
         return options.mFmhaKernelType == FmhaKernelType::SwapsMmaAbForGeneration
-            && !isTokenSparse(options.mSparseType) && options.mDtypeKv != tg::Dtype::E2m1;
+            && options.mDtypeKv != tg::Dtype::E2m1;
     }
 
     std::pair<bool, std::string> checkIfKernelExist(RunnerParams const& params) const

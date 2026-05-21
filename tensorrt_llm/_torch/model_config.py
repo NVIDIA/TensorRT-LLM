@@ -14,21 +14,15 @@ import transformers
 from transformers.utils import HF_MODULES_CACHE
 
 from tensorrt_llm._torch.pyexecutor.config_utils import (
-    get_qwen3_hybrid_num_attention_layers,
-    is_hybrid_linear,
-    is_nemotron_hybrid,
-    is_qwen3_hybrid,
-    load_pretrained_config,
-)
-from tensorrt_llm._utils import get_sm_version, is_sm_100f, torch_dtype_to_binding
+    get_qwen3_hybrid_num_attention_layers, is_nemotron_hybrid, is_qwen3_hybrid,
+    load_pretrained_config)
+from tensorrt_llm._utils import (get_sm_version, is_sm_100f,
+                                 torch_dtype_to_binding)
 from tensorrt_llm.bindings import LayerType as LayerTypeCpp
 from tensorrt_llm.functional import AllReduceStrategy
-from tensorrt_llm.llmapi.llm_args import (
-    DeepSeekSparseAttentionConfig,
-    DeepSeekV4SparseAttentionConfig,
-    KvCacheConfig,
-    MoeLoadBalancerConfig,
-)
+from tensorrt_llm.llmapi.llm_args import (DeepSeekSparseAttentionConfig,
+                                          DeepSeekV4SparseAttentionConfig,
+                                          KvCacheConfig, MoeLoadBalancerConfig)
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
@@ -41,12 +35,9 @@ from tensorrt_llm.quantization.modelopt_config import (
 
 if TYPE_CHECKING:
     from tensorrt_llm.bindings import ModelConfig as ModelConfigCpp
-    from tensorrt_llm.llmapi.llm_args import (
-        DecodingBaseConfig,
-        LoraConfig,
-        SparseAttentionConfig,
-        SpeculativeConfig,
-    )
+    from tensorrt_llm.llmapi.llm_args import (DecodingBaseConfig, LoraConfig,
+                                              SparseAttentionConfig,
+                                              SpeculativeConfig)
 
 TConfig = TypeVar("TConfig", bound=transformers.PretrainedConfig)
 
@@ -836,12 +827,17 @@ class ModelConfig(Generic[TConfig]):
                         pretrained_config, 'compress_ratios', None)
                     num_base_layers = pretrained_config.num_hidden_layers
                     spec_config = kwargs.get('spec_config', None)
+                    if (spec_config is not None
+                            and getattr(spec_config, 'num_nextn_predict_layers',
+                                        None) is None):
+                        spec_config.num_nextn_predict_layers = getattr(
+                            pretrained_config, 'num_nextn_predict_layers', 1)
                     mtp_enabled = (spec_config is not None and
                                    spec_config.spec_dec_mode.is_mtp_one_model())
                     sparse_attention_config = kwargs.get(
                         'sparse_attention_config')
-                    checkpoint_window_size = getattr(
-                        pretrained_config, 'window_size', None)
+                    checkpoint_window_size = getattr(pretrained_config,
+                                                     'window_size', None)
                     if checkpoint_window_size is None:
                         checkpoint_window_size = getattr(
                             pretrained_config, 'sliding_window', None)
@@ -883,10 +879,12 @@ class ModelConfig(Generic[TConfig]):
                             compress_ratios = list(compress_ratios) + [1] * (
                                 total_layers - len(compress_ratios))
 
+                    indexer_k_dtype = indexer_config.pop('indexer_k_dtype')
                     kwargs[
                         'sparse_attention_config'] = DeepSeekV4SparseAttentionConfig(
                             compress_ratios=compress_ratios,
                             window_size=window_size,
+                            indexer_k_dtype=indexer_k_dtype,
                             **indexer_config)
             else:
                 raise ValueError(
@@ -1194,7 +1192,8 @@ class ModelConfig(Generic[TConfig]):
             for x in self.pretrained_config.block_configs
         ])
 
-        from tensorrt_llm._torch.models.modeling_nemotron_nas import _ffn_mult_to_intermediate_size
+        from tensorrt_llm._torch.models.modeling_nemotron_nas import \
+            _ffn_mult_to_intermediate_size
         mlp_hidden_size = _ffn_mult_to_intermediate_size(
             biggest_ffn_mult, self.pretrained_config.hidden_size)
 

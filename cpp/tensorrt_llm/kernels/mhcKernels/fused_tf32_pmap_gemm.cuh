@@ -52,14 +52,18 @@
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wunknown-attributes"
 
+#include <cuda/std/utility>
 #include <cuda_bf16.h>
 #include <cutlass/arch/barrier.h>
 
-#include <deep_gemm/common/math.cuh>
-
-namespace deep_gemm
+namespace deep_gemm::sm90
 {
-using math::swap;
+using cuda::std::swap;
+}
+
+namespace deep_gemm::sm100
+{
+using cuda::std::swap;
 }
 
 #include <deep_gemm/common/reduction.cuh>
@@ -80,9 +84,8 @@ using deep_gemm::sm100::tcgen05_before_thread_sync;
 using deep_gemm::sm100::tcgen05_after_thread_sync;
 using deep_gemm::sm100::advance_umma_desc_lo;
 using deep_gemm::tma_copy;
-using deep_gemm::math::constexpr_ceil_div;
-using deep_gemm::ptx::get_lane_idx;
 using deep_gemm::utils::PatternVisitor;
+using deep_gemm::ptx::get_lane_idx;
 
 template <uint32_t kSwizzleMode, uint32_t kSwizzleBase = 16>
 __device__ __forceinline__ uint32_t get_swizzled_smem_offset(uint32_t const& offset, uint32_t const& lane_idx)

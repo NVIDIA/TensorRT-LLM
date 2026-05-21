@@ -2439,7 +2439,7 @@ class PyExecutor:
                 kv_cache_dtype_byte_size = getattr(self.model_engine,
                                                    'kv_cache_dtype_byte_size',
                                                    None)
-                if self._scheduler_manages_kv_suspend:
+                if self._is_kv_manager_v2:
                     self.kv_cache_manager.update_context_resources(
                         sample_state_scheduled_requests)
                 self.resource_manager.update_resources(
@@ -2592,10 +2592,13 @@ class PyExecutor:
 
     def _commit_kv_cache_stats(self,
                                scheduled_batch: ScheduledRequests) -> None:
-        if self._scheduler_manages_kv_suspend and isinstance(
-                self.kv_cache_manager, KVCacheManagerV2):
+        if self._is_kv_manager_v2:
             self.kv_cache_manager.commit_scheduled_kv_cache_stats(
                 scheduled_batch)
+
+    def _needs_early_context_resource_update(self) -> bool:
+        return (self._is_kv_manager_v2 and getattr(
+            self.kv_cache_manager, "has_sliding_window_attention", False))
 
     def _prepare_and_schedule_batch(self):
         new_requests = self._fetch_and_activate_new_requests()
@@ -3068,7 +3071,7 @@ class PyExecutor:
                                             None)
                     kv_cache_dtype_byte_size = getattr(
                         self.model_engine, 'kv_cache_dtype_byte_size', None)
-                    if self._scheduler_manages_kv_suspend:
+                    if self._is_kv_manager_v2:
                         self.kv_cache_manager.update_context_resources(
                             scheduled_batch)
                     self.resource_manager.update_resources(
@@ -3496,7 +3499,7 @@ class PyExecutor:
                     # blocks freed by this chunk are visible to the next
                     # iteration's scheduler.
                     # Only applies to KV cache manager V2 + scheduler V2.
-                    if (self._scheduler_manages_kv_suspend
+                    if (self._needs_early_context_resource_update()
                             and scheduled_batch.context_requests):
                         self.kv_cache_manager.update_context_resources(
                             scheduled_batch)
@@ -3646,6 +3649,9 @@ class PyExecutor:
         attn_metadata = getattr(self.model_engine, 'attn_metadata', None)
         kv_cache_dtype_byte_size = getattr(self.model_engine,
                                            'kv_cache_dtype_byte_size', None)
+        if (self._is_kv_manager_v2
+                and not self._needs_early_context_resource_update()):
+            self.kv_cache_manager.update_context_resources(scheduled_requests)
         self.resource_manager.update_resources(scheduled_requests,
                                                attn_metadata,
                                                kv_cache_dtype_byte_size)

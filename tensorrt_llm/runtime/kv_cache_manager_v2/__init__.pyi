@@ -202,6 +202,7 @@ class KVCacheStoredBlockData:
     cache_level: int
     priority: int
     mm_keys: list[MmKey] = ...
+    cache_salt: str | None = ...
 
 @dataclass(slots=True, frozen=True)
 class KVCacheStoredData:

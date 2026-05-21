@@ -235,6 +235,7 @@ class KvCacheCreator:
         self._dummy_reqs = None
         self._profiling_stage_data = profiling_stage_data
         self._is_disagg = is_disagg
+        self._cache_transceiver_config = llm_args.cache_transceiver_config
         self._execution_stream = execution_stream
         self._kv_cache_manager_cls = self._get_model_kv_cache_manager_cls(
             model_engine)

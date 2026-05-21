@@ -14,30 +14,29 @@ import torch.nn.functional as F
 import tensorrt_llm
 import tensorrt_llm.bindings
 from tensorrt_llm._torch.attention_backend.interface import (
-    AttentionForwardArgs,
-    MLAParams,
-    PositionalEmbeddingParams,
-)
-from tensorrt_llm._torch.attention_backend.trtllm import TrtllmAttention, TrtllmAttentionMetadata
+    AttentionForwardArgs, AttentionInputType, MLAParams,
+    PositionalEmbeddingParams)
+from tensorrt_llm._torch.attention_backend.trtllm import (
+    TrtllmAttention, TrtllmAttentionMetadata)
 from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
 from tensorrt_llm._torch.distributed.ops import allgather
 from tensorrt_llm._torch.modules.layer_norm import LayerNorm
 from tensorrt_llm._torch.modules.linear import Linear
-from tensorrt_llm._torch.modules.multi_stream_utils import maybe_execute_in_parallel
+from tensorrt_llm._torch.modules.multi_stream_utils import \
+    maybe_execute_in_parallel
 from tensorrt_llm._torch.modules.rotary_embedding import RotaryEmbedding
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm._torch.utils import maybe_compile
-from tensorrt_llm._utils import get_size_in_bytes, get_sm_version, maybe_pin_memory, prefer_pinned
+from tensorrt_llm._utils import (get_size_in_bytes, get_sm_version,
+                                 maybe_pin_memory, prefer_pinned)
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.bindings.executor import KvCacheConfig
-from tensorrt_llm.bindings.internal.batch_manager import CacheType as CacheTypeCpp
-from tensorrt_llm.deep_gemm import (
-    fp8_fp4_mqa_logits,
-    fp8_fp4_paged_mqa_logits,
-    fp8_mqa_logits,
-    fp8_paged_mqa_logits,
-    get_paged_mqa_logits_metadata,
-)
+from tensorrt_llm.bindings.internal.batch_manager import \
+    CacheType as CacheTypeCpp
+from tensorrt_llm.deep_gemm import (fp8_fp4_mqa_logits,
+                                    fp8_fp4_paged_mqa_logits, fp8_mqa_logits,
+                                    fp8_paged_mqa_logits,
+                                    get_paged_mqa_logits_metadata)
 from tensorrt_llm.llmapi.llm_args import SparseAttentionConfig
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
@@ -825,6 +824,40 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
             pin_memory=prefer_pinned(),
         )
 
+    def _create_radix_aux_buffers(self, capture_graph=False):
+        # Persistent scratch for Radix-split-work indexer path (blocks_per_row > 1).
+        # Mirrors the fix the Heuristic path applied: per-call th::empty inside
+        # indexer_topk_decode produces stale pointers under CUDA Graph replay when
+        # the caching allocator is perturbed by chunked prefill at high CONC.
+        # Sized to the worst case kMaxBlocksPerRowDecode=10 from
+        # cpp/tensorrt_llm/kernels/indexerTopK.cu, times the max number of
+        # generation rows (num_seqs * (1 + max_draft_tokens)); the cpp op aborts
+        # if this is smaller than num_rows*blocks_per_row*index_topk. Allocated
+        # unconditionally: even with enable_heuristic_topk=True the dispatcher can
+        # fall back to Radix when canUseHeuristic returns False (small numColumns,
+        # etc.). MUST be re-created whenever max_draft_tokens changes (see
+        # update_spec_dec_param) or it is left too small once MTP raises the
+        # generation-row count.
+        _radix_max_blocks_per_row = 10
+        _radix_max_gen_tokens = self.max_num_sequences * (1 +
+                                                          self.max_draft_tokens)
+        self.radix_aux_indices = self.get_empty(
+            self.cuda_graph_buffers,
+            (_radix_max_gen_tokens, _radix_max_blocks_per_row,
+             self.num_sparse_topk),
+            cache_name="radix_aux_indices",
+            dtype=torch.int32,
+            capture_graph=capture_graph,
+        )
+        self.radix_aux_logits = self.get_empty(
+            self.cuda_graph_buffers,
+            (_radix_max_gen_tokens, _radix_max_blocks_per_row,
+             self.num_sparse_topk),
+            cache_name="radix_aux_logits",
+            dtype=torch.float32,
+            capture_graph=capture_graph,
+        )
+
     def create_buffers_for_indexer(self, capture_graph=False):
         self.indexer_k_cache_block_offsets = self.get_empty(
             self.cuda_graph_buffers,
@@ -980,33 +1013,10 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
                 capture_graph=capture_graph,
             )
 
-        # Persistent scratch for Radix-split-work indexer path (blocks_per_row > 1).
-        # Mirrors the fix the Heuristic path applied above: per-call th::empty
-        # inside indexer_topk_decode produces stale pointers under CUDA Graph
-        # replay when the caching allocator is perturbed by chunked prefill at
-        # high CONC. Sized to the worst case kMaxBlocksPerRowDecode=10 from
-        # cpp/tensorrt_llm/kernels/indexerTopK.cu. Allocated unconditionally:
-        # even with enable_heuristic_topk=True, the dispatcher can fall back
-        # to Radix when canUseHeuristic returns False (small numColumns, etc.).
-        _radix_max_blocks_per_row = 10
-        _radix_max_gen_tokens = self.max_num_sequences * (1 +
-                                                          self.max_draft_tokens)
-        self.radix_aux_indices = self.get_empty(
-            self.cuda_graph_buffers,
-            (_radix_max_gen_tokens, _radix_max_blocks_per_row,
-             self.num_sparse_topk),
-            cache_name="radix_aux_indices",
-            dtype=torch.int32,
-            capture_graph=capture_graph,
-        )
-        self.radix_aux_logits = self.get_empty(
-            self.cuda_graph_buffers,
-            (_radix_max_gen_tokens, _radix_max_blocks_per_row,
-             self.num_sparse_topk),
-            cache_name="radix_aux_logits",
-            dtype=torch.float32,
-            capture_graph=capture_graph,
-        )
+        # Persistent scratch for the Radix-split-work indexer path. Re-created
+        # in update_spec_dec_param when max_draft_tokens changes so it stays
+        # large enough for the MTP generation-row count.
+        self._create_radix_aux_buffers(capture_graph=capture_graph)
 
         # Create expanded buffers for MTP support
         self.create_expanded_buffers(capture_graph=capture_graph)
@@ -1108,6 +1118,13 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
                     dtype=torch.float32,
                     capture_graph=capture_graph,
                 )
+            # The Radix-split-work scratch (radix_aux_*) is sized the same way
+            # (num_seqs * (1 + max_draft_tokens) rows) and is allocated
+            # unconditionally, so it must be resized here too -- otherwise the
+            # cpp indexer_topk_decode op aborts once MTP raises max_draft_tokens
+            # ("radix_aux_* must hold at least num_rows*blocks_per_row*index_topk
+            # elements").
+            self._create_radix_aux_buffers(capture_graph=capture_graph)
 
     def _get_pool_block_indices(self) -> torch.Tensor:
         """Extract memory pool block indices from host_kv_cache_block_offsets.
@@ -1249,9 +1266,9 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         # - Remove this once fp8_paged_mqa_logits supports an arbitrary number of MTP draft tokens.
         use_dsl = self.sparse_attention_config.use_cute_dsl_paged_mqa_logits
         self.use_expanded_buffers_for_mtp = (not use_dsl and (
-            (self.max_draft_tokens > 1 and get_sm_version() == 90)
-            or ((self.max_draft_tokens == 2 or self.max_draft_tokens > 3)
-                and get_sm_version() >= 100)))
+            (self.max_draft_tokens > 1 and get_sm_version() == 90) or
+            ((self.max_draft_tokens == 2 or self.max_draft_tokens > 3)
+             and get_sm_version() >= 100)))
         if self.use_expanded_buffers_for_mtp:
             # Expand kv_lens_cuda (only generation)
             num_tokens = self.num_generations * (1 + self.max_draft_tokens)
@@ -2549,8 +2566,7 @@ class Indexer(nn.Module):
                             metadata.scheduler_metadata_buffer_expanded)
                     logits_decode = torch.ops.trtllm.cute_dsl_fp8_paged_mqa_logits(
                         dsl_q, k_cache, weights_decode, fp8_ctx_lens,
-                        fp8_block_table, fp8_schedule_meta,
-                        indexer_max_seq_len)
+                        fp8_block_table, fp8_schedule_meta, indexer_max_seq_len)
             else:
                 decode_q_scale = q_scale[num_ctx_tokens:num_ctx_tokens +
                                          num_gen_tokens,
@@ -2563,8 +2579,7 @@ class Indexer(nn.Module):
                         q_decode.shape[0], q_decode.shape[1], self.n_heads)
                 logits_decode = self._call_paged_mqa_logits(
                     q_decode, k_cache, weights_decode, context_lens,
-                    block_table, scheduler_metadata_buffer,
-                    indexer_max_seq_len,
+                    block_table, scheduler_metadata_buffer, indexer_max_seq_len,
                     decode_q_scale)
 
             if use_custom_topk:
@@ -2836,9 +2851,10 @@ class DSATrtllmAttention(TrtllmAttention):
     ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
         """Transform local TopK indices to global paged KV cache indices."""
         # Transform the local topk indices to global topk indices in paged kv cache
+        is_generation = forward_args.attention_input_type == AttentionInputType.generation_only
         topk_indices_global, _ = transform_local_topk_and_prepare_pool_view(
             forward_args.topk_indices, metadata,
-            self.get_local_layer_idx(metadata), forward_args.is_generation)
+            self.get_local_layer_idx(metadata), is_generation)
 
         # TODO: Use sparse_attn_indexer to predict the indices for DSA attention
         # return self.indexer(q, k, metadata, hidden_states, qr, position_ids)

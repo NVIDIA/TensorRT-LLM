@@ -60,6 +60,7 @@ class KVCacheStoredBlockData:
     cache_level: int
     priority: int
     mm_keys: list[MmKey] = field(default_factory=list)
+    cache_salt: str | None = None
 
 
 @dataclass(slots=True, frozen=True)

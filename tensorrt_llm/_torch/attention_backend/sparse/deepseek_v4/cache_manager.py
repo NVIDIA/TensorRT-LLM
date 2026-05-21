@@ -4,7 +4,7 @@ from typing import Dict, List, Optional, Tuple
 import torch
 
 from tensorrt_llm._torch.pyexecutor import llm_request
-from tensorrt_llm._torch.pyexecutor.resource_manager import GPU_LEVEL, KVCacheManagerV2, Role
+from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import GPU_LEVEL, KVCacheManagerV2, Role
 from tensorrt_llm._utils import (
     TensorWrapper,
     convert_to_torch_tensor,
@@ -359,6 +359,7 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
         tokens_per_block: int,
         vocab_size: int | None,
         cache_tiers: List[GpuCacheTierConfig | HostCacheTierConfig],
+        enable_stats: bool,
     ) -> KVCacheManagerConfigPy:
         """
         Create the cache manager config for DeepSeek-V4.
@@ -479,6 +480,7 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
             layers=layers,
             typical_step=typical_step,
             constraints=constraints,
+            enable_stats=enable_stats,
         )
 
     def _init_indexer_dtype(self, sparse_attn_config: DeepSeekV4SparseAttentionConfig) -> None:
@@ -812,8 +814,7 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
         config = model_config.pretrained_config
         head_dim = config.kv_lora_rank + config.qk_rope_head_dim
         index_head_dim = model_config.sparse_attention_config.index_head_dim
-        is_disagg = kwargs.get("is_disagg", False)
-        pp_layers = mapping.pp_layers(model_config.get_num_attention_layers(is_disagg=is_disagg))
+        pp_layers = mapping.pp_layers(model_config.get_num_attention_layers())
         compress_ratios = [
             model_config.sparse_attention_config.compress_ratios[layer] for layer in pp_layers
         ]

@@ -50,21 +50,34 @@ if platform.system() != "Windows":
     except ImportError:
         logger.warning("cuda-tile package not found, TileIR kernels will not be available")
     else:
-        if (cc := torch.cuda.get_device_properties()) and (cc.major, cc.minor) < (10, 0):
-            logger.warning(
-                f"TileIR requires compute capability 10.0 or higher, but the current device has "
-                f"{cc.major}.{cc.minor}. TileIR kernels will not be available"
+        try:
+            cc = (
+                torch.cuda.get_device_properties(torch.cuda.current_device())
+                if torch.cuda.is_available()
+                else None
             )
-        elif shutil.which("tileiras") is not None:
-            IS_CUDA_TILE_AVAILABLE = True
-        # For systems without tileiras installed, try to locate from nvidia-cuda-tileiras package.
-        elif tileiras_files := importlib.metadata.files("nvidia-cuda-tileiras"):
-            for pkg_file in tileiras_files:
-                if pkg_file.name == "tileiras":
-                    tileiras_dir = pkg_file.locate().parent
-                    os.environ["PATH"] = f"{os.environ['PATH']}:{tileiras_dir}"
-                    break
-            assert shutil.which("tileiras") is not None
-            IS_CUDA_TILE_AVAILABLE = True
+        except RuntimeError as err:
+            logger.warning(
+                f"Failed to query CUDA device capability: {err}. TileIR kernels will not be available"
+            )
         else:
-            logger.warning("tileiras compiler not found, TileIR kernels will not be available")
+            if cc is None:
+                logger.warning("CUDA is not available, TileIR kernels will not be available")
+            elif (cc.major, cc.minor) < (10, 0):
+                logger.warning(
+                    f"TileIR requires compute capability 10.0 or higher, but the current device has "
+                    f"{cc.major}.{cc.minor}. TileIR kernels will not be available"
+                )
+            elif shutil.which("tileiras") is not None:
+                IS_CUDA_TILE_AVAILABLE = True
+            # For systems without tileiras installed, try to locate from nvidia-cuda-tileiras package.
+            elif tileiras_files := importlib.metadata.files("nvidia-cuda-tileiras"):
+                for pkg_file in tileiras_files:
+                    if pkg_file.name == "tileiras":
+                        tileiras_dir = pkg_file.locate().parent
+                        os.environ["PATH"] = f"{os.environ['PATH']}:{tileiras_dir}"
+                        break
+                assert shutil.which("tileiras") is not None
+                IS_CUDA_TILE_AVAILABLE = True
+            else:
+                logger.warning("tileiras compiler not found, TileIR kernels will not be available")
