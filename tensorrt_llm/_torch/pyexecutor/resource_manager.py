@@ -3466,6 +3466,11 @@ class KVCacheManagerV2(BaseResourceManager):
         needed.  Releasing it early allows new requests to be scheduled while
         the KV cache blocks are still being transferred via NIXL/UCX.
         """
+        kv_cache = self.kv_cache_map.get(request_id)
+        if kv_cache is not None:
+            for i in range(self.max_beam_width):
+                for pool_idx in range(self.num_pools):
+                    kv_cache.set_base_page_index_buf(i, pool_idx, None)
         self.index_mapper.remove_sequence(request_id)
         self._early_freed_index_requests.add(request_id)
 
