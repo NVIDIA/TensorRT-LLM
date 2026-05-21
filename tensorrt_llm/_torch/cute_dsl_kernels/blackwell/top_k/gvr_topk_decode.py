@@ -379,12 +379,52 @@ class GvrTopKKernel:
             self.dtype,
             num_bits_per_copy=cutlass.const_expr(128),
         )
-        frag = cute.make_fragment((vec_w,), self.dtype)
+
+        # 4-way unrolled fast path: issue 4 independent LDG.E.128 per round
+        # to engage LSU pipelining. Mirrors nvcc/ptxas auto-partial-unroll
+        # on the CUDA side (LDG.E.128.CONSTANT R8/R12/R16/R20 with
+        # +0x2000/+0x4000/+0x6000 strides). Separate fragments are needed
+        # so cute schedules the 4 LDGs concurrently rather than serializing
+        # on a single destination register set.
+        UNROLL = 4
+        step_elem = cutlass.const_expr(num_threads * vec_w)
+        frag0 = cute.make_fragment((vec_w,), self.dtype)
+        frag1 = cute.make_fragment((vec_w,), self.dtype)
+        frag2 = cute.make_fragment((vec_w,), self.dtype)
+        frag3 = cute.make_fragment((vec_w,), self.dtype)
+        frags = (frag0, frag1, frag2, frag3)
 
         row_addr = input_row.iterator.toint()
         n_aligned = (N // cutlass.Int32(vec_w)) * cutlass.Int32(vec_w)
         i = tidx * cutlass.Int32(vec_w)
-        step = cutlass.Int32(num_threads * vec_w)
+        step = cutlass.Int32(step_elem)
+        # Entry guard: last element of the last unrolled iter must fit.
+        fast_last_offset = cutlass.const_expr((UNROLL - 1) * step_elem + (vec_w - 1))
+
+        # Fast path: 4 LDG.E.128 in flight per round.
+        while i + cutlass.Int32(fast_last_offset) < N:
+            for u in cutlass.range_constexpr(UNROLL):
+                u_offset = cutlass.const_expr(u * step_elem)
+                src_ptr = cute.make_ptr(
+                    self.dtype,
+                    row_addr
+                    + cutlass.Int64(i + cutlass.Int32(u_offset)) * cutlass.Int64(elem_bytes),
+                    cute.AddressSpace.gmem,
+                    assumed_align=16,
+                )
+                src = cute.make_tensor(src_ptr, cute.make_layout((vec_w,)))
+                cute.copy(copy_atom, src, frags[u])
+            for u in cutlass.range_constexpr(UNROLL):
+                for j in cutlass.range_constexpr(vec_w):
+                    if cutlass.const_expr(self.dtype == cutlass.Float32):
+                        vj = frags[u][j]
+                    else:
+                        vj = cutlass.Float32(frags[u][j])
+                    if vj >= threshold:
+                        c = c + cutlass.Int32(1)
+            i = i + cutlass.Int32(UNROLL * step_elem)
+
+        # Tail vec loop: 1-way, handles N not divisible by UNROLL*step.
         while i + cutlass.Int32(vec_w - 1) < N:
             src_ptr = cute.make_ptr(
                 self.dtype,
@@ -393,12 +433,12 @@ class GvrTopKKernel:
                 assumed_align=16,
             )
             src = cute.make_tensor(src_ptr, cute.make_layout((vec_w,)))
-            cute.copy(copy_atom, src, frag)
+            cute.copy(copy_atom, src, frag0)
             for j in cutlass.range_constexpr(vec_w):
                 if cutlass.const_expr(self.dtype == cutlass.Float32):
-                    vj = frag[j]
+                    vj = frag0[j]
                 else:
-                    vj = cutlass.Float32(frag[j])
+                    vj = cutlass.Float32(frag0[j])
                 if vj >= threshold:
                     c = c + cutlass.Int32(1)
             i = i + step
