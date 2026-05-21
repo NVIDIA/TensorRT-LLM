@@ -398,9 +398,7 @@ class TestKVCacheAwareADPRouterWarmup:
     def _make_router(self, tp_size):
         dist = _mock_dist(tp_rank=0, tp_size=tp_size)
         mgr = _mock_kv_cache_manager()
-        return KVCacheAwareADPRouter(
-            dist=dist, kv_cache_manager=mgr, cold_start_warmup=True
-        )
+        return KVCacheAwareADPRouter(dist=dist, kv_cache_manager=mgr, cold_start_warmup=True)
 
     def _no_match(self, tp_size, req_ids):
         return [{rid: 0 for rid in req_ids} for _ in range(tp_size)]
