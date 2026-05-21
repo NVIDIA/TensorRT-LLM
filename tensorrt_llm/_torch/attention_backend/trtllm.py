@@ -15,7 +15,8 @@ from tensorrt_llm._torch.attention_backend import trtllm_gen
 from tensorrt_llm._utils import get_sm_version, maybe_pin_memory, prefer_pinned
 from tensorrt_llm.bindings.internal import thop
 from tensorrt_llm.functional import AttentionMaskType
-from tensorrt_llm.llmapi import DeepSeekV4SparseAttentionConfig, SkipSoftmaxAttentionConfig
+from tensorrt_llm.llmapi import (DeepSeekV4SparseAttentionConfig,
+                                 SkipSoftmaxAttentionConfig)
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
 from ..utils import (compute_swizzled_sf_shape, get_global_attrs,
@@ -25,6 +26,7 @@ from .interface import (AttentionBackend, AttentionForwardArgs,
                         AttentionSparseArgs, KVCacheParams, MLAParams,
                         PositionalEmbeddingParams, PredefinedAttentionMask,
                         RopeParams, merge_attention_forward_args)
+from .trtllm_gen import trtllm_gen_attention
 
 # Enable TRTLLM-Gen attention backend by default. Set
 # TRTLLM_ENABLE_TRTLLM_GEN_ATTENTION=0 to force the thop.attention path.
@@ -296,7 +298,8 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             self.kv_cache_block_offsets = self.get_empty(
                 buffers,
                 [
-                    self.kv_cache_manager.num_pools, self.max_num_sequences, 2,
+                    self.kv_cache_manager.num_attention_op_pools,
+                    self.max_num_sequences, 2,
                     self.kv_cache_manager.max_blocks_per_seq
                 ],
                 cache_name="kv_cache_block_offsets",
@@ -313,7 +316,7 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                 self.draft_kv_cache_block_offsets = self.get_empty(
                     buffers,
                     [
-                        self.draft_kv_cache_manager.num_pools,
+                        self.draft_kv_cache_manager.num_attention_op_pools,
                         self.max_num_sequences, 2,
                         self.draft_kv_cache_manager.max_blocks_per_seq
                     ],
