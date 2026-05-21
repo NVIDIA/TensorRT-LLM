@@ -162,10 +162,6 @@ class Attention(nn.Module):
             ]
         )
 
-        # TODO: Support combined Ulysses + CP. Ulysses shards heads while CP shards sequence.
-        # Currently kept as mutually exclusive.
-        attn2d_size = (vgm.attn2d_row_size * vgm.attn2d_col_size) if vgm else 1
-        use_attn2d = attn2d_size > 1 and self.qkv_mode != QKVMode.SEPARATE_QKV
         # Ulysses auto-wrap normally skips SEPARATE_QKV (cross-attention).
         # The async-ulysses path uses SEPARATE_QKV for stream-pipelined
         # V/Q/K projections AND still needs the head-sharding wrap — opt in
@@ -231,9 +227,8 @@ class Attention(nn.Module):
             self.attn,
             visual_gen_mapping=vgm,
             enable_sequence_parallel=enable_sequence_parallel,
+            async_pipeline=use_ulysses and async_ulysses,
         )
-        if use_ulysses and async_ulysses and hasattr(self.attn, "setup_async_pipeline"):
-            self.attn.setup_async_pipeline()
 
     def _init_qkv_proj(self) -> None:
         tp_mode = TensorParallelMode.COLUMN if self.tp_size > 1 else None

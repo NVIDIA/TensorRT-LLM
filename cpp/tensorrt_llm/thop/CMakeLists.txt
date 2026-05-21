@@ -41,6 +41,7 @@ add_library(
   allgatherOp.cpp
   allreduceOp.cpp
   alltoallOp.cpp
+  asyncUlyssesOp.cpp
   attentionOp.cpp
   causalConv1dOp.cpp
   convertSpecDecodingMaskToPackedMaskOp.cpp

@@ -51,13 +51,6 @@ def post_permute_5d_to_4d(out_5d, P):
     return out_5d.permute(1, 0, 2, 3, 4).contiguous().view(Bt, _P * Spt, HpP, Dt)
 
 
-def _can_use_fused_post_unscatter(H: int, D: int) -> bool:
-    """The fused kernel requires D % 8 == 0 (uint4 vec) and threads/block
-    H * (D / 8) <= 1024 (CUDA hw limit). Other shapes fall back to the
-    inductor-fused permute+reshape+contiguous+transpose+contig chain."""
-    return D % 8 == 0 and H * (D // 8) <= 1024
-
-
 def _ulysses_post_unscatter_to_hnd(q_5d, k_5d, v_5d):
     """One-launch fused replacement for the post-A2A 5D -> 4D HND chain."""
     return torch.ops.trtllm.ulysses_post_unscatter_qkv(q_5d, k_5d, v_5d)
@@ -86,10 +79,16 @@ class UlyssesAttention(AttentionBackend):
       + 1 for output (2 collectives total)
     """
 
+    # One side stream shared across all UlyssesAttention instances on the
+    # same device. Per-layer streams inflate the stream count and break
+    # cuda_graph capture.
+    _side_stream_by_device: ClassVar[Dict[int, "torch.cuda.Stream"]] = {}
+
     def __init__(
         self,
         inner_backend: AttentionBackend,
         process_group: torch.distributed.ProcessGroup,
+        async_pipeline: bool = False,
     ):
         self.inner_backend = inner_backend
         self.process_group = process_group
@@ -104,32 +103,18 @@ class UlyssesAttention(AttentionBackend):
         self.num_heads = self.sharded_num_heads * self.world_size
         self.num_kv_heads = self.sharded_num_kv_heads * self.world_size
 
-        # pg.boxed() is expensive to recreate (~100us); cache on first attach.
+        # Async pipeline state. Eagerly populated when async_pipeline=True;
+        # forward_async assumes these are set. Non-async path doesn't touch
+        # them.
         self._pg_boxed = None
-        self._group_ranks = None
-        # Side stream for the async A2A pipeline; set by setup_async_pipeline.
         self._async_side_stream: Optional[torch.cuda.Stream] = None
-
-    # One side stream shared across all UlyssesAttention instances on the
-    # same device. Per-layer streams inflate the stream count and break
-    # cuda_graph capture.
-    _SIDE_STREAM_BY_DEVICE: ClassVar[Dict[int, "torch.cuda.Stream"]] = {}
-
-    def setup_async_pipeline(self) -> None:
-        """Set up the async A2A pipeline: per-device singleton side stream +
-        cached process-group handles. Callers drive `forward_async` with their
-        own GEMM+norm+RoPE closures; no per-instance torch.compile state is
-        kept here (the outer compile region of the caller's block forward fuses
-        the closure bodies)."""
-        device = torch.cuda.current_device()
-        if device not in UlyssesAttention._SIDE_STREAM_BY_DEVICE:
-            UlyssesAttention._SIDE_STREAM_BY_DEVICE[device] = torch.cuda.Stream(device=device)
-        self._async_side_stream = UlyssesAttention._SIDE_STREAM_BY_DEVICE[device]
-        if self.process_group is not None:
-            self._pg_boxed = self.process_group.boxed()
-            self._group_ranks = sorted(
-                torch.distributed.get_process_group_ranks(self.process_group)
-            )
+        if async_pipeline:
+            device = torch.cuda.current_device()
+            if device not in UlyssesAttention._side_stream_by_device:
+                UlyssesAttention._side_stream_by_device[device] = torch.cuda.Stream(device=device)
+            self._async_side_stream = UlyssesAttention._side_stream_by_device[device]
+            if process_group is not None:
+                self._pg_boxed = process_group.boxed()
 
     def forward(
         self,
@@ -224,7 +209,7 @@ class UlyssesAttention(AttentionBackend):
     def _issue_async(self, perm_4d: torch.Tensor) -> torch.Tensor:
         """Issue one V/Q/K async a2a.
         Phase 1 (acquire slot + CUDA C permute+scatter) runs on the CURRENT
-        (default) stream. Phase 2 (cudaMemcpyBatchAsync peer push + LSA
+        (default) stream. Phase 2 (cudaMemcpyBatchAsync peer push + symm-mem
         barrier) is queued on the comm side stream, gated by an event so it
         waits for Phase 1 to complete. Returns the 5D recv-buf view.
 
@@ -232,14 +217,12 @@ class UlyssesAttention(AttentionBackend):
         no explicit chain event is needed between them. The default stream
         is free to immediately begin the next V/Q/K compute — that's where
         the V_push ∥ Q_compute ∥ K_compute overlap comes from."""
-        recv, send_h = torch.ops.trtllm.ulysses_a2a_async_prepare(
-            perm_4d, self._group_ranks, self._pg_boxed
-        )
+        recv, send_h = torch.ops.trtllm.ulysses_a2a_async_prepare(perm_4d, self._pg_boxed)
         ev = torch.cuda.Event()
         ev.record()
         with torch.cuda.stream(self._async_side_stream):
             ev.wait()
-            torch.ops.trtllm.ulysses_a2a_async(send_h, self._group_ranks, self._pg_boxed)
+            torch.ops.trtllm.ulysses_a2a_async(send_h, self._pg_boxed)
         return recv
 
     @torch.compiler.disable(recursive=False)
@@ -294,13 +277,12 @@ class UlyssesAttention(AttentionBackend):
         self._join_async()
 
         # Fast path: one fused kernel replaces the 6-kernel HND chain (3
-        # permute+reshape+contig + 3 transpose+contig). Falls back to the
-        # eager chain when the kernel's shape constraints aren't met.
+        # permute+reshape+contig + 3 transpose+contig). NHD backends keep
+        # the 3-copy eager permute path (kernel only outputs HND).
         _, B_q, Sp_q, HpP_q, D_q = q_5d.shape
         use_fused_op = (
             self.inner_backend.preferred_layout == AttentionTensorLayout.HND
             and q_5d.dtype == torch.bfloat16
-            and _can_use_fused_post_unscatter(HpP_q, D_q)
         )
         if use_fused_op:
             q_out, k_out, v_out = _ulysses_post_unscatter_to_hnd(q_5d, k_5d, v_5d)
@@ -779,6 +761,7 @@ def wrap_parallel_attention(
     *,
     visual_gen_mapping: Optional["VisualGenMapping"] = None,
     enable_sequence_parallel: bool = True,
+    async_pipeline: bool = False,
 ) -> AttentionBackend:
     """Wrap a compute backend with the configured parallelism strategy.
 
@@ -807,5 +790,9 @@ def wrap_parallel_attention(
         attn = RingAttention(attn, process_group=vgm.ring_group)
 
     if ulysses_size > 1:
-        attn = UlyssesAttention(attn, process_group=vgm.ulysses_group)
+        attn = UlyssesAttention(
+            attn,
+            process_group=vgm.ulysses_group,
+            async_pipeline=async_pipeline,
+        )
     return attn
