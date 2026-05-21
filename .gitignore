@@ -113,19 +113,3 @@ enroot/tensorrt_llm.devel.sqsh
 .claude/agent-memory/
 .claude/agent-tests/perf-test-sync/report.html
 .claude/agent-tests/perf-test-sync/results.json
-
-# for scaffolding
-CLAUDE.local.md
-uv.lock
-swebench_output/
-iter_research_output/
-open_deep_research_output/
-tot_research_output/
-examples/scaffolding/contrib/iter_research/search_datasets/
-examples/scaffolding/contrib/open_deep_research/search_datasets/
-examples/scaffolding/contrib/tree_of_thought_research/datasets
-examples/scaffolding/trace_replay/traces
-TRACES/
-TRACES_backup/
-TRACES_opus_default/
-TRACES_opus_reason/
