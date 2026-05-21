@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -55,11 +55,8 @@ std::string genUniqueAgentName()
 // layer num, since the buffer size is ratio is equal to the layer num ratio
 // except the VSWA case.
 
-template <typename CacheStateT>
-auto computeSendOffsetRatio(
-    CacheStateT const& peerCacheState, int peerIdx, CacheStateT const& selfCacheState, int connectionIdx)
+auto computeSendOffsetRatio(TargetRanksInfo const& peerTargetInfo, int connectionIdx)
 {
-    auto peerTargetInfo = targetIRanks(selfCacheState, peerCacheState, peerIdx);
     size_t offsetLayer = 0;
     for (int i = 0; i < connectionIdx; i++)
     {
@@ -98,6 +95,14 @@ AgentState const* findAgentState(CommState const& commState, std::string const& 
         }
     }
     return nullptr;
+}
+
+void validateConnectionIdx(
+    int connectionIdx, TargetRanksInfo const& targetInfo, char const* bufferKind, std::string const& remoteAgentName)
+{
+    TLLM_CHECK_WITH_INFO(static_cast<size_t>(connectionIdx) < targetInfo.mIRanks.size(),
+        "AgentConnectionManager received %s connection index %d outside target rank count %zu from agent '%s'",
+        bufferKind, connectionIdx, targetInfo.mIRanks.size(), remoteAgentName.c_str());
 }
 
 } // namespace
@@ -166,6 +171,8 @@ void AgentConnection::send(DataContext const& ctx, void const* data, size_t size
     auto const& dstBaseDesc = mSenderState.activeBufferDesc();
     auto const& offsetRatio = mSenderState.activeOffsetRatio();
     TLLM_CHECK_WITH_INFO(offsetRatio.second != 0, "AgentConnection::send offset ratio denominator cannot be 0");
+    TLLM_CHECK_WITH_INFO(
+        size % offsetRatio.second == 0, "AgentConnection::send size is not divisible by offset ratio denominator");
     TLLM_CHECK_WITH_INFO(size <= dstBaseDesc.getLen(), "AgentConnection::send size exceeds destination buffer");
     auto const chunkSize = size / offsetRatio.second;
     TLLM_CHECK_WITH_INFO(offsetRatio.first == 0 || chunkSize <= std::numeric_limits<size_t>::max() / offsetRatio.first,
@@ -505,10 +512,11 @@ AgentConnection const* AgentConnectionManager::recvConnectionAndRequestInfo(
                         {
                             if (!kvOffsetRatio)
                             {
-                                kvOffsetRatio
-                                    = computeSendOffsetRatio(requestInfo.getTransState().getCacheState().value(),
-                                        requestInfo.getTransState().getCommState()->getSelfIdx(), mCacheState,
-                                        connectionIdx);
+                                auto kvTargetInfo
+                                    = targetIRanks(mCacheState, requestInfo.getTransState().getCacheState().value(),
+                                        requestInfo.getTransState().getCommState()->getSelfIdx());
+                                validateConnectionIdx(connectionIdx, kvTargetInfo, "KV", remoteAgentName);
+                                kvOffsetRatio = computeSendOffsetRatio(kvTargetInfo, connectionIdx);
                             }
                             offsetRatios.push_back(*kvOffsetRatio);
                             break;
@@ -520,6 +528,7 @@ AgentConnection const* AgentConnectionManager::recvConnectionAndRequestInfo(
                                 auto rnnTargetInfo = targetIRanksForRnn(mCacheState,
                                     requestInfo.getTransState().getCacheState().value(),
                                     requestInfo.getTransState().getCommState()->getSelfIdx());
+                                validateConnectionIdx(connectionIdx, rnnTargetInfo, "RNN", remoteAgentName);
                                 size_t rnnOffsetLayer = 0;
                                 for (int ri = 0; ri < connectionIdx; ri++)
                                 {
