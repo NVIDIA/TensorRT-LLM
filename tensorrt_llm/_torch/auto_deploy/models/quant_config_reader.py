@@ -162,7 +162,14 @@ class ModelOPTQuantConfigReader(QuantConfigReader):
         if kv_algo:
             if kv_algo != "FP8":
                 raise ValueError(f"KV cache quantization format {kv_algo} not supported.")
-            quant_config["kv_cache_dtype"] = "fp8"
+            # AD_DISABLE_FP8_KV_CACHE=1 forces BF16 KV cache regardless of model quant config.
+            # This avoids the FP8 FMHA NVRTC path on systems where it crashes (e.g. GB200 SM100).
+            if os.environ.get("AD_DISABLE_FP8_KV_CACHE", "0") == "1":
+                ad_logger.warning(
+                    "AD_DISABLE_FP8_KV_CACHE=1: overriding FP8 KV cache to BF16 (auto)."
+                )
+            else:
+                quant_config["kv_cache_dtype"] = "fp8"
 
     @classmethod
     def from_file(

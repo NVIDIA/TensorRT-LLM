@@ -364,12 +364,27 @@ class NemotronHTopkRouter(nn.Module):
         with optimized CUDA kernels:
         """
         hidden_states = hidden_states.view(-1, self.config.hidden_size)
-        if self.weight.dtype == torch.float32:
-            router_logits = F.linear(hidden_states.type(torch.float32), self.weight)
-        else:
+        # dsv3_router_gemm_op has a custom fast kernel only for DSv3-specific dimensions
+        # (num_experts=256, hidden_dim=7168, num_tokens in [1,16]). For all other configs
+        # (e.g. SuperV3 with n_routed_experts=512, hidden_size=4096) it falls through to a
+        # cuBLAS path that is broken on GB200 (SM100). Use F.linear with fp32 upcast instead.
+        _DSV3_NUM_EXPERTS = 256
+        _DSV3_HIDDEN_DIM = 7168
+        use_dsv3_kernel = (
+            self.weight.dtype != torch.float32
+            and self.weight.shape[0] == _DSV3_NUM_EXPERTS
+            and self.weight.shape[1] == _DSV3_HIDDEN_DIM
+        )
+        if use_dsv3_kernel:
             router_logits = torch.ops.trtllm.dsv3_router_gemm_op(
                 hidden_states, self.weight.t(), bias=None, out_dtype=torch.float32
             )
+        else:
+            # Avoid upcasting to float32 for the GEMM: cublasSgemm(float) fails on GB200 (SM100).
+            # Instead, run the GEMM in the weight's native dtype (BF16 after model load) and
+            # cast the result to float32 for noaux_tc_op.
+            w_dtype = self.weight.dtype if self.weight.dtype != torch.float32 else torch.bfloat16
+            router_logits = F.linear(hidden_states.to(w_dtype), self.weight.to(w_dtype)).to(torch.float32)
 
         # Use the fused noaux_tc_op kernel which applies sigmoid internally
         # and performs group-based top-k selection with normalization
