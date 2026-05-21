@@ -97,6 +97,17 @@ from .harmony_adapter import (HarmonyAdapter, get_harmony_adapter,
 # yapf: enable
 TIMEOUT_KEEP_ALIVE = 5  # seconds.
 
+_SERVER_PROCESSING_TIMEPOINTS = (
+    "server_preprocess_start_time",
+    "server_prompt_preprocess_start_time",
+    "server_prompt_preprocess_end_time",
+    "server_input_preprocess_start_time",
+    "server_input_preprocess_end_time",
+    "server_preprocess_end_time",
+    "server_postprocess_start_time",
+    "server_postprocess_end_time",
+)
+
 
 def _build_tool_strict_guided_decoding_params(tools, tool_parser_name):
     """Build GuidedDecodingParams with structural tags for tools with strict=True.
@@ -548,6 +559,16 @@ class OpenAIServer:
             status_code=HTTPStatus.NOT_IMPLEMENTED,
         )
 
+    @staticmethod
+    def _record_server_timepoint(raw_request: Optional[Request],
+                                 name: str,
+                                 overwrite: bool = True) -> None:
+        if raw_request is None:
+            return
+        if overwrite or getattr(raw_request.state, name, None) is None:
+            setattr(raw_request.state, name,
+                    get_steady_clock_now_in_seconds())
+
     def _check_health(self) -> bool:
         if isinstance(self.generator, LLM):
             return self.generator._check_health()
@@ -830,6 +851,12 @@ class OpenAIServer:
                 "server_first_token_time", None)
             if server_first_token_time is not None:
                 server_first_token_time += self.disagg_server_steady_clock_offset
+            server_processing_timepoints = {}
+            for timepoint in _SERVER_PROCESSING_TIMEPOINTS:
+                value = metrics_dict.pop(timepoint, None)
+                if value is not None:
+                    value += self.disagg_server_steady_clock_offset
+                    server_processing_timepoints[timepoint] = value
             metrics_json["timing_metrics"] = {
                 "server_arrival_time":
                 server_arrival_time,
@@ -848,6 +875,7 @@ class OpenAIServer:
                 timing_metrics.last_token_time.total_seconds() +
                 self.disagg_server_steady_clock_offset,
             }
+            metrics_json["timing_metrics"].update(server_processing_timepoints)
             metrics_json["kv_cache_metrics"] = {
                 "num_total_allocated_blocks":
                 kv_cache_metrics.num_total_allocated_blocks,
@@ -890,6 +918,9 @@ class OpenAIServer:
         return JSONResponse(content=events)
 
     async def _extract_metrics(self, res: RequestOutput, raw_request: Request):
+        import logging as _xlg
+        _has_perf = getattr(res.outputs[0], "request_perf_metrics", None) is not None if res.outputs else False
+        logger.info(f"_EXTRACT_METRICS: finished={res.finished}, has_perf={_has_perf}")
         if not res.finished:
             return
         if self.metrics_collector:
@@ -907,6 +938,7 @@ class OpenAIServer:
                 self._iteration_stats_wakeup_event.set()
         if self.generator.args.return_perf_metrics:
             output = res.outputs[0]
+            logger.info(f"_EXTRACT_METRICS: return_perf_metrics=True, perf_metrics_val={output.request_perf_metrics}, perf_deque_exists={self.perf_metrics is not None}")
             item = {
                 "request_id": res.request_id,
                 "perf_metrics": res.outputs[0].request_perf_metrics
@@ -921,15 +953,28 @@ class OpenAIServer:
                     )
                 item[
                     "server_first_token_time"] = raw_request.state.server_first_token_time
+                for timepoint in _SERVER_PROCESSING_TIMEPOINTS:
+                    value = getattr(raw_request.state, timepoint, None)
+                    if value is not None:
+                        item[timepoint] = value
             if output.disaggregated_params:
                 item[
                     "ctx_request_id"] = output.disaggregated_params.ctx_request_id
+            # Preprocess (tokenization) time from LLM.generate_async
+            if hasattr(res, 'metrics_dict') and res.metrics_dict.get("preprocess_time_ms") is not None:
+                item["preprocess_time_ms"] = res.metrics_dict["preprocess_time_ms"]
+            # Harmony tokenization time (openai_to_harmony_tokens)
+            if raw_request and getattr(raw_request.state, "harmony_tokenize_time_ms", None) is not None:
+                item["harmony_tokenize_time_ms"] = raw_request.state.harmony_tokenize_time_ms
             # Request-level time breakdown (on GenerationResult/RequestOutput, not CompletionOutput)
             if getattr(res, 'time_breakdown_metrics', None) is not None:
                 item["time_breakdown_metrics"] = res.time_breakdown_metrics
             if self.perf_metrics is not None:
                 async with self.perf_metrics_lock:
                     self.perf_metrics.append(item)
+                    logger.info(f"_EXTRACT_METRICS: APPENDED to deque, len={len(self.perf_metrics)}")
+            else:
+                logger.info("_EXTRACT_METRICS: perf_metrics deque is None, NOT appending")
 
     async def _create_chat_response(
         self,
@@ -938,12 +983,20 @@ class OpenAIServer:
         raw_request: Request,
         disaggregated_params: Optional[LlmDisaggregatedParams] = None
     ) -> ChatCompletionResponse:
+        import logging as _xlg2
+        logger.info(f"_CREATE_CHAT_RESPONSE: called, promise.finished={promise.finished}")
         await promise.aresult()
+        logger.info(f"_CREATE_CHAT_RESPONSE: after aresult, promise.finished={promise.finished}")
+        self._record_server_timepoint(raw_request,
+                                      "server_postprocess_start_time",
+                                      overwrite=False)
         if self.postproc_worker_enabled:
             chat_response = promise.outputs[0]._postprocess_result
         else:
             post_processor, args = postproc_params.post_processor, postproc_params.postproc_args
             chat_response = post_processor(promise, args)
+        self._record_server_timepoint(raw_request,
+                                      "server_postprocess_end_time")
 
         if disaggregated_params is not None and chat_response.choices[
                 0].disaggregated_params is None:
@@ -998,6 +1051,7 @@ class OpenAIServer:
 
     async def openai_chat(self, request: ChatCompletionRequest,
                           raw_request: Request) -> Response:
+        logger.info(f"OPENAI_CHAT_ENTRY: stream={request.stream}, model={request.model}")
 
         def get_role() -> str:
             if request.add_generation_prompt:
@@ -1009,33 +1063,53 @@ class OpenAIServer:
         async def chat_stream_generator(
                 promise: RequestOutput,
                 postproc_params: PostprocParams) -> AsyncGenerator[str, None]:
+            res = None
             try:
                 if not self.postproc_worker_enabled:
                     post_processor, args = postproc_params.post_processor, postproc_params.postproc_args
                 first_response = await anext(promise)
                 raw_request.state.server_first_token_time = get_steady_clock_now_in_seconds(
                 )
+                logger.info(f'STREAM_FIRST: finished={first_response.finished}')
+                self._record_server_timepoint(raw_request,
+                                              "server_postprocess_start_time",
+                                              overwrite=False)
                 pp_results = first_response.outputs[
                     0]._postprocess_result if self.postproc_worker_enabled else post_processor(
                         first_response, args)
+                self._record_server_timepoint(raw_request,
+                                              "server_postprocess_end_time")
                 for pp_res in pp_results:
                     yield pp_res
                 # Making sure we can handle the situation where there is only one response
                 res = first_response
                 async for res in promise:
+                    self._record_server_timepoint(
+                        raw_request,
+                        "server_postprocess_start_time",
+                        overwrite=False)
                     pp_results = res.outputs[
                         0]._postprocess_result if self.postproc_worker_enabled else post_processor(
                             res, args)
+                    self._record_server_timepoint(
+                        raw_request, "server_postprocess_end_time")
                     for pp_res in pp_results:
+                        logger.info(f'STREAM_YIELD: finished={res.finished}, outputs={len(res.outputs)}')
                         yield pp_res
                 yield "data: [DONE]\n\n"
-                await self._extract_metrics(res, raw_request)
                 nvtx_mark("generation ends")
+            except GeneratorExit:
+                pass
             except:
                 logger.error(traceback.format_exc())
                 raise
+            finally:
+                if res is not None:
+                    await self._extract_metrics(res, raw_request)
 
         try:
+            self._record_server_timepoint(raw_request,
+                                          "server_preprocess_start_time")
             conversation: List[ConversationMessage] = []
             tool_dicts = None if request.tools is None else [
                 tool.model_dump() for tool in request.tools
@@ -1081,6 +1155,10 @@ class OpenAIServer:
             if request.prompt_token_ids is not None:
                 prompt = request.prompt_token_ids
             else:
+                import time as _time
+                _tok_start = _time.perf_counter()
+                self._record_server_timepoint(
+                    raw_request, "server_prompt_preprocess_start_time")
                 prompt: str = apply_chat_template(
                     model_type=self.model_config.model_type,
                     tokenizer=self.tokenizer,
@@ -1093,6 +1171,10 @@ class OpenAIServer:
                     chat_template=request.chat_template or self.chat_template,
                     chat_template_kwargs=request.chat_template_kwargs or {},
                 )
+                raw_request.state.harmony_tokenize_time_ms = (
+                    _time.perf_counter() - _tok_start) * 1000.0
+                self._record_server_timepoint(
+                    raw_request, "server_prompt_preprocess_end_time")
             prompt = prompt_inputs(prompt)
 
             mm_data, mm_embeddings = await mm_coroutines
@@ -1123,10 +1205,16 @@ class OpenAIServer:
             generate_inputs = prompt
             preprocess_fn = getattr(self.generator, "preprocess", None)
             if preprocess_fn is not None:
+                self._record_server_timepoint(
+                    raw_request, "server_input_preprocess_start_time")
                 generate_inputs = await asyncio.to_thread(
                     preprocess_fn, prompt, sampling_params,
                     disaggregated_params)
+                self._record_server_timepoint(
+                    raw_request, "server_input_preprocess_end_time")
 
+            self._record_server_timepoint(raw_request,
+                                          "server_preprocess_end_time")
             promise = self.generator.generate_async(
                 inputs=generate_inputs,
                 sampling_params=sampling_params,
@@ -1146,6 +1234,28 @@ class OpenAIServer:
             if request.stream:
                 response_generator = chat_stream_generator(
                     promise, postproc_params)
+
+                async def _deferred_extract_metrics(p=promise, rr=raw_request):
+                    import logging as _lg
+                    _log = _lg.getLogger('trt_llm')
+                    try:
+                        import asyncio as _aio
+                        for i in range(600):
+                            if p.finished:
+                                _log.warning(f'DEFERRED: promise finished after {i} polls, has_perf={p.outputs[0].request_perf_metrics is not None}')
+                                break
+                            await _aio.sleep(0.1)
+                        if p.finished:
+                            await self._extract_metrics(p, rr)
+                            _log.warning('DEFERRED: _extract_metrics done')
+                        else:
+                            _log.warning(f'DEFERRED: timeout, finished={p.finished}, done={getattr(p, _done, N/A)}')
+                    except Exception as e:
+                        _log.warning(f'DEFERRED: exception: {e}')
+                asyncio.create_task(_deferred_extract_metrics())
+
+
+
                 return StreamingResponse(content=response_generator,
                                          media_type="text/event-stream")
             else:
@@ -1265,11 +1375,16 @@ class OpenAIServer:
                 postproc_params: Optional[PostprocParams]
         ) -> CompletionResponse:
             response = await promise
+            self._record_server_timepoint(raw_request,
+                                          "server_postprocess_start_time",
+                                          overwrite=False)
             if not self.postproc_worker_enabled:
                 post_processor, args = postproc_params.post_processor, postproc_params.postproc_args
                 pp_result = post_processor(response, args)
             else:
                 pp_result = response.outputs[0]._postprocess_result
+            self._record_server_timepoint(raw_request,
+                                          "server_postprocess_end_time")
             if disaggregated_params and disaggregated_params.request_type and disaggregated_params.request_type == "context_only":
                 # Include prompt token ids for context-only requests
                 pp_result.prompt_token_ids = response.prompt_token_ids
@@ -1310,11 +1425,17 @@ class OpenAIServer:
                                        params: Optional[PostprocParams]):
             try:
                 async for output in promise:
+                    self._record_server_timepoint(
+                        raw_request,
+                        "server_postprocess_start_time",
+                        overwrite=False)
                     if not self.postproc_worker_enabled:
                         post_processor, args = params.post_processor, params.postproc_args
                         pp_result = post_processor(output, args)
                     else:
                         pp_result = output.outputs[0]._postprocess_result
+                    self._record_server_timepoint(
+                        raw_request, "server_postprocess_end_time")
                     for pp_res in pp_result:
                         yield pp_res
                 await self._extract_metrics(output, raw_request)
@@ -1364,6 +1485,8 @@ class OpenAIServer:
             yield "data: [DONE]\n\n"
 
         try:
+            self._record_server_timepoint(raw_request,
+                                          "server_preprocess_start_time")
             if isinstance(request.prompt, str) or \
                 (isinstance(request.prompt, list) and isinstance(request.prompt[0], int)):
                 prompts = [request.prompt]
@@ -1398,6 +1521,10 @@ class OpenAIServer:
                                  tracing.extract_trace_headers(
                                      raw_request.headers))
 
+                self._record_server_timepoint(
+                    raw_request,
+                    "server_prompt_preprocess_start_time",
+                    overwrite=False)
                 prompt = prompt_inputs(prompt)
                 if prompt.get("prompt") is not None:
                     prompt_token_ids, extra_processed_inputs = await asyncio.to_thread(
@@ -1409,7 +1536,11 @@ class OpenAIServer:
                         if extra_processed_inputs is not None else None)
                 else:
                     tokens_prompt = prompt
+                self._record_server_timepoint(
+                    raw_request, "server_prompt_preprocess_end_time")
 
+                self._record_server_timepoint(raw_request,
+                                              "server_preprocess_end_time")
                 promise = self.generator.generate_async(
                     inputs=tokens_prompt,
                     sampling_params=sampling_params,
@@ -1463,18 +1594,28 @@ class OpenAIServer:
 
         async def create_streaming_generator(promise: RequestOutput,
                                              postproc_params: PostprocParams):
+            res = None
             async for res in promise:
+                self._record_server_timepoint(raw_request,
+                                              "server_postprocess_start_time",
+                                              overwrite=False)
                 if not self.postproc_worker_enabled:
                     post_processor, args = postproc_params.post_processor, postproc_params.postproc_args
                     pp_results = post_processor(res, args)
                 else:
                     pp_results = res.outputs[0]._postprocess_result
+                self._record_server_timepoint(raw_request,
+                                              "server_postprocess_end_time")
                 for pp_res in pp_results:
                     yield pp_res
 
+            if res is not None:
+                await self._extract_metrics(res, raw_request)
             yield "data: [DONE]\n\n"
 
         try:
+            self._record_server_timepoint(raw_request,
+                                          "server_preprocess_start_time")
             # Initialize HarmonyAdapter
             # NOTE: WAR for Disagg failure, may affect perf if no warmup
             if not self.harmony_adapter:
@@ -1491,11 +1632,19 @@ class OpenAIServer:
             tool_choice = getattr(request, 'tool_choice', None)
 
             try:
+                import time as _time
+                _tok_start = _time.perf_counter()
+                self._record_server_timepoint(
+                    raw_request, "server_prompt_preprocess_start_time")
                 harmony_tokens = self.harmony_adapter.openai_to_harmony_tokens(
                     request.messages,
                     tools_dict,
                     reasoning_effort=reasoning_effort,
                     tool_choice=tool_choice)
+                raw_request.state.harmony_tokenize_time_ms = (
+                    _time.perf_counter() - _tok_start) * 1000.0
+                self._record_server_timepoint(
+                    raw_request, "server_prompt_preprocess_end_time")
             except Exception as e:
                 logger.error(f"messages_dict: {request.messages}")
                 logger.error(f"tools_dict: {tools_dict}")
@@ -1526,6 +1675,8 @@ class OpenAIServer:
             )
 
             # Generate
+            self._record_server_timepoint(raw_request,
+                                          "server_preprocess_end_time")
             promise = self.generator.generate_async(
                 inputs=harmony_tokens,
                 sampling_params=sampling_params,

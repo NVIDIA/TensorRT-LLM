@@ -169,16 +169,22 @@ class DisaggPerfMetricsCollector:
         ctx_request_id: int,
         server_arrival_time: float,
         server_first_token_time: float,
+        ctx_router_latency_ms: float = 0.0,
+        gen_router_latency_ms: float = 0.0,
+        pretokenize_latency_ms: float = 0.0,
     ):
         async with self._lock:
             self._request_meteics.append(
-                (
-                    ctx_server,
-                    gen_server,
-                    ctx_request_id,
-                    server_arrival_time,
-                    server_first_token_time,
-                )
+                {
+                    "ctx_server": ctx_server,
+                    "gen_server": gen_server,
+                    "ctx_request_id": ctx_request_id,
+                    "server_arrival_time": server_arrival_time,
+                    "server_first_token_time": server_first_token_time,
+                    "ctx_router_latency_ms": ctx_router_latency_ms,
+                    "gen_router_latency_ms": gen_router_latency_ms,
+                    "pretokenize_latency_ms": pretokenize_latency_ms,
+                }
             )
 
     async def get_perf_metrics(self) -> List[Dict[str, Any]]:
@@ -203,25 +209,27 @@ class DisaggPerfMetricsCollector:
                 server_metrics.update(req_metrics_map)
 
             remain_keys = []
-            for (
-                ctx_server,
-                gen_server,
-                ctx_request_id,
-                server_arrival_time,
-                server_first_token_time,
-            ) in self._request_meteics:
+            for entry in self._request_meteics:
+                if isinstance(entry, dict):
+                    ctx_server = entry["ctx_server"]
+                    gen_server = entry["gen_server"]
+                    ctx_request_id = entry["ctx_request_id"]
+                    server_arrival_time = entry["server_arrival_time"]
+                    server_first_token_time = entry["server_first_token_time"]
+                    ctx_router_latency_ms = entry.get("ctx_router_latency_ms", 0.0)
+                    gen_router_latency_ms = entry.get("gen_router_latency_ms", 0.0)
+                    pretokenize_latency_ms = entry.get("pretokenize_latency_ms", 0.0)
+                else:
+                    # Legacy tuple format
+                    (ctx_server, gen_server, ctx_request_id,
+                     server_arrival_time, server_first_token_time) = entry[:5]
+                    ctx_router_latency_ms = 0.0
+                    gen_router_latency_ms = 0.0
+                    pretokenize_latency_ms = 0.0
                 gen_perf_metrics = self._server_metrics[gen_server].pop(ctx_request_id, None)
                 if gen_perf_metrics is None:
                     # generation not finished
-                    remain_keys.append(
-                        (
-                            ctx_server,
-                            gen_server,
-                            ctx_request_id,
-                            server_arrival_time,
-                            server_first_token_time,
-                        )
-                    )
+                    remain_keys.append(entry)
                     continue
                 ctx_perf_metrics = self._server_metrics[ctx_server].pop(ctx_request_id, None)
                 # TODO: strip the keys for less repeating and use table style response
@@ -231,6 +239,9 @@ class DisaggPerfMetricsCollector:
                         "gen_server": gen_server,
                         "disagg_server_arrival_time": server_arrival_time,
                         "disagg_server_first_token_time": server_first_token_time,
+                        "ctx_router_latency_ms": ctx_router_latency_ms,
+                        "gen_router_latency_ms": gen_router_latency_ms,
+                        "pretokenize_latency_ms": pretokenize_latency_ms,
                         "ctx_perf_metrics": ctx_perf_metrics,
                         "gen_perf_metrics": gen_perf_metrics,
                     }

@@ -1,5 +1,5 @@
 import asyncio
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 import torch
@@ -8,6 +8,7 @@ from tensorrt_llm.executor.result import Logprob
 from tensorrt_llm.llmapi.disagg_utils import DisaggServerConfig
 from tensorrt_llm.serve.openai_disagg_service import OpenAIDisaggregatedService
 from tensorrt_llm.serve.openai_protocol import (
+    ChatCompletionRequest,
     CompletionRequest,
     CompletionResponse,
     CompletionResponseChoice,
@@ -61,6 +62,97 @@ def _make_completion_response(
             )
         ],
     )
+
+
+@pytest.mark.asyncio
+async def test_pretokenize_completion_erases_prompt(monkeypatch):
+    service = _make_service("context_first")
+    tokenized_prompt = [[10, 20, 30]]
+    tokenize = Mock(return_value=tokenized_prompt)
+    to_thread_calls = []
+
+    async def _fake_to_thread(func, *args, **kwargs):
+        to_thread_calls.append((func, args, kwargs))
+        return func(*args, **kwargs)
+
+    monkeypatch.setattr(asyncio, "to_thread", _fake_to_thread)
+    monkeypatch.setattr(
+        "tensorrt_llm.serve.openai_disagg_service.tokenize_request", tokenize)
+
+    request = CompletionRequest(model="test-model", prompt="hello")
+    pretokenized = await service._pretokenize_request(request)
+
+    assert pretokenized is request
+    assert pretokenized.prompt == tokenized_prompt[0]
+    assert to_thread_calls == [
+        (tokenize, (request, service._pretokenize_tokenizers,
+                    service._pretokenize_model_types,
+                    service._pretokenize_custom_tokenizer,
+                    service._pretokenize_use_harmony), {})
+    ]
+    tokenize.assert_called_once_with(request, service._pretokenize_tokenizers,
+                                     service._pretokenize_model_types,
+                                     service._pretokenize_custom_tokenizer,
+                                     service._pretokenize_use_harmony)
+
+
+@pytest.mark.asyncio
+async def test_pretokenize_chat_keeps_messages(monkeypatch):
+    service = _make_service("context_first")
+    tokenized_prompt = [[101, 102, 103]]
+    tokenize = Mock(return_value=tokenized_prompt)
+    to_thread_calls = []
+
+    async def _fake_to_thread(func, *args, **kwargs):
+        to_thread_calls.append((func, args, kwargs))
+        return func(*args, **kwargs)
+
+    monkeypatch.setattr(asyncio, "to_thread", _fake_to_thread)
+    monkeypatch.setattr(
+        "tensorrt_llm.serve.openai_disagg_service.tokenize_request", tokenize)
+
+    request = ChatCompletionRequest(model="test-model",
+                                    messages=[{
+                                        "role": "user",
+                                        "content": "hello"
+                                    }])
+    pretokenized = await service._pretokenize_request(request)
+
+    assert pretokenized is request
+    assert pretokenized.prompt_token_ids == tokenized_prompt[0]
+    assert pretokenized.messages == [{"role": "user", "content": "hello"}]
+    assert to_thread_calls == [
+        (tokenize, (request, service._pretokenize_tokenizers,
+                    service._pretokenize_model_types,
+                    service._pretokenize_custom_tokenizer,
+                    service._pretokenize_use_harmony), {})
+    ]
+    tokenize.assert_called_once_with(request, service._pretokenize_tokenizers,
+                                     service._pretokenize_model_types,
+                                     service._pretokenize_custom_tokenizer,
+                                     service._pretokenize_use_harmony)
+
+
+@pytest.mark.asyncio
+async def test_openai_completion_pretokenizes_at_entrypoint(monkeypatch):
+    service = _make_service("context_first")
+    service.is_ready = AsyncMock(return_value=True)
+    service._send_disagg_request = AsyncMock(return_value="done")
+    tokenize = Mock(return_value=[[10, 20, 30]])
+
+    async def _fake_to_thread(func, *args, **kwargs):
+        return func(*args, **kwargs)
+
+    monkeypatch.setattr(asyncio, "to_thread", _fake_to_thread)
+    monkeypatch.setattr(
+        "tensorrt_llm.serve.openai_disagg_service.tokenize_request", tokenize)
+
+    request = CompletionRequest(model="test-model", prompt="hello")
+    result = await service.openai_completion(request)
+
+    assert result == "done"
+    assert request.prompt == [10, 20, 30]
+    service._send_disagg_request.assert_called_once_with(request, None)
 
 
 async def _mock_streaming_response(chunks):

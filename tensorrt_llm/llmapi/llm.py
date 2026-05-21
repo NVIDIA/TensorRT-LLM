@@ -465,9 +465,12 @@ class BaseLLM:
             prompt = None
             query_token_ids = inputs.query_token_ids
             multimodal_params = inputs.multimodal_params
+            preprocess_time_ms = 0.0
         else:
+            t0 = time.perf_counter()
             prompt_token_ids, prompt, query_token_ids, multimodal_params = (
                 self._preprocess(inputs, sampling_params, disaggregated_params))
+            preprocess_time_ms = (time.perf_counter() - t0) * 1000.0
 
         arrival_time = steady_clock_now(
         ) if self.args.return_perf_metrics else None
@@ -499,8 +502,10 @@ class BaseLLM:
         )
 
         if sampling_params.return_perf_metrics:
-            result.metrics_dict.update(
-                {MetricNames.ARRIVAL_TIMESTAMP: time.time()})
+            result.metrics_dict.update({
+                MetricNames.ARRIVAL_TIMESTAMP: time.time(),
+                "preprocess_time_ms": preprocess_time_ms,
+            })
 
         return RequestOutput._from_generation_result(result, prompt,
                                                      self.tokenizer)

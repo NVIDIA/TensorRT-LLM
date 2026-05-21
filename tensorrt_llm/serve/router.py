@@ -21,6 +21,116 @@ from tensorrt_llm.serve.openai_protocol import (ChatCompletionRequest,
 OpenAIRequest = Union[CompletionRequest, ChatCompletionRequest]
 
 
+def _get_tokenizer(model: str,
+                   tokenizers: dict,
+                   custom_tokenizer: Optional[str] = None):
+    if model not in tokenizers:
+        if custom_tokenizer:
+            from tensorrt_llm.tokenizer import load_custom_tokenizer
+            tokenizers[model] = load_custom_tokenizer(custom_tokenizer, model)
+        else:
+            tokenizers[model] = AutoTokenizer.from_pretrained(
+                model, trust_remote_code=True)
+    return tokenizers[model]
+
+
+def _get_model_type(model: str, model_types: dict[str,
+                                                  Optional[str]]) -> Optional[str]:
+    if model not in model_types:
+        model_type = None
+        normalized_model = model.lower().replace("_", "-")
+        if "gpt-oss" in normalized_model or "gptoss" in normalized_model:
+            model_type = "gpt_oss"
+        else:
+            config_path = os.path.join(model, "config.json")
+            if os.path.isfile(config_path):
+                try:
+                    with open(config_path, encoding="utf-8") as config_file:
+                        config = json.load(config_file)
+                    raw_model_type = config.get("model_type")
+                    if isinstance(raw_model_type, str):
+                        model_type = raw_model_type
+                except (OSError, json.JSONDecodeError) as e:
+                    logger.debug(
+                        "tokenize_request: failed to read model config for "
+                        f"{model}: {e}")
+        model_types[model] = model_type
+    return model_types[model]
+
+
+def _uses_harmony_tokenization(request: ChatCompletionRequest,
+                               model_types: dict[str, Optional[str]],
+                               use_harmony: Optional[bool] = None) -> bool:
+    if use_harmony is not None:
+        return use_harmony
+    return _get_model_type(request.model, model_types) == "gpt_oss"
+
+
+def _tool_dicts(request: ChatCompletionRequest) -> Optional[list[dict]]:
+    return (None if getattr(request, "tools", None) is None else [
+        tool.model_dump() if hasattr(tool, "model_dump") else tool
+        for tool in request.tools
+    ])
+
+
+def _tokenize_harmony_chat(
+        request: ChatCompletionRequest) -> list[list[int]]:
+    from tensorrt_llm.serve import harmony_adapter
+
+    tools = _tool_dicts(request) if request.tools else None
+    result = harmony_adapter.get_harmony_adapter().openai_to_harmony_tokens(
+        request.messages,
+        tools,
+        reasoning_effort=harmony_adapter.maybe_transform_reasoning_effort(
+            request.reasoning_effort),
+        tool_choice=getattr(request, "tool_choice", None),
+    )
+    return [result]
+
+
+def tokenize_request(request: OpenAIRequest,
+                     tokenizers: Optional[dict] = None,
+                     model_types: Optional[dict[str, Optional[str]]] = None,
+                     custom_tokenizer: Optional[str] = None,
+                     use_harmony: Optional[bool] = None) -> list[list[int]]:
+    """Tokenize an OpenAI request using the KV-cache-aware router logic."""
+    tokenizers = tokenizers if tokenizers is not None else {}
+    model_types = model_types if model_types is not None else {}
+
+    if isinstance(request, ChatCompletionRequest):
+        if request.prompt_token_ids is not None:
+            return [request.prompt_token_ids]
+        if _uses_harmony_tokenization(request, model_types, use_harmony):
+            return _tokenize_harmony_chat(request)
+        tokenizer = _get_tokenizer(request.model, tokenizers, custom_tokenizer)
+        tool_dicts = _tool_dicts(request)
+        chat_template_kwargs = (request.chat_template_kwargs if getattr(
+            request, "chat_template_kwargs", None) else {})
+        result = tokenizer.apply_chat_template(
+            [msg if isinstance(msg, dict) else dict(msg) for msg in request.messages],
+            add_generation_prompt=request.add_generation_prompt,
+            tokenize=True,
+            tools=tool_dicts,
+            **chat_template_kwargs,
+        )
+        if isinstance(result, str):
+            result = tokenizer.encode(result, add_special_tokens=False)
+        return [result]
+
+    prompts = request.prompt
+    if isinstance(prompts, list) and isinstance(prompts[0], list):
+        return prompts
+    if isinstance(prompts, list) and isinstance(prompts[0], int):
+        return [prompts]
+    if isinstance(prompts, str):
+        prompts = [prompts]
+    else:
+        assert isinstance(prompts, list) and isinstance(prompts[0], str)
+
+    tokenizer = _get_tokenizer(request.model, tokenizers, custom_tokenizer)
+    return [tokenizer(prompt)["input_ids"] for prompt in prompts]
+
+
 def get_request_num_tokens(request: OpenAIRequest) -> int:
     if request.disaggregated_params is None or request.disaggregated_params.request_type == "context_only":
         if isinstance(request, ChatCompletionRequest):
@@ -693,111 +803,17 @@ class BlockHashMixin:
                     f", use_harmony={self._use_harmony}")
 
     def _get_tokenizer(self, model: str):
-        if model not in self._tokenizers:
-            if self._custom_tokenizer:
-                from tensorrt_llm.tokenizer import load_custom_tokenizer
-                self._tokenizers[model] = load_custom_tokenizer(
-                    self._custom_tokenizer, model)
-            else:
-                self._tokenizers[model] = AutoTokenizer.from_pretrained(
-                    model, trust_remote_code=True)
-        return self._tokenizers[model]
+        return _get_tokenizer(model, self._tokenizers, self._custom_tokenizer)
 
     def _get_model_type(self, model: str) -> Optional[str]:
-        if model not in self._model_types:
-            model_type = None
-            normalized_model = model.lower().replace("_", "-")
-            if "gpt-oss" in normalized_model or "gptoss" in normalized_model:
-                model_type = "gpt_oss"
-            else:
-                config_path = os.path.join(model, "config.json")
-                if os.path.isfile(config_path):
-                    try:
-                        with open(config_path, encoding="utf-8") as config_file:
-                            config = json.load(config_file)
-                        raw_model_type = config.get("model_type")
-                        if isinstance(raw_model_type, str):
-                            model_type = raw_model_type
-                    except (OSError, json.JSONDecodeError) as e:
-                        logger.debug(
-                            "BlockHashMixin: failed to read model config for "
-                            f"{model}: {e}")
-            self._model_types[model] = model_type
-        return self._model_types[model]
-
-    def _uses_harmony_tokenization(self,
-                                   request: ChatCompletionRequest) -> bool:
-        if self._use_harmony is not None:
-            return self._use_harmony
-        return self._get_model_type(request.model) == "gpt_oss"
-
-    @staticmethod
-    def _tool_dicts(request: ChatCompletionRequest) -> Optional[list[dict]]:
-        return (None if getattr(request, "tools", None) is None else [
-            tool.model_dump() if hasattr(tool, "model_dump") else tool
-            for tool in request.tools
-        ])
-
-    def _tokenize_harmony_chat(
-            self, request: ChatCompletionRequest) -> list[list[int]]:
-        from tensorrt_llm.serve import harmony_adapter
-
-        tools = self._tool_dicts(request) if request.tools else None
-        result = harmony_adapter.get_harmony_adapter().openai_to_harmony_tokens(
-            request.messages,
-            tools,
-            reasoning_effort=harmony_adapter.maybe_transform_reasoning_effort(
-                request.reasoning_effort),
-            tool_choice=getattr(request, "tool_choice", None),
-        )
-        return [result]
+        return _get_model_type(model, self._model_types)
 
     def _tokenize(self, request: OpenAIRequest) -> list[list[int]]:
-        # Handle ChatCompletionRequest (has messages, not prompt)
-        if isinstance(request, ChatCompletionRequest):
-            if request.prompt_token_ids is not None:
-                return [request.prompt_token_ids]
-            if self._uses_harmony_tokenization(request):
-                return self._tokenize_harmony_chat(request)
-            tokenizer = self._get_tokenizer(request.model)
-            # Forward tools and chat_template_kwargs so custom tokenizers
-            # (e.g. DeepseekV32Tokenizer) render tool schemas and respect
-            # template flags like `thinking=true` when computing the prompt
-            # token ids used for cache-aware routing.
-            tool_dicts = self._tool_dicts(request)
-            chat_template_kwargs = (request.chat_template_kwargs if getattr(
-                request, "chat_template_kwargs", None) else {})
-            result = tokenizer.apply_chat_template(
-                [
-                    msg if isinstance(msg, dict) else dict(msg)
-                    for msg in request.messages
-                ],
-                add_generation_prompt=request.add_generation_prompt,
-                tokenize=True,
-                tools=tool_dicts,
-                **chat_template_kwargs,
-            )
-            # Some custom tokenizers (e.g. DeepseekV32Tokenizer) return a
-            # string from apply_chat_template even with tokenize=True.
-            # Encode to token IDs if needed.
-            if isinstance(result, str):
-                result = tokenizer.encode(result, add_special_tokens=False)
-            return [result]
-
-        # Handle CompletionRequest (has prompt)
-        prompts = request.prompt
-        if isinstance(prompts, list) and isinstance(prompts[0], list):
-            return prompts
-        elif isinstance(prompts, list) and isinstance(prompts[0], int):
-            return [prompts]
-        elif isinstance(prompts, str):
-            prompts = [prompts]
-        else:
-            assert isinstance(prompts, list) and isinstance(prompts[0], str)
-
-        tokenizer = self._get_tokenizer(request.model)
-        token_lists = [tokenizer(prompt)["input_ids"] for prompt in prompts]
-        return token_lists
+        return tokenize_request(request,
+                                tokenizers=self._tokenizers,
+                                model_types=self._model_types,
+                                custom_tokenizer=self._custom_tokenizer,
+                                use_harmony=self._use_harmony)
 
     def _compute_block_hashes(self,
                               token_lists: list[list[int]]) -> list[list[int]]:
