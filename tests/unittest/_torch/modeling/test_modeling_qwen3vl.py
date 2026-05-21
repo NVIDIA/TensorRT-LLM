@@ -40,6 +40,7 @@ QWEN3_VL_8B_CONFIG = {
             "rope_type": "default",
         },
         "rope_theta": 5000000,
+        "tie_word_embeddings": False,
         "use_cache": True,
         "vocab_size": 151936,
     },

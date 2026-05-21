@@ -1190,3 +1190,72 @@ def _register_fake():
         out_shape = shape if shape is not None else list(like.shape)
         dtype = out_dtype if out_dtype is not None else like.dtype
         return like.new_empty(out_shape, dtype=dtype), output_buffer_kind
+
+    @torch.library.register_fake("trtllm::compute_probs_from_logits_op")
+    def _(logits: torch.Tensor,
+          temperatures: torch.Tensor,
+          top_k: Optional[torch.Tensor] = None,
+          top_p: Optional[torch.Tensor] = None,
+          skip_temperature: bool = False) -> torch.Tensor:
+        return logits.new_empty(list(logits.shape), dtype=torch.float32)
+
+    @torch.library.register_fake("trtllm::build_draft_prob_indices_out_op")
+    def _(topkScoreIndices: torch.Tensor, draftProbIndices: torch.Tensor,
+          topK: int, numDraftTokens: int) -> None:
+        return None
+
+    @torch.library.register_fake("trtllm::verify_dynamic_tree_rejection_out_op")
+    def _(candidates: torch.Tensor, draftProbs: torch.Tensor,
+          targetProbs: torch.Tensor, targetSupportIndices: torch.Tensor,
+          targetSupportLengths: torch.Tensor, draftProbIndices: torch.Tensor,
+          retrieveNextToken: torch.Tensor, retrieveNextSibling: torch.Tensor,
+          treeValid: torch.Tensor, acceptIndex: torch.Tensor,
+          acceptTokenNum: torch.Tensor, acceptToken: torch.Tensor,
+          numSpecStep: int, seed: torch.Tensor, offset: torch.Tensor) -> None:
+        return None
+
+    @torch.library.register_fake(
+        "trtllm::compute_draft_probs_for_dynamic_tree_rejection_op")
+    def _(draftLogits: torch.Tensor,
+          temperatures: torch.Tensor,
+          numDraftProbRows: int,
+          targetVocabSize: int,
+          top_k: Optional[torch.Tensor] = None,
+          top_p: Optional[torch.Tensor] = None,
+          skip_temperature: bool = False,
+          d2t: Optional[torch.Tensor] = None,
+          top_k_max: int = 0,
+          skip_all_sampling_params: bool = False) -> torch.Tensor:
+        batch_size = temperatures.shape[0]
+        return draftLogits.new_empty(
+            (batch_size, numDraftProbRows, targetVocabSize),
+            dtype=torch.float32)
+
+    @torch.library.register_fake(
+        "trtllm::compute_target_probs_for_dynamic_tree_rejection_op")
+    def _(
+        targetLogits: torch.Tensor,
+        temperatures: torch.Tensor,
+        numDraftTokens: int,
+        top_k: Optional[torch.Tensor] = None,
+        top_p: Optional[torch.Tensor] = None,
+        skip_temperature: bool = False,
+        top_k_max: int = 0,
+        skip_all_sampling_params: bool = False
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        batch_size = temperatures.shape[0]
+        target_vocab_size = targetLogits.shape[-1]
+        target_probs = targetLogits.new_empty(
+            (batch_size, numDraftTokens, target_vocab_size),
+            dtype=torch.float32)
+        has_filtering = (top_k is not None) or (top_p is not None)
+        if skip_all_sampling_params or not has_filtering:
+            support_indices = targetLogits.new_empty((0, ), dtype=torch.int32)
+            support_lengths = targetLogits.new_empty((0, ), dtype=torch.int32)
+        else:
+            support_dim = top_k_max if top_k_max > 0 else target_vocab_size
+            support_indices = targetLogits.new_empty(
+                (batch_size, numDraftTokens, support_dim), dtype=torch.int32)
+            support_lengths = targetLogits.new_empty(
+                (batch_size, numDraftTokens), dtype=torch.int32)
+        return target_probs, support_indices, support_lengths

@@ -718,14 +718,6 @@ class Attention(nn.Module):
         if v is not None:
             v = v[:num_tokens, :]
 
-        mrope_config = None
-        if mrope_rotary_cos_sin is not None or mrope_position_deltas is not None:
-            mrope_config = dict()
-            if mrope_rotary_cos_sin is not None:
-                mrope_config["mrope_rotary_cos_sin"] = mrope_rotary_cos_sin
-            if mrope_position_deltas is not None:
-                mrope_config["mrope_position_deltas"] = mrope_position_deltas
-
         # Helix CP generation path: get partial outputs with softmax stats,
         # then exchange and combine across CP ranks.
         # NOTE: The helix post-process combine step works on unquantized
@@ -747,7 +739,8 @@ class Attention(nn.Module):
                 attn_metadata,
                 forward_args=AttentionForwardArgs(
                     attention_mask=attention_mask,
-                    mrope_config=mrope_config,
+                    mrope_rotary_cos_sin=mrope_rotary_cos_sin,
+                    mrope_position_deltas=mrope_position_deltas,
                     attention_window_size=attention_window_size,
                     attention_mask_data=attention_mask_data,
                     softmax_stats_tensor=softmax_stats,
@@ -785,7 +778,8 @@ class Attention(nn.Module):
                 kv_scales_sf=kv_scales_sf,
                 kv_scales_sf_inv=kv_scales_sf_inv,
                 attention_mask=attention_mask,
-                mrope_config=mrope_config,
+                mrope_rotary_cos_sin=mrope_rotary_cos_sin,
+                mrope_position_deltas=mrope_position_deltas,
                 attention_window_size=attention_window_size,
                 attention_mask_data=attention_mask_data,
                 output=output[:num_tokens, :] if output is not None else None,
@@ -938,7 +932,9 @@ class Attention(nn.Module):
         q, k, v = self.convert_qkv(q, k, v)
 
         if attention_sinks is not None:
-            assert self.attn_backend == "TRTLLM", "Attention sinks are only supported for TRTLLM backend."
+            assert self.attn_backend == "TRTLLM", (
+                f"Attention sinks are only supported with attn_backend='TRTLLM'. "
+                f"Current backend: {self.attn_backend}.")
 
         attn_output = self.forward_impl(q,
                                         k,
@@ -2574,7 +2570,6 @@ class MLA(nn.Module):
             latent_cache=latent_cache,  # kvcache and k_pe
             q_pe=q_pe,  # used by `invokeMLARopeGeneration`
             topk_indices=topk_indices,  # used by DSA attention
-            is_generation=True,  # used by DSA attention
             cu_q_seqlens=cu_q_seqlens,  # used by `mlaGeneration`
             cu_kv_seqlens=cu_kv_seqlens,  # used by `mlaGeneration`
             fmha_scheduler_counter=
@@ -2692,7 +2687,6 @@ class MLA(nn.Module):
             latent_cache=latent_cache,  # kvcache and k_pe
             q_pe=q_pe,  # used by `invokeMLARopeGeneration`
             topk_indices=topk_indices,  # used by DSA attention
-            is_generation=False,  # used by DSA attention
         )
         fused_q = None
 

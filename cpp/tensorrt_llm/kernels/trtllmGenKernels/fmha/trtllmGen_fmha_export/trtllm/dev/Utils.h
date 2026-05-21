@@ -30,6 +30,16 @@ namespace dev {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
+// __block_size__ is only supported in CUDA 13 and later.
+// We can always emit the macro, and it will simply be ignored in CUDA 12.
+#if defined(__CUDACC_VER_MAJOR__) && __CUDACC_VER_MAJOR__ >= 13
+#define TLLM_BLOCK_SIZE(bx, by, bz) __block_size__((bx, by, bz))
+#else
+#define TLLM_BLOCK_SIZE(bx, by, bz)
+#endif
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
 template <typename T> inline __device__ T clamp(T x, T lb, T ub) {
   return (x < lb) ? lb : (x > ub ? ub : x);
 }
@@ -166,6 +176,42 @@ inline __device__ void cpAsyncPredicated(bool pred,
     assert(0 && "cpSize is not supported"); // The compiler will eliminate that code.
   }
 #endif
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+template <bool CxIsOne, bool CyIsOne, bool CzIsOne>
+inline __device__ dim3 getBlockIdInCluster() {
+  dim3 result;
+  if constexpr (CxIsOne) {
+    result.x = 0u;
+  } else {
+    asm volatile("mov.u32 %0, %%cluster_ctaid.x;\n" : "=r"(result.x) : );
+  }
+  if constexpr (CyIsOne) {
+    result.y = 0u;
+  } else {
+    asm volatile("mov.u32 %0, %%cluster_ctaid.y;\n" : "=r"(result.y) : );
+  }
+  if constexpr (CzIsOne) {
+    result.z = 0u;
+  } else {
+    asm volatile("mov.u32 %0, %%cluster_ctaid.z;\n" : "=r"(result.z) : );
+  }
+  return result;
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+template <bool IsSingleBlock>
+inline __device__ uint32_t getBlockRankInCluster() {
+  if constexpr (IsSingleBlock) {
+    return 0u;
+  } else {
+    uint32_t rank;
+    asm volatile("mov.u32 %0, %%cluster_ctarank;\n" : "=r"(rank) : );
+    return rank;
+  }
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -477,6 +523,60 @@ initPersistentSchedulerSm90Params(KernelParams const& kernelParams,
   }
 
   return schedulerParams;
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+// Relaxed arrive-and-wait at GPU scope.
+// Flips the MSB phase bit of *ptr by adding (arrivalCount + 0x80000000u - totalArrivals),
+// then spins until the phase bit changes.
+inline __device__ void arriveAndWaitRelaxedGpu(uint32_t* ptr,
+                                               uint32_t arrivalCount,
+                                               uint32_t totalArrivals) {
+  uint32_t phaseFlip = arrivalCount + 0x80000000u - totalArrivals;
+  uint32_t prevPhase =
+    0x80000000u &
+    __nv_atomic_fetch_add(ptr, phaseFlip, __NV_ATOMIC_RELAXED, __NV_THREAD_SCOPE_DEVICE);
+  while (prevPhase ==
+         (0x80000000u & __nv_atomic_load_n(ptr, __NV_ATOMIC_RELAXED, __NV_THREAD_SCOPE_DEVICE))) {
+  }
+}
+
+// Relaxed arrive-and-wait at SYS scope.
+// Flips the MSB phase bit of *ptr by adding (0x80000000u - totalArrivals),
+// then spins until the phase bit changes.
+inline __device__ void arriveAndWaitRelaxedSys(uint32_t* ptr, uint32_t totalArrivals) {
+  uint32_t phaseFlip = 0x80000000u - totalArrivals;
+  uint32_t prevPhase =
+    0x80000000u &
+    __nv_atomic_fetch_add(ptr, phaseFlip, __NV_ATOMIC_RELAXED, __NV_THREAD_SCOPE_SYSTEM);
+  while (prevPhase ==
+         (0x80000000u & __nv_atomic_load_n(ptr, __NV_ATOMIC_RELAXED, __NV_THREAD_SCOPE_SYSTEM))) {
+  }
+}
+
+// Relaxed global-memory atomic red with SYS-scope semantics
+inline __device__ void redRelaxedSys(uint32_t* ptr, uint32_t val) {
+  asm("red.relaxed.sys.global.add.u32 [%0], %1;"
+      :
+      : "l"((uint64_t)__cvta_generic_to_global(ptr)), "r"(val)
+      : "memory");
+}
+
+// Asynchronous global-memory atomic red with GPU-scope release semantics.
+inline __device__ void redAsyncReleaseGpu(uint32_t* ptr, uint32_t val) {
+  asm("red.async.release.gpu.global.add.u32 [%0], %1;"
+      :
+      : "l"((uint64_t)__cvta_generic_to_global(ptr)), "r"(val)
+      : "memory");
+}
+
+// Asynchronous global-memory atomic red with SYS-scope release semantics.
+inline __device__ void redAsyncReleaseSys(uint32_t* ptr, uint32_t val) {
+  asm("red.async.release.sys.global.add.u32 [%0], %1;"
+      :
+      : "l"((uint64_t)__cvta_generic_to_global(ptr)), "r"(val)
+      : "memory");
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
