@@ -341,6 +341,48 @@ class TestGemma4VisionTower(unittest.TestCase):
             f"max diff={diff.max().item():.6f} mean diff={diff.mean().item():.6f}",
         )
 
+    @torch.no_grad()
+    def test_forward_image_seq_lens_kwarg_matches_default(self):
+        """``image_seq_lens`` kwarg path is byte-equivalent to the default.
+
+        The tower derives per-image seq_lens entirely on CPU — no GPU
+        reduction, no D2H sync. Two CPU branches:
+          - ``image_seq_lens`` is provided (production: ``Gemma4InputProcessor``
+            emits it alongside ``image_position_ids``)
+          - ``image_seq_lens is None`` and the dummy/test input has no ``-1``
+            padding → fall back to ``[N] * B`` (every patch valid)
+
+        For a full-grid synthetic input the two branches must produce
+        identical output, since the explicit list ``[N] * B`` is exactly
+        what the default fallback computes.
+        """
+        torch.manual_seed(0)
+        cfg_dict = deepcopy(SMALL_VISION_CONFIG)
+        cfg_dict["use_clipped_linears"] = False
+        vision_cfg = Gemma4VisionConfig(**cfg_dict)
+
+        hf_tower = HFGemma4VisionModel(vision_cfg).to("cuda").to(torch.float32).eval()
+        trt_tower = _build_trt_vision_tower(vision_cfg)
+        trt_tower.load_weights(dict(hf_tower.state_dict()))
+
+        B = 3
+        pv, pos, output_length = _make_dummy_pixel_input(vision_cfg, B=B)
+        full_seq_lens = [pos.shape[1]] * B
+
+        with torch.inference_mode():
+            default_path = trt_tower(pv, pos, output_length=output_length).last_hidden_state
+            explicit_path = trt_tower(
+                pv, pos, output_length=output_length, image_seq_lens=full_seq_lens
+            ).last_hidden_state
+
+        self.assertEqual(default_path.shape, explicit_path.shape)
+        diff = (default_path - explicit_path).abs()
+        self.assertTrue(
+            torch.allclose(default_path, explicit_path, atol=1e-4, rtol=0),
+            f"image_seq_lens kwarg path diverges from default-all-valid path: "
+            f"max diff={diff.max().item():.6f}",
+        )
+
 
 class TestGemma4VisionTowerClamp(unittest.TestCase):
     """``use_clipped_linears=True`` — exercises the clamp-buffer remap path.

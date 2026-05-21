@@ -40,7 +40,7 @@ Architecture references (HF transformers 5.5.3 ``modeling_gemma4.py``):
 
 import math
 from dataclasses import dataclass
-from typing import Dict, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -751,6 +751,7 @@ class Gemma4VisionModel(nn.Module):
         pixel_values: torch.Tensor,
         pixel_position_ids: torch.Tensor,
         output_length: Optional[int] = None,
+        image_seq_lens: Optional[List[int]] = None,
     ) -> VisionOutput:
         if output_length is None:
             k = self.config.pooling_kernel_size
@@ -773,7 +774,16 @@ class Gemma4VisionModel(nn.Module):
         flat_cos = cos_btn[valid]
         flat_sin = sin_btn[valid]
         flat_position_ids = pixel_position_ids[valid]
-        seq_lens_cpu = valid.sum(dim=-1).to(torch.int).cpu()
+
+        # Per-image valid-patch count → ``attn_metadata.prompt_lens``, always
+        # CPU-derived to keep the GPU stream free of D2H syncs.
+        if image_seq_lens is not None:
+            assert len(image_seq_lens) == B, (
+                f"image_seq_lens length mismatch: got {len(image_seq_lens)}, expected {B}"
+            )
+            seq_lens_cpu = torch.tensor(image_seq_lens, dtype=torch.int, device="cpu")
+        else:
+            seq_lens_cpu = torch.full((B,), N, dtype=torch.int, device="cpu")
 
         attn_metadata = self._prepare_attn_metadata(seq_lens_cpu)
 
