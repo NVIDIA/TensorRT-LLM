@@ -498,7 +498,7 @@ window.runMermaid = runMermaid;</script>
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.17.1';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc12.post1';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc15';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -512,7 +512,7 @@ window.runMermaid = runMermaid;</script>
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.3.0rc12.post1" />
+  <meta name="docsearch:version" content="1.3.0rc15" />
   
     
     <script src="../../../_static/searchtools.js"></script>
@@ -767,9 +767,9 @@ window.runMermaid = runMermaid;</script>
 <li class="toctree-l1"><a class="reference internal" href="../../../overview.html">Overview</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../quick-start-guide.html">Quick Start Guide</a></li>
 <li class="toctree-l1 has-children"><a class="reference internal" href="../../../installation/index.html">Installation</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
-<li class="toctree-l2"><a class="reference internal" href="../../../installation/containers.html">Pre-built release container images on NGC</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../../../installation/linux.html">Installing on Linux via <code class="docutils literal notranslate"><span class="pre">pip</span></code></a></li>
-<li class="toctree-l2"><a class="reference internal" href="../../../installation/build-from-source-linux.html">Building from Source Code on Linux</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../installation/installation-guide.html">Installation Guide</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../installation/build-from-source.html">Build from Source</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../installation/containers.html">Container Images</a></li>
 </ul>
 </details></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../supported-hardware.html">Supported Hardware</a></li>
@@ -888,6 +888,11 @@ window.runMermaid = runMermaid;</script>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
 <ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../../blogs/tech_blog/blog24_MoE_as_Dense_GEMM.html">MoE as Dense GEMM: Optimizing Low-Latency MoE Inference on NVIDIA Blackwell</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../blogs/tech_blog/blog23_Joint_Optimization_of_Agent_Applications_and_TensorRT-LLM.html">Joint Optimization of Agent Applications and TensorRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../blogs/tech_blog/blog22_Helix_Parallelism_Scaling_Multi_Million_Token_Decoding_with_KV_Cache_Sharding.html">Helix Parallelism in TensorRT-LLM: Scaling Multi-Million-Token Decoding with KV Cache Sharding</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../blogs/tech_blog/blog21_Temporal_Correlation_Meets_Sparse_Attention.html">Temporal Correlation Meets Sparse Attention: Guess-Verify-Refine Top-K for Blackwell</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../blogs/tech_blog/blog20_Tuning_CUDA_Graph_Batch_Sizes_for_Higher_Output_Throughput.html">Tuning CUDA Graph Batch Sizes for Higher Output Throughput</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../blogs/tech_blog/blog19_DWDP_Distributed_Weight_Data_Parallelism_for_High_Performance_LLM_Inference_on_NVL72.html">DWDP: Distributed Weight Data Parallelism for High-Performance LLM Inference on NVL72</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../blogs/tech_blog/blog18_Optimizing_MoE_Communication_with_One_Sided_AlltoAll_Over_NVLink.html">Optimizing MoE Communication with One-Sided AlltoAll Over NVLink</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../blogs/tech_blog/blog17_Sparse_Attention_in_TensorRT-LLM.html">Sparse Attention in TensorRT LLM</a></li>
@@ -1007,6 +1012,7 @@ window.runMermaid = runMermaid;</script>
 <span class="k">except</span> <span class="ne">ImportError</span><span class="p">:</span>
     <span class="n">PlacementGroup</span> <span class="o">=</span> <span class="kc">None</span>
 
+<span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm.bindings.internal.batch_manager</span><span class="w"> </span><span class="kn">import</span> <span class="n">LinearCacheType</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm.lora_helper</span><span class="w"> </span><span class="kn">import</span> <span class="p">(</span><span class="n">LoraConfig</span><span class="p">,</span>
                                       <span class="n">get_default_trtllm_modules_to_hf_modules</span><span class="p">)</span>
 
@@ -1029,6 +1035,7 @@ window.runMermaid = runMermaid;</script>
                                  <span class="n">LookaheadDecodingConfig</span> <span class="k">as</span> <span class="n">_LookaheadDecodingConfig</span><span class="p">,</span>
                                  <span class="n">PeftCacheConfig</span> <span class="k">as</span> <span class="n">_PeftCacheConfig</span><span class="p">,</span>
                                  <span class="n">SchedulerConfig</span> <span class="k">as</span> <span class="n">_SchedulerConfig</span><span class="p">)</span> <span class="c1"># isort: skip</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">..bindings.internal.algorithms</span><span class="w"> </span><span class="kn">import</span> <span class="n">AgentTreeConfig</span> <span class="k">as</span> <span class="n">_AgentTreeConfig</span>  <span class="c1"># isort: skip</span>
 <span class="c1"># isort: on</span>
 
 <span class="c1"># yapf: enable</span>
@@ -1153,21 +1160,24 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">            List of batch sizes to create CUDA graphs for</span>
 <span class="sd">        &quot;&quot;&quot;</span>
         <span class="k">if</span> <span class="n">enable_padding</span><span class="p">:</span>
+            <span class="c1"># Start with [1, 2, 4, 8, 16, 24, ..., 128] (multiples of 8)</span>
             <span class="n">batch_sizes</span> <span class="o">=</span> <span class="p">[</span><span class="mi">1</span><span class="p">,</span> <span class="mi">2</span><span class="p">,</span> <span class="mi">4</span><span class="p">]</span> <span class="o">+</span> <span class="p">[</span><span class="n">i</span> <span class="o">*</span> <span class="mi">8</span> <span class="k">for</span> <span class="n">i</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="mi">1</span><span class="p">,</span> <span class="mi">17</span><span class="p">)]</span>
+            <span class="c1"># Sliding 64: extend by increments of 64 up to max_batch_size</span>
+            <span class="k">while</span> <span class="n">batch_sizes</span><span class="p">[</span><span class="o">-</span><span class="mi">1</span><span class="p">]</span> <span class="o">+</span> <span class="mi">64</span> <span class="o">&lt;=</span> <span class="n">max_batch_size</span><span class="p">:</span>
+                <span class="n">batch_sizes</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">batch_sizes</span><span class="p">[</span><span class="o">-</span><span class="mi">1</span><span class="p">]</span> <span class="o">+</span> <span class="mi">64</span><span class="p">)</span>
         <span class="k">else</span><span class="p">:</span>
             <span class="n">batch_sizes</span> <span class="o">=</span> <span class="nb">list</span><span class="p">(</span><span class="nb">range</span><span class="p">(</span><span class="mi">1</span><span class="p">,</span> <span class="mi">32</span><span class="p">))</span> <span class="o">+</span> <span class="p">[</span><span class="mi">32</span><span class="p">,</span> <span class="mi">64</span><span class="p">,</span> <span class="mi">128</span><span class="p">]</span>
+            <span class="c1"># Add powers of 2 up to max_batch_size</span>
+            <span class="n">batch_sizes</span> <span class="o">+=</span> <span class="p">[</span>
+                <span class="mi">2</span><span class="o">**</span><span class="n">i</span> <span class="k">for</span> <span class="n">i</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="mi">8</span><span class="p">,</span> <span class="n">math</span><span class="o">.</span><span class="n">ceil</span><span class="p">(</span><span class="n">math</span><span class="o">.</span><span class="n">log</span><span class="p">(</span><span class="n">max_batch_size</span><span class="p">,</span> <span class="mi">2</span><span class="p">)))</span>
+            <span class="p">]</span>
 
-        <span class="c1"># Add powers of 2 up to max_batch_size</span>
-        <span class="n">batch_sizes</span> <span class="o">+=</span> <span class="p">[</span>
-            <span class="mi">2</span><span class="o">**</span><span class="n">i</span> <span class="k">for</span> <span class="n">i</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="mi">8</span><span class="p">,</span> <span class="n">math</span><span class="o">.</span><span class="n">ceil</span><span class="p">(</span><span class="n">math</span><span class="o">.</span><span class="n">log</span><span class="p">(</span><span class="n">max_batch_size</span><span class="p">,</span> <span class="mi">2</span><span class="p">)))</span>
-        <span class="p">]</span>
-
-        <span class="c1"># Filter and sort batch sizes</span>
+        <span class="c1"># Filter and sort batch sizes for both branches</span>
         <span class="n">batch_sizes</span> <span class="o">=</span> <span class="nb">sorted</span><span class="p">(</span>
             <span class="p">[</span><span class="n">size</span> <span class="k">for</span> <span class="n">size</span> <span class="ow">in</span> <span class="n">batch_sizes</span> <span class="k">if</span> <span class="n">size</span> <span class="o">&lt;=</span> <span class="n">max_batch_size</span><span class="p">])</span>
 
         <span class="c1"># Add max_batch_size if not already included</span>
-        <span class="k">if</span> <span class="n">max_batch_size</span> <span class="o">!=</span> <span class="n">batch_sizes</span><span class="p">[</span><span class="o">-</span><span class="mi">1</span><span class="p">]:</span>
+        <span class="k">if</span> <span class="ow">not</span> <span class="n">batch_sizes</span> <span class="ow">or</span> <span class="n">max_batch_size</span> <span class="o">!=</span> <span class="n">batch_sizes</span><span class="p">[</span><span class="o">-</span><span class="mi">1</span><span class="p">]:</span>
             <span class="n">batch_sizes</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">max_batch_size</span><span class="p">)</span>
 
         <span class="k">return</span> <span class="n">batch_sizes</span>
@@ -1325,6 +1335,11 @@ window.runMermaid = runMermaid;</script>
         <span class="n">description</span><span class="o">=</span>
         <span class="s2">&quot;Whether to use CuTE DSL top-k kernel instead of the CUDA C++ indexer_topk_decode.&quot;</span>
     <span class="p">)</span>
+    <span class="n">use_cute_dsl_paged_mqa_logits</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+        <span class="n">description</span><span class="o">=</span>
+        <span class="s2">&quot;Whether to use CuTE DSL paged MQA logits kernel on SM100 instead of C++ DeepGEMM.&quot;</span>
+    <span class="p">)</span>
     <span class="n">q_split_threshold</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
         <span class="n">default</span><span class="o">=</span><span class="mi">8192</span><span class="p">,</span>
         <span class="n">description</span><span class="o">=</span>
@@ -1337,9 +1352,47 @@ window.runMermaid = runMermaid;</script>
     <span class="n">enable_heuristic_topk</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
         <span class="n">default</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
         <span class="n">description</span><span class="o">=</span>
-        <span class="s2">&quot;Whether to reuse previous step&#39;s TopK indices as heuristic hints &quot;</span>
-        <span class="s2">&quot;for the decode indexer TopK kernel, reducing threshold search iterations.&quot;</span>
+        <span class="s2">&quot;Whether to enable Guess-Verify-Refine (GVR) Top-K for the DSA decode &quot;</span>
+        <span class="s2">&quot;indexer. GVR reuses previous-step Top-K indices as hints to reduce &quot;</span>
+        <span class="s2">&quot;threshold search iterations. Currently supported for index_topk=2048 &quot;</span>
+        <span class="s2">&quot;on Blackwell (SM100+) and falls back to the production insertion/radix &quot;</span>
+        <span class="s2">&quot;Top-K path when prerequisites are not met.&quot;</span><span class="p">)</span>
+    <span class="n">indexer_k_dtype</span><span class="p">:</span> <span class="n">Literal</span><span class="p">[</span><span class="s2">&quot;fp8&quot;</span><span class="p">,</span> <span class="s2">&quot;fp4&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="s2">&quot;fp8&quot;</span><span class="p">,</span>
+        <span class="n">description</span><span class="o">=</span>
+        <span class="s2">&quot;Data type used for the indexer K cache. `fp4` requires Blackwell+ &quot;</span>
+        <span class="s2">&quot;(SM&gt;=100) and index_head_dim=128, it can halve the indexer K cache &quot;</span>
+        <span class="s2">&quot;per-token footprint from 132 B to 68 B.&quot;</span><span class="p">,</span>
     <span class="p">)</span>
+
+    <span class="nd">@model_validator</span><span class="p">(</span><span class="n">mode</span><span class="o">=</span><span class="s2">&quot;after&quot;</span><span class="p">)</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">_validate_indexer_k_dtype</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+<span class="w">        </span><span class="sd">&quot;&quot;&quot;Reject fp4 on pre-Blackwell or non-128 index_head_dim.</span>
+
+<span class="sd">        DeepGEMM&#39;s fp8_fp4_mqa_logits / fp8_fp4_paged_mqa_logits kernels</span>
+<span class="sd">        require SM&gt;=100, and invokeFusedCatFp4 hard-asserts head_dim==128.</span>
+<span class="sd">        Surface both as Pydantic errors so invalid configs fail fast at</span>
+<span class="sd">        construction instead of with a cryptic kernel-launch failure.</span>
+
+<span class="sd">        The SM check is skipped when CUDA is unavailable (config</span>
+<span class="sd">        construction on CPU-only hosts or at doc-gen time), leaving the</span>
+<span class="sd">        runtime kernel assertion as the final line of defense.</span>
+<span class="sd">        &quot;&quot;&quot;</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">indexer_k_dtype</span> <span class="o">==</span> <span class="s2">&quot;fp4&quot;</span><span class="p">:</span>
+            <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">index_head_dim</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">index_head_dim</span> <span class="o">!=</span> <span class="mi">128</span><span class="p">:</span>
+                <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
+                    <span class="sa">f</span><span class="s2">&quot;indexer_k_dtype=&#39;fp4&#39; requires index_head_dim=128, &quot;</span>
+                    <span class="sa">f</span><span class="s2">&quot;got </span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">index_head_dim</span><span class="si">}</span><span class="s2">. Set indexer_k_dtype=&#39;fp8&#39; &quot;</span>
+                    <span class="sa">f</span><span class="s2">&quot;for non-128 indexer head dims.&quot;</span><span class="p">)</span>
+            <span class="k">if</span> <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">is_available</span><span class="p">():</span>
+                <span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm._utils</span><span class="w"> </span><span class="kn">import</span> <span class="n">get_sm_version</span>
+                <span class="n">sm</span> <span class="o">=</span> <span class="n">get_sm_version</span><span class="p">()</span>
+                <span class="k">if</span> <span class="n">sm</span> <span class="o">&lt;</span> <span class="mi">100</span><span class="p">:</span>
+                    <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
+                        <span class="sa">f</span><span class="s2">&quot;indexer_k_dtype=&#39;fp4&#39; requires SM&gt;=100 (Blackwell); &quot;</span>
+                        <span class="sa">f</span><span class="s2">&quot;current device is SM</span><span class="si">{</span><span class="n">sm</span><span class="si">}</span><span class="s2">. Set indexer_k_dtype=&#39;fp8&#39; &quot;</span>
+                        <span class="sa">f</span><span class="s2">&quot;for non-Blackwell GPUs.&quot;</span><span class="p">)</span>
+        <span class="k">return</span> <span class="bp">self</span>
 
 <div class="viewcode-block" id="DeepSeekSparseAttentionConfig.supports_backend">
 <a class="viewcode-back" href="../../../llm-api/reference.html#tensorrt_llm.llmapi.DeepSeekSparseAttentionConfig.supports_backend">[docs]</a>
@@ -1410,7 +1463,8 @@ window.runMermaid = runMermaid;</script>
 <a class="viewcode-back" href="../../../llm-api/reference.html#tensorrt_llm.llmapi.SkipSoftmaxAttentionConfig.resolve_for_target_sparsity">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">resolve_for_target_sparsity</span><span class="p">(</span>
             <span class="bp">self</span><span class="p">,</span> <span class="n">formula</span><span class="p">:</span> <span class="nb">dict</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="s1">&#39;SkipSoftmaxAttentionConfig&#39;</span><span class="p">:</span>
-<span class="w">        </span><span class="sd">&quot;&quot;&quot;</span>
+<span class="w">        </span><span class="sd">&quot;&quot;&quot;Compute threshold_scale_factor from formula coefficients and target_sparsity.</span>
+
 <span class="sd">        Given formula coefficients from HF config.json (dict with &#39;prefill&#39; and</span>
 <span class="sd">        &#39;decode&#39; keys, each containing &#39;a&#39; and &#39;b&#39;), compute threshold_scale_factor</span>
 <span class="sd">        and return a new SkipSoftmaxAttentionConfig with it set.</span>
@@ -1597,7 +1651,6 @@ window.runMermaid = runMermaid;</script>
 <span class="c1"># Maps alias → full import path (module.ClassName).</span>
 <span class="n">TOKENIZER_ALIASES</span> <span class="o">=</span> <span class="p">{</span>
     <span class="s1">&#39;deepseek_v32&#39;</span><span class="p">:</span> <span class="s1">&#39;tensorrt_llm.tokenizer.deepseek_v32.DeepseekV32Tokenizer&#39;</span><span class="p">,</span>
-    <span class="s1">&#39;glm_moe_dsa&#39;</span><span class="p">:</span> <span class="s1">&#39;tensorrt_llm.tokenizer.glm_moe_dsa.GlmMoeDsaTokenizer&#39;</span><span class="p">,</span>
 <span class="p">}</span>
 
 
@@ -1891,6 +1944,14 @@ window.runMermaid = runMermaid;</script>
         <span class="s2">&quot;to 1-model code paths; non-greedy sampling is always enabled on 2-model paths.&quot;</span>
     <span class="p">)</span>
 
+    <span class="n">use_rejection_sampling</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+        <span class="n">status</span><span class="o">=</span><span class="s2">&quot;prototype&quot;</span><span class="p">,</span>
+        <span class="n">description</span><span class="o">=</span>
+        <span class="s2">&quot;If true, enables rejection sampling for one-model speculative decoding paths. &quot;</span>
+        <span class="s2">&quot;This is intended for non-greedy sampling configurations on the PyTorch backend. &quot;</span>
+        <span class="s2">&quot;The non-dynamic-tree one-model path requires FlashInfer.&quot;</span><span class="p">)</span>
+
     <span class="c1"># If set, drafting is allowed to use chain drafter.</span>
     <span class="n">_allow_chain_drafter</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="n">PrivateAttr</span><span class="p">(</span><span class="kc">True</span><span class="p">)</span>
     <span class="c1"># If set, drafting uses greedy sampling, irrespective of sampling parameters.</span>
@@ -1942,6 +2003,17 @@ window.runMermaid = runMermaid;</script>
             <span class="c1"># This ensures efficient lookup</span>
             <span class="k">return</span> <span class="nb">dict</span><span class="p">(</span><span class="nb">sorted</span><span class="p">(</span><span class="n">v</span><span class="o">.</span><span class="n">items</span><span class="p">(),</span> <span class="n">key</span><span class="o">=</span><span class="k">lambda</span> <span class="n">x</span><span class="p">:</span> <span class="n">x</span><span class="p">[</span><span class="mi">0</span><span class="p">]))</span>
         <span class="k">return</span> <span class="n">v</span>
+
+    <span class="nd">@model_validator</span><span class="p">(</span><span class="n">mode</span><span class="o">=</span><span class="s1">&#39;after&#39;</span><span class="p">)</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">validate_rejection_sampling_config</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+<span class="w">        </span><span class="sd">&quot;&quot;&quot;Reject SA-enhanced configurations that invalidate rejection sampling.&quot;&quot;&quot;</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">use_rejection_sampling</span> <span class="ow">and</span> <span class="nb">getattr</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="s1">&#39;sa_config&#39;</span><span class="p">,</span>
+                                                   <span class="kc">None</span><span class="p">)</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
+                <span class="s2">&quot;use_rejection_sampling is incompatible with sa_config &quot;</span>
+                <span class="s2">&quot;because SA enhancement may override the proposed draft tokens.&quot;</span>
+            <span class="p">)</span>
+        <span class="k">return</span> <span class="bp">self</span>
 
     <span class="nd">@model_validator</span><span class="p">(</span><span class="n">mode</span><span class="o">=</span><span class="s1">&#39;after&#39;</span><span class="p">)</span>
     <span class="c1"># 1. Validate that max_concurrency and draft_len_schedule are mutually exclusive.</span>
@@ -2198,7 +2270,6 @@ window.runMermaid = runMermaid;</script>
             <span class="p">)</span>
 
         <span class="bp">self</span><span class="o">.</span><span class="n">num_eagle_layers</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">max_draft_len</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">max_total_draft_tokens</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">max_draft_len</span>  <span class="c1"># If using linear-tree, the max_total_draft_tokens is the same as max_draft_len</span>
 
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">eagle3_model_arch</span> <span class="o">==</span> <span class="s2">&quot;mistral_large3&quot;</span> <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">eagle3_layers_to_capture</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
             <span class="c1"># FIXME find a better way to setup it.</span>
@@ -2227,7 +2298,8 @@ window.runMermaid = runMermaid;</script>
             <span class="bp">self</span><span class="o">.</span><span class="n">max_total_draft_tokens</span> <span class="o">=</span> <span class="nb">len</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">eagle_choices</span><span class="p">)</span>
 
         <span class="c1"># Dynamic tree logic</span>
-        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">use_dynamic_tree</span><span class="p">:</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">use_dynamic_tree</span> <span class="ow">or</span> <span class="bp">self</span><span class="o">.</span><span class="n">dynamic_tree_max_topK</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">use_dynamic_tree</span> <span class="o">=</span> <span class="kc">True</span>
             <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">eagle_choices</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
                 <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
                     <span class="s2">&quot;If use_dynamic_tree is True, eagle_choices should be None&quot;</span><span class="p">)</span>
@@ -2239,10 +2311,28 @@ window.runMermaid = runMermaid;</script>
                 <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
                     <span class="s2">&quot;dynamic_tree_max_topK should be provided, which indicates the number of nodes to expand each time&quot;</span>
                 <span class="p">)</span>
-            <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">max_total_draft_tokens</span> <span class="ow">is</span> <span class="kc">None</span> <span class="ow">or</span> <span class="bp">self</span><span class="o">.</span><span class="n">max_total_draft_tokens</span> <span class="o">&lt;=</span> <span class="mi">0</span><span class="p">:</span>
-                <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
-                    <span class="s2">&quot;max_total_draft_tokens should be provided, which indicates the total nodes of the final draft tree. (exclude the root node)&quot;</span>
+
+            <span class="n">default_max_total_draft_tokens</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">dynamic_tree_max_topK</span> <span class="o">*</span> <span class="bp">self</span><span class="o">.</span><span class="n">max_draft_len</span>
+
+            <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">max_total_draft_tokens</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">max_total_draft_tokens</span> <span class="o">=</span> <span class="n">default_max_total_draft_tokens</span>
+                <span class="n">logger</span><span class="o">.</span><span class="n">warning</span><span class="p">(</span>
+                    <span class="sa">f</span><span class="s2">&quot;max_total_draft_tokens is not provided, use the default value </span><span class="si">{</span><span class="n">default_max_total_draft_tokens</span><span class="si">}</span><span class="s2"> (default_max_total_draft_tokens = dynamic_tree_max_topK * max_draft_len)&quot;</span>
                 <span class="p">)</span>
+            <span class="k">else</span><span class="p">:</span>
+                <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">max_total_draft_tokens</span> <span class="o">&lt;</span> <span class="bp">self</span><span class="o">.</span><span class="n">max_draft_len</span><span class="p">:</span>
+                    <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
+                        <span class="sa">f</span><span class="s2">&quot;max_total_draft_tokens (</span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">max_total_draft_tokens</span><span class="si">}</span><span class="s2">) should be &gt;= max_draft_len (</span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">max_draft_len</span><span class="si">}</span><span class="s2">)&quot;</span>
+                    <span class="p">)</span>
+                <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">max_total_draft_tokens</span> <span class="o">&gt;</span> <span class="bp">self</span><span class="o">.</span><span class="n">dynamic_tree_max_topK</span> <span class="o">*</span> <span class="bp">self</span><span class="o">.</span><span class="n">max_draft_len</span><span class="p">:</span>
+                    <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
+                        <span class="sa">f</span><span class="s2">&quot;max_total_draft_tokens (</span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">max_total_draft_tokens</span><span class="si">}</span><span class="s2">) should be &lt;= &quot;</span>
+                        <span class="sa">f</span><span class="s2">&quot;dynamic_tree_max_topK * max_draft_len (</span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">dynamic_tree_max_topK</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="bp">self</span><span class="o">.</span><span class="n">max_draft_len</span><span class="si">}</span><span class="s2">)&quot;</span>
+                    <span class="p">)</span>
+
+        <span class="c1"># Linear tree</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">max_total_draft_tokens</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">max_total_draft_tokens</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">max_draft_len</span>
 
         <span class="k">return</span> <span class="bp">self</span></div>
 
@@ -2335,6 +2425,17 @@ window.runMermaid = runMermaid;</script>
 <a class="viewcode-back" href="../../../llm-api/reference.html#tensorrt_llm.llmapi.Eagle3DecodingConfig">[docs]</a>
 <span class="k">class</span><span class="w"> </span><span class="nc">Eagle3DecodingConfig</span><span class="p">(</span><span class="n">EagleDecodingConfig</span><span class="p">):</span>
     <span class="n">decoding_type</span><span class="p">:</span> <span class="n">Literal</span><span class="p">[</span><span class="s2">&quot;Eagle3&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="s2">&quot;Eagle3&quot;</span>
+
+    <span class="c1"># Backs the dynamic-tree worker&#39;s pre-allocated, batch-indexed CUDA buffers</span>
+    <span class="c1"># (draft_tokens_buffer, history_*_buffer, tree_mask_buffer, etc. in</span>
+    <span class="c1"># Eagle3OneModelDynamicTreeWorker.__init__). This MUST equal the global</span>
+    <span class="c1"># max_batch_size: the worker indexes those buffers with batch_idx in</span>
+    <span class="c1"># [0, global_max_batch_size) at runtime with no bounds check, so any value</span>
+    <span class="c1"># smaller than the global will OOB during warmup or generation as soon as</span>
+    <span class="c1"># batch_idx exceeds this capacity (illegal memory access). It is therefore</span>
+    <span class="c1"># exposed as a PrivateAttr -- not a user-tunable knob -- and is</span>
+    <span class="c1"># auto-populated by py_executor_creator from the global max_batch_size.</span>
+    <span class="n">_max_batch_size</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="n">PrivateAttr</span><span class="p">(</span><span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">)</span>
 
     <span class="n">sa_config</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">SAEnhancerConfig</span><span class="p">]</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
         <span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
@@ -2606,11 +2707,6 @@ window.runMermaid = runMermaid;</script>
 <a class="viewcode-back" href="../../../llm-api/reference.html#tensorrt_llm.llmapi.MTPDecodingConfig">[docs]</a>
 <span class="k">class</span><span class="w"> </span><span class="nc">MTPDecodingConfig</span><span class="p">(</span><span class="n">DecodingBaseConfig</span><span class="p">):</span>
     <span class="n">decoding_type</span><span class="p">:</span> <span class="n">Literal</span><span class="p">[</span><span class="s2">&quot;MTP&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="s2">&quot;MTP&quot;</span>
-    <span class="n">num_nextn_predict_layers</span><span class="p">:</span> <span class="n">PositiveInt</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
-        <span class="n">default</span><span class="o">=</span><span class="mi">1</span><span class="p">,</span>
-        <span class="n">description</span><span class="o">=</span>
-        <span class="s2">&quot;Number of MTP modules. Each module predicts the next token, so N modules produce N draft tokens.&quot;</span>
-    <span class="p">)</span>
     <span class="n">use_relaxed_acceptance_for_thinking</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
         <span class="n">default</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
         <span class="n">description</span><span class="o">=</span>
@@ -2643,14 +2739,14 @@ window.runMermaid = runMermaid;</script>
         <span class="n">description</span><span class="o">=</span><span class="s2">&quot;Optional Suffix Automaton configuration. When set, &quot;</span>
         <span class="s2">&quot;combines SA drafting with MTP speculative decoding.&quot;</span><span class="p">)</span>
 
-    <span class="c1"># TODO: remove this after distinguishing `max_draft_len` and `num_nextn_predict_layers`</span>
-    <span class="c1"># Now we need a flag when MTPDecodingConfig is updated by PyTorchModelEngine.</span>
-    <span class="n">num_nextn_predict_layers_from_model_config</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
-        <span class="n">default</span><span class="o">=</span><span class="mi">1</span><span class="p">,</span>
+    <span class="c1"># Internal field: number of MTP layers in the model checkpoint.</span>
+    <span class="c1"># Auto-populated from pretrained_config by update_spec_config_from_model_config.</span>
+    <span class="c1"># Do not set manually.</span>
+    <span class="n">num_nextn_predict_layers</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
         <span class="n">init</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
-        <span class="n">description</span><span class="o">=</span>
-        <span class="s2">&quot;Internal field storing MTP layer count from model config. Used to decide decoding mode: &quot;</span>
-        <span class="s2">&quot;when model has 1 layer and use_mtp_vanilla=False, uses faster EAGLE-style MTP instead of vanilla MTP.&quot;</span>
+        <span class="n">description</span><span class="o">=</span><span class="s2">&quot;Number of MTP layers in the model checkpoint. &quot;</span>
+        <span class="s2">&quot;Auto-populated from the model&#39;s pretrained config. Do not set manually.&quot;</span>
     <span class="p">)</span>
 
     <span class="n">begin_thinking_phase_token</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
@@ -2664,12 +2760,33 @@ window.runMermaid = runMermaid;</script>
         <span class="s2">&quot;Token ID marking end of thinking phase. Strict acceptance resumes after this.&quot;</span>
     <span class="p">)</span>
 
+    <span class="nd">@model_validator</span><span class="p">(</span><span class="n">mode</span><span class="o">=</span><span class="s2">&quot;before&quot;</span><span class="p">)</span>
+    <span class="nd">@classmethod</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">_remap_deprecated_num_nextn_predict_layers</span><span class="p">(</span><span class="bp">cls</span><span class="p">,</span> <span class="n">data</span><span class="p">):</span>
+        <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">data</span><span class="p">,</span> <span class="nb">dict</span><span class="p">)</span> <span class="ow">and</span> <span class="s2">&quot;num_nextn_predict_layers&quot;</span> <span class="ow">in</span> <span class="n">data</span><span class="p">:</span>
+            <span class="n">logger</span><span class="o">.</span><span class="n">warning</span><span class="p">(</span>
+                <span class="s2">&quot;MTPDecodingConfig: &#39;num_nextn_predict_layers&#39; is deprecated and will be &quot;</span>
+                <span class="s2">&quot;removed in a future release. Use &#39;max_draft_len&#39; instead.&quot;</span><span class="p">)</span>
+            <span class="k">if</span> <span class="s2">&quot;max_draft_len&quot;</span> <span class="ow">not</span> <span class="ow">in</span> <span class="n">data</span><span class="p">:</span>
+                <span class="n">data</span> <span class="o">=</span> <span class="nb">dict</span><span class="p">(</span><span class="n">data</span><span class="p">)</span>
+                <span class="n">data</span><span class="p">[</span><span class="s2">&quot;max_draft_len&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="n">data</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="s2">&quot;num_nextn_predict_layers&quot;</span><span class="p">)</span>
+            <span class="k">else</span><span class="p">:</span>
+                <span class="n">data</span> <span class="o">=</span> <span class="nb">dict</span><span class="p">(</span><span class="n">data</span><span class="p">)</span>
+                <span class="n">data</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="s2">&quot;num_nextn_predict_layers&quot;</span><span class="p">)</span>
+        <span class="k">return</span> <span class="n">data</span>
+
 <div class="viewcode-block" id="MTPDecodingConfig.set_max_total_draft_tokens">
 <a class="viewcode-back" href="../../../llm-api/reference.html#tensorrt_llm.llmapi.MTPDecodingConfig.set_max_total_draft_tokens">[docs]</a>
     <span class="nd">@model_validator</span><span class="p">(</span><span class="n">mode</span><span class="o">=</span><span class="s2">&quot;after&quot;</span><span class="p">)</span>
     <span class="k">def</span><span class="w"> </span><span class="nf">set_max_total_draft_tokens</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">max_draft_len</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">num_nextn_predict_layers</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">max_total_draft_tokens</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">num_nextn_predict_layers</span>  <span class="c1"># Current MTP only supports linear tree</span>
+        <span class="c1"># Default max_draft_len to 1 if not set by the user.</span>
+        <span class="c1"># For vanilla MTP, update_spec_config_from_model_config will override this</span>
+        <span class="c1"># with the actual num_nextn_predict_layers from the model.</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">max_draft_len</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">max_draft_len</span> <span class="o">=</span> <span class="mi">1</span>
+        <span class="k">elif</span> <span class="bp">self</span><span class="o">.</span><span class="n">max_draft_len</span> <span class="o">&lt;=</span> <span class="mi">0</span><span class="p">:</span>
+            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="s2">&quot;max_draft_len must be &gt; 0 for MTP&quot;</span><span class="p">)</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">max_total_draft_tokens</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">max_draft_len</span>  <span class="c1"># Current MTP only supports linear tree</span>
         <span class="k">return</span> <span class="bp">self</span></div>
 
 
@@ -2690,19 +2807,21 @@ window.runMermaid = runMermaid;</script>
         <span class="k">return</span> <span class="n">backend</span> <span class="ow">in</span> <span class="p">(</span><span class="s2">&quot;pytorch&quot;</span><span class="p">,</span> <span class="s2">&quot;_autodeploy&quot;</span><span class="p">)</span></div>
 
 
-    <span class="nd">@functools</span><span class="o">.</span><span class="n">cached_property</span>
+    <span class="nd">@property</span>
     <span class="k">def</span><span class="w"> </span><span class="nf">num_capture_layers</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
-        <span class="k">if</span> <span class="ow">not</span> <span class="bp">self</span><span class="o">.</span><span class="n">use_mtp_vanilla</span> <span class="ow">and</span> <span class="ow">not</span> <span class="bp">self</span><span class="o">.</span><span class="n">mtp_eagle_one_model</span><span class="p">:</span>
-            <span class="k">return</span> <span class="mi">1</span>
-        <span class="k">return</span> <span class="mi">0</span>
+        <span class="k">return</span> <span class="mi">1</span> <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">spec_dec_mode</span><span class="o">.</span><span class="n">is_mtp_eagle</span><span class="p">()</span> <span class="k">else</span> <span class="mi">0</span>
 
-    <span class="nd">@functools</span><span class="o">.</span><span class="n">cached_property</span>
+    <span class="nd">@property</span>
     <span class="k">def</span><span class="w"> </span><span class="nf">spec_dec_mode</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
         <span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm._torch.speculative.interface</span><span class="w"> </span><span class="kn">import</span> \
             <span class="n">SpeculativeDecodingMode</span> <span class="k">as</span> <span class="n">TorchSpeculativeDecodingMode</span>
-        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">num_nextn_predict_layers_from_model_config</span> <span class="o">==</span> <span class="mi">1</span> <span class="ow">and</span> <span class="ow">not</span> <span class="bp">self</span><span class="o">.</span><span class="n">use_mtp_vanilla</span> <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">mtp_eagle_one_model</span><span class="p">:</span>
+
+        <span class="c1"># num_nextn_predict_layers is set from the model&#39;s pretrained config by</span>
+        <span class="c1"># update_spec_config_from_model_config. Treat None (before model load) as 1.</span>
+        <span class="n">n</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">num_nextn_predict_layers</span> <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">num_nextn_predict_layers</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="k">else</span> <span class="mi">1</span>
+        <span class="k">if</span> <span class="n">n</span> <span class="o">==</span> <span class="mi">1</span> <span class="ow">and</span> <span class="ow">not</span> <span class="bp">self</span><span class="o">.</span><span class="n">use_mtp_vanilla</span> <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">mtp_eagle_one_model</span><span class="p">:</span>
             <span class="k">return</span> <span class="n">TorchSpeculativeDecodingMode</span><span class="o">.</span><span class="n">MTP_EAGLE_ONE_MODEL</span>
-        <span class="k">elif</span> <span class="bp">self</span><span class="o">.</span><span class="n">num_nextn_predict_layers_from_model_config</span> <span class="o">==</span> <span class="mi">1</span> <span class="ow">and</span> <span class="ow">not</span> <span class="bp">self</span><span class="o">.</span><span class="n">use_mtp_vanilla</span> <span class="ow">and</span> <span class="ow">not</span> <span class="bp">self</span><span class="o">.</span><span class="n">mtp_eagle_one_model</span><span class="p">:</span>
+        <span class="k">elif</span> <span class="n">n</span> <span class="o">==</span> <span class="mi">1</span> <span class="ow">and</span> <span class="ow">not</span> <span class="bp">self</span><span class="o">.</span><span class="n">use_mtp_vanilla</span> <span class="ow">and</span> <span class="ow">not</span> <span class="bp">self</span><span class="o">.</span><span class="n">mtp_eagle_one_model</span><span class="p">:</span>
             <span class="k">return</span> <span class="n">TorchSpeculativeDecodingMode</span><span class="o">.</span><span class="n">MTP_EAGLE</span>
         <span class="k">return</span> <span class="n">TorchSpeculativeDecodingMode</span><span class="o">.</span><span class="n">MTP</span></div>
 
@@ -2763,6 +2882,69 @@ window.runMermaid = runMermaid;</script>
         <span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm._torch.speculative.interface</span><span class="w"> </span><span class="kn">import</span> \
             <span class="n">SpeculativeDecodingMode</span> <span class="k">as</span> <span class="n">TorchSpeculativeDecodingMode</span>
         <span class="k">return</span> <span class="n">TorchSpeculativeDecodingMode</span><span class="o">.</span><span class="n">PARD</span></div>
+
+
+
+<div class="viewcode-block" id="DFlashDecodingConfig">
+<a class="viewcode-back" href="../../../llm-api/reference.html#tensorrt_llm.llmapi.DFlashDecodingConfig">[docs]</a>
+<span class="k">class</span><span class="w"> </span><span class="nc">DFlashDecodingConfig</span><span class="p">(</span><span class="n">DecodingBaseConfig</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;Configuration for DFlash speculative decoding.</span>
+
+<span class="sd">    DFlash is a target-dependent speculative decoding method that uses</span>
+<span class="sd">    hidden states from specific target model layers as cross-attention</span>
+<span class="sd">    context in the draft model to predict multiple draft tokens in parallel.</span>
+
+<span class="sd">    Key features:</span>
+<span class="sd">    - Target-dependent: uses hidden states from target model layers</span>
+<span class="sd">    - Parallel prediction: all K draft tokens in one forward pass</span>
+<span class="sd">    - Cross-attention: draft model attends to target hidden states</span>
+
+<span class="sd">    Reference: https://arxiv.org/pdf/2602.06036</span>
+<span class="sd">    &quot;&quot;&quot;</span>
+    <span class="n">mask_token_id</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+        <span class="n">description</span><span class="o">=</span>
+        <span class="s2">&quot;The token ID used as a mask token for parallel draft prediction. &quot;</span>
+        <span class="s2">&quot;If None, it will be read from the draft model config (dflash_config.mask_token_id).&quot;</span>
+    <span class="p">)</span>
+
+    <span class="n">target_layer_ids</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">List</span><span class="p">[</span><span class="nb">int</span><span class="p">]]</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+        <span class="n">description</span><span class="o">=</span>
+        <span class="s2">&quot;List of target model layer indices whose hidden states are captured &quot;</span>
+        <span class="s2">&quot;for cross-attention in the draft model. If None, read from the draft &quot;</span>
+        <span class="s2">&quot;model config (dflash_config.target_layer_ids).&quot;</span><span class="p">)</span>
+
+    <span class="n">decoding_type</span><span class="p">:</span> <span class="n">Literal</span><span class="p">[</span><span class="s2">&quot;DFlash&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="s2">&quot;DFlash&quot;</span>
+
+<div class="viewcode-block" id="DFlashDecodingConfig.set_max_total_draft_tokens">
+<a class="viewcode-back" href="../../../llm-api/reference.html#tensorrt_llm.llmapi.DFlashDecodingConfig.set_max_total_draft_tokens">[docs]</a>
+    <span class="nd">@model_validator</span><span class="p">(</span><span class="n">mode</span><span class="o">=</span><span class="s2">&quot;after&quot;</span><span class="p">)</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">set_max_total_draft_tokens</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">max_total_draft_tokens</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">max_draft_len</span>
+        <span class="k">return</span> <span class="bp">self</span></div>
+
+
+    <span class="nd">@property</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">tokens_per_gen_step</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">&quot;&quot;&quot;DFlash only needs K+1 tokens per gen request (K drafts + 1 bonus).</span>
+
+<span class="sd">        The draft produces its own mask queries internally; passing mask</span>
+<span class="sd">        fillers through the target is pure wasted work at large batch size.</span>
+<span class="sd">        &quot;&quot;&quot;</span>
+        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">max_draft_len</span> <span class="o">+</span> <span class="mi">1</span>
+
+<div class="viewcode-block" id="DFlashDecodingConfig.supports_backend">
+<a class="viewcode-back" href="../../../llm-api/reference.html#tensorrt_llm.llmapi.DFlashDecodingConfig.supports_backend">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">supports_backend</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">backend</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
+        <span class="k">return</span> <span class="n">backend</span> <span class="o">==</span> <span class="s2">&quot;pytorch&quot;</span></div>
+
+
+    <span class="nd">@functools</span><span class="o">.</span><span class="n">cached_property</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">spec_dec_mode</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+        <span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm._torch.speculative.interface</span><span class="w"> </span><span class="kn">import</span> \
+            <span class="n">SpeculativeDecodingMode</span> <span class="k">as</span> <span class="n">TorchSpeculativeDecodingMode</span>
+        <span class="k">return</span> <span class="n">TorchSpeculativeDecodingMode</span><span class="o">.</span><span class="n">DFLASH</span></div>
 
 
 
@@ -2968,6 +3150,17 @@ window.runMermaid = runMermaid;</script>
     <span class="n">MODEL_WEIGHTS_DRAFT</span> <span class="o">=</span> <span class="s2">&quot;draft_model_weights&quot;</span>
 
 
+<span class="nd">@dataclass</span>
+<span class="k">class</span><span class="w"> </span><span class="nc">_SleepConfigDefaultFactory</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;Picklable replacement for ``lambda: default_mode`` in SleepConfig&#39;s defaultdict.</span>
+<span class="sd">    &quot;&quot;&quot;</span>
+
+    <span class="n">default_mode</span><span class="p">:</span> <span class="n">Any</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="fm">__call__</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Any</span><span class="p">:</span>
+        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">default_mode</span>
+
+
 <span class="k">class</span><span class="w"> </span><span class="nc">SleepConfig</span><span class="p">(</span><span class="n">StrictBaseModel</span><span class="p">):</span>
 <span class="w">    </span><span class="sd">&quot;&quot;&quot;Configuration for the LLM sleep/wakeup feature.</span>
 <span class="sd">    &quot;&quot;&quot;</span>
@@ -3040,7 +3233,8 @@ window.runMermaid = runMermaid;</script>
             <span class="bp">cls</span><span class="o">.</span><span class="n">_normalize_restore_mode</span><span class="p">(</span><span class="n">value</span><span class="p">)</span>
             <span class="k">for</span> <span class="n">key</span><span class="p">,</span> <span class="n">value</span> <span class="ow">in</span> <span class="n">cases</span><span class="o">.</span><span class="n">items</span><span class="p">()</span>
         <span class="p">}</span>
-        <span class="k">return</span> <span class="n">defaultdict</span><span class="p">(</span><span class="k">lambda</span><span class="p">:</span> <span class="n">default_mode</span><span class="p">,</span> <span class="n">normalized_cases</span><span class="p">)</span>
+        <span class="n">factory</span> <span class="o">=</span> <span class="n">_SleepConfigDefaultFactory</span><span class="p">(</span><span class="n">default_mode</span><span class="p">)</span>
+        <span class="k">return</span> <span class="n">defaultdict</span><span class="p">(</span><span class="n">factory</span><span class="p">,</span> <span class="n">normalized_cases</span><span class="p">)</span>
 
     <span class="nd">@field_validator</span><span class="p">(</span><span class="s1">&#39;restore_modes&#39;</span><span class="p">,</span> <span class="n">mode</span><span class="o">=</span><span class="s1">&#39;plain&#39;</span><span class="p">)</span>
     <span class="nd">@classmethod</span>
@@ -3455,8 +3649,8 @@ window.runMermaid = runMermaid;</script>
 <span class="n">SpeculativeConfig</span><span class="p">:</span> <span class="n">TypeAlias</span> <span class="o">=</span> <span class="n">Annotated</span><span class="p">[</span>
     <span class="n">Union</span><span class="p">[</span>
         <span class="n">DraftTargetDecodingConfig</span><span class="p">,</span>
+        <span class="n">Eagle3DecodingConfig</span><span class="p">,</span>  <span class="c1"># Must be before EagleDecodingConfig since it&#39;s a subclass</span>
         <span class="n">EagleDecodingConfig</span><span class="p">,</span>
-        <span class="n">Eagle3DecodingConfig</span><span class="p">,</span>
         <span class="n">LookaheadDecodingConfig</span><span class="p">,</span>
         <span class="n">MedusaDecodingConfig</span><span class="p">,</span>
         <span class="n">MTPDecodingConfig</span><span class="p">,</span>
@@ -3465,6 +3659,7 @@ window.runMermaid = runMermaid;</script>
         <span class="n">UserProvidedDecodingConfig</span><span class="p">,</span>
         <span class="n">SaveHiddenStatesDecodingConfig</span><span class="p">,</span>
         <span class="n">PARDDecodingConfig</span><span class="p">,</span>
+        <span class="n">DFlashDecodingConfig</span><span class="p">,</span>
         <span class="n">AutoDecodingConfig</span><span class="p">,</span>
     <span class="p">],</span>
     <span class="n">Field</span><span class="p">(</span><span class="n">discriminator</span><span class="o">=</span><span class="s2">&quot;decoding_type&quot;</span><span class="p">),</span>
@@ -3478,6 +3673,47 @@ window.runMermaid = runMermaid;</script>
     <span class="p">],</span>
     <span class="n">Field</span><span class="p">(</span><span class="n">discriminator</span><span class="o">=</span><span class="s2">&quot;algorithm&quot;</span><span class="p">),</span>
 <span class="p">]</span>
+
+
+<span class="nd">@PybindMirror</span><span class="o">.</span><span class="n">mirror_pybind_fields</span><span class="p">(</span><span class="n">_AgentTreeConfig</span><span class="p">)</span>
+<span class="k">class</span><span class="w"> </span><span class="nc">AgentTreeConfig</span><span class="p">(</span><span class="n">StrictBaseModel</span><span class="p">,</span> <span class="n">PybindMirror</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;Configuration for agent tree scheduling.</span>
+
+<span class="sd">    Controls how agent requests are scheduled relative to regular chat requests.</span>
+<span class="sd">    &quot;&quot;&quot;</span>
+    <span class="n">agent_percentage</span><span class="p">:</span> <span class="nb">float</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="mf">0.0</span><span class="p">,</span>
+        <span class="n">description</span><span class="o">=</span>
+        <span class="s2">&quot;The percentage of agent requests to schedule. Defaults to 0.0. &quot;</span>
+        <span class="s2">&quot;Should be between 0.0 and 1.0. -1.0 means random schedule between agent and chatbot.&quot;</span>
+    <span class="p">)</span>
+    <span class="n">agent_types</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">List</span><span class="p">[</span><span class="nb">str</span><span class="p">]]</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+        <span class="n">description</span><span class="o">=</span>
+        <span class="s2">&quot;Types of agents to schedule (e.g. &#39;AgentDeepResearch&#39;, &#39;Researcher&#39;, &#39;MultiroundChat&#39;).&quot;</span>
+    <span class="p">)</span>
+    <span class="n">agent_inflight_seq_num</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="mi">2</span><span class="o">**</span><span class="mi">31</span> <span class="o">-</span> <span class="mi">1</span><span class="p">,</span>
+        <span class="n">description</span><span class="o">=</span><span class="s2">&quot;Max number of inflight sequences for agent requests.&quot;</span><span class="p">)</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">_to_pybind</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+        <span class="k">return</span> <span class="n">_AgentTreeConfig</span><span class="p">(</span>
+            <span class="n">agent_percentage</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">agent_percentage</span><span class="p">,</span>
+            <span class="n">agent_types</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">agent_types</span><span class="p">,</span>
+            <span class="n">agent_inflight_seq_num</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">agent_inflight_seq_num</span><span class="p">,</span>
+        <span class="p">)</span>
+
+
+<div class="viewcode-block" id="ReorderRequestPolicyConfig">
+<a class="viewcode-back" href="../../../llm-api/reference.html#tensorrt_llm.llmapi.ReorderRequestPolicyConfig">[docs]</a>
+<span class="k">class</span><span class="w"> </span><span class="nc">ReorderRequestPolicyConfig</span><span class="p">(</span><span class="n">StrictBaseModel</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;Configuration for request reordering policy.&quot;&quot;&quot;</span>
+    <span class="n">policy_name</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">Literal</span><span class="p">[</span><span class="s2">&quot;AgentTree&quot;</span><span class="p">]]</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span> <span class="n">description</span><span class="o">=</span><span class="s2">&quot;The name of the request reordering policy.&quot;</span><span class="p">)</span>
+    <span class="n">policy_args</span><span class="p">:</span> <span class="n">AgentTreeConfig</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
+        <span class="n">default_factory</span><span class="o">=</span><span class="n">AgentTreeConfig</span><span class="p">,</span>
+        <span class="n">description</span><span class="o">=</span><span class="s2">&quot;The arguments of the request reordering policy.&quot;</span><span class="p">)</span></div>
+
 
 
 <div class="viewcode-block" id="KvCacheConfig">
@@ -3496,7 +3732,7 @@ window.runMermaid = runMermaid;</script>
         <span class="n">description</span><span class="o">=</span>
         <span class="s2">&quot;The maximum number of tokens that should be stored in the KV cache. If both `max_tokens` and `free_gpu_memory_fraction` are specified, memory corresponding to the minimum will be used.&quot;</span>
     <span class="p">)</span>
-    <span class="n">max_attention_window</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">List</span><span class="p">[</span><span class="n">PositiveInt</span><span class="p">]]</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
+    <span class="n">max_attention_window</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">List</span><span class="p">[</span><span class="nb">int</span><span class="p">]]</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
         <span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
         <span class="n">min_length</span><span class="o">=</span><span class="mi">1</span><span class="p">,</span>
         <span class="n">description</span><span class="o">=</span>
@@ -3598,6 +3834,12 @@ window.runMermaid = runMermaid;</script>
     <span class="n">tokens_per_block</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span><span class="n">default</span><span class="o">=</span><span class="mi">32</span><span class="p">,</span>
                                   <span class="n">description</span><span class="o">=</span><span class="s2">&quot;The number of tokens per block.&quot;</span><span class="p">)</span>
 
+    <span class="c1"># This is a pure python field, not a pybind field. It is only for the Pytorch backend.</span>
+    <span class="n">mamba_state_cache_interval</span><span class="p">:</span> <span class="n">PositiveInt</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="mi">256</span><span class="p">,</span>
+        <span class="n">description</span><span class="o">=</span>
+        <span class="s2">&quot;The number of tokens between cache steps in the Mamba prefix cache.&quot;</span><span class="p">)</span>
+
     <span class="n">use_kv_cache_manager_v2</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
         <span class="n">default</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
         <span class="n">status</span><span class="o">=</span><span class="s2">&quot;prototype&quot;</span><span class="p">,</span>
@@ -3687,9 +3929,9 @@ window.runMermaid = runMermaid;</script>
                 <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
                     <span class="s2">&quot;kv_cache_config.max_attention_window must contain only integers&quot;</span>
                 <span class="p">)</span>
-            <span class="k">if</span> <span class="n">i</span> <span class="o">&lt;=</span> <span class="mi">0</span><span class="p">:</span>
+            <span class="k">if</span> <span class="n">i</span> <span class="o">&lt;=</span> <span class="mi">0</span> <span class="ow">and</span> <span class="n">i</span> <span class="ow">not</span> <span class="ow">in</span> <span class="p">[</span><span class="n">LinearCacheType</span><span class="o">.</span><span class="n">RECURRENT_STATES</span><span class="o">.</span><span class="n">value</span><span class="p">]:</span>
                 <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
-                    <span class="s2">&quot;kv_cache_config.max_attention_window values must be positive&quot;</span>
+                    <span class="s2">&quot;kv_cache_config.max_attention_window values must be positive or LinearCacheType.RECURRENT_STATES.value&quot;</span>
                 <span class="p">)</span>
         <span class="k">return</span> <span class="n">v</span></div>
 
@@ -3849,6 +4091,12 @@ window.runMermaid = runMermaid;</script>
         <span class="n">default</span><span class="o">=</span><span class="mi">0</span><span class="p">,</span> <span class="n">description</span><span class="o">=</span><span class="s2">&quot;The number of experts per worker.&quot;</span><span class="p">)</span>
     <span class="n">num_prefetch_experts</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
         <span class="n">default</span><span class="o">=</span><span class="mi">0</span><span class="p">,</span> <span class="n">description</span><span class="o">=</span><span class="s2">&quot;The number of prefetch experts per worker.&quot;</span><span class="p">)</span>
+    <span class="n">contention_opt</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+        <span class="n">description</span><span class="o">=</span>
+        <span class="s2">&quot;Enable limited-contention prefetch optimization. Uses batched &quot;</span>
+        <span class="s2">&quot;memcpy with round-robin slice ordering across peers and a 2 MiB &quot;</span>
+        <span class="s2">&quot;slice granularity to reduce NVLink contention.&quot;</span><span class="p">)</span>
 
 
 <span class="k">class</span><span class="w"> </span><span class="nc">BaseLlmArgs</span><span class="p">(</span><span class="n">StrictBaseModel</span><span class="p">):</span>
@@ -4474,6 +4722,10 @@ window.runMermaid = runMermaid;</script>
                 <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
                     <span class="s2">&quot;speculative_config.decoding_type &#39;PARD&#39; is only supported on the PyTorch backend.&quot;</span>
                 <span class="p">)</span>
+            <span class="k">elif</span> <span class="nb">isinstance</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">speculative_config</span><span class="p">,</span> <span class="n">DFlashDecodingConfig</span><span class="p">):</span>
+                <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
+                    <span class="s2">&quot;speculative_config.decoding_type &#39;DFlash&#39; is only supported on the PyTorch backend.&quot;</span>
+                <span class="p">)</span>
             <span class="k">else</span><span class="p">:</span>
                 <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
                     <span class="sa">f</span><span class="s2">&quot;Unrecognized speculative config type </span><span class="si">{</span><span class="nb">type</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">speculative_config</span><span class="p">)</span><span class="si">}</span><span class="s2">&quot;</span>
@@ -4667,6 +4919,50 @@ window.runMermaid = runMermaid;</script>
     <span class="n">VISION_ONLY</span> <span class="o">=</span> <span class="mi">2</span>
 
 
+<span class="k">class</span><span class="w"> </span><span class="nc">ModelExpressConfig</span><span class="p">(</span><span class="n">StrictBaseModel</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;Prototype configuration for ModelExpress (MX) weight transfer.&quot;&quot;&quot;</span>
+
+    <span class="n">server_url</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+        <span class="n">description</span><span class="o">=</span><span class="s2">&quot;URL of the MX (ModelExpress) server for P2P weight &quot;</span>
+        <span class="s2">&quot;transfer. When set together with checkpoint_format=&#39;MX&#39;, enables &quot;</span>
+        <span class="s2">&quot;GPU-to-GPU weight transfer from a running source instance, bypassing &quot;</span>
+        <span class="s2">&quot;disk I/O. When the server is unreachable, loading falls back to the &quot;</span>
+        <span class="s2">&quot;standard HuggingFace checkpoint path.&quot;</span><span class="p">,</span>
+        <span class="n">status</span><span class="o">=</span><span class="s2">&quot;prototype&quot;</span><span class="p">,</span>
+    <span class="p">)</span>
+
+    <span class="n">server_query_timeout_s</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">NonNegativeInt</span><span class="p">]</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+        <span class="n">description</span><span class="o">=</span><span class="s2">&quot;Timeout in seconds for upstream MxLiveWeightLoader source &quot;</span>
+        <span class="s2">&quot;discovery. When unset, TRT-LLM first probes for existing sources: &quot;</span>
+        <span class="s2">&quot;no source uses a short 30-second fallback cap, while an existing &quot;</span>
+        <span class="s2">&quot;source uses modelexpress&#39;s default wait for long donor loads.&quot;</span><span class="p">,</span>
+        <span class="n">status</span><span class="o">=</span><span class="s2">&quot;prototype&quot;</span><span class="p">,</span>
+    <span class="p">)</span>
+
+    <span class="n">preshard_strategy</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="s2">&quot;per_module&quot;</span><span class="p">,</span>
+        <span class="n">description</span><span class="o">=</span><span class="s2">&quot;How to inform TRT-LLM that MX-delivered weights are already &quot;</span>
+        <span class="s2">&quot;TP-sharded for the local rank. Only &#39;per_module&#39; is supported in &quot;</span>
+        <span class="s2">&quot;this MX-only PR; &#39;global&#39; requires LoadFormat.PRESHARDED.&quot;</span><span class="p">,</span>
+        <span class="n">status</span><span class="o">=</span><span class="s2">&quot;prototype&quot;</span><span class="p">,</span>
+    <span class="p">)</span>
+
+    <span class="nd">@model_validator</span><span class="p">(</span><span class="n">mode</span><span class="o">=</span><span class="s2">&quot;after&quot;</span><span class="p">)</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">validate_preshard_strategy</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="s1">&#39;ModelExpressConfig&#39;</span><span class="p">:</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">preshard_strategy</span> <span class="ow">not</span> <span class="ow">in</span> <span class="p">(</span><span class="s2">&quot;per_module&quot;</span><span class="p">,</span> <span class="s2">&quot;global&quot;</span><span class="p">):</span>
+            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
+                <span class="sa">f</span><span class="s2">&quot;mx_config.preshard_strategy must be &#39;per_module&#39; or &#39;global&#39;, &quot;</span>
+                <span class="sa">f</span><span class="s2">&quot;got &#39;</span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">preshard_strategy</span><span class="si">}</span><span class="s2">&#39;.&quot;</span><span class="p">)</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">preshard_strategy</span> <span class="o">==</span> <span class="s2">&quot;global&quot;</span><span class="p">:</span>
+            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
+                <span class="s2">&quot;mx_config.preshard_strategy=&#39;global&#39; requires &quot;</span>
+                <span class="s2">&quot;LoadFormat.PRESHARDED, which is not yet available in &quot;</span>
+                <span class="s2">&quot;TRT-LLM main. Use preshard_strategy=&#39;per_module&#39; instead.&quot;</span><span class="p">)</span>
+        <span class="k">return</span> <span class="bp">self</span>
+
+
 <span class="k">class</span><span class="w"> </span><span class="nc">SamplerType</span><span class="p">(</span><span class="n">StrEnum</span><span class="p">):</span>
 <span class="w">    </span><span class="sd">&quot;&quot;&quot;Enum for sampler type options.&quot;&quot;&quot;</span>
     <span class="n">TRTLLMSampler</span> <span class="o">=</span> <span class="s2">&quot;TRTLLMSampler&quot;</span>
@@ -4797,6 +5093,25 @@ window.runMermaid = runMermaid;</script>
         <span class="s2">&quot;irrespective of confidential compute state.&quot;</span><span class="p">,</span>
         <span class="n">status</span><span class="o">=</span><span class="s2">&quot;prototype&quot;</span><span class="p">)</span>
 
+    <span class="n">enable_speculative_beam_history_d2h</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+        <span class="n">description</span><span class="o">=</span><span class="s2">&quot;Opt-in beam-search optimization: skip per-step &quot;</span>
+        <span class="s2">&quot;beam-history D2H copies on likely-non-terminal steps via a &quot;</span>
+        <span class="s2">&quot;host-side predictor and route the remaining copies through a &quot;</span>
+        <span class="s2">&quot;private side stream. Mispredictions fall back to a synchronous &quot;</span>
+        <span class="s2">&quot;.cpu(), preserving correctness but breaking overlap on that step. &quot;</span>
+        <span class="s2">&quot;Incompatible with the async D2H worker &quot;</span>
+        <span class="s2">&quot;(sampler_force_async_worker=True or confidential compute).&quot;</span><span class="p">,</span>
+        <span class="n">status</span><span class="o">=</span><span class="s2">&quot;prototype&quot;</span><span class="p">)</span>
+
+    <span class="n">enable_early_first_token_response</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+        <span class="n">description</span><span class="o">=</span>
+        <span class="s2">&quot;Under the overlap scheduler, emit the first-token response ahead of &quot;</span>
+        <span class="s2">&quot;the next sample step to reduce TTFT. No effect when the overlap &quot;</span>
+        <span class="s2">&quot;scheduler is disabled.&quot;</span><span class="p">,</span>
+        <span class="n">status</span><span class="o">=</span><span class="s2">&quot;prototype&quot;</span><span class="p">)</span>
+
     <span class="n">enable_iter_perf_stats</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
         <span class="n">default</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
         <span class="n">description</span><span class="o">=</span><span class="s2">&quot;Enable iteration performance statistics.&quot;</span><span class="p">,</span>
@@ -4907,6 +5222,12 @@ window.runMermaid = runMermaid;</script>
         <span class="n">status</span><span class="o">=</span><span class="s2">&quot;prototype&quot;</span><span class="p">,</span>
     <span class="p">)</span>
 
+    <span class="n">mx_config</span><span class="p">:</span> <span class="n">ModelExpressConfig</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
+        <span class="n">default_factory</span><span class="o">=</span><span class="n">ModelExpressConfig</span><span class="p">,</span>
+        <span class="n">description</span><span class="o">=</span><span class="s2">&quot;ModelExpress (MX) P2P checkpoint loading config.&quot;</span><span class="p">,</span>
+        <span class="n">status</span><span class="o">=</span><span class="s2">&quot;prototype&quot;</span><span class="p">,</span>
+    <span class="p">)</span>
+
     <span class="n">kv_connector_config</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">KvCacheConnectorConfig</span><span class="p">]</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
         <span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
         <span class="n">description</span><span class="o">=</span><span class="s2">&quot;The config for KV cache connector.&quot;</span><span class="p">,</span>
@@ -4917,6 +5238,18 @@ window.runMermaid = runMermaid;</script>
         <span class="n">default</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
         <span class="n">description</span><span class="o">=</span>
         <span class="s2">&quot;Only load/execute the vision encoder part of the full model. Defaults to False.&quot;</span><span class="p">,</span>
+        <span class="n">status</span><span class="o">=</span><span class="s2">&quot;prototype&quot;</span><span class="p">,</span>
+    <span class="p">)</span>
+
+    <span class="n">encode_only</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+        <span class="n">description</span><span class="o">=</span>
+        <span class="s2">&quot;Set to True to use the batch-forward encode() path, which runs a &quot;</span>
+        <span class="s2">&quot;single forward pass and returns the model output directly, bypassing &quot;</span>
+        <span class="s2">&quot;the scheduler and autoregressive loop. Works for encoder-only &quot;</span>
+        <span class="s2">&quot;models (BERT, RoBERTa, reward models) and decoder models used in &quot;</span>
+        <span class="s2">&quot;single-prefill mode (e.g., extracting embeddings). When False &quot;</span>
+        <span class="s2">&quot;(default), uses the standard generate() path.&quot;</span><span class="p">,</span>
         <span class="n">status</span><span class="o">=</span><span class="s2">&quot;prototype&quot;</span><span class="p">,</span>
     <span class="p">)</span>
 
@@ -4946,6 +5279,20 @@ window.runMermaid = runMermaid;</script>
         <span class="s2">&quot;Only enable it if you intend to use this feature.&quot;</span><span class="p">,</span>
         <span class="n">status</span><span class="o">=</span><span class="s2">&quot;prototype&quot;</span><span class="p">)</span>
 
+    <span class="n">reorder_policy_config</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">ReorderRequestPolicyConfig</span><span class="p">]</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+        <span class="n">description</span><span class="o">=</span><span class="s2">&quot;The request reordering policy to use.&quot;</span><span class="p">,</span>
+        <span class="n">status</span><span class="o">=</span><span class="s2">&quot;prototype&quot;</span><span class="p">,</span>
+    <span class="p">)</span>
+
+    <span class="n">enable_resource_governor</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+        <span class="n">description</span><span class="o">=</span><span class="s2">&quot;Enable the resource governor for runtime cache management &quot;</span>
+        <span class="s2">&quot;operations such as KV cache truncation. This adds a per-iteration &quot;</span>
+        <span class="s2">&quot;broadcast collective.&quot;</span><span class="p">,</span>
+        <span class="n">status</span><span class="o">=</span><span class="s2">&quot;prototype&quot;</span><span class="p">,</span>
+    <span class="p">)</span>
+
     <span class="c1"># fp8 cute dsl configs</span>
     <span class="n">use_cute_dsl_blockscaling_mm</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
         <span class="n">default</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
@@ -4955,6 +5302,19 @@ window.runMermaid = runMermaid;</script>
     <span class="n">use_cute_dsl_blockscaling_bmm</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
         <span class="n">default</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
         <span class="n">description</span><span class="o">=</span><span class="s2">&quot;If true, use CuTe DSL fp8 blockscaling bmm implementation.&quot;</span><span class="p">,</span>
+        <span class="n">status</span><span class="o">=</span><span class="s2">&quot;prototype&quot;</span><span class="p">,</span>
+    <span class="p">)</span>
+    <span class="c1"># bf16 cute dsl configs</span>
+    <span class="n">use_cute_dsl_bf16_bmm</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+        <span class="n">description</span><span class="o">=</span>
+        <span class="s2">&quot;If true, use CuTe DSL bf16 persistent GEMM for BMM on Blackwell.&quot;</span><span class="p">,</span>
+        <span class="n">status</span><span class="o">=</span><span class="s2">&quot;prototype&quot;</span><span class="p">,</span>
+    <span class="p">)</span>
+    <span class="n">use_cute_dsl_bf16_gemm</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+        <span class="n">description</span><span class="o">=</span>
+        <span class="s2">&quot;If true, use CuTe DSL bf16 persistent GEMM for Linear layers on Blackwell.&quot;</span><span class="p">,</span>
         <span class="n">status</span><span class="o">=</span><span class="s2">&quot;prototype&quot;</span><span class="p">,</span>
     <span class="p">)</span>
 
@@ -5064,8 +5424,38 @@ window.runMermaid = runMermaid;</script>
                     <span class="n">exclude</span><span class="o">=</span><span class="p">{</span><span class="s2">&quot;decoding_type&quot;</span><span class="p">})</span>
                 <span class="bp">self</span><span class="o">.</span><span class="n">speculative_config</span> <span class="o">=</span> <span class="n">Eagle3DecodingConfig</span><span class="p">(</span><span class="o">**</span><span class="n">eagle_data</span><span class="p">)</span>
 
+            <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">speculative_config</span><span class="o">.</span><span class="n">use_rejection_sampling</span><span class="p">:</span>
+                <span class="k">if</span> <span class="ow">not</span> <span class="nb">isinstance</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">speculative_config</span><span class="p">,</span>
+                                  <span class="n">Eagle3DecodingConfig</span><span class="p">):</span>
+                    <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
+                        <span class="s2">&quot;use_rejection_sampling is only supported for &quot;</span>
+                        <span class="s2">&quot;PyTorch Eagle3 one-model speculative decoding paths.&quot;</span><span class="p">)</span>
+
             <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">speculative_config</span><span class="p">,</span> <span class="n">PARDDecodingConfig</span><span class="p">):</span>
                 <span class="k">assert</span> <span class="bp">self</span><span class="o">.</span><span class="n">speculative_config</span><span class="o">.</span><span class="n">max_draft_len</span> <span class="o">&gt;</span> <span class="mi">0</span><span class="p">,</span> <span class="s2">&quot;PARD max_draft_len must be &gt; 0&quot;</span>
+
+            <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">speculative_config</span><span class="p">,</span> <span class="n">DFlashDecodingConfig</span><span class="p">):</span>
+                <span class="k">assert</span> <span class="bp">self</span><span class="o">.</span><span class="n">speculative_config</span><span class="o">.</span><span class="n">max_draft_len</span> <span class="o">&gt;</span> <span class="mi">0</span><span class="p">,</span> <span class="s2">&quot;DFlash max_draft_len must be &gt; 0&quot;</span>
+                <span class="c1"># Resolve target_layer_ids and mask_token_id from draft model config if not set</span>
+                <span class="n">needs_target_layer_ids</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">speculative_config</span><span class="o">.</span><span class="n">target_layer_ids</span> <span class="ow">is</span> <span class="kc">None</span>
+                <span class="n">needs_mask_token_id</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">speculative_config</span><span class="o">.</span><span class="n">mask_token_id</span> <span class="ow">is</span> <span class="kc">None</span>
+                <span class="k">if</span> <span class="p">(</span><span class="n">needs_target_layer_ids</span> <span class="ow">or</span> <span class="n">needs_mask_token_id</span>
+                    <span class="p">)</span> <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">speculative_config</span><span class="o">.</span><span class="n">speculative_model</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+                    <span class="n">draft_config_path</span> <span class="o">=</span> <span class="n">os</span><span class="o">.</span><span class="n">path</span><span class="o">.</span><span class="n">join</span><span class="p">(</span>
+                        <span class="bp">self</span><span class="o">.</span><span class="n">speculative_config</span><span class="o">.</span><span class="n">speculative_model</span><span class="p">,</span>
+                        <span class="s2">&quot;config.json&quot;</span><span class="p">)</span>
+                    <span class="k">if</span> <span class="n">os</span><span class="o">.</span><span class="n">path</span><span class="o">.</span><span class="n">exists</span><span class="p">(</span><span class="n">draft_config_path</span><span class="p">):</span>
+                        <span class="k">with</span> <span class="nb">open</span><span class="p">(</span><span class="n">draft_config_path</span><span class="p">)</span> <span class="k">as</span> <span class="n">f</span><span class="p">:</span>
+                            <span class="n">draft_cfg</span> <span class="o">=</span> <span class="n">json</span><span class="o">.</span><span class="n">load</span><span class="p">(</span><span class="n">f</span><span class="p">)</span>
+                        <span class="n">dflash_cfg</span> <span class="o">=</span> <span class="n">draft_cfg</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;dflash_config&quot;</span><span class="p">,</span> <span class="p">{})</span>
+                        <span class="k">if</span> <span class="n">needs_target_layer_ids</span><span class="p">:</span>
+                            <span class="n">layer_ids</span> <span class="o">=</span> <span class="n">dflash_cfg</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;target_layer_ids&quot;</span><span class="p">)</span>
+                            <span class="k">if</span> <span class="n">layer_ids</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+                                <span class="bp">self</span><span class="o">.</span><span class="n">speculative_config</span><span class="o">.</span><span class="n">target_layer_ids</span> <span class="o">=</span> <span class="n">layer_ids</span>
+                        <span class="k">if</span> <span class="n">needs_mask_token_id</span><span class="p">:</span>
+                            <span class="n">mask_id</span> <span class="o">=</span> <span class="n">dflash_cfg</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;mask_token_id&quot;</span><span class="p">)</span>
+                            <span class="k">if</span> <span class="n">mask_id</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+                                <span class="bp">self</span><span class="o">.</span><span class="n">speculative_config</span><span class="o">.</span><span class="n">mask_token_id</span> <span class="o">=</span> <span class="n">mask_id</span>
 
             <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">speculative_config</span><span class="p">,</span> <span class="n">SADecodingConfig</span><span class="p">):</span>
                 <span class="n">pool_size</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">speculative_config</span><span class="o">.</span><span class="n">global_pool_size</span>
@@ -5112,6 +5502,30 @@ window.runMermaid = runMermaid;</script>
         <span class="k">return</span> <span class="bp">self</span></div>
 
 
+<div class="viewcode-block" id="TorchLlmArgs.validate_early_first_token_response">
+<a class="viewcode-back" href="../../../llm-api/reference.html#tensorrt_llm.llmapi.TorchLlmArgs.validate_early_first_token_response">[docs]</a>
+    <span class="nd">@model_validator</span><span class="p">(</span><span class="n">mode</span><span class="o">=</span><span class="s2">&quot;after&quot;</span><span class="p">)</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">validate_early_first_token_response</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="s1">&#39;TorchLlmArgs&#39;</span><span class="p">:</span>
+        <span class="k">if</span> <span class="ow">not</span> <span class="bp">self</span><span class="o">.</span><span class="n">enable_early_first_token_response</span><span class="p">:</span>
+            <span class="k">return</span> <span class="bp">self</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">disable_overlap_scheduler</span><span class="p">:</span>
+            <span class="n">logger</span><span class="o">.</span><span class="n">warning</span><span class="p">(</span>
+                <span class="s2">&quot;enable_early_first_token_response is relevant only when the &quot;</span>
+                <span class="s2">&quot;overlap scheduler is enabled; disabling it because &quot;</span>
+                <span class="s2">&quot;disable_overlap_scheduler is True.&quot;</span><span class="p">)</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">enable_early_first_token_response</span> <span class="o">=</span> <span class="kc">False</span>
+            <span class="k">return</span> <span class="bp">self</span>
+        <span class="n">is_disagg</span> <span class="o">=</span> <span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">cache_transceiver_config</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span>
+                     <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">cache_transceiver_config</span><span class="o">.</span><span class="n">backend</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">)</span>
+        <span class="k">if</span> <span class="n">is_disagg</span><span class="p">:</span>
+            <span class="n">logger</span><span class="o">.</span><span class="n">warning</span><span class="p">(</span>
+                <span class="s2">&quot;enable_early_first_token_response is supported only for &quot;</span>
+                <span class="s2">&quot;aggregated workloads; disabling it because &quot;</span>
+                <span class="s2">&quot;cache_transceiver_config is configured.&quot;</span><span class="p">)</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">enable_early_first_token_response</span> <span class="o">=</span> <span class="kc">False</span>
+        <span class="k">return</span> <span class="bp">self</span></div>
+
+
 <div class="viewcode-block" id="TorchLlmArgs.validate_checkpoint_format">
 <a class="viewcode-back" href="../../../llm-api/reference.html#tensorrt_llm.llmapi.TorchLlmArgs.validate_checkpoint_format">[docs]</a>
     <span class="nd">@model_validator</span><span class="p">(</span><span class="n">mode</span><span class="o">=</span><span class="s2">&quot;after&quot;</span><span class="p">)</span>
@@ -5128,6 +5542,32 @@ window.runMermaid = runMermaid;</script>
                 <span class="s2">&quot;checkpoint_format will be set to HF.&quot;</span><span class="p">)</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">checkpoint_format</span> <span class="o">=</span> <span class="s2">&quot;HF&quot;</span>
 
+        <span class="k">return</span> <span class="bp">self</span></div>
+
+
+<div class="viewcode-block" id="TorchLlmArgs.validate_mx_config">
+<a class="viewcode-back" href="../../../llm-api/reference.html#tensorrt_llm.llmapi.TorchLlmArgs.validate_mx_config">[docs]</a>
+    <span class="nd">@model_validator</span><span class="p">(</span><span class="n">mode</span><span class="o">=</span><span class="s2">&quot;after&quot;</span><span class="p">)</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">validate_mx_config</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="s1">&#39;TorchLlmArgs&#39;</span><span class="p">:</span>
+        <span class="c1"># When MX is the active checkpoint format and the user did not</span>
+        <span class="c1"># explicitly set ``mx_config.server_url``, honor the ``MODEL_EXPRESS_URL``</span>
+        <span class="c1"># env var that the upstream ``modelexpress`` library reads. This</span>
+        <span class="c1"># lets orchestrators configure MX via the environment while keeping</span>
+        <span class="c1"># the resolved value visible on ``llm_args.mx_config.server_url``.</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">checkpoint_format</span> <span class="o">==</span> <span class="s2">&quot;MX&quot;</span> <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">mx_config</span><span class="o">.</span><span class="n">server_url</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="n">env_url</span> <span class="o">=</span> <span class="n">os</span><span class="o">.</span><span class="n">environ</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;MODEL_EXPRESS_URL&quot;</span><span class="p">)</span>
+            <span class="k">if</span> <span class="n">env_url</span><span class="p">:</span>
+                <span class="n">logger</span><span class="o">.</span><span class="n">info</span><span class="p">(</span>
+                    <span class="s2">&quot;mx_config.server_url not set; using MODEL_EXPRESS_URL=</span><span class="si">%s</span><span class="s2"> &quot;</span>
+                    <span class="s2">&quot;from environment.&quot;</span><span class="p">,</span> <span class="n">env_url</span><span class="p">)</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">mx_config</span><span class="o">.</span><span class="n">server_url</span> <span class="o">=</span> <span class="n">env_url</span>
+
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">mx_config</span><span class="o">.</span><span class="n">server_url</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">checkpoint_format</span> <span class="o">!=</span> <span class="s2">&quot;MX&quot;</span><span class="p">:</span>
+            <span class="n">logger</span><span class="o">.</span><span class="n">warning</span><span class="p">(</span>
+                <span class="s2">&quot;mx_config.server_url is set but checkpoint_format is &#39;</span><span class="si">%s</span><span class="s2">&#39;, not &quot;</span>
+                <span class="s2">&quot;&#39;MX&#39;. The MX config will be ignored. Set &quot;</span>
+                <span class="s2">&quot;checkpoint_format=&#39;MX&#39; to enable MX P2P weight transfer.&quot;</span><span class="p">,</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">checkpoint_format</span><span class="p">)</span>
         <span class="k">return</span> <span class="bp">self</span></div>
 
 
@@ -5248,6 +5688,34 @@ window.runMermaid = runMermaid;</script>
         <span class="k">return</span> <span class="bp">self</span></div>
 
 
+<div class="viewcode-block" id="TorchLlmArgs.validate_cute_dsl_bf16">
+<a class="viewcode-back" href="../../../llm-api/reference.html#tensorrt_llm.llmapi.TorchLlmArgs.validate_cute_dsl_bf16">[docs]</a>
+    <span class="nd">@model_validator</span><span class="p">(</span><span class="n">mode</span><span class="o">=</span><span class="s1">&#39;after&#39;</span><span class="p">)</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">validate_cute_dsl_bf16</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="s1">&#39;TorchLlmArgs&#39;</span><span class="p">:</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">use_cute_dsl_bf16_bmm</span> <span class="ow">or</span> <span class="bp">self</span><span class="o">.</span><span class="n">use_cute_dsl_bf16_gemm</span><span class="p">:</span>
+            <span class="n">major</span><span class="p">,</span> <span class="n">minor</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">get_device_capability</span><span class="p">()</span>
+            <span class="n">sm</span> <span class="o">=</span> <span class="n">major</span> <span class="o">*</span> <span class="mi">10</span> <span class="o">+</span> <span class="n">minor</span>
+            <span class="k">if</span> <span class="n">sm</span> <span class="o">&lt;</span> <span class="mi">100</span><span class="p">:</span>
+                <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
+                    <span class="sa">f</span><span class="s2">&quot;use_cute_dsl_bf16_bmm and use_cute_dsl_bf16_gemm are only &quot;</span>
+                    <span class="sa">f</span><span class="s2">&quot;supported on Blackwell (sm &gt;= 100), but current device has &quot;</span>
+                    <span class="sa">f</span><span class="s2">&quot;sm </span><span class="si">{</span><span class="n">sm</span><span class="si">}</span><span class="s2">.&quot;</span><span class="p">)</span>
+        <span class="k">return</span> <span class="bp">self</span></div>
+
+
+<div class="viewcode-block" id="TorchLlmArgs.validate_speculative_beam_history_d2h">
+<a class="viewcode-back" href="../../../llm-api/reference.html#tensorrt_llm.llmapi.TorchLlmArgs.validate_speculative_beam_history_d2h">[docs]</a>
+    <span class="nd">@model_validator</span><span class="p">(</span><span class="n">mode</span><span class="o">=</span><span class="s1">&#39;after&#39;</span><span class="p">)</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">validate_speculative_beam_history_d2h</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="s1">&#39;TorchLlmArgs&#39;</span><span class="p">:</span>
+        <span class="k">if</span> <span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">enable_speculative_beam_history_d2h</span>
+                <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">sampler_force_async_worker</span><span class="p">):</span>
+            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
+                <span class="s2">&quot;enable_speculative_beam_history_d2h is incompatible with &quot;</span>
+                <span class="s2">&quot;sampler_force_async_worker=True; the speculative path &quot;</span>
+                <span class="s2">&quot;bypasses the sampler&#39;s async D2H worker.&quot;</span><span class="p">)</span>
+        <span class="k">return</span> <span class="bp">self</span></div>
+
+
 <div class="viewcode-block" id="TorchLlmArgs.get_executor_config">
 <a class="viewcode-back" href="../../../llm-api/reference.html#tensorrt_llm.llmapi.TorchLlmArgs.get_executor_config">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">get_executor_config</span><span class="p">(</span>
@@ -5307,6 +5775,7 @@ window.runMermaid = runMermaid;</script>
         <span class="s2">&quot;moe_config&quot;</span><span class="p">:</span> <span class="n">MoeConfig</span><span class="p">,</span>
         <span class="s2">&quot;nvfp4_gemm_config&quot;</span><span class="p">:</span> <span class="n">Nvfp4GemmConfig</span><span class="p">,</span>
         <span class="s2">&quot;attention_dp_config&quot;</span><span class="p">:</span> <span class="n">AttentionDpConfig</span><span class="p">,</span>
+        <span class="s2">&quot;reorder_policy_config&quot;</span><span class="p">:</span> <span class="n">ReorderRequestPolicyConfig</span><span class="p">,</span>
         <span class="s2">&quot;kv_cache_config&quot;</span><span class="p">:</span> <span class="n">KvCacheConfig</span><span class="p">,</span>
         <span class="s2">&quot;dwdp_config&quot;</span><span class="p">:</span> <span class="n">DwdpConfig</span><span class="p">,</span>
         <span class="s2">&quot;telemetry_config&quot;</span><span class="p">:</span> <span class="n">TelemetryConfig</span><span class="p">,</span>
@@ -5495,9 +5964,9 @@ window.runMermaid = runMermaid;</script>
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on May 15, 2026.</p>
+  <p>Last updated on May 20, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/11e16cd">11e16cd</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/c72d43d">c72d43d</a>.</p>
   
 </div></div>
       

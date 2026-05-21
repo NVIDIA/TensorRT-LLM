@@ -63,7 +63,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.17.1';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc12.post1';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc15';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -79,7 +79,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.3.0rc12.post1" />
+  <meta name="docsearch:version" content="1.3.0rc15" />
   
     
     <script src="../_static/searchtools.js"></script>
@@ -338,9 +338,9 @@
 <li class="toctree-l1"><a class="reference internal" href="../overview.html">Overview</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../quick-start-guide.html">Quick Start Guide</a></li>
 <li class="toctree-l1 has-children"><a class="reference internal" href="../installation/index.html">Installation</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
-<li class="toctree-l2"><a class="reference internal" href="../installation/containers.html">Pre-built release container images on NGC</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../installation/linux.html">Installing on Linux via <code class="docutils literal notranslate"><span class="pre">pip</span></code></a></li>
-<li class="toctree-l2"><a class="reference internal" href="../installation/build-from-source-linux.html">Building from Source Code on Linux</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../installation/installation-guide.html">Installation Guide</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../installation/build-from-source.html">Build from Source</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../installation/containers.html">Container Images</a></li>
 </ul>
 </details></li>
 <li class="toctree-l1"><a class="reference internal" href="../supported-hardware.html">Supported Hardware</a></li>
@@ -459,6 +459,11 @@
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
 <ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog24_MoE_as_Dense_GEMM.html">MoE as Dense GEMM: Optimizing Low-Latency MoE Inference on NVIDIA Blackwell</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog23_Joint_Optimization_of_Agent_Applications_and_TensorRT-LLM.html">Joint Optimization of Agent Applications and TensorRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog22_Helix_Parallelism_Scaling_Multi_Million_Token_Decoding_with_KV_Cache_Sharding.html">Helix Parallelism in TensorRT-LLM: Scaling Multi-Million-Token Decoding with KV Cache Sharding</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog21_Temporal_Correlation_Meets_Sparse_Attention.html">Temporal Correlation Meets Sparse Attention: Guess-Verify-Refine Top-K for Blackwell</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog20_Tuning_CUDA_Graph_Batch_Sizes_for_Higher_Output_Throughput.html">Tuning CUDA Graph Batch Sizes for Higher Output Throughput</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog19_DWDP_Distributed_Weight_Data_Parallelism_for_High_Performance_LLM_Inference_on_NVL72.html">DWDP: Distributed Weight Data Parallelism for High-Performance LLM Inference on NVL72</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog18_Optimizing_MoE_Communication_with_One_Sided_AlltoAll_Over_NVLink.html">Optimizing MoE Communication with One-Sided AlltoAll Over NVLink</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog17_Sparse_Attention_in_TensorRT-LLM.html">Sparse Attention in TensorRT LLM</a></li>
@@ -606,6 +611,90 @@
 <h2>Visual Generation<a class="headerlink" href="#visual-generation" title="Link to this heading">#</a></h2>
 <p>For diffusion-based visual generation (image/video), TensorRT-LLM provides a separate <code class="docutils literal notranslate"><span class="pre">VisualGen</span></code> API and <code class="docutils literal notranslate"><span class="pre">DiffusionExecutor</span></code> with its own pipeline architecture. See the <a class="reference internal" href="../models/visual-generation.html"><span class="std std-doc">Visual Generation</span></a> feature documentation.</p>
 </section>
+<section id="module-level-logging">
+<h2>Module-Level Logging<a class="headerlink" href="#module-level-logging" title="Link to this heading">#</a></h2>
+<p>TensorRT-LLM log messages include a fixed-width module tag that identifies which subsystem produced the message:</p>
+<div class="highlight-txt notranslate"><div class="highlight"><pre><span></span>[TRT-LLM] [I] [runtime ] Loading model weights...
+[TRT-LLM] [W] [_torch  ] FlashAttention not available, falling back to default
+[TRT-LLM] [I] [serve   ] Server listening on port 8000
+</pre></div>
+</div>
+<section id="module-abbreviation-table">
+<h3>Module Abbreviation Table<a class="headerlink" href="#module-abbreviation-table" title="Link to this heading">#</a></h3>
+<p>Module names longer than 8 characters are abbreviated to fit the fixed-width tag:</p>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head"><p>Module Name</p></th>
+<th class="head"><p>Display Tag</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">_torch</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">_torch</span>&#160; </code></p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">batch_manager</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">batchmgr</span></code></p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">common</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">common</span>&#160; </code></p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">cutlass_extensions</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">cutl_ext</span></code></p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">deep_ep</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">deep_ep</span> </code></p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">deep_gemm</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">deepgemm</span></code></p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">executor</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">executor</span></code></p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">executor_worker</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">exec_wkr</span></code></p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">flash_mla</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">flashmla</span></code></p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">kernels</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">kernels</span> </code></p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">layers</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">layers</span>&#160; </code></p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">runtime</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">runtime</span> </code></p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">serve</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">serve</span>&#160;&#160; </code></p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">quantization</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">quantize</span></code></p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">scaffolding</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">scaffold</span></code></p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">auto_parallel</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">autoprll</span></code></p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">visual_gen</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">vis_gen</span> </code></p></td>
+</tr>
+</tbody>
+</table>
+</div>
+</section>
+<section id="per-module-log-level-filtering">
+<h3>Per-Module Log Level Filtering<a class="headerlink" href="#per-module-log-level-filtering" title="Link to this heading">#</a></h3>
+<p>Use <code class="docutils literal notranslate"><span class="pre">TLLM_LOG_LEVEL_BY_MODULE</span></code> to set different log levels per module, overriding the global <code class="docutils literal notranslate"><span class="pre">TLLM_LOG_LEVEL</span></code>:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="c1"># Format: &quot;level:module1,module2;level:module3&quot;</span>
+<span class="nb">export</span><span class="w"> </span><span class="nv">TLLM_LOG_LEVEL</span><span class="o">=</span>warning
+<span class="nb">export</span><span class="w"> </span><span class="nv">TLLM_LOG_LEVEL_BY_MODULE</span><span class="o">=</span><span class="s2">&quot;debug:_torch,runtime;info:serve&quot;</span>
+</pre></div>
+</div>
+<p>This example sets the global level to <code class="docutils literal notranslate"><span class="pre">warning</span></code> but enables <code class="docutils literal notranslate"><span class="pre">debug</span></code> output for <code class="docutils literal notranslate"><span class="pre">_torch</span></code> and <code class="docutils literal notranslate"><span class="pre">runtime</span></code> modules, and <code class="docutils literal notranslate"><span class="pre">info</span></code> for <code class="docutils literal notranslate"><span class="pre">serve</span></code>. Valid levels: <code class="docutils literal notranslate"><span class="pre">trace</span></code>, <code class="docutils literal notranslate"><span class="pre">debug</span></code>, <code class="docutils literal notranslate"><span class="pre">verbose</span></code>, <code class="docutils literal notranslate"><span class="pre">info</span></code>, <code class="docutils literal notranslate"><span class="pre">warning</span></code>, <code class="docutils literal notranslate"><span class="pre">error</span></code>, <code class="docutils literal notranslate"><span class="pre">internal_error</span></code>.</p>
+</section>
+</section>
 </section>
 
 
@@ -663,6 +752,11 @@
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#visual-generation">Visual Generation</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#module-level-logging">Module-Level Logging</a><ul class="nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#module-abbreviation-table">Module Abbreviation Table</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#per-module-log-level-filtering">Per-Module Log Level Filtering</a></li>
+</ul>
+</li>
 </ul>
   </nav></div>
 
@@ -754,9 +848,9 @@
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on May 15, 2026.</p>
+  <p>Last updated on May 20, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/11e16cd">11e16cd</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/c72d43d">c72d43d</a>.</p>
   
 </div></div>
       

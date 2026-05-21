@@ -9,7 +9,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" /><meta name="viewport" content="width=device-width, initial-scale=1" />
 
-    <title>Pre-built release container images on NGC &#8212; TensorRT LLM</title>
+    <title>Container Images &#8212; TensorRT LLM</title>
   
   
   
@@ -63,7 +63,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.17.1';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc12.post1';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc15';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -73,13 +73,13 @@
 
     <link rel="index" title="Index" href="../genindex.html" />
     <link rel="search" title="Search" href="../search.html" />
-    <link rel="next" title="Installing on Linux via pip" href="linux.html" />
-    <link rel="prev" title="Installation" href="index.html" />
+    <link rel="next" title="Supported Hardware" href="../supported-hardware.html" />
+    <link rel="prev" title="Build from Source" href="build-from-source.html" />
 
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.3.0rc12.post1" />
+  <meta name="docsearch:version" content="1.3.0rc15" />
   
     
     <script src="../_static/searchtools.js"></script>
@@ -232,6 +232,10 @@
   
 
   
+    <button class="pst-navbar-icon sidebar-toggle secondary-toggle" aria-label="On this page">
+      <span class="fa-solid fa-outdent"></span>
+    </button>
+  
 </div>
 
     </header>
@@ -334,9 +338,9 @@
 <li class="toctree-l1"><a class="reference internal" href="../overview.html">Overview</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../quick-start-guide.html">Quick Start Guide</a></li>
 <li class="toctree-l1 current active has-children"><a class="reference internal" href="index.html">Installation</a><details open="open"><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul class="current">
-<li class="toctree-l2 current active"><a class="current reference internal" href="#">Pre-built release container images on NGC</a></li>
-<li class="toctree-l2"><a class="reference internal" href="linux.html">Installing on Linux via <code class="docutils literal notranslate"><span class="pre">pip</span></code></a></li>
-<li class="toctree-l2"><a class="reference internal" href="build-from-source-linux.html">Building from Source Code on Linux</a></li>
+<li class="toctree-l2"><a class="reference internal" href="installation-guide.html">Installation Guide</a></li>
+<li class="toctree-l2"><a class="reference internal" href="build-from-source.html">Build from Source</a></li>
+<li class="toctree-l2 current active"><a class="current reference internal" href="#">Container Images</a></li>
 </ul>
 </details></li>
 <li class="toctree-l1"><a class="reference internal" href="../supported-hardware.html">Supported Hardware</a></li>
@@ -455,6 +459,11 @@
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
 <ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog24_MoE_as_Dense_GEMM.html">MoE as Dense GEMM: Optimizing Low-Latency MoE Inference on NVIDIA Blackwell</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog23_Joint_Optimization_of_Agent_Applications_and_TensorRT-LLM.html">Joint Optimization of Agent Applications and TensorRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog22_Helix_Parallelism_Scaling_Multi_Million_Token_Decoding_with_KV_Cache_Sharding.html">Helix Parallelism in TensorRT-LLM: Scaling Multi-Million-Token Decoding with KV Cache Sharding</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog21_Temporal_Correlation_Meets_Sparse_Attention.html">Temporal Correlation Meets Sparse Attention: Guess-Verify-Refine Top-K for Blackwell</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog20_Tuning_CUDA_Graph_Batch_Sizes_for_Higher_Output_Throughput.html">Tuning CUDA Graph Batch Sizes for Higher Output Throughput</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog19_DWDP_Distributed_Weight_Data_Parallelism_for_High_Performance_LLM_Inference_on_NVL72.html">DWDP: Distributed Weight Data Parallelism for High-Performance LLM Inference on NVL72</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog18_Optimizing_MoE_Communication_with_One_Sided_AlltoAll_Over_NVLink.html">Optimizing MoE Communication with One-Sided AlltoAll Over NVLink</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog17_Sparse_Attention_in_TensorRT-LLM.html">Sparse Attention in TensorRT LLM</a></li>
@@ -527,7 +536,7 @@
     
     <li class="breadcrumb-item"><a href="index.html" class="nav-link">Installation</a></li>
     
-    <li class="breadcrumb-item active" aria-current="page"><span class="ellipsis">Pre-built release container images on NGC</span></li>
+    <li class="breadcrumb-item active" aria-current="page"><span class="ellipsis">Container Images</span></li>
   </ul>
 </nav>
 </div>
@@ -544,24 +553,151 @@
 <div id="searchbox"></div>
                 <article class="bd-article">
                   
-  <section class="tex2jax_ignore mathjax_ignore" id="pre-built-release-container-images-on-ngc">
-<span id="containers"></span><h1>Pre-built release container images on NGC<a class="headerlink" href="#pre-built-release-container-images-on-ngc" title="Link to this heading">#</a></h1>
-<p>Pre-built TensorRT LLM releases are made available as container images
-on NGC. This is likely the simplest way to obtain TensorRT LLM. Please refer to the <a class="reference external" href="https://catalog.ngc.nvidia.com/orgs/nvidia/teams/tensorrt-llm/containers/release">documentation in NGC</a> for usage instructions.</p>
+  <section class="tex2jax_ignore mathjax_ignore" id="container-images">
+<span id="build-containers"></span><h1>Container Images<a class="headerlink" href="#container-images" title="Link to this heading">#</a></h1>
+<p>TensorRT LLM uses a <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/docker/Dockerfile.multi">multi-stage Dockerfile</a> that produces three image types:</p>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head"><p>Stage</p></th>
+<th class="head"><p>Purpose</p></th>
+<th class="head"><p>NGC Image</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><strong><code class="docutils literal notranslate"><span class="pre">devel</span></code></strong></p></td>
+<td><p>Development environment with all build dependencies pre-installed. No TensorRT LLM source or wheel included. Mount your source checkout and build inside.</p></td>
+<td><p><a class="reference external" href="https://catalog.ngc.nvidia.com/orgs/nvidia/teams/tensorrt-llm/containers/devel"><code class="docutils literal notranslate"><span class="pre">devel</span></code></a></p></td>
+</tr>
+<tr class="row-odd"><td><p><strong><code class="docutils literal notranslate"><span class="pre">wheel</span></code></strong></p></td>
+<td><p>Intermediate build stage. Extends <code class="docutils literal notranslate"><span class="pre">devel</span></code>, copies the source tree, and compiles the TensorRT LLM wheel. Not published as a standalone image.</p></td>
+<td><p>–</p></td>
+</tr>
+<tr class="row-even"><td><p><strong><code class="docutils literal notranslate"><span class="pre">release</span></code></strong></p></td>
+<td><p>Runtime image. Extends <code class="docutils literal notranslate"><span class="pre">devel</span></code>, installs the pre-built wheel from the <code class="docutils literal notranslate"><span class="pre">wheel</span></code> stage. Ready to use with no further compilation.</p></td>
+<td><p><a class="reference external" href="https://catalog.ngc.nvidia.com/orgs/nvidia/teams/tensorrt-llm/containers/release"><code class="docutils literal notranslate"><span class="pre">release</span></code></a></p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<section id="pre-built-images-on-ngc">
+<h2>Pre-built Images on NGC<a class="headerlink" href="#pre-built-images-on-ngc" title="Link to this heading">#</a></h2>
+<p>The <code class="docutils literal notranslate"><span class="pre">devel</span></code> and <code class="docutils literal notranslate"><span class="pre">release</span></code> images are published to NGC and can be pulled directly:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="c1"># Pull the development image (for building from source)</span>
+docker<span class="w"> </span>pull<span class="w"> </span>nvcr.io/nvidia/tensorrt-llm/devel:1.3.0rc15
+
+<span class="c1"># Pull the release image (ready to run)</span>
+docker<span class="w"> </span>pull<span class="w"> </span>nvcr.io/nvidia/tensorrt-llm/release:1.3.0rc15
+</pre></div>
+</div>
+<p>Replace <code class="docutils literal notranslate"><span class="pre">x.y.z</span></code> with the desired version. Browse the available tags for <a class="reference external" href="https://catalog.ngc.nvidia.com/orgs/nvidia/teams/tensorrt-llm/containers/devel/tags"><code class="docutils literal notranslate"><span class="pre">devel</span></code></a> and <a class="reference external" href="https://catalog.ngc.nvidia.com/orgs/nvidia/teams/tensorrt-llm/containers/release/tags"><code class="docutils literal notranslate"><span class="pre">release</span></code></a> on NGC.</p>
 <div class="dropdown note admonition">
 <p class="admonition-title">Container image tags</p>
 <p>In the example shell commands, <code class="docutils literal notranslate"><span class="pre">x.y.z</span></code> corresponds to the TensorRT-LLM container
 version to use. If omitted, <code class="docutils literal notranslate"><span class="pre">IMAGE_TAG</span></code> will default to <code class="docutils literal notranslate"><span class="pre">tensorrt_llm.__version__</span></code>
-(e.g., this documentation was generated from the <code class="docutils literal notranslate"><span class="pre">1.3.0rc12.post1</span></code> source tree).
+(e.g., this documentation was generated from the <code class="docutils literal notranslate"><span class="pre">1.3.0rc15</span></code> source tree).
 If this does not work, e.g., because a container for the version you are
 currently working with has not been released yet, you can try using a
 container published for a previous
 <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/releases">GitHub pre-release or release</a>
 (see also <a class="reference external" href="https://catalog.ngc.nvidia.com/orgs/nvidia/teams/tensorrt-llm/containers/release/tags">NGC Catalog</a>).</p>
 </div>
-<p>Containers can also be built locally, see
-<a class="github reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/docker">NVIDIA/TensorRT-LLM</a>
-for all related options.</p>
+</section>
+<section id="building-images-locally">
+<h2>Building Images Locally<a class="headerlink" href="#building-images-locally" title="Link to this heading">#</a></h2>
+<p>All local image builds require the TensorRT LLM source tree and approximately 63 GB of free disk space. Clone the repository first if you have not already:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>git<span class="w"> </span>clone<span class="w"> </span>https://github.com/NVIDIA/TensorRT-LLM.git
+<span class="nb">cd</span><span class="w"> </span>TensorRT-LLM
+git<span class="w"> </span>submodule<span class="w"> </span>update<span class="w"> </span>--init<span class="w"> </span>--recursive
+git<span class="w"> </span>lfs<span class="w"> </span>pull
+</pre></div>
+</div>
+<section id="build-the-devel-image">
+<h3>Build the <code class="docutils literal notranslate"><span class="pre">devel</span></code> Image<a class="headerlink" href="#build-the-devel-image" title="Link to this heading">#</a></h3>
+<p><strong>On systems with GNU <code class="docutils literal notranslate"><span class="pre">make</span></code></strong></p>
+<p>Create a Docker image for development. The image will be tagged locally with <code class="docutils literal notranslate"><span class="pre">tensorrt_llm/devel:latest</span></code>.</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>make<span class="w"> </span>-C<span class="w"> </span>docker<span class="w"> </span>build
+</pre></div>
+</div>
+<p>Run the container:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>make<span class="w"> </span>-C<span class="w"> </span>docker<span class="w"> </span>run
+</pre></div>
+</div>
+<p>If you prefer to work with your own user account in that container, instead of <code class="docutils literal notranslate"><span class="pre">root</span></code>, add the <code class="docutils literal notranslate"><span class="pre">LOCAL_USER=1</span></code> option.</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>make<span class="w"> </span>-C<span class="w"> </span>docker<span class="w"> </span>run<span class="w"> </span><span class="nv">LOCAL_USER</span><span class="o">=</span><span class="m">1</span>
+</pre></div>
+</div>
+<p><strong>On systems without GNU <code class="docutils literal notranslate"><span class="pre">make</span></code></strong></p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>docker<span class="w"> </span>build<span class="w"> </span>--pull<span class="w"> </span><span class="se">\</span>
+<span class="w">            </span>--target<span class="w"> </span>devel<span class="w"> </span><span class="se">\</span>
+<span class="w">            </span>--file<span class="w"> </span>docker/Dockerfile.multi<span class="w"> </span><span class="se">\</span>
+<span class="w">            </span>--tag<span class="w"> </span>tensorrt_llm/devel:latest<span class="w"> </span><span class="se">\</span>
+<span class="w">            </span>.
+</pre></div>
+</div>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>docker<span class="w"> </span>run<span class="w"> </span>--rm<span class="w"> </span>-it<span class="w"> </span><span class="se">\</span>
+<span class="w">        </span>--ipc<span class="o">=</span>host<span class="w"> </span>--ulimit<span class="w"> </span><span class="nv">memlock</span><span class="o">=</span>-1<span class="w"> </span>--ulimit<span class="w"> </span><span class="nv">stack</span><span class="o">=</span><span class="m">67108864</span><span class="w"> </span>--gpus<span class="o">=</span>all<span class="w"> </span><span class="se">\</span>
+<span class="w">        </span>--volume<span class="w"> </span><span class="si">${</span><span class="nv">PWD</span><span class="si">}</span>:/code/tensorrt_llm<span class="w"> </span><span class="se">\</span>
+<span class="w">        </span>--workdir<span class="w"> </span>/code/tensorrt_llm<span class="w"> </span><span class="se">\</span>
+<span class="w">        </span>tensorrt_llm/devel:latest
+</pre></div>
+</div>
+<p>Note: please make sure to set <code class="docutils literal notranslate"><span class="pre">--ipc=host</span></code> as a docker run argument to avoid <code class="docutils literal notranslate"><span class="pre">Bus</span> <span class="pre">error</span> <span class="pre">(core</span> <span class="pre">dumped)</span></code>.</p>
+<p>Once inside the container, follow the steps in <a class="reference internal" href="build-from-source.html#build-from-source"><span class="std std-ref">Building from Source</span></a> (starting from Step 4) to build TensorRT LLM.</p>
+</section>
+<section id="build-the-release-image-one-step">
+<h3>Build the <code class="docutils literal notranslate"><span class="pre">release</span></code> Image (One Step)<a class="headerlink" href="#build-the-release-image-one-step" title="Link to this heading">#</a></h3>
+<p>This builds TensorRT LLM from source and installs it into a single ready-to-run container image.</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>make<span class="w"> </span>-C<span class="w"> </span>docker<span class="w"> </span>release_build
+</pre></div>
+</div>
+<p>You can add the <code class="docutils literal notranslate"><span class="pre">CUDA_ARCHS=&quot;&lt;list</span> <span class="pre">of</span> <span class="pre">architectures</span> <span class="pre">in</span> <span class="pre">CMake</span> <span class="pre">format&gt;&quot;</span></code> optional argument to specify which architectures should be supported by TensorRT LLM. It restricts the supported GPU architectures but helps reduce compilation time:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="c1"># Restrict the compilation to Ada and Hopper architectures.</span>
+make<span class="w"> </span>-C<span class="w"> </span>docker<span class="w"> </span>release_build<span class="w"> </span><span class="nv">CUDA_ARCHS</span><span class="o">=</span><span class="s2">&quot;89-real;90-real&quot;</span>
+</pre></div>
+</div>
+<p>After the image is built, the Docker container can be run.</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>make<span class="w"> </span>-C<span class="w"> </span>docker<span class="w"> </span>release_run
+</pre></div>
+</div>
+<p>The <code class="docutils literal notranslate"><span class="pre">make</span></code> command supports the <code class="docutils literal notranslate"><span class="pre">LOCAL_USER=1</span></code> argument to switch to the local user account instead of <code class="docutils literal notranslate"><span class="pre">root</span></code> inside the container. The examples of TensorRT LLM are installed in the <code class="docutils literal notranslate"><span class="pre">/app/tensorrt_llm/examples</span></code> directory.</p>
+</section>
+</section>
+<section id="using-enroot-slurm-clusters">
+<h2>Using Enroot (Slurm Clusters)<a class="headerlink" href="#using-enroot-slurm-clusters" title="Link to this heading">#</a></h2>
+<p>If you wish to use enroot instead of Docker, you can build a sqsh file that has the identical environment as the development image <code class="docutils literal notranslate"><span class="pre">tensorrt_llm/devel:latest</span></code>.</p>
+<ol class="arabic">
+<li><p>Allocate a compute node:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>salloc<span class="w"> </span>--nodes<span class="o">=</span><span class="m">1</span>
+</pre></div>
+</div>
+</li>
+<li><p>Create a sqsh file with essential TensorRT LLM dependencies installed:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="c1"># Using default sqsh filename (enroot/tensorrt_llm.devel.sqsh)</span>
+make<span class="w"> </span>-C<span class="w"> </span>enroot<span class="w"> </span>build_sqsh
+
+<span class="c1"># Or specify a custom path (optional)</span>
+make<span class="w"> </span>-C<span class="w"> </span>enroot<span class="w"> </span>build_sqsh<span class="w"> </span><span class="nv">SQSH_PATH</span><span class="o">=</span>/path/to/dev_trtllm_image.sqsh
+</pre></div>
+</div>
+</li>
+<li><p>Once this squash file is ready, you can follow the steps under <a class="reference internal" href="build-from-source.html#build-from-source"><span class="std std-ref">Building from Source</span></a> by launching an enroot sandbox:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="nb">export</span><span class="w"> </span><span class="nv">SQSH_PATH</span><span class="o">=</span>/path/to/dev_trtllm_image.sqsh
+
+<span class="c1"># Start a pseudo terminal for interactive session</span>
+make<span class="w"> </span>-C<span class="w"> </span>enroot<span class="w"> </span>run_sqsh
+
+<span class="c1"># Or, you could run commands directly</span>
+make<span class="w"> </span>-C<span class="w"> </span>enroot<span class="w"> </span>run_sqsh<span class="w"> </span><span class="nv">RUN_CMD</span><span class="o">=</span><span class="s2">&quot;python3 scripts/build_wheel.py&quot;</span>
+</pre></div>
+</div>
+</li>
+</ol>
+</section>
+<section id="advanced-topics">
+<h2>Advanced Topics<a class="headerlink" href="#advanced-topics" title="Link to this heading">#</a></h2>
+<p>For more information on building and running various TensorRT LLM container images,
+check <a class="github reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/docker">NVIDIA/TensorRT-LLM</a>.</p>
+</section>
 </section>
 
 
@@ -575,20 +711,20 @@ for all related options.</p>
                   
 <div class="prev-next-area">
     <a class="left-prev"
-       href="index.html"
+       href="build-from-source.html"
        title="previous page">
       <i class="fa-solid fa-angle-left"></i>
       <div class="prev-next-info">
         <p class="prev-next-subtitle">previous</p>
-        <p class="prev-next-title">Installation</p>
+        <p class="prev-next-title">Build from Source</p>
       </div>
     </a>
     <a class="right-next"
-       href="linux.html"
+       href="../supported-hardware.html"
        title="next page">
       <div class="prev-next-info">
         <p class="prev-next-subtitle">next</p>
-        <p class="prev-next-title">Installing on Linux via <code class="docutils literal notranslate"><span class="pre">pip</span></code></p>
+        <p class="prev-next-title">Supported Hardware</p>
       </div>
       <i class="fa-solid fa-angle-right"></i>
     </a>
@@ -599,9 +735,32 @@ for all related options.</p>
             
             
 
-<div class="bd-sidebar-secondary"></div>
+
+              
+                <dialog id="pst-secondary-sidebar-modal"></dialog>
+                <div id="pst-secondary-sidebar" class="bd-sidebar-secondary bd-toc"><div class="sidebar-secondary-items sidebar-secondary__inner">
 
 
+  <div class="sidebar-secondary-item">
+<div
+    id="pst-page-navigation-heading-2"
+    class="page-toc tocsection onthispage">
+    <i class="fa-solid fa-list"></i> On this page
+  </div>
+  <nav id="pst-page-toc-nav" class="page-toc" aria-labelledby="pst-page-navigation-heading-2">
+    <ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#pre-built-images-on-ngc">Pre-built Images on NGC</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#building-images-locally">Building Images Locally</a><ul class="nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#build-the-devel-image">Build the <code class="docutils literal notranslate"><span class="pre">devel</span></code> Image</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#build-the-release-image-one-step">Build the <code class="docutils literal notranslate"><span class="pre">release</span></code> Image (One Step)</a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#using-enroot-slurm-clusters">Using Enroot (Slurm Clusters)</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#advanced-topics">Advanced Topics</a></li>
+</ul>
+  </nav></div>
+
+</div></div>
               
             
 
@@ -689,9 +848,9 @@ for all related options.</p>
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on May 15, 2026.</p>
+  <p>Last updated on May 20, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/11e16cd">11e16cd</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/c72d43d">c72d43d</a>.</p>
   
 </div></div>
       
