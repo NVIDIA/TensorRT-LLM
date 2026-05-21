@@ -117,6 +117,43 @@ def _build_single_output_fused_mlir_module():
     return ModuleOp(Region([block]))
 
 
+def _build_precise_to_dtype_mlir_module():
+    from xdsl.dialects.builtin import (
+        BFloat16Type,
+        Float32Type,
+        IntegerAttr,
+        IntegerType,
+        ModuleOp,
+        StringAttr,
+        TensorType,
+    )
+    from xdsl.ir import Block, Region
+
+    from tensorrt_llm._torch.auto_deploy.mlir.dialect import AdGraphInput, AdGraphOutput, AdToDtype
+
+    input_type = TensorType(Float32Type(), [2, 4])
+    output_type = TensorType(BFloat16Type(), [2, 4])
+    block = Block()
+
+    input_op = AdGraphInput.build(
+        attributes={"input_name": StringAttr("x")},
+        result_types=[input_type],
+    )
+    block.add_op(input_op)
+
+    to_dtype_op = AdToDtype.build(
+        operands=[input_op.output],
+        attributes={"target_dtype": IntegerAttr(15, IntegerType(64))},
+        result_types=[output_type],
+    )
+    block.add_op(to_dtype_op)
+
+    output_op = AdGraphOutput.build(operands=[[to_dtype_op.output]])
+    block.add_op(output_op)
+
+    return ModuleOp(Region([block]))
+
+
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
@@ -137,7 +174,7 @@ def test_mlir_to_fx_propagates_single_output_fused_getitem_meta():
             "_original_target": _single_output_fused_stub,
             "_args_template": (("__mlir_operand__", 0),),
             "_kwargs_template": {},
-            "val": fake_val,
+            "val": (fake_val,),
         },
     }
 
@@ -153,6 +190,29 @@ def test_mlir_to_fx_propagates_single_output_fused_getitem_meta():
     assert "val" in getitem_nodes[0].meta
     assert tuple(getitem_nodes[0].meta["val"].shape) == tuple(fake_val.shape)
     assert getitem_nodes[0].meta["val"].dtype == fake_val.dtype
+
+
+def test_mlir_to_fx_synthesizes_precise_op_meta_from_result_type():
+    graph = torch.fx.Graph()
+    x = graph.placeholder("x")
+    graph.output(x)
+    original_gm = torch.fx.GraphModule(torch.nn.Module(), graph)
+
+    input_val = torch.empty((2, 4), dtype=torch.float32, device="meta")
+    new_gm = MLIRToFXConverter(original_gm).convert(
+        _build_precise_to_dtype_mlir_module(), {"x": {"val": input_val}}
+    )
+
+    to_dtype_nodes = [
+        n
+        for n in new_gm.graph.nodes
+        if n.op == "call_function" and n.target == torch.ops.aten.to.dtype
+    ]
+
+    assert len(to_dtype_nodes) == 1
+    assert "val" in to_dtype_nodes[0].meta
+    assert tuple(to_dtype_nodes[0].meta["val"].shape) == (2, 4)
+    assert to_dtype_nodes[0].meta["val"].dtype == torch.bfloat16
 
 
 def test_fx_to_mlir_basic():
