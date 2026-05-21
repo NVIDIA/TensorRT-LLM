@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import math
 import os
 import weakref
@@ -380,6 +383,27 @@ class FlashInferAttentionMetadata(AttentionMetadata):
             o_indptr=query_output_element_indptr,
         )
 
+    def _get_primary_pool_batch_cache_indices(self) -> list[list[int]]:
+        assert self.kv_cache_manager is not None
+        assert self.request_ids is not None
+
+        layer_idx = None
+        if self._vswa_layer_to_pool is not None:
+            primary_pool_id = self._vswa_layer_to_pool.get(0)
+            if primary_pool_id is None:
+                primary_pool_id = next(iter(self._vswa_layer_to_pool.values()))
+            layer_idx = self._vswa_pool_to_rep_layer[primary_pool_id]
+        else:
+            max_attention_window_vec = getattr(self.kv_cache_manager,
+                                               "max_attention_window_vec", None)
+            if (getattr(self.kv_cache_manager, "is_vswa", False)
+                    or (max_attention_window_vec is not None
+                        and len(max_attention_window_vec) > 1)):
+                layer_idx = 0
+
+        return self.kv_cache_manager.get_batch_cache_indices(
+            self.request_ids, layer_idx=layer_idx)
+
     def prepare(self) -> None:
         super().prepare()
         extra_attrs = get_model_extra_attrs()
@@ -413,9 +437,7 @@ class FlashInferAttentionMetadata(AttentionMetadata):
             return
 
         # indices of used cache blocks for each sequence
-        assert self.request_ids is not None
-        block_ids_per_seq = self.kv_cache_manager.get_batch_cache_indices(
-            self.request_ids)
+        block_ids_per_seq = self._get_primary_pool_batch_cache_indices()
 
         # number of tokens in the kv cache for each sequence in the batch
         cached_token_lens = torch.tensor(

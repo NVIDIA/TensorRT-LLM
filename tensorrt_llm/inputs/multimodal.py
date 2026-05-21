@@ -17,6 +17,11 @@ from tensorrt_llm.logger import logger
 # Default hasher
 default_hasher = blake3
 _INT32_MAX = 2**31 - 1
+_MULTIMODAL_RUN_METADATA_KEYS = (
+    "multimodal_item_run_cu_offsets",
+    "multimodal_run_positions",
+    "multimodal_run_lengths",
+)
 
 
 def strip_mm_data_for_generation(mm_data: Dict[str, Any]) -> None:
@@ -256,12 +261,29 @@ class MultimodalInput:
                    multimodal_run_lengths=mm_run_lengths)
 
     def to_tensor(self) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Convert data to tensors"""
+        """Convert data to tensors."""
         return (
             # int32 to match the type in TRTLLM SizeType32
             torch.tensor(self.multimodal_hashes, dtype=torch.int32),
             torch.tensor(self.multimodal_positions, dtype=torch.int32),
             torch.tensor(self.multimodal_lengths, dtype=torch.int32))
+
+
+def add_multimodal_run_metadata(
+        multimodal_data: Dict[str, Any],
+        multimodal_input: MultimodalInput) -> Dict[str, Any]:
+    """Return multimodal data with optional per-item run metadata attached."""
+    if multimodal_input.multimodal_item_run_cu_offsets is None:
+        return multimodal_data
+
+    multimodal_data = dict(multimodal_data)
+    multimodal_data["multimodal_item_run_cu_offsets"] = (
+        multimodal_input.multimodal_item_run_cu_offsets)
+    multimodal_data[
+        "multimodal_run_positions"] = multimodal_input.multimodal_run_positions
+    multimodal_data[
+        "multimodal_run_lengths"] = multimodal_input.multimodal_run_lengths
+    return multimodal_data
 
 
 @dataclass
@@ -325,6 +347,9 @@ class MultimodalRuntimeData:
 # Extend only after auditing each key's consumers.
 _CPU_ONLY_MULTIMODAL_DATA_KEYS = frozenset({
     "multimodal_embed_mask_cumsum",
+    "multimodal_embedding_lengths",
+    "multimodal_item_order",
+    *_MULTIMODAL_RUN_METADATA_KEYS,
 })
 
 
@@ -904,6 +929,9 @@ def find_mm_token_lengths(
 _MM_METADATA_ONLY_KEYS = frozenset({
     "mrope_config",
     "multimodal_embed_mask_cumsum",
+    "multimodal_embedding_lengths",
+    "multimodal_item_order",
+    *_MULTIMODAL_RUN_METADATA_KEYS,
     "special_token_offsets",
     "layout_metadata",
 })
@@ -1138,6 +1166,31 @@ def _find_mm_token_runs_from_mask(
         item_run_cu_offsets.append(len(run_positions))
 
     return item_run_cu_offsets, run_positions, run_lengths
+
+
+def _find_mm_embedding_lengths_from_masks(
+    mm_mask: torch.Tensor,
+    embed_mask: torch.Tensor,
+    num_mm_tokens: List[int],
+) -> List[int]:
+    """Compute per-item embedding-token counts from multimodal masks."""
+    if not torch.any(mm_mask):
+        return []
+
+    mm_positions = torch.where(mm_mask)[0]
+    lengths_t = torch.tensor(num_mm_tokens)
+    assert mm_positions.numel() == lengths_t.sum().item(), (
+        f"Number of multimodal tokens ({mm_positions.numel()}) does not match "
+        f"sum of per-unit lengths ({lengths_t.sum().item()}): "
+        f"num_mm_tokens={num_mm_tokens}")
+
+    embedding_lengths: List[int] = []
+    offset = 0
+    for item_length in num_mm_tokens:
+        item_positions = mm_positions[offset:offset + item_length]
+        offset += item_length
+        embedding_lengths.append(int(embed_mask[item_positions].sum().item()))
+    return embedding_lengths
 
 
 def validate_mm_inputs(prompt_token_ids: Union[torch.Tensor, List[int],

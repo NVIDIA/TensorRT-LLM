@@ -25,12 +25,7 @@ from tensorrt_llm.models.modeling_utils import QuantAlgo
 
 from ...autotuner import (AutoTuner, ConstraintSpec, DynamicTensorSpec,
                           OptimizationProfile, TunableRunner, TuningConfig)
-from ...custom_ops.cute_dsl_custom_ops import (
-    GroupedGemmInputsHelper,
-    Sm100BlockScaledContiguousGatherGroupedGemmActFusionRunner,
-    Sm100BlockScaledContiguousGroupedGemmFinalizeFusionRunner,
-    Sm100BlockScaledContiguousGroupedGemmRunner,
-    Sm100BlockScaledContiguousGroupedGemmSwigluFusionRunner)
+from ...cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
 from ...distributed import allgather
 from ...model_config import ModelConfig
 from ...utils import (ActivationType, AuxStreamType, EventType,
@@ -41,6 +36,34 @@ from .fused_moe_cutlass import CutlassFusedMoE
 from .interface import AlltoallMethodType
 from .quantization import MoEWeightLoadingMode, NVFP4CuteDslFusedMoEMethod
 from .routing import BaseMoeRoutingMethod
+
+if IS_CUTLASS_DSL_AVAILABLE:
+    from ...custom_ops.cute_dsl_custom_ops import (
+        GroupedGemmInputsHelper,
+        Sm100BlockScaledContiguousGatherGroupedGemmActFusionRunner,
+        Sm100BlockScaledContiguousGroupedGemmFinalizeFusionRunner,
+        Sm100BlockScaledContiguousGroupedGemmRunner,
+        Sm100BlockScaledContiguousGroupedGemmSwigluFusionRunner)
+else:
+
+    class GroupedGemmInputsHelper:
+
+        def generate_num_tokens_per_expert(self, *args, **kwargs):
+            raise RuntimeError(
+                "CUTLASS DSL is not available; CuteDslFusedMoE cannot prepare inputs."
+            )
+
+    class Sm100BlockScaledContiguousGatherGroupedGemmActFusionRunner:
+        pass
+
+    class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionRunner:
+        pass
+
+    class Sm100BlockScaledContiguousGroupedGemmRunner:
+        pass
+
+    class Sm100BlockScaledContiguousGroupedGemmSwigluFusionRunner:
+        pass
 
 
 @dataclass
@@ -77,7 +100,7 @@ def cute_dsl_fp8_group_blockwise_gemm_ref(
     offset_array: torch.Tensor,
 ) -> torch.Tensor:
     m, k = a.shape[0], a.shape[1]
-    l, n, k = b.shape[0], b.shape[1], b.shape[2]
+    _, n, k = b.shape[0], b.shape[1], b.shape[2]
     num_group, w_n, w_k = b_sf.shape[0], b_sf.shape[1], b_sf.shape[2]
 
     # Note: view(int8) will cause error.
@@ -163,16 +186,16 @@ def cute_dsl_nvfp4_grouped_gemm_ref(
     assert alpha.dim() == 1
 
     m, k = a.size(0), a.size(1) * 2
-    l, n = b.size(0), b.size(1)
+    num_experts, n = b.size(0), b.size(1)
     scale_k = k // scaling_vector_size
     assert m % tile_size == 0
     assert k % (scaling_vector_size * 4) == 0
     assert b.size(2) * 2 == k
     assert a_sf.size(0) == m * scale_k
-    assert b_sf.size(0) == l
+    assert b_sf.size(0) == num_experts
     assert b_sf.size(1) == n
     assert b_sf.size(2) == scale_k
-    assert alpha.size(0) == l
+    assert alpha.size(0) == num_experts
 
     num_tiles = m // tile_size
     assert tile_idx_to_group_idx.dtype == torch.int32
@@ -181,7 +204,8 @@ def cute_dsl_nvfp4_grouped_gemm_ref(
     assert num_non_exiting_tiles.size() == (1, )
 
     num_tiles_per_expert = torch.bincount(
-        tile_idx_to_group_idx[:num_non_exiting_tiles[0].item()], minlength=l)
+        tile_idx_to_group_idx[:num_non_exiting_tiles[0].item()],
+        minlength=num_experts)
     offsets = [0] + num_tiles_per_expert.cumsum(dim=0).tolist()
 
     ref = torch.empty(m, n, dtype=output_dtype, device="cuda")
@@ -376,6 +400,11 @@ class CuteDslFusedMoE(CutlassFusedMoE):
             Tuple[bool, Optional[str]]: (can_implement, skip_reason)
         """
         from .interface import _warn_and_return
+
+        if not IS_CUTLASS_DSL_AVAILABLE:
+            return _warn_and_return(
+                "CuteDslFusedMoE requires CUTLASS DSL, but CUTLASS DSL is not available"
+            )
 
         sm_version = get_sm_version()
 

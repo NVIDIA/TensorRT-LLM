@@ -374,6 +374,8 @@ class TestEncodeMultimodalDispatch:
         model = mock.MagicMock(spec=NemotronH_Nano_VL_V2)
         model.vision_encoder = mock.MagicMock(spec=NanoV2VLVisionEncoder)
         model.sound_encoder = mock.MagicMock(spec=ProjectedParakeet)
+        model._normalize_item_order_metadata = NemotronH_Nano_VL_V2._normalize_item_order_metadata
+        model._split_embeddings_by_item_order = NemotronH_Nano_VL_V2._split_embeddings_by_item_order
         return model
 
     @staticmethod
@@ -834,6 +836,8 @@ class TestEncodeMultimodalContract:
         model = mock.MagicMock(spec=NemotronH_Nano_VL_V2)
         model.vision_encoder = mock.MagicMock(spec=NanoV2VLVisionEncoder)
         model.sound_encoder = mock.MagicMock(spec=ProjectedParakeet)
+        model._normalize_item_order_metadata = NemotronH_Nano_VL_V2._normalize_item_order_metadata
+        model._split_embeddings_by_item_order = NemotronH_Nano_VL_V2._split_embeddings_by_item_order
         return model
 
     def _make_mm_param(self, modality_type, **extra):
@@ -901,6 +905,64 @@ class TestEncodeMultimodalContract:
 
         assert len(result) == 1
         assert result[0].shape == (8, self.HIDDEN)
+
+    def test_single_param_mixed_modalities_still_single_tensor(self):
+        """One request param can carry image + video + audio in prompt order."""
+        model = self._make_mock_model()
+        image_emb = torch.randn(5, self.HIDDEN)
+        video_emb = torch.randn(4, self.HIDDEN)
+        audio_emb = torch.randn(3, self.HIDDEN)
+        model.vision_encoder.side_effect = [
+            ([image_emb], [None]),
+            ([video_emb], [None]),
+        ]
+        model._encode_audio = mock.MagicMock(return_value=audio_emb)
+
+        param = mock.MagicMock()
+        param.multimodal_data = {
+            "modality_type": ["image", "video", "audio"],
+            "image": {},
+            "video": {},
+            "audio": {},
+        }
+
+        result = NemotronH_Nano_VL_V2._encode_multimodal(model, [param])
+
+        assert len(result) == 1
+        expected = torch.cat([image_emb, video_emb, audio_emb], dim=0)
+        assert torch.equal(result[0], expected)
+        assert model.vision_encoder.call_count == 2
+        model._encode_audio.assert_called_once()
+
+    def test_single_param_interleaved_items_follow_metadata_order(self):
+        """A request with image/video/image keeps the prompt item order."""
+        model = self._make_mock_model()
+        image_first = torch.randn(2, self.HIDDEN)
+        image_second = torch.randn(4, self.HIDDEN)
+        video_emb = torch.randn(3, self.HIDDEN)
+        model.vision_encoder.side_effect = [
+            ([torch.cat([image_first, image_second], dim=0)], [None]),
+            ([video_emb], [None]),
+        ]
+
+        param = mock.MagicMock()
+        param.multimodal_data = {
+            "modality_type": ["image", "video"],
+            "image": {},
+            "video": {},
+            "multimodal_item_order": [
+                {"modality": "image", "index": 0},
+                {"modality": "video", "index": 0},
+                {"modality": "image", "index": 1},
+            ],
+            "multimodal_embedding_lengths": [2, 3, 4],
+        }
+
+        result = NemotronH_Nano_VL_V2._encode_multimodal(model, [param])
+
+        assert len(result) == 1
+        expected = torch.cat([image_first, video_emb, image_second], dim=0)
+        assert torch.equal(result[0], expected)
 
     def test_empty_params_returns_empty_list(self):
         model = self._make_mock_model()

@@ -1,0 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# BF16 and NVFP4 were measured on a dlcluster B100 fallback while exact B200
+# access was unavailable; see slop/mixed-modality-integration-test/log.md.
+nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-BF16:
+  - accuracy: 18.00
+    num_samples: 50
+nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-FP8:
+  - quant_algo: FP8
+    kv_cache_quant_algo: FP8
+    accuracy: 27.33
+    num_samples: 50
+nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-NVFP4:
+  - quant_algo: MIXED_PRECISION
+    kv_cache_quant_algo: FP8
+    accuracy: 18.67
+    num_samples: 50

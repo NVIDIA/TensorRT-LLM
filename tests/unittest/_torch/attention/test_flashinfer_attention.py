@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import random
 import unittest
 from collections import defaultdict
@@ -60,6 +63,77 @@ class CUDAGraphTestScenario:
 
 
 class TestFlashInferAttention(unittest.TestCase):
+
+    def test_vswa_primary_batch_cache_indices_use_representative_layer(self):
+
+        class FakeKVCacheManager:
+
+            def __init__(self):
+                self.calls = []
+
+            def get_batch_cache_indices(self, request_ids, layer_idx=None):
+                self.calls.append((request_ids, layer_idx))
+                return [[0, 1], [2, 3]]
+
+        kv_cache_manager = FakeKVCacheManager()
+        metadata = object.__new__(FlashInferAttentionMetadata)
+        metadata.kv_cache_manager = kv_cache_manager
+        metadata.request_ids = [10, 11]
+        metadata._vswa_layer_to_pool = {0: 4, 3: 7}
+        metadata._vswa_pool_to_rep_layer = {4: 0, 7: 3}
+
+        block_ids = metadata._get_primary_pool_batch_cache_indices()
+
+        self.assertEqual(block_ids, [[0, 1], [2, 3]])
+        self.assertEqual(kv_cache_manager.calls, [([10, 11], 0)])
+
+    def test_vswa_primary_batch_cache_indices_without_pool_mapping_use_layer_zero(
+            self):
+
+        class FakeKVCacheManager:
+            is_vswa = True
+
+            def __init__(self):
+                self.calls = []
+
+            def get_batch_cache_indices(self, request_ids, layer_idx=None):
+                self.calls.append((request_ids, layer_idx))
+                return [[4, 5]]
+
+        kv_cache_manager = FakeKVCacheManager()
+        metadata = object.__new__(FlashInferAttentionMetadata)
+        metadata.kv_cache_manager = kv_cache_manager
+        metadata.request_ids = [12]
+        metadata._vswa_layer_to_pool = None
+
+        block_ids = metadata._get_primary_pool_batch_cache_indices()
+
+        self.assertEqual(block_ids, [[4, 5]])
+        self.assertEqual(kv_cache_manager.calls, [([12], 0)])
+
+    def test_vswa_primary_batch_cache_indices_with_multiple_windows_use_layer_zero(
+            self):
+
+        class FakeKVCacheManager:
+            max_attention_window_vec = [512, 32768]
+
+            def __init__(self):
+                self.calls = []
+
+            def get_batch_cache_indices(self, request_ids, layer_idx=None):
+                self.calls.append((request_ids, layer_idx))
+                return [[6, 7]]
+
+        kv_cache_manager = FakeKVCacheManager()
+        metadata = object.__new__(FlashInferAttentionMetadata)
+        metadata.kv_cache_manager = kv_cache_manager
+        metadata.request_ids = [13]
+        metadata._vswa_layer_to_pool = None
+
+        block_ids = metadata._get_primary_pool_batch_cache_indices()
+
+        self.assertEqual(block_ids, [[6, 7]])
+        self.assertEqual(kv_cache_manager.calls, [([13], 0)])
 
     @parameterized.expand([
         Scenario(num_layers=1,

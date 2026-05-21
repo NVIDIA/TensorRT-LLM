@@ -5,7 +5,15 @@
 import pytest
 import torch
 
-from tensorrt_llm.inputs.multimodal import MultimodalRuntimeData
+from tensorrt_llm.inputs.multimodal import (
+    MultimodalInput,
+    MultimodalRuntimeData,
+    _compute_mm_masks,
+    _find_mm_embedding_lengths_from_masks,
+    _find_mm_token_runs_from_mask,
+    _find_mm_token_start_pos_from_masks,
+    add_multimodal_run_metadata,
+)
 from tensorrt_llm.inputs.registry import maybe_compute_mm_embed_cumsum
 
 
@@ -34,6 +42,83 @@ def test_maybe_compute_mm_embed_cumsum_populates_py_multimodal_data():
         rtol=0,
         atol=0,
     )
+
+
+def test_add_multimodal_run_metadata_preserves_item_runs_in_py_data():
+    mm_input = MultimodalInput.from_components(
+        [[1, 2, 3, 4, 5, 6, 7, 8]],
+        [2],
+        [4],
+        mm_item_run_cu_offsets=[0, 1],
+        mm_run_positions=[2],
+        mm_run_lengths=[4],
+    )
+
+    multimodal_data = add_multimodal_run_metadata({"image": {}}, mm_input)
+
+    assert multimodal_data == {
+        "image": {},
+        "multimodal_item_run_cu_offsets": [0, 1],
+        "multimodal_run_positions": [2],
+        "multimodal_run_lengths": [4],
+    }
+
+
+def test_mixed_image_video_audio_masks_runs_embedding_lengths():
+    image_token = 100
+    video_token = 200
+    audio_token = 300
+    video_start = 201
+    video_end = 202
+    audio_start = 301
+    audio_end = 302
+    input_ids = torch.tensor(
+        [
+            10,
+            image_token,
+            image_token,
+            11,
+            video_start,
+            video_token,
+            video_token,
+            video_end,
+            12,
+            audio_start,
+            audio_token,
+            audio_end,
+            13,
+        ]
+    )
+    num_mm_tokens = [2, 4, 3]
+
+    mm_mask, embed_mask, special_mask = _compute_mm_masks(
+        input_ids,
+        vocab_size=None,
+        mm_token_ids=torch.tensor([image_token, video_token, audio_token]),
+        mm_special_token_ids=torch.tensor([video_start, video_end, audio_start, audio_end]),
+    )
+
+    start_positions, special_offsets = _find_mm_token_start_pos_from_masks(
+        mm_mask,
+        special_mask,
+        num_mm_tokens,
+    )
+    item_run_offsets, run_positions, run_lengths = _find_mm_token_runs_from_mask(
+        mm_mask,
+        num_mm_tokens,
+    )
+    embedding_lengths = _find_mm_embedding_lengths_from_masks(
+        mm_mask,
+        embed_mask,
+        num_mm_tokens,
+    )
+
+    assert start_positions == [1, 4, 9]
+    assert special_offsets == [2, 5, 6, 8]
+    assert item_run_offsets == [0, 1, 2, 3]
+    assert run_positions == [1, 4, 9]
+    assert run_lengths == num_mm_tokens
+    assert embedding_lengths == [2, 2, 1]
 
 
 def test_runtime_data_cumsum_math_simplest():

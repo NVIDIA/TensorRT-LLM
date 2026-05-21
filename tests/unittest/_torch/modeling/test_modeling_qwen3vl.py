@@ -1,6 +1,8 @@
 import os
 from dataclasses import dataclass
+from types import SimpleNamespace
 from typing import List, Optional
+from unittest import mock
 
 import torch
 from _torch.helpers import create_mock_cuda_graph_runner
@@ -10,7 +12,11 @@ from transformers import Qwen3VLForConditionalGeneration as HFQwen3VLForConditio
 from utils.llm_data import llm_models_root
 
 from tensorrt_llm._torch.models.checkpoints.hf.qwen3vl_weight_mapper import Qwen3VLHfWeightMapper
-from tensorrt_llm._torch.models.modeling_qwen3vl import Qwen3VLInputProcessorBase, Qwen3VLModel
+from tensorrt_llm._torch.models.modeling_qwen3vl import (
+    Qwen3VisionModelBase,
+    Qwen3VLInputProcessorBase,
+    Qwen3VLModel,
+)
 
 QWEN3_VL_8B_CONFIG = {
     "architectures": ["Qwen3VLForConditionalGeneration"],
@@ -299,3 +305,58 @@ class TestQwen3VL(TestModelingMultimodal):
                 hf_model_state_dict=self.hf_model.state_dict(),
                 disable_fuse_rope=True,
             )
+
+
+def test_qwen3vl_item_order_uses_vision_start_boundaries():
+    processor = object.__new__(Qwen3VLInputProcessorBase)
+    processor.config = SimpleNamespace(
+        vision_start_token_id=1,
+        vision_end_token_id=2,
+        image_token_id=3,
+        video_token_id=4,
+    )
+
+    item_order = Qwen3VLInputProcessorBase.get_mm_item_order(
+        processor,
+        [1, 3, 3, 2, 10, 1, 4, 4, 4, 2, 11, 1, 3, 3, 3, 2],
+        {"image": [object(), object()], "video": [object()]},
+    )
+
+    assert item_order == [("image", 0), ("video", 0), ("image", 1)]
+
+
+def test_qwen3vl_vision_encoder_reorders_mixed_items_by_prompt_order():
+    encoder = object.__new__(Qwen3VisionModelBase)
+    encoder.model_dtype = torch.float32
+    encoder.config = SimpleNamespace(spatial_merge_size=1)
+    image_first = torch.randn(2, 8)
+    image_second = torch.randn(4, 8)
+    video = torch.randn(3, 8)
+    encoder.visual = mock.Mock(
+        side_effect=[
+            (torch.cat([image_first, image_second], dim=0), []),
+            (video, []),
+        ]
+    )
+    param = SimpleNamespace(
+        multimodal_data={
+            "image": {
+                "pixel_values": torch.ones(2, 3),
+                "image_grid_thw": torch.tensor([[1, 1, 2], [1, 1, 4]]),
+            },
+            "video": {
+                "pixel_values_videos": torch.ones(1, 3),
+                "video_grid_thw": torch.tensor([[1, 1, 3]]),
+            },
+            "multimodal_item_order": [
+                {"modality": "image", "index": 0},
+                {"modality": "video", "index": 0},
+                {"modality": "image", "index": 1},
+            ],
+        }
+    )
+
+    result = Qwen3VisionModelBase.forward(encoder, [param])
+
+    assert len(result) == 1
+    assert torch.equal(result[0], torch.cat([image_first, video, image_second], dim=0))

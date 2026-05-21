@@ -38,6 +38,7 @@ from tensorrt_llm.quantization import QuantAlgo
 from ..common import venv_check_call, venv_mpi_check_call
 from ..conftest import llm_models_root
 from ..trt_test_alternative import check_call, exists
+from .mixed_modality import MixedModalityOmniEvaluator
 from .video_mme import VideoMME as VideoMMEEvaluator
 
 
@@ -306,6 +307,33 @@ class VideoMME(AccuracyTask):
     EVALUATOR_CLS = VideoMMEEvaluator
     EVALUATOR_KWARGS = {
         "dataset_path": DATASET_DIR,
+        "random_seed": 0,
+        "num_frames": 8,
+    }
+
+
+class MixedModality(AccuracyTask):
+    """One-request image+audio+video accuracy task for Nemotron Nano Omni."""
+
+    DATASET = "mixed_modality_omni"
+    MMMU_DATASET_DIR = f"{llm_models_root()}/datasets/MMMU"
+    VOXPOPULI_DATASET_DIR = f"{llm_models_root()}/datasets/facebook/voxpopuli"
+    VIDEOMME_DATASET_DIR = f"{llm_models_root()}/datasets/lmms-lab__Video-MME-short-v1"
+
+    ALPHA = 0.05
+    BETA = 0.2
+    SIGMA = 50.0
+    NUM_SAMPLES = int(os.getenv("TRTLLM_MIXED_MOD_NUM_SAMPLES", "50"))
+
+    MAX_BATCH_SIZE = 64
+    MAX_INPUT_LEN = 32768
+    MAX_OUTPUT_LEN = 256
+
+    EVALUATOR_CLS = MixedModalityOmniEvaluator
+    EVALUATOR_KWARGS = {
+        "mmmu_dataset_path": MMMU_DATASET_DIR,
+        "voxpopuli_dataset_path": VOXPOPULI_DATASET_DIR,
+        "videomme_dataset_path": VIDEOMME_DATASET_DIR,
         "random_seed": 0,
         "num_frames": 8,
     }

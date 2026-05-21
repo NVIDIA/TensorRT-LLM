@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 import math
 from typing import Optional
 
@@ -63,8 +65,20 @@ class VanillaAttentionMetadata(AttentionMetadata):
         super().prepare()
         # indices of used cache blocks for each sequence
         assert self.request_ids is not None
+        if self.kv_cache_manager is None:
+            self.block_ids_per_seq = None
+            return
+
+        layer_idx = None
+        max_attention_window_vec = getattr(self.kv_cache_manager,
+                                           "max_attention_window_vec", None)
+        if (getattr(self.kv_cache_manager, "is_vswa", False)
+                or (max_attention_window_vec is not None
+                    and len(max_attention_window_vec) > 1)):
+            layer_idx = 0
+
         self.block_ids_per_seq = self.kv_cache_manager.get_batch_cache_indices(
-            self.request_ids) if self.kv_cache_manager is not None else None
+            self.request_ids, layer_idx=layer_idx)
 
 
 class VanillaAttention(AttentionBackend[VanillaAttentionMetadata]):

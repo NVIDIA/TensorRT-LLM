@@ -975,6 +975,60 @@ class TestMergeEvsMMEmbeds:
         assert result.shape == input_ids.shape
         assert (result[: len(expected)] == expected).all()
 
+    def test_single_request_mixed_image_video_audio_evs(self):
+        """A mixed single request uses the shared EVS stream and expands video placeholders."""
+        model = _make_merge_model()
+        evs_ids = torch.tensor(
+            [
+                _TEXT_TOKEN,
+                _IMG_START,
+                _IMG_CTX_ID,
+                _IMG_CTX_ID,
+                _IMG_END,
+                _IMG_START,
+                _VIDEO_CTX_ID,
+                _IMG_END,
+                _SOUND_START,
+                _SOUND_CTX_ID,
+                _SOUND_END,
+            ],
+            dtype=torch.long,
+        )
+        param = MultimodalParams(
+            multimodal_data={
+                "modality_type": ["image", "video", "audio"],
+                "image": {"evs_ids": evs_ids},
+                "video": {"evs_ids": evs_ids},
+                "audio": {"evs_ids": evs_ids},
+            }
+        )
+        input_ids = torch.zeros(20, dtype=torch.long)
+
+        result = NemotronH_Nano_VL_V2.merge_evs_mm_embeds(
+            model, [torch.tensor([3])], [param], input_ids
+        )
+
+        expected = torch.tensor(
+            [
+                _TEXT_TOKEN,
+                _IMG_START,
+                _IMG_CTX_ID,
+                _IMG_CTX_ID,
+                _IMG_END,
+                _IMG_START,
+                _IMG_CTX_ID,
+                _IMG_CTX_ID,
+                _IMG_CTX_ID,
+                _IMG_END,
+                _SOUND_START,
+                _SOUND_CTX_ID,
+                _SOUND_END,
+            ],
+            dtype=torch.long,
+        )
+        assert result.shape == input_ids.shape
+        assert (result[: len(expected)] == expected).all()
+
     def test_mixed_audio_video_batch(self):
         """Audio entry passes through; video entry gets placeholders replaced."""
         model = _make_merge_model()
@@ -1744,13 +1798,75 @@ class TestExpandPromptTokenIdsForMM:
         assert mm_data_updates is None
         assert result == prompt
 
-    def test_multiple_modalities_raises(self):
-        proc = _make_fast_path_audio_processor()
+    def test_mixed_image_video_audio_expands_in_prompt_order(self):
+        proc = _make_fast_path_audio_processor(video_target_num_patches=None)
+        proc._add_video_prefix = False
+        proc.video_pruning_rate = 0
+        proc.video_temporal_patch_size = 1
+        img_ctx = proc.img_context_token_id
+        vid_ctx = proc.video_context_token_id
+        snd_ctx = proc._sound_context_token_id
+        prompt = [1, img_ctx, 2, vid_ctx, 3, snd_ctx, 4]
+        frames = [Image.new("RGB", (512, 512))]
+        mm_data = {
+            "image": [object()],
+            "video": [SimpleNamespace(frames=frames, metadata=None)],
+            "audio": [object()],
+        }
+
+        result, mm_data_updates = proc.expand_prompt_token_ids_for_mm(
+            prompt,
+            [5, 258, 5],
+            mm_data=mm_data,
+        )
+
+        image_block = [500] + [img_ctx] * 3 + [501]
+        video_block = list(range(9)) + [500] + [img_ctx] * 256 + [501]
+        audio_block = [200] + [snd_ctx] * 3 + [201]
+        assert mm_data_updates is None
+        assert result == [1] + image_block + [2] + video_block + [3] + audio_block + [4]
+
+    def test_call_mixed_image_video_audio_builds_ordered_metadata(self):
+        proc = _make_fast_path_audio_processor(video_target_num_patches=None)
+        proc._add_video_prefix = False
+        proc.video_pruning_rate = 0
+        proc.video_temporal_patch_size = 1
         img_ctx = proc.img_context_token_id
         snd_ctx = proc._sound_context_token_id
-        prompt = [img_ctx, snd_ctx]
-        with pytest.raises(ValueError, match="multiple modalities"):
-            proc.expand_prompt_token_ids_for_mm(prompt, [5, 5])
+        frames = [Image.new("RGB", (512, 512))]
+        image_data = {"pixel_values": torch.ones(1, 3, 2, 2)}
+        video_data = {"pixel_values": torch.ones(1, 3, 2, 2), "video_size": [[1, 1, 512, 512]]}
+        audio_data = {"input_audio_features": torch.ones(1, 4, 2)}
+        proc._prepare_image_modality_data = mock.Mock(return_value=image_data)
+        proc._prepare_video_modality_data = mock.Mock(return_value=video_data)
+        proc._prepare_audio_modality_data = mock.Mock(return_value=audio_data)
+        proc._get_num_tokens_for_item_order = mock.Mock(return_value=[5, 258, 5])
+        prompt = f"{proc.img_context_token}{proc.video_context_token}{AUDIO_PLACEHOLDER}"
+        inputs = {
+            "prompt": prompt,
+            "multi_modal_data": {
+                "image": [object()],
+                "video": [SimpleNamespace(frames=frames, metadata=None, audio=None)],
+                "audio": [object()],
+            },
+        }
+
+        result, extra_inputs = proc(inputs, None)
+
+        image_block = [500] + [img_ctx] * 3 + [501]
+        video_block = list(range(9)) + [500] + [img_ctx] * 256 + [501]
+        audio_block = [200] + [snd_ctx] * 3 + [201]
+        assert result == image_block + video_block + audio_block
+        multimodal_data = extra_inputs["multimodal_data"]
+        assert multimodal_data["modality_type"] == ["image", "video", "audio"]
+        assert multimodal_data["multimodal_item_order"] == [
+            {"modality": "image", "index": 0},
+            {"modality": "video", "index": 0},
+            {"modality": "audio", "index": 0},
+        ]
+        assert multimodal_data["image"] is image_data
+        assert multimodal_data["video"] is video_data
+        assert multimodal_data["audio"] is audio_data
 
 
 class TestGetNumTokensPerAudio:

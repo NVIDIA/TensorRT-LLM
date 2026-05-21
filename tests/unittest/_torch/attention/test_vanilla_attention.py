@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 import unittest
 
 import torch
@@ -12,6 +14,35 @@ from tensorrt_llm.mapping import Mapping
 
 
 class TestVanillaAttention(unittest.TestCase):
+
+    def test_vswa_prepare_passes_layer_idx(self):
+
+        class FakeKVCacheManager:
+
+            def __init__(self):
+                self.max_attention_window_vec = [512, 32768]
+                self.calls = []
+
+            def get_batch_cache_indices(self, request_ids, layer_idx=None):
+                self.calls.append((request_ids, layer_idx))
+                if layer_idx is None:
+                    raise ValueError("layer_idx must be provided for VSWA")
+                return [[0], [1]]
+
+        kv_cache_manager = FakeKVCacheManager()
+        attn_metadata = VanillaAttentionMetadata(
+            seq_lens=None,
+            num_contexts=0,
+            max_num_requests=2,
+            max_num_tokens=16,
+            kv_cache_manager=kv_cache_manager,
+            request_ids=[10, 11],
+        )
+
+        attn_metadata.prepare()
+
+        self.assertEqual(kv_cache_manager.calls, [([10, 11], 0)])
+        self.assertEqual(attn_metadata.block_ids_per_seq, [[0], [1]])
 
     def test_vanilla_attention(self):
         num_heads = 32

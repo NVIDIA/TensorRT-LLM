@@ -331,6 +331,48 @@ class Qwen3VLInputProcessorBase(BaseMultimodalInputProcessor, BaseMultimodalDumm
         input_ids[masks] = self.tllm_multimodal_token_id
         return input_ids
 
+    def get_mm_item_order(
+        self, prompt_token_ids: List[int], mm_data: Dict[str, Any]
+    ) -> List[Tuple[str, int]]:
+        def count_items(items: Any) -> int:
+            if items is None:
+                return 0
+            return len(items) if isinstance(items, list) else 1
+
+        counts = {
+            "image": count_items(mm_data.get("image")),
+            "video": count_items(mm_data.get("video")),
+        }
+        seen = {"image": 0, "video": 0}
+        item_order: List[Tuple[str, int]] = []
+
+        vision_start_token_id = self.config.vision_start_token_id
+        for idx, token_id in enumerate(prompt_token_ids[:-1]):
+            if token_id != vision_start_token_id:
+                continue
+            vision_token_id = prompt_token_ids[idx + 1]
+            if vision_token_id == self.config.image_token_id and seen["image"] < counts["image"]:
+                item_order.append(("image", seen["image"]))
+                seen["image"] += 1
+            elif vision_token_id == self.config.video_token_id and seen["video"] < counts["video"]:
+                item_order.append(("video", seen["video"]))
+                seen["video"] += 1
+        if seen == counts:
+            return item_order
+
+        seen = {"image": 0, "video": 0}
+        item_order = []
+        for token_id in prompt_token_ids:
+            if token_id == self.config.image_token_id and seen["image"] < counts["image"]:
+                item_order.append(("image", seen["image"]))
+                seen["image"] += 1
+            elif token_id == self.config.video_token_id and seen["video"] < counts["video"]:
+                item_order.append(("video", seen["video"]))
+                seen["video"] += 1
+        if seen != counts:
+            raise ValueError(f"Expected Qwen3-VL multimodal item counts {counts}, found {seen}.")
+        return item_order
+
     def get_mrope_config(
         self,
         input_ids: torch.IntTensor,
@@ -391,6 +433,10 @@ class Qwen3VLInputProcessorBase(BaseMultimodalInputProcessor, BaseMultimodalDumm
 
         fused_input_ids = processed_inputs["input_ids"][0]
         if mm_data:
+            item_order = self.get_mm_item_order(fused_input_ids.tolist(), mm_data)
+            multimodal_data["multimodal_item_order"] = [
+                {"modality": modality, "index": idx} for modality, idx in item_order
+            ]
             fused_input_ids = self._postprocess(fused_input_ids)
 
         return fused_input_ids.to(torch.int32).tolist(), {
@@ -866,18 +912,53 @@ class Qwen3VisionModelBase(nn.Module):
         pixel_values_videos_list = []
         image_grid_thw_list = []
         video_grid_thw_list = []
+        item_order = []
+        image_offset = 0
+        video_offset = 0
 
         for multimodal_param in multimodal_params:
             multimodal_data = multimodal_param.multimodal_data
+            local_image_count = 0
+            local_video_count = 0
             # Process images if present
             if multimodal_data.get("image") is not None:
                 pixel_values_list.append(multimodal_data["image"]["pixel_values"])
                 image_grid_thw_list.append(multimodal_data["image"]["image_grid_thw"])
+                local_image_count = len(multimodal_data["image"]["image_grid_thw"])
 
             # Process videos if present
             if multimodal_data.get("video") is not None:
                 pixel_values_videos_list.append(multimodal_data["video"]["pixel_values_videos"])
                 video_grid_thw_list.append(multimodal_data["video"]["video_grid_thw"])
+                local_video_count = len(multimodal_data["video"]["video_grid_thw"])
+
+            local_order = multimodal_data.get("multimodal_item_order")
+            if local_order is None:
+                local_order = [
+                    {"modality": "image", "index": idx} for idx in range(local_image_count)
+                ] + [{"modality": "video", "index": idx} for idx in range(local_video_count)]
+            local_seen = {"image": 0, "video": 0}
+            for entry in local_order:
+                if isinstance(entry, dict):
+                    modality = entry.get("modality", entry.get("type"))
+                    idx = entry.get("index", entry.get("item_index"))
+                    if idx is None:
+                        idx = local_seen.get(modality, 0)
+                elif isinstance(entry, str):
+                    modality = entry
+                    idx = local_seen.get(modality, 0)
+                else:
+                    modality, idx = entry
+                idx = int(idx)
+                if modality == "image":
+                    item_order.append(("image", image_offset + idx))
+                elif modality == "video":
+                    item_order.append(("video", video_offset + idx))
+                else:
+                    raise ValueError(f"Unknown Qwen3-VL modality in item order: {modality}")
+                local_seen[modality] = max(local_seen.get(modality, 0), idx + 1)
+            image_offset += local_image_count
+            video_offset += local_video_count
 
         # Concatenate tensors
         mm_content_dict = {}
@@ -908,8 +989,22 @@ class Qwen3VisionModelBase(nn.Module):
                 if len(video_grid_thw_list) > 1
                 else video_grid_thw_list[0]
             )
+        if item_order:
+            mm_extra_data["multimodal_item_order"] = item_order
 
         return mm_content_dict, mm_extra_data
+
+    def _split_visual_embeds_by_grid(
+        self, embeds: torch.Tensor, grid_thw: torch.Tensor
+    ) -> List[torch.Tensor]:
+        merge = self.config.spatial_merge_size
+        lengths = (grid_thw.prod(dim=1) // (merge * merge)).tolist()
+        if embeds.shape[0] != sum(lengths):
+            raise ValueError(
+                f"Qwen3-VL visual embedding length mismatch: encoder produced "
+                f"{embeds.shape[0]} rows, grid metadata expects {sum(lengths)}."
+            )
+        return list(embeds.split(lengths))
 
     @torch.inference_mode()
     def forward(self, multimodal_params: List[MultimodalParams]) -> List[torch.Tensor]:
@@ -917,13 +1012,10 @@ class Qwen3VisionModelBase(nn.Module):
         pixel_values = mm_content_data.get("pixel_values", None)
         pixel_values_videos = mm_content_data.get("pixel_values_videos", None)
 
-        if pixel_values is not None and pixel_values_videos is not None:
-            raise ValueError("Currently only support single modality per request")
-
         image_grid_thw = mm_extra_data.get("image_grid_thw", None)
         video_grid_thw = mm_extra_data.get("video_grid_thw", None)
 
-        embeds = []
+        embeds_by_modality: Dict[str, List[torch.Tensor]] = {}
         if pixel_values is not None:
             pixel_values = pixel_values.to(self.model_dtype)
             image_embeds, deepstack_image_embeds = self.visual(
@@ -932,7 +1024,9 @@ class Qwen3VisionModelBase(nn.Module):
             # NOTE: We concatenate deepstack_embeds to mm_embeds
             # The shape will be [seq_len, hidden_dim * (num_deepstack_layers + 1)]
             mixed_image_embeds = torch.cat([image_embeds] + deepstack_image_embeds, dim=1)
-            embeds.append(mixed_image_embeds)
+            embeds_by_modality["image"] = self._split_visual_embeds_by_grid(
+                mixed_image_embeds, image_grid_thw
+            )
 
         if pixel_values_videos is not None:
             pixel_values_videos = pixel_values_videos.to(self.model_dtype)
@@ -942,8 +1036,20 @@ class Qwen3VisionModelBase(nn.Module):
             # NOTE: We concatenate deepstack_embeds to mm_embeds
             # The shape will be [seq_len, hidden_dim * (num_deepstack_layers + 1)]
             mixed_video_embeds = torch.cat([video_embeds] + deepstack_video_embeds, dim=1)
-            embeds.append(mixed_video_embeds)
-        return embeds
+            embeds_by_modality["video"] = self._split_visual_embeds_by_grid(
+                mixed_video_embeds, video_grid_thw
+            )
+
+        item_order = mm_extra_data.get("multimodal_item_order")
+        if item_order:
+            ordered_embeds = [embeds_by_modality[modality][idx] for modality, idx in item_order]
+            return [torch.cat(ordered_embeds, dim=0)] if ordered_embeds else []
+        embeds = [
+            chunk
+            for modality in ("image", "video")
+            for chunk in embeds_by_modality.get(modality, [])
+        ]
+        return [torch.cat(embeds, dim=0)] if embeds else []
 
 
 class Qwen3VLModelBase(PreTrainedModel):

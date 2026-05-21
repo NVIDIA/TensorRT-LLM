@@ -25,7 +25,7 @@ from ..conftest import (
     skip_pre_blackwell,
     skip_pre_hopper,
 )
-from .accuracy_core import MMMU, LlmapiAccuracyTestHarness, VideoMME, VoxPopuli
+from .accuracy_core import MMMU, LlmapiAccuracyTestHarness, MixedModality, VideoMME, VoxPopuli
 
 
 class TestQwen2_VL_7B(LlmapiAccuracyTestHarness):
@@ -603,6 +603,17 @@ class TestNanoV3Omni(LlmapiAccuracyTestHarness):
         videomme_sampling_params,
         no_thinking_evaluator_kwargs,
     )
+    mixed_modality_sampling_params = SamplingParams(
+        max_tokens=MixedModality.MAX_OUTPUT_LEN,
+        truncate_prompt_tokens=MixedModality.MAX_INPUT_LEN,
+        temperature=0.0,
+        top_k=1,
+    )
+    MIXED_MODALITY_TASK_SPEC = (
+        MixedModality,
+        mixed_modality_sampling_params,
+        no_thinking_evaluator_kwargs,
+    )
 
     @pytest.mark.skip_less_device_memory(80000)
     @pytest.mark.parametrize(
@@ -618,7 +629,10 @@ class TestNanoV3Omni(LlmapiAccuracyTestHarness):
                 ),
                 32,
                 None,
-                (MMMU_TASK_SPEC,),
+                (
+                    MMMU_TASK_SPEC,
+                    MIXED_MODALITY_TASK_SPEC,
+                ),
                 id="bf16",
             ),
             pytest.param(
@@ -632,7 +646,12 @@ class TestNanoV3Omni(LlmapiAccuracyTestHarness):
                 ),
                 64,
                 QuantAlgo.FP8,
-                (MMMU_TASK_SPEC, VOXPOPULI_TASK_SPEC, VIDEOMME_TASK_SPEC),
+                (
+                    MMMU_TASK_SPEC,
+                    VOXPOPULI_TASK_SPEC,
+                    VIDEOMME_TASK_SPEC,
+                    MIXED_MODALITY_TASK_SPEC,
+                ),
                 marks=skip_pre_hopper,
                 id="fp8",
             ),
@@ -647,7 +666,12 @@ class TestNanoV3Omni(LlmapiAccuracyTestHarness):
                 ),
                 128,
                 QuantAlgo.MIXED_PRECISION,
-                (MMMU_TASK_SPEC, VOXPOPULI_TASK_SPEC, VIDEOMME_TASK_SPEC),
+                (
+                    MMMU_TASK_SPEC,
+                    VOXPOPULI_TASK_SPEC,
+                    VIDEOMME_TASK_SPEC,
+                    MIXED_MODALITY_TASK_SPEC,
+                ),
                 marks=(skip_pre_blackwell,),
                 id="nvfp4",
             ),
@@ -663,7 +687,11 @@ class TestNanoV3Omni(LlmapiAccuracyTestHarness):
         max_batch_size: int,
         expected_quant_algo: QuantAlgo | None,
         task_specs: tuple[
-            tuple[type[MMMU] | type[VoxPopuli], SamplingParams, dict[str, object]],
+            tuple[
+                type[MMMU] | type[VoxPopuli] | type[VideoMME] | type[MixedModality],
+                SamplingParams,
+                dict[str, object],
+            ],
             ...,
         ],
     ) -> None:
