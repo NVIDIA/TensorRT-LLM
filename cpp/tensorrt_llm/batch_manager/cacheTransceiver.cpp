@@ -600,6 +600,17 @@ RequestStatuses CacheTransceiver::checkContextTransferStatus(
 void CacheTransceiver::checkGenTransferStatus(std::optional<int> const& atLeastRequestNum)
 {
     bool blockAll = !atLeastRequestNum.has_value();
+    // Mirror the sender-side behavior in checkContextTransferStatus: when the
+    // caller does not request unbounded blocking, allow each receiver future to
+    // time out so the executor loop can periodically check
+    // py_kv_transfer_timed_out and cancel a stuck receiver (see
+    // https://nvbugs/6114140). When blockAll is true, leave the timeout unset
+    // so the legacy blocking behavior is preserved.
+    std::optional<int> receiverFutureTimeoutMs = std::nullopt;
+    if (!blockAll && mCacheTransceiverConfig.has_value())
+    {
+        receiverFutureTimeoutMs = mCacheTransceiverConfig->getKvTransferSenderFutureTimeoutMs();
+    }
     std::vector<LlmRequest::RequestIdType> genTransferReadyRequestIds;
     for (auto&& [request, future] : mRequesterFutures)
     {
@@ -716,14 +727,49 @@ void CacheTransceiver::checkGenTransferStatus(std::optional<int> const& atLeastR
         {
             try
             {
-                it->second.get();
-                it->first->setState(LlmRequestState::kDISAGG_GENERATION_TRANS_COMPLETE);
-
-                // Gather the kv cache transfer time from all workers and update to leader rank
-                if (!common::getEnvKVCacheTimeOutputPath().empty())
+                // Bounded wait when configured, otherwise preserve the legacy
+                // blocking behavior by treating an unset timeout as "wait forever".
+                auto status = it->second.wait_for(std::chrono::milliseconds(receiverFutureTimeoutMs.value_or(0)));
+                if (status == std::future_status::ready || !receiverFutureTimeoutMs.has_value())
                 {
-                    auto syncComm = mCacheState->getParallelConfig().mEnableAttentionDP ? mGroupDataComm : mGroupComm;
-                    updateKVCacheTransferBW(syncComm, it->first);
+                    it->second.get();
+                    it->first->setState(LlmRequestState::kDISAGG_GENERATION_TRANS_COMPLETE);
+
+                    // Gather the kv cache transfer time from all workers and update to leader rank
+                    if (!common::getEnvKVCacheTimeOutputPath().empty())
+                    {
+                        auto syncComm
+                            = mCacheState->getParallelConfig().mEnableAttentionDP ? mGroupDataComm : mGroupComm;
+                        updateKVCacheTransferBW(syncComm, it->first);
+                    }
+
+                    if (useMPI())
+                    {
+                        TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(),
+                            "**** it->first->mRequestId: %ld, context request ID: %ld ******** get feature ***",
+                            it->first->mRequestId, it->first->getContextPhaseParams().value().getReqId());
+                    }
+                    else
+                    {
+                        TLLM_LOG_DEBUG(tensorrt_llm::pg_utils::get_world_pg()->getRank(),
+                            "**** it->first->mRequestId: %ld, context request ID: %ld ******** get feature ***",
+                            it->first->mRequestId, it->first->getContextPhaseParams().value().getReqId());
+                    }
+                    it = mRequesterFutures.erase(it);
+                }
+                else if (status == std::future_status::timeout)
+                {
+                    TLLM_LOG_WARNING(
+                        "Timed out waiting for generation KV cache transfer for request %ld after %d milliseconds.",
+                        it->first->mRequestId, receiverFutureTimeoutMs.value());
+                    ++it;
+                }
+                else
+                {
+                    TLLM_LOG_ERROR("Future returned unexpected status for generation request %ld. Marking as error",
+                        it->first->mRequestId);
+                    it->first->setState(LlmRequestState::kDISAGG_TRANS_ERROR);
+                    it = mRequesterFutures.erase(it);
                 }
             }
             catch (std::exception const& e)
@@ -731,20 +777,8 @@ void CacheTransceiver::checkGenTransferStatus(std::optional<int> const& atLeastR
                 TLLM_LOG_ERROR(
                     "Error occurred during generation transfer for request %ld: %s", it->first->mRequestId, e.what());
                 it->first->setState(LlmRequestState::kDISAGG_TRANS_ERROR);
+                it = mRequesterFutures.erase(it);
             }
-            if (useMPI())
-            {
-                TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(),
-                    "**** it->first->mRequestId: %ld, context request ID: %ld ******** get feature ***",
-                    it->first->mRequestId, it->first->getContextPhaseParams().value().getReqId());
-            }
-            else
-            {
-                TLLM_LOG_DEBUG(tensorrt_llm::pg_utils::get_world_pg()->getRank(),
-                    "**** it->first->mRequestId: %ld, context request ID: %ld ******** get feature ***",
-                    it->first->mRequestId, it->first->getContextPhaseParams().value().getReqId());
-            }
-            it = mRequesterFutures.erase(it);
         }
         else
         {

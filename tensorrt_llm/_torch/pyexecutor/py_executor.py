@@ -3827,6 +3827,18 @@ class PyExecutor:
                 req_id = req.py_request_id if not req.is_child else req.parent_request_id
                 if req_id not in user_canceled_set:
                     req.state = LlmRequestState.DISAGG_TRANS_ERROR
+        # Cancel generation-side receivers whose KV cache transfer has exceeded
+        # kv_transfer_timeout_ms, mirroring the sender-side timeout path in
+        # _check_disagg_ctx_cache_transfer_status (see https://nvbugs/6114140).
+        # Without this, a receiver stuck on an unresponsive sender hangs the PP
+        # executor loop indefinitely.
+        for req in self.active_requests:
+            if (req.is_disagg_generation_transmission_in_progress
+                    and req.py_kv_transfer_timed_out):
+                is_cancelled = self.kv_cache_transceiver.cancel_request(req)
+                if is_cancelled:
+                    req.py_kv_transfer_start_time = None
+                    req.state = LlmRequestState.DISAGG_TRANS_ERROR
         self._check_cache_transfer_errors("generation requests")
 
     def _forward_step(
