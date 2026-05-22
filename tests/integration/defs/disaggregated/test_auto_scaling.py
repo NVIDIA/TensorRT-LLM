@@ -3,7 +3,7 @@ import os
 
 import pytest
 import requests
-from defs.conftest import llm_models_root
+from defs.conftest import get_sm_version, llm_models_root
 from disagg_test_utils import (CHECK_STATUS_INTERVAL, request_completion,
                                run_ctx_worker, run_disagg_server,
                                run_gen_worker, terminate, verify_cluster_info,
@@ -14,6 +14,29 @@ from disagg_test_utils import (CHECK_STATUS_INTERVAL, request_completion,
 pytest_plugins = ["disagg_test_utils"]
 
 ROUTER_TYPES = ["round_robin", "load_balancing", "kv_cache_aware"]
+
+
+def get_ucx_tls():
+    """Get UCX_TLS value based on GPU architecture.
+
+    Pre-Hopper GPUs need cuda_ipc excluded from UCX transports.
+    On some gb300 cluster, we need to set `cuda_copy,cuda_ipc,sm,self,tcp`
+    explicitly to avoid UCX auto-selection picking a misbehaving NIC transport.
+    """
+    sm = get_sm_version()
+    if sm == 103:
+        return "cuda_copy,cuda_ipc,sm,self,tcp"
+    if sm < 90:
+        return "^cuda_ipc,ib,gdr_copy"
+    return "^ib,gdr_copy"
+
+
+@pytest.fixture
+def worker_env():
+    """Per-worker environment with UCX_TLS set for the current GPU arch."""
+    env = os.environ.copy()
+    env["UCX_TLS"] = get_ucx_tls()
+    return env
 
 
 @pytest.fixture
@@ -31,16 +54,24 @@ def model_name():
 @pytest.mark.parametrize("service_discovery", ["etcd", "http"], indirect=True)
 async def test_service_discovery(model_name, disagg_server_config,
                                  worker_config, router, service_discovery,
-                                 disagg_port, work_dir):
+                                 disagg_port, work_dir, worker_env):
     ctx_worker1 = None
     gen_worker1 = None
     disagg_server = None
     try:
         # initial cluster, 1 ctx, 1 gen, request should succeed
-        ctx_worker1 = run_ctx_worker(model_name, worker_config, work_dir)
-        gen_worker1 = run_gen_worker(model_name, worker_config, work_dir)
-        disagg_server = run_disagg_server(disagg_server_config, work_dir,
-                                          disagg_port)
+        ctx_worker1 = run_ctx_worker(model_name,
+                                     worker_config,
+                                     work_dir,
+                                     env=worker_env)
+        gen_worker1 = run_gen_worker(model_name,
+                                     worker_config,
+                                     work_dir,
+                                     env=worker_env)
+        disagg_server = run_disagg_server(disagg_server_config,
+                                          work_dir,
+                                          disagg_port,
+                                          env=worker_env)
         await wait_for_disagg_server_ready(disagg_port)
         verify_cluster_info(True, 1, 1, port=disagg_port)
         response = request_completion(model_name,
@@ -60,7 +91,7 @@ async def test_service_discovery(model_name, disagg_server_config,
 @pytest.mark.timeout(900)
 async def test_minimal_instances(model_name, disagg_server_config,
                                  worker_config, router, service_discovery,
-                                 disagg_port, work_dir):
+                                 disagg_port, work_dir, worker_env):
     # the cluster should have at least 2 ctx and 2 gen workers
     minimal_instances = {
         "context_servers": 2,
@@ -76,10 +107,18 @@ async def test_minimal_instances(model_name, disagg_server_config,
     gen_worker2 = None
     disagg_server = None
     try:
-        ctx_worker1 = run_ctx_worker(model_name, worker_config, work_dir)
-        gen_worker1 = run_gen_worker(model_name, worker_config, work_dir)
-        disagg_server = run_disagg_server(disagg_server_config, work_dir,
-                                          disagg_port)
+        ctx_worker1 = run_ctx_worker(model_name,
+                                     worker_config,
+                                     work_dir,
+                                     env=worker_env)
+        gen_worker1 = run_gen_worker(model_name,
+                                     worker_config,
+                                     work_dir,
+                                     env=worker_env)
+        disagg_server = run_disagg_server(disagg_server_config,
+                                          work_dir,
+                                          disagg_port,
+                                          env=worker_env)
         await wait_for_disagg_server_status(disagg_port, 1, 1)
         verify_cluster_info(False, 1, 1, port=disagg_port)
         # with only 1 ctx and 1 gen worker, the request should fail
@@ -89,8 +128,14 @@ async def test_minimal_instances(model_name, disagg_server_config,
                                           port=disagg_port)
             print(response)
 
-        ctx_worker2 = run_ctx_worker(model_name, worker_config, work_dir)
-        gen_worker2 = run_gen_worker(model_name, worker_config, work_dir)
+        ctx_worker2 = run_ctx_worker(model_name,
+                                     worker_config,
+                                     work_dir,
+                                     env=worker_env)
+        gen_worker2 = run_gen_worker(model_name,
+                                     worker_config,
+                                     work_dir,
+                                     env=worker_env)
         await wait_for_disagg_server_ready(disagg_port)
         verify_cluster_info(True, 2, 2, port=disagg_port)
         response = request_completion(model_name,
@@ -108,7 +153,8 @@ async def test_minimal_instances(model_name, disagg_server_config,
 @pytest.mark.asyncio(loop_scope="module")
 @pytest.mark.timeout(900)
 async def test_worker_restart(model_name, disagg_server_config, worker_config,
-                              router, service_discovery, disagg_port, work_dir):
+                              router, service_discovery, disagg_port, work_dir,
+                              worker_env):
     ctx_worker1 = None
     ctx_worker2 = None
     gen_worker1 = None
@@ -120,13 +166,17 @@ async def test_worker_restart(model_name, disagg_server_config, worker_config,
         ctx_worker1 = run_ctx_worker(model_name,
                                      worker_config,
                                      work_dir,
-                                     device=0)
+                                     device=0,
+                                     env=worker_env)
         gen_worker1 = run_gen_worker(model_name,
                                      worker_config,
                                      work_dir,
-                                     device=1)
-        disagg_server = run_disagg_server(disagg_server_config, work_dir,
-                                          disagg_port)
+                                     device=1,
+                                     env=worker_env)
+        disagg_server = run_disagg_server(disagg_server_config,
+                                          work_dir,
+                                          disagg_port,
+                                          env=worker_env)
         await wait_for_disagg_server_ready(disagg_port)
         verify_cluster_info(True, 1, 1, port=disagg_port)
         response = request_completion(model_name,
@@ -149,7 +199,8 @@ async def test_worker_restart(model_name, disagg_server_config, worker_config,
                                      worker_config,
                                      work_dir,
                                      port=0,
-                                     device=1)
+                                     device=1,
+                                     env=worker_env)
         await wait_for_disagg_server_status(disagg_port, 1, 1)
         await asyncio.sleep(CHECK_STATUS_INTERVAL)
         verify_cluster_info(True, 1, 1, port=disagg_port)
@@ -171,7 +222,8 @@ async def test_worker_restart(model_name, disagg_server_config, worker_config,
                                      worker_config,
                                      work_dir,
                                      port=0,
-                                     device=0)
+                                     device=0,
+                                     env=worker_env)
         await wait_for_disagg_server_status(disagg_port, 1, 1)
         await asyncio.sleep(CHECK_STATUS_INTERVAL)
         verify_cluster_info(True, 1, 1, port=disagg_port)
@@ -185,12 +237,14 @@ async def test_worker_restart(model_name, disagg_server_config, worker_config,
                                      worker_config,
                                      work_dir,
                                      port=0,
-                                     device=0)
+                                     device=0,
+                                     env=worker_env)
         gen_worker1 = run_gen_worker(model_name,
                                      worker_config,
                                      work_dir,
                                      port=0,
-                                     device=1)
+                                     device=1,
+                                     env=worker_env)
         await wait_for_disagg_server_status(disagg_port, 2, 2)
         await asyncio.sleep(CHECK_STATUS_INTERVAL)
         verify_cluster_info(True, 2, 2, port=disagg_port)
@@ -214,16 +268,24 @@ async def test_worker_restart(model_name, disagg_server_config, worker_config,
 @pytest.mark.timeout(900)
 async def test_disagg_server_restart(model_name, disagg_server_config,
                                      worker_config, router, service_discovery,
-                                     disagg_port, work_dir):
+                                     disagg_port, work_dir, worker_env):
     ctx_worker1 = None
     gen_worker1 = None
     disagg_server = None
     try:
         # initial cluster, 1 ctx, 1 gen, request should succeed
-        ctx_worker1 = run_ctx_worker(model_name, worker_config, work_dir)
-        gen_worker1 = run_gen_worker(model_name, worker_config, work_dir)
-        disagg_server = run_disagg_server(disagg_server_config, work_dir,
-                                          disagg_port)
+        ctx_worker1 = run_ctx_worker(model_name,
+                                     worker_config,
+                                     work_dir,
+                                     env=worker_env)
+        gen_worker1 = run_gen_worker(model_name,
+                                     worker_config,
+                                     work_dir,
+                                     env=worker_env)
+        disagg_server = run_disagg_server(disagg_server_config,
+                                          work_dir,
+                                          disagg_port,
+                                          env=worker_env)
         await wait_for_disagg_server_ready(disagg_port)
         verify_cluster_info(True, 1, 1, port=disagg_port)
         response = request_completion(model_name,
@@ -246,8 +308,10 @@ async def test_disagg_server_restart(model_name, disagg_server_config,
                                 expected_code=500)
 
         # restart disagg server, the request should succeed
-        disagg_server = run_disagg_server(disagg_server_config, work_dir,
-                                          disagg_port)
+        disagg_server = run_disagg_server(disagg_server_config,
+                                          work_dir,
+                                          disagg_port,
+                                          env=worker_env)
         await wait_for_disagg_server_ready(disagg_port)
         verify_cluster_info(True, 1, 1, port=disagg_port)
         response = request_completion(model_name,
