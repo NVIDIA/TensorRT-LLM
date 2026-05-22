@@ -370,6 +370,7 @@ __launch_bounds__(BLOCK_SIZE) __global__ void beamStage3Kernel(
                 // The last token
                 int indexPrev = (topId / nV) % nBM;
                 int const step = bh.sequenceLengths[slot * nBM + indexPrev];
+                int const inputLength = bh.inputLengths[slot * nBM + indexPrev];
                 int const offsetCBA = (slot * nBM * 2 + nCBA) * nMSL;
                 bh.outputIdsCBA[offsetCBA + step] = bh.endIds[slot];
                 if (bh.logProbsCBA != nullptr)
@@ -377,7 +378,7 @@ __launch_bounds__(BLOCK_SIZE) __global__ void beamStage3Kernel(
                     bh.logProbsCBA[offsetCBA + step] = (float) topLogProb - smemCumLogProbs[(topId / nV) % nBM];
                 }
                 // Previous tokens
-                for (int j = step - 1; j >= 0; j--)
+                for (int j = step - 1; j >= inputLength; j--)
                 {
                     bh.outputIdsCBA[offsetCBA + j] = bh.outputIdsPtr[slot][indexPrev * nMSL + j];
                     indexPrev = bh.parentIdsPtr[slot][indexPrev * nMSL + j];
@@ -385,7 +386,7 @@ __launch_bounds__(BLOCK_SIZE) __global__ void beamStage3Kernel(
                 if (bh.logProbsCBA != nullptr && bh.logProbsTiled != nullptr)
                 {
                     indexPrev = (topId / nV) % nBM;
-                    for (int j = step - 1; j >= 0; j--)
+                    for (int j = step - 1; j >= inputLength; j--)
                     {
                         int const index = (j * nMBS + slot) * nBM + indexPrev;
                         bh.logProbsCBA[offsetCBA + j] = bh.logProbsTiled[index];

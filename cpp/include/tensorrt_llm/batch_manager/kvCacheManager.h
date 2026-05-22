@@ -162,6 +162,46 @@ struct LinearAttentionMetadata
         return false;
     }
 
+    [[nodiscard]] SizeType32 calcNumBlocksNeededForReq(
+        SizeType32 promptLen, SizeType32 tokensPerBlock, bool enableReuse) const
+    {
+        if (!enableReuse)
+        {
+            return 1;
+        }
+        SizeType32 count = 0;
+        if (statesSnapshotInterval > 0)
+        {
+            count += promptLen / statesSnapshotInterval; // round down
+        }
+        if (saveLastSnapshot
+            && (promptLen / tokensPerBlock * tokensPerBlock
+                != promptLen / statesSnapshotInterval * statesSnapshotInterval))
+        {
+            count += 1;
+        }
+        if (promptLen % tokensPerBlock == 0)
+        {
+            // corner case
+            count += 1;
+        }
+        return count;
+    }
+
+    [[nodiscard]] SizeType32 calcNumAdditionalBlocksNeededForReq(
+        SizeType32 numTokens, SizeType32 promptLen, SizeType32 tokensPerBlock, bool enableReuse) const
+    {
+        if (!enableReuse)
+        {
+            return 0;
+        }
+        if (promptLen % tokensPerBlock == 0 && numTokens <= promptLen + 1)
+        {
+            return 1;
+        }
+        return 0;
+    }
+
     [[nodiscard]] bool hasRecurrentStatesCache() const
     {
         return hasRecurrentStatesCache(cacheType);
@@ -872,7 +912,9 @@ public:
 
     //! \brief According to request's current position, copy data from the last full block to the next block (ignoring
     //! the placeholder block). It should be called after every context chunk is processed.
-    void copyLinearAttentionBlock(GenerationRequest& sequence, LlmRequest const& llmRequest);
+    //! \return true iff at least one async block transfer was actually issued. Callers can use this to decide
+    //! whether a subsequent refreshBlocks()/syncTransfers() is necessary.
+    bool copyLinearAttentionBlock(GenerationRequest& sequence, LlmRequest const& llmRequest);
 
     void replaceSharedBlock(GenerationRequest& sequence, SizeType32 blockIdx);
 
@@ -1387,7 +1429,8 @@ public:
 
     //! \brief According to request's current position, copy data from the last full block to the next block (ignoring
     //! the placeholder block). It should be called after every context chunk is processed.
-    void copyLinearAttentionBlock(GenerationRequest& sequence, LlmRequest const& llmRequest);
+    //! \return true iff at least one async block transfer was actually issued.
+    bool copyLinearAttentionBlock(GenerationRequest& sequence, LlmRequest const& llmRequest);
 
     void replaceSharedBlock(GenerationRequest& sequence, SizeType32 windowSize, SizeType32 blockIdx);
 
@@ -2217,7 +2260,12 @@ public:
 
     //! \brief According to request's current position, copy data from the last full block to the next block (ignoring
     //! the placeholder block). It should be called before every forward step, after adding new tokens.
-    void copyLinearAttentionBlock(LlmRequest const& llmRequest);
+    //! \return true iff at least one async block transfer was actually issued for this request. The caller can
+    //! aggregate this across requests and skip refreshBlocks() (which performs a stream sync) when no copies happened.
+    bool copyLinearAttentionBlock(LlmRequest const& llmRequest);
+
+    //! \brief Batch variant of copyLinearAttentionBlock. Returns true iff at least one copy was issued.
+    bool copyLinearAttentionBlockBatch(std::vector<std::shared_ptr<LlmRequest>> const& llmRequests);
 
     void addSequenceBatch(
         std::vector<std::tuple<LlmRequest::RequestIdType, SizeType32, SizeType32>> const& requestInfos,

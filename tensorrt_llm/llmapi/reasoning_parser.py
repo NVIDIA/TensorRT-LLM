@@ -96,6 +96,7 @@ class BaseReasoningParser(ABC):
 
 
 @register_reasoning_parser("deepseek-r1", reasoning_at_start=True)
+@register_reasoning_parser("laguna")
 @register_reasoning_parser("qwen3")
 @register_reasoning_parser("minimax_m2", reasoning_at_start=True)
 @register_reasoning_parser("minimax_m2_append_think", reasoning_at_start=True)
@@ -196,6 +197,7 @@ MODEL_TYPE_TO_REASONING_PARSER: dict[str, str] = {
     "qwen3_next": "qwen3",
     "deepseek_v3": "deepseek-r1",
     "deepseek_v32": "deepseek-r1",
+    "laguna": "laguna",
     "nemotron_h": "nano-v3",
     "nemotron_h_puzzle": "nano-v3",
     "gemma4": "gemma4",

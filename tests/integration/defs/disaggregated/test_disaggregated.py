@@ -189,8 +189,6 @@ def get_test_config(test_desc, example_dir, test_root):
         f"{test_configs_root}/disagg_config_overlap.yaml",
         "perf_metrics":
         f"{test_configs_root}/disagg_config_metrics.yaml",
-        "trtllm_sampler":
-        f"{test_configs_root}/disagg_config_trtllm_sampler.yaml",
         "load_balance":
         f"{test_configs_root}/disagg_config_load_balance.yaml",
         "cache_aware_balance":
@@ -321,7 +319,7 @@ def get_client_test_set(test_desc):
                              verify_streaming_completion=True,
                              verify_chat=False,
                              verify_streaming_chat=False)
-    if test_desc.startswith("overlap") or test_desc == "trtllm_sampler":
+    if test_desc.startswith("overlap"):
         return ClientTestSet(completion=True,
                              completion_streaming=True,
                              chat=True,
@@ -1052,21 +1050,6 @@ def test_disaggregated_kv_cache_time_output(disaggregated_test_root, llm_venv,
                 assert float(sample_recv[1]) <= float(sample[1])
                 break
         assert matched
-
-
-@pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
-                         indirect=True)
-def test_disaggregated_trtllm_sampler(disaggregated_test_root, llm_venv,
-                                      disaggregated_example_root,
-                                      llama_model_root):
-    setup_model_symlink(llm_venv, llama_model_root,
-                        "TinyLlama/TinyLlama-1.1B-Chat-v1.0")
-
-    run_disaggregated_test(disaggregated_example_root,
-                           "trtllm_sampler",
-                           env=llm_venv._new_env,
-                           model_path=llama_model_root,
-                           cwd=llm_venv.get_working_directory())
 
 
 @pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],

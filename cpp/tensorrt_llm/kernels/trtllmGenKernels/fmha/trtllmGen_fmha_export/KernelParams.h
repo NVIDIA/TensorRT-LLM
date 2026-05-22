@@ -447,6 +447,20 @@ static auto makeTmaShapeStrideKv(FmhaOptions const& options,
   return std::make_tuple(shape, stride);
 }
 
+// Check whether reshaping the K/V TMA box can merge consecutive token rows without changing which
+// elements are loaded. This requires the token stride, in descriptor element units, to be exactly
+// one descriptor head row. NHD paged-cache views fail this check because the next contiguous row is
+// the next head at the same token, not the next token for the same head.
+template <class FmhaOptions> static bool canUseTmaKvReshape(FmhaOptions const& options, bool isK) {
+  int32_t const strideKeys = std::get<0>(makeStrideKv(options, isK));
+  // For K the headDim may include extra RoPE coefficients.
+  int32_t const headDim = isK ? options.mHeadDimQk : options.mHeadDimV;
+  // Note that for FP4 KV input, elements are stored as uint8_t, each packs 2 FP4 elements.
+  int32_t const colIdxDivisor = options.mDtypeKv == tg::Dtype::E2m1 ? 2 : 1;
+  int32_t const physicalHeadDim = headDim / colIdxDivisor;
+  return strideKeys / colIdxDivisor == physicalHeadDim;
+}
+
 // Create the TMA shape/stride for KV scaling factors.
 template <class FmhaOptions, class KernelTraits_>
 static auto makeTmaShapeStrideKvSf(FmhaOptions const& options,
@@ -614,19 +628,26 @@ static KernelParams setKernelParams(FmhaOptions_ const& options,
   // Note that for FP4 KV input, elements are stored as uint8_t, each packs 2 FP4 elements.
   auto const numEltsDivisor =
     options.mDtypeKv == tg::Dtype::E2m1 && !storeTransformedKvInTmem ? 2 : 1;
+  // Use the compile-time factor as an upper bound. Descriptor setup lowers the launch-time factor
+  // when the input strides do not make consecutive token rows contiguous for a widened TMA box.
+  int32_t reshapeFactorKv{kernelTraits.mReshapeFactorKv};
+  if (reshapeFactorKv > 1 &&
+      (!canUseTmaKvReshape(options, /*isK*/ true) || !canUseTmaKvReshape(options, /*isK*/ false))) {
+    reshapeFactorKv = 1;
+  }
+  params.mReshapeFactorKv = reshapeFactorKv;
 
   // Shape/stride for gmem tensor Kv.
   auto [shapeK, strideK] = makeTmaShapeStrideKv(options,
                                                 params,
                                                 /*isK*/ true,
                                                 storeTransformedKvInTmem,
-                                                kernelTraits.mReshapeFactorKv);
+                                                reshapeFactorKv);
 
   // The tileShapes for K/V.
   std::vector<uint32_t> tileShapeKv(shapeK.size(), 1);
-  tileShapeKv[0] =
-    kernelTraits.mNumEltsInClampedHeadDimKv / numEltsDivisor * kernelTraits.mReshapeFactorKv;
-  tileShapeKv[1] = kernelTraits.mNumKeysPerTile / kernelTraits.mReshapeFactorKv;
+  tileShapeKv[0] = kernelTraits.mNumEltsInClampedHeadDimKv / numEltsDivisor * reshapeFactorKv;
+  tileShapeKv[1] = kernelTraits.mNumKeysPerTile / reshapeFactorKv;
   // K and V might use different tileShapes.
   std::vector<uint32_t> tileShapeK(tileShapeKv);
   std::vector<uint32_t> tileShapeV(tileShapeKv);
@@ -680,7 +701,7 @@ static KernelParams setKernelParams(FmhaOptions_ const& options,
                                                 params,
                                                 /*isK*/ false,
                                                 storeTransformedKvInTmem,
-                                                kernelTraits.mReshapeFactorKv);
+                                                reshapeFactorKv);
   // For sparse MQA/GQA (not MLA), V also needs 2D flattened descriptor with separate base pointer.
   if (isTokenSparse(options.mSparseType) && !options.mIsMlaGen) {
     shapeV = std::vector<uint64_t>{static_cast<uint64_t>(options.mHeadDimV),

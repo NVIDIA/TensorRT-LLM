@@ -315,25 +315,21 @@ class Qwen3HybridConfig(ModelConfig):
     num_linear_attention_layers: Optional[int] = Field(default=None)
     mamba_ssm_cache_dtype: Optional[str] = Field(default="auto")
 
-    @model_validator(mode="after")
-    def set_values_if_none(self):
-        """Derive num_attention_layers and num_linear_attention_layers.
+    @classmethod
+    def from_hf(cls, model_hf_name, hf_model_path):
+        pretrained_config = load_pretrained_config(hf_model_path
+                                                   or model_hf_name,
+                                                   trust_remote_code=True)
+        hf_config = pretrained_config.to_dict()
+        param_count = cls.get_param_count(model_hf_name, hf_model_path)
 
-        Uses the HF config's layer_types / full_attention_interval.
-        """
-        if self.num_linear_attention_layers is None or self.num_attention_layers is None:
-            pretrained_config = load_pretrained_config(self.name,
-                                                       trust_remote_code=True)
-            layer_types = get_qwen3_hybrid_layer_types(pretrained_config)
-            if self.num_attention_layers is None:
-                self.num_attention_layers = sum(1 for lt in layer_types
-                                                if lt == "full_attention")
-            if self.num_linear_attention_layers is None:
-                self.num_linear_attention_layers = sum(
-                    1 for lt in layer_types if lt == "linear_attention")
+        layer_types = get_qwen3_hybrid_layer_types(pretrained_config)
+        hf_config.setdefault("num_attention_layers",
+                             layer_types.count("full_attention"))
+        hf_config.setdefault("num_linear_attention_layers",
+                             layer_types.count("linear_attention"))
 
-        super().set_values_if_none()
-        return self
+        return cls(name=model_hf_name, param_count=param_count, **hf_config)
 
     def extra_model_cache_in_gb(self, bytes_per_elem, target_seq_len=None):
         d_inner = self.linear_value_head_dim * self.linear_num_value_heads
