@@ -384,6 +384,35 @@ def test_handle_response_propagates_should_abort():
     assert result._outputs[0]._postprocess_result == "mock_sse_data"
 
 
+def test_PostprocWorker_Output_tracing_fields():
+    """PostprocWorker.Output carries finish_reason and num_generated_tokens for
+    tracing on the num_postprocess_workers > 0 path. Both fields are optional
+    and default to None when not populated by the worker."""
+    out = PostprocWorker.Output(client_id=0, res=None, is_final=False)
+    assert out.finish_reason is None
+    assert out.num_generated_tokens is None
+
+
+def test_handle_response_postproc_nonstreaming_propagates_metadata():
+    """On the non-streaming path (res is not CompletionOutput), finish_reason and
+    token_ids are set on _outputs[0] from the PostprocWorker.Output fields."""
+    sampling_params = SamplingParams(max_tokens=10)
+    result = GenerationResultBase(id=1, sampling_params=sampling_params)
+
+    output = PostprocWorker.Output(
+        client_id=1,
+        res="mock_sse_data",  # non-streaming: res is not a CompletionOutput
+        is_final=True,
+        finish_reason="stop",
+        num_generated_tokens=5,
+    )
+    result._handle_response(output)
+
+    assert result._done
+    assert result._outputs[0].finish_reason == "stop"
+    assert len(result._outputs[0].token_ids) == 5
+
+
 def _ZeroMqQueue_sync_sync_task(addr: str):
     print(f"Setup receiver: {addr}")
     pull_pipe = ZeroMqQueue(address=addr, is_server=False, is_async=True)

@@ -15,16 +15,15 @@
 
 import array
 import enum
-import hashlib
 import math
 from collections.abc import Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from itertools import chain
-from typing import TYPE_CHECKING, Callable, ClassVar, Iterable, Iterator, NamedTuple, Type, cast
+from typing import TYPE_CHECKING, Callable, ClassVar, Iterator, NamedTuple, Type, cast
 
 from .. import rawref
-from .._block_radix_tree import Block, RootBlock, TreeTaskId, UselessBlockError
+from .._block_radix_tree import Block, ReuseMatch, ReuseScope, RootBlock, UselessBlockError
 from .._common import (
     BAD_BLOCK_ORDINAL,
     BAD_PAGE_INDEX,
@@ -70,7 +69,6 @@ from .._utils import (
     div_up,
     expect_type,
     filled_list,
-    find_index,
     make_typed,
     map_optional,
     stream_wait_events,
@@ -172,9 +170,7 @@ class _KVCache:
     __slots__ = (
         "id",
         "_manager",
-        "_lora_task_id",
-        "_cache_salt_id",
-        "_tree_task_id",
+        "_reuse_scope",
         "_get_priority",
         "_cuda_stream",
         "_status",
@@ -202,9 +198,7 @@ class _KVCache:
 
     id: int | None
     _manager: "KVCacheManager"
-    _lora_task_id: int | None
-    _cache_salt_id: int | None
-    _tree_task_id: TreeTaskId
+    _reuse_scope: ReuseScope
     _get_priority: Callable[[BlockOrdinal, LifeCycle], Priority]
     _cuda_stream: CudaStream | None
     _status: _Status
@@ -245,17 +239,14 @@ class _KVCache:
     def __init__(
         self,
         manager: "KVCacheManager",
-        lora_task_id: int | None,
-        input_tokens: Sequence[TokenIdExt] | None,
+        reuse_scope: ReuseScope,
+        reuse_match: ReuseMatch | None,
         id: int | None,
         custom_priority_callback: Callable[[BlockOrdinal, LifeCycle], Priority],
-        cache_salt_id: int | None = None,
     ):
         self.id = id
         self._manager = manager
-        self._lora_task_id = lora_task_id
-        self._cache_salt_id = cache_salt_id
-        self._tree_task_id = _KVCache._make_tree_task_id(lora_task_id, cache_salt_id)
+        self._reuse_scope = reuse_scope
         self._get_priority = custom_priority_callback
         self._cuda_stream = None
         self._status = self.Status.SUSPENDED
@@ -282,8 +273,8 @@ class _KVCache:
             lambda _: list[ScratchSlotLock](), manager._storage.num_life_cycles
         )
         self.__rawref__ = rawref.NULL
-        if input_tokens is not None:
-            self._setup_for_reuse(input_tokens)
+        if reuse_match is not None:
+            self._setup_for_reuse(reuse_match)
         self._avg_history_length = Average()
         self._avg_capacity = Average()
         self._avg_history_length.update(self.history_length)
@@ -1048,7 +1039,7 @@ class _KVCache:
             raise LogicError("Cannot commit block that is not full except last block")
         prev: RootBlock | Block
         if ordinal == 0:
-            prev = self.manager._radix_tree.add_or_get_existing(self._tree_task_id)
+            prev = self.manager._radix_tree.add_or_get_existing(self._reuse_scope)
         else:
             prev = self._get_tree_block(BlockOrdinal(ordinal - 1))
         try:
@@ -1256,36 +1247,6 @@ class _KVCache:
         return self.manager._storage
 
     @staticmethod
-    def _make_tree_task_id(lora_task_id: int | None, cache_salt_id: int | None) -> TreeTaskId:
-        """Compute the radix tree's per-request seed.
-
-        When ``cache_salt_id`` is ``None`` the seed reduces to ``lora_task_id``
-        so non-salted requests share the same radix-tree branch and the
-        salt-disabled fast path costs zero hashing.
-
-        When ``cache_salt_id`` is set, the seed becomes a SHA-256 digest that
-        binds ``(lora_task_id, cache_salt_id)`` together so two requests land
-        on the same root only when both fields agree; differing salts cannot
-        reuse one another's blocks.
-        """
-        if cache_salt_id is None:
-            return lora_task_id
-        if lora_task_id is not None and not 0 <= lora_task_id < (1 << 64):
-            raise ValueError(f"lora_task_id must be in [0, 2**64), got {lora_task_id}")
-        if not 0 <= cache_salt_id < (1 << 64):
-            raise ValueError(f"cache_salt_id must be in [0, 2**64), got {cache_salt_id}")
-        h = hashlib.sha256()
-        # Domain-separation byte distinguishes "no LoRA task" from
-        # ``lora_task_id == 0`` so the two cases produce distinct seeds.
-        if lora_task_id is None:
-            h.update(b"\x00")
-        else:
-            h.update(b"\x01")
-            h.update(lora_task_id.to_bytes(8, "little", signed=False))
-        h.update(cache_salt_id.to_bytes(8, "little", signed=False))
-        return h.digest()
-
-    @staticmethod
     def _to_block_ordinal(tokens_per_block: int, token_ordinal: int) -> BlockOrdinal:
         return BlockOrdinal(token_ordinal // tokens_per_block)
 
@@ -1430,95 +1391,25 @@ class _KVCache:
         beg, end = life_cycle.get_stale_range(history_length, tokens_per_block)
         return HalfOpenRange(BlockOrdinal(beg), BlockOrdinal(end))
 
-    def _setup_for_reuse(self, input_tokens: Sequence[TokenIdExt]) -> None:
+    def _get_matched_tokens(self, match: ReuseMatch) -> list[TokenIdExt]:
+        ret: list[TokenIdExt] = []
+        remaining = match.num_tokens
+        for block in match.blocks:
+            assert remaining > 0
+            num_block_tokens = min(remaining, len(block.tokens))
+            ret.extend(block.tokens[:num_block_tokens])
+            remaining -= num_block_tokens
+        assert remaining == 0
+        return ret
+
+    def _setup_for_reuse(self, match: ReuseMatch) -> None:
         manager = self.manager
-        # Use the salted tree task ID so requests with different ``cache_salt_id``
-        # values cannot reuse each other's blocks.
-        tree_task_id = self._tree_task_id
-        matched = list(
-            manager._radix_tree.match(
-                tree_task_id, input_tokens or [], manager.enable_partial_match
-            )
-        )
+        matched = match.blocks
         tokens_per_block = manager.tokens_per_block
-        assert all(b[1] == tokens_per_block for b in matched[:-1])
-
-        def get_num_matched_tokens(_):  # @fixme: remove the _ parameter
-            return tokens_per_block * (len(matched) - 1) + matched[-1][1] if matched else 0
-
+        num_tokens = match.num_tokens
         life_cycles = manager._life_cycles
-
-        def has_pages(block: Block, lc_list: Iterable[LifeCycleId]) -> bool:
-            return all(block.storage[lc] is not None for lc in lc_list)
-
-        # check for full attention layers
-        attn_life_cycles = list(life_cycles.attention_life_cycles())
-        if any(lc.window_size is None for _, lc in attn_life_cycles):
-            lc_list = [lc_idx for lc_idx, lc in attn_life_cycles if lc.window_size is None]
-
-            def check_no_pages(b: tuple[Block, int]):
-                return not has_pages(b[0], lc_list)
-
-            n = find_index(matched, check_no_pages)
-            matched = matched[:n]
-
-        def has_page(block: Block, lc: LifeCycleId) -> bool:
-            return block.storage[lc] is not None
-
-        swa_life_cycles = tuple(
-            (lc_idx, lc) for lc_idx, lc in attn_life_cycles if lc.window_size is not None
-        )
-        # check for SWA sink
-        for lc_idx, lc in swa_life_cycles:
-
-            def check_no_page_lc(b: tuple[Block, int]):
-                return not has_page(b[0], lc_idx)
-
-            n = find_index(matched[: lc.num_sink_blocks], check_no_page_lc)
-            if n < lc.num_sink_blocks:
-                matched = matched[:n]
-        # Check SWA window and SSM snapshot constraints together,
-        # since SSM truncation can invalidate SWA invariants.
-        # SSM is checked first (intervals are large, so it prunes more).
         ssm_lc_id = life_cycles.ssm_life_cycle_id
-        num_tokens = 0
-        while matched:
-            # SSM truncation: truncate to the last block with an SSM snapshot
-            if ssm_lc_id is not None:
-                ssm_trunc = 0
-                for i in reversed(range(len(matched))):
-                    if matched[i][0].storage[ssm_lc_id] is not None:
-                        ssm_trunc = i + 1
-                        break
-                matched = matched[:ssm_trunc]
-                if not matched:
-                    break
-            # SWA window check
-            num_tokens = get_num_matched_tokens(matched)
-            for lc_idx, lc in swa_life_cycles:
-                if lc.window_size is None:
-                    continue
-
-                def check_has_page_lc(b: tuple[Block, int]):
-                    return has_page(b[0], lc_idx)
-
-                n = find_index(reversed(matched), check_has_page_lc)
-                if n != 0:
-                    matched = matched[:-n]
-                    break
-                _, stale_end = _KVCache._get_stale_range(tokens_per_block, num_tokens, lc)
-
-                def check_no_page_stale(b: tuple[Block, int]):
-                    return not has_page(b[0], lc_idx)
-
-                n = find_index(reversed(matched[stale_end:]), check_no_page_stale)
-                if len(matched) - n > stale_end:
-                    matched = matched[: len(matched) - n]
-                    break
-            else:
-                break
-        num_tokens = get_num_matched_tokens(matched)
-        self._committed_tokens = list(input_tokens[:num_tokens])
+        self._committed_tokens = self._get_matched_tokens(match)
         self._history_length = num_tokens
         self._capacity = num_tokens
         # fill self._blocks
@@ -1530,9 +1421,9 @@ class _KVCache:
                         lambda _: filled_list(cast(BlockPage, None), life_cycles.size),
                         self.beam_width,
                     ),
-                    b[0],
+                    block,
                 )
-                for b in matched
+                for block in matched
             ],
         )
 
@@ -1541,20 +1432,18 @@ class _KVCache:
         for lc_idx, lc in life_cycles.items():
             if lc_idx == ssm_lc_id:
                 continue  # SSM is handled separately below
-            stale_start, stale_end = _KVCache._get_stale_range(
-                tokens_per_block, get_num_matched_tokens(matched), lc
-            )
+            stale_start, stale_end = _KVCache._get_stale_range(tokens_per_block, num_tokens, lc)
             for ordinal in chain(
                 typed_range(stale_start), typed_range(stale_end, BlockOrdinal(len(matched)))
             ):
                 block = self._block(ordinal, beam_idx)
-                holder = unwrap_rawref(unwrap_optional(matched[ordinal][0].storage[lc_idx])).hold()
+                holder = unwrap_rawref(unwrap_optional(matched[ordinal].storage[lc_idx])).hold()
                 # For partial blocks (last block, not full), we defer the copy to first resume().
                 # Just store the holder of the original committed page for now.
                 block[lc_idx] = holder
         # SSM reuse: hold the snapshot from the last matched block. Copy is deferred to first resume().
         if ssm_lc_id is not None and matched:
-            snapshot_block = matched[-1][0]
+            snapshot_block = matched[-1]
             snapshot_ref = snapshot_block.storage[ssm_lc_id]
             assert snapshot_ref is not None, (
                 "Last matched block must have SSM snapshot after truncation"

@@ -23,20 +23,12 @@ Automates detection and optimization of host-side (CPU) overhead in TensorRT-LLM
 - Optimizing PyExecutor throughput (requests/sec)
 - Need line-by-line profiling of specific Python functions
 
-### Detecting a CPU Bottleneck
+### Confirming the Bottleneck
 
 line_profiler measures *where* CPU time is spent but not *whether* CPU is the bottleneck.
-When user asks for confirmation, or there is no clear ending conditions for optimizations, use **nsys** (system-level trace) to confirm CPU is the limiting factor:
+If you need to confirm CPU is the limiting factor, run the `perf-host-analysis` skill first -- it provides a YES/NO verdict with metric evidence.
 
-| Indicator (from nsys) | Threshold | Meaning |
-|----------------------|-----------|---------|
-| GPU idle gaps between kernels | >30% of step time | CPU can't feed GPU fast enough |
-| `cudaLaunchKernel` API time | >10% of total time | Kernel launch overhead |
-| NVTX `_prepare_tp_inputs` range | >50% of step time | Input preparation dominates |
-| GPU SM utilization | <60% with no comm/sync bottleneck | CPU-bound inference |
-
-If nsys report is not available, use a rough heuristic: if doubling the batch size does not
-proportionally increase GPU utilization or throughput, CPU overhead is likely the bottleneck.
+As a rough heuristic without nsys: if doubling the batch size does not proportionally increase GPU utilization or throughput, CPU overhead is likely the bottleneck.
 
 ### Using Analysis Skill Results
 
@@ -95,6 +87,12 @@ EXTRA_SUFFIX=round1_eliminate_redundant_iter bash profile.sh
 
 ## Autonomous Optimization Loop
 
+Before starting the loop, review [references/optimization-strategy.md](references/optimization-strategy.md) for strategic guidance on ordering (zero-risk-first), measurement traps, and overhead scoping.
+
+**Key insight**: Optimizations are NOT independent. Fixing a 50ms bottleneck may reveal a 30ms bottleneck that was previously masked (hidden behind the larger one). Always re-profile after each significant change — the bottleneck landscape shifts.
+
+**Ordering principle**: Within each round, prefer zero-risk optimizations (caching, pre-allocation, hoisting invariants) over medium/high-risk ones (graph partition changes, algorithm fusion). Zero-risk changes provide free gains and make subsequent profiling cleaner.
+
 Run N rounds (default 3) of the following cycle:
 
 ```
@@ -102,9 +100,9 @@ FOR round = 1 to MAX_ROUNDS:
 
   1. PROFILE (with Drill-Down)
   2. ANALYZE (Multi-Option)
-  3. OPTIMIZE (Apply Change)
+  3. OPTIMIZE (Apply Change — prefer zero-risk first)
   4. TEST (Unit Test Validation)
-  5. VALIDATE (Re-Profile)
+  5. VALIDATE (Re-Profile — expect bottleneck landscape to shift)
   6. REPORT
 
 END FOR → FINAL SUMMARY
@@ -144,15 +142,21 @@ For the chosen hotspot:
 
 | Type | Indicators | Severity |
 |------|------------|----------|
-| **SYNC** | `.item()`, `.cpu()`, `synchronize()` | Critical |
+| **HOST_SYNC** | `.item()`, `.cpu()` in per-layer forward path | Critical |
+| **SYNC** | `.item()`, `.cpu()`, `synchronize()` in step-level code | Critical |
+| **CUSTOM_OP** | Chain of Python tensor ops (view/slice/cast) before kernel launch | Critical |
+| **GRAPH_BREAK** | Op that prevents CUDA graph capture of surrounding code (fix via GRAPH_EXPAND / GRAPH_SPLIT) | High |
 | **ALLOC** | `torch.zeros/empty/tensor()` in loops, `.clone()` | High |
+| **HOIST** | Per-layer recomputation of step-invariant values | High |
 | **PYLOOP** | `for x in collection:` with many iterations | High |
 | **REDUNDANT_ITER** | Multiple passes over the same collection | High |
 | **DEAD_WORK** | Object construction whose results are always discarded | High |
 | **CONTAINER** | Dict/set lookups in hot loops | Medium |
 | **FUNCALL** | Repeated method/property calls | Medium |
+| **COMM** | `dist.all_reduce`, `dist.barrier`, NCCL overhead in TP/PP paths | Medium |
 | **GIL** | Lock/queue contention | Medium |
-| **GC** | Periodic latency spikes, non-deterministic pauses | Low |
+| **SERIALIZE** | `pickle.dumps/loads`, `json.dumps/loads` in request processing | Medium |
+| **GC** | Periodic latency spikes, non-deterministic pauses (tail latency) | Low |
 | **COMPUTE** | Actual computation (may not be optimizable) | Low |
 
 For detailed classification with code examples, see [references/hotspot-classification.md](references/hotspot-classification.md).
@@ -164,9 +168,9 @@ For detailed classification with code examples, see [references/hotspot-classifi
 | A | ... | ... | Low/Med/High | ... |
 | B | ... | ... | ... | ... |
 
-4. **Select the best option** and explain reasoning (prefer high-savings + low-risk)
+4. **Select the best option** and explain reasoning (prefer high-savings + low-risk; follow zero-risk-first ordering from [references/optimization-strategy.md](references/optimization-strategy.md))
 
-For optimization patterns by type, see [references/optimization-patterns.md](references/optimization-patterns.md).
+For optimization patterns by type, see [references/optimization-patterns.md](references/optimization-patterns.md) (index) — it links to the relevant sub-file for each hotspot type. For GPU-specific patterns (CUSTOM_OP, GRAPH_SPLIT, GRAPH_EXPAND), see [references/patterns/gpu-graph.md](references/patterns/gpu-graph.md).
 
 ### Phase 3: OPTIMIZE (Apply Change)
 
@@ -213,7 +217,7 @@ For the full UT-to-file mapping, see [references/hot-path-files.md](references/h
   3. Did **benchmark metrics** (TPOT, throughput) improve?
 
 **If regression detected** (function time increased or metrics worsened):
-- The "optimization" may have triggered a CPython pitfall — see [references/optimization-patterns.md](references/optimization-patterns.md) (CPython Pitfalls section)
+- The "optimization" may have triggered a CPython pitfall — see [references/patterns/compound-pitfalls.md](references/patterns/compound-pitfalls.md) (CPython Pitfalls section)
 - Rollback and try the next-best option from Phase 2
 
 ### Phase 6: REPORT
@@ -284,8 +288,10 @@ For a concrete multi-round example, see [references/examples.md](references/exam
 
 | File | Contents |
 |------|----------|
-| [references/optimization-patterns.md](references/optimization-patterns.md) | Pattern catalog by hotspot type + CPython pitfalls |
-| [references/hotspot-classification.md](references/hotspot-classification.md) | Extended per-type indicators and code examples |
+| [references/optimization-patterns.md](references/optimization-patterns.md) | Pattern index — links to 6 sub-files: [sync-alloc](references/patterns/sync-alloc.md), [loop-iteration](references/patterns/loop-iteration.md), [python-overhead](references/patterns/python-overhead.md), [gpu-graph](references/patterns/gpu-graph.md), [system](references/patterns/system.md), [compound-pitfalls](references/patterns/compound-pitfalls.md) |
+| [references/optimization-strategy.md](references/optimization-strategy.md) | Zero-risk-first ordering, metric traps, three scopes of host overhead, pattern selection guide |
+| [references/hotspot-classification.md](references/hotspot-classification.md) | Extended per-type indicators and code examples (including CUSTOM_OP, GRAPH_BREAK, HOST_SYNC) |
+| [references/communication-patterns.md](references/communication-patterns.md) | Communication overhead patterns (NCCL batching, barrier removal, async overlap, reduce_scatter) |
 | [references/hot-path-files.md](references/hot-path-files.md) | Key file tables, drill-down targets, UT mapping |
 | [references/examples.md](references/examples.md) | Usage examples and multi-round walkthrough |
 | [trtllm-nvtx-ranges.md](../perf-host-analysis/references/trtllm-nvtx-ranges.md) | TRT-LLM NVTX range reference (from analysis skill) — maps range names to source functions |

@@ -1584,6 +1584,11 @@ class FlashInferAttention(AttentionBackend[FlashInferAttentionMetadata]):
 
             prefix_lens = metadata.cached_token_lens[:num_contexts].clone()
 
+            # attention_window_size is already in flashinfer/triton convention
+            # here (forward() subtracts 1 from the exclusive TRTLLM window).
+            window_left = (attention_window_size
+                           if attention_window_size is not None else -1)
+
             triton_prefill_with_custom_mask(
                 q=q[:num_ctx_tokens],
                 k=k[:num_ctx_tokens],
@@ -1600,6 +1605,7 @@ class FlashInferAttention(AttentionBackend[FlashInferAttentionMetadata]):
                 page_size=metadata.page_size,
                 custom_mask=attention_mask_data,
                 sm_scale=1 / (math.sqrt(self.head_dim) * self.q_scaling),
+                window_left=window_left,
             )
 
             if num_generations > 0:

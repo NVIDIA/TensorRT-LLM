@@ -1,3 +1,17 @@
+# SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 from typing import Tuple
 
 import torch
@@ -189,6 +203,17 @@ def _register_mxfp4_expert_params(
     experts_mod.register_parameter(dn_blocks_name, nn.Parameter(dn_blocks, requires_grad=False))
     experts_mod.register_parameter(dn_scales_name, nn.Parameter(dn_scales, requires_grad=False))
 
+    # Free the now-unused bf16 stacked weight params (`gate_up_proj`, `down_proj`).
+    # The biases (`gate_up_proj_bias`, `down_proj_bias`) are still consumed by
+    # ``triton_mxfp4_moe`` and must remain. For models like GPT-OSS-120B
+    # (128 experts × 36 layers × ~33 MB per layer of bf16 placeholder) freeing
+    # these saves ~150 GB per rank.
+    gu_w_local = gate_up_w_name.split(".")[-1]
+    dn_w_local = down_w_name.split(".")[-1]
+    for local_name in (gu_w_local, dn_w_local):
+        if local_name in experts_mod._parameters:
+            del experts_mod._parameters[local_name]
+
     # Full GM attribute paths for new params
     prefix = (experts_path + ".") if experts_path else ""
     return (
@@ -300,6 +325,15 @@ class InsertMXFP4MLP(BaseTransform):
             # Remove the now-unneeded router node if nobody else uses it
             if len(routing_node.users) == 0:
                 gm.graph.erase_node(routing_node)
+
+            # Erase the old get_attr nodes for gate_up_proj and down_proj.
+            # _register_mxfp4_expert_params deleted those attributes from the
+            # experts module, so these nodes now reference non-existent attrs.
+            # They have no users after the args replacement above, so it is
+            # safe to erase them directly.
+            for stale_node in (gate_up_w_node, down_w_node):
+                if len(stale_node.users) == 0:
+                    gm.graph.erase_node(stale_node)
 
             num_matches += 1
 

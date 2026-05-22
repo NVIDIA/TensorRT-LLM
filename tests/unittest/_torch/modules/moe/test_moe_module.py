@@ -60,6 +60,7 @@ from _torch.modules.moe.moe_test_utils import (
     should_skip_to_accelerate_ci,
     should_skip_trtllm,
     skip_if_insufficient_gpu_memory,
+    skip_trtllm_bf16_on_sm103,
     supports_autotuner_capture,
 )
 from _torch.modules.moe.quantize_utils import get_test_quant_params
@@ -802,6 +803,7 @@ QUANT_ALGOS = [
     QuantAlgo.FP8_BLOCK_SCALES,
     QuantAlgo.W4A8_NVFP4_FP8,
     QuantAlgo.W4A16_MXFP4,
+    QuantAlgo.W4A8_MXFP4_FP8,
     QuantAlgo.W4A8_MXFP4_MXFP8,
     QuantAlgo.W8A16,
     QuantAlgo.W4A8_AWQ,
@@ -1072,14 +1074,22 @@ def generate_multi_gpu_test_params(
             if not skip_reason:
                 # TP modes shard intermediate_size; EP modes don't
                 moe_tp_size = 4 if parallel_mode in ("DTP", "TTP") else 1
+                # Match the canonical predicate used by the worker impl so
+                # backend skip checks (e.g. the W4A8_MXFP4_FP8 + TRTLLM-Gen
+                # gpt-oss SwiGLU kernel-bug skip) fire on multi-GPU runs too.
+                swiglu_gptoss_style = (
+                    swiglu_alpha != 1 or swiglu_beta != 0 or swiglu_limit != float("inf")
+                )
                 for reason in (
                     _get_comm_method_skip_reason(comm_method, model_config, dtype=dtype),
                     should_skip_trtllm(
                         backend_type,
                         quant_algo,
                         model_config,
+                        swiglu_gptoss_style=swiglu_gptoss_style,
                         comm_method=comm_method,
                         moe_tp_size=moe_tp_size,
+                        parallel_mode=parallel_mode,
                     ),
                     should_skip_cutlass(
                         backend_type,
@@ -1314,8 +1324,10 @@ def test_configurable_moe_single_gpu(
     4. swiglu_gptoss_style (SwiGLU with custom parameters) works correctly
     """
     swiglu_gptoss_style = swiglu_alpha != 1 or swiglu_beta != 0 or swiglu_limit != float("inf")
+    backend_type = MoeBackendType(moe_backend)
+    skip_trtllm_bf16_on_sm103(backend_type, quant_algo, dtype)
     ci_skip = should_skip_to_accelerate_ci(
-        backend_type=MoeBackendType(moe_backend),
+        backend_type=backend_type,
         quant_algo=quant_algo,
         model_config=model_config,
         routing_method_cls=routing_method_cls,
@@ -1500,8 +1512,10 @@ def test_configurable_moe_multi_gpu(
     swiglu_limit,
 ):
     swiglu_gptoss_style = swiglu_alpha != 1 or swiglu_beta != 0 or swiglu_limit != float("inf")
+    backend_type = MoeBackendType(moe_backend)
+    skip_trtllm_bf16_on_sm103(backend_type, quant_algo, dtype)
     ci_skip = should_skip_to_accelerate_ci(
-        backend_type=MoeBackendType(moe_backend),
+        backend_type=backend_type,
         quant_algo=quant_algo,
         model_config=model_config,
         routing_method_cls=routing_method_cls,
@@ -1854,6 +1868,8 @@ def test_configurable_moe_multi_gpu_eplb(
     num_slots,
     routing_method_cls,
 ):
+    skip_trtllm_bf16_on_sm103(MoeBackendType(moe_backend), quant_algo, dtype)
+
     skip_if_insufficient_gpu_memory(
         model_config.num_experts,
         model_config.hidden_size,

@@ -1,7 +1,14 @@
-from typing import Optional
+from typing import Optional, Tuple
 
 import torch
-from flashinfer.sampling import top_k_top_p_sampling_from_logits
+
+from ..flashinfer_utils import IS_FLASHINFER_AVAILABLE
+
+if IS_FLASHINFER_AVAILABLE:
+    from flashinfer.sampling import chain_speculative_sampling, top_k_top_p_sampling_from_logits
+else:
+    chain_speculative_sampling = None
+    top_k_top_p_sampling_from_logits = None
 
 
 def forward_native(
@@ -92,6 +99,74 @@ def sampling_batch_spec_dec_one_model(
     """
     logits = apply_temperature(logits, temperatures)
     if use_flashinfer:
+        if top_k_top_p_sampling_from_logits is None:
+            raise RuntimeError("FlashInfer sampling requested but flashinfer is unavailable")
         return top_k_top_p_sampling_from_logits(logits, top_k, top_p, seed=seed, offset=offset)
     random_sampled = forward_native(logits, top_k, top_p)
     return random_sampled
+
+
+def compute_probs_from_logits(
+    logits: torch.Tensor,
+    temperatures: torch.Tensor,
+    top_k: Optional[torch.Tensor],
+    top_p: Optional[torch.Tensor],
+    skip_temperature: bool = False,
+) -> torch.Tensor:
+    """
+    Compute probabilities from logits with temperature, top-k, and top-p applied.
+    """
+    if logits.is_cuda:
+        return torch.ops.trtllm.compute_probs_from_logits_op(
+            logits, temperatures, top_k, top_p, skip_temperature
+        )
+
+    if not skip_temperature:
+        logits = apply_temperature(logits, temperatures)
+    logits = apply_top_k_top_p(logits, top_k, top_p)
+    probs = logits.softmax(dim=-1, dtype=torch.float32)
+
+    # Greedy rows should remain exactly one-hot so rejection sampling does not
+    # spuriously reject numerically-near argmax tokens.
+    greedy_temp_threshold = 1e-4
+    is_greedy = temperatures <= greedy_temp_threshold
+    argmax_ids = logits.argmax(dim=-1, keepdim=True)
+    one_hot = torch.zeros_like(probs).scatter_(1, argmax_ids, 1.0)
+    return torch.where(is_greedy.unsqueeze(1), one_hot, probs)
+
+
+def rejection_sampling_one_model(
+    draft_probs: torch.Tensor,
+    draft_token_ids: torch.Tensor,
+    target_probs: torch.Tensor,
+    deterministic: bool = True,
+    seed: Optional[int] = None,
+    offset: Optional[int] = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    CUDA-graph compatible rejection sampling for one-model speculative decoding.
+    """
+    batch_size = draft_token_ids.shape[0]
+    device = draft_token_ids.device
+
+    output_accepted_token_num = torch.zeros(batch_size, dtype=torch.int32, device=device)
+    output_emitted_draft_token_num = torch.zeros(batch_size, dtype=torch.int32, device=device)
+
+    if chain_speculative_sampling is None:
+        raise RuntimeError(
+            "Rejection sampling for one-model speculative decoding requires flashinfer"
+        )
+
+    accepted_tokens, _, output_emitted_draft_token_num = chain_speculative_sampling(
+        draft_probs,
+        draft_token_ids,
+        target_probs,
+        maybe_output_accepted_token_num=output_accepted_token_num,
+        maybe_output_emitted_draft_token_num=output_emitted_draft_token_num,
+        deterministic=deterministic,
+        generator=None,
+        seed=seed,
+        offset=offset,
+    )
+
+    return accepted_tokens, output_emitted_draft_token_num + 1

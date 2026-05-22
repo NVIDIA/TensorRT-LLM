@@ -45,7 +45,8 @@ from tensorrt_llm.media.encoding import image_to_bytes
 from tensorrt_llm.metrics.collector import MetricsCollector
 from tensorrt_llm.sampling_params import GuidedDecodingParams
 from tensorrt_llm.serve.chat_utils import (load_chat_template,
-                                           parse_chat_messages_coroutines)
+                                           parse_chat_messages_coroutines,
+                                           resolve_top_level_model_type)
 from tensorrt_llm.serve.cluster_storage import create_cluster_storage_client
 from tensorrt_llm.serve.disagg_auto_scaling import DisaggClusterWorker
 from tensorrt_llm.serve.metadata_server import create_metadata_server
@@ -261,7 +262,6 @@ class OpenAIServer(_VideoRoutesMixin):
                 self.disagg_cluster_worker = DisaggClusterWorker(
                     self.server_role, self.host, self.port,
                     self.disagg_cluster_config, self.disagg_cluster_storage)
-                await self.disagg_cluster_worker.register_worker()
 
             # VisualGen has no args
             if not isinstance(self.generator, VisualGen):
@@ -293,7 +293,6 @@ class OpenAIServer(_VideoRoutesMixin):
                     logger.info(
                         "Started background iteration stats collector task")
 
-            # terminate rank0 worker
             yield
 
             # Stop background iteration stats collector
@@ -388,10 +387,17 @@ class OpenAIServer(_VideoRoutesMixin):
         if disable_harmony or self.model_config is None:
             self.use_harmony = False
         else:
-            self.use_harmony = (self.model_config.model_type == "gpt_oss")
+            self.use_harmony = (type(self.model_config).model_type == "gpt_oss")
 
         self.tool_call_id_type = "random"  # default tool call id type is random
         if self.model_config is not None:
+            # NOTE: Use the instance-level ``model_type`` (JSON-derived) here, not
+            # ``type(cfg).model_type``. ``kimi_k2`` / ``deepseek_v32`` are aliases
+            # registered in ``_CONFIG_REGISTRY`` (config_utils.py) that reuse
+            # ``DeepseekV3Config``, whose class-level ``model_type`` is ``"deepseek_v3"``.
+            # Only the JSON ``model_type`` distinguishes these variants. Other call
+            # sites that consult multimodal/chat-template registries keyed on the
+            # canonical class attribute should keep using ``type(cfg).model_type``.
             if self.model_config.model_type == "kimi_k2":
                 self.tool_call_id_type = "kimi_k2"
             elif self.model_config.model_type == "deepseek_v32":
@@ -1172,7 +1178,7 @@ class OpenAIServer(_VideoRoutesMixin):
                 prompt = request.prompt_token_ids
             else:
                 prompt: str = apply_chat_template(
-                    model_type=self.model_config.model_type,
+                    model_type=resolve_top_level_model_type(self.model_config),
                     tokenizer=self.tokenizer,
                     processor=self.processor,
                     conversation=conversation,
@@ -1322,7 +1328,7 @@ class OpenAIServer(_VideoRoutesMixin):
                 prompt = request.prompt_token_ids
             else:
                 prompt: str = apply_chat_template(
-                    model_type=self.model_config.model_type,
+                    model_type=resolve_top_level_model_type(self.model_config),
                     tokenizer=self.tokenizer,
                     processor=self.processor,
                     conversation=conversation,
@@ -1953,4 +1959,17 @@ class OpenAIServer(_VideoRoutesMixin):
                                 port=port,
                                 log_level="info",
                                 timeout_keep_alive=TIMEOUT_KEEP_ALIVE)
-        await uvicorn.Server(config).serve(sockets=sockets)
+        server = uvicorn.Server(config)
+
+        async def _register_after_serving():
+            while not server.started:
+                await asyncio.sleep(0.1)
+            if self.disagg_cluster_worker:
+                try:
+                    await self.disagg_cluster_worker.register_worker()
+                except Exception as e:
+                    logger.error(f"Worker registration failed: {e}")
+                    server.should_exit = True
+
+        asyncio.create_task(_register_after_serving())
+        await server.serve(sockets=sockets)

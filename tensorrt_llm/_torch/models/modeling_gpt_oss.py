@@ -80,6 +80,12 @@ class AttentionBlock(Attention):
             use_custom_cublas_mm=use_custom_cublas_mm,
         )
 
+        if self.attn_backend != "TRTLLM":
+            raise ValueError(
+                f"GPT-OSS model uses attention sinks, which are only supported "
+                f"with attn_backend='TRTLLM'. Current backend: {self.attn_backend}."
+            )
+
         # Only apply sliding window to every other layer
         self.sliding_window = pretrained_config.sliding_window if layer_idx % 2 == 0 else None
 

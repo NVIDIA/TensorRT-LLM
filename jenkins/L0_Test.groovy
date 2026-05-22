@@ -2,7 +2,6 @@
 
 import java.lang.InterruptedException
 import groovy.transform.Field
-import groovy.json.JsonSlurper
 import groovy.json.JsonOutput
 import com.nvidia.bloom.KubernetesManager
 import com.nvidia.bloom.Constants
@@ -105,70 +104,15 @@ REQUIRED_OPEN_DRIVER_TYPES = ["b100-ts2", "rtx-5080", "rtx-5090", "rtx-pro-6000"
 // GPU types that don't support dynamic driver flashing
 REQUIRED_NO_DRIVER_TYPES = ["dgx-h100", "dgx-h200", "gh200", "gb10x"]
 
-// Infrastructure failure patterns that warrant automatic Slurm job retry.
-// Matched case-insensitively against exception toString() messages (including cause chain).
-SLURM_INFRA_FAILURE_PATTERNS = [
-    // Jenkins remoting channel failures
-    "channel is closing down or has closed down",
-    "ChannelClosedException",
-    "ClosedChannelException",
-    "RequestAbortedException",
-    "Connection was broken",
-    "marked offline",
-    // Jenkins agent startup failures (durable-task plugin)
-    "process apparently never started",
-    "wrapper script does not seem to be touching the log file",
-    // Slurm job externally killed (from SlurmConfig.checkJobStatus)
-    "job is no longer active",
-    // Network/SSH failures (also in SLURM_INFRA_SINGLE_RETRY_PATTERNS for retry cap)
-    "No route to host",
-    "Permission denied, please try again",
-    // K8s pod eviction (matches "Reason: Evicted" from kubelet message)
-    "Reason: Evicted",
-]
-
-// Patterns that should retry at most once (not the full SLURM_INFRA_RETRY_MAX).
-// These may indicate persistent problems where multiple retries waste resources.
-// NOTE: Entries here must also appear in SLURM_INFRA_FAILURE_PATTERNS to be
-// detected as infrastructure failures in the first place.
-SLURM_INFRA_SINGLE_RETRY_PATTERNS = [
-    "CANCELLED",
-    "DUE TO TIME LIMIT",
-    "Permission denied, please try again",
-]
-
-// Maximum number of retries for infrastructure failures (total attempts = SLURM_INFRA_RETRY_MAX + 1)
+// Maximum SLURM infra-failure retries (total attempts = SLURM_INFRA_RETRY_MAX + 1).
+// Recognised failure patterns are tagged with scope=SLURM or BOTH in the
+// shared-lib PATTERN_CATALOG.
 SLURM_INFRA_RETRY_MAX = 2
 
-// Infrastructure failure patterns specific to K8s test pods (the path that does
-// not go through SLURM). Passed as `extraInfraPatterns` to classifyInfraFailure
-// from the runLLMTestlistOnPlatform retry loop. SLURM_INFRA_FAILURE_PATTERNS
-// already covers shared symptoms (ChannelClosedException, marked offline,
-// Reason: Evicted, etc.) and is always checked first.
-K8S_INFRA_FAILURE_PATTERNS = [
-    // Image pull / pod startup
-    "ImagePullBackOff",
-    "ErrImagePull",
-    // Container runtime hiccups
-    "OCI runtime exec failed",
-    // Pod / node lifecycle
-    "OOMKilled",
-    "node status is not ready",
-    // JNLP agent disconnect (trailing space narrows the match)
-    "Cannot contact ",
-    // JNLP / HTTP-handshake transient (broad string -- single-retry-only below)
-    "Connection failed",
-]
-
-// K8s patterns capped at a single retry. Mirrors the SLURM list's caveat:
-// every entry here must also appear in K8S_INFRA_FAILURE_PATTERNS.
-K8S_INFRA_SINGLE_RETRY_PATTERNS = [
-    "OOMKilled",        // resource shortage; multi-retry rarely helps
-    "Connection failed", // short string; cap to bound false-positive cost
-]
-
+// Maximum K8s infra-failure retries (total attempts = K8S_INFRA_RETRY_MAX + 1).
 // Kept distinct from SLURM_INFRA_RETRY_MAX so the two paths can be tuned
-// independently as production telemetry comes in.
+// independently as production telemetry comes in. Patterns tagged scope=K8S
+// or BOTH in the shared-lib PATTERN_CATALOG.
 K8S_INFRA_RETRY_MAX = 2
 
 // Typed-exception hierarchy and FailureClassifier (PATTERN_CATALOG, classify(),
@@ -187,61 +131,6 @@ ENABLE_NGC_DEVEL_IMAGE_TEST = params.enableNgcDevelImageTest ?: false
 ENABLE_NGC_RELEASE_IMAGE_TEST = params.enableNgcReleaseImageTest ?: false
 
 COMMON_SSH_OPTIONS = "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o TCPKeepAlive=no -o ServerAliveInterval=30 -o ServerAliveCountMax=20"
-
-/**
- * Checks if an exception represents a transient infrastructure failure
- * that warrants retrying.
- *
- * Walks the exception cause chain to catch wrapped exceptions (e.g.,
- * AbortException wrapping ChannelClosedException).
- *
- * Callers may pass additional pattern lists (e.g., K8S_INFRA_FAILURE_PATTERNS)
- * to extend classification for path-specific symptoms without disturbing the
- * SLURM defaults.
- *
- * @param ex The caught exception
- * @param extraInfraPatterns Additional patterns appended to the infra-failure list
- * @param extraSingleRetryPatterns Additional patterns appended to the single-retry list
- * @return A map with keys:
- *   - isInfraFailure (boolean): true if this is a retryable infra failure
- *   - isSingleRetryOnly (boolean): true if this pattern should only retry once
- *   - matchedPattern (String): the pattern that matched, for logging
- */
-def classifyInfraFailure(Exception ex, List extraInfraPatterns=[], List extraSingleRetryPatterns=[]) {
-    def result = [isInfraFailure: false, isSingleRetryOnly: false, matchedPattern: ""]
-
-    // Build the full exception text by walking the cause chain
-    def exceptionText = ""
-    def current = ex
-    while (current != null) {
-        exceptionText += " " + current.toString()
-        current = current.cause
-    }
-    def lowerText = exceptionText.toLowerCase()
-
-    // Check against infrastructure failure patterns (SLURM defaults + caller extras)
-    for (pattern in (SLURM_INFRA_FAILURE_PATTERNS + extraInfraPatterns)) {
-        if (lowerText.contains(pattern.toLowerCase())) {
-            result.isInfraFailure = true
-            result.matchedPattern = pattern
-            break
-        }
-    }
-
-    if (!result.isInfraFailure) {
-        return result
-    }
-
-    // Check if this is a single-retry-only pattern
-    for (pattern in (SLURM_INFRA_SINGLE_RETRY_PATTERNS + extraSingleRetryPatterns)) {
-        if (lowerText.contains(pattern.toLowerCase())) {
-            result.isSingleRetryOnly = true
-            break
-        }
-    }
-
-    return result
-}
 
 def scpFromRemoteCmd(Map remote, String remotePath, String localPath) {
     String portOpt = remote.port ? "-P ${remote.port} " : ""
@@ -762,9 +651,33 @@ def runLLMTestlistWithAgent(pipeline, platform, testList, config=VANILLA_CONFIG,
                     } catch (InterruptedException e) {
                         throw e
                     } catch (Exception e) {
-                        // If the exception is about job being inactive, enrich it with log path
-                        if (e.message.contains("is no longer active")) {
-                            throw new Exception("${e.message}. Check SLURM logs at /home/svc_tensorrt/slurm-logs/slurm-${slurmJobID}-${nodeName}.out on ${cluster.host}")
+                        // If the exception is about job being inactive, throw a typed
+                        // InfraFailure(SLURM) so downstream consumers route via instanceof
+                        // rather than substring matching the catalog. The "<typed:..."
+                        // marker keeps the [INFRA-RETRY] log line distinguishable from
+                        // catalog-matched fallbacks.
+                        //
+                        // Critical for nested-retry correctness: the SLURM-scoped typed
+                        // throw is rejected by classify() at the OUTER K8s pod-launch
+                        // retry's scope guard (see classify() scope-mismatch branch).
+                        // That prevents the K8s outer from re-running a budget that the
+                        // inner SLURM retry already exhausted. End-to-end trace:
+                        //   1. SLURM job goes inactive while running.
+                        //   2. SlurmConfig.checkJobStatus() throws plain Exception with
+                        //      message "...is no longer active...".
+                        //   3. This catch wraps it as InfraFailure(TRANSIENT, SLURM).
+                        //   4. Inner runLLMTestlistOnSlurm retry catches, classifies via
+                        //      classify(scope=SLURM): instanceof InfraFailure with scope=SLURM
+                        //      passes through; consumer retries up to SLURM_INFRA_RETRY_MAX.
+                        //   5. If exhausted, the typed InfraFailure(SLURM) bubbles out of
+                        //      the inner SLURM retry into the outer K8s pod-launch retry.
+                        //   6. Outer classify(scope=K8S) sees typed InfraFailure with
+                        //      scope=SLURM != K8S, wraps as UserFailure -> outer rethrows
+                        //      without retry. No double-budget consumption.
+                        if (e.message?.contains("is no longer active")) {
+                            throw new InfraFailure(
+                                "${e.message}. Check SLURM logs at /home/svc_tensorrt/slurm-logs/slurm-${slurmJobID}-${nodeName}.out on ${cluster.host}",
+                                e, InfraFailure.TRANSIENT, InfraFailure.SLURM, "<typed:slurm-job-inactive>")
                         }
                         // Otherwise, log the error but continue (SSH might be temporarily unavailable)
                         pipeline.echo("Warning: Could not check SLURM job status: ${e.message}")
@@ -862,7 +775,7 @@ def executeLLMTestOnSlurm(pipeline, platform, testList, config=VANILLA_CONFIG, p
     runner {
         // TODO: refactor the finallyRunner to reuse within slurm or nonslurm job.
         cacheErrorAndUploadResult(stageName, {
-            runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config, perfMode, stageName, splitId, splits, skipInstallWheel, cpver)
+            runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config, perfMode, stageName, splitId, splits, skipInstallWheel, cpver, false, postTag)
         }, {
             // If the execution test list is null, remove the test result xml
             sh """
@@ -1117,7 +1030,7 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
 
                 // Add passed test list from previous pipeline run to the waives.txt
                 if (testFilter[(REUSE_TEST)] != false) {
-                    reusePassedTestResults(llmSrcLocal, stageName, "${llmSrcLocal}/tests/integration/test_lists/waives.txt")
+                    reusePassedTestResults(llmSrcLocal, stageName, "${llmSrcLocal}/tests/integration/test_lists/waives.txt", postTag)
                 }
 
                 Utils.copyFileToRemoteHost(
@@ -1426,7 +1339,12 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     # Wait until Slurm job is done
                     while true; do
                         # Use --allocations to ensure we match the exact job ID and not job steps (like 123.batch, 123.0)
-                        STATUS=\$(sacct -j \$jobId --format=State -Pn --allocations)
+                        # Tolerate transient sacct failures (e.g. slurmdbd unreachable) so the tracker survives controller blips.
+                        if ! STATUS=\$(sacct -j \$jobId --format=State -Pn --allocations 2>&1); then
+                            echo "Warning: sacct failed for job \$jobId: \$STATUS"
+                            sleep 60
+                            continue
+                        fi
 
                         if [[ -z \$STATUS || \$STATUS == "RUNNING" || \$STATUS == "PENDING" || \$STATUS == "CONFIGURING" ]]; then
                             echo "Slurm job \$jobId state: \${STATUS:-UNKNOWN}"
@@ -1548,7 +1466,7 @@ def _cbtsMaybeCollapseSplits(stageName, splitId, splits) {
     return [skip: false, splits: 1, splitId: 1]
 }
 
-def runLLMTestlistOnSlurm(pipeline, platform, testList, config=VANILLA_CONFIG, perfMode=false, stageName="Undefined", splitId=1, splits=1, gpuCount=1, nodeCount=1, runWithSbatch=false, skipInstallWheel=false, cpver="cp312")
+def runLLMTestlistOnSlurm(pipeline, platform, testList, config=VANILLA_CONFIG, perfMode=false, stageName="Undefined", splitId=1, splits=1, gpuCount=1, nodeCount=1, runWithSbatch=false, skipInstallWheel=false, cpver="cp312", String outerAttemptTag="")
 {
   def collapse = _cbtsMaybeCollapseSplits(stageName, splitId, splits)
   if (collapse.skip) {
@@ -1573,7 +1491,14 @@ def runLLMTestlistOnSlurm(pipeline, platform, testList, config=VANILLA_CONFIG, p
       // clobbered and the ensureStageResultNotUploaded guard does not trip on
       // the retry. First attempt keeps the canonical unsuffixed name so existing
       // downstream consumers (dashboards, the JIRA bot, etc.) are unaffected.
-      def postTag = (attempt == 1) ? "" : "-attempt-${attempt}"
+      //
+      // outerAttemptTag is the K8s outer dispatcher pod's tag ("" for outer
+      // attempt 1, "-pod-${N}" for outer attempt N>=2). Prefixing the inner
+      // postTag with it ensures the new dispatcher pod's inner attempt 1
+      // upload doesn't collide with the dead pod's already-recorded upload
+      // in GlobalState.uploadResultStageNames.
+      def innerSuffix = (attempt == 1) ? "" : "-attempt-${attempt}"
+      def postTag = "${outerAttemptTag}${innerSuffix}"
 
       if (nodeCount > 1 || runWithSbatch) {
         runLLMTestlistWithSbatch(pipeline, platform, testList, config, perfMode, stageName, splitId, splits, gpuCount, nodeCount, skipInstallWheel, cpver, postTag)
@@ -1604,6 +1529,11 @@ def runLLMTestlistOnSlurm(pipeline, platform, testList, config=VANILLA_CONFIG, p
       if (attempt > effectiveMax) {
         echo "[INFRA-RETRY] ${stageName}: Infrastructure failure (${c.detectedPattern}) " +
              "but max retries (${effectiveMax}) exhausted after ${attempt} attempts. Failing."
+        throw e
+      }
+      if (!hasBudgetForInfraRetry(pipeline, stageName, InfraFailure.SLURM, c, attempt, effectiveMax, 60L * 1000L, true)) {
+        echo "[INFRA-RETRY] ${stageName}: Infrastructure failure (${c.detectedPattern}) is retryable, " +
+             "but remaining CI timeout budget is too small for another SLURM attempt. Failing without retry."
         throw e
       }
 
@@ -1719,6 +1649,8 @@ def globalVars = [
 
 class GlobalState {
     static def uploadResultStageNames = []
+    static def stageAttemptEstimateMs = [:]
+    static def stageAttemptEstimateDetails = [:]
 
     // HOST_NODE_NAME to starting port section map
     // This map maintains the next available starting port for each host node
@@ -1731,6 +1663,83 @@ class GlobalState {
     static final int BASE_PORT = 10000           // Base starting port
     static final int PORT_SECTION_SIZE = 1000    // Number of ports per section/stage
     static final int MAX_PORT = 32000            // Maximum port number to avoid system ports
+}
+
+def recordRenderedStageAttemptEstimate(pipeline, String llmSrc, String testListPath, String stageName, def renderedTestCount)
+{
+    def estimate = trtllm_utils.estimateRenderedStageAttemptMillis(pipeline, llmSrc, testListPath, stageName, renderedTestCount)
+    if (estimate.error) {
+        echo "[CI-BUDGET] ${stageName}: failed to read .test_durations; using count-based estimate. Error: ${estimate.error}"
+    }
+
+    GlobalState.stageAttemptEstimateMs[stageName] = estimate.estimatedMs
+    GlobalState.stageAttemptEstimateDetails[stageName] = [
+        renderedCount: estimate.renderedCount,
+        knownCount: estimate.knownCount,
+        unknownCount: estimate.unknownCount,
+    ]
+    echo "[CI-BUDGET] ${stageName}: recorded test runtime estimate " +
+         "${trtllm_utils.formatCiBudgetMillis(estimate.estimatedMs)} " +
+         "(rendered=${estimate.renderedCount}, known=${estimate.knownCount}, unknown=${estimate.unknownCount})"
+}
+
+long estimateStageRetryRuntimeMs(String stageName, String scope)
+{
+    Long testEstimateValue = trtllm_utils.parseCiBudgetLong(GlobalState.stageAttemptEstimateMs[stageName])
+    long testEstimateMs = testEstimateValue != null ? testEstimateValue : 0L
+    if (testEstimateMs > 0L) {
+        long overheadMs = scope == InfraFailure.SLURM ? 45L * 60L * 1000L : 30L * 60L * 1000L
+        return testEstimateMs + overheadMs
+    }
+    return scope == InfraFailure.SLURM ? 4L * 60L * 60L * 1000L : 2L * 60L * 60L * 1000L
+}
+
+long retrySafetyMarginMs(String scope)
+{
+    return scope == InfraFailure.SLURM ? 20L * 60L * 1000L : 15L * 60L * 1000L
+}
+
+int retryMaxForFailure(String scope, InfraFailure failure)
+{
+    if (failure.severity == InfraFailure.PERSISTENT) {
+        return 1
+    }
+    return scope == InfraFailure.SLURM ? SLURM_INFRA_RETRY_MAX : K8S_INFRA_RETRY_MAX
+}
+
+boolean hasBudgetForInfraRetry(def pipeline, String stageName, String scope, InfraFailure failure, int attempt, int effectiveMax, long backoffMs, boolean logDecision)
+{
+    if (attempt > effectiveMax) {
+        return false
+    }
+    long estimateMs = estimateStageRetryRuntimeMs(stageName, scope)
+    long safetyMs = retrySafetyMarginMs(scope)
+    return trtllm_utils.canSpendCiBudget(pipeline, [
+        globalVars: globalVars,
+        label: "infra-retry:${scope}:${stageName}:attempt-${attempt + 1}",
+        estimateMs: estimateMs,
+        backoffMs: backoffMs,
+        safetyMs: safetyMs,
+        logDecision: logDecision,
+    ])
+}
+
+boolean retryContextAllowsRetry(def pipeline, Map retryContext, Throwable error, boolean logDecision=false)
+{
+    if (retryContext == null || error == null) {
+        return false
+    }
+    String scope = retryContext.scope ?: InfraFailure.K8S
+    def classified = FailureClassifier.classify(error, scope)
+    if (!(classified instanceof InfraFailure)) {
+        return false
+    }
+    Long parsedAttempt = trtllm_utils.parseCiBudgetLong(retryContext.attempt)
+    int attempt = parsedAttempt != null ? parsedAttempt as int : 1
+    int effectiveMax = retryMaxForFailure(scope, classified)
+    Long parsedBackoffMs = trtllm_utils.parseCiBudgetLong(retryContext.backoffMs)
+    long backoffMs = parsedBackoffMs != null ? parsedBackoffMs : 60L * 1000L
+    return hasBudgetForInfraRetry(pipeline, retryContext.stageName ?: "Unknown", scope, classified, attempt, effectiveMax, backoffMs, logDecision)
 }
 
 /**
@@ -1776,7 +1785,7 @@ def getHostNodeName() {
     ''', returnStdout: true).trim()
 }
 
-def cacheErrorAndUploadResult(stageName, taskRunner, finallyRunner, noResultIfSuccess=false, postTag="", boolean isFinalAttempt=true)
+def cacheErrorAndUploadResult(stageName, taskRunner, finallyRunner, noResultIfSuccess=false, postTag="", boolean isFinalAttempt=true, Map retryContext=null)
 {
     checkStageName([stageName])
     def Boolean stageIsInterrupted = false
@@ -1817,11 +1826,16 @@ def cacheErrorAndUploadResult(stageName, taskRunner, finallyRunner, noResultIfSu
             // (on a fresh pod) cannot remove. The tar artifact is still uploaded
             // for forensics; only the in-build test reporting is gated.
             boolean suppressTestReporting = false
-            if (!isFinalAttempt && stageIsFailed && caughtError != null) {
-                def c = FailureClassifier.classify(caughtError, InfraFailure.K8S)
-                if (c instanceof InfraFailure) {
+            if (stageIsFailed && caughtError != null) {
+                if (retryContext != null) {
+                    suppressTestReporting = retryContextAllowsRetry(null, retryContext, caughtError, false)
+                } else if (!isFinalAttempt) {
+                    def c = FailureClassifier.classify(caughtError, InfraFailure.K8S)
+                    suppressTestReporting = c instanceof InfraFailure
+                }
+                if (suppressTestReporting) {
                     suppressTestReporting = true
-                    echo "[INFRA-RETRY] ${stageName}${postTag}: suppressing synthetic stage-fail XML and junit() on intermediate retryable infra failure (${c.detectedPattern})"
+                    echo "[INFRA-RETRY] ${stageName}${postTag}: suppressing synthetic stage-fail XML and junit() because a retry is still planned"
                 }
             }
 
@@ -2473,6 +2487,7 @@ def renderTestDB(pipeline, testContext, llmSrc, stageName, preDefinedMakoOpts=nu
     def testDBLabel = (cbts != null && cbts.test_db_dir_override) ? "CBTS-narrowed [${cbts.scope}]" : "source"
     echo "renderTestDB: stage=${stageName} context=${testContext} test-db=${testDBLabel} dir=${testDBPath} -> ${testCount} tests"
     sh(script: "cat ${testList}")
+    recordRenderedStageAttemptEstimate(pipeline, llmSrc, testList, stageName, testCount)
 
     return testList
 }
@@ -2774,23 +2789,110 @@ def mergeWaivesTxt(pipeline, llmSrc, stageName) {
     }
 }
 
-def reusePassedTestResults(llmSrc, stageName, waivesTxt) {
+/**
+ * Append passes that previously succeeded for this commit + stage to the
+ * stage's waives.txt as SKIPs, so the upcoming pytest run skips them.
+ *
+ * Two sources are merged:
+ *
+ *  1. OpenSearch records of prior pipeline runs for the same commit and
+ *     stage (the historical mechanism). Populated only after a pipeline
+ *     completes -- has nothing to say about the current run.
+ *
+ *  2. Tarballs uploaded by earlier attempts of the *current* build, when
+ *     the infra-failure retry loop has fired. The current run's attempt 1
+ *     uploads its (partial) results before the retry kicks off; this
+ *     function downloads them and extracts passes via test_rerun.py's
+ *     extract_passed_tests mode. Closes the gap where a retry would
+ *     otherwise re-run every test that already passed pre-failure.
+ *
+ * @param llmSrc      Local TRT-LLM source root.
+ * @param stageName   Stage name; both the OpenSearch query key and the
+ *                    Artifactory artifact prefix (`results-${stageName}*`).
+ * @param waivesTxt   Path to the stage's waives.txt; passes are appended
+ *                    here with reason "SKIP (Reused from previous pipeline)".
+ * @param postTag     This attempt's full tar suffix (e.g. ""
+ *                    on attempt 1, "-attempt-2" on the first retry,
+ *                    "-SubJob-RunTest-attempt-2" for a retried sub-job).
+ *                    Used by priorAttemptTags() to enumerate earlier
+ *                    attempts in this build.
+ */
+def reusePassedTestResults(llmSrc, stageName, waivesTxt, String postTag = "") {
     try {
-        // Get passed test list from open search
-        def passedTestListFile = "${WORKSPACE}/${stageName}/passed_test_list.txt"
+        def reusedTests = []
+        def workDir = "${WORKSPACE}/${stageName}"
+        sh "mkdir -p ${workDir}"
+
+        // 1. OpenSearch lookup -- tests that PASSED in a previous pipeline run
+        //    for this commit + stage.
+        def passedTestListFile = "${workDir}/passed_test_list.txt"
         sh """
             python3 ${llmSrc}/jenkins/scripts/open_search_query.py \
             --commit-id ${env.gitlabCommit} \
             --stage-name ${stageName} \
             --output-file ${passedTestListFile}
         """
+        if (fileExists(passedTestListFile)) {
+            reusedTests += readFile(file: passedTestListFile).readLines().collect { it.trim() }.findAll { it }
+        }
 
-        def passedTestList = readFile(file: passedTestListFile).readLines()
-        def reusedTests = passedTestList.collect { test -> test.trim() }
+        // 2. Prior-attempt recovery -- tests that PASSED in an earlier attempt
+        //    of THIS pipeline run before infra retry fired. Only runs if postTag
+        //    decodes as a retry attempt (matches "...-attempt-N").
+        def priorTags = priorAttemptTags(postTag)
+        if (!priorTags.isEmpty()) {
+            def priorXmls = []
+            priorTags.each { priorTag ->
+                def tarName = "results-${stageName}${priorTag}.tar.gz"
+                def tarUrl = "https://urm.nvidia.com/artifactory/${UPLOAD_PATH}/test-results/${tarName}"
+                def priorDir = "${workDir}/prior${priorTag.replace('-', '_')}"
+                sh "mkdir -p ${priorDir}"
+                // Probe with HEAD so we can distinguish "this prior attempt never
+                // uploaded a tarball" (HTTP 404, expected when an attempt died
+                // before its finally block ran) from real errors (auth, 5xx,
+                // network). Only 404 is benign; anything else fails the build
+                // so silent skips don't mask a configuration regression.
+                def httpStatus = sh(returnStdout: true,
+                                    script: "curl -sS -o /dev/null -w '%{http_code}' --connect-timeout 10 --max-time 30 '${tarUrl}'").trim()
+                if (httpStatus == '404') {
+                    echo "Prior attempt artifact ${tarName} not present (HTTP 404); skipping"
+                    return
+                }
+                if (httpStatus != '200') {
+                    error "Probing prior attempt artifact ${tarName} returned HTTP ${httpStatus} (expected 200 or 404)"
+                }
+                sh "cd ${priorDir} && wget -nv -nc '${tarUrl}'"
+                sh "cd ${priorDir} && tar -xzf ${tarName}"
+                // results.xml may live at ${stageName}/results.xml inside the
+                // tar, or at the tar's root depending on how it was packaged.
+                // Scan both.
+                def xmlFiles = sh(returnStdout: true,
+                                  script: "find ${priorDir} -maxdepth 4 -name 'results*.xml' 2>/dev/null | tr '\\n' ',' | sed 's/,\$//'").trim()
+                if (xmlFiles) {
+                    priorXmls += xmlFiles.split(',') as List
+                }
+            }
+            if (!priorXmls.isEmpty()) {
+                def priorPassedFile = "${workDir}/prior_attempt_passed.txt"
+                sh """
+                    python3 ${llmSrc}/jenkins/scripts/test_rerun.py \
+                    extract_passed_tests \
+                    --output-file ${priorPassedFile} \
+                    --input-files ${priorXmls.join(',')}
+                """
+                if (fileExists(priorPassedFile)) {
+                    def priorPasses = readFile(file: priorPassedFile).readLines().collect { it.trim() }.findAll { it }
+                    if (!priorPasses.isEmpty()) {
+                        echo "Reusing ${priorPasses.size()} passed test(s) from prior attempt(s): ${priorTags}"
+                    }
+                    reusedTests += priorPasses
+                }
+            }
+        }
 
-        // Append reused tests to waives.txt
+        // 3. Dedupe and append everything to waives.txt as SKIPs.
+        reusedTests = reusedTests.unique()
         if (reusedTests.size() > 0) {
-            // Build the content to append
             def reusedTestsContent = reusedTests.collect { test ->
                 "${test} SKIP (Reused from previous pipeline)"
             }.join('\n')
@@ -2813,7 +2915,89 @@ REUSED_TESTS_EOF
     }
 }
 
-def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CONFIG, perfMode=false, stageName="Undefined", splitId=1, splits=1, skipInstallWheel=false, cpver="cp312", typeCheck=false)
+/**
+ * Decode a postTag into the postTags used by prior attempts of the same
+ * stage in this build.
+ *
+ * The retry runners compose postTag from two retry layers:
+ *   - runKubernetesPodWithInfraRetry (outer K8s pod retry) contributes
+ *     ``"-pod-${P}"`` for outer attempt P>=2 (and ``""`` for P=1).
+ *   - runLLMTestlistOnSlurm (inner SLURM retry) appends ``"-attempt-${I}"``
+ *     for inner attempt I>=2 (and ``""`` for I=1).
+ * The two suffixes nest: full postTag = ``${base}${outerTag}${innerSuffix}``
+ * where base is the caller-supplied prefix (e.g. ``""`` or
+ * ``"-SubJob-RunTest"``). The ``-pod-`` and ``-attempt-`` separators are
+ * distinct so the nested form is unambiguous.
+ *
+ * This function inverts that composition to enumerate the postTags of
+ * earlier attempts so reusePassedTestResults() can locate their uploaded
+ * tarballs.
+ *
+ * Returns an empty list when ``postTag`` does not encode a retry — either
+ * attempt 1 of attempt 1 (``postTag == ""``), or a caller-supplied tag that
+ * never went through the retry loop (e.g. ``"-SubJob-RunTest"``).
+ *
+ * For nested cases we don't know how many inner attempts each prior outer
+ * pod attempt completed, so we over-enumerate up to SLURM_INFRA_RETRY_MAX+1;
+ * the HTTP probe in reusePassedTestResults handles 404 for absent tarballs.
+ *
+ * Examples (with default SLURM_INFRA_RETRY_MAX=2):
+ *
+ *   ""                            -> []
+ *   "-attempt-2"                  -> [""]
+ *   "-attempt-3"                  -> ["", "-attempt-2"]
+ *   "-pod-2"                      -> ["", "-attempt-2", "-attempt-3"]
+ *   "-pod-2-attempt-2"            -> ["", "-attempt-2", "-attempt-3", "-pod-2"]
+ *   "-SubJob-RunTest"             -> []
+ *   "-SubJob-RunTest-pod-2"       -> ["-SubJob-RunTest", "-SubJob-RunTest-attempt-2", "-SubJob-RunTest-attempt-3"]
+ *
+ * @param postTag the current attempt's full tar suffix.
+ * @return List of postTag strings, ordered oldest-attempt-first.
+ */
+@NonCPS
+def priorAttemptTags(String postTag) {
+    if (!postTag) return []
+    // Peel "-attempt-N" suffix (inner SLURM retry counter) if present.
+    String remaining = postTag
+    Integer innerAttempt = null
+    def mInner = remaining =~ /^(.*)-attempt-(\d+)$/
+    if (mInner.matches()) {
+        innerAttempt = (mInner[0][2] as Integer)
+        remaining = mInner[0][1]
+    }
+    // Peel "-pod-P" suffix (outer K8s retry counter) if present.
+    Integer podAttempt = null
+    def mPod = remaining =~ /^(.*)-pod-(\d+)$/
+    if (mPod.matches()) {
+        podAttempt = (mPod[0][2] as Integer)
+        remaining = mPod[0][1]
+    }
+    String base = remaining
+    if (innerAttempt == null && podAttempt == null) return []   // no retry encoded
+    int outerN = podAttempt ?: 1
+    int innerN = innerAttempt ?: 1
+    int maxInner = SLURM_INFRA_RETRY_MAX + 1
+    def priors = []
+    // Earlier outer attempts (1..outerN-1) with all possible inner attempts.
+    for (int p = 1; p < outerN; p++) {
+        String podSuffix = (p == 1) ? "" : "-pod-${p}"
+        priors << "${base}${podSuffix}".toString()                          // inner attempt 1
+        for (int i = 2; i <= maxInner; i++) {
+            priors << "${base}${podSuffix}-attempt-${i}".toString()
+        }
+    }
+    // Current outer attempt's earlier inner attempts (1..innerN-1).
+    String thisPodSuffix = (outerN == 1) ? "" : "-pod-${outerN}"
+    if (innerN > 1) {
+        priors << "${base}${thisPodSuffix}".toString()                      // inner attempt 1
+        for (int i = 2; i < innerN; i++) {
+            priors << "${base}${thisPodSuffix}-attempt-${i}".toString()
+        }
+    }
+    return priors
+}
+
+def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CONFIG, perfMode=false, stageName="Undefined", splitId=1, splits=1, skipInstallWheel=false, cpver="cp312", typeCheck=false, String postTag="")
 {
     // Step 1: create LLM_ROOT dir and clean up the workspace
     def llmRootConfig = "${LLM_ROOT}${config}"
@@ -2970,7 +3154,7 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
 
         // Add passed test list from previous pipeline run to the waives.txt
         if (testFilter[(REUSE_TEST)] != false) {
-            reusePassedTestResults(llmSrc, stageName, "${llmSrc}/tests/integration/test_lists/waives.txt")
+            reusePassedTestResults(llmSrc, stageName, "${llmSrc}/tests/integration/test_lists/waives.txt", postTag)
         }
 
         // Process shard test list and create separate files for regular and isolate tests
@@ -3161,7 +3345,7 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
 // composed with an attempt tag by the helper) and `isFinalAttempt` (so this
 // function's `cacheErrorAndUploadResult` can suppress synthetic stage-fail XML
 // and junit() for intermediate retryable failures).
-def runLLMTestlistOnPlatform(pipeline, platform, testList, config=VANILLA_CONFIG, perfMode=false, stageName="Undefined", splitId=1, splits=1, skipInstallWheel=false, cpver="cp312", postTag="", typeCheck=false, boolean isFinalAttempt=true)
+def runLLMTestlistOnPlatform(pipeline, platform, testList, config=VANILLA_CONFIG, perfMode=false, stageName="Undefined", splitId=1, splits=1, skipInstallWheel=false, cpver="cp312", postTag="", typeCheck=false, boolean isFinalAttempt=true, Map retryContext=null)
 {
     def collapse = _cbtsMaybeCollapseSplits(stageName, splitId, splits)
     if (collapse.skip) {
@@ -3171,7 +3355,7 @@ def runLLMTestlistOnPlatform(pipeline, platform, testList, config=VANILLA_CONFIG
     splitId = collapse.splitId
 
     cacheErrorAndUploadResult(stageName, {
-        runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config, perfMode, stageName, splitId, splits, skipInstallWheel, cpver, typeCheck)
+        runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config, perfMode, stageName, splitId, splits, skipInstallWheel, cpver, typeCheck, postTag)
     }, {
         if (testFilter[(DEBUG_MODE)]) {
             try {
@@ -3208,7 +3392,7 @@ def runLLMTestlistOnPlatform(pipeline, platform, testList, config=VANILLA_CONFIG
         // Copy CPP test result
         sh "cp ${llmSrc}/cpp/build_backup/*.xml ${stageName} || true"
         sh "ls -al ${stageName}/"
-    }, false, postTag, isFinalAttempt)
+    }, false, postTag, isFinalAttempt, retryContext)
 }
 
 
@@ -3449,14 +3633,14 @@ def runInKubernetes(pipeline, podSpec, containerName)
     }
 }
 
-// Retry-aware K8s pod launcher. Mirrors the SLURM retry loop's classification,
-// budget, and backoff (K8S_INFRA_RETRY_MAX, K8S_INFRA_FAILURE_PATTERNS,
-// K8S_INFRA_SINGLE_RETRY_PATTERNS), but operates at the pod-launch level so
-// transient pod failures (ImagePullBackOff, eviction, OOMKilled, JNLP
-// disconnect, node NotReady) get a fresh pod on each retry rather than
+// Retry-aware K8s pod launcher. Mirrors the SLURM retry loop's classification
+// (classify(ex, InfraFailure.K8S)), budget (K8S_INFRA_RETRY_MAX), and backoff,
+// but operates at the pod-launch level so transient pod failures
+// (ImagePullBackOff, eviction, OOMKilled, JNLP disconnect, node NotReady) get
+// a fresh pod on each retry rather than
 // retrying the test body inside a dying pod.
 //
-// `runner` is invoked with `(attemptTag, isFinalAttempt)`. Callers append
+// `runner` is invoked with `(attemptTag, isFinalAttempt, retryContext)`. Callers append
 // `attemptTag` to any postTag they pass into cacheErrorAndUploadResult so each
 // attempt's tar and ensureStageResultNotUploaded guard key are unique;
 // `isFinalAttempt` lets cacheErrorAndUploadResult suppress synthetic stage-fail
@@ -3468,7 +3652,7 @@ def runKubernetesPodWithInfraRetry(pipeline, podSpec, containerName, String stag
     // DEBUG_MODE preserves the existing 2-hour-input human-inspection workflow
     // inside runLLMTestlistOnPlatform's finallyRunner: a single attempt only.
     if (testFilter[(DEBUG_MODE)]) {
-        trtllm_utils.launchKubernetesPod(pipeline, podSpec, containerName, { runner("", true) })
+        trtllm_utils.launchKubernetesPod(pipeline, podSpec, containerName, { runner("", true, null) })
         return
     }
 
@@ -3486,9 +3670,12 @@ def runKubernetesPodWithInfraRetry(pipeline, podSpec, containerName, String stag
             }
             // Attempt 1 keeps the caller-supplied postTag verbatim so the
             // canonical artifact name is unchanged for downstream consumers.
-            // Retries append "-attempt-N" to dodge the upload-once guard and
-            // preserve every attempt's tarball in Artifactory.
-            def attemptTag = (attempt == 1) ? "" : "-attempt-${attempt}"
+            // Retries append "-pod-N" to dodge the upload-once guard and
+            // preserve every attempt's tarball in Artifactory. The "-pod-"
+            // separator is distinct from the inner SLURM retry's "-attempt-"
+            // suffix so the two nest unambiguously: outer-pod 2 / inner-attempt
+            // 2 yields "-pod-2-attempt-2" rather than colliding with "-attempt-2".
+            def attemptTag = (attempt == 1) ? "" : "-pod-${attempt}"
             // For attempt 1 we don't yet know whether the failure (if any) will
             // be PERSISTENT, so use the worst-case multi-retry budget. From
             // attempt 2 onward we know the prior classification — if it was
@@ -3499,7 +3686,13 @@ def runKubernetesPodWithInfraRetry(pipeline, podSpec, containerName, String stag
             // another intermediate attempt.
             def effectiveMaxThisAttempt = (lastSeverity == InfraFailure.PERSISTENT) ? 1 : K8S_INFRA_RETRY_MAX
             boolean isFinalAttempt = (attempt > effectiveMaxThisAttempt)
-            trtllm_utils.launchKubernetesPod(pipeline, podSpec, containerName, { runner(attemptTag, isFinalAttempt) })
+            def retryContext = [
+                scope: InfraFailure.K8S,
+                stageName: stageName,
+                attempt: attempt,
+                backoffMs: 60L * 1000L,
+            ]
+            trtllm_utils.launchKubernetesPod(pipeline, podSpec, containerName, { runner(attemptTag, isFinalAttempt, retryContext) })
             if (attempt > 1) {
                 echo "[INFRA-RETRY] ${stageName}: Succeeded on attempt ${attempt}"
             }
@@ -3524,6 +3717,11 @@ def runKubernetesPodWithInfraRetry(pipeline, podSpec, containerName, String stag
             if (attempt > effectiveMax) {
                 echo "[INFRA-RETRY] ${stageName}: Infrastructure failure (${c.detectedPattern}) " +
                      "but max retries (${effectiveMax}) exhausted after ${attempt} attempts. Failing."
+                throw e
+            }
+            if (!hasBudgetForInfraRetry(pipeline, stageName, InfraFailure.K8S, c, attempt, effectiveMax, 60L * 1000L, true)) {
+                echo "[INFRA-RETRY] ${stageName}: Infrastructure failure (${c.detectedPattern}) is retryable, " +
+                     "but remaining CI timeout budget is too small for another K8s attempt. Failing without retry."
                 throw e
             }
 
@@ -3647,7 +3845,7 @@ def launchTestJobs(pipeline, testFilter)
         "RTXPro6000D-4_GPUs-PyTorch-Post-Merge-2": ["rtx-pro-6000d-x4", "l0_rtx_pro_6000", 2, 2, 4],
     ]
 
-    parallelJobs = x86TestConfigs.collectEntries{key, values -> [key, [createKubernetesPodConfig(LLM_DOCKER_IMAGE, values[0], "amd64", values[4] ?: 1, key.contains("-Perf-")), { attemptTag, isFinalAttempt ->
+    parallelJobs = x86TestConfigs.collectEntries{key, values -> [key, [createKubernetesPodConfig(LLM_DOCKER_IMAGE, values[0], "amd64", values[4] ?: 1, key.contains("-Perf-")), { attemptTag, isFinalAttempt, retryContext = null ->
         def config = VANILLA_CONFIG
         if (key.contains("single-device")) {
             config = SINGLE_DEVICE_CONFIG
@@ -3655,7 +3853,7 @@ def launchTestJobs(pipeline, testFilter)
         if (key.contains("llvm")) {
             config = LLVM_CONFIG
         }
-        runLLMTestlistOnPlatform(pipeline, values[0], values[1], config, key.contains("-Perf-"), key, values[2], values[3], false, "cp312", attemptTag, false, isFinalAttempt)
+        runLLMTestlistOnPlatform(pipeline, values[0], values[1], config, key.contains("-Perf-"), key, values[2], values[3], false, "cp312", attemptTag, false, isFinalAttempt, retryContext)
     }]]}
     fullSet = parallelJobs.keySet()
 
@@ -3710,12 +3908,25 @@ def launchTestJobs(pipeline, testFilter)
         "DGX_B200-8_GPUs-PyTorch-PerfSanity-Post-Merge-3": ["auto:dgx-b200-flex", "l0_b200_multi_gpus_perf_sanity", 3, 4, 8, 1, true],
         "DGX_B200-8_GPUs-PyTorch-PerfSanity-Post-Merge-4": ["auto:dgx-b200-flex", "l0_b200_multi_gpus_perf_sanity", 4, 4, 8, 1, true],
     ]
+    // B200 PerfSanity post-merge disaggregated
+    // 2 Nodes
+    x86SlurmTestConfigs += buildStageConfigs(
+        "DGX_B200-16_GPUs-2_Nodes-PyTorch-Disagg-PerfSanity-CTX1-NODE1-GPU4-GEN1-NODE1-GPU8-Post-Merge",
+        "auto:dgx-b200-flex",
+        "l0_b200_multi_nodes_perf_sanity_ctx1_node1_gpu4_gen1_node1_gpu8",
+        6,
+        16,
+        2
+    )
     fullSet += x86SlurmTestConfigs.keySet()
 
-    parallelSlurmJobs = x86SlurmTestConfigs.collectEntries{key, values -> [key, [createKubernetesPodConfig(LLM_DOCKER_IMAGE, "slurm", "amd64"), { attemptTag, isFinalAttempt ->
-        // attemptTag/isFinalAttempt come from runKubernetesPodWithInfraRetry
-        // for the outer dispatcher pod; the inner SLURM job runs its own
-        // retry loop (runLLMTestlistOnSlurm) so we don't thread these through.
+    parallelSlurmJobs = x86SlurmTestConfigs.collectEntries{key, values -> [key, [createKubernetesPodConfig(LLM_DOCKER_IMAGE, "slurm", "amd64"), { attemptTag, isFinalAttempt, retryContext = null ->
+        // attemptTag comes from runKubernetesPodWithInfraRetry for the outer
+        // dispatcher pod and is threaded into runLLMTestlistOnSlurm so the
+        // inner SLURM retry can prefix its postTag with the outer attempt's
+        // tag. Without this, a new dispatcher pod's inner attempt 1 would
+        // compute postTag="" and collide with the dead pod's already-recorded
+        // upload in GlobalState.uploadResultStageNames.
         def config = VANILLA_CONFIG
         if (key.contains("single-device")) {
             config = SINGLE_DEVICE_CONFIG
@@ -3723,7 +3934,7 @@ def launchTestJobs(pipeline, testFilter)
         if (key.contains("llvm")) {
             config = LLVM_CONFIG
         }
-        runLLMTestlistOnSlurm(pipeline, values[0], values[1], config, key.contains("-Perf-"), key, values[2], values[3], values[4] ?: 1, values[5] ?: 1, values[6] ?: false)
+        runLLMTestlistOnSlurm(pipeline, values[0], values[1], config, key.contains("-Perf-"), key, values[2], values[3], values[4] ?: 1, values[5] ?: 1, values[6] ?: false, false, "cp312", attemptTag)
     }]]}
 
     parallelJobs += parallelSlurmJobs
@@ -3925,14 +4136,16 @@ def launchTestJobs(pipeline, testFilter)
     fullSet += multiNodesSBSAConfigs.keySet()
 
     if (env.targetArch == AARCH64_TRIPLE) {
-        parallelJobs = SBSATestConfigs.collectEntries{key, values -> [key, [createKubernetesPodConfig(LLM_DOCKER_IMAGE, values[0], "arm64"), { attemptTag, isFinalAttempt ->
-            runLLMTestlistOnPlatform(pipeline, values[0], values[1], LINUX_AARCH64_CONFIG, false, key, values[2], values[3], false, "cp312", attemptTag, false, isFinalAttempt)
+        parallelJobs = SBSATestConfigs.collectEntries{key, values -> [key, [createKubernetesPodConfig(LLM_DOCKER_IMAGE, values[0], "arm64"), { attemptTag, isFinalAttempt, retryContext = null ->
+            runLLMTestlistOnPlatform(pipeline, values[0], values[1], LINUX_AARCH64_CONFIG, false, key, values[2], values[3], false, "cp312", attemptTag, false, isFinalAttempt, retryContext)
         }]]}
 
         // Add SBSA Slurm jobs
-        parallelSlurmJobs = SBSASlurmTestConfigs.collectEntries{key, values -> [key, [createKubernetesPodConfig(LLM_DOCKER_IMAGE, "slurm", "arm64"), { attemptTag, isFinalAttempt ->
-            // SLURM dispatchers run their own retry loop (runLLMTestlistOnSlurm);
-            // the outer pod-level retry args are accepted but unused here.
+        parallelSlurmJobs = SBSASlurmTestConfigs.collectEntries{key, values -> [key, [createKubernetesPodConfig(LLM_DOCKER_IMAGE, "slurm", "arm64"), { attemptTag, isFinalAttempt, retryContext = null ->
+            // attemptTag is threaded into runLLMTestlistOnSlurm as the outer
+            // dispatcher pod's tag so the inner SLURM retry's postTag can't
+            // collide with a previous dispatcher pod's upload. See the x86
+            // SLURM closure for the full rationale.
             def config = LINUX_AARCH64_CONFIG
             if (key.contains("single-device")) {
                 config = SINGLE_DEVICE_CONFIG
@@ -3940,12 +4153,12 @@ def launchTestJobs(pipeline, testFilter)
             if (key.contains("llvm")) {
                 config = LLVM_CONFIG
             }
-            runLLMTestlistOnSlurm(pipeline, values[0], values[1], config, key.contains("-Perf-"), key, values[2], values[3], values[4] ?: 1, values[5] ?: 1, values[6] ?: false)
+            runLLMTestlistOnSlurm(pipeline, values[0], values[1], config, key.contains("-Perf-"), key, values[2], values[3], values[4] ?: 1, values[5] ?: 1, values[6] ?: false, false, "cp312", attemptTag)
         }]]}
         parallelJobs += parallelSlurmJobs
 
         // Add SBSA multi node Slurm jobs
-        parallelMultiNodesSBSAJobs = multiNodesSBSAConfigs.collectEntries{key, values -> [key, [createKubernetesPodConfig(LLM_DOCKER_IMAGE, "slurm", "arm64"), { attemptTag, isFinalAttempt ->
+        parallelMultiNodesSBSAJobs = multiNodesSBSAConfigs.collectEntries{key, values -> [key, [createKubernetesPodConfig(LLM_DOCKER_IMAGE, "slurm", "arm64"), { attemptTag, isFinalAttempt, retryContext = null ->
             def config = LINUX_AARCH64_CONFIG
             if (key.contains("single-device")) {
                 config = SINGLE_DEVICE_CONFIG
@@ -3953,7 +4166,7 @@ def launchTestJobs(pipeline, testFilter)
             if (key.contains("llvm")) {
                 config = LLVM_CONFIG
             }
-            runLLMTestlistOnSlurm(pipeline, values[0], values[1], config, key.contains("-Perf-"), key, values[2], values[3], values[4] ?: 1, values[5] ?: 2, values[6] ?: false)
+            runLLMTestlistOnSlurm(pipeline, values[0], values[1], config, key.contains("-Perf-"), key, values[2], values[3], values[4] ?: 1, values[5] ?: 2, values[6] ?: false, false, "cp312", attemptTag)
         }]]}
 
         parallelJobs += parallelMultiNodesSBSAJobs
@@ -3973,12 +4186,12 @@ def launchTestJobs(pipeline, testFilter)
         docBuildConfigs = [:]
     }
 
-    docBuildJobs = docBuildConfigs.collectEntries{key, values -> [key, [values[0], { attemptTag, isFinalAttempt ->
+    docBuildJobs = docBuildConfigs.collectEntries{key, values -> [key, [values[0], { attemptTag, isFinalAttempt, retryContext = null ->
         // attemptTag uniquifies the upload-once guard key and tar filename per
         // pod-launch attempt; isFinalAttempt suppresses synthetic stage-fail XML
         // and junit() on intermediate retryable infra failures.
         stage("[${key}] Run") {
-            cacheErrorAndUploadResult("${key}", values[1], {}, true, attemptTag, isFinalAttempt)
+            cacheErrorAndUploadResult("${key}", values[1], {}, true, attemptTag, isFinalAttempt, retryContext)
         }
     }]]}
 
@@ -4106,7 +4319,7 @@ def launchTestJobs(pipeline, testFilter)
             if (checkPipStage) {
                 stage("Run LLMAPI Test") {
                     pipInstallSanitySpec = createKubernetesPodConfig(values[5], gpu_type, k8s_arch)
-                    runKubernetesPodWithInfraRetry(pipeline, pipInstallSanitySpec, "trt-llm", toStageName(values[1], key), { attemptTag, isFinalAttempt ->
+                    runKubernetesPodWithInfraRetry(pipeline, pipInstallSanitySpec, "trt-llm", toStageName(values[1], key), { attemptTag, isFinalAttempt, retryContext = null ->
                         echo "###### Prerequisites Start ######"
                         echoNodeAndGpuInfo(pipeline, toStageName(values[1], key))
                         // Clean up the pip constraint file from the base NGC PyTorch image.
@@ -4165,7 +4378,7 @@ def launchTestJobs(pipeline, testFilter)
                         }
                         withEnv(libEnv) {
                             sh "env | sort"
-                            runLLMTestlistOnPlatform(pipeline, gpu_type, "l0_sanity_check", config, false, toStageName(values[1], key), 1, 1, true, cpver, "-SubJob-RunTest" + attemptTag, true, isFinalAttempt)
+                            runLLMTestlistOnPlatform(pipeline, gpu_type, "l0_sanity_check", config, false, toStageName(values[1], key), 1, 1, true, cpver, "-SubJob-RunTest" + attemptTag, true, isFinalAttempt, retryContext)
                         }
                     })
                 }
@@ -4352,8 +4565,8 @@ def launchTestJobs(pipeline, testFilter)
                     echo "Skip - Passed in the previous pipelines."
                 }
             } else if (values instanceof List) {
-                runKubernetesPodWithInfraRetry(pipeline, values[0], "trt-llm", key, { attemptTag, isFinalAttempt ->
-                    values[1](attemptTag, isFinalAttempt)
+                runKubernetesPodWithInfraRetry(pipeline, values[0], "trt-llm", key, { attemptTag, isFinalAttempt, retryContext = null ->
+                    values[1](attemptTag, isFinalAttempt, retryContext)
                 })
             } else {
                 values()
@@ -4426,10 +4639,10 @@ def launchTestJobsForImagesSanityCheck(pipeline, globalVars) {
             stage(values.name) {
                 echo "Run ${values.name} sanity test."
                 imageSanitySpec = createKubernetesPodConfig(values.image, values.gpuType, values.k8sArch)
-                runKubernetesPodWithInfraRetry(pipeline, imageSanitySpec, "trt-llm", values.name, { attemptTag, isFinalAttempt ->
+                runKubernetesPodWithInfraRetry(pipeline, imageSanitySpec, "trt-llm", values.name, { attemptTag, isFinalAttempt, retryContext = null ->
                     sh "env | sort"
                     trtllm_utils.llmExecStepWithRetry(pipeline, script: "apt-get update && apt-get install -y git rsync curl")
-                    runLLMTestlistOnPlatform(pipeline, values.gpuType, "l0_sanity_check", values.config, false, values.name, 1, 1, true, null, "-SubJob-TestImage" + attemptTag, true, isFinalAttempt)
+                    runLLMTestlistOnPlatform(pipeline, values.gpuType, "l0_sanity_check", values.config, false, values.name, 1, 1, true, null, "-SubJob-TestImage" + attemptTag, true, isFinalAttempt, retryContext)
                 })
             }
         } else {
@@ -4484,6 +4697,7 @@ pipeline {
                     println testFilter
                     echo "env.globalVars is: ${env.globalVars}"
                     globalVars = trtllm_utils.updateMapWithJson(this, globalVars, env.globalVars, "globalVars")
+                    globalVars = trtllm_utils.initializeCiBudget(this, globalVars, 24, 'HOURS', 'L0_Test')
                     globalVars[ACTION_INFO] = trtllm_utils.setupPipelineDescription(this, globalVars[ACTION_INFO])
                 }
             }

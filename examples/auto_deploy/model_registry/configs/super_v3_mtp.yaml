@@ -9,7 +9,7 @@ attn_backend: trtllm
 model_factory: AutoModelForCausalLM
 skip_loading_weights: false
 cuda_graph_config:
-  batch_sizes: [1, 2, 4, 8, 16, 24, 32, 64, 128, 256, 320, 384]
+  batch_sizes: [1, 2, 4, 8, 16, 24, 32, 64, 128]
 kv_cache_config:
   # tunable mamba cache dtype
   # --> use float32 for accuracy and default (auto) for speed
@@ -50,10 +50,10 @@ transforms:
   fuse_mamba_a_log:
     stage: post_load_fusion
     enabled: true
-  # Triton SSM + causal conv are required for MTP as currently they are the only backends
-  # that support speculative mamba state caching.
+  # FlashInfer SSM is used for the MTP extend path; Triton causal conv is still required
+  # for speculative Mamba state caching in this configuration.
   insert_cached_ssm_attention:
-    backend: triton_ssm
+    backend: flashinfer_ssm
   insert_cached_causal_conv:
     backend: triton_causal_conv
   fuse_nvfp4_moe:

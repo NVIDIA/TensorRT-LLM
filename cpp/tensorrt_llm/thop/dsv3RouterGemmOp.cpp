@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 1993-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 1993-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -77,7 +77,8 @@ th::Tensor dsv3_router_gemm_op(th::Tensor const& mat_a, th::Tensor const& mat_b,
     auto const out_dtype_ = out_dtype.value_or(mat_a.scalar_type());
     auto const data_type = mat_a.scalar_type();
     constexpr int kNumExperts = 256;
-    constexpr int kHiddenDim = 7168;
+    constexpr int kHiddenDim7168 = 7168; // DeepSeek-V3 / DeepSeek-V3.2
+    constexpr int kHiddenDim6144 = 6144; // GLM-5
     std::vector<int64_t> output_size = {mat_a.sizes()[0], mat_b.sizes()[1]};
     th::Tensor out = th::empty(output_size, mat_a.options().dtype(out_dtype_));
     TORCH_CHECK(mat_a.dim() == 2 && mat_b.dim() == 2);
@@ -85,20 +86,22 @@ th::Tensor dsv3_router_gemm_op(th::Tensor const& mat_a, th::Tensor const& mat_b,
     TORCH_CHECK(mat_b.strides()[0] == 1);                          // Column-major
     TORCH_CHECK(!bias.has_value(), "bias is not support yet");
     auto stream = at::cuda::getCurrentCUDAStream(mat_a.get_device());
-    bool use_custom_kernel = false;
-    if (num_tokens >= 1 && num_tokens <= 16 && num_experts == kNumExperts && hidden_dim == kHiddenDim
-        && data_type == torch::kBFloat16 && out_dtype_ == torch::kFloat32)
-    {
-        use_custom_kernel = true;
-    }
+    bool const shape_ok = (num_tokens >= 1 && num_tokens <= 16 && num_experts == kNumExperts
+        && mat_b.sizes()[0] == hidden_dim && data_type == torch::kBFloat16 && out_dtype_ == torch::kFloat32);
 
-    if (use_custom_kernel)
+    if (shape_ok && hidden_dim == kHiddenDim7168)
     {
-        LoopUnroller<1, 16, kNumExperts, kHiddenDim>::unroll(num_tokens,
+        LoopUnroller<1, 16, kNumExperts, kHiddenDim7168>::unroll(num_tokens,
             reinterpret_cast<float*>(out.mutable_data_ptr()), reinterpret_cast<__nv_bfloat16 const*>(mat_a.data_ptr()),
             reinterpret_cast<__nv_bfloat16 const*>(mat_b.data_ptr()), stream);
     }
-    else
+    else if (shape_ok && hidden_dim == kHiddenDim6144)
+    {
+        LoopUnroller<1, 16, kNumExperts, kHiddenDim6144>::unroll(num_tokens,
+            reinterpret_cast<float*>(out.mutable_data_ptr()), reinterpret_cast<__nv_bfloat16 const*>(mat_a.data_ptr()),
+            reinterpret_cast<__nv_bfloat16 const*>(mat_b.data_ptr()), stream);
+    }
+    else // fallback to cublas, can be slow
     {
         cublas_mm_out(mat_a, mat_b, bias, out);
     }
