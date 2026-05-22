@@ -18,6 +18,7 @@ import math
 import os
 from abc import ABC, abstractmethod
 from collections import OrderedDict, defaultdict, deque
+from dataclasses import fields
 from typing import (TYPE_CHECKING, Dict, Iterable, List, Optional, Sequence,
                     Set, Tuple, Union)
 
@@ -31,7 +32,8 @@ from tensorrt_llm._utils import (TensorWrapper, convert_to_torch_tensor,
                                  get_size_in_bytes, mpi_comm, mpi_disabled,
                                  prefer_pinned, torch_comm)
 from tensorrt_llm.bindings.internal.batch_manager import (
-    KvCacheStats, LinearAttentionMetadata, LinearCacheType)
+    KvCacheIterationStats, KvCacheStats, LinearAttentionMetadata,
+    LinearCacheType)
 from tensorrt_llm.bindings.internal.batch_manager.kv_cache_manager_v2_utils import (
     IndexMapper, copy_batch_block_offsets_to_device)
 from tensorrt_llm.bindings.internal.runtime import TaskLayerModuleConfig
@@ -46,8 +48,9 @@ from tensorrt_llm.runtime.kv_cache_hash import (
 # isort: off
 from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     DEFAULT_BEAM_INDEX, AttentionLayerConfig, BufferConfig, CacheTierConfig,
-    GpuCacheTierConfig, HostCacheTierConfig)
+    GpuCacheTierConfig, HostCacheTierConfig, PageIndexMode, ReuseScope)
 # isort: on
+from tensorrt_llm.runtime.kv_cache_manager_v2 import KVCacheIterationStatsDelta
 from tensorrt_llm.runtime.kv_cache_manager_v2 import \
     KVCacheManager as KVCacheManagerPy
 from tensorrt_llm.runtime.kv_cache_manager_v2 import \
@@ -57,13 +60,16 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import (LayerId, TokenIdExt,
 from tensorrt_llm.runtime.kv_cache_manager_v2._block_radix_tree import \
     gen_multi_modal_tokens
 from tensorrt_llm.runtime.kv_cache_manager_v2._common import (BAD_PAGE_INDEX,
-                                                              GPU_LEVEL)
+                                                              GPU_LEVEL,
+                                                              CacheLevel)
 from tensorrt_llm.runtime.kv_cache_manager_v2._config import DataRole
 from tensorrt_llm.runtime.kv_cache_manager_v2._event_manager import \
     KVCacheEventManager
 from tensorrt_llm.runtime.kv_cache_manager_v2._exceptions import CuError
 from tensorrt_llm.runtime.kv_cache_manager_v2._exceptions import \
     OutOfMemoryError as KVCacheOutOfMemoryError
+from tensorrt_llm.runtime.kv_cache_manager_v2._life_cycle_registry import (
+    AttnLifeCycle, LifeCycleId)
 from tensorrt_llm.runtime.kv_cache_manager_v2._utils import (exact_div,
                                                              typed_range)
 from tensorrt_llm.sampling_params import SamplingParams
@@ -72,6 +78,9 @@ from ..._utils import binding_to_str_dtype, mpi_rank, nvtx_range
 from ...logger import logger
 from ...mapping import CpType, Mapping
 from .connectors.kv_cache_connector import KvCacheConnectorManager
+from .kv_cache_stats import (KVCacheV2IterationStatsReport,
+                             KVCacheV2LifeCycleIterationStats,
+                             KVCacheV2PoolGroupIterationStats)
 from .llm_request import (LlmRequest, LlmRequestState, SamplingConfig,
                           get_draft_token_length)
 from .scheduler import ScheduledRequests
@@ -93,6 +102,17 @@ if TYPE_CHECKING:
 BlocksPerWindow = Dict[int, Tuple[
     int,
     int]]  # window_size -> (blocks_in_primary_pool, blocks_in_secondary_pool)
+KV_CACHE_ITERATION_STATS_DELTA_FIELDS = tuple(
+    field.name for field in fields(KVCacheIterationStatsDelta))
+KV_CACHE_ITERATION_STATS_REUSE_FIELDS = (
+    "iter_reused_blocks",
+    "iter_full_reused_blocks",
+    "iter_partial_reused_blocks",
+    "iter_missed_blocks",
+)
+KV_CACHE_ITERATION_STATS_POOL_GROUP_FIELDS = tuple(
+    field_name for field_name in KV_CACHE_ITERATION_STATS_DELTA_FIELDS
+    if field_name not in KV_CACHE_ITERATION_STATS_REUSE_FIELDS)
 
 
 def _warn_if_unsupported_v1_kv_cache_event_hash_algo(hash_algo: str) -> None:
@@ -643,11 +663,12 @@ class KVCacheManager(BaseResourceManager):
 
         self.kv_cache_pool_mapping = self.impl.get_layer_to_pool_mapping()
         self.num_pools = self.impl.num_pools
+        self.num_attention_op_pools = self.num_pools
         self.max_blocks_per_seq = self.impl.max_blocks_per_seq
         self.enable_block_reuse = kv_cache_config.enable_block_reuse
         self.enable_partial_reuse = kv_cache_config.enable_partial_reuse
         self.host_kv_cache_block_offsets = torch.empty(
-            self.num_pools,
+            self.num_attention_op_pools,
             max_batch_size * max_beam_width,
             2,
             self.max_blocks_per_seq,
@@ -1866,11 +1887,15 @@ class KVCacheManagerV2(BaseResourceManager):
         kv_connector_manager: Optional[KvCacheConnectorManager] = None,
         execution_stream: Optional[torch.cuda.Stream] = None,
         is_disagg: bool = False,
+        enable_stats: bool = False,
+        enable_swa_scratch_reuse: bool = False,
         **kwargs,
     ) -> None:
         self.mapping = mapping
         self.dtype = dtype
         self.is_disagg = is_disagg
+        self.is_draft = is_draft
+        self.enable_swa_scratch_reuse = enable_swa_scratch_reuse and not self.is_draft
 
         assert kv_connector_manager is None, "kv_connector_manager is not supported for KVCacheManagerV2"
         assert max_beam_width == 1, "max_beam_width must be 1 for KVCacheManagerV2"
@@ -1884,7 +1909,6 @@ class KVCacheManagerV2(BaseResourceManager):
             spec_config=spec_config,
             layer_mask=layer_mask,
         )
-        self.is_draft = is_draft
         self.num_local_layers = len(self.pp_layers)
         self.layer_offsets = {
             idx: offset
@@ -1907,6 +1931,7 @@ class KVCacheManagerV2(BaseResourceManager):
         self.max_total_draft_tokens = spec_config.max_total_draft_tokens if spec_config is not None else 0
 
         self.event_buffer_max_size = kv_cache_config.event_buffer_max_size
+        self.enable_stats = enable_stats
         kv_cache_event_hash_algo = get_effective_kv_cache_event_hash_algo(
             kv_cache_config.kv_cache_event_hash_algo,
             use_kv_cache_manager_v2=True,
@@ -2116,6 +2141,10 @@ class KVCacheManagerV2(BaseResourceManager):
                                              event_manager=self.event_manager)
             else:
                 raise
+        # Pass execution_stream to StorageManager so _batched_migrate
+        # can record a fresh event (V1-style syncWithBufferManager)
+        # to order copy streams after the latest forward-pass work.
+        self.impl._storage._execution_stream = self._stream.cuda_stream
 
         if self.event_manager is not None:
             self.event_manager.set_layer_group_window_sizes(
@@ -2126,15 +2155,24 @@ class KVCacheManagerV2(BaseResourceManager):
                 self._get_event_layer_group_ids())
 
         self.num_pools = len(self.impl.layer_grouping)
+        # num_pools is the physical pool count owned by the KV cache manager.
+        # The TRT-LLM attention op indexes kv_cache_block_offsets and
+        # host_kv_cache_pool_mapping by attention-op pool ids. Most models use
+        # the physical pool ids directly. SWA scratch reuse is different:
+        # scratch slot IDs are only valid with per-layer page indices, so the
+        # attention op must see one virtual pool per local layer while the
+        # underlying cache manager can still group layers into fewer physical
+        # pools.
+        if self.enable_swa_scratch_reuse:
+            self.num_attention_op_pools = self.num_local_layers
+        else:
+            self.num_attention_op_pools = self.num_pools
 
         num_layers = len(config.layers)
         self.layer_to_pool_mapping_dict: dict[int, int] = {
             layer_id: self.impl.get_layer_group_id(layer_id)
             for layer_id in typed_range(LayerId(num_layers))
         }
-
-        (self.kv_cache_pool_pointers,
-         self.kv_cache_pool_mapping) = self._build_pool_mapping_tensors()
 
         self.kv_cache_map: dict[int, _KVCache] = {}
 
@@ -2199,34 +2237,9 @@ class KVCacheManagerV2(BaseResourceManager):
         )
         self.index_mapper = IndexMapper(index_mapper_capacity, max_beam_width)
         self._early_freed_index_requests: set[int] = set()
-        self.index_scales = torch.empty(self.num_pools,
-                                        dtype=torch.int32,
-                                        pin_memory=prefer_pinned(),
-                                        device='cpu')
-        self.kv_offset = torch.empty(self.num_pools,
-                                     dtype=torch.int32,
-                                     pin_memory=prefer_pinned(),
-                                     device='cpu')
-        for pool_id in range(self.num_pools):
-            layer_id = self.impl.layer_grouping[pool_id][0]
-            self.index_scales[pool_id] = self.impl.get_page_index_scale(
-                layer_id, Role.KEY)
-            if self.kv_cache_type != CacheTypeCpp.SELFKONLY:
-                self.kv_offset[pool_id] = exact_div(
-                    self.impl.get_mem_pool_base_address(layer_id, Role.VALUE) -
-                    self.impl.get_mem_pool_base_address(layer_id, Role.KEY),
-                    self.impl.get_page_stride(layer_id, Role.KEY))
-            else:
-                self.kv_offset[pool_id] = 0
+        self._prepare_page_table_tensor(index_mapper_capacity)
 
-        self.host_kv_cache_block_offsets = torch.empty(
-            self.num_pools,
-            index_mapper_capacity * max_beam_width,
-            2,  # key and value
-            self.max_blocks_per_seq,
-            dtype=torch.int32,
-            pin_memory=prefer_pinned(),
-            device='cpu')
+        self._log_kv_cache_pool_lifecycle_mapping()
 
     def _get_quota_from_max_tokens(self, max_tokens: int) -> int:
         return int(max_tokens * self.get_cache_bytes_per_token())
@@ -2263,63 +2276,157 @@ class KVCacheManagerV2(BaseResourceManager):
             for layer_group_id, layer_ids in enumerate(self.impl.layer_grouping)
         }
 
-    def _build_pool_mapping_tensors(self) -> Tuple[torch.Tensor, torch.Tensor]:
-        kv_cache_pool_pointers = torch.tensor([[
-            self.impl.get_mem_pool_base_address(
-                self.impl.layer_grouping[pool_id][0], Role.KEY), 0
-        ] for pool_id in range(self.num_pools)],
+    def _format_kv_cache_pool_lifecycle_entry(self, layer_id: LayerId,
+                                              role: DataRole) -> str:
+        attr = self.impl._storage.get_buffer_attr(layer_id, role)
+        pool_group_id = self.impl._storage.get_pool_group_index(
+            attr.life_cycle_id)
+        lifecycle = self.impl._life_cycles.get_life_cycle(attr.life_cycle_id)
+        return (f"role={str(role)}, pool_group_id={int(pool_group_id)}, "
+                f"lifecycle_id={int(attr.life_cycle_id)}, "
+                f"lifecycle={lifecycle}")
+
+    def _log_kv_cache_pool_lifecycle_mapping(self) -> None:
+        entries = OrderedDict()
+        for layer in self.kv_cache_manager_py_config.layers:
+            for buffer in layer.buffers:
+                entries.setdefault(
+                    self._format_kv_cache_pool_lifecycle_entry(
+                        layer.layer_id, buffer.role), None)
+
+        if not entries:
+            return
+
+        logger.info(f"{type(self).__name__} role-to-pool/lifecycle mapping:")
+        for entry in entries:
+            logger.info(entry)
+
+    def _prepare_page_table_tensor(self, index_mapper_capacity: int) -> None:
+        kv_cache_pool_pointers_list = []
+        kv_cache_pool_mapping_list = []
+        block_scale_pool_pointers_list = []
+        if self.enable_swa_scratch_reuse:
+            for layer_id in typed_range(LayerId(self.num_local_layers)):
+                kv_cache_pool_pointers_list.append([
+                    self.impl.get_mem_pool_base_address(
+                        layer_id, Role.KEY, PageIndexMode.PER_LAYER), 0
+                ])
+                if self.dtype == DataType.NVFP4:
+                    block_scale_pool_pointers_list.append([
+                        self.impl.get_mem_pool_base_address(
+                            layer_id, Role.KEY_BLOCK_SCALE,
+                            PageIndexMode.PER_LAYER), 0
+                    ])
+                kv_cache_pool_mapping_list.append([int(layer_id), 0])
+        else:
+            for pool_id in range(self.num_pools):
+                layer_id = self.impl.layer_grouping[pool_id][0]
+                kv_cache_pool_pointers_list.append([
+                    self.impl.get_mem_pool_base_address(layer_id, Role.KEY,
+                                                        PageIndexMode.SHARED), 0
+                ])
+                if self.dtype == DataType.NVFP4:
+                    block_scale_pool_pointers_list.append([
+                        self.impl.get_mem_pool_base_address(
+                            layer_id, Role.KEY_BLOCK_SCALE,
+                            PageIndexMode.SHARED), 0
+                    ])
+
+            for layer_id in typed_range(LayerId(self.num_local_layers)):
+                layer_group_id = self.impl.get_layer_group_id(layer_id)
+                if self.dtype != DataType.NVFP4:
+                    key_base_addr = kv_cache_pool_pointers_list[layer_group_id][
+                        0]
+                    addr_offset = self.impl.get_mem_pool_base_address(
+                        layer_id, Role.KEY,
+                        PageIndexMode.SHARED) - key_base_addr
+                else:
+                    key_base_addr = kv_cache_pool_pointers_list[layer_group_id][
+                        0]
+                    block_scale_base_addr = block_scale_pool_pointers_list[
+                        layer_group_id][0]
+                    addr_offset = self.impl.get_mem_pool_base_address(
+                        layer_id, Role.KEY,
+                        PageIndexMode.SHARED) - key_base_addr
+                    block_scale_addr_offset = self.impl.get_mem_pool_base_address(
+                        layer_id, Role.KEY_BLOCK_SCALE,
+                        PageIndexMode.SHARED) - block_scale_base_addr
+                    block_scale_offset = exact_div(
+                        block_scale_addr_offset,
+                        self.get_layer_bytes_per_token(
+                            layer_id, Role.KEY_BLOCK_SCALE) * self.kv_factor *
+                        self.tokens_per_block)
+                offset = exact_div(
+                    addr_offset,
+                    self.get_layer_bytes_per_token(layer_id, Role.KEY) *
+                    self.kv_factor * self.tokens_per_block)
+
+                if self.dtype == DataType.NVFP4:
+                    assert block_scale_offset == offset, "Block scale offset and offset should be the same"
+
+                kv_cache_pool_mapping_list.append([layer_group_id, offset])
+
+        if self.dtype == DataType.NVFP4:
+            for pool_id, block_scale_pool_pointers in enumerate(
+                    block_scale_pool_pointers_list):
+                pool_pointers = kv_cache_pool_pointers_list[pool_id]
+                kv_cache_pool_pointers_list[pool_id] = [
+                    [pool_pointers[0], block_scale_pool_pointers[0]],
+                    [pool_pointers[1], block_scale_pool_pointers[1]],
+                ]
+
+        kv_cache_pool_pointers = torch.tensor(kv_cache_pool_pointers_list,
                                               dtype=torch.int64,
                                               device="cpu",
                                               pin_memory=prefer_pinned())
-
-        if self.dtype == DataType.NVFP4:
-            kv_cache_pool_pointers = torch.stack([
-                kv_cache_pool_pointers,
-                torch.tensor([[
-                    self.impl.get_mem_pool_base_address(
-                        self.impl.layer_grouping[pool_id][0],
-                        Role.KEY_BLOCK_SCALE), 0
-                ] for pool_id in range(self.num_pools)],
-                             dtype=torch.int64,
-                             device="cpu",
-                             pin_memory=prefer_pinned())
-            ],
-                                                 dim=-1)
-
-        kv_cache_pool_mapping_list = []
-        for layer_id in typed_range(LayerId(self.num_local_layers)):
-            layer_group_id = self.impl.get_layer_group_id(layer_id)
-            if self.dtype != DataType.NVFP4:
-                addr_offset = self.impl.get_mem_pool_base_address(
-                    layer_id, Role.KEY) - int(
-                        kv_cache_pool_pointers[layer_group_id][0])
-            else:
-                addr_offset = self.impl.get_mem_pool_base_address(
-                    layer_id, Role.KEY) - int(
-                        kv_cache_pool_pointers[layer_group_id][0][0])
-                block_scale_addr_offset = self.impl.get_mem_pool_base_address(
-                    layer_id, Role.KEY_BLOCK_SCALE) - int(
-                        kv_cache_pool_pointers[layer_group_id][0][1])
-                block_scale_offset = exact_div(
-                    block_scale_addr_offset,
-                    self.get_layer_bytes_per_token(
-                        layer_id, Role.KEY_BLOCK_SCALE) * self.kv_factor *
-                    self.tokens_per_block)
-            offset = exact_div(
-                addr_offset,
-                self.get_layer_bytes_per_token(layer_id, Role.KEY) *
-                self.kv_factor * self.tokens_per_block)
-
-            if self.dtype == DataType.NVFP4:
-                assert block_scale_offset == offset, "Block scale offset and offset should be the same"
-
-            kv_cache_pool_mapping_list.append([layer_group_id, offset])
 
         kv_cache_pool_mapping = torch.tensor(kv_cache_pool_mapping_list,
                                              dtype=torch.int32,
                                              device="cpu",
                                              pin_memory=prefer_pinned())
-        return kv_cache_pool_pointers, kv_cache_pool_mapping
+
+        self.kv_cache_pool_pointers = kv_cache_pool_pointers
+        self.kv_cache_pool_mapping = kv_cache_pool_mapping
+        self.index_scales = torch.empty(self.num_pools,
+                                        dtype=torch.int32,
+                                        pin_memory=prefer_pinned(),
+                                        device='cpu')
+        self.kv_offset = torch.empty(self.num_pools,
+                                     dtype=torch.int32,
+                                     pin_memory=prefer_pinned(),
+                                     device='cpu')
+        for pool_id in range(self.num_pools):
+            layer_id = self.impl.layer_grouping[pool_id][0]
+            self.index_scales[pool_id] = self.impl.get_page_index_scale(
+                layer_id, Role.KEY)
+            if self.kv_cache_type != CacheTypeCpp.SELFKONLY:
+                self.kv_offset[pool_id] = exact_div(
+                    self.impl.get_mem_pool_base_address(layer_id, Role.VALUE,
+                                                        PageIndexMode.SHARED) -
+                    self.impl.get_mem_pool_base_address(layer_id, Role.KEY,
+                                                        PageIndexMode.SHARED),
+                    self.impl.get_page_stride(layer_id, Role.KEY))
+            else:
+                self.kv_offset[pool_id] = 0
+
+        self.host_kv_cache_block_offsets = torch.empty(
+            self.num_pools,
+            index_mapper_capacity * self.max_beam_width,
+            2,  # key and value
+            self.max_blocks_per_seq,
+            dtype=torch.int32,
+            pin_memory=prefer_pinned(),
+            device='cpu')
+        self._host_attention_op_block_offsets_staging = None
+        if self.enable_swa_scratch_reuse:
+            self._host_attention_op_block_offsets_staging = torch.empty(
+                self.num_attention_op_pools,
+                index_mapper_capacity * self.max_beam_width,
+                2,  # key and value
+                self.max_blocks_per_seq,
+                dtype=torch.int32,
+                pin_memory=prefer_pinned(),
+                device='cpu')
 
     def _build_cache_config(
         self,
@@ -2345,6 +2452,8 @@ class KVCacheManagerV2(BaseResourceManager):
             vocab_size=vocab_size,
             cache_tiers=cache_tiers,
             max_util_for_resume=kv_cache_config.max_util_for_resume,
+            enable_stats=self.enable_stats,
+            enable_swa_scratch_reuse=self.enable_swa_scratch_reuse,
             layers=[
                 AttentionLayerConfig(
                     layer_id=layer_id,
@@ -2375,10 +2484,11 @@ class KVCacheManagerV2(BaseResourceManager):
                     layer_idx: int,
                     kv_layout: str = "NHD") -> Optional[torch.Tensor]:
         layer_offset = self.layer_offsets[layer_idx]
-        addr_key = self.impl.get_mem_pool_base_address(layer_offset, Role.KEY)
+        addr_key = self.impl.get_mem_pool_base_address(layer_offset, Role.KEY,
+                                                       PageIndexMode.SHARED)
         if self.kv_cache_type != CacheTypeCpp.SELFKONLY:
             addr_value = self.impl.get_mem_pool_base_address(
-                layer_offset, Role.VALUE)
+                layer_offset, Role.VALUE, PageIndexMode.SHARED)
             page_size_key = self.impl.get_page_stride(layer_offset, Role.KEY)
             page_size_value = self.impl.get_page_stride(layer_offset,
                                                         Role.VALUE)
@@ -2448,6 +2558,25 @@ class KVCacheManagerV2(BaseResourceManager):
             for layer_id in typed_range(LayerId(self.num_local_layers))
         ])
         return max_num_pages // self.kv_factor
+
+    def commit_scheduled_kv_cache_stats(
+            self, scheduled_batch: ScheduledRequests) -> None:
+        if self.is_draft or not self.enable_stats:
+            return
+        dirty_req_ids = self.impl.get_dirty_stats_kv_cache_ids()
+        for req in scheduled_batch.all_requests():
+            if req.py_request_id in dirty_req_ids:
+                kv_cache = self.kv_cache_map.get(req.py_request_id)
+                if kv_cache is None:
+                    continue
+                request_stats = kv_cache.commit_pending_stats()
+                if not req.is_dummy and not request_stats.empty:
+                    req.update_kv_cache_perf_metrics(
+                        request_stats.alloc_total_blocks,
+                        request_stats.alloc_new_blocks,
+                        request_stats.reused_blocks,
+                        request_stats.missed_blocks,
+                    )
 
     # ---- Scheduling API (called by KVCacheV2Scheduler) ----
 
@@ -2645,10 +2774,10 @@ class KVCacheManagerV2(BaseResourceManager):
         if req.is_first_context_chunk:
             kv_cache = self.kv_cache_map.get(req.py_request_id)
             if kv_cache is None:
+                all_tokens = req.get_tokens(DEFAULT_BEAM_INDEX)
                 # Last token cannot be recovered, so we don't include it in
                 # the input tokens to look up for the block that can be reused.
                 if self.enable_block_reuse:
-                    all_tokens = req.get_tokens(DEFAULT_BEAM_INDEX)
                     tokens = self._augment_tokens_for_block_reuse(
                         all_tokens, req, end=len(all_tokens) - 1)
                 else:
@@ -2657,7 +2786,9 @@ class KVCacheManagerV2(BaseResourceManager):
                     req.py_request_id,
                     req.lora_task_id,
                     tokens,
-                    cache_salt_id=req.cache_salt_id)
+                    cache_salt_id=req.cache_salt_id,
+                    is_dummy=req.is_dummy,
+                    expected_prompt_length=req.prompt_len - 1)
                 if kv_cache is None:
                     return False
                 kv_cache.cuda_stream = self._stream.cuda_stream
@@ -2669,6 +2800,10 @@ class KVCacheManagerV2(BaseResourceManager):
                 req.set_prepopulated_prompt_len(kv_cache.num_committed_tokens,
                                                 self.tokens_per_block)
 
+            if req.is_disagg_generation_init_state:
+                # Disagg generation receives prompt KV from the context worker;
+                # scratch blocks are only valid for local prefill chunks.
+                kv_cache.enable_swa_scratch_reuse = False
             return self._resume_and_restore(req.py_request_id, kv_cache)
         else:
             # Subsequent chunk: cache must exist from first chunk.
@@ -2703,7 +2838,8 @@ class KVCacheManagerV2(BaseResourceManager):
         capacity = max(kv_cache.capacity, target)
         pre_cap = kv_cache.capacity
 
-        if not kv_cache.resize(capacity, history_length):
+        success = kv_cache.resize(capacity, history_length)
+        if not success:
             if req.is_first_context_chunk:
                 kv_cache.suspend()
             return False
@@ -2773,7 +2909,8 @@ class KVCacheManagerV2(BaseResourceManager):
                         req.py_request_id,
                         req.lora_task_id,
                         None,
-                        cache_salt_id=req.cache_salt_id)
+                        cache_salt_id=req.cache_salt_id,
+                        is_dummy=req.is_dummy)
                     kv_cache.stop_committing()
                 if not self._resume_and_restore(req.py_request_id, kv_cache):
                     raise RuntimeError(
@@ -2862,9 +2999,237 @@ class KVCacheManagerV2(BaseResourceManager):
                    n] = mm_tokens[mm_offset:mm_offset + n]
         return result
 
+    def _stats_window_size(self, window_size: Optional[int]) -> int:
+        return self.max_seq_len if window_size is None else int(window_size)
+
+    def _stats_life_cycle_window_size(self, life_cycle) -> Optional[int]:
+        if not isinstance(life_cycle, AttnLifeCycle):
+            return None
+        return self._stats_window_size(life_cycle.window_size)
+
+    def _storage_pool_groups_by_window(self) -> dict[int, set[int]]:
+        pool_groups_by_window: dict[int, set[int]] = defaultdict(set)
+        for life_cycle_id, life_cycle in self.impl._life_cycles.attention_life_cycles(
+        ):
+            pool_group_id = self.impl._storage.get_pool_group_index(
+                life_cycle_id)
+            pool_groups_by_window[self._stats_window_size(
+                life_cycle.window_size)].add(int(pool_group_id))
+        return pool_groups_by_window
+
+    @staticmethod
+    def _windows_by_pool_group(
+        pool_groups_by_window: dict[int,
+                                    set[int]]) -> dict[int, tuple[int, ...]]:
+        windows_by_pool_group: dict[int, set[int]] = defaultdict(set)
+        for window_size, pool_group_ids in pool_groups_by_window.items():
+            for pool_group_id in pool_group_ids:
+                windows_by_pool_group[pool_group_id].add(window_size)
+        return {
+            pool_group_id: tuple(sorted(window_sizes))
+            for pool_group_id, window_sizes in windows_by_pool_group.items()
+        }
+
+    @staticmethod
+    def _filter_iteration_stats_delta(
+            delta, field_names) -> KVCacheIterationStatsDelta:
+        filtered = KVCacheIterationStatsDelta()
+        for field_name in field_names:
+            setattr(filtered, field_name, getattr(delta, field_name))
+        return filtered
+
+    @staticmethod
+    def _add_iteration_stats_delta(bucket: dict[int,
+                                                KVCacheIterationStatsDelta],
+                                   key: int,
+                                   delta: KVCacheIterationStatsDelta) -> None:
+        if delta.empty:
+            return
+        if key not in bucket:
+            bucket[key] = delta.copy()
+            return
+        bucket[key].add(delta)
+
+    @staticmethod
+    def _iteration_cache_hit_rate(stats) -> float:
+        total = stats.iter_reused_blocks + stats.iter_missed_blocks
+        if stats.iter_reused_blocks == 0 or total == 0:
+            return 0.0
+        return stats.iter_reused_blocks / total
+
+    @staticmethod
+    def _apply_iteration_stats_delta(
+            stats,
+            delta,
+            field_names=KV_CACHE_ITERATION_STATS_DELTA_FIELDS) -> None:
+        if delta is None:
+            return
+        for field_name in field_names:
+            setattr(stats, field_name, getattr(delta, field_name))
+        stats.iter_cache_hit_rate = KVCacheManagerV2._iteration_cache_hit_rate(
+            stats)
+
+    def _build_iteration_stats(
+        self,
+        pool_group_ids: Iterable[int],
+        primary_stats,
+        secondary_stats_by_level,
+        delta,
+        field_names=KV_CACHE_ITERATION_STATS_DELTA_FIELDS,
+    ):
+        pool_group_ids = tuple(pool_group_ids)
+        stats = KvCacheIterationStats()
+        stats.primary_max_num_blocks = sum(primary_stats[pool_group_id].total
+                                           for pool_group_id in pool_group_ids)
+        stats.primary_free_num_blocks = sum(
+            primary_stats[pool_group_id].available
+            for pool_group_id in pool_group_ids)
+        stats.primary_used_num_blocks = (stats.primary_max_num_blocks -
+                                         stats.primary_free_num_blocks)
+        stats.secondary_max_num_blocks = sum(
+            level_stats[pool_group_id].total
+            for level_stats in secondary_stats_by_level
+            for pool_group_id in pool_group_ids)
+        stats.secondary_free_num_blocks = sum(
+            level_stats[pool_group_id].available
+            for level_stats in secondary_stats_by_level
+            for pool_group_id in pool_group_ids)
+        stats.secondary_used_num_blocks = (stats.secondary_max_num_blocks -
+                                           stats.secondary_free_num_blocks)
+        self._apply_iteration_stats_delta(stats, delta, field_names)
+        return stats
+
+    def _collect_iteration_stats_deltas(
+            self, raw_iteration_stats,
+            storage) -> tuple[dict, dict, dict, dict]:
+        reuse_deltas_by_window: dict[int, KVCacheIterationStatsDelta] = {}
+        reuse_deltas_by_life_cycle: dict[int, KVCacheIterationStatsDelta] = {}
+        pool_group_deltas_by_window: dict[int, KVCacheIterationStatsDelta] = {}
+        pool_group_deltas: dict[int, KVCacheIterationStatsDelta] = {}
+
+        for life_cycle_id, delta in raw_iteration_stats.items():
+            life_cycle = self.impl._life_cycles.get_life_cycle(life_cycle_id)
+            pool_group_id = int(storage.get_pool_group_index(life_cycle_id))
+            window_size = self._stats_life_cycle_window_size(life_cycle)
+
+            pool_group_delta = self._filter_iteration_stats_delta(
+                delta, KV_CACHE_ITERATION_STATS_POOL_GROUP_FIELDS)
+            self._add_iteration_stats_delta(pool_group_deltas, pool_group_id,
+                                            pool_group_delta)
+            if window_size is not None:
+                self._add_iteration_stats_delta(pool_group_deltas_by_window,
+                                                window_size, pool_group_delta)
+
+            reuse_delta = self._filter_iteration_stats_delta(
+                delta, KV_CACHE_ITERATION_STATS_REUSE_FIELDS)
+            if reuse_delta.empty:
+                continue
+            reuse_deltas_by_life_cycle[int(life_cycle_id)] = reuse_delta.copy()
+            if window_size is not None:
+                self._add_iteration_stats_delta(reuse_deltas_by_window,
+                                                window_size, reuse_delta)
+
+        return (reuse_deltas_by_window, reuse_deltas_by_life_cycle,
+                pool_group_deltas_by_window, pool_group_deltas)
+
+    def _build_window_iteration_stats(
+        self,
+        window_size: int,
+        pool_groups_by_window: dict[int, set[int]],
+        windows_by_pool_group: dict[int, tuple[int, ...]],
+        primary_stats,
+        secondary_stats_by_level,
+        pool_group_delta,
+        reuse_delta,
+    ):
+        pool_group_ids = tuple(
+            pool_group_id
+            for pool_group_id in pool_groups_by_window.get(window_size, set())
+            if windows_by_pool_group.get(pool_group_id) == (window_size, ))
+        stats = self._build_iteration_stats(
+            pool_group_ids,
+            primary_stats,
+            secondary_stats_by_level,
+            pool_group_delta,
+            KV_CACHE_ITERATION_STATS_POOL_GROUP_FIELDS,
+        )
+        self._apply_iteration_stats_delta(
+            stats, reuse_delta, KV_CACHE_ITERATION_STATS_REUSE_FIELDS)
+        return stats
+
+    def _build_pool_group_iteration_stats(
+        self,
+        pool_group_id: int,
+        windows_by_pool_group: dict[int, tuple[int, ...]],
+        primary_stats,
+        secondary_stats_by_level,
+        pool_group_delta,
+    ) -> KVCacheV2PoolGroupIterationStats:
+        return KVCacheV2PoolGroupIterationStats(
+            pool_group_id=pool_group_id,
+            slot_size=tuple(primary_stats[pool_group_id].slot_size),
+            window_sizes=windows_by_pool_group.get(pool_group_id, ()),
+            stats=self._build_iteration_stats(
+                (pool_group_id, ),
+                primary_stats,
+                secondary_stats_by_level,
+                pool_group_delta,
+                KV_CACHE_ITERATION_STATS_POOL_GROUP_FIELDS,
+            ),
+        )
+
+    def _build_life_cycle_iteration_stats(
+        self,
+        life_cycle_id: int,
+        storage,
+        primary_stats,
+        secondary_stats_by_level,
+        reuse_delta,
+    ) -> KVCacheV2LifeCycleIterationStats:
+        typed_life_cycle_id = LifeCycleId(life_cycle_id)
+        life_cycle = self.impl._life_cycles.get_life_cycle(typed_life_cycle_id)
+        pool_group_id = int(storage.get_pool_group_index(typed_life_cycle_id))
+        return KVCacheV2LifeCycleIterationStats(
+            life_cycle_id=life_cycle_id,
+            pool_group_id=pool_group_id,
+            window_size=self._stats_life_cycle_window_size(life_cycle),
+            kind="attention"
+            if isinstance(life_cycle, AttnLifeCycle) else "ssm",
+            stats=self._build_iteration_stats(
+                (),
+                primary_stats,
+                secondary_stats_by_level,
+                reuse_delta,
+                KV_CACHE_ITERATION_STATS_REUSE_FIELDS,
+            ),
+        )
+
     def get_kv_cache_stats(self):
         kv_cache_stats = KvCacheStats()
-        kv_cache_stats.allocated_bytes = self.impl.get_quota(GPU_LEVEL)
+        storage_stats = self.impl._get_storage_level_stats(GPU_LEVEL)
+        pool_group_stats = storage_stats.pool_group_stats
+        committed_stats = self.impl.get_committed_stats()
+
+        kv_cache_stats.max_num_blocks = storage_stats.max_num_blocks
+        kv_cache_stats.free_num_blocks = storage_stats.free_num_blocks
+        kv_cache_stats.used_num_blocks = storage_stats.used_num_blocks
+        kv_cache_stats.tokens_per_block = self.tokens_per_block
+        kv_cache_stats.alloc_total_blocks = committed_stats.alloc_total_blocks
+        kv_cache_stats.alloc_new_blocks = committed_stats.alloc_new_blocks
+        kv_cache_stats.reused_blocks = committed_stats.reused_blocks
+        kv_cache_stats.missed_blocks = committed_stats.missed_blocks
+        total = kv_cache_stats.reused_blocks + kv_cache_stats.missed_blocks
+        kv_cache_stats.cache_hit_rate = (
+            0.0 if kv_cache_stats.reused_blocks == 0 or total == 0 else
+            kv_cache_stats.reused_blocks / total)
+        kv_cache_stats.num_free_blocks_per_window_size = {
+            window_size:
+            sum(pool_group_stats[pool_group_id].available
+                for pool_group_id in pool_group_ids)
+            for window_size, pool_group_ids in
+            self._storage_pool_groups_by_window().items()
+        }
+        kv_cache_stats.allocated_bytes = storage_stats.allocated_bytes
 
         return kv_cache_stats
 
@@ -2878,8 +3243,72 @@ class KVCacheManagerV2(BaseResourceManager):
         return self.event_manager.get_latest_events(timeout_ms)
 
     def get_iteration_stats(self):
-        """V2 does not support per-iteration stats yet."""
-        return None
+        if not self.enable_stats:
+            return None
+
+        storage = self.impl._storage
+        pool_groups_by_window = self._storage_pool_groups_by_window()
+        windows_by_pool_group = self._windows_by_pool_group(
+            pool_groups_by_window)
+        raw_iteration_stats = self.impl.get_and_reset_iteration_stats()
+        (reuse_deltas_by_window, reuse_deltas_by_life_cycle,
+         pool_group_deltas_by_window,
+         pool_group_deltas) = self._collect_iteration_stats_deltas(
+             raw_iteration_stats, storage)
+
+        windows = set(pool_groups_by_window)
+        windows.update(reuse_deltas_by_window)
+        windows.update(pool_group_deltas_by_window)
+        primary_stats = storage.get_statistics(GPU_LEVEL)
+        secondary_stats_by_level = [
+            storage.get_statistics(CacheLevel(level))
+            for level in range(1, int(storage.num_cache_levels))
+        ]
+
+        stats_by_window = {
+            window_size:
+            self._build_window_iteration_stats(
+                window_size,
+                pool_groups_by_window,
+                windows_by_pool_group,
+                primary_stats,
+                secondary_stats_by_level,
+                pool_group_deltas_by_window.get(window_size),
+                reuse_deltas_by_window.get(window_size),
+            )
+            for window_size in sorted(windows)
+        }
+
+        pool_group_ids = sorted(
+            set(windows_by_pool_group) | set(pool_group_deltas))
+        stats_by_pool_group = {
+            pool_group_id:
+            self._build_pool_group_iteration_stats(
+                pool_group_id,
+                windows_by_pool_group,
+                primary_stats,
+                secondary_stats_by_level,
+                pool_group_deltas.get(pool_group_id),
+            )
+            for pool_group_id in pool_group_ids
+        }
+
+        stats_by_life_cycle = {
+            life_cycle_id:
+            self._build_life_cycle_iteration_stats(
+                life_cycle_id,
+                storage,
+                primary_stats,
+                secondary_stats_by_level,
+                reuse_delta,
+            )
+            for life_cycle_id, reuse_delta in sorted(
+                reuse_deltas_by_life_cycle.items())
+        }
+
+        return KVCacheV2IterationStatsReport(stats_by_window,
+                                             stats_by_pool_group,
+                                             stats_by_life_cycle)
 
     def get_block_ids_per_seq(self, request_ids: List[int]) -> torch.Tensor:
         block_ids_per_seq = self.get_batch_cache_indices(request_ids)
@@ -2952,11 +3381,19 @@ class KVCacheManagerV2(BaseResourceManager):
             req.is_dummy_request = True
             req.paged_kv_block_ids = []
             if prepare_resource:
-                kv_cache = self._create_kv_cache(
-                    req.py_request_id,
-                    req.lora_task_id,
-                    input_tokens,
-                    cache_salt_id=req.cache_salt_id)
+                # Dummy/warmup request. ``stop_committing()`` below blocks all
+                # writes to the radix tree, so the choice of branch does not
+                # affect committed state. ``cache_salt_id`` is left defaulted
+                # to None to avoid coupling synthetic data to any salted branch.
+                kv_cache = self._create_kv_cache(req.py_request_id,
+                                                 req.lora_task_id,
+                                                 input_tokens,
+                                                 is_dummy=req.is_dummy)
+                # Saturated IndexMapper (e.g. disagg gen trans in progress)
+                # returns None; retry next iter.
+                if kv_cache is None:
+                    release_resources(req)
+                    return None
                 assert kv_cache.num_committed_tokens == 0
                 success = kv_cache.resume(self._stream.cuda_stream)
                 if not success:
@@ -2964,6 +3401,8 @@ class KVCacheManagerV2(BaseResourceManager):
                     return None
                 kv_cache.stop_committing()
                 dummy_capacity = token_num + self.num_extra_kv_tokens + num_extra_decoding_steps
+                if is_gen:
+                    kv_cache.enable_swa_scratch_reuse = False
                 # Need to hint the committed history to activate stale-block
                 # optimization and match the solver's pool budget.
                 success = kv_cache.resize(dummy_capacity,
@@ -2977,7 +3416,11 @@ class KVCacheManagerV2(BaseResourceManager):
                         req.py_request_id,
                         req.lora_task_id,
                         input_tokens,
-                        cache_salt_id=req.cache_salt_id)
+                        is_dummy=req.is_dummy)
+                    # Dummy path: see comment above, no salt.
+                    if draft_kv_cache is None:
+                        release_resources(req)
+                        return None
                     success = draft_kv_cache.resume(
                         draft_kv_cache_manager._stream.cuda_stream)
                     if not success:
@@ -3023,6 +3466,11 @@ class KVCacheManagerV2(BaseResourceManager):
         needed.  Releasing it early allows new requests to be scheduled while
         the KV cache blocks are still being transferred via NIXL/UCX.
         """
+        kv_cache = self.kv_cache_map.get(request_id)
+        if kv_cache is not None:
+            for i in range(self.max_beam_width):
+                for pool_idx in range(self.num_pools):
+                    kv_cache.set_base_page_index_buf(i, pool_idx, None)
         self.index_mapper.remove_sequence(request_id)
         self._early_freed_index_requests.add(request_id)
 
@@ -3044,9 +3492,12 @@ class KVCacheManagerV2(BaseResourceManager):
         self._allocated_draft_lens.pop(request.py_request_id, None)
         kv_cache = self.kv_cache_map.pop(request.py_request_id, None)
         if kv_cache is None:
+            self.impl.clear_stats_excluded(request.py_request_id)
             return
+        kv_cache.discard_pending_stats()
         self.try_commit_blocks_for_reuse(request, kv_cache)
         kv_cache.close()
+        self.impl.clear_stats_excluded(request.py_request_id)
         if request.py_request_id in self._early_freed_index_requests:
             self._early_freed_index_requests.discard(request.py_request_id)
         else:
@@ -3293,6 +3744,11 @@ class KVCacheManagerV2(BaseResourceManager):
                     raise ValueError(
                         f"Failed to resize history length of KV cache for request {req.py_request_id} to {req.context_current_position} tokens at context update"
                     )
+            if req.context_remaining_length == 0:
+                # Scratch blocks are only for prefill chunks. Disable them at
+                # the context/generation boundary so generation uses normal KV
+                # pages before the first generation allocation.
+                kv_cache.enable_swa_scratch_reuse = False
 
     def update_resources(self,
                          scheduled_batch: ScheduledRequests,
@@ -3334,17 +3790,77 @@ class KVCacheManagerV2(BaseResourceManager):
                                                     beam_width)
         assert copy_idx.shape[0] == num_seqs
 
+        if self.enable_swa_scratch_reuse:
+            # TODO: implement this in CUDA kernel
+            self._copy_batch_block_offsets_per_layer(dst_tensor, request_ids,
+                                                     copy_idx, num_seqs)
+            return
+
         copy_batch_block_offsets_to_device(self.host_kv_cache_block_offsets,
                                            dst_tensor, copy_idx,
                                            self.index_scales, self.kv_offset,
                                            self._stream.cuda_stream)
+
+    def _fill_converted_batch_page_indices(
+        self,
+        dst_offsets: torch.Tensor,
+        request_ids: List[int],
+        copy_idx: torch.Tensor,
+        layer_id: LayerId,
+        data_role: DataRole,
+        page_index_mode: PageIndexMode = PageIndexMode.PER_LAYER,
+    ) -> None:
+        pool_id = self.layer_to_pool_mapping_dict[layer_id]
+        converter = self.impl.get_page_index_converter(layer_id, data_role)
+        assert dst_offsets.device.type == "cpu"
+        assert dst_offsets.dtype == torch.int32
+        assert dst_offsets.size(0) >= len(request_ids)
+        assert dst_offsets.size(1) >= self.max_blocks_per_seq
+        dst_offsets_np = dst_offsets.numpy()
+
+        for row, request_id in enumerate(request_ids):
+            kv_cache = self.kv_cache_map[request_id]
+            base_indices = self.host_kv_cache_block_offsets[pool_id,
+                                                            int(copy_idx[row]),
+                                                            0].tolist()
+            converted = converter(base_indices, page_index_mode,
+                                  kv_cache.get_scratch_desc(pool_id))
+            if len(converted) > self.max_blocks_per_seq:
+                raise ValueError(
+                    f"Converted page indices length {len(converted)} exceeds "
+                    f"max_blocks_per_seq {self.max_blocks_per_seq}")
+            dst_offsets_np[row, :len(converted)] = converted
+
+    def _copy_batch_block_offsets_per_layer(self, dst_tensor: torch.Tensor,
+                                            request_ids: List[int],
+                                            copy_idx: torch.Tensor,
+                                            num_seqs: int) -> None:
+        assert self._host_attention_op_block_offsets_staging is not None
+        staging = self._host_attention_op_block_offsets_staging
+        staging[:self.num_attention_op_pools, :num_seqs].fill_(BAD_PAGE_INDEX)
+        for local_layer_idx in range(self.num_local_layers):
+            layer_id = LayerId(local_layer_idx)
+            self._fill_converted_batch_page_indices(
+                staging[local_layer_idx, :num_seqs, 0, :], request_ids,
+                copy_idx, layer_id, Role.KEY)
+            if self.kv_cache_type == CacheTypeCpp.SELFKONLY:
+                staging[local_layer_idx, :num_seqs,
+                        1, :] = staging[local_layer_idx, :num_seqs, 0, :]
+            else:
+                self._fill_converted_batch_page_indices(
+                    staging[local_layer_idx, :num_seqs, 1, :], request_ids,
+                    copy_idx, layer_id, Role.VALUE)
+        dst_tensor[:self.num_attention_op_pools, :num_seqs].copy_(
+            staging[:self.num_attention_op_pools, :num_seqs], non_blocking=True)
 
     def _create_kv_cache(self,
                          request_id: int,
                          lora_task_id: int | None,
                          input_tokens: Sequence[TokenIdExt] | None,
                          *,
-                         cache_salt_id: int | None = None):
+                         cache_salt_id: int | None = None,
+                         is_dummy: bool = False,
+                         expected_prompt_length: int | None = None):
         assert request_id not in self.kv_cache_map, f"KV cache for request {request_id} already exists"
         if self.index_mapper.num_free_slots() == 0:
             logger.warning(
@@ -3353,10 +3869,16 @@ class KVCacheManagerV2(BaseResourceManager):
                 "Skipping KV cache creation; request will retry next iteration.",
                 request_id, self.index_mapper.size(), self.index_mapper.size())
             return None
-        kv_cache = self.impl.create_kv_cache(lora_task_id,
-                                             input_tokens,
-                                             cache_salt_id=cache_salt_id)
+        kv_cache = self.impl.create_kv_cache(
+            ReuseScope(lora_id=lora_task_id, salt=cache_salt_id),
+            input_tokens,
+            id=request_id,
+            expected_prompt_length=expected_prompt_length,
+        )
         self.kv_cache_map[request_id] = kv_cache
+        if is_dummy:
+            self.impl.mark_stats_excluded(request_id)
+            kv_cache.discard_pending_stats()
         index = self.index_mapper.add_new_sequence(request_id)
         for i in range(self.max_beam_width):
             for pool_idx in range(self.num_pools):

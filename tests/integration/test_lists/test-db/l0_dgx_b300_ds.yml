@@ -17,6 +17,7 @@ l0_dgx_b300_ds:
       orchestrator: mpi
   tests:
   - accuracy/test_disaggregated_serving.py::TestDeepSeekV4Flash::test_auto_dtype
+  - accuracy/test_disaggregated_serving.py::TestDeepSeekV4Flash::test_gen_first
   - accuracy/test_disaggregated_serving.py::TestDeepSeekV3Lite::test_kv_cache_v2_nixl_python
   - accuracy/test_disaggregated_serving.py::TestLlama3_1_8BInstruct::test_kv_cache_v2_nixl_python
   - accuracy/test_disaggregated_serving.py::TestGemma3_1BInstruct::test_kv_cache_v2_nixl_python
@@ -38,11 +39,7 @@ l0_dgx_b300_ds:
   # Blackwell (model_config.py::resolve_moe_backend) and ~7% faster per step
   # than WIDEEP in our measurements. WIDEEP variant of the same test is
   # currently held out of CI (see test_auto_dtype[moe_backend=WIDEEP]).
-  # TODO: re-enable once DeepSeek-V4-Flash-Base is uploaded to the CI model
-  # share at /scratch.trt_llm_data/llm-models/DeepSeek-V4-Flash-Base. The
-  # model is currently missing on B300 CI workers, so LLM(...) treats the
-  # path as an HF repo id and HFValidationError fires.
-  # - accuracy/test_llm_api_pytorch.py::TestDeepSeekV4FlashBase::test_auto_dtype[moe_backend=TRTLLM] TIMEOUT (60)
+  - accuracy/test_disaggregated_serving.py::TestDeepSeekV4FlashBase::test_auto_dtype TIMEOUT (120)
   # V4-Flash NVFP4 aggregate smoke (TP=4, no EPLB): 1 MMLU sample.
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV4Flash::test_auto_dtype TIMEOUT (60)
   # V4-Flash-Base FP8 chunked-prefill smoke with FP8 KV cache. Keep

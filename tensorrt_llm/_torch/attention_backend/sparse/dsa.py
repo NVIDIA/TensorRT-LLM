@@ -99,13 +99,27 @@ def warmup_heuristic_topk_decode(top_k: int = 2048,
     indices = torch.empty((1, top_k), dtype=torch.int32, device=device)
     pre_idx = torch.zeros((1, hint_size), dtype=torch.int32, device=device)
     scratch = torch.empty((top_k, ), dtype=torch.float32, device=device)
+    # The default warmup geometry (num_cols=4096) falls below kSeqSmall=12288
+    # and routes to the Radix path with blocks_per_row=2 (num_rows=1 sweeps
+    # bp ∈ [2, maxByCols=2]). The cpp op rejects blocks_per_row > 1 without
+    # caller-owned radix aux scratch, so supply worst-case (kMaxBlocksPerRowDecode=10)
+    # buffers here. Cost is negligible (~80 KB) and the warmup is a one-shot.
+    _radix_max_bp = 10
+    radix_aux_indices = torch.empty((1, _radix_max_bp, top_k),
+                                    dtype=torch.int32,
+                                    device=device)
+    radix_aux_logits = torch.empty((1, _radix_max_bp, top_k),
+                                   dtype=torch.float32,
+                                   device=device)
     torch.ops.trtllm.indexer_topk_decode(logits,
                                          seq_lens,
                                          indices,
                                          1,
                                          top_k,
                                          pre_idx=pre_idx,
-                                         heuristic_scratch=scratch)
+                                         heuristic_scratch=scratch,
+                                         radix_aux_indices=radix_aux_indices,
+                                         radix_aux_logits=radix_aux_logits)
     torch.cuda.synchronize()
 
 
@@ -883,6 +897,34 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
                 dtype=torch.float32,
                 capture_graph=capture_graph,
             )
+
+        # Persistent scratch for Radix-split-work indexer path (blocks_per_row > 1).
+        # Mirrors the fix the Heuristic path applied above: per-call th::empty
+        # inside indexer_topk_decode produces stale pointers under CUDA Graph
+        # replay when the caching allocator is perturbed by chunked prefill at
+        # high CONC. Sized to the worst case kMaxBlocksPerRowDecode=10 from
+        # cpp/tensorrt_llm/kernels/indexerTopK.cu. Allocated unconditionally:
+        # even with enable_heuristic_topk=True, the dispatcher can fall back
+        # to Radix when canUseHeuristic returns False (small numColumns, etc.).
+        _radix_max_blocks_per_row = 10
+        _radix_max_gen_tokens = self.max_num_sequences * (1 +
+                                                          self.max_draft_tokens)
+        self.radix_aux_indices = self.get_empty(
+            self.cuda_graph_buffers,
+            (_radix_max_gen_tokens, _radix_max_blocks_per_row,
+             self.num_sparse_topk),
+            cache_name="radix_aux_indices",
+            dtype=torch.int32,
+            capture_graph=capture_graph,
+        )
+        self.radix_aux_logits = self.get_empty(
+            self.cuda_graph_buffers,
+            (_radix_max_gen_tokens, _radix_max_blocks_per_row,
+             self.num_sparse_topk),
+            cache_name="radix_aux_logits",
+            dtype=torch.float32,
+            capture_graph=capture_graph,
+        )
 
         # Create expanded buffers for MTP support
         self.create_expanded_buffers(capture_graph=capture_graph)
@@ -2216,6 +2258,31 @@ class Indexer(nn.Module):
             topk_indices_buffer[:num_ctx_tokens, :] = \
                 metadata.topk_indices_buffer[:num_ctx_tokens, :]
 
+        # Prefill→decode GVR handoff: seed each finishing-prefill sequence's
+        # heuristic_prev_topk slot with its own last-context-token top-K, so
+        # the FIRST decode step of that sequence gets a warm-started preIdx
+        # (~60-75% set-overlap with the eventual decode top-K on this
+        # workload) instead of the all-zero / all-(-1) cold start that the
+        # default `heuristic_prev_topk.zero_()` initialization leaves behind.
+        # Without this, GVR P2 secant on decode step 0 runs from a benign
+        # but uninformative seed (kernel +1 offset on zeros → all indices
+        # point at compressed-token position 1), wasting iterations.
+        # Slot convention (mirrors the existing decode write-back at the
+        # bottom of the decode block): new gens from finishing prefill
+        # append after currently-active gens, i.e., slots
+        # [num_generations : num_generations + num_contexts].
+        if (self._enable_heuristic_topk and has_prefill
+                and not metadata.skip_indexer_for_ctx_reqs):
+            local_layer = metadata.kv_cache_manager.layer_offsets[
+                self.layer_idx]
+            ctx_seq_lens = metadata.seq_lens[:num_contexts]
+            # Per-sequence last context-token offset (exclusive cumsum minus 1).
+            last_ctx_idx = (torch.cumsum(ctx_seq_lens, dim=0) -
+                            1).to(dtype=torch.long)
+            metadata.heuristic_prev_topk[
+                local_layer, num_generations:num_generations +
+                num_contexts].copy_(topk_indices_buffer[last_ctx_idx, :])
+
         if has_decode and not metadata.skip_indexer_for_gen_reqs:
             # Get decode lengths per request (from seq_lens) for validation
             gen_seq_lens = metadata.seq_lens[num_contexts:num_contexts +
@@ -2346,7 +2413,9 @@ class Indexer(nn.Module):
                         self.index_topk,
                         pre_idx=pre_idx,
                         heuristic_scratch=heuristic_scratch,
-                        compress_ratio=self.compress_ratio)
+                        compress_ratio=self.compress_ratio,
+                        radix_aux_indices=metadata.radix_aux_indices,
+                        radix_aux_logits=metadata.radix_aux_logits)
             else:
                 # padded
                 positions = torch.arange(

@@ -276,6 +276,136 @@ def test_fp8_quantize_ue8m0_vs_triton(dtype, m, k):
 
 
 # ---------------------------------------------------------------------------
+# Tests for fp8_quantize_1x128_packed_ue8m0 (SM100 fused quant+pack)
+# ---------------------------------------------------------------------------
+
+
+def _decode_packed_int32_ue8m0(packed_int32):
+    """Decode int32 packed UE8M0 scales to (exponent, value) per byte."""
+    b0 = (packed_int32 >> 0) & 0xFF
+    b1 = (packed_int32 >> 8) & 0xFF
+    b2 = (packed_int32 >> 16) & 0xFF
+    b3 = (packed_int32 >> 24) & 0xFF
+    return torch.stack([b0, b1, b2, b3], dim=-1)
+
+
+@pytest.mark.skipif(not isSM100Family(),
+                    reason="fp8_quantize_1x128_packed_ue8m0 is SM100 only.")
+@pytest.mark.parametrize("m,k", [
+    (1, 128),
+    (3, 256),
+    (4, 512),
+    (7, 512),
+    (16, 7168),
+    (127, 4096),
+    (1024, 7168),
+])
+def test_fp8_quantize_1x128_packed_ue8m0_matches_legacy(m, k):
+    """The fused packed op should produce the same FP8 output and UE8M0
+    scales as the legacy (fp8_quantize_1x128 → pack) two-kernel sequence.
+    The legacy path is the canonical reference for what deep_gemm expects.
+    """
+    from tensorrt_llm.quantization.utils import fp8_utils
+
+    torch.manual_seed(0)
+    x = torch.randn((m, k), device="cuda", dtype=torch.bfloat16)
+
+    fused_fp8, fused_packed = torch.ops.trtllm.fp8_quantize_1x128_packed_ue8m0(
+        x)
+
+    # Legacy: unpacked quant + manual pack
+    ref_fp8, ref_scale = torch.ops.trtllm.fp8_quantize_1x128(x, use_ue8m0=True)
+    # ref_scale shape from fp8_quantize_1x128: [num_n_blocks, m_padded] float
+    # Convert to the same packed (m, num_packed_sf_k) int32 layout as fused.
+    ref_packed = fp8_utils.get_col_major_tma_aligned_packed_tensor(
+        ref_scale[:, :m].t().contiguous().to(torch.float32))
+
+    # FP8 bytes must be bit-identical for the valid [0, m) region.
+    assert torch.equal(fused_fp8.view(torch.uint8),
+                       ref_fp8.view(torch.uint8)[:m]), \
+        f"FP8 mismatch for ({m}, {k})"
+
+    # Packed scales: compare element-by-element.
+    fused_contig = fused_packed.contiguous().view(torch.int32)
+    ref_contig = ref_packed.contiguous().view(torch.int32)
+    assert fused_contig.shape == ref_contig.shape, \
+        f"shape mismatch fused={fused_contig.shape} ref={ref_contig.shape}"
+    assert torch.equal(
+        fused_contig,
+        ref_contig), (f"Packed UE8M0 mismatch for ({m}, {k}): "
+                      f"fused[0,:]={fused_contig[0]} ref[0,:]={ref_contig[0]}")
+
+
+@pytest.mark.skipif(not isSM100Family(),
+                    reason="fp8_quantize_1x128_packed_ue8m0 is SM100 only.")
+@pytest.mark.parametrize("m,k", [
+    (1, 128),
+    (3, 256),
+    (7, 512),
+    (13, 7168),
+    (127, 4096),
+])
+def test_fp8_quantize_1x128_packed_ue8m0_padded_rows_are_zero(m, k):
+    """Padded rows [m, m_aligned) of the physical packed scale buffer must be 0.
+    The op returns a `(m, num_packed_sf_k)` strided view that hides the padded
+    rows; allocate a sentinel buffer immediately before the call so any
+    unwritten ints in the padded region surface as the sentinel.
+    """
+    if m % 4 == 0:
+        pytest.skip("m is already TMA-aligned; no padded rows to check")
+
+    torch.manual_seed(0)
+    m_padded = ((m + 3) // 4) * 4
+    num_packed_sf_k = ((k + 127) // 128 + 3) // 4
+    total_int32 = num_packed_sf_k * m_padded
+
+    # Poison the CUDA caching allocator: allocate-fill-free a buffer of the
+    # exact size, then call the op. The op's empty_cuda is likely to land in
+    # the same slab, so any unwritten ints surface as the sentinel.
+    SENTINEL = 0x5A5A5A  # 5,921,370 — fits in int32 and is distinctive
+    poison = torch.empty((num_packed_sf_k, m_padded),
+                         dtype=torch.int32,
+                         device="cuda")
+    poison.fill_(SENTINEL)
+    del poison
+    torch.cuda.synchronize()
+
+    x = torch.randn((m, k), device="cuda", dtype=torch.bfloat16)
+    _, packed = torch.ops.trtllm.fp8_quantize_1x128_packed_ue8m0(x)
+
+    # Physical layout: int32[num_packed_sf_k][m_padded] starting at packed.data_ptr().
+    # The returned tensor's storage_size() reflects only the logical view, so
+    # reach into it via the data_ptr + cudaMemcpyDeviceToDevice into a fresh
+    # full-sized tensor.
+    physical = torch.empty((num_packed_sf_k, m_padded),
+                           dtype=torch.int32,
+                           device="cuda")
+    # Use cudart memcpy via torch's torch.cuda.memory functions
+    src_ptr = packed.data_ptr()
+    dst_ptr = physical.data_ptr()
+    nbytes = total_int32 * 4
+    # Build a 1-D byte view at src_ptr by creating a fresh tensor of the
+    # appropriate size; this requires an untyped storage of full extent. The
+    # storage created by `at::from_blob` is sized to the strided view's reach
+    # (m, num_packed_sf_k) so we need an out-of-band copy. cudart via torch:
+    torch.cuda.synchronize()
+    import ctypes
+    libcudart = ctypes.CDLL("libcudart.so")
+    err = libcudart.cudaMemcpy(ctypes.c_void_p(dst_ptr),
+                               ctypes.c_void_p(src_ptr),
+                               ctypes.c_size_t(nbytes),
+                               ctypes.c_int(3))  # cudaMemcpyDeviceToDevice
+    assert err == 0, f"cudaMemcpy failed with err={err}"
+    torch.cuda.synchronize()
+
+    padded_tail = physical[:, m:m_padded]
+    nonzero = int((padded_tail != 0).sum().item())
+    assert nonzero == 0, (
+        f"Padded rows [{m}, {m_padded}) must be zero; got {nonzero} non-zero "
+        f"int32 in shape ({num_packed_sf_k}, {m_padded - m})")
+
+
+# ---------------------------------------------------------------------------
 # Tests for triton_fp8_quantize_1x128 (library Triton quant kernel)
 # ---------------------------------------------------------------------------
 

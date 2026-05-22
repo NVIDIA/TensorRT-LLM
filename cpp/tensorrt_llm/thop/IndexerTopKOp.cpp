@@ -38,7 +38,8 @@ namespace torch_ext
 
 void indexer_topk_decode(th::Tensor const& logits, th::Tensor const& seq_lens, th::Tensor const& indices,
     int64_t next_n, int64_t index_topk, std::optional<th::Tensor> const& pre_idx,
-    std::optional<th::Tensor> const& heuristic_scratch, int64_t compress_ratio)
+    std::optional<th::Tensor> const& heuristic_scratch, int64_t compress_ratio,
+    std::optional<th::Tensor> const& radix_aux_indices, std::optional<th::Tensor> const& radix_aux_logits)
 {
     TORCH_CHECK(compress_ratio > 0, "compress_ratio must be greater than 0");
 
@@ -116,22 +117,53 @@ void indexer_topk_decode(th::Tensor const& logits, th::Tensor const& seq_lens, t
     if (logits_dtype == at::ScalarType::Float)
     {
         // fp32 path — full Scheme X v1.2 dispatcher (GVR / Insertion / Radix /
-        // Radix-split-work). aux_logits/aux_indices needed only by split-work.
+        // Radix-split-work). Caller-owned radix_aux_{indices,logits} are the
+        // split-work scratch buffers and are dereferenced only when
+        // blocksPerRow > 1; for blocksPerRow == 1 the dispatcher passes
+        // nullptr through to the kernel and never touches them (see
+        // indexerTopK.cu's invokeIndexerTopKDecode bp==1 branch).
         int const blocks_per_row = tk::computeIndexerTopKDecodeBlocksPerRow(num_rows, num_columns, splitWorkThreshold);
-        th::Tensor aux_indices = th::empty({0}, th::TensorOptions().dtype(th::kInt32).device(logits.device()));
-        th::Tensor aux_logits = th::empty({0}, th::TensorOptions().dtype(th::kFloat32).device(logits.device()));
-        if (blocks_per_row > 1)
+        int32_t* aux_indices_ptr = nullptr;
+        float* aux_logits_ptr = nullptr;
+        if (radix_aux_indices.has_value() && radix_aux_logits.has_value())
         {
-            aux_indices = th::empty({num_rows, blocks_per_row, index_topk},
-                th::TensorOptions().dtype(th::kInt32).device(logits.device()));
-            aux_logits = th::empty({num_rows, blocks_per_row, index_topk},
-                th::TensorOptions().dtype(th::kFloat32).device(logits.device()));
+            // Caller-owned scratch with stable address (CUDA Graph safe;
+            // matches the heuristic_scratch convention noted above). All
+            // in-tree callers under CUDA Graph capture go through dsa.py's
+            // DSAtrtllmAttentionMetadata which always pre-allocates these.
+            auto const& ai = radix_aux_indices.value();
+            auto const& al = radix_aux_logits.value();
+            TORCH_CHECK(ai.is_cuda() && al.is_cuda(), "radix_aux_{indices,logits} must be CUDA tensors");
+            TORCH_CHECK(ai.device() == logits.device() && al.device() == logits.device(),
+                "radix_aux_{indices,logits} must be on the same device as logits");
+            TORCH_CHECK(ai.is_contiguous() && al.is_contiguous(), "radix_aux_{indices,logits} must be contiguous");
+            TORCH_CHECK(ai.scalar_type() == th::kInt32, "radix_aux_indices must be int32");
+            TORCH_CHECK(al.scalar_type() == th::kFloat32, "radix_aux_logits must be float32");
+            if (blocks_per_row > 1)
+            {
+                int64_t const needed_elts = static_cast<int64_t>(num_rows) * blocks_per_row * index_topk;
+                TORCH_CHECK(ai.numel() >= needed_elts && al.numel() >= needed_elts,
+                    "radix_aux_{indices,logits} must hold at least num_rows*blocks_per_row*index_topk elements (got ",
+                    ai.numel(), " / ", al.numel(), ", need ", needed_elts, ")");
+            }
+            aux_indices_ptr = ai.data_ptr<int32_t>();
+            aux_logits_ptr = al.data_ptr<float>();
+        }
+        else
+        {
+            // No caller-supplied scratch. Allowed only when blocksPerRow == 1
+            // (kernel never dereferences nullptr aux pointers in that case).
+            // blocksPerRow > 1 without caller-owned scratch is the original
+            // G4 CUDA-Graph stale-pointer hazard — reject early.
+            TORCH_CHECK(blocks_per_row == 1,
+                "radix_aux_{indices,logits} must be pre-allocated by the caller when blocks_per_row > 1 "
+                "(got blocks_per_row=",
+                blocks_per_row, "). Required for CUDA Graph safety.");
         }
         tk::invokeIndexerTopKDecode(logits.data_ptr<float>(), seq_lens.data_ptr<int32_t>(), indices.data_ptr<int32_t>(),
-            aux_logits.data_ptr<float>(), aux_indices.data_ptr<int32_t>(), splitWorkThreshold, num_rows, num_columns,
-            logits_stride_0, logits_stride_1, static_cast<int32_t>(next_n), static_cast<int32_t>(index_topk), preIdxPtr,
-            preIdxStride, preIdxCount, static_cast<float*>(heuristicScratchPtr), static_cast<int32_t>(compress_ratio),
-            stream);
+            aux_logits_ptr, aux_indices_ptr, splitWorkThreshold, num_rows, num_columns, logits_stride_0,
+            logits_stride_1, static_cast<int32_t>(next_n), static_cast<int32_t>(index_topk), preIdxPtr, preIdxStride,
+            preIdxCount, static_cast<float*>(heuristicScratchPtr), static_cast<int32_t>(compress_ratio), stream);
     }
     else if (logits_dtype == at::ScalarType::BFloat16)
     {
@@ -196,7 +228,8 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
     m.def(
         "indexer_topk_decode(Tensor logits, Tensor seq_lens, Tensor indices, int next_n, int index_topk=2048, "
-        "Tensor? pre_idx=None, Tensor? heuristic_scratch=None, int compress_ratio=1) -> ()");
+        "Tensor? pre_idx=None, Tensor? heuristic_scratch=None, int compress_ratio=1, "
+        "Tensor? radix_aux_indices=None, Tensor? radix_aux_logits=None) -> ()");
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)

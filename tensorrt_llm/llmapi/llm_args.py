@@ -352,9 +352,10 @@ class DeepSeekSparseAttentionConfig(BaseSparseAttentionConfig):
         description=
         "Whether to enable Guess-Verify-Refine (GVR) Top-K for the DSA decode "
         "indexer. GVR reuses previous-step Top-K indices as hints to reduce "
-        "threshold search iterations. Currently supported for index_topk=2048 "
-        "on Blackwell (SM100+) and falls back to the production insertion/radix "
-        "Top-K path when prerequisites are not met.")
+        "threshold search iterations. Currently supported for index_topk ∈ "
+        "{512, 1024, 2048} on Blackwell (SM100+), with compress_ratio ∈ {1, 4} "
+        "(DSv3.2 + DSv4 indexers). Falls back to the production insertion/"
+        "radix Top-K path when prerequisites are not met.")
     indexer_k_dtype: Literal["fp8", "fp4"] = Field(
         default="fp8",
         description=

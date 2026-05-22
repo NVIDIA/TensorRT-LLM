@@ -45,6 +45,7 @@ if not TYPE_CHECKING and find_spec("kv_cache_manager_v2") is not None:
         KVCacheManagerConfig,
         LayerGroupId,
         LayerId,
+        ReuseScope,
         SsmLayerConfig,
         TokenId,
         TokenIdExt,
@@ -95,6 +96,7 @@ else:
         KVCacheManagerConfig,
         LayerGroupId,
         LayerId,
+        ReuseScope,
         SsmLayerConfig,
         TokenId,
         TokenIdExt,
@@ -295,8 +297,9 @@ class TestNoBatching(TestKVCacheManagerV2):
         self, req_id: int, lora_task_id: int | None, prompt_len: int, decode_len: int
     ) -> Request:
         prompt = [self.next_token() for _ in range(prompt_len)]
+        reuse_scope = ReuseScope(lora_id=lora_task_id)
         return self.Request(
-            req_id, self.manager.create_kv_cache(lora_task_id, prompt), prompt, decode_len
+            req_id, self.manager.create_kv_cache(reuse_scope, prompt), prompt, decode_len
         )
 
     def run_request(self, req: Request, interval: int, refcheck: bool) -> float:
@@ -491,6 +494,47 @@ class TestNoBatching(TestKVCacheManagerV2):
 
         self.manager.clear_reusable_blocks()
 
+    def test_reuse_scope_isolates_reuse(self) -> None:
+        self.prepare(16 << 20, 0, 0, 2, None, 0, tokens_per_block=8)
+        tokens = [TokenId(i) for i in range(64)]
+        capacity = 128
+        default_scope = ReuseScope()
+        scoped = ReuseScope(lora_id=7, salt=11)
+
+        def commit_for(reuse_scope: ReuseScope | None) -> None:
+            kv_cache = self.manager.create_kv_cache(reuse_scope, tokens[:-1])
+            self.assertEqual(kv_cache._reuse_scope, reuse_scope or default_scope)
+            with TemporaryCudaStream([]) as stream_holder:
+                stream = cast(CudaStream, stream_holder.handle)
+                self.assertTrue(kv_cache.resume(stream))
+                self.assertTrue(kv_cache.resize(capacity))
+                uncommitted = tokens[kv_cache.num_committed_tokens :]
+                if uncommitted:
+                    kv_cache.commit(uncommitted)
+                kv_cache.stop_committing()
+            kv_cache.close()
+
+        def num_reused(reuse_scope: ReuseScope | None) -> int:
+            probed = self.manager.probe_reuse(reuse_scope, tokens[:-1])
+            kv_cache = self.manager.create_kv_cache(reuse_scope, tokens[:-1])
+            self.assertEqual(kv_cache._reuse_scope, reuse_scope or default_scope)
+            ret = kv_cache.num_committed_tokens
+            kv_cache.close()
+            self.assertEqual(probed, ret)
+            return ret
+
+        commit_for(scoped)
+        self.assertGreater(num_reused(scoped), 0)
+        self.assertEqual(num_reused(ReuseScope(lora_id=7, salt=12)), 0)
+        self.assertEqual(num_reused(ReuseScope(lora_id=8, salt=11)), 0)
+        self.assertEqual(num_reused(ReuseScope(lora_id=7)), 0)
+        self.assertEqual(num_reused(ReuseScope(salt=11)), 0)
+        self.assertEqual(num_reused(None), 0)
+
+        commit_for(None)
+        self.assertGreater(num_reused(None), 0)
+        self.assertGreater(num_reused(default_scope), 0)
+
     @parameterized.expand(list(itertools.product([False, True], repeat=2)))
     # @assert_no_ref_cycle
     def test_naive(self, use_external_page_index_buf: bool, use_block_quant: bool) -> None:
@@ -592,8 +636,9 @@ class TestBatching(TestKVCacheManagerV2):
             prompt = [next(token_id_gen) for _ in range(gen_length())]
         decode_len = gen_length()
         lora_task_id = None
+        reuse_scope = ReuseScope(lora_id=lora_task_id)
         kv_cache = self.manager.create_kv_cache(
-            lora_task_id, prompt[:-1] if self.enable_reuse else None, id=next(self.req_id_gen)
+            reuse_scope, prompt[:-1] if self.enable_reuse else None, id=next(self.req_id_gen)
         )
         DBG_PRINT and print(  # type: ignore[arg-type]
             f"created {kv_cache.id} with {kv_cache.num_committed_tokens} tokens reused"
@@ -741,7 +786,8 @@ class TestDisagg(TestKVCacheManagerV2):
         self.prepare(128 << 20, 128 << 20, 1 << 30, 36, 128, 0)
         lora_task_id = None
         prompt = [self.next_token() for _ in range(prompt_len)]
-        kv_cache = self.manager.create_kv_cache(lora_task_id, prompt)
+        reuse_scope = ReuseScope(lora_id=lora_task_id)
+        kv_cache = self.manager.create_kv_cache(reuse_scope, prompt)
         assert kv_cache.num_committed_tokens == 0
         with TemporaryCudaStream([]) as stream:
             success = kv_cache.resume(cast(CudaStream, stream.handle))

@@ -15,23 +15,17 @@ from tensorrt_llm._torch.attention_backend import trtllm_gen
 from tensorrt_llm._utils import get_sm_version, maybe_pin_memory, prefer_pinned
 from tensorrt_llm.bindings.internal import thop
 from tensorrt_llm.functional import AttentionMaskType
-from tensorrt_llm.llmapi import DeepSeekV4SparseAttentionConfig, SkipSoftmaxAttentionConfig
+from tensorrt_llm.llmapi import (DeepSeekV4SparseAttentionConfig,
+                                 SkipSoftmaxAttentionConfig)
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
-from ..utils import compute_swizzled_sf_shape, get_global_attrs, get_model_extra_attrs
-from .interface import (
-    AttentionBackend,
-    AttentionForwardArgs,
-    AttentionInputType,
-    AttentionMask,
-    AttentionMetadata,
-    KVCacheParams,
-    MLAParams,
-    PositionalEmbeddingParams,
-    PredefinedAttentionMask,
-    RopeParams,
-    merge_attention_forward_args,
-)
+from ..utils import (compute_swizzled_sf_shape, get_global_attrs,
+                     get_model_extra_attrs)
+from .interface import (AttentionBackend, AttentionForwardArgs,
+                        AttentionInputType, AttentionMask, AttentionMetadata,
+                        KVCacheParams, MLAParams, PositionalEmbeddingParams,
+                        PredefinedAttentionMask, RopeParams,
+                        merge_attention_forward_args)
 from .trtllm_gen import trtllm_gen_attention
 
 # Enable TRTLLM-Gen attention backend via environment variable (default: off).
@@ -231,7 +225,8 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             self.kv_cache_block_offsets = self.get_empty(
                 buffers,
                 [
-                    self.kv_cache_manager.num_pools, self.max_num_sequences, 2,
+                    self.kv_cache_manager.num_attention_op_pools,
+                    self.max_num_sequences, 2,
                     self.kv_cache_manager.max_blocks_per_seq
                 ],
                 cache_name="kv_cache_block_offsets",
@@ -248,7 +243,7 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                 self.draft_kv_cache_block_offsets = self.get_empty(
                     buffers,
                     [
-                        self.draft_kv_cache_manager.num_pools,
+                        self.draft_kv_cache_manager.num_attention_op_pools,
                         self.max_num_sequences, 2,
                         self.draft_kv_cache_manager.max_blocks_per_seq
                     ],
@@ -1235,6 +1230,16 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                 and v is None) or (not is_fused_qkv and k is not None
                                    and v is not None)
 
+        # `quant_scale_qkv` only makes sense paired with `quant_q_buffer`: the
+        # C++ op interprets the buffer as the destination of a pre-quantized
+        # FP8 Q (DSv4 fused norm+RoPE path). Passing the scale without the
+        # buffer is meaningless and indicates a wiring bug.
+        # `quant_q_buffer` alone is fine: the regular FP8-KV-cache path
+        # allocates it as the output buffer for the legacy quant kernel.
+        assert (forward_args.quant_scale_qkv is None
+                or forward_args.quant_q_buffer is not None), (
+                    "quant_scale_qkv requires quant_q_buffer to be set")
+
         attention_input_type = forward_args.attention_input_type
         if not self.is_mla_enable:
             if is_fused_qkv:
@@ -1560,6 +1565,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                 num_contexts=metadata.num_contexts,
                 num_ctx_tokens=metadata.num_ctx_tokens,
                 compressed_kv_cache_pool_ptr=compressed_kv_cache_pool_ptr,
+                quant_scale_qkv=forward_args.quant_scale_qkv,
             )
 
         if self.print_skip_softmax_stat:

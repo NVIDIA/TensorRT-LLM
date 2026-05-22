@@ -539,6 +539,16 @@ class ModelConfig(Generic[TConfig]):
         return None
 
     @staticmethod
+    def _is_deepseek_v4_base_checkpoint(checkpoint_dir: str) -> bool:
+        tensor_info = ModelConfig._get_safetensors_header_for_tensor(
+            checkpoint_dir, _DEEPSEEK_V4_ROUTED_EXPERT_WEIGHT)
+        if tensor_info is None:
+            return False
+
+        return ModelConfig._detect_deepseek_v4_routed_moe_layout(
+            checkpoint_dir) not in ("mxfp4", "nvfp4")
+
+    @staticmethod
     def _has_deepseek_v4_layer_only_modelopt_quant_config(
             quant_config_file: str) -> bool:
         with open(quant_config_file) as f:
@@ -681,12 +691,31 @@ class ModelConfig(Generic[TConfig]):
                 index_topk = sparse_attention_config.index_topk or pretrained_config.index_topk
                 indexer_max_chunk_size = sparse_attention_config.indexer_max_chunk_size
                 skip_indexer_for_short_seqs = sparse_attention_config.skip_indexer_for_short_seqs
+                # Pass-through DSA tuning flags so user-set values survive the
+                # V4 sparse_attention_config rebuild below. The V3.2 path
+                # already threads these explicitly (lines 723-727); without
+                # this block the V4 rebuild silently drops any user override
+                # back to subclass defaults (e.g., enable_heuristic_topk=False
+                # even when the user set it to True in --extra_llm_api_options).
+                use_cute_dsl_topk = sparse_attention_config.use_cute_dsl_topk
+                use_cute_dsl_paged_mqa_logits = sparse_attention_config.use_cute_dsl_paged_mqa_logits
+                q_split_threshold = sparse_attention_config.q_split_threshold
+                indexer_rope_interleave = sparse_attention_config.indexer_rope_interleave
+                enable_heuristic_topk = sparse_attention_config.enable_heuristic_topk
+                indexer_k_dtype = sparse_attention_config.indexer_k_dtype
             else:
                 index_n_heads = pretrained_config.index_n_heads
                 index_head_dim = pretrained_config.index_head_dim
                 index_topk = pretrained_config.index_topk
                 indexer_max_chunk_size = None
                 skip_indexer_for_short_seqs = True
+                # Defaults match DeepSeekSparseAttentionConfig field defaults.
+                use_cute_dsl_topk = False
+                use_cute_dsl_paged_mqa_logits = False
+                q_split_threshold = 8192
+                indexer_rope_interleave = False
+                enable_heuristic_topk = False
+                indexer_k_dtype = "fp8"
             indexer_config = {}
             indexer_config['index_n_heads'] = index_n_heads
             indexer_config['index_head_dim'] = index_head_dim
@@ -694,6 +723,13 @@ class ModelConfig(Generic[TConfig]):
             indexer_config['indexer_max_chunk_size'] = indexer_max_chunk_size
             indexer_config[
                 'skip_indexer_for_short_seqs'] = skip_indexer_for_short_seqs
+            indexer_config['use_cute_dsl_topk'] = use_cute_dsl_topk
+            indexer_config[
+                'use_cute_dsl_paged_mqa_logits'] = use_cute_dsl_paged_mqa_logits
+            indexer_config['q_split_threshold'] = q_split_threshold
+            indexer_config['indexer_rope_interleave'] = indexer_rope_interleave
+            indexer_config['enable_heuristic_topk'] = enable_heuristic_topk
+            indexer_config['indexer_k_dtype'] = indexer_k_dtype
             return indexer_config
 
         # Use file lock to prevent race conditions when multiple processes
@@ -753,6 +789,11 @@ class ModelConfig(Generic[TConfig]):
                             indexer_k_dtype=indexer_k_dtype)
                 elif pretrained_config.architectures[
                         0] == "DeepseekV4ForCausalLM":
+                    if cls._is_deepseek_v4_base_checkpoint(checkpoint_dir):
+                        logger.warning(
+                            "Support for DeepSeek-V4 Base checkpoints is "
+                            "experimental. For better supported behavior, use "
+                            "a DeepSeek-V4 Instruct checkpoint.")
                     indexer_config = update_sparse_attention_indexer_config(
                         pretrained_config, kwargs)
                     checkpoint_compress_ratios = getattr(
@@ -768,7 +809,6 @@ class ModelConfig(Generic[TConfig]):
                     if checkpoint_window_size is None:
                         checkpoint_window_size = getattr(
                             pretrained_config, 'sliding_window', None)
-                    indexer_k_dtype = sparse_attention_config.indexer_k_dtype if sparse_attention_config else 'fp8'
                     if sparse_attention_config:
                         compress_ratios = sparse_attention_config.compress_ratios
                         window_size = sparse_attention_config.window_size
@@ -812,7 +852,6 @@ class ModelConfig(Generic[TConfig]):
                         'sparse_attention_config'] = DeepSeekV4SparseAttentionConfig(
                             compress_ratios=compress_ratios,
                             window_size=window_size,
-                            indexer_k_dtype=indexer_k_dtype,
                             **indexer_config)
             else:
                 raise ValueError(

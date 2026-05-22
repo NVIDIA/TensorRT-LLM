@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, NamedTuple, cast
 
@@ -445,7 +445,10 @@ class BatchedLockTarget(NamedTuple):
 
 
 def batched_lock_to_gpu(
-    kv_cache: "_KVCache", tasks: Sequence[BatchedLockTarget]
+    kv_cache: "_KVCache",
+    tasks: Sequence[BatchedLockTarget],
+    migration_recorder: Callable[[Sequence[Page], Sequence[Slot], CacheLevel, CacheLevel], None]
+    | None = None,
 ) -> list["_SharedPageLock"]:
     "Lock pages after migrating all pages to GPU. If migration fails, no locking happens."
     storage = kv_cache.manager._storage
@@ -461,13 +464,18 @@ def batched_lock_to_gpu(
         requirements[lc2pg[t.life_cycle]] += 1
 
     try:
-        storage.prepare_free_slots(GPU_LEVEL, requirements)
+        storage.prepare_free_slots(GPU_LEVEL, requirements, migration_recorder)
         partitioned = partition(tasks, lambda p: (p.page.cache_level, lc2pg[p.life_cycle]))
         for (lvl, pg_idx), part in partitioned.items():
             if lvl == GPU_LEVEL:
                 continue
             storage._batched_migrate(
-                pg_idx, GPU_LEVEL, lvl, [p.page for p in part], update_src=True
+                pg_idx,
+                GPU_LEVEL,
+                lvl,
+                [p.page for p in part],
+                update_src=True,
+                migration_recorder=migration_recorder,
             )
     except Exception:
         for t, e in zip(tasks, scheduled_for_eviction):

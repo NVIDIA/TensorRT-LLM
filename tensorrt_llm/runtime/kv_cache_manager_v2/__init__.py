@@ -14,7 +14,7 @@
 # limitations under the License.
 
 from . import rawref
-from ._block_radix_tree import gen_multi_modal_tokens
+from ._block_radix_tree import ReuseScope, gen_multi_modal_tokens
 from ._common import (
     NDEBUG,
     CacheLevel,
@@ -61,6 +61,7 @@ from ._event_manager import (
     UniqueToken,
 )
 from ._life_cycle_registry import LayerGroupId, LifeCycleId
+from ._stats import KVCacheIterationStatsDelta, KVCacheStatsDelta
 from ._storage import BufferId
 
 __all__ = [
@@ -83,6 +84,7 @@ __all__ = [
     "DEFAULT_BEAM_INDEX",
     "LayerId",
     "Priority",
+    "ReuseScope",
     "CacheLevel",
     "CacheTier",
     "CudaStream",
@@ -106,4 +108,6 @@ __all__ = [
     "PageIndexConverter",
     "PageIndexMode",
     "ScratchDesc",
+    "KVCacheIterationStatsDelta",
+    "KVCacheStatsDelta",
 ]

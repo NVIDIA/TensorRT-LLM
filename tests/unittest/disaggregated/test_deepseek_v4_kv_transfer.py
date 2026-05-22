@@ -8,11 +8,6 @@ different TP/PP/DP configurations.
 import os
 import threading
 import uuid
-
-# Exclude UCX IB transport (avoid NIXL setup hangs without IB) and gdr_copy
-# (avoid SIGSEGV at process exit from UCX rcache cleanup; gdr_copy disabled
-# falls back to cuda_ipc / cuda_copy without affecting correctness).
-os.environ.setdefault("UCX_TLS", "^ib,gdr_copy")
 from typing import Dict, List, Optional, Tuple
 
 import pytest
@@ -370,7 +365,7 @@ def _get_attn_types_for_layer(
         types.extend(
             [
                 DeepseekV4AttentionType.COMPRESS,
-                DeepseekV4AttentionType.COMPRESSOR_STATE,
+                DeepseekV4AttentionType.COMPRESSOR_KV,
                 DeepseekV4AttentionType.COMPRESSOR_SCORE,
             ]
         )
@@ -378,7 +373,7 @@ def _get_attn_types_for_layer(
         types.extend(
             [
                 DeepseekV4AttentionType.INDEXER_COMPRESS,
-                DeepseekV4AttentionType.INDEXER_COMPRESSOR_STATE,
+                DeepseekV4AttentionType.INDEXER_COMPRESSOR_KV,
                 DeepseekV4AttentionType.INDEXER_COMPRESSOR_SCORE,
             ]
         )
@@ -388,9 +383,9 @@ def _get_attn_types_for_layer(
 # Mirror transceiver.py windowed-block trim: only in-window blocks are transferred.
 _WINDOWED_ATTN_TYPES = {
     DeepseekV4AttentionType.SWA,
-    DeepseekV4AttentionType.COMPRESSOR_STATE,
+    DeepseekV4AttentionType.COMPRESSOR_KV,
     DeepseekV4AttentionType.COMPRESSOR_SCORE,
-    DeepseekV4AttentionType.INDEXER_COMPRESSOR_STATE,
+    DeepseekV4AttentionType.INDEXER_COMPRESSOR_KV,
     DeepseekV4AttentionType.INDEXER_COMPRESSOR_SCORE,
 }
 

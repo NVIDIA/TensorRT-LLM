@@ -8,11 +8,6 @@ TP/PP/DP/MLA/sliding-window configurations for both V1 and V2 cache managers.
 import os
 import threading
 import uuid
-
-# Exclude UCX IB transport (avoid NIXL setup hangs without IB) and gdr_copy
-# (avoid SIGSEGV at process exit from UCX rcache cleanup; gdr_copy disabled
-# falls back to cuda_ipc / cuda_copy without affecting correctness).
-os.environ.setdefault("UCX_TLS", "^ib,gdr_copy")
 from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import Dict, List, Optional
@@ -179,9 +174,9 @@ class ThreadSafeDistributed:
         key = f"bcast_{idx}"
         if self.rank == root:
             self._s[key] = obj
-        self._s["barrier"].wait()
+        self._s["world_barrier"].wait()
         result = self._s[key]
-        self._s["barrier"].wait()
+        self._s["world_barrier"].wait()
         return result
 
     def allgather(self, obj):
@@ -192,12 +187,17 @@ class ThreadSafeDistributed:
             if key not in self._s:
                 self._s[key] = [None] * self._world_size
             self._s[key][self.rank] = obj
-        self._s["barrier"].wait()
+        self._s["world_barrier"].wait()
         result = list(self._s[key])
-        self._s["barrier"].wait()
+        self._s["world_barrier"].wait()
         return result
 
     def pp_allgather(self, obj):
+        # pp_allgather is a per-tp-rank-group collective. Real distributed
+        # backends (NCCL/MPI) use a sub-communicator with pp_size members,
+        # one per pp_rank within the same tp_rank. Match that semantics here
+        # with a per-tp-group barrier so partial-participation early-returns
+        # in the transceiver do not deadlock the world barrier.
         idx = self._pp_ag_idx
         self._pp_ag_idx += 1
         key = f"pp_ag_{idx}_tp{self._tp_rank}"
@@ -205,12 +205,15 @@ class ThreadSafeDistributed:
             if key not in self._s:
                 self._s[key] = [None] * self._pp_size
             self._s[key][self._pp_rank] = obj
-        self._s["barrier"].wait()
+        barrier = self._s["pp_barriers"][self._tp_rank]
+        barrier.wait()
         result = list(self._s[key])
-        self._s["barrier"].wait()
+        barrier.wait()
         return result
 
     def tp_allgather(self, obj):
+        # tp_allgather is a per-pp-rank-group collective (tp_size members
+        # per pp_rank). See pp_allgather above for rationale.
         idx = self._tp_ag_idx
         self._tp_ag_idx += 1
         key = f"tp_ag_{idx}_pp{self._pp_rank}"
@@ -218,9 +221,10 @@ class ThreadSafeDistributed:
             if key not in self._s:
                 self._s[key] = [None] * self._tp_size
             self._s[key][self._tp_rank] = obj
-        self._s["barrier"].wait()
+        barrier = self._s["tp_barriers"][self._pp_rank]
+        barrier.wait()
         result = list(self._s[key])
-        self._s["barrier"].wait()
+        barrier.wait()
         return result
 
 
@@ -511,7 +515,15 @@ def create_instance_transceivers(
 ) -> List[KvCacheTransceiverV2]:
     """Create KvCacheTransceiverV2 for all ranks via threaded init."""
     world_size = tp * pp
-    shared = {"barrier": threading.Barrier(world_size), "lock": threading.Lock()}
+    shared = {
+        # World-wide collectives (broadcast, allgather) — all world_size threads.
+        "world_barrier": threading.Barrier(world_size),
+        # pp_allgather: one barrier per tp_rank, sized pp.
+        "pp_barriers": [threading.Barrier(pp) for _ in range(tp)],
+        # tp_allgather: one barrier per pp_rank, sized tp.
+        "tp_barriers": [threading.Barrier(tp) for _ in range(pp)],
+        "lock": threading.Lock(),
+    }
     results = [None] * world_size
     errors = [None] * world_size
     threads = []

@@ -50,12 +50,42 @@ LayerGroupId: TypeAlias = LifeCycleId
 CacheLevel = NewType("CacheLevel", int)
 TokenId = NewType("TokenId", int)
 TokenIdExt = Union[TokenId, bytes]
+
+class ReuseScope(NamedTuple):
+    lora_id: int | None = None
+    salt: int | None = None
+    def to_bytes(self) -> bytes: ...
+
 LayerId = NewType("LayerId", int)
 CudaStream = NewType("CudaStream", int)
 BeamIndex = NewType("BeamIndex", int)
 MemAddress = NewType("MemAddress", int)
 Priority = NewType("Priority", int)
 PoolGroupIndex = NewType("PoolGroupIndex", int)
+
+# From _stats.py
+@dataclass(slots=True)
+class KVCacheStatsDelta:
+    alloc_total_blocks: int = 0
+    alloc_new_blocks: int = 0
+    reused_blocks: int = 0
+    missed_blocks: int = 0
+
+@dataclass(slots=True)
+class KVCacheIterationStatsDelta:
+    iter_alloc_total_blocks: int = 0
+    iter_alloc_new_blocks: int = 0
+    iter_reused_blocks: int = 0
+    iter_full_reused_blocks: int = 0
+    iter_partial_reused_blocks: int = 0
+    iter_missed_blocks: int = 0
+    iter_gen_alloc_blocks: int = 0
+    iter_onboard_blocks: int = 0
+    iter_onboard_bytes: int = 0
+    iter_offload_blocks: int = 0
+    iter_offload_bytes: int = 0
+    iter_intra_device_copy_blocks: int = 0
+    iter_intra_device_copy_bytes: int = 0
 
 # From _config.py
 DataRole = NewType("DataRole", str)
@@ -138,8 +168,9 @@ class KVCacheManagerConfig:
     constraints: list[BatchDesc] = ...
     typical_step: BatchDesc | None = None
     ssm_reuse_interval: int = 512
-    helix_config: HelixConfig | None = None
     enable_swa_scratch_reuse: bool = False
+    enable_stats: bool = True
+    helix_config: HelixConfig | None = None
 
 # From _event_manager.py
 EventBlockHash: TypeAlias = int | str
@@ -252,11 +283,11 @@ class _KVCache:
     def __init__(
         self,
         manager: "KVCacheManager",
-        lora_task_id: int | None,
-        input_tokens: Sequence[TokenIdExt] | None,
+        reuse_scope: ReuseScope,
+        reuse_match: Any | None,
         id: Any,
         custom_priority_callback: Callable[[int, Any], Priority],
-        cache_salt_id: int | None,
+        cache_salt_id: int | None = None,
     ) -> None: ...
     def set_base_page_index_buf(
         self, beam_idx: BeamIndex, layer_group_id: LayerGroupId, buf: memoryview | None
@@ -271,6 +302,8 @@ class _KVCache:
     def finish_event(self) -> Any: ...
     @property
     def num_blocks(self) -> int: ...
+    def commit_pending_stats(self) -> KVCacheStatsDelta: ...
+    def discard_pending_stats(self) -> None: ...
     def close(self) -> None: ...
     @property
     def beam_width(self) -> BeamIndex: ...
@@ -391,14 +424,26 @@ class KVCacheManager:
     ) -> PageIndexConverter: ...
     def create_kv_cache(
         self,
-        lora_task_id: int | None = None,
+        reuse_scope: ReuseScope | None = None,
         input_tokens: Sequence[TokenIdExt] | None = None,
         id: Any = None,
         custom_priority_callback: Callable[[int, Any], Priority] = ...,
-        cache_salt_id: int | None = None,
     ) -> _KVCache: ...
+    def probe_reuse(
+        self,
+        reuse_scope: ReuseScope | None = None,
+        input_tokens: Sequence[TokenIdExt] | None = None,
+    ) -> int: ...
     def resize(self, cache_level: CacheLevel, quota: int, best_efforts: bool = False) -> bool: ...
     def get_quota(self, cache_level: CacheLevel) -> int: ...
+    def get_committed_stats(self) -> KVCacheStatsDelta: ...
+    def get_and_reset_iteration_stats(self) -> dict[LifeCycleId, KVCacheIterationStatsDelta]: ...
+    def mark_stats_dirty(self, kv_cache_id: int | None) -> None: ...
+    def clear_stats_dirty(self, kv_cache_id: int | None) -> None: ...
+    def get_dirty_stats_kv_cache_ids(self) -> set[int]: ...
+    def mark_stats_excluded(self, kv_cache_id: int | None) -> None: ...
+    def clear_stats_excluded(self, kv_cache_id: int | None) -> None: ...
+    def is_stats_excluded(self, kv_cache_id: int | None) -> bool: ...
     @property
     def cache_tier_list(self) -> Sequence[CacheTier]: ...
     @property
