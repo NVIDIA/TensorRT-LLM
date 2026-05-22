@@ -171,14 +171,64 @@ class BaseMultimodalInputProcessor(ABC):
         multimodal_embedding: Dict[str, List[torch.Tensor]],
         sampling_params: SamplingParams,
     ) -> Tuple[List[int], Optional[ExtraProcessedInputs]]:
-        """
-        Handle externally provided multimodal input embeddings.
+        """Handle externally provided multimodal input embeddings.
 
-        While inputs["multi_modal_data"] is handled by __call__, this method is intended to process
-        inputs["multi_modal_embeddings"].
+        While inputs["multi_modal_data"] is handled by __call__, this method is
+        intended to process inputs["multi_modal_embeddings"].
+
+        Auto-detokenizes `prompt_token_ids` --> `prompt` for non-fast-path VLMs
+        before delegating to `_attach_multimodal_embeddings_impl`. Subclasses
+        override `_attach_multimodal_embeddings_impl` (not this wrapper).
+        """
+        if (inputs.get("prompt_token_ids") is not None
+                and inputs.get("prompt") is None
+                and not self.supports_token_id_mm_expansion):
+            inputs = self._detokenize_to_text_prompt(inputs, sampling_params)
+        return self._attach_multimodal_embeddings_impl(inputs,
+                                                       multimodal_embedding,
+                                                       sampling_params)
+
+    def _attach_multimodal_embeddings_impl(
+        self,
+        inputs: TextPrompt,
+        multimodal_embedding: Dict[str, List[torch.Tensor]],
+        sampling_params: SamplingParams,
+    ) -> Tuple[List[int], Optional[ExtraProcessedInputs]]:
+        """Subclass hook for `attach_multimodal_embeddings`.
+
+        Subclasses that support `multi_modal_embeddings` override this method
+        rather than the wrapper `attach_multimodal_embeddings` itself.
+        Default raises NotImplementedError.
         """
         raise NotImplementedError(
             "Input processor does not support multimodal embedding input")
+
+    def _detokenize_to_text_prompt(
+        self,
+        inputs: TextPrompt,
+        sampling_params: SamplingParams,
+    ) -> TextPrompt:
+        """Decode `prompt_token_ids` to text and rebuild `inputs` as a TextPrompt.
+
+        Used by `__call__` and `attach_multimodal_embeddings` to normalize
+        tokenized inputs for non-fast-path VLMs before delegating to the
+        subclass-specific text-prompt path.
+
+        Also flips `sampling_params.add_special_tokens` to False so the
+        subclass's re-tokenization doesn't double-add BOS/EOS on top of the
+        ones already encoded in `prompt_token_ids`.
+        """
+        prompt = self.tokenizer.decode(inputs["prompt_token_ids"])
+        if sampling_params is not None and sampling_params.add_special_tokens:
+            logger.debug(
+                "Setting add_special_tokens to False because prompt_token_ids "
+                "were provided to generate. VLMs will re-encode the prompt.")
+            sampling_params.add_special_tokens = False
+        return TextPrompt(
+            prompt=prompt,
+            multi_modal_data=inputs.get("multi_modal_data"),
+            mm_processor_kwargs=inputs.get("mm_processor_kwargs") or {},
+        )
 
     @property
     @abstractmethod
@@ -210,14 +260,20 @@ class BaseMultimodalInputProcessor(ABC):
         """Dispatch between text-prompt and tokenized+MM fast paths.
 
         - Tokenized+MM fast path (`prompt_token_ids` set, `multi_modal_data` set,
-          no `prompt`): delegate to `call_with_token_ids`.
+          no `prompt`): if the subclass opts in via
+          `supports_token_id_mm_expansion`, delegate to `call_with_token_ids`;
+          otherwise detokenize first and fall through to `call_with_text_prompt`.
         - Else (text prompt with/without MM data, or tokenize-only requests):
           delegate to `call_with_text_prompt`.
         """
         if (inputs.get("prompt_token_ids") is not None
                 and inputs.get("multi_modal_data") is not None
                 and inputs.get("prompt") is None):
-            return self.call_with_token_ids(inputs, sampling_params)
+            if self.supports_token_id_mm_expansion:
+                return self.call_with_token_ids(inputs, sampling_params)
+            # Fast path not supported by this VLM — detokenize and fall through
+            # to the text-prompt path.
+            inputs = self._detokenize_to_text_prompt(inputs, sampling_params)
         return self.call_with_text_prompt(inputs, sampling_params)
 
     @abstractmethod

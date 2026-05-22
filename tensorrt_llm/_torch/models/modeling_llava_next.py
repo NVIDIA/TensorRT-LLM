@@ -329,7 +329,7 @@ class LlavaNextInputProcessor(BaseMultimodalInputProcessor,
 
         return expanded_ids, mm_token_length, mm_token_offsets
 
-    def attach_multimodal_embeddings(
+    def _attach_multimodal_embeddings_impl(
         self, inputs: TextPrompt,
         multimodal_embedding: Dict[str, List[torch.Tensor]],
         sampling_params: SamplingParams
