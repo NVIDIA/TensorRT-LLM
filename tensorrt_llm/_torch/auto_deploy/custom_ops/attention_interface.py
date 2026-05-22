@@ -1063,12 +1063,18 @@ class SequenceInfo:
             slot_idx = torch.arange(bs)
         assert len(slot_idx) >= bs
 
+        # Replicate the vanilla single-pool warm-up data for every registered
+        # pool so VSWA models (num_window_groups >= 2) receive one entry per
+        # pool. Block geometry (tokens_per_block, max_blocks_per_seq) is
+        # uniform across pools, so the same cache_loc / cu_num_pages tensors
+        # are valid metadata for every pool.
+        n_pools = max(1, self.num_window_groups)
         self.nest_sequences(
             input_ids.flatten(),
             cu_seqlen=torch.arange(bs + 1, dtype=torch.int) * seq_len,
             input_pos=0,  # no cache history
-            cache_loc_per_pool=[cache_loc],  # vanilla page assignments
-            cu_num_pages_per_pool=[cu_num_pages],  # vanilla page assignments
+            cache_loc_per_pool=[cache_loc for _ in range(n_pools)],
+            cu_num_pages_per_pool=[cu_num_pages for _ in range(n_pools)],
             slot_idx=slot_idx,  # vanilla slot indices
             **extra_args,
         )
