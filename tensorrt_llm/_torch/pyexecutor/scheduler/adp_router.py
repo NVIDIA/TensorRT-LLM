@@ -455,7 +455,7 @@ class KVCacheAwareADPRouter(ADPRouter):
         # Cold-start warmup: ranks not yet targeted through this router.
         # Empty set disables warmup; see ``route_requests``.
         self._pending_warmup_ranks: Set[int] = (
-            set(range(self.dist.tp_size)) if cold_start_warmup else set()
+            set(range(self.dist.mapping.dp_size)) if cold_start_warmup else set()
         )
         # Requests still sending KV to GEN are invisible in active_requests;
         # fold them back in via the transfer manager (see create_rank_state).
@@ -614,9 +614,8 @@ class KVCacheAwareADPRouter(ADPRouter):
                 all_ranks_num_active_tokens[target_dp_rank] += effective
                 scheduled = True
                 all_ranks_new_requests[target_dp_rank].append(req_item)
-            # Any targeted rank counts as warmed; cap-saturation also
-            # discards to avoid the synthesiser looping on a busy rank.
-            if target_dp_rank is not None:
+                # Only mark a rank as warmed once a request actually landed
+                # there; saturated picks stay pending for a later call.
                 self._pending_warmup_ranks.discard(target_dp_rank)
 
             if not scheduled:
