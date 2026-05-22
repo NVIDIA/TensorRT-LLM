@@ -41,7 +41,8 @@ l0_dgx_b300_ds:
   # currently held out of CI (see test_auto_dtype[moe_backend=WIDEEP]).
   - accuracy/test_disaggregated_serving.py::TestDeepSeekV4FlashBase::test_auto_dtype TIMEOUT (120)
   # V4-Flash NVFP4 aggregate smoke (TP=4, no EPLB): 1 MMLU sample.
-  - accuracy/test_llm_api_pytorch.py::TestDeepSeekV4Flash::test_auto_dtype TIMEOUT (60)
+  - accuracy/test_llm_api_pytorch.py::TestDeepSeekV4Flash::test_auto_dtype[moe_backend=TRTLLM] TIMEOUT (60)
+  - accuracy/test_llm_api_pytorch.py::TestDeepSeekV4Flash::test_auto_dtype[moe_backend=CUTLASS] TIMEOUT (60)
   # V4-Flash-Base FP8 chunked-prefill smoke with FP8 KV cache. Keep
   # max_num_tokens small in the test to force chunked prefill scheduling.
   # Held out for the same model-availability reason as test_auto_dtype above;
