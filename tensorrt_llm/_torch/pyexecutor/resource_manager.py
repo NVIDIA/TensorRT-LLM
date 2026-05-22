@@ -48,8 +48,8 @@ from tensorrt_llm.runtime.kv_cache_hash import (
 # isort: off
 from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     DEFAULT_BEAM_INDEX, AttentionLayerConfig, BufferConfig, CacheTierConfig,
-    GpuCacheTierConfig, HostCacheTierConfig, PageIndexMode,
-    ReuseScope, SwaScratchReuseConfig)
+    GpuCacheTierConfig, HostCacheTierConfig, PageIndexMode, ReuseScope,
+    SwaScratchReuseConfig)
 # isort: on
 from tensorrt_llm.runtime.kv_cache_manager_v2 import KVCacheIterationStatsDelta
 from tensorrt_llm.runtime.kv_cache_manager_v2 import \
