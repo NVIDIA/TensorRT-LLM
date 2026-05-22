@@ -19,7 +19,7 @@ import numpy as np
 import torch
 
 from tensorrt_llm._torch.visual_gen.config import PipelineComponent
-from tensorrt_llm._torch.visual_gen.output import MediaOutput
+from tensorrt_llm._torch.visual_gen.output import PipelineOutput
 from tensorrt_llm._torch.visual_gen.pipeline import BasePipeline
 from tensorrt_llm._torch.visual_gen.pipeline_registry import register_pipeline
 from tensorrt_llm.logger import logger
@@ -414,7 +414,7 @@ class QwenImagePipeline(BasePipeline):
         seed: int = 42,
         max_sequence_length: int = 1024,
         sigmas: Optional[list] = None,
-    ) -> MediaOutput:
+    ) -> PipelineOutput:
         """Text-to-image generation.
 
         Implementation mirrors ``diffusers.QwenImagePipeline.__call__``
@@ -521,4 +521,4 @@ class QwenImagePipeline(BasePipeline):
         if getattr(self, "rank", 0) == 0:
             logger.info("Pipeline total: %.2fs", time.time() - pipeline_start)
 
-        return MediaOutput(image=image)
+        return PipelineOutput(image=image)
