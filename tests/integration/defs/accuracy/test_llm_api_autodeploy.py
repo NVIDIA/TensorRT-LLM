@@ -1321,10 +1321,13 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
         if get_device_count() < world_size:
             pytest.skip("Not enough devices for world size, skipping test")
 
-        # Override the default MoE topology via `apply_sharding_hints`:
-        # `dist_mapping` selects MoE-TP vs MoE-EP, and ``"moe"`` in
-        # `shard_layers` lets the sharding pass wire up the MoE all_reduce
-        # (inserted by ``QuantizeMXFP4MOE._apply_trtllm`` when tp_size > 1).
+        # Override the default MoE topology via `apply_sharding_hints.dist_mapping`.
+        # The sharding invariants (`enabled`, `shard_layers: ["mha", "moe"]`, and
+        # `detect_sharding`/`sharding_transform_executor` disable) live in
+        # `gpt_oss.yaml`; here we only set the per-parametrize TP/EP mapping.
+        # `shard_layers=["mha","moe"]` (from yaml) lets the sharding pass wire up
+        # the MoE all_reduce inserted by ``QuantizeMXFP4MOE._apply_trtllm`` when
+        # tp_size > 1.
         extra_kwargs = {}
         if moe_topology is not None and world_size > 1:
             if moe_topology == "tp":
@@ -1334,16 +1337,7 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
             else:
                 raise ValueError(f"unknown moe_topology={moe_topology!r}")
             extra_kwargs["transforms"] = {
-                "detect_sharding": {
-                    "enabled": False
-                },
-                "sharding_transform_executor": {
-                    "enabled": False
-                },
                 "apply_sharding_hints": {
-                    "enabled": True,
-                    "requires_shape_prop": True,
-                    "shard_layers": ["mha", "moe"],
                     "dist_mapping": {
                         "tp": world_size,
                         "moe_tp": moe_tp,
