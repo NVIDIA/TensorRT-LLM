@@ -33,6 +33,9 @@ def _mock_dist(tp_rank=0, tp_size=1, has_cp_helix=False):
     dist = MagicMock()
     dist.tp_rank = tp_rank
     dist.tp_size = tp_size
+    # ADP scheduling assumes ``enable_attention_dp=True``, so ``dp_size``
+    # mirrors ``tp_size`` (see ``Mapping.dp_size``).
+    dist.mapping.dp_size = tp_size
     dist.has_cp_helix = has_cp_helix
     return dist
 
@@ -409,7 +412,7 @@ class TestKVCacheAwareADPRouterWarmup:
         ]
 
     def test_pending_initialised_in_ctor(self):
-        """``cold_start_warmup=True`` should populate ``_pending_warmup_ranks`` from dist.tp_size."""
+        """``cold_start_warmup=True`` should populate ``_pending_warmup_ranks`` from dist.mapping.dp_size."""
         router = self._make_router(tp_size=4)
         assert router._pending_warmup_ranks == {0, 1, 2, 3}
 
@@ -469,9 +472,9 @@ class TestKVCacheAwareADPRouterWarmup:
         assert [r.id for r in result[0]] == [1]
         assert router._pending_warmup_ranks == {1, 3}
 
-    def test_cap_saturation_discards_busy_rank(self):
-        """A cap-saturated synthesised target is still removed from pending
-        so the synthesiser doesn't loop on the same busy rank."""
+    def test_cap_saturation_keeps_rank_pending(self):
+        """A saturated warmup pick stays in ``_pending_warmup_ranks`` so a
+        later routing call can still seed it once load drops."""
         tp_size = 2
         router = self._make_router(tp_size=tp_size)
         router._all_ranks_prefix_matches = self._no_match(tp_size, [0])
@@ -483,7 +486,7 @@ class TestKVCacheAwareADPRouterWarmup:
         router.route_requests(
             states, [_make_request_item(0, num_tokens=10)], max_num_active_requests=1
         )
-        assert 0 not in router._pending_warmup_ranks
+        assert 0 in router._pending_warmup_ranks
 
     def test_empty_pending_disables_warmup(self):
         """Once pending is empty, routing reverts to pure scoring."""
