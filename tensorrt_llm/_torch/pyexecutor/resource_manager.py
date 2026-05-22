@@ -48,7 +48,8 @@ from tensorrt_llm.runtime.kv_cache_hash import (
 # isort: off
 from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     DEFAULT_BEAM_INDEX, AttentionLayerConfig, BufferConfig, CacheTierConfig,
-    GpuCacheTierConfig, HostCacheTierConfig, PageIndexMode, ReuseScope)
+    GpuCacheTierConfig, HostCacheTierConfig, PageIndexMode, ReuseScope,
+    SwaScratchReuseConfig)
 # isort: on
 from tensorrt_llm.runtime.kv_cache_manager_v2 import KVCacheIterationStatsDelta
 from tensorrt_llm.runtime.kv_cache_manager_v2 import \
@@ -1940,6 +1941,7 @@ class KVCacheManagerV2(BaseResourceManager):
         self.kv_factor = 1 if kv_cache_type == CacheTypeCpp.SELFKONLY else 2
         from ..speculative import get_num_extra_kv_tokens
         self.num_extra_kv_tokens = get_num_extra_kv_tokens(spec_config)
+        self.max_draft_len = spec_config.max_draft_len if spec_config is not None else 0
         self.max_total_draft_tokens = spec_config.max_total_draft_tokens if spec_config is not None else 0
 
         self.event_buffer_max_size = kv_cache_config.event_buffer_max_size
@@ -2459,13 +2461,21 @@ class KVCacheManagerV2(BaseResourceManager):
             if self.kv_cache_type != CacheTypeCpp.SELFKONLY:
                 buffer_type.append(Role.VALUE_BLOCK_SCALE)
 
+        scratch_reuse_config = None
+        if self.enable_swa_scratch_reuse:
+            # Context requests will allocate num_extra_kv_tokens tokens for spec decoding.
+            # Cache manager should not take them into account when calculating scratch range.
+            # Therefore set max_rewind_len to num_extra_kv_tokens.
+            scratch_reuse_config = SwaScratchReuseConfig(
+                max_rewind_len=self.num_extra_kv_tokens)
+
         return KVCacheManagerConfigPy(
             tokens_per_block=tokens_per_block,
             vocab_size=vocab_size,
             cache_tiers=cache_tiers,
             max_util_for_resume=kv_cache_config.max_util_for_resume,
             enable_stats=self.enable_stats,
-            enable_swa_scratch_reuse=self.enable_swa_scratch_reuse,
+            swa_scratch_reuse=scratch_reuse_config,
             layers=[
                 AttentionLayerConfig(
                     layer_id=layer_id,
