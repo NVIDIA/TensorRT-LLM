@@ -100,6 +100,39 @@ class TestQwen2_5_VL_7B(LlmapiAccuracyTestHarness):
             task.evaluate(llm, sampling_params=self.sampling_params)
 
 
+class TestExaone4_5_33B(LlmapiAccuracyTestHarness):
+    MODEL_NAME = "LGAI-EXAONE/EXAONE-4.5-33B"
+    MODEL_PATH = f"{llm_models_root()}/EXAONE-4.5-33B"
+    MAX_NUM_TOKENS = 16384
+
+    # EXAONE 4.5 ends each assistant turn with `<|endofturn|>`.
+    sampling_params = SamplingParams(
+        max_tokens=MMMU.MAX_OUTPUT_LEN,
+        truncate_prompt_tokens=MMMU.MAX_INPUT_LEN,
+        stop="<|endofturn|>",
+    )
+
+    kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.6)
+
+    @pytest.mark.parametrize(
+        "enable_chunked_prefill,max_num_tokens",
+        [
+            (False, MAX_NUM_TOKENS),
+            (True, 1024),
+        ],
+        ids=["full_budget", "forced_chunked_prefill"],
+    )
+    def test_auto_dtype(self, enable_chunked_prefill, max_num_tokens):
+        with LLM(
+            self.MODEL_PATH,
+            enable_chunked_prefill=enable_chunked_prefill,
+            max_num_tokens=max_num_tokens,
+            kv_cache_config=self.kv_cache_config,
+        ) as llm:
+            task = MMMU(self.MODEL_NAME)
+            task.evaluate(llm, sampling_params=self.sampling_params)
+
+
 class TestLlava_V1_6_Mistral_7B(LlmapiAccuracyTestHarness):
     MODEL_NAME = "llava-hf/llava-v1.6-mistral-7b-hf"
     MODEL_PATH = f"{llm_models_root()}/llava-v1.6-mistral-7b-hf"
@@ -422,6 +455,43 @@ class TestMistralLarge3_675B(LlmapiAccuracyTestHarness):
             enable_attention_dp=attention_dp,
             kv_cache_config=kv_cache_config,
         ) as llm:
+            task = MMMU(self.MODEL_NAME)
+            task.evaluate(llm, sampling_params=self.sampling_params)
+
+
+@pytest.mark.skip_less_device_memory(80000)
+class TestQwen3_5_35B_A3B_VL(LlmapiAccuracyTestHarness):
+    MODEL_NAME = "Qwen/Qwen3.5-35B-A3B"
+    MODEL_PATH = f"{llm_models_root()}/Qwen3.5-35B-A3B"
+    MAX_NUM_TOKENS = 16384
+    MAX_BATCH_SIZE = 32
+
+    sampling_params = SamplingParams(
+        max_tokens=MAX_NUM_TOKENS,
+        truncate_prompt_tokens=MMMU.MAX_INPUT_LEN,
+        stop="<|endoftext|>",
+    )
+
+    kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.6, enable_block_reuse=False)
+
+    def _make_llm(self, model_path: str) -> LLM:
+        return LLM(
+            model_path,
+            max_num_tokens=self.MAX_NUM_TOKENS,
+            max_batch_size=self.MAX_BATCH_SIZE,
+            kv_cache_config=self.kv_cache_config,
+        )
+
+    def test_auto_dtype(self) -> None:
+        with self._make_llm(self.MODEL_PATH) as llm:
+            task = MMMU(self.MODEL_NAME)
+            task.evaluate(llm, sampling_params=self.sampling_params)
+
+    @skip_pre_hopper
+    def test_fp8_prequantized(self) -> None:
+        model_path = f"{llm_models_root()}/Qwen3.5-35B-A3B-FP8"
+        with self._make_llm(model_path) as llm:
+            assert llm.args.quant_config.quant_algo == QuantAlgo.FP8_BLOCK_SCALES
             task = MMMU(self.MODEL_NAME)
             task.evaluate(llm, sampling_params=self.sampling_params)
 
