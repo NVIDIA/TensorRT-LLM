@@ -537,7 +537,7 @@ def selective_state_update_mtp_ssm_cache_trtllm(
     # (CppMambaHybridCacheManager) packs SSM + conv state into each block, giving
     # `ssm_states` a non-contiguous batch stride. Stage through a contiguous copy
     # and write the updated slots back when the kernel mutates the state.
-    state_in = state if state.is_contiguous() else state.contiguous()
+    state_in = state.contiguous()
     torch.ops.trtllm.mamba2_mtp_ssm_cache_update(
         state_in,
         x,
