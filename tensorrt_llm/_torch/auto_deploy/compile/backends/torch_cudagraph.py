@@ -516,11 +516,9 @@ class PiecewiseCapturedGraph(nn.Module):
 
         self.split_info = split_graph_at_dynamic_ops(gm)
 
-        # When multi-stream transforms reclassify ALL static partitions as
-        # dynamic (e.g. multi_stream_moe + multi_stream_mla_attn on every
-        # layer), there are zero capturable static segments.  Piecewise CUDA
-        # graphs are impossible — fall back to eager execution for
-        # prefill/mixed batches (monolithic CG still handles decode).
+        # If splitting leaves no capturable static segments, piecewise CUDA
+        # graphs are impossible; fall back to eager execution for prefill/mixed
+        # batches (monolithic CG still handles decode).
         if not self.split_info.static_submod_indices:
             ad_logger.warning(
                 "PiecewiseCapturedGraph: no static partitions after splitting "
