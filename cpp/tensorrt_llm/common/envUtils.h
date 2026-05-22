@@ -115,13 +115,13 @@ std::string const& getEnvKVCacheTimeOutputPath();
 
 bool getEnvTryZCopyForKVCacheTransfer();
 
-// Opt-in for the disagg mid-flight cancellation surface. Gates the full
-// detection + cancellation + mark-as-error triple, which must move together
-// for memory safety, e.g., no UAF.
+// Opt-in for the disagg mid-flight cancellation + deferred-cleanup surface.
 // Returns true when ``TRTLLM_DISAGG_ENABLE_INFLIGHT_CANCEL=1``; defaults to
-// false (cancel chain dormant: timeouts are still detected and logged once
-// per request, but no in-flight cancellation is issued and the future is left
-// to complete naturally).
+// false. When unset, timeouts are still detected and logged once per request,
+// but no in-flight cancellation is issued, deferred-cleanup paths are
+// inactive, and futures are left to complete naturally. The
+// detection + cancellation + mark-as-error triple is atomic by design and
+// must move together for memory safety.
 bool getEnvDisaggEnableInflightCancel();
 
 // Force deterministic behavior for all kernels.

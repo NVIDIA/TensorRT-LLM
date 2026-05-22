@@ -490,7 +490,7 @@ public:
                 isCancelled = true;
             }
         }
-        if (!isCancelled)
+        if (!isCancelled && common::getEnvDisaggEnableInflightCancel())
         {
             // Request is the mCurrentRequest (or not even in mReadyResponses)
             // — the queue-drain branch can't abort it. Flip the per-request
@@ -512,6 +512,13 @@ public:
             {
                 TLLM_LOG_WARNING("Cannot cancel request %zu", llmRequest.mRequestId);
             }
+        }
+        else if (!isCancelled)
+        {
+            TLLM_LOG_WARNING(
+                "Cannot cancel request %zu (in-flight cancel disabled; "
+                "set TRTLLM_DISAGG_ENABLE_INFLIGHT_CANCEL=1 to opt in)",
+                llmRequest.mRequestId);
         }
         return isCancelled;
     }
@@ -1256,7 +1263,7 @@ public:
             std::lock_guard<std::mutex> lg(mInFlightCancelMutex);
             mInFlightCancelFlags.erase(*queuedCancelledReqId);
         }
-        if (!isCancelled)
+        if (!isCancelled && common::getEnvDisaggEnableInflightCancel())
         {
             // Request already dequeued past mRequestsQueue (worker thread has
             // picked it up; most likely blocked inside requestSync ->
@@ -1278,6 +1285,13 @@ public:
             {
                 TLLM_LOG_WARNING("Cannot cancel request %zu", llmRequest.mRequestId);
             }
+        }
+        else if (!isCancelled)
+        {
+            TLLM_LOG_WARNING(
+                "Cannot cancel request %zu (in-flight cancel disabled; "
+                "set TRTLLM_DISAGG_ENABLE_INFLIGHT_CANCEL=1 to opt in)",
+                llmRequest.mRequestId);
         }
         return isCancelled;
     }

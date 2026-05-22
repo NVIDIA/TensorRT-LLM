@@ -678,8 +678,11 @@ class PyExecutor:
         # Initialize disagg PP termination handler if needed
         self._disagg_pp_termination_handler = None
         if self.dist.pp_size > 1 and self.enable_kv_cache_reuse and self.kv_cache_transceiver:
+            terminate_fn = (self._do_terminate_request_if_safe
+                            if is_disagg_inflight_cancel_enabled() else
+                            self._do_terminate_request)
             self._disagg_pp_termination_handler = DisaggPPTerminationHandler(
-                self.dist, self._do_terminate_request_if_safe)
+                self.dist, terminate_fn)
 
         if self.dist.pp_size > 1:
             self.event_loop = self._executor_loop_pp
@@ -4319,10 +4322,13 @@ class PyExecutor:
 
         failed_requests = (list(self.active_requests)
                            if requests is None else list(requests))
-        deferred_requests = [
-            request for request in failed_requests
-            if self._is_unquiesced_disagg_transfer(request)
-        ]
+        if is_disagg_inflight_cancel_enabled():
+            deferred_requests = [
+                request for request in failed_requests
+                if self._is_unquiesced_disagg_transfer(request)
+            ]
+        else:
+            deferred_requests = []
         if deferred_requests:
             # Deferred requests rely on a follow-up DISAGG_TRANS_ERROR
             # transition to surface the failure. The transition is
@@ -4377,6 +4383,8 @@ class PyExecutor:
                 or request.is_disagg_context_transmission_state)
 
     def _can_terminate_request_now(self, request: LlmRequest) -> bool:
+        if not is_disagg_inflight_cancel_enabled():
+            return True
         if request.is_disagg_context_transmission_state:
             # STOP-GAP: partial reuse asks _handle_responses to terminate
             # completed context requests before async KV transfer has always
