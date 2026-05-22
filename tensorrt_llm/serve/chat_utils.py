@@ -375,7 +375,7 @@ def parse_chat_messages_coroutines(
     #    `content_parts` - overwriting any STRING-style placeholders inserted here.
     # See also: `_resolve_content_format` (inputs/utils.py) for the full resolution used downstream.
     registry_format = MULTIMODAL_PLACEHOLDER_REGISTRY.get_content_format(
-        model_type)
+        type(model_config).model_type)
     if registry_format is not None:
         content_format = registry_format
     else:
@@ -404,14 +404,16 @@ def parse_chat_messages_coroutines(
             # prepend/append according to placeholder_placement.
             content_parts = parsed_msg.get("content_parts")
             interleave = MULTIMODAL_PLACEHOLDER_REGISTRY.get_interleave_placeholders(
-                model_type)
+                type(model_config).model_type)
             if content_parts and interleave:
                 parsed_msg["content"] = interleave_mm_placeholders(
-                    model_type, content_parts, msg_placeholder_counts,
+                    type(model_config).model_type, content_parts,
+                    msg_placeholder_counts,
                     mm_data_tracker.placeholder_modalities())
             else:
                 parsed_msg["content"] = add_multimodal_placeholders(
-                    model_type, parsed_msg["content"], msg_placeholder_counts)
+                    type(model_config).model_type, parsed_msg["content"],
+                    msg_placeholder_counts)
         mm_placeholder_counts.append(msg_placeholder_counts)
 
     return conversation, mm_data_tracker.retrieve_all_async(

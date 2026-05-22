@@ -29,6 +29,7 @@ from ..modules.fused_moe.moe_load_balancer import (
     MoeLoadBalancer, maybe_create_moe_load_balancer)
 from ..virtual_memory import RestoreMode
 from ..virtual_memory import scope as virtual_memory_scope
+from .config_utils import resolve_hf_torch_dtype, resolve_mamba_ssm_cache_dtype
 
 _KV_CACHE_MAP = {
     "fp8": QuantAlgo.FP8.value,
@@ -44,12 +45,10 @@ def validate_and_set_mamba_ssm_cache_dtype(
         mamba_ssm_stochastic_rounding: bool = False,
         mamba_ssm_philox_rounds: int = 10) -> None:
     if mamba_ssm_cache_dtype == "auto":
-        hf_dtype = getattr(config.pretrained_config, "mamba_ssm_cache_dtype",
-                           None)
-        if hf_dtype is not None:
-            mamba_ssm_cache_dtype = str_dtype_to_torch(hf_dtype)
-        else:
-            mamba_ssm_cache_dtype = config.pretrained_config.torch_dtype
+        mamba_ssm_cache_dtype = (
+            resolve_mamba_ssm_cache_dtype(config.pretrained_config)
+            or resolve_hf_torch_dtype(config.pretrained_config)
+            or config.torch_dtype)
     else:
         mamba_ssm_cache_dtype = str_dtype_to_torch(mamba_ssm_cache_dtype)
 

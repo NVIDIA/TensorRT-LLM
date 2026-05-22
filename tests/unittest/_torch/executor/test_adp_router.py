@@ -463,6 +463,53 @@ def test_schedule_attention_dp_requests_empty_lists(
     assert len(result) == 0
 
 
+def test_schedule_attention_dp_requests_serve_default_relax_None_does_not_crash(
+    attention_dp_config, all_ranks_num_active_requests, all_ranks_num_active_tokens
+):
+    """Regression: trtllm-serve produces SchedulingParams with attention_dp_relax=None.
+
+    openai_server.py builds ``SchedulingParams(agent_hierarchy=...)`` on every
+    chat request, leaving ``attention_dp_rank`` and ``attention_dp_relax`` at
+    their dataclass default of None. With >=2 such requests in one scheduling
+    iteration, ``sorted(new_requests, key=get_relax_value)`` previously raised
+    ``TypeError: '<' not supported between instances of 'NoneType' and
+    'NoneType'`` because the key returned None for every item.
+
+    Why prior coverage missed it:
+      * Every ADP CI E2E test calls ``LLM(...).generate`` where
+        ``request.scheduling_params`` is None, so ``base_worker`` leaves
+        ``py_scheduling_params=None`` and ``get_relax_value`` short-circuits
+        on the ``if scheduling_params is None`` branch.
+      * The mock factory in this file defaults ``attention_dp_relax=False``,
+        not None, so existing unit tests never construct the buggy shape.
+
+    Use the real ``SchedulingParams`` dataclass so the test tracks the actual
+    production default — if it ever flips back to None this stays accurate.
+    """
+    from tensorrt_llm.scheduling_params import SchedulingParams
+
+    def _make_serve_shaped_request(req_id):
+        mock_request = Mock()
+        mock_request.py_scheduling_params = SchedulingParams()
+        mock_request.input_token_ids = [1, 2, 3]
+        return RequestQueueItem(req_id, mock_request)
+
+    new_requests = [_make_serve_shaped_request(i) for i in range(4)]
+
+    # No raise = sort key is None-safe. All four items have
+    # attention_dp_rank=None so they fall into remaining_unscheduled and
+    # then balance across ranks; with capacity 8 per rank they all land.
+    all_ranks_new_requests, _ = _assign(
+        all_ranks_num_active_requests,
+        all_ranks_num_active_tokens,
+        new_requests,
+        attention_dp_config["max_num_active_requests"],
+    )
+
+    total_assigned = sum(len(reqs) for reqs in all_ranks_new_requests.values())
+    assert total_assigned == 4
+
+
 def test_schedule_attention_dp_requests_expected_num_active_calculation(
     attention_dp_config, all_ranks_num_active_requests, all_ranks_num_active_tokens
 ):

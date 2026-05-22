@@ -16,6 +16,9 @@
 
 All setup (dependency installation, repo cloning, env vars) is handled by
 a session-scoped pytest fixture. Configuration is read from verl_config.yml.
+
+Each wrapper function maps 1-to-1 to a single verl pytest case, enabling
+fine-grained waiving without blanket-skipping a whole file.
 """
 
 import os
@@ -28,6 +31,13 @@ import yaml
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _CONFIG_PATH = os.path.join(_HERE, "verl_config.yml")
 VERL_ROOT = os.path.join(_HERE, "verl_repo")
+
+_ROLLOUT = "tests/workers/rollout/rollout_trtllm"
+_ASYNC_SERVER = f"{_ROLLOUT}/test_async_server.py"
+_ADAPTER = f"{_ROLLOUT}/test_adapter.py"
+_ROLLOUT_UTILS = f"{_ROLLOUT}/test_trtllm_rollout_utils.py"
+_INTER_NODE = f"{_ROLLOUT}/test_inter_node_rollout.py"
+_ABORT = f"{_ROLLOUT}/test_trtllm_abort.py"
 
 
 def _load_config():
@@ -126,20 +136,107 @@ def _run_verl_test(test_path, extra_args=None, timeout=600):
     assert result.returncode == 0, f"Verl test failed with return code {result.returncode}"
 
 
-def test_async_server():
-    _run_verl_test("tests/workers/rollout/rollout_trtllm/test_async_server.py")
+def _run_single(verl_file, case_name, timeout=600):
+    """Run exactly one verl pytest case by name."""
+    _run_verl_test(verl_file, extra_args=["-k", case_name], timeout=timeout)
 
 
-def test_adapter():
-    _run_verl_test("tests/workers/rollout/rollout_trtllm/test_adapter.py")
+# ---------------------------------------------------------------------------
+# test_async_server.py wrappers
+# ---------------------------------------------------------------------------
 
 
-def test_rollout_utils():
-    _run_verl_test(
-        "tests/workers/rollout/rollout_trtllm/test_trtllm_rollout_utils.py",
-        extra_args=[
-            "-k",
-            "not (test_unimodal_generate or test_unimodal_batch_generate)",
-        ],
-        timeout=900,
-    )
+def test_placement_group_with_sub_ray_resource_pool():
+    _run_single(_ASYNC_SERVER, "test_placement_group_with_sub_ray_resource_pool")
+
+
+def test_placement_group_with_ray_resource_pool():
+    _run_single(_ASYNC_SERVER, "test_placement_group_with_ray_resource_pool")
+
+
+def test_placement_group_multi_node_ray_resource_pool():
+    _run_single(_ASYNC_SERVER, "test_placement_group_multi_node_ray_resource_pool")
+
+
+def test_placement_group_multi_node_multi_replica():
+    _run_single(_ASYNC_SERVER, "test_placement_group_multi_node_multi_replica")
+
+
+def test_async_generate():
+    _run_single(_ASYNC_SERVER, "test_async_generate")
+
+
+def test_async_memory_management():
+    _run_single(_ASYNC_SERVER, "test_async_memory_management")
+
+
+# ---------------------------------------------------------------------------
+# test_adapter.py wrappers
+# ---------------------------------------------------------------------------
+
+
+def test_make_async_request_get_method():
+    _run_single(_ADAPTER, "test_make_async_request_get_method")
+
+
+def test_make_async_request_post_method():
+    _run_single(_ADAPTER, "test_make_async_request_post_method")
+
+
+def test_make_async_request_http_error():
+    _run_single(_ADAPTER, "test_make_async_request_http_error")
+
+
+def test_make_async_request_max_attempts_exceeded():
+    _run_single(_ADAPTER, "test_make_async_request_max_attempts_exceeded")
+
+
+def test_init_without_device_mesh():
+    _run_single(_ADAPTER, "test_init_without_device_mesh")
+
+
+# ---------------------------------------------------------------------------
+# test_trtllm_rollout_utils.py wrappers  (900 s — multimodal cases are slow)
+# ---------------------------------------------------------------------------
+
+
+def test_unimodal_generate():
+    _run_single(_ROLLOUT_UTILS, "test_unimodal_generate", timeout=900)
+
+
+def test_unimodal_batch_generate():
+    _run_single(_ROLLOUT_UTILS, "test_unimodal_batch_generate", timeout=900)
+
+
+def test_multimodal_generate_with_image():
+    _run_single(_ROLLOUT_UTILS, "test_multimodal_generate_with_image", timeout=900)
+
+
+def test_multimodal_different_image_sizes():
+    _run_single(_ROLLOUT_UTILS, "test_multimodal_different_image_sizes", timeout=900)
+
+
+def test_multimodal_text_only_fallback():
+    _run_single(_ROLLOUT_UTILS, "test_multimodal_text_only_fallback", timeout=900)
+
+
+def test_wake_sleep_cycle():
+    _run_single(_ROLLOUT_UTILS, "test_wake_sleep_cycle", timeout=900)
+
+
+# ---------------------------------------------------------------------------
+# test_inter_node_rollout.py wrappers  (900 s — multi-node)
+# ---------------------------------------------------------------------------
+
+
+def test_inter_node_trtllm_rollout():
+    _run_single(_INTER_NODE, "test_inter_node_trtllm_rollout", timeout=900)
+
+
+# ---------------------------------------------------------------------------
+# test_trtllm_abort.py wrappers
+# ---------------------------------------------------------------------------
+
+
+def test_trtllm_abort():
+    _run_single(_ABORT, "test_trtllm_abort")

@@ -219,6 +219,10 @@ class Mamba2Metadata:
         self.state_indices = torch.zeros(max_batch_size,
                                          dtype=torch.int32,
                                          device="cuda")
+        # Stable data_ptr() of the CUDA tensor we alias (if any) — used to
+        # detect cache-manager buffer reallocation that would silently break
+        # CUDA graph replays.
+        self._state_indices_aliased_ptr = None
 
         self.replay_work_items = torch.zeros(max_batch_size,
                                              REPLAY_WORK_ITEM_WIDTH,
@@ -304,10 +308,42 @@ class Mamba2Metadata:
             ]
             indices = kv_cache_manager.get_state_indices(
                 batch_request_ids, is_padding)
-            for i, idx in enumerate(indices):
-                self.state_indices_cpu[i] = idx
-            self.state_indices[:batch_size].copy_(
-                self.state_indices_cpu[:batch_size], non_blocking=True)
+            if isinstance(indices,
+                          torch.Tensor) and indices.device.type == 'cuda':
+                # Alias the cache manager's CUDA buffer directly instead of
+                # copying. Iterating a CUDA tensor and assigning each 0-d
+                # slice to a CPU tensor would trigger one cudaMemcpyAsync +
+                # cudaStreamSynchronize per element.
+                #
+                # Safe under CUDA graphs only when the source buffer has a
+                # stable data pointer across all calls (currently true for
+                # CppMambaHybridCacheManager.cuda_state_indices, allocated
+                # once in __init__). If a future cache manager reallocates
+                # this buffer between iterations, captured kernels would
+                # still read from the address seen at capture time, so we
+                # assert stability here.
+                if self._state_indices_aliased_ptr is None:
+                    self._state_indices_aliased_ptr = indices.data_ptr()
+                else:
+                    assert indices.data_ptr(
+                    ) == self._state_indices_aliased_ptr, (
+                        "kv_cache_manager.get_state_indices() must return a "
+                        "buffer with a stable data pointer when CUDA graphs "
+                        "are used; got a different address than the first "
+                        "call.")
+                self.state_indices = indices
+            elif isinstance(indices, torch.Tensor):
+                # CPU tensor → bulk H2D
+                self.state_indices_cpu[:batch_size].copy_(indices[:batch_size])
+                self.state_indices[:batch_size].copy_(
+                    self.state_indices_cpu[:batch_size], non_blocking=True)
+            else:
+                # indices is a Python sequence (e.g. List[int]); data
+                # already lives on host, CPU staging is fine.
+                for i, idx in enumerate(indices):
+                    self.state_indices_cpu[i] = idx
+                self.state_indices[:batch_size].copy_(
+                    self.state_indices_cpu[:batch_size], non_blocking=True)
 
         self._prepare_replay_work_items(kv_cache_manager, batch_size,
                                         num_contexts)
@@ -378,3 +414,14 @@ class Mamba2Metadata:
             self.query_start_loc = None
             self.query_start_loc_long = self._arange_buffer_long[:batch_size +
                                                                  1]
+
+        # Complete any deferred recurrent-state block onboards scheduled by
+        # CppMambaHybridCacheManager.prepare_resources(). prepare_resources
+        # only enqueues the async cudaMemcpyAsync calls and sets a pending
+        # flag; we sync the onboard stream here, so the prior CPU-side prep
+        # work in _prepare_tp_inputs overlaps with the in-flight transfers.
+        # Cheap no-op on cache managers without this method or when no
+        # transfers were scheduled this iteration.
+        flush = getattr(kv_cache_manager, "flush_state_transfers", None)
+        if flush is not None:
+            flush()
