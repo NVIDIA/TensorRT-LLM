@@ -26,10 +26,11 @@ from typing import Annotated, Any, Dict, List, Literal, Optional, Tuple, Union
 import yaml
 from pydantic import model_validator
 
-from tensorrt_llm._torch.visual_gen.sparse_attention import SkipSoftmaxConfig
 from tensorrt_llm.llmapi.llm_args import Field
 from tensorrt_llm.llmapi.utils import StrictBaseModel, set_api_status
 from tensorrt_llm.models.modeling_utils import QuantConfig
+
+from .sparse_attention import SkipSoftmaxConfig
 
 # =============================================================================
 # Type aliases

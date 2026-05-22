@@ -26,12 +26,12 @@ from tensorrt_llm._torch.models.modeling_utils import MetaInitMode
 from tensorrt_llm.llmapi.utils import download_hf_model
 from tensorrt_llm.logger import logger
 from tensorrt_llm.visual_gen.args import VisualGenArgs
+from tensorrt_llm.visual_gen.sparse_attention import SkipSoftmaxConfig, apply_skip_softmax_overrides
 
 from .config import DiffusionModelConfig
 from .mapping import VisualGenMapping
 from .models import AutoPipeline
 from .pipeline_registry import PIPELINE_REGISTRY, PipelineComponent
-from .sparse_attention import SkipSoftmaxConfig, apply_skip_softmax_overrides
 
 if TYPE_CHECKING:
     from .models import BasePipeline

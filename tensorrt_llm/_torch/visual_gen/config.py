@@ -23,16 +23,6 @@ import torch
 from pydantic import BaseModel, ConfigDict
 from pydantic import Field as PydanticField
 
-from tensorrt_llm._torch.visual_gen.sparse_attention import SkipSoftmaxConfig
-from tensorrt_llm._torch.visual_gen.sparse_attention import (
-    auto_detect_sparse_attention_config as _auto_detect_sparse_attention_config,
-)
-from tensorrt_llm._torch.visual_gen.sparse_attention import (
-    auto_detect_sparse_yaml as _auto_detect_sparse_yaml,
-)
-from tensorrt_llm._torch.visual_gen.sparse_attention import (
-    load_sparse_config_from_yaml as _load_sparse_config_from_yaml,
-)
 from tensorrt_llm.functional import AllReduceStrategy
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
@@ -49,6 +39,16 @@ from tensorrt_llm.visual_gen.args import (
     TeaCacheConfig,
     TorchCompileConfig,
     VisualGenArgs,
+)
+from tensorrt_llm.visual_gen.sparse_attention import SkipSoftmaxConfig
+from tensorrt_llm.visual_gen.sparse_attention import (
+    auto_detect_sparse_attention_config as _auto_detect_sparse_attention_config,
+)
+from tensorrt_llm.visual_gen.sparse_attention import (
+    auto_detect_sparse_yaml as _auto_detect_sparse_yaml,
+)
+from tensorrt_llm.visual_gen.sparse_attention import (
+    load_sparse_config_from_yaml as _load_sparse_config_from_yaml,
 )
 
 # =============================================================================

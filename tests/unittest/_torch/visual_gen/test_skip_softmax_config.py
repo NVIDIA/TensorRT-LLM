@@ -8,13 +8,13 @@ from typing import Final
 
 import pytest
 
-from tensorrt_llm._torch.visual_gen.sparse_attention import (
+from tensorrt_llm.llmapi.llm_args import SkipSoftmaxAttentionConfig
+from tensorrt_llm.visual_gen.args import AttentionConfig, QuantAttentionConfig
+from tensorrt_llm.visual_gen.sparse_attention import (
     SkipSoftmaxConfig,
     SkipSoftmaxFormula,
     apply_skip_softmax_overrides,
 )
-from tensorrt_llm.llmapi.llm_args import SkipSoftmaxAttentionConfig
-from tensorrt_llm.visual_gen.args import AttentionConfig, QuantAttentionConfig
 
 # =============================================================================
 # SkipSoftmaxFormula — accepts both log_a (diffusion) and a (LLM) formats
@@ -232,9 +232,7 @@ class TestUseCaseScenarios:
         The pipeline should detect sparse_attention_config in checkpoint
         config.json and create a SkipSoftmaxConfig automatically.
         """
-        from tensorrt_llm._torch.visual_gen.sparse_attention import (
-            auto_detect_sparse_attention_config,
-        )
+        from tensorrt_llm.visual_gen.sparse_attention import auto_detect_sparse_attention_config
 
         ckpt = self.MODELOPT_CHECKPOINT
         result = auto_detect_sparse_attention_config(ckpt)
@@ -267,9 +265,7 @@ class TestUseCaseScenarios:
 
     def test_case_2a_no_sparse_config_returns_none(self):
         """Normal checkpoint (no sparse_attention_config) → returns None."""
-        from tensorrt_llm._torch.visual_gen.sparse_attention import (
-            auto_detect_sparse_attention_config,
-        )
+        from tensorrt_llm.visual_gen.sparse_attention import auto_detect_sparse_attention_config
 
         result = auto_detect_sparse_attention_config({})
         assert result is None
@@ -286,7 +282,7 @@ class TestUseCaseScenarios:
 class TestYamlLoading:
     def test_load_modelopt_yaml(self, tmp_path):
         """Load from ModelOpt sparse YAML file."""
-        from tensorrt_llm._torch.visual_gen.sparse_attention import load_sparse_config_from_yaml
+        from tensorrt_llm.visual_gen.sparse_attention import load_sparse_config_from_yaml
 
         yaml_content = """
 config_groups:
@@ -321,7 +317,7 @@ config_groups:
 
     def test_load_modelopt_yaml_llm_format_a(self, tmp_path):
         """Load from LLM-format YAML where prefill uses 'a' instead of 'log_a'."""
-        from tensorrt_llm._torch.visual_gen.sparse_attention import load_sparse_config_from_yaml
+        from tensorrt_llm.visual_gen.sparse_attention import load_sparse_config_from_yaml
 
         yaml_content = """
 config_groups:
@@ -344,7 +340,7 @@ config_groups:
 
     def test_load_consolidated_modelopt_yaml_component_map(self, tmp_path):
         """Load current ModelOpt YAML with separate component calibration."""
-        from tensorrt_llm._torch.visual_gen.sparse_attention import load_sparse_config_from_yaml
+        from tensorrt_llm.visual_gen.sparse_attention import load_sparse_config_from_yaml
 
         yaml_content = """
 transformer:
@@ -395,7 +391,7 @@ producer:
 
     def test_load_yaml_no_skip_softmax(self, tmp_path):
         """YAML without softmax_skip algo returns None."""
-        from tensorrt_llm._torch.visual_gen.sparse_attention import load_sparse_config_from_yaml
+        from tensorrt_llm.visual_gen.sparse_attention import load_sparse_config_from_yaml
 
         yaml_content = """
 config_groups:
@@ -410,7 +406,7 @@ config_groups:
 
     def test_auto_detect_yaml(self, tmp_path):
         """Auto-detect sparse YAML files in checkpoint directory."""
-        from tensorrt_llm._torch.visual_gen.sparse_attention import auto_detect_sparse_yaml
+        from tensorrt_llm.visual_gen.sparse_attention import auto_detect_sparse_yaml
 
         yaml_content = """
 config_groups:
