@@ -39,8 +39,8 @@ import pytest
 import torch
 from PIL import Image
 
-from tensorrt_llm._torch.visual_gen.config import TeaCacheConfig, VisualGenArgs
 from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineLoader
+from tensorrt_llm.visual_gen.args import TeaCacheConfig, VisualGenArgs
 
 
 @pytest.fixture(autouse=True, scope="module")
@@ -103,10 +103,8 @@ def _make_pipeline(checkpoint_path: str, use_ret_steps: bool = False):
     if not checkpoint_path or not os.path.exists(checkpoint_path):
         pytest.skip(f"Checkpoint not found: {checkpoint_path}")
     args = VisualGenArgs(
-        checkpoint_path=checkpoint_path,
-        device="cuda",
-        dtype="bfloat16",
-        cache=TeaCacheConfig(
+        model=checkpoint_path,
+        cache_config=TeaCacheConfig(
             teacache_thresh=0.2,
             use_ret_steps=use_ret_steps,
         ),
@@ -251,10 +249,8 @@ class TestWan22_I2V_TeaCacheRaisesError:
                 f"Checkpoint not found: {WAN22_I2V_A14B_PATH} (set DIFFUSION_MODEL_PATH_WAN22_I2V)"
             )
         args = VisualGenArgs(
-            checkpoint_path=WAN22_I2V_A14B_PATH,
-            device="cuda",
-            dtype="bfloat16",
-            cache=TeaCacheConfig(),
+            model=WAN22_I2V_A14B_PATH,
+            cache_config=TeaCacheConfig(),
         )
         with pytest.raises(ValueError, match="TeaCache is not supported for Wan 2\\.2"):
             PipelineLoader(args).load(skip_warmup=True)
