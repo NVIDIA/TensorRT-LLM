@@ -3765,8 +3765,7 @@ class TestDeepSeekV4Flash(LlmapiAccuracyTestHarness):
         # GB/rank at TP=2, ~36 GB/rank at TP=4 — TP=4 fits comfortably on
         # 4x B200 178GB. TRTLLM backend required because V4-Flash MXFP4
         # routed experts are unsupported by WIDEEP (raises "Unsupported
-        # quantization mode: [65536]"). is_integration_test=True keeps this
-        # to a 1-sample smoke.
+        # quantization mode: [65536]").
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.5)
         with LLM(self.MODEL_PATH,
                  tensor_parallel_size=4,
