@@ -18,6 +18,7 @@ import torch
 from _model_test_utils import get_small_model_config
 from build_and_run_ad import ExperimentConfig, main
 from test_common.llm_data import hf_id_to_local_model_dir
+from utils.util import skip_pre_blackwell
 
 from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
 from tensorrt_llm._torch.auto_deploy.models.eagle import EagleOneModelFactory
@@ -159,6 +160,52 @@ def test_super_mtp_ssm_replay_smoke():
     assert len(prompts_and_outputs) == 1
 
 
+@skip_pre_blackwell
+def test_ultra_mtp_smoke():
+    """Test one-model MTP/Eagle runtime with a tiny Ultra V3 target."""
+    test_prompt = "What is the capital of France?"
+    model_hub_id = "nvidia/Nemotron-Ultra-V3-NVFP4"
+    model_path = hf_id_to_local_model_dir(model_hub_id)
+
+    experiment_config = get_small_model_config(
+        model_hub_id,
+        transforms={
+            "insert_cached_causal_conv": {"backend": "triton_causal_conv"},
+            "insert_cached_ssm_attention": {"backend": "triton_ssm"},
+        },
+    )
+    experiment_config["args"]["model"] = model_path
+    experiment_config["args"]["runtime"] = "trtllm"
+    experiment_config["args"]["world_size"] = 1
+    experiment_config["args"]["speculative_config"] = MTPDecodingConfig(
+        max_draft_len=2,
+        mtp_eagle_one_model=True,
+        speculative_model=model_path,
+    )
+    experiment_config["args"]["speculative_model_kwargs"] = experiment_config["args"][
+        "model_kwargs"
+    ]
+    experiment_config["args"]["attn_backend"] = "flashinfer"
+    experiment_config["args"]["disable_overlap_scheduler"] = True
+    experiment_config["args"]["compile_backend"] = "torch-simple"
+    experiment_config["args"]["max_num_tokens"] = 256
+    experiment_config["prompt"]["batch_size"] = 1
+    experiment_config["prompt"]["queries"] = test_prompt
+
+    cfg = ExperimentConfig(**experiment_config)
+    cfg.prompt.sp_kwargs = {
+        "max_tokens": 64,
+        "top_k": None,
+        "temperature": 0.0,
+        "seed": 42,
+    }
+
+    results = main(cfg)
+
+    prompts_and_outputs = results["prompts_and_outputs"]
+    assert len(prompts_and_outputs) == 1
+
+
 def test_kv_cache_extra_seq_len_for_spec_dec():
     """Test that get_extra_seq_len_for_kv_cache computes correct extra capacity."""
     from tensorrt_llm._torch.auto_deploy.llm_args import LlmArgs
@@ -227,12 +274,15 @@ def test_eagle_quant_config_remaps_excludes_from_drafter_mapping():
         def get_quant_config(self):
             return {
                 "quant_algo": "NVFP4",
-                "exclude_modules": ["mtp.*", "lm_head"],
+                "exclude_modules": ["mtp.*", "mtp*", "lm_head"],
             }
 
     class DraftFactory:
         def get_checkpoint_conversion_mapping(self):
-            return {r"^mtp\.": "renamed."}
+            return {r"^mtp\.": "model."}
+
+        def get_exclude_modules_conversion_mapping(self):
+            return {r"^mtp(?=\.|\*)": "model"}
 
     factory = object.__new__(EagleOneModelFactory)
     factory.speculative_config = Eagle3DecodingConfig(
@@ -246,7 +296,9 @@ def test_eagle_quant_config_remaps_excludes_from_drafter_mapping():
     qcfg = factory.get_quant_config()
 
     assert "mtp.*" not in qcfg["exclude_modules"]
-    assert "renamed.*" in qcfg["exclude_modules"]
+    assert "mtp*" not in qcfg["exclude_modules"]
+    assert "model.*" in qcfg["exclude_modules"]
+    assert "model*" in qcfg["exclude_modules"]
     assert "lm_head" in qcfg["exclude_modules"]
     assert "model.layers.*" not in qcfg["exclude_modules"]
 
