@@ -876,20 +876,26 @@ class Qwen3VisionModel(torch.nn.Module):
 
         return torch.from_numpy(np.stack([hpos_ids, wpos_ids], axis=-1))
 
-    def rot_pos_emb(self, grid_thw: list[list[int]]) -> torch.Tensor:
-        max_hw = max(max(h, w) for _, h, w in grid_thw)
-        pos_ids = [
-            self.rot_pos_ids(h, w, self.spatial_merge_size)
-            if t == 1
-            else self.rot_pos_ids(h, w, self.spatial_merge_size).repeat(t, 1)
-            for t, h, w in grid_thw
-        ]
-        pos_ids = torch.cat(pos_ids, dim=0).to(self.device, non_blocking=True)
+    @lru_cache(maxsize=1024)  # noqa: B019
+    def _rotary_pos_emb_thw(self, t: int, h: int, w: int) -> torch.Tensor:
+        """Per-(t, h, w) rotary embeddings, cached as a device tensor.
 
-        freq_table = self.rotary_pos_emb(max_hw)  # (max_hw, dim // 2)
-        embeddings = freq_table[pos_ids]  # gather (total, 2, dim // 2)
-        embeddings = embeddings.flatten(1)
-        return embeddings
+        Mirrors vLLM's ``get_rope_by_thw`` pattern: the pos_ids construction
+        is CPU-side via ``rot_pos_ids`` (also lru_cached), the H->D copy and
+        the freq_table gather happen here. Once a given (t, h, w) tile has
+        been seen, ``rot_pos_emb`` becomes a dict lookup over already-
+        on-device tensors plus a single ``torch.cat`` (no transfer).
+        """
+        pos_ids = self.rot_pos_ids(h, w, self.spatial_merge_size)
+        if t > 1:
+            pos_ids = pos_ids.repeat(t, 1)
+        pos_ids = pos_ids.to(self.device, non_blocking=True)
+        freq_table = self.rotary_pos_emb(max(h, w))  # (max_hw, dim // 2)
+        return freq_table[pos_ids].flatten(1)
+
+    def rot_pos_emb(self, grid_thw: list[list[int]]) -> torch.Tensor:
+        pieces = [self._rotary_pos_emb_thw(t, h, w) for t, h, w in grid_thw]
+        return pieces[0] if len(pieces) == 1 else torch.cat(pieces, dim=0)
 
     # Adopted from https://github.com/vllm-project/vllm/blob/21eb2c3372fb6447ef36bee44ff7af79a330ffec/vllm/model_executor/models/qwen3_vl.py#L470)
     def fast_pos_embed_interpolate(self, grid_thw: list[list[int]]) -> torch.Tensor:

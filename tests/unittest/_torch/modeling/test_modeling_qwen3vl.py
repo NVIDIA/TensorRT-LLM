@@ -637,3 +637,99 @@ def test_rot_pos_ids_lru_cache_hit():
     assert a is b, "lru_cache should return the cached tensor object on hit"
     info = Qwen3VisionModel.rot_pos_ids.cache_info()
     assert info.hits >= 1 and info.misses >= 1
+
+
+# ---------------------------------------------------------------------------
+# L2 cache: per-(t, h, w) GPU rotary embeddings via _rotary_pos_emb_thw.
+#
+# Mirrors vLLM's get_rope_by_thw pattern: identical (t, h, w) returns the
+# same on-device tensor object so subsequent rot_pos_emb calls only do a
+# device-side torch.cat with no H->D transfer.
+# ---------------------------------------------------------------------------
+
+
+def _make_qwen3_vision_model_for_l2():
+    """Build a minimally-initialized Qwen3VisionModel that exposes
+    `_rotary_pos_emb_thw` and `rot_pos_emb` without loading any weights.
+
+    Bypasses the heavy `__init__` (blocks, mergers, attn metadata buffers)
+    by going through `__new__` so the class-level decorators (`@staticmethod`
+    on `rot_pos_ids` and `@lru_cache` on `_rotary_pos_emb_thw`) stay intact.
+    """
+    from transformers.models.qwen3_vl.modeling_qwen3_vl import (
+        Qwen3VLVisionRotaryEmbedding as HFQwen3VLVisionRotaryEmbedding,
+    )
+
+    obj = Qwen3VisionModel.__new__(Qwen3VisionModel)
+    torch.nn.Module.__init__(obj)
+    obj.spatial_merge_size = 2
+    obj.rotary_pos_emb = HFQwen3VLVisionRotaryEmbedding(36).to("cuda")
+
+    # patch_embed.proj.weight is what `Qwen3VisionModel.device` reads.
+    obj.patch_embed = torch.nn.Module()
+    obj.patch_embed.proj = torch.nn.Linear(1, 1, bias=False).to("cuda")
+    return obj
+
+
+def test_rotary_pos_emb_thw_returns_device_tensor():
+    """Cached per-(t, h, w) rotary embedding must live on CUDA so subsequent
+    rot_pos_emb calls do a device-side cat (no H->D transfer)."""
+    vm = _make_qwen3_vision_model_for_l2()
+    # Clear any lingering cache from a previous test.
+    vm._rotary_pos_emb_thw.cache_clear()
+
+    out = vm._rotary_pos_emb_thw(1, 16, 16)
+    assert out.is_cuda, "L2 cache must store the gather result on device"
+    assert out.shape[0] == 1 * 16 * 16
+    # dim is freq_table_dim (head_dim/2) * 2 after flatten(1)
+    assert out.shape[1] % 2 == 0
+
+
+def test_rotary_pos_emb_thw_lru_cache_hit():
+    """Same (t, h, w) must return the same device tensor object."""
+    vm = _make_qwen3_vision_model_for_l2()
+    vm._rotary_pos_emb_thw.cache_clear()
+    a = vm._rotary_pos_emb_thw(1, 16, 16)
+    b = vm._rotary_pos_emb_thw(1, 16, 16)
+    assert a is b, "L2 lru_cache must return the cached device tensor on hit"
+    info = vm._rotary_pos_emb_thw.cache_info()
+    assert info.hits >= 1 and info.misses >= 1
+
+
+def test_rot_pos_emb_l2_matches_per_tile():
+    """rot_pos_emb on a multi-image grid must equal concatenated per-tile
+    _rotary_pos_emb_thw outputs, bit-exact."""
+    vm = _make_qwen3_vision_model_for_l2()
+    vm._rotary_pos_emb_thw.cache_clear()
+
+    grid_thw_list = [(1, 16, 16), (1, 32, 32), (1, 16, 16), (3, 8, 12)]
+    out = vm.rot_pos_emb(grid_thw_list)
+
+    expected = torch.cat(
+        [vm._rotary_pos_emb_thw(t, h, w) for t, h, w in grid_thw_list],
+        dim=0,
+    )
+    torch.testing.assert_close(out, expected, atol=0, rtol=0)
+
+
+def test_rot_pos_emb_l2_no_device_transfer_on_hit():
+    """After the first call warms the L2 cache for a (t, h, w), a second
+    rot_pos_emb call on the same grid must not trigger any new H->D copy
+    in the rot_pos_emb path. We verify by checking that all per-tile
+    outputs are CUDA tensors and that cache hits dominate."""
+    vm = _make_qwen3_vision_model_for_l2()
+    vm._rotary_pos_emb_thw.cache_clear()
+
+    grid = [(1, 16, 16), (1, 32, 32), (1, 16, 16)]
+    vm.rot_pos_emb(grid)  # warm
+    miss_count = vm._rotary_pos_emb_thw.cache_info().misses
+
+    vm.rot_pos_emb(grid)  # all hits
+    info = vm._rotary_pos_emb_thw.cache_info()
+    assert info.misses == miss_count, (
+        f"second rot_pos_emb call should be all cache hits; got "
+        f"{info.misses - miss_count} extra miss(es)"
+    )
+    # Per-tile outputs must be on CUDA so forward's torch.cat is device-side.
+    for t, h, w in grid:
+        assert vm._rotary_pos_emb_thw(t, h, w).is_cuda

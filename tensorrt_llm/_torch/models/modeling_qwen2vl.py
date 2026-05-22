@@ -912,7 +912,17 @@ class Qwen2_5_VisionModel(torch.nn.Module):
     def get_rope_and_window_index_by_thw(
         self, t: int, h: int, w: int
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Tuple[int, ...]]:
-        """CPU (cos, sin, window_idx, seqlens) in window order; cached per `(t, h, w)`."""
+        """GPU (cos_thw, sin_thw); CPU (window_index_thw, seq_lens_thw).
+
+        Cached per ``(t, h, w)``. Mirrors vLLM's ``get_rope_by_thw`` pattern:
+        pos_ids and window_index are built on CPU, then moved to device once
+        per unique tile. The gather (``cos[pos_ids]``) and window reorder
+        (``cos_thw[window_index_thw_dev]``) run on device, so the cached
+        cos/sin tensors are already-on-device -- ``forward``'s ``torch.cat``
+        on them is a device-side cat with no H->D transfer. ``window_index``
+        stays on CPU because ``forward`` cats all per-tile window_index
+        tensors and ships them with a single H->D transfer.
+        """
         hpos_ids = torch.arange(h, dtype=torch.long).unsqueeze(1).expand(-1, w)
         wpos_ids = torch.arange(w, dtype=torch.long).unsqueeze(0).expand(h, -1)
         hpos_ids = (hpos_ids.reshape(h // self.spatial_merge_size,
@@ -926,11 +936,17 @@ class Qwen2_5_VisionModel(torch.nn.Module):
                                      self.spatial_merge_size).permute(
                                          0, 2, 1, 3).flatten())
         pos_ids = torch.stack([hpos_ids, wpos_ids], dim=-1).repeat(t, 1)
+
+        # Pos_ids -> device for the freq_table gather. rotary_cos_sin is
+        # created on CUDA in RopeParams.create_rope_const_params; this is
+        # the one H->D copy per unique (t, h, w).
+        device = self.rotary_pos_emb.rotary_cos_sin.device
+        pos_ids_dev = pos_ids.to(device, non_blocking=True)
         max_grid_size = max(h, w)
         cos_sin = self.rotary_pos_emb.rotary_cos_sin[:max_grid_size]
         cos, sin = cos_sin[:, 0, :], cos_sin[:, 1, :]
-        cos_flattened = cos[pos_ids].flatten(1)
-        sin_flattened = sin[pos_ids].flatten(1)
+        cos_flattened = cos[pos_ids_dev].flatten(1)
+        sin_flattened = sin[pos_ids_dev].flatten(1)
 
         cos_thw = cos_flattened.reshape(
             cos_flattened.shape[0] // self.spatial_merge_unit,
@@ -944,9 +960,12 @@ class Qwen2_5_VisionModel(torch.nn.Module):
         )
 
         window_index_thw, seq_lens_thw = self.get_window_index_by_thw(t, h, w)
-
-        cos_thw = cos_thw[window_index_thw, :, :].reshape(-1, cos_thw.shape[-1])
-        sin_thw = sin_thw[window_index_thw, :, :].reshape(-1, sin_thw.shape[-1])
+        # Device-side window reorder; cached cos/sin stay on device.
+        window_index_thw_dev = window_index_thw.to(device, non_blocking=True)
+        cos_thw = cos_thw[window_index_thw_dev, :, :].reshape(
+            -1, cos_thw.shape[-1])
+        sin_thw = sin_thw[window_index_thw_dev, :, :].reshape(
+            -1, sin_thw.shape[-1])
 
         return cos_thw, sin_thw, window_index_thw, tuple(seq_lens_thw)
 
@@ -985,14 +1004,11 @@ class Qwen2_5_VisionModel(torch.nn.Module):
         (rotary_pos_emb_cos, rotary_pos_emb_sin, window_indices,
          window_seq_lens) = self.get_rotary_pos_emb_window_data(grid_rows)
 
-        cos_sin = torch.stack(
-            [
-                torch.cat(rotary_pos_emb_cos),
-                torch.cat(rotary_pos_emb_sin),
-            ],
-            dim=0,
-        ).to(device=self.device, non_blocking=True)
-        cos, sin = cos_sin[0], cos_sin[1]
+        # cos/sin are already device tensors -- get_rope_and_window_index_by_thw
+        # caches them on `self.rotary_pos_emb.rotary_cos_sin.device`, so the
+        # cat runs on device with no H->D transfer.
+        cos = torch.cat(rotary_pos_emb_cos)
+        sin = torch.cat(rotary_pos_emb_sin)
         position_embeddings = (cos, sin)
 
         window_index = torch.cat(window_indices).to(device=self.device,
