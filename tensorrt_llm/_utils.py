@@ -1372,9 +1372,16 @@ def prefer_pinned() -> bool:
 
 def maybe_pin_memory(tensor: torch.Tensor) -> torch.Tensor:
     """
-    Pin the Tensor memory if pinning is preferred/beneficial for performance
+    Pin the Tensor memory if pinning is preferred/beneficial for performance.
+
+    Idempotent: if the tensor is already pinned, returns it unchanged.
+    PyTorch's ``.pin_memory()`` is itself a no-op for an already-pinned
+    tensor, but the call still goes through a CPython dispatch + pybind
+    boundary; gating on ``is_pinned()`` skips that for the common case
+    in tight loops (e.g. ``AttentionMetadata.prepare()`` re-pinning
+    ``kv_lens`` that callers already pinned upstream).
     """
-    if prefer_pinned():
+    if prefer_pinned() and not tensor.is_pinned():
         return tensor.pin_memory()
     return tensor
 

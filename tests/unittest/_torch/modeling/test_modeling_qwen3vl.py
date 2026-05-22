@@ -894,6 +894,20 @@ def test_async_tensor_h2d_tensor_input():
     torch.testing.assert_close(out.cpu(), src.to(torch.float32))
 
 
+def test_maybe_pin_memory_idempotent_on_already_pinned():
+    """A second call on an already-pinned tensor must return it unchanged
+    (same Python object) -- the new ``is_pinned()`` guard skips the
+    redundant ``.pin_memory()`` dispatch."""
+    from tensorrt_llm._utils import maybe_pin_memory
+
+    t = torch.tensor([1.0, 2.0, 3.0])
+    pinned = maybe_pin_memory(t)
+    if not pinned.is_pinned():
+        pytest.skip("prefer_pinned() is False in this environment (confidential compute mode)")
+    again = maybe_pin_memory(pinned)
+    assert again is pinned
+
+
 @pytest.mark.parametrize("n", [16, 256, 1024])
 def test_argsort_matches_scatter_inverse(n):
     """argsort(perm) must equal the scatter-assign inverse permutation."""
