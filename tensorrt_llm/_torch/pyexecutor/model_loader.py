@@ -864,6 +864,30 @@ class ModelLoader:
                 if hasattr(config.pretrained_config, sub_config):
                     getattr(config.pretrained_config,
                             sub_config).num_hidden_layers = num_layers_override
+
+        # For vanilla MTP with use_mtp_vanilla=True, expand the model's MTP layer
+        # count to match the user-requested max_draft_len. Extra MTP layer
+        # instances will share checkpoint weights via mod-indexing in the
+        # per-model weight loader (e.g., modeling_deepseekv3.py).
+        # The original checkpoint count is preserved on the pretrained_config
+        # as `_ckpt_num_nextn_predict_layers` for downstream mod-indexing.
+        from tensorrt_llm.llmapi.llm_args import MTPDecodingConfig
+        spec_config = self.spec_config
+        if (isinstance(spec_config, MTPDecodingConfig)
+                and spec_config.use_mtp_vanilla
+                and spec_config.max_draft_len is not None
+                and getattr(config.pretrained_config,
+                            'num_nextn_predict_layers', None)):
+            ckpt_nextn = config.pretrained_config.num_nextn_predict_layers
+            if spec_config.max_draft_len > ckpt_nextn:
+                config.pretrained_config._ckpt_num_nextn_predict_layers = ckpt_nextn
+                config.pretrained_config.num_nextn_predict_layers = \
+                    spec_config.max_draft_len
+                logger.warning(
+                    f"MTP vanilla: expanding num_nextn_predict_layers from "
+                    f"{ckpt_nextn} to {spec_config.max_draft_len} to match "
+                    f"max_draft_len. Extra MTP layer instances will share "
+                    f"checkpoint weights via mod-indexing.")
         return config
 
     def _call_load_weights(self,

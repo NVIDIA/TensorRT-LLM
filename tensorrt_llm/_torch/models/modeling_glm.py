@@ -92,11 +92,15 @@ class Glm4WeightLoader:
             else:
                 names = name.split(".")
                 if "model.layers" in name and int(names[2]) >= self.config.num_hidden_layers:
-                    mtp_layer_idx = int(names[2]) - self.config.num_hidden_layers
-                    names[2] = str(
-                        mtp_layer_idx % self.config.num_nextn_predict_layers
-                        + self.config.num_hidden_layers
+                    # Use the original checkpoint MTP layer count for
+                    # mod-indexing; falls back to num_nextn_predict_layers when
+                    # no expansion happened.
+                    ckpt_num_nextn = (
+                        getattr(self.config, "_ckpt_num_nextn_predict_layers", None)
+                        or self.config.num_nextn_predict_layers
                     )
+                    mtp_layer_idx = int(names[2]) - self.config.num_hidden_layers
+                    names[2] = str(mtp_layer_idx % ckpt_num_nextn + self.config.num_hidden_layers)
                     name = ".".join(names)
 
                 if names[-1] in params_map:
@@ -1025,7 +1029,10 @@ class Glm4MoeForCausalLM(SpecDecOneEngineForCausalLM[Glm4Model, PretrainedConfig
             and model_config.spec_config.spec_dec_mode.is_mtp_one_model()
         ):
             model_nextn = self.config.num_nextn_predict_layers
-            ckpt_nextn = self.config.num_nextn_predict_layers
+            ckpt_nextn = (
+                getattr(self.config, "_ckpt_num_nextn_predict_layers", None)
+                or self.config.num_nextn_predict_layers
+            )
             self.num_hidden_layers = self.config.num_hidden_layers
             assert ckpt_nextn > 0, "There is not MTP modules in the checkpoint."
             if ckpt_nextn == 1 and not model_config.spec_config.use_mtp_vanilla:
