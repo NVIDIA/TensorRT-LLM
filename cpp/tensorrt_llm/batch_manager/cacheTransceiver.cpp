@@ -224,21 +224,8 @@ CacheTransceiver::CacheTransceiver(kv_cache_manager::BaseKVCacheManager* cacheMa
         rnnModelCfg.mConvSectionLayout = static_cast<executor::kv_cache::CacheState::RnnModelConfig::ConvSectionLayout>(
             linearMeta->rnnConvSectionLayout);
 
-        // Derive dtype from the recurrent state pool.
-        nvinfer1::DataType rnnPoolDtype = dataType;
-        auto const totalPools = cacheManager->getNumPools();
-        for (SizeType32 poolIdx = 0; poolIdx < totalPools; ++poolIdx)
-        {
-            auto ws = blockManager.getPoolWindowSize(poolIdx);
-            if (kv_cache_manager::LinearAttentionMetadata::hasRecurrentStatesCache(ws))
-            {
-                rnnPoolDtype = cacheManager->getPrimaryPool(poolIdx)->getDataType();
-                break;
-            }
-        }
-
         // Derive actual SSM and conv dtypes from metadata byte sizes.
-        // Pool dtype may be UINT8 (raw bytes), so we cannot use rnnPoolDtype directly.
+        // Pool dtype is UINT8 (raw byte storage), so we cannot use pool->getDataType().
         // Only the byte size matters for split/concat kernel stride calculations — the actual
         // dtype enum is not interpreted numerically, just used for getDTypeSize() dispatch.
         auto dtypeFromSize = [](SizeType32 size) -> nvinfer1::DataType

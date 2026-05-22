@@ -279,8 +279,7 @@ class KvCacheCreator:
         # actually made.
         if is_hybrid_linear(model_engine.model.model_config.pretrained_config) \
                 and self._kv_cache_config.enable_block_reuse:
-            uses_v1_mamba_route = self._is_disagg \
-                or os.environ.get('TRTLLM_USE_CPP_MAMBA', '0') == '1' \
+            uses_v1_mamba_route = os.environ.get('TRTLLM_USE_CPP_MAMBA', '0') == '1' \
                 or os.environ.get('TRTLLM_USE_PY_MAMBA', '0') == '1' \
                 or self._speculative_config is not None
             if uses_v1_mamba_route:
