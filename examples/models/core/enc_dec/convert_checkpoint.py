@@ -18,6 +18,7 @@ from transformers import (AutoModelForSeq2SeqLM, Blip2ForConditionalGeneration,
                           Pix2StructForConditionalGeneration,
                           T5ForConditionalGeneration, VisionEncoderDecoderModel)
 
+from tensorrt_llm._deprecation import emit_engine_arch_deprecation
 from tensorrt_llm._utils import pad_vocab_size
 from tensorrt_llm.functional import (LayerNormPositionType, LayerNormType,
                                      MLPType)
@@ -142,15 +143,17 @@ def parse_t5_config(args, hf_model):
             component_config.encoder_head_size = config.getint(
                 'encoder', 'd_kv')
             component_config.decoder_start_token_id = config.getint(
-                'decoder', 'decoder_start_token_id')
-            component_config.eos_token_id = config.getint(
-                'decoder', 'eos_token_id')
-            bos_token_id = config.get('decoder', 'bos_token_id')
+                'decoder', 'decoder_start_token_id', fallback=0)
+            component_config.eos_token_id = config.getint('decoder',
+                                                          'eos_token_id',
+                                                          fallback=1)
+            bos_token_id = config.get('decoder', 'bos_token_id', fallback=None)
             # T5 does not have bos_token_id
             component_config.bos_token_id = int(
-                bos_token_id) if bos_token_id != "None" else None
-            component_config.pad_token_id = config.getint(
-                'decoder', 'pad_token_id')
+                bos_token_id) if bos_token_id not in (None, "None") else None
+            component_config.pad_token_id = config.getint('decoder',
+                                                          'pad_token_id',
+                                                          fallback=0)
 
         else:
             assert False, 'Unsupported component!'
@@ -1840,6 +1843,7 @@ def convert(worker_rank, world_size, args, model_config, convert_args,
 
 
 if __name__ == "__main__":
+    emit_engine_arch_deprecation("convert_checkpoint.py")
     parser = argparse.ArgumentParser(
         formatter_class=argparse.RawTextHelpFormatter)
     parser.add_argument(

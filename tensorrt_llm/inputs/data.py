@@ -17,6 +17,15 @@ class TextPrompt(TypedDict):
     if the model supports it.
     """
 
+    multi_modal_uuids: NotRequired[Dict[str, List[Any]]]
+    """
+    Optional user-provided UUIDs for multimodal items.
+    Structure mirrors multi_modal_data: {"image": ["uuid1", None, "uuid3"]}.
+    When a UUID is provided for an item, it will be returned in KV cache events
+    instead of the computed content hash. Use None to fall back to content
+    hashing for specific items.
+    """
+
     mm_processor_kwargs: NotRequired[Dict[str, Any]]
     """
     Optional multi-modal processor kwargs to be forwarded to the
@@ -39,6 +48,15 @@ class TokensPrompt(TypedDict):
     if the model supports it.
     """
 
+    multi_modal_uuids: NotRequired[Dict[str, List[Any]]]
+    """
+    Optional user-provided UUIDs for multimodal items.
+    Structure mirrors multi_modal_data: {"image": ["uuid1", None, "uuid3"]}.
+    When a UUID is provided for an item, it will be returned in KV cache events
+    instead of the computed content hash. Use None to fall back to content
+    hashing for specific items.
+    """
+
     mm_processor_kwargs: NotRequired[Dict[str, Any]]
     """
     Optional multi-modal processor kwargs to be forwarded to the
@@ -56,7 +74,7 @@ def prompt_inputs(inputs: PromptInputs, ) -> Union[TextPrompt, TokensPrompt]:
     if isinstance(inputs, str):
         prompt_inputs = TextPrompt(prompt=inputs)
     elif isinstance(inputs, list):
-        assert isinstance(inputs[0], int)
+        assert len(inputs) == 0 or isinstance(inputs[0], int)
         prompt_inputs = TokensPrompt(prompt_token_ids=inputs)
     elif isinstance(inputs, dict):
         assert inputs.get("prompt") is not None \

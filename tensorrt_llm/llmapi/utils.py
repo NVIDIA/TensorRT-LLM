@@ -15,11 +15,12 @@ import time
 import traceback
 import warnings
 import weakref
+from contextlib import nullcontext
 from functools import wraps
 from pathlib import Path
 from queue import Queue
-from typing import (Any, Callable, Iterable, List, Optional, Tuple, Type,
-                    get_type_hints)
+from typing import (Any, Callable, ContextManager, Iterable, List, Optional,
+                    Tuple, Type, get_type_hints)
 
 import filelock
 import huggingface_hub
@@ -30,6 +31,18 @@ from pydantic import BaseModel
 from tqdm.auto import tqdm
 
 from tensorrt_llm.logger import Singleton, logger
+
+
+class StrictBaseModel(BaseModel):
+    """
+    A base model that forbids arbitrary fields.
+
+    All user-facing configuration classes should inherit from this to ensure
+    typos and invalid fields are caught at validation time.
+    """
+
+    class Config:
+        extra = "forbid"
 
 
 def print_traceback_on_error(func):
@@ -159,19 +172,6 @@ def get_gpu_arch(device: int = 0) -> int:
     return torch.cuda.get_device_properties(device).major
 
 
-class ContextManager:
-    ''' A helper to create a context manager for a resource. '''
-
-    def __init__(self, resource):
-        self.resource = resource
-
-    def __enter__(self):
-        return self.resource.__enter__()
-
-    def __exit__(self, exc_type, exc_value, traceback):
-        return self.resource.__exit__(exc_type, exc_value, traceback)
-
-
 def is_directory_empty(directory: Path) -> bool:
     return not any(directory.iterdir())
 
@@ -219,7 +219,8 @@ def get_file_lock(model_name: str,
 class DisabledTqdm(tqdm):
 
     def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs, disable=True)
+        kwargs["disable"] = True
+        super().__init__(*args, **kwargs)
 
 
 def download_hf_model(model: str, revision: Optional[str] = None) -> Path:
@@ -236,16 +237,32 @@ def download_hf_model(model: str, revision: Optional[str] = None) -> Path:
     return Path(hf_folder)
 
 
-def download_hf_pretrained_config(model: str,
-                                  revision: Optional[str] = None) -> Path:
+def download_hf_partial(model: str,
+                        allow_patterns: List[str],
+                        revision: Optional[str] = None) -> Path:
+    """Download a partial model from HuggingFace.
+
+    Args:
+        model: The model name or path.
+        revision: The revision to use for the model.
+        allow_patterns: The patterns to allow for the model.
+
+    Returns:
+        The path to the downloaded model.
+    """
     with get_file_lock(model):
         hf_folder = snapshot_download(
             model,
             local_files_only=huggingface_hub.constants.HF_HUB_OFFLINE,
             revision=revision,
-            allow_patterns=["config.json"],
+            allow_patterns=allow_patterns,
             tqdm_class=DisabledTqdm)
     return Path(hf_folder)
+
+
+def download_hf_pretrained_config(model: str,
+                                  revision: Optional[str] = None) -> Path:
+    return download_hf_partial(model, ["config.json"], revision)
 
 
 def append_docstring(docstring: str):
@@ -299,6 +316,7 @@ class ManagedThread(threading.Thread):
                  error_queue: Queue,
                  name: Optional[str] = None,
                  stop_event: Optional[threading.Event] = None,
+                 context: Optional[ContextManager[Any]] = None,
                  **kwargs):
         super().__init__(name=name)
         self.task = task
@@ -306,26 +324,27 @@ class ManagedThread(threading.Thread):
         self.kwargs = kwargs
         self.daemon = True
         self.stop_event = stop_event or threading.Event()
+        self.context = context or nullcontext()
 
     def run(self):
+        with self.context:
+            while not self.stop_event.is_set():
+                task = self.task
+                if isinstance(task, weakref.WeakMethod):
+                    task = task()
+                    if task is None:
+                        # Normally, this should not happen.
+                        logger.warning("WeakMethod is expired.")
+                        break
 
-        while not self.stop_event.is_set():
-            task = self.task
-            if isinstance(task, weakref.WeakMethod):
-                task = task()
-                if task is None:
-                    # Normally, this should not happen.
-                    logger.warning("WeakMethod is expired.")
-                    break
-
-            try:
-                if not task(**self.kwargs):
-                    break
-            except Exception as e:
-                logger.error(
-                    f"Error in thread {self.name}: {e}\n{traceback.format_exc()}"
-                )
-                self.error_queue.put(e)
+                try:
+                    if not task(**self.kwargs):
+                        break
+                except Exception as e:
+                    logger.error(
+                        f"Error in thread {self.name}: {e}\n{traceback.format_exc()}"
+                    )
+                    self.error_queue.put(e)
 
         logger.info(f"Thread {self.name} stopped.")
 

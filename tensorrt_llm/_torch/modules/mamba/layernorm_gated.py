@@ -1,7 +1,7 @@
 # Adapted from https://github.com/state-spaces/mamba/blob/v2.2.4/mamba_ssm/ops/triton/layernorm_gated.py
 # Copyright (c) 2024, Tri Dao, Albert Gu.
 #
-# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -19,6 +19,25 @@
 import torch
 import triton
 import triton.language as tl
+
+from ...utils import Fp4QuantizedTensor
+
+
+def fused_gated_rmsnorm_quant_shape_ok(hidden_size: int,
+                                       group_size: int) -> bool:
+    """True if ``torch.ops.trtllm.fused_gated_rmsnorm_quant`` supports this shape.
+
+    Keep in sync with TORCH_CHECKs in cpp/tensorrt_llm/thop/fusedGatedRMSNormQuant.cpp.
+    """
+    if group_size <= 0 or hidden_size % group_size != 0:
+        return False
+    if group_size % 256 != 0:
+        return False
+    if not (256 <= group_size <= 8192):
+        return False
+    if hidden_size % 16 != 0:
+        return False
+    return True
 
 
 @triton.heuristics({"HAS_BIAS": lambda args: args["B"] is not None})
@@ -50,7 +69,9 @@ def _layer_norm_fwd_1pass_kernel(
     X += row * stride_x_row + group * N
     Y += row * stride_y_row + group * N
     if HAS_Z:
-        Z += row * stride_z_row + group * N
+        # Cast to int64 to avoid overflow: row * stride_z_row can exceed INT32_MAX
+        # when Z is a non-contiguous slice (e.g., 131071 * 22656 = 2,969,544,576)
+        Z += tl.cast(row, tl.int64) * stride_z_row + group * N
     if not IS_RMS_NORM:
         Mean += group * M
     Rstd += group * M
@@ -163,6 +184,7 @@ class RMSNorm(torch.nn.Module):
         norm_before_gate=True,
         device=None,
         dtype=None,
+        is_nvfp4: bool = False,
     ):
         """If group_size is not None, we do GroupNorm with each group having group_size elements.
         group_size=None is equivalent to group_size=hidden_size (i.e. there's only 1 group).
@@ -170,13 +192,21 @@ class RMSNorm(torch.nn.Module):
         factory_kwargs = {"device": device, "dtype": dtype}
         super().__init__()
         self.eps = eps
+        self.hidden_size = hidden_size
         self.weight = torch.nn.Parameter(
             torch.empty(hidden_size, **factory_kwargs))
         self.register_parameter("bias", None)
-        self.group_size = group_size
+        self.group_size = group_size if group_size is not None else hidden_size
         self.norm_before_gate = norm_before_gate
 
-    def forward(self, x, z=None):
+        self.is_nvfp4 = is_nvfp4
+        # nvfp4_scale will be set externally if is_nvfp4 is True
+        self.nvfp4_scale: torch.Tensor | None = None
+
+    def forward(
+            self,
+            x: torch.Tensor,
+            z: torch.Tensor | None = None) -> torch.Tensor | Fp4QuantizedTensor:
         """If z is not None, we do norm(x) * silu(z) if norm_before_gate, else norm(x * silu(z))"""
         x_shape_og = x.shape
         # reshape input data into 2D tensor
@@ -192,6 +222,30 @@ class RMSNorm(torch.nn.Module):
         bias = None
         if self.bias is not None:
             bias = self.bias.contiguous()
+
+        # NVFP4 quantized path - uses optimized fused CUDA kernel
+        # Fuses: SiLU gating + Group RMSNorm + FP4 quantization
+        if self.is_nvfp4 and z is not None and not self.norm_before_gate and \
+           fused_gated_rmsnorm_quant_shape_ok(self.hidden_size, self.group_size):
+            if self.nvfp4_scale is None:
+                raise ValueError(
+                    "RMSNormGated NVFP4 output requested but no `nvfp4_scale` is attached. "
+                    "Please set module.nvfp4_scale = input_scale from the next linear layer."
+                )
+
+            sf_scale = self.nvfp4_scale.contiguous()
+            fp4_out, sf_out = torch.ops.trtllm.fused_gated_rmsnorm_quant(
+                x, z, weight, self.group_size, self.eps, sf_scale)
+
+            # fp4_out is int32 with 8 FP4 values packed per int32
+            fp4_u8 = fp4_out.view(torch.uint8)
+            # Reshape to match expected output shape
+            if len(x_shape_og) != 2:
+                fp4_u8 = fp4_u8.reshape(*x_shape_og[:-1], x_shape_og[-1] // 2)
+
+            return Fp4QuantizedTensor(fp4_u8, sf_out, is_sf_swizzled=True)
+
+        # Original Triton kernel path
         y, _, _ = _layer_norm_fwd(
             x,
             weight,

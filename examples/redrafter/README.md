@@ -1,5 +1,11 @@
 # Recurrent Drafter (ReDrafter) Speculative Decoding
 
+> [!WARNING]
+> The `convert_checkpoint.py` / `trtllm-build` / `run.py` workflow described
+> below is **legacy** and will not receive new features. New projects should use
+> [`trtllm-serve`](https://nvidia.github.io/TensorRT-LLM/quick-start-guide.html)
+> or the [LLM Python API](https://nvidia.github.io/TensorRT-LLM/llm-api/index.html) instead.
+
 This document describes how to build and run a model using the ReDrafter speculative decoding technique ([`Github`](https://github.com/apple/ml-recurrent-drafter), [`Paper`](https://arxiv.org/abs/2403.09919)) in TensorRT LLM on single GPU, single node multiple GPU.
 
 ## Overview
@@ -7,7 +13,7 @@ Similar to other speculative decoding techniques, ReDrafter contains two major c
 
 The TensorRT-LLM's ReDrafter implementation can be found in [tensorrt_llm/models/redrafter/model.py](../../tensorrt_llm/models/redrafter/model.py), which combines the base model and the drafter definition which can be found in [tensorrt_llm/models/redrafter/model.py](../../tensorrt_llm/models/redrafter/drafter.py).
 
-For more information about ReDrafter visit [speculative decoding documentation](https://nvidia.github.io/TensorRT-LLM/advanced/speculative-decoding.html).
+For more information about ReDrafter visit [speculative decoding documentation](https://nvidia.github.io/TensorRT-LLM/features/speculative-decoding.html).
 
 ReDrafter has 3 additional hyperparameter that you can control for speculative decoding:
 - `redrafter_num_beams`: the number of paths to explore for speculation using beam search. Default is set to `5`.

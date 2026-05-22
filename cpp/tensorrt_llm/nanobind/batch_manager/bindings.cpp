@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2022-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -35,6 +35,7 @@
 #include <nanobind/stl/chrono.h>
 #include <nanobind/stl/optional.h>
 #include <nanobind/stl/shared_ptr.h>
+#include <nanobind/stl/string.h>
 #include <nanobind/stl/tuple.h>
 #include <nanobind/stl/unique_ptr.h>
 #include <nanobind/stl/vector.h>
@@ -153,6 +154,7 @@ void initBindings(nb::module_& m)
             nb::arg("num_tokens_per_iteration"), nb::arg("model_config"))
         .def_prop_ro("orig_prompt_len", &GenLlmReq::getOrigPromptLen)
         .def("has_draft_tokens", &GenLlmReq::hasDraftTokens)
+        .def("discard_draft_tokens", &GenLlmReq::discardDraftTokens, nb::arg("num_tokens_to_discard"))
         .def("move_to_next_context_chunk", &GenLlmReq::moveToNextContextChunk)
         .def_prop_ro("is_last_context_chunk", &GenLlmReq::isLastContextChunk)
         .def_prop_ro("is_first_context_chunk", &GenLlmReq::isFirstContextChunk)
@@ -163,11 +165,14 @@ void initBindings(nb::module_& m)
         .def_prop_ro("is_finished", &GenLlmReq::isFinished)
         .def_prop_ro("is_finished_due_to_length", &GenLlmReq::isFinishedDueToLength)
         .def_prop_ro("is_finished_due_to_cancellation", &GenLlmReq::isFinishedDueToCancellation)
+        .def_prop_ro("is_finished_without_error", &GenLlmReq::isFinishedWithoutError)
         .def_prop_rw(
             "context_current_position", &GenLlmReq::getContextCurrentPosition, &GenLlmReq::setContextCurrentPosition)
         .def_prop_ro("prepopulated_prompt_len", &GenLlmReq::getPrepopulatedPromptLen)
         .def("set_prepopulated_prompt_len", &GenLlmReq::setPrepopulatedPromptLen, nb::arg("prepopulated_prompt_len"),
             nb::arg("kv_tokens_per_block"))
+        .def_prop_rw(
+            "estimated_reusable_tokens", &GenLlmReq::getEstimatedReusableTokens, &GenLlmReq::setEstimatedReusableTokens)
         .def_prop_rw("guided_decoding_params", &GenLlmReq::getGuidedDecodingParams, &GenLlmReq::setGuidedDecodingParams)
         .def_prop_rw("context_phase_params", &GenLlmReq::getContextPhaseParams, &GenLlmReq::setContextPhaseParams)
         .def_prop_ro("is_context_only_request", &GenLlmReq::isContextOnlyRequest)
@@ -226,6 +231,36 @@ void initBindings(nb::module_& m)
                 if (self.getMultimodalLengths())
                 {
                     lengths = *self.getMultimodalLengths().value();
+                }
+                return lengths;
+            })
+        .def_prop_ro("multimodal_item_run_cu_offsets",
+            [](GenLlmReq& self)
+            {
+                std::optional<std::vector<GenLlmReq::SizeType32>> offsets = std::nullopt;
+                if (self.getMultimodalItemRunCuOffsets())
+                {
+                    offsets = *self.getMultimodalItemRunCuOffsets().value();
+                }
+                return offsets;
+            })
+        .def_prop_ro("multimodal_run_positions",
+            [](GenLlmReq& self)
+            {
+                std::optional<std::vector<GenLlmReq::SizeType32>> positions = std::nullopt;
+                if (self.getMultimodalRunPositions())
+                {
+                    positions = *self.getMultimodalRunPositions().value();
+                }
+                return positions;
+            })
+        .def_prop_ro("multimodal_run_lengths",
+            [](GenLlmReq& self)
+            {
+                std::optional<std::vector<GenLlmReq::SizeType32>> lengths = std::nullopt;
+                if (self.getMultimodalRunLengths())
+                {
+                    lengths = *self.getMultimodalRunLengths().value();
                 }
                 return lengths;
             })
@@ -289,6 +324,7 @@ void initBindings(nb::module_& m)
                 std::optional<std::vector<std::vector<tb::LlmRequest::SizeType32>>> multimodal_hashes,
                 std::optional<std::vector<tb::LlmRequest::SizeType32>> multimodal_positions,
                 std::optional<std::vector<tb::LlmRequest::SizeType32>> multimodal_lengths,
+                std::optional<std::vector<std::optional<std::string>>> multimodal_uuids,
                 std::optional<at::Tensor> multimodal_embedding, std::optional<at::Tensor> mrope_rotary_cos_sin,
                 std::optional<tb::LlmRequest::SizeType32> mrope_position_deltas,
                 std::optional<LoraTaskIdType> lora_task_id, std::optional<at::Tensor> lora_weights,
@@ -312,7 +348,11 @@ void initBindings(nb::module_& m)
                 std::optional<tb::LlmRequest::MillisecondsType> allotted_time_ms,
                 std::optional<executor::ContextPhaseParams> context_phase_params,
                 std::optional<tb::LlmRequest::CacheSaltIDType> cache_salt_id,
-                std::optional<tb::LlmRequest::TimePoint> arrival_time)
+                std::optional<tb::LlmRequest::TimePoint> arrival_time,
+                std::optional<std::vector<std::tuple<std::string, int>>> agent_hierarchy,
+                std::optional<std::vector<tb::LlmRequest::SizeType32>> multimodal_item_run_cu_offsets,
+                std::optional<std::vector<tb::LlmRequest::SizeType32>> multimodal_run_positions,
+                std::optional<std::vector<tb::LlmRequest::SizeType32>> multimodal_run_lengths)
             {
                 auto makeOptionalTensor = [](std::optional<at::Tensor> const& atTensor, bool unsqueeze = false)
                 {
@@ -344,7 +384,7 @@ void initBindings(nb::module_& m)
                 new (self) tb::LlmRequest{request_id, max_new_tokens, input_tokens, sampling_config, is_streaming,
                     end_id, pad_id, embedding_bias_tensor_ptr, bad_words_list_tensor_ptr, stop_words_list_tensor_ptr,
                     position_ids, prompt_embedding_table_tensor_ptr, prompt_vocab_size, multimodal_hashes,
-                    multimodal_positions, multimodal_lengths, multimodal_embedding_tensor_ptr,
+                    multimodal_positions, multimodal_lengths, multimodal_uuids, multimodal_embedding_tensor_ptr,
                     mrope_rotary_cos_sin_tensor_ptr, mrope_position_deltas, lora_task_id, lora_weights_tensor_ptr,
                     lora_config_tensor_ptr, lookahead_config, kv_cache_retention_config, return_log_probs,
                     return_context_logits, return_generation_logits, draft_tokens, draft_logits_tensor_ptr,
@@ -353,7 +393,8 @@ void initBindings(nb::module_& m)
                     encoder_output_length, cross_attention_mask_tensor_ptr, llm_request_type, input_token_extra_ids,
                     num_return_sequences, eagle_config, skip_cross_attn_blocks_tensor_ptr, return_perf_metrics,
                     guided_decoding_params, language_adapter_uid, allotted_time_ms, context_phase_params, cache_salt_id,
-                    arrival_time};
+                    arrival_time, std::move(agent_hierarchy), multimodal_item_run_cu_offsets, multimodal_run_positions,
+                    multimodal_run_lengths};
             },
             nb::arg("request_id"), nb::arg("max_new_tokens"), nb::arg("input_tokens"), nb::arg("sampling_config"),
             nb::arg("is_streaming"), nb::arg("end_id") = std::nullopt, nb::arg("pad_id") = std::nullopt,
@@ -361,25 +402,28 @@ void initBindings(nb::module_& m)
             nb::arg("stop_words_list") = std::nullopt, nb::arg("position_ids") = std::nullopt,
             nb::arg("prompt_embedding_table") = std::nullopt, nb::arg("prompt_vocab_size") = std::nullopt,
             nb::arg("multimodal_hashes") = std::nullopt, nb::arg("multimodal_positions") = std::nullopt,
-            nb::arg("multimodal_lengths") = std::nullopt, nb::arg("multimodal_embedding") = std::nullopt,
-            nb::arg("mrope_rotary_cos_sin") = std::nullopt, nb::arg("mrope_position_deltas") = std::nullopt,
-            nb::arg("lora_task_id") = std::nullopt, nb::arg("lora_weights") = std::nullopt,
-            nb::arg("lora_config") = std::nullopt, nb::arg("lookahead_config") = std::nullopt,
-            nb::arg("kv_cache_retention_config") = std::nullopt, nb::arg("return_log_probs") = false,
-            nb::arg("return_context_logits") = false, nb::arg("return_generation_logits") = false,
-            nb::arg("draft_tokens") = std::nullopt, nb::arg("draft_logits") = std::nullopt,
-            nb::arg("exclude_input_from_output") = false, nb::arg("logits_post_processor") = std::nullopt,
-            nb::arg("apply_logits_post_processor_batched") = false, nb::arg("encoder_input_tokens") = std::nullopt,
-            nb::arg("return_encoder_output") = false, nb::arg("client_id") = std::nullopt,
-            nb::arg("priority") = executor::Request::kDefaultPriority, nb::arg("encoder_input_features") = std::nullopt,
-            nb::arg("encoder_output_len") = std::nullopt, nb::arg("cross_attention_mask") = std::nullopt,
+            nb::arg("multimodal_lengths") = std::nullopt, nb::arg("multimodal_uuids") = std::nullopt,
+            nb::arg("multimodal_embedding") = std::nullopt, nb::arg("mrope_rotary_cos_sin") = std::nullopt,
+            nb::arg("mrope_position_deltas") = std::nullopt, nb::arg("lora_task_id") = std::nullopt,
+            nb::arg("lora_weights") = std::nullopt, nb::arg("lora_config") = std::nullopt,
+            nb::arg("lookahead_config") = std::nullopt, nb::arg("kv_cache_retention_config") = std::nullopt,
+            nb::arg("return_log_probs") = false, nb::arg("return_context_logits") = false,
+            nb::arg("return_generation_logits") = false, nb::arg("draft_tokens") = std::nullopt,
+            nb::arg("draft_logits") = std::nullopt, nb::arg("exclude_input_from_output") = false,
+            nb::arg("logits_post_processor") = std::nullopt, nb::arg("apply_logits_post_processor_batched") = false,
+            nb::arg("encoder_input_tokens") = std::nullopt, nb::arg("return_encoder_output") = false,
+            nb::arg("client_id") = std::nullopt, nb::arg("priority") = executor::Request::kDefaultPriority,
+            nb::arg("encoder_input_features") = std::nullopt, nb::arg("encoder_output_len") = std::nullopt,
+            nb::arg("cross_attention_mask") = std::nullopt,
             nb::arg("llm_request_type") = tb::LlmRequestType::LLMREQUEST_TYPE_CONTEXT_AND_GENERATION,
             nb::arg("input_token_extra_ids") = std::nullopt, nb::arg("num_return_sequences") = 1,
             nb::arg("eagle_config") = std::nullopt, nb::arg("skip_cross_attn_blocks") = std::nullopt,
             nb::arg("return_perf_metrics") = false, nb::arg("guided_decoding_params") = std::nullopt,
             nb::arg("language_adapter_uid") = std::nullopt, nb::arg("allotted_time_ms") = std::nullopt,
             nb::arg("context_phase_params") = std::nullopt, nb::arg("cache_salt_id") = std::nullopt,
-            nb::arg("arrival_time") = std::nullopt)
+            nb::arg("arrival_time") = std::nullopt, nb::arg("agent_hierarchy") = std::nullopt,
+            nb::arg("multimodal_item_run_cu_offsets") = std::nullopt,
+            nb::arg("multimodal_run_positions") = std::nullopt, nb::arg("multimodal_run_lengths") = std::nullopt)
         .def("check_token_id_range", &tb::LlmRequest::checkTokenIdRange, nb::arg("vocab_size"))
         .def(nb::init<tb::LlmRequest const&>())
         .def("validate", &tb::LlmRequest::validate, nb::arg("max_input_len"), nb::arg("max_seq_len"),
@@ -416,7 +460,41 @@ void initBindings(nb::module_& m)
 
     nb::class_<tb::rnn_state_manager::RnnStateManager>(m, "RnnStateManager")
         .def(nb::init<tr::SizeType32, tr::ModelConfig, tr::WorldConfig, tr::BufferManager>(),
-            nb::arg("max_num_sequences"), nb::arg("model_config"), nb::arg("world_config"), nb::arg("buffer_manager"));
+            nb::arg("max_num_sequences"), nb::arg("model_config"), nb::arg("world_config"), nb::arg("buffer_manager"),
+            nb::call_guard<nb::gil_scoped_release>())
+        .def(nb::init<tr::SizeType32, tr::SizeType32, tr::SizeType32, tr::SizeType32, tr::SizeType32, tr::SizeType32,
+                 tr::WorldConfig const&, int64_t, nvinfer1::DataType, nvinfer1::DataType,
+                 std::vector<tr::SizeType32> const&, tr::SizeType32>(),
+            nb::arg("d_state"), nb::arg("d_conv"), nb::arg("num_heads"), nb::arg("n_groups"), nb::arg("head_dim"),
+            nb::arg("max_batch_size"), nb::arg("world_config"), nb::arg("stream"), nb::arg("dtype"),
+            nb::arg("ssm_cache_dtype"), nb::arg("pp_layers"), nb::arg("num_layers"),
+            nb::call_guard<nb::gil_scoped_release>())
+        .def("get_cache_index", &tb::rnn_state_manager::RnnStateManager::getCacheIndex, nb::arg("request_id"),
+            nb::call_guard<nb::gil_scoped_release>())
+        .def(
+            "get_conv_states",
+            [](tb::rnn_state_manager::RnnStateManager& self, tr::SizeType32 layerIdx) -> at::Tensor
+            {
+                auto tensor = self.getConvStates(layerIdx);
+                return tr::Torch::tensor(tensor);
+            },
+            nb::arg("layer_idx"), nb::call_guard<nb::gil_scoped_release>())
+        .def(
+            "get_ssm_states",
+            [](tb::rnn_state_manager::RnnStateManager& self, tr::SizeType32 layerIdx) -> at::Tensor
+            {
+                auto tensor = self.getSsmStates(layerIdx);
+                return tr::Torch::tensor(tensor);
+            },
+            nb::arg("layer_idx"), nb::call_guard<nb::gil_scoped_release>())
+        .def("allocate_cache_blocks", &tb::rnn_state_manager::RnnStateManager::allocateCacheBlocks,
+            nb::arg("request_ids"), nb::call_guard<nb::gil_scoped_release>())
+        .def("free_cache_block", &tb::rnn_state_manager::RnnStateManager::freeCacheBlock, nb::arg("request_id"),
+            nb::call_guard<nb::gil_scoped_release>())
+        .def("get_state_indices", &tb::rnn_state_manager::RnnStateManager::getStateIndices, nb::arg("request_ids"),
+            nb::arg("is_padding"), nb::call_guard<nb::gil_scoped_release>())
+        .def("get_num_local_layers", &tb::rnn_state_manager::RnnStateManager::getNumLocalLayers,
+            nb::call_guard<nb::gil_scoped_release>());
 
     m.def(
         "add_new_tokens_to_requests",

@@ -4,10 +4,10 @@ import torch
 import torch.nn as nn
 from transformers.activations import ACT2FN
 from transformers.modeling_outputs import BaseModelOutput
-from transformers.modeling_utils import (get_parameter_device,
-                                         get_parameter_dtype)
 from transformers.models.clip.configuration_clip import CLIPVisionConfig
 from transformers.models.clip.modeling_clip import CLIPVisionEmbeddings
+
+from tensorrt_llm._utils import prefer_pinned
 
 from ..attention_backend.interface import (AttentionMetadata,
                                            PredefinedAttentionMask)
@@ -15,7 +15,20 @@ from ..attention_backend.utils import get_attention_backend
 from ..model_config import ModelConfig
 from ..modules.attention import Attention
 from ..modules.mlp import MLP
+from .hf_parameter_utils import get_parameter_device, get_parameter_dtype
 from .modeling_utils import _load_weights_impl, register_auto_model
+
+try:
+    # Available in transformers<5
+    from transformers.modeling_utils import (get_parameter_device,
+                                             get_parameter_dtype)
+except ImportError:
+    # Removed in transformers>=5
+    def get_parameter_device(module):
+        return next(module.parameters()).device
+
+    def get_parameter_dtype(module):
+        return next(module.parameters()).dtype
 
 
 class CLIPAttention(Attention):
@@ -206,7 +219,7 @@ class CLIPVisionModel(nn.Module):
         prompt_lens = [seq_len] * batch_size
         seq_lens = torch.tensor([seq_len] * batch_size,
                                 dtype=torch.int,
-                                pin_memory=True)
+                                pin_memory=prefer_pinned())
 
         self.attn_metadata.num_contexts = batch_size
         self.attn_metadata.request_ids = request_ids

@@ -190,7 +190,49 @@ def _torch_ssm(
         float
     ],  # NOTE: `torch` custom ops do not like `Tuple` inputs. Using `List` is the suggested WAR.
     chunk_size: int,
+    enable_sharding: bool = False,
+    layer_type: str = "ssm",
 ) -> torch.Tensor:
+    """Mamba state-space model (SSM) mixer forward (prefill / uncached path).
+
+    Implements the chunked SSM recurrence in ``_torch_ssm_prefill``: discretizes
+    states with ``dt`` / ``dt_bias``, applies intra- and inter-chunk updates, and
+    returns the hidden output. ``time_step_limit`` clamps the softplus-scaled
+    time step.
+
+    Args:
+        hidden_states: Input hidden states, shape
+            ``[batch, seq_len, num_heads, head_dim]``.
+        A: SSM decay/state matrix term, broadcast-compatible with chunked layout
+            (see internal reshape into chunks).
+        B: SSM input matrix (low-rank / group structure as in Mamba).
+        C: SSM output matrix (low-rank / group structure as in Mamba).
+        D: Residual skip scale, applied per head/feature as in the reference.
+        dt: Raw delta / time-step logits before softplus and clamping.
+        dt_bias: Bias added inside the softplus path for ``dt``.
+        time_step_limit: Two-element list ``[min, max]`` for clamping the effective
+            time step after ``softplus(dt + dt_bias)``. (Passed as ``List`` because
+            Torch custom ops avoid tuple inputs.)
+        chunk_size: Chunk length for blocked SSM computation along the sequence axis.
+        enable_sharding: When ``True``, ``apply_sharding_hints`` shards parameters such as
+            ``A``, ``D``, and ``dt_bias`` along the **head** dimension (per-rank head
+            slices). When ``False``, those parameter nodes are not head-sharded by the
+            hint pass.
+        layer_type: Layer classification for selective sharding via ``shard_layers``
+            config. Values: ``"mha"``, ``"mla"``, ``"mlp"``, ``"moe"``, ``"ssm"``,
+            ``"delta"``, ``"unknown"``.
+
+    Sharding hint arguments (graph-level metadata for ``apply_sharding_hints``):
+        ``enable_sharding``: When ``True``, ``apply_sharding_hints`` will shard the op's
+        weight/parameter ancestors along the head dimension (e.g., ``A``, ``D``,
+        ``dt_bias``).
+        ``layer_type``: Layer classification for selective sharding via
+        ``shard_layers`` config.
+
+    Returns:
+        SSM output tensor, same shape as ``hidden_states`` (float32 compute may be
+        used internally; see fake/meta for export).
+    """
     y, _ = _torch_ssm_prefill(hidden_states, A, B, C, D, dt, dt_bias, time_step_limit, chunk_size)
     return y
 
@@ -206,5 +248,7 @@ def _torch_ssm_meta(
     dt_bias: torch.Tensor,
     time_step_limit: List[float],
     chunk_size: int,
+    enable_sharding: bool = False,
+    layer_type: str = "ssm",
 ) -> torch.Tensor:
     return torch.empty_like(hidden_states, dtype=torch.float32)

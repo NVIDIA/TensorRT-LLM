@@ -190,7 +190,12 @@ void FusedMHARunnerV2::setupKernelParams(MHARunnerParams runnerParams)
             // Tensor K is contiguous.
             mKernelParams.k_stride_in_bytes
                 = get_size_in_bytes(mFixedParams.numKvHeads * mFixedParams.headSize, mFixedParams.dataType);
-            if (mFixedParams.headSizeQkNope > 0 && mFixedParams.dataType != DATA_TYPE_E4M3)
+            if (runnerParams.vStrideInBytes > 0)
+            {
+                // Caller provided the actual V stride (supports both contiguous and non-contiguous V).
+                mKernelParams.v_stride_in_bytes = runnerParams.vStrideInBytes;
+            }
+            else if (mFixedParams.headSizeQkNope > 0 && mFixedParams.dataType != DATA_TYPE_E4M3)
             {
                 // Non-FP8 context MLA: tensor V is not contiguous. The token stride is numKvHeads * (headSizeQkNope +
                 // headSizeV).
@@ -387,19 +392,10 @@ void FusedMHARunnerV2::setupLaunchParams(MHARunnerParams runnerParams)
     {
         TLLM_CHECK_WITH_INFO(false, "Unsupported architecture");
     }
-    // Hopper: fallback to original fmha_v2 when head_size <= 64 and seq_len <= 256
-    // Only supports packed_qkv input + padding/causal mask.
-    else if (isSm90 && !separateQKvInput && paddingOrCausalMask
-        && (mFixedParams.headSize == 32 || mFixedParams.headSize == 64) && runnerParams.qSeqLen <= 256
-        && !common::getEnvForceDeterministicAttention())
-    {
-        mLaunchParams.flash_attention = false;
-        // get max sequence length for non-flash-attention.
-        // this doesn't support different q and kv sequence lengths.
-        mLaunchParams.kernel_s = getSFromMaxSeqLen(runnerParams.qSeqLen);
-    }
     else
-    { // always use flash attention kernels for Ampere/Ada
+    {
+        // Non-flash-attention style original fmha_v2 kernel support has been removed
+        // always use flash attention kernels
         mLaunchParams.flash_attention = true;
         // flash attention kernles s = 0 (support any seq length)
         mLaunchParams.kernel_s = 0;

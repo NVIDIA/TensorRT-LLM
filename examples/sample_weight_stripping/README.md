@@ -1,5 +1,11 @@
 # Sample Weight-Stripping
 
+> [!WARNING]
+> The `convert_checkpoint.py` / `trtllm-build` / `run.py` workflow described
+> below is **legacy** and will not receive new features. New projects should use
+> [`trtllm-serve`](https://nvidia.github.io/TensorRT-LLM/quick-start-guide.html)
+> or the [LLM Python API](https://nvidia.github.io/TensorRT-LLM/llm-api/index.html) instead.
+
 ## Table Of Contents
 
 - [Overview](#overview)
@@ -41,7 +47,7 @@ trtllm-refit --checkpoint_dir ${CHECKPOINT_DIR} --engine_dir ${ENGINE_DIR}
 
 ## Prerequisites
 
-Install [TensorRT-LLM](https://github.com/NVIDIA/TensorRT-LLM/blob/main/README.md) either through [pip](https://github.com/NVIDIA/TensorRT-LLM/blob/main/README.md#installation) or [from the source](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/installation/build-from-source-linux.md).
+Install [TensorRT-LLM](https://github.com/NVIDIA/TensorRT-LLM/blob/main/README.md) either through [pip](https://github.com/NVIDIA/TensorRT-LLM/blob/main/README.md#installation) or [from the source](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/installation/build-from-source.md).
 
 ## Weight-Stripping Workflow Example
 
@@ -113,7 +119,7 @@ python3 ../summarize.py --engine_dir ./trt_engines/gptj_fp16_tp1.refit \
 1. Download the llama-7b-hf checkpoint and saved in /llm-models/llama-models/llama-7b-hf/.
 
 2. Calibrate the checkpoint and convert into TensorRT LLM format.
-Run below command lines in [`examples/models/core/llama`](../llama) directory.
+Run below command lines in [`examples/models/core/llama`](../models/core/llama) directory.
 ```bash
 # Calibrate INT4 using AMMO.
 python ../quantization/quantize.py --model_dir  /llm-models/llama-models/llama-7b-hf/ \
@@ -154,7 +160,7 @@ python3 ../summarize.py --engine_dir trt_int4_AWQ_full_from_wtless \
 1. Download the llama-7b-hf checkpoint and saved in /llm-models/llama-models/llama-7b-hf/.
 
 2. Convert the checkpoint into TensorRT LLM format.
-Run below command lines in [`examples/models/core/llama`](../llama) directory.
+Run below command lines in [`examples/models/core/llama`](../models/core/llama) directory.
 ```bash
 python3 convert_checkpoint.py --model_dir /llm-models/llama-models/llama-7b-hf/ \
                 --output_dir ./llama-7b-hf-fp16-woq \
@@ -194,7 +200,7 @@ python3 ../summarize.py --engine_dir ./engines/llama-7b-hf-fp16-woq-1gpu-wtless-
 1. Download the llama-v2-70b-hf checkpoint and saved in /llm-models/llama-models-v2/llama-v2-70b-hf/.
 
 2. Calibrate the checkpoint and convert into TensorRT LLM format.
-Run below command lines in [`examples/models/core/llama`](../llama) directory.
+Run below command lines in [`examples/models/core/llama`](../models/core/llama) directory.
 ```bash
 # Calibrate FP8 using AMMO.
 python ../quantization/quantize.py --model_dir /llm-models/llama-models-v2/llama-v2-70b-hf/ \
@@ -249,7 +255,7 @@ Building an engine from a pruned checkpoint will also allow the engine to be [re
 
 #### Pruning a TensorRT LLM Checkpoint
 
-1. Install [TensorRT-LLM](https://github.com/NVIDIA/TensorRT-LLM/blob/main/README.md) either through [pip](https://github.com/NVIDIA/TensorRT-LLM/blob/main/README.md#installation) or [from the source](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/installation/build-from-source-linux.md).
+1. Install [TensorRT-LLM](https://github.com/NVIDIA/TensorRT-LLM/blob/main/README.md) either through [pip](https://github.com/NVIDIA/TensorRT-LLM/blob/main/README.md#installation) or [from the source](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/installation/build-from-source.md).
 2. Download a model of your choice and convert it to a TensorRT LLM checkpoint ([llama instructions](https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/models/core/llama/README.md#usage)).
 3. (Optional) Run the `trtllm-prune` command.
 ```bash

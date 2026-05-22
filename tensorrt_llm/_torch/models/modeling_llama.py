@@ -7,8 +7,9 @@ from PIL.Image import Image
 from torch import nn
 from transformers import (AutoProcessor, AutoTokenizer, Llama4Config,
                           Llama4VisionModel, LlamaConfig, PretrainedConfig)
-from transformers.modeling_utils import load_sharded_checkpoint
 from transformers.models.llama4.modeling_llama4 import Llama4MultiModalProjector
+from transformers.utils import (SAFE_WEIGHTS_INDEX_NAME, SAFE_WEIGHTS_NAME,
+                                WEIGHTS_INDEX_NAME, WEIGHTS_NAME)
 
 from tensorrt_llm._torch.distributed import (AllReduce, AllReduceFusionOp,
                                              AllReduceParams, MoEAllReduce)
@@ -23,8 +24,8 @@ from tensorrt_llm.lora_manager import HfLoraLoader
 from tensorrt_llm.models.convert_utils import split_matrix_tp
 
 from ...inputs import (BaseMultimodalDummyInputsBuilder,
-                       BaseMultimodalInputProcessor, ExtraProcessedInputs,
-                       MultimodalPlaceholderMetadata,
+                       BaseMultimodalInputProcessor, ContentFormat,
+                       ExtraProcessedInputs, MultimodalPlaceholderMetadata,
                        MultimodalPlaceholderPlacement, TextPrompt,
                        register_input_processor)
 from ...sampling_params import SamplingParams
@@ -49,6 +50,26 @@ from .modeling_utils import (DecoderModel, DecoderModelForCausalLM,
                              EagerFusionConfig, register_auto_model)
 
 DISAGG = os.getenv('TLLM_MULTIMODAL_DISAGGREGATED', '0') == '1'
+
+try:
+    # Available in transformers<5
+    from transformers.modeling_utils import load_sharded_checkpoint
+except ImportError:
+    # Removed in transformers>=5; provide a minimal shim
+    def load_sharded_checkpoint(model, folder, strict=True):
+        import json
+
+        from safetensors.torch import load_file
+        index_file = os.path.join(folder, "model.safetensors.index.json")
+        if os.path.exists(index_file):
+            with open(index_file) as f:
+                shard_files = set(json.load(f)["weight_map"].values())
+            state_dict = {}
+            for sf in shard_files:
+                state_dict.update(load_file(os.path.join(folder, sf)))
+        else:
+            state_dict = load_file(os.path.join(folder, "model.safetensors"))
+        model.load_state_dict(state_dict, strict=strict)
 
 
 class Llama4Attention(Attention):
@@ -338,17 +359,31 @@ class Llama4MoE(nn.Module):
         fn1 = lambda: self.compute_routed_output(
             hidden_states, all_rank_num_tokens, cutlass_min_latency_mode)
         shared_output, routed_output = maybe_execute_in_parallel(
-            fn0, fn1, self.moe_event[0], self.moe_event[1], self.aux_stream)
+            fn0,
+            fn1,
+            self.moe_event[0],
+            self.moe_event[1],
+            self.aux_stream,
+            disable_on_compile=True)
         if cutlass_min_latency_mode:
             return [shared_output, *routed_output]
 
         assert shared_output.size() == routed_output.size(
         ), f'unmatched tensor shape'
-        final_hidden_states = shared_output + routed_output
         if not self.enable_attention_dp and self.mapping.has_tp():
+            if isinstance(shared_output, torch.Tensor):
+                output_tensor, _ = torch.ops.trtllm.allocate_output(
+                    shared_output, self.all_reduce.output_buffer_kind,
+                    self.mapping.tp_group)
+                final_hidden_states = torch.add(shared_output,
+                                                routed_output,
+                                                out=output_tensor)
+            else:
+                final_hidden_states = shared_output + routed_output
             final_hidden_states = self.all_reduce(
                 final_hidden_states, all_reduce_params=final_all_reduce_params)
-
+        else:
+            final_hidden_states = shared_output + routed_output
         return final_hidden_states
 
 
@@ -449,6 +484,10 @@ class Llama4DecoderLayer(DecoderLayer):
         self.input_layernorm = RMSNorm(hidden_size=config.hidden_size,
                                        eps=config.rms_norm_eps,
                                        dtype=config.torch_dtype)
+        # When post_load_weights() chains layernorms across layers,
+        # this flag is set to True to skip the input layernorm in
+        # forward() since it is handled by the previous layer.
+        self.skip_input_layernorm = False
 
         self.post_attention_layernorm = RMSNorm(hidden_size=config.hidden_size,
                                                 eps=config.rms_norm_eps,
@@ -493,6 +532,8 @@ class Llama4DecoderLayer(DecoderLayer):
 
         if residual is None:
             residual = hidden_states
+
+        if not self.skip_input_layernorm:
             hidden_states = self.input_layernorm(hidden_states)
 
         # Self Attention
@@ -668,6 +709,10 @@ class LlamaDecoderLayer(DecoderLayer):
             quantize_type="nvfp4"
             if not self.disable_nvfp4_layernorm_fusion and self.is_nvfp4
             and not (differ_pp_stage_with_previous_layer) else None)
+        # When post_load_weights() chains layernorms across layers,
+        # this flag is set to True to skip the input layernorm in
+        # forward() since it is handled by the previous layer.
+        self.skip_input_layernorm = False
 
         self.post_attention_layernorm = RMSNorm(
             hidden_size=config.hidden_size,
@@ -765,6 +810,8 @@ class LlamaDecoderLayer(DecoderLayer):
     ) -> Union[torch.Tensor, Fp4QuantizedTensor]:
         if residual is None:
             residual = hidden_states
+
+        if not self.skip_input_layernorm:
             hidden_states = self.input_layernorm(hidden_states)
 
         hidden_states = self.self_attn(
@@ -936,6 +983,10 @@ class Llama4Model(DecoderModel):
         self.norm = RMSNorm(hidden_size=config.hidden_size,
                             eps=config.rms_norm_eps,
                             dtype=config.torch_dtype)
+        # When post_load_weights() chains the final norm into the
+        # last decoder layer, this flag is set to True to skip
+        # applying it again in forward().
+        self.skip_norm = False
 
     def forward(
         self,
@@ -968,6 +1019,10 @@ class Llama4Model(DecoderModel):
                 spec_metadata=spec_metadata,
                 lora_params=lora_params,
             )
+
+        # If self.norm is not handled by the last layer, apply it here.
+        if not self.skip_norm:
+            hidden_states = self.norm(hidden_states)
 
         return hidden_states
 
@@ -1033,6 +1088,10 @@ class LlamaModel(DecoderModel):
         self.norm = RMSNorm(hidden_size=config.hidden_size,
                             eps=config.rms_norm_eps,
                             dtype=config.torch_dtype)
+        # When post_load_weights() chains the final norm into the
+        # last decoder layer, this flag is set to True to skip
+        # applying it again in forward().
+        self.skip_norm = False
 
     def forward(
         self,
@@ -1065,6 +1124,10 @@ class LlamaModel(DecoderModel):
                 lora_params=lora_params,
             )
 
+        # If self.norm is not handled by the last layer, apply it here.
+        if not self.skip_norm:
+            hidden_states = self.norm(hidden_states)
+
         return hidden_states
 
 
@@ -1082,10 +1145,62 @@ class LlamaForCausalLM(SpecDecOneEngineForCausalLM[LlamaModel, LlamaConfig]):
                 self.model.layers[:self.config.num_hidden_layers]):
             if idx == self.config.num_hidden_layers - 1:
                 layer.next_layer_layernorm = self.model.norm
+                self.model.skip_norm = True
             else:
                 layer.next_layer_layernorm = self.model.layers[
                     idx + 1].input_layernorm
+                self.model.layers[idx + 1].skip_input_layernorm = True
                 layer.next_attn = self.model.layers[idx + 1].self_attn
+
+
+def _load_checkpoint_into_module(module: nn.Module,
+                                 folder: str,
+                                 strict: bool = True) -> None:
+    """Load a sharded HuggingFace checkpoint into a module.
+
+    This replaces the removed ``transformers.modeling_utils.load_sharded_checkpoint``
+    function. It supports both safetensors and PyTorch checkpoint formats.
+    """
+    folder = str(folder)
+
+    # Determine checkpoint format and collect shard files
+    index_file = os.path.join(folder, SAFE_WEIGHTS_INDEX_NAME)
+    if os.path.isfile(index_file):
+        import json
+        with open(index_file) as f:
+            shard_files = sorted(set(json.load(f)["weight_map"].values()))
+        shard_paths = [os.path.join(folder, s) for s in shard_files]
+        use_safetensors = True
+    elif os.path.isfile(os.path.join(folder, WEIGHTS_INDEX_NAME)):
+        import json
+        with open(os.path.join(folder, WEIGHTS_INDEX_NAME)) as f:
+            shard_files = sorted(set(json.load(f)["weight_map"].values()))
+        shard_paths = [os.path.join(folder, s) for s in shard_files]
+        use_safetensors = False
+    elif os.path.isfile(os.path.join(folder, SAFE_WEIGHTS_NAME)):
+        shard_paths = [os.path.join(folder, SAFE_WEIGHTS_NAME)]
+        use_safetensors = True
+    elif os.path.isfile(os.path.join(folder, WEIGHTS_NAME)):
+        shard_paths = [os.path.join(folder, WEIGHTS_NAME)]
+        use_safetensors = False
+    else:
+        raise FileNotFoundError(
+            f"No checkpoint found in {folder}. Expected "
+            f"{SAFE_WEIGHTS_INDEX_NAME}, {WEIGHTS_INDEX_NAME}, "
+            f"{SAFE_WEIGHTS_NAME}, or {WEIGHTS_NAME}.")
+
+    # Load state dict from all shards and merge
+    full_state_dict: Dict[str, torch.Tensor] = {}
+    if use_safetensors:
+        from safetensors.torch import load_file
+        for path in shard_paths:
+            full_state_dict.update(load_file(path))
+    else:
+        for path in shard_paths:
+            full_state_dict.update(
+                torch.load(path, map_location="cpu", weights_only=True))
+
+    module.load_state_dict(full_state_dict, strict=strict)
 
 
 class Llama4VisionEncoder(nn.Module):
@@ -1118,9 +1233,9 @@ class Llama4VisionEncoder(nn.Module):
 
         # Otherwise, load the weights from the checkpoint.
         else:
-            load_sharded_checkpoint(module_dict,
-                                    self.pretrained_config._name_or_path,
-                                    strict=False)
+            _load_checkpoint_into_module(module_dict,
+                                         self.pretrained_config._name_or_path,
+                                         strict=False)
 
         self.vision_model = module_dict["vision_model"].to(self.device)
         self.mm_projector = module_dict["multi_modal_projector"].to(self.device)
@@ -1137,9 +1252,6 @@ class Llama4VisionEncoder(nn.Module):
             pixel_values).last_hidden_state.flatten(0, 1)
         image_features = self.mm_projector(image_features)
         return [image_features]
-
-
-from transformers import AutoTokenizer, PretrainedConfig
 
 
 class Llama4InputProcessor(BaseMultimodalInputProcessor,
@@ -1371,6 +1483,7 @@ class Llama4InputProcessor(BaseMultimodalInputProcessor,
     placeholder_metadata=MultimodalPlaceholderMetadata(
         placeholder_map={"image": "<|image|>"},
         placeholder_placement=MultimodalPlaceholderPlacement.BEFORE_TEXT,
+        content_format=ContentFormat.STRING,
     ))
 class Llama4ForConditionalGeneration(SpecDecOneEngineForCausalLM[Llama4Model,
                                                                  Llama4Config]):
@@ -1401,6 +1514,7 @@ class Llama4ForConditionalGeneration(SpecDecOneEngineForCausalLM[Llama4Model,
         inputs_embeds: Optional[torch.FloatTensor] = None,
         return_context_logits: bool = False,
         spec_metadata: Optional[SpecMetadata] = None,
+        resource_manager=None,
         **kwargs,
     ) -> torch.Tensor:
         multimodal_params = kwargs.get("multimodal_params", [])
@@ -1422,7 +1536,8 @@ class Llama4ForConditionalGeneration(SpecDecOneEngineForCausalLM[Llama4Model,
                                position_ids,
                                inputs_embeds,
                                spec_metadata=spec_metadata,
-                               return_context_logits=return_context_logits)
+                               return_context_logits=return_context_logits,
+                               resource_manager=resource_manager)
 
     def infer_max_seq_len(self):
         if self.model_config.attn_backend.upper() != 'TRTLLM':
@@ -1454,9 +1569,11 @@ class Llama4ForConditionalGeneration(SpecDecOneEngineForCausalLM[Llama4Model,
                 self.model.layers[:self.config.num_hidden_layers]):
             if idx == self.config.num_hidden_layers - 1:
                 layer.next_layer_layernorm = self.model.norm
+                self.model.skip_norm = True
             else:
                 layer.next_layer_layernorm = self.model.layers[
                     idx + 1].input_layernorm
+                self.model.layers[idx + 1].skip_input_layernorm = True
                 layer.next_attn = self.model.layers[idx + 1].self_attn
 
 

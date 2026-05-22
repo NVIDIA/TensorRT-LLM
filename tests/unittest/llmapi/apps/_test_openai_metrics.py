@@ -38,7 +38,7 @@ def client(llm):
                                                       (False, 503)])
 def test_health(client, llm, is_healthy, response_code):
     if not is_healthy:
-        with patch.object(llm._executor, 'is_shutdown', return_value=True):
+        with patch.object(llm._executor, 'check_health', return_value=False):
             response = client.get("/health")
             assert response.status_code == response_code
     else:
@@ -98,3 +98,19 @@ def test_metrics(client):
     assert "pinnedMemUsage" in response_dict
     assert "staticBatchingStats" in response_dict
     assert "timestamp" in response_dict
+    # Per-iteration KV cache stats (keyed by window size)
+    assert "kvCacheIterationStats" in response_dict
+    kv_iter = response_dict["kvCacheIterationStats"]
+    assert len(kv_iter) > 0
+    # Check fields in the first (and likely only) window size entry
+    ws_stats = next(iter(kv_iter.values()))
+    assert "primaryMaxNumBlocks" in ws_stats
+    assert "primaryUsedNumBlocks" in ws_stats
+    assert "iterReusedBlocks" in ws_stats
+    assert "iterFullReusedBlocks" in ws_stats
+    assert "iterPartialReusedBlocks" in ws_stats
+    assert "iterMissedBlocks" in ws_stats
+    assert "iterCacheHitRate" in ws_stats
+    assert "iterGenAllocBlocks" in ws_stats
+    assert "iterOnboardBlocks" in ws_stats
+    assert "iterOnboardBytes" in ws_stats

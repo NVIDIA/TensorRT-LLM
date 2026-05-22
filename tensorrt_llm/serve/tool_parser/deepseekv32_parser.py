@@ -61,6 +61,10 @@ class DeepSeekV32Parser(BaseToolParser):
     Reference: DeepSeek V3.2 format specification
     """
 
+    needs_raw_special_tokens = True
+
+    _eos_token = "<｜end▁of▁sentence｜>"  # nosec B105
+
     def __init__(self):
         super().__init__()
         self.bot_token = "<｜DSML｜function_calls>"  # nosec B105
@@ -118,6 +122,8 @@ class DeepSeekV32Parser(BaseToolParser):
         :param tools: List of available tools.
         :return: ParseResult indicating success or failure, consumed text, leftover text, and parsed calls.
         """
+        if self._eos_token in text:
+            text = text.replace(self._eos_token, "")
         idx = text.find(self.bot_token)
         normal_text = text[:idx].strip() if idx != -1 else text
         if self.bot_token not in text:
@@ -177,7 +183,7 @@ class DeepSeekV32Parser(BaseToolParser):
 
         if not has_tool_call and not potentially_dsml and not ends_with_prefix:
             self._buffer = ""
-            for e_token in [self.eot_token, self.invoke_end_token]:
+            for e_token in [self.eot_token, self.invoke_end_token, self._eos_token]:
                 if e_token in new_text:
                     new_text = new_text.replace(e_token, "")
             return StreamingParseResult(normal_text=new_text)

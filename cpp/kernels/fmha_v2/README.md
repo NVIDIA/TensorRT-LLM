@@ -20,7 +20,12 @@ the `setup.py` code:
 export TORCH_CUDA_ARCH_LIST=9.0 ENABLE_SM89_QMMA=1 ENABLE_HMMA_FP32=1 SCHEDULING_MODE=1 ENABLE_SM100=1 ENABLE_SM120=1
 ```
 
-To generate subset of kernels, you can add conditions in setup.py.
+To generate subset of kernels, you can add conditions in setup.py. Or set `FMHA_FILTER_ARCH` before calling setup.py:
+
+```
+# Build only for a specific arch (or list of architectures). Will not enable kernels that are disabled by default
+export FMHA_FILTER_ARCH=90
+```
 
 To generate the files and compile the kernels:
 ```

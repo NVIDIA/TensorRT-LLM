@@ -21,12 +21,13 @@ from .interface import AlltoallMethodType, MoE
 from .quantization import UnquantizedFusedMoEMethod
 
 # isort: off
-from .quantization import (
-    DeepSeekFP8BlockScalesFusedMoEMethod, FP8QDQFusedMoEMethod,
-    MoEWeightLoadingMode, NVFP4CutlassFusedMoEMethod, UnquantizedFusedMoEMethod,
-    INT8WoqPerChannelFusedMoEMethod, W4A8MXFP4FP8CutlassFusedMoEMethod,
-    W4A8MXFP4MXFP8CutlassFusedMoEMethod, WFP4A16FusedMoEMethod,
-    WInt4AFP8FusedMoEMethod)
+from .quantization import (DeepSeekFP8BlockScalesFusedMoEMethod,
+                           FP8QDQFusedMoEMethod, MoEWeightLoadingMode,
+                           NVFP4CutlassFusedMoEMethod,
+                           INT8WoqPerChannelFusedMoEMethod,
+                           W4A8MXFP4FP8CutlassFusedMoEMethod,
+                           W4A8MXFP4MXFP8CutlassFusedMoEMethod,
+                           WFP4A16FusedMoEMethod, WInt4AFP8FusedMoEMethod)
 # isort: on
 from .routing import BaseMoeRoutingMethod
 
@@ -76,14 +77,14 @@ class CutlassFusedMoE(MoE):
             "sm_constraint": ("min", 89),
             "dtypes": {torch.float16, torch.bfloat16, torch.float32},
         },
-        # FP8_BLOCK_SCALES: SM == 90 only
+        # FP8_BLOCK_SCALES: SM in {90, 120}
         QuantAlgo.FP8_BLOCK_SCALES: {
-            "sm_constraint": ("exact", 90),
-            "dtypes": {torch.float16, torch.bfloat16, torch.float32},
+            "sm_constraint": ("in", {90, 120}),
+            "dtypes": {torch.bfloat16},
         },
-        # NVFP4: SM in {100, 103}
+        # NVFP4: SM in {100, 103, 120, 121}
         QuantAlgo.NVFP4: {
-            "sm_constraint": ("in", {100, 103}),
+            "sm_constraint": ("in", {100, 103, 120, 121}),
             "dtypes": {torch.float16, torch.bfloat16, torch.float8_e4m3fn},
         },
         # W4A8_AWQ: SM in {89, 90} only
@@ -106,22 +107,22 @@ class CutlassFusedMoE(MoE):
             "sm_constraint": ("in", {100, 103}),
             "dtypes": {torch.float16, torch.bfloat16, torch.float32},
         },
-        # W4A8_MXFP4_MXFP8: SM in {100, 103}
+        # W4A8_MXFP4_MXFP8: SM in {100, 103, 120, 121}
         QuantAlgo.W4A8_MXFP4_MXFP8: {
-            "sm_constraint": ("in", {100, 103}),
+            "sm_constraint": ("in", {100, 103, 120, 121}),
             "dtypes": {torch.float16, torch.bfloat16},
         },
     }
 
-    # Quantization algorithms that support gptoss_style
     _GPTOSS_SUPPORTED_ALGOS = {QuantAlgo.W4A8_MXFP4_MXFP8}
+    """set[QuantAlgo]: Quantization algorithms that support swiglu_gptoss_style."""
 
     @classmethod
     def can_implement(
         cls,
         quant_algo: Optional[QuantAlgo],
         dtype_activation: torch.dtype = torch.bfloat16,
-        gptoss_style: bool = False,
+        swiglu_gptoss_style: bool = False,
     ) -> Tuple[bool, Optional[str]]:
         """
         Check if CutlassFusedMoE can implement the given quantization algorithm.
@@ -129,13 +130,13 @@ class CutlassFusedMoE(MoE):
         CutlassFusedMoE supports:
         - Unquantized (FP16/BF16): SM >= 80
         - FP8 per-tensor (QDQ): SM >= 89
-        - FP8_BLOCK_SCALES: SM == 90 only
-        - NVFP4: SM in {100, 103}
+        - FP8_BLOCK_SCALES: SM in {90, 120}
+        - NVFP4: SM in {100, 103, 120, 121}
         - W4A8_AWQ: SM in {89, 90} only
         - W8A16: SM >= 80
         - W4A16_MXFP4: SM == 90 only
         - W4A8_MXFP4_FP8: SM in {100, 103}
-        - W4A8_MXFP4_MXFP8: SM in {100, 103}
+        - W4A8_MXFP4_MXFP8: SM in {100, 103, 120, 121}
 
         Args:
             quant_algo: The quantization algorithm to check (None for unquantized)
@@ -145,8 +146,8 @@ class CutlassFusedMoE(MoE):
                 - FP8/FP8_BLOCK_SCALES/W4A8_MXFP4_FP8: float16, bfloat16, float32
                 - NVFP4: float16, bfloat16, float8_e4m3fn
                 - W4A16_MXFP4/W4A8_AWQ/W8A16/W4A8_MXFP4_MXFP8: float16, bfloat16
-            gptoss_style: Whether gptoss_style (bias/swiglu with custom alpha/beta/limit) is enabled.
-                CutlassFusedMoE only supports gptoss_style for W4A8_MXFP4_MXFP8 quantization.
+            swiglu_gptoss_style: Whether swiglu_gptoss_style (bias/swiglu with custom alpha/beta/limit) is enabled.
+                CutlassFusedMoE only supports swiglu_gptoss_style for W4A8_MXFP4_MXFP8 quantization.
 
         Returns:
             Tuple[bool, Optional[str]]: (can_implement, skip_reason)
@@ -160,10 +161,10 @@ class CutlassFusedMoE(MoE):
             return _warn_and_return(
                 f"CutlassFusedMoE requires SM >= 80, got SM{sm_version}")
 
-        # Check gptoss_style support
-        if gptoss_style and quant_algo not in cls._GPTOSS_SUPPORTED_ALGOS:
+        # Check swiglu_gptoss_style support
+        if swiglu_gptoss_style and quant_algo not in cls._GPTOSS_SUPPORTED_ALGOS:
             return _warn_and_return(
-                f"CutlassFusedMoE gptoss_style only supports W4A8_MXFP4_MXFP8 "
+                f"CutlassFusedMoE swiglu_gptoss_style only supports W4A8_MXFP4_MXFP8 "
                 f"(got quant_algo={quant_algo})")
 
         # Check if quant_algo is supported
@@ -454,8 +455,9 @@ class CutlassFusedMoE(MoE):
                 # No quantization needed here, handled in kernel
                 pass
             elif self.has_w4a16_mxfp4:
-                pad_size = self.hidden_size - x.shape[1]
-                x = torch.nn.functional.pad(x, (0, pad_size))
+                # Padding deferred to run_moe so that dispatch sends
+                # unpadded tensors (avoids NVLink workspace overallocation).
+                pass
             elif self.has_int8_woq_per_channel:
                 # No quantization needed here, handled in kernel
                 pass
@@ -467,6 +469,20 @@ class CutlassFusedMoE(MoE):
                         x, Fp4QuantizedTensor
                     ), "Fp4QuantizedTensor is not expected for AWQ quantization."
                     x = x * self.fc31_act_scale
+
+                # Dynamic quantization: compute input_scale from current input
+                # and update alpha in-place (same tensor addresses for CUDA graph).
+                if self.force_dynamic_quantization and hasattr(
+                        self, 'fc31_weight_scale_2'):
+                    FP8_MAX, E2M1_MAX = 448.0, 6.0
+                    amax_input = torch.amax(torch.abs(x)).float()
+                    dyn_input_scale = FP8_MAX * E2M1_MAX / amax_input
+
+                    # fc31_alpha[e] = weight_scale_2[e] / dyn_input_scale
+                    self.fc31_alpha.data.copy_(self.fc31_weight_scale_2.data /
+                                               dyn_input_scale)
+                    self.fc31_input_scale.data.copy_(dyn_input_scale)
+
                 # Quantize based on communication scenario
                 if post_quant_comm:
                     if isinstance(x, Fp4QuantizedTensor):
@@ -583,6 +599,58 @@ class CutlassFusedMoE(MoE):
         Returns:
             final_hidden_states: Output tensor from MoE computation
         """
+        # SM120 + FP8 block scales: use Triton kernel (CUTLASS TMA fails on SM120
+        # for large token counts due to cuTensorMapEncodeTiled limitations).
+        if self.has_deepseek_fp8_block_scales and get_sm_version() == 120:
+            from .fused_moe_triton_fp8_block_scale import \
+                run_triton_fp8_block_scale_moe
+            _use_alltoall = (enable_alltoall if enable_alltoall is not None else
+                             self.enable_alltoall)
+            # forward_chunk sets token_final_scales=None when
+            # apply_router_weight_on_input=True (weights already folded into x);
+            # substitute ones so the Triton kernel's per-token scaling is a no-op.
+            if token_final_scales is None:
+                token_final_scales = torch.ones_like(token_selected_experts,
+                                                     dtype=torch.float32)
+            # token_selected_experts contains GLOBAL expert IDs in the non-alltoall
+            # path (slot_start .. slot_end-1 for this rank's local experts, plus
+            # IDs for other ranks).  The Triton kernel operates on LOCAL IDs
+            # (0 .. expert_size_per_partition-1), so remap and zero-scale any
+            # non-local token-expert pairs to suppress their contribution.
+            local_n = self.expert_size_per_partition
+            if _use_alltoall:
+                # After alltoall dispatch, IDs are already local; padding = local_n
+                local_ids = token_selected_experts.clamp(0, local_n - 1)
+                is_local = token_selected_experts < local_n
+            else:
+                slot_start = self.slot_start
+                local_ids = (token_selected_experts - slot_start).clamp(
+                    0, local_n - 1)
+                is_local = ((token_selected_experts >= slot_start)
+                            & (token_selected_experts < slot_start + local_n))
+            local_scales = token_final_scales * is_local.to(
+                token_final_scales.dtype)
+            result = run_triton_fp8_block_scale_moe(
+                x,
+                local_ids,
+                local_scales,
+                self.w3_w1_weight,
+                self.quant_scales.fc_weight_scales,
+                self.w2_weight,
+                self.quant_scales.proj_weight_scales,
+                activation_type=self.activation_type,
+                output_dtype=output_dtype,
+            )
+            return result
+
+        # Pad input for mxfp4 alignment (128-aligned hidden_size).
+        # Done here rather than in quantize_input so that dispatch sends
+        # unpadded tensors and avoids NVLink workspace overallocation.
+        if self.has_w4a16_mxfp4:
+            pad_size = self.hidden_size - x.shape[-1]
+            if pad_size > 0:
+                x = torch.nn.functional.pad(x, (0, pad_size))
+
         # Determine weight dtype based on quantization mode
         weight_dtype = self.w3_w1_weight.dtype
         if self.has_any_quant:
@@ -594,6 +662,10 @@ class CutlassFusedMoE(MoE):
         if enable_alltoall is None:
             enable_alltoall = self.enable_alltoall
 
+        use_dynamic_fc2_scale = (self.has_nvfp4 and getattr(
+            self, 'force_dynamic_quantization', False)
+                                 and hasattr(self, 'fc2_weight_scale_2'))
+
         result = torch.ops.trtllm.fused_moe(
             x,
             token_selected_experts,
@@ -603,7 +675,8 @@ class CutlassFusedMoE(MoE):
             self.w2_weight.view(weight_dtype),
             self.w2_bias,
             output_dtype,
-            quant_scales=self.quant_scales,
+            quant_scales=list(self.quant_scales) +
+            ([self.fc2_weight_scale_2] if use_dynamic_fc2_scale else []),
             input_sf=x_sf,
             swizzled_input_sf=is_sf_swizzled,
             swiglu_alpha=self.swiglu_alpha,
@@ -628,6 +701,7 @@ class CutlassFusedMoE(MoE):
             activation_type=self.activation_type,
             unpadded_hidden_size=self.unpadded_hidden_size,
             out_tensor=moe_output,
+            use_dynamic_fc2_scale=use_dynamic_fc2_scale,
         )
         # When moe_output is provided, the result is written in-place and
         # fused_moe returns empty list to avoid aliasing constraint violation.

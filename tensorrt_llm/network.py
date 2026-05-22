@@ -494,8 +494,8 @@ class Network(object):
 
         def get_alias(tensor, tensor_id):
             if tensor not in tensor_to_alias:
-                if (not tensor in inputs_names) and (not tensor
-                                                     in output_names):
+                if (tensor not in inputs_names) and (tensor
+                                                     not in output_names):
                     tensor_to_alias[tensor] = f"t{tensor_id[0]}"
                     tensor_id[0] += 1
                 else:

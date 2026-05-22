@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -23,14 +23,16 @@ import socket
 import struct
 import sys
 import tempfile
+import threading
 import trace
 import traceback
 import weakref
 from contextlib import contextmanager
+from ctypes import byref
 from enum import EnumMeta
 from functools import lru_cache, partial, wraps
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Sequence, Union
+from typing import Any, Callable, Dict, List, Optional, Sequence, TypeVar, Union
 
 import numpy as np
 import nvtx
@@ -42,6 +44,21 @@ from typing_extensions import ParamSpec
 # isort: off
 import torch
 import tensorrt as trt
+
+try:
+    from pynvml import (
+        NVMLError,
+        nvmlDeviceGetCount,
+        nvmlDeviceGetHandleByIndex,
+        nvmlDeviceGetHandleByUUID,
+        nvmlDeviceGetTotalEnergyConsumption,
+        nvmlInit,
+        nvmlShutdown,
+    )
+
+    has_nvml = True
+except ImportError:
+    has_nvml = False
 # isort: on
 
 from tensorrt_llm.bindings import DataType, GptJsonConfig, LayerType
@@ -51,6 +68,23 @@ from tensorrt_llm.logger import logger
 # numpy doesn't know bfloat16, define abstract binary type instead
 np_bfloat16 = np.dtype('V2', metadata={"dtype": "bfloat16"})
 np_float8 = np.dtype('V1', metadata={"dtype": "float8"})
+
+
+def get_hf_rope_theta(config: Any, default: float = 10000.0) -> float:
+    """Return RoPE ``theta`` from a Hugging Face ``PreTrainedConfig``-like object.
+
+    Transformers v5+ nests ``rope_theta`` under ``rope_parameters`` for several
+    models (e.g. LLaMA); older releases expose ``config.rope_theta`` directly.
+    """
+    theta = getattr(config, "rope_theta", None)
+    if theta is not None:
+        return float(theta)
+    rope_params = getattr(config, "rope_parameters", None)
+    if isinstance(rope_params, dict):
+        theta = rope_params.get("rope_theta")
+        if theta is not None:
+            return float(theta)
+    return default
 
 
 def torch_to_numpy(x: torch.Tensor):
@@ -509,7 +543,17 @@ def set_mpi_comm(new_comm):
     comm = new_comm
 
 
+thread_local_comm = threading.local()
+
+
+def set_thread_local_mpi_comm(new_comm):
+    thread_local_comm.value = new_comm
+
+
 def mpi_comm():
+    if hasattr(thread_local_comm,
+               "value") and thread_local_comm.value is not None:
+        return thread_local_comm.value
     return comm
 
 
@@ -903,10 +947,13 @@ def _null_context_manager():
     yield
 
 
+_T = TypeVar("_T")
+
+
 def nvtx_range(msg: str,
                color: str = "grey",
                domain: str = "TensorRT-LLM",
-               category: Optional[str] = None):
+               category: Optional[str] = None) -> Callable[[_T], _T]:
     """
     Creates an NVTX range annotation for profiling.
 
@@ -1178,6 +1225,8 @@ class KVCacheEventSerializer:
 
     @staticmethod
     def _event_diff_to_json(data):
+        if data is None:
+            return None
         return {
             "type": "event_diff",
             "new_value": data.new_value,
@@ -1194,14 +1243,24 @@ class KVCacheEventSerializer:
 
     @staticmethod
     def _mm_key_to_json(data):
-        # MmKey is a pair of (array<uint8_t, 32>, SizeType32)
-        hash_array, start_offset = data
+        # MmKey is a tuple of (hash_bytes, start_offset, uuid)
+        # where uuid is optional (None if content-hashed)
+        if len(data) == 3:
+            hash_array, start_offset, uuid = data
+        else:
+            # Backward compatibility: old format (hash_array, start_offset)
+            hash_array, start_offset = data
+            uuid = None
 
         # Convert array to hex string
         hash_hex = ''.join(f'{b:02x}' for b in hash_array)
+
+        # Use UUID from C++ if available, otherwise use hash_hex
+        hash_or_uuid = uuid if uuid is not None else hash_hex
+
         return {
             "type": "mm_key",
-            "hash": hash_hex,
+            "hash": hash_or_uuid,
             "start_offset": start_offset
         }
 
@@ -1236,24 +1295,27 @@ def confidential_compute_enabled() -> bool:
     Query NVML for the confidential compute state
     """
 
+    try:
+        import pynvml
+    except ImportError:
+        logger.error("pynvml not available; assuming CC=off")
+        return False
+
     cc_enabled = False
 
     try:
-        # Init
-        import pynvml
         pynvml.nvmlInit()
 
         # Hopper and newer supports a more nuanced query of confidential
         # compute settings
         cc_settings = pynvml.c_nvmlSystemConfComputeSettings_v1_t()
-        if (pynvml.nvmlSystemGetConfComputeSettings(cc_settings) ==
-                pynvml.NVML_SUCCESS):
-            cc_enabled = (cc_settings.ccFeature
-                          == pynvml.NVML_CC_SYSTEM_FEATURE_ENABLED
-                          or cc_settings.multiGpuMode
-                          == pynvml.NVML_CC_SYSTEM_MULTIGPU_PROTECTED_PCIE
-                          or cc_settings.multiGpuMode
-                          == pynvml.NVML_CC_SYSTEM_MULTIGPU_NVLE)
+        ret = pynvml.nvmlSystemGetConfComputeSettings(byref(cc_settings))
+        pynvml._nvmlCheckReturn(ret)
+        cc_enabled = (
+            cc_settings.ccFeature == pynvml.NVML_CC_SYSTEM_FEATURE_ENABLED
+            or cc_settings.multiGpuMode
+            == pynvml.NVML_CC_SYSTEM_MULTIGPU_PROTECTED_PCIE
+            or cc_settings.multiGpuMode == pynvml.NVML_CC_SYSTEM_MULTIGPU_NVLE)
     except pynvml.NVMLError_NotSupported:
         # Simple query for older GPUs
         try:
@@ -1273,6 +1335,32 @@ def confidential_compute_enabled() -> bool:
             pass
 
     return cc_enabled
+
+
+@lru_cache(maxsize=None)
+def prefer_pinned() -> bool:
+    """
+    Returns whether pinned memory is beneficial for performance.
+
+    While pinned memory is typically preferred for H2D and D2H transfers, it
+    offers no advantage when Confidential Compute (CC) is enabled. In fact, CC
+    forces most transfers to be synchronous. The exception is pageable H2D
+    copies smaller than 2MB, which remain asynchronous.
+
+    Since input preparation relies heavily on these small H2D copies, usage of
+    pageable (and not pinned) memory across the board is preferred in CC mode
+    to maintain asynchronous execution.
+    """
+    return not confidential_compute_enabled()
+
+
+def maybe_pin_memory(tensor: torch.Tensor) -> torch.Tensor:
+    """
+    Pin the Tensor memory if pinning is preferred/beneficial for performance
+    """
+    if prefer_pinned():
+        return tensor.pin_memory()
+    return tensor
 
 
 P = ParamSpec("P")
@@ -1387,3 +1475,100 @@ def _setup_gc_nvtx_profiling() -> Optional[_GCNvtxHandle]:
 
 # Initialize GC NVTX profiling singleton at module import time
 _setup_gc_nvtx_profiling()
+
+
+class EnergyMonitor:
+    """Context manager that tracks GPU energy consumption via NVML.
+
+    Measures total energy (Joules) across all GPUs used by the process,
+    scaling by world_size / device_count for multi-node setups.
+    """
+
+    def __init__(self, world_size):
+        self._enabled = has_nvml
+        self._world_size = world_size
+        self._start_energies = None
+        self._total_energy = None
+        if self._enabled:
+            try:
+                nvmlInit()
+                self._handles = self._get_gpu_handles(world_size)
+                self._device_count = len(self._handles)
+            except (NVMLError, ValueError) as e:
+                logger.warning(f"Failed to initialize NVML: {e}")
+                self._enabled = False
+
+    @staticmethod
+    def _get_gpu_handles(world_size):
+        cuda_visible = os.environ.get("CUDA_VISIBLE_DEVICES", "").strip()
+        device_ids = ([e.strip() for e in cuda_visible.split(",")
+                       if e.strip()] if cuda_visible else [])
+
+        if not device_ids:
+            count = min(nvmlDeviceGetCount(), world_size)
+            return [nvmlDeviceGetHandleByIndex(i) for i in range(count)]
+
+        handles = []
+        for device_id in device_ids[:world_size]:
+            if device_id.startswith(("GPU-", "MIG-")):
+                handles.append(nvmlDeviceGetHandleByUUID(device_id))
+            else:
+                handles.append(nvmlDeviceGetHandleByIndex(int(device_id)))
+        return handles
+
+    def __enter__(self):
+        if self._enabled:
+            try:
+                self._start_energies = [
+                    nvmlDeviceGetTotalEnergyConsumption(handle)
+                    for handle in self._handles
+                ]
+            except NVMLError as e:
+                logger.warning(f"Failed to read GPU energy on start: {e}")
+                self._start_energies = None
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if not self._enabled or self._start_energies is None:
+            return False
+
+        try:
+            total_energy = 0.0
+            for handle, start_energy in zip(self._handles,
+                                            self._start_energies):
+                energy = (nvmlDeviceGetTotalEnergyConsumption(handle) -
+                          start_energy) / 1000.0
+                total_energy += energy
+            self._total_energy = (total_energy * self._world_size /
+                                  self._device_count)
+        except NVMLError as e:
+            logger.warning(f"Failed to read GPU energy on stop: {e}")
+        finally:
+            try:
+                nvmlShutdown()
+            except NVMLError:
+                pass
+        return False
+
+    def get_current_energy(self):
+        """Get total energy consumed (Joules) since __enter__ without stopping.
+
+        Unlike total_energy which is only available after __exit__, this method
+        can be called at any point while the monitor is active to get a live
+        reading of energy consumed so far.
+        """
+        if not self._enabled:
+            return None
+        try:
+            total_energy = 0.0
+            for handle in self._handles:
+                total_energy += nvmlDeviceGetTotalEnergyConsumption(
+                    handle) / 1000.0
+            return total_energy * self._world_size / self._device_count
+        except NVMLError as e:
+            logger.warning(f"Failed to read GPU energy: {e}")
+            return None
+
+    @property
+    def total_energy(self):
+        return self._total_energy

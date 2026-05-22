@@ -52,7 +52,7 @@ class TestQuant(unittest.TestCase):
         config = PretrainedConfig.from_dict(config)
         model = GPTForCausalLM(config)
 
-        quant_model = quantize(model, QuantConfig(quant_algo))
+        quant_model = quantize(model, QuantConfig(quant_algo=quant_algo))
 
         self.assertTrue(hasattr(quant_model, 'quant_mode'))
 
@@ -101,7 +101,7 @@ class TestQuant(unittest.TestCase):
 
         quant_model = quantize(
             model,
-            QuantConfig(quant_algo,
+            QuantConfig(quant_algo=quant_algo,
                         exclude_modules=[
                             'fc', 'dense', 'vocab_embedding',
                             'position_embedding', 'block_embedding'
@@ -123,6 +123,36 @@ class TestQuant(unittest.TestCase):
         self.assertTrue(
             isinstance(quant_model.lm_head, WeightOnlyQuantColumnLinear))
 
+    def test_is_module_excluded_from_quantization_ancestor_match(self):
+        qc = QuantConfig(
+            quant_algo=QuantAlgo.NVFP4,
+            exclude_modules=[
+                'model.layers.7.mixer',
+                'model.layers.7.mixer.o_proj',
+                'lm_head',
+                'backbone.layers.5.mixer.gate',
+                'model.layers.9.*',
+            ],
+        )
+
+        for name in (
+                'model.layers.7.mixer.q_proj',
+                'model.layers.7.mixer.k_proj',
+                'model.layers.7.mixer.v_proj',
+                'model.layers.7.mixer.o_proj',
+                'lm_head',
+                'lm_head.weight',
+                'model.layers.9.mixer.q_proj',
+        ):
+            self.assertTrue(qc.is_module_excluded_from_quantization(name), name)
+        for name in (
+                'model.layers.8.mixer.q_proj',
+                'model.embed_tokens',
+                'backbone.layers.5.mixer.something',
+        ):
+            self.assertFalse(qc.is_module_excluded_from_quantization(name),
+                             name)
+
     def test_convert_GPT_to_smooth_quant(self):
         config = {
             'architecture': 'GPTForCausalLM',
@@ -138,7 +168,7 @@ class TestQuant(unittest.TestCase):
         model = GPTForCausalLM(config)
 
         quant_algo = QuantAlgo.W8A8_SQ_PER_TENSOR_PLUGIN
-        quant_config = QuantConfig(quant_algo)
+        quant_config = QuantConfig(quant_algo=quant_algo)
         quant_model = quantize(model, quant_config)
         for layer in quant_model.transformer.layers:
             assert isinstance(layer.input_layernorm, SmoothQuantLayerNorm)
@@ -167,7 +197,8 @@ class TestQuant(unittest.TestCase):
         model = LLaMAForCausalLM(config)
 
         quant_algo = QuantAlgo.FP8_PER_CHANNEL_PER_TOKEN
-        quant_config = QuantConfig(quant_algo, use_meta_recipe=use_meta_recipe)
+        quant_config = QuantConfig(quant_algo=quant_algo,
+                                   use_meta_recipe=use_meta_recipe)
 
         quant_model = quantize(model, quant_config)
         local_num_hidden_layers = len(quant_model.transformer.layers)

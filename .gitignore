@@ -1,4 +1,5 @@
 __pycache__/
+.mypy_cache/
 .vscode
 .cursor
 *.engine
@@ -62,9 +63,9 @@ tensorrt_llm/scripts
 *docs/source/_cpp_gen*
 docs/source/**/*.rst
 !docs/source/examples/index.rst
-!docs/source/deployment-guide/config_table.rst
 !docs/source/_includes/note_sections.rst
 *.swp
+.nfs*
 
 # Testing
 .coverage.*
@@ -72,14 +73,19 @@ results_trt/
 llm-test-workspace/
 ad-test-workspace/
 
+# FetchContent reference cache
+3rdparty/.cache_3rdparty/
+
 # build/debug
 *.safetensors
 */tllm_debug/**
 *.patch
 !cpp/tensorrt_llm/deep_ep/*.patch
 examples/disaggregated/slurm/benchmark/logs/
+scripts/attribution/data/checksum_to_paths.yml
 
 # Generated files
+/ATTRIBUTIONS.md
 cpp/include/tensorrt_llm/executor/version.h
 cpp/tensorrt_llm/kernels/contextFusedMultiHeadAttention/fmha_v2_cu/
 cpp/tensorrt_llm/kernels/contextFusedMultiHeadAttention/cubin/fmha_cubin.h
@@ -89,6 +95,7 @@ cpp/tensorrt_llm/kernels/contextFusedMultiHeadAttention/cubin/fmha_cubin.cpp
 /examples/layer_wise_benchmarks/profiles/
 
 # User config files
+CLAUDE.local.md
 CMakeUserPresets.json
 compile_commands.json
 *.bin
@@ -102,3 +109,8 @@ enroot/tensorrt_llm.devel.sqsh
 
 # MacOSX Files
 .DS_Store
+
+# Agent related files
+.claude/agent-memory/
+.claude/agent-tests/perf-test-sync/report.html
+.claude/agent-tests/perf-test-sync/results.json

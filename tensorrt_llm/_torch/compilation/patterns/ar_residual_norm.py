@@ -8,6 +8,7 @@ from torch._inductor.pattern_matcher import (MULTIPLE, CallFunction, Ignored,
                                              PatternMatcherPass, fwd_only,
                                              register_replacement)
 
+from ...custom_ops.torch_custom_ops import BufferKind
 from ...distributed import AllReduceFusionOp, AllReduceStrategy
 
 aten = torch.ops.aten
@@ -532,7 +533,7 @@ def register_ub_patterns(custom_passes: List[PatternMatcherPass],
             weight_scale_key = KeywordArg('weight_scale')
             alpha_key = KeywordArg('alpha')
             output_dtype_key = KeywordArg('output_dtype')
-            to_userbuffers_key = KeywordArg('to_userbuffers')
+            output_buffer_kind_key = KeywordArg('output_buffer_kind')
             allowed_backends_key = KeywordArg('allowed_backends')
             trtllm_nvfp4_gemm_default = CallFunction(
                 torch.ops.trtllm.nvfp4_gemm.default,
@@ -542,7 +543,7 @@ def register_ub_patterns(custom_passes: List[PatternMatcherPass],
                 weight_scale_key,
                 alpha_key,
                 output_dtype_key,
-                to_userbuffers=to_userbuffers_key,
+                output_buffer_kind=output_buffer_kind_key,
                 allowed_backends=allowed_backends_key)
             ub_copy = CallFunction(torch.ops.trtllm.copy_to_userbuffers,
                                    trtllm_nvfp4_gemm_default)
@@ -554,7 +555,7 @@ def register_ub_patterns(custom_passes: List[PatternMatcherPass],
                 weight_scale: torch.Tensor,
                 alpha: torch.Tensor,
                 output_dtype: torch.dtype,
-                to_userbuffers: bool,
+                output_buffer_kind: int,
                 allowed_backends: str,
             ):
                 return
@@ -566,12 +567,12 @@ def register_ub_patterns(custom_passes: List[PatternMatcherPass],
                 weight_scale: torch.Tensor,
                 alpha: torch.Tensor,
                 output_dtype: torch.dtype,
-                to_userbuffers: bool,
+                output_buffer_kind: int,
                 allowed_backends: str,
             ):
                 nvfp4_gemm_output = torch.ops.trtllm.nvfp4_gemm(
                     act_fp4, weight, act_sf, weight_scale, alpha, output_dtype,
-                    True, allowed_backends)
+                    int(BufferKind.USERBUFFERS), allowed_backends)
                 return nvfp4_gemm_output
 
             def extra_check(match: Match) -> bool:
@@ -713,6 +714,65 @@ def register_ub_patterns(custom_passes: List[PatternMatcherPass],
             search_fn_pattern=trtllm_allreduce_default,
         )
 
+    def insert_copy_for_graph_output(custom_pass: PatternMatcherPass):
+        trtllm_allreduce_default = CallFunction(
+            torch.ops.trtllm.allreduce.default, KeywordArg("input"),
+            KeywordArg("residual"), KeywordArg("gamma"), KeywordArg("scale"),
+            None, None, mapping.tp_group, int(AllReduceStrategy.UB),
+            KeywordArg("fusion_op"), KeywordArg("eps"), Ignored())
+
+        def empty_copy_for_graph_output_pattern(
+            input: torch.Tensor,
+            residual: torch.Tensor,
+            gamma: torch.Tensor,
+            scale: Optional[torch.Tensor],
+            fusion_op: int,
+            eps: float,
+        ):
+            return
+
+        def target_copy_for_graph_output_pattern(
+            input: torch.Tensor,
+            residual: torch.Tensor,
+            gamma: torch.Tensor,
+            scale: Optional[torch.Tensor],
+            fusion_op: int,
+            eps: float,
+        ):
+            allreduce_output = torch.ops.trtllm.allreduce(
+                input, residual, gamma, scale, None, None, mapping.tp_group,
+                int(AllReduceStrategy.UB), fusion_op, eps, False)
+            non_ub_tensor = torch.empty_like(allreduce_output[0])
+            non_ub_tensor.copy_(allreduce_output[0])
+            allreduce_output[0] = non_ub_tensor
+            return allreduce_output
+
+        def extra_check(match: Match) -> bool:
+            ar_node = match.ctx.pattern_to_node[trtllm_allreduce_default]
+            assert isinstance(ar_node, torch.fx.graph.Node)
+            for user_node in ar_node.users:
+                if not isinstance(user_node, torch.fx.graph.Node):
+                    continue
+                if user_node.op == "call_function" and user_node.target == getitem and user_node.args[
+                        1] == 0:
+                    # Check whether the getitem is connected to output
+                    for getitem_user in user_node.users:
+                        if not isinstance(getitem_user, torch.fx.graph.Node):
+                            continue
+                        if getitem_user.op == "output":
+                            return True
+            return False
+
+        register_replacement(
+            empty_copy_for_graph_output_pattern,
+            target_copy_for_graph_output_pattern,
+            [],
+            fwd_only,
+            custom_pass,
+            search_fn_pattern=trtllm_allreduce_default,
+            extra_check=extra_check,
+        )
+
     custom_passes.append(PatternMatcherPass())
     register_convert_supported_ar_to_ub(custom_passes[-1])
 
@@ -721,6 +781,9 @@ def register_ub_patterns(custom_passes: List[PatternMatcherPass],
 
     custom_passes.append(PatternMatcherPass())
     register_ub_finalize_patterns(custom_passes[-1])
+
+    custom_passes.append(PatternMatcherPass())
+    insert_copy_for_graph_output(custom_passes[-1])
 
 
 def register_ar_fusions(custom_passes: List[PatternMatcherPass],

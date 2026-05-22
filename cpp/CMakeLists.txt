@@ -26,6 +26,22 @@ include(sanitizers)
 
 project(tensorrt_llm LANGUAGES CXX)
 
+# Single source of truth for the inline ABI namespace. Read by both the C++ side
+# (via tensorrt_llm/common/config.h's `#ifndef TRTLLM_ABI_NAMESPACE` guard) and
+# the cubin INCBIN aggregator (cpp/cmake/modules/ tllm_cubin_archive.cmake bakes
+# the same value into Itanium-mangled linker names). Override at configure time
+# with `-DTRTLLM_ABI_NAMESPACE=_v2` to ship a parallel ABI version that won't
+# collide at static-link time. The compile definition propagates to every C++ TU
+# under this directory so the macro expansion stays in sync with the CMake
+# variable.
+set(TRTLLM_ABI_NAMESPACE
+    "_v1"
+    CACHE
+      STRING
+      "Inline namespace used to version the TRT-LLM ABI (see tensorrt_llm/common/config.h)."
+)
+add_compile_definitions(TRTLLM_ABI_NAMESPACE=${TRTLLM_ABI_NAMESPACE})
+
 # Build options
 option(BUILD_PYT "Build in PyTorch TorchScript class mode" ON)
 option(BUILD_TESTS "Build Google tests" ON)
@@ -166,9 +182,8 @@ setup_cuda_architectures()
 set(CUDA_DRV_LIB CUDA::cuda_driver)
 set(CUDA_NVML_LIB CUDA::nvml)
 set(CUDA_RT_LIB CUDA::cudart_static)
-set(NVPTX_LIB CUDA::nvptxcompiler_static)
 
-set(CUDA_TOOLKIT_COMPONENTS cudart_static cuda_driver nvml nvptxcompiler_static)
+set(CUDA_TOOLKIT_COMPONENTS cudart_static cuda_driver nvml)
 
 if(CUBLAS_DYNAMIC_LINKING)
   set(CUBLAS_LIB CUDA::cublas)
@@ -227,8 +242,9 @@ set(CMAKE_CUDA_USE_RESPONSE_FILE_FOR_INCLUDES 0)
 find_library(RT_LIB rt)
 
 if(ENABLE_MULTI_DEVICE)
-  # NCCL dependencies
-  find_package(NCCL 2 REQUIRED)
+  # NCCL dependencies NCCL >= 2.29 is required for NCCLWindowAllocator used
+  # unconditionally in allreduceOp.cpp
+  find_package(NCCL 2.29 REQUIRED)
   set(NCCL_LIB NCCL::nccl)
 endif()
 
@@ -323,17 +339,28 @@ if(UNIX)
   set(CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG} -g -O0 -fno-inline")
 endif()
 
-# Note: The following are desirable settings that should be enabled if we
-# decrease shared library size. See e.g.
-# https://github.com/rapidsai/cudf/pull/6134 for a similar issue in another
-# project.
-
-# set(CMAKE_CUDA_FLAGS_RELWITHDEBINFO "${CMAKE_CUDA_FLAGS_RELWITHDEBINFO}
-# --generate-line-info")
-
-# set(CMAKE_CUDA_FLAGS_DEBUG "${CMAKE_CUDA_FLAGS_DEBUG} -G")
+# Emit CUDA line info for Debug and RelWithDebInfo so nsys/ncu can map samples
+# back to source. This inflates section sizes significantly, so building these
+# configurations for all CUDA architectures at once will fail to link --
+# build_wheel.py enforces that a specific --cuda_architectures must be passed in
+# that case. Note: full device debug info (-G) is intentionally NOT enabled by
+# default for Debug -- it can make ptxas memory usage explode on some kernels
+# and get OOM-killed in CI. Developers who need cuda-gdb stepping can opt in via
+# `build_wheel.py --extra-cmake-vars CMAKE_CUDA_FLAGS_DEBUG=-G` on a host with
+# enough memory for ptxas.
+# cmake-format: off
+set(CMAKE_CUDA_FLAGS_RELWITHDEBINFO "${CMAKE_CUDA_FLAGS_RELWITHDEBINFO} --generate-line-info")
+set(CMAKE_CUDA_FLAGS_DEBUG "${CMAKE_CUDA_FLAGS_DEBUG} --generate-line-info")
+# cmake-format: on
 
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -DBUILD_SYSTEM=cmake_oss ")
+
+# Generate dependency files (.d) to track all header dependencies This creates
+# .d files alongside .o files showing all headers used
+if(NOT WIN32)
+  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -MD -MP")
+  set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -MD -MP")
+endif()
 
 # note: cmake expr generation $<BOOL:${ENABLE_MULTI_DEVICE}> is a build time
 # evaluation so hard to debug at cmake time
@@ -367,6 +394,43 @@ if(CMAKE_SYSTEM_PROCESSOR STREQUAL x86_64)
   set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -mcmodel=medium")
   set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} -Wl,--no-relax")
   set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -Wl,--no-relax")
+endif()
+
+# ==== BOLT Compatible Flags ====
+# These flags enable LLVM BOLT binary compatible:
+# -fno-reorder-blocks-and-partition: Prevents compiler from splitting hot/cold
+# blocks -fno-plt: Removes PLT stubs for additional performance
+# -Wl,--emit-relocs (or -Wl,-q): Preserves relocation info for BOLT Note:
+# Binaries should NOT be stripped for BOLT to work Usage: cmake
+# -DENABLE_BOLT_COMPATIBLE=ON ...
+option(ENABLE_BOLT_COMPATIBLE "Enable BOLT-compatible build flags" OFF)
+if(ENABLE_BOLT_COMPATIBLE AND NOT WIN32)
+  message(STATUS "BOLT compatible flags enabled")
+  # Compiler flags for C/C++
+  add_compile_options(-fno-reorder-blocks-and-partition -fno-plt)
+  # Linker flags - applies to shared, module, and executable targets
+  add_link_options(-Wl,--emit-relocs)
+  # Disable stripping - required for BOLT (affects pybind11 POST_BUILD strip)
+  set(CMAKE_STRIP
+      ""
+      CACHE STRING "Disabled for BOLT compatibility" FORCE)
+  message(STATUS "BOLT: Disabled CMAKE_STRIP to prevent binary stripping")
+endif()
+# Note: For nanobind modules, use NOSTRIP option in nanobind_add_module()
+# ==== End BOLT Compatible Flags ====
+
+# Generate linker dependency files (link.d) for dependency scanning. These files
+# contain the resolved paths of all libraries used during linking.
+option(GENERATE_LINKER_DEPFILES
+       "Generate linker dependency files for dependency scanning" ON)
+if(GENERATE_LINKER_DEPFILES)
+  # Modify linker rules to add --dependency-file flag <TARGET> is a CMake
+  # placeholder that gets replaced with the output path
+  string(APPEND CMAKE_CXX_CREATE_SHARED_LIBRARY
+         " -Wl,--dependency-file,<TARGET>.d")
+  string(APPEND CMAKE_CXX_CREATE_SHARED_MODULE
+         " -Wl,--dependency-file,<TARGET>.d")
+  string(APPEND CMAKE_CXX_LINK_EXECUTABLE " -Wl,--dependency-file,<TARGET>.d")
 endif()
 
 # Disable deprecated declarations warnings

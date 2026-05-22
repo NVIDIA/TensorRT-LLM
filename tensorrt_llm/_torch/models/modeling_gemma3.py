@@ -15,12 +15,14 @@ from ..attention_backend import AttentionMetadata, FlashInferAttentionMetadata
 from ..attention_backend.interface import (AttentionMask, CustomAttentionMask,
                                            PositionalEmbeddingParams,
                                            PredefinedAttentionMask, RopeParams)
+from ..flashinfer_utils import IS_FLASHINFER_AVAILABLE
 from ..model_config import ModelConfig
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
 from ..modules.gated_mlp import GatedMLP
 from ..modules.linear import TensorParallelMode
 from ..modules.rms_norm import RMSNorm
+from ..utils import inference_mode_unless_compiling
 from .modeling_utils import (DecoderModel, DecoderModelForCausalLM,
                              register_auto_model)
 
@@ -46,7 +48,7 @@ class Gemma3TextScaledWordEmbedding(Embedding):
         )
         self.embed_scale = torch.sqrt(torch.tensor(hidden_size)).to(self.dtype)
 
-    @torch.inference_mode()
+    @inference_mode_unless_compiling
     def forward(self, input_ids):
         return super().forward(input_ids) * self.embed_scale
 
@@ -64,7 +66,20 @@ class Gemma3Attention(QKNormRoPEAttention):
         rope_params = RopeParams.from_config(config)
         self.attention_window_size = None
         if is_sliding:
-            rope_params.theta = config.rope_local_base_freq
+            # transformers 5.x moved rope_local_base_freq into
+            # rope_parameters["sliding_attention"]["rope_theta"]
+            local_freq = getattr(config, 'rope_local_base_freq', None)
+            if local_freq is None:
+                rp = getattr(config, 'rope_parameters', None) or {}
+                local_freq = rp.get('sliding_attention', {}).get('rope_theta')
+            if local_freq is None:
+                raise ValueError(
+                    "Gemma3 sliding attention requires a local RoPE base "
+                    "frequency, but neither `config.rope_local_base_freq` "
+                    "(transformers 4.x) nor "
+                    "`config.rope_parameters['sliding_attention']['rope_theta']` "
+                    "(transformers 5.x) is set on the model config.")
+            rope_params.theta = local_freq
             rope_params.scale_type = RotaryScalingType.none
             rope_params.scale = 1.0
             self.attention_window_size = config.sliding_window
@@ -89,7 +104,7 @@ class Gemma3Attention(QKNormRoPEAttention):
             q_scaling=q_scaling,
         )
 
-    @torch.inference_mode()
+    @inference_mode_unless_compiling
     def forward(
         self,
         position_ids: Optional[torch.IntTensor],
@@ -115,7 +130,10 @@ class Gemma3Attention(QKNormRoPEAttention):
 
 
 # This function is written to be compatible with TRTLLM's GatedMLP class.
-def pytorch_gelu_tanh(gate_x: torch.Tensor) -> torch.Tensor:
+def gelu_tanh(gate_x: torch.Tensor) -> torch.Tensor:
+    if IS_FLASHINFER_AVAILABLE:
+        return torch.ops.trtllm.flashinfer_gelu_tanh_and_mul(gate_x)
+
     gate, x = gate_x.chunk(2, dim=-1)
     return nn.functional.gelu(gate, approximate="tanh") * x
 
@@ -140,7 +158,7 @@ class Gemma3DecoderLayer(DecoderLayer):
         self.mlp = GatedMLP(hidden_size=config.hidden_size,
                             intermediate_size=config.intermediate_size,
                             bias=False,
-                            activation=pytorch_gelu_tanh,
+                            activation=gelu_tanh,
                             dtype=config.torch_dtype,
                             config=model_config,
                             layer_idx=layer_idx)
@@ -159,7 +177,7 @@ class Gemma3DecoderLayer(DecoderLayer):
             eps=config.rms_norm_eps,
             dtype=config.torch_dtype)
 
-    @torch.inference_mode()
+    @inference_mode_unless_compiling
     def forward(
         self,
         position_ids: torch.IntTensor,
@@ -218,7 +236,7 @@ class Gemma3TextModel(DecoderModel):
                             eps=config.pretrained_config.rms_norm_eps,
                             dtype=config.pretrained_config.torch_dtype)
 
-    @torch.inference_mode()
+    @inference_mode_unless_compiling
     def forward(
         self,
         attn_metadata: AttentionMetadata,
@@ -388,7 +406,7 @@ class Gemma3ForCausalLM(DecoderModelForCausalLM[Gemma3TextModel,
             context_mask_list.append(mask_i.flatten())
         return torch.cat(context_mask_list, dim=0).contiguous()
 
-    @torch.inference_mode()
+    @inference_mode_unless_compiling
     def forward(
         self,
         attn_metadata: AttentionMetadata,

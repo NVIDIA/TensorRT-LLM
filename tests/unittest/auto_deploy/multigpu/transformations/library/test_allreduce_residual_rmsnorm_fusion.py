@@ -1,0 +1,224 @@
+# SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""Tests for basic fusion of the allreduce, residual, and rmsnorm."""
+
+import pytest
+import torch
+from _dist_test_utils import get_device_counts
+from torch.distributed import DistNetworkError
+from torch.export import export
+
+from tensorrt_llm._torch.auto_deploy.custom_ops.distributed.trtllm_dist import (
+    is_trtllm_op_available,
+)
+from tensorrt_llm._torch.auto_deploy.distributed.common import cleanup, initialize_or_skip
+from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
+from tensorrt_llm._torch.auto_deploy.transform.optimizer import InferenceOptimizer
+from tensorrt_llm._torch.auto_deploy.utils.node_utils import is_op
+from tensorrt_llm._utils import get_free_port, mpi_broadcast, mpi_rank
+from tensorrt_llm.llmapi.mpi_session import MpiPoolSession
+
+# needed since MPI executor pool leaks a thread (_manager_spawn) on shutdown
+pytestmark = pytest.mark.threadleak(enabled=False)
+
+
+class RMSNorm(torch.nn.Module):
+    """Implementation of LlamaRMSNorm."""
+
+    def __init__(self, hidden_size, eps=1e-6, dtype=torch.float16):
+        super().__init__()
+        self.weight = torch.nn.Parameter(torch.ones(hidden_size).to(dtype).cuda())
+        self.variance_epsilon = eps
+
+    def forward(self, hidden_states: torch.Tensor):
+        input_dtype = hidden_states.dtype
+        hidden_states = hidden_states.to(torch.float32)
+        variance = hidden_states.pow(2).mean(-1, keepdim=True)
+        hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
+        return self.weight * hidden_states.to(input_dtype)
+
+
+class AllreduceResidualNorm(torch.nn.Module):
+    """AllreduceResidualNorm pattern model that do residual plus x."""
+
+    def __init__(self, hidden_size, dtype, strategy):
+        super().__init__()
+        self.norm = RMSNorm(hidden_size, 1e-5, dtype)
+        self.strategy = strategy
+
+    def forward(self, x, residual):
+        x = torch.ops.auto_deploy.trtllm_dist_all_reduce.default(x, self.strategy)
+        y = residual + x
+        normed = self.norm(y)
+        return normed, y
+
+
+class AllreduceResidualNorm2(torch.nn.Module):
+    """AllreduceResidualNorm pattern model that do x plus residual."""
+
+    def __init__(self, hidden_size, dtype, strategy):
+        super().__init__()
+        self.norm = RMSNorm(hidden_size, 1e-5, dtype)
+        self.strategy = strategy
+
+    def forward(self, x, residual):
+        x = torch.ops.auto_deploy.trtllm_dist_all_reduce.default(x, self.strategy)
+        y = x + residual
+        normed = self.norm(y)
+        return normed, y
+
+
+def _test_allreduce_fusion(port: int | None, ModuleCls, strategy: str, rmsnorm_op: str):
+    if not is_trtllm_op_available():
+        pytest.skip("Require trtllm ops to run test_allreduce_fusion.")
+
+    # Pick the port inside the MPI workers so rank 0 chooses it immediately
+    # before distributed init, instead of probing it in the parent and
+    # leaving a race window before the workers use it for rendezvous.
+    # mpi_broadcast is collective across all ranks in this worker invocation,
+    # so late-starting ranks block until they join and receive the same port.
+    if port is None:
+        port = mpi_broadcast(get_free_port() if mpi_rank() == 0 else None)
+
+    _, _ = initialize_or_skip(port=port)
+
+    try:
+        # Testing tensors
+        dtype = torch.float16
+        x = torch.randn(16, 16).to(dtype).cuda()
+        residual = torch.randn(16, 16).to(dtype).cuda()
+
+        # Trace the original model
+        model = ModuleCls(16, dtype, strategy=strategy)
+        args = (
+            x,
+            residual,
+        )
+        gm = torch_export_to_gm(model, args=args, clone=True)
+        # Run the original
+        original_outputs, residual_original = gm(x, residual)
+
+        # Build optimizer config. When testing the triton rmsnorm variant, run
+        # `fuse_rmsnorm` (with rmsnorm_backend="triton") before
+        # `fuse_allreduce_residual_rmsnorm` so the graph contains triton_rms_norm
+        # ops at the time the allreduce-residual-rmsnorm fusion runs.
+        optimizer_config = {
+            "match_rmsnorm_pattern": {
+                "stage": "pattern_matcher",
+            },
+            "detect_sharding": {
+                "stage": "post_export",
+                "allreduce_strategy": strategy,
+            },
+        }
+        if rmsnorm_op == "triton_rms_norm":
+            optimizer_config["fuse_rmsnorm"] = {
+                "stage": "post_load_fusion",
+                "rmsnorm_backend": "triton",
+            }
+        optimizer_config["fuse_allreduce_residual_rmsnorm"] = {
+            "stage": "post_load_fusion",
+        }
+
+        # Fuse ops with the specified strategy
+        gm_transformed = InferenceOptimizer(None, optimizer_config)(None, gm)
+
+        # Run the fused graph
+        fused_outputs, residual_fused = gm_transformed(x, residual)
+
+        # Check if fused node in the graph and verify strategy
+        has_fused_node = False
+        fused_node_strategy = None
+        for node in gm_transformed.graph.nodes:
+            if is_op(node, torch.ops.dist.trtllm_fused_allreduce_residual_rmsnorm):
+                has_fused_node = True
+                # The fused node should have the strategy as the last argument
+                # args: (x, residual, weight, eps, strategy)
+                if len(node.args) >= 5:
+                    fused_node_strategy = node.args[4]
+
+        assert has_fused_node, "Fused node not found."
+        assert fused_node_strategy == strategy, (
+            f"Fused node strategy mismatch: expected '{strategy}', got '{fused_node_strategy}'"
+        )
+
+        # Verify outputs are consistent
+        assert torch.allclose(residual_original, residual_fused, atol=1e-5), (
+            "Outputs differ between original and fused models."
+        )
+        assert torch.allclose(original_outputs, fused_outputs, atol=1e-5), (
+            "Outputs differ between original and fused models."
+        )
+
+        # check if we can still export the model as expected
+        export(gm_transformed, args=args)
+        torch_export_to_gm(gm_transformed, args=args)
+
+    finally:
+        # Keep teardown coordinated so one rank does not race ahead while
+        # peers still hold rendezvous/process-group resources.
+        if torch.distributed.is_initialized() and torch.distributed.get_world_size() > 1:
+            torch.distributed.barrier()
+        cleanup()
+
+
+@pytest.mark.parametrize("device_count", get_device_counts())
+@pytest.mark.parametrize(
+    "ModuleCls",
+    [AllreduceResidualNorm, AllreduceResidualNorm2],
+    ids=["residual_plus_x", "x_plus_residual"],
+)
+@pytest.mark.parametrize(
+    "strategy",
+    ["AUTO", "NCCL", "ONESHOT"],
+    ids=["strategy_auto", "strategy_nccl", "strategy_oneshot"],
+)
+@pytest.mark.parametrize(
+    "rmsnorm_op",
+    ["torch_rmsnorm", "triton_rms_norm"],
+    ids=["rmsnorm_torch", "rmsnorm_triton"],
+)
+def test_allreduce_fusion(device_count, ModuleCls, strategy, rmsnorm_op):
+    # Test the allreduce, residual, and rmsnorm fusion.
+    # MpiPoolSession is required because the test exercises trtllm's MPI-mode allreduce ops,
+    # which only activate when is_ompi() is true.
+    if device_count <= 1:
+        pytest.skip("Require multi GPUs to run test_allreduce_fusion.")
+
+    n_workers = device_count
+    # Retry on EADDRINUSE with a fresh MPI pool to avoid transient
+    # rendezvous port conflicts in distributed initialization.
+    max_retries = 5
+    last_exc: Exception | None = None
+    for _ in range(max_retries):
+        mpi_pool = MpiPoolSession(n_workers=n_workers)
+        try:
+            mpi_pool.submit_sync(
+                _test_allreduce_fusion,
+                port=None,
+                ModuleCls=ModuleCls,
+                strategy=strategy,
+                rmsnorm_op=rmsnorm_op,
+            )
+            return
+        except DistNetworkError as e:
+            last_exc = e
+            if "EADDRINUSE" not in str(e) and "address already in use" not in str(e).lower():
+                raise
+        finally:
+            mpi_pool.shutdown()
+    raise RuntimeError(
+        f"Failed to initialize distributed group after {max_retries} attempts due to repeated port conflicts"
+    ) from last_exc

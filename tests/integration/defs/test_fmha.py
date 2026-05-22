@@ -3,6 +3,8 @@ from functools import partial
 from pathlib import Path
 from subprocess import run
 
+from tests.unittest.utils.util import getSMVersion
+
 
 def test_fmha():
     build_run = partial(run, shell=True, check=True)
@@ -13,6 +15,17 @@ def test_fmha():
 
     try:
         os.chdir(fmha_v2_dir)
+
+        test_arch = getSMVersion()
+        # SM70 is deprecated in TRTLLM, so we don't need to test it
+        all_archs = [80, 86, 89, 90, 100, 120]
+
+        # TODO Find a way to get this programmatically
+        # Filter out the architectures that are tested explicitly to not double up
+        tested_archs = [80, 86, 89, 90]
+
+        # Select the family we belong to (e.g. 103 -> 100)
+        test_arch = max(filter(lambda x: x <= test_arch, all_archs))
 
         env = os.environ.copy()
         env.update({
@@ -26,10 +39,23 @@ def test_fmha():
             "1",  # Do not run tests with skip-softmax feature.
         })
 
-        build_run(
-            "rm -rf generated temp obj .pytest_cache __pycache__ bin cubin")
-        build_run("python3 setup.py", env=env)
-        build_run("make -j 16", env=env)
+        # The test executable is too large if we build all the architectures, so we must build architectures individually
+        def build_arch(arch):
+            env["FMHA_FILTER_ARCH"] = str(arch)
+            build_run(
+                "rm -rf generated temp obj .pytest_cache __pycache__ bin cubin")
+            build_run("python3 setup.py", env=env)
+            build_run("make -j 16", env=env)
+
+        # As part of the A100 test we compile all the architectures we dont have executors for, even if we dont run them
+        if test_arch == 80:
+            build_only_on_archs = set(all_archs) - set(tested_archs)
+
+            for arch in build_only_on_archs:
+                build_arch(arch)
+
+        # Run the test of our current architecture
+        build_arch(test_arch)
         build_run("pytest fmha_test.py", env=env)
 
     finally:

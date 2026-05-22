@@ -19,7 +19,7 @@ slurm:
 benchmark:
   mode: gen_only
   use_nv_sa_benchmark: false
-  multi_round: 8
+  multi_round: 1
   benchmark_ratio: 1.0
   streaming: true
   concurrency_list: '16384'
@@ -37,6 +37,7 @@ environment:
   trtllm_repo: ''
   build_wheel: false
   work_dir: <full_path_to_work_dir>
+  worker_env_var: MIMALLOC_PURGE_DELAY=0
 profiling:
   nsys_on: false
 accuracy:

@@ -11,6 +11,11 @@ numa_bind=${5}
 log_dir=${6}
 enable_nsys=${7}
 config_file=${8}
+cuda_devices=${9}
+
+# Set CUDA_VISIBLE_DEVICES from script argument (srun --export cannot
+# reliably pass comma-separated values inside shared containers).
+export CUDA_VISIBLE_DEVICES=${cuda_devices}
 
 # Clear UCX_TLS for specific clusters
 unset UCX_TLS

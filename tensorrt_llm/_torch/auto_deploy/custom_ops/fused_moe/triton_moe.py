@@ -1,3 +1,11 @@
+# Copyright contributors to the vLLM project
+# Licensed under the Apache License, Version 2.0.
+# Original source: https://github.com/vllm-project/vllm
+#
+# Copyright contributors to the SGLang project
+# Licensed under the Apache License, Version 2.0.
+# Original source: https://github.com/sgl-project/sglang
+#
 # SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
@@ -29,8 +37,7 @@ import torch.nn.functional as F
 import triton
 import triton.language as tl
 
-from tensorrt_llm._torch.utils import ActivationType  # noqa: F401
-
+from ..._compat import ActivationType  # noqa: F401
 from ...utils.logger import ad_logger
 
 
@@ -670,8 +677,8 @@ def triton_quant_fp8_moe(
     w1_weight: torch.Tensor,  # [E, I, H] stacked FP8 weights
     w2_weight: torch.Tensor,  # [E, H, I] stacked FP8 weights
     w3_weight: torch.Tensor,  # unused for mlp style
-    w1_input_scale: torch.Tensor,  # [E] stacked input scales
-    w2_input_scale: torch.Tensor,  # [E] stacked input scales
+    w1_input_scale: torch.Tensor,  # [1] max input scale (precomputed)
+    w2_input_scale: torch.Tensor,  # [1] max input scale (precomputed)
     w3_input_scale: torch.Tensor,  # unused
     w1_weight_scale: torch.Tensor,  # [E] stacked weight scales
     w2_weight_scale: torch.Tensor,  # [E] stacked weight scales
@@ -698,10 +705,11 @@ def triton_quant_fp8_moe(
     topk_weights = routing_weights.to(torch.float32).contiguous()
 
     # Weights are already stacked [E, ...] - just ensure contiguous and extract scales
+    # Input scales are precomputed max values (consistent with trtllm backend)
     w1_q = w1_weight.contiguous()
     w2_q = w2_weight.contiguous()
-    a1_scale = w1_input_scale[0].to(torch.float32).reshape(1).contiguous()
-    a2_scale = w2_input_scale[0].to(torch.float32).reshape(1).contiguous()
+    a1_scale = w1_input_scale.to(torch.float32).reshape(1).contiguous()
+    a2_scale = w2_input_scale.to(torch.float32).reshape(1).contiguous()
     b1_scale = w1_weight_scale.to(torch.float32).contiguous()
     b2_scale = w2_weight_scale.to(torch.float32).contiguous()
 
@@ -762,7 +770,7 @@ def triton_quant_fp8_moe(
 
 
 @triton_quant_fp8_moe.register_fake
-def triton_quant_fp8_moe(
+def triton_quant_fp8_moe_fake(
     x: torch.Tensor,
     selected_experts: torch.Tensor,
     routing_weights: torch.Tensor,

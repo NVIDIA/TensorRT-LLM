@@ -798,11 +798,6 @@ public:
                 cta_coord_mnkl = scheduler.work_tile_to_cta_coord(work_tile_info);
             } while (work_tile_info.is_valid());
 
-            // Hint on an early release of global memory resources.
-            // The timing of calling this function only influences performance,
-            // not functional correctness.
-            cutlass::arch::launch_dependent_grids();
-
             // Release the right to allocate before deallocations so that the next CTA can rasterize
             tmem_allocator.release_allocation_lock();
 
@@ -829,6 +824,9 @@ public:
 
             // Free entire tmem allocation
             tmem_allocator.free(tmem_base_ptr, TmemAllocator::Sm100TmemCapacityColumns);
+            // there are chances next kernel override tmem_base_ptr, so we need to hint the next kernel to launch after
+            // tmem free
+            cutlass::arch::launch_dependent_grids();
         }
 
         else if (is_participant.epi_load)

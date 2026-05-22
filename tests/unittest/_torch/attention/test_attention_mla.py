@@ -5,7 +5,6 @@ from typing import List
 
 import pytest
 import torch
-from utils.util import getSMVersion
 
 import tensorrt_llm
 from tensorrt_llm._torch.attention_backend.interface import (
@@ -368,10 +367,6 @@ def test_attention_mla(scenario: Scenario, context_sequence_lengths: List[int],
                        num_generation_steps: List[int], v2_kv_cache: bool):
     """Test MLA computation for both context and generation phases"""
 
-    if v2_kv_cache and getSMVersion() != 100:
-        pytest.skip(
-            "v2_kv_cache is only supported for MLA on Blackwell architectures")
-
     num_heads = scenario.num_heads
     num_kv_heads = scenario.num_kv_heads
     q_lora_rank = scenario.q_lora_rank
@@ -644,7 +639,8 @@ def _run_test_for_backend(backend_name, num_heads, num_kv_heads, num_layers,
             assert success, f"Failed to resume KV cache for request {req_id}"
             kv_cache.capacity = ctx_len
         else:
-            kv_cache_manager.impl.add_sequence(req_id, ctx_len, beam_width, req)
+            kv_cache_manager.impl.add_sequence_batch(
+                [(req_id, ctx_len, beam_width)], [req])
     attn_metadata = AttentionCls.Metadata(
         seq_lens=torch.tensor(context_sequence_lengths, dtype=torch.int),
         request_ids=list(range(len(context_sequence_lengths))),

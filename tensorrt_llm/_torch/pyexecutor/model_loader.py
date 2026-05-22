@@ -2,6 +2,7 @@ import copy
 import inspect
 import os
 import traceback
+import warnings
 from typing import Callable, Optional, Tuple
 
 import torch
@@ -9,7 +10,9 @@ import torch
 from tensorrt_llm._torch.models.checkpoints.base_checkpoint_loader import (
     AutoCheckpointMapper, BaseCheckpointLoader)
 from tensorrt_llm._utils import str_dtype_to_torch
-from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
+from tensorrt_llm.llmapi.llm_args import (ExecutorMemoryType,
+                                          ModelExpressConfig, TorchLlmArgs)
+from tensorrt_llm.llmapi.llm_utils import apply_model_defaults_to_llm_args
 from tensorrt_llm.logger import logger
 from tensorrt_llm.lora_helper import LoraConfig
 from tensorrt_llm.mapping import Mapping
@@ -24,6 +27,9 @@ from ..models.modeling_utils import (DecoderModelForCausalLM, MetaInitMode,
                                      timing)
 from ..modules.fused_moe.moe_load_balancer import (
     MoeLoadBalancer, maybe_create_moe_load_balancer)
+from ..virtual_memory import RestoreMode
+from ..virtual_memory import scope as virtual_memory_scope
+from .config_utils import resolve_hf_torch_dtype, resolve_mamba_ssm_cache_dtype
 
 _KV_CACHE_MAP = {
     "fp8": QuantAlgo.FP8.value,
@@ -33,14 +39,22 @@ _KV_CACHE_MAP = {
 _VALID_KV_CACHE_DTYPES = ("fp8", "nvfp4", "auto")
 
 
-def validate_and_set_mamba_ssm_cache_dtype(config: ModelConfig,
-                                           mamba_ssm_cache_dtype: str) -> None:
+def validate_and_set_mamba_ssm_cache_dtype(
+        config: ModelConfig,
+        mamba_ssm_cache_dtype: str,
+        mamba_ssm_stochastic_rounding: bool = False,
+        mamba_ssm_philox_rounds: int = 10) -> None:
     if mamba_ssm_cache_dtype == "auto":
-        mamba_ssm_cache_dtype = config.pretrained_config.torch_dtype
+        mamba_ssm_cache_dtype = (
+            resolve_mamba_ssm_cache_dtype(config.pretrained_config)
+            or resolve_hf_torch_dtype(config.pretrained_config)
+            or config.torch_dtype)
     else:
         mamba_ssm_cache_dtype = str_dtype_to_torch(mamba_ssm_cache_dtype)
 
     config.quant_config.mamba_ssm_cache_dtype = mamba_ssm_cache_dtype
+    config.quant_config.mamba_ssm_stochastic_rounding = mamba_ssm_stochastic_rounding
+    config.quant_config.mamba_ssm_philox_rounds = mamba_ssm_philox_rounds
 
 
 def validate_and_set_kv_cache_quant(model_config: ModelConfig,
@@ -69,17 +83,14 @@ def validate_and_set_kv_cache_quant(model_config: ModelConfig,
             f'"llm_args.KvCacheConfig.dtype="{pyt_kv_cache_dtype}" '
             f'Accepted types are "{_VALID_KV_CACHE_DTYPES}".')
 
-    # If we get to this point we have a valid quantization setting, but if
-    # we have an existing setting and it doesn't match we shouldn't proceed.
+    # If we get to this point we have a valid explicit quantization setting.
+    # Explicit kv_cache_dtype requests force override the checkpoint setting.
     if kv_cache_quant is not None and mapped_pyt_quant != kv_cache_quant:
-        raise RuntimeError(
-            "Attempting to override KV cache quantization "
-            f'"{kv_cache_quant}" with llm_args.KvCacheConfig.dtype='
-            f'"{pyt_kv_cache_dtype}". You cannot override a checkpoint with a '
-            "pre-quantized KV cache that doesn't match.")
+        logger.warning("Overriding checkpoint KV cache quantization "
+                       f'"{kv_cache_quant}" with llm_args.KvCacheConfig.dtype='
+                       f'"{pyt_kv_cache_dtype}".')
 
-    # We have an open ended KV cache in the checkpoint
-    # and we have a specified override.
+    # Apply explicit override from kv_cache_config.dtype.
     model_config.quant_config.kv_cache_quant_algo = mapped_pyt_quant
 
 
@@ -101,6 +112,7 @@ def initialize_dummy_weights(
     """
 
     def _get_random_min_max(dtype: torch.dtype) -> Tuple[int, int]:
+        """Return safe (min, max) bounds for uniform sampling of ``dtype``."""
         # These values are not necessarily the largest possible min/max,
         # they need to be small enough to avoid NaNs.
         if dtype in (torch.float8_e4m3fn, torch.int8):
@@ -116,7 +128,24 @@ def initialize_dummy_weights(
         else:
             raise NotImplementedError(f"Unknown quantized type: {dtype}.")
 
-    for param in model.state_dict().values():
+    # Calibration scalars (input_scale / inv_input_scale / kv_scales /
+    # inv_kv_scales / alpha / scalar_alpha) must keep their create_weights
+    # default (typically 1.0). Randomizing them breaks FP8 attention output
+    # and KV cache scaling for any `load_format="dummy"` + IPC update_weights
+    # flow when the checkpoint doesn't ship calibrated values (e.g., HF
+    # FineGrainedFP8, which uses dynamic activation quantization by design).
+    _SKIP_NAME_SUFFIXES = (
+        ".input_scale",
+        ".inv_input_scale",
+        ".kv_scales",
+        ".inv_kv_scales",
+        ".alpha",
+        ".scalar_alpha",
+    )
+
+    for _name, param in model.state_dict().items():
+        if any(_name.endswith(_s) for _s in _SKIP_NAME_SUFFIXES):
+            continue
         generator = torch.Generator(device=param.data.device)
         generator.manual_seed(seed)
         dtype = param.data.dtype
@@ -155,8 +184,13 @@ def get_rank_model_storage(model):
 
 
 def _construct_checkpoint_loader(
-        backend: str, checkpoint_loader: Optional[BaseCheckpointLoader],
-        checkpoint_format: Optional[str]) -> Optional[BaseCheckpointLoader]:
+    backend: str,
+    checkpoint_loader: Optional[BaseCheckpointLoader],
+    checkpoint_format: Optional[str],
+    *,
+    mx_config: Optional[ModelExpressConfig] = None,
+    mx_model_name: Optional[str] = None,
+) -> Optional[BaseCheckpointLoader]:
     if backend == "_autodeploy":
         return None
 
@@ -170,13 +204,33 @@ def _construct_checkpoint_loader(
             checkpoint_format)()
         config_loader = get_config_loader(checkpoint_format)()
 
+        # Pass extra kwargs for format-specific loaders (e.g. MX).
+        extra_kwargs: dict = {}
+        if checkpoint_format == "MX":
+            if mx_config is not None:
+                extra_kwargs["mx_server_url"] = mx_config.server_url
+                extra_kwargs[
+                    "query_timeout_s"] = mx_config.server_query_timeout_s
+            if mx_model_name is not None:
+                extra_kwargs["model_name"] = mx_model_name
+
         checkpoint_loader = BaseCheckpointLoader.get(
             checkpoint_format=checkpoint_format,
             weight_loader=checkpoint_weight_loader,
             weight_mapper=None,
-            config_loader=config_loader)
+            config_loader=config_loader,
+            **extra_kwargs)
 
     return checkpoint_loader
+
+
+def _apply_to_buffers_only(model: torch.nn.Module, fn):
+    """Apply *fn* to every buffer in *model*, skipping parameters.
+    """
+    for module in model.modules():
+        for key, buf in module._buffers.items():
+            if buf is not None:
+                module._buffers[key] = fn(buf)
 
 
 class ModelLoader:
@@ -192,7 +246,9 @@ class ModelLoader:
                  sparse_attention_config: Optional["SparseAttentionConfig"],
                  max_num_tokens: int,
                  max_seq_len: Optional[int],
-                 lora_config: Optional[LoraConfig] = None):
+                 lora_config: Optional[LoraConfig] = None,
+                 model_weights_memory_tag: Optional[ExecutorMemoryType] = None,
+                 model_weights_restore_mode: Optional[RestoreMode] = None):
         """
         Initializes the ModelLoader.
 
@@ -203,6 +259,11 @@ class ModelLoader:
             max_num_tokens: The maximum number of tokens the engine will handle.
             max_seq_len: The maximum sequence length.
             lora_config: Configuration for LoRA.
+            model_weights_memory_tag: When set, parameter allocations during
+                ``load()`` are placed under a separate virtual-memory tag so
+                they can be released/materialized independently of buffers.
+            model_weights_restore_mode: RestoreMode for the model weights
+                virtual-memory scope.
         """
         self.llm_args = llm_args
         self.mapping = mapping
@@ -211,6 +272,44 @@ class ModelLoader:
         self.max_num_tokens = max_num_tokens
         self.max_seq_len = max_seq_len
         self.lora_config = lora_config
+        self.model_weights_memory_tag = model_weights_memory_tag
+        self.model_weights_restore_mode = model_weights_restore_mode
+        self._weight_pool_proxy = None
+
+    @staticmethod
+    def load_config_and_apply_defaults(
+            checkpoint_dir: str, llm_args: TorchLlmArgs,
+            checkpoint_loader: BaseCheckpointLoader) -> TorchLlmArgs:
+        """Load model config and apply model-specific defaults to llm_args."""
+        if checkpoint_loader is None:
+            return llm_args
+
+        config_kwargs = {
+            'trust_remote_code': True,
+            'mm_encoder_only': llm_args.mm_encoder_only,
+        }
+        if llm_args.parallel_config:
+            config_kwargs['mapping'] = llm_args.parallel_config.to_mapping()
+
+        if llm_args.speculative_config:
+            config_kwargs['spec_config'] = llm_args.speculative_config
+
+        config = checkpoint_loader.load_config(checkpoint_dir, **config_kwargs)
+
+        model_cls = AutoModelForCausalLM._resolve_class(config)
+
+        # model_cls is None when the architecture is unknown/unsupported.
+        if model_cls and hasattr(model_cls, 'get_model_defaults'):
+            model_defaults = model_cls.get_model_defaults(llm_args)
+            if model_defaults:
+                applied_defaults = apply_model_defaults_to_llm_args(
+                    llm_args, model_defaults)
+                if applied_defaults:
+                    logger.info(
+                        f"Applied model defaults for {model_cls.__name__}: {applied_defaults}"
+                    )
+
+        return llm_args
 
     def load(
         self,
@@ -238,45 +337,113 @@ class ModelLoader:
                 config_copy = copy.deepcopy(config)
                 with MetaInitMode():
                     model = AutoModelForCausalLM.from_config(config_copy)
+                config = config_copy
+                is_meta_init = True
+            except Exception:
+                logger.info(
+                    f"Fallback to regular model init: {traceback.format_exc(limit=10)}"
+                )
+                model = AutoModelForCausalLM.from_config(config)
+                is_meta_init = False
 
-                memo = dict()
+            memo = dict()
+
+            if self.model_weights_memory_tag is not None:
+                # Allocate buffers to the outer virtual_memory_scope,
+                # but parameters (weights) to the dedicated inner virtual_memory_scope.
+
+                def allocate_buffer_on_cuda(t: torch.Tensor):
+                    if t not in memo:
+                        if t.device == torch.device('meta'):
+                            cuda_t = torch.empty_like(t, device='cuda')
+                        else:
+                            cuda_t = t.cuda()
+                        memo[t] = cuda_t
+                        memo[cuda_t] = cuda_t
+                    return memo[t]
+
+                _apply_to_buffers_only(model, allocate_buffer_on_cuda)
+
+                need_initialized_weights = load_format not in (LoadFormat.AUTO,
+                                                               LoadFormat.DUMMY)
+
+                def allocate_weights_on_cuda(t: torch.Tensor):
+                    if t not in memo:
+                        cuda_t = torch.empty_like(t, device='cuda')
+                        if t.device != torch.device('meta') and (
+                                need_initialized_weights or is_meta_init):
+                            if t.is_cuda:
+                                memory_type_map = {
+                                    ExecutorMemoryType.MODEL_WEIGHTS_MAIN:
+                                    ExecutorMemoryType.MODEL_ENGINE_MAIN,
+                                    ExecutorMemoryType.MODEL_WEIGHTS_DRAFT:
+                                    ExecutorMemoryType.MODEL_ENGINE_DRAFT,
+                                }
+
+                                warnings.warn(
+                                    f"A weight tensor of shape {t.shape} is already allocated on CUDA device before "
+                                    f"the weight allocation stage. This will cause extra CUDA memory usage in the "
+                                    f"'{memory_type_map[self.model_weights_memory_tag]}' scope."
+                                )
+                            cuda_t.copy_(t)
+                        memo[t] = cuda_t
+                        memo[cuda_t] = cuda_t
+                    return memo[t]
+
+                with virtual_memory_scope(
+                        self.model_weights_memory_tag,
+                        self.model_weights_restore_mode) as pool:
+                    model._apply(allocate_weights_on_cuda)
+                self._weight_pool_proxy = pool
+            elif is_meta_init:
 
                 def init_meta_tensor(t: torch.Tensor):
                     if t.device != torch.device('meta'):
                         return t
+
                     if t not in memo:
                         memo[t] = torch.empty_like(t, device='cuda')
                     return memo[t]
 
                 model._apply(init_meta_tensor)
-                config = config_copy
 
-            except Exception:
-                logger.info(
-                    f"Fallback to regular model init: {traceback.format_exc(limit=10)}\n"
-                )
-                model = AutoModelForCausalLM.from_config(config)
-            finally:
-                if 'memo' in locals():
-                    del memo
-
+            # Ensure everything is at least on CUDA
+            # No-op if worked as expected
             model.to("cuda")
+            del memo
+
             rank_model_storage = get_rank_model_storage(model)
             logger.info(
                 f"Use {rank_model_storage / (1024**3):.2f} GB for model weights."
             )
+            weights_preloaded = False
             if load_format == LoadFormat.AUTO:
+                # Pass model= so format-specific loaders (e.g. MX) can
+                # write weights directly into parameter buffers via P2P.
+                # Generic loaders ignore model=; loaders that can consume a
+                # live module reference (MX) use it for direct writes.
+                load_weights_kwargs: dict = {
+                    "mapping": self.mapping,
+                    "model": model,
+                }
+
                 if hasattr(model, 'llm_checkpoint_dir'):
                     weights = checkpoint_loader.load_weights(
-                        model.llm_checkpoint_dir, mapping=self.mapping)
+                        model.llm_checkpoint_dir, **load_weights_kwargs)
                 else:
                     weights = checkpoint_loader.load_weights(
-                        checkpoint_dir, mapping=self.mapping)
+                        checkpoint_dir, **load_weights_kwargs)
 
+                # When MX P2P succeeds, weights are already in model params.
+                # A non-empty dict contains size-mismatched tensors that
+                # should be merged via the standard disk pipeline.
+                weights_preloaded = checkpoint_loader.is_weights_preloaded()
                 self.weight_mapper = checkpoint_loader.get_initialized_weight_mapper(
                     model, config)
-                self._call_load_weights(model.load_weights, weights,
-                                        self.weight_mapper)
+
+                if weights:
+                    self._call_load_weights(model.load_weights, weights,
+                                            self.weight_mapper)
 
                 if self.spec_config is not None and self.spec_config.spec_dec_mode.need_load_draft_weights(
                 ):
@@ -311,6 +478,13 @@ class ModelLoader:
             else:
                 raise NotImplementedError(
                     f"No load support for load format: {load_format}")
+
+            checkpoint_loader.post_load_apply(
+                model, weights_preloaded=weights_preloaded)
+            checkpoint_loader.post_load_publish(
+                model,
+                checkpoint_dir=checkpoint_dir,
+                weights_preloaded=weights_preloaded)
 
             for module in model.modules():
                 if hasattr(module, 'post_load_weights') and not getattr(
@@ -369,6 +543,9 @@ class ModelLoader:
             use_cute_dsl_blockscaling_mm,
             use_cute_dsl_blockscaling_bmm=self.llm_args.
             use_cute_dsl_blockscaling_bmm,
+            video_pruning_rate=self.llm_args.video_pruning_rate,
+            use_cute_dsl_bf16_bmm=self.llm_args.use_cute_dsl_bf16_bmm,
+            use_cute_dsl_bf16_gemm=self.llm_args.use_cute_dsl_bf16_gemm,
         )
 
         # Only pass model_kwargs if it's explicitly set (not None)
@@ -380,11 +557,32 @@ class ModelLoader:
         # Store nvfp4 config in extra_attrs for Linear layer access
         config.extra_attrs[
             'nvfp4_gemm_allowed_backends'] = config.nvfp4_gemm_allowed_backends
+        # Store allreduce pre-allocation config for AllReduce module access.
+        # Use get_text_config() so VLM wrapper configs (e.g. KimiK2VLConfig,
+        # KimiK25Config) that store the text config under .text_config are
+        # handled transparently.  For flat configs get_text_config() returns
+        # self, so this is safe for all config types.  Still guard with
+        # try/except for configs that lack hidden_size entirely.
+        try:
+            config.extra_attrs[
+                'allreduce_max_num_tokens'] = config.max_num_tokens
+            config.extra_attrs[
+                'allreduce_hidden_size'] = config.pretrained_config.get_text_config(
+                ).hidden_size
+            config.extra_attrs[
+                'allreduce_dtype'] = config.pretrained_config.torch_dtype
+        except AttributeError as e:
+            logger.warning(
+                f"Could not read allreduce pre-allocation config from "
+                f"{type(config.pretrained_config).__name__}: {e}. "
+                f"AllReduce pre-allocation will be skipped.")
 
         validate_and_set_kv_cache_quant(config,
                                         self.llm_args.kv_cache_config.dtype)
         validate_and_set_mamba_ssm_cache_dtype(
-            config, self.llm_args.kv_cache_config.mamba_ssm_cache_dtype)
+            config, self.llm_args.kv_cache_config.mamba_ssm_cache_dtype,
+            self.llm_args.kv_cache_config.mamba_ssm_stochastic_rounding,
+            self.llm_args.kv_cache_config.mamba_ssm_philox_rounds)
 
         # Allow overriding the number of layers via environment variable
         # Note: This is kept for backward compatibility, but model_kwargs is preferred

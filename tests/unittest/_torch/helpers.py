@@ -1,4 +1,4 @@
-from typing import Dict, Tuple
+from typing import Dict, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -59,18 +59,28 @@ def per_token_cast_to_fp8_e8m0(
 
 def per_block_cast_to_fp8_e8m0(
         x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-    assert x.dim() == 2
-    m, n = x.shape
-    x_padded = torch.zeros((align(m, 128), align(n, 128)),
+    assert x.dim() == 2 or x.dim() == 3
+    squeezed = x.dim() == 2
+    if squeezed:
+        x = x.unsqueeze(0)
+
+    g, m, n = x.shape
+    x_padded = torch.zeros((g, align(m, 128), align(n, 128)),
                            dtype=x.dtype,
                            device=x.device)
-    x_padded[:m, :n] = x
-    x_view = x_padded.view(-1, 128, x_padded.size(1) // 128, 128)
-    x_amax = x_view.abs().float().amax(dim=(1, 3), keepdim=True).clamp(1e-4)
+    x_padded[:, :m, :n] = x
+    x_view = x_padded.view(g, -1, 128, x_padded.size(-1) // 128, 128)
+    x_amax = x_view.abs().float().amax(dim=(2, 4), keepdim=True).clamp(1e-4)
     sf = ceil_to_ue8m0(x_amax / 448.0)
     x_scaled = (x_view * (1.0 / sf)).to(torch.float8_e4m3fn)
-    return x_scaled.view_as(x_padded)[:m, :n].contiguous(), sf.view(
-        x_view.size(0), x_view.size(2))
+    x_scaled = x_scaled.view_as(x_padded)[:, :m, :n].contiguous()
+    sf = sf.view(x_view.size(0), x_view.size(1), x_view.size(3))
+
+    if squeezed:
+        x_scaled = x_scaled.squeeze(0)
+        sf = sf.squeeze(0)
+
+    return x_scaled, sf
 
 
 def calc_diff(x, y):
@@ -246,3 +256,22 @@ def create_mock_cuda_graph_runner(batch_size: int, use_mrope: bool = False):
         dist=None,
         kv_cache_manager_key=ResourceManagerType.KV_CACHE_MANAGER)
     return CUDAGraphRunner(config)
+
+
+def make_hf_hybrid_cache_for_tests(
+    config,
+    *,
+    max_cache_len: int,
+    max_batch_size: Optional[int] = None,
+    device=None,
+    dtype=None,
+):
+    """Build Hugging Face ``past_key_values`` for hybrid / sliding-window models in tests.
+
+    Transformers v5 removed ``HybridCache`` in favor of ``StaticCache`` for fixed-length
+    pre-allocated KV.
+    """
+    del max_batch_size, device, dtype  # StaticCache doesn't accept these kwargs.
+    from transformers.cache_utils import StaticCache
+
+    return StaticCache(config=config, max_cache_len=max_cache_len)

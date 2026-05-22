@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023-2024, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2023-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -114,5 +114,25 @@ struct BatchStateHash
         return bs.hash();
     }
 };
-
 } // namespace tensorrt_llm::batch_manager
+
+namespace tensorrt_llm::batch_manager::kv_cache_manager
+{
+inline std::size_t hash32Mix(uint32_t a, std::size_t seed)
+{
+    a = ((a >> 16) ^ a) * 0x45d9f3b;
+    a = ((a >> 16) ^ a) * 0x45d9f3b;
+    a = (a >> 16) ^ a;
+    seed ^= a + 0x9e3779b9 + (seed << 6) + (seed >> 2);
+    return seed;
+}
+
+inline std::size_t hash64Mix(uint64_t c, std::size_t seed)
+{
+    c = (c ^ (c >> 30)) * UINT64_C(0xbf58476d1ce4e5b9);
+    c = (c ^ (c >> 27)) * UINT64_C(0x94d049bb133111eb);
+    c = c ^ (c >> 31);
+    seed ^= c + 0x9e3779b9 + (seed << 6) + (seed >> 2);
+    return seed;
+}
+} // namespace tensorrt_llm::batch_manager::kv_cache_manager

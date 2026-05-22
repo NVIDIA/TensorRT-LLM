@@ -18,7 +18,7 @@ This guide provides a step-by-step process for adding a new model in PyTorch Bac
 ## Prerequisites
 
 Before you begin, ensure you have the following:
-- A working installation of TensorRT-LLM. Follow these [instructions](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/installation/build-from-source-linux.md).
+- A working installation of TensorRT-LLM. Follow these [instructions](../installation/build-from-source.md).
 
 ## Step-by-Step Guide
 
@@ -196,8 +196,8 @@ if __name__ == '__main__':
     main()
 ```
 
-We provide an out-of-tree modeling example in `examples/pytorch/out_of_tree_example`. The model is implemented in `modeling_opt.py` and you can run the example by:
+We provide an out-of-tree modeling example in `examples/llm-api/out_of_tree_example`. The model is implemented in `modeling_opt.py` and you can run the example by:
 
 ```bash
-python examples/pytorch/out_of_tree_example/main.py
+python examples/llm-api/out_of_tree_example/main.py
 ```

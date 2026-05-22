@@ -76,9 +76,10 @@ def main():
         prompts.append(test_case["problem"])
 
     if args.static_with_benchmark or args.concurrency:
-        if args.concurrency == None:
+        if args.concurrency is None:
             args.concurrency = 1
 
+        task_collection_types = {}
         if args.static_with_benchmark:
             task_collection_types = {"token_counter": GenerationTokenCounter}
 
@@ -109,7 +110,7 @@ def main():
             print(f'Answer={answer}, reference={ref_answer}')
             if answer == ref_answer:
                 correct_count += 1
-        except:
+        except (ValueError, TypeError):
             print(f'extracted_answer={extracted_answer}, not integer.')
         total_count += 1
     print(

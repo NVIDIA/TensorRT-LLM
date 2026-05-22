@@ -1,18 +1,25 @@
 from dataclasses import dataclass, field
-from typing import Dict, List
+from typing import Dict, List, Tuple
 
 from tensorrt_llm import logger
+from tensorrt_llm._torch.disaggregation.base.region import RegionMapperBase
+from tensorrt_llm._torch.disaggregation.native.mixers.attention.peer import AttentionPolicy
 from tensorrt_llm._torch.disaggregation.native.rank_info import RankInfo
-from tensorrt_llm._torch.disaggregation.native.region.block import (
-    HeadMatchMapper,
-    HeadMismatchMapper,
-    IdentityMapper,
-    RegionMapperBase,
+from tensorrt_llm._torch.disaggregation.resource.kv_extractor import KVRegionExtractorV1
+from tensorrt_llm._torch.disaggregation.resource.page import AttentionLayerGroup
+from tensorrt_llm._torch.disaggregation.resource.utils import (
+    PoolRole,
+    get_global_layer_ids,
+    get_layer_group_num_layers,
+    get_layer_to_layer_group,
+    get_physical_pool,
+    get_pool_role,
+    get_pool_view_global_layer_ids,
+    get_pool_view_num_layers,
 )
-from tensorrt_llm._torch.disaggregation.resource.kv_extractor import (
-    KVPoolAttrs,
-    KVRegionExtractorV1,
-)
+
+# Type alias for (lg_idx, pool_idx) pair
+LGPoolKey = Tuple[int, int]
 
 
 @dataclass
@@ -22,31 +29,25 @@ class PeerOverlap:
     overlap_cp_size: int = 0
     duplicate_head_factor: int = 1
     peer_duplicate_head_factor: int = 1
-    target_peer_pp_layer_num: List[int] = field(default_factory=list)
     ranks: List[int] = field(default_factory=list)
 
 
 class PeerRegistrar:
     def __init__(self, self_rank_info: RankInfo, self_extractor: KVRegionExtractorV1):
         self._ri = self_rank_info
+        self._attention_policy = AttentionPolicy(self_rank_info)
         self._peer_ri_cache: Dict[str, RankInfo] = {}
-        self._kv_map_cache: Dict[str, RegionMapperBase] = {}
+        self._kv_map_cache: Dict[
+            tuple, RegionMapperBase
+        ] = {}  # key: (peer_key, self_lg_pool_key, peer_lg_pool_key)
         self._self_ext_cache = self_extractor
         self._peer_ext_cache: Dict[str, KVRegionExtractorV1] = {}
         self._overlap_cache: Dict[str, PeerOverlap] = {}
-
-    def _block_size(self, layer_num: int, ri: RankInfo) -> int:
-        return (
-            layer_num
-            * ri.kv_factor
-            * ri.kv_heads_per_rank
-            * ri.tokens_per_block
-            * ri.dims_per_head
-            * ri.element_bytes
-        )
+        self._lg_pool_mapping_cache: Dict[
+            str, Dict[LGPoolKey, LGPoolKey]
+        ] = {}  # peer_key -> {(self_lg, self_pi) -> (peer_lg, peer_pi)}
 
     def register(self, peer_name: str, peer_rank: int, peer_ri: RankInfo):
-        # TODO: check if peer is valid for registration
         assert self._self_ext_cache is not None
         if not self._check_peer_compatible(peer_ri):
             raise ValueError(
@@ -55,11 +56,7 @@ class PeerRegistrar:
         key = self._unique_key(peer_name, peer_rank)
         self._peer_ri_cache[key] = peer_ri
         peer_ri = self.get_peer_rank_info(peer_name, peer_rank)
-        layer_num = peer_ri.layer_num_per_pp[peer_ri.pp_rank]
-        block_size = self._block_size(layer_num, peer_ri)
-        extractor = KVRegionExtractorV1(
-            KVPoolAttrs(pool_ptrs=peer_ri.kv_ptrs, block_bytes=[block_size])
-        )
+        extractor = KVRegionExtractorV1(peer_ri.page_table)
         self._peer_ext_cache[key] = extractor
 
     def peer_extractor(self, peer_name: str, peer_rank: int) -> KVRegionExtractorV1:
@@ -76,8 +73,12 @@ class PeerRegistrar:
             del self._peer_ri_cache[key]
         if key in self._peer_ext_cache:
             del self._peer_ext_cache[key]
-        if key in self._kv_map_cache:
-            del self._kv_map_cache[key]
+        # Clean up kv_map_cache entries for this peer
+        keys_to_remove = [k for k in self._kv_map_cache if k[0] == key]
+        for k in keys_to_remove:
+            del self._kv_map_cache[k]
+        if key in self._lg_pool_mapping_cache:
+            del self._lg_pool_mapping_cache[key]
 
     def get_peer_rank_info(self, peer_name: str, peer_rank: int):
         return self._peer_ri_cache[self._unique_key(peer_name, peer_rank)]
@@ -90,35 +91,7 @@ class PeerRegistrar:
         return name + str(rank)
 
     def _check_peer_compatible(self, peer_ri: RankInfo) -> bool:
-        if self._ri.is_mla != peer_ri.is_mla:
-            logger.warning(
-                "PeerRegistrar: compatibility check failed: 'is_mla' differs "
-                f"(local={self._ri.is_mla}, peer={peer_ri.is_mla})."
-            )
-            return False
-        if self._ri.cp_size != 1 or peer_ri.cp_size != 1:
-            logger.warning(
-                "PeerRegistrar: unsupported configuration: context parallelism (cp_size) "
-                f"must be 1 for both local and peer ranks (local={self._ri.cp_size}, peer={peer_ri.cp_size})."
-            )
-            return False
-        if self._ri.element_bytes != peer_ri.element_bytes:
-            logger.warning(
-                "PeerRegistrar: element size mismatch "
-                f"(local={self._ri.element_bytes} bytes, peer={peer_ri.element_bytes} bytes)."
-            )
-            return False
-        if self._ri.tokens_per_block != peer_ri.tokens_per_block:
-            logger.warning(
-                "PeerRegistrar: tokens_per_block mismatch "
-                f"(local={self._ri.tokens_per_block}, peer={peer_ri.tokens_per_block})."
-            )
-            return False
-        if self._ri.dims_per_head != peer_ri.dims_per_head:
-            logger.warning(
-                "PeerRegistrar: dims_per_head mismatch "
-                f"(local={self._ri.dims_per_head}, peer={peer_ri.dims_per_head})."
-            )
+        if not self._attention_policy.check_peer_compatible(peer_ri):
             return False
 
         self_layers = sum(self._ri.layer_num_per_pp)
@@ -130,77 +103,163 @@ class PeerRegistrar:
             )
             return False
 
-        if self._ri.is_mla:
-            if peer_ri.kv_heads_per_rank != 1 or self._ri.kv_heads_per_rank != 1:
-                logger.warning(
-                    "PeerRegistrar: MLA mode requires exactly 1 KV head per rank for both local and peer."
-                    f" (local={self._ri.kv_heads_per_rank}, peer={peer_ri.kv_heads_per_rank})"
-                )
-                return False
         return True
 
-    def _tp_per_dp(self, info: RankInfo) -> int:
-        return (
-            info.tp_size // info.dp_size
-            if getattr(info, "enable_attention_dp", False)
-            else info.tp_size
-        )
+    def get_pool_mapping(self, peer_ri: RankInfo) -> Dict[LGPoolKey, LGPoolKey]:
+        """Get mapping from (self_lg_idx, self_pool_idx) -> (peer_lg_idx, peer_pool_idx).
 
-    def get_kv_map(self, peer_ri: RankInfo):
+        Two-step matching:
+        1. Find peer layer_group via layer_to_layer_group (global_layer_id -> lg_idx).
+        2. Within the matched peer layer_group, find the peer pool by matching
+           pool_role AND global_layer_ids overlap.
+        """
         key = self._unique_key(peer_ri.instance_name, peer_ri.instance_rank)
-        if key in self._kv_map_cache:
-            return self._kv_map_cache[key]
+        if key in self._lg_pool_mapping_cache:
+            return self._lg_pool_mapping_cache[key]
 
-        self_tp_per_dp = self._tp_per_dp(self._ri)
-        peer_tp_per_dp = self._tp_per_dp(peer_ri)
+        mapping: Dict[LGPoolKey, LGPoolKey] = {}
+        self_pt = self._self_ext_cache.page_table
+        peer_pt = peer_ri.page_table
 
-        is_dup_head = (
-            self._ri.kv_heads_per_rank * self_tp_per_dp
-            != peer_ri.kv_heads_per_rank * peer_tp_per_dp
+        if self_pt is None or peer_pt is None:
+            self._lg_pool_mapping_cache[key] = mapping
+            return mapping
+        if not self_pt.layer_groups or not peer_pt.layer_groups:
+            self._lg_pool_mapping_cache[key] = mapping
+            return mapping
+
+        peer_layer_to_group = get_layer_to_layer_group(peer_pt)
+        assert self._ri.attention is not None
+        kv_factor = self._ri.attention.kv_factor
+
+        for self_lg_idx, self_lg in enumerate(self_pt.layer_groups):
+            if not isinstance(self_lg, AttentionLayerGroup):
+                continue
+            for self_pi, self_pv in enumerate(self_lg.pool_views):
+                is_indexer = len(self_pv.buffer_entries) == 0
+                # For INDEXER (empty buffer_entries), use group-level IDs for step-1 lookup
+                pv_global_ids = (
+                    get_global_layer_ids(self_lg)
+                    if is_indexer
+                    else get_pool_view_global_layer_ids(self_pv, self_lg)
+                )
+                if not pv_global_ids:
+                    continue
+
+                # Step 1: find peer layer_group via any overlapping global_layer_id
+                peer_lg_idx = None
+                for glid in pv_global_ids:
+                    if glid in peer_layer_to_group:
+                        peer_lg_idx = peer_layer_to_group[glid]
+                        break
+                if peer_lg_idx is None:
+                    continue
+                peer_lg = peer_pt.layer_groups[peer_lg_idx]
+
+                # Step 2: find peer pool within group by matching pool_role + layer overlap
+                self_pool_role = (
+                    PoolRole.INDEXER if is_indexer else get_pool_role(self_pv, kv_factor=kv_factor)
+                )
+                self_layer_set = set(pv_global_ids)
+                matched_peer_pi = None
+                for peer_pi, peer_pv in enumerate(peer_lg.pool_views):
+                    peer_is_indexer = len(peer_pv.buffer_entries) == 0
+                    peer_pool_role = (
+                        PoolRole.INDEXER
+                        if peer_is_indexer
+                        else get_pool_role(peer_pv, kv_factor=kv_factor)
+                    )
+                    if peer_pool_role != self_pool_role:
+                        continue
+                    if is_indexer:
+                        # INDEXER pools match by role alone
+                        matched_peer_pi = peer_pi
+                        break
+                    if set(get_pool_view_global_layer_ids(peer_pv, peer_lg)) & self_layer_set:
+                        matched_peer_pi = peer_pi
+                        break
+
+                if matched_peer_pi is not None:
+                    mapping[(self_lg_idx, self_pi)] = (peer_lg_idx, matched_peer_pi)
+
+        self._lg_pool_mapping_cache[key] = mapping
+        return mapping
+
+    def get_kv_map(
+        self,
+        peer_ri: RankInfo,
+        self_pool_key: LGPoolKey,
+        peer_pool_key: LGPoolKey,
+    ) -> RegionMapperBase:
+        """Get mapper for a specific pool pair.
+
+        Args:
+            peer_ri: Peer rank info.
+            self_pool_key: (self_lg_idx, self_pool_idx).
+            peer_pool_key: (peer_lg_idx, peer_pool_idx).
+        """
+        peer_key = self._unique_key(peer_ri.instance_name, peer_ri.instance_rank)
+        cache_key = (peer_key, self_pool_key, peer_pool_key)
+        if cache_key in self._kv_map_cache:
+            return self._kv_map_cache[cache_key]
+
+        self_pt = self._self_ext_cache.page_table
+        peer_pt = peer_ri.page_table
+        assert self_pt is not None
+        assert peer_pt is not None
+        self_lg_idx, self_pi = self_pool_key
+        peer_lg_idx, peer_pi = peer_pool_key
+        self_lg = self_pt.layer_groups[self_lg_idx]
+        peer_lg = peer_pt.layer_groups[peer_lg_idx]
+        self_pv = self_lg.pool_views[self_pi]
+        peer_pv = peer_lg.pool_views[peer_pi]
+
+        assert self._ri.attention is not None
+        kv_factor = self._ri.attention.kv_factor
+        is_indexer = len(self_pv.buffer_entries) == 0
+        self_pool_role = (
+            PoolRole.INDEXER if is_indexer else get_pool_role(self_pv, kv_factor=kv_factor)
         )
-        head_match = is_dup_head or self._ri.is_mla or self_tp_per_dp == peer_tp_per_dp
-        logger.debug(
-            "KVMapperFactory.get_kv_map: "
-            f"head_match={head_match}, is_dup_head={is_dup_head}, self_is_mla={self._ri.is_mla}, "
-            f"self_tp_per_dp={self_tp_per_dp}, peer_tp_per_dp={peer_tp_per_dp}"
-        )
-        # fast identity when write_all and same pp_size
-        if head_match and self._ri.pp_size == peer_ri.pp_size:
-            mapper = IdentityMapper()
-            self._kv_map_cache[key] = mapper
-            return mapper
 
-        # compute overlapping layers
-        self_start_layer = sum(self._ri.layer_num_per_pp[: self._ri.pp_rank])
-        self_end_layer = self_start_layer + self._ri.layer_num_per_pp[self._ri.pp_rank]
-        peer_start_layer = sum(peer_ri.layer_num_per_pp[: peer_ri.pp_rank])
-        peer_end_layer = peer_start_layer + peer_ri.layer_num_per_pp[peer_ri.pp_rank]
-        start = max(self_start_layer, peer_start_layer)
-        end = min(self_end_layer, peer_end_layer)
-        transfer_layers = end - start
-        self_layer_offset = start - self_start_layer
-        peer_layer_offset = start - peer_start_layer
+        # For INDEXER (empty buffer_entries), use group-level global layer IDs
+        if is_indexer:
+            self_global_ids = get_global_layer_ids(self_lg)
+            peer_global_ids = get_global_layer_ids(peer_lg)
+            self_num_layers = get_layer_group_num_layers(self_lg)
+            peer_num_layers = get_layer_group_num_layers(peer_lg)
+        else:
+            self_global_ids = get_pool_view_global_layer_ids(self_pv, self_lg)
+            peer_global_ids = get_pool_view_global_layer_ids(peer_pv, peer_lg)
+            self_num_layers = get_pool_view_num_layers(self_pv)
+            peer_num_layers = get_pool_view_num_layers(peer_pv)
 
-        if head_match:
-            mapper = HeadMatchMapper(
-                transfer_layers=transfer_layers,
-                src_layer_off=self_layer_offset,  # local layer offset
-                dst_layer_off=peer_layer_offset,  # peer layer offset
-                self_ri=self._ri,
-                peer_ri=peer_ri,
-            )
-            self._kv_map_cache[key] = mapper
-            return mapper
+        overlapping_layers = sorted(set(self_global_ids) & set(peer_global_ids))
+        transfer_layers = len(overlapping_layers)
 
-        # head mismatch case
-        mapper = HeadMismatchMapper(
-            transfer_layers=transfer_layers,
-            src_layer_off=self_layer_offset,
-            peer_layer_off=peer_layer_offset,
-            self_ri=self._ri,
+        if transfer_layers > 0:
+            first_overlap_layer = overlapping_layers[0]
+            self_layer_offset = self_global_ids.index(first_overlap_layer)
+            peer_layer_offset = peer_global_ids.index(first_overlap_layer)
+        else:
+            self_layer_offset = 0
+            peer_layer_offset = 0
+
+        self_phys = get_physical_pool(self_pt, self_lg_idx, self_pv.pool_idx)
+        peer_phys = get_physical_pool(peer_pt, peer_lg_idx, peer_pv.pool_idx)
+
+        mapper = self._attention_policy.build_kv_mapper(
             peer_ri=peer_ri,
+            pool_role=self_pool_role,
+            transfer_layers=transfer_layers,
+            self_layer_offset=self_layer_offset,
+            peer_layer_offset=peer_layer_offset,
+            self_pool_num_layers=self_num_layers,
+            peer_pool_num_layers=peer_num_layers,
+            self_pool_slot_bytes=self_phys.slot_bytes,
+            peer_pool_slot_bytes=peer_phys.slot_bytes,
         )
-        self._kv_map_cache[key] = mapper
+
+        self._kv_map_cache[cache_key] = mapper
         return mapper
 
     @staticmethod
@@ -229,19 +288,14 @@ class PeerRegistrar:
 
         pre = 0
         tgt_pp_ranks: List[int] = []
-        tgt_pp_layer_num: List[int] = []
         for p in range(peer_ri.pp_size):
             peer_start_layer = pre
             peer_end_layer = peer_start_layer + peer_ri.layer_num_per_pp[p]
             if self_start_layer < peer_end_layer and self_end_layer > peer_start_layer:
                 tgt_pp_ranks.append(p)
-                tgt_pp_layer_num.append(
-                    min(peer_end_layer, self_end_layer) - max(peer_start_layer, self_start_layer)
-                )
             pre += peer_ri.layer_num_per_pp[p]
 
         if tgt_pp_ranks == []:
-            # no overlap found
             targets = PeerOverlap()
             self._overlap_cache[key] = targets
             return targets
@@ -250,9 +304,8 @@ class PeerRegistrar:
         overlap_pp_size = len(tgt_pp_ranks)
         peer_end_pp = peer_start_pp + overlap_pp_size
 
-        # tp per dp-group
-        self_tp_per_dp = self._tp_per_dp(self._ri)
-        peer_tp_per_dp = self._tp_per_dp(peer_ri)
+        self_tp_per_dp = self._ri.tp_size_per_dp_group
+        peer_tp_per_dp = peer_ri.tp_size_per_dp_group
         self_tp_rank_in_dp = self._ri.tp_rank % self_tp_per_dp
 
         overlap_tp_size, peer_start_tp, peer_end_tp = self._find_overlap(
@@ -268,10 +321,7 @@ class PeerRegistrar:
                 for tp in range(peer_start_tp, peer_end_tp):
                     ranks.append(pp * peer_ri.tp_size * peer_ri.cp_size + cp * peer_ri.tp_size + tp)
 
-        factor_self = self._ri.kv_heads_per_rank * self_tp_per_dp
-        factor_peer = peer_ri.kv_heads_per_rank * peer_tp_per_dp
-        dup_head = max(1, factor_self // factor_peer)
-        peer_dup_head = max(1, factor_peer // factor_self)
+        dup_head, peer_dup_head = self._attention_policy.duplicate_head_factors(peer_ri)
 
         targets = PeerOverlap(
             overlap_pp_size=overlap_pp_size,
@@ -279,8 +329,35 @@ class PeerRegistrar:
             overlap_cp_size=overlap_cp_size,
             duplicate_head_factor=dup_head,
             peer_duplicate_head_factor=peer_dup_head,
-            target_peer_pp_layer_num=tgt_pp_layer_num,
             ranks=ranks,
         )
         self._overlap_cache[key] = targets
         return targets
+
+    def should_send_kv(self, peer_overlap: PeerOverlap, peer_rank_info: RankInfo) -> bool:
+        dup_head_factor = peer_overlap.duplicate_head_factor
+        if dup_head_factor <= 1:
+            return True
+        self_tp_rank_in_dp_group = self._ri.tp_rank % self._ri.tp_size_per_dp_group
+        return (peer_rank_info.dp_rank % dup_head_factor) == (
+            self_tp_rank_in_dp_group % dup_head_factor
+        )
+
+    def should_send_aux(self, peer_rank_info: RankInfo) -> bool:
+        # to ensure the transfer aux is not duplicated
+
+        # TP: only the first rank in each peer-TP-sized group sends aux
+        ratio = max(1, self._ri.tp_size_per_dp_group // peer_rank_info.tp_size_per_dp_group)
+        self_tp_rank_in_dp_group = self._ri.tp_rank % self._ri.tp_size_per_dp_group
+        should_send_in_tp = self_tp_rank_in_dp_group % ratio == 0
+
+        # PP: only the first self-PP rank whose layers overlap with the peer's PP rank sends aux.
+        # All tp/pp ranks have the same aux data, so pick the first overlapping one to avoid duplication.
+        peer_start_layer = sum(peer_rank_info.layer_num_per_pp[: peer_rank_info.pp_rank])
+        peer_end_layer = peer_start_layer + peer_rank_info.layer_num_per_pp[peer_rank_info.pp_rank]
+        offset = 0
+        for p, n in enumerate(self._ri.layer_num_per_pp):
+            if offset < peer_end_layer and offset + n > peer_start_layer:
+                return should_send_in_tp and p == self._ri.pp_rank
+            offset += n
+        return False

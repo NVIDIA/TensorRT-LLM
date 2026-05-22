@@ -13,7 +13,8 @@ from einops import rearrange
 from transformers import AutoConfig, AutoModelForCausalLM
 
 import tensorrt_llm
-from tensorrt_llm._utils import release_gc
+from tensorrt_llm._deprecation import emit_engine_arch_deprecation
+from tensorrt_llm._utils import get_hf_rope_theta, release_gc
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.llama import convert
 
@@ -443,6 +444,7 @@ def convert_from_hf(hf_model,
 
 
 if __name__ == '__main__':
+    emit_engine_arch_deprecation("convert_checkpoint.py")
     args = parse_arguments()
     world_size = args.tp_size * args.pp_size
 
@@ -478,7 +480,7 @@ if __name__ == '__main__':
         'norm_epsilon': hf_config.rms_norm_eps,
         'vocab_size': hf_config.vocab_size,
         'position_embedding_type': 'rope_gpt_neox',
-        'rotary_base': hf_config.rope_theta,
+        'rotary_base': get_hf_rope_theta(hf_config, 10000.0),
         'max_position_embeddings': hf_config.max_position_embeddings,
         'hidden_act': hf_config.hidden_act,
         'use_parallel_embedding': args.use_parallel_embedding,

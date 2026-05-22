@@ -5,14 +5,16 @@ This file tests:
 1. fp8_mqa_logits operation from the DeepGEMM library
 2. fp8_paged_mqa_logits operation with paged KV cache
 3. compute_cu_seqlen_kv_bounds utility for batched causal attention
+4. prepare/restore attention metadata for draft replay
 """
 
+import builtins
 import random
 from unittest.mock import Mock, patch
 
 import pytest
 import torch
-from utils.util import check_accuracy, skip_pre_hopper
+from utils.util import check_accuracy, skip_pre_blackwell, skip_pre_hopper
 
 from tensorrt_llm import deep_gemm
 from tensorrt_llm._torch.attention_backend.interface import (
@@ -20,6 +22,9 @@ from tensorrt_llm._torch.attention_backend.interface import (
 from tensorrt_llm._torch.attention_backend.sparse.dsa import (
     DSACacheManager, DSAtrtllmAttentionMetadata, Indexer,
     compute_cu_seqlen_kv_bounds_with_cache, split_prefill_chunks)
+from tensorrt_llm._torch.speculative.interface import (
+    prepare_attn_metadata_for_draft_replay,
+    restore_attn_metadata_after_draft_replay)
 from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.bindings.executor import KvCacheConfig
@@ -32,6 +37,7 @@ from tensorrt_llm.quantization.utils import fp8_utils
 
 
 def has_deep_gemm():
+    """Return True if the DeepGEMM library is available."""
     try:
         return deep_gemm is not None
     except Exception:
@@ -39,6 +45,7 @@ def has_deep_gemm():
 
 
 def _ceil_to_ue8m0(x: torch.Tensor):
+    """Round tensor values up to the nearest power of two (UE8M0 format)."""
     return torch.pow(2.0, torch.ceil(torch.log2(x.abs())))
 
 
@@ -53,22 +60,31 @@ def create_dsa_cache_manager(
     tokens_per_block: int,
     max_seq_len: int,
     num_layers: int = 1,
+    indexer_k_dtype: str = "fp8",
 ):
     """Helper to create a DSACacheManager for testing."""
 
     # Create a minimal sparse attention config
     class SparseAttentionConfig:
+        """Minimal mock of SparseAttentionConfig for testing."""
 
-        def __init__(self, index_head_dim, index_n_heads, index_topk):
+        def __init__(self, index_head_dim, index_n_heads, index_topk,
+                     indexer_k_dtype):
+            """Initialize sparse attention config with indexer parameters."""
             self.index_head_dim = index_head_dim
             self.index_n_heads = index_n_heads
             self.index_topk = index_topk
             self.prompt_budget = 1024
+            self.use_cute_dsl_topk = False
+            self.use_cute_dsl_paged_mqa_logits = False
+            self.enable_heuristic_topk = False
+            self.indexer_k_dtype = indexer_k_dtype
 
     sparse_attn_config = SparseAttentionConfig(
         index_head_dim=head_dim,
         index_n_heads=32,  # Default number of heads for indexer
-        index_topk=2048)
+        index_topk=2048,
+        indexer_k_dtype=indexer_k_dtype)
 
     # Create KV cache config
     kv_cache_config = KvCacheConfig(
@@ -114,8 +130,10 @@ def create_indexer(sparse_attn_config, layer_idx=0):
 
     # Create MLAParams
     class MLAParams:
+        """Mock MLA parameters for indexer creation."""
 
         def __init__(self, head_dim):
+            """Initialize MLA params with example hidden size and lora rank."""
             self.hidden_size = 4096  # Example hidden size
             self.q_lora_rank = 512  # Example q_lora_rank
             self.qk_rope_head_dim = 64
@@ -386,24 +404,29 @@ def _create_mock_metadata(request_ids,
                           max_draft_tokens=0,
                           enable_context_mla_with_cached_kv=False,
                           index_topk=2048,
-                          enable_indexer_skip=False):
+                          enable_indexer_skip=False,
+                          use_cute_dsl_paged_mqa_logits=False):
     """Helper to create mock metadata for testing."""
 
     class MockKVCacheParams:
+        """Mock KV cache parameters holding per-sequence cached token counts."""
 
         def __init__(self):
+            """Initialize with the provided num_cached_tokens."""
             self.num_cached_tokens_per_seq = num_cached_tokens
 
     class MockMetadata(DSAtrtllmAttentionMetadata):
+        """Mock DSA attention metadata for unit testing indexer operations."""
 
         def __init__(self):
+            """Initialize mock metadata with buffers, block tables, and indexer state."""
             self.num_sms = deep_gemm.get_num_sms()
             self.request_ids = request_ids
             self.num_contexts = num_contexts
             self.num_generations = num_generations
             self._num_seqs = num_contexts + num_generations
             self.max_draft_tokens = max_draft_tokens
-            self.sparse_mla_topk = index_topk
+            self.num_sparse_topk = index_topk
             self.enable_indexer_skip = enable_indexer_skip
             # Keep seq_lens on CPU for split_prefill_chunks and other CPU operations
             # CUDA kernels will convert to CUDA as needed
@@ -440,6 +463,27 @@ def _create_mock_metadata(request_ids,
             self.scheduler_metadata_buffer = torch.zeros((self.num_sms + 1, 2),
                                                          device='cuda',
                                                          dtype=torch.int32)
+            # DSL needs the next_n=1 schedule preserved (kNumNextNAtoms=1),
+            # so allocate a separate buffer for the full-next_n schedule.
+            # DeepGEMM expects the full-next_n schedule in
+            # `scheduler_metadata_buffer` itself (the alias makes
+            # `Indexer.prepare()`'s second populate overwrite the first).
+            if use_cute_dsl_paged_mqa_logits:
+                self.scheduler_metadata_buffer_full_next_n = torch.zeros(
+                    (self.num_sms + 1, 2), device='cuda', dtype=torch.int32)
+            else:
+                self.scheduler_metadata_buffer_full_next_n = self.scheduler_metadata_buffer
+            # Pre-allocated 2D kv_lens buffer for the DeepGEMM 2D context_lens API.
+            self.kv_lens_cuda_2d = torch.zeros(
+                (self.num_seqs, 1 + self.max_draft_tokens),
+                device='cuda',
+                dtype=torch.int32)
+            if num_generations > 0:
+                gen_kv_lens = kv_lens[num_contexts:num_contexts +
+                                      num_generations].cuda().to(torch.int32)
+                next_n_cap = 1 + self.max_draft_tokens
+                self.kv_lens_cuda_2d[:num_generations, :next_n_cap].copy_(
+                    gen_kv_lens.unsqueeze(-1).expand(-1, next_n_cap))
             self.cu_seqlen_ks = torch.zeros((num_tokens, ),
                                             device='cuda',
                                             dtype=torch.int32)
@@ -506,8 +550,10 @@ def _create_mock_metadata(request_ids,
 
             # Add runtime_features for chunked prefill detection
             class RuntimeFeatures:
+                """Mock runtime features for chunked prefill detection."""
 
                 def __init__(self):
+                    """Initialize runtime features from outer scope parameters."""
                     self.chunked_prefill = enable_context_mla_with_cached_kv
                     self.cache_reuse = False
                     self.has_speculative_draft_tokens = False
@@ -517,10 +563,12 @@ def _create_mock_metadata(request_ids,
             self.runtime_features = RuntimeFeatures()
 
             # Add expanded buffers for MTP support
+            # DSL kernel supports arbitrary next_n natively, so it never needs expansion.
             self.use_expanded_buffers_for_mtp = (
-                (self.max_draft_tokens > 1 and get_sm_version() == 90)
-                or ((self.max_draft_tokens == 2 or self.max_draft_tokens > 3)
-                    and get_sm_version() >= 100))
+                not use_cute_dsl_paged_mqa_logits
+                and ((self.max_draft_tokens > 1 and get_sm_version() == 90) or
+                     ((self.max_draft_tokens == 2 or self.max_draft_tokens > 3)
+                      and get_sm_version() >= 100)))
             self.kv_lens_expanded_cuda = torch.zeros(
                 (self.num_seqs * (1 + self.max_draft_tokens), ),
                 device='cuda',
@@ -536,11 +584,6 @@ def _create_mock_metadata(request_ids,
                 self.block_table_expanded, device='cpu', pin_memory=True)
             self.scheduler_metadata_buffer_expanded = torch.zeros(
                 (self.num_sms + 1, 2), device='cuda', dtype=torch.int32)
-            if self.max_draft_tokens == 3:
-                self.scheduler_metadata_buffer_mtp3 = torch.zeros(
-                    (self.num_sms // 2 + 1, 2),
-                    device='cuda',
-                    dtype=torch.int32)
             if self.use_expanded_buffers_for_mtp:
                 gen_kv_lens = kv_lens[num_contexts:self.num_seqs]
                 gen_kv_lens_expanded = torch.stack([gen_kv_lens] *
@@ -576,13 +619,13 @@ def _create_mock_metadata(request_ids,
 
             # Add skip indexer attributes
             self.topk_indices_buffer = torch.zeros(
-                (num_tokens, self.sparse_mla_topk),
+                (num_tokens, self.num_sparse_topk),
                 device='cuda',
                 dtype=torch.int32)
 
             if self.num_contexts > 0 and self.enable_indexer_skip:
                 self.skip_indexer_for_ctx_reqs = kv_lens[:self.num_contexts].max(
-                ).item() <= self.sparse_mla_topk
+                ).item() <= self.num_sparse_topk
             else:
                 self.skip_indexer_for_ctx_reqs = False
 
@@ -590,7 +633,7 @@ def _create_mock_metadata(request_ids,
                 self.max_draft_tokens + 1
                 self.skip_indexer_for_gen_reqs = kv_lens[
                     self.num_contexts:self.num_seqs].max().item(
-                    ) <= self.sparse_mla_topk
+                    ) <= self.num_sparse_topk
             else:
                 self.skip_indexer_for_gen_reqs = False
             self.prepare_dense_topk_indices(self.kv_lens_cuda_runtime,
@@ -697,7 +740,7 @@ def test_indexer_k_cache_scatter_custom_op():
                              dtype=torch.bfloat16)
     k_fp8, k_scale = fp8_utils.fp8_quantize_1x128_sf_transpose(k_original)
 
-    # Prepare byte-level data
+    # Prepare byte-level data for the Python reference path
     scale_size = k_scale.shape[1] * 4
     k_fp8_bytes = k_fp8.view(-1).view(torch.uint8).view(num_tokens, head_dim)
     k_scale_flat = k_scale.view(-1)
@@ -724,7 +767,7 @@ def test_indexer_k_cache_scatter_custom_op():
     k_cache_python.zero_()
 
     # Print cache properties
-    print(f"\n=== Cache Properties ===")
+    print("\n=== Cache Properties ===")
     print(f"  CUDA (layer {layer_idx_cuda}):")
     print(f"    Shape: {k_cache_cuda.shape}")
     print(f"    Stride: {k_cache_cuda.stride()}")
@@ -735,17 +778,19 @@ def test_indexer_k_cache_scatter_custom_op():
     print(f"    is_contiguous: {k_cache_python.is_contiguous()}")
 
     # ========== Path 1: CUDA Kernel ==========
-    print(f"\n=== Path 1: CUDA Kernel ===")
-    torch.ops.trtllm.indexer_k_cache_scatter_op(k_fp8_bytes, k_scale_bytes,
-                                                k_cache_cuda, flat_indices_fp8,
-                                                flat_indices_scale)
+    print("\n=== Path 1: CUDA Kernel ===")
+    torch.ops.trtllm.indexer_k_cache_scatter_op(k_fp8, k_scale, k_cache_cuda,
+                                                metadata.slot_mapping_fp8,
+                                                metadata.slot_mapping_scale,
+                                                num_tokens)
     torch.cuda.synchronize()
-    print(f"✓ CUDA kernel completed")
+    print("✓ CUDA kernel completed")
 
     # ========== Path 2: Python Reference ==========
-    print(f"\n=== Path 2: Python Reference ===")
+    print("\n=== Path 2: Python Reference ===")
 
     def _unravel_indices(flat_indices, shape):
+        """Convert flat indices to multi-dimensional indices for a 4D tensor."""
         d3 = shape[3]
         i3 = flat_indices % d3
         flat_indices = flat_indices // d3
@@ -775,13 +820,13 @@ def test_indexer_k_cache_scatter_custom_op():
     k_cache_python[scatter_indices_scale] = k_scale_bytes
 
     # ========== Validation: Byte-for-Byte Comparison ==========
-    print(f"\n=== Validation ===")
+    print("\n=== Validation ===")
 
     total_bytes = k_cache_cuda.numel()
 
     # Compare entire cache tensors
     if torch.equal(k_cache_cuda, k_cache_python):
-        print(f"✅ PERFECT MATCH! CUDA and Python produce identical cache")
+        print("✅ PERFECT MATCH! CUDA and Python produce identical cache")
         print(f"  Total bytes compared: {total_bytes}")
         print(
             f"  Tokens: {num_tokens}, head_dim: {head_dim}, block_size: {block_size}"
@@ -896,7 +941,17 @@ def test_fp8_k_cache_roundtrip():
 @pytest.mark.skipif(not has_deep_gemm(), reason="DeepGEMM not available")
 @skip_pre_hopper
 @pytest.mark.parametrize("batch_size,next_n", [(4, 1), (2, 2), (4, 3), (4, 4)])
-def test_indexer_decode_with_paged_kv_cache(batch_size, next_n):
+@pytest.mark.parametrize("backend", [
+    "deepgemm",
+    pytest.param(
+        "dsl",
+        marks=pytest.mark.skipif(
+            get_sm_version() not in (100, 103),
+            reason=
+            f"CuTe DSL FP8 Paged MQA Logits only supports SM 100/103, got SM {get_sm_version()}",
+        )),
+])
+def test_indexer_decode_with_paged_kv_cache(batch_size, next_n, backend):
     """
     Test FP8 paged KV cache with two-phase workflow and variable context lengths.
 
@@ -911,8 +966,8 @@ def test_indexer_decode_with_paged_kv_cache(batch_size, next_n):
     torch.manual_seed(123)
     random.seed(123)
 
-    # Test parameters
-    heads, head_dim = 32, 128
+    use_dsl = backend == "dsl"
+    heads, head_dim = (32, 128)
     block_size = 64
     avg_context_len = 2048
     num_gen_tokens = next_n  # Number of tokens to generate per sequence
@@ -930,7 +985,7 @@ def test_indexer_decode_with_paged_kv_cache(batch_size, next_n):
     final_lens = context_lens_context + num_gen_tokens
     max_seq_len = final_lens.max().item()
 
-    print(f"\n=== Test Config ===")
+    print("\n=== Test Config ===")
     print(
         f"  Batch: {batch_size}, Next_N: {next_n}, Heads: {heads}, Head_dim: {head_dim}"
     )
@@ -970,7 +1025,7 @@ def test_indexer_decode_with_paged_kv_cache(batch_size, next_n):
                              dtype=torch.bfloat16)
 
     # Phase 1: Write context tokens (variable per sequence) as FP8
-    print(f"\n=== Phase 1: Context (variable tokens/seq) ===")
+    print("\n=== Phase 1: Context (variable tokens/seq) ===")
     metadata_context = _create_mock_metadata(
         request_ids,
         batch_size,
@@ -983,6 +1038,7 @@ def test_indexer_decode_with_paged_kv_cache(batch_size, next_n):
         num_ctx_tokens=total_context_tokens,
         num_tokens=total_context_tokens,
         max_draft_tokens=next_n - 1,
+        use_cute_dsl_paged_mqa_logits=use_dsl,
     )
     Indexer.prepare(metadata_context)
 
@@ -1009,6 +1065,7 @@ def test_indexer_decode_with_paged_kv_cache(batch_size, next_n):
         num_ctx_tokens=0,
         num_tokens=batch_size * num_gen_tokens,
         max_draft_tokens=next_n - 1,
+        use_cute_dsl_paged_mqa_logits=use_dsl,
     )
     Indexer.prepare(metadata_gen)
 
@@ -1019,32 +1076,50 @@ def test_indexer_decode_with_paged_kv_cache(batch_size, next_n):
         f"✓ Wrote {batch_size * num_gen_tokens} FP8 generation tokens to cache")
 
     # Run kernel: FP8 paged MQA with actual cache
-    print(f"\n=== Kernel Execution ===")
+    print("\n=== Kernel Execution ===")
     kv_cache_fp8_pool = cache_manager.get_indexer_k_cache_buffers(layer_idx)
     q_fp8 = q.to(torch.float8_e4m3fn)
 
     if not metadata_gen.use_expanded_buffers_for_mtp:
         q_fp8 = q_fp8
-        context_lens = metadata_gen.kv_lens_cuda_runtime[0:batch_size]
+        # New DeepGEMM 2D context_lens API: shape (batch_size, next_n).
+        context_lens = metadata_gen.kv_lens_cuda_2d[0:batch_size, 0:next_n]
         block_table = metadata_gen.indexer_k_cache_block_offsets[0:batch_size]
-        if q_fp8.shape[1] == 4:
-            scheduler_metadata_buffer = metadata_gen.scheduler_metadata_buffer_mtp3
-        else:
-            scheduler_metadata_buffer = metadata_gen.scheduler_metadata_buffer
+        # The upgraded DeepGEMM paged MQA logits kernel picks
+        # num_kv_multicast=1 on SM100 for every next_n it supports
+        # (verified by the _schedule_meta_size assertion in
+        # deepgemm-src/csrc/apis/attention.hpp firing when we try to pass
+        # the legacy (num_sms // 2 + 1, 2) layout). The base scheduler
+        # buffer is the only layout the kernel will accept now. The DSL
+        # path uses its own schedule buffer instead (see below).
+        scheduler_metadata_buffer = metadata_gen.scheduler_metadata_buffer
     else:
         q_fp8 = q_fp8.view(-1, 1, *q_fp8.shape[2:])
         num_tokens = batch_size * next_n
-        context_lens = metadata_gen.kv_lens_expanded_cuda[:num_tokens]
+        # New API requires 2D; each expanded token becomes a (1,) row.
+        context_lens = metadata_gen.kv_lens_expanded_cuda[:num_tokens].view(
+            -1, 1)
         block_table = metadata_gen.block_table_expanded[:num_tokens]
         scheduler_metadata_buffer = metadata_gen.scheduler_metadata_buffer_expanded
 
-    logits = fp8_paged_mqa_logits(q_fp8, kv_cache_fp8_pool, weights,
-                                  context_lens, block_table,
-                                  scheduler_metadata_buffer, max_model_len)
+    if use_dsl:
+        # DSL design: kNumNextNAtoms = 1 for any real next_n. Reuse the base
+        # `scheduler_metadata_buffer` which is also built with num_atoms=1
+        # (from a (num_gen, 1) input shape). 1D contiguous kv_lens slice
+        # suffices for context_lens (all next_n positions share the same KV
+        # length on this path; kernel signature is 1D).
+        dsl_context_lens = metadata_gen.kv_lens_cuda_runtime[0:batch_size]
+        logits = torch.ops.trtllm.cute_dsl_fp8_paged_mqa_logits(
+            q_fp8, kv_cache_fp8_pool, weights, dsl_context_lens, block_table,
+            metadata_gen.scheduler_metadata_buffer, max_model_len)
+    else:
+        logits = fp8_paged_mqa_logits(q_fp8, kv_cache_fp8_pool, weights,
+                                      context_lens, block_table,
+                                      scheduler_metadata_buffer, max_model_len)
     print(f"✓ Kernel output shape: {logits.shape}")
 
     # Reference: Reconstruct BF16 cache from original values
-    print(f"\n=== Reference Computation ===")
+    print("\n=== Reference Computation ===")
     num_blocks = kv_cache_fp8_pool.shape[0]
     kv_cache_bf16 = torch.zeros((num_blocks, block_size, 1, head_dim),
                                 device="cuda",
@@ -1087,7 +1162,7 @@ def test_indexer_decode_with_paged_kv_cache(batch_size, next_n):
     print(f"✓ Reference output shape: {ref_logits.shape}")
 
     # Validate: Compare masked outputs (handle variable lengths and next_n)
-    print(f"\n=== Validation ===")
+    print("\n=== Validation ===")
     context_lens_cuda = metadata_gen.kv_lens_cuda_runtime  # [batch_size]
 
     # Expand context lens for each query: each sequence has next_n queries
@@ -1114,6 +1189,408 @@ def test_indexer_decode_with_paged_kv_cache(batch_size, next_n):
 
     assert diff < 1e-3, f"Accuracy check failed: {diff=}"
     print(f"✅ Test passed! Accuracy: {diff:.6f} < 1e-3")
+    print(
+        f"   Total cache tokens: {final_lens.sum().item()}, Avg: {final_lens.float().mean():.1f}"
+    )
+
+
+@pytest.mark.skipif(not has_deep_gemm(), reason="DeepGEMM not available")
+@skip_pre_blackwell
+@pytest.mark.parametrize("batch_size,next_n", [(4, 1), (2, 2), (4, 3), (4, 4)])
+@pytest.mark.parametrize("backend", [
+    "deepgemm",
+    pytest.param(
+        "dsl",
+        marks=pytest.mark.skipif(
+            get_sm_version() not in (100, 103),
+            reason=(f"CuTe DSL FP4 Paged MQA Logits only supports SM 100/103, "
+                    f"got SM {get_sm_version()}"),
+        )),
+])
+def test_indexer_decode_with_paged_kv_cache_fp4(batch_size, next_n, backend):
+    """FP4 indexer paged decode test (DeepGEMM + CuTe DSL backends).
+
+    Mirrors test_indexer_decode_with_paged_kv_cache but exercises the FP4
+    indexer cache layout end-to-end:
+    - cache_manager built with indexer_k_dtype="fp4"
+    - K/Q quantized via torch.ops.trtllm.fused_cat_fp4 (same CUDA op used
+      by Indexer._prep_q_or_k in dsa.py)
+    - kernel:
+      * "deepgemm" -> deep_gemm.fp8_fp4_paged_mqa_logits (direct path; DG
+        FP4 supports any next_n natively on SM100 via kNextNAtom=1/2)
+      * "dsl"      -> torch.ops.trtllm.cute_dsl_fp4_paged_mqa_logits.
+        The DSL FP4 kernel only supports next_n ∈ {1, 2, 3} natively, so
+        the test caller-side reshapes [B, next_n, ...] -> [B*factor,
+        eff_next_n, ...] via `_pick_dsl_expand` when the wave-aware picker
+        chooses to split (factor > 1).
+    - reference fed FP4-simulated bf16 inputs (dequantize the same FP4
+      bytes the kernel sees) so FP4 quantization noise cancels in the
+      diff check.
+    """
+    # Lazy import: cast_back_from_fp4 is a pure-Python helper in the
+    # kernel-layer FP4 test file. Pulling it in here avoids duplicating
+    # the ~50-line FP4 quant/dequant family. byte-for-byte equivalence
+    # between fused_cat_fp4 and per_token_cast_to_fp4(use_ue8m0=True,
+    # gran_k=32, use_packed_ue8m0=True) is asserted by
+    # test_cpp_custom_ops.py::test_fused_cat_fp4_matches_deepgemm, so
+    # cast_back_from_fp4 can decode fused_cat_fp4's outputs directly.
+    from test_cute_dsl_fp4_paged_mqa_logits import cast_back_from_fp4
+
+    from tensorrt_llm._torch.attention_backend.sparse.dsa import \
+        _pick_dsl_expand
+    from tensorrt_llm.deep_gemm import fp8_fp4_paged_mqa_logits
+
+    use_dsl = backend == "dsl"
+
+    torch.manual_seed(123)
+    random.seed(123)
+
+    # DG FP4 kernel requires head_dim=128 and num_heads ∈ {32, 64}.
+    heads, head_dim = (64, 128)
+    pe_dim = head_dim // 2
+    block_size = 64
+    avg_context_len = 2048
+    num_gen_tokens = next_n
+    max_model_len = 4096
+    layer_idx = 0
+
+    # Generate variable context lengths per sequence
+    context_lens_context = torch.randint(int(0.7 * avg_context_len),
+                                         int(1.4 * avg_context_len),
+                                         (batch_size, ),
+                                         dtype=torch.int32,
+                                         device="cpu")
+    final_lens = context_lens_context + num_gen_tokens
+
+    print("\n=== Test Config (FP4) ===")
+    print(
+        f"  Batch: {batch_size}, Next_N: {next_n}, Heads: {heads}, Head_dim: {head_dim}"
+    )
+    print(f"  Context lengths: {context_lens_context.tolist()}")
+    print(f"  Final lengths: {final_lens.tolist()}")
+
+    # Setup: FP4 cache manager + indexer
+    cache_manager, sparse_attn_config = create_dsa_cache_manager(
+        batch_size=batch_size,
+        head_dim=head_dim,
+        tokens_per_block=block_size,
+        max_seq_len=max_model_len,
+        num_layers=1,
+        indexer_k_dtype="fp4",
+    )
+    indexer = create_indexer(sparse_attn_config, layer_idx=layer_idx)
+
+    request_ids = list(range(batch_size))
+    cache_manager.add_dummy_requests(request_ids=request_ids,
+                                     token_nums=final_lens.tolist(),
+                                     is_gen=False,
+                                     prepare_resource=True)
+
+    total_context_tokens = context_lens_context.sum().item()
+    q = torch.randn((batch_size, next_n, heads, head_dim),
+                    device="cuda",
+                    dtype=torch.bfloat16)
+    weights = torch.randn((batch_size * next_n, heads),
+                          device="cuda",
+                          dtype=torch.float32)
+    k_context_bf16 = torch.randn((total_context_tokens, head_dim),
+                                 device="cuda",
+                                 dtype=torch.bfloat16)
+    k_gen_bf16 = torch.randn((batch_size * num_gen_tokens, head_dim),
+                             device="cuda",
+                             dtype=torch.bfloat16)
+
+    def _force_direct_path(meta):
+        """Reconfigure mock metadata so Indexer.prepare populates the direct
+        path's next_n>1 schedule.
+
+        DG FP4 supports any next_n natively on SM100 via kNextNAtom=1/2.
+        But the mock helper derives `use_expanded_buffers_for_mtp` from
+        the OLD FP8 limits and aliases `scheduler_metadata_buffer_full_next_n`
+        to the base buffer when expand mode is on — both of which would
+        leave the direct-path schedule unpopulated. Override:
+          - use_expanded_buffers_for_mtp = False (so the next_n=1 +
+            _full_next_n populate path in Indexer.prepare fires)
+          - re-allocate _full_next_n as a separate tensor (so the second
+            populate doesn't clobber the first)
+        """
+        meta.use_expanded_buffers_for_mtp = False
+        meta.scheduler_metadata_buffer_full_next_n = torch.zeros(
+            (meta.num_sms + 1, 2), device='cuda', dtype=torch.int32)
+
+    def _force_dsl_expand_setup(meta):
+        """Mirror DSAtrtllmAttentionMetadata.prepare's `expand_for_dsl`
+        populate so Indexer.prepare can build the schedule from
+        kv_lens_expanded_cuda. Calls the wave-aware picker; expand only
+        happens when factor > 1.
+
+        Always sets `expand_for_dsl=True` (analogous to dsa.py's prepare)
+        and writes the picker decision to `dsl_expand_factor`/`dsl_atom` so
+        downstream Indexer.prepare + forward read the same values.
+        """
+        if meta.num_generations == 0:
+            return
+        meta.expand_for_dsl = True
+        next_n = 1 + meta.max_draft_tokens
+        # FP4 kernel supports atoms ∈ {1, 2, 3}; matches dsa.py's
+        # `kernel_atoms = (1, 2, 3) if use_fp4 else (1, 2, 3, 4)` path.
+        gen_kv_lens = meta.kv_lens[meta.num_contexts:meta.num_seqs]
+        max_ctx = int(gen_kv_lens.max().item()) if gen_kv_lens.numel() else 0
+        factor, atom = _pick_dsl_expand(
+            next_n,
+            batch_size=meta.num_generations,
+            max_ctx=max_ctx,
+            num_sms=meta.num_sms,
+            kernel_atoms=(1, 2, 3),
+        )
+        meta.dsl_expand_factor = factor
+        meta.dsl_atom = atom
+        if factor <= 1:
+            # Picker chose kernel-native; no buffer populate needed.
+            return
+        num_tokens = meta.num_generations * factor
+        gen_kv_lens_expanded = gen_kv_lens.repeat_interleave(factor)
+        meta.kv_lens_expanded_host[:num_tokens].copy_(gen_kv_lens_expanded)
+        meta.kv_lens_expanded_cuda[:num_tokens].copy_(
+            meta.kv_lens_expanded_host[:num_tokens], non_blocking=True)
+        # block_table: repeat each row `factor` times.
+        max_len = meta.host_indexer_k_cache_block_offsets.shape[1]
+        gen_block_tensor = meta.host_indexer_k_cache_block_offsets[
+            meta.num_contexts:meta.num_seqs, :max_len]
+        expanded_blocks = gen_block_tensor.repeat_interleave(factor, dim=0)
+        meta.host_block_table_expanded[:num_tokens, :max_len].copy_(
+            expanded_blocks, non_blocking=True)
+        meta.block_table_expanded[:num_tokens].copy_(
+            meta.host_block_table_expanded[:num_tokens], non_blocking=True)
+        meta.block_table_expanded.clamp_(min=0)
+
+    # ---- Phase 1: write context tokens as FP4 ----
+    print(f"\n=== Phase 1: Context (variable tokens/seq) ({backend}) ===")
+    metadata_context = _create_mock_metadata(
+        request_ids,
+        batch_size,
+        num_contexts=batch_size,
+        num_generations=0,
+        seq_lens=context_lens_context.clone(),
+        kv_lens=context_lens_context.clone(),
+        num_cached_tokens=[0] * batch_size,
+        cache_manager=cache_manager,
+        num_ctx_tokens=total_context_tokens,
+        num_tokens=total_context_tokens,
+        max_draft_tokens=next_n - 1,
+        use_cute_dsl_paged_mqa_logits=use_dsl,
+    )
+    if not use_dsl:
+        _force_direct_path(metadata_context)
+    Indexer.prepare(metadata_context)
+
+    # Real path: split K at head_dim//2 + fused_cat_fp4 (mirrors
+    # Indexer._prep_q_or_k at dsa.py:2046-2050).
+    k_context_fp4, k_context_scale = torch.ops.trtllm.fused_cat_fp4(
+        k_context_bf16[:, :pe_dim].contiguous(),
+        k_context_bf16[:, pe_dim:].contiguous(),
+    )
+    indexer._update_k_cache(k_context_fp4, k_context_scale, metadata_context)
+    print(f"✓ Wrote {total_context_tokens} FP4 context tokens to cache")
+
+    # ---- Phase 2: write generation tokens as FP4 ----
+    print(f"\n=== Phase 2: Generation ({num_gen_tokens} tokens/seq) ===")
+    metadata_gen = _create_mock_metadata(
+        request_ids,
+        batch_size,
+        num_contexts=0,
+        num_generations=batch_size,
+        seq_lens=torch.tensor([num_gen_tokens] * batch_size,
+                              dtype=torch.int32,
+                              device='cpu'),
+        kv_lens=final_lens.clone(),
+        num_cached_tokens=context_lens_context.tolist(),
+        cache_manager=cache_manager,
+        num_ctx_tokens=0,
+        num_tokens=batch_size * num_gen_tokens,
+        max_draft_tokens=next_n - 1,
+        use_cute_dsl_paged_mqa_logits=use_dsl,
+    )
+    if not use_dsl:
+        _force_direct_path(metadata_gen)
+    else:
+        # Unconditional for DSL: picker inside decides factor (1 = native,
+        # >1 = atom-split). Mirrors dsa.py's `if expand_for_dsl and
+        # num_generations > 0` block which runs for any next_n ≥ 2.
+        _force_dsl_expand_setup(metadata_gen)
+    Indexer.prepare(metadata_gen)
+
+    k_gen_fp4, k_gen_scale = torch.ops.trtllm.fused_cat_fp4(
+        k_gen_bf16[:, :pe_dim].contiguous(),
+        k_gen_bf16[:, pe_dim:].contiguous(),
+    )
+    indexer._update_k_cache(k_gen_fp4, k_gen_scale, metadata_gen)
+    print(
+        f"✓ Wrote {batch_size * num_gen_tokens} FP4 generation tokens to cache")
+
+    # ---- Quantize Q to FP4 ----
+    q_flat = q.view(-1, head_dim)
+    q_fp4_flat, q_scale_flat = torch.ops.trtllm.fused_cat_fp4(
+        q_flat[:, :pe_dim].contiguous(),
+        q_flat[:, pe_dim:].contiguous(),
+    )
+    # DG fp8_fp4_paged_mqa_logits expects (q_fp4: int8 [B,next_n,H,D//2],
+    # sf_q: int32 [B,next_n,H]).
+    q_fp4 = q_fp4_flat.view(batch_size, next_n, heads, pe_dim)
+    sf_q = q_scale_flat.view(batch_size, next_n, heads)
+
+    # ---- Kernel call ----
+    print(f"\n=== Kernel Execution ({backend.upper()} FP4) ===")
+    kv_cache_fp4_pool = cache_manager.get_indexer_k_cache_buffers(layer_idx)
+
+    if use_dsl:
+        # DSL FP4 path: q tuple split into two args, q.dtype == uint8.
+        # The picker decision (factor, atom) was cached on metadata_gen
+        # in `_force_dsl_expand_setup`; expand only when factor > 1.
+        # The wiring under test is dsa.py's sparse_attn_indexer DSL FP4 branch.
+        dsl_q = q_fp4.view(torch.uint8)
+        dsl_sf_q = sf_q
+        dsl_context_lens = metadata_gen.kv_lens_cuda_runtime[0:batch_size]
+        dsl_block_table = metadata_gen.indexer_k_cache_block_offsets[
+            0:batch_size]
+        dsl_schedule_meta = metadata_gen.scheduler_metadata_buffer
+
+        if metadata_gen.dsl_expand_factor > 1:
+            factor = metadata_gen.dsl_expand_factor
+            eff_next_n = metadata_gen.dsl_atom
+            exp_B = batch_size * factor
+            dsl_q = dsl_q.reshape(exp_B, eff_next_n, heads, pe_dim)
+            dsl_sf_q = dsl_sf_q.reshape(exp_B, eff_next_n, heads)
+            dsl_context_lens = metadata_gen.kv_lens_expanded_cuda[:exp_B]
+            dsl_block_table = metadata_gen.block_table_expanded[:exp_B]
+            dsl_schedule_meta = (
+                metadata_gen.scheduler_metadata_buffer_expanded)
+
+        logits = torch.ops.trtllm.cute_dsl_fp4_paged_mqa_logits(
+            dsl_q,
+            dsl_sf_q,
+            kv_cache_fp4_pool,
+            weights,
+            dsl_context_lens,
+            dsl_block_table,
+            dsl_schedule_meta,
+            max_model_len,
+        )
+    else:
+        # DG FP4 direct path: DG supports any next_n natively on SM100 via
+        # kNextNAtom=(kNextN % 2 == 0) ? 2 : 1, so we always pass the
+        # original (B, next_n, ...) shape (no expand). dsa.py's
+        # use_expanded_buffers_for_mtp gate (lines 962-966) inherits FP8's
+        # next_n limit and is overly conservative for FP4; fixing it is
+        # out of scope here.
+        context_lens_2d = metadata_gen.kv_lens_cuda_2d[0:batch_size, 0:next_n]
+        block_table_kernel = metadata_gen.indexer_k_cache_block_offsets[
+            0:batch_size]
+        # Schedule buffer: next_n=1 uses the base buffer (built from
+        # (num_gen, 1)); next_n>1 uses the _full_next_n variant (built from
+        # (num_gen, next_n) so num_next_n_atoms encodes the real next_n).
+        if next_n == 1:
+            scheduler_metadata = metadata_gen.scheduler_metadata_buffer
+        else:
+            scheduler_metadata = (
+                metadata_gen.scheduler_metadata_buffer_full_next_n)
+
+        logits = fp8_fp4_paged_mqa_logits(
+            (q_fp4, sf_q),
+            kv_cache_fp4_pool,
+            weights,
+            context_lens_2d,
+            block_table_kernel,
+            scheduler_metadata,
+            max_model_len,
+            logits_dtype=torch.float32,
+        )
+    print(f"✓ Kernel output shape: {logits.shape}")
+
+    # ---- Reference: dequantize FP4 → simulated bf16 → fp32 matmul ----
+    print("\n=== Reference Computation (FP4-simulated) ===")
+    # FP4 packs UE8M0 with gran_k=32 (4 scales per token at head_dim=128);
+    # fused_cat_fp4 packs those 4 UE8M0 exponents into 1 int32 (use_packed_ue8m0=True).
+    q_simulated = cast_back_from_fp4(
+        q_fp4_flat,
+        q_scale_flat,
+        gran_k=32,
+        use_packed_ue8m0=True,
+    ).view(batch_size, next_n, heads, head_dim)
+    k_context_sim = cast_back_from_fp4(
+        k_context_fp4,
+        k_context_scale,
+        gran_k=32,
+        use_packed_ue8m0=True,
+    )
+    k_gen_sim = cast_back_from_fp4(
+        k_gen_fp4,
+        k_gen_scale,
+        gran_k=32,
+        use_packed_ue8m0=True,
+    )
+
+    # Reconstruct simulated KV cache in [num_blocks, block_size, 1, head_dim].
+    # Use fp32 directly so the ref matmul stays in fp32; bf16 matmul noise
+    # would dominate the FP4 quantization noise we're trying to cancel.
+    num_blocks = kv_cache_fp4_pool.shape[0]
+    kv_cache_sim = torch.zeros((num_blocks, block_size, 1, head_dim),
+                               device="cuda",
+                               dtype=torch.float32)
+    context_offset = 0
+    gen_offset = 0
+    for seq_idx in range(batch_size):
+        seq_context_len = context_lens_context[seq_idx].item()
+        for token_pos in range(seq_context_len):
+            block_idx = token_pos // block_size
+            pos_in_block = token_pos % block_size
+            physical_block_id = metadata_gen.indexer_k_cache_block_offsets[
+                seq_idx, block_idx].item()
+            if physical_block_id >= 0:
+                kv_cache_sim[physical_block_id, pos_in_block, 0, :] = \
+                    k_context_sim[context_offset + token_pos]
+        for gen_token_idx in range(num_gen_tokens):
+            token_pos = seq_context_len + gen_token_idx
+            block_idx = token_pos // block_size
+            pos_in_block = token_pos % block_size
+            physical_block_id = metadata_gen.indexer_k_cache_block_offsets[
+                seq_idx, block_idx].item()
+            if physical_block_id >= 0:
+                kv_cache_sim[physical_block_id, pos_in_block, 0, :] = \
+                    k_gen_sim[gen_offset + gen_token_idx]
+        context_offset += seq_context_len
+        gen_offset += num_gen_tokens
+
+    ref_logits = _ref_fp8_paged_mqa_logits(
+        q_simulated.float(),
+        kv_cache_sim,
+        weights,
+        metadata_gen.kv_lens_cuda_runtime[0:batch_size],
+        metadata_gen.indexer_k_cache_block_offsets,
+        max_model_len,
+    )
+    print(f"✓ Reference output shape: {ref_logits.shape}")
+
+    # ---- Validation ----
+    print("\n=== Validation ===")
+    context_lens_cuda = metadata_gen.kv_lens_cuda_runtime
+    positions = torch.arange(max_model_len, device="cuda").unsqueeze(0)
+    row_indices = torch.arange(batch_size * next_n, device="cuda") // next_n
+    next_n_offset = torch.arange(batch_size * next_n, device="cuda") % next_n
+    query_end_positions = (context_lens_cuda[row_indices] - next_n +
+                           next_n_offset)
+    mask = positions <= query_end_positions.unsqueeze(1)
+
+    diff = _calc_diff(
+        logits.float().masked_fill(~mask, 0),
+        ref_logits.float().masked_fill(~mask, 0),
+    )
+    # FP4 quantization noise dominates; kernel-layer FP4 test uses 0.02
+    # cosine-style diff (test_cute_dsl_fp4_paged_mqa_logits.py:493).
+    # Match that threshold here.
+    assert diff < 0.02, (
+        f"FP4 accuracy check failed ({backend}): diff={diff:.6f}")
+    print(f"✅ FP4 Test passed ({backend})! diff={diff:.6f} < 0.02")
     print(
         f"   Total cache tokens: {final_lens.sum().item()}, Avg: {final_lens.float().mean():.1f}"
     )
@@ -1412,7 +1889,7 @@ def test_split_prefill_chunks(max_chunk_size, seq_lens, start_idx,
         assert chunk_groups[i] == expected, \
             f"Chunk {i} mismatch:\nGot:      {chunk_groups[i]}\nExpected: {expected}"
 
-    print(f"✅ test_split_prefill_chunks passed")
+    print("✅ test_split_prefill_chunks passed")
 
 
 @pytest.mark.skipif(not has_deep_gemm(), reason="DeepGEMM not available")
@@ -1485,7 +1962,7 @@ def test_indexer_chunked_prefill(chunk_size, seq_lens_list, chunking_type):
                           for i, seq_len in enumerate(seq_lens_list)
                           if seq_len > chunk_size]
         if large_requests:
-            print(f"  Large requests (Q-block splitting):")
+            print("  Large requests (Q-block splitting):")
             for req_idx, seq_len in large_requests:
                 num_q_blocks = (seq_len + chunk_size - 1) // chunk_size
                 print(
@@ -1528,7 +2005,7 @@ def test_indexer_chunked_prefill(chunk_size, seq_lens_list, chunking_type):
     k_fp8, k_scale = fp8_utils.fp8_quantize_1x128_sf_transpose(k)
 
     # ========== Test Path 1: Chunked Prefill ==========
-    print(f"\n=== Chunked Path ===")
+    print("\n=== Chunked Path ===")
 
     metadata_chunked = _create_mock_metadata(
         request_ids,
@@ -1566,7 +2043,7 @@ def test_indexer_chunked_prefill(chunk_size, seq_lens_list, chunking_type):
     print(f"✓ Chunked execution completed, shape: {topk_indices_chunked.shape}")
 
     # ========== Test Path 2: Non-chunked Baseline ==========
-    print(f"\n=== Non-chunked Baseline ===")
+    print("\n=== Non-chunked Baseline ===")
 
     metadata_baseline = _create_mock_metadata(
         request_ids,
@@ -1600,7 +2077,7 @@ def test_indexer_chunked_prefill(chunk_size, seq_lens_list, chunking_type):
     )
 
     # ========== Validation ==========
-    print(f"\n=== Validation ===")
+    print("\n=== Validation ===")
 
     # Use Jaccard similarity to handle ties (multiple indices with same value)
     num_exact_matches = 0
@@ -1640,7 +2117,7 @@ def test_indexer_chunked_prefill(chunk_size, seq_lens_list, chunking_type):
     high_similarity_ratio = (num_exact_matches +
                              num_high_similarity) / total_tokens
 
-    print(f"  Results:")
+    print("  Results:")
     print(
         f"    Exact matches: {num_exact_matches}/{total_tokens} ({exact_match_ratio:.1%})"
     )
@@ -2240,7 +2717,7 @@ def test_indexer_topk_multi_request_with_different_cache(enable_indexer_skip):
     total_kv_lens = [seq_lens[i] + cached_tokens[i] for i in range(batch_size)]
     total_tokens = sum(seq_lens)
 
-    print(f"\n=== Test: Multi-request with different cache ===")
+    print("\n=== Test: Multi-request with different cache ===")
     print(
         f"  Req0: {cached_tokens[0]} cached + {seq_lens[0]} new = {total_kv_lens[0]} total"
     )
@@ -2345,9 +2822,9 @@ def test_indexer_topk_multi_request_with_different_cache(enable_indexer_skip):
                                                         use_custom_topk=True)
 
     # Validate: custom and fallback should match
-    print(f"\n=== Validation ===")
+    print("\n=== Validation ===")
 
-    print(f"Checking for invalid negative indices:")
+    print("Checking for invalid negative indices:")
     for tok_id in [0, 255, 256, 492]:  # First/last of each request
         num_valid_custom = (topk_custom[tok_id] >= 0).sum().item()
         num_valid_fallback = (topk_fallback[tok_id] >= 0).sum().item()
@@ -2364,11 +2841,11 @@ def test_indexer_topk_multi_request_with_different_cache(enable_indexer_skip):
             )
             if has_invalid:
                 print(
-                    f"    ⚠️ INVALID: Custom has negative indices < -1 (kernel bug!)"
+                    "    ⚠️ INVALID: Custom has negative indices < -1 (kernel bug!)"
                 )
 
     # Check tokens with large windows (>= 2048) should have exactly 2048 valid indices
-    print(f"\n=== Check: Large windows must have 2048 valid ===")
+    print("\n=== Check: Large windows must have 2048 valid ===")
     from tensorrt_llm._torch.attention_backend.sparse.dsa import \
         compute_cu_seqlen_kv_bounds_with_cache
     host_seq_lens = torch.tensor(seq_lens, dtype=torch.int32, device='cpu')
@@ -2409,3 +2886,56 @@ def test_indexer_topk_multi_request_with_different_cache(enable_indexer_skip):
         )
         assert avg_similarity >= 0.95, \
             f"Custom vs indexer skip differ: avg similarity {avg_similarity:.4f} < 0.95"
+
+
+class TestPrepareRestoreAttnMetadataForDraftReplay:
+    """Tests for prepare_attn_metadata_for_draft_replay and
+    restore_attn_metadata_after_draft_replay."""
+
+    @staticmethod
+    def _make_mock_metadata():
+        """Create a mock attention metadata object with KV cache block offsets."""
+        meta = Mock()
+        meta.kv_cache_manager = Mock(name="target_kv_cache_manager")
+        meta.kv_cache_block_offsets = torch.tensor([10, 20, 30])
+        meta.host_kv_cache_block_offsets = torch.tensor([10, 20, 30])
+        meta.draft_kv_cache_block_offsets = torch.tensor([100, 200, 300])
+        return meta
+
+    @staticmethod
+    def _make_mock_draft_manager():
+        """Create a mock draft KV cache manager with host block offsets."""
+        mgr = Mock(name="draft_kv_cache_manager")
+        mgr.host_kv_cache_block_offsets = torch.tensor([100, 200, 300])
+        return mgr
+
+    def test_prepare_swaps_and_restore_recovers(self):
+        """Test that prepare swaps KV manager and restore recovers original state."""
+        from tensorrt_llm._torch.attention_backend.trtllm import \
+            TrtllmAttentionMetadata
+
+        meta = self._make_mock_metadata()
+        mgr = self._make_mock_draft_manager()
+        original_kv_mgr = meta.kv_cache_manager
+        original_offsets = meta.kv_cache_block_offsets.clone()
+        original_host_offsets = meta.host_kv_cache_block_offsets.clone()
+
+        with patch('tensorrt_llm._torch.speculative.interface.isinstance',
+                   side_effect=lambda obj, cls:
+                   (obj is meta if cls is TrtllmAttentionMetadata else False
+                    if cls.__name__ == 'DSAtrtllmAttentionMetadata' else
+                    builtins.isinstance(obj, cls))):
+            saved = prepare_attn_metadata_for_draft_replay(meta, mgr)
+
+        assert saved is not None
+        assert saved['target_kv_cache_manager'] is original_kv_mgr
+        assert meta.kv_cache_manager is mgr
+        assert 'saved_dsa_state' not in saved
+
+        restore_attn_metadata_after_draft_replay(meta, saved)
+
+        assert meta.kv_cache_manager is original_kv_mgr
+        torch.testing.assert_close(meta.kv_cache_block_offsets,
+                                   original_offsets)
+        torch.testing.assert_close(meta.host_kv_cache_block_offsets,
+                                   original_host_offsets)

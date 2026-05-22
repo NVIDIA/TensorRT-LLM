@@ -18,6 +18,191 @@ import triton.language as tl
 
 
 @triton.jit
+def rope_fwd_interleaved_kernel(
+    q_ptr,  # [B, S, H_Q, D] input Q (interleaved layout)
+    k_ptr,  # [B, S, H_K, D] input K (interleaved layout)
+    cos_cache_ptr,  # [max_seq_len, D] cos cache
+    sin_cache_ptr,  # [max_seq_len, D] sin cache
+    position_ids_ptr,  # [B, S] position IDs
+    q_out_ptr,  # [B, S, H_Q, D] output Q
+    k_out_ptr,  # [B, S, H_K, D] output K
+    B,  # batch size
+    S,  # sequence length
+    H_Q,  # number of Q heads
+    H_K,  # number of K heads (typically 1 for MQA)
+    D: tl.constexpr,  # head dimension
+    stride_qb,  # Q batch stride
+    stride_qs,  # Q seq stride
+    stride_qh,  # Q head stride
+    stride_qd,  # Q dim stride
+    stride_kb,  # K batch stride
+    stride_ks,  # K seq stride
+    stride_kh,  # K head stride
+    stride_kd,  # K dim stride
+    stride_pos_b,  # position_ids batch stride
+    stride_pos_s,  # position_ids seq stride
+    stride_cache_s,  # cache seq stride
+    stride_cache_d,  # cache dim stride
+    BLOCK_SIZE_H: tl.constexpr,
+    BLOCK_SIZE_S: tl.constexpr,
+):
+    """
+    Fused RoPE kernel for DeepSeek-style interleaved Q/K inputs.
+
+    Input layout (interleaved): [q0_r, q0_i, q1_r, q1_i, ...]
+    After de-interleave: [q0_r, q1_r, ..., q0_i, q1_i, ...]
+
+    This kernel does:
+    1. Position ID lookup for cos/sin
+    2. Reads even and odd indices directly from the interleaved input using strided loads
+    3. RoPE application directly on the separated a/b values: y_first = a*cos - b*sin, y_second = b*cos + a*sin
+    4. Writes the output in contiguous "half-split" layout — first half and second half stored separately
+
+    Grid: (B, cdiv(H_Q, BLOCK_SIZE_H), cdiv(S, BLOCK_SIZE_S))
+    """
+    D2: tl.constexpr = D // 2
+    D2_PADDED: tl.constexpr = triton.next_power_of_2(D2)
+
+    # Program IDs
+    batch_id = tl.program_id(0)
+    head_block_id = tl.program_id(1)
+    seq_block_id = tl.program_id(2)
+
+    # Head offsets and mask
+    head_offsets = head_block_id * BLOCK_SIZE_H + tl.arange(0, BLOCK_SIZE_H)
+    head_mask = head_offsets < H_Q
+
+    # Sequence offsets and mask
+    seq_offsets = seq_block_id * BLOCK_SIZE_S + tl.arange(0, BLOCK_SIZE_S)
+    seq_mask = seq_offsets < S
+
+    # Dimension offsets for half the head dim (we read pairs)
+    dim_offsets = tl.arange(0, D2_PADDED)
+    dim_mask = dim_offsets < D2
+
+    # ========== LOAD POSITION IDS ==========
+    # position_ids: [B, S]
+    pos_ptr = position_ids_ptr + batch_id * stride_pos_b + seq_offsets * stride_pos_s
+    pos_ids = tl.load(pos_ptr, mask=seq_mask, other=0)  # [BLOCK_SIZE_S]
+
+    # ========== LOAD COS/SIN FROM CACHE ==========
+    # cos_cache, sin_cache: [max_seq_len, D]
+    # For each position, load the corresponding cos/sin values
+    # We need cos/sin for both halves of head_dim
+    cache_offsets = (
+        pos_ids[:, None] * stride_cache_s + dim_offsets[None, :] * stride_cache_d
+    )  # [BLOCK_SIZE_S, D2_PADDED]
+
+    cache_mask = seq_mask[:, None] & dim_mask[None, :]  # [BLOCK_SIZE_S, D2_PADDED]
+
+    cos_first = tl.load(cos_cache_ptr + cache_offsets, mask=cache_mask)  # [BLOCK_SIZE_S, D2_PADDED]
+    sin_first = tl.load(sin_cache_ptr + cache_offsets, mask=cache_mask)  # [BLOCK_SIZE_S, D2_PADDED]
+
+    # Second half of cos/sin (offset by D2)
+    cache_offsets_second = (
+        pos_ids[:, None] * stride_cache_s + (dim_offsets[None, :] + D2) * stride_cache_d
+    )
+    cos_second = tl.load(cos_cache_ptr + cache_offsets_second, mask=cache_mask)
+    sin_second = tl.load(sin_cache_ptr + cache_offsets_second, mask=cache_mask)
+
+    # ========== PROCESS Q ==========
+    # Q layout: [B, S, H, D] with interleaved D
+    # Read even indices (a) and odd indices (b) for de-interleaving
+    # Input: [q0_r, q0_i, q1_r, q1_i, ...] -> a=[q0_r, q1_r, ...], b=[q0_i, q1_i, ...]
+
+    q_base = batch_id * stride_qb
+
+    # Compute offsets for reading interleaved data
+    # even_offsets: positions 0, 2, 4, ... (stride 2)
+    # odd_offsets: positions 1, 3, 5, ... (stride 2)
+    q_offsets_base = (
+        seq_offsets[:, None, None] * stride_qs
+        + head_offsets[None, :, None] * stride_qh
+        + dim_offsets[None, None, :] * 2 * stride_qd  # stride 2 for interleaved
+    )  # [BLOCK_SIZE_S, BLOCK_SIZE_H, D2_PADDED]
+
+    even_offsets = q_base + q_offsets_base
+    odd_offsets = q_base + q_offsets_base + stride_qd
+
+    # Combined mask
+    load_mask = seq_mask[:, None, None] & head_mask[None, :, None] & dim_mask[None, None, :]
+
+    # Load Q values (even = a, odd = b)
+    q_a = tl.load(q_ptr + even_offsets, mask=load_mask)  # [BLOCK_SIZE_S, BLOCK_SIZE_H, D2_PADDED]
+    q_b = tl.load(q_ptr + odd_offsets, mask=load_mask)  # [BLOCK_SIZE_S, BLOCK_SIZE_H, D2_PADDED]
+
+    # Broadcast cos/sin for heads: [BLOCK_SIZE_S, D2_PADDED] -> [BLOCK_SIZE_S, 1, D2_PADDED]
+    cos_first_bc = cos_first[:, None, :]
+    sin_first_bc = sin_first[:, None, :]
+    cos_second_bc = cos_second[:, None, :]
+    sin_second_bc = sin_second[:, None, :]
+
+    # Apply RoPE formula
+    # y_first_half = a * cos - b * sin
+    # y_second_half = b * cos + a * sin
+    q_y1 = q_a * cos_first_bc - q_b * sin_first_bc
+    q_y2 = q_b * cos_second_bc + q_a * sin_second_bc
+
+    # Store Q output (CONTIGUOUS layout)
+    # Output layout: [B, S, H_Q, D] with first half = y1, second half = y2
+    # Compute contiguous strides: stride_b=S*H_Q*D, stride_s=H_Q*D, stride_h=D, stride_d=1
+    q_out_stride_b = S * H_Q * D
+    q_out_stride_s = H_Q * D
+    q_out_stride_h = D
+    q_out_offsets_first = (
+        batch_id * q_out_stride_b
+        + seq_offsets[:, None, None] * q_out_stride_s
+        + head_offsets[None, :, None] * q_out_stride_h
+        + dim_offsets[None, None, :]  # stride_d = 1
+    )
+    q_out_offsets_second = q_out_offsets_first + D2  # D2 * 1
+
+    tl.store(q_out_ptr + q_out_offsets_first, q_y1, mask=load_mask)
+    tl.store(q_out_ptr + q_out_offsets_second, q_y2, mask=load_mask)
+
+    # ========== PROCESS K ==========
+    # K typically has H_K=1 for MQA, but we handle general case
+    # Use head_offsets < H_K for K's mask
+    head_mask_k = head_offsets < H_K
+
+    k_base = batch_id * stride_kb
+
+    k_offsets_base = (
+        seq_offsets[:, None, None] * stride_ks
+        + head_offsets[None, :, None] * stride_kh
+        + dim_offsets[None, None, :] * 2 * stride_kd
+    )
+
+    k_even_offsets = k_base + k_offsets_base
+    k_odd_offsets = k_base + k_offsets_base + stride_kd
+
+    load_mask_k = seq_mask[:, None, None] & head_mask_k[None, :, None] & dim_mask[None, None, :]
+
+    k_a = tl.load(k_ptr + k_even_offsets, mask=load_mask_k)
+    k_b = tl.load(k_ptr + k_odd_offsets, mask=load_mask_k)
+
+    k_y1 = k_a * cos_first_bc - k_b * sin_first_bc
+    k_y2 = k_b * cos_second_bc + k_a * sin_second_bc
+
+    # Store K output (CONTIGUOUS layout)
+    # Output layout: [B, S, H_K, D] with first half = y1, second half = y2
+    # Compute contiguous strides: stride_b=S*H_K*D, stride_s=H_K*D, stride_h=D, stride_d=1
+    k_out_stride_b = S * H_K * D
+    k_out_stride_s = H_K * D
+    k_out_stride_h = D
+    k_out_offsets_first = (
+        batch_id * k_out_stride_b
+        + seq_offsets[:, None, None] * k_out_stride_s
+        + head_offsets[None, :, None] * k_out_stride_h
+        + dim_offsets[None, None, :]  # stride_d = 1
+    )
+    k_out_offsets_second = k_out_offsets_first + D2  # D2 * 1
+
+    tl.store(k_out_ptr + k_out_offsets_first, k_y1, mask=load_mask_k)
+    tl.store(k_out_ptr + k_out_offsets_second, k_y2, mask=load_mask_k)
+
+
+@triton.jit
 def rope_fwd_kernel(
     x_ptr,
     input_pos_ptr,

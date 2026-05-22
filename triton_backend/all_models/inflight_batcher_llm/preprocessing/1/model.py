@@ -111,7 +111,8 @@ class TritonPythonModel:
                                                        trust_remote_code=True)
 
         if isinstance(self.tokenizer, T5Tokenizer):
-            self.tokenizer_bos_id = self.tokenizer.sp_model.bos_id()
+            bos_id = self.tokenizer.bos_token_id
+            self.tokenizer_bos_id = bos_id if bos_id is not None else -1
 
         if not self.tokenizer.pad_token:
             self.tokenizer.pad_token = self.tokenizer.eos_token

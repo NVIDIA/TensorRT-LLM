@@ -1,17 +1,52 @@
 import tempfile
+from collections import defaultdict
+from dataclasses import is_dataclass
+from enum import Enum
+from pathlib import Path
+from typing import Annotated, Any, Literal, get_args, get_origin
 
 import pydantic_core
 import pytest
 import yaml
+from pydantic import BaseModel, TypeAdapter, ValidationError
+from utils.llm_data import llm_models_root
+from utils.util import force_ampere
 
 import tensorrt_llm.bindings.executor as tle
+import tensorrt_llm.llmapi.llm_args as llm_args_mod
 from tensorrt_llm import LLM as TorchLLM
 from tensorrt_llm._tensorrt_engine import LLM
+from tensorrt_llm._torch.auto_deploy.llm_args import \
+    LlmArgs as AutoDeployLlmArgs
+from tensorrt_llm._torch.model_config import ModelConfig
+from tensorrt_llm._torch.models.modeling_llama import LlamaForCausalLM
+from tensorrt_llm._torch.virtual_memory import RestoreMode
 from tensorrt_llm.builder import LoraConfig
+from tensorrt_llm.commands.serve import get_llm_args, is_non_default_or_required
 from tensorrt_llm.llmapi import (BuildConfig, CapacitySchedulerPolicy,
                                  SchedulerConfig)
-from tensorrt_llm.llmapi.llm_args import *
+# fmt: off
+from tensorrt_llm.llmapi.llm_args import (BaseLlmArgs, CacheTransceiverConfig,
+                                          CalibConfig, ContextChunkingPolicy,
+                                          CudaGraphConfig, DecodingBaseConfig,
+                                          DynamicBatchConfig,
+                                          Eagle3DecodingConfig,
+                                          EagleDecodingConfig,
+                                          ExecutorMemoryType,
+                                          ExtendedRuntimePerfKnobConfig,
+                                          KvCacheConfig,
+                                          LookaheadDecodingConfig, MoeConfig,
+                                          PeftCacheConfig, PybindMirror,
+                                          RayPlacementConfig, SleepConfig,
+                                          SpeculativeConfig, StrictBaseModel,
+                                          TorchCompileConfig, TorchLlmArgs,
+                                          TrtLlmArgs,
+                                          UserProvidedDecodingConfig,
+                                          update_llm_args_with_extra_dict)
+# fmt: on
+from tensorrt_llm.llmapi.llm_utils import apply_model_defaults_to_llm_args
 from tensorrt_llm.llmapi.utils import print_traceback_on_error
+from tensorrt_llm.models.modeling_utils import LayerQuantConfig, QuantConfig
 from tensorrt_llm.plugin import PluginConfig
 
 from .test_llm import llama_model_path
@@ -27,7 +62,7 @@ def test_LookaheadDecodingConfig():
     assert config.max_verification_set_size == 4
 
     # from dict
-    config = LookaheadDecodingConfig.from_dict({
+    config = LookaheadDecodingConfig(**{
         "max_window_size": 4,
         "max_ngram_size": 3,
         "max_verification_set_size": 4
@@ -54,19 +89,16 @@ class TestYaml:
             dict_content = yaml.safe_load(f)
         return dict_content
 
-    def test_update_llm_args_with_extra_dict_with_speculative_config(self):
+    def test_llm_args_yaml_with_speculative_config(self):
         yaml_content = """
 speculative_config:
     decoding_type: Lookahead
     max_window_size: 4
     max_ngram_size: 3
     """
-        dict_content = self._yaml_to_dict(yaml_content)
+        llm_args_dict = self._yaml_to_dict(yaml_content)
 
-        llm_args = TrtLlmArgs(model=llama_model_path)
-        llm_args_dict = update_llm_args_with_extra_dict(llm_args.model_dump(),
-                                                        dict_content)
-        llm_args = TrtLlmArgs(**llm_args_dict)
+        llm_args = TrtLlmArgs(model=llama_model_path, **llm_args_dict)
         assert llm_args.speculative_config.max_window_size == 4
         assert llm_args.speculative_config.max_ngram_size == 3
         assert llm_args.speculative_config.max_verification_set_size == 4
@@ -77,28 +109,21 @@ pytorch_backend_config: # this is deprecated
     max_num_tokens: 1
     max_seq_len: 1
 """
-        dict_content = self._yaml_to_dict(yaml_content)
+        llm_args_dict = self._yaml_to_dict(yaml_content)
 
-        llm_args = TrtLlmArgs(model=llama_model_path)
-        llm_args_dict = update_llm_args_with_extra_dict(llm_args.model_dump(),
-                                                        dict_content)
         with pytest.raises(ValueError):
-            llm_args = TrtLlmArgs(**llm_args_dict)
+            llm_args = TrtLlmArgs(model=llama_model_path, **llm_args_dict)
 
     def test_llm_args_with_build_config(self):
-        # build_config isn't a Pydantic
         yaml_content = """
 build_config:
     max_beam_width: 4
     max_batch_size: 8
     max_num_tokens: 256
     """
-        dict_content = self._yaml_to_dict(yaml_content)
+        llm_args_dict = self._yaml_to_dict(yaml_content)
 
-        llm_args = TrtLlmArgs(model=llama_model_path)
-        llm_args_dict = update_llm_args_with_extra_dict(llm_args.model_dump(),
-                                                        dict_content)
-        llm_args = TrtLlmArgs(**llm_args_dict)
+        llm_args = TrtLlmArgs(model=llama_model_path, **llm_args_dict)
         assert llm_args.build_config.max_beam_width == 4
         assert llm_args.build_config.max_batch_size == 8
         assert llm_args.build_config.max_num_tokens == 256
@@ -110,12 +135,9 @@ kv_cache_config:
     max_tokens: 1024
     max_attention_window: [1024, 1024, 1024]
     """
-        dict_content = self._yaml_to_dict(yaml_content)
+        llm_args_dict = self._yaml_to_dict(yaml_content)
 
-        llm_args = TrtLlmArgs(model=llama_model_path)
-        llm_args_dict = update_llm_args_with_extra_dict(llm_args.model_dump(),
-                                                        dict_content)
-        llm_args = TrtLlmArgs(**llm_args_dict)
+        llm_args = TrtLlmArgs(model=llama_model_path, **llm_args_dict)
         assert llm_args.kv_cache_config.enable_block_reuse == True
         assert llm_args.kv_cache_config.max_tokens == 1024
         assert llm_args.kv_cache_config.max_attention_window == [
@@ -128,12 +150,9 @@ max_batch_size: 16
 max_num_tokens: 256
 max_seq_len: 128
     """
-        dict_content = self._yaml_to_dict(yaml_content)
+        llm_args_dict = self._yaml_to_dict(yaml_content)
 
-        llm_args = TrtLlmArgs(model=llama_model_path)
-        llm_args_dict = update_llm_args_with_extra_dict(llm_args.model_dump(),
-                                                        dict_content)
-        llm_args = TrtLlmArgs(**llm_args_dict)
+        llm_args = TrtLlmArgs(model=llama_model_path, **llm_args_dict)
         assert llm_args.max_batch_size == 16
         assert llm_args.max_num_tokens == 256
         assert llm_args.max_seq_len == 128
@@ -144,25 +163,21 @@ max_seq_len: 128
 model_kwargs:
     num_hidden_layers: 2
     """
-        dict_content = self._yaml_to_dict(yaml_content)
-        llm_args = llm_args_cls(model=llama_model_path)
-        llm_args_dict = update_llm_args_with_extra_dict(llm_args.model_dump(),
-                                                        dict_content)
-        llm_args = llm_args_cls(**llm_args_dict)
+        llm_args_dict = self._yaml_to_dict(yaml_content)
+        llm_args = llm_args_cls(model=llama_model_path, **llm_args_dict)
         assert llm_args.model_kwargs['num_hidden_layers'] == 2
 
 
 def test_decoding_type_eagle3_parses_to_eagle3_decoding_config():
-    spec_cfg = DecodingBaseConfig.from_dict(
+    adapter = TypeAdapter(SpeculativeConfig)
+    spec_cfg = adapter.validate_python(
         dict(decoding_type="Eagle3",
              max_draft_len=3,
-             speculative_model_dir="/path/to/draft/model"))
+             speculative_model="/path/to/draft/model"))
     assert isinstance(spec_cfg, Eagle3DecodingConfig)
 
 
 def test_decoding_type_eagle_warns_on_pytorch_backend(monkeypatch):
-    import tensorrt_llm.llmapi.llm_args as llm_args_mod
-
     warnings_seen: list[str] = []
 
     def _capture_warning(msg, *args, **kwargs):
@@ -170,12 +185,9 @@ def test_decoding_type_eagle_warns_on_pytorch_backend(monkeypatch):
 
     monkeypatch.setattr(llm_args_mod.logger, "warning", _capture_warning)
 
-    spec_cfg = DecodingBaseConfig.from_dict(dict(
-        decoding_type="Eagle",
-        max_draft_len=3,
-        speculative_model_dir="/path/to/draft/model"),
-                                            backend="pytorch")
-    assert isinstance(spec_cfg, Eagle3DecodingConfig)
+    spec_cfg = EagleDecodingConfig(decoding_type="Eagle",
+                                   max_draft_len=3,
+                                   speculative_model="/path/to/draft/model")
 
     TorchLlmArgs(model=llama_model_path, speculative_config=spec_cfg)
 
@@ -185,23 +197,118 @@ def test_decoding_type_eagle_warns_on_pytorch_backend(monkeypatch):
 
 
 def test_decoding_type_eagle3_errors_on_tensorrt_backend():
-    spec_cfg = DecodingBaseConfig.from_dict(
-        dict(decoding_type="Eagle3",
-             max_draft_len=3,
-             speculative_model_dir="/path/to/draft/model"))
+    spec_cfg = Eagle3DecodingConfig(decoding_type="Eagle3",
+                                    max_draft_len=3,
+                                    speculative_model="/path/to/draft/model")
     with pytest.raises(ValueError,
                        match="only supported on the PyTorch backend"):
         TrtLlmArgs(model=llama_model_path, speculative_config=spec_cfg)
 
 
-def check_defaults(py_config_cls, pybind_config_cls):
-    py_config = py_config_cls()
-    pybind_config = pybind_config_cls()
-    # get member variables from pybinding_config
-    for member in PybindMirror.get_pybind_variable_fields(pybind_config_cls):
-        py_value = getattr(py_config, member)
-        pybind_value = getattr(pybind_config, member)
-        assert py_value == pybind_value, f"{member} default value is not equal"
+class TestModelDefaults:
+    """Test suite for model-specific default overrides functionality."""
+
+    def test_compute_applied_llm_defaults_simple_field(self):
+        model_defaults = {"enable_chunked_prefill": False}
+        llm_args = TorchLlmArgs(model="/tmp/dummy_model")
+        applied = apply_model_defaults_to_llm_args(llm_args, model_defaults)
+        assert applied == model_defaults
+
+    @pytest.mark.parametrize(
+        "defaults_dict,should_raise,error_contains",
+        [
+            # Invalid field name - this will definitely fail
+            ({
+                "invalid_field_that_does_not_exist": True
+            }, True, "invalid_field_that_does_not_exist"),
+            # Another invalid field name
+            ({
+                "non_existent_parameter": 123
+            }, True, "non_existent_parameter"),
+            # Invalid nested config field type (should be bool, not string)
+            ({
+                "kv_cache_config": {
+                    "enable_block_reuse": "not_a_boolean"
+                }
+            }, True, "enable_block_reuse"),
+            # Invalid nested config with extra fields (extra="forbid")
+            ({
+                "kv_cache_config": {
+                    "enable_block_reuse": True,
+                    "made_up_field": 999
+                }
+            }, True, "made_up_field"),
+            # Valid simple field
+            ({
+                "enable_chunked_prefill": False
+            }, False, None),
+            # Valid nested config
+            ({
+                "kv_cache_config": {
+                    "enable_block_reuse": False
+                }
+            }, False, None),
+            # Valid with type coercion (Pydantic will convert string to bool)
+            (
+                {
+                    "enable_chunked_prefill": "false"
+                },  # String will be coerced to bool
+                False,
+                None),
+        ])
+    def test_model_defaults_validation(self, defaults_dict, should_raise,
+                                       error_contains):
+        # Use a dummy model path for testing (doesn't need to exist for validation)
+        llm_args = TorchLlmArgs(model="/tmp/dummy_model_for_validation_test")
+
+        if should_raise:
+            # Should raise error with expected message when applying invalid defaults
+            with pytest.raises(
+                (ValueError, AttributeError, ValidationError)) as exc_info:
+                apply_model_defaults_to_llm_args(llm_args, defaults_dict)
+            assert error_contains in str(exc_info.value)
+        else:
+            # Should pass validation and apply successfully
+            applied = apply_model_defaults_to_llm_args(llm_args, defaults_dict)
+
+            # Check that the applied defaults match what we requested
+            # Note: We check 'applied' dict, not llm_args directly, because
+            # some fields may have validators that change values
+            for key in defaults_dict:
+                if key in applied:
+                    # The field was applied (not overridden by user)
+                    if isinstance(applied[key], dict):
+                        # For nested configs, check they're in the applied dict
+                        assert key in applied
+                    else:
+                        # For simple fields, check they're in the applied dict
+                        assert key in applied
+
+    def test_mock_model_with_invalid_defaults(self):
+        """Test that a model class returning invalid defaults fails during application."""
+
+        # Simulate a model that returns invalid defaults
+        class ModelWithBadDefaults:
+
+            @classmethod
+            def get_model_defaults(cls, llm_args):
+                return {
+                    "kv_cache_config": {
+                        "enable_block_reuse": "this_should_be_boolean",
+                        "max_tokens": "not_a_number"
+                    }
+                }
+
+        llm_args = TorchLlmArgs(model="/tmp/test")
+        bad_defaults = ModelWithBadDefaults.get_model_defaults(llm_args)
+
+        # This should raise ValidationError when trying to apply
+        with pytest.raises(ValidationError) as exc_info:
+            apply_model_defaults_to_llm_args(llm_args, bad_defaults)
+
+        # Check that the error message is helpful
+        error_str = str(exc_info.value)
+        assert "enable_block_reuse" in error_str or "max_tokens" in error_str
 
 
 def test_KvCacheConfig_declaration():
@@ -211,7 +318,6 @@ def test_KvCacheConfig_declaration():
                            sink_token_length=32,
                            free_gpu_memory_fraction=0.5,
                            host_cache_size=1024,
-                           onboard_blocks=True,
                            cross_kv_cache_fraction=0.5,
                            secondary_offload_min_priority=1,
                            event_buffer_max_size=0,
@@ -226,7 +332,6 @@ def test_KvCacheConfig_declaration():
     assert pybind_config.sink_token_length == 32
     assert pybind_config.free_gpu_memory_fraction == 0.5
     assert pybind_config.host_cache_size == 1024
-    assert pybind_config.onboard_blocks == True
     assert pybind_config.cross_kv_cache_fraction == 0.5
     assert pybind_config.secondary_offload_min_priority == 1
     assert pybind_config.event_buffer_max_size == 0
@@ -245,6 +350,88 @@ def test_ContextChunkingPolicy():
     val = ContextChunkingPolicy.EQUAL_PROGRESS
     assert PybindMirror.maybe_to_pybind(
         val) == tle.ContextChunkingPolicy.EQUAL_PROGRESS
+
+
+def test_SleepConfig_restore_modes_normalized_from_dict():
+    sleep_config = SleepConfig(
+        restore_modes={
+            ExecutorMemoryType.KV_CACHE.value: "NONE",
+            ExecutorMemoryType.MODEL_WEIGHTS_MAIN.value: "CPU",
+        })
+
+    assert sleep_config.restore_modes[
+        ExecutorMemoryType.KV_CACHE] == RestoreMode.NONE
+    assert sleep_config.restore_modes[
+        ExecutorMemoryType.MODEL_WEIGHTS_MAIN] == RestoreMode.CPU
+    assert isinstance(sleep_config.restore_modes[ExecutorMemoryType.SAMPLER],
+                      RestoreMode)
+
+
+def test_SleepConfig_restore_modes_normalized_from_defaultdict():
+    sleep_config = SleepConfig(restore_modes=defaultdict(
+        lambda: RestoreMode.CPU, {
+            ExecutorMemoryType.KV_CACHE: RestoreMode.NONE,
+            ExecutorMemoryType.MODEL_WEIGHTS_MAIN: "PINNED",
+        }))
+
+    assert sleep_config.restore_modes[
+        ExecutorMemoryType.KV_CACHE] == RestoreMode.NONE
+    assert sleep_config.restore_modes[
+        ExecutorMemoryType.MODEL_WEIGHTS_MAIN] == RestoreMode.PINNED
+    assert sleep_config.restore_modes[
+        ExecutorMemoryType.SAMPLER] == RestoreMode.CPU
+
+
+@force_ampere
+def test_SleepConfig_is_picklable():
+    """SleepConfig with default construction must survive a pickle round-trip.
+
+    MPI worker initialisation serialises llm_args (including SleepConfig) via
+    pickle to distribute configuration to each rank.  The defaultdict inside
+    restore_modes previously used a closure lambda as its default_factory, which
+    is not picklable.  This test catches any regression to that pattern.
+    """
+    import pickle
+
+    cfg_default = SleepConfig()
+    rt = pickle.loads(pickle.dumps(cfg_default))  # noqa: S301
+    assert rt.restore_modes == cfg_default.restore_modes
+
+
+@force_ampere
+def test_SleepConfig_pickle_custom_restore_modes_roundtrip():
+    """SleepConfig with explicit per-key overrides must survive a pickle round-trip."""
+    import pickle
+
+    cfg_custom = SleepConfig(
+        restore_modes={
+            ExecutorMemoryType.KV_CACHE.value: "NONE",
+            ExecutorMemoryType.MODEL_WEIGHTS_MAIN.value: "CPU",
+        })
+    rt_custom = pickle.loads(pickle.dumps(cfg_custom))  # noqa: S301
+    assert rt_custom.restore_modes[
+        ExecutorMemoryType.KV_CACHE] == RestoreMode.NONE
+    assert rt_custom.restore_modes[
+        ExecutorMemoryType.MODEL_WEIGHTS_MAIN] == RestoreMode.CPU
+
+
+@force_ampere
+def test_SleepConfig_pickle_defaultfactory_survives_roundtrip():
+    """The defaultdict default_factory must remain functional after pickle.
+
+    Missing keys should return a valid RestoreMode rather than raising
+    KeyError, proving the factory (not just the already-present entries)
+    was serialised correctly.
+    """
+    import pickle
+
+    cfg_default = SleepConfig()
+    rt = pickle.loads(pickle.dumps(cfg_default))  # noqa: S301
+
+    missing_key = ExecutorMemoryType.SAMPLER
+    assert isinstance(rt.restore_modes[missing_key], RestoreMode)
+    assert rt.restore_modes[missing_key] == cfg_default.restore_modes[
+        missing_key]
 
 
 def test_DynamicBatchConfig_declaration():
@@ -413,6 +600,129 @@ def test_update_llm_args_with_extra_dict_with_nested_dict():
     check_nested_dict_equality(build_config_dict1, build_config_dict2)
 
 
+class TestTelemetryConfigPrecedence:
+    """Test that telemetry config follows: default < YAML < CLI precedence."""
+
+    def test_default_telemetry_config_preserved_when_no_yaml(self):
+        """Default telemetry_config survives YAML merge when YAML has none."""
+        from tensorrt_llm.usage.config import TelemetryConfig, UsageContext
+        base = {
+            "model":
+            "dummy",
+            "telemetry_config":
+            TelemetryConfig(disabled=False,
+                            usage_context=UsageContext.CLI_SERVE),
+        }
+        yaml_dict = {"max_batch_size": 8}
+        merged = update_llm_args_with_extra_dict(base, yaml_dict)
+        tc = merged["telemetry_config"]
+        assert isinstance(tc, TelemetryConfig)
+        assert tc.disabled is False
+        assert tc.usage_context == UsageContext.CLI_SERVE
+
+    def test_yaml_can_override_disabled(self):
+        """YAML telemetry_config.disabled overrides the default."""
+        from tensorrt_llm.usage.config import TelemetryConfig, UsageContext
+        base = {
+            "model":
+            "dummy",
+            "telemetry_config":
+            TelemetryConfig(disabled=False,
+                            usage_context=UsageContext.CLI_SERVE),
+        }
+        yaml_dict = {"telemetry_config": {"disabled": True}}
+        merged = update_llm_args_with_extra_dict(base, yaml_dict)
+        tc = merged["telemetry_config"]
+        assert isinstance(tc, TelemetryConfig)
+        assert tc.disabled is True
+
+    def test_yaml_cannot_override_usage_context(self):
+        """usage_context is coupled to the CLI entry point.
+
+        The CLI entry point (serve, eval, etc.) that first creates the
+        TelemetryConfig sets usage_context, so YAML must not override it.
+        """
+        from tensorrt_llm.usage.config import TelemetryConfig, UsageContext
+        base = {
+            "model":
+            "dummy",
+            "telemetry_config":
+            TelemetryConfig(disabled=False,
+                            usage_context=UsageContext.CLI_SERVE),
+        }
+        yaml_dict = {
+            "telemetry_config": {
+                "disabled": True,
+                "usage_context": "cli_eval",
+            }
+        }
+        merged = update_llm_args_with_extra_dict(base, yaml_dict)
+        tc = merged["telemetry_config"]
+        assert isinstance(tc, TelemetryConfig)
+        assert tc.usage_context == UsageContext.CLI_SERVE
+        assert tc.disabled is True
+
+    def test_cli_disabled_overrides_yaml_enabled(self):
+        """CLI --telemetry-disabled wins over YAML disabled=false."""
+        from tensorrt_llm.usage.config import TelemetryConfig, UsageContext
+        base = {
+            "model":
+            "dummy",
+            "telemetry_config":
+            TelemetryConfig(disabled=False,
+                            usage_context=UsageContext.CLI_EVAL),
+        }
+        yaml_dict = {"telemetry_config": {"disabled": False}}
+        merged = update_llm_args_with_extra_dict(base, yaml_dict)
+        # Simulate CLI --no-telemetry (as done in eval.py / serve.py)
+        telemetry = False
+        if not telemetry:
+            merged["telemetry_config"] = merged["telemetry_config"].model_copy(
+                update={"disabled": True})
+        tc = merged["telemetry_config"]
+        assert tc.disabled is True
+        assert tc.usage_context == UsageContext.CLI_EVAL
+
+    def test_yaml_disabled_respected_when_cli_not_set(self):
+        """When CLI doesn't set --no-telemetry, YAML disabled=true is kept."""
+        from tensorrt_llm.usage.config import TelemetryConfig, UsageContext
+        base = {
+            "model":
+            "dummy",
+            "telemetry_config":
+            TelemetryConfig(disabled=False,
+                            usage_context=UsageContext.CLI_SERVE),
+        }
+        yaml_dict = {"telemetry_config": {"disabled": True}}
+        merged = update_llm_args_with_extra_dict(base, yaml_dict)
+        # CLI flag not set (--telemetry is default True) — no override
+        telemetry = True
+        if not telemetry:
+            merged["telemetry_config"] = merged["telemetry_config"].model_copy(
+                update={"disabled": True})
+        tc = merged["telemetry_config"]
+        assert tc.disabled is True
+        assert tc.usage_context == UsageContext.CLI_SERVE
+
+    @pytest.mark.parametrize("yaml_value", [None, False, "invalid", 0])
+    def test_yaml_null_telemetry_config_preserves_default(self, yaml_value):
+        """YAML telemetry_config: null/false/invalid preserves the CLI default."""
+        from tensorrt_llm.usage.config import TelemetryConfig, UsageContext
+        base = {
+            "model":
+            "dummy",
+            "telemetry_config":
+            TelemetryConfig(disabled=False,
+                            usage_context=UsageContext.CLI_SERVE),
+        }
+        yaml_dict = {"telemetry_config": yaml_value}
+        merged = update_llm_args_with_extra_dict(base, yaml_dict)
+        tc = merged["telemetry_config"]
+        assert isinstance(tc, TelemetryConfig)
+        assert tc.usage_context == UsageContext.CLI_SERVE
+        assert tc.disabled is False
+
+
 class TestTorchLlmArgsCudaGraphSettings:
 
     def test_cuda_graph_batch_sizes_case_0(self):
@@ -454,6 +764,238 @@ class TestTorchLlmArgsCudaGraphSettings:
         assert args.cuda_graph_config.batch_sizes == CudaGraphConfig._generate_cuda_graph_batch_sizes(
             128, True)
         assert args.cuda_graph_config.max_batch_size == 128
+
+    @pytest.mark.parametrize("max_batch_size", [64, 129, 320])
+    def test_generate_cuda_graph_batch_sizes_padding_edge_cases(
+            self, max_batch_size):
+        # All sizes must be <= max_batch_size, sorted, and include max_batch_size
+        batch_sizes = CudaGraphConfig._generate_cuda_graph_batch_sizes(
+            max_batch_size, enable_padding=True)
+        assert all(s <= max_batch_size for s in batch_sizes)
+        assert batch_sizes == sorted(batch_sizes)
+        assert max_batch_size in batch_sizes
+
+
+class TestPiecewiseCudaGraphCaptureDefaults:
+    """Piecewise CUDA graph capture-set defaults and reachable-ceiling filter.
+
+    Three invariants are exercised:
+
+    1. `TorchCompileConfig.capture_num_tokens` defaults to a fixed
+       powers-of-2 + 256-stride list when `enable_piecewise_cuda_graph`
+       is True (and stays `None` otherwise). The fixed list keeps the
+       capture set small to bound startup time and CUDA graph memory;
+       the model-engine filter (invariants 2 and 3) ensures the largest
+       reachable size is always captured even when it is not in this
+       default list.
+    2. `_filter_piecewise_capture_num_tokens` caps the candidate list at
+       `max_batch_size * (max_seq_len - 1 - num_extra_decoding_steps)` --
+       the largest forward-pass `num_tokens` the warmup builder can
+       construct, since every in-flight request must leave room for at
+       least one decode token.
+    3. The reachable ceiling itself is always present in the returned
+       capture set (when positive), so runtime ISLs in the gap between
+       the next-largest candidate and the ceiling get a graph rather
+       than falling back to eager.
+    """
+
+    _EXPECTED_DEFAULT_CAPTURE_NUM_TOKENS = [2**i for i in range(8)] + list(
+        range(256, 3073, 256))
+
+    def test_torch_compile_config_capture_num_tokens_default_when_piecewise_enabled(
+            self):
+        """Default capture set is the powers-of-2 + 256-stride list.
+
+        Keeps the capture set bounded (~20 entries) so server startup
+        time and CUDA graph memory stay predictable. The model engine
+        further filters and appends the reachable ceiling, so
+        out-of-range entries (e.g. > max_seq_len-1) are never recorded
+        and gap ISLs still get a graph.
+        """
+        config = TorchCompileConfig(enable_piecewise_cuda_graph=True)
+        assert config.capture_num_tokens == self._EXPECTED_DEFAULT_CAPTURE_NUM_TOKENS
+
+    def test_torch_compile_config_capture_num_tokens_stays_none_when_piecewise_disabled(
+            self):
+        """No default is populated when piecewise is off.
+
+        The capture set is irrelevant in this case; populating it would
+        be misleading in serialized configs.
+        """
+        config = TorchCompileConfig(enable_piecewise_cuda_graph=False)
+        assert config.capture_num_tokens is None
+
+    def test_torch_compile_config_capture_num_tokens_user_override_preserved(
+            self):
+        """User-supplied `capture_num_tokens` is not overwritten by the default."""
+        user_list = [4, 8, 16]
+        config = TorchCompileConfig(enable_piecewise_cuda_graph=True,
+                                    capture_num_tokens=user_list)
+        # `validate_capture_num_tokens` dedupes and reverse-sorts.
+        assert config.capture_num_tokens == sorted(set(user_list), reverse=True)
+
+    def test_torch_llm_args_capture_num_tokens_default_when_piecewise_enabled(
+            self):
+        """Same default applies when reached through `TorchLlmArgs` construction.
+
+        This is the path real users hit via `trtllm-serve` YAML.
+        """
+        args = TorchLlmArgs(
+            model=llama_model_path,
+            max_batch_size=1,
+            max_seq_len=128,
+            max_beam_width=10,
+            enable_chunked_prefill=True,
+            cuda_graph_config=CudaGraphConfig(max_batch_size=128,
+                                              enable_padding=True),
+            torch_compile_config=TorchCompileConfig(
+                enable_piecewise_cuda_graph=True),
+        )
+        assert args.torch_compile_config.capture_num_tokens == self._EXPECTED_DEFAULT_CAPTURE_NUM_TOKENS
+
+    def test_piecewise_filter_drops_entries_above_reachable_ceiling(self):
+        """Drop candidates above `max_batch_size * (max_seq_len - 1)`.
+
+        Without the cap, the warmup loop would silently skip these entries
+        and the outer padding logic would pad to a target with no captured
+        graph. They must be removed from `kept` and surfaced in
+        `unrecordable` so the warning fires. The ceiling itself is then
+        appended so ISLs in the gap still get a graph.
+        """
+        from tensorrt_llm._torch.pyexecutor.model_engine import \
+            _filter_piecewise_capture_num_tokens
+
+        candidates = CudaGraphConfig._generate_cuda_graph_batch_sizes(
+            128, enable_padding=True)
+        max_capturable = 1 * (128 - 1)
+        # Precondition: candidate list contains at least one entry above
+        # the reachable ceiling, otherwise the assertions below are vacuous.
+        assert any(i > max_capturable for i in candidates), (
+            "Test precondition no longer holds: cuda_graph_batch_sizes "
+            f"for max_batch_size=128 no longer contains entries above "
+            f"{max_capturable}. Update this test if CudaGraphConfig "
+            "behavior changed.")
+
+        kept, unrecordable = _filter_piecewise_capture_num_tokens(
+            candidates,
+            max_num_tokens=128,
+            max_batch_size=1,
+            max_seq_len=128,
+        )
+
+        assert kept[-1] == max_capturable  # ceiling appended
+        assert 120 in kept  # densely-packed entries below ceiling preserved
+        assert 128 not in kept
+        assert unrecordable == [128]
+
+    def test_piecewise_filter_keeps_all_entries_when_within_ceiling(self):
+        """Keep all candidates when the largest fits within the ceiling.
+
+        Symmetric case: when `max_batch_size * (max_seq_len - 1)` is at
+        least as large as the biggest candidate, nothing is dropped and
+        `unrecordable` is empty. The ceiling (128 here) coincides with the
+        largest candidate so no extra entry is appended.
+        """
+        from tensorrt_llm._torch.pyexecutor.model_engine import \
+            _filter_piecewise_capture_num_tokens
+
+        candidates = CudaGraphConfig._generate_cuda_graph_batch_sizes(
+            128, enable_padding=True)
+        kept, unrecordable = _filter_piecewise_capture_num_tokens(
+            candidates,
+            max_num_tokens=129,
+            max_batch_size=1,
+            max_seq_len=129,
+        )
+        assert kept[-1] == 128
+        assert 128 in kept
+        # Ceiling (128) was already in candidates, must not be duplicated.
+        assert kept.count(128) == 1
+        assert unrecordable == []
+
+    def test_piecewise_filter_subtracts_extra_decoding_steps(self):
+        """Subtract `num_extra_decoding_steps` from the ceiling.
+
+        Drafting loops consume extra decode steps; the filter must mirror
+        the `max_seq_len - 1 - num_extra_decoding_steps` constraint
+        applied when warmup requests are built. The ceiling is appended
+        whenever it is strictly greater than the largest surviving
+        candidate.
+        """
+        from tensorrt_llm._torch.pyexecutor.model_engine import \
+            _filter_piecewise_capture_num_tokens
+
+        candidates = [1, 2, 4, 8, 16, 32, 64, 100, 120]
+        # max_seq_len=128, batch=1, 5 extra decoding steps -> ceiling 122.
+        kept, unrecordable = _filter_piecewise_capture_num_tokens(
+            candidates,
+            max_num_tokens=128,
+            max_batch_size=1,
+            max_seq_len=128,
+            num_extra_decoding_steps=5,
+        )
+        assert kept[-1] == 122
+        assert 120 in kept
+        assert unrecordable == []
+        # Same setup with 9 extra decoding steps -> ceiling 118; 120 drops.
+        kept, unrecordable = _filter_piecewise_capture_num_tokens(
+            candidates,
+            max_num_tokens=128,
+            max_batch_size=1,
+            max_seq_len=128,
+            num_extra_decoding_steps=9,
+        )
+        assert kept[-1] == 118
+        assert 100 in kept
+        assert 120 not in kept
+        assert unrecordable == [120]
+
+    def test_piecewise_filter_does_not_double_append_ceiling(self):
+        """Ceiling already present in candidates -> not duplicated."""
+        from tensorrt_llm._torch.pyexecutor.model_engine import \
+            _filter_piecewise_capture_num_tokens
+
+        kept, _ = _filter_piecewise_capture_num_tokens(
+            [1, 64, 128],
+            max_num_tokens=129,
+            max_batch_size=1,
+            max_seq_len=129,
+        )
+        assert kept == [1, 64, 128]
+
+    def test_piecewise_filter_returns_empty_when_ceiling_is_zero(self):
+        """`max_seq_len=1` -> ceiling 0 -> nothing captured.
+
+        With ceiling 0 every positive candidate is unrecordable and the
+        ceiling itself is not appended, so the warning "exceeds reachable
+        ceiling 0; raise max_seq_len" fires for the full candidate list.
+        """
+        from tensorrt_llm._torch.pyexecutor.model_engine import \
+            _filter_piecewise_capture_num_tokens
+
+        kept, unrecordable = _filter_piecewise_capture_num_tokens(
+            [1, 2, 4],
+            max_num_tokens=8,
+            max_batch_size=1,
+            max_seq_len=1,
+        )
+        assert kept == []
+        assert unrecordable == [1, 2, 4]
+
+    def test_piecewise_filter_appends_ceiling_when_only_smaller_candidates(
+            self):
+        """No candidate near the ceiling -> ceiling still appended."""
+        from tensorrt_llm._torch.pyexecutor.model_engine import \
+            _filter_piecewise_capture_num_tokens
+
+        kept, _ = _filter_piecewise_capture_num_tokens(
+            [1, 2, 4, 8],
+            max_num_tokens=1024,
+            max_batch_size=8,
+            max_seq_len=128,
+        )
+        # Ceiling: 8 * (128 - 1) = 1016.
+        assert kept == [1, 2, 4, 8, 1016]
 
 
 class TestTrtLlmArgs:
@@ -501,8 +1043,6 @@ class TestTorchLlmArgs:
             args.invalid_arg = 1
 
     def test_speculative_model_alias(self):
-        """Test that speculative_model_dir is accepted as an alias for speculative_model."""
-
         spec_config = EagleDecodingConfig(
             max_draft_len=3,
             speculative_model_dir="/path/to/model",
@@ -515,8 +1055,6 @@ class TestTorchLlmArgs:
 
     @print_traceback_on_error
     def test_model_kwargs_with_num_hidden_layers(self):
-        """Test that model_kwargs can override num_hidden_layers."""
-        from tensorrt_llm._torch.model_config import ModelConfig
         config_no_kwargs = ModelConfig.from_pretrained(
             llama_model_path).pretrained_config
         model_kwargs = {'num_hidden_layers': 2}
@@ -568,7 +1106,7 @@ class TestTrtLlmArgs:
         args = TrtLlmArgs(model=llama_model_path, build_config=build_config)
         args_dict = args.model_dump()
 
-        new_args = TrtLlmArgs.from_kwargs(**args_dict)
+        new_args = TrtLlmArgs(**args_dict)
 
         assert new_args.model_dump() == args_dict
 
@@ -627,9 +1165,9 @@ class TestStrictBaseModelArbitraryArgs:
     def test_cuda_graph_config_arbitrary_args(self):
         """Test that CudaGraphConfig rejects arbitrary arguments."""
         # Valid arguments should work
-        config = CudaGraphConfig(batch_sizes=[1, 2, 4], max_batch_size=8)
+        config = CudaGraphConfig(batch_sizes=[1, 2, 4], max_batch_size=4)
         assert config.batch_sizes == [1, 2, 4]
-        assert config.max_batch_size == 8
+        assert config.max_batch_size == 4
 
         # Arbitrary arguments should be rejected
         with pytest.raises(
@@ -845,3 +1383,631 @@ class TestStrictBaseModelArbitraryArgs:
                 pydantic_core._pydantic_core.ValidationError) as exc_info:
             TestConfig(field1="test", field2=100, extra_field="should_fail")
         assert "extra_field" in str(exc_info.value)
+
+
+class TestServeDefaults:
+
+    def test_serve_get_llm_args_preserves_model_defaults(self):
+        # Get llm_args with default values (simulating serve.py behavior)
+        llm_args, _ = get_llm_args(
+            model=llama_model_path,
+            backend="pytorch",
+            # Don't pass parameters to test default behavior
+        )
+
+        # Verify that required params are present
+        assert "model" in llm_args
+        assert "backend" in llm_args
+        assert "postprocess_tokenizer_dir" in llm_args
+
+        # For PyTorch backend, build_config and scheduler_config should NOT be included
+        assert "build_config" not in llm_args
+        assert "scheduler_config" not in llm_args
+
+        # Test that when we DO pass values, they're included appropriately
+        llm_args_with_values, _ = get_llm_args(
+            model=llama_model_path,
+            backend="pytorch",
+            max_batch_size=128,  # Non-default value
+            tensor_parallel_size=4,  # Non-default value
+        )
+        assert llm_args_with_values.get("max_batch_size") == 128
+        assert llm_args_with_values.get("tensor_parallel_size") == 4
+
+    def test_serve_filters_default_values(self):
+        # Test with all defaults for PyTorch backend
+        llm_args, _ = get_llm_args(model=llama_model_path, backend="pytorch")
+
+        # Should only include required params
+        assert "model" in llm_args
+        assert "backend" in llm_args
+        assert "postprocess_tokenizer_dir" in llm_args
+
+        # Should NOT include build_config or scheduler_config for PyTorch
+        assert "build_config" not in llm_args
+        assert "scheduler_config" not in llm_args
+
+        # Test with custom values
+        llm_args, _ = get_llm_args(
+            model=llama_model_path,
+            backend="pytorch",
+            max_batch_size=128,  # Non-default value
+            tensor_parallel_size=4,  # Non-default value
+        )
+
+        # Custom values should be included
+        assert llm_args.get("max_batch_size") == 128
+        assert llm_args.get("tensor_parallel_size") == 4
+
+    def test_serve_backend_specific_configs(self):
+        # Test PyTorch backend
+        llm_args_pytorch, _ = get_llm_args(model=llama_model_path,
+                                           backend="pytorch")
+        assert "build_config" not in llm_args_pytorch
+        assert "scheduler_config" not in llm_args_pytorch
+
+        # Test TensorRT backend
+        llm_args_trt, _ = get_llm_args(model=llama_model_path,
+                                       backend="tensorrt")
+        assert "build_config" in llm_args_trt
+        assert "scheduler_config" in llm_args_trt
+
+    def test_serve_is_non_default_or_required_helper(self):
+        # Test always_include parameters
+        assert is_non_default_or_required("model", "test-model", "pytorch")
+        assert is_non_default_or_required("backend", "pytorch", "pytorch")
+        assert is_non_default_or_required("tokenizer", "test-tokenizer",
+                                          "pytorch")
+
+        # Test None values
+        assert not is_non_default_or_required("max_batch_size", None, "pytorch")
+
+        # Test default values (should return False)
+        assert not is_non_default_or_required("tensor_parallel_size", 1,
+                                              "pytorch")
+        assert not is_non_default_or_required("pipeline_parallel_size", 1,
+                                              "pytorch")
+
+        # Test non-default values (should return True)
+        assert is_non_default_or_required("tensor_parallel_size", 4, "pytorch")
+        assert is_non_default_or_required("max_batch_size", 128, "pytorch")
+
+
+class TestPyTorchBackendModelDefaults:
+
+    def get_tinyllama_path(self):
+        # Use local model path if available, otherwise use HuggingFace ID
+        model_root = llm_models_root()
+        if model_root:
+            local_path = model_root / "llama-models-v2/TinyLlama-1.1B-Chat-v1.0"
+            if local_path.exists():
+                return str(local_path)
+
+        # Fallback to HuggingFace model ID
+        return "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
+
+    @pytest.fixture(autouse=True)
+    def setup(self, monkeypatch, tmp_path):
+        self.get_model_defaults_called = False
+        self.tmp_path = tmp_path
+
+        def mock_get_model_defaults(cls, llm_args):
+            self.get_model_defaults_called = True
+            return {
+                "enable_chunked_prefill": True,
+                "max_batch_size": 999,
+                "max_input_len": 12345,
+                "kv_cache_config": {
+                    "enable_block_reuse": False,
+                    "free_gpu_memory_fraction": 0.75,
+                }
+            }
+
+        self.original_get_model_defaults = getattr(LlamaForCausalLM,
+                                                   'get_model_defaults', None)
+        setattr(LlamaForCausalLM, 'get_model_defaults',
+                classmethod(mock_get_model_defaults))
+
+        yield
+
+        if self.original_get_model_defaults is None:
+            delattr(LlamaForCausalLM, 'get_model_defaults')
+        else:
+            setattr(LlamaForCausalLM, 'get_model_defaults',
+                    self.original_get_model_defaults)
+
+    @pytest.mark.part0
+    def test_model_defaults_application(self):
+        self.get_model_defaults_called = False
+
+        with TorchLLM(
+                model=self.get_tinyllama_path(),
+                backend='pytorch',
+                skip_tokenizer_init=True,
+                env_overrides={"TLLM_WORKER_USE_SINGLE_PROCESS": "1"},
+        ) as llm:
+            assert self.get_model_defaults_called
+
+            modified_args = llm._executor.engine.model_engine.llm_args
+            assert modified_args.enable_chunked_prefill == True
+            assert modified_args.kv_cache_config.enable_block_reuse == False
+            assert modified_args.kv_cache_config.free_gpu_memory_fraction == 0.75
+
+    @pytest.mark.part0
+    def test_user_overrides_respected(self):
+        self.get_model_defaults_called = False
+
+        with TorchLLM(
+                model=self.get_tinyllama_path(),
+                backend='pytorch',
+                enable_chunked_prefill=False,
+                max_batch_size=42,
+                max_input_len=256,
+                kv_cache_config=KvCacheConfig(enable_block_reuse=True),
+                skip_tokenizer_init=True,
+                env_overrides={"TLLM_WORKER_USE_SINGLE_PROCESS": "1"},
+        ) as llm:
+            assert self.get_model_defaults_called
+
+            modified_args = llm._executor.engine.model_engine.llm_args
+            assert modified_args.enable_chunked_prefill == False
+            assert modified_args.max_batch_size == 42
+            assert modified_args.max_input_len == 256
+            assert modified_args.kv_cache_config.enable_block_reuse == True
+
+    @pytest.mark.part0
+    def test_partial_user_override(self):
+        self.get_model_defaults_called = False
+
+        with TorchLLM(
+                model=self.get_tinyllama_path(),
+                backend='pytorch',
+                max_batch_size=42,
+                skip_tokenizer_init=True,
+                env_overrides={"TLLM_WORKER_USE_SINGLE_PROCESS": "1"},
+        ) as llm:
+            assert self.get_model_defaults_called
+
+            modified_args = llm._executor.engine.model_engine.llm_args
+            assert modified_args.max_batch_size == 42
+            assert modified_args.enable_chunked_prefill == True
+            assert modified_args.kv_cache_config.enable_block_reuse == False
+
+    @pytest.mark.part0
+    def test_empty_nested_config_preserves_defaults(self):
+        """Passing an empty nested config should not block model defaults.
+
+        This covers the pattern used by tests that conditionally build a
+        KvCacheConfig: ``kv_cache_config=KvCacheConfig(...) if cond else
+        KvCacheConfig()``.  The else-branch must not shadow model defaults
+        like ``enable_block_reuse=False``.
+        """
+        self.get_model_defaults_called = False
+
+        with TorchLLM(
+                model=self.get_tinyllama_path(),
+                backend='pytorch',
+                kv_cache_config=KvCacheConfig(),
+                skip_tokenizer_init=True,
+                env_overrides={"TLLM_WORKER_USE_SINGLE_PROCESS": "1"},
+        ) as llm:
+            assert self.get_model_defaults_called
+
+            modified_args = llm._executor.engine.model_engine.llm_args
+            # Model defaults set enable_block_reuse=False and
+            # free_gpu_memory_fraction=0.75.  An empty KvCacheConfig()
+            # should not prevent these from being applied.
+            assert modified_args.kv_cache_config.enable_block_reuse == False
+            assert modified_args.kv_cache_config.free_gpu_memory_fraction == 0.75
+
+
+def test_executor_config_consistency():
+    """Verify that BaseLlmArgs exposes all ExecutorConfig options."""
+    # max_beam_width is not included since vague behavior due to lacking the support for dynamic beam width during
+    # generation
+    black_list = set(["max_beam_width"])
+    executor_config_attrs = set(attr for attr in dir(tle.ExecutorConfig)
+                                if not attr.startswith('_')
+                                and callable(getattr(tle.ExecutorConfig, attr)))
+    executor_config_attrs -= black_list
+    llm_args_attr = set(BaseLlmArgs.model_fields.keys())
+    # NOTE: When cpp ExecutorConfig add new options, please add the new options into `LlmArgs` with docs as well
+    # ASK chunweiy for help if you are not sure about the new options.
+    assert executor_config_attrs.issubset(llm_args_attr), \
+        f"New options found in underlying ExecutorConfig: {executor_config_attrs - llm_args_attr}"
+
+
+def _get_all_llm_args_classes():
+    """Get all subclasses of BaseLlmArgs by traversing the class hierarchy."""
+    subclasses = []
+    to_visit = [BaseLlmArgs]
+    while to_visit:
+        cls = to_visit.pop()
+        for subclass in cls.__subclasses__():
+            subclasses.append(subclass)
+            to_visit.append(subclass)
+    return subclasses
+
+
+def _get_all_pydantic_models_from_llm_args():
+    """Get all Pydantic models referenced by BaseLlmArgs and its subclasses."""
+    visited = set()
+    models = []
+
+    def extract_types_from_annotation(annotation):
+        """Extract all concrete types from an annotation (handles Union, Optional, List, etc.)."""
+        args = get_args(annotation)
+        if args:
+            # Generic type - recurse into all type arguments
+            return [
+                t for arg in args if arg is not type(None)
+                for t in extract_types_from_annotation(arg)
+            ]
+        elif isinstance(annotation, type):
+            return [annotation]
+        return []
+
+    def visit_model(model_cls):
+        if model_cls in visited:
+            return
+        if not isinstance(model_cls, type) or not issubclass(
+                model_cls, BaseModel):
+            return
+
+        visited.add(model_cls)
+        models.append(model_cls)
+
+        # Visit all field types
+        for field_name, field_info in model_cls.model_fields.items():
+            annotation = field_info.annotation
+            if annotation is None:
+                continue
+
+            # Extract all types from the annotation
+            types_in_annotation = extract_types_from_annotation(annotation)
+            for type_cls in types_in_annotation:
+                if isinstance(type_cls, type) and issubclass(
+                        type_cls, BaseModel):
+                    visit_model(type_cls)
+
+    # Start with BaseLlmArgs and all its subclasses
+    for cls in [BaseLlmArgs] + _get_all_llm_args_classes():
+        visit_model(cls)
+
+    return models
+
+
+def _get_qualified_name(cls: type) -> str:
+    """Return the fully qualified name of a class."""
+    return f"{cls.__module__}.{cls.__qualname__}"
+
+
+class TestPydanticBestPractices:
+    """Ensure that the user-facing LlmArgs and its subfields follow Pydantic best practices.
+    """
+
+    # Fields exempt from Pydantic compatibility checks due to typing limitations or other edge cases.
+    # Avoid adding to this list unless absolutely necessary, especially if a field is user-facing.
+    # Keys are Pydantic model classes, values are lists of field names.
+    _COMPATIBILITY_EXEMPT_FIELDS: dict[type, list[str]] = {
+        BaseLlmArgs: [
+            "batched_logits_processor",  # abstract base class type
+            "decoding_config",  # deprecated field, typed as object
+            "model_kwargs",  # typed as Dict[str, Any] for flexibility
+            "mpi_session",  # abstract base class type
+            "tokenizer",  # uses PreTrainedTokenizerBase
+        ],
+        TorchLlmArgs: [
+            "checkpoint_loader",  # abstract base class type
+        ],
+        AutoDeployLlmArgs: [
+            "transforms",  # typed as Dict[str, Dict[str, Any]] for flexibility
+            "model_kwargs",  # typed as Dict[str, Any] for flexibility
+            "speculative_model_kwargs",  # typed as Dict[str, Any] for flexibility (overrides draft model HF config)
+            "tokenizer_kwargs",  # typed as Dict[str, Any] for flexibility
+        ],
+        UserProvidedDecodingConfig: [
+            "drafter",  # abstract base class type
+            "resource_manager",  # abstract base class type
+        ],
+        MoeConfig: ["load_balancer"],  # allows multiple types including dict
+        RayPlacementConfig: ["placement_groups"],  # contains Ray-specific types
+    }
+
+    def _is_allowed_type(self, annotation, model_cls: type,
+                         field_name: str) -> tuple[bool, str]:
+        """Check if a type annotation is allowed for user-facing config fields.
+
+        Allowed:
+        - Pydantic models (must inherit from StrictBaseModel)
+        - Enums, primitives (str, int, float, bool, bytes, Path, type(None))
+        - Union/Optional/List/Dict of allowed types
+        Not allowed:
+        - object, Any, bare containers (dict, list without type parameters)
+        - dataclasses, non-Pydantic classes, Pydantic models not inheriting from StrictBaseModel
+
+        Returns (is_allowed, reason) tuple.
+        """
+        # Check if this field is exempt (check class and all parent classes)
+        for cls in model_cls.__mro__:
+            if field_name in self._COMPATIBILITY_EXEMPT_FIELDS.get(cls, []):
+                return True, "exempt"
+
+        # Check explicitly blocked types
+        if annotation is object:
+            return False, "bare 'object' type (use a specific type or Pydantic model)"
+        if annotation is Any:
+            return False, "'Any' type (use a specific type or Pydantic model)"
+
+        # Check for bare container types (missing type parameters)
+        if annotation in (dict, list, tuple, set, frozenset):
+            name = annotation.__name__
+            return False, f"bare '{name}' type (use {name}[...] with specific type parameters)"
+
+        # Check for dataclasses (should use Pydantic models instead)
+        if isinstance(annotation, type) and is_dataclass(annotation):
+            return False, f"class '{annotation.__name__}' is a dataclass (convert to a Pydantic StrictBaseModel instead)"
+
+        # Check for regular classes that aren't Pydantic models, enums, or primitives
+        _ALLOWED_CLASS_BASES = (BaseModel, Enum, str, int, float, bool, bytes,
+                                Path, type(None))
+        if isinstance(annotation, type) and not issubclass(
+                annotation, _ALLOWED_CLASS_BASES):
+            return False, f"class '{annotation.__name__}' is not a Pydantic model (convert to StrictBaseModel)"
+
+        # Require user-facing Pydantic models to inherit from StrictBaseModel
+        if isinstance(annotation, type) and issubclass(
+                annotation,
+                BaseModel) and not issubclass(annotation, StrictBaseModel):
+            return False, f"Pydantic model '{annotation.__name__}' is not a StrictBaseModel (convert to StrictBaseModel)"
+
+        # Recursively check generic type arguments for disallowed types
+        origin = get_origin(annotation)
+        if origin is not None:
+            # Skip Literal types - their args are values, not types
+            if origin is Literal:
+                return True, "Literal type"
+
+            # For Annotated types, only check the first arg (the actual type)
+            # The rest are metadata (validators, Field info, etc.)
+            if origin is Annotated:
+                args = get_args(annotation)
+                return self._is_allowed_type(args[0], model_cls, field_name)
+
+            # For other generic types (Union, List, Dict, etc.), check all type args
+            container_name = getattr(origin, "__name__", str(origin))
+            for arg in get_args(annotation):
+                if arg is type(None):
+                    continue
+                # Explicitly check for Any (it's a special form, not a type)
+                if arg is Any:
+                    return False, f"in {container_name}: 'Any' type (use a specific type)"
+                # Skip non-type args (e.g., Callable parameter specs)
+                if not isinstance(arg, type) and get_origin(arg) is None:
+                    continue
+                ok, reason = self._is_allowed_type(arg, model_cls, field_name)
+                if not ok:
+                    return False, f"in {container_name}: {reason}"
+
+        return True, "allowed"
+
+    def test_all_fields_have_descriptions(self):
+        """Test that all fields in LlmArgs classes (including subfields) have descriptions."""
+        violations = []
+
+        for cls in _get_all_pydantic_models_from_llm_args():
+            for field_name, field_info in cls.model_fields.items():
+                if field_name.startswith("_"):
+                    # Skip private / non user-facing fields
+                    continue
+                # Skip discriminator fields (single-value Literals)
+                annotation = field_info.annotation
+                if get_origin(annotation) is Literal and len(
+                        get_args(annotation)) == 1:
+                    continue
+                if field_info.description is None or field_info.description.strip(
+                ) == "":
+                    violations.append(
+                        f"{_get_qualified_name(cls)}.{field_name}: missing description"
+                    )
+
+        if violations:
+            pytest.fail(
+                "The following fields are missing descriptions:\n" +
+                "\n".join(violations) +
+                "\n\nPlease add a description to each by using Field(description=\"...\")."
+            )
+
+    def test_all_fields_have_allowed_types(self):
+        """Test that all fields in LlmArgs classes have allowed types.
+
+        Checks that fields (including subfields) have Pydantic-compatible
+        types according to the logic in _is_allowed_type.
+        """
+        violations = []
+
+        for cls in _get_all_pydantic_models_from_llm_args():
+            for field_name, field_info in cls.model_fields.items():
+                if field_name.startswith("_"):
+                    # Skip private / non user-facing fields
+                    continue
+                is_compatible, reason = self._is_allowed_type(
+                    field_info.annotation, cls, field_name)
+                if not is_compatible:
+                    violations.append(
+                        f"{_get_qualified_name(cls)}.{field_name}: {reason}")
+
+        if violations:
+            pytest.fail(
+                "The following user-facing fields have types that are not allowed:\n"
+                + "\n".join(violations) +
+                "\n\nPlease use Pydantic-compatible types (primitives, Pydantic models that inherit from StrictBaseModel, "
+                "or other compatible types). If this is intentional, add the field "
+                "to _COMPATIBILITY_EXEMPT_FIELDS.")
+
+    # Methods that shouldn't be manually defined on Pydantic models
+    # Keys are method names, values are suggestions for replacement
+    _FORBIDDEN_METHODS = {
+        "from_dict":
+        "Construct the class directly from the dict instead, i.e. MyModel(**my_dict).",
+        "from_kwargs":
+        "Construct the class directly from the kwargs instead, i.e. MyModel(**kwargs).",
+        "to_dict": "Use Pydantic's model_dump() instead.",
+        "validate":
+        "Use Pydantic's @field_validator or @model_validator instead.",
+        "is_valid":
+        "Use Pydantic's @field_validator or @model_validator instead.",
+    }
+
+    # Classes exempt from specific forbidden methods. Avoid adding to this list unless absolutely
+    # necessary, e.g. if needed to preserve backward compatibility with external libraries
+    # Keys are method names, values are sets of class names
+    _FORBIDDEN_METHODS_EXEMPT_CLASSES = {
+        "from_dict": {QuantConfig, LayerQuantConfig},
+    }
+
+    def test_no_manual_serialization_or_validation_methods(self):
+        """Test that LlmArgs and all nested Pydantic models do not define manual serialization/validation methods."""
+        violations = []
+
+        for cls in _get_all_pydantic_models_from_llm_args():
+            for method_name, suggestion in self._FORBIDDEN_METHODS.items():
+                if method_name in cls.__dict__:
+                    if cls in self._FORBIDDEN_METHODS_EXEMPT_CLASSES.get(
+                            method_name, set()):
+                        continue
+                    violations.append(
+                        f"{_get_qualified_name(cls)}.{method_name}(): {suggestion}"
+                    )
+
+        if violations:
+            pytest.fail(
+                "The following models define forbidden methods:\n" +
+                "\n".join(violations) +
+                "\n\nPydantic models should follow the recommendations above instead."
+            )
+
+    def test_no_mutable_default_values(self):
+        """Test that LlmArgs and all nested Pydantic models do not use mutable default values directly."""
+        violations = []
+
+        for cls in _get_all_pydantic_models_from_llm_args():
+            for field_name, field_info in cls.model_fields.items():
+                if field_name.startswith("_"):
+                    continue
+                # Check if the default is a mutable type instance
+                default = field_info.default
+                if isinstance(default, (list, dict, set)):
+                    type_name = type(default).__name__
+                    violations.append(
+                        f"{_get_qualified_name(cls)}.{field_name}: uses mutable default {type_name}. "
+                        f"Use Field(default_factory={type_name}) instead.")
+
+        if violations:
+            pytest.fail(
+                "The following fields use mutable default values:\n" +
+                "\n".join(violations) +
+                "\n\nMutable defaults are shared across instances and cause bugs. "
+                "Use Field(default_factory=...) instead.")
+
+    def test_no_custom_init_methods(self):
+        """Test that LlmArgs and all nested Pydantic models do not define custom __init__ methods.
+
+        Pydantic models should not override __init__ because:
+        - It bypasses Pydantic's validation and type coercion
+        - It can cause subtle bugs with model inheritance
+
+        There are better alternatives for all common use cases:
+        - For validation: use @field_validator or @model_validator
+        - For post-validation initialization: use model_post_init()
+        - For custom construction patterns: use classmethods (e.g. from_yaml())
+
+        See: https://docs.pydantic.dev/latest/concepts/models/#defining-a-custom-__init__
+        """
+        violations = []
+
+        for cls in _get_all_pydantic_models_from_llm_args():
+            if "__init__" in cls.__dict__:
+                violations.append(_get_qualified_name(cls))
+
+        if violations:
+            pytest.fail(
+                "The following Pydantic models define custom __init__ methods:\n"
+                + "\n".join(violations) +
+                "\n\nThese should be replaced with alternatives like validators, model_post_init, or classmethods. See this test's docstring for more details."
+            )
+
+
+class TestSkipSoftmaxAttentionConfig:
+
+    def test_resolve_computes_thresholds(self):
+        import math
+
+        from tensorrt_llm.llmapi.llm_args import SkipSoftmaxAttentionConfig
+
+        formula = {
+            'prefill': {
+                'a': 7e-5,
+                'b': 7.929109
+            },
+            'decode': {
+                'a': 7e-5,
+                'b': 16.9025
+            },
+        }
+        cfg = SkipSoftmaxAttentionConfig(target_sparsity={
+            'prefill': 0.5,
+            'decode': 0.5
+        })
+        resolved = cfg.resolve_for_target_sparsity(formula)
+
+        expected_prefill = 7e-5 * math.exp(7.929109 * 0.5)
+        expected_decode = 7e-5 * math.exp(16.9025 * 0.5)
+        assert resolved.threshold_scale_factor_prefill == pytest.approx(
+            expected_prefill)
+        assert resolved.threshold_scale_factor_decode == pytest.approx(
+            expected_decode)
+
+    def test_resolve_scalar_target_sparsity(self):
+        import math
+
+        from tensorrt_llm.llmapi.llm_args import SkipSoftmaxAttentionConfig
+
+        formula = {
+            'prefill': {
+                'a': 7e-5,
+                'b': 7.929109
+            },
+            'decode': {
+                'a': 7e-5,
+                'b': 16.9025
+            },
+        }
+        cfg = SkipSoftmaxAttentionConfig(target_sparsity=0.3)
+        resolved = cfg.resolve_for_target_sparsity(formula)
+
+        assert resolved.threshold_scale_factor_prefill == pytest.approx(
+            7e-5 * math.exp(7.929109 * 0.3))
+        assert resolved.threshold_scale_factor_decode == pytest.approx(
+            7e-5 * math.exp(16.9025 * 0.3))
+
+    def test_resolve_missing_coefficients_raises(self):
+        from tensorrt_llm.llmapi.llm_args import SkipSoftmaxAttentionConfig
+
+        cfg = SkipSoftmaxAttentionConfig(target_sparsity={
+            'prefill': 0.5,
+            'decode': 0.5
+        })
+        with pytest.raises(ValueError, match="missing formula coefficients"):
+            cfg.resolve_for_target_sparsity({})
+
+    def test_threshold_scale_factor_unaffected(self):
+        from tensorrt_llm.llmapi.llm_args import SkipSoftmaxAttentionConfig
+
+        cfg = SkipSoftmaxAttentionConfig(threshold_scale_factor={
+            'prefill': 0.001,
+            'decode': 0.002
+        })
+        assert cfg.target_sparsity is None
+        assert cfg.threshold_scale_factor_prefill == pytest.approx(0.001)
+        assert cfg.threshold_scale_factor_decode == pytest.approx(0.002)

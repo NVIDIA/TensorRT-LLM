@@ -1,12 +1,27 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 import copy
 import datetime
 import enum
+import gc
 import json
 import os
 import weakref
 from pathlib import Path
 from queue import Queue
-from typing import Dict, List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, Union
 
 import psutil
 import torch
@@ -18,12 +33,11 @@ from .._utils import (global_mpi_rank, global_mpi_size, mpi_comm, mpi_rank,
                       nvtx_range_debug)
 from ..bindings import executor as tllm
 from ..builder import ConfigEncoder, Engine, EngineConfig
-from ..llmapi.llm_args import BaseLlmArgs, PybindMirror
+from ..llmapi.llm_args import BaseLlmArgs, ExecutorMemoryType, PybindMirror
 from ..llmapi.tokenizer import TokenizerBase
 from ..llmapi.tracer import global_tracer
 from ..llmapi.utils import _SyncQueue, get_numa_aware_cpu_affinity, logger_debug
 from ..lora_manager import LoraManager
-from ..metrics import RequestEventTiming
 from ..prompt_adapter_manager import PromptAdapterManager
 from ..runtime import ModelConfig
 from ..runtime.model_runner import _engine_config_to_model_config
@@ -34,9 +48,12 @@ from .postproc_worker import (PostprocParams, PostprocWorker,
                               PostprocWorkerConfig)
 from .request import GenerationRequest, LoRARequest, PromptAdapterRequest
 from .result import (GenerationResult, LogProbsResult, ResponseWrapper,
-                     compute_logprobs)
+                     compute_logprobs, get_metrics_dict)
 from .utils import (ErrorResponse, IntraProcessQueue, RequestError,
                     is_llm_response)
+
+if TYPE_CHECKING:
+    from ..disaggregated_params import DisaggregatedParams
 
 __all__ = [
     "BaseWorker",
@@ -112,9 +129,14 @@ class BaseWorker(GenerationExecutor):
         self._backend = None if llm_args is None else llm_args.backend
         self._is_pytorch_backend = self._backend in ["pytorch", "_autodeploy"]
         self._lora_config = llm_args.lora_config if self._is_pytorch_backend else None
+        self._resource_governor_queue = None
 
         if global_mpi_size() > 1:
             logger.set_rank(self.global_rank)
+
+    @property
+    def resource_governor_queue(self):
+        return self._resource_governor_queue
 
     def _configure_affinity(self, device_id):
         '''Probe and configure the CPU affinity of the worker based on NUMA topology.
@@ -213,6 +235,9 @@ class BaseWorker(GenerationExecutor):
             else:
                 raise ValueError(f"Unsupported backend config: {self._backend}")
 
+            if self._resource_governor_queue is not None:
+                args["resource_governor_queue"] = self._resource_governor_queue
+
             # Define additional attributes that can be used later, such as in _deduce_max_tokens
             self.mapping = self.llm_args.parallel_config.to_mapping()
             self.checkpoint_loader = None
@@ -220,8 +245,12 @@ class BaseWorker(GenerationExecutor):
                 from tensorrt_llm._torch.pyexecutor.model_loader import \
                     _construct_checkpoint_loader
                 self.checkpoint_loader = _construct_checkpoint_loader(
-                    self.llm_args.backend, self.llm_args.checkpoint_loader,
-                    self.llm_args.checkpoint_format)
+                    self.llm_args.backend,
+                    self.llm_args.checkpoint_loader,
+                    self.llm_args.checkpoint_format,
+                    mx_config=self.llm_args.mx_config,
+                    mx_model_name=self.llm_args.model,
+                )
 
             self.max_seq_len = self.llm_args.max_seq_len
             # creare_py_executor may change some fields of llm_args
@@ -301,7 +330,7 @@ class BaseWorker(GenerationExecutor):
             iter_stats = self.engine.get_latest_iteration_stats()
             #TODO: Support req stats with TRT engine
             #      This would require ensuring iter and req stats have same size
-            return [(iter_stat, None) for iter_stat in iter_stats]
+            return [(iter_stat, None, None) for iter_stat in iter_stats]
         else:
             return self.engine.get_latest_iteration_stats()
 
@@ -389,16 +418,32 @@ class BaseWorker(GenerationExecutor):
         assert request.id is not None
         py_lora_path = None
         if self._lora_manager is not None and request.lora_request is not None:
-            adapter_in_cache = self._lora_manager.is_adapter_in_cpu_cache(
-                request.lora_request.adapter_id)
-            self._load_lora_adapter(request.lora_request)
-            uid = str(request.lora_request.adapter_id)
-            lora_config = tllm.LoraConfig(
-                task_id=request.lora_request.adapter_id,
-                weights=self._lora_manager.cpp_lora_weights[uid]
-                if not adapter_in_cache else None,
-                config=self._lora_manager.cpp_lora_config[uid])
-            py_lora_path = request.lora_request.lora_path
+            try:
+                if self._is_pytorch_backend:
+                    # PyTorch backend: don't embed weights in the request.
+                    # Each rank loads independently from disk via py_lora_path
+                    # in PeftCacheManager.add_request_peft().
+                    # Pre-load on rank 0 to warm the LoRA manager cache so that
+                    # add_request_peft finds the adapter already loaded.
+                    self._load_lora_adapter(request.lora_request)
+                    uid = str(request.lora_request.adapter_id)
+                    lora_config = tllm.LoraConfig(
+                        task_id=request.lora_request.adapter_id,
+                        weights=None,
+                        config=self._lora_manager.cpp_lora_config[uid])
+                else:
+                    adapter_in_cache = self._lora_manager.is_adapter_in_cpu_cache(
+                        request.lora_request.adapter_id)
+                    self._load_lora_adapter(request.lora_request)
+                    uid = str(request.lora_request.adapter_id)
+                    lora_config = tllm.LoraConfig(
+                        task_id=request.lora_request.adapter_id,
+                        weights=self._lora_manager.cpp_lora_weights[uid]
+                        if not adapter_in_cache else None,
+                        config=self._lora_manager.cpp_lora_config[uid])
+                py_lora_path = request.lora_request.lora_path
+            except Exception as e:
+                raise RequestError(f"Failed to load LoRA adapter: {e}") from e
         else:
             lora_config = None
 
@@ -427,7 +472,15 @@ class BaseWorker(GenerationExecutor):
                     multimodal_positions=request.multimodal_params.
                     multimodal_input.multimodal_positions,
                     multimodal_lengths=request.multimodal_params.
-                    multimodal_input.multimodal_lengths)
+                    multimodal_input.multimodal_lengths,
+                    multimodal_uuids=request.multimodal_params.multimodal_input.
+                    multimodal_uuids,
+                    multimodal_item_run_cu_offsets=request.multimodal_params.
+                    multimodal_input.multimodal_item_run_cu_offsets,
+                    multimodal_run_positions=request.multimodal_params.
+                    multimodal_input.multimodal_run_positions,
+                    multimodal_run_lengths=request.multimodal_params.
+                    multimodal_input.multimodal_run_lengths)
             # NOTE: Setting to None here to avoid sending multimodal_input again through the 'py_multimodal_data' field
             request.multimodal_params.multimodal_input = None
 
@@ -447,14 +500,6 @@ class BaseWorker(GenerationExecutor):
             if request_type == tllm.RequestType.REQUEST_TYPE_GENERATION_ONLY:
                 context_phase_params = request.disaggregated_params.get_context_phase_params(
                 )
-
-        if self._is_pytorch_backend and not self.llm_args.disable_overlap_scheduler \
-                and self.llm_args.kv_cache_config.enable_block_reuse \
-                and self.engine.kv_cache_transceiver is not None \
-                and request_type == tllm.RequestType.REQUEST_TYPE_CONTEXT_ONLY:
-            raise ValueError(
-                "Context only requests are not supported in pytorch backend when overlap is enabled with block reuse."
-            )
 
         assert request.id is not None
 
@@ -561,7 +606,9 @@ class BaseWorker(GenerationExecutor):
                 context_phase_params=context_phase_params,
                 type=request_type,
                 cache_salt_id=request.cache_salt_id,
-                disagg_request_id=disagg_request_id)
+                disagg_request_id=disagg_request_id,
+                priority=request.priority)
+            executor_request.py_original_end_id = request.sampling_params.end_id
             executor_request.py_num_logprobs = request.sampling_params.logprobs
             executor_request.py_lora_path = py_lora_path
             executor_request.py_logprobs_mode = request.sampling_params.logprobs_mode
@@ -644,6 +691,111 @@ class BaseWorker(GenerationExecutor):
 
         return result
 
+    def _check_sleep_wakeup_preconditions(self, method: str) -> None:
+        """Validate preconditions shared by sleep() and wakeup().
+
+        Args:
+            method: Name of the calling method (``"sleep"`` or ``"wakeup"``)
+                used in error messages.
+
+        Raises:
+            ValueError: If the backend is not ``"pytorch"`` or
+                ``sleep_config`` is not set.
+            NotImplementedError: If ``parallel_config.world_size > 1``.
+        """
+        # _autodeploy is intentionally excluded: its allocations are not tagged
+        # under sleep_config VMM scopes, so release_with_tag would silently
+        # no-op instead of actually freeing GPU memory.  Use _backend directly
+        # rather than _is_pytorch_backend, which also covers _autodeploy.
+        if self._backend != "pytorch":
+            raise ValueError(
+                f"{method}() is only available for the PyTorch (TorchLLM) "
+                "backend.")
+        if self.llm_args is None or self.llm_args.sleep_config is None:
+            raise ValueError(
+                "Sleep feature is not enabled, please set sleep_config in "
+                "the LLM arguments.")
+        # Non-rank-0 processes block on their local control_action_done
+        # threading.Event with no Python caller to release it — deadlock.
+        if self.llm_args.parallel_config.world_size > 1:
+            raise NotImplementedError(
+                f"{method}() requires parallel_config.world_size == 1; "
+                "use the Ray executor for multi-rank deployments.")
+
+    def sleep(self, sleep_tags: List[str]) -> None:
+        """Release GPU virtual memory for the specified memory type tags.
+
+        Single-rank (``world_size == 1``) only.  Uses
+        ``PyExecutor.control_action()`` to drain in-flight requests and pause
+        the event loop before calling ``release_with_tag()``, matching the
+        ``@control_action_decorator`` behaviour used in Ray.
+
+        Only allocations backed by virtual memory (VMM) and registered under
+        the active :class:`~tensorrt_llm.llmapi.llm_args.SleepConfig` are
+        released.  Components using alternative memory management (e.g.
+        ``LoadFormat.GMS``-managed weights) are not VMM-tagged and will be
+        silently skipped by ``release_with_tag``.
+
+        Args:
+            sleep_tags: List of
+                :class:`~tensorrt_llm.llmapi.llm_args.ExecutorMemoryType`
+                value strings (e.g. ``["kv_cache"]``).
+
+        Returns:
+            None.  The call is synchronous; when it returns all requested
+            VMM-tagged allocations have been released and the event loop
+            has been resumed.
+
+        Raises:
+            ValueError: If the backend is not ``"pytorch"`` or
+                ``sleep_config`` is not set.
+            NotImplementedError: If ``parallel_config.world_size > 1``.
+        """
+        self._check_sleep_wakeup_preconditions("sleep")
+
+        from tensorrt_llm._torch.virtual_memory import release_with_tag
+
+        tags = [ExecutorMemoryType(tag) for tag in sleep_tags]
+        logger.info(f"Sleep: {tags}")
+        with self.engine.control_action():
+            torch.cuda.synchronize()
+            release_with_tag(*tags)
+            torch.cuda.synchronize()
+            gc.collect()
+            torch.cuda.empty_cache()
+
+    def wakeup(self, wakeup_tags: List[str]) -> None:
+        """Materialize GPU virtual memory for the specified memory type tags.
+
+        Single-rank (``world_size == 1``) only.  See :meth:`sleep` for
+        details on VMM scope restrictions and backend prerequisites.
+
+        Args:
+            wakeup_tags: List of
+                :class:`~tensorrt_llm.llmapi.llm_args.ExecutorMemoryType`
+                value strings (e.g. ``["kv_cache"]``).
+
+        Returns:
+            None.  The call is synchronous; when it returns all requested
+            VMM-tagged allocations have been materialized and the event loop
+            has been resumed.
+
+        Raises:
+            ValueError: If the backend is not ``"pytorch"`` or
+                ``sleep_config`` is not set.
+            NotImplementedError: If ``parallel_config.world_size > 1``.
+        """
+        self._check_sleep_wakeup_preconditions("wakeup")
+
+        from tensorrt_llm._torch.virtual_memory import materialize_with_tag
+
+        tags = [ExecutorMemoryType(tag) for tag in wakeup_tags]
+        logger.info(f"Wakeup: {tags}")
+        with self.engine.control_action():
+            torch.cuda.synchronize()
+            materialize_with_tag(*tags)
+            torch.cuda.synchronize()
+
     def shutdown(self):
         if self.doing_shutdown:
             return
@@ -662,16 +814,58 @@ class BaseWorker(GenerationExecutor):
 
     # Define a Callable to join iteration and request stats
     @staticmethod
-    def _stats_serializer(
-            stats: Tuple[tllm.IterationStats, tllm.RequestStats]) -> str:
-        iteration_stats, req_stats = stats
+    def _stats_serializer(stats) -> str:
+        # Per-rank path: stats is ("per_rank_dict", {..., "rank": N}).
+        # Already serialized on the producing rank via allgather — just emit.
+        if (isinstance(stats, tuple) and len(stats) == 2
+                and stats[0] == "per_rank_dict"):
+            return json.dumps(stats[1])
+
+        iteration_stats, req_stats = stats[0], stats[1]
+        kv_iter_stats = stats[2] if len(stats) > 2 else None
+        attention_dp_rank = stats[3] if len(stats) > 3 else None
+
         stats_dict = json.loads(iteration_stats.to_json_str())
+        # Always tag the row so Dynamo's adapter can read
+        # stat["attentionDpRank"] without a missing-key branch. Non-ADP stats
+        # default to rank 0; ADP stats carry the rank supplied by PyExecutor.
+        stats_dict["attentionDpRank"] = (0 if attention_dp_rank is None else
+                                         attention_dp_rank)
 
         if req_stats is not None and len(req_stats) > 0:
             stats_dict["requestStats"] = []
             for req_stat in req_stats:
                 stats_dict["requestStats"].append(
                     json.loads(req_stat.to_json_str()))
+
+        # Inject per-iteration KV cache stats (keyed by window size)
+        if kv_iter_stats is not None:
+            stats_dict["kvCacheIterationStats"] = {
+                str(window_size): {
+                    "primaryMaxNumBlocks": s.primary_max_num_blocks,
+                    "primaryFreeNumBlocks": s.primary_free_num_blocks,
+                    "primaryUsedNumBlocks": s.primary_used_num_blocks,
+                    "secondaryMaxNumBlocks": s.secondary_max_num_blocks,
+                    "secondaryFreeNumBlocks": s.secondary_free_num_blocks,
+                    "secondaryUsedNumBlocks": s.secondary_used_num_blocks,
+                    "iterAllocTotalBlocks": s.iter_alloc_total_blocks,
+                    "iterAllocNewBlocks": s.iter_alloc_new_blocks,
+                    "iterReusedBlocks": s.iter_reused_blocks,
+                    "iterFullReusedBlocks": s.iter_full_reused_blocks,
+                    "iterPartialReusedBlocks": s.iter_partial_reused_blocks,
+                    "iterMissedBlocks": s.iter_missed_blocks,
+                    "iterCacheHitRate": s.iter_cache_hit_rate,
+                    "iterGenAllocBlocks": s.iter_gen_alloc_blocks,
+                    "iterOnboardBlocks": s.iter_onboard_blocks,
+                    "iterOnboardBytes": s.iter_onboard_bytes,
+                    "iterOffloadBlocks": s.iter_offload_blocks,
+                    "iterOffloadBytes": s.iter_offload_bytes,
+                    "iterIntraDeviceCopyBlocks":
+                    s.iter_intra_device_copy_blocks,
+                    "iterIntraDeviceCopyBytes": s.iter_intra_device_copy_bytes,
+                }
+                for window_size, s in kv_iter_stats.items()
+            }
 
         # Convert back to JSON string
         return json.dumps(stats_dict)
@@ -829,14 +1023,15 @@ class AwaitResponseHelper:
 
 
 def _get_params_for_first_rsp(
-        worker,
-        client_id) -> Tuple[Optional[SamplingParams], Optional[PostprocParams]]:
+    worker, client_id
+) -> Tuple[Optional[SamplingParams], Optional[PostprocParams],
+           Optional["DisaggregatedParams"]]:
     res = worker._results.get(client_id, None)
     assert res is not None
     if not res._params_transmitted:
         res._params_transmitted = True
-        return res.sampling_params, res.postproc_params
-    return None, None
+        return res.sampling_params, res.postproc_params, res.disaggregated_params
+    return None, None, None
 
 
 def _compute_pytorch_prompt_logprobs(
@@ -852,9 +1047,19 @@ def _compute_pytorch_prompt_logprobs(
                 prompt=cached, generation=None
             )  # generation logprobs, if requested, is provided directly in response.result.log_probs from the sampler.
     context_logits = response.result.context_logits
-    assert context_logits is not None, "context_logits cannot be None when prompt_logprobs is requested."
+    assert context_logits is not None, "context_logits must not be None when prompt_logprobs is requested."
+    result = response.result.get_result()
+    assert result is not None, "result must not be None when prompt_logprobs is requested."
+    # Single element list
+    first_generation_token = result.output_token_ids[0][:1]
+    assert first_generation_token, "first generation token must not be empty when prompt_logprobs is requested."
+    # Pass prompt_token_ids with an offset of 1 for correct mapping to the context logits
+    prompt_token_ids = generation_result._generation_request.prompt_token_ids[
+        1:] + first_generation_token
+
     logprobs_result = compute_logprobs(logprob_params.prompt_logprobs, None,
-                                       context_logits, None, None)
+                                       context_logits, None, None,
+                                       prompt_token_ids)
     if generation_result._streaming:
         generation_result._cached_prompt_logprobs = logprobs_result.prompt
 
@@ -880,7 +1085,7 @@ def _get_logprobs(worker,
     logprob_params = getattr(generation_result, "_logprob_params", None)
     if logprob_params:
         if is_pytorch_backend:
-            if not logprob_params.prompt_logprobs:
+            if logprob_params.prompt_logprobs is None:
                 # PyTorch: generation logprobs computed in sampler, no post-processing needed
                 return None
             else:
@@ -924,8 +1129,8 @@ def _send_rsp(
         else:
             worker.result_queue.put(response)
     else:
-        sampling_params, postproc_params = _get_params_for_first_rsp(
-            worker, response.client_id)
+        sampling_params, postproc_params, disaggregated_params = (
+            _get_params_for_first_rsp(worker, response.client_id))
         inp = PostprocWorker.Input(
             response,
             # sampling_params is necessary for creating fake GenerationResult
@@ -934,6 +1139,7 @@ def _send_rsp(
             # Request.
             sampling_params=sampling_params,
             postproc_params=postproc_params,
+            disaggregated_params=disaggregated_params,
             streaming=worker._results.get(response.client_id, None)._streaming)
 
         pid = response.client_id % worker.postproc_config.num_postprocess_workers
@@ -958,47 +1164,13 @@ def _send_rsp(
         raise ValueError(f"Unknown response type: {response}")
 
 
-def _get_metrics_dict(
-        response: tllm.Response) -> dict[RequestEventTiming, float]:
-    req_perf_metrics, metrics_dict = None, {}
-    res = response.result
-    if res:
-        if hasattr(res, '_result'):
-            if result := res.get_result():
-                req_perf_metrics = result.request_perf_metrics
-        else:
-            req_perf_metrics = res.request_perf_metrics
-        if req_perf_metrics and req_perf_metrics.timing_metrics:
-            metrics_dict = {
-                RequestEventTiming.ARRIVAL_TIME:
-                req_perf_metrics.timing_metrics.arrival_time.total_seconds(),
-                RequestEventTiming.FIRST_TOKEN_TIME:
-                req_perf_metrics.timing_metrics.first_token_time.total_seconds(
-                ),
-                RequestEventTiming.FIRST_SCHEDULED_TIME:
-                req_perf_metrics.timing_metrics.first_scheduled_time.
-                total_seconds(),
-                RequestEventTiming.LAST_TOKEN_TIME:
-                req_perf_metrics.timing_metrics.last_token_time.total_seconds(),
-                RequestEventTiming.KV_CACHE_TRANSFER_START:
-                req_perf_metrics.timing_metrics.kv_cache_transfer_start.
-                total_seconds(),
-                RequestEventTiming.KV_CACHE_TRANSFER_END:
-                req_perf_metrics.timing_metrics.kv_cache_transfer_end.
-                total_seconds(),
-                RequestEventTiming.KV_CACHE_SIZE:
-                req_perf_metrics.timing_metrics.kv_cache_size,
-            }
-    return metrics_dict
-
-
 def _maybe_wrap_response(
         worker,
         response: tllm.Response,
         is_pytorch_backend=False) -> Union[tllm.Response, ResponseWrapper]:
 
     logprobs_result = _get_logprobs(worker, response, is_pytorch_backend)
-    req_perf_metrics = _get_metrics_dict(response)
+    req_perf_metrics = get_metrics_dict(response)
     if logprobs_result or req_perf_metrics:
         response = ResponseWrapper(response, logprobs_result, req_perf_metrics)
     return response

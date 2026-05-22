@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2022-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -61,6 +61,7 @@ public:
         std::optional<std::vector<std::vector<SizeType32>>> multimodalHashes = std::nullopt,
         std::optional<std::vector<SizeType32>> multimodalPositions = std::nullopt,
         std::optional<std::vector<SizeType32>> multimodalLengths = std::nullopt,
+        std::optional<std::vector<std::optional<std::string>>> multimodalUuids = std::nullopt,
         std::optional<TensorPtr> multimodalEmbedding = std::nullopt,
         std::optional<TensorPtr> mropeRotaryCosSin = std::nullopt,
         std::optional<SizeType32> mropePositionDeltas = std::nullopt,
@@ -85,8 +86,11 @@ public:
         std::optional<SizeType32> languageAdapterUid = std::nullopt,
         std::optional<MillisecondsType> allottedTimeMs = std::nullopt,
         std::optional<executor::ContextPhaseParams> const& contextPhaseParams = std::nullopt,
-        std::optional<CacheSaltIDType> cacheSaltID = std::nullopt,
-        std::optional<TimePoint> arrivalTime = std::nullopt)
+        std::optional<CacheSaltIDType> cacheSaltID = std::nullopt, std::optional<TimePoint> arrivalTime = std::nullopt,
+        std::optional<std::vector<std::tuple<std::string, int>>> agent_hierarchy = std::nullopt,
+        std::optional<std::vector<SizeType32>> multimodalItemRunCuOffsets = std::nullopt,
+        std::optional<std::vector<SizeType32>> multimodalRunPositions = std::nullopt,
+        std::optional<std::vector<SizeType32>> multimodalRunLengths = std::nullopt)
         : Base(requestId,                                                                                       //
             maxNewTokens,                                                                                       //
             std::make_shared<std::vector<TokenIdType>>(std::move(inputTokens)),                                 //
@@ -111,6 +115,9 @@ public:
             multimodalLengths.has_value()
                 ? std::make_shared<std::vector<SizeType32>>(std::move(multimodalLengths.value()))                //
                 : std::optional<std::shared_ptr<std::vector<SizeType32>>>(std::nullopt),                         //
+            multimodalUuids.has_value()
+                ? std::make_shared<std::vector<std::optional<std::string>>>(std::move(multimodalUuids.value()))  //
+                : std::optional<std::shared_ptr<std::vector<std::optional<std::string>>>>(std::nullopt),         //
             multimodalEmbedding,                                                                                 //
             mropeRotaryCosSin,                                                                                   //
             mropePositionDeltas,                                                                                 //
@@ -149,7 +156,17 @@ public:
             allottedTimeMs,                                                                                      //
             contextPhaseParams,                                                                                  //
             cacheSaltID,                                                                                         //
-            arrivalTime                                                                                          //
+            arrivalTime,                                                                                         //
+            std::move(agent_hierarchy),                                                                          //
+            multimodalItemRunCuOffsets.has_value()
+                ? std::make_shared<std::vector<SizeType32>>(std::move(multimodalItemRunCuOffsets.value()))       //
+                : std::optional<std::shared_ptr<std::vector<SizeType32>>>(std::nullopt),                         //
+            multimodalRunPositions.has_value()
+                ? std::make_shared<std::vector<SizeType32>>(std::move(multimodalRunPositions.value()))           //
+                : std::optional<std::shared_ptr<std::vector<SizeType32>>>(std::nullopt),                         //
+            multimodalRunLengths.has_value()
+                ? std::make_shared<std::vector<SizeType32>>(std::move(multimodalRunLengths.value()))             //
+                : std::optional<std::shared_ptr<std::vector<SizeType32>>>(std::nullopt)                          //
         )
     {
     }

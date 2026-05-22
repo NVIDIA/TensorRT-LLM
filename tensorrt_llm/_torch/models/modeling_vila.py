@@ -36,8 +36,8 @@ from transformers import (AutoConfig, AutoImageProcessor, AutoModel,
 
 from ..._utils import nvtx_range
 from ...inputs import (BaseMultimodalDummyInputsBuilder,
-                       BaseMultimodalInputProcessor, ExtraProcessedInputs,
-                       MultimodalPlaceholderMetadata,
+                       BaseMultimodalInputProcessor, ContentFormat,
+                       ExtraProcessedInputs, MultimodalPlaceholderMetadata,
                        MultimodalPlaceholderPlacement, TextPrompt,
                        register_input_processor)
 from ...logger import logger
@@ -465,6 +465,7 @@ class VilaMultimodalProjector(PreTrainedModel):
                 self.layers = nn.Sequential(*modules)
             else:
                 raise ValueError(f"Unknown projector type: {mm_projector_type}")
+        self.post_init()
 
     def forward(self, x, *args, **kwargs):
         return self.layers(x)
@@ -1157,6 +1158,9 @@ class VilaInputProcessor(BaseMultimodalInputProcessor,
             "video": "<vila/video>"
         },
         placeholder_placement=MultimodalPlaceholderPlacement.BEFORE_TEXT,
+        # VILA handles its own chat template and placeholder insertion
+        # in VilaInputProcessor.
+        content_format=ContentFormat.PASSTHROUGH,
     ))
 class VilaModel(PreTrainedModel):
     config_class = VilaConfig
@@ -1240,6 +1244,10 @@ class VilaModel(PreTrainedModel):
             _resize_token_embeddings(self.llm, len(self.tokenizer))
             self.vocab_size = len(self.tokenizer)
 
+    @property
+    def vocab_size_padded(self) -> int:
+        return self.llm.vocab_size_padded
+
     def infer_max_seq_len(self) -> int:
         return self.llm.infer_max_seq_len()
 
@@ -1249,5 +1257,5 @@ class VilaModel(PreTrainedModel):
         self.model_config.pretrained_config = self.llm.config
 
 
-AutoConfig.register(VilaConfig.model_type, VilaConfig)
+AutoConfig.register(VilaConfig.model_type, VilaConfig, exist_ok=True)
 AutoModel.register(VilaConfig, VilaModel)

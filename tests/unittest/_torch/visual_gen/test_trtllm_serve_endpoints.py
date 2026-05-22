@@ -1,0 +1,1134 @@
+"""trtllm-serve visual_gen endpoints tests.
+
+Tests all endpoints registered for the VISUAL_GEN server role
+in OpenAIServer.register_visual_gen_routes():
+
+    POST /v1/images/generations
+    POST /v1/images/edits
+    POST /v1/videos/generations   (sync)
+    POST /v1/videos               (async)
+    GET  /v1/videos               (list)
+    GET  /v1/videos/{video_id}    (metadata)
+    GET  /v1/videos/{video_id}/content  (download)
+    DELETE /v1/videos/{video_id}  (delete)
+"""
+
+import asyncio
+import base64
+import os
+from io import BytesIO
+from typing import Optional
+from unittest.mock import patch
+
+import pytest
+import torch
+from fastapi.testclient import TestClient
+from PIL import Image
+
+from tensorrt_llm.serve.openai_protocol import VideoJob
+from tensorrt_llm.serve.openai_server import _normalize_image_output
+from tensorrt_llm.serve.visual_gen_utils import VIDEO_STORE
+from tensorrt_llm.visual_gen.output import VisualGenMetrics, VisualGenOutput
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+def _make_dummy_image_tensor(height: int = 64, width: int = 64) -> torch.Tensor:
+    """Create a small dummy uint8 image tensor (H, W, C)."""
+    return torch.randint(0, 256, (height, width, 3), dtype=torch.uint8)
+
+
+def _make_dummy_video_tensor(
+    num_frames: int = 4, height: int = 64, width: int = 64
+) -> torch.Tensor:
+    """Create a small dummy uint8 video tensor (T, H, W, C)."""
+    return torch.randint(0, 256, (num_frames, height, width, 3), dtype=torch.uint8)
+
+
+def _make_dummy_audio_tensor(length: int = 16000) -> torch.Tensor:
+    """Create a small dummy float32 audio tensor."""
+    return torch.randn(1, length, dtype=torch.float32)
+
+
+def _b64_white_png_1x1() -> str:
+    """Return a base64-encoded 1x1 white PNG for image edit tests."""
+    buf = BytesIO()
+    Image.new("RGB", (1, 1), (255, 255, 255)).save(buf, format="PNG")
+    return base64.b64encode(buf.getvalue()).decode("utf-8")
+
+
+def _run_async(coro):
+    """Run an async coroutine in a new event loop (for test helpers)."""
+    loop = asyncio.new_event_loop()
+    try:
+        return loop.run_until_complete(coro)
+    finally:
+        loop.close()
+
+
+# ---------------------------------------------------------------------------
+# Mock VisualGen
+# ---------------------------------------------------------------------------
+
+
+class MockVisualGen:
+    """Lightweight stand-in for VisualGen that avoids GPU / model loading.
+
+    When *batch_aware* is True (default), ``generate()`` and
+    ``generate_async()`` inspect ``params.num_images_per_prompt`` and expand
+    the stored single-item tensors into batched tensors ``(N, ...)`` so
+    callers can test batch handling end-to-end.
+    """
+
+    def __init__(
+        self,
+        image_output: Optional[torch.Tensor] = None,
+        video_output: Optional[torch.Tensor] = None,
+        audio_output: Optional[torch.Tensor] = None,
+        should_fail: bool = False,
+        batch_aware: bool = True,
+    ):
+        self._image = image_output
+        self._video = video_output
+        self._audio = audio_output
+        self._should_fail = should_fail
+        self._batch_aware = batch_aware
+        self._healthy = True
+        self._req_counter = 0
+        # Captured arguments of the most recent generate / generate_async call,
+        # used by tests to assert forwarded VisualGenParams fields.
+        self.last_inputs = None
+        self.last_params = None
+
+    def _maybe_batch(self, tensor, n):
+        """Replicate a single tensor along a new leading batch dimension."""
+        if tensor is None or n <= 1 or not self._batch_aware:
+            return tensor
+        return tensor.unsqueeze(0).expand(n, *tensor.shape).contiguous()
+
+    # --- VisualGen interface ---
+
+    def generate(self, inputs=None, params=None) -> VisualGenOutput:
+        self.last_inputs = inputs
+        self.last_params = params
+        if self._should_fail:
+            raise RuntimeError("Generation intentionally failed")
+        n = getattr(params, "num_images_per_prompt", 1) if params else 1
+        return VisualGenOutput(
+            request_id=self._next_request_id(),
+            image=self._maybe_batch(self._image, n),
+            video=self._maybe_batch(self._video, n),
+            audio=self._audio,
+            metrics=VisualGenMetrics(),
+        )
+
+    def generate_async(self, inputs=None, params=None) -> "MockVisualGenResult":
+        self.last_inputs = inputs
+        self.last_params = params
+        n = getattr(params, "num_images_per_prompt", 1) if params else 1
+        return MockVisualGenResult(
+            request_id=self._next_request_id(),
+            image=self._maybe_batch(self._image, n),
+            video=self._maybe_batch(self._video, n),
+            audio=self._audio,
+            should_fail=self._should_fail,
+        )
+
+    def _next_request_id(self) -> int:
+        rid = self._req_counter
+        self._req_counter += 1
+        return rid
+
+    @property
+    def default_params(self):
+        """Stand-in for VisualGen.default_params — parse_visual_gen_params
+        seeds request params from this, so it must return a fresh instance."""
+        from tensorrt_llm.visual_gen import VisualGenParams
+
+        return VisualGenParams()
+
+    def _check_health(self) -> bool:
+        return self._healthy
+
+    async def get_stats_async(self, timeout: int):
+        return
+
+    def shutdown(self):
+        pass
+
+
+class MockVisualGenResult:
+    """Mock future-like result for generate_async.
+
+    Mirrors the real :class:`VisualGenResult` surface enough for the server:
+    ``__await__``, ``aresult``, and a sync ``result``. Resolves to a
+    :class:`VisualGenOutput` (single-prompt path).
+    """
+
+    def __init__(
+        self,
+        request_id: int = 0,
+        image: Optional[torch.Tensor] = None,
+        video: Optional[torch.Tensor] = None,
+        audio: Optional[torch.Tensor] = None,
+        should_fail: bool = False,
+    ):
+        self.request_id = request_id
+        self._image = image
+        self._video = video
+        self._audio = audio
+        self._should_fail = should_fail
+
+    def __await__(self):
+        return self.aresult().__await__()
+
+    async def aresult(self, timeout=None):
+        if self._should_fail:
+            raise RuntimeError("Async generation intentionally failed")
+        return VisualGenOutput(
+            request_id=self.request_id,
+            image=self._image,
+            video=self._video,
+            audio=self._audio,
+            metrics=VisualGenMetrics(),
+        )
+
+    def result(self, timeout=None):
+        if self._should_fail:
+            raise RuntimeError("Async generation intentionally failed")
+        return VisualGenOutput(
+            request_id=self.request_id,
+            image=self._image,
+            video=self._video,
+            audio=self._audio,
+            metrics=VisualGenMetrics(),
+        )
+
+
+# ---------------------------------------------------------------------------
+# Server factory
+# ---------------------------------------------------------------------------
+
+
+def _create_server(generator: MockVisualGen, model_name: str = "test-model") -> TestClient:
+    """Instantiate an OpenAIServer for VISUAL_GEN with a mocked generator.
+
+    We patch the ``VisualGen`` name inside the ``openai_server`` module so that
+    ``isinstance(generator, VisualGen)`` returns True for our mock.
+    """
+    from tensorrt_llm.llmapi.disagg_utils import ServerRole
+    from tensorrt_llm.serve.openai_server import OpenAIServer
+
+    with patch("tensorrt_llm.serve.openai_server.VisualGen", MockVisualGen):
+        server = OpenAIServer(
+            generator=generator,
+            model=model_name,
+            tool_parser=None,
+            server_role=ServerRole.VISUAL_GEN,
+            metadata_server_cfg=None,
+        )
+    client = TestClient(server.app)
+    # Expose the mock so tests can assert captured generate() arguments.
+    client.mock_gen = generator
+    return client
+
+
+# ---------------------------------------------------------------------------
+# Fixtures
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture()
+def image_client(tmp_path):
+    """TestClient backed by a MockVisualGen that produces images."""
+    gen = MockVisualGen(image_output=_make_dummy_image_tensor())
+    os.environ["TRTLLM_MEDIA_STORAGE_PATH"] = str(tmp_path)
+    client = _create_server(gen)
+    yield client
+    os.environ.pop("TRTLLM_MEDIA_STORAGE_PATH", None)
+
+
+@pytest.fixture()
+def video_client(tmp_path):
+    """TestClient backed by a MockVisualGen that produces videos."""
+    gen = MockVisualGen(video_output=_make_dummy_video_tensor())
+    os.environ["TRTLLM_MEDIA_STORAGE_PATH"] = str(tmp_path)
+    client = _create_server(gen)
+    yield client
+    os.environ.pop("TRTLLM_MEDIA_STORAGE_PATH", None)
+
+
+@pytest.fixture()
+def video_audio_client(tmp_path):
+    """TestClient backed by a MockVisualGen that produces videos with audio."""
+    gen = MockVisualGen(
+        video_output=_make_dummy_video_tensor(),
+        audio_output=_make_dummy_audio_tensor(),
+    )
+    os.environ["TRTLLM_MEDIA_STORAGE_PATH"] = str(tmp_path)
+    client = _create_server(gen)
+    yield client
+    os.environ.pop("TRTLLM_MEDIA_STORAGE_PATH", None)
+
+
+@pytest.fixture()
+def failing_client(tmp_path):
+    """TestClient backed by a MockVisualGen that always fails."""
+    gen = MockVisualGen(should_fail=True)
+    os.environ["TRTLLM_MEDIA_STORAGE_PATH"] = str(tmp_path)
+    client = _create_server(gen)
+    yield client
+    os.environ.pop("TRTLLM_MEDIA_STORAGE_PATH", None)
+
+
+@pytest.fixture(autouse=True)
+def _clear_video_store():
+    """Reset the global VIDEO_STORE before each test."""
+    VIDEO_STORE._items.clear()
+    yield
+    VIDEO_STORE._items.clear()
+
+
+@pytest.fixture(autouse=True)
+def _mock_video_encoding():
+    """Mock video encoding to avoid ffmpeg dependency in unit tests.
+
+    Replaces ``tensorrt_llm.media.encoding._save_encoded_video`` with a stub
+    that writes a small dummy file so FileResponse can serve it; also mocks
+    ffmpeg availability so ``resolve_video_format`` always resolves to mp4.
+    """
+
+    def _dummy_save_encoded_video(video, audio, output_path, frame_rate, audio_sample_rate=24000):
+        os.makedirs(os.path.dirname(str(output_path)) or ".", exist_ok=True)
+        with open(str(output_path), "wb") as f:
+            f.write(b"\x00\x00\x00\x1cftypisom" + b"\x00" * 32)
+        return str(output_path)
+
+    with (
+        patch("tensorrt_llm.media.encoding._save_encoded_video", _dummy_save_encoded_video),
+        patch("tensorrt_llm.media.encoding._check_ffmpeg_available", return_value=True),
+    ):
+        yield
+
+
+# =========================================================================
+# POST /v1/images/generations
+# =========================================================================
+
+
+class TestImageGeneration:
+    def test_basic_image_generation_b64(self, image_client):
+        resp = image_client.post(
+            "/v1/images/generations",
+            json={
+                "prompt": "A cat sitting on a mat",
+                "response_format": "b64_json",
+                "size": "64x64",
+            },
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert "data" in data
+        assert len(data["data"]) >= 1
+        img_obj = data["data"][0]
+        assert img_obj["b64_json"] is not None
+        # Verify it decodes to valid bytes
+        decoded = base64.b64decode(img_obj["b64_json"])
+        assert len(decoded) > 0
+        assert img_obj["revised_prompt"] == "A cat sitting on a mat"
+
+    def test_image_generation_with_optional_params(self, image_client):
+        resp = image_client.post(
+            "/v1/images/generations",
+            json={
+                "prompt": "Sunset over ocean",
+                "response_format": "b64_json",
+                "size": "128x64",
+                "num_inference_steps": 20,
+                "guidance_scale": 7.5,
+                "seed": 123,
+                "negative_prompt": "blurry",
+            },
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["size"] == "128x64"
+
+        # Verify openai_server/parse_visual_gen_params forwarded every field.
+        params = image_client.mock_gen.last_params
+        assert image_client.mock_gen.last_inputs == "Sunset over ocean"
+        assert params.width == 128
+        assert params.height == 64
+        assert params.num_inference_steps == 20
+        assert params.guidance_scale == 7.5
+        assert params.negative_prompt == "blurry"
+
+    def test_image_generation_url_format_not_supported(self, image_client):
+        resp = image_client.post(
+            "/v1/images/generations",
+            json={
+                "prompt": "A dog",
+                "response_format": "url",
+            },
+        )
+        assert resp.status_code == 501
+
+    def test_image_generation_auto_size(self, image_client):
+        resp = image_client.post(
+            "/v1/images/generations",
+            json={
+                "prompt": "A tree",
+                "response_format": "b64_json",
+                "size": "auto",
+            },
+        )
+        assert resp.status_code == 200
+
+    def test_image_generation_failure(self, failing_client):
+        resp = failing_client.post(
+            "/v1/images/generations",
+            json={
+                "prompt": "A bird",
+                "response_format": "b64_json",
+            },
+        )
+        assert resp.status_code == 400
+
+    def test_image_generation_invalid_size(self, image_client):
+        """Invalid size triggers RequestValidationError → custom handler → 400."""
+        resp = image_client.post(
+            "/v1/images/generations",
+            json={
+                "prompt": "A mountain",
+                "response_format": "b64_json",
+                "size": "invalid",
+            },
+        )
+        assert resp.status_code == 400
+
+    def test_image_generation_null_output(self, tmp_path):
+        """Generator returns VisualGenOutput with image=None."""
+        gen = MockVisualGen(image_output=None)
+        os.environ["TRTLLM_MEDIA_STORAGE_PATH"] = str(tmp_path)
+        client = _create_server(gen)
+        resp = client.post(
+            "/v1/images/generations",
+            json={
+                "prompt": "null image",
+                "response_format": "b64_json",
+            },
+        )
+        assert resp.status_code == 500
+        os.environ.pop("TRTLLM_MEDIA_STORAGE_PATH", None)
+
+    def test_image_generation_multiple_n(self, image_client):
+        """Request n=2 images in one call."""
+        resp = image_client.post(
+            "/v1/images/generations",
+            json={
+                "prompt": "Flowers",
+                "response_format": "b64_json",
+                "size": "64x64",
+                "n": 2,
+            },
+        )
+        assert resp.status_code == 200
+
+    def test_image_generation_hd_quality(self, image_client):
+        resp = image_client.post(
+            "/v1/images/generations",
+            json={
+                "prompt": "HD landscape",
+                "response_format": "b64_json",
+                "quality": "hd",
+            },
+        )
+        assert resp.status_code == 200
+
+    def test_missing_prompt_image_generation(self, image_client):
+        """Missing required field → RequestValidationError → custom handler → 400."""
+        resp = image_client.post(
+            "/v1/images/generations",
+            json={},
+        )
+        assert resp.status_code == 400
+
+    def test_image_generation_b64_no_save_image_no_disk_write(self, image_client, tmp_path):
+        """Regression guard for NVBug 6064029.
+
+        The b64_json hot path must not call ``save_image()``, which caused a
+        redundant PNG encode plus an unnecessary disk write before fix #12903.
+        """
+        with patch("tensorrt_llm.media.encoding.save_image") as mock_save:
+            resp = image_client.post(
+                "/v1/images/generations",
+                json={
+                    "prompt": "A cat sitting on a mat",
+                    "response_format": "b64_json",
+                    "size": "64x64",
+                },
+            )
+        assert resp.status_code == 200
+        mock_save.assert_not_called()
+        assert list(tmp_path.glob("*.png")) == []
+
+    def test_image_generation_b64_with_4d_batch_pipeline_output(self, tmp_path):
+        """NVBug 6064029: when the pipeline returns a 4D (B, H, W, C)
+        tensor (e.g. FLUX2), all B images must be expanded, encoded once
+        each, and returned in order. Pre-fix, save_image silently kept
+        only image[0], so the response would drop every batch entry but
+        the first."""
+        # Use deterministic distinct images (all-zeros vs all-255) so
+        # we can verify per-image output mapping, not just call counts.
+        from tensorrt_llm.media.encoding import image_to_bytes
+
+        img0 = torch.zeros((64, 64, 3), dtype=torch.uint8)
+        img1 = torch.full((64, 64, 3), 255, dtype=torch.uint8)
+        batch = torch.stack([img0, img1])  # (2, H, W, C)
+        expected_b64 = [
+            base64.b64encode(image_to_bytes(img)).decode("utf-8") for img in (img0, img1)
+        ]
+
+        gen = MockVisualGen(image_output=batch)
+        os.environ["TRTLLM_MEDIA_STORAGE_PATH"] = str(tmp_path)
+        try:
+            client = _create_server(gen)
+            with (
+                patch(
+                    "tensorrt_llm.serve.openai_server.image_to_bytes",
+                    wraps=image_to_bytes,
+                ) as mock_cvt,
+                patch("tensorrt_llm.media.encoding.save_image") as mock_save,
+            ):
+                resp = client.post(
+                    "/v1/images/generations",
+                    json={
+                        "prompt": "two cats",
+                        "response_format": "b64_json",
+                        "size": "64x64",
+                    },
+                )
+            assert resp.status_code == 200
+            data = resp.json()["data"]
+            assert len(data) == 2
+            assert mock_cvt.call_count == 2
+            mock_save.assert_not_called()
+            # Content + order match: proves each batch entry maps to
+            # its own b64 output, not just "encoded twice on image[0]".
+            assert [entry["b64_json"] for entry in data] == expected_b64
+        finally:
+            os.environ.pop("TRTLLM_MEDIA_STORAGE_PATH", None)
+
+
+# =========================================================================
+# POST /v1/images/edits
+# =========================================================================
+
+
+class TestImageEdit:
+    """``/v1/images/edits`` returns 501 NotImplemented in the current release.
+
+    No in-tree pipeline implements image editing: Flux/Flux2 are
+    text-to-image only and ignore ``params.image``; Wan and LTX-2 produce
+    video, not edited images. Restore the full happy-path coverage when an
+    edit-capable pipeline lands.
+    """
+
+    def test_image_edit_returns_not_implemented(self, image_client):
+        """Valid request body still short-circuits to 501 NotImplemented."""
+        b64_img = _b64_white_png_1x1()
+        resp = image_client.post(
+            "/v1/images/edits",
+            json={
+                "image": b64_img,
+                "prompt": "Make it blue",
+                "num_inference_steps": 10,
+            },
+        )
+        assert resp.status_code == 501
+        body = resp.json()
+        assert body.get("type") == "NotImplementedError"
+        assert "not supported" in body.get("message", "").lower()
+
+    def test_missing_image_for_edit(self, image_client):
+        """Missing required field is rejected by FastAPI request validation
+        (400) before the 501 short-circuit, so this contract is unchanged."""
+        resp = image_client.post(
+            "/v1/images/edits",
+            json={
+                "prompt": "Edit without image",
+            },
+        )
+        assert resp.status_code == 400
+
+
+# =========================================================================
+# _normalize_image_output helper (NVBug 6064029)
+# =========================================================================
+
+
+class TestNormalizeImageOutput:
+    """Coverage for the helper added by the NVBug 6064029 fix."""
+
+    def test_list_input_passthrough(self):
+        t1 = _make_dummy_image_tensor()
+        t2 = _make_dummy_image_tensor()
+        out = _normalize_image_output([t1, t2])
+        assert len(out) == 2
+        assert out[0] is t1 and out[1] is t2
+
+    def test_3d_tensor_wrapped_as_single(self):
+        t = _make_dummy_image_tensor()  # (H, W, C)
+        assert t.dim() == 3
+        out = _normalize_image_output(t)
+        assert len(out) == 1 and out[0] is t
+
+    def test_4d_batch_tensor_expanded(self):
+        batch = torch.stack([_make_dummy_image_tensor() for _ in range(3)])
+        assert batch.dim() == 4 and batch.shape[0] == 3
+        out = _normalize_image_output(batch)
+        assert len(out) == 3
+        for i in range(3):
+            assert torch.equal(out[i], batch[i])
+
+
+# =========================================================================
+# POST /v1/videos/generations  (synchronous)
+# =========================================================================
+
+
+@pytest.mark.threadleak(enabled=False)  # FileResponse spawns AnyIO worker threads
+class TestVideoGenerationSync:
+    def test_basic_sync_video_generation(self, video_client):
+        resp = video_client.post(
+            "/v1/videos/generations",
+            json={
+                "prompt": "A rocket launching",
+                "size": "64x64",
+                "seconds": 1.0,
+                "fps": 8,
+            },
+            headers={"content-type": "application/json"},
+        )
+        assert resp.status_code == 200
+        assert resp.headers["content-type"] == "video/mp4"
+        assert len(resp.content) > 0
+
+    def test_sync_video_generation_with_params(self, video_client):
+        resp = video_client.post(
+            "/v1/videos/generations",
+            json={
+                "prompt": "Ocean waves",
+                "size": "64x64",
+                "seconds": 2.0,
+                "fps": 8,
+                "num_inference_steps": 10,
+                "guidance_scale": 5.0,
+                "seed": 42,
+                "negative_prompt": "blurry",
+            },
+            headers={"content-type": "application/json"},
+        )
+        assert resp.status_code == 200
+        assert len(resp.content) > 0
+
+        params = video_client.mock_gen.last_params
+        assert video_client.mock_gen.last_inputs == "Ocean waves"
+        assert params.width == 64
+        assert params.height == 64
+        assert params.num_inference_steps == 10
+        assert params.guidance_scale == 5.0
+        assert params.seed == 42
+        assert params.negative_prompt == "blurry"
+        assert params.frame_rate == 8
+        assert params.num_frames == int(2.0 * 8)
+
+    def test_sync_video_generation_multipart(self, video_client):
+        # Use files={} with a dummy file to ensure multipart/form-data
+        dummy_file = BytesIO(b"")
+        resp = video_client.post(
+            "/v1/videos/generations",
+            data={
+                "prompt": "Mountain sunrise",
+                "size": "64x64",
+                "seconds": "1.0",
+                "fps": "8",
+            },
+            files={"_dummy": ("dummy", dummy_file, "application/octet-stream")},
+        )
+        # The server will parse fields; _dummy is ignored since it's not "input_reference"
+        assert resp.status_code == 200
+        assert len(resp.content) > 0
+
+    def test_sync_video_generation_multipart_with_reference(self, video_client, tmp_path):
+        # Create a dummy reference image file
+        ref_path = tmp_path / "ref.png"
+        Image.new("RGB", (4, 4), (128, 128, 128)).save(str(ref_path))
+
+        with open(ref_path, "rb") as f:
+            resp = video_client.post(
+                "/v1/videos/generations",
+                data={
+                    "prompt": "Animate this image",
+                    "size": "64x64",
+                    "seconds": "1.0",
+                    "fps": "8",
+                },
+                files={"input_reference": ("ref.png", f, "image/png")},
+            )
+        assert resp.status_code == 200
+        assert len(resp.content) > 0
+
+        # input_reference should have been written to media storage and passed
+        # through as params.image (a filesystem path).
+        params = video_client.mock_gen.last_params
+        assert isinstance(params.image, str)
+        assert params.image.endswith("_reference.png")
+        assert os.path.exists(params.image)
+
+    def test_sync_video_failure(self, failing_client):
+        resp = failing_client.post(
+            "/v1/videos/generations",
+            json={
+                "prompt": "Should fail",
+                "size": "64x64",
+                "seconds": 1.0,
+                "fps": 8,
+            },
+            headers={"content-type": "application/json"},
+        )
+        assert resp.status_code == 500
+
+    def test_sync_video_null_output(self, tmp_path):
+        """Generator returns VisualGenOutput with video=None."""
+        gen = MockVisualGen(video_output=None)
+        os.environ["TRTLLM_MEDIA_STORAGE_PATH"] = str(tmp_path)
+        client = _create_server(gen)
+        resp = client.post(
+            "/v1/videos/generations",
+            json={"prompt": "null video", "size": "64x64", "seconds": 1.0, "fps": 8},
+            headers={"content-type": "application/json"},
+        )
+        assert resp.status_code == 500
+        os.environ.pop("TRTLLM_MEDIA_STORAGE_PATH", None)
+
+    def test_sync_video_unsupported_content_type(self, video_client):
+        resp = video_client.post(
+            "/v1/videos/generations",
+            content=b"some raw bytes",
+            headers={"content-type": "text/plain"},
+        )
+        assert resp.status_code == 400
+
+    def test_sync_video_missing_prompt_json(self, video_client):
+        """Missing required prompt → Pydantic ValidationError → 400."""
+        resp = video_client.post(
+            "/v1/videos/generations",
+            json={"size": "64x64"},
+            headers={"content-type": "application/json"},
+        )
+        assert resp.status_code == 400
+
+    def test_sync_video_missing_prompt_multipart(self, video_client):
+        """Missing prompt in multipart form → ValueError → 400."""
+        dummy_file = BytesIO(b"")
+        resp = video_client.post(
+            "/v1/videos/generations",
+            data={"size": "64x64"},
+            files={"_dummy": ("dummy", dummy_file, "application/octet-stream")},
+        )
+        assert resp.status_code == 400
+
+    def test_sync_video_batch_n2(self, video_client):
+        """Sync video with n=2 should succeed and return the first video."""
+        resp = video_client.post(
+            "/v1/videos/generations",
+            json={
+                "prompt": "Batch rockets",
+                "size": "64x64",
+                "seconds": 1.0,
+                "fps": 8,
+                "n": 2,
+            },
+            headers={"content-type": "application/json"},
+        )
+        assert resp.status_code == 200
+        assert len(resp.content) > 0
+
+
+# =========================================================================
+# POST /v1/videos  (asynchronous)
+# =========================================================================
+
+
+class TestVideoGenerationAsync:
+    def test_async_video_returns_202(self, video_client):
+        resp = video_client.post(
+            "/v1/videos",
+            json={
+                "prompt": "A dancing robot",
+                "size": "64x64",
+                "seconds": 1.0,
+                "fps": 8,
+            },
+            headers={"content-type": "application/json"},
+        )
+        assert resp.status_code == 202
+        data = resp.json()
+        assert data["status"] == "queued"
+        assert data["object"] == "video"
+        assert data["prompt"] == "A dancing robot"
+        assert data["id"].startswith("video_")
+
+    def test_async_video_job_metadata_fields(self, video_client):
+        resp = video_client.post(
+            "/v1/videos",
+            json={
+                "prompt": "Starry night",
+                "size": "64x64",
+                "seconds": 2.0,
+                "fps": 12,
+            },
+            headers={"content-type": "application/json"},
+        )
+        data = resp.json()
+        assert "created_at" in data
+        assert data["duration"] == 2.0
+        assert data["fps"] == 12
+        assert data["size"] == "64x64"
+
+    def test_async_video_multipart(self, video_client):
+        """Multipart encoding requires a file field to trigger the correct content-type."""
+        dummy_file = BytesIO(b"")
+        resp = video_client.post(
+            "/v1/videos",
+            data={
+                "prompt": "A sunset",
+                "size": "64x64",
+                "seconds": "1.0",
+                "fps": "8",
+            },
+            files={"_dummy": ("dummy", dummy_file, "application/octet-stream")},
+        )
+        assert resp.status_code == 202
+
+    def test_async_video_invalid_seconds(self, video_client):
+        """Seconds must be between 1.0 and 16.0. Validation error → 400."""
+        resp = video_client.post(
+            "/v1/videos",
+            json={
+                "prompt": "Too short",
+                "seconds": 0.1,
+                "size": "64x64",
+                "fps": 8,
+            },
+            headers={"content-type": "application/json"},
+        )
+        assert resp.status_code == 400
+
+    def test_async_video_invalid_fps(self, video_client):
+        """Fps must be between 8 and 60. Validation error → 400."""
+        resp = video_client.post(
+            "/v1/videos",
+            json={
+                "prompt": "Bad fps",
+                "seconds": 1.0,
+                "fps": 2,
+                "size": "64x64",
+            },
+            headers={"content-type": "application/json"},
+        )
+        assert resp.status_code == 400
+
+    def test_async_video_forwards_params(self, video_client):
+        """Ensure async video endpoint forwards VisualGenParams to generate_async."""
+        resp = video_client.post(
+            "/v1/videos",
+            json={
+                "prompt": "Rainy street",
+                "size": "128x64",
+                "seconds": 2.0,
+                "fps": 10,
+                "num_inference_steps": 12,
+                "guidance_scale": 6.0,
+                "seed": 7,
+                "negative_prompt": "noise",
+            },
+            headers={"content-type": "application/json"},
+        )
+        assert resp.status_code == 202
+        video_id = resp.json()["id"]
+
+        # The background task calls generate_async lazily — drive the event
+        # loop via status polling until the job completes.
+        import time as _time
+
+        deadline = _time.time() + 5
+        while _time.time() < deadline:
+            meta = video_client.get(f"/v1/videos/{video_id}").json()
+            if meta.get("status") in ("completed", "failed"):
+                break
+            _time.sleep(0.05)
+
+        params = video_client.mock_gen.last_params
+        assert video_client.mock_gen.last_inputs == "Rainy street"
+        assert params.width == 128
+        assert params.height == 64
+        assert params.num_inference_steps == 12
+        assert params.guidance_scale == 6.0
+        assert params.seed == 7
+        assert params.negative_prompt == "noise"
+        assert params.frame_rate == 10
+        assert params.num_frames == int(2.0 * 10)
+
+    def test_async_video_batch_n2(self, video_client):
+        """Async video with n=2 should accept the request and return 202."""
+        resp = video_client.post(
+            "/v1/videos",
+            json={
+                "prompt": "Batch fireworks",
+                "size": "64x64",
+                "seconds": 1.0,
+                "fps": 8,
+                "n": 2,
+            },
+            headers={"content-type": "application/json"},
+        )
+        assert resp.status_code == 202
+        data = resp.json()
+        assert data["status"] == "queued"
+        assert data["id"].startswith("video_")
+
+
+# =========================================================================
+# GET /v1/videos  (list)
+# =========================================================================
+
+
+class TestListVideos:
+    def test_list_videos_empty(self, video_client):
+        resp = video_client.get("/v1/videos")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["object"] == "list"
+        assert data["data"] == []
+
+    def test_list_videos_after_creation(self, video_client):
+        # Create two video jobs
+        video_client.post(
+            "/v1/videos",
+            json={"prompt": "First video", "size": "64x64", "seconds": 1.0, "fps": 8},
+            headers={"content-type": "application/json"},
+        )
+        video_client.post(
+            "/v1/videos",
+            json={"prompt": "Second video", "size": "64x64", "seconds": 1.0, "fps": 8},
+            headers={"content-type": "application/json"},
+        )
+
+        resp = video_client.get("/v1/videos")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert len(data["data"]) == 2
+
+
+# =========================================================================
+# GET /v1/videos/{video_id}  (metadata)
+# =========================================================================
+
+
+class TestGetVideoMetadata:
+    def test_get_video_metadata_success(self, video_client):
+        create_resp = video_client.post(
+            "/v1/videos",
+            json={"prompt": "Space walk", "size": "64x64", "seconds": 1.0, "fps": 8},
+            headers={"content-type": "application/json"},
+        )
+        video_id = create_resp.json()["id"]
+
+        resp = video_client.get(f"/v1/videos/{video_id}")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["id"] == video_id
+        assert data["object"] == "video"
+        assert data["prompt"] == "Space walk"
+
+    def test_get_video_metadata_not_found(self, video_client):
+        resp = video_client.get("/v1/videos/video_nonexistent")
+        assert resp.status_code == 404
+
+
+# =========================================================================
+# GET /v1/videos/{video_id}/content  (download)
+# =========================================================================
+
+
+@pytest.mark.threadleak(enabled=False)  # FileResponse spawns AnyIO worker threads
+class TestGetVideoContent:
+    def _insert_video_job(self, video_id: str, status: str = "queued"):
+        import time as _time
+
+        job = VideoJob(
+            created_at=int(_time.time()),
+            id=video_id,
+            model="test-model",
+            prompt="test prompt",
+            status=status,
+        )
+        _run_async(VIDEO_STORE.upsert(video_id, job))
+
+    def test_get_video_content_success(self, tmp_path):
+        gen = MockVisualGen(video_output=_make_dummy_video_tensor())
+        os.environ["TRTLLM_MEDIA_STORAGE_PATH"] = str(tmp_path)
+        client = _create_server(gen)
+
+        video_id = "video_testcontent"
+        self._insert_video_job(video_id, status="completed")
+
+        # Write a dummy mp4 file so FileResponse can serve it
+        video_path = tmp_path / f"{video_id}.mp4"
+        video_path.write_bytes(b"\x00\x00\x00\x1cftyp" + b"\x00" * 16)
+
+        resp = client.get(f"/v1/videos/{video_id}/content")
+        assert resp.status_code == 200
+        assert "video/mp4" in resp.headers.get("content-type", "")
+        assert len(resp.content) > 0
+        os.environ.pop("TRTLLM_MEDIA_STORAGE_PATH", None)
+
+    def test_get_video_content_not_found(self, video_client):
+        resp = video_client.get("/v1/videos/video_nonexistent/content")
+        assert resp.status_code == 404
+
+    def test_get_video_content_not_ready(self, tmp_path):
+        """A queued video should return 400 when its content is requested."""
+        gen = MockVisualGen(video_output=_make_dummy_video_tensor())
+        os.environ["TRTLLM_MEDIA_STORAGE_PATH"] = str(tmp_path)
+        client = _create_server(gen)
+
+        video_id = "video_notready"
+        self._insert_video_job(video_id, status="queued")
+
+        resp = client.get(f"/v1/videos/{video_id}/content")
+        assert resp.status_code == 400
+        os.environ.pop("TRTLLM_MEDIA_STORAGE_PATH", None)
+
+    def test_get_video_content_completed_but_file_missing(self, tmp_path):
+        """Video marked completed but file deleted from disk → 404."""
+        gen = MockVisualGen(video_output=_make_dummy_video_tensor())
+        os.environ["TRTLLM_MEDIA_STORAGE_PATH"] = str(tmp_path)
+        client = _create_server(gen)
+
+        video_id = "video_nofile"
+        self._insert_video_job(video_id, status="completed")
+        # Do NOT write a file
+
+        resp = client.get(f"/v1/videos/{video_id}/content")
+        assert resp.status_code == 404
+        os.environ.pop("TRTLLM_MEDIA_STORAGE_PATH", None)
+
+
+# =========================================================================
+# DELETE /v1/videos/{video_id}
+# =========================================================================
+
+
+class TestDeleteVideo:
+    def test_delete_video_success(self, tmp_path):
+        gen = MockVisualGen(video_output=_make_dummy_video_tensor())
+        os.environ["TRTLLM_MEDIA_STORAGE_PATH"] = str(tmp_path)
+        client = _create_server(gen)
+
+        create_resp = client.post(
+            "/v1/videos",
+            json={"prompt": "Delete me", "size": "64x64", "seconds": 1.0, "fps": 8},
+            headers={"content-type": "application/json"},
+        )
+        video_id = create_resp.json()["id"]
+
+        # Write a dummy video file matching the batch naming convention.
+        (tmp_path / f"{video_id}_0.mp4").write_bytes(b"\x00" * 32)
+
+        resp = client.delete(f"/v1/videos/{video_id}")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["deleted"] is True
+
+        # Verify it's gone from the store
+        resp = client.get(f"/v1/videos/{video_id}")
+        assert resp.status_code == 404
+
+        # Verify file is deleted
+        assert not (tmp_path / f"{video_id}_0.mp4").exists()
+        os.environ.pop("TRTLLM_MEDIA_STORAGE_PATH", None)
+
+    def test_delete_video_not_found(self, video_client):
+        resp = video_client.delete("/v1/videos/video_nonexistent")
+        assert resp.status_code == 404
+
+    def test_delete_video_without_file_on_disk(self, video_client):
+        """Delete a video job that exists in the store but has no file on disk."""
+        create_resp = video_client.post(
+            "/v1/videos",
+            json={"prompt": "No file", "size": "64x64", "seconds": 1.0, "fps": 8},
+            headers={"content-type": "application/json"},
+        )
+        video_id = create_resp.json()["id"]
+
+        resp = video_client.delete(f"/v1/videos/{video_id}")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["deleted"] is True
+
+    def test_delete_video_then_list_empty(self, video_client):
+        """After deleting the only video, the list should be empty."""
+        create_resp = video_client.post(
+            "/v1/videos",
+            json={"prompt": "Ephemeral", "size": "64x64", "seconds": 1.0, "fps": 8},
+            headers={"content-type": "application/json"},
+        )
+        video_id = create_resp.json()["id"]
+
+        video_client.delete(f"/v1/videos/{video_id}")
+
+        resp = video_client.get("/v1/videos")
+        assert resp.status_code == 200
+        assert resp.json()["data"] == []
+
+
+# =========================================================================
+# Test video generation failure handling (async)
+# =========================================================================
+
+
+class TestAsyncVideoFailureHandling:
+    def test_async_video_null_output_updates_job_status(self, tmp_path):
+        """When output.video is None in async generation, job status should be set to failed."""
+        import time
+
+        gen = MockVisualGen(video_output=None)
+        os.environ["TRTLLM_MEDIA_STORAGE_PATH"] = str(tmp_path)
+        client = _create_server(gen)
+
+        # Create async video job
+        create_resp = client.post(
+            "/v1/videos",
+            json={"prompt": "null video", "size": "64x64", "seconds": 1.0, "fps": 8},
+            headers={"content-type": "application/json"},
+        )
+        assert create_resp.status_code == 202
+        video_id = create_resp.json()["id"]
+
+        # Wait briefly for background task to complete
+        time.sleep(0.5)
+
+        # Check job status
+        resp = client.get(f"/v1/videos/{video_id}")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["status"] == "failed"
+        assert "error" in data
+        assert "output.video is None" in data["error"]
+
+        os.environ.pop("TRTLLM_MEDIA_STORAGE_PATH", None)

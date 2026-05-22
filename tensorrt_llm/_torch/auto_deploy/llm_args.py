@@ -1,20 +1,37 @@
+# SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 from importlib.resources import files
 from pathlib import Path
-from typing import Any, Dict, List, Literal, Optional, Type, Union
+from typing import Any, Dict, Literal, Optional, Type, Union
 
 import torch
 from pydantic import Field, ValidationInfo, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-from ...llmapi.llm_args import (
+from tensorrt_llm.llmapi.llm_args import (
     BuildConfig,
     EagleDecodingConfig,
-    SamplerType,
+    MTPDecodingConfig,
     TorchLlmArgs,
     _ParallelConfig,
 )
+
+from . import config as _ad_config_pkg
 from .models import ModelFactory, ModelFactoryRegistry
 from .utils._config import DynamicYamlMixInForSettings
+from .utils.dist_config import DistConfig
 from .utils.logger import ad_logger
 
 PathLike = Union[str, Path]
@@ -45,7 +62,6 @@ def _check_for_default_value_only(
 _TRANSFORMS_SHORTCUT_LOOKUP = {
     "attn_backend": ("insert_cached_attention.backend", "transformers_replace_cached_attn.backend"),
     "compile_backend": ("compile_model.backend",),
-    "cuda_graph_batch_sizes": ("compile_model.cuda_graph_batch_sizes",),
 }
 
 
@@ -78,15 +94,11 @@ class LlmArgs(DynamicYamlMixInForSettings, TorchLlmArgs, BaseSettings):
         frozen=True,
     )
 
-    @field_validator("max_seq_len", mode="before")
+    @field_validator("max_beam_width", mode="after")
     @classmethod
-    def ensure_max_seq_len(cls, value: Any, info: ValidationInfo) -> Any:
-        # NOTE: the bass class's default value is `None`, which is incompatible with the validators
-        # defined in this child class. This is problematic when e.g. TRTLLM serve explicitly passes
-        # the bass class's default in.
-        if value is None:
-            # Fallback to the AutoDeployConfig default when not provided.
-            return cls.model_fields["max_seq_len"].get_default(call_default_factory=True)
+    def ensure_no_beam_search(cls, value: Any) -> Any:
+        if value is not None and value > 1:
+            raise ValueError("AutoDeploy does not support beam search (max_beam_width > 1).")
         return value
 
     @field_validator("build_config", mode="before")
@@ -112,16 +124,62 @@ class LlmArgs(DynamicYamlMixInForSettings, TorchLlmArgs, BaseSettings):
         return _check_for_default_value_only(cls, value, info, msg)
 
     @model_validator(mode="after")
-    def setup_hidden_state_capture(self):
-        if self.speculative_config is None or not isinstance(
-            self.speculative_config, EagleDecodingConfig
-        ):
+    def validate_supported_speculative_config(self):
+        spec_config = self.speculative_config
+        if spec_config is None:
             return self
 
-        self.transforms["detect_hidden_states_for_capture"]["capture_hidden_states"] = True
+        if isinstance(spec_config, MTPDecodingConfig):
+            if not spec_config.mtp_eagle_one_model or spec_config.use_mtp_vanilla:
+                raise ValueError(
+                    "AutoDeploy only supports MTP speculative decoding with "
+                    "mtp_eagle_one_model=True and use_mtp_vanilla=False "
+                    f"(got mtp_eagle_one_model={spec_config.mtp_eagle_one_model}, "
+                    f"use_mtp_vanilla={spec_config.use_mtp_vanilla})."
+                )
+        elif isinstance(spec_config, EagleDecodingConfig):
+            if not spec_config.eagle3_one_model:
+                raise ValueError(
+                    "AutoDeploy only supports Eagle speculative decoding with "
+                    f"eagle3_one_model=True (got eagle3_one_model={spec_config.eagle3_one_model})."
+                )
+        else:
+            raise ValueError(
+                "AutoDeploy only supports speculative decoding via "
+                "MTPDecodingConfig(mtp_eagle_one_model=True) or "
+                "EagleDecodingConfig(eagle3_one_model=True)."
+            )
+
+        self.model_factory = "eagle_one_model"
+        return self
+
+    @model_validator(mode="after")
+    def setup_hidden_state_capture(self):
+        spec_config = self.speculative_config
+        if spec_config is None:
+            return self
+
+        if isinstance(spec_config, MTPDecodingConfig):
+            if spec_config.max_draft_len is None:
+                raise ValueError(
+                    "MTPDecodingConfig.max_draft_len must not be None when mtp_eagle_one_model is "
+                    "enabled. Ensure num_nextn_predict_layers is set in the model config."
+                )
+            capture_layers = {-1}
+        else:
+            assert isinstance(spec_config, EagleDecodingConfig)
+            if spec_config.max_draft_len is None:
+                raise ValueError(
+                    "EagleDecodingConfig.max_draft_len must not be None. "
+                    "Provide a positive integer for max_draft_len."
+                )
+            capture_layers = spec_config.eagle3_layers_to_capture
+
+        self.transforms["detect_hidden_states_for_capture"]["enabled"] = True
         self.transforms["detect_hidden_states_for_capture"]["eagle3_layers_to_capture"] = (
-            self.speculative_config.eagle3_layers_to_capture
+            capture_layers
         )
+
         return self
 
     @model_validator(mode="after")
@@ -163,6 +221,13 @@ class LlmArgs(DynamicYamlMixInForSettings, TorchLlmArgs, BaseSettings):
         "model config class, it will be ignored.",
     )
 
+    speculative_model_kwargs: Dict[str, Any] = Field(
+        default_factory=dict,
+        description="Extra kwargs for the speculative (draft) model config class. Same semantics "
+        "as model_kwargs but applied to the draft model when using one-model Eagle speculative "
+        "decoding.",
+    )
+
     skip_loading_weights: bool = Field(
         default=False,
         description="Whether to skip loading model weights during initialization. "
@@ -185,28 +250,17 @@ class LlmArgs(DynamicYamlMixInForSettings, TorchLlmArgs, BaseSettings):
         " no processes are spawned and the model is run on a single GPU (only for ``demollm``).",
     )
 
-    runtime: Literal["demollm", "trtllm"] = Field(default="trtllm")
+    runtime: Literal["demollm", "trtllm"] = Field(
+        default="trtllm",
+        description="The runtime backend to use. 'trtllm' is a production-grade runtime optimized for "
+        "high-performance inference. 'demollm' is a lightweight runtime for development and testing "
+        "with a simplified scheduler and KV-cache manager for easier debugging.",
+    )
 
     device: str = Field(default="cuda", description="The device to use for the model.", frozen=True)
 
-    sampler_type: Union[str, SamplerType] = Field(
-        default=SamplerType.TorchSampler,
-        description="The type of sampler to use. Options are TRTLLMSampler or TorchSampler. Defaults to TorchSampler.",
-    )
-
-    max_beam_width: int = Field(
-        default=1,
-        description="The maximum beam width. >1 is not supported by AutoDeploy.",
-        frozen=True,
-    )
-
-    draft_checkpoint_loader: Optional[object] = Field(
-        default=None,
-        description="The checkpoint loader to use for the draft model when using speculative decoding with two models.",
-    )
-
     ### INFERENCE OPTIMIZER CONFIG #################################################################
-    mode: Literal["graph", "transformers", "export_edgellm_onnx"] = Field(
+    mode: Literal["graph", "transformers"] = Field(
         default="graph",
         description="The mode to use for the inference optimizer. Currently, we "
         "support only the 'graph' and 'transformers' modes, i.e., full-graph capture + optimization"
@@ -220,29 +274,12 @@ class LlmArgs(DynamicYamlMixInForSettings, TorchLlmArgs, BaseSettings):
     )
 
     ### SHORTCUTS FOR COMMON INFERENCE OPTIMIZER CONFIGS ###########################################
-    attn_backend: str = Field(
-        default="flashinfer",
-        description=_shortcut_description("Attention backend to use.", "attn_backend"),
-    )
     compile_backend: str = Field(
-        default="torch-compile",
+        default="torch-cudagraph",
         description=_shortcut_description(
             "The backend to use for compiling the model.", "compile_backend"
         ),
     )
-    # TODO(#9306): fold this into `CudaGraphConfig`.
-    cuda_graph_batch_sizes: Optional[List[int]] = Field(
-        default=None,
-        description=_shortcut_description(
-            "List of batch sizes for CUDA graph creation. If not provided, a heuristic will"
-            " be used to determine the batch sizes.",
-            "cuda_graph_batch_sizes",
-        ),
-    )
-
-    ### SEQUENCE INTERFACE CONFIG ##################################################################
-    max_seq_len: int = Field(default=512, ge=1, description="The maximum sequence length.")
-    max_batch_size: int = Field(default=8, ge=1, description="The maximum batch size.")
 
     def model_dump(self, *args, **kwargs):
         """Convert the arguments to a dictionary that can be used as kwargs for the LLM API."""
@@ -295,46 +332,161 @@ class LlmArgs(DynamicYamlMixInForSettings, TorchLlmArgs, BaseSettings):
         return self
 
     @model_validator(mode="after")
-    def update_cuda_graph_batch_sizes(self):
-        # if not set, use heuristic
-        if self.cuda_graph_batch_sizes is None:
-            cg_bs = {1, self.max_batch_size}
-            # Only add batch sizes up to max_batch_size
-            cg_bs.update(range(1, min(128, self.max_batch_size) + 1, 16))
-            cg_bs.update(range(128, self.max_batch_size + 1, 128))
-        else:
-            cg_bs = [b for b in self.cuda_graph_batch_sizes if b <= self.max_batch_size]
-        self.cuda_graph_batch_sizes = sorted(cg_bs, reverse=True)
-        ad_logger.info(f"Using cuda_graph_batch_sizes: {self.cuda_graph_batch_sizes}")
+    def sync_cuda_graph_batch_sizes_to_compile_config(self):
+        """Propagate cuda_graph_config.batch_sizes into compile_model transform config.
 
-        # ensure that the cuda_graph_batch_sizes are updated in the shortcut and transform config
-        self.update_transforms_with_shortcuts()
+        The parent class CudaGraphConfig computes batch_sizes (with heuristic if needed),
+        but the compile_model transform has its own cuda_graph_batch_sizes field that must
+        be kept in sync.
+        """
+        cg = self.cuda_graph_config
+        if cg is None or "compile_model" not in self.transforms:
+            return self
+
+        if cg.max_batch_size > self.max_batch_size:
+            raise ValueError(
+                f"The top-level `max_batch_size` ({self.max_batch_size}) must be greater than "
+                f"or equal to `cuda_graph_config.max_batch_size` ({cg.max_batch_size})."
+            )
+
+        if cg.batch_sizes:
+            self.transforms["compile_model"]["cuda_graph_batch_sizes"] = cg.batch_sizes
+
+        return self
+
+    @model_validator(mode="after")
+    def cap_max_batch_size_to_max_num_tokens(self):
+        """Ensure max_batch_size does not exceed max_num_tokens.
+
+        Since each sequence uses at least one token slot, max_batch_size cannot
+        exceed max_num_tokens. When only max_num_tokens is explicitly set, we
+        silently cap max_batch_size and warn. When both are explicitly set and
+        incompatible, we raise an error.
+        """
+        if self.max_num_tokens is not None and self.max_batch_size > self.max_num_tokens:
+            both_explicit = (
+                "max_batch_size" in self.model_fields_set
+                and "max_num_tokens" in self.model_fields_set
+            )
+            if both_explicit:
+                raise ValueError(
+                    f"max_batch_size ({self.max_batch_size}) cannot exceed "
+                    f"max_num_tokens ({self.max_num_tokens}). Each sequence "
+                    f"consumes at least one token slot."
+                )
+            ad_logger.warning(
+                f"max_batch_size ({self.max_batch_size}) exceeds max_num_tokens "
+                f"({self.max_num_tokens}). Capping max_batch_size to "
+                f"{self.max_num_tokens}."
+            )
+            self.max_batch_size = self.max_num_tokens
+        return self
+
+    @model_validator(mode="after")
+    def disable_cudagraph_for_speculative_flashinfer(self):
+        if (
+            self.speculative_config is not None
+            and self.attn_backend == "flashinfer"
+            and self.is_cuda_graph_enabled()
+        ):
+            ad_logger.warning(
+                "Speculative decoding with FlashInfer attention does not currently support CUDA "
+                "graph replay in AutoDeploy; falling back to compile_backend='torch-simple'."
+            )
+            self.compile_backend = "torch-simple"
+            self.update_transforms_with_shortcuts()
         return self
 
     ### UTILITY METHODS ############################################################################
+    @property
+    def requires_uniform_kv_caches(self) -> bool:
+        """Whether CachedSequenceInterface must enforce a uniform KV cache mapping."""
+        return self.attn_backend.lower() == "trtllm"
+
     def create_factory(self) -> ModelFactory:
-        """Create a model factory from the arguments."""
+        """Create a model factory from the arguments.
+
+        Side effects:
+            This method resolves `max_seq_len` when it has not been explicitly set by the user.
+            The value is inferred from the model configuration via the factory and written back to
+            `self.max_seq_len` so that all downstream consumers see the same value.
+        """
 
         # TODO (lucaslie): consider supporting Path objects in the model factory
-        return ModelFactoryRegistry.get(self.model_factory)(
+        factory = ModelFactoryRegistry.get(self.model_factory)(
             model=str(self.model),
             model_kwargs=self.model_kwargs,
             tokenizer=None if self.tokenizer is None else str(self.tokenizer),
             tokenizer_kwargs=self.tokenizer_kwargs,
             skip_loading_weights=self.skip_loading_weights,
             max_seq_len=self.max_seq_len,
+            # Extra kwargs consumed by EagleOneModelFactory (ignored by others via **kwargs)
+            sync_before_hidden_state_capture=self.attn_backend == "flashinfer",
+            speculative_config=self.speculative_config,
+            speculative_model_kwargs=self.speculative_model_kwargs or None,
         )
+
+        # The factory handles the logic internally for getting the `max_seq_len` if not provided
+        # by the user.
+        self.max_seq_len = factory.max_seq_len
+
+        return factory
 
     def is_cuda_graph_enabled(self) -> bool:
         return self.compile_backend in ["torch-cudagraph", "torch-opt"]
 
+    def init_dist_config(self, rank: int, world_size: int) -> DistConfig:
+        """Build DistConfig from YAML transform config and runtime MPI info.
+
+        Reads ``dist_mapping`` from ``apply_sharding_hints`` (preferred) or
+        ``detect_sharding`` (fallback).  Runtime ``rank`` and ``world_size``
+        come from MPI, not from YAML.
+
+        Note: AutoDeploy blocks direct parallelism fields (tensor_parallel_size,
+        etc.) via ``ensure_no_custom_parallel_config``.  Users configure MoE
+        topology exclusively through YAML ``dist_mapping`` blocks.  If that
+        restriction is lifted in the future, a Tier-1 path deriving DistConfig
+        from ``self.parallel_config.to_mapping()`` should be added here.
+        """
+        ash = self.transforms.get("apply_sharding_hints", {})
+        sharding_config = (
+            ash if ash.get("enabled", False) else self.transforms.get("detect_sharding", {})
+        )
+        dist_mapping = sharding_config.get("dist_mapping", {})
+        enable_attention_dp = sharding_config.get("enable_attention_dp", False)
+        allreduce_strategy = sharding_config.get("allreduce_strategy", "NCCL")
+
+        if enable_attention_dp:
+            # Attention-DP forces EP-only MoE topology regardless of YAML moe_tp/moe_ep.
+            dist_mapping = {**dist_mapping, "moe_ep": self.world_size, "moe_tp": 1}
+            ad_logger.info(
+                f"Attention-DP with EP-only MoE: moe_ep_size={self.world_size}, moe_tp_size=1"
+            )
+
+        allreduce_strategy = sharding_config.get("allreduce_strategy", "NCCL")
+
+        try:
+            dc = DistConfig.from_sharding_params(
+                rank=rank,
+                world_size=world_size,
+                dist_mapping=dist_mapping,
+                enable_attention_dp=enable_attention_dp,
+                allreduce_strategy=allreduce_strategy,
+            )
+        except ValueError as e:
+            raise ValueError(
+                f"Invalid parallel grid config: {e}. "
+                f"Please check your dist_mapping configuration: {dist_mapping}"
+            ) from e
+
+        return dc
+
     ### PRIVATE METHODS ############################################################################
     @classmethod
     def _get_yaml_default_from_mode(cls, mode: Optional[str]) -> Optional[str]:
-        config_path = files("tensorrt_llm._torch.auto_deploy.config")
+        config_path = files(_ad_config_pkg)
         mapping = {
             "graph": str(config_path / "default.yaml"),
             "transformers": str(config_path / "transformers.yaml"),
-            "export_edgellm_onnx": str(config_path / "export_edgellm_onnx.yaml"),
         }
         return mapping.get(mode)

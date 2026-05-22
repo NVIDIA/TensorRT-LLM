@@ -22,19 +22,26 @@ This script:
 """
 
 import copy
+import sys
 from collections import defaultdict
 from pathlib import Path
 
 import yaml
 
-from examples.configs.database.database import (
+SCRIPT_DIR = Path(__file__).parent.resolve()
+_REPO_ROOT = SCRIPT_DIR.parent
+
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+from examples.configs.database.database import (  # noqa: E402
     DATABASE_LIST_PATH,
     Recipe,
     RecipeList,
     select_key_recipes,
 )
 
-REPO_ROOT = Path(__file__).parent.parent
+REPO_ROOT = _REPO_ROOT
 PERF_SANITY_DIR = REPO_ROOT / "tests" / "scripts" / "perf-sanity"
 TEST_LIST_PATH = (
     REPO_ROOT / "tests" / "integration" / "test_lists" / "qa" / "llm_config_database.yml"
@@ -63,7 +70,8 @@ GPU_WILDCARDS = {
 def generate_server_name(recipe: Recipe) -> str:
     """Generate a unique server name from recipe."""
     model_slug = recipe.model.replace("/", "_").replace("-", "_").replace(".", "_")
-    return f"{model_slug}_{recipe.isl}_{recipe.osl}_conc{recipe.concurrency}_gpu{recipe.num_gpus}"
+    name = f"{model_slug}_{recipe.isl}_{recipe.osl}_conc{recipe.concurrency}_gpu{recipe.num_gpus}"
+    return name
 
 
 def generate_client_name(recipe: Recipe) -> str:
@@ -115,7 +123,13 @@ def group_recipes_by_scenario(recipes: RecipeList) -> dict:
     """Group recipes by scenario key (model, gpu, isl, osl, num_gpus)."""
     groups = defaultdict(list)
     for recipe in recipes:
-        key = (recipe.model, recipe.gpu, recipe.isl, recipe.osl, recipe.num_gpus)
+        key = (
+            recipe.model,
+            recipe.gpu,
+            recipe.isl,
+            recipe.osl,
+            recipe.num_gpus,
+        )
         groups[key].append(recipe)
     return groups
 

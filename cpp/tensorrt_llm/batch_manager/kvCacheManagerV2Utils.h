@@ -77,6 +77,18 @@ public:
     at::Tensor getCopyIndex(
         std::vector<LlmRequest::RequestIdType> const& requestIds, SizeType32 numContext, SizeType32 beamWidth);
 
+    /// Number of sequences currently tracked (i.e. active IndexMapper slots).
+    [[nodiscard]] SizeType32 size() const noexcept
+    {
+        return static_cast<SizeType32>(indexMap_.size());
+    }
+
+    /// Number of free IndexMapper slots available for new sequences.
+    [[nodiscard]] SizeType32 numFreeSlots() const noexcept
+    {
+        return static_cast<SizeType32>(freeIndices_.size());
+    }
+
 private:
     std::unordered_map<LlmRequest::RequestIdType, SizeType32> indexMap_;
     std::set<SizeType32> freeIndices_;
@@ -95,7 +107,7 @@ CUresult copyDeviceToHost(
 CUresult copyDeviceToDevice(
     std::vector<Task<MemAddress, MemAddress>> const& tasks, ssize_t numBytes, CUstream stream) noexcept;
 
-void copyBatchBlockOffsetsToDevice(
-    ITensor const& input, ITensor& output, ITensor const& copyIndex, bool copyVIdx, CUstream stream) noexcept;
+void copyBatchBlockOffsetsToDevice(ITensor const& input, ITensor& output, ITensor const& copyIndex,
+    ITensor const& indexScales, ITensor const& kvOffset, CUstream stream) noexcept;
 
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager_v2

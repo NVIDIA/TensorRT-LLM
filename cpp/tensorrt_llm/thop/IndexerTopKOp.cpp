@@ -36,8 +36,9 @@ TRTLLM_NAMESPACE_BEGIN
 namespace torch_ext
 {
 
-void indexer_topk_decode(
-    th::Tensor const& logits, th::Tensor const& seq_lens, th::Tensor const& indices, int64_t next_n, int64_t index_topk)
+void indexer_topk_decode(th::Tensor const& logits, th::Tensor const& seq_lens, th::Tensor const& indices,
+    int64_t next_n, int64_t index_topk, std::optional<th::Tensor> const& pre_idx,
+    std::optional<th::Tensor> const& heuristic_scratch)
 {
 
     TORCH_CHECK(logits.is_cuda() && seq_lens.is_cuda() && indices.is_cuda(),
@@ -68,21 +69,82 @@ void indexer_topk_decode(
     TORCH_CHECK(logits_stride_0 >= 0, "logits_stride_0 must be greater than or equal to 0");
     TORCH_CHECK(logits_stride_1 >= 0, "logits_stride_1 must be greater than or equal to 0");
 
-    int32_t splitWorkThreshold = 200 * 1000;
-    th::Tensor aux_indices = th::empty({0}, th::TensorOptions().dtype(th::kInt32).device(logits.device()));
-    th::Tensor aux_logits = th::empty({0}, th::TensorOptions().dtype(th::kFloat32).device(logits.device()));
-    constexpr auto multipleBlocksPerRowConfig = 10;
-    if (num_columns >= splitWorkThreshold)
+    int32_t const* preIdxPtr = nullptr;
+    int32_t preIdxStride = 0;
+    int32_t preIdxCount = 0;
+    if (pre_idx.has_value())
     {
-        aux_indices = th::empty({num_rows, multipleBlocksPerRowConfig, index_topk},
-            th::TensorOptions().dtype(th::kInt32).device(logits.device()));
-        aux_logits = th::empty({num_rows, multipleBlocksPerRowConfig, index_topk},
-            th::TensorOptions().dtype(th::kFloat32).device(logits.device()));
+        auto const& preIdxTensor = pre_idx.value();
+        TORCH_CHECK(preIdxTensor.is_cuda(), "pre_idx must be a CUDA tensor");
+        TORCH_CHECK(preIdxTensor.device() == logits.device(), "pre_idx must be on the same device as logits");
+        TORCH_CHECK(preIdxTensor.is_contiguous(), "pre_idx must be contiguous");
+        TORCH_CHECK(preIdxTensor.dim() == 2, "pre_idx must be a 2D Tensor");
+        TORCH_CHECK(preIdxTensor.size(0) * next_n == numRows64,
+            "pre_idx first dimension must equal logits.size(0)/next_n (one hint row per batch element)");
+        preIdxPtr = preIdxTensor.data_ptr<int32_t>();
+        preIdxStride = static_cast<int32_t>(preIdxTensor.stride(0));
+        preIdxCount = static_cast<int32_t>(preIdxTensor.size(1));
     }
+
+    // Caller-owned scratch buffer for heuristic TopK output values.
+    // Must be pre-allocated with stable address for CUDA Graph compatibility.
+    // scratch dtype must match input dtype.
+    auto const logits_dtype = logits.scalar_type();
+    TORCH_CHECK(logits_dtype == at::ScalarType::Float || logits_dtype == at::ScalarType::BFloat16
+            || logits_dtype == at::ScalarType::Half,
+        "indexer_topk_decode: logits dtype must be float32, bfloat16, or float16; got ", logits_dtype);
+    void* heuristicScratchPtr = nullptr;
+    if (heuristic_scratch.has_value())
+    {
+        auto const& scratchTensor = heuristic_scratch.value();
+        TORCH_CHECK(scratchTensor.is_cuda(), "heuristic_scratch must be a CUDA tensor");
+        TORCH_CHECK(
+            scratchTensor.device() == logits.device(), "heuristic_scratch must be on the same device as logits");
+        TORCH_CHECK(scratchTensor.is_contiguous(), "heuristic_scratch must be contiguous");
+        TORCH_CHECK(scratchTensor.numel() >= static_cast<int64_t>(num_rows) * index_topk,
+            "heuristic_scratch must have at least numRows * index_topk elements");
+        TORCH_CHECK(scratchTensor.scalar_type() == logits_dtype,
+            "heuristic_scratch dtype must match logits dtype (got scratch=", scratchTensor.scalar_type(),
+            ", logits=", logits_dtype, ")");
+        heuristicScratchPtr = scratchTensor.data_ptr();
+    }
+
+    int32_t splitWorkThreshold = 200 * 1000;
     auto stream = at::cuda::getCurrentCUDAStream(logits.get_device());
-    tk::invokeIndexerTopKDecode(logits.data_ptr<float>(), seq_lens.data_ptr<int32_t>(), indices.data_ptr<int32_t>(),
-        aux_logits.data_ptr<float>(), aux_indices.data_ptr<int32_t>(), splitWorkThreshold, num_rows, num_columns,
-        logits_stride_0, logits_stride_1, static_cast<int32_t>(next_n), static_cast<int32_t>(index_topk), stream);
+
+    if (logits_dtype == at::ScalarType::Float)
+    {
+        // fp32 path — full Scheme X v1.2 dispatcher (GVR / Insertion / Radix /
+        // Radix-split-work). aux_logits/aux_indices needed only by split-work.
+        th::Tensor aux_indices = th::empty({0}, th::TensorOptions().dtype(th::kInt32).device(logits.device()));
+        th::Tensor aux_logits = th::empty({0}, th::TensorOptions().dtype(th::kFloat32).device(logits.device()));
+        constexpr auto multipleBlocksPerRowConfig = 10;
+        if (num_columns >= splitWorkThreshold)
+        {
+            aux_indices = th::empty({num_rows, multipleBlocksPerRowConfig, index_topk},
+                th::TensorOptions().dtype(th::kInt32).device(logits.device()));
+            aux_logits = th::empty({num_rows, multipleBlocksPerRowConfig, index_topk},
+                th::TensorOptions().dtype(th::kFloat32).device(logits.device()));
+        }
+        tk::invokeIndexerTopKDecode(logits.data_ptr<float>(), seq_lens.data_ptr<int32_t>(), indices.data_ptr<int32_t>(),
+            aux_logits.data_ptr<float>(), aux_indices.data_ptr<int32_t>(), splitWorkThreshold, num_rows, num_columns,
+            logits_stride_0, logits_stride_1, static_cast<int32_t>(next_n), static_cast<int32_t>(index_topk), preIdxPtr,
+            preIdxStride, preIdxCount, static_cast<float*>(heuristicScratchPtr), stream);
+    }
+    else if (logits_dtype == at::ScalarType::BFloat16)
+    {
+        tk::invokeIndexerTopKDecode(reinterpret_cast<__nv_bfloat16 const*>(logits.data_ptr()),
+            seq_lens.data_ptr<int32_t>(), indices.data_ptr<int32_t>(), splitWorkThreshold, num_rows, num_columns,
+            logits_stride_0, logits_stride_1, static_cast<int32_t>(next_n), static_cast<int32_t>(index_topk), preIdxPtr,
+            preIdxStride, preIdxCount, static_cast<__nv_bfloat16*>(heuristicScratchPtr), stream);
+    }
+    else // Half
+    {
+        tk::invokeIndexerTopKDecode(reinterpret_cast<__half const*>(logits.data_ptr()), seq_lens.data_ptr<int32_t>(),
+            indices.data_ptr<int32_t>(), splitWorkThreshold, num_rows, num_columns, logits_stride_0, logits_stride_1,
+            static_cast<int32_t>(next_n), static_cast<int32_t>(index_topk), preIdxPtr, preIdxStride, preIdxCount,
+            static_cast<__half*>(heuristicScratchPtr), stream);
+    }
 }
 
 void indexer_topk_prefill(th::Tensor const& logits, th::Tensor const& row_starts, th::Tensor const& row_ends,
@@ -128,8 +190,8 @@ TRTLLM_NAMESPACE_END
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
     m.def(
-        "indexer_topk_decode(Tensor logits, Tensor seq_lens, Tensor indices, int next_n, int index_topk=2048) -> "
-        "()");
+        "indexer_topk_decode(Tensor logits, Tensor seq_lens, Tensor indices, int next_n, int index_topk=2048, "
+        "Tensor? pre_idx=None, Tensor? heuristic_scratch=None) -> ()");
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)

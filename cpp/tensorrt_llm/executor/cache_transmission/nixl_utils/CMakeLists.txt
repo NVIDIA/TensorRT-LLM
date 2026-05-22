@@ -39,7 +39,7 @@ if(NIXL_ROOT)
   # Link against all NIXL libraries
   target_link_libraries(${NIXL_WRAPPER_TARGET} PRIVATE NIXL::nixl)
 
-  # Link against CUDA
+  # Link against CUDA runtime (for cudaMemcpy in posix fallback)
   target_link_libraries(${NIXL_WRAPPER_TARGET} PRIVATE CUDA::cudart)
 
   set(NIXL_ENABLED TRUE)
@@ -67,7 +67,14 @@ if(NIXL_ENABLED OR MOONCAKE_ENABLED)
   set(AGENT_BINDING_SOURCES "")
   list(APPEND AGENT_BINDING_SOURCES agentBindings.cpp)
 
-  nanobind_add_module(${TRANSFER_AGENT_BINDING_TARGET} ${AGENT_BINDING_SOURCES})
+  # NOSTRIP: Disable stripping for BOLT compatibility (requires --emit-relocs)
+  if(ENABLE_BOLT_COMPATIBLE)
+    nanobind_add_module(${TRANSFER_AGENT_BINDING_TARGET} NOSTRIP
+                        ${AGENT_BINDING_SOURCES})
+  else()
+    nanobind_add_module(${TRANSFER_AGENT_BINDING_TARGET}
+                        ${AGENT_BINDING_SOURCES})
+  endif()
   message(STATUS "Building tensorrt_llm_transfer_agent_binding with nanobind")
 
   target_compile_options(${TRANSFER_AGENT_BINDING_TARGET} PRIVATE -Wno-error)
@@ -88,15 +95,16 @@ if(NIXL_ENABLED OR MOONCAKE_ENABLED)
     message(STATUS "Transfer agent binding: NIXL support enabled")
   endif()
 
-  # Conditionally add Mooncake support
+  # Conditionally add Mooncake support NOTE: We intentionally do NOT link
+  # against tensorrt_llm_mooncake_wrapper here. The mooncake wrapper (and its
+  # dependency libtransfer_engine.so) is loaded lazily via DynLibLoader::dlopen
+  # in makeTransferAgent("mooncake", ...) at runtime. This allows the binding
+  # module to be imported even when Mooncake is not installed.
   if(MOONCAKE_ENABLED)
     target_compile_definitions(${TRANSFER_AGENT_BINDING_TARGET}
                                PRIVATE ENABLE_MOONCAKE)
-    target_include_directories(${TRANSFER_AGENT_BINDING_TARGET}
-                               PRIVATE ${TRANSFER_ENGINE_INCLUDE_DIR})
-    target_link_libraries(${TRANSFER_AGENT_BINDING_TARGET}
-                          PRIVATE tensorrt_llm_mooncake_wrapper)
-    message(STATUS "Transfer agent binding: Mooncake support enabled")
+    message(
+      STATUS "Transfer agent binding: Mooncake support enabled (lazy loading)")
   endif()
 
   # Common dependencies

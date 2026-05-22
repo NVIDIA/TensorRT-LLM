@@ -16,9 +16,6 @@ class Qwen3MoeHfWeightMapper(Qwen2MoeHfWeightMapper):
                                                  DecoderModelForCausalLM],
                               config: ModelConfig):
         super().init_model_and_config(model, config)
-        self._num_kv_heads = model.config.num_key_value_heads if hasattr(
-            model.config, 'num_key_value_heads'
-        ) and model.config.num_key_value_heads is not None else model.config.num_attention_heads
 
     def should_skip_module(self, module_name: str) -> bool:
         if module_name.startswith("draft_model"):
@@ -49,3 +46,11 @@ class Qwen3MoeHfWeightMapper(Qwen2MoeHfWeightMapper):
             return processed_weights
 
         return weights
+
+    @property
+    def _num_kv_heads(self) -> int:
+        num_kv_heads = self._model.config.num_key_value_heads if hasattr(
+            self._model.config, 'num_key_value_heads'
+        ) and self._model.config.num_key_value_heads is not None else self._model.config.num_attention_heads
+
+        return num_kv_heads

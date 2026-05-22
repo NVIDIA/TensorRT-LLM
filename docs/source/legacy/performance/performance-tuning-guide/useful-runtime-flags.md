@@ -24,7 +24,7 @@ For a more conservative approach with respect to the KV cache limitations in
 terms of memory allocation, `CapacitySchedulerPolicy` should be set to
 `GUARANTEED_NO_EVICT` to guarantee that a started request is never paused.
 
-If the goal is to maximizes the throughput, users should try `MAX_UTILIZATION`.
+If the goal is to maximize the throughput, users should try `MAX_UTILIZATION`.
 However, they need to keep in mind that it may have a negative impact on
 latency if requests have to be paused.
 

@@ -8,6 +8,7 @@ from typing import Any, Dict, List, Literal, Optional, Tuple
 
 import yaml
 from mpi4py.MPI import COMM_WORLD, Comm
+from mpi4py.util import pkl5
 
 from .._utils import global_mpi_rank, global_mpi_size
 
@@ -16,6 +17,9 @@ __all__ = [
     'parse_disagg_config_file',
     'extract_server_configs',
     'split_world_comm',
+    'get_usage_tokens_from_ctx',
+    'rewrite_usage_info_from_ctx',
+    'rewrite_usage_response_from_ctx',
 ]
 
 
@@ -23,6 +27,7 @@ class ServerRole(IntEnum):
     CONTEXT = 0
     GENERATION = 1
     MM_ENCODER = 2
+    VISUAL_GEN = 3
 
 
 @dataclass
@@ -95,6 +100,40 @@ class MetadataServerConfig():
     refresh_interval: float = 10.0
 
 
+def get_usage_tokens_from_ctx(
+        ctx_usage: Optional[Any]) -> tuple[Optional[int], int]:
+    if ctx_usage is None:
+        return None, 0
+
+    prompt_tokens = ctx_usage.prompt_tokens
+    cached_tokens = 0
+    prompt_tokens_details = ctx_usage.prompt_tokens_details
+    if prompt_tokens_details is not None:
+        cached_tokens = prompt_tokens_details.cached_tokens
+    return prompt_tokens, cached_tokens
+
+
+def rewrite_usage_info_from_ctx(usage: Optional[Any],
+                                ctx_usage: Optional[Any]) -> Optional[Any]:
+    prompt_tokens, cached_tokens = get_usage_tokens_from_ctx(ctx_usage)
+    if prompt_tokens is None or usage is None:
+        return usage
+
+    from tensorrt_llm.serve.openai_protocol import PromptTokensDetails
+
+    usage.prompt_tokens = prompt_tokens
+    usage.total_tokens = prompt_tokens + (usage.completion_tokens or 0)
+    usage.prompt_tokens_details = PromptTokensDetails(
+        cached_tokens=cached_tokens)
+    return usage
+
+
+def rewrite_usage_response_from_ctx(response: Any,
+                                    ctx_usage: Optional[Any]) -> Any:
+    rewrite_usage_info_from_ctx(response.usage, ctx_usage)
+    return response
+
+
 def get_ctx_gen_server_addrs(
         server_configs: list[CtxGenServerConfig]
 ) -> tuple[list[str], list[str]]:
@@ -129,6 +168,10 @@ def extract_disagg_cfg(hostname: str = 'localhost',
                        conditional_disagg_config: Optional[dict] = None,
                        otlp_config: Optional[dict] = None,
                        disagg_cluster: Optional[dict] = None,
+                       node_id: Optional[int] = None,
+                       schedule_style: Literal[
+                           'context_first',
+                           'generation_first'] = 'context_first',
                        **kwargs: Any) -> DisaggServerConfig:
     context_servers = context_servers or {}
     generation_servers = generation_servers or {}
@@ -172,7 +215,10 @@ def extract_disagg_cfg(hostname: str = 'localhost',
                                 conditional_disagg_config, otlp_config,
                                 max_retries, perf_metrics_max_requests,
                                 disagg_cluster_config)
-
+    if node_id is not None:
+        config.node_id = node_id
+    if schedule_style:
+        config.schedule_style = schedule_style
     return config
 
 
@@ -327,7 +373,7 @@ def split_world_comm(
         f"global_rank: {global_rank}, instance_idx: {instance_idx}, sub_rank: {sub_rank}, is_leader: {is_leader}"
     )
 
-    return is_leader, instance_idx, sub_comm
+    return is_leader, instance_idx, pkl5.Intracomm(sub_comm)
 
 
 def parse_metadata_server_config_file(

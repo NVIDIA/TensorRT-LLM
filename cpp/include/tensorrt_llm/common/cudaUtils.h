@@ -151,26 +151,6 @@ void checkEx(
 #define check_cuda_error(val) check((val), #val, __FILE__, __LINE__)
 #define check_cuda_error_2(val, file, line) check((val), #val, file, line)
 
-inline std::optional<bool> isCudaLaunchBlocking()
-{
-    thread_local bool firstCall = true;
-    thread_local std::optional<bool> result = std::nullopt;
-    if (!firstCall)
-    {
-        char const* env = std::getenv("CUDA_LAUNCH_BLOCKING");
-        if (env != nullptr && std::string(env) == "1")
-        {
-            result = true;
-        }
-        else
-        {
-            result = false;
-        }
-        firstCall = false;
-    }
-    return result;
-}
-
 inline bool isCapturing(cudaStream_t stream)
 {
     cudaStreamCaptureStatus status;
@@ -180,21 +160,23 @@ inline bool isCapturing(cudaStream_t stream)
 
 inline bool doCheckError(cudaStream_t stream)
 {
-    auto const cudaLaunchBlocking = isCudaLaunchBlocking();
-    if (cudaLaunchBlocking.has_value() && cudaLaunchBlocking.value())
+    // If we're capturing a CUDA graph we don't check.  Otherwise, we
+    // default to only checking in debug builds. But we always listen to
+    // the env variable.
+    static bool const doCheckIfNotCapturing = []()
     {
-        return !isCapturing(stream);
-    }
-
+        char const* env = std::getenv("CUDA_LAUNCH_BLOCKING");
+        if (env != nullptr)
+        {
+            return std::string(env) == "1";
+        }
 #ifndef NDEBUG
-    // Debug builds will sync when we're not capturing unless explicitly
-    // disabled.
-    bool const checkError = cudaLaunchBlocking.value_or(!isCapturing(stream));
+        return true;
 #else
-    bool const checkError = cudaLaunchBlocking.value_or(false);
+        return false;
 #endif
-
-    return checkError;
+    }();
+    return doCheckIfNotCapturing && !isCapturing(stream);
 }
 
 inline void syncAndCheck(cudaStream_t stream, char const* const file, int const line)
@@ -254,6 +236,8 @@ template<>                    struct packed_as<half,  2>          { using type =
 template<>                    struct packed_as<float,  2>         { using type = float2; };
 template<>                    struct packed_as<int8_t, 2>         { using type = int16_t; };
 template<>                    struct packed_as<int32_t, 2>        { using type = int2; };
+template<>                    struct packed_as<uint, 2>           { using type = uint2; };
+template<>                    struct packed_as<uint, 4>           { using type = uint4; };
 template<>                    struct packed_as<half2, 1>          { using type = half; };
 template<>                    struct packed_as<float2, 1>         { using type = float; };
 #ifdef ENABLE_BF16
@@ -1441,4 +1425,17 @@ TRTLLM_NAMESPACE_END
     do                                                                                                                 \
     {                                                                                                                  \
         tensorrt_llm::common::checkEx((stat), {cudaSuccess, cudaErrorCudartUnloading}, #stat, __FILE__, __LINE__);     \
+    } while (0)
+
+// Warn-only variant: log a warning on failure but do not throw or abort.
+// Use for cleanup/secondary operations where a CUDA error is non-fatal (e.g. free on an error path).
+#define TLLM_CUDA_CHECK_WARN(stat)                                                                                     \
+    do                                                                                                                 \
+    {                                                                                                                  \
+        cudaError_t const _tllm_cuda_warn_err = (stat);                                                                \
+        if (TLLM_UNLIKELY(_tllm_cuda_warn_err != cudaSuccess))                                                         \
+        {                                                                                                              \
+            TLLM_LOG_WARNING(                                                                                          \
+                "CUDA error in %s (%s:%d): %s", #stat, __FILE__, __LINE__, cudaGetErrorString(_tllm_cuda_warn_err));   \
+        }                                                                                                              \
     } while (0)

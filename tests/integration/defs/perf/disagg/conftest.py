@@ -92,14 +92,29 @@ def pytest_collection_modifyitems(config, items):
         )
         return
 
-    # Filter items based on test list
+    # Build lookup structures for flexible matching:
+    # 1. Exact match (full nodeid)
+    # 2. Suffix match (short name without module::class:: prefix)
+    # 3. Case-insensitive variants of both
+    wanted_lower = {t.lower() for t in wanted_tests}
+
+    def _matches(nodeid):
+        if nodeid in wanted_tests:
+            return True
+        # Extract short name: "test_disagg.py::Class::test_x[id]" -> "test_x[id]"
+        short = nodeid.rsplit("::", 1)[-1] if "::" in nodeid else nodeid
+        if short in wanted_tests:
+            return True
+        # Case-insensitive fallback
+        if nodeid.lower() in wanted_lower or short.lower() in wanted_lower:
+            return True
+        return False
+
     selected = []
     deselected = []
 
     for item in items:
-        # item.nodeid is the full test identifier like:
-        # "test_disagg.py::TestDisaggBenchmark::test_benchmark[deepseek-r1-fp4:1k1k:...]"
-        if item.nodeid in wanted_tests:
+        if _matches(item.nodeid):
             selected.append(item)
         else:
             deselected.append(item)

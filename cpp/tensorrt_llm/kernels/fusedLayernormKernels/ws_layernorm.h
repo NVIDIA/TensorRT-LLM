@@ -44,7 +44,7 @@ enum class SCALE_TYPE
 };
 
 template <typename T>
-void invokeWSLayerNorm(WarpSpecializedParam<T> param, bool use_rms_norm, int ctas);
+void invokeWSLayerNorm(WarpSpecializedParam<T> param, bool use_rms_norm, int ctas, bool output_hp_norm = false);
 
 } // namespace kernels
 

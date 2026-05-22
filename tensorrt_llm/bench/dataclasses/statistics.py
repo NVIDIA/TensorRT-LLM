@@ -121,6 +121,7 @@ class BenchmarkStatistics(BaseModel):
     # Token-related Properties
     total_output_tokens: int
     total_input_tokens: int
+    batch_full_output_throughput_tok_ns: Optional[float] = None
 
     # General Information
     num_requests: int
@@ -128,6 +129,9 @@ class BenchmarkStatistics(BaseModel):
 
     # Speculative Information
     acceptance_length: float
+
+    # Energy Monitoring
+    total_energy: Optional[float] = None
 
     # Percentile-related Statistics
     request_latency_percentiles: Optional[PercentileStats] = None
@@ -195,3 +199,15 @@ class BenchmarkStatistics(BaseModel):
     @computed_field
     def output_throughput_tok_ns_per_user(self) -> float:
         return self.output_throughput_percentiles.average
+
+    @computed_field
+    def output_tps_per_w(self) -> Optional[float]:
+        if not self.total_energy:
+            return None
+        return float(self.total_output_tokens / self.total_energy)
+
+    @computed_field
+    def total_gpu_power(self) -> Optional[float]:
+        if not self.total_energy or not self.total_latency_ns:
+            return None
+        return float((self.total_energy * 1e9) / self.total_latency_ns)

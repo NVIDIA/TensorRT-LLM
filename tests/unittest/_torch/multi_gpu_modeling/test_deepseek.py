@@ -70,32 +70,33 @@ def test_deepseek_streaming(model_name, backend, quant, tp_size):
 
     assert Path(model_dir).exists()
 
-    llm = LLM(model=model_dir,
-              tensor_parallel_size=tp_size,
-              enable_chunked_prefill=False,
-              **pytorch_config,
-              moe_config=moe_config,
-              moe_expert_parallel_size=-1,
-              moe_tensor_parallel_size=-1,
-              enable_attention_dp=enable_attention_dp,
-              kv_cache_config=KvCacheConfig(enable_block_reuse=False))
+    with LLM(model=model_dir,
+             tensor_parallel_size=tp_size,
+             enable_chunked_prefill=False,
+             **pytorch_config,
+             moe_config=moe_config,
+             moe_expert_parallel_size=-1,
+             moe_tensor_parallel_size=-1,
+             enable_attention_dp=enable_attention_dp,
+             kv_cache_config=KvCacheConfig(enable_block_reuse=False)) as llm:
 
-    sampling_params = SamplingParams(max_tokens=10)
+        sampling_params = SamplingParams(max_tokens=10)
 
-    async def task(prompt: str):
-        future = llm.generate_async(prompt,
-                                    streaming=True,
-                                    sampling_params=sampling_params)
-        output = await future.aresult()
-        return output.outputs[0].text
+        async def task(prompt: str):
+            future = llm.generate_async(prompt,
+                                        streaming=True,
+                                        sampling_params=sampling_params)
+            output = await future.aresult()
+            return output.outputs[0].text
 
-    async def test():
-        tasks = [task(prompt) for prompt in prompts]
-        results = await asyncio.gather(*tasks)
+        async def test():
+            tasks = [task(prompt) for prompt in prompts]
+            results = await asyncio.gather(*tasks)
 
-        assert len(results) == len(expected_outputs), "Output length mismatch"
-        for result, expected in zip(results, expected_outputs):
-            assert similar(result, expected,
-                           1.0), f"Expected '{expected}' but get '{result}'"
+            assert len(results) == len(
+                expected_outputs), "Output length mismatch"
+            for result, expected in zip(results, expected_outputs):
+                assert similar(result, expected,
+                               1.0), f"Expected '{expected}' but get '{result}'"
 
-    asyncio.run(test())
+        asyncio.run(test())

@@ -42,7 +42,6 @@ def test_profile_kvcache():
         "moe_expert_parallel_size": None,
         "gpus_per_node": 1,
         "trust_remote_code": False,
-        "build_config": build_config,
         "max_batch_size": build_config.max_batch_size,
         "max_num_tokens": build_config.max_num_tokens,
         "max_beam_width": build_config.max_beam_width,
@@ -52,7 +51,6 @@ def test_profile_kvcache():
         "num_postprocess_workers": 0,
         "postprocess_tokenizer_dir": VLM_MODEL,
         "reasoning_parser": None,
-        "fail_fast_on_attention_window_too_large": False,
         "cuda_graph_config": cuda_graph_config,
     }
 
@@ -116,7 +114,6 @@ def test_pyexecutor_and_kvcache_share_execution_stream():
         "num_postprocess_workers": 0,
         "postprocess_tokenizer_dir": MODEL,
         "reasoning_parser": None,
-        "fail_fast_on_attention_window_too_large": False,
     }
 
     torchllm_args = TorchLlmArgs(**llm_args)

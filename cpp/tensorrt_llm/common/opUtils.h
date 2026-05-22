@@ -38,6 +38,8 @@
 #include <string>
 #include <unordered_map>
 
+#include "tensorrt_llm/common/nvmlWrapper.h"
+
 TRTLLM_NAMESPACE_BEGIN
 
 namespace common::op
@@ -319,7 +321,8 @@ TRTLLM_NAMESPACE_END
         nvmlReturn_t r = cmd;                                                                                          \
         if (r != NVML_SUCCESS)                                                                                         \
         {                                                                                                              \
-            printf("Failed, NVML error %s:%d '%s'\n", __FILE__, __LINE__, nvmlErrorString(r));                         \
+            printf("Failed, NVML error %s:%d '%s'\n", __FILE__, __LINE__,                                              \
+                tensorrt_llm::common::NVMLWrapper::getInstance()->nvmlErrorString(r));                                 \
             exit(EXIT_FAILURE);                                                                                        \
         }                                                                                                              \
     } while (0)
@@ -330,6 +333,7 @@ TRTLLM_NAMESPACE_END
         nvmlReturn_t r = cmd;                                                                                          \
         if (TLLM_UNLIKELY(r != NVML_SUCCESS))                                                                          \
         {                                                                                                              \
-            TLLM_THROW("Failed, NVML error %s:%d '%s'\n", __FILE__, __LINE__, nvmlErrorString(r));                     \
+            TLLM_THROW("Failed, NVML error %s:%d '%s'\n", __FILE__, __LINE__,                                          \
+                tensorrt_llm::common::NVMLWrapper::getInstance()->nvmlErrorString(r));                                 \
         }                                                                                                              \
     } while (0)

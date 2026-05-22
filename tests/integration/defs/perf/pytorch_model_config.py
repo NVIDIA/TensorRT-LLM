@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -18,6 +18,30 @@ Model pytorch/TRT yaml config for trtllm-bench perf tests
 """
 
 from ..conftest import llm_models_root
+
+# DeepSeek FP8 (block-scale) models that hit the DeepGEMM-on-Hopper-only
+# limitation when the default CUTLASS MoE backend is used on Blackwell.
+# On SM100+ these need ``moe_config.backend: DEEPGEMM`` instead, otherwise
+# CutlassFp8BlockScaleGemmRunner -> deep_gemm::jit::Compiler::build throws
+# "DeepGEMM only supports Hopper (SM90)".
+_DEEPSEEK_FP8_BLOCK_SCALE_MODELS = (
+    'deepseek_v3_lite_fp8',
+    'deepseek_r1_fp8',
+    'deepseek_r1_0528_fp8',
+)
+
+
+def _get_sm_version_safe() -> int:
+    """Return the current device SM version, or 0 if it cannot be determined.
+
+    Imported lazily so importing this module does not require CUDA to be
+    available (e.g. during static test collection).
+    """
+    try:
+        from tensorrt_llm._utils import get_sm_version
+        return get_sm_version()
+    except Exception:
+        return 0
 
 
 def recursive_update(d, u):
@@ -77,7 +101,7 @@ def get_model_yaml_config(model_label: str,
                 'cuda_graph_config': {},
                 'speculative_config': {
                     'decoding_type': 'MTP',
-                    'num_nextn_predict_layers': 3
+                    'max_draft_len': 3
                 }
             }
         },
@@ -93,12 +117,11 @@ def get_model_yaml_config(model_label: str,
                     'enable_padding': False
                 },
                 'moe_config': {
-                    'backend': 'TRTLLM',
                     'max_num_tokens': 32768
                 },
                 'speculative_config': {
                     'decoding_type': 'MTP',
-                    'num_nextn_predict_layers': 3
+                    'max_draft_len': 3
                 },
                 'disable_overlap_scheduler': True,
                 'enable_autotuner': True,
@@ -150,6 +173,28 @@ def get_model_yaml_config(model_label: str,
                 'enable_chunked_prefill': True,
             }
         },
+        # Deepseek R1 NVFP4 with chunked prefill, large seq len, and fp8 KV cache
+        {
+            'patterns': [
+                'deepseek_r1_nvfp4-bench-pytorch-float4-maxbs:32-maxnt:4096-kv_frac:0.80-input_output_len:8192,512-reqs:3000-ep:2-tp:4-gpus:4',
+            ],
+            'config': {
+                'enable_attention_dp': True,
+                'enable_chunked_prefill': True,
+                'max_num_tokens': 4096,
+                'max_batch_size': 32,
+                'max_seq_len': 81920,
+                'kv_cache_config': {
+                    'dtype': 'fp8',
+                    'free_gpu_memory_fraction': 0.80,
+                    'enable_block_reuse': False,
+                },
+                'cuda_graph_config': {
+                    'enable_padding': True,
+                    'max_batch_size': 32,
+                },
+            }
+        },
         # Deepseek R1 model with CUTLASS backend
         {
             'patterns': [
@@ -183,9 +228,10 @@ def get_model_yaml_config(model_label: str,
                 }
             }
         },
-        # Llama Nemotron models with attention_dp disabled to prevent hangs
+        # Model-specific cases with attention_dp disabled to prevent hangs
         {
             'patterns': [
+                'deepseek_r1_distill_llama_70b',
                 'llama_v3.1_nemotron_ultra_253b_fp8-bench-pytorch-float8',
                 'llama_v3.3_nemotron_super_49b_fp8-bench-pytorch-float8',
                 'llama_v3.3_nemotron_super_49b-bench-pytorch-bfloat16'
@@ -205,18 +251,6 @@ def get_model_yaml_config(model_label: str,
                 'enable_attention_dp': True,
             }
         },
-        # Qwen3 models with fp4 quantization on B200 with moe backend equal to TRTLLM
-        {
-            'patterns': [
-                'qwen3_235b_a22b_fp4-bench-pytorch-float4-maxbs:512-maxnt:2048-input_output_len:1000,2000-con:8-ep:8-gpus:8',
-            ],
-            'config': {
-                'enable_attention_dp': False,
-                'moe_config': {
-                    'backend': 'TRTLLM'
-                }
-            }
-        },
         {
             'patterns': [
                 'qwen3_4b-bench-pytorch-streaming-bfloat16-maxbs:4-kv_frac:0.6-input_output_len:500,100-reqs:200-con:4',
@@ -232,6 +266,29 @@ def get_model_yaml_config(model_label: str,
                     'enable_block_reuse': False,
                 },
                 'enable_chunked_prefill': False,
+            }
+        },
+        # Qwen3-235B-A22B-FP4 with Eagle3 speculative decoding
+        {
+            'patterns': [
+                'qwen3_235b_a22b_fp4_eagle3-bench-pytorch',
+            ],
+            'config': {
+                'enable_attention_dp': False,
+                'disable_overlap_scheduler': False,
+                'enable_autotuner': False,
+                'enable_chunked_prefill': False,
+                'speculative_config': {
+                    'decoding_type':
+                    'Eagle',
+                    'max_draft_len':
+                    3,
+                    'speculative_model_dir':
+                    f"{llm_models_root()}/Qwen3/qwen3-235B-eagle3",
+                },
+                'kv_cache_config': {
+                    'enable_block_reuse': False,
+                },
             }
         },
         # Llama-v3.3 models with fp8 quantization
@@ -257,6 +314,29 @@ def get_model_yaml_config(model_label: str,
                 }
             }
         },
+        # GPT-OSS 20B (NVBug 5720470: MMHA vs XQA kernel regression)
+        {
+            'patterns': [
+                'gpt_oss_20b_fp4-bench-pytorch-float4',
+            ],
+            'config': {
+                'cuda_graph_config': {
+                    'max_batch_size': 512,
+                    'enable_padding': True,
+                },
+                'enable_chunked_prefill': False,
+                'enable_attention_dp': False,
+                'disable_overlap_scheduler': False,
+                'kv_cache_config': {
+                    'enable_block_reuse': False,
+                    'free_gpu_memory_fraction': 0.9,
+                },
+                'moe_config': {
+                    'backend': 'TRITON'
+                },
+                'print_iter_log': True,
+            }
+        },
         # GPT-OSS 120B max throughput test
         {
             'patterns': [
@@ -270,9 +350,6 @@ def get_model_yaml_config(model_label: str,
                 'cuda_graph_config': {
                     'enable_padding': True,
                     'max_batch_size': 720,
-                },
-                'moe_config': {
-                    'backend': 'CUTLASS'
                 },
                 'stream_interval': 10,
                 'num_postprocess_workers': 4
@@ -290,17 +367,14 @@ def get_model_yaml_config(model_label: str,
                     'enable_padding': True,
                     'max_batch_size': 720,
                 },
-                'moe_config': {
-                    'backend': 'TRTLLM'
-                },
                 'stream_interval': 10,
                 'num_postprocess_workers': 4
             }
         },
-        # GPT-OSS 120B speculative decoding (Eagle3 draft)
+        # GPT-OSS 120B speculative decoding with Eagle3
         {
             'patterns': [
-                'gpt_oss_120b_fp4-bench-pytorch-streaming-float4-maxbs:1-maxnt:4096-input_output_len:2048,128-reqs:1-con:1',
+                'gpt_oss_120b_eagle3-bench-pytorch',
             ],
             'config': {
                 'enable_attention_dp': False,
@@ -314,9 +388,34 @@ def get_model_yaml_config(model_label: str,
                     'decoding_type':
                     'Eagle',
                     'max_draft_len':
-                    5,
+                    3,
                     'speculative_model_dir':
-                    f"{llm_models_root()}/gpt_oss/gpt-oss-120b-Eagle3",
+                    f'{llm_models_root()}/gpt_oss/gpt-oss-120b-Eagle3',
+                },
+                'kv_cache_config': {
+                    'enable_block_reuse': False,
+                },
+            }
+        },
+        # GPT-OSS 120B speculative decoding with Eagle3-throughput (https://nvbugspro.nvidia.com/bug/5832481)
+        {
+            'patterns': [
+                'gpt_oss_120b_eagle3_throughput-bench-pytorch',
+            ],
+            'config': {
+                'enable_attention_dp': False,
+                'disable_overlap_scheduler': True,
+                'enable_autotuner': False,
+                'cuda_graph_config': {
+                    'enable_padding': True,
+                },
+                'speculative_config': {
+                    'decoding_type':
+                    'Eagle',
+                    'max_draft_len':
+                    3,
+                    'speculative_model_dir':
+                    f'{llm_models_root()}/gpt_oss/gpt-oss-120b-Eagle3-throughput',
                 },
                 'kv_cache_config': {
                     'enable_block_reuse': False,
@@ -362,7 +461,77 @@ def get_model_yaml_config(model_label: str,
             'config': {
                 'attn_backend': 'FLASHINFER',
             }
-        }
+        },
+        # Nemotron-3-Nano-Omni-30B-NVFP4 (text + image multimodal)
+        {
+            'patterns': ['nemotron_3_nano_omni_nvfp4'],
+            'config': {
+                'enable_chunked_prefill': True,
+                'moe_config': {
+                    'backend': 'CUTLASS',
+                },
+                'cuda_graph_config': {
+                    'enable_padding': True,
+                    'max_batch_size': 1,
+                },
+                'kv_cache_config': {
+                    'enable_block_reuse': False,
+                    'free_gpu_memory_fraction': 0.80,
+                    'mamba_ssm_cache_dtype': 'float32',
+                },
+            }
+        },
+        # Nemotron-3-Super-120B-NVFP4: (no MTP)
+        {
+            'patterns': ['nemotron_3_super_120b_nvfp4-'],
+            'config': {
+                'max_seq_len': 1048576,
+                'enable_chunked_prefill': True,
+                'enable_attention_dp': False,
+                'stream_interval': 1,
+                'moe_config': {
+                    'backend': 'CUTLASS',
+                },
+                'cuda_graph_config': {
+                    'enable_padding': True,
+                    'max_batch_size': 8,
+                },
+                'kv_cache_config': {
+                    'enable_block_reuse': False,
+                    'mamba_ssm_cache_dtype': 'float16',
+                    'mamba_ssm_stochastic_rounding': True,
+                    'mamba_ssm_philox_rounds': 5,
+                },
+            }
+        },
+        # Nemotron-3-Super-120B-NVFP4: MTP speculative decoding
+        {
+            'patterns': ['nemotron_3_super_120b_nvfp4_mtp'],
+            'config': {
+                'max_seq_len': 1048576,
+                'enable_chunked_prefill': True,
+                'enable_attention_dp': False,
+                'stream_interval': 1,
+                'moe_config': {
+                    'backend': 'CUTLASS',
+                },
+                'cuda_graph_config': {
+                    'enable_padding': True,
+                    'max_batch_size': 8,
+                },
+                'kv_cache_config': {
+                    'enable_block_reuse': False,
+                    'mamba_ssm_cache_dtype': 'float16',
+                    'mamba_ssm_stochastic_rounding': True,
+                    'mamba_ssm_philox_rounds': 5,
+                },
+                'speculative_config': {
+                    'decoding_type': 'MTP',
+                    'num_nextn_predict_layers': 3,
+                    'allow_advanced_sampling': True,
+                },
+            }
+        },
     ]
 
     # Apply pattern-based configurations on top of base config
@@ -375,6 +544,16 @@ def get_model_yaml_config(model_label: str,
                 if pattern_config.get('config'):
                     recursive_update(base_config, pattern_config['config'])
                 break  # Stop checking other patterns for this config once we find a match
+
+    # DeepSeek FP8 (block-scale) models on Blackwell (SM100+) must use the
+    # DEEPGEMM MoE backend; the default CUTLASS backend's FP8 block-scale path
+    # JIT-compiles DeepGEMM kernels that only target Hopper (SM90).
+    if 'pytorch' in model_label and any(
+            name in model_label.lower()
+            for name in _DEEPSEEK_FP8_BLOCK_SCALE_MODELS):
+        if _get_sm_version_safe() >= 100:
+            moe_config = base_config.setdefault('moe_config', {})
+            moe_config.setdefault('backend', 'DEEPGEMM')
 
     # lora-specific change for pytorch
     if 'pytorch' in model_label and 'loras' in model_label:

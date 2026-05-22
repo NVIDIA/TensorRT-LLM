@@ -24,7 +24,8 @@ import torch
 import triton
 import triton.language as tl
 
-PAD_SLOT_ID = -1
+from tensorrt_llm._torch.modules.mamba import PAD_SLOT_ID
+from tensorrt_llm._utils import get_sm_version
 
 
 @triton.jit()
@@ -621,7 +622,11 @@ def _causal_conv1d_update_kernel(
     BLOCK_N: tl.constexpr,
     SAVE_INTERMEDIATE: tl.constexpr,
     HAS_EAGLE_TREE_CUSTOM_ATTN_MASK: tl.constexpr,
+    LAUNCH_DEPENDENT_KERNELS: tl.constexpr,
 ):
+    if LAUNCH_DEPENDENT_KERNELS:
+        tl.extra.cuda.gdc_launch_dependents()
+
     # ruff: noqa: E501
     idx_seq = tl.program_id(0)
     if idx_seq >= batch:
@@ -975,9 +980,12 @@ def causal_conv1d_update(
     pad_slot_id: int = PAD_SLOT_ID,
     metadata=None,
     validate_data=False,
+    launch_dependent_kernels: bool = False,
+    _block_n: int | None = None,
+    _num_warps: int | None = None,
+    _num_stages: int | None = None,
 ):
-    """
-    x: (batch, dim) or (batch, dim, seqlen)
+    """x: (batch, dim) or (batch, dim, seqlen)
         [shape=2: single token prediction]
         [shape=3: single or multiple tokens prediction]
     conv_state: (..., dim, state_len), where state_len >= width - 1
@@ -999,7 +1007,16 @@ def causal_conv1d_update(
             in this case, the kernel will not process entries at
             indices 0 and 3
     out: (batch, dim) or (batch, dim, seqlen)
+    launch_dependent_kernels: If true, launch dependent kernels at kernel start.
+        This kernel is typically followed by selective state update,
+        which can profitably start fetching already available inputs
+        like the state before needing the output of this kernel.
+        Ignored on hardware that doesn't support PDL (sm < 90).
     """
+    # PDL needs sm >= 90.
+    if get_sm_version() < 90:
+        launch_dependent_kernels = False
+
     if validate_data:
         assert cache_seqlens is None  # not implemented yet - ok for vLLM
         assert pad_slot_id is not None
@@ -1156,9 +1173,12 @@ def causal_conv1d_update(
         NP2_STATELEN=np2_statelen,
         NP2_SEQLEN=np2_seqlen,
         USE_PAD_SLOT=pad_slot_id is not None,
-        BLOCK_N=256,
+        BLOCK_N=_block_n if _block_n is not None else 128,
         SAVE_INTERMEDIATE=intermediate_conv_window is not None,
         HAS_EAGLE_TREE_CUSTOM_ATTN_MASK=retrieve_next_token is not None,
+        LAUNCH_DEPENDENT_KERNELS=launch_dependent_kernels,
+        num_warps=_num_warps if _num_warps is not None else 4,
+        **({"num_stages": _num_stages} if _num_stages else {}),
     )
     if unsqueeze:
         out = out.squeeze(-1)

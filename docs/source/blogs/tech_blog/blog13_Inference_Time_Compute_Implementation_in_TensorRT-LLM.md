@@ -3,7 +3,7 @@
 By NVIDIA TensorRT LLM Team and UCSD Hao AI Lab
 
 ## Table of Contents
-- [Inference-Time Compute Implementation in TensorRT LLM (Part 1: Design and Implementation）](#inference-time-compute-implementation-in-tensorrt-llm)
+- [Inference-Time Compute Implementation in TensorRT LLM (Part 1: Design and Implementation)](#inference-time-compute-implementation-in-tensorrt-llm)
   - [Table of Content](#table-of-content)
   - [Background and Motivation](#background-and-motivation)
   - [Introduction for Scaffolding: A Framework for inference-time compute](#introduction-for-scaffolding)
@@ -48,11 +48,11 @@ Make the inference-time compute method modular and reusable. An inference time c
 composed of multiple modules. In scaffolding, `Controller` can be constructed by a series of `Sub-Controllers`, then users can flexibly assemble and replace the `Sub-Controllers`.
 
 
-Provides sufficient concurrency to achieve good performance while ease of use. Concurrency is the key for performance. `Scaffolding` provides three levels of concurrency. The first level is that the different requests to a `ScaffoldingLlm` instance can be concurrent. The second level is that the multiple `Sub-Controllers` can be concurrent.The third level is that the multiply Tasks which yielded from `Controller` can be concurrent.
+Provides sufficient concurrency to achieve good performance while ease of use. Concurrency is the key for performance. `Scaffolding` provides three levels of concurrency. The first level is that the different requests to a `ScaffoldingLlm` instance can be concurrent. The second level is that the multiple `Sub-Controllers` can be concurrent. The third level is that the multiple Tasks which yielded from `Controller` can be concurrent.
 
 
 ### Architecture
-`Scaffolding` consists of three core components. Let's first briefly introduce these components. The `Worker` class is the backend that execute a single task, such as sending an inference request to an LLM inference framework or service, or completing a call to an external tool. The `Controller` class focuses on defining the workflow of a inference-time compute method. The `ScaffoldingLlm` class is responsible for integrating the two and completing the entire task.
+`Scaffolding` consists of three core components. Let's first briefly introduce these components. The `Worker` class is the backend that executes a single task, such as sending an inference request to an LLM inference framework or service, or completing a call to an external tool. The `Controller` class focuses on defining the workflow of an inference-time compute method. The `ScaffoldingLlm` class is responsible for integrating the two and completing the entire task.
 
 
 This is the call sequence diagram of `Scaffolding`:
@@ -102,7 +102,7 @@ class Controller(ABC):
     def process(self, tasks: List[Task], **kwargs):
         raise NotImplementedError
 ```
-Its two core interfaces are `generate()` and `process()`. `generate()` is the entry point for `ScaffoldingLlm` to invoke. In the default implementation of `generate()`, it produces a `Task` and then invokes `process()`. The `process()` is the most important part of every `Contronller` class, as it defines the implementation the workflow of this inference-time compute method.
+Its two core interfaces are `generate()` and `process()`. `generate()` is the entry point for `ScaffoldingLlm` to invoke. In the default implementation of `generate()`, it produces a `Task` and then invokes `process()`. The `process()` is the most important part of every `Controller` class, as it defines the implementation of the workflow of this inference-time compute method.
 
 
 Let's go into a specific subclass of `Controller` to see how `process()` is implemented. 
@@ -125,7 +125,7 @@ class NativeGenerationController(Controller):
 Essentially, `process()` is an iterator in python that can return a list of tasks using yield statement. When the iterator is re-entered, that is, when the yield statement ends, the `Tasks` have been completed. That means the result of the `Task` has been written into its result field. Then the `process()` can proceed to the next steps.
 
 
-From here we can see that the implement of the `Controller` can focus on the design of the workflow. It does not directly call the `Worker` and does not need to care about how these tasks are completed. And that is how `Scaffolding` decouple inference-time compute method and execution backend.
+From here we can see that the implementation of the `Controller` can focus on the design of the workflow. It does not directly call the `Worker` and does not need to care about how these tasks are completed. And that is how `Scaffolding` decouples inference-time compute method and execution backend.
 
 
 Also, `Controller` makes the inference-time compute method modular and reusable. It only requires the `sub-Controller` to be a member of class, and then the `process()` function of the `sub-Controller` is called using the “yield from” statement.

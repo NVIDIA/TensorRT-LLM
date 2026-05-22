@@ -5,6 +5,7 @@ from tensorrt_llm._torch.attention_backend.interface import (RopeParams,
                                                              RotaryScalingType)
 from tensorrt_llm._torch.modules.rotary_embedding import (MRotaryEmbedding,
                                                           RotaryEmbedding)
+from tensorrt_llm.functional import RopeEmbeddingUtils
 
 
 class TestRotaryEmbedding:
@@ -158,3 +159,89 @@ class TestMRotaryEmbedding:
         assert len(result) == 2
         assert result[0].shape == q.shape
         assert result[1].shape == k.shape
+
+
+class TestDuplicateData:
+    """Tests for duplicate_data support in RoPE table creation."""
+
+    @pytest.mark.parametrize("dim,max_positions,theta", [
+        (64, 4096, 10000.0),
+        (64, 4096, 1000000.0),
+        (128, 8192, 10000.0),
+    ])
+    def test_attention_plugin_duplicate_matches_manual_cat(
+            self, dim, max_positions, theta):
+        """duplicate_data=True should equal creating without duplication then
+        manually concatenating, which is what _normalize_mla_rotary_cache_layout did."""
+        _, cs_no = RopeEmbeddingUtils.create_sinusoidal_positions_for_attention_plugin(
+            num_pos=max_positions,
+            dim=dim,
+            theta=theta,
+            duplicate_data=False,
+        )
+        _, cs_yes = RopeEmbeddingUtils.create_sinusoidal_positions_for_attention_plugin(
+            num_pos=max_positions,
+            dim=dim,
+            theta=theta,
+            duplicate_data=True,
+        )
+
+        t = torch.tensor(cs_no).view(max_positions, -1, 2)
+        expected = torch.cat([t, t], dim=1).reshape(1, -1).contiguous()
+        actual = torch.tensor(cs_yes)
+        assert actual.shape == expected.shape
+        torch.testing.assert_close(actual, expected)
+
+    def test_create_rope_const_params_mla_table_size(self):
+        """With duplicate_data=True and interleave=True, the table should have
+        dim*2 floats per position (doubled)."""
+        rp = RopeParams(dim=64,
+                        theta=10000.0,
+                        max_positions=2048,
+                        duplicate_data=True)
+        _, cos_sin = rp.create_rope_const_params(interleave=True)
+        floats_per_pos = cos_sin.numel() // rp.max_positions
+        assert floats_per_pos == rp.dim * 2
+
+    def test_create_rope_const_params_normal_table_size(self):
+        """With duplicate_data=False and interleave=True, the table should have
+        dim floats per position (normal)."""
+        rp = RopeParams(dim=64,
+                        theta=10000.0,
+                        max_positions=2048,
+                        duplicate_data=False)
+        _, cos_sin = rp.create_rope_const_params(interleave=True)
+        floats_per_pos = cos_sin.numel() // rp.max_positions
+        assert floats_per_pos == rp.dim
+
+
+class TestFromConfigDuplicateData:
+    """Tests for RopeParams.from_config setting duplicate_data based on qk_rope_head_dim."""
+
+    @staticmethod
+    def _make_config(**overrides):
+        defaults = dict(
+            hidden_size=4096,
+            num_attention_heads=32,
+            max_position_embeddings=4096,
+            rope_theta=10000.0,
+            model_type="llama",
+        )
+        defaults.update(overrides)
+
+        class _Cfg:
+            pass
+
+        cfg = _Cfg()
+        for k, v in defaults.items():
+            setattr(cfg, k, v)
+        return cfg
+
+    def test_no_qk_rope_head_dim(self):
+        rp = RopeParams.from_config(self._make_config())
+        assert rp.duplicate_data is False
+
+    def test_with_qk_rope_head_dim(self):
+        rp = RopeParams.from_config(self._make_config(qk_rope_head_dim=64))
+        assert rp.duplicate_data is True
+        assert rp.dim == 64

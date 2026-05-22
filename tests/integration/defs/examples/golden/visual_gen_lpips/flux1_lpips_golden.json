@@ -1,0 +1,13 @@
+{
+  "image": "flux1_lpips_golden.png",
+  "model": "FLUX.1-dev",
+  "source": "TensorRT-LLM VisualGen",
+  "prompt": "a tiny astronaut hatching from an egg on the moon",
+  "height": 256,
+  "width": 256,
+  "num_inference_steps": 4,
+  "guidance_scale": 3.5,
+  "seed": 42,
+  "lpips_net": "alex",
+  "lpips_threshold": 0.05
+}

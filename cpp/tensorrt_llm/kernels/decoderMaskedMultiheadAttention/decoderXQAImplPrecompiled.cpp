@@ -356,7 +356,7 @@ protected:
     TKernelMeta const* mKernelMeta;
     unsigned int mKernelMetaCount;
     unsigned int mSM;
-    std::unordered_map<unsigned long long const*, CUlibrary> mCuLibs;
+    std::unordered_map<unsigned char const*, CUlibrary> mCuLibs;
 
     bool mForceXQA = false;
 
@@ -394,11 +394,11 @@ public:
 
     static XQAKernelLoader& Get()
     {
-        int device_id = tensorrt_llm::common::getDevice();
         static std::unique_ptr<XQAKernelLoader> s_factory[32] = {nullptr};
+        int const device_id = tensorrt_llm::common::getDevice();
+        TLLM_CHECK_WITH_INFO(device_id < 32, "Invalid device_id %d (must be < 32)", device_id);
         if (s_factory[device_id] == nullptr)
         {
-            assert(device_id <= 32);
             s_factory[device_id] = std::make_unique<XQAKernelLoader>(XQAKernelLoader());
         }
 

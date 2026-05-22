@@ -22,6 +22,7 @@ from fmha_triton import fused_attention
 from plugin import get_engine_name
 
 from tensorrt_llm import profiler
+from tensorrt_llm._deprecation import emit_engine_arch_deprecation
 from tensorrt_llm._utils import (str_dtype_to_torch, str_dtype_to_trt,
                                  trt_dtype_to_torch)
 from tensorrt_llm.logger import logger
@@ -131,6 +132,7 @@ def run(engine_dir,
 
 
 if __name__ == '__main__':
+    emit_engine_arch_deprecation("run.py")
     parser = argparse.ArgumentParser(
         formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     parser.add_argument('--batch_size', type=int, default=4)

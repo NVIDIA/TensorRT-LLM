@@ -1,0 +1,82 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+name: LLM API Compatibility
+
+on:
+  pull_request:
+    types: [opened, edited, synchronize, reopened, labeled, unlabeled]
+
+jobs:
+  check-llm-api-compatibility:
+    name: Check LLM API Compatibility Label
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: read
+    steps:
+      - name: Validate LLM API compatibility label
+        uses: actions/github-script@v8
+        with:
+          script: |
+            const referencePrefixes = [
+              'tests/unittest/api_stability/references/',
+              'tests/unittest/api_stability/references_committed/',
+            ];
+            // Keep these names in sync with the PR template and API-change guide.
+            const compatibleApiLabel = 'api-compatible';
+            const breakingApiLabel = 'api-breaking';
+
+            const files = await github.paginate(github.rest.pulls.listFiles, {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: context.payload.pull_request.number,
+              per_page: 100,
+            });
+
+            const changedPaths = files
+              .flatMap((file) => [file.filename, file.previous_filename].filter(Boolean));
+            const apiReferenceChanged = changedPaths.some((path) =>
+              referencePrefixes.some((prefix) => path.startsWith(prefix))
+            );
+
+            if (!apiReferenceChanged) {
+              core.info('No API stability reference changes detected.');
+              return;
+            }
+
+            const labelNames = new Set(
+              (context.payload.pull_request.labels || []).map((label) => label.name)
+            );
+            const apiChangeLabels = [compatibleApiLabel, breakingApiLabel].filter((label) =>
+              labelNames.has(label)
+            );
+
+            if (apiChangeLabels.length !== 1) {
+              core.setFailed(
+                'API stability reference files changed. Apply exactly one ' +
+                `of these labels: '${compatibleApiLabel}' or '${breakingApiLabel}'.`
+              );
+              return;
+            }
+
+            if (
+              apiChangeLabels[0] === breakingApiLabel &&
+              !context.payload.pull_request.title.includes('BREAKING')
+            ) {
+              core.setFailed("Breaking LLM API changes must include 'BREAKING' in the PR title.");
+              return;
+            }
+
+            core.info(`LLM API change label accepted: ${apiChangeLabels[0]}`);

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include <array>
 #include <chrono>
 #include <cstdint>
 #include <functional>
@@ -69,6 +70,29 @@ using MedusaChoices = std::vector<std::vector<SizeType32>>;
 using EagleChoices = std::vector<std::vector<SizeType32>>;
 using PriorityType = float;
 using BufferView = std::basic_string_view<uint8_t>;
+
+//! MmKey is used in KVCacheBlock when multimodal data presents in a block.
+//! Hash is a 32-byte array; startOffset is the per-block token offset; uuid is optional.
+struct MmKey
+{
+    std::array<uint8_t, 32> hash;
+    SizeType32 startOffset{};
+    std::optional<std::string> uuid{std::nullopt};
+
+    MmKey() = default;
+
+    MmKey(std::array<uint8_t, 32> hash, SizeType32 startOffset, std::optional<std::string> uuid = std::nullopt)
+        : hash(std::move(hash))
+        , startOffset(startOffset)
+        , uuid(std::move(uuid))
+    {
+    }
+
+    bool operator==(MmKey const& other) const noexcept
+    {
+        return hash == other.hash && startOffset == other.startOffset && uuid == other.uuid;
+    }
+};
 
 enum class DataType
 {
@@ -219,6 +243,9 @@ enum class ContextChunkingPolicy
     /// @brief Iterate through each context request in sequence and attempt to increase its chunk
     /// count until the constraint is exceeded.
     kEQUAL_PROGRESS = 1,
+
+    /// @brief Force every context request to have a chunk size of `unit_size` or 0 unless it's the last chunk.
+    kFORCE_CHUNK = 2,
 };
 
 std::ostream& operator<<(std::ostream& os, ContextChunkingPolicy policy);
@@ -294,6 +321,35 @@ struct InflightBatchingStats
     SizeType32 microBatchId;
     /// @brief Average number of tokens decoded per request per iteration
     float avgNumDecodedTokensPerIter;
+    /// @brief Context tokens for scheduled context requests that are read from
+    /// KV cache rather than computed this iteration. Covers prefix-cache hits
+    /// and previously-chunked tokens for chunked-prefill continuations.
+    /// Complements @ref numCtxTokens (tokens computed this iteration).
+    SizeType32 numCtxKvTokens;
+    /// @brief Total KV context length (prompt + generated-so-far) summed
+    /// across scheduled generation (decode) requests.
+    SizeType32 numGenKvTokens;
+    /// @brief Number of context (prefill) requests waiting in the executor
+    /// request queue — submitted but not yet scheduled. Excludes non-normal
+    /// control items (shutdown/cancel) and requests without a payload.
+    SizeType32 numQueuedContextRequests;
+    /// @brief Sum of prompt-token counts across queued context requests (the
+    /// requests counted in @ref numQueuedContextRequests).
+    SizeType32 numQueuedCtxTokens;
+    /// @brief Number of generation-only requests waiting in the executor
+    /// request queue. On a disaggregated-decode engine these are requests
+    /// that have completed prefill elsewhere and are awaiting KV-cache
+    /// transfer before they can start decoding. Always 0 on a
+    /// non-disaggregated or disaggregated-prefill engine.
+    SizeType32 numQueuedGenRequests;
+    /// @brief Sum of prompt-token counts across queued generation-only
+    /// requests (the requests counted in @ref numQueuedGenRequests). Acts
+    /// as the KV-budget these requests will need once their KV transfer
+    /// completes.
+    SizeType32 numQueuedGenKvTokens;
+    /// @brief Total KV context length summed across paused (preempted-decode)
+    /// requests. Complements @ref numPausedRequests (count).
+    SizeType32 numPausedKvTokens;
 };
 
 /// @brief Struct that holds speculative decoding stats

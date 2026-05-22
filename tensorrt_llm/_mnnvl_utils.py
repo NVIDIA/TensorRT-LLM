@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import ctypes
+import functools
 import os
 import platform
 import sys
@@ -215,45 +216,74 @@ class MnnvlMemory:
                 allocated_mem_handle, allocation_prop.requestedHandleTypes, 0
             )
         )
-        if (
-            allocation_prop.requestedHandleTypes
-            == cuda.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_FABRIC
-        ):
-            all_handles_data = comm.allgather(exported_fabric_handle.data)
-        else:
-            all_handles_data = comm.allgather(exported_fabric_handle)
-            all_pids = comm.allgather(os.getpid())
-            libc = ctypes.CDLL(None, use_errno=True)
-            syscall = libc.syscall
-            SYS_pidfd_open = 434
-            SYS_pidfd_getfd = 438
-            pidfds = []
-            for i, pid in enumerate(all_pids):
-                pidfd = syscall(SYS_pidfd_open, pid, 0)
-                if pidfd < 0:
-                    err = ctypes.get_errno()
-                    raise RuntimeError(
-                        f"pidfd_open({pid}) failed with errno {err}: {os.strerror(err)}"
-                    )
-                pidfds.append(pidfd)
-
-            remote_fds = []
-            for i, (pidfd, fd) in enumerate(zip(pidfds, all_handles_data)):
-                remote_fd = syscall(SYS_pidfd_getfd, pidfd, fd, 0)
-                if remote_fd < 0:
-                    err = ctypes.get_errno()
-                    error_msg = f"pidfd_getfd(pidfd={pidfd}, fd={fd}) failed with errno {err}: {os.strerror(err)}."
-                    if err == 1:  # EPERM
-                        error_msg += (
-                            " Permission denied. If running in a container, try adding --cap-add=SYS_PTRACE "
-                            "to your docker run command."
+        pidfds = []
+        remote_fds = []
+        try:
+            if (
+                allocation_prop.requestedHandleTypes
+                == cuda.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_FABRIC
+            ):
+                all_handles_data = comm.allgather(exported_fabric_handle.data)
+            else:
+                all_handles_data = comm.allgather(exported_fabric_handle)
+                all_pids = comm.allgather(os.getpid())
+                libc = ctypes.CDLL(None, use_errno=True)
+                syscall = libc.syscall
+                SYS_pidfd_open = 434
+                SYS_pidfd_getfd = 438
+                for i, pid in enumerate(all_pids):
+                    pidfd = syscall(SYS_pidfd_open, pid, 0)
+                    if pidfd < 0:
+                        err = ctypes.get_errno()
+                        raise RuntimeError(
+                            f"pidfd_open({pid}) failed with errno {err}: {os.strerror(err)}"
                         )
-                    else:
-                        error_msg += " This may be due to kernel version (requires Linux 5.6+)."
-                    raise RuntimeError(error_msg)
-                remote_fds.append(remote_fd)
+                    pidfds.append(pidfd)
 
-            all_handles_data = remote_fds
+                for i, (pidfd, fd) in enumerate(zip(pidfds, all_handles_data)):
+                    remote_fd = syscall(SYS_pidfd_getfd, pidfd, fd, 0)
+                    if remote_fd < 0:
+                        err = ctypes.get_errno()
+                        error_msg = f"pidfd_getfd(pidfd={pidfd}, fd={fd}) failed with errno {err}: {os.strerror(err)}."
+                        if err == 1:  # EPERM
+                            error_msg += (
+                                " Permission denied. If running in a container, try adding --cap-add=SYS_PTRACE "
+                                "to your docker run command."
+                            )
+                        else:
+                            error_msg += " This may be due to kernel version (requires Linux 5.6+)."
+                        raise RuntimeError(error_msg)
+                    remote_fds.append(remote_fd)
+
+                all_handles_data = remote_fds
+        except Exception:
+            # Release resources on failure path to avoid leaks; then re-raise.
+            if isinstance(exported_fabric_handle, int):
+                try:
+                    os.close(exported_fabric_handle)
+                except OSError as e:
+                    logger.warning(
+                        "Failed to close exported shareable handle on error: %s",
+                        e,
+                    )
+            try:
+                _check_cu_result(cuda.cuMemRelease(allocated_mem_handle))
+            except RuntimeError as e:
+                logger.warning(
+                    "cuMemRelease failed during error cleanup (original error will be raised): %s",
+                    e,
+                )
+            for _pidfd in pidfds:
+                try:
+                    os.close(_pidfd)
+                except OSError:
+                    pass
+            for _rfd in remote_fds:
+                try:
+                    os.close(_rfd)
+                except OSError:
+                    pass
+            raise
         # all_handles_data like b'\x00\x00\x00 \x00\x00\x00\x00\x8f\xec\x02\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\t\x00\x00\x00\x00\x00\x1d\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00'  # noqa: E501
         # can use buf = memoryview(data) to import if using plain buffer for data.
 
@@ -323,8 +353,8 @@ class MnnvlMemory:
                 cls.current_mem_offset = 0
 
     @staticmethod
-    def support_nvlink(need_all_up: bool = True):
-        dev_id = torch.cuda.current_device()
+    @functools.cache
+    def support_nvlink(dev_id: int, need_all_up: bool = True):
         handle = pynvml.nvmlDeviceGetHandleByIndex(dev_id)
         link_count = pynvml.NVML_NVLINK_MAX_LINKS
         active_links = 0
@@ -352,7 +382,8 @@ class MnnvlMemory:
         # We check if it has all NVLink up now.
         # But it is not equivalent to MNNVL support.
         # May need better support check.
-        support_nvlink_and_all_up = MnnvlMemory.support_nvlink(True)
+        dev_id = torch.cuda.current_device()
+        support_nvlink_and_all_up = MnnvlMemory.support_nvlink(dev_id, True)
         return support_nvlink_and_all_up
 
 

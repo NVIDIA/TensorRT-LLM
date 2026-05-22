@@ -1,3 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import os
 import weakref
 from abc import abstractmethod
@@ -32,10 +47,13 @@ def _warn_and_return(reason: str) -> Tuple[bool, Optional[str]]:
 
 
 from ...model_config import ModelConfig
+from ...pyexecutor.dwdp import get_global_dwdp_manager
 from ...utils import (ActivationType, AuxStreamType, Fp4QuantizedTensor,
                       get_model_extra_attrs, is_gated_activation,
                       is_torch_compiling)
-from .routing import BaseMoeRoutingMethod
+from .routing import (BaseMoeRoutingMethod, RoutingMethodType,
+                      get_cached_perfect_router_logits,
+                      precompute_common_perfect_router_logits)
 
 
 class MoEWeightLoadingMode(Enum):
@@ -59,6 +77,30 @@ class AlltoallMethodType(IntEnum):
     DeepEP = 3
     # DeepEP low latency: CUDA Graphs are supported, IBGDA is required
     DeepEPLowLatency = 4
+
+
+class MoESchedulerKind(Enum):
+    """Selects which forward-execution scheduler ConfigurableMoE picks for a backend.
+
+    Backends declare this via the ``scheduler_kind`` class attribute on
+    ``MoE``. ``ConfigurableMoE`` reads it once at init time to construct the
+    matching scheduler and to gate communication-strategy creation.
+
+    The axis is whether the cross-rank EP exchange is fused into the MoE
+    kernel or is a separate host-orchestrated step:
+
+    - ``EXTERNAL_COMM``: comm lives outside the MoE kernel boundary; the
+      scheduler issues ``Communication.dispatch`` / ``Communication.combine``
+      from the host with per-chunk EPLB hooks and optional multi-stream
+      chunk overlap (Cutlass, DeepGemm, CuteDSL, DenseGEMM, TRTLLMGen).
+    - ``FUSED_COMM``: comm is fused into the backend's fused kernel via
+      NVLink SymmBuffer (DeepGEMM ``fp8_fp4_mega_moe``). No host comm;
+      lockstep chunk launches; EPLB statistic update with
+      ``ignore_allreduce=False``.
+    """
+
+    EXTERNAL_COMM = "external_comm"
+    FUSED_COMM = "fused_comm"
 
 
 def extract_extra_attrs(layer_idx: str):
@@ -152,13 +194,18 @@ class MoE(nn.Module):
         aux_stream_dict (Optional[Dict[AuxStreamType, torch.cuda.Stream]]): Auxiliary CUDA streams for overlapping.
     """
 
+    # Default scheduler kind for ConfigurableMoE forward dispatch. Backends
+    # whose fused kernel owns cross-rank exchange (e.g. MegaMoE-style)
+    # override this to ``MoESchedulerKind.FUSED_COMM``.
+    scheduler_kind: MoESchedulerKind = MoESchedulerKind.EXTERNAL_COMM
+
     @classmethod
     @abstractmethod
     def can_implement(
         cls,
         quant_algo: Optional[QuantAlgo],
         dtype_activation: torch.dtype = torch.bfloat16,
-        gptoss_style: bool = False,
+        swiglu_gptoss_style: bool = False,
     ) -> Tuple[bool, Optional[str]]:
         """
         Check if this MoE backend can implement the given quantization algorithm.
@@ -176,7 +223,7 @@ class MoE(nn.Module):
         Args:
             quant_algo: The quantization algorithm to check (None for unquantized)
             dtype_activation: The activation data type.
-            gptoss_style: Whether gptoss_style (bias/swiglu with custom alpha/beta/limit) is enabled.
+            swiglu_gptoss_style: Whether swiglu_gptoss_style (bias/swiglu with custom alpha/beta/limit) is enabled.
 
         Returns:
             Tuple[bool, Optional[str]]: (can_implement, skip_reason)
@@ -235,6 +282,9 @@ class MoE(nn.Module):
 
         # could be modified later
         self.quant_config = model_config.quant_config
+        self.force_dynamic_quantization = getattr(model_config,
+                                                  'force_dynamic_quantization',
+                                                  False)
 
         self.cluster_rank = model_config.mapping.moe_cluster_rank
         self.cluster_size = model_config.mapping.moe_cluster_size
@@ -290,6 +340,68 @@ class MoE(nn.Module):
                 range(self.slot_start, self.slot_end))
             self.initial_global_assignments = list(range(self.num_experts))
             self.allreduce = None
+
+        # Override expert layout if DWDP is enabled
+        self._init_dwdp_expert_layout()
+        self._init_perfect_router()
+
+    def _init_dwdp_expert_layout(self):
+        """Override expert layout when DWDP is enabled."""
+        dwdp_manager = get_global_dwdp_manager()
+        if dwdp_manager is None:
+            return
+        assert self.layer_load_balancer is None, (
+            "DWDP and EPLB (MoE load balancer) cannot be used together. "
+            "Disable one of dwdp_config or moe_load_balancer.")
+        self.num_slots = self.num_experts
+        self.expert_size_per_partition = dwdp_manager.num_experts_per_worker
+        dwdp_size = dwdp_manager.dwdp_size
+        self.initial_global_assignments = [
+            (ep_rank * self.num_experts // dwdp_size + local_slot_id) %
+            self.num_experts for ep_rank in range(dwdp_size)
+            for local_slot_id in range(self.expert_size_per_partition)
+        ]
+        self.slot_start = dwdp_manager.start_expert_id
+        self.slot_end = self.slot_start + self.expert_size_per_partition
+        self.initial_local_expert_ids = list(
+            range(self.slot_start, self.slot_end))
+
+    def _get_perfect_router_dtype(self) -> torch.dtype:
+        if self.routing_method.routing_method_type in (
+                RoutingMethodType.DeepSeekV3, RoutingMethodType.MiniMax2):
+            return torch.float32
+        return self.dtype if self.dtype is not None else torch.float32
+
+    def _init_perfect_router(self):
+        self._enable_perfect_router = os.environ.get("ENABLE_PERFECT_ROUTER",
+                                                     "0") == "1"
+        if not self._enable_perfect_router:
+            return
+
+        precompute_common_perfect_router_logits(
+            num_experts=self.num_experts,
+            experts_per_token=self.routing_method.experts_per_token,
+            moe_ep_size=self.ep_size,
+            dtype=self._get_perfect_router_dtype(),
+            routing_method=self.routing_method,
+            ep_rank=self.ep_rank)
+
+    def _maybe_get_perfect_router_logits(
+            self,
+            router_logits: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+        if router_logits is None or not self._enable_perfect_router:
+            return router_logits
+
+        num_tokens, num_experts = router_logits.shape
+        return get_cached_perfect_router_logits(
+            num_tokens=num_tokens,
+            num_experts=num_experts,
+            experts_per_token=self.routing_method.experts_per_token,
+            moe_ep_size=self.ep_size,
+            ep_rank=self.ep_rank,
+            device=router_logits.device,
+            dtype=router_logits.dtype,
+            routing_method=self.routing_method)
 
     def _init_load_balancer(
         self,
@@ -402,6 +514,18 @@ class MoE(nn.Module):
         Subclasses can override this to indicate load balancer support.
         """
         return False
+
+    def validate_configurable_moe(self, moe: "nn.Module") -> None:
+        """Backend-specific validation hook called by ``ConfigurableMoE``.
+
+        ``ConfigurableMoE.validate_backend`` invokes this AFTER the generic
+        EPLB/load-balancer compatibility check, so backends may inspect
+        ``moe.num_slots``, ``moe.ep_size``, ``moe._using_load_balancer()``,
+        ``moe._using_dynamic_load_balancer()``. Default is a no-op; backends
+        with extra constraints (e.g. fused-comm backends rejecting
+        dynamic EPLB) override this.
+        """
+        del moe
 
     def _using_load_balancer(self) -> bool:
         """Check if this MoE is using load balancer."""
@@ -728,6 +852,7 @@ class MoE(nn.Module):
         use_dp_padding: Optional[bool] = None,
         **kwargs,
     ) -> Union[torch.Tensor, List[torch.Tensor]]:
+        router_logits = self._maybe_get_perfect_router_logits(router_logits)
         if self.register_to_config and is_torch_compiling():
             hidden_states = x.fp4_tensor if isinstance(
                 x, Fp4QuantizedTensor) else x

@@ -2,7 +2,7 @@
 
 For advanced TensorRT LLM users, the full set of `tensorrt_llm._torch.auto_deploy.llm_args.LlmArgs` is exposed. Use at your own risk. The argument list may diverge from the standard TensorRT LLM argument list.
 
-- All configuration fields used by the AutoDeploy core pipeline, `InferenceOptimizer`, are exposed exclusively in `AutoDeployConfi`g in `tensorrt_llm._torch.auto_deploy.llm_args`.
+- All configuration fields used by the AutoDeploy core pipeline, `InferenceOptimizer`, are exposed exclusively in `AutoDeployConfig` in `tensorrt_llm._torch.auto_deploy.llm_args`.
   Please make sure to refer to those first.
 - For advanced users, the full set of `LlmArgs` in `tensorrt_llm._torch.auto_deploy.llm_args` can be used to configure the AutoDeploy `LLM` API, including runtime options.
 - Note that some fields in the full `LlmArgs`
@@ -15,7 +15,7 @@ For advanced TensorRT LLM users, the full set of `tensorrt_llm._torch.auto_deplo
 
 # Expert Configuration of `build_and_run_ad.py`
 
-For advanced users, `build_and_run_ad.py` provides advanced configuration capabilities using a flexible argument parser powered by PyDantic Settings and OmegaConf. You can use dot notation for CLI arguments, provide multiple YAML configuration files, and utilize sophisticated configuration precedence rules to create complex deployment configurations.
+For advanced users, `build_and_run_ad.py` provides advanced configuration capabilities using a flexible argument parser powered by Pydantic Settings and OmegaConf. You can use dot notation for CLI arguments, provide multiple YAML configuration files, and utilize sophisticated configuration precedence rules to create complex deployment configurations.
 
 ## CLI Arguments with Dot Notation
 

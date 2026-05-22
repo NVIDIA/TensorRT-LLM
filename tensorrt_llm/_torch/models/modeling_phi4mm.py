@@ -21,7 +21,6 @@ import torch
 import torchvision
 import transformers
 from einops import rearrange
-from PIL import Image
 from torchvision.transforms.functional import get_image_size, pad, resize
 from transformers.image_processing_utils import BatchFeature
 from transformers.image_utils import (ImageInput, is_pil_image,
@@ -33,8 +32,8 @@ from tensorrt_llm.inputs.multimodal import MultimodalParams
 
 from ...executor.request import LoRARequest
 from ...inputs import (BaseMultimodalDummyInputsBuilder,
-                       BaseMultimodalInputProcessor, ExtraProcessedInputs,
-                       MultimodalPlaceholderMetadata,
+                       BaseMultimodalInputProcessor, ContentFormat,
+                       ExtraProcessedInputs, MultimodalPlaceholderMetadata,
                        MultimodalPlaceholderPlacement, TextPrompt,
                        register_input_processor)
 from ...logger import logger
@@ -114,6 +113,11 @@ def _load_phi4mm_classes(local_path):
         spec = importlib.util.spec_from_file_location(
             f"{package_name}.hf_modeling_phi4mm", modeling_phi4mm_path)
         hf_modeling_phi4mm = importlib.util.module_from_spec(spec)
+        # transformers 5.3.0 merged SlidingWindowCache into StaticCache, but the
+        # model's custom modeling_phi4mm.py still imports it. Alias it so the
+        # import succeeds.
+        _cache_utils = importlib.import_module("transformers.cache_utils")
+        _cache_utils.SlidingWindowCache = _cache_utils.StaticCache
         spec.loader.exec_module(hf_modeling_phi4mm)
         Phi4MMAudioEmbedding = hf_modeling_phi4mm.Phi4MMAudioEmbedding
         Phi4MMImageEmbedding = hf_modeling_phi4mm.Phi4MMImageEmbedding
@@ -544,7 +548,7 @@ class HFPhi4MultimodalEncoder(transformers.PreTrainedModel):
     config_class = Phi4MMConfig
     base_model_prefix = "model"
     _tied_weights_keys = ["lm_head.weight"]
-    _supports_flash_attn_2 = True
+    _supports_flash_attn = True
     _supports_sdpa = True
     _supports_cache_class = True
 
@@ -823,7 +827,7 @@ class Phi4MMInputProcessor(BaseMultimodalInputProcessor,
     def get_num_tokens_per_image(
         self,
         *,
-        image: Image.Image,
+        image: torch.Tensor,
         **kwargs,
     ):
         images = [image]
@@ -946,10 +950,11 @@ class Phi4MMInputProcessor(BaseMultimodalInputProcessor,
         },
         placeholder_placement=MultimodalPlaceholderPlacement.BEFORE_TEXT,
         placeholders_separator="",
+        content_format=ContentFormat.STRING,
     ))
 class Phi4MMForCausalLM(transformers.PreTrainedModel):
 
-    _supports_flash_attn_2 = True
+    _supports_flash_attn = True
 
     def __init__(self, model_config: ModelConfig):
         if _is_disagg():
@@ -1028,6 +1033,10 @@ class Phi4MMForCausalLM(transformers.PreTrainedModel):
         self.mm_token_ids = torch.tensor(
             [_IMAGE_SPECIAL_TOKEN_ID, _AUDIO_SPECIAL_TOKEN_ID],
             device=self.device)
+
+    @property
+    def vocab_size_padded(self) -> int:
+        return self.llm.vocab_size_padded
 
     def infer_max_seq_len(self) -> int:
         return self.llm.infer_max_seq_len()

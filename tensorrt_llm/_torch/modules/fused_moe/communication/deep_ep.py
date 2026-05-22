@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -25,6 +25,7 @@ from typing import List, Optional, Tuple
 
 import torch
 
+from tensorrt_llm._mnnvl_utils import MnnvlMemory
 from tensorrt_llm._torch.modules.fused_moe.deep_ep_utils import buffer_pool, deep_ep_installed
 from tensorrt_llm._utils import local_mpi_size
 from tensorrt_llm.mapping import Mapping
@@ -38,6 +39,11 @@ class DeepEP(Communication):
     DeepEP strategy supporting both pre-quant and post-quant dispatch
 
     """
+
+    # Upper bound of `num_experts / num_ranks` enforced by
+    # `notify_dispatch` in the DeepEP intranode kernel
+    # (`kNumThreads = 128` in intranode.cu).
+    INTRANODE_MAX_EXPERTS_PER_RANK: int = 128
 
     def __init__(
         self,
@@ -60,6 +66,25 @@ class DeepEP(Communication):
                 f"2) Internode: 2, 4, 8, or 16 nodes with 8 ranks per node."
             )
 
+        # Intranode kernel (`notify_dispatch` in intranode.cu) asserts
+        # `num_experts % num_ranks == 0` and
+        # `num_experts / num_ranks <= kNumThreads (= 128)`. With EPLB,
+        # `num_experts` is `num_slots`, so raise early if the constraint is
+        # violated so the caller can fall back to another strategy.
+        if num_slots % mapping.moe_ep_size != 0:
+            raise RuntimeError(
+                f"DeepEP intranode kernel requires num_slots ({num_slots}) "
+                f"to be divisible by moe_ep_size ({mapping.moe_ep_size})."
+            )
+        slots_per_rank = num_slots // mapping.moe_ep_size
+        if slots_per_rank > self.INTRANODE_MAX_EXPERTS_PER_RANK:
+            raise RuntimeError(
+                f"DeepEP intranode kernel supports at most "
+                f"{self.INTRANODE_MAX_EXPERTS_PER_RANK} experts per rank, but "
+                f"num_slots={num_slots} / moe_ep_size={mapping.moe_ep_size} = "
+                f"{slots_per_rank}."
+            )
+
         # Store needed parameters
         self.num_slots = num_slots
         self.hidden_size = hidden_size
@@ -76,14 +101,27 @@ class DeepEP(Communication):
         self.deep_ep_buffer = buffer_pool.get_buffer(mapping)
         self.deep_ep_buffer.reserve(hidden_size, weight_dtype)
 
+        # Invalid token expert ID: TRTLLM-gen kernels only support -1 for invalid tokens.
+        self.invalid_token_expert_id = -1
+
+    def destroy(self):
+        """Release the DeepEP buffer to prevent deadlock/hang.
+
+        Buffer.__del__ calls intranode::barrier (collective op). Without
+        explicit release, non-deterministic GC timing across ranks causes
+        some ranks to block in the barrier indefinitely.
+        """
+        self.deep_ep_buffer = None
+
     @staticmethod
     def is_platform_supported() -> bool:
         """
-        Check if DeepEP is supported on the current platform
+        Check if DeepEP is supported on the current platform.
+
+        DeepEP requires NVLink connectivity between all GPUs
+        (NUM_MAX_NVL_PEERS=8 hardcoded in upstream configs.cuh).
         """
-        if os.environ.get("TRTLLM_CAN_USE_DEEP_EP", "0") != "1":
-            return False
-        return deep_ep_installed
+        return deep_ep_installed and MnnvlMemory.supports_mnnvl()
 
     @staticmethod
     def _is_deepep_feasible(num_ranks: int) -> bool:
@@ -144,6 +182,13 @@ class DeepEP(Communication):
         DeepEP dispatch
         """
         all_rank_max_num_tokens = max(all_rank_num_tokens)
+
+        # DeepEP C++ kernel requires topk_weights (token_final_scales) to be float32,
+        # but downstream backends (e.g. TRTLLM) may require the original dtype.
+        # Convert to float32 for dispatch, then restore afterward.
+        original_scales_dtype = token_final_scales.dtype if token_final_scales is not None else None
+        if token_final_scales is not None and token_final_scales.dtype != torch.float32:
+            token_final_scales = token_final_scales.to(torch.float32)
 
         if not self.supports_post_quant_dispatch():
             # Pre-quant dispatch (unquantized data)
@@ -214,6 +259,27 @@ class DeepEP(Communication):
                 "deep_ep_handle": deep_ep_handle,
                 "padded": padded,
             }
+
+        if kwargs.get("enable_sanitize_expert_ids", False) and token_selected_slots.numel() > 0:
+            # After dispatch, non-local expert slots are replaced with invalid_token_expert_id.
+            # Some renormalize kernel but not all yet might do this sanitization,
+            # but we want to make sure it is always done for non-local tokens to avoid potential issues.
+            slot_start = self.expert_size_per_partition * self.ep_rank
+            slot_end = slot_start + self.expert_size_per_partition
+            non_local_mask = (token_selected_slots < slot_start) | (
+                token_selected_slots >= slot_end
+            )
+            token_selected_slots = token_selected_slots.masked_fill(
+                non_local_mask, self.invalid_token_expert_id
+            )
+
+        # Restore token_final_scales to original dtype for downstream consumers
+        if (
+            token_final_scales is not None
+            and original_scales_dtype is not None
+            and token_final_scales.dtype != original_scales_dtype
+        ):
+            token_final_scales = token_final_scales.to(original_scales_dtype)
 
         return hidden_states, hidden_states_sf, token_selected_slots, token_final_scales
 

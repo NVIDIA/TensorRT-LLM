@@ -43,26 +43,27 @@ struct TargetRanksInfo
 
     // the size of the vector is equal to the mDomainPPSize. the value of the vector is the layer num should be fetched
     // from each target PP rank in domain PP.
-    std::vector<int> mPeerAttentionLayerNumInDomainPP;
+    // Used for both KV and RNN cache transfer
+    std::vector<int> mPeerLayerNumInDomainPP;
 
     int getPeerPPDomainLayerNum(int targetRankIdx) const
     {
         int ppDomainRankIdx = targetRankIdx % mDomainPPSize;
-        return mPeerAttentionLayerNumInDomainPP.at(ppDomainRankIdx);
+        return mPeerLayerNumInDomainPP.at(ppDomainRankIdx);
     }
 };
 
 TargetRanksInfo targetIRanks(
     kv_cache::CacheState const& peerCacheState, kv_cache::CacheState const& selfCacheState, int selfRank);
 
-TargetRanksInfo TargetRanksInfoForDP(
+TargetRanksInfo targetIRanksForRnn(
     kv_cache::CacheState const& peerCacheState, kv_cache::CacheState const& selfCacheState, int selfRank);
 
 /**
  * @brief Calculate the number of blocks allocated to a specific Context Parallelism (CP) rank.
  *
  * This function determines how many blocks should be allocated to a given CP rank when
- * distributing a total number of blocks across multiple CP ranks.
+ * distributing a total number of blocks across multiple CP ranks in a round-robin fashion.
  *
  * @param cpRank The rank (index) of the current CP process. Must be in range [0, cpSize).
  * @param cpSize The total number of CP ranks/processes in the parallel group.
@@ -71,22 +72,6 @@ TargetRanksInfo TargetRanksInfoForDP(
  * @return The number of blocks allocated to the specified CP rank.
  */
 int getBlockNumAccountingForCP(int cpRank, int cpSize, int numTotalBlocks);
-
-/**
- * @brief Convert a local block index to a global block ID when Context Parallelism (CP) is enabled.
- *
- * This function maps a local block index (within a specific CP rank) to its corresponding
- * global block ID across all CP ranks. It supports two distribution strategies controlled
- * by the environment variable TRTLLM_USE_ROUND_ROBIN_BLOCK_DIST_FOR_CP.
- *
- * @param localBlockIdx The local block index within the current CP rank (0-based).
- * @param cpSize The total number of CP ranks in the parallel group.
- * @param cpRank The rank of the current CP process. Must be in range [0, cpSize).
- * @param numTotalBlocks The total number of blocks distributed across all CP ranks.
- *
- * @return The global block ID corresponding to the local block index.
- */
-int getGlobalBlockIdAccountingForCP(int localBlockIdx, int cpSize, int cpRank, int numTotalBlocks);
 
 void concatKVCacheDispatch(runtime::ITensor::SharedPtr* inputBlocks, int inputBlockNum,
     std::vector<int> const& inputRanks, kv_cache::CacheState const& peerCacheState,
@@ -104,5 +89,41 @@ void concatKvCacheV2Dispatch(std::vector<runtime::ITensor::SharedPtr> const& inp
     std::map<SizeType32, std::vector<runtime::ITensor::SharedPtr>>& outputKvCacheBlocksPerWindow,
     kv_cache::CacheState const& peerCacheState, kv_cache::CacheState const& selfCacheState, int selfIdx,
     runtime::BufferManager const& bufferManager, bool isIndexerKCache = false);
-
 } // namespace tensorrt_llm::executor::kv_cache
+
+namespace tensorrt_llm::executor::rnn_cache
+{
+
+/**
+ * @brief Dispatch function to split RNN conv state across different TP configurations
+ */
+void splitRnnConvStateDispatch(std::vector<runtime::ITensor::SharedPtr> const& inputConvBlocks,
+    std::vector<runtime::ITensor::SharedPtr>& outputSplitBlocks, SizeType32 const slotIdx,
+    SizeType32 const maxBatchSize, kv_cache::CacheState const& destCacheState,
+    kv_cache::CacheState const& selfCacheState, int selfIdx, runtime::BufferManager const& bufferManager);
+
+/**
+ * @brief Dispatch function to split RNN SSM state across different TP configurations
+ */
+void splitRnnSsmStateDispatch(std::vector<runtime::ITensor::SharedPtr> const& inputSsmBlocks,
+    std::vector<runtime::ITensor::SharedPtr>& outputSplitBlocks, SizeType32 const slotIdx,
+    SizeType32 const maxBatchSize, size_t convBytesPerLayer, kv_cache::CacheState const& destCacheState,
+    kv_cache::CacheState const& selfCacheState, int selfIdx, runtime::BufferManager const& bufferManager);
+
+/**
+ * @brief Dispatch function to concat RNN conv state from different TP configurations
+ */
+void concatRnnConvStateDispatch(std::vector<runtime::ITensor::SharedPtr> const& inputSplitBlocks,
+    std::vector<runtime::ITensor::SharedPtr>& outputConvBlocks, SizeType32 slotIdx, SizeType32 maxBatchSize,
+    kv_cache::CacheState const& destCacheState, kv_cache::CacheState const& selfCacheState, int selfIdx,
+    runtime::BufferManager const& bufferManager);
+
+/**
+ * @brief Dispatch function to concat RNN SSM state from different TP configurations
+ */
+void concatRnnSsmStateDispatch(std::vector<runtime::ITensor::SharedPtr> const& inputSplitBlocks,
+    std::vector<runtime::ITensor::SharedPtr>& outputSsmBlocks, SizeType32 slotIdx, SizeType32 maxBatchSize,
+    size_t convBytesPerLayer, kv_cache::CacheState const& destCacheState, kv_cache::CacheState const& selfCacheState,
+    int selfIdx, runtime::BufferManager const& bufferManager);
+
+} // namespace tensorrt_llm::executor::rnn_cache
