@@ -145,12 +145,15 @@ class LTX2Attention(Attention):
             )
             self._has_dual_attn = True
 
-        # Cross-attention Ulysses wrap (v2a in LTX-2). Active only when
-        # the configured parallelism is Ulysses (ulysses_size > 1).
-        # Attention2D mode keeps ulysses_size == 1 (mapping enforces mutual
-        # exclusion), so this branch is naturally skipped under Attention2D.
+        # Cross-attention Ulysses wrap (v2a in LTX-2). Active only under pure
+        # Ulysses (ulysses_size > 1 AND cp_size == 1). Combined modes
+        # (ring + Ulysses, attn2d + Ulysses) shard the seq axis by
+        # seq_size = cp_size * ulysses_size, which this wrapper has not been
+        # validated against; gate them off and fall back to the plain attn
+        # + AG path until the combined-mode case is wired up explicitly.
+        cp_size = vgm.cp_size if vgm is not None else 1
         self._has_cross_dual_attn = False
-        if use_ulysses_cross and self._is_cross_attn and ulysses_size > 1:
+        if use_ulysses_cross and self._is_cross_attn and ulysses_size > 1 and cp_size == 1:
             U = ulysses_size
             H = self.num_attention_heads
             H_kv = self.num_key_value_heads
