@@ -320,7 +320,7 @@ python visual_gen_ltx2.py \
 | Argument | FLUX | Qwen-Image | WAN | LTX2 | Default | Description |
 |----------|------|------------|-----|------|---------|-------------|
 | `--model_path` | ✓ | ✓ | ✓ | ✓ | — | Path to model checkpoint directory |
-| `--text_encoder_path` | — | — | — | ✓ | — | Path to Gemma3 text encoder |
+| `--text_encoder_path` | — | ✓ | — | ✓ | — | Path to Gemma3 text encoder |
 | `--prompt` | ✓ | ✓ | ✓ | ✓ | — | Text prompt for generation |
 | `--negative_prompt` | — | ✓ | ✓ | ✓ | *(built-in)* | Negative prompt |
 | `--height` | ✓ | ✓ | ✓ | ✓ | 1024 / 1328 / 720 | Output height |
