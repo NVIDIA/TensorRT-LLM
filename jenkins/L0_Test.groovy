@@ -953,7 +953,8 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
     // Create a unique suffix for the job name
     String customSuffix = "${env.BUILD_TAG}-${UUID.randomUUID().toString().replaceAll("-", "").substring(0, 6)}".toLowerCase()
     def jobUID = "${cluster.host}-multi_node_test-${customSuffix}"
-    def disaggMode = stageName.contains("Disagg-PerfSanity")
+    def disaggMultiNodeMode = stageName.contains("Disagg-PerfSanity")
+    def aggMultiNodeMode = !disaggMultiNodeMode && nodeCount > 1 && stageName.contains("PerfSanity")
 
     Utils.exec(pipeline, script: "env | sort && pwd && ls -alh")
 
@@ -1095,7 +1096,7 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                 // Generate Job Launch Script
                 def container = LLM_DOCKER_IMAGE.replace("urm.nvidia.com/", "urm.nvidia.com#")
                 def mounts = getMountListForSlurmTest(cluster, true).join(",")
-                String[] taskArgs = getNodeArgs(nodeCount, gpuCount, disaggMode)
+                String[] taskArgs = getNodeArgs(nodeCount, gpuCount, disaggMultiNodeMode)
                 if (taskArgs == null) {
                     error "Invalid Slurm test stage name is set"
                 }
@@ -1215,24 +1216,24 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     ${srunPrologue}
                 """.replaceAll("(?m)^\\s*", "")
 
-                if (disaggMode) {
+                if (disaggMultiNodeMode || aggMultiNodeMode) {
                     def scriptLaunchPrefixPathLocal = Utils.createTempLocation(pipeline, "./slurm_launch_prefix.sh")
                     def scriptLaunchSrunArgsPathLocal = Utils.createTempLocation(pipeline, "./slurm_srun_args.txt")
-                    def scriptLaunchDraftPathLocal = "${llmSrcLocal}/jenkins/scripts/perf/disaggregated/slurm_launch_draft.sh"
-                    def scriptSubmitLocalPath = "${llmSrcLocal}/jenkins/scripts/perf/disaggregated/submit.py"
+                    // The unified submit.py handles both agg and disagg; only the
+                    // draft launch script differs between the two paths.
+                    def scriptLaunchDraftPathLocal = disaggMultiNodeMode
+                        ? "${llmSrcLocal}/jenkins/scripts/perf/disaggregated/slurm_launch_draft.sh"
+                        : "${llmSrcLocal}/jenkins/scripts/perf/aggregated/slurm_launch_draft.sh"
+                    def scriptSubmitLocalPath = "${llmSrcLocal}/jenkins/scripts/perf/submit.py"
 
-                    // Remove unrelated mpi envs before passing to submit.py
-                    // because mpi env will be set in slurm_launch.sh for disagg.
                     srunArgs.removeAll { it == "--mpi=pmi2" || it == "--mpi=pmix" }
 
                     pipeline.writeFile(file: scriptLaunchPrefixPathLocal, text: scriptLaunchPrefix)
                     pipeline.writeFile(file: scriptLaunchSrunArgsPathLocal, text: srunArgs.join(" "))
 
-                    // Output is the corresponding scriptLaunchPathLocal script under the disaggMode
                     sh """
                         pip3 install pyyaml && \\
                         python3 ${scriptSubmitLocalPath} \\
-                        --run-ci \\
                         --llm-src ${llmSrcLocal} \\
                         --test-list ${testListPathLocal} \\
                         --draft-launch-sh ${scriptLaunchDraftPathLocal} \\

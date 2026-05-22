@@ -249,15 +249,41 @@ def get_hardware_config(config, runtime_mode, benchmark_mode, test_name=None):
         }
 
 
-def get_env_config(config, runtime_mode):
-    """Get env config based on mode."""
+def get_env_config(config, runtime_mode, benchmark_mode=None, server_name=None):
+    """Get worker / server / benchmark env vars from the yaml.
+
+    Aggregated yaml stores env vars per server config under
+    `server_configs[i].server_env_var`. Disaggregated yaml stores them at the
+    top-level `environment.{worker,server,benchmark}_env_var`.
+
+    ctx_only is a hybrid: the launch path is aggregated, but the yaml is the
+    disagg one, so the agg launch's "server_env_var" comes from
+    `environment.worker_env_var`.
+
+    Returns: {worker_env_var, server_env_var, benchmark_env_var}.
+    """
+    env = config.get("environment", {}) or {}
     if runtime_mode == "aggregated":
-        return {}
-    env = config.get("environment", {})
+        if benchmark_mode == "ctx_only":
+            return {
+                "worker_env_var": env.get("worker_env_var", "") or "",
+                "server_env_var": env.get("worker_env_var", "") or "",
+                "benchmark_env_var": env.get("benchmark_env_var", "") or "",
+            }
+        agg_server_env_var = ""
+        for sc in config.get("server_configs", []) or []:
+            if sc.get("name") == server_name:
+                agg_server_env_var = sc.get("server_env_var", "") or ""
+                break
+        return {
+            "worker_env_var": "",
+            "server_env_var": agg_server_env_var,
+            "benchmark_env_var": "",
+        }
     return {
-        "worker_env_var": env.get("worker_env_var", ""),
-        "server_env_var": env.get("server_env_var", ""),
-        "benchmark_env_var": env.get("benchmark_env_var", ""),
+        "worker_env_var": env.get("worker_env_var", "") or "",
+        "server_env_var": env.get("server_env_var", "") or "",
+        "benchmark_env_var": env.get("benchmark_env_var", "") or "",
     }
 
 
@@ -515,6 +541,17 @@ def main():
     else:
         raise ValueError("Either --test-list or --config-file must be provided")
 
+    # Determine test_case_name (the bracketed pytest test id). When --test-list
+    # is provided it was already extracted above; for --config-file we mirror
+    # the same shape generate_pytest_command builds for test_list_content.
+    if not args.test_list:
+        if runtime_mode == "disaggregated":
+            test_case_name = f"disagg-{benchmark_mode}-{config_file_base_name}"
+        elif benchmark_mode == "ctx_only":
+            test_case_name = f"aggr-ctx_only-{config_file_base_name}"
+        else:
+            test_case_name = f"aggr-{config_file_base_name}-{select_pattern}"
+
     # Load config if not already loaded
     if not args.config_file:
         with open(config_yaml, "r") as f:
@@ -532,6 +569,10 @@ def main():
     if not work_dir:
         work_dir = os.path.join(llm_src, "jenkins", "scripts", "perf", "local", timestamp)
     os.makedirs(work_dir, exist_ok=True)
+
+    # Per-test output directory consumed by slurm_launch_draft.sh. Same shape
+    # as PerfSanityTestConfig.get_commands: <output_dir>/<test_case_name>.
+    test_output_dir = os.path.join(work_dir, test_case_name)
 
     test_prefix = args.test_prefix if args.test_prefix else f"{llm_src}/tests/integration/defs"
 
@@ -559,7 +600,7 @@ def main():
         )
 
     # Get configs based on mode
-    env_config = get_env_config(config, runtime_mode)
+    env_config = get_env_config(config, runtime_mode, benchmark_mode, select_pattern)
     bm_config = get_benchmark_config(config, benchmark_mode)
     hardware_config = get_hardware_config(
         config,
@@ -729,6 +770,7 @@ def main():
                 f"export gpusPerNodePerGenServer={hardware_config.get('gpus_per_node_per_gen_server', '')}",
                 f"export totalNodes={hardware_config.get('total_nodes', '')}",
                 f"export totalGpus={hardware_config.get('total_gpus', '')}",
+                f"export testOutputDir={test_output_dir}",
             ]
         )
 
@@ -745,20 +787,33 @@ def main():
             f"FLASHINFER_JIT_DIR=/tmp/flashinfer_jit_cache_\\${{SLURM_LOCALID}} "
             f"HF_HOME=/tmp/hf_home "
         )
-        # Aggregated mode (including ctx_only)
+        # Aggregated mode (including ctx_only).
+        # For regular agg, server_env_var (from the matched server_configs entry)
+        # carries spec-decode flags like TLLM_SPEC_DECODE_FORCE_NUM_ACCEPTED_TOKENS;
+        # for ctx_only, get_env_config maps environment.worker_env_var into the
+        # server_env_var slot. Both reach all SLURM ranks via env-prefix on
+        # pytestCommand before trtllm-llmapi-launch dispatches.
+        agg_server_env_vars = env_config.get("server_env_var", "")
         script_prefix_lines.extend(
             [
                 f'export WORKER_ENV_VARS="{worker_env_vars}"',
+                f'export SERVER_ENV_VARS="{agg_server_env_vars}"',
                 (
-                    'export pytestCommand="$WORKER_ENV_VARS $PYTEST_COMMON_VARS $NSYS_PREFIX $LLM_API_LAUNCH'
+                    'export pytestCommand="$SERVER_ENV_VARS $WORKER_ENV_VARS $PYTEST_COMMON_VARS'
+                    " $NSYS_PREFIX $LLM_API_LAUNCH"
                     f' $PYTEST_COMMAND --junitxml={work_dir}/report.xml"'
                 ),
                 f"export gpusPerNode={hardware_config.get('gpus_per_node', '')}",
                 f"export gpusPerNodePerServer={hardware_config.get('gpus_per_node_per_server', '')}",
                 f"export totalNodes={hardware_config.get('total_nodes', '')}",
                 f"export totalGpus={hardware_config.get('total_gpus', '')}",
+                f"export testOutputDir={test_output_dir}",
             ]
         )
+        # Forward pytestCommand into the pyxis container on every rank (matches the
+        # disagg branch's --container-env=pytestCommand). Without this, exports
+        # in the launch script don't survive the container boundary on multi-node.
+        srun_args_lines.append("--container-env=pytestCommand")
 
     # Export accuracy config to BENCHMARK node (disagg only)
     if runtime_mode == "disaggregated":
