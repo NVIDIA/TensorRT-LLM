@@ -670,7 +670,9 @@ void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(nb::module_& m)
         .def_prop_ro("pool_configurations",
             [](tbk::KVCacheManager& self) { return self.getBlockManager().getPoolConfigurations(); })
         .def("copy_linear_attention_block", &tbk::KVCacheManager::copyLinearAttentionBlock, nb::arg("llm_request"),
-            nb::call_guard<nb::gil_scoped_release>());
+            nb::call_guard<nb::gil_scoped_release>())
+        .def("copy_linear_attention_block_batch", &tbk::KVCacheManager::copyLinearAttentionBlockBatch,
+            nb::arg("llm_requests"), nb::call_guard<nb::gil_scoped_release>());
 }
 
 void tb::BasePeftCacheManagerBindings::initBindings(nb::module_& m)

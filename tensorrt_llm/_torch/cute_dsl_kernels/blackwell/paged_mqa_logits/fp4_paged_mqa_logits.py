@@ -364,6 +364,8 @@ class FP4MQALogitsKernel:
         num_epi_subtiles: int = 1,
         epi_dtype=cutlass.Float32,
         output_dtype=cutlass.Float32,
+        remove_online_sf_transpose: bool = False,
+        use_batched_store: bool = True,
     ):
         # Static FP4 invariants — see plan Sanity checklist.
         assert num_heads == 64, "FP4 kernel hardcodes num_heads=64 for TMEM/SMEM budget"
@@ -398,6 +400,16 @@ class FP4MQALogitsKernel:
         self.num_sms = num_sms
         self.num_epi_subtiles = num_epi_subtiles
         self.epi_dtype = epi_dtype
+        # When True, skip the in-kernel SMEM warp_transpose for KV SF; assume
+        # the host has pre-arranged GMEM SF into UTCCP chunk layout. Only valid
+        # for phys_block_kv=128 (1 phys block = 1 UTCCP atom). Q SF transpose
+        # is NOT affected by this flag (deferred to a separate phase).
+        if remove_online_sf_transpose and phys_block_kv != 128:
+            remove_online_sf_transpose = False
+        self.remove_online_sf_transpose = remove_online_sf_transpose
+        # When True, defer per-t STG to register array and emit all STGs in
+        # one contiguous LSU phase after the for-t loop (epilogue micro-opt).
+        self.use_batched_store = use_batched_store
         # epi_bytes covers fp16 and bf16 (FP8 only handled fp16).
         self.epi_bytes = 2 if epi_dtype in (cutlass.Float16, cutlass.BFloat16) else 4
         # sW stage stride padded to 128-byte SMEM alignment for TMA bulk copy.
@@ -625,7 +637,6 @@ class FP4MQALogitsKernel:
         #                              [SF   phys_block_kv*4         bytes (= phys_block_kv int32)]
         phys_block_kv = self.phys_block_kv
         half_head_dim = self.head_dim // 2  # FP4 packed bytes per row
-        phys_block_bytes = phys_block_kv * (half_head_dim + 4)
         scale_offset_bytes = phys_block_kv * half_head_dim  # to SF region of each phys block
 
         # Recast the fused buffer to FP4. Each uint8 byte becomes 2 FP4 elements,
@@ -636,23 +647,31 @@ class FP4MQALogitsKernel:
         # type inference and TMA descriptors are correct.
         b = cute.recast_tensor(b, Float4E2M1FN)
 
+        # Read the real per-block stride (bytes) from the input tensor.
+        # When KV is the indexer K-cache pool view, the pool is laid out as
+        # [num_blocks, num_layers, kvFactor, blockSize], so dim-0 stride =
+        # num_layers * kvFactor * phys_block_bytes (not phys_block_bytes).
+        # Using the input stride keeps both the contiguous test path and
+        # the strided prod path correct.
+        kv_block_stride_bytes = kv_fused.layout.stride[0]
+
         # KV data view: [phys_block_kv, head_dim, num_phys_blocks] FP4 elements.
         # Innermost stride 1 = consecutive FP4 elem = packed pair share a byte.
         # Per-row stride = head_dim FP4 elem = head_dim/2 bytes.
-        # Per-block stride = phys_block_bytes * 2 FP4 elem (data + SF region).
+        # Per-block stride (FP4 elem) = kv_block_stride_bytes * 2 (uint8→FP4 doubles).
         kv_layout = cute.make_layout(
             (phys_block_kv, self.head_dim, num_phys_blocks),
-            stride=(self.head_dim, 1, phys_block_bytes * 2),
+            stride=(self.head_dim, 1, kv_block_stride_bytes * 2),
         )
         a = cute.make_tensor(kv_fp4.iterator, kv_layout)
 
         # SF KV view: int32 (4 UE8M0 packed). Build a uint8 view at the SF
         # offset, then recast to int32.
-        # Layout in bytes: (phys_block_kv * 4, num_phys_blocks) stride (1, phys_block_bytes)
-        # After recast int32: (phys_block_kv, num_phys_blocks) stride (1, phys_block_bytes/4)
+        # Layout in bytes: (phys_block_kv * 4, num_phys_blocks) stride (1, kv_block_stride_bytes)
+        # After recast int32: (phys_block_kv, num_phys_blocks) stride (1, kv_block_stride_bytes/4)
         sf_kv_uint8_layout = cute.make_layout(
             (phys_block_kv * 4, num_phys_blocks),
-            stride=(1, phys_block_bytes),
+            stride=(1, kv_block_stride_bytes),
         )
         sf_kv_uint8 = cute.make_tensor(kv_fused.iterator + scale_offset_bytes, sf_kv_uint8_layout)
         sf_kv = cute.recast_tensor(sf_kv_uint8, cutlass.Int32)
@@ -1568,14 +1587,18 @@ class FP4MQALogitsKernel:
 
                     # Step 5.6: SF KV transpose + UTCCP. block_kv = 128 = 1
                     # UTCCP atom; loop is constexpr-1 but kept for clarity.
-                    sf_kv_atoms = self.block_kv // 128
-                    for atom_idx in cutlass.range_constexpr(sf_kv_atoms):
-                        atom_offset = atom_idx * 128
-                        stage_offset = kv_stage * sSF_KV_0.layout.stride[1]
-                        utccp_required_smem_warp_transpose(
-                            sSF_KV_0.iterator + stage_offset + atom_offset
-                        )
-                    cute.arch.fence_view_async_shared()
+                    # When remove_online_sf_transpose=True, the host has already
+                    # pre-arranged GMEM SF into UTCCP chunk layout, so the
+                    # in-kernel SMEM transpose (and its fence) can be skipped.
+                    if cutlass.const_expr(not self.remove_online_sf_transpose):
+                        sf_kv_atoms = self.block_kv // 128
+                        for atom_idx in cutlass.range_constexpr(sf_kv_atoms):
+                            atom_offset = atom_idx * 128
+                            stage_offset = kv_stage * sSF_KV_0.layout.stride[1]
+                            utccp_required_smem_warp_transpose(
+                                sSF_KV_0.iterator + stage_offset + atom_offset
+                            )
+                        cute.arch.fence_view_async_shared()
                     # int32 SMEM → UE8M0 view for UTCCP atom + chunk layout.
                     sSF_KV_0_ue8m0 = cute.recast_tensor(sSF_KV_0, Float8E8M0FNU)
                     stage_off_kv0_ue8m0 = kv_stage * sSF_KV_0_ue8m0.layout.stride[1]
@@ -1705,14 +1728,18 @@ class FP4MQALogitsKernel:
                     kv_stage_1 = kv_cons_state_umma_1.index
 
                     # Step 5.6: SF KV (group 1) transpose + UTCCP.
-                    sf_kv_atoms_1 = self.block_kv // 128
-                    for atom_idx in cutlass.range_constexpr(sf_kv_atoms_1):
-                        atom_offset = atom_idx * 128
-                        stage_offset = kv_stage_1 * sSF_KV_1.layout.stride[1]
-                        utccp_required_smem_warp_transpose(
-                            sSF_KV_1.iterator + stage_offset + atom_offset
-                        )
-                    cute.arch.fence_view_async_shared()
+                    # When remove_online_sf_transpose=True, the host has already
+                    # pre-arranged GMEM SF into UTCCP chunk layout, so the
+                    # in-kernel SMEM transpose (and its fence) can be skipped.
+                    if cutlass.const_expr(not self.remove_online_sf_transpose):
+                        sf_kv_atoms_1 = self.block_kv // 128
+                        for atom_idx in cutlass.range_constexpr(sf_kv_atoms_1):
+                            atom_offset = atom_idx * 128
+                            stage_offset = kv_stage_1 * sSF_KV_1.layout.stride[1]
+                            utccp_required_smem_warp_transpose(
+                                sSF_KV_1.iterator + stage_offset + atom_offset
+                            )
+                        cute.arch.fence_view_async_shared()
                     sSF_KV_1_ue8m0 = cute.recast_tensor(sSF_KV_1, Float8E8M0FNU)
                     stage_off_kv1_ue8m0 = kv_stage_1 * sSF_KV_1_ue8m0.layout.stride[1]
                     sSF_KV_1_chunk = cute.make_tensor(
@@ -1816,6 +1843,13 @@ class FP4MQALogitsKernel:
                     MAX_NUM_W_IN_REG = 56 if next_n == 3 else 64
                 NUM_W_IN_REG = min(MAX_NUM_W_IN_REG, num_heads)
                 w_cache = cute.make_fragment(NUM_W_IN_REG * next_n, self.epi_dtype)
+                # Batched STG: hold reduced result per t in register; the
+                # actual STG happens once after the for-t loop to land all
+                # STGs in one contiguous LSU phase.
+                if cutlass.const_expr(self.use_batched_store):
+                    result_arr = cute.make_fragment(next_n, self.output_dtype)
+                else:
+                    result_arr = None
                 q_stage_local = cutlass.Int32(0)
 
                 while has_work:
@@ -2022,9 +2056,18 @@ class FP4MQALogitsKernel:
                             result_t = sum_lo + sum_hi
                         else:
                             result_t = s0x + s0y + s1x + s1y
-                        out_row = q_idx * next_n + t
                         # Step 5.7: drop * scale_val (FP4 SF baked into acc).
-                        mLogits[(out_row, kv_pos)] = self.output_dtype(result_t)
+                        if cutlass.const_expr(self.use_batched_store):
+                            result_arr[t] = self.output_dtype(result_t)
+                        else:
+                            out_row = q_idx * next_n + t
+                            mLogits[(out_row, kv_pos)] = self.output_dtype(result_t)
+
+                    if cutlass.const_expr(self.use_batched_store):
+                        # Batched STG: all result_arr[t] → mLogits in one pass.
+                        for t in cutlass.range_constexpr(next_n):
+                            out_row = q_idx * next_n + t
+                            mLogits[(out_row, kv_pos)] = result_arr[t]
 
                     # Advance: inline fetch_next_task
                     next_kv_idx = kv_idx + NUM_MATH_WG
@@ -2063,6 +2106,13 @@ class FP4MQALogitsKernel:
                     MAX_NUM_W_IN_REG = 56 if next_n == 3 else 64
                 NUM_W_IN_REG = min(MAX_NUM_W_IN_REG, num_heads)
                 w_cache = cute.make_fragment(NUM_W_IN_REG * next_n, self.epi_dtype)
+                # Batched STG: hold reduced result per t in register; the
+                # actual STG happens once after the for-t loop to land all
+                # STGs in one contiguous LSU phase.
+                if cutlass.const_expr(self.use_batched_store):
+                    result_arr = cute.make_fragment(next_n, self.output_dtype)
+                else:
+                    result_arr = None
                 q_stage_local = cutlass.Int32(0)
 
                 while has_work:
@@ -2259,9 +2309,18 @@ class FP4MQALogitsKernel:
                             result_t = sum_lo + sum_hi
                         else:
                             result_t = s0x + s0y + s1x + s1y
-                        out_row = q_idx * next_n + t
                         # Step 5.7: drop * scale_val (FP4 SF baked into acc).
-                        mLogits[(out_row, kv_pos)] = self.output_dtype(result_t)
+                        if cutlass.const_expr(self.use_batched_store):
+                            result_arr[t] = self.output_dtype(result_t)
+                        else:
+                            out_row = q_idx * next_n + t
+                            mLogits[(out_row, kv_pos)] = self.output_dtype(result_t)
+
+                    if cutlass.const_expr(self.use_batched_store):
+                        # Batched STG: all result_arr[t] → mLogits in one pass.
+                        for t in cutlass.range_constexpr(next_n):
+                            out_row = q_idx * next_n + t
+                            mLogits[(out_row, kv_pos)] = result_arr[t]
 
                     # Advance: inline fetch_next_task
                     next_kv_idx = kv_idx + NUM_MATH_WG

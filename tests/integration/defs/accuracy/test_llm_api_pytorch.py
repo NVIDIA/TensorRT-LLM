@@ -6327,6 +6327,12 @@ class TestQwen3_5_4B(LlmapiAccuracyTestHarness):
         dflash_model_path = f"{llm_models_root()}/Qwen3.5-4B-DFlash"
         spec_config = DFlashDecodingConfig(max_draft_len=4,
                                            speculative_model=dflash_model_path)
+
+        # Use lower threshold for H20
+        is_h20_gpu = check_device_contain(
+            ["H20"]) and not check_device_contain(["H200"])
+        extra_acc_spec = "h20" if is_h20_gpu else None
+
         with LLM(target_model_path,
                  max_seq_len=4096,
                  max_batch_size=8,
@@ -6335,6 +6341,7 @@ class TestQwen3_5_4B(LlmapiAccuracyTestHarness):
                  speculative_config=spec_config) as llm:
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm,
+                          extra_acc_spec=extra_acc_spec,
                           extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
 
 
