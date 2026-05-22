@@ -709,6 +709,7 @@ class TestNanoV3Omni(LlmapiAccuracyTestHarness):
     ) -> None:
         with LLM(
             model_path,
+            trust_remote_code=True,
             kv_cache_config=kv_cache_config,
             enable_chunked_prefill=True,
             # Use a low-ish value for the below to force chunking for requests (helping to surface
