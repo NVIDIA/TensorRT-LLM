@@ -1330,7 +1330,6 @@ void splitUnifiedPoolSsm(runtime::ITensor::SharedPtr const& pool, std::vector<Si
     // Build pointer arrays: input pool block pointers (pointing to SSM start), output buffers, prefixLayerNum
     std::vector<uint64_t> allPtrs;
     SizeType32 const numBlocks = pool->getShape().d[1];
-    size_t layerStrideBytes = static_cast<size_t>(numBlocks) * blockSizeBytes;
     uint8_t* poolBase = static_cast<uint8_t*>(pool->data());
 
     for (auto blockIdx : realBlockIndices)
@@ -1829,7 +1828,7 @@ void splitUnifiedPoolSsmDispatch(runtime::ITensor::SharedPtr const& pool,
         splitUnifiedPoolSsm<int8_t>(pool, realBlockIndices, outputSplitBlocks, destCacheState, selfCacheState, selfIdx,
             ssmBytes, blockSizeBytes, bufferManager);
         break;
-    default: TLLM_THROW("splitUnifiedPoolSsmDispatch: unsupported SSM data type size %d", dataSize);
+    default: TLLM_THROW("splitUnifiedPoolSsmDispatch: unsupported SSM data type size %zu", dataSize);
     }
 }
 
@@ -1854,7 +1853,7 @@ void splitUnifiedPoolConvDispatch(runtime::ITensor::SharedPtr const& pool,
         splitUnifiedPoolConv<int8_t>(pool, realBlockIndices, outputSplitBlocks, destCacheState, selfCacheState, selfIdx,
             ssmBytes, blockSizeBytes, bufferManager);
         break;
-    default: TLLM_THROW("splitUnifiedPoolConvDispatch: unsupported conv data type size %d", dataSize);
+    default: TLLM_THROW("splitUnifiedPoolConvDispatch: unsupported conv data type size %zu", dataSize);
     }
 }
 
@@ -1878,7 +1877,7 @@ void concatUnifiedPoolSsmDispatch(runtime::ITensor::SharedPtr const& pool,
         concatUnifiedPoolSsm<int8_t>(pool, realBlockIndices, inputSplitBlocks, srcCacheState, selfCacheState, selfIdx,
             ssmBytes, blockSizeBytes, bufferManager);
         break;
-    default: TLLM_THROW("concatUnifiedPoolSsmDispatch: unsupported SSM data type size %d", dataSize);
+    default: TLLM_THROW("concatUnifiedPoolSsmDispatch: unsupported SSM data type size %zu", dataSize);
     }
 }
 
@@ -1902,7 +1901,7 @@ void concatUnifiedPoolConvDispatch(runtime::ITensor::SharedPtr const& pool,
         concatUnifiedPoolConv<int8_t>(pool, realBlockIndices, inputSplitBlocks, srcCacheState, selfCacheState, selfIdx,
             ssmBytes, blockSizeBytes, bufferManager);
         break;
-    default: TLLM_THROW("concatUnifiedPoolConvDispatch: unsupported conv data type size %d", dataSize);
+    default: TLLM_THROW("concatUnifiedPoolConvDispatch: unsupported conv data type size %zu", dataSize);
     }
 }
 

@@ -373,13 +373,6 @@ void CacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& sessio
         return;
     }
 
-    auto& blockManager = mCacheManager->getBlockManager();
-    auto const& lastBlockKey = session.getLastBlockKey();
-    auto const ppSize = selfConfig.getParallelConfig().mPipelineParallelism;
-    bool const recvSideHasCP = destConfig.getParallelConfig().mContextParallelism > 1;
-    auto blockRange
-        = getBlockRangeForSending(mCacheManager, llmRequest, lastBlockKey, indexFromEnd, recvSideHasCP, ppSize);
-
     auto pickUpConnections = cache_formatter_utils::pickSendConnections(
         connections.size(), selfConfig, selfIdx, destConfig, session.getCounterPartRanks());
     size_t targetNum = pickUpConnections.size();
@@ -388,6 +381,13 @@ void CacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& sessio
         TLLM_LOG_DEBUG("No targets to send KV cache to for request ID: %ld", llmRequest.mRequestId);
         return;
     }
+
+    auto& blockManager = mCacheManager->getBlockManager();
+    auto const& lastBlockKey = session.getLastBlockKey();
+    auto const ppSize = selfConfig.getParallelConfig().mPipelineParallelism;
+    bool const recvSideHasCP = destConfig.getParallelConfig().mContextParallelism > 1;
+    auto blockRange
+        = getBlockRangeForSending(mCacheManager, llmRequest, lastBlockKey, indexFromEnd, recvSideHasCP, ppSize);
     auto const numPools
         = blockManager.getNumPools(/*includeBlockScalePools=*/false, /*includeIndexerKCachePools=*/false);
     // TODO(oargov): are we sure the other side has the same number of pools? this might not hold for pp_size>1...

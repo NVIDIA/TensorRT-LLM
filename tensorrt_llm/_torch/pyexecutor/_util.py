@@ -100,6 +100,8 @@ def get_kv_cache_manager_cls(
         if kv_cache_config.enable_block_reuse:
             return CppMambaHybridCacheManager
         if use_cpp_mamba_cache_manager() or use_py_mamba_cache_manager():
+            logger.info(
+                "Using MixedMambaHybridCacheManager for hybrid mamba model")
             return MixedMambaHybridCacheManager
         if (cache_transceiver_config is not None
                 and cache_transceiver_config.transceiver_runtime == "PYTHON"):

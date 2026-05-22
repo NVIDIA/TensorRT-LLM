@@ -839,11 +839,6 @@ def create_py_executor(
                     "TRTLLM_USE_PY_MAMBA is ignored in disaggregated serving; "
                     "use cache_transceiver_config.transceiver_runtime='PYTHON' "
                     "to select PythonMambaCacheManager.")
-            if cache_transceiver_config.transceiver_runtime != "PYTHON" or os.environ.get(
-                    "TRTLLM_USE_CPP_MAMBA") == "1":
-                logger.info("Disaggregated serving with hybrid model detected. "
-                            "Enabling C++ MambaCacheManager.")
-                os.environ["TRTLLM_USE_CPP_MAMBA"] = "1"
             else:
                 logger.info("Disaggregated serving with hybrid model detected. "
                             "Enabling CppMambaHybridCacheManager.")
