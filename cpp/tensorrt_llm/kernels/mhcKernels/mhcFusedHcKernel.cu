@@ -804,14 +804,21 @@ void mhcFusedHcFmaAllInOneLaunch(__nv_bfloat16 const* x_prev, __nv_bfloat16 cons
     int const m_batches = (M + tile_m - 1) / tile_m;
 
     // ---- Zero workspace buffers (atomic accumulators + done counter) ----
-    // NOTE: Path F's kernel epilogue always uses atomicAdd into y_acc/r_acc
-    // (no KS=1 direct-store fast path like the MMA Path D in
-    // mhcFusedHcAllInOneLaunchImpl), so we cannot skip the zero even at
-    // num_k_splits == 1. Adding the direct-store branch would require kernel
-    // changes in fused_pmap_gemm_fma_allinone; deferred since Path F is the
-    // small-M (M <= 32) winner where the workspace zero is ~1 µs anyway.
-    fhcZeroWorkspaces(y_acc_workspace, static_cast<uint32_t>(M) * static_cast<uint32_t>(N), r_acc_workspace,
-        static_cast<uint32_t>(M), done_counter_workspace, static_cast<uint32_t>(m_batches), stream);
+    // KS=1 uses direct stores into y_acc/r_acc, so those accumulators do not
+    // need zeroing. done_counter still needs zeroing when multiple CTAs race to
+    // elect the Phase 4 CTA. TN=24, KS=1 has exactly one CTA per token batch,
+    // so it skips the zero kernel entirely.
+    int const ctas_per_batch = (N / tile_n) * num_k_splits;
+    if (num_k_splits > 1)
+    {
+        fhcZeroWorkspaces(y_acc_workspace, static_cast<uint32_t>(M) * static_cast<uint32_t>(N), r_acc_workspace,
+            static_cast<uint32_t>(M), done_counter_workspace, static_cast<uint32_t>(m_batches), stream);
+    }
+    else if (ctas_per_batch > 1)
+    {
+        fhcZeroWorkspaces(y_acc_workspace, /*y_elems=*/0, r_acc_workspace, /*r_elems=*/0, done_counter_workspace,
+            static_cast<uint32_t>(m_batches), stream);
+    }
 
     bool const fuse_norm = (norm_weight != nullptr);
     FmaAllInOneFn fn = fuse_norm ? pickFhcFmaAllInOne</*kFuseNorm=*/true>(tile_n, num_k_splits, tile_m)

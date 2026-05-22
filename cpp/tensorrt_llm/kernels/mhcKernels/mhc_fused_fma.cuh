@@ -380,14 +380,16 @@ __launch_bounds__(256) __global__ void fused_pmap_gemm_fma_ksplit(__nv_bfloat16 
 // Grid:  (ceil(M / TM), FULL_N / TN, KS)
 // Block: 256 threads.
 //
-// Uses atomicAdd into y_acc[M, FULL_N] and r_acc[M] for cross-CTA reduction
-// (KS > 1 and/or TN < FULL_N).  Uses per-token-batch atomic counter to elect
-// the last-home CTA, which __threadfences, reloads the now-complete y_acc /
-// r_acc / residual_cur rows, and runs bigFuse inline to produce
-// post_mix_out, comb_mix_out, layer_input_out.
+// Uses direct stores into y_acc[M, FULL_N] and r_acc[M] for KS == 1, and
+// atomicAdd for KS > 1 cross-CTA K reduction. Uses a per-token-batch atomic
+// counter when TN < FULL_N or KS > 1 to elect the last-home CTA, which
+// __threadfences, reloads the now-complete y_acc / r_acc / residual_cur rows,
+// and runs bigFuse inline to produce post_mix_out, comb_mix_out,
+// layer_input_out.
 //
-// Caller MUST zero y_acc[M, FULL_N], r_acc[M], done_counter[ceil(M / TM)]
-// before launch.  FULL_N must equal HC_MULT * (2 + HC_MULT) = 24.
+// Caller MUST zero y_acc[M, FULL_N] and r_acc[M] before launch only when
+// KS > 1. done_counter[ceil(M / TM)] must be zeroed only when more than one CTA
+// contributes to a token batch. FULL_N must equal HC_MULT * (2 + HC_MULT) = 24.
 // ===================================================================
 template <int TN, int KS, int TM = 1, int FULL_N = 24, int BF16_VEC_OVERRIDE = 0, bool kFuseNorm = false>
 __launch_bounds__(256) __global__ void fused_pmap_gemm_fma_allinone(__nv_bfloat16 const* __restrict__ residual_in,
@@ -798,10 +800,13 @@ __launch_bounds__(256) __global__ void fused_pmap_gemm_fma_allinone(__nv_bfloat1
 
     // Phase 4: inline bigFuse for the TM tokens in this batch.
     // Layout: FULL_N = HC_MULT*(2+HC_MULT) = 24
-    //   y_local[0..HC_MULT)               → s_pre_mix (sigmoid gate)
-    //   y_local[HC_MULT..2*HC_MULT)       → post_mix_out (sigmoid*hc_post_mult)
-    //   y_local[2*HC_MULT..FULL_N)        → comb_mix_out (Sinkhorn)
-    __shared__ float s_pre_mix[TM][HC_MULT];
+    //   y_acc[0..HC_MULT)              -> pre_mix (sigmoid gate)
+    //   y_acc[HC_MULT..2*HC_MULT)      -> post_mix_out (sigmoid*hc_post_mult)
+    //   y_acc[2*HC_MULT..FULL_N)       -> comb_mix_out (Sinkhorn)
+    //
+    // Lanes 0..3 in every warp compute pre_mix locally and broadcast it via
+    // shfl, so all 8 warps can stream layer_input without a CTA-wide shared
+    // memory handoff. Warp 0 also owns post_mix/comb_mix stores.
 
 #pragma unroll
     for (int t = 0; t < TM; t++)
@@ -812,55 +817,41 @@ __launch_bounds__(256) __global__ void fused_pmap_gemm_fma_allinone(__nv_bfloat1
             continue;
         }
         int const tok = base_tok + t;
-        float cm_vals[HC_MULT];
 
-        if (warp_id == 0 && lane < HC_MULT)
+        float pre_mix_local = 0.0f;
+        if (lane < HC_MULT)
         {
             float const r_val = r_acc[tok];
-            float y_local[HC_MULT3];
             float const* y_row = y_acc + static_cast<long long>(tok) * FULL_N;
-#pragma unroll
-            for (int c = 0; c < HC_MULT3; c++)
-                y_local[c] = y_row[c];
+            float const y_pre = y_row[lane];
 
             float const rstd = rsqrtf(r_val / static_cast<float>(K) + rms_eps);
             float const s0 = hc_scale[0], s1 = hc_scale[1], s2 = hc_scale[2];
 
-            float v = y_local[lane] * rstd * s0 + hc_base[lane];
-            s_pre_mix[t][lane] = 1.0f / (1.0f + expf(-v)) + hc_pre_eps;
+            float v = y_pre * rstd * s0 + hc_base[lane];
+            pre_mix_local = 1.0f / (1.0f + __expf(-v)) + hc_pre_eps;
 
-            v = y_local[HC_MULT + lane] * rstd * s1 + hc_base[HC_MULT + lane];
-            post_mix_out[tok * HC_MULT + lane] = 1.0f / (1.0f + expf(-v)) * hc_post_mult_value;
-
-#pragma unroll
-            for (int k = 0; k < HC_MULT; k++)
-                cm_vals[k]
-                    = y_local[2 * HC_MULT + lane * HC_MULT + k] * rstd * s2 + hc_base[2 * HC_MULT + lane * HC_MULT + k];
-
-            constexpr unsigned LANE_MASK = (1u << HC_MULT) - 1;
-            float const rowMax = fmaxf(fmaxf(cm_vals[0], cm_vals[1]), fmaxf(cm_vals[2], cm_vals[3]));
-#pragma unroll
-            for (int k = 0; k < HC_MULT; k++)
-                cm_vals[k] = expf(cm_vals[k] - rowMax);
-            // Reciprocal-multiply: 1 fdiv + 4 fmul vs 4 fdivs (faster on B200).
-            float inv_rs = 1.0f / (cm_vals[0] + cm_vals[1] + cm_vals[2] + cm_vals[3]);
-#pragma unroll
-            for (int k = 0; k < HC_MULT; k++)
-                cm_vals[k] = cm_vals[k] * inv_rs + hc_sinkhorn_eps;
-#pragma unroll
-            for (int k = 0; k < HC_MULT; k++)
+            if (warp_id == 0)
             {
-                float cs = cm_vals[k];
-                cs += __shfl_xor_sync(LANE_MASK, cs, 1);
-                cs += __shfl_xor_sync(LANE_MASK, cs, 2);
-                cm_vals[k] *= 1.0f / (cs + hc_sinkhorn_eps);
-            }
-            for (int it = 1; it < sinkhorn_repeat; it++)
-            {
-                inv_rs = 1.0f / (cm_vals[0] + cm_vals[1] + cm_vals[2] + cm_vals[3] + hc_sinkhorn_eps);
+                v = y_row[HC_MULT + lane] * rstd * s1 + hc_base[HC_MULT + lane];
+                post_mix_out[tok * HC_MULT + lane] = 1.0f / (1.0f + __expf(-v)) * hc_post_mult_value;
+
+                float cm_vals[HC_MULT];
 #pragma unroll
                 for (int k = 0; k < HC_MULT; k++)
-                    cm_vals[k] *= inv_rs;
+                    cm_vals[k] = y_row[2 * HC_MULT + lane * HC_MULT + k] * rstd * s2
+                        + hc_base[2 * HC_MULT + lane * HC_MULT + k];
+
+                constexpr unsigned LANE_MASK = (1u << HC_MULT) - 1;
+                float const rowMax = fmaxf(fmaxf(cm_vals[0], cm_vals[1]), fmaxf(cm_vals[2], cm_vals[3]));
+#pragma unroll
+                for (int k = 0; k < HC_MULT; k++)
+                    cm_vals[k] = __expf(cm_vals[k] - rowMax);
+                // Reciprocal-multiply: 1 fdiv + 4 fmul vs 4 fdivs (faster on B200).
+                float inv_rs = 1.0f / (cm_vals[0] + cm_vals[1] + cm_vals[2] + cm_vals[3]);
+#pragma unroll
+                for (int k = 0; k < HC_MULT; k++)
+                    cm_vals[k] = cm_vals[k] * inv_rs + hc_sinkhorn_eps;
 #pragma unroll
                 for (int k = 0; k < HC_MULT; k++)
                 {
@@ -869,81 +860,96 @@ __launch_bounds__(256) __global__ void fused_pmap_gemm_fma_allinone(__nv_bfloat1
                     cs += __shfl_xor_sync(LANE_MASK, cs, 2);
                     cm_vals[k] *= 1.0f / (cs + hc_sinkhorn_eps);
                 }
-            }
-            float* cm_out_ptr = comb_mix_out + tok * HC_MULT2;
+                for (int it = 1; it < sinkhorn_repeat; it++)
+                {
+                    inv_rs = 1.0f / (cm_vals[0] + cm_vals[1] + cm_vals[2] + cm_vals[3] + hc_sinkhorn_eps);
 #pragma unroll
-            for (int k = 0; k < HC_MULT; k++)
-                cm_out_ptr[lane * HC_MULT + k] = cm_vals[k];
+                    for (int k = 0; k < HC_MULT; k++)
+                        cm_vals[k] *= inv_rs;
+#pragma unroll
+                    for (int k = 0; k < HC_MULT; k++)
+                    {
+                        float cs = cm_vals[k];
+                        cs += __shfl_xor_sync(LANE_MASK, cs, 1);
+                        cs += __shfl_xor_sync(LANE_MASK, cs, 2);
+                        cm_vals[k] *= 1.0f / (cs + hc_sinkhorn_eps);
+                    }
+                }
+                float* cm_out_ptr = comb_mix_out + tok * HC_MULT2;
+#pragma unroll
+                for (int k = 0; k < HC_MULT; k++)
+                    cm_out_ptr[lane * HC_MULT + k] = cm_vals[k];
+            }
         }
-        __syncthreads();
 
-        // layer_input: warp>0 threads process hidden in parallel.
+        float pm[HC_MULT];
+#pragma unroll
+        for (int j = 0; j < HC_MULT; j++)
+            pm[j] = __shfl_sync(0xffffffff, pre_mix_local, j);
+
+        // layer_input: all threads process hidden in parallel.
         //
         // When kFuseNorm is true, accumulate per-thread sum_sq while writing
         // un-normalized layer_input bf16; after a __syncthreads, all threads
         // run pass 2: re-LDG from L2 (hot from pass 1's STGs), multiply by
         // rsqrt * norm_weight, STG normalized bf16. Saves one HBM read+write
         // pair vs the separate flashinfer.rmsnorm kernel.
-        constexpr int kFmaBigFuseWarps = BLOCK_SIZE / WARP_SIZE - 1;
+        constexpr int kFmaBigFuseWarps = BLOCK_SIZE / WARP_SIZE;
         __shared__ float s_sumsq_li[kFmaBigFuseWarps];
         __shared__ float s_rsqrt_li;
         constexpr int BF16_VEC_LI = 8;
         __nv_bfloat16* obase = layer_input_out + static_cast<long long>(tok) * hidden_size;
-        if (warp_id > 0)
+        __nv_bfloat16 const* rbase = residual_out + static_cast<long long>(tok) * HC_MULT * hidden_size;
+        int const p2_tid = tid;
+        constexpr int p2_threads = BLOCK_SIZE;
+        float sum_sq_local = 0.f;
+
+        for (int h = p2_tid * BF16_VEC_LI; h < hidden_size; h += p2_threads * BF16_VEC_LI)
         {
-            float pm[HC_MULT];
+            uint4 raws[HC_MULT];
 #pragma unroll
             for (int j = 0; j < HC_MULT; j++)
-                pm[j] = s_pre_mix[t][j];
+                raws[j] = __ldg(reinterpret_cast<uint4 const*>(&rbase[j * hidden_size + h]));
 
-            __nv_bfloat16 const* rbase = residual_out + static_cast<long long>(tok) * HC_MULT * hidden_size;
-            int const p2_tid = tid - WARP_SIZE;
-            constexpr int p2_threads = BLOCK_SIZE - WARP_SIZE;
-            float sum_sq_local = 0.f;
-
-            for (int h = p2_tid * BF16_VEC_LI; h < hidden_size; h += p2_threads * BF16_VEC_LI)
+            float acc_li[BF16_VEC_LI] = {};
+#pragma unroll
+            for (int j = 0; j < HC_MULT; j++)
             {
-                float acc_li[BF16_VEC_LI] = {};
-#pragma unroll
-                for (int j = 0; j < HC_MULT; j++)
-                {
-                    uint4 raw = *reinterpret_cast<uint4 const*>(&rbase[j * hidden_size + h]);
-                    __nv_bfloat162 const* pairs = reinterpret_cast<__nv_bfloat162 const*>(&raw);
-#pragma unroll
-                    for (int v = 0; v < BF16_VEC_LI / 2; v++)
-                    {
-                        float2 f = __bfloat1622float2(pairs[v]);
-                        acc_li[2 * v + 0] += pm[j] * f.x;
-                        acc_li[2 * v + 1] += pm[j] * f.y;
-                    }
-                }
-                uint4 out_raw;
-                __nv_bfloat162* opairs = reinterpret_cast<__nv_bfloat162*>(&out_raw);
+                __nv_bfloat162 const* pairs = reinterpret_cast<__nv_bfloat162 const*>(&raws[j]);
 #pragma unroll
                 for (int v = 0; v < BF16_VEC_LI / 2; v++)
-                    opairs[v] = __float22bfloat162_rn(make_float2(acc_li[2 * v], acc_li[2 * v + 1]));
-                *reinterpret_cast<uint4*>(&obase[h]) = out_raw;
-                if constexpr (kFuseNorm)
                 {
-#pragma unroll
-                    for (int v = 0; v < BF16_VEC_LI / 2; v++)
-                    {
-                        float2 b = __bfloat1622float2(opairs[v]);
-                        sum_sq_local += b.x * b.x + b.y * b.y;
-                    }
+                    float2 f = __bfloat1622float2(pairs[v]);
+                    acc_li[2 * v + 0] += pm[j] * f.x;
+                    acc_li[2 * v + 1] += pm[j] * f.y;
                 }
             }
-
+            uint4 out_raw;
+            __nv_bfloat162* opairs = reinterpret_cast<__nv_bfloat162*>(&out_raw);
+#pragma unroll
+            for (int v = 0; v < BF16_VEC_LI / 2; v++)
+                opairs[v] = __float22bfloat162_rn(make_float2(acc_li[2 * v], acc_li[2 * v + 1]));
+            *reinterpret_cast<uint4*>(&obase[h]) = out_raw;
             if constexpr (kFuseNorm)
             {
-                sum_sq_local += __shfl_xor_sync(0xffffffff, sum_sq_local, 16);
-                sum_sq_local += __shfl_xor_sync(0xffffffff, sum_sq_local, 8);
-                sum_sq_local += __shfl_xor_sync(0xffffffff, sum_sq_local, 4);
-                sum_sq_local += __shfl_xor_sync(0xffffffff, sum_sq_local, 2);
-                sum_sq_local += __shfl_xor_sync(0xffffffff, sum_sq_local, 1);
-                if ((tid & 31) == 0)
-                    s_sumsq_li[warp_id - 1] = sum_sq_local;
+#pragma unroll
+                for (int v = 0; v < BF16_VEC_LI / 2; v++)
+                {
+                    float2 b = __bfloat1622float2(opairs[v]);
+                    sum_sq_local += b.x * b.x + b.y * b.y;
+                }
             }
+        }
+
+        if constexpr (kFuseNorm)
+        {
+            sum_sq_local += __shfl_xor_sync(0xffffffff, sum_sq_local, 16);
+            sum_sq_local += __shfl_xor_sync(0xffffffff, sum_sq_local, 8);
+            sum_sq_local += __shfl_xor_sync(0xffffffff, sum_sq_local, 4);
+            sum_sq_local += __shfl_xor_sync(0xffffffff, sum_sq_local, 2);
+            sum_sq_local += __shfl_xor_sync(0xffffffff, sum_sq_local, 1);
+            if ((tid & 31) == 0)
+                s_sumsq_li[warp_id] = sum_sq_local;
         }
         if constexpr (kFuseNorm)
         {
@@ -957,29 +963,24 @@ __launch_bounds__(256) __global__ void fused_pmap_gemm_fma_allinone(__nv_bfloat1
                 s_rsqrt_li = rsqrtf(total / static_cast<float>(hidden_size) + norm_eps);
             }
             __syncthreads();
-            if (warp_id > 0)
+            float const rsqrt_val = s_rsqrt_li;
+            for (int h = p2_tid * BF16_VEC_LI; h < hidden_size; h += p2_threads * BF16_VEC_LI)
             {
-                int const p2_tid = tid - WARP_SIZE;
-                constexpr int p2_threads = BLOCK_SIZE - WARP_SIZE;
-                float const rsqrt_val = s_rsqrt_li;
-                for (int h = p2_tid * BF16_VEC_LI; h < hidden_size; h += p2_threads * BF16_VEC_LI)
-                {
-                    uint4 li_raw = *reinterpret_cast<uint4 const*>(&obase[h]);
-                    uint4 nw_raw = *reinterpret_cast<uint4 const*>(&norm_weight[h]);
-                    __nv_bfloat162 const* li_pairs = reinterpret_cast<__nv_bfloat162 const*>(&li_raw);
-                    __nv_bfloat162 const* nw_pairs = reinterpret_cast<__nv_bfloat162 const*>(&nw_raw);
-                    uint4 out_raw;
-                    __nv_bfloat162* opairs = reinterpret_cast<__nv_bfloat162*>(&out_raw);
+                uint4 li_raw = __ldg(reinterpret_cast<uint4 const*>(&obase[h]));
+                uint4 nw_raw = __ldg(reinterpret_cast<uint4 const*>(&norm_weight[h]));
+                __nv_bfloat162 const* li_pairs = reinterpret_cast<__nv_bfloat162 const*>(&li_raw);
+                __nv_bfloat162 const* nw_pairs = reinterpret_cast<__nv_bfloat162 const*>(&nw_raw);
+                uint4 out_raw;
+                __nv_bfloat162* opairs = reinterpret_cast<__nv_bfloat162*>(&out_raw);
 #pragma unroll
-                    for (int v = 0; v < BF16_VEC_LI / 2; v++)
-                    {
-                        float2 lif = __bfloat1622float2(li_pairs[v]);
-                        float2 nwf = __bfloat1622float2(nw_pairs[v]);
-                        opairs[v]
-                            = __float22bfloat162_rn(make_float2(lif.x * rsqrt_val * nwf.x, lif.y * rsqrt_val * nwf.y));
-                    }
-                    *reinterpret_cast<uint4*>(&obase[h]) = out_raw;
+                for (int v = 0; v < BF16_VEC_LI / 2; v++)
+                {
+                    float2 lif = __bfloat1622float2(li_pairs[v]);
+                    float2 nwf = __bfloat1622float2(nw_pairs[v]);
+                    opairs[v]
+                        = __float22bfloat162_rn(make_float2(lif.x * rsqrt_val * nwf.x, lif.y * rsqrt_val * nwf.y));
                 }
+                *reinterpret_cast<uint4*>(&obase[h]) = out_raw;
             }
         }
         __syncthreads();
