@@ -499,6 +499,15 @@ class PyExecutor:
         torch.cuda.current_stream().wait_stream(self.execution_stream)
         self.is_warmup = False
 
+        # When CUDA graphs are disabled, release the torch caching-allocator
+        # slack accumulated during warmup so it doesn't crowd out non-torch
+        # allocators (cuBLAS, UCX/NIXL transfer buffers, NVSHMEM, etc.) on the
+        # first real iteration. Skipped when graphs are captured: graph replay
+        # holds references to specific cache blocks and empty_cache() after
+        # capture is unsafe.
+        if self.llm_args.cuda_graph_config is None:
+            torch.cuda.empty_cache()
+
         # Snapshot some cumulative KV cache counters so that stats reported to
         # users exclude blocks reused and missed during warmup dummy requests.
         if hasattr(self.kv_cache_manager, 'snapshot_warmup_baseline'):
