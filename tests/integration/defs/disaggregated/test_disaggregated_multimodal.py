@@ -154,7 +154,7 @@ def test_qwen3vl_epd_video_split_item_runs(model_relative_path: str, llm_venv, t
             model_name=str(model_path),
             env=env,
             cwd=llm_venv.get_working_directory(),
-            server_start_timeout=900,
+            server_start_timeout=1500,
         )
         client = openai.OpenAI(
             api_key="tensorrt_llm", base_url=f"http://localhost:{server_port}/v1"

@@ -32,13 +32,10 @@ ExecutorSamplingConfig = tllm_executor.SamplingConfig
 FinishReason = tllm_executor.FinishReason
 
 
-def _shared_cpu_tensor_handle(
+def _shared_tensor_handle(
         tensor: torch.Tensor) -> tuple[Dict[str, Any], torch.Tensor]:
-    """Create a CPU shared-memory handle and return its backing tensor."""
+    """Create a shared tensor handle and retain the producer tensor."""
     tensor = tensor.detach()
-    if tensor.is_cuda:
-        tensor = tensor.cpu()
-    tensor = tensor.contiguous()
     return SharedTensorContainer.from_tensor(tensor).dump_to_dict(), tensor
 
 
@@ -419,12 +416,10 @@ class PyResult:
                                        mm_embedding_lengths,
                                        dim=0)
 
-        # Keep E/P result handoff on CPU shared memory. CUDA IPC handles can outlive
-        # the encoder-side producer during shutdown and abort in PyTorch cleanup.
         self._shared_tensor_lifetime_refs.clear()
         self._mm_embeddings = []
         for emb in split_embeddings:
-            handle, backing_tensor = _shared_cpu_tensor_handle(emb)
+            handle, backing_tensor = _shared_tensor_handle(emb)
             self._mm_embeddings.append(handle)
             self._shared_tensor_lifetime_refs.append(backing_tensor)
         self.diff.mm_embeddings = self._mm_embeddings
@@ -434,10 +429,9 @@ class PyResult:
         mrope_position_ids: torch.Tensor,
         mrope_position_deltas: torch.Tensor,
     ):
-        # Keep mRoPE result handoff CPU-backed for the same lifetime reason as MM embeddings.
-        self._mrope_position_ids, ids_backing = _shared_cpu_tensor_handle(
+        self._mrope_position_ids, ids_backing = _shared_tensor_handle(
             mrope_position_ids)
-        self._mrope_position_deltas, deltas_backing = _shared_cpu_tensor_handle(
+        self._mrope_position_deltas, deltas_backing = _shared_tensor_handle(
             mrope_position_deltas)
         self._shared_tensor_lifetime_refs.extend([ids_backing, deltas_backing])
         self.diff.mrope_position_ids = self._mrope_position_ids

@@ -418,6 +418,63 @@ def test_ad_engine_chunked_prefill_stages_multimodal_runtime_metadata():
     cache_seq_interface.shutdown()
 
 
+def test_ad_engine_forwards_non_disagg_cached_multimodal_embedding_in_chunked_prefill():
+    """Tensor cached embeddings should remain model-forward args for AD VLM prefill."""
+    device = torch.device("cuda")
+    max_seq_len = 64
+    max_batch_size = 8
+
+    kv_cache_config = KvCacheConfig(tokens_per_block=8)
+    cache_seq_interface = CachedSequenceInterface(
+        max_seq_len=max_seq_len,
+        max_batch_size=max_batch_size,
+        max_num_tokens=default_max_num_tokens(max_seq_len, max_batch_size),
+        device=device,
+        kv_cache_config=kv_cache_config,
+    )
+    cache_seq_interface.to(device)
+
+    engine = ADEngine(get_inference_model, cache_seq_interface)
+    engine._enable_chunked_prefill = True
+
+    kv_manager = _DummyKVCacheManager(tokens_per_block=8)
+    resource_manager = _DummyResourceManager(kv_manager)
+
+    tokens = [1, 2, 99, 99, 99, 99, 3, 4]
+    req = _DummyRequest(tokens=tokens, begin=4, size=4, seq_slot=0)
+    req.multimodal_positions = [2]
+    req.multimodal_lengths = [4]
+    cached_embedding = torch.arange(16, dtype=torch.float32).reshape(4, 4)
+    req.py_multimodal_data = {
+        "multimodal_embedding": cached_embedding,
+        "multimodal_embedding_lengths": [4],
+        "multimodal_embed_mask_cumsum": torch.tensor(
+            [False, False, True, True, True, True, False, False]
+        )
+        .to(torch.int64)
+        .cumsum(0),
+    }
+
+    scheduled_requests = ScheduledRequests()
+    scheduled_requests.context_requests_last_chunk.append(req)
+
+    engine._prepare_inputs(scheduled_requests, resource_manager, new_tokens=None)
+
+    named_args = cache_seq_interface.named_args
+    assert "multimodal_embedding" in named_args
+    torch.testing.assert_close(named_args["multimodal_embedding"].cpu(), cached_embedding)
+    assert "multimodal_embedding_lengths" not in named_args
+    assert "multimodal_embed_mask_cumsum" not in named_args
+    torch.testing.assert_close(
+        named_args["mm_chunk_flat_start"].cpu(), torch.tensor([2], dtype=torch.int64)
+    )
+    torch.testing.assert_close(
+        named_args["mm_chunk_count"].cpu(), torch.tensor([2], dtype=torch.int64)
+    )
+
+    cache_seq_interface.shutdown()
+
+
 def test_ad_engine_skips_multimodal_runtime_metadata_when_no_multimodal_requests():
     """Chunked prefill should not stage multimodal metadata for pure text requests."""
     device = torch.device("cuda")

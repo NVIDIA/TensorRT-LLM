@@ -19,6 +19,7 @@ try:
 except ModuleNotFoundError:
     pass
 
+from .._torch.pyexecutor.llm_request import LlmResult
 from .._utils import nvtx_range_debug
 from ..bindings import executor as tllm
 from ..disaggregated_params import DisaggregatedParams
@@ -44,42 +45,6 @@ __all__ = [
 ]
 
 
-def _clone_shared_tensor_handle(
-        handle: Dict[str, Any]) -> tuple[Dict[str, Any], torch.Tensor]:
-    """Copy a shared tensor handle into locally owned CPU shared storage."""
-    from tensorrt_llm._torch.shared_tensor import SharedTensorContainer
-
-    shared_tensor = SharedTensorContainer.from_dict(handle).get_local_view()
-    tensor = shared_tensor.detach()
-    if tensor.is_cuda:
-        tensor = tensor.cpu()
-    else:
-        tensor = tensor.clone()
-    tensor = tensor.contiguous()
-    return SharedTensorContainer.from_tensor(tensor).dump_to_dict(), tensor
-
-
-def _clone_shared_tensor_handles(
-    handles: List[Dict[str, Any]]
-) -> tuple[List[Dict[str, Any]], List[torch.Tensor]]:
-    cloned_handles = []
-    lifetime_refs = []
-    for handle in handles:
-        cloned_handle, backing_tensor = _clone_shared_tensor_handle(handle)
-        cloned_handles.append(cloned_handle)
-        lifetime_refs.append(backing_tensor)
-    return cloned_handles, lifetime_refs
-
-
-def _retain_shared_tensor_refs(params: DisaggregatedParams,
-                               refs: List[torch.Tensor],
-                               owner_refs: Optional[List[Any]] = None) -> None:
-    if refs:
-        params._shared_tensor_lifetime_refs.extend(refs)
-        if owner_refs is not None:
-            owner_refs.extend(refs)
-
-
 @dataclass(slots=True)
 class Logprob:
     """Holds logprob and vocab rank for a token."""
@@ -94,6 +59,19 @@ TokenLogprobs: TypeAlias = list[dict[int, Logprob]]
 # and the corresponding `logprobs` / `prompt_logprobs` is 0. Avoids the
 # per-token `dict[int, Logprob]` allocation overhead of `TokenLogprobs`.
 SimpleTokenLogprobs: TypeAlias = list[float]
+
+
+def _get_shared_tensor_lifetime_refs(result: LlmResult) -> List[torch.Tensor]:
+    return result._py_result._shared_tensor_lifetime_refs
+
+
+def _retain_shared_tensor_refs(params: DisaggregatedParams,
+                               refs: List[torch.Tensor],
+                               owner_refs: Optional[List[Any]] = None) -> None:
+    if refs:
+        params._shared_tensor_lifetime_refs.extend(refs)
+        if owner_refs is not None:
+            owner_refs.extend(refs)
 
 
 class LogProbsResult(NamedTuple):
@@ -581,14 +559,15 @@ class GenerationResultBase:
             if response_result.context_logits is not None:
                 self._context_logits = response_result.context_logits
 
+            if isinstance(response_result, LlmResult):
+                lifetime_refs = _get_shared_tensor_lifetime_refs(
+                    response_result)
+            else:
+                lifetime_refs = []
+            retained_shared_tensor_handles = False
             if hasattr(response_result, "mm_embedding_handles"
                        ) and response_result.mm_embedding_handles is not None:
-                # mm_embedding_handles is a list of handles (one per multimodal item).
-                # Take ownership immediately. The encoder-side PyResult may be
-                # freed before the prefill worker restores the handles.
-                mm_embedding_handles, lifetime_refs = (
-                    _clone_shared_tensor_handles(
-                        response_result.mm_embedding_handles))
+                mm_embedding_handles = response_result.mm_embedding_handles
                 if self._disaggregated_params is not None:
                     self._disaggregated_params.multimodal_embedding_handles = mm_embedding_handles
                     self._disaggregated_params.multimodal_hashes = self._multimodal_hashes
@@ -596,9 +575,7 @@ class GenerationResultBase:
                     self._disaggregated_params = DisaggregatedParams(
                         multimodal_embedding_handles=mm_embedding_handles,
                         multimodal_hashes=self._multimodal_hashes)
-                _retain_shared_tensor_refs(self._disaggregated_params,
-                                           lifetime_refs,
-                                           self._shared_tensor_lifetime_refs)
+                retained_shared_tensor_handles = True
 
             # Handle mrope handles for both:
             # 1. Regular mm_embedding case (disaggregated_params was just created/updated above)
@@ -606,18 +583,16 @@ class GenerationResultBase:
             #    were already computed in encode phase, but mrope still needs forwarding)
             if (getattr(response_result, "mrope_position_ids_handle", None)
                     is not None and self.disaggregated_params is not None):
-                mrope_position_ids_handle, ids_ref = (
-                    _clone_shared_tensor_handle(
-                        response_result.mrope_position_ids_handle))
-                mrope_position_deltas_handle, deltas_ref = (
-                    _clone_shared_tensor_handle(
-                        response_result.mrope_position_deltas_handle))
                 self._disaggregated_params.mrope_position_ids_handle = (
-                    mrope_position_ids_handle)
+                    response_result.mrope_position_ids_handle)
                 self._disaggregated_params.mrope_position_deltas_handle = (
-                    mrope_position_deltas_handle)
+                    response_result.mrope_position_deltas_handle)
+                retained_shared_tensor_handles = True
+
+            if (retained_shared_tensor_handles
+                    and self._disaggregated_params is not None):
                 _retain_shared_tensor_refs(self._disaggregated_params,
-                                           [ids_ref, deltas_ref],
+                                           lifetime_refs,
                                            self._shared_tensor_lifetime_refs)
 
             # Processing background errors here ASAF during generation.

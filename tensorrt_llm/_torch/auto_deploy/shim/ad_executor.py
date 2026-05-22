@@ -80,6 +80,10 @@ def _append_mm_extra_args(
     for key, value in multimodal_data.items():
         if key in _RESERVED_MM_DATA_KEYS:
             continue
+        if key == "multimodal_embedding" and not torch.is_tensor(value):
+            # E/P handoff can temporarily park shared-tensor handle dicts here.
+            # Those are transport metadata, not model-forward tensor kwargs.
+            continue
         extra_args[key].append(value)
 
 

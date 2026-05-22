@@ -4,6 +4,8 @@ import unittest
 
 import torch
 
+from tensorrt_llm._torch.pyexecutor.llm_request import (LlmResponse, LlmResult,
+                                                        PyResult)
 from tensorrt_llm._torch.shared_tensor import SharedTensorContainer
 from tensorrt_llm.bindings import executor as tllm
 from tensorrt_llm.disaggregated_params import DisaggregatedParams
@@ -76,28 +78,6 @@ class TestMultimodalParamsHandleConversion(unittest.TestCase):
         self.assertIsInstance(result, torch.Tensor)
         self.assertTrue(torch.allclose(result, self.mm_embedding))
 
-    def test_to_tensor_can_clone_shared_storage(self):
-        """Test restoring handles into tensors detached from shared storage."""
-        source = torch.arange(6, dtype=torch.float32)
-        params = MultimodalParams(multimodal_data={
-            "mrope_config": {
-                "mrope_position_deltas": source,
-            }
-        })
-
-        params.to_handle("multimodal_data")
-        params._shared_tensor_lifetime_refs.clear()
-        params.to_tensor("multimodal_data", clone_shared_tensors=True)
-
-        result = params.multimodal_data["mrope_config"]["mrope_position_deltas"]
-        self.assertIsInstance(result, torch.Tensor)
-        self.assertTrue(torch.allclose(result, source))
-        self.assertEqual(len(params._shared_tensor_lifetime_refs), 0)
-
-        result.add_(10)
-        self.assertTrue(
-            torch.allclose(source, torch.arange(6, dtype=torch.float32)))
-
     def test_to_handle_retains_shared_tensor_lifetime_refs(self):
         """Shared tensor handles remain restorable after source locals exit."""
         params = MultimodalParams()
@@ -150,31 +130,26 @@ class TestMultimodalParamsHandleConversion(unittest.TestCase):
     def test_generation_result_retains_response_shared_tensor_refs(self):
         """Encoder-result handles survive clearing request-side disagg refs."""
 
-        class FakeResult:
+        def make_llm_response(mm_embedding_handles, lifetime_refs):
+            py_result = PyResult(prompt_len=1, max_new_tokens=1)
+            py_result._mm_embeddings = mm_embedding_handles
+            py_result._shared_tensor_lifetime_refs.extend(lifetime_refs)
 
-            def __init__(self, mm_embedding_handles):
-                self.is_final = True
-                self.context_phase_params = None
-                self.decoding_iter = 0
-                self.cached_tokens = 0
-                self.avg_decoded_tokens_per_iter = None
-                self.finish_reasons = [tllm.FinishReason.LENGTH]
-                self.output_token_ids = [[1]]
-                self.cum_log_probs = None
-                self.log_probs = None
-                self.generation_logits = None
-                self.context_logits = None
-                self.request_perf_metrics = None
-                self.sequence_index = 0
-                self.mm_embedding_handles = mm_embedding_handles
+            cpp_result = tllm.Result()
+            cpp_result.output_token_ids = [[1]]
+            cpp_result.context_logits = None
+            cpp_result.generation_logits = None
+            cpp_result.log_probs = None
+            cpp_result.cum_log_probs = None
+            cpp_result.finish_reasons = [tllm.FinishReason.LENGTH]
+            cpp_result.is_final = True
+            cpp_result.sequence_index = 0
 
-        class FakeResponse:
-
-            def __init__(self, result):
-                self.result = result
-
-            def has_error(self):
-                return False
+            return LlmResponse(
+                request_id=0,
+                result=LlmResult(cpp_result, py_result, is_final=True),
+                client_id=0,
+            )
 
         producer_params = MultimodalParams(
             multimodal_data={
@@ -189,7 +164,9 @@ class TestMultimodalParamsHandleConversion(unittest.TestCase):
         )
         request.set_id(1)
         result = GenerationResult(request)
-        result._handle_response(FakeResponse(FakeResult([source_handle])))
+        result._handle_response(
+            make_llm_response([source_handle],
+                              producer_params._shared_tensor_lifetime_refs))
 
         handle = result.disaggregated_params.multimodal_embedding_handles[0]
         self.assertEqual(

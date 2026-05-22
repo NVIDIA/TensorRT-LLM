@@ -159,8 +159,8 @@ def test_mm_encoder_sampler_aligns_mixed_batch_by_request_index():
     assert mm_embedding_lengths == [4]
 
 
-def test_py_result_mm_embedding_handles_use_cpu_shared_memory():
-    """MM encoder result handles should be CPU-backed shared-memory handles."""
+def test_py_result_mm_embedding_handles_use_shared_tensor_handles():
+    """MM encoder result handles should preserve the producer tensor device."""
     result = PyResult(prompt_len=1, max_new_tokens=1)
     source = torch.arange(8, dtype=torch.float32).reshape(4, 2)
 
@@ -232,8 +232,8 @@ def test_generation_result_owns_mm_embedding_handles_for_disagg_handoff():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-def test_py_result_cuda_mm_embedding_handles_are_cpu_backed():
-    """CUDA MM encoder outputs are copied to CPU before creating handoff handles."""
+def test_py_result_cuda_mm_embedding_handles_stay_cuda_backed():
+    """CUDA MM encoder outputs should not move to CPU for handoff handles."""
     result = PyResult(prompt_len=1, max_new_tokens=1)
     source = torch.arange(8, dtype=torch.float32, device="cuda").reshape(4, 2)
 
@@ -241,10 +241,10 @@ def test_py_result_cuda_mm_embedding_handles_are_cpu_backed():
 
     handles = result.mm_embedding_handles
     assert handles is not None
-    assert [handle["method_key"] for handle in handles] == [2, 2]
-    restored = [SharedTensorContainer.from_dict(handle).get_local_view() for handle in handles]
-    assert all(tensor.device.type == "cpu" for tensor in restored)
-    assert torch.equal(torch.cat(restored, dim=0).to(source.device), source)
+    assert [handle["method_key"] for handle in handles] == [1, 1]
+    assert len(result._shared_tensor_lifetime_refs) == 2
+    assert all(tensor.device.type == "cuda" for tensor in result._shared_tensor_lifetime_refs)
+    assert torch.equal(torch.cat(result._shared_tensor_lifetime_refs, dim=0), source)
 
 
 class _FakeScheduledRequests:

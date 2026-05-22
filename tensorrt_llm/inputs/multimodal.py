@@ -590,14 +590,8 @@ class MultimodalParams:
                     from tensorrt_llm._torch.shared_tensor import \
                         SharedTensorContainer
 
-                    shared_tensor = SharedTensorContainer.from_dict(
+                    return SharedTensorContainer.from_dict(
                         input_data).get_local_view()
-                    if kwargs.get("clone_shared_tensors", False):
-                        tensor = shared_tensor.clone()
-                        if shared_tensor.is_cuda:
-                            torch.cuda.synchronize(shared_tensor.device)
-                        return tensor
-                    return shared_tensor
                 except Exception as e:
                     raise RuntimeError(
                         f"Failed to restore tensor from shared tensor dict: {e}"
@@ -677,15 +671,11 @@ class MultimodalParams:
             data, "to_handle", lifetime_refs=self._shared_tensor_lifetime_refs)
         setattr(self, element, transformed_data)
 
-    def to_tensor(self,
-                  element: str,
-                  clone_shared_tensors: bool = False) -> None:
+    def to_tensor(self, element: str) -> None:
         """Move specified multimodal data element from shared tensor.
 
         Args:
             element: Element to restore (only "multimodal_data" is supported)
-            clone_shared_tensors: When true, clone restored tensor views so the
-                result no longer depends on producer-side shared storage.
 
         Raises:
             ValueError: If element is not "multimodal_data"
@@ -701,10 +691,7 @@ class MultimodalParams:
             return  # Nothing to restore
 
         restored_data = self._apply_tensor_operation(
-            data,
-            "to_tensor",
-            clone_shared_tensors=clone_shared_tensors,
-            lifetime_refs=self._shared_tensor_lifetime_refs)
+            data, "to_tensor", lifetime_refs=self._shared_tensor_lifetime_refs)
         setattr(self, element, restored_data)
 
     def to_device(self,
