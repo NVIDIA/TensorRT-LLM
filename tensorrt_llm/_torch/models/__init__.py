@@ -11,6 +11,7 @@ from .modeling_clip import CLIPVisionModel
 from .modeling_cohere2 import Cohere2ForCausalLM
 from .modeling_deepseekv3 import DeepseekV3ForCausalLM
 from .modeling_exaone4 import Exaone4ForCausalLM
+from .modeling_exaone4_5 import Exaone4_5_ForConditionalGeneration
 from .modeling_exaone_moe import ExaoneMoeForCausalLM
 from .modeling_gemma3 import Gemma3ForCausalLM
 from .modeling_gemma3vl import Gemma3VLM
@@ -20,6 +21,7 @@ from .modeling_hunyuan_dense import HunYuanDenseV1ForCausalLM
 from .modeling_hunyuan_moe import HunYuanMoEV1ForCausalLM
 from .modeling_hyperclovax import HCXVisionForCausalLM
 from .modeling_kimi_k25 import KimiK25ForConditionalGeneration
+from .modeling_laguna import LagunaForCausalLM
 from .modeling_llama import LlamaForCausalLM
 from .modeling_llava_next import LlavaNextModel
 from .modeling_minimaxm2 import MiniMaxM2ForCausalLM
@@ -35,7 +37,8 @@ from .modeling_qwen import (Qwen2ForCausalLM, Qwen2ForProcessRewardModel,
                             Qwen2ForRewardModel)
 from .modeling_qwen2vl import Qwen2_5_VLModel, Qwen2VLModel
 from .modeling_qwen3 import Qwen3ForCausalLM
-from .modeling_qwen3_5 import Qwen3_5ForCausalLM, Qwen3_5MoeForCausalLM
+from .modeling_qwen3_5 import (Qwen3_5ForCausalLM, Qwen3_5MoeForCausalLM,
+                               Qwen3_5MoeVLModel)
 from .modeling_qwen3_moe import Qwen3MoeForCausalLM
 from .modeling_qwen3_next import Qwen3NextForCausalLM
 from .modeling_qwen3vl import Qwen3VLModel
@@ -54,10 +57,12 @@ __all__ = [
     "CLIPVisionModel",
     "DeepseekV3ForCausalLM",
     "Exaone4ForCausalLM",
+    "Exaone4_5_ForConditionalGeneration",
     "ExaoneMoeForCausalLM",
     "Gemma3ForCausalLM",
     "Gemma3VLM",
     "HCXVisionForCausalLM",
+    "LagunaForCausalLM",
     "HunYuanDenseV1ForCausalLM",
     "HunYuanMoEV1ForCausalLM",
     "KimiK25ForConditionalGeneration",
@@ -86,6 +91,7 @@ __all__ = [
     "Qwen3MoeForCausalLM",
     "Qwen3_5ForCausalLM",
     "Qwen3_5MoeForCausalLM",
+    "Qwen3_5MoeVLModel",
     "Qwen3NextForCausalLM",
     "Qwen3MoeVLModel",
     "GptOssForCausalLM",

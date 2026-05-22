@@ -60,8 +60,8 @@ from .handle_logits import HandleLogits
 from .hang_detector import HangDetector
 from .kv_cache_transceiver import KvCacheTransceiver
 from .llm_request import (ExecutorRequest, LlmRequest, LlmRequestState,
-                          LlmResponse)
-from .mamba_cache_manager import MambaHybridCacheManager
+                          LlmResponse, get_draft_token_length)
+from .mamba_cache_manager import BaseMambaCacheManager, MambaHybridCacheManager
 from .model_engine import ModelEngine
 from .perf_metrics_manager import PerfMetricsManager
 from .request_utils import (RequestBroadcaster, attach_py_objects_to_requests,
@@ -644,14 +644,58 @@ class PyExecutor:
                     "Both KV Cache Connector and KV Cache Transceiver are enabled. Are you sure you want to do this?"
                 )
 
-            if self.dist.pp_size > 1:
+            if self.dist.pp_size > 1 or self.dist.cp_size > 1:
                 raise NotImplementedError(
-                    "KV Cache Connector is not supported with pipeline parallelism."
-                )
+                    "KV Cache Connector is not supported with pipeline or "
+                    "context parallelism: the connector worker is registered "
+                    "with the local rank's primary pool only, with no "
+                    "coordination across ranks.")
+
+            if self.max_beam_width > 1:
+                raise NotImplementedError(
+                    "KV Cache Connector is not supported with beam search "
+                    "(max_beam_width > 1). The connector's per-request block "
+                    "list has no notion of beams, so non-leading beams would "
+                    "save and restore the wrong KV state.")
+
+            if self.enable_attention_dp:
+                raise NotImplementedError(
+                    "KV Cache Connector is not supported with attention data "
+                    "parallelism (enable_attention_dp). Dummy requests "
+                    "inserted for cross-DP balancing flow through the "
+                    "connector scheduler / worker hooks and are not "
+                    "distinguished from real requests.")
+
+            kv_cache_config = getattr(self.llm_args, 'kv_cache_config', None)
+            if kv_cache_config is not None and kv_cache_config.host_cache_size:
+                raise NotImplementedError(
+                    "KV Cache Connector is not supported with KV cache host "
+                    "offloading (KvCacheConfig.host_cache_size). The connector "
+                    "worker is only registered with the primary (GPU) pool and "
+                    "cannot read or write blocks that have been evicted to the "
+                    "secondary (host) pool, and the connector's load/save "
+                    "streams are not synchronized with the internal "
+                    "onboard/offload streams.")
 
             if self.kv_cache_manager is None:
                 raise ValueError(
                     "KV Cache Connector requires a KV Cache Manager.")
+
+            if getattr(self.kv_cache_manager, 'is_vswa', False):
+                raise NotImplementedError(
+                    "KV Cache Connector is not supported with variable "
+                    "sliding-window attention (per-layer max_attention_window "
+                    "with more than one distinct window size). The connector "
+                    "is registered with a single primary pool, but VSWA "
+                    "models allocate one pool per window size.")
+
+            if isinstance(self.kv_cache_manager, BaseMambaCacheManager):
+                raise NotImplementedError(
+                    "KV Cache Connector is not supported with Mamba / hybrid "
+                    "linear-attention models. Mamba layers carry SSM state "
+                    "rather than per-token KV blocks, so the connector's "
+                    "per-layer load/save hooks have nothing meaningful to "
+                    "transfer for those layers.")
 
             kv_tensor = self.kv_cache_manager.get_unique_primary_pool()
             self.kv_connector_manager.worker.register_kv_caches(kv_tensor)
@@ -2264,10 +2308,11 @@ class PyExecutor:
                     self._check_disagg_ctx_cache_transfer_status(0)
 
             # In gen-only benchmark mode, all requests must fit in KV cache
-            # simultaneously. If some requests are stuck in INIT state and the
-            # scheduler could not allocate KV for any of them, the benchmark
-            # will hang forever because in-progress generation requests won't
-            # release their KV cache.
+            # simultaneously because generation requests do not release their
+            # KV until the full benchmark batch can run. If the scheduler
+            # cannot fit any INIT request after all benchmark requests have
+            # been fetched, the fill gate would never open; raise an explicit
+            # error instead of hanging forever.
             if (self.benchmark_req_queues_size > 0 and not self.is_warmup
                     and not fitting_disagg_gen_init_requests):
                 stuck_init_requests = [
@@ -2321,42 +2366,83 @@ class PyExecutor:
 
     def _is_benchmark_disagg_fill_complete(
             self, scheduled_batch: ScheduledRequests) -> bool:
-        """Check whether all benchmark disagg requests have completed KV transfer.
+        """State-based fill-complete predicate for benchmark disagg mode.
 
-        With ADP, generation requests are distributed across TP ranks, so an
-        allgather is needed to obtain the global count.  Without ADP every
-        request is local, and we can compare directly.
+        The gate opens when all three conditions hold globally:
+
+        (A) The executor has fetched at least ``benchmark_req_queues_size``
+            requests cumulatively.
+        (B) Every request in ``active_requests`` on this rank is past the
+            KV-transfer phase (not in INIT or TRANS_IN_PROGRESS).
+        (C) The KV cache transceiver has no pending receive sessions.
+
+        For ADP, (B) and (C) are AND-ed across TP ranks via allgather.
 
         This method must only be called when ``is_benchmark_disagg`` is True.
 
         Args:
-            scheduled_batch: The current iteration's scheduled requests,
-                used to count generation requests that have completed
-                KV transfer.
+            scheduled_batch: Passed for API compatibility with callers
+                but no longer used by this predicate.
 
         Returns:
-            True when the total number of generation-ready requests
-            reaches ``benchmark_req_queues_size``.
+            True when the fill phase is complete and the first forward
+            pass can proceed.
         """
         if not self.is_benchmark_disagg:
             raise RuntimeError(
-                "_is_benchmark_disagg_fill_complete() should not be called outside benchmark "
-                "disagg mode.  This is an unexpected error.")
-        local_gen_count = sum(1 for req in scheduled_batch.generation_requests
-                              if not req.is_attention_dp_dummy)
-        if self.enable_attention_dp:
-            total_gen_count = sum(self.dist.tp_allgather(local_gen_count))
-        else:
-            total_gen_count = local_gen_count
+                "_is_benchmark_disagg_fill_complete() should not be called "
+                "outside benchmark disagg mode.")
 
-        if total_gen_count >= self.benchmark_req_queues_size:
-            return True
+        # (A) All benchmark requests have been fetched from the queue.
+        if self.num_fetch_requests < self.benchmark_req_queues_size:
+            if self.dist.rank == 0:
+                logger.debug(
+                    f"Benchmark disagg fill: fetching "
+                    f"{self.num_fetch_requests}/{self.benchmark_req_queues_size}"
+                )
+            return False
+
+        # (B) Every active request on this rank is past KV-transfer states.
+        local_all_past_transfer = not any(
+            req.is_disagg_generation_init_state
+            or req.is_disagg_generation_transmission_in_progress
+            for req in self.active_requests)
+
+        # Also require the transceiver's async receive bookkeeping to be
+        # drained before opening the fill gate.
+        local_no_inflight = (
+            self.kv_cache_transceiver is None
+            or self.kv_cache_transceiver.check_gen_transfer_complete())
+
+        local_ok = int(local_all_past_transfer and local_no_inflight)
+
+        if self.enable_attention_dp:
+            all_ranks_ok = self.dist.tp_allgather(local_ok)
+        else:
+            all_ranks_ok = [local_ok]
+        global_ok = min(all_ranks_ok) == 1
+
         if self.dist.rank == 0:
-            logger.debug(
-                f"Benchmark disagg fill in progress: "
-                f"num_fetched={self.num_fetch_requests}, "
-                f"total_gen_count={total_gen_count} (local={local_gen_count})")
-        return False
+            if global_ok:
+                logger.info(
+                    f"Benchmark disagg fill complete: "
+                    f"{len(self.active_requests)} active requests ready, "
+                    f"gate opening.")
+            else:
+                blocked_ranks = [
+                    rank for rank, ok in enumerate(all_ranks_ok) if not ok
+                ]
+                num_init = sum(1 for req in self.active_requests
+                               if req.is_disagg_generation_init_state)
+                num_in_progress = sum(
+                    1 for req in self.active_requests
+                    if req.is_disagg_generation_transmission_in_progress)
+                logger.debug(
+                    f"Benchmark disagg fill: blocked on ranks {blocked_ranks} "
+                    f"(rank {self.dist.rank} local: {num_init} INIT, "
+                    f"{num_in_progress} in-progress, "
+                    f"inflight={not local_no_inflight})")
+        return global_ok
 
     def _check_benchmark_disagg_gate(self, scheduled_batch: ScheduledRequests,
                                      can_forward: bool) -> tuple[bool, bool]:
@@ -3120,6 +3206,16 @@ class PyExecutor:
 
         max_new_requests = total_max - total_num_active_requests
 
+        # Benchmark disagg fill-phase admission throttle: a preloaded queue
+        # (concurrency == total_max) would otherwise pop all requests into
+        # DISAGG_GENERATION_INIT in one iter, tripping PR #12206's fail-fast
+        # under ADP-router imbalance and growing the recv-buffer fallback
+        # faster than transfers drain.  Cap at `tp_size` (≈ pre-#12208
+        # blocking fill rate).  Verified on Kimi-K2 8k1k ctx8/gen1 con=8192.
+        if (self.is_benchmark_disagg and self._benchmark_fill_phase_active
+                and not self.is_warmup):
+            max_new_requests = min(max_new_requests, self.dist.tp_size)
+
         return get_from_waiting_queue(
             waiting_queue,
             max_new_requests,
@@ -3742,6 +3838,12 @@ class PyExecutor:
                 if req.is_context_only_request and (
                         req.is_context_finished or req.is_finished_due_to_length
                 ) and not req.is_finished_due_to_cancellation:
+                    # Forward is done for this request — release the
+                    # IndexMapper slot so new requests can reuse it.
+                    # KV blocks stay allocated for the upcoming transfer.
+                    if hasattr(self.kv_cache_manager, 'release_index_slot'):
+                        self.kv_cache_manager.release_index_slot(
+                            req.py_request_id)
                     # Order is important here: we need to start the transfer before responding
                     # to make sure the blocks are stored for reuse before they are sent.
                     self.async_transfer_manager.start_transfer(req)

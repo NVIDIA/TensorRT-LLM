@@ -154,8 +154,11 @@ class KVCacheManagerConfig:
     def enable_swa_scratch_reuse(self) -> bool: ...
 
 # From _block_radix_tree.py
-def gen_multi_modal_tokens(
-    id_offset: int, multi_modal_data_digest: bytes, num_tokens: int
+def gen_multimodal_cache_key_tokens(
+    id_offset: int,
+    multi_modal_data_digest: bytes,
+    num_tokens: int,
+    token_offset: int = 0,
 ) -> list[TokenIdExt]: ...
 
 # From _core/_kv_cache.py
@@ -173,7 +176,7 @@ class _KVCache:
         self,
         manager: "KVCacheManager",
         reuse_scope: ReuseScope,
-        input_tokens: Sequence[TokenIdExt] | None,
+        reuse_match: Any | None,
         id: Any,
         custom_priority_callback: Callable[[int, Any], Priority],
     ) -> None: ...
@@ -311,6 +314,11 @@ class KVCacheManager:
         id: Any = None,
         custom_priority_callback: Callable[[int, Any], Priority] = ...,
     ) -> _KVCache: ...
+    def probe_reuse(
+        self,
+        reuse_scope: ReuseScope | None = None,
+        input_tokens: Sequence[TokenIdExt] | None = None,
+    ) -> int: ...
     def resize(self, cache_level: CacheLevel, quota: int, best_efforts: bool = False) -> bool: ...
     def get_quota(self, cache_level: CacheLevel) -> int: ...
     @property

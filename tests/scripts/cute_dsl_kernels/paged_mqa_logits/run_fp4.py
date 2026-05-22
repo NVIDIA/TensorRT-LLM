@@ -112,22 +112,65 @@ def _cast_back_from_fp4(packed: torch.Tensor, sf: torch.Tensor, gran_k: int = 32
     return x * sf[:, torch.arange(n, device=packed.device) // gran_k]
 
 
-def _kv_cache_cast_to_fp4(x: torch.Tensor):
-    num_blocks, block_size, num_heads, head_dim = x.shape
+def _apply_utccp_chunk_layout(sf_per_block: torch.Tensor) -> torch.Tensor:
+    """Reorder SF tokens within each 128-token atom to UTCCP chunk layout.
+
+    Equivalent to the SMEM-side ``utccp_required_smem_warp_transpose``: maps
+    linear token order [t0, t1, ..., t127] to chunk order
+    [t0, t32, t64, t96, t1, t33, ...] per 128-int32 atom.
+
+    Math: ``sf_out[m*4 + k] = sf_in[k*32 + m]`` per atom.
+
+    Used when remove_online_sf_transpose=True so the kernel can skip the
+    runtime warp_transpose. Only valid when phys_block_kv == 128 (1 phys
+    block = 1 UTCCP atom of 128 tokens).
+    """
+    assert sf_per_block.size(-1) == 128, (
+        f"chunk layout requires atom_size=128 (phys_block_kv=128); got {sf_per_block.size(-1)}"
+    )
+    new_shape = sf_per_block.shape[:-1] + (128,)
+    return (
+        sf_per_block.reshape(*sf_per_block.shape[:-1], 4, 32)
+        .transpose(-1, -2)
+        .contiguous()
+        .reshape(*new_shape)
+    )
+
+
+def _kv_cache_cast_to_fp4(x: torch.Tensor, remove_online_sf_transpose: bool = False):
+    # page_size here = phys_block_kv (tokens per physical KV page).
+    num_blocks, page_size, num_heads, head_dim = x.shape
     assert num_heads == 1 and head_dim == 128
+    # Mirror the kernel's graceful fallback: chunk layout only valid for
+    # page_size == 128 (1 phys page = 1 UTCCP atom of 128 tokens).
+    if remove_online_sf_transpose and page_size != 128:
+        print(
+            f"[_kv_cache_cast_to_fp4] remove_online_sf_transpose=True ignored: "
+            f"requires page_size (phys_block_kv) == 128, got {page_size}. "
+            f"Falling back to False."
+        )
+        remove_online_sf_transpose = False
+
     x_scaled, sf = _per_token_cast_to_fp4(x.view(-1, head_dim), gran_k=32)
-    x_back = _cast_back_from_fp4(x_scaled, sf, gran_k=32).view(num_blocks, block_size, 1, head_dim)
+    x_back = _cast_back_from_fp4(x_scaled, sf, gran_k=32).view(num_blocks, page_size, 1, head_dim)
     x_fp4 = torch.empty(
-        (num_blocks, block_size * (head_dim // 2 + 4)),
+        (num_blocks, page_size * (head_dim // 2 + 4)),
         device=x.device,
         dtype=torch.uint8,
     )
-    x_fp4[:, : block_size * head_dim // 2] = x_scaled.view(
-        num_blocks, block_size * head_dim // 2
+    x_fp4[:, : page_size * head_dim // 2] = x_scaled.view(
+        num_blocks, page_size * head_dim // 2
     ).view(torch.uint8)
-    x_fp4[:, block_size * head_dim // 2 :] = sf.view(num_blocks, block_size).view(torch.uint8)
+
+    # Reorder SF tokens to UTCCP chunk layout (mirrors what the in-kernel
+    # warp_transpose would do at runtime), so the kernel can skip the
+    # runtime SMEM transpose when remove_online_sf_transpose=True.
+    sf_per_block = sf.view(num_blocks, page_size)  # (num_blocks, 128) int32
+    if remove_online_sf_transpose:
+        sf_per_block = _apply_utccp_chunk_layout(sf_per_block)
+    x_fp4[:, page_size * head_dim // 2 :] = sf_per_block.view(torch.uint8)
     return (
-        x_fp4.view(num_blocks, block_size, num_heads, head_dim // 2 + 4),
+        x_fp4.view(num_blocks, page_size, num_heads, head_dim // 2 + 4),
         x_back.to(x.dtype),
     )
 
@@ -370,6 +413,7 @@ def _compile_fp4_kernel(
     num_epi_subtiles: int,
     epi_dtype,
     output_dtype,
+    remove_online_sf_transpose: bool = False,
 ):
     """Compile FP4 kernel with fake tensors + TVM FFI; cached by static config."""
     key = (
@@ -382,6 +426,7 @@ def _compile_fp4_kernel(
         num_epi_subtiles,
         epi_dtype,
         output_dtype,
+        remove_online_sf_transpose,
     )
     if key in _compiled_cache:
         return _compiled_cache[key]
@@ -428,6 +473,7 @@ def _compile_fp4_kernel(
         num_epi_subtiles=num_epi_subtiles,
         epi_dtype=epi_dtype,
         output_dtype=output_dtype,
+        remove_online_sf_transpose=remove_online_sf_transpose,
     )
     compiled = cute.compile(
         kernel,
@@ -466,6 +512,7 @@ def fp4_paged_mqa_logits(
     epi_dtype=cutlass.Float32,
     output_dtype=cutlass.Float32,
     num_sms: int = 148,
+    remove_online_sf_transpose: bool = False,
 ) -> torch.Tensor:
     """Standalone wrapper around FP4MQALogitsKernel; no trtllm dependency.
 
@@ -513,6 +560,7 @@ def fp4_paged_mqa_logits(
         num_epi_subtiles,
         epi_dtype,
         output_dtype,
+        remove_online_sf_transpose=remove_online_sf_transpose,
     )
     compiled(
         kv_flat,
@@ -609,6 +657,7 @@ def run(
     seed: int = 42,
     num_sms: int = 148,
     verify_meta: bool = False,
+    remove_online_sf_transpose: bool = False,
 ) -> float:
     """Generate random inputs, run kernel, compare to reference, print result.
 
@@ -660,7 +709,9 @@ def run(
         .to(torch.bfloat16)
     )
 
-    kv_fused, kv_sim = _kv_cache_cast_to_fp4(kv_cache)
+    kv_fused, kv_sim = _kv_cache_cast_to_fp4(
+        kv_cache, remove_online_sf_transpose=remove_online_sf_transpose
+    )
 
     # Reference uses original (B, next_n) layout regardless of how the kernel
     # is invoked below.
@@ -710,6 +761,7 @@ def run(
         epi_dtype=epi_dtype,
         output_dtype=output_dtype,
         num_sms=num_sms,
+        remove_online_sf_transpose=remove_online_sf_transpose,
     )
 
     positions = (
@@ -794,6 +846,15 @@ if __name__ == "__main__":
         action="store_true",
         help="verify CuTe DSL schedule_meta kernel against the pure-Python reference",
     )
+    parser.add_argument(
+        "--remove_online_sf_transpose",
+        action="store_true",
+        help=(
+            "skip in-kernel SMEM warp_transpose for KV SF; host pre-arranges "
+            "GMEM SF in UTCCP chunk layout (A/B perf test). "
+            "Requires phys_block_kv=128; auto-falls-back to False otherwise."
+        ),
+    )
     args = parser.parse_args()
 
     print("=== FP4 paged MQA logits standalone test ===")
@@ -811,4 +872,5 @@ if __name__ == "__main__":
         tol=args.tol,
         num_sms=args.num_sms,
         verify_meta=args.verify_meta,
+        remove_online_sf_transpose=args.remove_online_sf_transpose,
     )

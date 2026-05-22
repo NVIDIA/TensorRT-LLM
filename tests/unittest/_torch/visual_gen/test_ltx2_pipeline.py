@@ -35,6 +35,7 @@ os.environ.setdefault("TLLM_DISABLE_MPI", "1")
 
 _LTX2_BASE = os.path.join(str(llm_models_root(check=True)), "LTX-2")
 
+
 CHECKPOINT_PATH_BF16 = os.environ.get(
     "LTX2_MODEL_PATH",
     os.path.join(_LTX2_BASE, "ltx-2-19b-dev.safetensors"),
@@ -56,14 +57,15 @@ SKIP_COMPONENTS = [
 ]
 
 
-def _write_minimal_ltx2_diffusers_checkpoint(tmp_path):
-    checkpoint_path = tmp_path / "ltx2"
-    transformer_path = checkpoint_path / "transformer"
-    transformer_path.mkdir(parents=True)
-    (checkpoint_path / "model_index.json").write_text(
-        json.dumps({"transformer": ["tensorrt_llm", "LTX2Transformer"]})
+def _write_minimal_ltx2_native_checkpoint(tmp_path):
+    import safetensors.torch
+
+    checkpoint_path = tmp_path / "ltx-2-19b-dev.safetensors"
+    safetensors.torch.save_file(
+        {"__metadata_marker__": torch.zeros(1)},
+        str(checkpoint_path),
+        metadata={"config": json.dumps({"transformer": {"_class_name": "LTX2"}})},
     )
-    (transformer_path / "config.json").write_text(json.dumps({"_class_name": "LTX2"}))
     return checkpoint_path
 
 
@@ -807,9 +809,9 @@ class TestLTX2ForceOneStageEnv:
         )
 
         monkeypatch.delenv(LTX2_FORCE_ONE_STAGE_ENV, raising=False)
-        checkpoint_path = _write_minimal_ltx2_diffusers_checkpoint(tmp_path)
-        upsampler_path = checkpoint_path / "ltx-2-spatial-upscaler-x2-1.0.safetensors"
-        lora_path = checkpoint_path / "ltx-2-19b-distilled-lora-384.safetensors"
+        checkpoint_path = _write_minimal_ltx2_native_checkpoint(tmp_path)
+        upsampler_path = checkpoint_path.parent / "ltx-2-spatial-upscaler-x2-1.0.safetensors"
+        lora_path = checkpoint_path.parent / "ltx-2-19b-distilled-lora-384.safetensors"
         upsampler_path.touch()
         lora_path.touch()
 
@@ -824,9 +826,9 @@ class TestLTX2ForceOneStageEnv:
         from tensorrt_llm._torch.visual_gen.models.ltx2.pipeline_ltx2 import LTX2Pipeline
 
         monkeypatch.setenv(LTX2_FORCE_ONE_STAGE_ENV, "1")
-        checkpoint_path = _write_minimal_ltx2_diffusers_checkpoint(tmp_path)
-        upsampler_path = checkpoint_path / "ltx-2-spatial-upscaler-x2-1.0.safetensors"
-        lora_path = checkpoint_path / "ltx-2-19b-distilled-lora-384.safetensors"
+        checkpoint_path = _write_minimal_ltx2_native_checkpoint(tmp_path)
+        upsampler_path = checkpoint_path.parent / "ltx-2-spatial-upscaler-x2-1.0.safetensors"
+        lora_path = checkpoint_path.parent / "ltx-2-19b-distilled-lora-384.safetensors"
         upsampler_path.touch()
         lora_path.touch()
 
@@ -843,7 +845,7 @@ class TestLTX2ForceOneStageEnv:
         from tensorrt_llm._torch.visual_gen.models.ltx2.pipeline_ltx2 import LTX2Pipeline
 
         monkeypatch.setenv(LTX2_FORCE_ONE_STAGE_ENV, "1")
-        checkpoint_path = _write_minimal_ltx2_diffusers_checkpoint(tmp_path)
+        checkpoint_path = _write_minimal_ltx2_native_checkpoint(tmp_path)
 
         args = VisualGenArgs(
             checkpoint_path=str(checkpoint_path),
@@ -862,7 +864,7 @@ class TestLTX2ForceOneStageEnv:
         from tensorrt_llm._torch.visual_gen.models.ltx2.pipeline_ltx2 import LTX2Pipeline
 
         monkeypatch.delenv(LTX2_FORCE_ONE_STAGE_ENV, raising=False)
-        checkpoint_path = _write_minimal_ltx2_diffusers_checkpoint(tmp_path)
+        checkpoint_path = _write_minimal_ltx2_native_checkpoint(tmp_path)
 
         args = VisualGenArgs(
             checkpoint_path=str(checkpoint_path),

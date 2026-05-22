@@ -1,7 +1,6 @@
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from transformers import AutoConfig
 
 from tensorrt_llm.inputs import MultimodalDataTracker
 from tensorrt_llm.inputs.media_io import AudioMediaIO
@@ -398,8 +397,12 @@ class TestMultimodalPlaceholderCounts:
         ],
     )
     def test_per_message_counts(self, messages, expected_mm_placeholder_counts):
-        mock_config = MagicMock(spec=AutoConfig)
-        mock_config.model_type = _MM_MODEL_TYPE
+        # Use a real class so that `type(config).model_type` (a class-attribute
+        # lookup in the production code) resolves correctly.
+        class _StubConfig:
+            model_type = _MM_MODEL_TYPE
+
+        mock_config = _StubConfig()
 
         _, _, mm_placeholder_counts = parse_chat_messages_coroutines(messages, mock_config, None)
 

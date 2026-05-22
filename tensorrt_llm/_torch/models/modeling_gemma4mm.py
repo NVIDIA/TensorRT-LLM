@@ -15,8 +15,9 @@
 """Gemma4 multimodal model: multimodal embedder, input processor,
 and the Gemma4ForConditionalGeneration wrapper.
 
-Vision and audio towers use native transformers models via
-AutoModel.from_config() (requires transformers>=5.5.0).
+Vision tower is native TRT-LLM (``modeling_gemma4_vision.py``); audio tower
+is native TRT-LLM (``modeling_gemma4_audio.py``). Both replace the previous
+``AutoModel.from_config()`` HF fallback (requires transformers>=5.5.0).
 """
 
 import copy
@@ -48,6 +49,8 @@ from ...sampling_params import SamplingParams
 from ..attention_backend import AttentionMetadata
 from ..modules.linear import Linear
 from .modeling_gemma4 import Gemma4ForCausalLM
+from .modeling_gemma4_audio import Gemma4AudioModel
+from .modeling_gemma4_vision import Gemma4VisionModel
 from .modeling_multimodal_utils import find_input_mm_embeds, fuse_input_embeds
 from .modeling_utils import ModelConfig, filter_weights, register_auto_model
 
@@ -60,7 +63,6 @@ if Version(transformers.__version__) < Version(_MIN_TRANSFORMERS_FOR_GEMMA4):
     )
 
 from transformers import (  # noqa: E402
-    AutoModel,
     AutoTokenizer,
     Gemma4Config,
     PretrainedConfig,
@@ -501,6 +503,16 @@ class Gemma4InputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyInpu
             image_data: Dict = {"pixel_values": pixel_values}
             if image_position_ids is not None:
                 image_data["image_position_ids"] = image_position_ids
+                # Per-image valid-patch count, captured CPU-side from the
+                # ``-1`` padding sentinels in ``image_position_ids`` while
+                # both tensors are still host-resident (the processor runs
+                # on CPU; the executor pipeline moves them to GPU later).
+                # Persisting this as a ``List[int]`` lets the vision tower
+                # populate ``attn_metadata.prompt_lens`` directly without
+                # the ``valid.sum(-1).cpu()`` GPU→CPU sync each forward.
+                image_data["image_seq_lens"] = [
+                    int(s) for s in (image_position_ids != -1).all(dim=-1).sum(dim=-1).tolist()
+                ]
             mm_inner["image"] = image_data
         if input_features is not None:
             audio_data: Dict = {"audio_features": input_features}
@@ -522,6 +534,11 @@ class Gemma4InputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyInpu
             video_data: Dict = {"pixel_values": v}
             if vp is not None:
                 video_data["image_position_ids"] = vp
+                # See image branch above: CPU-side per-frame valid-patch count
+                # avoids the GPU→CPU sync inside the vision tower per forward.
+                video_data["image_seq_lens"] = [
+                    int(s) for s in (vp != -1).all(dim=-1).sum(dim=-1).tolist()
+                ]
             mm_inner["video"] = video_data
         multimodal_data = {"multimodal_data": mm_inner} if mm_inner else None
         return input_ids[0].to(torch.int32).tolist(), multimodal_data
@@ -576,6 +593,13 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
         return {
             "attn_backend": "FLASHINFER",
         }
+
+    def _check_and_adjust_experts_implementation(self, *args, **kwargs):
+        # transformers 5.x ``PreTrainedModel.__init__`` calls this with an
+        # ``experts_implementation`` argument and fails for VL wrapper models
+        # that do not directly contain MoE layers. TRT-LLM manages expert
+        # implementations independently, so skip the check.
+        return None
 
     def __init__(self, model_config: ModelConfig[Gemma4Config]):
         if _is_disagg():
@@ -634,9 +658,10 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
         llm_model_config = self.get_sub_model_config(model_config_cp, "text_config")
         self.llm = Gemma4ForCausalLM(llm_model_config)
 
-        # --- Vision tower (native transformers, eager mode) ---
+        # --- Vision tower (native TRT-LLM, see modeling_gemma4_vision.py) ---
         if config.vision_config is not None:
-            self.vision_tower = AutoModel.from_config(config.vision_config).eval().to(self._device)
+            vision_model_config = self.get_sub_model_config(model_config_cp, "vision_config")
+            self.vision_tower = Gemma4VisionModel(vision_model_config).eval().to(self._device)
             vision_hidden = config.vision_config.hidden_size
             text_hidden = config.text_config.hidden_size
             vision_eps = config.vision_config.rms_norm_eps
@@ -655,9 +680,10 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
             self.vision_tower = None
             self.embed_vision = None
 
-        # --- Audio tower (native transformers, eager mode) ---
+        # --- Audio tower (native TRT-LLM, see modeling_gemma4_audio.py) ---
         if config.audio_config is not None:
-            self.audio_tower = AutoModel.from_config(config.audio_config).eval().to(self._device)
+            audio_model_config = self.get_sub_model_config(model_config_cp, "audio_config")
+            self.audio_tower = Gemma4AudioModel(audio_model_config).eval().to(self._device)
             audio_hidden = getattr(
                 config.audio_config, "output_proj_dims", config.audio_config.hidden_size
             )
@@ -723,8 +749,7 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
 
         if self.vision_tower is not None:
             vit_weights = filter_weights("vision_tower", stripped)
-            # Native transformers models use load_state_dict, not load_weights
-            self.vision_tower.load_state_dict(vit_weights, strict=False)
+            self.vision_tower.load_weights(vit_weights)
 
         if self.embed_vision is not None:
             embed_v_weights = filter_weights("embed_vision", stripped)
@@ -732,7 +757,7 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
 
         if self.audio_tower is not None:
             audio_weights = filter_weights("audio_tower", stripped)
-            self.audio_tower.load_state_dict(audio_weights, strict=False)
+            self.audio_tower.load_weights(audio_weights)
 
         if self.embed_audio is not None:
             embed_a_weights = filter_weights("embed_audio", stripped)
@@ -745,42 +770,72 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
     def infer_max_seq_len(self) -> int:
         return self.llm.infer_max_seq_len()
 
+    @property
+    def multimodal_data_device_paths(self) -> List[str]:
+        """Dotted paths in ``multimodal_data`` that the engine should ship to
+        GPU. Anything not listed stays CPU-resident — notably
+        ``image.image_seq_lens`` / ``video.image_seq_lens`` (Python
+        ``List[int]`` carrying per-image valid-patch counts, consumed
+        host-side by ``Gemma4VisionModel.forward`` to populate
+        ``attn_metadata.prompt_lens`` without a GPU→CPU sync).
+        """
+        return [
+            "image.pixel_values",
+            "image.image_position_ids",
+            "video.pixel_values",
+            "video.image_position_ids",
+            "audio.audio_features",
+            "audio.audio_features_mask",
+        ]
+
     @nvtx_range("[Vision] process")
     def _get_image_features(
         self,
         pixel_values: torch.Tensor,
         image_position_ids: Optional[torch.Tensor] = None,
+        image_seq_lens: Optional[List[int]] = None,
     ) -> torch.Tensor:
+        # Single batched vision-tower call across all images in this LLM step.
+        # ``Gemma4VisionModel.forward`` flattens valid patches across the
+        # batch and runs FULL attention with per-image ``cu_seqlens`` via
+        # varlen ``attn_metadata`` (same pattern as Qwen2VL / LlavaNext).
+        # ``pixel_values`` arrives shape ``(B, max_patches, 3*patch_size**2)``
+        # already cross-request ``torch.cat``-ed in ``forward``, so all
+        # images share ``max_patches`` (image processor pads with -1
+        # sentinels in ``image_position_ids`` for variable image sizes).
         pooling_k2 = self._top_config.vision_config.pooling_kernel_size**2
         target_dtype = self.embed_vision.embedding_projection.weight.dtype
 
-        per_image_features = []
-        for i in range(pixel_values.shape[0]):
-            pv = pixel_values[i].unsqueeze(0)
-            pp = image_position_ids[i].unsqueeze(0) if image_position_ids is not None else None
+        batch_size, max_patches = pixel_values.shape[0], pixel_values.shape[1]
 
-            max_patches = pv.shape[1]
+        if image_position_ids is None:
+            # Square images with implicit row-major grid coordinates.
+            side = int(math.sqrt(max_patches))
+            grid = torch.stack(
+                torch.meshgrid(
+                    torch.arange(side, device=pixel_values.device),
+                    torch.arange(side, device=pixel_values.device),
+                    indexing="ij",
+                ),
+                dim=-1,
+            ).reshape(-1, 2)
+            image_position_ids = grid.unsqueeze(0).expand(batch_size, -1, -1)
 
-            if pp is None:
-                side = int(math.sqrt(max_patches))
-                pp = torch.stack(
-                    torch.meshgrid(
-                        torch.arange(side, device=pv.device),
-                        torch.arange(side, device=pv.device),
-                        indexing="ij",
-                    ),
-                    dim=-1,
-                ).reshape(1, -1, 2)
+        output_length = max_patches // pooling_k2
 
-            output_length = max_patches // pooling_k2
+        with torch.autocast(device_type="cuda", dtype=self.model_dtype):
+            output = self.vision_tower(
+                pixel_values,
+                image_position_ids,
+                output_length=output_length,
+                image_seq_lens=image_seq_lens,
+            )
+            # ``last_hidden_state`` is flat ``(N_valid_pool_tokens_total, hidden_size)``
+            # after pooler+strip; ``embed_vision`` is token-wise (RMSNorm +
+            # Linear), so shape doesn't matter for projection.
+            projected = self.embed_vision(output.last_hidden_state.to(target_dtype))
 
-            with torch.autocast(device_type="cuda", dtype=self.model_dtype):
-                output = self.vision_tower(pv, pp, output_length=output_length)
-                hidden = output.last_hidden_state
-                projected = self.embed_vision(hidden.unsqueeze(0).to(target_dtype)).squeeze(0)
-            per_image_features.append(projected)
-
-        return torch.cat(per_image_features, dim=0).contiguous()
+        return projected.contiguous()
 
     @nvtx_range("[Audio] process")
     def _get_audio_features(
@@ -827,12 +882,14 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
         # --- Extract image data ---
         pixel_values_list = []
         image_position_ids_list = []
+        image_seq_lens_extended: List[int] = []
         # --- Extract audio data ---
         audio_features_list = []
         audio_features_mask_list = []
         # --- Extract video data (treated as image frames at the tower) ---
         video_pixel_values_list = []
         video_position_ids_list = []
+        video_seq_lens_extended: List[int] = []
         for mp in multimodal_params:
             img_data = mp.multimodal_data.get("image", {})
             pv = img_data.get("pixel_values")
@@ -841,6 +898,9 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
                 pid = img_data.get("image_position_ids")
                 if pid is not None:
                     image_position_ids_list.append(pid)
+                seq_lens = img_data.get("image_seq_lens")
+                if seq_lens is not None:
+                    image_seq_lens_extended.extend(seq_lens)
 
             aud_data = mp.multimodal_data.get("audio", {})
             af = aud_data.get("audio_features")
@@ -857,6 +917,9 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
                 vpid = vid_data.get("image_position_ids")
                 if vpid is not None:
                     video_position_ids_list.append(vpid)
+                vsl = vid_data.get("image_seq_lens")
+                if vsl is not None:
+                    video_seq_lens_extended.extend(vsl)
 
         mm_embeds = []
         all_mm_token_ids = []
@@ -873,6 +936,11 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
             image_features = self._get_image_features(
                 pixel_values=pixel_values,
                 image_position_ids=image_position_ids,
+                image_seq_lens=(
+                    image_seq_lens_extended
+                    if len(image_seq_lens_extended) == pixel_values.shape[0]
+                    else None
+                ),
             )
             mm_embeds.append(image_features)
             all_mm_token_ids.append(self.image_token_ids)
@@ -892,6 +960,11 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
             video_features = self._get_image_features(
                 pixel_values=video_pixel_values,
                 image_position_ids=video_pos_ids,
+                image_seq_lens=(
+                    video_seq_lens_extended
+                    if len(video_seq_lens_extended) == video_pixel_values.shape[0]
+                    else None
+                ),
             )
             mm_embeds.append(video_features)
             if self.video_token_ids is not None:

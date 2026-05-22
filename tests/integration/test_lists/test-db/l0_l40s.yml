@@ -23,6 +23,7 @@ l0_l40s:
   - unittest/_torch/modeling/test_modeling_qwen2_5vl.py::TestQwen2_5_VL::test_all
   - unittest/_torch/modeling/test_modeling_qwen3vl_moe.py::TestQwen3VLMoe::test_all
   - unittest/_torch/modeling/test_modeling_qwen3vl.py::TestQwen3VL::test_all
+  - unittest/_torch/modeling/test_modeling_qwen3_5_vl_moe.py::TestQwen3_5MoeVL::test_all
   - test_e2e.py::test_ptp_scaffolding[DeepSeek-R1-Distill-Qwen-7B-DeepSeek-R1/DeepSeek-R1-Distill-Qwen-7B]
   - unittest/llmapi/apps/_test_openai_chat_multimodal.py::test_single_chat_session_image_embeds -m needs_l40s
   # MMMU sanity check
