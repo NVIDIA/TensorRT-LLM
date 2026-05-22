@@ -1,3 +1,17 @@
+# SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 import math
 from functools import partial
 from typing import Dict, List, Tuple
@@ -40,7 +54,7 @@ from ...utils.quantization_utils import (
 from ..interface import BaseTransform, SharedConfig, TransformInfo, TransformRegistry
 
 try:
-    from .....quantization.utils.fp4_utils import float4_sf_dtype
+    from tensorrt_llm.quantization.utils.fp4_utils import float4_sf_dtype
 except ImportError:
     float4_sf_dtype = None
 
@@ -205,6 +219,10 @@ class Quantization(BaseTransform):
         gm._register_load_state_dict_pre_hook(
             partial(self.load_hook, weight_name=lin_weight.node_key)
         )
+        if self.post_load_hook:
+            gm.register_load_state_dict_post_hook(
+                partial(self.post_load_hook, weight_name=lin_weight.node_key)
+            )
 
         with gm.graph.inserting_before(node):
             scales = {}
@@ -882,6 +900,15 @@ class FineGrainedFP8LinearQuantization(Quantization):
                 # Rename to match our buffer name
                 mod_prefix = weight_name.rsplit(".", 1)[0]
                 state_dict[mod_prefix + ".weight_scale_inv"] = state_dict[scale_inv_name]
+
+    # NOTE: post_load_hook intentionally inherited as None from the base
+    # `Quantization`. UE8M0 conversion + TMA col-major layout for DeepGEMM is
+    # done atomically inside `_dispatch_trtllm_finegrained_fp8_to_deepgemm`
+    # (transform/library/fuse_quant.py) for every node we actually swap to
+    # `trtllm_fp8_deepgemm`. Doing it there guarantees the graph never carries
+    # a UE8M0 scale paired with a raw-FP32-scale op, which previously caused
+    # NaN whenever dispatch failed to swap (deepgemm op missing in build,
+    # fuse_finegrained_fp8_linear disabled, partial pipeline, etc.).
 
     def _apply(
         self,

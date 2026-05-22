@@ -187,9 +187,8 @@ __global__ void routingMainKernel(KernelParams params)
         expertSelected = (warpIdx < params.mNumExpertGroups) && (laneIdx < params.mNumExpertsPerGroup);
     }
     auto scoreIdx = int64_t{blockIdx.x} * int64_t{params.mNumExperts} + threadExpert;
-    auto biasVal = expertSelected
-        ? static_cast<OutputT>(loadScalar(params.mPtrRoutingBias, threadExpert, params.mDtypeBias))
-        : invalidScore;
+    float biasVal
+        = expertSelected ? loadScalar(params.mPtrRoutingBias, threadExpert, params.mDtypeBias) : invalidScoreFloat;
 
     // initialize the mPtrExpertCounts
     if (params.mPtrExpertCounts)
@@ -549,8 +548,6 @@ void run(Data& data, void* stream)
         TLLM_CHECK_WITH_INFO(data.mNumExpertGroups >= data.mNumLimitedGroups,
             "Routing kernel expects top groups %d to be limited by #expert groups %d", data.mNumLimitedGroups,
             data.mNumExpertGroups);
-        TLLM_CHECK_WITH_INFO(
-            data.mNumExperts % 4 == 0, "Routing kernel expects #experts %d to be a multiple of 4.", data.mNumExperts);
     }
 
     int const numBlocks = data.mNumTokens;

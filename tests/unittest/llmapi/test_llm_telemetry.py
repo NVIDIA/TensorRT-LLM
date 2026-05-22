@@ -41,7 +41,7 @@ _kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.4)
 def _get_model_path():
     root = llm_models_root()
     assert root is not None, (
-        "LLM_MODELS_ROOT must be set or /home/scratch.trt_llm_data must be "
+        "LLM_MODELS_ROOT must be set or /home/scratch.trt_llm_data_ci must be "
         "accessible to run telemetry integration tests"
     )
     return str(root / MODEL_NAME)
@@ -280,7 +280,7 @@ class TestFeatureTrackingIntegration:
         self.model_path = _get_model_path()
 
     def test_features_json_present_in_report_pytorch(self):
-        """_collect_features returns valid JSON with all 6 keys from real llm_args."""
+        """_collect_features returns valid JSON with all feature keys."""
         import json
 
         captured, spy = _make_spy()
@@ -294,15 +294,7 @@ class TestFeatureTrackingIntegration:
 
         features_str = usage_lib._collect_features(llm_args)
         features = json.loads(features_str)
-        expected_keys = {
-            "lora",
-            "speculative_decoding",
-            "prefix_caching",
-            "cuda_graphs",
-            "chunked_context",
-            "data_parallel_size",
-        }
-        assert set(features.keys()) == expected_keys
+        assert set(features.keys()) == set(usage_lib._FEATURES_DEFAULTS.keys())
 
     def test_features_json_default_values_pytorch(self):
         """Default TinyLlama config has expected feature defaults."""

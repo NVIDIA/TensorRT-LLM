@@ -34,9 +34,7 @@ from torch._ops import OpOverloadPacket
 from torch.fx import GraphModule, Node
 from torch.types import Number
 
-from tensorrt_llm.llmapi.llm_args import KvCacheConfig
-
-from ...._utils import nvtx_range, prefer_pinned, str_dtype_to_torch
+from .._compat import KvCacheConfig, nvtx_range, prefer_pinned, str_dtype_to_torch
 from ..utils.logger import ad_logger
 from ..utils.node_utils import extract_op_args, get_op_schema
 
@@ -401,10 +399,13 @@ class BatchInfo:
     - [10] num_tokens_to_gather: number of tokens to gather before LM head
     - [11] gather_required: whether gathering is required (0 or 1)
 
+    Slot 12 (spec-decoding info, set once at runtime init):
+    - [12] max_draft_len: maximum draft length per request (0 when not spec dec)
+
     All fields can be accessed and updated with the convenience functions below.
     """
 
-    _NUM_ELEMENTS = 12
+    _NUM_ELEMENTS = 13
 
     def __init__(self, batch_info_host: Optional[torch.Tensor] = None):
         if batch_info_host is None:
@@ -415,15 +416,30 @@ class BatchInfo:
         # Use the tensor view directly so fake tensors can flow through
         # torch.compile metadata tracing without requiring a real .numpy() view.
         self._batch_info = batch_info_host
+        # Cached zero-copy numpy view for fast scalar/list writes on the host path.
+        # `.numpy()` raises RuntimeError on fake tensors and TypeError on cuda tensors;
+        # both fall back to the slow tensor-write path.
+        try:
+            self._batch_info_np = batch_info_host.numpy()
+        except (RuntimeError, TypeError):
+            self._batch_info_np = None
 
     def serialize(self) -> torch.Tensor:
         return self._batch_info_host
 
     def update(self, batch_info: List[int]) -> None:
-        self._batch_info[:6] = torch.as_tensor(batch_info, dtype=self._batch_info.dtype)
+        if self._batch_info_np is not None:
+            self._batch_info_np[:6] = batch_info
+        else:
+            self._batch_info[:6] = torch.as_tensor(batch_info, dtype=self._batch_info.dtype)
 
     def is_generate_only(self) -> bool:
         return self._batch_info[:4].sum().item() == 0
+
+    def is_extend_only(self) -> bool:
+        """True when batch contains only extend requests (no prefill, no decode)."""
+        num_prefill, num_extend, num_decode = self.get_num_sequences()
+        return num_prefill == 0 and num_extend > 0 and num_decode == 0
 
     def get_total_num_sequences(self) -> int:
         return sum(self.get_num_sequences())
@@ -501,6 +517,16 @@ class BatchInfo:
 
     def is_gather_required(self) -> bool:
         return bool(self._batch_info[11])
+
+    # --- spec-decoding info (slot 12) writer ---
+
+    def update_max_draft_len(self, max_draft_len: int) -> None:
+        self._batch_info[12] = max_draft_len
+
+    # --- spec-decoding info (slot 12) readers ---
+
+    def get_max_draft_len(self) -> int:
+        return int(self._batch_info[12])
 
 
 class SequenceInfo:
@@ -663,6 +689,7 @@ class SequenceInfo:
             ### ADDITIONAL ARGUMENTS AVAILABLE THAT ARE DERIVED FROM THE BASIC ARGUMENTS ###########
             ("seq_len", self.max_batch_size, torch.int),
             ("seq_len_with_cache", self.max_batch_size, torch.int),
+            ("prompt_lens", self.max_batch_size, torch.int),
             ("use_initial_states", self.max_batch_size, torch.bool),
             ### OTHER ARGUMENTS USED BY THE RUNTIME ################################################
             ("extra_page_per_seq", self.max_batch_size, torch.int),
@@ -724,8 +751,9 @@ class SequenceInfo:
         # check if we are still running uncached attention in which case we are also still
         # operate on unflattened tensors with explicit [batch_size, seq_len, ...] shape
         # generate-only batches are also formatted like this (i.e. [b, 1])
+        # Extend-only batches are also rectangular by construction.
         total_num_tokens = self.total_num_tokens
-        if not self._use_flattened_layout or self.is_generate_only:
+        if not self._use_flattened_layout or self.is_generate_only or self.is_extend_only:
             bs = self.num_sequences
             sl = total_num_tokens // bs
         # use [1,total_len] shape to indicate non-generate-only batch for cached attention
@@ -816,6 +844,10 @@ class SequenceInfo:
     @property
     def is_generate_only(self) -> bool:
         return self.batch_info.is_generate_only()
+
+    @property
+    def is_extend_only(self) -> bool:
+        return self.batch_info.is_extend_only()
 
     @property
     def num_blocks(self) -> int:
@@ -935,10 +967,25 @@ class SequenceInfo:
         input_ids = torch.ones(self.max_batch_size, seq_len, dtype=torch.int)
         self.set_example_sequence(input_ids)
 
-    def set_generate_only_batch(self, batch_size: Optional[int] = None) -> None:
-        """Set an example sequence for generate-only batch."""
+    def set_capture_batch(self, max_draft_len: int = 0, batch_size: Optional[int] = None) -> None:
+        """Set a synthetic cached-attention batch for cudagraph capture.
+
+        ``max_draft_len == 0`` produces the usual generate-only layout. ``max_draft_len > 0``
+        produces a synthetic extend-only batch with ``1 + max_draft_len`` tokens per sequence.
+        """
         batch_size = batch_size or self.max_batch_size
-        self.set_example_sequence(torch.ones(batch_size, 1, dtype=torch.int))
+        seq_len = 1 + max_draft_len
+
+        if seq_len > 1:
+            # extend-only request
+            batch_info = [0, 0, batch_size, batch_size * seq_len, 0, 0]
+        else:
+            # decode-only request
+            batch_info = [0, 0, 0, 0, batch_size, batch_size]
+
+        self.set_example_sequence(
+            input_ids=torch.ones(batch_size, seq_len, dtype=torch.int), batch_info=batch_info
+        )
 
     def reset(self) -> None:
         """Reset the sequence information.
@@ -946,7 +993,7 @@ class SequenceInfo:
         After reset the sequence information should correspond to a "generate-only" batch of
         sequences (b, s==1) without cache history.
         """
-        self.set_generate_only_batch()
+        self.set_capture_batch()
 
     @staticmethod
     def _flatten(nested_seqs: Sequence[Sequence[int]]) -> List[int]:
@@ -1024,7 +1071,13 @@ class SequenceInfo:
                         tnsr_like = torch.cat(tnsr_like)
                     else:
                         tnsr_like = tnsr_like[0]
-                self._extra_args[name] = tnsr_like.to(self.device, non_blocking=True)
+                if tnsr_like.device.type == "cpu":
+                    tnsr_like = tnsr_like.contiguous()
+                # Extra args are small model/runtime metadata tensors that currently bypass
+                # the pinned host staging path used by the core attention inputs. Copy them
+                # synchronously so the source tensor lifetime cannot race the next executor
+                # step under overlap scheduling.
+                self._extra_args[name] = tnsr_like.to(self.device, non_blocking=False)
             else:
                 self._extra_args[name] = None
 
@@ -1049,6 +1102,7 @@ class SequenceInfo:
         cu_num_pages: Union[Sequence[int], torch.Tensor, None] = None,
         extra_page_per_seq: Optional[Sequence[int]] = None,
         slot_idx: Union[Sequence[int], torch.Tensor, None] = None,
+        prompt_lens: Union[Sequence[int], torch.Tensor, None] = None,
         ### RUNTIME ARGUMENTS ######################################################################
         gather_context_logits: bool = False,
         _gather_idx: Union[Sequence[int], torch.Tensor, None] = None,
@@ -1121,15 +1175,6 @@ class SequenceInfo:
         # set new input_ids and make sure to flatten it
         self._stage_arg("input_ids", input_ids, reset_val=0)
 
-        # position_ids for each sequence is in the range [input_pos, input_pos + seq_len - 1]
-        ip_np = ip_host.numpy()
-        sl_np = sl_host.numpy()
-        base = np.repeat(ip_np, sl_np)
-        group_starts = np.repeat(np.cumsum(sl_np) - sl_np, sl_np)
-        offsets = np.arange(sl_np.sum()) - group_starts
-        position_ids = torch.from_numpy(base + offsets)  # zero-copy back
-        self._stage_arg("position_ids", position_ids)
-
         ### UPDATE EXTRA INPUTS ####################################################################
         self._extra_args = {}
         for key, value in extra_args.items():
@@ -1171,6 +1216,15 @@ class SequenceInfo:
         # update sequence length with cache
         seq_len_with_cache = ip_host + sl_host
         self._stage_arg("seq_len_with_cache", seq_len_with_cache)
+
+        # prompt_lens: original context length per sequence, constant across iterations.
+        # Defaults to seq_len when not provided (correct for prefill).
+        if prompt_lens is not None:
+            if isinstance(prompt_lens, (list, tuple)):
+                prompt_lens = torch.tensor(prompt_lens, dtype=torch.int)
+        else:
+            prompt_lens = sl_host
+        self._stage_arg("prompt_lens", prompt_lens)
 
         # check for updated use_initial_states
         use_initial_states = ip_host > 0
@@ -1355,9 +1409,17 @@ class SequenceInfo:
         # position_ids is per-token while offset is per-sequence; expand if needed
         if self.is_generate_only:
             offset_for_pos_ids = offset
+        elif self.is_extend_only:
+            _, num_extend, _ = self.batch_info.get_num_sequences()
+            _, num_extend_tokens, _ = self.batch_info.get_num_tokens()
+            tokens_per_seq = num_extend_tokens // num_extend
+            offset_for_pos_ids = offset[:num_extend].repeat_interleave(tokens_per_seq)
         else:
+            # mixed prefill + (extend/decode). Need to use seq_len in the generic case. Causes host sync.
+            # TODO: Can special case for cases where we know offset of prefill sequences to avoid host sync.
             seq_len = self.get_arg("seq_len", truncate=True)
             offset_for_pos_ids = torch.repeat_interleave(offset, seq_len.to(torch.int64))
+
         position_ids += offset_for_pos_ids
 
         # --- seq_len_with_cache (device) ---
@@ -1369,8 +1431,11 @@ class SequenceInfo:
         use_initial_states[:] = input_pos > 0
 
         # --- Bulk device-to-host sync ---
-        # TODO: we have to continue thinking about this and dissect more what fields are needed in
-        # the forward pass if we use cudagraph...
+        # This ensures that the H2D copy done by InputBuffer.copy_to_device() has been executed
+        # before we update the host-side tensors.
+        # By gating this on sync_to_host, we ensure that we only sync when a custom op needs updated host arguments.
+        # TODO: May need to dissect what fields are needed in the forward pass to reduce
+        # data movement.
         if sync_to_host:
             self._input_buffer.copy_to_host()
 
@@ -1385,7 +1450,14 @@ class SequenceInfo:
         increment = torch.zeros(self.num_sequences, dtype=torch.int32, device=self.device)
         num_prefill = self.batch_info.get_num_sequences()[0]
         gather_slot_idx = self.get_arg("_gather_slot_idx", truncate=True)
-        increment[num_prefill:] = new_lens_ungathered[gather_slot_idx] - 1
+        num_overlap = gather_slot_idx.numel()
+        # AD overlap mode packs real overlap-carried non-prefill sequences first. CUDA-graph dummy
+        # requests are appended later and therefore remain in the trailing zero-increment region.
+        # We deliberately only write gather_slot_idx entries for non-dummy requests, so that we
+        # can apply them to the prefix of "increment" here.
+        increment[num_prefill : num_prefill + num_overlap] = (
+            new_lens_ungathered[gather_slot_idx] - 1
+        )
         self.offset_pos_and_cache_(increment)
 
     @nvtx_range("ad_switch_to_generate_")
@@ -1396,12 +1468,17 @@ class SequenceInfo:
         an all-decode layout where each sequence has exactly 1 token. We assume that we just take
         the last position of each sequence for the metadata.
 
-        NOTE: right now, we always update both host and device tensor to ensure this does not
-        interfere with the device-to-host sync in offset_pos_and_cache_.
+        NOTE: update device tensors first and mirror back to host only when an updated host-side
+        argument is active.
 
-        NOTE: we assume the same structure as in nest_sequences for when to update the arguments.
-        In particular, arguments that are always updated in nest_sequences are also updated here.
-        Others are updated optionally depending on the argument being active.
+        This prevents race conditions with the H2D copy done by InputBuffer.copy_to_device().
+        The H2D copy was queued before the forward pass, but may not have been executed yet.
+        If this copy has not been executed and we updated host arguments directly,
+        we would be overwriting them with new values which would lead to these new values getting copied
+        to device when we wanted to copy the old data. By updating via a D2H sync on the active stream,
+        we ensure that these host-side tensors are updated *after* the H2D copy has been executed.
+
+        Additionally, we make sure the D2H sync only happens only when a custom op needs updated host arguments.
         """
         # already in generate mode
         if self.is_generate_only:
@@ -1414,31 +1491,49 @@ class SequenceInfo:
         self.batch_info.update([0, 0, 0, 0, num_seq, num_seq])
         self.batch_info.update_tokens_gather_info(num_seq, False)
 
-        for device, suffix in (
-            (self.host_device, self._host_suffix),
-            (self.device, ""),
-        ):
-            # --- input_ids ---
-            # use cu_seqlen as heuristic to get the input_ids if available
-            input_ids_flat = self.get_arg(f"input_ids{suffix}", truncate=False, unflatten=False)
-            extraction_indices = (self.get_arg(f"cu_seqlen{suffix}", truncate=True)[1:] - 1).long()
-            self.copy_(f"input_ids{suffix}", input_ids_flat[extraction_indices], strict=False)
+        # check if we need a d2h sync
+        _REQUIRES_UPDATE = {
+            "input_ids",
+            "input_pos",
+            "cu_seqlen",
+            "seq_len",
+            "position_ids",
+            "use_initial_states",
+        }
+        needs_d2h_sync = [
+            k + self._host_suffix
+            for k in _REQUIRES_UPDATE
+            if self._is_active(k + self._host_suffix, check_both=False)
+        ]
+        sync_to_host = any(needs_d2h_sync)
 
-            # --- input_pos ---
-            input_pos = self.get_arg(f"input_pos{suffix}", truncate=True)
-            input_pos += self.get_arg(f"seq_len{suffix}", truncate=True) - 1
+        # --- input_ids (device) ---
+        # use cu_seqlen as heuristic to get the input_ids if available
+        input_ids_flat = self.get_arg("input_ids", truncate=False, unflatten=False)
+        extraction_indices = (self.get_arg("cu_seqlen", truncate=True)[1:] - 1).long()
+        self.copy_("input_ids", input_ids_flat[extraction_indices], strict=False)
 
-            # --- cu_seqlen ---
-            cu_seqlen = torch.arange(num_seq + 1, dtype=torch.int32, device=device)
-            self.copy_(f"cu_seqlen{suffix}", cu_seqlen)
+        # --- input_pos (device) ---
+        input_pos = self.get_arg("input_pos", truncate=True)
+        input_pos += self.get_arg("seq_len", truncate=True) - 1
 
-            # --- seq_len ---
-            seq_len = self.get_arg(f"seq_len{suffix}", truncate=True)
-            seq_len.fill_(1)
+        # --- cu_seqlen (device) ---
+        cu_seqlen = torch.arange(num_seq + 1, dtype=torch.int32, device=self.device)
+        self.copy_("cu_seqlen", cu_seqlen)
 
-            # --- update derivative metadata that change in generate-only mode if active ---
-            self.copy_(f"position_ids{suffix}", input_pos, strict=False)
-            self.copy_(f"use_initial_states{suffix}", input_pos > 0)
+        # --- seq_len (device) ---
+        seq_len = self.get_arg("seq_len", truncate=True)
+        seq_len.fill_(1)
+
+        # ---  update derivative metadata that change in generate-only mode if active (device) ---
+        self.copy_("position_ids", input_pos, strict=False)
+        self.copy_("use_initial_states", input_pos > 0)
+
+        # --- Bulk device-to-host sync ---
+        # TODO: May need to dissect what fields are needed in the forward pass to reduce
+        # data movement.
+        if sync_to_host:
+            self._input_buffer.copy_to_host()
 
     def copy_(self, name: str, src: torch.Tensor, strict: bool = True) -> None:
         """Copy a tensor into the buffer. USE WITH CAUTION!

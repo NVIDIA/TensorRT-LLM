@@ -128,7 +128,7 @@
             LAUNCH_ESC(float, __nv_bfloat16, numExperts, numTopExperts, TopKExpertSelect<PreProc, PostProc>), kernel,  \
             numBlocks, numThreads, smemSize, stream);                                                                  \
     }                                                                                                                  \
-    else if (data.mDtypeOutput == tg::Dtype::Bfloat16)                                                                 \
+    else if (data.mDtypeOutput == tg::Dtype::Bfloat16 && data.mDtypeInput == tg::Dtype::Bfloat16)                      \
     {                                                                                                                  \
         LAUNCH_PDL_ROUTING(data, coopLaunch,                                                                           \
             LAUNCH_ESC(__nv_bfloat16, __nv_bfloat16, numExperts, numTopExperts, TopKExpertSelect<PreProc, PostProc>),  \
@@ -136,7 +136,8 @@
     }                                                                                                                  \
     else                                                                                                               \
     {                                                                                                                  \
-        TLLM_LOG_ERROR("Unsupported dtypeOutput");                                                                     \
+        TLLM_LOG_ERROR("Unsupported dtype combination: dtypeOutput=%d, dtypeInput=%d",                                 \
+            static_cast<int>(data.mDtypeOutput), static_cast<int>(data.mDtypeInput));                                  \
     }
 
 // routingCustom dispatch for custom ExpertSelectPolicy types that don't use PreProc/PostProc.
@@ -155,7 +156,7 @@
             LAUNCH_ESC(float, __nv_bfloat16, numExperts, numTopExperts, ExpertSelect), kernel, numBlocks, numThreads,  \
             smemSize, stream);                                                                                         \
     }                                                                                                                  \
-    else if (data.mDtypeOutput == tg::Dtype::Bfloat16)                                                                 \
+    else if (data.mDtypeOutput == tg::Dtype::Bfloat16 && data.mDtypeInput == tg::Dtype::Bfloat16)                      \
     {                                                                                                                  \
         LAUNCH_PDL_ROUTING(data, coopLaunch,                                                                           \
             LAUNCH_ESC(__nv_bfloat16, __nv_bfloat16, numExperts, numTopExperts, ExpertSelect), kernel, numBlocks,      \
@@ -163,7 +164,8 @@
     }                                                                                                                  \
     else                                                                                                               \
     {                                                                                                                  \
-        TLLM_LOG_ERROR("Unsupported dtypeOutput");                                                                     \
+        TLLM_LOG_ERROR("Unsupported dtype combination: dtypeOutput=%d, dtypeInput=%d",                                 \
+            static_cast<int>(data.mDtypeOutput), static_cast<int>(data.mDtypeInput));                                  \
     }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////

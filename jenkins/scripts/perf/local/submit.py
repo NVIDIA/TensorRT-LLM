@@ -324,7 +324,13 @@ def generate_srun_args(args, runtime_mode, timestamp):
 
 
 def generate_pytest_command(
-    test_prefix, work_dir, config_file_base_name, select_pattern, runtime_mode, benchmark_mode
+    test_prefix,
+    work_dir,
+    config_file_base_name,
+    select_pattern,
+    runtime_mode,
+    benchmark_mode,
+    waives_file="",
 ):
     """Generate pytest command and test list."""
     # Generate test list content based on runtime_mode and benchmark_mode
@@ -353,6 +359,9 @@ def generate_pytest_command(
         f"--output-dir={work_dir} "
         f"-o junit_logging=out-err"
     )
+
+    if waives_file:
+        pytest_command += f" --waives-file={waives_file}"
 
     return pytest_command, test_list_content, test_list_path
 
@@ -453,6 +462,11 @@ def main():
     )
     parser.add_argument("--test-prefix", default="", help="Test prefix")
     parser.add_argument(
+        "--waives-file",
+        default="",
+        help="Path to waives file for pytest (optional)",
+    )
+    parser.add_argument(
         "--mpi-type",
         default="",
         help="MPI type for srun (e.g. pmix, pmi2). If not set, aggregated runs default to"
@@ -506,6 +520,10 @@ def main():
         with open(config_yaml, "r") as f:
             config = yaml.safe_load(f)
 
+    # Detect GPU type from config metadata
+    supported_gpus = config.get("metadata", {}).get("supported_gpus", [])
+    is_b200 = "B200" in supported_gpus
+
     # Create timestamp
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
@@ -558,7 +576,13 @@ def main():
 
     # Generate pytest command
     pytest_command, test_list_content, test_list_path = generate_pytest_command(
-        test_prefix, work_dir, config_file_base_name, select_pattern, runtime_mode, benchmark_mode
+        test_prefix,
+        work_dir,
+        config_file_base_name,
+        select_pattern,
+        runtime_mode,
+        benchmark_mode,
+        waives_file=args.waives_file,
     )
 
     # Write test list file
@@ -664,6 +688,10 @@ def main():
                 f"TLLM_BENCHMARK_REQ_QUEUES_SIZE={concurrency} {gen_worker_env_vars}"
             )
 
+        if is_b200:
+            ucx_tls_cmd = "export UCX_TLS=^ib &&"
+        else:
+            ucx_tls_cmd = "unset UCX_TLS &&"
         script_prefix_lines.extend(
             [
                 f'export CTX_WORKER_ENV_VARS="{ctx_worker_env_vars}"',
@@ -671,20 +699,23 @@ def main():
                 f'export SERVER_ENV_VARS="{server_env_vars}"',
                 f'export BENCHMARK_ENV_VARS="{benchmark_env_var}"',
                 (
-                    'export pytestCommandCTXWorker="unset UCX_TLS &&'
+                    f'export pytestCommandCTXWorker="{ucx_tls_cmd}'
                     " $CTX_WORKER_ENV_VARS $PYTEST_COMMON_VARS"
                     " $NSYS_PREFIX $LLM_API_LAUNCH"
                     f' $PYTEST_COMMAND --junitxml={work_dir}/report.xml"'
                 ),
                 (
-                    'export pytestCommandGENWorker="unset UCX_TLS &&'
+                    f'export pytestCommandGENWorker="{ucx_tls_cmd}'
                     " $GEN_WORKER_ENV_VARS $PYTEST_COMMON_VARS"
                     " $NSYS_PREFIX $LLM_API_LAUNCH"
                     f' $PYTEST_COMMAND --junitxml={work_dir}/report.xml"'
                 ),
-                'export pytestCommandDisaggServer="$SERVER_ENV_VARS $PYTEST_COMMON_VARS $PYTEST_COMMAND"',
                 (
-                    'export pytestCommandBenchmark="$BENCHMARK_ENV_VARS $PYTEST_COMMON_VARS'
+                    f'export pytestCommandDisaggServer="{ucx_tls_cmd}'
+                    ' $SERVER_ENV_VARS $PYTEST_COMMON_VARS $PYTEST_COMMAND"'
+                ),
+                (
+                    f'export pytestCommandBenchmark="{ucx_tls_cmd} $BENCHMARK_ENV_VARS $PYTEST_COMMON_VARS'
                     f' $PYTEST_COMMAND --junitxml={work_dir}/report.xml"'
                 ),
                 f"export numCtxServers={hardware_config.get('num_ctx_servers', '')}",

@@ -1,4 +1,9 @@
-# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+# Copyright 2018 The HuggingFace Team
+# Licensed under the Apache License, Version 2.0.
+# Original source: https://github.com/huggingface/transformers
+#
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 
 """Slimmed down PyTorch DeepSeekV3 model implementation for auto_deploy export.
 
@@ -28,9 +33,9 @@ from transformers.generation import GenerationMixin
 from transformers.modeling_utils import PreTrainedModel
 from transformers.utils import ModelOutput
 
-from tensorrt_llm._torch.auto_deploy.models.custom import mla_rope_utils
-from tensorrt_llm._torch.auto_deploy.models.hf import AutoModelForCausalLMFactory
-from tensorrt_llm._torch.utils import ActivationType
+from ..._compat import ActivationType
+from ..hf import AutoModelForCausalLMFactory
+from . import mla_rope_utils
 
 
 class DeepSeekV3RMSNorm(nn.Module):
@@ -275,6 +280,12 @@ class DeepSeekV3MoE(nn.Module):
 
         selected_experts, routing_weights = self.gate(hidden_states)
 
+        # Compute shared expert BEFORE routed experts so that in the FX graph
+        # the shared-expert nodes precede the MoE node.  This lets the
+        # multi_stream_moe transform overlap them on separate CUDA streams.
+        if self.shared_experts is not None:
+            shared_expert_output = self.shared_experts(identity)
+
         # Use torch_moe custom op for routed experts
         final_hidden_states = torch.ops.auto_deploy.torch_moe(
             hidden_states.view(-1, hidden_states.shape[-1]),
@@ -289,9 +300,8 @@ class DeepSeekV3MoE(nn.Module):
 
         final_hidden_states = final_hidden_states.view(*orig_shape)
 
-        # Add shared experts output if present
         if self.shared_experts is not None:
-            final_hidden_states = final_hidden_states + self.shared_experts(identity)
+            final_hidden_states = final_hidden_states + shared_expert_output
 
         return final_hidden_states.to(hidden_states.dtype)
 
@@ -364,14 +374,19 @@ class DeepSeekV3Attention(nn.Module):
                 self.softmax_scale = self.softmax_scale * mscale * mscale
 
     def _init_rope(self):
-        if self.config.rope_scaling is None:
+        rope_scaling = self.config.rope_scaling
+        # In transformers 5.x rope_scaling is never None; treat "default"
+        # rope_type the same as no scaling.
+        scaling_type = None
+        if rope_scaling is not None:
+            scaling_type = rope_scaling.get("type", rope_scaling.get("rope_type"))
+        if scaling_type is None or scaling_type == "default":
             self.rotary_emb = DeepSeekV3RotaryEmbedding(
                 self.qk_rope_head_dim,
                 max_position_embeddings=self.max_position_embeddings,
                 base=self.rope_theta,
             )
         else:
-            scaling_type = self.config.rope_scaling["type"]
             scaling_factor = self.config.rope_scaling["factor"]
 
             if scaling_type == "yarn":
@@ -607,7 +622,7 @@ class DeepSeekV3Model(DeepSeekV3PreTrainedModel):
 class DeepSeekV3ForCausalLM(DeepSeekV3PreTrainedModel, GenerationMixin):
     """DeepSeekV3 model with language modeling head."""
 
-    _tied_weights_keys = ["lm_head.weight"]
+    _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
 
     def __init__(self, config):
         super().__init__(config)

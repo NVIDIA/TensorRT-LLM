@@ -1,4 +1,9 @@
-# Copyright (c) 2025-2026, NVIDIA CORPORATION. All rights reserved.
+# Copyright 2018 The HuggingFace Team
+# Licensed under the Apache License, Version 2.0.
+# Original source: https://github.com/huggingface/transformers
+#
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 
 """Slimmed down PyTorch NemotronH model implementation.
 
@@ -31,9 +36,9 @@ from transformers.generation import GenerationMixin
 from transformers.modeling_utils import PreTrainedModel
 from transformers.utils import ModelOutput
 
-from tensorrt_llm._torch.auto_deploy.custom_ops.normalization.rms_norm import gated_rms_norm_ref
-from tensorrt_llm._torch.auto_deploy.models.hf import AutoModelForCausalLMFactory
-from tensorrt_llm._torch.utils import ActivationType
+from ..._compat import ActivationType
+from ...custom_ops.normalization.rms_norm import gated_rms_norm_ref
+from ..hf import AutoModelForCausalLMFactory
 
 
 class MambaRMSNormGated(torch.nn.Module):
@@ -599,7 +604,7 @@ class NemotronHModel(NemotronHPreTrainedModel):
 
 
 class NemotronHForCausalLM(NemotronHPreTrainedModel, GenerationMixin):
-    _tied_weights_keys = ["lm_head.weight"]
+    _tied_weights_keys = {"lm_head.weight": "backbone.embeddings.weight"}
 
     def __init__(self, config):
         super().__init__(config)

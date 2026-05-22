@@ -44,14 +44,14 @@ class Mistral3Gate(nn.Module):
 class MistralLarge3ForCausalLM(DeepseekV3ForCausalLM):
     def __init__(self, model_config: ModelConfig):
         super().__init__(model_config)
-        self.weight_mapper = MistralLarge3WeightMapper()
 
     def forward(self, *args, **kwargs):
         return super().forward(*args, **kwargs)
 
-    def load_weights(self, weights: Dict):
+    def load_weights(self, weights: Dict, weight_mapper=None, params_map=None):
         assert self.model_config is not None, "self.model_config is required"
-        params_map = self.weight_mapper.mistral_llm_mapping.copy()
+        self.weight_mapper = weight_mapper or MistralLarge3WeightMapper()
+        params_map = params_map or self.weight_mapper.mistral_llm_mapping.copy()
         quantization_weights_map: Dict[str, str] = {}
         if self.model_config.quant_config.quant_algo == QuantAlgo.NVFP4:
             quantization_weights_map = {

@@ -228,9 +228,25 @@ def build_worker_environment(worker_config, env_config, role, benchmark_mode,
                           'TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP',
                           'TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP=1')
         if role == "GEN":
+            gen_config = worker_config.get('gen', {})
+            concurrency_int = int(concurrency)
+            max_batch_size = int(
+                gen_config.get('max_batch_size', concurrency_int))
+            enable_attention_dp = gen_config.get('enable_attention_dp', False)
+            tp_size = int(gen_config.get('tensor_parallel_size', 1))
+            max_capacity = ((max_batch_size * tp_size)
+                            if enable_attention_dp else max_batch_size)
+            queue_size = min(max_capacity, concurrency_int)
+            if queue_size < concurrency_int:
+                print(f"[WARNING] TLLM_BENCHMARK_REQ_QUEUES_SIZE capped to "
+                      f"{queue_size} (max_batch_size={max_batch_size} x "
+                      f"tp_size={tp_size} with "
+                      f"attention_dp={enable_attention_dp}) "
+                      f"which is less than concurrency={concurrency}. "
+                      f"Fill loop would hang if set to {concurrency}.")
             upsert_env_config(env_config, 'gen_worker_env_var',
                               'TLLM_BENCHMARK_REQ_QUEUES_SIZE',
-                              f'TLLM_BENCHMARK_REQ_QUEUES_SIZE={concurrency}')
+                              f'TLLM_BENCHMARK_REQ_QUEUES_SIZE={queue_size}')
 
     # 2. Add profiling env vars to env_config (conditional)
     if nsys_on:
@@ -407,8 +423,13 @@ def submit_job(config, log_dir, dry_run):
     gen_pp_size = worker_config['gen'].get('pipeline_parallel_size', 1)
     gen_world_size = gen_tp_size * gen_cp_size * gen_pp_size
     gen_nodes = calculate_nodes(gen_world_size, gen_num, gpus_per_node)
-    ucx_warmup_requests = 2 * ctx_world_size * \
-        gen_world_size if benchmark_config['mode'] == "e2e" else 0
+
+    ctx_dp_size = ctx_tp_size if worker_config['ctx'].get(
+        'enable_attention_dp', False) else 1
+    gen_dp_size = gen_tp_size if worker_config['gen'].get(
+        'enable_attention_dp', False) else 1
+    ucx_warmup_requests = 2 * ctx_num * ctx_dp_size * gen_num * gen_dp_size \
+        if benchmark_config['mode'] == "e2e" else 0
 
     total_nodes = ctx_nodes + gen_nodes
     total_tasks = total_nodes * gpus_per_node
@@ -427,9 +448,10 @@ def submit_job(config, log_dir, dry_run):
             load_balancer_config = yaml.safe_load(f)
     eplb_num_slots = load_balancer_config.get('num_slots', 0)
 
-    # Get mtp_size from gen config's speculative_config
+    # Get mtp_size from gen config's speculative_config. Leave it unset when
+    # max_draft_len is omitted so auto-MTP runs are not mislabeled as mtp0.
     mtp_size = worker_config['gen'].get('speculative_config',
-                                        {}).get('num_nextn_predict_layers', 0)
+                                        {}).get('max_draft_len')
 
     # Create base log directory path
     if 'log_dir' in env_config and env_config['log_dir']:
@@ -440,11 +462,13 @@ def submit_job(config, log_dir, dry_run):
         date_prefix = datetime.now().strftime("%Y%m%d-%H%M%S")
         log_base = os.path.join(log_base, f"{date_prefix}/{isl}-{osl}")
 
+        mtp_suffix = "" if mtp_size is None else f"_mtp{mtp_size}"
+
         # Determine directory suffix based on attention_dp
         if gen_enable_attention_dp:
-            dir_suffix = f"disagg_ctx{ctx_num}_gen{gen_num}_dep{gen_tp_size}_batch{gen_batch_size}_eplb{eplb_num_slots}_mtp{mtp_size}"
+            dir_suffix = f"disagg_ctx{ctx_num}_gen{gen_num}_dep{gen_tp_size}_batch{gen_batch_size}_eplb{eplb_num_slots}{mtp_suffix}"
         else:
-            dir_suffix = f"disagg_ctx{ctx_num}_gen{gen_num}_tep{gen_tp_size}_batch{gen_batch_size}_eplb{eplb_num_slots}_mtp{mtp_size}"
+            dir_suffix = f"disagg_ctx{ctx_num}_gen{gen_num}_tep{gen_tp_size}_batch{gen_batch_size}_eplb{eplb_num_slots}{mtp_suffix}"
 
         # Create full log directory path
         log_dir = os.path.join(log_base, dir_suffix)

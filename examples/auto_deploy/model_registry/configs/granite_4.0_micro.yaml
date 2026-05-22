@@ -1,0 +1,9 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Configuration for granite-4.0-micro (and similar GraniteMoeHybrid models)
+# Uses flashinfer attention backend (trtllm backend produces garbled output).
+attn_backend: flashinfer
+max_batch_size: 16
+kv_cache_config:
+  free_gpu_memory_fraction: 0.5

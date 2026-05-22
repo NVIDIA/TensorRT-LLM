@@ -1,3 +1,17 @@
+# SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """
 Quantization Config Reader Registry.
 
@@ -11,7 +25,12 @@ import os
 from abc import ABC, abstractmethod
 from typing import Any, Callable, Dict, Optional, Tuple, Type
 
-from tensorrt_llm._torch.auto_deploy.utils.logger import ad_logger
+from tensorrt_llm.quantization.modelopt_config import (
+    is_modelopt_quant_config,
+    read_modelopt_quant_config,
+)
+
+from ..utils.logger import ad_logger
 
 
 class QuantConfigReader(ABC):
@@ -96,12 +115,16 @@ class ModelOPTQuantConfigReader(QuantConfigReader):
     DEFAULT_KV_CACHE_DTYPE = "fp8"
 
     def read_config(self, config: Dict) -> Dict:
-        producer = config.get("producer", {}).get("name")
-        # sanity check
-        if producer != "modelopt":
-            raise ValueError(f"Expected producer 'modelopt', got '{producer}'")
-
-        quant_config = config.get("quantization", {})
+        # Accept either modelopt shape: legacy (producer.name == "modelopt"
+        # with a "quantization" wrapper) or flat (quant_method == "modelopt").
+        if not is_modelopt_quant_config(config):
+            raise ValueError(
+                "Expected a modelopt quant config "
+                f"(producer={config.get('producer')}, "
+                f"quant_method={config.get('quant_method')})"
+            )
+        # Downstream auto-deploy transforms operate on the legacy field names.
+        quant_config = read_modelopt_quant_config(config)
 
         quant_algo = quant_config.get("quant_algo", "").upper()
 

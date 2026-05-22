@@ -1,0 +1,50 @@
+# Dynamo-replica: agg-round-robin DeepSeek-V3.2 FP4 TRT-LLM deployment.
+#
+# Source (upstream Dynamo recipe):
+#   https://github.com/ai-dynamo/dynamo/tree/main/recipes/deepseek-v32-fp4/trtllm/agg-round-robin
+
+metadata:
+  model_name: deepseek_v32_fp4
+  supported_gpus:
+  - GB200
+hardware:
+  gpus_per_node: 4
+server_configs:
+  - name: "dsv32_fp4_dep8_trtllm_lpc_mnnvl_8k1k"
+    model_name: "deepseek_v32_fp4"
+    tensor_parallel_size: 8
+    moe_expert_parallel_size: 8
+    pipeline_parallel_size: 1
+    max_batch_size: 8
+    max_num_tokens: 8192
+    max_seq_len: 121000
+    attn_backend: "TRTLLM"
+    enable_attention_dp: true
+    enable_chunked_prefill: true
+    disable_overlap_scheduler: true
+    allreduce_strategy: MNNVL
+    num_postprocess_workers: 8
+    print_iter_log: true
+    stream_interval: 10
+    moe_config:
+      backend: 'TRTLLM'
+      use_low_precision_moe_combine: true
+    cuda_graph_config:
+      enable_padding: true
+      max_batch_size: 8
+    kv_cache_config:
+      dtype: 'fp8'
+      enable_block_reuse: false
+      free_gpu_memory_fraction: 0.9
+      tokens_per_block: 64
+    cache_transceiver_config:
+      backend: UCX
+      max_tokens_in_buffer: 120000
+    client_configs:
+      - name: "con4_iter10_8k1k"
+        concurrency: 4
+        iterations: 10
+        isl: 8192
+        osl: 1024
+        backend: "openai"
+        dataset_file: <dataset_file>

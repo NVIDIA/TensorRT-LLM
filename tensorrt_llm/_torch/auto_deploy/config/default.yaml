@@ -1,3 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 # This is the set of transforms running in "graph" mode. In this mode, we capture the full graph
 # of the model and optimize it for inference.
 transforms:
@@ -61,10 +76,6 @@ transforms:
   # RUN TRANSFORMATIONS ON STANDARDIZED GRAPH REPRESENTATION
   ############################################################################################
   eliminate_redundant_transposes:
-    stage: pattern_matcher
-  # TODO (lucaslie): let's move this to perf optimization once TP sharding is improved
-  # see https://github.com/NVIDIA/TensorRT-LLM/pull/3668#discussion_r2052714528
-  optimize_rope:
     stage: pattern_matcher
   quantize_int4_linear_from_config:
     stage: pattern_matcher
@@ -160,9 +171,6 @@ transforms:
   fuse_fp8_gemms:
     stage: post_load_fusion
     enabled: false # TODO: https://github.com/NVIDIA/TensorRT-LLM/issues/4674 this is causing OOMs
-  fuse_silu_mul:
-    stage: post_load_fusion
-    enabled: true
   fuse_fp8_linear:
     stage: post_load_fusion
     backend: trtllm
@@ -214,6 +222,10 @@ transforms:
   fuse_l2norm:
     stage: post_load_fusion
     backend: fla
+  fuse_silu_mul:
+    stage: post_load_fusion
+    enabled: true
+    backend: flashinfer
   fuse_swiglu:
     stage: post_load_fusion
     enabled: false
@@ -232,6 +244,19 @@ transforms:
     stage: post_load_fusion
     # TODO: fix https://github.com/NVIDIA/TensorRT-LLM/issues/9878 to enable by default
     enabled: false
+  # fuse_rope_into_trtllm_attention runs BEFORE optimize_rope, matching
+  # torch_rope_* IR ops directly (not flashinfer_rope).  Both are at
+  # post_load_fusion (after weight_load) so buffers are real tensors.
+  # DCE after fuse_rope removes dead rope nodes; optimize_rope then
+  # handles remaining torch_rope_* for non-trtllm backends.
+  fuse_rope_into_trtllm_attention:
+    stage: post_load_fusion
+    enabled: false
+  fuse_rope_into_trtllm_mla:
+    stage: post_load_fusion
+    enabled: false
+  optimize_rope:
+    stage: post_load_fusion
   ############################################################################################
   # VISUALIZE GRAPH
   ############################################################################################
@@ -288,6 +313,9 @@ transforms:
     stage: compile
     enabled: false
   multi_stream_gemm:
+    stage: compile
+    enabled: false
+  cleanup_identity_dtype_cast:
     stage: compile
     enabled: false
   compile_model:

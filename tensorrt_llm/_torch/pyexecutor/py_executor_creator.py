@@ -36,7 +36,7 @@ from ..virtual_memory import scope as virtual_memory_scope
 from ._util import (KvCacheCreator, _adjust_torch_mem_fraction,
                     create_py_executor_instance, instantiate_sampler, is_mla,
                     validate_feature_combination)
-from .config_utils import is_nemotron_hybrid, is_qwen3_hybrid
+from .config_utils import is_hybrid_linear
 from .connectors.kv_cache_connector import KvCacheConnectorManager
 from .dwdp import DwdpManager
 from .guided_decoder import CapturableGuidedDecoder, GuidedDecoder
@@ -225,11 +225,82 @@ def get_guided_decoding_config(guided_decoding_backend: str,
     return guided_decoding_config
 
 
+def _load_config_and_create_checkpoint_loader(
+        llm_args: TorchLlmArgs, checkpoint_dir: Optional[str] = None):
+    torch.cuda.set_per_process_memory_fraction(1.0)
+    checkpoint_loader = _construct_checkpoint_loader(
+        llm_args.backend,
+        llm_args.checkpoint_loader,
+        llm_args.checkpoint_format,
+        mx_config=llm_args.mx_config,
+        mx_model_name=llm_args.model,
+    )
+    llm_args = ModelLoader.load_config_and_apply_defaults(
+        checkpoint_dir, llm_args, checkpoint_loader)
+    return llm_args, checkpoint_loader
+
+
+def create_encoder_executor(
+    llm_args: TorchLlmArgs,
+    checkpoint_dir: Optional[str] = None,
+):
+    """Create an EncoderExecutor for models using the encode-only path.
+
+    Handles model loading and model_engine creation, then wraps in a
+    lightweight EncoderExecutor. Skips all decoder infrastructure
+    (KV cache, scheduler, sampler, drafter, speculative decoding).
+
+    Args:
+        llm_args: Configuration arguments.
+        checkpoint_dir: Path to model checkpoint.
+
+    Returns:
+        An EncoderExecutor instance ready for batch_forward() calls.
+    """
+    from .encoder_executor import EncoderExecutor
+
+    llm_args, checkpoint_loader = _load_config_and_create_checkpoint_loader(
+        llm_args, checkpoint_dir)
+
+    mapping = _get_mapping(llm_args.parallel_config.to_mapping())
+    dist = Distributed.get(mapping)
+
+    model_engine = PyTorchModelEngine(
+        model_path=checkpoint_dir,
+        llm_args=llm_args,
+        mapping=mapping,
+        dist=dist,
+        spec_config=None,
+        checkpoint_loader=checkpoint_loader,
+    )
+
+    return EncoderExecutor(
+        model_engine=model_engine,
+        dist=dist,
+    )
+
+
+def log_memory_usage(stage: str):
+    GB = 1 << 30
+    torch.cuda.empty_cache()
+    torch.cuda.reset_peak_memory_stats()
+    end, total_gpu_memory = torch.cuda.mem_get_info()
+    total_used_bytes = total_gpu_memory - end
+    model_bytes = torch.cuda.memory_stats()["allocated_bytes.all.current"]
+    logger.info(
+        f"Memory used at {stage} (inside torch) in memory usage profiling: {model_bytes / (GB):.2f} GiB"
+    )
+    logger.info(
+        f"Memory used at {stage} (outside torch) in memory usage profiling: {((total_used_bytes - model_bytes) if total_used_bytes > model_bytes else 0) / (GB):.2f} GiB"
+    )
+
+
 def create_py_executor(
     llm_args: TorchLlmArgs,
     checkpoint_dir: Optional[str] = None,
     tokenizer: Optional[TokenizerBase] = None,
     profiling_stage_data: Optional[dict] = None,
+    resource_governor_queue=None,
 ) -> PyExecutor:
     """Create and initialize a PyExecutor instance from the given LLM arguments.
 
@@ -244,19 +315,17 @@ def create_py_executor(
         tokenizer: Optional tokenizer instance. If None, loaded from checkpoint.
         profiling_stage_data: Optional dict for collecting per-stage memory
             profiling data during executor construction.
+        resource_governor_queue: Optional queue for resource governor
+            requests. When provided, it is installed before the worker thread
+            starts so all ranks observe the same collective sequence.
 
     Returns:
         A fully initialized PyExecutor instance.
     """
 
     skip_est = os.environ.get("TRTLLM_SKIP_KV_CACHE_ESTIMATION", '0') == '1'
-    torch.cuda.set_per_process_memory_fraction(1.0)
-    # Apply model-specific defaults early, before destructuring llm_args fields
-    checkpoint_loader = _construct_checkpoint_loader(llm_args.backend,
-                                                     llm_args.checkpoint_loader,
-                                                     llm_args.checkpoint_format)
-    llm_args = ModelLoader.load_config_and_apply_defaults(
-        checkpoint_dir, llm_args, checkpoint_loader)
+    llm_args, checkpoint_loader = _load_config_and_create_checkpoint_loader(
+        llm_args, checkpoint_dir)
 
     garbage_collection_gen0_threshold = llm_args.garbage_collection_gen0_threshold
     lora_config = llm_args.lora_config
@@ -377,6 +446,14 @@ def create_py_executor(
         has_draft_model_engine = spec_config.spec_dec_mode.has_draft_model()
         has_spec_drafter = spec_config.spec_dec_mode.has_spec_drafter()
 
+        # Eagle3DecodingConfig._max_batch_size is internally managed: the
+        # dynamic-tree worker pre-allocates batch-indexed CUDA buffers sized
+        # by this value, and runtime indexes them with no bounds check. It
+        # MUST equal the global max_batch_size to avoid OOB; we populate it
+        # here as the single source of truth.
+        if hasattr(spec_config, '_max_batch_size'):
+            spec_config._max_batch_size = max_batch_size
+
         # WAR for https://nvbugs/5807902
         # Disable separate draft KV cache in disaggregated mode
         # Enable separate pool for None DI + Non-KVBM and Aggregated + KVBM
@@ -461,15 +538,16 @@ def create_py_executor(
 
                 def drafting_loop_wrapper(model):
                     from tensorrt_llm._torch.speculative.drafting_loops import (
-                        LinearDraftingLoopWrapper, TreeDraftingLoopWrapper)
+                        LinearDraftingLoopWrapper,
+                        StaticTreeDraftingLoopWrapper)
                     from tensorrt_llm.llmapi import EagleDecodingConfig
 
-                    use_tree_drafter = isinstance(
+                    static_tree_drafter = isinstance(
                         draft_spec_config, EagleDecodingConfig
-                    ) and not draft_spec_config.is_linear_tree
+                    ) and draft_spec_config.eagle_choices is not None
 
-                    if use_tree_drafter:
-                        return TreeDraftingLoopWrapper(
+                    if static_tree_drafter:
+                        return StaticTreeDraftingLoopWrapper(
                             spec_config.max_draft_len,
                             spec_config.tokens_per_gen_step - 1, max_batch_size,
                             model)
@@ -545,16 +623,29 @@ def create_py_executor(
         cache_transceiver_config.max_tokens_in_buffer = net_max_seq_len
 
     config = model_engine.model.model_config.pretrained_config
-    if (is_nemotron_hybrid(config)
-            or is_qwen3_hybrid(config)) and kv_cache_config.enable_block_reuse:
+    if is_hybrid_linear(config) and kv_cache_config.enable_block_reuse and (
+            cache_transceiver_config is not None
+            and cache_transceiver_config.backend is not None):
         logger.warning(
-            "Disabling block reuse for MambaHybridCacheManager-based models")
+            "Disabling block reuse for MambaHybridCacheManager-based models when disagg is enabled"
+        )
         kv_cache_config.enable_block_reuse = False
         _set_model_engines_cache_reuse([model_engine, draft_model_engine],
                                        False)
     if is_mla(config):
         if model_engine.model.model_config.enable_flash_mla:
             tokens_per_block = 64
+            # Propagate the override back to kv_cache_config so any consumer
+            # that later reads llm_args.kv_cache_config.tokens_per_block sees
+            # the effective value. KvCacheConnectorScheduler subclasses
+            # (LMCache, Dynamo KVBM) are instantiated further down via
+            # scheduler_cls(llm_args) and size their block pools from
+            # llm_args.kv_cache_config.tokens_per_block. Without this the
+            # connector's block size desynced from the KVCacheManager's
+            # actual tokens_per_block (user-set or default 32 vs. FlashMLA's
+            # forced 64), producing a frozen cache_block_ids view to the
+            # connector and silently-corrupted decode KV (#13320).
+            kv_cache_config.tokens_per_block = tokens_per_block
             logger.info(
                 f"Change tokens_per_block to: {tokens_per_block} for using FlashMLA"
             )
@@ -604,6 +695,10 @@ def create_py_executor(
                                 int] = (chunking_policy, chunk_unit_size)
     else:
         ctx_chunk_config = None
+
+    if kv_cache_config.enable_block_reuse and is_hybrid_linear(config):
+        ctx_chunk_config = (ContextChunkingPolicy.FORCE_CHUNK,
+                            kv_cache_config.mamba_state_cache_interval)
 
     guided_decoder: Optional[GuidedDecoder] = None
     if guided_decoding_config is not None:
@@ -669,6 +764,11 @@ def create_py_executor(
                 "KV connector is not supported with VSWA (Variable Sliding Window Attention)."
             )
 
+        if mapping.enable_attention_dp:
+            raise NotImplementedError(
+                "KV connector is not supported with attention data parallelism (enable_attention_dp=True)."
+            )
+
         try:
             module = importlib.import_module(
                 kv_connector_config.connector_module)
@@ -726,9 +826,20 @@ def create_py_executor(
 
         is_disagg = (cache_transceiver_config is not None
                      and cache_transceiver_config.backend is not None)
-        is_hybrid = is_nemotron_hybrid(config) or is_qwen3_hybrid(config)
+        is_hybrid = is_hybrid_linear(config)
 
         if is_disagg and is_hybrid:
+            # NOTE: TRTLLM_USE_PY_MAMBA is an agg-mode-only override and has
+            # no effect in disagg. The disagg manager choice is driven solely
+            # by transceiver_runtime: PYTHON => PythonMambaCacheManager,
+            # otherwise CppMambaCacheManager. Clear the var here so the
+            # mutual-exclusion check in use_cpp_mamba_cache_manager() does
+            # not fire after we force TRTLLM_USE_CPP_MAMBA=1 below.
+            if os.environ.pop("TRTLLM_USE_PY_MAMBA", "0") == "1":
+                logger.warning(
+                    "TRTLLM_USE_PY_MAMBA is ignored in disaggregated serving; "
+                    "use cache_transceiver_config.transceiver_runtime='PYTHON' "
+                    "to select PythonMambaCacheManager.")
             if cache_transceiver_config.transceiver_runtime != "PYTHON" or os.environ.get(
                     "TRTLLM_USE_CPP_MAMBA") == "1":
                 logger.info("Disaggregated serving with hybrid model detected. "
@@ -760,7 +871,11 @@ def create_py_executor(
             execution_stream=execution_stream,
             draft_config=draft_config,
             skip_est=skip_est,
+            is_disagg=is_disagg,
         )
+
+        if not skip_est:
+            log_memory_usage("after loading weights")
 
         estimating_kv_cache = kv_cache_creator.try_prepare_estimation()
 
@@ -817,6 +932,7 @@ def create_py_executor(
             garbage_collection_gen0_threshold=garbage_collection_gen0_threshold,
             kv_connector_manager=kv_connector_manager
             if not estimating_kv_cache else None,
+            resource_governor_queue=resource_governor_queue,
             max_seq_len=max_seq_len,
             max_batch_size=max_batch_size,
             max_beam_width=max_beam_width,
@@ -846,6 +962,16 @@ def create_py_executor(
                 py_executor.kv_cache_transceiver.shutdown()
         finally:
             kv_cache_creator.teardown_managers(resources)
+
+        # Release Phase-1 CUDA graph pools before final KV allocation to avoid overshoot.
+        for eng in [model_engine, draft_model_engine]:
+            if eng is None:
+                continue
+            if eng.attn_metadata is not None:
+                if llm_args.cuda_graph_config is not None:
+                    eng._release_cuda_graphs()
+                eng.attn_metadata = None
+
         del py_executor  # free before constructing new
         gc.collect()
 
@@ -860,13 +986,6 @@ def create_py_executor(
             max_seq_len = kv_cache_creator._max_seq_len
             update_sampler_max_seq_len(max_seq_len, sampler)
 
-            for eng in [model_engine, draft_model_engine]:
-                if eng is None:
-                    continue
-                if eng.attn_metadata is not None:
-                    if llm_args.cuda_graph_config is not None:
-                        eng._release_cuda_graphs()
-                    eng.attn_metadata = None
         with allocation_scope(ExecutorMemoryType.EXTRA_RESOURCES):
 
             # run gc.collect() to free memory of the previous py_executor, avoid cudaFree overlap with cuda graph capture
@@ -886,6 +1005,7 @@ def create_py_executor(
                 garbage_collection_gen0_threshold=
                 garbage_collection_gen0_threshold,
                 kv_connector_manager=kv_connector_manager,
+                resource_governor_queue=resource_governor_queue,
                 max_seq_len=max_seq_len,
                 max_batch_size=max_batch_size,
                 max_beam_width=max_beam_width,

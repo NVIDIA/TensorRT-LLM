@@ -30,19 +30,20 @@ TensorRT-LLM **VisualGen** provides a unified inference stack for diffusion mode
 | `Wan-AI/Wan2.1-I2V-14B-720P-Diffusers` | Image-to-Video |
 | `Wan-AI/Wan2.2-T2V-A14B-Diffusers` | Text-to-Video |
 | `Wan-AI/Wan2.2-I2V-A14B-Diffusers` | Image-to-Video |
+| `Wan-AI/Wan2.2-TI2V-5B-Diffusers` | Text-to-Video, Image-to-Video |
 | `Lightricks/LTX-2` | Text-to-Video (with Audio), Image-to-Video (with Audio) |
 
 Models are auto-detected from the checkpoint directory. Diffusers-format models are detected via `model_index.json`; LTX-2 monolithic safetensors checkpoints are detected via embedded metadata. The `AutoPipeline` registry selects the appropriate pipeline class automatically.
 
 ### Feature Matrix
 
-| Model | FP8 blockwise | NVFP4 | TeaCache | CFG Parallelism | Ulysses Parallelism | Parallel VAE | CUDA Graph | torch.compile | trtllm-serve |
-|---|---|---|---|---|---|---|---|---|---|
-| **FLUX.1** | Yes | Yes | Yes | No [^1] | Yes | No | Yes | Yes | Yes |
-| **FLUX.2** | Yes | Yes | Yes | No [^1] | Yes | No | Yes | Yes | Yes |
-| **Wan 2.1** | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes |
-| **Wan 2.2** | Yes | Yes | No | Yes | Yes | Yes | Yes | Yes | Yes |
-| **LTX-2** | Yes | Yes | No | Yes | Yes | No | No | Yes | Yes |
+| Model | FP8 blockwise | NVFP4 | TeaCache | CFG Parallelism | Ulysses Parallelism | Parallel VAE | CUDA Graph | torch.compile | trtllm-serve | Attention2D | Ring Attention |
+|---|---|---|---|---|---|---|---|---|---|--|--|
+| **FLUX.1** | Yes | Yes | Yes | No [^1] | Yes | No | Yes | Yes | Yes | Yes | Yes |
+| **FLUX.2** | Yes | Yes | Yes | No [^1] | Yes | No | Yes | Yes | Yes | Yes | Yes |
+| **Wan 2.1** | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes |
+| **Wan 2.2** | Yes | Yes | No | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes |
+| **LTX-2** | Yes | Yes | No | Yes | Yes | No | No | Yes | Yes | Yes | Yes |
 
 [^1]: FLUX models use embedded guidance and do not have a separate negative prompt path, so CFG parallelism is not applicable.
 
@@ -112,13 +113,14 @@ TeaCache caches transformer outputs when timestep embeddings change slowly betwe
 
 ### Multi-GPU Parallelism
 
-Two parallelism modes can be combined:
+5 parallelism modes can be combined:
 
 - **CFG Parallelism** (`--cfg_size 2`): Splits positive/negative guidance prompts across GPUs.
 - **Ulysses Parallelism** (`--ulysses_size N`): Splits the sequence dimension across GPUs for longer sequences.
-
-Total GPU count = `cfg_size * ulysses_size`.
-
+- **Parallel VAE** (`--parallel_vae_size N`): Shards the final VAE decode along a spatial axis across GPUs, useful to reduce VAE latency and improve GPU utilization (Constraint: `parallel_vae_size ≤ world_size`). Currently only supported for WAN models.
+- **Attention Parallel**: There are 2 methods supported to run attention parallel. Both of these methods require the attention backend to support LSE (only FA4 currently) - 
+    - **Attention2D Parallelism** (`--attn2d_row_size N`, `--attn2d_col_size M`): Shards the sequence axis across a 2D `N x M` device mesh, all-gathering Q along rows and K/V along columns so each rank computes a sub-block of the attention matrix (total CP degree = `N * M`; not currently combinable with Ulysses).
+    - **Ring Attention Parallelism** (`--ring_size N`): Shards the sequence axis across a 1D ring of `N` ranks and streams K/V blocks around the ring so each rank computes its attention output without materializing the full K/V (mutually exclusive with Attention2D).
 ## Developer Guide
 
 ### Architecture Overview

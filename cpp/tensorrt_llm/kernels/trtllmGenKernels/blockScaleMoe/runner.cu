@@ -21,7 +21,6 @@
 #include "tensorrt_llm/kernels/trtllmGenKernels/batchedGemm/KernelRunner.h"
 #include "tensorrt_llm/kernels/trtllmGenKernels/batchedGemm/trtllmGen_bmm_export/trtllm/gen/DtypeDecl.h"
 #include "tensorrt_llm/kernels/trtllmGenKernels/batchedGemm/trtllmGen_bmm_export/trtllm/gen/SfLayoutDecl.h"
-#include <iostream>
 #include <tensorrt_llm/common/assert.h>
 #include <tensorrt_llm/common/envUtils.h>
 
@@ -67,7 +66,8 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
     int32_t* expandedIdxToPermutedIdx, int32_t* permutedIdxToExpandedIdx, int32_t* permutedIdxToTokenIdx,
     void* expertWeights, int32_t* expertIds, int32_t* numTokensPerExpert, int32_t* ctaIdxXyToBatchIdx,
     int32_t* ctaIdxXyToMnLimit, int32_t* numNonExitingCtas, btg::Dtype dtypeElt, bool useRoutingScalesOnInput,
-    bool useDeepSeekFp8, RoutingMethodType routingMethodType, cudaStream_t stream, btg::Dtype dtypeRoutingLogits)
+    bool useDeepSeekFp8, RoutingMethodType routingMethodType, cudaStream_t stream, btg::Dtype dtypeRoutingLogits,
+    btg::Dtype dtypeRoutingBias)
 {
     if (routingMethodType == RoutingMethodType::DeepSeekV3 && nGroup <= 1)
     {
@@ -85,9 +85,7 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
         routingData.mPreprocessType = moe::dev::routing::RoutingPreprocessType::SigmoidBias;
         routingData.mPostprocessType = moe::dev::routing::RoutingPostprocessType::ScaledSumNormalize;
         routingData.mPtrRoutingBias = routingBias;
-        // Bias is always bfloat16 in the current Runner::run() API (no separate bias dtype param).
-        // The bias buffer dtype is determined by the caller (thop), not by the routing logits dtype.
-        routingData.mDtypeBias = btg::Dtype::Bfloat16;
+        routingData.mDtypeBias = dtypeRoutingBias;
         routingData.mRouteScale = routedScalingFactor;
 
         // Pass-through raw pointer; kernels will cast to the proper InputT based on routing method
@@ -190,8 +188,7 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
         routingData.mPreprocessType = moe::dev::routing::RoutingPreprocessType::SigmoidBias;
         routingData.mPostprocessType = moe::dev::routing::RoutingPostprocessType::ScaledSumNormalize;
         routingData.mPtrRoutingBias = routingBias;
-        // Bias is always bfloat16 in the current Runner::run() API (no separate bias dtype param).
-        routingData.mDtypeBias = btg::Dtype::Bfloat16;
+        routingData.mDtypeBias = dtypeRoutingBias;
         routingData.mRouteScale = 1.0f;
         routingData.mSumEpsilon = 1e-20f;
 
@@ -252,8 +249,7 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
 
         // input:
         routingData.mPtrRoutingBias = routingBias;
-        // Bias is always bfloat16 in the current Runner::run() API (no separate bias dtype param).
-        routingData.mDtypeBias = btg::Dtype::Bfloat16;
+        routingData.mDtypeBias = dtypeRoutingBias;
         // Pass-through raw pointer; kernels will cast to the proper InputT based on routing method
         routingData.mPtrScores = expertIds == nullptr ? routingLogits : nullptr;
         routingData.mPtrTopKIds = expertIds;
@@ -410,17 +406,14 @@ tensorrt_llm::kernels::TrtllmGenBatchedGemmRunnerOptions getOptions(
 
     if (is_gated_activation)
     {
-
-        options = {// Swap A and B dtypes because transposeMmaOutput is hardcoded to true
-            .dtypeA = dtypeWeights,
-            .dtypeB = dtypeAct,
+        options = {.dtypeA = dtypeAct,
+            .dtypeB = dtypeWeights,
             .dtypeC = dtypeAct,
             .actType = actType,
             .deepSeekFp8 = useDeepSeekFp8,
             .fusedAct = !useDeepSeekFp8,
             .routeAct = true,
             .staticBatch = false,
-            .transposeMmaOutput = true,
             .tileSize = tileTokensDim,
             .epilogueTileM = useDeepSeekFp8 ? 64 : 128};
     }
@@ -434,15 +427,14 @@ tensorrt_llm::kernels::TrtllmGenBatchedGemmRunnerOptions getOptions(
         case ActType::Silu: eltwiseActType = EltwiseActType::Silu; break;
         }
         options = {
-            .dtypeA = dtypeWeights,
-            .dtypeB = dtypeAct,
+            .dtypeA = dtypeAct,
+            .dtypeB = dtypeWeights,
             .dtypeC = dtypeAct,
             .eltwiseActType = eltwiseActType,
             .deepSeekFp8 = useDeepSeekFp8,
             .fusedAct = false,
             .routeAct = true,
             .staticBatch = false,
-            .transposeMmaOutput = true,
             .tileSize = tileTokensDim,
             .epilogueTileM = 128,
         };
@@ -537,19 +529,16 @@ namespace Gemm2
 tensorrt_llm::kernels::TrtllmGenBatchedGemmRunnerOptions getOptions(
     btg::Dtype dtypeAct, btg::Dtype dtypeWeights, btg::Dtype dtypeOut, int32_t tileTokensDim, bool useDeepSeekFp8)
 {
-    tensorrt_llm::kernels::TrtllmGenBatchedGemmRunnerOptions options
-        = {// Swap A and B dtypes because transposeMmaOutput is hardcoded to true
-            .dtypeA = dtypeWeights,
-            .dtypeB = dtypeAct,
-            .dtypeC = dtypeOut,
-            .eltwiseActType = EltwiseActType::None,
-            .deepSeekFp8 = useDeepSeekFp8,
-            .fusedAct = false,
-            .routeAct = false,
-            .staticBatch = false,
-            .transposeMmaOutput = true,
-            .tileSize = tileTokensDim,
-            .epilogueTileM = useDeepSeekFp8 ? 64 : 128};
+    tensorrt_llm::kernels::TrtllmGenBatchedGemmRunnerOptions options = {.dtypeA = dtypeAct,
+        .dtypeB = dtypeWeights,
+        .dtypeC = dtypeOut,
+        .eltwiseActType = EltwiseActType::None,
+        .deepSeekFp8 = useDeepSeekFp8,
+        .fusedAct = false,
+        .routeAct = false,
+        .staticBatch = false,
+        .tileSize = tileTokensDim,
+        .epilogueTileM = useDeepSeekFp8 ? 64 : 128};
     return options;
 }
 

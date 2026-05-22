@@ -1,4 +1,9 @@
-# Copyright (c) 2025-2026, NVIDIA CORPORATION. All rights reserved.
+# Copyright 2018 The HuggingFace Team
+# Licensed under the Apache License, Version 2.0.
+# Original source: https://github.com/huggingface/transformers
+#
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 
 """Qwen3.5 MoE model for auto_deploy (text + vision).
 
@@ -40,19 +45,22 @@ from transformers.modeling_outputs import BaseModelOutputWithPooling
 from transformers.modeling_utils import PreTrainedModel
 from transformers.utils import ModelOutput
 
-from tensorrt_llm._torch.auto_deploy.custom_ops.attention_interface import BatchInfo
-from tensorrt_llm._torch.auto_deploy.models.factory import ModelFactoryRegistry
-from tensorrt_llm._torch.auto_deploy.models.hf import (
+from ...custom_ops.attention_interface import BatchInfo
+from ..factory import ModelFactoryRegistry
+from ..hf import (
     AutoModelForCausalLMFactory,
     AutoModelForImageTextToTextFactory,
     TextModelExportInfo,
 )
-from tensorrt_llm.inputs.multimodal import MultimodalInput, apply_mm_hashes, hexdigest_to_int32
-from tensorrt_llm.inputs.utils import VideoData
 
-# =============================================================================
-# Configuration
-# =============================================================================
+try:
+    from tensorrt_llm.inputs.multimodal import MultimodalInput, apply_mm_hashes, hexdigest_to_int32
+    from tensorrt_llm.inputs.utils import VideoData
+except ModuleNotFoundError:
+    MultimodalInput = None
+    apply_mm_hashes = None
+    hexdigest_to_int32 = None
+    VideoData = None
 
 
 class Qwen3_5MoeTextConfig(PretrainedConfig):
@@ -752,9 +760,46 @@ class Qwen3_5MoeTextModel(Qwen3_5MoePreTrainedModel):
         self.norm = Qwen3_5MoeRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.rotary_emb = Qwen3_5MoeTextRotaryEmbedding(config=config)
         self.lm_head = None  # set by parent model via set_lm_head()
+        self._register_load_state_dict_pre_hook(
+            self._remap_checkpoint_hierarchy_for_exported_text_model, with_module=True
+        )
 
         # Initialize weights and apply final processing
         self.post_init()
+
+    @staticmethod
+    def _remap_checkpoint_hierarchy_for_exported_text_model(_module, state_dict, prefix, *args):
+        """Remap checkpoint keys when the text model is loaded under a different export root.
+
+        Qwen3.5-35B is used in two AD paths:
+        - full-model export, where the text model is nested under ``model.language_model``
+        - text-submodule export, where the same text model becomes the exported root
+
+        The HF checkpoint keeps text weights under ``model.language_model.*`` but keeps
+        ``lm_head.weight`` at the top level. Normalize both cases into the hierarchy expected
+        by the currently loading module before the more specific module/sharding hooks run.
+        """
+        checkpoint_text_prefix = "model.language_model."
+        keys_to_process = list(state_dict.keys())
+        num_text_keys_remapped = 0
+        for key in keys_to_process:
+            if not key.startswith(checkpoint_text_prefix):
+                continue
+
+            remapped_key = prefix + key[len(checkpoint_text_prefix) :]
+            if remapped_key == key:
+                continue
+
+            state_dict[remapped_key] = state_dict[key]
+            state_dict.pop(key)
+            num_text_keys_remapped += 1
+
+        checkpoint_lm_head_key = "lm_head.weight"
+        remapped_lm_head_key = prefix + checkpoint_lm_head_key
+        if checkpoint_lm_head_key in state_dict and remapped_lm_head_key != checkpoint_lm_head_key:
+            if remapped_lm_head_key not in state_dict:
+                state_dict[remapped_lm_head_key] = state_dict[checkpoint_lm_head_key]
+            state_dict.pop(checkpoint_lm_head_key)
 
     def set_lm_head(self, lm_head: nn.Module):
         """Set the lm_head from the parent model."""
@@ -821,7 +866,7 @@ class Qwen3_5MoeTextModel(Qwen3_5MoePreTrainedModel):
 class Qwen3_5MoeForCausalLM(Qwen3_5MoePreTrainedModel, GenerationMixin):
     """Qwen3.5 MoE causal language model (text model + lm_head)."""
 
-    _tied_weights_keys = ["lm_head.weight"]
+    _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
 
     def __init__(self, config: Qwen3_5MoeTextConfig, **kwargs):
         super().__init__(config)
@@ -1676,17 +1721,17 @@ def qwen3_mrope_delta_with_cache(
     num_seq = num_prefill + num_decode
     out = torch.zeros((num_seq, 1), dtype=torch.int32, device=mrope_delta_cache.device)
     video_grid_norm = _normalize_video_grid_for_mrope(video_grid_thw)
-    if num_prefill > 0:
-        has_mm_metadata = all(
-            arg is not None
-            for arg in (
-                mm_item_cu_seqlen,
-                mm_item_types,
-                mm_token_lengths,
-                mm_special_offsets_cu_seqlen,
-                mm_special_offsets,
-            )
+    has_mm_metadata = all(
+        arg is not None
+        for arg in (
+            mm_item_cu_seqlen,
+            mm_item_types,
+            mm_token_lengths,
+            mm_special_offsets_cu_seqlen,
+            mm_special_offsets,
         )
+    )
+    if num_prefill > 0:
         if has_mm_metadata:
             img_idx = 0
             vid_idx = 0
@@ -2582,9 +2627,21 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3_5MoePreTrainedModel):
         )
         # Share lm_head with the text model so it's inside the exported graph
         self.model.language_model.set_lm_head(self.lm_head)
+        self._register_load_state_dict_pre_hook(
+            self._mirror_lm_head_weight_into_text_alias, with_module=True
+        )
 
         # Initialize weights and apply final processing
         self.post_init()
+
+    @staticmethod
+    def _mirror_lm_head_weight_into_text_alias(_module, state_dict, prefix, *args):
+        """Mirror top-level ``lm_head.weight`` into the nested text-model alias before load."""
+
+        source_key = prefix + "lm_head.weight"
+        alias_key = prefix + "model.language_model.lm_head.weight"
+        if source_key in state_dict and alias_key not in state_dict:
+            state_dict[alias_key] = state_dict[source_key]
 
     def get_input_embeddings(self):
         return self.model.language_model.get_input_embeddings()
@@ -2880,8 +2937,8 @@ class Qwen3_5MoeFactory(AutoModelForImageTextToTextFactory):
 # Registration
 # =============================================================================
 
-AutoConfig.register("qwen3_5_moe", Qwen3_5MoeConfig)
-AutoConfig.register("qwen3_5_moe_text", Qwen3_5MoeTextConfig)
+AutoConfig.register("qwen3_5_moe", Qwen3_5MoeConfig, exist_ok=True)
+AutoConfig.register("qwen3_5_moe_text", Qwen3_5MoeTextConfig, exist_ok=True)
 
 AutoModelForCausalLMFactory.register_custom_model_cls("Qwen3_5MoeTextConfig", Qwen3_5MoeForCausalLM)
 AutoModelForCausalLMFactory.register_custom_model_cls(

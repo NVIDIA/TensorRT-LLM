@@ -26,6 +26,22 @@ include(sanitizers)
 
 project(tensorrt_llm LANGUAGES CXX)
 
+# Single source of truth for the inline ABI namespace. Read by both the C++ side
+# (via tensorrt_llm/common/config.h's `#ifndef TRTLLM_ABI_NAMESPACE` guard) and
+# the cubin INCBIN aggregator (cpp/cmake/modules/ tllm_cubin_archive.cmake bakes
+# the same value into Itanium-mangled linker names). Override at configure time
+# with `-DTRTLLM_ABI_NAMESPACE=_v2` to ship a parallel ABI version that won't
+# collide at static-link time. The compile definition propagates to every C++ TU
+# under this directory so the macro expansion stays in sync with the CMake
+# variable.
+set(TRTLLM_ABI_NAMESPACE
+    "_v1"
+    CACHE
+      STRING
+      "Inline namespace used to version the TRT-LLM ABI (see tensorrt_llm/common/config.h)."
+)
+add_compile_definitions(TRTLLM_ABI_NAMESPACE=${TRTLLM_ABI_NAMESPACE})
+
 # Build options
 option(BUILD_PYT "Build in PyTorch TorchScript class mode" ON)
 option(BUILD_TESTS "Build Google tests" ON)
@@ -226,8 +242,9 @@ set(CMAKE_CUDA_USE_RESPONSE_FILE_FOR_INCLUDES 0)
 find_library(RT_LIB rt)
 
 if(ENABLE_MULTI_DEVICE)
-  # NCCL dependencies
-  find_package(NCCL 2 REQUIRED)
+  # NCCL dependencies NCCL >= 2.29 is required for NCCLWindowAllocator used
+  # unconditionally in allreduceOp.cpp
+  find_package(NCCL 2.29 REQUIRED)
   set(NCCL_LIB NCCL::nccl)
 endif()
 
@@ -322,15 +339,19 @@ if(UNIX)
   set(CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG} -g -O0 -fno-inline")
 endif()
 
-# Note: The following are desirable settings that should be enabled if we
-# decrease shared library size. See e.g.
-# https://github.com/rapidsai/cudf/pull/6134 for a similar issue in another
-# project.
-
-# set(CMAKE_CUDA_FLAGS_RELWITHDEBINFO "${CMAKE_CUDA_FLAGS_RELWITHDEBINFO}
-# --generate-line-info")
-
-# set(CMAKE_CUDA_FLAGS_DEBUG "${CMAKE_CUDA_FLAGS_DEBUG} -G")
+# Emit CUDA line info for Debug and RelWithDebInfo so nsys/ncu can map samples
+# back to source. This inflates section sizes significantly, so building these
+# configurations for all CUDA architectures at once will fail to link --
+# build_wheel.py enforces that a specific --cuda_architectures must be passed in
+# that case. Note: full device debug info (-G) is intentionally NOT enabled by
+# default for Debug -- it can make ptxas memory usage explode on some kernels
+# and get OOM-killed in CI. Developers who need cuda-gdb stepping can opt in via
+# `build_wheel.py --extra-cmake-vars CMAKE_CUDA_FLAGS_DEBUG=-G` on a host with
+# enough memory for ptxas.
+# cmake-format: off
+set(CMAKE_CUDA_FLAGS_RELWITHDEBINFO "${CMAKE_CUDA_FLAGS_RELWITHDEBINFO} --generate-line-info")
+set(CMAKE_CUDA_FLAGS_DEBUG "${CMAKE_CUDA_FLAGS_DEBUG} --generate-line-info")
+# cmake-format: on
 
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -DBUILD_SYSTEM=cmake_oss ")
 

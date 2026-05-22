@@ -2771,6 +2771,8 @@ repos:
             .*\.vscode/.*\.json | # vscode files can take comments
             .*\.devcontainer/.*\.json # devcontainer json files can take comments
           )$
+    -   id: file-contents-sorter
+        files: ^tests/integration/test_lists/waives\.txt$
 -   repo: https://github.com/PyCQA/autoflake
     rev: v2.3.1
     hooks:
@@ -2846,6 +2848,11 @@ repos:
         entry: ./scripts/check_test_list.py --check-duplicate-waives
         language: script
         pass_filenames: false
+    -   id: validate-test-lists
+        name: Validate test list entries exist in source files (AST)
+        entry: ./scripts/check_test_list.py --validate
+        language: script
+        pass_filenames: false
     -   id: DCO check
         name: Checks the commit message for a developer certificate of origin signature
         entry: ./scripts/dco_check.py
@@ -2856,6 +2863,20 @@ repos:
         entry: ./scripts/check_pinned_memory_usage.py
         language: script
         files: ^(tensorrt_llm|triton_backend)/.*\.py$
+    -   id: auto-deploy-import-discipline
+        name: Enforce relative imports inside auto_deploy
+        entry: python scripts/check_auto_deploy_imports.py
+        language: python
+        files: ^tensorrt_llm/_torch/auto_deploy/.*\.py$
+    -   id: check-skill-naming-convention
+        name: Check Claude Code skill naming convention
+        entry: python scripts/check_skill_naming_convention.py
+        language: python
+        additional_dependencies:
+        - PyYAML
+        pass_filenames: false
+        files: >-
+          ^(\.claude/skills/[^/]+/SKILL\.md|\.claude/agents/.*\.md|scripts/check_skill_naming_convention\.py)$
     -   id:  type-check
         name: Run static analysis of type correctness using mypy
         entry: scripts/run_mypy.sh

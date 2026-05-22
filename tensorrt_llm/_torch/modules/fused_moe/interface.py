@@ -51,7 +51,9 @@ from ...pyexecutor.dwdp import get_global_dwdp_manager
 from ...utils import (ActivationType, AuxStreamType, Fp4QuantizedTensor,
                       get_model_extra_attrs, is_gated_activation,
                       is_torch_compiling)
-from .routing import BaseMoeRoutingMethod
+from .routing import (BaseMoeRoutingMethod, RoutingMethodType,
+                      get_cached_perfect_router_logits,
+                      precompute_common_perfect_router_logits)
 
 
 class MoEWeightLoadingMode(Enum):
@@ -75,6 +77,30 @@ class AlltoallMethodType(IntEnum):
     DeepEP = 3
     # DeepEP low latency: CUDA Graphs are supported, IBGDA is required
     DeepEPLowLatency = 4
+
+
+class MoESchedulerKind(Enum):
+    """Selects which forward-execution scheduler ConfigurableMoE picks for a backend.
+
+    Backends declare this via the ``scheduler_kind`` class attribute on
+    ``MoE``. ``ConfigurableMoE`` reads it once at init time to construct the
+    matching scheduler and to gate communication-strategy creation.
+
+    The axis is whether the cross-rank EP exchange is fused into the MoE
+    kernel or is a separate host-orchestrated step:
+
+    - ``EXTERNAL_COMM``: comm lives outside the MoE kernel boundary; the
+      scheduler issues ``Communication.dispatch`` / ``Communication.combine``
+      from the host with per-chunk EPLB hooks and optional multi-stream
+      chunk overlap (Cutlass, DeepGemm, CuteDSL, DenseGEMM, TRTLLMGen).
+    - ``FUSED_COMM``: comm is fused into the backend's fused kernel via
+      NVLink SymmBuffer (DeepGEMM ``fp8_fp4_mega_moe``). No host comm;
+      lockstep chunk launches; EPLB statistic update with
+      ``ignore_allreduce=False``.
+    """
+
+    EXTERNAL_COMM = "external_comm"
+    FUSED_COMM = "fused_comm"
 
 
 def extract_extra_attrs(layer_idx: str):
@@ -168,6 +194,11 @@ class MoE(nn.Module):
         aux_stream_dict (Optional[Dict[AuxStreamType, torch.cuda.Stream]]): Auxiliary CUDA streams for overlapping.
     """
 
+    # Default scheduler kind for ConfigurableMoE forward dispatch. Backends
+    # whose fused kernel owns cross-rank exchange (e.g. MegaMoE-style)
+    # override this to ``MoESchedulerKind.FUSED_COMM``.
+    scheduler_kind: MoESchedulerKind = MoESchedulerKind.EXTERNAL_COMM
+
     @classmethod
     @abstractmethod
     def can_implement(
@@ -251,6 +282,9 @@ class MoE(nn.Module):
 
         # could be modified later
         self.quant_config = model_config.quant_config
+        self.force_dynamic_quantization = getattr(model_config,
+                                                  'force_dynamic_quantization',
+                                                  False)
 
         self.cluster_rank = model_config.mapping.moe_cluster_rank
         self.cluster_size = model_config.mapping.moe_cluster_size
@@ -309,6 +343,7 @@ class MoE(nn.Module):
 
         # Override expert layout if DWDP is enabled
         self._init_dwdp_expert_layout()
+        self._init_perfect_router()
 
     def _init_dwdp_expert_layout(self):
         """Override expert layout when DWDP is enabled."""
@@ -330,6 +365,43 @@ class MoE(nn.Module):
         self.slot_end = self.slot_start + self.expert_size_per_partition
         self.initial_local_expert_ids = list(
             range(self.slot_start, self.slot_end))
+
+    def _get_perfect_router_dtype(self) -> torch.dtype:
+        if self.routing_method.routing_method_type in (
+                RoutingMethodType.DeepSeekV3, RoutingMethodType.MiniMax2):
+            return torch.float32
+        return self.dtype if self.dtype is not None else torch.float32
+
+    def _init_perfect_router(self):
+        self._enable_perfect_router = os.environ.get("ENABLE_PERFECT_ROUTER",
+                                                     "0") == "1"
+        if not self._enable_perfect_router:
+            return
+
+        precompute_common_perfect_router_logits(
+            num_experts=self.num_experts,
+            experts_per_token=self.routing_method.experts_per_token,
+            moe_ep_size=self.ep_size,
+            dtype=self._get_perfect_router_dtype(),
+            routing_method=self.routing_method,
+            ep_rank=self.ep_rank)
+
+    def _maybe_get_perfect_router_logits(
+            self,
+            router_logits: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+        if router_logits is None or not self._enable_perfect_router:
+            return router_logits
+
+        num_tokens, num_experts = router_logits.shape
+        return get_cached_perfect_router_logits(
+            num_tokens=num_tokens,
+            num_experts=num_experts,
+            experts_per_token=self.routing_method.experts_per_token,
+            moe_ep_size=self.ep_size,
+            ep_rank=self.ep_rank,
+            device=router_logits.device,
+            dtype=router_logits.dtype,
+            routing_method=self.routing_method)
 
     def _init_load_balancer(
         self,
@@ -442,6 +514,18 @@ class MoE(nn.Module):
         Subclasses can override this to indicate load balancer support.
         """
         return False
+
+    def validate_configurable_moe(self, moe: "nn.Module") -> None:
+        """Backend-specific validation hook called by ``ConfigurableMoE``.
+
+        ``ConfigurableMoE.validate_backend`` invokes this AFTER the generic
+        EPLB/load-balancer compatibility check, so backends may inspect
+        ``moe.num_slots``, ``moe.ep_size``, ``moe._using_load_balancer()``,
+        ``moe._using_dynamic_load_balancer()``. Default is a no-op; backends
+        with extra constraints (e.g. fused-comm backends rejecting
+        dynamic EPLB) override this.
+        """
+        del moe
 
     def _using_load_balancer(self) -> bool:
         """Check if this MoE is using load balancer."""
@@ -768,6 +852,7 @@ class MoE(nn.Module):
         use_dp_padding: Optional[bool] = None,
         **kwargs,
     ) -> Union[torch.Tensor, List[torch.Tensor]]:
+        router_logits = self._maybe_get_perfect_router_logits(router_logits)
         if self.register_to_config and is_torch_compiling():
             hidden_states = x.fp4_tensor if isinstance(
                 x, Fp4QuantizedTensor) else x

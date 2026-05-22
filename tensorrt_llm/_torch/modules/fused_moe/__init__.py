@@ -18,13 +18,13 @@ from .routing import (BaseMoeRoutingMethod, DeepSeekV3MoeRoutingMethod,
                       RenormalizeNaiveMoeRoutingMethod, RoutingMethodType,
                       SigmoidRenormMoeRoutingMethod,
                       SparseMixerMoeRoutingMethod, StaticMoeRoutingMethod,
-                      create_renormalize_expert_load_balanced_logits)
+                      create_load_balanced_logits)
 
 # yapf: enable
 
 __all__ = [
     "BaseMoeRoutingMethod",
-    "create_renormalize_expert_load_balanced_logits",
+    "create_load_balanced_logits",
     "create_moe",
     "CuteDslFusedMoE",
     "CutlassFusedMoE",

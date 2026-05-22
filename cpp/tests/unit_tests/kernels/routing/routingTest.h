@@ -499,8 +499,15 @@ struct RoutingKernelTestParam
             }
         }
 
-        // Set singleClusterTokenNum
-        if (routingMethod == RoutingMethodType::DeepSeekV3)
+        // Set singleClusterTokenNum — the threshold above which expert counts are guaranteed to be written.
+        // Post-topK paths (useTopKAsInput/useTopKPackedAsInput) use the larger cluster capacity
+        // (NumBlocksPerCluster * NumThreads = 8192) since they don't do warp-per-token topK computation.
+        // Scores paths use the smaller capacity (NumBlocksPerCluster * NumWarps = 256 for custom, 1024 for DeepSeek).
+        if (useTopKAsInput || useTopKPackedAsInput)
+        {
+            singleClusterTokenNum = 8192;
+        }
+        else if (routingMethod == RoutingMethodType::DeepSeekV3)
         {
             singleClusterTokenNum = 1024;
         }
@@ -599,6 +606,8 @@ protected:
 
     virtual void setupBuffers(RoutingKernelTestParam const& param);
 
+    void verifyResult(RoutingKernelTestParam const& param);
+
     inline int32_t computeLog2(int32_t val, std::string const& name = "")
     {
         int32_t n = val;
@@ -642,10 +651,6 @@ protected:
         routingData.mPtrNumNonExitingCtas = bufferCast<int32_t>(*mPtrNumNonExitingCtasDevice);
     }
 
-private:
-    void verifyResult(RoutingKernelTestParam const& param);
-
-protected:
     std::shared_ptr<tensorrt_llm::runtime::BufferManager> mBufferManager;
     std::shared_ptr<tensorrt_llm::runtime::CudaStream> mStream;
     TensorPtr mCurandStatesDevice;

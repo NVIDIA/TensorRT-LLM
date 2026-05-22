@@ -1,3 +1,17 @@
+# SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """A demo LLM api to for debugging and testing purposes of e2e workflows."""
 
 import gc
@@ -8,12 +22,16 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 import torch
 import torch.multiprocessing as mp
 
-from ....executor import GenerationExecutor
-from ....executor.request import GenerationRequest
-from ....executor.result import CompletionOutput, GenerationResult
-from ....inputs.multimodal import MultimodalParams
-from ....sampling_params import SamplingParams
-from ...pyexecutor.sampling_utils import greedy_search_sampling_batch, top_k_sampling_batch
+from tensorrt_llm._torch.pyexecutor.sampling_utils import (
+    greedy_search_sampling_batch,
+    top_k_sampling_batch,
+)
+from tensorrt_llm.executor import GenerationExecutor
+from tensorrt_llm.executor.request import GenerationRequest
+from tensorrt_llm.executor.result import CompletionOutput, GenerationResult
+from tensorrt_llm.inputs.multimodal import MultimodalParams
+from tensorrt_llm.sampling_params import SamplingParams
+
 from ..distributed import common as dist_ad
 from ..utils.logger import ad_logger
 from .ad_executor import ADEngine
@@ -202,6 +220,7 @@ class DemoEngine(ADEngine):
                 cache_loc=cache_loc,
                 cu_num_pages=cu_num_pages,
                 slot_idx=list(range(batch_size)),
+                prompt_lens=total_lens,
             )
 
             # nest new tokens and run stop check

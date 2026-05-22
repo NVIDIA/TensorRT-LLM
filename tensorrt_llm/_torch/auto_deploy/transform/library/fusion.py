@@ -1,4 +1,17 @@
-import operator
+# SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 from abc import ABC, abstractmethod
 from collections import defaultdict
 from functools import lru_cache, partial
@@ -21,6 +34,7 @@ from ...utils.node_utils import (
     is_linear_op,
     is_op,
 )
+from ...utils.quantization_utils import ensure_tma_col_major
 from ..interface import BaseTransform, SharedConfig, TransformInfo, TransformRegistry
 
 
@@ -35,7 +49,7 @@ def _insert_fused_gemm(
 
     Args:
         allow_not_contigous: If True, split output via torch.narrow (zero-copy view).
-            If False, split via torch.split + .contiguous() (independent copies).
+            If False, split via torch.narrow + .contiguous() (independent contiguous copies).
 
     # before fusion:
     w1 = out1 x in,  w2 = out2 x in
@@ -50,7 +64,8 @@ def _insert_fused_gemm(
     # after fusion (allow_not_contigous=False):
     w = (out1+out2) x in
     y = x @ w.T
-    y1, y2 = split(y)                   # contiguous copies
+    y1 = y.narrow(-1, 0, out1).contiguous()    # contiguous copy
+    y2 = y.narrow(-1, out1, out2).contiguous()  # contiguous copy
     """
     keys_unfused = [extract_weight_name(n) for n in linear_nodes]
     params_unfused = [gm.get_parameter(k) for k in keys_unfused]
@@ -72,6 +87,7 @@ def _insert_fused_gemm(
     )
 
     fused_kwargs = dict(linear_nodes[0].kwargs)
+    ref_val = linear_nodes[0].meta.get("val")
 
     with gm.graph.inserting_before(linear_nodes[0]):
         get_param_node = gm.graph.get_attr(key_fused, torch.Tensor)
@@ -82,29 +98,33 @@ def _insert_fused_gemm(
             args=(parent_node, get_param_node, None),
             kwargs=fused_kwargs,
         )
+        if ref_val is not None:
+            fused_out_shape = (*ref_val.shape[:-1], sum(sizes_unfused))
+            fused_linear_node.meta["val"] = torch.empty(
+                fused_out_shape, dtype=ref_val.dtype, device="meta"
+            )
 
-    if allow_not_contigous:
-        offset = 0
-        for i, n in enumerate(linear_nodes):
-            size = sizes_unfused[i]
-            with gm.graph.inserting_before(n):
-                narrow_node = gm.graph.call_function(
-                    torch.narrow, args=(fused_linear_node, -1, offset, size)
+    offset = 0
+    for i, n in enumerate(linear_nodes):
+        size = sizes_unfused[i]
+        with gm.graph.inserting_before(n):
+            narrow_node = gm.graph.call_function(
+                torch.narrow, args=(fused_linear_node, -1, offset, size)
+            )
+            if ref_val is not None:
+                narrow_node.meta["val"] = torch.empty(
+                    (*ref_val.shape[:-1], size), dtype=ref_val.dtype, device="meta"
                 )
-            n.replace_all_uses_with(narrow_node)
-            offset += size
-    else:
-
-        def split_output(tensor: torch.Tensor) -> Tuple[torch.Tensor, ...]:
-            return tuple(t.contiguous() for t in torch.split(tensor, sizes_unfused, dim=-1))
-
-        with gm.graph.inserting_before(linear_nodes[0]):
-            split_node = gm.graph.call_function(split_output, args=(fused_linear_node,))
-
-        for i, n in enumerate(linear_nodes):
-            with gm.graph.inserting_before(n):
-                get_split_node = gm.graph.call_function(operator.getitem, args=(split_node, i))
-            n.replace_all_uses_with(get_split_node)
+            if allow_not_contigous:
+                n.replace_all_uses_with(narrow_node)
+            else:
+                contig_node = gm.graph.call_method("contiguous", args=(narrow_node,))
+                if ref_val is not None:
+                    contig_node.meta["val"] = torch.empty(
+                        (*ref_val.shape[:-1], size), dtype=ref_val.dtype, device="meta"
+                    )
+                n.replace_all_uses_with(contig_node)
+        offset += size
 
     # Clean up deleted modules to save GPU memory
     eliminate_dead_code(gm)
@@ -170,7 +190,7 @@ class QuantizationFusionMixin(ABC):
 
         Args:
             allow_not_contigous: If True, split output via torch.narrow (zero-copy view).
-                If False, split via torch.split + .contiguous() (independent copies).
+                If False, split via torch.narrow + .contiguous() (independent contiguous copies).
         """
         keys_unfused = [extract_weight_name(n) for n in linear_nodes]
         params_unfused = [gm.get_parameter(k) for k in keys_unfused]
@@ -196,7 +216,7 @@ class QuantizationFusionMixin(ABC):
         for name, buf in buffers_fused.items():
             gm.register_buffer(f"{key_fused}_{name}", buf)
 
-        ad_logger.warning(
+        ad_logger.debug(
             f"Fusing {len(linear_nodes)} quantized GEMMs ({keys_unfused}) into {key_fused}"
         )
 
@@ -233,33 +253,27 @@ class QuantizationFusionMixin(ABC):
                     fused_out_shape, dtype=ref_val.dtype, device="meta"
                 )
 
-        if allow_not_contigous:
-            offset = 0
-            for i, n in enumerate(linear_nodes):
-                size = sizes_unfused[i]
-                with gm.graph.inserting_before(n):
-                    narrow_node = gm.graph.call_function(
-                        torch.narrow, args=(fused_linear_node, -1, offset, size)
+        offset = 0
+        for i, n in enumerate(linear_nodes):
+            size = sizes_unfused[i]
+            with gm.graph.inserting_before(n):
+                narrow_node = gm.graph.call_function(
+                    torch.narrow, args=(fused_linear_node, -1, offset, size)
+                )
+                if ref_val is not None:
+                    narrow_node.meta["val"] = torch.empty(
+                        (*ref_val.shape[:-1], size), dtype=ref_val.dtype, device="meta"
                     )
+                if allow_not_contigous:
+                    n.replace_all_uses_with(narrow_node)
+                else:
+                    contig_node = gm.graph.call_method("contiguous", args=(narrow_node,))
                     if ref_val is not None:
-                        narrow_node.meta["val"] = torch.empty(
+                        contig_node.meta["val"] = torch.empty(
                             (*ref_val.shape[:-1], size), dtype=ref_val.dtype, device="meta"
                         )
-                n.replace_all_uses_with(narrow_node)
-                offset += size
-        else:
-
-            def split_output(tensor: torch.Tensor) -> Tuple[torch.Tensor, ...]:
-                """Split the output tensor of the fused linear node to obtain the original outputs."""
-                return tuple(t.contiguous() for t in torch.split(tensor, sizes_unfused, dim=-1))
-
-            with gm.graph.inserting_before(linear_nodes[0]):
-                split_node = gm.graph.call_function(split_output, args=(fused_linear_node,))
-
-            for i, n in enumerate(linear_nodes):
-                with gm.graph.inserting_before(n):
-                    get_split_node = gm.graph.call_function(operator.getitem, args=(split_node, i))
-                n.replace_all_uses_with(get_split_node)
+                    n.replace_all_uses_with(contig_node)
+            offset += size
 
         # Clean up deleted modules to save GPU memory
         eliminate_dead_code(gm)
@@ -453,7 +467,7 @@ class FuseGemmsMixedChildren(BaseTransform):
             skipped=False,
             num_matches=num_matches,
             is_clean=num_matches == 0,
-            has_valid_shapes=num_matches == 0,
+            has_valid_shapes=True,
         )
         return gm, info
 
@@ -589,7 +603,9 @@ class FuseFineGrainedFP8Gemms(QuantizationFusionMixin, BaseTransform):
             )
 
         fused_weights = torch.cat(weights, dim=0)
+
         fused_weight_scale_inv = torch.cat(weight_scale_inv, dim=0)
+        fused_weight_scale_inv = ensure_tma_col_major(fused_weight_scale_inv)
 
         return fused_weights, {"weight_scale_inv": fused_weight_scale_inv}
 

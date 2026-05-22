@@ -23,7 +23,6 @@ from enum import Enum
 from typing import TYPE_CHECKING, Any, Optional
 
 import torch
-import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 from tqdm import tqdm
@@ -33,6 +32,7 @@ from tensorrt_llm._torch.modules.mlp import MLP
 from tensorrt_llm._torch.visual_gen.attention_backend.utils import create_attention
 from tensorrt_llm._torch.visual_gen.modules.attention import Attention, QKVMode
 from tensorrt_llm._torch.visual_gen.quantization.loader import DynamicLinearWeightLoader
+from tensorrt_llm._torch.visual_gen.utils import SequenceSharder
 from tensorrt_llm.logger import logger
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
@@ -48,6 +48,7 @@ from .ltx2_core.transformer_args import (
     TransformerArgsPreprocessor,
 )
 from .ltx2_core.utils_ltx2 import rms_norm
+from .text_cache import TextCache
 
 if TYPE_CHECKING:
     from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
@@ -131,6 +132,8 @@ class LTX2Attention(Attention):
                 num_kv_heads=self.num_key_value_heads,
                 quant_config=self.quant_config,
                 dtype=self.dtype,
+                attention_config=config.attention,
+                attention_metadata_state=config.attention_metadata_state,
             )
             self._has_dual_attn = True
 
@@ -292,13 +295,12 @@ class BasicAVTransformerBlock(nn.Module):
         self.idx = idx
         self.norm_eps = norm_eps
 
-        self._use_ulysses = False
-        self._audio_is_sharded = False
+        # Per-block sharder: mirrors the root sharder's topology so the block
+        # can run cross-attention all-gathers independently.  Head-divisibility
+        # is checked once at the root model — skip num_heads here.
         vgm = config.visual_gen_mapping if config is not None else None
-        if vgm is not None and vgm.ulysses_size > 1:
-            self._use_ulysses = True
-            self._ulysses_size = vgm.ulysses_size
-            self._ulysses_pg = vgm.ulysses_group
+        self._sharder = SequenceSharder.from_vgm(vgm)
+        self._audio_is_sharded = False
 
         if video is not None:
             self._init_video_modules(video, rope_type, norm_eps, config, idx)
@@ -459,20 +461,19 @@ class BasicAVTransformerBlock(nn.Module):
 
     def _sp_all_gather(self, x: torch.Tensor, dim: int = 1) -> torch.Tensor:
         """All-gather *x* along *dim* across sequence-parallel ranks."""
-        x = x.contiguous()
-        gathered = [torch.empty_like(x) for _ in range(self._ulysses_size)]
-        dist.all_gather(gathered, x, group=self._ulysses_pg)
-        return torch.cat(gathered, dim=dim)
+        return self._sharder.gather(x, dim=dim)
 
     def _sp_gather_pe(self, pe):
-        """All-gather RoPE (cos, sin) tuple along the sequence dim."""
+        """All-gather RoPE (cos, sin) tuple along its sequence dim.
+
+        Split RoPE is ``[B, H, S, D]`` (dim 2); interleaved RoPE is
+        ``[B, S, D]`` (dim 1).  Inferred from ``cos.ndim``.
+        """
         if pe is None:
             return None
         cos, sin = pe
-        # Split RoPE: [B, H, S, D] — sequence at dim 2
-        # Interleaved RoPE: [B, S, D] — sequence at dim 1
         seq_dim = 2 if cos.ndim == 4 else 1
-        return (self._sp_all_gather(cos, dim=seq_dim), self._sp_all_gather(sin, dim=seq_dim))
+        return (self._sharder.gather(cos, dim=seq_dim), self._sharder.gather(sin, dim=seq_dim))
 
     # -- Forward -------------------------------------------------------------
 
@@ -481,12 +482,17 @@ class BasicAVTransformerBlock(nn.Module):
         video: TransformerArgs | None,
         audio: TransformerArgs | None,
         perturbations=None,
+        text_kv_video: tuple[torch.Tensor, torch.Tensor] | None = None,
+        text_kv_audio: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> tuple[TransformerArgs | None, TransformerArgs | None]:
         """Forward with optional perturbation masking for STG.
 
         Args:
             perturbations: Optional ``BatchedPerturbationConfig`` that masks
                 attention outputs for selected blocks/modalities.
+            text_kv_video: Pre-projected (K, V) for video text cross-attention.
+                Falls back to inline computation if ``None``.
+            text_kv_audio: Pre-projected (K, V) for audio text cross-attention.
         """
         if video is None and audio is None:
             raise ValueError("At least one of video or audio must be provided")
@@ -525,6 +531,7 @@ class BasicAVTransformerBlock(nn.Module):
             vx = vx + self.attn2(
                 rms_norm(vx, eps=self.norm_eps),
                 context=video.context,
+                pre_projected_kv=text_kv_video,
             )
             del vshift_msa, vscale_msa, vgate_msa
 
@@ -549,6 +556,7 @@ class BasicAVTransformerBlock(nn.Module):
             ax = ax + self.audio_attn2(
                 rms_norm(ax, eps=self.norm_eps),
                 context=audio.context,
+                pre_projected_kv=text_kv_audio,
             )
             del ashift_msa, ascale_msa, agate_msa
 
@@ -628,7 +636,7 @@ class BasicAVTransformerBlock(nn.Module):
 
                 # Project-before-gather (video → audio direction).
                 k_v2a, v_v2a = self.video_to_audio_attn.project_kv(vx_scaled)
-                if self._use_ulysses:
+                if self._sharder.is_active:
                     k_v2a = self._sp_all_gather(k_v2a)
                     v_v2a = self._sp_all_gather(v_v2a)
                     k_pe_v2a = self._sp_gather_pe(video.cross_positional_embeddings)
@@ -704,6 +712,14 @@ class LTX2CacheDiTPattern0BlockWrapper(nn.Module):
             aa: Optional[TransformerArgs] = replace(aa_src, x=encoder_hidden_states)
         else:
             aa = aa_src
+        # Cache-DiT's CachedBlocks iterates all inner blocks with the same kwargs,
+        # so looking up per-block text_kv via inner.idx is required — passing
+        # text_kv via the outer loop would feed every block block-0's KV.
+        idx = inner_mod.idx
+        v_kv_list = getattr(p, "_cache_dit_v_kv", None)
+        a_kv_list = getattr(p, "_cache_dit_a_kv", None)
+        kwargs.setdefault("text_kv_video", v_kv_list[idx] if v_kv_list else None)
+        kwargs.setdefault("text_kv_audio", a_kv_list[idx] if a_kv_list else None)
         out_v, out_a = inner_mod(video=va, audio=aa, perturbations=perturbations, **kwargs)
         return (
             out_v.x if out_v is not None else None,
@@ -811,33 +827,33 @@ class LTXModel(nn.Module):
         self._init_preprocessors(cross_pe_max_pos)
 
         vgm = model_config.visual_gen_mapping
-        primary_heads = (
-            num_attention_heads if model_type.is_video_enabled() else audio_num_attention_heads
+        # Validate video-head divisibility through the factory; audio heads
+        # are checked separately because the factory only accepts one count.
+        self._sharder = SequenceSharder.from_vgm(
+            vgm,
+            num_attention_heads=num_attention_heads if model_type.is_video_enabled() else None,
         )
-        ulysses_size = vgm.ulysses_size if vgm else 1
-        if ulysses_size > 1 and primary_heads % ulysses_size != 0:
+        self._cp_size = vgm.cp_size if vgm is not None else 1
+        self._ulysses_size = vgm.ulysses_size if vgm is not None else 1
+        if (
+            self._sharder.is_active
+            and vgm is not None
+            and vgm.ulysses_size > 1
+            and model_type.is_audio_enabled()
+            and audio_num_attention_heads % vgm.ulysses_size != 0
+        ):
             raise ValueError(
-                f"num_attention_heads ({primary_heads}) must be divisible by "
-                f"ulysses_size ({ulysses_size})"
+                f"audio_num_attention_heads ({audio_num_attention_heads}) "
+                f"must be divisible by dit_ulysses_size ({vgm.ulysses_size})"
             )
-        self.use_ulysses = ulysses_size > 1
-        self.ulysses_size = ulysses_size
-        self.ulysses_pg = vgm.ulysses_group if vgm else None
-        self.ulysses_rank = vgm.ulysses_rank if vgm else 0
-        # Audio is sharded by Ulysses only when its sequence length is
-        # divisible by ulysses_size (checked at runtime in forward).
-        # Head divisibility is validated here since the attention backend
-        # is created at init with sharded head counts.
-        if self.use_ulysses and model_type.is_audio_enabled():
-            if audio_num_attention_heads % self.ulysses_size != 0:
-                raise ValueError(
-                    f"audio_num_attention_heads ({audio_num_attention_heads}) "
-                    f"must be divisible by ulysses_size ({self.ulysses_size})"
-                )
 
         self._audio_is_sharded = False
         self._cache_dit_video_args: Optional[TransformerArgs] = None
         self._cache_dit_audio_args: Optional[TransformerArgs] = None
+        # Per-block text cross-attn KV lists, looked up by inner.idx in the
+        # Pattern_0 wrapper. Set once per forward in the Cache-DiT path.
+        self._cache_dit_v_kv: Optional[list] = None
+        self._cache_dit_a_kv: Optional[list] = None
 
         self._init_transformer_blocks(
             num_layers=num_layers,
@@ -1123,49 +1139,47 @@ class LTXModel(nn.Module):
             ]
         self.transformer_blocks = nn.ModuleList(blocks)
 
-    # -- Ulysses sequence sharding / gathering --------------------------------
+    # -- Sequence sharding / gathering ----------------------------------------
 
     def _shard_transformer_args(self, args: TransformerArgs) -> TransformerArgs:
-        """Shard sequence-dependent fields of *args* for Ulysses."""
+        """Shard sequence-dependent fields of *args* across sequence-parallel ranks.
+
+        Fields whose dim-1 doesn't match ``args.x``'s sequence length are passed
+        through unchanged (broadcast-compatible scalars, etc.).
+        """
         seq_len = args.x.shape[1]
-        chunk = seq_len // self.ulysses_size
-        s = self.ulysses_rank * chunk
-        e = s + chunk
-
-        def _shard(t):
-            if t is None or t.ndim < 2 or t.shape[1] != seq_len:
-                return t
-            return t[:, s:e]
-
-        def _shard_pe(pe):
-            if pe is None:
-                return None
-            cos, sin = pe
-            if cos.ndim == 4 and cos.shape[2] == seq_len:
-                # Split RoPE: [B, H, S, D] — sequence dim at index 2
-                return (cos[:, :, s:e], sin[:, :, s:e])
-            elif cos.ndim == 3 and cos.shape[1] == seq_len:
-                # Interleaved RoPE: [B, S, D] — sequence dim at index 1
-                return (cos[:, s:e], sin[:, s:e])
-            return pe
-
+        sh = self._sharder
+        pe_seq_dim = (
+            2
+            if args.positional_embeddings is not None and args.positional_embeddings[0].ndim == 4
+            else 1
+        )
+        cross_pe_seq_dim = (
+            2
+            if args.cross_positional_embeddings is not None
+            and args.cross_positional_embeddings[0].ndim == 4
+            else 1
+        )
         return replace(
             args,
-            x=args.x[:, s:e],
-            timesteps=_shard(args.timesteps),
-            embedded_timestep=_shard(args.embedded_timestep),
-            positional_embeddings=_shard_pe(args.positional_embeddings),
-            cross_positional_embeddings=_shard_pe(args.cross_positional_embeddings),
-            cross_scale_shift_timestep=_shard(args.cross_scale_shift_timestep),
-            cross_gate_timestep=_shard(args.cross_gate_timestep),
+            x=sh.shard(args.x, dim=1),
+            timesteps=sh.shard(args.timesteps, dim=1, expected_seq_len=seq_len),
+            embedded_timestep=sh.shard(args.embedded_timestep, dim=1, expected_seq_len=seq_len),
+            positional_embeddings=sh.shard_rope(
+                args.positional_embeddings, seq_len=seq_len, seq_dim=pe_seq_dim
+            ),
+            cross_positional_embeddings=sh.shard_rope(
+                args.cross_positional_embeddings, seq_len=seq_len, seq_dim=cross_pe_seq_dim
+            ),
+            cross_scale_shift_timestep=sh.shard(
+                args.cross_scale_shift_timestep, dim=1, expected_seq_len=seq_len
+            ),
+            cross_gate_timestep=sh.shard(args.cross_gate_timestep, dim=1, expected_seq_len=seq_len),
         )
 
     def _gather_sequence(self, x: torch.Tensor) -> torch.Tensor:
         """All-gather hidden states along the sequence dim."""
-        x = x.contiguous()
-        gathered = [torch.empty_like(x) for _ in range(self.ulysses_size)]
-        dist.all_gather(gathered, x, group=self.ulysses_pg)
-        return torch.cat(gathered, dim=1)
+        return self._sharder.gather(x, dim=1)
 
     def configure_audio_ulysses(self, audio_seq_len: int) -> None:
         """Configure whether audio uses Ulysses based on sequence length.
@@ -1174,11 +1188,19 @@ class LTXModel(nn.Module):
         known.  The decision is cached — ``forward()`` uses it without
         re-checking.
         """
-        if not self.use_ulysses:
+        if not self._sharder.is_active:
             self._audio_is_sharded = False
             return
 
-        self._audio_is_sharded = audio_seq_len % self.ulysses_size == 0
+        is_divisible = (audio_seq_len % self._sharder.size) == 0
+        if not is_divisible and self._cp_size > 1 and self._ulysses_size == 1:
+            raise ValueError(
+                f"audio_seq_len ({audio_seq_len}) must be divisible by seq_size "
+                f"({self._sharder.size}) when CP is active without Ulysses "
+                "(Ring/Attention2D has no plain-attention fallback)."
+            )
+
+        self._audio_is_sharded = is_divisible
         for block in self.transformer_blocks:
             target = block.inner if isinstance(block, LTX2CacheDiTPattern0BlockWrapper) else block
             target._audio_is_sharded = self._audio_is_sharded
@@ -1194,21 +1216,26 @@ class LTXModel(nn.Module):
         multi-rank operation; audio sharding will be reconfigured by
         the next :meth:`configure_audio_ulysses` call.
         """
-        if self.ulysses_size <= 1:
+        if self._sharder.size <= 1:
             return
 
-        self.use_ulysses = enabled
-        if not enabled:
+        if enabled:
+            self._sharder.enable()
+        else:
+            self._sharder.disable()
             self._audio_is_sharded = False
 
         for block in self.transformer_blocks:
-            block._use_ulysses = enabled
-            if not enabled:
-                block._audio_is_sharded = False
-            if hasattr(block, "attn1"):
-                block.attn1.set_ulysses_active(enabled)
-            if hasattr(block, "audio_attn1") and not enabled:
-                block.audio_attn1.set_ulysses_active(False)
+            target = block.inner if isinstance(block, LTX2CacheDiTPattern0BlockWrapper) else block
+            if enabled:
+                target._sharder.enable()
+            else:
+                target._sharder.disable()
+                target._audio_is_sharded = False
+            if hasattr(target, "attn1"):
+                target.attn1.set_ulysses_active(enabled)
+            if hasattr(target, "audio_attn1") and not enabled:
+                target.audio_attn1.set_ulysses_active(False)
 
     # -- Output processing ---------------------------------------------------
 
@@ -1231,11 +1258,58 @@ class LTXModel(nn.Module):
 
     # -- Forward -------------------------------------------------------------
 
+    def prepare_text_cache(
+        self,
+        *,
+        video_context: torch.Tensor | None = None,
+        video_context_mask: torch.Tensor | None = None,
+        video_positions: torch.Tensor | None = None,
+        audio_context: torch.Tensor | None = None,
+        audio_context_mask: torch.Tensor | None = None,
+        audio_positions: torch.Tensor | None = None,
+        dtype: torch.dtype,
+    ) -> TextCache:
+        """Compute step-invariant preprocessor outputs and text KV projections.
+
+        Called once before the denoise loop.  The returned ``TextCache``
+        is passed to ``forward()`` on every step.  Does not require latent
+        data — only text context, positions, and dtype are needed.
+        """
+        v_ctx = v_mask = v_pe = v_cross_pe = v_kv = None
+        a_ctx = a_mask = a_pe = a_cross_pe = a_kv = None
+
+        if video_context is not None:
+            v_ctx, v_mask, v_pe, v_cross_pe = self.video_args_preprocessor.prepare_text_cache(
+                video_context, video_context_mask, video_positions, dtype
+            )
+            v_kv = [block.attn2.project_kv(v_ctx) for block in self.transformer_blocks]
+
+        if audio_context is not None:
+            a_ctx, a_mask, a_pe, a_cross_pe = self.audio_args_preprocessor.prepare_text_cache(
+                audio_context, audio_context_mask, audio_positions, dtype
+            )
+            a_kv = [block.audio_attn2.project_kv(a_ctx) for block in self.transformer_blocks]
+
+        return TextCache(
+            video_context=v_ctx,
+            video_mask=v_mask,
+            video_pe=v_pe,
+            video_cross_pe=v_cross_pe,
+            video_kv=v_kv,
+            audio_context=a_ctx,
+            audio_mask=a_mask,
+            audio_pe=a_pe,
+            audio_cross_pe=a_cross_pe,
+            audio_kv=a_kv,
+        )
+
     def forward(
         self,
         video: Modality | None,
         audio: Modality | None,
         perturbations=None,
+        *,
+        text_cache: TextCache,
     ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
         """Forward pass through the LTX-2 transformer.
 
@@ -1243,6 +1317,8 @@ class LTXModel(nn.Module):
             video: Video modality input (or None).
             audio: Audio modality input (or None).
             perturbations: Optional ``BatchedPerturbationConfig`` for STG.
+            text_cache: Pre-computed step-invariant outputs from ``prepare_text_cache()``.
+                Always required — callers must invoke ``prepare_text_cache()`` first.
 
         Returns:
             Tuple of (video_output, audio_output) velocity predictions.
@@ -1252,42 +1328,75 @@ class LTXModel(nn.Module):
         if not self.model_type.is_audio_enabled() and audio is not None:
             raise ValueError("Audio is not enabled for this model")
 
-        video_args = self.video_args_preprocessor.prepare(video) if video is not None else None
-        audio_args = self.audio_args_preprocessor.prepare(audio) if audio is not None else None
+        video_args = (
+            self.video_args_preprocessor.prepare(
+                video,
+                text_cache.video_context,
+                text_cache.video_mask,
+                text_cache.video_pe,
+                text_cache.video_cross_pe,
+            )
+            if video is not None
+            else None
+        )
+        audio_args = (
+            self.audio_args_preprocessor.prepare(
+                audio,
+                text_cache.audio_context,
+                text_cache.audio_mask,
+                text_cache.audio_pe,
+                text_cache.audio_cross_pe,
+            )
+            if audio is not None
+            else None
+        )
 
-        # Shard sequences for Ulysses parallelism.
+        # Shard sequences for parallelism (Ulysses head-sharding, ring CP, or Attention2D).
         # Video is always sharded.  Audio sharding is decided once by
         # configure_audio_ulysses() and cached in self._audio_is_sharded.
-        if self.use_ulysses:
+        if self._sharder.is_active:
             if video_args is not None:
                 video_args = self._shard_transformer_args(video_args)
             if self._audio_is_sharded and audio_args is not None:
                 audio_args = self._shard_transformer_args(audio_args)
 
+        v_kv = text_cache.video_kv
+        a_kv = text_cache.audio_kv
+
         if self._uses_cache_dit():
+            # Cache-DiT path: wrapper consumes (vx, ax) positional args and
+            # reads full TransformerArgs from self._cache_dit_*_args. text_kv
+            # must be looked up by inner.idx inside the wrapper — Cache-DiT's
+            # CachedBlocks iterates inner blocks with a single shared kwargs
+            # dict, so passing text_kv[i] through the outer loop would feed
+            # every inner block block-0's KV.
+            self._cache_dit_video_args = video_args
+            self._cache_dit_audio_args = audio_args
+            self._cache_dit_v_kv = v_kv
+            self._cache_dit_a_kv = a_kv
             vx = video_args.x if video_args is not None else None
             ax = audio_args.x if audio_args is not None else None
             for block in self.transformer_blocks:
-                self._cache_dit_video_args = video_args
-                self._cache_dit_audio_args = audio_args
                 vx, ax = block(vx, ax, perturbations=perturbations)
                 if video_args is not None and vx is not None:
                     video_args = replace(video_args, x=vx)
                 if audio_args is not None and ax is not None:
                     audio_args = replace(audio_args, x=ax)
         else:
-            for block in self.transformer_blocks:
+            for i, block in enumerate(self.transformer_blocks):
                 video_args, audio_args = block(
                     video=video_args,
                     audio=audio_args,
                     perturbations=perturbations,
+                    text_kv_video=v_kv[i] if v_kv else None,
+                    text_kv_audio=a_kv[i] if a_kv else None,
                 )
 
         # Gather sequences back to full length for output processing.
         # Only gather embedded_timestep if it was actually sharded (dim-1
         # matches x); scalar timestep embeddings [B, 1, D] are
         # broadcast-compatible and must not be gathered.
-        if self.use_ulysses:
+        if self._sharder.is_active:
             if video_args is not None:
                 gathered_vx = self._gather_sequence(video_args.x)
                 v_et = video_args.embedded_timestep

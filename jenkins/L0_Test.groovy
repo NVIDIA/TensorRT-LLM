@@ -2,7 +2,6 @@
 
 import java.lang.InterruptedException
 import groovy.transform.Field
-import groovy.json.JsonSlurper
 import groovy.json.JsonOutput
 import com.nvidia.bloom.KubernetesManager
 import com.nvidia.bloom.Constants
@@ -16,6 +15,11 @@ import com.nvidia.bloom.SshAuthMethod
 import org.jenkinsci.plugins.workflow.cps.CpsThread
 import org.jsoup.Jsoup
 import org.jenkinsci.plugins.pipeline.modeldefinition.Utils as jUtils
+import trtllm.FailureClassifier
+import trtllm.exceptions.InfraFailure
+import trtllm.exceptions.PipelineInterruption
+import trtllm.exceptions.TrtllmCiException
+import trtllm.exceptions.UserFailure
 
 // LLM repository configuration
 withCredentials([string(credentialsId: 'default-llm-repo', variable: 'DEFAULT_LLM_REPO')]) {
@@ -38,6 +42,7 @@ linuxPkgName = ( env.targetArch == AARCH64_TRIPLE ? "tensorrt-llm-sbsa-release-s
 LLM_DOCKER_IMAGE = env.dockerImage
 LLM_ROCKYLINUX8_PY310_DOCKER_IMAGE = env.wheelDockerImagePy310
 LLM_ROCKYLINUX8_PY312_DOCKER_IMAGE = env.wheelDockerImagePy312
+LLM_WHEEL_DOCKER_IMAGE = env.wheelDockerImage
 
 // DLFW torch image
 DLFW_IMAGE = "urm.nvidia.com/docker/nvidia/pytorch:26.02-py3"
@@ -99,6 +104,28 @@ REQUIRED_OPEN_DRIVER_TYPES = ["b100-ts2", "rtx-5080", "rtx-5090", "rtx-pro-6000"
 // GPU types that don't support dynamic driver flashing
 REQUIRED_NO_DRIVER_TYPES = ["dgx-h100", "dgx-h200", "gh200", "gb10x"]
 
+// Maximum SLURM infra-failure retries (total attempts = SLURM_INFRA_RETRY_MAX + 1).
+// Recognised failure patterns are tagged with scope=SLURM or BOTH in the
+// shared-lib PATTERN_CATALOG.
+SLURM_INFRA_RETRY_MAX = 2
+
+// Maximum K8s infra-failure retries (total attempts = K8S_INFRA_RETRY_MAX + 1).
+// Kept distinct from SLURM_INFRA_RETRY_MAX so the two paths can be tuned
+// independently as production telemetry comes in. Patterns tagged scope=K8S
+// or BOTH in the shared-lib PATTERN_CATALOG.
+K8S_INFRA_RETRY_MAX = 2
+
+// Typed-exception hierarchy and FailureClassifier (PATTERN_CATALOG, classify(),
+// flattenThrowable) live in trtllm-jenkins-shared-lib under src/trtllm/. They
+// were originally inline here, but the Jenkins script-security sandbox
+// requires per-instance signature approval for `RuntimeException(String,
+// Throwable)` and `Throwable.getSuppressed()` when those operations execute
+// inside an inline pipeline script. Code under src/ in a shared library runs
+// outside the sandbox, so the same operations work without approval.
+//
+// See trtllm-jenkins-shared-lib for the implementation; the imports at the
+// top of this file pull them in.
+
 // ENABLE_NGC_DEVEL_IMAGE_TEST is currently disabled in the Jenkins BuildDockerImageSanityTest job config
 ENABLE_NGC_DEVEL_IMAGE_TEST = params.enableNgcDevelImageTest ?: false
 ENABLE_NGC_RELEASE_IMAGE_TEST = params.enableNgcReleaseImageTest ?: false
@@ -113,7 +140,10 @@ def scpFromRemoteCmd(Map remote, String remotePath, String localPath) {
     return "sshpass -p '${remote.passwd}' scp ${portOpt}-r -p ${COMMON_SSH_OPTIONS} ${remote.user}@${remote.host}:${remotePath} ${localPath}"
 }
 
-def uploadResults(def pipeline, SlurmCluster cluster, String clusterName, String nodeName, String stageName, Boolean stageIsInterrupted) {
+// `postTag` uniquifies the uploaded tar filename, the Artifactory guard key and
+// the locally-staged result XMLs when the same stageName is uploaded more than
+// once in a build (e.g. SLURM infra-failure retries). First attempt passes "".
+def uploadResults(def pipeline, SlurmCluster cluster, String clusterName, String nodeName, String stageName, Boolean stageIsInterrupted, String postTag="") {
     CloudManager.withSlurmSshCredentials(pipeline, clusterName, cluster) { remote ->
         def hasTimeoutTest = false
         def downloadResultSucceed = false
@@ -159,12 +189,29 @@ def uploadResults(def pipeline, SlurmCluster cluster, String clusterName, String
 
             echo "hasTimeoutTest: ${hasTimeoutTest}, downloadResultSucceed: ${downloadResultSucceed}, downloadPerfResultSucceed: ${downloadPerfResultSucceed}"
             if (hasTimeoutTest || downloadResultSucceed || downloadPerfResultSucceed) {
+                // On retry attempts, rename freshly-downloaded result XMLs so that
+                // (a) the tar for this attempt is distinguishable from prior attempts
+                //     already uploaded to Artifactory, and
+                // (b) the junit() glob below picks up this attempt's results as a
+                //     separate set, keeping earlier attempts' test data visible in
+                //     the Jenkins build report rather than overwriting it.
+                if (postTag) {
+                    sh """
+                        cd ${stageName}
+                        for f in results*.xml; do
+                            [ -f "\$f" ] || continue
+                            case "\$f" in *${postTag}.xml) continue ;; esac
+                            name=\"\${f%.xml}\"
+                            mv \"\$f\" \"\${name}${postTag}.xml\" || true
+                        done
+                    """
+                }
                 sh "ls -al ${stageName}/"
                 echo "Upload test results."
-                sh "tar -czvf results-${stageName}.tar.gz ${stageName}/"
-                ensureStageResultNotUploaded(stageName)
+                sh "tar -czvf results-${stageName}${postTag}.tar.gz ${stageName}/"
+                ensureStageResultNotUploaded("${stageName}${postTag}")
                 trtllm_utils.uploadArtifacts(
-                    "results-${stageName}.tar.gz",
+                    "results-${stageName}${postTag}.tar.gz",
                     "${UPLOAD_PATH}/test-results/"
                 )
             } else {
@@ -517,7 +564,7 @@ def cleanUpNodeResources(def pipeline, SlurmCluster cluster, String clusterName,
     }
 }
 
-def runLLMTestlistWithAgent(pipeline, platform, testList, config=VANILLA_CONFIG, perfMode=false, stageName="Undefined", splitId=1, splits=1, gpuCount=1, skipInstallWheel=false, cpver="cp312")
+def runLLMTestlistWithAgent(pipeline, platform, testList, config=VANILLA_CONFIG, perfMode=false, stageName="Undefined", splitId=1, splits=1, gpuCount=1, skipInstallWheel=false, cpver="cp312", String postTag="")
 {
     SlurmPartition partition = SlurmConfig.resolvePlatform(platform)
     SlurmCluster cluster = SlurmConfig.clusterConfig[partition.clusterName]
@@ -604,9 +651,33 @@ def runLLMTestlistWithAgent(pipeline, platform, testList, config=VANILLA_CONFIG,
                     } catch (InterruptedException e) {
                         throw e
                     } catch (Exception e) {
-                        // If the exception is about job being inactive, enrich it with log path
-                        if (e.message.contains("is no longer active")) {
-                            throw new Exception("${e.message}. Check SLURM logs at /home/svc_tensorrt/slurm-logs/slurm-${slurmJobID}-${nodeName}.out on ${cluster.host}")
+                        // If the exception is about job being inactive, throw a typed
+                        // InfraFailure(SLURM) so downstream consumers route via instanceof
+                        // rather than substring matching the catalog. The "<typed:..."
+                        // marker keeps the [INFRA-RETRY] log line distinguishable from
+                        // catalog-matched fallbacks.
+                        //
+                        // Critical for nested-retry correctness: the SLURM-scoped typed
+                        // throw is rejected by classify() at the OUTER K8s pod-launch
+                        // retry's scope guard (see classify() scope-mismatch branch).
+                        // That prevents the K8s outer from re-running a budget that the
+                        // inner SLURM retry already exhausted. End-to-end trace:
+                        //   1. SLURM job goes inactive while running.
+                        //   2. SlurmConfig.checkJobStatus() throws plain Exception with
+                        //      message "...is no longer active...".
+                        //   3. This catch wraps it as InfraFailure(TRANSIENT, SLURM).
+                        //   4. Inner runLLMTestlistOnSlurm retry catches, classifies via
+                        //      classify(scope=SLURM): instanceof InfraFailure with scope=SLURM
+                        //      passes through; consumer retries up to SLURM_INFRA_RETRY_MAX.
+                        //   5. If exhausted, the typed InfraFailure(SLURM) bubbles out of
+                        //      the inner SLURM retry into the outer K8s pod-launch retry.
+                        //   6. Outer classify(scope=K8S) sees typed InfraFailure with
+                        //      scope=SLURM != K8S, wraps as UserFailure -> outer rethrows
+                        //      without retry. No double-budget consumption.
+                        if (e.message?.contains("is no longer active")) {
+                            throw new InfraFailure(
+                                "${e.message}. Check SLURM logs at /home/svc_tensorrt/slurm-logs/slurm-${slurmJobID}-${nodeName}.out on ${cluster.host}",
+                                e, InfraFailure.TRANSIENT, InfraFailure.SLURM, "<typed:slurm-job-inactive>")
                         }
                         // Otherwise, log the error but continue (SSH might be temporarily unavailable)
                         pipeline.echo("Warning: Could not check SLURM job status: ${e.message}")
@@ -684,7 +755,7 @@ def runLLMTestlistWithAgent(pipeline, platform, testList, config=VANILLA_CONFIG,
         } else {
             throw new Exception("Unsupported container runtime: ${cluster.containerRuntime}")
         }
-        executeLLMTestOnSlurm(pipeline, platform, testList, config, perfMode, stageName, splitId, splits, skipInstallWheel, cpver, slurmRunner)
+        executeLLMTestOnSlurm(pipeline, platform, testList, config, perfMode, stageName, splitId, splits, skipInstallWheel, cpver, slurmRunner, postTag)
     } finally {
         stage("Clean Up Slurm Resource") {
             // Workaround to handle the interruption during clean up SLURM resources
@@ -699,16 +770,16 @@ def runLLMTestlistWithAgent(pipeline, platform, testList, config=VANILLA_CONFIG,
     }
 }
 
-def executeLLMTestOnSlurm(pipeline, platform, testList, config=VANILLA_CONFIG, perfMode=false, stageName="Undefined", splitId=1, splits=1, skipInstallWheel=false, cpver="cp312", runner)
+def executeLLMTestOnSlurm(pipeline, platform, testList, config=VANILLA_CONFIG, perfMode=false, stageName="Undefined", splitId=1, splits=1, skipInstallWheel=false, cpver="cp312", runner, String postTag="")
 {
     runner {
         // TODO: refactor the finallyRunner to reuse within slurm or nonslurm job.
         cacheErrorAndUploadResult(stageName, {
-            runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config, perfMode, stageName, splitId, splits, skipInstallWheel, cpver)
+            runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config, perfMode, stageName, splitId, splits, skipInstallWheel, cpver, false, postTag)
         }, {
             // If the execution test list is null, remove the test result xml
             sh """
-                ls -all ${stageName}/
+                ls -al ${stageName}/
                 if ! grep -q '<testcase' ${stageName}/results.xml; then
                     rm ${stageName}/results.xml || true
                 fi
@@ -716,8 +787,8 @@ def executeLLMTestOnSlurm(pipeline, platform, testList, config=VANILLA_CONFIG, p
             def llmPath = sh (script: "realpath .", returnStdout: true).trim()
             def llmSrc = "${llmPath}/${LLM_ROOT}${config}/TensorRT-LLM/src"
             // CPP tests will generate test result in ${llmSrc}/cpp/build_backup/, move these files to job result folder
-            sh "ls -all ${llmSrc}/cpp/build_backup/ || true"
-            sh "ls -all ${llmSrc}/cpp/build/ || true"
+            sh "ls -al ${llmSrc}/cpp/build_backup/ || true"
+            sh "ls -al ${llmSrc}/cpp/build/ || true"
             // Sed for CPP test result
             sh "cd ${llmSrc}/cpp/build_backup/ && sed -i 's/\" classname=\"/\" classname=\"${stageName}./g' *.xml || true"
             sh "cd ${llmSrc}/cpp/build_backup/ && sed -i 's/testsuite name=\"[^\"]*\"/testsuite name=\"${stageName}\"/g' *.xml || true"
@@ -726,7 +797,7 @@ def executeLLMTestOnSlurm(pipeline, platform, testList, config=VANILLA_CONFIG, p
             // Copy CPP test result
             sh "cp ${llmSrc}/cpp/build_backup/*.xml ${stageName} || true"
             sh "ls -al ${stageName}/"
-        })
+        }, false, postTag)
     }
 }
 // End of Methods to run Slurm job with Jenkins Agent
@@ -863,7 +934,7 @@ def getMountListForSlurmTest(SlurmCluster cluster, boolean useSbatch = false)
     return mounts
 }
 
-def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG, perfMode=false, stageName="Undefined", splitId=1, splits=1, gpuCount=1, nodeCount=1, skipInstallWheel=false, cpver="cp312")
+def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG, perfMode=false, stageName="Undefined", splitId=1, splits=1, gpuCount=1, nodeCount=1, skipInstallWheel=false, cpver="cp312", String postTag="")
 {
     SlurmPartition partition = SlurmConfig.resolvePlatform(platform)
     SlurmCluster cluster = SlurmConfig.clusterConfig[partition.clusterName]
@@ -946,7 +1017,7 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                 // line is "Mako options:", maybe we can make it more generic, which
                 // if the line cannot be split by "=", just ignore that line.
                 def makoOptsJson = transformMakoArgsToJson(["Mako options:"] + makoArgs)
-                def testListPathLocal = renderTestDB(testList, llmSrcLocal, stageName, makoOptsJson)
+                def testListPathLocal = renderTestDB(pipeline, testList, llmSrcLocal, stageName, makoOptsJson)
                 Utils.copyFileToRemoteHost(
                     pipeline,
                     remote,
@@ -959,7 +1030,7 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
 
                 // Add passed test list from previous pipeline run to the waives.txt
                 if (testFilter[(REUSE_TEST)] != false) {
-                    reusePassedTestResults(llmSrcLocal, stageName, "${llmSrcLocal}/tests/integration/test_lists/waives.txt")
+                    reusePassedTestResults(llmSrcLocal, stageName, "${llmSrcLocal}/tests/integration/test_lists/waives.txt", postTag)
                 }
 
                 Utils.copyFileToRemoteHost(
@@ -1159,7 +1230,8 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                         --install-sh ${scriptInstallPathNode} \\
                         --script-prefix ${scriptLaunchPrefixPathLocal} \\
                         --srun-args ${scriptLaunchSrunArgsPathLocal} \\
-                        --split-group ${splitId}
+                        --split-group ${splitId} \\
+                        --stage-name ${stageName}
                     """
                 } else {
                     if(nodeCount > 1) {
@@ -1267,10 +1339,15 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     # Wait until Slurm job is done
                     while true; do
                         # Use --allocations to ensure we match the exact job ID and not job steps (like 123.batch, 123.0)
-                        STATUS=\$(sacct -j \$jobId --format=State -Pn --allocations)
+                        # Tolerate transient sacct failures (e.g. slurmdbd unreachable) so the tracker survives controller blips.
+                        if ! STATUS=\$(sacct -j \$jobId --format=State -Pn --allocations 2>&1); then
+                            echo "Warning: sacct failed for job \$jobId: \$STATUS"
+                            sleep 60
+                            continue
+                        fi
 
                         if [[ -z \$STATUS || \$STATUS == "RUNNING" || \$STATUS == "PENDING" || \$STATUS == "CONFIGURING" ]]; then
-                            echo "Slurm job \$jobId is still running"
+                            echo "Slurm job \$jobId state: \${STATUS:-UNKNOWN}"
                             sleep 300
                         else
                             echo "Slurm job \$jobId finished with state: \$STATUS"
@@ -1342,7 +1419,7 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
         stageIsInterrupted = true
         throw e
     } finally {
-        uploadResults(pipeline, cluster, partition.clusterName, jobUID, stageName, stageIsInterrupted)
+        uploadResults(pipeline, cluster, partition.clusterName, jobUID, stageName, stageIsInterrupted, postTag)
         stage("Clean Up Slurm Resource") {
             // Workaround to handle the interruption during clean up SLURM resources
             retry(3) {
@@ -1356,13 +1433,117 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
     }
 }
 
-def runLLMTestlistOnSlurm(pipeline, platform, testList, config=VANILLA_CONFIG, perfMode=false, stageName="Undefined", splitId=1, splits=1, gpuCount=1, nodeCount=1, runWithSbatch=false, skipInstallWheel=false, cpver="cp312")
+// CBTS Layer 3 split-collapse heuristic: when the affected stage's narrowed
+// test count (from main.py compute_stage_test_counts) is below 20, collapse
+// pytest-split's splits to 1 — only group 1 runs everything; groups 2..N
+// skip and don't allocate a machine. At/above 20, splits stay at the
+// stage's default and pytest-split parallelizes normally.
+//
+// The 20 below is hard-coded inline rather than a top-level constant
+// because Groovy script-level `def` is not visible from method bodies
+// without `@Field`, and we don't otherwise need this value elsewhere.
+//
+// Returns [skip: bool, splits: int, splitId: int]. Callers should
+// `return` early when skip == true and otherwise overwrite splits/splitId
+// with the returned values before continuing their existing dispatch logic.
+def _cbtsMaybeCollapseSplits(stageName, splitId, splits) {
+    def cbts = testFilter[(CBTS_RESULT)]
+    def counts = cbts?.affected_stage_test_counts
+    if (!counts) {
+        return [skip: false, splits: splits, splitId: splitId]
+    }
+    def count = counts[stageName]
+    if (count == null || count >= 20) {
+        return [skip: false, splits: splits, splitId: splitId]
+    }
+    if (splitId > 1) {
+        echo "CBTS [${cbts.scope}]: ${stageName} narrowed to ${count} (< 20), skipping group ${splitId}/${splits}"
+        return [skip: true, splits: splits, splitId: splitId]
+    }
+    if (splits > 1) {
+        echo "CBTS [${cbts.scope}]: ${stageName} narrowed to ${count} (< 20), collapsing splits=${splits} → 1"
+    }
+    return [skip: false, splits: 1, splitId: 1]
+}
+
+def runLLMTestlistOnSlurm(pipeline, platform, testList, config=VANILLA_CONFIG, perfMode=false, stageName="Undefined", splitId=1, splits=1, gpuCount=1, nodeCount=1, runWithSbatch=false, skipInstallWheel=false, cpver="cp312", String outerAttemptTag="")
 {
+  def collapse = _cbtsMaybeCollapseSplits(stageName, splitId, splits)
+  if (collapse.skip) {
+    return
+  }
+  splits = collapse.splits
+  splitId = collapse.splitId
+
   echo "Run Slurm job with native sbatch: $runWithSbatch"
-  if (nodeCount > 1 || runWithSbatch) {
-    runLLMTestlistWithSbatch(pipeline, platform, testList, config, perfMode, stageName, splitId, splits, gpuCount, nodeCount, skipInstallWheel, cpver)
-  } else {
-    runLLMTestlistWithAgent(pipeline, platform, testList, config, perfMode, stageName, splitId, splits, gpuCount, skipInstallWheel, cpver)
+
+  def attempt = 0
+
+  while (true) {
+    attempt++
+    try {
+      if (attempt > 1) {
+        echo "[INFRA-RETRY] ${stageName}: Starting attempt ${attempt} of ${SLURM_INFRA_RETRY_MAX + 1}"
+      }
+
+      // Each attempt uploads its own test-result artifact under a unique name so
+      // the attempt-1 tar (already in Artifactory from its finally block) is not
+      // clobbered and the ensureStageResultNotUploaded guard does not trip on
+      // the retry. First attempt keeps the canonical unsuffixed name so existing
+      // downstream consumers (dashboards, the JIRA bot, etc.) are unaffected.
+      //
+      // outerAttemptTag is the K8s outer dispatcher pod's tag ("" for outer
+      // attempt 1, "-pod-${N}" for outer attempt N>=2). Prefixing the inner
+      // postTag with it ensures the new dispatcher pod's inner attempt 1
+      // upload doesn't collide with the dead pod's already-recorded upload
+      // in GlobalState.uploadResultStageNames.
+      def innerSuffix = (attempt == 1) ? "" : "-attempt-${attempt}"
+      def postTag = "${outerAttemptTag}${innerSuffix}"
+
+      if (nodeCount > 1 || runWithSbatch) {
+        runLLMTestlistWithSbatch(pipeline, platform, testList, config, perfMode, stageName, splitId, splits, gpuCount, nodeCount, skipInstallWheel, cpver, postTag)
+      } else {
+        runLLMTestlistWithAgent(pipeline, platform, testList, config, perfMode, stageName, splitId, splits, gpuCount, skipInstallWheel, cpver, postTag)
+      }
+
+      // Job succeeded
+      if (attempt > 1) {
+        echo "[INFRA-RETRY] ${stageName}: Succeeded on attempt ${attempt}"
+      }
+      return
+
+    } catch (InterruptedException e) {
+      // User abort / pipeline timeout -- never retry
+      throw e
+    } catch (Exception e) {
+      // classify() handles FlowInterruptedException + exit-code-143 +
+      // typed throws + cause-chain pattern matching, returning one of
+      // PipelineInterruption / InfraFailure / UserFailure. Scope=SLURM
+      // ensures we only match catalog rows tagged SLURM or BOTH.
+      def c = FailureClassifier.classify(e, InfraFailure.SLURM)
+      if (c instanceof PipelineInterruption) throw e
+      if (!(c instanceof InfraFailure))      throw e   // UserFailure -> don't retry
+
+      def effectiveMax = (c.severity == InfraFailure.PERSISTENT) ? 1 : SLURM_INFRA_RETRY_MAX
+
+      if (attempt > effectiveMax) {
+        echo "[INFRA-RETRY] ${stageName}: Infrastructure failure (${c.detectedPattern}) " +
+             "but max retries (${effectiveMax}) exhausted after ${attempt} attempts. Failing."
+        throw e
+      }
+      if (!hasBudgetForInfraRetry(pipeline, stageName, InfraFailure.SLURM, c, attempt, effectiveMax, 60L * 1000L, true)) {
+        echo "[INFRA-RETRY] ${stageName}: Infrastructure failure (${c.detectedPattern}) is retryable, " +
+             "but remaining CI timeout budget is too small for another SLURM attempt. Failing without retry."
+        throw e
+      }
+
+      echo "[INFRA-RETRY] ${stageName}: Infrastructure failure detected on attempt ${attempt}: " +
+           "${c.detectedPattern}"
+      echo "[INFRA-RETRY] ${stageName}: Exception: ${e.toString()}"
+      echo "[INFRA-RETRY] ${stageName}: Will retry (attempt ${attempt + 1} of ${effectiveMax + 1}) after 60s cooldown."
+
+      sleep(60)
+    }
   }
 }
 
@@ -1376,6 +1557,23 @@ def trimForStageList(stageNameList)
         trimedList.add(stageName.trim().replaceAll('\\\\', ''))
     }
     return trimedList
+}
+
+// Check if a stage key matches a pattern.
+// Supports exact match and wildcard '*' for glob-style matching.
+// Uses Pattern.quote() to safely handle special characters in stage names.
+// Examples: "A10-PyTorch-1" (exact), "*PerfSanity*" (contains), "A10-*" (prefix).
+def stageMatchesPattern(String key, String pattern) {
+    if (!pattern.contains('*')) {
+        return key == pattern
+    }
+    def regex = '^' + pattern.split('\\*', -1).collect { java.util.regex.Pattern.quote(it) }.join('.*') + '$'
+    return key ==~ regex
+}
+
+// Check if a stage key matches any pattern in the list.
+def stageMatchesAnyPattern(String key, List patterns) {
+    return patterns.any { pattern -> stageMatchesPattern(key, pattern) }
 }
 
 // Test filter flags
@@ -1412,6 +1610,8 @@ def DEBUG_MODE = "debug"
 @Field
 def DETAILED_LOG = "detailed_log"
 @Field
+def CBTS_RESULT = "cbts_result"
+@Field
 def testFilter = [
     (REUSE_TEST): null,
     (REUSE_STAGE_LIST): null,
@@ -1429,6 +1629,7 @@ def testFilter = [
     (DEBUG_MODE): false,
     (AUTO_TRIGGER_TAG_LIST): [],
     (DETAILED_LOG): false,
+    (CBTS_RESULT): null,
 ]
 
 @Field
@@ -1448,6 +1649,8 @@ def globalVars = [
 
 class GlobalState {
     static def uploadResultStageNames = []
+    static def stageAttemptEstimateMs = [:]
+    static def stageAttemptEstimateDetails = [:]
 
     // HOST_NODE_NAME to starting port section map
     // This map maintains the next available starting port for each host node
@@ -1460,6 +1663,83 @@ class GlobalState {
     static final int BASE_PORT = 10000           // Base starting port
     static final int PORT_SECTION_SIZE = 1000    // Number of ports per section/stage
     static final int MAX_PORT = 32000            // Maximum port number to avoid system ports
+}
+
+def recordRenderedStageAttemptEstimate(pipeline, String llmSrc, String testListPath, String stageName, def renderedTestCount)
+{
+    def estimate = trtllm_utils.estimateRenderedStageAttemptMillis(pipeline, llmSrc, testListPath, stageName, renderedTestCount)
+    if (estimate.error) {
+        echo "[CI-BUDGET] ${stageName}: failed to read .test_durations; using count-based estimate. Error: ${estimate.error}"
+    }
+
+    GlobalState.stageAttemptEstimateMs[stageName] = estimate.estimatedMs
+    GlobalState.stageAttemptEstimateDetails[stageName] = [
+        renderedCount: estimate.renderedCount,
+        knownCount: estimate.knownCount,
+        unknownCount: estimate.unknownCount,
+    ]
+    echo "[CI-BUDGET] ${stageName}: recorded test runtime estimate " +
+         "${trtllm_utils.formatCiBudgetMillis(estimate.estimatedMs)} " +
+         "(rendered=${estimate.renderedCount}, known=${estimate.knownCount}, unknown=${estimate.unknownCount})"
+}
+
+long estimateStageRetryRuntimeMs(String stageName, String scope)
+{
+    Long testEstimateValue = trtllm_utils.parseCiBudgetLong(GlobalState.stageAttemptEstimateMs[stageName])
+    long testEstimateMs = testEstimateValue != null ? testEstimateValue : 0L
+    if (testEstimateMs > 0L) {
+        long overheadMs = scope == InfraFailure.SLURM ? 45L * 60L * 1000L : 30L * 60L * 1000L
+        return testEstimateMs + overheadMs
+    }
+    return scope == InfraFailure.SLURM ? 4L * 60L * 60L * 1000L : 2L * 60L * 60L * 1000L
+}
+
+long retrySafetyMarginMs(String scope)
+{
+    return scope == InfraFailure.SLURM ? 20L * 60L * 1000L : 15L * 60L * 1000L
+}
+
+int retryMaxForFailure(String scope, InfraFailure failure)
+{
+    if (failure.severity == InfraFailure.PERSISTENT) {
+        return 1
+    }
+    return scope == InfraFailure.SLURM ? SLURM_INFRA_RETRY_MAX : K8S_INFRA_RETRY_MAX
+}
+
+boolean hasBudgetForInfraRetry(def pipeline, String stageName, String scope, InfraFailure failure, int attempt, int effectiveMax, long backoffMs, boolean logDecision)
+{
+    if (attempt > effectiveMax) {
+        return false
+    }
+    long estimateMs = estimateStageRetryRuntimeMs(stageName, scope)
+    long safetyMs = retrySafetyMarginMs(scope)
+    return trtllm_utils.canSpendCiBudget(pipeline, [
+        globalVars: globalVars,
+        label: "infra-retry:${scope}:${stageName}:attempt-${attempt + 1}",
+        estimateMs: estimateMs,
+        backoffMs: backoffMs,
+        safetyMs: safetyMs,
+        logDecision: logDecision,
+    ])
+}
+
+boolean retryContextAllowsRetry(def pipeline, Map retryContext, Throwable error, boolean logDecision=false)
+{
+    if (retryContext == null || error == null) {
+        return false
+    }
+    String scope = retryContext.scope ?: InfraFailure.K8S
+    def classified = FailureClassifier.classify(error, scope)
+    if (!(classified instanceof InfraFailure)) {
+        return false
+    }
+    Long parsedAttempt = trtllm_utils.parseCiBudgetLong(retryContext.attempt)
+    int attempt = parsedAttempt != null ? parsedAttempt as int : 1
+    int effectiveMax = retryMaxForFailure(scope, classified)
+    Long parsedBackoffMs = trtllm_utils.parseCiBudgetLong(retryContext.backoffMs)
+    long backoffMs = parsedBackoffMs != null ? parsedBackoffMs : 60L * 1000L
+    return hasBudgetForInfraRetry(pipeline, retryContext.stageName ?: "Unknown", scope, classified, attempt, effectiveMax, backoffMs, logDecision)
 }
 
 /**
@@ -1505,16 +1785,20 @@ def getHostNodeName() {
     ''', returnStdout: true).trim()
 }
 
-def cacheErrorAndUploadResult(stageName, taskRunner, finallyRunner, noResultIfSuccess=false, postTag="")
+def cacheErrorAndUploadResult(stageName, taskRunner, finallyRunner, noResultIfSuccess=false, postTag="", boolean isFinalAttempt=true, Map retryContext=null)
 {
     checkStageName([stageName])
     def Boolean stageIsInterrupted = false
     def Boolean stageIsFailed = true
+    Throwable caughtError = null
     try {
         taskRunner()
         stageIsFailed = false
     } catch (InterruptedException e) {
         stageIsInterrupted = true
+        throw e
+    } catch (Exception e) {
+        caughtError = e
         throw e
     } finally {
         ensureStageResultNotUploaded(stageName + postTag)
@@ -1534,10 +1818,31 @@ def cacheErrorAndUploadResult(stageName, taskRunner, finallyRunner, noResultIfSu
                 echo "Finished test stage execution."
                 return
             }
+
+            // Suppress synthetic stage-fail XML and junit() when this attempt is
+            // an intermediate retry that classified as a retryable infra failure.
+            // Without this, every transient pod-level failure poisons the per-build
+            // junit report with a permanent "Stage Failed" entry that the retry
+            // (on a fresh pod) cannot remove. The tar artifact is still uploaded
+            // for forensics; only the in-build test reporting is gated.
+            boolean suppressTestReporting = false
+            if (stageIsFailed && caughtError != null) {
+                if (retryContext != null) {
+                    suppressTestReporting = retryContextAllowsRetry(null, retryContext, caughtError, false)
+                } else if (!isFinalAttempt) {
+                    def c = FailureClassifier.classify(caughtError, InfraFailure.K8S)
+                    suppressTestReporting = c instanceof InfraFailure
+                }
+                if (suppressTestReporting) {
+                    suppressTestReporting = true
+                    echo "[INFRA-RETRY] ${stageName}${postTag}: suppressing synthetic stage-fail XML and junit() because a retry is still planned"
+                }
+            }
+
             echo "noResultIfSuccess: ${noResultIfSuccess}, stageIsFailed: ${stageIsFailed}"
             sh "mkdir -p ${stageName}"
             finallyRunner()
-            if (stageIsFailed) {
+            if (stageIsFailed && !suppressTestReporting) {
                 if (stageIsInterrupted) {
                     echo "Stage is interrupted, skip to generate terminated unexpectedly test result."
                 } else {
@@ -1558,7 +1863,9 @@ def cacheErrorAndUploadResult(stageName, taskRunner, finallyRunner, noResultIfSu
                 "results-${stageName}${postTag}.tar.gz",
                 "${UPLOAD_PATH}/test-results/"
             )
-            junit(testResults: "${stageName}/results*.xml")
+            if (!suppressTestReporting) {
+                junit(testResults: "${stageName}/results*.xml")
+            }
         }
 
         // Clean up the workspace
@@ -2127,7 +2434,7 @@ def getMakoArgsFromStageName(stageName, parseSysinfo=false) {
     return makoArgs
 }
 
-def renderTestDB(testContext, llmSrc, stageName, preDefinedMakoOpts=null) {
+def renderTestDB(pipeline, testContext, llmSrc, stageName, preDefinedMakoOpts=null) {
     def makoOpts = preDefinedMakoOpts
 
     if (!makoOpts) {
@@ -2137,7 +2444,30 @@ def renderTestDB(testContext, llmSrc, stageName, preDefinedMakoOpts=null) {
     }
 
     sh "pip3 install --extra-index-url https://urm.nvidia.com/artifactory/api/pypi/sw-tensorrt-pypi/simple --ignore-installed trt-test-db==1.8.5+bc6df7"
+    // CBTS Layer 3: regenerate cbts_test_db/ on this stage agent from the
+    // piggybacked input JSON if not already present.
+    def cbts = testFilter[(CBTS_RESULT)]
+    if (cbts != null && cbts.test_db_dir_override && cbts.cbts_input_json) {
+        def overrideDir = "${llmSrc}/${cbts.test_db_dir_override}"
+        def dirExists = sh(returnStdout: true, script: "test -d ${overrideDir} && echo yes || echo no").trim()
+        if (dirExists != "yes") {
+            def cbtsInputLocal = Utils.createTempLocation(pipeline, "./cbts_input.json")
+            pipeline.writeFile(file: cbtsInputLocal, text: cbts.cbts_input_json)
+            sh "apt-get update -qq && apt-get install -y -qq python3-yaml || true"
+            sh "cd ${llmSrc} && python3 jenkins/scripts/cbts/main.py ${cbtsInputLocal} > /dev/null 2>&1 || true"
+        }
+    }
     def testDBPath = "${llmSrc}/tests/integration/test_lists/test-db"
+    if (cbts != null && cbts.test_db_dir_override) {
+        def overrideYaml = "${llmSrc}/${cbts.test_db_dir_override}/${testContext}.yml"
+        def overrideOk = sh(returnStdout: true, script: "test -s ${overrideYaml} && echo yes || echo no").trim()
+        if (overrideOk == "yes") {
+            testDBPath = "${llmSrc}/${cbts.test_db_dir_override}"
+            echo "CBTS [${cbts.scope}]: rendering test list from filtered test-db at ${testDBPath}"
+        } else {
+            echo "CBTS [${cbts.scope}]: ${overrideYaml} missing/empty -- falling back to source test-db"
+        }
+    }
     def testList = "${llmSrc}/${testContext}.txt"
     def testDBQueryCmd = [
         "trt-test-db",
@@ -2153,7 +2483,11 @@ def renderTestDB(testContext, llmSrc, stageName, preDefinedMakoOpts=null) {
     ].join(" ")
 
     sh(label: "Render test list from test-db", script: testDBQueryCmd)
+    def testCount = sh(returnStdout: true, script: "wc -l < ${testList} | tr -d ' '").trim()
+    def testDBLabel = (cbts != null && cbts.test_db_dir_override) ? "CBTS-narrowed [${cbts.scope}]" : "source"
+    echo "renderTestDB: stage=${stageName} context=${testContext} test-db=${testDBLabel} dir=${testDBPath} -> ${testCount} tests"
     sh(script: "cat ${testList}")
+    recordRenderedStageAttemptEstimate(pipeline, llmSrc, testList, stageName, testCount)
 
     return testList
 }
@@ -2232,22 +2566,19 @@ def rerunFailedTests(stageName, llmSrc, testCmdLine, resultFileName="results.xml
 
     // Generate rerun test lists
     def failSignaturesList = trtllm_utils.getFailSignaturesList().join(",")
+    def testListCmd = testCmdLine.find { it.contains("--test-list=") }
+    def testListArg = testListCmd ? "--test-list=${testListCmd.split('=', 2)[1]}" : ""
+    def unfinishedTestFile = "${WORKSPACE}/${stageName}/unfinished_test.txt"
+    def unfinishedTestArg = fileExists(unfinishedTestFile) ? "--unfinished-test-file=${unfinishedTestFile}" : ""
     sh """
         python3 ${llmSrc}/jenkins/scripts/test_rerun.py \
         generate_rerun_tests_list \
         --output-dir=${rerunDir}/ \
         --input-file=${WORKSPACE}/${stageName}/${resultFileName} \
-        --fail-signatures='${failSignaturesList}'
+        --fail-signatures='${failSignaturesList}' \
+        ${testListArg} \
+        ${unfinishedTestArg}
     """
-
-    // If there are some failed tests that cannot be rerun (e.g. test duration > 10 min and no known failure signatures),
-    // fail the stage immediately without attempting any reruns
-    def rerunTestList = "${rerunDir}/rerun_0.txt"
-    if (fileExists(rerunTestList)) {
-        sh "cat ${rerunTestList}"
-        echo "There are some failed tests that cannot be rerun, skip the rerun step."
-        return true
-    }
 
     // If the stage has more than 5 failed tests, skip the rerun step
     def validLineCount = 0
@@ -2261,13 +2592,6 @@ def rerunFailedTests(stageName, llmSrc, testCmdLine, resultFileName="results.xml
             echo "Found ${count} ${testType} tests to rerun ${times} time(s)"
             validLineCount += count
         }
-    }
-    if (validLineCount > 5) {
-        echo "There are more than 5 failed ${testType} tests, skip the rerun step."
-        return true
-    } else if (validLineCount == 0) {
-        echo "No failed ${testType} tests need to be rerun, skip the rerun step."
-        return true
     }
 
     // Rerun tests
@@ -2465,23 +2789,110 @@ def mergeWaivesTxt(pipeline, llmSrc, stageName) {
     }
 }
 
-def reusePassedTestResults(llmSrc, stageName, waivesTxt) {
+/**
+ * Append passes that previously succeeded for this commit + stage to the
+ * stage's waives.txt as SKIPs, so the upcoming pytest run skips them.
+ *
+ * Two sources are merged:
+ *
+ *  1. OpenSearch records of prior pipeline runs for the same commit and
+ *     stage (the historical mechanism). Populated only after a pipeline
+ *     completes -- has nothing to say about the current run.
+ *
+ *  2. Tarballs uploaded by earlier attempts of the *current* build, when
+ *     the infra-failure retry loop has fired. The current run's attempt 1
+ *     uploads its (partial) results before the retry kicks off; this
+ *     function downloads them and extracts passes via test_rerun.py's
+ *     extract_passed_tests mode. Closes the gap where a retry would
+ *     otherwise re-run every test that already passed pre-failure.
+ *
+ * @param llmSrc      Local TRT-LLM source root.
+ * @param stageName   Stage name; both the OpenSearch query key and the
+ *                    Artifactory artifact prefix (`results-${stageName}*`).
+ * @param waivesTxt   Path to the stage's waives.txt; passes are appended
+ *                    here with reason "SKIP (Reused from previous pipeline)".
+ * @param postTag     This attempt's full tar suffix (e.g. ""
+ *                    on attempt 1, "-attempt-2" on the first retry,
+ *                    "-SubJob-RunTest-attempt-2" for a retried sub-job).
+ *                    Used by priorAttemptTags() to enumerate earlier
+ *                    attempts in this build.
+ */
+def reusePassedTestResults(llmSrc, stageName, waivesTxt, String postTag = "") {
     try {
-        // Get passed test list from open search
-        def passedTestListFile = "${WORKSPACE}/${stageName}/passed_test_list.txt"
+        def reusedTests = []
+        def workDir = "${WORKSPACE}/${stageName}"
+        sh "mkdir -p ${workDir}"
+
+        // 1. OpenSearch lookup -- tests that PASSED in a previous pipeline run
+        //    for this commit + stage.
+        def passedTestListFile = "${workDir}/passed_test_list.txt"
         sh """
             python3 ${llmSrc}/jenkins/scripts/open_search_query.py \
             --commit-id ${env.gitlabCommit} \
             --stage-name ${stageName} \
             --output-file ${passedTestListFile}
         """
+        if (fileExists(passedTestListFile)) {
+            reusedTests += readFile(file: passedTestListFile).readLines().collect { it.trim() }.findAll { it }
+        }
 
-        def passedTestList = readFile(file: passedTestListFile).readLines()
-        def reusedTests = passedTestList.collect { test -> test.trim() }
+        // 2. Prior-attempt recovery -- tests that PASSED in an earlier attempt
+        //    of THIS pipeline run before infra retry fired. Only runs if postTag
+        //    decodes as a retry attempt (matches "...-attempt-N").
+        def priorTags = priorAttemptTags(postTag)
+        if (!priorTags.isEmpty()) {
+            def priorXmls = []
+            priorTags.each { priorTag ->
+                def tarName = "results-${stageName}${priorTag}.tar.gz"
+                def tarUrl = "https://urm.nvidia.com/artifactory/${UPLOAD_PATH}/test-results/${tarName}"
+                def priorDir = "${workDir}/prior${priorTag.replace('-', '_')}"
+                sh "mkdir -p ${priorDir}"
+                // Probe with HEAD so we can distinguish "this prior attempt never
+                // uploaded a tarball" (HTTP 404, expected when an attempt died
+                // before its finally block ran) from real errors (auth, 5xx,
+                // network). Only 404 is benign; anything else fails the build
+                // so silent skips don't mask a configuration regression.
+                def httpStatus = sh(returnStdout: true,
+                                    script: "curl -sS -o /dev/null -w '%{http_code}' --connect-timeout 10 --max-time 30 '${tarUrl}'").trim()
+                if (httpStatus == '404') {
+                    echo "Prior attempt artifact ${tarName} not present (HTTP 404); skipping"
+                    return
+                }
+                if (httpStatus != '200') {
+                    error "Probing prior attempt artifact ${tarName} returned HTTP ${httpStatus} (expected 200 or 404)"
+                }
+                sh "cd ${priorDir} && wget -nv -nc '${tarUrl}'"
+                sh "cd ${priorDir} && tar -xzf ${tarName}"
+                // results.xml may live at ${stageName}/results.xml inside the
+                // tar, or at the tar's root depending on how it was packaged.
+                // Scan both.
+                def xmlFiles = sh(returnStdout: true,
+                                  script: "find ${priorDir} -maxdepth 4 -name 'results*.xml' 2>/dev/null | tr '\\n' ',' | sed 's/,\$//'").trim()
+                if (xmlFiles) {
+                    priorXmls += xmlFiles.split(',') as List
+                }
+            }
+            if (!priorXmls.isEmpty()) {
+                def priorPassedFile = "${workDir}/prior_attempt_passed.txt"
+                sh """
+                    python3 ${llmSrc}/jenkins/scripts/test_rerun.py \
+                    extract_passed_tests \
+                    --output-file ${priorPassedFile} \
+                    --input-files ${priorXmls.join(',')}
+                """
+                if (fileExists(priorPassedFile)) {
+                    def priorPasses = readFile(file: priorPassedFile).readLines().collect { it.trim() }.findAll { it }
+                    if (!priorPasses.isEmpty()) {
+                        echo "Reusing ${priorPasses.size()} passed test(s) from prior attempt(s): ${priorTags}"
+                    }
+                    reusedTests += priorPasses
+                }
+            }
+        }
 
-        // Append reused tests to waives.txt
+        // 3. Dedupe and append everything to waives.txt as SKIPs.
+        reusedTests = reusedTests.unique()
         if (reusedTests.size() > 0) {
-            // Build the content to append
             def reusedTestsContent = reusedTests.collect { test ->
                 "${test} SKIP (Reused from previous pipeline)"
             }.join('\n')
@@ -2504,7 +2915,89 @@ REUSED_TESTS_EOF
     }
 }
 
-def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CONFIG, perfMode=false, stageName="Undefined", splitId=1, splits=1, skipInstallWheel=false, cpver="cp312", typeCheck=false)
+/**
+ * Decode a postTag into the postTags used by prior attempts of the same
+ * stage in this build.
+ *
+ * The retry runners compose postTag from two retry layers:
+ *   - runKubernetesPodWithInfraRetry (outer K8s pod retry) contributes
+ *     ``"-pod-${P}"`` for outer attempt P>=2 (and ``""`` for P=1).
+ *   - runLLMTestlistOnSlurm (inner SLURM retry) appends ``"-attempt-${I}"``
+ *     for inner attempt I>=2 (and ``""`` for I=1).
+ * The two suffixes nest: full postTag = ``${base}${outerTag}${innerSuffix}``
+ * where base is the caller-supplied prefix (e.g. ``""`` or
+ * ``"-SubJob-RunTest"``). The ``-pod-`` and ``-attempt-`` separators are
+ * distinct so the nested form is unambiguous.
+ *
+ * This function inverts that composition to enumerate the postTags of
+ * earlier attempts so reusePassedTestResults() can locate their uploaded
+ * tarballs.
+ *
+ * Returns an empty list when ``postTag`` does not encode a retry — either
+ * attempt 1 of attempt 1 (``postTag == ""``), or a caller-supplied tag that
+ * never went through the retry loop (e.g. ``"-SubJob-RunTest"``).
+ *
+ * For nested cases we don't know how many inner attempts each prior outer
+ * pod attempt completed, so we over-enumerate up to SLURM_INFRA_RETRY_MAX+1;
+ * the HTTP probe in reusePassedTestResults handles 404 for absent tarballs.
+ *
+ * Examples (with default SLURM_INFRA_RETRY_MAX=2):
+ *
+ *   ""                            -> []
+ *   "-attempt-2"                  -> [""]
+ *   "-attempt-3"                  -> ["", "-attempt-2"]
+ *   "-pod-2"                      -> ["", "-attempt-2", "-attempt-3"]
+ *   "-pod-2-attempt-2"            -> ["", "-attempt-2", "-attempt-3", "-pod-2"]
+ *   "-SubJob-RunTest"             -> []
+ *   "-SubJob-RunTest-pod-2"       -> ["-SubJob-RunTest", "-SubJob-RunTest-attempt-2", "-SubJob-RunTest-attempt-3"]
+ *
+ * @param postTag the current attempt's full tar suffix.
+ * @return List of postTag strings, ordered oldest-attempt-first.
+ */
+@NonCPS
+def priorAttemptTags(String postTag) {
+    if (!postTag) return []
+    // Peel "-attempt-N" suffix (inner SLURM retry counter) if present.
+    String remaining = postTag
+    Integer innerAttempt = null
+    def mInner = remaining =~ /^(.*)-attempt-(\d+)$/
+    if (mInner.matches()) {
+        innerAttempt = (mInner[0][2] as Integer)
+        remaining = mInner[0][1]
+    }
+    // Peel "-pod-P" suffix (outer K8s retry counter) if present.
+    Integer podAttempt = null
+    def mPod = remaining =~ /^(.*)-pod-(\d+)$/
+    if (mPod.matches()) {
+        podAttempt = (mPod[0][2] as Integer)
+        remaining = mPod[0][1]
+    }
+    String base = remaining
+    if (innerAttempt == null && podAttempt == null) return []   // no retry encoded
+    int outerN = podAttempt ?: 1
+    int innerN = innerAttempt ?: 1
+    int maxInner = SLURM_INFRA_RETRY_MAX + 1
+    def priors = []
+    // Earlier outer attempts (1..outerN-1) with all possible inner attempts.
+    for (int p = 1; p < outerN; p++) {
+        String podSuffix = (p == 1) ? "" : "-pod-${p}"
+        priors << "${base}${podSuffix}".toString()                          // inner attempt 1
+        for (int i = 2; i <= maxInner; i++) {
+            priors << "${base}${podSuffix}-attempt-${i}".toString()
+        }
+    }
+    // Current outer attempt's earlier inner attempts (1..innerN-1).
+    String thisPodSuffix = (outerN == 1) ? "" : "-pod-${outerN}"
+    if (innerN > 1) {
+        priors << "${base}${thisPodSuffix}".toString()                      // inner attempt 1
+        for (int i = 2; i < innerN; i++) {
+            priors << "${base}${thisPodSuffix}-attempt-${i}".toString()
+        }
+    }
+    return priors
+}
+
+def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CONFIG, perfMode=false, stageName="Undefined", splitId=1, splits=1, skipInstallWheel=false, cpver="cp312", typeCheck=false, String postTag="")
 {
     // Step 1: create LLM_ROOT dir and clean up the workspace
     def llmRootConfig = "${LLM_ROOT}${config}"
@@ -2654,14 +3147,14 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
         def noRegularTests = false
         def noIsolateTests = false
         def rerunFailed = false
-        def testDBList = renderTestDB(testList, llmSrc, stageName)
+        def testDBList = renderTestDB(pipeline, testList, llmSrc, stageName)
 
         // Download and Merge waives.txt
         mergeWaivesTxt(pipeline, llmSrc, stageName)
 
         // Add passed test list from previous pipeline run to the waives.txt
         if (testFilter[(REUSE_TEST)] != false) {
-            reusePassedTestResults(llmSrc, stageName, "${llmSrc}/tests/integration/test_lists/waives.txt")
+            reusePassedTestResults(llmSrc, stageName, "${llmSrc}/tests/integration/test_lists/waives.txt", postTag)
         }
 
         // Process shard test list and create separate files for regular and isolate tests
@@ -2845,10 +3338,24 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
 }
 
 
-def runLLMTestlistOnPlatform(pipeline, platform, testList, config=VANILLA_CONFIG, perfMode=false, stageName="Undefined", splitId=1, splits=1, skipInstallWheel=false, cpver="cp312", postTag="", typeCheck=false)
+// Single-attempt test path. The infra-failure retry loop now lives one layer up
+// in `runKubernetesPodWithInfraRetry` so that retries get a fresh K8s pod
+// (recovering from ImagePullBackOff, pod eviction, OOMKilled, JNLP disconnect,
+// etc.). Callers that want pod-level retry pass through `postTag` (already
+// composed with an attempt tag by the helper) and `isFinalAttempt` (so this
+// function's `cacheErrorAndUploadResult` can suppress synthetic stage-fail XML
+// and junit() for intermediate retryable failures).
+def runLLMTestlistOnPlatform(pipeline, platform, testList, config=VANILLA_CONFIG, perfMode=false, stageName="Undefined", splitId=1, splits=1, skipInstallWheel=false, cpver="cp312", postTag="", typeCheck=false, boolean isFinalAttempt=true, Map retryContext=null)
 {
+    def collapse = _cbtsMaybeCollapseSplits(stageName, splitId, splits)
+    if (collapse.skip) {
+        return
+    }
+    splits = collapse.splits
+    splitId = collapse.splitId
+
     cacheErrorAndUploadResult(stageName, {
-        runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config, perfMode, stageName, splitId, splits, skipInstallWheel, cpver, typeCheck)
+        runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config, perfMode, stageName, splitId, splits, skipInstallWheel, cpver, typeCheck, postTag)
     }, {
         if (testFilter[(DEBUG_MODE)]) {
             try {
@@ -2867,7 +3374,7 @@ def runLLMTestlistOnPlatform(pipeline, platform, testList, config=VANILLA_CONFIG
         }
         // If the execution test list is null, remove the test result xml
         sh """
-            ls -all ${stageName}/
+            ls -al ${stageName}/
             if ! grep -q '<testcase' ${stageName}/results.xml; then
                 rm ${stageName}/results.xml || true
             fi
@@ -2875,8 +3382,8 @@ def runLLMTestlistOnPlatform(pipeline, platform, testList, config=VANILLA_CONFIG
         def llmPath = sh (script: "realpath .", returnStdout: true).trim()
         def llmSrc = "${llmPath}/${LLM_ROOT}${config}/TensorRT-LLM/src"
         // CPP tests will generate test result in ${llmSrc}/cpp/build_backup/, move these files to job result folder
-        sh "ls -all ${llmSrc}/cpp/build_backup/ || true"
-        sh "ls -all ${llmSrc}/cpp/build/ || true"
+        sh "ls -al ${llmSrc}/cpp/build_backup/ || true"
+        sh "ls -al ${llmSrc}/cpp/build/ || true"
         // Sed for CPP test result
         sh "cd ${llmSrc}/cpp/build_backup/ && sed -i 's/\" classname=\"/\" classname=\"${stageName}./g' *.xml || true"
         sh "cd ${llmSrc}/cpp/build_backup/ && sed -i 's/testsuite name=\"[^\"]*\"/testsuite name=\"${stageName}\"/g' *.xml || true"
@@ -2885,18 +3392,21 @@ def runLLMTestlistOnPlatform(pipeline, platform, testList, config=VANILLA_CONFIG
         // Copy CPP test result
         sh "cp ${llmSrc}/cpp/build_backup/*.xml ${stageName} || true"
         sh "ls -al ${stageName}/"
-    }, false, postTag)
+    }, false, postTag, isFinalAttempt, retryContext)
 }
 
 
-def checkPipInstall(pipeline, wheel_path)
+def checkPipInstall(pipeline, wheel_path, version_local)
 {
     def wheelArtifactLinks = "https://urm.nvidia.com/artifactory/${UPLOAD_PATH}/${wheel_path}"
-    trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${LLM_ROOT}/tests/unittest && python3 test_pip_install.py --wheel_path ${wheelArtifactLinks}")
+    trtllm_utils.llmExecStepWithRetry(pipeline, script: """
+        cd ${LLM_ROOT}/tests/unittest && \
+        python3 test_pip_install.py --wheel_path ${wheelArtifactLinks} --version_local "${version_local}"
+        """)
 }
 
 
-def runLLMBuild(pipeline, cpu_arch, reinstall_dependencies=false, wheel_path="", cpver="cp312")
+def runLLMBuild(pipeline, cpu_arch, reinstall_dependencies=false, wheel_path="", version_local="", cpver="cp312")
 {
     sh "pwd && ls -alh"
     sh "env | sort"
@@ -2925,6 +3435,18 @@ def runLLMBuild(pipeline, cpu_arch, reinstall_dependencies=false, wheel_path="",
     buildArgs = "--clean --nixl_root /opt/nvidia/nvda_nixl"
     if (cpu_arch == AARCH64_TRIPLE) {
         buildArgs += " -a '90-real;100-real;103-real;120-real'"
+    }
+
+    if (version_local) {
+        sh """
+            cd tensorrt_llm
+            sed -i.bak 's/^__version__ = "\\(.*\\)"\$/__version__ = "\\1+${version_local}"/' tensorrt_llm/version.py
+            if diff tensorrt_llm/version.py.bak tensorrt_llm/version.py; then
+                echo "ERROR: failed to inject local version '+${version_local}' into tensorrt_llm/version.py" >&2
+                exit 1
+            fi
+            rm tensorrt_llm/version.py.bak
+        """
     }
 
     withCredentials([usernamePassword(credentialsId: "urm-artifactory-creds", usernameVariable: 'CONAN_LOGIN_USERNAME', passwordVariable: 'CONAN_PASSWORD')]) {
@@ -3022,10 +3544,18 @@ def runPackageSanityCheck(pipeline, wheel_path, reinstall_dependencies=false, cp
 
 def checkStageNameSet(stageNames, jobKeys, paramName) {
     echo "Validate stage names for the passed GitLab bot params [${paramName}]."
-    invalidStageName = stageNames.findAll { !(it in jobKeys) }
-    if (invalidStageName) {
+    def unmatchedNames = stageNames.findAll { pattern ->
+        if (pattern.contains('*')) {
+            // Wildcard pattern: check that it matches at least one stage
+            !jobKeys.any { key -> stageMatchesPattern(key, pattern) }
+        } else {
+            // Exact name: check that it exists
+            !(pattern in jobKeys)
+        }
+    }
+    if (unmatchedNames) {
         def sortedJobKeys = jobKeys.sort()
-        throw new Exception("Cannot find the stage names [${invalidStageName}] from the passed params [${paramName}]. Available stage names (${sortedJobKeys.size()} total):\n${sortedJobKeys.collect { "    ${it}" }.join('\n')}")
+        throw new Exception("Cannot find the stage names [${unmatchedNames}] from the passed params [${paramName}]. Available stage names (${sortedJobKeys.size()} total):\n${sortedJobKeys.collect { "    ${it}" }.join('\n')}")
     }
 }
 
@@ -3103,6 +3633,110 @@ def runInKubernetes(pipeline, podSpec, containerName)
     }
 }
 
+// Retry-aware K8s pod launcher. Mirrors the SLURM retry loop's classification
+// (classify(ex, InfraFailure.K8S)), budget (K8S_INFRA_RETRY_MAX), and backoff,
+// but operates at the pod-launch level so transient pod failures
+// (ImagePullBackOff, eviction, OOMKilled, JNLP disconnect, node NotReady) get
+// a fresh pod on each retry rather than
+// retrying the test body inside a dying pod.
+//
+// `runner` is invoked with `(attemptTag, isFinalAttempt, retryContext)`. Callers append
+// `attemptTag` to any postTag they pass into cacheErrorAndUploadResult so each
+// attempt's tar and ensureStageResultNotUploaded guard key are unique;
+// `isFinalAttempt` lets cacheErrorAndUploadResult suppress synthetic stage-fail
+// XML and junit() for intermediate retryable failures so the per-build test
+// report isn't poisoned by transient infra blips that the next attempt
+// recovers from.
+def runKubernetesPodWithInfraRetry(pipeline, podSpec, containerName, String stageName, Closure runner)
+{
+    // DEBUG_MODE preserves the existing 2-hour-input human-inspection workflow
+    // inside runLLMTestlistOnPlatform's finallyRunner: a single attempt only.
+    if (testFilter[(DEBUG_MODE)]) {
+        trtllm_utils.launchKubernetesPod(pipeline, podSpec, containerName, { runner("", true, null) })
+        return
+    }
+
+    def attempt = 0
+    // Severity of the previous attempt's classification, or null on first attempt.
+    // Used to compute isFinalAttempt for the next attempt: a PERSISTENT prior
+    // failure caps the budget at 1 retry (attempt 2 is final), so the next
+    // attempt must not suppress synthetic stage-fail XML / junit().
+    def lastSeverity = null
+    while (true) {
+        attempt++
+        try {
+            if (attempt > 1) {
+                echo "[INFRA-RETRY] ${stageName}: Starting attempt ${attempt} of ${K8S_INFRA_RETRY_MAX + 1}"
+            }
+            // Attempt 1 keeps the caller-supplied postTag verbatim so the
+            // canonical artifact name is unchanged for downstream consumers.
+            // Retries append "-pod-N" to dodge the upload-once guard and
+            // preserve every attempt's tarball in Artifactory. The "-pod-"
+            // separator is distinct from the inner SLURM retry's "-attempt-"
+            // suffix so the two nest unambiguously: outer-pod 2 / inner-attempt
+            // 2 yields "-pod-2-attempt-2" rather than colliding with "-attempt-2".
+            def attemptTag = (attempt == 1) ? "" : "-pod-${attempt}"
+            // For attempt 1 we don't yet know whether the failure (if any) will
+            // be PERSISTENT, so use the worst-case multi-retry budget. From
+            // attempt 2 onward we know the prior classification — if it was
+            // PERSISTENT, effectiveMax for THIS attempt is 1, meaning attempt
+            // 2 IS the final attempt; pass isFinalAttempt=true so the inner
+            // cacheErrorAndUploadResult does not suppress synthetic stage-fail
+            // XML / junit() on what would otherwise look (to it) like just
+            // another intermediate attempt.
+            def effectiveMaxThisAttempt = (lastSeverity == InfraFailure.PERSISTENT) ? 1 : K8S_INFRA_RETRY_MAX
+            boolean isFinalAttempt = (attempt > effectiveMaxThisAttempt)
+            def retryContext = [
+                scope: InfraFailure.K8S,
+                stageName: stageName,
+                attempt: attempt,
+                backoffMs: 60L * 1000L,
+            ]
+            trtllm_utils.launchKubernetesPod(pipeline, podSpec, containerName, { runner(attemptTag, isFinalAttempt, retryContext) })
+            if (attempt > 1) {
+                echo "[INFRA-RETRY] ${stageName}: Succeeded on attempt ${attempt}"
+            }
+            return
+        } catch (InterruptedException e) {
+            // User abort / pipeline timeout -- never retry
+            throw e
+        } catch (Exception e) {
+            // classify() handles FlowInterruptedException + exit-code-143 +
+            // typed throws + cause-chain pattern matching, returning one of
+            // PipelineInterruption / InfraFailure / UserFailure. Scope=K8S
+            // ensures we only match catalog rows tagged K8S or BOTH; the new
+            // scope-isolation guard inside classify() also prevents a typed
+            // SLURM-scoped InfraFailure (e.g. from an inner SLURM retry that
+            // exhausted its own budget) from being treated as K8s infra here.
+            def c = FailureClassifier.classify(e, InfraFailure.K8S)
+            if (c instanceof PipelineInterruption) throw e
+            if (!(c instanceof InfraFailure))      throw e   // UserFailure -> don't retry
+
+            def effectiveMax = (c.severity == InfraFailure.PERSISTENT) ? 1 : K8S_INFRA_RETRY_MAX
+
+            if (attempt > effectiveMax) {
+                echo "[INFRA-RETRY] ${stageName}: Infrastructure failure (${c.detectedPattern}) " +
+                     "but max retries (${effectiveMax}) exhausted after ${attempt} attempts. Failing."
+                throw e
+            }
+            if (!hasBudgetForInfraRetry(pipeline, stageName, InfraFailure.K8S, c, attempt, effectiveMax, 60L * 1000L, true)) {
+                echo "[INFRA-RETRY] ${stageName}: Infrastructure failure (${c.detectedPattern}) is retryable, " +
+                     "but remaining CI timeout budget is too small for another K8s attempt. Failing without retry."
+                throw e
+            }
+
+            echo "[INFRA-RETRY] ${stageName}: Infrastructure failure detected on attempt ${attempt}: " +
+                 "${c.detectedPattern}"
+            echo "[INFRA-RETRY] ${stageName}: Exception: ${e.toString()}"
+            echo "[INFRA-RETRY] ${stageName}: Will retry (attempt ${attempt + 1} of ${effectiveMax + 1}) after 60s cooldown."
+
+            // Remember severity so the next attempt's isFinalAttempt is correct.
+            lastSeverity = c.severity
+            sleep(60)
+        }
+    }
+}
+
 def buildStageConfigs(stageName, platform, testlist, testCount, gpuCount, nodeCount, runWithSbatch=false) {
     def configs = [:]
     for (int k = 1; k <= testCount; k++) {
@@ -3135,19 +3769,11 @@ def launchTestJobs(pipeline, testFilter)
         "DGX_H100-4_GPUs-CPP-1": ["dgx-h100-x4", "l0_dgx_h100", 1, 1, 4],
         "A10-PyTorch-1": ["a10", "l0_a10", 1, 2],
         "A10-PyTorch-2": ["a10", "l0_a10", 2, 2],
-        "A10-CPP-1": ["a10", "l0_a10", 1, 1],
-        "A10-TensorRT-1": ["a10", "l0_a10", 1, 5],
-        "A10-TensorRT-2": ["a10", "l0_a10", 2, 5],
-        "A10-TensorRT-3": ["a10", "l0_a10", 3, 5],
-        "A10-TensorRT-4": ["a10", "l0_a10", 4, 5],
-        "A10-TensorRT-5": ["a10", "l0_a10", 5, 5],
-        "A30-Triton-1": ["a30", "l0_a30", 1, 1],
+        "A10-TensorRT-1": ["a10", "l0_a10", 1, 1],
         "A30-PyTorch-1": ["a30", "l0_a30", 1, 2],
         "A30-PyTorch-2": ["a30", "l0_a30", 2, 2],
+        "A10-CPP-1": ["a10", "l0_a10", 1, 1],
         "A30-AutoDeploy-1": ["a30", "l0_a30", 1, 1],
-        "A30-CPP-1": ["a30", "l0_a30", 1, 3],
-        "A30-CPP-2": ["a30", "l0_a30", 2, 3],
-        "A30-CPP-3": ["a30", "l0_a30", 3, 3],
         "A100X-PyTorch-1": ["a100x", "l0_a100", 1, 1],
         "L40S-PyTorch-1": ["l40s", "l0_l40s", 1, 2],
         "L40S-PyTorch-2": ["l40s", "l0_l40s", 2, 2],
@@ -3161,8 +3787,9 @@ def launchTestJobs(pipeline, testFilter)
         // Currently post-merge test stages only run tests with "stage: post_merge" mako
         // in the test-db. This behavior may change in the future.
         "A10-PyTorch-Post-Merge-1": ["a10", "l0_a10", 1, 1],
-        // "A10-TensorRT-Post-Merge-1": ["a10", "l0_a10", 1, 2],
-        // "A10-TensorRT-Post-Merge-2": ["a10", "l0_a10", 2, 2],
+        "A10-TensorRT-Post-Merge-1": ["a10", "l0_a10", 1, 3],
+        "A10-TensorRT-Post-Merge-2": ["a10", "l0_a10", 2, 3],
+        "A10-TensorRT-Post-Merge-3": ["a10", "l0_a10", 3, 3],
         "A10-FMHA-Post-Merge-1": ["a10", "l0_a10", 1, 1],
         // "A30-TensorRT-Post-Merge-1": ["a30", "l0_a30", 1, 6],
         // "A30-TensorRT-Post-Merge-2": ["a30", "l0_a30", 2, 6],
@@ -3170,7 +3797,8 @@ def launchTestJobs(pipeline, testFilter)
         // "A30-TensorRT-Post-Merge-4": ["a30", "l0_a30", 4, 6],
         // "A30-TensorRT-Post-Merge-5": ["a30", "l0_a30", 5, 6],
         // "A30-TensorRT-Post-Merge-6": ["a30", "l0_a30", 6, 6],
-        "A30-CPP-Post-Merge-1": ["a30", "l0_a30", 1, 1],
+        "A30-CPP-Post-Merge-1": ["a30", "l0_a30", 1, 2],
+        "A30-CPP-Post-Merge-2": ["a30", "l0_a30", 2, 2],
         "A30-Triton-Post-Merge-1": ["a30", "l0_a30", 1, 2],
         "A30-Triton-Post-Merge-2": ["a30", "l0_a30", 2, 2],
         // "A100X-TensorRT-Post-Merge-1": ["a100x", "l0_a100", 1, 6],
@@ -3202,6 +3830,7 @@ def launchTestJobs(pipeline, testFilter)
         "DGX_H200-4_GPUs-Triton-Post-Merge-1": ["dgx-h200-x4", "l0_dgx_h200", 1, 1, 4],
         "DGX_H200-8_GPUs-PyTorch-Post-Merge-1": ["dgx-h200-x8", "l0_dgx_h200", 1, 1, 8],
         "DGX_H200-4_GPUs-PyTorch-Post-Merge-1": ["dgx-h200-x4", "l0_dgx_h200", 1, 1, 4],
+        "DGX_H200-8_GPUs-PyTorch-PerfSanity-Post-Merge-1": ["dgx-h200-x8", "l0_dgx_h200_perf_sanity", 1, 1, 8],
         // "DGX_H200-4_GPUs-TensorRT-Post-Merge-1": ["dgx-h200-x4", "l0_dgx_h200", 1, 3, 4],
         // "DGX_H200-4_GPUs-TensorRT-Post-Merge-2": ["dgx-h200-x4", "l0_dgx_h200", 2, 3, 4],
         // "DGX_H200-4_GPUs-TensorRT-Post-Merge-3": ["dgx-h200-x4", "l0_dgx_h200", 3, 3, 4],
@@ -3216,7 +3845,7 @@ def launchTestJobs(pipeline, testFilter)
         "RTXPro6000D-4_GPUs-PyTorch-Post-Merge-2": ["rtx-pro-6000d-x4", "l0_rtx_pro_6000", 2, 2, 4],
     ]
 
-    parallelJobs = x86TestConfigs.collectEntries{key, values -> [key, [createKubernetesPodConfig(LLM_DOCKER_IMAGE, values[0], "amd64", values[4] ?: 1, key.contains("-Perf-")), {
+    parallelJobs = x86TestConfigs.collectEntries{key, values -> [key, [createKubernetesPodConfig(LLM_DOCKER_IMAGE, values[0], "amd64", values[4] ?: 1, key.contains("-Perf-")), { attemptTag, isFinalAttempt, retryContext = null ->
         def config = VANILLA_CONFIG
         if (key.contains("single-device")) {
             config = SINGLE_DEVICE_CONFIG
@@ -3224,7 +3853,7 @@ def launchTestJobs(pipeline, testFilter)
         if (key.contains("llvm")) {
             config = LLVM_CONFIG
         }
-        runLLMTestlistOnPlatform(pipeline, values[0], values[1], config, key.contains("-Perf-"), key, values[2], values[3])
+        runLLMTestlistOnPlatform(pipeline, values[0], values[1], config, key.contains("-Perf-"), key, values[2], values[3], false, "cp312", attemptTag, false, isFinalAttempt, retryContext)
     }]]}
     fullSet = parallelJobs.keySet()
 
@@ -3247,9 +3876,11 @@ def launchTestJobs(pipeline, testFilter)
         "DGX_H100-4_GPUs-PyTorch-Ray-1": ["auto:dgx-h100-x4", "l0_dgx_h100", 1, 1, 4],
         "DGX_H100-4_GPUs-AutoDeploy-1": ["auto:dgx-h100-x4", "l0_dgx_h100", 1, 1, 4],
         "DGX_H100-4_GPUs-AutoDeploy-Post-Merge-1": ["auto:dgx-h100-x4", "l0_dgx_h100", 1, 1, 4],
-        "DGX_B200-PyTorch-1": ["auto:dgx-b200-flex", "l0_b200", 1, 3, 1, 1, true],
-        "DGX_B200-PyTorch-2": ["auto:dgx-b200-flex", "l0_b200", 2, 3, 1, 1, true],
-        "DGX_B200-PyTorch-3": ["auto:dgx-b200-flex", "l0_b200", 3, 3, 1, 1, true],
+        "DGX_B200-PyTorch-1": ["auto:dgx-b200-flex", "l0_b200", 1, 5, 1, 1, true],
+        "DGX_B200-PyTorch-2": ["auto:dgx-b200-flex", "l0_b200", 2, 5, 1, 1, true],
+        "DGX_B200-PyTorch-3": ["auto:dgx-b200-flex", "l0_b200", 3, 5, 1, 1, true],
+        "DGX_B200-PyTorch-4": ["auto:dgx-b200-flex", "l0_b200", 4, 5, 1, 1, true],
+        "DGX_B200-PyTorch-5": ["auto:dgx-b200-flex", "l0_b200", 5, 5, 1, 1, true],
         "DGX_B200-AutoDeploy-1": ["auto:dgx-b200-flex", "l0_b200", 1, 1, 1, 1, true],
         "DGX_B200-Triton-Post-Merge-1": ["auto:dgx-b200-flex", "l0_b200", 1, 1, 1, 1, true],
         "DGX_B200-PyTorch-Post-Merge-1": ["auto:dgx-b200-flex", "l0_b200", 1, 2, 1, 1, true],
@@ -3261,22 +3892,41 @@ def launchTestJobs(pipeline, testFilter)
         "DGX_B200-4_GPUs-AutoDeploy-1": ["auto:dgx-b200-flex", "l0_dgx_b200", 1, 1, 4, 1, true],
         "DGX_B200-4_GPUs-PyTorch-Post-Merge-1": ["auto:dgx-b200-flex", "l0_dgx_b200", 1, 2, 4, 1, true],
         "DGX_B200-4_GPUs-PyTorch-Post-Merge-2": ["auto:dgx-b200-flex", "l0_dgx_b200", 2, 2, 4, 1, true],
-        "DGX_B200-8_GPUs-PyTorch-1": ["auto:dgx-b200-flex", "l0_dgx_b200", 1, 1, 8, 1, true],
+        "DGX_B200-8_GPUs-PyTorch-1": ["auto:dgx-b200-flex", "l0_dgx_b200", 1, 2, 8, 1, true],
+        "DGX_B200-8_GPUs-PyTorch-2": ["auto:dgx-b200-flex", "l0_dgx_b200", 2, 2, 8, 1, true],
         "DGX_B200-8_GPUs-AutoDeploy-Post-Merge-1": ["auto:dgx-b200-flex", "l0_dgx_b200", 1, 1, 8, 1, true],
         "DGX_B200-4_GPUs-Verl-Post-Merge-1": ["auto:dgx-b200-flex", "l0_verl", 1, 1, 4, 1, true],
         "B300-PyTorch-1": ["b300-single", "l0_b300", 1, 1],
         "DGX_B300-4_GPUs-PyTorch-1": ["b300-x4", "l0_dgx_b300", 1, 1, 4],
         "DGX_B300-4_GPUs-PyTorch-Post-Merge-1": ["b300-x4", "l0_dgx_b300", 1, 2, 4],
         "DGX_B300-4_GPUs-PyTorch-Post-Merge-2": ["b300-x4", "l0_dgx_b300", 2, 2, 4],
+        // VisualGen PerfSanity post-merge test
+        "DGX_B200-8_GPUs-PyTorch-VisualGen-PerfSanity-Post-Merge-1": ["auto:dgx-b200-flex", "l0_b200_visual_gen_perf_sanity", 1, 1, 8, 1, true],
         // PerfSanity post-merge tests
         "DGX_B200-8_GPUs-PyTorch-PerfSanity-Post-Merge-1": ["auto:dgx-b200-flex", "l0_b200_multi_gpus_perf_sanity", 1, 4, 8, 1, true],
         "DGX_B200-8_GPUs-PyTorch-PerfSanity-Post-Merge-2": ["auto:dgx-b200-flex", "l0_b200_multi_gpus_perf_sanity", 2, 4, 8, 1, true],
         "DGX_B200-8_GPUs-PyTorch-PerfSanity-Post-Merge-3": ["auto:dgx-b200-flex", "l0_b200_multi_gpus_perf_sanity", 3, 4, 8, 1, true],
         "DGX_B200-8_GPUs-PyTorch-PerfSanity-Post-Merge-4": ["auto:dgx-b200-flex", "l0_b200_multi_gpus_perf_sanity", 4, 4, 8, 1, true],
     ]
+    // B200 PerfSanity post-merge disaggregated
+    // 2 Nodes
+    x86SlurmTestConfigs += buildStageConfigs(
+        "DGX_B200-16_GPUs-2_Nodes-PyTorch-Disagg-PerfSanity-CTX1-NODE1-GPU4-GEN1-NODE1-GPU8-Post-Merge",
+        "auto:dgx-b200-flex",
+        "l0_b200_multi_nodes_perf_sanity_ctx1_node1_gpu4_gen1_node1_gpu8",
+        6,
+        16,
+        2
+    )
     fullSet += x86SlurmTestConfigs.keySet()
 
-    parallelSlurmJobs = x86SlurmTestConfigs.collectEntries{key, values -> [key, [createKubernetesPodConfig(LLM_DOCKER_IMAGE, "slurm", "amd64"), {
+    parallelSlurmJobs = x86SlurmTestConfigs.collectEntries{key, values -> [key, [createKubernetesPodConfig(LLM_DOCKER_IMAGE, "slurm", "amd64"), { attemptTag, isFinalAttempt, retryContext = null ->
+        // attemptTag comes from runKubernetesPodWithInfraRetry for the outer
+        // dispatcher pod and is threaded into runLLMTestlistOnSlurm so the
+        // inner SLURM retry can prefix its postTag with the outer attempt's
+        // tag. Without this, a new dispatcher pod's inner attempt 1 would
+        // compute postTag="" and collide with the dead pod's already-recorded
+        // upload in GlobalState.uploadResultStageNames.
         def config = VANILLA_CONFIG
         if (key.contains("single-device")) {
             config = SINGLE_DEVICE_CONFIG
@@ -3284,7 +3934,7 @@ def launchTestJobs(pipeline, testFilter)
         if (key.contains("llvm")) {
             config = LLVM_CONFIG
         }
-        runLLMTestlistOnSlurm(pipeline, values[0], values[1], config, key.contains("-Perf-"), key, values[2], values[3], values[4] ?: 1, values[5] ?: 1, values[6] ?: false)
+        runLLMTestlistOnSlurm(pipeline, values[0], values[1], config, key.contains("-Perf-"), key, values[2], values[3], values[4] ?: 1, values[5] ?: 1, values[6] ?: false, false, "cp312", attemptTag)
     }]]}
 
     parallelJobs += parallelSlurmJobs
@@ -3302,11 +3952,12 @@ def launchTestJobs(pipeline, testFilter)
         "GB200-4_GPUs-PyTorch-2": ["auto:gb200-x4", "l0_gb200_multi_gpus", 2, 2, 4],
         "GB200-4_GPUs-PyTorch-Post-Merge-1": ["auto:gb200-x4", "l0_gb200_multi_gpus", 1, 1, 4],
         "GB10-PyTorch-Post-Merge-1": ["gb10x-single", "l0_gb10", 1, 1],
-        // Disable GB300 stages due to nodes will be offline temporarily.
-        // "GB300-PyTorch-1": ["gb300-single", "l0_gb300", 1, 1],
-        "GB300-4_GPUs-PyTorch-Post-Merge-1": ["auto:gb300-x4", "l0_gb300_multi_gpus", 1, 1, 4],
+        "GB300-PyTorch-1": ["auto:gb300-x4", "l0_gb300", 1, 1],
+        "GB300-4_GPUs-PyTorch-Post-Merge-1": ["auto:gb300-x4", "l0_gb300_multi_gpus", 1, 2, 4],
+        "GB300-4_GPUs-PyTorch-Post-Merge-2": ["auto:gb300-x4", "l0_gb300_multi_gpus", 2, 2, 4],
         // PerfSanity pre-merge tests
-        "GB200-4_GPUs-PyTorch-PerfSanity-1": ["auto:gb200-x4", "l0_gb200_multi_gpus_perf_sanity", 1, 1, 4],
+        "GB200-4_GPUs-PyTorch-PerfSanity-1": ["auto:gb200-x4", "l0_gb200_multi_gpus_perf_sanity", 1, 2, 4],
+        "GB200-4_GPUs-PyTorch-PerfSanity-2": ["auto:gb200-x4", "l0_gb200_multi_gpus_perf_sanity", 2, 2, 4],
         // PerfSanity post-merge tests
         "GB200-4_GPUs-PyTorch-PerfSanity-Post-Merge-1": ["auto:gb200-x4", "l0_gb200_multi_gpus_perf_sanity", 1, 7, 4],
         "GB200-4_GPUs-PyTorch-PerfSanity-Post-Merge-2": ["auto:gb200-x4", "l0_gb200_multi_gpus_perf_sanity", 2, 7, 4],
@@ -3315,6 +3966,8 @@ def launchTestJobs(pipeline, testFilter)
         "GB200-4_GPUs-PyTorch-PerfSanity-Post-Merge-5": ["auto:gb200-x4", "l0_gb200_multi_gpus_perf_sanity", 5, 7, 4],
         "GB200-4_GPUs-PyTorch-PerfSanity-Post-Merge-6": ["auto:gb200-x4", "l0_gb200_multi_gpus_perf_sanity", 6, 7, 4],
         "GB200-4_GPUs-PyTorch-PerfSanity-Post-Merge-7": ["auto:gb200-x4", "l0_gb200_multi_gpus_perf_sanity", 7, 7, 4],
+        "GB300-4_GPUs-PyTorch-PerfSanity-Post-Merge-1": ["auto:gb300-x4", "l0_gb300_multi_gpus_perf_sanity", 1, 2, 4],
+        "GB300-4_GPUs-PyTorch-PerfSanity-Post-Merge-2": ["auto:gb300-x4", "l0_gb300_multi_gpus_perf_sanity", 2, 2, 4],
     ]
     fullSet += SBSASlurmTestConfigs.keySet()
 
@@ -3343,7 +3996,7 @@ def launchTestJobs(pipeline, testFilter)
         "GB200-8_GPUs-2_Nodes-PyTorch-Disagg-PerfSanity-CTX1-NODE1-GPU1-GEN1-NODE1-GPU2-Post-Merge",
         "auto:gb200-flex",
         "l0_gb200_multi_nodes_perf_sanity_ctx1_node1_gpu1_gen1_node1_gpu2",
-        3,
+        4,
         8,
         2
     )
@@ -3351,7 +4004,7 @@ def launchTestJobs(pipeline, testFilter)
         "GB200-8_GPUs-2_Nodes-PyTorch-Disagg-PerfSanity-CTX1-NODE1-GPU1-GEN1-NODE1-GPU4-Post-Merge",
         "auto:gb200-flex",
         "l0_gb200_multi_nodes_perf_sanity_ctx1_node1_gpu1_gen1_node1_gpu4",
-        4,
+        7,
         8,
         2
     )
@@ -3359,7 +4012,7 @@ def launchTestJobs(pipeline, testFilter)
         "GB200-8_GPUs-2_Nodes-PyTorch-Disagg-PerfSanity-CTX1-NODE1-GPU4-GEN1-NODE1-GPU4-Post-Merge",
         "auto:gb200-flex",
         "l0_gb200_multi_nodes_perf_sanity_ctx1_node1_gpu4_gen1_node1_gpu4",
-        3,
+        5,
         8,
         2
     )
@@ -3368,7 +4021,7 @@ def launchTestJobs(pipeline, testFilter)
         "GB200-12_GPUs-3_Nodes-PyTorch-Disagg-PerfSanity-CTX1-NODE1-GPU1-GEN1-NODE2-GPU8-Post-Merge",
         "auto:gb200-flex",
         "l0_gb200_multi_nodes_perf_sanity_ctx1_node1_gpu1_gen1_node2_gpu8",
-        1,
+        2,
         12,
         3
     )
@@ -3376,7 +4029,7 @@ def launchTestJobs(pipeline, testFilter)
         "GB200-12_GPUs-3_Nodes-PyTorch-Disagg-PerfSanity-CTX1-NODE1-GPU4-GEN1-NODE2-GPU8-Post-Merge",
         "auto:gb200-flex",
         "l0_gb200_multi_nodes_perf_sanity_ctx1_node1_gpu4_gen1_node2_gpu8",
-        7,
+        8,
         12,
         3
     )
@@ -3385,7 +4038,7 @@ def launchTestJobs(pipeline, testFilter)
         "GB200-16_GPUs-4_Nodes-PyTorch-Disagg-PerfSanity-CTX1-NODE2-GPU8-GEN1-NODE2-GPU8-Post-Merge",
         "auto:gb200-flex",
         "l0_gb200_multi_nodes_perf_sanity_ctx1_node2_gpu8_gen1_node2_gpu8",
-        1,
+        2,
         16,
         4
     )
@@ -3394,7 +4047,7 @@ def launchTestJobs(pipeline, testFilter)
         "GB200-20_GPUs-5_Nodes-PyTorch-Disagg-PerfSanity-CTX1-NODE1-GPU4-GEN1-NODE4-GPU16-Post-Merge",
         "auto:gb200-flex",
         "l0_gb200_multi_nodes_perf_sanity_ctx1_node1_gpu4_gen1_node4_gpu16",
-        2,
+        4,
         20,
         5
     )
@@ -3411,7 +4064,7 @@ def launchTestJobs(pipeline, testFilter)
         "GB200-24_GPUs-6_Nodes-PyTorch-Disagg-PerfSanity-CTX1-NODE2-GPU8-GEN1-NODE4-GPU16-Post-Merge",
         "auto:gb200-flex",
         "l0_gb200_multi_nodes_perf_sanity_ctx1_node2_gpu8_gen1_node4_gpu16",
-        1,
+        2,
         24,
         6
     )
@@ -3420,7 +4073,7 @@ def launchTestJobs(pipeline, testFilter)
         "GB200-36_GPUs-9_Nodes-PyTorch-Disagg-PerfSanity-CTX1-NODE1-GPU4-GEN1-NODE8-GPU32-Post-Merge",
         "auto:gb200-flex",
         "l0_gb200_multi_nodes_perf_sanity_ctx1_node1_gpu4_gen1_node8_gpu32",
-        8,
+        11,
         36,
         9
     )
@@ -3433,15 +4086,66 @@ def launchTestJobs(pipeline, testFilter)
         40,
         10
     )
+    // GB300 PerfSanity post-merge aggregated
+    // 2 Nodes
+    multiNodesSBSAConfigs += buildStageConfigs(
+        "GB300-8_GPUs-2_Nodes-PyTorch-PerfSanity-Node2-GPU8-Post-Merge",
+        "auto:gb300-flex",
+        "l0_gb300_multi_nodes_perf_sanity_node2_gpu8",
+        3,
+        8,
+        2
+    )
+    // GB300 PerfSanity post-merge disaggregated
+    // 2 Nodes
+    multiNodesSBSAConfigs += buildStageConfigs(
+        "GB300-8_GPUs-2_Nodes-PyTorch-Disagg-PerfSanity-CTX1-NODE1-GPU4-GEN1-NODE1-GPU4-Post-Merge",
+        "auto:gb300-flex",
+        "l0_gb300_multi_nodes_perf_sanity_ctx1_node1_gpu4_gen1_node1_gpu4",
+        4,
+        8,
+        2
+    )
+    // 3 Nodes
+    multiNodesSBSAConfigs += buildStageConfigs(
+        "GB300-12_GPUs-3_Nodes-PyTorch-Disagg-PerfSanity-CTX1-NODE1-GPU4-GEN1-NODE2-GPU8-Post-Merge",
+        "auto:gb300-flex",
+        "l0_gb300_multi_nodes_perf_sanity_ctx1_node1_gpu4_gen1_node2_gpu8",
+        4,
+        12,
+        3
+    )
+    // 5 Nodes
+    multiNodesSBSAConfigs += buildStageConfigs(
+        "GB300-20_GPUs-5_Nodes-PyTorch-Disagg-PerfSanity-CTX1-NODE1-GPU4-GEN1-NODE4-GPU16-Post-Merge",
+        "auto:gb300-flex",
+        "l0_gb300_multi_nodes_perf_sanity_ctx1_node1_gpu4_gen1_node4_gpu16",
+        4,
+        20,
+        5
+    )
+    // 9 Nodes
+    multiNodesSBSAConfigs += buildStageConfigs(
+        "GB300-36_GPUs-9_Nodes-PyTorch-Disagg-PerfSanity-CTX1-NODE1-GPU4-GEN1-NODE8-GPU32-Post-Merge",
+        "auto:gb300-flex",
+        "l0_gb300_multi_nodes_perf_sanity_ctx1_node1_gpu4_gen1_node8_gpu32",
+        4,
+        36,
+        9
+    )
     fullSet += multiNodesSBSAConfigs.keySet()
 
     if (env.targetArch == AARCH64_TRIPLE) {
-        parallelJobs = SBSATestConfigs.collectEntries{key, values -> [key, [createKubernetesPodConfig(LLM_DOCKER_IMAGE, values[0], "arm64"), {
-            runLLMTestlistOnPlatform(pipeline, values[0], values[1], LINUX_AARCH64_CONFIG, false, key, values[2], values[3])
+        parallelJobs = SBSATestConfigs.collectEntries{key, values -> [key, [createKubernetesPodConfig(LLM_DOCKER_IMAGE, values[0], "arm64"), { attemptTag, isFinalAttempt, retryContext = null ->
+            runLLMTestlistOnPlatform(pipeline, values[0], values[1], LINUX_AARCH64_CONFIG, false, key, values[2], values[3], false, "cp312", attemptTag, false, isFinalAttempt, retryContext)
         }]]}
 
         // Add SBSA Slurm jobs
-        parallelSlurmJobs = SBSASlurmTestConfigs.collectEntries{key, values -> [key, [createKubernetesPodConfig(LLM_DOCKER_IMAGE, "slurm", "arm64"), {
+        parallelSlurmJobs = SBSASlurmTestConfigs.collectEntries{key, values -> [key, [createKubernetesPodConfig(LLM_DOCKER_IMAGE, "slurm", "arm64"), { attemptTag, isFinalAttempt, retryContext = null ->
+            // attemptTag is threaded into runLLMTestlistOnSlurm as the outer
+            // dispatcher pod's tag so the inner SLURM retry's postTag can't
+            // collide with a previous dispatcher pod's upload. See the x86
+            // SLURM closure for the full rationale.
             def config = LINUX_AARCH64_CONFIG
             if (key.contains("single-device")) {
                 config = SINGLE_DEVICE_CONFIG
@@ -3449,12 +4153,12 @@ def launchTestJobs(pipeline, testFilter)
             if (key.contains("llvm")) {
                 config = LLVM_CONFIG
             }
-            runLLMTestlistOnSlurm(pipeline, values[0], values[1], config, key.contains("-Perf-"), key, values[2], values[3], values[4] ?: 1, values[5] ?: 1, values[6] ?: false)
+            runLLMTestlistOnSlurm(pipeline, values[0], values[1], config, key.contains("-Perf-"), key, values[2], values[3], values[4] ?: 1, values[5] ?: 1, values[6] ?: false, false, "cp312", attemptTag)
         }]]}
         parallelJobs += parallelSlurmJobs
 
         // Add SBSA multi node Slurm jobs
-        parallelMultiNodesSBSAJobs = multiNodesSBSAConfigs.collectEntries{key, values -> [key, [createKubernetesPodConfig(LLM_DOCKER_IMAGE, "slurm", "arm64"), {
+        parallelMultiNodesSBSAJobs = multiNodesSBSAConfigs.collectEntries{key, values -> [key, [createKubernetesPodConfig(LLM_DOCKER_IMAGE, "slurm", "arm64"), { attemptTag, isFinalAttempt, retryContext = null ->
             def config = LINUX_AARCH64_CONFIG
             if (key.contains("single-device")) {
                 config = SINGLE_DEVICE_CONFIG
@@ -3462,7 +4166,7 @@ def launchTestJobs(pipeline, testFilter)
             if (key.contains("llvm")) {
                 config = LLVM_CONFIG
             }
-            runLLMTestlistOnSlurm(pipeline, values[0], values[1], config, key.contains("-Perf-"), key, values[2], values[3], values[4] ?: 1, values[5] ?: 2, values[6] ?: false)
+            runLLMTestlistOnSlurm(pipeline, values[0], values[1], config, key.contains("-Perf-"), key, values[2], values[3], values[4] ?: 1, values[5] ?: 2, values[6] ?: false, false, "cp312", attemptTag)
         }]]}
 
         parallelJobs += parallelMultiNodesSBSAJobs
@@ -3482,20 +4186,24 @@ def launchTestJobs(pipeline, testFilter)
         docBuildConfigs = [:]
     }
 
-    docBuildJobs = docBuildConfigs.collectEntries{key, values -> [key, [values[0], {
+    docBuildJobs = docBuildConfigs.collectEntries{key, values -> [key, [values[0], { attemptTag, isFinalAttempt, retryContext = null ->
+        // attemptTag uniquifies the upload-once guard key and tar filename per
+        // pod-launch attempt; isFinalAttempt suppresses synthetic stage-fail XML
+        // and junit() on intermediate retryable infra failures.
         stage("[${key}] Run") {
-            cacheErrorAndUploadResult("${key}", values[1], {}, true)
+            cacheErrorAndUploadResult("${key}", values[1], {}, true, attemptTag, isFinalAttempt, retryContext)
         }
     }]]}
 
     // Python version and OS for sanity check
+    // Slots: [buildImage, gpuType, cpuArch, reinstallDependencies, isDlfw, pipInstallImage, extraPytorchInstall]
     x86SanityCheckConfigs = [
         "PY312-DLFW": [
-            LLM_ROCKYLINUX8_PY312_DOCKER_IMAGE,  // Workaround ABI incompatibilities between PyTorch 2.9.1 and 2.10.0a0
+            LLM_DOCKER_IMAGE,
             "B200_PCIe",
             X86_64_TRIPLE,
             false,
-            "dlfw/",
+            true,
             DLFW_IMAGE,
             false,
         ],
@@ -3504,7 +4212,7 @@ def launchTestJobs(pipeline, testFilter)
             "A10",
             X86_64_TRIPLE,
             true,
-            "",
+            false,
             UBUNTU_22_04_IMAGE,
             true, // Extra install PyTorch CUDA 13.0 package to align with the CUDA version used for building TensorRT LLM wheels.
         ],
@@ -3513,22 +4221,19 @@ def launchTestJobs(pipeline, testFilter)
             "A100X",
             X86_64_TRIPLE,
             true,
-            "",
+            false,
             UBUNTU_24_04_IMAGE,
             true, // Extra PyTorch CUDA 13.0 install
         ],
     ]
 
     aarch64SanityCheckConfigs = [
-        // Workaround PyTorch 2.9.1 vs. 2.10.0a0 incompatibility issue. Once resolved, change back to:
-        // 1. DLFW_IMAGE -> UBUNTU_24_04_IMAGE
-        // 2. Extra PyTorch CUDA install: false -> true
         "PY312-UB2404": [
-            LLM_DOCKER_IMAGE,
+            LLM_WHEEL_DOCKER_IMAGE,
             "GH200",
             AARCH64_TRIPLE,
             false,
-            "",
+            false,
             UBUNTU_24_04_IMAGE,
             true, // Extra PyTorch CUDA 13.0 install
         ],
@@ -3537,7 +4242,7 @@ def launchTestJobs(pipeline, testFilter)
             "GH200",
             AARCH64_TRIPLE,
             false,
-            "dlfw/",
+            true,
             DLFW_IMAGE,
             false,
         ],
@@ -3576,7 +4281,16 @@ def launchTestJobs(pipeline, testFilter)
             def sanitySpec = createKubernetesPodConfig(values[0], gpu_type, k8s_arch)
             sanityRunner = runInKubernetes(pipeline, sanitySpec, "trt-llm")
 
-            def wheelPath = "${values[4]}"
+            def isDlfw = values[4]
+            def versionLocal = ""
+            if (isDlfw) {
+                // Extract PyTorch version from LLM_DOCKER_IMAGE. e.g. pytorch-26.02 -> 2602
+                def matcher = LLM_DOCKER_IMAGE =~ /:pytorch-(\d+)\.(\d+)-/
+                if (!matcher.find()) {
+                    error "Failed to extract PyTorch version from LLM_DOCKER_IMAGE: ${LLM_DOCKER_IMAGE}"
+                }
+                versionLocal = "ngcpytorch${matcher.group(1)}${matcher.group(2)}"
+            }
             def wheelName = ""
             def cpver = "cp312"
             def pyver = "3.12"
@@ -3586,18 +4300,11 @@ def launchTestJobs(pipeline, testFilter)
             }
 
             buildRunner("[${toStageName(values[1], key)}] Build") {
-                def env = []
-                if (key.contains("manylinux")) {
-                    env = ["LD_LIBRARY_PATH+=:/usr/local/cuda/compat"]
-                }
-                withEnv(env) {
-                    wheelName = runLLMBuild(pipeline, cpu_arch, values[3], wheelPath, cpver)
-                }
+                wheelName = runLLMBuild(pipeline, cpu_arch, values[3], "", versionLocal, cpver)
             }
 
-            def fullWheelPath = "${cpu_arch}/${wheelPath}${wheelName}"
-
             // TODO: Re-enable the sanity check after updating GPU testers' driver version.
+            // def fullWheelPath = "${cpu_arch}/${wheelName}"
             // sanityRunner("Sanity check") {
             //     runPackageSanityCheck(pipeline, fullWheelPath, values[3], cpver)
             // }
@@ -3612,7 +4319,7 @@ def launchTestJobs(pipeline, testFilter)
             if (checkPipStage) {
                 stage("Run LLMAPI Test") {
                     pipInstallSanitySpec = createKubernetesPodConfig(values[5], gpu_type, k8s_arch)
-                    trtllm_utils.launchKubernetesPod(pipeline, pipInstallSanitySpec, "trt-llm", {
+                    runKubernetesPodWithInfraRetry(pipeline, pipInstallSanitySpec, "trt-llm", toStageName(values[1], key), { attemptTag, isFinalAttempt, retryContext = null ->
                         echo "###### Prerequisites Start ######"
                         echoNodeAndGpuInfo(pipeline, toStageName(values[1], key))
                         // Clean up the pip constraint file from the base NGC PyTorch image.
@@ -3620,6 +4327,10 @@ def launchTestJobs(pipeline, testFilter)
                             trtllm_utils.llmExecStepWithRetry(pipeline, script: "[ -f /etc/pip/constraint.txt ] && : > /etc/pip/constraint.txt || true")
                             // Remove the python3-pygments pip package because the dlfw image already includes a Debian pygments package, which conflicts with the pip-installed version.
                             trtllm_utils.llmExecStepWithRetry(pipeline, script: "apt-get remove -y python3-pygments")
+                            // Remove stale nvidia-cutlass-dsl from the base image to prevent namespace
+                            // directory corruption when pip upgrades to the version required by tensorrt_llm.
+                            trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 uninstall -y nvidia-cutlass-dsl nvidia-cutlass-dsl-libs-base || true")
+                            trtllm_utils.llmExecStepWithRetry(pipeline, script: 'rm -rf $(python3 -c "import site; print(site.getsitepackages()[0])")/nvidia_cutlass_dsl*')
                         }
                         trtllm_utils.llmExecStepWithRetry(pipeline, script: "apt-get update && apt-get install -y python3-pip git rsync curl wget")
                         trtllm_utils.checkoutSource(LLM_REPO, env.gitlabCommit, LLM_ROOT, false, true)
@@ -3655,7 +4366,7 @@ def launchTestJobs(pipeline, testFilter)
                             sh "env | sort"
                             trtllm_utils.llmRetry(1, "checkPipInstall", {
                                 timeout(time: 30, unit: 'MINUTES') {
-                                    checkPipInstall(pipeline, "${cpu_arch}/${wheelPath}")
+                                    checkPipInstall(pipeline, "${cpu_arch}", versionLocal)
                                 }
                             })
                         }
@@ -3667,7 +4378,7 @@ def launchTestJobs(pipeline, testFilter)
                         }
                         withEnv(libEnv) {
                             sh "env | sort"
-                            runLLMTestlistOnPlatform(pipeline, gpu_type, "l0_sanity_check", config, false, toStageName(values[1], key), 1, 1, true, cpver, "-SubJob-RunTest", true)
+                            runLLMTestlistOnPlatform(pipeline, gpu_type, "l0_sanity_check", config, false, toStageName(values[1], key), 1, 1, true, cpver, "-SubJob-RunTest" + attemptTag, true, isFinalAttempt, retryContext)
                         }
                     })
                 }
@@ -3790,17 +4501,17 @@ def launchTestJobs(pipeline, testFilter)
         }
     }
 
-    // Check --stage-list, only run the stages in stage-list.
+    // Check --stage-list, only run the stages in stage-list. Supports wildcard '*'.
     if (testFilter[TEST_STAGE_LIST] != null) {
         echo "Use TEST_STAGE_LIST for filtering. Stages: ${testFilter[(TEST_STAGE_LIST)]}."
-        parallelJobsFiltered = parallelJobs.findAll {it.key in testFilter[(TEST_STAGE_LIST)]}
+        parallelJobsFiltered = parallelJobs.findAll { stageMatchesAnyPattern(it.key, testFilter[(TEST_STAGE_LIST)]) }
         println parallelJobsFiltered.keySet()
     }
 
-    // Check --extra-stage, add the stages in extra-stage.
+    // Check --extra-stage, add the stages in extra-stage. Supports wildcard '*'.
     if (testFilter[EXTRA_STAGE_LIST] != null) {
         echo "Use EXTRA_STAGE_LIST for filtering. Stages: ${testFilter[(EXTRA_STAGE_LIST)]}."
-        parallelJobsFiltered += parallelJobs.findAll {it.key in testFilter[(EXTRA_STAGE_LIST)]}
+        parallelJobsFiltered += parallelJobs.findAll { stageMatchesAnyPattern(it.key, testFilter[(EXTRA_STAGE_LIST)]) }
         println parallelJobsFiltered.keySet()
     }
 
@@ -3811,6 +4522,36 @@ def launchTestJobs(pipeline, testFilter)
     }
     if (testFilter[(EXTRA_STAGE_LIST)] != null) {
         checkStageNameSet(testFilter[(EXTRA_STAGE_LIST)], fullSet, EXTRA_STAGE_LIST)
+    }
+
+    // CBTS Layer 2: replace `parallelJobsFiltered` with affected stages plus
+    // PackageSanityCheck (kept iff sanity_required) and PerfSanity (kept iff
+    // perfsanity_required). Pure -Perf- stages always excluded (own trigger
+    // model, full-list benchmarks).
+    def cbts = testFilter[(CBTS_RESULT)]
+    if (cbts != null) {
+        def affectedSet = (cbts.affected_stages ?: []) as Set
+        def needsSanity = cbts.sanity_required
+        def needsPerfSanity = cbts.perfsanity_required
+        parallelJobsFiltered = parallelJobs.findAll { key, _ ->
+            if (key =~ /-Perf-/) return false
+            return affectedSet.contains(key) ||
+                   (needsSanity && key =~ /PackageSanityCheck/) ||
+                   (needsPerfSanity && key =~ /PerfSanity/)
+        }
+        if (affectedSet.isEmpty()) {
+            if (parallelJobsFiltered.isEmpty()) {
+                echo "CBTS [${cbts.scope}]: trigger-mode mismatch + nothing force-kept → no-op"
+            } else {
+                echo "CBTS [${cbts.scope}]: trigger-mode mismatch — running " +
+                     "${parallelJobsFiltered.size()} force-kept stage(s) only"
+            }
+        } else if (parallelJobsFiltered) {
+            echo "CBTS [${cbts.scope}]: limiting to ${parallelJobsFiltered.size()} stages " +
+                 "(sanity_required=${needsSanity}, perfsanity_required=${needsPerfSanity})"
+        } else {
+            echo "CBTS [${cbts.scope}]: empty stage set after filtering"
+        }
     }
 
     echo "Check the passed GitLab bot testFilter parameters."
@@ -3824,8 +4565,8 @@ def launchTestJobs(pipeline, testFilter)
                     echo "Skip - Passed in the previous pipelines."
                 }
             } else if (values instanceof List) {
-                trtllm_utils.launchKubernetesPod(pipeline, values[0], "trt-llm", {
-                    values[1]()
+                runKubernetesPodWithInfraRetry(pipeline, values[0], "trt-llm", key, { attemptTag, isFinalAttempt, retryContext = null ->
+                    values[1](attemptTag, isFinalAttempt, retryContext)
                 })
             } else {
                 values()
@@ -3898,10 +4639,10 @@ def launchTestJobsForImagesSanityCheck(pipeline, globalVars) {
             stage(values.name) {
                 echo "Run ${values.name} sanity test."
                 imageSanitySpec = createKubernetesPodConfig(values.image, values.gpuType, values.k8sArch)
-                trtllm_utils.launchKubernetesPod(pipeline, imageSanitySpec, "trt-llm", {
+                runKubernetesPodWithInfraRetry(pipeline, imageSanitySpec, "trt-llm", values.name, { attemptTag, isFinalAttempt, retryContext = null ->
                     sh "env | sort"
                     trtllm_utils.llmExecStepWithRetry(pipeline, script: "apt-get update && apt-get install -y git rsync curl")
-                    runLLMTestlistOnPlatform(pipeline, values.gpuType, "l0_sanity_check", values.config, false, values.name, 1, 1, true, null, "-SubJob-TestImage", true)
+                    runLLMTestlistOnPlatform(pipeline, values.gpuType, "l0_sanity_check", values.config, false, values.name, 1, 1, true, null, "-SubJob-TestImage" + attemptTag, true, isFinalAttempt, retryContext)
                 })
             }
         } else {
@@ -3956,6 +4697,7 @@ pipeline {
                     println testFilter
                     echo "env.globalVars is: ${env.globalVars}"
                     globalVars = trtllm_utils.updateMapWithJson(this, globalVars, env.globalVars, "globalVars")
+                    globalVars = trtllm_utils.initializeCiBudget(this, globalVars, 24, 'HOURS', 'L0_Test')
                     globalVars[ACTION_INFO] = trtllm_utils.setupPipelineDescription(this, globalVars[ACTION_INFO])
                 }
             }
