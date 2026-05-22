@@ -17,7 +17,7 @@ server_configs:
       attention:
         backend: TRTLLM
       parallel:
-        enable_parallel_vae: true
+        parallel_vae_size: 8
         dit_cfg_size: 2
         dit_ulysses_size: 4
       cuda_graph:

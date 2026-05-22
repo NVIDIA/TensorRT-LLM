@@ -548,7 +548,7 @@ class HFPhi4MultimodalEncoder(transformers.PreTrainedModel):
     config_class = Phi4MMConfig
     base_model_prefix = "model"
     _tied_weights_keys = ["lm_head.weight"]
-    _supports_flash_attn_2 = True
+    _supports_flash_attn = True
     _supports_sdpa = True
     _supports_cache_class = True
 
@@ -954,7 +954,7 @@ class Phi4MMInputProcessor(BaseMultimodalInputProcessor,
     ))
 class Phi4MMForCausalLM(transformers.PreTrainedModel):
 
-    _supports_flash_attn_2 = True
+    _supports_flash_attn = True
 
     def __init__(self, model_config: ModelConfig):
         if _is_disagg():
