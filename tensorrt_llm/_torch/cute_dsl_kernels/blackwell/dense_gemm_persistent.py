@@ -732,10 +732,7 @@ class PersistentDenseGemmKernel:
                     cute.copy(tiled_copy_r2s, tRS_rC, tRS_sC[(None, None, None, c_buffer)])
 
                     # Fence and barrier
-                    cute.arch.fence_proxy(
-                        cute.arch.ProxyKind.async_shared,
-                        space=cute.arch.SharedSpace.shared_cta,
-                    )
+                    cute.arch.fence_view_async_shared()
                     epilog_threads = 32 * len(self.epilogue_warp_id)
                     cute.arch.barrier(
                         barrier_id=self.epilog_sync_bar_id,
