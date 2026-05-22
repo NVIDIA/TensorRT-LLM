@@ -11,7 +11,6 @@ accuracy/test_dwdp_disaggregated_serving.py::TestDwdpDeepSeekV3Lite::test_dwdp_a
 accuracy/test_llm_api.py::TestLlama3_1_8BInstruct::test_gather_generation_logits_cuda_graph SKIP (https://nvbugs/5772995)
 accuracy/test_llm_api.py::TestLlama3_1_8BInstruct::test_guided_decoding_4gpus[xgrammar] SKIP (https://nvbugs/5346443)
 accuracy/test_llm_api.py::TestMistralNemo12B::test_fp8 SKIP (https://nvbugs/5413197)
-accuracy/test_llm_api_autodeploy.py::TestGemma4MoE::test_bf16 SKIP (https://nvbugs/6158397)
 accuracy/test_llm_api_autodeploy.py::TestGemmaE2B::test_gemma4_e2b_it SKIP (https://nvbugs/6194934)
 accuracy/test_llm_api_autodeploy.py::TestMiniMaxM2::test_finegrained_fp8 SKIP (https://nvbugs/6158397)
 accuracy/test_llm_api_autodeploy.py::TestNemotronNanoV3::test_accuracy[nvfp4-4-trtllm] SKIP (https://nvbugs/6120981)
