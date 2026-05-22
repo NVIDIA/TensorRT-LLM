@@ -1078,6 +1078,15 @@ class AutoTuner:
                             **kwargs,
                         )
                 except Exception as e:
+                    # Synchronize to clear any pending CUDA errors left by the
+                    # failed tactic.  Without this, the stale error propagates
+                    # to subsequent CUDA/cuBLAS calls in the forward pass
+                    # (observed as CUBLAS_STATUS_EXECUTION_FAILED on SM103).
+                    try:
+                        torch.cuda.synchronize()
+                    except Exception:
+                        pass
+
                     # Handle None tensors for optional inputs
                     shapes = self._get_input_sizes(input_tensors)
                     logger.warning_once(
