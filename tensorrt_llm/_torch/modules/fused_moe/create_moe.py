@@ -99,7 +99,7 @@ def get_moe_cls(
         # input), runs the fused dispatch+GEMM+act+GEMM+combine kernel.
         # Mirrors the TRTLLM/CUTEDSL pattern: fall back to CutlassFusedMoE
         # whenever the backend can't serve this model — unsupported quant,
-        # wrong SM, missing bundled DeepGEMM symbols — so we never allocate
+        # wrong SM family, missing bundled DeepGEMM symbols — so we never allocate
         # MegaMoE-specific weight tensors we can't use.
         if quant_config is None or not quant_config.quant_mode.has_w4a8_mxfp4_mxfp8(
         ):
@@ -108,7 +108,7 @@ def get_moe_cls(
                 f"Check out details in quant_config: {quant_config}. Using CutlassFusedMoE instead."
             )
             return CutlassFusedMoE
-        # Beyond quant: also require SM100 and the bundled DG mega_moe
+        # Beyond quant: also require SM100 family and the bundled DG mega_moe
         # surface. ``can_implement`` already does this full check; call it
         # with ``swiglu_gptoss_style=False`` (MegaMoE rejects that anyway,
         # and the create path doesn't know the model's SwiGLU flavor yet).

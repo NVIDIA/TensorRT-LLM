@@ -30,6 +30,7 @@ l0_a10:
   - unittest/_torch/executor/test_scheduler_serializable_output.py
   - unittest/_torch/executor/test_kv_cache_estimation.py
   - unittest/_torch/executor/test_kv_cache_budget_split.py
+  - unittest/_torch/executor/test_disagg_index_mapper_early_release.py
   # NOTE: this is a CPU-only test, but we do not have a dedicated job for this (and therefore no
   # test list either).
   - unittest/_torch/models/checkpoints/hf/test_weight_loader.py
@@ -142,6 +143,9 @@ l0_a10:
   - llmapi/test_llm_api_connector.py::test_connector_multi_request
   - llmapi/test_llm_api_connector.py::test_connector_priorities
   - llmapi/test_llm_api_connector.py::test_connector_priorities_default
+  - llmapi/test_llm_api_connector.py::test_connector_rejects_unsupported_config[host_offloading]
+  - llmapi/test_llm_api_connector.py::test_connector_rejects_unsupported_config[beam_search]
+  - llmapi/test_llm_api_connector.py::test_connector_rejects_unsupported_config[attention_dp]
   - llmapi/test_llm_api_connector.py::test_connector_e2e_persistent_cache
   # third-party policy checks CPU-only
   - thirdparty/test_cmake_third_party.py::test_cmake_listfiles

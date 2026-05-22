@@ -179,6 +179,64 @@ def test_agent_desc_from_bytes():
     assert desc.backend_agent_desc == test_data
 
 
+def test_agent_desc_serialize_returns_bytes():
+    """Test that AgentDesc.serialize() returns bytes."""
+    desc = tab.AgentDesc("some_blob")
+    serialized = desc.serialize()
+    assert isinstance(serialized, bytes)
+    assert len(serialized) > 0
+
+
+def test_agent_desc_serialize_deserialize_no_regions():
+    """Test AgentDesc serialize/deserialize roundtrip without VMM regions."""
+    original_blob = b"nixl_metadata_blob_content"
+    desc = tab.AgentDesc(original_blob)
+    serialized = desc.serialize()
+
+    restored = tab.AgentDesc.deserialize(serialized)
+    assert restored.backend_agent_desc == original_blob
+
+
+def test_agent_desc_serialize_deserialize_roundtrip_string():
+    """Test AgentDesc serialize/deserialize roundtrip with string input."""
+    original_blob = "string_blob_data"
+    desc = tab.AgentDesc(original_blob)
+    serialized = desc.serialize()
+
+    restored = tab.AgentDesc.deserialize(serialized)
+    assert restored.backend_agent_desc == original_blob.encode()
+
+
+def test_agent_desc_serialize_deserialize_binary_blob():
+    """Test AgentDesc serialize/deserialize with binary data containing null bytes."""
+    # NIXL blobs can contain arbitrary binary data including null bytes
+    original_blob = bytes(range(256))
+    desc = tab.AgentDesc(original_blob)
+    serialized = desc.serialize()
+
+    restored = tab.AgentDesc.deserialize(serialized)
+    assert restored.backend_agent_desc == original_blob
+
+
+def test_agent_desc_deserialize_accepts_bytes():
+    """Test that AgentDesc.deserialize() accepts bytes input."""
+    desc = tab.AgentDesc(b"test_data")
+    serialized = desc.serialize()
+
+    # deserialize should accept bytes
+    restored = tab.AgentDesc.deserialize(serialized)
+    assert restored.backend_agent_desc == b"test_data"
+
+
+def test_agent_desc_serialize_deserialize_empty_blob():
+    """Test AgentDesc serialize/deserialize with empty backend blob."""
+    desc = tab.AgentDesc(b"")
+    serialized = desc.serialize()
+
+    restored = tab.AgentDesc.deserialize(serialized)
+    assert restored.backend_agent_desc == b""
+
+
 def test_base_agent_config_default():
     """Test BaseAgentConfig with default values."""
     config = tab.BaseAgentConfig()
