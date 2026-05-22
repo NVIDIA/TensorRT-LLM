@@ -2274,8 +2274,8 @@ _QUANT_MAX_BY_DTYPE = {
 # tensor shape so callers at other TP / nheads pick up the right cell.
 #
 # Schema: dict[(dtype_str, sr_str)] → list[(eff_batch_threshold, mode, knobs)]
-# sorted by threshold ascending.  Lookup finds the first threshold ≥ eff_b
-# (so missing intermediate batches fall up to the next tuned cell).  If
+# sorted by threshold ascending. Lookup finds the first threshold ≥ eff_b
+# (so missing intermediate batches fall up to the next tuned cell). If
 # eff_b exceeds the largest threshold, use the largest entry.
 #
 # Each `knobs` dict only contains keys for the chosen mode; the wrapper
@@ -2288,8 +2288,8 @@ _QUANT_MAX_BY_DTYPE = {
 #
 # Source: emit_tuning_from_noise.py. Auto-generated from noise-cleaned per-cell search
 # winners (best of pd / pm by bucket_expected_renorm). Effective batch = raw_batch × 16.
-# Missing dtype/SR combos (fp16/RN, int8/RN, fp8/RN) fall back via the
-# _resolve_tuning chain — RN→SR for same dtype, then unknown fp8 cells to int8/SR.
+# Missing dtype/SR combos fall back via the _resolve_tuning chain:
+# RN→SR for same dtype, then bf16/int16→fp16/SR and fp8→int8/SR.
 _DEFAULT_TUNING: dict[tuple[str, str], list[tuple[int, str, dict]]] = {
     ("fp16", "SR"): [
         (
@@ -2316,7 +2316,7 @@ _DEFAULT_TUNING: dict[tuple[str, str], list[tuple[int, str, dict]]] = {
                 "_warp_specialize": False,
                 "nowrite_first": False,
                 "rectangle_for_nowrite": True,
-            }
+            },
         ),  # raw_batch=1, score=6.66us (median of 4 noise runs; min=6.66us)
         (
             32,
@@ -2336,7 +2336,7 @@ _DEFAULT_TUNING: dict[tuple[str, str], list[tuple[int, str, dict]]] = {
                 "_use_tma_replay_write_store": False,
                 "_warp_specialize": False,
                 "rectangle_for_nowrite": False,
-            }
+            },
         ),  # raw_batch=2, score=6.84us (median of 4 noise runs; min=6.83us)
         (
             64,
@@ -2356,28 +2356,28 @@ _DEFAULT_TUNING: dict[tuple[str, str], list[tuple[int, str, dict]]] = {
                 "_use_tma_replay_write_store": False,
                 "_warp_specialize": False,
                 "rectangle_for_nowrite": False,
-            }
+            },
         ),  # raw_batch=4, score=7.13us (median of 4 noise runs; min=7.12us)
         (
             128,
             "persistent_dynamic",
             {
                 "_block_size_m": 8,
-                "_cta_per_sm": 9,
+                "_cta_per_sm": 7,
                 "_flatten": False,
-                "_heads_per_block": 16,
+                "_heads_per_block": 4,
                 "_num_loop_stages": 1,
-                "_num_stages": 4,
+                "_num_stages": 2,
                 "_num_warps": 1,
-                "_precompute_num_warps": 4,
+                "_precompute_num_warps": 2,
                 "_use_tma_rect_load": False,
                 "_use_tma_replay_nowrite_load": False,
                 "_use_tma_replay_write_load": False,
                 "_use_tma_replay_write_store": False,
                 "_warp_specialize": False,
                 "rectangle_for_nowrite": False,
-            }
-        ),  # raw_batch=8, score=7.68us (median of 4 noise runs; min=7.64us)
+            },
+        ),  # raw_batch=8, score=7.83us (manual retry of pre-noise winner)
         (
             256,
             "persistent_dynamic",
@@ -2396,7 +2396,7 @@ _DEFAULT_TUNING: dict[tuple[str, str], list[tuple[int, str, dict]]] = {
                 "_use_tma_replay_write_store": True,
                 "_warp_specialize": False,
                 "rectangle_for_nowrite": False,
-            }
+            },
         ),  # raw_batch=16, score=9.04us (median of 4 noise runs; min=9.03us)
         (
             512,
@@ -2422,7 +2422,7 @@ _DEFAULT_TUNING: dict[tuple[str, str], list[tuple[int, str, dict]]] = {
                 "_warp_specialize": False,
                 "nowrite_first": True,
                 "rectangle_for_nowrite": True,
-            }
+            },
         ),  # raw_batch=32, score=12.51us (median of 4 noise runs; min=12.47us)
         (
             1024,
@@ -2448,7 +2448,7 @@ _DEFAULT_TUNING: dict[tuple[str, str], list[tuple[int, str, dict]]] = {
                 "_warp_specialize": False,
                 "nowrite_first": False,
                 "rectangle_for_nowrite": True,
-            }
+            },
         ),  # raw_batch=64, score=17.41us (median of 4 noise runs; min=17.41us)
         (
             2048,
@@ -2474,7 +2474,7 @@ _DEFAULT_TUNING: dict[tuple[str, str], list[tuple[int, str, dict]]] = {
                 "_warp_specialize": False,
                 "nowrite_first": True,
                 "rectangle_for_nowrite": True,
-            }
+            },
         ),  # raw_batch=128, score=25.21us (median of 4 noise runs; min=25.16us)
         (
             4096,
@@ -2500,7 +2500,7 @@ _DEFAULT_TUNING: dict[tuple[str, str], list[tuple[int, str, dict]]] = {
                 "_warp_specialize": False,
                 "nowrite_first": True,
                 "rectangle_for_nowrite": True,
-            }
+            },
         ),  # raw_batch=256, score=42.06us (median of 4 noise runs; min=42.01us)
         (
             8192,
@@ -2526,7 +2526,7 @@ _DEFAULT_TUNING: dict[tuple[str, str], list[tuple[int, str, dict]]] = {
                 "_warp_specialize": False,
                 "nowrite_first": True,
                 "rectangle_for_nowrite": True,
-            }
+            },
         ),  # raw_batch=512, score=72.15us (median of 4 noise runs; min=72.11us)
         (
             16384,
@@ -2552,7 +2552,7 @@ _DEFAULT_TUNING: dict[tuple[str, str], list[tuple[int, str, dict]]] = {
                 "_warp_specialize": False,
                 "nowrite_first": True,
                 "rectangle_for_nowrite": True,
-            }
+            },
         ),  # raw_batch=1024, score=131.77us (median of 4 noise runs; min=131.63us)
     ],
     ("int8", "SR"): [
@@ -2574,7 +2574,7 @@ _DEFAULT_TUNING: dict[tuple[str, str], list[tuple[int, str, dict]]] = {
                 "_use_tma_replay_write_store": True,
                 "_warp_specialize": False,
                 "rectangle_for_nowrite": False,
-            }
+            },
         ),  # raw_batch=1, score=6.42us (median of 4 noise runs; min=6.39us)
         (
             32,
@@ -2594,7 +2594,7 @@ _DEFAULT_TUNING: dict[tuple[str, str], list[tuple[int, str, dict]]] = {
                 "_use_tma_replay_write_store": True,
                 "_warp_specialize": False,
                 "rectangle_for_nowrite": False,
-            }
+            },
         ),  # raw_batch=2, score=7.13us (median of 4 noise runs; min=7.09us)
         (
             64,
@@ -2614,7 +2614,7 @@ _DEFAULT_TUNING: dict[tuple[str, str], list[tuple[int, str, dict]]] = {
                 "_use_tma_replay_write_store": True,
                 "_warp_specialize": False,
                 "rectangle_for_nowrite": False,
-            }
+            },
         ),  # raw_batch=4, score=7.52us (median of 4 noise runs; min=7.50us)
         (
             128,
@@ -2634,7 +2634,7 @@ _DEFAULT_TUNING: dict[tuple[str, str], list[tuple[int, str, dict]]] = {
                 "_use_tma_replay_write_store": False,
                 "_warp_specialize": False,
                 "rectangle_for_nowrite": False,
-            }
+            },
         ),  # raw_batch=8, score=8.22us (median of 4 noise runs; min=8.21us)
         (
             256,
@@ -2654,7 +2654,7 @@ _DEFAULT_TUNING: dict[tuple[str, str], list[tuple[int, str, dict]]] = {
                 "_use_tma_replay_write_store": False,
                 "_warp_specialize": False,
                 "rectangle_for_nowrite": False,
-            }
+            },
         ),  # raw_batch=16, score=10.06us (median of 8 noise runs; min=9.97us)
         (
             512,
@@ -2680,7 +2680,7 @@ _DEFAULT_TUNING: dict[tuple[str, str], list[tuple[int, str, dict]]] = {
                 "_warp_specialize": False,
                 "nowrite_first": True,
                 "rectangle_for_nowrite": True,
-            }
+            },
         ),  # raw_batch=32, score=12.91us (median of 4 noise runs; min=12.90us)
         (
             1024,
@@ -2706,7 +2706,7 @@ _DEFAULT_TUNING: dict[tuple[str, str], list[tuple[int, str, dict]]] = {
                 "_warp_specialize": False,
                 "nowrite_first": False,
                 "rectangle_for_nowrite": True,
-            }
+            },
         ),  # raw_batch=64, score=18.05us (median of 4 noise runs; min=18.03us)
         (
             2048,
@@ -2732,7 +2732,7 @@ _DEFAULT_TUNING: dict[tuple[str, str], list[tuple[int, str, dict]]] = {
                 "_warp_specialize": False,
                 "nowrite_first": False,
                 "rectangle_for_nowrite": True,
-            }
+            },
         ),  # raw_batch=128, score=27.66us (median of 4 noise runs; min=27.56us)
         (
             4096,
@@ -2758,7 +2758,7 @@ _DEFAULT_TUNING: dict[tuple[str, str], list[tuple[int, str, dict]]] = {
                 "_warp_specialize": False,
                 "nowrite_first": True,
                 "rectangle_for_nowrite": True,
-            }
+            },
         ),  # raw_batch=256, score=45.13us (median of 4 noise runs; min=45.08us)
         (
             8192,
@@ -2784,7 +2784,7 @@ _DEFAULT_TUNING: dict[tuple[str, str], list[tuple[int, str, dict]]] = {
                 "_warp_specialize": False,
                 "nowrite_first": True,
                 "rectangle_for_nowrite": True,
-            }
+            },
         ),  # raw_batch=512, score=77.87us (median of 4 noise runs; min=77.78us)
         (
             16384,
@@ -2810,7 +2810,7 @@ _DEFAULT_TUNING: dict[tuple[str, str], list[tuple[int, str, dict]]] = {
                 "_warp_specialize": False,
                 "nowrite_first": True,
                 "rectangle_for_nowrite": True,
-            }
+            },
         ),  # raw_batch=1024, score=142.83us (median of 4 noise runs; min=142.79us)
     ],
     ("fp8", "SR"): [
@@ -2832,7 +2832,7 @@ _DEFAULT_TUNING: dict[tuple[str, str], list[tuple[int, str, dict]]] = {
                 "_use_tma_replay_write_store": True,
                 "_warp_specialize": False,
                 "rectangle_for_nowrite": False,
-            }
+            },
         ),  # raw_batch=1, score=6.30us (median of 4 noise runs; min=6.28us)
         (
             32,
@@ -2852,7 +2852,7 @@ _DEFAULT_TUNING: dict[tuple[str, str], list[tuple[int, str, dict]]] = {
                 "_use_tma_replay_write_store": False,
                 "_warp_specialize": False,
                 "rectangle_for_nowrite": False,
-            }
+            },
         ),  # raw_batch=2, score=6.80us (median of 4 noise runs; min=6.79us)
         (
             64,
@@ -2872,7 +2872,7 @@ _DEFAULT_TUNING: dict[tuple[str, str], list[tuple[int, str, dict]]] = {
                 "_use_tma_replay_write_store": False,
                 "_warp_specialize": False,
                 "rectangle_for_nowrite": False,
-            }
+            },
         ),  # raw_batch=4, score=7.00us (median of 4 noise runs; min=6.98us)
         (
             128,
@@ -2892,7 +2892,7 @@ _DEFAULT_TUNING: dict[tuple[str, str], list[tuple[int, str, dict]]] = {
                 "_use_tma_replay_write_store": False,
                 "_warp_specialize": False,
                 "rectangle_for_nowrite": False,
-            }
+            },
         ),  # raw_batch=8, score=7.67us (median of 4 noise runs; min=7.59us)
         (
             256,
@@ -2912,7 +2912,7 @@ _DEFAULT_TUNING: dict[tuple[str, str], list[tuple[int, str, dict]]] = {
                 "_use_tma_replay_write_store": False,
                 "_warp_specialize": False,
                 "rectangle_for_nowrite": False,
-            }
+            },
         ),  # raw_batch=16, score=8.58us (median of 4 noise runs; min=8.54us)
         (
             512,
@@ -2932,7 +2932,7 @@ _DEFAULT_TUNING: dict[tuple[str, str], list[tuple[int, str, dict]]] = {
                 "_use_tma_replay_write_store": False,
                 "_warp_specialize": False,
                 "rectangle_for_nowrite": False,
-            }
+            },
         ),  # raw_batch=32, score=10.60us (median of 4 noise runs; min=10.54us)
         (
             1024,
@@ -2958,7 +2958,7 @@ _DEFAULT_TUNING: dict[tuple[str, str], list[tuple[int, str, dict]]] = {
                 "_warp_specialize": False,
                 "nowrite_first": False,
                 "rectangle_for_nowrite": True,
-            }
+            },
         ),  # raw_batch=64, score=15.79us (median of 4 noise runs; min=15.77us)
         (
             2048,
@@ -2984,7 +2984,7 @@ _DEFAULT_TUNING: dict[tuple[str, str], list[tuple[int, str, dict]]] = {
                 "_warp_specialize": False,
                 "nowrite_first": False,
                 "rectangle_for_nowrite": True,
-            }
+            },
         ),  # raw_batch=128, score=23.65us (median of 4 noise runs; min=23.65us)
         (
             4096,
@@ -3010,7 +3010,7 @@ _DEFAULT_TUNING: dict[tuple[str, str], list[tuple[int, str, dict]]] = {
                 "_warp_specialize": False,
                 "nowrite_first": False,
                 "rectangle_for_nowrite": True,
-            }
+            },
         ),  # raw_batch=256, score=38.47us (median of 4 noise runs; min=38.42us)
         (
             8192,
@@ -3036,7 +3036,7 @@ _DEFAULT_TUNING: dict[tuple[str, str], list[tuple[int, str, dict]]] = {
                 "_warp_specialize": False,
                 "nowrite_first": True,
                 "rectangle_for_nowrite": True,
-            }
+            },
         ),  # raw_batch=512, score=68.32us (median of 4 noise runs; min=68.28us)
         (
             16384,
@@ -3062,7 +3062,7 @@ _DEFAULT_TUNING: dict[tuple[str, str], list[tuple[int, str, dict]]] = {
                 "_warp_specialize": False,
                 "nowrite_first": True,
                 "rectangle_for_nowrite": True,
-            }
+            },
         ),  # raw_batch=1024, score=123.51us (median of 4 noise runs; min=123.40us)
     ],
     ("fp32", "RN"): [
@@ -3084,7 +3084,7 @@ _DEFAULT_TUNING: dict[tuple[str, str], list[tuple[int, str, dict]]] = {
                 "_use_tma_replay_write_store": False,
                 "_warp_specialize": False,
                 "rectangle_for_nowrite": False,
-            }
+            },
         ),  # raw_batch=1, score=6.01us (median of 4 noise runs; min=6.00us)
         (
             32,
@@ -3104,18 +3104,18 @@ _DEFAULT_TUNING: dict[tuple[str, str], list[tuple[int, str, dict]]] = {
                 "_use_tma_replay_write_store": False,
                 "_warp_specialize": False,
                 "rectangle_for_nowrite": False,
-            }
+            },
         ),  # raw_batch=2, score=6.64us (median of 4 noise runs; min=6.62us)
         (
             64,
             "persistent_dynamic",
             {
                 "_block_size_m": 8,
-                "_cta_per_sm": 5,
+                "_cta_per_sm": 9,
                 "_flatten": False,
                 "_heads_per_block": 2,
                 "_num_loop_stages": 1,
-                "_num_stages": 3,
+                "_num_stages": 4,
                 "_num_warps": 1,
                 "_precompute_num_warps": 4,
                 "_use_tma_rect_load": False,
@@ -3124,8 +3124,8 @@ _DEFAULT_TUNING: dict[tuple[str, str], list[tuple[int, str, dict]]] = {
                 "_use_tma_replay_write_store": False,
                 "_warp_specialize": False,
                 "rectangle_for_nowrite": False,
-            }
-        ),  # raw_batch=4, score=7.09us (median of 4 noise runs; min=7.08us)
+            },
+        ),  # raw_batch=4, score=7.17us (manual retry of pre-noise winner)
         (
             128,
             "persistent_dynamic",
@@ -3144,7 +3144,7 @@ _DEFAULT_TUNING: dict[tuple[str, str], list[tuple[int, str, dict]]] = {
                 "_use_tma_replay_write_store": True,
                 "_warp_specialize": False,
                 "rectangle_for_nowrite": False,
-            }
+            },
         ),  # raw_batch=8, score=7.96us (median of 4 noise runs; min=7.90us)
         (
             256,
@@ -3164,7 +3164,7 @@ _DEFAULT_TUNING: dict[tuple[str, str], list[tuple[int, str, dict]]] = {
                 "_use_tma_replay_write_store": False,
                 "_warp_specialize": False,
                 "rectangle_for_nowrite": False,
-            }
+            },
         ),  # raw_batch=16, score=9.55us (median of 4 noise runs; min=9.50us)
         (
             512,
@@ -3184,7 +3184,7 @@ _DEFAULT_TUNING: dict[tuple[str, str], list[tuple[int, str, dict]]] = {
                 "_use_tma_replay_write_store": True,
                 "_warp_specialize": False,
                 "rectangle_for_nowrite": False,
-            }
+            },
         ),  # raw_batch=32, score=13.28us (median of 4 noise runs; min=13.23us)
         (
             1024,
@@ -3210,7 +3210,7 @@ _DEFAULT_TUNING: dict[tuple[str, str], list[tuple[int, str, dict]]] = {
                 "_warp_specialize": False,
                 "nowrite_first": True,
                 "rectangle_for_nowrite": True,
-            }
+            },
         ),  # raw_batch=64, score=19.12us (median of 4 noise runs; min=19.10us)
         (
             2048,
@@ -3236,7 +3236,7 @@ _DEFAULT_TUNING: dict[tuple[str, str], list[tuple[int, str, dict]]] = {
                 "_warp_specialize": False,
                 "nowrite_first": True,
                 "rectangle_for_nowrite": True,
-            }
+            },
         ),  # raw_batch=128, score=29.39us (median of 4 noise runs; min=29.34us)
         (
             4096,
@@ -3262,7 +3262,7 @@ _DEFAULT_TUNING: dict[tuple[str, str], list[tuple[int, str, dict]]] = {
                 "_warp_specialize": False,
                 "nowrite_first": True,
                 "rectangle_for_nowrite": True,
-            }
+            },
         ),  # raw_batch=256, score=49.36us (median of 4 noise runs; min=49.31us)
         (
             8192,
@@ -3288,7 +3288,7 @@ _DEFAULT_TUNING: dict[tuple[str, str], list[tuple[int, str, dict]]] = {
                 "_warp_specialize": False,
                 "nowrite_first": True,
                 "rectangle_for_nowrite": True,
-            }
+            },
         ),  # raw_batch=512, score=87.36us (median of 4 noise runs; min=87.31us)
         (
             16384,
@@ -3314,7 +3314,7 @@ _DEFAULT_TUNING: dict[tuple[str, str], list[tuple[int, str, dict]]] = {
                 "_warp_specialize": False,
                 "nowrite_first": True,
                 "rectangle_for_nowrite": True,
-            }
+            },
         ),  # raw_batch=1024, score=168.98us (median of 4 noise runs; min=168.83us)
     ],
 }
@@ -3363,10 +3363,8 @@ def _resolve_tuning(
 ) -> tuple[str, dict] | None:
     """Look up the default mode + knobs for this (eff_batch, dt, sr) cell.
 
-    Returns (mode, knobs_dict) or None if the table has no entry covering
-    this dtype/sr (including the fp8→int8/SR and dtype/RN→dtype/SR fallbacks).
-    Returning None lets the wrapper fall back to caller-provided kwargs or
-    kernel-side defaults.
+    Returns (mode, knobs_dict) or None if the table has no entry covering this
+    dtype/sr after fallbacks.
     """
     eff_b = batch * max(1, nheads_per_rank)
     # Lookup chain.  Order:
@@ -3396,7 +3394,7 @@ def _resolve_tuning(
             break
     if entries is None:
         return None
-    # Find first threshold ≥ eff_b; if none, use largest entry.
+    # Find first threshold >= eff_b; if none, use largest entry.
     for thresh, mode, knobs in entries:
         if eff_b <= thresh:
             return mode, dict(knobs)
@@ -3561,7 +3559,7 @@ def replay_selective_state_update(
         _-prefixed kwargs (_block_size_m, _num_warps, _num_stages,
         _precompute_num_warps, _precompute_num_stages, _heads_per_block,
         _maxnreg, _num_ctas) are benchmark-only overrides; production callers
-        should leave them None to use the heuristic-tuned defaults.
+        should leave them None to use the tuning-table defaults.
     """
     sm_version = get_sm_version()
 
@@ -3679,6 +3677,11 @@ def replay_selective_state_update(
     }.get(state.dtype, str(state.dtype))
     _sr_str = "SR" if rand_seed is not None else "RN"
     _table_entry = _resolve_tuning(batch, nheads, _dt_str, _sr_str)
+    if _table_entry is None:
+        raise ValueError(
+            "replay_selective_state_update has no default tuning for "
+            f"state dtype {_dt_str!r} with rounding mode {_sr_str!r}."
+        )
     if _table_entry is not None:
         _table_mode, _table_knobs = _table_entry
         if mode is None:
@@ -3787,7 +3790,7 @@ def replay_selective_state_update(
             _use_tma_replay_nowrite_load = bool(
                 _table_knobs.get("_use_tma_replay_nowrite_load", False)
             )
-    # Final defaults if neither caller nor table set them (empty table case).
+    # Final defaults for optional mode flags if neither caller nor table set them.
     if mode is None:
         mode = "persistent_dynamic"
     if rectangle_for_nowrite is None:
@@ -3868,124 +3871,54 @@ def replay_selective_state_update(
     decay_vec = torch.empty(batch, nheads, BLOCK_SIZE_T, device=device, dtype=torch.float32)
 
     z_strides = (
-        (z.stride(0), z.stride(1), z.stride(2), z.stride(3)) if z is not None else (0, 0, 0, 0)
+        (z.stride(0), z.stride(1), z.stride(2), z.stride(3))
+        if z is not None else (0, 0, 0, 0)
     )
 
-    # Kernel tuning: BLOCK_SIZE_M, num_warps, HEADS_PER_BLOCK, precompute_num_warps.
-    # Dtype-aware heuristic from B200 sweeps (batch 1-512, T=6/32, TP=8, conv1d +
-    # chained PDL).  Keyed on total_heads, BLOCK_SIZE_T, and state dtype; 16-bit
-    # states prefer different tiles from fp32 due to lower bandwidth.  Philox
-    # gets its own branch — stochastic rounding shifts compute toward CUDA cores,
-    # so small-batch configs want more warps to hide the extra work.
-    total_heads = batch * nheads
     heads_per_group = nheads // ngroups
-    state_is_16bit = state.dtype in (torch.float16, torch.bfloat16)
-    use_philox = rand_seed is not None
-    if BLOCK_SIZE_T <= 16:
-        if use_philox and state_is_16bit:
-            # Philox: more warps at small batch to hide CUDA core work.
-            # At large batch, converges to non-Philox fp16 config.
-            if total_heads <= 16:
-                BLOCK_SIZE_M, num_warps, precompute_num_warps, heads_per_block = 4, 4, 4, 1
-            elif total_heads <= 512:
-                BLOCK_SIZE_M, num_warps, precompute_num_warps, heads_per_block = 8, 1, 2, 1
-            else:
-                BLOCK_SIZE_M, num_warps, precompute_num_warps, heads_per_block = 32, 4, 2, 1
-        elif state_is_16bit:
-            if total_heads <= 16:
-                BLOCK_SIZE_M, num_warps, precompute_num_warps, heads_per_block = 32, 4, 4, 1
-            elif total_heads <= 64:
-                BLOCK_SIZE_M, num_warps, precompute_num_warps, heads_per_block = 8, 1, 2, 1
-            elif total_heads <= 256:
-                BLOCK_SIZE_M, num_warps, precompute_num_warps, heads_per_block = 16, 2, 2, 1
-            elif total_heads <= 512:
-                BLOCK_SIZE_M, num_warps, precompute_num_warps, heads_per_block = (
-                    32,
-                    1,
-                    1,
-                    min(2, heads_per_group),
-                )
-            else:
-                BLOCK_SIZE_M, num_warps, precompute_num_warps, heads_per_block = 32, 4, 2, 1
-        else:  # fp32 state (no Philox — fp32 doesn't need stochastic rounding)
-            if total_heads <= 32:
-                BLOCK_SIZE_M, num_warps, precompute_num_warps, heads_per_block = 8, 1, 4, 1
-            elif total_heads <= 64:
-                BLOCK_SIZE_M, num_warps, precompute_num_warps, heads_per_block = 8, 1, 2, 1
-            elif total_heads <= 128:
-                BLOCK_SIZE_M, num_warps, precompute_num_warps, heads_per_block = 8, 2, 2, 1
-            elif total_heads <= 256:
-                BLOCK_SIZE_M, num_warps, precompute_num_warps, heads_per_block = 16, 1, 2, 1
-            elif total_heads <= 512:
-                BLOCK_SIZE_M, num_warps, precompute_num_warps, heads_per_block = (
-                    64,
-                    2,
-                    2,
-                    min(2, heads_per_group),
-                )
-            else:
-                BLOCK_SIZE_M, num_warps, precompute_num_warps, heads_per_block = 32, 4, 2, 1
-    else:  # T > 16
-        if state_is_16bit:
-            if total_heads <= 128:
-                BLOCK_SIZE_M, num_warps, precompute_num_warps, heads_per_block = 16, 2, 4, 1
-            elif total_heads <= 256:
-                BLOCK_SIZE_M, num_warps, precompute_num_warps, heads_per_block = (
-                    16,
-                    1,
-                    4,
-                    min(2, heads_per_group),
-                )
-            elif total_heads <= 512:
-                BLOCK_SIZE_M, num_warps, precompute_num_warps, heads_per_block = (
-                    32,
-                    1,
-                    1,
-                    min(4, heads_per_group),
-                )
-            else:
-                BLOCK_SIZE_M, num_warps, precompute_num_warps, heads_per_block = (
-                    32,
-                    1,
-                    4,
-                    min(2, heads_per_group),
-                )
-        else:  # fp32 state
-            if total_heads <= 128:
-                BLOCK_SIZE_M, num_warps, precompute_num_warps, heads_per_block = 16, 2, 4, 1
-            elif total_heads <= 256:
-                BLOCK_SIZE_M, num_warps, precompute_num_warps, heads_per_block = (
-                    32,
-                    2,
-                    4,
-                    min(2, heads_per_group),
-                )
-            elif total_heads <= 512:
-                BLOCK_SIZE_M, num_warps, precompute_num_warps, heads_per_block = (
-                    64,
-                    2,
-                    2,
-                    min(4, heads_per_group),
-                )
-            else:
-                BLOCK_SIZE_M, num_warps, precompute_num_warps, heads_per_block = (
-                    64,
-                    2,
-                    4,
-                    min(2, heads_per_group),
-                )
-    if _block_size_m is not None:
-        BLOCK_SIZE_M = _block_size_m
-    if _num_warps is not None:
-        num_warps = _num_warps
-    if _heads_per_block is not None:
-        heads_per_block = int(_heads_per_block)
+    if mode == "persistent_dynamic":
+        assert _block_size_m is not None, "persistent_dynamic requires _block_size_m tuning"
+        assert _num_warps is not None, "persistent_dynamic requires _num_warps tuning"
+        assert _num_stages is not None, "persistent_dynamic requires _num_stages tuning"
+        assert _cta_per_sm is not None, "persistent_dynamic requires _cta_per_sm tuning"
+        assert _num_loop_stages is not None, "persistent_dynamic requires _num_loop_stages tuning"
+    else:
+        assert _block_size_m_write is not None, (
+            "persistent_main requires _block_size_m_write tuning"
+        )
+        assert _block_size_m_nowrite is not None, (
+            "persistent_main requires _block_size_m_nowrite tuning"
+        )
+        assert _num_warps_write is not None, "persistent_main requires _num_warps_write tuning"
+        assert _num_warps_nowrite is not None, "persistent_main requires _num_warps_nowrite tuning"
+        assert _num_stages_write is not None, "persistent_main requires _num_stages_write tuning"
+        assert _num_stages_nowrite is not None, (
+            "persistent_main requires _num_stages_nowrite tuning"
+        )
+        assert _cta_per_sm_write is not None, "persistent_main requires _cta_per_sm_write tuning"
+        assert _cta_per_sm_nowrite is not None, (
+            "persistent_main requires _cta_per_sm_nowrite tuning"
+        )
+        assert _num_loop_stages_write is not None, (
+            "persistent_main requires _num_loop_stages_write tuning"
+        )
+        assert _num_loop_stages_nowrite is not None, (
+            "persistent_main requires _num_loop_stages_nowrite tuning"
+        )
+    assert _heads_per_block is not None, "replay default tuning requires _heads_per_block"
+    assert _precompute_num_warps is not None, (
+        "replay default tuning requires _precompute_num_warps"
+    )
+    BLOCK_SIZE_M = (
+        _block_size_m if _block_size_m is not None else _block_size_m_nowrite
+    )
+    num_warps = _num_warps if _num_warps is not None else _num_warps_nowrite
+    precompute_num_warps = _precompute_num_warps
+    heads_per_block = int(_heads_per_block)
     assert heads_per_block > 0, "heads_per_block must be positive"
     heads_per_block = min(heads_per_block, heads_per_group)
     while heads_per_group % heads_per_block != 0 or heads_per_block & (heads_per_block - 1) != 0:
         heads_per_block -= 1
-    if _precompute_num_warps is not None:
-        precompute_num_warps = _precompute_num_warps
 
     # Per-main knob resolution: each _*_{write,nowrite} arg, if not None,
     # overrides the corresponding shared value for ONE main launch only.
