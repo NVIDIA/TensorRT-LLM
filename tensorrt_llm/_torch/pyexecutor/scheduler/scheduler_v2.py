@@ -84,9 +84,17 @@ class BudgetTracker:
         self.num_tokens += num_tokens
         self.num_requests += 1
         if peft_pages > 0:
-            lora_task_id = getattr(req, "lora_task_id", None)
-            self._claimed_peft_pages += peft_pages
-            self._seen_peft_task_ids.add(lora_task_id)
+            self.commit_peft(req, peft_pages)
+
+    def commit_peft(self, req: LlmRequest, peft_pages: int) -> None:
+        """Record only PEFT consumption without affecting token/request budgets.
+
+        Used by disagg_gen_init requests which need PEFT accounting but don't
+        participate in the forward pass.
+        """
+        lora_task_id = getattr(req, "lora_task_id", None)
+        self._claimed_peft_pages += peft_pages
+        self._seen_peft_task_ids.add(lora_task_id)
 
     # ---- PEFT budget ----
 
@@ -255,9 +263,6 @@ class KVCacheV2Scheduler(RequestScheduler):
 
         # --- Phase 1: generation / disagg only ---
         while req_it < req_it_end:
-            if budget.requests_full:
-                break
-
             req = requests_list[req_it]
 
             # --- Filter ---
@@ -267,22 +272,43 @@ class KVCacheV2Scheduler(RequestScheduler):
 
             req_state_value = req.state_value
 
-            # Disagg gen init bypasses normal state gating (same as C++ / V1 scheduler),
-            # but the V2 scheduler owns inline KV allocation so we must allocate here.
-            # V1 defers allocation to prepare_resources; V2 prepare_resources is a no-op
-            # for the primary manager, so allocation must happen in the scheduling loop.
+            # Disagg gen init bypasses both state gating and budget.requests_full
+            # (same as C++ / V1 scheduler), but the V2 scheduler owns inline KV
+            # allocation so we must allocate here. V1 defers allocation to
+            # prepare_resources; V2 prepare_resources is a no-op for the primary
+            # manager, so allocation must happen in the scheduling loop.
+            #
+            # Disagg does NOT count toward budget.num_requests because it
+            # doesn't participate in the forward pass. Capacity is gated by
+            # IndexMapper slot availability: prepare_context returns False when
+            # no free slots remain, so the request is skipped and retried next
+            # iteration. PEFT budget is still checked and committed.
             if req_state_value == self._disagg_gen_init_state_value:
-                if not self.kv_cache_manager.prepare_context(req):
-                    req_it += 1
-                    continue
-                if not self.kv_cache_manager.resize_context(
-                    req, req.context_remaining_length + get_draft_token_length(req)
-                ):
+                peft_pages = budget.peft_pages_needed(req)
+                if peft_pages is None:
+                    break
+
+                action, tokens = self._try_schedule_disagg_gen_init(req, budget)
+                if action is ScheduleAction.STOP:
+                    break
+                if action is ScheduleAction.SKIP:
                     req_it += 1
                     continue
                 disagg_candidates.append(req)
+                # Disagg requests only commit PEFT (not num_requests/num_tokens)
+                # because they don't participate in the forward pass. Counting
+                # them toward num_requests would steal batch slots from gen/ctx
+                # and delay KV transfer initiation. IndexMapper slot availability
+                # (via prepare_context) is the real capacity guard.
+                if peft_pages > 0:
+                    budget.commit_peft(req, peft_pages)
                 req_it += 1
                 continue
+
+            # Budget check for non-disagg requests (disagg bypasses this
+            # because it doesn't participate in the forward pass).
+            if budget.requests_full:
+                break
 
             if not (
                 req_state_value >= self._no_schedule_until_state_value
@@ -395,6 +421,31 @@ class KVCacheV2Scheduler(RequestScheduler):
         if not self.kv_cache_manager.resize_context(req, req_tokens):
             return ScheduleAction.STOP, 0
         return ScheduleAction.SCHEDULED, req_tokens
+
+    def _try_schedule_disagg_gen_init(
+        self, req: LlmRequest, budget: BudgetTracker
+    ) -> tuple[ScheduleAction, int]:
+        """Try to schedule a disagg generation init request.
+
+        Disagg gen init requests bypass normal state gating but still need
+        KV cache allocation inline (V2 prepare_resources is a no-op for
+        the primary manager).  Aligned with C++ CapacityScheduler which
+        treats disagg_gen_init identically to context_init for block/PEFT/
+        maxNumRequests accounting.
+
+        Returns ``(action, tokens)``.  *tokens* is 0 because disagg requests
+        don't participate in the forward pass token budget.
+        """
+        if not self.kv_cache_manager.prepare_context(req):
+            logger.debug("prepare_context failed for disagg gen init request %s", req.py_request_id)
+            return ScheduleAction.SKIP, 0
+
+        if not self.kv_cache_manager.resize_context(
+            req, req.context_remaining_length + get_draft_token_length(req)
+        ):
+            return ScheduleAction.SKIP, 0
+
+        return ScheduleAction.SCHEDULED, 0
 
     def _try_schedule_context(
         self, req: LlmRequest, budget: BudgetTracker

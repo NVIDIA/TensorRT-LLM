@@ -138,8 +138,10 @@ accuracy/test_llm_api_autodeploy.py::TestNemotronSuperV3::test_accuracy[nvfp4-1-
 accuracy/test_llm_api_autodeploy.py::TestNemotronSuperV3::test_accuracy[nvfp4-4-attn_dp_on-trtllm]
 accuracy/test_llm_api_autodeploy.py::TestNemotronSuperV3::test_functional_small[bf16]
 accuracy/test_llm_api_autodeploy.py::TestNemotronSuperV3::test_functional_small[fp8]
-accuracy/test_llm_api_autodeploy.py::TestNemotronSuperV3::test_mtp[ws4_180gb-flashinfer]
-accuracy/test_llm_api_autodeploy.py::TestNemotronSuperV3::test_mtp[ws4_180gb-trtllm]
+accuracy/test_llm_api_autodeploy.py::TestNemotronSuperV3::test_mtp[bf16_ws4_180gb-flashinfer]
+accuracy/test_llm_api_autodeploy.py::TestNemotronSuperV3::test_mtp[bf16_ws4_180gb-trtllm]
+accuracy/test_llm_api_autodeploy.py::TestNemotronSuperV3::test_mtp[fp8_ws4_80gb-trtllm]
+accuracy/test_llm_api_autodeploy.py::TestNemotronSuperV3::test_mtp[nvfp4_ws4_80gb-trtllm]
 accuracy/test_llm_api_autodeploy.py::TestNemotronV2::test_auto_dtype[False]
 accuracy/test_llm_api_autodeploy.py::TestNemotronV2::test_auto_dtype[True]
 accuracy/test_llm_api_autodeploy.py::TestNemotronV2::test_fp8[True]
@@ -558,6 +560,9 @@ accuracy/test_llm_api_pytorch.py::TestKimiK25::test_nvfp4[tp8_attn_dp]
 accuracy/test_llm_api_pytorch.py::TestKimiK2::test_fp8_blockscale[latency]
 accuracy/test_llm_api_pytorch.py::TestKimiK2::test_nvfp4[4gpus]
 accuracy/test_llm_api_pytorch.py::TestKimiK2::test_nvfp4[8gpus]
+accuracy/test_llm_api_pytorch.py::TestLagunaXS::test_bf16
+accuracy/test_llm_api_pytorch.py::TestLagunaXS::test_fp8
+accuracy/test_llm_api_pytorch.py::TestLagunaXS::test_nvfp4
 accuracy/test_llm_api_pytorch.py::TestLlama3_1_8B::test_nvfp4
 accuracy/test_llm_api_pytorch.py::TestLlama3_1_8B::test_nvfp4_streaming[stream_interval_4]
 accuracy/test_llm_api_pytorch.py::TestLlama3_1_8B::test_nvfp4_streaming[stream_interval_64]
@@ -811,6 +816,8 @@ accuracy/test_llm_api_pytorch_multimodal.py::TestQwen2_VL_7B::test_auto_dtype
 accuracy/test_llm_api_pytorch_multimodal.py::TestQwen3VL::test_auto_dtype[forced_chunked_prefill]
 accuracy/test_llm_api_pytorch_multimodal.py::TestQwen3VL_MOE::test_auto_dtype
 accuracy/test_llm_api_pytorch_multimodal.py::TestKimiK25::test_nvfp4[dep8]
+accuracy/test_llm_api_pytorch_multimodal.py::TestQwen3_5_35B_A3B_VL::test_auto_dtype
+accuracy/test_llm_api_pytorch_multimodal.py::TestQwen3_5_35B_A3B_VL::test_fp8_prequantized
 accuracy/test_llm_api_pytorch_multimodal.py::TestVILA1_5_3B::test_auto_dtype
 accuracy/test_llm_api_pytorch_ray.py::TestLlama3_1_8BInstruct::test_pp2_ray
 unittest/disaggregated/test_openai_disagg_server.py
