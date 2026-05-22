@@ -43,6 +43,7 @@ from ._config import (
     KVCacheDesc,
     KVCacheManagerConfig,
     SsmLayerConfig,
+    SwaScratchReuseConfig,
 )
 from ._core import (
     DEFAULT_BEAM_INDEX,
@@ -95,6 +96,7 @@ __all__ = [
     "MemAddress",
     "NDEBUG",
     "KVCacheManagerConfig",
+    "SwaScratchReuseConfig",
     "AttentionLayerConfig",
     "SsmLayerConfig",
     "BufferConfig",
