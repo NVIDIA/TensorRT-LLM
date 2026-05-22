@@ -1379,6 +1379,40 @@ def maybe_pin_memory(tensor: torch.Tensor) -> torch.Tensor:
     return tensor
 
 
+def async_tensor_h2d(data, dtype: torch.dtype,
+                     device: Union[str, torch.device]) -> torch.Tensor:
+    """Build a CPU tensor from ``data`` and ship it to ``device`` with a
+    non-blocking H->D copy.
+
+    Mirrors vLLM's helper of the same name. Centralizes the pinned-CPU
+    + ``cudaMemcpyAsync`` pattern so callers don't have to choose
+    between ``pin_memory=prefer_pinned()`` + ``.to(..., non_blocking=True)``
+    (sequence input) and ``maybe_pin_memory(t).to(..., non_blocking=True)``
+    (existing CPU tensor input). Without pinning, ``non_blocking=True``
+    silently degrades to a staging copy.
+
+    ``data`` may be:
+      * a Python sequence (list/tuple/etc.) — built via ``torch.tensor``.
+      * a CPU ``torch.Tensor`` — reused (and cast to ``dtype`` if needed)
+        before pinning.
+    """
+    if isinstance(data, torch.Tensor):
+        assert data.device.type == "cpu", (
+            "async_tensor_h2d expects a CPU tensor; got "
+            f"device={data.device}")
+        if data.dtype != dtype:
+            data = data.to(dtype)
+        if prefer_pinned() and not data.is_pinned():
+            data = data.pin_memory()
+        return data.to(device, non_blocking=True)
+    # Sequence input -- let torch.tensor pin during construction.
+    return torch.tensor(
+        data,
+        dtype=dtype,
+        pin_memory=prefer_pinned(),
+    ).to(device, non_blocking=True)
+
+
 P = ParamSpec("P")
 
 

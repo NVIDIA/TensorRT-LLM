@@ -30,7 +30,7 @@ from tensorrt_llm.functional import PositionEmbeddingType
 from tensorrt_llm.inputs.multimodal import (DisaggPrefillMultimodalInputs,
                                             MultimodalParams)
 
-from ..._utils import nvtx_range, prefer_pinned
+from ..._utils import async_tensor_h2d, nvtx_range, prefer_pinned
 from ...inputs import (BaseMultimodalDummyInputsBuilder,
                        BaseMultimodalInputProcessor, ContentFormat,
                        ExtraProcessedInputs, MultimodalPlaceholderMetadata,
@@ -1037,8 +1037,13 @@ class Qwen2_5_VisionModel(torch.nn.Module):
         sin = torch.cat(rotary_pos_emb_sin)
         position_embeddings = (cos, sin)
 
-        window_index = torch.cat(window_indices).to(device=self.device,
-                                                    non_blocking=True)
+        # window_index is built per tile on CPU (lru_cached). The cat
+        # result is a fresh pageable tensor, so route the H->D copy
+        # through async_tensor_h2d to land it on a pinned host buffer
+        # first -- otherwise ``non_blocking=True`` silently stages.
+        window_index = async_tensor_h2d(torch.cat(window_indices),
+                                        dtype=torch.long,
+                                        device=self.device)
 
         # window_index is a permutation: it maps original token order ->
         # window order. Its inverse permutation is exactly argsort(window_index),

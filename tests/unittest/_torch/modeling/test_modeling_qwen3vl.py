@@ -867,6 +867,33 @@ def test_freq_table_lru_cache_hit():
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# async_tensor_h2d helper (tensorrt_llm._utils).
+# ---------------------------------------------------------------------------
+
+
+def test_async_tensor_h2d_sequence_input():
+    """List/tuple input -> device tensor with correct dtype and values."""
+    from tensorrt_llm._utils import async_tensor_h2d
+
+    out = async_tensor_h2d([1, 2, 3, 4], dtype=torch.int32, device="cuda")
+    torch.cuda.synchronize()
+    assert out.is_cuda and out.dtype == torch.int32
+    torch.testing.assert_close(out.cpu(), torch.tensor([1, 2, 3, 4], dtype=torch.int32))
+
+
+def test_async_tensor_h2d_tensor_input():
+    """CPU tensor input -> device tensor with cast applied and values
+    preserved."""
+    from tensorrt_llm._utils import async_tensor_h2d
+
+    src = torch.tensor([0.5, 1.5, 2.5], dtype=torch.float64)
+    out = async_tensor_h2d(src, dtype=torch.float32, device="cuda")
+    torch.cuda.synchronize()
+    assert out.is_cuda and out.dtype == torch.float32
+    torch.testing.assert_close(out.cpu(), src.to(torch.float32))
+
+
 @pytest.mark.parametrize("n", [16, 256, 1024])
 def test_argsort_matches_scatter_inverse(n):
     """argsort(perm) must equal the scatter-assign inverse permutation."""

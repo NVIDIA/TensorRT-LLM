@@ -19,7 +19,7 @@ from tensorrt_llm._torch.models.modeling_multimodal_utils import _is_mm_disagg
 from tensorrt_llm.functional import PositionEmbeddingType
 from tensorrt_llm.mapping import Mapping
 
-from ..._utils import nvtx_range, nvtx_range_debug, prefer_pinned
+from ..._utils import async_tensor_h2d, nvtx_range, nvtx_range_debug, prefer_pinned
 from ...inputs import (
     BaseMultimodalDummyInputsBuilder,
     BaseMultimodalInputProcessor,
@@ -932,23 +932,15 @@ def _triton_pos_embed_interpolate_batched(
     total_out = starts[-1]
     output = torch.empty(total_out, hidden_dim, device=device, dtype=dtype)
 
-    # One pinned host buffer per param array, then non_blocking H->D so
-    # the copy is a real DMA (no pageable staging).
-    starts_t = torch.tensor(starts, dtype=torch.int32, pin_memory=prefer_pinned()).to(
-        device, non_blocking=True
-    )
-    hs_t = torch.tensor(hs, dtype=torch.int32, pin_memory=prefer_pinned()).to(
-        device, non_blocking=True
-    )
-    ws_t = torch.tensor(ws, dtype=torch.int32, pin_memory=prefer_pinned()).to(
-        device, non_blocking=True
-    )
-    h_scales_t = torch.tensor(h_scales, dtype=torch.float32, pin_memory=prefer_pinned()).to(
-        device, non_blocking=True
-    )
-    w_scales_t = torch.tensor(w_scales, dtype=torch.float32, pin_memory=prefer_pinned()).to(
-        device, non_blocking=True
-    )
+    # Each metadata array lands in a pinned host buffer and then a real
+    # DMA H->D (no pageable staging). ``async_tensor_h2d`` wraps the
+    # ``torch.tensor(..., pin_memory=prefer_pinned()).to(..., non_blocking=True)``
+    # idiom centrally.
+    starts_t = async_tensor_h2d(starts, dtype=torch.int32, device=device)
+    hs_t = async_tensor_h2d(hs, dtype=torch.int32, device=device)
+    ws_t = async_tensor_h2d(ws, dtype=torch.int32, device=device)
+    h_scales_t = async_tensor_h2d(h_scales, dtype=torch.float32, device=device)
+    w_scales_t = async_tensor_h2d(w_scales, dtype=torch.float32, device=device)
 
     BLOCK_D = triton.next_power_of_2(hidden_dim)
 
