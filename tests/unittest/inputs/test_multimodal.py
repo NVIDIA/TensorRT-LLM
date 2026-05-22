@@ -10,6 +10,7 @@ from tensorrt_llm.inputs.multimodal import (
     MultimodalInput,
     MultimodalRuntimeData,
     _find_mm_embedding_lengths_from_masks,
+    find_mm_token_lengths,
 )
 from tensorrt_llm.inputs.registry import maybe_compute_mm_embed_cumsum
 
@@ -63,6 +64,27 @@ def test_multimodal_embedding_lengths_exclude_special_tokens():
     embedding_lengths = _find_mm_embedding_lengths_from_masks(mm_mask, embed_mask, [5, 4])
 
     assert embedding_lengths == [3, 3]
+
+
+def test_find_mm_token_lengths_passes_all_grid_rows_for_single_video():
+    """A single logical video can have multiple processor grid rows."""
+
+    class FakeVideoProcessor:
+        def get_num_tokens_per_video(self, *, video, video_grid_thw=None):
+            assert video == ["frame"]
+            torch.testing.assert_close(
+                video_grid_thw,
+                torch.tensor([[1, 8, 10], [1, 8, 10]]),
+                rtol=0,
+                atol=0,
+            )
+            return 40
+
+    assert find_mm_token_lengths(
+        {"video": [["frame"]]},
+        FakeVideoProcessor(),
+        multimodal_data={"video": {"video_grid_thw": torch.tensor([[1, 8, 10], [1, 8, 10]])}},
+    ) == {"video": [40]}
 
 
 def test_disagg_prefill_multimodal_inputs_builds_typed_handoff():

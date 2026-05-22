@@ -997,6 +997,8 @@ def find_mm_token_lengths(
         if modality == "video" and video_grid_thw is not None:
             if len(video_grid_thw) == len(items):
                 video_grid_thw_for_items = video_grid_thw
+            elif len(items) == 1:
+                video_grid_thw_for_items = [video_grid_thw]
             else:
                 logger.warning(
                     "find_mm_token_lengths: video_grid_thw row count "

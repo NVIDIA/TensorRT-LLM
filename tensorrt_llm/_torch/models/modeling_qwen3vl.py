@@ -69,7 +69,14 @@ def _expand_prompt_token_ids_for_mm_handoff(
     vision_start_token_id: int,
     placeholder_id: int,
 ) -> DisaggPrefillMultimodalInputs:
-    """Expand Qwen3-VL image/video placeholders and emit sparse MM layout."""
+    """Expand Qwen3-VL image/video placeholders and emit sparse MM layout.
+
+    Qwen3-VL needs a bespoke single-pass expander because the handoff must
+    preserve per-item image/video type and treat the preceding vision_start
+    token as an item-specific leading special token. Generic one-run-per-item
+    layouts do not carry that item type, and Nano's generic non-contiguous-run
+    path does not need to distinguish image vs video placeholders this way.
+    """
     placeholder_positions = [
         pos
         for pos, token in enumerate(input_ids.tolist())
@@ -350,8 +357,14 @@ class Qwen3VLInputProcessorBase(BaseMultimodalInputProcessor, BaseMultimodalDumm
     ) -> int:
         merge = self.config.vision_config.spatial_merge_size
         if video_grid_thw is not None:
-            t, h, w = (int(x) for x in video_grid_thw)
-            return t * (h // merge) * (w // merge)
+            grid_thw = torch.as_tensor(video_grid_thw)
+            if grid_thw.ndim == 1:
+                grid_thw = grid_thw.reshape(1, 3)
+            if grid_thw.ndim != 2 or grid_thw.shape[-1] != 3:
+                raise ValueError("video_grid_thw must have shape [3] or [num_segments, 3]")
+            return sum(
+                int(t) * (int(h) // merge) * (int(w) // merge) for t, h, w in grid_thw.tolist()
+            )
 
         # Must run the full processor: HF's Qwen3VLProcessor._get_num_multimodal_tokens
         # (what the base class default delegates to) raises on video-only calls

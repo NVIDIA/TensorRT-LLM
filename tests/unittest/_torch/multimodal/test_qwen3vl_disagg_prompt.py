@@ -127,3 +127,23 @@ def test_qwen3vl_disagg_prompt_layout_requires_handle_per_placeholder():
             vision_start_token_id=1,
             placeholder_id=99,
         )
+
+
+def test_qwen3vl_video_token_count_sums_single_video_grid_rows():
+    """One logical video may be represented by multiple processor grid rows."""
+    processor = object.__new__(Qwen3VLInputProcessorBase)
+    object.__setattr__(
+        processor,
+        "_config",
+        SimpleNamespace(
+            vision_config=SimpleNamespace(spatial_merge_size=2),
+        ),
+    )
+
+    assert (
+        processor.get_num_tokens_per_video(
+            video=[],
+            video_grid_thw=torch.tensor([[1, 8, 10], [1, 8, 10]]),
+        )
+        == 40
+    )
