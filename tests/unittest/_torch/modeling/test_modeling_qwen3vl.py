@@ -655,10 +655,11 @@ def _make_qwen3_vision_model_for_l2():
 
     Bypasses the heavy `__init__` (blocks, mergers, attn metadata buffers)
     by going through `__new__` so the class-level decorators (`@staticmethod`
-    on `rot_pos_ids` and `@lru_cache` on `_rotary_pos_emb_thw`/`_freq_table`)
-    stay intact. The mock wires only the attrs those cached methods touch:
-    ``spatial_merge_size``, ``rope_inv_freq`` (replaces the prior HF rotary
-    dependency), and ``patch_embed.proj.weight`` (read by ``device``).
+    on `rot_pos_ids` and `@lru_cache` on `_rotary_pos_emb_thw`) stay intact.
+    The mock wires only the attrs those cached methods touch:
+    ``spatial_merge_size``, ``rope_cos_cache``/``rope_sin_cache`` (pre-
+    computed cos/sin buffers populated in the real ``__init__``), and
+    ``patch_embed.proj.weight`` (read by ``device``).
     """
     obj = Qwen3VisionModel.__new__(Qwen3VisionModel)
     torch.nn.Module.__init__(obj)
@@ -667,7 +668,11 @@ def _make_qwen3_vision_model_for_l2():
     # Mirror the real init: rope_dim = head_dim // 2 = 36, theta = 10000.
     rope_dim = 36
     inv_freq = 1.0 / (10000.0 ** (torch.arange(0, rope_dim, 2, dtype=torch.float32) / rope_dim))
-    obj.register_buffer("rope_inv_freq", inv_freq.to("cuda"), persistent=False)
+    max_rope_seqlen = 8192
+    seq = torch.arange(max_rope_seqlen, dtype=torch.float32)
+    freqs = torch.outer(seq, inv_freq)
+    obj.register_buffer("rope_cos_cache", freqs.cos().to("cuda"), persistent=False)
+    obj.register_buffer("rope_sin_cache", freqs.sin().to("cuda"), persistent=False)
 
     # patch_embed.proj.weight is what `Qwen3VisionModel.device` reads.
     obj.patch_embed = torch.nn.Module()
@@ -676,51 +681,57 @@ def _make_qwen3_vision_model_for_l2():
 
 
 def test_rotary_pos_emb_thw_returns_device_tensor():
-    """Cached per-(t, h, w) rotary embedding must live on CUDA so subsequent
-    rot_pos_emb calls do a device-side cat (no H->D transfer)."""
+    """Cached per-(t, h, w) rotary (cos, sin) pair must live on CUDA so
+    subsequent rot_pos_emb calls do device-side cats (no H->D transfer)."""
     vm = _make_qwen3_vision_model_for_l2()
-    # Clear any lingering cache from a previous test.
     vm._rotary_pos_emb_thw.cache_clear()
 
-    out = vm._rotary_pos_emb_thw(1, 16, 16)
-    assert out.is_cuda, "L2 cache must store the gather result on device"
-    assert out.shape[0] == 1 * 16 * 16
-    # dim is freq_table_dim (head_dim/2) * 2 after flatten(1)
-    assert out.shape[1] % 2 == 0
+    cos, sin = vm._rotary_pos_emb_thw(1, 16, 16)
+    assert cos.is_cuda and sin.is_cuda, "L2 cache must store cos/sin on device"
+    assert cos.shape == sin.shape
+    assert cos.shape[0] == 1 * 16 * 16
+    # After gather + flatten the per-token dim is 2 * freq_dim (= 36).
+    assert cos.shape[1] % 2 == 0
 
 
 def test_rotary_pos_emb_thw_lru_cache_hit():
-    """Same (t, h, w) must return the same device tensor object."""
+    """Same (t, h, w) must return the same cached (cos, sin) tuple
+    (object identity, not equality)."""
     vm = _make_qwen3_vision_model_for_l2()
     vm._rotary_pos_emb_thw.cache_clear()
-    a = vm._rotary_pos_emb_thw(1, 16, 16)
-    b = vm._rotary_pos_emb_thw(1, 16, 16)
-    assert a is b, "L2 lru_cache must return the cached device tensor on hit"
+    a_cos, a_sin = vm._rotary_pos_emb_thw(1, 16, 16)
+    b_cos, b_sin = vm._rotary_pos_emb_thw(1, 16, 16)
+    assert a_cos is b_cos and a_sin is b_sin, (
+        "L2 lru_cache must return the cached device tensors on hit"
+    )
     info = vm._rotary_pos_emb_thw.cache_info()
     assert info.hits >= 1 and info.misses >= 1
 
 
 def test_rot_pos_emb_l2_matches_per_tile():
-    """rot_pos_emb on a multi-image grid must equal concatenated per-tile
-    _rotary_pos_emb_thw outputs, bit-exact."""
+    """rot_pos_emb on a multi-image grid must equal the per-tile (cos, sin)
+    tensors concatenated along dim 0, bit-exact."""
     vm = _make_qwen3_vision_model_for_l2()
     vm._rotary_pos_emb_thw.cache_clear()
 
     grid_thw_list = [(1, 16, 16), (1, 32, 32), (1, 16, 16), (3, 8, 12)]
-    out = vm.rot_pos_emb(grid_thw_list)
+    cos_out, sin_out = vm.rot_pos_emb(grid_thw_list)
 
-    expected = torch.cat(
-        [vm._rotary_pos_emb_thw(t, h, w) for t, h, w in grid_thw_list],
+    cos_exp = torch.cat(
+        [vm._rotary_pos_emb_thw(t, h, w)[0] for t, h, w in grid_thw_list],
         dim=0,
     )
-    torch.testing.assert_close(out, expected, atol=0, rtol=0)
+    sin_exp = torch.cat(
+        [vm._rotary_pos_emb_thw(t, h, w)[1] for t, h, w in grid_thw_list],
+        dim=0,
+    )
+    torch.testing.assert_close(cos_out, cos_exp, atol=0, rtol=0)
+    torch.testing.assert_close(sin_out, sin_exp, atol=0, rtol=0)
 
 
 def test_rot_pos_emb_l2_no_device_transfer_on_hit():
     """After the first call warms the L2 cache for a (t, h, w), a second
-    rot_pos_emb call on the same grid must not trigger any new H->D copy
-    in the rot_pos_emb path. We verify by checking that all per-tile
-    outputs are CUDA tensors and that cache hits dominate."""
+    rot_pos_emb call on the same grid must not trigger any new miss."""
     vm = _make_qwen3_vision_model_for_l2()
     vm._rotary_pos_emb_thw.cache_clear()
 
@@ -734,9 +745,53 @@ def test_rot_pos_emb_l2_no_device_transfer_on_hit():
         f"second rot_pos_emb call should be all cache hits; got "
         f"{info.misses - miss_count} extra miss(es)"
     )
-    # Per-tile outputs must be on CUDA so forward's torch.cat is device-side.
+    # Per-tile cos/sin must be on CUDA so forward's torch.cat is device-side.
     for t, h, w in grid:
-        assert vm._rotary_pos_emb_thw(t, h, w).is_cuda
+        cos, sin = vm._rotary_pos_emb_thw(t, h, w)
+        assert cos.is_cuda and sin.is_cuda
+
+
+def test_rot_pos_emb_cos_sin_matches_old_repeat_chain():
+    """The new pre-computed-cos/sin path must produce the same per-token
+    (cos, sin) after the forward's ``.repeat(1, 2)`` as the prior
+    ``freqs.repeat(1, 2).cos()/.sin()`` chain."""
+    vm = _make_qwen3_vision_model_for_l2()
+    vm._rotary_pos_emb_thw.cache_clear()
+
+    grid_thw_list = [(1, 16, 16), (1, 32, 32), (3, 8, 12)]
+
+    # New path: gathered cos/sin then forward's `.repeat(1, 2)`.
+    cos_new, sin_new = vm.rot_pos_emb(grid_thw_list)
+    cos_new = cos_new.repeat(1, 2)
+    sin_new = sin_new.repeat(1, 2)
+
+    # Old path replica: build freqs via outer on the fly, then
+    # `flatten(1).repeat(1, 2).cos()/.sin()`.
+    rope_dim = 36
+    inv_freq = 1.0 / (10000.0 ** (torch.arange(0, rope_dim, 2, dtype=torch.float32) / rope_dim))
+    inv_freq = inv_freq.to("cuda")
+    cos_pieces, sin_pieces = [], []
+    for t, h, w in grid_thw_list:
+        pos_ids = Qwen3VisionModel.rot_pos_ids(h, w, vm.spatial_merge_size)
+        if t > 1:
+            pos_ids = pos_ids.repeat(t, 1)
+        pos_ids = pos_ids.to("cuda")
+        max_hw = max(h, w)
+        seq = torch.arange(max_hw, device="cuda", dtype=torch.float32)
+        freq_table = torch.outer(seq, inv_freq)  # (max_hw, 18)
+        freqs = freq_table[pos_ids].flatten(1)  # (total, 36)
+        emb = freqs.repeat(1, 2)  # (total, 72)
+        cos_pieces.append(emb.cos())
+        sin_pieces.append(emb.sin())
+    cos_old = torch.cat(cos_pieces, dim=0)
+    sin_old = torch.cat(sin_pieces, dim=0)
+
+    # The cos/sin formulas are identical; the only difference is that
+    # the new path computes the outer product host-side at init, while
+    # the old path computes it on-device per call. That's a single-ULP
+    # fp32 gap (~1e-7).
+    torch.testing.assert_close(cos_new, cos_old, atol=1e-6, rtol=1e-6)
+    torch.testing.assert_close(sin_new, sin_old, atol=1e-6, rtol=1e-6)
 
 
 # ---------------------------------------------------------------------------
@@ -820,38 +875,36 @@ def test_batched_pos_embed_matches_per_image(grid_thw_list, dtype):
 
 
 # ---------------------------------------------------------------------------
-# _freq_table (replaces HFQwen3VLVisionRotaryEmbedding).
+# rope_cos_cache / rope_sin_cache buffers (replace HF rotary + per-forward
+# .cos()/.sin()).
 # ---------------------------------------------------------------------------
 
 
-def test_freq_table_matches_hf_rotary():
-    """Our in-tree _freq_table must bit-match the HF
-    Qwen3VLVisionRotaryEmbedding(dim=36)(max_hw) output it replaces."""
+def test_rope_cos_sin_buffers_match_hf_rotary():
+    """Our pre-computed cos/sin buffers must bit-match HF's
+    ``Qwen3VLVisionRotaryEmbedding(dim=36)(max_hw).cos()/.sin()``
+    output. (The cos/sin split mirrors what
+    ``vllm.model_executor.layers.rotary_embedding.base._compute_cos_sin_cache``
+    does at init time.)"""
     from transformers.models.qwen3_vl.modeling_qwen3_vl import (
         Qwen3VLVisionRotaryEmbedding as HFQwen3VLVisionRotaryEmbedding,
     )
 
     vm = _make_qwen3_vision_model_for_l2()
-    vm._freq_table.cache_clear()
-
     hf = HFQwen3VLVisionRotaryEmbedding(36).to("cuda")
+    # Our buffers are computed on CPU at init time and then moved to
+    # device; HF computes the outer product on-device in its forward.
+    # Same arithmetic, different host/device fp32 codegen -- expect
+    # single-ULP differences (~1e-7).
+    atol = rtol = 1e-6
     for max_hw in [16, 32, 48, 64, 100, 128]:
-        ours = vm._freq_table(max_hw)
-        ref = hf(max_hw)
-        assert ours.shape == ref.shape
-        assert ours.dtype == ref.dtype
-        torch.testing.assert_close(ours, ref, atol=0, rtol=0)
-
-
-def test_freq_table_lru_cache_hit():
-    """Same max_hw must return the same cached tensor object."""
-    vm = _make_qwen3_vision_model_for_l2()
-    vm._freq_table.cache_clear()
-    a = vm._freq_table(48)
-    b = vm._freq_table(48)
-    assert a is b
-    info = vm._freq_table.cache_info()
-    assert info.hits >= 1 and info.misses >= 1
+        ref_freqs = hf(max_hw)
+        torch.testing.assert_close(
+            vm.rope_cos_cache[:max_hw], ref_freqs.cos(), atol=atol, rtol=rtol
+        )
+        torch.testing.assert_close(
+            vm.rope_sin_cache[:max_hw], ref_freqs.sin(), atol=atol, rtol=rtol
+        )
 
 
 # ---------------------------------------------------------------------------

@@ -979,18 +979,28 @@ class Qwen3VisionModel(torch.nn.Module):
         self.num_grid_per_side = int(self.config.num_position_embeddings**0.5)
 
         # 2D rotary positional embedding for the vision tower. Mirrors the
-        # HF Qwen3-VL formula exactly (theta=10000, dim=head_dim//2,
-        # inv_freq picks every other index across that dim) but drops the
-        # HFQwen3VLVisionRotaryEmbedding dependency. The actual freq table
-        # is built lazily and memoized per max-spatial-extent in
-        # `_freq_table`, so re-encoding identical (h, w) tiles is free.
+        # HF Qwen3-VL formula (theta=10000, dim=head_dim//2,
+        # inv_freq picks every other index across that dim) and pre-computes
+        # cos/sin into module buffers, vLLM-style
+        # (vllm/model_executor/layers/rotary_embedding/base.py
+        # ``_compute_cos_sin_cache``). ``forward`` then only gathers
+        # ``cos_cache[pos_ids]`` / ``sin_cache[pos_ids]`` -- no per-forward
+        # ``torch.outer`` or ``.cos()`` / ``.sin()`` kernels.
         head_dim = self.config.hidden_size // self.config.num_heads
         rope_dim = head_dim // 2
         rope_theta = 10000.0
         inv_freq = 1.0 / (
             rope_theta ** (torch.arange(0, rope_dim, 2, dtype=torch.float32) / rope_dim)
         )
-        self.register_buffer("rope_inv_freq", inv_freq, persistent=False)
+        # Cover the largest spatial extent the vision tower could plausibly
+        # see. 8192 is what vLLM's get_rope() defaults to for the Qwen3-VL
+        # vision tower; per-buffer it's
+        #   (8192, freq_dim=18) * fp32 = 576 KB, x2 buffers = 1.15 MB.
+        max_rope_seqlen = 8192
+        seq = torch.arange(max_rope_seqlen, dtype=torch.float32)
+        freqs = torch.outer(seq, inv_freq)  # (max_rope_seqlen, rope_dim/2)
+        self.register_buffer("rope_cos_cache", freqs.cos(), persistent=False)
+        self.register_buffer("rope_sin_cache", freqs.sin(), persistent=False)
 
         self.blocks = nn.ModuleList(
             [
@@ -1058,65 +1068,69 @@ class Qwen3VisionModel(torch.nn.Module):
 
         return torch.from_numpy(np.stack([hpos_ids, wpos_ids], axis=-1))
 
-    @lru_cache(maxsize=64)  # noqa: B019
-    def _freq_table(self, max_hw: int) -> torch.Tensor:
-        """Rotary freq table of shape ``(max_hw, len(inv_freq))``.
-
-        Replaces the prior ``HFQwen3VLVisionRotaryEmbedding(...)(max_hw)``
-        call: same formula (``torch.outer(arange(max_hw), inv_freq)``)
-        but memoized so re-encoding identical max-spatial-extents is
-        free. Cache is keyed by integer ``max_hw`` -- production has
-        at most a handful of distinct max-sizes (one per ``max(h, w)``
-        in the served tile set), so ``maxsize=64`` is plenty.
-        """
-        seq = torch.arange(max_hw, device=self.rope_inv_freq.device, dtype=self.rope_inv_freq.dtype)
-        return torch.outer(seq, self.rope_inv_freq)
-
     @lru_cache(maxsize=1024)  # noqa: B019
-    def _rotary_pos_emb_thw(self, t: int, h: int, w: int) -> torch.Tensor:
-        """Per-(t, h, w) rotary embeddings, cached as a device tensor.
+    def _rotary_pos_emb_thw(self, t: int, h: int, w: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Per-(t, h, w) rotary (cos, sin) pair, cached as device tensors.
 
-        Mirrors vLLM's ``get_rope_by_thw`` pattern: the pos_ids construction
-        is CPU-side via ``rot_pos_ids`` (also lru_cached), the H->D copy and
-        the freq_table gather happen here. Once a given (t, h, w) tile has
-        been seen, ``rot_pos_emb`` becomes a dict lookup over already-
-        on-device tensors plus a single ``torch.cat`` (no transfer).
+        Gathers from the pre-computed ``rope_cos_cache`` /
+        ``rope_sin_cache`` buffers populated in ``__init__`` -- so no
+        ``.cos()`` / ``.sin()`` kernels fire in forward. Mirrors vLLM's
+        ``get_rope_by_thw`` pattern: pos_ids are built CPU-side via
+        ``rot_pos_ids`` (also lru_cached), the H->D copy happens here on
+        the first miss, and subsequent calls return the cached on-device
+        cos/sin tuple. ``rot_pos_emb`` over a multi-image grid becomes a
+        list lookup + per-half ``torch.cat`` -- no transfer, no
+        elementwise trig.
 
-        GPU memory cost (measured on H200, ``HFQwen3VLVisionRotaryEmbedding``
-        with ``dim=36`` -> freq table ``(max_hw, 18)``, ``freq_table[pos_ids]
-        .flatten(1)`` -> shape ``(t*h*w, 36)``, fp32):
+        GPU memory cost (measured on H200, head_dim=72 -> freq_dim=18,
+        cos and sin each cached as (t*h*w, 36) after gather+flatten;
+        per-token = 2 * 36 floats * 4 bytes = 288 B, fp32):
 
           ============================  =======  =========
           tile (t, h, w)                tokens   per entry
           ============================  =======  =========
-          (1, 16, 16)  -- 224**2          256       36 KB
-          (1, 32, 32)  -- 448**2         1024      144 KB
-          (1, 48, 48)  -- 672**2         2304      324 KB
-          (1, 64, 64)  -- 1024**2        4096      576 KB
-          (8, 32, 32)  -- 8-frame 448    8192     1.12 MB
+          (1, 16, 16)  -- 224**2          256       72 KB
+          (1, 32, 32)  -- 448**2         1024      288 KB
+          (1, 48, 48)  -- 672**2         2304      648 KB
+          (1, 64, 64)  -- 1024**2        4096     1.13 MB
+          (8, 32, 32)  -- 8-frame 448    8192     2.25 MB
           ============================  =======  =========
 
-        Per-token cost is 144 bytes (= 36 floats x 4 bytes). Typical
-        production VLM serving has 10-30 unique tile shapes, so the cache
-        settles around 2-5 MB. ``maxsize=1024`` is a safety cap; reaching
-        it would require >1024 distinct (t, h, w) and even then LRU evicts.
+        Typical production VLM serving has 10-30 unique tile shapes, so
+        the cache settles around 4-10 MB. ``maxsize=1024`` is a safety
+        cap; reaching it would require >1024 distinct (t, h, w) and
+        even then LRU evicts.
 
-        Note: vLLM's ``get_rope_by_thw`` casts its rotary cos_sin_cache to
-        the model dtype (bf16) via ``get_rope(dtype=torch.get_default_dtype
-        ())`` -- so the equivalent vLLM cache is half the size (72 B/token).
-        Our ``RopeParams.create_rope_const_params`` hardcodes fp32; switching
-        to model dtype would halve this footprint but is a separate change.
+        Note: vLLM's ``get_rope_by_thw`` casts its rotary cos_sin_cache
+        to the model dtype (bf16) via ``get_rope(dtype=torch.get_default_dtype())``
+        -- so the equivalent vLLM cache is half the size (144 B/token).
+        ``RopeParams.create_rope_const_params`` hardcodes fp32;
+        switching to model dtype would halve this footprint but is a
+        separate change.
         """
         pos_ids = self.rot_pos_ids(h, w, self.spatial_merge_size)
         if t > 1:
             pos_ids = pos_ids.repeat(t, 1)
         pos_ids = pos_ids.to(self.device, non_blocking=True)
-        freq_table = self._freq_table(max(h, w))  # (max_hw, dim // 2)
-        return freq_table[pos_ids].flatten(1)
+        # Gather pre-computed cos/sin. pos_ids has shape (total, 2); the
+        # last-dim 2 holds the (h-pos, w-pos) freq indices, so after
+        # gather + flatten the per-token layout is
+        # ``[cos(freq_h), cos(freq_w)]`` of size ``2*freq_dim``.
+        cos = self.rope_cos_cache[pos_ids].flatten(1)
+        sin = self.rope_sin_cache[pos_ids].flatten(1)
+        return cos, sin
 
-    def rot_pos_emb(self, grid_thw: list[list[int]]) -> torch.Tensor:
-        pieces = [self._rotary_pos_emb_thw(t, h, w) for t, h, w in grid_thw]
-        return pieces[0] if len(pieces) == 1 else torch.cat(pieces, dim=0)
+    def rot_pos_emb(self, grid_thw: list[list[int]]) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Return concatenated (cos, sin) for the whole multi-image batch."""
+        cos_pieces: List[torch.Tensor] = []
+        sin_pieces: List[torch.Tensor] = []
+        for t, h, w in grid_thw:
+            c, s = self._rotary_pos_emb_thw(t, h, w)
+            cos_pieces.append(c)
+            sin_pieces.append(s)
+        if len(cos_pieces) == 1:
+            return cos_pieces[0], sin_pieces[0]
+        return torch.cat(cos_pieces, dim=0), torch.cat(sin_pieces, dim=0)
 
     # Adopted from https://github.com/vllm-project/vllm/blob/21eb2c3372fb6447ef36bee44ff7af79a330ffec/vllm/model_executor/models/qwen3_vl.py#L470)
     def fast_pos_embed_interpolate(self, grid_thw: list[list[int]]) -> torch.Tensor:
@@ -1165,16 +1179,19 @@ class Qwen3VisionModel(torch.nn.Module):
         # rot_pos_emb and fast_pos_embed_interpolate iterate it on CPU and
         # benefit from rot_pos_ids' lru_cache when (h, w) repeats.
         grid_rows = grid_thw.tolist()
-        rotary_pos_emb = self.rot_pos_emb(grid_rows)
+        # ``rot_pos_emb`` returns (cos, sin) gathered from the pre-computed
+        # cos/sin buffers -- no ``.cos()``/``.sin()`` kernels in forward.
+        # Each half has shape (total_tokens, 2*freq_dim); ``.repeat(1, 2)``
+        # below expands to head_dim so the per-token layout matches the
+        # prior ``freqs.flatten(1).repeat(1, 2).cos()`` chain bit-for-bit.
+        cos, sin = self.rot_pos_emb(grid_rows)
         pos_embeds = self.fast_pos_embed_interpolate(grid_rows)
 
         hidden_states = self.patch_embed(pixel_values)
         hidden_states += pos_embeds
         hidden_states = hidden_states.flatten(1)
 
-        rotary_pos_emb = rotary_pos_emb.flatten(1)
-        emb = rotary_pos_emb.repeat(1, 2)
-        position_embeddings = (emb.cos(), emb.sin())
+        position_embeddings = (cos.repeat(1, 2), sin.repeat(1, 2))
 
         deepstack_feature_lists = []
         for layer_num, block in enumerate(self.blocks):
