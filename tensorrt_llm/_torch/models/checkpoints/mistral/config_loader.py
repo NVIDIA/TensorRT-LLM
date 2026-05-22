@@ -34,7 +34,6 @@ from tensorrt_llm.quantization.mode import QuantAlgo
 
 
 class _MistralPretrainedConfig(PretrainedConfig):
-
     def __init__(
         self,
         max_position_embeddings: int = 128_000,
