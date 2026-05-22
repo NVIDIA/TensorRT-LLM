@@ -885,6 +885,31 @@ class Qwen3VisionModel(torch.nn.Module):
         the freq_table gather happen here. Once a given (t, h, w) tile has
         been seen, ``rot_pos_emb`` becomes a dict lookup over already-
         on-device tensors plus a single ``torch.cat`` (no transfer).
+
+        GPU memory cost (measured on H200, ``HFQwen3VLVisionRotaryEmbedding``
+        with ``dim=36`` -> freq table ``(max_hw, 18)``, ``freq_table[pos_ids]
+        .flatten(1)`` -> shape ``(t*h*w, 36)``, fp32):
+
+          ============================  =======  =========
+          tile (t, h, w)                tokens   per entry
+          ============================  =======  =========
+          (1, 16, 16)  -- 224**2          256       36 KB
+          (1, 32, 32)  -- 448**2         1024      144 KB
+          (1, 48, 48)  -- 672**2         2304      324 KB
+          (1, 64, 64)  -- 1024**2        4096      576 KB
+          (8, 32, 32)  -- 8-frame 448    8192     1.12 MB
+          ============================  =======  =========
+
+        Per-token cost is 144 bytes (= 36 floats x 4 bytes). Typical
+        production VLM serving has 10-30 unique tile shapes, so the cache
+        settles around 2-5 MB. ``maxsize=1024`` is a safety cap; reaching
+        it would require >1024 distinct (t, h, w) and even then LRU evicts.
+
+        Note: vLLM's ``get_rope_by_thw`` casts its rotary cos_sin_cache to
+        the model dtype (bf16) via ``get_rope(dtype=torch.get_default_dtype
+        ())`` -- so the equivalent vLLM cache is half the size (72 B/token).
+        Our ``RopeParams.create_rope_const_params`` hardcodes fp32; switching
+        to model dtype would halve this footprint but is a separate change.
         """
         pos_ids = self.rot_pos_ids(h, w, self.spatial_merge_size)
         if t > 1:

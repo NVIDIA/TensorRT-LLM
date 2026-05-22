@@ -922,6 +922,32 @@ class Qwen2_5_VisionModel(torch.nn.Module):
         on them is a device-side cat with no H->D transfer. ``window_index``
         stays on CPU because ``forward`` cats all per-tile window_index
         tensors and ships them with a single H->D transfer.
+
+        GPU memory cost (measured on H200, ``head_dim=80``,
+        ``rotary_cos_sin`` fp32; cos_thw and sin_thw each shape
+        ``(t*h*w, 2*head_dim)`` after gather+flatten+window reorder):
+
+          ============================  =======  =========
+          tile (t, h, w)                tokens   per entry
+          ============================  =======  =========
+          (1, 16, 16)  -- 224**2          256      160 KB
+          (1, 32, 32)  -- 448**2         1024      640 KB
+          (1, 48, 48)  -- 672**2         2304     1.41 MB
+          (1, 64, 64)  -- 1024**2        4096     2.50 MB
+          (8, 32, 32)  -- 8-frame 448    8192     5.00 MB
+          ============================  =======  =========
+
+        Per-token cost is 640 bytes (= 2 (cos, sin) x 80 (head_dim) x 4
+        bytes fp32). Typical production VLM serving has 10-30 unique tile
+        shapes, so the cache settles around 10-20 MB. ``maxsize=1024`` is
+        a safety cap; reaching it requires >1024 distinct (t, h, w).
+
+        Note: vLLM's equivalent ``get_rope_by_thw`` casts the rotary
+        cos_sin_cache to the model dtype (bf16) via ``get_rope(dtype=torch.
+        get_default_dtype())`` -- so the equivalent vLLM cache is half the
+        size (320 B/token, ~5-10 MB production). ``RopeParams.create_rope_
+        const_params`` hardcodes fp32; switching to model dtype would halve
+        this footprint but is a separate change.
         """
         hpos_ids = torch.arange(h, dtype=torch.long).unsqueeze(1).expand(-1, w)
         wpos_ids = torch.arange(w, dtype=torch.long).unsqueeze(0).expand(h, -1)
