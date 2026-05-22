@@ -139,12 +139,11 @@ def create_test_backend(
     pretrained_config.intermediate_size = intermediate_size
     pretrained_config.torch_dtype = dtype
 
-    # CUTE_DSL_B12X is internal-only: the user-facing API selects it
-    # transparently via the CUTLASS heuristic auto-promotion on SM120/121 +
-    # NVFP4. Route through "CUTLASS" so the test exercises the same code path
-    # users hit.
+    # CUTE_DSL_B12X is internal-only: the user-facing API selects it on the
+    # CUTEDSL path when SM120/121 + NVFP4 + flashinfer is importable. Route
+    # through "CUTEDSL" so the test exercises the same code path users hit.
     moe_backend_value = (
-        "CUTLASS" if backend_type == MoeBackendType.CUTE_DSL_B12X else backend_type.value
+        "CUTEDSL" if backend_type == MoeBackendType.CUTE_DSL_B12X else backend_type.value
     )
     model_config = ModelConfig(
         pretrained_config=pretrained_config,

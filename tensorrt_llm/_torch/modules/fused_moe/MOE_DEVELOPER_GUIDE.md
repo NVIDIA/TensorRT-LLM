@@ -147,7 +147,7 @@ Still on old path (standalone, with embedded communication):
 | `fused_moe_deepgemm.py` | `DeepGemmFusedMoE` | SM100/SM103 | FP8 Block Scales on Blackwell | `EXTERNAL_COMM` |
 | `fused_moe_densegemm.py` | `DenseGEMMFusedMoE` | SM100/SM103 | NVFP4 min-latency; CuTe DSL dense GEMM packs all experts into one matrix (vs Cutlass per-expert scatter), efficient for small token counts | `EXTERNAL_COMM` |
 | `fused_moe_cute_dsl.py` | `CuteDslFusedMoE` | SM100/SM103 | High throughput NVFP4, generally faster than Cutlass | `EXTERNAL_COMM` |
-| `fused_moe_cute_dsl_b12x.py` | `CuteDslB12xFusedMoE` | SM120/SM121 | NVFP4; auto-selected on the `CUTLASS` path | `EXTERNAL_COMM` |
+| `fused_moe_cute_dsl_b12x.py` | `CuteDslB12xFusedMoE` | SM120/SM121 | NVFP4 hybrid CUTLASS-prefill / FlashInfer NVFP4 MoE decode — best perf on RTX PRO 6000 (SM120) and DGX Spark (SM121); select via the `CUTEDSL` backend path (auto-promoted when flashinfer is importable) | `EXTERNAL_COMM` |
 | `mega_moe/mega_moe_deepgemm.py` | `MegaMoEDeepGemm` | SM100/SM103 | W4A8_MXFP4_MXFP8 via DeepGEMM `fp8_fp4_mega_moe` fused dispatch+GEMM+act+GEMM+combine kernel; requires `hidden_size % 512 == 0` | `FUSED_COMM` |
 | `fused_moe_triton.py` | `TritonFusedMoE` | SM90 only | GPT-OSS on Hopper (requires `swiglu_gptoss_style=True`) | (legacy path) |
 | `fused_moe_wide_ep.py` | `WideEPMoE` | All GPUs | Deprecating — use ConfigurableMoE instead | (legacy path) |
@@ -193,7 +193,7 @@ Each backend's `can_implement(quant_algo, dtype_activation, swiglu_gptoss_style,
 | Unquantized (BF16/FP16) | Y (SM80+) | N | N | N | N | N | Y (SM90, BF16) | Y | Y |
 | FP8 QDQ | Y (SM89+) | N | N | N | N | N | Y (SM90) | Y | Y |
 | FP8 Block Scales | Y (SM90, SM120) | Y (SM100/103) | Y (SM100/103) | N | Y (SM100/103) | N | N | Y | Y |
-| NVFP4 | Y (SM100/103/120/121) | Y (SM100/103) | N | Y (SM100/103) | Y (SM100/103) | N | N | Y | Y |
+| NVFP4 | Y (SM100/103/120/121) | Y (SM100/103) | N | Y (SM100/103) | Y (SM100/103/120/121) | N | N | Y | Y |
 | W4A8 NVFP4 FP8 | N | Y (SM100/103) | N | N | N | N | N | N | N |
 | W4A16 MXFP4 | Y (SM90) | Y (SM100/103) | N | N | N | N | Y (SM90) | N | N |
 | W4A8 MXFP4 FP8 | Y (SM100/103) | Y (SM100/103) | N | N | N | N | Y (SM90) | N | N |

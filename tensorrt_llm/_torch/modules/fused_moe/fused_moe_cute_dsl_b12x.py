@@ -79,7 +79,7 @@ class CuteDslB12xFusedMoE(CuteDslFusedMoE):
     The backend hard-rejects EP (b12x has no dispatch / combine kernel),
     MoE alltoall, ``Fp4QuantizedTensor`` input, ``swiglu_gptoss_style``
     biased SwiGLU, and activations outside ``{Relu2, Swiglu}``. It is
-    auto-selected on the ``CUTLASS`` MoE path when SM120 / SM121 + NVFP4 +
+    selected on the ``CUTEDSL`` MoE path when SM120 / SM121 + NVFP4 +
     flashinfer-importable gates pass (see ``create_moe.get_moe_cls``).
     """
 

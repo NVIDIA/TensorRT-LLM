@@ -251,10 +251,11 @@ def _create_model_config(
 
     # CUTE_DSL_B12X is an internal-only MoeBackendType — it has no
     # corresponding user-facing MoeConfig.backend literal. Route through
-    # "CUTLASS" so the test exercises the heuristic auto-promotion path that
-    # users hit on SM120/121 + NVFP4.
+    # "CUTEDSL" so the test exercises the cuteDSL-family selection path that
+    # users hit on SM120/121 + NVFP4 (where get_moe_cls returns the hybrid
+    # CuteDslB12xFusedMoE backend when flashinfer is importable).
     if moe_backend == MoeBackendType.CUTE_DSL_B12X.value:
-        moe_backend = MoeBackendType.CUTLASS.value
+        moe_backend = MoeBackendType.CUTEDSL.value
 
     kwargs = dict(
         pretrained_config=pretrained_config,
