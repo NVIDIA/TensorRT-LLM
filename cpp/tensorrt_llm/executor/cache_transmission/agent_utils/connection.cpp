@@ -445,12 +445,20 @@ AgentConnection const* AgentConnectionManager::recvConnectionAndRequestInfo(
                         "AgentConnectionManager received RequestAndBufferInfo from '%s' with embedded agent '%s'",
                         agent.c_str(), remoteAgentName.c_str());
                     auto const* expectedAgentState = findAgentState(mCommState, remoteAgentName);
-                    TLLM_CHECK_WITH_INFO(expectedAgentState != nullptr,
-                        "AgentConnectionManager received RequestAndBufferInfo from unknown agent '%s'",
-                        remoteAgentName.c_str());
-                    TLLM_CHECK_WITH_INFO(address == expectedAgentState->mConnectionInfo,
-                        "AgentConnectionManager received mismatched connection info for agent '%s'",
-                        remoteAgentName.c_str());
+                    if (expectedAgentState != nullptr)
+                    {
+                        TLLM_CHECK_WITH_INFO(address == expectedAgentState->mConnectionInfo,
+                            "AgentConnectionManager received mismatched connection info for agent '%s'",
+                            remoteAgentName.c_str());
+                    }
+                    else
+                    {
+                        std::scoped_lock remoteInfoLock(mRemoteConnectionInfoMutex);
+                        auto [remoteInfoIt, inserted] = mRemoteConnectionInfo.emplace(remoteAgentName, address);
+                        TLLM_CHECK_WITH_INFO(inserted || remoteInfoIt->second == address,
+                            "AgentConnectionManager received mismatched connection info for dynamic agent '%s'",
+                            remoteAgentName.c_str());
+                    }
                     TLLM_CHECK_WITH_INFO(connectionIdx >= 0,
                         "AgentConnectionManager received negative connection index for agent '%s'",
                         remoteAgentName.c_str());
