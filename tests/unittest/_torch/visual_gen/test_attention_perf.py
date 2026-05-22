@@ -872,8 +872,8 @@ _sm100_only = pytest.mark.skipif(
 
 # All five supported (qk_dtype, v_dtype, (q_block_size, k_block_size, v_block_size)) recipes.
 _QUANT_CONFIGS = [
-    QuantAttentionConfig(qk_dtype="e4m3", q_block_size=1, k_block_size=1, v_block_size=1),
-    QuantAttentionConfig(qk_dtype="e4m3", q_block_size=1, k_block_size=4, v_block_size=1),
+    QuantAttentionConfig(qk_dtype="fp8", q_block_size=1, k_block_size=1, v_block_size=1),
+    QuantAttentionConfig(qk_dtype="fp8", q_block_size=1, k_block_size=4, v_block_size=1),
     QuantAttentionConfig(qk_dtype="int8", q_block_size=1, k_block_size=1, v_block_size=1),
     QuantAttentionConfig(qk_dtype="int8", q_block_size=1, k_block_size=4, v_block_size=1),
     QuantAttentionConfig(qk_dtype="int8", q_block_size=1, k_block_size=16, v_block_size=1),

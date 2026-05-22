@@ -29,6 +29,7 @@ keep working with empty metadata until they are filled in.
 import json
 import os
 from dataclasses import dataclass, field
+from enum import Enum
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Type
 
 from tensorrt_llm.logger import logger
@@ -36,6 +37,25 @@ from tensorrt_llm.logger import logger
 if TYPE_CHECKING:
     from .config import DiffusionModelConfig
     from .pipeline import BasePipeline
+
+
+class PipelineComponent(str, Enum):
+    """Identifiers for Diffusers-pipeline components.
+
+    Inherits from ``str`` so values compare equal to plain strings,
+    e.g. ``PipelineComponent.VAE == "vae"`` is ``True``. The loader reads
+    these from ``model_index.json``.
+    """
+
+    TRANSFORMER = "transformer"
+    VAE = "vae"
+    TEXT_ENCODER = "text_encoder"
+    TEXT_ENCODER_2 = "text_encoder_2"
+    TOKENIZER = "tokenizer"
+    TOKENIZER_2 = "tokenizer_2"
+    SCHEDULER = "scheduler"
+    IMAGE_ENCODER = "image_encoder"
+    IMAGE_PROCESSOR = "image_processor"
 
 
 @dataclass

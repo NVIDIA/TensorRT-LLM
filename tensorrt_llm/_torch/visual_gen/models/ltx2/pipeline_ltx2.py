@@ -20,8 +20,7 @@ from tensorrt_llm._torch.visual_gen.cache.teacache import CacheContext
 from tensorrt_llm._torch.visual_gen.cuda_graph_runner import CUDAGraphRunner, CUDAGraphRunnerConfig
 from tensorrt_llm._torch.visual_gen.output import CudaPhaseTimer, PipelineOutput
 from tensorrt_llm._torch.visual_gen.pipeline import BasePipeline, ExtraParamSchema
-from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineComponent
-from tensorrt_llm._torch.visual_gen.pipeline_registry import register_pipeline
+from tensorrt_llm._torch.visual_gen.pipeline_registry import PipelineComponent, register_pipeline
 from tensorrt_llm._torch.visual_gen.utils import postprocess_video_tensor
 from tensorrt_llm.logger import logger
 
@@ -584,11 +583,11 @@ def _load_component_weights(
         "distilled_lora_path": None,
     },
     doc=(
-        "Lightricks LTX-Video. ``pipeline_config()`` returns the "
-        "superset of knobs. Setting both ``spatial_upsampler_path`` and "
-        "``distilled_lora_path`` selects the two-stage refinement "
-        "variant via ``resolve_variant()`` at load time; leaving either "
-        "as ``None`` stays on the one-stage variant."
+        "Lightricks LTX-2 support. ``pipeline_config()`` returns the "
+        "superset of knobs for one-stage and two-stage. Pipeline will "
+        "run two-stage if both ``spatial_upsampler_path`` and "
+        "``distilled_lora_path`` are not ``None``, either set by the "
+        "user or auto-discovered from the checkpoint."
     ),
 )
 class LTX2Pipeline(BasePipeline):

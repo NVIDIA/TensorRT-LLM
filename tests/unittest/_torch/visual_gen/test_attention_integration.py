@@ -289,7 +289,7 @@ def test_self_attention_equivalence(attn_backend: str):
 # batch_size: B=1 (cfg_size=2, split across GPUs) / B=2 (cfg_size=1, single GPU)
 @pytest.mark.parametrize("seq_len", [256, 512, 1560, 3600, 4096, 16384, 32760])
 @pytest.mark.parametrize("batch_size", [1, 2])
-@pytest.mark.parametrize("qk_dtype", ["e4m3", "int8"])
+@pytest.mark.parametrize("qk_dtype", ["fp8", "int8"])
 def test_sage_attention_self_attention(qk_dtype: str, batch_size: int, seq_len: int):
     """Test SageAttention (TRTLLM + quant_attention_config) self-attention.
 
@@ -692,7 +692,7 @@ def run_all_tests():
     # Run SageAttention self-attention tests (subset for manual runner)
     for batch_size in [1, 2]:
         for seq_len in [4096, 32760]:
-            for qk_dtype in ["e4m3", "int8"]:
+            for qk_dtype in ["fp8", "int8"]:
                 label = f"sage_B{batch_size}_S{seq_len}_QkDtype{qk_dtype}"
                 results[label] = test_sage_attention_self_attention(
                     qk_dtype=qk_dtype, batch_size=batch_size, seq_len=seq_len

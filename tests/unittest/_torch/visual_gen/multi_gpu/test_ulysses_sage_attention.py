@@ -135,7 +135,7 @@ def _logic_sage_ulysses_forward(rank, world_size, *, sage_attn_qk_int8: bool):
         num_heads=num_heads // world_size,
         head_dim=head_dim,
         quant_attention_config=QuantAttentionConfig(
-            qk_dtype="int8" if sage_attn_qk_int8 else "e4m3",
+            qk_dtype="int8" if sage_attn_qk_int8 else "fp8",
             q_block_size=1,
             k_block_size=blk_k,
             v_block_size=1,
@@ -194,7 +194,7 @@ def _logic_sage_ulysses_vs_reference(
         num_heads=num_heads // world_size,
         head_dim=head_dim,
         quant_attention_config=QuantAttentionConfig(
-            qk_dtype="int8" if sage_attn_qk_int8 else "e4m3",
+            qk_dtype="int8" if sage_attn_qk_int8 else "fp8",
             q_block_size=1,
             k_block_size=sage_attn_num_elts_per_blk_k,
             v_block_size=1,

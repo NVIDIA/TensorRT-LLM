@@ -8,7 +8,7 @@ import torch.distributed as dist
 import torch.nn as nn
 from pydantic import Field
 
-from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineComponent
+from tensorrt_llm._torch.visual_gen.pipeline_registry import PipelineComponent
 from tensorrt_llm._utils import nvtx_range
 from tensorrt_llm.llmapi.utils import StrictBaseModel
 from tensorrt_llm.logger import logger

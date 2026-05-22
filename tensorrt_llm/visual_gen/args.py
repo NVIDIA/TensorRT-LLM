@@ -50,22 +50,25 @@ class QuantAttentionConfig(StrictBaseModel):
     ``AttentionConfig.quant_attention_config = None`` disables it.
 
     Bare ``QuantAttentionConfig()`` is a valid finest-granularity recipe
-    (``qk_dtype="int8"``, ``v_dtype="e4m3"``, ``q=k=v=1``); tune
+    (``qk_dtype="int8"``, ``v_dtype="fp8"``, ``q=k=v=1``); tune
     ``k_block_size`` up (4 or 16) for speed.
+
+    The ``"fp8"`` dtype maps to ``e4m3`` (``torch.float8_e4m3fn``) in
+    the current kernel; ``e5m2`` is not supported on this path.
 
     Unsupported recipes are rejected by ``AttentionConfig``'s validator
     with a ``ValueError``.
     """
 
-    qk_dtype: Literal["int8", "e4m3"] = Field(
+    qk_dtype: Literal["int8", "fp8"] = Field(
         "int8",
         status="prototype",
-        description="Q/K quantization dtype: 'int8' or 'e4m3' (FP8).",
+        description="Q/K quantization dtype: 'int8' or 'fp8' (e4m3 in practice).",
     )
-    v_dtype: Literal["e4m3"] = Field(
-        "e4m3",
+    v_dtype: Literal["fp8"] = Field(
+        "fp8",
         status="prototype",
-        description="V quantization dtype. The current kernel always stores V in FP8.",
+        description="V quantization dtype. The current kernel always stores V in FP8 (e4m3).",
     )
     q_block_size: int = Field(
         1,
@@ -108,11 +111,11 @@ class AttentionConfig(StrictBaseModel):
     @model_validator(mode="after")
     def _validate_quant_attention_config(self) -> "AttentionConfig":
         SUPPORTED_QUANT_RECIPES = {
-            ("int8", "e4m3", (1, 1, 1)),
-            ("int8", "e4m3", (1, 4, 1)),
-            ("int8", "e4m3", (1, 16, 1)),
-            ("e4m3", "e4m3", (1, 1, 1)),
-            ("e4m3", "e4m3", (1, 4, 1)),
+            ("int8", "fp8", (1, 1, 1)),
+            ("int8", "fp8", (1, 4, 1)),
+            ("int8", "fp8", (1, 16, 1)),
+            ("fp8", "fp8", (1, 1, 1)),
+            ("fp8", "fp8", (1, 4, 1)),
         }
 
         if self.quant_attention_config is None:

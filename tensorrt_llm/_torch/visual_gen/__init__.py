@@ -15,7 +15,8 @@ from .checkpoints import WeightLoader
 from .config import DiffusionModelConfig
 from .mapping import VisualGenMapping
 from .models import AutoPipeline, BasePipeline, WanPipeline
-from .pipeline_loader import PipelineComponent, PipelineLoader
+from .pipeline_loader import PipelineLoader
+from .pipeline_registry import PipelineComponent
 
 __all__ = [
     "DiffusionModelConfig",

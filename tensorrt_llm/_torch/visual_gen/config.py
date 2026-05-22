@@ -373,7 +373,7 @@ class DiffusionModelConfig(BaseModel):
         cache_cfg = args.cache_config if args else None
         enable_layerwise_nvtx_marker = bool(args.enable_layerwise_nvtx_marker) if args else False
 
-        from .pipeline_loader import PipelineComponent
+        from .pipeline_registry import PipelineComponent
 
         component = PipelineComponent.TRANSFORMER
         checkpoint_path = Path(checkpoint_dir)

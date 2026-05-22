@@ -16,7 +16,6 @@ Dynamic Quantization:
 
 import os
 import time
-from enum import Enum
 from typing import TYPE_CHECKING, List, Optional, Union
 
 import torch
@@ -28,30 +27,10 @@ from tensorrt_llm.llmapi.utils import download_hf_model
 from tensorrt_llm.logger import logger
 from tensorrt_llm.visual_gen.args import VisualGenArgs
 
-
-class PipelineComponent(str, Enum):
-    """Identifiers for Diffusers-pipeline components.
-
-    Inherits from ``str`` so values compare equal to plain strings,
-    e.g. ``PipelineComponent.VAE == "vae"`` is ``True``. The loader reads
-    these from ``model_index.json``.
-    """
-
-    TRANSFORMER = "transformer"
-    VAE = "vae"
-    TEXT_ENCODER = "text_encoder"
-    TEXT_ENCODER_2 = "text_encoder_2"
-    TOKENIZER = "tokenizer"
-    TOKENIZER_2 = "tokenizer_2"
-    SCHEDULER = "scheduler"
-    IMAGE_ENCODER = "image_encoder"
-    IMAGE_PROCESSOR = "image_processor"
-
-
-from .config import DiffusionModelConfig  # noqa: E402
-from .mapping import VisualGenMapping  # noqa: E402
-from .models import AutoPipeline  # noqa: E402
-from .pipeline_registry import PIPELINE_REGISTRY  # noqa: E402
+from .config import DiffusionModelConfig
+from .mapping import VisualGenMapping
+from .models import AutoPipeline
+from .pipeline_registry import PIPELINE_REGISTRY, PipelineComponent
 
 if TYPE_CHECKING:
     from .models import BasePipeline

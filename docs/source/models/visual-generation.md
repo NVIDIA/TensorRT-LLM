@@ -109,7 +109,15 @@ args = VisualGenArgs(
 
 ### TeaCache
 
-TeaCache caches transformer outputs when timestep embeddings change slowly between denoising steps, skipping redundant computation. Enable with `teacache.enable_teacache: true` (YAML config). The `teacache_thresh` parameter controls the similarity threshold.
+TeaCache caches transformer outputs when timestep embeddings change slowly between denoising steps, skipping redundant computation. Enable via `VisualGenArgs.cache_config` (YAML or programmatic):
+
+```yaml
+cache_config:
+  cache_backend: teacache
+  teacache_thresh: 0.2
+```
+
+The `teacache_thresh` parameter controls the similarity threshold. Cache-DiT is also supported via `cache_backend: cache_dit` with its own set of knobs (see `CacheDiTConfig`).
 
 ### Multi-GPU Parallelism
 
@@ -140,7 +148,7 @@ Key components:
 | `BasePipeline` | `visual_gen/pipeline.py` | Base class: denoising loop, CFG handling, TeaCache, CUDA graph |
 | `AutoPipeline` | `visual_gen/pipeline_registry.py` | Factory: auto-detects model type, selects pipeline class |
 | `PipelineLoader` | `visual_gen/pipeline_loader.py` | Resolves checkpoint, loads config/weights, creates pipeline |
-| `TeaCacheBackend` | `visual_gen/teacache.py` | Runtime caching for transformer outputs |
+| `TeaCacheAccelerator` / `CacheDiTAccelerator` | `visual_gen/cache/` | Runtime caching backends (TeaCache, Cache-DiT) wrapping the transformer forward |
 | `WeightLoader` | `visual_gen/checkpoints/` | Loads transformer weights from safetensors/bin |
 
 VisualGen is a parallel inference subsystem within TensorRT-LLM. It shares low-level primitives (`Mapping`, `QuantConfig`, `Linear`, `RMSNorm`, `ZeroMqQueue`, `TrtllmAttention`) but has its own executor, scheduler (diffusers-based), request types, and pipeline architecture separate from the LLM autoregressive decode path.
@@ -172,5 +180,5 @@ After these steps, the framework automatically handles:
 
 - Weight loading with optional dynamic quantization via `PipelineLoader`
 - Multi-GPU execution via `DiffusionExecutor`
-- TeaCache integration (if you call `self._setup_teacache()` in `post_load_weights()`)
+- Cache acceleration (if you call `self._setup_cache_acceleration(self.transformer, coefficients=...)` in `post_load_weights()`; supports both TeaCache and Cache-DiT via `VisualGenArgs.cache_config`)
 - Serving via `trtllm-serve` with the full endpoint set
