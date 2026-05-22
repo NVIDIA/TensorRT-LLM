@@ -484,7 +484,7 @@ class Gemma4InputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyInpu
         )
 
     @torch.inference_mode()
-    def call_with_txt_prompt(
+    def call_with_text_prompt(
         self,
         inputs: TextPrompt,
         sampling_params: SamplingParams,

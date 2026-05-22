@@ -756,7 +756,7 @@ class HCXVisionInputProcessor(BaseMultimodalDummyInputsBuilder,
         return input_ids, preprocessed_image
 
     @torch.inference_mode()
-    def call_with_txt_prompt(
+    def call_with_text_prompt(
         self, inputs: TextPrompt, sampling_params: SamplingParams
     ) -> Tuple[List[int], Optional[ExtraProcessedInputs]]:
         text_prompt, mm_data, mm_processor_kwargs = inputs.get("prompt"), \

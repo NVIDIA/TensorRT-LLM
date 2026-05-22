@@ -1434,7 +1434,7 @@ class Llama4InputProcessor(BaseMultimodalInputProcessor,
         return token_ids.tolist(), {"multimodal_data": multimodal_data}
 
     @torch.inference_mode()
-    def call_with_txt_prompt(
+    def call_with_text_prompt(
         self, inputs: TextPrompt, sampling_params: SamplingParams
     ) -> Tuple[List[int], Optional[ExtraProcessedInputs]]:
         text_prompt, mm_data = inputs.get("prompt"), inputs.get(

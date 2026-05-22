@@ -131,9 +131,10 @@ class BaseMultimodalInputProcessor(ABC):
     models. Specific processors can override these methods if they need custom logic.
 
     Optional tokenized+MM fast path: to support prompt_token_ids + multi_modal_data
-    without detokenizing, implement get_text_with_mm_placeholders(mm_counts) and
+    without detokenizing, set the `supports_token_id_mm_expansion` class flag to
+    True and implement both get_text_with_mm_placeholders(mm_counts) and
     expand_prompt_token_ids_for_mm(prompt_token_ids, num_mm_tokens_per_placeholder, ...).
-    If these are not implemented, the pipeline detokenizes the text prompt first and then
+    If the flag is False, the pipeline detokenizes the text prompt first and then
     processes the multimodal inputs.
     """
 
@@ -144,6 +145,12 @@ class BaseMultimodalInputProcessor(ABC):
     # Default False: most VLMs (Llava, Qwen-VL) use causal attention over MM
     # tokens and tolerate splitting. Gemma4 sets True.
     mm_bidirectional_blocks: ClassVar[bool] = False
+
+    # Whether the subclass implements the tokenized+MM fast path — i.e. both
+    # `get_text_with_mm_placeholders` and `expand_prompt_token_ids_for_mm`.
+    # When True, `__call__` may route `prompt_token_ids + multi_modal_data`
+    # inputs to `call_with_token_ids` instead of detokenizing upstream.
+    supports_token_id_mm_expansion: ClassVar[bool] = False
 
     def __init__(self,
                  model_path,
@@ -203,24 +210,18 @@ class BaseMultimodalInputProcessor(ABC):
         """Dispatch between text-prompt and tokenized+MM fast paths.
 
         - Tokenized+MM fast path (`prompt_token_ids` set, `multi_modal_data` set,
-          no `prompt`): delegate to `call_with_token_ids`, which builds dummy
-          placeholder text, runs `call_with_txt_prompt` on it to populate the
-          multimodal payload, then expands the real token IDs via
-          `expand_prompt_token_ids_for_mm`.
+          no `prompt`): delegate to `call_with_token_ids`.
         - Else (text prompt with/without MM data, or tokenize-only requests):
-          delegate to `call_with_txt_prompt`.
-
-        Non-fast-path VLMs are detokenized upstream in `llm.py`, so this
-        dispatcher only sees fast-path-eligible inputs in the first branch.
+          delegate to `call_with_text_prompt`.
         """
         if (inputs.get("prompt_token_ids") is not None
                 and inputs.get("multi_modal_data") is not None
                 and inputs.get("prompt") is None):
             return self.call_with_token_ids(inputs, sampling_params)
-        return self.call_with_txt_prompt(inputs, sampling_params)
+        return self.call_with_text_prompt(inputs, sampling_params)
 
     @abstractmethod
-    def call_with_txt_prompt(
+    def call_with_text_prompt(
         self, inputs: TextPrompt, sampling_params: SamplingParams
     ) -> Tuple[List[int], Optional[ExtraProcessedInputs]]:
         """Process `inputs` containing a text `prompt` (and optionally `multi_modal_data`).
@@ -235,17 +236,38 @@ class BaseMultimodalInputProcessor(ABC):
     ) -> Tuple[List[int], Optional[ExtraProcessedInputs]]:
         """Fast path for `prompt_token_ids + multi_modal_data` without detokenizing.
 
-        Requires the subclass to implement `get_text_with_mm_placeholders` and
-        `expand_prompt_token_ids_for_mm`. Otherwise raises `NotImplementedError`
-        (callers should detokenize upstream — see `llm.py`).
+        Builds dummy placeholder text, runs `call_with_text_prompt` on it to populate the
+        multimodal payload, then expands the real token IDs via
+        `expand_prompt_token_ids_for_mm`.
+
+        Requires the subclass to opt in via the `supports_token_id_mm_expansion`
+        class flag and implement both of the following hooks; otherwise raises
+        `NotImplementedError`:
+
+        - `get_text_with_mm_placeholders(mm_counts: Dict[str, int]) -> str`
+            Build a minimal placeholder text for the given per-modality item
+            counts. Used to drive the HF processor / vision encoder without the
+            real prompt.
+        - `expand_prompt_token_ids_for_mm(
+              prompt_token_ids: List[int],
+              num_mm_tokens_per_placeholder: List[int],
+              *,
+              hf_processor_mm_kwargs: Optional[Dict[str, Any]] = None,
+              mm_data: Optional[Dict[str, Any]] = None,
+          ) -> Tuple[List[int], Optional[Dict[str, Dict[str, Any]]]]`
+            Replace each MM placeholder token in `prompt_token_ids` with the
+            corresponding number of MM feature tokens. Returns the expanded
+            token IDs and optional `mm_data_updates` — per-modality fields to
+            merge into `extra_processed_inputs["multimodal_data"]` (e.g. video
+            `evs_ids` for Nano OMNI V3 rebuilt from the real prompt instead
+            of the dummy one).
         """
-        get_text = getattr(self, "get_text_with_mm_placeholders", None)
-        expand_ids = getattr(self, "expand_prompt_token_ids_for_mm", None)
-        if get_text is None or expand_ids is None:
+        if not self.supports_token_id_mm_expansion:
             raise NotImplementedError(
                 f"{type(self).__name__} does not implement the tokenized+MM "
-                "fast path. Detokenize `prompt_token_ids` to a text prompt "
-                "before calling.")
+                "fast path (supports_token_id_mm_expansion is False). "
+                "Detokenize `prompt_token_ids` to a text prompt before calling."
+            )
 
         prompt_token_ids = inputs["prompt_token_ids"]
         mm_data = inputs["multi_modal_data"]
@@ -274,7 +296,7 @@ class BaseMultimodalInputProcessor(ABC):
                 "call_with_token_ids: find_mm_token_lengths returned no token "
                 "lengths for the provided multi_modal_data.")
 
-        expanded_ids, mm_data_updates = expand_ids(
+        expanded_ids, mm_data_updates = self.expand_prompt_token_ids_for_mm(
             prompt_token_ids,
             num_mm_tokens,
             hf_processor_mm_kwargs=inputs.get("mm_processor_kwargs"),
