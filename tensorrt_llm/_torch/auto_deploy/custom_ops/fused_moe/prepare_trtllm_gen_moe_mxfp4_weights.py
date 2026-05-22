@@ -31,6 +31,7 @@ from tensorrt_llm._torch.modules.fused_moe.quantization import (
     trtllmgen_maybe_get_cached_w2_permute_indices,
     trtllmgen_maybe_get_cached_w3_w1_permute_indices,
 )
+from tensorrt_llm.math_utils import pad_up
 
 # Cache permute indices to avoid recomputation across calls.
 # Keyed by (shape, role, num_elts_per_sf) inside the PT helpers.
@@ -51,12 +52,11 @@ def _compute_padded_dims(per_rank_i: int, hidden_size: int) -> Tuple[int, int, i
     ``i_pad`` / ``h_w2_pad`` align to 128 (TMA weight alignment);
     ``h_w1_pad`` aligns to 512 (TMA input-hidden constraint on w1's K-axis).
     """
-    i_pad = ((per_rank_i + _WEIGHT_ALIGNMENT - 1) // _WEIGHT_ALIGNMENT) * _WEIGHT_ALIGNMENT
-    h_w1_pad = (
-        (hidden_size + _INPUT_HIDDEN_ALIGNMENT - 1) // _INPUT_HIDDEN_ALIGNMENT
-    ) * _INPUT_HIDDEN_ALIGNMENT
-    h_w2_pad = ((hidden_size + _WEIGHT_ALIGNMENT - 1) // _WEIGHT_ALIGNMENT) * _WEIGHT_ALIGNMENT
-    return i_pad, h_w1_pad, h_w2_pad
+    return (
+        pad_up(per_rank_i, _WEIGHT_ALIGNMENT),
+        pad_up(hidden_size, _INPUT_HIDDEN_ALIGNMENT),
+        pad_up(hidden_size, _WEIGHT_ALIGNMENT),
+    )
 
 
 @dataclass(frozen=True)
