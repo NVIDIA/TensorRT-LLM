@@ -382,7 +382,7 @@ pipeline {
                 stage("Source Code OSS Scanning") {
                     steps {
                         script {
-                            //generateLockFiles(env.LLM_REPO, env.REF)
+                            generateLockFiles(env.LLM_REPO, env.REF)
                             pulseScanSourceCode(env.LLM_REPO, env.REF)
                         }
                     }
@@ -394,13 +394,13 @@ pipeline {
                         }
                     }
                 }
-                //stage("SonarQube Code Analysis") {
-                    //steps {
-                        //script {
-                            //sonarScan()
-                        //}
-                    //}
-                //}
+                stage("SonarQube Code Analysis") {
+                    steps {
+                        script {
+                            sonarScan()
+                        }
+                    }
+                }
             }
         }
         stage("Process In Pipeline Scan Result") {
