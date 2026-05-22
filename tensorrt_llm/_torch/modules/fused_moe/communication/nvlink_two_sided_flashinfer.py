@@ -107,6 +107,16 @@ class NVLinkTwoSidedFlashinfer(Communication):
         self.alltoall_workspace = flashinfer_MnnvlMoe.get_moe_workspaces(mapping)
         self.alltoall_prepare_workspace = flashinfer_MnnvlMoe.get_moe_prepare_workspace(mapping)
 
+        # FlashInfer's get_moe_workspaces does NOT initialize the FIFO region or
+        # zero the SenderSide/ReceiverSideFifoInfo bookkeeping, unlike the in-tree
+        # MnnvlMoe.get_moe_workspaces. Without this, the combine kernel spins on
+        # uninitialized completion flags and times out across NVL domains.
+        torch.ops.trtllm.moe_initialize_workspace(
+            self.alltoall_workspace, mapping.moe_ep_rank, mapping.moe_ep_size
+        )
+        torch.cuda.synchronize()
+        flashinfer_MnnvlMoe.moe_workspace.comm.barrier()
+
         # Initialize dispatch state
         self._dispatch_state = {}
 
