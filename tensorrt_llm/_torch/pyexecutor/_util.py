@@ -392,7 +392,7 @@ class KvCacheCreator:
                 multimodal_input = extra_processed_inputs.get(
                     'multimodal_input')
                 multimodal_data = extra_processed_inputs.get('multimodal_data')
-                req_mm_input = multimodal_input.to_executor(
+                req_mm_input = multimodal_input.to_binding(
                     trtllm) if multimodal_input else None
 
                 request = trtllm.Request(prompt_token_ids,

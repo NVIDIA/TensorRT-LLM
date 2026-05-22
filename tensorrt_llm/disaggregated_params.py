@@ -1,4 +1,4 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import IntEnum
 from typing import Any, Dict, List, Optional
 
@@ -65,6 +65,23 @@ class DisaggregatedParams:
     )
     mrope_position_ids_handle: Optional[Dict[str, Any]] = None
     mrope_position_deltas_handle: Optional[Dict[str, Any]] = None
+
+    # Private lifetime anchors for SharedTensorContainer dicts. The dict only
+    # names shared storage; it does not keep that storage alive.
+    _shared_tensor_lifetime_refs: List[Any] = field(default_factory=list, repr=False, compare=False)
+
+    def __getstate__(self) -> Dict[str, Any]:
+        state = {
+            name: getattr(self, name)
+            for name in self.__dataclass_fields__
+            if name != "_shared_tensor_lifetime_refs"
+        }
+        return state
+
+    def __setstate__(self, state: Dict[str, Any]) -> None:
+        for name, value in state.items():
+            setattr(self, name, value)
+        self._shared_tensor_lifetime_refs = []
 
     def get_context_phase_params(self) -> tllme.ContextPhaseParams:
         # Prefer disagg_request_id over ctx_request_id

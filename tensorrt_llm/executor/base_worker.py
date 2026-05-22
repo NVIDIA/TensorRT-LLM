@@ -468,7 +468,7 @@ class BaseWorker(GenerationExecutor):
         if request.multimodal_params is not None and request.multimodal_params.has_content(
         ):
             if request.multimodal_params.multimodal_input is not None:
-                multimodal_input = request.multimodal_params.multimodal_input.to_executor(
+                multimodal_input = request.multimodal_params.multimodal_input.to_binding(
                     tllm)
             # NOTE: Setting to None here to avoid sending multimodal_input again through the 'py_multimodal_data' field
             request.multimodal_params.multimodal_input = None
@@ -611,8 +611,17 @@ class BaseWorker(GenerationExecutor):
                 if request.multimodal_params.multimodal_data is not None:
                     # Resolve SharedTensorContainer dicts inside multimodal_data, including
                     # E/P handoff embedding handles parked under "multimodal_embedding".
-                    # Model code sees local tensor views after this point.
-                    request.multimodal_params.to_tensor("multimodal_data")
+                    # Clone E/P handoff tensors so the PD worker does not retain producer-backed
+                    # CUDA IPC/shared-memory views through decode and shutdown.
+                    clone_shared_tensors = (
+                        request.disaggregated_params is not None and
+                        (request.disaggregated_params.
+                         multimodal_embedding_handles is not None or
+                         request.disaggregated_params.mrope_position_ids_handle
+                         is not None))
+                    request.multimodal_params.to_tensor(
+                        "multimodal_data",
+                        clone_shared_tensors=clone_shared_tensors)
                     executor_request.py_multimodal_data = request.multimodal_params.multimodal_data
 
             if self._is_pytorch_backend and request.sampling_params.logits_processor:

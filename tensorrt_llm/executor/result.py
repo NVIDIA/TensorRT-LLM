@@ -44,6 +44,42 @@ __all__ = [
 ]
 
 
+def _clone_shared_tensor_handle(
+        handle: Dict[str, Any]) -> tuple[Dict[str, Any], torch.Tensor]:
+    """Copy a shared tensor handle into locally owned CPU shared storage."""
+    from tensorrt_llm._torch.shared_tensor import SharedTensorContainer
+
+    shared_tensor = SharedTensorContainer.from_dict(handle).get_local_view()
+    tensor = shared_tensor.detach()
+    if tensor.is_cuda:
+        tensor = tensor.cpu()
+    else:
+        tensor = tensor.clone()
+    tensor = tensor.contiguous()
+    return SharedTensorContainer.from_tensor(tensor).dump_to_dict(), tensor
+
+
+def _clone_shared_tensor_handles(
+    handles: List[Dict[str, Any]]
+) -> tuple[List[Dict[str, Any]], List[torch.Tensor]]:
+    cloned_handles = []
+    lifetime_refs = []
+    for handle in handles:
+        cloned_handle, backing_tensor = _clone_shared_tensor_handle(handle)
+        cloned_handles.append(cloned_handle)
+        lifetime_refs.append(backing_tensor)
+    return cloned_handles, lifetime_refs
+
+
+def _retain_shared_tensor_refs(params: DisaggregatedParams,
+                               refs: List[torch.Tensor],
+                               owner_refs: Optional[List[Any]] = None) -> None:
+    if refs:
+        params._shared_tensor_lifetime_refs.extend(refs)
+        if owner_refs is not None:
+            owner_refs.extend(refs)
+
+
 @dataclass(slots=True)
 class Logprob:
     """Holds logprob and vocab rank for a token."""
@@ -208,6 +244,7 @@ class GenerationResultBase:
             CompletionOutput(i) for i in range(self.sampling_params.best_of)
         ]
         self._context_logits: Optional[torch.Tensor] = None
+        self._shared_tensor_lifetime_refs: List[Any] = []
         # Request-level time breakdown (PyTorch backend); not on CompletionOutput to avoid API churn.
         self.time_breakdown_metrics: Optional[Dict] = None
 
@@ -547,7 +584,11 @@ class GenerationResultBase:
             if hasattr(response_result, "mm_embedding_handles"
                        ) and response_result.mm_embedding_handles is not None:
                 # mm_embedding_handles is a list of handles (one per multimodal item).
-                mm_embedding_handles = response_result.mm_embedding_handles
+                # Take ownership immediately. The encoder-side PyResult may be
+                # freed before the prefill worker restores the handles.
+                mm_embedding_handles, lifetime_refs = (
+                    _clone_shared_tensor_handles(
+                        response_result.mm_embedding_handles))
                 if self._disaggregated_params is not None:
                     self._disaggregated_params.multimodal_embedding_handles = mm_embedding_handles
                     self._disaggregated_params.multimodal_hashes = self._multimodal_hashes
@@ -555,6 +596,9 @@ class GenerationResultBase:
                     self._disaggregated_params = DisaggregatedParams(
                         multimodal_embedding_handles=mm_embedding_handles,
                         multimodal_hashes=self._multimodal_hashes)
+                _retain_shared_tensor_refs(self._disaggregated_params,
+                                           lifetime_refs,
+                                           self._shared_tensor_lifetime_refs)
 
             # Handle mrope handles for both:
             # 1. Regular mm_embedding case (disaggregated_params was just created/updated above)
@@ -562,10 +606,19 @@ class GenerationResultBase:
             #    were already computed in encode phase, but mrope still needs forwarding)
             if (getattr(response_result, "mrope_position_ids_handle", None)
                     is not None and self.disaggregated_params is not None):
+                mrope_position_ids_handle, ids_ref = (
+                    _clone_shared_tensor_handle(
+                        response_result.mrope_position_ids_handle))
+                mrope_position_deltas_handle, deltas_ref = (
+                    _clone_shared_tensor_handle(
+                        response_result.mrope_position_deltas_handle))
                 self._disaggregated_params.mrope_position_ids_handle = (
-                    response_result.mrope_position_ids_handle)
+                    mrope_position_ids_handle)
                 self._disaggregated_params.mrope_position_deltas_handle = (
-                    response_result.mrope_position_deltas_handle)
+                    mrope_position_deltas_handle)
+                _retain_shared_tensor_refs(self._disaggregated_params,
+                                           [ids_ref, deltas_ref],
+                                           self._shared_tensor_lifetime_refs)
 
             # Processing background errors here ASAF during generation.
             if self._background_error_handler and (
@@ -825,8 +878,23 @@ class GenerationResult(GenerationResultBase):
             postproc_params=generation_request.postproc_params,
         )
         self._generation_request = generation_request
+        multimodal_params = getattr(generation_request, "multimodal_params",
+                                    None)
+        if multimodal_params is not None:
+            # `generate_async` deletes `request.multimodal_params` after
+            # submit(), but multiprocess workers may restore request-side shared
+            # tensor handles later. Keep only the producer-side tensor refs here.
+            self._shared_tensor_lifetime_refs.extend(
+                getattr(multimodal_params, "_shared_tensor_lifetime_refs", []))
         self._streaming = generation_request.streaming
         self._disaggregated_params = disaggregated_params
+        if disaggregated_params is not None:
+            # E/P/D prefill requests park encoder-produced embedding handles in
+            # `multimodal_params.multimodal_data`; the backing refs live on
+            # DisaggregatedParams, not on MultimodalParams.
+            self._shared_tensor_lifetime_refs.extend(
+                getattr(disaggregated_params, "_shared_tensor_lifetime_refs",
+                        []))
         # minimal sampling params needed for logprob calculation
         self._logprob_params = logprob_params
         self.trace_headers = generation_request.trace_headers

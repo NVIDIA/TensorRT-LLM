@@ -1,8 +1,16 @@
+import gc
+import pickle
 import unittest
 
 import torch
 
+from tensorrt_llm._torch.shared_tensor import SharedTensorContainer
+from tensorrt_llm.bindings import executor as tllm
+from tensorrt_llm.disaggregated_params import DisaggregatedParams
+from tensorrt_llm.executor.request import GenerationRequest
+from tensorrt_llm.executor.result import GenerationResult
 from tensorrt_llm.inputs.multimodal import MultimodalInput, MultimodalParams
+from tensorrt_llm.sampling_params import SamplingParams
 
 
 class TestMultimodalParamsHandleConversion(unittest.TestCase):
@@ -67,6 +75,177 @@ class TestMultimodalParamsHandleConversion(unittest.TestCase):
         result = params.multimodal_data["multimodal_embedding"]
         self.assertIsInstance(result, torch.Tensor)
         self.assertTrue(torch.allclose(result, self.mm_embedding))
+
+    def test_to_tensor_can_clone_shared_storage(self):
+        """Test restoring handles into tensors detached from shared storage."""
+        source = torch.arange(6, dtype=torch.float32)
+        params = MultimodalParams(multimodal_data={
+            "mrope_config": {
+                "mrope_position_deltas": source,
+            }
+        })
+
+        params.to_handle("multimodal_data")
+        params._shared_tensor_lifetime_refs.clear()
+        params.to_tensor("multimodal_data", clone_shared_tensors=True)
+
+        result = params.multimodal_data["mrope_config"]["mrope_position_deltas"]
+        self.assertIsInstance(result, torch.Tensor)
+        self.assertTrue(torch.allclose(result, source))
+        self.assertEqual(len(params._shared_tensor_lifetime_refs), 0)
+
+        result.add_(10)
+        self.assertTrue(
+            torch.allclose(source, torch.arange(6, dtype=torch.float32)))
+
+    def test_to_handle_retains_shared_tensor_lifetime_refs(self):
+        """Shared tensor handles remain restorable after source locals exit."""
+        params = MultimodalParams()
+
+        def populate_params():
+            source = torch.arange(6, dtype=torch.float32)
+            params.multimodal_data = {"multimodal_embedding": source}
+            params.to_handle("multimodal_data")
+
+        populate_params()
+        gc.collect()
+
+        handle = params.multimodal_data["multimodal_embedding"]
+        restored = SharedTensorContainer.from_dict(handle).get_local_view()
+        self.assertTrue(
+            torch.allclose(restored, torch.arange(6, dtype=torch.float32)))
+        self.assertEqual(len(params._shared_tensor_lifetime_refs), 1)
+
+    def test_generation_result_retains_request_shared_tensor_refs(self):
+        """Request handles survive generate_async's multimodal_params cleanup."""
+
+        def build_result_and_handle():
+            source = torch.arange(6, dtype=torch.float32)
+            params = MultimodalParams(
+                multimodal_data={"multimodal_embedding": source})
+            params.to_handle("multimodal_data")
+            handle = params.multimodal_data["multimodal_embedding"]
+            request = GenerationRequest(
+                prompt_token_ids=[1],
+                sampling_params=SamplingParams(max_tokens=1),
+                multimodal_params=params,
+            )
+            request.set_id(1)
+            result = GenerationResult(request)
+            transport_params = pickle.loads(pickle.dumps(params))
+            self.assertEqual(len(transport_params._shared_tensor_lifetime_refs),
+                             0)
+            self.assertEqual(len(params._shared_tensor_lifetime_refs), 1)
+            del request.multimodal_params
+            return result, handle
+
+        result, handle = build_result_and_handle()
+        gc.collect()
+
+        restored = SharedTensorContainer.from_dict(handle).get_local_view()
+        self.assertTrue(
+            torch.allclose(restored, torch.arange(6, dtype=torch.float32)))
+        self.assertEqual(len(result._shared_tensor_lifetime_refs), 1)
+
+    def test_generation_result_retains_response_shared_tensor_refs(self):
+        """Encoder-result handles survive clearing request-side disagg refs."""
+
+        class FakeResult:
+
+            def __init__(self, mm_embedding_handles):
+                self.is_final = True
+                self.context_phase_params = None
+                self.decoding_iter = 0
+                self.cached_tokens = 0
+                self.avg_decoded_tokens_per_iter = None
+                self.finish_reasons = [tllm.FinishReason.LENGTH]
+                self.output_token_ids = [[1]]
+                self.cum_log_probs = None
+                self.log_probs = None
+                self.generation_logits = None
+                self.context_logits = None
+                self.request_perf_metrics = None
+                self.sequence_index = 0
+                self.mm_embedding_handles = mm_embedding_handles
+
+        class FakeResponse:
+
+            def __init__(self, result):
+                self.result = result
+
+            def has_error(self):
+                return False
+
+        producer_params = MultimodalParams(
+            multimodal_data={
+                "multimodal_embedding": torch.arange(6, dtype=torch.float32)
+            })
+        producer_params.to_handle("multimodal_data")
+        source_handle = producer_params.multimodal_data["multimodal_embedding"]
+
+        request = GenerationRequest(
+            prompt_token_ids=[1],
+            sampling_params=SamplingParams(max_tokens=1),
+        )
+        request.set_id(1)
+        result = GenerationResult(request)
+        result._handle_response(FakeResponse(FakeResult([source_handle])))
+
+        handle = result.disaggregated_params.multimodal_embedding_handles[0]
+        self.assertEqual(
+            len(result.disaggregated_params._shared_tensor_lifetime_refs), 1)
+        result.disaggregated_params._shared_tensor_lifetime_refs.clear()
+        del producer_params
+        gc.collect()
+
+        restored = SharedTensorContainer.from_dict(handle).get_local_view()
+        self.assertTrue(
+            torch.allclose(restored, torch.arange(6, dtype=torch.float32)))
+        self.assertEqual(len(result._shared_tensor_lifetime_refs), 1)
+
+    def test_generation_result_retains_disagg_shared_tensor_refs(self):
+        """E/P/D handoff handles survive transport without shipping refs."""
+
+        def build_result_and_handle():
+            source = torch.arange(6, dtype=torch.float32)
+            producer_params = MultimodalParams(
+                multimodal_data={"multimodal_embedding": source})
+            producer_params.to_handle("multimodal_data")
+            handle = producer_params.multimodal_data["multimodal_embedding"]
+
+            disaggregated_params = DisaggregatedParams(
+                request_type="context_and_generation",
+                multimodal_embedding_handles=[handle],
+            )
+            disaggregated_params._shared_tensor_lifetime_refs.extend(
+                producer_params._shared_tensor_lifetime_refs)
+            params = MultimodalParams(
+                multimodal_data={"multimodal_embedding": [handle]})
+            request = GenerationRequest(
+                prompt_token_ids=[1],
+                sampling_params=SamplingParams(max_tokens=1),
+                disaggregated_params=disaggregated_params,
+                multimodal_params=params,
+            )
+            request.set_id(1)
+            result = GenerationResult(request,
+                                      disaggregated_params=disaggregated_params)
+            transport_params = pickle.loads(pickle.dumps(disaggregated_params))
+            self.assertEqual(len(transport_params._shared_tensor_lifetime_refs),
+                             0)
+            self.assertEqual(
+                len(disaggregated_params._shared_tensor_lifetime_refs), 1)
+            del request.disaggregated_params
+            del request.multimodal_params
+            return result, handle
+
+        result, handle = build_result_and_handle()
+        gc.collect()
+
+        restored = SharedTensorContainer.from_dict(handle).get_local_view()
+        self.assertTrue(
+            torch.allclose(restored, torch.arange(6, dtype=torch.float32)))
+        self.assertEqual(len(result._shared_tensor_lifetime_refs), 1)
 
     def test_to_tensor_all_handles(self):
         """Test that to_handle followed by to_tensor preserves data integrity."""

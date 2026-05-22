@@ -22,12 +22,6 @@ _INT32_MAX = 2**31 - 1
 # serialization scheme can evolve without silently reusing stale cache keys.
 _HASH_SCHEME_TAG = b"trtllm.mm.hash.v1"
 
-_MULTIMODAL_RUN_METADATA_KEYS = (
-    "multimodal_item_run_cu_offsets",
-    "multimodal_run_positions",
-    "multimodal_run_lengths",
-)
-
 
 def _validate_int_list(values: Any, field_name: str) -> None:
     """Boundary metadata must be owned Python list[int]. No tensor/tuple."""
@@ -312,14 +306,17 @@ class MultimodalInput:
             torch.tensor(self.multimodal_lengths, dtype=torch.int32))
 
     def run_metadata(self) -> Dict[str, List[int]]:
-        metadata = {
-            key: getattr(self, key)
-            for key in _MULTIMODAL_RUN_METADATA_KEYS
-            if getattr(self, key) is not None
-        }
+        metadata = {}
+        if self.multimodal_item_run_cu_offsets is not None:
+            metadata[
+                "multimodal_item_run_cu_offsets"] = self.multimodal_item_run_cu_offsets
+        if self.multimodal_run_positions is not None:
+            metadata["multimodal_run_positions"] = self.multimodal_run_positions
+        if self.multimodal_run_lengths is not None:
+            metadata["multimodal_run_lengths"] = self.multimodal_run_lengths
         return metadata
 
-    def to_executor(self, executor_module: Any) -> Any:
+    def to_binding(self, executor_module: Any) -> Any:
         kwargs = dict(multimodal_hashes=self.multimodal_hashes,
                       multimodal_positions=self.multimodal_positions,
                       multimodal_lengths=self.multimodal_lengths,
@@ -499,11 +496,27 @@ class MultimodalParams:
     multimodal_input: Optional[MultimodalInput] = None
     multimodal_data: Optional[Dict[str, Any]] = field(default_factory=dict)
     multimodal_runtime: Optional[MultimodalRuntimeData] = None
+    _shared_tensor_lifetime_refs: List[Any] = field(default_factory=list,
+                                                    repr=False,
+                                                    compare=False)
 
     def __post_init__(self):
         """Ensure default values are properly set."""
         if self.multimodal_data is None:
             self.multimodal_data = {}
+
+    def __getstate__(self) -> Dict[str, Any]:
+        state = {
+            name: getattr(self, name)
+            for name in self.__dataclass_fields__
+            if name != "_shared_tensor_lifetime_refs"
+        }
+        return state
+
+    def __setstate__(self, state: Dict[str, Any]) -> None:
+        for name, value in state.items():
+            setattr(self, name, value)
+        self._shared_tensor_lifetime_refs = []
 
     def _is_shared_tensor_dict(self, obj: Any) -> bool:
         """Check if an object is a shared tensor dictionary.
@@ -577,8 +590,14 @@ class MultimodalParams:
                     from tensorrt_llm._torch.shared_tensor import \
                         SharedTensorContainer
 
-                    return SharedTensorContainer.from_dict(
+                    shared_tensor = SharedTensorContainer.from_dict(
                         input_data).get_local_view()
+                    if kwargs.get("clone_shared_tensors", False):
+                        tensor = shared_tensor.clone()
+                        if shared_tensor.is_cuda:
+                            torch.cuda.synchronize(shared_tensor.device)
+                        return tensor
+                    return shared_tensor
                 except Exception as e:
                     raise RuntimeError(
                         f"Failed to restore tensor from shared tensor dict: {e}"
@@ -605,8 +624,12 @@ class MultimodalParams:
                     # Import here to avoid circular imports
                     from tensorrt_llm._torch.shared_tensor import \
                         SharedTensorContainer
-                    return SharedTensorContainer.from_tensor(
+                    handle = SharedTensorContainer.from_tensor(
                         input_data).dump_to_dict()
+                    lifetime_refs = kwargs.get("lifetime_refs")
+                    if lifetime_refs is not None:
+                        lifetime_refs.append(input_data)
+                    return handle
                 except Exception as e:
                     raise RuntimeError(
                         f"Failed to convert tensor to shared tensor: {e}")
@@ -649,14 +672,20 @@ class MultimodalParams:
         if data is None:
             return  # Nothing to convert
 
-        transformed_data = self._apply_tensor_operation(data, "to_handle")
+        self._shared_tensor_lifetime_refs.clear()
+        transformed_data = self._apply_tensor_operation(
+            data, "to_handle", lifetime_refs=self._shared_tensor_lifetime_refs)
         setattr(self, element, transformed_data)
 
-    def to_tensor(self, element: str) -> None:
+    def to_tensor(self,
+                  element: str,
+                  clone_shared_tensors: bool = False) -> None:
         """Move specified multimodal data element from shared tensor.
 
         Args:
             element: Element to restore (only "multimodal_data" is supported)
+            clone_shared_tensors: When true, clone restored tensor views so the
+                result no longer depends on producer-side shared storage.
 
         Raises:
             ValueError: If element is not "multimodal_data"
@@ -671,7 +700,11 @@ class MultimodalParams:
         if data is None:
             return  # Nothing to restore
 
-        restored_data = self._apply_tensor_operation(data, "to_tensor")
+        restored_data = self._apply_tensor_operation(
+            data,
+            "to_tensor",
+            clone_shared_tensors=clone_shared_tensors,
+            lifetime_refs=self._shared_tensor_lifetime_refs)
         setattr(self, element, restored_data)
 
     def to_device(self,
