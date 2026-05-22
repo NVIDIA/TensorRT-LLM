@@ -298,12 +298,18 @@ class MultimodalInput
 public:
     explicit MultimodalInput(std::vector<std::vector<SizeType32>> multimodalHashes,
         std::vector<SizeType32> multimodalPositions, std::vector<SizeType32> multimodalLengths,
-        std::optional<std::vector<std::optional<std::string>>> multimodalUuids = std::nullopt);
+        std::optional<std::vector<std::optional<std::string>>> multimodalUuids = std::nullopt,
+        std::optional<std::vector<SizeType32>> multimodalItemRunCuOffsets = std::nullopt,
+        std::optional<std::vector<SizeType32>> multimodalRunPositions = std::nullopt,
+        std::optional<std::vector<SizeType32>> multimodalRunLengths = std::nullopt);
 
     [[nodiscard]] std::vector<std::vector<SizeType32>> getMultimodalHashes() const;
     [[nodiscard]] std::vector<SizeType32> getMultimodalPositions() const;
     [[nodiscard]] std::vector<SizeType32> getMultimodalLengths() const;
     [[nodiscard]] std::optional<std::vector<std::optional<std::string>>> const& getMultimodalUuids() const;
+    [[nodiscard]] std::optional<std::vector<SizeType32>> const& getMultimodalItemRunCuOffsets() const;
+    [[nodiscard]] std::optional<std::vector<SizeType32>> const& getMultimodalRunPositions() const;
+    [[nodiscard]] std::optional<std::vector<SizeType32>> const& getMultimodalRunLengths() const;
 
 private:
     friend class Serialization;
@@ -316,6 +322,12 @@ private:
     /// @brief Optional user-provided UUIDs for multimodal items.
     /// When provided, these are returned in KV cache events instead of content hashes.
     std::optional<std::vector<std::optional<std::string>>> mMultimodalUuids;
+    /// @brief Optional offsets indexing the flat exact multimodal run arrays per item.
+    std::optional<std::vector<SizeType32>> mMultimodalItemRunCuOffsets;
+    /// @brief Optional prompt start positions for flat exact multimodal token runs.
+    std::optional<std::vector<SizeType32>> mMultimodalRunPositions;
+    /// @brief Optional lengths for flat exact multimodal token runs.
+    std::optional<std::vector<SizeType32>> mMultimodalRunLengths;
 };
 
 /// @brief Configuration for mrope
@@ -671,7 +683,8 @@ public:
     /// @param embeddingBias The embedding bias tensor. Expected shape is [vocab_size]
     /// @param externalDraftTokensConfig The speculative decoding with external draft tokens configuration
     /// @param pTuningConfig The prompt tuning configuration
-    /// @param multimodalInput The multimodal input {multimodalHashes, multimodalPositions, multimodalLengths}
+    /// @param multimodalInput The multimodal input {multimodalHashes, multimodalPositions, multimodalLengths, optional
+    /// exact prompt runs}
     /// @param multimodalEmbedding The multimodal embedding tensor. Expected shape is [num_multimodal_tokens,
     /// hidden_dim]
     /// @param mRopeConfig The mrope configuration

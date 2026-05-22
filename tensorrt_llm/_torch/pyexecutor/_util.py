@@ -358,7 +358,13 @@ class KvCacheCreator:
                     multimodal_hashes=multimodal_input.multimodal_hashes,
                     multimodal_positions=multimodal_input.multimodal_positions,
                     multimodal_lengths=multimodal_input.multimodal_lengths,
-                    multimodal_uuids=multimodal_input.multimodal_uuids
+                    multimodal_uuids=multimodal_input.multimodal_uuids,
+                    multimodal_item_run_cu_offsets=multimodal_input.
+                    multimodal_item_run_cu_offsets,
+                    multimodal_run_positions=multimodal_input.
+                    multimodal_run_positions,
+                    multimodal_run_lengths=multimodal_input.
+                    multimodal_run_lengths,
                 ) if multimodal_input else None
 
                 request = trtllm.Request(prompt_token_ids,
@@ -1672,6 +1678,8 @@ def create_py_executor_instance(
         dist=dist,
         max_num_sequences=max_num_sequences,
         disable_overlap_scheduler=llm_args.disable_overlap_scheduler,
+        enable_early_first_token_response=llm_args.
+        enable_early_first_token_response,
         max_batch_size=max_batch_size,
         max_beam_width=max_beam_width,
         max_draft_len=spec_config.max_draft_len

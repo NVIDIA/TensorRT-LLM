@@ -38,7 +38,8 @@ from tensorrt_llm.llmapi import (
 # isort: on
 from tensorrt_llm.quantization import QuantAlgo
 
-from ..conftest import (get_device_count, get_device_memory, llm_models_root,
+from ..conftest import (check_device_contain, get_device_count,
+                        get_device_memory, llm_models_root,
                         parametrize_with_ids, skip_no_hopper,
                         skip_no_mxfp4_swizzle, skip_post_blackwell,
                         skip_pre_ada, skip_pre_blackwell, skip_pre_hopper,
@@ -4608,6 +4609,26 @@ class TestQwen3_8B(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
 
     @skip_pre_hopper
+    def test_fp8_block_scales_early_first_token_response(self):
+        """Accuracy with overlap scheduler + early first-token emission."""
+        pytorch_config = dict(
+            disable_overlap_scheduler=False,
+            enable_early_first_token_response=True,
+            cuda_graph_config=CudaGraphConfig(),
+        )
+        kv_cache_config = KvCacheConfig(enable_block_reuse=False)
+
+        with LLM(f"{llm_models_root()}/Qwen3/Qwen3-8B-FP8",
+                 **pytorch_config,
+                 kv_cache_config=kv_cache_config,
+                 enable_chunked_prefill=False,
+                 max_batch_size=64) as llm:
+            task = CnnDailymail(self.MODEL_NAME)
+            task.evaluate(llm)
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm)
+
+    @skip_pre_hopper
     def test_dummy_load_format(self):
         llm = LLM(
             f"{llm_models_root()}/Qwen3/Qwen3-8B-FP8",
@@ -4882,7 +4903,9 @@ class TestQwen3_30B_A3B(LlmapiAccuracyTestHarness):
                 moe_expert_parallel_size=ep_size,
                 **pytorch_config,
                 enable_attention_dp=attention_dp,
-                max_batch_size=32) as llm:
+                max_batch_size=32,
+                kv_cache_config=KvCacheConfig(
+                    free_gpu_memory_fraction=0.8)) as llm:
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm)
             task = GSM8K(self.MODEL_NAME)
@@ -6353,6 +6376,12 @@ class TestQwen3_5_35B_A3B(LlmapiAccuracyTestHarness):
             enable_padding=True, batch_sizes=[1, 2, 4, 8, 16, 32, 64, 128])
         moe_config = MoeConfig(backend=moe_backend)
 
+        # H20 path produces a small but fluctuating gap relative to H100/H200 BF16 MoE config.
+        # Construct extra spec to slightly dial down score threshold. See https://nvbugs/6069543.
+        is_h20_gpu = check_device_contain(
+            ["H20"]) and not check_device_contain(["H200"])
+        extra_acc_spec = "h20" if is_h20_gpu else None
+
         with LLM(self.MODEL_PATH,
                  tensor_parallel_size=tp_size,
                  moe_expert_parallel_size=1,
@@ -6364,6 +6393,7 @@ class TestQwen3_5_35B_A3B(LlmapiAccuracyTestHarness):
                  moe_config=moe_config) as llm:
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm,
+                          extra_acc_spec=extra_acc_spec,
                           extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
 
     @parametrize_with_ids("enable_block_reuse", [False, True])

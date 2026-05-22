@@ -17,10 +17,10 @@ from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
 )
 def test_w4a16_linear(dtype, weights_dtype, has_zero=False):
 
-    if get_sm_version() > FinegrainedMixedDtypeGemm.MAX_SUPPORTED_SM_VERSION:
+    if get_sm_version(
+    ) > FinegrainedMixedDtypeGemm.MAX_SUPPORTED_SM_VERSION_W4A16:
         pytest.skip(
-            f"W4A16/W4A8 is not supported in this SM version {get_sm_version()}"
-        )
+            f"W4A16 is not supported in this SM version {get_sm_version()}")
 
     SEQ_LEN = 10
     HIDDEN_SIZE = 128
