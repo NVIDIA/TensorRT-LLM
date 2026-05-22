@@ -716,6 +716,10 @@ def make_videomme_epd_test_config(
         ),
     ],
 )
+# TODO(venky): Add E/P/D VideoMME accuracy rows for the other supported VLM
+# families (Qwen*-VL, LLaVA-Next, and Kimi K2.5) once their baselines and model
+# fixtures are available. This CI matrix is currently thresholded only for
+# Nemotron Nano Omni.
 def test_disaggregated_videomme_vlm_epd(test_config: VideoMMEEPDTestConfig, ):
     """Run VideoMME shard through a model-specific llmapi E/PD config."""
     with launch_multimodal_encoder_pd_llm(

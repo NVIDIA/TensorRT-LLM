@@ -1286,7 +1286,8 @@ class OpenAIServer(_VideoRoutesMixin):
 
         async def create_mm_embedding_response(promise: RequestOutput):
             await promise.aresult()
-            # TODO: Replace mm_embedding_handles with a dedicated OpenAIBaseModel(JSON-safe), when enable multimodal disagg E2E
+            # TODO(TRTLLM-12407): Replace mm_embedding_handles with a dedicated
+            # OpenAIBaseModel(JSON-safe) when enabling multimodal disagg E2E.
             # NOTE: This endpoint only returns encoder handles to the caller. It
             # does not make trtllm-serve run full MM E/PD; the disagg protocol
             # still needs to carry these handles from MM encoder to context and
