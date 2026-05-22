@@ -621,7 +621,7 @@ class MNNVLAllReduce(nn.Module):
         buffer_flags = workspace["buffer_flags"]
 
         if fusion_op == AllReduceFusionOp.NONE:
-            output, _ = torch.ops.trtllm.mnnvl_fusion_allreduce(
+            output, = torch.ops.trtllm.mnnvl_fusion_allreduce(
                 input,
                 None,  # gamma
                 None,  # residual
@@ -631,18 +631,50 @@ class MNNVLAllReduce(nn.Module):
                 False,  # rmsnorm_fusion
             )
             return output.view(shape)
-        # Fallback to use other allreduce if hidden_size is not supported
-        elif fusion_op == AllReduceFusionOp.RESIDUAL_RMS_NORM:
-            output, residual_out = torch.ops.trtllm.mnnvl_fusion_allreduce(
-                input,
-                all_reduce_params.norm_weight,  # gamma
-                all_reduce_params.residual,  # residual
-                all_reduce_params.eps,  # epsilon
-                buffer_base,  # comm_buffer
-                buffer_flags,  # buffer_flags
-                True,  # rmsnorm_fusion
-            )
+
+        supported_fusion_ops = (
+            AllReduceFusionOp.RESIDUAL_RMS_NORM,
+            AllReduceFusionOp.RESIDUAL_RMS_NORM_QUANT_FP8,
+            AllReduceFusionOp.RESIDUAL_RMS_NORM_QUANT_NVFP4,
+            AllReduceFusionOp.RESIDUAL_RMS_NORM_OUT_QUANT_FP8,
+            AllReduceFusionOp.RESIDUAL_RMS_NORM_OUT_QUANT_NVFP4,
+        )
+        if fusion_op not in supported_fusion_ops:
+            return None
+
+        outputs = torch.ops.trtllm.mnnvl_fusion_allreduce(
+            input,
+            all_reduce_params.norm_weight,  # gamma
+            all_reduce_params.residual,  # residual
+            all_reduce_params.eps,  # epsilon
+            buffer_base,  # comm_buffer
+            buffer_flags,  # buffer_flags
+            True,  # rmsnorm_fusion
+            all_reduce_params.scale,  # scale
+            int(fusion_op),
+        )
+
+        if fusion_op == AllReduceFusionOp.RESIDUAL_RMS_NORM:
+            output, residual_out = outputs
             return output.view(shape), residual_out.view(shape)
+        if fusion_op == AllReduceFusionOp.RESIDUAL_RMS_NORM_QUANT_FP8:
+            quant_out, residual_out = outputs
+            return quant_out.view(shape), residual_out.view(shape)
+        if fusion_op == AllReduceFusionOp.RESIDUAL_RMS_NORM_OUT_QUANT_FP8:
+            output, quant_out, residual_out = outputs
+            return output.view(shape), quant_out.view(shape), residual_out.view(
+                shape)
+
+        fp4_shape = (*shape[:-1], shape[-1] // 2)
+        if fusion_op == AllReduceFusionOp.RESIDUAL_RMS_NORM_QUANT_NVFP4:
+            quant_out, scale_out, residual_out = outputs
+            return quant_out.view(fp4_shape), scale_out, residual_out.view(
+                shape)
+        if fusion_op == AllReduceFusionOp.RESIDUAL_RMS_NORM_OUT_QUANT_NVFP4:
+            output, quant_out, scale_out, residual_out = outputs
+            return (output.view(shape), quant_out.view(fp4_shape), scale_out,
+                    residual_out.view(shape))
+
         return None
 
 

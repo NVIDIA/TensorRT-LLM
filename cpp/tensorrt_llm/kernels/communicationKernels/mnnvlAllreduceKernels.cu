@@ -21,6 +21,7 @@
 #include <cuda/atomic>
 #include <cuda_bf16.h>
 #include <cuda_pipeline.h>
+#include <optional>
 #include <tuple>
 #include <type_traits>
 #include <utility>
@@ -32,6 +33,7 @@
 #include "tensorrt_llm/common/lamportUtils.cuh"
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/common/reduceKernelUtils.cuh"
+#include "tensorrt_llm/kernels/quantization.cuh"
 
 TRTLLM_NAMESPACE_BEGIN
 
@@ -293,6 +295,9 @@ struct MnnvlAllReduceKernelParams
     T** inputPtrs;
     T* bufferInputPtr;
     T* mcastPtr;
+    void* quantOutPtr;
+    void* scaleOutPtr;
+    float const* scaleFactorPtr;
     int numTokens;
     int tokenDim;
     int nRanks;
@@ -300,6 +305,7 @@ struct MnnvlAllReduceKernelParams
     float epsilon;
     uint32_t* bufferFlags;
     bool waitForResults;
+    QuantizationSFLayout layout;
 };
 
 template <typename PackedType, typename T>
@@ -424,6 +430,59 @@ inline __device__ PackedVec<PackedType, T> reduceOneshotDeterministicFastPath(
     return reduceOneshotDeterministic<WorldSize, LocalRank, T, PackedType, kELTS_PER_THREAD>(remoteValues, localValue);
 }
 
+template <ar_fusion::AllReduceFusionPattern Pattern, typename T, typename PackedType, int kELTS_PER_THREAD>
+inline __device__ void quantizeEpilogue(PackedVec<PackedType, T> const& value,
+    MnnvlAllReduceKernelParams<T> const& params, int packedAccessIdx, int accessIdInToken, int token)
+{
+    if constexpr (ar_fusion::GetQuantType<Pattern> == ar_fusion::QuantType::kFP4)
+    {
+        static_assert(kELTS_PER_THREAD == 8, "NVFP4 quantization expects eight elements per 16-byte access.");
+        constexpr int kSFVecSize = 16;
+        using QuantPackedVec = tensorrt_llm::kernels::PackedVec<T>;
+        QuantPackedVec packVal = *reinterpret_cast<QuantPackedVec const*>(&value.packed);
+        auto* sfOut = cvt_quant_get_sf_out_offset<uint32_t, 2>(std::nullopt /* batchIdx */, token, accessIdInToken,
+            std::nullopt /* numRows */, params.tokenDim / kSFVecSize, reinterpret_cast<uint32_t*>(params.scaleOutPtr),
+            params.layout);
+        reinterpret_cast<uint32_t*>(params.quantOutPtr)[packedAccessIdx]
+            = cvt_warp_fp16_to_fp4<T, kSFVecSize, false>(packVal, *params.scaleFactorPtr, sfOut);
+    }
+    else if constexpr (ar_fusion::GetQuantType<Pattern> == ar_fusion::QuantType::kFP8)
+    {
+        float const scale = 1.F / *params.scaleFactorPtr;
+        using PackedQuantizedType = std::conditional_t<std::is_same_v<T, float>, float, float2>;
+        PackedQuantizedType quantized;
+#pragma unroll
+        for (int i = 0; i < kELTS_PER_THREAD; ++i)
+        {
+            reinterpret_cast<__nv_fp8_e4m3*>(&quantized)[i]
+                = static_cast<__nv_fp8_e4m3>(static_cast<float>(value.elements[i]) * scale);
+        }
+        reinterpret_cast<PackedQuantizedType*>(params.quantOutPtr)[packedAccessIdx] = quantized;
+    }
+    else
+    {
+        static_assert(ar_fusion::GetQuantType<Pattern> == ar_fusion::QuantType::kNone, "Invalid quant type");
+    }
+}
+
+template <ar_fusion::AllReduceFusionPattern Pattern, typename T, typename PackedType, int kELTS_PER_THREAD>
+inline __device__ void writeEpilogueOutput(PackedVec<PackedType, T> const& value,
+    MnnvlAllReduceKernelParams<T> const& params, int threadOffset, int packedAccessIdx, int accessIdInToken, int token)
+{
+    if constexpr (ar_fusion::HasAllReduceOut<Pattern> || ar_fusion::HasNormOut<Pattern>)
+    {
+        if (params.outputPtr != nullptr)
+        {
+            reinterpret_cast<PackedType*>(&params.outputPtr[threadOffset])[0] = value.packed;
+        }
+    }
+    if constexpr (ar_fusion::GetQuantType<Pattern> != ar_fusion::QuantType::kNone)
+    {
+        quantizeEpilogue<Pattern, T, PackedType, kELTS_PER_THREAD>(
+            value, params, packedAccessIdx, accessIdInToken, token);
+    }
+}
+
 } // namespace detail
 
 using detail::PackedVec;
@@ -434,8 +493,11 @@ using detail::copyF4;
 using detail::MnnvlAllReduceKernelParams;
 using detail::sanitizeLamportPayload;
 using detail::reduceOneshotDeterministicFastPath;
+using detail::writeEpilogueOutput;
 
-template <uint8_t WorldSize, typename T, bool RMSNormFusion = false, typename PackedType = float4>
+template <uint8_t WorldSize, typename T,
+    ar_fusion::AllReduceFusionPattern Pattern = ar_fusion::AllReduceFusionPattern::kAllReduce,
+    typename PackedType = float4>
 __global__ void __launch_bounds__(1024) oneshotAllreduceFusionKernel(MnnvlAllReduceKernelParams<T> params)
 {
     constexpr int kELTS_PER_THREAD = sizeof(PackedType) / sizeof(T);
@@ -559,13 +621,19 @@ __global__ void __launch_bounds__(1024) oneshotAllreduceFusionKernel(MnnvlAllRed
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
     cudaTriggerProgrammaticLaunchCompletion();
 #endif
-    if constexpr (RMSNormFusion)
+    if constexpr (ar_fusion::HasResidual<Pattern>)
     {
         // =============================== Residual ===============================
         PackedVec<PackedType, T> residualIn;
         residualIn.packed = *reinterpret_cast<PackedType const*>(&params.residualInPtr[threadOffset]);
         packedAccum += residualIn;
-        *reinterpret_cast<PackedType*>(&params.residualOutPtr[threadOffset]) = packedAccum.packed;
+        if constexpr (ar_fusion::HasResidualOut<Pattern>)
+        {
+            *reinterpret_cast<PackedType*>(&params.residualOutPtr[threadOffset]) = packedAccum.packed;
+        }
+    }
+    if constexpr (ar_fusion::HasRMSNorm<Pattern>)
+    {
         // =============================== Rmsnorm ================================
         PackedVec<PackedType, T> gamma;
         gamma.packed = *reinterpret_cast<PackedType const*>(&params.gammaPtr[packedIdx * kELTS_PER_THREAD]);
@@ -610,7 +678,9 @@ __global__ void __launch_bounds__(1024) oneshotAllreduceFusionKernel(MnnvlAllRed
                 cuda_cast<float, T>(packedAccum.elements[i]) * rcpRms * cuda_cast<float, T>(gamma.elements[i]));
         }
     }
-    reinterpret_cast<PackedType*>(&params.outputPtr[threadOffset])[0] = packedAccum.packed;
+    int const packedAccessIdx = threadOffset / kELTS_PER_THREAD;
+    writeEpilogueOutput<Pattern, T, PackedType, kELTS_PER_THREAD>(
+        packedAccum, params, threadOffset, packedAccessIdx, packedIdx, token);
     flag.waitAndUpdate({static_cast<uint32_t>(params.numTokens * params.tokenDim * WorldSize * kELT_SIZE), 0, 0, 0});
 }
 
@@ -653,16 +723,54 @@ void oneshotAllreduceFusionOp(AllReduceFusionParams const& params)
         .numAttrs = 2U,
     };
 
-#define LAUNCH_ALLREDUCE_KERNEL(WORLD_SIZE, T, RMSNORM)                                                                \
-    TLLM_CUDA_CHECK(cudaLaunchKernelEx(&config, &oneshotAllreduceFusionKernel<WORLD_SIZE, T, RMSNORM>, kernelParams));
-#define DISPATCH_ALLREDUCE_KERNEL(WORLD_SIZE, T)                                                                       \
-    if (params.rmsNormFusion)                                                                                          \
+#define LAUNCH_ALLREDUCE_KERNEL(WORLD_SIZE, T, PATTERN)                                                                \
+    TLLM_CUDA_CHECK(cudaLaunchKernelEx(&config, &oneshotAllreduceFusionKernel<WORLD_SIZE, T, PATTERN>, kernelParams));
+#define DISPATCH_ALLREDUCE_PATTERN(WORLD_SIZE, T)                                                                      \
+    if (params.pattern == ar_fusion::AllReduceFusionPattern::kAllReduce)                                               \
     {                                                                                                                  \
-        LAUNCH_ALLREDUCE_KERNEL(WORLD_SIZE, T, true);                                                                  \
+        LAUNCH_ALLREDUCE_KERNEL(WORLD_SIZE, T, ar_fusion::AllReduceFusionPattern::kAllReduce);                         \
+    }                                                                                                                  \
+    else if (params.pattern == ar_fusion::AllReduceFusionPattern::kARResidualRMSNorm)                                  \
+    {                                                                                                                  \
+        LAUNCH_ALLREDUCE_KERNEL(WORLD_SIZE, T, ar_fusion::AllReduceFusionPattern::kARResidualRMSNorm);                 \
+    }                                                                                                                  \
+    else if (params.pattern == ar_fusion::AllReduceFusionPattern::kARResidualRMSNormFP8Quant)                          \
+    {                                                                                                                  \
+        LAUNCH_ALLREDUCE_KERNEL(WORLD_SIZE, T, ar_fusion::AllReduceFusionPattern::kARResidualRMSNormFP8Quant);         \
+    }                                                                                                                  \
+    else if (params.pattern == ar_fusion::AllReduceFusionPattern::kARResidualRMSNormOutFP8Quant)                       \
+    {                                                                                                                  \
+        LAUNCH_ALLREDUCE_KERNEL(WORLD_SIZE, T, ar_fusion::AllReduceFusionPattern::kARResidualRMSNormOutFP8Quant);      \
+    }                                                                                                                  \
+    else if (params.pattern == ar_fusion::AllReduceFusionPattern::kARResidualRMSNormFP4Quant)                          \
+    {                                                                                                                  \
+        if constexpr (!std::is_same_v<T, float>)                                                                       \
+        {                                                                                                              \
+            LAUNCH_ALLREDUCE_KERNEL(WORLD_SIZE, T, ar_fusion::AllReduceFusionPattern::kARResidualRMSNormFP4Quant);     \
+        }                                                                                                              \
+        else                                                                                                           \
+        {                                                                                                              \
+            TLLM_CHECK_WITH_INFO(false, "[MNNVL AllReduceOneShot] NVFP4 quantization does not support FP32 input.");   \
+        }                                                                                                              \
+    }                                                                                                                  \
+    else if (params.pattern == ar_fusion::AllReduceFusionPattern::kARResidualRMSNormOutFP4Quant)                       \
+    {                                                                                                                  \
+        if constexpr (!std::is_same_v<T, float>)                                                                       \
+        {                                                                                                              \
+            LAUNCH_ALLREDUCE_KERNEL(WORLD_SIZE, T, ar_fusion::AllReduceFusionPattern::kARResidualRMSNormOutFP4Quant);  \
+        }                                                                                                              \
+        else                                                                                                           \
+        {                                                                                                              \
+            TLLM_CHECK_WITH_INFO(false, "[MNNVL AllReduceOneShot] NVFP4 quantization does not support FP32 input.");   \
+        }                                                                                                              \
+    }                                                                                                                  \
+    else if (params.pattern == ar_fusion::AllReduceFusionPattern::kARRMSNorm)                                          \
+    {                                                                                                                  \
+        LAUNCH_ALLREDUCE_KERNEL(WORLD_SIZE, T, ar_fusion::AllReduceFusionPattern::kARRMSNorm);                         \
     }                                                                                                                  \
     else                                                                                                               \
     {                                                                                                                  \
-        LAUNCH_ALLREDUCE_KERNEL(WORLD_SIZE, T, false);                                                                 \
+        TLLM_CHECK_WITH_INFO(false, "[MNNVL AllReduceOneShot] Unsupported fusion pattern.");                           \
     }
     // C++17 compatible alternative using a template function
     auto dispatchImpl = [&](auto* type_ptr) -> bool
@@ -676,23 +784,24 @@ void oneshotAllreduceFusionOp(AllReduceFusionParams const& params)
         T const* residualIn = reinterpret_cast<T const*>(params.residualIn);
         T const* gamma = reinterpret_cast<T const*>(params.gamma);
         MnnvlAllReduceKernelParams<T> kernelParams{output, residualOut, input, residualIn, gamma, ucPtrs,
-            reinterpret_cast<T*>(params.bufferPtrLocal), mcPtr, numTokens, tokenDim, params.nRanks, params.rank,
-            static_cast<float>(params.epsilon), params.bufferFlags, false};
+            reinterpret_cast<T*>(params.bufferPtrLocal), mcPtr, params.quantOut, params.scaleOut, params.scaleFactor,
+            numTokens, tokenDim, params.nRanks, params.rank, static_cast<float>(params.epsilon), params.bufferFlags,
+            false, params.layout};
 
         switch (params.nRanks)
         {
             // FIXME: Do we need other world sizes?
-        case 2: DISPATCH_ALLREDUCE_KERNEL(2, T); return true;
-        case 4: DISPATCH_ALLREDUCE_KERNEL(4, T); return true;
-        case 8: DISPATCH_ALLREDUCE_KERNEL(8, T); return true;
-        case 16: DISPATCH_ALLREDUCE_KERNEL(16, T); return true;
-        case 32: DISPATCH_ALLREDUCE_KERNEL(32, T); return true;
-        case 64: DISPATCH_ALLREDUCE_KERNEL(64, T); return true;
+        case 2: DISPATCH_ALLREDUCE_PATTERN(2, T); return true;
+        case 4: DISPATCH_ALLREDUCE_PATTERN(4, T); return true;
+        case 8: DISPATCH_ALLREDUCE_PATTERN(8, T); return true;
+        case 16: DISPATCH_ALLREDUCE_PATTERN(16, T); return true;
+        case 32: DISPATCH_ALLREDUCE_PATTERN(32, T); return true;
+        case 64: DISPATCH_ALLREDUCE_PATTERN(64, T); return true;
         }
         return false;
     };
 #undef LAUNCH_ALLREDUCE_KERNEL
-#undef DISPATCH_ALLREDUCE_KERNEL
+#undef DISPATCH_ALLREDUCE_PATTERN
     bool launched = (params.dType == nvinfer1::DataType::kBF16 && dispatchImpl((__nv_bfloat16*) nullptr))
         || (params.dType == nvinfer1::DataType::kFLOAT && dispatchImpl((float*) nullptr))
         || (params.dType == nvinfer1::DataType::kHALF && dispatchImpl((__nv_half*) nullptr));
@@ -843,7 +952,7 @@ __global__ __launch_bounds__(128) void twoshotAllreduceKernel(MnnvlAllReduceKern
 //      1. Use CGA if supported. It expands the hidden dimension to 8k x 8 = 64k.
 //      2. Set loads_per_thread >1. Which can be used if CGA is not supported. Note that this will be limited by the
 //      shared memory size and register count.
-template <typename T, bool UseCGA, int LoadsPerThread = 1>
+template <typename T, ar_fusion::AllReduceFusionPattern Pattern, bool UseCGA, int LoadsPerThread = 1>
 __global__ __launch_bounds__(1024) void rmsNormLamport(MnnvlAllReduceKernelParams<T> params)
 {
     static int const kELTS_PER_LOAD = sizeof(float4) / sizeof(T);
@@ -901,16 +1010,19 @@ __global__ __launch_bounds__(1024) void rmsNormLamport(MnnvlAllReduceKernelParam
         offsets[i] = blockLoadOffset + threadLoadOffset;
     }
 
-#pragma unroll
-    for (uint32_t i = 0; i < LoadsPerThread; i++)
+    if constexpr (ar_fusion::HasResidual<Pattern>)
     {
-        uint32_t const threadLoadOffset = (i * loadStride + threadOffset) * kELTS_PER_LOAD;
-        if (blockOffset * blockChunkSize + threadLoadOffset < static_cast<uint32_t>(params.tokenDim))
+#pragma unroll
+        for (uint32_t i = 0; i < LoadsPerThread; i++)
         {
-            copyF4(&smemResidual[threadLoadOffset], &params.residualInPtr[blockLoadOffset + threadLoadOffset]);
+            uint32_t const threadLoadOffset = (i * loadStride + threadOffset) * kELTS_PER_LOAD;
+            if (blockOffset * blockChunkSize + threadLoadOffset < static_cast<uint32_t>(params.tokenDim))
+            {
+                copyF4(&smemResidual[threadLoadOffset], &params.residualInPtr[blockLoadOffset + threadLoadOffset]);
+            }
         }
+        __pipeline_commit();
     }
-    __pipeline_commit();
 #pragma unroll
     for (uint32_t i = 0; i < LoadsPerThread; i++)
     {
@@ -958,18 +1070,24 @@ __global__ __launch_bounds__(1024) void rmsNormLamport(MnnvlAllReduceKernelParam
         if (blockOffset * blockChunkSize + threadLoadOffset < static_cast<uint32_t>(params.tokenDim))
         {
             PackedVec<float4, T> inp{.packed = loadPacked<float4>(&smemInput[threadLoadOffset])};
-            PackedVec<float4, T> res{.packed = loadPacked<float4>(&smemResidual[threadLoadOffset])};
+            PackedVec<float4, T> inpPlusRes = inp;
+            if constexpr (ar_fusion::HasResidual<Pattern>)
+            {
+                PackedVec<float4, T> res{.packed = loadPacked<float4>(&smemResidual[threadLoadOffset])};
+                inpPlusRes = inp + res;
+                if constexpr (ar_fusion::HasResidualOut<Pattern>)
+                {
+                    *reinterpret_cast<float4*>(&params.residualOutPtr[blockLoadOffset + threadLoadOffset])
+                        = inpPlusRes.packed;
+                }
+            }
 
-            PackedVec<float4, T> inp_plus_res = inp + res;
 #pragma unroll
             for (int j = 0; j < kELTS_PER_LOAD; j++)
             {
-                rInput[i * kELTS_PER_LOAD + j] = cuda_cast<float, T>(inp_plus_res.elements[j]);
-                threadSum += cuda_cast<float, T>(inp_plus_res.elements[j] * inp_plus_res.elements[j]);
+                rInput[i * kELTS_PER_LOAD + j] = cuda_cast<float, T>(inpPlusRes.elements[j]);
+                threadSum += cuda_cast<float, T>(inpPlusRes.elements[j] * inpPlusRes.elements[j]);
             }
-
-            *reinterpret_cast<float4*>(&params.residualOutPtr[blockLoadOffset + threadLoadOffset])
-                = inp_plus_res.packed;
         }
     }
 
@@ -1023,7 +1141,10 @@ __global__ __launch_bounds__(1024) void rmsNormLamport(MnnvlAllReduceKernelParam
                     cuda_cast<float, T>(gamma.elements[j]) * rInput[i * kELTS_PER_LOAD + j] * rcpRms);
             }
 
-            *reinterpret_cast<float4*>(&params.outputPtr[blockLoadOffset + threadLoadOffset]) = r_out.packed;
+            int const accessIdInToken = (blockOffset * blockChunkSize + threadLoadOffset) / kELTS_PER_LOAD;
+            int const packedAccessIdx = (blockLoadOffset + threadLoadOffset) / kELTS_PER_LOAD;
+            writeEpilogueOutput<Pattern, T, float4, kELTS_PER_LOAD>(
+                r_out, params, blockLoadOffset + threadLoadOffset, packedAccessIdx, accessIdInToken, token);
         }
     }
     constexpr int kELTS_SIZE = sizeof(T);
@@ -1081,8 +1202,9 @@ void twoshotAllreduceFusionOp(AllReduceFusionParams const& params)
         T const* input = reinterpret_cast<T const*>(params.input);
         MnnvlAllReduceKernelParams<T> kernelParams{output, reinterpret_cast<T*>(params.residualOut), input,
             reinterpret_cast<T const*>(params.residualIn), reinterpret_cast<T const*>(params.gamma), ucPtrs,
-            reinterpret_cast<T*>(params.bufferPtrLocal), mcastPtr, numTokens, tokenDim, params.nRanks, params.rank,
-            static_cast<float>(params.epsilon), params.bufferFlags, !params.rmsNormFusion};
+            reinterpret_cast<T*>(params.bufferPtrLocal), mcastPtr, params.quantOut, params.scaleOut, params.scaleFactor,
+            numTokens, tokenDim, params.nRanks, params.rank, static_cast<float>(params.epsilon), params.bufferFlags,
+            !params.rmsNormFusion, params.layout};
         switch (params.nRanks)
         {
         case 2: LAUNCH_ALLREDUCE_KERNEL(2, T); return true;
@@ -1150,11 +1272,60 @@ void twoshotAllreduceFusionOp(AllReduceFusionParams const& params)
             "threads_needed: %d",
             numTokens, rnClusterSize, rnBlockSize, rnClusterSize, rnLoadsPerThread, divUp(tokenDim, numEltsPerThread));
 
-#define RUN_RMSNORM_KERNEL(T, USE_CGA, LOADS_PER_THREAD)                                                               \
-    TLLM_CUDA_CHECK(cudaFuncSetAttribute(                                                                              \
-        &rmsNormLamport<T, USE_CGA, LOADS_PER_THREAD>, cudaFuncAttributeMaxDynamicSharedMemorySize, smemSize));        \
+#define RUN_RMSNORM_KERNEL(T, PATTERN, USE_CGA, LOADS_PER_THREAD)                                                      \
+    TLLM_CUDA_CHECK(cudaFuncSetAttribute(&rmsNormLamport<T, PATTERN, USE_CGA, LOADS_PER_THREAD>,                       \
+        cudaFuncAttributeMaxDynamicSharedMemorySize, smemSize));                                                       \
     rnConfig.dynamicSmemBytes = smemSize;                                                                              \
-    TLLM_CUDA_CHECK(cudaLaunchKernelEx(&rnConfig, &rmsNormLamport<T, USE_CGA, LOADS_PER_THREAD>, kernelParams));
+    TLLM_CUDA_CHECK(                                                                                                   \
+        cudaLaunchKernelEx(&rnConfig, &rmsNormLamport<T, PATTERN, USE_CGA, LOADS_PER_THREAD>, kernelParams));
+
+#define DISPATCH_RMSNORM_PATTERN(T, USE_CGA, LOADS_PER_THREAD)                                                         \
+    if (params.pattern == ar_fusion::AllReduceFusionPattern::kARResidualRMSNorm)                                       \
+    {                                                                                                                  \
+        RUN_RMSNORM_KERNEL(T, ar_fusion::AllReduceFusionPattern::kARResidualRMSNorm, USE_CGA, LOADS_PER_THREAD);       \
+    }                                                                                                                  \
+    else if (params.pattern == ar_fusion::AllReduceFusionPattern::kARResidualRMSNormFP8Quant)                          \
+    {                                                                                                                  \
+        RUN_RMSNORM_KERNEL(                                                                                            \
+            T, ar_fusion::AllReduceFusionPattern::kARResidualRMSNormFP8Quant, USE_CGA, LOADS_PER_THREAD);              \
+    }                                                                                                                  \
+    else if (params.pattern == ar_fusion::AllReduceFusionPattern::kARResidualRMSNormOutFP8Quant)                       \
+    {                                                                                                                  \
+        RUN_RMSNORM_KERNEL(                                                                                            \
+            T, ar_fusion::AllReduceFusionPattern::kARResidualRMSNormOutFP8Quant, USE_CGA, LOADS_PER_THREAD);           \
+    }                                                                                                                  \
+    else if (params.pattern == ar_fusion::AllReduceFusionPattern::kARResidualRMSNormFP4Quant)                          \
+    {                                                                                                                  \
+        if constexpr (!std::is_same_v<T, float>)                                                                       \
+        {                                                                                                              \
+            RUN_RMSNORM_KERNEL(                                                                                        \
+                T, ar_fusion::AllReduceFusionPattern::kARResidualRMSNormFP4Quant, USE_CGA, LOADS_PER_THREAD);          \
+        }                                                                                                              \
+        else                                                                                                           \
+        {                                                                                                              \
+            TLLM_CHECK_WITH_INFO(false, "[MNNVL AllReduceTwoShot] NVFP4 quantization does not support FP32 input.");   \
+        }                                                                                                              \
+    }                                                                                                                  \
+    else if (params.pattern == ar_fusion::AllReduceFusionPattern::kARResidualRMSNormOutFP4Quant)                       \
+    {                                                                                                                  \
+        if constexpr (!std::is_same_v<T, float>)                                                                       \
+        {                                                                                                              \
+            RUN_RMSNORM_KERNEL(                                                                                        \
+                T, ar_fusion::AllReduceFusionPattern::kARResidualRMSNormOutFP4Quant, USE_CGA, LOADS_PER_THREAD);       \
+        }                                                                                                              \
+        else                                                                                                           \
+        {                                                                                                              \
+            TLLM_CHECK_WITH_INFO(false, "[MNNVL AllReduceTwoShot] NVFP4 quantization does not support FP32 input.");   \
+        }                                                                                                              \
+    }                                                                                                                  \
+    else if (params.pattern == ar_fusion::AllReduceFusionPattern::kARRMSNorm)                                          \
+    {                                                                                                                  \
+        RUN_RMSNORM_KERNEL(T, ar_fusion::AllReduceFusionPattern::kARRMSNorm, USE_CGA, LOADS_PER_THREAD);               \
+    }                                                                                                                  \
+    else                                                                                                               \
+    {                                                                                                                  \
+        TLLM_CHECK_WITH_INFO(false, "[MNNVL AllReduceTwoShot] Unsupported RMSNorm fusion pattern.");                   \
+    }
 
         // C++ 17 does not support capturing structured bindings
         auto dispatchRN = [&, rnLoadsPerThread](auto* type_ptr)
@@ -1164,24 +1335,25 @@ void twoshotAllreduceFusionOp(AllReduceFusionParams const& params)
                 reinterpret_cast<T*>(params.residualOut), reinterpret_cast<T const*>(params.input),
                 reinterpret_cast<T const*>(params.residualIn), reinterpret_cast<T const*>(params.gamma),
                 reinterpret_cast<T**>(params.bufferPtrsDev), reinterpret_cast<T*>(params.bufferPtrLocal),
-                reinterpret_cast<T*>(params.multicastPtr), numTokens, tokenDim, params.nRanks, params.rank,
-                static_cast<float>(params.epsilon), params.bufferFlags, false};
+                reinterpret_cast<T*>(params.multicastPtr), params.quantOut, params.scaleOut, params.scaleFactor,
+                numTokens, tokenDim, params.nRanks, params.rank, static_cast<float>(params.epsilon), params.bufferFlags,
+                false, params.layout};
             if (rnUseCGA)
             {
-                RUN_RMSNORM_KERNEL(T, true, 1);
+                DISPATCH_RMSNORM_PATTERN(T, true, 1);
             }
             else
             {
                 switch (rnLoadsPerThread)
                 {
-                case 1: RUN_RMSNORM_KERNEL(T, false, 1); break;
-                case 2: RUN_RMSNORM_KERNEL(T, false, 2); break;
-                case 3: RUN_RMSNORM_KERNEL(T, false, 3); break;
-                case 4: RUN_RMSNORM_KERNEL(T, false, 4); break;
-                case 5: RUN_RMSNORM_KERNEL(T, false, 5); break;
-                case 6: RUN_RMSNORM_KERNEL(T, false, 6); break;
-                case 7: RUN_RMSNORM_KERNEL(T, false, 7); break;
-                case 8: RUN_RMSNORM_KERNEL(T, false, 8); break;
+                case 1: DISPATCH_RMSNORM_PATTERN(T, false, 1); break;
+                case 2: DISPATCH_RMSNORM_PATTERN(T, false, 2); break;
+                case 3: DISPATCH_RMSNORM_PATTERN(T, false, 3); break;
+                case 4: DISPATCH_RMSNORM_PATTERN(T, false, 4); break;
+                case 5: DISPATCH_RMSNORM_PATTERN(T, false, 5); break;
+                case 6: DISPATCH_RMSNORM_PATTERN(T, false, 6); break;
+                case 7: DISPATCH_RMSNORM_PATTERN(T, false, 7); break;
+                case 8: DISPATCH_RMSNORM_PATTERN(T, false, 8); break;
                 default: return false;
                 }
             }
@@ -1196,6 +1368,7 @@ void twoshotAllreduceFusionOp(AllReduceFusionParams const& params)
             TLLM_CHECK_WITH_INFO(false, "[MNNVL AllReduceTwoShot] Failed to dispatch rmsnorm lamport kernel.");
         }
 #undef RUN_RMSNORM_KERNEL
+#undef DISPATCH_RMSNORM_PATTERN
     }
 }
 
