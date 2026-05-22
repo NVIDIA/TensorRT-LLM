@@ -417,31 +417,16 @@ class WanBlock(nn.Module):
             encoder_hidden_states_text = encoder_hidden_states[:, image_context_length:]
 
         # Text cross-attention
-        batch_size, seq_len = norm_x.shape[:2]
         q, k, v = self.attn2.get_qkv(norm_x, encoder_hidden_states_text)
         q, k = self.attn2.apply_qk_norm(q, k)
-        attn2_output = self.attn2._attn_impl(
-            q,
-            k,
-            v,
-            batch_size=batch_size,
-            seq_len=seq_len,
-            kv_seq_len=encoder_hidden_states_text.shape[1],
-        )
+        attn2_output = self.attn2._attn_impl(q, k, v)
 
         # I2V: image cross-attention
         if encoder_hidden_states_img is not None:
             key_img = self.add_k_proj(encoder_hidden_states_img)
             value_img = self.add_v_proj(encoder_hidden_states_img)
             key_img = self.norm_added_k(key_img)
-            attn_img_output = self.attn2._attn_impl(
-                q,
-                key_img,
-                value_img,
-                batch_size=batch_size,
-                seq_len=seq_len,
-                kv_seq_len=encoder_hidden_states_img.shape[1],
-            )
+            attn_img_output = self.attn2._attn_impl(q, key_img, value_img)
             attn2_output = attn2_output + attn_img_output
 
         # Apply to_out once to the combined (text + image) attention output

@@ -16,7 +16,7 @@ Dynamic Quantization:
 
 import os
 import time
-from typing import TYPE_CHECKING, Optional
+from typing import Optional
 
 import torch
 import torch.distributed as dist
@@ -28,10 +28,7 @@ from tensorrt_llm.logger import logger
 
 from .config import DiffusionModelConfig, VisualGenArgs
 from .mapping import VisualGenMapping
-from .models import AutoPipeline
-
-if TYPE_CHECKING:
-    from .models import BasePipeline
+from .models import BasePipeline
 
 
 class PipelineLoader:
@@ -129,24 +126,32 @@ class PipelineLoader:
         self,
         checkpoint_dir: Optional[str] = None,
         skip_warmup: bool = False,
-    ) -> "BasePipeline":
+    ):
         """
-        Load a diffusion pipeline with optional dynamic quantization.
+        Load a diffusion pipeline. Returns either a `BasePipeline` (handwritten
+        path) or an `AutoTransformerPipeline` (auto path) — the two are NOT
+        in the same class hierarchy; callers use `isinstance(pipeline,
+        BasePipeline)` to gate handwritten-only operations.
 
         Flow:
-        1. Resolve checkpoint_dir (local path or HuggingFace Hub model ID)
-        2. Load config via DiffusionModelConfig.from_pretrained()
-        3. Create pipeline via AutoPipeline.from_config() with MetaInit
-        4. Load transformer weights via pipeline.load_transformer_weights()
-        5. Load auxiliary components (VAE, text_encoder)
-        6. Call pipeline.post_load_weights()
+        1. Resolve checkpoint_dir (local path or HuggingFace Hub model ID).
+        2. Load config via DiffusionModelConfig.from_pretrained().
+        3. `_create_pipeline` branches on auto vs handwritten:
+           - Handwritten: MetaInitMode wrap → materialize → load weights →
+             load standard components → post-load hooks → torch.compile →
+             warmup.
+           - Auto: skip MetaInitMode (Diffusers from_pretrained loads weights
+             eagerly), do all load work in __init__, then warmup. The auto
+             path silently ignores `args.text_encoder_path` and
+             `args.skip_components` (Diffusers' from_pretrained owns
+             standard-component loading) — warnings emitted below.
 
         Args:
             checkpoint_dir: Local path or HF Hub model ID (uses args.checkpoint_path if not provided)
             skip_warmup: If True, skip warmup inference after loading (useful for testing)
 
         Returns:
-            Loaded pipeline (WanPipeline, FluxPipeline, etc.) - type auto-detected
+            Loaded pipeline — `BasePipeline` subclass or `AutoTransformerPipeline`.
         """
         # Resolve checkpoint_dir
         checkpoint_dir = checkpoint_dir or (self.args.checkpoint_path if self.args else None)
@@ -181,62 +186,83 @@ class PipelineLoader:
         self._setup_visual_gen_mapping(config)
 
         # =====================================================================
-        # STEP 2: Create Pipeline with MetaInit
-        # Pipeline type is auto-detected from model_index.json
-        # - Meta tensors (no GPU memory until materialization)
-        # - If quant_config specifies FP8, Linear layers have FP8 weight buffers
+        # STEP 2: Create Pipeline
+        # Pipeline type is auto-detected from model_index.json.
+        # - Handwritten path: meta-init wrap so Linear layers don't allocate
+        #   GPU buffers until step 2b's materialize. Weights are loaded in
+        #   step 3 / step 4 below.
+        # - Auto path (AutoTransformerPipeline): Diffusers'
+        #   `DiffusionPipeline.from_pretrained` loads all weights eagerly in
+        #   one call, which is incompatible with meta-tensor dispatch — so we
+        #   skip MetaInitMode entirely for the auto branch. The auto path
+        #   does ALL load work inside `__init__`.
         # =====================================================================
-        logger.info("Creating pipeline with MetaInitMode")
-        with MetaInitMode():
-            pipeline = AutoPipeline.from_config(config, checkpoint_dir)
+        pipeline = self._create_pipeline(config, checkpoint_dir)
+        is_handwritten = isinstance(pipeline, BasePipeline)
 
-        # Convert meta tensors to CUDA tensors
-        self._materialize_meta_tensors(pipeline)
-        pipeline.to(self.device)
+        # The auto path's component-loading is owned by Diffusers'
+        # `from_pretrained` (inside `AutoDiffusersPipeline.__init__`); the
+        # loader's `text_encoder_path` / `skip_components` knobs do not apply.
+        # Warn loudly if the user set them — they will be silently dropped.
+        if not is_handwritten:
+            if text_encoder_path:
+                logger.warning(
+                    f"AutoTransformerPipeline ignores VisualGenArgs.text_encoder_path"
+                    f"={text_encoder_path!r}; Diffusers' from_pretrained loads "
+                    "the text encoder from the checkpoint directory directly. "
+                    "Use a Diffusers-shaped checkpoint with the desired text "
+                    "encoder co-located, or override after construction via "
+                    "`pipeline._inner._pipe.text_encoder = ...`."
+                )
+            if skip_components:
+                logger.warning(
+                    f"AutoTransformerPipeline ignores VisualGenArgs.skip_components"
+                    f"={list(skip_components)!r}; Diffusers' from_pretrained loads "
+                    "all components eagerly. To skip a component, edit the "
+                    "checkpoint's `model_index.json` or replace the component "
+                    "post-construction."
+                )
 
-        # =====================================================================
-        # STEP 3: Load Transformer Weights
-        # Each pipeline implements load_transformer_weights() for its own
-        # checkpoint format.  The default (BasePipeline) uses WeightLoader
-        # for diffusers-compatible checkpoints with a transformer/ subdir.
-        # If dynamic_weight_quant=True:
-        #   - BF16 checkpoint weights are loaded
-        #   - Quantized on-the-fly to FP8/NVFP4 by DynamicLinearWeightLoader
-        #   - Copied into model's quantized buffers
-        # =====================================================================
-        weights = pipeline.load_transformer_weights(checkpoint_dir)
-        pipeline.load_weights(weights)
+        # ----- Handwritten-only lifecycle (steps 2b-4) ------------------------
+        if is_handwritten:
+            # Convert meta tensors to CUDA tensors
+            self._materialize_meta_tensors(pipeline)
+            pipeline.to(self.device)
 
-        # =====================================================================
-        # STEP 4: Load Standard Components (VAE, TextEncoder, etc.)
-        # These are NOT quantized - loaded as-is from checkpoint
-        # =====================================================================
-        extra_kwargs = {}
-        if text_encoder_path:
-            extra_kwargs["text_encoder_path"] = text_encoder_path
-        pipeline.load_standard_components(
-            checkpoint_dir,
-            self.device,
-            skip_components,
-            **extra_kwargs,
-        )
+            # STEP 3: Load transformer weights (handwritten checkpoint format).
+            weights = pipeline.load_transformer_weights(checkpoint_dir)
+            pipeline.load_weights(weights)
+
+            # STEP 4: Load standard components (VAE, TextEncoder, etc.).
+            extra_kwargs = {}
+            if text_encoder_path:
+                extra_kwargs["text_encoder_path"] = text_encoder_path
+            pipeline.load_standard_components(
+                checkpoint_dir,
+                self.device,
+                skip_components,
+                **extra_kwargs,
+            )
+
         logger.info(f"Model loaded successfully in {time.time() - load_start:.2f}s")
 
         # =====================================================================
-        # STEP 5: Post-load Hooks (TeaCache setup, etc.)
+        # STEP 5: Post-load hooks
+        # Common hooks run on both paths; handwritten-only hooks gated on
+        # `is_handwritten` to keep the auto path from advertising features it
+        # silently no-ops.
         # =====================================================================
-
         t0 = time.time()
-        if config.parallel.parallel_vae_size > 1:
+        if is_handwritten and config.parallel.parallel_vae_size > 1:
             pipeline.setup_parallel_vae()
 
         if hasattr(pipeline, "post_load_weights"):
             pipeline.post_load_weights()
 
-        if config.torch_compile.enable_torch_compile:
+        if is_handwritten and config.torch_compile.enable_torch_compile:
             torch._dynamo.config.cache_size_limit = 128
             pipeline.torch_compile()
-        else:
+        elif is_handwritten:
             logger.info("torch.compile disabled by config")
 
         if not skip_warmup:
@@ -253,19 +279,58 @@ class PipelineLoader:
             logger.info("Warmup skipped (skip_warmup=True)")
 
         if config.pipeline.enable_layerwise_nvtx_marker:
-            from tensorrt_llm._torch.pyexecutor.layerwise_nvtx_marker import LayerwiseNvtxMarker
+            if not is_handwritten:
+                # `transformer_components` is a `BasePipeline` concept (multi-
+                # stream pipelines like WAN 2.2 declare both `transformer` and
+                # `transformer_2`); the auto path has only the captured
+                # GraphModule and doesn't expose the same enumeration. Skip
+                # the marker on the auto path with an info log rather than
+                # crashing on AttributeError.
+                logger.info(
+                    "enable_layerwise_nvtx_marker=True ignored on the auto path "
+                    "(no `transformer_components` enumeration)"
+                )
+            else:
+                from tensorrt_llm._torch.pyexecutor.layerwise_nvtx_marker import LayerwiseNvtxMarker
 
-            marker = LayerwiseNvtxMarker()
-            module_prefix = pipeline.__class__.__name__
-            for transformer_component in pipeline.transformer_components:
-                logger.info(f"Registering layerwise NVTX markers for {transformer_component}")
-                marker.register_hooks(getattr(pipeline, transformer_component), module_prefix)
+                marker = LayerwiseNvtxMarker()
+                module_prefix = pipeline.__class__.__name__
+                for transformer_component in pipeline.transformer_components:
+                    logger.info(f"Registering layerwise NVTX markers for {transformer_component}")
+                    marker.register_hooks(getattr(pipeline, transformer_component), module_prefix)
 
         logger.info(
             f"Pipeline loaded: {pipeline.__class__.__name__} "
             f"(total load time: {time.time() - load_start:.2f}s)"
         )
         return pipeline
+
+    def _create_pipeline(self, config: DiffusionModelConfig, checkpoint_dir: str):
+        """Build the pipeline instance, branching on auto vs handwritten path.
+
+        The handwritten path is constructed inside `MetaInitMode` so its
+        Linear layers don't allocate GPU buffers until step 2b's materialize.
+        The auto path is constructed *outside* MetaInitMode because Diffusers'
+        `DiffusionPipeline.from_pretrained` loads weights eagerly (and meta
+        tensors confuse it).
+
+        Dispatch (`AutoPipeline.from_config`) reuses the existing handwritten
+        registry; the auto branch returns an `AutoTransformerPipeline` which is
+        NOT a `BasePipeline` subclass — the caller uses `isinstance` to gate
+        handwritten-only lifecycle hooks.
+        """
+        # Resolve which path will be taken so we know whether MetaInitMode
+        # applies, without duplicating the registry's dispatch logic.
+        from .auto.pipeline import AutoTransformerPipeline
+        from .pipeline_registry import AutoPipeline as _AP
+
+        target_cls = _AP.resolve_target_class(config, checkpoint_dir)
+        if target_cls is AutoTransformerPipeline:
+            logger.info("Creating AutoTransformerPipeline (no MetaInitMode)")
+            return AutoTransformerPipeline(config, checkpoint_dir)
+        logger.info(f"Creating {target_cls.__name__} with MetaInitMode")
+        with MetaInitMode():
+            return target_cls(config)
 
     def _materialize_meta_tensors(self, module: torch.nn.Module) -> None:
         """

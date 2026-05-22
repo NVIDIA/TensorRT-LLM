@@ -35,6 +35,7 @@ from tensorrt_llm.quantization.mode import QuantAlgo
 # =============================================================================
 
 CacheBackendName = Literal["teacache", "cache_dit"]
+PipelineMode = Literal["fallback", "auto", "strict"]
 
 # =============================================================================
 # Pipeline component identifiers
@@ -524,6 +525,18 @@ class VisualGenArgs(StrictBaseModel):
     # Skip warmup inference after loading (useful for testing or fast startup)
     skip_warmup: bool = False
 
+    # VisGen-Auto dispatch mode — handled by
+    # `tensorrt_llm._torch.visual_gen.pipeline_registry.AutoPipeline`.
+    pipeline_mode: PipelineMode = PydanticField(
+        "fallback",
+        description=(
+            "Dispatch mode for the auto-pipeline path. "
+            "'fallback' (default): use handwritten pipeline if registered, else auto. "
+            "'auto': force the auto path even for registered checkpoints (parity testing). "
+            "'strict': use handwritten if registered, else raise."
+        ),
+    )
+
     # Sub-configs (dict input for quant_config is coerced to QuantConfig in model_validator)
     quant_config: QuantConfig = PydanticField(default_factory=QuantConfig)
     compilation: CompilationConfig = PydanticField(default_factory=CompilationConfig)
@@ -687,6 +700,7 @@ class DiffusionModelConfig(BaseModel):
     attention_metadata_state: Optional[Dict[str, Any]] = None
     parallel: ParallelConfig = PydanticField(default_factory=ParallelConfig)
     cache: Optional[CacheConfig] = None
+    pipeline_mode: PipelineMode = "fallback"
 
     @property
     def cache_backend(self) -> Optional[CacheBackendName]:
@@ -934,6 +948,7 @@ class DiffusionModelConfig(BaseModel):
         attention_cfg = args.attention if args else AttentionConfig()
         parallel_cfg = args.parallel if args else ParallelConfig()
         cache_cfg = args.cache if args else None
+        pipeline_mode: PipelineMode = args.pipeline_mode if args else "fallback"
 
         component = PipelineComponent.TRANSFORMER
         checkpoint_path = Path(checkpoint_dir)
@@ -1064,6 +1079,7 @@ class DiffusionModelConfig(BaseModel):
             attention_metadata_state=attention_metadata_state,
             parallel=parallel_cfg,
             cache=cache_cfg,
+            pipeline_mode=pipeline_mode,
             skip_create_weights_in_init=True,
             extra_attrs=extra_attrs,
             **kwargs,
