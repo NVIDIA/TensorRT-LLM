@@ -16,7 +16,7 @@ verl_config:
     # Create nvshmem symlink (needed before DeepEP build)
     - >-
       (cd /usr/local/lib/python3.12/dist-packages/nvidia/nvshmem/lib &&
-      ln -s libnvshmem_host.so.3 libnvshmem_host.so)
+      ln -sf libnvshmem_host.so.3 libnvshmem_host.so)
     # Install DeepEP
     - >-
       git clone -b hybrid-ep https://github.com/deepseek-ai/DeepEP.git &&
