@@ -141,7 +141,9 @@ def test_qwen3vl_epd_video_split_item_runs(model_relative_path: str, llm_venv, t
     )
 
     env = llm_venv._new_env.copy()
-    env["TLLM_MULTIMODAL_DISAGGREGATED"] = "1"
+    # This is the OpenAI P/D disaggregated serving path. Do not set
+    # TLLM_MULTIMODAL_DISAGGREGATED here: that flag is for MM E/P handoff,
+    # where prefill receives encoder embedding handles instead of raw video.
     env["UCX_MM_ERROR_HANDLING"] = "y"
     env["UCX_TLS"] = get_ucx_tls()
 

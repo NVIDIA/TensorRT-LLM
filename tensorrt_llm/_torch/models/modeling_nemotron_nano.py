@@ -49,7 +49,6 @@ from .modeling_multimodal_utils import (
     get_attached_multimodal_embeddings,
     get_multimodal_embeddings,
     has_raw_multimodal_payload,
-    is_disagg_context_role,
 )
 from .modeling_parakeet import ParakeetExtractor, ProjectedParakeet
 from .modeling_radio import RADIOVisionModel, calc_seq_lens
@@ -2611,8 +2610,8 @@ class NemotronH_Nano_VL_V2(transformers.PreTrainedModel):
         # to be the LLM-only config and no longer has vision_config /
         # sound_config / force_image_size / etc.
         mm_pretrained = self._mm_model_config.pretrained_config
-        # Normal worker and context worker own encoders. MM E/P prefill uses attached embeddings.
-        is_multimodal_encoder_worker = not _is_mm_disagg() or is_disagg_context_role()
+        # Normal workers own encoders. MM E/P handoff uses attached embeddings.
+        is_multimodal_encoder_worker = not _is_mm_disagg()
         if self.vision_encoder is None and is_multimodal_encoder_worker:
             self.vision_encoder = NanoV2VLVisionEncoder(self._mm_model_config).eval().to("cuda")
         sound_config = getattr(mm_pretrained, "sound_config", None)
@@ -3119,13 +3118,6 @@ class NemotronH_Nano_VL_V2(transformers.PreTrainedModel):
             raw_ctx_params = [param for param in ctx_params if has_raw_multimodal_payload(param)]
             # Raw image/video/audio tensors: run local encoder.
             if raw_ctx_params:
-                # Decode-side prefill should receive handles, not raw payloads.
-                if _is_mm_disagg() and not is_disagg_context_role():
-                    raise ValueError(
-                        "Raw multimodal inputs require a local multimodal encoder on the "
-                        "disaggregated context worker. Set TRTLLM_DISAGG_ROLE=context for "
-                        "context workers, or provide multimodal_embedding handles."
-                    )
                 if (
                     any(
                         param.multimodal_data["modality_type"] in ("image", "video")

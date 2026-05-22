@@ -32,18 +32,12 @@ from tensorrt_llm.inputs.multimodal import MultimodalParams
 from tensorrt_llm.logger import logger
 
 _MULTIMODAL_ENV_NAME = "TLLM_MULTIMODAL_DISAGGREGATED"
-_DISAGG_ROLE_ENV_NAME = "TRTLLM_DISAGG_ROLE"
-_DISAGG_CONTEXT_ROLES = {"context", "ctx"}
 
 
 # Make this a runtime lookup rather than a module-wide constant for easier unit testing.
 # MM E/P split flag. Not generic disaggregated serving.
 def _is_mm_disagg() -> bool:
     return os.getenv(_MULTIMODAL_ENV_NAME, "0") == "1"
-
-
-def is_disagg_context_role() -> bool:
-    return os.getenv(_DISAGG_ROLE_ENV_NAME, "").lower() in _DISAGG_CONTEXT_ROLES
 
 
 def has_raw_multimodal_payload(param: MultimodalParams) -> bool:

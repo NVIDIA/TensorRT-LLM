@@ -610,8 +610,6 @@ def launch_multimodal_encoder_pd_llm(
         if "TMPDIR" in env_updates:
             # tempfile caches TMPDIR. Keep the cache in sync with the env.
             monkeypatch.setattr(tempfile, "tempdir", env_updates["TMPDIR"])
-        # Stale context role would make PD accept raw MM as local.
-        monkeypatch.delenv("TRTLLM_DISAGG_ROLE", raising=False)
         encoder = MultimodalEncoder(model=model_name, **encoder_llm_config)
         pd_llm = LLM(model=model_name, **pd_llm_config)
         with encoder, pd_llm:

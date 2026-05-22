@@ -65,8 +65,8 @@ def test_nemotron_nano_registers_native_multimodal_epd_components():
         vision_encoder_cls, vlm_base_model = MODEL_CLASS_VISION_ENCODER_MAPPING[arch]
         assert vision_encoder_cls is NanoV2VLMultimodalEncoder
         assert vlm_base_model is None
-    assert getattr(NanoV2VLInputProcessor, "support_mm_disagg") is True
-    assert getattr(NemotronH_Nano_VL_V2, "support_mm_disagg") is True
+    assert NanoV2VLInputProcessor.support_mm_disagg is True
+    assert NemotronH_Nano_VL_V2.support_mm_disagg is True
 
 
 def test_nemotron_nano_epd_handoff_preserves_non_contiguous_video_runs(monkeypatch):
@@ -115,10 +115,9 @@ def test_nemotron_nano_epd_handoff_preserves_non_contiguous_video_runs(monkeypat
     assert handoff.special_token_offsets == [0, 3, 4, 7]
 
 
-def test_nemotron_nano_loads_multimodal_encoder_on_disagg_context_role(monkeypatch):
-    """Context workers load the vision encoder needed for MM prefill."""
-    monkeypatch.setenv("TLLM_MULTIMODAL_DISAGGREGATED", "1")
-    monkeypatch.setenv("TRTLLM_DISAGG_ROLE", "context")
+def test_nemotron_nano_loads_multimodal_encoder_for_normal_worker(monkeypatch):
+    """Normal workers load the vision encoder needed for raw MM prefill."""
+    monkeypatch.delenv("TLLM_MULTIMODAL_DISAGGREGATED", raising=False)
 
     fake_encoder = MagicMock()
     fake_encoder.eval.return_value = fake_encoder
@@ -148,6 +147,36 @@ def test_nemotron_nano_loads_multimodal_encoder_on_disagg_context_role(monkeypat
 
     vision_encoder_cls.assert_called_once_with(model._mm_model_config)
     fake_encoder.load_weights.assert_called_once_with(weights)
+
+
+def test_nemotron_nano_defers_multimodal_encoder_for_mm_epd_worker(monkeypatch):
+    """MM E/P/D full-model workers consume attached embeddings instead of raw encoders."""
+    monkeypatch.setenv("TLLM_MULTIMODAL_DISAGGREGATED", "1")
+
+    vision_encoder_cls = MagicMock()
+    monkeypatch.setattr(nemotron_nano, "NanoV2VLVisionEncoder", vision_encoder_cls)
+
+    fake_mapper = MagicMock()
+    monkeypatch.setattr(
+        nemotron_nano, "NemotronHHfWeightMapper", MagicMock(return_value=fake_mapper)
+    )
+
+    model = SimpleNamespace(
+        _mm_model_config=_make_minimal_nano_model_config(),
+        vision_encoder=None,
+        sound_encoder=None,
+        llm=MagicMock(),
+        model_config=SimpleNamespace(),
+    )
+    weights = {
+        "vision_model.weight": torch.empty(0),
+        "mlp1.weight": torch.empty(0),
+        "language_model.weight": torch.empty(0),
+    }
+
+    NemotronH_Nano_VL_V2.load_weights(model, weights)
+
+    vision_encoder_cls.assert_not_called()
 
 
 @pytest.fixture(scope="function")

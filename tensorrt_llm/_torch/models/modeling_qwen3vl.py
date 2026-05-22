@@ -48,7 +48,6 @@ from .modeling_multimodal_utils import (
     fuse_input_embeds,
     get_attached_multimodal_embeddings,
     get_multimodal_embeddings,
-    is_disagg_context_role,
 )
 from .modeling_qwen2vl import Qwen2_5_VLVisionAttention
 from .modeling_utils import (
@@ -1113,8 +1112,8 @@ class Qwen3VLModelBase(PreTrainedModel):
         self.llm = AutoModelForCausalLM.from_config(llm_model_config)
 
         self.mm_encoder = None
-        # Normal worker and context worker own encoder. MM E/P prefill uses attached embeddings.
-        if not _is_mm_disagg() or is_disagg_context_role():
+        # Normal workers own the encoder. MM E/P handoff uses attached embeddings.
+        if not _is_mm_disagg():
             self.mm_encoder = Qwen3VisionModelBase(
                 copy.deepcopy(model_config), kwargs.get("vision_model_class", None)
             ).eval()
@@ -1258,10 +1257,9 @@ class Qwen3VLModelBase(PreTrainedModel):
             elif has_raw_image_or_video_data:
                 raise ValueError(
                     "Raw multimodal inputs require a local multimodal encoder on this "
-                    "disaggregated worker. Set TRTLLM_DISAGG_ROLE=context for context "
-                    "workers, or provide multimodal_embedding handles."
+                    "worker, or multimodal_embedding handles from an encoder handoff."
                 )
-            elif not getattr(self, "support_mm_disagg", False):
+            elif not self.support_mm_disagg:
                 raise NotImplementedError(
                     f"{type(self)} does not support disaggregated inference yet. Please unset "
                     "the TLLM_MULTIMODAL_DISAGGREGATED environment variable, or set it to '0'."

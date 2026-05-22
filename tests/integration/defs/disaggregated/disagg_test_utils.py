@@ -139,7 +139,6 @@ def _run_worker(
             stderr = log_file
         if device != -1:
             env["CUDA_VISIBLE_DEVICES"] = str(device)
-        env["TRTLLM_DISAGG_ROLE"] = "context" if role.startswith("ctx") else "generation"
         print(f"Running {role} on port {port}")
         return ProcessWrapper(
             subprocess.Popen(cmd, env=env, stdout=stdout, stderr=stderr),
