@@ -2297,7 +2297,15 @@ def _stack_nvfp4_cutlass_moe_weights(
             )
 
         node.replace_all_uses_with(new_node)
+        input_nodes = node.all_input_nodes
         graph.erase_node(node)
+        for input_node in input_nodes:
+            if input_node.op == "get_attr" and len(input_node.users) == 0:
+                graph.erase_node(input_node)
+        # Free per-layer to avoid accumulating ~ per_layer_weight_bytes across all MoE layers.
+        # Only pass weight lists; scales/alphas live as buffers under the same submodules and
+        # are removed together when delete_submodule(...) drops the owning module.
+        remove_original_experts(gm, [w1_list, w2_list, w3_list])
 
     # Clean up after processing all nodes
     # eliminate_dead_code will remove unused get_attr nodes, then delete_all_unused_submodules
@@ -2854,7 +2862,15 @@ def _stack_nvfp4_trtllm_gen_moe_weights(
             )
 
         node.replace_all_uses_with(new_node)
+        input_nodes = node.all_input_nodes
         graph.erase_node(node)
+        for input_node in input_nodes:
+            if input_node.op == "get_attr" and len(input_node.users) == 0:
+                graph.erase_node(input_node)
+        # Free per-layer to avoid accumulating ~ per_layer_weight_bytes across all MoE layers.
+        # Only pass weight lists; scales/alphas live as buffers under the same submodules and
+        # are removed together when delete_submodule(...) drops the owning module.
+        remove_original_experts(gm, [w1_list, w2_list, w3_list])
         fused_key_counter += 1
 
     eliminate_dead_code(gm)
