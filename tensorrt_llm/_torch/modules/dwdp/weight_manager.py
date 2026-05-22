@@ -315,6 +315,27 @@ class DWDPWeightManager:
         this forward pass completes, the copy_stream may already be writing to
         the alternate slot for the next-next layer's prefetch.
 
+        Design rationale — implicit compute-done signal via stream in-order semantics:
+            The IPC-era predecessor of this code carried per-layer compute_events
+            (O(N_moe), ~116 events for DSv3 with 58 MoE layers and ping-pong slots)
+            to signal "kernel(L) finished, slot is reusable". This implementation
+            replaces them with per-slot consume_events recorded inside this very
+            method (4 events total, independent of N_moe).
+
+            The simplification relies on CUDA stream in-order semantics: an event
+            recorded on a stream fires only after every prior enqueue on that
+            stream has completed. Because step 3 above (record consume_events[
+            other_buf]) is enqueued on compute_stream AFTER step 2's binding —
+            which is in turn ordered before the next kernel(L) launch on the same
+            stream — the consume event for slot S cannot fire until every kernel
+            that read slot S has finished. This gives the same WAR ordering as
+            an explicit per-layer compute_event would, with O(1) bookkeeping.
+
+            Implication for future work: if num_buffers ever grows beyond 2 (e.g.
+            to support cross-node prefetch with deeper pipelines), per-slot events
+            may need to become per-slot event LISTS, and the "next kernel is
+            enqueued on the same stream" invariant must be preserved.
+
         Args:
             backend_module: The MoE backend module whose weight parameters will
                 be rebound. Must have attributes matching self._weight_names
