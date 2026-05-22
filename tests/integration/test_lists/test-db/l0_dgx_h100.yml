@@ -319,6 +319,11 @@ l0_dgx_h100:
       orchestrator: ray
   tests:
     - unittest/_torch/ray_orchestrator/multi_gpu -m "gpu2"
+    - unittest/_torch/ray_orchestrator/multi_gpu/test_ops.py -m "part0"
+    - unittest/_torch/ray_orchestrator/multi_gpu/test_ops.py -m "part1"
+    - unittest/_torch/ray_orchestrator/multi_gpu/test_ops.py -m "part2"
+    - unittest/_torch/ray_orchestrator/multi_gpu/test_ops.py -m "part3"
+    - unittest/_torch/ray_orchestrator/multi_gpu/test_ops.py -m "part4"
     - unittest/llmapi/test_llm_multi_gpu_pytorch.py -m "gpu2"
     - unittest/llmapi/test_async_llm.py -m "gpu2"
     - accuracy/test_llm_api_pytorch_ray.py::TestLlama3_1_8BInstruct::test_pp2_ray
@@ -374,6 +379,7 @@ l0_dgx_h100:
   - accuracy/test_llm_api_autodeploy.py::TestNemotronSuperV3::test_accuracy[bf16-4-attn_dp_on-trtllm]
   - accuracy/test_llm_api_autodeploy.py::TestNemotronSuperV3::test_accuracy[fp8-4-attn_dp_off-trtllm]
   - accuracy/test_llm_api_autodeploy.py::TestNemotronSuperV3::test_accuracy[fp8-4-attn_dp_on-trtllm]
+  - accuracy/test_llm_api_autodeploy.py::TestNemotronSuperV3::test_mtp[fp8_ws4_80gb-trtllm]
   - accuracy/test_llm_api_autodeploy.py::TestLlama3_1_8B::test_attention_dp[4]
   - accuracy/test_llm_api_autodeploy.py::TestQwen3_5_397B_MoE::test_bf16_small[4]
   - accuracy/test_llm_api_autodeploy.py::TestMiniMaxM2::test_finegrained_fp8
