@@ -679,7 +679,7 @@ static KernelParams setKernelParams(FmhaOptions_ const& options,
                                       strideK,
                                       tileShapeK,
                                       const_cast<void*>(kBasePtr),
-                                      /*swizzled=*/kernelTraits.mSwizzleKv,
+                                      /*swizzled=*/kernelTraits.mSwizzleK,
                                       /*unpack4b=*/storeTransformedKvInTmem);
 
   // Build the TMA descriptor for the DSv4 sparse MLA sliding-window KV pool.
@@ -692,7 +692,7 @@ static KernelParams setKernelParams(FmhaOptions_ const& options,
                            strideK,
                            tileShapeK,
                            const_cast<void*>(slidingWindowKvPoolBasePtr),
-                           /*swizzled = */ kernelTraits.mSwizzleKv,
+                           /*swizzled = */ kernelTraits.mSwizzleK,
                            /*unpack4b=*/storeTransformedKvInTmem);
   }
 
@@ -716,7 +716,7 @@ static KernelParams setKernelParams(FmhaOptions_ const& options,
                                       tileShapeV,
                                       // MlaGen kernels reuse the same buffer for K and V.
                                       const_cast<void*>(options.mIsMlaGen ? kBasePtr : vBasePtr),
-                                      /*swizzled=*/kernelTraits.mSwizzleKv,
+                                      /*swizzled=*/kernelTraits.mSwizzleV,
                                       /*unpack4b=*/storeTransformedKvInTmem);
 
   // If the KV dtype is E2m1, additional scaling factors are needed for dequant.
