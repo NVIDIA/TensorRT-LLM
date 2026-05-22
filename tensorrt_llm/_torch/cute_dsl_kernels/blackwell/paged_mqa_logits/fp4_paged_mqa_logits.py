@@ -55,17 +55,14 @@ import cutlass.utils.blackwell_helpers as sm100_utils
 import cutlass.utils.blockscaled_layout as blockscaled_utils
 from cutlass import BFloat16, Float4E2M1FN, Float8E8M0FNU, Float16, Int32
 from cutlass._mlir import ir
-from cutlass._mlir.dialects import llvm, nvvm, vector
+from cutlass._mlir.dialects import llvm, vector
 from cutlass.cute.nvgpu import cpasync, tcgen05
 from cutlass.cutlass_dsl import dsl_user_op
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 
-# Compat across CuTe DSL versions:
-#   4.4.x              : nvvm.RoundingModeKind.RN (enum, accepted by cute.arch.*)
-#   4.5.0+ / internal  : nvvm.RoundingModeKind removed; cute.arch.* strictly require
-#                        the string literal 'rn' (passing FPRoundingMode.RN enum
-#                        raises TypeError per nvvm_wrappers.from_str).
-_RND_RN = getattr(getattr(nvvm, "RoundingModeKind", None), "RN", None) or "rn"
+# CuTe DSL CUDA 13 validates rounding modes as string literals. The string
+# form is also accepted by older wrappers, so keep it version-independent.
+_RND_RN = "rn"
 
 
 @dsl_user_op
