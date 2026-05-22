@@ -156,8 +156,8 @@ def _stored_event_payloads(events):
     return [event["data"] for event in _stored_events(events)]
 
 
-def _commit_and_close(manager, stream, tokens, *, input_tokens=None, cache_salt_id=None):
-    kv_cache = manager.create_kv_cache(input_tokens=input_tokens, cache_salt_id=cache_salt_id)
+def _commit_and_close(manager, stream, tokens, *, input_tokens=None, reuse_scope=None):
+    kv_cache = manager.create_kv_cache(input_tokens=input_tokens, reuse_scope=reuse_scope)
     assert kv_cache.resume(stream)
     kv_cache.capacity = len(input_tokens or []) + len(tokens)
     kv_cache.commit(tokens)
@@ -919,7 +919,7 @@ def test_v2_stored_events_match_block_hash_chain():
         stored_events = _stored_events(events)
         assert len(stored_events) == 1
 
-        root_key = RootBlock.make_key(None)
+        root_key = RootBlock.make_key(ReuseScope())
         block0_key = Block.make_key(root_key, tokens[:tokens_per_block])
         block1_key = Block.make_key(block0_key, tokens[tokens_per_block:])
         expected_hashes = [block0_key.hex(), block1_key.hex()]
@@ -963,7 +963,7 @@ def test_v2_v1_hash_events_include_cache_salt_from_kv_cache():
             manager,
             stream,
             _token_ids(1, 7),
-            cache_salt_id=123,
+            reuse_scope=ReuseScope(salt=123),
         )
         events = _flush_serialized_events(event_manager)
 
@@ -1007,7 +1007,7 @@ def test_v2_reused_prefix_does_not_emit_duplicate_stored_events():
         reuse_events = _flush_serialized_events(event_manager)
         reused_hashes = _stored_block_hashes(reuse_events)
 
-        root_key = RootBlock.make_key(None)
+        root_key = RootBlock.make_key(ReuseScope())
         block0_key = Block.make_key(root_key, prefix_tokens[:tokens_per_block])
         block1_key = Block.make_key(block0_key, prefix_tokens[tokens_per_block:])
         block2_key = Block.make_key(block1_key, new_tokens)
