@@ -796,6 +796,182 @@ def _triton_pos_embed_interpolate(
     return output
 
 
+@triton.jit
+def _bilinear_pos_embed_batched_kernel(
+    embed_ptr,
+    output_ptr,
+    starts_ptr,  # (num_images + 1,) int32, cumulative output-token offsets
+    hs_ptr,  # (num_images,) int32
+    ws_ptr,  # (num_images,) int32
+    h_scales_ptr,  # (num_images,) float32
+    w_scales_ptr,  # (num_images,) float32
+    NUM_IMAGES: tl.constexpr,
+    NUM_GRID: tl.constexpr,
+    M_SIZE: tl.constexpr,
+    HIDDEN_DIM: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    """Single-launch variant of ``_bilinear_pos_embed_kernel``.
+
+    Replaces per-image kernel launches with one launch that covers the
+    entire (sum of t*h*w) output. Each program owns one output token.
+    The kernel finds its owning image via a linear scan over
+    ``starts_ptr``; ``NUM_IMAGES`` is a constexpr so the scan unrolls and
+    has no dynamic-bound branch.
+
+    Per-image (h, w, h_scale, w_scale) are loaded once per program. The
+    rest of the bilinear-interp + spatial-merge reorder math mirrors the
+    per-image kernel exactly, so the per-token output is bit-identical.
+    """
+    pid = tl.program_id(0)
+
+    # Linear scan finds the image whose [start, end) covers pid.
+    # tl.where keeps the update branch-free.
+    img_idx = 0
+    for i in tl.static_range(NUM_IMAGES):
+        end_i = tl.load(starts_ptr + i + 1)
+        img_idx = tl.where(pid >= end_i, i + 1, img_idx)
+
+    start = tl.load(starts_ptr + img_idx)
+    H = tl.load(hs_ptr + img_idx)
+    W = tl.load(ws_ptr + img_idx)
+    h_scale = tl.load(h_scales_ptr + img_idx)
+    w_scale = tl.load(w_scales_ptr + img_idx)
+
+    local_pid = pid - start
+
+    # The rest mirrors the per-image kernel. ``H``, ``W``, ``h_scale``,
+    # ``w_scale`` are now runtime values rather than constexpr, but the
+    # arithmetic structure is identical.
+    total_spatial = H * W
+    spatial_idx = local_pid % total_spatial
+
+    num_blocks_w = W // M_SIZE
+    block_idx = spatial_idx // (M_SIZE * M_SIZE)
+    local_idx = spatial_idx % (M_SIZE * M_SIZE)
+    br = block_idx // num_blocks_w
+    bc = block_idx % num_blocks_w
+    lr = local_idx // M_SIZE
+    lc = local_idx % M_SIZE
+    row = br * M_SIZE + lr
+    col = bc * M_SIZE + lc
+
+    h_frac = row.to(tl.float32) * h_scale
+    w_frac = col.to(tl.float32) * w_scale
+
+    hf = tl.math.floor(h_frac).to(tl.int32)
+    wf = tl.math.floor(w_frac).to(tl.int32)
+    hc = tl.minimum(hf + 1, NUM_GRID - 1)
+    wc = tl.minimum(wf + 1, NUM_GRID - 1)
+
+    dh = h_frac - hf.to(tl.float32)
+    dw = w_frac - wf.to(tl.float32)
+    w11 = dh * dw
+    w10 = dh - w11
+    w01 = dw - w11
+    w00 = 1.0 - dh - w01
+
+    off00 = (hf * NUM_GRID + wf) * HIDDEN_DIM
+    off01 = (hf * NUM_GRID + wc) * HIDDEN_DIM
+    off10 = (hc * NUM_GRID + wf) * HIDDEN_DIM
+    off11 = (hc * NUM_GRID + wc) * HIDDEN_DIM
+    out_off = pid * HIDDEN_DIM
+
+    out_dtype = output_ptr.dtype.element_ty
+    w00_c = w00.to(out_dtype)
+    w01_c = w01.to(out_dtype)
+    w10_c = w10.to(out_dtype)
+    w11_c = w11.to(out_dtype)
+
+    for d in tl.range(0, HIDDEN_DIM, BLOCK_D):
+        cols = d + tl.arange(0, BLOCK_D)
+        mask = cols < HIDDEN_DIM
+
+        e00 = tl.load(embed_ptr + off00 + cols, mask=mask)
+        e01 = tl.load(embed_ptr + off01 + cols, mask=mask)
+        e10 = tl.load(embed_ptr + off10 + cols, mask=mask)
+        e11 = tl.load(embed_ptr + off11 + cols, mask=mask)
+
+        val = w00_c * e00 + w01_c * e01 + w10_c * e10 + w11_c * e11
+        tl.store(output_ptr + out_off + cols, val, mask=mask)
+
+
+def _triton_pos_embed_interpolate_batched(
+    embed_weight: torch.Tensor,
+    grid_thw: list[list[int]],
+    num_grid_per_side: int,
+    m_size: int,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    """Single-launch fused bilinear pos-embed for a multi-image batch.
+
+    Builds five small per-image metadata tensors on CPU (cumulative
+    offsets, hs, ws, h/w scales), ships them in one pinned H->D copy
+    each, and dispatches a single ``_bilinear_pos_embed_batched_kernel``
+    over the full output. Equivalent to ``torch.cat([
+    _triton_pos_embed_interpolate(...) for t, h, w in grid_thw])`` but
+    with one kernel launch + zero ``torch.cat``.
+    """
+    hidden_dim = embed_weight.shape[1]
+    device = embed_weight.device
+
+    # Per-image metadata as plain Python lists; we ship them in one
+    # combined H->D transfer below.
+    starts = [0]
+    hs: list[int] = []
+    ws: list[int] = []
+    h_scales: list[float] = []
+    w_scales: list[float] = []
+    for t, h, w in grid_thw:
+        assert h % m_size == 0 and w % m_size == 0, (
+            f"h={h} and w={w} must be divisible by m_size={m_size}"
+        )
+        starts.append(starts[-1] + t * h * w)
+        hs.append(h)
+        ws.append(w)
+        h_scales.append(float(num_grid_per_side - 1) / float(h - 1) if h > 1 else 0.0)
+        w_scales.append(float(num_grid_per_side - 1) / float(w - 1) if w > 1 else 0.0)
+
+    total_out = starts[-1]
+    output = torch.empty(total_out, hidden_dim, device=device, dtype=dtype)
+
+    # One pinned host buffer per param array, then non_blocking H->D so
+    # the copy is a real DMA (no pageable staging).
+    starts_t = torch.tensor(starts, dtype=torch.int32, pin_memory=prefer_pinned()).to(
+        device, non_blocking=True
+    )
+    hs_t = torch.tensor(hs, dtype=torch.int32, pin_memory=prefer_pinned()).to(
+        device, non_blocking=True
+    )
+    ws_t = torch.tensor(ws, dtype=torch.int32, pin_memory=prefer_pinned()).to(
+        device, non_blocking=True
+    )
+    h_scales_t = torch.tensor(h_scales, dtype=torch.float32, pin_memory=prefer_pinned()).to(
+        device, non_blocking=True
+    )
+    w_scales_t = torch.tensor(w_scales, dtype=torch.float32, pin_memory=prefer_pinned()).to(
+        device, non_blocking=True
+    )
+
+    BLOCK_D = triton.next_power_of_2(hidden_dim)
+
+    _bilinear_pos_embed_batched_kernel[(total_out,)](
+        embed_weight,
+        output,
+        starts_t,
+        hs_t,
+        ws_t,
+        h_scales_t,
+        w_scales_t,
+        len(grid_thw),
+        num_grid_per_side,
+        m_size,
+        hidden_dim,
+        BLOCK_D,
+    )
+    return output
+
+
 class Qwen3VisionModel(torch.nn.Module):
     def __init__(self, model_config: ModelConfig[PretrainedConfig]):
         super().__init__()
@@ -924,18 +1100,19 @@ class Qwen3VisionModel(torch.nn.Module):
 
     # Adopted from https://github.com/vllm-project/vllm/blob/21eb2c3372fb6447ef36bee44ff7af79a330ffec/vllm/model_executor/models/qwen3_vl.py#L470)
     def fast_pos_embed_interpolate(self, grid_thw: list[list[int]]) -> torch.Tensor:
-        embed_weight = self.pos_embed.weight
-        num_grid_per_side = self.num_grid_per_side
-        m_size = self.spatial_merge_size
-        dtype = embed_weight.dtype
-        return torch.cat(
-            [
-                _triton_pos_embed_interpolate(
-                    embed_weight, t, h, w, num_grid_per_side, m_size, dtype
-                )
-                for t, h, w in grid_thw
-            ],
-            dim=0,
+        """Single-launch batched Triton bilinear pos-embed interpolation.
+
+        Replaces the prior ``torch.cat([_triton_pos_embed_interpolate(...)
+        for ...])`` (N kernel launches + a cat) with one launch that owns
+        the entire output. Per-image params (h, w, h/w scales, cumulative
+        starts) ride one pinned H->D copy each.
+        """
+        return _triton_pos_embed_interpolate_batched(
+            self.pos_embed.weight,
+            grid_thw,
+            self.num_grid_per_side,
+            self.spatial_merge_size,
+            self.pos_embed.weight.dtype,
         )
 
     def prepare_attn_metadata(self, seq_lens, attn_metadata: AttentionMetadata):

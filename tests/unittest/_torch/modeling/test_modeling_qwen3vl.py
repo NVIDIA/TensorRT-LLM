@@ -18,6 +18,7 @@ from tensorrt_llm._torch.models.modeling_qwen3vl import (
     Qwen3VLInputProcessorBase,
     Qwen3VLModel,
     _triton_pos_embed_interpolate,
+    _triton_pos_embed_interpolate_batched,
 )
 from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.models.modeling_utils import QuantConfig
@@ -733,3 +734,83 @@ def test_rot_pos_emb_l2_no_device_transfer_on_hit():
     # Per-tile outputs must be on CUDA so forward's torch.cat is device-side.
     for t, h, w in grid:
         assert vm._rotary_pos_emb_thw(t, h, w).is_cuda
+
+
+# ---------------------------------------------------------------------------
+# Single-launch batched Triton kernel for fast_pos_embed_interpolate.
+#
+# `_triton_pos_embed_interpolate_batched` replaces the per-image kernel
+# launch + torch.cat with one launch that owns the entire output. The
+# per-token output must match the per-image kernel exactly (bit-identical),
+# since both kernels share the same arithmetic; the only difference is the
+# program_id -> image_idx lookup and runtime (h, w) values.
+# ---------------------------------------------------------------------------
+
+
+_BATCHED_GRIDS = [
+    # Single image
+    [(1, 16, 16)],
+    [(1, 48, 48)],
+    [(3, 8, 12)],
+    # Multi-image, varied (h, w)
+    [(1, 16, 16), (1, 32, 32)],
+    [(1, 16, 16), (3, 8, 12), (1, 32, 32)],
+    [(1, 8, 12), (1, 14, 20), (1, 32, 32), (5, 16, 16)],
+]
+
+
+@pytest.mark.parametrize("dtype", _VIT_POS_EMBED_DTYPES, ids=lambda d: str(d).split(".")[-1])
+@pytest.mark.parametrize(
+    "grid_thw_list",
+    _BATCHED_GRIDS,
+    ids=["_".join(f"{t}x{h}x{w}" for t, h, w in cfg) for cfg in _BATCHED_GRIDS],
+)
+def test_batched_pos_embed_matches_per_image(grid_thw_list, dtype):
+    """Single-launch batched kernel output must equal torch.cat of the
+    per-image kernel outputs, bit-for-bit."""
+    device = "cuda"
+    torch.manual_seed(42)
+    embed_weight = (
+        torch.randn(
+            _VIT_POS_EMBED_NUM_GRID_PER_SIDE * _VIT_POS_EMBED_NUM_GRID_PER_SIDE,
+            _VIT_POS_EMBED_HIDDEN_DIM,
+            device=device,
+            dtype=dtype,
+        )
+        * 0.25
+    )
+
+    per_image = torch.cat(
+        [
+            _triton_pos_embed_interpolate(
+                embed_weight,
+                t,
+                h,
+                w,
+                _VIT_POS_EMBED_NUM_GRID_PER_SIDE,
+                _VIT_POS_EMBED_SPATIAL_MERGE_SIZE,
+                dtype,
+            )
+            for t, h, w in grid_thw_list
+        ],
+        dim=0,
+    )
+    batched = _triton_pos_embed_interpolate_batched(
+        embed_weight,
+        grid_thw_list,
+        _VIT_POS_EMBED_NUM_GRID_PER_SIDE,
+        _VIT_POS_EMBED_SPATIAL_MERGE_SIZE,
+        dtype,
+    )
+
+    assert batched.shape == per_image.shape
+    assert batched.dtype == per_image.dtype
+    # Same arithmetic, same program_id ordering. The per-image kernel
+    # receives ``h_scale``/``w_scale`` as JIT constants; the batched
+    # kernel loads them from an fp32 tensor (same precision, different
+    # codegen path), so FMA fusion choices can differ by a single ULP
+    # in fp32. The bf16 path stays within the same tolerance the
+    # per-image test uses (1e-2).
+    atol = {torch.float32: 5e-4, torch.bfloat16: 1e-2}[dtype]
+    rtol = {torch.float32: 5e-4, torch.bfloat16: 1e-2}[dtype]
+    torch.testing.assert_close(batched, per_image, atol=atol, rtol=rtol)
