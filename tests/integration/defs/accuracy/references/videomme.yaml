@@ -1,0 +1,15 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Initial Video-MME short-shard guardrail for E2E video QA. Update these values
+# after collecting stable model baselines on the generated 300-question shard.
+nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-FP8:
+  - quant_algo: FP8
+    kv_cache_quant_algo: FP8
+    accuracy: 69.5
+    num_samples: 300
+nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-NVFP4:
+  - quant_algo: MIXED_PRECISION
+    kv_cache_quant_algo: FP8
+    accuracy: 68.0
+    num_samples: 300

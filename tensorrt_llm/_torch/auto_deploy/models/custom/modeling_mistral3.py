@@ -1,3 +1,7 @@
+# Copyright 2018 The HuggingFace Team
+# Licensed under the Apache License, Version 2.0.
+# Original source: https://github.com/huggingface/transformers
+#
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
@@ -626,7 +630,7 @@ class Mistral4Model(Mistral4PreTrainedModel):
 
 
 class Mistral4ForCausalLM(Mistral4PreTrainedModel, GenerationMixin):
-    _tied_weights_keys = ["lm_head.weight"]
+    _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
 
     def __init__(self, config: Mistral4TextConfig, **kwargs):
         super().__init__(config)

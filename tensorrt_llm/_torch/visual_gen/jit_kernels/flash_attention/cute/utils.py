@@ -17,14 +17,20 @@ from cutlass.cute.runtime import from_dlpack
 
 
 # cute.arch.{fma,mul,add}_packed_f32x2 uses RZ rounding mode by default
-fma_packed_f32x2 = partial(cute.arch.fma_packed_f32x2, rnd=nvvm.RoundingModeKind.RN)
-mul_packed_f32x2 = partial(cute.arch.mul_packed_f32x2, rnd=nvvm.RoundingModeKind.RN)
-add_packed_f32x2 = partial(cute.arch.add_packed_f32x2, rnd=nvvm.RoundingModeKind.RN)
+# Compat across CuTe DSL versions:
+#   4.4.x              : nvvm.RoundingModeKind.RN (enum, accepted by cute.arch.*)
+#   4.5.0+ / internal  : nvvm.RoundingModeKind removed; cute.arch.* strictly require
+#                        the string literal 'rn' (passing FPRoundingMode.RN enum
+#                        raises TypeError per nvvm_wrappers.from_str).
+_RND_RN = getattr(getattr(nvvm, "RoundingModeKind", None), "RN", None) or "rn"
+fma_packed_f32x2 = partial(cute.arch.fma_packed_f32x2, rnd=_RND_RN)
+mul_packed_f32x2 = partial(cute.arch.mul_packed_f32x2, rnd=_RND_RN)
+add_packed_f32x2 = partial(cute.arch.add_packed_f32x2, rnd=_RND_RN)
 sub_packed_f32x2 = partial(
     cute.arch.calc_packed_f32x2_op,
     src_c=None,
     calc_func=nvvm.sub_packed_f32x2,
-    rnd=nvvm.RoundingModeKind.RN,
+    rnd=_RND_RN,
 )
 
 

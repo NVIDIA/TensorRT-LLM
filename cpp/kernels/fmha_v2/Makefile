@@ -124,8 +124,14 @@ ifneq ($(wildcard generated),)
 include generated/makefile
 endif
 
-CUBIN_CPP = $(patsubst %.cu.cubin, %.cubin.cpp, $(CUBINS))
-CUBIN_OBJ = $(patsubst %.cubin.cpp, %.cubin.o, $(CUBIN_CPP))
+# Each raw nvcc cubin is wrapped into a single-entry zstd-compressed tarball
+# matching the schema consumed by cpp/cmake/modules/tllm_cubin_archive.cmake.
+# The tarball entry is renamed `<stem>.cubin` (no `.cu` infix) so the build
+# extracts to the same on-disk filename consumers expect.
+# The legacy `xxd -i`-based bin2c flow (CUBIN_CPP / CUBIN_OBJ /
+# bin/libfmha_cubin.a) is gone -- consumer libraries pull cubin bytes in via
+# INCBIN at build time instead.
+CUBIN_TARS = $(patsubst %.cu.cubin, %.cubin.tar.zst, $(CUBINS))
 
 GENCODES =
 
@@ -184,13 +190,13 @@ dirs:
 	if [ ! -d bin/test/unit/arch ]; then mkdir -p bin/test/unit/arch; fi
 
 .PHONY: cubin
-cubin: $(CUBIN_CPP)
+cubin:
 	$(MAKE) dirs
-	$(MAKE) bin/libfmha_cubin.a
+	$(MAKE) $(CUBIN_TARS)
 
 cubin_demobert:
 	$(MAKE) dirs
-	$(MAKE) PREPROCESSOR_FLAGS="$(PREPROCESSOR_FLAGS) -DUSE_DEMO_BERT_PARAMS=1" $(CUBIN_CPP)
+	$(MAKE) PREPROCESSOR_FLAGS="$(PREPROCESSOR_FLAGS) -DUSE_DEMO_BERT_PARAMS=1" $(CUBIN_TARS)
 
 clean:
 	rm -rf bin obj cubin generated train_ops/build
@@ -235,9 +241,6 @@ bin/fmhca.exe: $(OBJECTS_MHCA)
 	$(CXX) $(CXX_FLAGS) -o $@ $^ -L$(CUDA)/lib64 -Wl,-rpath=$(CUDA)/lib64 -lcudart -lcudart -lcublas -lcublasLt
 
 ###################################################################################################
-
-bin/libfmha_cubin.a: $(CUBIN_OBJ)
-	ar rcs $@ $^
 
 ###################################################################################################
 
@@ -332,5 +335,23 @@ cubin/%_sm120.no_i2f_f2i.cu.cubin: ./generated/%_sm120.no_i2f_f2i.cu ./src/*.h .
 
 ###################################################################################################
 
-cubin/%.cubin.cpp: cubin/%.cu.cubin
-	xxd -i $< >& $@
+# Per-cubin tarball. The `cmake -E tar` invocation produces a single-entry
+# zstd archive whose entry is named "<stem>.cubin" (without the ".cu" infix),
+# matching the on-disk layout consumers expect after extraction.
+#
+# `--mtime=1970-01-01UTC` pins the archive entry's mtime, so two runs with
+# identical cubin bytes produce byte-identical tarballs. That is what lets
+# git/LFS dedupe across regenerations -- the tarball's content hash stays
+# stable when the input cubin's content does. The consumer-side build
+# (cpp/cmake/modules/tllm_cubin_archive.cmake) compensates for the frozen
+# entry mtime by copying the tarball file's mtime onto the extracted cubin
+# via `touch -r` -- otherwise ninja's restat optimization would mis-skip
+# downstream .o rebuilds.
+#
+# The hard-link / unlink dance keeps the cubin/ dir uncluttered between
+# builds.
+cubin/%.cubin.tar.zst: cubin/%.cu.cubin
+	@cd cubin && rm -f $*.cubin && \
+	  (ln $*.cu.cubin $*.cubin 2>/dev/null || cp $*.cu.cubin $*.cubin) && \
+	  cmake -E tar cf $*.cubin.tar.zst --zstd --mtime="1970-01-01UTC" -- $*.cubin && \
+	  rm -f $*.cubin

@@ -67,6 +67,7 @@ class VisualGenMapping(DeviceMeshTopologyImpl):
         ulysses_size: int = 1,
         attn2d_row_size: int = 1,
         attn2d_col_size: int = 1,
+        parallel_vae_size: int = 1,
         order: str = DEFAULT_DIM_ORDER,
     ):
         # cp_size unifies ring and Attention2D under one context-parallelism mesh dimension.
@@ -96,6 +97,12 @@ class VisualGenMapping(DeviceMeshTopologyImpl):
                 f"cfg({cfg_size}) * tp({tp_size}) * cp({cp_size}) * "
                 f"ulysses({ulysses_size}) = {product} != world_size({world_size})"
             )
+        if parallel_vae_size < 1:
+            raise ValueError(f"parallel_vae_size ({parallel_vae_size}) must be >= 1")
+        if parallel_vae_size > world_size:
+            raise ValueError(
+                f"parallel_vae_size ({parallel_vae_size}) cannot exceed world_size ({world_size})"
+            )
 
         dims = order.split("-")
         if set(dims) != _VALID_DIM_NAMES or len(dims) != len(_VALID_DIM_NAMES):
@@ -113,6 +120,10 @@ class VisualGenMapping(DeviceMeshTopologyImpl):
         self.ulysses_size = ulysses_size
         self.attn2d_row_size = attn2d_row_size
         self.attn2d_col_size = attn2d_col_size
+        self.parallel_vae_size = parallel_vae_size
+        self._vae_ranks = list(range(self.parallel_vae_size))
+        self._vae_group: Optional[ProcessGroup] = None
+        self._vae_adj_groups: list[Optional[ProcessGroup]] = []
         self._attn2d_row_group: Optional[ProcessGroup] = None
         self._attn2d_col_group: Optional[ProcessGroup] = None
         self._order = order
@@ -129,6 +140,7 @@ class VisualGenMapping(DeviceMeshTopologyImpl):
 
         if dist.is_initialized() and world_size > 1:
             self.build_mesh()
+            self._build_vae_group()
 
     # ------------------------------------------------------------------
     # Mesh construction
@@ -195,6 +207,61 @@ class VisualGenMapping(DeviceMeshTopologyImpl):
         logger.debug(
             f"VisualGenMapping._build_attn2d_groups: row_size={row_size}, col_size={col_size}"
         )
+
+    def _validate_vae_ranks_share_cfg_group(self) -> None:
+        """Ensure all ``vae_ranks`` share one cfg coordinate (or span the full world).
+
+        Today ``_vae_ranks = list(range(parallel_vae_size))`` only sits inside
+        one CFG group when ``cfg`` is the outermost axis of ``dit_dim_order``.
+        """
+        if self.parallel_vae_size <= 1 or self.cfg_size <= 1:
+            return
+        if self.parallel_vae_size == self.world_size:
+            return
+
+        # Row-major stride along the cfg axis from the mesh order.
+        stride, cfg_stride = 1, None
+        for dim in reversed(self._dim_names):
+            if dim == "cfg":
+                cfg_stride = stride
+                break
+            stride *= self._dim_sizes[dim]
+        assert cfg_stride is not None  # 'cfg' is always present in _dim_names
+
+        cfg_coords = {(r // cfg_stride) % self.cfg_size for r in self._vae_ranks}
+        if len(cfg_coords) > 1:
+            raise NotImplementedError(
+                f"vae_ranks={self._vae_ranks} straddle CFG groups "
+                f"(cfg coordinates={sorted(cfg_coords)}) under order='{self._order}'. "
+                "VAE ranks must share a single CFG group, or span the full world. "
+                "_vae_ranks is currently hardcoded to list(range(parallel_vae_size)), "
+                "which only lands in one CFG group when 'cfg' is the outermost axis "
+                "of dit_dim_order. Either pick parallel_vae_size <= ranks_per_cfg_group "
+                "or derive _vae_ranks from the mesh."
+            )
+
+    def _build_vae_group(self) -> None:
+        """Create the process group used by parallel VAE."""
+        if self.parallel_vae_size <= 1:
+            return
+
+        self._validate_vae_ranks_share_cfg_group()
+
+        # use_local_synchronization=False since new_group is world-collective, so every
+        # rank (including non-VAE ranks) must participate or the next world-wide
+        # collective deadlocks.
+        pg = dist.new_group(self._vae_ranks, use_local_synchronization=False)
+        if self._rank in self._vae_ranks:
+            self._vae_group = pg
+
+        adj_groups: list[Optional[ProcessGroup]] = [None] * (self.parallel_vae_size - 1)
+        for i in range(self.parallel_vae_size - 1):
+            ranks = [self._vae_ranks[i], self._vae_ranks[i + 1]]
+            pg = dist.new_group(ranks, use_local_synchronization=False)
+            if self._rank in ranks:
+                adj_groups[i] = pg
+        if self._rank in self._vae_ranks:
+            self._vae_adj_groups = adj_groups
 
     # ------------------------------------------------------------------
     # Rank decomposition
@@ -269,6 +336,18 @@ class VisualGenMapping(DeviceMeshTopologyImpl):
     def attn2d_mesh_group(self) -> Optional[ProcessGroup]:
         """Full CP group for Attention2D (same as cp_group)."""
         return self._group("cp")
+
+    @property
+    def vae_ranks(self) -> list[int]:
+        return self._vae_ranks
+
+    @property
+    def vae_group(self) -> Optional[ProcessGroup]:
+        return self._vae_group
+
+    @property
+    def vae_adj_groups(self) -> list[Optional[ProcessGroup]]:
+        return self._vae_adj_groups
 
     # ------------------------------------------------------------------
     # Bridge to LLM Mapping (for Linear layers)

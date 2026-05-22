@@ -190,17 +190,13 @@ generate_cu_trtllm = os.environ.get('GENERATE_CU_TRTLLM',
                                     'False').lower() == 'true'
 
 ns_open = r"""
-namespace tensorrt_llm
-{
-namespace kernels
-{
+namespace tensorrt_llm::TRTLLM_ABI_NAMESPACE::kernels {
 // clang-format off
 """ if generate_cu_trtllm else ""
 
 ns_close = r"""
 // clang-format on
-} // namespace kernels
-} // namespace tensorrt_llm
+} // namespace tensorrt_llm::TRTLLM_ABI_NAMESPACE::kernels
 """ if generate_cu_trtllm else ""
 
 copyright = '''\
@@ -2092,7 +2088,7 @@ def encode_name(kernel_spec):
     # Produce file, launch function and kernel names.
     fname = name_base.replace('__placeholder__', '')
     if seqlen >= 1024 and not kernel_spec.flash_attention:
-        fname += '.no_i2f_f2i'
+        fname += '_no_i2f_f2i'
     fname += '.cu'
     lname = ('run_' + name_base).replace('__placeholder__', '')
     kname = name_base + '_kernel'
@@ -3359,8 +3355,21 @@ def get_cubin_header(kernel_traits, specs_names):
                 kspec.enable_skip_softmax, mask_type):
             continue
         name = fname.replace('.', '_')
-        data = 'extern unsigned char cubin_{name}_cubin[];'.format(name=name)
-        size = 'extern uint32_t cubin_{name}_cubin_len;'.format(name=name)
+        # No `extern "C"` -- the build-time INCBIN aggregator
+        # (cpp/cmake/modules/tllm_cubin_archive.cmake +
+        # cpp/include/tensorrt_llm/common/cubinIncbin.h) emits these symbols
+        # under their C++-mangled names so they're scoped to the surrounding
+        # `tensorrt_llm::TRTLLM_ABI_NAMESPACE::kernels` namespace. That
+        # protects against multi-definition errors when two packages or two
+        # TRT-LLM ABI versions ship the same kernel set.
+        # Match the definition site emitted by TLLM_INCBIN_NS in
+        # cpp/include/tensorrt_llm/common/cubinIncbin.h:
+        #   extern unsigned char const SYMBOL[];
+        #   extern unsigned int  const SYMBOL_len;
+        data = 'extern unsigned char const cubin_{name}_cubin[];'.format(
+            name=name)
+        size = 'extern unsigned int const cubin_{name}_cubin_len;'.format(
+            name=name)
         if kspec.sm in cubins_dict:
             cubins_dict[kspec.sm].append(data)
             cubin_lens_dict[kspec.sm].append(size)
@@ -3583,12 +3592,17 @@ def get_cubin_header(kernel_traits, specs_names):
         else:
             assert False, 'Something terrible happened'
 
+    def render_sm(sm):
+        if int(sm) >= 100:
+            return f"{sm}F"
+        return sm
+
     metadata_v1 = ',\n'.join(metadata_v1)
     # Add macros to only include needed cubins during compilation.
     if bool(metadata_v2_dict):
         metadata_v2 = ''
         for sm in metadata_v2_dict.keys():
-            macro_begin = f"#ifndef EXCLUDE_SM_{sm}"
+            macro_begin = f"#ifndef EXCLUDE_SM_{render_sm(sm)}"
             macro_end = f"#endif\n\n"
             metadata_v2 += macro_begin + '\n' + (',\n'.join(
                 metadata_v2_dict[sm]))
@@ -3604,7 +3618,7 @@ def get_cubin_header(kernel_traits, specs_names):
             list(launchers_dict.keys())))
 
     for sm in all_sms:
-        macro_begin = f"#ifndef EXCLUDE_SM_{sm}"
+        macro_begin = f"#ifndef EXCLUDE_SM_{render_sm(sm)}"
         macro_end = f"#endif\n"
 
         # Add cubin array declarations
@@ -3806,7 +3820,7 @@ TRTLLM_NAMESPACE_END
 
 {local_ns_close}
 
-using namespace tensorrt_llm::kernels;
+using namespace tensorrt_llm::TRTLLM_ABI_NAMESPACE::kernels;
 
 namespace tensorrt_llm::TRTLLM_ABI_NAMESPACE::kernels {{
 
@@ -3909,12 +3923,12 @@ def modify_cubin_header(cubin_header):
     target = "#ifndef EXCLUDE_SM_80"
     addition_cubin_array = """
 #ifndef EXCLUDE_SM_80
-extern unsigned char cubin_fmha_v2_flash_attention_fp16_64_128_S_q_paged_kv_128_sm80_cu_cubin[];
+extern unsigned char const cubin_fmha_v2_flash_attention_fp16_64_128_S_q_paged_kv_128_sm80_cu_cubin[];
 #endif
 """
     addition_cubin_length = """
 #ifndef EXCLUDE_SM_80
-extern uint32_t cubin_fmha_v2_flash_attention_fp16_64_128_S_q_paged_kv_128_sm80_cu_cubin_len;
+extern unsigned int const cubin_fmha_v2_flash_attention_fp16_64_128_S_q_paged_kv_128_sm80_cu_cubin_len;
 #endif
 """
     # Add cubin array and length into there corresponding sections.

@@ -66,7 +66,7 @@ class EagleDrafterFactory(AutoModelForCausalLMFactory):
 
         # Convert base config to EagleConfig, preserving existing values
         # and applying model-specific defaults based on model_type
-        model_config = EagleConfig(model_config, model_type)
+        model_config = EagleConfig.from_base_config(model_config, model_type)
 
         with (init_empty_weights if device == "meta" else nullcontext)():
             model = EagleDrafterForCausalLM._from_config(model_config, **unused_kwargs)

@@ -23,7 +23,6 @@ from ..llmapi.tokenizer import TokenizerBase
 from ..llmapi.tracer import global_tracer
 from ..llmapi.utils import _SyncQueue, get_numa_aware_cpu_affinity, logger_debug
 from ..lora_manager import LoraManager
-from ..metrics import RequestEventTiming
 from ..prompt_adapter_manager import PromptAdapterManager
 from ..runtime import ModelConfig
 from ..runtime.model_runner import _engine_config_to_model_config
@@ -34,7 +33,7 @@ from .postproc_worker import (PostprocParams, PostprocWorker,
                               PostprocWorkerConfig)
 from .request import GenerationRequest, LoRARequest, PromptAdapterRequest
 from .result import (GenerationResult, LogProbsResult, ResponseWrapper,
-                     compute_logprobs)
+                     compute_logprobs, get_metrics_dict)
 from .utils import (ErrorResponse, IntraProcessQueue, RequestError,
                     is_llm_response)
 
@@ -115,9 +114,14 @@ class BaseWorker(GenerationExecutor):
         self._backend = None if llm_args is None else llm_args.backend
         self._is_pytorch_backend = self._backend in ["pytorch", "_autodeploy"]
         self._lora_config = llm_args.lora_config if self._is_pytorch_backend else None
+        self._resource_governor_queue = None
 
         if global_mpi_size() > 1:
             logger.set_rank(self.global_rank)
+
+    @property
+    def resource_governor_queue(self):
+        return self._resource_governor_queue
 
     def _configure_affinity(self, device_id):
         '''Probe and configure the CPU affinity of the worker based on NUMA topology.
@@ -216,6 +220,9 @@ class BaseWorker(GenerationExecutor):
             else:
                 raise ValueError(f"Unsupported backend config: {self._backend}")
 
+            if self._resource_governor_queue is not None:
+                args["resource_governor_queue"] = self._resource_governor_queue
+
             # Define additional attributes that can be used later, such as in _deduce_max_tokens
             self.mapping = self.llm_args.parallel_config.to_mapping()
             self.checkpoint_loader = None
@@ -223,8 +230,12 @@ class BaseWorker(GenerationExecutor):
                 from tensorrt_llm._torch.pyexecutor.model_loader import \
                     _construct_checkpoint_loader
                 self.checkpoint_loader = _construct_checkpoint_loader(
-                    self.llm_args.backend, self.llm_args.checkpoint_loader,
-                    self.llm_args.checkpoint_format)
+                    self.llm_args.backend,
+                    self.llm_args.checkpoint_loader,
+                    self.llm_args.checkpoint_format,
+                    mx_config=self.llm_args.mx_config,
+                    mx_model_name=self.llm_args.model,
+                )
 
             self.max_seq_len = self.llm_args.max_seq_len
             # creare_py_executor may change some fields of llm_args
@@ -392,15 +403,28 @@ class BaseWorker(GenerationExecutor):
         assert request.id is not None
         py_lora_path = None
         if self._lora_manager is not None and request.lora_request is not None:
-            adapter_in_cache = self._lora_manager.is_adapter_in_cpu_cache(
-                request.lora_request.adapter_id)
-            self._load_lora_adapter(request.lora_request)
-            uid = str(request.lora_request.adapter_id)
-            lora_config = tllm.LoraConfig(
-                task_id=request.lora_request.adapter_id,
-                weights=self._lora_manager.cpp_lora_weights[uid]
-                if not adapter_in_cache else None,
-                config=self._lora_manager.cpp_lora_config[uid])
+            if self._is_pytorch_backend:
+                # PyTorch backend: don't embed weights in the request.
+                # Each rank loads independently from disk via py_lora_path
+                # in PeftCacheManager.add_request_peft().
+                # Pre-load on rank 0 to warm the LoRA manager cache so that
+                # add_request_peft finds the adapter already loaded.
+                self._load_lora_adapter(request.lora_request)
+                uid = str(request.lora_request.adapter_id)
+                lora_config = tllm.LoraConfig(
+                    task_id=request.lora_request.adapter_id,
+                    weights=None,
+                    config=self._lora_manager.cpp_lora_config[uid])
+            else:
+                adapter_in_cache = self._lora_manager.is_adapter_in_cpu_cache(
+                    request.lora_request.adapter_id)
+                self._load_lora_adapter(request.lora_request)
+                uid = str(request.lora_request.adapter_id)
+                lora_config = tllm.LoraConfig(
+                    task_id=request.lora_request.adapter_id,
+                    weights=self._lora_manager.cpp_lora_weights[uid]
+                    if not adapter_in_cache else None,
+                    config=self._lora_manager.cpp_lora_config[uid])
             py_lora_path = request.lora_request.lora_path
         else:
             lora_config = None
@@ -432,7 +456,13 @@ class BaseWorker(GenerationExecutor):
                     multimodal_lengths=request.multimodal_params.
                     multimodal_input.multimodal_lengths,
                     multimodal_uuids=request.multimodal_params.multimodal_input.
-                    multimodal_uuids)
+                    multimodal_uuids,
+                    multimodal_item_run_cu_offsets=request.multimodal_params.
+                    multimodal_input.multimodal_item_run_cu_offsets,
+                    multimodal_run_positions=request.multimodal_params.
+                    multimodal_input.multimodal_run_positions,
+                    multimodal_run_lengths=request.multimodal_params.
+                    multimodal_input.multimodal_run_lengths)
             # NOTE: Setting to None here to avoid sending multimodal_input again through the 'py_multimodal_data' field
             request.multimodal_params.multimodal_input = None
 
@@ -662,17 +692,22 @@ class BaseWorker(GenerationExecutor):
     # Define a Callable to join iteration and request stats
     @staticmethod
     def _stats_serializer(stats) -> str:
+        # Per-rank path: stats is ("per_rank_dict", {..., "rank": N}).
+        # Already serialized on the producing rank via allgather — just emit.
+        if (isinstance(stats, tuple) and len(stats) == 2
+                and stats[0] == "per_rank_dict"):
+            return json.dumps(stats[1])
+
         iteration_stats, req_stats = stats[0], stats[1]
         kv_iter_stats = stats[2] if len(stats) > 2 else None
+        attention_dp_rank = stats[3] if len(stats) > 3 else None
 
         stats_dict = json.loads(iteration_stats.to_json_str())
-        # Tag with dp_rank=0 so Dynamo's adapter can always read
-        # stat["attentionDpRank"] without a missing-key branch. Attention-DP
-        # per-rank emission is a follow-up; today FPM only flows under
-        # non-attention-DP.
-        # TODO(https://jirasw.nvidia.com/browse/TRTLLM-12123): implement
-        # per-rank IterationStats delivery under attention-DP.
-        stats_dict.setdefault("attentionDpRank", 0)
+        # Always tag the row so Dynamo's adapter can read
+        # stat["attentionDpRank"] without a missing-key branch. Non-ADP stats
+        # default to rank 0; ADP stats carry the rank supplied by PyExecutor.
+        stats_dict["attentionDpRank"] = (0 if attention_dp_rank is None else
+                                         attention_dp_rank)
 
         if req_stats is not None and len(req_stats) > 0:
             stats_dict["requestStats"] = []
@@ -1006,47 +1041,13 @@ def _send_rsp(
         raise ValueError(f"Unknown response type: {response}")
 
 
-def _get_metrics_dict(
-        response: tllm.Response) -> dict[RequestEventTiming, float]:
-    req_perf_metrics, metrics_dict = None, {}
-    res = response.result
-    if res:
-        if hasattr(res, '_result'):
-            if result := res.get_result():
-                req_perf_metrics = result.request_perf_metrics
-        else:
-            req_perf_metrics = res.request_perf_metrics
-        if req_perf_metrics and req_perf_metrics.timing_metrics:
-            metrics_dict = {
-                RequestEventTiming.ARRIVAL_TIME:
-                req_perf_metrics.timing_metrics.arrival_time.total_seconds(),
-                RequestEventTiming.FIRST_TOKEN_TIME:
-                req_perf_metrics.timing_metrics.first_token_time.total_seconds(
-                ),
-                RequestEventTiming.FIRST_SCHEDULED_TIME:
-                req_perf_metrics.timing_metrics.first_scheduled_time.
-                total_seconds(),
-                RequestEventTiming.LAST_TOKEN_TIME:
-                req_perf_metrics.timing_metrics.last_token_time.total_seconds(),
-                RequestEventTiming.KV_CACHE_TRANSFER_START:
-                req_perf_metrics.timing_metrics.kv_cache_transfer_start.
-                total_seconds(),
-                RequestEventTiming.KV_CACHE_TRANSFER_END:
-                req_perf_metrics.timing_metrics.kv_cache_transfer_end.
-                total_seconds(),
-                RequestEventTiming.KV_CACHE_SIZE:
-                req_perf_metrics.timing_metrics.kv_cache_size,
-            }
-    return metrics_dict
-
-
 def _maybe_wrap_response(
         worker,
         response: tllm.Response,
         is_pytorch_backend=False) -> Union[tllm.Response, ResponseWrapper]:
 
     logprobs_result = _get_logprobs(worker, response, is_pytorch_backend)
-    req_perf_metrics = _get_metrics_dict(response)
+    req_perf_metrics = get_metrics_dict(response)
     if logprobs_result or req_perf_metrics:
         response = ResponseWrapper(response, logprobs_result, req_perf_metrics)
     return response

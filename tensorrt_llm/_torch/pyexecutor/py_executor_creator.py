@@ -228,9 +228,13 @@ def get_guided_decoding_config(guided_decoding_backend: str,
 def _load_config_and_create_checkpoint_loader(
         llm_args: TorchLlmArgs, checkpoint_dir: Optional[str] = None):
     torch.cuda.set_per_process_memory_fraction(1.0)
-    checkpoint_loader = _construct_checkpoint_loader(llm_args.backend,
-                                                     llm_args.checkpoint_loader,
-                                                     llm_args.checkpoint_format)
+    checkpoint_loader = _construct_checkpoint_loader(
+        llm_args.backend,
+        llm_args.checkpoint_loader,
+        llm_args.checkpoint_format,
+        mx_config=llm_args.mx_config,
+        mx_model_name=llm_args.model,
+    )
     llm_args = ModelLoader.load_config_and_apply_defaults(
         checkpoint_dir, llm_args, checkpoint_loader)
     return llm_args, checkpoint_loader
@@ -276,11 +280,27 @@ def create_encoder_executor(
     )
 
 
+def log_memory_usage(stage: str):
+    GB = 1 << 30
+    torch.cuda.empty_cache()
+    torch.cuda.reset_peak_memory_stats()
+    end, total_gpu_memory = torch.cuda.mem_get_info()
+    total_used_bytes = total_gpu_memory - end
+    model_bytes = torch.cuda.memory_stats()["allocated_bytes.all.current"]
+    logger.info(
+        f"Memory used at {stage} (inside torch) in memory usage profiling: {model_bytes / (GB):.2f} GiB"
+    )
+    logger.info(
+        f"Memory used at {stage} (outside torch) in memory usage profiling: {((total_used_bytes - model_bytes) if total_used_bytes > model_bytes else 0) / (GB):.2f} GiB"
+    )
+
+
 def create_py_executor(
     llm_args: TorchLlmArgs,
     checkpoint_dir: Optional[str] = None,
     tokenizer: Optional[TokenizerBase] = None,
     profiling_stage_data: Optional[dict] = None,
+    resource_governor_queue=None,
 ) -> PyExecutor:
     """Create and initialize a PyExecutor instance from the given LLM arguments.
 
@@ -295,6 +315,9 @@ def create_py_executor(
         tokenizer: Optional tokenizer instance. If None, loaded from checkpoint.
         profiling_stage_data: Optional dict for collecting per-stage memory
             profiling data during executor construction.
+        resource_governor_queue: Optional queue for resource governor
+            requests. When provided, it is installed before the worker thread
+            starts so all ranks observe the same collective sequence.
 
     Returns:
         A fully initialized PyExecutor instance.
@@ -423,9 +446,13 @@ def create_py_executor(
         has_draft_model_engine = spec_config.spec_dec_mode.has_draft_model()
         has_spec_drafter = spec_config.spec_dec_mode.has_spec_drafter()
 
-        if hasattr(spec_config,
-                   'max_batch_size') and spec_config.max_batch_size is None:
-            spec_config.max_batch_size = max_batch_size
+        # Eagle3DecodingConfig._max_batch_size is internally managed: the
+        # dynamic-tree worker pre-allocates batch-indexed CUDA buffers sized
+        # by this value, and runtime indexes them with no bounds check. It
+        # MUST equal the global max_batch_size to avoid OOB; we populate it
+        # here as the single source of truth.
+        if hasattr(spec_config, '_max_batch_size'):
+            spec_config._max_batch_size = max_batch_size
 
         # WAR for https://nvbugs/5807902
         # Disable separate draft KV cache in disaggregated mode
@@ -597,10 +624,10 @@ def create_py_executor(
 
     config = model_engine.model.model_config.pretrained_config
     if is_hybrid_linear(config) and kv_cache_config.enable_block_reuse and (
-            spec_config is not None or cache_transceiver_config is not None
+            cache_transceiver_config is not None
             and cache_transceiver_config.backend is not None):
         logger.warning(
-            "Disabling block reuse for MambaHybridCacheManager-based models when MTP or disagg is enabled"
+            "Disabling block reuse for MambaHybridCacheManager-based models when disagg is enabled"
         )
         kv_cache_config.enable_block_reuse = False
         _set_model_engines_cache_reuse([model_engine, draft_model_engine],
@@ -608,6 +635,17 @@ def create_py_executor(
     if is_mla(config):
         if model_engine.model.model_config.enable_flash_mla:
             tokens_per_block = 64
+            # Propagate the override back to kv_cache_config so any consumer
+            # that later reads llm_args.kv_cache_config.tokens_per_block sees
+            # the effective value. KvCacheConnectorScheduler subclasses
+            # (LMCache, Dynamo KVBM) are instantiated further down via
+            # scheduler_cls(llm_args) and size their block pools from
+            # llm_args.kv_cache_config.tokens_per_block. Without this the
+            # connector's block size desynced from the KVCacheManager's
+            # actual tokens_per_block (user-set or default 32 vs. FlashMLA's
+            # forced 64), producing a frozen cache_block_ids view to the
+            # connector and silently-corrupted decode KV (#13320).
+            kv_cache_config.tokens_per_block = tokens_per_block
             logger.info(
                 f"Change tokens_per_block to: {tokens_per_block} for using FlashMLA"
             )
@@ -825,6 +863,9 @@ def create_py_executor(
             is_disagg=is_disagg,
         )
 
+        if not skip_est:
+            log_memory_usage("after loading weights")
+
         estimating_kv_cache = kv_cache_creator.try_prepare_estimation()
 
         with allocation_scope(
@@ -880,6 +921,7 @@ def create_py_executor(
             garbage_collection_gen0_threshold=garbage_collection_gen0_threshold,
             kv_connector_manager=kv_connector_manager
             if not estimating_kv_cache else None,
+            resource_governor_queue=resource_governor_queue,
             max_seq_len=max_seq_len,
             max_batch_size=max_batch_size,
             max_beam_width=max_beam_width,
@@ -952,6 +994,7 @@ def create_py_executor(
                 garbage_collection_gen0_threshold=
                 garbage_collection_gen0_threshold,
                 kv_connector_manager=kv_connector_manager,
+                resource_governor_queue=resource_governor_queue,
                 max_seq_len=max_seq_len,
                 max_batch_size=max_batch_size,
                 max_beam_width=max_beam_width,

@@ -23,6 +23,5 @@ attention:
 parallel:
   dit_cfg_size: 1
   dit_ulysses_size: 1
-  enable_parallel_vae: true
 cuda_graph:
   enable_cuda_graph: false

@@ -39,10 +39,14 @@ l0_dgx_b300:
   - unittest/_torch/modules/moe/test_moe_module.py::test_configurable_moe_multi_gpu[parallel=DEP-comm=DEEPEP-e60_k4_h2048_i1408-seq=8-dtype=torch.bfloat16-backend=CUTEDSL-quant=NVFP4-routing=Renormalize]
   # DEEPGEMM backend: FP8_BLOCK_SCALES
   - unittest/_torch/modules/moe/test_moe_module.py::test_configurable_moe_multi_gpu[parallel=DEP-comm=DEEPEP-e60_k4_h2048_i1408-seq=8-dtype=torch.bfloat16-backend=DEEPGEMM-quant=FP8_BLOCK_SCALES-routing=Renormalize]
+  # MEGAMOE_DEEPGEMM backend: W4A8_MXFP4_MXFP8
+  - unittest/_torch/modules/moe/test_moe_module.py::test_configurable_moe_multi_gpu[parallel=DEP-comm=IGNORE-e8_k1_h512_i512-seq=8-dtype=torch.bfloat16-backend=MEGAMOE_DEEPGEMM-quant=W4A8_MXFP4_MXFP8-routing=DeepSeekV3]
+  - unittest/_torch/modules/moe/test_moe_module.py::test_configurable_moe_single_gpu[e256_k8_h7168_i2048-seq=1-dtype=torch.bfloat16-backend=MEGAMOE_DEEPGEMM-quant=W4A8_MXFP4_MXFP8-routing=DeepSeekV3]
   # ------------- MoE: EPLB (Expert Load Balancing) tests ---------------
   - unittest/_torch/modules/moe/test_moe_module.py::test_configurable_moe_multi_gpu_eplb[parallel=DEP-comm=NVLINK_ONE_SIDED-e8_k2_h512_i512-slots=16-dtype=torch.bfloat16-backend=CUTLASS-quant=NVFP4-routing=Renormalize]
   - unittest/_torch/modules/moe/test_moe_module.py::test_configurable_moe_multi_gpu_eplb[parallel=DEP-comm=NVLINK_ONE_SIDED-e8_k2_h512_i512-slots=16-dtype=torch.bfloat16-backend=TRTLLM-quant=NVFP4-routing=Renormalize]
   - unittest/_torch/modules/moe/test_moe_module.py::test_configurable_moe_multi_gpu_eplb[parallel=DEP-comm=NVLINK_ONE_SIDED-e8_k2_h512_i512-slots=16-dtype=torch.bfloat16-backend=TRTLLM-quant=W4A16_MXFP4-routing=Renormalize]
+  - unittest/_torch/modules/moe/test_moe_module.py::test_configurable_moe_multi_gpu_eplb -k "MEGAMOE_DEEPGEMM"
   - unittest/_torch/modeling -k "modeling_llama"
   - unittest/_torch/modeling -k "modeling_mixtral"
   - unittest/_torch/modeling -k "modeling_gpt_oss"

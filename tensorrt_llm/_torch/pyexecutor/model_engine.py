@@ -99,6 +99,46 @@ class ModelEngine(ABC):
         return
 
 
+def _filter_piecewise_capture_num_tokens(
+    candidate_num_tokens: list[int],
+    max_num_tokens: int,
+    max_batch_size: int,
+    max_seq_len: int,
+    num_extra_decoding_steps: int = 0,
+) -> Tuple[list[int], list[int]]:
+    """Cap piecewise CUDA graph capture candidates at the engine's reachable
+    `num_tokens` ceiling `max_batch_size * (max_seq_len - 1 - num_extra_decoding_steps)`
+    and ensure the ceiling itself is captured.
+
+    Each in-flight request must leave room for at least one decode token,
+    so the ceiling is the largest forward-pass `num_tokens` the warmup
+    builder can construct. Including it in the capture set closes the
+    runtime padding gap between the next-largest candidate and the ceiling
+    (otherwise ISLs in that gap have no graph >= them and fall back to
+    eager).
+
+    Returns `(kept, unrecordable)` where `kept` is sorted ascending,
+    deduped, and contains the ceiling whenever it is positive.
+    `unrecordable` is the sorted unique set of input entries above the
+    ceiling but within `max_num_tokens`.
+    """
+    max_capturable_num_tokens = max(
+        0, max_batch_size * (max_seq_len - 1 - num_extra_decoding_steps))
+    piecewise_capacity_limit = min(max_num_tokens, max_capturable_num_tokens)
+    kept = sorted(
+        {i
+         for i in candidate_num_tokens if 0 < i <= piecewise_capacity_limit})
+    if piecewise_capacity_limit > 0 and (not kept or kept[-1]
+                                         < piecewise_capacity_limit):
+        kept.append(piecewise_capacity_limit)
+    unrecordable = sorted({
+        i
+        for i in candidate_num_tokens
+        if max_capturable_num_tokens < i <= max_num_tokens
+    })
+    return kept, unrecordable
+
+
 def _filter_cuda_graph_batch_sizes(cuda_graph_batch_sizes: list[int],
                                    max_batch_size: int, max_num_tokens: int,
                                    max_total_draft_tokens: int,
@@ -167,8 +207,12 @@ class PyTorchModelEngine(ModelEngine):
 
         if checkpoint_loader is None:
             checkpoint_loader = _construct_checkpoint_loader(
-                llm_args.backend, llm_args.checkpoint_loader,
-                llm_args.checkpoint_format)
+                llm_args.backend,
+                llm_args.checkpoint_loader,
+                llm_args.checkpoint_format,
+                mx_config=llm_args.mx_config,
+                mx_model_name=llm_args.model,
+            )
 
         self.mapping = mapping
         if mapping.has_pp():
@@ -286,10 +330,23 @@ class PyTorchModelEngine(ModelEngine):
             torch_compile_piecewise_cuda_graph_num_tokens
             or cuda_graph_batch_sizes or [])
 
-        self._piecewise_cuda_graph_num_tokens = [
-            i for i in piecewise_cuda_graph_num_tokens
-            if i <= self.max_num_tokens
-        ]
+        num_extra_decoding_steps = self._get_num_extra_decoding_steps()
+        self._piecewise_cuda_graph_num_tokens, unrecordable = (
+            _filter_piecewise_capture_num_tokens(
+                piecewise_cuda_graph_num_tokens,
+                max_num_tokens=self.max_num_tokens,
+                max_batch_size=self.batch_size,
+                max_seq_len=self.max_seq_len,
+                num_extra_decoding_steps=num_extra_decoding_steps,
+            ))
+        if unrecordable:
+            logger.warning(
+                f"Skipping piecewise CUDA graph capture for num_tokens="
+                f"{unrecordable}: exceeds reachable ceiling "
+                f"max_batch_size*(max_seq_len-1-num_extra_decoding_steps)="
+                f"{max(0, self.batch_size * (self.max_seq_len - 1 - num_extra_decoding_steps))}. "
+                f"Capturing the ceiling itself; raise max_seq_len for larger graphs."
+            )
 
         try:
             use_ub_for_nccl = (
@@ -363,8 +420,12 @@ class PyTorchModelEngine(ModelEngine):
             self.without_logits = self.spec_config.spec_dec_mode.without_logits(
             ) or self.model_is_wrapped
             self.max_total_draft_tokens = spec_config.tokens_per_gen_step - 1
-            # PARD/DFlash use 2K tokens per gen request (K accepted + K masks), so
-            # their per-request draft buffer width is 2K-1 = max_total_draft_tokens.
+            # Parallel-draft modes (PARD, DFlash) size their per-request draft
+            # buffer by tokens_per_gen_step - 1 so the engine reserves exactly
+            # one slot per draft token the target will verify.  PARD still uses
+            # 2K tokens per gen req (K drafts + K mask fillers); DFlash was
+            # reduced to K+1 (K drafts + 1 bonus) - the spec config's
+            # tokens_per_gen_step carries the per-algorithm width.
             if spec_config.spec_dec_mode.is_parallel_draft():
                 self.max_draft_len = self.max_total_draft_tokens
             else:
@@ -1308,6 +1369,8 @@ class PyTorchModelEngine(ModelEngine):
             "Cannot fuse drafting loop. Not enough KV cache space for all draft tokens."
         )
         token_num -= num_extra_decoding_steps
+        token_num = int(
+            token_num)  # Ensure int for range() in add_dummy_requests
 
         max_seq_len_request = kv_cache_manager.add_dummy_requests(
             request_ids=[batch_size - 1],
@@ -1579,8 +1642,14 @@ class PyTorchModelEngine(ModelEngine):
                     'attn_metadata'].num_chunked_ctx_requests
                 previous_batch_tokens = inputs['input_ids'].shape[
                     0] - num_ctx_tokens
-                inputs['position_ids'][0, num_ctx_tokens:] += (
-                    self.previous_pos_id_offsets_cuda[:previous_batch_tokens])
+                if inputs['position_ids'].ndim == 3:  # mrope: [3, 1, N]
+                    inputs['position_ids'][:, :, num_ctx_tokens:] += (
+                        self.
+                        previous_pos_id_offsets_cuda[:previous_batch_tokens])
+                else:
+                    inputs['position_ids'][0, num_ctx_tokens:] += (
+                        self.
+                        previous_pos_id_offsets_cuda[:previous_batch_tokens])
                 if hasattr(inputs['attn_metadata'], 'kv_lens_cuda'):
                     if num_ctx_requests >= num_chunked_ctx_requests and num_chunked_ctx_requests > 0:
                         # The generation requests with draft_tokens are treated as chunked context requests when extend_ctx returns True.
@@ -1620,8 +1689,14 @@ class PyTorchModelEngine(ModelEngine):
                     'attn_metadata'].num_chunked_ctx_requests
                 previous_batch_tokens = inputs['input_ids'].shape[
                     0] - num_ctx_tokens
-                inputs['position_ids'][0, num_ctx_tokens:] -= (
-                    self.previous_pos_id_offsets_cuda[:previous_batch_tokens])
+                if inputs['position_ids'].ndim == 3:  # mrope: [3, 1, N]
+                    inputs['position_ids'][:, :, num_ctx_tokens:] -= (
+                        self.
+                        previous_pos_id_offsets_cuda[:previous_batch_tokens])
+                else:
+                    inputs['position_ids'][0, num_ctx_tokens:] -= (
+                        self.
+                        previous_pos_id_offsets_cuda[:previous_batch_tokens])
                 # Only TrtllmAttentionMetadata has kv_lens_cuda.
                 if isinstance(inputs['attn_metadata'], TrtllmAttentionMetadata):
                     if num_ctx_requests >= num_chunked_ctx_requests and num_chunked_ctx_requests > 0:
@@ -2565,7 +2640,7 @@ class PyTorchModelEngine(ModelEngine):
         _n_gen = len(generation_requests)
         if _n_gen > 0:
             # All generation requests have the same beam width
-            beam_width = generation_requests[0].sampling_config.beam_width
+            beam_width = generation_requests[0].py_beam_width
 
             # Pre-extend constant-value lists to avoid per-request append
             # overhead (saves ~3 append calls per request).
@@ -2911,9 +2986,8 @@ class PyTorchModelEngine(ModelEngine):
                     )
                 if segment.shape[0] != 3 and segment.shape[-1] == 3:
                     logger.warning(
-                        "Transposing unexpected mrope_position_ids shape from %s",
-                        tuple(segment.shape),
-                    )
+                        "Transposing unexpected mrope_position_ids shape from "
+                        f"{tuple(segment.shape)}")
                     segment = segment.transpose(0, 2).contiguous()
                 if segment.shape[:2] != (3, 1):
                     raise RuntimeError(
@@ -3829,9 +3903,10 @@ class PyTorchModelEngine(ModelEngine):
             # to spec_metadata so downstream code (eagle3, interface, trtllm) can read it.
             spec_metadata.runtime_draft_len = self.runtime_draft_len
 
-            # PARD/DFlash have 2K tokens per gen request, not K+1.  Pass 2K-1
-            # so generation_lengths = 2K and the XQA kernel computes
-            # the correct past_kv_len.
+            # Parallel-draft modes advertise a per-gen-step width via
+            # tokens_per_gen_step (PARD: 2K, DFlash: K+1).  Pass
+            # (tokens_per_gen_step - 1) so generation_lengths = tokens_per_gen_step
+            # and the XQA kernel computes the correct past_kv_len.
             if spec_metadata.spec_dec_mode.is_parallel_draft():
                 sd_max_draft_len = self.original_max_total_draft_tokens
                 sd_max_total = self.original_max_total_draft_tokens
