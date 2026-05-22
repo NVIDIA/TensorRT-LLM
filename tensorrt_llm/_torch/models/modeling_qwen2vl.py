@@ -1040,13 +1040,11 @@ class Qwen2_5_VisionModel(torch.nn.Module):
         window_index = torch.cat(window_indices).to(device=self.device,
                                                     non_blocking=True)
 
-        # Scatter sort: window_index maps original token order -> window order.
-        reverse_indices = torch.empty_like(window_index)
-        reverse_indices[window_index] = torch.arange(
-            window_index.numel(),
-            device=self.device,
-            dtype=window_index.dtype,
-        )
+        # window_index is a permutation: it maps original token order ->
+        # window order. Its inverse permutation is exactly argsort(window_index),
+        # which torch implements as a fused gpu sort rather than the
+        # alloc + scatter pair the previous code used.
+        reverse_indices = torch.argsort(window_index)
 
         rope_position_ids = rope_position_ids.to(device=self.device,
                                                  dtype=torch.int32,

@@ -852,3 +852,36 @@ def test_freq_table_lru_cache_hit():
     assert a is b
     info = vm._freq_table.cache_info()
     assert info.hits >= 1 and info.misses >= 1
+
+
+# ---------------------------------------------------------------------------
+# argsort(window_index) equivalence with the prior scatter-assign inverse.
+#
+# Qwen2.5-VL's vision tower swaps
+#   reverse_indices = torch.empty_like(window_index)
+#   reverse_indices[window_index] = torch.arange(N, device=..., dtype=...)
+# for
+#   reverse_indices = torch.argsort(window_index)
+# The two are mathematically the inverse permutation; argsort is one
+# fused op vs the prior alloc + scatter pair.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("n", [16, 256, 1024])
+def test_argsort_matches_scatter_inverse(n):
+    """argsort(perm) must equal the scatter-assign inverse permutation."""
+    torch.manual_seed(n)
+    window_index = torch.randperm(n, device="cuda", dtype=torch.long)
+
+    # Old scatter-assign path.
+    old = torch.empty_like(window_index)
+    old[window_index] = torch.arange(n, device="cuda", dtype=window_index.dtype)
+    # New argsort path.
+    new = torch.argsort(window_index)
+
+    torch.testing.assert_close(new, old, atol=0, rtol=0)
+    # Functional check: applying `new` to `window_index` is identity.
+    identity = window_index[new]
+    torch.testing.assert_close(
+        identity, torch.arange(n, device="cuda", dtype=window_index.dtype), atol=0, rtol=0
+    )

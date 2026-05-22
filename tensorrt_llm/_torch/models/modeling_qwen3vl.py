@@ -1020,6 +1020,12 @@ class Qwen3VisionModel(torch.nn.Module):
                 for _ in range(len(self.deepstack_visual_indexes))
             ]
         )
+        # O(1) lookup table: layer_idx -> merger position. Avoids the
+        # per-layer ``deepstack_visual_indexes.index(layer_num)`` linear
+        # scan in `forward`. (Not a parameter; just a Python dict.)
+        self._deepstack_layer_to_merger_idx = {
+            layer_idx: i for i, layer_idx in enumerate(self.deepstack_visual_indexes)
+        }
         self.metadata_cls = get_attention_backend(self.model_config.attn_backend).Metadata
 
         self.attn_metadata = self.metadata_cls(
@@ -1185,10 +1191,9 @@ class Qwen3VisionModel(torch.nn.Module):
                 attn_metadata=attn_metadata,
                 position_embeddings=position_embeddings,
             )
-            if layer_num in self.deepstack_visual_indexes:
-                deepstack_feature = self.deepstack_merger_list[
-                    self.deepstack_visual_indexes.index(layer_num)
-                ](hidden_states)
+            merger_idx = self._deepstack_layer_to_merger_idx.get(layer_num)
+            if merger_idx is not None:
+                deepstack_feature = self.deepstack_merger_list[merger_idx](hidden_states)
                 deepstack_feature_lists.append(deepstack_feature)
         hidden_states = self.merger(hidden_states)
 
