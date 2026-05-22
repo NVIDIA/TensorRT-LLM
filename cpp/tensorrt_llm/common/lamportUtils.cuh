@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2025-2026, NVIDIA CORPORATION. All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -36,6 +36,8 @@ namespace common
 {
 
 constexpr uint16_t kNEGZERO_FP16 = 0x8000U;
+constexpr uint32_t kNEGZERO_FP32 = 0x80000000U;
+constexpr uint32_t kWARP_SIZE = 32U;
 
 template <typename T>
 union Fp16BitCast
@@ -83,7 +85,7 @@ static inline __device__ bool isNegZero(T val)
 
     if constexpr (std::is_same_v<T, float>)
     {
-        return val == 0.F && signbit(val);
+        return __float_as_uint(val) == kNEGZERO_FP32;
     }
     else if constexpr (std::is_same_v<T, __nv_bfloat16> || std::is_same_v<T, __nv_half>)
     {
@@ -121,6 +123,49 @@ constexpr __device__ __host__ PackedType getPackedLamportInit()
     return initValue.mPacked;
 }
 
+template <typename PackedType>
+union VolatilePackedLoad
+{
+    PackedType packed;
+    uint32_t words[sizeof(PackedType) / sizeof(uint32_t)];
+};
+
+template <typename PackedType>
+inline __device__ VolatilePackedLoad<PackedType> loadPackedVolatile(void const* ptr)
+{
+    static_assert(sizeof(PackedType) == 0, "loadPackedVolatile not specialized for this type");
+    return {};
+}
+
+template <>
+inline __device__ VolatilePackedLoad<float4> loadPackedVolatile<float4>(void const* ptr)
+{
+    VolatilePackedLoad<float4> returnValue;
+    asm volatile(
+        "ld.volatile.global.v4.u32 {%0, %1, %2, %3}, [%4];\n"
+        : "=r"(returnValue.words[0]), "=r"(returnValue.words[1]), "=r"(returnValue.words[2]), "=r"(returnValue.words[3])
+        : "l"(ptr)
+        : "memory");
+    return returnValue;
+}
+
+template <>
+inline __device__ VolatilePackedLoad<float2> loadPackedVolatile<float2>(void const* ptr)
+{
+    VolatilePackedLoad<float2> returnValue;
+    asm volatile("ld.volatile.global.v2.u32 {%0, %1}, [%2];\n"
+                 : "=r"(returnValue.words[0]), "=r"(returnValue.words[1])
+                 : "l"(ptr)
+                 : "memory");
+    return returnValue;
+}
+
+template <typename PackedType>
+inline __device__ bool isLamportDirty(VolatilePackedLoad<PackedType> const& value)
+{
+    return value.words[0] == kNEGZERO_FP32;
+}
+
 // A helper class to get the correct base pointer for a given layout
 struct LamportBufferLayout
 {
@@ -154,8 +199,8 @@ struct LamportBufferLayout
 namespace cg = cooperative_groups;
 
 // PackedType is the one used in kernel for Lamport buffer (LDG.128 or LDG.64)
-template <typename PackedType = float4>
-__device__ struct __attribute__((aligned(32))) LamportFlags
+template <typename PackedType = float4, bool UseCGA = false>
+struct __attribute__((aligned(32))) LamportFlags
 {
 public:
     __device__ explicit LamportFlags(uint32_t* bufferFlags, uint32_t numStages = 1)
@@ -206,17 +251,91 @@ public:
 
     __device__ void ctaArrive()
     {
-        int tid{0};
+        if constexpr (UseCGA)
+        {
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-
-        cg::cluster_group cluster = cg::this_cluster();
-        // We update the atomic counter per cluster
-        tid = cluster.thread_rank();
-        cluster.sync();
+            cg::cluster_group cluster = cg::this_cluster();
+            // We update the atomic counter per cluster.
+            int tid = cluster.thread_rank();
+            cluster.sync();
+            arriveCounter(tid);
 #else
-        tid = threadIdx.x;
-        __syncthreads();
+            __syncthreads();
+            arriveCounter(threadIdx.x);
 #endif
+        }
+        else
+        {
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 700))
+            uint32_t const barrierThreads
+                = ((static_cast<uint32_t>(blockDim.x) + kWARP_SIZE - 1U) / kWARP_SIZE) * kWARP_SIZE;
+            if (threadIdx.x < kWARP_SIZE)
+            {
+                asm volatile("barrier.cta.sync 1, %0;" ::"r"(barrierThreads) : "memory");
+                arriveCounter(threadIdx.x);
+            }
+            else
+            {
+                asm volatile("barrier.cta.arrive 1, %0;" ::"r"(barrierThreads) : "memory");
+            }
+#else
+            __syncthreads();
+            arriveCounter(threadIdx.x);
+#endif
+        }
+    }
+
+    __device__ void waitAndUpdate(uint4 bytesToClearPerStage)
+    {
+        bool isLastCtaT0{false};
+        int targetCount{0};
+        if constexpr (UseCGA)
+        {
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+            cg::grid_group grid = cg::this_grid();
+            // Use the first thread instead of the last thread as the last thread may exit early.
+            isLastCtaT0 = grid.thread_rank() == 0;
+            targetCount = grid.num_clusters();
+#else
+            isLastCtaT0 = threadIdx.x == 0 && blockIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0;
+            targetCount = gridDim.x * gridDim.y * gridDim.z;
+#endif
+        }
+        else
+        {
+            isLastCtaT0 = threadIdx.x == 0 && blockIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0;
+            targetCount = gridDim.x * gridDim.y * gridDim.z;
+        }
+        if (isLastCtaT0)
+        {
+            uint4* flagPtr = reinterpret_cast<uint4*>(mBufferFlagsPtr);
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 700))
+            uint32_t arrivedCount;
+            do
+            {
+                asm volatile("ld.acquire.gpu.global.u32 %0, [%1];"
+                             : "=r"(arrivedCount)
+                             : "l"(mFlagAccessPtr)
+                             : "memory");
+            } while (arrivedCount < static_cast<uint32_t>(targetCount));
+#else
+            while (*reinterpret_cast<uint32_t volatile*>(mFlagAccessPtr) < static_cast<uint32_t>(targetCount))
+            {
+            }
+#endif
+            // 'Current' becomes 'Dirty'
+            flagPtr[0] = {(mCurrentIndex + 1) % 3, // Current index
+                mCurrentIndex,                     // Dirty index
+                mCurBufferLayout.bytesPerBuffer,   // Buffer size
+                mCurBufferLayout.numStages};       // Dirty - Number of stages
+            flagPtr[1] = bytesToClearPerStage;
+            *mFlagAccessPtr = 0;
+        }
+    }
+
+private:
+    __device__ void arriveCounter(int tid)
+    {
         if (tid == 0)
         {
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000))
@@ -229,36 +348,6 @@ public:
         }
     }
 
-    __device__ void waitAndUpdate(uint4 bytesToClearPerStage)
-    {
-        bool isLastCtaT0{false};
-        int targetCount{0};
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-        cg::grid_group grid = cg::this_grid();
-        // Use the first thread instead of the last thread as the last thread may exit early
-        isLastCtaT0 = grid.thread_rank() == 0;
-        targetCount = grid.num_clusters();
-#else
-        isLastCtaT0 = threadIdx.x == 0 && blockIdx.x == 0 && blockIdx.y == 0;
-        targetCount = gridDim.x * gridDim.y;
-#endif
-        if (isLastCtaT0)
-        {
-            uint4* flagPtr = reinterpret_cast<uint4*>(mBufferFlagsPtr);
-            while (*reinterpret_cast<uint32_t volatile*>(mFlagAccessPtr) < targetCount)
-            {
-            }
-            // 'Current' becomes 'Dirty'
-            flagPtr[0] = {(mCurrentIndex + 1) % 3, // Current index
-                mCurrentIndex,                     // Dirty index
-                mCurBufferLayout.bytesPerBuffer,   // Buffer size
-                mCurBufferLayout.numStages};       // Dirty - Number of stages
-            flagPtr[1] = bytesToClearPerStage;
-            *mFlagAccessPtr = 0;
-        }
-    }
-
-private:
     uint32_t* mBufferFlagsPtr;
     uint32_t* mFlagAccessPtr;
 

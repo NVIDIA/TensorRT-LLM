@@ -523,7 +523,9 @@ class MNNVLAllReduce(nn.Module):
     """A specialized AllReduce implementation for Multi-Node NVLink communication.
 
     This class handles the MNNVL-specific allreduce operations, which can be more efficient
-    for certain operations when using NVLink for multi-node communication.
+    for certain operations when using NVLink for multi-node communication. The oneshot kernel
+    uses a cyclic remote-rank reduction order by default; set
+    ``FORCE_ALL_REDUCE_DETERMINISTIC=1`` to use stable rank-order reduction.
     """
     allreduce_mnnvl_workspaces: Dict[Mapping, Dict] = {}
 
