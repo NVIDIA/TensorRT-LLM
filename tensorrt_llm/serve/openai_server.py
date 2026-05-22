@@ -1051,6 +1051,12 @@ class OpenAIServer:
                 gather_generation_logits,
                 reasoning_parser=self.generator.args.reasoning_parser,
                 backend=self.generator.args.backend)
+            # Mirror the /v1/completions gate at line ~1386 so the
+            # /perf_metrics deque is populated for chat requests too.
+            # Without this, server-level `return_perf_metrics: true` is
+            # ignored on this path and /perf_metrics returns [].
+            if len(os.getenv("TRTLLM_KVCACHE_TIME_OUTPUT_PATH", "")) > 0:
+                sampling_params.return_perf_metrics = True
             if self.tool_parser and request.tools:
                 tool_parser_cls = ToolParserFactory.parsers.get(
                     self.tool_parser.lower())
@@ -1466,16 +1472,35 @@ class OpenAIServer:
 
         async def create_streaming_generator(promise: RequestOutput,
                                              postproc_params: PostprocParams):
-            async for res in promise:
+            try:
                 if not self.postproc_worker_enabled:
                     post_processor, args = postproc_params.post_processor, postproc_params.postproc_args
-                    pp_results = post_processor(res, args)
-                else:
-                    pp_results = res.outputs[0]._postprocess_result
+                # Stamp server_first_token_time on the first response and call
+                # _extract_metrics after [DONE], mirroring chat_stream_generator
+                # in `openai_chat`. Without this, the /perf_metrics deque is
+                # never populated for harmony chat requests because the metrics
+                # entry is only appended inside _extract_metrics.
+                first_response = await anext(promise)
+                raw_request.state.server_first_token_time = (
+                    get_steady_clock_now_in_seconds())
+                pp_results = (
+                    first_response.outputs[0]._postprocess_result
+                    if self.postproc_worker_enabled else post_processor(
+                        first_response, args))
                 for pp_res in pp_results:
                     yield pp_res
-
-            yield "data: [DONE]\n\n"
+                res = first_response
+                async for res in promise:
+                    pp_results = (res.outputs[0]._postprocess_result
+                                  if self.postproc_worker_enabled else
+                                  post_processor(res, args))
+                    for pp_res in pp_results:
+                        yield pp_res
+                yield "data: [DONE]\n\n"
+                await self._extract_metrics(res, raw_request)
+            except:
+                logger.error(traceback.format_exc())
+                raise
 
         try:
             # Initialize HarmonyAdapter
@@ -1527,6 +1552,12 @@ class OpenAIServer:
                 vocab_size=self.tokenizer.tokenizer.vocab_size,
                 reasoning_parser="gpt_oss")
             sampling_params.detokenize = False  # Harmony adapter handles detokenization
+            # Mirror the /v1/completions gate at line ~1386 so the
+            # /perf_metrics deque is populated for chat (harmony) requests
+            # too. Without this, server-level `return_perf_metrics: true`
+            # is ignored on this path and /perf_metrics returns [].
+            if len(os.getenv("TRTLLM_KVCACHE_TIME_OUTPUT_PATH", "")) > 0:
+                sampling_params.return_perf_metrics = True
             disaggregated_params = to_llm_disaggregated_params(
                 request.disaggregated_params)
             trace_headers = (None if raw_request is None else
