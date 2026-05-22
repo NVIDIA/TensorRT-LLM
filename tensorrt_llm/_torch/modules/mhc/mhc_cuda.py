@@ -602,6 +602,33 @@ _FUSED_HC_ALL_FMA_TN_KS_TM = tuple(
 _FUSED_HC_BIGFUSE_BS = _BIGFUSE_BLOCK_SIZE_OPTIONS
 
 
+def _fused_hc_mma_ks_options(hidden_size: int) -> tuple[int, ...]:
+    return tuple(ks for ks in _FUSED_HC_HALF_MMA_KS if _fused_hc_mma_ks_supported(hidden_size, ks))
+
+
+def _fused_hc_target_mma_ks(hidden_size: int, M: int) -> int | None:
+    """Pick the measured splitK ridge for the MMA fused_hc paths."""
+    valid = _fused_hc_mma_ks_options(hidden_size)
+    if not valid:
+        return None
+    m_tiles = max(1, (M + 63) // 64)
+    target = max(1, 128 // m_tiles)
+    candidates = tuple(ks for ks in valid if ks <= target)
+    return candidates[-1] if candidates else valid[0]
+
+
+def _fused_hc_mma_bigfuse_bs_options(M: int) -> tuple[int, ...]:
+    # Historical sweeps: 512 wins through M=256, 256 wins at 512/2048/4096,
+    # and M=1024 is split between 128 and 512 depending on hidden/mode.
+    if M < 512:
+        return (512,)
+    if M == 1024:
+        return (128, 512)
+    if M >= 8192:
+        return (128, 256)
+    return (256,)
+
+
 def _fused_hc_call(
     backend_code: int,
     tile_n: int,
@@ -847,52 +874,51 @@ class MhcFusedHcRunner(TunableRunner):
     def get_valid_tactics(self, inputs, profile: OptimizationProfile, **kwargs):
         M = inputs[0].shape[0]
         tactics = []
-        # All four backends support the fused next-layer RMSNorm now (Path B/E
-        # in bigfuse, Path D/F in the all-in-one epilogue), so the autotuner
-        # explores the full tactic space regardless of norm_weight.
+        seen = set()
+
+        def add(tactic):
+            if tactic not in seen:
+                seen.add(tactic)
+                tactics.append(tactic)
+
+        # FMA variants only win at very small M. For M > 32, keep autotuning
+        # to MMA-only choices and avoid spending time on FMA tactics that do
+        # not win in the measured H=4096/7168 sweeps.
         # The MMA (tcgen05) paths require SM100+. On older archs only the FMA
-        # paths are compilable/runnable — we simply never emit MMA tactics.
-        mma_ks = tuple(
-            ks for ks in _FUSED_HC_HALF_MMA_KS if _fused_hc_mma_ks_supported(self.hidden_size, ks)
-        )
+        # paths are compilable/runnable, so we simply never emit MMA tactics.
+        mma_ks = _fused_hc_mma_ks_options(self.hidden_size)
         mma_ok = _fused_hc_mma_supported() and bool(mma_ks)
-        # Path F (fused_all_fma, 1-kernel FMA) — preferred at small M (<=32)
-        # where MMA can't fill BLOCK_M=64. Include for M <= 64 as the
-        # crossover is measured per-M.
-        if M <= 64:
+
+        if M <= 32:
             for tn, ks, tm in _FUSED_HC_ALL_FMA_TN_KS_TM:
                 # Skip grids that wildly oversubscribe SMs.
                 m_batches = (M + tm - 1) // tm
                 if m_batches * (self.n * (2 + self.n) // tn) * ks > 148 * 4:
                     continue
-                # fused_all_fma runs bigfuse inline — no bigfuse_bs tactic axis.
-                tactics.append(("fused_all_fma", tn, ks, 0, tm))
-        # Path D (fused_all_mma, 1-kernel TF32 MMA) — preferred at mid/large
-        # M (>=64). Include when M >= 48 to overlap with Path F at the
-        # crossover boundary.
-        if mma_ok and M >= 48:
-            for ks in mma_ks:
-                m_tiles = (M + 63) // 64
-                if m_tiles * ks > 148 * 4:
-                    continue
-                tactics.append(("fused_all_mma", 0, ks, 0, 1))
-        # Half-fused FMA path (2-kernel) — useful at smallish M; kept as a
-        # fallback option for the autotuner at small M.
-        if M <= 512:
+                add(("fused_all_fma", tn, ks, 0, tm))
             for tn, ks in _FUSED_HC_HALF_FMA_TN_KS:
                 if ks > 1 and M * (self.n * (2 + self.n) // tn) >= 148 * 2:
                     continue
                 for bs in _FUSED_HC_BIGFUSE_BS:
-                    tactics.append(("fused_half_fma", tn, ks, bs, 1))
-        # Half-fused MMA path (2-kernel) — always an option when tcgen05 is
-        # available.
-        if mma_ok:
-            for ks in mma_ks:
+                    add(("fused_half_fma", tn, ks, bs, 1))
+
+        if mma_ok and M >= 32:
+            ks = _fused_hc_target_mma_ks(self.hidden_size, M)
+            if ks is not None:
                 m_tiles = (M + 63) // 64
-                if m_tiles * ks > 148 * 4:
-                    continue
-                for bs in _FUSED_HC_BIGFUSE_BS:
-                    tactics.append(("fused_half_mma", 0, ks, bs, 1))
+                if m_tiles * ks <= 148 * 4:
+                    for bs in _fused_hc_mma_bigfuse_bs_options(M):
+                        add(("fused_half_mma", 0, ks, bs, 1))
+                    if M >= 64:
+                        add(("fused_all_mma", 0, ks, 0, 1))
+
+        if not mma_ok and M > 32:
+            # Pre-SM100 fallback: keep one supported half-FMA ladder.
+            bs = 512 if M < 512 else 256
+            for tn, ks in _FUSED_HC_HALF_FMA_TN_KS:
+                if ks == 1:
+                    add(("fused_half_fma", tn, ks, bs, 1))
+
         return tactics
 
     def forward(self, inputs, *, tactic=-1, **kwargs):
