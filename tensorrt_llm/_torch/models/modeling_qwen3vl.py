@@ -1181,9 +1181,11 @@ class Qwen3VisionModel(torch.nn.Module):
         grid_rows = grid_thw.tolist()
         # ``rot_pos_emb`` returns (cos, sin) gathered from the pre-computed
         # cos/sin buffers -- no ``.cos()``/``.sin()`` kernels in forward.
-        # Each half has shape (total_tokens, 2*freq_dim); ``.repeat(1, 2)``
-        # below expands to head_dim so the per-token layout matches the
-        # prior ``freqs.flatten(1).repeat(1, 2).cos()`` chain bit-for-bit.
+        # Each half has shape (total_tokens, 2*freq_dim) = (total_tokens,
+        # rotary_dim), which is what ``Qwen2_5_VLVisionAttention.apply_rope``
+        # / ``RotaryEmbedding.apply_rotary_pos_emb`` expects (it computes
+        # ``rot_dim = cos.shape[-1] * 2 = head_dim`` and chunks q/k into
+        # halves of size ``cos.shape[-1]``).
         cos, sin = self.rot_pos_emb(grid_rows)
         pos_embeds = self.fast_pos_embed_interpolate(grid_rows)
 
@@ -1191,12 +1193,22 @@ class Qwen3VisionModel(torch.nn.Module):
         hidden_states += pos_embeds
         hidden_states = hidden_states.flatten(1)
 
-        position_embeddings = (cos.repeat(1, 2), sin.repeat(1, 2))
+        # Vision RoPE backend (FlashInfer path) gates on ``position_ids is
+        # not None``; supply trivial 0..seq_len-1 positions on device so
+        # the gate clears when ``head_dim % 64 == 0``. For Qwen3-VL
+        # (head_dim=72) the gate misses and we fall through to the
+        # PyTorch path, which broadcasts cos/sin over the chunked q/k.
+        seq_len = hidden_states.shape[0]
+        rope_position_ids = torch.arange(seq_len, dtype=torch.int32, pin_memory=prefer_pinned()).to(
+            device=self.device, non_blocking=True
+        )
+        position_embeddings = (cos, sin)
 
         deepstack_feature_lists = []
         for layer_num, block in enumerate(self.blocks):
             hidden_states = block(
                 hidden_states,
+                position_ids=rope_position_ids,
                 attn_metadata=attn_metadata,
                 position_embeddings=position_embeddings,
             )

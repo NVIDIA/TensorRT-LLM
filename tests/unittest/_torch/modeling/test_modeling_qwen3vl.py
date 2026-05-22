@@ -979,3 +979,104 @@ def test_argsort_matches_scatter_inverse(n):
     torch.testing.assert_close(
         identity, torch.arange(n, device="cuda", dtype=window_index.dtype), atol=0, rtol=0
     )
+
+
+# ---------------------------------------------------------------------------
+# End-to-end Qwen3VLVisionBlock forward path.
+#
+# The pre-EXAONE-4.5 ``apply_rotary_pos_emb_vision`` (HF) accepted
+# ``cos / sin`` of shape ``(seq, head_dim)``; the post-EXAONE-4.5
+# ``RotaryEmbedding.apply_rotary_pos_emb`` (TRT-LLM) expects
+# ``(seq, head_dim // 2)`` and broadcasts. This test pushes one block
+# through with the post-EXAONE shape so any future regression (e.g.
+# re-introducing a stray ``.repeat(1, 2)`` on cos/sin) surfaces here
+# rather than only at full-model CI.
+# ---------------------------------------------------------------------------
+
+
+def test_qwen3vl_vision_block_forward_end_to_end():
+    """One ``Qwen3VLVisionBlock.forward`` call with random weights and the
+    correct (post-EXAONE) ``cos/sin`` shape must not raise a broadcasting
+    error in ``apply_rope``."""
+    from transformers import Qwen3VLConfig
+
+    from tensorrt_llm._torch.attention_backend.utils import get_attention_backend
+    from tensorrt_llm._torch.model_config import ModelConfig
+    from tensorrt_llm._torch.models.modeling_qwen3vl import Qwen3VLVisionBlock
+
+    hf_config = Qwen3VLConfig(
+        text_config={
+            "hidden_size": 256,
+            "num_attention_heads": 4,
+            "num_hidden_layers": 1,
+            "intermediate_size": 256,
+            "head_dim": 64,
+            "rope_scaling": {
+                "mrope_section": [8, 8, 8],
+                "mrope_interleaved": True,
+                "rope_type": "default",
+            },
+            "max_position_embeddings": 1024,
+            "rms_norm_eps": 1e-6,
+            "num_key_value_heads": 4,
+            "vocab_size": 1024,
+            "dtype": "bfloat16",
+            "rope_theta": 10000.0,
+            "tie_word_embeddings": False,
+            "model_type": "qwen3_vl_text",
+        },
+        vision_config={
+            "hidden_size": 1152,
+            "num_heads": 16,  # head_dim = 72
+            "depth": 1,
+            "intermediate_size": 4304,
+            "patch_size": 16,
+            "spatial_merge_size": 2,
+            "temporal_patch_size": 2,
+            "in_channels": 3,
+            "num_position_embeddings": 2304,
+            "out_hidden_size": 256,
+            "deepstack_visual_indexes": [],
+            "hidden_act": "gelu_pytorch_tanh",
+            "model_type": "qwen3_vl",
+            "initializer_range": 0.02,
+        },
+        architectures=["Qwen3VLForConditionalGeneration"],
+        image_token_id=151655,
+        video_token_id=151656,
+        vision_start_token_id=151652,
+        vision_end_token_id=151653,
+    )
+
+    mc = ModelConfig(pretrained_config=hf_config, attn_backend="TRTLLM")
+    block = Qwen3VLVisionBlock(mc, layer_idx=0).to("cuda", dtype=torch.bfloat16)
+
+    seq_len = 256
+    head_dim = 72
+    freq_dim = head_dim // 2  # 36 -- the (post-EXAONE) cos/sin last-dim
+
+    hidden = torch.randn(seq_len, 1152, device="cuda", dtype=torch.bfloat16)
+    cos = torch.randn(seq_len, freq_dim, device="cuda", dtype=torch.float32)
+    sin = torch.randn(seq_len, freq_dim, device="cuda", dtype=torch.float32)
+    position_ids = torch.arange(seq_len, dtype=torch.int32, device="cuda")
+
+    metadata_cls = get_attention_backend("TRTLLM").Metadata
+    attn_metadata = metadata_cls(
+        max_num_requests=64,
+        max_num_tokens=seq_len,
+        kv_cache_manager=None,
+    )
+    attn_metadata.num_contexts = 1
+    attn_metadata.request_ids = [1]
+    attn_metadata.prompt_lens = [seq_len]
+    attn_metadata.seq_lens = torch.tensor([seq_len], dtype=torch.int)
+    attn_metadata.max_seq_len = seq_len
+    attn_metadata.prepare()
+
+    out = block(
+        hidden,
+        position_ids=position_ids,
+        position_embeddings=(cos, sin),
+        attn_metadata=attn_metadata,
+    )
+    assert out.shape == hidden.shape
