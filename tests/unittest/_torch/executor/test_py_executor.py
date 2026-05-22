@@ -275,6 +275,7 @@ def _make_gen_request(num_draft_tokens: int = 0) -> Mock:
     req = Mock()
     req.num_draft_tokens = num_draft_tokens
     req.py_draft_tokens = None
+    req.is_disagg_generation_transmission_complete = False
     return req
 
 
