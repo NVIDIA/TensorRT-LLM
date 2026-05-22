@@ -66,6 +66,8 @@ _RESERVED_MM_DATA_KEYS = frozenset(
     {
         "layout_metadata",
         "mm_bidirectional_blocks",
+        "multimodal_embedding",
+        "multimodal_embedding_lengths",
         "special_token_offsets",
         "multimodal_embed_mask_cumsum",
     }
@@ -82,6 +84,15 @@ def _append_mm_extra_args(
 
 
 def _metadata_to_list(value: Any) -> List[int]:
+    """Normalize request-side MM metadata before AutoDeploy flattens it.
+
+    The processor handoff produces Python lists, but request-side
+    py_multimodal_data can already contain tensorized metadata by the time
+    AutoDeploy stages chunked prefill. Keep this narrow until the E/P/D handoff
+    uses one representation everywhere.
+    """
+    # TODO(TRTLLM-12419): Remove this once MM layout metadata is never a mix of
+    # processor-side lists and request-side tensors.
     if value is None:
         return []
     if torch.is_tensor(value):
