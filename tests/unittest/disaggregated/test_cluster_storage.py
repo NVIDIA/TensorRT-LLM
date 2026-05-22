@@ -43,7 +43,9 @@ class Server(uvicorn.Server):
 timeout = pytest.mark.timeout
 
 
-@pytest.mark.parametrize("host", ["localhost", "127.0.0.1", "::1"])
+@pytest.mark.parametrize("host",
+                         ["localhost", "LOCALHOST", "LocalHost", "127.0.0.1",
+                          "::1"])
 def test_is_loopback_host_accepts_loopback_hosts(host):
     assert is_loopback_host(host)
 

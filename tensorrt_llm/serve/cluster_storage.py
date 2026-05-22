@@ -20,10 +20,12 @@ from tensorrt_llm.logger import logger
 
 
 def is_loopback_host(host: Optional[str]) -> bool:
-    if host == "localhost":
+    if not isinstance(host, str) or not host:
+        return False
+    if host.lower() == "localhost":
         return True
     try:
-        return bool(host) and ipaddress.ip_address(host).is_loopback
+        return ipaddress.ip_address(host).is_loopback
     except ValueError:
         return False
 
