@@ -340,6 +340,7 @@ void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(nb::module_& m)
         .def_rw("rnn_n_groups", &tbk::LinearAttentionMetadata::rnnNGroups)
         .def_rw("rnn_conv_section_layout", &tbk::LinearAttentionMetadata::rnnConvSectionLayout)
         .def_rw("rnn_ssm_bytes", &tbk::LinearAttentionMetadata::rnnSsmBytes)
+        .def_rw("rnn_ssm_dtype_size", &tbk::LinearAttentionMetadata::rnnSsmDtypeSize)
         .def_rw("rnn_conv_dtype_size", &tbk::LinearAttentionMetadata::rnnConvDtypeSize);
 
     nb::enum_<tbk::LinearAttentionMetadata::LinearCacheType>(m, "LinearCacheType")

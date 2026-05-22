@@ -141,6 +141,7 @@ struct LinearAttentionMetadata
     SizeType32 rnnNGroups{0};           // Number of groups (Mamba2)
     SizeType32 rnnConvSectionLayout{0}; // 0=NONE, 1=NEMOTRON, 2=QWEN3_NEXT
     SizeType32 rnnSsmBytes{0};      // SSM state bytes per layer (local, = numHeadsLocal * headDim * dState * dtypeSize)
+    SizeType32 rnnSsmDtypeSize{0};  // SSM state dtype size in bytes (e.g., 2 for fp16, 4 for fp32)
     SizeType32 rnnConvDtypeSize{0}; // Conv state dtype size in bytes (e.g., 2 for bf16, 1 for fp8)
 
     [[nodiscard]] bool shouldAllocateRecurrentStates(

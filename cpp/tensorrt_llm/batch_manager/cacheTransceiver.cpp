@@ -237,22 +237,25 @@ CacheTransceiver::CacheTransceiver(kv_cache_manager::BaseKVCacheManager* cacheMa
             }
         }
 
-        // SSM dtype = pool dtype (pool is allocated with ssm_state_dtype).
-        // Conv dtype may differ from pool dtype (e.g., model uses bf16 conv with fp16 ssm).
+        // Derive actual SSM and conv dtypes from metadata byte sizes.
+        // Pool dtype may be UINT8 (raw bytes), so we cannot use rnnPoolDtype directly.
         // Only the byte size matters for split/concat kernel stride calculations — the actual
         // dtype enum is not interpreted numerically, just used for getDTypeSize() dispatch.
-        nvinfer1::DataType convDtype = rnnPoolDtype; // fallback: same as pool
-        if (linearMeta->rnnConvDtypeSize > 0)
+        auto dtypeFromSize = [](SizeType32 size) -> nvinfer1::DataType
         {
-            switch (linearMeta->rnnConvDtypeSize)
+            switch (size)
             {
-            case 4: convDtype = nvinfer1::DataType::kFLOAT; break;
-            case 2: convDtype = nvinfer1::DataType::kBF16; break;
-            case 1: convDtype = nvinfer1::DataType::kFP8; break;
-            default: convDtype = rnnPoolDtype; break;
+            case 4: return nvinfer1::DataType::kFLOAT;
+            case 2: return nvinfer1::DataType::kBF16;
+            case 1: return nvinfer1::DataType::kFP8;
+            default: TLLM_THROW("Unsupported RNN state dtype size: %d", size);
             }
-        }
-        mCacheState->setRnnConfig(rnnModelCfg, rnnLayerNumPerPP, convDtype, rnnPoolDtype);
+        };
+        TLLM_CHECK_WITH_INFO(linearMeta->rnnSsmDtypeSize > 0, "rnnSsmDtypeSize not set in LinearAttentionMetadata");
+        TLLM_CHECK_WITH_INFO(linearMeta->rnnConvDtypeSize > 0, "rnnConvDtypeSize not set in LinearAttentionMetadata");
+        nvinfer1::DataType ssmDtype = dtypeFromSize(linearMeta->rnnSsmDtypeSize);
+        nvinfer1::DataType convDtype = dtypeFromSize(linearMeta->rnnConvDtypeSize);
+        mCacheState->setRnnConfig(rnnModelCfg, rnnLayerNumPerPP, convDtype, ssmDtype);
 
         // Create RnnCacheTransBufferManager for unified pool path.
         mRnnCacheTransBufferManager
