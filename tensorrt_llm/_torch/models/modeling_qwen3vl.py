@@ -1,7 +1,9 @@
 import copy
 import re
+from functools import lru_cache
 from typing import Any, Dict, List, Optional, Tuple, Union
 
+import numpy as np
 import torch
 import torch.nn as nn
 import triton
@@ -842,42 +844,50 @@ class Qwen3VisionModel(torch.nn.Module):
             kv_cache_manager=None,
         )
 
-    def rot_pos_emb(self, grid_thw: torch.Tensor) -> torch.Tensor:
-        merge_size = self.spatial_merge_size
+    @property
+    def device(self) -> torch.device:
+        return self.patch_embed.proj.weight.device
 
-        max_hw = int(grid_thw[:, 1:].max().item())
+    @staticmethod
+    @lru_cache(maxsize=1024)
+    def rot_pos_ids(h: int, w: int, spatial_merge_size: int) -> torch.Tensor:
+        # Adopted from https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/models/qwen3_vl.py
+        # CPU-side numpy build; identical (h, w) hits the lru_cache, so the
+        # per-image torch.arange/expand/stack chain only runs on first sight.
+        hpos_ids = np.broadcast_to(np.arange(h).reshape(h, 1), (h, w))
+        h_div = h // spatial_merge_size
+        w_div = w // spatial_merge_size
+        hpos_ids = hpos_ids.reshape(
+            h_div,
+            spatial_merge_size,
+            w_div,
+            spatial_merge_size,
+        )
+        hpos_ids = hpos_ids.transpose(0, 2, 1, 3).flatten()
+
+        wpos_ids = np.broadcast_to(np.arange(w).reshape(1, w), (h, w))
+        wpos_ids = wpos_ids.reshape(
+            h_div,
+            spatial_merge_size,
+            w_div,
+            spatial_merge_size,
+        )
+        wpos_ids = wpos_ids.transpose(0, 2, 1, 3).flatten()
+
+        return torch.from_numpy(np.stack([hpos_ids, wpos_ids], axis=-1))
+
+    def rot_pos_emb(self, grid_thw: list[list[int]]) -> torch.Tensor:
+        max_hw = max(max(h, w) for _, h, w in grid_thw)
+        pos_ids = [
+            self.rot_pos_ids(h, w, self.spatial_merge_size)
+            if t == 1
+            else self.rot_pos_ids(h, w, self.spatial_merge_size).repeat(t, 1)
+            for t, h, w in grid_thw
+        ]
+        pos_ids = torch.cat(pos_ids, dim=0).to(self.device, non_blocking=True)
+
         freq_table = self.rotary_pos_emb(max_hw)  # (max_hw, dim // 2)
-        device = freq_table.device
-
-        total_tokens = int(torch.prod(grid_thw, dim=1).sum().item())
-        pos_ids = torch.empty((total_tokens, 2), dtype=torch.long, device=device)
-
-        offset = 0
-        for num_frames, height, width in grid_thw:
-            merged_h, merged_w = height // merge_size, width // merge_size
-
-            block_rows = torch.arange(merged_h, device=device)  # block row indices
-            block_cols = torch.arange(merged_w, device=device)  # block col indices
-            intra_row = torch.arange(merge_size, device=device)  # intra-block row offsets
-            intra_col = torch.arange(merge_size, device=device)  # intra-block col offsets
-
-            # Compute full-resolution positions
-            row_idx = block_rows[:, None, None, None] * merge_size + intra_row[None, None, :, None]
-            col_idx = block_cols[None, :, None, None] * merge_size + intra_col[None, None, None, :]
-
-            row_idx = row_idx.expand(merged_h, merged_w, merge_size, merge_size).reshape(-1)
-            col_idx = col_idx.expand(merged_h, merged_w, merge_size, merge_size).reshape(-1)
-
-            coords = torch.stack((row_idx, col_idx), dim=-1)
-
-            if num_frames > 1:
-                coords = coords.repeat(num_frames, 1)
-
-            num_tokens = coords.shape[0]
-            pos_ids[offset : offset + num_tokens] = coords
-            offset += num_tokens
-
-        embeddings = freq_table[pos_ids]  # lookup rotary embeddings
+        embeddings = freq_table[pos_ids]  # gather (total, 2, dim // 2)
         embeddings = embeddings.flatten(1)
         return embeddings
 
@@ -923,11 +933,12 @@ class Qwen3VisionModel(torch.nn.Module):
             ).tolist()
             attn_metadata = self.prepare_attn_metadata(seq_lens, self.attn_metadata)
 
-        with nvtx_range("Qwen3VisionModel forward compute rot_pos_emb"):
-            # Getting positional embedding
-            rotary_pos_emb = self.rot_pos_emb(grid_thw)
-        with nvtx_range("Qwen3VisionModel forward compute fast_pos_embed_interpolate"):
-            pos_embeds = self.fast_pos_embed_interpolate(grid_thw)
+        # Materialize the (t, h, w) grid as a plain Python list once; both
+        # rot_pos_emb and fast_pos_embed_interpolate iterate it on CPU and
+        # benefit from rot_pos_ids' lru_cache when (h, w) repeats.
+        grid_rows = grid_thw.tolist()
+        rotary_pos_emb = self.rot_pos_emb(grid_rows)
+        pos_embeds = self.fast_pos_embed_interpolate(grid_rows)
 
         hidden_states = self.patch_embed(pixel_values)
         hidden_states += pos_embeds

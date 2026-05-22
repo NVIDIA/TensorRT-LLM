@@ -14,6 +14,7 @@ from utils.llm_data import llm_models_root
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.checkpoints.hf.qwen3vl_weight_mapper import Qwen3VLHfWeightMapper
 from tensorrt_llm._torch.models.modeling_qwen3vl import (
+    Qwen3VisionModel,
     Qwen3VLInputProcessorBase,
     Qwen3VLModel,
     _triton_pos_embed_interpolate,
@@ -524,3 +525,115 @@ def test_vit_pos_embed_temporal_repeat(dtype):
 
     expected = out_single.repeat(t_multi, 1)
     torch.testing.assert_close(out_multi, expected, atol=0, rtol=0)
+
+
+# ---------------------------------------------------------------------------
+# Accuracy tests for ``Qwen3VisionModel.rot_pos_emb``'s pos_ids construction.
+# The new implementation lifts pos_ids generation to CPU (numpy + lru_cache)
+# and ships a single H->D copy at the end. Previously pos_ids were built on
+# device via a per-image torch.arange/expand/stack chain. The freq_table
+# lookup is identical in both paths, so we only verify pos_ids equality —
+# that guarantees the final ``freq_table[pos_ids]`` output matches bit-for-bit.
+# ---------------------------------------------------------------------------
+
+
+def _rot_pos_ids_gpu_reference(grid_thw: torch.Tensor, spatial_merge_size: int) -> torch.Tensor:
+    """Pre-vectorization GPU reference for pos_ids.
+
+    Mirrors the original on-device implementation: per-image torch.arange
+    + broadcast/expand/stack/repeat, written into a contiguous (total, 2)
+    buffer on the same device as ``grid_thw``.
+    """
+    device = grid_thw.device
+    total_tokens = int(torch.prod(grid_thw, dim=1).sum().item())
+    pos_ids = torch.empty((total_tokens, 2), dtype=torch.long, device=device)
+
+    offset = 0
+    for num_frames, height, width in grid_thw:
+        merged_h, merged_w = height // spatial_merge_size, width // spatial_merge_size
+
+        block_rows = torch.arange(merged_h, device=device)
+        block_cols = torch.arange(merged_w, device=device)
+        intra_row = torch.arange(spatial_merge_size, device=device)
+        intra_col = torch.arange(spatial_merge_size, device=device)
+
+        row_idx = (
+            block_rows[:, None, None, None] * spatial_merge_size + intra_row[None, None, :, None]
+        )
+        col_idx = (
+            block_cols[None, :, None, None] * spatial_merge_size + intra_col[None, None, None, :]
+        )
+
+        row_idx = row_idx.expand(
+            merged_h, merged_w, spatial_merge_size, spatial_merge_size
+        ).reshape(-1)
+        col_idx = col_idx.expand(
+            merged_h, merged_w, spatial_merge_size, spatial_merge_size
+        ).reshape(-1)
+
+        coords = torch.stack((row_idx, col_idx), dim=-1)
+        if num_frames > 1:
+            coords = coords.repeat(num_frames, 1)
+
+        num_tokens = coords.shape[0]
+        pos_ids[offset : offset + num_tokens] = coords
+        offset += num_tokens
+
+    return pos_ids
+
+
+_ROT_POS_IDS_GRIDS = [
+    # Single image, varying (h, w)
+    [(1, 4, 4)],
+    [(1, 16, 16)],
+    [(1, 32, 48)],
+    [(1, 14, 20)],
+    # Multi-frame video (t > 1)
+    [(3, 16, 16)],
+    [(5, 8, 12)],
+    # Multi-image batch (mixed sizes)
+    [(1, 16, 16), (1, 32, 32)],
+    [(1, 8, 12), (1, 14, 20), (1, 32, 32)],
+    # Mix of images and a video clip
+    [(1, 16, 16), (3, 8, 12), (1, 14, 20)],
+]
+
+
+@pytest.mark.parametrize(
+    "grid_thw_list",
+    _ROT_POS_IDS_GRIDS,
+    ids=["_".join(f"{t}x{h}x{w}" for t, h, w in cfg) for cfg in _ROT_POS_IDS_GRIDS],
+)
+def test_rot_pos_ids_matches_gpu_reference(grid_thw_list):
+    """`rot_pos_ids` + cat (new path) must produce the same pos_ids tensor
+    as the pre-vectorization on-device implementation."""
+    spatial_merge_size = _VIT_POS_EMBED_SPATIAL_MERGE_SIZE
+    device = "cuda"
+
+    grid_thw = torch.tensor(grid_thw_list, dtype=torch.long, device=device)
+    expected = _rot_pos_ids_gpu_reference(grid_thw, spatial_merge_size)
+
+    # New path: per-(h, w) CPU build (lru_cache), per-image repeat, then
+    # cat + single H->D transfer.
+    pieces = [
+        Qwen3VisionModel.rot_pos_ids(h, w, spatial_merge_size)
+        if t == 1
+        else Qwen3VisionModel.rot_pos_ids(h, w, spatial_merge_size).repeat(t, 1)
+        for t, h, w in grid_thw_list
+    ]
+    actual = torch.cat(pieces, dim=0).to(device, non_blocking=True)
+
+    assert actual.shape == expected.shape
+    assert actual.dtype == expected.dtype
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+
+
+def test_rot_pos_ids_lru_cache_hit():
+    """Repeated (h, w, spatial_merge_size) keys must hit the lru_cache and
+    return the same underlying tensor object (no recompute)."""
+    Qwen3VisionModel.rot_pos_ids.cache_clear()
+    a = Qwen3VisionModel.rot_pos_ids(16, 16, 2)
+    b = Qwen3VisionModel.rot_pos_ids(16, 16, 2)
+    assert a is b, "lru_cache should return the cached tensor object on hit"
+    info = Qwen3VisionModel.rot_pos_ids.cache_info()
+    assert info.hits >= 1 and info.misses >= 1

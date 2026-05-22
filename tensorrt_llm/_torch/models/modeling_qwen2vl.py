@@ -985,6 +985,16 @@ class Qwen2_5_VisionModel(torch.nn.Module):
         (rotary_pos_emb_cos, rotary_pos_emb_sin, window_indices,
          window_seq_lens) = self.get_rotary_pos_emb_window_data(grid_rows)
 
+        cos_sin = torch.stack(
+            [
+                torch.cat(rotary_pos_emb_cos),
+                torch.cat(rotary_pos_emb_sin),
+            ],
+            dim=0,
+        ).to(device=self.device, non_blocking=True)
+        cos, sin = cos_sin[0], cos_sin[1]
+        position_embeddings = (cos, sin)
+
         window_index = torch.cat(window_indices).to(device=self.device,
                                                     non_blocking=True)
 
@@ -995,12 +1005,6 @@ class Qwen2_5_VisionModel(torch.nn.Module):
             device=self.device,
             dtype=window_index.dtype,
         )
-
-        cos = torch.cat(rotary_pos_emb_cos).to(device=self.device,
-                                               non_blocking=True)
-        sin = torch.cat(rotary_pos_emb_sin).to(device=self.device,
-                                               non_blocking=True)
-        position_embeddings = (cos, sin)
 
         rope_position_ids = rope_position_ids.to(device=self.device,
                                                  dtype=torch.int32,
@@ -1127,32 +1131,22 @@ class Qwen2VLModelBase(PreTrainedModel):
 
     @nvtx_range("Qwen2.5-VL prepare_mrope_config")
     def prepare_mrope_config(self, multimodal_params: List[MultimodalParams],
-                             num_context_requests: int):
+                             num_context_requests: int,
+                             num_generation_requests: int,
+                             position_ids: torch.Tensor):
         mrope_config = {}
-        mrope_rotary_cos_sin = []
+        mrope_rotary_cos_sin = None
         mrope_position_deltas = []
-        for multimodal_param in multimodal_params[:num_context_requests]:
-            if multimodal_param.multimodal_data.get('mrope_config') is not None:
-                with nvtx_range("Qwen2.5-VL get_cos_sin"):
-                    if multimodal_param.multimodal_data['mrope_config'].get(
-                            'mrope_position_ids') is not None:
-                        mrope_position_ids = multimodal_param.multimodal_data[
-                            'mrope_config']['mrope_position_ids']
-
-                        self.mrope_position_ids_padding_cuda[:, :, :
-                                                             mrope_position_ids.
-                                                             shape[
-                                                                 -1]] = mrope_position_ids
-                        self.mrope_position_ids_padding_cuda[:, :,
-                                                             mrope_position_ids.
-                                                             shape[-1]:] = 0
-
-                        cos, sin = self.rotary_emb.get_cos_sin(
-                            self.mrope_position_ids_padding_cuda)
-                        concat_cos_sin = torch.stack((cos, sin), dim=-1)
-                        concat_cos_sin = concat_cos_sin.reshape(
-                            concat_cos_sin.shape[0], -1)
-                        mrope_rotary_cos_sin.append(concat_cos_sin)
+        if position_ids.shape[-1] > num_generation_requests:
+            if num_generation_requests > 0:
+                ctx_position_ids = position_ids[:, :, :-num_generation_requests]
+            else:
+                ctx_position_ids = position_ids
+            self.mrope_position_ids_padding_cuda[:, :, :ctx_position_ids.
+                                                 shape[-1]] = ctx_position_ids
+            cos, sin = self.rotary_emb.get_cos_sin(
+                self.mrope_position_ids_padding_cuda)
+            mrope_rotary_cos_sin = torch.stack((cos, sin), dim=-1).flatten(1)
 
         for multimodal_param in multimodal_params[num_context_requests:]:
             if multimodal_param.multimodal_data.get('mrope_config') is not None:
@@ -1162,14 +1156,12 @@ class Qwen2VLModelBase(PreTrainedModel):
                         multimodal_param.multimodal_data['mrope_config']
                         ['mrope_position_deltas'])
 
-        with nvtx_range("Qwen2.5-VL concat mrope_rotary_cos_sin"):
-            if mrope_rotary_cos_sin:
-                mrope_config['mrope_rotary_cos_sin'] = torch.cat(
-                    mrope_rotary_cos_sin, dim=0)
-        with nvtx_range("Qwen2.5-VL concat mrope_position_deltas"):
-            if mrope_position_deltas:
-                mrope_config['mrope_position_deltas'] = torch.cat(
-                    mrope_position_deltas, dim=0)
+        if mrope_rotary_cos_sin is not None:
+            mrope_config['mrope_rotary_cos_sin'] = mrope_rotary_cos_sin
+        if mrope_position_deltas:
+            mrope_config['mrope_position_deltas'] = (
+                mrope_position_deltas[0] if len(mrope_position_deltas) == 1 else
+                torch.cat(mrope_position_deltas, dim=0))
 
         return mrope_config
 
@@ -1186,7 +1178,8 @@ class Qwen2VLModelBase(PreTrainedModel):
         """
         VLM forward logic with inflight batching support.
         """
-        num_context_requests = attn_metadata.num_contexts
+        num_context_requests, num_generation_requests = (
+            attn_metadata.num_contexts, attn_metadata.num_generations)
 
         multimodal_params = kwargs.get("multimodal_params", [])
         mm_embeds = []
@@ -1214,7 +1207,9 @@ class Qwen2VLModelBase(PreTrainedModel):
 
         if not self.model_config.pretrained_config.disable_fuse_rope:
             mrope_config = self.prepare_mrope_config(multimodal_params,
-                                                     num_context_requests)
+                                                     num_context_requests,
+                                                     num_generation_requests,
+                                                     position_ids)
 
         input_ids, input_embeds = fuse_input_embeds(self.llm.model.embed_tokens,
                                                     input_ids, mm_embeds,
@@ -1398,7 +1393,8 @@ class Qwen2_5_VLModel(Qwen2VLModelBase):
     def multimodal_data_device_paths(self) -> List[str]:
         return [
             "image.pixel_values", "video.pixel_values_videos",
-            "multimodal_embedding"
+            "multimodal_embedding", "mrope_config.mrope_position_ids",
+            "mrope_config.mrope_position_deltas"
         ]
 
     def load_weights(self, weights, weight_mapper: BaseWeightMapper):

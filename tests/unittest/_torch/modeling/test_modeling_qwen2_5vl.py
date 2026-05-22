@@ -302,3 +302,88 @@ class TestQwen2_5_VL(TestModelingMultimodal):
                 load_weights=True,
                 hf_model_state_dict=self.hf_model.state_dict(),
                 disable_fuse_rope=True)
+
+
+# ---------------------------------------------------------------------------
+# Equivalence tests for the Qwen2.5-VL optimization steps.
+#
+# These do not exercise the full `Qwen2VLModelBase`/`Qwen2_5_VisionModel` —
+# they isolate the host-side reshapes/transfers we changed and prove the
+# new path is numerically identical to the prior implementation.
+# ---------------------------------------------------------------------------
+
+import pytest  # noqa: E402
+
+
+def _vision_transfer_old(rotary_pos_emb_cos, rotary_pos_emb_sin, window_indices,
+                         device):
+    """Reproduces the prior 3-separate-`.to(device, non_blocking=True)` shape:
+    cos / sin / window_index each get their own H->D copy."""
+    cos = torch.cat(rotary_pos_emb_cos).to(device=device, non_blocking=True)
+    sin = torch.cat(rotary_pos_emb_sin).to(device=device, non_blocking=True)
+    window_index = torch.cat(window_indices).to(device=device,
+                                                non_blocking=True)
+    return cos, sin, window_index
+
+
+def _vision_transfer_new(rotary_pos_emb_cos, rotary_pos_emb_sin, window_indices,
+                         device):
+    """The new path: stack cos/sin on host -> single H->D, then ship
+    window_index in a second copy (different dtype)."""
+    cos_sin = torch.stack(
+        [
+            torch.cat(rotary_pos_emb_cos),
+            torch.cat(rotary_pos_emb_sin),
+        ],
+        dim=0,
+    ).to(device=device, non_blocking=True)
+    cos, sin = cos_sin[0], cos_sin[1]
+    window_index = torch.cat(window_indices).to(device=device,
+                                                non_blocking=True)
+    return cos, sin, window_index
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize(
+    "shapes",
+    [
+        # (per-image (rows, hidden)) tuples — same shape requirements as the
+        # real `Qwen2_5_VisionModel.get_rotary_pos_emb_window_data` output:
+        # cos[i] and sin[i] share shape/dtype; window_indices[i] is int64.
+        [(64, 80)],
+        [(64, 80), (256, 80)],
+        [(32, 80), (96, 80), (128, 80)],
+    ],
+    ids=lambda s: "_".join(f"{r}x{h}" for r, h in s),
+)
+def test_qwen2_5_vision_cos_sin_stack_equivalence(shapes, dtype):
+    """Stacked-on-host single H->D must match the old 3-transfer shape
+    bit-for-bit for cos, sin, and window_index."""
+    torch.manual_seed(7)
+    device = "cuda"
+
+    rotary_pos_emb_cos = [torch.randn(r, h, dtype=dtype) for r, h in shapes]
+    rotary_pos_emb_sin = [torch.randn(r, h, dtype=dtype) for r, h in shapes]
+    window_indices = [torch.randperm(r, dtype=torch.long) for r, _ in shapes]
+
+    cos_old, sin_old, win_old = _vision_transfer_old(rotary_pos_emb_cos,
+                                                     rotary_pos_emb_sin,
+                                                     window_indices, device)
+    cos_new, sin_new, win_new = _vision_transfer_new(rotary_pos_emb_cos,
+                                                     rotary_pos_emb_sin,
+                                                     window_indices, device)
+
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(cos_new, cos_old, atol=0, rtol=0)
+    torch.testing.assert_close(sin_new, sin_old, atol=0, rtol=0)
+    torch.testing.assert_close(win_new, win_old, atol=0, rtol=0)
+
+
+# NOTE: A direct numerical equivalence test between the old per-request
+# prepare_mrope_config loop and the new flatten path is intentionally not
+# included here. The two paths produce intentionally different output
+# layouts (N stacked per-request blocks vs a single concatenated block);
+# the downstream attention contract was updated alongside the flatten
+# rewrite on qwen3vl_opt, where the same algorithm was validated end-to-
+# end. The stack-vs-3-transfers test above is what's unique to qwen2.5.
