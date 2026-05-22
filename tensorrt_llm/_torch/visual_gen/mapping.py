@@ -160,7 +160,7 @@ class VisualGenMapping(DeviceMeshTopologyImpl):
 
         if self._use_attn2d_plane:
             dim_order = _DEVICE_MESH_DIM_ORDER_ATTN2D
-            self._dim_names = dim_order.split("-")
+            self._dim_names = tuple(dim_order.split("-"))
             self._dim_sizes = {
                 "cfg": cfg_size,
                 "tp": tp_size,
@@ -170,7 +170,7 @@ class VisualGenMapping(DeviceMeshTopologyImpl):
             }
         else:
             dim_order = _DEVICE_MESH_DIM_ORDER_LEGACY
-            self._dim_names = dim_order.split("-")
+            self._dim_names = tuple(dim_order.split("-"))
             self._dim_sizes = {
                 "cfg": cfg_size,
                 "tp": tp_size,
