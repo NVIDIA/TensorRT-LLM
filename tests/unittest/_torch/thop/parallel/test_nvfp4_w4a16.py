@@ -37,7 +37,8 @@ def _make_nvfp4_weights(out_features, in_features, dtype=torch.bfloat16):
     """Create NVFP4 quantized weights from random BF16 data.
 
     Returns (w_original, w_fp4_packed, block_scale_fp8, weight_scale_2)
-    where the scales are in ModelOpt checkpoint format (not CUTLASS swizzled).
+    where the scales are padded to the layout that load_weights expects
+    (matching real ModelOpt checkpoint format).
     """
     w = torch.randn(out_features, in_features, dtype=dtype).cuda()
     w_float = w.float()
@@ -47,7 +48,16 @@ def _make_nvfp4_weights(out_features, in_features, dtype=torch.bfloat16):
     packed_uint8 = packed_weight.to(torch.uint8)
     block_scale_fp8 = block_scale.to(torch.float8_e4m3fn)
 
-    return w, packed_uint8, block_scale_fp8, weight_scale_2
+    n_sf = out_features
+    k_sf = in_features // SCALING_VECTOR_SIZE
+    n_sf_padded = pad_up(n_sf, 128)
+    k_sf_padded = pad_up(k_sf, 4)
+    bs_padded = torch.zeros(
+        n_sf_padded, k_sf_padded, dtype=block_scale_fp8.dtype, device=block_scale_fp8.device
+    )
+    bs_padded[:n_sf, :k_sf] = block_scale_fp8
+
+    return w, packed_uint8, bs_padded, weight_scale_2
 
 
 # ──────────────────────────────────────────────────────────────────────────────
