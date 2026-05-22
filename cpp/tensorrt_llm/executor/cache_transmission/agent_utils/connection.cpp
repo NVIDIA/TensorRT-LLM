@@ -171,8 +171,6 @@ void AgentConnection::send(DataContext const& ctx, void const* data, size_t size
     auto const& dstBaseDesc = mSenderState.activeBufferDesc();
     auto const& offsetRatio = mSenderState.activeOffsetRatio();
     TLLM_CHECK_WITH_INFO(offsetRatio.second != 0, "AgentConnection::send offset ratio denominator cannot be 0");
-    TLLM_CHECK_WITH_INFO(
-        size % offsetRatio.second == 0, "AgentConnection::send size is not divisible by offset ratio denominator");
     TLLM_CHECK_WITH_INFO(size <= dstBaseDesc.getLen(), "AgentConnection::send size exceeds destination buffer");
     auto const chunkSize = size / offsetRatio.second;
     TLLM_CHECK_WITH_INFO(offsetRatio.first == 0 || chunkSize <= std::numeric_limits<size_t>::max() / offsetRatio.first,
