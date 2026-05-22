@@ -725,6 +725,18 @@ class AttentionDpConfig(StrictBaseModel):
         "cache affinity can dominate while preventing runaway concentration "
         "on a single rank. Set to 1.0 for strict fair share. "
         "Only used when enable_kv_cache_aware_routing is True.")
+    kv_cache_routing_cold_start_warmup: bool = Field(
+        default=False,
+        description=
+        "Cold-start mitigation in KV cache-aware routing. When True, the "
+        "first tp_size relaxed requests after router init are round-robined "
+        "across ranks (bypassing cache-affinity scoring) so every rank "
+        "caches the shared system prompt before scoring would otherwise pin "
+        "all traffic to the first warm rank. Only useful when requests "
+        "share a long system prefix; for diverse-prompt workloads this can "
+        "scatter requests that would otherwise consolidate on a single warm "
+        "rank, wasting prefill. Default False preserves pre-warmup routing. "
+        "Only used when enable_kv_cache_aware_routing is True.")
 
     @model_validator(mode='after')
     def validate_attention_dp_config(self) -> 'AttentionDpConfig':
