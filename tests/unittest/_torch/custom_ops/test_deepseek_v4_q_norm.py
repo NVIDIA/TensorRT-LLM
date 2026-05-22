@@ -169,6 +169,42 @@ def test_deepseek_v4_q_norm_fused_fp8_zero_rows():
 
 
 @pytest.mark.parametrize("num_tokens", [1, 7, 129])
+def test_deepseek_v4_q_b_layernorm_fused_fp8_returns_3d_q_pe(num_tokens):
+    """Lock down the q_pe dim==3 contract expected by thop.attention's
+    sparse-MLA context branch (TORCH_CHECK(q_pe->dim() == 3))."""
+    import types
+    from types import SimpleNamespace
+
+    from tensorrt_llm._torch.modules.attention import MLA
+
+    num_heads = 16
+    qk_head_dim = 512
+    kv_lora_rank = 448
+    rope_dim = qk_head_dim - kv_lora_rank
+    stub = SimpleNamespace(
+        num_heads_tp=num_heads,
+        qk_head_dim=qk_head_dim,
+        kv_lora_rank=kv_lora_rank,
+        q_b_layernorm=SimpleNamespace(variance_epsilon=1e-6),
+    )
+    fused = types.MethodType(MLA._deepseek_v4_q_b_layernorm_fused_fp8, stub)
+    q_proj = torch.randn(
+        num_tokens, num_heads * qk_head_dim, dtype=torch.bfloat16, device="cuda"
+    ).contiguous()
+
+    placeholder_q, quant_q_buffer, q_pe, scale = fused(q_proj)
+
+    assert q_pe.shape == (num_tokens, num_heads, rope_dim)
+    assert q_pe.stride(2) == 1
+    assert q_pe.is_contiguous()
+    assert quant_q_buffer.shape == (num_tokens, num_heads * qk_head_dim)
+    assert quant_q_buffer.dtype == torch.float8_e4m3fn
+    assert placeholder_q.data_ptr() == q_proj.data_ptr()
+    assert scale.shape == (1,) and scale.dtype == torch.float32
+    assert float(scale.item()) == 1.0
+
+
+@pytest.mark.parametrize("num_tokens", [1, 7, 129])
 @pytest.mark.parametrize("num_heads", [1, 16, 128])
 def test_deepseek_v4_q_norm_fused_fp8_interleaved_layout(num_tokens, num_heads):
     """The per-head stride of `quant_q_out` is inferred from the buffer shape:

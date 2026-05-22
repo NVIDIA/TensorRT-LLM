@@ -1762,21 +1762,21 @@ class MLA(nn.Module):
             self._quant_scale_qkv = torch.tensor([1.0],
                                                  dtype=torch.float32,
                                                  device=q_proj.device)
-        # Allocate the interleaved [N, H*head_dim] FP8 buffer (nope filled by
-        # this op, rope slot left for applyMLARopeAndAssignQKVKernelOptContext) and the bf16 rope buffer.
+        # q_pe is 3D so thop.attention's sparse-MLA context branch passes its
+        # q_pe->dim() == 3 check; the kernel op consumes the flat 2D view.
         num_tokens = q_proj.shape[0]
         rope_dim = self.qk_head_dim - self.kv_lora_rank
         quant_q_buffer = q_proj.new_empty(
             (num_tokens, self.num_heads_tp * self.qk_head_dim),
             dtype=torch.float8_e4m3fn)
-        q_pe = q_proj.new_empty((num_tokens, self.num_heads_tp * rope_dim))
+        q_pe = q_proj.new_empty((num_tokens, self.num_heads_tp, rope_dim))
         torch.ops.trtllm.deepseek_v4_q_norm_fused_fp8(
             q_proj,
             quant_q_buffer,
-            q_pe,
+            q_pe.view(num_tokens, self.num_heads_tp * rope_dim),
             self.num_heads_tp,
             self.qk_head_dim,
-            self.kv_lora_rank,  # nope_dim
+            self.kv_lora_rank,
             float(self.q_b_layernorm.variance_epsilon),
             self._quant_scale_qkv,
         )
