@@ -1087,12 +1087,12 @@ void WindowBlockManager::allocatePools(bool useUvm)
     constexpr nvinfer1::DataType kScaleDtypeNVFP4 = nvinfer1::DataType::kFP8;
 
     bool const requestFabricMemory = tc::getEnvKVCachePoolUseFabricMemory();
-    bool const fabricMemorySupported = FabricMemory::supportFbaricMemory();
+    bool const fabricMemorySupported = FabricMemory::supportFabricMemory();
     if (requestFabricMemory && !fabricMemorySupported)
     {
         TLLM_LOG_WARNING(
             "[%s] TRTLLM_KVCACHE_POOL_USE_FABRIC_MEMORY=1 was set but fabric memory is not supported on this "
-            "platform (FabricMemory::supportFbaricMemory() returned false); falling back to standard GPU "
+            "platform (FabricMemory::supportFabricMemory() returned false); falling back to standard GPU "
             "allocation.",
             mLogPrefix.c_str());
     }

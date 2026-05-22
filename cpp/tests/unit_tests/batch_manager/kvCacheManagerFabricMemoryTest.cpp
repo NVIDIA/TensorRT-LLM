@@ -88,7 +88,7 @@ protected:
 
 TEST_F(KVCacheManagerFabricMemoryTest, AllocatePoolsFallbackWhenFabricUnsupported)
 {
-    if (FabricMemory::supportFbaricMemory())
+    if (FabricMemory::supportFabricMemory())
     {
         GTEST_SKIP() << "This test targets hardware without fabric memory support";
     }
@@ -127,7 +127,7 @@ TEST_F(KVCacheManagerFabricMemoryTest, AllocatePoolsFallbackWhenFabricUnsupporte
 
 TEST_F(KVCacheManagerFabricMemoryTest, AllocatePoolsWithFabricMemory)
 {
-    if (!FabricMemory::supportFbaricMemory())
+    if (!FabricMemory::supportFabricMemory())
     {
         GTEST_SKIP() << "Fabric memory not supported on this hardware";
     }
@@ -168,7 +168,7 @@ TEST_F(KVCacheManagerFabricMemoryTest, AllocatePoolsWithFabricMemory)
 // releasePools() syncs the transfer manager before unmapping the fabric allocation.
 TEST_F(KVCacheManagerFabricMemoryTest, OffloadOnboardRoundTripWithFabricPrimary)
 {
-    if (!FabricMemory::supportFbaricMemory())
+    if (!FabricMemory::supportFabricMemory())
     {
         GTEST_SKIP() << "Fabric memory not supported on this hardware";
     }
