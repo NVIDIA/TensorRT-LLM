@@ -3632,11 +3632,16 @@ class PyExecutor:
 
     @nvtx_range("_check_disagg_gen_transfer_status")
     def _check_disagg_gen_transfer_status(self):
-
-        need_check = any([
-            req.is_disagg_generation_transmission_in_progress
-            for req in self.active_requests
-        ])
+        # The downstream C++ checkGenTransferStatus runs a cross-rank
+        # gatherRequestIds collective on the gen-side comm. Any
+        # rank-asymmetric gate here (e.g. the previous "if need_check"
+        # predicate, which reads rank-local LlmRequest state from
+        # self.active_requests) causes ABBA deadlock against the next
+        # unconditional collective on the same ranks (helix CI #39529
+        # hang). All gen-side ranks must enter this call together, so
+        # the gate is intentionally absent. at_least_num is rank-local
+        # and only affects the per-request loop behavior inside the C++
+        # function (blockAll vs polling), which is safe to diverge.
         non_gen_first_reqs = [
             req for req in self.active_requests
             if req.py_disaggregated_params and req.py_disaggregated_params.
@@ -3645,10 +3650,8 @@ class PyExecutor:
         need_check_one = bool(non_gen_first_reqs) and all(
             req.is_disagg_generation_transmission_in_progress
             for req in non_gen_first_reqs)
-
-        if need_check:
-            at_least_num = 1 if need_check_one else 0
-            self._check_disagg_gen_cache_transfer_status(at_least_num)
+        at_least_num = 1 if need_check_one else 0
+        self._check_disagg_gen_cache_transfer_status(at_least_num)
 
         return
 
@@ -3838,8 +3841,16 @@ class PyExecutor:
                     for req in resources_to_prepare:
                         prepared_ids.add(req.py_request_id)
 
-            # Trigger KV cache exchange for new disagg_gen_init_requests
-            self._recv_disagg_gen_cache(fitting_disagg_gen_init_requests)
+        # Always trigger _recv_disagg_gen_cache, even when this rank has no
+        # newly fitting disagg-gen-init requests. The downstream C++
+        # checkGenTransferStatus runs a cross-rank gatherRequestIds
+        # collective on the gen-side comm; skipping it on ranks with no
+        # local work creates the rank-asymmetric entry that produces an
+        # ABBA deadlock with the next unconditional collective on the
+        # same ranks.
+        # _recv_disagg_gen_cache handles the empty-input case as a no-op
+        # for the receive work while still entering the collective.
+        self._recv_disagg_gen_cache(fitting_disagg_gen_init_requests)
 
     @nvtx_range("_prepare_disagg_gen_transmission_complete")
     def _prepare_disagg_gen_transmission_complete(self, scheduled_batch):
@@ -3928,35 +3939,43 @@ class PyExecutor:
                 continue
             recv_reqs.append(req)
 
-        if not recv_reqs:
-            return
+        # NOTE: do NOT early-exit when recv_reqs is empty.
+        #
+        # The _check_disagg_gen_cache_transfer_status call below dispatches
+        # into C++ checkGenTransferStatus, whose body begins with a
+        # cross-rank gatherRequestIds collective on the gen-side comm
+        # (mGroupDataComm with attention-DP, otherwise mGroupComm). A
+        # rank-asymmetric early-exit here causes ABBA deadlock against
+        # any subsequent unconditional collective on the same ranks --
+        # e.g. _can_queue's tp_allgather under attention-DP, or PP
+        # step-boundary collectives.
+        if recv_reqs:
+            if os.getenv("TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP") == "1":
+                for req in recv_reqs:
+                    self._disagg_gen_kv_recv_started_ids.add(req.py_request_id)
+                    try:
+                        self.kv_cache_transceiver.request_and_receive_sync(req)
+                    except Exception:
+                        self._disagg_gen_kv_recv_started_ids.discard(
+                            req.py_request_id)
+                        raise
+            else:
+                for req in recv_reqs:
+                    self._disagg_gen_kv_recv_started_ids.add(req.py_request_id)
+                    try:
+                        self.kv_cache_transceiver.request_and_receive_async(req)
+                    except Exception:
+                        self._disagg_gen_kv_recv_started_ids.discard(
+                            req.py_request_id)
+                        raise
 
-        if os.getenv("TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP") == "1":
+            # Record the transfer start time unconditionally so the Python
+            # fallback deadline in _check_kv_transfer_timeout can fire even
+            # when kv_transfer_timeout_ms is not configured. The check there
+            # picks the configured timeout or the fallback floor.
             for req in recv_reqs:
-                self._disagg_gen_kv_recv_started_ids.add(req.py_request_id)
-                try:
-                    self.kv_cache_transceiver.request_and_receive_sync(req)
-                except Exception:
-                    self._disagg_gen_kv_recv_started_ids.discard(
-                        req.py_request_id)
-                    raise
-        else:
-            for req in recv_reqs:
-                self._disagg_gen_kv_recv_started_ids.add(req.py_request_id)
-                try:
-                    self.kv_cache_transceiver.request_and_receive_async(req)
-                except Exception:
-                    self._disagg_gen_kv_recv_started_ids.discard(
-                        req.py_request_id)
-                    raise
-
-        # Record the transfer start time unconditionally so the Python
-        # fallback deadline in _check_kv_transfer_timeout can fire even
-        # when kv_transfer_timeout_ms is not configured. The check there
-        # picks the configured timeout or the fallback floor.
-        for req in recv_reqs:
-            if req.state == LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS:
-                req.py_kv_transfer_start_time = time.time()
+                if req.state == LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS:
+                    req.py_kv_transfer_start_time = time.time()
 
         non_gen_first_active = [
             req for req in self.active_requests
@@ -3966,6 +3985,8 @@ class PyExecutor:
         block_transfer = bool(non_gen_first_active) and all(
             req.is_disagg_generation_transmission_in_progress
             for req in non_gen_first_active)
+        # Always reach the C++ collective so every gen-side rank
+        # participates in lockstep with its peers.
         self._check_disagg_gen_cache_transfer_status(1 if block_transfer else 0)
 
         return
