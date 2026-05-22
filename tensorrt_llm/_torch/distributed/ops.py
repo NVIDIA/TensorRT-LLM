@@ -524,8 +524,9 @@ class MNNVLAllReduce(nn.Module):
 
     This class handles the MNNVL-specific allreduce operations, which can be more efficient
     for certain operations when using NVLink for multi-node communication. The oneshot kernel
-    uses a cyclic remote-rank reduction order by default; set
-    ``FORCE_ALL_REDUCE_DETERMINISTIC=1`` to use stable rank-order reduction.
+    is deterministic across ranks. For TP sizes up to 8, it uses a rank-specialized
+    fast path that keeps the local value in registers and volatile-loads only peers
+    from the Lamport buffer. Larger world sizes use a compact deterministic fallback.
     """
     allreduce_mnnvl_workspaces: Dict[Mapping, Dict] = {}
 

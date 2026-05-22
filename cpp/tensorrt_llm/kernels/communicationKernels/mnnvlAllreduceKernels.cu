@@ -23,6 +23,7 @@
 #include <cuda_pipeline.h>
 #include <tuple>
 #include <type_traits>
+#include <utility>
 
 #include "tensorrt_llm/common/cudaTypeUtils.cuh"
 #include "tensorrt_llm/common/cudaUtils.h"
@@ -314,6 +315,115 @@ inline __device__ void sanitizeLamportPayload(PackedVec<PackedType, T>& value)
     }
 }
 
+template <int Rank, uint8_t WorldSize, uint8_t LocalRank, typename T, typename PackedType, int kELTS_PER_THREAD>
+inline __device__ bool pollOneshotRemoteRank(
+    PackedVec<PackedType, T>* remoteValues, T* stagePtrLocal, int token, int tokenDim, int packedIdx)
+{
+    if constexpr (Rank == LocalRank)
+    {
+        return true;
+    }
+    else
+    {
+        auto loaded = loadPackedVolatile<PackedType>(
+            &stagePtrLocal[token * tokenDim * WorldSize + Rank * tokenDim + packedIdx * kELTS_PER_THREAD]);
+        remoteValues[Rank].packed = loaded.packed;
+        return !isLamportDirty(loaded);
+    }
+}
+
+template <uint8_t WorldSize, uint8_t LocalRank, typename T, typename PackedType, int kELTS_PER_THREAD, int... Ranks>
+inline __device__ bool pollOneshotRemoteRanks(PackedVec<PackedType, T>* remoteValues, T* stagePtrLocal, int token,
+    int tokenDim, int packedIdx, std::integer_sequence<int, Ranks...>)
+{
+    bool valid = true;
+    ((valid &= pollOneshotRemoteRank<Ranks, WorldSize, LocalRank, T, PackedType, kELTS_PER_THREAD>(
+          remoteValues, stagePtrLocal, token, tokenDim, packedIdx)),
+        ...);
+    return valid;
+}
+
+template <typename T, typename PackedType, int kELTS_PER_THREAD>
+inline __device__ void accumulatePacked(float (&accum)[kELTS_PER_THREAD], PackedVec<PackedType, T> const& value)
+{
+#pragma unroll
+    for (int i = 0; i < kELTS_PER_THREAD; i++)
+    {
+        accum[i] += cuda_cast<float, T>(value.elements[i]);
+    }
+}
+
+template <int Rank, uint8_t LocalRank, typename T, typename PackedType, int kELTS_PER_THREAD>
+inline __device__ void accumulateOneshotRank(float (&accum)[kELTS_PER_THREAD],
+    PackedVec<PackedType, T> const* remoteValues, PackedVec<PackedType, T> const& localValue)
+{
+    if constexpr (Rank == LocalRank)
+    {
+        accumulatePacked<T, PackedType, kELTS_PER_THREAD>(accum, localValue);
+    }
+    else
+    {
+        accumulatePacked<T, PackedType, kELTS_PER_THREAD>(accum, remoteValues[Rank]);
+    }
+}
+
+template <uint8_t LocalRank, typename T, typename PackedType, int kELTS_PER_THREAD, int... Ranks>
+inline __device__ void accumulateOneshotRanks(float (&accum)[kELTS_PER_THREAD],
+    PackedVec<PackedType, T> const* remoteValues, PackedVec<PackedType, T> const& localValue,
+    std::integer_sequence<int, Ranks...>)
+{
+    (accumulateOneshotRank<Ranks, LocalRank, T, PackedType, kELTS_PER_THREAD>(accum, remoteValues, localValue), ...);
+}
+
+template <uint8_t WorldSize, uint8_t LocalRank, typename T, typename PackedType, int kELTS_PER_THREAD>
+inline __device__ void waitOneshotRemoteRanks(
+    PackedVec<PackedType, T>* remoteValues, T* stagePtrLocal, int token, int tokenDim, int packedIdx)
+{
+    static_assert(LocalRank < WorldSize);
+    while (1)
+    {
+        bool const valid = pollOneshotRemoteRanks<WorldSize, LocalRank, T, PackedType, kELTS_PER_THREAD>(
+            remoteValues, stagePtrLocal, token, tokenDim, packedIdx, std::make_integer_sequence<int, WorldSize>{});
+        if (valid)
+        {
+            break;
+        }
+    }
+}
+
+template <uint8_t WorldSize, uint8_t LocalRank, typename T, typename PackedType, int kELTS_PER_THREAD>
+inline __device__ PackedVec<PackedType, T> reduceOneshotDeterministic(
+    PackedVec<PackedType, T> const* remoteValues, PackedVec<PackedType, T> const& localValue)
+{
+    static_assert(LocalRank < WorldSize);
+    float accum[kELTS_PER_THREAD];
+#pragma unroll
+    for (int i = 0; i < kELTS_PER_THREAD; i++)
+    {
+        accum[i] = 0.F;
+    }
+    accumulateOneshotRanks<LocalRank, T, PackedType, kELTS_PER_THREAD>(
+        accum, remoteValues, localValue, std::make_integer_sequence<int, WorldSize>{});
+
+    PackedVec<PackedType, T> packedAccum;
+#pragma unroll
+    for (int i = 0; i < kELTS_PER_THREAD; i++)
+    {
+        packedAccum.elements[i] = cuda_cast<T, float>(accum[i]);
+    }
+    return packedAccum;
+}
+
+template <uint8_t WorldSize, uint8_t LocalRank, typename T, typename PackedType, int kELTS_PER_THREAD>
+inline __device__ PackedVec<PackedType, T> reduceOneshotDeterministicFastPath(
+    PackedVec<PackedType, T> const& localValue, T* stagePtrLocal, int token, int tokenDim, int packedIdx)
+{
+    PackedVec<PackedType, T> remoteValues[WorldSize];
+    waitOneshotRemoteRanks<WorldSize, LocalRank, T, PackedType, kELTS_PER_THREAD>(
+        remoteValues, stagePtrLocal, token, tokenDim, packedIdx);
+    return reduceOneshotDeterministic<WorldSize, LocalRank, T, PackedType, kELTS_PER_THREAD>(remoteValues, localValue);
+}
+
 } // namespace detail
 
 using detail::PackedVec;
@@ -323,14 +433,13 @@ using detail::divUp;
 using detail::copyF4;
 using detail::MnnvlAllReduceKernelParams;
 using detail::sanitizeLamportPayload;
+using detail::reduceOneshotDeterministicFastPath;
 
-template <uint8_t WorldSize, typename T, bool RMSNormFusion = false, bool StableReductionOrder = false,
-    typename PackedType = float4>
+template <uint8_t WorldSize, typename T, bool RMSNormFusion = false, typename PackedType = float4>
 __global__ void __launch_bounds__(1024) oneshotAllreduceFusionKernel(MnnvlAllReduceKernelParams<T> params)
 {
     constexpr int kELTS_PER_THREAD = sizeof(PackedType) / sizeof(T);
     constexpr uint32_t kELT_SIZE = sizeof(T);
-    constexpr int kVALUES_TO_POLL = StableReductionOrder ? WorldSize : WorldSize - 1;
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
     namespace cg = cooperative_groups;
     cg::cluster_group cluster = cg::this_cluster();
@@ -374,61 +483,78 @@ __global__ void __launch_bounds__(1024) oneshotAllreduceFusionKernel(MnnvlAllRed
         return;
     }
 
-    PackedVec<PackedType, float> valuesLamport[kVALUES_TO_POLL];
-    while (1)
-    {
-        bool valid = true;
-#pragma unroll
-        for (int r = 0; r < kVALUES_TO_POLL; r++)
-        {
-            int rankToLoad = r;
-            if constexpr (!StableReductionOrder)
-            {
-                rankToLoad = (r + params.rank + 1) % WorldSize;
-            }
-            auto loaded = loadPackedVolatile<PackedType>(&stagePtrLocal[token * params.tokenDim * WorldSize
-                + rankToLoad * params.tokenDim + packedIdx * kELTS_PER_THREAD]);
-            valuesLamport[r].packed = loaded.packed;
-            valid &= !isLamportDirty(loaded);
-        }
-        if (valid)
-        {
-            break;
-        }
-    }
-
-    auto values = reinterpret_cast<PackedVec<PackedType, T>*>(valuesLamport);
     // ======================= Reduction =============================
-    float accum[kELTS_PER_THREAD];
+    // Fully deterministic: every rank uses the exact same reduction order. For WorldSize <= 8, specialize the local
+    // slot so the fast path reuses `val` from registers without a dynamic `remoteValues[params.rank]` store. Larger
+    // world sizes use the compact fallback because the benefit is thin but specializing every rank significantly
+    // increases compile time.
     PackedVec<PackedType, T> packedAccum;
-
-#pragma unroll
-    for (int i = 0; i < kELTS_PER_THREAD; i++)
+    if constexpr (WorldSize <= 8)
     {
-        if constexpr (StableReductionOrder)
+        packedAccum = val;
+#define RUN_ONESHOT_LOCAL_RANK(LOCAL_RANK)                                                                             \
+    case LOCAL_RANK:                                                                                                   \
+        if constexpr (WorldSize > LOCAL_RANK)                                                                          \
+        {                                                                                                              \
+            packedAccum = reduceOneshotDeterministicFastPath<WorldSize, LOCAL_RANK, T, PackedType, kELTS_PER_THREAD>(  \
+                val, stagePtrLocal, token, params.tokenDim, packedIdx);                                                \
+        }                                                                                                              \
+        break
+
+        switch (params.rank)
         {
-            accum[i] = cuda_cast<float, T>(values[0].elements[i]);
+            RUN_ONESHOT_LOCAL_RANK(0);
+            RUN_ONESHOT_LOCAL_RANK(1);
+            RUN_ONESHOT_LOCAL_RANK(2);
+            RUN_ONESHOT_LOCAL_RANK(3);
+            RUN_ONESHOT_LOCAL_RANK(4);
+            RUN_ONESHOT_LOCAL_RANK(5);
+            RUN_ONESHOT_LOCAL_RANK(6);
+            RUN_ONESHOT_LOCAL_RANK(7);
         }
-        else
-        {
-            accum[i] = cuda_cast<float, T>(val.elements[i]);
-        }
+#undef RUN_ONESHOT_LOCAL_RANK
     }
-
-#pragma unroll
-    for (int r = StableReductionOrder ? 1 : 0; r < kVALUES_TO_POLL; r++)
+    else
     {
+        PackedVec<PackedType, float> valuesLamport[WorldSize];
+        while (1)
+        {
+            bool valid = true;
+#pragma unroll
+            for (int r = 0; r < WorldSize; r++)
+            {
+                auto loaded = loadPackedVolatile<PackedType>(&stagePtrLocal[token * params.tokenDim * WorldSize
+                    + r * params.tokenDim + packedIdx * kELTS_PER_THREAD]);
+                valuesLamport[r].packed = loaded.packed;
+                valid &= !isLamportDirty(loaded);
+            }
+            if (valid)
+            {
+                break;
+            }
+        }
+
+        auto values = reinterpret_cast<PackedVec<PackedType, T>*>(valuesLamport);
+        float accum[kELTS_PER_THREAD];
 #pragma unroll
         for (int i = 0; i < kELTS_PER_THREAD; i++)
         {
-            accum[i] += cuda_cast<float, T>(values[r].elements[i]);
+            accum[i] = 0.F;
         }
-    }
-
 #pragma unroll
-    for (int i = 0; i < kELTS_PER_THREAD; i++)
-    {
-        packedAccum.elements[i] = cuda_cast<T, float>(accum[i]);
+        for (int r = 0; r < WorldSize; r++)
+        {
+#pragma unroll
+            for (int i = 0; i < kELTS_PER_THREAD; i++)
+            {
+                accum[i] += cuda_cast<float, T>(values[r].elements[i]);
+            }
+        }
+#pragma unroll
+        for (int i = 0; i < kELTS_PER_THREAD; i++)
+        {
+            packedAccum.elements[i] = cuda_cast<T, float>(accum[i]);
+        }
     }
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
     cudaTriggerProgrammaticLaunchCompletion();
@@ -501,14 +627,11 @@ void oneshotAllreduceFusionOp(AllReduceFusionParams const& params)
 
     auto [blockSize, clusterSize, loadsPerThread] = adjustGridConfig<true>(numTokens, tokenDim, eltsPerThread);
     dim3 grid(numTokens, clusterSize, 1);
-    bool const stableReductionOrder = tensorrt_llm::common::getEnvForceDeterministicAllReduce();
 
     TLLM_LOG_DEBUG(
         "[MNNVL AllReduceOneShot] Dispatch: grid size: (%d, %d, 1), block_size: %d, cluster_size: %d, "
-        "loads_per_thread: %d, stable_reduction_order: %d, "
-        "threads_needed: %d",
-        numTokens, clusterSize, blockSize, clusterSize, loadsPerThread, static_cast<int>(stableReductionOrder),
-        divUp(tokenDim, eltsPerThread));
+        "loads_per_thread: %d, deterministic_reduction_order: 1, threads_needed: %d",
+        numTokens, clusterSize, blockSize, clusterSize, loadsPerThread, divUp(tokenDim, eltsPerThread));
 
     TLLM_CHECK_WITH_INFO(blockSize <= 1024 && loadsPerThread == 1,
         "Hidden Dimension %d exceeds the maximum supported hidden dimension (%d)", tokenDim, 1024 * 8 * eltsPerThread);
@@ -530,31 +653,16 @@ void oneshotAllreduceFusionOp(AllReduceFusionParams const& params)
         .numAttrs = 2U,
     };
 
-#define LAUNCH_ALLREDUCE_KERNEL(WORLD_SIZE, T, RMSNORM, STABLE_REDUCTION_ORDER)                                        \
-    TLLM_CUDA_CHECK(cudaLaunchKernelEx(                                                                                \
-        &config, &oneshotAllreduceFusionKernel<WORLD_SIZE, T, RMSNORM, STABLE_REDUCTION_ORDER>, kernelParams));
+#define LAUNCH_ALLREDUCE_KERNEL(WORLD_SIZE, T, RMSNORM)                                                                \
+    TLLM_CUDA_CHECK(cudaLaunchKernelEx(&config, &oneshotAllreduceFusionKernel<WORLD_SIZE, T, RMSNORM>, kernelParams));
 #define DISPATCH_ALLREDUCE_KERNEL(WORLD_SIZE, T)                                                                       \
     if (params.rmsNormFusion)                                                                                          \
     {                                                                                                                  \
-        if (stableReductionOrder)                                                                                      \
-        {                                                                                                              \
-            LAUNCH_ALLREDUCE_KERNEL(WORLD_SIZE, T, true, true);                                                        \
-        }                                                                                                              \
-        else                                                                                                           \
-        {                                                                                                              \
-            LAUNCH_ALLREDUCE_KERNEL(WORLD_SIZE, T, true, false);                                                       \
-        }                                                                                                              \
+        LAUNCH_ALLREDUCE_KERNEL(WORLD_SIZE, T, true);                                                                  \
     }                                                                                                                  \
     else                                                                                                               \
     {                                                                                                                  \
-        if (stableReductionOrder)                                                                                      \
-        {                                                                                                              \
-            LAUNCH_ALLREDUCE_KERNEL(WORLD_SIZE, T, false, true);                                                       \
-        }                                                                                                              \
-        else                                                                                                           \
-        {                                                                                                              \
-            LAUNCH_ALLREDUCE_KERNEL(WORLD_SIZE, T, false, false);                                                      \
-        }                                                                                                              \
+        LAUNCH_ALLREDUCE_KERNEL(WORLD_SIZE, T, false);                                                                 \
     }
     // C++17 compatible alternative using a template function
     auto dispatchImpl = [&](auto* type_ptr) -> bool
