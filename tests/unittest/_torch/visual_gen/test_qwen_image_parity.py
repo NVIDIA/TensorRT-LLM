@@ -51,7 +51,7 @@ def _cosine(a: torch.Tensor, b: torch.Tensor) -> float:
 requires_ckpt = pytest.mark.skipif(
     _ckpt_path() is None,
     reason=(
-        f"Qwen-Image checkpoint not found at ${_CKPT_ENV}. "
+        f"Qwen-Image checkpoint not found at {_CKPT_ENV}. "
         "Set QWEN_IMAGE_CKPT to a local Qwen/Qwen-Image checkpoint "
         "to enable parity tests."
     ),
