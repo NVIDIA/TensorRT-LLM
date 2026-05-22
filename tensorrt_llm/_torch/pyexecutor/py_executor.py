@@ -3838,6 +3838,12 @@ class PyExecutor:
                 if req.is_context_only_request and (
                         req.is_context_finished or req.is_finished_due_to_length
                 ) and not req.is_finished_due_to_cancellation:
+                    # Forward is done for this request — release the
+                    # IndexMapper slot so new requests can reuse it.
+                    # KV blocks stay allocated for the upcoming transfer.
+                    if hasattr(self.kv_cache_manager, 'release_index_slot'):
+                        self.kv_cache_manager.release_index_slot(
+                            req.py_request_id)
                     # Order is important here: we need to start the transfer before responding
                     # to make sure the blocks are stored for reuse before they are sent.
                     self.async_transfer_manager.start_transfer(req)

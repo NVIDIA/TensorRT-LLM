@@ -754,6 +754,7 @@ class KvCacheCreator:
             estimating_kv_cache=estimating_kv_cache,
             execution_stream=self._execution_stream,
             layer_mask=spec_dec_layer_mask,
+            is_disagg=self._is_disagg,
         )
 
         if not self._skip_est:
@@ -898,6 +899,7 @@ class KvCacheCreator:
             is_draft=True,
             layer_mask=spec_dec_layer_mask,
             num_layers=num_draft_layers,
+            is_disagg=self._is_disagg,
         )
 
     def _split_kv_cache_budget_for_draft(self) -> Optional[KvCacheConfig]:
@@ -1094,7 +1096,8 @@ def _create_kv_cache_manager(
         dtype: Optional[torch.dtype] = None,
         is_draft: Optional[bool] = None,
         layer_mask: Optional[List[bool]] = None,
-        num_layers: Optional[int] = None) -> KVCacheManager:
+        num_layers: Optional[int] = None,
+        is_disagg: bool = False) -> KVCacheManager:
     """
     Returns:
         A KVCacheManager instance for the given model engine or model config
@@ -1228,6 +1231,7 @@ def _create_kv_cache_manager(
             is_estimating_kv_cache=estimating_kv_cache,
             execution_stream=execution_stream,
             layer_mask=layer_mask,
+            is_disagg=is_disagg,
         )
     elif is_nemotron_hybrid(config):
         if max_beam_width > 1:
@@ -1404,6 +1408,7 @@ def _create_kv_cache_manager(
             is_estimating_kv_cache=estimating_kv_cache,
             execution_stream=execution_stream,
             layer_mask=layer_mask,
+            is_disagg=is_disagg,
         )
     # Note: Gemma4 KV sharing cache remapping is handled in Gemma4Attention
     # via cache_layer_idx — shared layers use target layer's index for

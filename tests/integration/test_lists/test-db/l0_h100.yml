@@ -71,6 +71,7 @@ l0_h100:
   - unittest/disaggregated/test_request_id.py
   - unittest/disaggregated/test_kv_transfer.py
   - unittest/disaggregated/test_kv_transfer_mp.py
+  - unittest/disaggregated/test_cache_transceiver_single_process.py
   - unittest/others/test_kv_cache_transceiver.py::test_kv_cache_transceiver_single_process[PYTHON-mha-ctx_fp16_gen_fp16]
   - unittest/others/test_kv_cache_transceiver.py::test_kv_cache_transceiver_single_process[PYTHON-mla-ctx_fp16_gen_fp16]
   - unittest/llmapi/test_llm_telemetry.py
