@@ -331,7 +331,7 @@ def launch_disaggregated_llm(
         gen_servers.append((env, gen_server_args))
 
     @contextlib.contextmanager
-    def multi_popen(server_configs, server_name="", enable_redirect_log=True):
+    def multi_popen(server_configs, server_name="", enable_redirect_log=False):
         processes = []
         log_files = []
         try:
