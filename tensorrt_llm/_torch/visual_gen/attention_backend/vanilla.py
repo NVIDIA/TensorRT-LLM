@@ -86,8 +86,7 @@ class VanillaAttention(AttentionBackend):
             attention_mask: Attention mask type (CAUSAL or FULL)
             key_padding_mask: Optional ``[B, S_kv]`` bool tensor; True = valid,
                 False = pad. Expanded internally to ``[B, 1, 1, S_kv]`` and
-                passed as ``attn_mask`` to SDPA. Only the non-causal branch is
-                supported (LTX-2 cross-attn is non-causal).
+                passed as ``attn_mask`` to SDPA. Non-causal only.
 
         Returns:
             Output tensor [batch_size, num_heads, seq_len, head_dim]

@@ -137,8 +137,7 @@ class FlashAttn4Attention(AttentionBackend):
             attention_mask: Attention mask type (CAUSAL or FULL)
             key_padding_mask: Optional ``[B, S_kv]`` bool tensor; True = valid,
                 False = pad. Translated to FA4's ``seqused_k = mask.sum(dim=1)``
-                (assumes True-prefix layout, which matches LTX-2 audio padding).
-                Only the non-causal branch is supported.
+                (assumes True-prefix layout). Non-causal only.
 
         Returns:
             Output tensor [batch_size, seq_len, num_heads, head_dim]

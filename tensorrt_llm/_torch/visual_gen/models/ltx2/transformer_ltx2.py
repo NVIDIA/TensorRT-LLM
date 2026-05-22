@@ -145,12 +145,9 @@ class LTX2Attention(Attention):
             )
             self._has_dual_attn = True
 
-        # Cross-attention Ulysses wrap (v2a in LTX-2). Active only under pure
-        # Ulysses (ulysses_size > 1 AND cp_size == 1). Combined modes
-        # (ring + Ulysses, attn2d + Ulysses) shard the seq axis by
-        # seq_size = cp_size * ulysses_size, which this wrapper has not been
-        # validated against; gate them off and fall back to the plain attn
-        # + AG path until the combined-mode case is wired up explicitly.
+        # v2a Ulysses wrap: active under pure Ulysses only. Combined modes
+        # (ring/attn2d + Ulysses) shard seq by cp_size * ulysses_size and are
+        # not validated here — they fall through to the plain + AG path.
         cp_size = vgm.cp_size if vgm is not None else 1
         self._has_cross_dual_attn = False
         if use_ulysses_cross and self._is_cross_attn and ulysses_size > 1 and cp_size == 1:
@@ -176,10 +173,8 @@ class LTX2Attention(Attention):
                 attention_config=config.attention,
                 attention_metadata_state=config.attention_metadata_state,
             )
-            # VanillaAttention.support_fused_qkv() is False, so UlyssesAttention
-            # takes the unfused path (Q + K + V independent 4D a2a + output).
-            # The unfused path handles S_q != S_kv correctly via the inner
-            # backend's seq_len / seq_len_kv kwargs.
+            # UlyssesAttention takes the unfused path (S_q != S_kv supported
+            # via seq_len / seq_len_kv) since VanillaAttention.support_fused_qkv() is False.
             self._ulysses_cross_attn = UlyssesAttention(
                 inner_backend=inner,
                 process_group=vgm.ulysses_group,
@@ -532,14 +527,10 @@ class BasicAVTransformerBlock(nn.Module):
         self.scale_shift_table = nn.Parameter(torch.empty(6, cfg.dim))
 
     def _init_audio_modules(self, cfg, rope_type, eps, model_config, idx):
-        # audio_attn1 may receive padded audio (when audio_pad_for_ulysses=True
-        # and T_a % U != 0) and relies on key_padding_mask to zero attention
-        # to padded K positions. The TRTLLM self-attn backend silently ignores
-        # ``key_padding_mask``, which would let valid Q tokens attend to padded
-        # K and corrupt the real audio stream. Mirror the existing cross-attn
-        # TRTLLM→VANILLA fallback (modules/attention.py) and downgrade audio
-        # self-attn to VANILLA in that case. Audio is small (T_a ~ 126) so the
-        # backend downgrade is negligible (<<1ms/step).
+        # TRTLLM self-attn silently drops key_padding_mask, which would let
+        # valid Q attend to padded K and corrupt the audio stream. Mirror the
+        # existing cross-attn TRTLLM→VANILLA fallback (modules/attention.py);
+        # audio is small (T_a ~ 126) so the downgrade is negligible.
         audio_self_config = model_config
         if (
             model_config.parallel.audio_pad_for_ulysses
@@ -834,23 +825,17 @@ class BasicAVTransformerBlock(nn.Module):
                 ax_scaled = ax_norm3 * (1 + scale_ca_audio_v2a) + shift_ca_audio_v2a
                 vx_scaled = vx_norm3 * (1 + scale_ca_video_v2a) + shift_ca_video_v2a
 
-                # Project-before-gather (video → audio direction). RoPE applied
-                # to K in project_kv on local shard; see audio→video branch above.
-                # Strict-Ulysses v2a: when the v2a Ulysses wrapper is active,
-                # K/V (video, large) stay seq-sharded and the wrapper handles
-                # the Q a2a + fused K|V 5D a2a (or independent 4D a2a when the
-                # underlying backend doesn't support fused QKV) + output a2a.
-                # RoPE commutes with a2a along the seq dim, so
-                # rotate-before-gather is value-preserving. No key_padding_mask
-                # — video K/V is unpadded; padded audio Q is stripped on exit
-                # by LTXModel.forward.
-                # When the wrapper is not active (no Ulysses build, or Stage 2
-                # disable, or audio not sharded), we fall back to the
-                # all-gather path so the plain backend gets full K/V.
-                # The gate uses the attention module's own state rather than
-                # ``_audio_is_sharded`` because the latter can be true under
-                # Attention2D (generic sequence parallelism, ulysses_size==1)
-                # where the Ulysses wrapper was never built.
+                # v2a: when the Ulysses wrapper is active, K/V (video, large)
+                # stay seq-sharded and the wrapper handles Q + K|V + output
+                # a2a internally. RoPE is applied to K in project_kv on the
+                # local shard (commutes with a2a along the seq dim, so
+                # rotate-before-gather is value-preserving). No
+                # key_padding_mask — video K/V is unpadded; padded audio Q is
+                # stripped on exit by LTXModel.forward. When inactive (no
+                # wrapper built, Stage 2 disable, or audio not sharded), fall
+                # back to AG so the plain backend sees full K/V. Gate on
+                # is_ulysses_active() — _audio_is_sharded can be true under
+                # Attention2D where no wrapper was built.
                 k_v2a, v_v2a = self.video_to_audio_attn.project_kv(
                     vx_scaled, pe=video.cross_positional_embeddings
                 )
@@ -1068,14 +1053,7 @@ class LTXModel(nn.Module):
             )
 
         self._audio_is_sharded = False
-        # Audio pad slots for Ulysses (set by configure_audio_ulysses when
-        # parallel.audio_pad_for_ulysses=True and T_a % U != 0). Read by
-        # forward() to shape the [B, S_full_padded] mask and strip on exit.
-        self._audio_pad = 0
-        # Config gate for "pad audio to multiple of U + mask attention". Default
-        # True so production benefits from full Ulysses scaling at any T_a.
-        # Set false in YAML parallel.audio_pad_for_ulysses to fall back to the
-        # naturally-divisible-only behavior (wrapper engages iff T_a % U == 0).
+        self._audio_pad = 0  # set by configure_audio_ulysses
         self._audio_pad_for_ulysses = model_config.parallel.audio_pad_for_ulysses
         self._cache_dit_video_args: Optional[TransformerArgs] = None
         self._cache_dit_audio_args: Optional[TransformerArgs] = None
@@ -1633,10 +1611,8 @@ class LTXModel(nn.Module):
                 audio_context, audio_context_mask, audio_positions, dtype
             )
             a_kv = [block.audio_attn2.project_kv(a_ctx) for block in self.transformer_blocks]
-            # Extend audio PE to the padded length once, so per-step forward
-            # doesn't redo it. configure_audio_ulysses runs before this and
-            # has set self._audio_pad (0 when no pad). Seq dim per rope type:
-            # SPLIT cos = [B, H, T, D] → 2; INTERLEAVED cos = [B, T, D] → 1.
+            # Extend audio PE to padded length once at cache-build time.
+            # seq_dim per rope type: SPLIT cos [B,H,T,D] → 2, INTERLEAVED [B,T,D] → 1.
             if self._audio_pad > 0:
                 pe_seq_dim = 2 if (a_pe is not None and a_pe[0].ndim == 4) else 1
                 a_pe = self._pad_pe(a_pe, self._audio_pad, seq_dim=pe_seq_dim)
