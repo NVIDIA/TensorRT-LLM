@@ -93,6 +93,7 @@ def Field(default: Any = ...,
     Returns:
         A Pydantic FieldInfo object with the status added to json_schema_extra if provided
     """
+
     if status is not None:
         json_schema_extra = kwargs.get('json_schema_extra', {})
         if isinstance(json_schema_extra, dict):
