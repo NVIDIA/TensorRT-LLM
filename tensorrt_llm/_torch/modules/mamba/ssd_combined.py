@@ -47,9 +47,17 @@ _FLASHINFER_SSD_VALID_HEAD_DIMS = (64, 128)
 
 
 def _flashinfer_ssd_supported(chunk_size, dstate, headdim):
+    # The kernel was written for Nemotron-H (chunk_size=128, dstate=128) and has a
+    # bug in tma_partition_for_mma_b_operand: it tiles the B SSM operand with
+    # tile_shape_mnk_intra2[1:] = (headdim, chunk_size) instead of the correct
+    # tile_shape_mnk_intra1[1:] = (chunk_size, dstate), making gmem K-mode =
+    # chunk_size/16 mismatch smem K-mode = dstate/16. Only compiles when
+    # dstate == chunk_size (masked the bug for NemotronH). See
+    # https://github.com/flashinfer-ai/flashinfer/issues/3397 for upstream fix.
     return (chunk_size in _FLASHINFER_SSD_VALID_M_MODES
             and dstate in _FLASHINFER_SSD_VALID_M_MODES
-            and headdim in _FLASHINFER_SSD_VALID_HEAD_DIMS)
+            and headdim in _FLASHINFER_SSD_VALID_HEAD_DIMS
+            and dstate == chunk_size)
 
 
 @functools.cache
