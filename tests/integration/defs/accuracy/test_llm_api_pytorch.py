@@ -3776,9 +3776,9 @@ class TestDeepSeekV4Flash(LlmapiAccuracyTestHarness):
                  max_seq_len=4096,
                  kv_cache_config=kv_cache_config) as llm:
             task = MMLU(self.MODEL_NAME)
-            task.evaluate(llm, is_integration_test=True)
+            task.evaluate(llm)
             task = GSM8K(self.MODEL_NAME)
-            task.evaluate(llm, is_integration_test=True)
+            task.evaluate(llm)
 
     @pytest.mark.skip_less_mpi_world_size(4)
     @parametrize_with_ids("moe_backend", [
