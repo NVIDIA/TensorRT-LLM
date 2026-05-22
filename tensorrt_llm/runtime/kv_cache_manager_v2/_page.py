@@ -20,6 +20,7 @@ from typing import TYPE_CHECKING, NamedTuple, cast
 from . import rawref
 from ._block_radix_tree import Block
 from ._common import (
+    BAD_BLOCK_ORDINAL,
     BAD_PAGE_INDEX,
     DEFAULT_BEAM_INDEX,
     GPU_LEVEL,
@@ -419,7 +420,9 @@ class _SharedPageLock:
         old_base_index = kv_cache._update_base_page_index(
             beam_index, ordinal, life_cycle, new_index
         )
-        assert NDEBUG or old_base_index == self._get_base_page_index()
+        assert NDEBUG or old_base_index == (
+            self._get_base_page_index() if ordinal != BAD_BLOCK_ORDINAL else BAD_PAGE_INDEX
+        )
         self._uniq_lock = None
         return page
 
@@ -472,3 +475,34 @@ def batched_lock_to_gpu(
         page.lock(kv_cache, beam_index, ordinal, life_cycle, skip_wait=True)
         for page, beam_index, ordinal, life_cycle in tasks
     ]
+
+
+@dataclass(slots=True)
+class ScratchSlotLock:
+    slot: Slot
+    owner: rawref.ref["_KVCache"]
+    life_cycle: LifeCycleId
+
+    def __init__(
+        self, slot: Slot, kv_cache: "_KVCache", life_cycle: LifeCycleId, skip_wait: bool = False
+    ):
+        if not skip_wait:
+            slot.ready_event.wait_in_stream(kv_cache.cuda_stream)
+        self.slot = slot.move_to_new_slot()
+        self.owner = rawref.ref(kv_cache)
+        self.life_cycle = life_cycle
+
+    def detach_slot(self) -> Slot:
+        assert self.slot.has_valid_slot
+        return self.slot.move_to_new_slot()
+
+    def unlock(self):
+        assert self.slot.has_valid_slot
+        kv_cache = unwrap_rawref(self.owner)
+        self.slot.ready_event = kv_cache.finish_event
+        kv_cache.manager._storage.release_slot(self.life_cycle, GPU_LEVEL, self.slot)
+        assert not self.slot.has_valid_slot
+
+    def __del__(self):
+        if self.slot.has_valid_slot:
+            self.unlock()

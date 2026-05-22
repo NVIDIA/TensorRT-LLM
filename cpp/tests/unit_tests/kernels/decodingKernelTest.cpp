@@ -287,6 +287,190 @@ TEST_F(TestBeamHypothesesCopy, SingleBatchTest)
     checkAllEqual();
 }
 
+void runFinalizeKeepsPromptPrefixFromUnfinishedIds(SizeType32 beamWidth)
+{
+    SizeType32 constexpr batchSize{2};
+    SizeType32 constexpr maxSeqLen{9};
+    auto constexpr nvTokenIdType = TRTDataType<TokenIdType>::value;
+    auto constexpr nvSizeType = TRTDataType<SizeType32>::value;
+    auto constexpr nvFloatType = TRTDataType<float>::value;
+    auto constexpr nvBoolType = TRTDataType<bool>::value;
+
+    auto stream = std::make_shared<tensorrt_llm::runtime::CudaStream>();
+    auto bufferManager = std::make_shared<tensorrt_llm::runtime::BufferManager>(stream);
+
+    auto const idsShape = ITensor::makeShape({batchSize, beamWidth, maxSeqLen});
+    auto const cbaShape = ITensor::makeShape({batchSize, beamWidth * 2, maxSeqLen});
+    auto const beamShape = ITensor::makeShape({batchSize, beamWidth});
+    auto const cbaBeamShape = ITensor::makeShape({batchSize, beamWidth * 2});
+
+    auto outputIds = bufferManager->gpu(idsShape, nvTokenIdType);
+    auto outputIdsUnfinish = bufferManager->gpu(idsShape, nvTokenIdType);
+    auto parentIdsUnfinish = bufferManager->gpu(idsShape, nvSizeType);
+    auto outputIdsCBA = bufferManager->gpu(cbaShape, nvTokenIdType);
+    auto sequenceLengths = bufferManager->gpu(beamShape, nvSizeType);
+    auto inputLengths = bufferManager->gpu(beamShape, nvSizeType);
+    auto cumLogProbs = bufferManager->gpu(beamShape, nvFloatType);
+    auto sequenceLengthsCBA = bufferManager->gpu(cbaBeamShape, nvSizeType);
+    auto cumLogProbsCBA = bufferManager->gpu(cbaBeamShape, nvFloatType);
+    auto normedScoresCBA = bufferManager->gpu(cbaBeamShape, nvFloatType);
+    auto numBeamsCBA = bufferManager->gpu(ITensor::makeShape({batchSize}), nvSizeType);
+    auto batchDones = bufferManager->gpu(ITensor::makeShape({batchSize}), nvBoolType);
+    auto lengthPenalties = bufferManager->gpu(ITensor::makeShape({batchSize}), nvFloatType);
+
+    std::vector<TokenIdType> outputIdsHost(batchSize * beamWidth * maxSeqLen, 0);
+    std::vector<TokenIdType> outputIdsUnfinishHost(batchSize * beamWidth * maxSeqLen, -1);
+    std::vector<SizeType32> parentIdsUnfinishHost(batchSize * beamWidth * maxSeqLen, 0);
+    std::vector<TokenIdType> outputIdsCBAHost(batchSize * beamWidth * 2 * maxSeqLen, -777);
+    std::vector<SizeType32> sequenceLengthsHost(batchSize * beamWidth, 0);
+    std::vector<SizeType32> inputLengthsHost(batchSize * beamWidth, 0);
+    std::vector<float> cumLogProbsHost(batchSize * beamWidth, 0.0f);
+    std::vector<SizeType32> sequenceLengthsCBAHost(batchSize * beamWidth * 2, 0);
+    std::vector<float> cumLogProbsCBAHost(batchSize * beamWidth * 2, -100.0f);
+    std::vector<float> normedScoresCBAHost(batchSize * beamWidth * 2, -100.0f);
+    std::vector<SizeType32> numBeamsCBAHost(batchSize, beamWidth);
+    bool batchDonesHost[batchSize] = {false, false};
+    float lengthPenaltiesHost[batchSize] = {0.0f, 0.0f};
+
+    auto promptToken = [](SizeType32 batchIdx, SizeType32 pos) -> TokenIdType
+    { return static_cast<TokenIdType>((batchIdx + 1) * 100 + pos); };
+    auto unfinishedToken = [](SizeType32 batchIdx, SizeType32 beamIdx, SizeType32 pos) -> TokenIdType
+    { return static_cast<TokenIdType>(1000 + batchIdx * 100 + beamIdx * 10 + pos); };
+    auto cbaToken = [](SizeType32 batchIdx, SizeType32 cbaIdx, SizeType32 pos) -> TokenIdType
+    { return static_cast<TokenIdType>(3000 + batchIdx * 100 + cbaIdx * 10 + pos); };
+    auto inputLengthForBatch = [](SizeType32 batchIdx) -> SizeType32 { return batchIdx == 0 ? 3 : 5; };
+    auto sequenceLengthForBatch = [](SizeType32 batchIdx) -> SizeType32 { return batchIdx == 0 ? 7 : 8; };
+
+    for (SizeType32 batchIdx = 0; batchIdx < batchSize; ++batchIdx)
+    {
+        SizeType32 const inputLength = inputLengthForBatch(batchIdx);
+        SizeType32 const sequenceLength = sequenceLengthForBatch(batchIdx);
+        SizeType32 const idsBatchOffset = batchIdx * beamWidth * maxSeqLen;
+        SizeType32 const cbaBatchOffset = batchIdx * beamWidth * 2 * maxSeqLen;
+        SizeType32 const cbaBeamOffset = batchIdx * beamWidth * 2;
+
+        for (SizeType32 beamIdx = 0; beamIdx < beamWidth; ++beamIdx)
+        {
+            SizeType32 const beamOffset = idsBatchOffset + beamIdx * maxSeqLen;
+            inputLengthsHost[batchIdx * beamWidth + beamIdx] = inputLength;
+            sequenceLengthsHost[batchIdx * beamWidth + beamIdx] = sequenceLength;
+            cumLogProbsHost[batchIdx * beamWidth + beamIdx]
+                = beamWidth == 1 ? 12.0f : (beamIdx == 1 ? 12.0f : 5.0f + beamIdx * 3.0f);
+
+            for (SizeType32 pos = 0; pos < sequenceLength; ++pos)
+            {
+                outputIdsUnfinishHost[beamOffset + pos]
+                    = pos < inputLength ? promptToken(batchIdx, pos) : unfinishedToken(batchIdx, beamIdx, pos);
+                parentIdsUnfinishHost[beamOffset + pos] = beamIdx;
+            }
+        }
+
+        for (SizeType32 cbaIdx = 0; cbaIdx < beamWidth; ++cbaIdx)
+        {
+            sequenceLengthsCBAHost[cbaBeamOffset + cbaIdx] = sequenceLength;
+            normedScoresCBAHost[cbaBeamOffset + cbaIdx]
+                = beamWidth == 1 ? 10.0f : (cbaIdx == 1 ? 10.0f : 1.0f - cbaIdx * 2.0f);
+            cumLogProbsCBAHost[cbaBeamOffset + cbaIdx] = normedScoresCBAHost[cbaBeamOffset + cbaIdx];
+            for (SizeType32 pos = inputLength; pos < sequenceLength; ++pos)
+            {
+                outputIdsCBAHost[cbaBatchOffset + cbaIdx * maxSeqLen + pos] = cbaToken(batchIdx, cbaIdx, pos);
+            }
+        }
+    }
+
+    bufferManager->copy(outputIdsHost.data(), *outputIds);
+    bufferManager->copy(outputIdsUnfinishHost.data(), *outputIdsUnfinish);
+    bufferManager->copy(parentIdsUnfinishHost.data(), *parentIdsUnfinish);
+    bufferManager->copy(outputIdsCBAHost.data(), *outputIdsCBA);
+    bufferManager->copy(sequenceLengthsHost.data(), *sequenceLengths);
+    bufferManager->copy(inputLengthsHost.data(), *inputLengths);
+    bufferManager->copy(cumLogProbsHost.data(), *cumLogProbs);
+    bufferManager->copy(sequenceLengthsCBAHost.data(), *sequenceLengthsCBA);
+    bufferManager->copy(cumLogProbsCBAHost.data(), *cumLogProbsCBA);
+    bufferManager->copy(normedScoresCBAHost.data(), *normedScoresCBA);
+    bufferManager->copy(numBeamsCBAHost.data(), *numBeamsCBA);
+    bufferManager->copy(batchDonesHost, *batchDones);
+    bufferManager->copy(lengthPenaltiesHost, *lengthPenalties);
+    stream->synchronize();
+
+    tk::BeamHypotheses bh;
+    bh.nMaxBatchSize = batchSize;
+    bh.nBatchSize = batchSize;
+    bh.nBeamWidth = beamWidth;
+    bh.nMaxSeqLen = maxSeqLen;
+    bh.lengthPenalties = bufferCast<float>(*lengthPenalties);
+    bh.inputLengths = bufferCast<SizeType32>(*inputLengths);
+    bh.outputIds = bufferCast<TokenIdType>(*outputIds);
+    bh.sequenceLengths = bufferCast<SizeType32>(*sequenceLengths);
+    bh.cumLogProbs = bufferCast<float>(*cumLogProbs);
+    bh.outputIdsCBA = bufferCast<TokenIdType>(*outputIdsCBA);
+    bh.sequenceLengthsCBA = bufferCast<SizeType32>(*sequenceLengthsCBA);
+    bh.cumLogProbsCBA = bufferCast<float>(*cumLogProbsCBA);
+    bh.normedScoresCBA = bufferCast<float>(*normedScoresCBA);
+    bh.numBeamsCBA = bufferCast<SizeType32>(*numBeamsCBA);
+    bh.batchDones = bufferCast<bool>(*batchDones);
+    bh.outputIdsUnfinish = bufferCast<TokenIdType>(*outputIdsUnfinish);
+    bh.parentIdsUnfinish = bufferCast<SizeType32>(*parentIdsUnfinish);
+
+    tk::invokeInsertUnfinishedPath(bh, stream->get());
+    tk::invokeFinalize(bh, stream->get());
+    stream->synchronize();
+
+    auto outputIdsResult = bufferManager->copyFrom(*outputIds, MemoryType::kCPU);
+    auto sequenceLengthsResult = bufferManager->copyFrom(*sequenceLengths, MemoryType::kCPU);
+    stream->synchronize();
+    auto const outputIdsPtr = bufferCast<TokenIdType>(*outputIdsResult);
+    auto const sequenceLengthsPtr = bufferCast<SizeType32>(*sequenceLengthsResult);
+
+    for (SizeType32 batchIdx = 0; batchIdx < batchSize; ++batchIdx)
+    {
+        SizeType32 const inputLength = inputLengthForBatch(batchIdx);
+        SizeType32 const sequenceLength = sequenceLengthForBatch(batchIdx);
+        for (SizeType32 beamIdx = 0; beamIdx < beamWidth; ++beamIdx)
+        {
+            EXPECT_EQ(sequenceLengthsPtr[batchIdx * beamWidth + beamIdx], sequenceLength);
+            SizeType32 selectedCbaIdx = 0;
+            if (beamWidth == 1)
+            {
+                selectedCbaIdx = 1;
+            }
+            else
+            {
+                selectedCbaIdx = beamIdx == 0 ? 4 : (beamIdx == 1 ? 5 : 1);
+            }
+
+            for (SizeType32 pos = 0; pos < sequenceLength; ++pos)
+            {
+                TokenIdType expected = promptToken(batchIdx, pos);
+                if (pos >= inputLength)
+                {
+                    if (selectedCbaIdx >= beamWidth)
+                    {
+                        expected = unfinishedToken(batchIdx, selectedCbaIdx - beamWidth, pos);
+                    }
+                    else
+                    {
+                        expected = cbaToken(batchIdx, selectedCbaIdx, pos);
+                    }
+                }
+                SizeType32 const dst = batchIdx * beamWidth * maxSeqLen + beamIdx * maxSeqLen + pos;
+                EXPECT_EQ(outputIdsPtr[dst], expected)
+                    << "batchIdx=" << batchIdx << ", beamIdx=" << beamIdx << ", pos=" << pos;
+            }
+        }
+    }
+}
+
+TEST(BeamHypothesesFinalizeTest, KeepsPromptPrefixFromUnfinishedIds)
+{
+    runFinalizeKeepsPromptPrefixFromUnfinishedIds(3);
+}
+
+TEST(BeamHypothesesFinalizeTest, KeepsPromptPrefixFromUnfinishedIdsBeamWidthOne)
+{
+    runFinalizeKeepsPromptPrefixFromUnfinishedIds(1);
+}
+
 /**
  * @brief Fills a slice of a tensor with data from a source array.
  *

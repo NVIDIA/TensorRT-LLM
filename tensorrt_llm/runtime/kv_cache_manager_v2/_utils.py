@@ -128,6 +128,9 @@ class HalfOpenRange(tuple[Idx, Idx], Generic[Idx]):
     def __len__(self) -> int:
         return max(0, self[1] - self[0])
 
+    def __contains__(self, item: Any) -> bool:
+        return self[0] <= item < self[1]
+
 
 def intersect(a: HalfOpenRange[Idx], b: HalfOpenRange[Idx]) -> HalfOpenRange[Idx]:
     """Returns the intersection of two half-open ranges [beg, end).
@@ -266,7 +269,7 @@ class TypedIndexList(Protocol[Index, T]):
 
 
 # @TODO: use this where applicable.
-def to_typed(index_type: Type[Index], lst: list[T]) -> TypedIndexList[Index, T]:
+def to_typed(index_type: Callable[[Any], Index], lst: list[T]) -> TypedIndexList[Index, T]:
     """
     Casts a standard list to a TypedIndexList with a strongly typed integer index.
 

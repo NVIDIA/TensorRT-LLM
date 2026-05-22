@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -32,7 +32,7 @@ import yaml
 from defs.common import get_free_port_in_ci as get_free_port
 from defs.common import parse_gsm8k_output, wait_for_server
 from defs.conftest import (get_sm_version, llm_models_root, skip_arm,
-                           skip_no_hopper, skip_pre_blackwell)
+                           skip_no_hopper, skip_pre_blackwell, skip_pre_hopper)
 from defs.trt_test_alternative import check_call, check_output, print_info
 from disagg_test_utils import (ProcessWrapper, run_ctx_worker,
                                run_disagg_server, run_gen_worker, terminate,
@@ -61,7 +61,13 @@ def get_ucx_tls():
 
     Pre-Hopper GPUs need cuda_ipc excluded from UCX transports.
     """
-    if get_sm_version() < 90:
+    sm = get_sm_version()
+    """
+    ON some gb300 cluster,  we need to set `cuda_copy,cuda_ipc,sm,self,tcp` for UCX_TLS
+    """
+    if sm == 103:
+        return "cuda_copy,cuda_ipc,sm,self,tcp"
+    if sm < 90:
         return "^cuda_ipc,ib,gdr_copy"
     return "^ib,gdr_copy"
 
@@ -155,6 +161,14 @@ def get_test_config(test_desc, example_dir, test_root):
         f"{test_configs_root}/disagg_config_gen_only_bs1.yaml",
         "gen_only_insufficient_kv":
         f"{test_configs_root}/disagg_config_gen_only_insufficient_kv.yaml",
+        "kv_cache_aware":
+        f"{test_configs_root}/disagg_config_gen_only_kv_cache_aware.yaml",
+        "round_robin":
+        f"{test_configs_root}/disagg_config_round_robin.yaml",
+        "load_balancing":
+        f"{test_configs_root}/disagg_config_load_balancing.yaml",
+        "conversation":
+        f"{test_configs_root}/disagg_config_conversation.yaml",
         "4_ranks":
         f"{test_configs_root}/disagg_config_ctxtp2_gentp1.yaml",
         "4_ranks_trt_backend":
@@ -175,8 +189,6 @@ def get_test_config(test_desc, example_dir, test_root):
         f"{test_configs_root}/disagg_config_overlap.yaml",
         "perf_metrics":
         f"{test_configs_root}/disagg_config_metrics.yaml",
-        "trtllm_sampler":
-        f"{test_configs_root}/disagg_config_trtllm_sampler.yaml",
         "load_balance":
         f"{test_configs_root}/disagg_config_load_balance.yaml",
         "cache_aware_balance":
@@ -255,6 +267,8 @@ def get_test_config(test_desc, example_dir, test_root):
         f"{test_configs_root}/disagg_config_cancel_stress_test_large.yaml",
         "llama31_8b_ucx":
         f"{test_configs_root}/disagg_config_ctxtp2_gentp2_llama31_8b_ucx.yaml",
+        "mamba_conc_greater_than_mbs":
+        f"{test_configs_root}/disagg_config_mamba_conc_greater_than_mbs.yaml",
     }
 
     if test_desc not in config_map:
@@ -305,7 +319,7 @@ def get_client_test_set(test_desc):
                              verify_streaming_completion=True,
                              verify_chat=False,
                              verify_streaming_chat=False)
-    if test_desc.startswith("overlap") or test_desc == "trtllm_sampler":
+    if test_desc.startswith("overlap"):
         return ClientTestSet(completion=True,
                              completion_streaming=True,
                              chat=True,
@@ -597,10 +611,13 @@ def run_disaggregated_test(example_dir,
             "https://nvbugs/5584607 Ray orchestrator is not supported with NIXL(DEFAULT) cache transceiver backend."
         )
 
+    run_env = env.copy() if env else os.environ.copy()
+    run_env["UCX_TLS"] = get_ucx_tls()
+
     config_file = get_test_config(test_desc, example_dir,
                                   os.path.dirname(__file__))
     config, ctx_workers, gen_workers, disagg_server, server_port, work_dir = \
-        setup_disagg_cluster(config_file, model_name=model_path, env=env, cwd=cwd,
+        setup_disagg_cluster(config_file, model_name=model_path, env=run_env, cwd=cwd,
                              schedule_style=disagg_schedule_style)
 
     server_host = config.get("hostname", "localhost")
@@ -627,7 +644,7 @@ def run_disaggregated_test(example_dir,
             client_config_file,
             test_desc,
             num_iters,
-            env,
+            run_env,
             300,  # timeout
             prompt_file,
             extra_endpoints_test,
@@ -652,6 +669,7 @@ def test_disaggregated_diff_max_tokens(disaggregated_test_root,
                            "2_ranks_diff_max_tokens",
                            env=llm_venv._new_env,
                            prompt_file="long_prompts.json",
+                           model_path=llama_model_root,
                            cwd=llm_venv.get_working_directory())
 
 
@@ -668,6 +686,7 @@ def test_disaggregated_single_gpu(disaggregated_test_root,
     run_disaggregated_test(disaggregated_example_root,
                            "2_ranks",
                            env=env,
+                           model_path=llama_model_root,
                            cwd=llm_venv.get_working_directory())
 
 
@@ -684,6 +703,7 @@ def test_disaggregated_single_gpu_trt_backend(disaggregated_test_root,
     run_disaggregated_test(disaggregated_example_root,
                            "2_ranks_trt_backend",
                            env=env,
+                           model_path=llama_model_root,
                            cwd=llm_venv.get_working_directory())
 
 
@@ -700,6 +720,39 @@ def test_disaggregated_benchmark_gen_only(disaggregated_test_root,
     run_disaggregated_test(disaggregated_example_root,
                            "gen_only",
                            env=env,
+                           model_path=llama_model_root,
+                           cwd=llm_venv.get_working_directory())
+
+
+@pytest.mark.parametrize("router_type",
+                         ["load_balancing", "kv_cache_aware", "conversation"])
+@pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
+                         indirect=True)
+def test_disaggregated_router(disaggregated_test_root,
+                              disaggregated_example_root, llm_venv,
+                              llama_model_root, router_type, tmp_path):
+    setup_model_symlink(llm_venv, llama_model_root,
+                        "TinyLlama/TinyLlama-1.1B-Chat-v1.0")
+
+    metrics_file = tmp_path / f"perf_metrics_{router_type}.json"
+
+    def fetch_perf_metrics(server_url: str):
+        import json
+
+        import requests as http_requests
+        resp = http_requests.get(f"{server_url}/perf_metrics", timeout=10)
+        assert resp.status_code == 200, \
+            f"Failed to fetch perf_metrics: {resp.status_code}"
+        metrics = resp.json()
+        metrics_file.write_text(json.dumps(metrics, indent=2))
+        logger.info(f"Router={router_type}: saved {len(metrics)} perf metrics "
+                    f"to {metrics_file}")
+
+    run_disaggregated_test(disaggregated_example_root,
+                           router_type,
+                           env=llm_venv._new_env,
+                           extra_endpoints_test=fetch_perf_metrics,
+                           model_path=llama_model_root,
                            cwd=llm_venv.get_working_directory())
 
 
@@ -716,6 +769,7 @@ def test_disaggregated_benchmark_gen_only_trt_backend(
     run_disaggregated_test(disaggregated_example_root,
                            "gen_only_trt_backend",
                            env=env,
+                           model_path=llama_model_root,
                            cwd=llm_venv.get_working_directory())
 
 
@@ -734,12 +788,14 @@ def test_disaggregated_benchmark_gen_only_insufficient_kv(
     env = llm_venv._new_env.copy()
     env['TRTLLM_DISAGG_BENCHMARK_GEN_ONLY'] = '1'
     env['TLLM_BENCHMARK_REQ_QUEUES_SIZE'] = '64'
+    env["UCX_TLS"] = get_ucx_tls()
 
     config_file = get_test_config("gen_only_insufficient_kv",
                                   disaggregated_example_root,
                                   os.path.dirname(__file__))
     config, ctx_workers, gen_workers, disagg_server, server_port, work_dir = \
         setup_disagg_cluster(config_file,
+                             model_name=llama_model_root,
                              env=env,
                              cwd=llm_venv.get_working_directory())
 
@@ -793,6 +849,7 @@ def test_disaggregated_genbs1(disaggregated_test_root,
     run_disaggregated_test(disaggregated_example_root,
                            "gen_only_bs1",
                            env=env,
+                           model_path=llama_model_root,
                            cwd=llm_venv.get_working_directory())
 
 
@@ -808,6 +865,7 @@ def test_disaggregated_multi_gpu(disaggregated_test_root,
     run_disaggregated_test(disaggregated_example_root,
                            "4_ranks",
                            env=llm_venv._new_env,
+                           model_path=llama_model_root,
                            cwd=llm_venv.get_working_directory())
 
 
@@ -823,6 +881,7 @@ def test_disaggregated_multi_gpu_trt_backend(disaggregated_test_root,
     run_disaggregated_test(disaggregated_example_root,
                            "4_ranks_trt_backend",
                            env=llm_venv._new_env,
+                           model_path=llama_model_root,
                            cwd=llm_venv.get_working_directory())
 
 
@@ -836,6 +895,7 @@ def test_disaggregated_cuda_graph(disaggregated_test_root, llm_venv,
     run_disaggregated_test(disaggregated_example_root,
                            "cuda_graph",
                            env=llm_venv._new_env,
+                           model_path=llama_model_root,
                            cwd=llm_venv.get_working_directory())
 
 
@@ -849,6 +909,7 @@ def test_disaggregated_mixed(disaggregated_test_root, llm_venv,
     run_disaggregated_test(disaggregated_example_root,
                            "mixed",
                            env=llm_venv._new_env,
+                           model_path=llama_model_root,
                            cwd=llm_venv.get_working_directory())
 
 
@@ -862,9 +923,12 @@ def test_disaggregated_overlap(disaggregated_test_root, llm_venv,
     run_disaggregated_test(disaggregated_example_root,
                            "overlap",
                            env=llm_venv._new_env,
+                           model_path=llama_model_root,
                            cwd=llm_venv.get_working_directory())
 
 
+@skip_pre_hopper
+@pytest.mark.skip_less_device(8)
 @pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
                          indirect=True)
 @pytest.mark.parametrize("ctx_pp", [1, 4], ids=["ctx_pp1", "ctx_pp4"])
@@ -884,6 +948,7 @@ def test_disaggregated_overlap_gen_first(disaggregated_test_root,
         disaggregated_example_root,
         "overlap_gen_first" if ctx_pp == 1 else "overlap_gen_first_pp4",
         env=llm_venv._new_env,
+        model_path=llama_model_root,
         cwd=llm_venv.get_working_directory(),
         disagg_schedule_style="generation_first")
 
@@ -901,6 +966,7 @@ def test_disaggregated_overlap_transceiver_runtime_python(
     run_disaggregated_test(disaggregated_example_root,
                            "overlap_transceiver_runtime_python",
                            env=env,
+                           model_path=llama_model_root,
                            cwd=llm_venv.get_working_directory())
 
 
@@ -921,6 +987,7 @@ def test_disaggregated_perf_metrics(disaggregated_test_root, llm_venv,
                            "perf_metrics",
                            env=llm_venv._new_env,
                            extra_endpoints_test=extra_endpoints_test,
+                           model_path=llama_model_root,
                            cwd=llm_venv.get_working_directory())
 
 
@@ -938,6 +1005,7 @@ def test_disaggregated_chat_completion_tool_calls(disaggregated_test_root,
                            num_iters=1,
                            prompt_file="tool_call_prompts.json",
                            env=llm_venv._new_env,
+                           model_path=llama_model_root,
                            cwd=llm_venv.get_working_directory())
 
 
@@ -954,6 +1022,7 @@ def test_disaggregated_kv_cache_time_output(disaggregated_test_root, llm_venv,
                            "perf_metrics",
                            env=llm_venv._new_env
                            | {"TRTLLM_KVCACHE_TIME_OUTPUT_PATH": output_path},
+                           model_path=llama_model_root,
                            cwd=llm_venv.get_working_directory())
     assert os.path.isdir(output_path)
     send_file = os.path.join(output_path, "rank_0_send.csv")
@@ -985,20 +1054,6 @@ def test_disaggregated_kv_cache_time_output(disaggregated_test_root, llm_venv,
 
 @pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
                          indirect=True)
-def test_disaggregated_trtllm_sampler(disaggregated_test_root, llm_venv,
-                                      disaggregated_example_root,
-                                      llama_model_root):
-    setup_model_symlink(llm_venv, llama_model_root,
-                        "TinyLlama/TinyLlama-1.1B-Chat-v1.0")
-
-    run_disaggregated_test(disaggregated_example_root,
-                           "trtllm_sampler",
-                           env=llm_venv._new_env,
-                           cwd=llm_venv.get_working_directory())
-
-
-@pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
-                         indirect=True)
 def test_disaggregated_load_balance(disaggregated_test_root, llm_venv,
                                     disaggregated_example_root,
                                     llama_model_root):
@@ -1008,6 +1063,7 @@ def test_disaggregated_load_balance(disaggregated_test_root, llm_venv,
     run_disaggregated_test(disaggregated_example_root,
                            "load_balance",
                            env=llm_venv._new_env,
+                           model_path=llama_model_root,
                            cwd=llm_venv.get_working_directory())
 
 
@@ -1022,6 +1078,7 @@ def test_disaggregated_cache_aware_balance(disaggregated_test_root, llm_venv,
     run_disaggregated_test(disaggregated_example_root,
                            "cache_aware_balance",
                            env=llm_venv._new_env,
+                           model_path=llama_model_root,
                            cwd=llm_venv.get_working_directory())
 
 
@@ -1036,6 +1093,7 @@ def test_disaggregated_conditional(disaggregated_test_root, llm_venv,
     run_disaggregated_test(disaggregated_example_root,
                            "conditional",
                            env=llm_venv._new_env,
+                           model_path=llama_model_root,
                            cwd=llm_venv.get_working_directory())
 
 
@@ -1048,6 +1106,7 @@ def test_disaggregated_ngram(disaggregated_test_root, llm_venv,
     run_disaggregated_test(disaggregated_example_root,
                            "ngram",
                            env=llm_venv._new_env,
+                           model_path=llama_model_root,
                            cwd=llm_venv.get_working_directory())
 
 
@@ -1107,6 +1166,7 @@ def test_disaggregated_ctxtp2pp2_gentp2pp2(disaggregated_test_root, llm_venv,
     run_disaggregated_test(disaggregated_example_root,
                            "ctxtp2pp2_gentp2pp2",
                            env=llm_venv._new_env,
+                           model_path=llama_model_root,
                            cwd=llm_venv.get_working_directory())
 
 
@@ -1121,6 +1181,7 @@ def test_disaggregated_ctxpp4_genpp4(disaggregated_test_root, llm_venv,
     run_disaggregated_test(disaggregated_example_root,
                            "ctxpp4_genpp4",
                            env=llm_venv._new_env,
+                           model_path=llama_model_root,
                            cwd=llm_venv.get_working_directory())
 
 
@@ -1912,6 +1973,7 @@ def run_accuracy_test(model_path: str, server_url: str, concurrency: int,
         return False, accuracy_value
 
 
+@skip_pre_hopper
 @pytest.mark.parametrize("benchmark_model_root", ['DeepSeek-V3-Lite-bf16'],
                          indirect=True)
 def test_disaggregated_deepseek_v3_lite_bf16_empty_batch(
@@ -2287,7 +2349,7 @@ def test_disaggregated_logprobs_serving(disaggregated_test_root,
 
     env = llm_venv._new_env.copy()
     env["TRTLLM_USE_UCX_KVCACHE"] = "1"
-    env["UCX_TLS"] = "^ib,gdr_copy"
+    env["UCX_TLS"] = get_ucx_tls()
     ctx_workers, gen_workers, disagg_server, work_dir = [], [], None, None
     config, ctx_workers, gen_workers, disagg_server, server_port, work_dir = \
         setup_disagg_cluster(config_file, env=env,
@@ -2433,3 +2495,39 @@ def test_disaggregated_cancel_large_context_requests_long(
                                   requests_per_burst=32,
                                   model_path=model_dir,
                                   cwd=llm_venv.get_working_directory())
+
+
+@pytest.mark.skip_less_device(8)
+@skip_pre_blackwell
+@pytest.mark.parametrize("model_path",
+                         ['NVIDIA-Nemotron-3-Super-120B-A12B-FP8'])
+def test_disaggregated_mamba_conc_greater_than_mbs(disaggregated_example_root,
+                                                   llm_venv, model_path,
+                                                   benchmark_root,
+                                                   shared_gpt_path):
+    model_dir = f"{llm_models_root()}/{model_path}"
+    setup_model_symlink(llm_venv, model_dir, model_path)
+
+    config_file = get_test_config("mamba_conc_greater_than_mbs",
+                                  disaggregated_example_root,
+                                  os.path.dirname(__file__))
+
+    env = llm_venv._new_env.copy()
+    env["UCX_TLS"] = get_ucx_tls()
+    e2el, ttft = run_disaggregated_benchmark(
+        disaggregated_example_root,
+        config_file,
+        benchmark_root,
+        model_dir,
+        shared_gpt_path,
+        env=env,
+        num_prompts=40,
+        max_concurrency=4,
+        random_input_len=1024,
+        random_output_len=1024,
+        skip_warmup=True,
+        model_path=model_dir,
+        cwd=llm_venv.get_working_directory())
+    print(f"E2EL: {e2el} ms, TTFT: {ttft} ms")
+
+    assert e2el > 0 and ttft > 0

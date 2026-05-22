@@ -1,3 +1,17 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 import json
 from enum import Enum
 from pathlib import Path
@@ -9,7 +23,6 @@ import yaml
 from pydantic import BaseModel, ConfigDict, model_validator
 from pydantic import Field as PydanticField
 
-from tensorrt_llm._torch.visual_gen.mapping import DEFAULT_DIM_ORDER
 from tensorrt_llm.functional import AllReduceStrategy
 from tensorrt_llm.llmapi.utils import StrictBaseModel, set_api_status
 from tensorrt_llm.logger import logger
@@ -51,12 +64,81 @@ class PipelineComponent(str, Enum):
 # =============================================================================
 
 
+class SageAttentionConfig(StrictBaseModel):
+    """Configuration for SageAttention quantization (TRTLLM backend only).
+
+    SageAttention quantizes Q/K/V into FP8 (or INT8 for Q/K) with per-block
+    scaling factors, enabling faster attention kernels. Providing this config
+    to AttentionConfig enables SageAttention; omitting it (None) disables it.
+
+    Similar to ``sparse_attention_config`` for the base TRTLLM attention
+    backend — the presence of the config object signals enablement.
+
+    Currently these (num_elts_per_blk_q, num_elts_per_blk_k, num_elts_per_blk_v)
+    combinations are enabled:
+    - (1, 1, 1)
+    - (1, 4, 1)
+    - (1, 16, 1) [for qk_int8 == True only]
+    """
+
+    num_elts_per_blk_q: int = PydanticField(
+        1, ge=0, description="Elements per quantization block for Q (0 disables)"
+    )
+    num_elts_per_blk_k: int = PydanticField(
+        4, ge=0, description="Elements per quantization block for K (0 disables)"
+    )
+    num_elts_per_blk_v: int = PydanticField(
+        1, ge=0, description="Elements per quantization block for V (0 disables)"
+    )
+    qk_int8: bool = PydanticField(True, description="Use INT8 (vs E4M3) for Q/K quantization")
+
+
 class AttentionConfig(StrictBaseModel):
     """Configuration for Attention layers."""
 
     backend: Literal["VANILLA", "TRTLLM", "FA4"] = PydanticField(
         "VANILLA", description="Attention backend: VANILLA (PyTorch SDPA), TRTLLM, FA4"
     )
+    sage_attention_config: Optional[SageAttentionConfig] = PydanticField(
+        None,
+        description=(
+            "SageAttention config (TRTLLM backend only). "
+            "Set to a SageAttentionConfig instance to enable SageAttention; "
+            "leave as None to disable."
+        ),
+    )
+
+    @model_validator(mode="after")
+    def _validate_sage_attn_config(self) -> "AttentionConfig":
+        SUPPORTED_SAGE_CONFIGS = {
+            (1, 1, 1, False),
+            (1, 4, 1, False),
+            (1, 1, 1, True),
+            (1, 4, 1, True),
+            (1, 16, 1, True),
+        }
+
+        if self.sage_attention_config is not None:
+            if self.backend != "TRTLLM":
+                logger.critical(
+                    f"sage_attention_config requires backend='TRTLLM', "
+                    f"got backend='{self.backend}'. Either set backend='TRTLLM' "
+                    f"or remove sage_attention_config. Disabling SageAttention."
+                )
+                self.sage_attention_config = None
+                return self
+
+            if (
+                self.sage_attention_config.num_elts_per_blk_q,
+                self.sage_attention_config.num_elts_per_blk_k,
+                self.sage_attention_config.num_elts_per_blk_v,
+                self.sage_attention_config.qk_int8,
+            ) not in SUPPORTED_SAGE_CONFIGS:
+                logger.critical(
+                    f"Unsupported {self.sage_attention_config=}. Disabling SageAttention."
+                )
+                self.sage_attention_config = None
+        return self
 
 
 class ParallelConfig(StrictBaseModel):
@@ -64,18 +146,20 @@ class ParallelConfig(StrictBaseModel):
 
     Currently Supported:
         - dit_cfg_size: CFG (Classifier-Free Guidance) parallelism
-        - dit_ulysses_size: Ulysses sequence parallelism
+        - dit_ulysses_size: Ulysses head-sharding parallelism
+        - dit_attn2d_row_size, dit_attn2d_col_size: Attention2D context parallelism
 
     Not Yet Supported:
         - dit_tp_size: Tensor parallelism (not implemented)
-        - dit_ring_size: Ring attention (not implemented)
-        - dit_cp_size, dit_dp_size, dit_fsdp_size: Other parallelism types
+        - dit_ring_size: Ring attention context parallelism (not implemented)
+        - dit_dp_size, dit_fsdp_size: Other parallelism types
+        - Combining Ulysses and Attention2D (orthogonal in principle, not yet implemented)
 
     See mapping.py for more details.
 
     Example Configurations:
         1. cfg_size=1, ulysses_size=2 -> 2 GPUs (Ulysses only)
-           GPU 0-1: Single prompt, sequence parallelism across 2 GPUs
+           GPU 0-1: Single prompt, heads sharded across 2 GPUs
 
         2. cfg_size=2, ulysses_size=1 -> 2 GPUs (CFG only)
            GPU 0: Positive prompt
@@ -88,26 +172,27 @@ class ParallelConfig(StrictBaseModel):
         4. cfg_size=2, ulysses_size=4 -> 8 GPUs (CFG + Ulysses)
            GPU 0-3: CFG group 0 (positive), Ulysses parallel
            GPU 4-7: CFG group 1 (negative), Ulysses parallel
+
+        5. cfg_size=1, attn2d_row_size=2, attn2d_col_size=2 -> 4 GPUs (Attention2D only)
+           2x2 mesh: Q gathered across row group, K/V gathered across col group
     """
 
-    enable_parallel_vae: bool = True
+    parallel_vae_size: int = PydanticField(
+        1,
+        ge=1,
+        description="Number of ranks used for VAE parallelism. 1 disables parallel VAE.",
+    )
     parallel_vae_split_dim: Literal["width", "height"] = "width"
 
     # DiT Parallelism
-    dit_dp_size: int = PydanticField(1, ge=1)
+    dit_dp_size: int = PydanticField(1, ge=1)  # Not yet supported
     dit_tp_size: int = PydanticField(1, ge=1)  # Not yet supported
     dit_ulysses_size: int = PydanticField(1, ge=1)  # Supported
-    dit_ring_size: int = PydanticField(1, ge=1)  # Not yet supported
-    dit_cp_size: int = PydanticField(1, ge=1)
+    dit_ring_size: int = PydanticField(1, ge=1)  # Supported
+    dit_attn2d_row_size: int = PydanticField(1, ge=1)  # Supported
+    dit_attn2d_col_size: int = PydanticField(1, ge=1)  # Supported
     dit_cfg_size: int = PydanticField(1, ge=1)  # Supported
     dit_fsdp_size: int = PydanticField(1, ge=1)
-    dit_dim_order: str = PydanticField(
-        DEFAULT_DIM_ORDER,
-        description=(
-            "Outermost-to-innermost ordering of parallelism axes for the "
-            "DeviceMesh. Innermost = most contiguous ranks."
-        ),
-    )
 
     # Refiner Parallelism (Optional)
     refiner_dit_dp_size: int = 1
@@ -121,12 +206,29 @@ class ParallelConfig(StrictBaseModel):
     t5_fsdp_size: int = 1
 
     @property
+    def seq_parallel_size(self) -> int:
+        """Parallelism degree over the sequence/context axis.
+
+        Returns the active parallel degree: Attention2D total mesh size if enabled,
+        ring size if ring CP is enabled, otherwise Ulysses size (head-sharding).
+        Exactly one of these is active at a time; combining them is not yet implemented.
+        """
+        attn2d_size = self.dit_attn2d_row_size * self.dit_attn2d_col_size
+        if attn2d_size > 1:
+            cp_size = attn2d_size
+        elif self.dit_ring_size > 1:
+            cp_size = self.dit_ring_size
+        else:
+            cp_size = 1
+        return cp_size * self.dit_ulysses_size
+
+    @property
     def n_workers(self) -> int:
-        return self.dit_cfg_size * self.dit_ulysses_size
+        return self.dit_cfg_size * self.seq_parallel_size
 
     @property
     def total_parallel_size(self) -> int:
-        return self.dit_cfg_size * self.dit_tp_size * self.dit_ring_size * self.dit_ulysses_size
+        return self.dit_cfg_size * self.dit_tp_size * self.seq_parallel_size
 
     def validate_world_size(self, world_size: int) -> None:
         if self.total_parallel_size > world_size:
@@ -382,8 +484,9 @@ class VisualGenArgs(StrictBaseModel):
         "",
         description=(
             "Path to the learned LatentUpsampler checkpoint (.safetensors). "
-            "Required for LTX-2 two-stage pipelines. When provided, the "
-            "pipeline auto-selects LTX2TwoStagesPipeline."
+            "Optional for LTX-2 two-stage pipelines. When provided, the "
+            "pipeline auto-selects LTX2TwoStagesPipeline. If omitted, "
+            "TensorRT-LLM tries to discover it in the checkpoint directory."
         ),
     )
 
@@ -392,8 +495,9 @@ class VisualGenArgs(StrictBaseModel):
         "",
         description=(
             "Path to the distilled LoRA checkpoint (.safetensors) used in "
-            "the stage 2 refinement pass. The LoRA weights are merged into "
-            "the transformer for stage 2 denoising and un-merged afterwards."
+            "the stage 2 refinement pass. If omitted, TensorRT-LLM tries to "
+            "discover it in the checkpoint directory. The LoRA weights are "
+            "merged into the transformer for stage 2 denoising and un-merged afterwards."
         ),
     )
 
@@ -568,10 +672,6 @@ class DiffusionModelConfig(BaseModel):
 
     # Unified parallelism mapping (populated by setup_visual_gen_mapping)
     visual_gen_mapping: Optional[Any] = None  # VisualGenMapping (lazy import)
-
-    # VAE parallelism (promoted from ParallelConfig for pipeline_loader)
-    enable_parallel_vae: bool = True
-    parallel_vae_split_dim: Literal["width", "height"] = "width"
 
     dynamic_weight_quant: bool = False
 
@@ -839,11 +939,11 @@ class DiffusionModelConfig(BaseModel):
         checkpoint_path = Path(checkpoint_dir)
         extra_attrs: Dict[str, Any] = {}
 
-        # Propagate two-stage paths into extra_attrs for pipeline use
-        if args and args.spatial_upsampler_path:
-            extra_attrs["spatial_upsampler_path"] = args.spatial_upsampler_path
-        if args and args.distilled_lora_path:
-            extra_attrs["distilled_lora_path"] = args.distilled_lora_path
+        if args:
+            if args.spatial_upsampler_path:
+                extra_attrs["spatial_upsampler_path"] = args.spatial_upsampler_path
+            if args.distilled_lora_path:
+                extra_attrs["distilled_lora_path"] = args.distilled_lora_path
 
         # Discover pipeline components (diffusers layout)
         components = discover_pipeline_components(checkpoint_path)
@@ -874,6 +974,8 @@ class DiffusionModelConfig(BaseModel):
                     transformer_2_spec = model_index.get("transformer_2")
                     if transformer_2_spec and transformer_2_spec[0] is not None:
                         pretrained_config.boundary_ratio = model_index["boundary_ratio"]
+                if "expand_timesteps" in model_index:
+                    pretrained_config.expand_timesteps = bool(model_index["expand_timesteps"])
         else:
             # ---------- Single safetensors ----------
             native_config = cls._try_load_safetensors_config(checkpoint_path)
@@ -881,6 +983,8 @@ class DiffusionModelConfig(BaseModel):
             if native_config is not None:
                 transformer_dict = native_config.get("transformer", {})
                 pretrained_config = SimpleNamespace(**transformer_dict)
+                if not getattr(pretrained_config, "_name_or_path", None):
+                    pretrained_config._name_or_path = str(checkpoint_path)
                 extra_attrs["monolithic_safetensors_config"] = native_config
 
                 # quantization_config lives as a separate safetensors metadata

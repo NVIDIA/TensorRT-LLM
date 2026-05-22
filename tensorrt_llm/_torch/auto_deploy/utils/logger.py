@@ -1,3 +1,17 @@
+# SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 import logging
 import os
 
@@ -59,10 +73,9 @@ class ADLogger(metaclass=Singleton):
 
     def log(self, severity, *msg):
         level = self._SEVERITY_TO_LEVEL.get(severity, logging.INFO)
-        parts = [f"[{self.PREFIX}]"]
+        parts = []
         if self.rank is not None:
             parts.append(f"[RANK {self.rank}]")
-        parts.append(severity)
         parts.extend(map(str, msg))
         self._logger.log(level, " ".join(parts))
 
@@ -71,17 +84,17 @@ class ADLogger(metaclass=Singleton):
             self._appeared_keys.add(key)
             self.log(severity, *msg)
 
-    def info(self, msg, *args, **kwargs):
-        self._logger.info(msg, *args, **kwargs)
+    def info(self, *msg):
+        self.log(self.INFO, *msg)
 
-    def warning(self, msg, *args, **kwargs):
-        self._logger.warning(msg, *args, **kwargs)
+    def warning(self, *msg):
+        self.log(self.WARNING, *msg)
 
-    def error(self, msg, *args, **kwargs):
-        self._logger.error(msg, *args, **kwargs)
+    def error(self, *msg):
+        self.log(self.ERROR, *msg)
 
-    def debug(self, msg, *args, **kwargs):
-        self._logger.debug(msg, *args, **kwargs)
+    def debug(self, *msg):
+        self.log(self.DEBUG, *msg)
 
     def warning_once(self, *msg, key):
         self.log_once(self.WARNING, *msg, key=key)

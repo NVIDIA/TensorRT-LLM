@@ -12,7 +12,7 @@ context_servers:
   disable_overlap_scheduler: true
   speculative_config:
     decoding_type: MTP
-    num_nextn_predict_layers: 1
+    max_draft_len: 1
   kv_cache_config:
     enable_block_reuse: true
   cache_transceiver_config:
@@ -25,7 +25,7 @@ generation_servers:
   enable_attention_dp: true
   speculative_config:
     decoding_type: MTP
-    num_nextn_predict_layers: 1
+    max_draft_len: 1
   kv_cache_config:
     enable_block_reuse: true
   cache_transceiver_config:

@@ -16,19 +16,30 @@
 from typing import List, Optional
 
 import torch
+from flashinfer.mamba import selective_state_update as _flashinfer_ssm_update
 from torch.fx import Node
 
 from ..._compat import KvCacheConfig
-from ..attention_interface import AttentionRegistry, BatchInfo, MHACallable, ResourceHandlerDict
+from ..attention_interface import (
+    AttentionRegistry,
+    BatchInfo,
+    MHACallable,
+    ResourceHandlerDict,
+    SpecSSMResourceHandler,
+)
 from .mamba_backend_common import (
     BaseBackendSSM,
     _flatten_ssm_inputs,
     _prepare_ssm_decode_inputs,
+    _prepare_ssm_grouped_state_update_inputs,
     _run_ssm_prefill,
 )
 
 
-@torch.library.custom_op("auto_deploy::flashinfer_cached_ssm", mutates_args=("ssm_state_cache",))
+@torch.library.custom_op(
+    "auto_deploy::flashinfer_cached_ssm",
+    mutates_args=("ssm_state_cache", "intermediate_ssm_state_cache"),
+)
 def _flashinfer_cached_ssm(
     # INPUTS (dense but may be flattened across sequences)
     hidden_states: torch.Tensor,  # [b, s, num_heads, head_dim]
@@ -50,6 +61,9 @@ def _flashinfer_cached_ssm(
     seq_idx_prefill: torch.Tensor,  # [1, num_prefill_tokens]
     # CACHES
     ssm_state_cache: torch.Tensor,  # [max_batch_size, num_heads, head_dim, ssm_state_size]
+    intermediate_ssm_state_cache: Optional[
+        torch.Tensor
+    ],  # [spec_state_size, max_draft_len+1, num_heads, head_dim, d_state]
     # CONSTANTS
     time_step_limit: List[float],
     chunk_size: int,
@@ -60,9 +74,10 @@ def _flashinfer_cached_ssm(
     )
     ssm_state_size = B.shape[3]
     batch_info = BatchInfo(batch_info_host)
-    num_prefill, _, num_decode = batch_info.get_num_sequences()
-    num_prefill_tokens, _, num_decode_tokens = batch_info.get_num_tokens()
-    num_total_tokens = num_prefill_tokens + num_decode_tokens
+    num_prefill, num_extend, num_decode = batch_info.get_num_sequences()
+    num_prefill_tokens, num_extend_tokens, num_decode_tokens = batch_info.get_num_tokens()
+    num_total_tokens = num_prefill_tokens + num_extend_tokens + num_decode_tokens
+
     if out is not None:
         preallocated_ssm_out = out.view(bs, num_heads, head_dim)
     else:
@@ -72,6 +87,7 @@ def _flashinfer_cached_ssm(
             device=hidden_states.device,
         )
 
+    # PREFILL
     _run_ssm_prefill(
         hs_flat,
         B_flat,
@@ -94,6 +110,71 @@ def _flashinfer_cached_ssm(
         preallocated_ssm_out[:num_prefill_tokens].unsqueeze(0),
     )
 
+    # EXTEND: multi-token MTP verification path, writes intermediate SSM states
+    extend_inputs = _prepare_ssm_grouped_state_update_inputs(
+        hs_flat,
+        B_flat,
+        C_flat,
+        dt_flat,
+        A,
+        D,
+        dt_bias,
+        slot_idx,
+        seq_start=num_prefill,
+        token_start=num_prefill_tokens,
+        num_seq=num_extend,
+        num_tokens=num_extend_tokens,
+        num_heads=num_heads,
+        head_dim=head_dim,
+        ssm_state_size=ssm_state_size,
+    )
+
+    if extend_inputs is not None:
+        tokens_per_extend = num_extend_tokens // num_extend
+        if intermediate_ssm_state_cache.size(1) < tokens_per_extend:
+            raise RuntimeError(
+                "flashinfer_cached_ssm: intermediate_ssm_state_cache is too small "
+                f"for extend branch (size1={intermediate_ssm_state_cache.size(1)}, "
+                f"tokens_per_extend={tokens_per_extend})"
+            )
+        (
+            slot_idx_extend,
+            x_extend,
+            B_extend,
+            C_extend,
+            dt_extend,
+            A_full,
+            D_full,
+            dt_bias_hp,
+        ) = extend_inputs
+
+        preallocated_ssm_out_e = preallocated_ssm_out[
+            num_prefill_tokens : num_prefill_tokens + num_extend_tokens
+        ].view(num_extend, tokens_per_extend, num_heads, head_dim)
+
+        intermediate_state_indices = torch.arange(
+            num_extend, dtype=torch.int32, device=slot_idx_extend.device
+        )
+        _flashinfer_ssm_update(
+            ssm_state_cache,
+            x_extend,
+            dt_extend,
+            A_full,
+            B_extend,
+            C_extend,
+            D_full,
+            z=None,
+            dt_bias=dt_bias_hp,
+            dt_softplus=True,
+            state_batch_indices=slot_idx_extend.to(torch.int32),
+            out=preallocated_ssm_out_e,
+            disable_state_update=True,
+            intermediate_states_buffer=intermediate_ssm_state_cache,
+            cache_steps=tokens_per_extend,
+            intermediate_state_indices=intermediate_state_indices,
+        )
+
+    # DECODE: single-token autoregressive path
     decode_inputs = _prepare_ssm_decode_inputs(
         hs_flat,
         B_flat,
@@ -103,8 +184,8 @@ def _flashinfer_cached_ssm(
         D,
         dt_bias,
         slot_idx,
-        num_prefill,
-        num_prefill_tokens,
+        num_prefill + num_extend,
+        num_prefill_tokens + num_extend_tokens,
         num_decode,
         num_decode_tokens,
         num_heads,
@@ -124,23 +205,23 @@ def _flashinfer_cached_ssm(
             D_full,
         ) = decode_inputs
 
-        import flashinfer
-
         slot_idx_decode_i32 = slot_idx_decode.to(torch.int32)
-        y_decode = flashinfer.mamba.selective_state_update(
+        y_decode = _flashinfer_ssm_update(
             ssm_state_cache,
             x_decode,
             dt_hp,
             A_full,
             B_decode,
             C_decode,
-            D=D_full,
+            D_full,
             z=None,
             dt_bias=dt_bias_hp,
             dt_softplus=True,
             state_batch_indices=slot_idx_decode_i32,
         )
-        preallocated_ssm_out[num_prefill_tokens:num_total_tokens].copy_(y_decode)
+        preallocated_ssm_out[num_prefill_tokens + num_extend_tokens : num_total_tokens].copy_(
+            y_decode
+        )
 
     if out is not None:
         # out is reused across CUDA graph replays with varying num_total_tokens,
@@ -174,6 +255,9 @@ def _flashinfer_cached_ssm_fake(
     seq_idx_prefill: torch.Tensor,  # [1, num_prefill_tokens]
     # CACHES
     ssm_state_cache: torch.Tensor,  # [max_batch_size, num_heads, head_dim, ssm_state_size]
+    intermediate_ssm_state_cache: Optional[
+        torch.Tensor
+    ],  # [spec_state_size, max_draft_len+1, num_heads, head_dim, d_state]
     # CONSTANTS
     time_step_limit: List[float],
     chunk_size: int,
@@ -213,4 +297,7 @@ class FlashinferBackendSSM(BaseBackendSSM):
                 "Consider using 'triton_ssm' backend instead."
             )
 
+        ret["intermediate_ssm_state_cache"] = SpecSSMResourceHandler.from_base(
+            ret["ssm_state_cache"]
+        )
         return ret

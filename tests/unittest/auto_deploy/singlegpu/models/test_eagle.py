@@ -16,22 +16,53 @@
 """Unit tests for Eagle3 model with AutoDeploy."""
 
 from pathlib import Path
+from typing import Any, ClassVar, Dict
 
 import pytest
 import torch
 from _model_test_utils import get_small_model_config
 from build_and_run_ad import ExperimentConfig, main
+from test_common.llm_data import hf_id_to_local_model_dir
 
+import tensorrt_llm._torch.auto_deploy.custom_ops  # noqa: F401
+from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
 from tensorrt_llm._torch.auto_deploy.models.custom.modeling_eagle import (
     Eagle3DraftOutput,
     EagleConfig,
     EagleDrafterForCausalLM,
+    EagleRMSNorm,
 )
 from tensorrt_llm._torch.auto_deploy.models.eagle import EagleDrafterFactory
 from tensorrt_llm._torch.auto_deploy.models.factory import ModelFactoryRegistry
-from tests.test_common.llm_data import hf_id_to_local_model_dir
+from tensorrt_llm._torch.auto_deploy.utils.node_utils import (
+    get_weight_shape,
+    infer_draft_embedding_size,
+    is_any_lin_op,
+)
 
 EAGLE_MODEL_HUB_ID = "yuhuili/EAGLE3-LLaMA3.1-Instruct-8B"
+NEMOTRON_SUPER_MODEL_HUB_ID = "nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16"
+
+NEMOTRON_SUPER_DRAFT_MODEL_KWARGS = {
+    "hidden_size": 32,
+    "intermediate_size": 64,
+    "head_dim": 8,
+    "num_attention_heads": 4,
+    "num_key_value_heads": 2,
+    "attention_bias": False,
+    "layer_norm_epsilon": 1e-5,
+    "residual_in_fp32": False,
+    "mlp_bias": False,
+    "mlp_hidden_act": "relu2",
+    "n_routed_experts": 4,
+    "n_shared_experts": 1,
+    "num_experts_per_tok": 2,
+    "moe_intermediate_size": 64,
+    "moe_shared_expert_intermediate_size": 64,
+    "moe_latent_size": 16,
+    "n_group": 1,
+    "topk_group": 1,
+}
 
 ###############################################################################
 # Mock classes for standalone Eagle testing
@@ -49,7 +80,7 @@ class MockEagleConfig(EagleConfig):
     For standalone testing, we need to load these from the checkpoint.
     """
 
-    _drafter_defaults = {
+    _drafter_defaults: ClassVar[Dict[str, Dict[str, Any]]] = {
         "llama": {
             "load_embedding_from_target": False,
             "load_lm_head_from_target": False,
@@ -107,7 +138,9 @@ class MockEagleDrafterFactory(EagleDrafterFactory):
         from accelerate import init_empty_weights
 
         model_config, unused_kwargs = self._get_model_config()
-        model_config = MockEagleConfig(model_config, model_config.model_type)
+        # transformers>=5.5 applies @dataclass(kw_only=True) to PretrainedConfig
+        # subclasses, overriding EagleConfig.__init__. Use the factory classmethod.
+        model_config = MockEagleConfig.from_base_config(model_config, model_config.model_type)
 
         with (init_empty_weights if device == "meta" else nullcontext)():
             model = MockEagle3ModelForCausalLM._from_config(model_config, **unused_kwargs)
@@ -122,6 +155,29 @@ class MockEagleDrafterFactory(EagleDrafterFactory):
         model.eval()
 
         return model
+
+
+def _build_small_draft_factory(
+    model_hub_id: str, model_kwargs: dict | None = None
+) -> EagleDrafterFactory:
+    draft_model_path = hf_id_to_local_model_dir(model_hub_id)
+    if draft_model_path is None or not Path(draft_model_path).is_dir():
+        pytest.skip(
+            f"Draft model {model_hub_id} not found (LLM_MODELS_ROOT not set or model missing)"
+        )
+
+    return EagleDrafterFactory(
+        model=str(draft_model_path),
+        model_kwargs=model_kwargs,
+        skip_loading_weights=True,
+        max_seq_len=64,
+    )
+
+
+def test_eagle_rmsnorm_keeps_fp32_weights():
+    norm = EagleRMSNorm(hidden_size=16)
+
+    assert norm.weight.dtype == torch.float32
 
 
 @pytest.fixture
@@ -146,8 +202,8 @@ def test_build_ad_eagle(register_mock_eagle_factory):
     llm_extra_args = {
         "model_factory": "MockEagleDrafter",
         "transforms": {
-            "insert_cached_attention": {"backend": "flashinfer"},
-            "compile_model": {"backend": "torch-compile"},
+            "insert_cached_attention": {"backend": "trtllm"},
+            "compile_model": {"backend": "torch-simple"},
         },
     }
     experiment_config = get_small_model_config(EAGLE_MODEL_HUB_ID, **llm_extra_args)
@@ -183,7 +239,7 @@ def test_eagle_model_torch_export():
     eagle_path = Path(eagle_model_path)
 
     # Setup
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = torch.device("cuda")
     dtype = torch.float16
 
     # Create model via EagleDrafterFactory (creates EagleDrafterForCausalLM)
@@ -221,3 +277,47 @@ def test_eagle_model_torch_export():
         print("\n".join(code_lines))
     except Exception as e:
         pytest.fail(f"torch.export failed: {e}")
+
+
+@pytest.mark.parametrize(
+    ("model_hub_id", "model_kwargs", "expected_is_eagle"),
+    [
+        (
+            EAGLE_MODEL_HUB_ID,
+            get_small_model_config(EAGLE_MODEL_HUB_ID)["args"]["model_kwargs"],
+            True,
+        ),
+        (NEMOTRON_SUPER_MODEL_HUB_ID, NEMOTRON_SUPER_DRAFT_MODEL_KWARGS, False),
+    ],
+)
+def test_infer_draft_hidden_size_from_exported_draft_graph(
+    model_hub_id, model_kwargs, expected_is_eagle
+):
+    factory = _build_small_draft_factory(model_hub_id, model_kwargs=model_kwargs)
+    model = factory.build_model("cuda")
+    inner_model = model.model.eval()
+    hidden_size = model.config.hidden_size
+    dtype = model.config.torch_dtype
+
+    batch_size = 2
+    seq_len = 4
+    inputs_embeds = torch.randn(batch_size, seq_len, hidden_size, device="cuda", dtype=dtype)
+    position_ids = (
+        torch.arange(seq_len, device="cuda", dtype=torch.long).unsqueeze(0).repeat(batch_size, 1)
+    )
+    hidden_states = torch.randn(batch_size, seq_len, hidden_size, device="cuda", dtype=dtype)
+
+    gm = torch_export_to_gm(
+        inner_model,
+        args=(inputs_embeds, position_ids, hidden_states),
+        clone=True,
+    )
+    gm.is_draft = True
+
+    linear_nodes = [node for node in gm.graph.nodes if is_any_lin_op(node)]
+    assert linear_nodes, "Expected exported draft graph to contain linear nodes"
+    assert get_weight_shape(linear_nodes[-1], dim=0) == hidden_size
+
+    embd, in_eagle_drafter = infer_draft_embedding_size(gm, linear_nodes)
+    assert embd == hidden_size
+    assert in_eagle_drafter is expected_is_eagle

@@ -23,6 +23,6 @@ attention:
 parallel:
   dit_cfg_size: 2
   dit_ulysses_size: 4
-  enable_parallel_vae: true
+  parallel_vae_size: 8
 cuda_graph:
   enable_cuda_graph: false

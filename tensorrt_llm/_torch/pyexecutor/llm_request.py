@@ -1,6 +1,6 @@
 from copy import copy, deepcopy
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union, cast
 
 import torch
 
@@ -384,13 +384,17 @@ class PyResult:
 
     def append_mm_embeddings(self, mm_embeddings: torch.Tensor,
                              multimodal_lengths: List[int]):
-        """Split concatenated embeddings by multimodal_lengths and create handles for each.
+        """Split concatenated embeddings by per-item lengths and create handles.
 
         Args:
-            mm_embeddings: Concatenated multimodal embeddings tensor of shape [total_tokens, hidden_dim]
-            multimodal_lengths: List of token lengths for each multimodal item
+            mm_embeddings: Concatenated multimodal embeddings tensor of shape
+                [total_tokens, hidden_dim].
+            multimodal_lengths: Current per-item split lengths.
         """
-        # Split the concatenated tensor by lengths to get per-item embeddings
+        # TODO(TRTLLM-12175): callers currently pass request.multimodal_lengths,
+        # a prompt-side MM-token count that may include non-embedding
+        # special/framing tokens. This split needs per-item encoder-output
+        # embedding lengths instead.
         split_embeddings = torch.split(mm_embeddings, multimodal_lengths, dim=0)
 
         # Create a SharedTensorContainer handle for each split
@@ -684,6 +688,7 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         self.py_return_logits_device_memory = return_logits_device_memory
         self.py_additional_outputs = additional_outputs
 
+        self.py_beam_width = cast(int, self.sampling_config.beam_width)
         self.py_is_draft = is_draft
         # The request's sequence slot ID, an index between 0 (inclusive) and max_batch_size (exclusive).
         self.py_seq_slot = seq_slot
@@ -787,7 +792,7 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
 
         # When using beam search we cannot incrementically update the logprobs in the result.
         # Instead we need to update all logprobs. In that case no deep copy is needed.
-        need_deep_copy_logprobs = self.py_result.log_probs and self.sampling_config.beam_width <= 1
+        need_deep_copy_logprobs = self.py_result.log_probs and self.py_beam_width <= 1
         need_deep_copy_generation_logits = self.py_result._generation_logits is not None
         need_any_deep_copy = need_deep_copy_logprobs or need_deep_copy_generation_logits
         # Performs a deep copy of py_result._log_probs or py_result._generation_logits to eliminate race conditions
@@ -942,11 +947,20 @@ def executor_request_to_llm_request(
     multimodal_positions = None
     multimodal_lengths = None
     multimodal_uuids = None
+    multimodal_item_run_cu_offsets = None
+    multimodal_run_positions = None
+    multimodal_run_lengths = None
     if executor_request.multimodal_input is not None:
         multimodal_hashes = executor_request.multimodal_input.multimodal_hashes
         multimodal_positions = executor_request.multimodal_input.multimodal_positions
         multimodal_lengths = executor_request.multimodal_input.multimodal_lengths
         multimodal_uuids = executor_request.multimodal_input.multimodal_uuids
+        multimodal_item_run_cu_offsets = (
+            executor_request.multimodal_input.multimodal_item_run_cu_offsets)
+        multimodal_run_positions = (
+            executor_request.multimodal_input.multimodal_run_positions)
+        multimodal_run_lengths = (
+            executor_request.multimodal_input.multimodal_run_lengths)
 
     # Extract mrope fields
     mrope_rotary_cos_sin = None
@@ -954,6 +968,10 @@ def executor_request_to_llm_request(
     if executor_request.mrope_config is not None:
         mrope_rotary_cos_sin = executor_request.mrope_config.mrope_rotary_cos_sin
         mrope_position_deltas = executor_request.mrope_config.mrope_position_deltas
+
+    agent_hierarchy = None
+    if getattr(executor_request, "py_scheduling_params", None) is not None:
+        agent_hierarchy = executor_request.py_scheduling_params.agent_hierarchy
 
     llm_request = LlmRequest(
         request_id=req_id,
@@ -977,6 +995,9 @@ def executor_request_to_llm_request(
         multimodal_positions=multimodal_positions,
         multimodal_lengths=multimodal_lengths,
         multimodal_uuids=multimodal_uuids,
+        multimodal_item_run_cu_offsets=multimodal_item_run_cu_offsets,
+        multimodal_run_positions=multimodal_run_positions,
+        multimodal_run_lengths=multimodal_run_lengths,
         multimodal_embedding=executor_request.multimodal_embedding,
         lora_task_id=executor_request.lora_config.task_id
         if executor_request.lora_config is not None else None,
@@ -1022,6 +1043,7 @@ def executor_request_to_llm_request(
         py_multimodal_data=getattr(executor_request, "py_multimodal_data",
                                    None),
         kv_cache_retention_config=executor_request.kv_cache_retention_config,
+        agent_hierarchy=agent_hierarchy,
         logprobs_mode=getattr(executor_request, "py_logprobs_mode",
                               LogprobMode.RAW),
     )

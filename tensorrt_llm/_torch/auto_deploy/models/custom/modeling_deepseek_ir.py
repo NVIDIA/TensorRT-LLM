@@ -1,3 +1,7 @@
+# Copyright 2018 The HuggingFace Team
+# Licensed under the Apache License, Version 2.0.
+# Original source: https://github.com/huggingface/transformers
+#
 # SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
@@ -48,10 +52,11 @@ from transformers.generation import GenerationMixin
 from transformers.modeling_utils import PreTrainedModel
 from transformers.utils import ModelOutput
 
-import tensorrt_llm._torch.auto_deploy.custom_ops  # noqa: F401 -- register all ops
-from tensorrt_llm._torch.auto_deploy.models.custom import mla_rope_utils
-from tensorrt_llm._torch.auto_deploy.models.hf import AutoModelForCausalLMFactory
 from tensorrt_llm._torch.utils import ActivationType
+
+from ... import custom_ops  # noqa: F401 -- register all ops
+from ..hf import AutoModelForCausalLMFactory
+from . import mla_rope_utils
 
 
 class DeepSeekV3RMSNorm(nn.Module):
@@ -334,6 +339,9 @@ class DeepSeekV3MoE(nn.Module):
 
         selected_experts, routing_weights = self.gate(hidden_states)
 
+        if self.shared_experts is not None:
+            shared_expert_output = self.shared_experts(identity)
+
         final_hidden_states = torch.ops.auto_deploy.torch_moe(
             hidden_states.view(-1, hidden_states.shape[-1]),
             selected_experts,
@@ -349,7 +357,7 @@ class DeepSeekV3MoE(nn.Module):
         final_hidden_states = final_hidden_states.view(*orig_shape)
 
         if self.shared_experts is not None:
-            final_hidden_states = final_hidden_states + self.shared_experts(identity)
+            final_hidden_states = final_hidden_states + shared_expert_output
 
         final_hidden_states = torch.ops.auto_deploy.all_reduce(
             final_hidden_states, layer_type="moe"

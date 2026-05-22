@@ -1,3 +1,7 @@
+# Copyright 2018 The HuggingFace Team
+# Licensed under the Apache License, Version 2.0.
+# Original source: https://github.com/huggingface/transformers
+#
 # SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
@@ -39,8 +43,8 @@ from transformers.modeling_utils import PreTrainedModel
 from transformers.models.llama.configuration_llama import LlamaConfig
 from transformers.utils import ModelOutput
 
-import tensorrt_llm._torch.auto_deploy.custom_ops  # noqa: F401 -- register all ops
-from tensorrt_llm._torch.auto_deploy.models.hf import AutoModelForCausalLMFactory
+from ... import custom_ops  # noqa: F401 -- register all ops
+from ..hf import AutoModelForCausalLMFactory
 
 
 class Llama3RMSNorm(nn.Module):

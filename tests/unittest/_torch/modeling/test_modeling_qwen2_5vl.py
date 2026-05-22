@@ -1,6 +1,6 @@
 import os
 from dataclasses import dataclass
-from typing import List
+from typing import List, Optional
 
 import torch
 from _torch.helpers import create_mock_cuda_graph_runner
@@ -12,7 +12,9 @@ from utils.llm_data import llm_models_root
 
 from tensorrt_llm._torch.models.checkpoints.hf.qwen2vl_weight_mapper import \
     Qwen2VLHfWeightMapper
-from tensorrt_llm._torch.models.modeling_qwen2vl import Qwen2_5_VLModel
+from tensorrt_llm._torch.models.modeling_qwen2vl import (
+    Qwen2_5_VLModel, Qwen2VLInputProcessorBase)
+from tensorrt_llm._utils import get_sm_version
 
 QWEN2_5_VL_7B_CONFIG = {
     "architectures": ["Qwen2_5_VLForConditionalGeneration"],
@@ -116,12 +118,15 @@ class TestQwen2_5_VL(TestModelingMultimodal):
                           input_ids,
                           multimodal_params_list,
                           is_gen: bool = False,
-                          num_cached_tokens_per_seq: List[int] = None):
+                          num_cached_tokens_per_seq: List[int] = None,
+                          total_prompt_len: Optional[int] = None):
 
-        trtllm_inputs = super().get_trtllm_inputs(input_ids,
-                                                  multimodal_params_list,
-                                                  is_gen,
-                                                  num_cached_tokens_per_seq)
+        trtllm_inputs = super().get_trtllm_inputs(
+            input_ids,
+            multimodal_params_list,
+            is_gen,
+            num_cached_tokens_per_seq,
+            total_prompt_len=total_prompt_len)
 
         if is_gen:
             mrope_gen_position_ids = []
@@ -231,29 +236,64 @@ class TestQwen2_5_VL(TestModelingMultimodal):
                                    disable_fuse_rope=False,
                                    chunked_prefill=False,
                                    kv_cache_reuse=False),
-
-            # ==== Chunked Prefill Scenarios ====
-            TestQwen2_5_VLScenario(modality="image",
-                                   use_cuda_graph=False,
-                                   disable_fuse_rope=False,
-                                   chunked_prefill=True,
-                                   kv_cache_reuse=False),
-
-            # ==== KV Cache Reuse Scenarios ====
-            TestQwen2_5_VLScenario(modality="image",
-                                   use_cuda_graph=False,
-                                   disable_fuse_rope=False,
-                                   chunked_prefill=False,
-                                   kv_cache_reuse=True),
-
-            # ==== Disable fuse rope scenarios ====
+        ]
+        # Paged context FMHA (triggered by chunked_prefill / kv_cache_reuse)
+        # is forced on for correctness on Hopper (SM90). On Blackwell (SM100)
+        # the trtllm-gen kernel set falls back to an unfused MHA path whose
+        # output diverges from the non-paged context kernel; gate those
+        # scenarios to SM90 until the Blackwell fallback matches.
+        if torch.cuda.is_available() and get_sm_version() == 90:
+            scenarios.extend([
+                # ==== Chunked Prefill Scenarios ====
+                TestQwen2_5_VLScenario(modality="image",
+                                       use_cuda_graph=False,
+                                       disable_fuse_rope=False,
+                                       chunked_prefill=True,
+                                       kv_cache_reuse=False),
+                # ==== KV Cache Reuse Scenarios ====
+                TestQwen2_5_VLScenario(modality="image",
+                                       use_cuda_graph=False,
+                                       disable_fuse_rope=False,
+                                       chunked_prefill=False,
+                                       kv_cache_reuse=True),
+            ])
+        # ==== Disable fuse rope scenarios ====
+        # Run last: setup_scenario rebuilds trtllm_model with
+        # disable_fuse_rope=True for this scenario, and the rebuild is not
+        # undone afterwards. Keeping it at the tail prevents the rebuilt
+        # model from leaking into chunked-prefill / kv-cache-reuse
+        # scenarios (where it surfaces as a cos/sin vs. q/k seq-len
+        # mismatch in MRotaryEmbedding.forward).
+        scenarios.append(
             TestQwen2_5_VLScenario(modality="image",
                                    use_cuda_graph=False,
                                    disable_fuse_rope=True,
                                    chunked_prefill=False,
-                                   kv_cache_reuse=False),
-        ]
+                                   kv_cache_reuse=False))
         return scenarios
+
+    def get_hf_inputs(self, modality: str, prompt, media):
+        processor_inputs = super().get_hf_inputs(modality, prompt, media)
+
+        # HF transformers 5.x uses a different get_rope_index algorithm for Qwen2.5-VL:
+        # it multiplies temporal positions by tokens_per_second, which diverges from
+        # TRT-LLM's algorithm. Compute position IDs using TRT-LLM's get_rope_index and
+        # pass them explicitly so both models use the same position IDs.
+        has_vision = "image_grid_thw" in processor_inputs or "video_grid_thw" in processor_inputs
+        if has_vision:
+            position_ids, _ = Qwen2VLInputProcessorBase.get_rope_index(
+                self.hf_config,
+                processor_inputs["input_ids"],
+                image_grid_thw=processor_inputs.get("image_grid_thw"),
+                video_grid_thw=processor_inputs.get("video_grid_thw"),
+                attention_mask=processor_inputs.get("attention_mask"),
+                second_per_grid_ts=processor_inputs.get("second_per_grid_ts"),
+            )
+            processor_inputs["position_ids"] = position_ids.to(
+                processor_inputs["input_ids"].device)
+            processor_inputs.pop("mm_token_type_ids", None)
+
+        return processor_inputs
 
     def setup_scenario(self, scenario: TestQwen2_5_VLScenario):
         super().setup_scenario(scenario)
