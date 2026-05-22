@@ -8,7 +8,7 @@ import argparse
 import time
 
 from tensorrt_llm import VisualGen, VisualGenArgs, VisualGenParams, logger
-from tensorrt_llm._torch.visual_gen.config import CacheDiTConfig
+from tensorrt_llm._torch.visual_gen.config import CacheDiTConfig, TeaCacheConfig
 
 logger.set_level("info")
 
@@ -134,6 +134,22 @@ def parse_args():
     )
 
     # Diffusion cache acceleration
+    parser.add_argument(
+        "--enable_teacache",
+        action="store_true",
+        help="Enable TeaCache stage-1 acceleration.",
+    )
+    parser.add_argument(
+        "--teacache_thresh",
+        type=float,
+        default=None,
+        help="TeaCache similarity threshold. Omit to use the LTX-2 default.",
+    )
+    parser.add_argument(
+        "--use_ret_steps",
+        action="store_true",
+        help="Use ret_steps TeaCache mode.",
+    )
     parser.add_argument(
         "--enable_cache_dit",
         action="store_true",
@@ -335,9 +351,21 @@ def _cache_dit_config_from_args(args) -> CacheDiTConfig:
     return CacheDiTConfig(**overrides)
 
 
+def _teacache_config_from_args(args) -> TeaCacheConfig:
+    """Build TeaCacheConfig from CLI args."""
+    kwargs: dict = {
+        "use_ret_steps": args.use_ret_steps,
+    }
+    if args.teacache_thresh is not None:
+        kwargs["teacache_thresh"] = args.teacache_thresh
+    return TeaCacheConfig(**kwargs)
+
+
 def _build_diffusion_args(args) -> VisualGenArgs:
     """Build VisualGenArgs from parsed CLI args."""
-    if args.enable_cache_dit:
+    if args.enable_teacache:
+        cache_kwargs = {"cache": _teacache_config_from_args(args)}
+    elif args.enable_cache_dit:
         logger.info("Cache DiT enabled; LTX2 will run as a one-stage pipeline.")
         cache_kwargs = {"cache": _cache_dit_config_from_args(args)}
     else:
@@ -377,6 +405,9 @@ def _build_diffusion_args(args) -> VisualGenArgs:
 
 def main():
     args = parse_args()
+
+    if args.enable_teacache and args.enable_cache_dit:
+        raise ValueError("--enable_teacache and --enable_cache_dit are mutually exclusive.")
 
     attn2d_size = args.attn2d_row_size * args.attn2d_col_size
     if attn2d_size > 1 and args.ulysses_size > 1:

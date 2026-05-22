@@ -16,7 +16,7 @@ import torch.distributed as dist
 from transformers import Gemma3ForConditionalGeneration, GemmaTokenizerFast
 
 from tensorrt_llm._torch.utils import make_weak_ref
-from tensorrt_llm._torch.visual_gen.cache.teacache import CacheContext
+from tensorrt_llm._torch.visual_gen.cache.teacache import CacheContext, register_extractor
 from tensorrt_llm._torch.visual_gen.config import PipelineComponent
 from tensorrt_llm._torch.visual_gen.cuda_graph_runner import CUDAGraphRunner, CUDAGraphRunnerConfig
 from tensorrt_llm._torch.visual_gen.output import CudaPhaseTimer, PipelineOutput
@@ -200,18 +200,26 @@ def _load_ltx2_transformer_weights(
     return weights
 
 
-# TeaCache polynomial coefficients for LTX-0.9.1-HFIE. Calibrated from the LTX-Video model family.
-# Maps raw embedding L1 distances to rescaled distances for cache decisions.
-# Coefficients are from:
-# https://huggingface.co/jbilcke-hf/LTX-Video-0.9.1-HFIE/blob/main/teacache.py#L42
-# TODO: Need to verify coefficients for correctness.
-
-# LTX2_TEACACHE_COEFFICIENTS = {
-#     "ltx": {
-#         "ret_steps": [2.14700694e+01, -1.28016453e+01, 2.31279151e+00, 7.92487521e-01, 9.69274326e-03],
-#         "standard": [2.14700694e+01, -1.28016453e+01, 2.31279151e+00, 7.92487521e-01, 9.69274326e-03],
-#     },
-# }
+# Coefficients calibrated from LTX-2 BF16 stage-1 samples using the output
+# relative-L1 fit. Stage 2 uses a short distilled refinement schedule and is
+# kept uncached by the two-stage pipeline.
+LTX2_TEACACHE_COEFFICIENTS = {
+    "ret_steps": [
+        -18.763005693192905,
+        24.5964390395728,
+        -8.718555981283336,
+        0.977153258766494,
+        0.02979450913205161,
+    ],
+    "standard": [
+        -18.763005693192905,
+        24.5964390395728,
+        -8.718555981283336,
+        0.977153258766494,
+        0.02979450913205161,
+    ],
+    "default_thresh": 0.2,
+}
 
 
 class LTX2TeaCacheExtractor:
@@ -964,13 +972,15 @@ class LTX2Pipeline(BasePipeline):
         """Finalize after weight loading: TeaCache, Cache-DiT, derived attributes."""
         super().post_load_weights()
 
-        # TODO: TeaCache disabled: LTX2_TEACACHE_COEFFICIENTS are unverified.
-        # To re-enable, uncomment the following lines and verify coefficients.
-        # register_extractor(
-        #     "LTXModel",
-        #     LTX2TeaCacheExtractor(self._compute_ltx2_timestep_embedding),
-        # )
-        # self._setup_teacache(self.transformer, coefficients=LTX2_TEACACHE_COEFFICIENTS)
+        if self.transformer is not None and self.model_config.cache_backend == "teacache":
+            register_extractor(
+                "LTXModel",
+                LTX2TeaCacheExtractor(self._compute_ltx2_timestep_embedding),
+            )
+            self._setup_cache_acceleration(
+                self.transformer,
+                coefficients=LTX2_TEACACHE_COEFFICIENTS,
+            )
 
         # Cache-DiT
         if self.transformer is not None and self.model_config.cache_backend == "cache_dit":
