@@ -14,16 +14,28 @@
 # limitations under the License.
 
 from functools import cache
+import math
 from typing import Dict, NamedTuple, Optional
 
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from transformers import ParakeetEncoder as HFParakeetEncoder
 from transformers import ParakeetEncoderConfig, PretrainedConfig
+from transformers.activations import ACT2FN
 from transformers.audio_utils import mel_filter_bank
+from transformers.models.parakeet.modeling_parakeet import (
+    ParakeetEncoderRelPositionalEncoding as HFParakeetEncoderRelPositionalEncoding,
+)
+from transformers.models.parakeet.modeling_parakeet import (
+    ParakeetEncoderSubsamplingConv2D as HFParakeetEncoderSubsamplingConv2D,
+)
 
 from ...logger import logger
+from ..modules.attention import Attention
+from ..modules.layer_norm import LayerNorm
+from ..modules.linear import Linear
 from ..modules.rms_norm import RMSNorm
 
 EPSILON = 1e-5
@@ -169,7 +181,7 @@ class ParakeetExtractor:
         num_frames = torch.tensor(
             [cs // self.config.hop_length for cs in clip_sizes], dtype=torch.float
         )
-        n_tokens = HFParakeetEncoder._get_subsampling_output_length(self, num_frames)
+        n_tokens = ParakeetEncoder._get_subsampling_output_length(self, num_frames)
         return max(1, int(n_tokens.sum().item()))
 
     def _to_mono_tensor(
@@ -257,7 +269,7 @@ class ParakeetExtractor:
 
 
 # This config is the extractor's single source of truth. It also supplies the fields read by
-# `HFParakeetEncoder._get_subsampling_output_length`.
+# `ParakeetEncoder._get_subsampling_output_length`.
 class _ExtractorConfig(NamedTuple):
     feature_size: int
     sampling_rate: int
@@ -293,8 +305,8 @@ def _make_parakeet_encoder_config(
 ) -> ParakeetEncoderConfig:
     """Build a `ParakeetEncoderConfig` from the HF `sound_config`.
 
-    `HFParakeetEncoder` expects fields (`scale_input`, `attention_bias`, `max_position_embeddings`)
-    that are not present in the raw HF composite config, so we map/default them here.
+    Several fields required by `ParakeetEncoderConfig` are absent from the raw
+    HF composite config, so we map/default them here.
     """
     return ParakeetEncoderConfig(
         hidden_size=sound_config.hidden_size,
@@ -308,8 +320,6 @@ def _make_parakeet_encoder_config(
         subsampling_conv_kernel_size=sound_config.subsampling_conv_kernel_size,
         subsampling_conv_stride=sound_config.subsampling_conv_stride,
         num_mel_bins=sound_config.num_mel_bins,
-        # Fields required by HFParakeetEncoder but absent from the HF
-        # composite config — use the defaults from ParakeetEncoderConfig.
         scale_input=getattr(sound_config, "scale_input", False),
         attention_bias=getattr(sound_config, "attention_bias", False),
         max_position_embeddings=getattr(sound_config, "max_position_embeddings", 5000),
@@ -330,8 +340,8 @@ class ParakeetProjection(nn.Module):
     ):
         super().__init__()
         self.norm = RMSNorm(hidden_size=hidden_size, eps=eps, dtype=dtype)
-        self.linear1 = nn.Linear(hidden_size, projection_hidden_size, bias=bias, dtype=dtype)
-        self.linear2 = nn.Linear(projection_hidden_size, llm_hidden_size, bias=bias, dtype=dtype)
+        self.linear1 = Linear(hidden_size, projection_hidden_size, bias=bias, dtype=dtype)
+        self.linear2 = Linear(projection_hidden_size, llm_hidden_size, bias=bias, dtype=dtype)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         hidden_states = self.norm(hidden_states)
@@ -339,6 +349,420 @@ class ParakeetProjection(nn.Module):
         hidden_states = torch.square(torch.nn.functional.relu(hidden_states))
         hidden_states = self.linear2(hidden_states)
         return hidden_states
+
+
+# ---------------------------------------------------------------------------
+# Native TRT-LLM encoder — attention built on trtllm.Attention
+# ---------------------------------------------------------------------------
+
+
+class ParakeetConformerAttention(Attention):
+    """Conformer self-attention built on trtllm.Attention.
+
+    qkv_proj and o_proj are inherited from trtllm.Attention (TP-sharded,
+    quantization-ready, fused QKV kernel).  The Transformer-XL relative
+    positional encoding (RPE) is computed here and injected into the parent's
+    logit_bias SDPA path via _forward_with_logit_bias, so we share the
+    attention backend infrastructure without re-implementing SDPA.
+
+    relative_k_proj, bias_u, and bias_v implement the content-position term;
+    the content-content term uses the standard QK product inside SDPA.
+    """
+
+    def __init__(
+        self,
+        config: ParakeetEncoderConfig,
+        layer_idx: int,
+        dtype: Optional[torch.dtype] = None,
+        model_config=None,
+    ):
+        head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
+        num_kv_heads = getattr(config, "num_key_value_heads", config.num_attention_heads)
+        super().__init__(
+            hidden_size=config.hidden_size,
+            num_attention_heads=config.num_attention_heads,
+            num_key_value_heads=num_kv_heads,
+            max_position_embeddings=None,
+            bias=config.attention_bias,
+            pos_embd_params=None,
+            rope_fusion=False,
+            layer_idx=layer_idx,
+            dtype=dtype,
+            dense_bias=config.attention_bias,
+            config=model_config,  # None → default ModelConfig (TP=1)
+            q_scaling=1.0,
+            head_dim=head_dim,
+        )
+        # Relative-position key projection: position_embeddings → [T_pos, H*d]
+        self.relative_k_proj = Linear(
+            config.hidden_size,
+            config.num_attention_heads * head_dim,
+            bias=False,
+            dtype=dtype,
+        )
+        # Transformer-XL global content bias added to q for the content-content term
+        self.bias_u = nn.Parameter(torch.zeros(self.num_heads, self.head_dim, dtype=dtype))
+        # Transformer-XL global positional bias added to q for content-position term
+        self.bias_v = nn.Parameter(torch.zeros(self.num_heads, self.head_dim, dtype=dtype))
+
+    @staticmethod
+    def _rel_shift(x: torch.Tensor) -> torch.Tensor:
+        """Shaw et al. relative shift. Appendix B of https://arxiv.org/abs/1901.02860."""
+        B, H, T, T_pos = x.shape
+        x = F.pad(x, (1, 0))
+        x = x.view(B, H, -1, T)
+        return x[:, :, 1:].view(B, H, T, T_pos)
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_embeddings: Optional[torch.Tensor] = None,
+        **kwargs,
+    ) -> torch.Tensor:
+        """
+        Args:
+            hidden_states:       [B, T, hidden_size]
+            attention_mask:      Optional [B, 1, T, T] bool mask; True = attend.
+            position_embeddings: [B, T_pos, hidden_size] relative position encodings.
+        Returns:
+            [B, T, hidden_size]
+        """
+        B, T, C = hidden_states.shape
+
+        # ── QKV projection (TP-sharded fused kernel from trtllm.Attention) ──
+        qkv = self.qkv_proj(hidden_states.reshape(-1, C))  # [B*T, (q+k+v)*d]
+        q, k, v = self.split_qkv(qkv)  # each [B*T, H_rank*d]
+
+        # Reshape to [B, H, T, d] for RPE computation
+        q = q.view(B, T, self.num_heads, self.head_dim).transpose(1, 2)
+        k = k.view(B, T, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+        v = v.view(B, T, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+
+        # ── Transformer-XL RPE: compute matrix_bd ────────────────────────────
+        scale = 1.0 / math.sqrt(self.head_dim)
+
+        # Content-position term: (q + bias_v) @ rel_k^T, then _rel_shift
+        q_v = q + self.bias_v.view(1, self.num_heads, 1, self.head_dim)
+        rel_k = self.relative_k_proj(position_embeddings.reshape(-1, C)).view(
+            B, -1, self.num_heads, self.head_dim
+        )  # [B, T_pos, H, d]
+        matrix_bd = q_v @ rel_k.permute(0, 2, 3, 1)  # [B, H, T, T_pos]
+        matrix_bd = self._rel_shift(matrix_bd)[..., :T] * scale  # [B, H, T, T]
+
+        # Fold in the padding mask (−∞ for masked/padded positions)
+        if attention_mask is not None:
+            matrix_bd = matrix_bd.masked_fill_(~attention_mask, float("-inf"))
+
+        # Content-content term: add bias_u to q; SDPA computes (q+bias_u)@k^T
+        q = q + self.bias_u.view(1, self.num_heads, 1, self.head_dim)
+
+        # ── SDPA via parent's logit_bias path ─────────────────────────────────
+        # Flatten back to packed [B*T, H*d] as expected by _forward_with_logit_bias
+        q = q.transpose(1, 2).reshape(B * T, self.q_size)
+        k = k.transpose(1, 2).reshape(B * T, self.kv_size)
+        v = v.transpose(1, 2).reshape(B * T, self.kv_size)
+
+        attn_output, _ = self._forward_with_logit_bias(q, k, v, B=B, T=T, logit_bias=matrix_bd)
+
+        # ── Output projection (TP row-parallel with AllReduce) ────────────────
+        return self.o_proj(attn_output).reshape(B, T, C)
+
+    def load_weights(self, weights: Dict[str, torch.Tensor], prefix: str = "") -> None:
+        """Load checkpoint weights.
+
+        The checkpoint stores q/k/v as separate projections; qkv_proj is fused.
+        """
+        self.qkv_proj.load_weights(
+            [
+                {"weight": weights[f"{prefix}q_proj.weight"]},
+                {"weight": weights[f"{prefix}k_proj.weight"]},
+                {"weight": weights[f"{prefix}v_proj.weight"]},
+            ]
+        )
+        self.o_proj.load_weights([{"weight": weights[f"{prefix}o_proj.weight"]}])
+        self.relative_k_proj.load_weights([{"weight": weights[f"{prefix}relative_k_proj.weight"]}])
+        self.bias_u.data.copy_(weights[f"{prefix}bias_u"])
+        self.bias_v.data.copy_(weights[f"{prefix}bias_v"])
+
+
+class ParakeetFeedForward(nn.Module):
+    """Conformer FFN: Linear(hidden→intermediate) → activation → Linear(intermediate→hidden)."""
+
+    def __init__(self, config: ParakeetEncoderConfig, dtype: Optional[torch.dtype] = None):
+        super().__init__()
+        self.linear1 = Linear(
+            config.hidden_size,
+            config.intermediate_size,
+            bias=bool(config.attention_bias),
+            dtype=dtype,
+        )
+        self.linear2 = Linear(
+            config.intermediate_size,
+            config.hidden_size,
+            bias=bool(config.attention_bias),
+            dtype=dtype,
+        )
+        self.activation = ACT2FN[config.hidden_act]
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        return self.linear2(self.activation(self.linear1(hidden_states)))
+
+
+class ParakeetConvolutionModule(nn.Module):
+    """Conformer depthwise convolution module with trtllm.Linear pointwise projections.
+
+    Pointwise 1×1 convolutions use trtllm.Linear (operating on the last dim);
+    the depthwise Conv1d and BatchNorm remain as HF/PyTorch modules.
+    Checkpoint weights for pointwise_conv1/2 have shape [C_out, C_in, 1] and are
+    squeezed to [C_out, C_in] during load_weights.
+    """
+
+    def __init__(self, config: ParakeetEncoderConfig, dtype: Optional[torch.dtype] = None):
+        super().__init__()
+        channels = config.hidden_size
+        kernel_size = config.conv_kernel_size
+        self.activation = ACT2FN[getattr(config, "hidden_act", "silu")]
+        self.padding = (kernel_size - 1) // 2
+        self.pointwise_conv1 = Linear(
+            channels, 2 * channels, bias=config.convolution_bias, dtype=dtype
+        )
+        self.depthwise_conv = nn.Conv1d(
+            channels,
+            channels,
+            kernel_size,
+            stride=1,
+            padding=self.padding,
+            groups=channels,
+            bias=config.convolution_bias,
+        )
+        self.norm = nn.BatchNorm1d(channels)
+        self.pointwise_conv2 = Linear(channels, channels, bias=config.convolution_bias, dtype=dtype)
+        if dtype is not None:
+            self.depthwise_conv.to(dtype=dtype)
+            self.norm.to(dtype=dtype)
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        # GLU via linear — no initial transpose needed
+        hidden_states = self.pointwise_conv1(hidden_states)  # [B, T, 2C]
+        hidden_states = nn.functional.glu(hidden_states, dim=-1)  # [B, T, C]
+
+        # Depthwise conv operates on [B, C, T]
+        hidden_states = hidden_states.transpose(1, 2)
+
+        if attention_mask is not None:
+            if attention_mask.dtype == torch.bool:
+                all_masked_rows = torch.all(~attention_mask, dim=2)
+            else:
+                all_masked_rows = torch.all(~(attention_mask == 0.0), dim=2)
+            hidden_states = hidden_states.masked_fill(all_masked_rows, 0.0)
+
+        hidden_states = self.depthwise_conv(hidden_states)
+        hidden_states = self.norm(hidden_states)
+        hidden_states = self.activation(hidden_states)
+
+        hidden_states = hidden_states.transpose(1, 2)  # [B, T, C]
+        return self.pointwise_conv2(hidden_states)
+
+
+class ParakeetConformerBlock(nn.Module):
+    """Conformer block with trtllm layers throughout.
+
+    All linear projections use trtllm.Linear; all normalization uses
+    trtllm.LayerNorm. Attribute names mirror HF ParakeetEncoderBlock so
+    checkpoint weight keys map 1-to-1 without remapping.
+    """
+
+    def __init__(
+        self,
+        config: ParakeetEncoderConfig,
+        layer_idx: int,
+        dtype: Optional[torch.dtype] = None,
+    ):
+        super().__init__()
+        self.feed_forward1 = ParakeetFeedForward(config, dtype=dtype)
+        self.self_attn = ParakeetConformerAttention(config, layer_idx, dtype=dtype)
+        self.conv = ParakeetConvolutionModule(config, dtype=dtype)
+        self.feed_forward2 = ParakeetFeedForward(config, dtype=dtype)
+        self.norm_feed_forward1 = LayerNorm(hidden_size=config.hidden_size, eps=1e-5, dtype=dtype)
+        self.norm_self_att = LayerNorm(hidden_size=config.hidden_size, eps=1e-5, dtype=dtype)
+        self.norm_conv = LayerNorm(hidden_size=config.hidden_size, eps=1e-5, dtype=dtype)
+        self.norm_feed_forward2 = LayerNorm(hidden_size=config.hidden_size, eps=1e-5, dtype=dtype)
+        self.norm_out = LayerNorm(hidden_size=config.hidden_size, eps=1e-5, dtype=dtype)
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_embeddings: Optional[torch.Tensor] = None,
+        **kwargs,
+    ) -> torch.Tensor:
+        # FFN1 with 0.5 residual scaling (Conformer architecture)
+        residual = hidden_states
+        hidden_states = residual + 0.5 * self.feed_forward1(self.norm_feed_forward1(hidden_states))
+
+        # Self-attention with relative positional encoding
+        hidden_states = hidden_states + self.self_attn(
+            self.norm_self_att(hidden_states),
+            attention_mask=attention_mask,
+            position_embeddings=position_embeddings,
+        )
+
+        # Convolution module
+        hidden_states = hidden_states + self.conv(
+            self.norm_conv(hidden_states), attention_mask=attention_mask
+        )
+
+        # FFN2 with 0.5 residual scaling
+        hidden_states = hidden_states + 0.5 * self.feed_forward2(
+            self.norm_feed_forward2(hidden_states)
+        )
+
+        return self.norm_out(hidden_states)
+
+
+class ParakeetEncoder(nn.Module):
+    """Native TRT-LLM Conformer encoder.
+
+    Mirrors the structure and attribute names of HF ParakeetEncoder so that
+    checkpoint weight keys map without remapping.  All linear projections use
+    trtllm.Linear and all normalization uses trtllm.LayerNorm; only the
+    depthwise Conv1d, BatchNorm, and Conv2D subsampling remain as plain PyTorch.
+    """
+
+    def __init__(self, config: ParakeetEncoderConfig, dtype: Optional[torch.dtype] = None):
+        super().__init__()
+        self.config = config
+        self.input_scale = math.sqrt(config.hidden_size) if config.scale_input else 1.0
+        self.subsampling = HFParakeetEncoderSubsamplingConv2D(config)
+        self.encode_positions = HFParakeetEncoderRelPositionalEncoding(config)
+        self.layers = nn.ModuleList(
+            [
+                ParakeetConformerBlock(config, layer_idx=i, dtype=dtype)
+                for i in range(config.num_hidden_layers)
+            ]
+        )
+
+        if dtype is not None:
+            self.subsampling.to(dtype=dtype)
+            self.encode_positions.to(dtype=dtype)
+
+    def _get_subsampling_output_length(self, input_lengths: torch.Tensor) -> torch.Tensor:
+        cfg = self.config
+        num_layers = int(math.log2(cfg.subsampling_factor))
+        add_pad = (cfg.subsampling_conv_kernel_size - 1) // 2 * 2 - cfg.subsampling_conv_kernel_size
+        lengths = input_lengths
+        for _ in range(num_layers):
+            lengths = (
+                torch.div(lengths.to(torch.float) + add_pad, cfg.subsampling_conv_stride) + 1.0
+            )
+            lengths = torch.floor(lengths)
+        return lengths.to(torch.int)
+
+    def _build_attention_mask(self, attention_mask: torch.Tensor, seq_len: int) -> torch.Tensor:
+        """Convert 2-D input mask to 4-D additive attention mask after subsampling."""
+        output_lengths = self._get_subsampling_output_length(attention_mask.sum(-1))
+        output_mask = torch.arange(seq_len, device=attention_mask.device) < output_lengths[:, None]
+        mask_2d = output_mask.unsqueeze(1).expand(-1, seq_len, -1)
+        mask_2d = mask_2d & mask_2d.transpose(1, 2)
+        return mask_2d.unsqueeze(1)
+
+    def forward(
+        self,
+        input_features: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        hidden_states = self.subsampling(input_features, attention_mask)
+        hidden_states = hidden_states * self.input_scale
+        position_embeddings = self.encode_positions(hidden_states)
+
+        attn_mask_4d = None
+        if attention_mask is not None:
+            attn_mask_4d = self._build_attention_mask(attention_mask, hidden_states.shape[1])
+
+        for block in self.layers:
+            hidden_states = block(
+                hidden_states,
+                attention_mask=attn_mask_4d,
+                position_embeddings=position_embeddings,
+            )
+
+        return hidden_states
+
+    def load_weights(self, weights: Dict[str, torch.Tensor]) -> None:
+        """Load weights from a flat dict with keys relative to the encoder root.
+
+        ParakeetConformerAttention modules load their own weights (fused QKV from
+        separate q/k/v checkpoint keys).  All other trtllm.Linear modules are loaded
+        via their native API.  Remaining parameters (trtllm.LayerNorm, BatchNorm,
+        etc.) are loaded via state_dict — trtllm.LayerNorm uses the same weight/bias
+        parameter names as nn.LayerNorm so no remapping is needed.
+        """
+        trtllm_param_keys: set[str] = set()
+        # Track prefixes of attention modules whose sub-modules must be skipped.
+        attn_prefixes: list[str] = []
+
+        for mod_name, module in self.named_modules():
+            # Skip sub-modules of already-handled attention blocks: named_modules()
+            # recurses into ParakeetConformerAttention so qkv_proj/o_proj would
+            # otherwise fall through to the generic Linear branch below.
+            if any(mod_name.startswith(p) for p in attn_prefixes):
+                continue
+
+            if isinstance(module, ParakeetConformerAttention):
+                # Attention owns its own weight loading (fused QKV + relative_k_proj
+                # + bias_u/bias_v).  Prefix maps "layers.i.self_attn" → "layers.i.self_attn."
+                prefix = f"{mod_name}." if mod_name else ""
+                attn_prefixes.append(prefix)
+                module.load_weights(weights, prefix=prefix)
+                # Checkpoint keys (excluded from remaining dict):
+                for suffix in (
+                    "q_proj.weight",
+                    "k_proj.weight",
+                    "v_proj.weight",
+                    "o_proj.weight",
+                    "relative_k_proj.weight",
+                    "bias_u",
+                    "bias_v",
+                ):
+                    trtllm_param_keys.add(f"{prefix}{suffix}")
+                if module.qkv_proj.bias is not None:
+                    for sfx in ("q_proj.bias", "k_proj.bias", "v_proj.bias"):
+                        trtllm_param_keys.add(f"{prefix}{sfx}")
+                if module.o_proj.bias is not None:
+                    trtllm_param_keys.add(f"{prefix}o_proj.bias")
+                # Model parameter names (allowed as missing in load_state_dict):
+                # qkv_proj is fused in the model but split in the checkpoint.
+                trtllm_param_keys.add(f"{prefix}qkv_proj.weight")
+                if module.qkv_proj.bias is not None:
+                    trtllm_param_keys.add(f"{prefix}qkv_proj.bias")
+            elif isinstance(module, Linear):
+                w = weights[f"{mod_name}.weight"]
+                # Pointwise Conv1d weights are stored as [C_out, C_in, 1]; squeeze for Linear.
+                entry: Dict[str, torch.Tensor] = {"weight": w.squeeze(-1) if w.dim() == 3 else w}
+                bias_key = f"{mod_name}.bias"
+                if bias_key in weights:
+                    entry["bias"] = weights[bias_key]
+                module.load_weights([entry])
+                trtllm_param_keys.add(f"{mod_name}.weight")
+                trtllm_param_keys.add(bias_key)
+
+        remaining = {k: v for k, v in weights.items() if k not in trtllm_param_keys}
+        incompatible = self.load_state_dict(remaining, strict=False)
+
+        # Allowed gaps: trtllm weights (loaded above) and convolution bias keys
+        # absent in pre-transformers-5.0 checkpoints.
+        unexpected_missing = [
+            k
+            for k in incompatible.missing_keys
+            if k not in trtllm_param_keys and not ("_conv" in k and k.endswith(".bias"))
+        ]
+        if unexpected_missing:
+            raise KeyError(f"Missing encoder weights after loading: {unexpected_missing}")
 
 
 class ProjectedParakeet(nn.Module):
@@ -352,7 +776,7 @@ class ProjectedParakeet(nn.Module):
     ):
         super().__init__()
         encoder_config = _make_parakeet_encoder_config(sound_config)
-        self.encoder = HFParakeetEncoder(encoder_config).to(dtype=dtype)
+        self.encoder = ParakeetEncoder(encoder_config, dtype=dtype)
         self.projection = ParakeetProjection(
             hidden_size=sound_config.hidden_size,
             projection_hidden_size=sound_config.projection_hidden_size,
@@ -366,16 +790,11 @@ class ProjectedParakeet(nn.Module):
         input_features: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        outputs = self.encoder(
-            input_features=input_features,
-            attention_mask=attention_mask,
-        )
-        hidden_states = outputs.last_hidden_state
-        return self.projection(hidden_states)
+        return self.projection(self.encoder(input_features, attention_mask))
 
     def load_weights(self, weights: Dict[str, torch.Tensor]) -> None:
-        encoder_weights = {}
-        projection_weights = {}
+        encoder_weights: Dict[str, torch.Tensor] = {}
+        projection_weights: Dict[str, torch.Tensor] = {}
         for key, value in weights.items():
             if key.startswith("sound_encoder.encoder."):
                 sub_key = key[len("sound_encoder.encoder.") :]
@@ -387,17 +806,16 @@ class ProjectedParakeet(nn.Module):
                 sub_key = key[len("sound_projection.") :]
                 projection_weights[sub_key] = value
 
-        # There was a bug in `transformers` prior to version 5.0, where the
-        # `ParakeetEncoderConvolutionModule` would ignore the value of `config.convolution_bias`
-        # and always use a bias.
-        incompatible_keys = self.encoder.load_state_dict(encoder_weights, strict=False)
-        non_conv_bias_keys = [
-            key
-            for key in incompatible_keys.missing_keys
-            if not ("_conv" in key and key.endswith(".bias"))
-        ]
-        if len(non_conv_bias_keys) > 0:
-            raise KeyError(
-                f"The following keys were missing from the checkpoint: {non_conv_bias_keys}."
-            )
-        self.projection.load_state_dict(projection_weights, strict=True)
+        self.encoder.load_weights(encoder_weights)
+
+        # projection.linear1/2 are trtllm.Linear; load them via their API.
+        # projection.norm (RMSNorm) is loaded via state_dict.
+        proj = self.projection
+        proj.linear1.load_weights([{"weight": projection_weights["linear1.weight"]}])
+        proj.linear2.load_weights([{"weight": projection_weights["linear2.weight"]}])
+        norm_weights = {
+            k: v
+            for k, v in projection_weights.items()
+            if not k.startswith("linear1.") and not k.startswith("linear2.")
+        }
+        proj.load_state_dict(norm_weights, strict=False)
