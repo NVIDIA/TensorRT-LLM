@@ -1,3 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import json
 from pathlib import Path
 from typing import Any
@@ -16,6 +31,35 @@ from tensorrt_llm.quantization.mode import QuantAlgo
 # vllm code here
 # https://github.com/vllm-project/vllm/blob/48a5fff66e78985a634abac0d8d7f271da744000/vllm/transformers_utils/configs/mistral.py
 ###################
+
+
+class _MistralPretrainedConfig(PretrainedConfig):
+
+    def __init__(
+        self,
+        max_position_embeddings: int = 128_000,
+        rope_scaling: dict[str, Any] | None = None,
+        rope_parameters: dict[str, Any] | None = None,
+        **kwargs,
+    ):
+        original_rope_scaling = rope_scaling
+        self.max_position_embeddings = max_position_embeddings
+        self.rope_scaling = rope_scaling
+        self.rope_parameters = rope_parameters or rope_scaling
+        super().__init__(
+            max_position_embeddings=max_position_embeddings,
+            rope_scaling=rope_scaling,
+            rope_parameters=rope_parameters,
+            **kwargs,
+        )
+        if self.rope_scaling is None and original_rope_scaling is not None:
+            self.rope_scaling = original_rope_scaling
+        if self.rope_parameters is None and self.rope_scaling is not None:
+            self.rope_parameters = self.rope_scaling
+
+
+def _mistral_pretrained_config_from_dict(config_dict: dict[str, Any]) -> PretrainedConfig:
+    return _MistralPretrainedConfig.from_dict(config_dict)
 
 
 def adapt_config_dict(
@@ -72,7 +116,7 @@ def adapt_config_dict(
     for k, v in defaults.items():
         config_dict.setdefault(k, v)
 
-    config = PretrainedConfig.from_dict(config_dict)
+    config = _mistral_pretrained_config_from_dict(config_dict)
 
     return config
 
@@ -87,7 +131,7 @@ def _remap_mistral_vision_args(config: dict) -> dict:
     config = {
         "model_type": "pixtral",
         "architectures": ["PixtralForConditionalGeneration"],
-        "text_config": PretrainedConfig.from_dict(config),
+        "text_config": _mistral_pretrained_config_from_dict(config),
         "vision_config": PretrainedConfig.from_dict(vision_config),
     }
     if quant_config:
@@ -175,7 +219,7 @@ def _remap_mistral_audio_args(config: dict) -> dict:
     config = {
         "model_type": "whixtral",
         "architectures": ["VoxtralForConditionalGeneration"],
-        "text_config": PretrainedConfig.from_dict(config),
+        "text_config": _mistral_pretrained_config_from_dict(config),
         "audio_config": WhisperConfig(
             num_mel_bins=encoder_args["audio_encoding_args"]["num_mel_bins"],
             window_size=encoder_args["audio_encoding_args"]["window_size"],
