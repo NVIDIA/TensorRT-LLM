@@ -677,11 +677,19 @@ class KVCacheManager(BaseResourceManager):
             device='cpu')
         self.blocks_per_window = blocks_per_window
 
-    def probe_prefix_match_length(self, input_tokens, lora_task_id=None):
+    def probe_prefix_match_length(self,
+                                  input_tokens,
+                                  lora_task_id=None,
+                                  cache_salt_id=None):
         """Probe the KV cache radix tree for prefix match length.
 
         Returns the number of prefix tokens already cached on this rank.
         Used by KVCacheAwareADPRouter for cache-aware routing.
+
+        ``cache_salt_id`` scopes the probe to the same per-request
+        namespace that ``_create_kv_cache`` uses; without it, salted
+        requests would be probed against the salt=None namespace and the
+        router would see the wrong match length.
         """
         if not self.enable_block_reuse:
             return 0
@@ -698,12 +706,16 @@ class KVCacheManager(BaseResourceManager):
             LlmRequest as CppLlmRequest
         block_key = BlockKey(tokens=input_tokens, lora_task_id=lora_task_id)
         unique_tokens = block_key.unique_tokens
+        # buildBlockKeys() on the C++ side pulls cache_salt_id off the
+        # request, so dummy_req must carry it for the probe namespace to
+        # match the real create_kv_cache path.
         dummy_req = CppLlmRequest(request_id=0,
                                   max_new_tokens=0,
                                   input_tokens=input_tokens,
                                   sampling_config=SamplingConfig(),
                                   is_streaming=False,
-                                  lora_task_id=lora_task_id)
+                                  lora_task_id=lora_task_id,
+                                  cache_salt_id=cache_salt_id)
         summary = self.impl.analyze_prefix_reuse(unique_tokens, dummy_req)
         return summary.reusable_blocks_all * self.tokens_per_block
 
@@ -2584,6 +2596,33 @@ class KVCacheManagerV2(BaseResourceManager):
         """Return True if *request_id* has a live, non-suspended KV cache."""
         kv_cache = self.kv_cache_map.get(request_id)
         return kv_cache is not None and kv_cache.is_active
+
+    def probe_prefix_match_length(self,
+                                  input_tokens,
+                                  lora_task_id=None,
+                                  cache_salt_id=None):
+        """Probe the v2 KV cache radix tree for prefix match length.
+
+        Returns the number of prefix tokens already cached on this rank,
+        without acquiring page ownership. Mirrors the v1 KVCacheManager
+        adapter so KVCacheAwareADPRouter works on both backends.
+
+        ``cache_salt_id`` (and ``lora_task_id``) must match the values
+        used by ``_create_kv_cache`` (which constructs
+        ``ReuseScope(lora_id=lora_task_id, salt=cache_salt_id)``).
+        Otherwise the probe queries the wrong reuse namespace and the
+        router sees an incorrect match length.
+        """
+        if not self.enable_block_reuse:
+            return 0
+        if not input_tokens:
+            return 0
+        from tensorrt_llm.runtime.kv_cache_manager_v2._block_radix_tree import \
+            ReuseScope
+        return self.impl.probe_reuse(
+            ReuseScope(lora_id=lora_task_id, salt=cache_salt_id),
+            input_tokens,
+        )
 
     def _effective_draft_len(self, req: LlmRequest) -> int:
         """Draft token length to use for next-step KV capacity calculation.
