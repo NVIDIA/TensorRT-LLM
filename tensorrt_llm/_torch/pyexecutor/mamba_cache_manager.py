@@ -1597,7 +1597,7 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
         # get_state_indices can return indices in arbitrary request order.
         for i, req in enumerate(self.requests):
             self._request_id_to_state_index[
-                req.py_request_id] = host_block_offsets[i].item()
+                req.py_request_id] = self._host_state_indices[i].item()
 
     def get_state_indices(self,
                           request_ids: Optional[List[int]] = None,
