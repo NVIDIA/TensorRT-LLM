@@ -237,7 +237,22 @@ CacheTransceiver::CacheTransceiver(kv_cache_manager::BaseKVCacheManager* cacheMa
             }
         }
 
-        mCacheState->setRnnConfig(rnnModelCfg, rnnLayerNumPerPP, rnnPoolDtype, rnnPoolDtype);
+        // SSM dtype = pool dtype (pool is allocated with ssm_state_dtype).
+        // Conv dtype may differ from pool dtype (e.g., model uses bf16 conv with fp16 ssm).
+        // Only the byte size matters for split/concat kernel stride calculations — the actual
+        // dtype enum is not interpreted numerically, just used for getDTypeSize() dispatch.
+        nvinfer1::DataType convDtype = rnnPoolDtype; // fallback: same as pool
+        if (linearMeta->rnnConvDtypeSize > 0)
+        {
+            switch (linearMeta->rnnConvDtypeSize)
+            {
+            case 4: convDtype = nvinfer1::DataType::kFLOAT; break;
+            case 2: convDtype = nvinfer1::DataType::kBF16; break;
+            case 1: convDtype = nvinfer1::DataType::kFP8; break;
+            default: convDtype = rnnPoolDtype; break;
+            }
+        }
+        mCacheState->setRnnConfig(rnnModelCfg, rnnLayerNumPerPP, convDtype, rnnPoolDtype);
 
         // Create RnnCacheTransBufferManager for unified pool path.
         mRnnCacheTransBufferManager

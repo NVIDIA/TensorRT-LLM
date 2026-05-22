@@ -1156,6 +1156,7 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
         self.linear_attention_metadata.rnn_conv_section_layout = conv_section_map.get(
             self._rnn_conv_section_layout, 0)
         self.linear_attention_metadata.rnn_ssm_bytes = self.ssm_bytes
+        self.linear_attention_metadata.rnn_conv_dtype_size = self.conv_state_dtype.itemsize
         kv_cache_config = kv_cache_config.model_copy(deep=True)
         if kv_cache_config.enable_partial_reuse:
             logger.warning(
