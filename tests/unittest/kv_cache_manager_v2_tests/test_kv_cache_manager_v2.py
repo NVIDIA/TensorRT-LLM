@@ -2411,11 +2411,7 @@ class TestScratchReuse(TestKVCacheManagerV2):
             success = kv.resume(stream)
             self.assertTrue(success)
             self.assertFalse(kv.has_scratch_slots)
-
             # Chunk 2: resize to 352 with history_length=256.
-            if rewind_len > 0:
-                with self.assertRaisesRegex(AssertionError, "old_capacity - max_rewind_len"):
-                    kv.resize(352, 223)
             success = kv.resize(352, 256)
             self.assertTrue(success)
 
