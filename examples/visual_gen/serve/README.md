@@ -18,11 +18,7 @@ These examples show how to interact with the visual generation server using both
 
 Before running these examples, ensure you have:
 
-1. **Install modules**: Install required dependencies before running examples:
-
-   ```bash
-   pip install "diffusers>=0.37.0"
-   ```
+1. **Install modules**: Install optional dependency:
 
    **Optional**: For better video compression (H.264/MP4), install [ffmpeg](https://ffmpeg.org/):
    ```bash

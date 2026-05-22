@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -61,7 +61,13 @@ def get_ucx_tls():
 
     Pre-Hopper GPUs need cuda_ipc excluded from UCX transports.
     """
-    if get_sm_version() < 90:
+    sm = get_sm_version()
+    """
+    ON some gb300 cluster,  we need to set `cuda_copy,cuda_ipc,sm,self,tcp` for UCX_TLS
+    """
+    if sm == 103:
+        return "cuda_copy,cuda_ipc,sm,self,tcp"
+    if sm < 90:
         return "^cuda_ipc,ib,gdr_copy"
     return "^ib,gdr_copy"
 
@@ -183,8 +189,6 @@ def get_test_config(test_desc, example_dir, test_root):
         f"{test_configs_root}/disagg_config_overlap.yaml",
         "perf_metrics":
         f"{test_configs_root}/disagg_config_metrics.yaml",
-        "trtllm_sampler":
-        f"{test_configs_root}/disagg_config_trtllm_sampler.yaml",
         "load_balance":
         f"{test_configs_root}/disagg_config_load_balance.yaml",
         "cache_aware_balance":
@@ -315,7 +319,7 @@ def get_client_test_set(test_desc):
                              verify_streaming_completion=True,
                              verify_chat=False,
                              verify_streaming_chat=False)
-    if test_desc.startswith("overlap") or test_desc == "trtllm_sampler":
+    if test_desc.startswith("overlap"):
         return ClientTestSet(completion=True,
                              completion_streaming=True,
                              chat=True,
@@ -454,6 +458,82 @@ def run_client_tests(example_dir,
                         assert expected_string in content, f"Expected string '{expected_string}' not found in {output_file}"
                 for not_expected_string in not_expected_strings:
                     assert not_expected_string not in content, f"Unexpected string '{not_expected_string}' found in {output_file}"
+
+
+def verify_usage_with_cache_reuse(server_url: str, model: str):
+    """Verify repeated requests report context-side usage after cache reuse."""
+    prompt = "Explain why a repeated disaggregated request should reuse cached KV blocks."
+    max_tokens = 4
+    timeout = aiohttp.ClientTimeout(total=120)
+
+    async def send_request(session: aiohttp.ClientSession, endpoint: str):
+        if endpoint == "completions":
+            payload = {
+                "model": model,
+                "prompt": prompt,
+                "max_tokens": max_tokens,
+                "temperature": 0.0,
+                "ignore_eos": True,
+            }
+        else:
+            payload = {
+                "model": model,
+                "messages": [{
+                    "role": "user",
+                    "content": prompt,
+                }],
+                "max_tokens": max_tokens,
+                "temperature": 0.0,
+                "ignore_eos": True,
+            }
+
+        async with session.post(f"{server_url}/v1/{endpoint}",
+                                json=payload,
+                                timeout=timeout) as resp:
+            assert resp.status == 200, \
+                f"{endpoint} request failed with {resp.status}: {await resp.text()}"
+            return await resp.json()
+
+    def validate_usage(endpoint: str, first_response: dict[str, Any],
+                       second_response: dict[str, Any]):
+        first_usage = first_response.get("usage")
+        second_usage = second_response.get("usage")
+        print(f"[usage_check] {endpoint} first_usage={first_usage}")
+        print(f"[usage_check] {endpoint} second_usage={second_usage}")
+        assert first_usage is not None, f"{endpoint} first response missing usage"
+        assert second_usage is not None, f"{endpoint} second response missing usage"
+        assert second_usage["prompt_tokens"] == first_usage["prompt_tokens"], \
+            (f"{endpoint} prompt_tokens mismatch: second={second_usage['prompt_tokens']} "
+             f"!= first={first_usage['prompt_tokens']}")
+        assert second_usage["completion_tokens"] == max_tokens, \
+            (f"{endpoint} completion_tokens mismatch: "
+             f"got={second_usage['completion_tokens']} expected={max_tokens}")
+        assert second_usage["total_tokens"] == (
+            second_usage["prompt_tokens"] + second_usage["completion_tokens"]), \
+            (f"{endpoint} total_tokens mismatch: "
+             f"got={second_usage['total_tokens']} expected="
+             f"{second_usage['prompt_tokens'] + second_usage['completion_tokens']}")
+
+        prompt_tokens_details = second_usage.get("prompt_tokens_details")
+        assert prompt_tokens_details is not None, \
+            f"{endpoint} second response missing prompt_tokens_details"
+        print(
+            f"[usage_check] {endpoint} prompt_tokens_details={prompt_tokens_details}"
+        )
+        assert prompt_tokens_details["cached_tokens"] == (
+            second_usage["prompt_tokens"] - 1), \
+            (f"{endpoint} cached_tokens mismatch: "
+             f"got={prompt_tokens_details['cached_tokens']} "
+             f"expected={second_usage['prompt_tokens'] - 1}")
+
+    async def check_usage():
+        async with aiohttp.ClientSession() as session:
+            for endpoint in ("completions", "chat/completions"):
+                first_response = await send_request(session, endpoint)
+                second_response = await send_request(session, endpoint)
+                validate_usage(endpoint, first_response, second_response)
+
+    asyncio.run(check_usage())
 
 
 # TODO: add test for disaggregated server prometheus metrics
@@ -599,18 +679,21 @@ def run_disaggregated_test(example_dir,
                            extra_endpoints_test=None,
                            model_path=None,
                            cwd=None,
-                           disagg_schedule_style=None):
+                           disagg_schedule_style=None,
+                           post_client_test=None):
     """Run disaggregated test using service discovery instead of MPI."""
-
     if mpi_disabled():
         pytest.skip(
             "https://nvbugs/5584607 Ray orchestrator is not supported with NIXL(DEFAULT) cache transceiver backend."
         )
 
+    run_env = env.copy() if env else os.environ.copy()
+    run_env["UCX_TLS"] = get_ucx_tls()
+
     config_file = get_test_config(test_desc, example_dir,
                                   os.path.dirname(__file__))
     config, ctx_workers, gen_workers, disagg_server, server_port, work_dir = \
-        setup_disagg_cluster(config_file, model_name=model_path, env=env, cwd=cwd,
+        setup_disagg_cluster(config_file, model_name=model_path, env=run_env, cwd=cwd,
                              schedule_style=disagg_schedule_style)
 
     server_host = config.get("hostname", "localhost")
@@ -637,7 +720,7 @@ def run_disaggregated_test(example_dir,
             client_config_file,
             test_desc,
             num_iters,
-            env,
+            run_env,
             300,  # timeout
             prompt_file,
             extra_endpoints_test,
@@ -645,6 +728,8 @@ def run_disaggregated_test(example_dir,
             all_worker_procs,
             disagg_server.process,
             use_ray=True)
+        if post_client_test is not None:
+            post_client_test(server_url)
     finally:
         terminate(*ctx_workers, *gen_workers, disagg_server)
         shutil.rmtree(work_dir, ignore_errors=True)
@@ -781,6 +866,7 @@ def test_disaggregated_benchmark_gen_only_insufficient_kv(
     env = llm_venv._new_env.copy()
     env['TRTLLM_DISAGG_BENCHMARK_GEN_ONLY'] = '1'
     env['TLLM_BENCHMARK_REQ_QUEUES_SIZE'] = '64'
+    env["UCX_TLS"] = get_ucx_tls()
 
     config_file = get_test_config("gen_only_insufficient_kv",
                                   disaggregated_example_root,
@@ -912,13 +998,19 @@ def test_disaggregated_overlap(disaggregated_test_root, llm_venv,
     setup_model_symlink(llm_venv, llama_model_root,
                         "TinyLlama/TinyLlama-1.1B-Chat-v1.0")
 
+    def post_client_test(server_url: str):
+        verify_usage_with_cache_reuse(server_url,
+                                      "TinyLlama/TinyLlama-1.1B-Chat-v1.0")
+
     run_disaggregated_test(disaggregated_example_root,
                            "overlap",
                            env=llm_venv._new_env,
+                           post_client_test=post_client_test,
                            model_path=llama_model_root,
                            cwd=llm_venv.get_working_directory())
 
 
+@skip_pre_hopper
 @pytest.mark.skip_less_device(8)
 @pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
                          indirect=True)
@@ -935,13 +1027,18 @@ def test_disaggregated_overlap_gen_first(disaggregated_test_root,
             os.makedirs(os.path.dirname(dst), exist_ok=True)
             os.symlink(src, dst, target_is_directory=True)
 
+    def post_client_test(server_url: str):
+        verify_usage_with_cache_reuse(server_url,
+                                      "TinyLlama/TinyLlama-1.1B-Chat-v1.0")
+
     run_disaggregated_test(
         disaggregated_example_root,
         "overlap_gen_first" if ctx_pp == 1 else "overlap_gen_first_pp4",
         env=llm_venv._new_env,
         model_path=llama_model_root,
         cwd=llm_venv.get_working_directory(),
-        disagg_schedule_style="generation_first")
+        disagg_schedule_style="generation_first",
+        post_client_test=post_client_test)
 
 
 @pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
@@ -1041,21 +1138,6 @@ def test_disaggregated_kv_cache_time_output(disaggregated_test_root, llm_venv,
                 assert float(sample_recv[1]) <= float(sample[1])
                 break
         assert matched
-
-
-@pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
-                         indirect=True)
-def test_disaggregated_trtllm_sampler(disaggregated_test_root, llm_venv,
-                                      disaggregated_example_root,
-                                      llama_model_root):
-    setup_model_symlink(llm_venv, llama_model_root,
-                        "TinyLlama/TinyLlama-1.1B-Chat-v1.0")
-
-    run_disaggregated_test(disaggregated_example_root,
-                           "trtllm_sampler",
-                           env=llm_venv._new_env,
-                           model_path=llama_model_root,
-                           cwd=llm_venv.get_working_directory())
 
 
 @pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
@@ -1771,7 +1853,6 @@ def run_disaggregated_aiperf(config_file,
         env: Environment variables dict
         cwd: Working directory
     """
-
     cleanup_output_files()
     run_env = env.copy()
     run_env["UCX_TLS"] = get_ucx_tls()
@@ -2355,7 +2436,7 @@ def test_disaggregated_logprobs_serving(disaggregated_test_root,
 
     env = llm_venv._new_env.copy()
     env["TRTLLM_USE_UCX_KVCACHE"] = "1"
-    env["UCX_TLS"] = "^ib,gdr_copy"
+    env["UCX_TLS"] = get_ucx_tls()
     ctx_workers, gen_workers, disagg_server, work_dir = [], [], None, None
     config, ctx_workers, gen_workers, disagg_server, server_port, work_dir = \
         setup_disagg_cluster(config_file, env=env,
@@ -2519,8 +2600,7 @@ def test_disaggregated_mamba_conc_greater_than_mbs(disaggregated_example_root,
                                   os.path.dirname(__file__))
 
     env = llm_venv._new_env.copy()
-    # Need to set UCX_TLS to ^ib to avoid hangs on CI B200 cluster.
-    env["UCX_TLS"] = "^ib"
+    env["UCX_TLS"] = get_ucx_tls()
     e2el, ttft = run_disaggregated_benchmark(
         disaggregated_example_root,
         config_file,

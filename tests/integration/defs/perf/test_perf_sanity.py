@@ -56,6 +56,7 @@ MODEL_PATH_DICT = {
     "llama_v3.3_70b_instruct_fp4": "llama-3.3-models/Llama-3.3-70B-Instruct-FP4",
     "deepseek_v3_lite_fp8": "DeepSeek-V3-Lite/fp8",
     "llama_v3.1_8b_instruct": "llama-3.1-model/Llama-3.1-8B-Instruct",
+    "llama_v3.1_8b_instruct_fp8": "llama-3.1-model/Llama-3.1-8B-Instruct-FP8",
     "glm_5_nvfp4": "GLM-5-NVFP4",
 }
 
@@ -381,6 +382,8 @@ class ServerConfig:
             # backfill completes.
             "s_spec_decoding_type",
             "l_num_nextn_predict_layers",
+            # moe_config
+            "l_load_balancer_num_slots",
         ]
 
     def to_db_data(self) -> dict:
@@ -477,6 +480,7 @@ class ClientConfig:
         client_config_data: dict,
         model_name: str,
         env_vars: str = "",
+        spec_decoding: bool = False,
     ):
         self.model_name = model_name
         self.concurrency = client_config_data.get("concurrency", 1)
@@ -492,6 +496,9 @@ class ClientConfig:
         self.dataset_file = client_config_data.get("dataset_file", "")
         self.use_nv_sa_benchmark = client_config_data.get("use_nv_sa_benchmark", False)
         self.env_vars = env_vars
+        # --ignore-eos must be off when spec decoding is enabled: forcing generation
+        # past EOS produces unstable acceptance rates.
+        self.spec_decoding = spec_decoding
 
         # Generate default name if not provided
         self.name = client_config_data.get("name", "")
@@ -522,7 +529,6 @@ class ClientConfig:
             str(self.concurrency * self.iterations),
             "--max-concurrency",
             str(self.concurrency),
-            "--ignore-eos",
             "--random-input-len",
             str(self.isl),
             "--random-output-len",
@@ -533,6 +539,8 @@ class ClientConfig:
             "--percentile-metrics",
             "ttft,tpot,itl,e2el",
         ]
+        if not self.spec_decoding:
+            benchmark_cmd.append("--ignore-eos")
         if self.backend:
             benchmark_cmd.extend(["--backend", self.backend])
         if self.trust_remote_code:
@@ -557,11 +565,12 @@ class ClientConfig:
             str(self.concurrency * self.iterations),
             "--max-concurrency",
             str(self.concurrency),
-            "--ignore-eos",
             "--no-test-input",
             "--percentile-metrics",
             "ttft,tpot,itl,e2el",
         ]
+        if not self.spec_decoding:
+            benchmark_cmd.append("--ignore-eos")
         if dataset_path:
             benchmark_cmd.append("--dataset-name")
             benchmark_cmd.append("trtllm_custom")
@@ -608,10 +617,15 @@ class ClientConfig:
             "b_use_chat_template",
             "b_streaming",
             "b_use_nv_sa_benchmark",
+            "b_eos",
         ]
 
     def to_db_data(self) -> dict:
         """Convert ClientConfig to database data."""
+        # b_eos = True when --ignore-eos is NOT used (EOS honored). Historical
+        # rows lack this field; _match() treats missing b_* as False, so legacy
+        # baselines (which always had --ignore-eos) only match new b_eos=False
+        # rows, while spec-decoding (b_eos=True) becomes a new test case.
         db_data = {
             "s_client_name": self.name,
             "l_concurrency": self.concurrency,
@@ -625,6 +639,7 @@ class ClientConfig:
             "b_streaming": self.streaming,
             "b_trust_remote_code": self.trust_remote_code,
             "b_use_nv_sa_benchmark": self.use_nv_sa_benchmark,
+            "b_eos": self.spec_decoding,
             "s_client_log_link": "",
             "s_client_env_vars": self.env_vars,
         }
@@ -1266,6 +1281,7 @@ class PerfSanityTestConfig:
                     client_config_data,
                     server_config_data["model_name"],
                     env_vars=client_env_var,
+                    spec_decoding=bool(server_config.spec_decoding_type),
                 )
                 client_configs.append(client_config)
 
@@ -1392,6 +1408,13 @@ class PerfSanityTestConfig:
         dataset_file = "" if benchmark_mode == "ctx_only" else benchmark.get("dataset_file", "")
         use_nv_sa_benchmark = benchmark.get("use_nv_sa_benchmark", False)
 
+        if benchmark_mode == "ctx_only":
+            spec_decoding = bool(ctx_server_config.spec_decoding_type)
+        else:
+            spec_decoding = bool(ctx_server_config.spec_decoding_type) or bool(
+                gen_server_config.spec_decoding_type
+            )
+
         client_configs = []
         for concurrency in concurrency_values:
             client_config_data = {
@@ -1412,6 +1435,7 @@ class PerfSanityTestConfig:
                 client_config_data,
                 model_name,
                 env_vars=client_env_var,
+                spec_decoding=spec_decoding,
             )
             client_configs.append(client_config)
 
@@ -1528,32 +1552,15 @@ class PerfSanityTestConfig:
         if not output:
             return
 
-        # Tolerance: allow up to 1% failed requests for high-concurrency benchmarks
-        # where transient network issues can cause rare individual request failures.
-        max_failure_rate = 0.01
-
         # Check for non-zero failed requests (default benchmark)
         failed_requests_match = re.search(r"Failed requests:\s+(\d+)", output)
         if failed_requests_match:
             failed_count = int(failed_requests_match.group(1))
             if failed_count > 0:
-                total_match = re.search(r"Successful requests:\s+(\d+)", output)
-                total_requests = (
-                    int(total_match.group(1)) + failed_count if total_match else failed_count
-                )
-                failure_rate = failed_count / total_requests if total_requests > 0 else 1.0
-                if failure_rate > max_failure_rate:
-                    error_msg = (
-                        f"Benchmark output contains {failed_count} failed requests "
-                        f"({failure_rate:.2%} failure rate exceeds {max_failure_rate:.0%} threshold)."
-                    )
-                    raise RuntimeError(error_msg)
-                return
+                error_msg = f"Benchmark output contains {failed_count} failed requests."
+                raise RuntimeError(error_msg)
 
-        # Check for explicit failure markers (default benchmark) only when
-        # the numeric "Failed requests:" line was not found (the markers are
-        # always printed together with the numeric count, so this avoids
-        # double-counting when the failure rate is within tolerance).
+        # Check for explicit failure markers (default benchmark)
         if "!FAILED REQUESTS!" in output or "!CHECK LOG FOR ERRORS!" in output:
             error_msg = "Benchmark output contains failure markers."
             raise RuntimeError(error_msg)
@@ -1569,14 +1576,11 @@ class PerfSanityTestConfig:
                 num_prompts = int(num_prompts_match.group(1))
                 failed_count = num_prompts - successful_count
                 if failed_count > 0:
-                    failure_rate = failed_count / num_prompts if num_prompts > 0 else 1.0
-                    if failure_rate > max_failure_rate:
-                        error_msg = (
-                            f"SA benchmark: {failed_count} of {num_prompts} requests failed "
-                            f"({successful_count} successful, "
-                            f"{failure_rate:.2%} exceeds {max_failure_rate:.0%} threshold)."
-                        )
-                        raise RuntimeError(error_msg)
+                    error_msg = (
+                        f"SA benchmark: {failed_count} of {num_prompts} requests failed "
+                        f"({successful_count} successful)."
+                    )
+                    raise RuntimeError(error_msg)
 
     def run_ex(self, commands) -> Dict[int, List[str]]:
         """Run commands and collect outputs."""

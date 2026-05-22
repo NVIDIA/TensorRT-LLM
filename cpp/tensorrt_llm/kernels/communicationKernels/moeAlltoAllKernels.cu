@@ -60,9 +60,27 @@ using tensorrt_llm::common::launchWithPdlWhenEnabled;
         __VA_ARGS__;                                                                                                   \
         break;                                                                                                         \
     }                                                                                                                  \
+    case 18:                                                                                                           \
+    {                                                                                                                  \
+        constexpr int TOP_K = 18;                                                                                      \
+        __VA_ARGS__;                                                                                                   \
+        break;                                                                                                         \
+    }                                                                                                                  \
     case 16:                                                                                                           \
     {                                                                                                                  \
         constexpr int TOP_K = 16;                                                                                      \
+        __VA_ARGS__;                                                                                                   \
+        break;                                                                                                         \
+    }                                                                                                                  \
+    case 14:                                                                                                           \
+    {                                                                                                                  \
+        constexpr int TOP_K = 14;                                                                                      \
+        __VA_ARGS__;                                                                                                   \
+        break;                                                                                                         \
+    }                                                                                                                  \
+    case 12:                                                                                                           \
+    {                                                                                                                  \
+        constexpr int TOP_K = 12;                                                                                      \
         __VA_ARGS__;                                                                                                   \
         break;                                                                                                         \
     }                                                                                                                  \

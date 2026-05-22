@@ -50,6 +50,12 @@ LayerGroupId: TypeAlias = LifeCycleId
 CacheLevel = NewType("CacheLevel", int)
 TokenId = NewType("TokenId", int)
 TokenIdExt = Union[TokenId, bytes]
+
+class ReuseScope(NamedTuple):
+    lora_id: int | None = None
+    salt: int | None = None
+    def to_bytes(self) -> bytes: ...
+
 LayerId = NewType("LayerId", int)
 CudaStream = NewType("CudaStream", int)
 BeamIndex = NewType("BeamIndex", int)
@@ -142,8 +148,11 @@ class KVCacheManagerConfig:
     enable_swa_scratch_reuse: bool = False
 
 # From _block_radix_tree.py
-def gen_multi_modal_tokens(
-    id_offset: int, multi_modal_data_digest: bytes, num_tokens: int
+def gen_multimodal_cache_key_tokens(
+    id_offset: int,
+    multi_modal_data_digest: bytes,
+    num_tokens: int,
+    token_offset: int = 0,
 ) -> list[TokenIdExt]: ...
 
 # From _core/_kv_cache.py
@@ -160,8 +169,8 @@ class _KVCache:
     def __init__(
         self,
         manager: "KVCacheManager",
-        lora_task_id: int | None,
-        input_tokens: Sequence[TokenIdExt] | None,
+        reuse_scope: ReuseScope,
+        reuse_match: Any | None,
         id: Any,
         custom_priority_callback: Callable[[int, Any], Priority],
     ) -> None: ...
@@ -294,11 +303,16 @@ class KVCacheManager:
     ) -> PageIndexConverter: ...
     def create_kv_cache(
         self,
-        lora_task_id: int | None = None,
+        reuse_scope: ReuseScope | None = None,
         input_tokens: Sequence[TokenIdExt] | None = None,
         id: Any = None,
         custom_priority_callback: Callable[[int, Any], Priority] = ...,
     ) -> _KVCache: ...
+    def probe_reuse(
+        self,
+        reuse_scope: ReuseScope | None = None,
+        input_tokens: Sequence[TokenIdExt] | None = None,
+    ) -> int: ...
     def resize(self, cache_level: CacheLevel, quota: int, best_efforts: bool = False) -> bool: ...
     def get_quota(self, cache_level: CacheLevel) -> int: ...
     @property

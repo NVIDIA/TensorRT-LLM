@@ -59,7 +59,8 @@ To enable dynamic tree mode, set `use_dynamic_tree=True` on the `Eagle3DecodingC
 * `use_dynamic_tree` (`bool`): Enables dynamic tree draft generation. Mutually exclusive with `eagle_choices` (static tree).
 * `dynamic_tree_max_topK` (`int`): Maximum number of tokens to expand per node at each draft layer.
 * `max_total_draft_tokens` (`int`, optional): Total draft token budget for the tree. Must satisfy `max_draft_len <= max_total_draft_tokens <= dynamic_tree_max_topK * max_draft_len`. Defaults to `dynamic_tree_max_topK * max_draft_len` if not set.
-* `max_batch_size` (`int`): Required when `use_dynamic_tree=True` for pre-allocating dynamic tree CUDA buffers.
+
+When `use_dynamic_tree=True`, the dynamic tree CUDA buffers are pre-allocated based on the `LLM`'s `max_batch_size`, which is propagated internally and must not be passed directly to `Eagle3DecodingConfig`.
 
 ```python
 from tensorrt_llm.llmapi import Eagle3DecodingConfig
@@ -70,7 +71,6 @@ speculative_config = Eagle3DecodingConfig(
     use_dynamic_tree=True,
     dynamic_tree_max_topK=10,
     max_total_draft_tokens=60,
-    max_batch_size=4,
 )
 
 llm = LLM("/path/to/target_model", speculative_config=speculative_config)

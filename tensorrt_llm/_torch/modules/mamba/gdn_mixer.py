@@ -436,15 +436,36 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         query = mixed_qkvz[..., :q_end]
         key = mixed_qkvz[..., q_end:k_end]
 
-        # Optimize: Use view (zero-copy) instead of reshape for contiguous slices
-        # Layout: [v_concat | z_concat], need to reshape each separately
-        value = mixed_qkvz[..., k_end:v_end].view(batch_size, num_v_heads_local, self.head_v_dim)
-        z = mixed_qkvz[..., v_end:z_end].view(batch_size, num_v_heads_local, self.head_v_dim)
+        # When heads_ratio == 1, ng == num_v_heads_local, so view works directly.
+        # When heads_ratio > 1 (dense models), the last-dim slice is
+        # [b, ng, ratio*hv] and we need [b, ng*ratio, hv].  A plain view
+        # fails because the slice is not contiguous in the packed qkvz
+        # tensor.  Adding .contiguous() before view is equivalent to
+        # reshape but makes the copy explicit and avoids a hidden perf
+        # drop.  An alternative zero-copy path would require changing
+        # the packing layout, which is a larger refactor.
+        if heads_ratio == 1:
+            value = mixed_qkvz[..., k_end:v_end]
+            z = mixed_qkvz[..., v_end:z_end]
+        else:
+            value = (
+                mixed_qkvz[..., k_end:v_end]
+                .contiguous()
+                .view(batch_size, num_v_heads_local, self.head_v_dim)
+            )
+            z = (
+                mixed_qkvz[..., v_end:z_end]
+                .contiguous()
+                .view(batch_size, num_v_heads_local, self.head_v_dim)
+            )
 
         # Slice ba components: [b, ng, 2*np/ng] -> [b, np] each
-        # Optimize: Use view instead of reshape (zero-copy for contiguous data)
-        b = mixed_ba[..., :heads_ratio].view(batch_size, num_v_heads_local)
-        a = mixed_ba[..., heads_ratio:].view(batch_size, num_v_heads_local)
+        if heads_ratio == 1:
+            b = mixed_ba[..., 0]
+            a = mixed_ba[..., 1]
+        else:
+            b = mixed_ba[..., :heads_ratio].contiguous().view(batch_size, num_v_heads_local)
+            a = mixed_ba[..., heads_ratio:].contiguous().view(batch_size, num_v_heads_local)
 
         return query, key, value, z, b, a
 
@@ -466,7 +487,7 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         num_decodes = kwargs["num_decodes"]
 
         if is_target_verify:
-            draft_token_num = spec_metadata.max_draft_len + 1
+            draft_token_num = spec_metadata.runtime_draft_len + 1
             assert num_decodes > 0
             assert mixed_qkv.shape[0] == num_decodes * draft_token_num
             assert a.shape[0] == num_decodes * draft_token_num
@@ -634,7 +655,7 @@ class Qwen3NextGatedDeltaNet(nn.Module):
             )
 
             if is_target_verify:
-                draft_token_num = spec_metadata.max_draft_len + 1
+                draft_token_num = spec_metadata.runtime_draft_len + 1
                 assert num_decodes > 0
                 assert mixed_qkv_d.shape[0] == num_decodes * draft_token_num
                 assert a_d.shape[0] == num_decodes * draft_token_num
@@ -738,7 +759,7 @@ class Qwen3NextGatedDeltaNet(nn.Module):
                 last_recurrent_state = last_recurrent_state.to(ssm_states.dtype, copy=False)
                 ssm_states[state_indices_p] = last_recurrent_state
 
-            draft_token_num = spec_metadata.max_draft_len + 1
+            draft_token_num = spec_metadata.runtime_draft_len + 1
             query_d = query[:, num_prefill_tokens:, :, :].reshape(
                 num_decodes, draft_token_num, self.num_k_heads // self.attn_tp_size, self.head_k_dim
             )

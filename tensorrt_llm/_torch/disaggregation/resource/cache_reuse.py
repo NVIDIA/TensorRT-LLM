@@ -15,7 +15,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import Union
+from typing import List, Sequence, Union
 
 import numpy as np
 
@@ -38,8 +38,23 @@ class CacheReuseAdapter(ABC):
     def tokens_per_block(self) -> int: ...
 
     @abstractmethod
-    def get_cached_token_count(self, req: LlmRequest) -> int:
-        """Block-aligned count of prefix tokens already cached for *req*."""
+    def _global_cached_token_count(self, req: LlmRequest) -> int:
+        """Block-aligned cached prefix length reported by the cache manager."""
+
+    def get_cached_token_count_per_layer_group(
+        self,
+        req: LlmRequest,
+        layer_groups: Sequence[AttentionLayerGroup],
+    ) -> List[int]:
+        """Per-layer-group cached prefix in tokens (block-aligned).
+
+        Returns the reuse-hit prefix only; SWA stale-region handling lives at
+        the transfer call site (it is a transport concern, not a cache one).
+        """
+        if not self.enable_block_reuse:
+            return [0] * len(layer_groups)
+        scalar = max(0, self._global_cached_token_count(req))
+        return [scalar] * len(layer_groups)
 
     @abstractmethod
     def get_block_ids(
@@ -72,12 +87,11 @@ class _CacheReuseAdapterV1(CacheReuseAdapter):
     def tokens_per_block(self) -> int:
         return self._mgr.tokens_per_block
 
-    def get_cached_token_count(self, req: LlmRequest) -> int:
+    def _global_cached_token_count(self, req: LlmRequest) -> int:
         if not self.enable_block_reuse:
             return 0
-        cached = req.prepopulated_prompt_len
         tpb = self.tokens_per_block
-        return (cached // tpb) * tpb
+        return (req.prepopulated_prompt_len // tpb) * tpb
 
     def get_block_ids(self, req, group_idx, lg):  # noqa: ARG002
         first_layer = get_global_layer_ids(lg)[0]
@@ -106,15 +120,14 @@ class _CacheReuseAdapterV2(CacheReuseAdapter):
     def tokens_per_block(self) -> int:
         return self._mgr.tokens_per_block
 
-    def get_cached_token_count(self, req: LlmRequest) -> int:
+    def _global_cached_token_count(self, req: LlmRequest) -> int:
         if not self.enable_block_reuse:
             return 0
         kv_cache = self._mgr.kv_cache_map.get(req.py_request_id)
         if kv_cache is None:
             return 0
-        cached = kv_cache.num_committed_tokens
         tpb = self.tokens_per_block
-        return (cached // tpb) * tpb
+        return (kv_cache.num_committed_tokens // tpb) * tpb
 
     def get_block_ids(self, req, group_idx, lg):  # noqa: ARG002
         return np.fromiter(

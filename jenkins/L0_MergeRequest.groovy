@@ -38,6 +38,7 @@ def getContainerURIs()
     keys = [
         "LLM_DOCKER_IMAGE",
         "LLM_SBSA_DOCKER_IMAGE",
+        "LLM_SBSA_WHEEL_DOCKER_IMAGE",
         "LLM_ROCKYLINUX8_PY310_DOCKER_IMAGE",
         "LLM_ROCKYLINUX8_PY312_DOCKER_IMAGE"
     ]
@@ -930,11 +931,22 @@ def getMultiGpuFileChanged(pipeline, testFilter, globalVars)
         "tensorrt_llm/evaluate/mmlu.py",
         "tensorrt_llm/executor/",
         "tensorrt_llm/functional.py",
-        "tensorrt_llm/llmapi/",
+        "tensorrt_llm/llmapi/disagg_utils.py",
+        "tensorrt_llm/llmapi/mgmn_leader_node.py",
+        "tensorrt_llm/llmapi/mgmn_worker_node.py",
+        "tensorrt_llm/llmapi/mpi_session.py",
+        "tensorrt_llm/llmapi/trtllm-llmapi-launch",
         "tensorrt_llm/mapping.py",
         "tensorrt_llm/models/llama/",
         "tensorrt_llm/parameter.py",
-        "tensorrt_llm/serve/",
+        "tensorrt_llm/serve/cluster_storage.py",
+        "tensorrt_llm/serve/disagg_auto_scaling.py",
+        "tensorrt_llm/serve/metadata_server.py",
+        "tensorrt_llm/serve/openai_client.py",
+        "tensorrt_llm/serve/openai_disagg_server.py",
+        "tensorrt_llm/serve/openai_disagg_service.py",
+        "tensorrt_llm/serve/openai_server.py",
+        "tensorrt_llm/serve/router.py",
         "tests/integration/defs/cpp/test_multi_gpu.py",
         "tests/integration/test_lists/test-db/l0_dgx_h100.yml",
         "tests/integration/test_lists/test-db/l0_dgx_h200.yml",
@@ -1379,6 +1391,7 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                         def additionalParameters = [
                             'testFilter': testFilterJson,
                             "dockerImage": globalVars["LLM_SBSA_DOCKER_IMAGE"],
+                            'wheelDockerImage': globalVars["LLM_SBSA_WHEEL_DOCKER_IMAGE"],
                         ]
 
                         launchJob(pipeline, "L0_Test-SBSA-Single-GPU", false, enableFailFast, globalVars, "SBSA", additionalParameters)
@@ -1433,6 +1446,7 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                         def additionalParameters = [
                             'testFilter': testFilterJson,
                             "dockerImage": globalVars["LLM_SBSA_DOCKER_IMAGE"],
+                            'wheelDockerImage': globalVars["LLM_SBSA_WHEEL_DOCKER_IMAGE"],
                         ]
 
                         launchJob(pipeline, "L0_Test-SBSA-Multi-GPU", false, enableFailFast, globalVars, "SBSA", additionalParameters)
@@ -1465,11 +1479,18 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                             branch = "github-pr-" + globalVars[GITHUB_PR_API_URL].split('/').last()
                         }
 
+                        // Force the image tag suffix to be this L0_MergeRequest BUILD_NUMBER
+                        // instead of the BuildDockerImages helper job's own counter.
+                        def shortCommit = env.gitlabCommit ? env.gitlabCommit.substring(0, 7) : "undefined"
+                        def branchTag = branch.replaceAll('/', '_')
+                        def defaultTag = "${shortCommit}-${branchTag}-${env.BUILD_NUMBER}"
+
                         def additionalParameters = [
                             'branch': branch,
                             'action': "push",
                             'triggerType': env.JOB_NAME ==~ /.*PostMerge.*/ ? "post-merge" : "pre-merge",
                             'runSanityCheck': env.JOB_NAME ==~ /.*PostMerge.*/ ? true : false,
+                            'defaultTag': defaultTag,
                         ]
 
                         launchJob(pipeline, "/LLM/helpers/BuildDockerImages", false, enableFailFast, globalVars, "x86_64", additionalParameters)
@@ -1671,6 +1692,7 @@ pipeline {
             steps
             {
                 script {
+                    globalVars = trtllm_utils.initializeCiBudget(this, globalVars, 24, 'HOURS', 'L0_MergeRequest')
                     preparation(this, testFilter, globalVars)
                     println globalVars
                     globalVars[ACTION_INFO] = trtllm_utils.setupPipelineDescription(this, globalVars[ACTION_INFO])

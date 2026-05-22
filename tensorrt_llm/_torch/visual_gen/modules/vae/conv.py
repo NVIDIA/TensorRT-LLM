@@ -1,4 +1,4 @@
-from typing import List
+from typing import List, Optional
 
 import torch
 import torch.distributed as dist
@@ -33,7 +33,7 @@ class HaloExchangeConv(nn.Module):
         self,
         module: nn.Module,
         chunk_dim: int,
-        adj_groups: List[dist.ProcessGroup],
+        adj_groups: List[Optional[dist.ProcessGroup]],
         rank: int,
         world_size: int,
     ) -> None:
@@ -60,6 +60,14 @@ class HaloExchangeConv(nn.Module):
         d = chunk_kernel - 1
         self.halo_left = d // 2
         self.halo_right = d - self.halo_left
+
+    def _adj_group(self, index: int) -> dist.ProcessGroup:
+        group = self.adj_groups[index]
+        if group is None:
+            raise RuntimeError(
+                f"Missing VAE adjacent process group {index} for local rank {self.rank}"
+            )
+        return group
 
     def _exchange_halos(self, x: torch.Tensor) -> torch.Tensor:
         """Exchange boundary slices with adjacent ranks.
@@ -90,17 +98,17 @@ class HaloExchangeConv(nn.Module):
         if self.rank % 2 == 0:
             if self.rank > 0:
                 gather_buf = [recv_from_left, send_left]
-                dist.all_gather(gather_buf, send_left, group=self.adj_groups[self.rank - 1])
+                dist.all_gather(gather_buf, send_left, group=self._adj_group(self.rank - 1))
             if self.rank < self.world_size - 1:
                 gather_buf = [send_right, recv_from_right]
-                dist.all_gather(gather_buf, send_right, group=self.adj_groups[self.rank])
+                dist.all_gather(gather_buf, send_right, group=self._adj_group(self.rank))
         else:
             if self.rank < self.world_size - 1:
                 gather_buf = [send_right, recv_from_right]
-                dist.all_gather(gather_buf, send_right, group=self.adj_groups[self.rank])
+                dist.all_gather(gather_buf, send_right, group=self._adj_group(self.rank))
             if self.rank > 0:
                 gather_buf = [recv_from_left, send_left]
-                dist.all_gather(gather_buf, send_left, group=self.adj_groups[self.rank - 1])
+                dist.all_gather(gather_buf, send_left, group=self._adj_group(self.rank - 1))
 
         # Trim received data to the actual needed halo sizes.
         # recv_from_left holds the left neighbor's right-edge slices; we need
@@ -166,7 +174,7 @@ class HaloExchangeConv2dStride2(nn.Module):
         self,
         module: nn.Module,
         chunk_dim: int,
-        adj_groups: List[dist.ProcessGroup],
+        adj_groups: List[Optional[dist.ProcessGroup]],
         rank: int,
         world_size: int,
         pad_before_conv: tuple = (0, 1, 0, 1),

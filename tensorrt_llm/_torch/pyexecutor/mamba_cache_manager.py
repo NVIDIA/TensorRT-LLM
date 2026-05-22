@@ -32,7 +32,8 @@ from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 from tensorrt_llm._torch.pyexecutor.resource_manager import (
     BaseResourceManager, CacheTypeCpp, DataType, KVCacheManager, get_pp_layers)
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
-from tensorrt_llm._utils import nvtx_range, torch_dtype_to_binding
+from tensorrt_llm._utils import (nvtx_range, prefer_pinned,
+                                 torch_dtype_to_binding)
 from tensorrt_llm.bindings.internal.batch_manager import (
     LinearAttentionMetadata, LinearCacheType)
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig
@@ -60,7 +61,32 @@ def use_cpp_mamba_cache_manager() -> bool:
     Returns True if TRTLLM_USE_CPP_MAMBA='1' is set, False otherwise.
     By default, PythonMambaCacheManager is used.
     """
-    return os.environ.get('TRTLLM_USE_CPP_MAMBA', '0') == '1'
+    cpp = os.environ.get('TRTLLM_USE_CPP_MAMBA', '0') == '1'
+    py = os.environ.get('TRTLLM_USE_PY_MAMBA', '0') == '1'
+    if cpp and py:
+        raise ValueError(
+            "TRTLLM_USE_CPP_MAMBA=1 and TRTLLM_USE_PY_MAMBA=1 are mutually "
+            "exclusive; unset one of them.")
+    return cpp
+
+
+def use_py_mamba_cache_manager() -> bool:
+    """Check if PythonMambaCacheManager should be forced (agg mode override).
+
+    Returns True if TRTLLM_USE_PY_MAMBA='1' is set, False otherwise.
+
+    Agg-mode-only override: forces the V1-route MixedMambaHybridCacheManager
+    with PythonMambaCacheManager inside instead of the default unified-pool
+    CppMambaHybridCacheManager. Disagg mode is unaffected — it already picks
+    PythonMambaCacheManager when transceiver_runtime='PYTHON'.
+    """
+    cpp = os.environ.get('TRTLLM_USE_CPP_MAMBA', '0') == '1'
+    py = os.environ.get('TRTLLM_USE_PY_MAMBA', '0') == '1'
+    if cpp and py:
+        raise ValueError(
+            "TRTLLM_USE_CPP_MAMBA=1 and TRTLLM_USE_PY_MAMBA=1 are mutually "
+            "exclusive; unset one of them.")
+    return py
 
 
 class BaseMambaCacheManager(ABC):
@@ -891,7 +917,7 @@ class MixedMambaHybridCacheManager(KVCacheManager, MambaCacheManager,
             mamba_ssm_cache_dtype,
             mamba_layer_mask,
             execution_stream,
-            speculative_num_draft_tokens=(spec_config.max_draft_len
+            speculative_num_draft_tokens=(spec_config.tokens_per_gen_step - 1
                                           if spec_config is not None else None),
             model_type=model_type,
             use_replay_state_update=use_replay_state_update,
@@ -997,12 +1023,73 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
         mapping: Mapping,
         dtype: DataType = DataType.HALF,
         spec_config: Optional["DecodingBaseConfig"] = None,
-        layer_mask: Optional[List[bool]] = None,
+        layer_mask: Optional[
+            List[bool]] = None,  # this is the full attention layer mask
         is_estimating_kv_cache: bool = False,
+        is_draft: bool = False,
         use_replay_state_update: bool = False,
         **kwargs,
     ) -> None:
+        # 3 kinds of layers:
+        # 1) Mamba layers (mamba_layer_mask is True)
+        # 2) Full attention layers (full_attention_layer_mask is True)
+        # 3) Not managed layers (both masks are False)
+        total_layers = len(mamba_layer_mask)
+        if layer_mask is None:
+            full_attention_layer_mask = [False] * total_layers
+        elif len(layer_mask) != total_layers:
+            raise ValueError(
+                f"layer_mask length ({len(layer_mask)}) must match "
+                f"mamba_layer_mask length ({total_layers})")
+        else:
+            full_attention_layer_mask = list(layer_mask)
+        layer_mask = [
+            mamba_layer_mask[i] or full_attention_layer_mask[i]
+            for i in range(total_layers)
+        ]
+        # PP sharding is done across all layers.
+        # This is called again in the super().__init__, but we want it to run first
+        # to set up mtp states before the C++ backend is initialized.
+        self.pp_layers, _ = get_pp_layers(
+            mamba_num_layers + num_layers,
+            mapping,
+            spec_config=spec_config,
+            layer_mask=layer_mask,
+        )
+        self.mamba_pp_layers = [
+            layer_idx for layer_idx in self.pp_layers
+            if mamba_layer_mask[layer_idx]
+        ]
+        self.local_num_mamba_layers = len(self.mamba_pp_layers)
+        self.requests = []
+        # Seed externally visible mamba fields before any early return so that
+        # accessors (get_mamba_ssm_cache_dtype, use_replay_state_update) work
+        # on ranks with no local mamba layers.
         self._use_replay_state_update = use_replay_state_update
+        self.ssm_state_dtype = mamba_ssm_cache_dtype
+
+        if self.local_num_mamba_layers == 0:
+            logger.info(
+                "No local mamba layers for this rank, skipping mamba cache initialization"
+            )
+            super().__init__(
+                kv_cache_config,
+                kv_cache_type,
+                num_layers=num_layers,
+                num_kv_heads=num_kv_heads,
+                head_dim=head_dim,
+                tokens_per_block=tokens_per_block,
+                max_seq_len=max_seq_len,
+                max_batch_size=max_batch_size,
+                mapping=mapping,
+                dtype=dtype,
+                spec_config=spec_config,
+                layer_mask=full_attention_layer_mask,
+                is_estimating_kv_cache=is_estimating_kv_cache,
+                is_draft=is_draft,
+            )
+            return
+
         # Derive ssm_state_shape and conv_state_shape from mamba params (same as MambaCacheManager)
         tp_size = mapping.tp_size if not mapping.enable_attention_dp else 1
         d_inner = mamba_head_dim * mamba_num_heads
@@ -1018,7 +1105,6 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
         nheads = nheads // tp_size
         self.conv_state_shape = [conv_dim, mamba_d_conv - 1]
         self.ssm_state_shape = [nheads, mamba_head_dim, mamba_d_state]
-        self.ssm_state_dtype = mamba_ssm_cache_dtype
         self.conv_state_dtype = mamba_cache_dtype
         self.ssm_count = math.prod(self.ssm_state_shape)
         self.conv_count = math.prod(self.conv_state_shape)
@@ -1049,18 +1135,7 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
             )
             kv_cache_config.enable_partial_reuse = False
 
-        full_attention_layer_mask = layer_mask.copy()
-
         kv_cache_config.max_attention_window = []
-        # 3 kinds of layers:
-        # 1) Mamba layers (mamba_layer_mask is True)
-        # 2) Full attention layers (full_attention_layer_mask is True)
-        # 3) Not managed layers (both masks are False)
-        total_layers = len(mamba_layer_mask)
-        layer_mask = [
-            mamba_layer_mask[i] or full_attention_layer_mask[i]
-            for i in range(total_layers)
-        ]
         for i in range(len(layer_mask)):
             if layer_mask[i]:
                 kv_cache_config.max_attention_window.append(
@@ -1083,21 +1158,6 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
             if is_mamba:
                 per_layer_kv_heads[i] = 0
 
-        # PP sharding is done across all layers.
-        # This is called again in the super().__init__, but we want it to run first
-        # to set up mtp states before the C++ backend is initialized.
-        self.pp_layers, _ = get_pp_layers(
-            mamba_num_layers + num_layers,
-            mapping,
-            spec_config=spec_config,
-            layer_mask=layer_mask,
-        )
-        self.mamba_pp_layers = [
-            layer_idx for layer_idx in self.pp_layers
-            if mamba_layer_mask[layer_idx]
-        ]
-        self.local_num_mamba_layers = len(self.mamba_pp_layers)
-
         self._setup_mtp_intermediate_states(spec_config, max_batch_size)
 
         # pass remaining arguments to super class
@@ -1115,6 +1175,7 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
             spec_config=spec_config,
             layer_mask=layer_mask,
             is_estimating_kv_cache=is_estimating_kv_cache,
+            is_draft=is_draft,
             linear_attention_metadata=self.linear_attention_metadata,
         )
 
@@ -1128,13 +1189,18 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
         ],
                                               dtype=torch.int32,
                                               device="cpu")
-        self.requests = []
         self.recurrent_states_pool_index = self.kv_cache_pool_mapping[
             self.layer_offsets[self.mamba_pp_layers[0]]][0]
 
         self.cuda_state_indices = torch.zeros([self.max_batch_size],
                                               dtype=torch.int32,
                                               device="cuda")
+        self._host_state_indices = torch.zeros([self.max_batch_size],
+                                               dtype=torch.int32,
+                                               pin_memory=prefer_pinned())
+        self._row_indices = torch.arange(self.max_batch_size,
+                                         dtype=torch.long,
+                                         device="cpu")
         self.kv_cache_config = kv_cache_config
         self.is_estimating_kv_cache = is_estimating_kv_cache
 
@@ -1189,9 +1255,13 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
 
         # Per-request fixed cost. STATIC_SLOTS_PER_REQUEST = 1 today (the
         # live mamba state); fixed-position snapshots are not yet
-        # implemented and would simply increment this constant.
+        # implemented and would simply increment this constant. With
+        # pipeline parallelism, multiple microbatches are in-flight
+        # concurrently on the same rank, so each rank holds Mamba state
+        # for up to ``max_batch_size * pp_size`` concurrent sequences.
         STATIC_SLOTS_PER_REQUEST = 1
-        intercept = (max_batch_size * state_bytes_per_rank *
+        pp_size = mapping.pp_size if mapping is not None else 1
+        intercept = (max_batch_size * pp_size * state_bytes_per_rank *
                      STATIC_SLOTS_PER_REQUEST)
 
         # Regular-snapshot bytes per token. None / non-positive intervals
@@ -1269,9 +1339,16 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
     def _prepare_resources(self, scheduled_batch: ScheduledRequests):
         self.requests = scheduled_batch.context_requests + \
             scheduled_batch.generation_requests
-        for req in self.requests:
-            self.impl.copy_linear_attention_block(req)
-        self.impl.refresh_blocks()
+        # Issue all async block onboards; defer the syncTransfers() (refresh_blocks)
+        # until just before forward so the CPU-side prep (attn metadata, input
+        # tensor assembly, draft model prep, etc.) can overlap with the in-flight
+        # cudaMemcpyAsync calls instead of being serialized behind them.
+        # copy_linear_attention_block returns True iff it actually issued a copy;
+        # we skip refresh_blocks entirely when nothing was scheduled.
+        self._pending_state_transfers = self.impl.copy_linear_attention_block_batch(
+            self.requests)
+        if self._pending_state_transfers:
+            logger.info(f"Need to transfer mamba state blocks")
         self._setup_state_indices()
         # Reset replay double-buffer state for fresh context blocks. A reused
         # block (prefix-cache hit or block recycled across requests) may carry
@@ -1287,7 +1364,19 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
 
     def prepare_resources(self, scheduled_batch: ScheduledRequests):
         super().prepare_resources(scheduled_batch)
+        if self.local_num_mamba_layers == 0:
+            return
         self._prepare_resources(scheduled_batch)
+
+    @nvtx_range("hybrid_flush_state_transfers")
+    def flush_state_transfers(self) -> None:
+        """Complete any deferred state-block onboards scheduled by
+        prepare_resources(). Must be called before forward() reads recurrent
+        state blocks. Cheap no-op when nothing was scheduled.
+        """
+        if getattr(self, "_pending_state_transfers", False):
+            self.impl.refresh_blocks()
+            self._pending_state_transfers = False
 
     def is_speculative(self) -> bool:
         return self.spec_config is not None
@@ -1296,6 +1385,8 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
                             attn_metadata: "AttentionMetadata",
                             num_accepted_tokens: torch.Tensor,
                             state_indices: Optional[torch.Tensor] = None):
+        if self.local_num_mamba_layers == 0:
+            return
         # Note: cannot use @torch.compile here because all_ssm_states and
         # all_conv_states are dtype-reinterpreted views of the C++ pool
         # (uint8 -> typed), and aot_autograd does not support mutations on
@@ -1335,6 +1426,33 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
         accepted_conv = self.intermediate_conv_states[:, src_state_indices,
                                                       num_accepted_draft_tokens]
         self.all_conv_states[:, state_indices_d, :] = accepted_conv
+
+    def get_num_available_tokens(self,
+                                 token_num_upper_bound: int,
+                                 max_num_draft_tokens: int = 0,
+                                 **kwargs) -> int:
+        # Base bound from attention KV cache pool (the parent's behaviour).
+        result = super().get_num_available_tokens(token_num_upper_bound,
+                                                  max_num_draft_tokens,
+                                                  **kwargs)
+        # Also bound by the recurrent-state pool capacity: each request needs
+        # roughly ceil(N / states_snapshot_interval) recurrent-state blocks
+        # (+1 for the corner case where N is a multiple of tokens_per_block).
+        # When block reuse is disabled, only one snapshot is needed per
+        # request, so no additional capping is required here.
+        interval = (self.linear_attention_metadata.states_snapshot_interval
+                    if self.linear_attention_metadata is not None else 0)
+        if interval and interval > 0:
+            stats = self.impl.get_kv_cache_stats()
+            rs_free = stats.num_free_blocks_per_window_size.get(
+                LinearCacheType.RECURRENT_STATES.value, 0)
+            # Reserve 1 block for the always-allocated last block (corner case
+            # / final live state) so we don't promise more tokens than the
+            # pool can actually back at allocation time.
+            usable_rs_blocks = max(0, rs_free - 1)
+            rs_token_cap = usable_rs_blocks * interval
+            result = min(result, rs_token_cap)
+        return max(result, 0)
 
     def get_ssm_states(self, layer_idx: int) -> torch.Tensor:
         return self.all_ssm_states[self.mamba_layer_offsets[layer_idx]]
@@ -1394,6 +1512,8 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
         super().free_resources(request, pin_on_release)
 
     def _setup_state_indices(self) -> None:
+        if self.local_num_mamba_layers == 0:
+            return
         block_indices = []
         for req in self.requests:
             if req.is_context_finished:
@@ -1407,34 +1527,41 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
         self.impl.copy_batch_block_offsets(
             self.host_block_offsets,
             [req.py_request_id for req in self.requests], 1, 0)
-        host_block_offsets = torch.zeros([len(self.requests)],
-                                         dtype=torch.int32,
-                                         device="cpu")
-        for i in range(len(self.requests)):
-            # With layer-first pool layout, setOffsets produces the block index directly
-            # (no longer multiplied by num_local_mamba_layers)
-            value = self.host_block_offsets[self.recurrent_states_pool_index, i,
-                                            0, block_indices[i]]
-            max_blocks = self.blocks_per_window[
-                LinearCacheType.RECURRENT_STATES.value][0]
-            if value < 0 or value >= max_blocks:
-                req = self.requests[i]
+
+        max_blocks = self.blocks_per_window[
+            LinearCacheType.RECURRENT_STATES.value][0]
+        n = len(self.requests)
+        self._host_state_indices.zero_()
+        if n > 0:
+            # Vectorized gather: replace per-element Python loop with a single
+            # tensor index op. block_indices is a small Python list so
+            # torch.tensor() conversion here is O(n) at C level, much cheaper
+            # than n round-trips through Python indexing.
+            bi = torch.tensor(block_indices, dtype=torch.long)
+            rows = self._row_indices[:n]
+            # host_block_offsets: [num_pools, max_batch_size, 2, max_blocks_per_seq]
+            values = self.host_block_offsets[self.recurrent_states_pool_index,
+                                             rows, 0, bi]
+            invalid_mask = (values < 0) | (values >= max_blocks)
+            if invalid_mask.any():
+                bad_i = int(invalid_mask.nonzero(as_tuple=False)[0, 0])
+                req = self.requests[bad_i]
+                value = int(values[bad_i])
                 raise RuntimeError(
                     f"Invalid recurrent state block index {value} "
-                    f"(expected 0 <= index < {max_blocks}) for request {i}, "
+                    f"(expected 0 <= index < {max_blocks}) for request {bad_i}, "
                     f"prompt_len={req.prompt_len}, "
                     f"is_context_finished={req.is_context_finished}, "
                     f"context_current_position={req.context_current_position}, "
                     f"prepopulated_token_num={req.prepopulated_prompt_len}, "
                     f"context_chunk_size={req.context_chunk_size if not req.is_context_finished else 'N/A'}, "
-                    f"block_index for next step is {block_indices[i]}, "
+                    f"block_index for next step is {block_indices[bad_i]}, "
                     f"\nblock_ids={self.impl.get_cache_block_ids(req.py_request_id, LinearCacheType.RECURRENT_STATES.value)}"
                 )
-            host_block_offsets[i] = value
+            self._host_state_indices[:n] = values
 
-        torch.fill_(self.cuda_state_indices, 0)
-        self.cuda_state_indices[:len(self.requests)] = host_block_offsets.cuda()
-        self._host_state_indices = host_block_offsets.clone()
+        self.cuda_state_indices.copy_(self._host_state_indices,
+                                      non_blocking=True)
 
     def get_state_indices(
             self,
@@ -1497,7 +1624,8 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
         self.intermediate_conv_states = None
         self.intermediate_state_indices = None
         if self.spec_config is not None:
-            speculative_num_draft_tokens = self.spec_config.max_draft_len
+            # DFlash/PARD use 2K query tokens per gen, so size by tokens_per_gen_step.
+            speculative_num_draft_tokens = self.spec_config.tokens_per_gen_step - 1
             num_local_mamba_layers = len(self.mamba_pp_layers)
 
             # Legacy SSM intermediate buffer is only needed when replay is

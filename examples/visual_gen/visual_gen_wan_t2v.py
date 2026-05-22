@@ -191,6 +191,17 @@ def parse_args():
         "Note: TRTLLM falls back to VANILLA for cross-attention.",
     )
 
+    # SageAttention (requires --attention_backend TRTLLM)
+    parser.add_argument(
+        "--enable_sage_attention",
+        action="store_true",
+        help=(
+            "Enable SageAttention (per-block quantized Q/K/V). Requires TRTLLM backend. "
+            "Block layout is chosen from --model_path: (1, 4, 1) for Wan2.x 1.3B, "
+            "(1, 16, 1) otherwise."
+        ),
+    )
+
     # Parallelism
     parser.add_argument(
         "--cfg_size",
@@ -228,7 +239,18 @@ def parse_args():
         "Can be set independently of --attn2d_row_size; asymmetric meshes (e.g. 1x4 or 4x1) are valid. "
         "Cannot be combined with --ulysses_size (not yet implemented).",
     )
-    parser.add_argument("--disable_parallel_vae", action="store_true", help="Disable parallel VAE")
+    parser.add_argument(
+        "--ring_size",
+        type=int,
+        default=1,
+        help="Ring Attention parallel size. Cannot be combined with --attn2d_row_size / --attn2d_col_size.",
+    )
+    parser.add_argument(
+        "--parallel_vae_size",
+        type=int,
+        default=1,
+        help="Number of ranks used for parallel VAE. 1 disables parallel VAE.",
+    )
 
     # CUDA graph
     parser.add_argument(
@@ -298,6 +320,12 @@ def _cache_dit_config_from_args(args) -> CacheDiTConfig:
     return CacheDiTConfig(**overrides)
 
 
+def _wan_needs_fine_grained_sage(model_path: str) -> bool:
+    """Hard-coded heuristics for determining if a WAN model needs finer-grained SageAttentionConfig."""
+    lower = model_path.lower().replace(".", "_").replace("-", "_")
+    return "_1_3b" in lower
+
+
 def main():
     args = parse_args()
 
@@ -306,9 +334,21 @@ def main():
         raise ValueError(
             "Combining --ulysses_size with --attn2d_row_size/--attn2d_col_size is not yet implemented."
         )
+    if args.ring_size > 1 and attn2d_size > 1:
+        raise ValueError(
+            "Combining --ring_size with --attn2d_row_size/--attn2d_col_size is not yet implemented."
+        )
 
     if args.ulysses_size > 1:
-        parallel_str = f"Ulysses(size={args.ulysses_size})"
+        num_heads = 40
+        logger.info(
+            f"Using Ulysses sequence parallelism: "
+            f"{num_heads} heads / {args.ulysses_size} ranks = "
+            f"{num_heads // args.ulysses_size} heads per GPU"
+        )
+
+    if args.ulysses_size > 1 or args.ring_size > 1:
+        parallel_str = f"Ulysses(size={args.ulysses_size}), Ring(size={args.ring_size})"
     elif attn2d_size > 1:
         parallel_str = (
             f"Attention2D(row={args.attn2d_row_size}, col={args.attn2d_col_size}, "
@@ -316,6 +356,20 @@ def main():
         )
     else:
         parallel_str = "None"
+
+    attention_cfg = {
+        "backend": args.attention_backend,
+    }
+    if args.enable_sage_attention:
+        num_elts_per_blk_k = 4 if _wan_needs_fine_grained_sage(args.model_path) else 16
+        sage_cfg = {
+            "num_elts_per_blk_q": 1,
+            "num_elts_per_blk_k": num_elts_per_blk_k,
+            "num_elts_per_blk_v": 1,
+            "qk_int8": True,
+        }
+        attention_cfg["sage_attention_config"] = sage_cfg
+        logger.info(f"SageAttention: INT8 Q/K, blocks (1, {num_elts_per_blk_k}, 1)")
 
     if args.enable_cache_dit:
         cache_kwargs = {"cache": _cache_dit_config_from_args(args)}
@@ -326,14 +380,15 @@ def main():
 
     kwargs = dict(
         revision=args.revision,
-        attention={"backend": args.attention_backend},
+        attention=attention_cfg,
         **cache_kwargs,
         parallel={
             "dit_cfg_size": args.cfg_size,
             "dit_ulysses_size": args.ulysses_size,
             "dit_attn2d_row_size": args.attn2d_row_size,
             "dit_attn2d_col_size": args.attn2d_col_size,
-            "enable_parallel_vae": not args.disable_parallel_vae,
+            "parallel_vae_size": args.parallel_vae_size,
+            "dit_ring_size": args.ring_size,
         },
         torch_compile={
             "enable_torch_compile": not args.disable_torch_compile,

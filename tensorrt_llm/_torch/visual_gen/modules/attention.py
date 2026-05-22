@@ -67,15 +67,14 @@ class Attention(nn.Module):
         self.bias = bias
 
         # Fused QK Norm + RoPE: each model class opts in via fuse_qk_norm_rope.
-        # Default: enable for per_head norm only (FLUX). Full-dim not yet supported.
-        if fuse_qk_norm_rope is not None:
-            self.fuse_qk_norm_rope = fuse_qk_norm_rope
-        else:
-            self.fuse_qk_norm_rope = qk_norm_mode != "full"
+        # Supported for both per_head (FLUX) and full/cross-head (WAN) norm modes.
+        # Defaults to False; models that want the fused kernel must pass True explicitly.
+        self.fuse_qk_norm_rope = fuse_qk_norm_rope if fuse_qk_norm_rope is not None else False
         self.interleave = interleave
 
         # Select compute backend (orthogonal to parallelism)
         vgm = config.visual_gen_mapping
+        ring_size = vgm.ring_size if vgm else 1
         ulysses_size = vgm.ulysses_size if vgm else 1
         base_backend = config.attention.backend
 
@@ -163,13 +162,17 @@ class Attention(nn.Module):
                 row_process_group=vgm.attn2d_row_group,
                 col_process_group=vgm.attn2d_col_group,
             )
-        elif use_ulysses:
-            from ..attention_backend.parallel import UlyssesAttention
+        else:
+            # Wrap with parallelism strategies (orthogonal to backend choice)
+            if (ring_size > 1 or ulysses_size > 1) and self.qkv_mode != QKVMode.SEPARATE_QKV:
+                if ring_size > 1:
+                    from ..attention_backend.parallel import RingAttention
 
-            self.attn = UlyssesAttention(
-                inner_backend=self.attn,
-                process_group=vgm.ulysses_group,
-            )
+                    self.attn = RingAttention(self.attn, process_group=vgm.ring_group)
+                if ulysses_size > 1:
+                    from ..attention_backend.parallel import UlyssesAttention
+
+                    self.attn = UlyssesAttention(self.attn, process_group=vgm.ulysses_group)
 
     def _init_qkv_proj(self) -> None:
         if self.qkv_mode == QKVMode.FUSE_QKV:
@@ -256,7 +259,11 @@ class Attention(nn.Module):
         q_add_weight: Optional[torch.Tensor] = None,
         k_add_weight: Optional[torch.Tensor] = None,
     ) -> None:
-        """Apply fused QK Norm + RoPE in-place on packed QKV tensor."""
+        """Apply fused QK Norm + RoPE in-place on packed QKV tensor.
+
+        Dispatches to per-head kernel (FLUX) or cross-head kernel (WAN)
+        based on qk_norm_mode.
+        """
         cos_2d = freqs_cos.reshape(-1, self.head_dim).float().contiguous()
         sin_2d = freqs_sin.reshape(-1, self.head_dim).float().contiguous()
 
@@ -268,29 +275,44 @@ class Attention(nn.Module):
         cos_tiled = cos_2d.repeat(B, 1) if B > 1 else cos_2d
         sin_tiled = sin_2d.repeat(B, 1) if B > 1 else sin_2d
 
-        # Dual-stream batch correction: when B>1 and dual-stream is active,
-        # the kernel uses modulo (tokenIdx % tokens_per_batch) to find the
-        # local position within each batch element for the text/image boundary.
-        # 0 = no dual-stream (single-stream or batch=1).
-        tokens_per_batch = S if num_txt_tokens > 0 else 0
+        if self.qk_norm_mode == "full":
+            torch.ops.trtllm.fused_dit_cross_head_qk_norm_rope(
+                qkv_2d,
+                self.num_attention_heads,
+                self.num_key_value_heads,
+                self.num_key_value_heads,
+                self.head_dim,
+                self.eps,
+                self.norm_q.weight,
+                self.norm_k.weight,
+                cos_tiled,
+                sin_tiled,
+                self.interleave,
+            )
+        else:
+            # Dual-stream batch correction: when B>1 and dual-stream is active,
+            # the kernel uses modulo (tokenIdx % tokens_per_batch) to find the
+            # local position within each batch element for the text/image boundary.
+            # 0 = no dual-stream (single-stream or batch=1).
+            tokens_per_batch = S if num_txt_tokens > 0 else 0
 
-        torch.ops.trtllm.fused_dit_qk_norm_rope(
-            qkv_2d,
-            self.num_attention_heads,
-            self.num_key_value_heads,
-            self.num_key_value_heads,
-            self.head_dim,
-            self.eps,
-            self.norm_q.weight,
-            self.norm_k.weight,
-            q_add_weight,
-            k_add_weight,
-            cos_tiled,
-            sin_tiled,
-            num_txt_tokens,
-            self.interleave,
-            tokens_per_batch,
-        )
+            torch.ops.trtllm.fused_dit_qk_norm_rope(
+                qkv_2d,
+                self.num_attention_heads,
+                self.num_key_value_heads,
+                self.num_key_value_heads,
+                self.head_dim,
+                self.eps,
+                self.norm_q.weight,
+                self.norm_k.weight,
+                q_add_weight,
+                k_add_weight,
+                cos_tiled,
+                sin_tiled,
+                num_txt_tokens,
+                self.interleave,
+                tokens_per_batch,
+            )
 
     def _attn_impl(
         self,
@@ -312,6 +334,8 @@ class Attention(nn.Module):
         backend_layout = getattr(self.attn, "preferred_layout", AttentionTensorLayout.NHD)
 
         batch_size = q.shape[0]
+        seq_len = q.shape[1]
+        seq_len_kv = k.shape[1] if k is not None else seq_len
 
         # Reshape inputs: [B, S, H*D] -> backend's preferred 4D layout
         if backend_layout == AttentionTensorLayout.HND:
@@ -323,7 +347,20 @@ class Attention(nn.Module):
             k = k.view(batch_size, -1, self.num_key_value_heads, self.head_dim)
             v = v.view(batch_size, -1, self.num_key_value_heads, self.head_dim)
 
-        out = self.attn.forward(q=q, k=k, v=v, **kwargs)
+        kwargs.update(
+            {
+                "batch_size": batch_size,
+                "seq_len": seq_len,
+                "seq_len_kv": seq_len_kv,
+            }
+        )
+
+        out = self.attn.forward(
+            q=q,
+            k=k,
+            v=v,
+            **kwargs,
+        )
 
         # Flatten back to [B, S, H*D]
         if backend_layout == AttentionTensorLayout.HND:

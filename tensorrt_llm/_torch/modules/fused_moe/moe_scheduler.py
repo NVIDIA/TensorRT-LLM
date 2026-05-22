@@ -52,6 +52,7 @@ from tensorrt_llm._torch.utils import EventType, Fp4QuantizedTensor
 from tensorrt_llm.tools.layer_wise_benchmarks import get_calibrator
 
 from .communication import DeepEP, DeepEPLowLatency, NVLinkOneSided, NVLinkTwoSided
+from .communication.nvlink_two_sided_flashinfer import NVLinkTwoSidedFlashinfer
 from .fused_moe_cute_dsl import CuteDslFusedMoE
 from .fused_moe_cutlass import CutlassFusedMoE
 from .fused_moe_deepgemm import DeepGemmFusedMoE
@@ -183,7 +184,7 @@ class ExternalCommMoEScheduler(MoEScheduler):
     # NVLink-specific EPLB stat-gather paths)
     # ------------------------------------------------------------------
     def _is_using_nvlink_two_sided(self) -> bool:
-        return isinstance(self.moe.comm, NVLinkTwoSided)
+        return isinstance(self.moe.comm, (NVLinkTwoSided, NVLinkTwoSidedFlashinfer))
 
     def _is_using_nvlink_one_sided(self) -> bool:
         return isinstance(self.moe.comm, NVLinkOneSided)
