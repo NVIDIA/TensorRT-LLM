@@ -179,6 +179,29 @@ def test_nemotron_nano_defers_multimodal_encoder_for_mm_epd_worker(monkeypatch):
     vision_encoder_cls.assert_not_called()
 
 
+def test_nemotron_nano_rejects_evs_attached_video_embeddings():
+    """EVS needs retained-token metadata that E/P attached embeddings do not carry."""
+    model = SimpleNamespace(
+        video_pruning_rate=0.5,
+        _validate_evs_context_batch=MagicMock(),
+    )
+    attn_metadata = SimpleNamespace(num_contexts=1, num_generations=0)
+    param = MultimodalParams(
+        multimodal_data={
+            "modality_type": "video",
+            "multimodal_embedding": torch.zeros(1, 4),
+        }
+    )
+
+    with pytest.raises(ValueError, match="EVS video pruning is not supported"):
+        NemotronH_Nano_VL_V2.forward(
+            model,
+            attn_metadata,
+            input_ids=torch.tensor([[20]], dtype=torch.long),
+            multimodal_params=[param],
+        )
+
+
 @pytest.fixture(scope="function")
 def data_dict_fixture():
     test_data_root = Path(os.path.join(llm_models_root(), "multimodals", "test_data"))

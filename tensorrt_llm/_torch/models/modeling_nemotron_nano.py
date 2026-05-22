@@ -3142,6 +3142,16 @@ class NemotronH_Nano_VL_V2(transformers.PreTrainedModel):
                 )
             # E/P prefill: encoder already ran; use attached embeddings.
             else:
+                if self.video_pruning_rate > 0 and any(
+                    param.has_content() and param.multimodal_data.get("modality_type") == "video"
+                    for param in ctx_params
+                ):
+                    # TODO(TRTLLM-12534): Carry EVS retained-token counts through
+                    # encoder handoff before enabling video pruning for E/P.
+                    raise ValueError(
+                        "EVS video pruning is not supported with attached "
+                        "multimodal embeddings yet."
+                    )
                 mm_embedding = get_attached_multimodal_embeddings(ctx_params)
             # Adjust input_ids in videos if EVS is applied.
             if self.video_pruning_rate > 0:
