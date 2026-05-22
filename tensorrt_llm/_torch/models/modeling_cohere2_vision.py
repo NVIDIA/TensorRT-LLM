@@ -1,60 +1,63 @@
-import os
-import dataclasses
 import copy
-from typing import Optional, List, Tuple, Literal
+import dataclasses
+import os
+from typing import List, Literal, Optional, Tuple
 
 import torch
 from torch import nn
-from ..._utils import nvtx_range
-from transformers import (AutoProcessor, AutoTokenizer, Cohere2VisionConfig, PreTrainedModel, PretrainedConfig)
-from transformers.activations import ACT2FN
+from transformers import (
+    AutoProcessor,
+    AutoTokenizer,
+    Cohere2VisionConfig,
+    PretrainedConfig,
+    PreTrainedModel,
+)
 
-from tensorrt_llm._torch.models.checkpoints.base_weight_mapper import BaseWeightMapper
+from ..._utils import nvtx_range
 from ...inputs import (
     BaseMultimodalDummyInputsBuilder,
     BaseMultimodalInputProcessor,
     ContentFormat,
+    ExtraProcessedInputs,
     MultimodalPlaceholderMetadata,
     MultimodalPlaceholderPlacement,
-    register_input_processor,
     TextPrompt,
-    ExtraProcessedInputs,
+    register_input_processor,
 )
 from ...logger import logger
-from ..attention_backend import AttentionMetadata
 from ...sampling_params import SamplingParams
-
-from .modeling_auto import AutoModelForCausalLM
-from .modeling_utils import ModelConfig, filter_weights, register_auto_model
-from .modeling_multimodal_utils import fuse_input_embeds, find_input_mm_embeds
-from .modeling_cohere2 import Cohere2ForCausalLM
-from .modeling_siglip import SiglipVisionModel
+from ..attention_backend import AttentionMetadata
 from ..modules.linear import Linear
+from .modeling_cohere2 import Cohere2ForCausalLM
+from .modeling_multimodal_utils import find_input_mm_embeds, fuse_input_embeds
+from .modeling_siglip import SiglipVisionModel
+from .modeling_utils import ModelConfig, filter_weights, register_auto_model
 
-class Cohere2InputProcessor(BaseMultimodalInputProcessor,
-                             BaseMultimodalDummyInputsBuilder):
-    
-    def __init__(self,
-                 model_path: str,
-                 config: PretrainedConfig,
-                 tokenizer: AutoTokenizer,
-                 trust_remote_code: bool = True,
-                 **kwargs):
-        super().__init__(model_path=model_path,
-                         config=config,
-                         tokenizer=tokenizer,
-                         trust_remote_code=trust_remote_code,
-                         **kwargs)
+
+class Cohere2InputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyInputsBuilder):
+    def __init__(
+        self,
+        model_path: str,
+        config: PretrainedConfig,
+        tokenizer: AutoTokenizer,
+        trust_remote_code: bool = True,
+        **kwargs,
+    ):
+        super().__init__(
+            model_path=model_path,
+            config=config,
+            tokenizer=tokenizer,
+            trust_remote_code=trust_remote_code,
+            **kwargs,
+        )
         self._config = config
         self._tokenizer = tokenizer
         self._model_path = model_path
         self._processor = AutoProcessor.from_pretrained(
-            model_path,
-            trust_remote_code=trust_remote_code,
-            use_fast=self.use_fast
+            model_path, trust_remote_code=trust_remote_code, use_fast=self.use_fast
         )
         self._dtype = self.config.torch_dtype
-    
+
     @property
     def config(self) -> PretrainedConfig:
         return self._config
@@ -66,15 +69,15 @@ class Cohere2InputProcessor(BaseMultimodalInputProcessor,
     @property
     def model_path(self) -> str:
         return self._model_path
-    
+
     @property
     def processor(self) -> AutoProcessor:
         return self._processor
-    
+
     @property
     def dtype(self) -> torch.dtype:
         return self._dtype
-    
+
     @nvtx_range("[Vision] preprocess")
     def _preprocess(self, inputs):
         text_prompt, mm_data = inputs.get("prompt"), inputs.get("multi_modal_data", {})
@@ -96,7 +99,7 @@ class Cohere2InputProcessor(BaseMultimodalInputProcessor,
         pixel_values = processor_output.get("pixel_values")
 
         return input_ids, pixel_values
-    
+
     @torch.inference_mode()
     def __call__(
         self, inputs: TextPrompt, sampling_params: SamplingParams
@@ -105,24 +108,25 @@ class Cohere2InputProcessor(BaseMultimodalInputProcessor,
         multimodal_data = None
         if pixel_values is not None:
             multimodal_data = {
-                "multimodal_data": {
-                    "image": {
-                        "pixel_values": pixel_values
-                    }
-                },
+                "multimodal_data": {"image": {"pixel_values": pixel_values}},
             }
         return inputs_ids[0].to(torch.int32).tolist(), multimodal_data
+
 
 # Original HF implementation:
 # https://github.com/huggingface/transformers/blob/v5.8.1/src/transformers/models/cohere2_vision/modeling_cohere2_vision.py
 class Cohere2VisionMultiModalProjector(nn.Module):
-    """Cohere2MultiModalProjector using TRTLLM's Linear and RMSNorm."""
+    """
+    Cohere2MultiModalProjector using TRTLLM's Linear and RMSNorm.
+    """
 
     def __init__(self, model_config: ModelConfig[Cohere2VisionConfig]):
         assert model_config.pretrained_config is not None
         self.config = model_config
         super().__init__()
-        config: Cohere2VisionConfig = model_config.pretrained_config  # Extract Hugging Face's config
+        config: Cohere2VisionConfig = (
+            model_config.pretrained_config
+        )  # Extract Hugging Face's config
 
         self.downsample_factor = config.downsample_factor
         self.intermediate_size = config.alignment_intermediate_size
@@ -140,10 +144,10 @@ class Cohere2VisionMultiModalProjector(nn.Module):
             bias=True,
         )
 
-    def pixel_shuffle(self, image_features: torch.Tensor): # B, S, D
+    def pixel_shuffle(self, image_features: torch.Tensor):  # B, S, D
         # Concatenate a number of horizontal and vertical patches to the channel dimension
         batch_size, seq_length, feature_dim = image_features.shape
-        height = width = int(seq_length ** 0.5)
+        height = width = int(seq_length**0.5)
         image_features = image_features.reshape(image_features.shape[0], width, height, -1)
         channels = image_features.shape[-1]
         image_features = image_features.reshape(
@@ -164,13 +168,12 @@ class Cohere2VisionMultiModalProjector(nn.Module):
         image_features = image_features.permute(0, 2, 1, 3)
         return image_features
 
-
     def load_weights(self, weights: dict[str, torch.Tensor]):
         self.gate_and_up_proj.weight.data.copy_(weights["linear_1.weight"])
         self.gate_and_up_proj.bias.data.copy_(weights["linear_1.bias"])
         self.down_proj.weight.data.copy_(weights["linear_2.weight"])
         self.down_proj.bias.data.copy_(weights["linear_2.bias"])
-    
+
     def forward(self, image_features):
         # TODO: implement pixel_shuffle
         image_features = self.pixel_shuffle(image_features)
@@ -204,38 +207,39 @@ class Cohere2VisionModel(PreTrainedModel):
 
     def __init__(self, model_config: ModelConfig[Cohere2VisionConfig]):
         if self._is_disagg():
-            raise NotImplementedError(
-                "Cohere2Vision does not support disaggregated inference yet."
-            )
-        
+            raise NotImplementedError("Cohere2Vision does not support disaggregated inference yet.")
+
         config = model_config.pretrained_config
         self._supports_sdpa = True
         super().__init__(config)
-        
+
         # Models must have a self.model_config attribute
         model_config_cp = copy.deepcopy(model_config)
         self.model_config = model_config_cp
 
-        # Set extra internal configurations 
+        # Set extra internal configurations
         self._device = "cuda"
         # TODO: Convert the image token index (single integer) to torch.Tensor
-        self.image_token_ids = torch.tensor([config.image_token_id],
-                                            dtype=torch.int32,
-                                            device=self._device)
-
+        self.image_token_ids = torch.tensor(
+            [config.image_token_id], dtype=torch.int32, device=self._device
+        )
 
         # Configure self.llm, self.siglip_tower, self.vision_projector
         llm_model_config = self._get_submodel_config(model_config_cp, "text_config")
         self.llm = Cohere2ForCausalLM(llm_model_config)
 
         vision_model_config = self._get_submodel_config(model_config_cp, "vision_config")
-        
+
         # Use post layernorm to prevent overflow in the outputs of SigLIP
         self.siglip_tower = SiglipVisionModel(vision_model_config, use_post_layernorm=True)
-        
-        self.multimodal_projector = Cohere2VisionMultiModalProjector(
-            model_config,
-        ).to(self._device).eval()
+
+        self.multimodal_projector = (
+            Cohere2VisionMultiModalProjector(
+                model_config,
+            )
+            .to(self._device)
+            .eval()
+        )
 
         self._device = "cuda"
         self.model_dtype = getattr(config, "torch_dtype", torch.bfloat16)
@@ -245,7 +249,6 @@ class Cohere2VisionModel(PreTrainedModel):
         self.model_config.pretrained_config = self.llm.config
         # NOTE: In-place replacement of the argument similarly with Qwen3VL
         model_config.pretrained_config = self.llm.config
-
 
     @staticmethod
     def _get_submodel_config(
@@ -260,14 +263,16 @@ class Cohere2VisionModel(PreTrainedModel):
         # weight loading fails for vision.
         quant_config = model_config.quant_config if name == "text_config" else None
         submodel_config: ModelConfig[Cohere2VisionConfig] = dataclasses.replace(
-           model_config,
-           pretrained_config=pretrained_config,
-           quant_config=quant_config 
+            model_config, pretrained_config=pretrained_config, quant_config=quant_config
         )
         # Make sure the top-level data type is replicated by default
-        if (hasattr(submodel_config.pretrained_config, "torch_dtype")
-                and submodel_config.pretrained_config.torch_dtype is None):
-            submodel_config.pretrained_config.torch_dtype = model_config.pretrained_config.torch_dtype
+        if (
+            hasattr(submodel_config.pretrained_config, "torch_dtype")
+            and submodel_config.pretrained_config.torch_dtype is None
+        ):
+            submodel_config.pretrained_config.torch_dtype = (
+                model_config.pretrained_config.torch_dtype
+            )
         return submodel_config
 
     @property
@@ -285,14 +290,13 @@ class Cohere2VisionModel(PreTrainedModel):
         llm_weights = {}
         for k, v in weights.items():
             if k.startswith(key):
-                new_k = "model" + k[len(key):]
+                new_k = "model" + k[len(key) :]
                 llm_weights[new_k] = v
             elif k.startswith("lm_head."):
                 llm_weights[k] = v
         return llm_weights
-    
-    def load_weights(self, weights: dict[str, torch.Tensor]):
 
+    def load_weights(self, weights: dict[str, torch.Tensor]):
         llm_weights = self._rename_llm_weights("model.language_model", weights)
         self.llm.load_weights(llm_weights)
 
@@ -312,10 +316,11 @@ class Cohere2VisionModel(PreTrainedModel):
         return_context_logits: Optional[bool] = False,
         **kwargs,
     ) -> torch.Tensor:
-        num_context_requests, num_generation_requests = attn_metadata.num_contexts, attn_metadata.num_generations
-        logger.debug(
-            f"[Cohere2Vision::forward]{num_context_requests=}, {num_generation_requests=}"
+        num_context_requests, num_generation_requests = (
+            attn_metadata.num_contexts,
+            attn_metadata.num_generations,
         )
+        logger.debug(f"[Cohere2Vision::forward]{num_context_requests=}, {num_generation_requests=}")
         multimodal_params = kwargs.get("multimodal_params", [])
         pixel_values = [
             multimodal_param.multimodal_data["image"]["pixel_values"]
@@ -325,9 +330,7 @@ class Cohere2VisionModel(PreTrainedModel):
         multimodal_embeds = []
         multimodal_token_mask = None
         if len(pixel_values) > 0:
-            image_features = self._get_image_features(
-                pixel_values=torch.cat(pixel_values)
-            )
+            image_features = self._get_image_features(pixel_values=torch.cat(pixel_values))
             # Flatten leading batch/spatial dims into a single token sequence:
             # (B, H/d, W/d, hidden_size) -> (B*H/d*W/d, hidden_size)
             image_features = image_features.reshape(-1, image_features.shape[-1])
@@ -359,16 +362,11 @@ class Cohere2VisionModel(PreTrainedModel):
         )
 
         return logits
-        
+
     @nvtx_range("[Vision] process")
     def _get_image_features(self, pixel_values):
-        attn_metadata = self.siglip_tower.prepare_attn_metadata(
-            pixel_values.shape[0]
-        )
+        attn_metadata = self.siglip_tower.prepare_attn_metadata(pixel_values.shape[0])
         with torch.autocast(device_type="cuda", dtype=self.model_dtype):
-            image_features = self.siglip_tower(
-                pixel_values,
-                attn_metadata=attn_metadata
-            )[-1]
+            image_features = self.siglip_tower(pixel_values, attn_metadata=attn_metadata)[-1]
             image_features = self.multimodal_projector(image_features)
         return image_features

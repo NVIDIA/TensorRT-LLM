@@ -5,32 +5,34 @@ from typing import List
 import pytest
 from test_modeling_multimodal import MultimodalScenario, TestModelingMultimodal, llm_models_root
 from transformers import AutoTokenizer, Cohere2VisionConfig
-from transformers import Cohere2VisionForConditionalGeneration as HFCohere2VisionForConditionalGeneration
+from transformers import (
+    Cohere2VisionForConditionalGeneration as HFCohere2VisionForConditionalGeneration,
+)
 
 from tensorrt_llm._torch.models.modeling_cohere2_vision import Cohere2VisionModel
 from tensorrt_llm.inputs import create_input_processor
 
 COMMAND_A_140M_CONFIG = {
-  # NOTE: TestModelingMultimodal.get_dtype() reads "torch_dtype", not "dtype",
-  # so both keys must be set consistently.
-  "dtype": "bfloat16",
-  "torch_dtype": "bfloat16",
-  "text_config": {
-    "hidden_size": 256, # head_dim * num_attention_heads
-    "intermediate_size": 128,
-    "head_dim": 64,
-    "num_attention_heads": 16,
-    "num_key_value_heads": 2,
-  },
-  "vision_config": {
-    "image_size": 512,
-    "hidden_size": 256,
-    "intermediate_size": 128,
-    "num_attention_heads": 4,
-    # head_dim is automatically set as hidden_size // num_attention_heads
-  },
-  # The processor and tokenizer are loaded from Command A Vision 111B
-  "_name_or_path": str(Path(llm_models_root()) / "command-a-vision-07-2025/"),
+    # NOTE: TestModelingMultimodal.get_dtype() reads "torch_dtype", not "dtype",
+    # so both keys must be set consistently.
+    "dtype": "bfloat16",
+    "torch_dtype": "bfloat16",
+    "text_config": {
+        "hidden_size": 256,  # head_dim * num_attention_heads
+        "intermediate_size": 128,
+        "head_dim": 64,
+        "num_attention_heads": 16,
+        "num_key_value_heads": 2,
+    },
+    "vision_config": {
+        "image_size": 512,
+        "hidden_size": 256,
+        "intermediate_size": 128,
+        "num_attention_heads": 4,
+        # head_dim is automatically set as hidden_size // num_attention_heads
+    },
+    # The processor and tokenizer are loaded from Command A Vision 111B
+    "_name_or_path": str(Path(llm_models_root()) / "command-a-vision-07-2025/"),
 }
 
 
@@ -80,17 +82,19 @@ class TestCohere2Vision(TestModelingMultimodal):
             ),
         ]
         return scenarios
-    
+
 
 @pytest.mark.skip(
     reason="Cohere2InputProcessor does not yet implement expand_prompt_token_ids_for_mm "
-           "(the tokenized + multimodal-hashing path). Re-enable when added."
+    "(the tokenized + multimodal-hashing path). Re-enable when added."
 )
 def test_cohere2_vision_expand_prompt_token_ids_for_mm():
     """Test Cohere2VisionInputProcessor.expand_prompt_token_ids_for_mm replaces image placeholders correctly."""
     model_path = COMMAND_A_140M_CONFIG["_name_or_path"]
     if not Path(model_path).exists():
-        pytest.skip(f"Cohere2Vision (Command A) model not found at {model_path} (set LLM_MODELS_ROOT)")
+        pytest.skip(
+            f"Cohere2Vision (Command A) model not found at {model_path} (set LLM_MODELS_ROOT)"
+        )
 
     tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
     input_processor = create_input_processor(model_path, tokenizer=tokenizer)
@@ -98,8 +102,7 @@ def test_cohere2_vision_expand_prompt_token_ids_for_mm():
     # The COMMAND_A_140M_CONFIG is a reduced test config and does not carry
     # these fields; read them from the real config loaded by the input processor.
     config = input_processor.config
-    image_token_id = getattr(config, "image_token_id", None) \
-        or config.image_token_index
+    image_token_id = getattr(config, "image_token_id", None) or config.image_token_index
     vocab_size = config.text_config.vocab_size
     placeholder_id = vocab_size + 1
 
