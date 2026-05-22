@@ -14,9 +14,6 @@ from transformers.activations import ACT2FN as HF_ACT2FN
 from transformers.models.qwen3_vl.modeling_qwen3_vl import (
     Qwen3VLVisionPatchEmbed as HFQwen3VLVisionPatchEmbed,
 )
-from transformers.models.qwen3_vl.modeling_qwen3_vl import (
-    Qwen3VLVisionRotaryEmbedding as HFQwen3VLVisionRotaryEmbedding,
-)
 
 from tensorrt_llm._torch.models.modeling_multimodal_utils import _is_mm_disagg
 from tensorrt_llm.functional import PositionEmbeddingType
@@ -989,8 +986,19 @@ class Qwen3VisionModel(torch.nn.Module):
         self.pos_embed = nn.Embedding(self.config.num_position_embeddings, self.config.hidden_size)
         self.num_grid_per_side = int(self.config.num_position_embeddings**0.5)
 
+        # 2D rotary positional embedding for the vision tower. Mirrors the
+        # HF Qwen3-VL formula exactly (theta=10000, dim=head_dim//2,
+        # inv_freq picks every other index across that dim) but drops the
+        # HFQwen3VLVisionRotaryEmbedding dependency. The actual freq table
+        # is built lazily and memoized per max-spatial-extent in
+        # `_freq_table`, so re-encoding identical (h, w) tiles is free.
         head_dim = self.config.hidden_size // self.config.num_heads
-        self.rotary_pos_emb = HFQwen3VLVisionRotaryEmbedding(head_dim // 2)
+        rope_dim = head_dim // 2
+        rope_theta = 10000.0
+        inv_freq = 1.0 / (
+            rope_theta ** (torch.arange(0, rope_dim, 2, dtype=torch.float32) / rope_dim)
+        )
+        self.register_buffer("rope_inv_freq", inv_freq, persistent=False)
 
         self.blocks = nn.ModuleList(
             [
@@ -1052,6 +1060,20 @@ class Qwen3VisionModel(torch.nn.Module):
 
         return torch.from_numpy(np.stack([hpos_ids, wpos_ids], axis=-1))
 
+    @lru_cache(maxsize=64)  # noqa: B019
+    def _freq_table(self, max_hw: int) -> torch.Tensor:
+        """Rotary freq table of shape ``(max_hw, len(inv_freq))``.
+
+        Replaces the prior ``HFQwen3VLVisionRotaryEmbedding(...)(max_hw)``
+        call: same formula (``torch.outer(arange(max_hw), inv_freq)``)
+        but memoized so re-encoding identical max-spatial-extents is
+        free. Cache is keyed by integer ``max_hw`` -- production has
+        at most a handful of distinct max-sizes (one per ``max(h, w)``
+        in the served tile set), so ``maxsize=64`` is plenty.
+        """
+        seq = torch.arange(max_hw, device=self.rope_inv_freq.device, dtype=self.rope_inv_freq.dtype)
+        return torch.outer(seq, self.rope_inv_freq)
+
     @lru_cache(maxsize=1024)  # noqa: B019
     def _rotary_pos_emb_thw(self, t: int, h: int, w: int) -> torch.Tensor:
         """Per-(t, h, w) rotary embeddings, cached as a device tensor.
@@ -1091,7 +1113,7 @@ class Qwen3VisionModel(torch.nn.Module):
         if t > 1:
             pos_ids = pos_ids.repeat(t, 1)
         pos_ids = pos_ids.to(self.device, non_blocking=True)
-        freq_table = self.rotary_pos_emb(max(h, w))  # (max_hw, dim // 2)
+        freq_table = self._freq_table(max(h, w))  # (max_hw, dim // 2)
         return freq_table[pos_ids].flatten(1)
 
     def rot_pos_emb(self, grid_thw: list[list[int]]) -> torch.Tensor:

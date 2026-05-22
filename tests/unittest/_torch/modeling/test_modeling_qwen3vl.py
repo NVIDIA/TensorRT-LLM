@@ -655,16 +655,19 @@ def _make_qwen3_vision_model_for_l2():
 
     Bypasses the heavy `__init__` (blocks, mergers, attn metadata buffers)
     by going through `__new__` so the class-level decorators (`@staticmethod`
-    on `rot_pos_ids` and `@lru_cache` on `_rotary_pos_emb_thw`) stay intact.
+    on `rot_pos_ids` and `@lru_cache` on `_rotary_pos_emb_thw`/`_freq_table`)
+    stay intact. The mock wires only the attrs those cached methods touch:
+    ``spatial_merge_size``, ``rope_inv_freq`` (replaces the prior HF rotary
+    dependency), and ``patch_embed.proj.weight`` (read by ``device``).
     """
-    from transformers.models.qwen3_vl.modeling_qwen3_vl import (
-        Qwen3VLVisionRotaryEmbedding as HFQwen3VLVisionRotaryEmbedding,
-    )
-
     obj = Qwen3VisionModel.__new__(Qwen3VisionModel)
     torch.nn.Module.__init__(obj)
     obj.spatial_merge_size = 2
-    obj.rotary_pos_emb = HFQwen3VLVisionRotaryEmbedding(36).to("cuda")
+
+    # Mirror the real init: rope_dim = head_dim // 2 = 36, theta = 10000.
+    rope_dim = 36
+    inv_freq = 1.0 / (10000.0 ** (torch.arange(0, rope_dim, 2, dtype=torch.float32) / rope_dim))
+    obj.register_buffer("rope_inv_freq", inv_freq.to("cuda"), persistent=False)
 
     # patch_embed.proj.weight is what `Qwen3VisionModel.device` reads.
     obj.patch_embed = torch.nn.Module()
@@ -814,3 +817,38 @@ def test_batched_pos_embed_matches_per_image(grid_thw_list, dtype):
     atol = {torch.float32: 5e-4, torch.bfloat16: 1e-2}[dtype]
     rtol = {torch.float32: 5e-4, torch.bfloat16: 1e-2}[dtype]
     torch.testing.assert_close(batched, per_image, atol=atol, rtol=rtol)
+
+
+# ---------------------------------------------------------------------------
+# _freq_table (replaces HFQwen3VLVisionRotaryEmbedding).
+# ---------------------------------------------------------------------------
+
+
+def test_freq_table_matches_hf_rotary():
+    """Our in-tree _freq_table must bit-match the HF
+    Qwen3VLVisionRotaryEmbedding(dim=36)(max_hw) output it replaces."""
+    from transformers.models.qwen3_vl.modeling_qwen3_vl import (
+        Qwen3VLVisionRotaryEmbedding as HFQwen3VLVisionRotaryEmbedding,
+    )
+
+    vm = _make_qwen3_vision_model_for_l2()
+    vm._freq_table.cache_clear()
+
+    hf = HFQwen3VLVisionRotaryEmbedding(36).to("cuda")
+    for max_hw in [16, 32, 48, 64, 100, 128]:
+        ours = vm._freq_table(max_hw)
+        ref = hf(max_hw)
+        assert ours.shape == ref.shape
+        assert ours.dtype == ref.dtype
+        torch.testing.assert_close(ours, ref, atol=0, rtol=0)
+
+
+def test_freq_table_lru_cache_hit():
+    """Same max_hw must return the same cached tensor object."""
+    vm = _make_qwen3_vision_model_for_l2()
+    vm._freq_table.cache_clear()
+    a = vm._freq_table(48)
+    b = vm._freq_table(48)
+    assert a is b
+    info = vm._freq_table.cache_info()
+    assert info.hits >= 1 and info.misses >= 1
