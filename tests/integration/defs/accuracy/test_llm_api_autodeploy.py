@@ -831,6 +831,9 @@ class TestNemotronUltraV3(LlmapiAccuracyTestHarness):
     CONFIG_YAML = str(
         Path(get_llm_root()) / "examples" / "auto_deploy" / "model_registry" /
         "configs" / "ultra_v3.yaml")
+    MTP_CONFIG_YAML = str(
+        Path(get_llm_root()) / "examples" / "auto_deploy" / "model_registry" /
+        "configs" / "ultra_v3_mtp.yaml")
     MODEL_PATHS = {
         "nvfp4": hf_id_to_local_model_dir("nvidia/Nemotron-Ultra-V3-NVFP4"),
     }
@@ -881,6 +884,43 @@ class TestNemotronUltraV3(LlmapiAccuracyTestHarness):
                                   "enable_thinking": True
                               },
                           })
+
+        print_memory_usage("after evaluation")
+
+    @skip_pre_blackwell
+    @pytest.mark.parametrize("world_size", [4, 8])
+    @pytest.mark.parametrize("model_id", ["nvfp4"])
+    def test_mtp(self, model_id, world_size):
+        if get_device_count() < world_size:
+            pytest.skip(f"Not enough devices for world_size={world_size}")
+
+        model_path = self.MODEL_PATHS[model_id]
+        print_memory_usage("test start")
+        with AutoDeployLLM(
+                model=model_path,
+                tokenizer=model_path,
+                world_size=world_size,
+                yaml_extra=[self.MTP_CONFIG_YAML],
+                trust_remote_code=True,
+                enable_iter_perf_stats=True,
+        ) as llm:
+            _set_quant_config(llm, model_id)
+            print_memory_usage("after engine build")
+
+            sampling_params = self.get_default_sampling_params()
+            sampling_params.max_tokens = 1024
+            task = GSM8K(self.MODEL_NAME)
+            task.NUM_SAMPLES = 128
+            task.evaluate(llm,
+                          sampling_params=sampling_params,
+                          extra_evaluator_kwargs={
+                              "apply_chat_template": True,
+                              "chat_template_kwargs": {
+                                  "enable_thinking": True
+                              },
+                          })
+            _check_acceptance_rate_stats(llm.get_stats(),
+                                         min_acceptance_rate=0.50)
 
         print_memory_usage("after evaluation")
 

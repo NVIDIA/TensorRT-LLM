@@ -222,6 +222,35 @@ def test_mtp_autodeploy_uses_eagle_one_model_capture():
     assert args.transforms["detect_hidden_states_for_capture"]["eagle3_layers_to_capture"] == {-1}
 
 
+def test_eagle_quant_config_remaps_excludes_from_drafter_mapping():
+    class TargetFactory:
+        def get_quant_config(self):
+            return {
+                "quant_algo": "NVFP4",
+                "exclude_modules": ["mtp.*", "lm_head"],
+            }
+
+    class DraftFactory:
+        def get_checkpoint_conversion_mapping(self):
+            return {r"^mtp\.": "renamed."}
+
+    factory = object.__new__(EagleOneModelFactory)
+    factory.speculative_config = Eagle3DecodingConfig(
+        max_draft_len=1,
+        speculative_model="draft",
+        eagle3_one_model=True,
+    )
+    factory.target_factory = TargetFactory()
+    factory.draft_factory = DraftFactory()
+
+    qcfg = factory.get_quant_config()
+
+    assert "mtp.*" not in qcfg["exclude_modules"]
+    assert "renamed.*" in qcfg["exclude_modules"]
+    assert "lm_head" in qcfg["exclude_modules"]
+    assert "model.layers.*" not in qcfg["exclude_modules"]
+
+
 def test_detect_hidden_states_capture_last_layer_for_mtp_eagle_one_model():
     from tensorrt_llm._torch.auto_deploy.llm_args import LlmArgs
 
