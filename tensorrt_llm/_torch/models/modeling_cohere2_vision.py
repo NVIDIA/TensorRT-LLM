@@ -26,7 +26,7 @@ from ...sampling_params import SamplingParams
 
 from .modeling_auto import AutoModelForCausalLM
 from .modeling_utils import ModelConfig, filter_weights, register_auto_model
-from .modeling_multimodal_utils import fuse_input_embeds
+from .modeling_multimodal_utils import fuse_input_embeds, find_input_mm_embeds
 from .modeling_cohere2 import Cohere2ForCausalLM
 from .modeling_siglip import SiglipVisionModel
 from ..modules.linear import Linear
@@ -120,8 +120,8 @@ class Cohere2VisionMultiModalProjector(nn.Module):
 
     def __init__(self, model_config: ModelConfig[Cohere2VisionConfig]):
         assert model_config.pretrained_config is not None
-        super().__init__()
         self.config = model_config
+        super().__init__()
         config: Cohere2VisionConfig = model_config.pretrained_config  # Extract Hugging Face's config
 
         self.downsample_factor = config.downsample_factor
@@ -209,6 +209,7 @@ class Cohere2VisionModel(PreTrainedModel):
             )
         
         config = model_config.pretrained_config
+        self._supports_sdpa = True
         super().__init__(config)
         
         # Models must have a self.model_config attribute
@@ -242,6 +243,8 @@ class Cohere2VisionModel(PreTrainedModel):
         # NOTE: From now on, the configuration behaves as that of the text encoder
         self.config = self.llm.config
         self.model_config.pretrained_config = self.llm.config
+        # NOTE: In-place replacement of the argument similarly with Qwen3VL
+        model_config.pretrained_config = self.llm.config
 
 
     @staticmethod
@@ -329,6 +332,11 @@ class Cohere2VisionModel(PreTrainedModel):
             # (B, H/d, W/d, hidden_size) -> (B*H/d*W/d, hidden_size)
             image_features = image_features.reshape(-1, image_features.shape[-1])
             multimodal_embeds = [image_features.contiguous()]
+
+            # Avoid all the image embeddings will be fused later;
+            # Slice mm_embeds to only the mebeddings whose placeholder tokens
+            # are in the current chunk / not cached
+            multimodal_embeds = find_input_mm_embeds(multimodal_embeds, multimodal_params)
 
             # Get token type ids. 0 corresponds to text tokens, 1 corresponds to image tokens
             multimodal_token_mask = torch.isin(input_ids, self.image_token_ids)
