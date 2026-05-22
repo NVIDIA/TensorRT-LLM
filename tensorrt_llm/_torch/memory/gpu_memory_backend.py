@@ -70,7 +70,7 @@ class GPUMemoryBackend(Protocol):
     def mem_pool_scope(
         self,
         device: Optional[torch.device] = None,
-    ) -> "Iterator[None]":
+    ) -> Iterator[None]:
         """Return a context manager scoping CUDA allocations to the backend pool."""
         ...
 
@@ -349,31 +349,35 @@ class GMSBackend:
         device_index = self._device_index
         tracked_storage_ptrs: set[int] = set()
 
-        with torch.no_grad():
-            for _name, tensor, tensor_type in _iter_module_tensors(model):
-                if tensor_type != "parameter" or tensor is None or not tensor.is_cuda:
-                    continue
+        # No torch.no_grad() guard: ``tensor.data = X`` bypasses autograd by
+        # definition (it's a data-attribute assignment, not an autograd-tracked
+        # operation), and ``replacement.copy_(tensor)`` is an in-place op on a
+        # freshly created tensor with no autograd history. Model loading also
+        # runs outside any grad-enabled context.
+        for _name, tensor, tensor_type in _iter_module_tensors(model):
+            if tensor_type != "parameter" or tensor is None or not tensor.is_cuda:
+                continue
 
-                # GMS tracks whole storage allocations, so use the storage
-                # base pointer instead of a tensor view's offset pointer.
-                storage_base_ptr = tensor.untyped_storage().data_ptr()
-                if _ptr_in_gms(gms_client, int(storage_base_ptr)):
-                    continue
-                if storage_base_ptr in tracked_storage_ptrs:
-                    continue
-                tracked_storage_ptrs.add(storage_base_ptr)
+            # GMS tracks whole storage allocations, so use the storage
+            # base pointer instead of a tensor view's offset pointer.
+            storage_base_ptr = tensor.untyped_storage().data_ptr()
+            if _ptr_in_gms(gms_client, int(storage_base_ptr)):
+                continue
+            if storage_base_ptr in tracked_storage_ptrs:
+                continue
+            tracked_storage_ptrs.add(storage_base_ptr)
 
-                nbytes = _storage_nbytes(tensor)
-                base_va = gms_client.create_mapping(size=nbytes, tag=self._tag)
-                replacement = _tensor_from_pointer(
-                    int(base_va),
-                    list(tensor.shape),
-                    list(tensor.stride()),
-                    tensor.dtype,
-                    device_index,
-                )
-                replacement.copy_(tensor)
-                tensor.data = replacement
+            nbytes = _storage_nbytes(tensor)
+            base_va = gms_client.create_mapping(size=nbytes, tag=self._tag)
+            replacement = _tensor_from_pointer(
+                int(base_va),
+                list(tensor.shape),
+                list(tensor.stride()),
+                tensor.dtype,
+                device_index,
+            )
+            replacement.copy_(tensor)
+            tensor.data = replacement
 
     def finalize_write(self, model: nn.Module) -> int:
         """Register tensors, commit them, and transition this client to RO.

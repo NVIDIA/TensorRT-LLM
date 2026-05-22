@@ -542,8 +542,17 @@ class ModelLoader:
                                              if hasattr(model,
                                                         'llm_checkpoint_dir')
                                              else checkpoint_dir)
+                            # Pass model= for symmetry with the LoadFormat.AUTO
+                            # primary load above. Generic loaders (HF) ignore
+                            # this kwarg; loaders that consume a live module
+                            # reference (MX) use it for direct P2P writes into
+                            # parameter buffers. Keeping the call shape
+                            # consistent here avoids forgetting it when MX+GMS
+                            # composition lands later.
                             weights = checkpoint_loader.load_weights(
-                                weight_source, mapping=self.mapping)
+                                weight_source,
+                                mapping=self.mapping,
+                                model=model)
 
                             # ``weights`` may be:
                             #   - non-empty dict: standard mapping pipeline runs
@@ -632,13 +641,30 @@ class ModelLoader:
                             "LoadFormat.GMS (RW): loaded and committed weights via %s",
                             checkpoint_loader.checkpoint_format)
                     elif gms_backend.is_rw is False:
-                        # RO path: run post-load hooks first because GMS
-                        # materializes by walking the final module tree. The
-                        # hook order creates any aliases/derived parameter
-                        # attributes before the zero-copy GMS tensors replace
-                        # the meta tensors across the whole model tree
-                        # (including draft_model when speculative decoding is
-                        # present).
+                        # RO path: weights are coming from a GMS donor that
+                        # has already committed the post-post_load layout, so
+                        # the receiver flags ``weights_preloaded=True`` on the
+                        # checkpoint-loader hooks. ``MXCheckpointLoader.post_load_publish``
+                        # (and any other format-aware loader) honors this flag
+                        # to early-return and not re-publish, while still
+                        # letting ``post_load_apply`` perform any
+                        # receiver-side per-format work (e.g., marking
+                        # presharded modules).
+                        #
+                        # Hook order:
+                        #   1. ``post_load_apply``: format-specific apply
+                        #      work (e.g., MX preshard markers).
+                        #   2. Per-module ``post_load_weights``: creates
+                        #      aliases/derived parameter attributes BEFORE
+                        #      ``materialize_module`` walks the final module
+                        #      tree (including ``draft_model`` for spec dec).
+                        #   3. ``materialize_module``: zero-copy bind GMS
+                        #      pool storage onto the model parameters.
+                        #   4. ``post_load_publish``: any receiver-side
+                        #      publish (no-op via the receiver guard).
+                        checkpoint_loader.post_load_apply(
+                            model, weights_preloaded=True)
+
                         for module in model.modules():
                             if hasattr(module,
                                        'post_load_weights') and not getattr(
@@ -646,6 +672,11 @@ class ModelLoader:
                                 module.post_load_weights()
 
                         gms_backend.materialize_module(model)
+
+                        checkpoint_loader.post_load_publish(
+                            model,
+                            checkpoint_dir=checkpoint_dir,
+                            weights_preloaded=True)
                         gms_post_load_handled = True
                         logger.info("LoadFormat.GMS (RO): materialized weights")
                     else:
@@ -690,13 +721,17 @@ class ModelLoader:
                             module, '_weights_removed', False):
                         module.post_load_weights()
 
-            # TODO(GMS-MOE-LB): the MoE load balancer's
+            # TODO(GMS-MOE-LB): when the (MoE, GMS) combination is enabled,
             # ``register_weight_slots_after_to_cuda`` and ``finalize_model``
-            # run AFTER the GMS RW pool was closed and finalize_write
-            # committed. Any CUDA allocations they make therefore land in
-            # non-GMS memory and are NOT part of the committed layout that
-            # RO peers receive. Out of scope for the GMS-only PR (no MoE
-            # coverage today); fix as part of (MoE, GMS) follow-up.
+            # must run INSIDE ``mem_pool_scope`` and BEFORE ``finalize_write``
+            # so MoE allocations become part of the committed layout that
+            # RO peers receive. Today they run outside the pool and after
+            # commit, which would silently produce a broken MoE routing
+            # state on RO peers — that combination is REJECTED at config
+            # time by ``TorchLlmArgs.validate_gms_moe_compat`` in
+            # ``tensorrt_llm/llmapi/llm_args.py``. When implementing the
+            # follow-up, drop the validator gate AFTER moving these calls
+            # into the pool scope.
             if isinstance(moe_load_balancer, MoeLoadBalancer):
                 moe_load_balancer.register_weight_slots_after_to_cuda()
                 logger.info("moe_load_balancer finalizing model...")

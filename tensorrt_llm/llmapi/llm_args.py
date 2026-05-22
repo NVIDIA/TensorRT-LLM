@@ -106,7 +106,8 @@ def Field(default: Any = ...,
 
 
 class CudaGraphConfig(StrictBaseModel):
-    """Configuration for CUDA graphs.
+    """
+    Configuration for CUDA graphs.
     """
     # List of batch sizes to create CUDA graphs for.
     batch_sizes: Optional[List[int]] = Field(
@@ -251,7 +252,8 @@ class GuidedDecodingConfig(StrictBaseModel):
 
 
 class BaseSparseAttentionConfig(StrictBaseModel):
-    """Configuration for sparse attention.
+    """
+    Configuration for sparse attention.
     """
     algorithm: str
 
@@ -280,7 +282,8 @@ class BaseSparseAttentionConfig(StrictBaseModel):
 
 
 class RocketSparseAttentionConfig(BaseSparseAttentionConfig):
-    """Configuration for RocketKV sparse attention.
+    """
+    Configuration for RocketKV sparse attention.
     """
     algorithm: Literal["rocket"] = "rocket"
     window_size: Optional[int] = Field(
@@ -306,7 +309,8 @@ class RocketSparseAttentionConfig(BaseSparseAttentionConfig):
 
 
 class DeepSeekSparseAttentionConfig(BaseSparseAttentionConfig):
-    """Configuration for DeepSeek Sparse Attention.
+    """
+    Configuration for DeepSeek Sparse Attention.
     """
     algorithm: Literal["dsa"] = "dsa"
     index_n_heads: Optional[int] = Field(
@@ -397,7 +401,8 @@ class DeepSeekSparseAttentionConfig(BaseSparseAttentionConfig):
 
 
 class SkipSoftmaxAttentionConfig(BaseSparseAttentionConfig):
-    """Configuration for skip softmax attention.
+    """
+    Configuration for skip softmax attention.
     """
     algorithm: Literal["skip_softmax"] = "skip_softmax"
     threshold_scale_factor: Optional[Union[float, Dict[str, float]]] = Field(
@@ -552,7 +557,8 @@ class MoeLoadBalancerConfig(StrictBaseModel):
 
     def get_layer_initial_global_assignments(
             self, layer_idx: int) -> Optional[List[int]]:
-        """Retrieves the initial global assignments for a specific layer.
+        """
+        Retrieves the initial global assignments for a specific layer.
         """
         if self.initial_global_assignments is None:
             return None
@@ -577,7 +583,8 @@ class MoeLoadBalancerConfig(StrictBaseModel):
 
 
 class MoeConfig(StrictBaseModel):
-    """Configuration for MoE.
+    """
+    Configuration for MoE.
     """
     backend: Literal[
         "AUTO", "CUTLASS", "CUTEDSL", "WIDEEP", "TRTLLM", "DEEPGEMM",
@@ -621,7 +628,8 @@ TOKENIZER_ALIASES = {
 
 
 class Nvfp4GemmConfig(StrictBaseModel):
-    """Configuration for NVFP4 GEMM backend selection.
+    """
+    Configuration for NVFP4 GEMM backend selection.
     """
     allowed_backends: List[Nvfp4Backend] = Field(
         default_factory=lambda: ['cutlass', 'cublaslt', 'cuda_core'],
@@ -633,7 +641,8 @@ class Nvfp4GemmConfig(StrictBaseModel):
 
 
 class AttentionDpConfig(StrictBaseModel):
-    """Configuration for attention DP.
+    """
+    Configuration for attention DP.
     """
     enable_balance: bool = Field(default=False,
                                  description="Whether to enable balance.")
@@ -693,7 +702,8 @@ class AttentionDpConfig(StrictBaseModel):
 
 
 class CpConfig(StrictBaseModel):
-    """Configuration for context parallelism.
+    """
+    Configuration for context parallelism.
     """
     # TODO: given that multiple fields here are only used with specific cp_types, consider
     # making this a Pydantic discriminated union.
@@ -800,7 +810,8 @@ class _ParallelConfig(StrictBaseModel):
 
 
 class CalibConfig(StrictBaseModel):
-    """Calibration configuration.
+    """
+    Calibration configuration.
     """
     device: Literal['cuda',
                     'cpu'] = Field(default='cuda',
@@ -1060,7 +1071,8 @@ class KvCacheConnectorConfig(StrictBaseModel):
 
 
 class LayerwiseBenchmarksConfig(StrictBaseModel):
-    """Configuration for layer-wise benchmarks calibration.
+    """
+    Configuration for layer-wise benchmarks calibration.
     """
     calibration_mode: Literal["NONE", "MARK", "COLLECT"] = Field(
         default="NONE",
@@ -1437,7 +1449,8 @@ class UserProvidedDecodingConfig(DecodingBaseConfig):
 
 
 class NGramDecodingConfig(DecodingBaseConfig):
-    """Configuration for NGram drafter speculative decoding.
+    """
+    Configuration for NGram drafter speculative decoding.
     """
     decoding_type: Literal["NGram"] = "NGram"
     max_matching_ngram_size: PositiveInt = Field(
@@ -2195,7 +2208,8 @@ class PybindMirrorMeta(type(PybindMirror)):
 
 
 class PybindMirrorEnumMeta(EnumMeta, PybindMirrorMeta):
-    """Combined metaclass for Enum and PybindMirror.  This is crucial.
+    """
+    Combined metaclass for Enum and PybindMirror.  This is crucial.
     """
 
 
@@ -2300,7 +2314,8 @@ class SchedulerConfig(StrictBaseModel, PybindMirror):
 
 @PybindMirror.mirror_pybind_fields(_PeftCacheConfig)
 class PeftCacheConfig(StrictBaseModel, PybindMirror):
-    """Configuration for the PEFT cache.
+    """
+    Configuration for the PEFT cache.
     """
     num_host_module_layer: int = Field(
         default=0,
@@ -2369,7 +2384,8 @@ class PeftCacheConfig(StrictBaseModel, PybindMirror):
 
 @PybindMirror.mirror_pybind_fields(_LookaheadDecodingConfig)
 class LookaheadDecodingConfig(DecodingBaseConfig, PybindMirror):
-    """Configuration for lookahead speculative decoding.
+    """
+    Configuration for lookahead speculative decoding.
     """
 
     decoding_type: Literal["Lookahead"] = "Lookahead"
@@ -2473,7 +2489,8 @@ class ReorderRequestPolicyConfig(StrictBaseModel):
 
 @PybindMirror.mirror_pybind_fields(_KvCacheConfig)
 class KvCacheConfig(StrictBaseModel, PybindMirror):
-    """Configuration for the KV cache.
+    """
+    Configuration for the KV cache.
     """
     enable_block_reuse: bool = Field(
         default=True,
@@ -2687,7 +2704,8 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
 
 @PybindMirror.mirror_pybind_fields(_ExtendedRuntimePerfKnobConfig)
 class ExtendedRuntimePerfKnobConfig(StrictBaseModel, PybindMirror):
-    """Configuration for extended runtime performance knobs.
+    """
+    Configuration for extended runtime performance knobs.
     """
 
     multi_block_mode: bool = Field(
@@ -2717,7 +2735,8 @@ class ExtendedRuntimePerfKnobConfig(StrictBaseModel, PybindMirror):
 
 @PybindMirror.mirror_pybind_fields(_CacheTransceiverConfig)
 class CacheTransceiverConfig(StrictBaseModel, PybindMirror):
-    """Configuration for the cache transceiver.
+    """
+    Configuration for the cache transceiver.
     """
 
     backend: Optional[Literal[
@@ -2828,7 +2847,8 @@ class DwdpConfig(StrictBaseModel):
 
 
 class BaseLlmArgs(StrictBaseModel):
-    """Base class for both TorchLlmArgs and TrtLlmArgs. It contains all the arguments that are common to both.
+    """
+    Base class for both TorchLlmArgs and TrtLlmArgs. It contains all the arguments that are common to both.
     """
     model_config = ConfigDict(arbitrary_types_allowed=True, extra="forbid")
 
@@ -3344,7 +3364,8 @@ class TrtLlmArgs(BaseLlmArgs):
 
     @model_validator(mode="after")
     def init_build_config(self):
-        """Creating a default BuildConfig if none is provided
+        """
+        Creating a default BuildConfig if none is provided
         """
         build_config = getattr(self, "build_config", None)
         if build_config is None:
@@ -3745,7 +3766,8 @@ class SamplerType(StrEnum):
 
 
 class TorchCompileConfig(StrictBaseModel):
-    """Configuration for torch.compile.
+    """
+    Configuration for torch.compile.
     """
     enable_fullgraph: bool = Field(
         default=True,
@@ -4306,6 +4328,47 @@ class TorchLlmArgs(BaseLlmArgs):
                 "gms_config is set but load_format is '%s', not 'GMS'. "
                 "The GMS config will be ignored. Set load_format='GMS' to "
                 "enable GPU Memory Service.", self.load_format.name)
+        return self
+
+    @model_validator(mode="after")
+    def validate_gms_moe_compat(self) -> 'TorchLlmArgs':
+        """Reject ``LoadFormat.GMS`` combined with a MoE load balancer.
+
+        The ``MoeLoadBalancer``'s ``register_weight_slots_after_to_cuda``
+        and ``finalize_model`` run AFTER the GMS RW pool is closed and
+        ``finalize_write`` has committed, so any CUDA allocations they
+        make land in non-GMS memory and are NOT part of the committed
+        layout that RO peers receive. The result is "wrong inference,
+        no error" on RO peers (broken MoE routing state). Failing at
+        config-validation time is strictly better than that silent
+        miscompute.
+
+        The fix for this gap (running the MoE finalize work INSIDE
+        ``mem_pool_scope`` and BEFORE ``finalize_write`` so MoE
+        allocations are part of the committed layout) is tracked as
+        the (MoE, GMS) follow-up; see ``model_loader.py``'s
+        ``TODO(GMS-MOE-LB)`` comment.
+
+        Returns:
+            ``self`` (Pydantic ``model_validator`` contract).
+
+        Raises:
+            ValueError: When ``load_format == LoadFormat.GMS`` and
+                ``moe_config.load_balancer`` is set.
+        """
+        if (self.load_format == LoadFormat.GMS and self.moe_config is not None
+                and self.moe_config.load_balancer is not None):
+            raise ValueError(
+                "LoadFormat.GMS is incompatible with moe_config.load_balancer "
+                "in this PR. The MoE load balancer's "
+                "register_weight_slots_after_to_cuda and finalize_model run "
+                "after the GMS pool closes and finalize_write commits, so "
+                "their allocations land outside the committed layout. RO "
+                "peers would receive a broken MoE routing state. Either "
+                "disable moe_config.load_balancer or use LoadFormat.AUTO. "
+                "Tracked as the (MoE, GMS) follow-up at "
+                "tensorrt_llm/_torch/pyexecutor/model_loader.py "
+                "(see TODO(GMS-MOE-LB)).")
         return self
 
     @model_validator(mode="after")
