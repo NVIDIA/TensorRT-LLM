@@ -1493,17 +1493,28 @@ class OpenAIServer:
             # Get tool_choice from request
             tool_choice = getattr(request, 'tool_choice', None)
 
-            try:
-                harmony_tokens = self.harmony_adapter.openai_to_harmony_tokens(
-                    request.messages,
-                    tools_dict,
-                    reasoning_effort=reasoning_effort,
-                    tool_choice=tool_choice)
-            except Exception as e:
-                logger.error(f"messages_dict: {request.messages}")
-                logger.error(f"tools_dict: {tools_dict}")
-                logger.error(f"request: {request}")
-                raise e
+            # Disagg: when the ctx worker has already harmony-tokenized the
+            # messages, `_get_gen_request` forwards those token IDs as
+            # `prompt_token_ids` on the gen request (see
+            # openai_disagg_service.py::_get_gen_request and
+            # openai_server.py::_create_chat_response which attaches
+            # `promise.prompt_token_ids` to the ctx response when
+            # `request_type == "context_only"`). Re-running the harmony
+            # adapter on gen would duplicate that work, so skip it.
+            if request.prompt_token_ids is not None:
+                harmony_tokens = request.prompt_token_ids
+            else:
+                try:
+                    harmony_tokens = self.harmony_adapter.openai_to_harmony_tokens(
+                        request.messages,
+                        tools_dict,
+                        reasoning_effort=reasoning_effort,
+                        tool_choice=tool_choice)
+                except Exception as e:
+                    logger.error(f"messages_dict: {request.messages}")
+                    logger.error(f"tools_dict: {tools_dict}")
+                    logger.error(f"request: {request}")
+                    raise e
 
             # Get harmony stop tokens
             harmony_stop_tokens = self.harmony_adapter.get_stop_tokens()
