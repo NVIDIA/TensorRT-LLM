@@ -3761,7 +3761,7 @@ class TestDeepSeekV4Flash(LlmapiAccuracyTestHarness):
 
     @pytest.mark.skip_less_mpi_world_size(4)
     def test_auto_dtype(self):
-        # Aggregate (non-disagg, non-EPLB) smoke test. NVFP4 weights are ~71
+        # Aggregate (non-disagg, non-EPLB) coverage. NVFP4 weights are ~71
         # GB/rank at TP=2, ~36 GB/rank at TP=4 — TP=4 fits comfortably on
         # 4x B200 178GB. TRTLLM backend required because V4-Flash MXFP4
         # routed experts are unsupported by WIDEEP (raises "Unsupported
@@ -3774,8 +3774,9 @@ class TestDeepSeekV4Flash(LlmapiAccuracyTestHarness):
                  enable_attention_dp=True,
                  max_seq_len=4096,
                  kv_cache_config=kv_cache_config) as llm:
+            # Keep MMLU in smoke mode until a DeepSeek-V4-Flash reference is registered.
             task = MMLU(self.MODEL_NAME)
-            task.evaluate(llm)
+            task.evaluate(llm, is_integration_test=True)
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
 
