@@ -31,7 +31,7 @@ dependencies = [
     "tensorrt (>=10.15.1,<10.16.0)",
     "torchvision (>=0.27.0,<0.28.0)",
     "nvidia-modelopt[torch] (>=0.37.0,<0.38.0)",
-    "transformers (==5.5.3)",
+    "transformers (==5.5.4)",
     "prometheus-client (>=0.25.0,<0.26.0)",
     "prometheus-fastapi-instrumentator (>=7.1.0,<8.0.0)",
     "pydantic (>=2.9.1)",
