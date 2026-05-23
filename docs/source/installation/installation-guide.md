@@ -65,7 +65,7 @@ image hosted on NGC](https://catalog.ngc.nvidia.com/orgs/nvidia/teams/tensorrt-l
 Once all prerequisites are in place, TensorRT LLM can be installed as follows:
 
 ```bash
-pip3 install --ignore-installed pip setuptools wheel && pip3 install tensorrt_llm
+pip3 install --ignore-installed pip "setuptools<80" wheel && pip3 install tensorrt_llm
 ```
 
 > **Note:** The TensorRT LLM wheel on PyPI is built with PyTorch 2.10.0. This version may be incompatible with the NVIDIA NGC PyTorch container, which uses a more recent PyTorch build. If you are using the NGC PyTorch container, install the wheel built specifically for that container using the `+ngcpytorch{YYMM}` local version suffix, where `YYMM` is derived from the container tag (e.g., `pytorch:26.02` → `ngcpytorch2602`):
@@ -108,7 +108,7 @@ There are some known limitations when you pip install the pre-built TensorRT LLM
    ```bash
    CURRENT_TORCH_VERSION=$(python3 -c "import torch; print(torch.__version__)")
    echo "torch==$CURRENT_TORCH_VERSION" > /tmp/torch-constraint.txt
-   pip3 install --ignore-installed pip setuptools wheel && pip3 install tensorrt_llm -c /tmp/torch-constraint.txt
+   pip3 install --ignore-installed pip "setuptools<80" wheel && pip3 install tensorrt_llm -c /tmp/torch-constraint.txt
    ```
 
 ## Option 3: Build from Source
