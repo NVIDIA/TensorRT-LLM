@@ -55,8 +55,16 @@ HIDDEN_SIZES = (8, 2880, 7168, 7176, 8192, 16384)
 DTYPES = (torch.bfloat16, )
 FUSION_CASES = (True, False)
 QUANT_DTYPES = (torch.float16, torch.bfloat16)
-QUANT_SEQ_LEN_CASES = (16, 2048)
-QUANT_HIDDEN_SIZE = 128
+QUANT_HIDDEN_SIZE = 2880
+# Quant fusion uses tp=2 and 2-byte inputs in this test. The first two shapes
+# cover one-shot and two-shot at the same real hidden size; the wide hidden-size
+# case also crosses the two-shot threshold while keeping the fused RMSNorm stage
+# on the CGA grid-policy path.
+QUANT_SHAPE_CASES = (
+    pytest.param(16, 2880, id="oneshot_m16_n2880"),
+    pytest.param(2048, 2880, id="twoshot_m2048_n2880"),
+    pytest.param(32, 16384, id="twoshot_cga_m32_n16384"),
+)
 QUANT_FUSION_OPS = (
     pytest.param(AllReduceFusionOp.RESIDUAL_RMS_NORM_QUANT_FP8,
                  id="residual_rms_norm_quant_fp8"),
@@ -505,16 +513,14 @@ def _make_quant_scale(reference_norm: torch.Tensor,
 
 @pytest.mark.skipif(torch.cuda.device_count() < 2,
                     reason="needs 2 GPUs to run this test")
-@pytest.mark.parametrize("seq_len",
-                         QUANT_SEQ_LEN_CASES,
-                         ids=lambda x: f"seqlen:{x}")
+@pytest.mark.parametrize("seq_len, hidden_size", QUANT_SHAPE_CASES)
 @pytest.mark.parametrize("dtype", QUANT_DTYPES, ids=_dtype_id)
 @pytest.mark.parametrize("fusion_op", QUANT_FUSION_OPS)
 @pytest.mark.parametrize("mpi_pool_executor", [2], indirect=True)
-def test_mnnvl_quant_fusion(seq_len, dtype, fusion_op, mpi_pool_executor):
+def test_mnnvl_quant_fusion(seq_len, hidden_size, dtype, fusion_op,
+                            mpi_pool_executor):
     torch.manual_seed(42)
     tensor_parallel_size = mpi_pool_executor.num_workers
-    hidden_size = QUANT_HIDDEN_SIZE
     eps = 1e-5
 
     x = torch.randn((tensor_parallel_size, seq_len, hidden_size), dtype=dtype)
