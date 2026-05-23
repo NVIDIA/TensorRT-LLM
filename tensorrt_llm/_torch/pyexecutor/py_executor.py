@@ -65,6 +65,7 @@ from .mamba_cache_manager import BaseMambaCacheManager, MambaHybridCacheManager
 from .model_engine import ModelEngine
 from .perf_metrics_manager import PerfMetricsManager
 from .request_utils import (RequestBroadcaster, attach_py_objects_to_requests,
+                            derive_attention_dp_per_rank_request_cap,
                             get_from_waiting_queue, merge_requests)
 from .resource_manager import (KVCacheManagerV2, ResourceManager,
                                ResourceManagerType, request_context)
@@ -416,6 +417,28 @@ class PyExecutor:
         self.max_input_len = max_input_len
         # _executor_loop private data
         self.max_num_active_requests = model_engine.get_max_num_sequences()
+        # nvbug-6133201: under attention DP, tighten the per-rank request
+        # cap so per-rank gen-phase step-token load cannot exceed
+        # max_num_tokens. No-op for correctly-sized configs.
+        if self.enable_attention_dp:
+            derived_cap = derive_attention_dp_per_rank_request_cap(
+                base_cap=self.max_num_active_requests,
+                max_num_tokens=self.max_num_tokens,
+                max_total_draft_tokens=self.max_total_draft_tokens,
+            )
+            if derived_cap < self.max_num_active_requests:
+                step_tokens_per_req = 1 + max(self.max_total_draft_tokens, 0)
+                required_max_num_tokens = (self.max_num_active_requests *
+                                           step_tokens_per_req)
+                logger.warning(
+                    f"[PyExecutor] enable_attention_dp: max_num_tokens="
+                    f"{self.max_num_tokens} cannot fit max_batch_size="
+                    f"{self.max_num_active_requests} at {step_tokens_per_req} "
+                    f"step-tokens each; capping per-rank max_num_active_requests "
+                    f"to {derived_cap}. Raise max_num_tokens to "
+                    f"{required_max_num_tokens} to run at the declared "
+                    f"max_batch_size.")
+            self.max_num_active_requests = derived_cap
         self.active_requests: List[LlmRequest] = []
         self.expected_num_active_requests = 0
         # TODO: Remove PP size == 1 gate for disagg + block reuse with PP > 1.
