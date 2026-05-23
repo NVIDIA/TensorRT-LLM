@@ -211,6 +211,24 @@ public:
                 mla_params.q_pe = static_cast<T*>(q_pe->data_ptr());
                 mla_params.q_pe_ld = q_pe->strides()[1];
                 mla_params.q_pe_stride = q_pe->strides()[0];
+
+                // Fused FP8-Q path: forward caller's quant_q_buffer / scale so
+                // applyMLARopeAndAssignQKVKernelOptContext<kOutputFp8Q=true>
+                // appends rope FP8 in place and the standalone quantize is
+                // skipped. Without this wiring the sparse-MLA context branch
+                // runs the legacy quantize over the bf16 placeholder q.
+                mla_params.bmm1_scale = mla_bmm1_scale.has_value()
+                    ? reinterpret_cast<float*>(mla_bmm1_scale.value().data_ptr())
+                    : nullptr;
+                mla_params.bmm2_scale = mla_bmm2_scale.has_value()
+                    ? reinterpret_cast<float*>(mla_bmm2_scale.value().data_ptr())
+                    : nullptr;
+                mla_params.quant_q_buf
+                    = quant_q_buffer.has_value() ? reinterpret_cast<void*>(quant_q_buffer.value().data_ptr()) : nullptr;
+                mla_params.quant_scale_qkv = quant_scale_qkv.has_value()
+                    ? reinterpret_cast<float const*>(quant_scale_qkv.value().data_ptr())
+                    : nullptr;
+                mla_params.fuse_q_fp8_in_rope = (quant_q_buffer.has_value() && quant_scale_qkv.has_value());
             }
             else if (is_context)
             {
