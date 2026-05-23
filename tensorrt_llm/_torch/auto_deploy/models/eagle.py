@@ -46,7 +46,7 @@ from .factory import DynamicShape, ModelFactory, ModelFactoryRegistry, SubModule
 from .hf import AutoModelForCausalLMFactory
 
 
-def get_module_names(
+def mapped_module_names(
     modules: List[str],
     renamed_modules: Optional[Dict[str, str]],
 ) -> List[str]:
@@ -390,13 +390,11 @@ class EagleOneModelFactory(ModelFactory):
     def get_sharding_config(self) -> Dict[str, Any]:
         return self.target_factory.get_sharding_config()
 
-    # TODO(govind): It's possible that draft models have different quant configs than target models.
-    # We need to address this possibility.
     def get_quant_config(self) -> Dict[str, Any]:
         qcfg = dict(self.target_factory.get_quant_config())
         excluded = qcfg.get("exclude_modules")
         if excluded:
-            qcfg["exclude_modules"] = get_module_names(
+            qcfg["exclude_modules"] = mapped_module_names(
                 list(excluded),
                 getattr(self.draft_factory, "_quant_exclude_conversion_mapping", None),
             )
