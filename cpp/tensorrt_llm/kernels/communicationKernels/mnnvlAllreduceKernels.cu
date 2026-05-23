@@ -206,10 +206,16 @@ inline __device__ __host__ T divUp(T m, T n)
     return (m + n - 1) / n;
 }
 
+inline bool requiresTwoAccessScaleGroup(ar_fusion::AllReduceFusionPattern pattern)
+{
+    return pattern == ar_fusion::AllReduceFusionPattern::kARResidualRMSNormFP4Quant
+        || pattern == ar_fusion::AllReduceFusionPattern::kARResidualRMSNormOutFP4Quant;
+}
+
 // A helper function to tune the grid configuration for fused oneshot and RMSNorm kernels.
 // Return (block_size, cluster_size, loads_per_thread).
 template <bool UseCluster>
-std::tuple<int, int, int> adjustGridConfig(int numTokens, int dim, int eltsPerThread)
+std::tuple<int, int, int> adjustGridConfig(int numTokens, int dim, int eltsPerThread, int accessGroupSize = 1)
 {
     // Step 1: Start from the widest cluster we are willing to launch. The caller can request a no-CGA
     // fallback for multi-load RMSNorm rows, in which case the cluster width stays at one CTA.
@@ -221,9 +227,11 @@ std::tuple<int, int, int> adjustGridConfig(int numTokens, int dim, int eltsPerTh
     blockSize = divUp(threadsNeeded, clusterSize);
     if constexpr (UseCluster)
     {
-        // Step 2: Shrink the cluster until the hidden dimension partitions cleanly across CTAs.
-        // This keeps each CTA responsible for an integral chunk of packed elements.
-        while (threadsNeeded % clusterSize != 0 && clusterSize > 1)
+        // Step 2: Shrink the cluster until the hidden dimension partitions cleanly across CTAs
+        // and each CTA contains an integral packed-access group. NVFP4 scale generation uses a
+        // two-access group, so it must not straddle a CTA boundary.
+        while ((threadsNeeded % clusterSize != 0 || divUp(threadsNeeded, clusterSize) % accessGroupSize != 0)
+            && clusterSize > 1)
         {
             clusterSize /= 2;
         }
@@ -250,7 +258,8 @@ std::tuple<int, int, int> adjustGridConfig(int numTokens, int dim, int eltsPerTh
         {
             int const candidateClusterSize = clusterSize * 2;
             int const candidateBlockSize = divUp(threadsNeeded, candidateClusterSize);
-            if (candidateBlockSize < 64 || numTokens * candidateClusterSize > smCount)
+            if (candidateBlockSize < 64 || candidateBlockSize % accessGroupSize != 0
+                || numTokens * candidateClusterSize > smCount)
             {
                 break;
             }
@@ -292,6 +301,12 @@ std::tuple<int, int, int> adjustGridConfig(int numTokens, int dim, int eltsPerTh
                 break;
             }
         }
+        blockSize = divUp(threadsNeeded, clusterSize * loadsPerThread);
+    }
+
+    while (blockSize % accessGroupSize != 0 && loadsPerThread < 8)
+    {
+        loadsPerThread += 1;
         blockSize = divUp(threadsNeeded, clusterSize * loadsPerThread);
     }
 
@@ -699,6 +714,7 @@ __global__ void __launch_bounds__(1024) oneshotAllreduceFusionKernel(MnnvlAllRed
 }
 
 using detail::adjustGridConfig;
+using detail::requiresTwoAccessScaleGroup;
 
 void oneshotAllreduceFusionOp(AllReduceFusionParams const& params)
 {
@@ -708,8 +724,10 @@ void oneshotAllreduceFusionOp(AllReduceFusionParams const& params)
     int const numTokens = params.numTokens;
     int const tokenDim = params.tokenDim;
     int const eltsPerThread = sizeof(float4) / getDTypeSize(params.dType);
+    int const accessGroupSize = requiresTwoAccessScaleGroup(params.pattern) ? 2 : 1;
 
-    auto [blockSize, clusterSize, loadsPerThread] = adjustGridConfig<true>(numTokens, tokenDim, eltsPerThread);
+    auto [blockSize, clusterSize, loadsPerThread]
+        = adjustGridConfig<true>(numTokens, tokenDim, eltsPerThread, accessGroupSize);
     dim3 grid(numTokens, clusterSize, 1);
 
     TLLM_LOG_DEBUG(
@@ -1243,14 +1261,15 @@ void twoshotAllreduceFusionOp(AllReduceFusionParams const& params)
     // Launch the rmsnorm lamport kernel if fusion is enabled
     if (params.rmsNormFusion)
     {
-        auto gridConfig = adjustGridConfig<true>(numTokens, tokenDim, numEltsPerThread);
+        int const accessGroupSize = requiresTwoAccessScaleGroup(params.pattern) ? 2 : 1;
+        auto gridConfig = adjustGridConfig<true>(numTokens, tokenDim, numEltsPerThread, accessGroupSize);
         int rnBlockSize = std::get<0>(gridConfig);
         int rnClusterSize = std::get<1>(gridConfig);
         int rnLoadsPerThread = std::get<2>(gridConfig);
         bool rnUseCGA = rnClusterSize > 1 && rnLoadsPerThread == 1;
         if (!rnUseCGA)
         {
-            gridConfig = adjustGridConfig<false>(numTokens, tokenDim, numEltsPerThread);
+            gridConfig = adjustGridConfig<false>(numTokens, tokenDim, numEltsPerThread, accessGroupSize);
             rnBlockSize = std::get<0>(gridConfig);
             rnClusterSize = std::get<1>(gridConfig);
             rnLoadsPerThread = std::get<2>(gridConfig);
