@@ -15,14 +15,9 @@
 
 # Config for Ultra V3 with MTP speculative decoding.
 #
-runtime: trtllm
-compile_backend: torch-cudagraph
 max_batch_size: 4
 max_seq_len: 12288 # tuned for 0.80 free_gpu_memory_fraction with 8-way TP
 enable_chunked_prefill: false # TODO: Support chunked prefill w/ spec dec
-attn_backend: trtllm
-model_factory: AutoModelForCausalLM
-skip_loading_weights: false
 cuda_graph_config:
   batch_sizes: [1, 2, 4]
 kv_cache_config:
@@ -60,7 +55,6 @@ transforms:
         "fc1_latent_proj": "gather"
         "fc2_latent_proj": "gather"
   multi_stream_moe:
-    stage: compile
     enabled: true
   gather_logits_before_lm_head:
     # TODO: fix https://github.com/NVIDIA/TensorRT-LLM/issues/9878 to enable by default
@@ -68,15 +62,10 @@ transforms:
   fuse_mamba_a_log:
     stage: post_load_fusion
     enabled: true
-  # Triton SSM + causal conv are required for MTP as currently they are the only backends
-  # that support speculative mamba state caching.
-  insert_cached_ssm_attention:
-    backend: triton_ssm
+  # Triton causal conv is required for MTP speculative Mamba state caching.
   insert_cached_causal_conv:
     backend: triton_causal_conv
   fuse_fp8_moe:
     allow_different_input_scales: true
   fuse_nvfp4_moe:
     allow_different_input_scales: true
-  load_weights:
-    disable_preload: false
