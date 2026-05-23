@@ -22,6 +22,49 @@
 namespace tensorrt_llm::batch_manager::kv_cache_manager
 {
 
+// [TTFT-INVESTIGATION 2026-05-23] Per-phase wall-clock breakdown for
+// WindowBlockManager::findBlocksInReuseTreeByBlockKey, the suspect
+// O(prefix^2) hot path under mCachedBlocksRootMutex identified in
+// FINDINGS_RWLT_0522.md. The struct is overwritten on every call;
+// callers (currently only the perf unit test and any ad-hoc
+// instrumentation) read it immediately after invocation. Cost is 5x
+// std::chrono::steady_clock::now() per call (sub-microsecond on x86).
+// Fields:
+//  - lockWaitMs   : time blocked acquiring mCachedBlocksRootMutex
+//  - chopMs       : chopVectorIntoBlocks<UniqueToken> splitting prefix
+//                   tokens into per-block sub-vectors (suspect O(N^2)
+//                   in current impl: allocates a fresh list of vectors
+//                   sized prefix_blocks each call).
+//  - keysBuildMs  : std::vector<BlockKey> blockKeys construction loop;
+//                   currently copies the full blockKey (including
+//                   extraKeys / loraTaskId) on every iteration before
+//                   overwriting uniqueTokens, which is itself a
+//                   potential per-block O(extraKeys) cost.
+//  - walkLoopMs   : the actual findMatchingBlock walk down the radix
+//                   tree (KVCacheBlock::findMatchingBlock chain).
+//  - numBlockKeys : prefix_tokens / mTokensPerBlock (+1 if tail);
+//                   == prefix_blocks.
+//  - numTokensInKey : blockKey.uniqueTokens.size() on entry.
+//  - foundLeaf    : true iff the walk completed (vs early-exited on
+//                   the first findMatchingBlock miss).
+struct DbgFindBlocksInReuseTreeTiming
+{
+    double lockWaitMs = 0.0;
+    double chopMs = 0.0;
+    double keysBuildMs = 0.0;
+    double walkLoopMs = 0.0;
+    int numBlockKeys = 0;
+    int numTokensInKey = 0;
+    bool foundLeaf = false;
+    bool valid = false;
+};
+
+inline DbgFindBlocksInReuseTreeTiming& dbgFindBlocksInReuseTreeTiming() noexcept
+{
+    thread_local DbgFindBlocksInReuseTreeTiming t;
+    return t;
+}
+
 class BlockIterator;
 
 class BlockRangeForWindow

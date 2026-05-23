@@ -41,8 +41,11 @@
 #include <chrono>
 #include <cmath>
 #include <cstddef>
+#include <cstdlib>
 #include <fcntl.h>
 #include <filesystem>
+#include <iomanip>
+#include <iostream>
 #include <memory>
 #include <set>
 #include <sys/types.h>
@@ -718,6 +721,210 @@ TEST_F(KVCacheManagerTest, FindBlocksInReuseTreeByBlockKeysTest)
     auto const prev1 = prev2->getPrevBlock();
     ASSERT_NE(prev1, nullptr);
     EXPECT_EQ(prev1->getPrevBlock(), nullptr);
+}
+
+// [TTFT-INVESTIGATION 2026-05-23] Microbenchmark for the disagg-only hot path
+// WindowBlockManager::findBlocksInReuseTreeByBlockKey -- the function
+// FINDINGS_RWLT_0522.md identified as accounting for >99% of ctx-side
+// blockrange_ms (and growing super-linearly with ISL: ~0.013 ms/blk at 8-16k
+// to ~0.107 ms/blk at 64-80k, 8x cost per block across 6x ISL).
+//
+// Setup matches the production GPT-OSS config that hit the regression:
+// tokens_per_block = 32, single window, block reuse enabled, single trie
+// chain (one long shared-prefix conversation). The per-block byte size is
+// kept tiny (numLayers/numKvHeads/sizePerHead) because the trie walk is
+// pool-byte-size-independent -- we want the test to fit in <100 MB of pool
+// memory so it runs anywhere with a GPU.
+//
+// The function is instrumented with DbgFindBlocksInReuseTreeTiming
+// (cpp/include/tensorrt_llm/batch_manager/kvCacheUtils.h), which splits the
+// per-call cost into:
+//   - lockWaitMs   : acquiring mCachedBlocksRootMutex
+//   - chopMs       : chopVectorIntoBlocks<UniqueToken> (suspect O(N^2))
+//   - keysBuildMs  : std::vector<BlockKey> construction (per-block BlockKey
+//                    copy incl. extraKeys / loraTaskId)
+//   - walkLoopMs   : the radix-tree walk (findMatchingBlock x prefix_blocks)
+//
+// Sweep config defaults (CI-friendly, ~5s wall time on B200): ISLs up to
+// 32k tokens, 3 iterations each. Override for deeper investigation:
+//   TRTLLM_FIND_BLOCKS_PERF_MAX_TOKENS=81920 ./kvCacheManagerTest \
+//       --gtest_filter='*FindBlocksInReuseTreeByBlockKeyPerf*'
+//   TRTLLM_FIND_BLOCKS_PERF_ITERS=10 ./kvCacheManagerTest \
+//       --gtest_filter='*FindBlocksInReuseTreeByBlockKeyPerf*'
+TEST_F(KVCacheManagerTest, FindBlocksInReuseTreeByBlockKeyPerfTest)
+{
+    // Tiny KV-cache footprint per block -- only the trie walk cost matters
+    // for this perf test; block byte size is independent of the hot path.
+    auto constexpr numLayers = 2;
+    auto constexpr numKvHeads = 2;
+    auto constexpr sizePerHead = 16;
+    auto constexpr tokensPerBlock = 32; // matches prod GPT-OSS kv_cache_config
+    auto constexpr maxNumSequences = 8;
+    auto constexpr beamWidth = 1;
+
+    // Parse sweep config from env vars (default sweep capped at 32k tokens
+    // so the test completes in <1s in CI; bump TRTLLM_FIND_BLOCKS_PERF_MAX_TOKENS
+    // to investigate the super-linear regime up to ~80k).
+    SizeType32 maxIslTokens = 32768;
+    int iterations = 3;
+    if (auto const* env = std::getenv("TRTLLM_FIND_BLOCKS_PERF_MAX_TOKENS"))
+    {
+        maxIslTokens = static_cast<SizeType32>(std::stoi(env));
+    }
+    if (auto const* env = std::getenv("TRTLLM_FIND_BLOCKS_PERF_ITERS"))
+    {
+        iterations = std::max(1, std::stoi(env));
+    }
+
+    // Sweep covers a fixed set of "interesting" ISL sizes (each ~2x the
+    // previous), capped at maxIslTokens. The last bucket is forced to
+    // exactly maxIslTokens so the user-requested ceiling is always
+    // measured.
+    std::vector<SizeType32> islSweep;
+    for (SizeType32 isl : {2048, 4096, 8192, 16384, 32768, 65536, 81920})
+    {
+        if (isl <= maxIslTokens && (islSweep.empty() || isl > islSweep.back()))
+        {
+            islSweep.push_back(isl);
+        }
+    }
+    if (islSweep.empty() || islSweep.back() < maxIslTokens)
+    {
+        islSweep.push_back(maxIslTokens);
+    }
+    SizeType32 const largestIsl = islSweep.back();
+
+    // Pool sized for the largest ISL only -- because all prefixes share the
+    // same root chain (built once below), no extra blocks are needed beyond
+    // the largest ISL's block count.
+    SizeType32 const largestBlocks = (largestIsl + tokensPerBlock - 1) / tokensPerBlock;
+    SizeType32 const blocksInPrimaryPool = largestBlocks + 64;
+    SizeType32 const blocksInSecondaryPool = 0;
+    SizeType32 const maxAttentionWindow = largestIsl;
+
+    auto const stream = std::make_shared<tr::CudaStream>();
+    auto const blocksPerWindow
+        = BlocksPerWindow{{maxAttentionWindow, {blocksInPrimaryPool, blocksInSecondaryPool}}};
+
+    tr::SamplingConfig const samplingConfig{beamWidth};
+    SizeType32 constexpr maxNewTokens{0};
+    bool constexpr isStreaming{false};
+
+    KVCacheManager kvCacheManager(numLayers, numKvHeads, sizePerHead, tokensPerBlock, blocksPerWindow, maxNumSequences,
+        beamWidth, std::vector<BlockManager::SizeType32>{maxAttentionWindow}, std::nullopt, nvinfer1::DataType::kHALF,
+        false, stream, maxAttentionWindow, /*enableBlockReuse=*/true);
+
+    // Build the canonical long token sequence ONCE. Each ISL bucket queries
+    // a prefix of this sequence (so they all share the same trie chain).
+    // Token IDs are unique-per-position to avoid accidental hash collisions
+    // between blocks (a real conversation has highly varied tokens too).
+    auto fullTokens = std::make_shared<VecTokens>();
+    fullTokens->reserve(largestIsl);
+    for (SizeType32 i = 0; i < largestIsl; ++i)
+    {
+        fullTokens->push_back(i);
+    }
+
+    // Single insertion of the full sequence: addSequenceBatch claims the
+    // blocks, simulatePrefillCompletion marks prefill done, removeSequence
+    // hands the blocks to the reuse tree (because enableBlockReuse=true).
+    // After this point the entire 0..largestIsl chain lives in
+    // mCachedBlocksRoot and is queryable via findBlocksInReuseTreeByBlockKey.
+    {
+        LlmRequest::RequestIdType const reqId{1};
+        auto req = std::make_shared<LlmRequest>(reqId, maxNewTokens, fullTokens, samplingConfig, isStreaming);
+        kvCacheManager.addSequenceBatch({{{reqId, largestIsl, beamWidth}}}, {std::ref(*req)});
+        EXPECT_EQ(req->getContextCurrentPosition(), 0);
+        tensorrt_llm::testing::KvCacheManagerTestUtil::simulatePrefillCompletion(*req);
+        (void) kvCacheManager.removeSequence(reqId, req);
+    }
+
+    auto const windowSize = theOnlyWindowSize(kvCacheManager);
+
+    // Print the sweep header. std::cout flushes to gtest's captured stdout
+    // and shows up in --gtest_print_time output.
+    std::cout << "\n[FindBlocksPerf] tokens_per_block=" << tokensPerBlock
+              << " iters_per_isl=" << iterations
+              << " pool_blocks=" << blocksInPrimaryPool
+              << " largest_isl=" << largestIsl << "\n";
+    auto const headerSep = std::string(108, '-');
+    std::cout << headerSep << "\n";
+    std::cout << std::setw(10) << "isl_tok" << std::setw(12) << "prefix_blk" << std::setw(12) << "total_us"
+              << std::setw(12) << "lock_us" << std::setw(12) << "chop_us" << std::setw(12) << "keys_us"
+              << std::setw(12) << "walk_us" << std::setw(14) << "us_per_blk"
+              << "\n";
+    std::cout << headerSep << "\n";
+
+    for (auto const isl : islSweep)
+    {
+        VecTokens prefixTokens(fullTokens->begin(), fullTokens->begin() + isl);
+        BlockKey const prefixKey{prefixTokens};
+
+        // Warm-up: pulls the radix-tree nodes into L2/L3 and ensures the
+        // very first allocation doesn't skew the first measured iteration.
+        auto const warmup = kvCacheManager.findBlocksInReuseTreeByBlockKey(prefixKey, windowSize);
+        ASSERT_NE(warmup, nullptr) << "warm-up at isl=" << isl << " failed to find the leaf";
+
+        std::vector<double> totalMsSamples;
+        totalMsSamples.reserve(iterations);
+        double sumLockMs = 0.0;
+        double sumChopMs = 0.0;
+        double sumKeysMs = 0.0;
+        double sumWalkMs = 0.0;
+        int prefixBlocks = 0;
+
+        for (int it = 0; it < iterations; ++it)
+        {
+            auto const t0 = std::chrono::steady_clock::now();
+            auto const found = kvCacheManager.findBlocksInReuseTreeByBlockKey(prefixKey, windowSize);
+            auto const t1 = std::chrono::steady_clock::now();
+            ASSERT_NE(found, nullptr) << "isl=" << isl << " iter=" << it << " failed";
+
+            auto const& dbg = dbgFindBlocksInReuseTreeTiming();
+            ASSERT_TRUE(dbg.valid) << "isl=" << isl << " iter=" << it << " dbg not valid";
+            ASSERT_TRUE(dbg.foundLeaf) << "isl=" << isl << " iter=" << it << " did not find leaf";
+
+            totalMsSamples.push_back(std::chrono::duration<double, std::milli>(t1 - t0).count());
+            sumLockMs += dbg.lockWaitMs;
+            sumChopMs += dbg.chopMs;
+            sumKeysMs += dbg.keysBuildMs;
+            sumWalkMs += dbg.walkLoopMs;
+            prefixBlocks = dbg.numBlockKeys;
+        }
+
+        std::sort(totalMsSamples.begin(), totalMsSamples.end());
+        double const medianMs = totalMsSamples[totalMsSamples.size() / 2];
+        double const medianUs = medianMs * 1000.0;
+        double const meanLockUs = (sumLockMs / iterations) * 1000.0;
+        double const meanChopUs = (sumChopMs / iterations) * 1000.0;
+        double const meanKeysUs = (sumKeysMs / iterations) * 1000.0;
+        double const meanWalkUs = (sumWalkMs / iterations) * 1000.0;
+        double const usPerBlk = prefixBlocks > 0 ? (medianUs / prefixBlocks) : 0.0;
+
+        std::cout << std::setw(10) << isl << std::setw(12) << prefixBlocks << std::fixed << std::setprecision(1)
+                  << std::setw(12) << medianUs << std::setw(12) << meanLockUs << std::setw(12) << meanChopUs
+                  << std::setw(12) << meanKeysUs << std::setw(12) << meanWalkUs << std::setprecision(3)
+                  << std::setw(14) << usPerBlk << "\n";
+    }
+    std::cout << headerSep << "\n";
+    std::cout << "[FindBlocksPerf] total_us = median of " << iterations
+              << " calls; phase columns are means across all iters.\n"
+              << "[FindBlocksPerf] sub-phase fields come from "
+                 "tensorrt_llm::batch_manager::kv_cache_manager::dbgFindBlocksInReuseTreeTiming()\n";
+
+    // Correctness sanity check: at the largest ISL, the walk must have
+    // descended the expected number of blocks. Guards against silently
+    // failing measurements (e.g. if the trie got partially evicted).
+    {
+        VecTokens prefixTokens(fullTokens->begin(), fullTokens->end());
+        BlockKey const prefixKey{prefixTokens};
+        auto const found = kvCacheManager.findBlocksInReuseTreeByBlockKey(prefixKey, windowSize);
+        ASSERT_NE(found, nullptr);
+        auto const& dbg = dbgFindBlocksInReuseTreeTiming();
+        EXPECT_EQ(dbg.numBlockKeys, largestBlocks);
+        EXPECT_EQ(dbg.numTokensInKey, largestIsl);
+        EXPECT_TRUE(dbg.foundLeaf);
+    }
 }
 
 #ifdef ENABLE_FP4

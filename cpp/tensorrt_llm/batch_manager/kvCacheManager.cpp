@@ -20,6 +20,7 @@
 #include "tensorrt_llm/batch_manager/common.h"
 #include "tensorrt_llm/batch_manager/evictionPolicy.h"
 #include "tensorrt_llm/batch_manager/kvCacheTransferManager.h"
+#include "tensorrt_llm/batch_manager/kvCacheUtils.h"
 #include "tensorrt_llm/batch_manager/radixBlockTree.h"
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/cudaUtils.h"
@@ -35,6 +36,7 @@
 #include "tensorrt_llm/runtime/worldConfig.h"
 
 #include <algorithm>
+#include <chrono>
 #include <limits>
 #include <map>
 #include <optional>
@@ -1883,30 +1885,76 @@ bool WindowBlockManager::blockInRadixTree(BlockPtr const& block)
 
 std::shared_ptr<KVCacheBlock> WindowBlockManager::findBlocksInReuseTreeByBlockKey(BlockKey const& blockKey)
 {
+    // [TTFT-INVESTIGATION 2026-05-23] Sub-phase wall-clock timing for this
+    // function (the disagg-only hot path identified in FINDINGS_RWLT_0522.md
+    // as accounting for >99% of ctx-side blockrange_ms at large ISL). The
+    // dbg struct is thread_local and overwritten on every call; readers
+    // (currently only the FindBlocksInReuseTreeByBlockKeyPerfTest unit test)
+    // must consume it immediately after this call returns. The lock is held
+    // around the entire body, so any cost attributed to chop / keysBuild /
+    // walkLoop is also the time spent blocking concurrent storeBlocks /
+    // loadOrAllocateBlocks calls on this WindowBlockManager.
+    auto& dbg = dbgFindBlocksInReuseTreeTiming();
+    dbg = {};
+    dbg.numTokensInKey = static_cast<int>(blockKey.uniqueTokens.size());
+
+    auto const tLock0 = std::chrono::steady_clock::now();
     std::lock_guard<std::mutex> lock(mCachedBlocksRootMutex);
+    auto const tLock1 = std::chrono::steady_clock::now();
     auto blockedUniqueTokens
         = chopVectorIntoBlocks<UniqueToken>(blockKey.uniqueTokens, blockKey.uniqueTokens.size(), mTokensPerBlock, true);
+    auto const tChop1 = std::chrono::steady_clock::now();
 
-    std::vector<BlockKey> blockKeys;
+    // Build a single reusable per-block lookup key by copying only the
+    // small scalar / extraKeys fields from the input once. uniqueTokens is
+    // re-bound inside the walk loop below to the current block's slice
+    // (a cheap VecUniqueTokens copy of size <= mTokensPerBlock).
+    //
+    // The previous implementation materialized a std::vector<BlockKey>
+    // via `blockKeys.push_back(blockKey); blockKeys.back().uniqueTokens =
+    // ...`, which copied the input's full uniqueTokens (size =
+    // prefix_tokens) on every iteration only to overwrite it on the next
+    // line -- O(prefix_blocks^2) total work. The
+    // FindBlocksInReuseTreeByBlockKeyPerfTest before-fix measurement
+    // attributed 93-99% of total wall time to this loop across all
+    // measured ISLs (181 ms at 1024 prefix_blocks alone). See
+    // FINDINGS_RWLT_0522.md for the original disagg-side observation.
+    BlockKey lookupKey;
+    lookupKey.usesExtraIds = blockKey.usesExtraIds;
+    lookupKey.loraTaskId = blockKey.loraTaskId;
+    lookupKey.extraKeys = blockKey.extraKeys;
+    lookupKey.cacheSaltID = blockKey.cacheSaltID;
+    auto const tKeys1 = std::chrono::steady_clock::now();
+
+    auto const finalize = [&](bool foundLeaf)
+    {
+        auto const tEnd = std::chrono::steady_clock::now();
+        dbg.lockWaitMs = std::chrono::duration<double, std::milli>(tLock1 - tLock0).count();
+        dbg.chopMs = std::chrono::duration<double, std::milli>(tChop1 - tLock1).count();
+        dbg.keysBuildMs = std::chrono::duration<double, std::milli>(tKeys1 - tChop1).count();
+        dbg.walkLoopMs = std::chrono::duration<double, std::milli>(tEnd - tKeys1).count();
+        dbg.numBlockKeys = static_cast<int>(blockedUniqueTokens.size());
+        dbg.foundLeaf = foundLeaf;
+        dbg.valid = true;
+    };
+
+    auto searchRoot = mCachedBlocksRoot;
     for (auto const& blockedUniqueTokensList : blockedUniqueTokens)
     {
-        blockKeys.push_back(blockKey);
-        blockKeys.back().uniqueTokens = blockedUniqueTokensList;
-    }
-    auto searchRoot = mCachedBlocksRoot;
-    for (auto const& blockKey : blockKeys)
-    {
+        lookupKey.uniqueTokens = blockedUniqueTokensList;
         auto [partialMatch, numMatched, matchingBlock] = searchRoot != nullptr
-            ? searchRoot->findMatchingBlock(blockKey, true, true)
+            ? searchRoot->findMatchingBlock(lookupKey, true, true)
             : std::make_tuple(false, 0, nullptr);
 
         if (matchingBlock == nullptr)
         {
+            finalize(/*foundLeaf=*/false);
             return nullptr;
         }
 
         searchRoot = std::move(matchingBlock);
     }
+    finalize(/*foundLeaf=*/true);
     return searchRoot;
 }
 
