@@ -206,39 +206,61 @@ inline __device__ __host__ T divUp(T m, T n)
     return (m + n - 1) / n;
 }
 
-// A helper function to tune the grid configuration for fused oneshot and rmsnorm kernels.
+// A helper function to tune the grid configuration for fused oneshot and RMSNorm kernels.
 // Return (block_size, cluster_size, loads_per_thread).
 template <bool UseCluster>
 std::tuple<int, int, int> adjustGridConfig(int numTokens, int dim, int eltsPerThread)
 {
+    // Step 1: Start from the widest cluster we are willing to launch. The caller can request a no-CGA
+    // fallback for multi-load RMSNorm rows, in which case the cluster width stays at one CTA.
     int clusterSize = UseCluster ? 8 : 1;
     int blockSize = 128;
-    // ========================== Adjust the grid configuration ==========================
     int threadsNeeded = divUp(dim, eltsPerThread);
     int loadsPerThread = 1;
 
     blockSize = divUp(threadsNeeded, clusterSize);
     if constexpr (UseCluster)
     {
+        // Step 2: Shrink the cluster until the hidden dimension partitions cleanly across CTAs.
+        // This keeps each CTA responsible for an integral chunk of packed elements.
         while (threadsNeeded % clusterSize != 0 && clusterSize > 1)
         {
             clusterSize /= 2;
         }
+        int const maxDivisibleClusterSize = clusterSize;
         blockSize = divUp(threadsNeeded, clusterSize);
+        // Step 3: If divisibility leaves each CTA too small, trade cluster width for at least
+        // a 128-thread CTA. This improves occupancy and avoids tiny CTAs when the row is narrow.
         while (blockSize < 128 && clusterSize >= 2)
         {
             blockSize *= 2;
             clusterSize /= 2;
         }
         int smCount = getMultiProcessorCount();
+        // Step 4: If the token grid already has enough CTAs to cover the GPU, reduce cluster
+        // width and make CTAs larger. This avoids over-partitioning one token across too many CTAs.
         while (numTokens * clusterSize > smCount && clusterSize > 1 && blockSize <= 512)
         {
             blockSize *= 2;
             clusterSize /= 2;
         }
+        // Step 5: If the token grid still underfills the GPU, restore cluster width up to the
+        // divisibility limit. We accept 64-thread CTAs here to expose more CTAs per token.
+        while (clusterSize < maxDivisibleClusterSize)
+        {
+            int const candidateClusterSize = clusterSize * 2;
+            int const candidateBlockSize = divUp(threadsNeeded, candidateClusterSize);
+            if (candidateBlockSize < 64 || numTokens * candidateClusterSize > smCount)
+            {
+                break;
+            }
+            clusterSize = candidateClusterSize;
+            blockSize = candidateBlockSize;
+        }
     }
 
-    // Trying to scale up use multiple loads or CGA
+    // Step 6: For very wide rows, first increase cluster width on SM90+ and then increase
+    // per-thread loads. The goal is to keep block_size within CUDA's 1024-thread limit.
     while (blockSize > 1024)
     {
         if constexpr (UseCluster)
@@ -273,14 +295,6 @@ std::tuple<int, int, int> adjustGridConfig(int numTokens, int dim, int eltsPerTh
         blockSize = divUp(threadsNeeded, clusterSize * loadsPerThread);
     }
 
-    if constexpr (UseCluster)
-    {
-        while (blockSize > 1024 && loadsPerThread < 8)
-        {
-            loadsPerThread += 1;
-            blockSize = divUp(threadsNeeded, clusterSize * loadsPerThread);
-        }
-    }
     return {blockSize, clusterSize, loadsPerThread};
 }
 
