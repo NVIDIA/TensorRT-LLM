@@ -5,14 +5,11 @@
 import copy
 import gc
 import json
-import multiprocessing
 import os
 import time
-from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple, Union
 
-import psutil
 import safetensors.torch
 import torch
 import torch.distributed as dist
@@ -20,12 +17,12 @@ from transformers import Gemma3ForConditionalGeneration, GemmaTokenizerFast
 
 from tensorrt_llm._torch.utils import make_weak_ref
 from tensorrt_llm._torch.visual_gen.cache.teacache import CacheContext
+from tensorrt_llm._torch.visual_gen.checkpoints.prefetch import prefetch_files_to_host_cache
 from tensorrt_llm._torch.visual_gen.cuda_graph_runner import CUDAGraphRunner, CUDAGraphRunnerConfig
 from tensorrt_llm._torch.visual_gen.output import CudaPhaseTimer, PipelineOutput
 from tensorrt_llm._torch.visual_gen.pipeline import BasePipeline, ExtraParamSchema
 from tensorrt_llm._torch.visual_gen.pipeline_registry import PipelineComponent, register_pipeline
 from tensorrt_llm._torch.visual_gen.utils import postprocess_video_tensor
-from tensorrt_llm._utils import local_mpi_barrier, local_mpi_rank, local_mpi_size
 from tensorrt_llm.logger import logger
 
 from .ltx2_core.audio_vae import AudioDecoderConfigurator, VocoderConfigurator, decode_audio
@@ -156,63 +153,20 @@ def _assert_resolution(height: int, width: int, *, is_two_stage: bool = False) -
 
 
 _LTX2_PREFETCHED_SAFETENSORS: Set[str] = set()
-_LTX2_PREFETCH_CHUNK_SIZE = 16 * 1024 * 1024
 
 
-def _prefetch_ltx2_file(file_name: str) -> None:
-    if not os.path.exists(file_name):
-        return
-
-    logger.info(f"Prefetching LTX-2 checkpoint file {file_name} to host page cache...")
-    with open(file_name, "rb") as f:
-        while f.read(_LTX2_PREFETCH_CHUNK_SIZE):
-            pass
-    logger.info(f"Finished prefetching LTX-2 checkpoint file {file_name}.")
-
-
-def _prefetch_ltx2_safetensors_files(file_names: List[str]) -> None:
+def _prefetch_ltx2_safetensors_files(file_names: List[str]) -> bool:
     """Warm LTX-2 safetensors files in the host page cache.
 
-    For multi-GPU runs, local ranks split the file list and synchronize before
+    For distributed runs, local ranks split the file list and synchronize before
     weight loading so ranks do not duplicate the prefetch work on the same node.
     """
-    paths: List[str] = []
-    seen: Set[str] = set()
-    for file_name in file_names:
-        path = os.path.abspath(file_name)
-        if path not in seen:
-            paths.append(path)
-            seen.add(path)
-
-    paths = [path for path in paths if path not in _LTX2_PREFETCHED_SAFETENSORS]
-    try:
-        if not paths:
-            return
-
-        prefetch_size = sum(os.path.getsize(path) for path in paths if os.path.exists(path))
-        available_memory = psutil.virtual_memory().available
-        if prefetch_size >= available_memory * 0.9:
-            logger.info(
-                "Skipping LTX-2 checkpoint prefetch because files require "
-                f"{prefetch_size / (1024**3):.2f}GB and available host memory is "
-                f"{available_memory / (1024**3):.2f}GB."
-            )
-            return
-
-        local_paths = paths[local_mpi_rank() :: local_mpi_size()]
-        if local_paths:
-            logger.info(
-                f"Prefetching {prefetch_size / (1024**3):.2f}GB LTX-2 checkpoint "
-                "files across local ranks."
-            )
-            max_workers = min(multiprocessing.cpu_count() * 2, 16, len(local_paths))
-            with ThreadPoolExecutor(max_workers=max_workers) as executor:
-                list(executor.map(_prefetch_ltx2_file, local_paths))
-    except Exception as exc:
-        logger.warning(f"LTX-2 checkpoint prefetch failed; continuing without prefetch: {exc}")
-    finally:
-        _LTX2_PREFETCHED_SAFETENSORS.update(paths)
-        local_mpi_barrier()
+    return prefetch_files_to_host_cache(
+        file_names,
+        description="LTX-2 checkpoint",
+        prefetched_paths=_LTX2_PREFETCHED_SAFETENSORS,
+        ignore_errors=True,
+    )
 
 
 def _load_ltx2_transformer_weights(
