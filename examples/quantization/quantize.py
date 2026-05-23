@@ -108,9 +108,9 @@ if __name__ == "__main__":
     parser.add_argument("--cp_size", type=int, default=1)
     parser.add_argument("--awq_block_size", type=int, default=128)
     parser.add_argument("--kv_cache_dtype",
-                        help="KV Cache dtype.",
+                        help="KV Cache dtype. Use 'nvfp4' only with --qformat fp8.",
                         default=None,
-                        choices=["int8", "fp8", None])
+                        choices=["int8", "fp8", "nvfp4", None])
     parser.add_argument("--quantize_lm_head",
                         action='store_true',
                         default=False)
