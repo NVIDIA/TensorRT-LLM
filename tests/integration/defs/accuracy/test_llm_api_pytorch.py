@@ -3774,9 +3774,8 @@ class TestDeepSeekV4Flash(LlmapiAccuracyTestHarness):
                  enable_attention_dp=True,
                  max_seq_len=4096,
                  kv_cache_config=kv_cache_config) as llm:
-            # Keep MMLU in smoke mode until a DeepSeek-V4-Flash reference is registered.
             task = MMLU(self.MODEL_NAME)
-            task.evaluate(llm, is_integration_test=True)
+            task.evaluate(llm)
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
 
