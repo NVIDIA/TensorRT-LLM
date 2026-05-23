@@ -1838,17 +1838,34 @@ class PyExecutor:
                         and req.py_disaggregated_params.schedule_style ==
                         DisaggScheduleStyle.GENERATION_FIRST
                         for req in self.active_requests)
-                    if num_fitting_reqs == 0 and not fitting_disagg_gen_init_requests:
-                        if not all_gen_first:
-                            logger.warning(
-                                "num_fitting_reqs=0 and fitting_disagg_gen_init_requests is empty, may not have enough kvCache"
-                            )
-                            self._check_disagg_ctx_cache_transfer_status(1)
-                        elif self.async_transfer_manager.has_any_inflight_requests(
-                        ):
-                            # Non-blocking cleanup of completed/timed-out
-                            # transfers to free KV blocks (see _executor_loop).
-                            self._check_disagg_ctx_cache_transfer_status(0)
+                    # The downstream C++ checkContextTransferStatus runs a
+                    # cross-rank gatherRequestIds collective on the ctx-side
+                    # comm (mGroupTPInDPComm with attention-DP, otherwise
+                    # mGroupTensorParaComm). Any rank-asymmetric gate here
+                    # (e.g. the previous `if num_fitting_reqs == 0` predicate,
+                    # which reads rank-local scheduler / async-transfer-manager
+                    # state and diverges in helix-CP setups by design) causes
+                    # ABBA deadlock against the next unconditional collective
+                    # on the same ranks (sampler NCCL ops, _can_queue's
+                    # tp_allgather, PP step boundary). All ctx-side ranks must
+                    # enter this call together, so the gate is intentionally
+                    # absent. at_least_num is rank-local and only affects the
+                    # per-request loop behavior inside the C++ function
+                    # (blockAll vs polling), which is safe to diverge --
+                    # mirrors bdfdf8be02's fix for
+                    # _check_disagg_gen_transfer_status. See PR #13713 CI
+                    # build #39569 helix test hang for the failure signature
+                    # on TestQwen3_8B::test_auto_dtype_with_helix
+                    # [pp1tp1cp4, pp1tp2cp2].
+                    at_least_num = 0
+                    if (num_fitting_reqs == 0
+                            and not fitting_disagg_gen_init_requests
+                            and not all_gen_first):
+                        logger.warning(
+                            "num_fitting_reqs=0 and fitting_disagg_gen_init_requests is empty, may not have enough kvCache"
+                        )
+                        at_least_num = 1
+                    self._check_disagg_ctx_cache_transfer_status(at_least_num)
 
                 self.num_scheduled_requests = scheduled_batch.batch_size
 
@@ -2383,19 +2400,20 @@ class PyExecutor:
                 req.py_disaggregated_params and req.py_disaggregated_params.
                 schedule_style == DisaggScheduleStyle.GENERATION_FIRST
                 for req in self.active_requests)
-            if num_fitting_reqs == 0 and not fitting_disagg_gen_init_requests:
-                if not all_gen_first:
-                    logger.warning(
-                        "num_fitting_reqs=0 and fitting_disagg_gen_init_requests is empty, may not have enough kvCache"
-                    )
-                    self._check_disagg_ctx_cache_transfer_status(1)
-                elif self.async_transfer_manager.has_any_inflight_requests():
-                    # Non-blocking cleanup of completed/timed-out transfers
-                    # to free KV blocks. We avoid the blocking check because
-                    # gen-first requests may be waiting for peer info (which
-                    # would block indefinitely), but completed transfers must
-                    # still be reaped so that KV cache can be reclaimed.
-                    self._check_disagg_ctx_cache_transfer_status(0)
+            # Same rank-symmetric pattern as _executor_loop_pp above; see
+            # rationale comment there. The C++ gatherRequestIds collective
+            # inside checkContextTransferStatus must be entered by every
+            # ctx-side rank together. at_least_num is rank-local and safe
+            # to diverge (it only controls per-request loop behavior inside
+            # the C++ function, not collective entry).
+            at_least_num = 0
+            if (num_fitting_reqs == 0 and not fitting_disagg_gen_init_requests
+                    and not all_gen_first):
+                logger.warning(
+                    "num_fitting_reqs=0 and fitting_disagg_gen_init_requests is empty, may not have enough kvCache"
+                )
+                at_least_num = 1
+            self._check_disagg_ctx_cache_transfer_status(at_least_num)
 
             # In gen-only benchmark mode, all requests must fit in KV cache
             # simultaneously because generation requests do not release their
