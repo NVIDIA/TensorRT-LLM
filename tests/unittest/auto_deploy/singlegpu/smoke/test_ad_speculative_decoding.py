@@ -74,6 +74,9 @@ def test_super_mtp_smoke():
     experiment_config["args"]["attn_backend"] = "flashinfer"
     experiment_config["args"]["disable_overlap_scheduler"] = True
     experiment_config["args"]["compile_backend"] = "torch-simple"
+    experiment_config["args"].setdefault("transforms", {}).setdefault("compile_model", {})[
+        "piecewise_enabled"
+    ] = False
     experiment_config["args"]["max_num_tokens"] = 256
     experiment_config["prompt"]["batch_size"] = 1
     experiment_config["prompt"]["queries"] = test_prompt

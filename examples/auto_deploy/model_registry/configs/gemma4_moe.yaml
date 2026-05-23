@@ -24,7 +24,7 @@ transforms:
     num_batched_inputs: 8
     # Gemma4 image batches carry variable-length multimodal span tensors.
     # Piecewise CUDA graph currently sizes those buffers from text-only warmup.
-    piecewise_enabled: false
+    piecewise_enabled: true
   mlir_elementwise_fusion:
     enabled: true
   gather_logits_before_lm_head:

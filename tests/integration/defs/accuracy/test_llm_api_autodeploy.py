@@ -35,6 +35,22 @@ _AD_CONFIGS_DIR = (Path(get_llm_root()) / 'examples' / 'auto_deploy' /
                    'model_registry' / 'configs')
 _AD_MODEL_REGISTRY_DIR = Path(
     get_llm_root()) / 'examples' / 'auto_deploy' / 'model_registry'
+_PIECEWISE_COMPILE_BACKENDS = {"torch-cudagraph", "torch-opt"}
+
+
+def _disable_piecewise_for_non_piecewise_backend(config: dict,
+                                                 compile_backend: str) -> None:
+    if compile_backend in _PIECEWISE_COMPILE_BACKENDS:
+        return
+    config.setdefault("transforms",
+                      {}).setdefault("compile_model",
+                                     {})["piecewise_enabled"] = False
+
+
+def _disable_piecewise(config: dict) -> None:
+    config.setdefault("transforms",
+                      {}).setdefault("compile_model",
+                                     {})["piecewise_enabled"] = False
 
 
 def _load_ad_config(config_name):
@@ -67,8 +83,9 @@ def _get_registry_yaml_extra(model_name: str) -> tuple[list[str], int]:
 
 
 def _set_quant_config(llm, model_id: str) -> None:
-    """Set quant_config on *llm* based on *model_id* so the accuracy harness
-    can resolve the correct thresholds.
+    """Set quant_config on *llm* based on *model_id*.
+
+    This lets the accuracy harness resolve the correct thresholds.
     """
     QUANT_ALGO_BY_MODEL_ID = {
         "fp8": {
@@ -267,6 +284,8 @@ class TestLlama3_1_8B(LlmapiAccuracyTestHarness):
                 },
             },
         }
+        _disable_piecewise_for_non_piecewise_backend(
+            config, backend_cfg["compile_backend"])
         if enable_chunked_prefill:
             config["enable_chunked_prefill"] = True
             # NOTE: must be > max(tokens_per_block, max_batch_size)
@@ -368,6 +387,7 @@ class TestLlama3_1_8B_Instruct_Eagle3(LlmapiAccuracyTestHarness):
                 "torch_dtype": "bfloat16"
             },
         }
+        _disable_piecewise(kwargs)
 
         return kwargs
 
@@ -654,6 +674,8 @@ class TestNemotronSuperV3(LlmapiAccuracyTestHarness):
         kwargs["attn_backend"] = attn_backend
         kwargs.setdefault("transforms", {}).setdefault(
             "detect_sharding", {})["enable_attention_dp"] = enable_attention_dp
+        if enable_attention_dp:
+            _disable_piecewise(kwargs)
 
         print_memory_usage("test start")
         with AutoDeployLLM(model=model_path,
@@ -738,6 +760,7 @@ class TestNemotronSuperV3(LlmapiAccuracyTestHarness):
         # TODO: Fix. See: https://github.com/NVIDIA/TensorRT-LLM/issues/13133
         if attn_backend != "trtllm":
             kwargs["compile_backend"] = "torch-simple"
+            _disable_piecewise(kwargs)
 
         print(
             f"SuperV3 MTP params: world_size={world_size}, model_path={model_path}"
@@ -826,7 +849,7 @@ class TestNemotronUltraV3(LlmapiAccuracyTestHarness):
 
 
 class TestGLM4Flash(LlmapiAccuracyTestHarness):
-    """Accuracy regression tests for GLM-4.7-Flash variants"""
+    """Accuracy regression tests for GLM-4.7-Flash variants."""
 
     MODEL_NAME = "GLM-4.7-Flash"
     MODEL_PATH_BF16 = hf_id_to_local_model_dir("zai-org/GLM-4.7-Flash")
@@ -1439,7 +1462,11 @@ class TestModelRegistryAccuracy(LlmapiAccuracyTestHarness):
                      id="nvidia_Llama-3.1-Nemotron-Nano-8B-v1"),
         pytest.param(
             "Qwen/QwQ-32B",
-            {},
+            {"transforms": {
+                "compile_model": {
+                    "piecewise_enabled": False
+                }
+            }},
             [MMLU],
             marks=pytest.mark.skip_less_device_memory(80000),
             id="Qwen_QwQ-32B",
