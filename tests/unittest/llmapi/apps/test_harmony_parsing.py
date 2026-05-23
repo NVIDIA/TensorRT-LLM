@@ -269,6 +269,9 @@ class TestStreamingNonFunctionsToolCall:
 
         assert result is not None
         assert "content" in result
+        assert result["content"] == "Action plan:"
+        assert "<|channel|>" not in result["content"]
+        assert "<|end|>" not in result["content"]
         assert "tool_calls" not in result or result.get("tool_calls") == []
 
     def test_commentary_no_recipient_returns_preamble(self):
@@ -286,6 +289,9 @@ class TestStreamingNonFunctionsToolCall:
 
         assert result is not None
         assert "content" in result
+        assert result["content"] == "Step 1: ..."
+        assert "<|channel|>" not in result["content"]
+        assert "<|end|>" not in result["content"]
         assert "tool_calls" not in result or result.get("tool_calls") == []
 
 
@@ -422,6 +428,29 @@ class TestNonStreamingToolCallOnAnalysisChannel:
             recipient=recipient, content_text=text, content_type=content_type, channel=channel
         )
 
+    def test_nonstreaming_commentary_preamble_is_plain_content(self, adapter):
+        """Commentary preamble maps to plain OpenAI content, not Harmony syntax."""
+        msg = self._make_harmony_msg(
+            channel="commentary",
+            recipient=None,
+            text="hello",
+            content_type=None,
+        )
+        with patch.object(
+            adapter.encoding, "parse_messages_from_completion_tokens", return_value=[msg]
+        ):
+            result = adapter.harmony_output_to_openai(
+                harmony_output_tokens=[1, 2, 3],
+                available_tools=None,
+                tool_choice=None,
+            )
+
+        assert result["content"] == "hello"
+        assert result["tool_calls"] == []
+        assert "<|channel|>" not in result["content"]
+        assert "<|message|>" not in result["content"]
+        assert "<|end|>" not in result["content"]
+
     def test_nonstreaming_functions_tool_on_analysis_channel(self, adapter):
         """Functions.* tool call on analysis channel appears in tool_calls.
 
@@ -537,6 +566,40 @@ class TestNonStreamingToolCallOnAnalysisChannel:
         assert "reasoning" in result
         assert "Let me think" in result["reasoning"]
         assert "tool_calls" not in result or len(result.get("tool_calls", [])) == 0
+
+    def test_parse_failure_does_not_return_raw_harmony_text(self, adapter):
+        raw = "<|start|>assistant<|channel|>commentary<|message|>hello<|end|>"
+        with patch.object(
+            adapter.encoding,
+            "parse_messages_from_completion_tokens",
+            side_effect=ValueError("parse failed"),
+        ), patch.object(adapter, "_safe_decode_utf8", return_value=raw):
+            result = adapter.harmony_output_to_openai(
+                harmony_output_tokens=[1, 2, 3],
+                available_tools=None,
+                tool_choice=None,
+            )
+
+        assert result["content"] == "[Response processing failed - 3 tokens generated]"
+        assert "<|channel|>" not in result["content"]
+        assert "<|message|>" not in result["content"]
+        assert "<|end|>" not in result["content"]
+        assert result["_harmony_parsing_failed"] is True
+
+    def test_parse_failure_preserves_plain_decoded_text(self, adapter):
+        with patch.object(
+            adapter.encoding,
+            "parse_messages_from_completion_tokens",
+            side_effect=ValueError("parse failed"),
+        ), patch.object(adapter, "_safe_decode_utf8", return_value="plain answer"):
+            result = adapter.harmony_output_to_openai(
+                harmony_output_tokens=[1, 2, 3],
+                available_tools=None,
+                tool_choice=None,
+            )
+
+        assert result["content"] == "plain answer"
+        assert result["_harmony_parsing_failed"] is True
 
 
 class TestReasoningContentField:

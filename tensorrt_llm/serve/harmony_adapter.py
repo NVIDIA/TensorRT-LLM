@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import json
@@ -84,12 +85,12 @@ class HarmonyStreamState:
         self.tool_call_index = 0
         self.tokens_processed = 0
 
-        # Track channel states for token preservation
+        # Track channel states for routing parsed Harmony deltas
         self.has_preamble_content = False
         self.current_channel_state = None  # "analysis", "commentary_preamble", "commentary_tool", "final"
         self.generated_channels = [
         ]  # Track generated channels to avoid generating too many messages
-        self.channel_started = False  # Track if we've sent opening token for current channel
+        self.channel_started = False  # Track if current channel produced content
 
         # Track sent arguments for tool call streaming deltas
         self.sent_tool_arguments = {}  # tool_call_id -> sent_arguments_length
@@ -134,7 +135,7 @@ class HarmonyStreamState:
                                 "active", True):
                             tool_info["active"] = False
 
-                # Send closing token for previous channel
+                # Flush any pending delta for the previous channel
                 closing_delta = self._create_closing_token_delta()
                 if closing_delta:
                     raw_deltas.append(closing_delta)
@@ -241,12 +242,12 @@ class HarmonyStreamState:
         return self.parser.messages
 
     def _create_closing_token_delta(self) -> dict[str, Any] | None:
-        """Create closing token delta for channel transition."""
+        """Create any pending delta for a channel transition."""
         if not self.current_channel_state or not self.channel_started:
             return None
 
         if self.current_channel_state == "commentary_preamble":
-            return {"content": "<|end|>", "tool_calls": []}
+            return None
         elif self.current_channel_state == "final":
             return None  # No closing token needed for final content
 
@@ -328,29 +329,22 @@ class HarmonyStreamState:
                     }]
                 }
             else:
-                # Commentary preamble -> content with token preservation
+                # Commentary preamble -> visible content without Harmony control tokens.
                 self.has_preamble_content = True
                 self.current_channel_state = "commentary_preamble"
 
-                # Send opening token if this is the first content in this channel
                 if not self.channel_started:
                     self.channel_started = True
-                    return {
-                        "content":
-                        f"<|channel|>commentary<|message|>{self.parser.last_content_delta}",
-                        "tool_calls": []
-                    }
-                else:
-                    return {
-                        "content": self.parser.last_content_delta,
-                        "tool_calls": []
-                    }
+                return {
+                    "content": self.parser.last_content_delta,
+                    "tool_calls": []
+                }
 
         elif self.parser.current_channel == "final":
-            # Final channel -> content with token preservation
+            # Final channel -> visible content
             self.current_channel_state = "final"
 
-            # Send raw content directly (no special tokens for final channel)
+            # Send raw text directly.
             if self.has_preamble_content:
                 return {
                     "content": self.parser.last_content_delta,
@@ -419,8 +413,8 @@ class HarmonyStreamState:
 
     def finalize_request(self) -> dict[str, Any] | None:
         """
-        Finalize the request and return any remaining closing token delta.
-        Call this when the request is complete to ensure proper token closure.
+        Finalize the request and return any remaining channel delta.
+        Call this when the request is complete to flush parser state.
         """
         return self._create_closing_token_delta()
 
@@ -908,12 +902,12 @@ class HarmonyAdapter:
 
         content_parts = []
 
-        # Add preamble content using proper harmony format
+        # Add preamble content as plain OpenAI content. Harmony control tokens
+        # are protocol syntax and must not leak into user-visible content.
         if commentary_preambles:
             preamble_text = "\n".join(commentary_preambles).strip()
             if preamble_text:
-                content_parts.append(
-                    f"<|channel|>commentary<|message|>{preamble_text}<|end|>")
+                content_parts.append(preamble_text)
 
         # Add final content directly (no wrapping needed)
         if final_content.strip():
@@ -1204,20 +1198,20 @@ class HarmonyAdapter:
 
         except Exception as e:
             raw_text = self._safe_decode_utf8(harmony_output_tokens,
-                                              "HARMONY _OUTPUT: ")
+                                              "HARMONY_OUTPUT: ")
             logger.warning(
                 f"Failed to parse harmony output: {e}. Raw output: {raw_text}")
             logger.debug(f"Detailed error: {traceback.format_exc()}")
 
-            # Check if raw_text contains a decode error (fallback content)
+            fallback_content = f"[Response processing failed - {len(harmony_output_tokens)} tokens generated]"
             if "HARMONY_OUTPUT:" in raw_text:
-                # The raw text itself couldn't be decoded, create a safe fallback
-                fallback_content = f"[Response processing failed - {len(harmony_output_tokens)} tokens generated]"
                 logger.warning(
                     "Raw text decoding also failed, using fallback content")
-            else:
-                # Raw text was decoded successfully, use it
+            elif "<|" not in raw_text:
                 fallback_content = raw_text
+            else:
+                logger.warning(
+                    "Harmony parsing failed; suppressing raw Harmony text")
 
             return {
                 "role": "assistant",
@@ -1252,7 +1246,7 @@ class HarmonyAdapter:
         current_tool_call_name = None
         tool_call_buffer = ""
 
-        # Channel transition tracking for special tokens
+        # Channel transition tracking
         previous_channel = None
         commentary_preamble_started = False
         final_started = False
@@ -1262,14 +1256,12 @@ class HarmonyAdapter:
         for token in tokens:
             parser.process(token)
 
-            # Handle channel transitions for special tokens
+            # Handle channel transitions
             if parser.current_channel != previous_channel:
                 # Channel transition detected
 
                 # Close previous channel if needed
                 if previous_channel == "commentary" and commentary_preamble_started:
-                    # Close preamble with harmony end token
-                    deltas.append({"content": "<|end|>", "tool_calls": []})
                     commentary_preamble_started = False
                 elif previous_channel == "final" and final_started:
                     # No closing token needed for final content
@@ -1279,11 +1271,8 @@ class HarmonyAdapter:
                 if parser.current_channel == "commentary" and not (
                         parser.current_recipient
                         and "functions." in str(parser.current_recipient)):
-                    # Starting commentary preamble with harmony format
-                    deltas.append({
-                        "content": "<|channel|>commentary<|message|>",
-                        "tool_calls": []
-                    })
+                    # Starting commentary preamble. Harmony control tokens are
+                    # parser syntax, not OpenAI response content.
                     commentary_preamble_started = True
                 elif parser.current_channel == "final":
                     # No opening token needed for final content
@@ -1324,19 +1313,19 @@ class HarmonyAdapter:
                             }]
                         })
                     else:
-                        # Preamble content (already wrapped with special tokens)
+                        # Preamble content
                         deltas.append({
                             "content": parser.last_content_delta,
                             "tool_calls": []
                         })
 
                 elif parser.current_channel == "final":
-                    # Final content (already wrapped with special tokens)
+                    # Final content
                     deltas.append({"content": parser.last_content_delta})
 
         # Close any remaining open channels
         if commentary_preamble_started:
-            deltas.append({"content": "<|end|>", "tool_calls": []})
+            commentary_preamble_started = False
         # No closing needed for final content
 
         return deltas
