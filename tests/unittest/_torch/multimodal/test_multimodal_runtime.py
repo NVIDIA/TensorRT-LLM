@@ -781,7 +781,7 @@ class _FakeMultimodalInputProcessor(BaseMultimodalInputProcessor):
     def dtype(self):
         return torch.float32
 
-    def __call__(self, inputs, sampling_params):
+    def call_with_text_prompt(self, inputs, sampling_params):
         raise NotImplementedError("This fake only supports token queries.")
 
     def get_vocab_size(self):
