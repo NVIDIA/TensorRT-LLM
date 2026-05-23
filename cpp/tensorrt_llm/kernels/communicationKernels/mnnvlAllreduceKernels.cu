@@ -388,6 +388,55 @@ inline __device__ void accumulatePacked(float (&accum)[kELTS_PER_THREAD], Packed
     }
 }
 
+template <uint8_t WorldSize, int kRankChunk, typename T, typename PackedType, int kELTS_PER_THREAD>
+inline __device__ void accumulateLamportRanksChunked(
+    float (&accum)[kELTS_PER_THREAD], T const* input, int token, int tokenDim, int packedIdx)
+{
+    static_assert(kRankChunk > 0);
+    static_assert(WorldSize % kRankChunk == 0);
+
+#pragma unroll
+    for (int i = 0; i < kELTS_PER_THREAD; i++)
+    {
+        accum[i] = 0.F;
+    }
+
+#pragma unroll 1
+    for (int rankBase = 0; rankBase < WorldSize; rankBase += kRankChunk)
+    {
+        float chunkAccum[kELTS_PER_THREAD];
+        while (1)
+        {
+            bool valid = true;
+#pragma unroll
+            for (int i = 0; i < kELTS_PER_THREAD; i++)
+            {
+                chunkAccum[i] = 0.F;
+            }
+#pragma unroll
+            for (int rr = 0; rr < kRankChunk; rr++)
+            {
+                int const r = rankBase + rr;
+                auto loaded = loadPackedVolatile<PackedType>(
+                    &input[token * tokenDim * WorldSize + r * tokenDim + packedIdx * kELTS_PER_THREAD]);
+                PackedVec<PackedType, T> value;
+                value.packed = loaded.packed;
+                valid &= !isLamportDirty(loaded);
+                accumulatePacked<T, PackedType, kELTS_PER_THREAD>(chunkAccum, value);
+            }
+            if (valid)
+            {
+                break;
+            }
+        }
+#pragma unroll
+        for (int i = 0; i < kELTS_PER_THREAD; i++)
+        {
+            accum[i] += chunkAccum[i];
+        }
+    }
+}
+
 template <int Rank, uint8_t LocalRank, typename T, typename PackedType, int kELTS_PER_THREAD>
 inline __device__ void accumulateOneshotRank(float (&accum)[kELTS_PER_THREAD],
     PackedVec<PackedType, T> const* remoteValues, PackedVec<PackedType, T> const& localValue)
@@ -521,6 +570,7 @@ using detail::divUp;
 using detail::copyF4;
 using detail::MnnvlAllReduceKernelParams;
 using detail::sanitizeLamportPayload;
+using detail::accumulateLamportRanksChunked;
 using detail::reduceOneshotDeterministicFastPath;
 using detail::writeEpilogueOutput;
 
@@ -607,40 +657,12 @@ __global__ void __launch_bounds__(1024) oneshotAllreduceFusionKernel(MnnvlAllRed
     }
     else
     {
-        PackedVec<PackedType, float> valuesLamport[WorldSize];
-        while (1)
-        {
-            bool valid = true;
-#pragma unroll
-            for (int r = 0; r < WorldSize; r++)
-            {
-                auto loaded = loadPackedVolatile<PackedType>(&stagePtrLocal[token * params.tokenDim * WorldSize
-                    + r * params.tokenDim + packedIdx * kELTS_PER_THREAD]);
-                valuesLamport[r].packed = loaded.packed;
-                valid &= !isLamportDirty(loaded);
-            }
-            if (valid)
-            {
-                break;
-            }
-        }
-
-        auto values = reinterpret_cast<PackedVec<PackedType, T>*>(valuesLamport);
+        // Chunk Lamport polling so only a bounded rank set is live at once, avoiding register spills for large
+        // world sizes.
+        constexpr int kRankChunk = 8;
         float accum[kELTS_PER_THREAD];
-#pragma unroll
-        for (int i = 0; i < kELTS_PER_THREAD; i++)
-        {
-            accum[i] = 0.F;
-        }
-#pragma unroll
-        for (int r = 0; r < WorldSize; r++)
-        {
-#pragma unroll
-            for (int i = 0; i < kELTS_PER_THREAD; i++)
-            {
-                accum[i] += cuda_cast<float, T>(values[r].elements[i]);
-            }
-        }
+        accumulateLamportRanksChunked<WorldSize, kRankChunk, T, PackedType, kELTS_PER_THREAD>(
+            accum, stagePtrLocal, token, params.tokenDim, packedIdx);
 #pragma unroll
         for (int i = 0; i < kELTS_PER_THREAD; i++)
         {
@@ -903,42 +925,15 @@ __global__ __launch_bounds__(128) void twoshotAllreduceKernel(MnnvlAllReduceKern
     if (inBounds && (token % WorldSize) == params.rank)
     {
         int localToken = token / WorldSize;
-        float accum[kELTS_PER_THREAD] = {0.F};
-
-        // Use float as we only check each float value for validity
-        PackedVec<PackedType, float> valuesLamport[WorldSize];
-        while (1)
-        {
-            bool valid = true;
-#pragma unroll
-            for (int r = 0; r < WorldSize; r++)
-            {
-                auto loaded = loadPackedVolatile<PackedType>(&scatterBufLocal[localToken * params.tokenDim * WorldSize
-                    + r * params.tokenDim + packedIdx * kELTS_PER_THREAD]);
-                valuesLamport[r].packed = loaded.packed;
-                valid &= !isLamportDirty(loaded);
-            }
-            if (valid)
-            {
-                break;
-            }
-        }
-
-        // Now we view it as the value for reduction
-        auto values = reinterpret_cast<PackedVec<PackedType, T>*>(valuesLamport);
-#pragma unroll
-        for (int r = 0; r < WorldSize; r++)
-        {
-
-#pragma unroll
-            for (int i = 0; i < kELTS_PER_THREAD; i++)
-            {
-                accum[i] += cuda_cast<float, T>(values[r].elements[i]);
-            }
-        }
 
         // Store vectorized result
         PackedVec<PackedType, T> packedAccum;
+        // Chunk Lamport polling so only a bounded rank set is live at once, avoiding register spills for large
+        // world sizes.
+        constexpr int kRankChunk = WorldSize < 16 ? WorldSize : 16;
+        float accum[kELTS_PER_THREAD];
+        accumulateLamportRanksChunked<WorldSize, kRankChunk, T, PackedType, kELTS_PER_THREAD>(
+            accum, scatterBufLocal, localToken, params.tokenDim, packedIdx);
 #pragma unroll
         for (int i = 0; i < kELTS_PER_THREAD; i++)
         {
