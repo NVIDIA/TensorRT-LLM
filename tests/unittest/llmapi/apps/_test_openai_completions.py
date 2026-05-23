@@ -279,11 +279,13 @@ async def test_completion_stream_options(async_client: openai.AsyncOpenAI,
                                                        False,
                                                    })
     async for chunk in stream:
+        assert chunk.object == "text_completion"
         if chunk.choices[0].finish_reason is None:
             assert chunk.usage is None
         else:
             assert chunk.usage is None
             final_chunk = await stream.__anext__()
+            assert final_chunk.object == "text_completion"
             assert final_chunk.usage is not None
             assert final_chunk.usage.prompt_tokens > 0
             assert final_chunk.usage.completion_tokens > 0
@@ -306,6 +308,7 @@ async def test_completion_stream_options(async_client: openai.AsyncOpenAI,
                                                        True,
                                                    })
     async for chunk in stream:
+        assert chunk.object == "text_completion"
         assert chunk.usage is not None
         assert chunk.usage.prompt_tokens > 0
         assert chunk.usage.completion_tokens > 0
@@ -313,6 +316,7 @@ async def test_completion_stream_options(async_client: openai.AsyncOpenAI,
                                             chunk.usage.completion_tokens)
         if chunk.choices[0].finish_reason is not None:
             final_chunk = await stream.__anext__()
+            assert final_chunk.object == "text_completion"
             assert final_chunk.usage is not None
             assert final_chunk.usage.prompt_tokens > 0
             assert final_chunk.usage.completion_tokens > 0

@@ -549,9 +549,9 @@ def completion_stream_post_processor(rsp: DetokenizedGenerationResultBase,
         )
         rewrite_usage_info_from_ctx(final_usage, ctx_usage)
 
-        final_usage_chunk = ChatCompletionStreamResponse(choices=[],
-                                                         model=args.model,
-                                                         usage=final_usage)
+        final_usage_chunk = CompletionStreamResponse(choices=[],
+                                                     model=args.model,
+                                                     usage=final_usage)
         final_usage_data = final_usage_chunk.model_dump_json()
         res.append(f"data: {final_usage_data}\n\n")
     args.first_iteration = False
