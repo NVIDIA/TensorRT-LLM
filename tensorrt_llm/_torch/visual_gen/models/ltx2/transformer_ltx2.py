@@ -29,6 +29,7 @@ from tqdm import tqdm
 
 from tensorrt_llm._torch.modules.linear import Linear, WeightMode
 from tensorrt_llm._torch.modules.mlp import MLP
+from tensorrt_llm._torch.visual_gen.attention_backend.parallel import UlyssesAttention
 from tensorrt_llm._torch.visual_gen.attention_backend.utils import create_attention
 from tensorrt_llm._torch.visual_gen.modules.attention import Attention, QKVMode
 from tensorrt_llm._torch.visual_gen.quantization.loader import DynamicLinearWeightLoader
@@ -159,7 +160,6 @@ class LTX2Attention(Attention):
                     f"Ulysses cross-attn requires num_attention_heads ({H}) and "
                     f"num_key_value_heads ({H_kv}) divisible by ulysses_size ({U})"
                 )
-            from tensorrt_llm._torch.visual_gen.attention_backend.parallel import UlyssesAttention
 
             self._plain_cross_attn = self.attn  # base-class built at full H
             inner = create_attention(
