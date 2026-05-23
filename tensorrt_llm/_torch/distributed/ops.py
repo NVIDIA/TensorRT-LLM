@@ -29,6 +29,8 @@ from tensorrt_llm.plugin.plugin import CustomAllReduceHelper
 _NCCL_SYMMETRIC_ZERO_COPY: bool = (os.environ.get(
     "TLLM_NCCL_SYMMETRIC_ZERO_COPY", "1") == "1")
 
+_MNNVL_ONE_SHOT_THRESHOLD_BYTES = 64 * 1024 * 8 * 2
+
 _thread_local = threading.local()
 
 
@@ -566,8 +568,9 @@ class MNNVLAllReduce(nn.Module):
     def get_required_workspace_size(num_tokens: int, hidden_dim: int,
                                     group_size: int, dtype: torch.dtype) -> int:
         elem_size = torch.tensor([], dtype=dtype).element_size()
-        # This should match the heuristic in allreduceOp.cpp
-        is_one_shot = num_tokens * hidden_dim * group_size * elem_size <= 64 * 1024 * 8
+        # This should match the heuristic in allreduceOp.cpp.
+        is_one_shot = (num_tokens * hidden_dim * group_size * elem_size
+                       <= _MNNVL_ONE_SHOT_THRESHOLD_BYTES)
         if is_one_shot:
             # For one-shot, each rank needs to store num_tokens * group_size tokens
             workspace_size = num_tokens * hidden_dim * group_size * elem_size
