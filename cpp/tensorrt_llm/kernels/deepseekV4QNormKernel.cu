@@ -174,22 +174,14 @@ __global__ void deepseekV4QNormFusedKernel(T const* __restrict__ input, __nv_fp8
 
     sumSquares = warpReduceSum(sumSquares);
     float const normScale = rsqrtf(sumSquares / static_cast<float>(kHeadDim) + eps);
+    float const fp8Scale = normScale * quantScale;
 
     // First kPairsPerLane-1 iters land in the nope range -> FP8 STG.
-    //
-    // We deliberately round the post-norm value to T (bf16 or half) BEFORE
-    // applying quantScale so the FP8 cast sees the same input as the legacy
-    // two-kernel path (norm-bf16-store → reload → quant-scale → FP8). Skipping
-    // this round produces FP8 output that is mathematically more accurate but
-    // diverges from the bf16-trained MoE router; the resulting top-K drift
-    // costs ~9.5pp on GSM8K for DSv4-Flash and unbalances expert dispatch.
 #pragma unroll
     for (int i = 0; i < kPairsPerLane - 1; ++i)
     {
         int const pairIdx = i * kWarpSize + laneId;
-        auto const rounded = Vec2Traits<T>::fromFloat2(float2{values[i].x * normScale, values[i].y * normScale});
-        float2 reloaded = Vec2Traits<T>::toFloat2(rounded);
-        float2 scaled{reloaded.x * quantScale, reloaded.y * quantScale};
+        float2 scaled{values[i].x * fp8Scale, values[i].y * fp8Scale};
         nopeOutPair[pairIdx] = __nv_fp8x2_e4m3(scaled);
     }
 
