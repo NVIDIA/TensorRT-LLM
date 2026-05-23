@@ -278,11 +278,7 @@ def test_eagle_quant_config_remaps_excludes_from_drafter_mapping():
             }
 
     class DraftFactory:
-        def get_checkpoint_conversion_mapping(self):
-            return {r"^mtp\.": "model."}
-
-        def get_exclude_modules_conversion_mapping(self):
-            return {r"^mtp(?=\.|\*)": "model"}
+        _quant_exclude_conversion_mapping = {r"^mtp(?=\.|\*)": "model"}
 
     factory = object.__new__(EagleOneModelFactory)
     factory.speculative_config = Eagle3DecodingConfig(

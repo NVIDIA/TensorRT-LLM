@@ -46,22 +46,20 @@ from .factory import DynamicShape, ModelFactory, ModelFactoryRegistry, SubModule
 from .hf import AutoModelForCausalLMFactory
 
 
-def _apply_conversion_mapping(pattern: str, conversion_mapping: Dict[str, str]) -> str:
-    mapped_pattern = pattern
-    for regex, replacement in conversion_mapping.items():
-        mapped_pattern = re.sub(regex, replacement, mapped_pattern)
-    return mapped_pattern
-
-
-def _remap_exclude_modules_from_conversion_mapping(
-    exclude_modules: List[str],
-    conversion_mapping: Optional[Dict[str, str]],
+def get_module_names(
+    modules: List[str],
+    renamed_modules: Optional[Dict[str, str]],
 ) -> List[str]:
-    """Apply the drafter module name conversion to exclude patterns."""
-    if not conversion_mapping:
-        return exclude_modules
+    if not renamed_modules:
+        return modules
 
-    return [_apply_conversion_mapping(pattern, conversion_mapping) for pattern in exclude_modules]
+    mapped_modules = []
+    for module in modules:
+        mapped_module = module
+        for regex, replacement in renamed_modules.items():
+            mapped_module = re.sub(regex, replacement, mapped_module)
+        mapped_modules.append(mapped_module)
+    return mapped_modules
 
 
 @ModelFactoryRegistry.register("EagleDrafter")
@@ -99,19 +97,13 @@ class EagleDrafterFactory(AutoModelForCausalLMFactory):
 
         # Store module-name conversion mappings if present.
         self._checkpoint_conversion_mapping = getattr(model, "_checkpoint_conversion_mapping", None)
-        self._exclude_modules_conversion_mapping = getattr(
-            model, "_exclude_modules_conversion_mapping", None
+        self._quant_exclude_conversion_mapping = getattr(
+            model, "_quant_exclude_conversion_mapping", None
         )
 
         model.eval()
 
         return model
-
-    def get_checkpoint_conversion_mapping(self) -> Optional[Dict[str, str]]:
-        return getattr(self, "_checkpoint_conversion_mapping", None)
-
-    def get_exclude_modules_conversion_mapping(self) -> Optional[Dict[str, str]]:
-        return getattr(self, "_exclude_modules_conversion_mapping", None)
 
     def build_and_load_model(self, _device: DeviceLikeType) -> nn.Module:
         raise NotImplementedError(
@@ -404,13 +396,9 @@ class EagleOneModelFactory(ModelFactory):
         qcfg = dict(self.target_factory.get_quant_config())
         excluded = qcfg.get("exclude_modules")
         if excluded:
-            conversion_mapping = (
-                self.draft_factory.get_exclude_modules_conversion_mapping()
-                or self.draft_factory.get_checkpoint_conversion_mapping()
-            )
-            qcfg["exclude_modules"] = _remap_exclude_modules_from_conversion_mapping(
+            qcfg["exclude_modules"] = get_module_names(
                 list(excluded),
-                conversion_mapping,
+                getattr(self.draft_factory, "_quant_exclude_conversion_mapping", None),
             )
         return qcfg
 

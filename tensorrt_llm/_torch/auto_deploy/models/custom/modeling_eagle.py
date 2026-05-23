@@ -142,7 +142,7 @@ class EagleConfig(PretrainedConfig):
                 r"^mtp\.": "model.",
             },
             # Quantization excludes are glob patterns, so handle both mtp.* and mtp*.
-            "_exclude_modules_conversion_mapping": {
+            "_quant_exclude_conversion_mapping": {
                 r"^mtp(?=\.|\*)": "model",
             },
         },
@@ -617,8 +617,8 @@ class EagleDrafterForCausalLM(PreTrainedModel):
         self._checkpoint_conversion_mapping = getattr(
             config, "_checkpoint_conversion_mapping", None
         )
-        self._exclude_modules_conversion_mapping = getattr(
-            config, "_exclude_modules_conversion_mapping", None
+        self._quant_exclude_conversion_mapping = getattr(
+            config, "_quant_exclude_conversion_mapping", None
         )
 
         self.load_embedding_from_target = getattr(config, "load_embedding_from_target", False)
