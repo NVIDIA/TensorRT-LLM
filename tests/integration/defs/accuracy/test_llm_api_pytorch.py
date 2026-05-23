@@ -447,7 +447,7 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm, extra_acc_spec="use_sa_spec")
 
-    @skip_pre_hopper
+    @skip_pre_blackwell
     def test_eagle3_sa_dynamic_draft_len(self):
         pytorch_config = dict(
             max_batch_size=500,
@@ -563,7 +563,7 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm, extra_acc_spec="use_sa_spec")
 
-    @skip_pre_hopper
+    @skip_pre_blackwell
     def test_pard_dynamic_draft_len(self):
         draft_len_schedule = {50: 4, 200: 3, 350: 2}
         max_draft_len = 4
@@ -588,7 +588,7 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
 
-    @skip_pre_hopper
+    @skip_pre_blackwell
     def test_pard_sa_dynamic_draft_len(self):
         draft_len_schedule = {50: 4, 200: 3, 350: 2}
         max_draft_len = 4
@@ -609,7 +609,7 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
         with LLM(self.MODEL_PATH,
                  kv_cache_config=kv_cache_config,
                  enable_chunked_prefill=False,
-                 max_num_tokens=8192,
+                 max_num_tokens=16384,
                  **pytorch_config,
                  speculative_config=pard_config) as llm:
             task = GSM8K(self.MODEL_NAME)
@@ -638,6 +638,7 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
 
+    @skip_pre_blackwell
     def test_dflash_dynamic_draft_len(self):
         # DFlash uses a Qwen3-style draft with q/k_norm and 8K-wide cross-attn
         # context, so the per-layer rmsnorm row count scales as
@@ -661,6 +662,7 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
             draft_len_schedule=draft_len_schedule,
         )
         with LLM(model=target_model_dir,
+                 max_seq_len=8192,
                  **pytorch_config,
                  kv_cache_config=kv_cache_config,
                  speculative_config=spec_config) as llm:
@@ -724,7 +726,7 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
 
-    @skip_pre_hopper
+    @skip_pre_blackwell
     def test_suffix_automaton_dynamic_draft_len(self):
         draft_len_schedule = {50: 4, 200: 3, 350: 2}
         max_draft_len = 4
@@ -754,7 +756,7 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
 
-    @skip_pre_hopper
+    @skip_pre_blackwell
     def test_draft_target_dynamic_draft_len(self):
         draft_len_schedule = {50: 4, 200: 3, 350: 2}
         max_draft_len = 4
@@ -1994,6 +1996,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm, extra_acc_spec="use_sa_spec")
 
+    @skip_pre_blackwell
     @pytest.mark.skip_less_device_memory(60000)
     def test_mtp_dynamic_draft_len(self):
         draft_len_schedule = {50: 4, 200: 3, 350: 2}
@@ -2018,6 +2021,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
 
+    @skip_pre_blackwell
     @pytest.mark.skip_less_device_memory(60000)
     def test_mtp_sa_dynamic_draft_len(self):
         """Accuracy test for MTP + SA with dynamic draft length."""
@@ -2045,6 +2049,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm, extra_acc_spec="use_sa_spec")
 
+    @skip_pre_blackwell
     @pytest.mark.skip_less_device_memory(60000)
     def test_mtp_eagle_dynamic_draft_len(self):
         draft_len_schedule = {50: 4, 200: 3, 350: 2}
