@@ -16,6 +16,11 @@ def get_env_enable_pdl() -> bool:
 
 
 if platform.system() != "Windows":
+    # The default CuTe-DSL fused_add_rmsnorm in flashinfer >=0.6.8 raises
+    # cudaErrorLaunchFailure during CUDA-graph capture on Blackwell. The CUDA
+    # JIT path is graph-safe; flashinfer reads this env var at norm-module
+    # import time, so it must be set before `import flashinfer`.
+    os.environ.setdefault("FLASHINFER_USE_CUDA_NORM", "1")
     try:
         import flashinfer
         logger.info(f"flashinfer is available: {flashinfer.__version__}")

@@ -222,14 +222,18 @@ class DeepEP(Communication):
         else:
             # Post-quant dispatch (quantized data, nvfp4 only)
 
+            sf_dtype = None
             if hidden_states_sf is not None:
                 # Adapter between `hidden_states_sf` and DeepEP
                 # TODO: remove the adapter by adding dtype support to DeepEP
                 sf_dtype = hidden_states_sf.dtype
                 hidden_states_sf = hidden_states_sf.view(torch.float32)
 
+            # DeepEP `Buffer.dispatch` only wraps the receive payload as
+            # `(recv_x, recv_x_scales)` when an `x_scales` was supplied; with
+            # `hidden_states_sf=None` it returns a bare tensor instead.
             (
-                (hidden_states, hidden_states_sf),
+                recv_x,
                 recv_topk_idx,
                 token_final_scales,
                 num_recv_tokens_per_expert_list,
@@ -244,6 +248,10 @@ class DeepEP(Communication):
                 self.ep_size,
                 self.use_cuda_graph,
             )
+            if sf_dtype is not None:
+                hidden_states, hidden_states_sf = recv_x
+            else:
+                hidden_states, hidden_states_sf = recv_x, None
 
             padded, hidden_states, hidden_states_sf, token_selected_slots, token_final_scales = (
                 self._pad_empty_recv_tensors(
