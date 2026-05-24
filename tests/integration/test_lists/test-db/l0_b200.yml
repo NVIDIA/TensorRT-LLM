@@ -330,6 +330,7 @@ l0_b200:
   # custom_ops, smoke, transformations files) and pure-FP8 tests are covered
   # on Hopper (l0_h100.yml) and not duplicated here.
   - unittest/auto_deploy/singlegpu/custom_ops/attention/test_triton_paged_attention.py::TestSDPADispatch
+  - unittest/auto_deploy/singlegpu/custom_ops/mamba/test_flashinfer_mamba_cached_op.py
   - unittest/auto_deploy/singlegpu/custom_ops/moe/test_ad_moe_op.py
   - unittest/auto_deploy/singlegpu/custom_ops/moe/test_trtllm_moe.py
   - unittest/auto_deploy/singlegpu/custom_ops/quantization/test_quant.py
