@@ -41,7 +41,8 @@ from .llm_request import ExecutorResponse
 from .mamba_cache_manager import (BaseMambaCacheManager,
                                   CppMambaHybridCacheManager,
                                   MixedMambaHybridCacheManager,
-                                  use_cpp_mamba_cache_manager)
+                                  use_cpp_mamba_cache_manager,
+                                  use_py_mamba_cache_manager)
 from .model_engine import PyTorchModelEngine
 from .py_executor import PyExecutor
 from .resource_manager import (KVCacheManager, KVCacheManagerV2,
@@ -75,9 +76,14 @@ def get_kv_cache_manager_cls(model_config: ModelConfig,
     """Resolve the concrete KV cache manager class for ``model_config``.
 
     For hybrid mamba models the choice between ``Mixed`` (separate pools,
-    needed for disagg / TRTLLM_USE_CPP_MAMBA) and ``Cpp`` (unified pool with
-    block reuse) is made here. Callers that don't care about disagg can omit
-    ``is_disagg`` and get the unified-pool default.
+    needed for disagg / TRTLLM_USE_CPP_MAMBA / TRTLLM_USE_PY_MAMBA) and
+    ``Cpp`` (unified pool with block reuse) is made here. Callers that don't
+    care about disagg can omit ``is_disagg`` and get the unified-pool default.
+
+    Env-var overrides (agg mode only — disagg picks its inner impl via
+    ``cache_transceiver_config.transceiver_runtime``):
+      * ``TRTLLM_USE_CPP_MAMBA=1`` — Mixed manager with CppMambaCacheManager.
+      * ``TRTLLM_USE_PY_MAMBA=1``  — Mixed manager with PythonMambaCacheManager.
     """
     config = model_config.pretrained_config
     sparse_attn_config = model_config.sparse_attention_config
@@ -90,9 +96,30 @@ def get_kv_cache_manager_cls(model_config: ModelConfig,
             logger.info("Hybrid linear model has 0 mamba layers; using "
                         "KVCacheManager without mamba caching")
             return _non_hybrid_kv_cache_manager_cls(config, kv_cache_config)
-        if is_disagg or use_cpp_mamba_cache_manager():
+        if kv_cache_config.enable_block_reuse:
+            return CppMambaHybridCacheManager
+        if is_disagg or use_cpp_mamba_cache_manager(
+        ) or use_py_mamba_cache_manager():
             return MixedMambaHybridCacheManager
-        return CppMambaHybridCacheManager
+        default_cls = CppMambaHybridCacheManager
+        env_override = os.environ.get('TLLM_MAMBA_MANAGER_PREFERENCE', None)
+        if env_override is not None:
+            if env_override.upper() == 'MIXED':
+                logger.warning(
+                    "Environment variable TLLM_MAMBA_MANAGER_PREFERENCE=MIXED overrides the default Mamba cache manager to MixedMambaHybridCacheManager. This may lead to increased memory usage due to lack of block reuse, but can be necessary for disaggregated setups or to avoid potential issues with the C++ manager. Set TLLM_MAMBA_MANAGER_PREFERENCE=CPP to use the CppMambaHybridCacheManager instead, which is the default for non-disaggregated setups without block reuse explicitly disabled."
+                )
+                return MixedMambaHybridCacheManager
+            elif env_override.upper() == 'CPP':
+                logger.warning(
+                    "Environment variable TLLM_MAMBA_MANAGER_PREFERENCE=CPP overrides the default Mamba cache manager to CppMambaHybridCacheManager. This enables block reuse and can reduce memory usage, but may not be compatible with disaggregated setups. Set TLLM_MAMBA_MANAGER_PREFERENCE=MIXED to use the MixedMambaHybridCacheManager instead if you encounter issues with the C++ manager or are running in a disaggregated environment."
+                )
+                return CppMambaHybridCacheManager
+            else:
+                logger.warning(
+                    f"Unrecognized value for TLLM_MAMBA_MANAGER_PREFERENCE: {env_override}. "
+                    f"Expected 'CPP' or 'MIXED'. Using default {default_cls.__name__}."
+                )
+        return default_cls
     else:
         return _non_hybrid_kv_cache_manager_cls(config, kv_cache_config)
 
@@ -236,14 +263,16 @@ class KvCacheCreator:
                     "event buffer max size > 0, or cache transceiver. Falling back to KVCacheManager."
                 )
                 cls = KVCacheManager
-        # The V1-route hybrid mamba managers (disagg via TRTLLM_USE_CPP_MAMBA,
-        # or one-model speculative decoding) keep mamba state in a separate
-        # cache that doesn't honor block reuse. Warn at the routing site so
-        # users see the warning where the decision is actually made.
+        # The V1-route hybrid mamba managers (disagg, TRTLLM_USE_CPP_MAMBA,
+        # TRTLLM_USE_PY_MAMBA, or one-model speculative decoding) keep mamba
+        # state in a separate cache that doesn't honor block reuse. Warn at
+        # the routing site so users see the warning where the decision is
+        # actually made.
         if is_hybrid_linear(model_engine.model.model_config.pretrained_config) \
                 and self._kv_cache_config.enable_block_reuse:
             uses_v1_mamba_route = self._is_disagg \
                 or os.environ.get('TRTLLM_USE_CPP_MAMBA', '0') == '1' \
+                or os.environ.get('TRTLLM_USE_PY_MAMBA', '0') == '1' \
                 or self._speculative_config is not None
             if uses_v1_mamba_route:
                 logger.warning(
@@ -745,6 +774,7 @@ class KvCacheCreator:
             estimating_kv_cache=estimating_kv_cache,
             execution_stream=self._execution_stream,
             layer_mask=spec_dec_layer_mask,
+            is_disagg=self._is_disagg,
         )
 
         if not self._skip_est:
@@ -889,6 +919,7 @@ class KvCacheCreator:
             is_draft=True,
             layer_mask=spec_dec_layer_mask,
             num_layers=num_draft_layers,
+            is_disagg=self._is_disagg,
         )
 
     def _split_kv_cache_budget_for_draft(self) -> Optional[KvCacheConfig]:
@@ -1085,7 +1116,8 @@ def _create_kv_cache_manager(
         dtype: Optional[torch.dtype] = None,
         is_draft: Optional[bool] = None,
         layer_mask: Optional[List[bool]] = None,
-        num_layers: Optional[int] = None) -> KVCacheManager:
+        num_layers: Optional[int] = None,
+        is_disagg: bool = False) -> KVCacheManager:
     """
     Returns:
         A KVCacheManager instance for the given model engine or model config
@@ -1219,6 +1251,7 @@ def _create_kv_cache_manager(
             is_estimating_kv_cache=estimating_kv_cache,
             execution_stream=execution_stream,
             layer_mask=layer_mask,
+            is_disagg=is_disagg,
         )
     elif is_nemotron_hybrid(config):
         if max_beam_width > 1:
@@ -1262,14 +1295,25 @@ def _create_kv_cache_manager(
                         "using legacy MTP path")
             use_replay = False
 
-        # Replay Philox uses PTX cvt.rs.f16x2.f32 which needs sm >= 100.
+        # Replay Philox uses PTX cvt.rs.f16x2.f32 which needs 100 <= sm < 120.
         # Flashinfer has a SW fallback at any SM.
         if (stochastic_rounding
                 and mamba_params.mamba_ssm_cache_dtype == torch.float16
-                and sm < 100):
-            logger.info("Replay kernel Philox requires sm >= 100; "
+                and sm < 100 or sm in (120, 121)):
+            logger.info("Replay kernel Philox requires 100 <= sm < 120; "
                         "using legacy MTP path for stochastic rounding support")
             use_replay = False
+
+        # Use replay algorithm for mamba (default is off).
+        enforce_disable_replay = os.environ.get('TRTLLM_USE_MAMBA_REPLAY',
+                                                '0') == '0'
+        if enforce_disable_replay:
+            logger.info(
+                "Replay kernel is disabled by TRTLLM_USE_MAMBA_REPLAY=0")
+            use_replay = False
+        else:
+            logger.info(
+                "Replay kernel is not changed since TRTLLM_USE_MAMBA_REPLAY=1")
 
         kv_cache_manager = kv_cache_manager_cls(
             # mamba cache parameters
@@ -1384,6 +1428,7 @@ def _create_kv_cache_manager(
             is_estimating_kv_cache=estimating_kv_cache,
             execution_stream=execution_stream,
             layer_mask=layer_mask,
+            is_disagg=is_disagg,
         )
     # Note: Gemma4 KV sharing cache remapping is handled in Gemma4Attention
     # via cache_layer_idx — shared layers use target layer's index for
