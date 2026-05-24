@@ -1022,30 +1022,18 @@ void TrtGptModelInflightBatching::forwardAsync(RequestList const& activeRequests
         {
             prepareDisaggGenInitRequests(activeRequests, fittingDisaggGenInitRequests);
         }
-        // checkContextTransferStatus runs a cross-rank gatherRequestIds
-        // collective on the ctx-side comm. Entering it from a rank-local
-        // predicate (the previous `if (empty) ... checkContextTransferStatus(1,
-        // true)` gate) causes ABBA deadlock against the next unconditional
-        // collective on the same ranks. All ranks must enter this call
-        // together; ``atLeastNum`` is rank-local and only controls per-request
-        // blocking behavior inside the C++ function, which is safe to diverge.
-        // Mirrors 53a0692aa4 (Python ctx-side fix). See PR #13713 CI build
-        // #39604 failure of
-        // ``test_asymmetric_executor[llama-4proc-mpi_kvcache-90]``.
-        bool const nothingFitsLocally = fittingRequests.empty() && fittingDisaggGenInitRequests.empty();
-        if (nothingFitsLocally)
+        if (fittingRequests.empty() && fittingDisaggGenInitRequests.empty())
         {
             TLLM_LOG_WARNING(
                 "CapacityScheduler didn't schedule any requests in iteration %lu, "
                 "probably because of insufficient resources such as KV cache, "
                 "will try wait for KV cache transfer to complete",
                 mIterCounter);
-        }
-        if (mCacheTransceiver)
-        {
-            int const atLeastNum = nothingFitsLocally ? 1 : 0;
-            mCacheTransceiver->checkContextTransferStatus(atLeastNum, true);
-            // will free kvCache in next iteration when atLeastNum==1.
+            if (mCacheTransceiver)
+            {
+                mCacheTransceiver->checkContextTransferStatus(1, true);
+                // will free kvCache in next iteration.
+            }
         }
         std::tie(currRequests.contextRequests, currRequests.generationRequests)
             = (*mMicroBatchScheduler)(fittingRequests, mInflightReqIds, mMaxBatchSizeRuntime, mMaxNumTokensRuntime);
@@ -1654,33 +1642,28 @@ void TrtGptModelInflightBatching::checkDisaggGenTransferStatus(RequestList const
 
     auto timeStart = std::chrono::steady_clock::now();
 
-    // The downstream checkGenTransferStatus runs a cross-rank
-    // gatherRequestIds collective on the gen-side comm (mGroupTPInDPComm
-    // with attention-DP, otherwise mGroupTensorParaComm). Any
-    // rank-asymmetric gate here (the previous `if (needCheck)` predicate
-    // reads rank-local LlmRequest state from activeRequests) causes ABBA
-    // deadlock against the next unconditional collective on the same ranks
-    // (asymmetric_executor[llama-4proc-mpi_kvcache-90] CI failure path).
-    // All gen-side ranks must enter this call together; ``atLeastNum`` is
-    // rank-local and only affects the per-request loop behavior inside the
-    // C++ function (blockAll vs polling), which is safe to diverge.
-    // Mirrors bdfdf8be02's fix on the Python side
-    // (_check_disagg_gen_transfer_status). See PR #13713 CI build #39604.
-    auto const needCheckOne = !activeRequests.empty()
-        && std::all_of(activeRequests.begin(), activeRequests.end(),
+    // TODO:
+    auto const needCheck = std::any_of(activeRequests.begin(), activeRequests.end(),
+        [](auto const& req) { return req->isDisaggGenerationTransmissionInProgress(); });
+
+    if (needCheck)
+    {
+        auto const needCheckOne = std::all_of(activeRequests.begin(), activeRequests.end(),
             [](auto const& req) { return req->isDisaggGenerationTransmissionInProgress(); });
 
-    int atLeastNum = needCheckOne ? 1 : 0;
-    TLLM_LOG_DEBUG(
-        mpi::MpiComm::world().getRank(), "noPreppared requests, checkGenTransferStatus atLeastNum:%d", atLeastNum);
+        int atLeastNum = needCheckOne ? 1 : 0;
+        TLLM_LOG_DEBUG(
+            mpi::MpiComm::world().getRank(), "noPreppared requests, checkGenTransferStatus atLeastNum:%d", atLeastNum);
 
-    mCacheTransceiver->checkGenTransferStatus(atLeastNum);
+        mCacheTransceiver->checkGenTransferStatus(atLeastNum);
 
-    auto timeEnd = std::chrono::steady_clock::now();
-    auto duration = std::chrono::duration<float, std::milli>(timeEnd - timeStart).count();
-    TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(),
-        "no Prepare checkDisaggGenTransferStatus time:%f ms, needCheckOne:%d, activeRequests.size():%ld", duration,
-        needCheckOne, activeRequests.size());
+        auto timeEnd = std::chrono::steady_clock::now();
+        auto duration = std::chrono::duration<float, std::milli>(timeEnd - timeStart).count();
+        TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(),
+            "no Prepare checkDisaggGenTransferStatus time:%f ms, "
+            "needCheckOne:%d,needCheck:%ld,activeRequests.size():%ld",
+            duration, needCheckOne, needCheck, activeRequests.size());
+    }
 }
 
 void TrtGptModelInflightBatching::prepareDistGenBufferAndDecoder(RequestVector const& generationRequests)

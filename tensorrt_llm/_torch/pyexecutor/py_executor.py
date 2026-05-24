@@ -42,7 +42,6 @@ from tensorrt_llm.tools.profiler.host_profile_tools.host_profiler import (
     get_global_profiler, host_profiler_context)
 
 from ..distributed import Distributed
-from ..distributed.communicator import ReduceOp
 from ..expert_statistic import ExpertStatistic
 from ..models.modeling_llama import Llama4ForConditionalGeneration
 from ..models.modeling_utils import DecoderModelForCausalLM
@@ -1746,91 +1745,41 @@ class PyExecutor:
 
     def _pp_retry_until_can_schedule(self, scheduled_batch):
         """
-        Wait until every rank can run the scheduled batch, retrying:
+        If current rank cannot run the scheduled batch, it will retry following steps until it has enough KV cache resources or reach maximum retry count:
         1. Wait for cache transceiver to finish at least one cache transmission.
         2. Terminate requests that have finished context cache transmission.
-        3. Check if all ranks have enough KV cache resources to run the scheduled batch.
-
-        Must be entered by EVERY rank on EVERY call. The function performs
-        cross-rank consensus on ``scheduler.can_schedule`` (rank 0 already
-        knows it can schedule, having just propagated the result, but
-        participates so collective entry stays rank-symmetric). Any
-        rank-asymmetric exit -- early-return, raise, or the inner break --
-        causes ABBA deadlock against the next unconditional collective on
-        the same ranks (the ``_check_disagg_ctx_cache_transfer_status``
-        gatherRequestIds call at the end of ``_prepare_and_schedule_batch``,
-        ``_can_queue``'s ``tp_allgather``, or PP step-boundary collectives).
-        Mirrors bdfdf8be02 (gen-side ``_check_disagg_gen_transfer_status``)
-        and 53a0692aa4 (ctx-side ``_check_disagg_ctx_cache_transfer_status``
-        in ``_executor_loop`` / ``_executor_loop_pp``). See PR #13713 CI
-        build #39604 hang in
-        ``TestDeepSeekV3Lite::test_auto_dtype_with_helix[fifo_v2-...-pp2tp1cp2]``
-        and ``TestNemotron3Super120B::test_auto_dtype[use_py_transceiver=False]``.
+        3. Check if current rank has enough KV cache resources to run the scheduled batch.
         """
         scheduled_batch_requests = scheduled_batch.all_requests()
-
-        def _all_ranks_can_schedule() -> bool:
-            # Bool AND via min-reduce: False on any rank -> consensus False.
-            local = self.scheduler.can_schedule(scheduled_batch_requests)
-            if self.dist.world_size <= 1:
-                return local
-            return bool(self.dist.allreduce(int(local), op=ReduceOp.MIN))
-
-        if _all_ranks_can_schedule():
+        if self.scheduler.can_schedule(scheduled_batch_requests):
             return
 
-        # Only non-leader ranks log the warning -- rank 0 is here purely to
-        # keep collective entry symmetric.
-        if self.dist.rank != 0:
-            logger.warning(
-                "Cannot run first PP's schedule result due to limited KV cache resources. This may cause bubbles in the PP pipeline. Please consider increasing the KV cache size by setting `free_gpu_memory_fraction` to a larger value."
-            )
-
+        logger.warning(
+            "Cannot run first PP's schedule result due to limited KV cache resources. This may cause bubbles in the PP pipeline. Please consider increasing the KV cache size by setting `free_gpu_memory_fraction` to a larger value."
+        )
         if self.kv_cache_transceiver is None:
-            # Config-level predicate identical across ranks. All raise.
             raise RuntimeError(
                 "KV cache transceiver is not enabled, but current rank cannot run first PP's schedule result due to limited KV cache resources. This is not expected."
             )
-
-        # ``has_any_inflight_requests()`` tracks ctx-side outbound transfers
-        # only (``start_transfer`` is called from ``_send_kv_async``). On a
-        # gen-side process this is always False; the gen-side equivalent
-        # signal is ``not check_gen_transfer_complete()`` (mRequesterFutures
-        # non-empty in C++). Combine both, then OR-reduce across ranks so a
-        # gen-side process correctly waits on its own pending recvs instead
-        # of raising immediately.
-        local_has_inflight = (
-            self.async_transfer_manager.has_any_inflight_requests()
-            or not self.kv_cache_transceiver.check_gen_transfer_complete())
-        if self.dist.world_size > 1:
-            any_has_inflight = bool(
-                self.dist.allreduce(int(local_has_inflight), op=ReduceOp.MAX))
-        else:
-            any_has_inflight = local_has_inflight
-        if not any_has_inflight:
+        if not self.async_transfer_manager.has_any_inflight_requests():
             raise RuntimeError(
-                "No context cache transmission is in progress and no generation cache transfer is pending, but at least one rank cannot run first PP's schedule result due to limited KV cache resources. This is not expected."
+                "No context cache transmission is in progress, but current rank cannot run first PP's schedule result due to limited KV cache resources. This is not expected."
             )
-
         if self.enable_kv_cache_reuse and self._disagg_pp_termination_handler is not None:
-            # Config-level predicate identical across ranks. All raise.
             raise RuntimeError(
                 "Cannot terminate requests in cache transmission and release their KV cache resources when block reuse is enabled. Please consider increasing the KV cache size."
             )
 
         for retry_count in range(self.pp_scheduler_max_retry_count):
-            # Drain inside the loop BEFORE the consensus check so every rank
-            # enters the underlying gatherRequestIds collective on every
-            # iteration. 53a0692aa4 made this callsite rank-symmetric on
-            # collective entry, so the (1) is now safe for all ranks.
-            self._check_disagg_ctx_cache_transfer_status(1)
-            self._check_kv_transfer_timeout()
-
-            if _all_ranks_can_schedule():
+            if self.scheduler.can_schedule(scheduled_batch_requests):
                 break
             logger.debug(
                 f"Retrying to run first PP's schedule result ({retry_count + 1}/{self.pp_scheduler_max_retry_count})"
             )
+
+            # Let cache transceiver finish at least one cache transmission and release requests' KV cache resources
+            self._check_disagg_ctx_cache_transfer_status(1)
+            self._check_kv_transfer_timeout()
         else:
             raise RuntimeError(
                 f"Reach maximum PP retry count ({self.pp_scheduler_max_retry_count}) but still cannot run first PP's schedule result. Please consider increasing the KV cache size by setting `free_gpu_memory_fraction` to a larger value. Or you can set `TLLM_PP_SCHEDULER_MAX_RETRY_COUNT` to a larger value to allow more retries."
@@ -1872,16 +1821,9 @@ class PyExecutor:
                 # Stage 0: first PP rank schedules requests and propagates the result to all other PP ranks.
                 scheduled_batch, fitting_disagg_gen_init_requests, num_fitting_reqs = self._pp_schedule_and_propagate(
                     microbatch_id)
-                # Retry-until-all-ranks-can-schedule must run on EVERY rank
-                # so the cross-rank consensus inside (and the per-iteration
-                # _check_disagg_ctx_cache_transfer_status collective) stays
-                # rank-symmetric. Rank 0 already knows it can schedule
-                # (having just propagated the result); it short-circuits on
-                # the first consensus check when every other rank also
-                # agrees, otherwise it participates in lockstep with peers
-                # through the retry body.
-                self._pp_retry_until_can_schedule(scheduled_batch)
                 if self.dist.rank != 0:
+                    # Retry until current rank can run first PP's schedule result.
+                    self._pp_retry_until_can_schedule(scheduled_batch)
                     # Run scheduler locally because scheduler may change llm requests' state.
                     self.scheduler.schedule_request(self.active_requests,
                                                     self.inflight_req_ids)
