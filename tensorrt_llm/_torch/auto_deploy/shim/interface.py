@@ -447,6 +447,26 @@ class CachedSequenceInterface:
         # Exception: in replay mode intermediate_ssm_state_cache is omitted entirely from
         # get_cache_initializers and uses the function's default (None) via kwarg routing.
         use_replay = len(replay_old_x) > 0
+        if use_replay:
+            n = len(ssm_managed)
+            for lst, name in [
+                (replay_old_x, "replay_old_x"),
+                (replay_old_B, "replay_old_B"),
+                (replay_old_dt, "replay_old_dt"),
+                (replay_old_dA_cumsum, "replay_old_dA_cumsum"),
+            ]:
+                assert len(lst) == n, (
+                    f"Replay bundle mismatch: {name} has {len(lst)} entries, "
+                    f"expected {n} (== len(ssm_managed))"
+                )
+            assert len(replay_cache_buf_idx) == n, (
+                f"Replay bundle mismatch: replay_cache_buf_idx has {len(replay_cache_buf_idx)} "
+                f"entries, expected {n} (== len(ssm_managed))"
+            )
+            assert len(replay_prev_num_accepted) == n, (
+                f"Replay bundle mismatch: replay_prev_num_accepted has "
+                f"{len(replay_prev_num_accepted)} entries, expected {n} (== len(ssm_managed))"
+            )
         if self._spec_config is not None:
             if not use_replay:
                 assert len(ssm_spec) == len(ssm_managed), (
