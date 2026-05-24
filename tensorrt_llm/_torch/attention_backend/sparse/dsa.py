@@ -1020,6 +1020,32 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
                     dtype=torch.float32,
                     capture_graph=capture_graph,
                 )
+            # Resize radix aux scratch for new max_draft_tokens. Allocated
+            # unconditionally to mirror the __init__ path: even when
+            # enable_heuristic_topk=True the dispatcher can still fall back to
+            # the Radix path for small numColumns, so the buffers must follow
+            # the new max_num_sequences*(1+max_draft_tokens) bound or the
+            # kernel-side TORCH_CHECK in IndexerTopKOp.cpp (numel >=
+            # num_rows*blocks_per_row*index_topk) will fire on the next step.
+            _radix_max_blocks_per_row = 10
+            _radix_max_gen_tokens = self.max_num_sequences * (
+                1 + self.max_draft_tokens)
+            self.radix_aux_indices = self.get_empty(
+                self.cuda_graph_buffers,
+                (_radix_max_gen_tokens, _radix_max_blocks_per_row,
+                 self.num_sparse_topk),
+                cache_name="radix_aux_indices",
+                dtype=torch.int32,
+                capture_graph=capture_graph,
+            )
+            self.radix_aux_logits = self.get_empty(
+                self.cuda_graph_buffers,
+                (_radix_max_gen_tokens, _radix_max_blocks_per_row,
+                 self.num_sparse_topk),
+                cache_name="radix_aux_logits",
+                dtype=torch.float32,
+                capture_graph=capture_graph,
+            )
 
     def _get_pool_block_indices(self) -> torch.Tensor:
         """Extract memory pool block indices from host_kv_cache_block_offsets.

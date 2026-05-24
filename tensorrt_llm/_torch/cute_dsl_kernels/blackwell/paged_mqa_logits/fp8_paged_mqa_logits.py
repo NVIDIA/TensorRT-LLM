@@ -64,7 +64,7 @@ import cutlass.utils as utils
 import cutlass.utils.blackwell_helpers as sm100_utils
 from cutlass import Float16, Int32
 from cutlass._mlir import ir
-from cutlass._mlir.dialects import llvm, nvvm, vector
+from cutlass._mlir.dialects import llvm, vector
 from cutlass.cute.nvgpu import cpasync, tcgen05
 from cutlass.cutlass_dsl import dsl_user_op
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
@@ -1409,10 +1409,10 @@ class FP8MQALogitsKernel:
                                     w2 = w_cache[r0 + 2]
                                     w3 = w_cache[r0 + 3]
                                     s0x, s0y = cute.arch.fma_packed_f32x2(
-                                        (a0, a1), (w0, w1), (s0x, s0y), rnd=nvvm.RoundingModeKind.RN
+                                        (a0, a1), (w0, w1), (s0x, s0y), rnd="rn"
                                     )
                                     s1x, s1y = cute.arch.fma_packed_f32x2(
-                                        (a2, a3), (w2, w3), (s1x, s1y), rnd=nvvm.RoundingModeKind.RN
+                                        (a2, a3), (w2, w3), (s1x, s1y), rnd="rn"
                                     )
                             # SMEM-path: weights from shared mem
                             smem_h_start = max(0, NUM_W_IN_REG - i * subtile_n)
@@ -1448,10 +1448,10 @@ class FP8MQALogitsKernel:
                                     w2 = sW[(t * num_heads + h_g + 2, q_stage_local)]
                                     w3 = sW[(t * num_heads + h_g + 3, q_stage_local)]
                                     s0x, s0y = cute.arch.fma_packed_f32x2(
-                                        (a0, a1), (w0, w1), (s0x, s0y), rnd=nvvm.RoundingModeKind.RN
+                                        (a0, a1), (w0, w1), (s0x, s0y), rnd="rn"
                                     )
                                     s1x, s1y = cute.arch.fma_packed_f32x2(
-                                        (a2, a3), (w2, w3), (s1x, s1y), rnd=nvvm.RoundingModeKind.RN
+                                        (a2, a3), (w2, w3), (s1x, s1y), rnd="rn"
                                     )
                         if cutlass.const_expr(self.epi_dtype == cutlass.Float16):
                             ps_sum = add_f16x2(ps0, ps1)
@@ -1625,10 +1625,10 @@ class FP8MQALogitsKernel:
                                     w2 = w_cache[r0 + 2]
                                     w3 = w_cache[r0 + 3]
                                     s0x, s0y = cute.arch.fma_packed_f32x2(
-                                        (a0, a1), (w0, w1), (s0x, s0y), rnd=nvvm.RoundingModeKind.RN
+                                        (a0, a1), (w0, w1), (s0x, s0y), rnd="rn"
                                     )
                                     s1x, s1y = cute.arch.fma_packed_f32x2(
-                                        (a2, a3), (w2, w3), (s1x, s1y), rnd=nvvm.RoundingModeKind.RN
+                                        (a2, a3), (w2, w3), (s1x, s1y), rnd="rn"
                                     )
                             # SMEM-path
                             smem_h_start = max(0, NUM_W_IN_REG - i * subtile_n)
@@ -1664,10 +1664,10 @@ class FP8MQALogitsKernel:
                                     w2 = sW[(t * num_heads + h_g + 2, q_stage_local)]
                                     w3 = sW[(t * num_heads + h_g + 3, q_stage_local)]
                                     s0x, s0y = cute.arch.fma_packed_f32x2(
-                                        (a0, a1), (w0, w1), (s0x, s0y), rnd=nvvm.RoundingModeKind.RN
+                                        (a0, a1), (w0, w1), (s0x, s0y), rnd="rn"
                                     )
                                     s1x, s1y = cute.arch.fma_packed_f32x2(
-                                        (a2, a3), (w2, w3), (s1x, s1y), rnd=nvvm.RoundingModeKind.RN
+                                        (a2, a3), (w2, w3), (s1x, s1y), rnd="rn"
                                     )
                         if cutlass.const_expr(self.epi_dtype == cutlass.Float16):
                             ps_sum = add_f16x2(ps0, ps1)

@@ -26,6 +26,11 @@ l0_b200_ds:
   - unittest/_torch/attention/sparse/deepseek_v4/test_compressor_module.py TIMEOUT (90)
   - unittest/_torch/attention/sparse/deepseek_v4/test_compressor_tf32.py TIMEOUT (15)
   - unittest/_torch/custom_ops/test_deepseek_v4_q_norm.py TIMEOUT (15)
+  - unittest/_torch/thop/parallel/test_indexer_topk.py TIMEOUT (30)
+  - unittest/_torch/attention/sparse/dsa/test_dsa_indexer.py TIMEOUT (30)
+  - unittest/_torch/attention/sparse/dsa/test_dsa_sparse_mla.py TIMEOUT (30)
+  - unittest/_torch/thop/parallel/test_dsv3_fused_a_gemm.py
+  - unittest/_torch/thop/parallel/test_dsv3_router_gemm.py
   # ------------- Disaggregated transfer component tests (single GPU) ---------------
   - unittest/disaggregated/test_agent.py
   - unittest/disaggregated/test_agent_multi_backends.py
