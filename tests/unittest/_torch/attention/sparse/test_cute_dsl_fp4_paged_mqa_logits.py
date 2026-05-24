@@ -139,9 +139,45 @@ def cast_back_from_fp4(
 # ---------------------------------------------------------------------------
 
 
-def kv_cache_cast_to_fp4(x: torch.Tensor):
-    num_blocks, block_size, num_heads, head_dim = x.shape
+def _apply_utccp_chunk_layout(sf_per_block: torch.Tensor) -> torch.Tensor:
+    """Reorder SF tokens within each 128-token atom to UTCCP chunk layout.
+
+    Equivalent to the SMEM-side ``utccp_required_smem_warp_transpose``: maps
+    linear token order [t0, t1, ..., t127] to chunk order
+    [t0, t32, t64, t96, t1, t33, ...] per 128-int32 atom.
+
+    Math: ``sf_out[m*4 + k] = sf_in[k*32 + m]`` per atom.
+
+    Used when ``remove_online_sf_transpose=True`` so the kernel can skip the
+    runtime warp_transpose. Only valid when phys_block_kv == 128 (1 phys
+    block = 1 UTCCP atom of 128 tokens).
+    """
+    assert sf_per_block.size(-1) == 128, (
+        f"chunk layout requires atom_size=128 (phys_block_kv=128); got {sf_per_block.size(-1)}"
+    )
+    new_shape = sf_per_block.shape[:-1] + (128,)
+    return (
+        sf_per_block.reshape(*sf_per_block.shape[:-1], 4, 32)
+        .transpose(-1, -2)
+        .contiguous()
+        .reshape(*new_shape)
+    )
+
+
+def kv_cache_cast_to_fp4(x: torch.Tensor, remove_online_sf_transpose: bool = False):
+    # page_size here = phys_block_kv (tokens per physical KV page).
+    num_blocks, page_size, num_heads, head_dim = x.shape
     assert num_heads == 1 and head_dim == 128
+    # Mirror the kernel's graceful fallback: chunk layout only valid for
+    # page_size == 128 (1 phys page = 1 UTCCP atom of 128 tokens).
+    if remove_online_sf_transpose and page_size != 128:
+        print(
+            f"[kv_cache_cast_to_fp4] remove_online_sf_transpose=True ignored: "
+            f"requires page_size (phys_block_kv) == 128, got {page_size}. "
+            f"Falling back to False."
+        )
+        remove_online_sf_transpose = False
+
     x_scaled, sf = per_token_cast_to_fp4(
         x.view(-1, head_dim),
         use_ue8m0=True,
@@ -153,18 +189,25 @@ def kv_cache_cast_to_fp4(x: torch.Tensor):
         sf,
         gran_k=32,
         use_packed_ue8m0=True,
-    ).view(num_blocks, block_size, 1, head_dim)
+    ).view(num_blocks, page_size, 1, head_dim)
     x_fp4 = torch.empty(
-        (num_blocks, block_size * (head_dim // 2 + 4)),
+        (num_blocks, page_size * (head_dim // 2 + 4)),
         device=x.device,
         dtype=torch.uint8,
     )
-    x_fp4[:, : block_size * head_dim // 2] = x_scaled.view(
-        num_blocks, block_size * head_dim // 2
+    x_fp4[:, : page_size * head_dim // 2] = x_scaled.view(
+        num_blocks, page_size * head_dim // 2
     ).view(torch.uint8)
-    x_fp4[:, block_size * head_dim // 2 :] = sf.view(num_blocks, block_size).view(torch.uint8)
+
+    # Reorder SF tokens to UTCCP chunk layout (mirrors what the in-kernel
+    # warp_transpose would do at runtime), so the kernel can skip the
+    # runtime SMEM transpose when remove_online_sf_transpose=True.
+    sf_per_block = sf.view(num_blocks, page_size)  # (num_blocks, 128) int32
+    if remove_online_sf_transpose:
+        sf_per_block = _apply_utccp_chunk_layout(sf_per_block)
+    x_fp4[:, page_size * head_dim // 2 :] = sf_per_block.view(torch.uint8)
     return (
-        x_fp4.view(num_blocks, block_size, num_heads, head_dim // 2 + 4),
+        x_fp4.view(num_blocks, page_size, num_heads, head_dim // 2 + 4),
         x_cast_back.to(x.dtype),
     )
 
@@ -375,7 +418,15 @@ def test_cute_dsl_fp4_paged_mqa_logits(
     )
 
     # Quantize KV cache to fused FP4 layout.
-    kv_fused, kv_simulated = kv_cache_cast_to_fp4(kv_cache)
+    # Exercise the remove_online_sf_transpose path when supported (only valid
+    # for phys_block_kv=128). For other page sizes, both host helper and
+    # kernel silently fall back to False, but we skip enabling to avoid
+    # fallback print noise during the test sweep.
+    remove_online_sf_transpose = phys_block_kv == 128
+
+    kv_fused, kv_simulated = kv_cache_cast_to_fp4(
+        kv_cache, remove_online_sf_transpose=remove_online_sf_transpose
+    )
 
     # Schedule metadata. DG c491439e requires 2D context_lens, and block_kv
     # must be 64 to align metadata SPLIT_KV (= block_kv*4) with the compute
@@ -413,6 +464,7 @@ def test_cute_dsl_fp4_paged_mqa_logits(
         num_epi_subtiles=num_epi_subtiles,
         epi_dtype=epi_dtype,
         output_dtype=output_dtype,
+        remove_online_sf_transpose=remove_online_sf_transpose,
     )
 
     assert logits.dtype == output_dtype
@@ -641,6 +693,43 @@ def _generate_bench_data(
     }
 
 
+def _choose_atom_split(batch, ctx, next_n, num_sms=148, split_kv_tokens=256, tie="max_na"):
+    """Pick (num_atoms, atom_size) decomposition of next_n minimizing wave count;
+    tie-break configurable via `tie`:
+      - "max_na":  prefer LARGEST num_atoms = smallest atom = most SMs busy per
+                   wave; pays HBM cost of num_atoms× KV re-reads.
+      - "max_atom": prefer LARGEST atom = smallest num_atoms = least HBM cost;
+                    may leave SMs idle when ntask < num_sms.
+
+    Kernel natively supports atom ∈ {1, 2, 3}. For next_n not divisible by any
+    of these (e.g. next_n=4), caller-side atom-split splits Q dim into
+    num_atoms groups of atom_size each; KV is read num_atoms× (1× HBM cost
+    per atom).
+
+    Strategy:
+      1. Enumerate (num_atoms, atom) with num_atoms * atom == next_n,
+         atom ∈ {1, 2, 3}.
+      2. Compute waves = ceil(B * num_atoms * ceil(ctx / split_kv) / num_sms).
+      3. Pick min waves; tie-break per `tie` param.
+
+    Returns (num_atoms, atom)."""
+    cands = []
+    for atom in (1, 2, 3):
+        if next_n % atom == 0:
+            na = next_n // atom
+            ntask = batch * na * ((ctx + split_kv_tokens - 1) // split_kv_tokens)
+            waves = (ntask + num_sms - 1) // num_sms
+            cands.append((waves, na, atom))
+    if tie == "max_na":
+        cands.sort(key=lambda x: (x[0], -x[1]))  # min waves, then MAX na
+    elif tie == "max_atom":
+        cands.sort(key=lambda x: (x[0], x[1]))  # min waves, then MIN na (= max atom)
+    else:
+        raise ValueError(f"unknown tie={tie!r}; expected 'max_na' or 'max_atom'")
+    _, na, atom = cands[0]
+    return na, atom
+
+
 def benchmark_fp4_paged_mqa_logits(
     batch_sizes,
     next_ns,
@@ -677,8 +766,10 @@ def benchmark_fp4_paged_mqa_logits(
         f"num_epi_subtiles={num_epi_subtiles}  mode={mode_str}  block_kv={block_kv}"
     )
     hdr = (
-        f"{'batch':>5s} {'ctx':>7s} {'next_n':>6s} {'nblk':>7s} | "
-        f"{'DSL(us)':>8s} {'DG(us)':>8s} {'DG/DSL':>7s}"
+        f"{'batch':>5s} {'ctx':>7s} {'next_n':>6s} {'nblk':>7s} {'ntask':>6s} | "
+        f"{'maxAtom':>7s} {'DSL(us)':>8s} | "
+        f"{'maxNa':>5s} {'DSL(us)':>8s} {'max_atom/max_na':>15s} | "
+        f"{'DG(us)':>8s} {'DG/DSL_max_atom':>15s} {'DG/DSL_max_na':>13s}"
     )
     print(hdr)
     print("-" * len(hdr))
@@ -687,6 +778,30 @@ def benchmark_fp4_paged_mqa_logits(
         for context_len in context_lens:
             for batch_size in batch_sizes:
                 nblk = batch_size * ((context_len + block_kv - 1) // block_kv)
+                SPLIT_KV_TOKENS = 256
+                # Pick both atom-split strategies for A/B comparison:
+                #   max_atom (baseline): min waves, tie-break max atom (least HBM)
+                #   max_na (experimental): min waves, tie-break max num_atoms (more SMs busy)
+                na_base, atom_base = _choose_atom_split(
+                    batch_size,
+                    context_len,
+                    next_n,
+                    num_sms=num_sms,
+                    split_kv_tokens=SPLIT_KV_TOKENS,
+                    tie="max_atom",
+                )
+                na_exp, atom_exp = _choose_atom_split(
+                    batch_size,
+                    context_len,
+                    next_n,
+                    num_sms=num_sms,
+                    split_kv_tokens=SPLIT_KV_TOKENS,
+                    tie="max_na",
+                )
+                # ntask reflects baseline pick (matches existing log conventions).
+                ntask = (
+                    batch_size * na_base * ((context_len + SPLIT_KV_TOKENS - 1) // SPLIT_KV_TOKENS)
+                )
 
                 data = _generate_bench_data(
                     batch_size,
@@ -698,24 +813,38 @@ def benchmark_fp4_paged_mqa_logits(
                     varlen=varlen,
                 )
 
-                # FP4 kernel natively supports next_n ∈ {1, 2, 3}. For
-                # next_n == 4 we apply DG's caller-side atom-split:
-                # [B,4,H,D//2] → [2B,2,H,D//2], context_lens / block_table
-                # are repeated 2× (mirrors DeepGEMM's kNextNAtom=2; 2× HBM).
-                # See study-deepseek-v4/DeepGEMM/tests/test_attention_post_merge.py
-                # for the reference pattern.
-                if next_n == 4:
-                    exp_B = batch_size * 2
-                    dsl_q_fp4 = data["q_fp4"].reshape(exp_B, 2, num_heads, head_dim // 2)
-                    dsl_sf_q = data["sf_q"].reshape(exp_B, 2, num_heads)
-                    # weights [B*4, H] is layout-equivalent to [exp_B*2, H], unchanged.
-                    dsl_ctx_lens = data["context_lens"].repeat_interleave(2)
-                    dsl_block_table = data["block_table"].repeat_interleave(2, dim=0)
-                else:
-                    dsl_q_fp4 = data["q_fp4"]
-                    dsl_sf_q = data["sf_q"]
-                    dsl_ctx_lens = data["context_lens"]
-                    dsl_block_table = data["block_table"]
+                # Helper: reshape inputs per (na, atom). Returns dict of tensors.
+                # `data`, `batch_size`, `num_heads`, `head_dim` bound via default
+                # args for explicit early-binding (ruff F821 can't track deeply
+                # nested closure captures).
+                def _split(
+                    na,
+                    atom,
+                    data=data,
+                    batch_size=batch_size,
+                    num_heads=num_heads,
+                    head_dim=head_dim,
+                ):
+                    if na > 1:
+                        return {
+                            "q": data["q_fp4"].reshape(
+                                batch_size * na, atom, num_heads, head_dim // 2
+                            ),
+                            "sf_q": data["sf_q"].reshape(batch_size * na, atom, num_heads),
+                            "ctx_lens": data["context_lens"].repeat_interleave(na),
+                            "block_table": data["block_table"].repeat_interleave(na, dim=0),
+                        }
+                    return {
+                        "q": data["q_fp4"],
+                        "sf_q": data["sf_q"],
+                        "ctx_lens": data["context_lens"],
+                        "block_table": data["block_table"],
+                    }
+
+                base_t = _split(na_base, atom_base)
+                # Experimental only differs from baseline when strategies diverge.
+                strats_diverge = (na_base, atom_base) != (na_exp, atom_exp)
+                exp_t = _split(na_exp, atom_exp) if strats_diverge else base_t
 
                 # DG metadata: same convention as the FP8 bench. SPLIT_KV =
                 # block_kv * 4 must equal DSL's compute SPLIT_KV = 256, so
@@ -723,34 +852,60 @@ def benchmark_fp4_paged_mqa_logits(
                 # 2D `(exp_B, 1)` context_lens gives num_next_n_atoms=1 — the
                 # DSL kernel processes all real next_n positions in one atom.
                 DG_METADATA_BLOCK_KV = 64
-                dsl_schedule_meta = get_paged_mqa_logits_metadata(
-                    dsl_ctx_lens.unsqueeze(-1),
+                dsl_schedule_meta_base = get_paged_mqa_logits_metadata(
+                    base_t["ctx_lens"].unsqueeze(-1),
                     DG_METADATA_BLOCK_KV,
                     num_sms,
                 )
-
-                def dsl_fn(
-                    data=data,
-                    dsl_q_fp4=dsl_q_fp4,
-                    dsl_sf_q=dsl_sf_q,
-                    dsl_ctx_lens=dsl_ctx_lens,
-                    dsl_block_table=dsl_block_table,
-                ):
-                    torch.ops.trtllm.cute_dsl_fp4_paged_mqa_logits(
-                        dsl_q_fp4,
-                        dsl_sf_q,
-                        data["kv_fused"],
-                        data["weights"],
-                        dsl_ctx_lens,
-                        dsl_block_table,
-                        dsl_schedule_meta,
-                        data["max_model_len"],
-                        num_epi_subtiles=num_epi_subtiles,
-                        epi_dtype=epi_dtype,
-                        output_dtype=output_dtype,
+                dsl_schedule_meta_exp = (
+                    get_paged_mqa_logits_metadata(
+                        exp_t["ctx_lens"].unsqueeze(-1),
+                        DG_METADATA_BLOCK_KV,
+                        num_sms,
                     )
+                    if strats_diverge
+                    else dsl_schedule_meta_base
+                )
 
-                dsl_us = _bench_kineto(dsl_fn, "kernel_cutlass_kernel", num_iterations) * 1e6
+                def _make_dsl_fn(t, schedule_meta, data=data):
+                    def dsl_fn(t=t, schedule_meta=schedule_meta, data=data):
+                        torch.ops.trtllm.cute_dsl_fp4_paged_mqa_logits(
+                            t["q"],
+                            t["sf_q"],
+                            data["kv_fused"],
+                            data["weights"],
+                            t["ctx_lens"],
+                            t["block_table"],
+                            schedule_meta,
+                            data["max_model_len"],
+                            num_epi_subtiles=num_epi_subtiles,
+                            epi_dtype=epi_dtype,
+                            output_dtype=output_dtype,
+                        )
+
+                    return dsl_fn
+
+                # baseline (max_atom) and experimental (max_na) timing.
+                base_us = (
+                    _bench_kineto(
+                        _make_dsl_fn(base_t, dsl_schedule_meta_base),
+                        "kernel_cutlass_kernel",
+                        num_iterations,
+                    )
+                    * 1e6
+                )
+                if strats_diverge:
+                    exp_us = (
+                        _bench_kineto(
+                            _make_dsl_fn(exp_t, dsl_schedule_meta_exp),
+                            "kernel_cutlass_kernel",
+                            num_iterations,
+                        )
+                        * 1e6
+                    )
+                else:
+                    exp_us = base_us
+                strat_speedup = base_us / exp_us  # >1 = max_na faster
 
                 dg_us = None
                 try:
@@ -783,11 +938,17 @@ def benchmark_fp4_paged_mqa_logits(
                 except RuntimeError:
                     pass
 
-                ratio_str = f"{dg_us / dsl_us:6.3f}x" if dg_us else "   N/A "
+                # DG vs both DSL variants for direct comparison.
+                ratio_base_str = f"{dg_us / base_us:14.3f}x" if dg_us else "         N/A  "
+                ratio_exp_str = f"{dg_us / exp_us:12.3f}x" if dg_us else "       N/A  "
                 dg_str = f"{dg_us:7.1f}" if dg_us else "    N/A"
+                base_lab = f"{na_base}/{atom_base}"
+                exp_lab = f"{na_exp}/{atom_exp}"
                 print(
-                    f"{batch_size:5d} {context_len:7d} {next_n:6d} "
-                    f"{nblk:7d} | {dsl_us:7.1f} {dg_str} {ratio_str}"
+                    f"{batch_size:5d} {context_len:7d} {next_n:6d} {nblk:7d} {ntask:6d} | "
+                    f"{base_lab:>7s} {base_us:8.1f} | "
+                    f"{exp_lab:>5s} {exp_us:8.1f} {strat_speedup:14.3f}x | "
+                    f"{dg_str} {ratio_base_str} {ratio_exp_str}"
                 )
 
                 del data
@@ -823,7 +984,7 @@ if __name__ == "__main__":
         "--context_len",
         type=int,
         nargs="+",
-        default=[4096, 8192, 16384, 32768, 65536, 131072],
+        default=[1024, 2048, 4096, 8192, 16384, 32768, 65536, 131072],
         help="context lengths (default: 4096 8192 16384 32768 65536 131072)",
     )
     parser.add_argument(
@@ -851,7 +1012,7 @@ if __name__ == "__main__":
         "--num_epi_subtiles",
         type=int,
         default=1,
-        choices=[1, 2, 4],
+        choices=[1, 2, 3, 4],
         help="epilogue sub-tile count (default: 1)",
     )
     parser.add_argument(

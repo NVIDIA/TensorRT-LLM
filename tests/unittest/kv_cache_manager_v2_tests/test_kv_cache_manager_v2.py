@@ -515,10 +515,12 @@ class TestNoBatching(TestKVCacheManagerV2):
             kv_cache.close()
 
         def num_reused(reuse_scope: ReuseScope | None) -> int:
+            probed = self.manager.probe_reuse(reuse_scope, tokens[:-1])
             kv_cache = self.manager.create_kv_cache(reuse_scope, tokens[:-1])
             self.assertEqual(kv_cache._reuse_scope, reuse_scope or default_scope)
             ret = kv_cache.num_committed_tokens
             kv_cache.close()
+            self.assertEqual(probed, ret)
             return ret
 
         commit_for(scoped)

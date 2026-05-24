@@ -16,10 +16,9 @@ from tensorrt_llm._torch.visual_gen.cache.teacache import (
     ExtractorConfig,
     register_extractor_from_config,
 )
-from tensorrt_llm._torch.visual_gen.config import PipelineComponent
 from tensorrt_llm._torch.visual_gen.output import CudaPhaseTimer, PipelineOutput
 from tensorrt_llm._torch.visual_gen.pipeline import BasePipeline
-from tensorrt_llm._torch.visual_gen.pipeline_registry import register_pipeline
+from tensorrt_llm._torch.visual_gen.pipeline_registry import PipelineComponent, register_pipeline
 from tensorrt_llm.logger import logger
 
 from .transformer_flux import FluxTransformer2DModel
@@ -40,7 +39,11 @@ FLUX_TEACACHE_COEFFICIENTS = {
 }
 
 
-@register_pipeline("FluxPipeline")
+@register_pipeline(
+    "FluxPipeline",
+    hf_ids=["black-forest-labs/FLUX.1-dev"],
+    doc="Black Forest Labs FLUX.1 family (text-to-image).",
+)
 class FluxPipeline(BasePipeline):
     """FLUX.1 Text-to-Image Pipeline.
 
@@ -53,7 +56,7 @@ class FluxPipeline(BasePipeline):
             and model_config.visual_gen_mapping.cfg_size != 1
         ):
             raise ValueError(
-                "FluxPipeline does not support CFG parallelism. Please set dit_cfg_size to 1."
+                "FluxPipeline does not support CFG parallelism. Please set cfg_size to 1."
             )
 
         super().__init__(model_config)

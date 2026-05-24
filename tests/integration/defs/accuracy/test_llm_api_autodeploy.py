@@ -311,8 +311,10 @@ class TestLlama3_1_8B(LlmapiAccuracyTestHarness):
                 task.evaluate(llm, sampling_params=sampling_params)
 
     @pytest.mark.skip_less_device_memory(32000)
-    @pytest.mark.skip_less_device(2)
-    @pytest.mark.parametrize("world_size", [2, 4])
+    @pytest.mark.parametrize("world_size", [
+        pytest.param(2, marks=pytest.mark.skip_less_device(2)),
+        pytest.param(4, marks=pytest.mark.skip_less_device(4)),
+    ])
     def test_attention_dp(self, world_size):
         """Test attention data parallelism mode where TP sharding is disabled."""
         kwargs = self.get_default_kwargs(enable_chunked_prefill=True)
@@ -708,26 +710,62 @@ class TestNemotronSuperV3(LlmapiAccuracyTestHarness):
     @skip_pre_hopper
     @pytest.mark.parametrize("attn_backend", ["flashinfer", "trtllm"])
     @pytest.mark.parametrize(
-        "world_size",
+        "model_id, world_size",
         [
             pytest.param(
+                "bf16",
                 4,
-                marks=pytest.mark.skip_less_device_memory(180000),
-                id="ws4_180gb",
+                marks=[
+                    pytest.mark.skip_less_device(4),
+                    pytest.mark.skip_less_device_memory(180000),
+                ],
+                id="bf16_ws4_180gb",
             ),
             pytest.param(
+                "fp8",
+                4,
+                marks=[
+                    pytest.mark.skip_less_device(4),
+                    pytest.mark.skip_less_device_memory(80000),
+                ],
+                id="fp8_ws4_80gb",
+            ),
+            pytest.param(
+                "nvfp4",
+                4,
+                marks=[
+                    pytest.mark.skip_less_device(4),
+                    pytest.mark.skip_less_device_memory(80000),
+                    skip_pre_blackwell,
+                ],
+                id="nvfp4_ws4_80gb",
+            ),
+            pytest.param(
+                "fp8",
                 8,
-                marks=pytest.mark.skip_less_device_memory(80000),
-                id="ws8_80gb",
+                marks=[
+                    pytest.mark.skip_less_device(8),
+                    pytest.mark.skip_less_device_memory(80000),
+                ],
+                id="fp8_ws8_80gb",
+            ),
+            pytest.param(
+                "nvfp4",
+                8,
+                marks=[
+                    pytest.mark.skip_less_device(8),
+                    pytest.mark.skip_less_device_memory(80000),
+                    skip_pre_blackwell,
+                ],
+                id="nvfp4_ws8_80gb",
             ),
         ],
     )
-    def test_mtp(self, world_size, attn_backend):
-        if get_device_count() < world_size:
-            pytest.skip(f"Not enough devices for world_size={world_size}")
+    def test_mtp(self, world_size, attn_backend, model_id):
 
-        model_path = self.MODEL_PATHS["bf16"]
+        model_path = self.MODEL_PATHS[model_id]
         kwargs = {}
+        # TODO: gate for bf16 only after replay lands
         low_memory_overrides(
             kwargs,
             max_batch_size=8,
@@ -742,8 +780,8 @@ class TestNemotronSuperV3(LlmapiAccuracyTestHarness):
             kwargs["compile_backend"] = "torch-simple"
 
         print(
-            f"SuperV3 MTP params: world_size={world_size}, model_path={model_path}"
-        )
+            f"SuperV3 MTP params: model_id={model_id}, world_size={world_size}, "
+            f"model_path={model_path}")
         print(f"kwargs: {kwargs}")
 
         mtp_yaml = str(
@@ -761,9 +799,17 @@ class TestNemotronSuperV3(LlmapiAccuracyTestHarness):
                 enable_iter_perf_stats=True,
                 **kwargs,
         ) as llm:
+            _set_quant_config(llm, model_id)
+            if model_id == "nvfp4":
+                llm.args.quant_config.quant_algo = QuantAlgo.MIXED_PRECISION
+            print_memory_usage("after engine build")
+
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
-            self.check_acceptance_rate(llm, min_acceptance_rate=0.45)
+            # bf16 acceptance is stable; fp8/nvfp4 have higher variance due to
+            # arithmetic rounding, so use a lower threshold for quantized models.
+            min_rate = 0.50 if model_id == "bf16" else 0.40
+            self.check_acceptance_rate(llm, min_acceptance_rate=min_rate)
 
         print_memory_usage("after evaluation")
 
