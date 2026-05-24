@@ -1015,6 +1015,14 @@ def create_autodeploy_executor(
             vocab_size_padded=vocab_size_padded,
         )
 
+    # Speculative-decoding draft sizes must be forwarded to PyExecutor so that the
+    # attention-DP dummy created in `_pad_attention_dp_dummy_request` is materialized
+    # with `py_draft_tokens = [1] * max_total_draft_tokens` instead of `[]`. An empty
+    # `py_draft_tokens` makes the dummy classify as decode in `_prepare_inputs` and
+    # trips the eagle wrapper's `assert num_decode == 0` under MTP + attention_dp.
+    max_draft_len = 0 if spec_config is None else spec_config.max_draft_len
+    max_total_draft_tokens = 0 if spec_config is None else spec_config.tokens_per_gen_step - 1
+
     # creating the executor object
     py_executor = PyExecutor(
         resource_manager,
@@ -1027,6 +1035,8 @@ def create_autodeploy_executor(
         max_input_len=ad_config.max_input_len,
         max_batch_size=ad_config.max_batch_size,
         max_beam_width=ad_config.max_beam_width,
+        max_draft_len=max_draft_len,
+        max_total_draft_tokens=max_total_draft_tokens,
         guided_decoder=guided_decoder,
         resource_governor_queue=resource_governor_queue,
         garbage_collection_gen0_threshold=ad_config.garbage_collection_gen0_threshold,
