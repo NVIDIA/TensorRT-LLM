@@ -151,6 +151,8 @@ class CachedSequenceInterface:
         self.info.batch_info.update_max_draft_len(
             spec_config.max_draft_len if spec_config is not None else 0
         )
+        # Default to non-replay; updated in initialize_cache once resources are identified.
+        self.info.batch_info.update_use_replay(False)
 
     @property
     def args(self) -> Tuple[torch.Tensor, ...]:
@@ -813,6 +815,10 @@ class CachedSequenceInterface:
             replay_cache_buf_idx,
             replay_prev_num_accepted,
         ) = self._identify_managed_state_resources()
+
+        # Propagate replay mode into BatchInfo so SSM backends can branch on it
+        # without inspecting the presence/absence of Optional cache tensors.
+        self.info.batch_info.update_use_replay(len(replay_old_x) > 0)
 
         # 2. Prepare configuration
         kv_cache_config = self._prepare_kv_cache_config(max_tokens, kv_managed)

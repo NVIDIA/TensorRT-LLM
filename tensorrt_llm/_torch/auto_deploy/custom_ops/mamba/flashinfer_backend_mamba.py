@@ -115,7 +115,7 @@ def _flashinfer_cached_ssm(
     # NOTE: intermediate_state_indices_extend (torch.arange) is NOT hoisted here.
     # It is only needed for the non-replay FlashInfer extend path. Hoisting it
     # unconditionally would create an unnecessary arange kernel in the gap for
-    # the replay path (where replay_old_x is not None and the arange is unused).
+    # the replay path (where use_replay=True and the arange is unused).
 
     if out is not None:
         preallocated_ssm_out = out.view(bs, num_heads, head_dim)
@@ -187,7 +187,7 @@ def _flashinfer_cached_ssm(
 
         slot_idx_extend_i32 = slot_idx_extend  # already int32; no .to() kernel
 
-        use_replay = replay_old_x is not None
+        use_replay = batch_info.is_use_replay()
         if use_replay:
             # Replay path: fast-forward SSM state via tl.dot on cached values.
             # State is updated in-place; no disable_state_update needed.
@@ -363,8 +363,9 @@ FLASHINFER_SUPPORTED_HEAD_DIMS = [64, 128]
 
 @AttentionRegistry.register("flashinfer_ssm")
 class FlashinferBackendSSM(BaseBackendSSM):
-    # When ssm_replay=True, use the replay kernel (tl.dot fast-forward) instead of FlashInfer.
-    # Disabled automatically when: block reuse enabled, tree attention, or SM < 80.
+    # ssm_replay=True allocates replay buffers at compile time (SM80+), which causes
+    # BatchInfo.is_use_replay() to return True at runtime.  Never check ssm_replay at
+    # runtime — use batch_info.is_use_replay() instead.
     ssm_replay: bool = False
 
     @classmethod

@@ -379,7 +379,7 @@ class BatchInfo:
     Args:
         batch_info_host: The batch info tensor on the host.
 
-    The information is stored in a 12-element batch_info_host tensor as follows:
+    The information is stored in a 14-element batch_info_host tensor as follows:
 
     Slots 0-5 (batch composition):
     - [0] num_prefill: number of prefill requests
@@ -402,10 +402,13 @@ class BatchInfo:
     Slot 12 (spec-decoding info, set once at runtime init):
     - [12] max_draft_len: maximum draft length per request (0 when not spec dec)
 
+    Slot 13 (replay mode flag, set once at runtime init):
+    - [13] use_replay: 1 if SSM replay state-update path is active, 0 otherwise
+
     All fields can be accessed and updated with the convenience functions below.
     """
 
-    _NUM_ELEMENTS = 13
+    _NUM_ELEMENTS = 14
 
     def __init__(self, batch_info_host: Optional[torch.Tensor] = None):
         if batch_info_host is None:
@@ -527,6 +530,16 @@ class BatchInfo:
 
     def get_max_draft_len(self) -> int:
         return int(self._batch_info[12])
+
+    # --- replay mode flag (slot 13) writer ---
+
+    def update_use_replay(self, use_replay: bool) -> None:
+        self._batch_info[13] = int(use_replay)
+
+    # --- replay mode flag (slot 13) reader ---
+
+    def is_use_replay(self) -> bool:
+        return bool(self._batch_info[13])
 
 
 class SequenceInfo:
