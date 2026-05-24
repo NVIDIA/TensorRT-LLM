@@ -2179,16 +2179,6 @@ class AttentionDescriptor(ABC):
         return []
 
     @classmethod
-    def get_kwarg_cache_keys(cls) -> Set[str]:
-        """Return cache resource keys that should be passed as kwargs (not positional args).
-
-        By default all cache resources are positional. Override to route specific cache keys
-        (e.g. replay tensors that must appear after constants in the function signature) to
-        the call_function kwargs dict instead.
-        """
-        return set()
-
-    @classmethod
     def get_layer_idx(cls, source_attn_node: Node) -> Optional[int]:
         """Return the logical layer index associated with a source attention node, if any."""
         return _extract_optional_op_arg(source_attn_node, "layer_idx")

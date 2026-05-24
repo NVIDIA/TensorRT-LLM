@@ -60,7 +60,7 @@ def _fi_align(t: torch.Tensor) -> torch.Tensor:
 
 @torch.library.custom_op(
     "auto_deploy::flashinfer_cached_ssm",
-    mutates_args=("ssm_state_cache",),
+    mutates_args=("ssm_state_cache", "intermediate_ssm_state_cache"),
 )
 def _flashinfer_cached_ssm(
     # INPUTS (dense but may be flattened across sequences)
@@ -83,21 +83,20 @@ def _flashinfer_cached_ssm(
     seq_idx_prefill: torch.Tensor,  # [1, num_prefill_tokens]
     # CACHES
     ssm_state_cache: torch.Tensor,  # [max_batch_size, num_heads, head_dim, ssm_state_size]
-    # CONSTANTS — Optional defaults so infer_schema accepts them; always supplied by the transform.
-    # Positions 16-17: constants come right after the single positional cache node (ssm_state_cache).
-    time_step_limit: Optional[List[float]] = None,
-    chunk_size: int = 256,
-    # SPEC / REPLAY CACHES — all kwargs, absent in replay mode or non-replay mode respectively.
-    # Lowercase names to match PyTorch FX node name normalization.
     intermediate_ssm_state_cache: Optional[
         torch.Tensor
-    ] = None,  # kwarg; present in non-replay, absent in replay (uses None default)
-    replay_old_x: Optional[torch.Tensor] = None,  # [max_batch, T, nheads, head_dim]
-    replay_old_b: Optional[torch.Tensor] = None,  # [max_batch, 2, T, ngroups, dstate]
-    replay_old_dt: Optional[torch.Tensor] = None,  # [max_batch, 2, nheads, T] fp32
-    replay_old_da_cumsum: Optional[torch.Tensor] = None,  # [max_batch, 2, nheads, T] fp32
-    replay_cache_buf_idx: Optional[torch.Tensor] = None,  # [max_batch] int32
-    replay_prev_num_accepted: Optional[torch.Tensor] = None,  # [max_batch] int32
+    ],  # [spec_state_size, max_draft_len+1, num_heads, head_dim, d_state]; None in replay mode
+    replay_old_x: Optional[torch.Tensor],  # [max_batch, T, nheads, head_dim]; None in non-replay
+    replay_old_b: Optional[torch.Tensor],  # [max_batch, 2, T, ngroups, dstate]; None in non-replay
+    replay_old_dt: Optional[torch.Tensor],  # [max_batch, 2, nheads, T] fp32; None in non-replay
+    replay_old_da_cumsum: Optional[
+        torch.Tensor
+    ],  # [max_batch, 2, nheads, T] fp32; None in non-replay
+    replay_cache_buf_idx: Optional[torch.Tensor],  # [max_batch] int32; None in non-replay
+    replay_prev_num_accepted: Optional[torch.Tensor],  # [max_batch] int32; None in non-replay
+    # CONSTANTS
+    time_step_limit: List[float],
+    chunk_size: int,
     out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     b, s, num_heads, head_dim, bs, hs_flat, B_flat, C_flat, dt_flat = _flatten_ssm_inputs(
@@ -145,7 +144,7 @@ def _flashinfer_cached_ssm(
         chunk_offsets,
         seq_idx_prefill,
         ssm_state_cache,
-        time_step_limit or [],
+        time_step_limit,
         chunk_size,
         preallocated_ssm_out[:num_prefill_tokens].unsqueeze(0),
     )
@@ -332,20 +331,20 @@ def _flashinfer_cached_ssm_fake(
     seq_idx_prefill: torch.Tensor,  # [1, num_prefill_tokens]
     # CACHES
     ssm_state_cache: torch.Tensor,  # [max_batch_size, num_heads, head_dim, ssm_state_size]
-    # CONSTANTS
-    time_step_limit: Optional[List[float]] = None,
-    chunk_size: int = 256,
-    # SPEC / REPLAY CACHES — all kwargs, absent in replay mode or non-replay mode respectively.
-    # Lowercase names to match PyTorch FX node name normalization.
     intermediate_ssm_state_cache: Optional[
         torch.Tensor
-    ] = None,  # [spec_state_size, max_draft_len+1, num_heads, head_dim, d_state]
-    replay_old_x: Optional[torch.Tensor] = None,  # [max_batch, T, nheads, head_dim]
-    replay_old_b: Optional[torch.Tensor] = None,  # [max_batch, 2, T, ngroups, dstate]
-    replay_old_dt: Optional[torch.Tensor] = None,  # [max_batch, 2, nheads, T] fp32
-    replay_old_da_cumsum: Optional[torch.Tensor] = None,  # [max_batch, 2, nheads, T] fp32
-    replay_cache_buf_idx: Optional[torch.Tensor] = None,  # [max_batch] int32
-    replay_prev_num_accepted: Optional[torch.Tensor] = None,  # [max_batch] int32
+    ],  # [spec_state_size, max_draft_len+1, num_heads, head_dim, d_state]; None in replay mode
+    replay_old_x: Optional[torch.Tensor],  # [max_batch, T, nheads, head_dim]; None in non-replay
+    replay_old_b: Optional[torch.Tensor],  # [max_batch, 2, T, ngroups, dstate]; None in non-replay
+    replay_old_dt: Optional[torch.Tensor],  # [max_batch, 2, nheads, T] fp32; None in non-replay
+    replay_old_da_cumsum: Optional[
+        torch.Tensor
+    ],  # [max_batch, 2, nheads, T] fp32; None in non-replay
+    replay_cache_buf_idx: Optional[torch.Tensor],  # [max_batch] int32; None in non-replay
+    replay_prev_num_accepted: Optional[torch.Tensor],  # [max_batch] int32; None in non-replay
+    # CONSTANTS
+    time_step_limit: List[float],
+    chunk_size: int,
     out: Optional[torch.Tensor] = None,
 ):
     if out is not None:
@@ -368,26 +367,6 @@ class FlashinferBackendSSM(BaseBackendSSM):
     # Disabled automatically when: block reuse enabled, tree attention, or SM < 80.
     ssm_replay: bool = False
 
-    # Cache keys always passed as kwargs (follow constants at positions 16-17).
-    # intermediate_ssm_state_cache is always a kwarg: present in non-replay, absent in replay
-    # (uses function default None). Replay keys are present only when ssm_replay=True.
-    # All keys lowercase to match PyTorch FX node name normalization.
-    _KWARG_CACHE_KEYS = frozenset(
-        {
-            "intermediate_ssm_state_cache",
-            "replay_old_x",
-            "replay_old_b",
-            "replay_old_dt",
-            "replay_old_da_cumsum",
-            "replay_cache_buf_idx",
-            "replay_prev_num_accepted",
-        }
-    )
-
-    @classmethod
-    def get_kwarg_cache_keys(cls):
-        return cls._KWARG_CACHE_KEYS
-
     @classmethod
     def get_cached_attention_op(cls) -> MHACallable:
         return torch.ops.auto_deploy.flashinfer_cached_ssm.default
@@ -409,21 +388,19 @@ class FlashinferBackendSSM(BaseBackendSSM):
                 "Consider using 'triton_ssm' backend instead."
             )
 
-        if cls.ssm_replay and get_sm_version() >= 80:
-            # Replay mode: intermediate_ssm_state_cache is absent from the graph — it uses the
-            # function's default (None) via kwarg routing. Only replay buffers are registered.
-            # T is determined by MambaHybridCacheManager from spec_config at construction time.
-            ssm_h = ret["ssm_state_cache"]
-            x_dtype = torch.bfloat16
+        ssm_h = ret["ssm_state_cache"]
 
+        # All 7 optional caches are always registered positionally (None = unused in this mode).
+        # intermediate_ssm_state_cache: real in non-replay, None in replay.
+        # replay_old_*: real in replay mode (SM80+), None otherwise.
+        if cls.ssm_replay and get_sm_version() >= 80:
+            ret["intermediate_ssm_state_cache"] = None
+            x_dtype = torch.bfloat16
+            B_fake = source_attn_node.args[2].meta["val"]
+            n_groups = B_fake.shape[-2] if B_fake.ndim >= 4 else 1
             ret["replay_old_x"] = ReplayOldXHandler(
                 num_heads=ssm_h.num_heads, head_dim=ssm_h.head_dim, dtype=x_dtype
             )
-            # Derive n_groups from B tensor shape at the source node.
-            # Use lowercase keys: FX lowercases node names, so "replay_old_B" →
-            # node.name "replay_old_b". Use lowercase to keep _caches / node names consistent.
-            B_fake = source_attn_node.args[2].meta["val"]
-            n_groups = B_fake.shape[-2] if B_fake.ndim >= 4 else 1
             ret["replay_old_b"] = ReplayOldBHandler(
                 n_groups=n_groups, d_state=ssm_h.d_state, dtype=x_dtype
             )
@@ -432,9 +409,11 @@ class FlashinferBackendSSM(BaseBackendSSM):
             ret["replay_cache_buf_idx"] = ReplayCacheBufIdxHandler()
             ret["replay_prev_num_accepted"] = ReplayPrevNumAcceptedHandler()
         else:
-            # Non-replay mode: include intermediate_ssm_state_cache as a kwarg resource.
-            # It is absent in replay mode, where the function default (None) takes over.
-            ret["intermediate_ssm_state_cache"] = SpecSSMResourceHandler.from_base(
-                ret["ssm_state_cache"]
-            )
+            ret["intermediate_ssm_state_cache"] = SpecSSMResourceHandler.from_base(ssm_h)
+            ret["replay_old_x"] = None
+            ret["replay_old_b"] = None
+            ret["replay_old_dt"] = None
+            ret["replay_old_da_cumsum"] = None
+            ret["replay_cache_buf_idx"] = None
+            ret["replay_prev_num_accepted"] = None
         return ret
