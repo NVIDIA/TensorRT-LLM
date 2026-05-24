@@ -847,7 +847,11 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                     buf_dim = spec_tree_manager._internal_buf_dim
                 else:
                     buf_dim = max_total_draft_tokens + 1
-                self.spec_decoding_packed_mask = torch.empty(
+                # Zero-init: dynamic-tree dst has inner dim
+                # ceil(buf_dim/32) but only ceil((max_total_draft_tokens+1)/32)
+                # is written each step. Unwritten cols would otherwise feed the
+                # C++ XQA kernel as live mask bits.
+                self.spec_decoding_packed_mask = torch.zeros(
                     [self.max_num_requests, buf_dim,
                      math.ceil(buf_dim / 32)],
                     dtype=torch.int,

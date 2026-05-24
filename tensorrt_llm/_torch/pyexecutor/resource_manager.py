@@ -837,7 +837,8 @@ class KVCacheManager(BaseResourceManager):
         self.max_blocks_per_seq = self.impl.max_blocks_per_seq
         self.enable_block_reuse = kv_cache_config.enable_block_reuse
         self.enable_partial_reuse = kv_cache_config.enable_partial_reuse
-        self.host_kv_cache_block_offsets = torch.empty(
+        # Keep unused block offsets as safe block index 0.
+        self.host_kv_cache_block_offsets = torch.zeros(
             self.num_pools,
             max_batch_size * max_beam_width,
             2,
@@ -969,13 +970,7 @@ class KVCacheManager(BaseResourceManager):
                         continue
                 draft_len = get_draft_token_length(req)
                 self.impl.add_token(req.py_request_id)
-                for _ in range(draft_len):
-                    self.impl.add_token(req.py_request_id)
-                # Top up to _kv_reserve_draft_tokens (see __init__): on
-                # dynamic-tree draft manager this exceeds draft_len; otherwise
-                # only nonzero when scheduler truncated py_draft_tokens.
-                reserve_slack = self._kv_reserve_draft_tokens - draft_len
-                for _ in range(max(0, reserve_slack)):
+                for _ in range(max(draft_len, self._kv_reserve_draft_tokens)):
                     self.impl.add_token(req.py_request_id)
 
             # prefill and generation kernels wait for scheduled offload/onboard/partial copy work before launching
@@ -2356,7 +2351,8 @@ class KVCacheManagerV2(BaseResourceManager):
             else:
                 self.kv_offset[pool_id] = 0
 
-        self.host_kv_cache_block_offsets = torch.empty(
+        # Keep unused block offsets as safe block index 0.
+        self.host_kv_cache_block_offsets = torch.zeros(
             self.num_pools,
             (max_num_sequences + 1) * max_beam_width,
             2,  # key and value
