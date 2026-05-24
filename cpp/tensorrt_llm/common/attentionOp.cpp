@@ -1580,8 +1580,17 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
     workspaceSizes.cpWorkspace = cpWorkspaceSize;
     workspaceSizes.fmhaMultiCtasKvScratch = fmha_multi_ctas_kv_scratch_size;
     auto const workspaceLayout = AttentionWorkspaceManager::buildContextLayout(workspaceSizes);
-    auto const workspaceViews = AttentionWorkspaceManager::materializeContext<T>(
+    auto workspaceViews = AttentionWorkspaceManager::materializeContext<T>(
         params.workspace, workspaceLayout, cpMaxPadedSequenceLength, getHeadSize(), mNumHeads, mNumKVHeads);
+
+    // Fused FP8-Q path: caller pre-fills the nope segment of `quant_q_buf`;
+    // route the workspace pointer to it so the fused RoPE kernel appends rope
+    // FP8 in place and the FMHA Q load reads the merged [nope|rope] buffer.
+    if (mIsMLAEnabled && params.mla_param != nullptr && params.mla_param->fuse_q_fp8_in_rope
+        && params.mla_param->quant_q_buf != nullptr)
+    {
+        workspaceViews.fp8QBuf = reinterpret_cast<__nv_fp8_e4m3*>(params.mla_param->quant_q_buf);
+    }
 
     // build attention mask, cu_seqlens, and padding offset tensors
     // Note: self attn and cross attn should use different params
