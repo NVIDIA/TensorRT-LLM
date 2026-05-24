@@ -1583,6 +1583,16 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
     auto const workspaceViews = AttentionWorkspaceManager::materializeContext<T>(
         params.workspace, workspaceLayout, cpMaxPadedSequenceLength, getHeadSize(), mNumHeads, mNumKVHeads);
 
+    auto* fp8QBuf = workspaceViews.fp8QBuf;
+    // Fused FP8-Q path: caller pre-fills the nope segment of `quant_q_buf`;
+    // route the context-MLA Q pointer to it so the fused RoPE kernel appends
+    // rope FP8 in place and the FMHA Q load reads the merged [nope|rope] buffer.
+    if (mIsMLAEnabled && params.mla_param != nullptr && params.mla_param->fuse_q_fp8_in_rope
+        && params.mla_param->quant_q_buf != nullptr)
+    {
+        fp8QBuf = reinterpret_cast<__nv_fp8_e4m3*>(params.mla_param->quant_q_buf);
+    }
+
     // build attention mask, cu_seqlens, and padding offset tensors
     // Note: self attn and cross attn should use different params
     // cross attn's seqlen info is from encoder input lengths, not decoder input lengths!
@@ -1809,7 +1819,7 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
             // Set BMM scales for FP8 context computation
             params.mla_param->bmm1_scale = workspaceViews.fmhaBmm1Scale;
             params.mla_param->bmm2_scale = workspaceViews.fmhaBmm2Scale;
-            params.mla_param->quant_q_buf = mFP8ContextMLA ? workspaceViews.fp8QBuf : nullptr;
+            params.mla_param->quant_q_buf = mFP8ContextMLA ? fp8QBuf : nullptr;
             params.mla_param->quant_k_buf = mFP8ContextMLA ? workspaceViews.fp8KBuf : nullptr;
             params.mla_param->quant_v_buf = mFP8ContextMLA ? workspaceViews.fp8VBuf : nullptr;
             // Set additional scales for context phase
@@ -1943,14 +1953,14 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
             {
                 TLLM_CHECK_WITH_INFO(
                     mFmhaDispatcher->isSeparateQAndKvInput(), "Separate QKV input is required for fp8 context MLA");
-                TLLM_CHECK_WITH_INFO(workspaceViews.fp8QBuf != nullptr, "FP8 q buffer is required for fp8 context MLA");
+                TLLM_CHECK_WITH_INFO(fp8QBuf != nullptr, "FP8 q buffer is required for fp8 context MLA");
                 // In sparse MLA (absorption mode), K and V are stored in KV cache, not as separate FP8 buffers
                 TLLM_CHECK_WITH_INFO(useSparseMLA() || workspaceViews.fp8KBuf != nullptr,
                     "FP8 k buffer is required for fp8 context MLA in non-sparse mode");
                 TLLM_CHECK_WITH_INFO(useSparseMLA() || workspaceViews.fp8VBuf != nullptr,
                     "FP8 v buffer is required for fp8 context MLA in non-sparse mode");
 
-                fmhaParams.qPtr = reinterpret_cast<void const*>(workspaceViews.fp8QBuf);
+                fmhaParams.qPtr = reinterpret_cast<void const*>(fp8QBuf);
                 fmhaParams.kPtr = useSparseMLA() ? nullptr : reinterpret_cast<void const*>(workspaceViews.fp8KBuf);
                 fmhaParams.vPtr = useSparseMLA() ? nullptr : reinterpret_cast<void const*>(workspaceViews.fp8VBuf);
             }
