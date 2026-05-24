@@ -33,6 +33,7 @@ void inplaceSliceCopy(at::Tensor& dest, at::Tensor const& src, int64_t dim1Start
 {
     CHECK_TH_CUDA(dest);
     CHECK_TH_CUDA(src);
+    TORCH_CHECK(dest.get_device() == src.get_device(), "dest and src must be on the same CUDA device");
     TORCH_CHECK(dest.is_contiguous(), "dest must be contiguous");
     TORCH_CHECK(src.is_contiguous(), "src must be contiguous");
     TORCH_CHECK(dest.dim() == 2, "dest must be 2-D");
@@ -41,6 +42,7 @@ void inplaceSliceCopy(at::Tensor& dest, at::Tensor const& src, int64_t dim1Start
 
     int64_t const numTokens = src.size(0);
     int64_t const sliceWidth = dim1End - dim1Start;
+    TORCH_CHECK(dim1Start >= 0, "dim1Start must be non-negative");
     TORCH_CHECK(sliceWidth > 0, "dim1End must be greater than dim1Start");
     TORCH_CHECK(numTokens <= dest.size(0), "numTokens exceeds dest row count");
     TORCH_CHECK(dim1End <= dest.size(1), "dim1End exceeds dest column count");

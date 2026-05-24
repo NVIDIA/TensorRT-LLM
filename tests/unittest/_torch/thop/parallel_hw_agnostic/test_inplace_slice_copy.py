@@ -114,3 +114,23 @@ def test_out_of_bounds_raises():
     src = torch.randn(8, 8, dtype=dtype, device="cuda")
     with pytest.raises(RuntimeError):
         torch.ops.trtllm.inplace_slice_copy(dest, src, 28, 36)
+
+
+def test_negative_dim1_start_raises():
+    """A negative dim1_start would underflow the dest pointer."""
+    dtype = torch.bfloat16
+    dest = torch.zeros(8, 32, dtype=dtype, device="cuda")
+    src = torch.randn(8, 8, dtype=dtype, device="cuda")
+    with pytest.raises(RuntimeError):
+        torch.ops.trtllm.inplace_slice_copy(dest, src, -8, 0)
+
+
+def test_device_mismatch_raises():
+    """dest and src on different CUDA devices must be rejected."""
+    if torch.cuda.device_count() < 2:
+        pytest.skip("requires >= 2 CUDA devices")
+    dtype = torch.bfloat16
+    dest = torch.zeros(8, 32, dtype=dtype, device="cuda:0")
+    src = torch.randn(8, 32, dtype=dtype, device="cuda:1")
+    with pytest.raises(RuntimeError):
+        torch.ops.trtllm.inplace_slice_copy(dest, src, 0, 32)
