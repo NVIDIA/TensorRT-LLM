@@ -1153,90 +1153,70 @@ void invokeBuildDraftProbIndices(int64_t const* topkScoreIndices, int32_t* draft
     sync_check_cuda_error(stream);
 }
 
-//! \param predicts             [out] accepted token ids + bonus token [bs * numDraftTokens]
-//! \param acceptIndex          [out] accepted path as local tree positions [bs, numSpeculativeTokens]
-//! \param acceptTokenNum       [out] number of accepted draft tokens per batch [bs]
-//! \param candidates           [in]  candidate token id per tree node [bs, numDraftTokens]
-//! \param retrieveIndex        [in]  tree node -> local index [bs, numDraftTokens]
-//! \param retrieveNextToken    [in]  first-child pointer [bs, numDraftTokens], -1=none
-//! \param retrieveNextSibling  [in]  next-sibling pointer [bs, numDraftTokens], -1=none
-//! \param targetPredict        [in]  target model prediction per position [bs * numDraftTokens]
-//! \param batchSize            batch size
-//! \param numSpeculativeTokens second dim of acceptIndex/acceptToken
-//!                             (= numSpecStep = max_path_len, >= max possible accepts + 1)
-//! \param numDraftTokens       total tree nodes per batch (including root)
-__global__ void verifyDynamicTreeGreedyKernel(int64_t* predicts, int64_t* acceptIndex, int64_t* acceptTokenNum,
-    int64_t* acceptToken, int64_t const* candidates, int32_t const* retrieveIndex, int32_t const* retrieveNextToken,
-    int32_t const* retrieveNextSibling, int64_t const* targetPredict, bool const* treeValid, uint32_t batchSize,
+//! retrievePacked layout [bs, numDraftTokens, 3] int32 row-major:
+//! [b,n,0]=retrieveIndex, [b,n,1]=retrieveNextToken, [b,n,2]=retrieveNextSibling
+__global__ void verifyDynamicTreeGreedyPackedKernel(int32_t* acceptIndex, int32_t* acceptTokenNum, int32_t* acceptToken,
+    int32_t const* candidates, int32_t const* retrievePacked, int32_t const* targetPredict, bool const* treeValid,
     uint32_t numSpeculativeTokens, uint32_t numDraftTokens)
 {
     uint32_t bx = blockIdx.x;
     uint32_t batchOffset = bx * numDraftTokens;
+    int32_t const* row = retrievePacked + static_cast<size_t>(bx) * numDraftTokens * 3;
 
-    // First-gen or dummy request: no valid tree, accept only the bonus token
     if (treeValid != nullptr && !treeValid[bx])
     {
         acceptTokenNum[bx] = 0;
         acceptIndex[bx * numSpeculativeTokens] = 0;
         acceptToken[bx * numSpeculativeTokens] = targetPredict[batchOffset];
-        predicts[batchOffset] = targetPredict[batchOffset];
         return;
     }
 
-    int32_t lastAcceptedLocalIdx = retrieveIndex[batchOffset];
+    int32_t lastAcceptedLocalIdx = row[0];
     acceptIndex[bx * numSpeculativeTokens] = lastAcceptedLocalIdx;
     uint32_t numAcceptedTokens = 0;
     int32_t curIndex = 0;
 
-    // Root token: target prediction at root position
     acceptToken[bx * numSpeculativeTokens] = targetPredict[batchOffset + lastAcceptedLocalIdx];
 
     for (uint32_t j = 1; j < numSpeculativeTokens; ++j)
     {
-        curIndex = retrieveNextToken[batchOffset + curIndex];
+        curIndex = row[static_cast<size_t>(curIndex) * 3 + 1];
 
-        while (curIndex != -1)
+        while (curIndex >= 0 && static_cast<uint32_t>(curIndex) < numDraftTokens)
         {
-            int32_t draftLocalIdx = retrieveIndex[batchOffset + curIndex];
-            int64_t draftTokenId = candidates[batchOffset + curIndex];
-            int64_t targetTokenId = targetPredict[batchOffset + lastAcceptedLocalIdx];
+            int32_t draftLocalIdx = row[static_cast<size_t>(curIndex) * 3];
+            int32_t draftTokenId = candidates[batchOffset + curIndex];
+            int32_t targetTokenId = targetPredict[batchOffset + lastAcceptedLocalIdx];
 
             if (draftTokenId == targetTokenId)
             {
-                predicts[batchOffset + lastAcceptedLocalIdx] = targetTokenId;
                 ++numAcceptedTokens;
                 acceptIndex[bx * numSpeculativeTokens + numAcceptedTokens] = draftLocalIdx;
-                // Accepted token: target prediction at accepted draft position
                 acceptToken[bx * numSpeculativeTokens + numAcceptedTokens] = targetPredict[batchOffset + draftLocalIdx];
                 lastAcceptedLocalIdx = draftLocalIdx;
                 break;
             }
-            else
-            {
-                curIndex = retrieveNextSibling[batchOffset + curIndex];
-            }
+            curIndex = row[static_cast<size_t>(curIndex) * 3 + 2];
         }
 
-        if (curIndex == -1)
+        if (curIndex < 0 || static_cast<uint32_t>(curIndex) >= numDraftTokens)
+        {
             break;
+        }
     }
 
     acceptTokenNum[bx] = numAcceptedTokens;
-    // Bonus token from target model at the last accepted position
-    predicts[batchOffset + lastAcceptedLocalIdx] = targetPredict[batchOffset + lastAcceptedLocalIdx];
 }
 
-void invokeVerifyDynamicTreeGreedy(int64_t* predicts, int64_t* acceptIndex, int64_t* acceptTokenNum,
-    int64_t* acceptToken, int64_t const* candidates, int32_t const* retrieveIndex, int32_t const* retrieveNextToken,
-    int32_t const* retrieveNextSibling, int64_t const* targetPredict, bool const* treeValid, SizeType32 batchSize,
-    SizeType32 numDraftTokens, SizeType32 numSpecStep, cudaStream_t stream)
+void invokeVerifyDynamicTreeGreedyPacked(int32_t* acceptIndex, int32_t* acceptTokenNum, int32_t* acceptToken,
+    int32_t const* candidates, int32_t const* retrievePacked, int32_t const* targetPredict, bool const* treeValid,
+    SizeType32 batchSize, SizeType32 numDraftTokens, SizeType32 numSpecStep, cudaStream_t stream)
 {
     dim3 grid(batchSize);
     dim3 block(1);
 
-    verifyDynamicTreeGreedyKernel<<<grid, block, 0, stream>>>(predicts, acceptIndex, acceptTokenNum, acceptToken,
-        candidates, retrieveIndex, retrieveNextToken, retrieveNextSibling, targetPredict, treeValid, batchSize,
-        numSpecStep, numDraftTokens);
+    verifyDynamicTreeGreedyPackedKernel<<<grid, block, 0, stream>>>(acceptIndex, acceptTokenNum, acceptToken,
+        candidates, retrievePacked, targetPredict, treeValid, numSpecStep, numDraftTokens);
 
     sync_check_cuda_error(stream);
 }

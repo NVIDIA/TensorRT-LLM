@@ -1308,6 +1308,7 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
         is_gen: bool = False,
         prepare_resource: bool = True,
         max_num_draft_tokens: int = 0,
+        kv_reserve_draft_tokens: Optional[int] = None,
         use_mrope: bool = False,
         max_beam_width: int = 1,
         # For capturable drafting loops. During normal inference, the draft model always
@@ -1317,12 +1318,18 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
         num_extra_decoding_steps: int = 0,
         draft_kv_cache_manager: Optional[KVCacheManager] = None,
     ) -> List[LlmRequest]:
-        requests = super().add_dummy_requests(request_ids, token_nums, is_gen,
-                                              prepare_resource,
-                                              max_num_draft_tokens, use_mrope,
-                                              max_beam_width,
-                                              num_extra_decoding_steps,
-                                              draft_kv_cache_manager)
+        requests = super().add_dummy_requests(
+            request_ids=request_ids,
+            token_nums=token_nums,
+            is_gen=is_gen,
+            prepare_resource=prepare_resource,
+            max_num_draft_tokens=max_num_draft_tokens,
+            kv_reserve_draft_tokens=kv_reserve_draft_tokens,
+            use_mrope=use_mrope,
+            max_beam_width=max_beam_width,
+            num_extra_decoding_steps=num_extra_decoding_steps,
+            draft_kv_cache_manager=draft_kv_cache_manager,
+        )
         if requests:
             self.requests.extend(requests)
         self._setup_state_indices()

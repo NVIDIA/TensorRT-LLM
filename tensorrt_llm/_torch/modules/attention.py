@@ -980,22 +980,28 @@ class Attention(nn.Module):
         return q, k, v
 
     def _adjust_position_ids_for_spec_dec(self, position_ids, attn_metadata):
-        """Replicate C++ kernel's rotary_pos = past_seq_len + offset."""
+        """Replicate C++ kernel's rotary_pos = past_seq_len + offset.
+
+        The dynamic-tree draft loop writes spec_decoding_position_offsets
+        consecutively (row stride = gen_len), so a flat reshape to
+        (num_gens, gen_len) reads the right rows.
+        """
         num_contexts = attn_metadata.num_contexts
         num_gens = attn_metadata.num_seqs - num_contexts
         if num_gens <= 0:
             return position_ids
         gen_len = int(attn_metadata.seq_lens[num_contexts])
+        if gen_len <= 0:
+            return position_ids
         base_pos = attn_metadata.kv_lens_cuda[num_contexts:num_contexts +
                                               num_gens] - gen_len
-        offsets = attn_metadata.spec_decoding_position_offsets[:num_gens *
-                                                               gen_len].view(
-                                                                   num_gens,
-                                                                   gen_len)
-        adjusted = (base_pos.unsqueeze(1) + offsets).reshape(-1)
+        total = num_gens * gen_len
+        offsets = attn_metadata.spec_decoding_position_offsets[:total].view(
+            num_gens, gen_len)
         start = attn_metadata.num_ctx_tokens
-        end = start + num_gens * gen_len
-        position_ids[0, start:end] = adjusted
+        end = start + total
+        adjusted = (base_pos.unsqueeze(1) + offsets).reshape(-1)
+        position_ids.view(-1)[start:end] = adjusted
         return position_ids
 
     def apply_qk_norm(self, q, k):
