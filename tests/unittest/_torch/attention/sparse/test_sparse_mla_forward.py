@@ -2237,6 +2237,62 @@ def test_forward_sparse_mla_unified(batch_name, kv_cache_dtype: str,
     print(f"  ✓ Test '{batch_name}' completed\n")
 
 
+_FUSED_Q_FP8_PREFILL_BATCHES = [
+    "small_prefill",
+    "medium_prefill",
+    "single_prefill",
+]
+
+
+@pytest.mark.skipif(not HAS_FLASH_MLA, reason="FlashMLA not available")
+@pytest.mark.skipif(get_sm_version() < 100,
+                    reason="DSv4 fused FP8 Q-quant requires SM100")
+@pytest.mark.parametrize("batch_name", _FUSED_Q_FP8_PREFILL_BATCHES)
+def test_forward_sparse_mla_unified_fused_q_fp8(monkeypatch, batch_name):
+    """Regression test for the sparse-MLA context-branch fused FP8 Q-quant
+    wiring.  The wo-linear helper bypasses `_q_branch`, so we monkey-patch
+    `forward_context_sparse_mla` to manually populate the fused buffers
+    (mimicking `_deepseek_v4_q_b_layernorm_fused_fp8`) and replace q with
+    NaN.  Without the C++ wiring fix the legacy standalone quantize runs
+    over the NaN placeholder and the output diverges from the reference.
+    """
+    monkeypatch.setenv("TRTLLM_DISABLE_FUSED_Q_FP8_QUANT", "0")
+
+    from tensorrt_llm._torch.modules import attention as attn_mod
+    original_fwd = attn_mod.MLA.forward_context_sparse_mla
+
+    def patched_fwd(self, q, compressed_kv, k_pe, attn_metadata, output,
+                    **kwargs):
+        if (self.is_deepseek_v4 and self.qk_head_dim == 512
+                and self.kv_lora_rank == 448
+                and bool(getattr(self.mqa, "has_fp8_kv_cache", False))):
+            num_tokens = q.shape[0]
+            num_heads = self.num_heads_tp
+            nope_dim = self.kv_lora_rank
+            head_dim = self.qk_head_dim
+            q_view = q.view(num_tokens, num_heads, head_dim)
+            quant_q_buffer = torch.empty((num_tokens, num_heads * head_dim),
+                                         dtype=torch.float8_e4m3fn,
+                                         device=q.device)
+            quant_q_buffer.view(
+                num_tokens, num_heads,
+                head_dim)[:, :, :nope_dim] = q_view[:, :, :nope_dim].float().to(
+                    torch.float8_e4m3fn)
+            self._fused_quant_q_buffer = quant_q_buffer
+            self._fused_q_pe = q_view[:, :, nope_dim:].contiguous()
+            self._quant_scale_qkv = torch.tensor([1.0],
+                                                 dtype=torch.float32,
+                                                 device=q.device)
+            q = torch.full_like(q, float('nan'))
+        return original_fwd(self, q, compressed_kv, k_pe, attn_metadata, output,
+                            **kwargs)
+
+    monkeypatch.setattr(attn_mod.MLA, 'forward_context_sparse_mla', patched_fwd)
+    test_forward_sparse_mla_unified(batch_name=batch_name,
+                                    kv_cache_dtype="fp8",
+                                    sparse_attn_algo="deepseek_v4")
+
+
 if __name__ == "__main__":
     # Test pure prefill
     test_forward_sparse_mla_unified(batch_name="small_prefill",
