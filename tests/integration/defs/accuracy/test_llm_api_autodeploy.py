@@ -150,11 +150,15 @@ def low_memory_overrides(config,
                          max_seq_len=8192,
                          max_num_tokens=8192):
     """Update and return config that reduce memory footprint for unquantized (bf16) runs."""
+    cuda_graph_batch_sizes = [
+        s for s in [1, 2, 4, 8, 16, 32, 64, 128] if s <= max_batch_size
+    ]
     config.update({
         "max_batch_size": max_batch_size,
         "max_seq_len": max_seq_len,
         "max_num_tokens": max_num_tokens,
         "cuda_graph_config": {
+            "batch_sizes": cuda_graph_batch_sizes,
             "max_batch_size": max_batch_size,
         },
     })
