@@ -167,7 +167,7 @@ def _flashinfer_cached_ssm(
         A,
         D,
         dt_bias,
-        slot_idx_i32,  # already int32 — slice is a no-op, no extra kernel
+        slot_idx_i32,
         seq_start=num_prefill,
         token_start=num_prefill_tokens,
         num_seq=num_extend,
@@ -180,7 +180,7 @@ def _flashinfer_cached_ssm(
     if extend_inputs is not None:
         tokens_per_extend = num_extend_tokens // num_extend
         (
-            slot_idx_extend,  # already int32 (sliced from slot_idx_i32)
+            slot_idx_extend,
             x_extend,
             B_extend,
             C_extend,
@@ -193,8 +193,6 @@ def _flashinfer_cached_ssm(
         preallocated_ssm_out_e = preallocated_ssm_out[
             num_prefill_tokens : num_prefill_tokens + num_extend_tokens
         ].view(num_extend, tokens_per_extend, num_heads, head_dim)
-
-        slot_idx_extend_i32 = slot_idx_extend  # already int32; no .to() kernel
 
         use_replay = batch_info.is_use_replay()
         if use_replay:
@@ -221,7 +219,7 @@ def _flashinfer_cached_ssm(
                 D=D_full,
                 dt_bias=dt_bias_hp,
                 dt_softplus=True,
-                state_batch_indices=slot_idx_extend_i32,
+                state_batch_indices=slot_idx_extend,
                 launch_with_pdl=True,  # PDL chain: triton_causal_conv extend → precompute → main
             )
         else:
@@ -234,7 +232,7 @@ def _flashinfer_cached_ssm(
             # Only needed for the non-replay FlashInfer path; not hoisted to avoid
             # an unnecessary arange kernel in the stream gap for the replay path.
             intermediate_state_indices = torch.arange(
-                num_extend, dtype=torch.int32, device=slot_idx_extend_i32.device
+                num_extend, dtype=torch.int32, device=slot_idx_extend.device
             )
             _flashinfer_ssm_update(
                 ssm_state_cache,
@@ -247,7 +245,7 @@ def _flashinfer_cached_ssm(
                 z=None,
                 dt_bias=dt_bias_hp,
                 dt_softplus=True,
-                state_batch_indices=slot_idx_extend_i32,
+                state_batch_indices=slot_idx_extend,
                 out=preallocated_ssm_out_e,
                 disable_state_update=True,
                 intermediate_states_buffer=intermediate_ssm_state_cache,
@@ -264,7 +262,7 @@ def _flashinfer_cached_ssm(
         A,
         D,
         dt_bias,
-        slot_idx_i32,  # already int32 — no .to() kernel at decode time
+        slot_idx_i32,
         num_prefill + num_extend,
         num_prefill_tokens + num_extend_tokens,
         num_decode,
@@ -276,7 +274,7 @@ def _flashinfer_cached_ssm(
 
     if decode_inputs is not None:
         (
-            slot_idx_decode,  # already int32 (sliced from slot_idx_i32)
+            slot_idx_decode,
             x_decode,
             B_decode,
             C_decode,
@@ -290,7 +288,6 @@ def _flashinfer_cached_ssm(
         B_decode = _fi_align(B_decode)
         C_decode = _fi_align(C_decode)
 
-        slot_idx_decode_i32 = slot_idx_decode  # already int32; no .to() kernel
         y_decode = _flashinfer_ssm_update(
             ssm_state_cache,
             x_decode,
@@ -302,7 +299,7 @@ def _flashinfer_cached_ssm(
             z=None,
             dt_bias=dt_bias_hp,
             dt_softplus=True,
-            state_batch_indices=slot_idx_decode_i32,
+            state_batch_indices=slot_idx_decode,
         )
         preallocated_ssm_out[num_prefill_tokens + num_extend_tokens : num_total_tokens].copy_(
             y_decode
