@@ -33,6 +33,8 @@ from ..interface import (
     TransformRegistry,
 )
 
+_VIEW_METHOD_TARGETS = {"view", "reshape", "transpose", "permute", "contiguous"}
+
 
 def _is_supported_nvfp4_linear(node: Node) -> bool:
     return is_op(node, torch.ops.auto_deploy.torch_quant_nvfp4_linear)
@@ -51,7 +53,12 @@ def _same_scale_node(lhs: Node, rhs: Node) -> bool:
 
 
 def _is_view_like(node: Node) -> bool:
-    return is_any_view_op(node)
+    return is_any_view_op(node) or (
+        node.op == "call_method"
+        and node.target in _VIEW_METHOD_TARGETS
+        and bool(node.args)
+        and isinstance(node.args[0], Node)
+    )
 
 
 def _is_dtype_cast(node: Node) -> bool:
@@ -66,6 +73,8 @@ def _unwrap_post_norm_nodes(node: Node) -> Tuple[Node, list[Node]]:
     current = node
     post_nodes: list[Node] = []
     while isinstance(current, Node) and _is_supported_passthrough(current):
+        if not current.args or not isinstance(current.args[0], Node):
+            break
         post_nodes.append(current)
         current = current.args[0]
     return current, post_nodes
@@ -113,8 +122,11 @@ def _extract_dtype_from_meta(node: Node) -> torch.dtype | None:
 
 
 def _get_out_dtype(linear_node: Node, source_node: Node) -> torch.dtype:
+    input_arg, _, _, _, _, _ = _extract_nvfp4_linear_args(linear_node)
+    input_dtype = _extract_dtype_from_meta(input_arg) if isinstance(input_arg, Node) else None
     return (
         _extract_dtype_from_meta(linear_node)
+        or input_dtype
         or _extract_dtype_from_meta(source_node)
         or torch.bfloat16
     )
@@ -334,7 +346,6 @@ class FuseRMSNormQuantNVFP4(BaseTransform):
                 continue
 
             earliest_user = min(nvfp4_linear_users, key=lambda n: node_order.get(n, float("inf")))
-            out_dtype = _get_out_dtype(earliest_user, norm_node)
 
             allreduce_info = _extract_nonquant_allreduce_norm(norm_node)
             if allreduce_info is not None:
@@ -355,11 +366,17 @@ class FuseRMSNormQuantNVFP4(BaseTransform):
                         list(norm_node.users), key=lambda n: node_order.get(n, float("inf"))
                     )
 
+                fused_input_scale = _get_arg_defined_before(
+                    graph, input_scale, insertion_node, node_order
+                )
+                if fused_input_scale is None:
+                    continue
+
                 with graph.inserting_before(insertion_node):
                     if needs_norm_output:
                         fused_quant = graph.call_function(
                             torch.ops.dist.trtllm_fused_allreduce_residual_rmsnorm_out_quant_nvfp4.default,
-                            args=(tensor, residual, norm_weight, input_scale, eps, strategy),
+                            args=(tensor, residual, norm_weight, fused_input_scale, eps, strategy),
                         )
                         new_norm_out = graph.call_function(operator.getitem, args=(fused_quant, 0))
                         fp4_node = graph.call_function(operator.getitem, args=(fused_quant, 1))
@@ -371,7 +388,7 @@ class FuseRMSNormQuantNVFP4(BaseTransform):
                     else:
                         fused_quant = graph.call_function(
                             torch.ops.dist.trtllm_fused_allreduce_residual_rmsnorm_quant_nvfp4.default,
-                            args=(tensor, residual, norm_weight, input_scale, eps, strategy),
+                            args=(tensor, residual, norm_weight, fused_input_scale, eps, strategy),
                         )
                         fp4_node = graph.call_function(operator.getitem, args=(fused_quant, 0))
                         scale_node = graph.call_function(operator.getitem, args=(fused_quant, 1))
@@ -391,7 +408,7 @@ class FuseRMSNormQuantNVFP4(BaseTransform):
                     nvfp4_linear_users,
                     fp4_node,
                     scale_node,
-                    out_dtype,
+                    norm_node,
                     processed_nvfp4_users,
                 )
 
@@ -419,14 +436,17 @@ class FuseRMSNormQuantNVFP4(BaseTransform):
                 fused_input_scale = _get_arg_defined_before(
                     graph, input_scale, insertion_node, node_order
                 )
-                if fused_input_scale is None:
+                fused_norm_weight = _get_arg_defined_before(
+                    graph, norm_weight, insertion_node, node_order
+                )
+                if fused_input_scale is None or fused_norm_weight is None:
                     continue
 
                 with graph.inserting_before(insertion_node):
                     if needs_norm_output:
                         fused_quant = graph.call_function(
                             torch.ops.auto_deploy.trtllm_fused_add_rmsnorm_out_quant_nvfp4.default,
-                            args=(add_lhs, add_rhs, norm_weight, fused_input_scale, eps),
+                            args=(add_lhs, add_rhs, fused_norm_weight, fused_input_scale, eps),
                         )
                         new_norm_out = graph.call_function(operator.getitem, args=(fused_quant, 0))
                         fp4_node = graph.call_function(operator.getitem, args=(fused_quant, 1))
@@ -438,7 +458,7 @@ class FuseRMSNormQuantNVFP4(BaseTransform):
                     else:
                         fused_quant = graph.call_function(
                             torch.ops.auto_deploy.trtllm_fused_add_rmsnorm_quant_nvfp4.default,
-                            args=(add_lhs, add_rhs, norm_weight, fused_input_scale, eps),
+                            args=(add_lhs, add_rhs, fused_norm_weight, fused_input_scale, eps),
                         )
                         fp4_node = graph.call_function(operator.getitem, args=(fused_quant, 0))
                         new_residual_out = graph.call_function(
@@ -455,7 +475,7 @@ class FuseRMSNormQuantNVFP4(BaseTransform):
                     nvfp4_linear_users,
                     fp4_node,
                     scale_node,
-                    out_dtype,
+                    norm_node,
                     processed_nvfp4_users,
                 )
 
@@ -489,7 +509,7 @@ class FuseRMSNormQuantNVFP4(BaseTransform):
                 nvfp4_linear_users,
                 fp4_node,
                 scale_node,
-                out_dtype,
+                norm_node,
                 processed_nvfp4_users,
             )
 
@@ -513,12 +533,13 @@ class FuseRMSNormQuantNVFP4(BaseTransform):
         nvfp4_linear_users: List[Node],
         fp4_node: Node,
         scale_node: Node,
-        out_dtype: torch.dtype,
+        source_node: Node,
         processed_nvfp4_users: set[int],
     ) -> int:
         cnt = 0
         graph = fp4_node.graph
         for nvfp4_user in nvfp4_linear_users:
+            out_dtype = _get_out_dtype(nvfp4_user, source_node)
             with graph.inserting_before(nvfp4_user):
                 gemm_node = _insert_prequant_linear(
                     graph, nvfp4_user, fp4_node, scale_node, out_dtype

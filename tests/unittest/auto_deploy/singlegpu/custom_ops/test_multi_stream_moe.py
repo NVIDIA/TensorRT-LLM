@@ -693,5 +693,6 @@ def test_tuple_fork_pattern_and_correctness():
         for n in gm.graph.nodes
         if n.op == "call_function" and n.target is begin_aux_stream_passthrough
     ]
+    assert len(begin_nodes) == 1, f"Expected exactly one begin_aux node, got {len(begin_nodes)}"
     assert begin_nodes[0].args[0].target is torch.ops.auto_deploy.mock_tuple_fork_moe_test.default
     _assert_numerical_correctness(gm, model, torch.randn(4, hidden_dim, device="cuda"))

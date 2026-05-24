@@ -21,6 +21,10 @@ import torch.distributed as dist
 import torch.nn.functional as F
 from einops import rearrange
 
+import tensorrt_llm.quantization.utils.fp4_utils as fp4_utils
+
+from ..quantization.quant import TRTLLM_NVFP4_SCALING_VECTOR_SIZE
+
 try:
     from tensorrt_llm._torch.flashinfer_utils import get_env_enable_pdl
 except (ModuleNotFoundError, ImportError):
@@ -35,6 +39,11 @@ try:
 except (ModuleNotFoundError, ImportError):
     _layer_norm_fwd = None
 from .triton_rms_norm import rms_norm
+
+
+def _get_nvfp4_fake_shapes(x: torch.Tensor) -> tuple[tuple[int, ...], int]:
+    output_shape, sf_size = fp4_utils.get_fp4_shape(x.shape, TRTLLM_NVFP4_SCALING_VECTOR_SIZE)
+    return tuple(output_shape), sf_size
 
 
 @torch.library.custom_op("auto_deploy::flashinfer_rms_norm", mutates_args=())
@@ -310,10 +319,7 @@ def _trtllm_fused_gated_rmsnorm_quant_nvfp4_fake(
     group_size: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     del gate, weight, scale, eps, group_size
-    output_shape = (*x.shape[:-1], x.shape[-1] // 2)
-    m = int(x.numel() // x.shape[-1])
-    sf_vec_size = 16
-    sf_size = ((m + 127) // 128) * 128 * ((x.shape[-1] // sf_vec_size + 3) // 4) * 4
+    output_shape, sf_size = _get_nvfp4_fake_shapes(x)
     return x.new_empty(output_shape, dtype=torch.uint8), x.new_empty((sf_size,), dtype=torch.uint8)
 
 
@@ -380,10 +386,7 @@ def _trtllm_fused_add_rmsnorm_quant_nvfp4_fake(
     eps: float,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     del residual, weight, scale, eps
-    output_shape = (*x.shape[:-1], x.shape[-1] // 2)
-    m = int(x.numel() // x.shape[-1])
-    sf_vec_size = 16
-    sf_size = ((m + 127) // 128) * 128 * ((x.shape[-1] // sf_vec_size + 3) // 4) * 4
+    output_shape, sf_size = _get_nvfp4_fake_shapes(x)
     return (
         x.new_empty(output_shape, dtype=torch.uint8),
         torch.empty_like(x),
@@ -416,10 +419,7 @@ def _trtllm_fused_add_rmsnorm_out_quant_nvfp4_fake(
     eps: float,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     del residual, weight, scale, eps
-    output_shape = (*x.shape[:-1], x.shape[-1] // 2)
-    m = int(x.numel() // x.shape[-1])
-    sf_vec_size = 16
-    sf_size = ((m + 127) // 128) * 128 * ((x.shape[-1] // sf_vec_size + 3) // 4) * 4
+    output_shape, sf_size = _get_nvfp4_fake_shapes(x)
     return (
         torch.empty_like(x),
         x.new_empty(output_shape, dtype=torch.uint8),
