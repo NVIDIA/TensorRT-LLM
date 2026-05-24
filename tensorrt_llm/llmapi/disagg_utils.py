@@ -17,6 +17,9 @@ __all__ = [
     'parse_disagg_config_file',
     'extract_server_configs',
     'split_world_comm',
+    'get_usage_tokens_from_ctx',
+    'rewrite_usage_info_from_ctx',
+    'rewrite_usage_response_from_ctx',
 ]
 
 
@@ -95,6 +98,40 @@ class MetadataServerConfig():
     port: int = 2379
     health_check_timeout: float = 5.0
     refresh_interval: float = 10.0
+
+
+def get_usage_tokens_from_ctx(
+        ctx_usage: Optional[Any]) -> tuple[Optional[int], int]:
+    if ctx_usage is None:
+        return None, 0
+
+    prompt_tokens = ctx_usage.prompt_tokens
+    cached_tokens = 0
+    prompt_tokens_details = ctx_usage.prompt_tokens_details
+    if prompt_tokens_details is not None:
+        cached_tokens = prompt_tokens_details.cached_tokens
+    return prompt_tokens, cached_tokens
+
+
+def rewrite_usage_info_from_ctx(usage: Optional[Any],
+                                ctx_usage: Optional[Any]) -> Optional[Any]:
+    prompt_tokens, cached_tokens = get_usage_tokens_from_ctx(ctx_usage)
+    if prompt_tokens is None or usage is None:
+        return usage
+
+    from tensorrt_llm.serve.openai_protocol import PromptTokensDetails
+
+    usage.prompt_tokens = prompt_tokens
+    usage.total_tokens = prompt_tokens + (usage.completion_tokens or 0)
+    usage.prompt_tokens_details = PromptTokensDetails(
+        cached_tokens=cached_tokens)
+    return usage
+
+
+def rewrite_usage_response_from_ctx(response: Any,
+                                    ctx_usage: Optional[Any]) -> Any:
+    rewrite_usage_info_from_ctx(response.usage, ctx_usage)
+    return response
 
 
 def get_ctx_gen_server_addrs(

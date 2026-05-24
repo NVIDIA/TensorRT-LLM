@@ -504,6 +504,7 @@ def launchStages(pipeline, cpu_arch, enableFailFast, globalVars)
 
         echo "env.globalVars is: ${env.globalVars}"
         globalVars = trtllm_utils.updateMapWithJson(pipeline, globalVars, env.globalVars, "globalVars")
+        globalVars = trtllm_utils.initializeCiBudget(pipeline, globalVars, 24, 'HOURS', "Build-${cpu_arch}")
         globalVars[ACTION_INFO] = trtllm_utils.setupPipelineDescription(pipeline, globalVars[ACTION_INFO])
     }
 

@@ -77,9 +77,7 @@ class BindingsNixlTransferAgent(BaseTransferAgent):
 
     def load_remote_agent(self, name: str, agent_desc: bytes):
         """Load a remote agent by its descriptor (bytes)."""
-        # AgentDesc expects std::string which can hold binary data
-        desc_str = agent_desc if isinstance(agent_desc, bytes) else agent_desc.encode()
-        cpp_desc = AgentDesc(desc_str)
+        cpp_desc = AgentDesc.deserialize(agent_desc)
         self._cpp_agent.load_remote_agent(name, cpp_desc)
 
     def load_remote_agent_by_connection(self, name: str, connection_info: str):
@@ -89,7 +87,9 @@ class BindingsNixlTransferAgent(BaseTransferAgent):
     def get_local_agent_desc(self) -> bytes:
         """Get the local agent descriptor as bytes."""
         agent_desc = self._cpp_agent.get_local_agent_desc()
-        return agent_desc.backend_agent_desc  # Returns bytes
+        return (
+            agent_desc.serialize()
+        )  # Serialize structured AgentDesc to opaque bytes for transport
 
     def get_local_connection_info(self) -> str:
         """Get the local connection info."""

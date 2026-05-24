@@ -32,6 +32,7 @@ class PostprocArgs:
     first_iteration: bool = True
     num_prompt_tokens: Optional[int] = None
     tokenizer: Optional[TransformersTokenizer] = None
+    ctx_usage: Optional[Any] = None
 
 
 @dataclass(kw_only=True)

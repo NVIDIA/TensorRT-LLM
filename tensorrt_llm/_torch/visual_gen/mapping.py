@@ -242,7 +242,8 @@ class VisualGenMapping(DeviceMeshTopologyImpl):
         """Ensure all ``vae_ranks`` share one cfg coordinate (or span the full world).
 
         Today ``_vae_ranks = list(range(parallel_vae_size))`` only sits inside
-        one CFG group when ``cfg`` is the outermost axis of ``dit_dim_order``.
+        one CFG group when ``cfg`` is the outermost axis of
+        ``_DEVICE_MESH_DIM_ORDER``.
         """
         if self.parallel_vae_size <= 1 or self.cfg_size <= 1:
             return
@@ -262,12 +263,13 @@ class VisualGenMapping(DeviceMeshTopologyImpl):
         if len(cfg_coords) > 1:
             raise NotImplementedError(
                 f"vae_ranks={self._vae_ranks} straddle CFG groups "
-                f"(cfg coordinates={sorted(cfg_coords)}) under order='{self._order}'. "
+                f"(cfg coordinates={sorted(cfg_coords)}) under "
+                f"order='{_DEVICE_MESH_DIM_ORDER}'. "
                 "VAE ranks must share a single CFG group, or span the full world. "
                 "_vae_ranks is currently hardcoded to list(range(parallel_vae_size)), "
                 "which only lands in one CFG group when 'cfg' is the outermost axis "
-                "of dit_dim_order. Either pick parallel_vae_size <= ranks_per_cfg_group "
-                "or derive _vae_ranks from the mesh."
+                "of _DEVICE_MESH_DIM_ORDER. Either pick parallel_vae_size <= "
+                "ranks_per_cfg_group or derive _vae_ranks from the mesh."
             )
 
     def _build_vae_group(self) -> None:

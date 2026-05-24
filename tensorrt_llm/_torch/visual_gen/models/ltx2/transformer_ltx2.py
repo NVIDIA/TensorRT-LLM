@@ -844,7 +844,7 @@ class LTXModel(nn.Module):
         ):
             raise ValueError(
                 f"audio_num_attention_heads ({audio_num_attention_heads}) "
-                f"must be divisible by dit_ulysses_size ({vgm.ulysses_size})"
+                f"must be divisible by ulysses_size ({vgm.ulysses_size})"
             )
 
         self._audio_is_sharded = False
