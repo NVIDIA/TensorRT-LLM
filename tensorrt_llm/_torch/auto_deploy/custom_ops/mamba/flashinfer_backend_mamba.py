@@ -60,7 +60,16 @@ def _fi_align(t: torch.Tensor) -> torch.Tensor:
 
 @torch.library.custom_op(
     "auto_deploy::flashinfer_cached_ssm",
-    mutates_args=("ssm_state_cache", "intermediate_ssm_state_cache"),
+    mutates_args=(
+        "ssm_state_cache",
+        "intermediate_ssm_state_cache",
+        # replay buffers: written in-place by the precompute and main kernels
+        # (double-buffered B/dt/dA_cumsum, single-buffered x); None in non-replay mode
+        "replay_old_x",
+        "replay_old_b",
+        "replay_old_dt",
+        "replay_old_da_cumsum",
+    ),
 )
 def _flashinfer_cached_ssm(
     # INPUTS (dense but may be flattened across sequences)
@@ -378,11 +387,12 @@ class FlashinferBackendSSM(BaseBackendSSM):
     ) -> ResourceHandlerDict:
         ret = super().get_cache_initializers(source_attn_node, cache_config)
 
-        # In replay mode we never call FlashInfer, so head_dim can be anything.
-        if (
-            not cls.ssm_replay
-            and ret["ssm_state_cache"].head_dim not in FLASHINFER_SUPPORTED_HEAD_DIMS
-        ):
+        # Replay requires both ssm_replay=True and SM >= 80 (Ampere+).
+        # Only when use_replay=True do we skip FlashInfer at runtime; otherwise
+        # _flashinfer_ssm_update is called and head_dim must be supported.
+        use_replay = cls.ssm_replay and get_sm_version() >= 80
+
+        if not use_replay and ret["ssm_state_cache"].head_dim not in FLASHINFER_SUPPORTED_HEAD_DIMS:
             raise ValueError(
                 f"flashinfer_ssm only supports head_dim in {FLASHINFER_SUPPORTED_HEAD_DIMS}. "
                 f"Got head_dim={ret['ssm_state_cache'].head_dim}. "
@@ -394,7 +404,7 @@ class FlashinferBackendSSM(BaseBackendSSM):
         # All 7 optional caches are always registered positionally (None = unused in this mode).
         # intermediate_ssm_state_cache: real in non-replay, None in replay.
         # replay_old_*: real in replay mode (SM80+), None otherwise.
-        if cls.ssm_replay and get_sm_version() >= 80:
+        if use_replay:
             ret["intermediate_ssm_state_cache"] = None
             x_dtype = torch.bfloat16
             B_fake = source_attn_node.args[2].meta["val"]
