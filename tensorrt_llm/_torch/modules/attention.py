@@ -1738,11 +1738,9 @@ class MLA(nn.Module):
         # Context-only batches: the fused path leaves a placeholder bf16 q_buf
         # that forward_generation_sparse_mla would read uninitialized, so
         # mixed/gen batches must take the legacy unfused path.
-        # `TRTLLM_DISABLE_FUSED_Q_FP8_QUANT=1` is an opt-out kill switch for
-        # debugging numerical drift between fused (skips bf16 round-trip) and
-        # legacy (bf16 store -> reload -> FP8) Q-quant paths. Keep it disabled
-        # by default until DSv4 accuracy recovers on the fused path.
-        if os.environ.get("TRTLLM_DISABLE_FUSED_Q_FP8_QUANT", "1") == "1":
+        # `TRTLLM_DISABLE_FUSED_Q_FP8_QUANT=1` opts back into the legacy
+        # two-kernel Q-quant path as a kill switch.
+        if os.environ.get("TRTLLM_DISABLE_FUSED_Q_FP8_QUANT", "0") == "1":
             return False
         if not self.is_deepseek_v4:
             return False

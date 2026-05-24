@@ -1584,6 +1584,14 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
         = reinterpret_cast<__nv_fp8_e4m3*>(nextWorkspacePtr(workspace_byte_ptr, offset, fp8_qkv_buffer_size));
     __nv_fp8_e4m3* fp8_q_buf
         = reinterpret_cast<__nv_fp8_e4m3*>(nextWorkspacePtr(workspace_byte_ptr, offset, fp8_q_buf_size));
+    // Fused FP8-Q path: caller pre-fills the nope segment of `quant_q_buf`;
+    // route the workspace pointer to it so the fused RoPE kernel appends rope
+    // FP8 in place and the FMHA Q load reads the merged [nope|rope] buffer.
+    if (mIsMLAEnabled && params.mla_param != nullptr && params.mla_param->fuse_q_fp8_in_rope
+        && params.mla_param->quant_q_buf != nullptr)
+    {
+        fp8_q_buf = reinterpret_cast<__nv_fp8_e4m3*>(params.mla_param->quant_q_buf);
+    }
     __nv_fp8_e4m3* fp8_k_buf
         = reinterpret_cast<__nv_fp8_e4m3*>(nextWorkspacePtr(workspace_byte_ptr, offset, fp8_k_buf_size));
     __nv_fp8_e4m3* fp8_v_buf
