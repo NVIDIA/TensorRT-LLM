@@ -139,7 +139,16 @@ def _run_verl_test(test_path, extra_args=None, timeout=600):
 
 
 def _run_single(verl_file, case_name, timeout=600):
-    """Run exactly one verl pytest case by name."""
+    """Run exactly one verl pytest case by ``-k`` filter.
+
+    Tried switching to pytest node-ID syntax (``<file>::<case>``) per
+    CodeRabbit's suggestion, but it returns pytest exit 4 (usage error)
+    under verl's own pytest config — likely because verl's conftest /
+    pytest plugins don't cleanly accept the absolute-path node-ID format.
+    Substring collision under ``-k`` is a theoretical risk we accept
+    because verl's case names are distinctive and don't share substrings
+    in practice.
+    """
     _run_verl_test(verl_file, extra_args=["-k", case_name], timeout=timeout)
 
 
@@ -150,6 +159,25 @@ def _run_single(verl_file, case_name, timeout=600):
 _STEP_LINE = re.compile(r"step:\d+ - ")
 
 
+def _dump_log_tail(log_file, lines=100, label=""):
+    """Print last ``lines`` lines of ``log_file`` to stdout for CI diagnostics.
+
+    The verl E2E tests redirect subprocess stdout/stderr to per-test log
+    files inside the container's ``/tmp``. When the container exits those
+    files are lost, so on subprocess failure we dump the tail to stdout
+    (which the CI runner captures into Jenkins console output) so the
+    actual error is preserved.
+    """
+    print(f"=== {label} log tail ({log_file}, last {lines} lines) ===")
+    try:
+        with open(log_file) as fh:
+            for line in fh.readlines()[-lines:]:
+                print(line, end="")
+    except OSError as e:
+        print(f"(could not read log: {e})")
+    print("=== end log tail ===")
+
+
 def _run_verl_train(extra_args, log_file=None, timeout=1800):
     """Run ``python3 -m verl.trainer.main_ppo`` in VERL_ROOT with Hydra overrides.
 
@@ -158,7 +186,9 @@ def _run_verl_train(extra_args, log_file=None, timeout=1800):
     caller can grep per-step metrics out of it.
     """
     if log_file is None:
-        log_file = tempfile.mktemp(suffix="-verl-train.log")
+        # ``mkstemp`` rather than the deprecated ``mktemp`` to avoid TOCTOU.
+        fd, log_file = tempfile.mkstemp(suffix="-verl-train.log")
+        os.close(fd)
     cmd = [sys.executable, "-m", "verl.trainer.main_ppo", *extra_args]
     with open(log_file, "w") as fh:
         result = subprocess.run(
@@ -169,6 +199,8 @@ def _run_verl_train(extra_args, log_file=None, timeout=1800):
             stderr=subprocess.STDOUT,
             timeout=timeout,
         )
+    if result.returncode != 0:
+        _dump_log_tail(log_file, label=f"verl trainer (exit {result.returncode})")
     assert result.returncode == 0, f"verl trainer exited {result.returncode}; see {log_file}"
     return log_file
 
@@ -186,7 +218,11 @@ def _ensure_gsm8k(local_dir):
         os.path.join(os.environ.get("TRTLLM_TEST_DATA_PATH", ""), "gsm8k"),
     ]
     for path in candidates:
-        if path and os.path.exists(os.path.join(path, "train.parquet")):
+        if (
+            path
+            and os.path.exists(os.path.join(path, "train.parquet"))
+            and os.path.exists(os.path.join(path, "test.parquet"))
+        ):
             return path
     os.makedirs(local_dir, exist_ok=True)
     subprocess.check_call(
@@ -196,35 +232,46 @@ def _ensure_gsm8k(local_dir):
     return local_dir
 
 
-def _check_convergence(log_file, target=0.01, ppo_kl_max=0.1):
-    """Parse the verl trainer's stdout log for per-step metrics and assert two bounds.
+def _check_convergence(log_file, target=0.01, ppl_ratio_max=1.05, min_kl_readings=1):
+    """Parse the verl trainer's stdout log for per-step metrics and assert bounds.
+
+    Used by both colocated (``test_e2e_convergence_qwen25_05b_grpo_trtllm``)
+    and standalone-async (``test_verl_E2E_standalone``) E2E tests.
 
       1. **Convergence (learning signal)**: ``max(critic/rewards/mean) > target``
          — the model has to show *any* learning signal during the short loop.
          Mirrors verl's own ``tests/special_e2e/check_results.py`` (which uses
          ``best_reward > args.target`` with default 0.2). We use a much lower
-         target (0.01) because: (a) GSM8K reward is binary 0/1 and our gate
-         runs only ~30 steps on Qwen2.5-0.5B with effective batch
+         target (0.01) because GSM8K reward is binary 0/1 and our gate runs
+         only ~30 steps on Qwen2.5-0.5B with effective batch
          ``train_batch_size(16) × rollout.n(4) = 64``, so non-zero rewards
-         can only be ``1/64=0.0156``, ``2/64=0.0313``, ``4/64=0.0625`` …;
-         (b) higher thresholds (e.g. ``> 0.05``) proved empirically flaky
-         over 20-step dry-runs — success spikes are heavy-tail — so we trade
-         a tighter convergence claim for run-to-run reliability; (c) Test 1's
-         role is a *smoke + IS-ratio* gate, not a real convergence assertion
-         (that needs 100s of steps).
+         can only be ``1/64=0.0156``, ``2/64=0.0313``, ``4/64=0.0625`` …
+         Higher thresholds (e.g. ``> 0.05``) proved empirically flaky
+         (heavy-tail success spikes), so we trade a tighter convergence
+         claim for run-to-run reliability. **Set ``target=None`` to skip**
+         (e.g. the standalone-async test where reward is not the focus).
 
-      2. **Importance-sampling ratio near 1**: ``max(actor/ppo_kl) < ppo_kl_max``
+      2. **Per-step PPL ratio near 1**: ``max(exp(|actor/ppo_kl|)) < ppl_ratio_max``
          — the trainer's policy must stay close to the rollout policy.
          ``actor/ppo_kl`` is verl's per-step ``mean(-log(ratio))`` where
-         ``ratio = π_train / π_rollout``. Threshold 0.1 means
-         ``ratio ∈ [exp(-0.1), exp(0.1)] ≈ [0.905, 1.105]`` — i.e. the ratio
-         stays *near 1 within ±10%*. A weight-sync / dtype / NaN-gradient
-         regression drives this up immediately (matches the framing of the
-         "RL Collapse from training-inference mismatch" paper referenced in
-         ``verl/trainer/config/algorithm.py:72``). Tighter than the
-         ``PPO_KL_MAX = 0.2`` used in ``test_verl_E2E_standalone`` because
-         empirical TRTLLM-rollout runs on this config have measured
-         ``|ppo_kl| < 5e-4`` (~200× headroom on the 0.1 bound).
+         ``ratio = π_train / π_rollout``; the PPL ratio is ``exp(|kl|)``,
+         interpretable as "by what factor does perplexity drift between
+         trainer and rollout per step". Symmetric absolute value catches
+         negative drift too. Default 1.05 leaves ~13× margin over the worst
+         ``|kl|`` we've measured across our colocated Lyris dry-runs
+         (``|kl|=3.8e-3`` ⇒ ratio=1.0038), absorbing run-to-run variance.
+         The standalone-async path uses a tighter 1.01 bound because under
+         bypass_mode (where ``old_log_probs`` come directly from rollout)
+         any drift IS the regression to catch. A weight-sync / dtype /
+         NaN-gradient regression typically drives ``|kl|`` to ~1.0+ on the
+         first PPO step (ratio ≫ 2.7), so both bounds catch them.
+
+      3. **Minimum kl readings**: ``len(kls) >= min_kl_readings`` —
+         guards against degenerate runs where the trainer didn't emit
+         enough PPO steps to assert on (e.g. verl's fully_async pipeline
+         logs PPO metrics with one-step lag and may emit 0 readings if
+         only one trainer step actually fires; bump ``min_kl_readings``
+         to require multiple).
 
     Verl prints one summary line per step in the form
     ``step:N - key1:val1 - key2:val2 - …``. When the trainer runs as a Ray
@@ -234,6 +281,8 @@ def _check_convergence(log_file, target=0.01, ppo_kl_max=0.1):
     ``check_results.py`` uses ``startswith("step")`` and would miss
     Ray-prefixed lines).
     """
+    import math
+
     rewards, kls = [], []
     with open(log_file) as fh:
         for line in fh:
@@ -253,17 +302,22 @@ def _check_convergence(log_file, target=0.01, ppo_kl_max=0.1):
                     rewards.append(f)
                 elif key == "actor/ppo_kl":
                     kls.append(f)
-    assert rewards, f"No critic/rewards/mean lines parsed from {log_file}"
-    best = max(rewards)
-    assert best > target, (
-        f"Convergence target not met: best critic/rewards/mean={best:.4f} "
-        f"<= {target}; see {log_file}"
+    if target is not None:
+        assert rewards, f"No critic/rewards/mean lines parsed from {log_file}"
+        best = max(rewards)
+        assert best > target, (
+            f"Convergence target not met: best critic/rewards/mean={best:.4f} "
+            f"<= {target}; see {log_file}"
+        )
+    assert len(kls) >= min_kl_readings, (
+        f"Expected >= {min_kl_readings} actor/ppo_kl readings, got {len(kls)}: "
+        f"{kls}; see {log_file}"
     )
-    assert kls, f"No actor/ppo_kl lines parsed from {log_file}"
-    worst_kl = max(kls)
-    assert worst_kl < ppo_kl_max, (
-        f"Importance-sampling ratio out of band: max(actor/ppo_kl)="
-        f"{worst_kl:.4f} >= {ppo_kl_max} (ratio not near 1); see {log_file}"
+    worst_kl = max(abs(kl) for kl in kls)
+    worst_ratio = math.exp(worst_kl)
+    assert worst_ratio < ppl_ratio_max, (
+        f"PPL ratio out of band: max(exp(|actor/ppo_kl|))={worst_ratio:.4f} "
+        f"(|kl|={worst_kl:.4f}) >= {ppl_ratio_max}; see {log_file}"
     )
 
 

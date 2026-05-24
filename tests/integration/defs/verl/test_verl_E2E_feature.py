@@ -34,8 +34,8 @@ from .test_verl_cases import VERL_ROOT, _ensure_gsm8k
 
 
 @pytest.mark.timeout(1500)
-def test_e2e_smoke_qwen25_7b_megatron_trtllm():
-    """1-step Megatron(TP=2,PP=1) GRPO + Qwen2.5-7B + TRT-LLM rollout."""
+def test_e2e_smoke_qwen25_7b_megatron_trtllm() -> None:
+    """3-step Megatron(TP=2,PP=1) GRPO + Qwen2.5-7B + TRT-LLM rollout."""
     model = os.path.join(os.environ["TRTLLM_TEST_MODEL_PATH_ROOT"], "Qwen/Qwen2.5-7B-Instruct")
     data_dir = _ensure_gsm8k("/tmp/verl-data/gsm8k")
     env = os.environ.copy()
