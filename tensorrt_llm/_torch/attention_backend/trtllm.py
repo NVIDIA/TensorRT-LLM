@@ -44,7 +44,6 @@ _THOP_EXCLUDED_FIELDS: frozenset = frozenset({
 # rich object owns them). Sync test enforces both the kwarg name and the
 # literal value.
 _THOP_LITERALS: dict = {
-    "sink_token_length": 0,
     "sparse_mla_topk_lens": None,
     "compressed_kv_cache_pool_ptr": None,
 }
@@ -1424,39 +1423,10 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
 
         self._ensure_rope_table_size(metadata.max_seq_len)
 
-        rotary_embedding_dim = self.rope_params.dim
-        rotary_embedding_base = self.rope_params.theta
-        rotary_embedding_scale_type = int(self.rope_params.scale_type)
-        rotary_embedding_scales = [
-            self.rope_params.scale, self.rope_params.short_m_scale,
-            self.rope_params.long_m_scale
-        ]
-        rotary_embedding_max_position_info = [
-            self.rope_params.max_positions,
-            self.rope_params.original_max_positions
-        ]
-        spec_decoding_bool_params = [
-            metadata.is_spec_decoding_enabled, metadata.use_spec_decoding,
-            metadata.is_spec_dec_tree
-        ]
-        spec_decoding_tensor_params = [
-            metadata.spec_decoding_generation_lengths,
-            metadata.spec_decoding_position_offsets_cpp,
-            metadata.spec_decoding_packed_mask
-        ]
-        if self.is_sm_version_trtllm_gen_kernel(sm=get_sm_version()):
-            spec_decoding_tensor_params.append(
-                metadata.spec_decoding_bl_tree_mask_offset)
-            spec_decoding_tensor_params.append(
-                metadata.spec_decoding_bl_tree_mask)
-            spec_decoding_tensor_params.append(
-                metadata.spec_bl_tree_first_sparse_mask_offset_kv)
-        helix_tensor_params = [
-            metadata.helix_position_offsets, metadata.helix_is_inactive_rank
-        ]
-
-        layer_idx = self.get_local_layer_idx(metadata)
-        if metadata.spec_decoding_bl_tree_mask is not None and layer_idx == 0:
+        # Refresh every call: the cache-manager mapping can change between
+        # forward passes.
+        self.local_layer_idx = self.get_local_layer_idx(metadata)
+        if metadata.spec_decoding_bl_tree_mask is not None and self.local_layer_idx == 0:
             metadata.spec_decoding_bl_tree_mask.zero_()
 
         if self.print_skip_softmax_stat:
@@ -1496,68 +1466,33 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             # inputs) or a literal allowlisted in ``_THOP_LITERALS``.
             # ``test_attention_op_sync.py`` enforces this statically.
             thop.attention(
-                q,
-                k,
-                v,
-                output,
-                output_sf,
-                workspace,
-                metadata.kv_lens_cuda_runtime,
-                metadata.kv_lens_runtime,
-                metadata.host_total_kv_lens,
-                metadata.prompt_lens_cuda_runtime,
-                metadata.prompt_lens_cpu_runtime,
-                metadata.host_request_types_runtime,
-                metadata.kv_cache_block_offsets,
-                metadata.host_kv_cache_pool_pointers,
-                metadata.host_kv_cache_pool_mapping,
-                metadata.cache_indirection,
-                kv_scale_orig_quant,
-                kv_scale_quant_orig,
-                out_scale,
-                self.rotary_inv_freq,
-                self.rotary_cos_sin,
-                forward_args.latent_cache,
-                forward_args.q_pe,
-                metadata.block_ids_per_seq,
-                forward_args.attention_sinks,
-                is_fused_qkv,
-                update_kv_cache,
-                self.predicted_tokens_per_seq,
-                layer_idx,
-                self.num_heads,
-                self.num_kv_heads,
-                self.head_dim,
-                metadata.tokens_per_block,
-                metadata.max_num_requests,
-                max_context_length,
-                attention_window_size,
-                metadata.beam_width,
-                int(mask_type),
-                self.quant_mode,
-                self.q_scaling,
-                self.position_embedding_type,
-                rotary_embedding_dim,
-                rotary_embedding_base,
-                rotary_embedding_scale_type,
-                rotary_embedding_scales,
-                rotary_embedding_max_position_info,
-                use_paged_context_fmha,
-                int(attention_input_type),
-                self.is_mla_enable,
-                forward_args.chunked_prefill_buffer_batch_size,
-                self.q_lora_rank,
-                self.kv_lora_rank,
-                self.qk_nope_head_dim,
-                self.qk_rope_head_dim,
-                self.v_head_dim,
-                self.rope_append,
-                mrope_rotary_cos_sin,
-                mrope_position_deltas,
-                helix_tensor_params,
-                self.attention_chunk_size,
-                forward_args.softmax_stats_tensor,
-                spec_decoding_bool_params,
+                q=q,
+                k=k,
+                v=v,
+                output=forward_args.output,
+                output_sf=forward_args.output_sf,
+                workspace_=metadata.effective_workspace,
+
+                # --- Per-step batch state (TrtllmAttentionMetadata) ---
+                sequence_length=metadata.kv_lens_cuda_runtime,
+                host_past_key_value_lengths=metadata.kv_lens_runtime,
+                host_total_kv_lens=metadata.host_total_kv_lens,
+                context_lengths=metadata.prompt_lens_cuda_runtime,
+                host_context_lengths=metadata.prompt_lens_cpu_runtime,
+                host_request_types=metadata.host_request_types_runtime,
+                kv_cache_block_offsets=metadata.kv_cache_block_offsets,
+                host_kv_cache_pool_pointers=metadata.
+                host_kv_cache_pool_pointers,
+                host_kv_cache_pool_mapping=metadata.host_kv_cache_pool_mapping,
+                cache_indirection=metadata.cache_indirection,
+                block_ids_per_seq=metadata.block_ids_per_seq,
+                tokens_per_block=metadata.tokens_per_block,
+                max_num_requests=metadata.max_num_requests,
+                beam_width=metadata.beam_width,
+                use_paged_context_fmha=metadata.use_paged_context_fmha,
+                helix_tensor_params=metadata.helix_tensor_params,
+                spec_decoding_bool_params=metadata.spec_decoding_bool_params,
+                spec_decoding_tensor_params=metadata.
                 spec_decoding_tensor_params,
                 num_sparse_topk=metadata.num_sparse_topk,
                 flash_mla_tile_scheduler_metadata=metadata.
@@ -1637,10 +1572,9 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                 sparse_attn_indices_block_size=forward_args.sparse.
                 sparse_attn_indices_block_size,
 
-                # --- Literals intentionally None / 0 (see _THOP_LITERALS) ---
+                # --- Literals intentionally None (see _THOP_LITERALS) ---
                 # ``sparse_mla_topk_lens`` and ``compressed_kv_cache_pool_ptr``
                 # stay as literal ``None`` until DeepSeek V4 sparse-MLA lands.
-                sink_token_length=0,
                 sparse_mla_topk_lens=None,
                 compressed_kv_cache_pool_ptr=None,
             )
