@@ -23,6 +23,7 @@ from typing import Optional, Union
 
 import torch
 
+from tensorrt_llm.llmapi.llm_args import SkipSoftmaxAttentionConfig
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.visual_gen.args import QuantAttentionConfig
@@ -202,6 +203,7 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
         max_seq_len: int = 4096,
         quant_attention_config: Optional[QuantAttentionConfig] = None,
         attention_metadata_state: Optional[dict] = None,
+        sparse_attention_config: Optional[SkipSoftmaxAttentionConfig] = None,
     ):
         num_kv_heads = num_kv_heads or num_heads
 
@@ -213,6 +215,11 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
             quant_config=quant_config,
             dtype=dtype,
         )
+        # Plain attribute (no construct-time caching). The kernel re-reads
+        # self.sparse_attention_config per forward call, so callers like
+        # apply_skip_softmax_overrides() can swap or clear it post-construction
+        # and the next forward picks up the change.
+        self.sparse_attention_config = sparse_attention_config
 
         # TRTLLM expects flat [B*S, H*D] format
         self._preferred_layout = AttentionTensorLayout.NHD
