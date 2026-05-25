@@ -83,6 +83,21 @@ _TINY_KWARGS_UNIVERSAL: Dict[str, Any] = {
     "vocab_size": 64,
     "max_position_embeddings": 256,
     "rope_theta": 1000000.0,
+    # Force vanilla rotary on every model: transformers 5.x defaults
+    # ``rope_scaling`` to ``{"rope_type": "default"}`` for some configs
+    # (e.g. ``DeepseekV3Config``), and ``modeling_deepseek.py`` --
+    # which is the production deployment path for real DeepSeek-V3
+    # checkpoints -- assumes any non-None ``rope_scaling`` ships the
+    # full yarn dict (``factor``, ``mscale_all_dim``, ...). That
+    # assumption is fine in production where real configs always carry
+    # those keys, but a default-constructed config in this test trips
+    # ``DeepSeekV3Attention.__init__`` with a ``KeyError: 'factor'``
+    # before any sharding work runs. Setting ``rope_scaling = None``
+    # routes every model in the matrix through its vanilla rotary
+    # branch, which is also the appropriate stimulus for a sharding
+    # equivalence test (we want minimal, deterministic embeddings,
+    # not yarn extrapolation behaviour).
+    "rope_scaling": None,
     # MoE -- deepseek requires num_experts % n_group == 0 (n_group defaults to 8)
     "num_experts": 8,
     "num_experts_per_tok": 2,
@@ -91,6 +106,12 @@ _TINY_KWARGS_UNIVERSAL: Dict[str, Any] = {
     "first_k_dense_replace": 0,
     "n_routed_experts": 8,
     "n_shared_experts": 1,
+    # DeepSeek-V3 alternates dense and MoE blocks every ``moe_layer_freq``
+    # layers (``layer_idx % moe_layer_freq == 0`` -> MoE). Real configs ship
+    # ``moe_layer_freq = 1`` (every layer is MoE) but ``DeepseekV3Config()``
+    # leaves the attribute unset, which trips ``DeepSeekV3DecoderLayer``
+    # before sharding ever runs.
+    "moe_layer_freq": 1,
     # MLA (DeepSeek-V3)
     "q_lora_rank": 8,
     "kv_lora_rank": 8,
