@@ -1547,7 +1547,7 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
     def free_resources(self, request: LlmRequest, pin_on_release: bool = False):
         if request in self.requests:
             self.requests.remove(request)
-            # self._request_id_to_state_index.pop(request.py_request_id, None)
+            self._request_id_to_state_index.pop(request.py_request_id, None)
         super().free_resources(request, pin_on_release)
 
     def _setup_state_indices(self) -> None:
