@@ -562,10 +562,10 @@ def test_nvfp4_grouped_gemm_finalize_blackwell(
 
     c = torch.ops.trtllm.cute_dsl_nvfp4_grouped_gemm_finalize_blackwell(
         a,
-        [b],
+        b,
         a_sf,
-        [b_sf],
-        [alpha],
+        b_sf,
+        alpha,
         tile_idx_to_group_idx,
         tile_idx_to_mn_limit,
         permuted_idx_to_expanded_idx,
@@ -599,35 +599,6 @@ def test_nvfp4_grouped_gemm_finalize_blackwell(
     )
     match_ratio = torch.isclose(c, c_ref, rtol=1.6e-2, atol=1e-5).sum().item() / c.numel()
     assert match_ratio > 0.99
-
-    if num_local_experts > 1:
-        split_sizes = (num_local_experts // 2, num_local_experts - num_local_experts // 2)
-        b_list = list(torch.split(b, split_sizes, dim=0))
-        b_sf_list = list(torch.split(b_sf, split_sizes, dim=0))
-        alpha_list = list(torch.split(alpha, split_sizes, dim=0))
-        c_multi = torch.ops.trtllm.cute_dsl_nvfp4_grouped_gemm_finalize_blackwell(
-            a,
-            b_list,
-            a_sf,
-            b_sf_list,
-            alpha_list,
-            tile_idx_to_group_idx,
-            tile_idx_to_mn_limit,
-            permuted_idx_to_expanded_idx,
-            num_non_exiting_tiles,
-            token_final_scales,
-            num_experts=num_experts,
-            top_k=top_k,
-            num_local_experts=num_local_experts,
-            local_expert_offset=0,
-            tile_size=tile_size,
-            output_dtype=torch.bfloat16,
-            scaling_vector_size=sf_vec_size,
-        )
-        multi_match_ratio = (
-            torch.isclose(c_multi, c_ref, rtol=1.6e-2, atol=1e-5).sum().item() / c_ref.numel()
-        )
-        assert multi_match_ratio > 0.99
 
 
 @pytest.mark.skipif(
