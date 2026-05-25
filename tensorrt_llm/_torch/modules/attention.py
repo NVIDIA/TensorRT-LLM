@@ -712,7 +712,7 @@ class Attention(nn.Module):
         # then exchange and combine across CP ranks.
         # NOTE: The helix post-process combine step works on unquantized
         # (BF16/FP16) partial outputs and softmax stats from each rank.
-        # We intentionally skip passing out_scale/out_scale_sf to FMHA here
+        # We intentionally skip passing out_scale to FMHA here
         # so it produces BF16 output. After combining, the downstream o_proj
         # linear layer handles quantization (FP8/NVFP4) in its apply() method.
         if self.mapping.has_cp_helix() and attn_metadata.num_contexts == 0:
@@ -741,21 +741,24 @@ class Attention(nn.Module):
             attn_output = self._helix_post_process(attn_output, softmax_stats)
             return attn_output, None
 
+        # Don't set out_scale if o_proj has pre_quant_scale — this prevents
+        # FP8/FP4 output and keeps attention output in BF16 for better
+        # precision when applying pre_quant_scale. Also don't set out_scale
+        # if LoRA is active — LoRA grouped_gemm doesn't support FP8.
+        # When ``output_sf`` is set the kernel writes NVFP4 output and reads
+        # ``input_scale`` as its scaling factor; otherwise it reads
+        # ``inv_input_scale``.
         out_scale = None
-        out_scale_sf = None
-        # Don't set out_scale if o_proj has pre_quant_scale - this prevents FP8/FP4 output
-        # and keeps attention output in BF16 for better precision when applying pre_quant_scale
-        # Also don't set out_scale if LoRA is active - LoRA grouped_gemm doesn't support FP8
         if self._use_quantize_output() and not has_lora:
-            out_scale = self.o_proj.inv_input_scale
-            out_scale_sf = self.o_proj.input_scale
+            out_scale = (self.o_proj.input_scale if output_sf is not None else
+                         self.o_proj.inv_input_scale)
 
-        kv_scales_sf = None
-        kv_scales_sf_inv = None
+        kv_scale_orig_quant = None
+        kv_scale_quant_orig = None
         if self.quant_config is not None and self.quant_config.layer_quant_mode.has_fp4_kv_cache(
         ):
-            kv_scales_sf = self.qkv_proj.kv_scales
-            kv_scales_sf_inv = self.qkv_proj.inv_kv_scales
+            kv_scale_orig_quant = self.qkv_proj.inv_kv_scales
+            kv_scale_quant_orig = self.qkv_proj.kv_scales
 
         attn_output = self.attn.forward(
             q,
@@ -764,9 +767,8 @@ class Attention(nn.Module):
             attn_metadata,
             forward_args=AttentionForwardArgs(
                 out_scale=out_scale,
-                out_scale_sf=out_scale_sf,
-                kv_scales_sf=kv_scales_sf,
-                kv_scales_sf_inv=kv_scales_sf_inv,
+                kv_scale_orig_quant=kv_scale_orig_quant,
+                kv_scale_quant_orig=kv_scale_quant_orig,
                 attention_mask=attention_mask,
                 mrope_rotary_cos_sin=mrope_rotary_cos_sin,
                 mrope_position_deltas=mrope_position_deltas,

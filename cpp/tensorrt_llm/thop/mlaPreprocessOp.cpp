@@ -129,17 +129,14 @@ std::vector<torch::Tensor> loadPagedKVCacheForMLA(torch::ScalarType out_dtype, i
         attention_window_size, beam_width, 0 /*seq_offset*/, true /*is_mla_enable*/, torch::elementSize(out_dtype))
                                        .kvCacheBuffer;
 
-    float const* kv_scale_orig_quant_ptr = nullptr;
     float const* kv_scale_quant_orig_ptr = nullptr;
     if (kv_cache_quant_mode.hasKvCacheQuant())
     {
         TLLM_CHECK_WITH_INFO(kv_cache_quant_mode.hasFp8KvCache(), "Only FP8 KV cache is supported for now");
-        TORCH_CHECK(kv_scale_orig_quant.has_value());
-        TORCH_CHECK(kv_scale_quant_orig.has_value());
-        kv_scale_orig_quant_ptr = kv_scale_orig_quant.value().data_ptr<float>();
+    }
+    if (kv_scale_quant_orig.has_value())
+    {
         kv_scale_quant_orig_ptr = kv_scale_quant_orig.value().data_ptr<float>();
-        TLLM_CHECK(kv_scale_orig_quant_ptr != nullptr);
-        TLLM_CHECK(kv_scale_quant_orig_ptr != nullptr);
     }
 
     std::vector<torch::Tensor> outputs;
@@ -217,16 +214,10 @@ std::vector<torch::Tensor> loadChunkedKVCacheForMLA(torch::ScalarType out_dtype,
         attention_window_size, beam_width, 0 /*seq_offset*/, true /*is_mla_enable*/, torch::elementSize(out_dtype))
                                        .kvCacheBuffer;
 
-    float const* kv_scale_orig_quant_ptr = nullptr;
     float const* kv_scale_quant_orig_ptr = nullptr;
-    if (kv_cache_quant_mode.hasKvCacheQuant())
+    if (kv_scale_quant_orig.has_value())
     {
-        TORCH_CHECK(kv_scale_orig_quant.has_value());
-        TORCH_CHECK(kv_scale_quant_orig.has_value());
-        kv_scale_orig_quant_ptr = kv_scale_orig_quant.value().data_ptr<float>();
         kv_scale_quant_orig_ptr = kv_scale_quant_orig.value().data_ptr<float>();
-        TLLM_CHECK(kv_scale_orig_quant_ptr != nullptr);
-        TLLM_CHECK(kv_scale_quant_orig_ptr != nullptr);
     }
 
     std::vector<torch::Tensor> outputs;
@@ -321,16 +312,13 @@ void MLARopeAppendPagedKVAssignQ(torch::Tensor& q, torch::Tensor& latent_cache, 
                                        .kvCacheBuffer;
 
     float const* kv_scale_orig_quant_ptr = nullptr;
-    float const* kv_scale_quant_orig_ptr = nullptr;
     if (kv_cache_quant_mode.hasKvCacheQuant())
     {
         TLLM_CHECK_WITH_INFO(kv_cache_quant_mode.hasFp8KvCache(), "Only FP8 KV cache is supported for now");
-        TORCH_CHECK(kv_scale_orig_quant.has_value());
-        TORCH_CHECK(kv_scale_quant_orig.has_value());
+    }
+    if (kv_scale_orig_quant.has_value())
+    {
         kv_scale_orig_quant_ptr = kv_scale_orig_quant.value().data_ptr<float>();
-        kv_scale_quant_orig_ptr = kv_scale_quant_orig.value().data_ptr<float>();
-        TLLM_CHECK(kv_scale_orig_quant_ptr != nullptr);
-        TLLM_CHECK(kv_scale_quant_orig_ptr != nullptr);
     }
 
     if (input_dtype == torch::kFloat16)
@@ -425,7 +413,6 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
         ", Tensor kv_cache_block_offsets"
         ", Tensor host_kv_cache_pool_pointers"
         ", Tensor host_kv_cache_pool_mapping"
-        ", Tensor? kv_scale_orig_quant"
         ", Tensor? kv_scale_quant_orig"
         ", int layer_idx"
         ", int lora_size"
@@ -454,7 +441,6 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
         ", Tensor kv_cache_block_offsets"
         ", Tensor host_kv_cache_pool_pointers"
         ", Tensor host_kv_cache_pool_mapping"
-        ", Tensor? kv_scale_orig_quant"
         ", Tensor? kv_scale_quant_orig"
         ", int layer_idx"
         ", int lora_size"
@@ -491,7 +477,6 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
         ", Tensor host_kv_cache_pool_pointers"
         ", Tensor host_kv_cache_pool_mapping"
         ", Tensor? kv_scale_orig_quant"
-        ", Tensor? kv_scale_quant_orig"
         ", int layer_idx"
         ", int tokens_per_block"
         ", int attention_window_size"
