@@ -1820,7 +1820,7 @@ class KVCacheManager(BaseResourceManager):
             max_snapshots += self.spec_config.max_draft_len
         if (kv_cache_config.enable_block_reuse and interval is not None
                 and interval > 0):
-            max_snapshots = max(max_tokens // interval, max_snapshots)
+            max_snapshots += max_tokens // interval
 
         secondary_snapshots = int(max_snapshots *
                                   (self._secondary_pool_memory_bytes /
