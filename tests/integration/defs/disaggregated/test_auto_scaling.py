@@ -1,5 +1,6 @@
 import asyncio
 import os
+import platform
 
 import pytest
 import requests
@@ -24,7 +25,7 @@ def get_ucx_tls():
     explicitly to avoid UCX auto-selection picking a misbehaving NIC transport.
     """
     sm = get_sm_version()
-    if sm == 103:
+    if sm == 103 and "aarch" in platform.machine().lower():
         return "cuda_copy,cuda_ipc,sm,self,tcp"
     if sm < 90:
         return "^cuda_ipc,ib,gdr_copy"
