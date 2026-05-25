@@ -272,11 +272,31 @@ def _run_equivalence_job_impl(
     #    Both sides still go through the same export step, so any
     #    torch_export_to_gm semantic gap is identical on both sides and
     #    cancels out of the comparison.
+    #
+    #    We pass the example inputs as ``kwargs`` (not positional ``args``)
+    #    to mirror the AutoDeploy runtime path -- the production export
+    #    transform (``transform/library/export_to_gm.py:ExportToGM``) also
+    #    calls ``torch_export_to_gm(..., args=(), kwargs=captured_kwargs)``.
+    #    Binding by name makes the test invariant to ``forward()`` parameter
+    #    ordering across IR modeling files, which currently differs between
+    #    qwen3 (``(input_ids, position_ids, inputs_embeds, ...)``) and
+    #    nemotron_h / qwen3_5_moe (``(input_ids, inputs_embeds,
+    #    position_ids, ...)``). Positional export would silently bind
+    #    ``position_ids`` to whatever lives in slot 2, which trips the
+    #    "specify exactly one of input_ids or inputs_embeds" guard on the
+    #    latter family. The runtime path dodges this by being kwarg-based
+    #    and by stripping ``**kwargs`` via ``set_exact_signature``; this
+    #    test dodges it by just being kwarg-based.
     # ------------------------------------------------------------------
     dist_cfg_spec = _DIST_CONFIGS[dist_config_name]
     enable_attention_dp = dist_cfg_spec["enable_attention_dp"]
 
-    gm_unsharded = torch_export_to_gm(model, args=(input_ids, position_ids), clone=True)
+    gm_unsharded = torch_export_to_gm(
+        model,
+        args=(),
+        kwargs={"input_ids": input_ids, "position_ids": position_ids},
+        clone=True,
+    )
     if enable_attention_dp:
         assert BATCH_SIZE % world_size == 0, (
             f"BATCH_SIZE={BATCH_SIZE} must be divisible by world_size={world_size} "
@@ -288,7 +308,10 @@ def _run_equivalence_job_impl(
     else:
         local_in_for_export, local_pos_for_export = input_ids, position_ids
     gm_sharded = torch_export_to_gm(
-        model, args=(local_in_for_export, local_pos_for_export), clone=True
+        model,
+        args=(),
+        kwargs={"input_ids": local_in_for_export, "position_ids": local_pos_for_export},
+        clone=True,
     )
 
     # ------------------------------------------------------------------
@@ -352,8 +375,15 @@ def _run_equivalence_job_impl(
     #   replicated unsharded reference.
     # ------------------------------------------------------------------
     with torch.inference_mode():
-        y_unsharded = extract_logits(gm_unsharded(input_ids, position_ids))
-        y_local = extract_logits(gm_sharded(local_in_for_export, local_pos_for_export))
+        # Call the exported GMs with the same kwarg convention used at
+        # export time (see step 3 above). The GM's traced forward signature
+        # mirrors the export call, and calling by name keeps it that way --
+        # we never reintroduce a positional dependency that would tie this
+        # test back to ``forward()`` parameter ordering.
+        y_unsharded = extract_logits(gm_unsharded(input_ids=input_ids, position_ids=position_ids))
+        y_local = extract_logits(
+            gm_sharded(input_ids=local_in_for_export, position_ids=local_pos_for_export)
+        )
         if enable_attention_dp:
             y_sharded = _all_gather_concat(y_local.contiguous(), world_size)
         else:
