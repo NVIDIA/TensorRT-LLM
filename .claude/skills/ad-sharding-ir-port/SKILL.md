@@ -263,6 +263,6 @@ You are NOT done until every row in the table is a yes-allowed category.
 
 - All four configurations of the **sharding equivalence test** (Step 11b) pass with the parsed `rel_rmse` strictly below the parsed `tol` from the same rank-0 log line. Report the per-cell `rel_rmse` and `tol` pair.
 - `world_size=1`: unsharded path; hints should not break correctness.
-- `world_size=<max-available>`: end-to-end run (Step 11a) at the maximum GPU count auto-detected on the machine (head-divisibility permitting; see Step 11). One run is sufficient — no `world_size=2` and `world_size=8` pair, no hardcoded literals. Repeating across smaller sizes adds noise without coverage, because Step 11b's offline sharding equivalence test already exercises 2- and 4-GPU dist configs.
+- `world_size=<max-available>`: end-to-end run (Step 11a) at the maximum GPU count auto-detected on the machine (head-divisibility permitting; see Step 11). 
 - `apply_sharding_hints` node count vs expectation.
 - Optional: `shard_layers: ['moe']` to verify selective sharding.
