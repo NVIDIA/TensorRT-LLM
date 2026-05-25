@@ -44,6 +44,10 @@ from .model_engine import PyTorchModelEngine
 from .model_loader import ModelLoader, _construct_checkpoint_loader
 from .py_executor import PyExecutor
 
+FLASH_MLA_TOKENS_PER_BLOCK = 64
+FP4_MLA_TOKENS_PER_BLOCK = 128
+FLASHINFER_FP4_MLA_ATTENTION_ENV = "TRTLLM_FLASHINFER_FP4_MLA_ATTENTION"
+
 
 class _ExecutorMemoryMonitor:
     """Currently this focuses on tracking memory usage and related errors."""
@@ -179,6 +183,55 @@ def _set_model_engines_cache_reuse(model_engines, cache_reuse: bool):
         if engine is None:
             continue
         engine.attn_runtime_features.cache_reuse = cache_reuse
+
+
+def _has_fp4_kv_cache(model_config, kv_cache_config) -> bool:
+    kv_cache_quant_algo = getattr(getattr(model_config, "quant_config", None),
+                                  "kv_cache_quant_algo", None)
+    fp4_quant_values = {
+        QuantAlgo.NVFP4,
+        getattr(QuantAlgo.NVFP4, "value", None),
+        "NVFP4",
+    }
+    kv_cache_dtype = getattr(kv_cache_config, "dtype", None)
+    return ((isinstance(kv_cache_dtype, str)
+             and kv_cache_dtype.lower() == "nvfp4")
+            or (isinstance(kv_cache_quant_algo, str)
+                and kv_cache_quant_algo.upper() == "NVFP4")
+            or kv_cache_quant_algo in fp4_quant_values)
+
+
+def _enable_fp4_mla_attention() -> bool:
+    return os.getenv(FLASHINFER_FP4_MLA_ATTENTION_ENV, "0").lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
+
+def _select_mla_tokens_per_block(config, model_config, kv_cache_config,
+                                 tokens_per_block: int) -> int:
+    if not is_mla(config):
+        return tokens_per_block
+
+    if (_has_fp4_kv_cache(model_config, kv_cache_config)
+            and _enable_fp4_mla_attention()):
+        tokens_per_block = FP4_MLA_TOKENS_PER_BLOCK
+        logger.info(
+            f"Change tokens_per_block to: {tokens_per_block} for using FP4 MLA attention"
+        )
+        kv_cache_config.tokens_per_block = tokens_per_block
+        return tokens_per_block
+
+    if model_config.enable_flash_mla:
+        tokens_per_block = FLASH_MLA_TOKENS_PER_BLOCK
+        logger.info(
+            f"Change tokens_per_block to: {tokens_per_block} for using FlashMLA"
+        )
+        kv_cache_config.tokens_per_block = tokens_per_block
+
+    return tokens_per_block
 
 
 def _get_mapping(_mapping: Mapping) -> Mapping:
@@ -633,24 +686,10 @@ def create_py_executor(
         kv_cache_config.enable_block_reuse = False
         _set_model_engines_cache_reuse([model_engine, draft_model_engine],
                                        False)
+    tokens_per_block = _select_mla_tokens_per_block(
+        config, model_engine.model.model_config, kv_cache_config,
+        tokens_per_block)
     if is_mla(config):
-        if model_engine.model.model_config.enable_flash_mla:
-            tokens_per_block = 64
-            # Propagate the override back to kv_cache_config so any consumer
-            # that later reads llm_args.kv_cache_config.tokens_per_block sees
-            # the effective value. KvCacheConnectorScheduler subclasses
-            # (LMCache, Dynamo KVBM) are instantiated further down via
-            # scheduler_cls(llm_args) and size their block pools from
-            # llm_args.kv_cache_config.tokens_per_block. Without this the
-            # connector's block size desynced from the KVCacheManager's
-            # actual tokens_per_block (user-set or default 32 vs. FlashMLA's
-            # forced 64), producing a frozen cache_block_ids view to the
-            # connector and silently-corrupted decode KV (#13320).
-            kv_cache_config.tokens_per_block = tokens_per_block
-            logger.info(
-                f"Change tokens_per_block to: {tokens_per_block} for using FlashMLA"
-            )
-
         sm_version = get_sm_version()
         if kv_cache_config.enable_block_reuse and sm_version not in [
                 90, 100, 103, 120

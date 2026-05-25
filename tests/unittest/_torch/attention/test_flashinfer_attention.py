@@ -666,3 +666,33 @@ class TestFlashInferAttention(unittest.TestCase):
                 "cudnn",
                 msg="No-KV ragged prefill should use FlashInfer's cudnn backend",
             )
+
+
+class TestFlashInferFp4KvGuards(unittest.TestCase):
+    """Guards that FlashInfer + NVFP4 KV cache rejects unsupported configs at
+    init time with a clear NotImplementedError, rather than failing mid-forward.
+
+    Phase 1 of NVFP4 KV cache support on the FlashInfer backend only covers
+    MLA; non-MLA FP4 should error out early pointing users to attn_backend
+    ``TRTLLM`` or a BF16/FP8 KV cache.
+    """
+
+    def test_non_mla_fp4_kv_raises_not_implemented(self):
+        from tensorrt_llm.models.modeling_utils import QuantConfig
+        from tensorrt_llm.quantization.mode import QuantAlgo
+
+        quant_config = QuantConfig(kv_cache_quant_algo=QuantAlgo.NVFP4)
+        with self.assertRaises(NotImplementedError) as ctx:
+            FlashInferAttention(
+                layer_idx=0,
+                num_heads=8,
+                head_dim=64,
+                num_kv_heads=8,
+                quant_config=quant_config,
+            )
+        # Message must point users at the supported alternatives so they can
+        # self-serve without reading the backend source.
+        msg = str(ctx.exception)
+        self.assertIn("NVFP4 KV cache", msg)
+        self.assertIn("MLA", msg)
+        self.assertIn("TRTLLM", msg)

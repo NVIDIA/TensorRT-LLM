@@ -6,8 +6,6 @@ from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
-import triton
-import triton.language as tl
 
 if TYPE_CHECKING:
     from ..speculative.interface import SpecMetadata
@@ -24,6 +22,7 @@ from tensorrt_llm.models.modeling_utils import QuantConfig
 
 from ..utils import (compute_swizzled_sf_shape, get_global_attrs,
                      get_model_extra_attrs)
+from .fp4_mla_kv import HP_BLOCK_SIZE, update_hp_kv_for_fp4_mla
 from .interface import (AttentionBackend, AttentionForwardArgs,
                         AttentionInputType, AttentionMask, AttentionMetadata,
                         KVCacheParams, MLAParams, PositionalEmbeddingParams,
@@ -33,11 +32,6 @@ from .interface import (AttentionBackend, AttentionForwardArgs,
 # Enable TRTLLM-Gen attention backend via environment variable (default: on).
 _TRTLLM_ENABLE_TRTLLM_GEN_ATTENTION = (os.environ.get(
     "TRTLLM_ENABLE_TRTLLM_GEN_ATTENTION", "0") == "1")
-
-# Circular buffer size for the high-precision BF16 KV pool (MLA FP4 models).
-# Each sequence slot holds HP_BLOCK_SIZE token vectors; token at absolute
-# position t maps to buffer slot t % HP_BLOCK_SIZE.
-HP_BLOCK_SIZE: int = 16
 
 
 @functools.cache
@@ -141,11 +135,11 @@ class TrtllmAttentionMetadata(AttentionMetadata):
 
     # High-precision BF16 KV pool for MLA FP4 models, indexed by seq_slot.
     # Shape: [max_num_sequences, num_local_layers, kv_factor, HP_BLOCK_SIZE * head_dim]
-    # Standalone tensor — not part of the block-based paged KV cache.
+    # Standalone tensor, not part of the block-based paged KV cache.
     high_precision_kv_pool: Optional[torch.Tensor] = None
-    # Ownership tracking: maps seq_slot → request_id that last wrote it.
+    # Ownership tracking: maps seq_slot to request_id that last wrote it.
     # Plain Python dict, updated during context phase, checked during decode.
-    # Debug only — runs outside CUDA graph.
+    # Debug only; runs outside CUDA graph.
     hp_pool_owners: Optional[dict] = None
 
     # Pre-computed FlashMLA tile-scheduler metadata and num_splits.
@@ -1053,108 +1047,6 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         return not (sm < 100 or sm in [120, 121])
 
 
-# ---------------------------------------------------------------------------
-# Triton kernels for storing latent cache into the high-precision KV pool
-# ---------------------------------------------------------------------------
-
-
-@triton.jit
-def _hp_kv_store_context_kernel(
-        pool_ptr,
-        latent_cache_ptr,
-        seq_slots_ptr,  # int32 [num_contexts] – seq_slot for each ctx seq
-        kv_lens_ptr,  # int32 [num_contexts] – total KV length after prefill
-        token_offsets_ptr,  # int32 [num_contexts] – excl. prefix-sum of prompt_lens
-        prompt_lens_ptr,  # int32 [num_contexts] – number of new tokens per ctx seq
-        layer_idx,
-        pool_stride_seq,  # pool.stride(0): elements between adjacent seq slots
-        pool_stride_layer,  # pool.stride(1): elements between adjacent layers
-        lc_stride,  # latent_cache.stride(0): elements between adjacent tokens
-        D: tl.
-    constexpr,  # head_dim (runtime dimension, = latent_cache.shape[-1])
-        BLOCK_D: tl.
-    constexpr,  # next_power_of_2(D), used for vectorised load/store
-        HP_BLOCK: tl.constexpr,  # = HP_BLOCK_SIZE (16)
-):
-    """Store the tail tokens of each context sequence into the HP KV pool.
-
-    Grid: (num_contexts, HP_BLOCK_SIZE).
-    Only programs where buf_pos < kv_len % HP_BLOCK actually write.
-
-    For a context sequence with total KV length L = num_cached + prompt_len:
-      - remainder = L % HP_BLOCK
-      - The last `remainder` new tokens (latent_cache positions
-        [offset + prompt_len - remainder, offset + prompt_len)) are stored
-        into pool slots [0, remainder), which correspond to the absolute token
-        positions [L - remainder, L) in the circular buffer.
-    """
-    ctx_idx = tl.program_id(0)
-    buf_pos = tl.program_id(1)
-
-    kv_len = tl.load(kv_lens_ptr + ctx_idx)
-    remainder = kv_len % HP_BLOCK
-    if buf_pos >= remainder:
-        return
-
-    seq_slot = tl.load(seq_slots_ptr + ctx_idx)
-    prompt_len = tl.load(prompt_lens_ptr + ctx_idx)
-    tok_offset = tl.load(token_offsets_ptr + ctx_idx)
-
-    # Index of this token within latent_cache: last `remainder` new tokens,
-    # buf_pos-th of them (0-indexed from the start of the tail).
-    token_idx = tok_offset + prompt_len - remainder + buf_pos
-
-    offs_d = tl.arange(0, BLOCK_D)
-    mask_d = offs_d < D
-    src = tl.load(latent_cache_ptr + token_idx * lc_stride + offs_d,
-                  mask=mask_d,
-                  other=0.0)
-
-    # Destination: pool[seq_slot, layer_idx, 0, buf_pos * D : (buf_pos+1) * D]
-    dst_base = (seq_slot * pool_stride_seq + layer_idx * pool_stride_layer +
-                buf_pos * D)
-    tl.store(pool_ptr + dst_base + offs_d, src, mask=mask_d)
-
-
-@triton.jit
-def _hp_kv_store_gen_kernel(
-    pool_ptr,
-    latent_cache_ptr,
-    seq_slots_ptr,  # int32 [num_gen] – seq_slot for each gen seq
-    kv_lens_ptr,  # int32 [num_gen] – total KV length after this decode step
-    gen_tok_start,  # int – offset in latent_cache where gen tokens begin
-    layer_idx,
-    pool_stride_seq,
-    pool_stride_layer,
-    lc_stride,
-    D: tl.constexpr,
-    BLOCK_D: tl.constexpr,
-    HP_BLOCK: tl.constexpr,
-):
-    """Store the current generation token into the HP KV pool.
-
-    Grid: (num_gen_seqs,).
-    Each program stores one token into the circular buffer position
-    (kv_len - 1) % HP_BLOCK, overwriting the oldest entry.
-    """
-    gen_idx = tl.program_id(0)
-
-    seq_slot = tl.load(seq_slots_ptr + gen_idx)
-    kv_len = tl.load(kv_lens_ptr + gen_idx)
-    buf_pos = (kv_len - 1) % HP_BLOCK
-
-    token_idx = gen_tok_start + gen_idx
-    offs_d = tl.arange(0, BLOCK_D)
-    mask_d = offs_d < D
-    src = tl.load(latent_cache_ptr + token_idx * lc_stride + offs_d,
-                  mask=mask_d,
-                  other=0.0)
-
-    dst_base = (seq_slot * pool_stride_seq + layer_idx * pool_stride_layer +
-                buf_pos * D)
-    tl.store(pool_ptr + dst_base + offs_d, src, mask=mask_d)
-
-
 class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
 
     Metadata = TrtllmAttentionMetadata
@@ -1685,122 +1577,20 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         self,
         metadata: TrtllmAttentionMetadata,
         latent_cache: Optional[torch.Tensor],
+        attention_input_type: AttentionInputType = AttentionInputType.mixed,
     ) -> None:
-        """Store recent KV tokens at BF16 into the high-precision pool.
-
-        Called on every layer before the attention kernel.  The pool acts as a
-        circular buffer of HP_BLOCK_SIZE slots per sequence:
-
-        Context phase  — stores the last ``kv_len % HP_BLOCK_SIZE`` new tokens
-            of each request into buffer positions [0, remainder).  These are the
-            tail tokens that do not fill a complete FP4 block of 16.
-
-        Generation phase — stores the single new token for each request into
-            position ``(kv_len - 1) % HP_BLOCK_SIZE``, overwriting the oldest
-            entry in the circular buffer.
-
-        The Triton kernels use the GPU ``seq_slots`` tensor for scatter indexing
-        and are CUDA-graph-compatible for the generation phase.
-
-        Args:
-            metadata: Attention metadata containing seq_slots, kv_lens, and
-                the high_precision_kv_pool tensor.
-            latent_cache: MLA latent cache for the current tokens,
-                shape [num_tokens, head_dim].  When None, only ownership
-                tracking runs (no data is written to the pool).
-        """
-        if metadata.hp_pool_owners is None:
-            return
-        num_contexts = metadata.num_contexts
-        num_seqs = metadata.num_seqs
-        local_layer = self.get_local_layer_idx(metadata)
-
-        # ------------------------------------------------------------------
-        # Ownership tracking (layer 0, eager mode only — debug guard).
-        # Context phase never uses CUDA graph; decode check is debug-only.
-        # ------------------------------------------------------------------
-        if local_layer == 0 and not metadata.is_cuda_graph and not metadata.is_warmup:
-            # Context: register ownership of each seq_slot.
-            for batch_idx in range(num_contexts):
-                seq_slot = metadata.seq_slots_cpu[batch_idx].item()
-                request_id = metadata.request_ids[batch_idx]
-                metadata.hp_pool_owners[seq_slot] = request_id
-
-            # Decode: verify that the expected request still owns each slot.
-            for batch_idx in range(num_contexts, num_seqs):
-                seq_slot = metadata.seq_slots_cpu[batch_idx].item()
-                request_id = metadata.request_ids[batch_idx]
-                owner = metadata.hp_pool_owners.get(seq_slot)
-                if owner != request_id:
-                    raise RuntimeError(
-                        f"HP KV pool ownership mismatch: seq_slot={seq_slot} "
-                        f"is owned by request {owner} but request "
-                        f"{request_id} is attempting to use it")
-
-        if latent_cache is None:
-            return
-
-        # ------------------------------------------------------------------
-        # Triton kernel dispatch — runs on every layer, CUDA-graph-safe.
-        # ------------------------------------------------------------------
-        pool = metadata.high_precision_kv_pool
-        head_dim = latent_cache.shape[-1]
-        block_d = triton.next_power_of_2(head_dim)
-        pool_s0 = pool.stride(0)  # stride across sequence slots
-        pool_s1 = pool.stride(1)  # stride across layers
-        lc_stride = latent_cache.stride(0)
-
-        # Context phase: store last (kv_len % HP_BLOCK_SIZE) new tokens.
-        if num_contexts > 0:
-            prompt_lens_cpu = metadata.prompt_lens_cpu_runtime[:num_contexts]
-            # Exclusive prefix sum: token offset in latent_cache for each ctx seq.
-            token_offsets_cpu = torch.zeros(num_contexts,
-                                            dtype=torch.int32,
-                                            device='cpu')
-            if num_contexts > 1:
-                token_offsets_cpu[1:].copy_(
-                    torch.cumsum(prompt_lens_cpu[:-1].to(torch.int32), dim=0))
-            token_offsets_gpu = token_offsets_cpu.to(pool.device,
-                                                     non_blocking=False)
-            prompt_lens_gpu = metadata.prompt_lens_cuda_runtime[:num_contexts]
-
-            _hp_kv_store_context_kernel[(num_contexts, HP_BLOCK_SIZE)](
-                pool,
-                latent_cache,
-                metadata.seq_slots,
-                metadata.kv_lens_cuda_runtime,
-                token_offsets_gpu,
-                prompt_lens_gpu,
-                local_layer,
-                pool_s0,
-                pool_s1,
-                lc_stride,
-                D=head_dim,
-                BLOCK_D=block_d,
-                HP_BLOCK=HP_BLOCK_SIZE,
-            )
-
-        # Generation phase: store current token at (kv_len - 1) % HP_BLOCK_SIZE.
-        num_gen = num_seqs - num_contexts
-        if num_gen > 0:
-            # Scalar offset: number of context tokens packed before gen tokens.
-            ctx_tok_count = int(
-                metadata.prompt_lens_cpu_runtime[:num_contexts].sum().item())
-
-            _hp_kv_store_gen_kernel[(num_gen, )](
-                pool,
-                latent_cache,
-                metadata.seq_slots[num_contexts:],
-                metadata.kv_lens_cuda_runtime[num_contexts:],
-                ctx_tok_count,
-                local_layer,
-                pool_s0,
-                pool_s1,
-                lc_stride,
-                D=head_dim,
-                BLOCK_D=block_d,
-                HP_BLOCK=HP_BLOCK_SIZE,
-            )
+        """Thin wrapper over the shared HP-pool update helper (see
+        ``fp4_mla_kv.update_hp_kv_for_fp4_mla`` for the full contract)."""
+        if attention_input_type == AttentionInputType.context_only:
+            phase = "context"
+        elif attention_input_type == AttentionInputType.generation_only:
+            phase = "generation"
+        else:
+            phase = "all"
+        update_hp_kv_for_fp4_mla(metadata,
+                                 latent_cache,
+                                 self.get_local_layer_idx(metadata),
+                                 phase=phase)
 
     def forward(
         self,
@@ -1901,7 +1691,8 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         # High-precision BF16 KV pool hooks (MLA FP4 only).
         if metadata.high_precision_kv_pool is not None and self.is_mla_enable:
             self._update_high_precision_kv_for_fp4_mla(
-                metadata, forward_args.latent_cache)
+                metadata, forward_args.latent_cache,
+                forward_args.attention_input_type)
 
         self._run(q, k, v, output, output_sf, metadata, forward_args,
                   use_paged_context_fmha, sparse_kv_indices, sparse_kv_offsets,
