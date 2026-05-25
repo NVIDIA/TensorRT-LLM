@@ -22,7 +22,11 @@ NODE_RANK = int(os.environ.get("SLURM_NODEID", 0))
 NODE_LIST = expand_slurm_nodelist(os.environ.get("SLURM_NODELIST", ""))
 SLURM_NTASKS_PER_NODE = int(os.environ.get("SLURM_NTASKS_PER_NODE", 1))
 
-pytestmark = pytest.mark.threadleak(enabled=False)
+pytestmark = [
+    pytest.mark.threadleak(enabled=False),
+    pytest.mark.skipif(len(NODE_LIST) != 2,
+                       reason="This test is only expected to run with 2 nodes"),
+]
 
 # This test assumes that there are >2 nodes, we run ctx/disagg-server/client on the first node,
 # and run gen the second node.
@@ -186,9 +190,6 @@ def client(disagg_server: RemoteDisaggOpenAIServer):
 
 def test_completion(client: openai.OpenAI,
                     disagg_server: RemoteDisaggOpenAIServer, model_name: str):
-    if len(NODE_LIST) != 2:
-        pytest.skip("This test is only expected to run with 2 nodes")
-        return
     if is_pytest_node():
         print(f"running test_completion on rank {RANK} node rank {NODE_RANK}")
         prompt = "What is the result of 1+1? Answer in one word: "
