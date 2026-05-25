@@ -276,8 +276,9 @@ class PythonMambaCacheManager(BaseResourceManager):
         - Legacy: caches full intermediate SSM states (intermediate_ssm)
         - Replay: compact double-buffered cache (old_x, old_B, old_dt, old_dA_cumsum)
         """
-        _SHARED_FIELDS = frozenset(
-            {"prev_num_accepted_tokens", "cache_buf_idx"})
+        _SHARED_FIELDS = frozenset({
+            "prev_num_accepted_tokens", "cache_buf_idx", "mamba_ssm_rand_seed"
+        })
 
         intermediate_conv_window: torch.Tensor  # always allocated
 
@@ -289,6 +290,10 @@ class PythonMambaCacheManager(BaseResourceManager):
         # 0 means temporal saved state is actually the last state, not two back.
         prev_num_accepted_tokens: torch.Tensor | None = None  # (cache,) int — shared across layers
         cache_buf_idx: torch.Tensor | None = None  # (cache,) int32 — shared across layers
+        # Per-cache-slot Philox seeds. Replay bumps them in-place per launch so
+        # CUDA graph replay uses fresh SR draws without allocating RNG tensors.
+        # (cache,) int64 - shared across layers
+        mamba_ssm_rand_seed: torch.Tensor | None = None
         old_x: torch.Tensor | None = None  # (layers, cache, T, nheads, dim)
         old_B: torch.Tensor | None = None  # (layers, cache, 2, T, ngroups, dstate)
         # Processed dt: softplus(raw_dt + dt_bias), clamped to dt_limit.
@@ -406,6 +411,9 @@ class PythonMambaCacheManager(BaseResourceManager):
                 spec_kwargs['cache_buf_idx'] = torch.zeros(max_batch_size,
                                                            dtype=torch.int32,
                                                            device=device)
+                spec_kwargs['mamba_ssm_rand_seed'] = torch.empty(
+                    max_batch_size, dtype=torch.int64,
+                    device=device).random_(1, 2**62)
                 spec_kwargs['old_x'] = torch.zeros(num_local_layers,
                                                    max_batch_size,
                                                    T,
@@ -534,6 +542,9 @@ class PythonMambaCacheManager(BaseResourceManager):
             if (isinstance(self.mamba_cache, self.SpeculativeState)
                     and self._use_replay_state_update):
                 self.mamba_cache.prev_num_accepted_tokens[block] = 0
+                if self.mamba_cache.mamba_ssm_rand_seed is not None:
+                    self.mamba_cache.mamba_ssm_rand_seed[block] = torch.randint(
+                        1, 2**62, (1, ), dtype=torch.int64).item()
 
     def prepare_resources(self, scheduled_batch: ScheduledRequests):
         context_ids = [
@@ -641,6 +652,7 @@ class PythonMambaCacheManager(BaseResourceManager):
                 prev_num_accepted_tokens=_drop(
                     self.mamba_cache.prev_num_accepted_tokens),
                 cache_buf_idx=_drop(self.mamba_cache.cache_buf_idx),
+                mamba_ssm_rand_seed=_drop(self.mamba_cache.mamba_ssm_rand_seed),
                 old_x=_drop(self.mamba_cache.old_x),
                 old_B=_drop(self.mamba_cache.old_B),
                 old_dt=_drop(self.mamba_cache.old_dt),
@@ -1320,6 +1332,7 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
         self.intermediate_state_indices = None
         self.prev_num_accepted_tokens = None
         self.cache_buf_idx = None
+        self.mamba_ssm_rand_seed = None
         self.old_x = None
         self.old_B = None
         self.old_dt = None
@@ -1392,13 +1405,41 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
         # block (prefix-cache hit or block recycled across requests) may carry
         # stale prev_num_accepted_tokens / cache_buf_idx values from a prior
         # owner; the replay kernel reads these on the first decode step.
+        # Deterministically zero the per-slot stripes of all replay buffers so
+        # the kernel's unconditional loads (e.g. total_dA_cumsum at prev_k=0)
+        # never see Inf/NaN from a prior owner; this prevented intermittent
+        # SSM state corruption at higher concurrency (c=32) where slot reuse
+        # is frequent.
         if self._use_replay_state_update and self.prev_num_accepted_tokens is not None:
             num_contexts = len(scheduled_batch.context_requests)
             if num_contexts > 0:
                 ctx_slots = self.cuda_state_indices[:num_contexts].long()
                 self.prev_num_accepted_tokens[ctx_slots] = 0
-                # don't care which half of doulbe-buffer is using
-                # self.cache_buf_idx[ctx_slots] = 0
+                self.cache_buf_idx[ctx_slots] = 0
+                if self.old_x is not None:
+                    self.old_x[:, ctx_slots] = 0
+                if self.old_B is not None:
+                    self.old_B[:, ctx_slots] = 0
+                if self.old_dt is not None:
+                    self.old_dt[:, ctx_slots] = 0
+                if self.old_dA_cumsum is not None:
+                    self.old_dA_cumsum[:, ctx_slots] = 0
+                # Zero the SSM/conv state stripes for fresh context slots so
+                # the replay kernel cannot observe stale state on the first
+                # decode step of a recycled slot when the prefill does not
+                # fully overwrite the cache.
+                if self.all_ssm_states is not None:
+                    self.all_ssm_states[:, ctx_slots] = 0
+                if self.all_conv_states is not None:
+                    self.all_conv_states[:, ctx_slots] = 0
+                if self.mamba_ssm_rand_seed is not None:
+                    self.mamba_ssm_rand_seed[ctx_slots] = torch.randint(
+                        1,
+                        2**62,
+                        (num_contexts, ),
+                        dtype=torch.int64,
+                        device=self.mamba_ssm_rand_seed.device,
+                    )
 
     def prepare_resources(self, scheduled_batch: ScheduledRequests):
         super().prepare_resources(scheduled_batch)
@@ -1532,6 +1573,7 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
                 spec_kwargs['cache_buf_idx'] = self.cache_buf_idx
                 spec_kwargs['prev_num_accepted_tokens'] = (
                     self.prev_num_accepted_tokens)
+                spec_kwargs['mamba_ssm_rand_seed'] = self.mamba_ssm_rand_seed
             else:
                 spec_kwargs['intermediate_ssm'] = self.intermediate_ssm_states[
                     layer_offset]
@@ -1718,6 +1760,7 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
             # are allocated in _setup_replay_buffers after _setup_states().
             self.prev_num_accepted_tokens = None
             self.cache_buf_idx = None
+            self.mamba_ssm_rand_seed = None
             self.old_x = None
             self.old_B = None
             self.old_dt = None
@@ -1770,6 +1813,9 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
                                          T,
                                          dtype=torch.float32,
                                          device=device)
+        self.mamba_ssm_rand_seed = torch.empty(cache_size,
+                                               dtype=torch.int64,
+                                               device=device).random_(1, 2**62)
 
     @property
     def use_replay_state_update(self) -> bool:

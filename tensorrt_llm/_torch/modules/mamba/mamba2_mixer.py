@@ -169,6 +169,8 @@ class Mamba2Mixer(nn.Module):
         # cache manager), so precompute both gate values here.
         sr_base = (self._stochastic_rounding_requested
                    and self._mamba_ssm_cache_dtype == torch.float16)
+        # Keep replay SSM-cache writes on the same stochastic-rounding policy
+        # as flashinfer; the replay kernel masks stale slots before using them.
         self._stochastic_rounding_for_replay = sr_base
         self._stochastic_rounding_for_flashinfer = sr_base and self._use_flashinfer
 
@@ -509,8 +511,16 @@ class Mamba2Mixer(nn.Module):
 
                 philox_kwargs = {}
                 if use_stochastic_rounding:
-                    philox_kwargs['rand_seed'] = torch.randint(
-                        0, 2**62, (1, ), device=x_d.device, dtype=torch.int64)
+                    if use_replay:
+                        rand_seed = layer_cache.mamba_ssm_rand_seed
+                        rand_seed.add_(1)
+                        philox_kwargs['rand_seed'] = rand_seed
+                    else:
+                        philox_kwargs['rand_seed'] = torch.randint(
+                            0,
+                            2**62, (1, ),
+                            device=x_d.device,
+                            dtype=torch.int64)
                     philox_kwargs['philox_rounds'] = self._philox_rounds
 
                 if use_replay:
