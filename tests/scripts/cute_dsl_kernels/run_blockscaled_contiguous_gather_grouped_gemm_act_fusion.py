@@ -686,16 +686,16 @@ def run(
         b_tensor,
         c_tensor,
         sfa_tensor,
-            sfb_tensor,
-            sfc_tensor,
-            norm_const_tensor,
-            tile_idx_to_expert_idx,
-            tile_idx_to_mn_limit,
-            token_id_mapping,
-            num_non_exiting_tiles,
-            alpha,
-            current_stream,
-        )
+        sfb_tensor,
+        sfc_tensor,
+        norm_const_tensor,
+        tile_idx_to_expert_idx,
+        tile_idx_to_mn_limit,
+        token_id_mapping,
+        num_non_exiting_tiles,
+        alpha,
+        current_stream,
+    )
 
     torch.cuda.synchronize()
     # Compute reference result

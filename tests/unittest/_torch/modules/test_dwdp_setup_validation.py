@@ -26,6 +26,7 @@ and total expert count, catching the four distinct failure modes:
 The uniform integer-division case used by current dwdp=4 / dwdp=8
 configurations must pass cleanly.
 """
+
 import unittest
 
 from tensorrt_llm._torch.modules.dwdp.setup import _validate_partition_config
@@ -45,7 +46,6 @@ def _kwargs(**overrides):
 
 
 class TestValidatePartitionConfig(unittest.TestCase):
-
     # ------------------------------------------------------------------
     # Happy paths — must NOT raise
     # ------------------------------------------------------------------
@@ -56,22 +56,26 @@ class TestValidatePartitionConfig(unittest.TestCase):
 
     def test_uniform_dwdp8(self):
         # 256 / 8 = 32. Cross-tray DWDP=8 config (verified 2026-04-28).
-        _validate_partition_config(**_kwargs(
-            num_experts_per_worker=32,
-            num_prefetch_experts=32,
-            dwdp_size=8,
-            loaded_local_experts=32,
-        ))
+        _validate_partition_config(
+            **_kwargs(
+                num_experts_per_worker=32,
+                num_prefetch_experts=32,
+                dwdp_size=8,
+                loaded_local_experts=32,
+            )
+        )
 
     def test_uniform_dwdp2(self):
         # DSv3-Lite 72 / 2 = 36. Used by accuracy integration test.
-        _validate_partition_config(**_kwargs(
-            num_experts_per_worker=36,
-            num_prefetch_experts=36,
-            num_experts_total=72,
-            dwdp_size=2,
-            loaded_local_experts=36,
-        ))
+        _validate_partition_config(
+            **_kwargs(
+                num_experts_per_worker=36,
+                num_prefetch_experts=36,
+                num_experts_total=72,
+                dwdp_size=2,
+                loaded_local_experts=36,
+            )
+        )
 
     # ------------------------------------------------------------------
     # Failure mode 1: non-positive size or stride
@@ -109,11 +113,13 @@ class TestValidatePartitionConfig(unittest.TestCase):
     def test_partial_coverage_rejected(self):
         # 4 ranks of size 32, stride 32 covers only [0, 128) of 256 experts.
         with self.assertRaisesRegex(ValueError, "does not cover all experts"):
-            _validate_partition_config(**_kwargs(
-                num_experts_per_worker=32,
-                num_prefetch_experts=32,
-                loaded_local_experts=32,
-            ))
+            _validate_partition_config(
+                **_kwargs(
+                    num_experts_per_worker=32,
+                    num_prefetch_experts=32,
+                    loaded_local_experts=32,
+                )
+            )
 
     def test_coverage_exact_match_passes(self):
         # 4 ranks of size 64, stride 64 covers exactly [0, 256). Boundary case.
@@ -122,11 +128,13 @@ class TestValidatePartitionConfig(unittest.TestCase):
     def test_coverage_with_overlap_passes(self):
         # 4 ranks of size 70, stride 62: 3*62+70 = 256 — exact equality.
         # 8-expert overlap between adjacent ranks is the redundancy case.
-        _validate_partition_config(**_kwargs(
-            num_experts_per_worker=70,
-            num_prefetch_experts=62,
-            loaded_local_experts=70,
-        ))
+        _validate_partition_config(
+            **_kwargs(
+                num_experts_per_worker=70,
+                num_prefetch_experts=62,
+                loaded_local_experts=70,
+            )
+        )
 
     def test_dwdp3_mode_b_overlap_passes(self):
         # dwdp=3, 256 experts: Mode B with stride=85, size=86.
@@ -213,11 +221,13 @@ class TestValidatePartitionConfig(unittest.TestCase):
         # All checks are independent; first violated check should raise.
         # zero size triggers before any other condition is examined.
         with self.assertRaises(ValueError):
-            _validate_partition_config(**_kwargs(
-                num_experts_per_worker=0,
-                num_prefetch_experts=128,
-                loaded_local_experts=0,
-            ))
+            _validate_partition_config(
+                **_kwargs(
+                    num_experts_per_worker=0,
+                    num_prefetch_experts=128,
+                    loaded_local_experts=0,
+                )
+            )
 
 
 if __name__ == "__main__":

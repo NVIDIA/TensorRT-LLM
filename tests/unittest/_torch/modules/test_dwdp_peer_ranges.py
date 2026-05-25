@@ -30,16 +30,13 @@ Cases covered:
   * Boundary expert ids (0, num_experts - 1).
   * Out-of-range expert ids raise.
 """
+
 import unittest
 
-from tensorrt_llm._torch.modules.dwdp.specs import (
-    compute_peer_ranges,
-    lookup_owner,
-)
+from tensorrt_llm._torch.modules.dwdp.specs import compute_peer_ranges, lookup_owner
 
 
 class TestComputePeerRanges(unittest.TestCase):
-
     def test_uniform_dwdp4_matches_floor_div(self):
         # 256 experts / 4 ranks = 64 each.  Every rank's range starts at
         # rank * 64 and ends at the next rank's start.
@@ -131,12 +128,12 @@ class TestComputePeerRanges(unittest.TestCase):
         for r in range(len(peer_ranges) - 1):
             cur_end = peer_ranges[r][1]
             next_start = peer_ranges[r + 1][0]
-            self.assertGreater(cur_end, next_start,
-                               f"Expected overlap between rank {r} and {r+1}")
+            self.assertGreater(
+                cur_end, next_start, f"Expected overlap between rank {r} and {r + 1}"
+            )
 
 
 class TestLookupOwner(unittest.TestCase):
-
     def test_uniform_matches_floor_div(self):
         # The whole point: lookup_owner must agree with the
         # legacy formula on every uniform expert id.
@@ -195,8 +192,11 @@ class TestLookupOwner(unittest.TestCase):
         # Overlap zone [62, 70): both rank 0 and rank 1 have it.
         # First-match → rank 0.
         for expert_id in range(62, 70):
-            self.assertEqual(lookup_owner(expert_id, peer_ranges), 0,
-                             f"overlap should pick lowest peer at {expert_id}")
+            self.assertEqual(
+                lookup_owner(expert_id, peer_ranges),
+                0,
+                f"overlap should pick lowest peer at {expert_id}",
+            )
         # Past rank 0's range → rank 1 (or its overlap with rank 2)
         self.assertEqual(lookup_owner(70, peer_ranges), 1)
         self.assertEqual(lookup_owner(123, peer_ranges), 1)  # in rank 1's exclusive

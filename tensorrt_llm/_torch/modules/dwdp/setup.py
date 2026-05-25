@@ -208,7 +208,7 @@ def setup_dwdp(
         f"(used={((total_mem-free_mem)/(1024**3)):.2f}GB)"
     )
 
-    # 5. WeightBuffer: composite VAs
+    # 5. WeightBuffer: composite VA layout
     logger.info("[DWDP Setup] Creating weight buffer (composite VA layout)...")
     weight_buffer = WeightBuffer.create(
         layer_weight_specs=layer_weight_specs,
@@ -470,7 +470,7 @@ def fill_edge_bytes(
     MNNVL handle's mapped VA.  This is a one-time setup operation.
 
     Args:
-        weight_buffer: WeightBuffer with composite VAs.
+        weight_buffer: WeightBuffer with composite VA layout.
         peer_views: ``{(peer_rank, layer_idx, name): tensor}`` from Transport.
         local_start: First local expert index (inclusive).
         local_end: Last local expert index (exclusive).

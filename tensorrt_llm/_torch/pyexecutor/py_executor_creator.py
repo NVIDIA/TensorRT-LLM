@@ -13,7 +13,7 @@ from strenum import StrEnum
 
 import tensorrt_llm
 from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManagerType
-from tensorrt_llm._utils import get_sm_version
+from tensorrt_llm._utils import get_sm_version, global_mpi_rank
 from tensorrt_llm.llmapi.llm_args import (CapacitySchedulerPolicy,
                                           ContextChunkingPolicy,
                                           ExecutorMemoryType,
@@ -22,7 +22,6 @@ from tensorrt_llm.llmapi.llm_args import (CapacitySchedulerPolicy,
 from tensorrt_llm.llmapi.tokenizer import (TokenizerBase,
                                            _llguidance_tokenizer_info,
                                            _xgrammar_tokenizer_info)
-from tensorrt_llm._utils import global_mpi_rank
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.quantization import QuantAlgo
@@ -446,9 +445,10 @@ def create_py_executor(
     if llm_args.dwdp_config is not None and llm_args.dwdp_config.dwdp_size > 1:
         dwdp_size = llm_args.dwdp_config.dwdp_size
         dwdp_rank = global_mpi_rank() % dwdp_size
-        mapping = Mapping(
-            **{**mapping.to_dict(), "dwdp_size": dwdp_size, "dwdp_rank": dwdp_rank}
-        )
+        mapping = Mapping(**{
+            **mapping.to_dict(), "dwdp_size": dwdp_size,
+            "dwdp_rank": dwdp_rank
+        })
 
     dist = Distributed.get(mapping)
 
@@ -491,9 +491,9 @@ def create_py_executor(
     dwdp_manager: Optional[DwdpManager] = None
     if llm_args.dwdp_config is not None:
         assert mapping.tp_size == 1 and llm_args.dwdp_config.dwdp_size > 1, "DWDP requires TP=1 and dwdp_size > 1"
-        dwdp_manager = DwdpManager(
-            config=llm_args.dwdp_config, dist=dist, mapping=mapping
-        )
+        dwdp_manager = DwdpManager(config=llm_args.dwdp_config,
+                                   dist=dist,
+                                   mapping=mapping)
         dwdp_manager.__enter__()
         logger.info(f"Dwdp Manager initialized. Config: {llm_args.dwdp_config}")
 

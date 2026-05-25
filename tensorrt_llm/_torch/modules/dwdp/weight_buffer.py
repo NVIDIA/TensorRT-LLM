@@ -29,10 +29,9 @@ there is exactly one WeightBuffer managing all MoE layers for that group.
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
-
-import logging
 
 import torch
 
@@ -43,10 +42,8 @@ except ImportError:
     logger = logging.getLogger(__name__)
 
 from .page_pool import PagePool, compute_slot_sizes
-from .specs import EdgeInfo, LayerWeightSpecs, MnnvlHandleSet, PageAlignedLayout, WeightSpec
+from .specs import EdgeInfo, LayerWeightSpecs, MnnvlHandleSet, PageAlignedLayout
 from .vmm import (
-    align_up,
-    check_cu_result,
     free_va,
     get_allocation_granularity,
     map_handle,
@@ -153,9 +150,7 @@ class WeightBuffer:
             self._granularity = granularity
 
         if pool_page_size is None:
-            self._pool_page_size = (
-                PagePool.DEFAULT_PAGE_SIZE_MULTIPLIER * self._granularity
-            )
+            self._pool_page_size = PagePool.DEFAULT_PAGE_SIZE_MULTIPLIER * self._granularity
         else:
             self._pool_page_size = pool_page_size
 
@@ -432,9 +427,7 @@ class WeightBuffer:
 
             # Store the full tensor and compute remote slices.
             layer_state.tensors[name] = full_tensor
-            remote_slices = self._compute_remote_slices(
-                full_tensor, layout, spec.num_experts
-            )
+            remote_slices = self._compute_remote_slices(full_tensor, layout, spec.num_experts)
             layer_state.remote_slices[name] = remote_slices
 
         self._layer_states[layer_idx] = layer_state
@@ -500,9 +493,7 @@ class WeightBuffer:
             raise KeyError(f"Weight '{name}' not found in layer {layer_idx}")
         return self._layer_states[layer_idx].tensors[name]
 
-    def get_remote_slices(
-        self, layer_idx: int, name: str
-    ) -> List[Tuple[torch.Tensor, int, int]]:
+    def get_remote_slices(self, layer_idx: int, name: str) -> List[Tuple[torch.Tensor, int, int]]:
         """Get (slice_tensor, expert_start, expert_end) for each remote region.
 
         These are P2P copy destinations. WeightManager copies peer data here.
@@ -555,9 +546,7 @@ class WeightBuffer:
         """
         return self.get_layout(layer_idx, name).data_offset
 
-    def compute_peer_data_offset(
-        self, layer_idx: int, name: str, peer_local_start: int
-    ) -> int:
+    def compute_peer_data_offset(self, layer_idx: int, name: str, peer_local_start: int) -> int:
         """Compute data_offset for a peer rank given their local_start.
 
         layer_idx is required because different layers may have
@@ -695,9 +684,7 @@ class WeightBuffer:
                 try:
                     free_va(state.va_base, state.va_size)
                 except Exception as e:
-                    logger.warning(
-                        f"[WeightBuffer] Failed to free VA for layer {layer_idx}: {e}"
-                    )
+                    logger.warning(f"[WeightBuffer] Failed to free VA for layer {layer_idx}: {e}")
 
         self._layer_states.clear()
 

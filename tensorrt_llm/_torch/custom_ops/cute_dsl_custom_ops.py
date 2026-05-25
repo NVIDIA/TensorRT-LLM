@@ -1673,7 +1673,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             a, b, *_ = inputs
             b_list = b if isinstance(b, (list, tuple)) else [b]
             m, k = a.size(0), a.size(1) * 2
-            l = sum(bi.size(0) for bi in b_list)
+            l = sum(bi.size(0) for bi in b_list)  # noqa: E741
             n = b_list[0].size(1)
 
             mma_tiler_mn_candidates = [(self.tile_size, 128),
@@ -1745,7 +1745,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             assert alpha.dim() == 1
 
             m, k = a.size(0), a.size(1) * 2
-            l, n = b.size(0), b.size(1)
+            l, n = b.size(0), b.size(1)  # noqa: E741
             scale_k = k // self.scaling_vector_size
             assert m % self.tile_size == 0
             assert k % (self.scaling_vector_size * 4) == 0
@@ -1971,7 +1971,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         ) -> List[Tuple[int, int]]:
             a, b, *_ = inputs
             m, k = a.size(0), a.size(1) * 2
-            l, n = b.size(0), b.size(1)
+            l, n = b.size(0), b.size(1)  # noqa: E741
 
             mma_tiler_mn_candidates = [(self.tile_size, 128),
                                        (self.tile_size, 256)]
@@ -2050,7 +2050,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             assert alpha.dim() == 1
 
             m, k = a.size(0), a.size(1) * 2
-            l, n = b.size(0), b.size(1)
+            l, n = b.size(0), b.size(1)  # noqa: E741
             scale_k = k // self.scaling_vector_size
             assert m % self.tile_size == 0
             assert k % (self.scaling_vector_size * 4) == 0
@@ -2371,7 +2371,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         ) -> List[Tuple[int, int]]:
             a, b, *_ = inputs
             m, k = a.size(0), a.size(1) * 2
-            l, n = b.size(0), b.size(1)
+            l, n = b.size(0), b.size(1)  # noqa: E741
 
             mma_tiler_mn_candidates = [(self.tile_size, 128),
                                        (self.tile_size, 256)]
@@ -2442,7 +2442,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             assert alpha.dim() == 1
 
             m, k = a.size(0), a.size(1) * 2
-            l, n = b.size(0), b.size(1)
+            l, n = b.size(0), b.size(1)  # noqa: E741
             scale_k = k // self.scaling_vector_size
             interm_size = n // 2
             assert m % self.tile_size == 0
@@ -2709,7 +2709,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             # m is the permuted size from permuted_idx_to_expanded_idx, not from a
             m = permuted_idx_to_expanded_idx.size(0)
             k = a.size(1) * 2
-            l, n = b.size(0), b.size(1)
+            l, n = b.size(0), b.size(1)  # noqa: E741
 
             mma_tiler_mn_candidates = [(self.tile_size, 128),
                                        (self.tile_size, 256)]
@@ -2808,7 +2808,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             # permuted_idx_to_expanded_idx.size(0) is m (permuted size after gather)
             orig_m, k = a.size(0), a.size(1) * 2
             m = permuted_idx_to_expanded_idx.size(0)
-            l, n = b.size(0), b.size(1)
+            l, n = b.size(0), b.size(1)  # noqa: E741
             scale_k = k // self.scaling_vector_size
             interm_size = n // 2 if self.is_gated else n
 
@@ -3001,8 +3001,12 @@ if IS_CUTLASS_DSL_AVAILABLE:
         tuner = AutoTuner.get()
 
         runner = Sm100BlockScaledContiguousGatherGroupedGemmActFusionRunner(
-            num_experts, top_k, num_local_experts, local_expert_offset,
-            tile_size, scaling_vector_size,
+            num_experts,
+            top_k,
+            num_local_experts,
+            local_expert_offset,
+            tile_size,
+            scaling_vector_size,
             activation_type=activation_type)
         inputs = [
             input, weight, input_scale, weight_scale, alpha,
@@ -3755,7 +3759,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             m = a.shape[0]
             k = a.shape[1] * 2  # fp4 packed in k dimension
             n = b.shape[0] * b.shape[1]  # num_expert * weight_per_expert
-            l = 1  # dense GEMM
+            l = 1  # dense GEMM  # noqa: E741
 
             # Define candidates together
             mma_tiler_mn_candidates = [(128, 128), (128, 256), (256, 256)]
@@ -3829,7 +3833,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             m = a.shape[0]
             k = a.shape[1] * 2  # fp4 packed in k dimension
             n = b.shape[0] * b.shape[1]  # num_expert * weight_per_expert
-            l = 1  # dense GEMM
+            l = 1  # dense GEMM  # noqa: E741
             n_out = n // 2  # SwiGLU output
 
             # Default tactic if not provided
@@ -4050,7 +4054,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         m = input.shape[0]
         n = weight.shape[0] * weight.shape[1]  # num_expert * weight_per_expert
         n_out = n // 2  # SwiGLU output
-        l = 1  # dense GEMM
+        l = 1  # dense GEMM  # noqa: E741
 
         if output_dtype == torch.float4_e2m1fn_x2:
             # FP4 packed: 2 elements per byte
@@ -4140,7 +4144,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             m = a.shape[0]
             k = a.shape[1] * 2  # fp4 packed in k dimension
             n = b.shape[0]
-            l = 1  # dense GEMM
+            l = 1  # dense GEMM  # noqa: E741
 
             # Define candidates
             mma_tiler_mn_candidates = [(128, 64), (128, 128), (128, 256),
@@ -4228,7 +4232,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             m = a.shape[0]
             k = a.shape[1] * 2  # fp4 packed in k dimension
             n = b.shape[0]
-            l = 1  # dense GEMM
+            l = 1  # dense GEMM  # noqa: E741
 
             # The kernel wrapper expects alpha_scale laid out token-major
             # (token has stride 1, expert has stride m), which gives

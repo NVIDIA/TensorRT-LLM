@@ -27,6 +27,7 @@ The heavy lifting — MNNVL handle allocation, composite VA layout,
 double-buffer scheduling — lives in ``tensorrt_llm._torch.modules.dwdp``
 and is wired up by ``setup_dwdp()`` during ``setup(model)``.
 """
+
 from __future__ import annotations
 
 from typing import List, Optional
@@ -41,7 +42,6 @@ from tensorrt_llm._utils import global_mpi_rank
 from tensorrt_llm.llmapi.llm_args import DwdpConfig
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
-
 
 _global_dwdp_manager: Optional["DwdpManager"] = None
 
@@ -90,9 +90,7 @@ class DwdpManager:
         # Without this validation `num_groups` is a dead schema field, which
         # is how it was treated up through commit `1fbc0d49`.
         if config.num_groups <= 0:
-            raise ValueError(
-                f"DwdpConfig.num_groups must be positive, got {config.num_groups}"
-            )
+            raise ValueError(f"DwdpConfig.num_groups must be positive, got {config.num_groups}")
         self.rank = global_mpi_rank()
         group_id = self.rank // mapping.dwdp_size
         if group_id >= config.num_groups:
@@ -192,9 +190,7 @@ class DwdpManager:
     def add_layer(self, layer_idx: int) -> None:
         """Register an MoE layer index. Called from configurable_moe.__init__."""
         if layer_idx in self._registered_layers:
-            logger.warning(
-                f"[DwdpManager] Layer {layer_idx} already registered; ignoring"
-            )
+            logger.warning(f"[DwdpManager] Layer {layer_idx} already registered; ignoring")
             return
         self._registered_layers.append(layer_idx)
 

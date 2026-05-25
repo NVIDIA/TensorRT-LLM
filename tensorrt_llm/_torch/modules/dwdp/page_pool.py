@@ -41,18 +41,12 @@ from tensorrt_llm.logger import logger
 
 from .vmm import (
     align_up,
-    check_cu_result,
     create_local_handle,
     get_allocation_granularity,
     map_handle,
     release_handle,
     unmap_va,
 )
-
-try:
-    from cuda.bindings import driver as cuda
-except ImportError:
-    from cuda import cuda
 
 
 class PagePool:
@@ -134,9 +128,7 @@ class PagePool:
             # page_size must also be a power of 2 because vmm.align_up
             # requires it (used in map_pages for safety alignment).
             if (page_size & (page_size - 1)) != 0:
-                raise ValueError(
-                    f"page_size must be a power of 2, got {page_size}"
-                )
+                raise ValueError(f"page_size must be a power of 2, got {page_size}")
             self._page_size = page_size
 
         self._slot_sizes = list(slot_sizes)
@@ -390,7 +382,6 @@ def compute_slot_sizes(
     Returns:
         [slot0_size, slot1_size] in bytes.
     """
-    from .specs import PageAlignedLayout
 
     slot_sizes = [0, 0]
 

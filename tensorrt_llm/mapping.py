@@ -154,7 +154,8 @@ class MappingBase:
             self.moe_tp_cluster_ep_size = moe_cluster_size
         else:
             self.moe_tp_cluster_ep_size = moe_tp_ep_size * moe_cluster_size
-        if not (dwdp_size > 1) and self.moe_tp_cluster_ep_size != moe_world_size:
+        if not (dwdp_size
+                > 1) and self.moe_tp_cluster_ep_size != moe_world_size:
             raise ValueError(
                 "moe_tp_size * moe_ep_size * moe_cluster_size must equal to moe_world_size, "
                 f"but got {self.moe_tp_cluster_ep_size} != {moe_world_size}")

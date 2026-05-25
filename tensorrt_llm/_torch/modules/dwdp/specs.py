@@ -23,7 +23,6 @@ from typing import Dict, List, Tuple
 
 import torch
 
-
 # (local_start, local_end_capped) for one peer DWDP rank.  ``local_start``
 # is ``peer_rank * num_prefetch_experts`` (the rank-to-rank stride).
 # ``local_end_capped`` is the *valid* upper bound — i.e.,
@@ -78,10 +77,7 @@ def lookup_owner(expert_id: int, peer_ranges: PeerRanges) -> int:
     for peer_rank, (start, end) in enumerate(peer_ranges):
         if start <= expert_id < end:
             return peer_rank
-    raise ValueError(
-        f"expert_id={expert_id} not owned by any peer in "
-        f"peer_ranges={peer_ranges}"
-    )
+    raise ValueError(f"expert_id={expert_id} not owned by any peer in peer_ranges={peer_ranges}")
 
 
 @dataclass(frozen=True)
@@ -333,9 +329,7 @@ class PageAlignedLayout:
                 f"({granularity}), got {pool_granularity}"
             )
         if (pool_granularity & (pool_granularity - 1)) != 0:
-            raise ValueError(
-                f"pool_granularity must be a power of 2, got {pool_granularity}"
-            )
+            raise ValueError(f"pool_granularity must be a power of 2, got {pool_granularity}")
 
         # Compute byte offsets
         local_start_bytes = local_start * expert_bytes

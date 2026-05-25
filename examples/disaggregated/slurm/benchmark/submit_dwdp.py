@@ -215,14 +215,16 @@ def submit_dwdp_job(config, log_dir, dry_run):
     # groups and cross-node GEN TP allreduces are explicitly called out so
     # they aren't a silent surprise when reading benchmark logs.
     _num_ctx_gpus = ctx_num * ctx_world_size
-    _is_divisible_layout = (_num_ctx_gpus % gpus_per_node == 0)
+    _is_divisible_layout = _num_ctx_gpus % gpus_per_node == 0
     _num_dwdp_groups = ctx_num // dwdp_size if dwdp_size > 0 else 1
     print("=" * 72)
     print("[DWDP launch summary]")
-    print(f"  Total GPU: {_num_ctx_gpus + gen_num * gen_world_size}    "
-          f"Total nodes: {total_nodes}    "
-          f"Launcher path: {'block' if _is_divisible_layout else 'arbitrary'}    "
-          f"(num_ctx_gpus % gpus_per_node = {_num_ctx_gpus % gpus_per_node})")
+    print(
+        f"  Total GPU: {_num_ctx_gpus + gen_num * gen_world_size}    "
+        f"Total nodes: {total_nodes}    "
+        f"Launcher path: {'block' if _is_divisible_layout else 'arbitrary'}    "
+        f"(num_ctx_gpus % gpus_per_node = {_num_ctx_gpus % gpus_per_node})"
+    )
     print(f"  CTX servers: {ctx_num}  (TP={ctx_world_size} each)")
     print(f"  GEN servers: {gen_num}  (TP={gen_world_size} each)")
     _per_node = {}
@@ -230,17 +232,19 @@ def submit_dwdp_job(config, log_dir, dry_run):
         for _sid in sorted(allocations.get(_role, {}).keys()):
             for _host, _gpus in allocations[_role][_sid]["nodes"].items():
                 _per_node.setdefault(_host, []).append((_role, _sid, _gpus))
-    print(f"  Per-node placement:")
+    print("  Per-node placement:")
     for _host in sorted(_per_node.keys()):
         _ctxs = [(s, g) for r, s, g in _per_node[_host] if r == "CTX"]
         _gens = [(s, g) for r, s, g in _per_node[_host] if r == "GEN"]
         _parts = []
         if _ctxs:
-            _parts.append(f"CTX {[s for s, _ in _ctxs]} (GPU "
-                          f"{sorted(sum([g for _, g in _ctxs], []))})")
+            _parts.append(
+                f"CTX {[s for s, _ in _ctxs]} (GPU {sorted(sum([g for _, g in _ctxs], []))})"
+            )
         if _gens:
-            _parts.append(f"GEN {[s for s, _ in _gens]} (GPU "
-                          f"{sorted(sum([g for _, g in _gens], []))})")
+            _parts.append(
+                f"GEN {[s for s, _ in _gens]} (GPU {sorted(sum([g for _, g in _gens], []))})"
+            )
         _shared = "  [CTX/GEN sharing node]" if _ctxs and _gens else ""
         print(f"    {_host}: {' + '.join(_parts)}{_shared}")
     if _num_dwdp_groups and dwdp_size:
@@ -251,8 +255,11 @@ def submit_dwdp_job(config, log_dir, dry_run):
             for _c in _members:
                 if _c in allocations.get("CTX", {}):
                     _member_nodes.update(allocations["CTX"][_c]["nodes"].keys())
-            _span = ("intra-node" if len(_member_nodes) == 1
-                     else f"cross-node ({len(_member_nodes)} nodes via MNNVL fabric)")
+            _span = (
+                "intra-node"
+                if len(_member_nodes) == 1
+                else f"cross-node ({len(_member_nodes)} nodes via MNNVL fabric)"
+            )
             print(f"    group {_g} = CTX {_members}    {_span}")
     if gen_num and gen_world_size > 1:
         _gen_nodes = set()
@@ -261,8 +268,10 @@ def submit_dwdp_job(config, log_dir, dry_run):
         if len(_gen_nodes) == 1:
             print(f"  GEN TP={gen_world_size}: intra-node (NVLink allreduce)")
         else:
-            print(f"  GEN TP={gen_world_size}: cross-node "
-                  f"({len(_gen_nodes)} nodes; allreduce uses MNNVL fabric)")
+            print(
+                f"  GEN TP={gen_world_size}: cross-node "
+                f"({len(_gen_nodes)} nodes; allreduce uses MNNVL fabric)"
+            )
     print("=" * 72)
 
     server_config = convert_allocations_to_server_config(allocations)
@@ -324,7 +333,7 @@ def submit_dwdp_job(config, log_dir, dry_run):
     # physical placement; the arbitrary path's cost is inherent to
     # SLURM/PMIX behaviour under --distribution=arbitrary and not
     # specific to this launcher.  So we use it only when needed.
-    is_divisible_layout = (num_ctx_gpus % gpus_per_node == 0)
+    is_divisible_layout = num_ctx_gpus % gpus_per_node == 0
 
     if is_divisible_layout:
         # ---- Block-distribution path (perf-optimal) ----

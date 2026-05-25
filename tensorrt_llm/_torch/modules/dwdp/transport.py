@@ -263,9 +263,7 @@ class DWDPTransport:
 
         # Pick any spec to read the model's total expert count.  All layers
         # share the same ``num_experts`` (the gate-side global expert table).
-        first_spec = next(
-            iter(next(iter(layer_weight_specs.values())).values())
-        )
+        first_spec = next(iter(next(iter(layer_weight_specs.values())).values()))
         num_experts_total = first_spec.num_experts
 
         # Compute every peer's valid expert range deterministically from the
@@ -290,10 +288,7 @@ class DWDPTransport:
         if expected_keys != provided_keys:
             missing = expected_keys - provided_keys
             extra = provided_keys - expected_keys
-            raise ValueError(
-                f"local_params keys mismatch. "
-                f"Missing: {missing}, Extra: {extra}"
-            )
+            raise ValueError(f"local_params keys mismatch. Missing: {missing}, Extra: {extra}")
 
         handles: Dict[Tuple[int, str], int] = {}
         sizes: Dict[Tuple[int, str], int] = {}
@@ -390,8 +385,7 @@ class DWDPTransport:
                     )
 
             logger.info(
-                f"[DWDPTransport] Rank {dwdp_rank}: all handles exported, "
-                f"importing peer handles..."
+                f"[DWDPTransport] Rank {dwdp_rank}: all handles exported, importing peer handles..."
             )
 
             # ----------------------------------------------------------
@@ -591,9 +585,7 @@ class DWDPTransport:
         self._imported_handles.clear()
         self._peer_va_mappings.clear()
 
-        logger.debug(
-            f"[DWDPTransport] Rank {self._dwdp_rank}: released all resources"
-        )
+        logger.debug(f"[DWDPTransport] Rank {self._dwdp_rank}: released all resources")
 
     def __del__(self) -> None:
         """Clean up on garbage collection (best-effort; errors logged to debug)."""

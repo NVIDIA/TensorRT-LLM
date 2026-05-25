@@ -25,13 +25,13 @@ Covers:
 - to_dict/from_dict round-trip preserves DWDP fields
 - __eq__ and __hash__ include DWDP fields
 """
+
 import unittest
 
 from tensorrt_llm.mapping import Mapping
 
 
 class TestMappingDwdp(unittest.TestCase):
-
     # ------------------------------------------------------------------
     # Construction + validation
     # ------------------------------------------------------------------
@@ -94,9 +94,14 @@ class TestMappingDwdp(unittest.TestCase):
     def test_override_beats_explicit_moe_values(self):
         """Even if user explicitly passes moe_tp/ep sizes, DWDP override wins."""
         m = Mapping(
-            world_size=4, rank=0, tp_size=4,
-            moe_tp_size=2, moe_ep_size=2, moe_cluster_size=1,
-            dwdp_size=4, dwdp_rank=1,
+            world_size=4,
+            rank=0,
+            tp_size=4,
+            moe_tp_size=2,
+            moe_ep_size=2,
+            moe_cluster_size=1,
+            dwdp_size=4,
+            dwdp_rank=1,
         )
         self.assertEqual(m.moe_tp_size, 1)
         self.assertEqual(m.moe_ep_size, 1)
@@ -104,8 +109,9 @@ class TestMappingDwdp(unittest.TestCase):
 
     def test_non_dwdp_leaves_moe_alone(self):
         """When DWDP disabled, existing MoE defaulting logic is preserved."""
-        m = Mapping(world_size=4, rank=0, tp_size=4,
-                    moe_tp_size=2, moe_ep_size=2, moe_cluster_size=1)
+        m = Mapping(
+            world_size=4, rank=0, tp_size=4, moe_tp_size=2, moe_ep_size=2, moe_cluster_size=1
+        )
         self.assertEqual(m.moe_tp_size, 2)
         self.assertEqual(m.moe_ep_size, 2)
 
@@ -131,8 +137,9 @@ class TestMappingDwdp(unittest.TestCase):
         """
         for dwdp_size in (3, 5):
             for dwdp_rank in range(dwdp_size):
-                m = Mapping(world_size=1, rank=0, tp_size=1,
-                            dwdp_size=dwdp_size, dwdp_rank=dwdp_rank)
+                m = Mapping(
+                    world_size=1, rank=0, tp_size=1, dwdp_size=dwdp_size, dwdp_rank=dwdp_rank
+                )
                 self.assertEqual(m.moe_ep_size, 1)
                 self.assertEqual(m.dwdp_size, dwdp_size)
                 self.assertEqual(m.dwdp_rank, dwdp_rank)
@@ -149,14 +156,14 @@ class TestMappingDwdp(unittest.TestCase):
         not from ``moe_ep_rank``.
         """
         for dwdp_rank in range(4):
-            m = Mapping(world_size=4, rank=dwdp_rank, tp_size=4,
-                        dwdp_size=4, dwdp_rank=dwdp_rank)
+            m = Mapping(world_size=4, rank=dwdp_rank, tp_size=4, dwdp_size=4, dwdp_rank=dwdp_rank)
             self.assertEqual(m.moe_ep_rank, 0)
 
     def test_moe_ep_rank_uses_tp_rank_when_disabled(self):
         """DWDP off: moe_ep_rank falls back to tp_rank % moe_ep_size."""
-        m = Mapping(world_size=4, rank=0, tp_size=4,
-                    moe_tp_size=1, moe_ep_size=4, moe_cluster_size=1)
+        m = Mapping(
+            world_size=4, rank=0, tp_size=4, moe_tp_size=1, moe_ep_size=4, moe_cluster_size=1
+        )
         self.assertEqual(m.moe_ep_rank, m.tp_rank % m.moe_ep_size)
 
     # ------------------------------------------------------------------
@@ -166,10 +173,10 @@ class TestMappingDwdp(unittest.TestCase):
     def test_to_dict_includes_dwdp(self):
         m = Mapping(world_size=4, rank=1, tp_size=4, dwdp_size=4, dwdp_rank=1)
         d = m.to_dict()
-        self.assertIn('dwdp_size', d)
-        self.assertIn('dwdp_rank', d)
-        self.assertEqual(d['dwdp_size'], 4)
-        self.assertEqual(d['dwdp_rank'], 1)
+        self.assertIn("dwdp_size", d)
+        self.assertIn("dwdp_rank", d)
+        self.assertEqual(d["dwdp_size"], 4)
+        self.assertEqual(d["dwdp_rank"], 1)
 
     def test_roundtrip_preserves_dwdp(self):
         m1 = Mapping(world_size=4, rank=1, tp_size=4, dwdp_size=4, dwdp_rank=1)
@@ -201,12 +208,14 @@ class TestMappingDwdp(unittest.TestCase):
         self.assertNotEqual(m_on, m_off)
 
     def test_hash_distinguishes_dwdp(self):
-        """Hash must differ for different dwdp configurations (probabilistic but
-        deterministic here since we only tweak dwdp_rank)."""
+        """Hash must differ for different dwdp configurations.
+
+        Probabilistic but deterministic here since we only tweak dwdp_rank.
+        """
         m1 = Mapping(world_size=4, rank=0, tp_size=4, dwdp_size=4, dwdp_rank=0)
         m2 = Mapping(world_size=4, rank=0, tp_size=4, dwdp_size=4, dwdp_rank=1)
         self.assertNotEqual(hash(m1), hash(m2))
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     unittest.main()

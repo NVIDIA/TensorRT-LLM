@@ -22,6 +22,7 @@ DwdpManager is a thin lifecycle layer that:
 These tests mock out COMM_WORLD / global_mpi_rank / setup_dwdp so the full
 lifecycle can be exercised on a single CPU without MPI / CUDA / MNNVL.
 """
+
 import unittest
 from unittest.mock import MagicMock, patch
 
@@ -82,7 +83,6 @@ def _configure_mock_comm_world(mock_comm_world, world_size: int = 1024):
 @patch("tensorrt_llm._torch.pyexecutor.dwdp.global_mpi_rank", return_value=0)
 @patch("tensorrt_llm._torch.pyexecutor.dwdp.COMM_WORLD")
 class TestDwdpManagerLifecycle(unittest.TestCase):
-
     def setUp(self):
         # Ensure no leftover global singleton from a prior test.
         set_global_dwdp_manager(None)
@@ -135,7 +135,7 @@ class TestDwdpManagerLifecycle(unittest.TestCase):
             dwdp_size=2,
             num_groups=1,
             num_experts_per_worker=6,  # storage size
-            num_prefetch_experts=4,    # stride < size -> 2-expert overlap
+            num_prefetch_experts=4,  # stride < size -> 2-expert overlap
         )
         # rank=0: [0, 6). rank=1 would be [4, 10) -> 2-expert overlap [4, 6).
         mgr = DwdpManager(
@@ -191,8 +191,7 @@ class TestDwdpManagerLifecycle(unittest.TestCase):
                 mapping=_make_mapping(),
             )
 
-    def test_init_rejects_group_id_exceeding_num_groups(
-            self, mock_comm_world, mock_rank, _setup):
+    def test_init_rejects_group_id_exceeding_num_groups(self, mock_comm_world, mock_rank, _setup):
         # rank=4, dwdp_size=2 -> group_id=2; with num_groups=2 group_id must be < 2.
         # Override the class-level rank mock to test out-of-range group_id.
         mock_rank.return_value = 4
@@ -277,8 +276,7 @@ class TestDwdpManagerLifecycle(unittest.TestCase):
             mgr2.__enter__()
         mgr1.__exit__(None, None, None)
 
-    def test_cleanup_frees_comm_and_idempotent(
-            self, mock_comm_world, _rank, _setup):
+    def test_cleanup_frees_comm_and_idempotent(self, mock_comm_world, _rank, _setup):
         sub_comm = MagicMock()
         mock_comm_world.Create_group.return_value = sub_comm
         mock_comm_world.group.Incl.return_value = MagicMock()
@@ -299,8 +297,7 @@ class TestDwdpManagerLifecycle(unittest.TestCase):
     # add_layer (SSOT)
     # ------------------------------------------------------------------
 
-    def test_add_layer_appends_to_registered(
-            self, mock_comm_world, _rank, _setup):
+    def test_add_layer_appends_to_registered(self, mock_comm_world, _rank, _setup):
         mock_comm_world.Create_group.return_value = MagicMock()
         mock_comm_world.group.Incl.return_value = MagicMock()
         mock_comm_world.Get_size.return_value = 1024
@@ -314,8 +311,7 @@ class TestDwdpManagerLifecycle(unittest.TestCase):
         mgr.add_layer(7)
         self.assertEqual(mgr._registered_layers, [3, 5, 7])
 
-    def test_add_layer_duplicate_is_idempotent(
-            self, mock_comm_world, _rank, _setup):
+    def test_add_layer_duplicate_is_idempotent(self, mock_comm_world, _rank, _setup):
         mock_comm_world.Create_group.return_value = MagicMock()
         mock_comm_world.group.Incl.return_value = MagicMock()
         mock_comm_world.Get_size.return_value = 1024
@@ -332,8 +328,7 @@ class TestDwdpManagerLifecycle(unittest.TestCase):
     # setup(model) forwards to setup_dwdp with layer_indices SSOT
     # ------------------------------------------------------------------
 
-    def test_setup_forwards_layer_indices(
-            self, mock_comm_world, _rank, mock_setup):
+    def test_setup_forwards_layer_indices(self, mock_comm_world, _rank, mock_setup):
         sub_comm = MagicMock()
         mock_comm_world.Create_group.return_value = sub_comm
         mock_comm_world.group.Incl.return_value = MagicMock()
@@ -354,8 +349,8 @@ class TestDwdpManagerLifecycle(unittest.TestCase):
 
         fake_model = MagicMock()
         with patch(
-                "tensorrt_llm._torch.pyexecutor.dwdp.torch.cuda.current_device",
-                return_value=0,
+            "tensorrt_llm._torch.pyexecutor.dwdp.torch.cuda.current_device",
+            return_value=0,
         ):
             result = mgr.setup(fake_model)
 
@@ -376,8 +371,7 @@ class TestDwdpManagerLifecycle(unittest.TestCase):
     # Runtime forwards require setup()
     # ------------------------------------------------------------------
 
-    def test_runtime_before_setup_raises(
-            self, mock_comm_world, _rank, _setup):
+    def test_runtime_before_setup_raises(self, mock_comm_world, _rank, _setup):
         mock_comm_world.Create_group.return_value = MagicMock()
         mock_comm_world.group.Incl.return_value = MagicMock()
         mock_comm_world.Get_size.return_value = 1024
@@ -393,8 +387,7 @@ class TestDwdpManagerLifecycle(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             mgr.record_compute_and_prefetch_next(3)
 
-    def test_prefetch_first_layers_forwards(
-            self, mock_comm_world, _rank, mock_setup):
+    def test_prefetch_first_layers_forwards(self, mock_comm_world, _rank, mock_setup):
         mock_comm_world.Create_group.return_value = MagicMock()
         mock_comm_world.group.Incl.return_value = MagicMock()
         mock_comm_world.Get_size.return_value = 1024
@@ -408,19 +401,23 @@ class TestDwdpManagerLifecycle(unittest.TestCase):
             mapping=_make_mapping(),
         )
         with patch(
-                "tensorrt_llm._torch.pyexecutor.dwdp.torch.cuda.current_device",
-                return_value=0,
+            "tensorrt_llm._torch.pyexecutor.dwdp.torch.cuda.current_device",
+            return_value=0,
         ):
             mgr.setup(MagicMock())
         mgr.prefetch_first_layers()
         # First MoE layer 3 + ping-pong depth -> also prefetch next (5)
-        self.assertEqual(fake_wm.prefetch_layer.call_args_list, [
-            unittest.mock.call(3),
-            unittest.mock.call(5),
-        ])
+        self.assertEqual(
+            fake_wm.prefetch_layer.call_args_list,
+            [
+                unittest.mock.call(3),
+                unittest.mock.call(5),
+            ],
+        )
 
     def test_record_compute_and_prefetch_next_schedules_next(
-            self, mock_comm_world, _rank, mock_setup):
+        self, mock_comm_world, _rank, mock_setup
+    ):
         mock_comm_world.Create_group.return_value = MagicMock()
         mock_comm_world.group.Incl.return_value = MagicMock()
         mock_comm_world.Get_size.return_value = 1024
@@ -433,8 +430,8 @@ class TestDwdpManagerLifecycle(unittest.TestCase):
             mapping=_make_mapping(),
         )
         with patch(
-                "tensorrt_llm._torch.pyexecutor.dwdp.torch.cuda.current_device",
-                return_value=0,
+            "tensorrt_llm._torch.pyexecutor.dwdp.torch.cuda.current_device",
+            return_value=0,
         ):
             mgr.setup(MagicMock())
 
@@ -443,7 +440,8 @@ class TestDwdpManagerLifecycle(unittest.TestCase):
         fake_wm.prefetch_layer.assert_called_once_with(9)
 
     def test_record_compute_and_prefetch_next_last_layer_is_noop(
-            self, mock_comm_world, _rank, mock_setup):
+        self, mock_comm_world, _rank, mock_setup
+    ):
         mock_comm_world.Create_group.return_value = MagicMock()
         mock_comm_world.group.Incl.return_value = MagicMock()
         mock_comm_world.Get_size.return_value = 1024
@@ -456,16 +454,15 @@ class TestDwdpManagerLifecycle(unittest.TestCase):
             mapping=_make_mapping(),
         )
         with patch(
-                "tensorrt_llm._torch.pyexecutor.dwdp.torch.cuda.current_device",
-                return_value=0,
+            "tensorrt_llm._torch.pyexecutor.dwdp.torch.cuda.current_device",
+            return_value=0,
         ):
             mgr.setup(MagicMock())
 
         mgr.record_compute_and_prefetch_next(60)
         fake_wm.prefetch_layer.assert_not_called()
 
-    def test_wait_and_bind_forwards(
-            self, mock_comm_world, _rank, mock_setup):
+    def test_wait_and_bind_forwards(self, mock_comm_world, _rank, mock_setup):
         mock_comm_world.Create_group.return_value = MagicMock()
         mock_comm_world.group.Incl.return_value = MagicMock()
         mock_comm_world.Get_size.return_value = 1024
@@ -477,8 +474,8 @@ class TestDwdpManagerLifecycle(unittest.TestCase):
             mapping=_make_mapping(),
         )
         with patch(
-                "tensorrt_llm._torch.pyexecutor.dwdp.torch.cuda.current_device",
-                return_value=0,
+            "tensorrt_llm._torch.pyexecutor.dwdp.torch.cuda.current_device",
+            return_value=0,
         ):
             mgr.setup(MagicMock())
         backend = MagicMock()

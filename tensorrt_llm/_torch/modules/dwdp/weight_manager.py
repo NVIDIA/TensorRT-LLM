@@ -67,7 +67,7 @@ class DWDPWeightManager:
     is done via CUDA events and stream.wait_event() — the CPU is never blocked.
 
     Attributes:
-        weight_buffer: WeightBuffer with composite VAs for all MoE layers.
+        weight_buffer: WeightBuffer with composite VA layout for all MoE layers.
         dwdp_rank: This instance's DWDP rank (0..dwdp_size-1).
         dwdp_size: Total number of DWDP ranks.
     """
@@ -108,7 +108,7 @@ class DWDPWeightManager:
         so the first prefetch does not stall waiting for a never-recorded event.
 
         Args:
-            weight_buffer: WeightBuffer with composite VAs for all MoE layers.
+            weight_buffer: WeightBuffer with composite VA layout for all MoE layers.
             peer_views: Mapping of (peer_rank, layer_idx, weight_name) to tensor
                 views into peer's MNNVL handle. These are IMMUTABLE — the source
                 GPU never writes to them during inference.
@@ -137,9 +137,7 @@ class DWDPWeightManager:
         if dwdp_size <= 0:
             raise ValueError(f"dwdp_size must be positive, got {dwdp_size}")
         if dwdp_rank < 0 or dwdp_rank >= dwdp_size:
-            raise ValueError(
-                f"dwdp_rank must be in [0, {dwdp_size}), got {dwdp_rank}"
-            )
+            raise ValueError(f"dwdp_rank must be in [0, {dwdp_size}), got {dwdp_rank}")
 
         self._weight_buffer = weight_buffer
         self._peer_views = peer_views
@@ -166,12 +164,8 @@ class DWDPWeightManager:
         #   Waited on by compute_stream (RAW — must finish copy before read).
         # consume_events[i]: recorded on compute_stream after forward using slot i.
         #   Waited on by copy_stream (WAR — must finish read before overwrite).
-        self._prefetch_events: List[torch.cuda.Event] = [
-            torch.cuda.Event() for _ in range(2)
-        ]
-        self._consume_events: List[torch.cuda.Event] = [
-            torch.cuda.Event() for _ in range(2)
-        ]
+        self._prefetch_events: List[torch.cuda.Event] = [torch.cuda.Event() for _ in range(2)]
+        self._consume_events: List[torch.cuda.Event] = [torch.cuda.Event() for _ in range(2)]
 
         # Initialize consume_events as "already signaled" so the first prefetch
         # does not stall. We record them on the current (default) stream, which
@@ -186,9 +180,7 @@ class DWDPWeightManager:
         # src_ptrs, sizes)`` tuple per layer to avoid host-side rebuild on
         # every prefetch.
         self._use_batched_prefetch = contention_opt
-        self._batched_copy_plans: Dict[
-            int, Tuple[List[int], List[int], List[int]]
-        ] = {}
+        self._batched_copy_plans: Dict[int, Tuple[List[int], List[int], List[int]]] = {}
 
         logger.info(
             f"[DWDPWeightManager] Initialized: rank={dwdp_rank}/{dwdp_size}, "
@@ -283,8 +275,7 @@ class DWDPWeightManager:
         """
         if layer_idx not in self._moe_layer_set:
             raise KeyError(
-                f"Layer {layer_idx} is not a MoE layer. "
-                f"Valid layers: {self._moe_layer_indices}"
+                f"Layer {layer_idx} is not a MoE layer. Valid layers: {self._moe_layer_indices}"
             )
 
         buf_idx = self._weight_buffer.buffer_index_for_layer(layer_idx)
@@ -303,16 +294,13 @@ class DWDPWeightManager:
             self._prefetch_events[buf_idx].record(self._copy_stream)
 
         logger.debug(
-            f"[DWDPWeightManager] Prefetch enqueued: layer={layer_idx}, "
-            f"buf_slot={buf_idx}"
+            f"[DWDPWeightManager] Prefetch enqueued: layer={layer_idx}, buf_slot={buf_idx}"
         )
 
     def _prefetch_layer_per_slice(self, layer_idx: int) -> None:
         """Default prefetch: one ``torch.Tensor.copy_`` per peer chunk."""
         for name in self._weight_names:
-            remote_slices = self._weight_buffer.get_remote_slices(
-                layer_idx, name
-            )
+            remote_slices = self._weight_buffer.get_remote_slices(layer_idx, name)
             for dst_slice, expert_start, expert_end in remote_slices:
                 # A remote slice may span multiple peer ranks.  Walk
                 # the destination range and dispatch each contiguous
@@ -335,8 +323,8 @@ class DWDPWeightManager:
 
                     peer_key = (peer_rank, layer_idx, name)
                     src_tensor = self._peer_views[peer_key]
-                    dst_slice[dst_offset:dst_offset + n].copy_(
-                        src_tensor[local_offset:local_offset + n]
+                    dst_slice[dst_offset : dst_offset + n].copy_(
+                        src_tensor[local_offset : local_offset + n]
                     )
                     dst_offset += n
                     cursor = chunk_end
@@ -361,9 +349,7 @@ class DWDPWeightManager:
         # Step 1: collect per-peer ``(dst_ptr, src_ptr, total_size)`` triples.
         peer_triples: Dict[int, List[Tuple[int, int, int]]] = {}
         for name in self._weight_names:
-            remote_slices = self._weight_buffer.get_remote_slices(
-                layer_idx, name
-            )
+            remote_slices = self._weight_buffer.get_remote_slices(layer_idx, name)
             for dst_slice, expert_start, expert_end in remote_slices:
                 cursor = expert_start
                 dst_offset = 0
@@ -376,8 +362,8 @@ class DWDPWeightManager:
 
                     peer_key = (peer_rank, layer_idx, name)
                     src_tensor = self._peer_views[peer_key]
-                    dst_sub = dst_slice[dst_offset:dst_offset + n]
-                    src_sub = src_tensor[local_offset:local_offset + n]
+                    dst_sub = dst_slice[dst_offset : dst_offset + n]
+                    src_sub = src_tensor[local_offset : local_offset + n]
                     size_bytes = dst_sub.numel() * dst_sub.element_size()
 
                     peer_triples.setdefault(peer_rank, []).append(
@@ -436,9 +422,7 @@ class DWDPWeightManager:
         from cuda.bindings import runtime as cudart
 
         attr = cudart.cudaMemcpyAttributes()
-        attr.srcAccessOrder = (
-            cudart.cudaMemcpySrcAccessOrder.cudaMemcpySrcAccessOrderStream
-        )
+        attr.srcAccessOrder = cudart.cudaMemcpySrcAccessOrder.cudaMemcpySrcAccessOrderStream
         (err,) = cudart.cudaMemcpyBatchAsync(
             dst_ptrs,
             src_ptrs,
@@ -455,9 +439,7 @@ class DWDPWeightManager:
                 f"{layer_idx}, copies={len(dst_ptrs)}): {err}"
             )
 
-    def wait_and_bind(
-        self, backend_module: torch.nn.Module, layer_idx: int
-    ) -> None:
+    def wait_and_bind(self, backend_module: torch.nn.Module, layer_idx: int) -> None:
         """Wait for prefetch completion and bind weight tensors to the module.
 
         On the compute stream:
@@ -504,8 +486,7 @@ class DWDPWeightManager:
         """
         if layer_idx not in self._moe_layer_set:
             raise KeyError(
-                f"Layer {layer_idx} is not a MoE layer. "
-                f"Valid layers: {self._moe_layer_indices}"
+                f"Layer {layer_idx} is not a MoE layer. Valid layers: {self._moe_layer_indices}"
             )
 
         buf_idx = self._weight_buffer.buffer_index_for_layer(layer_idx)

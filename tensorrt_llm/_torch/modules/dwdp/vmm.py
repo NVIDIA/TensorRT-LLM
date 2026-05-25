@@ -27,7 +27,7 @@ from __future__ import annotations
 
 import functools
 import platform
-from typing import Optional, Tuple
+from typing import Tuple
 
 import torch
 
@@ -151,9 +151,7 @@ def _get_allocation_granularity_cached(device_id: int) -> int:
     """Cached implementation of get_allocation_granularity (thread-safe via lru_cache)."""
     allocation_prop = get_allocation_prop(device_id)
     option = cuda.CUmemAllocationGranularity_flags.CU_MEM_ALLOC_GRANULARITY_RECOMMENDED
-    return check_cu_result(
-        cuda.cuMemGetAllocationGranularity(prop=allocation_prop, option=option)
-    )
+    return check_cu_result(cuda.cuMemGetAllocationGranularity(prop=allocation_prop, option=option))
 
 
 def get_allocation_granularity(device_id: int, use_cache: bool = True) -> int:
@@ -171,9 +169,7 @@ def get_allocation_granularity(device_id: int, use_cache: bool = True) -> int:
 
     allocation_prop = get_allocation_prop(device_id)
     option = cuda.CUmemAllocationGranularity_flags.CU_MEM_ALLOC_GRANULARITY_RECOMMENDED
-    return check_cu_result(
-        cuda.cuMemGetAllocationGranularity(prop=allocation_prop, option=option)
-    )
+    return check_cu_result(cuda.cuMemGetAllocationGranularity(prop=allocation_prop, option=option))
 
 
 def get_access_desc(device_id: int) -> cuda.CUmemAccessDesc:
@@ -402,9 +398,6 @@ def _tensor_from_ptr_internal(
     # Create storage using ctypes to call internal PyTorch function
     # This approach uses torch.Storage.from_buffer equivalent for CUDA
     try:
-        # PyTorch 2.0+ approach using UntypedStorage
-        storage = torch.UntypedStorage(total_bytes, device=device)
-
         # Get the data pointer of the new storage and copy memory reference
         # Note: This creates a view, we need to use set_ instead
         tensor = torch.empty(shape, dtype=dtype, device=device)
