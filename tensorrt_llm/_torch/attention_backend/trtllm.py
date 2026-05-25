@@ -1168,10 +1168,14 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             )
 
     def get_local_layer_idx(self, metadata: TrtllmAttentionMetadata) -> int:
+        if self.local_layer_idx is not None:
+            return self.local_layer_idx
         if metadata.kv_cache_manager is None:
+            # Uncached: recomputed each call until a cache manager appears.
             return self.layer_idx
-        else:
-            return metadata.kv_cache_manager.layer_offsets[self.layer_idx]
+        self.local_layer_idx = metadata.kv_cache_manager.layer_offsets[
+            self.layer_idx]
+        return self.local_layer_idx
 
     def use_nvfp4_output(
         self,
@@ -1423,10 +1427,8 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
 
         self._ensure_rope_table_size(metadata.max_seq_len)
 
-        # Refresh every call: the cache-manager mapping can change between
-        # forward passes.
-        self.local_layer_idx = self.get_local_layer_idx(metadata)
-        if metadata.spec_decoding_bl_tree_mask is not None and self.local_layer_idx == 0:
+        if metadata.spec_decoding_bl_tree_mask is not None and self.get_local_layer_idx(
+                metadata) == 0:
             metadata.spec_decoding_bl_tree_mask.zero_()
 
         if self.print_skip_softmax_stat:
