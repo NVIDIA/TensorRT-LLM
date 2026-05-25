@@ -9,7 +9,7 @@ from typing import (Any, Callable, ClassVar, Dict, List, Optional, Protocol,
 import torch
 from PIL import Image
 from torch import Tensor, nn
-from transformers import (AutoProcessor, PretrainedConfig,
+from transformers import (AutoConfig, AutoProcessor, PretrainedConfig,
                           PreTrainedTokenizerBase)
 
 import tensorrt_llm
@@ -712,6 +712,12 @@ def create_input_processor(
     from tensorrt_llm._torch.model_config import ModelConfig
     from tensorrt_llm._torch.models import get_model_architecture
 
+    # Normalize Path → str so downstream HF and dynamic-module-cache lookups
+    # behave identically across call sites (the LLM main process passes Path
+    # while MPI workers pass str; transformers 5.5.x is sensitive to this).
+    if model_path_or_dir is not None:
+        model_path_or_dir = str(model_path_or_dir)
+
     config = None
 
     if checkpoint_format == "HF":
@@ -719,10 +725,24 @@ def create_input_processor(
             model_config = ModelConfig.from_pretrained(model_path_or_dir,
                                                        trust_remote_code=True)
             config = model_config.pretrained_config
-        except (ValueError, EnvironmentError) as e:
-            logger.debug(
-                f"Unable to load HF config from {model_path_or_dir}: {e}. Falling back."
-            )
+        except Exception as e:
+            # transformers 5.5.x can raise types beyond (ValueError,
+            # EnvironmentError) — e.g. ImportError from auto_map dynamic
+            # modules — when loading custom configs. Catch broadly so the
+            # LLM falls back to AutoConfig instead of silently dispatching
+            # to DefaultInputProcessor (which strips multimodal data and
+            # tanks accuracy on VLMs like Kimi K2.5; see NVBug 6182617).
+            logger.warning(
+                "ModelConfig.from_pretrained failed for %s: %s. "
+                "Falling back to AutoConfig.", model_path_or_dir, e)
+            try:
+                config = AutoConfig.from_pretrained(model_path_or_dir,
+                                                    trust_remote_code=True)
+            except Exception as e2:
+                logger.warning(
+                    "AutoConfig.from_pretrained also failed for %s: %s. "
+                    "Using DefaultInputProcessor.", model_path_or_dir, e2)
+                config = None
     elif checkpoint_format in ("mistral", "mistral_large_3"):
         logger.debug(f"Detected checkpoint_format={checkpoint_format}.")
         from tensorrt_llm._torch.models.checkpoints.mistral.config_loader import \
@@ -747,6 +767,14 @@ def create_input_processor(
                                        tokenizer,
                                        trust_remote_code=True,
                                        **kwargs)
+        # Config loaded but no model-specific processor matched — surface this
+        # so VLM accuracy regressions (e.g. NVBug 6182617) are visible at
+        # WARN level instead of being hidden behind a missing INFO log.
+        logger.warning(
+            "create_input_processor: no model-specific InputProcessor "
+            "registered for architectures=%s at %s; using DefaultInputProcessor. "
+            "Multimodal hashing will fail for VLM models.",
+            getattr(config, "architectures", None), model_path_or_dir)
 
     return DefaultInputProcessor(None, None, tokenizer)
 
