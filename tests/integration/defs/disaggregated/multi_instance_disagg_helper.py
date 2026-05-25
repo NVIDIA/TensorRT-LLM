@@ -29,6 +29,7 @@ import os
 import shutil
 import subprocess
 import tempfile
+import time
 
 import yaml
 from disagg_test_utils import ProcessWrapper, wait_for_disagg_server_ready
@@ -79,6 +80,97 @@ def _allocate_free_port_on_host(host: str) -> int:
     return get_free_port_in_ci()
 
 
+def _gpus_per_instance(server_cfg: dict) -> int:
+    return (
+        server_cfg.get("tensor_parallel_size", 1)
+        * server_cfg.get("pipeline_parallel_size", 1)
+        * server_cfg.get("context_parallel_size", 1)
+    )
+
+
+def _required_worker_ranks(base_config: dict) -> int:
+    ctx_servers = base_config.get("context_servers", {}) or {}
+    gen_servers = base_config.get("generation_servers", {}) or {}
+    return ctx_servers.get("num_instances", 0) * _gpus_per_instance(ctx_servers) + gen_servers.get(
+        "num_instances", 0
+    ) * _gpus_per_instance(gen_servers)
+
+
+def _candidate_shared_roots(cwd: str | None) -> list[str]:
+    candidates = [
+        os.environ.get("TRTLLM_DISAGG_SHARED_TMPDIR"),
+        os.environ.get("jobWorkspace"),
+        os.environ.get("JOB_WORKSPACE"),
+    ]
+    llm_models_root = os.environ.get("LLM_MODELS_ROOT")
+    if llm_models_root:
+        candidates.append(os.path.dirname(llm_models_root))
+    if cwd:
+        candidates.append(cwd)
+
+    deduped = []
+    seen = set()
+    for candidate in candidates:
+        if not candidate:
+            continue
+        candidate = os.path.abspath(candidate)
+        if candidate in seen:
+            continue
+        seen.add(candidate)
+        deduped.append(candidate)
+    return deduped
+
+
+def _create_work_dir(cwd: str | None) -> str:
+    """Create a work dir visible to MPI ranks when CI provides one."""
+    errors = []
+    for shared_root in _candidate_shared_roots(cwd):
+        if not os.path.isdir(shared_root):
+            errors.append(f"{shared_root}: not a directory")
+            continue
+        try:
+            work_dir = tempfile.mkdtemp(prefix="multi_disagg_", dir=shared_root)
+            probe_path = os.path.join(work_dir, ".write_probe")
+            with open(probe_path, "w") as f:
+                f.write("ok")
+            os.remove(probe_path)
+            print(f"Using disagg shared work dir: {work_dir}")
+            return work_dir
+        except OSError as e:
+            errors.append(f"{shared_root}: {e}")
+
+    # Single-node local runs can still use node-local /tmp. Multi-node CI is
+    # expected to provide jobWorkspace or TRTLLM_DISAGG_SHARED_TMPDIR.
+    work_dir = tempfile.mkdtemp(prefix="multi_disagg_")
+    print(f"Falling back to node-local disagg work dir {work_dir}; shared root attempts: {errors}")
+    return work_dir
+
+
+class _MpiWorkerStopProcess:
+    """Process-like shim used by disagg_test_utils.terminate()."""
+
+    pid = "mpi-disagg-workers"
+
+    def __init__(self, stop_file: str):
+        self._stop_file = stop_file
+        self._stopped = False
+
+    def poll(self):
+        return 0 if self._stopped else None
+
+    def kill(self):
+        os.makedirs(os.path.dirname(self._stop_file), exist_ok=True)
+        with open(self._stop_file, "w") as f:
+            f.write("stop\n")
+        self._stopped = True
+
+    def wait(self, timeout=None):
+        # Give leader ranks a chance to observe the stop file before pytest
+        # removes the temporary work dir.
+        time.sleep(min(timeout or 5, 5))
+        return 0
+
+
 # ---------------------------------------------------------------------------
 # Combined config writer + setup entry point
 # ---------------------------------------------------------------------------
@@ -94,16 +186,8 @@ def _build_combined_config(
 
     num_ctx = ctx_servers.get("num_instances", 0)
     num_gen = gen_servers.get("num_instances", 0)
-    gpus_per_ctx = (
-        ctx_servers.get("tensor_parallel_size", 1)
-        * ctx_servers.get("pipeline_parallel_size", 1)
-        * ctx_servers.get("context_parallel_size", 1)
-    )
-    gpus_per_gen = (
-        gen_servers.get("tensor_parallel_size", 1)
-        * gen_servers.get("pipeline_parallel_size", 1)
-        * gen_servers.get("context_parallel_size", 1)
-    )
+    gpus_per_ctx = _gpus_per_instance(ctx_servers)
+    gpus_per_gen = _gpus_per_instance(gen_servers)
 
     # Plan rank ranges: ctx instances first, then gen instances. This matches
     # `extract_disagg_cfg`'s ordering, which `split_world_comm` consumes.
@@ -138,10 +222,10 @@ def _build_combined_config(
     # disaggregated_mpi_worker can read them per instance via
     # extract_ctx_gen_cfgs().
     combined = dict(base_config)
-    if num_ctx:
+    if "context_servers" in combined:
         combined["context_servers"] = dict(ctx_servers)
         combined["context_servers"]["urls"] = ctx_urls
-    if num_gen:
+    if "generation_servers" in combined:
         combined["generation_servers"] = dict(gen_servers)
         combined["generation_servers"]["urls"] = gen_urls
 
@@ -161,9 +245,8 @@ def setup_multi_instance_disagg_cluster(
     compatibility:
         (config, ctx_workers, gen_workers, disagg_server, server_port, work_dir)
 
-    ``ctx_workers`` and ``gen_workers`` are returned empty because in this
-    flow the workers run as in-MPI-pool tasks (no separate subprocesses on
-    the pytest side) — there is nothing for pytest to terminate locally.
+    ``ctx_workers`` carries a process-like stop shim because the real workers
+    run as in-MPI-pool tasks rather than local subprocesses.
     """
     # Lazy imports to avoid breaking single-node tests on import.
     from tensorrt_llm.executor.utils import create_mpi_comm_session
@@ -172,6 +255,12 @@ def setup_multi_instance_disagg_cluster(
         base_config = yaml.safe_load(f)
 
     mpi_world_size = int(os.environ.get("tllm_mpi_size", "1"))
+    required_ranks = _required_worker_ranks(base_config)
+    if required_ranks != mpi_world_size:
+        raise RuntimeError(
+            f"Disagg config requires {required_ranks} MPI ranks, "
+            f"but tllm_mpi_size is {mpi_world_size}"
+        )
 
     # Step 0: create the shared mgmn proxy client up-front so we can use it
     # for both the hostname gather and the long-running disagg task.
@@ -183,27 +272,12 @@ def setup_multi_instance_disagg_cluster(
         base_config, work_dir="", rank_to_host=rank_to_host
     )
 
-    # Each MPI rank — including ranks on remote nodes — will reread the
-    # combined config after the task is dispatched. ``/tmp`` is node-local, so
-    # use a shared location instead. Prefer ``LLM_MODELS_ROOT``'s parent (a
-    # lustre mount that's already required by these tests); fall back to
-    # ``cwd`` or ``/tmp`` as a last resort.
-    shared_root_candidates = [
-        os.environ.get("TRTLLM_DISAGG_SHARED_TMPDIR"),
-        os.path.dirname(os.environ.get("LLM_MODELS_ROOT", "") or "")
-        if os.environ.get("LLM_MODELS_ROOT")
-        else None,
-        cwd,
-    ]
-    shared_root = next(
-        (p for p in shared_root_candidates if p and os.path.isdir(p) and p.startswith("/lustre")),
-        None,
-    )
-    if shared_root:
-        work_dir = tempfile.mkdtemp(prefix="multi_disagg_", dir=shared_root)
-    else:
-        work_dir = tempfile.mkdtemp(prefix="multi_disagg_")
+    # Each MPI rank — including ranks on remote nodes — rereads the combined
+    # config after the task is dispatched. ``/tmp`` is node-local in CI, so use
+    # a known shared job directory when one is available.
+    work_dir = _create_work_dir(cwd)
     combined_cfg_path = os.path.join(work_dir, "combined.yaml")
+    worker_stop_file = os.path.join(work_dir, "stop_workers")
     with open(combined_cfg_path, "w") as f:
         yaml.dump(combined, f, sort_keys=False)
 
@@ -216,16 +290,18 @@ def setup_multi_instance_disagg_cluster(
     frontend_cfg["port"] = frontend_port
     # Strip the per-worker LLM params; the frontend only needs routing info.
     if "context_servers" in frontend_cfg:
+        ctx_cfg = combined.get("context_servers", {})
         frontend_cfg["context_servers"] = {
-            "num_instances": combined["context_servers"]["num_instances"],
-            "urls": combined["context_servers"]["urls"],
-            "router": combined["context_servers"].get("router", {}),
+            "num_instances": ctx_cfg.get("num_instances", 0),
+            "urls": ctx_cfg.get("urls", []),
+            "router": ctx_cfg.get("router", {}),
         }
     if "generation_servers" in frontend_cfg:
+        gen_cfg = combined.get("generation_servers", {})
         frontend_cfg["generation_servers"] = {
-            "num_instances": combined["generation_servers"]["num_instances"],
-            "urls": combined["generation_servers"]["urls"],
-            "router": combined["generation_servers"].get("router", {}),
+            "num_instances": gen_cfg.get("num_instances", 0),
+            "urls": gen_cfg.get("urls", []),
+            "router": gen_cfg.get("router", {}),
         }
     frontend_cfg_path = os.path.join(work_dir, "frontend.yaml")
     with open(frontend_cfg_path, "w") as f:
@@ -238,7 +314,7 @@ def setup_multi_instance_disagg_cluster(
     # blocks each rank for the lifetime of the disagg cluster.
     from tensorrt_llm.commands.serve import disaggregated_mpi_worker_main
 
-    mpi_session.submit(disaggregated_mpi_worker_main, combined_cfg_path, "info")
+    mpi_session.submit(disaggregated_mpi_worker_main, combined_cfg_path, "info", worker_stop_file)
 
     # --- 2) Launch the disagg frontend on the pytest process's node.
     sub_env = dict(env) if env else None
@@ -286,18 +362,17 @@ def setup_multi_instance_disagg_cluster(
     config_for_return["hostname"] = frontend_host
     config_for_return["port"] = frontend_port
 
-    # ctx/gen worker lists empty: in this flow the workers are not
-    # subprocesses of pytest; they live inside the shared MPI pool and are
-    # cleaned up when the pool tears down.
-    return config_for_return, [], [], disagg_server, frontend_port, work_dir
+    # The workers live inside the shared MPI pool. Return a process-like shim
+    # so the normal test cleanup path can ask them to exit before pytest
+    # removes the shared config directory.
+    worker_stopper = ProcessWrapper(_MpiWorkerStopProcess(worker_stop_file))
+    return (config_for_return, [worker_stopper], [], disagg_server, frontend_port, work_dir)
 
 
 def should_use_multi_instance_path(base_config: dict) -> bool:
-    """Return True iff this config needs the multi-instance helper."""
+    """Return True iff this config needs the MPI-worker helper."""
     if int(os.environ.get("tllm_mpi_size", "1")) <= 1:
         # No shared mgmn pool — old path handles single-node multi-instance
         # by giving each subprocess its own CUDA_VISIBLE_DEVICES.
         return False
-    ctx = base_config.get("context_servers", {}) or {}
-    gen = base_config.get("generation_servers", {}) or {}
-    return (ctx.get("num_instances", 0) + gen.get("num_instances", 0)) > 1
+    return _required_worker_ranks(base_config) > 1

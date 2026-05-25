@@ -419,7 +419,8 @@ class RemoteMpiCommSessionServer():
                  n_workers: int = 0,
                  addr: str = f'tcp://127.0.0.1:*',
                  comm=None,
-                 is_comm: bool = False):
+                 is_comm: bool = False,
+                 stop_file: Optional[str] = None):
         # FIXME: this is a hack to avoid circular import, resolve later
         from tensorrt_llm.executor.ipc import ZeroMqQueue
         self.addr = addr
@@ -428,6 +429,7 @@ class RemoteMpiCommSessionServer():
                                  socket_type=zmq.PAIR,
                                  use_hmac_encryption=True)
         self.comm = comm
+        self.stop_file = stop_file
         self.results = []  # the results may arrive in any order
 
         if self.comm is not None:
@@ -437,6 +439,9 @@ class RemoteMpiCommSessionServer():
             self.session = MpiCommSession(
                 n_workers=n_workers) if is_comm else MpiPoolSession(
                     n_workers=n_workers)
+
+    def _stop_file_requested(self) -> bool:
+        return bool(self.stop_file and os.path.exists(self.stop_file))
 
     @staticmethod
     def task_wrapper(task: Callable[..., T], *args, **kwargs) -> T:
@@ -469,9 +474,19 @@ class RemoteMpiCommSessionServer():
                      "yellow")
         pending_futures = []
         while True:
+            if self._stop_file_requested():
+                logger.info(
+                    "RemoteMpiCommSessionServer received stop-file request")
+                self.session.shutdown(wait=False)
+                break
+
             # Wait for any pending futures from previous tasks to complete
             # This ensures all ranks are ready before accepting the next task
             if pending_futures:
+                if not all(future.done() for future in pending_futures):
+                    time.sleep(1)
+                    continue
+
                 logger_debug(
                     f"RemoteMpiCommSessionServer waiting for {len(pending_futures)} pending futures to complete\n",
                     "grey")
@@ -501,6 +516,9 @@ class RemoteMpiCommSessionServer():
                 logger_debug(
                     "RemoteMpiCommSessionServer all pending futures completed\n",
                     "grey")
+
+            if not self.queue.poll(1):
+                continue
 
             message: Optional[RemoteTask] = self.queue.get()
             if message is None:
