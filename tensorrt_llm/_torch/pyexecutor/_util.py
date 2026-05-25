@@ -70,13 +70,14 @@ def _non_hybrid_kv_cache_manager_cls(config, kv_cache_config: KvCacheConfig):
     return KVCacheManagerV2 if needs_v2 else KVCacheManager
 
 
-def get_kv_cache_manager_cls(model_config: ModelConfig,
-                             kv_cache_config: KvCacheConfig,
-                             is_disagg: bool = False):
+def get_kv_cache_manager_cls(
+        model_config: ModelConfig,
+        kv_cache_config: KvCacheConfig,
+        is_disagg: bool = False,
+        cache_transceiver_config: Optional[CacheTransceiverConfig] = None):
     """Resolve the concrete KV cache manager class for ``model_config``.
 
-    For hybrid mamba models the choice between ``Mixed`` (separate pools,
-    needed for disagg / TRTLLM_USE_CPP_MAMBA / TRTLLM_USE_PY_MAMBA) and
+    For hybrid mamba models the choice between ``Mixed`` ( TRTLLM_USE_CPP_MAMBA / TRTLLM_USE_PY_MAMBA) and
     ``Cpp`` (unified pool with block reuse) is made here. Callers that don't
     care about disagg can omit ``is_disagg`` and get the unified-pool default.
 
@@ -98,8 +99,14 @@ def get_kv_cache_manager_cls(model_config: ModelConfig,
             return _non_hybrid_kv_cache_manager_cls(config, kv_cache_config)
         if kv_cache_config.enable_block_reuse:
             return CppMambaHybridCacheManager
-        if is_disagg or use_cpp_mamba_cache_manager(
-        ) or use_py_mamba_cache_manager():
+        if use_cpp_mamba_cache_manager() or use_py_mamba_cache_manager():
+            logger.info(
+                "Using MixedMambaHybridCacheManager for hybrid mamba model")
+            return MixedMambaHybridCacheManager
+        if (cache_transceiver_config is not None
+                and cache_transceiver_config.transceiver_runtime == "PYTHON"):
+            logger.info("Python transceiver detected; using "
+                        "MixedMambaHybridCacheManager for hybrid mamba model")
             return MixedMambaHybridCacheManager
         default_cls = CppMambaHybridCacheManager
         env_override = os.environ.get('TLLM_MAMBA_MANAGER_PREFERENCE', None)
@@ -237,9 +244,11 @@ class KvCacheCreator:
 
     def _get_model_kv_cache_manager_cls(self, model_engine: PyTorchModelEngine):
         config = model_engine.model.model_config.pretrained_config
-        cls = get_kv_cache_manager_cls(model_engine.model.model_config,
-                                       self._kv_cache_config,
-                                       is_disagg=self._is_disagg)
+        cls = get_kv_cache_manager_cls(
+            model_engine.model.model_config,
+            self._kv_cache_config,
+            is_disagg=self._is_disagg,
+            cache_transceiver_config=self._cache_transceiver_config)
         if cls == KVCacheManagerV2:
             if self._kv_connector_manager is not None or (
                     self._max_beam_width is not None and self._max_beam_width
@@ -270,13 +279,13 @@ class KvCacheCreator:
         # actually made.
         if is_hybrid_linear(model_engine.model.model_config.pretrained_config) \
                 and self._kv_cache_config.enable_block_reuse:
-            uses_v1_mamba_route = self._is_disagg \
-                or os.environ.get('TRTLLM_USE_CPP_MAMBA', '0') == '1' \
+            uses_v1_mamba_route = os.environ.get('TRTLLM_USE_CPP_MAMBA', '0') == '1' \
                 or os.environ.get('TRTLLM_USE_PY_MAMBA', '0') == '1' \
                 or self._speculative_config is not None
             if uses_v1_mamba_route:
                 logger.warning(
-                    "Block reuse does not work with MTP or disagg for hybrid linear models"
+                    "Block reuse does not work with MTP for hybrid linear models "
+                    "when using the legacy MambaCacheManager (TRTLLM_USE_CPP_MAMBA=1)"
                 )
         return cls
 
