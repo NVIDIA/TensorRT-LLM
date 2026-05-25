@@ -26,6 +26,7 @@
 #include "tensorrt_llm/runtime/cudaStream.h"
 #include <cstddef>
 #include <iostream>
+#include <limits>
 #include <memory>
 #include <type_traits>
 
@@ -33,6 +34,31 @@ namespace su = tensorrt_llm::executor::serialize_utils;
 
 namespace tensorrt_llm::executor
 {
+
+namespace
+{
+
+constexpr size_t kMultimodalInputRunExtensionTag = std::numeric_limits<size_t>::max();
+constexpr SizeType32 kMultimodalInputRunExtensionVersion{1};
+
+bool hasMultimodalInputRunExtension(MultimodalInput const& multimodalInput)
+{
+    return multimodalInput.getMultimodalItemRunCuOffsets().has_value()
+        || multimodalInput.getMultimodalRunPositions().has_value()
+        || multimodalInput.getMultimodalRunLengths().has_value();
+}
+
+std::vector<std::vector<SizeType32>> deserializeMultimodalHashesWithSize(std::istream& is, size_t size)
+{
+    std::vector<std::vector<SizeType32>> multimodalHashes;
+    for (size_t index = 0; index < size; ++index)
+    {
+        multimodalHashes.emplace_back(su::deserialize<std::vector<SizeType32>>(is));
+    }
+    return multimodalHashes;
+}
+
+} // namespace
 
 // TimePoint
 RequestPerfMetrics::TimePoint Serialization::deserializeTimePoint(std::istream& is)
@@ -336,29 +362,72 @@ size_t Serialization::serializedSize(PromptTuningConfig const& config)
 // MultimodalInput
 MultimodalInput Serialization::deserializeMultimodalInput(std::istream& is)
 {
-    auto multimodalHashes = su::deserialize<std::vector<std::vector<SizeType32>>>(is);
+    auto const hashListSizeOrExtensionTag = su::deserialize<size_t>(is);
+    auto const hasRunExtension = hashListSizeOrExtensionTag == kMultimodalInputRunExtensionTag;
+    if (hasRunExtension)
+    {
+        auto const version = su::deserialize<SizeType32>(is);
+        TLLM_CHECK_WITH_INFO(
+            version == kMultimodalInputRunExtensionVersion, "Unsupported MultimodalInput run extension version.");
+    }
+    auto multimodalHashes = hasRunExtension ? su::deserialize<std::vector<std::vector<SizeType32>>>(is)
+                                            : deserializeMultimodalHashesWithSize(is, hashListSizeOrExtensionTag);
     auto multimodalPositions = su::deserialize<std::vector<SizeType32>>(is);
     auto multimodalLengths = su::deserialize<std::vector<SizeType32>>(is);
     auto multimodalUuids = su::deserialize<std::optional<std::vector<std::optional<std::string>>>>(is);
+    std::optional<std::vector<SizeType32>> multimodalItemRunCuOffsets = std::nullopt;
+    std::optional<std::vector<SizeType32>> multimodalRunPositions = std::nullopt;
+    std::optional<std::vector<SizeType32>> multimodalRunLengths = std::nullopt;
+    if (hasRunExtension)
+    {
+        multimodalItemRunCuOffsets = su::deserialize<std::optional<std::vector<SizeType32>>>(is);
+        multimodalRunPositions = su::deserialize<std::optional<std::vector<SizeType32>>>(is);
+        multimodalRunLengths = su::deserialize<std::optional<std::vector<SizeType32>>>(is);
+    }
     return MultimodalInput{std::move(multimodalHashes), std::move(multimodalPositions), std::move(multimodalLengths),
-        std::move(multimodalUuids)};
+        std::move(multimodalUuids), std::move(multimodalItemRunCuOffsets), std::move(multimodalRunPositions),
+        std::move(multimodalRunLengths)};
 }
 
 void Serialization::serialize(MultimodalInput const& multimodalInput, std::ostream& os)
 {
+    auto const hasRunExtension = hasMultimodalInputRunExtension(multimodalInput);
+    if (hasRunExtension)
+    {
+        su::serialize(kMultimodalInputRunExtensionTag, os);
+        su::serialize(kMultimodalInputRunExtensionVersion, os);
+    }
     su::serialize(multimodalInput.mMultimodalHashes, os);
     su::serialize(multimodalInput.mMultimodalPositions, os);
     su::serialize(multimodalInput.mMultimodalLengths, os);
     su::serialize(multimodalInput.mMultimodalUuids, os);
+    if (hasRunExtension)
+    {
+        su::serialize(multimodalInput.mMultimodalItemRunCuOffsets, os);
+        su::serialize(multimodalInput.mMultimodalRunPositions, os);
+        su::serialize(multimodalInput.mMultimodalRunLengths, os);
+    }
 }
 
 size_t Serialization::serializedSize(MultimodalInput const& multimodalInput)
 {
     size_t totalSize = 0;
+    auto const hasRunExtension = hasMultimodalInputRunExtension(multimodalInput);
+    if (hasRunExtension)
+    {
+        totalSize += su::serializedSize(kMultimodalInputRunExtensionTag);
+        totalSize += su::serializedSize(kMultimodalInputRunExtensionVersion);
+    }
     totalSize += su::serializedSize(multimodalInput.mMultimodalHashes);
     totalSize += su::serializedSize(multimodalInput.mMultimodalPositions);
     totalSize += su::serializedSize(multimodalInput.mMultimodalLengths);
     totalSize += su::serializedSize(multimodalInput.mMultimodalUuids);
+    if (hasRunExtension)
+    {
+        totalSize += su::serializedSize(multimodalInput.mMultimodalItemRunCuOffsets);
+        totalSize += su::serializedSize(multimodalInput.mMultimodalRunPositions);
+        totalSize += su::serializedSize(multimodalInput.mMultimodalRunLengths);
+    }
     return totalSize;
 }
 
@@ -570,6 +639,8 @@ kv_cache::CacheState Serialization::deserializeCacheState(std::istream& is)
         rnnCfg.mNGroups = su::deserialize<decltype(CacheState::RnnModelConfig::mNGroups)>(is);
         rnnCfg.mNumLayers = su::deserialize<decltype(CacheState::RnnModelConfig::mNumLayers)>(is);
         rnnCfg.mNumHeads = su::deserialize<decltype(CacheState::RnnModelConfig::mNumHeads)>(is);
+        rnnCfg.mConvSectionLayout
+            = static_cast<CacheState::RnnModelConfig::ConvSectionLayout>(su::deserialize<SizeType32>(is));
         convStateDataType = su::deserialize<nvinfer1::DataType>(is);
         ssmStateDataType = su::deserialize<nvinfer1::DataType>(is);
         rnnLayerNumPerPP = su::deserialize<std::vector<SizeType32>>(is);
@@ -621,6 +692,7 @@ void Serialization::serialize(kv_cache::CacheState const& state, std::ostream& o
         su::serialize(rnn.mNGroups, os);
         su::serialize(rnn.mNumLayers, os);
         su::serialize(rnn.mNumHeads, os);
+        su::serialize(static_cast<SizeType32>(rnn.mConvSectionLayout), os);
         su::serialize(state.mRnnCacheState->mConvStateDataType, os);
         su::serialize(state.mRnnCacheState->mSsmStateDataType, os);
         su::serialize(state.mRnnCacheState->mLayerNumPerPP, os);
@@ -662,6 +734,7 @@ size_t Serialization::serializedSize(kv_cache::CacheState const& state)
         totalSize += su::serializedSize(rnn.mNGroups);
         totalSize += su::serializedSize(rnn.mNumLayers);
         totalSize += su::serializedSize(rnn.mNumHeads);
+        totalSize += su::serializedSize(static_cast<SizeType32>(rnn.mConvSectionLayout));
         totalSize += su::serializedSize(state.mRnnCacheState->mConvStateDataType);
         totalSize += su::serializedSize(state.mRnnCacheState->mSsmStateDataType);
         totalSize += su::serializedSize(state.mRnnCacheState->mLayerNumPerPP);

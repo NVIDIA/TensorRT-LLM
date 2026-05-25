@@ -577,14 +577,15 @@ class Mistral3VLM(MultimodalModelMixin, PreTrainedModel):
                 f"Using intermediate layers ({vision_feature_layer}) in the `PixtralVisionModel` "
                 f"is not supported. Please use `vision_feature_layer=-1`.")
 
-        self._device = "cuda"
         self.model_dtype = getattr(config, "torch_dtype", torch.bfloat16)
         image_token_index = getattr(
             config, "image_token_index", None) or getattr(
                 config.vision_config, "image_token_id", None)
-        self._image_token_ids = torch.tensor([image_token_index],
-                                             dtype=torch.int32,
-                                             device=self._device)
+        # Move with the module, but keep this derived helper out of checkpoints.
+        self.register_buffer("_image_token_ids",
+                             torch.tensor([image_token_index],
+                                          dtype=torch.int32),
+                             persistent=False)
 
         model_config_cp = copy.deepcopy(model_config)
 
@@ -610,7 +611,7 @@ class Mistral3VLM(MultimodalModelMixin, PreTrainedModel):
         self._vision_tower = modeling_pixtral.PixtralVisionModel(
             vision_model_config)
         self._multi_modal_projector = Mistral3MultiModalProjector(
-            model_config).eval().to(self._device)
+            model_config).eval()
         self._post_config()
 
     # This is necessary because the executor looks at
@@ -700,10 +701,6 @@ class Mistral3VLM(MultimodalModelMixin, PreTrainedModel):
         **encoder_kwargs: Any,
     ) -> MultimodalEncoderOutput:
         mm_embeds = self._vision_forward(list(multimodal_params))
-        if len(mm_embeds) != 1:
-            raise ValueError(
-                f"Expected Mistral vision encoder to return 1 tensor, got {len(mm_embeds)}."
-            )
         return MultimodalEncoderOutput(embeddings=mm_embeds[0])
 
     def get_language_model_forward_kwargs(

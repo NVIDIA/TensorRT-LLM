@@ -39,13 +39,9 @@ import torch.nn.functional as F
 try:
     from diffusers import DiffusionPipeline
 
-    from tensorrt_llm._torch.visual_gen.config import (
-        ParallelConfig,
-        TorchCompileConfig,
-        VisualGenArgs,
-    )
     from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineLoader
     from tensorrt_llm._utils import get_free_port
+    from tensorrt_llm.visual_gen.args import ParallelConfig, TorchCompileConfig, VisualGenArgs
 
     MODULES_AVAILABLE = True
 except ImportError:
@@ -153,13 +149,11 @@ def run_test_in_distributed(world_size: int, test_fn: Callable, **kwargs):
 def _build_parallel_args(checkpoint_path: str) -> "VisualGenArgs":
     """Build VisualGenArgs with cfg=2, ulysses=2, parallel_vae=2."""
     return VisualGenArgs(
-        checkpoint_path=checkpoint_path,
-        device="cuda",
-        dtype="bfloat16",
-        torch_compile=TorchCompileConfig(enable_torch_compile=False),
-        parallel=ParallelConfig(
-            dit_cfg_size=2,
-            dit_ulysses_size=2,
+        model=checkpoint_path,
+        torch_compile_config=TorchCompileConfig(enable=False),
+        parallel_config=ParallelConfig(
+            cfg_size=2,
+            ulysses_size=2,
             parallel_vae_size=2,
             parallel_vae_split_dim="width",
         ),
