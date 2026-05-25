@@ -201,9 +201,6 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
         ... )
     """
 
-    # Maximum number of B tensors supported
-    MAX_B_TENSORS = 4
-
     def __init__(
         self,
         sf_vec_size: int,
@@ -211,7 +208,6 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
         cluster_shape_mn: Tuple[int, int],
         use_blkred: bool = False,
         raster_along_m: bool = False,
-        b_tensor_l_sizes: Optional[Tuple[int, ...]] = None,
     ):
         """Initializes the configuration for a Blackwell blockscaled dense GEMM kernel.
 
@@ -229,10 +225,6 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
         :type cluster_shape_mn: Tuple[int, int]
         :param raster_along_m: Boolean, True to use raster along M.
         :type raster_along_m: bool
-        :param b_tensor_l_sizes: Optional tuple of L sizes for each B tensor.
-            E.g., (8, 8, 16) means 3 B tensors with L=8, 8, 16. Sum equals total L.
-            If None, single B tensor mode (backward compatible).
-        :type b_tensor_l_sizes: Optional[Tuple[int, ...]]
         """
 
         self.sf_vec_size = sf_vec_size
@@ -294,25 +286,14 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
         # TMEM offset for final accumulator
         self.tmem_final_offset = 384
 
-        # Multi-B tensor configuration
-        if b_tensor_l_sizes is None:
-            self.num_b_tensors = 1
-            self.b_tensor_l_sizes = None
-            # Offsets padded for safe indexing in kernel
-            self.b_tensor_l_offsets = (0,) + (2**30,) * self.MAX_B_TENSORS
-        else:
-            assert len(b_tensor_l_sizes) <= self.MAX_B_TENSORS, (
-                f"Max {self.MAX_B_TENSORS} B tensors, got {len(b_tensor_l_sizes)}"
-            )
-            self.num_b_tensors = len(b_tensor_l_sizes)
-            self.b_tensor_l_sizes = b_tensor_l_sizes
-            offsets = [0]
-            for l_size in b_tensor_l_sizes:
-                offsets.append(offsets[-1] + l_size)
-            # Pad to MAX_B_TENSORS + 1 for safe indexing
-            while len(offsets) < self.MAX_B_TENSORS + 1:
-                offsets.append(2**30)
-            self.b_tensor_l_offsets = tuple(offsets)
+        # Single-B kernel mode.  The DWDP IPC-era multi-B path that supplied
+        # ``b_tensor_l_sizes`` was removed once DWDP switched to VA: the
+        # composite-VA tensor swap leaves a single [num_experts, ...] B tensor
+        # per call, so the per-rank tuple no longer exists.  Kept here so
+        # downstream ``cute.const_expr(num_b_tensors >= 2/3/4)`` branches
+        # statically fold away at compile time.
+        self.num_b_tensors = 1
+        self.b_tensor_l_offsets = (0, 2**30)
 
     def _setup_attributes(self):
         """Set up configurations that are dependent on GEMM inputs
@@ -2785,11 +2766,11 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
     def wrapper(
         self,
         a_ptr: cute.Pointer,
-        b_ptr_tuple: Tuple[cute.Pointer, ...],
+        b_ptr: cute.Pointer,
         a_sf_ptr: cute.Pointer,
-        b_sf_ptr_tuple: Tuple[cute.Pointer, ...],
+        b_sf_ptr: cute.Pointer,
         c_ptr: cute.Pointer,
-        alpha_ptr_tuple: Tuple[cute.Pointer, ...],
+        alpha_ptr: cute.Pointer,
         tile_idx_to_group_idx_ptr: cute.Pointer,
         tile_idx_to_mn_limit_ptr: cute.Pointer,
         permuted_idx_to_expanded_idx_ptr: cute.Pointer,
@@ -2798,6 +2779,7 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
         m: cutlass.Int64,
         n: cutlass.Int64,
         k: cutlass.Int64,
+        l: cutlass.Int64,  # noqa: E741
         num_tokens: cutlass.Int64,
         top_k: cutlass.Int64,
         tile_size: cutlass.Constexpr,
@@ -2806,10 +2788,9 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
         stream: cuda.CUstream,
         epilogue_op: cutlass.Constexpr = lambda x: x,
     ):
-        """Unified wrapper supporting both single-B and multi-B tensors.
+        """Single-B wrapper.
 
-        B tensors are always passed as tuples (length 1 for single-B).
-        L sizes are configured via b_tensor_l_sizes in __init__.
+        ``l`` is the number of experts in the (sole) B tensor.
         """
         scale_k = k // scaling_vector_size
         num_tiles = m // tile_size
@@ -2825,68 +2806,16 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
             c_ptr, layout=cute.make_ordered_layout((num_tokens, n, 1), order=(1, 0, 2))
         )
 
-        l_0 = self.b_tensor_l_sizes[0]
-        alpha_0 = cute.make_tensor(alpha_ptr_tuple[0], layout=cute.make_layout((l_0,)))
-        b_0 = cute.make_tensor(
-            b_ptr_tuple[0], layout=cute.make_ordered_layout((n, k, l_0), order=(1, 0, 2))
+        alpha = cute.make_tensor(alpha_ptr, layout=cute.make_layout((l,)))
+        b = cute.make_tensor(
+            b_ptr, layout=cute.make_ordered_layout((n, k, l), order=(1, 0, 2))
         )
-        b_sf_0 = cute.make_tensor(
-            b_sf_ptr_tuple[0],
+        b_sf = cute.make_tensor(
+            b_sf_ptr,
             layout=cute.make_ordered_layout(
-                (32, 4, n // 128, 4, scale_k // 4, l_0), order=(2, 1, 4, 0, 3, 5)
+                (32, 4, n // 128, 4, scale_k // 4, l), order=(2, 1, 4, 0, 3, 5)
             ),
         )
-        b_tuple = [b_0]
-        b_sf_tuple = [b_sf_0]
-        alpha_tuple = [alpha_0]
-
-        if cutlass.const_expr(self.num_b_tensors >= 2):
-            l_1 = self.b_tensor_l_sizes[1]
-            alpha_1 = cute.make_tensor(alpha_ptr_tuple[1], layout=cute.make_layout((l_1,)))
-            b_1 = cute.make_tensor(
-                b_ptr_tuple[1], layout=cute.make_ordered_layout((n, k, l_1), order=(1, 0, 2))
-            )
-            b_sf_1 = cute.make_tensor(
-                b_sf_ptr_tuple[1],
-                layout=cute.make_ordered_layout(
-                    (32, 4, n // 128, 4, scale_k // 4, l_1), order=(2, 1, 4, 0, 3, 5)
-                ),
-            )
-            b_tuple.append(b_1)
-            b_sf_tuple.append(b_sf_1)
-            alpha_tuple.append(alpha_1)
-
-        if cutlass.const_expr(self.num_b_tensors >= 3):
-            l_2 = self.b_tensor_l_sizes[2]
-            alpha_2 = cute.make_tensor(alpha_ptr_tuple[2], layout=cute.make_layout((l_2,)))
-            b_2 = cute.make_tensor(
-                b_ptr_tuple[2], layout=cute.make_ordered_layout((n, k, l_2), order=(1, 0, 2))
-            )
-            b_sf_2 = cute.make_tensor(
-                b_sf_ptr_tuple[2],
-                layout=cute.make_ordered_layout(
-                    (32, 4, n // 128, 4, scale_k // 4, l_2), order=(2, 1, 4, 0, 3, 5)
-                ),
-            )
-            b_tuple.append(b_2)
-            b_sf_tuple.append(b_sf_2)
-            alpha_tuple.append(alpha_2)
-
-        if cutlass.const_expr(self.num_b_tensors >= 4):
-            l_3 = self.b_tensor_l_sizes[3]
-            alpha_3 = cute.make_tensor(alpha_ptr_tuple[3], layout=cute.make_layout((l_3,)))
-            b_3 = cute.make_tensor(
-                b_ptr_tuple[3], layout=cute.make_ordered_layout((n, k, l_3), order=(1, 0, 2))
-            )
-            b_sf_3 = cute.make_tensor(
-                b_sf_ptr_tuple[3],
-                layout=cute.make_ordered_layout(
-                    (32, 4, n // 128, 4, scale_k // 4, l_3), order=(2, 1, 4, 0, 3, 5)
-                ),
-            )
-            b_tuple.append(b_3)
-            b_sf_tuple.append(b_sf_3)
-            alpha_tuple.append(alpha_3)
 
         tile_idx_to_group_idx = cute.make_tensor(
             tile_idx_to_group_idx_ptr, layout=cute.make_layout((num_tiles,))
@@ -2907,14 +2836,14 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
 
         return self(
             a,
-            tuple(b_tuple),
+            b,
             c,
             a_sf,
-            tuple(b_sf_tuple),
+            b_sf,
             tile_idx_to_group_idx,
             num_non_exiting_tiles,
             tile_idx_to_mn_limit,
-            tuple(alpha_tuple),
+            alpha,
             max_active_clusters=max_active_clusters,
             stream=stream,
             permuted_idx_to_expanded_idx=permuted_idx_to_expanded_idx,

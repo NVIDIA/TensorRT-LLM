@@ -2083,25 +2083,20 @@ if IS_CUTLASS_DSL_AVAILABLE:
                              a.data_ptr(),
                              cute.AddressSpace.gmem,
                              assumed_align=32)
-            # Kernel ``wrapper`` still consumes tuple-form b / b_sf / alpha
-            # pointers (left in place from the DWDP IPC era).  Phase 2
-            # restored the runner-class interface to bare tensors; rewriting
-            # the kernel wrapper to drop the tuple/MAX_B_TENSORS unrolling
-            # is Phase 3.
-            b_ptr = (make_ptr(cutlass.Float4E2M1FN,
-                              b.data_ptr(),
-                              cute.AddressSpace.gmem,
-                              assumed_align=32), )
+            b_ptr = make_ptr(cutlass.Float4E2M1FN,
+                             b.data_ptr(),
+                             cute.AddressSpace.gmem,
+                             assumed_align=32)
             a_sf_ptr = make_ptr(cutlass.Float8E4M3FN,
                                 a_sf.data_ptr(),
                                 cute.AddressSpace.gmem,
                                 assumed_align=16)
-            b_sf_ptr = (make_ptr(cutlass.Float8E4M3FN,
-                                 b_sf.data_ptr(),
-                                 cute.AddressSpace.gmem,
-                                 assumed_align=16), )
-            alpha_ptr = (make_ptr(cutlass.Float32, alpha.data_ptr(),
-                                  cute.AddressSpace.gmem), )
+            b_sf_ptr = make_ptr(cutlass.Float8E4M3FN,
+                                b_sf.data_ptr(),
+                                cute.AddressSpace.gmem,
+                                assumed_align=16)
+            alpha_ptr = make_ptr(cutlass.Float32, alpha.data_ptr(),
+                                 cute.AddressSpace.gmem)
             tile_idx_to_group_idx_ptr = make_ptr(
                 cutlass.Int32, tile_idx_to_group_idx.data_ptr(),
                 cute.AddressSpace.gmem)
@@ -2143,7 +2138,6 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     cluster_shape_mn=cluster_shape_mn,
                     use_blkred=True,
                     raster_along_m=raster_along_m,
-                    b_tensor_l_sizes=(l, ),
                 )
                 # Compute max active clusters on current device
                 hardware_info = cutlass.utils.HardwareInfo()
@@ -2165,6 +2159,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     m,
                     n,
                     k,
+                    l,
                     num_tokens,
                     self.top_k,
                 ]
@@ -2196,6 +2191,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 m,
                 n,
                 k,
+                l,
                 num_tokens,
                 self.top_k,
             ]
@@ -2844,29 +2840,25 @@ if IS_CUTLASS_DSL_AVAILABLE:
                                dtype=a_sf.dtype,
                                device=a_sf.device)
 
-            # Create pointers.  Kernel ``wrapper`` still consumes tuple-form
-            # b / b_sf / alpha pointers (left in place from the DWDP IPC era);
-            # Phase 2 restored the runner-class interface to bare tensors,
-            # and Phase 3 rewrites the kernel wrapper to drop the
-            # tuple/MAX_B_TENSORS unrolling entirely.
+            # Create pointers.
             a_ptr = make_ptr(cutlass.Float4E2M1FN,
                              a.data_ptr(),
                              cute.AddressSpace.gmem,
                              assumed_align=32)
-            b_ptr = (make_ptr(cutlass.Float4E2M1FN,
-                              b.data_ptr(),
-                              cute.AddressSpace.gmem,
-                              assumed_align=32), )
+            b_ptr = make_ptr(cutlass.Float4E2M1FN,
+                             b.data_ptr(),
+                             cute.AddressSpace.gmem,
+                             assumed_align=32)
             a_sf_ptr = make_ptr(cutlass.Float8E4M3FN,
                                 a_sf.data_ptr(),
                                 cute.AddressSpace.gmem,
                                 assumed_align=16)
-            b_sf_ptr = (make_ptr(cutlass.Float8E4M3FN,
-                                 b_sf.data_ptr(),
-                                 cute.AddressSpace.gmem,
-                                 assumed_align=16), )
-            alpha_ptr = (make_ptr(cutlass.Float32, alpha.data_ptr(),
-                                  cute.AddressSpace.gmem), )
+            b_sf_ptr = make_ptr(cutlass.Float8E4M3FN,
+                                b_sf.data_ptr(),
+                                cute.AddressSpace.gmem,
+                                assumed_align=16)
+            alpha_ptr = make_ptr(cutlass.Float32, alpha.data_ptr(),
+                                 cute.AddressSpace.gmem)
             c_ptr = make_ptr(cutlass.Float4E2M1FN,
                              c.data_ptr(),
                              cute.AddressSpace.gmem,
@@ -2914,7 +2906,6 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     vectorized_f32=True,
                     topk=self.top_k,
                     raster_along_m=raster_along_m,
-                    b_tensor_l_sizes=(l, ),
                     activation_type=self.activation_type,
                 )
                 hardware_info = cutlass.utils.HardwareInfo()
@@ -2938,6 +2929,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     m,
                     n,
                     k,
+                    l,
                 ]
 
                 compiled_gemm = cute.compile(
@@ -2970,6 +2962,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 m,
                 n,
                 k,
+                l,
             ]
 
             compiled_gemm(*exec_args, stream=stream)

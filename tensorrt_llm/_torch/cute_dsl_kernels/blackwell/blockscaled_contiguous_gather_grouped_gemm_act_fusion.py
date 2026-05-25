@@ -265,9 +265,6 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         ... )
     """
 
-    # Maximum number of B tensors supported
-    MAX_B_TENSORS = 4
-
     def __init__(
         self,
         sf_vec_size: int,
@@ -276,7 +273,6 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         vectorized_f32: bool,
         topk: cutlass.Int64,
         raster_along_m: bool = False,
-        b_tensor_l_sizes: Optional[Tuple[int, ...]] = None,
         activation_type: ActivationType = ActivationType.Swiglu,
     ):
         """Initializes the configuration for a Blackwell blockscaled dense GEMM kernel with
@@ -317,10 +313,6 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         :type vectorized_f32: bool
         :param topk: Number of experts selected per token (used for token ID mapping).
         :type topk: cutlass.Int64
-        :param b_tensor_l_sizes: Optional tuple of L sizes for each B tensor.
-            E.g., (8, 8, 16) means 3 B tensors with L=8, 8, 16. Sum equals total L.
-            If None, single B tensor mode (backward compatible).
-        :type b_tensor_l_sizes: Optional[Tuple[int, ...]]
         :param activation_type: Fused activation. Must be ``ActivationType.Swiglu``
             (gated, default) or ``ActivationType.Relu2`` (non-gated).
         :type activation_type: ActivationType
@@ -408,25 +400,14 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
 
         self.vectorized_f32 = vectorized_f32
 
-        # Multi-B tensor configuration
-        if b_tensor_l_sizes is None:
-            self.num_b_tensors = 1
-            self.b_tensor_l_sizes = None
-            # Offsets padded for safe indexing in kernel
-            self.b_tensor_l_offsets = (0,) + (2**30,) * self.MAX_B_TENSORS
-        else:
-            assert len(b_tensor_l_sizes) <= self.MAX_B_TENSORS, (
-                f"Max {self.MAX_B_TENSORS} B tensors, got {len(b_tensor_l_sizes)}"
-            )
-            self.num_b_tensors = len(b_tensor_l_sizes)
-            self.b_tensor_l_sizes = b_tensor_l_sizes
-            offsets = [0]
-            for l_size in b_tensor_l_sizes:
-                offsets.append(offsets[-1] + l_size)
-            # Pad to MAX_B_TENSORS + 1 for safe indexing
-            while len(offsets) < self.MAX_B_TENSORS + 1:
-                offsets.append(2**30)
-            self.b_tensor_l_offsets = tuple(offsets)
+        # Single-B kernel mode.  The DWDP IPC-era multi-B path that supplied
+        # ``b_tensor_l_sizes`` was removed once DWDP switched to VA: the
+        # composite-VA tensor swap leaves a single [num_experts, ...] B tensor
+        # per call, so the per-rank tuple no longer exists.  Kept here so
+        # downstream ``cute.const_expr(num_b_tensors >= 2/3/4)`` branches
+        # statically fold away at compile time.
+        self.num_b_tensors = 1
+        self.b_tensor_l_offsets = (0, 2**30)
 
     def _setup_attributes(self):
         """Set up configurations that are dependent on GEMM inputs
@@ -3699,12 +3680,12 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
     def wrapper(
         self,
         a_ptr: cute.Pointer,
-        b_ptr_tuple: Tuple[cute.Pointer, ...],
+        b_ptr: cute.Pointer,
         a_sf_ptr: cute.Pointer,
-        b_sf_ptr_tuple: Tuple[cute.Pointer, ...],
+        b_sf_ptr: cute.Pointer,
         c_ptr: cute.Pointer,
         c_sf_ptr: cute.Pointer,
-        alpha_ptr_tuple: Tuple[cute.Pointer, ...],
+        alpha_ptr: cute.Pointer,
         tile_idx_to_group_idx_ptr: cute.Pointer,
         tile_idx_to_mn_limit_ptr: cute.Pointer,
         token_id_mapping_ptr: cute.Pointer,
@@ -3714,6 +3695,7 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         m: cutlass.Int64,
         n: cutlass.Int64,
         k: cutlass.Int64,
+        l: cutlass.Int64,  # noqa: E741
         tile_size: cutlass.Constexpr,
         scaling_vector_size: cutlass.Constexpr,
         max_active_clusters: cutlass.Constexpr,
@@ -3721,18 +3703,16 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         epilogue_op: cutlass.Constexpr = lambda x: x,
         activation_type: cutlass.Constexpr = ActivationType.Swiglu,
     ):
-        """Unified wrapper supporting both single-B and multi-B tensors.
+        """Single-B wrapper.
 
-        B tensors are always passed as tuples (length 1 for single-B).
-        L sizes are configured via b_tensor_l_sizes in __init__.
-        ``activation_type`` is an ``ActivationType`` value and must match the
-        one passed to ``__init__``; only ``Swiglu`` and ``Relu2`` are supported.
+        ``l`` is the number of experts in the (sole) B tensor.  ``activation_type``
+        must match the one passed to ``__init__``; only ``Swiglu`` and ``Relu2``
+        are supported.
         """
         is_gated = is_gated_activation(activation_type)
         scale_k = k // scaling_vector_size
         interm_size = n // 2 if is_gated else n
         num_tiles = m // tile_size
-        total_l = self.b_tensor_l_offsets[self.num_b_tensors]
 
         a = cute.make_tensor(
             a_ptr, layout=cute.make_ordered_layout((orig_m, k, 1), order=(1, 0, 2))
@@ -3746,74 +3726,20 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         c_sf = cute.make_tensor(
             c_sf_ptr,
             layout=cute.make_ordered_layout(
-                (32, 4, m // 128, 4, interm_size // (scaling_vector_size * 4), total_l),
+                (32, 4, m // 128, 4, interm_size // (scaling_vector_size * 4), l),
                 order=(2, 1, 4, 0, 3, 5),
             ),
         )
-
-        # Create B and alpha tensors using const_expr conditions
-        l_0 = self.b_tensor_l_sizes[0]
-        alpha_0 = cute.make_tensor(alpha_ptr_tuple[0], layout=cute.make_layout((l_0,)))
-        b_0 = cute.make_tensor(
-            b_ptr_tuple[0], layout=cute.make_ordered_layout((n, k, l_0), order=(1, 0, 2))
+        alpha = cute.make_tensor(alpha_ptr, layout=cute.make_layout((l,)))
+        b = cute.make_tensor(
+            b_ptr, layout=cute.make_ordered_layout((n, k, l), order=(1, 0, 2))
         )
-        b_sf_0 = cute.make_tensor(
-            b_sf_ptr_tuple[0],
+        b_sf = cute.make_tensor(
+            b_sf_ptr,
             layout=cute.make_ordered_layout(
-                (32, 4, n // 128, 4, scale_k // 4, l_0), order=(2, 1, 4, 0, 3, 5)
+                (32, 4, n // 128, 4, scale_k // 4, l), order=(2, 1, 4, 0, 3, 5)
             ),
         )
-        b_tuple = [b_0]
-        b_sf_tuple = [b_sf_0]
-        alpha_tuple = [alpha_0]
-
-        if cutlass.const_expr(self.num_b_tensors >= 2):
-            l_1 = self.b_tensor_l_sizes[1]
-            alpha_1 = cute.make_tensor(alpha_ptr_tuple[1], layout=cute.make_layout((l_1,)))
-            b_1 = cute.make_tensor(
-                b_ptr_tuple[1], layout=cute.make_ordered_layout((n, k, l_1), order=(1, 0, 2))
-            )
-            b_sf_1 = cute.make_tensor(
-                b_sf_ptr_tuple[1],
-                layout=cute.make_ordered_layout(
-                    (32, 4, n // 128, 4, scale_k // 4, l_1), order=(2, 1, 4, 0, 3, 5)
-                ),
-            )
-            b_tuple.append(b_1)
-            b_sf_tuple.append(b_sf_1)
-            alpha_tuple.append(alpha_1)
-
-        if cutlass.const_expr(self.num_b_tensors >= 3):
-            l_2 = self.b_tensor_l_sizes[2]
-            alpha_2 = cute.make_tensor(alpha_ptr_tuple[2], layout=cute.make_layout((l_2,)))
-            b_2 = cute.make_tensor(
-                b_ptr_tuple[2], layout=cute.make_ordered_layout((n, k, l_2), order=(1, 0, 2))
-            )
-            b_sf_2 = cute.make_tensor(
-                b_sf_ptr_tuple[2],
-                layout=cute.make_ordered_layout(
-                    (32, 4, n // 128, 4, scale_k // 4, l_2), order=(2, 1, 4, 0, 3, 5)
-                ),
-            )
-            b_tuple.append(b_2)
-            b_sf_tuple.append(b_sf_2)
-            alpha_tuple.append(alpha_2)
-
-        if cutlass.const_expr(self.num_b_tensors >= 4):
-            l_3 = self.b_tensor_l_sizes[3]
-            alpha_3 = cute.make_tensor(alpha_ptr_tuple[3], layout=cute.make_layout((l_3,)))
-            b_3 = cute.make_tensor(
-                b_ptr_tuple[3], layout=cute.make_ordered_layout((n, k, l_3), order=(1, 0, 2))
-            )
-            b_sf_3 = cute.make_tensor(
-                b_sf_ptr_tuple[3],
-                layout=cute.make_ordered_layout(
-                    (32, 4, n // 128, 4, scale_k // 4, l_3), order=(2, 1, 4, 0, 3, 5)
-                ),
-            )
-            b_tuple.append(b_3)
-            b_sf_tuple.append(b_sf_3)
-            alpha_tuple.append(alpha_3)
 
         tile_idx_to_group_idx = cute.make_tensor(
             tile_idx_to_group_idx_ptr, layout=cute.make_layout((num_tiles,))
@@ -3829,17 +3755,17 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
 
         return self(
             a,
-            tuple(b_tuple),
+            b,
             c,
             a_sf,
-            tuple(b_sf_tuple),
+            b_sf,
             c_sf,
             global_sf,
             tile_idx_to_group_idx,
             tile_idx_to_mn_limit,
             token_id_mapping,
             num_non_exiting_tiles,
-            tuple(alpha_tuple),
+            alpha,
             max_active_clusters=max_active_clusters,
             stream=stream,
             epilogue_op=epilogue_op,
