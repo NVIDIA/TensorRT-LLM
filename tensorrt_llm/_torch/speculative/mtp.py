@@ -675,7 +675,7 @@ class MTPWorker(SpecWorkerBase):
             mtp_past_hidden_states_pool.index_copy_(0, slot_ids,
                                                     new_mtp_past_hidden_states)
 
-    @torch.compile(options={"max-autotune": True})
+    # @torch.compile(options={"max-autotune": True})
     def topk_kernel(self, gen_logprobs, num_gens, mtp_num_modules,
                     spec_metadata):
         topk_value, topk_indices = torch.topk(gen_logprobs,
@@ -689,7 +689,7 @@ class MTPWorker(SpecWorkerBase):
             num_gens, mtp_num_modules)
         return topk_value, topk_indices, draft_tokens
 
-    @torch.compile(options={"max-autotune": True})
+    # @torch.compile(options={"max-autotune": True})
     def process_generation_logits(self, logits, num_contexts):
         gen_logits = logits[num_contexts:]
         gen_logprobs = torch.softmax(gen_logits, dim=-1)
@@ -1070,7 +1070,7 @@ class MTPWorker(SpecWorkerBase):
             "attn_metadata": attn_metadata,
         }
 
-    @torch.compile(options={"max-autotune": True})
+    # @torch.compile(options={"max-autotune": True})
     def get_local_max_and_combined(self, logits, mapping_lm_tp=None):
         local_max_values, local_argmax = torch.max(logits, dim=-1, keepdim=True)
         # Adjust indices based on TP rank and size
@@ -1089,7 +1089,7 @@ class MTPWorker(SpecWorkerBase):
             dim=-1).flatten(-2)
         return combined
 
-    @torch.compile(options={"max-autotune": True})
+    # @torch.compile(options={"max-autotune": True})
     def get_draft_tokens_from_gathered(self, gathered):
         gathered_indices_float = gathered[..., 0::2]  # Even positions: indices
         gathered_values_float = gathered[..., 1::2]  # Odd positions: values

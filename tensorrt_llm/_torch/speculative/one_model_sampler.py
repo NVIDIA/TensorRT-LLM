@@ -91,7 +91,7 @@ def apply_temperature(
     return logits.div_(temp.unsqueeze(dim=1))
 
 
-@torch.compile(options={"max-autotune": True})
+# @torch.compile(options={"max-autotune": True})
 def sampling_batch_spec_dec_one_model(
     logits: torch.Tensor,
     temperatures: torch.Tensor,
