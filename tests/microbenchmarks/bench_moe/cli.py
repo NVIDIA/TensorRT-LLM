@@ -31,6 +31,7 @@ from tensorrt_llm.models.modeling_utils import QuantAlgo
 from .backend import MoeBackendType
 from .routing import _per_rank_tokens
 from .search import (
+    _coerce_str_tuple,
     _maybe_auto_enable_search_axes,
     _parse_analysis,
     _parse_search_axes,
@@ -535,20 +536,6 @@ def _resolve_model_from_args(args: argparse.Namespace) -> ModelSpec:
         swiglu_beta=base.swiglu_beta,
         swiglu_limit=base.swiglu_limit,
     )
-
-
-def _coerce_str_tuple(val: Any) -> Tuple[str, ...]:
-    """Normalize ``nargs="+"`` argparse fields into an upper-cased str tuple.
-
-    Accepts the post-parse value of ``--backend``/``--comm_method``/
-    ``--parallel_mode`` regardless of whether it came in as a single string
-    (e.g. from a config file or default) or a list (argparse ``nargs="+"``).
-    """
-    if val is None:
-        return ()
-    if isinstance(val, (list, tuple)):
-        return tuple(str(v).upper() for v in val if str(v).strip())
-    return (str(val).upper(),)
 
 
 def _resolve_workloads_from_args(args: argparse.Namespace) -> List[WorkloadSpec]:

@@ -93,10 +93,11 @@ def _compute_stats(values: List[float]) -> Dict[str, float]:
     n = len(s)
     mean = sum(s) / n
     variance = sum((x - mean) ** 2 for x in s) / n
+    median = s[n // 2] if n % 2 else (s[n // 2 - 1] + s[n // 2]) / 2.0
     p90_idx = max(0, min(n - 1, int(round(0.9 * (n - 1)))))
     return {
         "mean": mean,
-        "median": s[n // 2],
+        "median": median,
         "stdev": variance**0.5,
         "min": s[0],
         "max": s[-1],

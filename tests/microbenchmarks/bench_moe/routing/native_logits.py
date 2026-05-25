@@ -225,19 +225,12 @@ def _make_supplied_topk_run_moe(
 
 def _make_supplied_topk_apply(
     moe_module,
-    apply_orig,
     materialized_ids: torch.Tensor,
     materialized_scales: torch.Tensor,
 ):
     """Return a ``routing_method.apply`` wrapper returning the plan directly."""
 
     def supplied_apply(router_logits):
-        # Honour the original apply to preserve dtypes/device when possible,
-        # but discard its result.
-        try:
-            _ = apply_orig(router_logits)
-        except Exception:
-            pass
         local = materialized_ids
         scales = materialized_scales
         if router_logits is not None:
@@ -272,25 +265,25 @@ def _maybe_install_routing_control_patch(
 
     routing_target = moe
     apply_method_orig = routing_target.routing_method.apply
-    routing_target.routing_method.apply = _make_supplied_topk_apply(
-        routing_target, apply_method_orig, materialized_ids, materialized_scales
-    )
-
     inner_backend = getattr(moe, "backend", moe)
     run_moe_orig = None
-    if isinstance(inner_backend, TRTLLMGenFusedMoE):
-        run_moe_orig = inner_backend.run_moe
-        inner_backend.run_moe = _make_supplied_topk_run_moe(
-            inner_backend, run_moe_orig, materialized_ids, materialized_scales
-        )
-
     forward_impl_orig = moe.forward_impl
-    moe.forward_impl = make_forward_impl_check(moe, forward_impl_orig)
 
     try:
+        routing_target.routing_method.apply = _make_supplied_topk_apply(
+            routing_target, materialized_ids, materialized_scales
+        )
+
+        if isinstance(inner_backend, TRTLLMGenFusedMoE):
+            run_moe_orig = inner_backend.run_moe
+            inner_backend.run_moe = _make_supplied_topk_run_moe(
+                inner_backend, run_moe_orig, materialized_ids, materialized_scales
+            )
+
+        moe.forward_impl = make_forward_impl_check(moe, forward_impl_orig)
         yield
     finally:
         routing_target.routing_method.apply = apply_method_orig
         if run_moe_orig is not None:
-            getattr(moe, "backend", moe).run_moe = run_moe_orig
+            inner_backend.run_moe = run_moe_orig
         moe.forward_impl = forward_impl_orig
