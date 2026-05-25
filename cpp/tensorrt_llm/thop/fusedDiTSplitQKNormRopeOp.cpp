@@ -35,7 +35,9 @@ void fused_dit_split_norm_rope(torch::Tensor& tensor, int64_t num_heads, int64_t
     TORCH_CHECK(tensor.dim() == 2, "tensor must be 2D: [num_tokens, num_heads*head_dim]");
     TORCH_CHECK(weight.dim() == 1, "weight must be 1D");
     TORCH_CHECK(cos_emb.dim() >= 2 && cos_emb.dim() <= 4, "cos_emb must have rank in [2, 4]; got ", cos_emb.dim());
-    TORCH_CHECK(sin_emb.dim() == cos_emb.dim(), "sin_emb rank must match cos_emb");
+    TORCH_CHECK(sin_emb.sizes() == cos_emb.sizes(),
+        "sin_emb shape must match cos_emb exactly (raw, pre-flatten); got cos=", cos_emb.sizes(),
+        " sin=", sin_emb.sizes());
 
     // Flatten cos/sin to 2D internally. Two supported layouts:
     //   shape (..., num_heads, head_dim) → per-head cos, fold last 2 dims together
