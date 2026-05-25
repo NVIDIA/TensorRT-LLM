@@ -83,21 +83,17 @@ _TINY_KWARGS_UNIVERSAL: Dict[str, Any] = {
     "vocab_size": 64,
     "max_position_embeddings": 256,
     "rope_theta": 1000000.0,
-    # Force vanilla rotary on every model: transformers 5.x defaults
-    # ``rope_scaling`` to ``{"rope_type": "default"}`` for some configs
-    # (e.g. ``DeepseekV3Config``), and ``modeling_deepseek.py`` --
-    # which is the production deployment path for real DeepSeek-V3
-    # checkpoints -- assumes any non-None ``rope_scaling`` ships the
-    # full yarn dict (``factor``, ``mscale_all_dim``, ...). That
-    # assumption is fine in production where real configs always carry
-    # those keys, but a default-constructed config in this test trips
-    # ``DeepSeekV3Attention.__init__`` with a ``KeyError: 'factor'``
-    # before any sharding work runs. Setting ``rope_scaling = None``
-    # routes every model in the matrix through its vanilla rotary
-    # branch, which is also the appropriate stimulus for a sharding
-    # equivalence test (we want minimal, deterministic embeddings,
-    # not yarn extrapolation behaviour).
-    "rope_scaling": None,
+    # ``rope_scaling`` is intentionally NOT set here: in transformers 5.x,
+    # ``PretrainedConfig.__setattr__`` aliases ``rope_scaling`` <->
+    # ``rope_parameters`` and on composite configs (e.g.
+    # ``Qwen3_5MoeConfig``) propagates the value into ``text_config``,
+    # so a universal ``rope_scaling = None`` would also nuke
+    # ``text_config.rope_parameters`` and break models that read it
+    # (e.g. ``Qwen3_5MoeTextRotaryEmbedding``). DeepSeek-V3 needs a
+    # ``factor`` key in its ``rope_scaling`` dict to clear
+    # ``DeepSeekV3Attention.__init__``; that family-specific patch is
+    # handled in ``_apply_layer_count_dependent_quirks`` below, gated
+    # on the DeepSeek MLA marker so it does not touch other families.
     # MoE -- deepseek requires num_experts % n_group == 0 (n_group defaults to 8)
     "num_experts": 8,
     "num_experts_per_tok": 2,
@@ -276,6 +272,46 @@ def _apply_layer_count_dependent_quirks(config: Any, num_layers: int) -> None:
         config.layers_block_type = _balanced_layers_block_type(num_layers)
 
 
+def _apply_per_family_quirks(config: Any) -> None:
+    """Patch config fields whose default is broken for a specific family.
+
+    These are NOT layer-count dependent and NOT safe to put in
+    :data:`_TINY_KWARGS_UNIVERSAL`, because the universal kwargs are
+    applied via ``setattr`` to every model's config, and some keys
+    (notably ``rope_scaling``) trigger aliasing / sub-config
+    propagation inside ``PretrainedConfig.__setattr__`` that would
+    break other families. Each branch dispatches on a feature marker
+    on the config object (never on the filename) so it fires for any
+    config that exposes the same field, independent of family naming.
+
+    **Ordering invariant**: must be called on a *pristine* config --
+    i.e. before :data:`_TINY_KWARGS_UNIVERSAL` is applied -- because
+    the universal kwargs ``setattr`` many family-specific keys
+    (``kv_lora_rank``, ``q_lora_rank``, ``ssm_state_size``, ...) onto
+    every config to keep one tiny-kwargs dict universal. After the
+    universal pass every config looks like every family, so
+    feature-presence detection here would over-match.
+
+    Currently handled:
+
+    * ``kv_lora_rank`` -- present iff this is a DeepSeek-V3 / MLA
+      family config. ``modeling_deepseek.DeepSeekV3Attention.__init__``
+      reads ``config.rope_scaling["factor"]`` unconditionally when
+      ``rope_scaling is not None``. In production deployments the real
+      DeepSeek-V3 checkpoint ships a full yarn dict that includes
+      ``factor``, but a default-constructed ``DeepseekV3Config`` in
+      transformers 5.x sets ``rope_scaling = {"rope_type": "default"}``
+      without the yarn keys, so the lookup raises ``KeyError: 'factor'``
+      before any sharding work runs. We override with a minimal dict
+      that (a) provides ``factor`` to clear the unconditional lookup
+      and (b) keeps ``rope_type = "default"`` so ``_init_rope`` routes
+      through the vanilla rotary branch (correct stimulus for a sharding
+      equivalence test; yarn extrapolation behaviour is out of scope).
+    """
+    if _is_writable_attr(config, "kv_lora_rank"):
+        config.rope_scaling = {"rope_type": "default", "factor": 1.0}
+
+
 # -----------------------------------------------------------------------------
 # Spec derivation from a modeling-file path
 # -----------------------------------------------------------------------------
@@ -402,13 +438,19 @@ def build_ir_model(spec: IRModelSpec, device: torch.device, dtype: torch.dtype) 
     Does not touch the filesystem and does not require LLM_MODELS_ROOT. The
     universal :data:`_TINY_KWARGS_UNIVERSAL` is applied with ``setattr`` on a
     default-constructed config; this works for fields not accepted as
-    constructor kwargs in the installed transformers version. Layer-count
-    dependent fields are then patched via
+    constructor kwargs in the installed transformers version. Family-specific
+    field defaults that the universal kwargs cannot safely cover are patched
+    via :func:`_apply_per_family_quirks`, which runs **before** the universal
+    kwargs are applied so that its feature-presence dispatch reads the
+    pristine config (the universal kwargs ``setattr`` many family-specific
+    keys onto every config, which would otherwise cause spurious matches).
+    Layer-count dependent fields are then patched via
     :func:`_apply_layer_count_dependent_quirks`.
     """
     cfg_module = importlib.import_module(spec.config_module)
     cfg_cls = getattr(cfg_module, spec.config_cls)
     config = cfg_cls()
+    _apply_per_family_quirks(config)
     for k, v in _TINY_KWARGS_UNIVERSAL.items():
         setattr(config, k, v)
     _apply_layer_count_dependent_quirks(config, _TINY_KWARGS_UNIVERSAL["num_hidden_layers"])
