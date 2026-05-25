@@ -1464,7 +1464,11 @@ def test_cute_dsl_topk_decode_single_pass_multi_cta_cluster(
 @pytest.mark.parametrize("batch_size", [1, 64, 128])
 @pytest.mark.parametrize("next_n", [1, 2, 3])
 @pytest.mark.parametrize("index_topk", [512, 1024, 2048])
-@pytest.mark.parametrize("num_tokens", [8192, 16384])
+# num_tokens=4096 added to cover the new uniform kSeqSmall=4096 boundary
+# across all K (indexerTopK.cu kSeqSmallDefaultForK). num_tokens=4096 sits
+# right at the GVR routing threshold for every K ∈ {512, 1024, 2048} so the
+# assertion validates the just-inside-GVR path correctness.
+@pytest.mark.parametrize("num_tokens", [4096, 8192, 16384])
 @pytest.mark.parametrize(
     "dtype",
     [torch.float32, torch.bfloat16, torch.float16],
@@ -1601,11 +1605,19 @@ def _run_indexer_topk_decode_v4_gvr_check(
     next_n_offset = torch.arange(num_gen_tokens, device="cuda") % next_n
 
     # Uncompressed seq_lens are what the kernel receives in `seq_lens`.
-    # Clamp so that compressed_actual_kv_len ≥ kSeqSmall (= 12288) for every
-    # row; the kernel will divide actual_kv_len by compress_ratio internally,
-    # so a floor of (kSeqSmall + 1) * compress_ratio + next_n on the
-    # uncompressed seq_len guarantees compressed N stays in the GVR window.
-    min_uncompressed = (12288 + 1) * compress_ratio + next_n
+    # Clamp so that compressed_actual_kv_len > kSeqSmall for every row; the
+    # kernel will divide actual_kv_len by compress_ratio internally, so a
+    # floor of (kSeqSmall + 1) * compress_ratio + next_n on the uncompressed
+    # seq_len guarantees compressed N stays in the GVR window.
+    # kSeqSmall is uniform 4096 across K (matches indexerTopK.cu
+    # kSeqSmallDefaultForK).
+    ksmall = 4096
+    min_uncompressed = (ksmall + 1) * compress_ratio + next_n
+    if min_uncompressed >= num_tokens:
+        pytest.skip(
+            f"num_tokens={num_tokens} too small to clamp into the GVR window for "
+            f"K={index_topk} (needs uncompressed > {min_uncompressed})"
+        )
     seq_lens = generate_seq_lens(batch_size, min_uncompressed, num_tokens)
     seq_lens = seq_lens.clamp(min=min_uncompressed)
 
@@ -1690,7 +1702,10 @@ def _run_indexer_topk_decode_v4_gvr_check(
 @pytest.mark.parametrize("batch_size", [1, 64])
 @pytest.mark.parametrize("next_n", [1, 2, 3])
 @pytest.mark.parametrize("index_topk", [512, 1024, 2048])
-@pytest.mark.parametrize("num_tokens", [65536, 131072])
+# num_tokens=32768 added so that all K ∈ {512, 1024, 2048} hit the uniform
+# kSeqSmall=4096 boundary at compress_ratio=4 (helper's clamp floor =
+# (4096+1)*4+next_n ≈ 16389 < 32768, so no skip is triggered for any K).
+@pytest.mark.parametrize("num_tokens", [32768, 65536, 131072])
 @pytest.mark.parametrize(
     "dtype",
     [torch.float32, torch.bfloat16, torch.float16],
