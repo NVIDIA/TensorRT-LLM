@@ -255,7 +255,6 @@ full:B200/perf/test_perf.py::test_perf[t5_3b] SKIP (bert_attention_plugin does n
 full:B200/perf/test_perf.py::test_perf[t5_base] SKIP (bert_attention_plugin does not support SM >= 100)
 full:B200/perf/test_perf.py::test_perf[t5_large] SKIP (bert_attention_plugin does not support SM >= 100)
 full:B300/unittest/_torch/modules/moe/test_moe_backend.py::test_moe_backend -k "TRTLLM" SKIP (https://nvbugs/6165866)
-full:DGX_B200/accuracy/test_llm_api_pytorch.py::TestQwen3_5_35B_A3B::test_bf16_mtp[mtp_on] SKIP (https://nvbugs/6205312)
 full:DGX_H100/kv_cache/test_prefix_aware_scheduling.py::TestServePrefixAwareScheduling::test_multi_round_qa_shared_prefix[swa-chunked] SKIP (https://nvbugs/6136737)
 full:GB200-OCI/accuracy/test_llm_api_autodeploy.py::TestNemotronNanoV3::test_accuracy[bf16-4-trtllm] SKIP (https://nvbugs/6185150)
 full:GB200/perf/test_perf_sanity.py::test_e2e[aggr_upload-ctx_only-gb200_qwen3-235b-fp4_8k1k_con1024_ctx1_tp1_gen1_dep8_eplb0_mtp0_ccb-NIXL] SKIP (https://nvbugs/6194788)
