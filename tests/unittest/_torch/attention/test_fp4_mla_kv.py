@@ -16,6 +16,7 @@ import torch
 
 import tensorrt_llm
 from tensorrt_llm._torch.attention_backend.fp4_mla_kv import (
+    FLASHINFER_FP4_MLA_ATTENTION_BACKEND_ENV,
     FLASHINFER_FP4_MLA_ATTENTION_ENV,
     FP4_BLOCK_SIZE,
     FP4_MLA_KV_GLOBAL_SCALE,
@@ -32,6 +33,7 @@ from tensorrt_llm._torch.attention_backend.fp4_mla_kv import (
     scatter_fp4_mla_kv_cache,
     update_hp_kv_for_fp4_mla,
 )
+from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm.bindings.executor import KvCacheConfig
 from tensorrt_llm.mapping import Mapping
@@ -392,13 +394,15 @@ def _fp4_mla_attention_decode_reference(
         global_scale=_TEST_GLOBAL_SCALE,
     )
 
-    p_dequant = _dequant_fp4_swizzled(
-        metadata._fp4_mla_attention_p_buf,
-        metadata._fp4_mla_attention_p_sf_buf,
-        logical_dim=metadata.page_size,
-        sf_per_token=metadata.page_size // 16,
-        global_scale=FP4_MLA_P_GLOBAL_SCALE,
-    )
+    p_dequant = None
+    if hasattr(metadata, "_fp4_mla_attention_p_buf"):
+        p_dequant = _dequant_fp4_swizzled(
+            metadata._fp4_mla_attention_p_buf,
+            metadata._fp4_mla_attention_p_sf_buf,
+            logical_dim=metadata.page_size,
+            sf_per_token=metadata.page_size // 16,
+            global_scale=FP4_MLA_P_GLOBAL_SCALE,
+        )
 
     indptr = metadata.paged_kv_indptr_decode.cpu().tolist()
     kv_lens = metadata.kv_lens_cuda_runtime.cpu().tolist()
@@ -413,16 +417,19 @@ def _fp4_mla_attention_decode_reference(
         q = q_dequant[q_start : q_start + num_heads]
         probs = torch.softmax(torch.matmul(q, logical_k.transpose(0, 1)) * sm_scale, dim=-1)
 
-        p_pages = []
-        for page_rel in range(indptr[seq_idx + 1] - indptr[seq_idx]):
-            page_start = page_rel * metadata.page_size
-            valid_tokens = max(min(kv_len - page_start, metadata.page_size), 0)
-            if valid_tokens == 0:
-                continue
-            compact_page = indptr[seq_idx] + page_rel
-            p_start = compact_page * num_heads
-            p_pages.append(p_dequant[p_start : p_start + num_heads, :valid_tokens])
-        p = torch.cat(p_pages, dim=-1)
+        if p_dequant is None:
+            p = probs
+        else:
+            p_pages = []
+            for page_rel in range(indptr[seq_idx + 1] - indptr[seq_idx]):
+                page_start = page_rel * metadata.page_size
+                valid_tokens = max(min(kv_len - page_start, metadata.page_size), 0)
+                if valid_tokens == 0:
+                    continue
+                compact_page = indptr[seq_idx] + page_rel
+                p_start = compact_page * num_heads
+                p_pages.append(p_dequant[p_start : p_start + num_heads, :valid_tokens])
+            p = torch.cat(p_pages, dim=-1)
 
         exact_probs.append(probs)
         quantized_probs.append(p)
@@ -443,6 +450,127 @@ def _cuda_event_benchmark(fn, *, warmup_iters=10, iters=100):
     end.record()
     torch.cuda.synchronize()
     return start.elapsed_time(end) / iters
+
+
+def _assert_fp4_mla_attention_decode_accuracy(
+    monkeypatch,
+    *,
+    backend: str,
+    num_heads: int,
+    seq_lens: list[int],
+    seed: int,
+    check_probs: bool,
+) -> None:
+    monkeypatch.setenv(FLASHINFER_FP4_MLA_ATTENTION_ENV, "1")
+    monkeypatch.setenv(FLASHINFER_FP4_MLA_ATTENTION_BACKEND_ENV, backend)
+
+    (
+        kv_cache_manager,
+        metadata,
+        q_nope,
+        q_pe,
+        kv_lora_rank,
+        qk_rope_head_dim,
+    ) = _build_fp4_mla_attention_decode_case(
+        seq_lens=seq_lens,
+        num_heads=num_heads,
+        seed=seed,
+    )
+    try:
+        output = torch.empty_like(q_nope)
+        sm_scale = 0.1
+        run_fp4_mla_attention_decode(
+            metadata,
+            layer_idx=0,
+            local_layer=0,
+            q_nope=q_nope,
+            q_pe=q_pe,
+            output=output,
+            sm_scale=sm_scale,
+            kv_lora_rank=kv_lora_rank,
+            qk_rope_head_dim=qk_rope_head_dim,
+        )
+        torch.cuda.synchronize()
+
+        ref_output, exact_probs, quantized_probs = _fp4_mla_attention_decode_reference(
+            metadata,
+            q_nope,
+            q_pe,
+            sm_scale=sm_scale,
+            kv_lora_rank=kv_lora_rank,
+            qk_rope_head_dim=qk_rope_head_dim,
+        )
+        if check_probs:
+            for seq_idx, (exact_prob, quantized_prob) in enumerate(
+                zip(exact_probs, quantized_probs)
+            ):
+                torch.testing.assert_close(
+                    quantized_prob,
+                    exact_prob,
+                    atol=8e-2,
+                    rtol=8e-2,
+                    msg=f"FP4 MLA attention probabilities diverged for sequence {seq_idx}",
+                )
+        torch.testing.assert_close(
+            output.float(),
+            ref_output,
+            atol=1e-1,
+            rtol=1e-1,
+            msg=f"{backend} FP4 MLA attention decode output diverged from reference",
+        )
+    finally:
+        kv_cache_manager.shutdown()
+
+
+def _ceil_div(lhs: int, rhs: int) -> int:
+    return (lhs + rhs - 1) // rhs
+
+
+def _estimate_fp4_mla_attention_decode_mbu_bytes(
+    *,
+    batch_size: int,
+    seq_len: int,
+    num_heads: int,
+    kv_lora_rank: int,
+    qk_rope_head_dim: int,
+    page_size: int,
+) -> int:
+    """Estimate logical global-memory traffic for the FP4 MLA decode benchmark."""
+    fp4_block_size = 16
+    head_block_size = 128
+    bf16_bytes = 2
+    fp32_bytes = 4
+
+    q_input_dim = kv_lora_rank + qk_rope_head_dim
+    qk_dim = q_input_dim + FP4_MLA_Q_RESIDUAL_DIM
+    pages_per_seq = _ceil_div(seq_len, page_size)
+    padded_seq_len = pages_per_seq * page_size
+    head_blocks = _ceil_div(num_heads, head_block_size)
+    q_rows = batch_size * num_heads
+
+    qk_fp4_bytes_per_token = qk_dim // 2 + _ceil_div(qk_dim, fp4_block_size)
+    v_fp4_bytes_per_token = kv_lora_rank // 2 + _ceil_div(kv_lora_rank, fp4_block_size)
+    p_bytes_per_seq = padded_seq_len // 2 + _ceil_div(padded_seq_len, fp4_block_size)
+
+    q_setup_bytes = q_rows * q_input_dim * bf16_bytes * 3 + q_rows * qk_fp4_bytes_per_token
+    qk_cache_bytes = 2 * batch_size * head_blocks * padded_seq_len * qk_fp4_bytes_per_token
+    qk_q_bytes = 2 * batch_size * num_heads * pages_per_seq * qk_fp4_bytes_per_token
+    stats_bytes = batch_size * num_heads * 2 * fp32_bytes * (1 + pages_per_seq)
+    p_prob_bytes = batch_size * num_heads * padded_seq_len * fp32_bytes * 2
+    p_quant_bytes = 2 * batch_size * num_heads * p_bytes_per_seq
+    pv_cache_bytes = batch_size * head_blocks * padded_seq_len * v_fp4_bytes_per_token
+    output_bytes = q_rows * kv_lora_rank * bf16_bytes
+
+    return (
+        q_setup_bytes
+        + qk_cache_bytes
+        + qk_q_bytes
+        + stats_bytes
+        + p_prob_bytes
+        + p_quant_bytes
+        + pv_cache_bytes
+        + output_bytes
+    )
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
@@ -1160,63 +1288,41 @@ def test_fp4_mla_attention_decode_residual_qk_duplicates_k_tail(monkeypatch):
 @pytest.mark.skipif(_is_pre_blackwell(), reason="requires Blackwell FP4 tensor cores")
 def test_fp4_mla_attention_decode_multi_seq_matches_reference(monkeypatch):
     """Multiple decode sequences and heads must match a QK-softmax-PV reference."""
-    monkeypatch.setenv(FLASHINFER_FP4_MLA_ATTENTION_ENV, "1")
-    num_heads = 5
-    seq_lens = [32, 128]
-
-    (
-        kv_cache_manager,
-        metadata,
-        q_nope,
-        q_pe,
-        kv_lora_rank,
-        qk_rope_head_dim,
-    ) = _build_fp4_mla_attention_decode_case(
-        seq_lens=seq_lens,
-        num_heads=num_heads,
+    _assert_fp4_mla_attention_decode_accuracy(
+        monkeypatch,
+        backend="triton",
+        num_heads=5,
+        seq_lens=[32, 128],
         seed=7,
+        check_probs=True,
     )
-    try:
-        output = torch.empty_like(q_nope)
-        sm_scale = 0.1
-        run_fp4_mla_attention_decode(
-            metadata,
-            layer_idx=0,
-            local_layer=0,
-            q_nope=q_nope,
-            q_pe=q_pe,
-            output=output,
-            sm_scale=sm_scale,
-            kv_lora_rank=kv_lora_rank,
-            qk_rope_head_dim=qk_rope_head_dim,
-        )
-        torch.cuda.synchronize()
 
-        ref_output, exact_probs, quantized_probs = _fp4_mla_attention_decode_reference(
-            metadata,
-            q_nope,
-            q_pe,
-            sm_scale=sm_scale,
-            kv_lora_rank=kv_lora_rank,
-            qk_rope_head_dim=qk_rope_head_dim,
-        )
-        for seq_idx, (exact_prob, quantized_prob) in enumerate(zip(exact_probs, quantized_probs)):
-            torch.testing.assert_close(
-                quantized_prob,
-                exact_prob,
-                atol=8e-2,
-                rtol=8e-2,
-                msg=f"FP4 MLA attention probabilities diverged for sequence {seq_idx}",
-            )
-        torch.testing.assert_close(
-            output.float(),
-            ref_output,
-            atol=1e-1,
-            rtol=1e-1,
-            msg="FP4 MLA attention decode output diverged from the QK-softmax-PV reference",
-        )
-    finally:
-        kv_cache_manager.shutdown()
+
+@pytest.mark.skipif(_is_pre_blackwell(), reason="requires Blackwell FP4 support")
+def test_fp4_mla_attention_decode_cutile_matches_reference(monkeypatch):
+    """CuTile decode backend must preserve the FP4 MLA residual-tail contract."""
+    _assert_fp4_mla_attention_decode_accuracy(
+        monkeypatch,
+        backend="cutile",
+        num_heads=128,
+        seq_lens=[32, 128],
+        seed=7,
+        check_probs=False,
+    )
+
+
+@pytest.mark.skipif(_is_pre_blackwell(), reason="requires Blackwell FP4 support")
+@pytest.mark.skipif(not IS_CUTLASS_DSL_AVAILABLE, reason="requires CuTe DSL")
+def test_fp4_mla_attention_decode_cute_dsl_matches_reference(monkeypatch):
+    """CuTe DSL decode backend must preserve the FP4 MLA decode contract."""
+    _assert_fp4_mla_attention_decode_accuracy(
+        monkeypatch,
+        backend="cute_dsl",
+        num_heads=2,
+        seq_lens=[32],
+        seed=10,
+        check_probs=False,
+    )
 
 
 @pytest.mark.skipif(
@@ -1237,6 +1343,8 @@ def test_fp4_mla_attention_decode_perf_benchmark(
     ``TRTLLM_RUN_FP4_MLA_ATTENTION_BENCHMARK=1 pytest -s -k fp4_mla_attention_decode_perf``.
     """
     monkeypatch.setenv(FLASHINFER_FP4_MLA_ATTENTION_ENV, "1")
+    backend = os.environ.get(FLASHINFER_FP4_MLA_ATTENTION_BACKEND_ENV, "triton")
+    monkeypatch.setenv(FLASHINFER_FP4_MLA_ATTENTION_BACKEND_ENV, backend)
     num_heads = 128
     (
         kv_cache_manager,
@@ -1274,11 +1382,21 @@ def test_fp4_mla_attention_decode_perf_benchmark(
         pv_dim = kv_lora_rank
         matmul_flops = 2 * batch_size * num_heads * seq_len * (qk_dim + pv_dim)
         matmul_tflops = matmul_flops / avg_ms / 1e9
+        mbu_bytes = _estimate_fp4_mla_attention_decode_mbu_bytes(
+            batch_size=batch_size,
+            seq_len=seq_len,
+            num_heads=num_heads,
+            kv_lora_rank=kv_lora_rank,
+            qk_rope_head_dim=qk_rope_head_dim,
+            page_size=metadata.page_size,
+        )
+        mbu_tbps = mbu_bytes / avg_ms / 1e9
         print(
             "\nrun_fp4_mla_attention_decode "
-            f"batch={batch_size} seq_len={seq_len} heads={num_heads}: "
+            f"backend={backend} batch={batch_size} seq_len={seq_len} heads={num_heads}: "
             f"{avg_ms:.4f} ms, {tokens * num_heads / avg_ms / 1e3:.2f} M token-head/s, "
-            f"{matmul_tflops:.2f} estimated matmul TFLOP/s"
+            f"{matmul_tflops:.2f} estimated matmul TFLOP/s, "
+            f"estimated MBU={mbu_tbps:.2f} TB/s"
         )
         assert torch.isfinite(output.float()).all()
     finally:
