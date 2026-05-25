@@ -51,6 +51,9 @@ from functools import partial
 from pathlib import Path
 from typing import Optional
 
+import pytest
+import torch
+
 # Make sure the helpers directory is importable both when running under
 # pytest (which adds it via the ``pythonpath`` directive in
 # ``tests/unittest/pytest.ini``) and when running inside a spawn() worker
@@ -59,43 +62,6 @@ _HELPERS_DIR = str(Path(__file__).resolve().parents[3] / "_utils_test")
 if _HELPERS_DIR not in sys.path:
     sys.path.insert(0, _HELPERS_DIR)
 
-
-def _scrub_unbuilt_tensorrt_llm_from_sys_path() -> None:
-    """Drop sys.path entries that contain an *uncompiled* tensorrt_llm tree.
-
-    The pytest setup at ``tests/unittest/conftest.py`` and
-    ``tests/unittest/utils/cpp_paths.py`` adds the repo root to sys.path. When
-    the test is invoked from a git worktree that is *separate* from the build
-    root, that worktree's ``tensorrt_llm/`` is a source-only checkout with no
-    compiled C++ extensions, and spawn workers pick it up before the editable
-    install finder, breaking the runtime imports. This scrub is a no-op in
-    CI / single-tree setups (where every sys.path entry containing
-    ``tensorrt_llm`` also has the .so), so it's safe to always apply.
-
-    Runs at module-import time so it takes effect *before* a spawn worker
-    unpickles this module's symbols and triggers ``import tensorrt_llm``.
-    """
-    so_relpath = os.path.join("tensorrt_llm", "runtime", "kv_cache_manager_v2", "rawref")
-    for entry in list(sys.path):
-        if not entry:
-            continue
-        try:
-            real = os.path.realpath(entry)
-        except OSError:
-            continue
-        init_py = os.path.join(real, "tensorrt_llm", "__init__.py")
-        if not os.path.isfile(init_py):
-            continue
-        rawref_dir = os.path.join(real, so_relpath)
-        if os.path.isdir(rawref_dir) and any(f.endswith(".so") for f in os.listdir(rawref_dir)):
-            continue
-        sys.path.remove(entry)
-
-
-_scrub_unbuilt_tensorrt_llm_from_sys_path()
-
-import pytest  # noqa: E402  -- after sys.path scrub to win over uncompiled tensorrt_llm
-import torch  # noqa: E402
 from _sharding_ir_helpers import (  # noqa: E402
     build_ir_model,
     build_random_prefill_inputs,
