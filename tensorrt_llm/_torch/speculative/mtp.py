@@ -207,7 +207,7 @@ class MTPSpecMetadata(SpecMetadata):
                 mtp_slot_ids.append(slot_id)
 
             # MTP Vanilla: Update mtp hidden states and past tokens
-            if self.spec_dec_mode.is_mtp_one_model():
+            if self.spec_dec_mode.is_mtp_vanilla():
                 mtp_hidden_states_ptrs = []
                 mtp_past_tokens_ptrs = []
                 for slot_id in mtp_slot_ids:

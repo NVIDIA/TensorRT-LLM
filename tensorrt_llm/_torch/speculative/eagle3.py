@@ -580,11 +580,11 @@ class Eagle3OneModelWorker(SpecWorkerBase):
 
     def _prepare_attn_metadata_for_spec_dec(self, attn_metadata):
         attn_metadata.prepare_for_spec_dec("_seq_lens", "_seq_lens_cuda")
-        # NOTE(TRTLLM-11508): the previous kv_lens_cuda save/restore was removed
-        # during the Eagle3/MTP-eagle merge. The drafting loop now updates
-        # kv_lens_cuda incrementally and calls attn_metadata.update_for_spec_dec()
-        # to keep the runtime view consistent. Verify under Eagle3 regressions
-        # if any kv-lens drift is observed.
+        # NOTE: the previous kv_lens_cuda save/restore was removed during the
+        # Eagle3/MTP-eagle merge. The drafting loop now updates kv_lens_cuda
+        # incrementally and calls attn_metadata.update_for_spec_dec() to keep
+        # the runtime view consistent. Verify under Eagle3 regressions if any
+        # kv-lens drift is observed.
         batch_size = attn_metadata.num_seqs
 
         # Save spec-dec params that the drafting loop will overwrite.

@@ -1439,8 +1439,7 @@ class MTPForCausalLM(nn.Module):
                     f"Model type {model_type} not supported for MTP")
 
         spec_dec_mode = model_config.spec_config.spec_dec_mode
-        assert (spec_dec_mode.is_mtp_one_model()
-                or spec_dec_mode.is_mtp_eagle_one_model())
+        assert spec_dec_mode.is_mtp_one_model()
         checkpoint_mtp_num_layers = model_config.pretrained_config.num_nextn_predict_layers
         if spec_dec_mode.is_mtp_eagle_one_model():
             mtp_num_layers = 1
@@ -1626,8 +1625,7 @@ def get_draft_model(model_config, draft_config, lm_head, model):
                 f"Unsupported eagle3 model architecture: {spec_dec_mode.eagle3_model_arch}"
             )
 
-    elif (spec_dec_mode.is_mtp_one_model()
-          or spec_dec_mode.is_mtp_eagle_one_model()):
+    elif spec_dec_mode.is_mtp_one_model():
         return MTPForCausalLM(model_config,
                               model_config.pretrained_config.num_hidden_layers,
                               lm_head, model)

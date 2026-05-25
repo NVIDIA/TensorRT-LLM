@@ -60,7 +60,7 @@ def get_spec_metadata(spec_config,
             vocab_size=vocab_size,
             spec_resource_manager=spec_resource_manager,
         )
-    if spec_config.spec_dec_mode.is_mtp_one_model():
+    if spec_config.spec_dec_mode.is_mtp_vanilla():
         return MTPSpecMetadata(
             max_draft_len=spec_config.max_draft_len,
             max_total_draft_tokens=spec_config.tokens_per_gen_step - 1,
@@ -216,7 +216,7 @@ def get_spec_resource_manager(model_engine, draft_model_engine=None):
             )
         else:
             return None
-    if spec_dec_mode.is_mtp_one_model():
+    if spec_dec_mode.is_mtp_vanilla():
         sa_manager = None
         sa_cfg = getattr(spec_config, 'sa_config', None)
         if sa_cfg is not None:
@@ -288,7 +288,7 @@ def get_spec_decoder(
     if spec_config.spec_dec_mode.is_mtp_eagle_one_model():
         # MTP Eagle one-model now uses the same sampler as Eagle3 one-model.
         return Eagle3OneModelSampler(sampler_args, spec_config=spec_config)
-    if spec_config.spec_dec_mode.is_mtp_one_model():
+    if spec_config.spec_dec_mode.is_mtp_vanilla():
         return MTPSampler(sampler_args, nextn=spec_config.max_draft_len)
     if spec_config.spec_dec_mode.is_eagle3(
     ) or spec_config.spec_dec_mode.is_mtp_eagle():
@@ -341,7 +341,7 @@ def get_spec_drafter(model_engine,
 def get_num_spec_layers(spec_config):
     if spec_config.spec_dec_mode.is_mtp_eagle_one_model():
         return 1
-    if spec_config.spec_dec_mode.is_mtp_one_model():
+    if spec_config.spec_dec_mode.is_mtp_vanilla():
         return spec_config.num_nextn_predict_layers
     if spec_config.spec_dec_mode.is_eagle3_one_model():
         num_eagle_layers = spec_config.num_eagle_layers
