@@ -53,7 +53,6 @@ MAX_SEQ_LEN = 512
 MAX_BATCH_SIZE = 16
 VOCAB_SIZE = 129280
 NUM_KV_HEADS = 1
-INDEXER_QUANT_BLOCK_SIZE = 128
 
 
 # DeepSeek-V4 specific ratios (mirrors module constants)
@@ -407,32 +406,43 @@ def _expected_valid_blocks(
 
 def _split_blockwise_buffer(
     buffer: torch.Tensor,
+    indexer_k_dtype: str,
     index_head_dim: int = INDEX_HEAD_DIM,
-    quant_block_size: int = INDEXER_QUANT_BLOCK_SIZE,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Split a blockwise FP8 quantized buffer into value and scale buffers.
+    """Split an indexer K cache buffer into value and scale buffers.
 
     Args:
         buffer: shape [num_blocks, tokens_per_block, bytes_per_token]
+        indexer_k_dtype: "fp8" or "fp4".
 
     Returns:
-        (values_buffer, scales_buffer) where values are uint8 and scales are float32
+        (values_buffer, scales_buffer) with raw uint8 values and dtype-specific scales.
     """
     num_blocks, tokens_per_block, bytes_per_token = buffer.shape
     bytes_per_block = bytes_per_token * tokens_per_block
 
+    if indexer_k_dtype == "fp8":
+        value_dim = index_head_dim
+        scale_dim = index_head_dim // 128
+        scale_dtype = torch.float32
+    elif indexer_k_dtype == "fp4":
+        value_dim = index_head_dim // 2
+        scale_dim = index_head_dim // 32
+        scale_dtype = torch.uint8
+    else:
+        raise ValueError(f"Unsupported indexer_k_dtype {indexer_k_dtype!r}")
+    scale_bytes = scale_dim * scale_dtype.itemsize
+
     # Value buffer
-    value_shape = (num_blocks, tokens_per_block, index_head_dim)
-    value_stride = (bytes_per_block, index_head_dim, 1)
+    value_shape = (num_blocks, tokens_per_block, value_dim)
+    value_stride = (bytes_per_block, value_dim, 1)
     value_buffer = buffer.as_strided(value_shape, value_stride, 0).view(torch.uint8)
 
     # Scale buffer
-    scale_dim = index_head_dim // quant_block_size
-    scale_bytes = scale_dim * 4  # float32 = 4 bytes
     scale_shape = (num_blocks, tokens_per_block, scale_bytes)
     scale_stride = (bytes_per_block, scale_bytes, 1)
-    scale_offset = index_head_dim * tokens_per_block
-    scale_buffer = buffer.as_strided(scale_shape, scale_stride, scale_offset).view(torch.float32)
+    scale_offset = value_dim * tokens_per_block
+    scale_buffer = buffer.as_strided(scale_shape, scale_stride, scale_offset).view(scale_dtype)
 
     return value_buffer, scale_buffer
 
@@ -458,7 +468,7 @@ def _read_cache_data(
         return torch.tensor([]), None
 
     if attn_type == DeepseekV4AttentionType.INDEXER_COMPRESS:
-        values_buf, scales_buf = _split_blockwise_buffer(buffer)
+        values_buf, scales_buf = _split_blockwise_buffer(buffer, mgr._indexer_k_dtype)
         return values_buf[indices], scales_buf[indices]
 
     return buffer[indices], None

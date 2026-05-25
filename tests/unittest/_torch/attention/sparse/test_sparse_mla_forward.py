@@ -2198,12 +2198,13 @@ def test_forward_sparse_mla_unified(batch_name, kv_cache_dtype: str,
                 )
 
         if sparse_attn_algo == "deepseek_v4":
+            min_topk_overlap = 0.90 if sparse_config.indexer_k_dtype == "fp4" else 0.95
             topk_mismatch = get_deepseek_v4_topk_mismatch(
                 topk_indices_local, reference_topk_indices_local)
             topk_overlap_mismatch = get_deepseek_v4_topk_overlap_mismatch(
                 topk_indices_local,
                 reference_topk_indices_local,
-                min_overlap=0.95,
+                min_overlap=min_topk_overlap,
             )
             if topk_overlap_mismatch is not None:
                 if topk_mismatch is not None:
@@ -2213,7 +2214,7 @@ def test_forward_sparse_mla_unified(batch_name, kv_cache_dtype: str,
                 print("  ✓ Indexer top-k matches independent reference")
             else:
                 print("  ✓ Indexer top-k overlap with independent "
-                      "reference is at least 0.95")
+                      f"reference is at least {min_topk_overlap}")
                 print(f"  ! {topk_mismatch}")
 
         if (sparse_attn_algo == "deepseek_v4"
