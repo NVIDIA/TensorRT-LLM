@@ -44,7 +44,9 @@ FP4_MLA_KV_GLOBAL_SCALE: float = 448.0 * 6.0 / 448.0 * 6.0
 FP4_MLA_P_GLOBAL_SCALE: float = 448.0 * 6.0
 FP4_MLA_Q_RESIDUAL_DIM: int = 64
 FLASHINFER_FP4_MLA_ATTENTION_ENV = "TRTLLM_FLASHINFER_FP4_MLA_ATTENTION"
+FLASHINFER_FP4_MLA_ATTENTION_BACKEND_ENV = "TRTLLM_FLASHINFER_FP4_MLA_ATTENTION_BACKEND"
 FLASHINFER_FP4_MLA_DEBUG_ENV = "TRTLLM_FLASHINFER_FP4_MLA_DEBUG"
+_FP4_MLA_CUTE_DSL_BACKEND = "cute_dsl"
 _HPUpdatePhase = Literal["all", "context", "generation"]
 
 
@@ -63,6 +65,10 @@ def _env_enabled(name: str) -> bool:
 def is_flashinfer_fp4_mla_attention_enabled() -> bool:
     """Return whether FlashInfer MLA should allocate no-dequant FP4 attention buffers."""
     return _env_enabled(FLASHINFER_FP4_MLA_ATTENTION_ENV)
+
+
+def _fp4_mla_attention_backend() -> str:
+    return os.getenv(FLASHINFER_FP4_MLA_ATTENTION_BACKEND_ENV, "triton").lower()
 
 
 def _fp4_mla_debug_enabled() -> bool:
@@ -833,6 +839,46 @@ def _max_generation_pages(metadata: Any) -> int:
     return metadata.num_generation_blocks
 
 
+def _host_int_list(value: Any, start: int, end: int) -> Optional[list[int]]:
+    if value is None:
+        return None
+    if isinstance(value, torch.Tensor):
+        if value.is_cuda:
+            return None
+        return [int(item) for item in value[start:end].tolist()]
+    try:
+        return [int(item) for item in value[start:end]]
+    except (TypeError, ValueError):
+        return None
+
+
+def _infer_cutile_assume_full_pages(metadata: Any, max_pages: int, page_size: int) -> bool:
+    if getattr(metadata, "is_cuda_graph", False):
+        return False
+
+    start = metadata.num_contexts
+    end = metadata.num_seqs
+    kv_cache_params = getattr(metadata, "kv_cache_params", None)
+    cached_token_lens = _host_int_list(
+        getattr(kv_cache_params, "num_cached_tokens_per_seq", None),
+        start,
+        end,
+    )
+    seq_lens_kv = _host_int_list(getattr(metadata, "seq_lens_kv", None), start, end)
+    if cached_token_lens is not None and seq_lens_kv is not None:
+        if len(cached_token_lens) != len(seq_lens_kv):
+            return False
+        kv_lens = [
+            cached_len + seq_len for cached_len, seq_len in zip(cached_token_lens, seq_lens_kv)
+        ]
+    elif kv_cache_params is None:
+        kv_lens = _host_int_list(getattr(metadata, "prompt_lens_cpu_runtime", None), start, end)
+    else:
+        return False
+
+    return bool(kv_lens) and min(kv_lens) == max(kv_lens) == max_pages * page_size
+
+
 def run_fp4_mla_attention_decode(
     metadata: Any,
     layer_idx: int,
@@ -927,6 +973,112 @@ def run_fp4_mla_attention_decode(
     sf_cache = sf_cache.view(torch.float8_e4m3fn)
 
     num_gen_blocks = metadata.num_generation_blocks
+    v_sf = get_fp4_mla_v_scale_pool_view(metadata, v_head_dim=kv_lora_rank)[local_layer].view(
+        torch.float8_e4m3fn
+    )
+
+    src_page_ids = metadata.paged_kv_indices[
+        metadata.num_context_blocks : metadata.num_context_blocks + num_gen_blocks
+    ]
+    kv_lens = metadata.kv_lens_cuda_runtime[metadata.num_contexts : metadata.num_seqs]
+    max_pages = _max_generation_pages(metadata)
+    if max_pages == 0:
+        return
+
+    backend = _fp4_mla_attention_backend()
+    if backend == "cutile":
+        from .fp4_mla_cutile import fp4_mla_paged_attention
+
+        total_p_rows = max(src_page_ids.shape[0] * num_heads, 1)
+        p_fp4 = _ensure_workspace_tensor(
+            metadata,
+            "_fp4_mla_attention_p_buf",
+            (total_p_rows, metadata.page_size // 2),
+            dtype=torch.uint8,
+            device=q_nope.device,
+        )
+        p_sf = _ensure_workspace_tensor(
+            metadata,
+            "_fp4_mla_attention_p_sf_buf",
+            (max(_get_fp4_mla_swizzled_scale_size(total_p_rows, metadata.page_size), 1),),
+            dtype=torch.float8_e4m3fn,
+            device=q_nope.device,
+        )
+        stats_shape = (num_gen, num_heads)
+        max_scores = _ensure_workspace_tensor(
+            metadata,
+            "_fp4_mla_attention_max_buf",
+            stats_shape,
+            dtype=torch.float32,
+            device=q_nope.device,
+        )
+        denom = _ensure_workspace_tensor(
+            metadata,
+            "_fp4_mla_attention_denom_buf",
+            stats_shape,
+            dtype=torch.float32,
+            device=q_nope.device,
+        )
+        page_max = None
+        page_sum = None
+        if max_pages >= 8:
+            page_stats_shape = (num_gen, max_pages, num_heads)
+            page_max = _ensure_workspace_tensor(
+                metadata,
+                "_fp4_mla_attention_page_max_buf",
+                page_stats_shape,
+                dtype=torch.float32,
+                device=q_nope.device,
+            )
+            page_sum = _ensure_workspace_tensor(
+                metadata,
+                "_fp4_mla_attention_page_sum_buf",
+                page_stats_shape,
+                dtype=torch.float32,
+                device=q_nope.device,
+            )
+        assume_full_pages = _infer_cutile_assume_full_pages(
+            metadata,
+            max_pages,
+            metadata.page_size,
+        )
+        assume_valid_pages = False
+        _fp4_mla_debug(
+            "attention decode cutile launch: "
+            f"num_gen={num_gen} num_heads={num_heads} local_layer={local_layer} "
+            f"layer_idx={layer_idx} head_dim={head_dim} kv_lora_rank={kv_lora_rank} "
+            f"rope_dim={qk_rope_head_dim} max_pages={max_pages} "
+            f"assume_full_pages={assume_full_pages} "
+            f"assume_valid_pages={assume_valid_pages}"
+        )
+        fp4_mla_paged_attention(
+            q_fp4,
+            q_sf,
+            kv_cache,
+            sf_cache,
+            v_sf,
+            global_scale,
+            src_page_ids,
+            metadata.paged_kv_indptr_decode,
+            kv_lens,
+            output,
+            sm_scale=float(sm_scale),
+            num_heads=num_heads,
+            v_head_dim=kv_lora_rank,
+            page_size=metadata.page_size,
+            q_residual_dim=q_residual_dim,
+            max_pages=max_pages,
+            assume_full_pages=assume_full_pages,
+            assume_valid_pages=assume_valid_pages,
+            p_fp4_workspace=p_fp4,
+            p_sf_workspace=p_sf,
+            max_scores_workspace=max_scores,
+            denom_workspace=denom,
+            page_max_workspace=page_max,
+            page_sum_workspace=page_sum,
+        )
+        _debug_sync("attention_cutile")
+        return
     total_p_rows = num_gen_blocks * num_heads
     p_fp4 = _ensure_workspace_tensor(
         metadata,
@@ -942,13 +1094,6 @@ def run_fp4_mla_attention_decode(
         dtype=torch.float8_e4m3fn,
         device=q_nope.device,
     )
-    p_probs = _ensure_workspace_tensor(
-        metadata,
-        "_fp4_mla_attention_p_prob_buf",
-        (max(num_gen * num_heads, 1), metadata.page_size),
-        dtype=torch.float32,
-        device=q_nope.device,
-    )[: num_gen * num_heads]
     stats_shape = (num_gen, num_heads)
     max_scores = _ensure_workspace_tensor(
         metadata,
@@ -965,17 +1110,64 @@ def run_fp4_mla_attention_decode(
         device=q_nope.device,
     )
 
-    v_sf = get_fp4_mla_v_scale_pool_view(metadata, v_head_dim=kv_lora_rank)[local_layer].view(
-        torch.float8_e4m3fn
-    )
+    if backend == _FP4_MLA_CUTE_DSL_BACKEND:
+        from .fp4_mla_cute import run_fp4_mla_attention_decode_cute
 
-    src_page_ids = metadata.paged_kv_indices[
-        metadata.num_context_blocks : metadata.num_context_blocks + num_gen_blocks
-    ]
-    kv_lens = metadata.kv_lens_cuda_runtime[metadata.num_contexts : metadata.num_seqs]
-    max_pages = _max_generation_pages(metadata)
-    if max_pages == 0:
+        page_stats_shape = (num_gen, max_pages, num_heads)
+        page_max = _ensure_workspace_tensor(
+            metadata,
+            "_fp4_mla_attention_page_max_buf",
+            page_stats_shape,
+            dtype=torch.float32,
+            device=q_nope.device,
+        )
+        page_sum = _ensure_workspace_tensor(
+            metadata,
+            "_fp4_mla_attention_page_sum_buf",
+            page_stats_shape,
+            dtype=torch.float32,
+            device=q_nope.device,
+        )
+        run_fp4_mla_attention_decode_cute(
+            output=output,
+            max_scores=max_scores,
+            denom=denom,
+            page_max=page_max,
+            page_sum=page_sum,
+            p_fp4=p_fp4,
+            p_sf=p_sf,
+            q_fp4=q_fp4,
+            q_sf=q_sf,
+            kv_cache=kv_cache,
+            sf_cache=sf_cache,
+            v_sf=v_sf,
+            global_scale=global_scale,
+            src_page_ids=src_page_ids,
+            paged_kv_indptr_decode=metadata.paged_kv_indptr_decode,
+            kv_lens=kv_lens,
+            sm_scale=float(sm_scale),
+            kv_lora_rank=kv_lora_rank,
+            qk_rope_head_dim=qk_rope_head_dim,
+            q_residual_dim=q_residual_dim,
+            page_size=metadata.page_size,
+            max_pages=max_pages,
+        )
+        _debug_sync("attention_cute_dsl")
         return
+    if backend != "triton":
+        raise ValueError(
+            f"Unsupported FP4 MLA attention backend '{backend}'. "
+            f"Set {FLASHINFER_FP4_MLA_ATTENTION_BACKEND_ENV} to 'triton', "
+            "'cutile', or 'cute_dsl'."
+        )
+
+    p_probs = _ensure_workspace_tensor(
+        metadata,
+        "_fp4_mla_attention_p_prob_buf",
+        (max(num_gen * num_heads, 1), metadata.page_size),
+        dtype=torch.float32,
+        device=q_nope.device,
+    )[: num_gen * num_heads]
 
     block_h = 128
     block_t = metadata.page_size
