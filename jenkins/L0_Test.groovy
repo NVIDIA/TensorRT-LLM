@@ -4414,10 +4414,13 @@ def launchTestJobs(pipeline, testFilter)
                         // and expose UCX shared libraries shipped inside the wheel
                         // (tensorrt_llm/libs/ucx/*.so and libtensorrt_llm_ucx_wrapper.so)
                         // so dlopen can find them at test runtime.
+                        // Use `pip3 show` (metadata only) instead of `import tensorrt_llm`,
+                        // because importing executes tensorrt_llm/__init__.py which prints a
+                        // version banner to stdout and would pollute the captured path.
                         def trtllmLibsDir = sh(
-                            script: "python3 -c 'import os, tensorrt_llm; print(os.path.join(os.path.dirname(tensorrt_llm.__file__), \"libs\"))'",
+                            script: "pip3 show tensorrt_llm | grep \"Location\" | awk -F\":\" '{ gsub(/ /, \"\", \$2); print \$2\"/tensorrt_llm/libs\"}'",
                             returnStdout: true,
-                        ).trim()
+                        ).replaceAll("\\s","")
                         libEnv += ["LD_LIBRARY_PATH+trtllm_ucx=${trtllmLibsDir}/ucx"]
                         libEnv += ["LD_LIBRARY_PATH+trtllm_libs=${trtllmLibsDir}"]
 
