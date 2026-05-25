@@ -693,7 +693,6 @@ def _apply_mcp_tool_text_payload(task: MCPCallTask,
         err, str) else (str(err) if err is not None else "")
 
 
-
 class MCPWorker(Worker):
 
     class ToolCall:

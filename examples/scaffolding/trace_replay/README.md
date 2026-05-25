@@ -36,31 +36,18 @@ examples/scaffolding/trace_replay/
 │   └── django__django-16801/
 │       ├── django__django-16801.trace.json        (compact)
 │       └── django__django-16801.full.trace.json   (full)
-├── analysis/                  -- offline KV-cache hit-rate upper-bound analyzer
-│   ├── compute_cache_hit_trace.py   CLI: optimal upper-bound hit rate per trace
-│   ├── cache_hit.py / aggregation.py / annotate.py / blocks.py /
-│   │   branch_summary.py / streams.py / io.py / __init__.py
-│   └── README.md
-├── pareto/                    -- multi-config Pareto sweep over trtllm-serve
-│   ├── trace_replay_client.py             one ladder point: external server client
-│   ├── trace_replay_pareto_aggregate.py   N step JSONs -> combined v4 record + PNGs
-│   ├── _common.py                         shared helpers
-│   └── README.md
-└── plots/                     -- plot helpers (loaded dynamically by pareto/)
-    ├── plot_trace_replay_token_pareto.py            throughput Pareto PNG
-    ├── plot_trace_replay_agent_pareto.py            agent-concurrency Pareto PNG
-    ├── plot_trace_replay_job_pareto.py              job-throughput PNG
-    ├── plot_trace_replay_session_hit_pareto.py      per-session KV-hit curve
-    ├── plot_trace_replay_session_hit_vs_time.py     KV-hit vs session start time
-    └── plot_trace_replay_per_call_hit_curves.py     per-LLM-call hit trajectory
+└── analysis/                  -- offline KV-cache hit-rate upper-bound analyzer
+    ├── compute_cache_hit_trace.py   CLI: optimal upper-bound hit rate per trace
+    ├── cache_hit.py / aggregation.py / annotate.py / blocks.py /
+    │   branch_summary.py / streams.py / io.py / __init__.py
+    └── README.md
 ```
 
-Four workflows are covered:
+Two workflows are covered:
 
 | Goal | Entry point |
 |---|---|
 | Replay one trace once against one serving config | `run_trace_replay.py` |
-| Sweep throughput/latency Pareto over a `(B, N, C)` ladder | `pareto/trace_replay_client.py` + `pareto/trace_replay_pareto_aggregate.py` |
 | Offline upper bound on KV-cache hit rate (no GPU) | `analysis/compute_cache_hit_trace.py` |
 
 ## The Core Design in One Picture
@@ -177,14 +164,8 @@ You can see this in:
 - `run_trace_replay.py`: one trace, one config, one report — the simplest
   thing that works. Use this to sanity-check a trace, or to compare two
   serving configs on a fixed workload.
-- `pareto/trace_replay_client.py`: one ladder point of a multi-config
-  sweep. Replays the same trace at `N` total sessions with `C` in flight,
-  designed to be called repeatedly by an outer driver as `B`/`N`/`C` step
-  through a ladder. Writes a single step JSON per invocation.
 
-Both share the same core (`ReplayEngine` + `TRTOpenaiWorker`); they differ
-in how they wrap the run (single launch vs `asyncio.Semaphore`-gated
-multi-session burst) and what they aggregate.
+Built on `ReplayEngine` + `TRTOpenaiWorker`.
 
 Flow for `run_trace_replay.py`:
 
@@ -265,37 +246,6 @@ budgets as the envelope for generation.
 Output JSON also includes run schema, timestamps, host/runtime metadata,
 CLI argv, replay endpoint settings, and trace file metadata.
 
-### Multi-config Pareto record (`pareto/`)
-
-`trace_replay_client.py` emits a per-ladder-point **step JSON**
-(`schema = trace_replay_pareto_frontier.step.v4`).
-`trace_replay_pareto_aggregate.py` concatenates `runs[]` from N step JSONs
-into a combined `trace_replay_pareto_frontier.v4` record and delegates to
-`../plots/` to write the Pareto PNGs.
-
-The per-run row carries:
-
-- the three load knobs (`max_batch_size`, `total_sessions`, `concurrency`)
-- whole-burst throughput and TPOT/intvty (`output_tps_aggregate_full_burst`,
-  `full_burst_*_tpot_ms`, `full_burst_*_intvty`)
-- **refill-sustained "steady-state" window**: starts at the C+1 admission
-  (first refill), ends at the first completion after the last admission;
-  only LLM calls fully contained in the window count. Fields:
-  `steady_state_window` (audit dict), `output_tps_aggregate_steady_state`,
-  `steady_state_*_tpot_ms`, `steady_state_*_intvty`,
-  `total_output_tokens_steady_state`. Headline unsuffixed fields
-  (`output_tps_aggregate`, `median_tpot_ms`, ...) point at steady-state
-  when valid (`N > C`); for saturation sweeps (`N <= C`) consult the
-  `*_full_burst` mirrors.
-- per-session admission/end offsets, per-LLM-call timing offsets,
-  `steady_state_included` flag on every detail entry.
-- offline KV-cache hit-rate upper bound (`optimal_cache_hit`) loaded from
-  `<trace_dir>/*.cachehit.json` if present — stamped by the aggregator
-  onto each run row. Engine-measured per-session rates are derived on
-  demand at plot time from `replay_assistant_generations_detail`
-  (`num_reused_blocks` / `num_missed_blocks` per assistant LLM call), so
-  no measured-rate aggregate is cached on the row.
-
 ### KV-cache hit-rate analysis (`analysis/`)
 
 `compute_cache_hit_trace.py` is a pure offline simulator: it assumes an
@@ -314,25 +264,6 @@ synthetic IDs. Output:
 Defaults mirror real TRT-LLM behavior (`tokens_per_block=32`,
 `--decode-kv-reuse`, `--cot-pollutes-cache`). See `analysis/README.md`
 for the full flag/schema reference.
-
-Pair `optimal_cache_hit` (offline UB) with the on-demand engine-measured
-per-session rate at plot time to read how much of the ideal block-reuse
-the runtime actually captures at any `(B, N, C)` point.
-
-### Plots (`plots/`)
-
-Loaded dynamically by `pareto/trace_replay_pareto_aggregate.py` after the
-combined record is written. Each `write_*_png_from_json_file(...)` accepts
-the v4 JSON path and writes a sibling PNG. Available helpers:
-
-| Module | Output | What it shows |
-|---|---|---|
-| `plot_trace_replay_token_pareto` | `<stem>_throughput_pareto.png` | token throughput vs median intvty |
-| `plot_trace_replay_agent_pareto` | `<stem>_agent_pareto.png` | agent concurrency vs intvty |
-| `plot_trace_replay_job_pareto` | `<stem>_job_pareto.png` | agent-sessions/hour vs intvty |
-| `plot_trace_replay_session_hit_pareto` | `<stem>_session_hit_pareto.png` | per-session KV-cache block hit-rate curve |
-| `plot_trace_replay_session_hit_vs_time` | `<stem>_session_hit_vs_time.png` | session KV-hit vs session start offset |
-| `plot_trace_replay_per_call_hit_curves` | `<stem>_per_call_hit_curves.png` | per-LLM-call hit trajectory across sessions |
 
 ## Usage: End-to-End Workflow
 
@@ -393,38 +324,7 @@ Default output filename:
 
 - `<trace_base>_<model>_replay_statistics_<YYYYMMDD_HHMMSS>.json`
 
-### 3) Sweep a `(B, N, C)` Pareto ladder
-
-Start `trtllm-serve` outside the client (the driver script handles
-lifecycle), then run one ladder point:
-
-```bash
-python examples/scaffolding/trace_replay/pareto/trace_replay_client.py \
-  --base_url http://127.0.0.1:8000/v1 \
-  --model /path/to/Qwen3-235B-A22B \
-  --trace_dir .../traces/swebench/django__django-14787 \
-  --total_sessions 32 --concurrency 16 --max_batch_size 16 \
-  --ladder_index 1 --ladder_step 16 \
-  --tensor_parallel_size 4 --moe_expert_parallel_size 4 \
-  --output_json .../step16.json
-```
-
-After running every ladder step, aggregate:
-
-```bash
-python examples/scaffolding/trace_replay/pareto/trace_replay_pareto_aggregate.py \
-  --step_jsons out/step8.json out/step16.json out/step32.json \
-  --trace_dir .../traces/swebench/django__django-14787 \
-  --output_json out/django__django-14787_Qwen3-235B-A22B_tp4_ep4.json
-```
-
-The combined JSON and the Pareto PNGs land in the same directory as
-`--output_json`. The reference Slurm driver that orchestrates server
-lifecycle + the full ladder is `exps/drivers/run_trace_pareto_server.sh`.
-
-See `pareto/README.md` for the full client/aggregator reference.
-
-### 4) Compute KV-cache hit rates
+### 3) Compute KV-cache hit rates
 
 Offline ideal upper bound from a trace (no GPU needed):
 
@@ -442,11 +342,6 @@ python examples/scaffolding/trace_replay/analysis/compute_cache_hit_trace.py \
   path/to/some.trace.json
 ```
 
-Engine-measured per-session hit rates are computed directly from each
-step JSON's `replay_assistant_generations_detail` (`num_reused_blocks` /
-`num_missed_blocks` per call) at plot time — no extra CLI step is
-required.
-
 See `analysis/README.md` for flags and output schema.
 
 ## Practical Boundaries and Gotchas
@@ -461,19 +356,6 @@ See `analysis/README.md` for flags and output schema.
   / `parallel_end`).
 - Full traces can be very large; use compact traces for routine replay
   benchmarking.
-- In Pareto sweeps the steady-state window is only valid when
-  `total_sessions > concurrency`. For saturation sweeps (`N == C`) the
-  unsuffixed headline fields (`output_tps_aggregate`, `median_tpot_ms`,
-  ...) are `None`; use the `*_full_burst` mirrors.
-- The two cache-hit numbers serve different purposes:
-  `optimal_cache_hit` is an offline upper bound; the engine-measured
-  per-session block hit rate (derived on demand at plot time from
-  `num_reused_blocks` / `num_missed_blocks`) is the actual achieved
-  rate. Their gap reflects scheduling / eviction losses, not a bug.
-
----
-
-If you want to scale this into multi-session ladder-style replay, the
-current building blocks (`ReplayEngine` + `compute_replay_run_metrics(...)`
-+ the `pareto/` driver pair) keep metric definitions consistent across
-single-config and ladder-style runs.
+- `optimal_cache_hit` from `analysis/` is an offline upper bound on
+  block-reuse; the engine-measured rate at runtime will be lower due to
+  scheduling and eviction losses, not a bug.

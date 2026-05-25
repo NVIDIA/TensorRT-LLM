@@ -715,7 +715,7 @@ class KVCacheV2Scheduler(RequestScheduler):
         # Skip if already suspended — suspending again is a no-op
         # that frees no pages.
         if self.kv_cache_manager.is_request_active(req.py_request_id):
-            logger.info(
+            logger.debug(
                 "[V2Scheduler] Self-evicting request %s "
                 "(state=%s, prompt_len=%d, generated_tokens=%d) "
                 "to free GPU pages",
@@ -793,7 +793,7 @@ class KVCacheV2Scheduler(RequestScheduler):
                 break
 
             victim = requests_list[victim_idx]
-            logger.info(
+            logger.debug(
                 "[V2Scheduler] Evicting request %s "
                 "(state=%s, prompt_len=%d, generated_tokens=%d) "
                 "to free pages for request %s",

@@ -126,7 +126,8 @@ def compute_cache_hit_upper_bound(
         Uses engine-aligned ``ceil(L / block)`` block accounting. The token
         sequence itself is stored in the radix tree so future requests can
         match at single-token granularity (a partial trailing block hits
-        when its content matches)."""
+        when its content matches).
+        """
         if not token_ids:
             return 0
         before = cached_block_count[0]
@@ -290,9 +291,7 @@ def _score_assistant_event(
     n_total_blocks = engine_aligned_block_count(effective_prompt_tokens, tokens_per_block)
 
     matched_tokens = prefix_cache.match(prompt_token_ids)
-    hit_blocks = engine_aligned_hit_blocks(
-        matched_tokens, n_total_blocks, tokens_per_block
-    )
+    hit_blocks = engine_aligned_hit_blocks(matched_tokens, n_total_blocks, tokens_per_block)
     miss_blocks = n_total_blocks - hit_blocks
 
     hit_tokens = min(matched_tokens, effective_prompt_tokens)
@@ -320,19 +319,15 @@ def _score_assistant_event(
         if cot_pollutes_cache and reasoning_tokens > 0:
             reasoning_token_ids = segments.allocate_tokens(reasoning_tokens)
             if content_tokens > 0:
-                content_token_ids = segments.assemble_prompt(
-                    branch_path, conversation_id
-                )[effective_prompt_tokens:]
+                content_token_ids = segments.assemble_prompt(branch_path, conversation_id)[
+                    effective_prompt_tokens:
+                ]
             else:
                 content_token_ids = []
-            decode_stream = (
-                list(prompt_token_ids) + reasoning_token_ids + content_token_ids
-            )
+            decode_stream = list(prompt_token_ids) + reasoning_token_ids + content_token_ids
             commit_stream(decode_stream)
         elif content_tokens > 0:
-            tail_prompt = segments.assemble_prompt(
-                branch_path, conversation_id
-            )
+            tail_prompt = segments.assemble_prompt(branch_path, conversation_id)
             commit_stream(tail_prompt)
     new_cached_completion_blocks = cached_block_count_cell[0] - cached_before_completion
     new_cached_blocks = new_cached_prompt_blocks + new_cached_completion_blocks
@@ -448,9 +443,7 @@ def _build_record(
         totals.hit_tokens / totals.prompt_tokens if totals.prompt_tokens else 0.0
     )
     block_total = totals.hit_blocks + totals.miss_blocks
-    optimal_overall_cache_block_hit_rate = (
-        totals.hit_blocks / block_total if block_total else 0.0
-    )
+    optimal_overall_cache_block_hit_rate = totals.hit_blocks / block_total if block_total else 0.0
     record: Dict[str, Any] = {
         "schema": SCHEMA,
         "created_at_utc": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
@@ -463,7 +456,11 @@ def _build_record(
             "decode_kv_reuse": decode_kv_reuse,
             "cot_pollutes_cache": cot_pollutes_cache,
             "parallel_policy": "shared",
-            "request_definition": "assistant message events; prompt length = natural concatenation of stored segments (matches replay engine's /v1/completions input_tokens length)",
+            "request_definition": (
+                "assistant message events; prompt length = natural "
+                "concatenation of stored segments (matches replay engine's "
+                "/v1/completions input_tokens length)"
+            ),
             "hit_definition": (
                 "n_total_blocks = ceil(L_effective / block); "
                 "reused_blocks = min(ceil(matched_tokens / block), n_total_blocks). "

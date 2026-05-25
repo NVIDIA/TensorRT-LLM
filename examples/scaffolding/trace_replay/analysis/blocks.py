@@ -61,9 +61,7 @@ class TokenPrefixCache:
                 return
             tail = child.edge_tail
             j = 0
-            while (
-                j < len(tail) and i + 1 + j < n and tail[j] == toks[i + 1 + j]
-            ):
+            while j < len(tail) and i + 1 + j < n and tail[j] == toks[i + 1 + j]:
                 j += 1
             if j == len(tail):
                 node = child
