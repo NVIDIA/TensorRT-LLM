@@ -580,13 +580,18 @@ def _restore_lora_state(
 # ---------------------------------------------------------------------------
 
 
+# Registered without ``hf_ids`` / ``defaults`` on purpose: this class is
+# only reached via ``LTX2Pipeline.resolve_variant()`` swap, never through
+# class-name dispatch from the registry, so its own discovery surface
+# entry would duplicate the canonical ``LTX2Pipeline`` entry above and
+# make ``supported_models()`` / ``pipeline_config()`` ambiguous.
 @register_pipeline("LTX2TwoStagesPipeline")
 class LTX2TwoStagesPipeline(LTX2Pipeline):
-    """Two-stage text-to-video with audio.
+    """Lightricks LTX-Video two-stage text-to-video with audio.
 
     Stage 1: denoise at half spatial resolution with full guidance.
-    Stage 2: learned 2x spatial upsample, refinement denoising
-             (distilled sigma schedule, no guidance, distilled LoRA),
+    Stage 2: learned 2x spatial upsample, refinement denoising with
+             the distilled sigma schedule (no guidance, distilled LoRA),
              then decode.
     """
 
@@ -608,7 +613,7 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
         super().load_standard_components(
             checkpoint_dir,
             device,
-            skip_components,
+            skip_components=skip_components,
             **kwargs,
         )
 

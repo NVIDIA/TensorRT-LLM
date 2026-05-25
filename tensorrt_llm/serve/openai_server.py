@@ -262,7 +262,6 @@ class OpenAIServer(_VideoRoutesMixin):
                 self.disagg_cluster_worker = DisaggClusterWorker(
                     self.server_role, self.host, self.port,
                     self.disagg_cluster_config, self.disagg_cluster_storage)
-                await self.disagg_cluster_worker.register_worker()
 
             # VisualGen has no args
             if not isinstance(self.generator, VisualGen):
@@ -294,7 +293,6 @@ class OpenAIServer(_VideoRoutesMixin):
                     logger.info(
                         "Started background iteration stats collector task")
 
-            # terminate rank0 worker
             yield
 
             # Stop background iteration stats collector
@@ -389,10 +387,17 @@ class OpenAIServer(_VideoRoutesMixin):
         if disable_harmony or self.model_config is None:
             self.use_harmony = False
         else:
-            self.use_harmony = (self.model_config.model_type == "gpt_oss")
+            self.use_harmony = (type(self.model_config).model_type == "gpt_oss")
 
         self.tool_call_id_type = "random"  # default tool call id type is random
         if self.model_config is not None:
+            # NOTE: Use the instance-level ``model_type`` (JSON-derived) here, not
+            # ``type(cfg).model_type``. ``kimi_k2`` / ``deepseek_v32`` are aliases
+            # registered in ``_CONFIG_REGISTRY`` (config_utils.py) that reuse
+            # ``DeepseekV3Config``, whose class-level ``model_type`` is ``"deepseek_v3"``.
+            # Only the JSON ``model_type`` distinguishes these variants. Other call
+            # sites that consult multimodal/chat-template registries keyed on the
+            # canonical class attribute should keep using ``type(cfg).model_type``.
             if self.model_config.model_type == "kimi_k2":
                 self.tool_call_id_type = "kimi_k2"
             elif self.model_config.model_type == "deepseek_v32":
@@ -427,6 +432,14 @@ class OpenAIServer(_VideoRoutesMixin):
             if max_perf_metrics > 0:
                 self.perf_metrics = deque(maxlen=max_perf_metrics)
                 self.perf_metrics_lock = asyncio.Lock()
+
+    def _logit_bias_vocab_size(self) -> int:
+        for config in (self.model_config,
+                       getattr(self.model_config, "text_config", None)):
+            vocab_size = getattr(config, "vocab_size", None)
+            if vocab_size is not None:
+                return int(vocab_size)
+        return int(self.tokenizer.tokenizer.vocab_size)
 
     def _log_config_info_metrics(self) -> None:
         """Extract configuration from generator args and log as Prometheus info gauges."""
@@ -1124,13 +1137,13 @@ class OpenAIServer(_VideoRoutesMixin):
             tool_dicts = None if request.tools is None else [
                 tool.model_dump() for tool in request.tools
             ]
-            # Pass the tokenizer vocabulary size so ``logit_bias`` can be
+            # Pass the model vocabulary size so ``logit_bias`` can be
             # expanded into an embedding bias tensor in the sampler.
             vocab_size = getattr(self.tokenizer.tokenizer,
                                  "vocab_size", None) or getattr(
                                      self.tokenizer, "vocab_size", None)
             sampling_params = request.to_sampling_params(
-                vocab_size=vocab_size,
+                vocab_size=self._logit_bias_vocab_size(),
                 gather_generation_logits=self.generator.args.
                 gather_generation_logits,
                 reasoning_parser=self.generator.args.reasoning_parser,
@@ -1473,10 +1486,10 @@ class OpenAIServer(_VideoRoutesMixin):
 
             promises: List[RequestOutput] = []
             postproc_params_collection: List[Optional[PostprocParams]] = []
-            # Pass the tokenizer vocabulary size so ``logit_bias`` can be
+            # Pass the model vocabulary size so ``logit_bias`` can be
             # expanded into an embedding bias tensor in the sampler.
             sampling_params = request.to_sampling_params(
-                vocab_size=self._vocab_size,
+                vocab_size=self._logit_bias_vocab_size(),
                 gather_generation_logits=self.generator.args.
                 gather_generation_logits,
                 backend=self.generator.args.backend)
@@ -1610,7 +1623,8 @@ class OpenAIServer(_VideoRoutesMixin):
                 request.stop_token_ids = harmony_stop_tokens
 
             sampling_params = request.to_sampling_params(
-                vocab_size=self._vocab_size, reasoning_parser="gpt_oss")
+                vocab_size=self._logit_bias_vocab_size(),
+                reasoning_parser="gpt_oss")
             sampling_params.detokenize = False  # Harmony adapter handles detokenization
             disaggregated_params = to_llm_disaggregated_params(
                 request.disaggregated_params)
@@ -1954,4 +1968,17 @@ class OpenAIServer(_VideoRoutesMixin):
                                 port=port,
                                 log_level="info",
                                 timeout_keep_alive=TIMEOUT_KEEP_ALIVE)
-        await uvicorn.Server(config).serve(sockets=sockets)
+        server = uvicorn.Server(config)
+
+        async def _register_after_serving():
+            while not server.started:
+                await asyncio.sleep(0.1)
+            if self.disagg_cluster_worker:
+                try:
+                    await self.disagg_cluster_worker.register_worker()
+                except Exception as e:
+                    logger.error(f"Worker registration failed: {e}")
+                    server.should_exit = True
+
+        asyncio.create_task(_register_after_serving())
+        await server.serve(sockets=sockets)

@@ -215,6 +215,17 @@ public:
 
     static bool shouldUseNvrtc(FmhaOptions const& options)
     {
+        // Sparse MQA/GQA uses NVRTC path for now because no model really uses it.
+        if (isStaticTokenSparse(options.mSparseType) && !options.mIsMlaGen)
+        {
+            return true;
+        }
+        // Dynamic sparse MLA uses cubin as a compiler issue in NVRTC path.
+        // This constraint can be removed when CUDA version upgrades to 13.2 or later.
+        if (isDynamicTokenSparse(options.mSparseType))
+        {
+            return false;
+        }
         return options.mFmhaKernelType == FmhaKernelType::SwapsMmaAbForGeneration
             && options.mDtypeKv != tg::Dtype::E2m1;
     }
