@@ -549,6 +549,19 @@ void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(nb::module_& m)
             [](tbk::BaseKVCacheManager& self) -> at::Tensor { return tr::Torch::tensor(self.getIndexerKCachePool()); },
             nb::call_guard<nb::gil_scoped_release>())
         .def(
+            "get_mla_v_scale_pool",
+            [](tbk::BaseKVCacheManager& self)
+            {
+                std::optional<at::Tensor> mla_v_scale_pool{std::nullopt};
+                auto tensor = self.getMlaVScalePool();
+                if (tensor)
+                {
+                    mla_v_scale_pool = tr::Torch::tensor(tensor);
+                }
+                return mla_v_scale_pool;
+            },
+            nb::call_guard<nb::gil_scoped_release>())
+        .def(
             "get_unique_primary_pool", [](tbk::BaseKVCacheManager& self) { return self.getUniquePrimaryPool(); },
             nb::call_guard<nb::gil_scoped_release>())
         .def(
@@ -655,7 +668,7 @@ void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(nb::module_& m)
                  tbk::CacheType, std::optional<tensorrt_llm::executor::RetentionPriority>,
                  std::shared_ptr<tbk::KVCacheEventManager>, bool, bool, std::shared_ptr<tbc::KvCacheConnectorManager>,
                  bool, SizeType32, SizeType32, bool, std::optional<tbk::LinearAttentionMetadata>,
-                 std::vector<tbk::PoolConfiguration> const&>(),
+                 std::vector<tbk::PoolConfiguration> const&, bool>(),
             nb::arg("num_kv_heads_per_layer"), nb::arg("size_per_head"), nb::arg("tokens_per_block"),
             nb::arg("blocks_per_window"), nb::arg("max_num_sequences"), nb::arg("max_beam_width"),
             nb::arg("max_attention_window_vec"), nb::arg("dtype"), nb::arg("sink_token_length"), nb::arg("stream"),
@@ -667,7 +680,7 @@ void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(nb::module_& m)
             nb::arg("indexer_k_cache_index_head_dim") = 0, nb::arg("indexer_k_cache_use_fp4") = false,
             nb::arg("linear_attention_metadata").none() = std::nullopt,
             nb::arg("pool_configurations") = std::vector<tbk::PoolConfiguration>{},
-            nb::call_guard<nb::gil_scoped_release>())
+            nb::arg("enable_mla_v_scale_pool") = false, nb::call_guard<nb::gil_scoped_release>())
         .def(
             "scheduling_has_free_blocks",
             [](tbk::KVCacheManager& self, SizeType32 numRequired, SizeType32 windowSize)
