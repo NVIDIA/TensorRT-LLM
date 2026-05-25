@@ -4291,6 +4291,29 @@ class TestQwen3_30B_A3B(LlmapiAccuracyTestHarness):
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
 
+    @skip_pre_hopper
+    @skip_post_blackwell
+    @pytest.mark.parametrize(
+        "tp_size,pp_size,ep_size,attention_dp,cuda_graph,overlap_scheduler",
+        [(2, 1, 1, False, False, True)],
+        ids=["tp2_ep1"])
+    def test_w4a8(self, tp_size, pp_size, ep_size, attention_dp, cuda_graph,
+                  overlap_scheduler):
+        pytorch_config = dict(
+            disable_overlap_scheduler=not overlap_scheduler,
+            cuda_graph_config=CudaGraphConfig() if cuda_graph else None)
+
+        llm = LLM(
+            f"{llm_models_root()}/Qwen3/saved_models_Qwen3-30B-A3B_w4a8_hf",
+            tensor_parallel_size=tp_size,
+            pipeline_parallel_size=pp_size,
+            moe_expert_parallel_size=ep_size,
+            **pytorch_config,
+            enable_attention_dp=attention_dp)
+        with llm:
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm)
+
     @pytest.mark.parametrize("moe_backend", ["CUTLASS", "TRTLLM"])
     @pytest.mark.parametrize("tp_size,pp_size,ep_size", [
         (1, 1, 1),
