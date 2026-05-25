@@ -359,6 +359,32 @@ class AutoTunerStatistics:
         return stats_str
 
 
+@contextlib.contextmanager
+def _exclusive_cache_lock(lock_path: Path):
+    """Cross-node-correct exclusive lock used by save_cache/load_cache.
+
+    POSIX byte-range lock (`fcntl.lockf`) held on a SEPARATE lockfile
+    (not the data file), which avoids the truncate / rename complications
+    of locking the file you're also rewriting. The lockfile is persistent;
+    the kernel releases the lock when the holding fd is closed — including
+    on process death, so there is no stale-lock cleanup path to maintain.
+
+    Both readers and writers use LOCK_EX: read/write frequencies on the
+    autotuner cache are similar and the simpler "always exclusive" model
+    avoids reader/writer-priority pitfalls on networked filesystems.
+    """
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o644)
+    try:
+        fcntl.lockf(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        try:
+            fcntl.lockf(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
+
+
 class AutoTunerProfilingCache:
     """AutoTunerCache for caching profiling results.
 
@@ -509,9 +535,28 @@ class AutoTunerProfilingCache:
         Note:
             The cache is saved in JSON format which provides human-readable output.
             Some type information may be lost for complex tactic objects.
+
+            Concurrency model:
+            * Cross-process mutual exclusion uses POSIX byte-range locks
+              (`fcntl.lockf`) on a SEPARATE lockfile next to the data
+              file. The lockfile is persistent (never unlinked); the
+              kernel auto-releases the lock when the holding fd is
+              closed, including on crash, so no stale-lock cleanup is
+              needed. Both readers and writers take LOCK_EX — read/write
+              frequencies are similar here and the simpler logic is
+              worth more than read parallelism.
+            * The data file itself is replaced atomically via
+              (write-to-tmp + fsync + rename). A writer killed at any
+              point leaves a discardable .tmp file; `file_path` is never
+              partially written, so concurrent readers always see a
+              fully-formed JSON document.
+            * The on-disk rank-specific dict is MERGED (not replaced)
+              with this writer's contribution so a concurrent writer
+              that loaded earlier does not get its entries clobbered.
         """
         file_path = Path(file_path)
         file_path.parent.mkdir(parents=True, exist_ok=True)
+        lock_path = self._lock_path_for(file_path)
 
         try:
             # Partition cache into shared (non-INDEPENDENT) and rank-specific (INDEPENDENT)
@@ -520,18 +565,8 @@ class AutoTunerProfilingCache:
             serialized_shared_cache = self._serialize_cache_data(shared_cache)
             serialized_rank_cache = self._serialize_cache_data(rank_cache)
 
-            with open(file_path, 'a+') as f:
-                fcntl.flock(f, fcntl.LOCK_EX)
-                f.seek(0)
-                content = f.read()
-                if content.strip():
-                    current_cache = json.loads(content)
-                else:
-                    current_cache = {
-                        "metadata": self._serialize_metadata(),
-                    }
-                f.seek(0)
-                f.truncate()
+            with _exclusive_cache_lock(lock_path):
+                current_cache = self._read_existing_cache(file_path)
 
                 # Merge shared cache entries (non-INDEPENDENT ops)
                 if self.SHARED_CACHE_KEY not in current_cache:
@@ -539,16 +574,58 @@ class AutoTunerProfilingCache:
                 current_cache[self.SHARED_CACHE_KEY].update(
                     serialized_shared_cache)
 
-                # Save rank-specific cache entries (INDEPENDENT ops)
-                current_cache[f"rank_{rank}"] = serialized_rank_cache
+                # Merge rank-specific cache entries (INDEPENDENT ops).
+                # MUST be a merge (not assignment): a concurrent writer
+                # that committed its rank_{rank} contribution between
+                # this writer's load_cache and save_cache would otherwise
+                # be silently dropped by an `=` assignment that re-writes
+                # the slot with only this writer's in-memory cache.
+                rank_key = f"rank_{rank}"
+                if rank_key not in current_cache:
+                    current_cache[rank_key] = {}
+                current_cache[rank_key].update(serialized_rank_cache)
 
-                json.dump(current_cache, f, indent=2, default=str)
+                self._atomic_write_json(file_path, current_cache)
             logger.info(
                 f"[AutoTuner] Successfully saved cache to {file_path} using JSON format"
             )
         except Exception as e:
             logger.error(f"[AutoTuner] Failed to save cache with JSON: {e}")
             raise
+
+    @staticmethod
+    def _lock_path_for(file_path: Path) -> Path:
+        """Return the lockfile path that pairs with `file_path`."""
+        return file_path.with_name(file_path.name + ".lock")
+
+    def _read_existing_cache(self, file_path: Path) -> Dict[str, Any]:
+        """Read the data file (best-effort) under the caller's lock."""
+        if not file_path.exists():
+            return {"metadata": self._serialize_metadata()}
+        try:
+            with open(file_path, "r") as f:
+                content = f.read()
+            if not content.strip():
+                return {"metadata": self._serialize_metadata()}
+            return json.loads(content)
+        except (FileNotFoundError, json.JSONDecodeError) as e:
+            # An earlier writer from a pre-fix version may have left a
+            # corrupted file behind. Don't fail the current save — start
+            # from a fresh dict and overwrite atomically.
+            logger.warning(f"[AutoTuner] Could not parse existing cache at "
+                           f"{file_path}: {e!r}; starting from a fresh dict.")
+            return {"metadata": self._serialize_metadata()}
+
+    @staticmethod
+    def _atomic_write_json(file_path: Path, payload: Dict[str, Any]) -> None:
+        """Write `payload` to `file_path` atomically (tmp + fsync + rename)."""
+        tmp_path = file_path.with_name(
+            f".{file_path.name}.tmp.{os.getpid()}.{time.time_ns()}")
+        with open(tmp_path, "w") as f:
+            json.dump(payload, f, indent=2, default=str)
+            f.flush()
+            os.fsync(f.fileno())
+        os.rename(tmp_path, file_path)
 
     def load_cache(self, file_path: Union[str, Path], rank: int) -> None:
         """Load the profiling cache from disk in JSON format.
@@ -572,11 +649,13 @@ class AutoTunerProfilingCache:
         if not file_path.exists():
             raise FileNotFoundError(f"Cache file not found: {file_path}")
 
+        lock_path = self._lock_path_for(file_path)
         try:
-            with open(file_path, 'r') as f:
-                fcntl.flock(f, fcntl.LOCK_SH)
-                current_cache_contents = json.load(f)
-                self._deserialize_metadata(current_cache_contents["metadata"])
+            with _exclusive_cache_lock(lock_path):
+                with open(file_path, "r") as f:
+                    current_cache_contents = json.load(f)
+            self._deserialize_metadata(
+                current_cache_contents.get("metadata", {}))
 
             # Start with empty cache and independent ops set
             self.cache = {}
