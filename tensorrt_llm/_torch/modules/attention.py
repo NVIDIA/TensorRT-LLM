@@ -921,10 +921,14 @@ class Attention(nn.Module):
         q, k, v = self.apply_rope(q, k, v, position_ids)
         q, k, v = self.convert_qkv(q, k, v)
 
-        if attention_sinks is not None:
-            assert self.attn_backend == "TRTLLM", (
-                f"Attention sinks are only supported with attn_backend='TRTLLM'. "
-                f"Current backend: {self.attn_backend}.")
+        if attention_sinks is not None and self.attn_backend != "TRTLLM":
+            sm = get_sm_version()
+            if sm in (120, 121):
+                raise ValueError(
+                    f"Attention sinks on SM{sm} require attn_backend='TRTLLM'. "
+                    f"You passed attn_backend='{self.attn_backend}'. Remove the "
+                    f"override (default is TRTLLM) or set "
+                    f"attn_backend='TRTLLM' explicitly.")
 
         attn_output = self.forward_impl(q,
                                         k,
