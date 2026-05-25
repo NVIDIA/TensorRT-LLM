@@ -185,21 +185,18 @@ def parse_args():
         "--attention_backend",
         type=str,
         default="VANILLA",
-        choices=["VANILLA", "TRTLLM", "FA4"],
+        choices=["VANILLA", "TRTLLM", "FA4", "CUTEDSL"],
         help="Attention backend (VANILLA: PyTorch SDPA, TRTLLM: optimized kernels, "
-        "FA4: Flash Attention 4). "
+        "FA4: Flash Attention 4, CUTEDSL: CuTe DSL kernels). "
         "Note: TRTLLM falls back to VANILLA for cross-attention.",
     )
-
-    # SageAttention (requires --attention_backend TRTLLM)
     parser.add_argument(
-        "--enable_sage_attention",
-        action="store_true",
-        help=(
-            "Enable SageAttention (per-block quantized Q/K/V). Requires TRTLLM backend. "
-            "Block layout is chosen from --model_path: (1, 4, 1) for Wan2.x 1.3B, "
-            "(1, 16, 1) otherwise."
-        ),
+        "--quant_attention_mode",
+        default="NO_QUANT",
+        choices=["NO_QUANT", "QK16PV8", "SAGE"],
+        help="Quantized attention presets: NO_QUANT: no quantization; "
+        "QK16PV8: quantize P@V(Bmm2) only (requires backend=CUTEDSL); "
+        "SAGE: Sage Attention algorithm (requires backend=TRTLLM). ",
     )
 
     # Parallelism
@@ -357,10 +354,8 @@ def main():
     else:
         parallel_str = "None"
 
-    attention_cfg = {
-        "backend": args.attention_backend,
-    }
-    if args.enable_sage_attention:
+    attention_cfg = {"backend": args.attention_backend}
+    if args.quant_attention_mode == "SAGE":
         k_block_size = 4 if _wan_needs_fine_grained_sage(args.model_path) else 16
         attention_cfg["quant_attention_config"] = {
             "qk_dtype": "int8",
@@ -369,6 +364,12 @@ def main():
             "v_block_size": 1,
         }
         logger.info(f"SageAttention: INT8 Q/K, blocks (1, {k_block_size}, 1)")
+    elif args.quant_attention_mode == "QK16PV8":
+        attention_cfg["quant_attention_config"] = {
+            "qk_dtype": "bf16",
+            "v_dtype": "fp8",
+        }
+        logger.info("QK16PV8: BF16 Q/K, FP8 V (per-tensor)")
 
     if args.enable_cache_dit:
         cache_kwargs = {"cache_config": _cache_dit_config_from_args(args)}

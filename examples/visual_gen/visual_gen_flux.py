@@ -209,15 +209,18 @@ def parse_args():
         "--attention_backend",
         type=str,
         default="VANILLA",
-        choices=["VANILLA", "TRTLLM", "FA4"],
+        choices=["VANILLA", "TRTLLM", "FA4", "CUTEDSL"],
         help="Attention backend (VANILLA: PyTorch SDPA, TRTLLM: optimized kernels, "
-        "FA4: Flash Attention 4). "
+        "FA4: Flash Attention 4, CUTEDSL: CuTe DSL kernels). "
         "Note: TRTLLM falls back to VANILLA for cross-attention.",
     )
     parser.add_argument(
-        "--enable_sage_attention",
-        action="store_true",
-        help="Enable SageAttention (per-block quantized Q/K/V). Requires TRTLLM backend.",
+        "--quant_attention_mode",
+        default="NO_QUANT",
+        choices=["NO_QUANT", "QK16PV8", "SAGE"],
+        help="Quantized attention presets: NO_QUANT: no quantization; "
+        "QK16PV8: quantize P@V(Bmm2) only (requires backend=CUTEDSL); "
+        "SAGE: Sage Attention algorithm (requires backend=TRTLLM).",
     )
 
     # Parallelism
@@ -342,7 +345,7 @@ def build_visual_gen_args(args) -> VisualGenArgs:
         cache_kwargs = {}
 
     attention_cfg: dict = {"backend": args.attention_backend}
-    if args.enable_sage_attention:
+    if args.quant_attention_mode == "SAGE":
         attention_cfg["quant_attention_config"] = {
             "qk_dtype": "int8",
             "q_block_size": 1,
@@ -350,6 +353,12 @@ def build_visual_gen_args(args) -> VisualGenArgs:
             "v_block_size": 1,
         }
         logger.info("SageAttention: INT8 Q/K, blocks (1, 16, 1)")
+    elif args.quant_attention_mode == "QK16PV8":
+        attention_cfg["quant_attention_config"] = {
+            "qk_dtype": "bf16",
+            "v_dtype": "fp8",
+        }
+        logger.info("QK16PV8: BF16 Q/K, FP8 V (per-tensor)")
 
     kwargs = dict(
         revision=args.revision,
@@ -450,6 +459,7 @@ def main():
                     "model_path": args.model_path,
                     "linear_type": args.linear_type,
                     "attention_backend": args.attention_backend,
+                    "quant_attention_mode": args.quant_attention_mode,
                     "height": args.height,
                     "width": args.width,
                     "steps": args.steps,

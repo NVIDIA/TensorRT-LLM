@@ -16,7 +16,7 @@
 Parallelism Wrappers
 
 Wraps any attention backend with a parallelism strategy. Not a standalone
-backend — compose around a real backend (VANILLA/TRTLLM/FA4).
+backend — compose around a real backend (VANILLA/TRTLLM/FA4/CUTEDSL).
 
 """
 
@@ -256,8 +256,8 @@ class Attention2DAttention(AttentionBackend):
     Supported inner backends
     ------------------------
     The inner backend must support LSE output (``support_lse() -> True``) — required
-    for the reduce-scatter combine step.  Currently only the FA4 backend
-    (``FlashAttn4Attention``) meets this requirement.
+    for the reduce-scatter combine step.  Currently the FA4 and CUTEDSL
+    backends meet this requirement.
 
     Note: ``AttentionTensorLayout.NHD`` and ``AttentionTensorLayout.HND`` are both
     handled transparently; transposition is applied before the inner forward and
