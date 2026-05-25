@@ -305,6 +305,14 @@ class WanBlock(nn.Module):
             qkv_mode=_qkv_mode_self,
             qk_norm=True,
             eps=eps,
+            # TODO: fuse_qk_norm_rope is currently inert when _use_async_ulysses
+            # is set (qkv_mode forced to SEPARATE_QKV above), so the closures
+            # run to_q -> norm_q -> view -> apply_rotary_emb as 4 ops instead
+            # of the fused kernel. See PR #13978 follow-up #3 for the plan to
+            # feed the fused norm+rope kernel output directly into the
+            # symm-mem slot via the ulyssesPermuteScatter epilogue.
+            # Also disable when TP>1 since the fused kernel lacks cross-rank
+            # all-reduce for the cross-head RMSNorm variance.
             fuse_qk_norm_rope=(tp_size == 1),
             config=model_config,
             layer_idx=_layer_idx,

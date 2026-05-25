@@ -81,7 +81,20 @@ namespace
 class AsyncUlyssesOp
 {
 public:
-    static constexpr int kNumSlots = 4;
+    // Slot ring depth. Minimum 3 = one slot each for V/Q/K within a single
+    // forward_async call. A slot is touched by 4 ops in sequence:
+    //   (a) default-stream Phase-1 write  — permute+scatter into slot.sendBuf
+    //   (b) side-stream Phase-2 CE push   — reads slot.sendBuf
+    //   (c) side-stream Phase-2 barrier   — peer writes into slot.recv
+    //   (d) default-stream SDPA read       — reads slot.recv
+    // Intra-layer hazard: V/Q/K must use distinct slots, otherwise (a) on the
+    // default stream races (b) on the side stream — they touch the same
+    // sendBuf and there is no stream sync between them until _join_async.
+    // Cross-layer hazard (Layer N+1 V reusing Layer N V's slot): safe because
+    // _join_async at end of Layer N waits the side stream's K barrier event,
+    // and SDPA on the default stream drains the recv read before Layer N+1
+    // starts. So kNumSlots = 3 is the tight minimum.
+    static constexpr int kNumSlots = 3;
 
     explicit AsyncUlyssesOp(c10::intrusive_ptr<c10d::ProcessGroup> pg)
         : mPg(std::move(pg))
@@ -228,6 +241,10 @@ public:
             }
         }
         TLLM_CHECK_WITH_INFO(h, "emitBarrier: no slot allocated yet — _prepare must precede the first _async barrier.");
+        // 10s timeout: on hang, the kernel traps with rank+channel diagnostic instead of spinning silently
+        // until SLURM wall-clock kills. Generous enough to absorb first-touch IPC + first cuda_graph
+        // capture jitter. channel=0: V/Q/K issues all run on the same per-device side stream so
+        // they FIFO-serialize; channel multiplexing only matters across distinct streams.
         h->barrier(/*channel=*/0, /*timeout_ms=*/10000);
     }
 
@@ -284,6 +301,18 @@ private:
             return slot;
         }
 
+        // First-time / size-up allocation is NOT capture-safe:
+        // empty_strided_p2p + rendezvous + cudaMalloc all violate stream
+        // capture invariants. Caller must warm up out-of-capture so the slot
+        // is allocated and cached before any cuda_graph capture begins.
+        cudaStream_t const stream = at::cuda::getCurrentCUDAStream().stream();
+        cudaStreamCaptureStatus captureStatus = cudaStreamCaptureStatusNone;
+        TLLM_CUDA_CHECK(cudaStreamIsCapturing(stream, &captureStatus));
+        TORCH_CHECK(captureStatus == cudaStreamCaptureStatusNone,
+            "async-ulysses: slot allocation (empty_strided_p2p + rendezvous + cudaMalloc) "
+            "is not graph-capture-safe. Warm up the model out-of-capture (run one forward "
+            "pass before enabling cuda_graph capture) so slots are cached.");
+
         // Size-up: drop refs to old handle/tensor, then alloc fresh.
         if (slot.basePtr != nullptr)
         {
@@ -319,9 +348,9 @@ private:
             slot.peerPtrs[p] = ptrs[p];
         }
 
-        // sendBuf: regular cudaMalloc, sized to match basePtr. Capture-safe
-        // because we eagerly alloc here (out of capture), and the data path
-        // (run_a2a_ce_push) just reads from it.
+        // sendBuf: regular cudaMalloc, sized to match basePtr. The
+        // cudaStreamIsCapturing guard above prevents this from running under
+        // capture; the data path (run_a2a_ce_push) just reads from it.
         if (slot.sendBuf != nullptr && slot.sendBufBytes < requiredSize)
         {
             (void) cudaFree(slot.sendBuf);

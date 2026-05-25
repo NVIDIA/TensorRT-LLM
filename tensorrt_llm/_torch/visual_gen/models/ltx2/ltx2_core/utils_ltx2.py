@@ -17,6 +17,8 @@ def to_velocity(
     """
     # Tensor sigma: keep on device. `.item()` would force a D2H sync that
     # deadlocks under nsys profiling combined with CUDA graph replay.
+    # The scheduler guarantees sigma > 0 inside the denoise loop, so we
+    # skip the zero check on the tensor path (re-checking would re-sync).
     if isinstance(sigma, torch.Tensor):
         sigma = sigma.to(calc_dtype)
     elif sigma == 0:

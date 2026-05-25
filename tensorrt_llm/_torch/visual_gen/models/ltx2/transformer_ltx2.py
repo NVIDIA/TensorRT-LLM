@@ -144,6 +144,12 @@ class LTX2Attention(Attention):
             eps=norm_eps,
             bias=True,
             interleave=(rope_type == LTXRopeType.INTERLEAVED),
+            # TODO: fuse_qk_norm_rope is currently inert when
+            # _use_async_ulysses is set (qkv_mode forced to SEPARATE_QKV above),
+            # so the closures run to_q -> norm_q -> view -> apply_rotary_emb
+            # as 4 ops instead of the fused kernel. See PR #13978 follow-up #3
+            # for the plan to feed the fused norm+rope kernel output directly
+            # into the symm-mem slot via the ulyssesPermuteScatter epilogue.
             fuse_qk_norm_rope=True,
             config=config,
             layer_idx=layer_idx,
@@ -536,9 +542,7 @@ class BasicAVTransformerBlock(nn.Module):
         )
 
     def _init_video_modules(self, cfg, rope_type, eps, model_config, idx):
-        _async_ulysses = (
-            model_config.parallel.async_ulysses if model_config is not None else False
-        )
+        _async_ulysses = model_config.parallel.async_ulysses if model_config is not None else False
         self.attn1 = LTX2Attention(
             query_dim=cfg.dim,
             heads=cfg.heads,
