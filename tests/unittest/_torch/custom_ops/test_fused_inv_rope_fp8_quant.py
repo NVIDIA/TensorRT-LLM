@@ -5,7 +5,8 @@ Numerical-equivalence test for the vLLM-ported fused inverse-RoPE +
 FP8 1x128 quantize op.
 
 Compares (mla_rope_inplace -> fp8_batched_quantize_1x128_permute102) against
-the new fused op `trtllm::fused_inv_rope_fp8_quant_vllm_port`.
+the new fused op `trtllm::fused_inv_rope_fp8_quant_vllm_port` (optimized
+Triton kernel).
 
 Run inside a CUDA Blackwell (SM100f) container (the TRT-LLM build sqsh).
 """
@@ -55,8 +56,9 @@ def _fused_path(
     return fp8_fused, scale_fused
 
 
-@pytest.mark.parametrize("num_tokens", [3, 64, 257, 512])
+@pytest.mark.parametrize("num_tokens", [3, 64, 257, 512, 1024, 2048, 8192])
 def test_fused_inv_rope_fp8_quant_neox(num_tokens):
+    """Optimized Triton kernel vs the legacy 2-kernel reference."""
     torch.manual_seed(0)
     device = "cuda"
     n_groups = 4
@@ -110,8 +112,8 @@ def test_fused_inv_rope_fp8_quant_neox(num_tokens):
     abs_diff = (deq_ref - deq_fused).abs()
     rel = abs_diff.mean() / (deq_ref.abs().mean() + 1e-9)
     print(
-        f"[NEOX num_tokens={num_tokens}] mean abs diff = "
-        f"{abs_diff.mean().item():.4e}  rel = {rel.item():.4e}  "
+        f"[NEOX num_tokens={num_tokens}] "
+        f"mean abs diff = {abs_diff.mean().item():.4e}  rel = {rel.item():.4e}  "
         f"max = {abs_diff.max().item():.4e}"
     )
     # FP8 e4m3 has ~3 mantissa bits; 1-ULP tolerance scales with the value.
