@@ -2430,8 +2430,14 @@ class MLA(nn.Module):
         if isinstance(self.mha, TrtllmAttention):
             assert isinstance(attn_metadata, TrtllmAttentionMetadata)
             trtllm_attention = cast(TrtllmAttention, self.mha)
-            if trtllm_attention.is_chunked_prefill_mla_context_for_warmup(
-                    attn_metadata):
+            # Warm up maybe_compiled_cat for both the chunked-prefill path and
+            # the cached-kv path; without this, the cached-kv prefill
+            # (block-reuse without chunked_prefill) recompiles per shape and
+            # may stall inside inductor's compile worker.
+            if (trtllm_attention.is_chunked_prefill_mla_context_for_warmup(
+                    attn_metadata)
+                    or trtllm_attention.has_cached_kv_for_mla_context(
+                        attn_metadata)):
                 self.cached_warmup_forward_context_with_chunked_prefill(
                     self.num_heads_tp, self.qk_nope_head_dim,
                     self.qk_rope_head_dim, self.kv_lora_rank, self.v_head_dim,
