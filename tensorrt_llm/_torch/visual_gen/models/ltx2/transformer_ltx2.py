@@ -226,14 +226,12 @@ class LTX2Attention(Attention):
         v = self.to_v(context)
 
         # All cross-attn K-norm paths (with or without RoPE) go through the
-        # split-fuse kernels.  fallback only kicks in for unsupported head_dim.
-        if self.qk_norm and self.head_dim in (64, 128):
+        # split-fuse kernels. The kernel itself enforces head_dim ∈ {64, 128}
+        # — no need to gate here. Eager fallback only when qk_norm is off.
+        if self.qk_norm:
             self.apply_split_norm_or_norm_rope(k, self.norm_k.weight, self.num_key_value_heads, pe)
-        else:
-            if self.qk_norm:
-                k = self.norm_k(k)
-            if pe is not None:
-                k = apply_rotary_emb(k, pe, self.rope_type)
+        elif pe is not None:
+            k = apply_rotary_emb(k, pe, self.rope_type)
         return k, v
 
     def forward(
@@ -252,11 +250,11 @@ class LTX2Attention(Attention):
             uncached path requires `context`. pe optional (None = norm-only).
             k_pe overrides pe for K (e.g. AV cross-attn) when provided.
         """
-        # Fallback to the naive eager rope path when fusion is disabled or
-        # the kernel doesn't support this head_dim. LTX-2 prod has
-        # fuse_qk_norm_rope=True and head_dim ∈ {64, 128}, so this branch
-        # never fires in production.
-        if not self.fuse_qk_norm_rope or self.head_dim not in (64, 128):
+        # Fallback to the naive eager rope path only when fusion is explicitly
+        # disabled. head_dim envelope (kernel template supports {64, 128}) is
+        # enforced at the kernel layer; trust it to throw a clear error if a
+        # caller constructs LTX2Attention with an unsupported head_dim.
+        if not self.fuse_qk_norm_rope:
             return self._forward_unfused(x, context, pe, k_pe, pre_projected_kv)
 
         if self.qkv_mode == QKVMode.FUSE_QKV:
@@ -312,12 +310,11 @@ class LTX2Attention(Attention):
         k_pe: tuple[torch.Tensor, torch.Tensor] | None,
         pre_projected_kv: tuple[torch.Tensor, torch.Tensor] | None,
     ) -> torch.Tensor:
-        """Fallback path for unsupported configs (e.g. head_dim ∉ {64, 128} or
-        fuse_qk_norm_rope=False).
+        """Fallback path when ``fuse_qk_norm_rope=False`` is explicitly set.
 
-        LTX-2 prod uses fused (head_dim ∈ {64, 128} and fuse_qk_norm_rope=True
-        by default), so in practice this is never entered. Kept for safety in
-        case the class is reused for other models or fusion is explicitly off.
+        LTX-2 prod hardcodes ``fuse_qk_norm_rope=True`` in __init__, so this
+        path is never entered in production — only useful when the class is
+        subclassed/instantiated with fusion off (e.g. ablation tests).
 
         Contract: caller must pass *pe* / *k_pe* in 4D layout
         ([B, T, H, D] for SPLIT rope, [B, T, D] for INTERLEAVED). The fused

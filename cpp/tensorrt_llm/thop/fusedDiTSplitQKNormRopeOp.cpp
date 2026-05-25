@@ -34,27 +34,36 @@ void fused_dit_split_norm_rope(torch::Tensor& tensor, int64_t num_heads, int64_t
 {
     TORCH_CHECK(tensor.dim() == 2, "tensor must be 2D: [num_tokens, num_heads*head_dim]");
     TORCH_CHECK(weight.dim() == 1, "weight must be 1D");
-    TORCH_CHECK(cos_emb.dim() == 2, "cos_emb must be 2D");
-    TORCH_CHECK(sin_emb.dim() == 2, "sin_emb must be 2D");
+    TORCH_CHECK(cos_emb.dim() >= 2 && cos_emb.dim() <= 4, "cos_emb must have rank in [2, 4]; got ", cos_emb.dim());
+    TORCH_CHECK(sin_emb.dim() == cos_emb.dim(), "sin_emb rank must match cos_emb");
+
+    // Flatten cos/sin to 2D internally. Two supported layouts:
+    //   shape (..., num_heads, head_dim) → per-head cos, fold last 2 dims together
+    //   shape (...,            head_dim) → shared cos, fold all leading dims
+    int64_t const cos_last_raw = cos_emb.size(-1);
+    bool const fold_last_two = (cos_emb.dim() >= 3 && cos_last_raw == head_dim && cos_emb.size(-2) == num_heads);
+    int64_t const cos_new_last = fold_last_two ? num_heads * head_dim : cos_last_raw;
+    torch::Tensor cos_2d = cos_emb.reshape({-1, cos_new_last}).contiguous();
+    torch::Tensor sin_2d = sin_emb.reshape({-1, cos_new_last}).contiguous();
 
     CHECK_INPUT(tensor, torch::kBFloat16);
     CHECK_INPUT(weight, torch::kBFloat16);
     // Cos/sin may be fp32 or bf16 (kernel upcasts bf16 to fp32 in registers, lossless).
-    auto const cos_dtype = cos_emb.scalar_type();
+    auto const cos_dtype = cos_2d.scalar_type();
     TORCH_CHECK(cos_dtype == torch::kFloat32 || cos_dtype == torch::kBFloat16,
         "cos_emb dtype must be float32 or bfloat16, got ", cos_dtype);
-    TORCH_CHECK(sin_emb.scalar_type() == cos_dtype, "sin_emb dtype must match cos_emb (", sin_emb.scalar_type(), " vs ",
+    TORCH_CHECK(sin_2d.scalar_type() == cos_dtype, "sin_emb dtype must match cos_emb (", sin_2d.scalar_type(), " vs ",
         cos_dtype, ")");
     bool const cos_is_bf16 = (cos_dtype == torch::kBFloat16);
     if (cos_is_bf16)
     {
-        CHECK_INPUT(cos_emb, torch::kBFloat16);
-        CHECK_INPUT(sin_emb, torch::kBFloat16);
+        CHECK_INPUT(cos_2d, torch::kBFloat16);
+        CHECK_INPUT(sin_2d, torch::kBFloat16);
     }
     else
     {
-        CHECK_INPUT(cos_emb, torch::kFloat32);
-        CHECK_INPUT(sin_emb, torch::kFloat32);
+        CHECK_INPUT(cos_2d, torch::kFloat32);
+        CHECK_INPUT(sin_2d, torch::kFloat32);
     }
 
     int64_t const num_tokens = tensor.size(0);
@@ -63,7 +72,7 @@ void fused_dit_split_norm_rope(torch::Tensor& tensor, int64_t num_heads, int64_t
     // Auto-detect broadcast: cos may carry one row per token (num_tokens) or one row
     // per token-in-batch (num_tokens / B); in the latter case the kernel broadcasts
     // cos across B via cos_tokenIdx = tokenIdx % cos_seq_per_batch.
-    int64_t const cos_rows = cos_emb.size(0);
+    int64_t const cos_rows = cos_2d.size(0);
     int cos_seq_per_batch = 0;
     if (cos_rows != num_tokens)
     {
@@ -71,10 +80,10 @@ void fused_dit_split_norm_rope(torch::Tensor& tensor, int64_t num_heads, int64_t
             ") must equal num_tokens (", num_tokens, ") or evenly divide it (broadcast); got non-divisor count");
         cos_seq_per_batch = static_cast<int>(cos_rows);
     }
-    bool const per_head_cos = (cos_emb.size(1) == num_heads * head_dim);
-    TORCH_CHECK(per_head_cos || cos_emb.size(1) == head_dim, "cos_emb last dim must be head_dim (", head_dim,
-        ") or num_heads*head_dim (", num_heads * head_dim, "); got ", cos_emb.size(1));
-    TORCH_CHECK(sin_emb.size(0) == cos_rows && sin_emb.size(1) == cos_emb.size(1), "sin_emb shape must match cos_emb");
+    bool const per_head_cos = (cos_2d.size(1) == num_heads * head_dim);
+    TORCH_CHECK(per_head_cos || cos_2d.size(1) == head_dim, "cos_emb last dim must be head_dim (", head_dim,
+        ") or num_heads*head_dim (", num_heads * head_dim, "); got ", cos_2d.size(1));
+    TORCH_CHECK(sin_2d.size(0) == cos_rows && sin_2d.size(1) == cos_2d.size(1), "sin_emb shape must match cos_emb");
     TORCH_CHECK(weight.size(0) == num_heads * head_dim, "weight must be [num_heads*head_dim] (full-dim norm), got ",
         weight.size(0), " expected ", num_heads * head_dim);
 
@@ -82,7 +91,7 @@ void fused_dit_split_norm_rope(torch::Tensor& tensor, int64_t num_heads, int64_t
 
     tensorrt_llm::kernels::launchFusedDiTSplitNormFullDimRope(tensor.data_ptr(), static_cast<int>(num_tokens),
         static_cast<int>(num_heads), static_cast<int>(head_dim), static_cast<float>(eps), weight.data_ptr(),
-        cos_emb.data_ptr(), sin_emb.data_ptr(), interleave, per_head_cos, cos_is_bf16, cos_seq_per_batch, stream);
+        cos_2d.data_ptr(), sin_2d.data_ptr(), interleave, per_head_cos, cos_is_bf16, cos_seq_per_batch, stream);
 }
 
 TORCH_LIBRARY_FRAGMENT(trtllm, m)

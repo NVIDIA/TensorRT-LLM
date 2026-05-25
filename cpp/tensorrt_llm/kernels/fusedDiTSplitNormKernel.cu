@@ -45,7 +45,9 @@ __global__ void fusedDiTSplitNormFullDimKernel(__nv_bfloat16* __restrict__ tenso
     constexpr int THREADS_PER_ROW = BLOCK_SIZE / ROWS_PER_BLOCK; // 128
     constexpr int WARPS_PER_ROW = THREADS_PER_ROW / 32;          // 4
     constexpr int CHUNK_ELEMS = 8;                               // uint4 = 8 bf16
-    constexpr int MAX_N = 32 * HEAD_DIM;
+    // MAX_N = max(num_heads) * HEAD_DIM. 64 covers WAN-14B (40 heads); matches
+    // the cap of fused_dit_qk_norm_rope (full-dim) and fused_dit_split_norm_rope.
+    constexpr int MAX_N = 64 * HEAD_DIM;
     constexpr int MAX_CHUNKS_PER_ROW = (MAX_N + THREADS_PER_ROW * CHUNK_ELEMS - 1) / (THREADS_PER_ROW * CHUNK_ELEMS);
 
 #if (defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900)
@@ -175,8 +177,9 @@ __global__ void fusedDiTSplitNormFullDimKernel(__nv_bfloat16* __restrict__ tenso
 void launchFusedDiTSplitNormFullDim(
     void* tensor, int num_tokens, int num_heads, int head_dim, float eps, void const* weight, cudaStream_t stream)
 {
-    TLLM_CHECK_WITH_INFO(num_heads <= 32,
-        "fusedDiTSplitNormFullDim: num_heads (%d) must be <= 32 (block_size = num_heads*32 <= 1024)", num_heads);
+    // num_heads cap is SMEM/register driven (MAX_N = 64 * HEAD_DIM in the kernel template),
+    // NOT block_size — the launcher uses a fixed blockDim=256 with 2 rows/CTA.
+    TLLM_CHECK_WITH_INFO(num_heads <= 64, "fusedDiTSplitNormFullDim: num_heads (%d) must be <= 64", num_heads);
     TLLM_CHECK_WITH_INFO(num_heads >= 1, "fusedDiTSplitNormFullDim: num_heads must be >= 1, got %d", num_heads);
 
     int const N = num_heads * head_dim;
