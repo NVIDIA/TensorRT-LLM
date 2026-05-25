@@ -50,6 +50,14 @@ except ImportError:
 from .specs import PeerRanges, lookup_owner
 from .weight_buffer import WeightBuffer
 
+# Slice granularity for the batched prefetch path: 2 MiB.  Each peer's
+# contribution to a layer is split into chunks of this size and the chunks
+# are interleaved across peers in a single ``cudaMemcpyBatchAsync`` call
+# so that any moment in flight touches multiple NVLink links, limiting
+# single-link contention.  Ported from the IPC-era DWDP contention
+# optimization (PR #12974) to the VA-based pipeline.
+MEMCPY_BATCH_SLICE_BYTES = 1 << 21
+
 
 class DWDPWeightManager:
     """Runtime P2P copy orchestrator for DWDP expert weight prefetch.
@@ -78,6 +86,8 @@ class DWDPWeightManager:
         "_prefetch_events",
         "_consume_events",
         "_transport",
+        "_use_batched_prefetch",
+        "_batched_copy_plans",
     )
 
     def __init__(
@@ -89,6 +99,7 @@ class DWDPWeightManager:
         weight_names: List[str],
         dwdp_rank: int,
         dwdp_size: int,
+        contention_opt: bool = False,
     ) -> None:
         """Initialize the DWDPWeightManager.
 
@@ -113,6 +124,12 @@ class DWDPWeightManager:
                 (e.g., ["gate_up_proj", "down_proj"]).
             dwdp_rank: This instance's DWDP rank (0..dwdp_size-1).
             dwdp_size: Total number of DWDP ranks.
+            contention_opt: If True, ``prefetch_layer`` issues a single
+                ``cudaMemcpyBatchAsync`` per layer with sub-slices interleaved
+                across peers in ``MEMCPY_BATCH_SLICE_BYTES`` (2 MiB) chunks
+                to reduce single-NVLink-link contention.  Plans are cached
+                per layer since peer ``data_ptr()`` and destination
+                ``data_ptr()`` are stable after initialization.
 
         Raises:
             ValueError: If dwdp_rank is out of range or dwdp_size is invalid.
@@ -163,11 +180,22 @@ class DWDPWeightManager:
         for event in self._consume_events:
             event.record(current_stream)
 
+        # Batched contention-optimized prefetch.  Plans are stable after
+        # initialization (peer data pointers + destination slice pointers
+        # do not move during inference) so we cache one ``(dst_ptrs,
+        # src_ptrs, sizes)`` tuple per layer to avoid host-side rebuild on
+        # every prefetch.
+        self._use_batched_prefetch = contention_opt
+        self._batched_copy_plans: Dict[
+            int, Tuple[List[int], List[int], List[int]]
+        ] = {}
+
         logger.info(
             f"[DWDPWeightManager] Initialized: rank={dwdp_rank}/{dwdp_size}, "
             f"moe_layers={len(self._moe_layer_indices)}, "
             f"weights={self._weight_names}, "
-            f"experts_per_rank={self._experts_per_rank}"
+            f"experts_per_rank={self._experts_per_rank}, "
+            f"contention_opt={contention_opt}"
         )
 
     @property
@@ -237,6 +265,13 @@ class DWDPWeightManager:
         remote slices. Finally, records a prefetch_event so the compute stream
         can wait for the copy to complete.
 
+        Two implementations dispatch on ``self._use_batched_prefetch`` (set
+        from ``DwdpConfig.contention_opt``): the default per-slice path
+        issues one ``torch.Tensor.copy_`` per peer chunk, while the batched
+        path collapses all chunks into a single ``cudaMemcpyBatchAsync``
+        call whose sub-slices round-robin across peers in 2 MiB chunks to
+        limit single-NVLink-link contention.
+
         This method returns immediately — all GPU work is enqueued on
         copy_stream and does not block the CPU.
 
@@ -259,37 +294,10 @@ class DWDPWeightManager:
             # before overwriting it with new P2P data.
             self._copy_stream.wait_event(self._consume_events[buf_idx])
 
-            for name in self._weight_names:
-                remote_slices = self._weight_buffer.get_remote_slices(
-                    layer_idx, name
-                )
-                for dst_slice, expert_start, expert_end in remote_slices:
-                    # A remote slice may span multiple peer ranks.  Walk
-                    # the destination range and dispatch each contiguous
-                    # sub-chunk to the peer that owns it.  ``lookup_owner``
-                    # picks the lowest-rank owner (matters under redundancy
-                    # where multiple peers cover the same expert id).
-                    cursor = expert_start
-                    dst_offset = 0
-                    while cursor < expert_end:
-                        peer_rank = lookup_owner(cursor, self._peer_ranges)
-                        peer_local_start, peer_local_end = self._peer_ranges[peer_rank]
-                        local_offset = cursor - peer_local_start
-                        # Stop at the first of: end of the destination
-                        # remote slice, or end of this peer's valid range.
-                        # Crossing the latter means the next expert is
-                        # owned by a different peer (or by *us*, which
-                        # would be a bug since this is the *remote* slice).
-                        chunk_end = min(expert_end, peer_local_end)
-                        n = chunk_end - cursor
-
-                        peer_key = (peer_rank, layer_idx, name)
-                        src_tensor = self._peer_views[peer_key]
-                        dst_slice[dst_offset:dst_offset + n].copy_(
-                            src_tensor[local_offset:local_offset + n]
-                        )
-                        dst_offset += n
-                        cursor = chunk_end
+            if self._use_batched_prefetch:
+                self._prefetch_layer_batched(layer_idx)
+            else:
+                self._prefetch_layer_per_slice(layer_idx)
 
             # RAW signal: record event so compute_stream knows copy is done.
             self._prefetch_events[buf_idx].record(self._copy_stream)
@@ -298,6 +306,154 @@ class DWDPWeightManager:
             f"[DWDPWeightManager] Prefetch enqueued: layer={layer_idx}, "
             f"buf_slot={buf_idx}"
         )
+
+    def _prefetch_layer_per_slice(self, layer_idx: int) -> None:
+        """Default prefetch: one ``torch.Tensor.copy_`` per peer chunk."""
+        for name in self._weight_names:
+            remote_slices = self._weight_buffer.get_remote_slices(
+                layer_idx, name
+            )
+            for dst_slice, expert_start, expert_end in remote_slices:
+                # A remote slice may span multiple peer ranks.  Walk
+                # the destination range and dispatch each contiguous
+                # sub-chunk to the peer that owns it.  ``lookup_owner``
+                # picks the lowest-rank owner (matters under redundancy
+                # where multiple peers cover the same expert id).
+                cursor = expert_start
+                dst_offset = 0
+                while cursor < expert_end:
+                    peer_rank = lookup_owner(cursor, self._peer_ranges)
+                    peer_local_start, peer_local_end = self._peer_ranges[peer_rank]
+                    local_offset = cursor - peer_local_start
+                    # Stop at the first of: end of the destination
+                    # remote slice, or end of this peer's valid range.
+                    # Crossing the latter means the next expert is
+                    # owned by a different peer (or by *us*, which
+                    # would be a bug since this is the *remote* slice).
+                    chunk_end = min(expert_end, peer_local_end)
+                    n = chunk_end - cursor
+
+                    peer_key = (peer_rank, layer_idx, name)
+                    src_tensor = self._peer_views[peer_key]
+                    dst_slice[dst_offset:dst_offset + n].copy_(
+                        src_tensor[local_offset:local_offset + n]
+                    )
+                    dst_offset += n
+                    cursor = chunk_end
+
+    def _build_batched_prefetch_copy_plan(
+        self, layer_idx: int
+    ) -> Tuple[List[int], List[int], List[int]]:
+        """Build a per-layer ``cudaMemcpyBatchAsync`` plan.
+
+        Strategy: collect every ``(dst_ptr, src_ptr, size_bytes)`` triple
+        from the same per-slice / per-peer walk used by
+        ``_prefetch_layer_per_slice``, then split each peer's contiguous
+        chunks into ``MEMCPY_BATCH_SLICE_BYTES`` (2 MiB) sub-slices and
+        interleave them across peers in round-robin order.  Interleaving
+        is what limits single-NVLink-link contention — at any moment the
+        in-flight memcpys touch every peer link rather than saturating one.
+
+        Returns:
+            Three parallel lists ``(dst_ptrs, src_ptrs, sizes)`` of the
+            same length, suitable for ``cudaMemcpyBatchAsync``.
+        """
+        # Step 1: collect per-peer ``(dst_ptr, src_ptr, total_size)`` triples.
+        peer_triples: Dict[int, List[Tuple[int, int, int]]] = {}
+        for name in self._weight_names:
+            remote_slices = self._weight_buffer.get_remote_slices(
+                layer_idx, name
+            )
+            for dst_slice, expert_start, expert_end in remote_slices:
+                cursor = expert_start
+                dst_offset = 0
+                while cursor < expert_end:
+                    peer_rank = lookup_owner(cursor, self._peer_ranges)
+                    peer_local_start, peer_local_end = self._peer_ranges[peer_rank]
+                    local_offset = cursor - peer_local_start
+                    chunk_end = min(expert_end, peer_local_end)
+                    n = chunk_end - cursor
+
+                    peer_key = (peer_rank, layer_idx, name)
+                    src_tensor = self._peer_views[peer_key]
+                    dst_sub = dst_slice[dst_offset:dst_offset + n]
+                    src_sub = src_tensor[local_offset:local_offset + n]
+                    size_bytes = dst_sub.numel() * dst_sub.element_size()
+
+                    peer_triples.setdefault(peer_rank, []).append(
+                        (dst_sub.data_ptr(), src_sub.data_ptr(), size_bytes)
+                    )
+
+                    dst_offset += n
+                    cursor = chunk_end
+
+        # Step 2: split each per-peer triple into 2 MiB sub-slices.
+        peer_subslices: Dict[int, List[Tuple[int, int, int]]] = {}
+        for peer, triples in peer_triples.items():
+            sub_list: List[Tuple[int, int, int]] = []
+            for dst_ptr, src_ptr, total in triples:
+                offset = 0
+                while offset < total:
+                    sz = min(MEMCPY_BATCH_SLICE_BYTES, total - offset)
+                    sub_list.append((dst_ptr + offset, src_ptr + offset, sz))
+                    offset += sz
+            peer_subslices[peer] = sub_list
+
+        # Step 3: round-robin across peers.  At each round, take the next
+        # sub-slice from every peer that still has one, then advance.
+        # Peers naturally drop out as their sub-slice lists exhaust.
+        dst_ptrs: List[int] = []
+        src_ptrs: List[int] = []
+        sizes: List[int] = []
+        cursors = {peer: 0 for peer in peer_subslices}
+        while cursors:
+            for peer in list(cursors):
+                idx = cursors[peer]
+                if idx < len(peer_subslices[peer]):
+                    d, s, sz = peer_subslices[peer][idx]
+                    dst_ptrs.append(d)
+                    src_ptrs.append(s)
+                    sizes.append(sz)
+                    cursors[peer] = idx + 1
+                else:
+                    del cursors[peer]
+
+        return dst_ptrs, src_ptrs, sizes
+
+    def _prefetch_layer_batched(self, layer_idx: int) -> None:
+        """Batched prefetch: one ``cudaMemcpyBatchAsync`` per layer."""
+        plan = self._batched_copy_plans.get(layer_idx)
+        if plan is None:
+            plan = self._build_batched_prefetch_copy_plan(layer_idx)
+            self._batched_copy_plans[layer_idx] = plan
+
+        dst_ptrs, src_ptrs, sizes = plan
+        if not dst_ptrs:
+            return
+
+        # Imported lazily because ``cuda.bindings.runtime`` is a heavy
+        # binding and the default per-slice path does not need it.
+        from cuda.bindings import runtime as cudart
+
+        attr = cudart.cudaMemcpyAttributes()
+        attr.srcAccessOrder = (
+            cudart.cudaMemcpySrcAccessOrder.cudaMemcpySrcAccessOrderStream
+        )
+        (err,) = cudart.cudaMemcpyBatchAsync(
+            dst_ptrs,
+            src_ptrs,
+            sizes,
+            len(dst_ptrs),
+            [attr],
+            [0],
+            1,
+            self._copy_stream.cuda_stream,
+        )
+        if err != cudart.cudaError_t.cudaSuccess:
+            raise RuntimeError(
+                f"cudaMemcpyBatchAsync failed for DWDP prefetch (layer="
+                f"{layer_idx}, copies={len(dst_ptrs)}): {err}"
+            )
 
     def wait_and_bind(
         self, backend_module: torch.nn.Module, layer_idx: int

@@ -76,6 +76,7 @@ def setup_dwdp(
     layer_indices: List[int],
     num_experts_per_worker: int,
     num_prefetch_experts: int,
+    contention_opt: bool = False,
 ) -> Optional[DWDPWeightManager]:
     """Set up DWDP for a model after weight loading.
 
@@ -241,6 +242,7 @@ def setup_dwdp(
         weight_names=list(weight_names),
         dwdp_rank=mapping.dwdp_rank,
         dwdp_size=mapping.dwdp_size,
+        contention_opt=contention_opt,
     )
     logger.info("[DWDP Setup] Weight manager created.")
 
