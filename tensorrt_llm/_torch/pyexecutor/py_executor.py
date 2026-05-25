@@ -1,7 +1,6 @@
 import dataclasses
 import datetime
 import functools
-import json
 import os
 import threading
 import time
@@ -357,61 +356,6 @@ class PyExecutor:
         self.print_log = self.llm_args.print_iter_log
         self.enable_iter_perf_stats = self.llm_args.enable_iter_perf_stats
         self.enable_iter_req_stats = self.llm_args.enable_iter_req_stats
-        # Wall-clock throttled one-line KV-cache + inflight batching log.
-        # Emitted at the end of ``_process_iter_stats`` from rank 0 only,
-        # so the server log (batch_*_serve_step*.log) carries a steady
-        # "how close to KV cache saturation / request pause" trace
-        # without scaling to the per-iter rate. Zero disables.
-        self.kv_monitor_log_period_s = float(
-            getattr(self.llm_args, "kv_monitor_log_period_s", 5.0) or 0.0)
-        self._kv_monitor_last_log_time: float = 0.0
-
-        # ------------------------------------------------------------------
-        # Per-iter batch-size sampler (structured JSONL, off by default).
-        #
-        # Rank 0 opens ``iter_state_sample_path`` once, then on every
-        # ``iter_state_sample_every_iters``-th iteration appends a compact
-        # record to an in-memory buffer. Every
-        # ``iter_state_drain_period_s`` seconds the buffer is serialised
-        # once and written / flushed to the file in one syscall, so the
-        # hot scheduler loop pays at most a ``list.append`` per sample
-        # and amortises ``json.dumps`` + ``write`` + lustre latency over
-        # the drain window. Meant for post-hoc batch-utilisation /
-        # under-batching analyses (compare e.g. trace-replay vs
-        # InferenceX-style random-prompt bench at the same ``--conc``).
-        # When ``iter_state_sample_path`` is ``None`` the sampler is a
-        # single null check per iter (no allocation).
-        # ------------------------------------------------------------------
-        self.iter_state_sample_path = (getattr(
-            self.llm_args, "iter_state_sample_path", None) or None)
-        self.iter_state_sample_every_iters = int(
-            getattr(self.llm_args, "iter_state_sample_every_iters", 100) or 0)
-        self.iter_state_drain_period_s = float(
-            getattr(self.llm_args, "iter_state_drain_period_s", 5.0) or 0.0)
-        self._iter_state_sample_file = None
-        self._iter_state_buffer: List[Dict] = []
-        self._iter_state_drain_last_t: float = 0.0
-        if (self.iter_state_sample_path
-                and self.iter_state_sample_every_iters > 0
-                and getattr(self.dist, "rank", 0) == 0):
-            # Default file buffering; the drain path calls ``.flush()``
-            # every iter_state_drain_period_s so post-hoc readers see
-            # partial data even if the server is SIGTERM'd mid-run
-            # (trace-replay tears down the server per ladder step).
-            try:
-                self._iter_state_sample_file = open(self.iter_state_sample_path,
-                                                    "w")
-                logger.info(
-                    f"[iter_state_sampler] rank 0 writing to "
-                    f"{self.iter_state_sample_path} "
-                    f"(every {self.iter_state_sample_every_iters} iters, "
-                    f"drain {self.iter_state_drain_period_s}s)")
-            except OSError as e:
-                logger.warning(
-                    f"[iter_state_sampler] failed to open "
-                    f"{self.iter_state_sample_path}: {e!r}; sampler disabled")
-                self._iter_state_sample_file = None
-
         self.stream_interval = self.llm_args.stream_interval
         self.perf_manager = PerfMetricsManager(
             enabled=getattr(self.llm_args, 'return_perf_metrics', False))
@@ -425,58 +369,6 @@ class PyExecutor:
         self.batch_wait_timeout_iters = self.llm_args.batch_wait_timeout_iters
         self.batch_wait_max_tokens_ratio = self.llm_args.batch_wait_max_tokens_ratio
         self.enable_batch_waiting = self.batch_wait_timeout_iters > 0 or self.batch_wait_max_tokens_ratio > 0
-
-        # Decode-deferral (recipe.md section 12): inverse of the prefill-
-        # waiting knob above. When the candidate generation batch is below
-        # ``decode_defer_threshold * max_batch_size`` AND prefill work is
-        # ready to take its place, drop the generation requests for this
-        # iteration so the in-flight decode set can grow before paying
-        # the next MoE all-to-all. ``max_decode_defer_iters`` bounds the
-        # worst-case TPOT regression by forcing decode after that many
-        # consecutive defers, regardless of batch size.
-        self.decode_defer_threshold = float(
-            getattr(self.llm_args, "decode_defer_threshold", 0.0) or 0.0)
-        self.max_decode_defer_iters = int(
-            getattr(self.llm_args, "max_decode_defer_iters", 10) or 0)
-        self.enable_decode_deferral = (self.decode_defer_threshold > 0.0
-                                       and self.max_decode_defer_iters > 0)
-        # Last iter's decision, surfaced to the per-iter sampler so
-        # ``decode_deferred`` lands in the JSONL alongside ctx / gen.
-        self._last_iter_decode_deferred = False
-
-        # Per-iter GPU forward timing for the iter_state JSONL sampler.
-        # Two alternating CUDA event pairs so iter N reads iter N-1 (whose
-        # events have completed by the time iter N starts recording).
-        # CUDA events on the same stream as the forward pass capture
-        # GPU-side wall time including any NCCL all-to-all kernels that
-        # are queued on that stream.
-        self._fwd_timing_events = [
-            (torch.cuda.Event(enable_timing=True),
-             torch.cuda.Event(enable_timing=True)),
-            (torch.cuda.Event(enable_timing=True),
-             torch.cuda.Event(enable_timing=True)),
-        ]
-        self._fwd_timing_idx = 0
-        self._last_iter_gpu_forward_ms = 0.0
-
-        # CPU-timestamp 4-phase breakdown of one executor iter:
-        # iter_start  ---schedule_ms--->  forward_start_cpu
-        #             ---forward_cpu_ms--->  forward_end_cpu
-        #             ---post_ms--->  iter_end
-        # ``forward_cpu_ms`` is the CPU-observed wall of the forward call
-        # (includes kernel launch overhead and any sync waits the CPU
-        # makes); compare against ``gpu_forward_ms`` (CUDA event) to see
-        # CPU-vs-GPU overlap. ``schedule_ms`` covers Python scheduler
-        # work before forward; ``post_ms`` covers sampling, response
-        # handling, IPC. All four sum to ``iter_latency_ms``.
-        self._last_iter_forward_start_cpu = 0.0
-        self._last_iter_forward_end_cpu = 0.0
-        self._last_iter_post_schedule_cpu = 0.0
-        self._last_iter_schedule_ms = 0.0
-        self._last_iter_schedule_main_ms = 0.0
-        self._last_iter_schedule_post_main_ms = 0.0
-        self._last_iter_forward_cpu_ms = 0.0
-        self._last_iter_post_ms = 0.0
 
         self.num_fetch_requests_cur_rank = 0
         self.num_fetch_requests = 0
@@ -619,7 +511,6 @@ class PyExecutor:
         self.adp_ctx_waiting_iters_count = 0
         self.adp_ctx_batching_wait_iters_count = 0
         self.batch_wait_iters_count = 0
-        self.consecutive_decode_defer_iters = 0
 
         def on_detected():
             self._handle_errors(
@@ -1636,36 +1527,6 @@ class PyExecutor:
         """All ranks: build local stats; ADP queues them for later fanout."""
         iter_end_time = time.time()
         iter_latency_ms = (iter_end_time - batch_state.iter_start_time) * 1e3
-        # 4-phase CPU breakdown for the iter_state JSONL sampler. Falls
-        # back to 0.0 if forward timestamps weren't set (eg the executor
-        # took an early-exit path that skipped _forward_step).
-        if self._last_iter_forward_start_cpu > 0.0 and self._last_iter_forward_end_cpu > 0.0:
-            self._last_iter_schedule_ms = (self._last_iter_forward_start_cpu -
-                                           batch_state.iter_start_time) * 1e3
-            self._last_iter_forward_cpu_ms = (
-                self._last_iter_forward_end_cpu -
-                self._last_iter_forward_start_cpu) * 1e3
-            self._last_iter_post_ms = (iter_end_time -
-                                       self._last_iter_forward_end_cpu) * 1e3
-            # Sub-split schedule into main scheduler call vs everything else
-            # (resource_manager.prepare_resources, kv_connector_start_batch,
-            # guided/draft setup, etc.) preceding _forward_step.
-            if self._last_iter_post_schedule_cpu > 0.0:
-                self._last_iter_schedule_main_ms = (
-                    self._last_iter_post_schedule_cpu -
-                    batch_state.iter_start_time) * 1e3
-                self._last_iter_schedule_post_main_ms = (
-                    self._last_iter_forward_start_cpu -
-                    self._last_iter_post_schedule_cpu) * 1e3
-            else:
-                self._last_iter_schedule_main_ms = 0.0
-                self._last_iter_schedule_post_main_ms = 0.0
-        else:
-            self._last_iter_schedule_ms = 0.0
-            self._last_iter_schedule_main_ms = 0.0
-            self._last_iter_schedule_post_main_ms = 0.0
-            self._last_iter_forward_cpu_ms = 0.0
-            self._last_iter_post_ms = 0.0
         if batch_state.iter_stats is None:
             return
 
@@ -1687,219 +1548,7 @@ class PyExecutor:
         else:
             self._append_iter_stats(stats, req_stats)
 
-        self._maybe_log_kv_monitor(stats)
-        self._maybe_sample_iter_state(stats)
-
-    def _maybe_log_kv_monitor(self, stats) -> None:
-        """Emit a throttled one-line KV cache + inflight batching summary.
-
-        Triggered from every ``_process_iter_stats`` call but gated on
-        wall-clock time so the log rate stays at
-        ``kv_monitor_log_period_s`` seconds regardless of the scheduler's
-        iter rate. Only rank 0 prints; on ADP the other ranks' KV trees
-        differ, and we trade per-rank visibility for a clean, single-line
-        per tick trace. Disable by setting ``kv_monitor_log_period_s=0``
-        in the extra-llm-api-config YAML.
-        """
-        if self.kv_monitor_log_period_s <= 0:
-            return
-        if getattr(self.dist, "rank", 0) != 0:
-            return
-        now = time.time()
-        if now - self._kv_monitor_last_log_time < self.kv_monitor_log_period_s:
-            return
-        self._kv_monitor_last_log_time = now
-
-        kv = getattr(stats, "kv_cache_stats", None)
-        ib = getattr(stats, "inflight_batching_stats", None)
-        if kv is None or ib is None:
-            return
-
-        used = int(getattr(kv, "used_num_blocks", 0) or 0)
-        mx = int(getattr(kv, "max_num_blocks", 0) or 0)
-        tpb = int(getattr(kv, "tokens_per_block", 0) or 0)
-        pct = (used / mx * 100.0) if mx else 0.0
-        paused = int(getattr(ib, "num_paused_requests", 0) or 0)
-        hit = getattr(kv, "cache_hit_rate", None)
-        hit_s = f" hit={hit * 100.0:.1f}%" if hit is not None else ""
-        tag = "[PAUSED!] " if paused > 0 else ""
-        logger.info(f"{tag}[kvmon iter={getattr(stats, 'iter', '?')}] "
-                    f"kv={pct:5.1f}% ({used * tpb:,}/{mx * tpb:,} tok, "
-                    f"{used}/{mx} blk) paused={paused} "
-                    f"queued={getattr(stats, 'num_queued_requests', 0)} "
-                    f"active={getattr(stats, 'num_active_requests', 0)}/"
-                    f"{getattr(stats, 'max_num_active_requests', 0)} "
-                    f"ctx={getattr(ib, 'num_context_requests', 0)} "
-                    f"gen={getattr(ib, 'num_gen_requests', 0)}{hit_s}")
-
-    def _maybe_sample_iter_state(self, stats) -> None:
-        """Append one structured record per sampled iter to a JSONL file.
-
-        Sibling of :meth:`_maybe_log_kv_monitor`. Same source fields
-        (``stats.num_active_requests``, ``inflight_batching_stats``,
-        ``kv_cache_stats``) but:
-
-        - Gated on ``iter_id % iter_state_sample_every_iters == 0`` rather
-          than wall-clock (predictable density in iter-space; 100 iters
-          ~= 0.5-2 Hz at typical executor iter rates).
-        - Output is machine-parseable JSONL at a separate path rather
-          than mixed into the human ``logger.info`` stream.
-        - Actual file I/O is batched: each sampled iter only appends to
-          an in-memory list, the list is drained and flushed once per
-          ``iter_state_drain_period_s`` seconds (~5 s), so the hot path
-          never pays a per-sample ``json.dumps`` / ``write`` / ``flush``.
-
-        Disabled when ``iter_state_sample_path`` is unset or when rank !=
-        0 (``_iter_state_sample_file`` is left as ``None`` in both
-        cases). In that state the body returns after a single attribute
-        load.
-
-        Methodology note (see ``recipe.md`` workspace root §3.2 for the
-        canonical version). The intended downstream interpretation is
-        ``global_batch = (active - paused) * dp_size``:
-
-        - ``active - paused`` filters out admitted requests the scheduler
-          evicted this iter (KV pressure), giving the count of requests
-          whose forward pass actually ran. Empirically ``active - paused``
-          tracks ``ctx + gen`` within 1-3 requests across our trace and
-          bench runs at C=128 (the MAX_UTILIZATION scheduler is greedy),
-          so either serves as a batch-size proxy.
-        - ``* dp_size`` lifts the rank-0-local counts produced here to a
-          global fleet count so TEP (dp_size=1) and ADP (dp_size=tp_size)
-          configs compare apples-to-apples on the same y-axis. The sampler
-          itself is rank-0-only; callers compute the lift based on the
-          server config.
-        """
-        if self._iter_state_sample_file is None:
-            return
-        every = self.iter_state_sample_every_iters
-        if every <= 0:
-            return
-        iter_id = getattr(stats, "iter", None)
-        if iter_id is None or (iter_id % every) != 0:
-            return
-
-        # Append-only hot path: one dict alloc + one ``list.append``.
-        # No JSON serialisation, no syscall.
-        ib = getattr(stats, "inflight_batching_stats", None)
-        kv = getattr(stats, "kv_cache_stats", None)
-        now = time.time()
-        self._iter_state_buffer.append({
-            "iter":
-            iter_id,
-            "t_unix":
-            now,
-            "t_mono":
-            time.monotonic(),
-            "active":
-            int(getattr(stats, "num_active_requests", 0) or 0),
-            "max_active":
-            int(getattr(stats, "max_num_active_requests", 0) or 0),
-            "queued":
-            int(getattr(stats, "num_queued_requests", 0) or 0),
-            "ctx":
-            int(getattr(ib, "num_context_requests", 0) or 0) if ib else 0,
-            "gen":
-            int(getattr(ib, "num_gen_requests", 0) or 0) if ib else 0,
-            "paused":
-            int(getattr(ib, "num_paused_requests", 0) or 0) if ib else 0,
-            "ctx_tokens":
-            int(getattr(ib, "num_ctx_tokens", 0) or 0) if ib else 0,
-            "kv_used_blk":
-            int(getattr(kv, "used_num_blocks", 0) or 0) if kv else 0,
-            "kv_max_blk":
-            int(getattr(kv, "max_num_blocks", 0) or 0) if kv else 0,
-            "tokens_per_blk":
-            int(getattr(kv, "tokens_per_block", 0) or 0) if kv else 0,
-            "iter_latency_ms":
-            getattr(stats, "iter_latency_ms", None),
-            # CUDA-event measured GPU forward time on the execution stream
-            # (includes attention + MoE compute and any NCCL all-to-all
-            # queued on that stream). Compared against ``iter_latency_ms``
-            # this isolates GPU compute+comm from Python/CPU overhead.
-            "gpu_forward_ms":
-            float(self._last_iter_gpu_forward_ms),
-            # CPU-timestamp 4-phase breakdown of the iter:
-            #   schedule_ms     = forward_start_cpu - iter_start
-            #   forward_cpu_ms  = forward_end_cpu  - forward_start_cpu
-            #   post_ms         = iter_end         - forward_end_cpu
-            # forward_cpu_ms vs gpu_forward_ms tells CPU-vs-GPU overlap
-            # (forward_cpu_ms < gpu_forward_ms => CPU returned before GPU
-            # finished, ie launches are async-overlapped with prior work).
-            "schedule_ms":
-            float(self._last_iter_schedule_ms),
-            # Sub-split of schedule: schedule_main = end of
-            # _prepare_and_schedule_batch - iter_start (the scheduler
-            # call itself, including ADP router decisions); schedule_post_main
-            # = forward_start - end of schedule (resource prep, draft, etc).
-            "schedule_main_ms":
-            float(self._last_iter_schedule_main_ms),
-            "schedule_post_main_ms":
-            float(self._last_iter_schedule_post_main_ms),
-            "forward_cpu_ms":
-            float(self._last_iter_forward_cpu_ms),
-            "post_ms":
-            float(self._last_iter_post_ms),
-            # Decode-deferral observability (recipe.md section 12).
-            # ``decode_deferred`` is True iff this iter dropped the
-            # generation set because of decode_defer_threshold.
-            # ``decode_defer_streak`` is the current consecutive-defer
-            # counter AFTER this iter's decision; when it equals
-            # max_decode_defer_iters the next defer is force-overridden
-            # by the anti-starvation cap. Both are 0 / False on every
-            # iter when decode-deferral is disabled (the default).
-            "decode_deferred":
-            bool(self._last_iter_decode_deferred),
-            "decode_defer_streak":
-            int(self.consecutive_decode_defer_iters),
-        })
-
-        # Drain boundary: ``json.dumps`` all buffered records once, write
-        # once, flush once. Amortises any lustre stall across the whole
-        # window rather than per-sample.
-        if (now - self._iter_state_drain_last_t
-                >= self.iter_state_drain_period_s):
-            self._iter_state_drain_last_t = now
-            self._drain_iter_state_buffer()
-
-    def _drain_iter_state_buffer(self) -> None:
-        """Serialise + flush the in-memory iter-state buffer in one call.
-
-        Called periodically by :meth:`_maybe_sample_iter_state` and once
-        from :meth:`_executor_loop_cleanup` so a SIGTERM'd server still
-        leaves a fully-formed JSONL (modulo the final open 5 s window).
-        No-op when the file is not open or the buffer is empty.
-        """
-        if self._iter_state_sample_file is None or not self._iter_state_buffer:
-            return
-        payload = "\n".join(
-            json.dumps(rec, separators=(",", ":"))
-            for rec in self._iter_state_buffer) + "\n"
-        try:
-            self._iter_state_sample_file.write(payload)
-            self._iter_state_sample_file.flush()
-        except (OSError, ValueError) as e:
-            # Best-effort: warn once and keep the buffer so the next
-            # drain retries. ``ValueError`` covers "I/O on closed file"
-            # if cleanup raced the last drain.
-            logger.warning(
-                f"[iter_state_sampler] drain of "
-                f"{len(self._iter_state_buffer)} record(s) failed: {e!r}")
-            return
-        self._iter_state_buffer.clear()
-
     def _executor_loop_cleanup(self):
-
-        # Final drain + close of the iter-state sampler (no-op when
-        # disabled). Done first so a crash during the per-micro-batch
-        # wait-on-handles below doesn't lose the last 0-5 s of samples.
-        if self._iter_state_sample_file is not None:
-            try:
-                self._drain_iter_state_buffer()
-                self._iter_state_sample_file.close()
-            except Exception as e:
-                logger.warning(f"[iter_state_sampler] close failed: {e!r}")
-            self._iter_state_sample_file = None
 
         for i in range(self.num_micro_batches):
             self.wait_on_pp_send_handles(self.send_handles, i)
@@ -2801,7 +2450,6 @@ class PyExecutor:
                     self._sync_and_process_resource_governor_queue()
 
                 scheduled_batch, iter_stats = self._prepare_and_schedule_batch()
-                self._last_iter_post_schedule_cpu = time.time()
                 self._handle_control_request()
 
                 if scheduled_batch is None:
@@ -3082,7 +2730,6 @@ class PyExecutor:
                     self._sync_and_process_resource_governor_queue()
 
                 scheduled_batch, iter_stats = self._prepare_and_schedule_batch()
-                self._last_iter_post_schedule_cpu = time.time()
                 self._handle_control_request()
 
                 if scheduled_batch is None:
@@ -3799,54 +3446,6 @@ class PyExecutor:
         self.batch_wait_iters_count = 0
         return context_requests
 
-    def _decode_defer_requests(self, context_requests: list[LlmRequest],
-                               generation_requests: list[LlmRequest]):
-        """Inverse of :meth:`_waiting_requests`: defer DECODE, run PREFILL.
-
-        Returns the (possibly empty) list of generation requests that
-        should run this iteration. Mirrors the prefill-deferral flow:
-
-        - If the candidate decode batch is small relative to
-          ``max_batch_size`` AND there is prefill ready to take its
-          place AND we have not already deferred for too many iterations
-          in a row, return ``[]`` (drop decode for this iter, keep
-          prefill). The decode requests stay in ``self.active_requests``
-          with their KV blocks intact; they re-enter the scheduler on
-          the next iteration. The all-to-all-bound MoE step that would
-          otherwise process a tiny decode batch is skipped, and the
-          prefill iteration that runs in its place feeds the next
-          decode wave with more context.
-
-        - Otherwise (decode batch is large enough, no prefill is ready,
-          or anti-starvation cap reached) return the original
-          ``generation_requests`` and reset the counter.
-
-        ``decode_defer_threshold`` is a fraction of ``max_batch_size``
-        so the knob keeps the same meaning across configurations
-        regardless of how the operator picked ``max_batch_size``. The
-        anti-starvation cap (``max_decode_defer_iters``) bounds the
-        worst-case decode TPOT regression to that many iterations
-        worth of latency; on agent traces a single cap window
-        (~50-200 ms) is two to three orders of magnitude smaller than
-        the tool-call sleeps that motivated the deferral in the first
-        place.
-        """
-
-        threshold = self.decode_defer_threshold * self.max_batch_size
-        decode_too_small = len(generation_requests) < threshold
-        prefill_ready = len(context_requests) > 0
-        within_starvation_cap = (self.consecutive_decode_defer_iters
-                                 < self.max_decode_defer_iters)
-
-        if decode_too_small and prefill_ready and within_starvation_cap:
-            self.consecutive_decode_defer_iters += 1
-            self._last_iter_decode_deferred = True
-            return []
-
-        self.consecutive_decode_defer_iters = 0
-        self._last_iter_decode_deferred = False
-        return generation_requests
-
     @nvtx_range("_schedule")
     def _schedule(self):
         scheduler_output = self.scheduler.schedule_request(
@@ -3890,23 +3489,9 @@ class PyExecutor:
             ]
             self._revert_ctx_alloc(dropped)
 
-        # Decode-deferral (recipe.md section 12). Acts on the inverse
-        # phase from ``_waiting_requests`` above: when there is decode
-        # AND prefill in the same iteration but the decode batch is
-        # below ``decode_defer_threshold * max_batch_size``, drop the
-        # generation set so prefill runs alone and the in-flight decode
-        # set keeps growing for the next iter. The anti-starvation cap
-        # in ``_decode_defer_requests`` guarantees decode resumes after
-        # ``max_decode_defer_iters`` consecutive defers.
-        scheduled_generation_requests = scheduler_output.generation_requests
-        if self.enable_decode_deferral:
-            scheduled_generation_requests = self._decode_defer_requests(
-                scheduled_context_requests,
-                scheduler_output.generation_requests)
-
         scheduled_requests = ScheduledRequests()
         scheduled_requests.reset_context_requests(scheduled_context_requests)
-        scheduled_requests.generation_requests = scheduled_generation_requests
+        scheduled_requests.generation_requests = scheduler_output.generation_requests
         scheduled_requests.paused_requests = scheduler_output.paused_requests
 
         return scheduled_requests, scheduler_output.fitting_disagg_gen_init_requests, num_fitting
@@ -4326,30 +3911,11 @@ class PyExecutor:
             # Run model forward on the execution stream for proper synchronization
             # with KVCacheTransferManager's onboard/offload operations.
             self.execution_stream.wait_stream(torch.cuda.current_stream())
-            # Read previous iteration's elapsed forward time before reusing
-            # those events. ``query()`` is non-blocking; if the event hasn't
-            # completed (ie first iter / pp pipeline pre-warmup) we skip.
-            prev_idx = (self._fwd_timing_idx - 1) % 2
-            prev_start, prev_end = self._fwd_timing_events[prev_idx]
-            try:
-                if self._fwd_timing_idx > 0 and prev_start.query(
-                ) and prev_end.query():
-                    self._last_iter_gpu_forward_ms = float(
-                        prev_start.elapsed_time(prev_end))
-            except Exception:
-                pass
-            cur_start, cur_end = self._fwd_timing_events[self._fwd_timing_idx %
-                                                         2]
-            self._fwd_timing_idx += 1
-            self._last_iter_forward_start_cpu = time.time()
             with torch.cuda.stream(self.execution_stream):
-                cur_start.record(self.execution_stream)
                 outputs = forward(scheduled_requests, self.resource_manager,
                                   new_tensors_device, gather_context_logits,
                                   cache_indirection_buffer,
                                   num_accepted_tokens_device)
-                cur_end.record(self.execution_stream)
-            self._last_iter_forward_end_cpu = time.time()
 
             # Ensure the default stream waits for execution_stream to complete
             # before downstream operations use the outputs.

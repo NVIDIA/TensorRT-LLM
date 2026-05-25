@@ -107,9 +107,7 @@ def Field(default: Any = ...,
 
 
 class CudaGraphConfig(StrictBaseModel):
-    """
-    Configuration for CUDA graphs.
-    """
+    """Configuration for CUDA graphs."""
     # List of batch sizes to create CUDA graphs for.
     batch_sizes: Optional[List[int]] = Field(
         default=None,
@@ -253,9 +251,7 @@ class GuidedDecodingConfig(StrictBaseModel):
 
 
 class BaseSparseAttentionConfig(StrictBaseModel):
-    """
-    Configuration for sparse attention.
-    """
+    """Configuration for sparse attention."""
     algorithm: str
 
     seq_len_threshold: Optional[int] = Field(
@@ -285,9 +281,7 @@ class BaseSparseAttentionConfig(StrictBaseModel):
 
 
 class RocketSparseAttentionConfig(BaseSparseAttentionConfig):
-    """
-    Configuration for RocketKV sparse attention.
-    """
+    """Configuration for RocketKV sparse attention."""
     algorithm: Literal["rocket"] = "rocket"
     window_size: Optional[int] = Field(
         default=32, description="The window size for RocketKV.")
@@ -312,9 +306,7 @@ class RocketSparseAttentionConfig(BaseSparseAttentionConfig):
 
 
 class DeepSeekSparseAttentionConfig(BaseSparseAttentionConfig):
-    """
-    Configuration for DeepSeek Sparse Attention.
-    """
+    """Configuration for DeepSeek Sparse Attention."""
     algorithm: Literal["dsa"] = "dsa"
     index_n_heads: Optional[int] = Field(
         default=None, description="The number of heads for the indexer.")
@@ -405,9 +397,7 @@ class DeepSeekSparseAttentionConfig(BaseSparseAttentionConfig):
 
 
 class SkipSoftmaxAttentionConfig(BaseSparseAttentionConfig):
-    """
-    Configuration for skip softmax attention.
-    """
+    """Configuration for skip softmax attention."""
     algorithm: Literal["skip_softmax"] = "skip_softmax"
     threshold_scale_factor: Optional[Union[float, Dict[str, float]]] = Field(
         default=None,
@@ -563,9 +553,7 @@ class MoeLoadBalancerConfig(StrictBaseModel):
 
     def get_layer_initial_global_assignments(
             self, layer_idx: int) -> Optional[List[int]]:
-        """
-        Retrieves the initial global assignments for a specific layer.
-        """
+        """Retrieves the initial global assignments for a specific layer."""
         if self.initial_global_assignments is None:
             return None
 
@@ -589,9 +577,7 @@ class MoeLoadBalancerConfig(StrictBaseModel):
 
 
 class MoeConfig(StrictBaseModel):
-    """
-    Configuration for MoE.
-    """
+    """Configuration for MoE."""
     backend: Literal[
         "AUTO", "CUTLASS", "CUTEDSL", "WIDEEP", "TRTLLM", "DEEPGEMM",
         "DENSEGEMM", "VANILLA", "TRITON"] = Field(
@@ -634,9 +620,7 @@ TOKENIZER_ALIASES = {
 
 
 class Nvfp4GemmConfig(StrictBaseModel):
-    """
-    Configuration for NVFP4 GEMM backend selection.
-    """
+    """Configuration for NVFP4 GEMM backend selection."""
     allowed_backends: List[Nvfp4Backend] = Field(
         default_factory=lambda: ['cutlass', 'cublaslt', 'cuda_core'],
         min_length=1,
@@ -647,9 +631,7 @@ class Nvfp4GemmConfig(StrictBaseModel):
 
 
 class AttentionDpConfig(StrictBaseModel):
-    """
-    Configuration for attention DP.
-    """
+    """Configuration for attention DP."""
     enable_balance: bool = Field(default=False,
                                  description="Whether to enable balance.")
     timeout_iters: int = Field(
@@ -708,9 +690,7 @@ class AttentionDpConfig(StrictBaseModel):
 
 
 class CpConfig(StrictBaseModel):
-    """
-    Configuration for context parallelism.
-    """
+    """Configuration for context parallelism."""
     # TODO: given that multiple fields here are only used with specific cp_types, consider
     # making this a Pydantic discriminated union.
     cp_type: CpType = Field(default=CpType.ULYSSES,
@@ -816,9 +796,7 @@ class _ParallelConfig(StrictBaseModel):
 
 
 class CalibConfig(StrictBaseModel):
-    """
-    Calibration configuration.
-    """
+    """Calibration configuration."""
     device: Literal['cuda',
                     'cpu'] = Field(default='cuda',
                                    description="The device to run calibration.")
@@ -1098,9 +1076,7 @@ class KvCacheConnectorConfig(StrictBaseModel):
 
 
 class LayerwiseBenchmarksConfig(StrictBaseModel):
-    """
-    Configuration for layer-wise benchmarks calibration.
-    """
+    """Configuration for layer-wise benchmarks calibration."""
     calibration_mode: Literal["NONE", "MARK", "COLLECT"] = Field(
         default="NONE",
         description=
@@ -1484,9 +1460,7 @@ class UserProvidedDecodingConfig(DecodingBaseConfig):
 
 
 class NGramDecodingConfig(DecodingBaseConfig):
-    """
-    Configuration for NGram drafter speculative decoding.
-    """
+    """Configuration for NGram drafter speculative decoding."""
     decoding_type: Literal["NGram"] = "NGram"
     max_matching_ngram_size: PositiveInt = Field(
         default=2,
@@ -2008,8 +1982,7 @@ class ExecutorMemoryType(StrEnum):
 
 @dataclass
 class _SleepConfigDefaultFactory:
-    """Picklable replacement for ``lambda: default_mode`` in SleepConfig's defaultdict.
-    """
+    """Picklable replacement for ``lambda: default_mode`` in SleepConfig's defaultdict."""
 
     default_mode: Any
 
@@ -2018,8 +1991,7 @@ class _SleepConfigDefaultFactory:
 
 
 class SleepConfig(StrictBaseModel):
-    """Configuration for the LLM sleep/wakeup feature.
-    """
+    """Configuration for the LLM sleep/wakeup feature."""
 
     restore_modes: dict[
         ExecutorMemoryType, Literal["NONE", "MEMSET", "CPU", "PINNED"]
@@ -2263,9 +2235,7 @@ class PybindMirrorMeta(type(PybindMirror)):
 
 
 class PybindMirrorEnumMeta(EnumMeta, PybindMirrorMeta):
-    """
-    Combined metaclass for Enum and PybindMirror.  This is crucial.
-    """
+    """Combined metaclass for Enum and PybindMirror.  This is crucial."""
 
 
 @PybindMirror.mirror_pybind_enum(_BatchingType)
@@ -2369,9 +2339,7 @@ class SchedulerConfig(StrictBaseModel, PybindMirror):
 
 @PybindMirror.mirror_pybind_fields(_PeftCacheConfig)
 class PeftCacheConfig(StrictBaseModel, PybindMirror):
-    """
-    Configuration for the PEFT cache.
-    """
+    """Configuration for the PEFT cache."""
     num_host_module_layer: int = Field(
         default=0,
         description=
@@ -2439,9 +2407,7 @@ class PeftCacheConfig(StrictBaseModel, PybindMirror):
 
 @PybindMirror.mirror_pybind_fields(_LookaheadDecodingConfig)
 class LookaheadDecodingConfig(DecodingBaseConfig, PybindMirror):
-    """
-    Configuration for lookahead speculative decoding.
-    """
+    """Configuration for lookahead speculative decoding."""
 
     decoding_type: Literal["Lookahead"] = "Lookahead"
     max_window_size: PositiveInt = Field(
@@ -2544,9 +2510,7 @@ class ReorderRequestPolicyConfig(StrictBaseModel):
 
 @PybindMirror.mirror_pybind_fields(_KvCacheConfig)
 class KvCacheConfig(StrictBaseModel, PybindMirror):
-    """
-    Configuration for the KV cache.
-    """
+    """Configuration for the KV cache."""
     enable_block_reuse: bool = Field(
         default=True,
         description=
@@ -2678,38 +2642,6 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
         "The maximum utilization of the KV cache for resume. Default is 95%. Only used when using KV cache manager v2 (experimental)."
     )
 
-    # Pure python fields: server-wide defaults that LLM.generate_async applies to
-    # every request whose kv_cache_retention_config is None. Used by the priority-
-    # demotion experiment to give active-session blocks a higher retention priority
-    # than the runtime default (kDefaultRetentionPriority = 35), so that session-end
-    # demotion to 35 creates a two-tier free-queue eviction order.
-    default_retention_priority: Optional[int] = Field(
-        default=None,
-        ge=0,
-        le=100,
-        description=
-        "If set, every request whose `kv_cache_retention_config` is None gets a "
-        "single TokenRangeRetentionConfig(priority=default_retention_priority) "
-        "covering its whole prompt. Overridden by `retention_priority_gradient_*` "
-        "when both are set. Valid range: 0..100 (see KvCacheRetentionConfig).")
-    retention_priority_gradient_start: Optional[int] = Field(
-        default=None,
-        ge=0,
-        le=100,
-        description=
-        "First-block retention priority for the server-wide gradient. Must be set "
-        "together with `retention_priority_gradient_end`. When set, every request "
-        "whose `kv_cache_retention_config` is None gets a per-block gradient from "
-        "`start` (first block) to `end` (last block), linearly interpolated. "
-        "Overrides `default_retention_priority`.")
-    retention_priority_gradient_end: Optional[int] = Field(
-        default=None,
-        ge=0,
-        le=100,
-        description=
-        "Last-block retention priority for the server-wide gradient. See "
-        "`retention_priority_gradient_start`.")
-
     def _to_pybind(self):
         config = _KvCacheConfig(
             enable_block_reuse=self.enable_block_reuse,
@@ -2788,23 +2720,10 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
                 "kv_cache_config.max_util_for_resume must be between 0 and 1")
         return v
 
-    @model_validator(mode='after')
-    def validate_retention_priority_overrides(self) -> 'KvCacheConfig':
-        start = self.retention_priority_gradient_start
-        end = self.retention_priority_gradient_end
-        if (start is None) != (end is None):
-            raise ValueError(
-                "kv_cache_config.retention_priority_gradient_start and "
-                "retention_priority_gradient_end must either both be set or both be None"
-            )
-        return self
-
 
 @PybindMirror.mirror_pybind_fields(_ExtendedRuntimePerfKnobConfig)
 class ExtendedRuntimePerfKnobConfig(StrictBaseModel, PybindMirror):
-    """
-    Configuration for extended runtime performance knobs.
-    """
+    """Configuration for extended runtime performance knobs."""
 
     multi_block_mode: bool = Field(
         default=True, description="Whether to use multi-block mode.")
@@ -2833,9 +2752,7 @@ class ExtendedRuntimePerfKnobConfig(StrictBaseModel, PybindMirror):
 
 @PybindMirror.mirror_pybind_fields(_CacheTransceiverConfig)
 class CacheTransceiverConfig(StrictBaseModel, PybindMirror):
-    """
-    Configuration for the cache transceiver.
-    """
+    """Configuration for the cache transceiver."""
 
     backend: Optional[Literal[
         "DEFAULT", "UCX", "NIXL", "MOONCAKE", "MPI"]] = Field(
@@ -2945,8 +2862,9 @@ class DwdpConfig(StrictBaseModel):
 
 
 class BaseLlmArgs(StrictBaseModel):
-    """
-    Base class for both TorchLlmArgs and TrtLlmArgs. It contains all the arguments that are common to both.
+    """Base class for both TorchLlmArgs and TrtLlmArgs.
+
+    It contains all the arguments that are common to both.
     """
     model_config = ConfigDict(arbitrary_types_allowed=True, extra="forbid")
 
@@ -3462,9 +3380,7 @@ class TrtLlmArgs(BaseLlmArgs):
 
     @model_validator(mode="after")
     def init_build_config(self):
-        """
-        Creating a default BuildConfig if none is provided
-        """
+        """Create a default BuildConfig if none is provided."""
         build_config = getattr(self, "build_config", None)
         if build_config is None:
             kwargs = {}
@@ -3789,9 +3705,7 @@ class SamplerType(StrEnum):
 
 
 class TorchCompileConfig(StrictBaseModel):
-    """
-    Configuration for torch.compile.
-    """
+    """Configuration for torch.compile."""
     enable_fullgraph: bool = Field(
         default=True,
         description="Enable full graph compilation in torch.compile.")
@@ -3934,59 +3848,6 @@ class TorchLlmArgs(BaseLlmArgs):
                                  description="Print iteration logs.",
                                  status="beta")
 
-    kv_monitor_log_period_s: NonNegativeFloat = Field(
-        default=5.0,
-        description=(
-            "Period in seconds at which the pytorch executor emits a "
-            "one-line KV cache + inflight batching summary to the server "
-            "log (throttled from the per-iter stats hook, so it does not "
-            "scale with iter rate). The line carries used/max KV blocks, "
-            "free headroom percent, the current numPausedRequests count "
-            "(non-zero = MAX_UTILIZATION scheduler is already evicting "
-            "in-flight requests due to KV contention), queued/active "
-            "counts, and the running cache hit rate. Set to 0 to disable."),
-        status="prototype")
-
-    iter_state_sample_path: Optional[str] = Field(
-        default=None,
-        description=(
-            "When set, rank 0 of the pytorch executor appends one JSONL "
-            "record per sampled iteration (every "
-            "iter_state_sample_every_iters-th iter) to an in-memory "
-            "buffer, flushed to this file every "
-            "iter_state_drain_period_s seconds. Each record carries "
-            "{iter, t_unix, t_mono, active, max_active, queued, ctx, "
-            "gen, paused, ctx_tokens, kv_used_blk, kv_max_blk, "
-            "tokens_per_blk, iter_latency_ms}. Default None = disabled "
-            "(no overhead, no file is opened). Use for post-hoc "
-            "batch-size-distribution / time-series analysis without "
-            "grepping human-oriented log lines. See ``recipe.md`` §3.2 "
-            "for the canonical methodology and downstream interpretation "
-            "(``(active - paused) * dp_size`` as the global batch proxy)."),
-        status="prototype")
-
-    iter_state_sample_every_iters: PositiveInt = Field(
-        default=100,
-        description=(
-            "Stride between sampled iterations when "
-            "iter_state_sample_path is set. At typical pytorch-executor "
-            "iter rates of 50-200 iter/s, every=100 gives a 0.5-2 Hz "
-            "sample stream (450-1800 records over a 15-min run), "
-            "enough for both distribution and time-series plots while "
-            "adding only a list.append on the hot path. See "
-            "``recipe.md`` §3.2."),
-        status="prototype")
-
-    iter_state_drain_period_s: NonNegativeFloat = Field(
-        default=5.0,
-        description=(
-            "Wall-clock boundary (seconds) at which the in-memory sample "
-            "buffer is flushed to iter_state_sample_path. Matches "
-            "kv_monitor_log_period_s so the two trace-emitters fire on "
-            "similar cadences. 0 = flush on every sample (not "
-            "recommended; defeats buffering). See ``recipe.md`` §3.2."),
-        status="prototype")
-
     batch_wait_timeout_ms: NonNegativeFloat = Field(
         default=0,
         description=
@@ -4005,41 +3866,6 @@ class TorchLlmArgs(BaseLlmArgs):
         le=1,
         description=
         "Token accumulation threshold ratio for batch scheduling optimization. If greater than 0, the scheduler will accumulate requests locally until the total token count reaches batch_wait_max_tokens_ratio * max_num_tokens. This mechanism enhances GPU utilization efficiency by ensuring adequate batch sizes. If 0, disables token-based batching delays.",
-        status="prototype")
-
-    decode_defer_threshold: float = Field(
-        default=0.0,
-        ge=0.0,
-        le=1.0,
-        description=(
-            "Defer the decode batch when fewer than "
-            "decode_defer_threshold * max_batch_size generation requests "
-            "would be scheduled this iteration AND at least one prefill "
-            "request is ready to fill the slot, allowing the decode "
-            "batch to accumulate over the next few iterations before "
-            "execution. Mirrors the existing prefill-deferral knob "
-            "(batch_wait_*) but acts on the inverse phase: prefill is "
-            "executed first, decode waits. Targets agent / tool-using "
-            "workloads where tool-call sleeps leave the in-flight "
-            "decode batch persistently below the concurrency cap, "
-            "starving expert-parallel MoE all-to-all bandwidth (small "
-            "decode batch -> few tokens per all-to-all -> fixed-cost "
-            "communication dominates). 0 = disabled (default; identical "
-            "to current behavior). Typical value 0.5 = defer when "
-            "decode batch would be < half of max_batch_size. See "
-            "``recipe.md`` (workspace root) section 12."),
-        status="prototype")
-
-    max_decode_defer_iters: NonNegativeInt = Field(
-        default=10,
-        description=(
-            "Anti-starvation cap for decode_defer_threshold: after this "
-            "many consecutive iterations of deferring decode the "
-            "scheduler forces decode regardless of batch size. Bounds "
-            "the worst-case TPOT regression to "
-            "max_decode_defer_iters * iter_latency. Ignored when "
-            "decode_defer_threshold == 0. Default 10 (~50-200 ms at "
-            "typical executor iter rates of 50-200 iter/s)."),
         status="prototype")
 
     torch_compile_config: Optional[TorchCompileConfig] = Field(

@@ -1237,10 +1237,7 @@ class OpenAIServer(_VideoRoutesMixin):
                              tracing.extract_trace_headers(raw_request.headers))
 
             scheduling_params = SchedulingParams(
-                agent_hierarchy=request.agent_hierarchy,
-                attention_dp_rank=request.attention_dp_rank,
-                attention_dp_relax=request.attention_dp_relax,
-            )
+                agent_hierarchy=request.agent_hierarchy)
 
             generate_inputs = prompt
             preprocess_fn = getattr(self.generator, "preprocess", None)
@@ -1539,10 +1536,6 @@ class OpenAIServer(_VideoRoutesMixin):
                 else:
                     tokens_prompt = prompt
 
-                scheduling_params = SchedulingParams(
-                    attention_dp_rank=request.attention_dp_rank,
-                    attention_dp_relax=request.attention_dp_relax,
-                )
                 promise = self.generator.generate_async(
                     inputs=tokens_prompt,
                     sampling_params=sampling_params,
@@ -1550,8 +1543,7 @@ class OpenAIServer(_VideoRoutesMixin):
                     streaming=request.stream,
                     lora_request=request.lora_request,
                     disaggregated_params=disaggregated_params,
-                    trace_headers=trace_headers,
-                    scheduling_params=scheduling_params)
+                    trace_headers=trace_headers)
                 asyncio.create_task(
                     self.await_disconnected(raw_request, promise))
                 if not self.postproc_worker_enabled:
@@ -1658,10 +1650,7 @@ class OpenAIServer(_VideoRoutesMixin):
             )
 
             scheduling_params = SchedulingParams(
-                agent_hierarchy=request.agent_hierarchy,
-                attention_dp_rank=request.attention_dp_rank,
-                attention_dp_relax=request.attention_dp_relax,
-            )
+                agent_hierarchy=request.agent_hierarchy)
 
             # Generate
             promise = self.generator.generate_async(

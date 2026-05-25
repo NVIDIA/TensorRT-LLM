@@ -417,31 +417,6 @@ class CompletionRequest(OpenAIBaseModel):
         description=("Parameters for disaggregated serving"),
     )
 
-    attention_dp_rank: Optional[int] = Field(
-        default=None,
-        description=(
-            "When attention DP is enabled, pin this request to the given DP "
-            "rank. The ADP router in the pytorch executor will place the "
-            "request on the specified rank whenever that rank still has "
-            "capacity for one more active request; if not, and "
-            "``attention_dp_relax`` is true (the default), the router falls "
-            "back to its load-balanced placement path, and if "
-            "``attention_dp_relax`` is false, the request is held in the "
-            "waiting queue until the target rank frees a slot. This lets a "
-            "client pre-warm specific ranks (e.g. by pinning a short "
-            "system-prompt prefill to each rank in turn) and have the server "
-            "honour the placement even when the ADP group is otherwise empty."),
-    )
-    attention_dp_relax: Optional[bool] = Field(
-        default=None,
-        description=(
-            "Companion to ``attention_dp_rank``. True (the default when "
-            "``attention_dp_rank`` is set) = if the target rank is full, fall "
-            "back to load-balanced placement; False = strictly pin, let the "
-            "request wait for the target rank. Has no effect when "
-            "``attention_dp_rank`` is not set."),
-    )
-
     # doc: end-completion-extra-params
 
     def to_sampling_params(self,
@@ -822,31 +797,6 @@ class ChatCompletionRequest(OpenAIBaseModel):
 
     agent_hierarchy: Optional[AgentHierarchy] = Field(
         default=None, description="Agent hierarchy ")
-
-    attention_dp_rank: Optional[int] = Field(
-        default=None,
-        description=(
-            "When attention DP is enabled, pin this request to the given DP "
-            "rank. The ADP router in the pytorch executor will place the "
-            "request on the specified rank whenever that rank still has "
-            "capacity for one more active request; if not, and "
-            "``attention_dp_relax`` is true (the default), the router falls "
-            "back to its load-balanced placement path, and if "
-            "``attention_dp_relax`` is false, the request is held in the "
-            "waiting queue until the target rank frees a slot. This lets a "
-            "client pre-warm specific ranks (e.g. by pinning a short "
-            "system-prompt prefill to each rank in turn) and have the server "
-            "honour the placement even when the ADP group is otherwise empty."),
-    )
-    attention_dp_relax: Optional[bool] = Field(
-        default=None,
-        description=(
-            "Companion to ``attention_dp_rank``. True (the default when "
-            "``attention_dp_rank`` is set) = if the target rank is full, fall "
-            "back to load-balanced placement; False = strictly pin, let the "
-            "request wait for the target rank. Has no effect when "
-            "``attention_dp_rank`` is not set."),
-    )
 
     # doc: end-chat-completion-extra-params
 
