@@ -262,7 +262,9 @@ UniqPageLock::~UniqPageLock()
 {
     Page& p = *page();
     assert(gNdebug || (p.cacheLevel == kGpuLevel && !p.scheduledForEviction()));
-    // Merge finish events and set on the page (mirrors Python's merge_events()).
+    // Set readyEvent to the merged finish events of all readers. For committed (read-only)
+    // pages, this means the next reader will wait for prior reads to complete, which is
+    // unnecessary but correct. See the CommittedPage comment in page.h for rationale.
     p.readyEvent = mergeEvents(finishEvents);
 
     // Clear the holder's lock reference.

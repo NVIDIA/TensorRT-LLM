@@ -78,6 +78,17 @@ public:
 
 // ---------------------------------------------------------------------------
 // CommittedPage — page associated with a Block in the radix tree.
+//
+// A committed page is immutable — all access after commit is read-only.
+//
+// We intentionally do not add a separate read event to track read completion.
+// The inherited Slot::readyEvent serves double duty: after commit or migration
+// it represents write completion; after UniqPageLock is destroyed it is set to
+// the merged finish events of all prior readers.  This means a new reader may
+// unnecessarily wait for a prior reader (read-after-read on immutable data),
+// but this is functionally correct, only occurs when the lock is fully released
+// between reuses, and saves one event field per committed page — a worthwhile
+// tradeoff given the potentially huge number of committed pages in the system.
 // ---------------------------------------------------------------------------
 class CommittedPage : public Page
 {
