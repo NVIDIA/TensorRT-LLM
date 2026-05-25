@@ -2541,7 +2541,10 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
     sink_token_length: Optional[int] = Field(
         default=None,
         description=
-        "Number of sink tokens (tokens to always keep in attention window).")
+        "Deprecated and ignored on the PyTorch backend. StreamingLLM is not supported "
+        "by the PyTorch attention kernels — any non-None value has no effect and "
+        "will be silently dropped before reaching the executor.",
+        deprecated=True)
     free_gpu_memory_fraction: Optional[float] = Field(
         default=0.9,
         ge=0,
@@ -2659,7 +2662,6 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
             enable_block_reuse=self.enable_block_reuse,
             max_tokens=self.max_tokens,
             max_attention_window=self.max_attention_window,
-            sink_token_length=self.sink_token_length,
             free_gpu_memory_fraction=self.free_gpu_memory_fraction,
             host_cache_size=self.host_cache_size,
             cross_kv_cache_fraction=self.cross_kv_cache_fraction,

@@ -639,10 +639,6 @@ class KVCacheManager(BaseResourceManager):
             layer_mask=layer_mask,
         )
 
-        sink_token_length = (kv_cache_config.sink_token_length
-                             if kv_cache_config.sink_token_length is not None
-                             else 0)
-
         # Determine if this is VSWA (Variable Sliding Window Attention).
         # The `w > 0` check excludes LinearCacheType.RECURRENT_STATES sentinel
         # values (negative) used by hybrid linear attention models.
@@ -761,7 +757,6 @@ class KVCacheManager(BaseResourceManager):
             max_attention_window_vec=self.max_attention_window_vec,
             blocks_per_window=blocks_per_window,
             tokens_per_block=tokens_per_block,
-            sink_token_length=sink_token_length,
             max_seq_len=self.max_seq_len,
             max_beam_width=max_beam_width,
         )
@@ -794,7 +789,7 @@ class KVCacheManager(BaseResourceManager):
             'max_beam_width': max_beam_width,
             'max_attention_window_vec': self.max_attention_window_vec,
             'dtype': dtype,
-            'sink_token_length': sink_token_length,
+            'sink_token_length': 0,
             'stream': self._stream.cuda_stream,  # Pass to BufferManager
             'max_sequence_length': self.max_seq_len,
             'chunk_size': min(max_num_tokens, self.max_seq_len),
@@ -1375,17 +1370,13 @@ class KVCacheManager(BaseResourceManager):
 
     def get_max_atten_window_upper_bound(self, blocks_in_primary_pool,
                                          tokens_per_block, max_beam_width,
-                                         sink_token_len,
                                          max_seq_len: Optional[int]):
         token_capacity = blocks_in_primary_pool * tokens_per_block
         max_blocks_per_seq = math.floor(token_capacity /
                                         (max_beam_width * tokens_per_block))
         assert max_blocks_per_seq > 0, "Impossible to fit in any sequence in kvCache"
 
-        max_token_num = max_blocks_per_seq * tokens_per_block
-        sink_tokens_in_last_block = sink_token_len % tokens_per_block
-        sink_bubble_len = 0 if sink_tokens_in_last_block == 0 else tokens_per_block - sink_tokens_in_last_block
-        max_atten_window_upper_bound = max_token_num - sink_bubble_len
+        max_atten_window_upper_bound = max_blocks_per_seq * tokens_per_block
         if max_seq_len is not None and max_seq_len > max_atten_window_upper_bound and max_beam_width > 1:
             max_atten_window_upper_bound -= tokens_per_block
         assert max_atten_window_upper_bound > 0, "Impossible to fit in any sequence in kvCache"
@@ -1990,7 +1981,6 @@ class KVCacheManager(BaseResourceManager):
         max_attention_window_vec: List[int],
         blocks_per_window: BlocksPerWindow,
         tokens_per_block: int,
-        sink_token_length: int,
         max_seq_len: int,
         max_beam_width: int,
     ) -> Tuple[BlocksPerWindow, int, List[int]]:
@@ -2002,7 +1992,6 @@ class KVCacheManager(BaseResourceManager):
             max_attention_window_vec: List of attention window sizes
             blocks_per_window: Dict mapping window size to (primary_blocks, secondary_blocks)
             tokens_per_block: Number of tokens per block
-            sink_token_length: Length of sink tokens
             max_seq_len: Maximum sequence length
 
         Returns:
@@ -2018,7 +2007,6 @@ class KVCacheManager(BaseResourceManager):
                 blocks_in_primary_pool=blocks_in_primary_pool,
                 tokens_per_block=tokens_per_block,
                 max_beam_width=max_beam_width,
-                sink_token_len=sink_token_length,
                 max_seq_len=max_seq_len)
             if window_size > upper_bound:
                 logger.warning(
