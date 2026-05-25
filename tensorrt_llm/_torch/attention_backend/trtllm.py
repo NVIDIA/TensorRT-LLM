@@ -21,6 +21,8 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
+import triton
+import triton.language as tl
 
 if TYPE_CHECKING:
     from ..speculative.interface import SpecMetadata
@@ -29,8 +31,11 @@ if TYPE_CHECKING:
 from tensorrt_llm._torch.attention_backend.fmha import (
     Fmha, get_enabled_fmha_lib_classes)
 from tensorrt_llm._utils import get_sm_version, maybe_pin_memory, prefer_pinned
+from tensorrt_llm.bindings import DataType
 from tensorrt_llm.bindings.internal import thop
 from tensorrt_llm.functional import AttentionMaskType
+from tensorrt_llm.llmapi import SkipSoftmaxAttentionConfig
+from tensorrt_llm.logger import logger
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
 from ..utils import (compute_swizzled_sf_shape, get_global_attrs,
@@ -42,6 +47,11 @@ from .interface import (AttentionBackend, AttentionForwardArgs,
                         merge_attention_forward_args)
 from .sparse.params import SparseParams
 from .sparse.skip_softmax import SkipSoftmaxParams
+
+# Circular buffer size for the high-precision BF16 KV pool (MLA FP4 models).
+# Each sequence slot holds HP_BLOCK_SIZE token vectors; token at absolute
+# position t maps to buffer slot t % HP_BLOCK_SIZE.
+HP_BLOCK_SIZE: int = 16
 
 
 @functools.cache
@@ -145,6 +155,24 @@ class TrtllmAttentionMetadata(AttentionMetadata):
     kv_cache_block_offsets: Optional[torch.Tensor] = None
     host_kv_cache_block_offsets: Optional[torch.Tensor] = None
     draft_kv_cache_block_offsets: Optional[torch.Tensor] = None
+
+    # Per-request seq_slot from SeqSlotManager (stable across steps).
+    # GPU tensor with stable address for CUDA graph compatibility.
+    # Shape: [max_num_sequences], int32. Values copied each step.
+    seq_slots: Optional[torch.Tensor] = None
+    seq_slots_cpu: Optional[torch.Tensor] = None
+
+    # True during warmup forward passes (dummy requests, no real data).
+    is_warmup: bool = False
+
+    # High-precision BF16 KV pool for MLA FP4 models, indexed by seq_slot.
+    # Shape: [max_num_sequences, num_local_layers, kv_factor, HP_BLOCK_SIZE * head_dim]
+    # Standalone tensor — not part of the block-based paged KV cache.
+    high_precision_kv_pool: Optional[torch.Tensor] = None
+    # Ownership tracking: maps seq_slot → request_id that last wrote it.
+    # Plain Python dict, updated during context phase, checked during decode.
+    # Debug only — runs outside CUDA graph.
+    hp_pool_owners: Optional[dict] = None
 
     # Pre-computed FlashMLA tile-scheduler metadata and num_splits.
     # Computed once per forward pass in TrtllmAttention.forward() and reused across layers.
@@ -418,6 +446,45 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                     device='cpu',
                     pin_memory=prefer_pinned(),
                 )
+
+        # Allocate high-precision BF16 KV pool for MLA FP4 models.
+        # Standalone tensor indexed by seq_slot, not part of block-based paged KV cache.
+        # Each sequence gets a circular buffer of HP_BLOCK_SIZE=16 recent tokens at BF16.
+        if (self.kv_cache_manager is not None
+                and self.kv_cache_manager.kv_factor == 1
+                and self.kv_cache_manager.dtype == DataType.NVFP4):
+
+            self.seq_slots = self.get_empty(
+                buffers,
+                (self.max_num_sequences, ),
+                cache_name="seq_slots",
+                dtype=torch.int32,
+                capture_graph=capture_graph,
+            )
+            self.seq_slots_cpu = torch.empty(
+                self.max_num_sequences,
+                dtype=torch.int32,
+                device='cpu',
+                pin_memory=prefer_pinned(),
+            )
+            self.hp_pool_owners = {}
+            num_local_layers = self.kv_cache_manager.num_local_layers
+            head_dim = self.kv_cache_manager.head_dim
+            kv_factor = self.kv_cache_manager.kv_factor
+            self.high_precision_kv_pool = self.get_empty(
+                buffers,
+                [
+                    self.max_num_sequences, num_local_layers, kv_factor,
+                    HP_BLOCK_SIZE * head_dim
+                ],
+                cache_name="high_precision_kv_pool",
+                dtype=torch.bfloat16,
+                capture_graph=capture_graph,
+            )
+            logger.info(
+                f"Allocated high-precision BF16 KV pool: shape="
+                f"{list(self.high_precision_kv_pool.shape)}, "
+                f"size={self.high_precision_kv_pool.nbytes / (1 << 20):.1f} MB")
 
         # Allocate static buffers for helix parallelism support.
         if self.enable_helix:
@@ -1116,6 +1183,106 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         return not (sm < 100 or sm in [120, 121])
 
 
+# ---------------------------------------------------------------------------
+# Triton kernels for storing latent cache into the high-precision KV pool
+# ---------------------------------------------------------------------------
+
+
+@triton.jit
+def _hp_kv_store_context_kernel(
+        pool_ptr,
+        latent_cache_ptr,
+        seq_slots_ptr,  # int32 [num_contexts] – seq_slot for each ctx seq
+        kv_lens_ptr,  # int32 [num_contexts] – total KV length after prefill
+        token_offsets_ptr,  # int32 [num_contexts] – excl. prefix-sum of prompt_lens
+        prompt_lens_ptr,  # int32 [num_contexts] – number of new tokens per ctx seq
+        layer_idx,
+        pool_stride_seq,  # pool.stride(0): elements between adjacent seq slots
+        pool_stride_layer,  # pool.stride(1): elements between adjacent layers
+        lc_stride,  # latent_cache.stride(0): elements between adjacent tokens
+        D: tl.constexpr,
+        BLOCK_D: tl.constexpr,
+        HP_BLOCK: tl.constexpr,  # = HP_BLOCK_SIZE (16)
+):
+    """Store the tail tokens of each context sequence into the HP KV pool.
+
+    Grid: (num_contexts, HP_BLOCK_SIZE).
+    Only programs where buf_pos < kv_len % HP_BLOCK actually write.
+
+    For a context sequence with total KV length L = num_cached + prompt_len:
+      - remainder = L % HP_BLOCK
+      - The last `remainder` new tokens (latent_cache positions
+        [offset + prompt_len - remainder, offset + prompt_len)) are stored
+        into pool slots [0, remainder), which correspond to the absolute token
+        positions [L - remainder, L) in the circular buffer.
+    """
+    ctx_idx = tl.program_id(0)
+    buf_pos = tl.program_id(1)
+
+    kv_len = tl.load(kv_lens_ptr + ctx_idx)
+    remainder = kv_len % HP_BLOCK
+    if buf_pos >= remainder:
+        return
+
+    seq_slot = tl.load(seq_slots_ptr + ctx_idx)
+    prompt_len = tl.load(prompt_lens_ptr + ctx_idx)
+    tok_offset = tl.load(token_offsets_ptr + ctx_idx)
+
+    # Index of this token within latent_cache: last `remainder` new tokens,
+    # buf_pos-th of them (0-indexed from the start of the tail).
+    token_idx = tok_offset + prompt_len - remainder + buf_pos
+
+    offs_d = tl.arange(0, BLOCK_D)
+    mask_d = offs_d < D
+    src = tl.load(latent_cache_ptr + token_idx * lc_stride + offs_d,
+                  mask=mask_d,
+                  other=0.0)
+
+    # Destination: pool[seq_slot, layer_idx, 0, buf_pos * D : (buf_pos+1) * D]
+    dst_base = (seq_slot * pool_stride_seq + layer_idx * pool_stride_layer +
+                buf_pos * D)
+    tl.store(pool_ptr + dst_base + offs_d, src, mask=mask_d)
+
+
+@triton.jit
+def _hp_kv_store_gen_kernel(
+    pool_ptr,
+    latent_cache_ptr,
+    seq_slots_ptr,  # int32 [num_gen] – seq_slot for each gen seq
+    kv_lens_ptr,  # int32 [num_gen] – total KV length after this decode step
+    gen_tok_start,  # int – offset in latent_cache where gen tokens begin
+    layer_idx,
+    pool_stride_seq,
+    pool_stride_layer,
+    lc_stride,
+    D: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+    HP_BLOCK: tl.constexpr,
+):
+    """Store the current generation token into the HP KV pool.
+
+    Grid: (num_gen_seqs,).
+    Each program stores one token into the circular buffer position
+    (kv_len - 1) % HP_BLOCK, overwriting the oldest entry.
+    """
+    gen_idx = tl.program_id(0)
+
+    seq_slot = tl.load(seq_slots_ptr + gen_idx)
+    kv_len = tl.load(kv_lens_ptr + gen_idx)
+    buf_pos = (kv_len - 1) % HP_BLOCK
+
+    token_idx = gen_tok_start + gen_idx
+    offs_d = tl.arange(0, BLOCK_D)
+    mask_d = offs_d < D
+    src = tl.load(latent_cache_ptr + token_idx * lc_stride + offs_d,
+                  mask=mask_d,
+                  other=0.0)
+
+    dst_base = (seq_slot * pool_stride_seq + layer_idx * pool_stride_layer +
+                buf_pos * D)
+    tl.store(pool_ptr + dst_base + offs_d, src, mask=mask_d)
+
+
 class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
 
     Metadata = TrtllmAttentionMetadata
@@ -1421,6 +1588,92 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             if fmha_cls.is_available(self):
                 self.fmha_libs.append(fmha_cls(self))
 
+    def _update_high_precision_kv_for_fp4_mla(
+        self,
+        metadata: TrtllmAttentionMetadata,
+        latent_cache: Optional[torch.Tensor],
+    ) -> None:
+        """Store recent KV tokens at BF16 into the high-precision pool."""
+        if metadata.hp_pool_owners is None:
+            return
+        num_contexts = metadata.num_contexts
+        num_seqs = metadata.num_seqs
+        local_layer = self.get_local_layer_idx(metadata)
+
+        if local_layer == 0 and not metadata.is_cuda_graph and not metadata.is_warmup:
+            for batch_idx in range(num_contexts):
+                seq_slot = metadata.seq_slots_cpu[batch_idx].item()
+                request_id = metadata.request_ids[batch_idx]
+                metadata.hp_pool_owners[seq_slot] = request_id
+
+            for batch_idx in range(num_contexts, num_seqs):
+                seq_slot = metadata.seq_slots_cpu[batch_idx].item()
+                request_id = metadata.request_ids[batch_idx]
+                owner = metadata.hp_pool_owners.get(seq_slot)
+                if owner != request_id:
+                    raise RuntimeError(
+                        f"HP KV pool ownership mismatch: seq_slot={seq_slot} "
+                        f"is owned by request {owner} but request "
+                        f"{request_id} is attempting to use it")
+
+        if latent_cache is None:
+            return
+
+        pool = metadata.high_precision_kv_pool
+        head_dim = latent_cache.shape[-1]
+        block_d = triton.next_power_of_2(head_dim)
+        pool_s0 = pool.stride(0)
+        pool_s1 = pool.stride(1)
+        lc_stride = latent_cache.stride(0)
+
+        if num_contexts > 0:
+            prompt_lens_cpu = metadata.prompt_lens_cpu_runtime[:num_contexts]
+            token_offsets_cpu = torch.zeros(num_contexts,
+                                            dtype=torch.int32,
+                                            device='cpu')
+            if num_contexts > 1:
+                token_offsets_cpu[1:].copy_(
+                    torch.cumsum(prompt_lens_cpu[:-1].to(torch.int32), dim=0))
+            token_offsets_gpu = token_offsets_cpu.to(pool.device,
+                                                     non_blocking=False)
+            prompt_lens_gpu = metadata.prompt_lens_cuda_runtime[:num_contexts]
+
+            _hp_kv_store_context_kernel[(num_contexts, HP_BLOCK_SIZE)](
+                pool,
+                latent_cache,
+                metadata.seq_slots,
+                metadata.kv_lens_cuda_runtime,
+                token_offsets_gpu,
+                prompt_lens_gpu,
+                local_layer,
+                pool_s0,
+                pool_s1,
+                lc_stride,
+                D=head_dim,
+                BLOCK_D=block_d,
+                HP_BLOCK=HP_BLOCK_SIZE,
+            )
+
+        num_gen = num_seqs - num_contexts
+        if num_gen > 0:
+            ctx_tok_count = int(
+                metadata.prompt_lens_cpu_runtime[:num_contexts].sum().item())
+
+            _hp_kv_store_gen_kernel[(num_gen, )](
+                pool,
+                latent_cache,
+                metadata.seq_slots[num_contexts:],
+                metadata.kv_lens_cuda_runtime[num_contexts:],
+                ctx_tok_count,
+                local_layer,
+                pool_s0,
+                pool_s1,
+                lc_stride,
+                D=head_dim,
+                BLOCK_D=block_d,
+                HP_BLOCK=HP_BLOCK_SIZE,
+            )
+
     def forward(
         self,
         q: torch.Tensor,
@@ -1637,6 +1890,10 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             assert metadata.num_generations == 0
             assert metadata.kv_cache_manager is None
             assert metadata.num_contexts == metadata.num_seqs
+
+        if metadata.high_precision_kv_pool is not None and self.is_mla_enable:
+            self._update_high_precision_kv_for_fp4_mla(
+                metadata, forward_args.latent_cache)
 
         if not self.fmha_libs:
             self.create_fmha_libs()
