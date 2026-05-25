@@ -3028,99 +3028,6 @@ if IS_CUTLASS_DSL_AVAILABLE:
             return c, c_sf
 
     @torch.library.custom_op(
-        "trtllm::cute_dsl_nvfp4_gather_grouped_gemm_act_fusion_blackwell_multi_b",
-        mutates_args=(),
-        device_types="cuda")
-    def cute_dsl_nvfp4_gather_grouped_gemm_act_fusion_blackwell_multi_b(
-        input: torch.Tensor,
-        weight: List[torch.Tensor],
-        input_scale: torch.Tensor,
-        weight_scale: List[torch.Tensor],
-        alpha: List[torch.Tensor],
-        tile_idx_to_group_idx: torch.Tensor,
-        tile_idx_to_mn_limit: torch.Tensor,
-        permuted_idx_to_expanded_idx: torch.Tensor,
-        num_non_exiting_tiles: torch.Tensor,
-        global_sf: torch.Tensor,
-        num_experts: int,
-        top_k: int,
-        num_local_experts: int,
-        local_expert_offset: int,
-        tile_size: int,
-        scaling_vector_size: int = 16,
-        activation_type: int = int(ActivationType.Swiglu),
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """CuteDSL-based NVFP4 gather grouped GEMM with activation fusion (multi-B list interface).
-
-        Supports ``ActivationType.Swiglu`` (gated) and ``ActivationType.Relu2``
-        (non-gated) epilogues; other ``ActivationType`` values raise an assertion.
-
-        Args:
-            weight: List of B tensors. Single-B mode: [b], multi-B mode: [b0, b1, ...].
-            weight_scale: List of scale tensors, matching weight.
-            alpha: List of alpha tensors, matching weight.
-            activation_type: ``ActivationType`` value selecting the fused activation.
-        """
-        tuner = AutoTuner.get()
-
-        b_tensor_l_sizes = tuple(w.size(0) for w in weight)
-
-        runner = Sm100BlockScaledContiguousGatherGroupedGemmActFusionRunner(
-            num_experts, top_k, num_local_experts, local_expert_offset,
-            tile_size, scaling_vector_size, b_tensor_l_sizes, activation_type)
-        inputs = [
-            input, weight, input_scale, weight_scale, alpha,
-            tile_idx_to_group_idx, tile_idx_to_mn_limit,
-            permuted_idx_to_expanded_idx, num_non_exiting_tiles, global_sf
-        ]
-
-        _, best_tactic = tuner.choose_one(
-            "trtllm::cute_dsl_nvfp4_gather_grouped_gemm_act_fusion_blackwell_multi_b",
-            [runner],
-            runner.get_tuning_config(),
-            inputs,
-        )
-
-        # Call forward with inputs list
-        output = runner.forward(inputs, tactic=best_tactic)
-        return output
-
-    @torch.library.register_fake(
-        "trtllm::cute_dsl_nvfp4_gather_grouped_gemm_act_fusion_blackwell_multi_b"
-    )
-    def _fake_multi_b(
-        input: torch.Tensor,
-        weight: List[torch.Tensor],
-        input_scale: torch.Tensor,
-        weight_scale: List[torch.Tensor],
-        alpha: List[torch.Tensor],
-        tile_idx_to_group_idx: torch.Tensor,
-        tile_idx_to_mn_limit: torch.Tensor,
-        permuted_idx_to_expanded_idx: torch.Tensor,
-        num_non_exiting_tiles: torch.Tensor,
-        global_sf: torch.Tensor,
-        num_experts: int,
-        top_k: int,
-        num_local_experts: int,
-        local_expert_offset: int,
-        tile_size: int,
-        scaling_vector_size: int = 16,
-        activation_type: int = int(ActivationType.Swiglu),
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        m = permuted_idx_to_expanded_idx.size(0)
-        n = weight[0].size(1)
-        is_gated = is_gated_activation(ActivationType(activation_type))
-        interm_size = n // 2 if is_gated else n
-        output = torch.empty(m,
-                             interm_size // 2,
-                             dtype=input.dtype,
-                             device=input.device)
-        output_scale = torch.empty(m * interm_size // scaling_vector_size,
-                                   dtype=input_scale.dtype,
-                                   device=input_scale.device)
-        return output, output_scale
-
-    @torch.library.custom_op(
         "trtllm::cute_dsl_nvfp4_gather_grouped_gemm_act_fusion_blackwell",
         mutates_args=(),
         device_types="cuda")
@@ -3143,31 +3050,35 @@ if IS_CUTLASS_DSL_AVAILABLE:
         scaling_vector_size: int = 16,
         activation_type: int = int(ActivationType.Swiglu),
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """CuteDSL-based NVFP4 gather grouped GEMM with activation fusion (single-B tensor interface).
+        """CuteDSL-based NVFP4 gather grouped GEMM with activation fusion.
 
-        Thin wrapper: wraps single tensors into lists and calls
-        cute_dsl_nvfp4_gather_grouped_gemm_act_fusion_blackwell_multi_b.
-        ``activation_type`` must be ``ActivationType.Swiglu`` or ``ActivationType.Relu2``.
+        Supports ``ActivationType.Swiglu`` (gated) and ``ActivationType.Relu2``
+        (non-gated) epilogues; other ``ActivationType`` values raise an
+        assertion in the runner.
         """
-        return torch.ops.trtllm.cute_dsl_nvfp4_gather_grouped_gemm_act_fusion_blackwell_multi_b(
-            input,
-            [weight],
-            input_scale,
-            [weight_scale],
-            [alpha],
-            tile_idx_to_group_idx,
-            tile_idx_to_mn_limit,
-            permuted_idx_to_expanded_idx,
-            num_non_exiting_tiles,
-            global_sf,
-            num_experts,
-            top_k,
-            num_local_experts,
-            local_expert_offset,
-            tile_size,
-            scaling_vector_size,
-            activation_type,
+        tuner = AutoTuner.get()
+
+        runner = Sm100BlockScaledContiguousGatherGroupedGemmActFusionRunner(
+            num_experts, top_k, num_local_experts, local_expert_offset,
+            tile_size, scaling_vector_size,
+            activation_type=activation_type)
+        # Internal runner / helper still expect list-form for weight, weight_scale,
+        # alpha; wrap the single tensors in single-element lists. The deeper
+        # bare-tensor revert lives in the runner-class cleanup (Phase 2).
+        inputs = [
+            input, [weight], input_scale, [weight_scale], [alpha],
+            tile_idx_to_group_idx, tile_idx_to_mn_limit,
+            permuted_idx_to_expanded_idx, num_non_exiting_tiles, global_sf
+        ]
+
+        _, best_tactic = tuner.choose_one(
+            "trtllm::cute_dsl_nvfp4_gather_grouped_gemm_act_fusion_blackwell",
+            [runner],
+            runner.get_tuning_config(),
+            inputs,
         )
+        output = runner.forward(inputs, tactic=best_tactic)
+        return output
 
     @torch.library.register_fake(
         "trtllm::cute_dsl_nvfp4_gather_grouped_gemm_act_fusion_blackwell")
