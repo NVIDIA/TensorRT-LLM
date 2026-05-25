@@ -213,8 +213,8 @@ public:
         , mGuidedDecodingParams(std::move(guidedDecodingParams))
         , mLanguageAdapterUid(languageAdapterUid)
         , mAllottedTimeMs(allottedTimeMs)
-        , mAgentHierarchy(std::move(agent_hierarchy))
         , mCacheSalt(std::move(cacheSalt))
+        , mAgentHierarchy(std::move(agent_hierarchy))
     {
         if (mEncoderTokens.has_value() || encoderInputFeatures.has_value())
         {
