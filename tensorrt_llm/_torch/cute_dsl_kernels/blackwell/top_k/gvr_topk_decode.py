@@ -158,7 +158,9 @@ class GvrTopKKernel:
         num_threads: int = BLOCK_SIZE,
         enable_unroll_4: Optional[bool] = None,
         enable_unroll_2: Optional[bool] = None,
+        enable_phase3_unroll: Optional[bool] = None,
         use_strided_layout: bool = True,
+        use_constant_hint: bool = False,
     ):
         # cutlass.Numeric enum: cutlass.Float32 / cutlass.BFloat16 / cutlass.Float16
         self.dtype = dtype
@@ -166,21 +168,34 @@ class GvrTopKKernel:
         self.next_n = next_n
         self.num_threads = num_threads
         self.num_warps = num_threads // WARP_SIZE
-        # Vec-loop unrolling switches for block_count_ge.
-        #   * enable_unroll_4: 4-way unrolled fast path (4 LDG.E.128 in flight)
-        #   * enable_unroll_2: 2-way unrolled medium path (2 LDG.E.128 in flight)
+        # Vec-loop unrolling switches.
+        #   * enable_unroll_4: 4-way fast path in block_count_ge (4 LDG.E.128
+        #     in flight). Controls block_count_ge's fast path only.
+        #   * enable_unroll_2: 2-way medium path in block_count_ge AND
+        #     phase3_collect (cascade between fast and tail).
+        #   * enable_phase3_unroll: 4-way fast path in phase3_collect only.
+        #     Independent of enable_unroll_4 because the perf trade-offs
+        #     differ — phase3 has thread-local wc state and smem writes,
+        #     making fast-path more expensive at large grid.
         #   * use_strided_layout: True → single make_ptr + (UNROLL, vec_w)
         #       strided layout (cute emits shared base + imm offsets); False →
         #       UNROLL separate make_ptr calls (cute emits 4 independent base
-        #       regs, matches the b459a8ff2 commit style). A/B knob to isolate
-        #       whether strided causes fp32 large-grid regressions.
+        #       regs, matches the b459a8ff2 commit style).
+        #   * use_constant_hint: True → CopyG2ROp(invariant=True) → emits
+        #       SASS LDG.E.*.CONSTANT (read-only data cache, matches CUDA
+        #       __ldg path). False → CopyUniversalOp → plain LDG.E.* (no
+        #       .CONSTANT modifier).
         if enable_unroll_4 is None:
             enable_unroll_4 = True
         if enable_unroll_2 is None:
             enable_unroll_2 = dtype != cutlass.Float32
+        if enable_phase3_unroll is None:
+            enable_phase3_unroll = True
         self.enable_unroll_4 = enable_unroll_4
         self.enable_unroll_2 = enable_unroll_2
+        self.enable_phase3_unroll = enable_phase3_unroll
         self.use_strided_layout = use_strided_layout
+        self.use_constant_hint = use_constant_hint
 
         # Map cutlass dtype → GvrParams lookup name
         if dtype == cutlass.Float32:
@@ -196,6 +211,27 @@ class GvrTopKKernel:
         self.kC = params.kC
         self.kNumBins = params.kNumBins
         self.kFTarget = params.kFTarget
+
+    # ------------------------------------------------------------------
+    # Build a 128-bit copy atom for the input scan loops. With
+    # use_constant_hint=True we use CopyG2ROp+invariant to get
+    # LDG.E.*.CONSTANT (read-only cache, matches CUDA __ldg). Defined as
+    # a plain Python method (not @cute.jit) so the if-else branches both
+    # bind copy_atom in the same trace scope.
+    # ------------------------------------------------------------------
+    def _make_load_copy_atom(self):
+        if self.use_constant_hint:
+            return cute.make_copy_atom(
+                cute.nvgpu.CopyG2ROp(),
+                self.dtype,
+                num_bits_per_copy=128,
+                invariant=True,
+            )
+        return cute.make_copy_atom(
+            cute.nvgpu.CopyUniversalOp(),
+            self.dtype,
+            num_bits_per_copy=128,
+        )
 
     # ------------------------------------------------------------------
     # Input load helper — casts to fp32 regardless of input dtype.
@@ -391,12 +427,10 @@ class GvrTopKKernel:
         elem_bytes = cutlass.const_expr(self.dtype.width // 8)
         c = cutlass.Int32(0)
 
-        # Vectorized main loop using cute.copy.
-        copy_atom = cute.make_copy_atom(
-            cute.nvgpu.CopyUniversalOp(),
-            self.dtype,
-            num_bits_per_copy=cutlass.const_expr(128),
-        )
+        # Vectorized main loop using cute.copy. use_constant_hint=True
+        # switches to CopyG2ROp+invariant which emits SASS LDG.E.*.CONSTANT
+        # (read-only data cache, matches CUDA __ldg).
+        copy_atom = self._make_load_copy_atom()
 
         # 4-way unrolled fast path: issue 4 independent LDG.E.128 per round
         # to engage LSU pipelining. Mirrors nvcc/ptxas auto-partial-unroll
@@ -832,6 +866,7 @@ class GvrTopKKernel:
             smem_wcnt[warp_id] = warp_total
         cute.arch.barrier()
 
+        # TODO: let multiple threads do this.
         # ---- Block prefix sum (tid==0 over NUM_WARPS warp totals) ----
         if tidx == 0:
             total = cutlass.Int32(0)
@@ -848,23 +883,136 @@ class GvrTopKKernel:
         my_write_pos = my_base + my_excl_offset
 
         # ---- Stream-write loop ----
-        # 4-element unrolled main loop + scalar tail.
+        # 3-tier cascade mirroring block_count_ge: 4-way unrolled fast path
+        # → 2-way medium → 1-way tail → scalar tail. Each conditional write
+        # advances thread-local wc; LDGs themselves are independent and
+        # cute can pipeline them. Switches gate via self.* (set in __init__).
         thr_final = s_thr[0]
-        # Vectorized main loop using cute.copy (128-bit per thread per iter).
         vec_w_p3 = cutlass.const_expr(128 // self.dtype.width)
         elem_bytes_p3 = cutlass.const_expr(self.dtype.width // 8)
-        copy_atom_p3 = cute.make_copy_atom(
-            cute.nvgpu.CopyUniversalOp(),
-            self.dtype,
-            num_bits_per_copy=cutlass.const_expr(128),
-        )
-        frag_p3 = cute.make_fragment((vec_w_p3,), self.dtype)
+        # use_constant_hint=True → LDG.E.*.CONSTANT (same as block_count_ge).
+        copy_atom_p3 = self._make_load_copy_atom()
         row_addr_p3 = input_row.iterator.toint()
+        step_elem_p3 = cutlass.const_expr(num_threads * vec_w_p3)
+        UNROLL = 4
+        UNROLL_MID = 2
 
         n_aligned = (N // cutlass.Int32(vec_w_p3)) * cutlass.Int32(vec_w_p3)
         wc = my_write_pos
         ic2 = tidx * cutlass.Int32(vec_w_p3)
-        step = cutlass.Int32(num_threads * vec_w_p3)
+        step = cutlass.Int32(step_elem_p3)
+
+        # Phase3 unrolling: master gated by self.enable_phase3_unroll.
+        # When OFF, only the tail 1-way loop runs (matches the pre-unroll
+        # state of phase3_collect). When ON, the inner enable_unroll_4 and
+        # enable_unroll_2 switches independently control the 4-way fast
+        # path and 2-way medium path (same semantics as in block_count_ge).
+        if self.enable_phase3_unroll:
+            # Fast path: 4-way unrolled vec loop (4 LDG.E.128 in flight).
+            # See block_count_ge for strided vs separate-ptrs trade-offs.
+            if self.enable_unroll_4:
+                fast_last_offset_p3 = cutlass.const_expr(
+                    (UNROLL - 1) * step_elem_p3 + (vec_w_p3 - 1)
+                )
+                if self.use_strided_layout:
+                    big_layout_p3 = cute.make_layout((UNROLL, vec_w_p3), stride=(step_elem_p3, 1))
+                    big_frag_p3 = cute.make_fragment(big_layout_p3, self.dtype)
+                    while ic2 + cutlass.Int32(fast_last_offset_p3) < N:
+                        big_src_ptr = cute.make_ptr(
+                            self.dtype,
+                            row_addr_p3 + cutlass.Int64(ic2) * cutlass.Int64(elem_bytes_p3),
+                            cute.AddressSpace.gmem,
+                            assumed_align=16,
+                        )
+                        big_src = cute.make_tensor(big_src_ptr, big_layout_p3)
+                        for u in cutlass.range_constexpr(UNROLL):
+                            cute.copy(
+                                copy_atom_p3,
+                                big_src[u, None],
+                                big_frag_p3[u, None],
+                            )
+                        for u in cutlass.range_constexpr(UNROLL):
+                            u_off = cutlass.const_expr(u * step_elem_p3)
+                            for j in cutlass.range_constexpr(vec_w_p3):
+                                if cutlass.const_expr(self.dtype == cutlass.Float32):
+                                    vj_p3 = big_frag_p3[u, j]
+                                else:
+                                    vj_p3 = cutlass.Float32(big_frag_p3[u, j])
+                                if vj_p3 >= thr_final and wc < cutlass.Int32(kCC):
+                                    smem_keys[wc] = vj_p3
+                                    smem_vals[wc] = ic2 + cutlass.Int32(u_off + j)
+                                    wc = wc + cutlass.Int32(1)
+                        ic2 = ic2 + cutlass.Int32(UNROLL * step_elem_p3)
+                else:
+                    # Separate-ptrs path (matches the b459a8ff2 commit style).
+                    frag_a = cute.make_fragment((vec_w_p3,), self.dtype)
+                    frag_b = cute.make_fragment((vec_w_p3,), self.dtype)
+                    frag_c = cute.make_fragment((vec_w_p3,), self.dtype)
+                    frag_d = cute.make_fragment((vec_w_p3,), self.dtype)
+                    frags_sep = (frag_a, frag_b, frag_c, frag_d)
+                    while ic2 + cutlass.Int32(fast_last_offset_p3) < N:
+                        for u in cutlass.range_constexpr(UNROLL):
+                            u_off = cutlass.const_expr(u * step_elem_p3)
+                            src_ptr_u = cute.make_ptr(
+                                self.dtype,
+                                row_addr_p3
+                                + cutlass.Int64(ic2 + cutlass.Int32(u_off))
+                                * cutlass.Int64(elem_bytes_p3),
+                                cute.AddressSpace.gmem,
+                                assumed_align=16,
+                            )
+                            src_u = cute.make_tensor(src_ptr_u, cute.make_layout((vec_w_p3,)))
+                            cute.copy(copy_atom_p3, src_u, frags_sep[u])
+                        for u in cutlass.range_constexpr(UNROLL):
+                            u_off = cutlass.const_expr(u * step_elem_p3)
+                            for j in cutlass.range_constexpr(vec_w_p3):
+                                if cutlass.const_expr(self.dtype == cutlass.Float32):
+                                    vj_p3 = frags_sep[u][j]
+                                else:
+                                    vj_p3 = cutlass.Float32(frags_sep[u][j])
+                                if vj_p3 >= thr_final and wc < cutlass.Int32(kCC):
+                                    smem_keys[wc] = vj_p3
+                                    smem_vals[wc] = ic2 + cutlass.Int32(u_off + j)
+                                    wc = wc + cutlass.Int32(1)
+                        ic2 = ic2 + cutlass.Int32(UNROLL * step_elem_p3)
+
+            # Medium path: 2-way unroll for the remainder when fast-path exits
+            # with [2*step, 4*step) elements left. Runs at most once.
+            if self.enable_unroll_2:
+                mid_layout_p3 = cute.make_layout((UNROLL_MID, vec_w_p3), stride=(step_elem_p3, 1))
+                mid_frag_p3 = cute.make_fragment(mid_layout_p3, self.dtype)
+                mid_last_offset_p3 = cutlass.const_expr(
+                    (UNROLL_MID - 1) * step_elem_p3 + (vec_w_p3 - 1)
+                )
+                while ic2 + cutlass.Int32(mid_last_offset_p3) < N:
+                    mid_src_ptr = cute.make_ptr(
+                        self.dtype,
+                        row_addr_p3 + cutlass.Int64(ic2) * cutlass.Int64(elem_bytes_p3),
+                        cute.AddressSpace.gmem,
+                        assumed_align=16,
+                    )
+                    mid_src = cute.make_tensor(mid_src_ptr, mid_layout_p3)
+                    for u in cutlass.range_constexpr(UNROLL_MID):
+                        cute.copy(
+                            copy_atom_p3,
+                            mid_src[u, None],
+                            mid_frag_p3[u, None],
+                        )
+                    for u in cutlass.range_constexpr(UNROLL_MID):
+                        u_off = cutlass.const_expr(u * step_elem_p3)
+                        for j in cutlass.range_constexpr(vec_w_p3):
+                            if cutlass.const_expr(self.dtype == cutlass.Float32):
+                                vj_p3 = mid_frag_p3[u, j]
+                            else:
+                                vj_p3 = cutlass.Float32(mid_frag_p3[u, j])
+                            if vj_p3 >= thr_final and wc < cutlass.Int32(kCC):
+                                smem_keys[wc] = vj_p3
+                                smem_vals[wc] = ic2 + cutlass.Int32(u_off + j)
+                                wc = wc + cutlass.Int32(1)
+                    ic2 = ic2 + cutlass.Int32(UNROLL_MID * step_elem_p3)
+
+        # Tail vec loop: 1-way, handles remainder < 2*step.
+        tail_frag_p3 = cute.make_fragment((vec_w_p3,), self.dtype)
         while ic2 + cutlass.Int32(vec_w_p3 - 1) < N:
             src_ptr_p3 = cute.make_ptr(
                 self.dtype,
@@ -873,20 +1021,19 @@ class GvrTopKKernel:
                 assumed_align=16,
             )
             src_p3 = cute.make_tensor(src_ptr_p3, cute.make_layout((vec_w_p3,)))
-            cute.copy(copy_atom_p3, src_p3, frag_p3)
+            cute.copy(copy_atom_p3, src_p3, tail_frag_p3)
             for j in cutlass.range_constexpr(vec_w_p3):
                 if cutlass.const_expr(self.dtype == cutlass.Float32):
-                    vj_p3 = frag_p3[j]
+                    vj_p3 = tail_frag_p3[j]
                 else:
-                    # TODO: why cast to float32?
-                    vj_p3 = cutlass.Float32(frag_p3[j])
+                    vj_p3 = cutlass.Float32(tail_frag_p3[j])
                 if vj_p3 >= thr_final and wc < cutlass.Int32(kCC):
                     smem_keys[wc] = vj_p3
                     smem_vals[wc] = ic2 + cutlass.Int32(j)
                     wc = wc + cutlass.Int32(1)
             ic2 = ic2 + step
 
-        # Tail scalar loop
+        # Tail scalar loop (N % vec_w)
         it2 = n_aligned + tidx
         while it2 < N:
             v = self._load_fp32(input_row, it2)
@@ -1552,7 +1699,9 @@ def gvr_topk_decode(
     out_indices: Optional[torch.Tensor] = None,
     enable_unroll_4: Optional[bool] = None,
     enable_unroll_2: Optional[bool] = None,
+    enable_phase3_unroll: Optional[bool] = None,
     use_strided_layout: Optional[bool] = None,
+    use_constant_hint: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """cuTe DSL GVR Top-K, drop-in for ``torch.ops.trtllm.indexer_topk_decode``.
 
@@ -1598,6 +1747,8 @@ def gvr_topk_decode(
         enable_unroll_4 = True
     if enable_unroll_2 is None:
         enable_unroll_2 = cute_dtype != cutlass.Float32
+    if enable_phase3_unroll is None:
+        enable_phase3_unroll = True
     if use_strided_layout is None:
         use_strided_layout = cute_dtype != cutlass.Float32
 
@@ -1610,7 +1761,9 @@ def gvr_topk_decode(
         next_n,
         enable_unroll_4,
         enable_unroll_2,
+        enable_phase3_unroll,
         use_strided_layout,
+        use_constant_hint,
     )
     if key not in _gvr_topk_compile_cache:
         n_rows = cute.sym_int()
@@ -1639,7 +1792,9 @@ def gvr_topk_decode(
             next_n=next_n,
             enable_unroll_4=enable_unroll_4,
             enable_unroll_2=enable_unroll_2,
+            enable_phase3_unroll=enable_phase3_unroll,
             use_strided_layout=use_strided_layout,
+            use_constant_hint=use_constant_hint,
         )
         _gvr_topk_compile_cache[key] = cute.compile(
             kernel,
