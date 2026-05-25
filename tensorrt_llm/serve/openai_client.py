@@ -85,8 +85,12 @@ class OpenAIClient(ABC):
     async def shutdown(self) -> None: ...
 
     @abstractmethod
-    async def _finish_request(self, request: UCompletionRequest) -> None:
-        """Finish the request in the router."""
+    async def _finish_request(self, request: UCompletionRequest, success: bool = True) -> None:
+        """Finish the request in the router.
+
+        ``success`` lets the router distinguish completed vs failed requests
+        (e.g. for cache backfill).
+        """
         ...
 
 
@@ -129,9 +133,10 @@ class OpenAIHttpClient(OpenAIClient):
         if server is None:
             server, _ = await self._router.get_next_server(request)
         url = f"http://{server}/{endpoint}"
-        logger.debug(
-            f"Sending {self._role} request {request.disaggregated_params.ctx_request_id} to {url}"
-        )
+        # disaggregated_params is None when conditional_disagg bypasses ctx.
+        _dp = request.disaggregated_params
+        _ctx_rid = _dp.ctx_request_id if _dp is not None else None
+        logger.debug(f"Sending {self._role} request {_ctx_rid} to {url}")
         try:
             self._metrics_collector.total_requests.inc()
             resp_generator = self._post_with_retry(server, url, request, hooks)
@@ -153,7 +158,7 @@ class OpenAIHttpClient(OpenAIClient):
         except Exception:
             self._metrics_collector.error_requests.inc()
             # finish the request upon error
-            await self._finish_request(request)
+            await self._finish_request(request, success=False)
             raise
 
     async def _post_with_retry(
@@ -246,6 +251,7 @@ class OpenAIHttpClient(OpenAIClient):
         assert "text/event-stream" in http_response.headers.get("Content-Type", ""), (
             "Response is not streaming"
         )
+        success = True
         try:
             last_token_time = start_time
             i = 0
@@ -276,17 +282,19 @@ class OpenAIHttpClient(OpenAIClient):
             # a client error is expected when the response stream is done if the connector has close=True
             logger.error(f"{self._role} client {server} error: {e}")
             self._metrics_collector.error_requests.inc()
+            success = False
             raise
         except Exception:
             self._metrics_collector.error_requests.inc()
+            success = False
             raise
         finally:
             # finish the request after streaming response is done or error is raised
-            await self._finish_request(request)
+            await self._finish_request(request, success=success)
 
-    async def _finish_request(self, request: UCompletionRequest) -> None:
+    async def _finish_request(self, request: UCompletionRequest, success: bool = True) -> None:
         self._metrics_collector.completed_requests.inc()
-        await self._router.finish_request(request, self._session)
+        await self._router.finish_request(request, self._session, success=success)
 
     async def collect_metrics(self) -> Dict[str, Any]:
         metrics = {}

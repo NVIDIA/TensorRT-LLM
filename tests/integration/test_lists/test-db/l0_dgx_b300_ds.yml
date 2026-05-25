@@ -21,6 +21,9 @@ l0_dgx_b300_ds:
   - accuracy/test_disaggregated_serving.py::TestDeepSeekV3Lite::test_kv_cache_v2_nixl_python
   - accuracy/test_disaggregated_serving.py::TestLlama3_1_8BInstruct::test_kv_cache_v2_nixl_python
   - accuracy/test_disaggregated_serving.py::TestGemma3_1BInstruct::test_kv_cache_v2_nixl_python
+  # Gen-first disagg DSV3-Lite MLA diagonal: noadp/mtp0 baseline, adp/mtp2 stress.
+  - accuracy/test_disaggregated_serving.py::TestDeepSeekV3Lite::test_gen_first[noadp-mtp0]
+  - accuracy/test_disaggregated_serving.py::TestDeepSeekV3Lite::test_gen_first[adp-mtp2]
   # ------------- Disaggregated transfer component tests (multi-process) ---------------
   - unittest/disaggregated/test_kv_transfer_mp.py
   # Split test_py_cache_transceiver_mp.py by workflow (4 × 12 = 48 combos).

@@ -95,8 +95,10 @@ accuracy/test_disaggregated_serving.py::TestQwen3_8B::test_auto_dtype_with_helix
 accuracy/test_disaggregated_serving.py::TestQwen3_8B::test_auto_dtype_with_helix[nccl-cudagraph:with_padding-pp1tp2cp2]
 accuracy/test_disaggregated_serving.py::TestQwen3_8B::test_auto_dtype_with_helix[nccl-cudagraph:with_padding-pp2tp1cp2]
 accuracy/test_disaggregated_serving.py::TestQwen3_8B::test_chunked_prefill
-accuracy/test_disaggregated_serving.py::TestQwen3_8B::test_gen_first[noadp-ctx_tp2pp1-gen_tp1pp1]
-accuracy/test_disaggregated_serving.py::TestQwen3_8B::test_gen_first[adp-ctx_tp2pp1-gen_tp2pp1]
+accuracy/test_disaggregated_serving.py::TestQwen3_8B::test_gen_first
+accuracy/test_disaggregated_serving.py::TestQwen3_8B::test_gen_first_kv_cache_v1
+accuracy/test_disaggregated_serving.py::TestDeepSeekV3Lite::test_gen_first[noadp-mtp0]
+accuracy/test_disaggregated_serving.py::TestDeepSeekV3Lite::test_gen_first[adp-mtp2]
 accuracy/test_disaggregated_serving.py::TestQwen3_8B::test_nixl_backend
 accuracy/test_disaggregated_serving.py::TestQwen3NextInstruct::test_auto_dtype[use_py_transceiver=False]
 accuracy/test_disaggregated_serving.py::TestQwen3NextInstruct::test_auto_dtype[use_py_transceiver=True]
@@ -821,6 +823,7 @@ disaggregated/test_disaggregated.py::test_disaggregated_ctxtp2pp2_gentp2pp2[Tiny
 disaggregated/test_disaggregated.py::test_disaggregated_cuda_graph[TinyLlama-1.1B-Chat-v1.0]
 disaggregated/test_disaggregated.py::test_disaggregated_deepseek_v3_lite_bf16_cache_aware_balance[DeepSeek-V3-Lite-bf16]
 disaggregated/test_disaggregated.py::test_disaggregated_deepseek_v3_lite_bf16_conditional[DeepSeek-V3-Lite-bf16]
+disaggregated/test_disaggregated.py::test_disaggregated_deepseek_v3_lite_bf16_conditional_v2[DeepSeek-V3-Lite-bf16]
 disaggregated/test_disaggregated.py::test_disaggregated_deepseek_v3_lite_bf16_empty_batch[DeepSeek-V3-Lite-bf16]
 disaggregated/test_disaggregated.py::test_disaggregated_deepseek_v3_lite_fp8_attention_dp[DeepSeek-V3-Lite-fp8]
 disaggregated/test_disaggregated.py::test_disaggregated_deepseek_v3_lite_fp8_attention_dp_gen_only[DeepSeek-V3-Lite-fp8]
