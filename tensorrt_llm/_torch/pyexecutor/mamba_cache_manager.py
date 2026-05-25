@@ -987,6 +987,14 @@ def calc_context_stop_positions(prompt_len: int,
     return stop_positions
 
 
+def validate_hybrid_cache_config(kv_cache_config: KvCacheConfig,
+                                 tokens_per_block: int):
+    if kv_cache_config.enable_block_reuse:
+        # validate mamba_state_cache_interval
+        assert kv_cache_config.mamba_state_cache_interval > 0, "mamba_state_cache_interval must be positive when block reuse is enabled"
+        assert kv_cache_config.mamba_state_cache_interval % tokens_per_block == 0, "mamba_state_cache_interval must be a multiple of tokens_per_block for proper block alignment"
+
+
 class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
     """Hybrid cache manager storing mamba states inside the KVCacheManager pool.
 
@@ -1090,6 +1098,7 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
             )
             return
 
+        validate_hybrid_cache_config(kv_cache_config, tokens_per_block)
         # Derive ssm_state_shape and conv_state_shape from mamba params (same as MambaCacheManager)
         tp_size = mapping.tp_size if not mapping.enable_attention_dp else 1
         d_inner = mamba_head_dim * mamba_num_heads
