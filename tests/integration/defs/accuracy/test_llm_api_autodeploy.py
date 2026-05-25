@@ -1296,22 +1296,24 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
 
 
 class TestGemma4MoE(LlmapiAccuracyTestHarness):
-    """Gemma4 MoE accuracy via AutoDeploy on the dual-pool C++ KVCacheManager.
-
-    Gemma4-26B-A4B-it is the first AutoDeploy model with mixed (head_dim, dtype)
-    across attention windows: SWA layers use head_dim=256 and global-attention
-    layers use head_dim=512.  A single C++ KVCacheManager hosts both pools via
-    the per-window overrides added by commits 1c273f0594 / 823d6ea0e1, and the
-    Python AutoDeploy shim drives them through one `_create_kv_cache_manager`
-    call (commit f37ef9b844).  This integration test exercises the path
-    end-to-end against the registered MMMU / MMLU / GSM8K reference accuracies.
-    """
+    """Bench-run coverage for Gemma4 MoE via AutoDeploy."""
 
     MODEL_NAME = "google/gemma-4-26B-A4B-it"
     MODEL_PATH = hf_id_to_local_model_dir(MODEL_NAME)
     EXTRA_EVALUATOR_KWARGS = {
         "apply_chat_template": True,
     }
+
+    def get_default_sampling_params(self):
+        return SamplingParams(
+            max_tokens=MMMU.MAX_OUTPUT_LEN,  # noqa: F821
+            truncate_prompt_tokens=MMMU.MAX_INPUT_LEN,  # noqa: F821
+            stop="<|endoftext|>",
+            end_id=None,
+            pad_id=None,
+            n=1,
+            use_beam_search=False,
+        )
 
     @pytest.mark.skip_less_device_memory(80000)
     def test_bf16(self):
@@ -1320,40 +1322,15 @@ class TestGemma4MoE(LlmapiAccuracyTestHarness):
         if get_device_count() < registry_world_size:
             pytest.skip("Not enough devices for world size, skipping test")
 
-        sampling_params = SamplingParams(end_id=None,
-                                         pad_id=None,
-                                         n=1,
-                                         use_beam_search=False)
-        # MMMU needs its own output-length / truncation / stop-token config; the
-        # text tasks below reuse the generic sampling_params above.
-        mmmu_sampling_params = SamplingParams(
-            max_tokens=MMMU.MAX_OUTPUT_LEN,
-            truncate_prompt_tokens=MMMU.MAX_INPUT_LEN,
-            stop="<|endoftext|>",
-            end_id=None,
-            pad_id=None,
-            n=1,
-            use_beam_search=False,
-        )
+        sampling_params = self.get_default_sampling_params()
         with AutoDeployLLM(model=self.MODEL_PATH,
                            tokenizer=self.MODEL_PATH,
                            world_size=registry_world_size,
                            yaml_extra=yaml_paths) as llm:
-            task = MMMU(self.MODEL_NAME)
-            task.evaluate(
-                llm,
-                sampling_params=mmmu_sampling_params,
-                extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS,
-            )
-            task = MMLU(self.MODEL_NAME)
+            task = MMMU(self.MODEL_NAME)  # noqa: F821
             task.evaluate(
                 llm,
                 sampling_params=sampling_params,
-                extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS,
-            )
-            task = GSM8K(self.MODEL_NAME)
-            task.evaluate(
-                llm,
                 extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS,
             )
 

@@ -777,15 +777,6 @@ class ADEngine(ModelEngine):
         cache_loc_per_pool: List[List[int]] = [[] for _ in range(num_pools)]
         cu_num_pages_per_pool: List[List[int]] = [[0] for _ in range(num_pools)]
         extra_page_per_seq_per_pool: List[List[int]] = [[] for _ in range(num_pools)]
-        # Phase 2: per-pool window-local seq_len_with_cache / last_page_len.
-        # Computed for EVERY pool (including pool 0), since pool 0 has no
-        # privileged "full attention" status — the kvcache transform assigns
-        # pool indices by the order in which distinct KV handlers appear in
-        # the FX graph (layer 0's window class wins pool 0).  A model whose
-        # first layer is SWA (e.g. Gemma-3n) or a pure-SWA model (Mistral,
-        # Phi-3) would otherwise hand the global, unclamped value to the
-        # kernel for pool 0 and corrupt long sequences — exactly the
-        # MMLU-on-Gemma-3n drop this commit fixes.
         seq_len_with_cache_per_pool: List[List[int]] = [[] for _ in range(num_pools)]
         last_page_len_per_pool: List[List[int]] = [[] for _ in range(num_pools)]
 
@@ -875,11 +866,6 @@ class ADEngine(ModelEngine):
             cache_loc_per_pool=cache_loc_per_pool if num_pools > 0 else None,
             cu_num_pages_per_pool=cu_num_pages_per_pool if num_pools > 0 else None,
             extra_page_per_seq_per_pool=extra_page_per_seq_per_pool if num_pools > 0 else None,
-            # Per-pool window-local lengths gate on num_pools > 0, not
-            # num_pools >= 2.  A pure-SWA single-pool model (Mistral, Phi-3,
-            # all-sliding Gemma variants) needs window-local values just as
-            # much as a mixed-window model; gating at >=2 would silently
-            # leave it on the unclamped global value.
             seq_len_with_cache_per_pool=seq_len_with_cache_per_pool if num_pools > 0 else None,
             last_page_len_per_pool=last_page_len_per_pool if num_pools > 0 else None,
             slot_idx=state_slot_idx,

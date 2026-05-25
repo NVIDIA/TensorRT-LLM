@@ -1584,7 +1584,7 @@ public:
         return result;
     }
 
-    //! \brief Convenience: window_size -> sizePerHead, derived from getPoolConfigurations().
+    //! \brief Convenience: window_size -> dataType, derived from getPoolConfigurations().
     //!        For one-pool-per-window managers only; multi-pool-per-window will collide.
     [[nodiscard]] std::map<SizeType32, nvinfer1::DataType> getDataTypePerWindow() const
     {
