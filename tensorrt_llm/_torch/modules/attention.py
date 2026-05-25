@@ -1741,10 +1741,15 @@ class MLA(nn.Module):
                 requires_grad=False,
             )
             if is_sm_100f():
-                # On DSv4 with the cute_dsl FP8 BMM enabled, keep o_a_proj in
-                # its native FP8 e4m3 form (no load-time dequant) so
-                # cute_dsl_fp8_bmm_blackwell can consume it directly.
-                if self.is_deepseek_v4 and self.use_cute_dsl_blockscaling_bmm:
+                # DSv4 always keeps o_a_proj in its native FP8 e4m3 form so
+                # cute_dsl_fp8_bmm_blackwell + fused_inv_rope_fp8_quant can
+                # consume it directly. Decoupled from
+                # use_cute_dsl_blockscaling_bmm: only DSv4 has o_a_proj, and
+                # the fused inv-RoPE -> FP8 quant -> cute-dsl BMM chain is the
+                # only viable path for it on SM100; gating on the global
+                # bmm-config flag was conflating two independent kernel
+                # choices (K/V absorption BMM vs. DSv4 o_a_proj BMM).
+                if self.is_deepseek_v4:
                     self.o_a_proj = nn.Parameter(
                         torch.empty(
                             (self.n_local_groups, self.o_lora_rank,
@@ -1909,13 +1914,15 @@ class MLA(nn.Module):
         attn_out_latent = attn_out_latent.view(num_tokens, self.num_heads_tp,
                                                -1)
 
-        # When o_a_proj is FP8 and the cute_dsl FP8 BMM is enabled on SM100,
-        # fuse the inverse-RoPE into the FP8-quant epilogue (vLLM-ported
-        # Triton kernel) and call cute_dsl_fp8_bmm_blackwell directly. Saves
-        # one BF16 read+write of the latent vs the
-        # mla_rope_inplace + fp8_batched_quantize_1x128_permute102 pair.
+        # When o_a_proj is FP8 on SM100 (which is always the case for DSv4
+        # under FP8 block-scales after init), fuse the inverse-RoPE into the
+        # FP8-quant epilogue (vLLM-ported Triton kernel) and call
+        # cute_dsl_fp8_bmm_blackwell directly. Saves one BF16 read+write of
+        # the latent vs the mla_rope_inplace +
+        # fp8_batched_quantize_1x128_permute102 pair. Decoupled from
+        # use_cute_dsl_blockscaling_bmm (which gates the separate K/V
+        # absorption BMM kernel choice).
         fused_inv_rope_fp8 = (self.o_a_proj.dtype == torch.float8_e4m3fn
-                              and self.use_cute_dsl_blockscaling_bmm
                               and is_sm_100f())
         if fused_inv_rope_fp8:
             heads_per_group = self.num_heads_tp // self.n_local_groups

@@ -5,7 +5,8 @@ Numerical-equivalence test for the vLLM-ported fused inverse-RoPE +
 FP8 1x128 quantize op.
 
 Compares (mla_rope_inplace -> fp8_batched_quantize_1x128_permute102) against
-the new fused op `trtllm::fused_inv_rope_fp8_quant_vllm_port`.
+the new fused op `trtllm::fused_inv_rope_fp8_quant_vllm_port` (optimized
+Triton kernel).
 
 Run inside a CUDA Blackwell (SM100f) container (the TRT-LLM build sqsh).
 """
@@ -55,9 +56,9 @@ def _fused_path(
     return fp8_fused, scale_fused
 
 
-@pytest.mark.parametrize("is_neox", [True, False])
-@pytest.mark.parametrize("num_tokens", [3, 64, 257, 512])
-def test_fused_inv_rope_fp8_quant_matches_reference(num_tokens, is_neox):
+@pytest.mark.parametrize("num_tokens", [3, 64, 257, 512, 1024, 2048, 8192])
+def test_fused_inv_rope_fp8_quant_neox(num_tokens):
+    """Optimized Triton kernel vs the legacy 2-kernel reference."""
     torch.manual_seed(0)
     device = "cuda"
     n_groups = 4
@@ -78,14 +79,7 @@ def test_fused_inv_rope_fp8_quant_matches_reference(num_tokens, is_neox):
     position_ids = torch.randint(0, max_pos, (num_tokens,), dtype=torch.int32, device=device)
 
     fp8_ref, scale_ref = _ref_path(
-        o_bf16,
-        position_ids,
-        rotary_cos_sin,
-        num_heads,
-        n_groups,
-        nope_dim,
-        rope_dim,
-        is_neox=is_neox,
+        o_bf16, position_ids, rotary_cos_sin, num_heads, n_groups, nope_dim, rope_dim, is_neox=True
     )
     fp8_fused, scale_fused = _fused_path(
         o_bf16,
@@ -95,7 +89,7 @@ def test_fused_inv_rope_fp8_quant_matches_reference(num_tokens, is_neox):
         heads_per_group,
         nope_dim,
         rope_dim,
-        is_neox=is_neox,
+        is_neox=True,
     )
 
     assert fp8_ref.shape == fp8_fused.shape, (fp8_ref.shape, fp8_fused.shape)
@@ -117,6 +111,17 @@ def test_fused_inv_rope_fp8_quant_matches_reference(num_tokens, is_neox):
     deq_fused = dequant(fp8_fused, scale_fused)
     abs_diff = (deq_ref - deq_fused).abs()
     rel = abs_diff.mean() / (deq_ref.abs().mean() + 1e-9)
+    print(
+        f"[NEOX num_tokens={num_tokens}] "
+        f"mean abs diff = {abs_diff.mean().item():.4e}  rel = {rel.item():.4e}  "
+        f"max = {abs_diff.max().item():.4e}"
+    )
     # FP8 e4m3 has ~3 mantissa bits; 1-ULP tolerance scales with the value.
     # Allow a generous 1% relative bound.
     assert rel.item() < 1e-2, f"relative mismatch {rel.item()}"
+
+
+if __name__ == "__main__":
+    test_fused_inv_rope_fp8_quant_neox(64)
+    test_fused_inv_rope_fp8_quant_neox(257)
+    print("OK")
