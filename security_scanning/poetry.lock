@@ -844,14 +844,14 @@ files = [
 
 [[package]]
 name = "click"
-version = "8.4.0"
+version = "8.4.1"
 description = "Composable command line interface toolkit"
 optional = false
 python-versions = ">=3.10"
 groups = ["main"]
 files = [
-    {file = "click-8.4.0-py3-none-any.whl", hash = "sha256:40c50b7c6c6adac2823d411041ec84f3f103f1b280d5e9ce0d7f998995832f81"},
-    {file = "click-8.4.0.tar.gz", hash = "sha256:638f1338fe1235c8f4e008e4a8a254fb5c5fbdcbb40ece3c9142ebb78e792973"},
+    {file = "click-8.4.1-py3-none-any.whl", hash = "sha256:482be17c6991b8c19c5429a1e995d9b0efdbb63172824c41f99965dc0ade8ec2"},
+    {file = "click-8.4.1.tar.gz", hash = "sha256:918b5633eddf6b41c32d4f454bf0de810065c74e3f7dbf8ee5452f8be88d3e96"},
 ]
 
 [package.dependencies]
@@ -2114,14 +2114,14 @@ files = [
 
 [[package]]
 name = "huggingface-hub"
-version = "1.15.0"
+version = "1.16.1"
 description = "Client library to download and publish models, datasets and other repos on the huggingface.co hub"
 optional = false
 python-versions = ">=3.10.0"
 groups = ["main"]
 files = [
-    {file = "huggingface_hub-1.15.0-py3-none-any.whl", hash = "sha256:a4a59af04cbc41a3fe3fec429b171ef994ef8c971eda10136746f408dd4e3744"},
-    {file = "huggingface_hub-1.15.0.tar.gz", hash = "sha256:28abfdddda3927fd4de6a63cf26ab012498a2c24dae52baf150c5c6edf98a1d5"},
+    {file = "huggingface_hub-1.16.1-py3-none-any.whl", hash = "sha256:64340de934b9ce37857ef85a82de72f5629e8a270f9119eabb12bf495eb53c22"},
+    {file = "huggingface_hub-1.16.1.tar.gz", hash = "sha256:7f1dc4c5ec21aed69be630ad0c3378616be16f3de1a47b141c0e812965d9c832"},
 ]
 
 [package.dependencies]
@@ -2150,14 +2150,14 @@ typing = ["types-PyYAML", "types-simplejson", "types-toml", "types-tqdm", "types
 
 [[package]]
 name = "idna"
-version = "3.15"
+version = "3.16"
 description = "Internationalized Domain Names in Applications (IDNA)"
 optional = false
-python-versions = ">=3.8"
+python-versions = ">=3.9"
 groups = ["main"]
 files = [
-    {file = "idna-3.15-py3-none-any.whl", hash = "sha256:048adeaf8c2d788c40fee287673ccaa74c24ffd8dcf09ffa555a2fbb59f10ac8"},
-    {file = "idna-3.15.tar.gz", hash = "sha256:ca962446ea538f7092a95e057da437618e886f4d349216d2b1e294abfdb65fdc"},
+    {file = "idna-3.16-py3-none-any.whl", hash = "sha256:cc246e3a3f89580c3a951b5ad298ca4638078b2cdd4f115654332b5c26daded5"},
+    {file = "idna-3.16.tar.gz", hash = "sha256:d7a6da03db833450fca25d2358ac9ff06cd624577a4aea3a596d5c0f77b8e03d"},
 ]
 
 [package.extras]
@@ -3745,6 +3745,7 @@ files = [
 
 [package.dependencies]
 nvidia-cutlass-dsl-libs-base = "4.5.0"
+nvidia-cutlass-dsl-libs-cu13 = {version = "4.5.0", optional = true, markers = "extra == \"cu13\""}
 
 [package.extras]
 cu13 = ["nvidia-cutlass-dsl-libs-cu13 (==4.5.0)"]
@@ -3772,6 +3773,32 @@ files = [
 [package.dependencies]
 cuda-python = ">=12.8"
 numpy = "*"
+typing-extensions = "*"
+
+[[package]]
+name = "nvidia-cutlass-dsl-libs-cu13"
+version = "4.5.0"
+description = "NVIDIA CUTLASS Python DSL"
+optional = false
+python-versions = ">=3.10"
+groups = ["main"]
+files = [
+    {file = "nvidia_cutlass_dsl_libs_cu13-4.5.0-cp310-cp310-manylinux_2_28_aarch64.whl", hash = "sha256:b95cd78ca5f3440cd488ea03c30d394ca07e491e5bd6bb274f8f26d4f4713439"},
+    {file = "nvidia_cutlass_dsl_libs_cu13-4.5.0-cp310-cp310-manylinux_2_28_x86_64.whl", hash = "sha256:145cf5563b2d0d347c722d84a3b74541da5a1ec5b46821b54acc202693ce56ae"},
+    {file = "nvidia_cutlass_dsl_libs_cu13-4.5.0-cp311-cp311-manylinux_2_28_aarch64.whl", hash = "sha256:dadddab5bfe11973f8a0dfa66645a42ccb587287abb0766992e0e69da621dc82"},
+    {file = "nvidia_cutlass_dsl_libs_cu13-4.5.0-cp311-cp311-manylinux_2_28_x86_64.whl", hash = "sha256:35726dddb6f6e63c767caf7533d583b4462e2c6b90df7fa67738d58b2eede742"},
+    {file = "nvidia_cutlass_dsl_libs_cu13-4.5.0-cp312-cp312-manylinux_2_28_aarch64.whl", hash = "sha256:a799eb9d65ba03095444907b8bf617b5a8bd7d03d1b95cec9637c558af6d0b60"},
+    {file = "nvidia_cutlass_dsl_libs_cu13-4.5.0-cp312-cp312-manylinux_2_28_x86_64.whl", hash = "sha256:fc0b5a81ff591db72489134ca206ae886f0cce43f20863010a7f30fcfe484a7b"},
+    {file = "nvidia_cutlass_dsl_libs_cu13-4.5.0-cp313-cp313-manylinux_2_28_aarch64.whl", hash = "sha256:f2b821671add2e69a1377e7fd87e6261995db281b2f8e516ddae2fd6b7a6c1d0"},
+    {file = "nvidia_cutlass_dsl_libs_cu13-4.5.0-cp313-cp313-manylinux_2_28_x86_64.whl", hash = "sha256:554b775069d093f308949a65880bf9c9bfd48b1f4b2fd0e0d97aa2f608e6eea1"},
+    {file = "nvidia_cutlass_dsl_libs_cu13-4.5.0-cp314-cp314-manylinux_2_28_aarch64.whl", hash = "sha256:652e34d8a78accceab321da0232157e493b113e417306269d700a297a7d62447"},
+    {file = "nvidia_cutlass_dsl_libs_cu13-4.5.0-cp314-cp314-manylinux_2_28_x86_64.whl", hash = "sha256:3d460d03d6ea0a463e262ee07964ccafffde8eeefe058c9615d77da1ddd6d003"},
+]
+
+[package.dependencies]
+cuda-python = ">=12.8"
+numpy = "*"
+nvidia-cutlass-dsl-libs-base = "4.5.0"
 typing-extensions = "*"
 
 [[package]]
@@ -4002,14 +4029,14 @@ onnx = ">=1.14.0"
 
 [[package]]
 name = "openai"
-version = "2.37.0"
+version = "2.38.0"
 description = "The official Python library for the openai API"
 optional = false
 python-versions = ">=3.9"
 groups = ["main"]
 files = [
-    {file = "openai-2.37.0-py3-none-any.whl", hash = "sha256:814633888b8f3b1ffd6615697c6e4ef93632d08b7c2e28c8c5ef3556e5a10107"},
-    {file = "openai-2.37.0.tar.gz", hash = "sha256:f4bc562cc5f3a43d40d678105572d9d44765f6e0f50c125f63055419b72f4bd9"},
+    {file = "openai-2.38.0-py3-none-any.whl", hash = "sha256:ec6661c57b2dcc47414a767e6e3335c7ed3d19c9696999283a3c82e95c756a3c"},
+    {file = "openai-2.38.0.tar.gz", hash = "sha256:798694c6cf74145541fda94325b6f8f72d8e1fd0262cc137c8d728177a6a4ce3"},
 ]
 
 [package.dependencies]
@@ -5143,14 +5170,14 @@ windows-terminal = ["colorama (>=0.4.6)"]
 
 [[package]]
 name = "pyjwt"
-version = "2.12.1"
+version = "2.13.0"
 description = "JSON Web Token implementation in Python"
 optional = false
 python-versions = ">=3.9"
 groups = ["main"]
 files = [
-    {file = "pyjwt-2.12.1-py3-none-any.whl", hash = "sha256:28ca37c070cad8ba8cd9790cd940535d40274d22f80ab87f3ac6a713e6e8454c"},
-    {file = "pyjwt-2.12.1.tar.gz", hash = "sha256:c74a7a2adf861c04d002db713dd85f84beb242228e671280bf709d765b03672b"},
+    {file = "pyjwt-2.13.0-py3-none-any.whl", hash = "sha256:66adcc2aff09b3f1bbd95fc1e1577df8ac8723c978552fd43304c8a290ac5728"},
+    {file = "pyjwt-2.13.0.tar.gz", hash = "sha256:41571c89ca91598c79e8ef18a2d07367d4810fbbd6f637794879baf1b7703423"},
 ]
 
 [package.dependencies]
@@ -5159,9 +5186,6 @@ typing_extensions = {version = ">=4.0", markers = "python_version < \"3.11\""}
 
 [package.extras]
 crypto = ["cryptography (>=3.4.0)"]
-dev = ["coverage[toml] (==7.10.7)", "cryptography (>=3.4.0)", "pre-commit", "pytest (>=8.4.2,<9.0.0)", "sphinx", "sphinx-rtd-theme", "zope.interface"]
-docs = ["sphinx", "sphinx-rtd-theme", "zope.interface"]
-tests = ["coverage[toml] (==7.10.7)", "pytest (>=8.4.2,<9.0.0)"]
 
 [[package]]
 name = "pyparsing"
@@ -6674,14 +6698,14 @@ telegram = ["requests"]
 
 [[package]]
 name = "transformers"
-version = "5.5.3"
+version = "5.5.4"
 description = "Transformers: the model-definition framework for state-of-the-art machine learning models in text, vision, audio, and multimodal models, for both inference and training."
 optional = false
 python-versions = ">=3.10.0"
 groups = ["main"]
 files = [
-    {file = "transformers-5.5.3-py3-none-any.whl", hash = "sha256:e48f3ec31dd96505e96e66b63a1e43e1ad7a65749e108d9227caaf51051cdb02"},
-    {file = "transformers-5.5.3.tar.gz", hash = "sha256:3f60128e840b40d352655903552e1eed4f94ed49369a4d43e1bc067bd32d3f50"},
+    {file = "transformers-5.5.4-py3-none-any.whl", hash = "sha256:0bd6281b82966fe5a7a16f553ea517a9db1dee6284d7cb224dfd88fc0dd1c167"},
+    {file = "transformers-5.5.4.tar.gz", hash = "sha256:2e67cadba81fc7608cc07c4dd54f524820bc3d95b1cabd0ef3db7733c4f8b82e"},
 ]
 
 [package.dependencies]
@@ -6835,14 +6859,14 @@ zstd = ["backports-zstd (>=1.0.0) ; python_version < \"3.14\""]
 
 [[package]]
 name = "uvicorn"
-version = "0.47.0"
+version = "0.48.0"
 description = "The lightning-fast ASGI server."
 optional = false
 python-versions = ">=3.10"
 groups = ["main"]
 files = [
-    {file = "uvicorn-0.47.0-py3-none-any.whl", hash = "sha256:2c5715bc12d1892d84752049f400cd1c3cb018514967fdfeb97640443a6a9432"},
-    {file = "uvicorn-0.47.0.tar.gz", hash = "sha256:7c9a0ea1a9414106bbab7324609c162d8fa0cdcdcb703060987269d77c7bb533"},
+    {file = "uvicorn-0.48.0-py3-none-any.whl", hash = "sha256:48097851328b87ec36117d3d575234519eb58c2b22d79666e9bbc6c49a761dad"},
+    {file = "uvicorn-0.48.0.tar.gz", hash = "sha256:a5504207195d08c2511bf9125ede5ac4a4b71725d519e758d01dcf0bc2d31c37"},
 ]
 
 [package.dependencies]
@@ -7284,4 +7308,4 @@ type = ["pytest-mypy (>=1.0.1) ; platform_python_implementation != \"PyPy\""]
 [metadata]
 lock-version = "2.1"
 python-versions = ">=3.10,<3.13"
-content-hash = "2c43a568609b6d690b979db609c65792e84c70dc3f6f586a1acad49d4940db3b"
+content-hash = "40d4bdcc33ff08c4d66194f59c11519f058eaa20245742bd97d0b102c52a3ad7"

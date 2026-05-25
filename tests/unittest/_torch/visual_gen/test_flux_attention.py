@@ -21,12 +21,12 @@ import torch
 import torch.nn.functional as F
 
 from tensorrt_llm._torch.visual_gen.config import (
-    AttentionConfig,
     DiffusionModelConfig,
     create_attention_metadata_state,
 )
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
+from tensorrt_llm.visual_gen.args import AttentionConfig
 
 
 class TestFluxAttentionBackend(unittest.TestCase):

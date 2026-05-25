@@ -46,31 +46,81 @@ void fused_dit_qk_norm_rope(torch::Tensor& qkv, // [num_tokens, (Hq+Hk+Hv)*head_
     TORCH_CHECK(qkv.dim() == 2, "QKV tensor must be 2D: [num_tokens, total_heads*head_dim]");
     TORCH_CHECK(q_weight.dim() == 1, "q_weight must be 1D");
     TORCH_CHECK(k_weight.dim() == 1, "k_weight must be 1D");
-    TORCH_CHECK(cos_emb.dim() == 2, "cos_emb must be 2D: [num_tokens, head_dim]");
-    TORCH_CHECK(sin_emb.dim() == 2, "sin_emb must be 2D: [num_tokens, head_dim]");
+    TORCH_CHECK(cos_emb.dim() == 2, "cos_emb must be 2D: [num_tokens, head_dim] or [num_tokens, num_heads*head_dim]");
+    TORCH_CHECK(sin_emb.dim() == 2, "sin_emb must be 2D: [num_tokens, head_dim] or [num_tokens, num_heads*head_dim]");
 
     CHECK_INPUT(qkv, torch::kBFloat16);
     CHECK_INPUT(q_weight, torch::kBFloat16);
     CHECK_INPUT(k_weight, torch::kBFloat16);
-    CHECK_INPUT(cos_emb, torch::kFloat32);
-    CHECK_INPUT(sin_emb, torch::kFloat32);
+    // Cos/sin may be fp32 (per-head FLUX path) or bf16 (B-2 full-dim LTX-2 path).
+    // Per-head path requires fp32 (kernel has no bf16 branch); enforced below.
+    auto const cos_dtype = cos_emb.scalar_type();
+    TORCH_CHECK(cos_dtype == torch::kFloat32 || cos_dtype == torch::kBFloat16,
+        "cos_emb dtype must be float32 or bfloat16, got ", cos_dtype);
+    TORCH_CHECK(sin_emb.scalar_type() == cos_dtype, "sin_emb dtype must match cos_emb");
+    bool const cos_is_bf16 = (cos_dtype == torch::kBFloat16);
+    if (cos_is_bf16)
+    {
+        CHECK_INPUT(cos_emb, torch::kBFloat16);
+        CHECK_INPUT(sin_emb, torch::kBFloat16);
+    }
+    else
+    {
+        CHECK_INPUT(cos_emb, torch::kFloat32);
+        CHECK_INPUT(sin_emb, torch::kFloat32);
+    }
 
     int64_t num_tokens = qkv.size(0);
     int64_t total_heads = num_heads_q + num_heads_k + num_heads_v;
     TORCH_CHECK(qkv.size(1) == total_heads * head_dim, "QKV tensor size must match total_heads * head_dim");
-    TORCH_CHECK(cos_emb.size(0) == num_tokens && cos_emb.size(1) == head_dim, "cos_emb must be [num_tokens, head_dim]");
-    TORCH_CHECK(sin_emb.size(0) == num_tokens && sin_emb.size(1) == head_dim, "sin_emb must be [num_tokens, head_dim]");
+    // Auto-detect broadcast: cos rows == num_tokens (flat) or num_tokens / B (broadcast over B).
+    int64_t const cos_rows = cos_emb.size(0);
+    int cos_seq_per_batch = 0;
+    if (cos_rows != num_tokens)
+    {
+        TORCH_CHECK(cos_rows > 0 && num_tokens % cos_rows == 0, "cos_emb.size(0) (", cos_rows,
+            ") must equal num_tokens (", num_tokens, ") or evenly divide it (broadcast); got non-divisor count");
+        cos_seq_per_batch = static_cast<int>(cos_rows);
+    }
+    bool const per_head_cos = (cos_emb.size(1) == num_heads_q * head_dim);
+    TORCH_CHECK(per_head_cos || cos_emb.size(1) == head_dim, "cos_emb last dim must be head_dim (", head_dim,
+        ") or num_heads_q*head_dim (", num_heads_q * head_dim, "); got ", cos_emb.size(1));
+    TORCH_CHECK(sin_emb.size(0) == cos_rows && sin_emb.size(1) == cos_emb.size(1), "sin_emb shape must match cos_emb");
 
-    // Only per-head norm supported
-    TORCH_CHECK(q_weight.size(0) == head_dim,
-        "fused_dit_qk_norm_rope only supports per-head norm (q_weight must be [head_dim]). "
-        "Full-dim norm (q_weight [num_heads * head_dim]) is not yet supported. Got q_weight size: ",
-        q_weight.size(0), ", head_dim: ", head_dim);
-    TORCH_CHECK(k_weight.size(0) == head_dim,
-        "fused_dit_qk_norm_rope only supports per-head norm (k_weight must be [head_dim]). Got k_weight size: ",
-        k_weight.size(0));
+    // Auto-dispatch by weight shape:
+    //   weight.size(0) == head_dim                   → per-head norm (FLUX/Cosmos3, original kernel)
+    //   weight.size(0) == num_heads_per_side*head_dim → full-dim norm (LTX-2)
+    bool const is_full_dim_q = (q_weight.size(0) == num_heads_q * head_dim);
+    bool const is_full_dim_k = (k_weight.size(0) == num_heads_k * head_dim);
+    bool const is_per_head_q = (q_weight.size(0) == head_dim);
+    bool const is_per_head_k = (k_weight.size(0) == head_dim);
+    TORCH_CHECK(is_full_dim_q == is_full_dim_k && is_per_head_q == is_per_head_k,
+        "q_weight and k_weight must use the same norm mode (both per-head or both full-dim).");
+    TORCH_CHECK(is_per_head_q || is_full_dim_q,
+        "q_weight size must be [head_dim] (per-head) or [num_heads*head_dim] (full-dim); got ", q_weight.size(0),
+        " head_dim=", head_dim, " num_heads_q=", num_heads_q);
 
-    // Validate optional add_weights (dual-stream)
+    if (is_full_dim_q)
+    {
+        TORCH_CHECK(!q_add_weight.has_value() && !k_add_weight.has_value(),
+            "Full-dim norm does not support dual-stream add_weights");
+        TORCH_CHECK(num_txt_tokens <= 0, "Full-dim norm does not support dual-stream (num_txt_tokens must be -1)");
+        auto stream = at::cuda::getCurrentCUDAStream(qkv.get_device());
+        tensorrt_llm::kernels::launchFusedDiTQKNormRopeFullDim(qkv.data_ptr(), static_cast<int>(num_tokens),
+            static_cast<int>(num_heads_q), static_cast<int>(num_heads_k), static_cast<int>(num_heads_v),
+            static_cast<int>(head_dim), static_cast<float>(eps), q_weight.data_ptr(), k_weight.data_ptr(),
+            cos_emb.data_ptr(), sin_emb.data_ptr(), interleave, per_head_cos, cos_is_bf16, cos_seq_per_batch, stream);
+        return;
+    }
+
+    // Per-head path (original FLUX/Cosmos3 kernel) — only fp32 cos supported here, no broadcast.
+    TORCH_CHECK(cos_seq_per_batch == 0,
+        "Per-head fused_dit_qk_norm_rope (FLUX/Cosmos) does not support cos broadcast over B; "
+        "got cos_emb rows = ",
+        cos_rows, ", num_tokens = ", num_tokens);
+    TORCH_CHECK(!cos_is_bf16,
+        "Per-head fused_dit_qk_norm_rope (FLUX/Cosmos) requires fp32 cos/sin; bf16 cos is only supported "
+        "by the full-dim path (LTX-2)");
     void const* q_add_ptr = nullptr;
     void const* k_add_ptr = nullptr;
     if (q_add_weight.has_value())

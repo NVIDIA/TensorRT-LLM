@@ -2,7 +2,7 @@ import functools
 import math
 import os
 import weakref
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
@@ -25,9 +25,8 @@ from .interface import (AttentionBackend, AttentionForwardArgs,
                         KVCacheParams, MLAParams, PositionalEmbeddingParams,
                         PredefinedAttentionMask, RopeParams,
                         merge_attention_forward_args)
-from .trtllm_gen import trtllm_gen_attention
 
-# Enable TRTLLM-Gen attention backend via environment variable (default: off).
+# Enable TRTLLM-Gen attention backend via environment variable (default: on).
 _TRTLLM_ENABLE_TRTLLM_GEN_ATTENTION = (os.environ.get(
     "TRTLLM_ENABLE_TRTLLM_GEN_ATTENTION", "0") == "1")
 
@@ -91,6 +90,9 @@ class TrtllmAttentionMetadata(AttentionMetadata):
 
     # parameters required for spec-dec mode
     spec_decoding_position_offsets: Optional[torch.Tensor] = None
+    # C++ attention op requires a 2-D position_offsets tensor and reads
+    # sizes()[1] as the generation length / packed-mask row stride.
+    spec_decoding_position_offsets_cpp: Optional[torch.Tensor] = None
     spec_decoding_packed_mask: Optional[torch.Tensor] = None
     spec_decoding_generation_lengths: Optional[torch.Tensor] = None
     spec_decoding_bl_tree_mask_offset: Optional[torch.Tensor] = None
@@ -173,6 +175,20 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         self.enable_helix = self.mapping.has_cp_helix(
         ) if self.mapping is not None else False
         self._post_init_with_buffers(self.cuda_graph_buffers)
+
+    def update_position_offsets_for_cpp(self, query_len: int) -> None:
+        """Refresh the C++ view of spec-dec position offsets."""
+        offsets = self.spec_decoding_position_offsets
+        if offsets is None or offsets.dim() != 1:
+            self.spec_decoding_position_offsets_cpp = offsets
+            return
+
+        if self.max_num_requests > 0 and query_len > 0:
+            total = self.max_num_requests * query_len
+            self.spec_decoding_position_offsets_cpp = offsets[:total].view(
+                self.max_num_requests, query_len)
+        else:
+            self.spec_decoding_position_offsets_cpp = offsets
 
     def _post_init_with_buffers(self, buffers) -> None:
 
@@ -769,6 +785,7 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         model_is_wrapped: bool = False,
         spec_metadata: Optional['SpecMetadata'] = None,
         spec_tree_manager: Optional['SpecTreeManager'] = None,
+        num_contexts: int = 0,
     ) -> None:
         '''
         Update the spec-dec parameters for the TRTLLM attention layer.
@@ -782,6 +799,10 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             model_is_wrapped: Optional[bool] = False, whether the drafter model is wrapped (i.e, CDL).
             spec_metadata: Optional['SpecMetadata'] = None, the metadata of the spec-dec.
             spec_tree_manager: Optional['SpecTreeManager'] = None, the spec_tree_manager for draft token tree.
+            num_contexts: int = 0, the number of context (prefill) requests in the
+                batch.  The slot-storage layout is ``[ctx | gen]``; dynamic-tree
+                metadata only describes the gen rows, so we must source from
+                ``[num_contexts:batch_size]`` rather than ``[:batch_size]``.
         '''
 
         # Disable spec decoding on Blackwell (sm100+). The trtllmGen FMHA
@@ -825,7 +846,11 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                     buf_dim = spec_tree_manager._internal_buf_dim
                 else:
                     buf_dim = max_total_draft_tokens + 1
-                self.spec_decoding_packed_mask = torch.empty(
+                # Zero-init: dynamic-tree dst has inner dim
+                # ceil(buf_dim/32) but only ceil((max_total_draft_tokens+1)/32)
+                # is written each step. Unwritten cols would otherwise feed the
+                # C++ XQA kernel as live mask bits.
+                self.spec_decoding_packed_mask = torch.zeros(
                     [self.max_num_requests, buf_dim,
                      math.ceil(buf_dim / 32)],
                     dtype=torch.int,
@@ -846,31 +871,42 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                 self.spec_decoding_bl_tree_mask = None
                 self.spec_bl_tree_first_sparse_mask_offset_kv = None
 
+            cpp_query_len = 0
+
             # Case 1: dynamic tree — copy per-request params from spec_tree_manager.
             if self.is_spec_dec_dynamic_tree:
                 assert spec_tree_manager is not None, "spec_tree_manager is required for dynamic tree"
                 n_dt = spec_tree_manager.max_total_draft_tokens + 1
-                mask_width = spec_tree_manager.spec_dec_packed_mask.shape[-1]
+                buf_dim = spec_tree_manager._internal_buf_dim
 
-                self.spec_decoding_position_offsets[:batch_size * n_dt].view(
-                    batch_size,
-                    n_dt).copy_(spec_tree_manager.
-                                spec_dec_position_offsets[:batch_size],
-                                non_blocking=True)
+                assert buf_dim >= n_dt, (
+                    f"Dynamic-tree copy requires buf_dim >= n_dt; got "
+                    f"buf_dim={buf_dim}, n_dt={n_dt}.")
 
-                if self.is_sm_version_trtllm_gen_kernel(sm=get_sm_version()):
-                    self.spec_decoding_packed_mask[:batch_size].zero_()
-                    self.spec_decoding_packed_mask[:batch_size, :n_dt, :].copy_(
-                        spec_tree_manager.spec_dec_packed_mask[:batch_size],
-                        non_blocking=True)
-                else:
-                    total = batch_size * n_dt * mask_width
+                slot_storage = spec_tree_manager.slot_storage
+
+                num_gens = batch_size - num_contexts
+                if num_gens > 0:
+                    slot_ids = slot_storage.all_ids_buf[num_contexts:batch_size]
+
+                    pos_src = torch.index_select(slot_storage.position_offsets,
+                                                 0, slot_ids)[:, :n_dt]
+                    pos_dst = self.spec_decoding_position_offsets[:num_gens *
+                                                                  n_dt].view(
+                                                                      num_gens,
+                                                                      n_dt)
+                    pos_dst.copy_(pos_src, non_blocking=True)
+
+                    actual_mask_width = math.ceil(n_dt / 32)
+                    mask_src = torch.index_select(
+                        slot_storage.packed_mask, 0,
+                        slot_ids)[:, :, :actual_mask_width]
+                    total = num_gens * n_dt * actual_mask_width
                     self.spec_decoding_packed_mask.view(-1)[:total].copy_(
-                        spec_tree_manager.spec_dec_packed_mask[:batch_size].
-                        reshape(-1),
-                        non_blocking=True)
+                        mask_src.reshape(-1), non_blocking=True)
 
                 self.spec_decoding_generation_lengths[:batch_size].fill_(n_dt)
+                cpp_query_len = n_dt
 
             # Case 2/3: static tree
             elif self.is_spec_dec_tree and not self.is_spec_dec_dynamic_tree and spec_metadata is not None:
@@ -900,6 +936,7 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                     # Considering that these spec-dec params are accessed consecutively (without padding) in the attention Op,
                     # we need to write them consecutively when setting them.
                     # For the next drafter layers, we will prepare these spec-dec params in the drafting loops.
+
                     # position_offsets
                     position_offset = torch.arange(
                         max_draft_len + 1,
@@ -920,6 +957,9 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                             spec_decoding_packed_mask, non_blocking=True)
                     self.generate_spec_decoding_generation_length(
                         runtime_draft_len=max_draft_len)
+                    if (self.spec_decoding_position_offsets is not None
+                            and self.spec_decoding_position_offsets.dim() == 1):
+                        cpp_query_len = max_draft_len + 1
 
             # Case 4: linear tree
             else:
@@ -936,6 +976,8 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                     self.max_num_requests, runtime_draft_len)
                 self.spec_decoding_packed_mask = generate_spec_decoding_packed_mask(
                     self.max_num_requests, runtime_draft_len)
+
+            self.update_position_offsets_for_cpp(cpp_query_len)
 
     def generate_spec_decoding_generation_length(self, runtime_draft_len):
         self.spec_decoding_generation_lengths[:self.max_num_requests].fill_(
@@ -1201,6 +1243,15 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             return AttentionMaskType.padding
         raise ValueError("Unexpected attention mask type")
 
+    def _get_trtllm_gen_backend(
+            self) -> trtllm_gen.FlashInferTrtllmGenAttention:
+        backend = getattr(self, "_trtllm_gen_backend", None)
+        if backend is None:
+            backend = trtllm_gen.FlashInferTrtllmGenAttention(
+                attention_layer=self, )
+            self._trtllm_gen_backend = backend
+        return backend
+
     def _run(
         self,
         q: torch.Tensor,
@@ -1291,14 +1342,9 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             metadata.is_spec_decoding_enabled, metadata.use_spec_decoding,
             metadata.is_spec_dec_tree
         ]
-        position_offsets_for_cpp = metadata.spec_decoding_position_offsets
-        if (metadata.spec_decoding_position_offsets is not None
-                and metadata.spec_decoding_position_offsets.dim() == 1):
-            position_offsets_for_cpp = metadata.spec_decoding_position_offsets.view(
-                metadata.max_num_requests, -1)
-
         spec_decoding_tensor_params = [
-            metadata.spec_decoding_generation_lengths, position_offsets_for_cpp,
+            metadata.spec_decoding_generation_lengths,
+            metadata.spec_decoding_position_offsets_cpp,
             metadata.spec_decoding_packed_mask
         ]
         if self.is_sm_version_trtllm_gen_kernel(sm=get_sm_version()):
@@ -1344,119 +1390,29 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         use_sage_attn = (forward_args.sage_attn_num_elts_per_blk_q > 0
                          or forward_args.sage_attn_num_elts_per_blk_k > 0
                          or forward_args.sage_attn_num_elts_per_blk_v > 0)
-        if _TRTLLM_ENABLE_TRTLLM_GEN_ATTENTION and not helix_active and not use_sage_attn and trtllm_gen.is_supported(
-                q=q,
-                num_heads=self.num_heads,
-                num_kv_heads=self.num_kv_heads,
-                head_size=self.head_dim,
-                out_dtype=output.dtype,
-                mask_type=int(mask_type),
-                has_alibi=(self.position_embedding_type == 4
-                           or self.position_embedding_type == 5),
-                is_padded=False,
-                use_paged_kv_cache=(metadata.kv_cache_block_offsets
-                                    is not None),
-                tokens_per_block=metadata.tokens_per_block,
-                beam_width=metadata.beam_width,
-                position_shift_enabled=False,
-                sink_token_length=0,
-                cross_attention=False,
-                is_spec_decoding=metadata.is_spec_decoding_enabled,
-                is_mla_enable=self.is_mla_enable,
-                is_fused_qkv=is_fused_qkv,
-                update_kv_cache=update_kv_cache,
-                has_cross_kv=False,
-                quant_config=self.quant_config,
-                kv_cache_manager=metadata.kv_cache_manager,
-                skip_softmax_threshold_scale_factor_prefill=
-                skip_softmax_threshold_scale_factor_prefill,
-                skip_softmax_threshold_scale_factor_decode=
-                skip_softmax_threshold_scale_factor_decode,
-        )[0]:
-            trtllm_gen_attention(
+
+        use_trtllm_gen = False
+        if _TRTLLM_ENABLE_TRTLLM_GEN_ATTENTION:
+            trtllm_gen_backend = self._get_trtllm_gen_backend()
+            trtllm_gen_forward_args = replace(forward_args,
+                                              output=output,
+                                              output_sf=output_sf)
+            use_trtllm_gen = trtllm_gen_backend.is_supported(
                 q,
-                k,
-                v,
-                output,
-                output_sf,
-                workspace,
-                metadata.kv_lens_cuda_runtime,
-                metadata.kv_lens_runtime,
-                metadata.host_total_kv_lens,
-                metadata.prompt_lens_cuda_runtime,
-                metadata.prompt_lens_cpu_runtime,
-                metadata.host_request_types_runtime,
-                metadata.kv_cache_block_offsets,
-                metadata.host_kv_cache_pool_pointers,
-                metadata.host_kv_cache_pool_mapping,
-                metadata.cache_indirection,
-                kv_scale_orig_quant,
-                kv_scale_quant_orig,
-                out_scale,
-                self.rotary_inv_freq,
-                self.rotary_cos_sin,
-                forward_args.latent_cache,
-                forward_args.q_pe,
-                metadata.block_ids_per_seq,
-                forward_args.attention_sinks,
-                is_fused_qkv,
-                update_kv_cache,
-                self.predicted_tokens_per_seq,
-                layer_idx,
-                self.num_heads,
-                self.num_kv_heads,
-                self.head_dim,
-                metadata.tokens_per_block,
-                metadata.max_num_requests,
-                max_context_length,
-                attention_window_size,
-                0,
-                metadata.beam_width,
-                int(mask_type),
-                self.quant_mode,
-                self.q_scaling,
-                self.position_embedding_type,
-                rotary_embedding_dim,
-                rotary_embedding_base,
-                rotary_embedding_scale_type,
-                rotary_embedding_scales,
-                rotary_embedding_max_position_info,
-                use_paged_context_fmha,
-                int(attention_input_type),
-                self.is_mla_enable,
-                forward_args.chunked_prefill_buffer_batch_size,
-                self.q_lora_rank,
-                self.kv_lora_rank,
-                self.qk_nope_head_dim,
-                self.qk_rope_head_dim,
-                self.v_head_dim,
-                mrope_rotary_cos_sin,
-                mrope_position_deltas,
-                helix_tensor_params,
-                self.attention_chunk_size,
-                forward_args.softmax_stats_tensor,
-                spec_decoding_bool_params,
-                spec_decoding_tensor_params,
-                sparse_kv_indices,
-                sparse_kv_offsets,
-                sparse_attn_indices,
-                sparse_attn_offsets,
-                sparse_attn_indices_block_size,
-                num_sparse_topk,
-                skip_softmax_threshold_scale_factor_prefill,
-                skip_softmax_threshold_scale_factor_decode,
-                self.skip_softmax_stat,
-                forward_args.cu_q_seqlens,
-                forward_args.cu_kv_seqlens,
-                forward_args.fmha_scheduler_counter,
-                forward_args.mla_bmm1_scale,
-                forward_args.mla_bmm2_scale,
-                forward_args.quant_q_buffer,
-                self.quant_config,
-                metadata.kv_cache_manager,
-                metadata.num_contexts,
-                metadata.num_ctx_tokens,
-                global_layer_idx=self.layer_idx,
+                metadata=metadata,
+                forward_args=trtllm_gen_forward_args,
+                mask_type=int(mask_type),
+                active_helix=helix_active,
+                use_sage_attn=use_sage_attn,
+            )[0]
+
+        if use_trtllm_gen:
+            trtllm_gen_backend.attention(
+                q,
+                metadata=metadata,
+                forward_args=trtllm_gen_forward_args,
+                mask_type=int(mask_type),
+                use_paged_context_fmha=use_paged_context_fmha,
             )
         else:
             thop.attention(
@@ -1496,7 +1452,6 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                 metadata.max_num_requests,
                 max_context_length,
                 attention_window_size,
-                0,
                 metadata.beam_width,
                 int(mask_type),
                 self.quant_mode,
@@ -1718,7 +1673,6 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         assert metadata.num_ctx_cached_tokens + metadata.num_ctx_tokens == metadata.host_ctx_kv_indptr[
             metadata.num_contexts]
 
-        sink_token_length = 0
         beam_width = 1
 
         compressed_kv, k_pe = torch.ops.trtllm.load_paged_kv_cache_for_mla(
@@ -1737,7 +1691,6 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             self.mla_params.qk_rope_head_dim,
             metadata.kv_cache_manager.tokens_per_block,
             metadata.kv_cache_manager.max_seq_len,
-            sink_token_length,
             beam_width,
             self.quant_mode,
         )
@@ -1766,7 +1719,6 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                                      device=cu_chunked_seq_len.device)
             return empty_kv, empty_k_pe
 
-        sink_token_length = 0
         beam_width = 1
 
         output_kv, output_k_pe = torch.ops.trtllm.load_chunked_kv_cache_for_mla(
@@ -1786,7 +1738,6 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             metadata.kv_cache_manager.tokens_per_block,
             chunked_max_seq_len,
             metadata.kv_cache_manager.max_seq_len,
-            sink_token_length,
             beam_width,
             self.quant_mode,
         )
@@ -1806,7 +1757,6 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         # kernel reads it.
         self._ensure_rope_table_size(metadata.kv_cache_manager.max_seq_len)
 
-        sink_token_length = 0
         beam_width = 1
 
         torch.ops.trtllm.mla_rope_append_paged_kv_assign_q(
@@ -1829,7 +1779,6 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             self.get_local_layer_idx(metadata),
             metadata.kv_cache_manager.tokens_per_block,
             metadata.kv_cache_manager.max_seq_len,
-            sink_token_length,
             beam_width,
             self.quant_mode,
         )
@@ -1913,7 +1862,6 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
 
         assert self.is_mla_enable and self.mla_params is not None
         assert metadata.kv_cache_manager is not None
-        sink_token_length = 0
 
         # Ensure RoPE cos/sin table covers the sequence length before the
         # kernel reads it.
@@ -1953,7 +1901,6 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             self.head_dim,
             metadata.kv_cache_manager.tokens_per_block,
             metadata.max_seq_len,  # attention_window_size
-            sink_token_length,
             metadata.beam_width,
             self.quant_mode,
             self.q_scaling,

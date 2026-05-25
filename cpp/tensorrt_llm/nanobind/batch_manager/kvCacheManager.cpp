@@ -332,7 +332,16 @@ void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(nb::module_& m)
         .def_rw("cache_type", &tbk::LinearAttentionMetadata::cacheType)
         .def_rw("all_recurrent_states_bytes", &tbk::LinearAttentionMetadata::allRecurrentStatesBytes)
         .def_rw("states_snapshot_interval", &tbk::LinearAttentionMetadata::statesSnapshotInterval)
-        .def_rw("save_last_snapshot", &tbk::LinearAttentionMetadata::saveLastSnapshot);
+        .def_rw("save_last_snapshot", &tbk::LinearAttentionMetadata::saveLastSnapshot)
+        .def_rw("rnn_num_heads", &tbk::LinearAttentionMetadata::rnnNumHeads)
+        .def_rw("rnn_head_dim", &tbk::LinearAttentionMetadata::rnnHeadDim)
+        .def_rw("rnn_d_state", &tbk::LinearAttentionMetadata::rnnDState)
+        .def_rw("rnn_d_conv", &tbk::LinearAttentionMetadata::rnnDConv)
+        .def_rw("rnn_n_groups", &tbk::LinearAttentionMetadata::rnnNGroups)
+        .def_rw("rnn_conv_section_layout", &tbk::LinearAttentionMetadata::rnnConvSectionLayout)
+        .def_rw("rnn_ssm_bytes", &tbk::LinearAttentionMetadata::rnnSsmBytes)
+        .def_rw("rnn_ssm_dtype_size", &tbk::LinearAttentionMetadata::rnnSsmDtypeSize)
+        .def_rw("rnn_conv_dtype_size", &tbk::LinearAttentionMetadata::rnnConvDtypeSize);
 
     nb::enum_<tbk::LinearAttentionMetadata::LinearCacheType>(m, "LinearCacheType")
         .value("RECURRENT_STATES", tbk::LinearAttentionMetadata::LinearCacheType::kRecurrentStates);
@@ -641,7 +650,9 @@ void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(nb::module_& m)
         .def_prop_ro(
             "is_variable_window", [](tbk::KVCacheManager& self) { return self.getBlockManager().isVariableWindow(); })
         .def("copy_linear_attention_block", &tbk::KVCacheManager::copyLinearAttentionBlock, nb::arg("llm_request"),
-            nb::call_guard<nb::gil_scoped_release>());
+            nb::call_guard<nb::gil_scoped_release>())
+        .def("copy_linear_attention_block_batch", &tbk::KVCacheManager::copyLinearAttentionBlockBatch,
+            nb::arg("llm_requests"), nb::call_guard<nb::gil_scoped_release>());
 }
 
 void tb::BasePeftCacheManagerBindings::initBindings(nb::module_& m)

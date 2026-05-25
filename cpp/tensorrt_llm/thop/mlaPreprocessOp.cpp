@@ -110,7 +110,7 @@ std::vector<torch::Tensor> loadPagedKVCacheForMLA(torch::ScalarType out_dtype, i
     torch::Tensor const& host_kv_cache_pool_mapping, torch::optional<torch::Tensor> kv_scale_orig_quant,
     torch::optional<torch::Tensor> kv_scale_quant_orig, int64_t const layer_idx, int64_t const lora_size,
     int64_t const rope_size, int64_t const tokens_per_block, int64_t const attention_window_size,
-    int64_t const sink_token_length, int64_t const beam_width, int64_t const quant_mode)
+    int64_t const beam_width, int64_t const quant_mode)
 {
     TORCH_CHECK(out_dtype == torch::kFloat16 || out_dtype == torch::kFloat32 || out_dtype == torch::kBFloat16,
         "out_dtype only support float16, float32, bfloat16");
@@ -123,12 +123,11 @@ std::vector<torch::Tensor> loadPagedKVCacheForMLA(torch::ScalarType out_dtype, i
 
     auto kv_cache_quant_mode = tc::QuantMode(static_cast<uint32_t>(quant_mode));
     int head_size = lora_size + rope_size;
-    KVBlockArray kv_cache_buffer
-        = buildPagedKvCacheBuffers(std::optional(kv_cache_block_offsets), std::optional(host_kv_cache_pool_pointers),
-            std::optional(host_kv_cache_pool_mapping), kv_cache_quant_mode, layer_idx, num_contexts, tokens_per_block,
-            1 /*kv_head_num*/, head_size, attention_window_size, attention_window_size, sink_token_length, beam_width,
-            0 /*seq_offset*/, true /*is_mla_enable*/, torch::elementSize(out_dtype))
-              .kvCacheBuffer;
+    KVBlockArray kv_cache_buffer = buildPagedKvCacheBuffers(std::optional(kv_cache_block_offsets),
+        std::optional(host_kv_cache_pool_pointers), std::optional(host_kv_cache_pool_mapping), kv_cache_quant_mode,
+        layer_idx, num_contexts, tokens_per_block, 1 /*kv_head_num*/, head_size, attention_window_size,
+        attention_window_size, beam_width, 0 /*seq_offset*/, true /*is_mla_enable*/, torch::elementSize(out_dtype))
+                                       .kvCacheBuffer;
 
     float const* kv_scale_orig_quant_ptr = nullptr;
     float const* kv_scale_quant_orig_ptr = nullptr;
@@ -202,8 +201,7 @@ std::vector<torch::Tensor> loadChunkedKVCacheForMLA(torch::ScalarType out_dtype,
     torch::Tensor const& host_kv_cache_pool_pointers, torch::Tensor const& host_kv_cache_pool_mapping,
     torch::optional<torch::Tensor> kv_scale_orig_quant, torch::optional<torch::Tensor> kv_scale_quant_orig,
     int64_t const layer_idx, int64_t const lora_size, int64_t const rope_size, int64_t const tokens_per_block,
-    int64_t const max_seq_len, int64_t const attention_window_size, int64_t const sink_token_length,
-    int64_t const beam_width, int64_t const quant_mode)
+    int64_t const max_seq_len, int64_t const attention_window_size, int64_t const beam_width, int64_t const quant_mode)
 {
     TORCH_CHECK(out_dtype == torch::kFloat16 || out_dtype == torch::kFloat32 || out_dtype == torch::kBFloat16,
         "out_dtype only support float16, float32, bfloat16");
@@ -213,12 +211,11 @@ std::vector<torch::Tensor> loadChunkedKVCacheForMLA(torch::ScalarType out_dtype,
     TORCH_CHECK(cu_ctx_chunked_kv_lens.size(0) >= num_contexts + 1);
     int head_size = lora_size + rope_size;
     auto kv_cache_quant_mode = tc::QuantMode(static_cast<uint32_t>(quant_mode));
-    KVBlockArray kv_cache_buffer
-        = buildPagedKvCacheBuffers(std::optional(kv_cache_block_offsets), std::optional(host_kv_cache_pool_pointers),
-            std::optional(host_kv_cache_pool_mapping), kv_cache_quant_mode, layer_idx, num_contexts, tokens_per_block,
-            1 /*kv_head_num*/, head_size, attention_window_size, attention_window_size, sink_token_length, beam_width,
-            0 /*seq_offset*/, true /*is_mla_enable*/, torch::elementSize(out_dtype))
-              .kvCacheBuffer;
+    KVBlockArray kv_cache_buffer = buildPagedKvCacheBuffers(std::optional(kv_cache_block_offsets),
+        std::optional(host_kv_cache_pool_pointers), std::optional(host_kv_cache_pool_mapping), kv_cache_quant_mode,
+        layer_idx, num_contexts, tokens_per_block, 1 /*kv_head_num*/, head_size, attention_window_size,
+        attention_window_size, beam_width, 0 /*seq_offset*/, true /*is_mla_enable*/, torch::elementSize(out_dtype))
+                                       .kvCacheBuffer;
 
     float const* kv_scale_orig_quant_ptr = nullptr;
     float const* kv_scale_quant_orig_ptr = nullptr;
@@ -297,8 +294,7 @@ void MLARopeAppendPagedKVAssignQ(torch::Tensor& q, torch::Tensor& latent_cache, 
     torch::Tensor const& kv_cache_block_offsets, torch::Tensor const& host_kv_cache_pool_pointers,
     torch::Tensor const& host_kv_cache_pool_mapping, torch::optional<torch::Tensor> kv_scale_orig_quant,
     torch::optional<torch::Tensor> kv_scale_quant_orig, int64_t const layer_idx, int64_t const tokens_per_block,
-    int64_t const attention_window_size, int64_t const sink_token_length, int64_t const beam_width,
-    int64_t const quant_mode)
+    int64_t const attention_window_size, int64_t const beam_width, int64_t const quant_mode)
 {
     auto input_dtype = q.scalar_type();
     TORCH_CHECK(input_dtype == torch::kFloat16 || input_dtype == torch::kFloat32 || input_dtype == torch::kBFloat16);
@@ -318,12 +314,11 @@ void MLARopeAppendPagedKVAssignQ(torch::Tensor& q, torch::Tensor& latent_cache, 
 
     auto kv_cache_quant_mode = tc::QuantMode(static_cast<uint32_t>(quant_mode));
     int head_size = lora_size + rope_size;
-    KVBlockArray kv_cache_buffer
-        = buildPagedKvCacheBuffers(std::optional(kv_cache_block_offsets), std::optional(host_kv_cache_pool_pointers),
-            std::optional(host_kv_cache_pool_mapping), kv_cache_quant_mode, layer_idx, num_contexts, tokens_per_block,
-            1 /*kv_head_num*/, head_size, attention_window_size, attention_window_size, sink_token_length, beam_width,
-            0 /*seq_offset*/, true /*is_mla_enable*/, torch::elementSize(input_dtype))
-              .kvCacheBuffer;
+    KVBlockArray kv_cache_buffer = buildPagedKvCacheBuffers(std::optional(kv_cache_block_offsets),
+        std::optional(host_kv_cache_pool_pointers), std::optional(host_kv_cache_pool_mapping), kv_cache_quant_mode,
+        layer_idx, num_contexts, tokens_per_block, 1 /*kv_head_num*/, head_size, attention_window_size,
+        attention_window_size, beam_width, 0 /*seq_offset*/, true /*is_mla_enable*/, torch::elementSize(input_dtype))
+                                       .kvCacheBuffer;
 
     float const* kv_scale_orig_quant_ptr = nullptr;
     float const* kv_scale_quant_orig_ptr = nullptr;
@@ -437,7 +432,6 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
         ", int rope_size"
         ", int tokens_per_block"
         ", int attention_window_size"
-        ", int sink_token_length"
         ", int beam_width"
         ", int quant_mode"
         ") -> Tensor[]");
@@ -468,7 +462,6 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
         ", int tokens_per_block"
         ", int max_seq_len"
         ", int attention_window_size"
-        ", int sink_token_length"
         ", int beam_width"
         ", int quant_mode"
         ") -> Tensor[]");
@@ -502,7 +495,6 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
         ", int layer_idx"
         ", int tokens_per_block"
         ", int attention_window_size"
-        ", int sink_token_length"
         ", int beam_width"
         ", int quant_mode"
         ") -> ()");

@@ -674,6 +674,18 @@ class AttentionDpConfig(StrictBaseModel):
         "cache affinity can dominate while preventing runaway concentration "
         "on a single rank. Set to 1.0 for strict fair share. "
         "Only used when enable_kv_cache_aware_routing is True.")
+    kv_cache_routing_cold_start_warmup: bool = Field(
+        default=False,
+        description=
+        "Cold-start mitigation in KV cache-aware routing. When True, the "
+        "first tp_size relaxed requests after router init are round-robined "
+        "across ranks (bypassing cache-affinity scoring) so every rank "
+        "caches the shared system prompt before scoring would otherwise pin "
+        "all traffic to the first warm rank. Only useful when requests "
+        "share a long system prefix; for diverse-prompt workloads this can "
+        "scatter requests that would otherwise consolidate on a single warm "
+        "rank, wasting prefill. Default False preserves pre-warmup routing. "
+        "Only used when enable_kv_cache_aware_routing is True.")
 
     @model_validator(mode='after')
     def validate_attention_dp_config(self) -> 'AttentionDpConfig':
@@ -2529,7 +2541,10 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
     sink_token_length: Optional[int] = Field(
         default=None,
         description=
-        "Number of sink tokens (tokens to always keep in attention window).")
+        "Deprecated and ignored on the PyTorch backend. StreamingLLM is not supported "
+        "by the PyTorch attention kernels — any non-None value has no effect and "
+        "will be silently dropped before reaching the executor.",
+        deprecated=True)
     free_gpu_memory_fraction: Optional[float] = Field(
         default=0.9,
         ge=0,
@@ -2647,7 +2662,6 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
             enable_block_reuse=self.enable_block_reuse,
             max_tokens=self.max_tokens,
             max_attention_window=self.max_attention_window,
-            sink_token_length=self.sink_token_length,
             free_gpu_memory_fraction=self.free_gpu_memory_fraction,
             host_cache_size=self.host_cache_size,
             cross_kv_cache_fraction=self.cross_kv_cache_fraction,
@@ -2862,10 +2876,7 @@ class DwdpConfig(StrictBaseModel):
 
 
 class BaseLlmArgs(StrictBaseModel):
-    """Base class for both TorchLlmArgs and TrtLlmArgs.
-
-    It contains all the arguments that are common to both.
-    """
+    """Base class for both TorchLlmArgs and TrtLlmArgs. It contains all the arguments that are common to both."""
     model_config = ConfigDict(arbitrary_types_allowed=True, extra="forbid")
 
     # Explicit arguments
@@ -3380,7 +3391,7 @@ class TrtLlmArgs(BaseLlmArgs):
 
     @model_validator(mode="after")
     def init_build_config(self):
-        """Create a default BuildConfig if none is provided."""
+        """Creating a default BuildConfig if none is provided"""
         build_config = getattr(self, "build_config", None)
         if build_config is None:
             kwargs = {}

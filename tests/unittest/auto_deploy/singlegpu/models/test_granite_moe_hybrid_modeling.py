@@ -179,6 +179,7 @@ def _create_small_config():
     )
     # Required by HF's attention implementation dispatch
     config._attn_implementation = "eager"
+    config.use_cache = False
     return config
 
 
@@ -233,6 +234,7 @@ def _create_small_hybrid_config():
         pad_token_id=0,
     )
     config._attn_implementation = "eager"
+    config.use_cache = False
     return config
 
 
