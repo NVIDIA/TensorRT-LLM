@@ -1287,7 +1287,8 @@ def set_cuda_device():
 
 
 def disaggregated_mpi_worker_main(config_file: Optional[str],
-                                  log_level: str = "info"):
+                                  log_level: str = "info",
+                                  stop_file: Optional[str] = None):
     """Body of the ``disaggregated_mpi_worker`` CLI command.
 
     Exposed as a plain Python function so it can also be dispatched as a task
@@ -1305,6 +1306,8 @@ def disaggregated_mpi_worker_main(config_file: Optional[str],
     _bin = _shutil.which("trtllm-serve")
     if _bin and sys.argv and sys.argv[0] != _bin:
         sys.argv[0] = _bin
+    if stop_file:
+        os.environ["TLLM_DISAGG_WORKER_STOP_FILE"] = stop_file
 
     from tensorrt_llm._utils import mpi_rank
     if os.environ.get(DisaggLauncherEnvs.
