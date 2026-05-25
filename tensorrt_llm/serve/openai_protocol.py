@@ -116,6 +116,30 @@ class ModelList(OpenAIBaseModel):
 
 
 class TokenizeRequest(OpenAIBaseModel):
+    """Request body for the ``POST /v1/tokenize`` endpoint.
+
+    Returns the token-id sequence (and its length) that the server would
+    produce for the given text under its loaded tokenizer, without
+    submitting any generation work to the executor.  Useful for clients
+    that need to size prompts against ``max_input_len`` or correlate
+    prompt boundaries with subsequent ``/v1/completions`` token ids,
+    notably the scaffolding trace-replay client which works in raw
+    token-id space.
+
+    The caller supplies exactly one of:
+
+    * ``prompt`` -- a plain string; tokenized directly via
+      ``tokenizer.encode``.
+    * ``messages`` -- a list of OpenAI chat-completion messages;
+      rendered through the server's chat template (mirroring the
+      ``/v1/chat/completions`` prefill path) before being encoded.
+
+    Supplying both, or neither, is rejected with a 400 by the validator
+    below.  ``model`` is accepted for compatibility with multi-model
+    routers but is otherwise ignored -- the server tokenizes against
+    its own loaded model.
+    """
+
     model: Optional[str] = None
     prompt: Optional[str] = None
     messages: Optional[List[OpenAIChatCompletionMessageParam]] = None
@@ -131,6 +155,16 @@ class TokenizeRequest(OpenAIBaseModel):
 
 
 class TokenizeResponse(OpenAIBaseModel):
+    """Response body for the ``POST /v1/tokenize`` endpoint.
+
+    ``count`` is the length of the encoded sequence (always populated);
+    ``tokens`` is the full id list (populated for both prompt and
+    messages paths).  Clients that only need the length can ignore
+    ``tokens`` -- the field is kept ``Optional`` so future read-only
+    callers may request a count-only variant without breaking the
+    schema.
+    """
+
     count: int
     tokens: Optional[List[int]] = None
 
