@@ -26,7 +26,7 @@ and operates on a purely functional paradigm that is compatible with the torch c
 
 import math
 from abc import ABC, abstractmethod
-from typing import Dict, List, Literal, Optional, Protocol, Sequence, Set, Tuple, Type, Union
+from typing import Any, Dict, List, Literal, Optional, Protocol, Sequence, Set, Tuple, Type, Union
 
 import numpy as np
 import torch
@@ -752,6 +752,17 @@ class SequenceInfo:
         self._cached_named_args_main: Optional[Dict[str, torch.Tensor]] = None
         self._cached_named_args_sig: Optional[Tuple[int, bool]] = None
 
+        # Decode-step fast-path signature. Captures the subset of nest_sequences's
+        # control flow that varies between iterations (overlap-scheduler activity,
+        # gather_context_logits). When the previous call established a single-seq
+        # pure-decode batch with the same signature, the next call can skip ~15
+        # stage_arg invocations + the derived-metadata recomputation and only
+        # refresh the values that actually change per token (input_ids, input_pos,
+        # cache_loc/cu_num_pages, and the four derivatives of input_pos).
+        # Invalidated whenever active args, device, or buffer views change (via
+        # _invalidate_named_args_cache).
+        self._prev_decode_sig: Optional[Tuple[bool, bool, bool]] = None
+
         # HOST PREPARE FOR ATTENTION FORWARD #######################################################
         self._host_prepare_functions: List[Tuple[PrepareMetadataHostCallable, List[str]]] = []
 
@@ -850,6 +861,9 @@ class SequenceInfo:
         """Clear the named_args cache. Call when active args, device, or buffer views change."""
         self._cached_named_args_main = None
         self._cached_named_args_sig = None
+        # The decode fast-path piggybacks on stable pinned-buffer layouts; any
+        # invalidation that affects named_args also invalidates it.
+        self._prev_decode_sig = None
 
     @property
     def available_args(self) -> Set[str]:
@@ -1134,6 +1148,110 @@ class SequenceInfo:
                 return candidate
         return 0
 
+    def _decode_step_signature(
+        self,
+        cu_seqlen: Union[Sequence[int], torch.Tensor],
+        batch_info: Union[Sequence[int], torch.Tensor, None],
+        extra_args: Dict[str, Any],
+        _ungathered_input_ids: Optional[torch.Tensor],
+        _ungathered_new_lens: Optional[torch.Tensor],
+        gather_context_logits: bool,
+    ) -> Optional[Tuple[bool, bool, bool]]:
+        """Return a signature tuple if this call is eligible for the decode fast path,
+        or ``None`` if it must take the full nest_sequences path.
+
+        Eligibility: exactly one sequence, batch_info advertises pure decode
+        (no prefill, no extend), and no multimodal extras. Within those constraints
+        the returned tuple captures the variable dispatch flags so subsequent calls
+        only fast-path when those flags also match the previous call.
+        """
+        # Single-sequence check. Both list and tensor cu_seqlens are valid inputs.
+        if isinstance(cu_seqlen, torch.Tensor):
+            if cu_seqlen.numel() != 2:
+                return None
+        elif len(cu_seqlen) != 2:
+            return None
+        # Pure-decode check via the explicitly-provided batch_info layout
+        # [num_prefill, num_prefill_tokens, num_extend, num_extend_tokens, num_decode, num_decode_tokens].
+        if batch_info is None or len(batch_info) < 6:
+            return None
+        if batch_info[0] != 0 or batch_info[2] != 0 or batch_info[4] != 1:
+            return None
+        # Multimodal / model-specific extras break the staging signature.
+        if extra_args:
+            return None
+        return (
+            _ungathered_input_ids is not None,
+            _ungathered_new_lens is not None,
+            gather_context_logits,
+        )
+
+    def _nest_sequences_decode_fast(
+        self,
+        input_ids: Union[Sequence[int], torch.Tensor],
+        input_pos: Union[Sequence[int], int, torch.Tensor],
+        cache_loc: Union[Sequence[int], torch.Tensor, None],
+        cu_num_pages: Union[Sequence[int], torch.Tensor, None],
+        _ungathered_input_ids: Optional[torch.Tensor],
+        _ungathered_new_lens: Optional[torch.Tensor],
+    ) -> None:
+        """Steady-state decode fast path. Pre-conditions are checked by the caller
+        in ``nest_sequences`` via ``_decode_step_signature``: single-sequence,
+        pure-decode batch, no multimodal extras, dispatch flags unchanged from
+        the previous step.
+
+        Only the values that genuinely change per token are restaged:
+        ``input_ids``, ``input_pos``, and the optional ``cache_loc`` /
+        ``cu_num_pages``. The four derivatives of input_pos (``last_page_len``,
+        ``seq_len_with_cache``, ``position_ids``, ``pages_per_seq``) are
+        recomputed numpy-only over the cached host views. Everything else
+        (``cu_seqlen``, ``seq_len``, ``batch_info``, ``prompt_lens``,
+        ``slot_idx``, ``extra_page_per_seq``, ``use_initial_states``,
+        ``any_prefill_use_initial_states``, ``token_gather_indices``, and the
+        three ``_gather_*`` overlap-scheduler tensors) already hold the correct
+        value from the previous call and are left in place.
+
+        ``sl_host`` is implicitly ``[1]`` and is therefore folded into the
+        derivative expressions as constants rather than re-fetched.
+        """
+        if isinstance(input_pos, int):
+            input_pos = torch.full((self.num_sequences,), input_pos, dtype=torch.int)
+        self._stage_arg("input_pos", input_pos)
+        self._stage_arg("input_ids", input_ids, reset_val=0)
+
+        # Re-stage paged-cache assignments if provided. Page assignments change
+        # only when the decode crosses a tokens_per_block boundary, but the
+        # caller passes them on every step; staging is a fast numpy copy.
+        self._stage_arg("cache_loc", cache_loc)
+        self._stage_arg("cu_num_pages", cu_num_pages)
+
+        # Refresh the four derivatives of input_pos. sl == 1 in the steady state.
+        ip_host_np = self._input_buffer.get_host_np_view("input_pos", truncate=True)
+        # last_page_len = (input_pos + seq_len - 1) % tokens_per_block + 1, with seq_len == 1.
+        self._stage_arg("last_page_len", ip_host_np % self.tokens_per_block + 1)
+        # seq_len_with_cache = input_pos + seq_len.
+        self._stage_arg("seq_len_with_cache", ip_host_np + 1)
+
+        if self._is_required("position_ids"):
+            # For a single-sequence single-token decode, position_ids[i] == input_pos[i].
+            # InputBuffer.stage copies into the pinned buffer, so no aliasing concern.
+            self._stage_arg("position_ids", ip_host_np, reset_val=0)
+
+        if self._is_required("pages_per_seq"):
+            assert cu_num_pages is not None, "cu_num_pages is required for pages_per_seq"
+            cu_num_pages_host_np = self._input_buffer.get_host_np_view(
+                "cu_num_pages", truncate=True
+            )
+            self._stage_arg("pages_per_seq", cu_num_pages_host_np[1:] - cu_num_pages_host_np[:-1])
+
+        # Same H2D + rescatter + offset + host-prep tail as the full path.
+        self._input_buffer.copy_to_device()
+        if _ungathered_input_ids is not None:
+            self.rescatter_input_ids_(_ungathered_input_ids)
+        if _ungathered_new_lens is not None:
+            self.offset_with_new_lens_(_ungathered_new_lens)
+        self.run_host_prepare_for_attention_forward()
+
     @nvtx_range("ad_nest_sequences")
     def nest_sequences(
         self,
@@ -1192,6 +1310,34 @@ class SequenceInfo:
         chosen as "neutral" values so that for cases like rounding up batch sizes for cudagraph we
         only write to unused caches.
         """
+        # Decode fast path: when the previous call established a single-sequence,
+        # pure-decode batch with matching dispatch flags, only restage the values
+        # that actually change per token. Skips ~15 stage_arg calls + the
+        # cu_seqlen/seq_len/batch_info/prompt_lens/slot_idx/_gather_*/etc.
+        # derivations that would re-stage values byte-identical to the previous
+        # step. See ``_nest_sequences_decode_fast`` for the invariants.
+        sig = self._decode_step_signature(
+            cu_seqlen,
+            batch_info,
+            extra_args,
+            _ungathered_input_ids,
+            _ungathered_new_lens,
+            gather_context_logits,
+        )
+        if sig is not None and sig == self._prev_decode_sig:
+            self._nest_sequences_decode_fast(
+                input_ids,
+                input_pos,
+                cache_loc,
+                cu_num_pages,
+                _ungathered_input_ids,
+                _ungathered_new_lens,
+            )
+            return
+        # First iter / shape change / batch-composition change: record current
+        # signature (may be None) and fall through to the full staging path.
+        self._prev_decode_sig = sig
+
         ### UPDATE (CU)SEQ_LEN, BATCH INFO, AND INPUT_POS FIRST SINCE IT'S USED FOR OTHER UPDATES ##
         self._stage_arg("cu_seqlen", cu_seqlen)
         # Numpy view over the truncated host buffer — used by all subsequent arithmetic.
