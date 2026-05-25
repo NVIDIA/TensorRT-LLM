@@ -6,6 +6,7 @@ import re
 from functools import lru_cache
 from typing import Any, Dict, List, Optional, Tuple, Union
 
+import numpy as np
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
@@ -52,6 +53,17 @@ from ..flashinfer_utils import IS_FLASHINFER_AVAILABLE
 if IS_FLASHINFER_AVAILABLE:
     from ..custom_ops import flashinfer_apply_rope_with_cos_sin_cache_inplace
 
+# Vision RoPE on Qwen2-VL/2.5-VL/3-VL uses head_dim 72/80 which doesn't satisfy
+# FlashInfer's "head_size % 64 == 0" precondition. Fall back to flash_attn's
+# fused Triton rotary kernel: one launch instead of the ~7 elementwise launches
+# of the PyTorch path (mul x4, add/sub x2, cat x1).
+try:
+    from flash_attn.ops.triton.rotary import \
+        apply_rotary as _flash_attn_apply_rotary  # type: ignore
+    _FLASH_ATTN_ROTARY_AVAILABLE = True
+except ImportError:  # pragma: no cover - flash_attn is part of the default deps
+    _flash_attn_apply_rotary = None
+    _FLASH_ATTN_ROTARY_AVAILABLE = False
 from ..modules.gated_mlp import GatedMLP
 from ..modules.rotary_embedding import MRotaryEmbedding, RotaryEmbedding
 from .modeling_auto import AutoModelForCausalLM
@@ -151,7 +163,6 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
         image_token_id = config.image_token_id
         video_token_id = config.video_token_id
         vision_start_token_id = config.vision_start_token_id
-        mrope_position_deltas = []
 
         # Handle case with no vision inputs
         if image_grid_thw is None and video_grid_thw is None:
@@ -176,121 +187,124 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
                 )
             return position_ids, mrope_position_deltas
 
-        # Handle case with vision inputs
-        total_input_ids = input_ids
-        if attention_mask is None:
-            attention_mask = torch.ones_like(total_input_ids)
-
-        position_ids = torch.ones(
-            3,
-            input_ids.shape[0],
-            input_ids.shape[1],
-            dtype=input_ids.dtype,
-            device=input_ids.device,
-        )
-
-        image_index, video_index = 0, 0
-        attention_mask = attention_mask.to(total_input_ids.device)
-
-        for i, input_ids in enumerate(total_input_ids):
-            input_ids = input_ids[attention_mask[i] == 1]
-            image_nums, video_nums = 0, 0
-            vision_start_indices = torch.argwhere(
-                input_ids == vision_start_token_id).squeeze(1)
-            vision_tokens = input_ids[vision_start_indices + 1]
-            image_nums = (vision_tokens == image_token_id).sum()
-            video_nums = (vision_tokens == video_token_id).sum()
-            input_tokens = input_ids.tolist()
-            llm_pos_ids_list: list = []
+        # numpy-based vectorized impl: ~2-3× faster than the torch loop
+        # version on CPU since per-image/video work is small tensor
+        # allocations dominated by Python+dispatch overhead. Output tensors
+        # are placed back on ``input_ids.device``.
+        input_device = input_ids.device
+        input_dtype = input_ids.dtype
+        ids_np = input_ids.detach().cpu().numpy()
+        attn_np = (np.ones_like(ids_np) if attention_mask is None else
+                   attention_mask.detach().cpu().numpy())
+        image_grid_np = (image_grid_thw.detach().cpu().numpy()
+                         if image_grid_thw is not None else None)
+        video_grid_np = (video_grid_thw.detach().cpu().numpy()
+                         if video_grid_thw is not None else None)
+        if second_per_grid_ts is not None and isinstance(
+                second_per_grid_ts, torch.Tensor):
+            second_per_grid_ts_np = second_per_grid_ts.detach().cpu().numpy()
+        else:
+            second_per_grid_ts_np = second_per_grid_ts
+        tokens_per_second = (config.vision_config.tokens_per_second if hasattr(
+            config.vision_config, 'tokens_per_second') else None)
+        B, S = ids_np.shape
+        position_ids_np = np.ones((3, B, S), dtype=ids_np.dtype)
+        deltas = []
+        image_index = 0
+        video_index = 0
+        for i in range(B):
+            mask_i = attn_np[i] == 1
+            seq = ids_np[i][mask_i]
+            vision_start_indices = np.flatnonzero(seq == vision_start_token_id)
+            vision_tokens = (seq[vision_start_indices +
+                                 1] if vision_start_indices.size else seq[:0])
+            image_nums = int((vision_tokens == image_token_id).sum())
+            video_nums = int((vision_tokens == video_token_id).sum())
+            seq_list = seq.tolist()
+            has_image = image_token_id in seq_list
+            has_video = video_token_id in seq_list
+            llm_pos_ids_list = []
             st = 0
             remain_images, remain_videos = image_nums, video_nums
-
             for _ in range(image_nums + video_nums):
-                if image_token_id in input_tokens and remain_images > 0:
-                    ed_image = input_tokens.index(image_token_id, st)
+                if has_image and remain_images > 0:
+                    ed_image = seq_list.index(image_token_id, st)
                 else:
-                    ed_image = len(input_tokens) + 1
-                if video_token_id in input_tokens and remain_videos > 0:
-                    ed_video = input_tokens.index(video_token_id, st)
+                    ed_image = len(seq_list) + 1
+                if has_video and remain_videos > 0:
+                    ed_video = seq_list.index(video_token_id, st)
                 else:
-                    ed_video = len(input_tokens) + 1
-
+                    ed_video = len(seq_list) + 1
                 if ed_image < ed_video:
-                    t, h, w = (
-                        image_grid_thw[image_index][0],
-                        image_grid_thw[image_index][1],
-                        image_grid_thw[image_index][2],
-                    )
+                    t = int(image_grid_np[image_index][0])
+                    h = int(image_grid_np[image_index][1])
+                    w = int(image_grid_np[image_index][2])
                     second_per_grid_t = 0
                     image_index += 1
                     remain_images -= 1
                     ed = ed_image
                 else:
-                    t, h, w = (
-                        video_grid_thw[video_index][0],
-                        video_grid_thw[video_index][1],
-                        video_grid_thw[video_index][2],
-                    )
-                    if second_per_grid_ts is not None:
-                        second_per_grid_t = second_per_grid_ts[video_index]
+                    t = int(video_grid_np[video_index][0])
+                    h = int(video_grid_np[video_index][1])
+                    w = int(video_grid_np[video_index][2])
+                    if second_per_grid_ts_np is not None:
+                        second_per_grid_t = float(
+                            second_per_grid_ts_np[video_index])
                     else:
                         second_per_grid_t = 1.0
                     video_index += 1
                     remain_videos -= 1
                     ed = ed_video
-
-                llm_grid_t, llm_grid_h, llm_grid_w = (
-                    t.item(),
-                    h.item() // spatial_merge_size,
-                    w.item() // spatial_merge_size,
-                )
+                llm_grid_t = t
+                llm_grid_h = h // spatial_merge_size
+                llm_grid_w = w // spatial_merge_size
                 text_len = ed - st
-
-                st_idx = llm_pos_ids_list[-1].max() + 1 if len(
-                    llm_pos_ids_list) > 0 else 0
-                llm_pos_ids_list.append(
-                    torch.arange(text_len).view(1, -1).expand(3, -1) + st_idx)
-
+                st_idx = llm_pos_ids_list[-1].max(
+                ) + 1 if llm_pos_ids_list else 0
+                if text_len > 0:
+                    llm_pos_ids_list.append(
+                        np.broadcast_to(np.arange(text_len), (3, text_len)) +
+                        st_idx)
                 # Calculate temporal position IDs based on model type
-                if hasattr(config.vision_config, 'tokens_per_second'):
+                if tokens_per_second is not None:
                     # Qwen2_5_VL style temporal position calculation
-                    if isinstance(second_per_grid_t, torch.Tensor):
-                        second_per_grid_t = second_per_grid_t.item()
-                    range_tensor = torch.arange(llm_grid_t).view(-1, 1)
-                    expanded_range = range_tensor.expand(
-                        -1, llm_grid_h * llm_grid_w)
-                    time_tensor = expanded_range * second_per_grid_t * config.vision_config.tokens_per_second
-                    t_index = time_tensor.long().flatten()
+                    t_index = (np.arange(llm_grid_t).reshape(-1, 1) *
+                               (second_per_grid_t * tokens_per_second))
+                    t_index = np.broadcast_to(
+                        t_index.astype(np.int64),
+                        (llm_grid_t, llm_grid_h * llm_grid_w),
+                    ).reshape(-1)
+                    h_idx = np.broadcast_to(
+                        np.arange(llm_grid_h).reshape(1, -1, 1),
+                        (llm_grid_t, llm_grid_h, llm_grid_w),
+                    ).reshape(-1)
+                    w_idx = np.broadcast_to(
+                        np.arange(llm_grid_w).reshape(1, 1, -1),
+                        (llm_grid_t, llm_grid_h, llm_grid_w),
+                    ).reshape(-1)
+                    block = np.stack([t_index, h_idx, w_idx])
                 else:
                     # Qwen2VL style temporal position calculation
-                    t_index = torch.arange(llm_grid_t).view(-1, 1).expand(
-                        -1, llm_grid_h * llm_grid_w).flatten()
-
-                h_index = torch.arange(llm_grid_h).view(1, -1, 1).expand(
-                    llm_grid_t, -1, llm_grid_w).flatten()
-                w_index = torch.arange(llm_grid_w).view(1, 1, -1).expand(
-                    llm_grid_t, llm_grid_h, -1).flatten()
-
-                llm_pos_ids_list.append(
-                    torch.stack([t_index, h_index, w_index]) + text_len +
-                    st_idx)
+                    block = np.indices(
+                        (llm_grid_t, llm_grid_h, llm_grid_w)).reshape(3, -1)
+                llm_pos_ids_list.append(block + text_len + st_idx)
                 st = ed + llm_grid_t * llm_grid_h * llm_grid_w
-
-            if st < len(input_tokens):
-                st_idx = llm_pos_ids_list[-1].max() + 1 if len(
-                    llm_pos_ids_list) > 0 else 0
-                text_len = len(input_tokens) - st
+            if st < len(seq_list):
+                st_idx = llm_pos_ids_list[-1].max(
+                ) + 1 if llm_pos_ids_list else 0
+                text_len = len(seq_list) - st
                 llm_pos_ids_list.append(
-                    torch.arange(text_len).view(1, -1).expand(3, -1) + st_idx)
-
-            llm_positions = torch.cat(llm_pos_ids_list, dim=1).reshape(3, -1)
-            position_ids[..., i, attention_mask[i] == 1] = llm_positions.to(
-                position_ids.device)
-            mrope_position_deltas.append(llm_positions.max() + 1 -
-                                         len(total_input_ids[i]))
-
-        mrope_position_deltas = torch.tensor(
-            mrope_position_deltas, device=input_ids.device).unsqueeze(1)
+                    np.broadcast_to(np.arange(text_len), (3, text_len)) +
+                    st_idx)
+            llm_positions = np.concatenate(llm_pos_ids_list,
+                                           axis=1).reshape(3, -1)
+            position_ids_np[:, i, mask_i] = llm_positions
+            deltas.append(
+                int(llm_positions.max()) + 1 - int(ids_np[i].shape[0]))
+        position_ids = torch.from_numpy(position_ids_np).to(device=input_device,
+                                                            dtype=input_dtype)
+        mrope_position_deltas = torch.tensor(deltas,
+                                             device=input_device).unsqueeze(1)
         return position_ids, mrope_position_deltas
 
     def _preprocess(self, text: Dict[str, any], mm_data: Dict[str, any],
@@ -649,13 +663,39 @@ class Qwen2_5_VLVisionAttention(Attention):
                     err,
                 )
 
-        cos = cos.to(dtype=q.dtype)
-        sin = sin.to(dtype=q.dtype)
+        # cos/sin are pre-cast to ``q.dtype`` upstream (``get_rope_and_window_
+        # index_by_thw`` for Qwen2.5-VL; ``rope_cos_cache`` buffer dtype for
+        # Qwen3-VL). When that holds, ``.to(dtype=q.dtype)`` is a no-op; keep
+        # it as a safety net for callers/quantization paths that didn't pre-cast.
+        if cos.dtype != q.dtype:
+            cos = cos.to(dtype=q.dtype)
+        if sin.dtype != q.dtype:
+            sin = sin.to(dtype=q.dtype)
         q = q.view(seq_len, -1, self.head_dim)
         k = k.view(seq_len, -1, self.head_dim)
         v = v.view(seq_len, -1, self.head_dim)
-        q = RotaryEmbedding.apply_rotary_pos_emb(q, cos, sin)
-        k = RotaryEmbedding.apply_rotary_pos_emb(k, cos, sin)
+        if _FLASH_ATTN_ROTARY_AVAILABLE:
+            # flash_attn Triton kernel: single launch per tensor. cos/sin
+            # are expected as ``[seqlen, head_dim/2]``. The PyTorch path
+            # built ``RotaryEmbedding.apply_rotary_pos_emb`` with cos/sin
+            # already in that layout (see ``get_rotary_pos_emb_window_data``).
+            # The kernel takes 4D ``(batch, seq, nheads, headdim)``; add a
+            # batch dim, run in-place, then drop it.
+            q4 = q.unsqueeze(0)
+            k4 = k.unsqueeze(0)
+            _flash_attn_apply_rotary(q4,
+                                     cos,
+                                     sin,
+                                     interleaved=False,
+                                     inplace=True)
+            _flash_attn_apply_rotary(k4,
+                                     cos,
+                                     sin,
+                                     interleaved=False,
+                                     inplace=True)
+        else:
+            q = RotaryEmbedding.apply_rotary_pos_emb(q, cos, sin)
+            k = RotaryEmbedding.apply_rotary_pos_emb(k, cos, sin)
         q, k, v = q.reshape(seq_len, -1), k.reshape(seq_len,
                                                     -1), v.reshape(seq_len, -1)
         return q, k, v
@@ -736,21 +776,21 @@ class Qwen2_5_VLVisionBlock(torch.nn.Module):
         position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         **kwargs,
     ) -> torch.Tensor:
-
-        residual = hidden_states
-        hidden_states = self.norm1(hidden_states)
-        hidden_states = residual + self.attn(
-            hidden_states=hidden_states,
+        # vLLM-style residual fusion: collapse the post-attn residual add
+        # into ``norm2``'s residual path (``RMSNorm.forward`` with ``residual=``
+        # uses the FlashInfer ``fused_add_rmsnorm`` kernel). Saves one
+        # ``add<c10::BFloat16>`` launch per vision block (= 32 launches per
+        # executor iter at full-batch). Mirrors
+        # ``vllm/model_executor/models/qwen2_5_vl.py::Qwen2_5_VisionBlock``.
+        x_attn = self.attn(
+            hidden_states=self.norm1(hidden_states),
             attn_metadata=attn_metadata,
             position_ids=position_ids,
             position_embeddings=position_embeddings,
             **kwargs,
         )
-
-        residual = hidden_states
-        hidden_states = self.norm2(hidden_states)
-        hidden_states = residual + self.mlp(hidden_states)
-        return hidden_states
+        x_fused_norm, residual = self.norm2(hidden_states, residual=x_attn)
+        return residual + self.mlp(x_fused_norm)
 
 
 class Qwen2_5_VLPatchMerger(torch.nn.Module):
@@ -992,6 +1032,18 @@ class Qwen2_5_VisionModel(torch.nn.Module):
             -1, cos_thw.shape[-1])
         sin_thw = sin_thw[window_index_thw_dev, :, :].reshape(
             -1, sin_thw.shape[-1])
+
+        # Cast once (per cached (t, h, w)) to the vision-tower dtype so the
+        # per-block ``cos.to(dtype=q.dtype)`` cast in ``apply_rope`` becomes a
+        # no-op. Mirrors vLLM's ``get_rope_by_thw`` which builds the rotary
+        # cache directly in the model dtype (see note above).
+        target_dtype = (
+            self.model_config.pretrained_config.vision_config.torch_dtype
+            if hasattr(self.model_config.pretrained_config.vision_config,
+                       "torch_dtype") else
+            self.model_config.pretrained_config.torch_dtype)
+        cos_thw = cos_thw.to(target_dtype)
+        sin_thw = sin_thw.to(target_dtype)
 
         return cos_thw, sin_thw, window_index_thw, tuple(seq_lens_thw)
 
