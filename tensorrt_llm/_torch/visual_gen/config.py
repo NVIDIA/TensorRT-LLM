@@ -40,6 +40,16 @@ from tensorrt_llm.visual_gen.args import (
     TorchCompileConfig,
     VisualGenArgs,
 )
+from tensorrt_llm.visual_gen.sparse_attention import SkipSoftmaxConfig
+from tensorrt_llm.visual_gen.sparse_attention import (
+    auto_detect_sparse_attention_config as _auto_detect_sparse_attention_config,
+)
+from tensorrt_llm.visual_gen.sparse_attention import (
+    auto_detect_sparse_yaml as _auto_detect_sparse_yaml,
+)
+from tensorrt_llm.visual_gen.sparse_attention import (
+    load_sparse_config_from_yaml as _load_sparse_config_from_yaml,
+)
 
 # =============================================================================
 # Utilities
@@ -464,6 +474,45 @@ class DiffusionModelConfig(BaseModel):
                     f"Config not found at {checkpoint_dir}. "
                     "Expected model_index.json (diffusers) or "
                     "safetensors with embedded config metadata."
+                )
+
+        # Load sparse attention calibration. ModelOpt artifacts carry the
+        # calibration formula and disabled-layer/component map; user config
+        # contributes only public knobs such as target_sparsity.
+        yaml_sparse = None
+        yaml_path = attention_cfg.sparse_config_path
+        if yaml_path is not None:
+            yaml_sparse = _load_sparse_config_from_yaml(yaml_path)
+            if yaml_sparse is not None:
+                logger.info(f"Loaded sparse config from {yaml_path}")
+
+        if yaml_sparse is None:
+            yaml_sparse = _auto_detect_sparse_yaml(str(checkpoint_path))
+            if yaml_sparse is not None:
+                logger.info("Auto-detected sparse config YAML from checkpoint")
+
+        if yaml_sparse is None:
+            ckpt_dict = vars(pretrained_config) if pretrained_config else {}
+            yaml_sparse = _auto_detect_sparse_attention_config(ckpt_dict)
+            if yaml_sparse is not None:
+                formula = yaml_sparse._formula
+                if formula is not None:
+                    logger.info(
+                        "Auto-detected sparse config from config.json "
+                        f"(formula: log_a={formula.log_a:.2f}, b={formula.b:.2f})"
+                    )
+                else:
+                    logger.info("Auto-detected sparse config from config.json")
+
+        if yaml_sparse is not None:
+            user_cfg = attention_cfg.sparse_attention_config
+            if user_cfg is not None and isinstance(user_cfg, SkipSoftmaxConfig):
+                attention_cfg = attention_cfg.model_copy(
+                    update={"sparse_attention_config": yaml_sparse._with_public_overrides(user_cfg)}
+                )
+            else:
+                attention_cfg = attention_cfg.model_copy(
+                    update={"sparse_attention_config": yaml_sparse}
                 )
 
         # Resolve quant_config. A user dict containing ``quant_algo``
