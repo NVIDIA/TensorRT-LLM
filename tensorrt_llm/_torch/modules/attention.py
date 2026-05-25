@@ -51,19 +51,9 @@ def extract_extra_attrs(layer_idx: str, attn_type: str):
     metadata_ref = extra_attrs.get("attention_metadata", None)
     assert metadata_ref is not None, "Attention metadata is not set"
     metadata = metadata_ref()
-    if attn_type == "mla":
-        assert isinstance(
-            metadata,
-            TrtllmAttentionMetadata,
-        )
-    else:
-        assert isinstance(
-            metadata,
-            FlashInferAttentionMetadata,
-        ) or isinstance(
-            metadata,
-            TrtllmAttentionMetadata,
-        )
+    assert isinstance(
+        metadata, (FlashInferAttentionMetadata, TrtllmAttentionMetadata)
+    ), "Metadata must be a subclass of FlashInferAttentionMetadata or TrtllmAttentionMetadata"
 
     attn_layers = extra_attrs.get(attn_type + "_layers", None)
     assert attn_layers is not None, "Attention layer is not registered"
@@ -1727,7 +1717,14 @@ class MLA(nn.Module):
             latent_cache_ctx = latent_cache[:num_ctx_tokens, ...]
             if self.apply_rotary_emb:
                 assert position_ids is not None
-                k_pe_ctx = self.apply_rope(q_ctx, k_pe_ctx, position_ids)
+                # position_ids spans [ctx..., gen...] in mixed batches; slice to
+                # match q_ctx/k_pe_ctx so external RoPE uses ctx positions.
+                ctx_position_ids = position_ids[..., :num_ctx_tokens]
+                k_pe_ctx = self.apply_rope(q_ctx, k_pe_ctx, ctx_position_ids)
+                # External RoPE is only used by backends that do not handle
+                # fused RoPE internally, so keep latent_cache in sync.
+                latent_cache_ctx = torch.cat([compressed_kv_ctx, k_pe_ctx],
+                                             dim=-1)
 
             if self.llama_4_scaling:
                 q_ctx = self._attention_scaling(
@@ -1751,7 +1748,14 @@ class MLA(nn.Module):
                 latent_cache_gen = latent_cache[num_ctx_tokens:, ...]
             if self.apply_rotary_emb:
                 assert position_ids is not None
-                k_pe_gen = self.apply_rope(q_gen, k_pe_gen, position_ids)
+                # position_ids spans [ctx..., gen...] in mixed batches; gen
+                # positions start at num_ctx_tokens.
+                gen_position_ids = position_ids[..., num_ctx_tokens:]
+                k_pe_gen = self.apply_rope(q_gen, k_pe_gen, gen_position_ids)
+                # External RoPE is only used by backends that do not handle
+                # fused RoPE internally, so keep latent_cache in sync.
+                latent_cache_gen = torch.cat([compressed_kv_gen, k_pe_gen],
+                                             dim=-1)
 
             if self.llama_4_scaling:
                 q_gen = self._attention_scaling(
@@ -2405,6 +2409,18 @@ class MLA(nn.Module):
         output: torch.Tensor,
         latent_cache: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        if isinstance(attn_metadata, FlashInferAttentionMetadata):
+            if (attn_metadata.enable_context_mla_with_cached_kv
+                    and attn_metadata.num_ctx_cached_tokens > 0):
+                return self.forward_absorption_context(
+                    q,
+                    compressed_kv,
+                    k_pe,
+                    attn_metadata,
+                    output,
+                    position_ids=position_ids,
+                    latent_cache=latent_cache)
+
         if isinstance(self.mha, TrtllmAttention):
             assert isinstance(attn_metadata, TrtllmAttentionMetadata)
             trtllm_attention = cast(TrtllmAttention, self.mha)
@@ -2453,7 +2469,7 @@ class MLA(nn.Module):
 
         # fused_q contains 1) the result of the following bmm with shape [num_tokens, num_heads, kv_lora_rank]
         # 2) rope(q_pe) with shape [num_tokens, num_heads, qk_rope_head_dim]. rope is applied inside AttentionOp
-        num_seqs = attn_metadata.kv_lens_cuda_runtime.size(0)
+        num_seqs = attn_metadata.num_seqs
 
         cu_q_seqlens = torch.empty(num_seqs + 1,
                                    dtype=torch.int32,
