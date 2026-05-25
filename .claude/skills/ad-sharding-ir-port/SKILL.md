@@ -136,7 +136,9 @@ transforms:
     enabled: true
 ```
 
-Use `world_size: 8` when validating TP head-divisibility. Optional `shard_layers` limits which `layer_type` hints are processed; unset means shard all shardable nodes.
+Set `world_size` once, to the **maximum number of GPUs available on the machine**, auto-detected with `python -c 'import torch; print(torch.cuda.device_count())'` (or `nvidia-smi --list-gpus | wc -l`). Do **not** hardcode `world_size: 8` (or any other literal) — porting agents run on heterogeneous hardware and an 8-GPU literal will simply fail to launch on a 2- or 4-GPU machine. If the model's `num_attention_heads` (and, for GQA, `num_key_value_heads`) does not divide the detected GPU count, fall back to the largest power-of-two divisor that does (e.g. 4 on an 8-GPU machine if `num_attention_heads = 12`). Run the end-to-end command exactly once at that size — there is no value in repeating it at multiple smaller sizes, because the offline sharding equivalence test (Step 11b) already exercises 2- and 4-GPU dist configs cheaply.
+
+Optional `shard_layers` limits which `layer_type` hints are processed; unset means shard all shardable nodes.
 
 ### Step 11a — End-to-end run
 
@@ -261,6 +263,6 @@ You are NOT done until every row in the table is a yes-allowed category.
 
 - All four configurations of the **sharding equivalence test** (Step 11b) pass with the parsed `rel_rmse` strictly below the parsed `tol` from the same rank-0 log line. Report the per-cell `rel_rmse` and `tol` pair.
 - `world_size=1`: unsharded path; hints should not break correctness.
-- `world_size=2` and `8`: shape checks and coherent output.
+- `world_size=<max-available>`: end-to-end run (Step 11a) at the maximum GPU count auto-detected on the machine (head-divisibility permitting; see Step 11). One run is sufficient — no `world_size=2` and `world_size=8` pair, no hardcoded literals. Repeating across smaller sizes adds noise without coverage, because Step 11b's offline sharding equivalence test already exercises 2- and 4-GPU dist configs.
 - `apply_sharding_hints` node count vs expectation.
 - Optional: `shard_layers: ['moe']` to verify selective sharding.
