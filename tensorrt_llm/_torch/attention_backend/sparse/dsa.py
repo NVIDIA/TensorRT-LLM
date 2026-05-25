@@ -779,13 +779,19 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         model_is_wrapped: bool = False,
         spec_metadata: Optional['SpecMetadata'] = None,
         spec_tree_manager: Optional['SpecTreeManager'] = None,
+        num_contexts: int = 0,
     ):
         """Update speculative decoding parameters and create expanded buffers."""
-        super().update_spec_dec_param(batch_size, is_spec_decoding_enabled,
+        super().update_spec_dec_param(batch_size,
+                                      is_spec_decoding_enabled,
                                       is_spec_dec_tree,
-                                      is_spec_dec_dynamic_tree, max_draft_len,
-                                      max_total_draft_tokens, model_is_wrapped,
-                                      spec_metadata, spec_tree_manager)
+                                      is_spec_dec_dynamic_tree,
+                                      max_draft_len,
+                                      max_total_draft_tokens,
+                                      model_is_wrapped,
+                                      spec_metadata,
+                                      spec_tree_manager,
+                                      num_contexts=num_contexts)
         self.max_draft_tokens = max_draft_len
         capture_graph = self.is_cuda_graph
         if self.kv_lens_cuda_2d.shape[1] != 1 + self.max_draft_tokens:
@@ -2509,7 +2515,6 @@ class DSATrtllmAttention(TrtllmAttention):
         assert self.is_mla_enable and self.mla_params is not None
         assert metadata.kv_cache_manager is not None
 
-        sink_token_length = 0
         beam_width = 1
 
         torch.ops.trtllm.mla_rope_append_paged_kv_assign_q(
@@ -2532,7 +2537,6 @@ class DSATrtllmAttention(TrtllmAttention):
             self.get_local_layer_idx(metadata),
             metadata.kv_cache_manager.tokens_per_block,
             metadata.kv_cache_manager.max_seq_len,
-            sink_token_length,
             beam_width,
             self.quant_mode,
         )

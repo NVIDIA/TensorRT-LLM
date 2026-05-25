@@ -149,6 +149,18 @@ struct LinearAttentionMetadata
     // If set, overrides the automatic computation (fullAttention.primaryBlocks - this.primaryBlocks).
     std::optional<SizeType32> numPlaceholderBlocks;
 
+    /// RNN model params for disagg TP-mismatch split/concat (CUDA kernels need these individually).
+    /// Populated by CppMambaHybridCacheManager; default 0 for non-hybrid models.
+    SizeType32 rnnNumHeads{0};          // GLOBAL num heads (pre-TP)
+    SizeType32 rnnHeadDim{0};           // Head dimension
+    SizeType32 rnnDState{0};            // SSM state dimension
+    SizeType32 rnnDConv{0};             // Conv kernel size - 1
+    SizeType32 rnnNGroups{0};           // Number of groups (Mamba2)
+    SizeType32 rnnConvSectionLayout{0}; // 0=NONE, 1=NEMOTRON, 2=QWEN3_NEXT
+    SizeType32 rnnSsmBytes{0};      // SSM state bytes per layer (local, = numHeadsLocal * headDim * dState * dtypeSize)
+    SizeType32 rnnSsmDtypeSize{0};  // SSM state dtype size in bytes (e.g., 2 for fp16, 4 for fp32)
+    SizeType32 rnnConvDtypeSize{0}; // Conv state dtype size in bytes (e.g., 2 for bf16, 1 for fp8)
+
     [[nodiscard]] bool shouldAllocateRecurrentStates(
         SizeType32 currentBlockEndTokenIdx, SizeType32 promptLen, SizeType32 tokensPerBlock) const
     {

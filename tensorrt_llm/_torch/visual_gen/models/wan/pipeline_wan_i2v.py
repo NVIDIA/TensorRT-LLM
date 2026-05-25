@@ -15,7 +15,6 @@ from tensorrt_llm._torch.visual_gen.cache.teacache import (
     ExtractorConfig,
     register_extractor_from_config,
 )
-from tensorrt_llm._torch.visual_gen.config import PipelineComponent
 from tensorrt_llm._torch.visual_gen.models.wan.defaults import (
     get_wan_default_params,
     get_wan_extra_param_specs,
@@ -23,7 +22,7 @@ from tensorrt_llm._torch.visual_gen.models.wan.defaults import (
 from tensorrt_llm._torch.visual_gen.models.wan.pipeline_wan_utils import retrieve_latents
 from tensorrt_llm._torch.visual_gen.output import CudaPhaseTimer, PipelineOutput
 from tensorrt_llm._torch.visual_gen.pipeline import BasePipeline, ExtraParamSchema
-from tensorrt_llm._torch.visual_gen.pipeline_registry import register_pipeline
+from tensorrt_llm._torch.visual_gen.pipeline_registry import PipelineComponent, register_pipeline
 from tensorrt_llm._torch.visual_gen.utils import postprocess_video_tensor
 from tensorrt_llm.logger import logger
 
@@ -79,7 +78,15 @@ WAN_DEFAULT_NEGATIVE_PROMPT = (
 )
 
 
-@register_pipeline("WanImageToVideoPipeline")
+@register_pipeline(
+    "WanImageToVideoPipeline",
+    hf_ids=[
+        "Wan-AI/Wan2.1-I2V-14B-480P-Diffusers",
+        "Wan-AI/Wan2.1-I2V-14B-720P-Diffusers",
+        "Wan-AI/Wan2.2-I2V-A14B-Diffusers",
+    ],
+    doc="Wan 2.1 & 2.2 image-to-video family.",
+)
 class WanImageToVideoPipeline(BasePipeline):
     def __init__(self, model_config):
         # Wan2.2 14B two-stage denoising parameters
@@ -195,7 +202,6 @@ class WanImageToVideoPipeline(BasePipeline):
                 )
                 logger.info(f"transformer_2 in model_index.json: {has_transformer_2}")
 
-        # Set default VAE scale factors (will be overridden if VAE is loaded)
         self.vae_scale_factor_temporal = 4
         self.vae_scale_factor_spatial = 8
 
@@ -254,21 +260,20 @@ class WanImageToVideoPipeline(BasePipeline):
             logger.info("Detected Wan 2.2 I2V (two-stage, no CLIP)")
         else:
             logger.info("Detected Wan 2.1 I2V (single-stage, uses CLIP)")
+            if PipelineComponent.IMAGE_ENCODER not in skip_components:
+                logger.info("Loading CLIP image encoder for I2V conditioning (Wan 2.1 only)...")
+                self.image_encoder = CLIPVisionModel.from_pretrained(
+                    checkpoint_dir,
+                    subfolder=PipelineComponent.IMAGE_ENCODER,
+                    torch_dtype=torch.float32,  # Keep CLIP in FP32 for stability
+                ).to(device)
 
-        if PipelineComponent.IMAGE_ENCODER not in skip_components and not self.is_wan22_14b:
-            logger.info("Loading CLIP image encoder for I2V conditioning (Wan 2.1 only)...")
-            self.image_encoder = CLIPVisionModel.from_pretrained(
-                checkpoint_dir,
-                subfolder=PipelineComponent.IMAGE_ENCODER,
-                torch_dtype=torch.float32,  # Keep CLIP in FP32 for stability
-            ).to(device)
-
-        if PipelineComponent.IMAGE_PROCESSOR not in skip_components and not self.is_wan22_14b:
-            logger.info("Loading CLIP image processor...")
-            self.image_processor = CLIPImageProcessor.from_pretrained(
-                checkpoint_dir,
-                subfolder=PipelineComponent.IMAGE_PROCESSOR,
-            )
+            if PipelineComponent.IMAGE_PROCESSOR not in skip_components:
+                logger.info("Loading CLIP image processor...")
+                self.image_processor = CLIPImageProcessor.from_pretrained(
+                    checkpoint_dir,
+                    subfolder=PipelineComponent.IMAGE_PROCESSOR,
+                )
 
         self.video_processor = VideoProcessor(vae_scale_factor=self.vae_scale_factor_spatial)
 

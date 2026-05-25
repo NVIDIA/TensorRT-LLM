@@ -85,6 +85,12 @@ def inplace_info():
         torch.ops.trtllm.fused_dit_cross_head_qk_norm_rope.default: {
             1: "qkv"
         },
+        torch.ops.trtllm.fused_dit_split_norm_rope.default: {
+            1: "tensor"
+        },
+        torch.ops.trtllm.fused_dit_split_norm.default: {
+            1: "tensor"
+        },
         torch.ops.trtllm.flashinfer_apply_rope_with_cos_sin_cache_inplace.default:
         {
             1: "query",

@@ -143,7 +143,7 @@ def build_visual_gen_db_entry(
     server_config: dict[str, Any],
     client_config: dict[str, Any],
     result_data: dict[str, Any],
-    extra_visual_gen_options_path: str = "",
+    visual_gen_args_path: str = "",
 ) -> dict[str, Any]:
     """Build one OpenSearch document from VisualGen config and result JSON."""
     expected_num_gpus = get_visual_gen_num_gpus_from_server_config(server_config)
@@ -161,24 +161,25 @@ def build_visual_gen_db_entry(
         "s_model_name": str(model_name).lower(),
         "s_server_name": server_name,
         "l_gpus": expected_num_gpus,
-        "s_extra_visual_gen_options_path": str(extra_visual_gen_options_path),
-        "s_attn_backend": str(_get_nested_value(server_config, "attention.backend", "")),
+        "s_visual_gen_args_path": str(visual_gen_args_path),
+        "s_attn_backend": str(_get_nested_value(server_config, "attention_config.backend", "")),
         "s_quant_algo": str(_get_nested_value(server_config, "quant_config.quant_algo", "")),
-        "b_enable_teacache": _get_nested_value(server_config, "cache.cache_backend", "")
+        "b_enable_teacache": _get_nested_value(server_config, "cache_config.cache_backend", "")
         == "teacache",
         "b_enable_cuda_graph": bool(
-            _get_nested_value(server_config, "cuda_graph.enable_cuda_graph", False)
+            _get_nested_value(server_config, "cuda_graph_config.enable", False)
         ),
         "b_enable_torch_compile": bool(
-            _get_nested_value(server_config, "torch_compile.enable_torch_compile", False)
+            _get_nested_value(server_config, "torch_compile_config.enable", False)
         ),
         "b_enable_two_stage": bool(
-            server_config.get("spatial_upsampler_path") or server_config.get("distilled_lora_path")
+            _get_nested_value(server_config, "pipeline_config.spatial_upsampler_path", None)
+            or _get_nested_value(server_config, "pipeline_config.distilled_lora_path", None)
         ),
-        "l_cfg_size": int(_get_nested_value(server_config, "parallel.dit_cfg_size", 1)),
-        "l_ulysses_size": int(_get_nested_value(server_config, "parallel.dit_ulysses_size", 1)),
+        "l_cfg_size": int(_get_nested_value(server_config, "parallel_config.cfg_size", 1)),
+        "l_ulysses_size": int(_get_nested_value(server_config, "parallel_config.ulysses_size", 1)),
         "l_parallel_vae_size": int(
-            _get_nested_value(server_config, "parallel.parallel_vae_size", 1)
+            _get_nested_value(server_config, "parallel_config.parallel_vae_size", 1)
         ),
         "s_generation_mode": _infer_generation_mode(client_config),
         "s_backend": str(client_config.get("backend")),
