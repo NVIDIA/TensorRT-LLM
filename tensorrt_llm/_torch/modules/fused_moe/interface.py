@@ -217,6 +217,12 @@ class MoE(nn.Module):
     # override this to ``MoESchedulerKind.FUSED_COMM``.
     scheduler_kind: MoESchedulerKind = MoESchedulerKind.EXTERNAL_COMM
 
+    # Opt-in flag for non-divisible EP (num_experts % ep_size != 0). False by default
+    # so backends whose dispatch/combine paths still assume uniform partitioning fail
+    # fast with a clear error. Backends that fully exercise the ceil/floor partition
+    # (see ``_compute_ep_partition``) should override this to ``True``.
+    _supports_non_divisible_ep: bool = False
+
     @classmethod
     @abstractmethod
     def can_implement(
@@ -315,6 +321,20 @@ class MoE(nn.Module):
 
         self.ep_size = model_config.mapping.moe_ep_size
         self.ep_rank = model_config.mapping.moe_ep_rank
+
+        # Non-divisible EP gate. Backends opt in via the class attribute
+        # ``_supports_non_divisible_ep``. Default is to reject so that any backend
+        # whose dispatch/combine paths still assume uniform partitioning fails fast
+        # with a clear error instead of silently using a wrong local-expert range.
+        if (self.num_experts % self.ep_size != 0
+                and not type(self)._supports_non_divisible_ep):
+            raise ValueError(
+                f"{type(self).__name__} does not support non-divisible EP: "
+                f"num_experts ({self.num_experts}) must be divisible by "
+                f"ep_size ({self.ep_size}). Override "
+                f"`_supports_non_divisible_ep = True` on the subclass after "
+                f"verifying the kernel/comm path handles ceil/floor partitioning."
+            )
 
         self.moe_backend = model_config.moe_backend
         self.use_dp = model_config.mapping.enable_attention_dp
