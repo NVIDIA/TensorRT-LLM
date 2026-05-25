@@ -396,6 +396,13 @@ class _InsertCachedOperator(BaseTransform):
         num_groups = len(handler_groups)
         is_multi_group = num_groups >= 2
         vswa_group_nodes: dict[int, dict[str, "Node"]] = {}
+        # Per-group extra-metadata: group 0 reuses the previously-built nodes;
+        # groups 1..N-1 get their own prepare-extra call wired to per-group
+        # swappable inputs.  This is required because some backends' prepare-extra
+        # ops (e.g. Triton's, which consumes seq_len_with_cache) would otherwise
+        # produce group-0 outputs that silently feed every layer.
+        meta_nodes_extra_by_group: Dict[int, List[Node]] = {0: meta_nodes_extra}
+        host_suffix = "_host"
 
         has_unmanaged_paged = num_groups == 0 and any(
             h.is_paged for h in cm._resource_lookup.values()
@@ -430,9 +437,19 @@ class _InsertCachedOperator(BaseTransform):
             )
 
         if is_multi_group:
+            # Names that are routed per-group end-to-end.  seq_len_with_cache is
+            # in this set because under SWA front-eviction the live window's
+            # length diverges from the global (input_pos + seq_len); the kernel,
+            # the prepare-extra op, and the host prepare all need the
+            # window-capped value.
+            vswa_swappable_bases = {
+                "cache_loc",
+                "cu_num_pages",
+                "last_page_len",
+                "seq_len_with_cache",
+            }
+
             # Create per-group graph placeholders for groups 1..N-1
-            vswa_swappable_bases = {"cache_loc", "cu_num_pages", "last_page_len"}
-            host_suffix = "_host"
             std_arg_names = self.attn_descriptor.get_standard_metadata_args()
             for gi in range(1, num_groups):
                 vswa_group_nodes[gi] = {}
@@ -444,6 +461,38 @@ class _InsertCachedOperator(BaseTransform):
                         vswa_group_nodes[gi][arg_name] = self._add_or_retrieve_input(
                             gm, cm, group_arg
                         )
+
+            # Per-group prepare-extra-metadata: re-invoke the op with this
+            # group's swappable inputs so each non-zero group's downstream
+            # consumers (e.g. update_paged_kv_cache write positions) reflect
+            # the window-capped view.  Skipped when the backend has no extra-op.
+            prep_meta_op, num_meta_out, const_args_extra = (
+                self.attn_descriptor.get_prepare_extra_metadata_info(source_attn_nodes[0])
+            )
+            if prep_meta_op is not None and num_meta_out > 0:
+                op_arg_names = [
+                    arg.name
+                    for arg in get_op_schema(prep_meta_op).arguments
+                    if arg.name in cm.info.available_args
+                ]
+                for gi in range(1, num_groups):
+                    group_inputs: List[Node] = []
+                    for arg_name in op_arg_names:
+                        base = arg_name.removesuffix(host_suffix)
+                        if base in vswa_swappable_bases:
+                            is_host = arg_name.endswith(host_suffix)
+                            group_arg = f"{base}_g{gi}{host_suffix if is_host else ''}"
+                            group_inputs.append(self._add_or_retrieve_input(gm, cm, group_arg))
+                        else:
+                            group_inputs.append(self._add_or_retrieve_input(gm, cm, arg_name))
+                    meta_nodes_extra_by_group[gi] = self._insert_extra_metadata_op(
+                        gm, prep_meta_op, group_inputs, const_args_extra, num_meta_out
+                    )
+            else:
+                # Backend has no extra-op: every group gets an empty list (which
+                # is what the original meta_nodes_extra would have been anyway).
+                for gi in range(1, num_groups):
+                    meta_nodes_extra_by_group[gi] = []
 
         # --- Pass 2: insert cached attention nodes with correct group metadata ---
         for (
@@ -462,13 +511,15 @@ class _InsertCachedOperator(BaseTransform):
                     if arg_name in vswa_group_nodes.get(group_idx, {}):
                         layer_meta_nodes_std[arg_pos] = vswa_group_nodes[group_idx][arg_name]
 
+            layer_meta_nodes_extra = meta_nodes_extra_by_group.get(group_idx, meta_nodes_extra)
+
             self._insert_cached_attn_node(
                 gm,
                 attn_node,
                 attn_descriptor.get_cached_attention_op(),
                 qkv,
                 layer_meta_nodes_std,
-                meta_nodes_extra,
+                layer_meta_nodes_extra,
                 cache_in_nodes,
                 constants,
                 prepared_mask,

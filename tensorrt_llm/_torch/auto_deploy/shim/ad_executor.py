@@ -14,7 +14,7 @@ import types
 from collections import abc, defaultdict
 from dataclasses import dataclass
 from types import SimpleNamespace
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import torch
 from strenum import StrEnum
@@ -200,6 +200,105 @@ def maybe_pad_for_cuda_graph(func):
         return ret
 
     return wrapper
+
+
+def _compute_window_local_view(
+    all_indices: Sequence[int],
+    front_removed: int,
+    end_compute_i: int,
+    group_window: int,
+    tokens_per_block: int,
+) -> Tuple[List[int], int, int, int]:
+    """Compute the window-coherent metadata view for one (request, window) pair.
+
+    The C++ KVCacheManager allocates blocks linearly during prefill and only
+    front-evicts during generation (kvCacheManager.cpp::adjustBlocksIfNeeded
+    is invoked from addToken, not addSequenceBatch).  Two regimes follow:
+
+      * Pre-eviction (typically a single long prefill that has not yet been
+        decoded past the window): ``front_removed == 0`` and the live page
+        list covers the full sequence.  The kernel needs every live page and
+        the unclamped local cache length; the sliding-window mask is applied
+        inside the kernel.
+
+      * Post-eviction (decode/extend has advanced past the window): the C++
+        side has bumped ``mNumFrontBlocksRemovedPerWindow`` without popping
+        ``mCacheBlockIds``, so the head of the page list is stale.  After
+        slicing those entries off, the live cache length in window-local
+        coords is ``end_compute_i - front_removed * tokens_per_block`` —
+        bounded above by ``group_window + tokens_per_block - 1`` by the
+        ``while (live >= window + page_size) detachFrontBlock`` loop.
+
+    Both regimes collapse to a single rule: trust the C++ accounting and
+    derive the local cache length from ``end_compute_i`` and ``front_removed``
+    rather than artificially clamping to ``group_window``.  Disagreement
+    between the Python and C++ sides (e.g. a caller passing a stale
+    ``end_compute_i`` against a fresher ``front_removed``) is asserted on
+    rather than silently masked.
+
+    Args:
+        all_indices: Full historical page list from ``get_cache_indices``,
+            including stale front entries when eviction has fired.
+        front_removed: Count of stale front entries, from
+            ``get_num_front_blocks_removed``.
+        end_compute_i: Global token position after this step's tokens are
+            processed (``input_pos + seq_len``).
+        group_window: Sliding-window size for this pool.  Currently only used
+            for the defensive sanity assertion below; the window mask itself
+            is applied inside the kernel via the ``sliding_window`` constant.
+        tokens_per_block: Cache page size.
+
+    Returns:
+        active_indices: the live slice of all_indices to hand the kernel.
+        extra_page: the next page after the live slice (used by the overlap
+            scheduler's deferred-page insertion), or -1 when there is no
+            slot past the live region.
+        seq_len_with_cache: window-local cache length the kernel should see.
+        last_page_len: derived from seq_len_with_cache and tokens_per_block.
+    """
+    live_len = len(all_indices) - front_removed
+    # Window-local cache length: how many tokens the live pages actually hold.
+    # Pre-eviction: end_compute_i (the full prefill so far).
+    # Post-eviction: end_compute_i - front_removed * page_size (capped above by
+    # window + page_size - 1 thanks to the C++ eviction loop).
+    local_cache_len = end_compute_i - front_removed * tokens_per_block
+    # Live cache length must fit inside the live pages.  The C++ KVCacheManager
+    # keeps the two in sync (it bumps front_removed exactly as it frees blocks,
+    # and allocates new ones for incoming tokens), so a violation means the
+    # Python side and C++ side disagree on either end_compute_i or
+    # front_removed -- fail loudly rather than silently clamp.
+    live_capacity = live_len * tokens_per_block
+    assert local_cache_len <= live_capacity, (
+        f"window-local cache length {local_cache_len} exceeds live page capacity "
+        f"{live_capacity} (live_len={live_len}, end_compute_i={end_compute_i}, "
+        f"front_removed={front_removed}, tokens_per_block={tokens_per_block}). "
+        f"C++ KVCacheManager accounting is expected to keep these in sync."
+    )
+    active_token_count = local_cache_len
+    # Sanity: live cache should never exceed window + one spillover page once
+    # front-eviction has fired (the C++ ``while (live >= window + page_size)
+    # detachFrontBlock`` loop guarantees this).  Pre-eviction (front_removed=0,
+    # e.g. a single long prefill) may legitimately exceed the window because
+    # blocks are allocated linearly for the full prompt and only detached
+    # during generation -- so we skip the check there.
+    assert active_token_count <= group_window + tokens_per_block or front_removed == 0, (
+        f"window-local cache length {active_token_count} exceeds "
+        f"window {group_window} + page_size {tokens_per_block} "
+        f"(end_compute_i={end_compute_i}, front_removed={front_removed})"
+    )
+    # Pages needed to address active_token_count tokens; equals live_len in
+    # the common case (post-eviction live = window + spillover, pre-eviction
+    # live = ceil(end_compute_i / page_size)).
+    pages_for_active = (active_token_count + tokens_per_block - 1) // tokens_per_block
+    num_active = min(live_len, pages_for_active)
+    active_indices = list(all_indices[front_removed : front_removed + num_active])
+    extra_slot_idx = front_removed + num_active
+    extra_page = all_indices[extra_slot_idx] if len(all_indices) > extra_slot_idx else -1
+    if active_token_count > 0:
+        last_page_len = (active_token_count - 1) % tokens_per_block + 1
+    else:
+        last_page_len = 0
+    return active_indices, extra_page, active_token_count, last_page_len
 
 
 class ADEngine(ModelEngine):
@@ -678,6 +777,17 @@ class ADEngine(ModelEngine):
         cache_loc_per_pool: List[List[int]] = [[] for _ in range(num_pools)]
         cu_num_pages_per_pool: List[List[int]] = [[0] for _ in range(num_pools)]
         extra_page_per_seq_per_pool: List[List[int]] = [[] for _ in range(num_pools)]
+        # Phase 2: per-pool window-local seq_len_with_cache / last_page_len.
+        # Computed for EVERY pool (including pool 0), since pool 0 has no
+        # privileged "full attention" status — the kvcache transform assigns
+        # pool indices by the order in which distinct KV handlers appear in
+        # the FX graph (layer 0's window class wins pool 0).  A model whose
+        # first layer is SWA (e.g. Gemma-3n) or a pure-SWA model (Mistral,
+        # Phi-3) would otherwise hand the global, unclamped value to the
+        # kernel for pool 0 and corrupt long sequences — exactly the
+        # MMLU-on-Gemma-3n drop this commit fixes.
+        seq_len_with_cache_per_pool: List[List[int]] = [[] for _ in range(num_pools)]
+        last_page_len_per_pool: List[List[int]] = [[] for _ in range(num_pools)]
 
         # Batched per-pool lookup preserves the #13560 host-overhead
         # optimization: one C++ call per pool instead of one per (request, pool).
@@ -702,22 +812,42 @@ class ADEngine(ModelEngine):
 
             for pool_idx, group_window in enumerate(kv_group_windows):
                 all_indices = batch_cache_indices_per_pool[pool_idx][i]
-                # Active blocks = pages needed to fit end_compute_i tokens within
-                # this window.  The trailing slot in all_indices (when present)
-                # is the reserved spillover page.
-                active_token_count = min(end_compute_i, group_window)
-                pages_for_active = (active_token_count + _tokens_per_block - 1) // _tokens_per_block
-                num_active = min(len(all_indices), pages_for_active)
-                active_indices = all_indices[:num_active]
+                # SWA front-eviction: get_batch_cache_indices returns the FULL
+                # historical page list including front-evicted entries (the
+                # C++ side bumps a counter rather than popping mCacheBlockIds).
+                # _compute_window_local_view slices it down to the live window
+                # in window-local coords.
+                front_removed = kv_cache_manager.get_num_front_blocks_removed(
+                    request.py_request_id, window_size=group_window
+                )
+                (
+                    active_indices,
+                    extra_page,
+                    active_token_count,
+                    lpl_i,
+                ) = _compute_window_local_view(
+                    all_indices,
+                    front_removed=front_removed,
+                    end_compute_i=end_compute_i,
+                    group_window=group_window,
+                    tokens_per_block=_tokens_per_block,
+                )
+                num_active = len(active_indices)
 
                 cache_loc_per_pool[pool_idx].extend(active_indices)
                 cu_num_pages_per_pool[pool_idx].append(
                     cu_num_pages_per_pool[pool_idx][i] + num_active
                 )
-                if len(all_indices) > num_active:
-                    extra_page_per_seq_per_pool[pool_idx].append(all_indices[num_active])
-                else:
-                    extra_page_per_seq_per_pool[pool_idx].append(-1)
+                extra_page_per_seq_per_pool[pool_idx].append(extra_page)
+                # Window-local seq_len_with_cache / last_page_len for every
+                # pool (including 0).  For full-attention pools the helper
+                # returns the unclamped global value (group_window equals
+                # max_seq_len, no clamping kicks in), so this is identical to
+                # the legacy single-pool path for non-SWA models.  For SWA
+                # pools (whether pool 0 or pool 1+), it carries the
+                # window-local coords the kernel needs under front-eviction.
+                seq_len_with_cache_per_pool[pool_idx].append(active_token_count)
+                last_page_len_per_pool[pool_idx].append(lpl_i)
 
         # Store batch information based on prefill, decode, and extend requests.
         num_decode = len(generation_requests)
@@ -745,6 +875,13 @@ class ADEngine(ModelEngine):
             cache_loc_per_pool=cache_loc_per_pool if num_pools > 0 else None,
             cu_num_pages_per_pool=cu_num_pages_per_pool if num_pools > 0 else None,
             extra_page_per_seq_per_pool=extra_page_per_seq_per_pool if num_pools > 0 else None,
+            # Per-pool window-local lengths gate on num_pools > 0, not
+            # num_pools >= 2.  A pure-SWA single-pool model (Mistral, Phi-3,
+            # all-sliding Gemma variants) needs window-local values just as
+            # much as a mixed-window model; gating at >=2 would silently
+            # leave it on the unclamped global value.
+            seq_len_with_cache_per_pool=seq_len_with_cache_per_pool if num_pools > 0 else None,
+            last_page_len_per_pool=last_page_len_per_pool if num_pools > 0 else None,
             slot_idx=state_slot_idx,
             prompt_lens=prompt_lens,
             gather_context_logits=gather_context_logits,
