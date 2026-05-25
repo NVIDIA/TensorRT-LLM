@@ -283,6 +283,121 @@ class TestDwdpDeepSeekV3Lite(LlmapiAccuracyTestHarness):
 
     @pytest.mark.skip_less_device(4)
     @skip_pre_blackwell
+    def test_dwdp_accuracy_contention_opt(self):
+        """End-to-end accuracy test with ``contention_opt=True``.
+
+        Mirrors ``test_dwdp_accuracy`` (uniform partition, dwdp_size=2,
+        GEN TP=2 on 4 GPU) but turns on the contention optimization so
+        that ``DWDPWeightManager.prefetch_layer`` exercises the batched
+        ``cudaMemcpyBatchAsync`` code path with 2 MiB sub-slices
+        round-robined across peers.  Pass criterion is the same GSM8K
+        threshold (61.537) — the batched path must produce
+        bit-for-bit equivalent results to the per-slice default path,
+        since the only difference is the schedule / launch shape of
+        the same set of D2D copies.
+        """
+        model_path = f"{llm_models_root()}/DeepSeek-V3-Lite/nvfp4_moe_only_mtp"
+
+        ctx_port_0 = get_free_port()
+        ctx_port_1 = get_free_port()
+        gen_port = get_free_port()
+        serve_port = get_free_port()
+
+        ctx_server_config = {
+            "num_instances": 2,
+            "urls": [
+                f"localhost:{ctx_port_0}",
+                f"localhost:{ctx_port_1}",
+            ],
+            "tensor_parallel_size": 1,
+            "pipeline_parallel_size": 1,
+            "disable_overlap_scheduler": True,
+            "enable_autotuner": False,
+            "enable_chunked_prefill": False,
+            "cuda_graph_config": None,
+            "max_batch_size": 16,
+            "max_num_tokens": 8192,
+            "kv_cache_config": {
+                "free_gpu_memory_fraction": 0.4,
+                "enable_block_reuse": False,
+                "enable_partial_reuse": False,
+                "tokens_per_block": 32,
+            },
+            "cache_transceiver_config": {
+                "backend": "UCX",
+                "max_tokens_in_buffer": 8192,
+            },
+            "moe_config": {
+                "backend": "CUTEDSL",
+            },
+            "dwdp_config": {
+                "dwdp_size": 2,
+                "num_groups": 1,
+                "num_experts_per_worker": 36,
+                "num_prefetch_experts": 36,
+                "contention_opt": True,
+            },
+        }
+
+        gen_server_config = {
+            "num_instances": 1,
+            "urls": [f"localhost:{gen_port}"],
+            "tensor_parallel_size": 2,
+            "pipeline_parallel_size": 1,
+            "disable_overlap_scheduler": True,
+            "enable_autotuner": False,
+            "enable_chunked_prefill": False,
+            "cuda_graph_config": None,
+            "max_batch_size": 128,
+            "max_num_tokens": 1024,
+            "kv_cache_config": {
+                "free_gpu_memory_fraction": 0.5,
+                "enable_block_reuse": False,
+                "enable_partial_reuse": False,
+                "tokens_per_block": 32,
+            },
+            "cache_transceiver_config": {
+                "backend": "UCX",
+                "max_tokens_in_buffer": 8192,
+            },
+            "moe_config": {
+                "backend": "CUTEDSL",
+            },
+        }
+
+        worker_config = {
+            "model": model_path,
+            "hostname": "localhost",
+            "port": serve_port,
+            "backend": "pytorch",
+            "context_servers": ctx_server_config,
+            "generation_servers": gen_server_config,
+        }
+
+        frontend_config = {
+            "backend": "pytorch",
+            "hostname": "localhost",
+            "port": serve_port,
+            "context_servers": {
+                "num_instances": 2,
+                "urls": [
+                    f"localhost:{ctx_port_0}",
+                    f"localhost:{ctx_port_1}",
+                ],
+            },
+            "generation_servers": {
+                "num_instances": 1,
+                "urls": [f"localhost:{gen_port}"],
+            },
+        }
+
+        with launch_dwdp_disaggregated_llm(
+            worker_config, frontend_config, model_path, total_gpus=4, max_workers=128
+        ) as llm:
+            run_accuracy_test(llm, self.MODEL_NAME, ["GSM8K"])
+
+    @pytest.mark.skip_less_device(4)
+    @skip_pre_blackwell
     def test_dwdp_accuracy_mode_b_overlap(self):
         """End-to-end accuracy test for Phase 2's redundancy (overlap) path.
 
