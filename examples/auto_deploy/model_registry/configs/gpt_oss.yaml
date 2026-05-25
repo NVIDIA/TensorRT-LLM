@@ -7,7 +7,6 @@
 # Both share GQA (64 Q / 8 KV heads), head_dim=64, hidden=2880, and MXFP4
 # weights on HF that AD's `quantize_mxfp4_moe` transform handles.
 # world_size is set via the registry's `world_size_N.yaml` overlay — not here.
-runtime: trtllm
 model_factory: AutoModelForCausalLM
 model_kwargs:
   dtype: bfloat16
@@ -43,5 +42,3 @@ transforms:
     enabled: true
   fuse_add_rms_norm:
     enabled: true
-  compile_model:
-    piecewise_enabled: false
