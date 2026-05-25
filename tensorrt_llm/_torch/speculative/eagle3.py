@@ -885,9 +885,8 @@ class Eagle3OneModelWorker(SpecWorkerBase):
                     hidden_states = hidden_states[gather_ids]
                 else:
                     hidden_states = hidden_states_to_save[gather_ids]
-                position_ids = (
-                    _select_mtp_position_ids(inputs["position_ids"], gather_ids)
-                    + 1)
+                position_ids = (_select_mtp_position_ids(
+                    inputs["position_ids"], gather_ids) + 1)
 
                 # Update attn_metadata for the next iteration.
                 if i == 0:
