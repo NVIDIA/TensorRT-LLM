@@ -502,26 +502,69 @@ class FusedMoEMethodBase(ABC):
         if not allow_partial_loading:
             self.process_weights_after_loading(module)
 
+            # Finalize shared weights eagerly so each layer's CPU tensors are freed
+            # before the next layer is loaded. This prevents accumulation of all
+            # layers' shared weight tensors in host memory simultaneously.
+            # Partial-loading callers (e.g. RLHF reload) instead rely on
+            # ``post_load_weights`` to finalize once the loading sequence ends.
+            self._finalize_shared_weights(module)
+
+    def _prepare_shared_weights_for_finalization(self, module: torch.nn.Module):
+        """Hook for subclasses to transform shared weight tensors before
+        they are copied into shared memory and freed.
+
+        Called by ``_finalize_shared_weights`` just before the tensors stored
+        as ``local_shared_*`` module attributes are registered with the load
+        balancer and written into POSIX shared-memory segments.  Subclasses
+        may override this to apply weight transformations (e.g. resmoothing)
+        while the tensors are still in private process memory.
+        """
+
+    def _finalize_shared_weights(self, module: torch.nn.Module):
+        """Register shared weights with the load balancer and copy them into
+        shared memory, then delete the private CPU tensor copies.
+
+        Calling this at the end of each layer's ``load_weights`` (rather than
+        deferring to ``post_load_weights``) prevents all layers' CPU tensors
+        from accumulating in host memory simultaneously.  With fewer GPUs per
+        node each rank is responsible for more experts, so the accumulated
+        private tensors can easily exceed available host memory.
+
+        This method is idempotent: if the per-layer ``local_shared_*`` tensors
+        have already been finalized (and deleted), it is a no-op.  This lets
+        ``post_load_weights`` invoke it as a safety net for callers that pass
+        ``allow_partial_loading=True`` (e.g. the RLHF reload path), without
+        double-finalizing in the eager path.
+        """
+        if not self.need_load_shared_weights(module):
+            return
+        if not hasattr(module, 'local_shared_w3_w1_tensors'):
+            return
+        self._prepare_shared_weights_for_finalization(module)
+        weight_fns = {
+            'w3_w1_weight': getattr(module, 'local_shared_w3_w1_tensors'),
+            'w2_weight': getattr(module, 'local_shared_w2_tensors')
+        }
+        delattr(module, 'local_shared_w3_w1_tensors')
+        delattr(module, 'local_shared_w2_tensors')
+        if module.bias:
+            weight_fns.update({
+                'w3_w1_bias':
+                getattr(module, 'local_shared_w3_w1_bias_tensors'),
+                'w2_bias':
+                getattr(module, 'local_shared_w2_bias_tensors')
+            })
+            delattr(module, 'local_shared_w3_w1_bias_tensors')
+            delattr(module, 'local_shared_w2_bias_tensors')
+        module.register_all_parameter_slot_and_to_fix_weight_fns(weight_fns)
+        module.layer_load_balancer.host_tensor_sharer.finalize_layer_weights()
+
     def post_load_weights(self, module: torch.nn.Module):
-        if self.need_load_shared_weights(module):
-            weight_fns = {
-                'w3_w1_weight': getattr(module, 'local_shared_w3_w1_tensors'),
-                'w2_weight': getattr(module, 'local_shared_w2_tensors')
-            }
-            delattr(module, 'local_shared_w3_w1_tensors')
-            delattr(module, 'local_shared_w2_tensors')
-            if module.bias:
-                weight_fns.update({
-                    'w3_w1_bias':
-                    getattr(module, 'local_shared_w3_w1_bias_tensors'),
-                    'w2_bias':
-                    getattr(module, 'local_shared_w2_bias_tensors')
-                })
-                delattr(module, 'local_shared_w3_w1_bias_tensors')
-                delattr(module, 'local_shared_w2_bias_tensors')
-            module.register_all_parameter_slot_and_to_fix_weight_fns(weight_fns)
-            module.layer_load_balancer.host_tensor_sharer.finalize_layer_weights(
-            )
+        # Safety net for deferred-finalization callers (e.g. RLHF reload, which
+        # passes allow_partial_loading=True and so skips the eager per-layer
+        # finalization in load_weights).  Idempotent when finalization already
+        # ran eagerly.
+        self._finalize_shared_weights(module)
         if hasattr(module,
                    "layer_load_balancer") and module.layer_load_balancer:
             module.layer_load_balancer.set_initial_weight_assignments(
@@ -1154,21 +1197,18 @@ class DeepSeekFP8BlockScalesFusedMoEMethod(FusedMoEMethodBase):
                 local_shared_w2_scale_tensors,
                 device=torch.device("cpu"))
 
-    def post_load_weights(self, module: torch.nn.Module):
-        if self.need_load_shared_weights(module):
-            weight_fns = {}
-            if hasattr(module, 'local_shared_w3_w1_scale_tensors'):
-                weight_fns['w3_w1_weight_scaling_factor'] = getattr(
-                    module, 'local_shared_w3_w1_scale_tensors')
-                delattr(module, 'local_shared_w3_w1_scale_tensors')
-            if hasattr(module, 'local_shared_w2_scale_tensors'):
-                weight_fns['w2_weight_scaling_factor'] = getattr(
-                    module, 'local_shared_w2_scale_tensors')
-                delattr(module, 'local_shared_w2_scale_tensors')
-            if weight_fns:
-                module.register_all_parameter_slot_and_to_fix_weight_fns(
-                    weight_fns)
-        super().post_load_weights(module)
+    def _prepare_shared_weights_for_finalization(self, module: torch.nn.Module):
+        weight_fns = {}
+        if hasattr(module, 'local_shared_w3_w1_scale_tensors'):
+            weight_fns['w3_w1_weight_scaling_factor'] = getattr(
+                module, 'local_shared_w3_w1_scale_tensors')
+            delattr(module, 'local_shared_w3_w1_scale_tensors')
+        if hasattr(module, 'local_shared_w2_scale_tensors'):
+            weight_fns['w2_weight_scaling_factor'] = getattr(
+                module, 'local_shared_w2_scale_tensors')
+            delattr(module, 'local_shared_w2_scale_tensors')
+        if weight_fns:
+            module.register_all_parameter_slot_and_to_fix_weight_fns(weight_fns)
 
 
 def resmooth_and_transform_fp8_scale(
@@ -1194,7 +1234,7 @@ class DeepSeekFP8BlockScalesFusedMoEMethodDeepGemm(
     def _needs_e8m0_resmooth(self):
         return is_sm_100f() or get_sm_version() == 120
 
-    def post_load_weights(self, module: torch.nn.Module):
+    def _prepare_shared_weights_for_finalization(self, module: torch.nn.Module):
         if self._needs_e8m0_resmooth():
             # Resmooth shared experts before registering shared weights
             if self.need_load_shared_weights(module):
@@ -1229,17 +1269,16 @@ class DeepSeekFP8BlockScalesFusedMoEMethodDeepGemm(
                             resmoothed_shared_w2_weight.cpu())
                     setattr(module, 'local_shared_w2_scale_tensors',
                             transformed_shared_w2_scale.cpu())
+        super()._prepare_shared_weights_for_finalization(module)
 
-        # Call super() after resmooth shared experts (local_shared tensors will be deleted in super().post_load_weights())
+    def post_load_weights(self, module: torch.nn.Module):
         super().post_load_weights(module)
 
         if self._needs_e8m0_resmooth():
             logger.debug("Resmoothing FP8 weights in post_load_weights")
             resmoothed_w3_w1_weight, transformed_w3_w1_scale = resmooth_and_transform_fp8_scale(
                 module.w3_w1_weight, module.w3_w1_weight_scaling_factor)
-            replace_parameter_and_save_metadata(module, "w3_w1_weight",
-                                                resmoothed_w3_w1_weight,
-                                                module.rebuild_tensor_metadata)
+            module.w3_w1_weight.data.copy_(resmoothed_w3_w1_weight)
             replace_parameter_and_save_metadata(module,
                                                 "w3_w1_weight_scaling_factor",
                                                 transformed_w3_w1_scale,
@@ -1247,9 +1286,7 @@ class DeepSeekFP8BlockScalesFusedMoEMethodDeepGemm(
 
             resmoothed_w2_weight, transformed_w2_scale = resmooth_and_transform_fp8_scale(
                 module.w2_weight, module.w2_weight_scaling_factor)
-            replace_parameter_and_save_metadata(module, "w2_weight",
-                                                resmoothed_w2_weight,
-                                                module.rebuild_tensor_metadata)
+            module.w2_weight.data.copy_(resmoothed_w2_weight)
             replace_parameter_and_save_metadata(module,
                                                 "w2_weight_scaling_factor",
                                                 transformed_w2_scale,

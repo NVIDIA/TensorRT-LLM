@@ -114,22 +114,38 @@ void KVCacheTransferManager::copyBlock(BlockPtr const& src, BlockPtr const& dst,
             auto const& pool = pools[poolIdx];
 
             // For layer-first layout pools, block data is non-contiguous across layers.
-            // Copy each layer's block data separately.
+            // Pool shape: {numLayers, numBlocks, kvFactor, blockSize}. For a fixed block
+            // index, per-layer slices are contiguous rows of (kvFactor * blockSize) elements,
+            // separated by a stride of numBlocks rows between layers. Issue this as a single
+            // pitched cudaMemcpy2DAsync instead of one cudaMemcpyAsync per layer.
             if (pool.layerFirstLayout)
             {
                 auto srcPool = src->isPrimary() ? pool.primaryPtr : pool.secondaryPtr;
                 auto dstPool = dst->isPrimary() ? pool.primaryPtr : pool.secondaryPtr;
-                auto const srcBlockIdx = static_cast<tr::ITensor::DimType64>(src->getMemoryPoolBlockIndex());
-                auto const dstBlockIdx = static_cast<tr::ITensor::DimType64>(dst->getMemoryPoolBlockIndex());
+                auto const srcBlockIdx = static_cast<size_t>(src->getMemoryPoolBlockIndex());
+                auto const dstBlockIdx = static_cast<size_t>(dst->getMemoryPoolBlockIndex());
 
-                for (SizeType32 layerIdx = 0; layerIdx < pool.numLayers; ++layerIdx)
-                {
-                    // pool shape: {numLayers, numBlocks, kvFactor, blockSize}
-                    // slice at {layerIdx, blockIdx} gives {1, kvFactor, blockSize}
-                    auto srcBlock = tr::ITensor::slice(srcPool, {layerIdx, srcBlockIdx}, 1);
-                    auto dstBlock = tr::ITensor::slice(dstPool, {layerIdx, dstBlockIdx}, 1);
-                    (isOffload ? mOffloadManager : mOnboardManager).copy(*srcBlock, *dstBlock);
-                }
+                // Compute pitches from each pool independently: primary and secondary pools
+                // may have different block counts (mNumPrimaryBlocks vs mNumSecondaryBlocks),
+                // so their per-layer strides differ. Using the primary shape for both pitches
+                // would corrupt host-offloaded recurrent state on CPU<->GPU transfers.
+                auto const& srcShape = srcPool->getShape();
+                auto const& dstShape = dstPool->getShape();
+                TLLM_CHECK_WITH_INFO(srcShape.nbDims >= 2,
+                    "Expected layer-first KVCache pool to have at least 2 dims, got %d", srcShape.nbDims);
+                TLLM_CHECK_WITH_INFO(dstShape.nbDims >= 2,
+                    "Expected layer-first KVCache pool to have at least 2 dims, got %d", dstShape.nbDims);
+                auto const srcLayerStrideBytes = srcPool->getSizeInBytes() / static_cast<size_t>(pool.numLayers);
+                auto const dstLayerStrideBytes = dstPool->getSizeInBytes() / static_cast<size_t>(pool.numLayers);
+                // rowBytes is the per-block per-layer payload — identical for primary and secondary.
+                auto const rowBytes = srcLayerStrideBytes / static_cast<size_t>(srcShape.d[1]);
+
+                auto* srcBase = static_cast<char*>(srcPool->data()) + srcBlockIdx * rowBytes;
+                auto* dstBase = static_cast<char*>(dstPool->data()) + dstBlockIdx * rowBytes;
+
+                auto stream = (isOffload ? mOffloadManager : mOnboardManager).getStream().get();
+                TLLM_CUDA_CHECK(cudaMemcpy2DAsync(dstBase, dstLayerStrideBytes, srcBase, srcLayerStrideBytes, rowBytes,
+                    static_cast<size_t>(pool.numLayers), cudaMemcpyDefault, stream));
                 continue;
             }
 
@@ -425,8 +441,12 @@ std::size_t KVCacheTransferManager::computeBlockTransferBytes(
         }
 
         auto const dataType = pool.primaryPtr->getDataType();
-        auto const bytesPerElement
-            = pool.primaryPtr->getSizeInBytes() / static_cast<std::size_t>(pool.primaryPtr->getSize());
+        auto const numElements = static_cast<std::size_t>(pool.primaryPtr->getSize());
+        if (numElements == 0)
+        {
+            continue; // empty pool contributes 0 bytes; avoids divide-by-zero
+        }
+        auto const bytesPerElement = pool.primaryPtr->getSizeInBytes() / numElements;
 
         // Mirror the logic in copyBlock: a partial copy only happens when numTokensToCopy > 0,
         // the data type supports it (not kINT4/kFP4), not block scales, and numTokensToCopy < tokensPerBlock.

@@ -550,6 +550,7 @@ class KVCacheManager(BaseResourceManager):
         self.mapping = mapping
         self.dtype = dtype
         self.kv_cache_type = kv_cache_type
+        self.spec_config = spec_config
         self.pp_layers, self.num_layers = get_pp_layers(
             num_layers,
             mapping,
@@ -620,16 +621,23 @@ class KVCacheManager(BaseResourceManager):
                                        1) if spec_config is not None else 0
         self.linear_attention_metadata = linear_attention_metadata
 
+        # Dynamic-tree draft manager reserves K*max_draft_len KV slots (the draft
+        # loop can write that many even if max_total_draft_tokens is smaller).
+        # Target manager keeps max_total_draft_tokens exactly.
+        self._kv_reserve_draft_tokens = self.max_total_draft_tokens
+        if (self.is_draft and spec_config is not None
+                and getattr(spec_config, 'use_dynamic_tree', False)
+                and getattr(spec_config, 'dynamic_tree_max_topK', 0) > 0):
+            draft_loop_tokens = spec_config.dynamic_tree_max_topK * spec_config.max_draft_len
+            self._kv_reserve_draft_tokens = max(self.max_total_draft_tokens,
+                                                draft_loop_tokens)
+
         self.max_attention_window_vec = self._resolve_max_attention_window_vec(
             kv_cache_config=kv_cache_config,
             max_seq_len=max_seq_len,
             num_layers=num_layers,
             layer_mask=layer_mask,
         )
-
-        sink_token_length = (kv_cache_config.sink_token_length
-                             if kv_cache_config.sink_token_length is not None
-                             else 0)
 
         # Determine if this is VSWA (Variable Sliding Window Attention).
         # The `w > 0` check excludes LinearCacheType.RECURRENT_STATES sentinel
@@ -668,13 +676,19 @@ class KVCacheManager(BaseResourceManager):
                 # slots live in a separate window: at minimum the live
                 # state per concurrent request, and -- when block reuse is
                 # enabled -- enough room for one regular snapshot per
-                # snapshot interval over the full token budget.
-                max_snapshots = self.max_batch_size
+                # snapshot interval over the full token budget. With
+                # pipeline parallelism, multiple microbatches can be
+                # in-flight simultaneously on the same rank, each holding
+                # up to ``max_batch_size`` sequences' Mamba state, so the
+                # live-state slot count must scale with ``pp_size``.
+                pp_size = self.mapping.pp_size if self.mapping is not None else 1
+                live_state_slots = self.max_batch_size * pp_size
+                max_snapshots = live_state_slots
                 if kv_cache_config.enable_block_reuse:
                     max_snapshots = max(
                         kv_cache_config.max_tokens //
                         linear_attention_metadata.states_snapshot_interval,
-                        self.max_batch_size)
+                        live_state_slots)
 
                 blocks_per_window[LinearCacheType.RECURRENT_STATES.value] = (
                     int(max_snapshots), 0)
@@ -743,7 +757,6 @@ class KVCacheManager(BaseResourceManager):
             max_attention_window_vec=self.max_attention_window_vec,
             blocks_per_window=blocks_per_window,
             tokens_per_block=tokens_per_block,
-            sink_token_length=sink_token_length,
             max_seq_len=self.max_seq_len,
             max_beam_width=max_beam_width,
         )
@@ -776,7 +789,7 @@ class KVCacheManager(BaseResourceManager):
             'max_beam_width': max_beam_width,
             'max_attention_window_vec': self.max_attention_window_vec,
             'dtype': dtype,
-            'sink_token_length': sink_token_length,
+            'sink_token_length': 0,
             'stream': self._stream.cuda_stream,  # Pass to BufferManager
             'max_sequence_length': self.max_seq_len,
             'chunk_size': min(max_num_tokens, self.max_seq_len),
@@ -826,7 +839,8 @@ class KVCacheManager(BaseResourceManager):
         self.max_blocks_per_seq = self.impl.max_blocks_per_seq
         self.enable_block_reuse = kv_cache_config.enable_block_reuse
         self.enable_partial_reuse = kv_cache_config.enable_partial_reuse
-        self.host_kv_cache_block_offsets = torch.empty(
+        # Keep unused block offsets as safe block index 0.
+        self.host_kv_cache_block_offsets = torch.zeros(
             self.num_pools,
             max_batch_size * max_beam_width,
             2,
@@ -958,7 +972,7 @@ class KVCacheManager(BaseResourceManager):
                         continue
                 draft_len = get_draft_token_length(req)
                 self.impl.add_token(req.py_request_id)
-                for _ in range(draft_len):
+                for _ in range(max(draft_len, self._kv_reserve_draft_tokens)):
                     self.impl.add_token(req.py_request_id)
 
             # prefill and generation kernels wait for scheduled offload/onboard/partial copy work before launching
@@ -993,6 +1007,9 @@ class KVCacheManager(BaseResourceManager):
         is_gen: bool = False,
         prepare_resource: bool = True,
         max_num_draft_tokens: int = 0,
+        # Override of py_draft_tokens length for KV reserve (e.g. dynamic-tree
+        # draft loop). Falls back to max_num_draft_tokens when None.
+        kv_reserve_draft_tokens: Optional[int] = None,
         use_mrope: bool = False,
         max_beam_width: int = 1,
         # For capturable drafting loops. During normal inference, the draft model always
@@ -1002,6 +1019,7 @@ class KVCacheManager(BaseResourceManager):
         num_extra_decoding_steps: int = 0,
         draft_kv_cache_manager: Optional[BaseResourceManager] = None,
     ):
+        _kv_draft = kv_reserve_draft_tokens if kv_reserve_draft_tokens is not None else max_num_draft_tokens
         available_blocks = self.get_num_free_blocks()
         # No padding if not enough KV cache space
         if available_blocks < 1:
@@ -1099,10 +1117,10 @@ class KVCacheManager(BaseResourceManager):
                         req.py_decoding_iter = 1
                 req.py_draft_tokens = [1] * max_num_draft_tokens
                 if prepare_resource:
-                    for _ in range(max_num_draft_tokens):
+                    for _ in range(_kv_draft):
                         self.impl.add_token(req.request_id)
                     if draft_kv_cache_manager is not None:
-                        for _ in range(max_num_draft_tokens):
+                        for _ in range(_kv_draft):
                             draft_kv_cache_manager.impl.add_token(
                                 req.request_id)
 
@@ -1124,6 +1142,17 @@ class KVCacheManager(BaseResourceManager):
                 continue
             if request.py_rewind_len > 0:
                 self.rewind_kv_cache(request, request.py_rewind_len)
+            # Symmetric companion to prepare_resources's reserve_slack
+            # add_token loop: when _kv_reserve_draft_tokens (e.g. dynamic
+            # tree's K*max_draft_len) exceeds the runtime draft length,
+            # those extra slots must also be rewound, otherwise the draft
+            # KV cache leaks reserve_slack tokens per generation iteration
+            # and eventually overflows mCacheBlockIndices.
+            runtime_draft_len = (request.py_rewind_len +
+                                 request.py_num_accepted_draft_tokens)
+            extra_rewind = self._kv_reserve_draft_tokens - runtime_draft_len
+            if extra_rewind > 0:
+                self.rewind_kv_cache(request, extra_rewind)
 
         # For context requests, store completed context blocks for KV cache reuse.
         # We wait until context_remaining_length == 0 (all chunks processed) before
@@ -1341,17 +1370,13 @@ class KVCacheManager(BaseResourceManager):
 
     def get_max_atten_window_upper_bound(self, blocks_in_primary_pool,
                                          tokens_per_block, max_beam_width,
-                                         sink_token_len,
                                          max_seq_len: Optional[int]):
         token_capacity = blocks_in_primary_pool * tokens_per_block
         max_blocks_per_seq = math.floor(token_capacity /
                                         (max_beam_width * tokens_per_block))
         assert max_blocks_per_seq > 0, "Impossible to fit in any sequence in kvCache"
 
-        max_token_num = max_blocks_per_seq * tokens_per_block
-        sink_tokens_in_last_block = sink_token_len % tokens_per_block
-        sink_bubble_len = 0 if sink_tokens_in_last_block == 0 else tokens_per_block - sink_tokens_in_last_block
-        max_atten_window_upper_bound = max_token_num - sink_bubble_len
+        max_atten_window_upper_bound = max_blocks_per_seq * tokens_per_block
         if max_seq_len is not None and max_seq_len > max_atten_window_upper_bound and max_beam_width > 1:
             max_atten_window_upper_bound -= tokens_per_block
         assert max_atten_window_upper_bound > 0, "Impossible to fit in any sequence in kvCache"
@@ -1416,7 +1441,14 @@ class KVCacheManager(BaseResourceManager):
         return result
 
     def get_num_free_blocks(self) -> int:
-        if self.is_vswa or self.is_linear_attention:
+        if self.is_linear_attention:
+            value = self.impl.get_kv_cache_stats(
+            ).num_free_blocks_per_window_size[self.max_seq_len]
+            logger.debug(
+                f"For linear attention case, we return the number of free blocks for the kv cache (not for the recurrent states): {value}"
+            )
+            return value
+        if self.is_vswa:
             logger.info(
                 f"For {'linear attention' if self.is_linear_attention else 'VSWA'} case, we return the minimum of the number of free blocks for each window size: {self.impl.get_kv_cache_stats().num_free_blocks_per_window_size}"
             )
@@ -1432,10 +1464,16 @@ class KVCacheManager(BaseResourceManager):
                                  token_num_upper_bound: int,
                                  max_num_draft_tokens: int = 0,
                                  **kwargs) -> int:
-        return min(
-            token_num_upper_bound,
-            self.get_num_free_blocks() * self.tokens_per_block -
+        free_blocks = self.get_num_free_blocks()
+        result = min(
+            token_num_upper_bound, free_blocks * self.tokens_per_block -
             self.num_extra_kv_tokens - max_num_draft_tokens)
+        logger.debug(
+            f"[get_num_available_tokens] free_blocks={free_blocks}, "
+            f"tokens_per_block={self.tokens_per_block}, "
+            f"num_extra_kv_tokens={self.num_extra_kv_tokens}, "
+            f"token_num_upper_bound={token_num_upper_bound}, result={result}")
+        return result
 
     def get_buffers(self,
                     layer_idx: int,
@@ -1587,7 +1625,8 @@ class KVCacheManager(BaseResourceManager):
                 list(range(self.num_local_layers))
             }
         for local_layer_idx in range(self.num_local_layers):
-            window_size = self.max_attention_window_vec[local_layer_idx %
+            global_layer_idx = self.pp_layers[local_layer_idx]
+            window_size = self.max_attention_window_vec[global_layer_idx %
                                                         pattern_len]
             window_size_to_layers_map[window_size].append(local_layer_idx)
         return window_size_to_layers_map
@@ -1746,7 +1785,12 @@ class KVCacheManager(BaseResourceManager):
         slope = attention_slope + mamba_slope
         # STATIC_SLOTS_PER_REQUEST = 1 (live state); fixed-position
         # snapshots are not yet implemented.
-        intercept = self.max_batch_size * state_bytes_local
+        # With pipeline parallelism, multiple microbatches can be in-flight
+        # simultaneously on the same rank, so each rank holds Mamba state for
+        # up to ``max_batch_size * pp_size`` concurrent sequences. Mirror the
+        # behaviour of KVCacheManagerV2 (see max_num_sequences calculation).
+        pp_size = self.mapping.pp_size if self.mapping is not None else 1
+        intercept = self.max_batch_size * pp_size * state_bytes_local
 
         # heuristic: When block reuse is enabled, we assume the mamba snapshots are dominant instead of active states,
         # otherwise we may run out of kv cache blocks prior to mamba blocks due to the large number of max_batch_size.
@@ -1769,10 +1813,18 @@ class KVCacheManager(BaseResourceManager):
         # Recurrent state slot count: live state per concurrent request, with
         # extra room for one regular snapshot per snapshot interval over the
         # full token budget when block reuse is enabled.
-        max_snapshots = self.max_batch_size
+        # With pipeline parallelism, multiple microbatches can be in-flight
+        # simultaneously on the same rank, each holding up to ``max_batch_size``
+        # sequences' Mamba state, so the live-state slot count must scale with
+        # ``pp_size``. +1 is for the CUDA graph padding dummy.
+        max_snapshots = self.max_batch_size * pp_size + 1
+        if self.spec_config is not None:
+            # cuda graph has different request ids for different draft len (CUDAGraphRunner::_get_padded_batch)
+            # TODO: we can use a same slot for all these
+            max_snapshots += self.spec_config.max_draft_len
         if (kv_cache_config.enable_block_reuse and interval is not None
                 and interval > 0):
-            max_snapshots = max_tokens // interval
+            max_snapshots = max(max_tokens // interval, max_snapshots)
 
         secondary_snapshots = int(max_snapshots *
                                   (self._secondary_pool_memory_bytes /
@@ -1929,7 +1981,6 @@ class KVCacheManager(BaseResourceManager):
         max_attention_window_vec: List[int],
         blocks_per_window: BlocksPerWindow,
         tokens_per_block: int,
-        sink_token_length: int,
         max_seq_len: int,
         max_beam_width: int,
     ) -> Tuple[BlocksPerWindow, int, List[int]]:
@@ -1941,7 +1992,6 @@ class KVCacheManager(BaseResourceManager):
             max_attention_window_vec: List of attention window sizes
             blocks_per_window: Dict mapping window size to (primary_blocks, secondary_blocks)
             tokens_per_block: Number of tokens per block
-            sink_token_length: Length of sink tokens
             max_seq_len: Maximum sequence length
 
         Returns:
@@ -1957,7 +2007,6 @@ class KVCacheManager(BaseResourceManager):
                 blocks_in_primary_pool=blocks_in_primary_pool,
                 tokens_per_block=tokens_per_block,
                 max_beam_width=max_beam_width,
-                sink_token_len=sink_token_length,
                 max_seq_len=max_seq_len)
             if window_size > upper_bound:
                 logger.warning(
@@ -2044,10 +2093,12 @@ class KVCacheManagerV2(BaseResourceManager):
         is_draft: bool = False,
         kv_connector_manager: Optional[KvCacheConnectorManager] = None,
         execution_stream: Optional[torch.cuda.Stream] = None,
+        is_disagg: bool = False,
         **kwargs,
     ) -> None:
         self.mapping = mapping
         self.dtype = dtype
+        self.is_disagg = is_disagg
 
         assert kv_connector_manager is None, "kv_connector_manager is not supported for KVCacheManagerV2"
         assert max_beam_width == 1, "max_beam_width must be 1 for KVCacheManagerV2"
@@ -2082,6 +2133,15 @@ class KVCacheManagerV2(BaseResourceManager):
         from ..speculative import get_num_extra_kv_tokens
         self.num_extra_kv_tokens = get_num_extra_kv_tokens(spec_config)
         self.max_total_draft_tokens = spec_config.max_total_draft_tokens if spec_config is not None else 0
+
+        # Mirror V1's KV reserve sizing (see V1 __init__ for rationale).
+        self._kv_reserve_draft_tokens = self.max_total_draft_tokens
+        if (self.is_draft and spec_config is not None
+                and getattr(spec_config, 'use_dynamic_tree', False)
+                and getattr(spec_config, 'dynamic_tree_max_topK', 0) > 0):
+            draft_loop_tokens = spec_config.dynamic_tree_max_topK * spec_config.max_draft_len
+            self._kv_reserve_draft_tokens = max(self.max_total_draft_tokens,
+                                                draft_loop_tokens)
 
         self.event_buffer_max_size = kv_cache_config.event_buffer_max_size
 
@@ -2278,14 +2338,10 @@ class KVCacheManagerV2(BaseResourceManager):
             # stay int.
             self.max_seq_len = int(max_num_tokens)
 
-        # Pad max_blocks_per_seq to next multiple of 4 for copy_block_offsets kernel.
-        # Computed after max_seq_len clamping, but account for extra tokens
-        # (num_extra_kv_tokens + max_total_draft_tokens) so the host
-        # page-index buffer is large enough for the maximum capacity a single
-        # sequence can reach during warmup or normal operation.
-        # The +1 accounts for the base decode token that
-        # _required_gen_capacity adds on top of draft tokens.
-        max_seq_capacity = self.max_seq_len + self.num_extra_kv_tokens + self.max_total_draft_tokens + 1
+        # Pad max_blocks_per_seq to next multiple of 4 (copy_block_offsets kernel).
+        # Account for max single-sequence capacity = seq_len + extra KV tokens +
+        # _kv_reserve_draft_tokens (see __init__) + 1 base decode token.
+        max_seq_capacity = self.max_seq_len + self.num_extra_kv_tokens + self._kv_reserve_draft_tokens + 1
         self.max_blocks_per_seq = (max_seq_capacity + tokens_per_block -
                                    1) // tokens_per_block
         if self.max_blocks_per_seq % 4 != 0:
@@ -2297,8 +2353,20 @@ class KVCacheManagerV2(BaseResourceManager):
         # With pipeline parallelism, multiple microbatches can be in-flight
         # simultaneously, so we need slots for all concurrent sequences.
         # Plus 1 for cuda graph dummy request.
+        # In disaggregated mode, use a coefficient of 2: at any moment up to
+        # `max_num_sequences` requests can be actively generating while another
+        # up to `max_num_sequences` requests are still in KV transfer
+        # (TRANS_IN_PROGRESS) and continue to hold their index slots. The 2x
+        # capacity lets the next batch of active requests acquire slots without
+        # waiting for the previous batch's transfers to finish.
         max_num_sequences = max_batch_size * mapping.pp_size
-        self.index_mapper = IndexMapper(max_num_sequences + 1, max_beam_width)
+        index_mapper_capacity = max_num_sequences * (2 if is_disagg else 1) + 1
+        logger.info(
+            f"KVCacheManagerV2: IndexMapper capacity={index_mapper_capacity} "
+            f"(max_num_sequences={max_num_sequences}, is_disagg={is_disagg}, max_beam_width={max_beam_width})"
+        )
+        self.index_mapper = IndexMapper(index_mapper_capacity, max_beam_width)
+        self._early_freed_index_requests: set[int] = set()
         self.index_scales = torch.empty(self.num_pools,
                                         dtype=torch.int32,
                                         pin_memory=prefer_pinned(),
@@ -2319,9 +2387,10 @@ class KVCacheManagerV2(BaseResourceManager):
             else:
                 self.kv_offset[pool_id] = 0
 
-        self.host_kv_cache_block_offsets = torch.empty(
+        # Keep unused block offsets as safe block index 0.
+        self.host_kv_cache_block_offsets = torch.zeros(
             self.num_pools,
-            (max_num_sequences + 1) * max_beam_width,
+            index_mapper_capacity * max_beam_width,
             2,  # key and value
             self.max_blocks_per_seq,
             dtype=torch.int32,
@@ -2425,7 +2494,8 @@ class KVCacheManagerV2(BaseResourceManager):
                         ) for role in buffer_type
                     ],
                     sliding_window_size=self.max_attention_window_vec[
-                        layer_id % len(self.max_attention_window_vec)],
+                        self.pp_layers[layer_id] %
+                        len(self.max_attention_window_vec)],
                     num_sink_tokens=None,
                 ) for layer_id in typed_range(LayerId(self.num_local_layers))
             ],
@@ -2660,6 +2730,8 @@ class KVCacheManagerV2(BaseResourceManager):
                     req.lora_task_id,
                     tokens,
                     cache_salt_id=req.cache_salt_id)
+                if kv_cache is None:
+                    return False
                 kv_cache.cuda_stream = self._stream.cuda_stream
 
             if not self.enable_block_reuse:
@@ -2799,6 +2871,12 @@ class KVCacheManagerV2(BaseResourceManager):
                         f"Failed to resume draft KV cache for request {req.py_request_id}"
                     )
                 new_cap = self._required_gen_capacity(req, kv_cache.capacity)
+                # Pad the resize up to _kv_reserve_draft_tokens (see __init__);
+                # no-op when reserve == draft_token_length.
+                reserve_slack = (self._kv_reserve_draft_tokens -
+                                 get_draft_token_length(req))
+                if reserve_slack > 0:
+                    new_cap += reserve_slack
                 if not kv_cache.resize(new_cap):
                     raise RuntimeError(
                         f"Draft KV cache generation resize failed for request "
@@ -2885,10 +2963,12 @@ class KVCacheManagerV2(BaseResourceManager):
             is_gen: bool = False,
             prepare_resource: bool = True,
             max_num_draft_tokens: int = 0,
+            kv_reserve_draft_tokens: Optional[int] = None,
             use_mrope: bool = False,
             max_beam_width: int = 1,
             num_extra_decoding_steps: int = 0,
             draft_kv_cache_manager: Optional['BaseResourceManager'] = None):
+        _kv_draft = kv_reserve_draft_tokens if kv_reserve_draft_tokens is not None else max_num_draft_tokens
 
         beam_width = max_beam_width
         requests = []
@@ -2972,7 +3052,7 @@ class KVCacheManagerV2(BaseResourceManager):
                 req.py_prompt_len = req.prompt_len
                 req.py_draft_tokens = [1] * max_num_draft_tokens
                 if prepare_resource:
-                    new_capacity = kv_cache.capacity + max_num_draft_tokens + 1
+                    new_capacity = kv_cache.capacity + _kv_draft + 1
                     success = kv_cache.resize(new_capacity,
                                               history_length=history_hint)
                     if not success:
@@ -3006,6 +3086,17 @@ class KVCacheManagerV2(BaseResourceManager):
             kv_cache.commit(tokens)
             kv_cache.stop_committing()
 
+    def release_index_slot(self, request_id: int) -> None:
+        """Release IndexMapper slot early while keeping KV cache blocks allocated.
+
+        After prefill completes on a context-only worker, the IndexMapper slot
+        (used for host_kv_cache_block_offsets during model forward) is no longer
+        needed.  Releasing it early allows new requests to be scheduled while
+        the KV cache blocks are still being transferred via NIXL/UCX.
+        """
+        self.index_mapper.remove_sequence(request_id)
+        self._early_freed_index_requests.add(request_id)
+
     def free_resources(self, request: LlmRequest, pin_on_release: bool = False):
         self._allocated_draft_lens.pop(request.py_request_id, None)
         kv_cache = self.kv_cache_map.pop(request.py_request_id, None)
@@ -3013,7 +3104,10 @@ class KVCacheManagerV2(BaseResourceManager):
             return
         self.try_commit_blocks_for_reuse(request, kv_cache)
         kv_cache.close()
-        self.index_mapper.remove_sequence(request.py_request_id)
+        if request.py_request_id in self._early_freed_index_requests:
+            self._early_freed_index_requests.discard(request.py_request_id)
+        else:
+            self.index_mapper.remove_sequence(request.py_request_id)
 
     def get_batch_cache_indices(
             self,
@@ -3299,6 +3393,13 @@ class KVCacheManagerV2(BaseResourceManager):
                          input_tokens: Sequence[TokenIdExt] | None,
                          cache_salt_id: int | None = None):
         assert request_id not in self.kv_cache_map, f"KV cache for request {request_id} already exists"
+        if self.index_mapper.num_free_slots() == 0:
+            logger.warning(
+                "No free IndexMapper slots for request %s "
+                "(%d/%d slots in use, likely held by DISAGG_GENERATION_TRANS_IN_PROGRESS requests). "
+                "Skipping KV cache creation; request will retry next iteration.",
+                request_id, self.index_mapper.size(), self.index_mapper.size())
+            return None
         kv_cache = self.impl.create_kv_cache(
             ReuseScope(lora_id=lora_task_id, salt=cache_salt_id),
             input_tokens,
