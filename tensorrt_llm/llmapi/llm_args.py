@@ -875,6 +875,13 @@ class DeepSeekV4SparseAttentionConfig(DeepSeekSparseAttentionConfig):
     index_head_dim: Optional[int] = Field(
         default=128,
         description="The dimension of the DeepSeek-V4 indexer heads.")
+    indexer_k_dtype: Literal["fp8", "fp4"] = Field(
+        default="fp4",
+        description=
+        "Data type used for the indexer K cache. DeepSeek-V4 defaults to "
+        "`fp4` to reduce the per-token indexer K footprint on Blackwell+ "
+        "(SM>=100). Set to `fp8` for the legacy FP8 indexer K cache path.",
+    )
     skip_indexer_for_short_seqs: bool = Field(
         default=False,
         description=

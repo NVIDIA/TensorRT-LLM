@@ -629,6 +629,26 @@ def test_deepseek_v4_sparse_ratios_prefer_checkpoint_defaults(tmp_path, monkeypa
     assert model_config.sparse_attention_config.window_size == 128
 
 
+def test_deepseek_v4_model_config_defaults_to_fp4_indexer(tmp_path, monkeypatch):
+    checkpoint_ratios = [128, 128, 4, 128, 4, 128, 0, 4]
+    config = DeepseekV4Config(
+        architectures=["DeepseekV4ForCausalLM"],
+        num_hidden_layers=len(checkpoint_ratios),
+        compress_ratios=checkpoint_ratios,
+    )
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.model_config.load_pretrained_config", lambda *args, **kwargs: config
+    )
+
+    model_config = ModelConfig.from_pretrained(
+        str(tmp_path),
+        attn_backend="TRTLLM",
+        moe_backend="TRTLLM",
+    )
+
+    assert model_config.sparse_attention_config.indexer_k_dtype == "fp4"
+
+
 def test_deepseek_v4_sparse_ratios_keep_checkpoint_length_without_mtp(tmp_path, monkeypatch):
     checkpoint_ratios = [128, 128] + [4, 128] * 29 + [0, 4]
     config = DeepseekV4Config(
