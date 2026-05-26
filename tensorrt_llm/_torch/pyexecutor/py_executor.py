@@ -3834,8 +3834,9 @@ class PyExecutor:
             elapsed_time = (current_time - req.py_kv_transfer_start_time) * 1000
             if elapsed_time > timeout_ms and not req.py_kv_transfer_timed_out:
                 logger.warning(
-                    f"Terminating {type} request {req.py_request_id} due to KV cache transfer timeout"
-                )
+                    f"Terminating {type} request {req.py_request_id} due to KV "
+                    f"cache transfer timeout: elapsed {elapsed_time:.0f}ms > "
+                    f"kv_transfer_timeout_ms={timeout_ms}ms")
                 req.py_kv_transfer_timed_out = True
 
         for req in self.async_transfer_manager.requests_in_transfer().values():
