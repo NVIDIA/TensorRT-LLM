@@ -27,8 +27,8 @@
   </noscript>
   
   <!-- Loaded before other Sphinx assets -->
-  <link href="../../../_static/styles/theme.css?digest=55c26ed414f5f8a31ebb" rel="stylesheet" />
-<link href="../../../_static/styles/pydata-sphinx-theme.css?digest=55c26ed414f5f8a31ebb" rel="stylesheet" />
+  <link href="../../../_static/styles/theme.css?digest=0790524f97105ba85085" rel="stylesheet" />
+<link href="../../../_static/styles/pydata-sphinx-theme.css?digest=0790524f97105ba85085" rel="stylesheet" />
 
     <link rel="stylesheet" type="text/css" href="../../../_static/pygments.css?v=8f2a1f02" />
     <link rel="stylesheet" type="text/css" href="../../../_static/styles/nvidia-sphinx-theme.css?v=933278ad" />
@@ -39,10 +39,10 @@
     <link rel="stylesheet" type="text/css" href="../../../_static/custom.css?v=19d20f17" />
   
   <!-- So that users can add custom icons -->
-  <script defer src="../../../_static/scripts/fontawesome.js?digest=55c26ed414f5f8a31ebb"></script>
+  <script defer src="../../../_static/scripts/fontawesome.js?digest=0790524f97105ba85085"></script>
   <!-- Pre-loaded scripts that we'll load fully later -->
-  <link rel="preload" as="script" href="../../../_static/scripts/bootstrap.js?digest=55c26ed414f5f8a31ebb" />
-<link rel="preload" as="script" href="../../../_static/scripts/pydata-sphinx-theme.js?digest=55c26ed414f5f8a31ebb" />
+  <link rel="preload" as="script" href="../../../_static/scripts/bootstrap.js?digest=0790524f97105ba85085" />
+<link rel="preload" as="script" href="../../../_static/scripts/pydata-sphinx-theme.js?digest=0790524f97105ba85085" />
 
 
 
@@ -496,9 +496,9 @@ window.addEventListener("load", load);
 window.runMermaid = runMermaid;</script>
     <script>DOCUMENTATION_OPTIONS.pagename = '_modules/tensorrt_llm/llmapi/llm_args';</script>
     <script>
-        DOCUMENTATION_OPTIONS.theme_version = '0.17.1';
+        DOCUMENTATION_OPTIONS.theme_version = '0.18.0';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc15';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc16';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -512,7 +512,7 @@ window.runMermaid = runMermaid;</script>
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.3.0rc15" />
+  <meta name="docsearch:version" content="1.3.0rc16" />
   
     
     <script src="../../../_static/searchtools.js"></script>
@@ -643,11 +643,18 @@ window.runMermaid = runMermaid;</script>
       
         <div class="navbar-item">
 
-<button class="btn btn-sm nav-link pst-navbar-icon theme-switch-button pst-js-only" aria-label="Color mode" data-bs-title="Color mode"  data-bs-placement="bottom" data-bs-toggle="tooltip">
-  <i class="theme-switch fa-solid fa-sun                fa-lg" data-mode="light" title="Light"></i>
-  <i class="theme-switch fa-solid fa-moon               fa-lg" data-mode="dark"  title="Dark"></i>
-  <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg" data-mode="auto"  title="System Settings"></i>
-</button></div>
+<div class="theme-switch-container dropdown pst-js-only" data-bs-toggle="tooltip" data-bs-placement="bottom" title="Color mode">
+  <button class="btn btn-sm nav-link pst-navbar-icon theme-switch-button dropdown-toggle" aria-label="Color mode" data-bs-toggle="dropdown">
+    <i class="theme-switch fa-solid fa-sun fa-lg fa-fw" data-mode="light" title="Light"></i>
+    <i class="theme-switch fa-solid fa-moon fa-lg fa-fw" data-mode="dark" title="Dark"></i>
+    <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg fa-fw" data-mode="auto" title="System Settings"></i>
+  </button>
+  <ul class="dropdown-menu dropdown-menu-end">
+    <li><button class="dropdown-item d-flex align-items-center theme-change-button" data-mode="auto"><i class="fa-solid fa-circle-half-stroke fa-lg fa-fw me-1"></i>System Settings</button></li>
+    <li><button class="dropdown-item d-flex align-items-center theme-change-button" data-mode="light"><i class="fa-solid fa-sun fa-lg fa-fw me-1"></i>Light</button></li>
+    <li><button class="dropdown-item d-flex align-items-center theme-change-button" data-mode="dark"><i class="fa-solid fa-moon fa-lg fa-fw me-1"></i>Dark</button></li>
+  </ul>
+</div></div>
       
     </div>
     
@@ -744,11 +751,18 @@ window.runMermaid = runMermaid;</script>
         
           <div class="navbar-item">
 
-<button class="btn btn-sm nav-link pst-navbar-icon theme-switch-button pst-js-only" aria-label="Color mode" data-bs-title="Color mode"  data-bs-placement="bottom" data-bs-toggle="tooltip">
-  <i class="theme-switch fa-solid fa-sun                fa-lg" data-mode="light" title="Light"></i>
-  <i class="theme-switch fa-solid fa-moon               fa-lg" data-mode="dark"  title="Dark"></i>
-  <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg" data-mode="auto"  title="System Settings"></i>
-</button></div>
+<div class="theme-switch-container dropdown pst-js-only" data-bs-toggle="tooltip" data-bs-placement="bottom" title="Color mode">
+  <button class="btn btn-sm nav-link pst-navbar-icon theme-switch-button dropdown-toggle" aria-label="Color mode" data-bs-toggle="dropdown">
+    <i class="theme-switch fa-solid fa-sun fa-lg fa-fw" data-mode="light" title="Light"></i>
+    <i class="theme-switch fa-solid fa-moon fa-lg fa-fw" data-mode="dark" title="Dark"></i>
+    <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg fa-fw" data-mode="auto" title="System Settings"></i>
+  </button>
+  <ul class="dropdown-menu dropdown-menu-end">
+    <li><button class="dropdown-item d-flex align-items-center theme-change-button" data-mode="auto"><i class="fa-solid fa-circle-half-stroke fa-lg fa-fw me-1"></i>System Settings</button></li>
+    <li><button class="dropdown-item d-flex align-items-center theme-change-button" data-mode="light"><i class="fa-solid fa-sun fa-lg fa-fw me-1"></i>Light</button></li>
+    <li><button class="dropdown-item d-flex align-items-center theme-change-button" data-mode="dark"><i class="fa-solid fa-moon fa-lg fa-fw me-1"></i>Dark</button></li>
+  </ul>
+</div></div>
         
       </div>
     
@@ -1094,9 +1108,7 @@ window.runMermaid = runMermaid;</script>
 <div class="viewcode-block" id="CudaGraphConfig">
 <a class="viewcode-back" href="../../../llm-api/reference.html#tensorrt_llm.llmapi.CudaGraphConfig">[docs]</a>
 <span class="k">class</span><span class="w"> </span><span class="nc">CudaGraphConfig</span><span class="p">(</span><span class="n">StrictBaseModel</span><span class="p">):</span>
-<span class="w">    </span><span class="sd">&quot;&quot;&quot;</span>
-<span class="sd">    Configuration for CUDA graphs.</span>
-<span class="sd">    &quot;&quot;&quot;</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;Configuration for CUDA graphs.&quot;&quot;&quot;</span>
     <span class="c1"># List of batch sizes to create CUDA graphs for.</span>
     <span class="n">batch_sizes</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">List</span><span class="p">[</span><span class="nb">int</span><span class="p">]]</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
         <span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
@@ -1244,9 +1256,7 @@ window.runMermaid = runMermaid;</script>
 
 
 <span class="k">class</span><span class="w"> </span><span class="nc">BaseSparseAttentionConfig</span><span class="p">(</span><span class="n">StrictBaseModel</span><span class="p">):</span>
-<span class="w">    </span><span class="sd">&quot;&quot;&quot;</span>
-<span class="sd">    Configuration for sparse attention.</span>
-<span class="sd">    &quot;&quot;&quot;</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;Configuration for sparse attention.&quot;&quot;&quot;</span>
     <span class="n">algorithm</span><span class="p">:</span> <span class="nb">str</span>
 
     <span class="n">seq_len_threshold</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
@@ -1278,9 +1288,7 @@ window.runMermaid = runMermaid;</script>
 <div class="viewcode-block" id="RocketSparseAttentionConfig">
 <a class="viewcode-back" href="../../../llm-api/reference.html#tensorrt_llm.llmapi.RocketSparseAttentionConfig">[docs]</a>
 <span class="k">class</span><span class="w"> </span><span class="nc">RocketSparseAttentionConfig</span><span class="p">(</span><span class="n">BaseSparseAttentionConfig</span><span class="p">):</span>
-<span class="w">    </span><span class="sd">&quot;&quot;&quot;</span>
-<span class="sd">    Configuration for RocketKV sparse attention.</span>
-<span class="sd">    &quot;&quot;&quot;</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;Configuration for RocketKV sparse attention.&quot;&quot;&quot;</span>
     <span class="n">algorithm</span><span class="p">:</span> <span class="n">Literal</span><span class="p">[</span><span class="s2">&quot;rocket&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="s2">&quot;rocket&quot;</span>
     <span class="n">window_size</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
         <span class="n">default</span><span class="o">=</span><span class="mi">32</span><span class="p">,</span> <span class="n">description</span><span class="o">=</span><span class="s2">&quot;The window size for RocketKV.&quot;</span><span class="p">)</span>
@@ -1314,9 +1322,7 @@ window.runMermaid = runMermaid;</script>
 <div class="viewcode-block" id="DeepSeekSparseAttentionConfig">
 <a class="viewcode-back" href="../../../llm-api/reference.html#tensorrt_llm.llmapi.DeepSeekSparseAttentionConfig">[docs]</a>
 <span class="k">class</span><span class="w"> </span><span class="nc">DeepSeekSparseAttentionConfig</span><span class="p">(</span><span class="n">BaseSparseAttentionConfig</span><span class="p">):</span>
-<span class="w">    </span><span class="sd">&quot;&quot;&quot;</span>
-<span class="sd">    Configuration for DeepSeek Sparse Attention.</span>
-<span class="sd">    &quot;&quot;&quot;</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;Configuration for DeepSeek Sparse Attention.&quot;&quot;&quot;</span>
     <span class="n">algorithm</span><span class="p">:</span> <span class="n">Literal</span><span class="p">[</span><span class="s2">&quot;dsa&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="s2">&quot;dsa&quot;</span>
     <span class="n">index_n_heads</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
         <span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span> <span class="n">description</span><span class="o">=</span><span class="s2">&quot;The number of heads for the indexer.&quot;</span><span class="p">)</span>
@@ -1416,9 +1422,7 @@ window.runMermaid = runMermaid;</script>
 <div class="viewcode-block" id="SkipSoftmaxAttentionConfig">
 <a class="viewcode-back" href="../../../llm-api/reference.html#tensorrt_llm.llmapi.SkipSoftmaxAttentionConfig">[docs]</a>
 <span class="k">class</span><span class="w"> </span><span class="nc">SkipSoftmaxAttentionConfig</span><span class="p">(</span><span class="n">BaseSparseAttentionConfig</span><span class="p">):</span>
-<span class="w">    </span><span class="sd">&quot;&quot;&quot;</span>
-<span class="sd">    Configuration for skip softmax attention.</span>
-<span class="sd">    &quot;&quot;&quot;</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;Configuration for skip softmax attention.&quot;&quot;&quot;</span>
     <span class="n">algorithm</span><span class="p">:</span> <span class="n">Literal</span><span class="p">[</span><span class="s2">&quot;skip_softmax&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="s2">&quot;skip_softmax&quot;</span>
     <span class="n">threshold_scale_factor</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">Union</span><span class="p">[</span><span class="nb">float</span><span class="p">,</span> <span class="n">Dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">float</span><span class="p">]]]</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
         <span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
@@ -1581,9 +1585,7 @@ window.runMermaid = runMermaid;</script>
 
     <span class="k">def</span><span class="w"> </span><span class="nf">get_layer_initial_global_assignments</span><span class="p">(</span>
             <span class="bp">self</span><span class="p">,</span> <span class="n">layer_idx</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Optional</span><span class="p">[</span><span class="n">List</span><span class="p">[</span><span class="nb">int</span><span class="p">]]:</span>
-<span class="w">        </span><span class="sd">&quot;&quot;&quot;</span>
-<span class="sd">        Retrieves the initial global assignments for a specific layer.</span>
-<span class="sd">        &quot;&quot;&quot;</span>
+<span class="w">        </span><span class="sd">&quot;&quot;&quot;Retrieves the initial global assignments for a specific layer.&quot;&quot;&quot;</span>
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">initial_global_assignments</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
             <span class="k">return</span> <span class="kc">None</span>
 
@@ -1609,9 +1611,7 @@ window.runMermaid = runMermaid;</script>
 <div class="viewcode-block" id="MoeConfig">
 <a class="viewcode-back" href="../../../llm-api/reference.html#tensorrt_llm.llmapi.MoeConfig">[docs]</a>
 <span class="k">class</span><span class="w"> </span><span class="nc">MoeConfig</span><span class="p">(</span><span class="n">StrictBaseModel</span><span class="p">):</span>
-<span class="w">    </span><span class="sd">&quot;&quot;&quot;</span>
-<span class="sd">    Configuration for MoE.</span>
-<span class="sd">    &quot;&quot;&quot;</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;Configuration for MoE.&quot;&quot;&quot;</span>
     <span class="n">backend</span><span class="p">:</span> <span class="n">Literal</span><span class="p">[</span>
         <span class="s2">&quot;AUTO&quot;</span><span class="p">,</span> <span class="s2">&quot;CUTLASS&quot;</span><span class="p">,</span> <span class="s2">&quot;CUTEDSL&quot;</span><span class="p">,</span> <span class="s2">&quot;WIDEEP&quot;</span><span class="p">,</span> <span class="s2">&quot;TRTLLM&quot;</span><span class="p">,</span> <span class="s2">&quot;DEEPGEMM&quot;</span><span class="p">,</span>
         <span class="s2">&quot;DENSEGEMM&quot;</span><span class="p">,</span> <span class="s2">&quot;VANILLA&quot;</span><span class="p">,</span> <span class="s2">&quot;TRITON&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
@@ -1655,9 +1655,7 @@ window.runMermaid = runMermaid;</script>
 
 
 <span class="k">class</span><span class="w"> </span><span class="nc">Nvfp4GemmConfig</span><span class="p">(</span><span class="n">StrictBaseModel</span><span class="p">):</span>
-<span class="w">    </span><span class="sd">&quot;&quot;&quot;</span>
-<span class="sd">    Configuration for NVFP4 GEMM backend selection.</span>
-<span class="sd">    &quot;&quot;&quot;</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;Configuration for NVFP4 GEMM backend selection.&quot;&quot;&quot;</span>
     <span class="n">allowed_backends</span><span class="p">:</span> <span class="n">List</span><span class="p">[</span><span class="n">Nvfp4Backend</span><span class="p">]</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
         <span class="n">default_factory</span><span class="o">=</span><span class="k">lambda</span><span class="p">:</span> <span class="p">[</span><span class="s1">&#39;cutlass&#39;</span><span class="p">,</span> <span class="s1">&#39;cublaslt&#39;</span><span class="p">,</span> <span class="s1">&#39;cuda_core&#39;</span><span class="p">],</span>
         <span class="n">min_length</span><span class="o">=</span><span class="mi">1</span><span class="p">,</span>
@@ -1670,9 +1668,7 @@ window.runMermaid = runMermaid;</script>
 <div class="viewcode-block" id="AttentionDpConfig">
 <a class="viewcode-back" href="../../../llm-api/reference.html#tensorrt_llm.llmapi.AttentionDpConfig">[docs]</a>
 <span class="k">class</span><span class="w"> </span><span class="nc">AttentionDpConfig</span><span class="p">(</span><span class="n">StrictBaseModel</span><span class="p">):</span>
-<span class="w">    </span><span class="sd">&quot;&quot;&quot;</span>
-<span class="sd">    Configuration for attention DP.</span>
-<span class="sd">    &quot;&quot;&quot;</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;Configuration for attention DP.&quot;&quot;&quot;</span>
     <span class="n">enable_balance</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span><span class="n">default</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
                                  <span class="n">description</span><span class="o">=</span><span class="s2">&quot;Whether to enable balance.&quot;</span><span class="p">)</span>
     <span class="n">timeout_iters</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
@@ -1715,6 +1711,18 @@ window.runMermaid = runMermaid;</script>
         <span class="s2">&quot;cache affinity can dominate while preventing runaway concentration &quot;</span>
         <span class="s2">&quot;on a single rank. Set to 1.0 for strict fair share. &quot;</span>
         <span class="s2">&quot;Only used when enable_kv_cache_aware_routing is True.&quot;</span><span class="p">)</span>
+    <span class="n">kv_cache_routing_cold_start_warmup</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+        <span class="n">description</span><span class="o">=</span>
+        <span class="s2">&quot;Cold-start mitigation in KV cache-aware routing. When True, the &quot;</span>
+        <span class="s2">&quot;first tp_size relaxed requests after router init are round-robined &quot;</span>
+        <span class="s2">&quot;across ranks (bypassing cache-affinity scoring) so every rank &quot;</span>
+        <span class="s2">&quot;caches the shared system prompt before scoring would otherwise pin &quot;</span>
+        <span class="s2">&quot;all traffic to the first warm rank. Only useful when requests &quot;</span>
+        <span class="s2">&quot;share a long system prefix; for diverse-prompt workloads this can &quot;</span>
+        <span class="s2">&quot;scatter requests that would otherwise consolidate on a single warm &quot;</span>
+        <span class="s2">&quot;rank, wasting prefill. Default False preserves pre-warmup routing. &quot;</span>
+        <span class="s2">&quot;Only used when enable_kv_cache_aware_routing is True.&quot;</span><span class="p">)</span>
 
 <div class="viewcode-block" id="AttentionDpConfig.validate_attention_dp_config">
 <a class="viewcode-back" href="../../../llm-api/reference.html#tensorrt_llm.llmapi.AttentionDpConfig.validate_attention_dp_config">[docs]</a>
@@ -1735,9 +1743,7 @@ window.runMermaid = runMermaid;</script>
 
 
 <span class="k">class</span><span class="w"> </span><span class="nc">CpConfig</span><span class="p">(</span><span class="n">StrictBaseModel</span><span class="p">):</span>
-<span class="w">    </span><span class="sd">&quot;&quot;&quot;</span>
-<span class="sd">    Configuration for context parallelism.</span>
-<span class="sd">    &quot;&quot;&quot;</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;Configuration for context parallelism.&quot;&quot;&quot;</span>
     <span class="c1"># TODO: given that multiple fields here are only used with specific cp_types, consider</span>
     <span class="c1"># making this a Pydantic discriminated union.</span>
     <span class="n">cp_type</span><span class="p">:</span> <span class="n">CpType</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span><span class="n">default</span><span class="o">=</span><span class="n">CpType</span><span class="o">.</span><span class="n">ULYSSES</span><span class="p">,</span>
@@ -1845,9 +1851,7 @@ window.runMermaid = runMermaid;</script>
 <div class="viewcode-block" id="CalibConfig">
 <a class="viewcode-back" href="../../../llm-api/reference.html#tensorrt_llm.llmapi.CalibConfig">[docs]</a>
 <span class="k">class</span><span class="w"> </span><span class="nc">CalibConfig</span><span class="p">(</span><span class="n">StrictBaseModel</span><span class="p">):</span>
-<span class="w">    </span><span class="sd">&quot;&quot;&quot;</span>
-<span class="sd">    Calibration configuration.</span>
-<span class="sd">    &quot;&quot;&quot;</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;Calibration configuration.&quot;&quot;&quot;</span>
     <span class="n">device</span><span class="p">:</span> <span class="n">Literal</span><span class="p">[</span><span class="s1">&#39;cuda&#39;</span><span class="p">,</span>
                     <span class="s1">&#39;cpu&#39;</span><span class="p">]</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span><span class="n">default</span><span class="o">=</span><span class="s1">&#39;cuda&#39;</span><span class="p">,</span>
                                    <span class="n">description</span><span class="o">=</span><span class="s2">&quot;The device to run calibration.&quot;</span><span class="p">)</span>
@@ -2128,9 +2132,7 @@ window.runMermaid = runMermaid;</script>
 
 
 <span class="k">class</span><span class="w"> </span><span class="nc">LayerwiseBenchmarksConfig</span><span class="p">(</span><span class="n">StrictBaseModel</span><span class="p">):</span>
-<span class="w">    </span><span class="sd">&quot;&quot;&quot;</span>
-<span class="sd">    Configuration for layer-wise benchmarks calibration.</span>
-<span class="sd">    &quot;&quot;&quot;</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;Configuration for layer-wise benchmarks calibration.&quot;&quot;&quot;</span>
     <span class="n">calibration_mode</span><span class="p">:</span> <span class="n">Literal</span><span class="p">[</span><span class="s2">&quot;NONE&quot;</span><span class="p">,</span> <span class="s2">&quot;MARK&quot;</span><span class="p">,</span> <span class="s2">&quot;COLLECT&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
         <span class="n">default</span><span class="o">=</span><span class="s2">&quot;NONE&quot;</span><span class="p">,</span>
         <span class="n">description</span><span class="o">=</span>
@@ -2558,9 +2560,7 @@ window.runMermaid = runMermaid;</script>
 <div class="viewcode-block" id="NGramDecodingConfig">
 <a class="viewcode-back" href="../../../llm-api/reference.html#tensorrt_llm.llmapi.NGramDecodingConfig">[docs]</a>
 <span class="k">class</span><span class="w"> </span><span class="nc">NGramDecodingConfig</span><span class="p">(</span><span class="n">DecodingBaseConfig</span><span class="p">):</span>
-<span class="w">    </span><span class="sd">&quot;&quot;&quot;</span>
-<span class="sd">    Configuration for NGram drafter speculative decoding.</span>
-<span class="sd">    &quot;&quot;&quot;</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;Configuration for NGram drafter speculative decoding.&quot;&quot;&quot;</span>
     <span class="n">decoding_type</span><span class="p">:</span> <span class="n">Literal</span><span class="p">[</span><span class="s2">&quot;NGram&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="s2">&quot;NGram&quot;</span>
     <span class="n">max_matching_ngram_size</span><span class="p">:</span> <span class="n">PositiveInt</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
         <span class="n">default</span><span class="o">=</span><span class="mi">2</span><span class="p">,</span>
@@ -3152,8 +3152,7 @@ window.runMermaid = runMermaid;</script>
 
 <span class="nd">@dataclass</span>
 <span class="k">class</span><span class="w"> </span><span class="nc">_SleepConfigDefaultFactory</span><span class="p">:</span>
-<span class="w">    </span><span class="sd">&quot;&quot;&quot;Picklable replacement for ``lambda: default_mode`` in SleepConfig&#39;s defaultdict.</span>
-<span class="sd">    &quot;&quot;&quot;</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;Picklable replacement for ``lambda: default_mode`` in SleepConfig&#39;s defaultdict.&quot;&quot;&quot;</span>
 
     <span class="n">default_mode</span><span class="p">:</span> <span class="n">Any</span>
 
@@ -3162,8 +3161,7 @@ window.runMermaid = runMermaid;</script>
 
 
 <span class="k">class</span><span class="w"> </span><span class="nc">SleepConfig</span><span class="p">(</span><span class="n">StrictBaseModel</span><span class="p">):</span>
-<span class="w">    </span><span class="sd">&quot;&quot;&quot;Configuration for the LLM sleep/wakeup feature.</span>
-<span class="sd">    &quot;&quot;&quot;</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;Configuration for the LLM sleep/wakeup feature.&quot;&quot;&quot;</span>
 
     <span class="n">restore_modes</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span>
         <span class="n">ExecutorMemoryType</span><span class="p">,</span> <span class="n">Literal</span><span class="p">[</span><span class="s2">&quot;NONE&quot;</span><span class="p">,</span> <span class="s2">&quot;MEMSET&quot;</span><span class="p">,</span> <span class="s2">&quot;CPU&quot;</span><span class="p">,</span> <span class="s2">&quot;PINNED&quot;</span><span class="p">]</span>
@@ -3407,9 +3405,7 @@ window.runMermaid = runMermaid;</script>
 
 
 <span class="k">class</span><span class="w"> </span><span class="nc">PybindMirrorEnumMeta</span><span class="p">(</span><span class="n">EnumMeta</span><span class="p">,</span> <span class="n">PybindMirrorMeta</span><span class="p">):</span>
-<span class="w">    </span><span class="sd">&quot;&quot;&quot;</span>
-<span class="sd">    Combined metaclass for Enum and PybindMirror.  This is crucial.</span>
-<span class="sd">    &quot;&quot;&quot;</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;Combined metaclass for Enum and PybindMirror.  This is crucial.&quot;&quot;&quot;</span>
 
 
 <div class="viewcode-block" id="BatchingType">
@@ -3528,9 +3524,7 @@ window.runMermaid = runMermaid;</script>
 
 <span class="nd">@PybindMirror</span><span class="o">.</span><span class="n">mirror_pybind_fields</span><span class="p">(</span><span class="n">_PeftCacheConfig</span><span class="p">)</span>
 <span class="k">class</span><span class="w"> </span><span class="nc">PeftCacheConfig</span><span class="p">(</span><span class="n">StrictBaseModel</span><span class="p">,</span> <span class="n">PybindMirror</span><span class="p">):</span>
-<span class="w">    </span><span class="sd">&quot;&quot;&quot;</span>
-<span class="sd">    Configuration for the PEFT cache.</span>
-<span class="sd">    &quot;&quot;&quot;</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;Configuration for the PEFT cache.&quot;&quot;&quot;</span>
     <span class="n">num_host_module_layer</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
         <span class="n">default</span><span class="o">=</span><span class="mi">0</span><span class="p">,</span>
         <span class="n">description</span><span class="o">=</span>
@@ -3600,9 +3594,7 @@ window.runMermaid = runMermaid;</script>
 <a class="viewcode-back" href="../../../llm-api/reference.html#tensorrt_llm.llmapi.LookaheadDecodingConfig">[docs]</a>
 <span class="nd">@PybindMirror</span><span class="o">.</span><span class="n">mirror_pybind_fields</span><span class="p">(</span><span class="n">_LookaheadDecodingConfig</span><span class="p">)</span>
 <span class="k">class</span><span class="w"> </span><span class="nc">LookaheadDecodingConfig</span><span class="p">(</span><span class="n">DecodingBaseConfig</span><span class="p">,</span> <span class="n">PybindMirror</span><span class="p">):</span>
-<span class="w">    </span><span class="sd">&quot;&quot;&quot;</span>
-<span class="sd">    Configuration for lookahead speculative decoding.</span>
-<span class="sd">    &quot;&quot;&quot;</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;Configuration for lookahead speculative decoding.&quot;&quot;&quot;</span>
 
     <span class="n">decoding_type</span><span class="p">:</span> <span class="n">Literal</span><span class="p">[</span><span class="s2">&quot;Lookahead&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="s2">&quot;Lookahead&quot;</span>
     <span class="n">max_window_size</span><span class="p">:</span> <span class="n">PositiveInt</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
@@ -3720,9 +3712,7 @@ window.runMermaid = runMermaid;</script>
 <a class="viewcode-back" href="../../../llm-api/reference.html#tensorrt_llm.llmapi.KvCacheConfig">[docs]</a>
 <span class="nd">@PybindMirror</span><span class="o">.</span><span class="n">mirror_pybind_fields</span><span class="p">(</span><span class="n">_KvCacheConfig</span><span class="p">)</span>
 <span class="k">class</span><span class="w"> </span><span class="nc">KvCacheConfig</span><span class="p">(</span><span class="n">StrictBaseModel</span><span class="p">,</span> <span class="n">PybindMirror</span><span class="p">):</span>
-<span class="w">    </span><span class="sd">&quot;&quot;&quot;</span>
-<span class="sd">    Configuration for the KV cache.</span>
-<span class="sd">    &quot;&quot;&quot;</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;Configuration for the KV cache.&quot;&quot;&quot;</span>
     <span class="n">enable_block_reuse</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
         <span class="n">default</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
         <span class="n">description</span><span class="o">=</span>
@@ -3741,7 +3731,10 @@ window.runMermaid = runMermaid;</script>
     <span class="n">sink_token_length</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
         <span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
         <span class="n">description</span><span class="o">=</span>
-        <span class="s2">&quot;Number of sink tokens (tokens to always keep in attention window).&quot;</span><span class="p">)</span>
+        <span class="s2">&quot;Deprecated and ignored on the PyTorch backend. StreamingLLM is not supported &quot;</span>
+        <span class="s2">&quot;by the PyTorch attention kernels — any non-None value has no effect and &quot;</span>
+        <span class="s2">&quot;will be silently dropped before reaching the executor.&quot;</span><span class="p">,</span>
+        <span class="n">deprecated</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
     <span class="n">free_gpu_memory_fraction</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">float</span><span class="p">]</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
         <span class="n">default</span><span class="o">=</span><span class="mf">0.9</span><span class="p">,</span>
         <span class="n">ge</span><span class="o">=</span><span class="mi">0</span><span class="p">,</span>
@@ -3859,7 +3852,6 @@ window.runMermaid = runMermaid;</script>
             <span class="n">enable_block_reuse</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">enable_block_reuse</span><span class="p">,</span>
             <span class="n">max_tokens</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">max_tokens</span><span class="p">,</span>
             <span class="n">max_attention_window</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">max_attention_window</span><span class="p">,</span>
-            <span class="n">sink_token_length</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">sink_token_length</span><span class="p">,</span>
             <span class="n">free_gpu_memory_fraction</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">free_gpu_memory_fraction</span><span class="p">,</span>
             <span class="n">host_cache_size</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">host_cache_size</span><span class="p">,</span>
             <span class="n">cross_kv_cache_fraction</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">cross_kv_cache_fraction</span><span class="p">,</span>
@@ -3953,9 +3945,7 @@ window.runMermaid = runMermaid;</script>
 <a class="viewcode-back" href="../../../llm-api/reference.html#tensorrt_llm.llmapi.ExtendedRuntimePerfKnobConfig">[docs]</a>
 <span class="nd">@PybindMirror</span><span class="o">.</span><span class="n">mirror_pybind_fields</span><span class="p">(</span><span class="n">_ExtendedRuntimePerfKnobConfig</span><span class="p">)</span>
 <span class="k">class</span><span class="w"> </span><span class="nc">ExtendedRuntimePerfKnobConfig</span><span class="p">(</span><span class="n">StrictBaseModel</span><span class="p">,</span> <span class="n">PybindMirror</span><span class="p">):</span>
-<span class="w">    </span><span class="sd">&quot;&quot;&quot;</span>
-<span class="sd">    Configuration for extended runtime performance knobs.</span>
-<span class="sd">    &quot;&quot;&quot;</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;Configuration for extended runtime performance knobs.&quot;&quot;&quot;</span>
 
     <span class="n">multi_block_mode</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
         <span class="n">default</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span> <span class="n">description</span><span class="o">=</span><span class="s2">&quot;Whether to use multi-block mode.&quot;</span><span class="p">)</span>
@@ -3987,9 +3977,7 @@ window.runMermaid = runMermaid;</script>
 <a class="viewcode-back" href="../../../llm-api/reference.html#tensorrt_llm.llmapi.CacheTransceiverConfig">[docs]</a>
 <span class="nd">@PybindMirror</span><span class="o">.</span><span class="n">mirror_pybind_fields</span><span class="p">(</span><span class="n">_CacheTransceiverConfig</span><span class="p">)</span>
 <span class="k">class</span><span class="w"> </span><span class="nc">CacheTransceiverConfig</span><span class="p">(</span><span class="n">StrictBaseModel</span><span class="p">,</span> <span class="n">PybindMirror</span><span class="p">):</span>
-<span class="w">    </span><span class="sd">&quot;&quot;&quot;</span>
-<span class="sd">    Configuration for the cache transceiver.</span>
-<span class="sd">    &quot;&quot;&quot;</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;Configuration for the cache transceiver.&quot;&quot;&quot;</span>
 
     <span class="n">backend</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">Literal</span><span class="p">[</span>
         <span class="s2">&quot;DEFAULT&quot;</span><span class="p">,</span> <span class="s2">&quot;UCX&quot;</span><span class="p">,</span> <span class="s2">&quot;NIXL&quot;</span><span class="p">,</span> <span class="s2">&quot;MOONCAKE&quot;</span><span class="p">,</span> <span class="s2">&quot;MPI&quot;</span><span class="p">]]</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
@@ -4100,9 +4088,7 @@ window.runMermaid = runMermaid;</script>
 
 
 <span class="k">class</span><span class="w"> </span><span class="nc">BaseLlmArgs</span><span class="p">(</span><span class="n">StrictBaseModel</span><span class="p">):</span>
-<span class="w">    </span><span class="sd">&quot;&quot;&quot;</span>
-<span class="sd">    Base class for both TorchLlmArgs and TrtLlmArgs. It contains all the arguments that are common to both.</span>
-<span class="sd">    &quot;&quot;&quot;</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;Base class for both TorchLlmArgs and TrtLlmArgs. It contains all the arguments that are common to both.&quot;&quot;&quot;</span>
     <span class="n">model_config</span> <span class="o">=</span> <span class="n">ConfigDict</span><span class="p">(</span><span class="n">arbitrary_types_allowed</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span> <span class="n">extra</span><span class="o">=</span><span class="s2">&quot;forbid&quot;</span><span class="p">)</span>
 
     <span class="c1"># Explicit arguments</span>
@@ -4621,9 +4607,7 @@ window.runMermaid = runMermaid;</script>
 <a class="viewcode-back" href="../../../llm-api/reference.html#tensorrt_llm.llmapi.TrtLlmArgs.init_build_config">[docs]</a>
     <span class="nd">@model_validator</span><span class="p">(</span><span class="n">mode</span><span class="o">=</span><span class="s2">&quot;after&quot;</span><span class="p">)</span>
     <span class="k">def</span><span class="w"> </span><span class="nf">init_build_config</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
-<span class="w">        </span><span class="sd">&quot;&quot;&quot;</span>
-<span class="sd">        Creating a default BuildConfig if none is provided</span>
-<span class="sd">        &quot;&quot;&quot;</span>
+<span class="w">        </span><span class="sd">&quot;&quot;&quot;Creating a default BuildConfig if none is provided&quot;&quot;&quot;</span>
         <span class="n">build_config</span> <span class="o">=</span> <span class="nb">getattr</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="s2">&quot;build_config&quot;</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
         <span class="k">if</span> <span class="n">build_config</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
             <span class="n">kwargs</span> <span class="o">=</span> <span class="p">{}</span>
@@ -4973,9 +4957,7 @@ window.runMermaid = runMermaid;</script>
 <div class="viewcode-block" id="TorchCompileConfig">
 <a class="viewcode-back" href="../../../llm-api/reference.html#tensorrt_llm.llmapi.TorchCompileConfig">[docs]</a>
 <span class="k">class</span><span class="w"> </span><span class="nc">TorchCompileConfig</span><span class="p">(</span><span class="n">StrictBaseModel</span><span class="p">):</span>
-<span class="w">    </span><span class="sd">&quot;&quot;&quot;</span>
-<span class="sd">    Configuration for torch.compile.</span>
-<span class="sd">    &quot;&quot;&quot;</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;Configuration for torch.compile.&quot;&quot;&quot;</span>
     <span class="n">enable_fullgraph</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
         <span class="n">default</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
         <span class="n">description</span><span class="o">=</span><span class="s2">&quot;Enable full graph compilation in torch.compile.&quot;</span><span class="p">)</span>
@@ -5891,8 +5873,8 @@ window.runMermaid = runMermaid;</script>
   
 
   <!-- Scripts loaded after <body> so the DOM is not blocked -->
-  <script defer src="../../../_static/scripts/bootstrap.js?digest=55c26ed414f5f8a31ebb"></script>
-<script defer src="../../../_static/scripts/pydata-sphinx-theme.js?digest=55c26ed414f5f8a31ebb"></script>
+  <script defer src="../../../_static/scripts/bootstrap.js?digest=0790524f97105ba85085"></script>
+<script defer src="../../../_static/scripts/pydata-sphinx-theme.js?digest=0790524f97105ba85085"></script>
 
 
   <footer class="bd-footer">
@@ -5964,9 +5946,9 @@ window.runMermaid = runMermaid;</script>
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on May 20, 2026.</p>
+  <p>Last updated on May 25, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/c72d43d">c72d43d</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/4517988">4517988</a>.</p>
   
 </div></div>
       

@@ -14,9 +14,9 @@ Pre-built TensorRT LLM releases are available as [container images on NGC](https
 Replace `x.y.z` with the desired version tag. Browse the [available tags on NGC](https://catalog.ngc.nvidia.com/orgs/nvidia/teams/tensorrt-llm/containers/release/tags) to find the latest release.
 
 ```bash
-docker pull nvcr.io/nvidia/tensorrt-llm/release:1.3.0rc15
+docker pull nvcr.io/nvidia/tensorrt-llm/release:1.3.0rc16
 
-docker run --rm -it --ipc host --gpus all --ulimit memlock=-1 --ulimit stack=67108864 -p 8000:8000 nvcr.io/nvidia/tensorrt-llm/release:1.3.0rc15
+docker run --rm -it --ipc host --gpus all --ulimit memlock=-1 --ulimit stack=67108864 -p 8000:8000 nvcr.io/nvidia/tensorrt-llm/release:1.3.0rc16
 ```
 
 {{container_tag_admonition}}
