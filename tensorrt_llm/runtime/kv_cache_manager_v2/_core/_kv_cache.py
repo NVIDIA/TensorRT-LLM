@@ -71,6 +71,7 @@ from .._utils import (
     div_up,
     expect_type,
     filled_list,
+    intersect,
     make_typed,
     map_optional,
     stream_wait_events,
@@ -706,8 +707,13 @@ class _KVCache:
                     continue
                 stale_beg, stale_end = stale_ranges[lc]
                 if enable_scratch:
-                    num_scratch_blocks = len(scratch_ranges[lc])
-                    num_new_normal_blocks = (new_num_blocks - old_num_blocks) - num_scratch_blocks
+                    # Only newly added blocks consume slots below; scratch range may
+                    # extend before old_num_blocks when history_length < old_capacity.
+                    new_block_range = HalfOpenRange(old_num_blocks, new_num_blocks)
+                    num_new_blocks_using_scratch = len(
+                        intersect(scratch_ranges[lc], new_block_range)
+                    )
+                    num_new_normal_blocks = len(new_block_range) - num_new_blocks_using_scratch
                     num_new_slots[lc] = num_new_normal_blocks * beam_width
                 else:
                     if old_num_blocks < stale_beg:
