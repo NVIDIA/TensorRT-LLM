@@ -53,14 +53,14 @@ fi
 source "$config_file"
 
 # Apply defaults for anything still unset
-: "${trtllm:=/localhome/swqa/fzhu/TensorRT-LLM}"
-: "${work_dir:=$HOME/perf_runs/disagg_$(date +%Y%m%d_%H%M%S)}"
+: "${trtllm:=CHANGE_ME}"
+: "${work_dir:=$trtllm/perf_runs/disagg_$(date +%Y%m%d_%H%M%S)}"
 : "${partition:=CHANGE_ME}"
 : "${account:=coreai_comparch_trtllm}"
 : "${job_name:=disagg_test}"
 : "${image:=}"
 : "${image_var:=LLM_DOCKER_IMAGE}"
-: "${mounts:=/lustre:/lustre,/home:/home}"
+: "${mounts:=CHANGE_ME}"
 : "${llm_models_path:=/path/to/models}"
 : "${install_mode:=wheel}"
 : "${wheel_path:=CHANGE_ME}"
@@ -93,6 +93,14 @@ for _tid in "${test_ids[@]}"; do
         exit 1
     fi
 done
+if [[ "$trtllm" == "CHANGE_ME" ]]; then
+    echo "ERROR: please set 'trtllm' (path to TensorRT-LLM source tree) in $config_file." >&2
+    exit 1
+fi
+if [[ "$mounts" == "CHANGE_ME" ]]; then
+    echo "ERROR: please set 'mounts' (cluster-specific enroot bind mounts) in $config_file." >&2
+    exit 1
+fi
 if [[ ! -d "$trtllm" ]]; then
     echo "ERROR: trtllm directory not found: $trtllm" >&2
     exit 1
