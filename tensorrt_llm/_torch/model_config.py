@@ -319,18 +319,18 @@ class ModelConfig(Generic[TConfig]):
         if moe_backend.upper() != "AUTO":
             return moe_backend
 
-        is_nemotron_h = architecture in ("NemotronHForCausalLM",
-                                         "NemotronHPuzzleForCausalLM")
         is_w4a16_nvfp4 = quant_config.quant_algo in (QuantAlgo.W4A16_NVFP4,
                                                      "W4A16_NVFP4")
-        if is_nemotron_h and is_w4a16_nvfp4 and get_sm_version() in (120, 121):
-            return "FLASHINFER_NVFP4SM12X"
+        if is_w4a16_nvfp4 and get_sm_version() in (120, 121):
+            return "CUTEDSL"
 
         return ModelConfig.resolve_moe_backend(moe_backend, architecture)
 
     @staticmethod
-    def load_modelopt_quant_config(quant_config_file, checkpoint_dir,
-                                   moe_backend, hf_quant_config=None):
+    def load_modelopt_quant_config(quant_config_file,
+                                   checkpoint_dir,
+                                   moe_backend,
+                                   hf_quant_config=None):
         with open(quant_config_file) as f:
             quant_config_dict = json.load(f)
         return ModelConfig._build_modelopt_quant_config(
@@ -338,8 +338,10 @@ class ModelConfig(Generic[TConfig]):
             moe_backend, hf_quant_config)
 
     @staticmethod
-    def _build_modelopt_quant_config(json_quant_configs, checkpoint_dir,
-                                     moe_backend, hf_quant_config=None):
+    def _build_modelopt_quant_config(json_quant_configs,
+                                     checkpoint_dir,
+                                     moe_backend,
+                                     hf_quant_config=None):
         """Build (quant_config, layer_quant_config) from a normalized modelopt 'quantization' inner dict.
 
         ``json_quant_configs`` should be a dict as produced by
@@ -708,11 +710,6 @@ class ModelConfig(Generic[TConfig]):
         quant_config = QuantConfig()
         layer_quant_config = None
         requested_moe_backend = kwargs.get('moe_backend', 'AUTO')
-<<<<<<< HEAD
-=======
-        moe_backend = requested_moe_backend
-        # Resolve AUTO to specific backend based on model architecture
->>>>>>> ff309a699b (fix cuda core w4a16)
         architecture = pretrained_config.architectures[
             0] if pretrained_config.architectures else ""
         # Use an architecture-only backend hint for quant config parsing. Some
@@ -738,7 +735,10 @@ class ModelConfig(Generic[TConfig]):
                 source_file="hf_quant_config.json",
             )
             quant_config, layer_quant_config = cls._build_modelopt_quant_config(
-                normalized, checkpoint_dir, moe_backend_hint, hf_quant_config=hf_quant_config)
+                normalized,
+                checkpoint_dir,
+                moe_backend_hint,
+                hf_quant_config=hf_quant_config)
         # quantized ckpt in other formats
         elif getattr(pretrained_config, "quantization_config",
                      None) is not None:
@@ -750,12 +750,6 @@ class ModelConfig(Generic[TConfig]):
         elif quant_config_file := cached_file(checkpoint_dir, 'dtypes.json'):
             quant_config, layer_quant_config = cls.load_quant_config_from_dtypes_json(
                 quant_config_file, moe_backend_hint)
-
-        kwargs['moe_backend'] = cls.resolve_moe_backend(
-            requested_moe_backend,
-            architecture,
-            quant_config=quant_config,
-        )
 
         kwargs['moe_backend'] = cls.resolve_moe_backend_after_quant_config(
             requested_moe_backend, architecture, quant_config)

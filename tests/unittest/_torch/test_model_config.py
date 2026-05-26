@@ -202,25 +202,33 @@ def test_load_modelopt_quant_config_respects_hf_w4a16_metadata(tmp_path):
     assert layer_quant_config is None
 
 
-def test_auto_moe_backend_selects_flashinfer_for_nemotron_h_w4a16_sm12x():
+@pytest.mark.parametrize(
+    "architecture",
+    ["NemotronHForCausalLM", "Qwen3MoeForCausalLM", "SomeOtherForCausalLM"],
+)
+def test_auto_moe_backend_selects_cutedsl_for_w4a16_sm12x(architecture):
     quant_config = QuantConfig(quant_algo=QuantAlgo.W4A16_NVFP4, group_size=16)
 
     with pytest.MonkeyPatch.context() as mp:
         mp.setattr("tensorrt_llm._torch.model_config.get_sm_version", lambda: 121)
         moe_backend = ModelConfig.resolve_moe_backend_after_quant_config(
-            "AUTO", "NemotronHForCausalLM", quant_config
+            "AUTO", architecture, quant_config
         )
 
-    assert moe_backend == "FLASHINFER_NVFP4SM12X"
+    assert moe_backend == "CUTEDSL"
 
 
-def test_auto_moe_backend_keeps_cutlass_for_nemotron_h_w4a16_on_other_sm():
+@pytest.mark.parametrize(
+    "architecture",
+    ["NemotronHForCausalLM", "Qwen3MoeForCausalLM", "SomeOtherForCausalLM"],
+)
+def test_auto_moe_backend_keeps_cutlass_for_w4a16_on_other_sm(architecture):
     quant_config = QuantConfig(quant_algo=QuantAlgo.W4A16_NVFP4, group_size=16)
 
     with pytest.MonkeyPatch.context() as mp:
         mp.setattr("tensorrt_llm._torch.model_config.get_sm_version", lambda: 100)
         moe_backend = ModelConfig.resolve_moe_backend_after_quant_config(
-            "AUTO", "NemotronHForCausalLM", quant_config
+            "AUTO", architecture, quant_config
         )
 
     assert moe_backend == "CUTLASS"

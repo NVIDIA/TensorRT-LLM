@@ -3020,6 +3020,10 @@ class NVFP4CuteDslB12xFusedMoEMethod(NVFP4CutlassFusedMoEMethod):
         # layers across the model share one wrapper-owned output buffer.
         from .fused_moe_cute_dsl_b12x import _SHARED_MOE_OUTPUT_BUF
 
+        quant_config = getattr(module, "quant_config", None)
+        is_w4a16_nvfp4 = (quant_config is not None
+                          and quant_config.layer_quant_mode.has_w4a16_nvfp4())
+
         num_local_experts = module.w3_w1_weight.shape[0]
         # Tensor shapes use the *padded* per-rank dims because TP partitions
         # may pad ``intermediate_size`` up to a kernel-friendly boundary.
@@ -3069,11 +3073,28 @@ class NVFP4CuteDslB12xFusedMoEMethod(NVFP4CutlassFusedMoEMethod):
                                               k=w2_in_dim,
                                               num_groups=num_local_experts)
 
-        w1_alpha_b12x = ((1.0 / module.fc31_input_scale).expand(
-            module.num_experts).to(torch.float32).contiguous())
-        w2_alpha_b12x = ((1.0 / module.fc2_input_scale).expand(
-            module.num_experts).to(torch.float32).contiguous())
-        fc2_input_scale_b12x = (1.0 / module.fc2_input_scale).to(torch.float32)
+        if is_w4a16_nvfp4:
+            # W4A16 path: BF16/FP16 activations multiplied by FP4 weights.
+            # There is no online activation quantization, so the wrapper uses
+            # ``w*_alpha`` only as FC1/FC2 epilogue dequant multipliers.
+            # Since we still un-normalize FP8 block scales by weight_scale_2
+            # above, alpha is unity. ``fc2_input_scale`` is ignored in this
+            # FlashInfer mode.
+            alpha_device = module.w3_w1_weight.device
+            w1_alpha_b12x = torch.ones(module.num_experts,
+                                       dtype=torch.float32,
+                                       device=alpha_device)
+            w2_alpha_b12x = torch.ones(module.num_experts,
+                                       dtype=torch.float32,
+                                       device=alpha_device)
+            fc2_input_scale_b12x = None
+        else:
+            w1_alpha_b12x = ((1.0 / module.fc31_input_scale).expand(
+                module.num_experts).to(torch.float32).contiguous())
+            w2_alpha_b12x = ((1.0 / module.fc2_input_scale).expand(
+                module.num_experts).to(torch.float32).contiguous())
+            fc2_input_scale_b12x = (1.0 / module.fc2_input_scale).to(
+                torch.float32)
 
         # TRT-LLM packs 16 FP4 values per int64. flashinfer's internal
         # ``view(torch.float4_e2m1fn_x2)`` requires byte-contiguous storage
@@ -3096,14 +3117,21 @@ class NVFP4CuteDslB12xFusedMoEMethod(NVFP4CutlassFusedMoEMethod):
                 f"{ActivationType(module.activation_type).name}; "
                 f"supported: {supported}.")
 
+        # The model config may carry the logical intermediate size while the
+        # NVFP4 weight tensors are padded for kernel alignment, e.g. Nano3.5
+        # uses 1856 logical channels and 1920 stored channels. FlashInfer's
+        # CUDA-graph workspace must match the stored tensors.
+        b12x_intermediate_size = w2_in_dim
+
         module.b12x_wrapper = B12xMoEWrapper(
             num_experts=module.num_experts,
             top_k=module.routing_method.experts_per_token,
             hidden_size=module.hidden_size,
-            intermediate_size=module.intermediate_size_per_partition,
+            intermediate_size=b12x_intermediate_size,
             use_cuda_graph=getattr(module, "_b12x_use_cuda_graph", False),
             max_num_tokens=module.moe_max_num_tokens,
             activation=self._ACTIVATION_MAP[module.activation_type],
+            quant_mode="w4a16" if is_w4a16_nvfp4 else "nvfp4",
         )
 
         # Replace the wrapper's per-instance output buffer with a shared one.
@@ -3124,10 +3152,11 @@ class NVFP4CuteDslB12xFusedMoEMethod(NVFP4CutlassFusedMoEMethod):
 
         logger.info_once(
             f"NVFP4CuteDslB12xFusedMoEMethod active: hidden={module.hidden_size}, "
-            f"intermediate={module.intermediate_size_per_partition}, "
+            f"intermediate={b12x_intermediate_size}, "
             f"experts={module.num_experts}, top_k="
             f"{module.routing_method.experts_per_token}, "
-            f"activation={self._ACTIVATION_MAP[module.activation_type]}.",
+            f"activation={self._ACTIVATION_MAP[module.activation_type]}, "
+            f"quant_mode={'w4a16' if is_w4a16_nvfp4 else 'nvfp4'}.",
             key="cute_dsl_b12x_moe_active",
         )
 

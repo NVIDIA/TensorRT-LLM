@@ -76,11 +76,11 @@ def test_nemotron_h_moe_uses_w4a4_nvfp4_expert_config_for_w4a16_checkpoint():
     assert model_config.quant_config.quant_algo == QuantAlgo.W4A16_NVFP4
 
 
-def test_nemotron_h_moe_preserves_w4a16_config_for_flashinfer_sm12x():
+def test_nemotron_h_moe_preserves_w4a16_config_for_cutedsl_sm12x():
     quant_config = QuantConfig(
         quant_algo=QuantAlgo.W4A16_NVFP4, group_size=16, exclude_modules=["lm_head"]
     )
-    model_config = _make_nemotron_h_moe_config(quant_config, moe_backend="FLASHINFER_NVFP4SM12X")
+    model_config = _make_nemotron_h_moe_config(quant_config, moe_backend="CUTEDSL")
     captured = {}
 
     def fake_create_moe(**kwargs):
@@ -108,7 +108,7 @@ def test_nemotron_h_mtp_bf16_body_uses_cutlass_moe_backend():
             mtp_hybrid_override_pattern="*E",
             torch_dtype=torch.bfloat16,
         ),
-        moe_backend="FLASHINFER_NVFP4SM12X",
+        moe_backend="CUTEDSL",
         quant_config=quant_config,
     )
     captured = []
@@ -141,4 +141,4 @@ def test_nemotron_h_mtp_bf16_body_uses_cutlass_moe_backend():
         assert sublayer_model_config.quant_config.quant_algo is None
         assert sublayer_model_config.moe_backend == "CUTLASS"
     assert model_config.quant_config.quant_algo == QuantAlgo.W4A16_NVFP4
-    assert model_config.moe_backend == "FLASHINFER_NVFP4SM12X"
+    assert model_config.moe_backend == "CUTEDSL"

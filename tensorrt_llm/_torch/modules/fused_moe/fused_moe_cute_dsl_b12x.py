@@ -44,24 +44,25 @@ _ACTIVATION_MAP = {
 
 
 class CuteDslB12xFusedMoE(CuteDslFusedMoE):
-    """Hybrid CUTLASS-prefill / b12x-decode NVFP4 fused-MoE backend for SM120 / SM121.
+    """B12x NVFP4 fused-MoE backend for SM120 / SM121.
 
     Member of the cuteDSL backend family: the decode kernel
     (``flashinfer.B12xMoEWrapper.run``) is JIT-compiled CuTe DSL, so the
     backend slots in next to :class:`CuteDslFusedMoE` (which targets SM100 /
-    SM103). The hybrid prefill path still routes through the C++ CUTLASS
-    NVFP4 GroupGEMM via explicit :class:`CutlassFusedMoE` method calls; the
-    parent class on the MRO does not change which kernels execute, only
-    where the b12x backend sits in the family.
+    SM103). Plain NVFP4 prefill can route through the C++ CUTLASS NVFP4
+    GroupGEMM via explicit :class:`CutlassFusedMoE` method calls; the parent
+    class on the MRO does not change which kernels execute, only where the
+    b12x backend sits in the family.
 
     Composition (see ``MOE_DEVELOPER_GUIDE.md`` for the full explainer):
 
-    - **Prefill (``m >= _PREFILL_VIA_CUTLASS_THRESHOLD``)** explicitly
+    - **NVFP4 prefill (``m >= _PREFILL_VIA_CUTLASS_THRESHOLD``)** explicitly
       invokes :class:`CutlassFusedMoE` NVFP4 GroupGEMM. The b12x kernel's
       12-CTA-per-token MMA pattern is suboptimal at large ``m``.
     - **Decode (``m <  _PREFILL_VIA_CUTLASS_THRESHOLD``)** dispatches to
       FlashInfer's ``B12xMoEWrapper.run`` — a kernel purpose-built for
       ``m=1`` / small routed-row counts.
+    - **W4A16_NVFP4** stays on the b12x path for both prefill and decode.
 
     NVFP4 weights are loaded via :class:`NVFP4CuteDslB12xFusedMoEMethod`
     (an :class:`NVFP4CutlassFusedMoEMethod` subclass returned by
@@ -79,8 +80,9 @@ class CuteDslB12xFusedMoE(CuteDslFusedMoE):
     The backend hard-rejects EP (b12x has no dispatch / combine kernel),
     MoE alltoall, ``Fp4QuantizedTensor`` input, ``swiglu_gptoss_style``
     biased SwiGLU, and activations outside ``{Relu2, Swiglu}``. It is
-    selected on the ``CUTEDSL`` MoE path when SM120 / SM121 + NVFP4 +
-    flashinfer-importable gates pass (see ``create_moe.get_moe_cls``).
+    selected on the ``CUTEDSL`` MoE path when SM120 / SM121 + NVFP4 or
+    W4A16_NVFP4 + flashinfer-importable gates pass (see
+    ``create_moe.get_moe_cls``).
     """
 
     # SM versions on which the FlashInfer b12x NVFP4 MoE kernel is available.
@@ -105,9 +107,9 @@ class CuteDslB12xFusedMoE(CuteDslFusedMoE):
         if sm_version not in cls._SUPPORTED_SM_VERSIONS:
             sm_list = "/".join(f"SM{v}" for v in sorted(cls._SUPPORTED_SM_VERSIONS))
             return _warn_and_return(f"CuteDslB12xFusedMoE requires {sm_list}, got SM{sm_version}")
-        if quant_algo != QuantAlgo.NVFP4:
+        if quant_algo not in {QuantAlgo.NVFP4, QuantAlgo.W4A16_NVFP4}:
             return _warn_and_return(
-                f"CuteDslB12xFusedMoE only supports NVFP4 quantization "
+                f"CuteDslB12xFusedMoE only supports NVFP4 or W4A16_NVFP4 quantization "
                 f"(got quant_algo={quant_algo})"
             )
         if dtype_activation not in {torch.float16, torch.bfloat16}:
@@ -158,7 +160,10 @@ class CuteDslB12xFusedMoE(CuteDslFusedMoE):
         if (
             self.quant_config is not None
             and self.quant_config.layer_quant_mode.has_any_quant(exclude_kv_cache=True)
-            and self.quant_config.layer_quant_mode.has_nvfp4()
+            and (
+                self.quant_config.layer_quant_mode.has_nvfp4()
+                or self.quant_config.layer_quant_mode.has_w4a16_nvfp4()
+            )
         ):
             from .quantization import NVFP4CuteDslB12xFusedMoEMethod
 
@@ -167,9 +172,12 @@ class CuteDslB12xFusedMoE(CuteDslFusedMoE):
 
     def _route_to_cutlass(self, x) -> bool:
         """Return ``True`` iff this call should fall back to the inherited
-        CUTLASS path (prefill chunk). ``Fp4QuantizedTensor`` inputs always
-        stay on the b12x path (which rejects them) so the existing error
-        message is preserved."""
+        CUTLASS path (NVFP4 prefill chunk). ``Fp4QuantizedTensor`` inputs
+        always stay on the b12x path (which rejects them) so the existing
+        error message is preserved."""
+        quant_config = getattr(self, "quant_config", None)
+        if quant_config is not None and quant_config.layer_quant_mode.has_w4a16_nvfp4():
+            return False
         return isinstance(x, torch.Tensor) and x.shape[0] >= self._PREFILL_VIA_CUTLASS_THRESHOLD
 
     # ``post_load_weights`` is inherited from ``CutlassFusedMoE`` and
@@ -190,12 +198,12 @@ class CuteDslB12xFusedMoE(CuteDslFusedMoE):
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """Hybrid dispatch entrypoint for activation handling.
 
-        Prefill chunks (``x.shape[0] >= _PREFILL_VIA_CUTLASS_THRESHOLD``) take
-        the inherited :meth:`CutlassFusedMoE.quantize_input` path so the
-        downstream ``run_moe`` can call CUTLASS NVFP4 GroupGEMM. Decode
-        chunks pass through unchanged because b12x quantizes activations
-        internally (consumes a bf16 / fp16 ``x`` and produces its own scale
-        factors).
+        NVFP4 prefill chunks take the inherited
+        :meth:`CutlassFusedMoE.quantize_input` path so the downstream
+        ``run_moe`` can call CUTLASS NVFP4 GroupGEMM. Decode chunks and
+        W4A16_NVFP4 chunks pass through unchanged because b12x quantizes
+        activations internally (consumes a bf16 / fp16 ``x`` and produces its
+        own scale factors).
         """
         if self._route_to_cutlass(x):
             return CutlassFusedMoE.quantize_input(
