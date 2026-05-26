@@ -19,10 +19,10 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Tuple
 
-import torch
 from pydantic import BaseModel, ConfigDict
 from pydantic import Field as PydanticField
 
+import torch
 from tensorrt_llm.functional import AllReduceStrategy
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
@@ -107,7 +107,7 @@ class DiffusionModelConfig(BaseModel):
     mapping: Mapping = PydanticField(default_factory=Mapping)
     skip_create_weights_in_init: bool = False
     force_dynamic_quantization: bool = False
-    allreduce_strategy: AllReduceStrategy = PydanticField(default=AllReduceStrategy.AUTO)
+    allreduce_strategy: AllReduceStrategy = PydanticField(default=AllReduceStrategy.NCCL)
     extra_attrs: Dict = PydanticField(default_factory=dict)
 
     # Unified parallelism mapping (populated by setup_visual_gen_mapping)

@@ -3,7 +3,6 @@ from typing import Optional, Tuple
 
 import torch
 import torch.nn as nn
-
 from tensorrt_llm.llmapi.llm_args import SkipSoftmaxAttentionConfig
 
 from ...modules.linear import Linear, WeightMode, WeightsLoadingConfig
@@ -124,6 +123,8 @@ class Attention(nn.Module):
                     quant_config=self.quant_config,
                     skip_create_weights_in_init=self.skip_create_weights_in_init,
                     force_dynamic_quantization=self.force_dynamic_quantization,
+                    # TODO: TP attn
+                    reduce_output=False,
                 )
             ]
         )
@@ -215,6 +216,8 @@ class Attention(nn.Module):
                     "k": (self.q_dim, self.kv_dim),
                     "v": (self.q_dim + self.kv_dim, self.kv_dim),
                 },
+                # TODO: TP attn
+                reduce_output=False,
             )
         else:
             self.to_q = Linear(
@@ -226,6 +229,8 @@ class Attention(nn.Module):
                 quant_config=self.quant_config,
                 skip_create_weights_in_init=self.skip_create_weights_in_init,
                 force_dynamic_quantization=self.force_dynamic_quantization,
+                # TODO: TP attn
+                reduce_output=False,
             )
             self.to_k = Linear(
                 self.hidden_size,
@@ -236,6 +241,8 @@ class Attention(nn.Module):
                 quant_config=self.quant_config,
                 skip_create_weights_in_init=self.skip_create_weights_in_init,
                 force_dynamic_quantization=self.force_dynamic_quantization,
+                # TODO: TP attn
+                reduce_output=False,
             )
             self.to_v = Linear(
                 self.hidden_size,
@@ -246,6 +253,8 @@ class Attention(nn.Module):
                 quant_config=self.quant_config,
                 skip_create_weights_in_init=self.skip_create_weights_in_init,
                 force_dynamic_quantization=self.force_dynamic_quantization,
+                # TODO: TP attn
+                reduce_output=False,
             )
 
     def get_qkv(

@@ -13,12 +13,11 @@ from __future__ import annotations
 from typing import Optional
 
 import torch.distributed as dist
-from torch.distributed import ProcessGroup
-from torch.distributed.device_mesh import init_device_mesh
-
 from tensorrt_llm._torch.device_mesh import DeviceMeshTopologyImpl, SingleProcessGroup
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
+from torch.distributed import ProcessGroup
+from torch.distributed.device_mesh import init_device_mesh
 
 _VALID_DIM_NAMES = frozenset({"cfg", "tp", "cp", "ulysses"})
 # Outermost-to-innermost for init_device_mesh
@@ -164,11 +163,13 @@ class VisualGenMapping(DeviceMeshTopologyImpl):
                 )
             return
 
-        shape = tuple(self._dim_sizes[d] for d in self._dim_names)
+        dims = ("pp",) + (self._dim_names) + ("cp",)
+        shape = (1,) + tuple(self._dim_sizes[d] for d in self._dim_names) + (1,)
+
         cls.device_mesh = init_device_mesh(
             "cuda",
             mesh_shape=shape,
-            mesh_dim_names=self._dim_names,
+            mesh_dim_names=dims,
         )
         logger.debug(
             f"VisualGenMapping.build_mesh: dims={self._dim_names}, "
