@@ -60,6 +60,7 @@ def test_cache_size_estimation_uses_model_attention_layer_count():
     size_per_token = DeepseekV4CacheManager.get_cache_size_per_token(
         FakeModelConfig(),
         Mapping(world_size=1, rank=0, tp_size=1, pp_size=1),
+        tokens_per_block=128,
         is_disagg=True,
     )
 
@@ -68,7 +69,7 @@ def test_cache_size_estimation_uses_model_attention_layer_count():
     assert cost.intercept == 0
 
 
-def test_cache_size_estimation_returns_swa_fixed_cost_as_intercept():
+def test_cache_size_estimation_models_prefill_swa_scratch(monkeypatch):
     class FakeModelConfig:
         sparse_attention_config = SimpleNamespace(
             index_head_dim=128,
@@ -85,6 +86,7 @@ def test_cache_size_estimation_returns_swa_fixed_cost_as_intercept():
         def get_num_attention_layers(self) -> int:
             return len(self.sparse_attention_config.compress_ratios)
 
+    monkeypatch.setenv(DSV4_ENABLE_SWA_SCRATCH_REUSE_ENV, "1")
     size_per_token = DeepseekV4CacheManager.get_cache_size_per_token(
         FakeModelConfig(),
         Mapping(world_size=1, rank=0, tp_size=1, pp_size=1),
@@ -99,13 +101,24 @@ def test_cache_size_estimation_returns_swa_fixed_cost_as_intercept():
         max_batch_size=2,
     )
 
-    cost = CacheCost.from_raw(size_per_token)
-    assert cost.slope == 0
-    assert cost.intercept > 0
-    assert CacheCost.from_raw(short_seq_size_per_token) == cost
+    scratch_cost = CacheCost.from_raw(size_per_token)
+    assert scratch_cost.slope > 0
+    assert scratch_cost.intercept == 2 * 128 * scratch_cost.slope
+    assert CacheCost.from_raw(short_seq_size_per_token) == scratch_cost
+
+    monkeypatch.setenv(DSV4_ENABLE_SWA_SCRATCH_REUSE_ENV, "0")
+    no_scratch_size_per_token = DeepseekV4CacheManager.get_cache_size_per_token(
+        FakeModelConfig(),
+        Mapping(world_size=1, rank=0, tp_size=1, pp_size=1),
+        tokens_per_block=128,
+        max_batch_size=2,
+    )
+    no_scratch_cost = CacheCost.from_raw(no_scratch_size_per_token)
+    assert no_scratch_cost.slope == 2 * scratch_cost.slope
+    assert no_scratch_cost.intercept == 0
 
 
-def test_quota_from_max_tokens_models_swa_as_fixed_cost():
+def test_quota_from_max_tokens_models_prefill_swa_scratch():
     manager = object.__new__(DeepseekV4CacheManager)
     manager.pp_layers = [0, 1]
     manager._compress_ratios = [1, 1]
@@ -118,15 +131,27 @@ def test_quota_from_max_tokens_models_swa_as_fixed_cost():
     manager.tokens_per_block = 128
     manager.max_batch_size = 2
 
+    manager.enable_swa_scratch_reuse = True
     small_quota = manager._get_quota_from_max_tokens(1)
     large_quota = manager._get_quota_from_max_tokens(4096)
+    scratch_delta = large_quota - small_quota
 
-    assert small_quota == large_quota
+    assert small_quota < large_quota
     assert small_quota > manager._get_extra_quota_padding()
-    assert manager._get_max_tokens_from_quota(small_quota) == float("inf")
+    assert manager._get_max_tokens_from_quota(small_quota) == 1
+    assert manager._get_max_tokens_from_quota(large_quota) == 4096
+
+    manager.enable_swa_scratch_reuse = False
+    no_scratch_small_quota = manager._get_quota_from_max_tokens(1)
+    no_scratch_large_quota = manager._get_quota_from_max_tokens(4096)
+    no_scratch_delta = no_scratch_large_quota - no_scratch_small_quota
+
+    assert no_scratch_small_quota < no_scratch_large_quota
+    assert no_scratch_delta == 2 * scratch_delta
+    assert manager._get_max_tokens_from_quota(no_scratch_large_quota) == 4096
 
 
-def test_needed_resource_uses_full_slope_and_fixed_swa_cost():
+def test_needed_resource_uses_prefill_swa_scratch_slope():
     manager = object.__new__(DeepseekV4CacheManager)
     manager.pp_layers = [0, 1]
     manager._compress_ratios = [4, 4]
@@ -137,6 +162,7 @@ def test_needed_resource_uses_full_slope_and_fixed_swa_cost():
     manager._swa_window_size = 128
     manager.tokens_per_block = 128
     manager.num_extra_kv_tokens = 0
+    manager.enable_swa_scratch_reuse = True
 
     context_request = SimpleNamespace(
         is_context_init_state=True,
@@ -145,6 +171,15 @@ def test_needed_resource_uses_full_slope_and_fixed_swa_cost():
         is_disagg_generation_init_state=False,
         state=LlmRequestState.CONTEXT_INIT,
         prompt_len=10,
+        max_new_tokens=100,
+    )
+    longer_context_request = SimpleNamespace(
+        is_context_init_state=True,
+        is_generation_in_progress_state=False,
+        is_generation_to_complete_state=False,
+        is_disagg_generation_init_state=False,
+        state=LlmRequestState.CONTEXT_INIT,
+        prompt_len=11,
         max_new_tokens=100,
     )
     generation_request = SimpleNamespace(
@@ -156,16 +191,26 @@ def test_needed_resource_uses_full_slope_and_fixed_swa_cost():
         prompt_len=10,
         max_new_tokens=20,
     )
+    longer_generation_request = SimpleNamespace(
+        is_context_init_state=False,
+        is_generation_in_progress_state=True,
+        is_generation_to_complete_state=False,
+        is_disagg_generation_init_state=False,
+        state=LlmRequestState.GENERATION_IN_PROGRESS,
+        prompt_len=10,
+        max_new_tokens=21,
+    )
 
     full_attn_size_per_token = manager.get_cache_bytes_per_token()
     context_bytes = manager.get_needed_resource_to_completion(context_request)
+    longer_context_bytes = manager.get_needed_resource_to_completion(longer_context_request)
     generation_bytes = manager.get_needed_resource_to_completion(generation_request)
+    longer_generation_bytes = manager.get_needed_resource_to_completion(longer_generation_request)
 
     assert full_attn_size_per_token > 0
     assert context_bytes > context_request.prompt_len * full_attn_size_per_token
-    assert generation_bytes - context_bytes == (
-        generation_request.max_new_tokens * full_attn_size_per_token
-    )
+    assert longer_context_bytes - context_bytes > full_attn_size_per_token
+    assert longer_generation_bytes - generation_bytes == full_attn_size_per_token
 
 
 def _view_fp8_as_uint8(buffer: torch.Tensor) -> torch.Tensor:
