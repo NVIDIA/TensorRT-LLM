@@ -1887,17 +1887,22 @@ std::shared_ptr<KVCacheBlock> WindowBlockManager::findBlocksInReuseTreeByBlockKe
     auto blockedUniqueTokens
         = chopVectorIntoBlocks<UniqueToken>(blockKey.uniqueTokens, blockKey.uniqueTokens.size(), mTokensPerBlock, true);
 
-    std::vector<BlockKey> blockKeys;
+    // Walk the reuse tree one block at a time using a single reusable BlockKey
+    // (scalar fields copied once, uniqueTokens rebound per iteration). A fresh
+    // BlockKey per iteration would copy the input's full uniqueTokens (size =
+    // prefix_tokens), making this loop O(prefix_blocks^2) instead of O(prefix_blocks).
+    BlockKey lookupKey;
+    lookupKey.usesExtraIds = blockKey.usesExtraIds;
+    lookupKey.loraTaskId = blockKey.loraTaskId;
+    lookupKey.extraKeys = blockKey.extraKeys;
+    lookupKey.cacheSaltID = blockKey.cacheSaltID;
+
+    auto searchRoot = mCachedBlocksRoot;
     for (auto const& blockedUniqueTokensList : blockedUniqueTokens)
     {
-        blockKeys.push_back(blockKey);
-        blockKeys.back().uniqueTokens = blockedUniqueTokensList;
-    }
-    auto searchRoot = mCachedBlocksRoot;
-    for (auto const& blockKey : blockKeys)
-    {
+        lookupKey.uniqueTokens = blockedUniqueTokensList;
         auto [partialMatch, numMatched, matchingBlock] = searchRoot != nullptr
-            ? searchRoot->findMatchingBlock(blockKey, true, true)
+            ? searchRoot->findMatchingBlock(lookupKey, true, true)
             : std::make_tuple(false, 0, nullptr);
 
         if (matchingBlock == nullptr)
