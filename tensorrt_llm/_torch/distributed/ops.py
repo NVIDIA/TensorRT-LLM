@@ -5,8 +5,6 @@ import threading
 from typing import Dict, List, Optional, Tuple, Union
 
 import torch
-from torch import nn
-
 from tensorrt_llm._mnnvl_utils import HelixCpMnnvlMemory, MnnvlMemory
 from tensorrt_llm._torch.distributed.symm_mem_allreduce import \
     SymmetricMemoryAllReduce
@@ -20,6 +18,7 @@ from tensorrt_llm.functional import (AllReduceFusionOp, AllReduceParams,
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.plugin.plugin import CustomAllReduceHelper
+from torch import nn
 
 # Feature flag: GEMM→NCCL-window zero-copy (writes GEMM output directly into
 # the window buffer so the allreduce needs no extra copy).  Off by default
@@ -777,6 +776,9 @@ class AllReduce(nn.Module):
                         f"MNNVLAllReduce can't be enabled due to failing the is_mnnvl check."
                     )
                     self.mnnvl_allreduce = None
+            self.tp_group = self.mapping.tp_group
+            if self._disable_mpi and not self.mnnvl_allreduce:
+                self.pg = self.mapping.tp_group_pg
 
     def uses_nccl_symmetric_memory_window(self) -> bool:
         """Return True if this allreduce can use an NCCL window output buffer.
@@ -877,7 +879,7 @@ class AllReduce(nn.Module):
         additional_args = {}
         if self._disable_mpi:
             # Get ProcessGroup from mapping
-            pg = self.mapping.tp_group_pg
+            pg = self.pg
             assert pg is not None, "TP ProcessGroup not initialised"
             additional_args = {
                 "rank": torch.distributed.get_rank(),
@@ -897,7 +899,7 @@ class AllReduce(nn.Module):
                 scale=all_reduce_params.scale,
                 bias=all_reduce_params.bias,
                 workspace=self.workspace,
-                group=self.mapping.tp_group,
+                group=self.tp_group,
                 strategy=allreduce_strategy,
                 op=all_reduce_params.fusion_op,
                 eps=all_reduce_params.eps,
@@ -912,7 +914,7 @@ class AllReduce(nn.Module):
                 scale=all_reduce_params.scale,
                 bias=all_reduce_params.bias,
                 workspace=self.workspace,
-                group=self.mapping.tp_group,
+                group=self.tp_group,
                 strategy=allreduce_strategy,
                 op=all_reduce_params.fusion_op,
                 eps=all_reduce_params.eps,
