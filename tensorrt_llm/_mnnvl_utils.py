@@ -382,12 +382,9 @@ class MnnvlMemory:
         # We check if it has all NVLink up now.
         # But it is not equivalent to MNNVL support.
         # May need better support check.
-        # SM120/121 (RTX PRO 6000 Blackwell desktop / Server Edition) lack the
-        # NVSwitch fabric required by MNNVL-class all-to-all kernels; even with
-        # local NVLink bridges reporting up, those kernels deadlock there. The
-        # MoE CommunicationFactory consults this predicate (directly and via
-        # NVLinkOneSided / NVLinkTwoSided / DeepEP) to fall back to a
-        # non-MNNVL path (AllGather + ReduceScatter).
+        # SM120/121 (RTX PRO 6000 Blackwell) lack NVSwitch fabric; MNNVL-class
+        # all-to-all kernels deadlock there even when local NVLink bridges
+        # report up.
         if get_sm_version() in (120, 121):
             return False
         dev_id = torch.cuda.current_device()
