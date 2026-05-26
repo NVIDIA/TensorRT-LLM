@@ -163,13 +163,12 @@ class VisualGenMapping(DeviceMeshTopologyImpl):
                 )
             return
 
-        dims = ("pp",) + (self._dim_names) + ("cp",)
-        shape = (1,) + tuple(self._dim_sizes[d] for d in self._dim_names) + (1,)
+        shape = tuple(self._dim_sizes[d] for d in self._dim_names)
 
         cls.device_mesh = init_device_mesh(
             "cuda",
             mesh_shape=shape,
-            mesh_dim_names=dims,
+            mesh_dim_names=self._dim_names,
         )
         logger.debug(
             f"VisualGenMapping.build_mesh: dims={self._dim_names}, "
