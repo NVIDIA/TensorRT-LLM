@@ -309,7 +309,7 @@ class PyExecutor:
             waiting_queue_policy: WaitingQueuePolicy = WaitingQueuePolicy.FCFS,
             adp_router: Optional[ADPRouter] = None,
             dwdp_manager: Optional[DwdpManager] = None,
-            enable_kv_pool_rebalance: bool = True):
+            enable_kv_pool_rebalance: bool = False):
         super(PyExecutor, self).__init__()
         self.device_id = torch.cuda.current_device()
         self.global_rank = dist.rank
@@ -2649,7 +2649,7 @@ class PyExecutor:
 
         MVP scope: single-GPU aggregated, no in-flight disagg transfer,
         no beam search, no drafter, not during warmup or shutdown.
-        Honors the ``enable_kv_pool_rebalance`` user-facing kill switch.
+        Honors the ``enable_kv_pool_rebalance`` opt-in flag (default off).
         """
         if not self.enable_kv_pool_rebalance:
             return False
