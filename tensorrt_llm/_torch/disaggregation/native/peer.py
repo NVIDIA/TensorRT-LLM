@@ -100,7 +100,7 @@ class PeerRegistrar:
             # Allow mismatch when one side has speculative (e.g. MTP) layers
             # that the other side doesn't. The pool_mapping logic will only
             # transfer layers that exist on both sides.
-            logger.info(
+            logger.warning(
                 "PeerRegistrar: layer count differs "
                 f"(local={self_layers}, peer={peer_layers}), "
                 "allowing partial layer transfer."
