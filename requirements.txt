@@ -30,7 +30,7 @@ nvidia-modelopt[torch]~=0.37.0
 # torch 2.10.0+cu130 depends on nvidia-nccl-cu13==2.28.9
 nvidia-nccl-cu13>=2.28.9,<=2.29.2
 nvidia-cuda-nvrtc
-transformers==5.5.3
+transformers==5.5.4
 prometheus_client
 prometheus_fastapi_instrumentator
 pydantic>=2.9.1
@@ -54,7 +54,7 @@ ordered-set
 peft>=0.18.1,<0.19.0
 patchelf
 einops
-flashinfer-python==0.6.11.post1
+flashinfer-python @ git+https://github.com/flashinfer-ai/flashinfer.git@v0.6.12rc1#egg=flashinfer-python
 opencv-python-headless
 xgrammar==0.1.32
 llguidance==0.7.29
@@ -71,7 +71,7 @@ xdsl>=0.59.0 # Optional: required for MLIR-based elementwise fusion in AutoDeplo
 tiktoken
 blobfile
 openai-harmony==0.0.4
-nvidia-cutlass-dsl==4.5.0; python_version >= "3.10"
+nvidia-cutlass-dsl[cu13]==4.5.0; python_version >= "3.10"
 plotly
 numexpr
 partial_json_parser

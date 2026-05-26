@@ -1,0 +1,16 @@
+{
+  "video": "wan21_t2v_lpips_golden_video.mp4",
+  "model": "Wan2.1-T2V-1.3B-Diffusers",
+  "source": "TensorRT-LLM VisualGen",
+  "prompt": "A cat sitting on a windowsill",
+  "negative_prompt": null,
+  "height": 256,
+  "width": 256,
+  "num_frames": 5,
+  "num_inference_steps": 1,
+  "guidance_scale": 5.0,
+  "seed": 42,
+  "frame_rate": 16.0,
+  "lpips_net": "alex",
+  "lpips_threshold": 0.05
+}
