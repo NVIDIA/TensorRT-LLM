@@ -798,7 +798,7 @@ class Attention(nn.Module):
         T: int,
         logit_bias: torch.Tensor,
     ) -> torch.Tensor:
-        """SDPA fallback for an arbitrary float additive logit bias (e.g. Conformer RPE).
+        """SDPA with an arbitrary float additive logit bias (e.g. Conformer RPE).
 
         Assumes q/k/v are already split (not fused) and in packed format
         [B*T, num_heads_per_rank * head_dim].  All sequences must have the

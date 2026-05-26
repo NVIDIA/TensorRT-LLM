@@ -352,7 +352,7 @@ class ParakeetProjection(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# Native TRT-LLM encoder — attention built on trtllm.Attention
+# Conformer encoder
 # ---------------------------------------------------------------------------
 
 
@@ -465,7 +465,6 @@ class ParakeetConformerAttention(Attention):
 
         attn_output, _ = self._forward_with_logit_bias(q, k, v, B=B, T=T, logit_bias=matrix_bd)
 
-        # ── Output projection (TP row-parallel with AllReduce) ────────────────
         return self.o_proj(attn_output).reshape(B, T, C)
 
     def load_weights(self, weights: Dict[str, torch.Tensor], prefix: str = "") -> None:
@@ -510,10 +509,8 @@ class ParakeetFeedForward(nn.Module):
 
 
 class ParakeetConvolutionModule(nn.Module):
-    """Conformer depthwise convolution module with trtllm.Linear pointwise projections.
+    """Conformer depthwise convolution module.
 
-    Pointwise 1×1 convolutions use trtllm.Linear (operating on the last dim);
-    the depthwise Conv1d and BatchNorm remain as HF/PyTorch modules.
     Checkpoint weights for pointwise_conv1/2 have shape [C_out, C_in, 1] and are
     squeezed to [C_out, C_in] during load_weights.
     """
@@ -547,7 +544,6 @@ class ParakeetConvolutionModule(nn.Module):
         hidden_states: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        # GLU via linear — no initial transpose needed
         hidden_states = self.pointwise_conv1(hidden_states)  # [B, T, 2C]
         hidden_states = nn.functional.glu(hidden_states, dim=-1)  # [B, T, C]
 
@@ -570,12 +566,7 @@ class ParakeetConvolutionModule(nn.Module):
 
 
 class ParakeetConformerBlock(nn.Module):
-    """Conformer block with trtllm layers throughout.
-
-    All linear projections use trtllm.Linear; all normalization uses
-    trtllm.LayerNorm. Attribute names mirror HF ParakeetEncoderBlock so
-    checkpoint weight keys map 1-to-1 without remapping.
-    """
+    """Conformer block: FFN → self-attention → convolution → FFN → layer norm."""
 
     def __init__(
         self,
@@ -601,23 +592,20 @@ class ParakeetConformerBlock(nn.Module):
         position_embeddings: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> torch.Tensor:
-        # FFN1 with 0.5 residual scaling (Conformer architecture)
+        # 0.5 residual scaling on both FFN halves is part of the Conformer design.
         residual = hidden_states
         hidden_states = residual + 0.5 * self.feed_forward1(self.norm_feed_forward1(hidden_states))
 
-        # Self-attention with relative positional encoding
         hidden_states = hidden_states + self.self_attn(
             self.norm_self_att(hidden_states),
             attention_mask=attention_mask,
             position_embeddings=position_embeddings,
         )
 
-        # Convolution module
         hidden_states = hidden_states + self.conv(
             self.norm_conv(hidden_states), attention_mask=attention_mask
         )
 
-        # FFN2 with 0.5 residual scaling
         hidden_states = hidden_states + 0.5 * self.feed_forward2(
             self.norm_feed_forward2(hidden_states)
         )
@@ -626,13 +614,7 @@ class ParakeetConformerBlock(nn.Module):
 
 
 class ParakeetEncoder(nn.Module):
-    """Native TRT-LLM Conformer encoder.
-
-    Mirrors the structure and attribute names of HF ParakeetEncoder so that
-    checkpoint weight keys map without remapping.  All linear projections use
-    trtllm.Linear and all normalization uses trtllm.LayerNorm; only the
-    depthwise Conv1d, BatchNorm, and Conv2D subsampling remain as plain PyTorch.
-    """
+    """Conformer encoder for Parakeet audio."""
 
     def __init__(self, config: ParakeetEncoderConfig, dtype: Optional[torch.dtype] = None):
         super().__init__()
@@ -698,9 +680,7 @@ class ParakeetEncoder(nn.Module):
 
         ParakeetConformerAttention modules load their own weights (fused QKV from
         separate q/k/v checkpoint keys).  All other trtllm.Linear modules are loaded
-        via their native API.  Remaining parameters (trtllm.LayerNorm, BatchNorm,
-        etc.) are loaded via state_dict — trtllm.LayerNorm uses the same weight/bias
-        parameter names as nn.LayerNorm so no remapping is needed.
+        via their native API.  Remaining parameters are loaded via state_dict.
         """
         trtllm_param_keys: set[str] = set()
         # Track prefixes of attention modules whose sub-modules must be skipped.
@@ -754,8 +734,7 @@ class ParakeetEncoder(nn.Module):
         remaining = {k: v for k, v in weights.items() if k not in trtllm_param_keys}
         incompatible = self.load_state_dict(remaining, strict=False)
 
-        # Allowed gaps: trtllm weights (loaded above) and convolution bias keys
-        # absent in pre-transformers-5.0 checkpoints.
+        # Allowed gaps: trtllm weights (loaded above) and optional convolution bias keys.
         unexpected_missing = [
             k
             for k in incompatible.missing_keys
