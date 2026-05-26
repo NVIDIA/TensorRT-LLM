@@ -54,3 +54,10 @@ transforms:
     backend: flashinfer_ssm
   compile_model:
     piecewise_enabled: true
+  fuse_nvfp4_moe:
+    backend: trtllm_gen
+  mlir_elementwise_fusion:
+    stage: post_load_fusion
+    enabled: true
+    run_shape_prop: false
+    bypass_ops: []
