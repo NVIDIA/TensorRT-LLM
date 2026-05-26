@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2025, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -33,6 +33,7 @@
 #include <list>
 #include <memory>
 #include <optional>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -146,7 +147,11 @@ public:
         std::optional<SizeType32> languageAdapterUid = std::nullopt,
         std::optional<MillisecondsType> allottedTimeMs = std::nullopt,
         std::optional<executor::ContextPhaseParams> const& contextPhaseParams = std::nullopt,
-        std::optional<CacheSaltIDType> cacheSaltID = std::nullopt, std::optional<TimePoint> arrivalTime = std::nullopt)
+        std::optional<CacheSaltIDType> cacheSaltID = std::nullopt, std::optional<TimePoint> arrivalTime = std::nullopt,
+        std::optional<std::vector<std::tuple<std::string, int>>> agent_hierarchy = std::nullopt,
+        std::optional<std::shared_ptr<std::vector<SizeType32>>> multimodalItemRunCuOffsets = std::nullopt,
+        std::optional<std::shared_ptr<std::vector<SizeType32>>> multimodalRunPositions = std::nullopt,
+        std::optional<std::shared_ptr<std::vector<SizeType32>>> multimodalRunLengths = std::nullopt)
         : mRequestId(requestId)
         , mPromptLen(inputTokens->size())
         , mMaxNewTokens(maxNewTokens)
@@ -170,6 +175,9 @@ public:
         , mMultimodalPositions(std::move(multimodalPositions))
         , mMultimodalLengths(std::move(multimodalLengths))
         , mMultimodalUuids(std::move(multimodalUuids))
+        , mMultimodalItemRunCuOffsets(std::move(multimodalItemRunCuOffsets))
+        , mMultimodalRunPositions(std::move(multimodalRunPositions))
+        , mMultimodalRunLengths(std::move(multimodalRunLengths))
         , mMultimodalEmbedding(std::move(multimodalEmbedding))
         , mMropeRotaryCosSin(std::move(mropeRotaryCosSin))
         , mMropePositionDeltas(mropePositionDeltas)
@@ -206,6 +214,7 @@ public:
         , mLanguageAdapterUid(languageAdapterUid)
         , mAllottedTimeMs(allottedTimeMs)
         , mCacheSaltID(cacheSaltID)
+        , mAgentHierarchy(std::move(agent_hierarchy))
     {
         if (mEncoderTokens.has_value() || encoderInputFeatures.has_value())
         {
@@ -394,6 +403,32 @@ public:
         {
             mMropeRotaryCosSin = executor::detail::toITensor(mRopeConfig.value().getMRopeRotaryCosSin());
             mMropePositionDeltas = mRopeConfig.value().getMRopePositionDeltas();
+        }
+
+        auto multimodalInput = req.getMultimodalInput();
+        if (multimodalInput)
+        {
+            mMultimodalHashes
+                = std::make_shared<std::vector<std::vector<SizeType32>>>(multimodalInput->getMultimodalHashes());
+            mMultimodalPositions = std::make_shared<std::vector<SizeType32>>(multimodalInput->getMultimodalPositions());
+            mMultimodalLengths = std::make_shared<std::vector<SizeType32>>(multimodalInput->getMultimodalLengths());
+            if (auto const& multimodalUuids = multimodalInput->getMultimodalUuids())
+            {
+                mMultimodalUuids = std::make_shared<std::vector<std::optional<std::string>>>(multimodalUuids.value());
+            }
+            if (auto const& multimodalItemRunCuOffsets = multimodalInput->getMultimodalItemRunCuOffsets())
+            {
+                mMultimodalItemRunCuOffsets
+                    = std::make_shared<std::vector<SizeType32>>(multimodalItemRunCuOffsets.value());
+            }
+            if (auto const& multimodalRunPositions = multimodalInput->getMultimodalRunPositions())
+            {
+                mMultimodalRunPositions = std::make_shared<std::vector<SizeType32>>(multimodalRunPositions.value());
+            }
+            if (auto const& multimodalRunLengths = multimodalInput->getMultimodalRunLengths())
+            {
+                mMultimodalRunLengths = std::make_shared<std::vector<SizeType32>>(multimodalRunLengths.value());
+            }
         }
 
         auto loraConfig = req.getLoraConfig();
@@ -923,6 +958,21 @@ public:
     [[nodiscard]] std::optional<std::shared_ptr<std::vector<std::optional<std::string>>>> getMultimodalUuids() const
     {
         return mMultimodalUuids;
+    }
+
+    [[nodiscard]] std::optional<std::shared_ptr<std::vector<SizeType32>>> getMultimodalItemRunCuOffsets() const
+    {
+        return mMultimodalItemRunCuOffsets;
+    }
+
+    [[nodiscard]] std::optional<std::shared_ptr<std::vector<SizeType32>>> getMultimodalRunPositions() const
+    {
+        return mMultimodalRunPositions;
+    }
+
+    [[nodiscard]] std::optional<std::shared_ptr<std::vector<SizeType32>>> getMultimodalRunLengths() const
+    {
+        return mMultimodalRunLengths;
     }
 
     [[nodiscard]] std::optional<TensorPtr> getMultimodalEmbedding() const
@@ -1949,6 +1999,11 @@ public:
         return maybeToGlobalSteadyClock(std::chrono::steady_clock::now());
     }
 
+    [[nodiscard]] std::optional<std::vector<std::tuple<std::string, int>>> const& getAgentHierarchy() const
+    {
+        return mAgentHierarchy;
+    }
+
     RequestIdType mRequestId;
     SizeType32 mPromptLen;
     SizeType32 mMaxNewTokens;
@@ -2002,7 +2057,7 @@ protected:
     // getRemainingBlocksToCompletion) so that the micro batch scheduler
     // can account for cached tokens when computing the token budget.
     // Marked mutable because it is a cache/estimate set during const
-    // capacity-scheduler queries. Reset to 0 after addSequence sets
+    // capacity-scheduler queries. Reset to 0 after addSequenceBatch sets
     // the authoritative mPrepopulatedPromptLen and advances context position.
     mutable SizeType32 mEstimatedReusableTokens{0};
 
@@ -2020,6 +2075,9 @@ protected:
     std::optional<std::shared_ptr<std::vector<SizeType32>>> mMultimodalPositions{std::nullopt};
     std::optional<std::shared_ptr<std::vector<SizeType32>>> mMultimodalLengths{std::nullopt};
     std::optional<std::shared_ptr<std::vector<std::optional<std::string>>>> mMultimodalUuids{std::nullopt};
+    std::optional<std::shared_ptr<std::vector<SizeType32>>> mMultimodalItemRunCuOffsets{std::nullopt};
+    std::optional<std::shared_ptr<std::vector<SizeType32>>> mMultimodalRunPositions{std::nullopt};
+    std::optional<std::shared_ptr<std::vector<SizeType32>>> mMultimodalRunLengths{std::nullopt};
     std::optional<TensorPtr> mMultimodalEmbedding{std::nullopt};
     std::optional<TensorPtr> mMropeRotaryCosSin{std::nullopt};
     std::optional<SizeType32> mMropePositionDeltas{std::nullopt};
@@ -2140,6 +2198,8 @@ protected:
 
     // Cache salt id for each request.
     std::optional<CacheSaltIDType> mCacheSaltID{std::nullopt};
+
+    std::optional<std::vector<std::tuple<std::string, int>>> mAgentHierarchy{std::nullopt};
 
 private:
     void initialize(
@@ -2334,7 +2394,11 @@ public:
         std::optional<SizeType32> languageAdapterUid = std::nullopt,
         std::optional<MillisecondsType> allottedTimeMs = std::nullopt,
         std::optional<executor::ContextPhaseParams> const& contextPhaseParams = std::nullopt,
-        std::optional<CacheSaltIDType> cacheSaltID = std::nullopt, std::optional<TimePoint> arrivalTime = std::nullopt)
+        std::optional<CacheSaltIDType> cacheSaltID = std::nullopt, std::optional<TimePoint> arrivalTime = std::nullopt,
+        std::optional<std::vector<std::tuple<std::string, int>>> agent_hierarchy = std::nullopt,
+        std::optional<std::vector<SizeType32>> multimodalItemRunCuOffsets = std::nullopt,
+        std::optional<std::vector<SizeType32>> multimodalRunPositions = std::nullopt,
+        std::optional<std::vector<SizeType32>> multimodalRunLengths = std::nullopt)
         : Base(requestId, maxNewTokens, std::make_shared<std::vector<TokenIdType>>(std::move(inputTokens)),
             samplingConfig, isStreaming, endId, padId, std::move(embeddingBias), std::move(badWordsList),
             std::move(stopWordsList),
@@ -2368,7 +2432,16 @@ public:
                                : std::optional<std::shared_ptr<VecTokenExtraIds>>(std::nullopt),
             numReturnSequences, std::move(eagleConfig), skipCrossAttnBlocks, returnPerfMetrics,
             std::move(guidedDecodingParams), languageAdapterUid, allottedTimeMs, contextPhaseParams, cacheSaltID,
-            arrivalTime)
+            arrivalTime, std::move(agent_hierarchy),
+            multimodalItemRunCuOffsets.has_value()
+                ? std::make_shared<std::vector<SizeType32>>(std::move(multimodalItemRunCuOffsets.value()))
+                : std::optional<std::shared_ptr<std::vector<SizeType32>>>(std::nullopt),
+            multimodalRunPositions.has_value()
+                ? std::make_shared<std::vector<SizeType32>>(std::move(multimodalRunPositions.value()))
+                : std::optional<std::shared_ptr<std::vector<SizeType32>>>(std::nullopt),
+            multimodalRunLengths.has_value()
+                ? std::make_shared<std::vector<SizeType32>>(std::move(multimodalRunLengths.value()))
+                : std::optional<std::shared_ptr<std::vector<SizeType32>>>(std::nullopt))
     {
     }
 

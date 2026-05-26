@@ -47,10 +47,18 @@ public:
 
 public:
   // Get the mmaOpsPerClk.
-  static int32_t getMmaOpsPerClk(FmhaOptions const& options);
+  static int32_t getMmaOpsPerClk(FmhaOptions const& options,
+                                 KernelTraits const& kernelTraits,
+                                 bool isBmm1 = true);
 
   // Select the GQA generation kernel.
   void selectGqaGenerationKernel();
+
+  // Select the kernel for tree-based custom speculative decoding (Eagle3 dynamic tree, MTP tree).
+  // Triggered by isCustomSpecDecodingGen with specDecodingTargetMaxGenLen > 0.
+  // Uses numTokensHeadsQ = numHeadsQPerKv * specDecodingTargetMaxGenLen as a config-time
+  // deterministic heuristic to choose tileSizeQ + kernelType.
+  void selectSpecDecTreeKernel();
 
   // Select the kernel and update the options.
   std::tuple<FmhaOptions, FmhaOptionsFromArgs, int32_t> selectKernel();
@@ -84,6 +92,9 @@ private:
   // Sets the kernel type and tileSizeQ for GQA generation kernels.
   void setGqaKernelTypeAndTileSizeQ();
 
+  // Set headDimPerCtaV for context and GQA generation kernels. MLA sets separately.
+  void setHeadDimPerCtaV(FmhaOptions& options);
+
   // Set the numInstsQ and numInstsKv.
   void setNumInstsQAndKv(FmhaOptions& options, bool forceSet = false, bool updateSetFlags = true);
 
@@ -92,6 +103,9 @@ private:
 
   // Set MMA order, interleavesMufuAndSums, and usesOrderedSequence.
   void setMmaOrder();
+
+  // Select the sparse MLA generation kernel.
+  void selectSparseMlaGenerationKernel();
 
   // Set softmax configs.
   void setSoftmaxConfigs();

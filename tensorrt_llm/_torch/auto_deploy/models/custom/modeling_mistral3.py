@@ -1,3 +1,7 @@
+# Copyright 2018 The HuggingFace Team
+# Licensed under the Apache License, Version 2.0.
+# Original source: https://github.com/huggingface/transformers
+#
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
@@ -42,13 +46,9 @@ from transformers.modeling_utils import PreTrainedModel
 from transformers.models.auto import AutoModelForCausalLM
 from transformers.utils import ModelOutput, cached_file
 
-from tensorrt_llm._torch.auto_deploy.models.factory import ModelFactoryRegistry
-from tensorrt_llm._torch.auto_deploy.models.hf import (
-    AutoModelForCausalLMFactory,
-    AutoModelForImageTextToTextFactory,
-)
-from tensorrt_llm._torch.utils import ActivationType
-
+from ..._compat import ActivationType
+from ..factory import ModelFactoryRegistry
+from ..hf import AutoModelForCausalLMFactory, AutoModelForImageTextToTextFactory
 from . import mla_rope_utils
 
 
@@ -630,7 +630,7 @@ class Mistral4Model(Mistral4PreTrainedModel):
 
 
 class Mistral4ForCausalLM(Mistral4PreTrainedModel, GenerationMixin):
-    _tied_weights_keys = ["lm_head.weight"]
+    _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
 
     def __init__(self, config: Mistral4TextConfig, **kwargs):
         super().__init__(config)

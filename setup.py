@@ -427,6 +427,10 @@ setup(
     scripts=['tensorrt_llm/llmapi/trtllm-llmapi-launch'],
     extras_require={
         "devel": devel_deps,
+        # MX remains prototype-only and is intentionally not declared as an
+        # optional package extra until its external dependency completes OSS
+        # allowlist onboarding. Keep install instructions in docs/PR text
+        # rather than packaging metadata.
     },
     zip_safe=True,
     install_requires=required_deps,

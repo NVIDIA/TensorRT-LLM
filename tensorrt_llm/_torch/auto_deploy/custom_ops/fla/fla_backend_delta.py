@@ -1,3 +1,10 @@
+# Copyright (c) 2023-2026, Songlin Yang, Yu Zhang, Zhiyuan Li
+#
+# This source code is licensed under the MIT license found in the
+# LICENSE file in the root directory of this source tree.
+# For a list of all contributors, visit:
+#   https://github.com/fla-org/flash-linear-attention/graphs/contributors
+#
 # SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
@@ -26,7 +33,7 @@ import torch
 from torch._ops import OpOverloadPacket
 from torch.fx import Node
 
-from .....llmapi.llm_args import KvCacheConfig
+from ..._compat import KvCacheConfig
 from ...utils.node_utils import extract_op_args
 from ..attention_interface import (
     AttentionDescriptor,

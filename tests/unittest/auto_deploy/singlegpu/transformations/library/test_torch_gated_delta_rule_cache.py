@@ -1,3 +1,17 @@
+# SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """Transform unit test for insert_cached_gated_delta_rule with the torch_gated_delta backend.
 
 Verifies the full pipeline:
@@ -16,10 +30,12 @@ from typing import List, Optional
 import pytest
 import torch
 import torch.nn as nn
+from _model_test_utils import default_max_num_tokens
 from _torch_test_utils import all_close
 
 # Register all auto_deploy custom ops
 import tensorrt_llm._torch.auto_deploy.custom_ops  # noqa: F401
+from tensorrt_llm._torch.auto_deploy._compat import KvCacheConfig
 from tensorrt_llm._torch.auto_deploy.models.factory import (
     FullModelExportInfo,
     ModelFactory,
@@ -27,7 +43,6 @@ from tensorrt_llm._torch.auto_deploy.models.factory import (
 )
 from tensorrt_llm._torch.auto_deploy.shim.interface import CachedSequenceInterface
 from tensorrt_llm._torch.auto_deploy.transform.optimizer import InferenceOptimizer
-from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 
 # ---------------------------------------------------------------------------
 # Dummy factory (same pattern as test_kv_cache.py)
@@ -156,6 +171,7 @@ def test_torch_gated_delta_rule_cache(num_k_heads, num_v_heads):
     cm = CachedSequenceInterface(
         max_seq_len=max_position_embeddings,
         max_batch_size=batch_size,
+        max_num_tokens=default_max_num_tokens(max_position_embeddings, batch_size),
         device="cuda",
         kv_cache_config=kv_cache_config,
     )

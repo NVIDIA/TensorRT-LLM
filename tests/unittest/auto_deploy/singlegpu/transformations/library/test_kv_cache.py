@@ -1,3 +1,17 @@
+# SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 from types import SimpleNamespace
 from typing import List, Optional
 from unittest.mock import MagicMock
@@ -5,8 +19,11 @@ from unittest.mock import MagicMock
 import pytest
 import torch
 import torch.nn as nn
-from _model_test_utils import GQA
+from _model_test_utils import GQA, default_max_num_tokens
 from _torch_test_utils import all_close
+
+import tensorrt_llm._torch.auto_deploy.custom_ops  # noqa: F401
+from tensorrt_llm._torch.auto_deploy._compat import KvCacheConfig
 
 # Initialize resources first (KVPagedResourceHandler is used within tests below)
 from tensorrt_llm._torch.auto_deploy.custom_ops.attention_interface import KVPagedResourceHandler
@@ -24,7 +41,7 @@ from tensorrt_llm._torch.auto_deploy.transform.library.kvcache import (
     ResizeKVCache,
 )
 from tensorrt_llm._torch.auto_deploy.transform.optimizer import InferenceOptimizer
-from tensorrt_llm.llmapi.llm_args import KvCacheConfig
+from tensorrt_llm._torch.auto_deploy.utils.node_utils import is_op
 
 
 class DummyFactory(ModelFactory):
@@ -126,6 +143,63 @@ class GQAWithSdpaAndEmbedding(GQA):
         return self.o_proj(attn_output)
 
 
+class SpanMaskedAttentionModel(torch.nn.Module):
+    """Minimal model whose source graph uses a semantic multimodal mask op."""
+
+    def __init__(self, hidden_size: int = 8, num_heads: int = 2):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.num_heads = num_heads
+        self.head_dim = hidden_size // num_heads
+
+        self.q_proj = torch.nn.Linear(hidden_size, hidden_size, bias=False)
+        self.k_proj = torch.nn.Linear(hidden_size, hidden_size, bias=False)
+        self.v_proj = torch.nn.Linear(hidden_size, hidden_size, bias=False)
+
+    def _embed(self, input_ids: torch.Tensor) -> torch.Tensor:
+        return input_ids.unsqueeze(-1).expand(-1, -1, self.hidden_size).to(torch.float32)
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        position_ids: torch.Tensor,
+        mm_token_positions: torch.Tensor,
+        mm_token_lengths: torch.Tensor,
+        mm_item_cu_seqlen: torch.Tensor,
+    ) -> torch.Tensor:
+        del position_ids
+        x = self._embed(input_ids)
+        batch_size, seq_len, _ = x.shape
+
+        q = self.q_proj(x).view(batch_size, seq_len, self.num_heads, self.head_dim)
+        k = self.k_proj(x).view(batch_size, seq_len, self.num_heads, self.head_dim)
+        v = self.v_proj(x).view(batch_size, seq_len, self.num_heads, self.head_dim)
+        attn_mask = torch.ops.auto_deploy.gemma4_multimodal_mask.default(
+            input_ids,
+            mm_token_positions,
+            mm_token_lengths,
+            mm_item_cu_seqlen,
+        )
+        return torch.ops.auto_deploy.torch_attention(
+            q,
+            k,
+            v,
+            attn_mask=attn_mask,
+            is_causal=False,
+            layout="bsnd",
+        )
+
+
+def _create_cpu_seq_info() -> CachedSequenceInterface:
+    return CachedSequenceInterface(
+        max_seq_len=16,
+        max_batch_size=4,
+        max_num_tokens=default_max_num_tokens(16, 4),
+        device="cpu",
+        kv_cache_config=KvCacheConfig(tokens_per_block=16),
+    )
+
+
 # TODO (lucaslie): consider rewriting this test with a custom InferenceOptimizer config
 @pytest.mark.parametrize(
     "dtype",
@@ -175,6 +249,7 @@ def test_sdpa_with_kv_cache(dtype, attn_backend, gqa_config):
     cm = CachedSequenceInterface(
         max_seq_len=max_position_embeddings,
         max_batch_size=batch_size,
+        max_num_tokens=default_max_num_tokens(max_position_embeddings, batch_size),
         device="cuda",
         kv_cache_config=kv_cache_config,
     )
@@ -283,6 +358,165 @@ def test_sdpa_with_kv_cache(dtype, attn_backend, gqa_config):
     assert exported_gm is not None
 
 
+@torch.inference_mode()
+def test_source_graph_uses_semantic_multimodal_mask_op():
+    model = SpanMaskedAttentionModel().eval()
+    input_ids = torch.tensor([[1, 2, 3, 4, 5]], dtype=torch.int64)
+    position_ids = torch.arange(input_ids.shape[1], dtype=torch.int64).repeat(input_ids.shape[0], 1)
+    mm_token_positions = torch.tensor([1, 3], dtype=torch.int32)
+    mm_token_lengths = torch.tensor([2, 2], dtype=torch.int32)
+    mm_item_cu_seqlen = torch.tensor([0, 2], dtype=torch.int32)
+
+    gm = torch_export_to_gm(
+        model,
+        args=(
+            input_ids,
+            position_ids,
+            mm_token_positions,
+            mm_token_lengths,
+            mm_item_cu_seqlen,
+        ),
+        clone=True,
+    )
+
+    semantic_nodes = [
+        node for node in gm.graph.nodes if is_op(node, torch.ops.auto_deploy.gemma4_multimodal_mask)
+    ]
+    assert len(semantic_nodes) == 1
+
+
+@torch.inference_mode()
+def test_insert_cached_attention_lowers_semantic_mask_for_torch_backend():
+    model = SpanMaskedAttentionModel().eval()
+    input_ids = torch.tensor([[1, 2, 3, 4, 5]], dtype=torch.int64)
+    position_ids = torch.arange(input_ids.shape[1], dtype=torch.int64).repeat(input_ids.shape[0], 1)
+    mm_token_positions = torch.tensor([1, 3], dtype=torch.int32)
+    mm_token_lengths = torch.tensor([2, 2], dtype=torch.int32)
+    mm_item_cu_seqlen = torch.tensor([0, 2], dtype=torch.int32)
+
+    gm = torch_export_to_gm(
+        model,
+        args=(
+            input_ids,
+            position_ids,
+            mm_token_positions,
+            mm_token_lengths,
+            mm_item_cu_seqlen,
+        ),
+        clone=True,
+    )
+    cm = _create_cpu_seq_info()
+    gm_transformed = InferenceOptimizer(
+        None,
+        {
+            "insert_cached_attention": {
+                "stage": "cache_init",
+                "backend": "torch",
+            },
+        },
+    )(cm, gm)
+
+    assert not any(
+        is_op(node, torch.ops.auto_deploy.torch_attention) for node in gm_transformed.graph.nodes
+    )
+    assert any(
+        is_op(node, torch.ops.auto_deploy.gemma4_prepare_multimodal_mask)
+        for node in gm_transformed.graph.nodes
+    )
+
+    cached_nodes = [
+        node
+        for node in gm_transformed.graph.nodes
+        if is_op(node, torch.ops.auto_deploy.torch_cached_attention_with_cache)
+    ]
+    assert len(cached_nodes) == 1
+    assert is_op(cached_nodes[0].args[-1], torch.ops.auto_deploy.gemma4_prepare_multimodal_mask)
+
+
+@torch.inference_mode()
+def test_insert_cached_attention_lowers_semantic_mask_for_triton_paged_backend():
+    model = SpanMaskedAttentionModel().eval()
+    input_ids = torch.tensor([[1, 2, 3, 4, 5]], dtype=torch.int64)
+    position_ids = torch.arange(input_ids.shape[1], dtype=torch.int64).repeat(input_ids.shape[0], 1)
+    mm_token_positions = torch.tensor([1, 3], dtype=torch.int32)
+    mm_token_lengths = torch.tensor([2, 2], dtype=torch.int32)
+    mm_item_cu_seqlen = torch.tensor([0, 2], dtype=torch.int32)
+
+    gm = torch_export_to_gm(
+        model,
+        args=(
+            input_ids,
+            position_ids,
+            mm_token_positions,
+            mm_token_lengths,
+            mm_item_cu_seqlen,
+        ),
+        clone=True,
+    )
+    cm = _create_cpu_seq_info()
+    gm_transformed = InferenceOptimizer(
+        None,
+        {
+            "insert_cached_attention": {
+                "stage": "cache_init",
+                "backend": "triton_paged",
+            },
+        },
+    )(cm, gm)
+
+    assert any(
+        is_op(node, torch.ops.auto_deploy.gemma4_prepare_multimodal_mask)
+        for node in gm_transformed.graph.nodes
+    )
+    cached_nodes = [
+        node
+        for node in gm_transformed.graph.nodes
+        if is_op(node, torch.ops.auto_deploy.triton_paged_mha_with_cache)
+    ]
+    assert len(cached_nodes) == 1
+    assert is_op(cached_nodes[0].args[-1], torch.ops.auto_deploy.gemma4_prepare_multimodal_mask)
+
+
+@torch.inference_mode()
+def test_insert_cached_attention_rejects_unsupported_semantic_mask_backend():
+    model = SpanMaskedAttentionModel().eval()
+    input_ids = torch.tensor([[1, 2, 3, 4, 5]], dtype=torch.int64)
+    position_ids = torch.arange(input_ids.shape[1], dtype=torch.int64).repeat(input_ids.shape[0], 1)
+    mm_token_positions = torch.tensor([1, 3], dtype=torch.int32)
+    mm_token_lengths = torch.tensor([2, 2], dtype=torch.int32)
+    mm_item_cu_seqlen = torch.tensor([0, 2], dtype=torch.int32)
+
+    gm = torch_export_to_gm(
+        model,
+        args=(
+            input_ids,
+            position_ids,
+            mm_token_positions,
+            mm_token_lengths,
+            mm_item_cu_seqlen,
+        ),
+        clone=True,
+    )
+    cm = _create_cpu_seq_info()
+
+    with pytest.raises(
+        RuntimeError,
+        match=(
+            "Cached attention backend 'flashinfer' does not support lowering semantic mask op"
+            ".*gemma4_multimodal_mask.*Supported backends: torch, triton_paged"
+        ),
+    ):
+        InferenceOptimizer(
+            None,
+            {
+                "insert_cached_attention": {
+                    "stage": "cache_init",
+                    "backend": "flashinfer",
+                },
+            },
+        )(cm, gm)
+
+
 # =============================================================================
 # Transform Unit Tests for Refactored Pipeline
 # =============================================================================
@@ -299,6 +533,7 @@ def dummy_cached_interface():
     return CachedSequenceInterface(
         max_seq_len=128,
         max_batch_size=4,
+        max_num_tokens=default_max_num_tokens(128, 4),
         device="cuda",
         kv_cache_config=kv_cache_config,
     )
@@ -375,6 +610,7 @@ def test_resize_kv_cache_transform_runs_when_needed():
     cm = CachedSequenceInterface(
         max_seq_len=128,
         max_batch_size=4,
+        max_num_tokens=default_max_num_tokens(128, 4),
         device="cuda",
         kv_cache_config=kv_cache_config,
     )
@@ -424,6 +660,7 @@ def test_insert_cached_attention_uses_add_resource():
     cm = CachedSequenceInterface(
         max_seq_len=max_seq_len,
         max_batch_size=batch_size,
+        max_num_tokens=default_max_num_tokens(max_seq_len, batch_size),
         device="cuda",
         kv_cache_config=kv_cache_config,
     )
@@ -497,6 +734,7 @@ def test_insert_cached_attention_passes_kv_cache_config():
     cm = CachedSequenceInterface(
         max_seq_len=max_seq_len,
         max_batch_size=batch_size,
+        max_num_tokens=default_max_num_tokens(max_seq_len, batch_size),
         device="cuda",
         kv_cache_config=kv_cache_config,
     )

@@ -139,8 +139,7 @@ struct GemmGatedActOptions : public gemm::GemmOptions
 inline bool checkAndUpdateGemmGatedActOptions(
     gemmGatedAct::GemmGatedActOptions& options, tg::CudaArch cudaArch, bool updateOptions = true)
 {
-    auto isValid = gemm::checkAndUpdateGemmOptions(options, cudaArch,
-        /* tpGrpSize */ 1, updateOptions);
+    auto isValid = gemm::checkAndUpdateGemmOptions(options, cudaArch, /* tpGrpSize */ 1, updateOptions);
     if (!isValid)
     {
         return false;
@@ -192,11 +191,6 @@ inline bool checkAndUpdateGemmGatedActOptions(
     if (options.mNumSlicesForSplitK > 1)
     {
         TLLM_CHECK_ERROR(doesSplitKUseDsmem(options.mSplitK), "Split-k GMEM and GemmGatedAct are not supported yet.");
-    }
-
-    if (gemm::isBiasTypeMn(options.mBiasType))
-    {
-        TLLM_CHECK_ERROR(options.mTransposeMmaOutput, "Bias type Mn is not supported with not transpose mma output.");
     }
 
     return true;

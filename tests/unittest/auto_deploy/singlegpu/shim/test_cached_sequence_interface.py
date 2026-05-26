@@ -1,3 +1,17 @@
+# SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """Unit tests for CachedSequenceInterface in interface.py.
 
 Tests the refactored CachedSequenceInterface which now:
@@ -8,7 +22,9 @@ Tests the refactored CachedSequenceInterface which now:
 
 import pytest
 import torch
+from _model_test_utils import default_max_num_tokens
 
+from tensorrt_llm._torch.auto_deploy._compat import KvCacheConfig
 from tensorrt_llm._torch.auto_deploy.custom_ops.attention_interface import (
     CausalConvResourceHandler,
     KVPagedResourceHandler,
@@ -22,12 +38,22 @@ from tensorrt_llm._torch.auto_deploy.custom_ops.attention_interface import (
 from tensorrt_llm._torch.auto_deploy.shim.interface import CachedSequenceInterface
 from tensorrt_llm._torch.pyexecutor.mamba_cache_manager import MambaHybridCacheManager
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
-from tensorrt_llm.llmapi import DraftTargetDecodingConfig
-from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 
 # =============================================================================
 # Fixtures
 # =============================================================================
+
+
+class _SpecDecModeForStateBindingTest:
+    def use_one_engine(self):
+        return True
+
+
+class _SpecConfigForStateBindingTest:
+    def __init__(self, max_draft_len: int):
+        self.max_draft_len = max_draft_len
+        self.tokens_per_gen_step = max_draft_len + 1
+        self.spec_dec_mode = _SpecDecModeForStateBindingTest()
 
 
 @pytest.fixture
@@ -66,6 +92,7 @@ def test_init_creates_sequence_info_with_tokens_per_block(paged_kv_cache_config)
     interface = CachedSequenceInterface(
         max_seq_len=128,
         max_batch_size=4,
+        max_num_tokens=default_max_num_tokens(128, 4),
         device="cuda",
         kv_cache_config=paged_kv_cache_config,
     )
@@ -80,6 +107,7 @@ def test_init_uses_default_kv_cache_config_when_not_provided():
     interface = CachedSequenceInterface(
         max_seq_len=128,
         max_batch_size=4,
+        max_num_tokens=default_max_num_tokens(128, 4),
         device="cuda",
     )
 
@@ -108,6 +136,7 @@ def test_init_propagates_vocab_size_padded():
     interface = CachedSequenceInterface(
         max_seq_len=128,
         max_batch_size=4,
+        max_num_tokens=default_max_num_tokens(128, 4),
         vocab_size_padded=vocab_size_padded,
         device="cuda",
     )
@@ -120,6 +149,7 @@ def test_init_stores_device():
     interface = CachedSequenceInterface(
         max_seq_len=128,
         max_batch_size=4,
+        max_num_tokens=default_max_num_tokens(128, 4),
         device="cuda:0",
     )
 
@@ -131,6 +161,7 @@ def test_init_default_device_is_cuda():
     interface = CachedSequenceInterface(
         max_seq_len=128,
         max_batch_size=4,
+        max_num_tokens=default_max_num_tokens(128, 4),
     )
 
     assert interface.device == "cuda"
@@ -146,6 +177,7 @@ def test_add_resource_paged_handler(paged_kv_cache_config):
     interface = CachedSequenceInterface(
         max_seq_len=128,
         max_batch_size=4,
+        max_num_tokens=default_max_num_tokens(128, 4),
         device="cuda",
         kv_cache_config=paged_kv_cache_config,
     )
@@ -162,6 +194,7 @@ def test_add_resource_state_handler(paged_kv_cache_config):
     interface = CachedSequenceInterface(
         max_seq_len=128,
         max_batch_size=4,
+        max_num_tokens=default_max_num_tokens(128, 4),
         device="cuda",
         kv_cache_config=paged_kv_cache_config,
     )
@@ -177,6 +210,7 @@ def test_add_resource_unpaged_handler(paged_kv_cache_config):
     interface = CachedSequenceInterface(
         max_seq_len=128,
         max_batch_size=4,
+        max_num_tokens=default_max_num_tokens(128, 4),
         device="cuda",
         kv_cache_config=paged_kv_cache_config,
     )
@@ -193,6 +227,7 @@ def test_add_multiple_resources(paged_kv_cache_config):
     interface = CachedSequenceInterface(
         max_seq_len=128,
         max_batch_size=4,
+        max_num_tokens=default_max_num_tokens(128, 4),
         device="cuda",
         kv_cache_config=paged_kv_cache_config,
     )
@@ -218,6 +253,7 @@ def test_initialize_resources_paged_only_creates_kv_cache_manager(paged_kv_cache
     interface = CachedSequenceInterface(
         max_seq_len=128,
         max_batch_size=4,
+        max_num_tokens=default_max_num_tokens(128, 4),
         device="cuda",
         kv_cache_config=paged_kv_cache_config,
     )
@@ -233,11 +269,58 @@ def test_initialize_resources_paged_only_creates_kv_cache_manager(paged_kv_cache
     assert not isinstance(interface.kv_cache_manager, MambaHybridCacheManager)
 
 
+def test_initialize_resources_incompatible_kv_layers_can_be_unmanaged(paged_kv_cache_config):
+    """Compatible layers are managed; incompatible ones may fall back to unmanaged buffers."""
+    interface = CachedSequenceInterface(
+        max_seq_len=128,
+        max_batch_size=4,
+        max_num_tokens=default_max_num_tokens(128, 4),
+        device="cuda",
+        kv_cache_config=paged_kv_cache_config,
+        requires_uniform_kv_caches=False,
+    )
+
+    managed_name = interface.add_resource(
+        "kv_cache_0",
+        KVPagedResourceHandler(8, 64, dtype=torch.float16, kv_layout="HND"),
+    )
+    unmanaged_name = interface.add_resource(
+        "kv_cache_1",
+        KVPagedResourceHandler(8, 80, dtype=torch.float16, kv_layout="HND"),
+    )
+
+    interface.initialize_resources()
+
+    assert managed_name not in interface._unmanaged_resources
+    assert unmanaged_name in interface._unmanaged_resources
+
+
+def test_initialize_resources_incompatible_kv_layers_raise_when_uniform_managed_caches_required(
+    paged_kv_cache_config,
+):
+    """Strict interface configurations reject mixed managed and unmanaged KV layouts."""
+    interface = CachedSequenceInterface(
+        max_seq_len=128,
+        max_batch_size=4,
+        max_num_tokens=default_max_num_tokens(128, 4),
+        device="cuda",
+        kv_cache_config=paged_kv_cache_config,
+        requires_uniform_kv_caches=True,
+    )
+
+    interface.add_resource("kv_cache_0", KVPagedResourceHandler(8, 64, dtype=torch.float16))
+    interface.add_resource("kv_cache_1", KVPagedResourceHandler(8, 80, dtype=torch.float16))
+
+    with pytest.raises(RuntimeError):
+        interface.initialize_resources()
+
+
 def test_initialize_resources_mixed_creates_mamba_hybrid_cache_manager(paged_kv_cache_config):
     """Test mixed paged + state resources create MambaHybridCacheManager."""
     interface = CachedSequenceInterface(
         max_seq_len=128,
         max_batch_size=4,
+        max_num_tokens=default_max_num_tokens(128, 4),
         device="cuda",
         kv_cache_config=paged_kv_cache_config,
     )
@@ -261,6 +344,7 @@ def test_initialize_resources_creates_cache_views_with_correct_shape(paged_kv_ca
     interface = CachedSequenceInterface(
         max_seq_len=128,
         max_batch_size=4,
+        max_num_tokens=default_max_num_tokens(128, 4),
         device="cuda",
         kv_cache_config=paged_kv_cache_config,
     )
@@ -293,6 +377,7 @@ def test_initialize_resources_creates_state_views_with_correct_shape(paged_kv_ca
     interface = CachedSequenceInterface(
         max_seq_len=128,
         max_batch_size=4,
+        max_num_tokens=default_max_num_tokens(128, 4),
         device="cuda",
         kv_cache_config=paged_kv_cache_config,
     )
@@ -320,11 +405,80 @@ def test_initialize_resources_creates_state_views_with_correct_shape(paged_kv_ca
     assert ssm_cache.dtype == torch.bfloat16
 
 
+def test_intermediate_state_resources_bind_via_managed_state_path(paged_kv_cache_config):
+    """Verify speculative Mamba intermediate state buffers bind through CSI-managed cache."""
+    interface = CachedSequenceInterface(
+        max_seq_len=128,
+        max_batch_size=4,
+        max_num_tokens=default_max_num_tokens(128, 4),
+        device="cuda",
+        kv_cache_config=paged_kv_cache_config,
+        spec_config=_SpecConfigForStateBindingTest(max_draft_len=2),
+    )
+
+    num_heads = 4
+    head_dim = 64
+    d_state = 16
+    conv_dim = head_dim * num_heads + 2 * 2 * d_state
+    resource_names = []
+
+    for i in range(2):
+        resource_names.append(
+            interface.add_resource(
+                f"ssm_state_{i}",
+                SSMResourceHandler(
+                    num_heads=num_heads,
+                    head_dim=head_dim,
+                    d_state=d_state,
+                    dtype=torch.bfloat16,
+                ),
+            )
+        )
+        resource_names.append(
+            interface.add_resource(
+                f"intermediate_ssm_state_{i}",
+                SpecSSMResourceHandler(
+                    num_heads=num_heads,
+                    head_dim=head_dim,
+                    d_state=d_state,
+                    dtype=torch.bfloat16,
+                ),
+            )
+        )
+        resource_names.append(
+            interface.add_resource(
+                f"conv_state_{i}",
+                CausalConvResourceHandler(conv_dim=conv_dim, d_conv=4, dtype=torch.float32),
+            )
+        )
+        resource_names.append(
+            interface.add_resource(
+                f"intermediate_conv_state_{i}",
+                SpecCausalConvResourceHandler(
+                    conv_dim=conv_dim,
+                    d_conv=4,
+                    dtype=torch.float32,
+                ),
+            )
+        )
+
+    num_caches = interface.initialize_resources()
+
+    assert num_caches == len(resource_names)
+    assert isinstance(interface.kv_cache_manager, MambaHybridCacheManager)
+    for resource_name in resource_names:
+        cache = interface._caches[resource_name]
+        assert cache is not None
+        assert cache.is_contiguous()
+        assert resource_name not in interface._unmanaged_resources
+
+
 def test_initialize_resources_unpaged_allocated_locally(paged_kv_cache_config):
     """Verify UnpagedResourceHandler resources are allocated locally (not via cache manager)."""
     interface = CachedSequenceInterface(
         max_seq_len=128,
         max_batch_size=4,
+        max_num_tokens=default_max_num_tokens(128, 4),
         device="cuda",
         kv_cache_config=paged_kv_cache_config,
     )
@@ -350,6 +504,7 @@ def test_is_paged_returns_true_for_paged_only(paged_kv_cache_config):
     interface = CachedSequenceInterface(
         max_seq_len=128,
         max_batch_size=4,
+        max_num_tokens=default_max_num_tokens(128, 4),
         device="cuda",
         kv_cache_config=paged_kv_cache_config,
     )
@@ -366,6 +521,7 @@ def test_is_paged_returns_false_for_hybrid(paged_kv_cache_config):
     interface = CachedSequenceInterface(
         max_seq_len=128,
         max_batch_size=4,
+        max_num_tokens=default_max_num_tokens(128, 4),
         device="cuda",
         kv_cache_config=paged_kv_cache_config,
     )
@@ -390,6 +546,7 @@ def test_needs_resize_returns_false_when_fraction_is_zero(paged_kv_cache_config)
     interface = CachedSequenceInterface(
         max_seq_len=128,
         max_batch_size=4,
+        max_num_tokens=default_max_num_tokens(128, 4),
         device="cuda",
         kv_cache_config=paged_kv_cache_config,
     )
@@ -405,6 +562,7 @@ def test_needs_resize_returns_true_when_fraction_is_positive(resizable_kv_cache_
     interface = CachedSequenceInterface(
         max_seq_len=128,
         max_batch_size=4,
+        max_num_tokens=default_max_num_tokens(128, 4),
         device="cuda",
         kv_cache_config=resizable_kv_cache_config,
     )
@@ -420,6 +578,7 @@ def test_resize_kv_cache_manager_skipped_when_not_needed(paged_kv_cache_config):
     interface = CachedSequenceInterface(
         max_seq_len=128,
         max_batch_size=4,
+        max_num_tokens=default_max_num_tokens(128, 4),
         device="cuda",
         kv_cache_config=paged_kv_cache_config,
     )
@@ -447,6 +606,7 @@ def test_shutdown_clears_caches(paged_kv_cache_config):
     interface = CachedSequenceInterface(
         max_seq_len=128,
         max_batch_size=4,
+        max_num_tokens=default_max_num_tokens(128, 4),
         device="cuda",
         kv_cache_config=paged_kv_cache_config,
     )
@@ -467,6 +627,7 @@ def test_clear_caches_clears_all(paged_kv_cache_config):
     interface = CachedSequenceInterface(
         max_seq_len=128,
         max_batch_size=4,
+        max_num_tokens=default_max_num_tokens(128, 4),
         device="cuda",
         kv_cache_config=paged_kv_cache_config,
     )
@@ -497,6 +658,7 @@ def test_update_kv_cache_config_valid_field():
     interface = CachedSequenceInterface(
         max_seq_len=128,
         max_batch_size=4,
+        max_num_tokens=default_max_num_tokens(128, 4),
         device="cuda",
     )
 
@@ -510,6 +672,7 @@ def test_update_kv_cache_config_multiple_fields():
     interface = CachedSequenceInterface(
         max_seq_len=128,
         max_batch_size=4,
+        max_num_tokens=default_max_num_tokens(128, 4),
         device="cuda",
     )
 
@@ -529,6 +692,7 @@ def test_update_kv_cache_config_invalid_field_raises():
     interface = CachedSequenceInterface(
         max_seq_len=128,
         max_batch_size=4,
+        max_num_tokens=default_max_num_tokens(128, 4),
         device="cuda",
     )
 
@@ -546,6 +710,7 @@ def test_named_args_includes_sequence_info_and_caches(paged_kv_cache_config):
     interface = CachedSequenceInterface(
         max_seq_len=128,
         max_batch_size=4,
+        max_num_tokens=default_max_num_tokens(128, 4),
         device="cuda",
         kv_cache_config=paged_kv_cache_config,
     )
@@ -570,6 +735,7 @@ def test_args_returns_tuple_of_tensors(paged_kv_cache_config):
     interface = CachedSequenceInterface(
         max_seq_len=128,
         max_batch_size=4,
+        max_num_tokens=default_max_num_tokens(128, 4),
         device="cuda",
         kv_cache_config=paged_kv_cache_config,
     )
@@ -593,6 +759,7 @@ def test_to_moves_sequence_info(paged_kv_cache_config):
     interface = CachedSequenceInterface(
         max_seq_len=128,
         max_batch_size=4,
+        max_num_tokens=default_max_num_tokens(128, 4),
         device="cpu",
         kv_cache_config=paged_kv_cache_config,
     )
@@ -609,13 +776,20 @@ def test_to_moves_sequence_info(paged_kv_cache_config):
 
 def test_sequence_info_tokens_per_block_from_constructor():
     """Verify tokens_per_block is set correctly from constructor."""
-    seq_info = SequenceInfo(max_seq_len=128, max_batch_size=4, tokens_per_block=32)
+    seq_info = SequenceInfo(
+        max_seq_len=128,
+        max_batch_size=4,
+        max_num_tokens=default_max_num_tokens(128, 4),
+        tokens_per_block=32,
+    )
     assert seq_info.tokens_per_block == 32
 
 
 def test_sequence_info_tokens_per_block_defaults_to_max_seq_len():
     """Verify tokens_per_block defaults to max_seq_len when not provided."""
-    seq_info = SequenceInfo(max_seq_len=128, max_batch_size=4)
+    seq_info = SequenceInfo(
+        max_seq_len=128, max_batch_size=4, max_num_tokens=default_max_num_tokens(128, 4)
+    )
     assert seq_info.tokens_per_block == 128
 
 
@@ -706,6 +880,7 @@ def test_sequence_info_last_page_len_uses_tokens_per_block():
     seq_info = SequenceInfo(
         max_seq_len=128,
         max_batch_size=4,
+        max_num_tokens=default_max_num_tokens(128, 4),
         tokens_per_block=16,
     )
 
@@ -729,6 +904,7 @@ def test_sequence_info_page_assignments():
     seq_info = SequenceInfo(
         max_seq_len=128,
         max_batch_size=4,
+        max_num_tokens=default_max_num_tokens(128, 4),
         tokens_per_block=16,
     )
 
@@ -748,6 +924,26 @@ def test_sequence_info_page_assignments():
         cache_loc[cu_num_pages[i] : cu_num_pages[i + 1]] for i in range(len(cu_num_pages) - 1)
     ]
     assert page_assignments == [[0], [1, 2]]
+
+
+def test_sequence_info_set_capture_batch_max_draft_len_gt_0_builds_extend_only_batch():
+    """max_draft_len > 0 should build the synthetic extend-only batch used by Eagle capture."""
+    seq_info = SequenceInfo(
+        max_seq_len=128,
+        max_batch_size=4,
+        max_num_tokens=default_max_num_tokens(128, 4),
+        tokens_per_block=32,
+    )
+
+    seq_info.set_capture_batch(batch_size=2, max_draft_len=3)
+
+    assert not seq_info.is_generate_only
+    assert seq_info.is_extend_only
+    assert seq_info.batch_info.get_num_sequences() == (0, 2, 0)
+    assert seq_info.batch_info.get_num_tokens() == (0, 8, 0)
+
+    input_ids = seq_info.get_arg("input_ids", truncate=True, unflatten=True)
+    assert tuple(input_ids.shape) == (2, 4)
 
 
 # =============================================================================
@@ -784,80 +980,12 @@ def test_typed_handlers_inherit_from_state_resource_handler():
     assert isinstance(conv_handler, StateResourceHandler)
 
 
-def test_intermediate_state_resources_bind_via_managed_state_path(paged_kv_cache_config):
-    """Test that speculative Mamba state handlers bind through the managed cache path."""
-    spec_config = DraftTargetDecodingConfig(
-        max_draft_len=2,
-        speculative_model="dummy-model",
-    )
-    interface = CachedSequenceInterface(
-        max_seq_len=128,
-        max_batch_size=4,
-        device="cuda",
-        kv_cache_config=paged_kv_cache_config,
-        spec_config=spec_config,
-    )
-
-    num_heads = 4
-    head_dim = 64
-    d_state = 16
-    conv_dim = head_dim * num_heads + 2 * 2 * d_state
-    resource_names = []
-
-    for i in range(2):
-        resource_names.append(
-            interface.add_resource(
-                f"ssm_state_{i}",
-                SSMResourceHandler(
-                    num_heads=num_heads,
-                    head_dim=head_dim,
-                    d_state=d_state,
-                    dtype=torch.bfloat16,
-                ),
-            )
-        )
-        resource_names.append(
-            interface.add_resource(
-                f"intermediate_ssm_state_{i}",
-                SpecSSMResourceHandler(
-                    num_heads=num_heads,
-                    head_dim=head_dim,
-                    d_state=d_state,
-                    dtype=torch.bfloat16,
-                ),
-            )
-        )
-        resource_names.append(
-            interface.add_resource(
-                f"conv_state_{i}",
-                CausalConvResourceHandler(conv_dim=conv_dim, d_conv=4, dtype=torch.float32),
-            )
-        )
-        resource_names.append(
-            interface.add_resource(
-                f"intermediate_conv_state_{i}",
-                SpecCausalConvResourceHandler(
-                    conv_dim=conv_dim,
-                    d_conv=4,
-                    dtype=torch.float32,
-                ),
-            )
-        )
-
-    interface.initialize_resources()
-
-    for resource_name in resource_names:
-        cache = interface._caches[resource_name]
-        assert cache is not None
-        assert cache.is_contiguous()
-        assert resource_name not in interface._unmanaged_resources
-
-
 def test_multiple_ssm_resources_contiguous_views(paged_kv_cache_config):
     """Test that multiple SSM resources get contiguous views from MambaHybridCacheManager."""
     interface = CachedSequenceInterface(
         max_seq_len=128,
         max_batch_size=4,
+        max_num_tokens=default_max_num_tokens(128, 4),
         device="cuda",
         kv_cache_config=paged_kv_cache_config,
     )
@@ -885,6 +1013,7 @@ def test_multiple_conv_resources_contiguous_views(paged_kv_cache_config):
     interface = CachedSequenceInterface(
         max_seq_len=128,
         max_batch_size=4,
+        max_num_tokens=default_max_num_tokens(128, 4),
         device="cuda",
         kv_cache_config=paged_kv_cache_config,
     )
@@ -912,6 +1041,7 @@ def test_mixed_ssm_conv_resources_uses_min_layers(paged_kv_cache_config):
     interface = CachedSequenceInterface(
         max_seq_len=128,
         max_batch_size=4,
+        max_num_tokens=default_max_num_tokens(128, 4),
         device="cuda",
         kv_cache_config=paged_kv_cache_config,
     )
@@ -962,6 +1092,7 @@ def test_generic_state_handler_allocated_locally(paged_kv_cache_config):
     interface = CachedSequenceInterface(
         max_seq_len=128,
         max_batch_size=4,
+        max_num_tokens=default_max_num_tokens(128, 4),
         device="cuda",
         kv_cache_config=paged_kv_cache_config,
     )
@@ -985,7 +1116,12 @@ def test_generic_state_handler_allocated_locally(paged_kv_cache_config):
 
 def test_active_host_prep_args_initially_empty():
     """Verify _active_host_prep_args starts empty and is populated by register_host_prepare."""
-    seq_info = SequenceInfo(max_seq_len=128, max_batch_size=4, tokens_per_block=32)
+    seq_info = SequenceInfo(
+        max_seq_len=128,
+        max_batch_size=4,
+        max_num_tokens=default_max_num_tokens(128, 4),
+        tokens_per_block=32,
+    )
 
     # Initially empty -- only populated by register_host_prepare_for_attention_forward
     assert len(seq_info._active_host_prep_args) == 0
@@ -1004,7 +1140,12 @@ def test_active_host_prep_args_initially_empty():
 
 def test_requires_copy_args_not_in_named_args():
     """Verify that _requires_copy args do NOT appear in named_args."""
-    seq_info = SequenceInfo(max_seq_len=128, max_batch_size=4, tokens_per_block=32)
+    seq_info = SequenceInfo(
+        max_seq_len=128,
+        max_batch_size=4,
+        max_num_tokens=default_max_num_tokens(128, 4),
+        tokens_per_block=32,
+    )
 
     named_args = seq_info.named_args
     for rc_arg in seq_info._active_host_prep_args:
@@ -1014,7 +1155,12 @@ def test_requires_copy_args_not_in_named_args():
 
 def test_args_stored_to_input_buffer():
     """Verify that args are written to InputBuffer by nest_sequences."""
-    seq_info = SequenceInfo(max_seq_len=128, max_batch_size=4, tokens_per_block=32)
+    seq_info = SequenceInfo(
+        max_seq_len=128,
+        max_batch_size=4,
+        max_num_tokens=default_max_num_tokens(128, 4),
+        tokens_per_block=32,
+    )
 
     # nest_sequences computes token_gather_indices internally from gather_context_logits
     # Default (gather_context_logits=False): 1 prefill seq of 3 tokens → gather last token only
@@ -1050,7 +1196,12 @@ def test_args_stored_to_input_buffer():
 
 def test_register_host_prepare_populates_requires_copy():
     """Verify register_host_prepare_for_attention_forward auto-populates _requires_copy."""
-    seq_info = SequenceInfo(max_seq_len=128, max_batch_size=4, tokens_per_block=32)
+    seq_info = SequenceInfo(
+        max_seq_len=128,
+        max_batch_size=4,
+        max_num_tokens=default_max_num_tokens(128, 4),
+        tokens_per_block=32,
+    )
 
     # Define a dummy host prepare function
     def dummy_host_prepare(batch_info_host: torch.Tensor, cu_num_pages_host: torch.Tensor):

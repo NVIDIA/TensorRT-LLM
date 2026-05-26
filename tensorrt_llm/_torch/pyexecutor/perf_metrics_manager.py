@@ -11,6 +11,7 @@ from typing import Optional
 
 import torch
 
+from tensorrt_llm.logger import logger
 from tensorrt_llm.serve.responses_utils import get_steady_clock_now_in_seconds
 
 from .llm_request import PerfTimingInfo
@@ -167,14 +168,27 @@ class PerfMetricsManager:
                     perf.gpu_forward_end_event.synchronize()
                 if perf.gpu_sample_end_event and not perf.gpu_sample_end_event.query():
                     perf.gpu_sample_end_event.synchronize()
-                batch_gpu_forward_time = perf.gpu_forward_start_event.elapsed_time(
-                    perf.gpu_forward_end_event
-                )
-                batch_gpu_sample_time = (
-                    perf.gpu_forward_end_event.elapsed_time(perf.gpu_sample_end_event)
-                    if perf.gpu_sample_end_event
-                    else 0.0
-                )
+                try:
+                    batch_gpu_forward_time = perf.gpu_forward_start_event.elapsed_time(
+                        perf.gpu_forward_end_event
+                    )
+                    batch_gpu_sample_time = (
+                        perf.gpu_forward_end_event.elapsed_time(perf.gpu_sample_end_event)
+                        if perf.gpu_sample_end_event
+                        else 0.0
+                    )
+                except RuntimeError as e:
+                    # CUDA event timing can fail if events were not recorded
+                    # on the current stream. Skip metrics for this batch rather
+                    # than crashing the executor thread.
+                    logger.warning(
+                        "Failed to compute GPU event elapsed_time: %s. "
+                        "Setting batch GPU times to 0.0. This may indicate "
+                        "an issue with the forward pass or stream synchronization.",
+                        e,
+                    )
+                    batch_gpu_forward_time = 0.0
+                    batch_gpu_sample_time = 0.0
 
             target["gpu_forward_time"] = batch_gpu_forward_time
             target["gpu_sample_time"] = batch_gpu_sample_time

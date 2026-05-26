@@ -1,13 +1,30 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import types
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 
-from ...executor.result import CompletionOutput
-from ...inputs.registry import DefaultInputProcessor, ExtraProcessedInputs
-from ...llmapi.llm import RequestOutput, _TorchLLM
-from ...llmapi.tokenizer import TokenizerBase, TransformersTokenizer, tokenizer_factory
-from ...sampling_params import SamplingParams
+from tensorrt_llm.executor.result import CompletionOutput
+from tensorrt_llm.inputs.registry import DefaultInputProcessor, ExtraProcessedInputs
+from tensorrt_llm.llmapi.llm import RequestOutput, _TorchLLM
+from tensorrt_llm.llmapi.tokenizer import TokenizerBase, TransformersTokenizer, tokenizer_factory
+from tensorrt_llm.sampling_params import SamplingParams
+
 from .distributed import common as dist_ad
 from .llm_args import LlmArgs
 from .models.factory import ModelFactory
@@ -46,17 +63,27 @@ class ADInputProcessor(DefaultInputProcessor):
             # multi_modal_data should not be present in the messages field
             assert "multi_modal_data" not in inputs, f"unexpected multi_modal_data key in {inputs=}"
 
+            # Normalize message content to list-of-dicts format only for multimodal
+            # processors (e.g., Llama4) that expect {"type": "text", "text": "..."}
+            # instead of plain strings when tokenize=True. Text-only models' Jinja2
+            # chat templates expect content as a plain string.
+            messages = inputs["messages"]
+            if hasattr(self.processor, "image_processor"):
+                for msg in messages:
+                    if isinstance(msg.get("content"), str):
+                        msg["content"] = [{"type": "text", "text": msg["content"]}]
+
             # TODO: we don't really need this but it makes for a good sanity check. Consider
             # removing this in the future if we need to speed things up.
             prompt = self.processor.apply_chat_template(
-                inputs["messages"],
+                messages,
                 add_generation_prompt=True,
                 tokenize=False,
             )
             inputs["prompt"] = prompt
 
             all_args = self.processor.apply_chat_template(
-                inputs["messages"],
+                messages,
                 add_generation_prompt=True,
                 tokenize=True,
                 return_dict=True,
@@ -87,6 +114,11 @@ class ADInputProcessor(DefaultInputProcessor):
         if all_args is not None:
             # TODO: is there a more reliable way to avoid the attention_mask here?
             all_args.pop("attention_mask", None)
+            # token_type_ids is produced by some tokenizers (e.g. Hunyuan) but is not
+            # a graph input for decoder-only causal LMs; drop it here so it does not get
+            # forwarded as an extra_arg to the exported model, which would cause a kwarg
+            # keyword mismatch at inference time.
+            all_args.pop("token_type_ids", None)
 
             # TODO: can we avoid the extra tolist() here eventually?
             token_ids = all_args.pop("input_ids")
@@ -127,6 +159,20 @@ class LLM(_TorchLLM):
         """We don't need to validate args for AutoDeploy backend for now."""
         pass
 
+    @property
+    def _hf_model_dir(self):
+        return (
+            Path(self.factory._prefetched_model_path)
+            if self.factory._prefetched_model_path is not None
+            else None
+        )
+
+    @_hf_model_dir.setter
+    def _hf_model_dir(self, value):
+        # Parent class assigns this in __init__ and _build_model();
+        # AutoDeploy derives it from factory._prefetched_model_path instead.
+        pass
+
     def _create_input_processor(self) -> ADInputProcessor:
         processor = self.factory.init_processor()
         base = ADInputProcessor(self.tokenizer, processor)
@@ -165,6 +211,15 @@ class DemoLLM(LLM):
 
     def __init__(self, **kwargs):
         self.args: LlmArgs = LlmArgs(**kwargs)
+
+        if self.args.encode_only:
+            raise NotImplementedError(
+                "encode_only=True is not supported by DemoLLM (AutoDeploy debug path). "
+                "Use the standard LLM class with backend='pytorch' for encoder-only mode."
+            )
+        # set encode_only and encoder_executor to BaseLLM's default values
+        self._encode_only = False
+        self._encoder_executor = None
 
         self.mpi_session = None
         self.runtime_context = None

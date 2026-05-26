@@ -784,7 +784,6 @@ def model_config() -> Dict:
         "kv_cache_free_gpu_mem_fraction": "0.5",
         "cross_kv_cache_fraction": "0.5",
         "kv_cache_host_memory_bytes": "4",
-        "kv_cache_onboard_blocks": "false",
         "gpu_device_ids": "0,1,2,3",
         "executor_worker_path": str(os.path.abspath(__file__)),
         "lora_cache_optimal_adapter_size": "1",
@@ -814,7 +813,6 @@ def test_get_executor_config(model_config: Dict):
     assert config.kv_cache_config.free_gpu_memory_fraction == 0.5
     assert config.kv_cache_config.cross_kv_cache_fraction == 0.5
     assert config.kv_cache_config.host_cache_size == 4
-    assert config.kv_cache_config.onboard_blocks == False
     assert config.parallel_config.device_ids == [0, 1, 2, 3]
     assert config.parallel_config.orchestrator_config is None
     assert config.peft_cache_config.optimal_adapter_size == 1
@@ -859,7 +857,6 @@ def test_get_executor_config_minimal():
     assert config.kv_cache_config.free_gpu_memory_fraction is None
     assert config.kv_cache_config.cross_kv_cache_fraction is None
     assert config.kv_cache_config.host_cache_size is None
-    assert config.kv_cache_config.onboard_blocks == True
     assert config.parallel_config is None
     assert config.peft_cache_config.optimal_adapter_size == 8
     assert config.peft_cache_config.max_adapter_size == 64

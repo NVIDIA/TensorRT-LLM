@@ -1,0 +1,10 @@
+group: mmmu_pro
+task:
+  - mmmu_pro_standard_10
+  - mmmu_pro_standard_4
+aggregate_metric_list:
+  - metric: acc
+    aggregation: mean
+    weight_by_size: true
+metadata:
+  version: 0.0

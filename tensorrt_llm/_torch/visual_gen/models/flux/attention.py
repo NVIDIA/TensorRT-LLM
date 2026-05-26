@@ -8,7 +8,7 @@ Key Components:
 - Flux2ParallelSelfAttention: Fused QKV+MLP for FLUX.2 single-stream blocks
 """
 
-from typing import TYPE_CHECKING, Optional, Tuple, Union
+from typing import Optional, Tuple, Union
 
 import torch
 import torch.nn.functional as F
@@ -16,11 +16,8 @@ import torch.nn.functional as F
 from tensorrt_llm._torch.modules.linear import Linear, WeightMode, WeightsLoadingConfig
 from tensorrt_llm._torch.modules.rms_norm import RMSNorm
 from tensorrt_llm._torch.modules.swiglu import swiglu
+from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
 from tensorrt_llm._torch.visual_gen.modules.attention import Attention, QKVMode, apply_rotary_emb
-
-if TYPE_CHECKING:
-    from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
-
 
 # =============================================================================
 # Joint Attention (shared by FLUX.1 and FLUX.2 dual-stream blocks)
@@ -49,7 +46,7 @@ class FluxJointAttention(Attention):
         added_kv_proj_dim: Optional[int] = None,
         eps: float = 1e-6,
         pre_only: bool = False,
-        config: Optional["DiffusionModelConfig"] = None,
+        config: Optional[DiffusionModelConfig] = None,
         layer_idx: int = 0,
     ):
         super().__init__(
@@ -195,7 +192,7 @@ class FluxJointAttention(Attention):
 
         q_add = self.norm_added_q.weight if hasattr(self, "norm_added_q") else None
         k_add = self.norm_added_k.weight if hasattr(self, "norm_added_k") else None
-        self.apply_qk_norm_rope(
+        self.apply_packed_qk_norm_rope(
             qkv,
             freqs_cos,
             freqs_sin,
@@ -287,7 +284,7 @@ class Flux2ParallelSelfAttention(FluxJointAttention):
         mlp_ratio: float = 3.0,
         bias: bool = False,
         eps: float = 1e-6,
-        config: Optional["DiffusionModelConfig"] = None,
+        config: Optional[DiffusionModelConfig] = None,
         layer_idx: int = 0,
     ):
         # Set MLP dims BEFORE super().__init__() — _init_qkv_proj() needs them
@@ -365,7 +362,7 @@ class Flux2ParallelSelfAttention(FluxJointAttention):
         # torch.split produces non-contiguous views; fused kernel requires contiguous
         qkv = qkv.contiguous()
 
-        self.apply_qk_norm_rope(qkv, freqs_cos, freqs_sin, num_txt_tokens=-1)
+        self.apply_packed_qk_norm_rope(qkv, freqs_cos, freqs_sin, num_txt_tokens=-1)
 
         q, k, v = qkv.split([self.q_dim, self.kv_dim, self.kv_dim], dim=-1)
         return q, k, v

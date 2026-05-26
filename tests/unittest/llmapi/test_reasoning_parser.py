@@ -1,3 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import json
 import os
 
@@ -233,6 +248,43 @@ def test_qwen3_reasoning_parser_stream(delta_texts: list, content: list,
         assert result.reasoning_content == reasoning_context[i]
 
 
+@pytest.mark.parametrize(("text", "content", "reasoning_context"), [
+    ("a<think>b</think>c", "c", "b"),
+    ("<think>a</think>b", "b", "a"),
+    ("<think>a", "", "a"),
+    ("a", "a", ""),
+    ("<think>", "", ""),
+])
+def test_laguna_reasoning_parser(text: str, content: str,
+                                 reasoning_context: str):
+    reasoning_parser = ReasoningParserFactory.create_reasoning_parser("laguna")
+    result = reasoning_parser.parse(text)
+    assert result.content == content
+    assert result.reasoning_content == reasoning_context
+
+
+@pytest.mark.parametrize(("delta_texts", "content", "reasoning_context"), [
+    (["<think>a", "l</think>r", "b"], ["", "r", "b"], ["a", "l", ""]),
+    (["<th", "ink>a</think>b"], ["", "b"], ["", "a"]),
+    (["<think>a</th", "ink>b"], ["", "b"], ["a", ""]),
+    (["<think>", "a</think>b"], ["", "b"], ["", "a"]),
+    (["<think>a</think>", "b"], ["", "b"], ["a", ""]),
+    (["<think>a</th", "ank></th", "ink>b"], ["", "", "b"
+                                             ], ["a", "</thank>", ""]),
+])
+def test_laguna_reasoning_parser_stream(delta_texts: list, content: list,
+                                        reasoning_context: list):
+    reasoning_parser = ReasoningParserFactory.create_reasoning_parser("laguna")
+    for i, delta_text in enumerate(delta_texts):
+        result = reasoning_parser.parse_delta(delta_text)
+        assert result.content == content[i]
+        assert result.reasoning_content == reasoning_context[i]
+
+
+TOOL_CALL = "<tool_call>"
+TOOL_CALL_END = "</tool_call>"
+
+
 @pytest.mark.parametrize(
     ("text", "content", "reasoning_context", "chat_template_kwargs"),
     [
@@ -265,6 +317,38 @@ def test_qwen3_reasoning_parser_stream(delta_texts: list, content: list,
         (f"a b {R1_END}", "a b ", "", {
             "force_nonempty_content": True
         }),
+        # NVBug 6060281: whitespace-only content after </redacted_thinking> must
+        # still trigger the reasoning-to-content swap when force_nonempty_content.
+        (f"a {R1_END}\n", "a ", "", {
+            "force_nonempty_content": True
+        }),
+        (f"a {R1_END} \t ", "a ", "", {
+            "force_nonempty_content": True
+        }),
+        # NVBug 6082303: <tool_call> as implicit end-of-reasoning.
+        # No </think> before <tool_call> — tool call must appear in content.
+        (f"I need weather{TOOL_CALL}get_weather{TOOL_CALL_END}",
+         f"{TOOL_CALL}get_weather{TOOL_CALL_END}", "I need weather", None),
+        # </think> before <tool_call> — standard end wins.
+        (f"reasoning{R1_END}{TOOL_CALL}get_weather{TOOL_CALL_END}",
+         f"{TOOL_CALL}get_weather{TOOL_CALL_END}", "reasoning", None),
+        # <tool_call> with enable_thinking=False — all goes to content.
+        (f"content{TOOL_CALL}get_weather{TOOL_CALL_END}",
+         f"content{TOOL_CALL}get_weather{TOOL_CALL_END}", "", {
+             "enable_thinking": False
+         }),
+        # <tool_call> with force_nonempty_content — content is non-empty, no swap.
+        (f"reasoning{TOOL_CALL}get_weather{TOOL_CALL_END}",
+         f"{TOOL_CALL}get_weather{TOOL_CALL_END}", "reasoning", {
+             "force_nonempty_content": True
+         }),
+        # <think> then <tool_call> without </think> with enable_thinking=False:
+        # reasoning_at_start is False so parse() looks for <think> tag,
+        # strips it, then tool_call acts as implicit end-of-reasoning.
+        (f"{R1_START}reasoning{TOOL_CALL}get_weather{TOOL_CALL_END}",
+         f"{TOOL_CALL}get_weather{TOOL_CALL_END}", "reasoning", {
+             "enable_thinking": False
+         }),
     ])
 def test_nano_v3_reasoning_parser(text: str, content: str,
                                   reasoning_context: str,
@@ -309,6 +393,75 @@ def test_nano_v3_reasoning_parser(text: str, content: str,
         (["a", f"{R1_END}r", "b"], ["a", f"{R1_END}r", "b"], ["", "", ""], {
             "enable_thinking": False
         }),
+        # NVBug 6082303: <tool_call> as implicit end-of-reasoning in streaming.
+        # Single-token <tool_call> after reasoning deltas.
+        (
+            ["I need ", "weather", TOOL_CALL, "get_weather"],
+            ["", "", f"{TOOL_CALL}", "get_weather"],
+            ["I need ", "weather", "", ""],
+            None,
+        ),
+        # <tool_call> combined with preceding reasoning text in one delta.
+        (
+            ["reasoning" + TOOL_CALL + "tool_data"],
+            [TOOL_CALL + "tool_data"],
+            ["reasoning"],
+            None,
+        ),
+        # </think> before <tool_call> — standard handling.
+        (
+            ["reasoning", R1_END, TOOL_CALL + "data"],
+            ["", "", TOOL_CALL + "data"],
+            ["reasoning", "", ""],
+            None,
+        ),
+        # Token-level chunks mimicking the bug scenario from NVBug 6082303.
+        (
+            [
+                "I", " need to check", " the weather in", " New York City",
+                TOOL_CALL, "<function=get_weather>", "<parameter=location>NYC",
+                "</parameter>", "</function>", TOOL_CALL_END
+            ],
+            [
+                "", "", "", "", TOOL_CALL, "<function=get_weather>",
+                "<parameter=location>NYC", "</parameter>", "</function>",
+                TOOL_CALL_END
+            ],
+            [
+                "I", " need to check", " the weather in", " New York City", "",
+                "", "", "", "", ""
+            ],
+            None,
+        ),
+        # Parent buffers trailing "<" (prefix of "</think>") from a text
+        # token, then the full <tool_call> special token arrives atomically.
+        (
+            ["reasoning<", "<tool_call>data"],
+            ["", "<tool_call>data"],
+            ["reasoning", "<"],
+            None,
+        ),
+        # force_nonempty_content + streaming tool call: tool_call ends
+        # reasoning, accumulated reasoning is discarded (not swapped into
+        # content), and content carries the tool markup.
+        (
+            ["I need ", "weather", TOOL_CALL, "get_weather"],
+            ["", "", TOOL_CALL, "get_weather"],
+            ["I need ", "weather", "", ""],
+            {
+                "force_nonempty_content": True
+            },
+        ),
+        # enable_thinking=False + streaming tool call: everything is content
+        # (no buffering since <tool_call> is not a prefix of <think>).
+        (
+            ["content", TOOL_CALL, "data"],
+            ["content", TOOL_CALL, "data"],
+            ["", "", ""],
+            {
+                "enable_thinking": False
+            },
+        ),
     ])
 def test_nano_v3_reasoning_parser_stream(delta_texts: list, content: list,
                                          reasoning_context: list,
@@ -322,27 +475,36 @@ def test_nano_v3_reasoning_parser_stream(delta_texts: list, content: list,
         assert result.reasoning_content == reasoning_context[i]
 
 
-@pytest.mark.parametrize(("delta_texts", "finish_content", "finish_reasoning",
-                          "chat_template_kwargs"), [
-                              (["a", "b"], "", "", None),
-                              ([R1_END, "a", "b"], "", "", None),
-                              (["a", R1_END, "b"], "", "", None),
-                              (["a", "b"], "", "", {
-                                  "enable_thinking": False
-                              }),
-                              ([f"{R1_START}a", "b"], "", "", {
-                                  "enable_thinking": False
-                              }),
-                              (["a", "b"], "", "", {
-                                  "force_nonempty_content": False
-                              }),
-                              (["a", "b"], "ab", "", {
-                                  "force_nonempty_content": True
-                              }),
-                              ([R1_END, "a", "b"], "", "", {
-                                  "force_nonempty_content": True
-                              }),
-                          ])
+@pytest.mark.parametrize(
+    ("delta_texts", "finish_content", "finish_reasoning",
+     "chat_template_kwargs"),
+    [
+        (["a", "b"], "", "", None),
+        ([R1_END, "a", "b"], "", "", None),
+        (["a", R1_END, "b"], "", "", None),
+        (["a", "b"], "", "", {
+            "enable_thinking": False
+        }),
+        ([f"{R1_START}a", "b"], "", "", {
+            "enable_thinking": False
+        }),
+        (["a", "b"], "", "", {
+            "force_nonempty_content": False
+        }),
+        (["a", "b"], "ab", "", {
+            "force_nonempty_content": True
+        }),
+        ([R1_END, "a", "b"], "", "", {
+            "force_nonempty_content": True
+        }),
+        # NVBug 6082303: <tool_call> ends reasoning,
+        # finish should return empty (tag acted as
+        # implicit closing).
+        (["reasoning", "<tool_call>data"], "", "", None),
+        (["reasoning", "<tool_call>data"], "", "", {
+            "force_nonempty_content": True
+        }),
+    ])
 def test_nano_v3_reasoning_parser_finish(delta_texts: list, finish_content: str,
                                          finish_reasoning: str,
                                          chat_template_kwargs: dict):
@@ -471,3 +633,120 @@ def test_auto_detect_no_config(tmp_path):
 
     result = resolve_auto_reasoning_parser(model_dir)
     assert result is None
+
+
+def test_auto_detect_gemma4(tmp_path):
+    """Gemma 4 model → 'gemma4' parser."""
+    model_dir = str(tmp_path / "gemma-4-26B-A4B-it")
+    os.makedirs(model_dir)
+    _write_config(model_dir, "gemma4")
+
+    result = resolve_auto_reasoning_parser(model_dir)
+    assert result == "gemma4"
+
+
+def test_auto_detect_laguna(tmp_path):
+    """Laguna model → 'laguna' parser."""
+    model_dir = str(tmp_path / "Laguna")
+    os.makedirs(model_dir)
+    _write_config(model_dir, "laguna")
+
+    result = resolve_auto_reasoning_parser(model_dir)
+    assert result == "laguna"
+
+
+# ---------------------------------------------------------------------------
+# Gemma 4 reasoning parser tests
+# ---------------------------------------------------------------------------
+
+G4_OPEN, G4_CLOSE = "<|channel>", "<channel|>"
+
+
+@pytest.mark.parametrize(
+    ("text", "content", "reasoning_content"),
+    [
+        # No reasoning block: everything is content.
+        ("hello world", "hello world", ""),
+        # Channel block wrapping reasoning, followed by content.
+        (f"{G4_OPEN}thought\nreasoning{G4_CLOSE}answer", "answer",
+         "thought\nreasoning"),
+        # Content before and after the reasoning block.
+        (f"pre{G4_OPEN}r{G4_CLOSE}post", "prepost", "r"),
+        # Unterminated channel: remainder treated as reasoning.
+        (f"{G4_OPEN}abc", "", "abc"),
+        # Multiple interleaved channel blocks.
+        (f"a{G4_OPEN}r1{G4_CLOSE}b{G4_OPEN}r2{G4_CLOSE}c", "abc", "r1r2"),
+        # Empty reasoning block (e.g. prefilled when enable_thinking=False).
+        (f"{G4_OPEN}thought\n{G4_CLOSE}answer", "answer", "thought\n"),
+    ],
+)
+def test_gemma4_reasoning_parser(text: str, content: str,
+                                 reasoning_content: str):
+    parser = ReasoningParserFactory.create_reasoning_parser("gemma4")
+    result = parser.parse(text)
+    assert result.content == content
+    assert result.reasoning_content == reasoning_content
+
+
+@pytest.mark.parametrize(
+    ("delta_texts", "content", "reasoning_content"),
+    [
+        # No reasoning: plain content streams through.
+        (["a", "b"], ["a", "b"], ["", ""]),
+        # Open and close in a single delta.
+        ([f"{G4_OPEN}r{G4_CLOSE}c"], ["c"], ["r"]),
+        # Delimiters split across deltas.
+        ([G4_OPEN, "r", G4_CLOSE, "c"], ["", "", "", "c"], ["", "r", "", ""]),
+        # Partial open tag held back until complete.
+        (["pre<|cha", "nnel>r<chan", "nel|>post"], ["pre", "", "post"
+                                                    ], ["", "r", ""]),
+        # Two reasoning blocks interleaved with content.
+        (
+            [f"{G4_OPEN}r1{G4_CLOSE}c1", f"{G4_OPEN}r2{G4_CLOSE}c2"],
+            ["c1", "c2"],
+            ["r1", "r2"],
+        ),
+        # Partial close tag at end of delta buffered.
+        ([f"{G4_OPEN}reason<chan", "nel|>tail"], ["", "tail"], ["reason", ""]),
+    ],
+)
+def test_gemma4_reasoning_parser_stream(delta_texts: list, content: list,
+                                        reasoning_content: list):
+    parser = ReasoningParserFactory.create_reasoning_parser("gemma4")
+    for i, delta in enumerate(delta_texts):
+        result = parser.parse_delta(delta)
+        assert result.content == content[i], (
+            f"Step {i}: delta={delta!r} expected content={content[i]!r} "
+            f"got {result.content!r}")
+        assert result.reasoning_content == reasoning_content[i], (
+            f"Step {i}: delta={delta!r} expected reasoning="
+            f"{reasoning_content[i]!r} got {result.reasoning_content!r}")
+
+
+def test_gemma4_reasoning_parser_finish_flushes_buffer():
+    """finish() should flush any buffered trailing text."""
+    parser = ReasoningParserFactory.create_reasoning_parser("gemma4")
+    # Send a partial open tag; parser holds it back.
+    parser.parse_delta("some text<|cha")
+    # Stream ended mid-tag: the held-back suffix flushes as content.
+    result = parser.finish()
+    assert result.content == "<|cha"
+    assert result.reasoning_content == ""
+
+
+def test_gemma4_reasoning_parser_finish_unterminated_reasoning():
+    """Verify finish() flushes a held-back partial close tag as reasoning.
+
+    When the stream ends mid-channel with a buffered partial close tag, the
+    remainder should surface as reasoning content.
+    """
+    parser = ReasoningParserFactory.create_reasoning_parser("gemma4")
+    # Enter reasoning; stream ends with a partial close tag (held back).
+    stream = parser.parse_delta(f"{G4_OPEN}reasoning_start<chan")
+    assert stream.reasoning_content == "reasoning_start"
+    assert stream.content == ""
+    # finish() should release the buffered "<chan" as reasoning since we are
+    # still inside the channel block.
+    result = parser.finish()
+    assert result.content == ""
+    assert result.reasoning_content == "<chan"

@@ -1,4 +1,4 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: BSD-3-Clause
 
 # Redistribution and use in source and binary forms, with or without
@@ -156,144 +156,6 @@ CUDA Graph Support:
 * Only rows within (aligned_groupm[0]+aligned_groupm[1]+...) contain valid data
 * Padding rows in C matrix will not be written by the kernel
 """
-
-
-# TODO(zhichenj): Remove this hook helper function after nvidia-cutlass-dsl 4.4 is released.
-def hooked_PersistentTileSchedulerParams_init(
-    self,
-    problem_shape_ntile_mnl: cute.Shape,
-    cluster_shape_mnk: cute.Shape,
-    swizzle_size: int = 1,
-    raster_along_m: bool = True,
-    *,
-    loc=None,
-    ip=None,
-):
-    if cluster_shape_mnk[2] != 1:
-        raise ValueError(f"unsupported cluster_shape_k {cluster_shape_mnk[2]}")
-    if swizzle_size < 1:
-        raise ValueError(f"expect swizzle_size >= 1, but get {swizzle_size}")
-
-    self.problem_shape_ntile_mnl = problem_shape_ntile_mnl
-    # cluster_shape_mnk is kept for reconstruction
-    self._cluster_shape_mnk = cluster_shape_mnk
-    self.cluster_shape_mn = cluster_shape_mnk[:2]
-    self.swizzle_size = swizzle_size
-    self._raster_along_m = raster_along_m
-    self._loc = loc
-
-    # Apply swizzle if swizzle_size > 1
-    if swizzle_size > 1:
-        problem_shape_ncluster_mnl = cute.round_up(
-            self.problem_layout_ncluster_mnl.shape,
-            (1, swizzle_size, 1) if raster_along_m else (swizzle_size, 1, 1),
-        )
-
-        if raster_along_m:
-            self.problem_layout_ncluster_mnl = cute.make_layout(
-                (
-                    problem_shape_ncluster_mnl[0],
-                    (swizzle_size, problem_shape_ncluster_mnl[1] // swizzle_size),
-                    problem_shape_ncluster_mnl[2],
-                ),
-                stride=(
-                    swizzle_size,
-                    (1, swizzle_size * problem_shape_ncluster_mnl[0]),
-                    problem_shape_ncluster_mnl[0] * problem_shape_ncluster_mnl[1],
-                ),
-                loc=loc,
-                ip=ip,
-            )
-        else:
-            self.problem_layout_ncluster_mnl = cute.make_layout(
-                (
-                    (swizzle_size, problem_shape_ncluster_mnl[0] // swizzle_size),
-                    problem_shape_ncluster_mnl[1],
-                    problem_shape_ncluster_mnl[2],
-                ),
-                stride=(
-                    (1, swizzle_size * problem_shape_ncluster_mnl[1]),
-                    swizzle_size,
-                    problem_shape_ncluster_mnl[0] * problem_shape_ncluster_mnl[1],
-                ),
-                loc=loc,
-                ip=ip,
-            )
-
-    # Create FastDivmod divisors (only when swizzle_size == 1 for correctness)
-    # FastDivmod assumes simple col-major/row-major layout, incompatible with swizzled layouts
-    if swizzle_size == 1:
-        problem_shape_ncluster_mnl = cute.ceil_div(
-            self.problem_shape_ntile_mnl, cluster_shape_mnk[:2], loc=loc, ip=ip
-        )
-        if raster_along_m:
-            self.problem_layout_ncluster_mnl = cute.make_layout(
-                problem_shape_ncluster_mnl,
-                stride=(
-                    1,
-                    problem_shape_ncluster_mnl[0],
-                    problem_shape_ncluster_mnl[0] * problem_shape_ncluster_mnl[1],
-                ),
-                loc=loc,
-                ip=ip,
-            )
-        else:
-            self.problem_layout_ncluster_mnl = cute.make_layout(
-                problem_shape_ncluster_mnl,
-                stride=(
-                    problem_shape_ncluster_mnl[1],
-                    1,
-                    problem_shape_ncluster_mnl[0] * problem_shape_ncluster_mnl[1],
-                ),
-                loc=loc,
-                ip=ip,
-            )
-        problem_layout_size = cute.size(self.problem_layout_ncluster_mnl, loc=loc, ip=ip)
-        cluster_count_m = self.problem_layout_ncluster_mnl.shape[0]
-        cluster_count_n = self.problem_layout_ncluster_mnl.shape[1]
-
-        # batch_fdd: Used to map linear_idx to work_unit_id (handles persistent scheduling)
-        self.batch_fdd = cute.fast_divmod_create_divisor(problem_layout_size, loc=loc, ip=ip)
-
-        # cluster_shape_m_fdd: Used to decode work_unit_id to cluster coordinates
-        self.cluster_shape_m_fdd = cute.fast_divmod_create_divisor(cluster_count_m, loc=loc, ip=ip)
-
-        # cluster_shape_n_fdd: Used for the second level decomposition
-        self.cluster_shape_n_fdd = cute.fast_divmod_create_divisor(cluster_count_n, loc=loc, ip=ip)
-    else:
-        # FastDivmod not applicable with swizzling, set to None
-        self.batch_fdd = None
-        self.cluster_shape_m_fdd = None
-        self.cluster_shape_n_fdd = None
-
-
-def hooked_get_cluster_work_idx_with_fastdivmod(
-    self, current_work_linear_idx: cutlass.Int32, *, loc=None, ip=None
-) -> Tuple[cutlass.Int32, cutlass.Int32, cutlass.Int32]:
-    work_iteration, work_unit_id = divmod(current_work_linear_idx, self.params.batch_fdd)
-
-    if self.params._raster_along_m:
-        # raster_along_m=True means column major (m is fastest)
-        # First, get cluster_m using cluster_shape_m_fdd
-        cluster_n_batch, cluster_m = divmod(work_unit_id, self.params.cluster_shape_m_fdd)
-
-        # Then decode cluster_n_batch to get cluster_n and batch_l using FastDivmod
-        batch_l, cluster_n = divmod(cluster_n_batch, self.params.cluster_shape_n_fdd)
-    else:
-        # raster_along_m=False means row major (n is fastest)
-        # First, get cluster_n using cluster_shape_n_fdd
-        cluster_m_batch, cluster_n = divmod(work_unit_id, self.params.cluster_shape_n_fdd)
-
-        # Then decode cluster_m_batch to get cluster_m and batch_l using FastDivmod
-        batch_l, cluster_m = divmod(cluster_m_batch, self.params.cluster_shape_m_fdd)
-
-    return (cluster_m, cluster_n, batch_l)
-
-
-cutlass.utils.PersistentTileSchedulerParams.__init__ = hooked_PersistentTileSchedulerParams_init
-cutlass.utils.StaticPersistentTileScheduler._get_cluster_work_idx_with_fastdivmod = (
-    hooked_get_cluster_work_idx_with_fastdivmod
-)
 
 
 class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
@@ -1490,8 +1352,8 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
                             sInfo[(4, tile_info_producer_state.index)] = mn_limit
                             # fence view async shared
                         cute.arch.fence_proxy(
-                            cute.arch.ProxyKind.async_shared,
-                            space=cute.arch.SharedSpace.shared_cta,
+                            "async.shared",
+                            space="cta",
                         )
 
                         self.sched_sync_barrier.arrive_and_wait()
@@ -1520,8 +1382,8 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
                             sInfo[(4, tile_info_producer_state.index)] = mn_limit
                             # fence view async shared
                         cute.arch.fence_proxy(
-                            cute.arch.ProxyKind.async_shared,
-                            space=cute.arch.SharedSpace.shared_cta,
+                            "async.shared",
+                            space="cta",
                         )
 
                         self.sched_sync_barrier.arrive_and_wait()
@@ -1542,8 +1404,8 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
                 sInfo[(3, tile_info_producer_state.index)] = cutlass.Int32(0)
                 sInfo[(4, tile_info_producer_state.index)] = cutlass.Int32(0)
             cute.arch.fence_proxy(
-                cute.arch.ProxyKind.async_shared,
-                space=cute.arch.SharedSpace.shared_cta,
+                "async.shared",
+                space="cta",
             )
             self.sched_sync_barrier.arrive_and_wait()
             tile_info_pipeline.producer_commit(tile_info_producer_state)
@@ -1571,8 +1433,8 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
                 tile_info[idx] = sInfo[(idx, tile_info_consumer_state.index)]
             is_valid_tile = tile_info[3] == 1
             cute.arch.fence_proxy(
-                cute.arch.ProxyKind.async_shared,
-                space=cute.arch.SharedSpace.shared_cta,
+                "async.shared",
+                space="cta",
             )
             tile_info_pipeline.consumer_release(tile_info_consumer_state)
             tile_info_consumer_state.advance()
@@ -1877,8 +1739,8 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
                     tile_info[idx] = sInfo[(idx, tile_info_consumer_state.index)]
                 is_valid_tile = tile_info[3] == 1
                 cute.arch.fence_proxy(
-                    cute.arch.ProxyKind.async_shared,
-                    space=cute.arch.SharedSpace.shared_cta,
+                    "async.shared",
+                    space="cta",
                 )
                 tile_info_pipeline.consumer_release(tile_info_consumer_state)
                 tile_info_consumer_state.advance()
@@ -1963,8 +1825,8 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
                 tile_info[idx] = sInfo[(idx, tile_info_consumer_state.index)]
             is_valid_tile = tile_info[3] == 1
             cute.arch.fence_proxy(
-                cute.arch.ProxyKind.async_shared,
-                space=cute.arch.SharedSpace.shared_cta,
+                "async.shared",
+                space="cta",
             )
             tile_info_pipeline.consumer_release(tile_info_consumer_state)
             tile_info_consumer_state.advance()
@@ -2114,8 +1976,8 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
                     tile_info[idx] = sInfo[(idx, tile_info_consumer_state.index)]
                 is_valid_tile = tile_info[3] == 1
                 cute.arch.fence_proxy(
-                    cute.arch.ProxyKind.async_shared,
-                    space=cute.arch.SharedSpace.shared_cta,
+                    "async.shared",
+                    space="cta",
                 )
                 tile_info_pipeline.consumer_release(tile_info_consumer_state)
                 tile_info_consumer_state.advance()
@@ -2182,8 +2044,8 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
                 tile_info[idx] = sInfo[(idx, tile_info_consumer_state.index)]
             is_valid_tile = tile_info[3] == 1
             cute.arch.fence_proxy(
-                cute.arch.ProxyKind.async_shared,
-                space=cute.arch.SharedSpace.shared_cta,
+                "async.shared",
+                space="cta",
             )
             tile_info_pipeline.consumer_release(tile_info_consumer_state)
             tile_info_consumer_state.advance()
@@ -2333,8 +2195,8 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
 
                 if cutlass.const_expr(self.use_blkred):
                     cute.arch.fence_proxy(
-                        cute.arch.ProxyKind.async_shared,
-                        space=cute.arch.SharedSpace.shared_cta,
+                        "async.shared",
+                        space="cta",
                     )
                 #
                 # Async arrive accumulator buffer empty
@@ -2347,8 +2209,8 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
 
                 if cutlass.const_expr(self.use_blkred):
                     cute.arch.fence_proxy(
-                        cute.arch.ProxyKind.async_shared,
-                        space=cute.arch.SharedSpace.shared_cta,
+                        "async.shared",
+                        space="cta",
                     )
                     if is_valid_row:
                         coord_n = mma_tile_coord_mnl[1] * self.cta_tile_shape_mnk[1]
@@ -2380,8 +2242,8 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
                     tile_info[idx] = sInfo[(idx, tile_info_consumer_state.index)]
                 is_valid_tile = tile_info[3] == 1
                 cute.arch.fence_proxy(
-                    cute.arch.ProxyKind.async_shared,
-                    space=cute.arch.SharedSpace.shared_cta,
+                    "async.shared",
+                    space="cta",
                 )
                 tile_info_pipeline.consumer_release(tile_info_consumer_state)
                 tile_info_consumer_state.advance()

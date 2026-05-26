@@ -12,11 +12,13 @@ from diffusers import AutoencoderKL, FlowMatchEulerDiscreteScheduler
 from diffusers.utils.torch_utils import randn_tensor
 from transformers import CLIPTextModel, CLIPTokenizer, T5EncoderModel, T5TokenizerFast
 
-from tensorrt_llm._torch.visual_gen.config import PipelineComponent
-from tensorrt_llm._torch.visual_gen.output import MediaOutput
+from tensorrt_llm._torch.visual_gen.cache.teacache import (
+    ExtractorConfig,
+    register_extractor_from_config,
+)
+from tensorrt_llm._torch.visual_gen.output import CudaPhaseTimer, PipelineOutput
 from tensorrt_llm._torch.visual_gen.pipeline import BasePipeline
-from tensorrt_llm._torch.visual_gen.pipeline_registry import register_pipeline
-from tensorrt_llm._torch.visual_gen.teacache import ExtractorConfig, register_extractor_from_config
+from tensorrt_llm._torch.visual_gen.pipeline_registry import PipelineComponent, register_pipeline
 from tensorrt_llm.logger import logger
 
 from .transformer_flux import FluxTransformer2DModel
@@ -37,7 +39,11 @@ FLUX_TEACACHE_COEFFICIENTS = {
 }
 
 
-@register_pipeline("FluxPipeline")
+@register_pipeline(
+    "FluxPipeline",
+    hf_ids=["black-forest-labs/FLUX.1-dev"],
+    doc="Black Forest Labs FLUX.1 family (text-to-image).",
+)
 class FluxPipeline(BasePipeline):
     """FLUX.1 Text-to-Image Pipeline.
 
@@ -50,7 +56,7 @@ class FluxPipeline(BasePipeline):
             and model_config.visual_gen_mapping.cfg_size != 1
         ):
             raise ValueError(
-                "FluxPipeline does not support CFG parallelism. Please set dit_cfg_size to 1."
+                "FluxPipeline does not support CFG parallelism. Please set cfg_size to 1."
             )
 
         super().__init__(model_config)
@@ -226,27 +232,29 @@ class FluxPipeline(BasePipeline):
                 )
             )
 
-            # Enable TeaCache with FLUX.1-specific polynomial coefficients
-            self._setup_teacache(self.transformer, FLUX_TEACACHE_COEFFICIENTS)
+            # TeaCache or Cache-DiT
+            self._setup_cache_acceleration(self.transformer, FLUX_TEACACHE_COEFFICIENTS)
 
-    DEFAULT_GENERATION_PARAMS = {
-        "height": 1024,
-        "width": 1024,
-        "num_inference_steps": 50,
-        "guidance_scale": 3.5,
-        "max_sequence_length": 512,
-    }
+    @property
+    def default_generation_params(self):
+        return {
+            "height": 1024,
+            "width": 1024,
+            "num_inference_steps": 50,
+            "guidance_scale": 3.5,
+            "max_sequence_length": 512,
+        }
 
     def infer(self, req):
         """Run inference from DiffusionRequest."""
         return self.forward(
             prompt=req.prompt,
-            height=req.height,
-            width=req.width,
-            num_inference_steps=req.num_inference_steps,
-            guidance_scale=req.guidance_scale,
-            seed=req.seed,
-            max_sequence_length=req.max_sequence_length,
+            height=req.params.height,
+            width=req.params.width,
+            num_inference_steps=req.params.num_inference_steps,
+            guidance_scale=req.params.guidance_scale,
+            seed=req.params.seed,
+            max_sequence_length=req.params.max_sequence_length,
         )
 
     @torch.inference_mode()
@@ -274,9 +282,11 @@ class FluxPipeline(BasePipeline):
             max_sequence_length: Maximum text sequence length
 
         Returns:
-            MediaOutput with image tensor (B, H, W, C).
+            PipelineOutput with image tensor (B, H, W, C).
         """
         pipeline_start = time.time()
+        timer = CudaPhaseTimer()
+        timer.mark_pre_start()
 
         # Determine batch size
         if isinstance(prompt, str):
@@ -311,6 +321,7 @@ class FluxPipeline(BasePipeline):
             self.scheduler.set_timesteps(sigmas=sigmas, device=self.device, mu=mu)
 
         timesteps = self.scheduler.timesteps
+        self.scheduler.set_begin_index(0)
 
         # Prepare guidance (embedded guidance for FLUX)
         guidance = None
@@ -335,6 +346,7 @@ class FluxPipeline(BasePipeline):
                 return_dict=False,
             )[0]
 
+        timer.mark_denoise_start()
         latents = self.denoise(
             latents=latents,
             scheduler=self.scheduler,
@@ -343,6 +355,7 @@ class FluxPipeline(BasePipeline):
             forward_fn=forward_fn,
             timesteps=timesteps,
         )
+        timer.mark_post_start()
 
         # Decode
         logger.info("Decoding image...")
@@ -353,7 +366,8 @@ class FluxPipeline(BasePipeline):
             logger.info(f"Image decoded in {time.time() - decode_start:.2f}s")
             logger.info(f"Total pipeline time: {time.time() - pipeline_start:.2f}s")
 
-        return MediaOutput(image=image)
+        timer.mark_end()
+        return timer.fill(PipelineOutput(image=image))
 
     def _encode_prompt(
         self,

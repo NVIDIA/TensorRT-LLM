@@ -213,13 +213,9 @@ class QuantConfig(StrictBaseModel):
             return False
 
     def _get_quant_cfg(self, module_name=None):
-        if self.exclude_modules is not None:
-            for exclude_module in self.exclude_modules:
-                if exclude_module == module_name or (
-                        exclude_module.endswith('*')
-                        and module_name.startswith(exclude_module[:-1])):
-                    return LayerQuantConfig(quant_algo=None,
-                                            quantized_layers={})
+        if (module_name is not None
+                and self.is_module_excluded_from_quantization(module_name)):
+            return LayerQuantConfig(quant_algo=None, quantized_layers={})
         return self
 
     def _get_modelopt_qformat(self):
@@ -253,17 +249,31 @@ class QuantConfig(StrictBaseModel):
     def is_module_excluded_from_quantization(self, name: str) -> bool:
         """Check if the module is excluded from quantization.
 
+        A module is excluded if its own name or any ancestor (split on
+        ``.``) matches an entry in ``exclude_modules`` via ``fnmatch`` or
+        a ``re:`` prefixed regex. The ancestor walk means listing a parent
+        module (without a glob suffix) implicitly excludes all of its
+        children.
+
         Args:
             name (str): The name of the module.
 
         Returns:
             bool: True if the module is excluded from quantization, False otherwise.
         """
-        if self.exclude_modules is not None:
+        if self.exclude_modules is None:
+            return False
+        candidate = name
+        while True:
             for exclude_module in self.exclude_modules:
-                if fnmatch.fnmatchcase(name, exclude_module):
+                if exclude_module.startswith("re:"):
+                    if re.fullmatch(exclude_module[3:], candidate):
+                        return True
+                elif fnmatch.fnmatchcase(candidate, exclude_module):
                     return True
-        return False
+            if '.' not in candidate:
+                return False
+            candidate = candidate.rsplit('.', 1)[0]
 
     # NOTE: this is kept for backward compatibility with external libraries (e.g., modelopt).
     # For new code, prefer directly using QuantConfig(**config) instead.

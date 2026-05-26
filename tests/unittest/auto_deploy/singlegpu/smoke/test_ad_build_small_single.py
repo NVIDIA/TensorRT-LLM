@@ -1,3 +1,17 @@
+# SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """Testing build_and_run_ad end2end."""
 
 import pytest
@@ -232,6 +246,8 @@ def _check_ad_config(experiment_config: ExperimentConfig, llm_args: LlmArgs):
             {
                 "transforms": {
                     "multi_stream_moe": {"stage": "compile", "enabled": True},
+                    # NOTE: trtllm attention backend fails on B200 (likely illegal memory access); use flashinfer.
+                    "insert_cached_attention": {"backend": "flashinfer"},
                     "insert_cached_ssm_attention": {"backend": "triton_ssm"},
                     # TODO: https://github.com/NVIDIA/TensorRT-LLM/issues/9878
                     "compile_model": {
@@ -247,8 +263,29 @@ def _check_ad_config(experiment_config: ExperimentConfig, llm_args: LlmArgs):
                 "transforms": {
                     "mlir_elementwise_fusion": {"enabled": True},
                     "multi_stream_moe": {"stage": "compile", "enabled": True},
+                    # Use flashinfer attention: trtllm backend does not support FP8 KV cache
+                    # with BF16 output currently.
+                    "insert_cached_attention": {"backend": "flashinfer"},
                     "insert_cached_ssm_attention": {"backend": "triton_ssm"},
                     "compile_model": {"backend": "torch-cudagraph"},
+                },
+            },
+        ),
+        # Smoke test for NVIDIA/TensorRT-LLM#13321 — exercises the piecewise
+        # CUDA graph + multi_stream_moe path.  Multi-stream passthroughs are
+        # no-op'd on the piecewise path via ``disable_multi_stream`` so the
+        # static segment capture is safe; decode batches still overlap via
+        # the monolithic CG path.
+        (
+            "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-FP8",
+            {
+                "compile_backend": "torch-cudagraph",
+                "transforms": {
+                    "mlir_elementwise_fusion": {"enabled": True},
+                    "multi_stream_moe": {"stage": "compile", "enabled": True},
+                    "insert_cached_attention": {"backend": "flashinfer"},
+                    "insert_cached_ssm_attention": {"backend": "triton_ssm"},
+                    "compile_model": {"piecewise_enabled": True},
                 },
             },
         ),

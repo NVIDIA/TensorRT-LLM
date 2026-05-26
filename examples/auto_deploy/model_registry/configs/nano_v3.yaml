@@ -52,3 +52,5 @@ transforms:
     enabled: true
   insert_cached_ssm_attention:
     backend: flashinfer_ssm
+  compile_model:
+    piecewise_enabled: true

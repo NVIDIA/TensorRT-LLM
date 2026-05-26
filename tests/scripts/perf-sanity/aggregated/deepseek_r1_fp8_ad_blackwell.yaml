@@ -1,0 +1,20 @@
+metadata:
+  model_name: deepseek_r1_0528_fp8
+  supported_gpus:
+  - B200
+hardware:
+  gpus_per_node: 8
+server_configs:
+  # 1k1k config - AutoDeploy backend, 8 GPUs (DeepSeek-R1 0528 FP8 on DGX B200)
+  - name: "r1_fp8_ad_ws8_1k1k"
+    model_name: "deepseek_r1_0528_fp8"
+    backend: "_autodeploy"
+    extra_llm_api_config_path: "examples/auto_deploy/model_registry/configs/deepseek-r1.yaml"
+    world_size: 8
+    client_configs:
+      - name: "con64_iter10_1k1k"
+        concurrency: 64
+        iterations: 10
+        isl: 1024
+        osl: 1024
+        backend: "openai"

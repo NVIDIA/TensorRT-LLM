@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020-2025, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2020-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -131,6 +131,36 @@ QKV_LAYOUT_FUNCTION(ContiguousKv)
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
+// Sparse attention types.
+enum class SparseType : int32_t
+{
+    None = 0,
+    StaticTokenSparse = 1,
+    DynamicTokenSparse = 2,
+};
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+// Helper functions to check the sparse attention type.
+
+#define SPARSE_TYPE_FUNCTION(SparseTypeName)                                                                           \
+    inline bool is##SparseTypeName(SparseType sparseType)                                                              \
+    {                                                                                                                  \
+        return (sparseType == SparseType::SparseTypeName);                                                             \
+    }
+
+SPARSE_TYPE_FUNCTION(StaticTokenSparse)
+SPARSE_TYPE_FUNCTION(DynamicTokenSparse)
+
+#undef SPARSE_TYPE_FUNCTION
+
+inline bool isTokenSparse(SparseType sparseType)
+{
+    return sparseType == SparseType::StaticTokenSparse || sparseType == SparseType::DynamicTokenSparse;
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
 enum class TileScheduler
 {
     // Static scheduler (Non-persistent).
@@ -199,6 +229,8 @@ struct TllmGenFmhaRunnerParams
     void const* vPtr;
     // Packed KV buffer
     void const* kvPtr;
+    // Base pointer for the DSv4 sparse MLA sliding-window KV pool.
+    void const* slidingWindowKvPoolBasePtr = nullptr;
     // Packed KV scaling factor buffer
     void const* kvSfPtr;
     // Packed QKV buffer
@@ -213,6 +245,8 @@ struct TllmGenFmhaRunnerParams
     int64_t* customMaskOffsetsPtr;
     // The first sparseMask offsets in the Kv sequence dimension.
     int32_t* firstSparseMaskOffsetsKvPtr;
+    // The variable sparse MLA topK lengths with shape [numTokensQ].
+    int32_t const* ptrSparseMlaTopKLens = nullptr;
     // The counter for the multiCtasKv mode.
     int32_t* multiCtasKvCounterPtr;
     // The sequence length buffer for K/V.
@@ -240,6 +274,11 @@ struct TllmGenFmhaRunnerParams
     void* oPtr;
     // The output scaling factor buffer.
     void* oSfPtr;
+    // SageAttention scaling factors for Q, K, P and V.
+    float const* sageAttnSfsQPtr = nullptr;
+    float const* sageAttnSfsKPtr = nullptr;
+    float const* sageAttnSfsPPtr = nullptr;
+    float const* sageAttnSfsVPtr = nullptr;
     // The sequence lengths for Q.
     int const* seqLensQPtr;
 
@@ -282,10 +321,10 @@ struct TllmGenFmhaRunnerParams
     int mSfStartTokenIdx;
     // Skip softmax threshold scale factor.
     float mSkipSoftmaxThresholdScaleFactor;
-    // Whether to use sparse MLA.
-    bool mSparseMla;
-    // The top k value for sparse MLA.
-    int mSparseMlaTopK;
+    // Sparse attention type.
+    SparseType mSparseAttention;
+    // The top k value for sparse attention.
+    int mSparseTopK;
     // The cuda stream.
     cudaStream_t stream;
     // The layer index.

@@ -1,4 +1,5 @@
 __pycache__/
+.mypy_cache/
 .vscode
 .cursor
 *.engine
@@ -64,12 +65,16 @@ docs/source/**/*.rst
 !docs/source/examples/index.rst
 !docs/source/_includes/note_sections.rst
 *.swp
+.nfs*
 
 # Testing
 .coverage.*
 results_trt/
 llm-test-workspace/
 ad-test-workspace/
+
+# FetchContent reference cache
+3rdparty/.cache_3rdparty/
 
 # build/debug
 *.safetensors
@@ -104,3 +109,8 @@ enroot/tensorrt_llm.devel.sqsh
 
 # MacOSX Files
 .DS_Store
+
+# Agent related files
+.claude/agent-memory/
+.claude/agent-tests/perf-test-sync/report.html
+.claude/agent-tests/perf-test-sync/results.json

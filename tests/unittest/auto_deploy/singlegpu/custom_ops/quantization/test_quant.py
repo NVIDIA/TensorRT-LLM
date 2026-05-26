@@ -1,3 +1,17 @@
+# SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 import pytest
 import torch
 import torch.nn.functional as F
@@ -20,7 +34,10 @@ INT4_BLOCK_SIZE = 128
 @pytest.mark.parametrize("N", [18, 28, 30, 32])
 @pytest.mark.parametrize("K", [16, 32])
 @pytest.mark.parametrize("bias", [True, False])
-@pytest.mark.skipif(not fp8_compatible(), reason="Requires fp8 support")
+@pytest.mark.skipif(
+    not (fp8_compatible() and trtllm_ops_available()),
+    reason="Requires fp8 support and TRT-LLM ops",
+)
 def test_fp8_linear(M, N, K, bias):
     if N % 16 != 0 or K % 16 != 0:
         pytest.skip("https://github.com/NVIDIA/TensorRT-LLM/issues/8811")
@@ -82,7 +99,11 @@ def test_fp4_linear():
 
 @pytest.mark.parametrize("input_dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("mat2_dtype", [torch.float16, torch.bfloat16])
-@pytest.mark.skipif(not fp8_compatible(), reason="Requires fp8 support")
+@pytest.mark.skipif(
+    not (fp8_compatible() and trtllm_ops_available()),
+    reason="Requires fp8 support and TRT-LLM ops (flashinfer bmm_fp8 cublasLt path "
+    "is only validated against the TRT-LLM torch build)",
+)
 def test_fp8_bmm(input_dtype, mat2_dtype):
     # Create test tensors: (B, M, K) and (B, K, N)
     batch_size, M, K, N = 2, 32, 64, 80

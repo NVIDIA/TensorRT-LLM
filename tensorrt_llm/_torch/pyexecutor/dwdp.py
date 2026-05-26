@@ -21,6 +21,9 @@ QUANT_SCALE_PARAMS = [
     "fc2_alpha",  # NVFP4 alpha
 ]
 
+# Default slice granularity for batched memcpy (2 MiB).
+MEMCPY_BATCH_SLICE_BYTES = 1 << 21
+
 
 _global_dwdp_manager: Optional["DwdpManager"] = None
 
@@ -259,6 +262,10 @@ class DwdpManager:
         self.dwdp_size = config.dwdp_size
         self.num_experts_per_worker = config.num_experts_per_worker
         self.num_groups = config.num_groups
+        self.use_batched_prefetch = config.contention_opt
+
+        if config.contention_opt:
+            global MEMCPY_BATCH_SLICE_BYTES
 
         self._init_dwdp_group()
 
@@ -267,6 +274,9 @@ class DwdpManager:
 
         # Prefetch buffer (initialized later in create_py_executor)
         self.prefetch_buffer: Optional[DwdpPrefetchBuffer] = None
+        # Batched prefetch copy plans are stable once peer handles and prefetch
+        # buffers are initialized, so cache them per layer to avoid host rebuild.
+        self.batched_prefetch_copy_plans: Dict[int, Tuple[List[int], List[int], List[int]]] = {}
         # Auto-detected from first add_layer() call
         self.first_moe_layer_idx: Optional[int] = None
 
@@ -392,6 +402,7 @@ class DwdpManager:
 
         Called in create_py_executor() after model loading.
         """
+        self.batched_prefetch_copy_plans.clear()
         self.prefetch_buffer = DwdpPrefetchBuffer(
             dwdp_size=self.dwdp_size,
             dwdp_rank=self.dwdp_rank,
@@ -527,6 +538,127 @@ class DwdpManager:
         src_offset = prefetch_start - peer_start
         return src_offset
 
+    def _build_batched_prefetch_copy_plan(
+        self,
+        layer_idx: int,
+        collector: DwdpLayerHandleCollector,
+        buffer_idx: int,
+    ) -> Tuple[List[int], List[int], List[int]]:
+        """
+        Build one batched memcpy plan for all remote peers in round-robin slice order.
+
+        Each remote buffer is split into MEMCPY_BATCH_SLICE_BYTES slices and
+        interleaved across peers so that copies to different source ranks alternate,
+        limiting NVLink contention on any single link.
+
+        Results are cached per layer_idx since peer pointers and buffer addresses
+        are stable after initialization.
+        """
+        cached = self.batched_prefetch_copy_plans.get(layer_idx)
+        if cached is not None:
+            return cached
+
+        dst_ptrs: List[int] = []
+        src_ptrs: List[int] = []
+        sizes: List[int] = []
+
+        for param_name, param_shape in collector.param_shapes.items():
+            param_dtype = collector.param_dtypes[param_name]
+            expert_size = param_shape.numel() * param_dtype.itemsize
+            data_size = self.num_prefetch_experts * expert_size
+
+            slice_offset = 0
+            while slice_offset < data_size:
+                slice_size = min(MEMCPY_BATCH_SLICE_BYTES, data_size - slice_offset)
+
+                # Round-robin across peers for this slice
+                for peer_offset in range(1, self.dwdp_size):
+                    peer_rank = (self.dwdp_rank + peer_offset) % self.dwdp_size
+                    src_expert_offset = self._get_prefetch_src_offset_from_peer(peer_rank)
+
+                    base_ptr = collector.get_peer_ptr(peer_rank, param_name)
+                    src_ptr = base_ptr + src_expert_offset * expert_size
+
+                    dst_tensor = self.prefetch_buffer.buffers[buffer_idx][param_name][peer_rank]
+                    if dst_tensor is None:
+                        raise RuntimeError(
+                            f"Missing prefetch buffer for peer_rank={peer_rank} param={param_name}"
+                        )
+                    dst_ptr = dst_tensor.data_ptr()
+
+                    dst_ptrs.append(dst_ptr + slice_offset)
+                    src_ptrs.append(src_ptr + slice_offset)
+                    sizes.append(slice_size)
+
+                slice_offset += slice_size
+
+        copy_plan = (dst_ptrs, src_ptrs, sizes)
+        self.batched_prefetch_copy_plans[layer_idx] = copy_plan
+        return copy_plan
+
+    def _prefetch_layer_default(
+        self,
+        layer_idx: int,
+        collector: DwdpLayerHandleCollector,
+        buffer_idx: int,
+    ):
+        """Original per-peer cudaMemcpyAsync prefetch path (baseline)."""
+        for peer_rank in range(self.dwdp_size):
+            if peer_rank == self.dwdp_rank:
+                continue
+
+            src_expert_offset = self._get_prefetch_src_offset_from_peer(peer_rank)
+
+            for param_name, param_shape in collector.param_shapes.items():
+                param_dtype = collector.param_dtypes[param_name]
+                expert_size = param_shape.numel() * param_dtype.itemsize
+
+                base_ptr = collector.get_peer_ptr(peer_rank, param_name)
+                src_ptr = base_ptr + src_expert_offset * expert_size
+
+                dst_tensor = self.prefetch_buffer.buffers[buffer_idx][param_name][peer_rank]
+                dst_ptr = dst_tensor.data_ptr()
+
+                data_size = self.num_prefetch_experts * expert_size
+
+                (err,) = cudart.cudaMemcpyAsync(
+                    dst_ptr,
+                    src_ptr,
+                    data_size,
+                    cudart.cudaMemcpyKind.cudaMemcpyDeviceToDevice,
+                    self.prefetch_buffer.prefetch_stream.cuda_stream,
+                )
+                check_cuda_error(
+                    err, f"prefetch layer {layer_idx} peer_rank {peer_rank} {param_name}"
+                )
+
+    def _prefetch_layer_batched(
+        self,
+        layer_idx: int,
+        collector: DwdpLayerHandleCollector,
+        buffer_idx: int,
+    ):
+        """Batched cudaMemcpyBatchAsync prefetch path (limited-contention opt)."""
+        dst_ptrs, src_ptrs, sizes = self._build_batched_prefetch_copy_plan(
+            layer_idx, collector, buffer_idx
+        )
+        if not dst_ptrs:
+            return
+
+        attr = cudart.cudaMemcpyAttributes()
+        attr.srcAccessOrder = cudart.cudaMemcpySrcAccessOrder.cudaMemcpySrcAccessOrderStream
+        (err,) = cudart.cudaMemcpyBatchAsync(
+            dst_ptrs,
+            src_ptrs,
+            sizes,
+            len(dst_ptrs),
+            [attr],
+            [0],
+            1,
+            self.prefetch_buffer.prefetch_stream.cuda_stream,
+        )
+        check_cuda_error(err, f"prefetch layer {layer_idx} batch")
+
     @nvtx_range("dwdp_prefetch_layer")
     def prefetch_layer(self, layer_idx: int, wait_compute_layer_idx: Optional[int] = None):
         """
@@ -541,45 +673,14 @@ class DwdpManager:
         Peer copy runs on prefetch stream.
         """
         moe_idx = layer_idx - self.first_moe_layer_idx
-        param_names = self.ipc_collectors[moe_idx].param_shapes.keys()
         collector = self.ipc_collectors[moe_idx]
         buffer_idx = layer_idx % self.prefetch_buffer.num_buffers
 
-        # Peer copy on prefetch stream
-        # Local weights are used directly - no local copy needed
         with torch.cuda.stream(self.prefetch_buffer.prefetch_stream):
-            # Wait for compute to complete before overwriting buffer
             if wait_compute_layer_idx is not None:
                 self.prefetch_buffer.wait_compute_event(wait_compute_layer_idx)
 
-            for peer_rank in range(self.dwdp_size):
-                if peer_rank == self.dwdp_rank:
-                    continue  # Skip local rank - local weights used directly
-
-                src_expert_offset = self._get_prefetch_src_offset_from_peer(peer_rank)
-
-                for param_name in param_names:
-                    param_shape = collector.param_shapes[param_name]
-                    param_dtype = collector.param_dtypes[param_name]
-                    expert_size = param_shape.numel() * param_dtype.itemsize
-
-                    # src_ptr points to peer's tensor start, add offset for specific experts
-                    base_ptr = collector.get_peer_ptr(peer_rank, param_name)
-                    src_ptr = base_ptr + src_expert_offset * expert_size
-
-                    # dst_tensor is directly indexed by peer_rank in the list
-                    dst_tensor = self.prefetch_buffer.buffers[buffer_idx][param_name][peer_rank]
-                    dst_ptr = dst_tensor.data_ptr()
-
-                    data_size = self.num_prefetch_experts * expert_size
-
-                    (err,) = cudart.cudaMemcpyAsync(
-                        dst_ptr,
-                        src_ptr,
-                        data_size,
-                        cudart.cudaMemcpyKind.cudaMemcpyDeviceToDevice,
-                        self.prefetch_buffer.prefetch_stream.cuda_stream,
-                    )
-                    check_cuda_error(
-                        err, f"prefetch layer {layer_idx} peer_rank {peer_rank} {param_name}"
-                    )
+            if self.use_batched_prefetch:
+                self._prefetch_layer_batched(layer_idx, collector, buffer_idx)
+            else:
+                self._prefetch_layer_default(layer_idx, collector, buffer_idx)

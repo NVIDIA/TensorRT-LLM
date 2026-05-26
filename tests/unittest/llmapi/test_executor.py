@@ -345,8 +345,7 @@ def test_abort_on_GenerationResultBase():
 
 
 def test_abort_on_DetokenizedGenerationResultBase():
-    """DetokenizedGenerationResultBase inherits abort() so postprocess workers
-    can call it without AttributeError (NVBug 5955173)."""
+    """DetokenizedGenerationResultBase inherits abort() so postprocess workers can call it without AttributeError (NVBug 5955173)."""
     sampling_params = SamplingParams(max_tokens=4)
     result = DetokenizedGenerationResultBase(id=1,
                                              sampling_params=sampling_params)
@@ -359,8 +358,7 @@ def test_abort_on_DetokenizedGenerationResultBase():
 
 
 def test_PostprocWorker_Output_should_abort():
-    """PostprocWorker.Output carries should_abort flag for worker-to-main-thread
-    abort signal propagation."""
+    """PostprocWorker.Output carries should_abort flag for worker-to-main-thread abort signal propagation."""
     out_default = PostprocWorker.Output(client_id=0, res=None, is_final=False)
     assert out_default.should_abort is False
 
@@ -372,8 +370,7 @@ def test_PostprocWorker_Output_should_abort():
 
 
 def test_handle_response_propagates_should_abort():
-    """When a PostprocWorker.Output has should_abort=True, _handle_response
-    on the main-thread GenerationResult calls abort() (NVBug 5955173)."""
+    """When a PostprocWorker.Output has should_abort=True, _handle_response on the main-thread GenerationResult calls abort() (NVBug 5955173)."""
     sampling_params = SamplingParams(max_tokens=4)
     result = GenerationResultBase(id=1, sampling_params=sampling_params)
     assert not result.aborted()
@@ -385,6 +382,35 @@ def test_handle_response_propagates_should_abort():
     result._handle_response(output)
     assert result.aborted()
     assert result._outputs[0]._postprocess_result == "mock_sse_data"
+
+
+def test_PostprocWorker_Output_tracing_fields():
+    """PostprocWorker.Output carries finish_reason and num_generated_tokens for
+    tracing on the num_postprocess_workers > 0 path. Both fields are optional
+    and default to None when not populated by the worker."""
+    out = PostprocWorker.Output(client_id=0, res=None, is_final=False)
+    assert out.finish_reason is None
+    assert out.num_generated_tokens is None
+
+
+def test_handle_response_postproc_nonstreaming_propagates_metadata():
+    """On the non-streaming path (res is not CompletionOutput), finish_reason and
+    token_ids are set on _outputs[0] from the PostprocWorker.Output fields."""
+    sampling_params = SamplingParams(max_tokens=10)
+    result = GenerationResultBase(id=1, sampling_params=sampling_params)
+
+    output = PostprocWorker.Output(
+        client_id=1,
+        res="mock_sse_data",  # non-streaming: res is not a CompletionOutput
+        is_final=True,
+        finish_reason="stop",
+        num_generated_tokens=5,
+    )
+    result._handle_response(output)
+
+    assert result._done
+    assert result._outputs[0].finish_reason == "stop"
+    assert len(result._outputs[0].token_ids) == 5
 
 
 def _ZeroMqQueue_sync_sync_task(addr: str):
@@ -550,8 +576,7 @@ def test_ResponsePostprocessWorker():
 
 
 def test_get_params_for_first_rsp_returns_disaggregated_params_once():
-    """Verify _get_params_for_first_rsp extracts disaggregated_params from
-    the GenerationResult on the first call and returns None after.
+    """Verify _get_params_for_first_rsp extracts disaggregated_params from the GenerationResult on the first call and returns None after.
 
     Regression test for https://nvbugs/5991957.
     """

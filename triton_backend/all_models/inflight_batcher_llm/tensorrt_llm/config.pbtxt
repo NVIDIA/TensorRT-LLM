@@ -206,8 +206,15 @@ input [
     optional: true
   },
   {
+    name: "prompt_ignore_length"
+    data_type: TYPE_INT32
+    dims: [ 1 ]
+    reshape: { shape: [ ] }
+    optional: true
+  },
+  {
     name: "early_stopping"
-    data_type: TYPE_BOOL
+    data_type: TYPE_INT32
     dims: [ 1 ]
     reshape: { shape: [ ] }
     optional: true
@@ -677,13 +684,6 @@ parameters: {
   key: "kv_cache_host_memory_bytes"
   value: {
     string_value: "${kv_cache_host_memory_bytes}"
-  }
-}
-# kv_cache_onboard_blocks is for internal implementation.
-parameters: {
-  key: "kv_cache_onboard_blocks"
-  value: {
-    string_value: "${kv_cache_onboard_blocks}"
   }
 }
 # enable_trt_overlap is an experimental feature used with CUDA Graph Mode.

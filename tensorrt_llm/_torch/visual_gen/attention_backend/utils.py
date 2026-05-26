@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -25,6 +25,7 @@ from typing import Optional, Type
 import torch
 
 from tensorrt_llm.models.modeling_utils import QuantConfig
+from tensorrt_llm.visual_gen.args import AttentionConfig
 
 from .interface import AttentionBackend
 
@@ -77,6 +78,8 @@ def create_attention(
     dtype: Optional[torch.dtype] = None,
     max_batch_size: int = 16,
     max_seq_len: int = 4096,
+    attention_config: Optional[AttentionConfig] = None,
+    attention_metadata_state: Optional[dict] = None,
     **kwargs,
 ) -> AttentionBackend:
     """
@@ -97,12 +100,29 @@ def create_attention(
             will automatically reallocate if larger batches are encountered.
         max_seq_len: Initial sequence length for metadata pre-allocation. The backend
             will automatically reallocate if longer sequences are encountered.
+        attention_config: Optional AttentionConfig; quant_attention_config is
+            extracted and forwarded to the TRTLLM backend when present.
+        attention_metadata_state: Optional model-scoped metadata state from
+            visual-gen config. Required for TRTLLM backend.
         **kwargs: Additional backend-specific arguments
 
     Returns:
         AttentionBackend instance
     """
     attn_cls = get_visual_gen_attention_backend(backend)
+
+    # Extract quant_attention_config from AttentionConfig and pass to TRTLLM backend.
+    # AttentionConfig validation disables unsupported recipes by normalizing
+    # quant_attention_config to None.
+    if attention_config is not None and attention_config.quant_attention_config is not None:
+        kwargs["quant_attention_config"] = attention_config.quant_attention_config
+    if backend.upper() == "TRTLLM":
+        if attention_metadata_state is None:
+            raise ValueError(
+                "TRTLLM backend requires `attention_metadata_state` from "
+                "DiffusionModelConfig; creation path must not allocate metadata implicitly."
+            )
+        kwargs["attention_metadata_state"] = attention_metadata_state
 
     return attn_cls(
         layer_idx=layer_idx,

@@ -1,4 +1,9 @@
-# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+# Copyright 2018 The HuggingFace Team
+# Licensed under the Apache License, Version 2.0.
+# Original source: https://github.com/huggingface/transformers
+#
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 
 """Slimmed down PyTorch Kimi-K2.5 model implementation for auto_deploy export.
 
@@ -38,8 +43,8 @@ from transformers.generation import GenerationMixin
 from transformers.modeling_utils import PreTrainedModel
 from transformers.utils import ModelOutput
 
-from tensorrt_llm._torch.auto_deploy.models.hf import AutoModelForCausalLMFactory
-from tensorrt_llm._torch.utils import ActivationType
+from ..._compat import ActivationType
+from ..hf import AutoModelForCausalLMFactory
 
 # =============================================================================
 # Configuration
@@ -859,7 +864,7 @@ class KimiK2ForCausalLM(KimiK2PreTrainedModel, GenerationMixin):
       model.embed_tokens, model.layers.*, model.norm, lm_head
     """
 
-    _tied_weights_keys = ["lm_head.weight"]
+    _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
 
     def __init__(self, config, **kwargs):
         super().__init__(config)

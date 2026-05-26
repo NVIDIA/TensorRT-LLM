@@ -1,3 +1,17 @@
+# SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 from unittest.mock import MagicMock, patch
 
 import pydantic
@@ -37,6 +51,14 @@ def test_custom_values():
     assert args.max_seq_len == 2048
     # backend should be overridden if it was 'TRTLLM'
     assert args.transforms["insert_cached_attention"]["backend"] == "flashinfer"
+
+
+def test_requires_uniform_kv_caches_follows_attention_backend():
+    """TRTLLM requires stricter KV cache compatibility than FlashInfer."""
+    assert LlmArgs(model="test-model", attn_backend="TRTLLM").requires_uniform_kv_caches is True
+    assert (
+        LlmArgs(model="test-model", attn_backend="flashinfer").requires_uniform_kv_caches is False
+    )
 
 
 # ================================
@@ -177,6 +199,41 @@ def test_parallel_config_validation(parallel_field, invalid_value):
         ValueError, match="AutoDeploy only supports parallelization via the `world_size` argument."
     ):
         LlmArgs(**kwargs)
+
+
+# ================================
+# Speculative Config Validation
+# ================================
+
+
+class TestSpeculativeConfigValidation:
+    """AutoDeploy only supports Eagle3 one-model and MTP-Eagle one-model speculative decoding.
+
+    Verify that supported speculative modes are accepted and configured before executor setup.
+    """
+
+    def test_accepts_eagle_one_model(self):
+        from tensorrt_llm.llmapi import EagleDecodingConfig
+
+        spec_config = EagleDecodingConfig(
+            max_draft_len=3,
+            speculative_model="some/model",
+            eagle3_one_model=True,
+        )
+        # Should not raise.
+        args = LlmArgs(model="test-model", speculative_config=spec_config)
+        assert args.model_factory == "eagle_one_model"
+
+    def test_accepts_mtp_eagle_one_model(self):
+        from tensorrt_llm.llmapi import MTPDecodingConfig
+
+        spec_config = MTPDecodingConfig(
+            num_nextn_predict_layers=3,
+            mtp_eagle_one_model=True,
+        )
+        # Should not raise.
+        args = LlmArgs(model="test-model", speculative_config=spec_config)
+        assert args.model_factory == "eagle_one_model"
 
 
 # ================================

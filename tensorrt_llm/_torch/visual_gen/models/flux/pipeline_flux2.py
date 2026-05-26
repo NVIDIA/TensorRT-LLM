@@ -35,11 +35,13 @@ from transformers import (
     Mistral3ForConditionalGeneration,
 )
 
-from tensorrt_llm._torch.visual_gen.config import PipelineComponent
-from tensorrt_llm._torch.visual_gen.output import MediaOutput
+from tensorrt_llm._torch.visual_gen.cache.teacache import (
+    ExtractorConfig,
+    register_extractor_from_config,
+)
+from tensorrt_llm._torch.visual_gen.output import CudaPhaseTimer, PipelineOutput
 from tensorrt_llm._torch.visual_gen.pipeline import BasePipeline
-from tensorrt_llm._torch.visual_gen.pipeline_registry import register_pipeline
-from tensorrt_llm._torch.visual_gen.teacache import ExtractorConfig, register_extractor_from_config
+from tensorrt_llm._torch.visual_gen.pipeline_registry import PipelineComponent, register_pipeline
 from tensorrt_llm.logger import logger
 
 from .transformer_flux2 import Flux2Transformer2DModel
@@ -87,7 +89,11 @@ def format_input(prompts: List[str], system_message: str) -> List[List[dict]]:
     ]
 
 
-@register_pipeline("Flux2Pipeline")
+@register_pipeline(
+    "Flux2Pipeline",
+    hf_ids=["black-forest-labs/FLUX.2-dev"],
+    doc="Black Forest Labs FLUX.2 family (text-to-image).",
+)
 class Flux2Pipeline(BasePipeline):
     """FLUX.2 Text-to-Image Pipeline.
 
@@ -119,7 +125,7 @@ class Flux2Pipeline(BasePipeline):
             and model_config.visual_gen_mapping.cfg_size != 1
         ):
             raise ValueError(
-                "Flux2Pipeline does not support CFG parallelism. Please set dit_cfg_size to 1."
+                "Flux2Pipeline does not support CFG parallelism. Please set cfg_size to 1."
             )
 
         super().__init__(model_config)
@@ -319,27 +325,29 @@ class Flux2Pipeline(BasePipeline):
                 )
             )
 
-            # Enable TeaCache with FLUX.2-specific polynomial coefficients
-            self._setup_teacache(self.transformer, FLUX2_TEACACHE_COEFFICIENTS)
+            # TeaCache or Cache-DiT
+            self._setup_cache_acceleration(self.transformer, FLUX2_TEACACHE_COEFFICIENTS)
 
-    DEFAULT_GENERATION_PARAMS = {
-        "height": 1024,
-        "width": 1024,
-        "num_inference_steps": 50,
-        "guidance_scale": 3.5,
-        "max_sequence_length": 512,
-    }
+    @property
+    def default_generation_params(self):
+        return {
+            "height": 1024,
+            "width": 1024,
+            "num_inference_steps": 50,
+            "guidance_scale": 3.5,
+            "max_sequence_length": 512,
+        }
 
     def infer(self, req):
         """Run inference from DiffusionRequest."""
         return self.forward(
             prompt=req.prompt,
-            height=req.height,
-            width=req.width,
-            num_inference_steps=req.num_inference_steps,
-            guidance_scale=req.guidance_scale,
-            seed=req.seed,
-            max_sequence_length=req.max_sequence_length,
+            height=req.params.height,
+            width=req.params.width,
+            num_inference_steps=req.params.num_inference_steps,
+            guidance_scale=req.params.guidance_scale,
+            seed=req.params.seed,
+            max_sequence_length=req.params.max_sequence_length,
         )
 
     @torch.inference_mode()
@@ -367,9 +375,11 @@ class Flux2Pipeline(BasePipeline):
             max_sequence_length: Maximum text sequence length
 
         Returns:
-            MediaOutput with image tensor (B, H, W, C).
+            PipelineOutput with image tensor (B, H, W, C).
         """
         pipeline_start = time.time()
+        timer = CudaPhaseTimer()
+        timer.mark_pre_start()
 
         # Determine batch size
         if isinstance(prompt, str):
@@ -403,6 +413,7 @@ class Flux2Pipeline(BasePipeline):
         else:
             self.scheduler.set_timesteps(sigmas=sigmas.tolist(), device=self.device, mu=mu)
         timesteps = self.scheduler.timesteps
+        self.scheduler.set_begin_index(0)
 
         # Prepare guidance (only for variants with guidance_embeds=True)
         guidance = None
@@ -426,6 +437,7 @@ class Flux2Pipeline(BasePipeline):
                 return_dict=False,
             )[0]
 
+        timer.mark_denoise_start()
         latents = self.denoise(
             latents=latents,
             scheduler=self.scheduler,
@@ -434,6 +446,7 @@ class Flux2Pipeline(BasePipeline):
             forward_fn=forward_fn,
             timesteps=timesteps,
         )
+        timer.mark_post_start()
 
         # Decode
         logger.info("Decoding image...")
@@ -444,7 +457,8 @@ class Flux2Pipeline(BasePipeline):
             logger.info(f"Image decoded in {time.time() - decode_start:.2f}s")
             logger.info(f"Total pipeline time: {time.time() - pipeline_start:.2f}s")
 
-        return MediaOutput(image=image)
+        timer.mark_end()
+        return timer.fill(PipelineOutput(image=image))
 
     def _encode_prompt(
         self,
