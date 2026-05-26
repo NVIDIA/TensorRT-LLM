@@ -22,7 +22,13 @@ import pytest
 from tensorrt_llm._torch.disaggregation.base.transfer import TokenRange
 from tensorrt_llm._torch.disaggregation.native.transfer import Sender
 from tensorrt_llm._torch.disaggregation.resource.cache_reuse import CacheReuseAdapter
-from tensorrt_llm._torch.disaggregation.resource.page import AttentionLayerGroup
+from tensorrt_llm._torch.disaggregation.resource.page import (
+    BUFFER_ENTRY_DTYPE,
+    AttentionLayerGroup,
+    PhysicalPool,
+    PhysicalPoolGroup,
+    PoolView,
+)
 from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
 
 # ---------------------------------------------------------------------------
@@ -200,6 +206,116 @@ class TestCreateKvSliceTokenRange:
         kv_slice = transceiver._create_kv_slice(req, token_range=explicit)
 
         assert kv_slice.token_range is explicit
+
+    def test_explicit_token_range_slices_blocks_by_ordinal(self):
+        tokens_per_block = 8
+        layer_group = AttentionLayerGroup(pool_group_idx=0, kv_head_num_per_rank=1)
+        block_ids = np.arange(8, dtype=np.int64)
+        reuse_adapter = SimpleNamespace(
+            tokens_per_block=tokens_per_block,
+            get_cached_token_count_per_layer_group=lambda req, layer_groups: [0],
+            get_block_ids=lambda req, idx, lg: block_ids,
+        )
+        transceiver = object.__new__(KvCacheTransceiverV2)
+        transceiver._reuse_adapter = reuse_adapter
+        transceiver._page_table = SimpleNamespace(layer_groups=[layer_group])
+        transceiver._kv_cache_manager = SimpleNamespace(num_extra_kv_tokens=0)
+        req = SimpleNamespace(
+            prompt_len=64,
+            py_request_id=0,
+            is_generation_only_request=lambda: False,
+        )
+
+        kv_slice = transceiver._create_kv_slice(req, token_range=TokenRange(start=16, end=40))
+
+        np.testing.assert_array_equal(kv_slice.block_ids_per_layer_groups[0], [2, 3, 4])
+
+    def test_generation_cache_skip_is_relative_to_range_start(self):
+        tokens_per_block = 8
+        layer_group = AttentionLayerGroup(pool_group_idx=0, kv_head_num_per_rank=1)
+        block_ids = np.arange(8, dtype=np.int64)
+        reuse_adapter = SimpleNamespace(
+            tokens_per_block=tokens_per_block,
+            get_cached_token_count_per_layer_group=lambda req, layer_groups: [32],
+            get_block_ids=lambda req, idx, lg: block_ids,
+        )
+        transceiver = object.__new__(KvCacheTransceiverV2)
+        transceiver._reuse_adapter = reuse_adapter
+        transceiver._page_table = SimpleNamespace(layer_groups=[layer_group])
+        transceiver._kv_cache_manager = SimpleNamespace(num_extra_kv_tokens=0)
+        req = SimpleNamespace(
+            prompt_len=64,
+            py_request_id=0,
+            is_generation_only_request=lambda: True,
+        )
+
+        kv_slice = transceiver._create_kv_slice(req, token_range=TokenRange(start=16, end=64))
+
+        np.testing.assert_array_equal(kv_slice.block_ids_per_layer_groups[0], [4, 5, 6, 7])
+
+    def test_debug_rejects_negative_page_id_in_active_swa_range(self, monkeypatch):
+        monkeypatch.setenv("TRTLLM_DEBUG_KV_SLICE", "1")
+        tokens_per_block = 8
+        layer_group = AttentionLayerGroup(
+            pool_group_idx=0, kv_head_num_per_rank=1, sliding_window_size=24
+        )
+        block_ids = np.array([10, -1, 20, 21], dtype=np.int64)
+        reuse_adapter = SimpleNamespace(
+            tokens_per_block=tokens_per_block,
+            get_cached_token_count_per_layer_group=lambda req, layer_groups: [0],
+            get_block_ids=lambda req, idx, lg: block_ids,
+        )
+        transceiver = object.__new__(KvCacheTransceiverV2)
+        transceiver._reuse_adapter = reuse_adapter
+        transceiver._page_table = SimpleNamespace(layer_groups=[layer_group])
+        transceiver._kv_cache_manager = SimpleNamespace(num_extra_kv_tokens=0)
+        req = SimpleNamespace(
+            prompt_len=32,
+            py_request_id=0,
+            is_generation_only_request=lambda: False,
+        )
+
+        with pytest.raises(RuntimeError, match="Invalid KV transfer block ids"):
+            transceiver._create_kv_slice(req)
+
+    def test_debug_rejects_positive_page_id_outside_pool(self, monkeypatch):
+        monkeypatch.setenv("TRTLLM_DEBUG_KV_SLICE", "1")
+        tokens_per_block = 8
+        layer_group = AttentionLayerGroup(
+            pool_group_idx=0,
+            kv_head_num_per_rank=1,
+            pool_views=[
+                PoolView(
+                    pool_idx=0,
+                    buffer_entries=np.array([], dtype=BUFFER_ENTRY_DTYPE),
+                )
+            ],
+        )
+        block_ids = np.array([0, 1, 5, 2], dtype=np.int64)
+        reuse_adapter = SimpleNamespace(
+            tokens_per_block=tokens_per_block,
+            get_cached_token_count_per_layer_group=lambda req, layer_groups: [0],
+            get_block_ids=lambda req, idx, lg: block_ids,
+        )
+        transceiver = object.__new__(KvCacheTransceiverV2)
+        transceiver._reuse_adapter = reuse_adapter
+        transceiver._page_table = SimpleNamespace(
+            layer_groups=[layer_group],
+            pool_groups=[
+                PhysicalPoolGroup(
+                    pools=[PhysicalPool(base_address=0, slot_bytes=1, num_slots=3)]
+                )
+            ],
+        )
+        transceiver._kv_cache_manager = SimpleNamespace(num_extra_kv_tokens=0)
+        req = SimpleNamespace(
+            prompt_len=32,
+            py_request_id=0,
+            is_generation_only_request=lambda: False,
+        )
+
+        with pytest.raises(RuntimeError, match="Out-of-range KV transfer block ids"):
+            transceiver._create_kv_slice(req)
 
 
 # ---------------------------------------------------------------------------

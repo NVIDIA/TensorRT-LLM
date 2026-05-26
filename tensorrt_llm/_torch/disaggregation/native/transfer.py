@@ -61,6 +61,70 @@ LlmRequestType = tensorrt_llm.bindings.internal.batch_manager.LlmRequestType
 KV_TRANSFER_NUM_THREADS = int(os.environ.get("TRTLLM_KV_TRANSFER_NUM_THREADS", "1"))
 
 
+def _debug_transfer_region_checks_enabled() -> bool:
+    value = os.environ.get("TRTLLM_DEBUG_KV_TRANSFER_REGION")
+    if value is None:
+        value = os.environ.get("TRTLLM_DEBUG_KV_SLICE", "0")
+    return value.lower() not in ("", "0", "false", "no", "off")
+
+
+def _get_transfer_pool(page_table, layer_group_id: int, pool_idx: int):
+    layer_group = page_table.layer_groups[layer_group_id]
+    pool_view = layer_group.pool_views[pool_idx]
+    return page_table.pool_groups[layer_group.pool_group_idx].pools[pool_view.pool_idx]
+
+
+def _validate_transfer_region_ids(
+    region_ids: np.ndarray,
+    page_table,
+    layer_group_id: int,
+    pool_idx: int,
+    side: str,
+    unique_rid: int,
+    slice_id: int,
+) -> None:
+    if not _debug_transfer_region_checks_enabled() or region_ids.size == 0:
+        return
+    pool = _get_transfer_pool(page_table, layer_group_id, pool_idx)
+    bad = (region_ids < 0) | (region_ids >= pool.num_slots)
+    if np.any(bad):
+        offsets = np.flatnonzero(bad)[:8].tolist()
+        values = region_ids[bad][:8].tolist()
+        raise RuntimeError(
+            f"Invalid KV transfer {side} region ids: rid={unique_rid}, "
+            f"slice={slice_id}, layer_group={layer_group_id}, pool={pool_idx}, "
+            f"num_slots={pool.num_slots}, bad_offsets={offsets}, bad_values={values}"
+        )
+
+
+def _validate_transfer_region_ptrs(
+    ptrs: np.ndarray,
+    bytes_per_region: int,
+    page_table,
+    layer_group_id: int,
+    pool_idx: int,
+    side: str,
+    unique_rid: int,
+    slice_id: int,
+) -> None:
+    if not _debug_transfer_region_checks_enabled() or ptrs.size == 0:
+        return
+    pool = _get_transfer_pool(page_table, layer_group_id, pool_idx)
+    begin = int(pool.base_address)
+    end = begin + int(pool.slot_bytes) * int(pool.num_slots)
+    region_bytes = int(bytes_per_region)
+    bad = (ptrs < begin) | (ptrs + region_bytes > end)
+    if np.any(bad):
+        offsets = np.flatnonzero(bad)[:8].tolist()
+        values = ptrs[bad][:8].tolist()
+        raise RuntimeError(
+            f"Invalid KV transfer {side} mapped ptrs: rid={unique_rid}, "
+            f"slice={slice_id}, layer_group={layer_group_id}, pool={pool_idx}, "
+            f"pool_range=[{begin}, {end}), bytes_per_region={region_bytes}, "
+            f"bad_offsets={offsets}, bad_ptrs={values}"
+        )
+
+
 @dataclass
 class RecvReqInfo:
     sender_req_id: int
@@ -717,6 +781,25 @@ class Sender(SenderBase):
                     tokens_per_block=tpb,
                 )
 
+                _validate_transfer_region_ids(
+                    src_block_ids,
+                    extractor.page_table,
+                    self_lg,
+                    self_pi,
+                    "src",
+                    task._unique_rid,
+                    task.slice_id,
+                )
+                _validate_transfer_region_ids(
+                    dst_block_ids,
+                    peer_extractor.page_table,
+                    peer_lg,
+                    peer_pi,
+                    "dst",
+                    task._unique_rid,
+                    task.slice_id,
+                )
+
                 src_region = extractor.extract(
                     src_block_ids, layer_group_id=self_lg, pool_idx=self_pi
                 )
@@ -727,6 +810,26 @@ class Sender(SenderBase):
                 region_pair = mapper.map(src_region, dst_region)
                 region_pairs = region_pair if isinstance(region_pair, list) else [region_pair]
                 for rp in region_pairs:
+                    _validate_transfer_region_ptrs(
+                        rp.src.memory.ptrs,
+                        rp.src.memory.bytes_per_region,
+                        extractor.page_table,
+                        self_lg,
+                        self_pi,
+                        "src",
+                        task._unique_rid,
+                        task.slice_id,
+                    )
+                    _validate_transfer_region_ptrs(
+                        rp.dst.memory.ptrs,
+                        rp.dst.memory.bytes_per_region,
+                        peer_extractor.page_table,
+                        peer_lg,
+                        peer_pi,
+                        "dst",
+                        task._unique_rid,
+                        task.slice_id,
+                    )
                     src_frag_parts.append(rp.src.memory.ptrs)
                     dst_frag_parts.append(rp.dst.memory.ptrs)
                     size_specs.append((rp.src.memory.ptrs.size, rp.src.memory.bytes_per_region))
