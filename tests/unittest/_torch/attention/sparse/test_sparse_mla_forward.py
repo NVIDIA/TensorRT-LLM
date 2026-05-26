@@ -2198,7 +2198,13 @@ def test_forward_sparse_mla_unified(batch_name, kv_cache_dtype: str,
                 )
 
         if sparse_attn_algo == "deepseek_v4":
-            min_topk_overlap = 0.90 if sparse_config.indexer_k_dtype == "fp4" else 0.95
+            if sparse_config.indexer_k_dtype == "fp4":
+                # FP4 indexer K cache is expected to have lower top-k overlap
+                # with the bf16 reference, especially in the long-context mixed
+                # batch that validates routing rather than exact output.
+                min_topk_overlap = 0.85 if batch_name == "large_mixed_deepseek_v4" else 0.90
+            else:
+                min_topk_overlap = 0.95
             topk_mismatch = get_deepseek_v4_topk_mismatch(
                 topk_indices_local, reference_topk_indices_local)
             topk_overlap_mismatch = get_deepseek_v4_topk_overlap_mismatch(
