@@ -435,13 +435,13 @@ def _logic_cfg2_ring2_ulysses2(rank, world_size):
     assert vgm.cp_group is not None
     assert vgm.ring_group is not None
     assert vgm.ulysses_group is not None
-    assert vgm.seq_group is not None
+    assert vgm.seq_group() is not None
 
     assert dist.get_world_size(vgm.cfg_group) == 2
     assert dist.get_world_size(vgm.cp_group) == 2
     assert dist.get_world_size(vgm.ring_group) == 2
     assert dist.get_world_size(vgm.ulysses_group) == 2
-    assert dist.get_world_size(vgm.seq_group) == 4
+    assert dist.get_world_size(vgm.seq_group()) == 4
 
     device = torch.device(f"cuda:{rank}")
     one = torch.ones(1, device=device)
@@ -459,7 +459,7 @@ def _logic_cfg2_ring2_ulysses2(rank, world_size):
     assert x.item() == 2.0, f"Rank {rank}: ulysses all_reduce expected 2, got {x.item()}"
 
     x = one.clone()
-    dist.all_reduce(x, group=vgm.seq_group)
+    dist.all_reduce(x, group=vgm.seq_group())
     assert x.item() == 4.0, f"Rank {rank}: seq all_reduce expected 4, got {x.item()}"
 
 
@@ -488,7 +488,7 @@ def _logic_attn2d_seq_rank_matches_global_rank(rank, world_size):
 
     device = torch.device(f"cuda:{rank}")
     tensor = torch.ones(1, device=device)
-    dist.all_reduce(tensor, group=vgm.seq_group)
+    dist.all_reduce(tensor, group=vgm.seq_group())
     assert tensor.item() == float(world_size), (
         f"Rank {rank}: seq_group all_reduce expected sum={world_size}"
     )

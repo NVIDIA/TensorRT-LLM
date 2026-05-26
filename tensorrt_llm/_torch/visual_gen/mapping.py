@@ -264,6 +264,8 @@ class VisualGenMapping(DeviceMeshTopologyImpl):
                     "Create a mesh cache keyed by (dim_names, dim_sizes) or reset "
                     "DeviceMeshTopologyImpl.device_mesh before constructing a different topology."
                 )
+            if self._use_attn2d_plane:
+                self._attach_attn2d_groups_from_device_mesh()
             return
 
         shape = tuple(self._dim_sizes[d] for d in self._dim_names)
@@ -351,8 +353,7 @@ class VisualGenMapping(DeviceMeshTopologyImpl):
         if len(cfg_coords) > 1:
             raise NotImplementedError(
                 f"vae_ranks={self._vae_ranks} straddle CFG groups "
-                f"(cfg coordinates={sorted(cfg_coords)}) under "
-                f"order='{_DEVICE_MESH_DIM_ORDER}'. "
+                f"(cfg coordinates={sorted(cfg_coords)}) under order='{self._dim_names}'. "
                 "VAE ranks must share a single CFG group, or span the full world. "
                 "_vae_ranks is currently hardcoded to list(range(parallel_vae_size)), "
                 "which only lands in one CFG group when 'cfg' is the outermost axis "

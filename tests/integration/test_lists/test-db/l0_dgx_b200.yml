@@ -52,12 +52,12 @@ l0_dgx_b200:
   - unittest/_torch/visual_gen/multi_gpu
   - unittest/_torch/visual_gen/test_flux_pipeline.py::TestFluxParallelism::test_ulysses_2gpu_correctness
   - unittest/_torch/visual_gen/test_flux_pipeline.py::TestFluxCombinedOptimizations::test_all_optimizations_combined
-  - examples/test_visual_gen.py::test_wan22_t2v_lpips_against_golden[single_gpu]
-  - examples/test_visual_gen.py::test_wan22_t2v_lpips_against_golden[ulysses4]
-  - examples/test_visual_gen.py::test_wan22_t2v_lpips_against_golden[cfg2_ulysses2]
-  - examples/test_visual_gen.py::test_wan22_t2v_lpips_against_golden[ulysses2_ring2]
-  - examples/test_visual_gen.py::test_wan22_t2v_lpips_against_golden[attn2d_2x1_ulysses2]
-  - examples/test_visual_gen.py::test_wan22_t2v_lpips_against_golden[attn2d_2x2]
+  - examples/test_visual_gen.py::test_wan22_t2v_lpips_against_golden
+  - examples/test_visual_gen_multi_gpu.py::test_wan22_t2v_lpips_against_golden_multi_gpu[ulysses4]
+  - examples/test_visual_gen_multi_gpu.py::test_wan22_t2v_lpips_against_golden_multi_gpu[cfg2_ulysses2]
+  - examples/test_visual_gen_multi_gpu.py::test_wan22_t2v_lpips_against_golden_multi_gpu[ulysses2_ring2]
+  - examples/test_visual_gen_multi_gpu.py::test_wan22_t2v_lpips_against_golden_multi_gpu[attn2d_2x1_ulysses2]
+  - examples/test_visual_gen_multi_gpu.py::test_wan22_t2v_lpips_against_golden_multi_gpu[attn2d_2x2]
 - condition:
     ranges:
       system_gpu_count:
@@ -173,9 +173,9 @@ l0_dgx_b200:
   - accuracy/test_disaggregated_serving.py::TestNemotron3Super120B::test_ctx_dp2_gen_tp4 TIMEOUT (60)
   - accuracy/test_disaggregated_serving.py::TestQwen3NextInstruct::test_auto_dtype[use_py_transceiver=True] TIMEOUT (60)
   - accuracy/test_disaggregated_serving.py::TestQwen3NextInstruct::test_auto_dtype[use_py_transceiver=False] TIMEOUT (60)
-  - examples/test_visual_gen.py::test_wan22_t2v_lpips_against_golden[cfg2_ulysses4]
-  - examples/test_visual_gen.py::test_wan22_t2v_lpips_against_golden[cfg2_ulysses2_ring2]
-  - examples/test_visual_gen.py::test_wan22_t2v_lpips_against_golden[attn2d_2x2_ulysses2]
+  - examples/test_visual_gen_multi_gpu.py::test_wan22_t2v_lpips_against_golden_multi_gpu[cfg2_ulysses4]
+  - examples/test_visual_gen_multi_gpu.py::test_wan22_t2v_lpips_against_golden_multi_gpu[cfg2_ulysses2_ring2]
+  - examples/test_visual_gen_multi_gpu.py::test_wan22_t2v_lpips_against_golden_multi_gpu[attn2d_2x2_ulysses2]
 - condition:
     ranges:
       system_gpu_count:
@@ -218,9 +218,9 @@ l0_dgx_b200:
   - accuracy/test_llm_api_pytorch.py::TestMistralLarge3_675B::test_fp8[latency_moe_deepgemm] TIMEOUT (60)
   - accuracy/test_llm_api_pytorch.py::TestNemotronV3Super::test_nvfp4_parallelism[TP8_PP1] TIMEOUT (60)
   - test_e2e.py::test_deepseek_r1_mtp_bench TIMEOUT(60) # Cover https://nvbugs/5670108
-  - examples/test_visual_gen.py::test_wan22_t2v_lpips_against_golden[cfg2_ulysses4]
-  - examples/test_visual_gen.py::test_wan22_t2v_lpips_against_golden[cfg2_ulysses2_ring2]
-  - examples/test_visual_gen.py::test_wan22_t2v_lpips_against_golden[attn2d_2x2_ulysses2]
+  - examples/test_visual_gen_multi_gpu.py::test_wan22_t2v_lpips_against_golden_multi_gpu[cfg2_ulysses4]
+  - examples/test_visual_gen_multi_gpu.py::test_wan22_t2v_lpips_against_golden_multi_gpu[cfg2_ulysses2_ring2]
+  - examples/test_visual_gen_multi_gpu.py::test_wan22_t2v_lpips_against_golden_multi_gpu[attn2d_2x2_ulysses2]
 - condition:
     ranges:
       system_gpu_count:
@@ -321,12 +321,12 @@ l0_dgx_b200:
   - examples/test_visual_gen.py::test_flux2_lpips_against_golden
   - examples/test_visual_gen.py::test_ltx2_lpips_against_golden
   - examples/test_visual_gen.py::test_wan21_t2v_lpips_against_golden
-  - examples/test_visual_gen.py::test_wan22_t2v_lpips_against_golden[single_gpu]
-  - examples/test_visual_gen.py::test_wan22_t2v_lpips_against_golden[ulysses4]
-  - examples/test_visual_gen.py::test_wan22_t2v_lpips_against_golden[cfg2_ulysses2]
-  - examples/test_visual_gen.py::test_wan22_t2v_lpips_against_golden[ulysses2_ring2]
-  - examples/test_visual_gen.py::test_wan22_t2v_lpips_against_golden[attn2d_2x1_ulysses2]
-  - examples/test_visual_gen.py::test_wan22_t2v_lpips_against_golden[attn2d_2x2]
+  - examples/test_visual_gen.py::test_wan22_t2v_lpips_against_golden
+  - examples/test_visual_gen_multi_gpu.py::test_wan22_t2v_lpips_against_golden_multi_gpu[ulysses4]
+  - examples/test_visual_gen_multi_gpu.py::test_wan22_t2v_lpips_against_golden_multi_gpu[cfg2_ulysses2]
+  - examples/test_visual_gen_multi_gpu.py::test_wan22_t2v_lpips_against_golden_multi_gpu[ulysses2_ring2]
+  - examples/test_visual_gen_multi_gpu.py::test_wan22_t2v_lpips_against_golden_multi_gpu[attn2d_2x1_ulysses2]
+  - examples/test_visual_gen_multi_gpu.py::test_wan22_t2v_lpips_against_golden_multi_gpu[attn2d_2x2]
   - examples/test_visual_gen.py::test_vbench_dimension_score_wan
   - examples/test_visual_gen.py::test_vbench_dimension_score_wan22_a14b_fp8
   - examples/test_visual_gen.py::test_vbench_dimension_score_wan22_a14b_nvfp4

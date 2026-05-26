@@ -128,7 +128,7 @@ class LTX2Attention(Attention):
             fuse_qk_norm_rope=True,
             config=config,
             layer_idx=layer_idx,
-            enable_ulysses=enable_ulysses,
+            enable_sequence_parallel=enable_ulysses,
         )
 
         # Build a runtime-toggleable Ulysses ↔ plain pair.

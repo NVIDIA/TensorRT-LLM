@@ -83,21 +83,6 @@ WAN22_LPIPS_NUM_INFERENCE_STEPS = 4
 WAN22_LPIPS_GUIDANCE_SCALE = 4.0
 WAN22_LPIPS_SEED = 42
 WAN22_LPIPS_FRAME_RATE = 16.0
-WAN22_LPIPS_PARALLEL_VARIANTS = [
-    ("single_gpu", {}),
-    ("ulysses4", {"dit_ulysses_size": 4}),
-    ("cfg2_ulysses2", {"dit_cfg_size": 2, "dit_ulysses_size": 2}),
-    ("ulysses2_ring2", {"dit_ulysses_size": 2, "dit_ring_size": 2}),
-    ("attn2d_2x1_ulysses2", {"dit_attn2d_row_size": 2, "dit_ulysses_size": 2}),
-    ("attn2d_2x2", {"dit_attn2d_row_size": 2, "dit_attn2d_col_size": 2}),
-    ("cfg2_ulysses4", {"dit_cfg_size": 2, "dit_ulysses_size": 4}),
-    ("cfg2_ulysses2_ring2", {"dit_cfg_size": 2, "dit_ulysses_size": 2, "dit_ring_size": 2}),
-    (
-        "attn2d_2x2_ulysses2",
-        {"dit_attn2d_row_size": 2, "dit_attn2d_col_size": 2, "dit_ulysses_size": 2},
-    ),
-]
-
 # LTX-2 configuration
 LTX2_MODEL_CHECKPOINT_PATH = "LTX-2/ltx-2-19b-dev.safetensors"
 LTX2_TEXT_ENCODER_SUBPATH = "gemma-3-12b-it"
@@ -341,18 +326,6 @@ def _skip_if_missing(path, label, is_dir=False):
         pytest.skip(f"{label} not found: {path}")
 
 
-def _skip_if_insufficient_gpus_for_parallel(parallel):
-    from tensorrt_llm._torch.visual_gen.config import ParallelConfig
-
-    parallel_cfg = ParallelConfig(**parallel)
-    required = parallel_cfg.total_parallel_size
-    available = torch.cuda.device_count()
-    if available < required:
-        pytest.skip(
-            f"Insufficient GPUs for parallel={parallel}: requires {required}, available {available}"
-        )
-
-
 def _extract_visual_gen_lpips_golden_media(tmp_path):
     _skip_if_missing(VISUAL_GEN_LPIPS_GOLDEN_MEDIA_ZIP, "VisualGen LPIPS golden media zip")
     extract_dir = tmp_path / "visual_gen_lpips_golden_media"
@@ -554,9 +527,8 @@ def _generate_ltx2_lpips_video(output_path):
     _save_lpips_video_mp4(generated_video, output_path, frame_rate=LTX2_T2V_FRAME_RATE)
 
 
-def _generate_wan_lpips_video(
+def _run_wan_lpips_pipeline(
     model_path,
-    output_path,
     prompt,
     negative_prompt,
     height,
@@ -565,7 +537,6 @@ def _generate_wan_lpips_video(
     num_inference_steps,
     guidance_scale,
     seed,
-    frame_rate,
     parallel=None,
 ):
     from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineLoader
@@ -575,7 +546,7 @@ def _generate_wan_lpips_video(
     args_kwargs = dict(
         model=model_path,
         compilation_config=CompilationConfig(skip_warmup=True),
-        torch_compile_config=TorchCompileConfig(enable_torch_compile=False),
+        torch_compile_config=TorchCompileConfig(enable=False),
     )
     if parallel is not None:
         args_kwargs["parallel"] = parallel
@@ -593,11 +564,41 @@ def _generate_wan_lpips_video(
                 guidance_scale=guidance_scale,
                 seed=seed,
             )
-        generated_video = result.video.detach().cpu()
+        if result is None or result.video is None:
+            return None
+        return result.video.detach().cpu()
     finally:
         del pipeline
         _cleanup_cuda()
 
+
+def _generate_wan_lpips_video(
+    model_path,
+    output_path,
+    prompt,
+    negative_prompt,
+    height,
+    width,
+    num_frames,
+    num_inference_steps,
+    guidance_scale,
+    seed,
+    frame_rate,
+    parallel=None,
+):
+    generated_video = _run_wan_lpips_pipeline(
+        model_path,
+        prompt,
+        negative_prompt,
+        height,
+        width,
+        num_frames,
+        num_inference_steps,
+        guidance_scale,
+        seed,
+        parallel=parallel,
+    )
+    assert generated_video is not None, "Single-GPU Wan LPIPS run produced no video"
     _save_lpips_video_mp4(generated_video, output_path, frame_rate=frame_rate)
 
 
@@ -686,14 +687,8 @@ def test_wan21_t2v_lpips_against_golden(tmp_path):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-@pytest.mark.parametrize(
-    "variant_name,parallel",
-    WAN22_LPIPS_PARALLEL_VARIANTS,
-    ids=[name for name, _ in WAN22_LPIPS_PARALLEL_VARIANTS],
-)
-def test_wan22_t2v_lpips_against_golden(tmp_path, variant_name, parallel):
-    _skip_if_insufficient_gpus_for_parallel(parallel)
-    generated_path = tmp_path / f"wan22_t2v_generated_{variant_name}.mp4"
+def test_wan22_t2v_lpips_against_golden(tmp_path):
+    generated_path = tmp_path / "wan22_t2v_generated.mp4"
     golden_path = _golden_media_path(
         tmp_path, "wan22_t2v_lpips_golden_video.mp4", "Wan 2.2 LPIPS golden video"
     )
@@ -709,11 +704,10 @@ def test_wan22_t2v_lpips_against_golden(tmp_path, variant_name, parallel):
         WAN22_LPIPS_GUIDANCE_SCALE,
         WAN22_LPIPS_SEED,
         WAN22_LPIPS_FRAME_RATE,
-        parallel=parallel,
     )
     score = _run_lpips_eval(
         tmp_path,
-        f"wan22_t2v_{variant_name}",
+        "wan22_t2v",
         "video",
         WAN22_LPIPS_PROMPT,
         golden_path,
