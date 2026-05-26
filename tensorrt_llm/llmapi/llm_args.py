@@ -1719,7 +1719,13 @@ class MTPDecodingConfig(DecodingBaseConfig):
 
     @property
     def num_capture_layers(self) -> int:
-        return 1 if self.spec_dec_mode.is_mtp_eagle() else 0
+        # MTP_EAGLE and MTP_EAGLE_ONE_MODEL both capture the target model's
+        # last hidden layer (see Eagle3OneModelSpecMetadata.__post_init__);
+        # the shared Eagle3ResourceManager must allocate hidden_states with
+        # matching column count.
+        mode = self.spec_dec_mode
+        return 1 if (mode.is_mtp_eagle()
+                     or mode.is_mtp_eagle_one_model()) else 0
 
     @property
     def spec_dec_mode(self):
