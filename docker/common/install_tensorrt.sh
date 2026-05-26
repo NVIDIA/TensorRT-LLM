@@ -3,19 +3,23 @@
 set -ex
 
 TRT_VER="10.16.1.11"
-# Align with the pre-installed cuDNN / cuBLAS / NCCL versions from
+# TensorRT / cuDNN / cuBLAS / NCCL versions stay aligned with the pre-installed
+# packages from the 26.04 PyTorch base image:
 # https://docs.nvidia.com/deeplearning/frameworks/pytorch-release-notes/rel-26-04.html#rel-26-04
-CUDA_VER="13.2" # 13.2.1
+CUDA_VER="13.2" # 13.2.1 — used for TensorRT URL and libcublas package suffix
 # Keep the installation for cuDNN if users want to install PyTorch with source codes.
 # PyTorch 2.x can compile with cuDNN v9.
 CUDNN_VER="9.21.0.82-1"
 NCCL_VER="2.29.7-1+cuda13.2"
 CUBLAS_VER="13.4.0.1-1"
-# Align with the pre-installed CUDA / NVCC / NVRTC versions from
+# NVRTC and CUDA runtime/driver are intentionally pinned to CUDA 13.1.1 so they
+# match the toolkit reinstalled by install_cuda_toolkit.sh (downgrade from the
+# 26.04 image's 13.2.x to the 26.02 stack 13.1.1). Versions follow
 # https://docs.nvidia.com/cuda/cuda-toolkit-release-notes/index.html
-NVRTC_VER="13.2.78-1"
-CUDA_RUNTIME="13.2.75-1"
-CUDA_DRIVER_VERSION="595.58.03-1.el8"
+NVRTC_CUDA_VER="13.1"
+NVRTC_VER="13.1.115-1"
+CUDA_RUNTIME="13.1.80-1"
+CUDA_DRIVER_VERSION="590.48.01-1.el8"
 
 for i in "$@"; do
     case $i in
@@ -30,8 +34,8 @@ for i in "$@"; do
 done
 
 NVCC_VERSION_OUTPUT=$(nvcc --version)
-if [[ $(echo $NVCC_VERSION_OUTPUT | grep -oP "\d+\.\d+" | head -n 1) != ${CUDA_VER} ]]; then
-  echo "The version of pre-installed CUDA is not equal to ${CUDA_VER}."
+if [[ $(echo $NVCC_VERSION_OUTPUT | grep -oP "\d+\.\d+" | head -n 1) != ${NVRTC_CUDA_VER} ]]; then
+  echo "The version of pre-installed CUDA is not equal to ${NVRTC_CUDA_VER}."
 fi
 
 install_ubuntu_requirements() {
@@ -64,7 +68,7 @@ install_ubuntu_requirements() {
     fi
 
     CUBLAS_CUDA_VERSION=$(echo $CUDA_VER | sed 's/\./-/g')
-    NVRTC_CUDA_VERSION=$(echo $CUDA_VER | sed 's/\./-/g')
+    NVRTC_CUDA_VERSION=$(echo $NVRTC_CUDA_VER | sed 's/\./-/g')
 
     apt-get install -y --no-install-recommends \
         libcudnn9-cuda-13=${CUDNN_VER} \
@@ -82,17 +86,20 @@ install_ubuntu_requirements() {
 
 install_rockylinux_requirements() {
     CUBLAS_CUDA_VERSION=$(echo $CUDA_VER | sed 's/\./-/g')
+    NVRTC_CUDA_VERSION=$(echo $NVRTC_CUDA_VER | sed 's/\./-/g')
 
     ARCH=$(uname -m)
     if [ "$ARCH" = "x86_64" ];then ARCH1="x86_64" && ARCH2="x64" && ARCH3=$ARCH1;fi
     if [ "$ARCH" = "aarch64" ];then ARCH1="aarch64" && ARCH2="aarch64sbsa" && ARCH3="sbsa";fi
 
-    # Download and install packages
+    # cuda-compat and cuda-toolkit-config-common are tied to the reinstalled
+    # CUDA toolkit (13.1.1), so they use NVRTC_CUDA_VERSION. libcublas is kept
+    # at the 26.04 stack version, so it uses CUBLAS_CUDA_VERSION.
     for pkg in \
         "libnccl-${NCCL_VER}.${ARCH1}" \
         "libnccl-devel-${NCCL_VER}.${ARCH1}" \
-        "cuda-compat-${CUBLAS_CUDA_VERSION}-${CUDA_DRIVER_VERSION}.${ARCH1}" \
-        "cuda-toolkit-${CUBLAS_CUDA_VERSION}-config-common-${CUDA_RUNTIME}.noarch" \
+        "cuda-compat-${NVRTC_CUDA_VERSION}-${CUDA_DRIVER_VERSION}.${ARCH1}" \
+        "cuda-toolkit-${NVRTC_CUDA_VERSION}-config-common-${CUDA_RUNTIME}.noarch" \
         "cuda-toolkit-13-config-common-${CUDA_RUNTIME}.noarch" \
         "cuda-toolkit-config-common-${CUDA_RUNTIME}.noarch" \
         "libcublas-${CUBLAS_CUDA_VERSION}-${CUBLAS_VER}.${ARCH1}" \
@@ -107,8 +114,8 @@ install_rockylinux_requirements() {
     dnf -y install \
         libnccl-${NCCL_VER}.${ARCH1}.rpm \
         libnccl-devel-${NCCL_VER}.${ARCH1}.rpm \
-        cuda-compat-${CUBLAS_CUDA_VERSION}-${CUDA_DRIVER_VERSION}.${ARCH1}.rpm \
-        cuda-toolkit-${CUBLAS_CUDA_VERSION}-config-common-${CUDA_RUNTIME}.noarch.rpm \
+        cuda-compat-${NVRTC_CUDA_VERSION}-${CUDA_DRIVER_VERSION}.${ARCH1}.rpm \
+        cuda-toolkit-${NVRTC_CUDA_VERSION}-config-common-${CUDA_RUNTIME}.noarch.rpm \
         cuda-toolkit-13-config-common-${CUDA_RUNTIME}.noarch.rpm \
         cuda-toolkit-config-common-${CUDA_RUNTIME}.noarch.rpm \
         libcublas-${CUBLAS_CUDA_VERSION}-${CUBLAS_VER}.${ARCH1}.rpm \
