@@ -1087,7 +1087,8 @@ def collectTestResults(pipeline, testFilter)
                     // No need to fail the stage if the duration file generation fails.
                     echo "An error occurred while generating or uploading the duration file: ${e.toString()}"
                 }
-                if (currentBuild.currentResult == 'SUCCESS') {
+                // if (currentBuild.currentResult == 'SUCCESS') {
+                if (true) {
                     // Mark the stage UNSTABLE (yellow) on any failure inside this block.
                     catchError(
                         buildResult: 'SUCCESS',
