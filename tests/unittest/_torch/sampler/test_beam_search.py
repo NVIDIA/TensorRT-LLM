@@ -609,6 +609,125 @@ def test_beam_search_sampling_batch_basic():
                 torch.tensor(predecessor_beam, dtype=torch.int32))
 
 
+def test_beam_search_sampling_batch_disagg_handoff():
+    """Test context-first disagg beam handoff seeds gen-side beam scores."""
+
+    test_params = GeneralTestParams()
+    batch_size = test_params.batch_size
+    beam_width = test_params.beam_width
+    vocab_size = test_params.vocab_size
+    max_batch_size = test_params.max_batch_size
+    prompt_len = test_params.prompt_len
+    temperature = 1.0
+
+    seq_slots = torch.arange(
+        batch_size, dtype=torch.int64) + (max_batch_size - batch_size) // 2
+    seq_offsets = torch.arange(max_batch_size, dtype=torch.int64) * beam_width
+    beam_idx_arange = torch.arange(beam_width, dtype=torch.int32)
+
+    def make_metadata(seq_len: int) -> BeamSearchMetadata:
+        return BeamSearchMetadata(
+            cache_indirection=torch.zeros(
+                (max_batch_size, beam_width, prompt_len + 2),
+                dtype=torch.int32),
+            cache_indirection_buffer=torch.full(
+                (max_batch_size, beam_width, prompt_len + 2),
+                -1,
+                dtype=torch.int32),
+            cum_log_probs=torch.zeros((max_batch_size, beam_width),
+                                      dtype=torch.float32),
+            seq_slots=seq_slots,
+            seq_lens=torch.full((batch_size, ), seq_len, dtype=torch.int32),
+            finished_beams=torch.zeros((max_batch_size, beam_width),
+                                       dtype=torch.int32),
+            new_log_probs=torch.zeros((max_batch_size, beam_width),
+                                      dtype=torch.float32),
+            predecessor_beams=torch.zeros((max_batch_size, beam_width),
+                                          dtype=torch.int32),
+            seq_offsets=seq_offsets,
+            beam_idx_arange=beam_idx_arange,
+        )
+
+    torch.manual_seed(43)
+    context_logits = torch.randn((batch_size, vocab_size), dtype=torch.float32)
+    generation_logits = torch.randn((batch_size * beam_width, vocab_size),
+                                    dtype=torch.float32)
+    for req_idx in range(batch_size):
+        context_logits[req_idx, req_idx * beam_width:req_idx * beam_width +
+                       beam_width] += torch.tensor([8.0, 7.0, 1.0])
+        for beam_idx in range(beam_width):
+            row = req_idx * beam_width + beam_idx
+            generation_logits[row, 10 + beam_idx] += 4.0 + beam_idx
+
+    # Baseline: one continuous request. Context produces first beams, then
+    # generation continues with beam_width input beams.
+    continuous_metadata = make_metadata(prompt_len)
+    first_tokens, _ = beam_search_sampling_batch(
+        logits=context_logits,
+        beam_width_in=1,
+        beam_width_out=beam_width,
+        beam_search_args=continuous_metadata,
+        temperature=temperature,
+        return_probs=False,
+    )
+    first_gen_cum_log_probs = continuous_metadata.cum_log_probs[
+        seq_slots, :beam_width].clone()
+    assert first_tokens.shape == (batch_size, beam_width)
+
+    continuous_metadata.seq_lens = torch.full((batch_size, ),
+                                             prompt_len + 1,
+                                             dtype=torch.int32)
+    continuous_next_tokens, _ = beam_search_sampling_batch(
+        logits=generation_logits,
+        beam_width_in=beam_width,
+        beam_width_out=beam_width,
+        beam_search_args=continuous_metadata,
+        temperature=temperature,
+        return_probs=False,
+    )
+    continuous_cum_log_probs = continuous_metadata.cum_log_probs[
+        seq_slots, :beam_width].clone()
+    continuous_new_log_probs = continuous_metadata.new_log_probs[
+        seq_slots, :beam_width].clone()
+    continuous_predecessor_beams = continuous_metadata.predecessor_beams[
+        seq_slots, :beam_width].clone()
+
+    # Disaggregated generation starts from reset sampler buffers, then seeds
+    # the first-token cumulative beam scores transferred from context.
+    disagg_metadata = make_metadata(prompt_len + 1)
+    disagg_metadata.cum_log_probs[seq_slots, :beam_width] = first_gen_cum_log_probs
+    disagg_next_tokens, _ = beam_search_sampling_batch(
+        logits=generation_logits,
+        beam_width_in=beam_width,
+        beam_width_out=beam_width,
+        beam_search_args=disagg_metadata,
+        temperature=temperature,
+        return_probs=False,
+    )
+
+    torch.testing.assert_close(disagg_next_tokens, continuous_next_tokens)
+    torch.testing.assert_close(disagg_metadata.cum_log_probs[
+        seq_slots, :beam_width], continuous_cum_log_probs)
+    torch.testing.assert_close(disagg_metadata.new_log_probs[
+        seq_slots, :beam_width], continuous_new_log_probs)
+    torch.testing.assert_close(disagg_metadata.predecessor_beams[
+        seq_slots, :beam_width], continuous_predecessor_beams)
+
+    # This is the regression guard for disagg: if gen-side cum_log_probs remain
+    # reset after receiving first_gen_tokens, the next step is scored incorrectly.
+    unseeded_metadata = make_metadata(prompt_len + 1)
+    beam_search_sampling_batch(
+        logits=generation_logits,
+        beam_width_in=beam_width,
+        beam_width_out=beam_width,
+        beam_search_args=unseeded_metadata,
+        temperature=temperature,
+        return_probs=False,
+    )
+    assert not torch.allclose(unseeded_metadata.cum_log_probs[
+        seq_slots, :beam_width], continuous_cum_log_probs)
+
+
 def create_default_request(test_params: GeneralTestParams) -> LlmRequest:
     sampling_params = SamplingParams(n=test_params.beam_width,
                                      best_of=test_params.beam_width,
