@@ -14,6 +14,7 @@
 # limitations under the License.
 """Eagle3 one-model dynamic tree speculative decoding."""
 
+import math
 from typing import TYPE_CHECKING, Optional
 
 import torch
@@ -69,6 +70,38 @@ def _resample_final_tokens(
     topk_score_indices = torch.sort(topk_score_indices).values
     real_draft_tokens = torch.gather(history_tokens, dim=1, index=topk_score_indices)
     return real_draft_tokens, topk_score_indices
+
+
+@torch.compile(options={"max-autotune": True})
+def _build_mask_and_position(
+    parent_mask: torch.Tensor,
+    selected_parents: torch.Tensor,
+    tree_mask_init: torch.Tensor,
+    previous_position_offsets: torch.Tensor,
+    K: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Fused mask + position offset build for draft steps 1+."""
+    batch_size, num_tokens_previous_layer, _ = parent_mask.shape
+    num_tokens_current_layer = num_tokens_previous_layer + K
+    parent_mask_selected = torch.gather(
+        parent_mask[:, -K:, :],
+        1,
+        selected_parents.unsqueeze(-1).expand(batch_size, K, num_tokens_previous_layer),
+    )
+    padding = parent_mask.new_zeros(batch_size, num_tokens_previous_layer, num_tokens_current_layer)
+    bottom = torch.cat([parent_mask_selected, tree_mask_init], dim=2)
+    current_mask = torch.cat([padding, bottom], dim=1)
+    new_positions = torch.cat(
+        [previous_position_offsets, previous_position_offsets[:, -K:] + 1], dim=1
+    )
+    return current_mask, new_positions
+
+
+@torch.compile(options={"max-autotune": True})
+def _gather_parent_hs(hs_write_buffer: torch.Tensor, read_idx: torch.Tensor) -> torch.Tensor:
+    """Fused gather of parent hidden states."""
+    hs_dim = hs_write_buffer.shape[2]
+    return torch.gather(hs_write_buffer, 1, read_idx.unsqueeze(-1).expand(-1, -1, hs_dim))
 
 
 @triton.jit
@@ -173,13 +206,13 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
 
         # Pre-allocated 2D buffers
         self.draft_tokens_buffer = torch.zeros(
-            max_batch_size, loop_max_tokens, dtype=torch.int64, device="cuda"
+            max_batch_size, loop_max_tokens, dtype=torch.int32, device="cuda"
         )
         self.position_ids_buffer = torch.zeros(
-            max_batch_size, loop_max_tokens, dtype=torch.int64, device="cuda"
+            max_batch_size, loop_max_tokens, dtype=torch.int32, device="cuda"
         )
         self.history_draft_tokens_buffer = torch.zeros(
-            (max_batch_size, (K + K * K * (max_draft_len - 1))), dtype=torch.int64, device="cuda"
+            (max_batch_size, (K + K * K * (max_draft_len - 1))), dtype=torch.int32, device="cuda"
         )
         self.history_score_buffer = torch.zeros(
             (max_batch_size, K + K * K * (max_draft_len - 1)), dtype=torch.float32, device="cuda"
@@ -210,7 +243,7 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
         )
 
         self._accept_token = torch.zeros(
-            max_batch_size, max_draft_len + 1, dtype=torch.int64, device="cuda"
+            max_batch_size, max_draft_len + 1, dtype=torch.int32, device="cuda"
         )
         self._last_selected_parents = None
         self._kv_head_dim_bytes = None
@@ -246,30 +279,22 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
             max_batch_size * tokens_per_gen_step, dtype=torch.int64, device="cuda"
         )
         self._candidates_buf = torch.zeros(
+            max_batch_size, tokens_per_gen_step, dtype=torch.int32, device="cuda"
+        )
+        self._rejection_candidates_buf = torch.zeros(
             max_batch_size, tokens_per_gen_step, dtype=torch.int64, device="cuda"
         )
         self._target_predict_buf = torch.zeros(
-            max_batch_size, tokens_per_gen_step, dtype=torch.int64, device="cuda"
+            max_batch_size, tokens_per_gen_step, dtype=torch.int32, device="cuda"
         )
-
         # Step 0 input buffers
         max_total_tokens = max_batch_size * tokens_per_gen_step
-        self._step0_input_ids_buf = torch.zeros(max_total_tokens, dtype=torch.int64, device="cuda")
+        self._step0_input_ids_buf = torch.zeros(max_total_tokens, dtype=torch.int32, device="cuda")
         self._step0_position_ids_buf = torch.zeros(
-            max_total_tokens, dtype=torch.int64, device="cuda"
+            max_total_tokens, dtype=torch.int32, device="cuda"
         )
         self._step0_hidden_states_buf = None
         self._gather_ids_buf = torch.zeros(max_total_tokens, dtype=torch.long, device="cuda")
-        self._current_mask_buf = torch.zeros(
-            max_batch_size,
-            loop_max_tokens,
-            loop_max_tokens,
-            dtype=torch.int32,
-            device="cuda",
-        )
-        self._new_pos_offset_buf = torch.zeros(
-            max_batch_size, loop_max_tokens, dtype=torch.int32, device="cuda"
-        )
 
         # Mask repack scratch (graph-safe; avoids .contiguous() in the draft loop).
         buf_dim = max(self.max_total_draft_tokens + 1, K * max_draft_len)
@@ -278,7 +303,7 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
             max_batch_size * buf_dim * mask_width, dtype=torch.int32, device="cuda"
         )
 
-        # sm≥100 (except 120/121): prepareCustomMask keeps padded 3D; no 1D repack.
+        # sm>=100 (except 120/121): prepareCustomMask keeps padded 3D; no 1D repack.
         sm = get_sm_version()
         self._needs_mask_repack = sm < 100 or sm in (120, 121)
 
@@ -303,18 +328,28 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
         )
 
     def _repack_mask_padded_to_packed(self, mask_buf, n_req, n_tok):
-        """XQA indexes mask flat via cuQSeqLens; padded [n_req, buf_dim, maskW] has
-        batch stride buf_dim*maskW, so when n_tok < buf_dim and n_req > 1 packed
-        reads are wrong. Copy [:n_req,:n_tok] through scratch into flat prefix."""
+        """XQA indexes mask flat via cuQSeqLens with per-request stride
+        n_tok * ceil(n_tok/32) (C++ sets mPackedMaskMaxSeqLenQ from
+        spec_decoding_position_offsets_cpp.sizes()[1]).
+        The padded buffer is [n_req, buf_dim, ceil(buf_dim/32)] with a
+        larger row stride, so when n_tok < buf_dim and n_req > 1 packed
+        reads see misaligned rows. Copy the meaningful
+        [:n_req, :n_tok, :ceil(n_tok/32)] sub-block through scratch into
+        the compact flat prefix that XQA expects."""
         buf_dim = mask_buf.shape[1]
         if n_tok >= buf_dim or n_req <= 1:
             return
-        mask_width = mask_buf.shape[2]
+        mask_width = math.ceil(n_tok / 32)
         total_elems = n_req * n_tok * mask_width
         scratch = self._mask_repack_buf[:total_elems].view(n_req, n_tok, mask_width)
-        scratch.copy_(mask_buf[:n_req, :n_tok, :])
+        scratch.copy_(mask_buf[:n_req, :n_tok, :mask_width])
         flat = mask_buf.view(-1)
         flat[:total_elems] = scratch.view(-1)
+
+    def _apply_spec_metadata(self, attn_metadata, batch_size, query_len):
+        """Set spec-dec gen lengths and refresh the C++ position-offset view."""
+        attn_metadata.spec_decoding_generation_lengths[:batch_size] = query_len
+        attn_metadata.update_position_offsets_for_cpp(query_len)
 
     @nvtx_range("eagle3_dyn._ensure_spec_tree_manager")
     def _ensure_spec_tree_manager(self, resource_manager):
@@ -566,24 +601,21 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
 
         # Step-0 causal spec-dec (None in prefill-only warmup).
         if attn_metadata.spec_decoding_generation_lengths is not None:
-            # Gen kernel uses base data_ptr (no num_contexts offset); fill rows [:num_gens].
-            attn_metadata.spec_decoding_generation_lengths[:num_gens].fill_(num_step0_tokens)
-
-            # Position stride num_step0_tokens matches C++ generation_input_length.
-            pos_2d = attn_metadata.spec_decoding_position_offsets[
-                : num_gens * num_step0_tokens
-            ].view(num_gens, num_step0_tokens)
-            pos_2d[:] = self._causal_offs[:num_step0_tokens]
-
-            attn_metadata.spec_decoding_packed_mask[:num_gens].fill_(0)
-            attn_metadata.spec_decoding_packed_mask[:num_gens, :num_step0_tokens, 0] = (
-                self._step0_causal_mask[:num_step0_tokens]
+            total = num_gens * num_step0_tokens
+            dst = attn_metadata.spec_decoding_position_offsets[:total].view(
+                num_gens, num_step0_tokens
             )
-            # Packed flat for cuQSeqLens when _needs_mask_repack; else keep padded layout.
+            dst.copy_(self._causal_offs[:num_step0_tokens].unsqueeze(0).expand(num_gens, -1))
+            self._apply_spec_metadata(attn_metadata, num_gens, num_step0_tokens)
+
+            # Hopper XQA needs packed 1D mask; Blackwell expects padded 3D.
+            packed_mask = attn_metadata.spec_decoding_packed_mask
+            packed_mask[:num_gens].zero_()
+            packed_mask[:num_gens, :num_step0_tokens, 0] = self._step0_causal_mask[
+                :num_step0_tokens
+            ]
             if self._needs_mask_repack:
-                self._repack_mask_padded_to_packed(
-                    attn_metadata.spec_decoding_packed_mask, num_gens, num_step0_tokens
-                )
+                self._repack_mask_padded_to_packed(packed_mask, num_gens, num_step0_tokens)
 
         attn_metadata.use_spec_decoding = num_gens > 0
 
@@ -649,11 +681,7 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
                 inp_hs = self._accumulated_hs[:batch_size, :num_tokens_per_req, :].reshape(
                     num_infer_tokens, -1
                 )
-                inp_ids = (
-                    self.draft_tokens_buffer[:batch_size, :num_tokens_per_req]
-                    .reshape(-1)
-                    .to(torch.int32)
-                )
+                inp_ids = self.draft_tokens_buffer[:batch_size, :num_tokens_per_req].reshape(-1)
                 inp_pos = self.position_ids_buffer[:batch_size, :num_tokens_per_req].reshape(-1)
                 inputs = {
                     "input_ids": inp_ids,
@@ -718,7 +746,8 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
             self._topk_score_indices_buf[:num_gens].copy_(topk_score_indices[num_contexts:])
 
         if spec_tree_manager is not None:
-            # Gen-only; spec-dec batch is [:num_gens] (not num_contexts-offset).
+            # Build into contiguous work buffers indexed by bid (0..num_gens-1).
+            # Cannot use slotIds because padded dummies share dummy_slot_id.
             self.tree_ops_converter.build_dynamic_tree(
                 history_draft_tokens_parent_buffer=self.history_draft_tokens_parent_buffer[
                     num_contexts:batch_size
@@ -732,12 +761,11 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
                 use_packed_mask=True,
             )
 
-            # Scatter only gen trees to stable slot storage
-            gen_slots = spec_tree_manager._all_slot_ids_buf[num_contexts:batch_size]
-            spec_tree_manager.scatter_trees_to_slots(gen_slots, num_gens)
-            spec_tree_manager.mark_tree_valid(gen_slots, num_gens)
+            slot_storage = spec_tree_manager.slot_storage
+            gen_slots = slot_storage.all_ids_buf[num_contexts:batch_size]
+            spec_tree_manager.scatter_to_slot_storage(slot_storage, gen_slots, num_gens)
 
-        return real_draft_tokens.to(torch.int32)
+        return real_draft_tokens
 
     def _sample_and_accept_dynamic_tree(
         self, logits, attn_metadata, spec_metadata, batch_size, num_contexts, num_gens
@@ -759,35 +787,35 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
         self._accepted_draft_indices_tensor[:batch_size].fill_(-1)
 
         num_flat_tokens = logits.shape[0]
+        # torch.argmax writes LongTensor indices; token storage below remains int32.
         torch.argmax(logits, dim=-1, out=self._target_tokens_buf[:num_flat_tokens])
         target_tokens = self._target_tokens_buf[:num_flat_tokens]
 
         # Context requests: accept sampled token
-        accepted_tokens[:num_contexts, 0] = target_tokens[:num_contexts].to(torch.int32)
+        accepted_tokens[:num_contexts, 0].copy_(target_tokens[:num_contexts])
 
         # Generation requests: tree verification
         if num_gens > 0:
             spec_tree_manager = self.spec_tree_manager
 
             target_predict = self._target_predict_buf[:num_gens]
-            target_predict[:] = target_tokens[num_contexts:].reshape(num_gens, N)
+            target_predict.copy_(target_tokens[num_contexts:].reshape(num_gens, N))
 
             if spec_tree_manager is None:
                 # CUDA graph warmup: accept only the first token per request
                 num_accepted_tokens[num_contexts:batch_size] = 1
-                accepted_tokens[num_contexts:batch_size, 0] = target_predict[:, 0].to(torch.int32)
+                accepted_tokens[num_contexts:batch_size, 0] = target_predict[:, 0]
                 self._accepted_draft_indices_tensor[num_contexts:batch_size] = -1
                 return accepted_tokens, num_accepted_tokens
 
             candidates = self._candidates_buf[:num_gens]
-            candidates[:, 1:] = spec_metadata.draft_tokens.reshape(num_gens, N - 1).to(torch.int64)
+            candidates[:, 1:] = spec_metadata.draft_tokens.reshape(num_gens, N - 1)
             candidates[:, 0] = target_predict[:, 0]
 
-            # Slots for gen rows: real py_seq_slot vs dummy; dummy -> slot_has_tree False
-            gen_slot_ids = spec_tree_manager._all_slot_ids_buf[
-                num_contexts : num_contexts + num_gens
-            ]
-            tree_valid = spec_tree_manager.slot_has_tree[gen_slot_ids]
+            slot_storage = spec_tree_manager.slot_storage
+            gen_slot_ids = slot_storage.all_ids_buf[num_contexts : num_contexts + num_gens]
+            tree_valid = slot_storage.has_tree[gen_slot_ids]
+            retrieve_packed = slot_storage.pack_retrieve_from_slots(gen_slot_ids, num_gens)
 
             if self._can_use_rejection_sampling(spec_metadata):
                 vocab_size = logits.shape[-1]
@@ -829,15 +857,25 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
                     self.offset = torch.tensor([0], dtype=torch.int64, device=device)
                 # Use in-place operations for CUDA graph compatibility
                 self.seed.add_(1).remainder_(2**31)
+                rejection_candidates = self._rejection_candidates_buf[:num_gens]
+                rejection_candidates[:, 1:].copy_(
+                    spec_metadata.draft_tokens.reshape(num_gens, N - 1)
+                )
+                rejection_candidates[:, 0].copy_(
+                    target_tokens[num_contexts:].reshape(num_gens, N)[:, 0]
+                )
+                retrieve_next_token, retrieve_next_sibling = slot_storage.next_links_from_slots(
+                    gen_slot_ids, num_gens
+                )
 
                 _, accept_index, accept_token_num, accept_token = (
                     self.tree_ops_converter.verify_dynamic_tree_rejection_from_logits_out(
-                        candidates,
+                        rejection_candidates,
                         draft_logits_tree,
                         target_logits_tree,
                         draft_prob_indices,
-                        spec_tree_manager.retrieve_next_token[:num_gens],
-                        spec_tree_manager.retrieve_next_sibling[:num_gens],
+                        retrieve_next_token,
+                        retrieve_next_sibling,
                         tree_valid,
                         temps,
                         top_ks,
@@ -868,12 +906,10 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
                 )
                 return accepted_tokens, num_accepted_tokens
 
-            _, accept_index, accept_token_num, accept_token = (
-                self.tree_ops_converter.verify_dynamic_tree_greedy_out(
+            accept_index, accept_token_num, accept_token = (
+                self.tree_ops_converter.verify_dynamic_tree_greedy_out_packed(
                     candidates,
-                    spec_tree_manager.retrieve_index[:num_gens],
-                    spec_tree_manager.retrieve_next_token[:num_gens],
-                    spec_tree_manager.retrieve_next_sibling[:num_gens],
+                    retrieve_packed,
                     target_predict,
                     num_gens,
                     self._max_path_len,
@@ -1087,71 +1123,51 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
         batch_size = attn_metadata.num_seqs
         num_tokens_current_layer = self.K * (cur_draft_idx + 1)
         num_tokens_previous_layer = self.K * cur_draft_idx
+        packed_mask = attn_metadata.spec_decoding_packed_mask
         if cur_draft_idx == 0:
-            attn_metadata.spec_decoding_packed_mask.fill_(0)
             spec_tree_manager.compute_spec_dec_packed_mask(
                 self.tree_mask_init_buffer[:batch_size],
-                attn_metadata.spec_decoding_packed_mask[:batch_size],
+                packed_mask[:batch_size, :num_tokens_current_layer, :],
             )
             self.tree_mask_buffer[
                 : batch_size * num_tokens_current_layer * num_tokens_current_layer
             ].copy_(self.tree_mask_init_buffer[:batch_size].view(-1))
             attn_metadata.spec_decoding_position_offsets.fill_(0)
-            attn_metadata.spec_decoding_generation_lengths[:batch_size] = num_tokens_current_layer
+            self._apply_spec_metadata(attn_metadata, batch_size, num_tokens_current_layer)
         else:
             num_parent_mask = batch_size * cur_draft_idx * self.K * cur_draft_idx * self.K
             parent_mask = self.tree_mask_buffer[:num_parent_mask].reshape(
                 batch_size, cur_draft_idx * self.K, cur_draft_idx * self.K
             )
 
-            selected_parents_expanded = selected_parents.unsqueeze(-1).expand(
-                batch_size, self.K, parent_mask.size(-1)
-            )
-            parent_mask_selected = torch.gather(
-                parent_mask[:, -self.K :, :], dim=1, index=selected_parents_expanded
-            )
+            prev_total = batch_size * num_tokens_previous_layer
+            previous_position_offsets = attn_metadata.spec_decoding_position_offsets[
+                :prev_total
+            ].view(batch_size, num_tokens_previous_layer)
 
-            # current_mask = cat([parent_mask_selected, tree_mask_init], dim=2) then
-            # current_mask = cat([mask_padding, current_mask], dim=1)
-            current_mask = self._current_mask_buf[
-                :batch_size, :num_tokens_current_layer, :num_tokens_current_layer
-            ]
-            # Top rows: padding zeros
-            current_mask[:, :num_tokens_previous_layer, :].zero_()
-            # Bottom rows: [parent_mask_selected | tree_mask_init]
-            prev_cols = parent_mask.size(-1)  # = num_tokens_previous_layer
-            current_mask[:, num_tokens_previous_layer:, :prev_cols].copy_(parent_mask_selected)
-            current_mask[:, num_tokens_previous_layer:, prev_cols:num_tokens_current_layer].copy_(
-                self.tree_mask_init_buffer[:batch_size]
+            # Fused: gather parent masks + build current mask + compute positions
+            current_mask, new_positions = _build_mask_and_position(
+                parent_mask,
+                selected_parents,
+                self.tree_mask_init_buffer[:batch_size],
+                previous_position_offsets,
+                self.K,
             )
 
             spec_tree_manager.compute_spec_dec_packed_mask(
-                current_mask, attn_metadata.spec_decoding_packed_mask[:batch_size]
+                current_mask, packed_mask[:batch_size, :num_tokens_current_layer, :]
             )
             self.tree_mask_buffer[
                 : batch_size * num_tokens_current_layer * num_tokens_current_layer
             ].copy_(current_mask.reshape(-1))
 
-            attn_metadata.spec_decoding_generation_lengths[:batch_size] = num_tokens_current_layer
-
-            previous_position_offsets = attn_metadata.spec_decoding_position_offsets[
-                : batch_size * num_tokens_previous_layer
-            ].view(batch_size, num_tokens_previous_layer)
-
-            new_pos = self._new_pos_offset_buf[:batch_size, :num_tokens_current_layer]
-            new_pos[:, :num_tokens_previous_layer].copy_(previous_position_offsets)
-            new_pos[:, num_tokens_previous_layer:num_tokens_current_layer].copy_(
-                previous_position_offsets[:, -self.K :] + 1
-            )
-            attn_metadata.spec_decoding_position_offsets[
-                : batch_size * num_tokens_current_layer
-            ] = new_pos.reshape(-1)
+            cur_total = batch_size * num_tokens_current_layer
+            attn_metadata.spec_decoding_position_offsets[:cur_total] = new_positions.reshape(-1)
+            self._apply_spec_metadata(attn_metadata, batch_size, num_tokens_current_layer)
 
         # Hopper XQA needs packed 1D mask; Blackwell expects padded 3D.
         if self._needs_mask_repack:
-            self._repack_mask_padded_to_packed(
-                attn_metadata.spec_decoding_packed_mask, batch_size, num_tokens_current_layer
-            )
+            self._repack_mask_padded_to_packed(packed_mask, batch_size, num_tokens_current_layer)
 
     def prepare_for_generation(
         self,
@@ -1258,9 +1274,7 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
             #    Positions 0:K retain step0_hs set in step 0 and are never modified.
             num_tokens_next = (cur_draft_idx + 1) * self.K
             read_idx = self._hs_read_map[:batch_size, self.K : num_tokens_next]
-            gathered = torch.gather(
+            self._accumulated_hs[:batch_size, self.K : num_tokens_next] = _gather_parent_hs(
                 self._hs_write_buffer[:batch_size],
-                1,
-                read_idx.unsqueeze(-1).expand(-1, -1, self._hs_dim),
+                read_idx,
             )
-            self._accumulated_hs[:batch_size, self.K : num_tokens_next] = gathered

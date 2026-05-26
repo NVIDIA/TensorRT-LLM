@@ -16,6 +16,7 @@
 import asyncio
 import json
 import os
+import platform
 import re
 import shutil
 import subprocess
@@ -65,7 +66,7 @@ def get_ucx_tls():
     """
     ON some gb300 cluster,  we need to set `cuda_copy,cuda_ipc,sm,self,tcp` for UCX_TLS
     """
-    if sm == 103:
+    if sm == 103 and "aarch" in platform.machine().lower():
         return "cuda_copy,cuda_ipc,sm,self,tcp"
     if sm < 90:
         return "^cuda_ipc,ib,gdr_copy"

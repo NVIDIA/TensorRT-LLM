@@ -340,6 +340,7 @@ class TestLlama3_1_8B_Instruct_Eagle3(LlmapiAccuracyTestHarness):
         "yuhuili/EAGLE3-LLaMA3.1-Instruct-8B")
 
     def get_default_kwargs(self, attn_backend="flashinfer"):
+        yaml_paths, _ = _get_registry_yaml_extra(self.MODEL_NAME)
         speculative_config = Eagle3DecodingConfig(
             max_draft_len=3,
             speculative_model=self.EAGLE_MODEL_PATH,
@@ -351,14 +352,13 @@ class TestLlama3_1_8B_Instruct_Eagle3(LlmapiAccuracyTestHarness):
         compile_backend = "torch-cudagraph" if attn_backend == "trtllm" else "torch-simple"
 
         kwargs = {
+            "yaml_extra": yaml_paths,
             "attn_backend": attn_backend,
             "compile_backend": compile_backend,
             "skip_tokenizer_init": False,
             "trust_remote_code": True,
-            "max_batch_size": 128,
             "max_seq_len": 8192,
             "max_num_tokens": 8192,
-            "skip_loading_weights": False,
             "enable_iter_perf_stats": True,
             "kv_cache_config": {
                 "free_gpu_memory_fraction": 0.7
@@ -408,7 +408,9 @@ class TestNemotronH(LlmapiAccuracyTestHarness):
     def get_default_kwargs(self,
                            enable_chunked_prefill=False,
                            attn_backend="flashinfer"):
+        yaml_paths, _ = _get_registry_yaml_extra(self.MODEL_NAME)
         config = {
+            "yaml_extra": yaml_paths,
             "skip_tokenizer_init": False,
             "trust_remote_code": True,
             "attn_backend": attn_backend,
@@ -423,7 +425,6 @@ class TestNemotronH(LlmapiAccuracyTestHarness):
             "max_seq_len": 8192,
             # Set explicitly to match default build_config behavior
             "max_num_tokens": 8192,
-            "skip_loading_weights": False,
             "transforms": {
                 "compile_model": {
                     "backend": "torch-cudagraph",
@@ -460,6 +461,7 @@ class TestNemotronH(LlmapiAccuracyTestHarness):
         sampling_params = self.get_default_sampling_params()
         with AutoDeployLLM(model=self.MODEL_PATH,
                            tokenizer=self.MODEL_PATH,
+                           world_size=1,
                            **kwargs) as llm:
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm, sampling_params=sampling_params)
@@ -886,7 +888,9 @@ class TestGLM4Flash(LlmapiAccuracyTestHarness):
     def get_default_kwargs(self,
                            enable_chunked_prefill=False,
                            attn_backend="flashinfer"):
+        yaml_paths, _ = _get_registry_yaml_extra("zai-org/GLM-4.7-Flash")
         config = {
+            "yaml_extra": yaml_paths,
             "skip_tokenizer_init": False,
             "trust_remote_code": True,
             "attn_backend": attn_backend,
@@ -905,28 +909,20 @@ class TestGLM4Flash(LlmapiAccuracyTestHarness):
             },
             "model_kwargs": {
                 "torch_dtype": "bfloat16"
-            },
-            "transforms": {
-                "fuse_nvfp4_moe": {
-                    "allow_different_input_scales": True,
-                },
-                "multi_stream_moe": {
-                    "stage": "compile",
-                    "enabled": True,
-                },
-                "multi_stream_mla_attn": {
-                    "stage": "compile",
-                    "enabled": True,
-                },
             }
         }
         if enable_chunked_prefill:
             config["enable_chunked_prefill"] = True
             config[
                 "max_num_tokens"] = 512  # NOTE: must be > max(tokens_per_block, max_batch_size)
+            config.setdefault("transforms", {})
             config["transforms"]["compile_model"] = {
                 "piecewise_enabled": True,
             }
+        else:
+            # Keep the original non-chunked variant behavior even when
+            # registry defaults enable chunked prefill.
+            config["enable_chunked_prefill"] = False
         return config
 
     def get_default_sampling_params(self):
@@ -979,10 +975,11 @@ class TestQwen3NextInstruct(LlmapiAccuracyTestHarness):
     MODEL_NAME = "Qwen/Qwen3-Next-80B-A3B-Instruct"
 
     def get_default_kwargs(self):
+        yaml_paths, _ = _get_registry_yaml_extra(self.MODEL_NAME)
         return {
+            "yaml_extra": yaml_paths,
             "skip_tokenizer_init": False,
             "trust_remote_code": True,
-            "skip_loading_weights": False,
             "enable_chunked_prefill": True,
             "max_batch_size": 64,
             "max_seq_len": 4096,
@@ -1155,10 +1152,12 @@ class TestMiniMaxM2(LlmapiAccuracyTestHarness):
                       GSM8K.MAX_INPUT_LEN + GSM8K.MAX_OUTPUT_LEN)
 
     def get_default_kwargs(self):
+        yaml_paths, _ = _get_registry_yaml_extra(self.MODEL_NAME)
         return {
+            "yaml_extra": yaml_paths,
             "skip_tokenizer_init": False,
             "trust_remote_code": True,
-            "skip_loading_weights": False,
+            "attn_backend": "trtllm",
             "compile_backend": "torch-cudagraph",
             "kv_cache_config": {
                 "free_gpu_memory_fraction": 0.7,
@@ -1169,9 +1168,6 @@ class TestMiniMaxM2(LlmapiAccuracyTestHarness):
             "enable_chunked_prefill": True,
             "cuda_graph_config": {
                 "batch_sizes": [1, 2, 4, 8, 16, 24, 32, 64]
-            },
-            "model_kwargs": {
-                "torch_dtype": "bfloat16",
             },
         }
 

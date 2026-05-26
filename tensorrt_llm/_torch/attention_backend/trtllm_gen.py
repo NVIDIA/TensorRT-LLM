@@ -188,7 +188,6 @@ class TrtllmGenSupportChecker:
         out_dtype: Optional[torch.dtype] = None,
         mask_type: int = 1,
         beam_width: int = 1,
-        sink_token_length: int = 0,
         tokens_per_block: Optional[int] = 64,
         use_paged_kv_cache: bool = True,
         is_mla_enable: bool = False,
@@ -285,11 +284,6 @@ class TrtllmGenSupportChecker:
                 )
             if position_shift_enabled:
                 return False, "[Generation] Position shift is not supported."
-            if sink_token_length != 0:
-                return (
-                    False,
-                    f"[Generation] StreamingLLM (sink_token_length={sink_token_length}) is not supported.",
-                )
             if tokens_per_block < cls.MIN_TOKENS_PER_BLOCK:
                 return (
                     False,
@@ -482,7 +476,6 @@ class EnqueueParams:
     max_past_kv_length: int = 0
     max_attention_window_size: int = 0
     cyclic_attention_window_size: int = 0
-    sink_token_length: int = 0
     num_tokens: int = 0
     seq_offset: int = 0
     tokens_per_block: int = 64
@@ -693,7 +686,6 @@ class FlashInferTrtllmGenAttention:
             out_dtype=output.dtype,
             mask_type=mask_type,
             beam_width=metadata.beam_width,
-            sink_token_length=0,
             tokens_per_block=metadata.tokens_per_block,
             use_paged_kv_cache=use_paged_kv_cache,
             is_mla_enable=self._is_mla_enable,
@@ -1030,7 +1022,6 @@ class FlashInferTrtllmGenAttention:
             kv_cache_quant_mode=params.kv_cache_quant_mode,
             max_attention_window_size=params.max_attention_window_size,
             cyclic_attention_window_size=params.cyclic_attention_window_size,
-            sink_token_length=params.sink_token_length,
             num_tokens=params.num_tokens,
             batch_size=params.batch_size,
             input_seq_length=params.input_seq_length,
@@ -1088,7 +1079,6 @@ class FlashInferTrtllmGenAttention:
             kv_cache_quant_mode=params.kv_cache_quant_mode,
             max_attention_window_size=params.max_attention_window_size,
             cyclic_attention_window_size=params.cyclic_attention_window_size,
-            sink_token_length=params.sink_token_length,
             num_tokens=params.num_tokens,
             batch_size=params.batch_size,
             input_seq_length=params.input_seq_length,
@@ -1139,7 +1129,6 @@ class FlashInferTrtllmGenAttention:
             kv_cache_quant_mode=params.kv_cache_quant_mode,
             max_attention_window_size=params.max_attention_window_size,
             cyclic_attention_window_size=params.cyclic_attention_window_size,
-            sink_token_length=params.sink_token_length,
             num_tokens=params.num_tokens,
             batch_beam=batch_beam,
             input_seq_length=params.input_seq_length,
