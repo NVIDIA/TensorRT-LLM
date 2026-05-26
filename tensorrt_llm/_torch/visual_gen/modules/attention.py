@@ -58,7 +58,7 @@ class Attention(nn.Module):
         self.quant_config = config.quant_config
         self.skip_create_weights_in_init = config.skip_create_weights_in_init
         self.force_dynamic_quantization = config.force_dynamic_quantization
-        self.mapping = getattr(config, "mapping", None)
+        self.mapping = config.mapping
         self.allreduce_strategy = config.allreduce_strategy
 
         self.hidden_size = hidden_size

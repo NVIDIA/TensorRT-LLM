@@ -277,6 +277,8 @@ class FluxTransformerBlock(nn.Module):
         self.config = config
         self.layer_idx = layer_idx
 
+        tp_size = config.mapping.tp_size if config and config.mapping else 1
+
         # AdaLN for image and text
         self.norm1 = AdaLayerNormZero(
             dim,
@@ -325,7 +327,7 @@ class FluxTransformerBlock(nn.Module):
             dtype=dtype,
             config=config,
             layer_idx=layer_idx,
-            reduce_output=(self.config.mapping.tp_size != 1),
+            reduce_output=(tp_size != 1),
         )
         self.ff_context = MLP(
             hidden_size=dim,
@@ -335,7 +337,7 @@ class FluxTransformerBlock(nn.Module):
             dtype=dtype,
             config=config,
             layer_idx=layer_idx,
-            reduce_output=(self.config.mapping.tp_size != 1),
+            reduce_output=(tp_size != 1),
         )
 
     def forward(
@@ -464,11 +466,11 @@ class FluxSingleTransformerBlock(nn.Module):
         )
         self.act_mlp = _gelu_tanh_eager
 
-        q_dim = num_attention_heads * attention_head_dim
+        kv_dim = num_attention_heads * attention_head_dim
 
         # MLP + Attn Output projection, requires special handling for TP
         self.proj_out = FluxJointAttnMLPProj(
-            attn_dim=q_dim,
+            attn_dim=kv_dim,
             mlp_dim=self.mlp_hidden_dim,
             out_dim=dim,
             bias=True,

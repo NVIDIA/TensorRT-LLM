@@ -313,7 +313,8 @@ class Flux2ParallelSelfAttention(FluxJointAttention):
         config: Optional[DiffusionModelConfig] = None,
         layer_idx: int = 0,
     ):
-        tp_size = config.mapping.tp_size if config else 1
+        # self.tp_size is set in super().__init__
+        tp_size = config.mapping.tp_size if config and config.mapping else 1
 
         # Set MLP dims BEFORE super().__init__() — _init_qkv_proj() needs them
         self.mlp_hidden_dim = int(hidden_size * mlp_ratio)
@@ -334,7 +335,7 @@ class Flux2ParallelSelfAttention(FluxJointAttention):
 
         # Output projection needs FULL dims (ROW parallel divides internally)
         self.to_out = FluxJointAttnMLPProj(
-            attn_dim=self.q_dim,
+            attn_dim=self.kv_dim,
             mlp_dim=self.mlp_hidden_dim,
             out_dim=hidden_size,
             bias=bias,

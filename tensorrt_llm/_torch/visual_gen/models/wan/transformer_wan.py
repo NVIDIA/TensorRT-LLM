@@ -284,12 +284,12 @@ class WanBlock(nn.Module):
             hidden_size=hidden_size, eps=eps, dtype=torch.float32, has_weights=False, has_bias=False
         )
 
-        # Self-attention with fused QKV. All WAN variants (1.3B 12h, 5B 24h, 14B 40h)
-        # fit the default fused_dit_qk_norm_rope op's full-dim template now that
-        # the num_heads cap is 64 (post-survey 2026-05).
-        # However, we must disable the fused QK norm + Rope for TP, since Wan QK norm
-        # is cross head, and thus a collective operation. This mode is not yet supported
-        # by the fused kernel.
+        # Self-attention with fused QKV. All WAN variants (1.3B 12h, 5B 24h,
+        # 14B 40h) fit the default fused_dit_qk_norm_rope op's full-dim
+        # template now that the num_heads cap is 64 (post-survey 2026-05).
+        # However, this kernel does not support TP due to the cross-head
+        # normalization being a collective op. Thus, we must disable it if
+        # using TP.
         tp_size = model_config.mapping.tp_size if model_config.mapping else 1
         self.attn1 = Attention(
             hidden_size=hidden_size,
@@ -337,11 +337,10 @@ class WanBlock(nn.Module):
             dtype=dtype,
             config=model_config,
             layer_idx=_layer_idx,
-            reduce_output=(model_config.mapping.tp_size != 1),
+            reduce_output=(tp_size != 1),
         )
 
         # I2V: Additional K/V projections for image embeddings.
-        # COLUMN parallel to match attn2's TP-sharded head count.
         self.add_k_proj = self.add_v_proj = None
         self.norm_added_k = None
         if added_kv_proj_dim is not None:

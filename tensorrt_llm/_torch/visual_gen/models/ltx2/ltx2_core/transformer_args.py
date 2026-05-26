@@ -117,8 +117,10 @@ class TransformerArgsPreprocessor:
         freq_grid_generator = (
             _generate_freq_grid_np if self.double_precision_rope else _generate_freq_grid_pytorch
         )
-        tp_size = self.model_config.mapping.tp_size if self.model_config else 1
-        tp_rank = self.model_config.mapping.tp_rank if self.model_config else 0
+
+        mapping = self.model_config.mapping if self.model_config else None
+        tp_size = mapping.tp_size if mapping else 1
+        tp_rank = mapping.tp_rank if mapping else 0
 
         # Generate full-dimension RoPE, then slice the per-rank chunk.
         # Column-parallel QKV partitions heads contiguously across ranks,

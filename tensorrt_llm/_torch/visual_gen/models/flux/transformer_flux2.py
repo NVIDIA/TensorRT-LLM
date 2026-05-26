@@ -227,6 +227,8 @@ class Flux2TransformerBlock(nn.Module):
         self.num_attention_heads = num_attention_heads
         self.attention_head_dim = attention_head_dim
 
+        tp_size = config.mapping.tp_size if config and config.mapping else 1
+
         # Layer norms (TRT-LLM - without elementwise affine, modulation provides scale/shift)
         self.norm1 = LayerNorm(hidden_size=dim, eps=eps, has_weights=False, has_bias=False)
         self.norm1_context = LayerNorm(hidden_size=dim, eps=eps, has_weights=False, has_bias=False)
@@ -252,7 +254,7 @@ class Flux2TransformerBlock(nn.Module):
             dtype=dtype,
             config=config,
             layer_idx=layer_idx,
-            reduce_output=(config.mapping.tp_size != 1),
+            reduce_output=(tp_size != 1),
         )
         # FFN for text stream
         self.ff_context = GatedMLP(
@@ -262,7 +264,7 @@ class Flux2TransformerBlock(nn.Module):
             dtype=dtype,
             config=config,
             layer_idx=layer_idx,
-            reduce_output=(config.mapping.tp_size != 1),
+            reduce_output=(tp_size != 1),
         )
 
     def forward(
