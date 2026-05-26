@@ -2678,6 +2678,19 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
         "The maximum utilization of the KV cache for resume. Default is 95%. Only used when using KV cache manager v2 (experimental)."
     )
 
+    enable_kv_pool_rebalance: bool = Field(
+        default=True,
+        status="prototype",
+        description=
+        "Whether the PyExecutor may invoke the KVCacheManagerV2 auto-tuner "
+        "(``adjust()``) to rebalance pool-group ratios between iterations. "
+        "When True the executor calls ``adjust()`` opportunistically; the "
+        "auto-tuner itself remains gated by V2's internal 2000-sample / 120s "
+        "cooldown. When False the rebalance hook is skipped entirely and pool "
+        "ratios remain at their warmup-derived values. Only used when using "
+        "KV cache manager v2 (experimental)."
+    )
+
     def _to_pybind(self):
         config = _KvCacheConfig(
             enable_block_reuse=self.enable_block_reuse,

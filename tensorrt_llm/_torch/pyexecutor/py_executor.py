@@ -308,7 +308,8 @@ class PyExecutor:
             execution_stream: Optional[torch.cuda.Stream] = None,
             waiting_queue_policy: WaitingQueuePolicy = WaitingQueuePolicy.FCFS,
             adp_router: Optional[ADPRouter] = None,
-            dwdp_manager: Optional[DwdpManager] = None):
+            dwdp_manager: Optional[DwdpManager] = None,
+            enable_kv_pool_rebalance: bool = True):
         super(PyExecutor, self).__init__()
         self.device_id = torch.cuda.current_device()
         self.global_rank = dist.rank
@@ -341,6 +342,7 @@ class PyExecutor:
                                           None)
         self.guided_decoder = guided_decoder
         self.disable_overlap_scheduler = disable_overlap_scheduler
+        self.enable_kv_pool_rebalance = enable_kv_pool_rebalance
         self.virtual_memory_pools = virtual_memory_pools
 
         # enqueue and _fetch_new_requests used data
@@ -2647,7 +2649,10 @@ class PyExecutor:
 
         MVP scope: single-GPU aggregated, no in-flight disagg transfer,
         no beam search, no drafter, not during warmup or shutdown.
+        Honors the ``enable_kv_pool_rebalance`` user-facing kill switch.
         """
+        if not self.enable_kv_pool_rebalance:
+            return False
         if self.dist.pp_size > 1:
             return False
         if self.kv_cache_transceiver is not None:

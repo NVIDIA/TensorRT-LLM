@@ -1690,6 +1690,8 @@ def create_py_executor_instance(
         execution_stream=execution_stream,
         waiting_queue_policy=waiting_queue_policy,
         dwdp_manager=dwdp_manager,
+        enable_kv_pool_rebalance=llm_args.kv_cache_config.
+        enable_kv_pool_rebalance,
     )
 
 
