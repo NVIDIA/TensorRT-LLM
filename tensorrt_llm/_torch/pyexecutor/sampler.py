@@ -197,6 +197,18 @@ def _debug_batch_next_tokens(
         return f"<unavailable: {err}>"
 
 
+def _debug_beam_history_tensor(tensor: torch.Tensor, max_positions: int = 16):
+    try:
+        values = tensor.detach().cpu().tolist()
+        return [{
+            "beam": beam_idx,
+            "num_positions": len(beam_values),
+            "tail": beam_values[-max_positions:],
+        } for beam_idx, beam_values in enumerate(values)]
+    except (RuntimeError, TypeError, ValueError, IndexError) as err:
+        return f"<unavailable: {err}>"
+
+
 @dataclass(kw_only=True)
 class LogProbsState:
     sampled_vals: torch.Tensor
@@ -3161,6 +3173,14 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             # Gather the correct tokens for each beam
             new_path = torch.zeros_like(current_path)
             torch.gather(input=current_path, dim=0, index=cache_indirection, out=new_path)
+            logger.info(
+                "TorchSampler._prepare_beam_history path gather: "
+                f"request_id={request.py_request_id} "
+                f"seq_slot={request.py_seq_slot} "
+                f"prompt_length={prompt_length} num_tokens={num_tokens} "
+                f"current_path={_debug_beam_history_tensor(current_path)} "
+                f"cache_indirection={_debug_beam_history_tensor(cache_indirection)} "
+                f"new_path={_debug_beam_history_tensor(new_path)}")
             return new_path
 
         if request.py_return_log_probs:
@@ -3221,10 +3241,21 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
 
         def _builder() -> BeamHistory | None:
             if not need_history.item():
+                logger.info(
+                    "TorchSampler._prepare_beam_history skipped: "
+                    f"request_id={request.py_request_id} "
+                    f"seq_slot={request.py_seq_slot} "
+                    f"prompt_length={prompt_length} "
+                    f"num_generated_tokens={num_generated_tokens}")
                 return None
 
             new_path = _post_process_path()
             new_logprobs, new_logprobs_indices, cum_logprobs = _maybe_postprocess_logprobs()
+            logger.info(
+                "TorchSampler._prepare_beam_history built: "
+                f"request_id={request.py_request_id} "
+                f"seq_slot={request.py_seq_slot} "
+                f"tokens={_debug_beam_history_tensor(new_path)}")
 
             return BeamHistory(
                 tokens=new_path,
@@ -3252,6 +3283,22 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             f"Beam_history.tokens.shape[0] should equal beam width: \
                 {beam_history.tokens.shape[0]} != {beam_width}"
         )
+        request_tokens_before = [
+            {
+                "beam": beam_idx,
+                "num_tokens": len(tokens),
+                "tail": tokens[-16:],
+            }
+            for beam_idx in range(beam_width)
+            for tokens in [list(request.get_tokens(beam_idx))]
+        ]
+        logger.info(
+            "TorchSampler._finalize_beam before correction: "
+            f"request_id={request.py_request_id} "
+            f"seq_slot={request.py_seq_slot} "
+            f"request_tokens={request_tokens_before} "
+            f"beam_history_tokens="
+            f"{_debug_beam_history_tensor(beam_history.tokens)}")
         if request.py_return_log_probs:
             assert beam_history.logprobs is not None
             assert beam_history.logprobs_indices is not None
@@ -3284,6 +3331,21 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                     )[0]
                 )
         request.set_generated_tokens(gen_token_list)
+        request_tokens_after = [
+            {
+                "beam": beam_idx,
+                "num_tokens": len(tokens),
+                "tail": tokens[-16:],
+            }
+            for beam_idx in range(beam_width)
+            for tokens in [list(request.get_tokens(beam_idx))]
+        ]
+        logger.info(
+            "TorchSampler._finalize_beam after correction: "
+            f"request_id={request.py_request_id} "
+            f"seq_slot={request.py_seq_slot} "
+            f"gen_token_list={gen_token_list} "
+            f"request_tokens={request_tokens_after}")
         if request.py_return_log_probs:
             # cum_log_probs will not change when padding with end tokens.
             # Therefore, we do not need to correct it
