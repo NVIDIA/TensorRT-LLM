@@ -253,13 +253,20 @@ class OpenAIDisaggregatedService(OpenAIService):
             gen_server, info = await self._gen_router.get_next_server(request)
             match_length = sum(info["matches"])
             total_length = sum(len(token_list) for token_list in info["token_lists"])
-            if (
+            need_ctx_decision = (
                 match_length == 0
                 or total_length - match_length
                 > self.conditional_disagg_config.max_local_prefill_length
-            ):
-                return gen_server, True
-            return gen_server, False
+            )
+            # Visibility hook for verifying bypass triggers in disagg deployments.
+            logger.debug(
+                f"[conditional_disagg] gen={gen_server} match={match_length} "
+                f"total={total_length} residual={total_length - match_length} "
+                f"max_local_prefill_length="
+                f"{self.conditional_disagg_config.max_local_prefill_length} "
+                f"→ need_ctx={need_ctx_decision}"
+            )
+            return gen_server, need_ctx_decision
         return None, True
 
     async def _check_gen_only_disagg(self, request: UCompletionRequest) -> bool:

@@ -444,9 +444,11 @@ class PyExecutor:
                                                         KVCacheManagerV2)
         self.enable_kv_cache_events = self.kv_cache_manager is not None and self.kv_cache_manager.event_buffer_max_size > 0
         self.enable_kv_cache_reuse = self.kv_cache_manager is not None and self.kv_cache_manager.enable_block_reuse
+        # AsyncTransferManager pin/unpin path is V1-only; V2 holds blocks via _KVCache refcount.
         self.enable_partial_reuse_for_disagg = (
             self.enable_kv_cache_reuse
-            and self.kv_cache_manager.enable_partial_reuse)
+            and self.kv_cache_manager.enable_partial_reuse
+            and not isinstance(self.kv_cache_manager, KVCacheManagerV2))
 
         self.max_input_len = max_input_len
         # _executor_loop private data
