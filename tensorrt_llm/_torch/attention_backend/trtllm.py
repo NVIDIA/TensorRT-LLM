@@ -1522,20 +1522,19 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             trtllm_gen_backend = self._get_trtllm_gen_backend()
             use_trtllm_gen = trtllm_gen_backend.is_supported(
                 q,
-                metadata=metadata,
-                forward_args=forward_args,
-                mask_type=int(forward_args.mask_type),
-                active_helix=helix_active,
-                use_sage_attn=use_sage_attn,
+                attn=self,
+                meta=metadata,
+                fwd=forward_args,
             )[0]
 
         if use_trtllm_gen:
-            trtllm_gen_backend.attention(
+            trtllm_gen_backend.forward(
                 q,
-                metadata=metadata,
-                forward_args=forward_args,
-                mask_type=int(forward_args.mask_type),
-                use_paged_context_fmha=metadata.use_paged_context_fmha,
+                k,
+                v,
+                attn=self,
+                meta=metadata,
+                fwd=forward_args,
             )
         else:
             # Every kwarg sources from ``self`` / ``metadata`` /

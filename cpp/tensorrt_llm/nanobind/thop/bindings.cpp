@@ -34,11 +34,12 @@ namespace tensorrt_llm::nanobind::thop
 namespace
 {
 
-nb::object optionalTensorToObject(std::optional<at::Tensor> const& tensor)
+template <typename T>
+nb::object optionalToObject(std::optional<T> const& value)
 {
-    if (tensor.has_value())
+    if (value.has_value())
     {
-        return nb::cast(*tensor);
+        return nb::cast(*value);
     }
     return nb::none();
 }
@@ -72,9 +73,9 @@ nb::tuple trtllmGenContextPreprocessBinding(torch::Tensor qkv_input, torch::Tens
             total_num_blocks, kv_factor, need_build_kv_cache_metadata);
     }();
 
-    return nb::make_tuple(std::get<0>(result), optionalTensorToObject(std::get<1>(result)),
-        optionalTensorToObject(std::get<2>(result)), optionalTensorToObject(std::get<3>(result)),
-        optionalTensorToObject(std::get<4>(result)), optionalTensorToObject(std::get<5>(result)), std::get<6>(result),
+    return nb::make_tuple(std::get<0>(result), optionalToObject(std::get<1>(result)),
+    optionalToObject(std::get<2>(result)), optionalToObject(std::get<3>(result)),
+    optionalToObject(std::get<4>(result)), optionalToObject(std::get<5>(result)), std::get<6>(result),
         std::get<7>(result), std::get<8>(result), std::get<9>(result), std::get<10>(result), std::get<11>(result));
 }
 
@@ -108,9 +109,9 @@ nb::tuple trtllmGenGenerationPreprocessBinding(torch::Tensor qkv_input, torch::T
             need_build_kv_cache_metadata);
     }();
 
-    return nb::make_tuple(std::get<0>(result), optionalTensorToObject(std::get<1>(result)),
-        optionalTensorToObject(std::get<2>(result)), optionalTensorToObject(std::get<3>(result)), std::get<4>(result),
-        std::get<5>(result), std::get<6>(result), optionalTensorToObject(std::get<7>(result)), std::get<8>(result),
+    return nb::make_tuple(std::get<0>(result), optionalToObject(std::get<1>(result)),
+        optionalToObject(std::get<2>(result)), optionalToObject(std::get<3>(result)), std::get<4>(result),
+        std::get<5>(result), std::get<6>(result), optionalToObject(std::get<7>(result)), std::get<8>(result),
         std::get<9>(result), std::get<10>(result), std::get<11>(result));
 }
 
