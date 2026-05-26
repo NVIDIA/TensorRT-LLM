@@ -187,6 +187,9 @@ class Attention(nn.Module):
             self.num_attention_heads //= tp_size
             self.num_key_value_heads //= tp_size
 
+            self.q_dim = self.num_attention_heads * self.head_dim
+            self.kv_dim = self.num_key_value_heads * self.head_dim
+
         # Create compute backend
         self.attn = create_attention(
             backend=backend_name,
@@ -285,18 +288,6 @@ class Attention(nn.Module):
                 reduce_output=False,
             )
 
-    def split_qkv(self, qkv: torch.Tensor):
-        def calc_shard(dim):
-            shard = dim // self.mapping.tp_size
-            start = shard * self.mapping.tp_rank
-            end = min(shard * (self.mapping.tp_rank + 1), dim)
-            return end - start
-
-        q_shard = calc_shard(self.q_dim)
-        kv_shard = calc_shard(self.kv_dim)
-
-        return qkv.split([q_shard, kv_shard, kv_shard], dim=-1)
-
     def get_qkv(
         self,
         hidden_states: torch.Tensor,
@@ -304,7 +295,7 @@ class Attention(nn.Module):
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         if self.qkv_mode == QKVMode.FUSE_QKV:
             qkv = self.qkv_proj(hidden_states)
-            q, k, v = self.split_qkv(qkv)
+            q, k, v = qkv.split([self.q_dim, self.kv_dim, self.kv_dim], dim=-1)
         else:
             kv_source = (
                 encoder_hidden_states if encoder_hidden_states is not None else hidden_states
