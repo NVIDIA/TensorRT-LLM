@@ -240,7 +240,7 @@ For the full request body schema and response codes (including the `409` for dou
    # trtllm-trace-1778480665-7993d824-rank-1.json   (TP=2)
    ```
 
-5. **Open the traces** in [ui.perfetto.dev](https://ui.perfetto.dev/) or `chrome://tracing`. Each captured iteration is wrapped in an sglang-compatible `step[EXTEND bs=N toks=M]` / `step[DECODE bs=N]` scope.
+5. **Open the traces** in [ui.perfetto.dev](https://ui.perfetto.dev/) or `chrome://tracing`. Each captured iteration is wrapped in a `step[EXTEND bs=N toks=M]` / `step[DECODE bs=N]` scope.
 
 ### Open-ended window (manual stop)
 

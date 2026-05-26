@@ -1437,7 +1437,7 @@ class PyExecutor:
 
         if output_dir is None:
             # ``/tmp`` is the documented developer default for the profile
-            # trace directory (matches sglang and the server docs); the
+            # trace directory (matches the server docs); the
             # user-facing override is the ``TLLM_TORCH_PROFILER_DIR`` env
             # var or the ``output_dir`` request body field.
             output_dir = os.environ.get(
@@ -2474,10 +2474,10 @@ class PyExecutor:
                         self._handle_first_token_response(scheduled_batch)
 
                     # Stage 1.1: Async forward (all ranks) and decoding pass (last rank only)
-                    # Per-iteration sglang-compatible step[...] scope. Appears
-                    # in Kineto traces under the user_annotation / gpu_user_annotation
-                    # categories so trtllm-serve /start_profile output is
-                    # comparable to sglang's trace.
+                    # Per-iteration step[...] scope. Appears in Kineto traces
+                    # under the user_annotation / gpu_user_annotation
+                    # categories so trtllm-serve /start_profile output exposes
+                    # per-iteration boundaries to downstream trace viewers.
                     pp_step_label = self._build_step_scope_label(
                         scheduled_batch)
                     if not self.dist.is_last_pp_rank:
@@ -3173,10 +3173,10 @@ class PyExecutor:
                                 scheduled_batch: ScheduledRequests) -> str:
         """Format a per-iteration scope label for ``torch.profiler``.
 
-        The label matches sglang's ``step[...]`` convention so chrome
-        traces from ``trtllm-serve`` and sglang can be visually and
-        programmatically compared. The label appears in the Kineto
-        ``user_annotation`` / ``gpu_user_annotation`` lanes.
+        The label uses a ``step[...]`` convention that exposes per-iteration
+        boundaries in chrome traces and can be parsed programmatically. The
+        label appears in the Kineto ``user_annotation`` /
+        ``gpu_user_annotation`` lanes.
 
         Format:
           - ``step[DECODE bs=N]`` when every scheduled request is in
@@ -3297,11 +3297,11 @@ class PyExecutor:
                     gpu_forward_start, gpu_forward_end, gpu_sample_end = self.perf_manager.create_timing_events(
                     )
 
-                    # Emit an sglang-compatible step[...] user_annotation
-                    # scope around the forward+sample region so Kineto
-                    # traces from trtllm-serve /start_profile match the
-                    # shape of sglang's traces (same category, same label
-                    # format).
+                    # Emit a step[...] user_annotation scope around the
+                    # forward+sample region so Kineto traces from
+                    # trtllm-serve /start_profile expose per-iteration
+                    # boundaries with a consistent category and label
+                    # format.
                     with torch.profiler.record_function(
                             self._build_step_scope_label(scheduled_batch)):
                         with self.perf_manager.record_perf_events(
@@ -3606,8 +3606,8 @@ class PyExecutor:
 
                 # Per-iteration scope label for torch.profiler. Reused to
                 # wrap forward and sample calls below so the resulting
-                # chrome trace has sglang-compatible ``step[...]``
-                # user_annotation scopes.
+                # chrome trace has ``step[...]`` user_annotation scopes
+                # marking each iteration.
                 step_scope_label = self._build_step_scope_label(scheduled_batch)
 
                 can_queue, can_queue_this_rank = self._can_queue(
