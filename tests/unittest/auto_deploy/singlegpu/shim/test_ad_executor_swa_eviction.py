@@ -34,9 +34,14 @@ pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not 
 
 # Geometry shared across cases: SWA window of 64 tokens with tokens_per_block=32
 # gives 2 pages per window — small enough to exercise eviction boundaries
-# without ballooning runtime.
+# without ballooning runtime.  FULL_WINDOW doubles as the fixture's
+# ``max_seq_len`` and therefore sets the SWA pool's per-sequence cap
+# (``maxTokenNum = max(windowSize, maxSequenceLength)`` in kvCacheManager.cpp).
+# It must exceed the longest scenario the tests construct (192-token prefill
+# in ``test_helper_pre_eviction_long_prefill_passes_full_pages``) or the C++
+# side clamps allocation and the helper sees fewer live pages than expected.
 SWA_WINDOW = 64
-FULL_WINDOW = 128
+FULL_WINDOW = 256
 TOKENS_PER_BLOCK = 32
 PAGES_PER_SWA_WINDOW = SWA_WINDOW // TOKENS_PER_BLOCK  # 2
 
