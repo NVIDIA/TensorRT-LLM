@@ -2531,6 +2531,18 @@ class KVCacheManagerV2(BaseResourceManager):
         if kv_cache is not None and kv_cache.is_active:
             kv_cache.suspend()
 
+    def resume_request(self, req: LlmRequest) -> bool:
+        """Resume a previously-suspended KV cache for *req*.
+
+        Returns True if the cache is (or becomes) active on GPU, False if
+        resume was refused (e.g. GPU pressure above max_util_for_resume)
+        or no cache exists for the request.
+        """
+        kv_cache = self.kv_cache_map.get(req.py_request_id)
+        if kv_cache is None:
+            return False
+        return self._resume_and_restore(req.py_request_id, kv_cache)
+
     # ---- prepare_resources ----
 
     @nvtx_range("prepare_resources_kv_cache_manager_v2")

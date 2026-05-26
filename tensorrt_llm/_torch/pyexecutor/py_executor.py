@@ -2405,6 +2405,9 @@ class PyExecutor:
                 if self._resource_governor_enabled:
                     self._sync_and_process_resource_governor_queue()
 
+                if self._is_kv_manager_v2 and self._can_pause_for_rebalance():
+                    self._maybe_rebalance_kv_pools()
+
                 scheduled_batch, iter_stats = self._prepare_and_schedule_batch()
                 self._handle_control_request()
 
@@ -2638,6 +2641,57 @@ class PyExecutor:
                     request.messages, len(request.messages_to_retain))
             else:
                 raise ValueError(f"Invalid request type: {type(request)}.")
+
+    def _can_pause_for_rebalance(self) -> bool:
+        """Gate KV pool rebalance to the cases the v1 hook supports.
+
+        MVP scope: single-GPU aggregated, no in-flight disagg transfer,
+        no beam search, no drafter, not during warmup or shutdown.
+        """
+        if self.dist.pp_size > 1:
+            return False
+        if self.kv_cache_transceiver is not None:
+            return False
+        if self.is_warmup:
+            return False
+        if self.is_shutdown:
+            return False
+        if self.kv_cache_manager.max_beam_width > 1:
+            return False
+        if self.drafter is not None:
+            return False
+        return True
+
+    def _maybe_rebalance_kv_pools(self) -> None:
+        """Rebalance KV pool ratios when the V2 auto-tuner asks for it.
+
+        Fast path: ``need_adjustment`` checks the sample counter and the
+        120s cooldown before doing any real work.  On the slow path we
+        drain pending GPU work, suspend every active request, call
+        ``adjust()``, and resume.  Resume failures stay suspended; the
+        scheduler reactivates them through prepare_context /
+        try_allocate_generation on the next iteration, the same path it
+        uses today after eviction.
+        """
+        mgr = self.kv_cache_manager
+        if not mgr.impl.need_adjustment:
+            return
+
+        torch.cuda.current_stream().synchronize()
+
+        paused: List[LlmRequest] = []
+        for req in self.active_requests:
+            if mgr.is_request_active(req.py_request_id):
+                mgr.suspend_request(req)
+                paused.append(req)
+
+        try:
+            mgr.impl.adjust()
+        except Exception as e:
+            logger.warning(f"KV pool adjust() failed: {e!r}")
+
+        for req in paused:
+            mgr.resume_request(req)
 
     @contextmanager
     def control_action(self):
