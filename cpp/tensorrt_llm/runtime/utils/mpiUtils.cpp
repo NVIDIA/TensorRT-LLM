@@ -100,6 +100,15 @@ std::recursive_mutex mpiMutex;
 MpiComm initLocalSession()
 {
 #if ENABLE_MULTI_DEVICE
+    {
+        // Match initialize()'s opt-out: don't call MPI_Comm_split_type when
+        // MPI is disabled at runtime (no MPI runtime, single-device, Ray).
+        char const* val = std::getenv("TLLM_DISABLE_MPI");
+        if (val != nullptr && std::string(val) == "1")
+        {
+            return MpiComm{COMM_SESSION, false};
+        }
+    }
     MPI_Comm localComm = nullptr;
     MPI_Comm_split_type(COMM_SESSION, OMPI_COMM_TYPE_HOST, COMM_SESSION.getRank(), MPI_INFO_NULL, &localComm);
     MpiComm localSession{localComm, false};
@@ -172,6 +181,20 @@ void initialize(MpiThreadSupport threadMode, bool forwardAbortToParent)
     if (mpiInitialized)
     {
         return;
+    }
+    // When the runtime is explicitly opted out of MPI (Ray-orchestrated jobs,
+    // single-device text inference, hosts where the prebuilt MPI runtime is
+    // misconfigured), do not call MPI_Init_thread.  Distributed comms route
+    // through torch.distributed via pg_utils; MpiComm methods short-circuit
+    // through couldUseMPI() and throw if a caller still reaches them.
+    {
+        char const* val = std::getenv("TLLM_DISABLE_MPI");
+        if (val != nullptr && std::string(val) == "1")
+        {
+            TLLM_LOG_INFO("TLLM_DISABLE_MPI=1; skipping MPI_Init_thread");
+            mpiInitialized = true;
+            return;
+        }
     }
 #if ENABLE_MULTI_DEVICE
     int initialized = 0;

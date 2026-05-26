@@ -36,8 +36,21 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, TypeVar, Union
 
 import numpy as np
 import nvtx
-from mpi4py import MPI
-from mpi4py.util import pkl5
+
+# Make mpi4py optional.  rc.initialize=False prevents mpi4py from calling
+# MPI_Init at module load: a process whose MPI runtime is broken (e.g.,
+# wheel-baked path mismatch) or absent (single-GPU inference, Ray-orchestrated
+# jobs with TLLM_DISABLE_MPI=1) can still `import tensorrt_llm`.  MPI is
+# initialized lazily on first comm operation -- see _ensure_comms() below.
+try:
+    import mpi4py
+    mpi4py.rc.initialize = False
+    mpi4py.rc.finalize = False
+    from mpi4py import MPI
+    from mpi4py.util import pkl5
+except ImportError:
+    MPI = None
+    pkl5 = None
 from packaging import version
 from typing_extensions import ParamSpec
 
@@ -535,7 +548,29 @@ def get_free_ports(num=1) -> List[int]:
 # mpi4py only exports MPI_COMM_TYPE_SHARED, so we define OMPI_COMM_TYPE_HOST here
 OMPI_COMM_TYPE_HOST = 9
 
-comm = pkl5.Intracomm(MPI.COMM_WORLD)
+# Lazy MPI communicators: initialized on first call to mpi_comm() /
+# local_mpi_comm() so that processes without a working MPI runtime can still
+# `import tensorrt_llm` (helpers below short-circuit via ENABLE_MULTI_DEVICE
+# and mpi_disabled() before reaching MPI calls).
+comm = None
+local_comm = None
+_comm_lock = threading.Lock()
+
+
+def _ensure_comms():
+    """Initialize MPI and the trtllm communicators on first use."""
+    global comm, local_comm
+    if MPI is None:
+        return
+    if comm is not None and local_comm is not None:
+        return
+    with _comm_lock:
+        if not MPI.Is_initialized():
+            MPI.Init_thread(MPI.THREAD_MULTIPLE)
+        if comm is None:
+            comm = pkl5.Intracomm(MPI.COMM_WORLD)
+        if local_comm is None:
+            local_comm = comm.Split_type(split_type=OMPI_COMM_TYPE_HOST)
 
 
 def set_mpi_comm(new_comm):
@@ -554,13 +589,12 @@ def mpi_comm():
     if hasattr(thread_local_comm,
                "value") and thread_local_comm.value is not None:
         return thread_local_comm.value
+    _ensure_comms()
     return comm
 
 
-local_comm = mpi_comm().Split_type(split_type=OMPI_COMM_TYPE_HOST)
-
-
 def local_mpi_comm():
+    _ensure_comms()
     return local_comm
 
 
@@ -601,12 +635,17 @@ def global_mpi_rank():
     if mpi_disabled():
         # Fallback: return 0 when MPI is absent (Ray / Slurm PMIx)
         return 0
-
-    return MPI.COMM_WORLD.Get_rank() if ENABLE_MULTI_DEVICE else 0
+    if not (ENABLE_MULTI_DEVICE and MPI is not None):
+        return 0
+    _ensure_comms()
+    return MPI.COMM_WORLD.Get_rank()
 
 
 def global_mpi_size():
-    return MPI.COMM_WORLD.Get_size() if ENABLE_MULTI_DEVICE else 1
+    if mpi_disabled() or not (ENABLE_MULTI_DEVICE and MPI is not None):
+        return 1
+    _ensure_comms()
+    return MPI.COMM_WORLD.Get_size()
 
 
 def mpi_world_size():
@@ -626,7 +665,9 @@ def local_mpi_rank():
 
 
 def local_mpi_size():
-    return local_comm.Get_size() if ENABLE_MULTI_DEVICE else 1
+    if mpi_disabled() or not (ENABLE_MULTI_DEVICE and MPI is not None):
+        return 1
+    return local_mpi_comm().Get_size() if ENABLE_MULTI_DEVICE else 1
 
 
 def default_gpus_per_node():
@@ -639,13 +680,13 @@ def default_gpus_per_node():
 
 
 def mpi_barrier():
-    if ENABLE_MULTI_DEVICE:
+    if ENABLE_MULTI_DEVICE and not mpi_disabled() and MPI is not None:
         mpi_comm().Barrier()
 
 
 def local_mpi_barrier():
-    if ENABLE_MULTI_DEVICE:
-        local_comm.Barrier()
+    if ENABLE_MULTI_DEVICE and not mpi_disabled() and MPI is not None:
+        local_mpi_comm().Barrier()
 
 
 def mpi_broadcast(obj, root=0):

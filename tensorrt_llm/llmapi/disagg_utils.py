@@ -7,8 +7,14 @@ from enum import IntEnum
 from typing import Any, Dict, List, Literal, Optional, Tuple
 
 import yaml
-from mpi4py.MPI import COMM_WORLD, Comm
-from mpi4py.util import pkl5
+
+try:
+    from mpi4py.MPI import COMM_WORLD, Comm
+    from mpi4py.util import pkl5
+except ImportError:
+    COMM_WORLD = None
+    Comm = None  # type: ignore[assignment]
+    pkl5 = None  # disagg paths require MPI; this lets non-MPI imports succeed
 
 from .._utils import global_mpi_rank, global_mpi_size
 

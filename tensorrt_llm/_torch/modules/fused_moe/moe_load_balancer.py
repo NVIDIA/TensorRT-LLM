@@ -9,7 +9,15 @@ from typing import Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
-from mpi4py import MPI
+
+from tensorrt_llm._utils import mpi_disabled
+
+try:
+    from mpi4py import MPI as _MPI
+    if mpi_disabled():
+        _MPI = None
+except ImportError:
+    _MPI = None
 
 import tensorrt_llm
 import tensorrt_llm.bindings.internal.runtime as _tbr
@@ -130,7 +138,7 @@ class HostMoeTensorSharer:
     """
 
     def __init__(self, layer_id: int, expert_count: int,
-                 shared_mpi_comm: MPI.Comm):
+                 shared_mpi_comm: "_MPI.Comm"):
         """
         Initialize a HostMoeTensorSharer instance.
 
@@ -380,7 +388,7 @@ class SingleLayerMoeLoadBalancer:
     def __init__(
             self,
             single_layer_load_balancer_impl: _tbr.SingleLayerMoeLoadBalancer,
-            shared_mpi_comm: MPI.Comm,
+            shared_mpi_comm: "_MPI.Comm",
             expert_count: int,
             updates_enabled: bool = True,
             repeated_count=1,
@@ -894,7 +902,7 @@ class MoeLoadBalancer:
     def _setup_mpi_comm(self):
         global_mpi_comm = tensorrt_llm.mpi_comm()
         shared_mpi_comm = global_mpi_comm.Split_type(
-            split_type=MPI.COMM_TYPE_SHARED)
+            split_type=_MPI.COMM_TYPE_SHARED)
         shared_size = shared_mpi_comm.Get_size()
         local_size = tensorrt_llm.local_mpi_size()
         assert shared_size == local_size, \

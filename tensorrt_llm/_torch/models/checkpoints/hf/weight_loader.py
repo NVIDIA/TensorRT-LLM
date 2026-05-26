@@ -22,7 +22,15 @@ import psutil
 import safetensors
 import torch
 import tqdm
-from mpi4py import MPI as _MPI
+
+from tensorrt_llm._utils import mpi_disabled
+
+try:
+    from mpi4py import MPI as _MPI
+    if mpi_disabled():
+        _MPI = None
+except ImportError:
+    _MPI = None
 
 from tensorrt_llm._torch.models.checkpoints.base_weight_loader import (
     BaseWeightLoader, ConsumableWeightsDict)
@@ -56,7 +64,7 @@ class HfWeightLoader(BaseWeightLoader):
         mpi barrier indefinitely for the ranks that do not.
         """
         available_host_memory = psutil.virtual_memory().available
-        if ENABLE_MULTI_DEVICE:
+        if ENABLE_MULTI_DEVICE and _MPI is not None:
             return local_mpi_comm().allreduce(available_host_memory,
                                               op=_MPI.MIN)
         return available_host_memory
