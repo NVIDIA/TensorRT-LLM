@@ -1,0 +1,455 @@
+/usr/local/lib/python3.12/dist-packages/requests/__init__.py:113: RequestsDependencyWarning: urllib3 (2.6.3) or chardet (6.0.0.post1)/charset_normalizer (3.4.4) doesn't match a supported version!
+  warnings.warn(
+Running 3 items in this shard
+sFF                                                                      [100%]
+=================================== FAILURES ===================================
+______________ test_beam_search_disagg_e2e[sampling_information1] ______________
+
+fixed_params = {'max_beam_width': 2, 'max_tokens': 8}
+input_prompts = [[1, 2, 3], [4, 5, 6], [7, 8, 9]]
+model_kwargs = {'checkpoint_loader': <tensorrt_llm._torch.models.checkpoints.hf.checkpoint_loader.HfCheckpointLoader object at 0x7f26a1a5fc80>, 'disable_flashinfer_sampling': False, 'model': PosixPath('dummy_path'), 'sampler_type': 'TorchSampler'}
+
+    @pytest.mark.threadleak(enabled=False)
+    def test_beam_search_disagg_e2e(
+        fixed_params,
+        input_prompts,
+        model_kwargs: dict[str, Any],
+    ) -> None:
+        if model_kwargs["sampler_type"] != "TorchSampler":
+            pytest.skip("Disaggregated beam score handoff is implemented for TorchSampler")
+    
+        sampling_params = SamplingParams(
+            max_tokens=fixed_params["max_tokens"],
+            n=fixed_params["max_beam_width"],
+            best_of=fixed_params["max_beam_width"],
+            use_beam_search=True,
+            end_id=-1,
+            include_stop_str_in_output=True,
+            additional_model_outputs=["cache_indirection"],
+        )
+    
+        disagg_kwargs = deepcopy(model_kwargs)
+        disagg_kwargs |= dict(
+            disable_overlap_scheduler=True,
+            cuda_graph_config=None,
+            cache_transceiver_config=CacheTransceiverConfig(
+                backend="NIXL",
+                transceiver_runtime="PYTHON",
+                kv_transfer_timeout_ms=1000,
+                kv_transfer_sender_future_timeout_ms=1000,
+            ),
+        )
+    
+        ctx_llm = _build_llm(fixed_params, input_prompts, disagg_kwargs)
+        gen_llm = _build_llm(fixed_params, input_prompts, disagg_kwargs)
+        try:
+            with ctx_llm, gen_llm:
+>               validate_disagg_outputs(ctx_llm, gen_llm,
+                                        input_prompts[:1],
+                                        sampling_params)
+
+tests/unittest/_torch/sampler/test_beam_search.py:515: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+tests/unittest/_torch/sampler/test_beam_search.py:412: in validate_disagg_outputs
+    validate_disagg_output(output, input_prompts[output_idx],
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+output = RequestOutput(request_id=2, prompt=None, prompt_token_ids=[1, 2, 3], outputs=[CompletionOutput(index=0, text='', token...dal_embedding_handles=None, multimodal_hashes=None, mrope_position_ids_handle=None, mrope_position_deltas_handle=None))
+input_prompt = [1, 2, 3]
+sampling_params = SamplingParams(end_id=-1, pad_id=-1, max_tokens=8, bad=None, bad_token_ids=None, stop=None, stop_token_ids=None, inclu...ue, add_special_tokens=True, truncate_prompt_tokens=None, skip_special_tokens=True, spaces_between_special_tokens=True)
+
+    def validate_disagg_output(output: GenerationResult, input_prompt: list[int],
+                               sampling_params: SamplingParams) -> None:
+        """Validate disagg beam output without requiring full-run cache history."""
+        check_context_logits(output, sampling_params)
+        assert len(output.outputs) == sampling_params.n
+        expected_outputs = get_expected_outputs(
+            input_prompt[-1], num_iterations=sampling_params.max_tokens)
+    
+        for beam_idx, beam_output in enumerate(output.outputs):
+            assert beam_output.finish_reason == "length"
+            check_generation_logits(beam_output, sampling_params, valid_tokens=None)
+            check_logprobs(beam_output, sampling_params, valid_tokens=None)
+            expected_token_ids = expected_outputs.outputs[beam_idx].tolist()
+>           assert beam_output.token_ids == expected_token_ids, (
+                f"expected {expected_token_ids} token ids, "
+                f"got {beam_output.token_ids}")
+E           AssertionError: expected [6, 9, 12, 15, 18, 21, 24, 27] token ids, got [0, 9, 12, 15, 18, 21, 24, 27]
+E           assert [0, 9, 12, 15, 18, 21, ...] == [6, 9, 12, 15, 18, 21, ...]
+E             
+E             At index 0 diff: 0 != 6
+E             Use -v to get more diff
+
+tests/unittest/_torch/sampler/test_beam_search.py:295: AssertionError
+----------------------------- Captured stdout call -----------------------------
+[05/26/2026-20:53:41] [TRT-LLM] [I] [llmapi  ] Using LLM with PyTorch backend
+[05/26/2026-20:53:41] [TRT-LLM] [W] [llmapi  ] Using default gpus_per_node: 8
+[TensorRT-LLM] TensorRT LLM version: 1.3.0rc15
+[TRT-LLM] [I] [runtime ] [RANK 0] Refreshed the MPI local session
+Model init total -- 0.00s
+[TRT-LLM] [I] [batchmgr] [RANK 0] Max KV cache blocks per sequence: 1 [window size=32], tokens per block=32, primary blocks=14, secondary blocks=0, max sequence length=32
+[TRT-LLM] [I] [batchmgr] [RANK 0] Number of tokens per block: 32.
+[TRT-LLM] [I] [batchmgr] [RANK 0] [MemUsageChange] Allocated 0.00 GiB for max tokens in paged KV cache (448).
+[TRT-LLM] [I] [executor] [RANK 0] NixlTransferAgent::NixlTransferAgent using NIXL backend: UCX
+[TRT-LLM] [I] [executor] [RANK 0] NixlTransferAgent::NixlTransferAgent backendParams: num_threads: 8
+[1779828899.143124] [luna-prod-72-80gb:47693:0]      ucp_worker.c:2315 UCX  WARN  invalid configuration: IB_PCI_RELAXED_ORDERING=try
+[1779828899.166560] [luna-prod-72-80gb:47693:0]      ucp_worker.c:2315 UCX  WARN  invalid configuration: IB_PCI_RELAXED_ORDERING=try
+[1779828899.190127] [luna-prod-72-80gb:47693:0]      ucp_worker.c:2315 UCX  WARN  invalid configuration: IB_PCI_RELAXED_ORDERING=try
+[1779828899.213615] [luna-prod-72-80gb:47693:0]      ucp_worker.c:2315 UCX  WARN  invalid configuration: IB_PCI_RELAXED_ORDERING=try
+[1779828899.236891] [luna-prod-72-80gb:47693:0]      ucp_worker.c:2315 UCX  WARN  invalid configuration: IB_PCI_RELAXED_ORDERING=try
+[1779828899.260346] [luna-prod-72-80gb:47693:0]      ucp_worker.c:2315 UCX  WARN  invalid configuration: IB_PCI_RELAXED_ORDERING=try
+[1779828899.283726] [luna-prod-72-80gb:47693:0]      ucp_worker.c:2315 UCX  WARN  invalid configuration: IB_PCI_RELAXED_ORDERING=try
+[1779828899.307104] [luna-prod-72-80gb:47693:0]      ucp_worker.c:2315 UCX  WARN  invalid configuration: IB_PCI_RELAXED_ORDERING=try
+[1779828899.356397] [luna-prod-72-80gb:47693:0]      ucp_worker.c:2315 UCX  WARN  invalid configuration: IB_PCI_RELAXED_ORDERING=try
+[TRT-LLM] [I] [executor] [RANK 0] NixlTransferAgent::NixlTransferAgent mAddress: 
+[TRT-LLM] [W] [batchmgr] [RANK 0] [kv cache manager] storeContextBlocks: Can not find sequence for request 6
+[TRT-LLM] [W] [batchmgr] [RANK 0] [kv cache manager] storeContextBlocks: Can not find sequence for request 7
+[TRT-LLM] [W] [batchmgr] [RANK 0] [kv cache manager] storeContextBlocks: Can not find sequence for request 8
+[TRT-LLM] [W] [batchmgr] [RANK 0] [kv cache manager] storeContextBlocks: Can not find sequence for request 9
+[TRT-LLM] [W] [batchmgr] [RANK 0] [kv cache manager] storeContextBlocks: Can not find sequence for request 10
+[TRT-LLM] [W] [batchmgr] [RANK 0] [kv cache manager] storeContextBlocks: Can not find sequence for request 11
+[TRT-LLM] [W] [batchmgr] [RANK 0] [kv cache manager] storeContextBlocks: Can not find sequence for request 12
+[TRT-LLM] [I] [batchmgr] [RANK 0] Max KV cache blocks per sequence: 1 [window size=32], tokens per block=32, primary blocks=312, secondary blocks=0, max sequence length=32
+[TRT-LLM] [I] [batchmgr] [RANK 0] Number of tokens per block: 32.
+[TRT-LLM] [I] [batchmgr] [RANK 0] [MemUsageChange] Allocated 0.01 GiB for max tokens in paged KV cache (9984).
+[TRT-LLM] [I] [executor] [RANK 0] NixlTransferAgent::NixlTransferAgent using NIXL backend: UCX
+[TRT-LLM] [I] [executor] [RANK 0] NixlTransferAgent::NixlTransferAgent backendParams: num_threads: 8
+[1779828901.951726] [luna-prod-72-80gb:47693:0]      ucp_worker.c:2315 UCX  WARN  invalid configuration: IB_PCI_RELAXED_ORDERING=try
+[1779828901.974959] [luna-prod-72-80gb:47693:0]      ucp_worker.c:2315 UCX  WARN  invalid configuration: IB_PCI_RELAXED_ORDERING=try
+[1779828901.998062] [luna-prod-72-80gb:47693:0]      ucp_worker.c:2315 UCX  WARN  invalid configuration: IB_PCI_RELAXED_ORDERING=try
+[1779828902.021337] [luna-prod-72-80gb:47693:0]      ucp_worker.c:2315 UCX  WARN  invalid configuration: IB_PCI_RELAXED_ORDERING=try
+[1779828902.044811] [luna-prod-72-80gb:47693:0]      ucp_worker.c:2315 UCX  WARN  invalid configuration: IB_PCI_RELAXED_ORDERING=try
+[1779828902.068142] [luna-prod-72-80gb:47693:0]      ucp_worker.c:2315 UCX  WARN  invalid configuration: IB_PCI_RELAXED_ORDERING=try
+[1779828902.091300] [luna-prod-72-80gb:47693:0]      ucp_worker.c:2315 UCX  WARN  invalid configuration: IB_PCI_RELAXED_ORDERING=try
+[1779828902.114476] [luna-prod-72-80gb:47693:0]      ucp_worker.c:2315 UCX  WARN  invalid configuration: IB_PCI_RELAXED_ORDERING=try
+[1779828902.137815] [luna-prod-72-80gb:47693:0]      ucp_worker.c:2315 UCX  WARN  invalid configuration: IB_PCI_RELAXED_ORDERING=try
+[TRT-LLM] [I] [executor] [RANK 0] NixlTransferAgent::NixlTransferAgent mAddress: 
+[05/26/2026-20:55:03] [TRT-LLM] [I] [llmapi  ] Using LLM with PyTorch backend
+[05/26/2026-20:55:03] [TRT-LLM] [W] [llmapi  ] Using default gpus_per_node: 8
+[TensorRT-LLM] TensorRT LLM version: 1.3.0rc15
+[TRT-LLM] [I] [runtime ] [RANK 0] Refreshed the MPI local session
+Model init total -- 0.00s
+[TRT-LLM] [I] [batchmgr] [RANK 0] Max KV cache blocks per sequence: 1 [window size=32], tokens per block=32, primary blocks=14, secondary blocks=0, max sequence length=32
+[TRT-LLM] [I] [batchmgr] [RANK 0] Number of tokens per block: 32.
+[TRT-LLM] [I] [batchmgr] [RANK 0] [MemUsageChange] Allocated 0.00 GiB for max tokens in paged KV cache (448).
+[TRT-LLM] [I] [executor] [RANK 0] NixlTransferAgent::NixlTransferAgent using NIXL backend: UCX
+[TRT-LLM] [I] [executor] [RANK 0] NixlTransferAgent::NixlTransferAgent backendParams: num_threads: 8
+[1779828973.240987] [luna-prod-72-80gb:48088:0]      ucp_worker.c:2315 UCX  WARN  invalid configuration: IB_PCI_RELAXED_ORDERING=try
+[1779828973.264258] [luna-prod-72-80gb:48088:0]      ucp_worker.c:2315 UCX  WARN  invalid configuration: IB_PCI_RELAXED_ORDERING=try
+[1779828973.287538] [luna-prod-72-80gb:48088:0]      ucp_worker.c:2315 UCX  WARN  invalid configuration: IB_PCI_RELAXED_ORDERING=try
+[1779828973.310910] [luna-prod-72-80gb:48088:0]      ucp_worker.c:2315 UCX  WARN  invalid configuration: IB_PCI_RELAXED_ORDERING=try
+[1779828973.334261] [luna-prod-72-80gb:48088:0]      ucp_worker.c:2315 UCX  WARN  invalid configuration: IB_PCI_RELAXED_ORDERING=try
+[1779828973.357520] [luna-prod-72-80gb:48088:0]      ucp_worker.c:2315 UCX  WARN  invalid configuration: IB_PCI_RELAXED_ORDERING=try
+[1779828973.380570] [luna-prod-72-80gb:48088:0]      ucp_worker.c:2315 UCX  WARN  invalid configuration: IB_PCI_RELAXED_ORDERING=try
+[1779828973.403678] [luna-prod-72-80gb:48088:0]      ucp_worker.c:2315 UCX  WARN  invalid configuration: IB_PCI_RELAXED_ORDERING=try
+[1779828973.482337] [luna-prod-72-80gb:48088:0]      ucp_worker.c:2315 UCX  WARN  invalid configuration: IB_PCI_RELAXED_ORDERING=try
+[TRT-LLM] [I] [executor] [RANK 0] NixlTransferAgent::NixlTransferAgent mAddress: 
+[TRT-LLM] [W] [batchmgr] [RANK 0] [kv cache manager] storeContextBlocks: Can not find sequence for request 6
+[TRT-LLM] [W] [batchmgr] [RANK 0] [kv cache manager] storeContextBlocks: Can not find sequence for request 7
+[TRT-LLM] [W] [batchmgr] [RANK 0] [kv cache manager] storeContextBlocks: Can not find sequence for request 8
+[TRT-LLM] [W] [batchmgr] [RANK 0] [kv cache manager] storeContextBlocks: Can not find sequence for request 9
+[TRT-LLM] [W] [batchmgr] [RANK 0] [kv cache manager] storeContextBlocks: Can not find sequence for request 10
+[TRT-LLM] [W] [batchmgr] [RANK 0] [kv cache manager] storeContextBlocks: Can not find sequence for request 11
+[TRT-LLM] [W] [batchmgr] [RANK 0] [kv cache manager] storeContextBlocks: Can not find sequence for request 12
+[TRT-LLM] [I] [batchmgr] [RANK 0] Max KV cache blocks per sequence: 1 [window size=32], tokens per block=32, primary blocks=312, secondary blocks=0, max sequence length=32
+[TRT-LLM] [I] [batchmgr] [RANK 0] Number of tokens per block: 32.
+[TRT-LLM] [I] [batchmgr] [RANK 0] [MemUsageChange] Allocated 0.01 GiB for max tokens in paged KV cache (9984).
+[TRT-LLM] [I] [executor] [RANK 0] NixlTransferAgent::NixlTransferAgent using NIXL backend: UCX
+[TRT-LLM] [I] [executor] [RANK 0] NixlTransferAgent::NixlTransferAgent backendParams: num_threads: 8
+[1779828976.047873] [luna-prod-72-80gb:48088:0]      ucp_worker.c:2315 UCX  WARN  invalid configuration: IB_PCI_RELAXED_ORDERING=try
+[1779828976.071137] [luna-prod-72-80gb:48088:0]      ucp_worker.c:2315 UCX  WARN  invalid configuration: IB_PCI_RELAXED_ORDERING=try
+[1779828976.094571] [luna-prod-72-80gb:48088:0]      ucp_worker.c:2315 UCX  WARN  invalid configuration: IB_PCI_RELAXED_ORDERING=try
+[1779828976.118001] [luna-prod-72-80gb:48088:0]      ucp_worker.c:2315 UCX  WARN  invalid configuration: IB_PCI_RELAXED_ORDERING=try
+[1779828976.141533] [luna-prod-72-80gb:48088:0]      ucp_worker.c:2315 UCX  WARN  invalid configuration: IB_PCI_RELAXED_ORDERING=try
+[1779828976.165056] [luna-prod-72-80gb:48088:0]      ucp_worker.c:2315 UCX  WARN  invalid configuration: IB_PCI_RELAXED_ORDERING=try
+[1779828976.188535] [luna-prod-72-80gb:48088:0]      ucp_worker.c:2315 UCX  WARN  invalid configuration: IB_PCI_RELAXED_ORDERING=try
+[1779828976.211877] [luna-prod-72-80gb:48088:0]      ucp_worker.c:2315 UCX  WARN  invalid configuration: IB_PCI_RELAXED_ORDERING=try
+[1779828976.235213] [luna-prod-72-80gb:48088:0]      ucp_worker.c:2315 UCX  WARN  invalid configuration: IB_PCI_RELAXED_ORDERING=try
+[TRT-LLM] [I] [executor] [RANK 0] NixlTransferAgent::NixlTransferAgent mAddress: 
+[TRT-LLM] [W] [batchmgr] [RANK 0] [kv cache manager] storeContextBlocks: Can not find sequence for request 1000
+TEST RAISED ERROR: expected [6, 9, 12, 15, 18, 21, 24, 27] token ids, got [0, 9, 12, 15, 18, 21, 24, 27]
+assert [0, 9, 12, 15, 18, 21, ...] == [6, 9, 12, 15, 18, 21, ...]
+  
+  At index 0 diff: 0 != 6
+  Use -v to get more diff
+----------------------------- Captured stderr call -----------------------------
+The argument `trust_remote_code` is to be used with Auto classes. It has no effect here and is ignored.
+[33;20mrank 0 using MpiPoolSession to spawn MPI processes
+[0mSkipping import of cpp extensions due to incompatible torch version 2.11.0a0+eb65b36914.nv26.02 for torchao version 0.15.0             Please see https://github.com/pytorch/ao/issues/2919 for more info
+/usr/local/lib/python3.12/dist-packages/requests/__init__.py:113: RequestsDependencyWarning: urllib3 (2.6.3) or chardet (6.0.0.post1)/charset_normalizer (3.4.4) doesn't match a supported version!
+  warnings.warn(
+Multiple distributions found for package optimum. Picked distribution: optimum
+Multiple distributions found for package modelopt. Picked distribution: nvidia-modelopt
+/home/scratch.athenac_coreai/pyuser/lib/python3.12/site-packages/modelopt/torch/__init__.py:36: UserWarning: transformers version 5.3.0 is incompatible with nvidia-modelopt and may cause issues. Please install recommended version with `pip install nvidia-modelopt[hf]` if working with HF models.
+  _warnings.warn(
+/home/scratch.athenac_coreai/TensorRT-LLM/tensorrt_llm/serve/openai_protocol.py:117: UserWarning: Field name "schema" in "ResponseFormat" shadows an attribute in parent "OpenAIBaseModel"
+  class ResponseFormat(OpenAIBaseModel):
+`torch_dtype` is deprecated! Use `dtype` instead!
+The argument `trust_remote_code` is to be used with Auto classes. It has no effect here and is ignored.
+[33;20mrank 0 using MpiPoolSession to spawn MPI processes
+[0mSkipping import of cpp extensions due to incompatible torch version 2.11.0a0+eb65b36914.nv26.02 for torchao version 0.15.0             Please see https://github.com/pytorch/ao/issues/2919 for more info
+/usr/local/lib/python3.12/dist-packages/requests/__init__.py:113: RequestsDependencyWarning: urllib3 (2.6.3) or chardet (6.0.0.post1)/charset_normalizer (3.4.4) doesn't match a supported version!
+  warnings.warn(
+Multiple distributions found for package optimum. Picked distribution: optimum
+Multiple distributions found for package modelopt. Picked distribution: nvidia-modelopt
+/home/scratch.athenac_coreai/pyuser/lib/python3.12/site-packages/modelopt/torch/__init__.py:36: UserWarning: transformers version 5.3.0 is incompatible with nvidia-modelopt and may cause issues. Please install recommended version with `pip install nvidia-modelopt[hf]` if working with HF models.
+  _warnings.warn(
+/home/scratch.athenac_coreai/TensorRT-LLM/tensorrt_llm/serve/openai_protocol.py:117: UserWarning: Field name "schema" in "ResponseFormat" shadows an attribute in parent "OpenAIBaseModel"
+  class ResponseFormat(OpenAIBaseModel):
+`torch_dtype` is deprecated! Use `dtype` instead!
+Traceback (most recent call last):
+  File "/home/scratch.athenac_coreai/TensorRT-LLM/tests/unittest/conftest.py", line 121, in pytest_pyfunc_call
+    return (yield)
+            ^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/pluggy/_callers.py", line 121, in _multicall
+    res = hook_impl.function(*args)
+          ^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/scratch.athenac_coreai/pyuser/lib/python3.12/site-packages/_pytest/python.py", line 166, in pytest_pyfunc_call
+    result = testfunction(**testargs)
+             ^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/scratch.athenac_coreai/TensorRT-LLM/tests/unittest/_torch/sampler/test_beam_search.py", line 515, in test_beam_search_disagg_e2e
+    validate_disagg_outputs(ctx_llm, gen_llm,
+  File "/home/scratch.athenac_coreai/TensorRT-LLM/tests/unittest/_torch/sampler/test_beam_search.py", line 412, in validate_disagg_outputs
+    validate_disagg_output(output, input_prompts[output_idx],
+  File "/home/scratch.athenac_coreai/TensorRT-LLM/tests/unittest/_torch/sampler/test_beam_search.py", line 295, in validate_disagg_output
+    assert beam_output.token_ids == expected_token_ids, (
+AssertionError: expected [6, 9, 12, 15, 18, 21, 24, 27] token ids, got [0, 9, 12, 15, 18, 21, 24, 27]
+assert [0, 9, 12, 15, 18, 21, ...] == [6, 9, 12, 15, 18, 21, ...]
+  
+  At index 0 diff: 0 != 6
+  Use -v to get more diff
+______________ test_beam_search_disagg_e2e[sampling_information2] ______________
+
+fixed_params = {'max_beam_width': 2, 'max_tokens': 8}
+input_prompts = [[1, 2, 3], [4, 5, 6], [7, 8, 9]]
+model_kwargs = {'checkpoint_loader': <tensorrt_llm._torch.models.checkpoints.hf.checkpoint_loader.HfCheckpointLoader object at 0x7f26a1ae6c30>, 'disable_flashinfer_sampling': True, 'model': PosixPath('dummy_path'), 'sampler_type': 'TorchSampler'}
+
+    @pytest.mark.threadleak(enabled=False)
+    def test_beam_search_disagg_e2e(
+        fixed_params,
+        input_prompts,
+        model_kwargs: dict[str, Any],
+    ) -> None:
+        if model_kwargs["sampler_type"] != "TorchSampler":
+            pytest.skip("Disaggregated beam score handoff is implemented for TorchSampler")
+    
+        sampling_params = SamplingParams(
+            max_tokens=fixed_params["max_tokens"],
+            n=fixed_params["max_beam_width"],
+            best_of=fixed_params["max_beam_width"],
+            use_beam_search=True,
+            end_id=-1,
+            include_stop_str_in_output=True,
+            additional_model_outputs=["cache_indirection"],
+        )
+    
+        disagg_kwargs = deepcopy(model_kwargs)
+        disagg_kwargs |= dict(
+            disable_overlap_scheduler=True,
+            cuda_graph_config=None,
+            cache_transceiver_config=CacheTransceiverConfig(
+                backend="NIXL",
+                transceiver_runtime="PYTHON",
+                kv_transfer_timeout_ms=1000,
+                kv_transfer_sender_future_timeout_ms=1000,
+            ),
+        )
+    
+        ctx_llm = _build_llm(fixed_params, input_prompts, disagg_kwargs)
+        gen_llm = _build_llm(fixed_params, input_prompts, disagg_kwargs)
+        try:
+            with ctx_llm, gen_llm:
+>               validate_disagg_outputs(ctx_llm, gen_llm,
+                                        input_prompts[:1],
+                                        sampling_params)
+
+tests/unittest/_torch/sampler/test_beam_search.py:515: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+tests/unittest/_torch/sampler/test_beam_search.py:412: in validate_disagg_outputs
+    validate_disagg_output(output, input_prompts[output_idx],
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+output = RequestOutput(request_id=2, prompt=None, prompt_token_ids=[1, 2, 3], outputs=[CompletionOutput(index=0, text='', token...dal_embedding_handles=None, multimodal_hashes=None, mrope_position_ids_handle=None, mrope_position_deltas_handle=None))
+input_prompt = [1, 2, 3]
+sampling_params = SamplingParams(end_id=-1, pad_id=-1, max_tokens=8, bad=None, bad_token_ids=None, stop=None, stop_token_ids=None, inclu...ue, add_special_tokens=True, truncate_prompt_tokens=None, skip_special_tokens=True, spaces_between_special_tokens=True)
+
+    def validate_disagg_output(output: GenerationResult, input_prompt: list[int],
+                               sampling_params: SamplingParams) -> None:
+        """Validate disagg beam output without requiring full-run cache history."""
+        check_context_logits(output, sampling_params)
+        assert len(output.outputs) == sampling_params.n
+        expected_outputs = get_expected_outputs(
+            input_prompt[-1], num_iterations=sampling_params.max_tokens)
+    
+        for beam_idx, beam_output in enumerate(output.outputs):
+            assert beam_output.finish_reason == "length"
+            check_generation_logits(beam_output, sampling_params, valid_tokens=None)
+            check_logprobs(beam_output, sampling_params, valid_tokens=None)
+            expected_token_ids = expected_outputs.outputs[beam_idx].tolist()
+>           assert beam_output.token_ids == expected_token_ids, (
+                f"expected {expected_token_ids} token ids, "
+                f"got {beam_output.token_ids}")
+E           AssertionError: expected [6, 9, 12, 15, 18, 21, 24, 27] token ids, got [0, 9, 12, 15, 18, 21, 24, 27]
+E           assert [0, 9, 12, 15, 18, 21, ...] == [6, 9, 12, 15, 18, 21, ...]
+E             
+E             At index 0 diff: 0 != 6
+E             Use -v to get more diff
+
+tests/unittest/_torch/sampler/test_beam_search.py:295: AssertionError
+----------------------------- Captured stdout call -----------------------------
+[05/26/2026-20:56:20] [TRT-LLM] [I] [llmapi  ] Using LLM with PyTorch backend
+[05/26/2026-20:56:20] [TRT-LLM] [W] [llmapi  ] Using default gpus_per_node: 8
+[TensorRT-LLM] TensorRT LLM version: 1.3.0rc15
+[TRT-LLM] [I] [runtime ] [RANK 0] Refreshed the MPI local session
+Model init total -- 0.00s
+[TRT-LLM] [I] [batchmgr] [RANK 0] Max KV cache blocks per sequence: 1 [window size=32], tokens per block=32, primary blocks=14, secondary blocks=0, max sequence length=32
+[TRT-LLM] [I] [batchmgr] [RANK 0] Number of tokens per block: 32.
+[TRT-LLM] [I] [batchmgr] [RANK 0] [MemUsageChange] Allocated 0.00 GiB for max tokens in paged KV cache (448).
+[TRT-LLM] [I] [executor] [RANK 0] NixlTransferAgent::NixlTransferAgent using NIXL backend: UCX
+[TRT-LLM] [I] [executor] [RANK 0] NixlTransferAgent::NixlTransferAgent backendParams: num_threads: 8
+[1779829042.544792] [luna-prod-72-80gb:48404:0]      ucp_worker.c:2315 UCX  WARN  invalid configuration: IB_PCI_RELAXED_ORDERING=try
+[1779829042.567941] [luna-prod-72-80gb:48404:0]      ucp_worker.c:2315 UCX  WARN  invalid configuration: IB_PCI_RELAXED_ORDERING=try
+[1779829042.591166] [luna-prod-72-80gb:48404:0]      ucp_worker.c:2315 UCX  WARN  invalid configuration: IB_PCI_RELAXED_ORDERING=try
+[1779829042.614182] [luna-prod-72-80gb:48404:0]      ucp_worker.c:2315 UCX  WARN  invalid configuration: IB_PCI_RELAXED_ORDERING=try
+[1779829042.637207] [luna-prod-72-80gb:48404:0]      ucp_worker.c:2315 UCX  WARN  invalid configuration: IB_PCI_RELAXED_ORDERING=try
+[1779829042.660320] [luna-prod-72-80gb:48404:0]      ucp_worker.c:2315 UCX  WARN  invalid configuration: IB_PCI_RELAXED_ORDERING=try
+[1779829042.683680] [luna-prod-72-80gb:48404:0]      ucp_worker.c:2315 UCX  WARN  invalid configuration: IB_PCI_RELAXED_ORDERING=try
+[1779829042.706867] [luna-prod-72-80gb:48404:0]      ucp_worker.c:2315 UCX  WARN  invalid configuration: IB_PCI_RELAXED_ORDERING=try
+[1779829043.008885] [luna-prod-72-80gb:48404:0]      ucp_worker.c:2315 UCX  WARN  invalid configuration: IB_PCI_RELAXED_ORDERING=try
+[TRT-LLM] [I] [executor] [RANK 0] NixlTransferAgent::NixlTransferAgent mAddress: 
+[TRT-LLM] [W] [batchmgr] [RANK 0] [kv cache manager] storeContextBlocks: Can not find sequence for request 6
+[TRT-LLM] [W] [batchmgr] [RANK 0] [kv cache manager] storeContextBlocks: Can not find sequence for request 7
+[TRT-LLM] [W] [batchmgr] [RANK 0] [kv cache manager] storeContextBlocks: Can not find sequence for request 8
+[TRT-LLM] [W] [batchmgr] [RANK 0] [kv cache manager] storeContextBlocks: Can not find sequence for request 9
+[TRT-LLM] [W] [batchmgr] [RANK 0] [kv cache manager] storeContextBlocks: Can not find sequence for request 10
+[TRT-LLM] [W] [batchmgr] [RANK 0] [kv cache manager] storeContextBlocks: Can not find sequence for request 11
+[TRT-LLM] [W] [batchmgr] [RANK 0] [kv cache manager] storeContextBlocks: Can not find sequence for request 12
+[TRT-LLM] [I] [batchmgr] [RANK 0] Max KV cache blocks per sequence: 1 [window size=32], tokens per block=32, primary blocks=312, secondary blocks=0, max sequence length=32
+[TRT-LLM] [I] [batchmgr] [RANK 0] Number of tokens per block: 32.
+[TRT-LLM] [I] [batchmgr] [RANK 0] [MemUsageChange] Allocated 0.01 GiB for max tokens in paged KV cache (9984).
+[TRT-LLM] [I] [executor] [RANK 0] NixlTransferAgent::NixlTransferAgent using NIXL backend: UCX
+[TRT-LLM] [I] [executor] [RANK 0] NixlTransferAgent::NixlTransferAgent backendParams: num_threads: 8
+[1779829045.574203] [luna-prod-72-80gb:48404:0]      ucp_worker.c:2315 UCX  WARN  invalid configuration: IB_PCI_RELAXED_ORDERING=try
+[1779829045.597573] [luna-prod-72-80gb:48404:0]      ucp_worker.c:2315 UCX  WARN  invalid configuration: IB_PCI_RELAXED_ORDERING=try
+[1779829045.620702] [luna-prod-72-80gb:48404:0]      ucp_worker.c:2315 UCX  WARN  invalid configuration: IB_PCI_RELAXED_ORDERING=try
+[1779829045.644118] [luna-prod-72-80gb:48404:0]      ucp_worker.c:2315 UCX  WARN  invalid configuration: IB_PCI_RELAXED_ORDERING=try
+[1779829045.667648] [luna-prod-72-80gb:48404:0]      ucp_worker.c:2315 UCX  WARN  invalid configuration: IB_PCI_RELAXED_ORDERING=try
+[1779829045.691082] [luna-prod-72-80gb:48404:0]      ucp_worker.c:2315 UCX  WARN  invalid configuration: IB_PCI_RELAXED_ORDERING=try
+[1779829045.714411] [luna-prod-72-80gb:48404:0]      ucp_worker.c:2315 UCX  WARN  invalid configuration: IB_PCI_RELAXED_ORDERING=try
+[1779829045.737657] [luna-prod-72-80gb:48404:0]      ucp_worker.c:2315 UCX  WARN  invalid configuration: IB_PCI_RELAXED_ORDERING=try
+[1779829045.760889] [luna-prod-72-80gb:48404:0]      ucp_worker.c:2315 UCX  WARN  invalid configuration: IB_PCI_RELAXED_ORDERING=try
+[TRT-LLM] [I] [executor] [RANK 0] NixlTransferAgent::NixlTransferAgent mAddress: 
+[05/26/2026-20:57:27] [TRT-LLM] [I] [llmapi  ] Using LLM with PyTorch backend
+[05/26/2026-20:57:27] [TRT-LLM] [W] [llmapi  ] Using default gpus_per_node: 8
+[TensorRT-LLM] TensorRT LLM version: 1.3.0rc15
+[TRT-LLM] [I] [runtime ] [RANK 0] Refreshed the MPI local session
+Model init total -- 0.00s
+[TRT-LLM] [I] [batchmgr] [RANK 0] Max KV cache blocks per sequence: 1 [window size=32], tokens per block=32, primary blocks=14, secondary blocks=0, max sequence length=32
+[TRT-LLM] [I] [batchmgr] [RANK 0] Number of tokens per block: 32.
+[TRT-LLM] [I] [batchmgr] [RANK 0] [MemUsageChange] Allocated 0.00 GiB for max tokens in paged KV cache (448).
+[TRT-LLM] [I] [executor] [RANK 0] NixlTransferAgent::NixlTransferAgent using NIXL backend: UCX
+[TRT-LLM] [I] [executor] [RANK 0] NixlTransferAgent::NixlTransferAgent backendParams: num_threads: 8
+[1779829104.741886] [luna-prod-72-80gb:48741:0]      ucp_worker.c:2315 UCX  WARN  invalid configuration: IB_PCI_RELAXED_ORDERING=try
+[1779829104.765740] [luna-prod-72-80gb:48741:0]      ucp_worker.c:2315 UCX  WARN  invalid configuration: IB_PCI_RELAXED_ORDERING=try
+[1779829104.788675] [luna-prod-72-80gb:48741:0]      ucp_worker.c:2315 UCX  WARN  invalid configuration: IB_PCI_RELAXED_ORDERING=try
+[1779829104.811673] [luna-prod-72-80gb:48741:0]      ucp_worker.c:2315 UCX  WARN  invalid configuration: IB_PCI_RELAXED_ORDERING=try
+[1779829104.834640] [luna-prod-72-80gb:48741:0]      ucp_worker.c:2315 UCX  WARN  invalid configuration: IB_PCI_RELAXED_ORDERING=try
+[1779829104.857348] [luna-prod-72-80gb:48741:0]      ucp_worker.c:2315 UCX  WARN  invalid configuration: IB_PCI_RELAXED_ORDERING=try
+[1779829104.880253] [luna-prod-72-80gb:48741:0]      ucp_worker.c:2315 UCX  WARN  invalid configuration: IB_PCI_RELAXED_ORDERING=try
+[1779829104.902945] [luna-prod-72-80gb:48741:0]      ucp_worker.c:2315 UCX  WARN  invalid configuration: IB_PCI_RELAXED_ORDERING=try
+[1779829104.971960] [luna-prod-72-80gb:48741:0]      ucp_worker.c:2315 UCX  WARN  invalid configuration: IB_PCI_RELAXED_ORDERING=try
+[TRT-LLM] [I] [executor] [RANK 0] NixlTransferAgent::NixlTransferAgent mAddress: 
+[TRT-LLM] [W] [batchmgr] [RANK 0] [kv cache manager] storeContextBlocks: Can not find sequence for request 6
+[TRT-LLM] [W] [batchmgr] [RANK 0] [kv cache manager] storeContextBlocks: Can not find sequence for request 7
+[TRT-LLM] [W] [batchmgr] [RANK 0] [kv cache manager] storeContextBlocks: Can not find sequence for request 8
+[TRT-LLM] [W] [batchmgr] [RANK 0] [kv cache manager] storeContextBlocks: Can not find sequence for request 9
+[TRT-LLM] [W] [batchmgr] [RANK 0] [kv cache manager] storeContextBlocks: Can not find sequence for request 10
+[TRT-LLM] [W] [batchmgr] [RANK 0] [kv cache manager] storeContextBlocks: Can not find sequence for request 11
+[TRT-LLM] [W] [batchmgr] [RANK 0] [kv cache manager] storeContextBlocks: Can not find sequence for request 12
+[TRT-LLM] [I] [batchmgr] [RANK 0] Max KV cache blocks per sequence: 1 [window size=32], tokens per block=32, primary blocks=312, secondary blocks=0, max sequence length=32
+[TRT-LLM] [I] [batchmgr] [RANK 0] Number of tokens per block: 32.
+[TRT-LLM] [I] [batchmgr] [RANK 0] [MemUsageChange] Allocated 0.01 GiB for max tokens in paged KV cache (9984).
+[TRT-LLM] [I] [executor] [RANK 0] NixlTransferAgent::NixlTransferAgent using NIXL backend: UCX
+[TRT-LLM] [I] [executor] [RANK 0] NixlTransferAgent::NixlTransferAgent backendParams: num_threads: 8
+[1779829107.545540] [luna-prod-72-80gb:48741:0]      ucp_worker.c:2315 UCX  WARN  invalid configuration: IB_PCI_RELAXED_ORDERING=try
+[1779829107.569422] [luna-prod-72-80gb:48741:0]      ucp_worker.c:2315 UCX  WARN  invalid configuration: IB_PCI_RELAXED_ORDERING=try
+[1779829107.592314] [luna-prod-72-80gb:48741:0]      ucp_worker.c:2315 UCX  WARN  invalid configuration: IB_PCI_RELAXED_ORDERING=try
+[1779829107.615083] [luna-prod-72-80gb:48741:0]      ucp_worker.c:2315 UCX  WARN  invalid configuration: IB_PCI_RELAXED_ORDERING=try
+[1779829107.637841] [luna-prod-72-80gb:48741:0]      ucp_worker.c:2315 UCX  WARN  invalid configuration: IB_PCI_RELAXED_ORDERING=try
+[1779829107.660957] [luna-prod-72-80gb:48741:0]      ucp_worker.c:2315 UCX  WARN  invalid configuration: IB_PCI_RELAXED_ORDERING=try
+[1779829107.683755] [luna-prod-72-80gb:48741:0]      ucp_worker.c:2315 UCX  WARN  invalid configuration: IB_PCI_RELAXED_ORDERING=try
+[1779829107.706580] [luna-prod-72-80gb:48741:0]      ucp_worker.c:2315 UCX  WARN  invalid configuration: IB_PCI_RELAXED_ORDERING=try
+[1779829107.729349] [luna-prod-72-80gb:48741:0]      ucp_worker.c:2315 UCX  WARN  invalid configuration: IB_PCI_RELAXED_ORDERING=try
+[TRT-LLM] [I] [executor] [RANK 0] NixlTransferAgent::NixlTransferAgent mAddress: 
+[TRT-LLM] [W] [batchmgr] [RANK 0] [kv cache manager] storeContextBlocks: Can not find sequence for request 1000
+TEST RAISED ERROR: expected [6, 9, 12, 15, 18, 21, 24, 27] token ids, got [0, 9, 12, 15, 18, 21, 24, 27]
+assert [0, 9, 12, 15, 18, 21, ...] == [6, 9, 12, 15, 18, 21, ...]
+  
+  At index 0 diff: 0 != 6
+  Use -v to get more diff
+----------------------------- Captured stderr call -----------------------------
+The argument `trust_remote_code` is to be used with Auto classes. It has no effect here and is ignored.
+[33;20mrank 0 using MpiPoolSession to spawn MPI processes
+[0mSkipping import of cpp extensions due to incompatible torch version 2.11.0a0+eb65b36914.nv26.02 for torchao version 0.15.0             Please see https://github.com/pytorch/ao/issues/2919 for more info
+/usr/local/lib/python3.12/dist-packages/requests/__init__.py:113: RequestsDependencyWarning: urllib3 (2.6.3) or chardet (6.0.0.post1)/charset_normalizer (3.4.4) doesn't match a supported version!
+  warnings.warn(
+Multiple distributions found for package optimum. Picked distribution: optimum
+Multiple distributions found for package modelopt. Picked distribution: nvidia-modelopt
+/home/scratch.athenac_coreai/pyuser/lib/python3.12/site-packages/modelopt/torch/__init__.py:36: UserWarning: transformers version 5.3.0 is incompatible with nvidia-modelopt and may cause issues. Please install recommended version with `pip install nvidia-modelopt[hf]` if working with HF models.
+  _warnings.warn(
+/home/scratch.athenac_coreai/TensorRT-LLM/tensorrt_llm/serve/openai_protocol.py:117: UserWarning: Field name "schema" in "ResponseFormat" shadows an attribute in parent "OpenAIBaseModel"
+  class ResponseFormat(OpenAIBaseModel):
+`torch_dtype` is deprecated! Use `dtype` instead!
+The argument `trust_remote_code` is to be used with Auto classes. It has no effect here and is ignored.
+[33;20mrank 0 using MpiPoolSession to spawn MPI processes
+[0mSkipping import of cpp extensions due to incompatible torch version 2.11.0a0+eb65b36914.nv26.02 for torchao version 0.15.0             Please see https://github.com/pytorch/ao/issues/2919 for more info
+/usr/local/lib/python3.12/dist-packages/requests/__init__.py:113: RequestsDependencyWarning: urllib3 (2.6.3) or chardet (6.0.0.post1)/charset_normalizer (3.4.4) doesn't match a supported version!
+  warnings.warn(
+Multiple distributions found for package optimum. Picked distribution: optimum
+Multiple distributions found for package modelopt. Picked distribution: nvidia-modelopt
+/home/scratch.athenac_coreai/pyuser/lib/python3.12/site-packages/modelopt/torch/__init__.py:36: UserWarning: transformers version 5.3.0 is incompatible with nvidia-modelopt and may cause issues. Please install recommended version with `pip install nvidia-modelopt[hf]` if working with HF models.
+  _warnings.warn(
+/home/scratch.athenac_coreai/TensorRT-LLM/tensorrt_llm/serve/openai_protocol.py:117: UserWarning: Field name "schema" in "ResponseFormat" shadows an attribute in parent "OpenAIBaseModel"
+  class ResponseFormat(OpenAIBaseModel):
+`torch_dtype` is deprecated! Use `dtype` instead!
+Traceback (most recent call last):
+  File "/home/scratch.athenac_coreai/TensorRT-LLM/tests/unittest/conftest.py", line 121, in pytest_pyfunc_call
+    return (yield)
+            ^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/pluggy/_callers.py", line 121, in _multicall
+    res = hook_impl.function(*args)
+          ^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/scratch.athenac_coreai/pyuser/lib/python3.12/site-packages/_pytest/python.py", line 166, in pytest_pyfunc_call
+    result = testfunction(**testargs)
+             ^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/scratch.athenac_coreai/TensorRT-LLM/tests/unittest/_torch/sampler/test_beam_search.py", line 515, in test_beam_search_disagg_e2e
+    validate_disagg_outputs(ctx_llm, gen_llm,
+  File "/home/scratch.athenac_coreai/TensorRT-LLM/tests/unittest/_torch/sampler/test_beam_search.py", line 412, in validate_disagg_outputs
+    validate_disagg_output(output, input_prompts[output_idx],
+  File "/home/scratch.athenac_coreai/TensorRT-LLM/tests/unittest/_torch/sampler/test_beam_search.py", line 295, in validate_disagg_output
+    assert beam_output.token_ids == expected_token_ids, (
+AssertionError: expected [6, 9, 12, 15, 18, 21, 24, 27] token ids, got [0, 9, 12, 15, 18, 21, 24, 27]
+assert [0, 9, 12, 15, 18, 21, ...] == [6, 9, 12, 15, 18, 21, ...]
+  
+  At index 0 diff: 0 != 6
+  Use -v to get more diff
+=============================== warnings summary ===============================
+../pyuser/lib/python3.12/site-packages/modelopt/torch/__init__.py:36
+  /home/scratch.athenac_coreai/pyuser/lib/python3.12/site-packages/modelopt/torch/__init__.py:36: UserWarning: transformers version 5.3.0 is incompatible with nvidia-modelopt and may cause issues. Please install recommended version with `pip install nvidia-modelopt[hf]` if working with HF models.
+    _warnings.warn(
+
+../pyuser/lib/python3.12/site-packages/_pytest/config/__init__.py:1434
+  /home/scratch.athenac_coreai/pyuser/lib/python3.12/site-packages/_pytest/config/__init__.py:1434: PytestConfigWarning: Unknown config option: xdist_start_method
+  
+    self._warn_or_fail_if_strict(f"Unknown config option: {key}\n")
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+============================== slowest durations ===============================
+158.54s call     _torch/sampler/test_beam_search.py::test_beam_search_disagg_e2e[sampling_information1]
+131.34s call     _torch/sampler/test_beam_search.py::test_beam_search_disagg_e2e[sampling_information2]
+
+(7 durations < 0.005s hidden.  Use -vv to show these durations.)
+=========================== short test summary info ============================
+FAILED tests/unittest/_torch/sampler/test_beam_search.py::test_beam_search_disagg_e2e[sampling_information1]
+FAILED tests/unittest/_torch/sampler/test_beam_search.py::test_beam_search_disagg_e2e[sampling_information2]
+2 failed, 1 skipped, 2 warnings in 291.37s (0:04:51)
