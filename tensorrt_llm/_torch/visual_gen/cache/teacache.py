@@ -205,6 +205,11 @@ class TeaCacheHook:
         self.rescale_func = np.poly1d(config.coefficients)
         self.extractor_fn = None
 
+        # Runtime warmup/cutoff bounds, derived per-generation by
+        # TeaCacheBackend.refresh from num_inference_steps.
+        self.ret_steps: Optional[int] = None
+        self.cutoff_steps: Optional[int] = None
+
         # Separate cache state for conditional (pos) and unconditional (neg) branches
         self.state_pos = self._new_state()
         self.state_neg = self._new_state()
@@ -293,12 +298,12 @@ class TeaCacheHook:
         Returns True to compute, False to use cache.
         """
         # Warmup: Always compute first few steps to build stable cache
-        if self.config.ret_steps is not None and state["cnt"] < self.config.ret_steps:
+        if self.ret_steps is not None and state["cnt"] < self.ret_steps:
             state["acc_dist"] = 0.0
             return True
 
         # Cooldown: Always compute last few steps for quality
-        if self.config.cutoff_steps is not None and state["cnt"] >= self.config.cutoff_steps:
+        if self.cutoff_steps is not None and state["cnt"] >= self.cutoff_steps:
             return True
 
         # First step: no previous input to compare
@@ -374,20 +379,17 @@ class TeaCacheBackend:
         # Reset cache state (clears previous residuals and counters)
         self.hook.reset_state()
 
-        # Derive warmup/cutoff from mode (use_ret_steps)
+        # Derive warmup/cutoff from mode (use_ret_steps).
         # Aligns with TeaCache repo settings for Wan 2.1
         # (ref: https://github.com/ali-vilab/TeaCache/blob/main/TeaCache4Wan2.1/teacache_generate.py)
-        if self.config.ret_steps is None:
-            self.config.ret_steps = 5 if self.config.use_ret_steps else 1
-        self.config.cutoff_steps = (
-            num_inference_steps if self.config.use_ret_steps else num_inference_steps - 1
-        )
-
-        self.config.num_steps = num_inference_steps
+        ret_steps = 5 if self.config.use_ret_steps else 1
+        cutoff_steps = num_inference_steps if self.config.use_ret_steps else num_inference_steps - 1
+        self.hook.ret_steps = ret_steps
+        self.hook.cutoff_steps = cutoff_steps
 
         logger.info(
             f"TeaCache: {num_inference_steps} steps | "
-            f"warmup: {self.config.ret_steps}, cutoff: {self.config.cutoff_steps}, "
+            f"warmup: {ret_steps}, cutoff: {cutoff_steps}, "
             f"thresh: {self.config.teacache_thresh}"
         )
 

@@ -47,6 +47,8 @@ struct FmhaOptions : public KernelConfigBase {
   bool mDryRun{false};
   // Enable the auto tuner.
   bool mEnablesAutoTuner{false};
+  // Enable the BF16Q+FP8KV K-only transform path. Disabled by default.
+  bool mEnablesBf16QFp8KvKOnlyTransform{false};
   // Whether is exporting cubin.
   bool mIsExportingCubin{false};
 
@@ -127,6 +129,7 @@ struct FmhaOptions : public KernelConfigBase {
     TO_JSON(mChunkedAttentionSize);
     TO_JSON(mDryRun);
     TO_JSON(mEnablesAutoTuner);
+    TO_JSON(mEnablesBf16QFp8KvKOnlyTransform);
     TO_JSON(mIsExportingCubin);
     TO_JSON(mIsTracing);
     TO_JSON(mMaxNumCtasPerSeqKv);
@@ -498,6 +501,11 @@ inline void checkFmhaOptions(FmhaOptions const& options,
   if (options.mDtypeQ != options.mDtypeKv) {
     TLLM_CHECK_ERROR(options.mMmaOrder == MmaOrder::Pv0_Qk0_Pv1_Qk1,
                      "Only MMA order Pv0_Qk0_Pv1_Qk1 is supported for transformed K/V.");
+  }
+  if (options.mEnablesBf16QFp8KvKOnlyTransform) {
+    TLLM_CHECK_ERROR(usesKOnlyTransformPipeline(options),
+                     "BF16Q+FP8KV K-only transform is only supported for non-MLA Blackwell "
+                     "generation kernels with BF16 Q, E4M3 K/V, and H64/H128.");
   }
 
   if (options.mMmaOrder == MmaOrder::Qk0_Qk1_Pv0_Pv1) {

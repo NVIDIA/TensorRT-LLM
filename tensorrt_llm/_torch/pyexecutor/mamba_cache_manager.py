@@ -994,7 +994,6 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
     C++ KVCacheManager, enabling block reuse / prefix caching across attention
     and mamba layers. This is the default hybrid manager.
 
-    Disaggregated serving is not supported yet.
     """
 
     def __init__(
@@ -1028,6 +1027,7 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
         is_estimating_kv_cache: bool = False,
         is_draft: bool = False,
         use_replay_state_update: bool = False,
+        model_type: str = "nemotron_hybrid",
         **kwargs,
     ) -> None:
         # 3 kinds of layers:
@@ -1106,6 +1106,24 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
         self.conv_state_shape = [conv_dim, mamba_d_conv - 1]
         self.ssm_state_shape = [nheads, mamba_head_dim, mamba_d_state]
         self.conv_state_dtype = mamba_cache_dtype
+
+        # Store GLOBAL (pre-TP-division) mamba params for disagg RnnModelConfig.
+        # d_inner is computed at the top of __init__ before TP division.
+        d_inner_global = d_inner  # = mamba_head_dim * mamba_num_heads (GLOBAL)
+        conv_dim_global = d_inner_global + 2 * mamba_n_groups * mamba_d_state
+        self._rnn_d_state = mamba_d_state
+        self._rnn_d_conv = mamba_d_conv
+        self._rnn_num_heads = mamba_num_heads  # GLOBAL
+        self._rnn_n_groups = mamba_n_groups
+        self._rnn_head_dim = mamba_head_dim
+        self._rnn_hidden_size = d_inner_global  # GLOBAL = head_dim * num_heads
+        self._rnn_conv_dim_size = conv_dim_global  # GLOBAL conv dim
+        self._rnn_num_layers = mamba_num_layers
+
+        # Conv section layout for section-aware split/concat in TP mismatch.
+        # Section dims are derived from mHiddenSize and mNGroups*mDState in C++;
+        # we just need to tell C++ which ordering to use.
+        self._rnn_conv_section_layout = model_type  # "nemotron_hybrid" or "qwen3_next"
         self.ssm_count = math.prod(self.ssm_state_shape)
         self.conv_count = math.prod(self.conv_state_shape)
         self.ssm_bytes = self.ssm_count * self.ssm_state_dtype.itemsize
@@ -1128,6 +1146,18 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
         self.linear_attention_metadata.cache_type = LinearCacheType.RECURRENT_STATES.value
         self.linear_attention_metadata.all_recurrent_states_bytes = self.ssm_bytes + self.conv_bytes
         self.linear_attention_metadata.states_snapshot_interval = kv_cache_config.mamba_state_cache_interval if kv_cache_config.enable_block_reuse else 0
+        # RNN model params for disagg TP-mismatch split/concat.
+        conv_section_map = {"nemotron_hybrid": 1, "qwen3_next": 2}
+        self.linear_attention_metadata.rnn_num_heads = self._rnn_num_heads
+        self.linear_attention_metadata.rnn_head_dim = self._rnn_head_dim
+        self.linear_attention_metadata.rnn_d_state = self._rnn_d_state
+        self.linear_attention_metadata.rnn_d_conv = self._rnn_d_conv
+        self.linear_attention_metadata.rnn_n_groups = self._rnn_n_groups
+        self.linear_attention_metadata.rnn_conv_section_layout = conv_section_map.get(
+            self._rnn_conv_section_layout, 0)
+        self.linear_attention_metadata.rnn_ssm_bytes = self.ssm_bytes
+        self.linear_attention_metadata.rnn_ssm_dtype_size = self.ssm_state_dtype.itemsize
+        self.linear_attention_metadata.rnn_conv_dtype_size = self.conv_state_dtype.itemsize
         kv_cache_config = kv_cache_config.model_copy(deep=True)
         if kv_cache_config.enable_partial_reuse:
             logger.warning(
@@ -1201,6 +1231,7 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
         self._row_indices = torch.arange(self.max_batch_size,
                                          dtype=torch.long,
                                          device="cpu")
+        self._request_id_to_state_index = {}
         self.kv_cache_config = kv_cache_config
         self.is_estimating_kv_cache = is_estimating_kv_cache
 
@@ -1308,6 +1339,7 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
         is_gen: bool = False,
         prepare_resource: bool = True,
         max_num_draft_tokens: int = 0,
+        kv_reserve_draft_tokens: Optional[int] = None,
         use_mrope: bool = False,
         max_beam_width: int = 1,
         # For capturable drafting loops. During normal inference, the draft model always
@@ -1317,12 +1349,18 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
         num_extra_decoding_steps: int = 0,
         draft_kv_cache_manager: Optional[KVCacheManager] = None,
     ) -> List[LlmRequest]:
-        requests = super().add_dummy_requests(request_ids, token_nums, is_gen,
-                                              prepare_resource,
-                                              max_num_draft_tokens, use_mrope,
-                                              max_beam_width,
-                                              num_extra_decoding_steps,
-                                              draft_kv_cache_manager)
+        requests = super().add_dummy_requests(
+            request_ids=request_ids,
+            token_nums=token_nums,
+            is_gen=is_gen,
+            prepare_resource=prepare_resource,
+            max_num_draft_tokens=max_num_draft_tokens,
+            kv_reserve_draft_tokens=kv_reserve_draft_tokens,
+            use_mrope=use_mrope,
+            max_beam_width=max_beam_width,
+            num_extra_decoding_steps=num_extra_decoding_steps,
+            draft_kv_cache_manager=draft_kv_cache_manager,
+        )
         if requests:
             self.requests.extend(requests)
         self._setup_state_indices()
@@ -1509,6 +1547,7 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
     def free_resources(self, request: LlmRequest, pin_on_release: bool = False):
         if request in self.requests:
             self.requests.remove(request)
+            self._request_id_to_state_index.pop(request.py_request_id, None)
         super().free_resources(request, pin_on_release)
 
     def _setup_state_indices(self) -> None:
@@ -1563,10 +1602,21 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
         self.cuda_state_indices.copy_(self._host_state_indices,
                                       non_blocking=True)
 
-    def get_state_indices(
-            self,
-            request_ids: Optional[List[int]] = None,
-            is_padding: Optional[List[bool]] = None) -> torch.Tensor:
+        # Build request_id → pool block offset mapping so that
+        # get_state_indices can return indices in arbitrary request order.
+        for i, req in enumerate(self.requests):
+            self._request_id_to_state_index[
+                req.py_request_id] = self._host_state_indices[i].item()
+
+    def get_state_indices(self,
+                          request_ids: Optional[List[int]] = None,
+                          is_padding: Optional[List[bool]] = None) -> list:
+        if request_ids is not None:
+            # Return indices in the order of the caller's request_ids,
+            # not the internal self.requests order.  This is critical when
+            # the batch is reordered after prepare_resources (e.g. disagg
+            # serving sorts generation_requests by py_batch_idx).
+            return [self._request_id_to_state_index[rid] for rid in request_ids]
         return self.cuda_state_indices
 
     def calc_next_context_chunk_size(self, request: LlmRequest) -> int:

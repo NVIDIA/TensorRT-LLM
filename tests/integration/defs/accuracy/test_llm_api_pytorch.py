@@ -1757,6 +1757,18 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
 
     @pytest.mark.skip_less_device_memory(60000)
     @parametrize_with_ids("enable_chunked_prefill", [False, True])
+    def test_bfloat16_flashinfer(self, enable_chunked_prefill):
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.75)
+        with LLM(self.MODEL_PATH,
+                 kv_cache_config=kv_cache_config,
+                 attn_backend="FLASHINFER",
+                 enable_chunked_prefill=enable_chunked_prefill,
+                 max_num_tokens=512 if enable_chunked_prefill else 8192) as llm:
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+
+    @pytest.mark.skip_less_device_memory(60000)
+    @parametrize_with_ids("enable_chunked_prefill", [False, True])
     @parametrize_with_ids("attention_dp,cuda_graph,overlap_scheduler",
                           [(False, False, False), (True, True, True)])
     @parametrize_with_ids("mtp_nextn", [0, 2])
@@ -6327,6 +6339,12 @@ class TestQwen3_5_4B(LlmapiAccuracyTestHarness):
         dflash_model_path = f"{llm_models_root()}/Qwen3.5-4B-DFlash"
         spec_config = DFlashDecodingConfig(max_draft_len=4,
                                            speculative_model=dflash_model_path)
+
+        # Use lower threshold for H20
+        is_h20_gpu = check_device_contain(
+            ["H20"]) and not check_device_contain(["H200"])
+        extra_acc_spec = "h20" if is_h20_gpu else None
+
         with LLM(target_model_path,
                  max_seq_len=4096,
                  max_batch_size=8,
@@ -6335,6 +6353,7 @@ class TestQwen3_5_4B(LlmapiAccuracyTestHarness):
                  speculative_config=spec_config) as llm:
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm,
+                          extra_acc_spec=extra_acc_spec,
                           extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
 
 
@@ -6595,6 +6614,37 @@ class TestQwen3_5_397B_A17B(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
             mocker.patch.object(GSM8K, "MAX_OUTPUT_LEN",
                                 self.GSM8K_MAX_OUTPUT_LEN)
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm,
+                          extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
+
+
+@skip_pre_hopper
+@pytest.mark.skip_less_device_memory(80000)
+class TestQwen3_6_27B(LlmapiAccuracyTestHarness):
+    MODEL_NAME = "Qwen/Qwen3.6-27B"
+    EXTRA_EVALUATOR_KWARGS = dict(
+        apply_chat_template=True,
+        fewshot_as_multiturn=True,
+        chat_template_kwargs=dict(enable_thinking=False),
+    )
+
+    def test_fp8(self):
+        model_path = f"{llm_models_root()}/Qwen3.6-27B-FP8"
+
+        if not os.path.exists(model_path):
+            pytest.skip(f"Model directory {model_path} does not exist")
+
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.8,
+                                        enable_block_reuse=False)
+        cuda_graph_config = CudaGraphConfig(enable_padding=True)
+
+        with LLM(model_path,
+                 max_seq_len=4096,
+                 max_batch_size=32,
+                 kv_cache_config=kv_cache_config,
+                 cuda_graph_config=cuda_graph_config) as llm:
+            assert llm.args.quant_config.quant_algo == QuantAlgo.FP8_BLOCK_SCALES
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm,
                           extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
