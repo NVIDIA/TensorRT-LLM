@@ -377,7 +377,7 @@ Example
    # trtllm-trace-1778480665-7993d824-rank-0.json
    # trtllm-trace-1778480665-7993d824-rank-1.json   (TP=2)
 
-Open the trace files in `ui.perfetto.dev <https://ui.perfetto.dev/>`_ or ``chrome://tracing``. Each captured iteration is wrapped in an SGLang-compatible ``step[EXTEND bs=N toks=M]`` or ``step[DECODE bs=N]`` user-annotation scope so traces from ``trtllm-serve`` and SGLang can be compared side-by-side.
+Open the trace files in `ui.perfetto.dev <https://ui.perfetto.dev/>`_ or ``chrome://tracing``. Each captured iteration is wrapped in a ``step[EXTEND bs=N toks=M]`` or ``step[DECODE bs=N]`` user-annotation scope.
 
 For a full benchmarking + profiling workflow (including multi-cycle capture under steady-state load), see :doc:`run-benchmark-with-trtllm-serve`.
 
