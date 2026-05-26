@@ -5,6 +5,7 @@ from typing import Callable, List, Optional, Tuple
 
 import pytest
 import torch
+from torch import nn
 from torch.multiprocessing.reductions import reduce_tensor
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 from utils.llm_data import llm_models_root
@@ -416,15 +417,17 @@ class RefW4A8NVFP4FP8ModelWithIPCHandles(RefHFModel):
     Mirrors ``RefNVFP4ModelWithIPCHandles`` from the multi-GPU test file but:
     - uses block size 32 (vs NVFP4's 16) to match
       ``W4A8NVFP4FP8LinearMethod.scaling_vector_size``
-    - skips ``input_scale``: the W4A8 LLM is configured with
-      ``force_dynamic_quantization=True``, so the per-tensor input scale is
-      computed at runtime and does not need to be provided through IPC.
+    - calibrates per-Linear ``input_scale`` by hooking nn.Linear inputs
+      while the bf16 HF model runs the calibration prompts. The resulting
+      ``input_scale = amax/448`` is shipped via IPC alongside the FP4
+      weight + FP8 block scale + FP32 weight_scale_2.
 
     Provides IPC handles with keys ``weight`` (FP4 packed uint8),
-    ``weight_scale`` (FP8 per-block), and ``weight_scale_2`` (fp32
-    per-tensor). q/k/v and gate/up projections in a fusion group share a
-    unified ``weight_scale_2`` so the per-tensor cross-shard consistency
-    check inside ``_finalize_w4a8_scales`` passes.
+    ``weight_scale`` (FP8 per-block), ``weight_scale_2`` (fp32 per-tensor),
+    and ``input_scale`` (fp32 per-tensor, static). q/k/v and gate/up
+    projections in a fusion group share a unified ``weight_scale_2`` so
+    the per-tensor cross-shard consistency check inside
+    ``_finalize_w4a8_scales`` passes.
     """
 
     W4A8_BLOCK_SIZE = 32
@@ -456,10 +459,19 @@ class RefW4A8NVFP4FP8ModelWithIPCHandles(RefHFModel):
     )
     _PROJ_TO_GROUP = {proj: group for group in FUSION_GROUPS for proj in group}
 
+    # 4 prompts used both for calibration and at test time (same input distribution).
+    CALIBRATION_PROMPTS = [
+        "Hello, my name is",
+        "The president of the United States is",
+        "The capital of France is",
+        "The future of AI is",
+    ]
+
     def __init__(
         self, model_dir: str, device_id: int = 0, num_hidden_layers: Optional[int] = None
     ):
         self.device_id = device_id
+        self.model_dir = model_dir
         config = AutoConfig.from_pretrained(model_dir)
         if num_hidden_layers is not None:
             config.num_hidden_layers = num_hidden_layers
@@ -468,8 +480,59 @@ class RefW4A8NVFP4FP8ModelWithIPCHandles(RefHFModel):
         ).to(f"cuda:{device_id}")
         self.all_weights = {}
         self._dequantized_weights = {}
+        # input_scales[<linear-name>.weight] = FP32 scalar (amax/448) used for static
+        # FP8 activation quantization. Filled by _calibrate_input_scales().
+        self.input_scales: dict = {}
         self.device_uuid = [get_device_uuid(i) for i in range(torch.cuda.device_count())]
+        self._calibrate_input_scales()
         self._quantize_and_replicate_weights()
+
+    def _calibrate_input_scales(self):
+        """Run the HF model on a few prompts, hooking every nn.Linear's input
+        to collect per-tensor amax. ``input_scale = amax / 448`` (FP8 e4m3fn max).
+
+        Stored under the same key the weight uses (``<name>.weight`` →
+        ``<name>.input_scale``) so the IPC handle can ship them alongside the
+        FP4 weights for static activation quantization on the LLM side.
+        """
+        amax: dict = {}
+        hooks = []
+
+        def make_hook(linear_name):
+            def hook(_mod, inputs):
+                x = inputs[0]
+                # inputs may be a tuple (x, ...) for some Linear subclasses; first elem is the activation.
+                if not isinstance(x, torch.Tensor):
+                    return
+                cur = x.detach().float().abs().amax().item()
+                amax[linear_name] = max(amax.get(linear_name, 0.0), cur)
+            return hook
+
+        for name, mod in self.model.named_modules():
+            if isinstance(mod, nn.Linear):
+                hooks.append(mod.register_forward_pre_hook(make_hook(name)))
+
+        tokenizer = AutoTokenizer.from_pretrained(self.model_dir)
+        device = f"cuda:{self.device_id}"
+        self.model.eval()
+        with torch.no_grad():
+            for prompt in self.CALIBRATION_PROMPTS:
+                ids = torch.tensor(
+                    [tokenizer.encode(prompt)], dtype=torch.long, device=device
+                )
+                self.model(ids)
+        for h in hooks:
+            h.remove()
+        del tokenizer
+
+        # Convert amax to input_scale (FP32 scalar) on CUDA so IPC reduce_tensor works.
+        for linear_name, a in amax.items():
+            if a <= 0.0:
+                # No tokens routed through this expert during calibration — fall back to 1.0
+                a = 1.0
+            self.input_scales[f"{linear_name}.weight"] = torch.tensor(
+                a / 448.0, dtype=torch.float32, device=device
+            )
 
     @staticmethod
     def _unfuse_moe_expert_params(all_params):
@@ -607,11 +670,26 @@ class RefW4A8NVFP4FP8ModelWithIPCHandles(RefHFModel):
             torch.bfloat16,
         )
 
-        return [
+        entries = [
             (name, packed_uint8),
             (name + "_scale", block_scale_fp8),
             (name + "_scale_2", weight_scale_2),
         ]
+        # Static activation quantization: ship per-tensor input_scale calibrated
+        # offline. Required for the MoE TRTLLMGen W4A8 NVFP4 FP8 path
+        # (fused_moe_trtllm_gen.py: it calls
+        # ``static_quantize_e4m3_per_tensor(x, 1.0/fc31_input_scale)`` with no
+        # dynamic-quant fallback). Dense W4A8NVFP4FP8LinearMethod consumes the
+        # same key via load_weight_scales and stashes it in
+        # tmp_w4a8_input_scales_list for the alpha computation in finalize.
+        # Key format: replace ``.weight`` suffix with ``.input_scale``, mirroring
+        # how modelopt-emitted checkpoints carry these per-Linear tensors.
+        if name.endswith(".weight") and name in self.input_scales:
+            entries.append(
+                (name.replace(".weight", ".input_scale"),
+                 self.input_scales[name].clone())
+            )
+        return entries
 
     def get_weight_ipc_handles_serialized(
         self,
@@ -650,6 +728,10 @@ def test_llm_update_weights_w4a8_nvfp4_fp8(model_dir):
     )
     tokenizer = AutoTokenizer.from_pretrained(model_dir)
     kv_cache_config = KvCacheConfig(enable_block_reuse=True, free_gpu_memory_fraction=0.1)
+    # TRTLLM (trtllm_gen) is the only MoE backend with a W4A8_NVFP4_FP8 dispatch
+    # case today (W4A8NVFP4FP8TRTLLMGenFusedMoEMethod). Cutlass / DeepGemm
+    # backends do not (would hit "Unsupported quantization mode: [16384]").
+    moe_config = MoeConfig(backend="TRTLLM")
     with LLM(
         model=model_dir,
         ray_worker_extension_cls="tensorrt_llm.llmapi.rlhf_utils.WorkerExtension",
@@ -657,7 +739,6 @@ def test_llm_update_weights_w4a8_nvfp4_fp8(model_dir):
         load_format="dummy",
         pipeline_parallel_size=1,
         kv_cache_config=kv_cache_config,
-        force_dynamic_quantization=True,
         model_kwargs={
             "num_hidden_layers": num_hidden_layers,
             "quantization_config": {
@@ -667,6 +748,7 @@ def test_llm_update_weights_w4a8_nvfp4_fp8(model_dir):
                 "exclude_modules": ["*mlp.gate", "lm_head"],
             },
         },
+        moe_config=moe_config,
     ) as llm:
         prompts_texts = [
             "Hello, my name is",
@@ -706,6 +788,9 @@ def test_llm_partial_update_weights_w4a8_nvfp4_fp8(model_dir):
     )
     tokenizer = AutoTokenizer.from_pretrained(model_dir)
     kv_cache_config = KvCacheConfig(enable_block_reuse=True, free_gpu_memory_fraction=0.1)
+    # See note in test_llm_update_weights_w4a8_nvfp4_fp8: only TRTLLM (trtllm_gen)
+    # MoE backend has a W4A8_NVFP4_FP8 dispatch case today.
+    moe_config = MoeConfig(backend="TRTLLM")
     with LLM(
         model=model_dir,
         ray_worker_extension_cls="tensorrt_llm.llmapi.rlhf_utils.WorkerExtension",
@@ -713,7 +798,6 @@ def test_llm_partial_update_weights_w4a8_nvfp4_fp8(model_dir):
         load_format="dummy",
         pipeline_parallel_size=1,
         kv_cache_config=kv_cache_config,
-        force_dynamic_quantization=True,
         model_kwargs={
             "num_hidden_layers": num_hidden_layers,
             "quantization_config": {
@@ -723,6 +807,7 @@ def test_llm_partial_update_weights_w4a8_nvfp4_fp8(model_dir):
                 "exclude_modules": ["*mlp.gate", "lm_head"],
             },
         },
+        moe_config=moe_config,
     ) as llm:
         prompts_texts = [
             "Hello, my name is",
