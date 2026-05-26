@@ -273,6 +273,18 @@ class ShardingTransformConfig(TransformConfig):
         "Only effective when shard_all_unprocessed is True. "
         "When None, all unprocessed linear nodes are sharded.",
     )
+    exclude_shard_node_filter: Optional[str] = Field(
+        default=None,
+        description="Comma-separated list of substrings. Linear nodes whose name contains "
+        "ANY of the listed substrings are kept TP-replicated across all ranks "
+        "(no column-shard / row-shard / AllGather / AllReduce added) regardless of which "
+        "sharding path (heuristic catch-all, MHA, MLA, MoE, MLP) selected them. "
+        "Other sharding for the same layer (e.g. q_b_proj head-shard, o_proj row-shard) is "
+        "unaffected. Use to match PT-style replicated patterns -- for example, DeepseekV3 "
+        "keeps q_a_proj + kv_a_proj_with_mqa replicated (TP-unsharded, no AllGather) while "
+        "still column-sharding q_b/kv_b by heads. Example: "
+        "'q_a_proj,kv_a_proj_with_mqa'. When None (default), all sharding paths run as-is.",
+    )
     allreduce_strategy: AllReduceStrategy = Field(
         default=AllReduceStrategy.AUTO,
         description="AllReduce strategy for distributed operations. "
@@ -1390,6 +1402,12 @@ class ShardingTransformContainer(BaseModel):
     def add(self, transform: ShardingTransformInfo) -> bool:
         """Append a transform only if that node was
         not sharded before. Do not overwrite existing transforms.
+
+        Honors ``ShardingTransformConfig.exclude_shard_node_filter``: nodes whose
+        name matches any of the configured substrings are kept replicated across
+        TP ranks (the transform is silently dropped). The exclusion applies to
+        all weight/EP sharding paths so callers do not need to thread the filter
+        through every heuristic.
         """
         # Find the appropriate list by checking inheritance
         transform_list = None
@@ -1400,6 +1418,17 @@ class ShardingTransformContainer(BaseModel):
 
         if transform_list is None:
             raise ValueError(f"Unknown transform type: {type(transform)}")
+
+        # Global node-exclusion filter -- keeps matching nodes replicated
+        # regardless of which sharding heuristic picked them up.
+        if isinstance(transform, (WeightShardingInfo, EPShardingInfo)) and _is_node_excluded(
+            transform.target_node, self.config
+        ):
+            ad_logger.info(
+                f"Skipping sharding for node {transform.target_node!r} "
+                f"due to exclude_shard_node_filter"
+            )
+            return False
 
         # Check if node already has a transform
         for existing_transform in transform_list:
@@ -1412,6 +1441,21 @@ class ShardingTransformContainer(BaseModel):
 ########################################################
 #  Helper functions
 ########################################################
+
+
+def _is_node_excluded(node_name: str, config: "ShardingTransformConfig") -> bool:
+    """Return True if ``node_name`` matches any keyword in
+    ``ShardingTransformConfig.exclude_shard_node_filter``.
+
+    The filter is a comma-separated list of substrings; a node is excluded if its
+    name contains ANY of the listed substrings. Used to keep selected linears
+    replicated across TP ranks (no sharding/AllGather/AllReduce inserted).
+    """
+    pattern = getattr(config, "exclude_shard_node_filter", None)
+    if not pattern:
+        return False
+    keywords = [k.strip() for k in pattern.split(",") if k.strip()]
+    return any(kw in node_name for kw in keywords)
 
 
 def _load_hook_remove(
@@ -2554,12 +2598,21 @@ def _process_mla_sharding(
     # extract o_proj node
     o_proj = layer_subgraph.terminating_node
 
-    # add the sharding strategies for the q_a_proj and kv_a_proj nodes
-    num_simple_shards = _process_simple_shard(
-        [q_a_proj, kv_a_proj], transform_container, layer_type=LayerType.MLA
+    # add the sharding strategies for the q_a_proj and kv_a_proj nodes.
+    # Nodes excluded via ShardingTransformConfig.exclude_shard_node_filter are
+    # intentionally kept replicated and must not abort MLA processing of the
+    # remaining linears (q_b/kv_b/o_proj). Count only the ones we actually
+    # attempted to shard when validating against the "already sharded" guard.
+    a_proj_candidates = [q_a_proj, kv_a_proj]
+    a_proj_to_shard = [n for n in a_proj_candidates if not _is_node_excluded(n.name, config)]
+    num_simple_shards = (
+        _process_simple_shard(a_proj_to_shard, transform_container, layer_type=LayerType.MLA)
+        if a_proj_to_shard
+        else 0
     )
-    if num_simple_shards < 2:
-        # it means that "someone else" already sharded these nodes. Skipping.
+    if num_simple_shards < len(a_proj_to_shard):
+        # Genuine "someone else already sharded these" case (e.g. via MANUAL
+        # source). Abort to avoid double-processing.
         return 0
 
     # extract the sub-subgraph from q_b_proj and kv_b_proj to o_proj
