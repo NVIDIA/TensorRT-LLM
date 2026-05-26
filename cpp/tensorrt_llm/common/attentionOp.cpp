@@ -1345,11 +1345,16 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
 
     if (useKVCache())
     {
+        int32_t const kvCacheWindowSize = params.context_kv_cache_window_size > 0 ? params.context_kv_cache_window_size
+                                                                                  : params.cyclic_attention_window_size;
+        int32_t const maxKvCacheWindowSize = params.context_kv_cache_window_size > 0
+            ? std::max(params.context_kv_cache_window_size, params.max_cyclic_attention_window_size)
+            : params.max_cyclic_attention_window_size;
         auto buffers = buildKvCacheBuffers<KVCacheBuffer>(params.batch_size, params.max_blocks_per_sequence,
-            mTokensPerBlock, sizePerToken, params.cyclic_attention_window_size, params.max_cyclic_attention_window_size,
-            params.sink_token_length, params.can_use_one_more_block, params.host_primary_pool_pointer,
-            params.host_secondary_pool_pointer, params.host_primary_block_scale_pool_pointer,
-            params.host_secondary_block_scale_pool_pointer, params.block_offsets, mKVCacheQuantMode.hasFp4KvCache(),
+            mTokensPerBlock, sizePerToken, kvCacheWindowSize, maxKvCacheWindowSize, params.sink_token_length,
+            params.can_use_one_more_block, params.host_primary_pool_pointer, params.host_secondary_pool_pointer,
+            params.host_primary_block_scale_pool_pointer, params.host_secondary_block_scale_pool_pointer,
+            params.block_offsets, mKVCacheQuantMode.hasFp4KvCache(),
             isCrossAttention() ? params.cross_kv_length : params.max_attention_window_size, params.key_value_cache);
         kv_cache_buffer = buffers.kvCacheBuffer;
         kv_scale_cache_buffer = buffers.kvScaleCacheBuffer;
@@ -1668,8 +1673,16 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
         preprocessingParams.batch_size = params.batch_size;
         preprocessingParams.max_input_seq_len = params.input_seq_length;
         preprocessingParams.max_kv_seq_len = max_kv_seq_len;
-        preprocessingParams.cyclic_kv_cache_len
-            = isCrossAttention() ? params.cross_kv_length : params.cyclic_attention_window_size;
+        if constexpr (std::is_same_v<KVCacheBuffer, KVBlockArray>)
+        {
+            preprocessingParams.cyclic_kv_cache_len
+                = isCrossAttention() ? params.cross_kv_length : kv_cache_buffer.mCyclicCacheLen;
+        }
+        else
+        {
+            preprocessingParams.cyclic_kv_cache_len
+                = isCrossAttention() ? params.cross_kv_length : params.cyclic_attention_window_size;
+        }
         preprocessingParams.sink_token_len = params.sink_token_length;
         preprocessingParams.token_num = params.num_tokens;
         preprocessingParams.remove_padding = mRemovePadding;

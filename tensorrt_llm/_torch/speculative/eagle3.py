@@ -371,10 +371,31 @@ class Eagle3OneModelSpecMetadata(SpecMetadata):
             layer_id: int,
             hidden_states: torch.Tensor,
             residual: Optional[torch.Tensor] = None) -> None:
+        assert self.hidden_states is not None
         for i, captured_layer_id in enumerate(self.layers_to_capture):
             if captured_layer_id == layer_id:
-                num_tokens = hidden_states.shape[0]
-                to_save = hidden_states + residual if residual is not None else hidden_states
+                # CUDA graph padding can make hidden_states larger than the
+                # scheduled token count. Capture only real tokens; otherwise
+                # EAGLE one-model can overrun the preallocated capture buffer.
+                num_tokens = self.num_tokens
+                if num_tokens > self.hidden_states.shape[0]:
+                    raise RuntimeError(
+                        "EAGLE3 hidden-state capture token count exceeds "
+                        f"buffer capacity: num_tokens={num_tokens}, "
+                        f"capacity={self.hidden_states.shape[0]}")
+                if num_tokens > hidden_states.shape[0]:
+                    raise RuntimeError(
+                        "EAGLE3 hidden-state capture token count exceeds "
+                        f"available hidden states: num_tokens={num_tokens}, "
+                        f"hidden_states={hidden_states.shape[0]}")
+                to_save = hidden_states[:num_tokens]
+                if residual is not None:
+                    if num_tokens > residual.shape[0]:
+                        raise RuntimeError(
+                            "EAGLE3 hidden-state capture token count exceeds "
+                            f"available residual states: num_tokens={num_tokens}, "
+                            f"residual={residual.shape[0]}")
+                    to_save = to_save + residual[:num_tokens]
                 self.hidden_states[:num_tokens, i * self.hidden_size:(i + 1) *
                                    self.hidden_size].copy_(to_save,
                                                            non_blocking=True)

@@ -298,7 +298,13 @@ public:
         // The cyclic_attention_window_size will determine the cyclic kv cache position of new tokens.
         // Note that this cyclic_attention_window_size might be smaller than the actual kv cache capactity.
         int const cyclic_attention_window_size = attention_window_size;
-        bool const can_use_one_more_block = beam_width > 1;
+        bool const can_use_one_more_block = cyclic_attention_window_size > 0;
+        int const context_kv_cache_window_size
+            = is_context && op.mPagedKVCache && op.mPagedContextFMHA && cyclic_attention_window_size > 0
+            ? (max_past_kv_length > cyclic_attention_window_size
+                    ? cyclic_attention_window_size + op.mMaxContextLength
+                    : std::max(cyclic_attention_window_size, max_past_kv_length))
+            : 0;
 
         int max_blocks_per_sequence
             = op.useKVCache() && kv_cache_block_offsets.has_value() ? kv_cache_block_offsets.value().size(-1) : 0;
@@ -390,6 +396,7 @@ public:
         common_enqueue_params.max_attention_window_size = max_attention_window_size;
         common_enqueue_params.cyclic_attention_window_size = cyclic_attention_window_size;
         common_enqueue_params.max_cyclic_attention_window_size = cyclic_attention_window_size;
+        common_enqueue_params.context_kv_cache_window_size = context_kv_cache_window_size;
         common_enqueue_params.can_use_one_more_block = can_use_one_more_block;
         common_enqueue_params.sink_token_length = sink_token_length;
         common_enqueue_params.kv_scale_orig_quant = kv_scale_orig_quant_ptr;
@@ -1031,11 +1038,12 @@ common::op::KvCacheBuffers<kernels::KVBlockArray> buildPagedKvCacheBuffers(
         blockSize, layerIdxInCachePool, kvFactor, quantMode.hasFp4KvCache());
 
     int32_t const maxBlocksPerSequence = static_cast<int32_t>(kv_cache_block_offsets->size(-1));
+    bool const canUseOneMoreBlock = cyclic_attention_window_size > 0;
     return common::op::buildKvCacheBuffers<kernels::KVBlockArray>(static_cast<int32_t>(batch_size),
         maxBlocksPerSequence, static_cast<int32_t>(tokens_per_block), sizePerToken,
         static_cast<int32_t>(cyclic_attention_window_size),
         static_cast<int32_t>(std::max(cyclic_attention_window_size, max_attention_window_size)),
-        static_cast<int32_t>(sink_token_length), beam_width > 1, poolPointers.primaryPoolPtr,
+        static_cast<int32_t>(sink_token_length), canUseOneMoreBlock, poolPointers.primaryPoolPtr,
         poolPointers.secondaryPoolPtr, poolPointers.primaryBlockScalePoolPtr, poolPointers.secondaryBlockScalePoolPtr,
         blockOffsets, quantMode.hasFp4KvCache());
 }

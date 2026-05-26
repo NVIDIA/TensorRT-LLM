@@ -117,9 +117,8 @@ def test_kv_cache_transceiver_single_process(ctx_gen_kv_cache_dtype,
             disagg_request_id=uuid.uuid4().int & 0x7FFFFFFFFFFFFFFF)
         ctx_request.py_disaggregated_params = disaggregated_params
 
-    kv_cache_manager_ctx.impl.add_sequence(ctx_request.py_request_id,
-                                           ctx_request.prompt_len, 1,
-                                           ctx_request)
+    kv_cache_manager_ctx.impl.add_sequence_batch(
+        [(ctx_request.py_request_id, ctx_request.prompt_len, 1)], [ctx_request])
     # send ctx request
     kv_cache_transceiver_ctx.respond_and_send_async(ctx_request)
 
@@ -148,9 +147,8 @@ def test_kv_cache_transceiver_single_process(ctx_gen_kv_cache_dtype,
 
         gen_request.py_disaggregated_params = disaggregated_params
 
-    kv_cache_manager_gen.impl.add_sequence(gen_request.py_request_id,
-                                           gen_request.prompt_len, 1,
-                                           gen_request)
+    kv_cache_manager_gen.impl.add_sequence_batch(
+        [(gen_request.py_request_id, gen_request.prompt_len, 1)], [gen_request])
     # send gen request
     kv_cache_transceiver_gen.request_and_receive_async(gen_request)
 
@@ -198,9 +196,8 @@ def test_cancel_request_in_transmission(attention_type):
         is_streaming=False,
         llm_request_type=LlmRequestType.LLMREQUEST_TYPE_CONTEXT_ONLY)
 
-    kv_cache_manager_ctx.impl.add_sequence(ctx_request.py_request_id,
-                                           ctx_request.prompt_len, 1,
-                                           ctx_request)
+    kv_cache_manager_ctx.impl.add_sequence_batch(
+        [(ctx_request.py_request_id, ctx_request.prompt_len, 1)], [ctx_request])
     # send ctx request
     kv_cache_transceiver_ctx.respond_and_send_async(ctx_request)
 
@@ -222,9 +219,8 @@ def test_cancel_request_in_transmission(attention_type):
         llm_request_type=LlmRequestType.LLMREQUEST_TYPE_GENERATION_ONLY,
         context_phase_params=ctx_request.context_phase_params)
 
-    kv_cache_manager_gen.impl.add_sequence(gen_request.py_request_id,
-                                           gen_request.prompt_len, 1,
-                                           gen_request)
+    kv_cache_manager_gen.impl.add_sequence_batch(
+        [(gen_request.py_request_id, gen_request.prompt_len, 1)], [gen_request])
     # send gen request
     kv_cache_transceiver_gen.request_and_receive_async(gen_request)
 

@@ -429,7 +429,12 @@ class TestProbeOnV1KVCacheManager:
         assert result == 0
 
     def test_block_to_token_conversion(self):
-        """Verify num_blocks * tokens_per_block conversion."""
+        """Verify num_blocks * tokens_per_block conversion.
+
+        Also pins the expectation that probe_prefix_match_length calls
+        ``analyze_prefix_reuse`` exactly once. Guards against an accidental
+        regression to a separate count-path in the router.
+        """
         from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 
         mgr = Mock(spec=KVCacheManager)
@@ -443,3 +448,4 @@ class TestProbeOnV1KVCacheManager:
 
         result = KVCacheManager.probe_prefix_match_length(mgr, input_tokens=list(range(200)))
         assert result == 192  # 3 blocks * 64 tokens/block
+        mgr.impl.analyze_prefix_reuse.assert_called_once()

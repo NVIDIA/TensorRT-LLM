@@ -68,10 +68,61 @@ def get_kv_cache_manager_cls(model_config: ModelConfig,
         return KVCacheManagerV2 if kv_cache_config.use_kv_cache_manager_v2 else KVCacheManager
 
 
-def is_vswa_enabled(kv_cache_config):
+def is_vswa_enabled(kv_cache_config: KvCacheConfig) -> bool:
     max_attention_window = kv_cache_config.max_attention_window
     return max_attention_window is not None and len(
         set(max_attention_window)) > 1
+
+
+def _is_sliding_attention_layer(layer_type: object) -> bool:
+    layer_type_name = getattr(layer_type, "name", str(layer_type)).lower()
+    return "sliding" in layer_type_name
+
+
+def _normalize_attention_windows(
+    max_attention_window: List[int],
+    max_seq_len: int,
+) -> Optional[List[int]]:
+    normalized = [min(max_seq_len, window) for window in max_attention_window]
+    if all(window == max_seq_len for window in normalized):
+        return None
+    if len(set(normalized)) == 1:
+        return [normalized[0]]
+    return normalized
+
+
+def _derive_draft_max_attention_window(
+    kv_cache_config: KvCacheConfig,
+    draft_pretrained_config: object,
+    max_seq_len: int,
+    num_draft_layers: int,
+) -> Optional[List[int]]:
+    if not is_vswa_enabled(kv_cache_config):
+        max_attention_window = kv_cache_config.max_attention_window
+        if max_attention_window is None:
+            return None
+        return _normalize_attention_windows(max_attention_window, max_seq_len)
+
+    sliding_window = getattr(draft_pretrained_config, "sliding_window", None)
+    layer_types = getattr(draft_pretrained_config, "layer_types", None)
+    if sliding_window is not None and layer_types:
+        layer_type_pattern = list(layer_types)
+        if layer_type_pattern:
+            draft_windows = []
+            for layer_idx in range(num_draft_layers):
+                layer_type = layer_type_pattern[layer_idx %
+                                                len(layer_type_pattern)]
+                draft_windows.append(
+                    int(sliding_window)
+                    if _is_sliding_attention_layer(layer_type) else max_seq_len)
+            return _normalize_attention_windows(draft_windows, max_seq_len)
+
+    use_sliding_window = getattr(draft_pretrained_config, "use_sliding_window",
+                                 None)
+    if sliding_window is not None and use_sliding_window is True:
+        return _normalize_attention_windows([int(sliding_window)], max_seq_len)
+
+    return None
 
 
 class KvCacheCreator:
@@ -694,7 +745,18 @@ class KvCacheCreator:
         # the sparse_attention_config. Get it from effective_draft_config which
         # falls back to the target model's config for MTP mode.
         sparse_attn_config = effective_draft_config.sparse_attention_config
-        draft_kv_config = kv_cache_config_override if kv_cache_config_override is not None else self._kv_cache_config
+        draft_kv_config = (kv_cache_config_override if kv_cache_config_override
+                           is not None else self._kv_cache_config).model_copy()
+        draft_kv_config.max_attention_window = _derive_draft_max_attention_window(
+            self._kv_cache_config,
+            effective_draft_config.pretrained_config,
+            self._max_seq_len,
+            num_draft_layers,
+        )
+        if is_vswa_enabled(self._kv_cache_config):
+            logger.info(
+                f"Derived draft KV cache max_attention_window for separate "
+                f"draft manager: {draft_kv_config.max_attention_window}")
         return _create_kv_cache_manager(
             model_engine=None,
             kv_cache_manager_cls=draft_kv_cache_manager_cls,

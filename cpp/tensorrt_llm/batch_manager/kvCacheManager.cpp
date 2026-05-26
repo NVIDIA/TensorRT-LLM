@@ -35,6 +35,7 @@
 #include "tensorrt_llm/runtime/worldConfig.h"
 
 #include <algorithm>
+#include <cmath>
 #include <limits>
 #include <map>
 #include <optional>
@@ -114,6 +115,46 @@ SizeType32 getUsableUniqueTokenCountForReuse(
     return materializedUniqueTokenCount > 0 ? materializedUniqueTokenCount - 1 : 0;
 }
 
+std::vector<SizeType32> getReuseSafeWindowOrder(std::map<SizeType32, WindowSizeMetadata> const& metadataByWindow)
+{
+    // Mixed full+SWA models keep a single request-level cached-prefix scalar.
+    // Process full-attention windows first so the short SWA tail cannot cap
+    // the prefix that full-attention layers can safely reuse.
+    std::vector<SizeType32> orderedWindowSizes;
+    orderedWindowSizes.reserve(metadataByWindow.size());
+
+    for (bool const wantSwa : {false, true})
+    {
+        for (auto const& [windowSize, metadata] : metadataByWindow)
+        {
+            if (metadata.isSWA == wantSwa)
+            {
+                orderedWindowSizes.push_back(windowSize);
+            }
+        }
+    }
+    return orderedWindowSizes;
+}
+
+SizeType32 getFirstRealBlockIdxForWindow(
+    WindowSizeMetadata const& metadata, SizeType32 inputLength, SizeType32 tokensPerBlock)
+{
+    // SWA context only needs a bounded physical tail, but the request still
+    // has a full logical block table. Blocks before firstRealBlockIdx remain
+    // placeholders and are aliased when context block offsets are copied.
+    auto const logicalInputLength = std::min(inputLength, metadata.maxTokenNum + metadata.temporaryAttentionWindow);
+    auto const logicalBlocks = tc::ceilDiv(logicalInputLength, tokensPerBlock);
+    if (!metadata.isSWA || metadata.temporaryAttentionWindow <= 0)
+    {
+        return 0;
+    }
+
+    auto const physicalInputLength
+        = std::min(inputLength, metadata.windowSize + metadata.temporaryAttentionWindow + tokensPerBlock);
+    auto const physicalBlocks = tc::ceilDiv(physicalInputLength, tokensPerBlock);
+    return logicalBlocks > physicalBlocks ? logicalBlocks - physicalBlocks : 0;
+}
+
 } // namespace
 
 namespace tensorrt_llm::batch_manager::kv_cache_manager
@@ -141,6 +182,16 @@ BlockPtr KVCacheBlock::createPlaceholder(IdType blockId, SizeType32 windowSize)
     // Use an out-of-range pool index as sentinel; the mIsPlaceholder flag gates
     // getCacheBlockIndices to return nil so this index is never submitted to the GPU.
     auto block = std::make_shared<KVCacheBlock>(blockId, tk::KVCacheIndex::nullIndex, windowSize);
+    block->mIsPlaceholder = true;
+    return block;
+}
+
+BlockPtr KVCacheBlock::createPlaceholder()
+{
+    // SWA on-demand placeholder form: never attached to the lookup tree, only occupies a
+    // slot in the sequence's allocated-blocks list. The sentinel block ID ensures that any
+    // accidental mAllBlocksById[id] lookup produces an obvious out-of-range failure.
+    auto block = std::make_shared<KVCacheBlock>(kPlaceholderBlockId, tk::KVCacheIndex::nullIndex);
     block->mIsPlaceholder = true;
     return block;
 }
@@ -550,41 +601,48 @@ bool KVCacheBlock::isLeaf() const
 // achieve identical performance as assuming all layers as full attention.
 std::map<SizeType32, float> BlockManager::calculateWindowSizeToShare(
     std::map<SizeType32, std::vector<SizeType32>> const& windowSizeToLayers,
-    std::map<SizeType32, SizeType32> const& windowSizeToCacheSizePerToken)
+    std::map<SizeType32, SizeType32> const& windowSizeToCacheSizePerToken,
+    std::optional<TempAttentionWindowInputs> const& tempAttentionWindowInputs)
 {
     if (windowSizeToLayers.size() == 1)
     {
         return {{windowSizeToLayers.begin()->first, 1.0f}};
     }
 
-    std::map<SizeType32, float> windowSizeToContribution;
-
-    SizeType32 cacheSizePerTokenTotal
-        = std::accumulate(windowSizeToCacheSizePerToken.begin(), windowSizeToCacheSizePerToken.end(), SizeType32{0},
-            [](auto sum, auto const& windowSize) { return sum + windowSize.second; });
-    for (auto const& [windowSize, cacheSizePerToken] : windowSizeToCacheSizePerToken)
-    {
-        auto const cacheSizeWeight = static_cast<float>(cacheSizePerToken) / cacheSizePerTokenTotal;
-        windowSizeToContribution[windowSize] = cacheSizeWeight;
-    }
-
+    std::map<SizeType32, double> windowSizeToContribution;
     for (auto const& [windowSize, _] : windowSizeToLayers)
     {
-        windowSizeToContribution.at(windowSize) *= windowSize;
+        TLLM_CHECK_WITH_INFO(windowSizeToCacheSizePerToken.count(windowSize) > 0,
+            "Missing cache size per token for window size %d", windowSize);
+        auto const cacheSizePerToken = windowSizeToCacheSizePerToken.at(windowSize);
+        TLLM_CHECK_WITH_INFO(cacheSizePerToken > 0, "Cache size per token for window size %d must be positive, got %d",
+            windowSize, cacheSizePerToken);
+        SizeType32 temporaryAttentionWindow = 0;
+        if (tempAttentionWindowInputs && tempAttentionWindowInputs->pagedContextFMHA
+            && tempAttentionWindowInputs->maxInputLen > windowSize)
+        {
+            temporaryAttentionWindow = std::min(
+                tempAttentionWindowInputs->maxNumTokens, tempAttentionWindowInputs->maxInputLen - windowSize);
+            temporaryAttentionWindow = std::max(temporaryAttentionWindow, SizeType32{0});
+        }
+        auto const effectiveWindowSize = windowSize + temporaryAttentionWindow;
+        windowSizeToContribution[windowSize]
+            = static_cast<double>(effectiveWindowSize) * static_cast<double>(cacheSizePerToken);
     }
     auto const windowSizesTotalSum = std::accumulate(windowSizeToContribution.begin(), windowSizeToContribution.end(),
         0.0, [](auto sum, auto const& windowSize) { return sum + windowSize.second; });
+    TLLM_CHECK_WITH_INFO(windowSizesTotalSum > 0.0, "Window size contribution sum must be positive.");
 
     std::map<SizeType32, float> windowSizeToShare;
     for (auto const& [windowSize, windowSizeSum] : windowSizeToContribution)
     {
-        float const fraction = windowSizeSum / windowSizesTotalSum;
+        float const fraction = static_cast<float>(windowSizeSum / windowSizesTotalSum);
         TLLM_CHECK(0.0f < fraction && fraction <= 1.0f);
         windowSizeToShare[windowSize] = fraction;
     }
     auto total = std::accumulate(windowSizeToShare.begin(), windowSizeToShare.end(), 0.0f,
         [](auto sum, auto const& windowSize) { return sum + windowSize.second; });
-    TLLM_CHECK(total == 1.0f);
+    TLLM_CHECK_WITH_INFO(std::abs(total - 1.0f) < 1.0e-5f, "Window size shares must sum to 1.0, got %f", total);
     return windowSizeToShare;
 }
 
@@ -915,12 +973,12 @@ WindowBlockManager::~WindowBlockManager()
         100.0 * mReusedTokens / mTotalInputTokens);
 }
 
-bool BlockManager::verifyQueueIntegrity(SizeType32 windowSize)
+bool BlockManager::verifyQueueIntegrity(SizeType32 windowSize) const
 {
     return mWindowBlockManagers.at(windowSize).verifyQueueIntegrity();
 }
 
-bool WindowBlockManager::verifyQueueIntegrity()
+bool WindowBlockManager::verifyQueueIntegrity() const
 {
     return mEvictionPolicy->verifyQueueIntegrity();
 }
@@ -942,7 +1000,6 @@ bool WindowBlockManager::verifyQueueIntegrity()
 
 void BlockManager::storeContextBlocks(GenerationRequest& sequence, LlmRequest const& llmRequest)
 {
-    constexpr int beamIdx = 0; // no need to consider more than one beam for input tokens
     // Iterate in descending window-size order (largest/full-attention windows first).
     // This guarantees that the Stored event for the full-attention window is committed
     // before flushRemovedEvents fires for SWA windows, preserving the per-window
@@ -950,17 +1007,71 @@ void BlockManager::storeContextBlocks(GenerationRequest& sequence, LlmRequest co
     // and Stored(full) is not interleaved with Removed(SWA).
     for (auto it = mWindowBlockManagers.rbegin(); it != mWindowBlockManagers.rend(); ++it)
     {
-        auto& [windowSize, manager] = *it;
-        auto cacheBlockIds = sequence.getCacheBlockIds(windowSize);
-        auto const& uniqueTokens = llmRequest.getUniqueTokens(beamIdx);
-        TLLM_LOG_DEBUG("storeContextBlocks for request %lu on window %d with %d unique tokens", llmRequest.mRequestId,
-            windowSize, uniqueTokens.size());
-        auto const usableUniqueTokenCount = getUsableUniqueTokenCountForReuse(uniqueTokens, llmRequest);
-        auto blockedUniqueTokens
-            = chopVectorIntoBlocks<UniqueToken>(uniqueTokens, usableUniqueTokenCount, getTokensPerBlock(), false);
-        auto blockKeys = buildBlockKeys(blockedUniqueTokens, llmRequest);
-        (void) manager.storeBlocks(std::move(blockKeys), cacheBlockIds[beamIdx]);
+        it->second.storeContextBlocks(sequence, llmRequest);
     }
+}
+
+void WindowBlockManager::storeContextBlocks(GenerationRequest& sequence, LlmRequest const& llmRequest)
+{
+    // Store fully-filled context blocks (both SWA and non-SWA) in the reuse trie so
+    // that OOW blocks are already in the trie before detachFrontBlock replaces them
+    // with placeholders. storeBlocks advances past placeholder slots without re-
+    // inserting, and continues past evicted SWA anchors so later in-window blocks
+    // remain reusable through value-less trie nodes.
+    //
+    // Unlike getUsableUniqueTokenCountForReuse (which caps at contextCurrentPosition when
+    // prefill is not complete), here we key by uniqueTokens.size() - 1.  The last token
+    // is not yet materialized, but all full blocks before it have been written to KV
+    // cache during the context phase, so they are safe to store for reuse.  Callers may
+    // invoke storeContextBlocks immediately after addSequenceBatch (before
+    // simulatePrefillCompletion is used in tests, or before the first generation step in
+    // production) and rely on the full context being stored.
+    auto constexpr beamIdx = 0; // no need to consider more than one beam for input tokens
+    auto const& uniqueTokens = llmRequest.getUniqueTokens(beamIdx);
+    TLLM_LOG_DEBUG("storeContextBlocks for request %lu on window %d with %zu unique tokens", llmRequest.mRequestId,
+        mWindowSize, uniqueTokens.size());
+    if (uniqueTokens.empty())
+    {
+        return;
+    }
+    // Respect chunked prefill: getUsableUniqueTokenCountForReuse caps at
+    // contextCurrentPosition when prefill is not yet complete, preventing us from
+    // storing blocks whose KV state has not been computed yet.
+    //
+    // Legacy-test fallback: some unit tests (e.g. the VSWA suite ported from PR #12004)
+    // call storeContextBlocks immediately after addSequenceBatch without running
+    // simulatePrefillCompletion, so contextCurrentPosition is 0 and
+    // getUsableUniqueTokenCountForReuse would return 0.  Treating that degenerate state
+    // as "prefill complete" by falling back to uniqueTokens.size() - 1 preserves the
+    // pre-#13029 single-shot test semantics without affecting production (production
+    // always sets contextCurrentPosition > 0 before invoking storeContextBlocks).
+    SizeType32 usableUniqueTokenCount = getUsableUniqueTokenCountForReuse(uniqueTokens, llmRequest);
+    if (usableUniqueTokenCount == 0 && llmRequest.getContextCurrentPosition() == 0)
+    {
+        usableUniqueTokenCount = static_cast<SizeType32>(uniqueTokens.size()) - 1;
+    }
+    auto blockedUniqueTokens
+        = chopVectorIntoBlocks<UniqueToken>(uniqueTokens, usableUniqueTokenCount, getTokensPerBlock(), false);
+    if (blockedUniqueTokens.empty())
+    {
+        return;
+    }
+    auto blockKeys = buildBlockKeys(blockedUniqueTokens, llmRequest);
+
+    // Build beam-0 block pointers from the allocated-block list rather than
+    // resolving IDs. SWA context may use transient placeholder sentinels that
+    // are intentionally not present in mAllBlocksById.
+    auto const& allocatedBlocks = mAllocatedBlocksPerSeq.at(sequence.getRequestId());
+    auto const beamWidth = sequence.getBeamWidth();
+    std::vector<BlockPtr> beam0Blocks;
+    beam0Blocks.reserve(std::min<std::size_t>(allocatedBlocks.size() / std::max(beamWidth, 1), blockKeys.size()));
+    for (SizeType32 bi = 0;
+         bi < static_cast<SizeType32>(allocatedBlocks.size()) && beam0Blocks.size() < blockKeys.size(); bi += beamWidth)
+    {
+        beam0Blocks.push_back(allocatedBlocks[bi]);
+    }
+    blockKeys.resize(beam0Blocks.size());
+    (void) storeBlocks(std::move(blockKeys), beam0Blocks);
 }
 
 void WindowBlockManager::createBlockScalePools(SizeType32 quantBlockSize)
@@ -1118,18 +1229,6 @@ void WindowBlockManager::freeLeafBlock(BlockPtr const& block)
     block->freeLeafBlock();
 }
 
-void WindowBlockManager::freeChildren(BlockPtr const& block)
-{
-    // Tell event manager we are freeing block
-    if (mEventManager && blockInRadixTree(block))
-    {
-        mEventManager->enqueueRemovedEvent(block, mWindowSize);
-    }
-
-    // Free block and all it's descendants from radix tree
-    block->freeBlockAndAllDescendants();
-}
-
 BlockPtr WindowBlockManager::getFreeBlock(GenerationRequest& sequence, executor::RetentionPriority priority,
     std::optional<std::chrono::milliseconds> durationMs, executor::KvCacheTransferMode mode,
     std::string const& directory, bool wantPlaceholder)
@@ -1168,36 +1267,25 @@ BlockPtr WindowBlockManager::getFreeBlock(GenerationRequest& sequence, executor:
         block = offloadBlock;
     }
 
-    // Removes children of the block from the search tree
-    freeChildren(block);
+    // True priority eviction: detach ONLY this block from the lookup tree.
+    // Descendants remain in the tree and free queue, where they can be evicted
+    // independently according to their own priority.  Previously, freeChildren()
+    // also detached all descendants, which prevented high-priority interior blocks
+    // from surviving eviction pressure on their low-priority leaf children.
+    //
+    // Serialize with the lookup tree mutex: storeBlocks, analyzePrefixReuse,
+    // and addSequenceBatch all hold this mutex while accessing the trie, so
+    // detachFromLookupNode must do the same.
+    {
+        std::lock_guard<std::recursive_mutex> treeLock(mLookupTree->getMutex());
+        if (mEventManager && blockInRadixTree(block))
+        {
+            mEventManager->enqueueRemovedEvent(block, mWindowSize);
+        }
+        block->detachFromLookupNode();
+    }
     // Claim the block in primary block queue
     mEvictionPolicy->claimBlock(block, priority, durationMs);
-
-    // Deal with invalidating block save for reuse for the sequence
-    if (mBlockToSequence.count(block->getBlockId()) > 0)
-    {
-        auto const& originalOwnerSequenceId = mBlockToSequence[block->getBlockId()];
-        if (mIsValidStoreForReuseSequence.count(originalOwnerSequenceId) > 0
-            && sequence.getRequestId() != originalOwnerSequenceId)
-        {
-            TLLM_LOG_DEBUG("%s::getFreeBlock - Block %d was originally held but released from sequence %d",
-                mLogPrefix.c_str(), block->getBlockId(), originalOwnerSequenceId);
-            if (mIsValidStoreForReuseSequence[originalOwnerSequenceId])
-            {
-                TLLM_LOG_DEBUG("%s::getFreeBlock - Invalidate store block for reuse for sequence %d",
-                    mLogPrefix.c_str(), originalOwnerSequenceId);
-            }
-            else
-            {
-                TLLM_LOG_DEBUG("%s::getFreeBlock - Store block for reuse for sequence %d is already invalid",
-                    mLogPrefix.c_str(), originalOwnerSequenceId);
-            }
-            mIsValidStoreForReuseSequence[originalOwnerSequenceId] = false;
-        }
-    }
-
-    // Record which sequence is using the block
-    mBlockToSequence[block->getBlockId()] = sequence.getRequestId();
     TLLM_LOG_DEBUG("%s::getFreeBlock - Block %d is now acquired by sequence %d", mLogPrefix.c_str(),
         block->getBlockId(), sequence.getRequestId());
 
@@ -1211,6 +1299,8 @@ void WindowBlockManager::setOffsets(tk::KVCacheIndex* offsetsPtr, nvinfer1::Dims
     auto constexpr vIdx = 1;
 
     auto const& block = getBlockById(blockId);
+    bool const isSwaPlaceholder = blockId == KVCacheBlock::kPlaceholderBlockId;
+    TLLM_CHECK_WITH_INFO(block != nullptr || isSwaPlaceholder, "Unknown KV cache block id %d", blockId);
     for (SizeType32 poolIdx = 0; poolIdx < static_cast<SizeType32>(mPools.size()); poolIdx++)
     {
         auto const& pool = mPools.at(poolIdx);
@@ -1221,7 +1311,7 @@ void WindowBlockManager::setOffsets(tk::KVCacheIndex* offsetsPtr, nvinfer1::Dims
             auto const fieldIdx = (mCacheType == CacheType::kSELFKONLY || isRecurrentState()) ? 0 : xIdx;
             auto const blockIndex = [&]() -> tk::KVCacheIndex
             {
-                if (block->isPlaceholder())
+                if (isSwaPlaceholder || block->isPlaceholder())
                 {
                     return tk::KVCacheIndex::nullIndex;
                 }
@@ -1318,6 +1408,12 @@ PrefixReuseSummary BlockManager::analyzePrefixReuse(
     return onlyManager.analyzePrefixReuse(uniqueTokens, llmRequest);
 }
 
+PrefixReuseSummary BlockManager::analyzePrefixReuse(
+    VecUniqueTokens const& uniqueTokens, LlmRequest const& llmRequest, SizeType32 windowSize) const
+{
+    return mWindowBlockManagers.at(windowSize).analyzePrefixReuse(uniqueTokens, llmRequest);
+}
+
 PrefixReuseSummary WindowBlockManager::analyzePrefixReuse(
     VecUniqueTokens const& uniqueTokens, LlmRequest const& llmRequest) const
 {
@@ -1327,45 +1423,137 @@ PrefixReuseSummary WindowBlockManager::analyzePrefixReuse(
 
     PrefixReuseSummary summary;
 
-    std::lock_guard<std::mutex> lock(mCachedBlocksRootMutex);
-    auto searchRoot = mCachedBlocksRoot;
+    std::lock_guard<std::recursive_mutex> lock(mLookupTree->getMutex());
+    auto reuseMatches = findReusableBlockMatches(
+        blockKeys, /*enablePartialReuse=*/false, /*copyOnPartialReuse=*/false, std::numeric_limits<SizeType32>::max());
 
-    for (auto const& blockKey : blockKeys)
+    for (auto const& match : reuseMatches.matches)
     {
-        auto [partialMatch, numMatched, matchingBlock] = searchRoot != nullptr
-            ? searchRoot->findMatchingBlock(blockKey, false, false)
-            : std::make_tuple(false, 0, nullptr);
-
-        if (matchingBlock == nullptr)
+        if (match.isTraversalOnly)
         {
-            summary.firstNewBlock = blockKey;
-            break;
+            continue;
         }
 
         ++summary.reusableBlocksAll;
-        if (matchingBlock->hasRefs())
+        if (match.block->hasRefs())
         {
             ++summary.reusableBlocksAllocated;
         }
-
-        searchRoot = std::move(matchingBlock);
     }
+    summary.firstNewBlock = reuseMatches.firstNewBlock;
 
     TLLM_LOG_DEBUG("%s::analyzePrefixReuse - reusableAllocated=%d, reusableAll=%d, hasNewBlock=%d", mLogPrefix.c_str(),
         summary.reusableBlocksAllocated, summary.reusableBlocksAll, summary.firstNewBlock.has_value());
     return summary;
 }
 
-WindowBlockManager::ClaimResult WindowBlockManager::claimMatchingBlocks(GenerationRequest& sequence,
-    SizeType32 inputLength, SizeType32 numContextBlocks, LlmRequest& llmRequest, size_t requestIdx,
-    PartialClaimTracker& tracker, std::vector<ClaimResult>& claimResults)
+WindowBlockManager::ReuseMatchResult WindowBlockManager::findReusableBlockMatches(
+    std::vector<BlockKey> const& blockKeys, bool enablePartialReuse, bool copyOnPartialReuse,
+    SizeType32 maxMatchedTokens) const
 {
-    // NOTE: Caller must hold mCachedBlocksRootMutex.
+    ReuseMatchResult result;
+    std::vector<ReuseMatch> candidateMatches;
+    candidateMatches.reserve(blockKeys.size());
+    auto searchNode = mCachedBlocksRoot ? mCachedBlocksRoot->getLookupNode() : nullptr;
+    SizeType32 candidateMatchedTokens{0};
+    SizeType32 latestMissingAnchorEndToken{0};
+
+    auto updateSafePrefix = [&]()
+    {
+        if (!mIsSWA || latestMissingAnchorEndToken == 0
+            || candidateMatchedTokens >= latestMissingAnchorEndToken + mWindowSize)
+        {
+            result.matches = candidateMatches;
+            result.totalMatchedTokens = candidateMatchedTokens;
+        }
+    };
+
+    for (auto const& blockKey : blockKeys)
+    {
+        if (!searchNode || blockKey.uniqueTokens.empty())
+        {
+            break;
+        }
+
+        auto exactMatch = searchNode->findMatchingNode(blockKey);
+        if (exactMatch.has_value())
+        {
+            auto const numMatchedTokens = static_cast<SizeType32>(blockKey.uniqueTokens.size());
+            if (candidateMatchedTokens + numMatchedTokens > maxMatchedTokens)
+            {
+                break;
+            }
+
+            auto const node = exactMatch->node;
+            auto existing = node->getValue(mWindowSize);
+            candidateMatchedTokens += numMatchedTokens;
+
+            if (existing.has_value() && *existing)
+            {
+                auto block = *existing;
+                candidateMatches.push_back(ReuseMatch{block, numMatchedTokens, !block->isFull(), false});
+            }
+            else if (mIsSWA)
+            {
+                candidateMatches.push_back(ReuseMatch{nullptr, numMatchedTokens, false, true});
+                latestMissingAnchorEndToken = std::max(latestMissingAnchorEndToken, candidateMatchedTokens);
+            }
+            else
+            {
+                break;
+            }
+
+            searchNode = node;
+            updateSafePrefix();
+            continue;
+        }
+
+        if (enablePartialReuse)
+        {
+            auto partialMatches = searchNode->findPartiallyMatchingNodes(blockKey);
+            for (auto const& match : partialMatches)
+            {
+                auto existing = match.node->getValue(mWindowSize);
+                if (!existing.has_value() || !(*existing))
+                {
+                    continue;
+                }
+
+                auto block = *existing;
+                if (copyOnPartialReuse || (!block->hasRefs() && block->isLeaf()))
+                {
+                    auto const numMatchedTokens = static_cast<SizeType32>(match.key.uniqueTokens.size());
+                    if (candidateMatchedTokens + numMatchedTokens <= maxMatchedTokens)
+                    {
+                        candidateMatchedTokens += numMatchedTokens;
+                        candidateMatches.push_back(ReuseMatch{block, numMatchedTokens, true, false});
+                        updateSafePrefix();
+                    }
+                    break;
+                }
+            }
+        }
+        break;
+    }
+
+    if (result.matches.size() < blockKeys.size())
+    {
+        result.firstNewBlock = blockKeys[result.matches.size()];
+    }
+    return result;
+}
+
+WindowBlockManager::ClaimResult WindowBlockManager::claimMatchingBlocks(GenerationRequest& sequence,
+    SizeType32 inputLength, SizeType32 numContextBlocks, SizeType32 firstRealBlockIdx, LlmRequest& llmRequest,
+    size_t requestIdx, PartialClaimTracker& tracker, std::vector<ClaimResult>& claimResults)
+{
+    // NOTE: Caller must hold mLookupTree->getMutex().
     TLLM_CHECK_WITH_INFO(!(isRecurrentState()) || inputLength == llmRequest.getPromptLen(),
         "Recurrent state does not support CP or truncation yet.");
 
     ClaimResult result;
     result.numContextBlocks = numContextBlocks;
+    result.firstRealBlockIdx = firstRealBlockIdx;
 
     auto const requestId = sequence.getRequestId();
     auto const [seqIt, emplaceDone] = mAllocatedBlocksPerSeq.emplace(requestId, std::vector<BlockPtr>{});
@@ -1408,167 +1596,164 @@ WindowBlockManager::ClaimResult WindowBlockManager::claimMatchingBlocks(Generati
     TLLM_CHECK(result.perBlockRetentions.size() == static_cast<size_t>(numContextBlocks));
 
     // Phase 1: Walk radix tree, claim matching blocks — no onboard, no getFreeBlock
-    // NOTE: Caller must hold mCachedBlocksRootMutex.
+    // NOTE: Caller must hold mLookupTree->getMutex().
 
-    // Compute shareLastContextBlockAmongBeams — aligned with loadOrAllocateBlocks (PR #10437).
+    // Compute shareLastContextBlockAmongBeams for the batch-add allocation path.
     auto const beamWidth = sequence.getBeamWidth();
     bool const isShareLastContextBlock = mCacheType == CacheType::kCROSS || inputLength % mTokensPerBlock == 0;
     result.numSharedContextBlocks
         = (beamWidth > 1 && !isShareLastContextBlock) ? numContextBlocks - 1 : numContextBlocks;
     result.shareLastContextBlockAmongBeams = result.numSharedContextBlocks == numContextBlocks;
-    auto searchRoot = mCachedBlocksRoot;
-    auto blockItr = result.blockKeys.begin();
+    auto reuseMatches = findReusableBlockMatches(
+        result.blockKeys, mEnablePartialReuse, mCopyOnPartialReuse, sequence.getCurrentPrepopulatedPromptLen());
+    result.totalMatchedTokens = reuseMatches.totalMatchedTokens;
 
-    for (int bi = 0; bi < result.numSharedContextBlocks; ++bi)
+    for (int bi = 0; bi < result.numSharedContextBlocks && bi < static_cast<int>(reuseMatches.matches.size()); ++bi)
     {
-        auto [partialMatch, numMatched, matchingBlock] = (searchRoot != nullptr && blockItr != result.blockKeys.end())
-            ? searchRoot->findMatchingBlock(*blockItr, mEnablePartialReuse, mCopyOnPartialReuse)
-            : std::make_tuple(false, 0, nullptr);
+        auto const& match = reuseMatches.matches[bi];
         if (isRecurrentState())
         {
-            TLLM_CHECK(partialMatch == false);
+            TLLM_CHECK(match.isPartialMatch == false);
         }
 
-        if (matchingBlock != nullptr
-            && result.totalMatchedTokens + numMatched <= sequence.getCurrentPrepopulatedPromptLen())
+        ClaimResult::ClaimedBlock claimed;
+        claimed.numMatchedTokens = match.numMatchedTokens;
+        claimed.isPartialMatch = match.isPartialMatch;
+        claimed.needsCopy = false;
+        claimed.isTraversalOnly = match.isTraversalOnly;
+        if (match.isTraversalOnly || (mIsSWA && bi < result.firstRealBlockIdx))
         {
-            ClaimResult::ClaimedBlock claimed;
-            claimed.block = matchingBlock;
-            claimed.numMatchedTokens
-                = numMatched > 0 ? numMatched : static_cast<SizeType32>(blockItr->uniqueTokens.size());
-            claimed.isPartialMatch = partialMatch;
-            claimed.needsCopy = false;
-            claimed.isPlaceholder = matchingBlock->isPlaceholder();
+            // The prefix is reusable for traversal, but this SWA block is outside
+            // the active attention window for this sequence. Keep a logical slot
+            // in the sequence without claiming or allocating physical KV memory.
+            claimed.block = KVCacheBlock::createPlaceholder();
+            claimed.isPlaceholder = true;
+            claimed.isTraversalOnly = true;
+            result.claimedBlocks.push_back(std::move(claimed));
+            continue;
+        }
 
-            result.totalMatchedTokens += claimed.numMatchedTokens;
-            if (!claimed.isPlaceholder)
-            {
-                result.latestMatchingNonPlaceholderBlockIdx = bi;
-            }
+        auto matchingBlock = match.block;
+        auto const partialMatch = match.isPartialMatch;
+        claimed.block = matchingBlock;
+        claimed.isPlaceholder = matchingBlock->isPlaceholder();
+        if (!claimed.isPlaceholder)
+        {
+            result.latestMatchingNonPlaceholderBlockIdx = bi;
+        }
 
-            // Priority update event
-            if (result.perBlockRetentions[bi].retentionPriority.has_value()
-                && matchingBlock->getPriority() != result.perBlockRetentions[bi].retentionPriority && mEventManager)
-            {
-                mEventManager->enqueueUpdatedEvent(tle::KVCacheUpdatedData(matchingBlock->getHash())
-                                                       .priorityUpdated(matchingBlock->getPriority(),
-                                                           *result.perBlockRetentions[bi].retentionPriority),
-                    mWindowSize);
-            }
+        // Priority update event
+        if (result.perBlockRetentions[bi].retentionPriority.has_value()
+            && matchingBlock->getPriority() != result.perBlockRetentions[bi].retentionPriority && mEventManager)
+        {
+            mEventManager->enqueueUpdatedEvent(
+                tle::KVCacheUpdatedData(matchingBlock->getHash())
+                    .priorityUpdated(matchingBlock->getPriority(), *result.perBlockRetentions[bi].retentionPriority),
+                mWindowSize);
+        }
 
-            if (partialMatch)
+        if (partialMatch)
+        {
+            if (matchingBlock->hasRefs() || !matchingBlock->isLeaf())
             {
-                if (matchingBlock->hasRefs() || !matchingBlock->isLeaf())
+                // Block in use or has children — always needs copy.
+                claimed.needsCopy = true;
+                if (!matchingBlock->hasRefs())
                 {
-                    // Block in use or has children — always needs copy.
-                    claimed.needsCopy = true;
-                    if (!matchingBlock->hasRefs())
-                    {
-                        // Unreferenced non-leaf: claim to protect from eviction during copies.
-                        // Use tracker to assign release responsibility to the last copier.
-                        mEvictionPolicy->claimBlock(matchingBlock, result.perBlockRetentions[bi].retentionPriority,
-                            result.perBlockRetentions[bi].durationMs);
+                    // Unreferenced non-leaf: claim to protect from eviction during copies.
+                    // Use tracker to assign release responsibility to the last copier.
+                    mEvictionPolicy->claimBlock(matchingBlock, result.perBlockRetentions[bi].retentionPriority,
+                        result.perBlockRetentions[bi].durationMs);
 
-                        auto const blockId = matchingBlock->getBlockId();
-                        auto tIt = tracker.map.find(blockId);
-                        if (tIt != tracker.map.end())
-                        {
-                            if (tIt->second.fullyMatched)
-                            {
-                                // A full match holds this block — do not release.
-                                claimed.shouldReleaseCopySource = false;
-                            }
-                            else
-                            {
-                                // Previous copier no longer responsible for release.
-                                claimResults[tIt->second.requestIdx]
-                                    .claimedBlocks[tIt->second.claimedIdx]
-                                    .shouldReleaseCopySource
-                                    = false;
-                                claimed.shouldReleaseCopySource = true;
-                            }
-                            tIt->second.requestIdx = requestIdx;
-                            tIt->second.claimedIdx = result.claimedBlocks.size();
-                        }
-                        else
-                        {
-                            tracker.map[blockId] = {requestIdx, result.claimedBlocks.size(), /*fullyMatched=*/false};
-                            claimed.shouldReleaseCopySource = true;
-                        }
-                    }
-                }
-                else
-                {
-                    // Leaf with no refs — decide reuse vs copy using the batch tracker.
-                    // Do NOT call freeLeafBlock here (cascade prune would corrupt the trie
-                    // for later requests).  Claim to protect from eviction; freeLeafBlock is
-                    // deferred to Phase 2 for the single reuser.
                     auto const blockId = matchingBlock->getBlockId();
                     auto tIt = tracker.map.find(blockId);
                     if (tIt != tracker.map.end())
                     {
                         if (tIt->second.fullyMatched)
                         {
-                            // A previous request already fully matched this block — must copy.
-                            claimed.needsCopy = true;
+                            // A full match holds this block — do not release.
+                            claimed.shouldReleaseCopySource = false;
                         }
                         else
                         {
-                            // A previous request was going to reuse — bump it to copy,
-                            // and this request becomes the new reuser.
-                            claimResults[tIt->second.requestIdx].claimedBlocks[tIt->second.claimedIdx].needsCopy = true;
-                            claimed.needsCopy = false;
-                            tIt->second.requestIdx = requestIdx;
-                            tIt->second.claimedIdx = result.claimedBlocks.size();
+                            // Previous copier no longer responsible for release.
+                            claimResults[tIt->second.requestIdx]
+                                .claimedBlocks[tIt->second.claimedIdx]
+                                .shouldReleaseCopySource
+                                = false;
+                            claimed.shouldReleaseCopySource = true;
                         }
+                        tIt->second.requestIdx = requestIdx;
+                        tIt->second.claimedIdx = result.claimedBlocks.size();
                     }
                     else
                     {
-                        // First request to partially match this leaf — reuse it.
-                        claimed.needsCopy = false;
                         tracker.map[blockId] = {requestIdx, result.claimedBlocks.size(), /*fullyMatched=*/false};
+                        claimed.shouldReleaseCopySource = true;
                     }
-                    mEvictionPolicy->claimBlock(matchingBlock, result.perBlockRetentions[bi].retentionPriority,
-                        result.perBlockRetentions[bi].durationMs);
                 }
-                searchRoot = nullptr; // no matching for following blocks
             }
             else
             {
-                // Full match — claim block (removes from free queue, protecting from eviction)
-                searchRoot = matchingBlock;
-                mEvictionPolicy->claimBlock(matchingBlock, result.perBlockRetentions[bi].retentionPriority,
-                    result.perBlockRetentions[bi].durationMs);
-
-                // If a previous request was going to reuse or release this block via partial match,
-                // it must now copy instead — a full match takes priority.
+                // Leaf with no refs — decide reuse vs copy using the batch tracker.
+                // Do NOT call freeLeafBlock here (cascade prune would corrupt the trie
+                // for later requests). Claim to protect from eviction; freeLeafBlock is
+                // deferred to Phase 2 for the single reuser.
+                auto const blockId = matchingBlock->getBlockId();
+                auto tIt = tracker.map.find(blockId);
+                if (tIt != tracker.map.end())
                 {
-                    auto const blockId = matchingBlock->getBlockId();
-                    auto tIt = tracker.map.find(blockId);
-                    if (tIt != tracker.map.end() && !tIt->second.fullyMatched)
+                    if (tIt->second.fullyMatched)
                     {
-                        claimResults[tIt->second.requestIdx].claimedBlocks[tIt->second.claimedIdx].needsCopy = true;
-                        claimResults[tIt->second.requestIdx]
-                            .claimedBlocks[tIt->second.claimedIdx]
-                            .shouldReleaseCopySource
-                            = false;
-                        tIt->second.fullyMatched = true;
+                        // A previous request already fully matched this block — must copy.
+                        claimed.needsCopy = true;
                     }
                     else
                     {
-                        tracker.map[blockId] = {requestIdx, result.claimedBlocks.size(), /*fullyMatched=*/true};
+                        // A previous request was going to reuse — bump it to copy,
+                        // and this request becomes the new reuser.
+                        claimResults[tIt->second.requestIdx].claimedBlocks[tIt->second.claimedIdx].needsCopy = true;
+                        claimed.needsCopy = false;
+                        tIt->second.requestIdx = requestIdx;
+                        tIt->second.claimedIdx = result.claimedBlocks.size();
                     }
                 }
+                else
+                {
+                    // First request to partially match this leaf — reuse it.
+                    claimed.needsCopy = false;
+                    tracker.map[blockId] = {requestIdx, result.claimedBlocks.size(), /*fullyMatched=*/false};
+                }
+                mEvictionPolicy->claimBlock(matchingBlock, result.perBlockRetentions[bi].retentionPriority,
+                    result.perBlockRetentions[bi].durationMs);
             }
-
-            result.claimedBlocks.push_back(std::move(claimed));
-            ++blockItr;
         }
         else
         {
-            // No match — stop matching, remaining blocks handled in Phase 2
-            break;
+            // Full match — claim block (removes from free queue, protecting from eviction)
+            mEvictionPolicy->claimBlock(matchingBlock, result.perBlockRetentions[bi].retentionPriority,
+                result.perBlockRetentions[bi].durationMs);
+
+            // If a previous request was going to reuse or release this block via partial match,
+            // it must now copy instead — a full match takes priority.
+            {
+                auto const blockId = matchingBlock->getBlockId();
+                auto tIt = tracker.map.find(blockId);
+                if (tIt != tracker.map.end() && !tIt->second.fullyMatched)
+                {
+                    claimResults[tIt->second.requestIdx].claimedBlocks[tIt->second.claimedIdx].needsCopy = true;
+                    claimResults[tIt->second.requestIdx].claimedBlocks[tIt->second.claimedIdx].shouldReleaseCopySource
+                        = false;
+                    tIt->second.fullyMatched = true;
+                }
+                else
+                {
+                    tracker.map[blockId] = {requestIdx, result.claimedBlocks.size(), /*fullyMatched=*/true};
+                }
+            }
         }
+
+        result.claimedBlocks.push_back(std::move(claimed));
     }
 
     TLLM_LOG_DEBUG("%s::claimMatchingBlocks for request %lu - Claimed %zu blocks, %d matched tokens",
@@ -1580,7 +1765,7 @@ WindowBlockManager::ClaimResult WindowBlockManager::claimMatchingBlocks(Generati
 SizeType32 WindowBlockManager::onboardAndAllocateBlocks(
     GenerationRequest& sequence, LlmRequest& llmRequest, ClaimResult& claimResult, bool isEnableBlockReuse)
 {
-    // NOTE: Caller must hold mCachedBlocksRootMutex.
+    // NOTE: Caller must hold mLookupTree->getMutex().
     std::set<KVCacheBlock::IdType> reusedBlockIds;
     auto blockItr = claimResult.blockKeys.begin();
     SizeType32 bi = 0;
@@ -1588,6 +1773,16 @@ SizeType32 WindowBlockManager::onboardAndAllocateBlocks(
     // Process claimed (matched) blocks: onboard + addBlockToAllBeams
     for (auto& claimed : claimResult.claimedBlocks)
     {
+        if (claimed.isTraversalOnly)
+        {
+            TLLM_LOG_DEBUG("%s::onboardAndAllocateBlocks for request %lu - Traversed missing SWA anchor",
+                mLogPrefix.c_str(), sequence.getRequestId());
+            addBlockToAllBeams(claimed.block, sequence);
+            ++blockItr;
+            ++bi;
+            continue;
+        }
+
         KVCacheBlock::IdType matchingBlockId = claimed.block->getBlockId();
 
         if (claimed.isPartialMatch && claimed.needsCopy)
@@ -1658,6 +1853,10 @@ SizeType32 WindowBlockManager::onboardAndAllocateBlocks(
     for (; bi < claimResult.numSharedContextBlocks; ++bi)
     {
         bool shouldAllocate = true;
+        if (mIsSWA && bi < claimResult.firstRealBlockIdx)
+        {
+            shouldAllocate = false;
+        }
         if (isRecurrentState())
         {
             if (isEnableBlockReuse)
@@ -1674,6 +1873,16 @@ SizeType32 WindowBlockManager::onboardAndAllocateBlocks(
             TLLM_LOG_DEBUG(
                 "%s::onboardAndAllocateBlocks - Recurrent state block %d. shouldAllocate=%d for sequence %lu",
                 mLogPrefix.c_str(), bi, shouldAllocate, sequence.getRequestId());
+        }
+
+        if (mIsSWA && !shouldAllocate)
+        {
+            addSwaPlaceholderToAllBeams(sequence);
+            if (blockItr != claimResult.blockKeys.end())
+            {
+                ++blockItr;
+            }
+            continue;
         }
 
         auto freeBlock = getFreeBlock(sequence,
@@ -1697,6 +1906,15 @@ SizeType32 WindowBlockManager::onboardAndAllocateBlocks(
     auto const beamWidth = sequence.getBeamWidth();
     for (int nbi = claimResult.numSharedContextBlocks; nbi < claimResult.numContextBlocks; ++nbi)
     {
+        if (mIsSWA && nbi < claimResult.firstRealBlockIdx)
+        {
+            addSwaPlaceholderToAllBeams(sequence);
+            if (blockItr != claimResult.blockKeys.end())
+            {
+                ++blockItr;
+            }
+            continue;
+        }
         for (SizeType32 beamIdx = 0; beamIdx < beamWidth; ++beamIdx)
         {
             auto freeBlock = getFreeBlock(sequence,
@@ -1760,13 +1978,14 @@ SizeType32 WindowBlockManager::onboardAndAllocateBlocks(
     return totalPrepopulatedLen;
 }
 
-WindowBlockManager::ClaimResult WindowBlockManager::buildClaimResultMetadata(
-    GenerationRequest& sequence, SizeType32 inputLength, SizeType32 numContextBlocks, LlmRequest& llmRequest)
+WindowBlockManager::ClaimResult WindowBlockManager::buildClaimResultMetadata(GenerationRequest& sequence,
+    SizeType32 inputLength, SizeType32 numContextBlocks, SizeType32 firstRealBlockIdx, LlmRequest& llmRequest)
 {
     // Build ClaimResult metadata without walking the radix tree.
     // Used for non-reuse path where all blocks are freshly allocated.
     ClaimResult result;
     result.numContextBlocks = numContextBlocks;
+    result.firstRealBlockIdx = firstRealBlockIdx;
 
     auto const requestId = sequence.getRequestId();
     auto const [seqIt, emplaceDone] = mAllocatedBlocksPerSeq.emplace(requestId, std::vector<BlockPtr>{});
@@ -1819,7 +2038,7 @@ WindowBlockManager::ClaimResult WindowBlockManager::buildClaimResultMetadata(
 
 std::vector<WindowBlockManager::BatchSeqStats> WindowBlockManager::addSequenceBatch(
     std::vector<GenerationRequest*> const& sequences, std::vector<SizeType32> const& inputLengths,
-    std::vector<SizeType32> const& numContextBlocksVec,
+    std::vector<SizeType32> const& numContextBlocksVec, std::vector<SizeType32> const& firstRealBlockIdxVec,
     std::vector<std::reference_wrapper<LlmRequest>> const& llmRequests, bool isEnableBlockReuse)
 {
     auto const n = sequences.size();
@@ -1827,7 +2046,7 @@ std::vector<WindowBlockManager::BatchSeqStats> WindowBlockManager::addSequenceBa
     std::vector<BatchSeqStats> results(n);
 
     // Hold the lock for the entire two-phase operation.
-    std::lock_guard<std::mutex> lock(mCachedBlocksRootMutex);
+    std::lock_guard<std::recursive_mutex> lock(mLookupTree->getMutex());
 
     if (isEnableBlockReuse)
     {
@@ -1837,8 +2056,8 @@ std::vector<WindowBlockManager::BatchSeqStats> WindowBlockManager::addSequenceBa
         PartialClaimTracker tracker;
         for (size_t i = 0; i < n; ++i)
         {
-            claimResults[i] = claimMatchingBlocks(
-                *sequences[i], inputLengths[i], numContextBlocksVec[i], llmRequests[i].get(), i, tracker, claimResults);
+            claimResults[i] = claimMatchingBlocks(*sequences[i], inputLengths[i], numContextBlocksVec[i],
+                firstRealBlockIdxVec[i], llmRequests[i].get(), i, tracker, claimResults);
         }
     }
     else
@@ -1848,7 +2067,7 @@ std::vector<WindowBlockManager::BatchSeqStats> WindowBlockManager::addSequenceBa
         for (size_t i = 0; i < n; ++i)
         {
             claimResults[i] = buildClaimResultMetadata(
-                *sequences[i], inputLengths[i], numContextBlocksVec[i], llmRequests[i].get());
+                *sequences[i], inputLengths[i], numContextBlocksVec[i], firstRealBlockIdxVec[i], llmRequests[i].get());
         }
     }
 
@@ -1883,7 +2102,7 @@ bool WindowBlockManager::blockInRadixTree(BlockPtr const& block)
 
 std::shared_ptr<KVCacheBlock> WindowBlockManager::findBlocksInReuseTreeByBlockKey(BlockKey const& blockKey)
 {
-    std::lock_guard<std::mutex> lock(mCachedBlocksRootMutex);
+    std::lock_guard<std::recursive_mutex> lock(mLookupTree->getMutex());
     auto blockedUniqueTokens
         = chopVectorIntoBlocks<UniqueToken>(blockKey.uniqueTokens, blockKey.uniqueTokens.size(), mTokensPerBlock, true);
 
@@ -1893,212 +2112,30 @@ std::shared_ptr<KVCacheBlock> WindowBlockManager::findBlocksInReuseTreeByBlockKe
         blockKeys.push_back(blockKey);
         blockKeys.back().uniqueTokens = blockedUniqueTokensList;
     }
-    auto searchRoot = mCachedBlocksRoot;
-    for (auto const& blockKey : blockKeys)
-    {
-        auto [partialMatch, numMatched, matchingBlock] = searchRoot != nullptr
-            ? searchRoot->findMatchingBlock(blockKey, true, true)
-            : std::make_tuple(false, 0, nullptr);
-
-        if (matchingBlock == nullptr)
-        {
-            return nullptr;
-        }
-
-        searchRoot = std::move(matchingBlock);
-    }
-    return searchRoot;
+    return searchReuseTree(blockKeys);
 }
 
-SizeType32 WindowBlockManager::loadOrAllocateBlocks(std::vector<BlockKey> const& blockKeys, SizeType32 inputLength,
-    SizeType32 numContextBlocks, GenerationRequest& sequence,
-    std::vector<executor::RetentionPriorityAndDuration> const& perBlockRetentions, executor::KvCacheTransferMode mode,
-    std::string const& directory, bool isEnableBlockReuse)
+std::shared_ptr<KVCacheBlock> WindowBlockManager::findBlocksInReuseTreeByBlockKeys(
+    std::vector<BlockKey> const& blockKeys)
 {
-    std::lock_guard<std::mutex> lock(mCachedBlocksRootMutex);
-    SizeType32 numMatchedTokens{0};
-    SizeType32 latestMatchingNonPlaceholderBlockIdx{-1};
-    auto searchRoot = mCachedBlocksRoot;
-    std::set<KVCacheBlock::IdType> reusedBlockIds;
+    std::lock_guard<std::recursive_mutex> lock(mLookupTree->getMutex());
+    return searchReuseTree(blockKeys);
+}
 
-    // The last block can be shared between beams if it is fully filled (won't be written to during generation)
-    // or if this is cross-attention KV cache (read-only). Otherwise, allocate a unique block per beam.
-    auto const beamWidth = sequence.getBeamWidth();
-    bool const isShareLastContextBlock = mCacheType == CacheType::kCROSS || inputLength % mTokensPerBlock == 0;
-    SizeType32 numSharedContextBlocks
-        = (beamWidth > 1 && !isShareLastContextBlock) ? numContextBlocks - 1 : numContextBlocks;
-
-    auto blockItr = blockKeys.begin();
-    for (int bi = 0; bi < numSharedContextBlocks; ++bi)
+std::shared_ptr<KVCacheBlock> WindowBlockManager::searchReuseTree(std::vector<BlockKey> const& blockKeys)
+{
+    if (blockKeys.empty())
     {
-        auto [partialMatch, numMatched, matchingBlock]
-            = searchRoot != nullptr && blockItr != blockKeys.end() && isEnableBlockReuse
-            ? searchRoot->findMatchingBlock(*blockItr, mEnablePartialReuse, mCopyOnPartialReuse)
-            : std::make_tuple(false, 0, nullptr);
-        if (isRecurrentState())
-        {
-            TLLM_CHECK(partialMatch == false);
-        }
-        if (matchingBlock != nullptr && numMatchedTokens + numMatched <= sequence.getCurrentPrepopulatedPromptLen())
-        {
-            KVCacheBlock::IdType matchingBlockId = matchingBlock->getBlockId();
-
-            numMatchedTokens += numMatched > 0 ? numMatched : blockItr->uniqueTokens.size();
-            if (!matchingBlock->isPlaceholder())
-            {
-                latestMatchingNonPlaceholderBlockIdx = bi;
-            }
-            if (perBlockRetentions[bi].retentionPriority.has_value()
-                && matchingBlock->getPriority() != perBlockRetentions[bi].retentionPriority && mEventManager)
-            {
-                mEventManager->enqueueUpdatedEvent(
-                    tle::KVCacheUpdatedData(matchingBlock->getHash())
-                        .priorityUpdated(matchingBlock->getPriority(), *perBlockRetentions[bi].retentionPriority),
-                    mWindowSize);
-            }
-            if (partialMatch)
-            {
-                if (matchingBlock->hasRefs() || !matchingBlock->isLeaf())
-                {
-                    // Somebody else is using block or it is not a leaf, copy reusable tokens
-                    auto newBlock = getFreeBlock(
-                        sequence, matchingBlock->getPriority(), matchingBlock->getDurationMs(), mode, directory);
-                    mTransferManager->onboard(matchingBlock, newBlock, mPools, numMatched, mode, directory);
-                    // TODO: (optional) Send out event
-                    matchingBlock = newBlock;
-                    if (blockItr != blockKeys.end())
-                    {
-                        matchingBlock->setBlockKey(
-                            *blockItr, blockItr->uniqueTokens.size() == static_cast<size_t>(mTokensPerBlock));
-                    }
-                    matchingBlock->setHash();
-                    TLLM_LOG_DEBUG("%s::loadOrAllocateBlocks for request %lu - Copied partially filled block %d",
-                        mLogPrefix.c_str(), sequence.getRequestId(), matchingBlockId);
-                }
-                else
-                {
-                    // Leaf block that nobody is using. Make block private and reuse
-                    freeLeafBlock(matchingBlock);
-                    mEvictionPolicy->claimBlock(
-                        matchingBlock, perBlockRetentions[bi].retentionPriority, perBlockRetentions[bi].durationMs);
-                    TLLM_LOG_DEBUG("%s::loadOrAllocateBlocks for request %lu - Reused partially filled block %d",
-                        mLogPrefix.c_str(), sequence.getRequestId(), matchingBlockId);
-                }
-                searchRoot = nullptr; // no matching needed for following blocks
-            }
-            else
-            {
-                searchRoot = matchingBlock;
-                // Recover block and reuse
-                mEvictionPolicy->claimBlock(
-                    matchingBlock, perBlockRetentions[bi].retentionPriority, perBlockRetentions[bi].durationMs);
-                TLLM_LOG_DEBUG("%s::loadOrAllocateBlocks for request %lu - Matched full block %d", mLogPrefix.c_str(),
-                    sequence.getRequestId(), matchingBlockId);
-            }
-            onboardBlock(sequence, matchingBlock, mode, directory);
-            addBlockToAllBeams(matchingBlock, sequence);
-            if (!matchingBlock->isPlaceholder())
-            {
-                // TODO: only add once for reused blocks
-                ++mReusedBlocks;
-                if (!reusedBlockIds.count(matchingBlockId))
-                {
-                    reusedBlockIds.insert(matchingBlockId);
-                    ++mReusedUniqueBlocks;
-                }
-                if (partialMatch)
-                {
-                    ++mPartialReusedBlocks;
-                }
-                else
-                {
-                    ++mFullReusedBlocks;
-                }
-            }
-            ++blockItr;
-        }
-        else // matchingBlock == nullptr || numMatchedTokens + numMatched > sequence.getCurrentPrepopulatedPromptLen()
-        {
-            BlockPtr freeBlock;
-            bool shouldAllocate = true;
-            if (isRecurrentState())
-            {
-                if (isEnableBlockReuse)
-                {
-                    // loadOrAllocateBlocks is only called by addSequence, which ensures it's the first chunk, so the
-                    // token num always starts from 0.
-                    shouldAllocate = mLinearAttentionMetadata->shouldAllocateRecurrentStates(
-                        /*currentBlockEndTokenIdx=*/(bi + 1) * mTokensPerBlock, inputLength, mTokensPerBlock);
-                }
-                else
-                {
-                    // When block reuse is disabled, only the last context block needs real memory to store the
-                    // current recurrent state. All other blocks are placeholders.
-                    shouldAllocate = (bi == numContextBlocks - 1);
-                }
-                TLLM_LOG_DEBUG(
-                    "%s::loadOrAllocateBlocks - Recurrent state block %d. shouldAllocate=%d for sequence %lu",
-                    mLogPrefix.c_str(), bi, shouldAllocate, sequence.getRequestId());
-            }
-
-            // If we haven't set a priority, set it to the default priority level (low)
-            freeBlock = getFreeBlock(sequence,
-                perBlockRetentions[bi].retentionPriority.value_or(
-                    executor::KvCacheRetentionConfig::kDefaultRetentionPriority),
-                perBlockRetentions[bi].durationMs, mode, directory, /*wantPlaceholder=*/!shouldAllocate);
-            addBlockToAllBeams(freeBlock, sequence);
-            TLLM_LOG_DEBUG("%s::loadOrAllocateBlocks - No match, allocated new block %d for sequence %lu",
-                mLogPrefix.c_str(), freeBlock->getBlockId(), sequence.getRequestId());
-            // allBlockStats.emplace_back(freeBlock, "N");
-            searchRoot = nullptr; // no matching needed for following blocks
-            if (blockItr != blockKeys.end())
-            {
-                freeBlock->setBlockKey(
-                    *blockItr, blockItr->uniqueTokens.size() == static_cast<size_t>(mTokensPerBlock));
-                ++blockItr;
-            }
-            freeBlock->setHash();
-            ++mMissedBlocks;
-        }
+        return mCachedBlocksRoot;
     }
 
-    // Allocate new blocks that cannot be shared by multiple beams.
-    for (int bi = numSharedContextBlocks; bi < numContextBlocks; ++bi)
+    auto reuseMatches = findReusableBlockMatches(
+        blockKeys, /*enablePartialReuse=*/true, /*copyOnPartialReuse=*/true, std::numeric_limits<SizeType32>::max());
+    if (reuseMatches.matches.size() != blockKeys.size() || reuseMatches.matches.back().isTraversalOnly)
     {
-        // TODO: Still look for match. Clone matching block or allocate fresh ones.
-        // This work is described in JIRA task https://jirasw.nvidia.com/browse/TRTLLM-2069.
-        for (SizeType32 beamIdx = 0; beamIdx < beamWidth; ++beamIdx)
-        {
-            // If we haven't set a priority, set it to the default priority level (low)
-            auto freeBlock = getFreeBlock(sequence,
-                perBlockRetentions[bi].retentionPriority.value_or(
-                    executor::KvCacheRetentionConfig::kDefaultRetentionPriority),
-                perBlockRetentions[bi].durationMs, mode, directory);
-            addBlockToBeam(freeBlock, sequence, beamIdx);
-            if (blockItr != blockKeys.end())
-            {
-                freeBlock->setBlockKey(
-                    *blockItr, blockItr->uniqueTokens.size() == static_cast<size_t>(mTokensPerBlock));
-                ++blockItr;
-            }
-            freeBlock->setHash();
-            TLLM_LOG_DEBUG("%s::loadOrAllocateBlocks - Beam %d. Allocated non-shared block %d for bi %d",
-                mLogPrefix.c_str(), beamIdx, freeBlock->getBlockId(), bi);
-        }
-        ++mMissedBlocks;
-        if (blockItr != blockKeys.end())
-        {
-            ++blockItr;
-        }
+        return nullptr;
     }
-
-    if (isRecurrentState())
-    {
-        // purge tailing placeholder blocks
-        numMatchedTokens = (latestMatchingNonPlaceholderBlockIdx + 1) * mTokensPerBlock;
-    }
-    sequence.setCurrentPrepopulatedPromptLen(numMatchedTokens);
-    return sequence.getCurrentPrepopulatedPromptLen();
+    return reuseMatches.matches.back().block;
 }
 
 void BlockManager::syncTransferManagerWithBufferManager()
@@ -2128,112 +2165,29 @@ void WindowBlockManager::refreshBlocks()
     mTransferManager->syncTransfers();
 }
 
-SizeType32 BlockManager::addSequence(GenerationRequest& sequence, SizeType32 inputLength, SizeType32 numContextBlocks,
-    LlmRequest& llmRequest, SizeType32 windowSize, bool isEnableBlockReuse)
-{
-    return mWindowBlockManagers.at(windowSize)
-        .addSequence(sequence, inputLength, numContextBlocks, llmRequest, isEnableBlockReuse);
-}
-
 std::vector<WindowBlockManager::BatchSeqStats> BlockManager::addSequenceBatch(
     std::vector<GenerationRequest*> const& sequences, std::vector<SizeType32> const& inputLengths,
-    std::vector<SizeType32> const& numContextBlocksVec,
+    std::vector<SizeType32> const& numContextBlocksVec, std::vector<SizeType32> const& firstRealBlockIdxVec,
     std::vector<std::reference_wrapper<LlmRequest>> const& llmRequests, SizeType32 windowSize, bool isEnableBlockReuse)
 {
     return mWindowBlockManagers.at(windowSize)
-        .addSequenceBatch(sequences, inputLengths, numContextBlocksVec, llmRequests, isEnableBlockReuse);
+        .addSequenceBatch(
+            sequences, inputLengths, numContextBlocksVec, firstRealBlockIdxVec, llmRequests, isEnableBlockReuse);
 }
 
-SizeType32 WindowBlockManager::addSequence(GenerationRequest& sequence, SizeType32 inputLength,
-    SizeType32 numContextBlocks, LlmRequest& llmRequest, bool isEnableBlockReuse)
+void BlockManager::adjustBlocksIfNeeded(GenerationRequest& sequence, bool detachSwaFrontBlocks)
 {
-    TLLM_CHECK_WITH_INFO(!(isRecurrentState()) || inputLength == llmRequest.getPromptLen(),
-        "Recurrent state does not support CP or truncation yet.");
-    auto const requestId = sequence.getRequestId();
-    auto const [seqIt, emplaceDone] = mAllocatedBlocksPerSeq.emplace(requestId, std::vector<BlockPtr>{});
-    TLLM_CHECK(emplaceDone);
-
-    auto constexpr beamIdx = 0;
-    bool const isSelfCache = mCacheType == CacheType::kSELF || mCacheType == CacheType::kSELFKONLY;
-
-    // For cross KV cache without encoder tokens (e.g., encoder-decoder models with feature inputs like Whisper),
-    // encoder unique tokens are not available. Use empty block keys since block reuse is disabled for cross
-    // KV cache and unique tokens are only needed for radix tree lookup.
-    bool const hasUniqueTokens = isSelfCache
-        || (llmRequest.getEncoderUniqueTokens().has_value() && llmRequest.getEncoderUniqueTokens().value());
-    std::vector<BlockKey> blockKeys;
-    VecUniqueTokens const* uniqueTokensPtr = nullptr;
-
-    if (hasUniqueTokens)
+    for (auto& [_, manager] : mWindowBlockManagers)
     {
-        auto const& uniqueTokens
-            = isSelfCache ? llmRequest.getUniqueTokens(beamIdx) : *(llmRequest.getEncoderUniqueTokens().value());
-        uniqueTokensPtr = &uniqueTokens;
-
-        // Ignore last token because it can't be recovered
-        auto blockedUniqueTokens
-            = chopVectorIntoBlocks<UniqueToken>(uniqueTokens, inputLength - 1, mTokensPerBlock, true);
-        // Add empty block if last token is separated
-        if (inputLength % mTokensPerBlock == 1)
-        {
-            blockedUniqueTokens.emplace_back();
-        }
-
-        blockKeys = buildBlockKeys(blockedUniqueTokens, llmRequest);
-    }
-
-    auto config = llmRequest.getKvCacheRetentionConfig();
-
-    auto perBlockRetentions = config.value_or(executor::KvCacheRetentionConfig())
-                                  .getPerBlockRetentionPriorityDuration(getTokensPerBlock(), inputLength);
-
-    auto mode = config.value_or(executor::KvCacheRetentionConfig()).getTransferMode();
-    auto directory = config.value_or(executor::KvCacheRetentionConfig()).getDirectory();
-
-    if (mode != executor::KvCacheTransferMode::DRAM && directory.empty())
-    {
-        TLLM_LOG_WARNING(
-            "Transfer mode %d specified without directory, falling back to DRAM mode", static_cast<int>(mode));
-        mode = executor::KvCacheTransferMode::DRAM;
-    }
-
-    TLLM_CHECK(perBlockRetentions.size() == (size_t) numContextBlocks);
-
-    auto const prepopulatedPromptLen = loadOrAllocateBlocks(
-        blockKeys, inputLength, numContextBlocks, sequence, perBlockRetentions, mode, directory, isEnableBlockReuse);
-    mReusedTokens += static_cast<double>(prepopulatedPromptLen);
-    mTotalInputTokens += static_cast<double>(uniqueTokensPtr ? uniqueTokensPtr->size() : inputLength);
-
-    SizeType32 numConnectorMatchedTokens = 0;
-
-    // If we're using a KV cache connector, check if any additional blocks can be loaded.
-    if (mKvCacheConnectorManager && !llmRequest.isDummyRequest())
-    {
-        numConnectorMatchedTokens = mKvCacheConnectorManager->getNumNewMatchedTokens(llmRequest, prepopulatedPromptLen);
-    }
-
-    // Return the total prepopulated length for this window (do not set on llmRequest here -
-    // the caller KVCacheManager::addSequence will use the minimum across all windows)
-    auto const totalPrepopulatedLen = prepopulatedPromptLen + numConnectorMatchedTokens;
-    TLLM_LOG_DEBUG(
-        "%s::addSequence: Request %lu, inputLength %d, prepopulatedPromptLen %d, numConnectorMatchedTokens %d",
-        mLogPrefix.c_str(), llmRequest.mRequestId, inputLength, prepopulatedPromptLen, numConnectorMatchedTokens);
-    return totalPrepopulatedLen;
-}
-
-void BlockManager::adjustBlocksIfNeeded(GenerationRequest& sequence)
-{
-    for (auto& [windowSize, manager] : mWindowBlockManagers)
-    {
-        mWindowBlockManagers.at(windowSize).adjustBlocksIfNeeded(sequence);
+        manager.adjustBlocksIfNeeded(sequence, detachSwaFrontBlocks);
     }
 }
 
-void WindowBlockManager::adjustBlocksIfNeeded(GenerationRequest& sequence)
+void WindowBlockManager::adjustBlocksIfNeeded(GenerationRequest& sequence, bool detachSwaFrontBlocks)
 {
     auto const minTokensForBlockDetach = mWindowSize + mTokensPerBlock;
-    while (mIsSWA && // A block only go out-of-window in SWA
-        (sequence.getNumTokens() - sequence.getNumFrontBlocksRemoved() * getTokensPerBlock()
+    while (detachSwaFrontBlocks && mIsSWA && // A block only go out-of-window in SWA
+        (sequence.getNumTokens() - sequence.getNumFrontBlocksRemoved(mWindowSize) * getTokensPerBlock()
             >= minTokensForBlockDetach))
     {
         // Detaching block for SWA is non-trivial due to the radix tree structure.
@@ -2275,6 +2229,12 @@ void WindowBlockManager::addBlockToAllBeams(BlockPtr const& block, GenerationReq
     {
         addBlockToBeam(block, sequence, beamIdx);
     }
+}
+
+void WindowBlockManager::addSwaPlaceholderToAllBeams(GenerationRequest& sequence)
+{
+    auto placeholder = KVCacheBlock::createPlaceholder();
+    addBlockToAllBeams(placeholder, sequence);
 }
 
 void BlockManager::allocateBlock(GenerationRequest& sequence, SizeType32 windowSize)
@@ -2519,111 +2479,178 @@ void WindowBlockManager::copyLinearAttentionBlock(GenerationRequest& sequence, L
 }
 
 std::pair<SizeType32, std::vector<KVCacheBlock::IdType>> WindowBlockManager::storeBlocks(
-    std::vector<BlockKey> const& blockKeys, std::vector<KVCacheBlock::IdType> const& blockIds, bool pinBlocks)
+    std::vector<BlockKey> blockKeys, std::vector<BlockPtr> const& blocks, bool pinBlocks)
 {
     SizeType32 numBlocksStoredForReuse = 0;
-    std::lock_guard<std::mutex> lock(mCachedBlocksRootMutex);
-    TLLM_LOG_DEBUG(
-        "%s::storeBlocks - %zu blockKeys, %zu blockIds", mLogPrefix.c_str(), blockKeys.size(), blockIds.size());
+    std::lock_guard<std::recursive_mutex> lock(mLookupTree->getMutex());
 
-    auto searchRoot = mCachedBlocksRoot;
-    bool needMatch = true;
+    // Trim to the shorter of the two inputs so the zip below is always in-bounds.
+    auto const numBlocks = std::min(blockKeys.size(), blocks.size());
+    blockKeys.resize(numBlocks);
 
-    // There is no guarantee that these vectors will be the same length.
-    // Only iterate as long as we have valid blockKey and blockId.
-    auto numBlocks = std::min(blockKeys.size(), blockIds.size());
-    while (numBlocks > 0 && blockIds[numBlocks - 1] < 0)
+    TLLM_LOG_DEBUG("%s::storeBlocks - %zu blockKeys, %zu blocks", mLogPrefix.c_str(), numBlocks, blocks.size());
+
+    if (numBlocks == 0)
     {
-        numBlocks--;
+        return {0, {}};
     }
+
+    // Insert (or look up) trie nodes for the entire prefix chain in one pass.
+    // This separates structural trie insertion from block-value assignment and
+    // allows us to skip occupied slots and continue storing later blocks
+    // (rather than stopping on the first collision).
+    auto nodeMatches = mLookupTree->insertNodes(blockKeys);
+
     std::vector<BlockPtr> storedBlocks;
     std::vector<KVCacheBlock::IdType> pinnedBlockIds;
-    for (std::size_t blockCnt = 0; blockCnt < numBlocks; ++blockCnt)
+    // prevBlock tracks the trie-level parent used for hash chaining and setPrevBlockInSeq.
+    BlockPtr prevBlock = mCachedBlocksRoot;
+
+    for (std::size_t i = 0; i < nodeMatches.exactMatches.size() && i < numBlocks; ++i)
     {
-        try
+        auto const& node = nodeMatches.exactMatches[i].node;
+        auto const& block = blocks[i];
+        auto const& blockKey = blockKeys[i];
+
+        if (block->isPlaceholder())
         {
-            // Protect against blockIds being shorter than blockKeys.
-            auto const bid = blockIds.at(blockCnt);
-            TLLM_LOG_DEBUG("%s::storeBlocks - Searching match for block %d", mLogPrefix.c_str(), bid);
-            // We set blockId to an invalid value to indicate that a block has been released early for a limited
-            // attention layer. Make sure we don't store an invalid block because of this.
-            auto block = getBlockById(bid);
-            // Protect against blockKeys being shorter than blockIds.
-            auto const& blockKey = blockKeys.at(blockCnt);
-
-            // If either of the above error conditions occur, std::vector::at will throw an exception, which is caught
-            // further down. This will prevent an invalid block from being stored for reuse. The catch clause exits loop
-            // early, preventing blocks following an invalid block from being reused.
-
-            auto [partialMatch, numMatched, matchedBlock] = needMatch
-                ? searchRoot->findMatchingBlock(blockKey, false, false)
-                : std::make_tuple(false, 0, nullptr);
-            if (matchedBlock != nullptr)
+            // Two placeholder flavors coexist at this call site:
+            //   1) SWA on-demand placeholders (blockId == kPlaceholderBlockId): the real
+            //      OOW block was stored earlier (storeContextBlocks / storeNewBlock) or
+            //      has been evicted. Advance prevBlock via the existing trie value if
+            //      present; if absent (evicted anchor), continue past it. SWA lookup can
+            //      traverse value-less exact nodes once the missing anchor is OOW.
+            //   2) Linear-attention placeholders (blockId is a negative per-slot ID from
+            //      mAllPlaceholderBlocksById, not kPlaceholderBlockId): these represent
+            //      gaps in the recurrent-state chain and must be stored at their trie
+            //      slots so that subsequent lookups can traverse through them.
+            auto const existing = node->getValue(mWindowSize);
+            if (block->getBlockId() == KVCacheBlock::kPlaceholderBlockId)
             {
-                // Found match
-                TLLM_LOG_DEBUG("%s::storeBlocks - Found matching block %d, traverse", mLogPrefix.c_str(),
-                    matchedBlock->getBlockId());
-                searchRoot = matchedBlock;
-                // TODO possible optimization: if bid != matchedBlock->getBlockId(),
-                // block can be freed and inserted at mFreePrimaryBlocks.begin()
+                // SWA on-demand placeholder path.
+                if (existing.has_value() && *existing)
+                {
+                    TLLM_LOG_DEBUG("%s::storeBlocks - OOW placeholder at %zu, found anchor block %d in trie",
+                        mLogPrefix.c_str(), i, (*existing)->getBlockId());
+                    prevBlock = *existing;
+                    continue;
+                }
+                TLLM_LOG_DEBUG(
+                    "%s::storeBlocks - OOW placeholder at %zu, anchor block evicted; continuing past missing anchor",
+                    mLogPrefix.c_str(), i);
+                // Keep the hash/back-pointer chain tied to the nearest populated
+                // ancestor while leaving the value-less trie node in place for SWA
+                // traversal.
+                auto walker = node->getParentNode();
+                while (walker)
+                {
+                    auto ancestorValue = walker->getValue(mWindowSize);
+                    if (ancestorValue.has_value() && *ancestorValue)
+                    {
+                        prevBlock = *ancestorValue;
+                        break;
+                    }
+                    walker = walker->getParentNode();
+                }
+                continue;
+            }
+
+            // Linear-attention placeholder path: store at this slot if empty, advance
+            // prevBlock regardless.
+            if (!existing.has_value())
+            {
+                TLLM_LOG_DEBUG("%s::storeBlocks - linear-attention placeholder %d: inserting at trie slot",
+                    mLogPrefix.c_str(), block->getBlockId());
+                block->detachFromLookupNode();
+                block->setBlockKey(blockKey, static_cast<SizeType32>(blockKey.uniqueTokens.size()) == mTokensPerBlock);
+                block->setPrevBlockInSeq(prevBlock);
+                block->attachToLookupNode(node, mWindowSize);
+                auto const newHash = BlockKeyHasher()(blockKey, prevBlock->getHash());
+                if (block->getHash() != newHash)
+                {
+                    block->setHash(newHash);
+                }
+                storedBlocks.push_back(block);
+                prevBlock = block;
+                ++numBlocksStoredForReuse;
             }
             else
             {
-                // No match
-                TLLM_LOG_DEBUG("%s::storeBlocks - No match, inserting block %d into search structure",
-                    mLogPrefix.c_str(), block->getBlockId());
-                TLLM_CHECK_WITH_INFO(block->getBlockId() == bid,
-                    "Block id mismatch " + std::to_string(block->getBlockId()) + " != " + std::to_string(bid));
-
-                if (block->getPrevBlock() != nullptr)
-                {
-                    block->getPrevBlock()->removeNextBlock(block->getBlockKey());
-                }
-                block->setBlockKey(blockKey, static_cast<SizeType32>(blockKey.uniqueTokens.size()) == mTokensPerBlock);
-                block->setPrevBlockInSeq(searchRoot);
-                searchRoot->addNextBlock(blockKey, block);
-
-                // Sanity check. The list of stored blocks should be connected.
-                TLLM_CHECK(storedBlocks.empty() || block->getPrevBlock() == storedBlocks.back());
-                storedBlocks.push_back(block);
-                TLLM_CHECK(block->getPrevBlockInSeq() == nullptr
-                    || block->getPrevBlockInSeq()->getHash() == searchRoot->getHash());
-                auto oldHash = block->getHash();
-                auto newHash = BlockKeyHasher()(blockKey, searchRoot->getHash());
-                if (oldHash != newHash)
-                {
-                    TLLM_LOG_DEBUG("#%d block hash %zx -> %zx", block->getBlockId(), oldHash, newHash);
-                    block->setHash(newHash);
-                }
-                searchRoot = block;
-                numBlocksStoredForReuse++;
-                needMatch = false; // no matching needed for following blocks
+                prevBlock = *existing;
             }
-            if (pinBlocks)
-            {
-                // If the block has no refs it sits in the eviction policy's free
-                // queue. Claim it first so that the later unpinBlocksById /
-                // releaseBlock cycle does not create a duplicate queue entry.
-                // Pass the block's existing priority and duration so that
-                // claimBlock does not clear its retention/expiry metadata.
-                if (!searchRoot->hasRefs())
-                {
-                    mEvictionPolicy->claimBlock(searchRoot, searchRoot->getPriority(), searchRoot->getDurationMs());
-                }
-                searchRoot->incRefCount();
-                pinnedBlockIds.push_back(searchRoot->getBlockId());
-            }
+            continue;
         }
-        catch (std::out_of_range const& ex)
+
+        auto const bid = block->getBlockId();
+        auto const existing = node->getValue(mWindowSize);
+
+        if (existing.has_value())
         {
-            TLLM_LOG_WARNING("Out of range access, terminating storeBlocks early.");
-            // Prevent blocks following an invalid block from being reused.
-            break;
+            // Trie slot already occupied (block previously stored by this or another sequence).
+            // Advance prevBlock and continue. Subsequent blocks may still need
+            // storing as children of this node.
+            TLLM_LOG_DEBUG("%s::storeBlocks - Block %d: slot occupied by %d, skipping", mLogPrefix.c_str(), bid,
+                (*existing)->getBlockId());
+            prevBlock = *existing;
+        }
+        else
+        {
+            // Empty trie slot — store this block.
+            TLLM_LOG_DEBUG("%s::storeBlocks - Block %d: no existing entry, inserting into search structure",
+                mLogPrefix.c_str(), bid);
+
+            block->detachFromLookupNode();
+            block->setBlockKey(blockKey, static_cast<SizeType32>(blockKey.uniqueTokens.size()) == mTokensPerBlock);
+            block->setPrevBlockInSeq(prevBlock);
+            block->attachToLookupNode(node, mWindowSize);
+
+            auto const newHash = BlockKeyHasher()(blockKey, prevBlock->getHash());
+            if (block->getHash() != newHash)
+            {
+                TLLM_LOG_DEBUG("#%d block hash %zx -> %zx", bid, block->getHash(), newHash);
+                block->setHash(newHash);
+            }
+
+            storedBlocks.push_back(block);
+            prevBlock = block;
+            numBlocksStoredForReuse++;
+        }
+
+        if (pinBlocks)
+        {
+            // If the block has no refs it sits in the eviction policy's free
+            // queue. Claim it first so that the later unpinBlocksById /
+            // releaseBlock cycle does not create a duplicate queue entry.
+            // Pass the block's existing priority and duration so that
+            // claimBlock does not clear its retention/expiry metadata.
+            if (!prevBlock->hasRefs())
+            {
+                mEvictionPolicy->claimBlock(prevBlock, prevBlock->getPriority(), prevBlock->getDurationMs());
+            }
+            prevBlock->incRefCount();
+            pinnedBlockIds.push_back(prevBlock->getBlockId());
         }
     }
+
     if (mEventManager)
     {
-        mEventManager->enqueueStoredEvent(storedBlocks, mWindowSize);
+        // Linear-attention placeholders can legitimately land in storedBlocks via the
+        // empty-slot branch above (they represent gaps in the recurrent-state chain),
+        // but KVCacheEventManager::enqueueStoredEvent calls isPrimary() on every entry
+        // and isPrimary() asserts on placeholders.  Filter them out before enqueuing.
+        std::vector<BlockPtr> nonPlaceholderStoredBlocks;
+        nonPlaceholderStoredBlocks.reserve(storedBlocks.size());
+        for (auto const& b : storedBlocks)
+        {
+            if (!b->isPlaceholder())
+            {
+                nonPlaceholderStoredBlocks.push_back(b);
+            }
+        }
+        if (!nonPlaceholderStoredBlocks.empty())
+        {
+            mEventManager->enqueueStoredEvent(nonPlaceholderStoredBlocks, mWindowSize);
+        }
     }
     return {numBlocksStoredForReuse, pinnedBlockIds};
 }
@@ -2721,7 +2748,7 @@ void WindowBlockManager::releaseLastBlock(GenerationRequest& sequence)
 
 KvCacheIterationStats WindowBlockManager::getAndResetIterationStats()
 {
-    std::lock_guard<std::mutex> lock(mCachedBlocksRootMutex);
+    std::lock_guard<std::recursive_mutex> lock(mLookupTree->getMutex());
     KvCacheIterationStats stats;
 
     // Instantaneous gauges
@@ -2804,21 +2831,10 @@ std::optional<KVCacheBlock::IdType> BlockManager::releaseBlocks(
     // Reuse is implied to be enabled if llmRequest is provided.
     std::optional<KVCacheBlock::IdType> lastStoredId = std::nullopt;
 
-    // For now, the attention kernel only accepts a single
-    // "prepopulatedPromptLen", that is, all window sizes will use the same
-    // prepopulated prompt length, so it is meaningless right now to save
-    // blocks only for a certain window size while blocks in the other
-    // window size are not valid for saving for reuse.
-    bool isAllWindowSizesValidForStoreForReuse = true;
-    for (auto& [windowSize, manager] : mWindowBlockManagers)
-    {
-        isAllWindowSizesValidForStoreForReuse &= manager.isSequenceValidForStoreForReuse(sequence.getRequestId());
-    }
-
     for (auto& [_, manager] : mWindowBlockManagers)
     {
         if (!llmRequest.has_value() || llmRequest->isDummyRequest() || sequence.getBeamWidth() > 1
-            || !isAllWindowSizesValidForStoreForReuse || mLinearAttentionMetadata.has_value()
+            || mLinearAttentionMetadata.has_value()
             /* Hybrid model we only store context blocks for reuse*/)
         {
             lastStoredId = manager.releaseBlocks(sequence, std::nullopt);
@@ -2888,12 +2904,6 @@ void BlockManager::storeNewBlock(GenerationRequest& sequence, OptionalRef<LlmReq
 {
     for (auto& [_, manager] : mWindowBlockManagers)
     {
-        if (manager.isSWA())
-        {
-            // SWA cannot store new blocks on the fly because the block stored
-            // may go OOW and be reused by another sequence.
-            continue;
-        }
         manager.storeNewBlock(sequence, llmRequest);
     }
 }
@@ -2902,8 +2912,6 @@ void WindowBlockManager::storeNewBlock(GenerationRequest& sequence, OptionalRef<
 {
     auto constexpr beamIdx = 0;
     auto const& uniqueTokens = llmRequest->getUniqueTokens(beamIdx);
-    auto const& cacheBlockIds = sequence.getCacheBlockIds(mWindowSize);
-
     if (uniqueTokens.size() == 0)
     {
         return;
@@ -2919,33 +2927,47 @@ void WindowBlockManager::storeNewBlock(GenerationRequest& sequence, OptionalRef<
     }
     auto blockedUniqueTokens = chopVectorIntoBlocks<UniqueToken>(uniqueTokens, usableSize, mTokensPerBlock, true);
     auto blockKeys = buildBlockKeys(blockedUniqueTokens, *llmRequest);
-    if (blockKeys.size() < 2 || cacheBlockIds[beamIdx].size() < blockKeys.size())
+
+    // Build beam-0 block pointers from the allocated sequence blocks. SWA
+    // out-of-window positions are placeholders with sentinel ids, so storing
+    // by BlockPtr is the only representation that preserves the trie path.
+    auto const requestId = sequence.getRequestId();
+    auto& seqBlocks = mAllocatedBlocksPerSeq.at(requestId);
+    auto const beamWidth = sequence.getBeamWidth();
+    std::vector<BlockPtr> beam0Blocks;
+    beam0Blocks.reserve(seqBlocks.size() / std::max(beamWidth, 1));
+    for (SizeType32 bi = 0; bi < static_cast<SizeType32>(seqBlocks.size()); bi += beamWidth)
+    {
+        beam0Blocks.push_back(seqBlocks[bi]);
+    }
+
+    if (blockKeys.size() < 2 || beam0Blocks.size() < blockKeys.size())
     {
         // store all blocks
         TLLM_LOG_DEBUG("%s::storeNewBlock - store all blocks", mLogPrefix.c_str());
-        (void) storeBlocks(std::move(blockKeys), cacheBlockIds[beamIdx]);
+        (void) storeBlocks(std::move(blockKeys), beam0Blocks);
         return;
     }
 
-    auto lastBlock = mAllBlocksById.at(cacheBlockIds[beamIdx][blockKeys.size() - 1]);
-    auto prevBlock = mAllBlocksById.at(cacheBlockIds[beamIdx][blockKeys.size() - 2]);
+    auto const& lastBlock = beam0Blocks.at(blockKeys.size() - 1);
+    auto const& prevBlock = beam0Blocks.at(blockKeys.size() - 2);
 
-    // If the previous block is not in the radix tree, we need to store all blocks
-    if (prevBlock->getPrevBlock() == nullptr)
+    // If the previous block is a placeholder or not in the radix tree, store
+    // all blocks so storeBlocks can advance through the placeholder path.
+    if (prevBlock->isPlaceholder() || prevBlock->getPrevBlock() == nullptr)
     {
         TLLM_LOG_DEBUG("%s::storeNewBlock - store all blocks", mLogPrefix.c_str());
-        (void) storeBlocks(std::move(blockKeys), cacheBlockIds[beamIdx]);
+        (void) storeBlocks(std::move(blockKeys), beam0Blocks);
         return;
     }
 
-    if (lastBlock->getPrevBlock() != nullptr)
+    if (!lastBlock->isPlaceholder() && lastBlock->getPrevBlock() != nullptr)
     {
-        // If the last block is not in the radix tree, we need to store all blocks
         TLLM_LOG_DEBUG("%s::storeNewBlock - no need to store", mLogPrefix.c_str());
         return;
     }
     TLLM_LOG_DEBUG("%s::storeNewBlock - store the last block", mLogPrefix.c_str());
-    (void) storeBlocks(std::move(blockKeys), cacheBlockIds[beamIdx]);
+    (void) storeBlocks(std::move(blockKeys), beam0Blocks);
 }
 
 std::vector<KVCacheBlock::IdType> WindowBlockManager::storeBlocksForReuse(
@@ -2953,9 +2975,18 @@ std::vector<KVCacheBlock::IdType> WindowBlockManager::storeBlocksForReuse(
 {
     auto constexpr beamIdx = 0;
     auto const& uniqueTokens = llmRequest->getUniqueTokens(beamIdx);
-    auto const& cacheBlockIds = sequence.getCacheBlockIds(mWindowSize);
 
+    // Respect chunked prefill: getUsableUniqueTokenCountForReuse caps at
+    // contextCurrentPosition when prefill is not yet complete.  storeBlocks already
+    // handles trie slots that are already occupied (skips re-insertion and still pins
+    // existing blocks when pinBlocks=true), so callers can invoke storeBlocksForReuse
+    // regardless of whether earlier blocks are already in the trie.  See
+    // storeContextBlocks for the legacy-test fallback used when contextCurrentPosition==0.
     auto usableUniqueTokenCount = getUsableUniqueTokenCountForReuse(uniqueTokens, *llmRequest);
+    if (usableUniqueTokenCount == 0 && llmRequest->getContextCurrentPosition() == 0 && !uniqueTokens.empty())
+    {
+        usableUniqueTokenCount = static_cast<SizeType32>(uniqueTokens.size()) - 1;
+    }
     if (isRecurrentState())
     {
         usableUniqueTokenCount = std::min(
@@ -2967,7 +2998,18 @@ std::vector<KVCacheBlock::IdType> WindowBlockManager::storeBlocksForReuse(
         = chopVectorIntoBlocks<UniqueToken>(uniqueTokens, usableUniqueTokenCount, mTokensPerBlock, true);
     auto blockKeys = buildBlockKeys(blockedUniqueTokens, *llmRequest);
 
-    auto [numStored, pinnedBlockIds] = storeBlocks(std::move(blockKeys), cacheBlockIds[beamIdx], pinBlocks);
+    // Build beam-0 block pointer vector from mAllocatedBlocksPerSeq.  OOW positions are
+    // placeholders; storeBlocks handles them transparently.
+    auto& seqBlocks = mAllocatedBlocksPerSeq.at(sequence.getRequestId());
+    auto const beamWidth = sequence.getBeamWidth();
+    std::vector<BlockPtr> beam0Blocks;
+    beam0Blocks.reserve(seqBlocks.size() / std::max(beamWidth, 1));
+    for (SizeType32 bi = 0; bi < static_cast<SizeType32>(seqBlocks.size()); bi += beamWidth)
+    {
+        beam0Blocks.push_back(seqBlocks[bi]);
+    }
+
+    auto [numStored, pinnedBlockIds] = storeBlocks(std::move(blockKeys), beam0Blocks, pinBlocks);
 
     return pinnedBlockIds;
 }
@@ -2984,45 +3026,62 @@ std::optional<KVCacheBlock::IdType> WindowBlockManager::releaseBlocks(
     auto& allocatedBlocks = node.mapped();
     if (llmRequest.has_value() && !isRecurrentState()) // only store context blocks for recurrent states
     {
-        // If llmRequest is provided, block store for reuse is enabled.
-        if (!isSequenceValidForStoreForReuse(requestId))
+        // If llmRequest is provided, block store for reuse is enabled. OOW
+        // positions in allocatedBlocks are placeholders; storeBlocks handles
+        // them by advancing the trie path instead of inserting a real block.
+        if (mIsSWA)
         {
-            TLLM_LOG_DEBUG(
-                "%s::releaseBlocks - sequence %lu does not have all blocks valid, block is not saved for reuse",
-                mLogPrefix.c_str(), sequence.getRequestId());
+            TLLM_LOG_DEBUG("%s::releaseBlocks - SWA sequence %lu, storing blocks for reuse", mLogPrefix.c_str(),
+                sequence.getRequestId());
         }
-        else
+        auto const& uniqueTokens = llmRequest->getUniqueTokens(/*beamIdx=*/0);
+        // Respect chunked prefill; store only blocks whose KV state has been computed.
+        auto usableUniqueTokenCount = getUsableUniqueTokenCountForReuse(uniqueTokens, *llmRequest);
+        if (usableUniqueTokenCount == 0 && llmRequest->getContextCurrentPosition() == 0 && !uniqueTokens.empty())
         {
-            if (mIsSWA)
-            {
-                TLLM_LOG_DEBUG("%s::releaseBlocks - sequence %lu is valid for store for reuse", mLogPrefix.c_str(),
-                    sequence.getRequestId());
-            }
-            auto const& uniqueTokens = llmRequest->getUniqueTokens(/*beamIdx=*/0);
-            auto const usableUniqueTokenCount = getUsableUniqueTokenCountForReuse(uniqueTokens, *llmRequest);
-            auto blockedUniqueTokens = chopVectorIntoBlocks<UniqueToken>(
-                uniqueTokens, usableUniqueTokenCount, mTokensPerBlock, /*allowPartial=*/true);
-            auto blockKeys = buildBlockKeys(blockedUniqueTokens, *llmRequest);
-
-            std::vector<KVCacheBlock::IdType> cacheBlockIds(allocatedBlocks.size());
-            std::transform(allocatedBlocks.begin(), allocatedBlocks.end(), cacheBlockIds.begin(),
-                [](BlockPtr const& block) { return block->getBlockId(); });
-
-            auto [numBlocksStoredForReuse, pinnedBlockIds] = storeBlocks(std::move(blockKeys), cacheBlockIds);
-            TLLM_LOG_DEBUG("%s::releaseBlocks Request %lu, %d blocks stored for reuse", mLogPrefix.c_str(),
-                sequence.getRequestId(), numBlocksStoredForReuse);
+            usableUniqueTokenCount = static_cast<SizeType32>(uniqueTokens.size()) - 1;
         }
+        auto blockedUniqueTokens = chopVectorIntoBlocks<UniqueToken>(
+            uniqueTokens, usableUniqueTokenCount, mTokensPerBlock, /*allowPartial=*/true);
+        auto blockKeys = buildBlockKeys(blockedUniqueTokens, *llmRequest);
+
+        auto const beamWidth = sequence.getBeamWidth();
+        std::vector<BlockPtr> beam0Blocks;
+        beam0Blocks.reserve(allocatedBlocks.size() / std::max(beamWidth, 1));
+        for (SizeType32 bi = 0; bi < static_cast<SizeType32>(allocatedBlocks.size()); bi += beamWidth)
+        {
+            beam0Blocks.push_back(allocatedBlocks[bi]);
+        }
+
+        auto [numBlocksStoredForReuse, pinnedBlockIds]
+            = storeBlocks(std::move(blockKeys), beam0Blocks, /*pinBlocks=*/false);
+        TLLM_LOG_DEBUG("%s::releaseBlocks Request %lu, %d blocks stored for reuse", mLogPrefix.c_str(),
+            sequence.getRequestId(), numBlocksStoredForReuse);
     }
-    for (auto it = allocatedBlocks.rbegin(); it != allocatedBlocks.rend() - sequence.getNumFrontBlocksRemoved(); ++it)
+    // Iterate all allocated blocks (including placeholder sentinels at OOW positions);
+    // EvictionPolicy::releaseBlock silently skips placeholders.
+    for (auto it = allocatedBlocks.rbegin(); it != allocatedBlocks.rend(); ++it)
     {
         auto& block = *it;
+        if (block->isPlaceholder())
+        {
+            // SWA placeholder blocks model out-of-window logical slots. They
+            // have no backing pool entry, so they must not enter the real LRU
+            // eviction queues during sequence release.
+            if (block->hasRefs())
+            {
+                block->decRefCount();
+            }
+            continue;
+        }
         // Decrease ref count
         if (block->hasRefs())
         {
             // An out-of-window block may not have any ref count.
             block->decRefCount();
         }
-        // If ref count is zero, move block to free blocks
+        // If ref count is zero, move block to free blocks. Placeholder blocks have
+        // mRefCount==0 and are silently ignored by EvictionPolicy::releaseBlock().
         if (!block->hasRefs())
         {
             mEvictionPolicy->releaseBlock(block);
@@ -3045,6 +3104,12 @@ void WindowBlockManager::schedulingReleaseBlocks(RequestIdType requestId)
 {
     for (auto& block : mAllocatedBlocksPerSeq.at(requestId))
     {
+        // Skip placeholder blocks: they are OOW sentinels whose mSchedulingRefCount is
+        // always 0. Calling decSchedulingRefCount() on them would underflow.
+        if (block->isPlaceholder())
+        {
+            continue;
+        }
         // Decrease ref count
         block->decSchedulingRefCount();
         // If ref count is zero, move block to free blocks
@@ -3257,16 +3322,20 @@ SizeType32 KVCacheManager::getNeededBlocksOneStep(LlmRequest const& req, bool tw
             = tc::ceilDiv(numUnSharedTokens, getTokensPerBlock()) * req.mSamplingConfig.beamWidth;
         auto numRequiredBlocks = numSharedBlocks + numUnSharedBlocks;
 
-        // Subtract reusable blocks if block reuse is enabled and we're not using variable window attention
-        if (mEnableBlockReuse && !mBlockManager.isVariableWindow() && !isCrossKv()
-            && !req.isDisaggGenerationInitState())
+        // Subtract reusable blocks if block reuse is enabled. For variable-window
+        // attention, reuse must be analyzed per window because each window owns a
+        // distinct block pool and can have a different reusable prefix.
+        if (mEnableBlockReuse && !isCrossKv() && !req.isDisaggGenerationInitState())
         {
             // Use the cached summary if provided; otherwise perform a fresh tree walk.
-            auto const summary
-                = cachedSummary.has_value() ? cachedSummary.value() : analyzePrefixReuse(req.getUniqueTokens(0), req);
+            auto const summary = cachedSummary.has_value()
+                ? cachedSummary.value()
+                : (mBlockManager.isVariableWindow()
+                        ? mBlockManager.analyzePrefixReuse(req.getUniqueTokens(0), req, windowSize)
+                        : analyzePrefixReuse(req.getUniqueTokens(0), req));
             auto const numReusableBlocks = summary.reusableBlocksAllocated;
             auto const promptInputLen = std::min(req.mPromptLen, windowSize + chunkSize);
-            // `addSequence()` ignores the last prompt token because its KV cannot be recovered.
+            // Sequence insertion ignores the last prompt token because its KV cannot be recovered.
             // When the prompt lands exactly on a block boundary, counting reusable full blocks from
             // all unique tokens can over-credit one extra shared block.
             TLLM_CHECK_WITH_INFO(promptInputLen > 0, "Unexpected: promptInputLen == 0");
@@ -3348,7 +3417,8 @@ SizeType32 KVCacheManager::getRemainingBlocksToCompletion(
         }
     }
 
-    auto const temporaryAttentionWindow = mBlockManager.getWindowSizeMetadata(windowSize).temporaryAttentionWindow;
+    auto const metadata = mBlockManager.getWindowSizeMetadata(windowSize);
+    auto const temporaryAttentionWindow = metadata.temporaryAttentionWindow;
 
     SizeType32 const numContextBlocks
         = (std::min(req.mPromptLen, windowSize + temporaryAttentionWindow) + mSinkBubbleLength) / getTokensPerBlock();
@@ -3366,7 +3436,16 @@ SizeType32 KVCacheManager::getRemainingBlocksToCompletion(
         if (seqIt != mSequences.end())
         {
             auto const& seq = seqIt->second;
-            numAllocBlocksPerBeam = seq.getCacheBlockIds(windowSize).at(0).size();
+            auto const& blockIds = seq.getCacheBlockIds(windowSize).at(0);
+            if (metadata.isSWA)
+            {
+                numAllocBlocksPerBeam = static_cast<SizeType32>(std::count_if(blockIds.begin(), blockIds.end(),
+                    [](auto const blockId) { return blockId != KVCacheBlock::kPlaceholderBlockId; }));
+            }
+            else
+            {
+                numAllocBlocksPerBeam = static_cast<SizeType32>(blockIds.size());
+            }
         }
     }
 
@@ -3374,28 +3453,34 @@ SizeType32 KVCacheManager::getRemainingBlocksToCompletion(
     // comment in getNeededBlocksOneStep for the full rationale — free reusable blocks must
     // not be subtracted because they are already counted in the eviction policy's free count.
     SizeType32 numReusableContextBlocks = 0;
-    if (mEnableBlockReuse && !mBlockManager.isVariableWindow() && req.isContextInitState() && req.isFirstContextChunk()
-        && numAllocBlocksPerBeam == 0)
+    SizeType32 numReusableBlocksAllocated = 0;
+    SizeType32 numReusableBlocksAll = 0;
+    if (mEnableBlockReuse && req.isContextInitState() && req.isFirstContextChunk() && numAllocBlocksPerBeam == 0)
     {
         // Use the cached summary if provided; otherwise perform a fresh tree walk.
-        auto const summary
-            = cachedSummary.has_value() ? cachedSummary.value() : analyzePrefixReuse(req.getUniqueTokens(0), req);
+        auto const summary = cachedSummary.has_value()
+            ? cachedSummary.value()
+            : (mBlockManager.isVariableWindow()
+                    ? mBlockManager.analyzePrefixReuse(req.getUniqueTokens(0), req, windowSize)
+                    : analyzePrefixReuse(req.getUniqueTokens(0), req));
         // Block budget: only subtract blocks that are already allocated (have active refs).
         // Free cached blocks are already counted in the eviction policy's free pool and
         // must not be double-counted against the capacity estimate.
         // Cap at (promptLen-1)/tpb to avoid over-counting when the prompt is exactly
         // block-aligned (last full block has not been committed to the tree yet).
         SizeType32 const maxRecoverableBlocks = (req.mPromptLen - 1) / getTokensPerBlock();
-        numReusableContextBlocks = std::min({summary.reusableBlocksAllocated, numContextBlocks, maxRecoverableBlocks});
+        numReusableBlocksAllocated = summary.reusableBlocksAllocated;
+        numReusableBlocksAll = summary.reusableBlocksAll;
+        numReusableContextBlocks = std::min({numReusableBlocksAllocated, numContextBlocks, maxRecoverableBlocks});
         // Token budget: count all reusable blocks (free or allocated). Cached tokens need
         // not be recomputed regardless of whether their blocks currently have active refs.
         req.setEstimatedReusableTokens(
-            std::min({summary.reusableBlocksAll, numContextBlocks, maxRecoverableBlocks}) * getTokensPerBlock());
+            std::min({numReusableBlocksAll, numContextBlocks, maxRecoverableBlocks}) * getTokensPerBlock());
         TLLM_LOG_DEBUG(
             "getRemainingBlocksToCompletion: request ID %lu, numContextBlocks=%d, "
             "numReusableBlocksAllocated=%d, numReusableBlocksAll=%d, "
             "numReusableContextBlocks=%d, numGenBlocksPerBeam=%d",
-            req.mRequestId, numContextBlocks, summary.reusableBlocksAllocated, summary.reusableBlocksAll,
+            req.mRequestId, numContextBlocks, numReusableBlocksAllocated, numReusableBlocksAll,
             numReusableContextBlocks, numGenBlocksPerBeam);
     }
 
@@ -3414,15 +3499,21 @@ SizeType32 KVCacheManager::getRemainingBlocksToCompletion(
 
     // Adjust for reusable context blocks (only allocated ones)
     SizeType32 const effectiveContextBlocks = numContextBlocks - numReusableContextBlocks;
+    SizeType32 remainingBlocks{0};
 
     if (numAllocBlocksPerBeam < effectiveContextBlocks) // Still haven't allocated all context blocks
     {
-        return effectiveContextBlocks - numAllocBlocksPerBeam
+        remainingBlocks = effectiveContextBlocks - numAllocBlocksPerBeam
             + (numGenBlocksPerBeam + numExtraBlocksPerBeam) * req.mSamplingConfig.beamWidth;
     }
+    else
+    {
+        SizeType32 const effectiveTotalBlocks = numTotalBlocksPerBeam - numReusableContextBlocks;
+        remainingBlocks
+            = (effectiveTotalBlocks - numAllocBlocksPerBeam + numExtraBlocksPerBeam) * req.mSamplingConfig.beamWidth;
+    }
 
-    SizeType32 const effectiveTotalBlocks = numTotalBlocksPerBeam - numReusableContextBlocks;
-    return (effectiveTotalBlocks - numAllocBlocksPerBeam + numExtraBlocksPerBeam) * req.mSamplingConfig.beamWidth;
+    return remainingBlocks;
 }
 
 void BlockManager::updateSequenceCacheBlockOffsets(GenerationRequest& sequence, SizeType32 windowSize)
@@ -3480,12 +3571,12 @@ void BlockManager::updateCacheBlockOffsetsAtIdx(GenerationRequest& sequence, Siz
     }
 }
 
-void KVCacheManager::addToken(RequestIdType requestId)
+void KVCacheManager::addToken(RequestIdType requestId, bool detachSwaFrontBlocks)
 {
     // TODO: add streamLLM support
     auto& sequence = getSequence(requestId);
     sequence.addNewTokens(1);
-    mBlockManager.adjustBlocksIfNeeded(sequence);
+    mBlockManager.adjustBlocksIfNeeded(sequence, detachSwaFrontBlocks);
 }
 
 void KVCacheManager::copyLinearAttentionBlock(LlmRequest const& llmRequest)
@@ -3504,13 +3595,45 @@ void WindowBlockManager::detachFrontBlock(GenerationRequest& sequence)
     auto const requestId = sequence.getRequestId();
     auto const beamWidth = sequence.getBeamWidth();
     auto& allocatedBlocks = mAllocatedBlocksPerSeq.at(requestId);
-    SizeType32 outOfWindowBlockIdx = sequence.getNumFrontBlocksRemoved();
+    SizeType32 outOfWindowBlockIdx = sequence.getNumFrontBlocksRemoved(mWindowSize);
+    auto& cacheBlocksTensor = sequence.getCacheBlockIndices(mWindowSize);
+    auto* offsetsPtr = bufferCast<tk::KVCacheIndex>(cacheBlocksTensor);
+    auto const& offsetsShape = cacheBlocksTensor.getShape();
 
     for (auto beamIdx = 0; beamIdx < beamWidth; ++beamIdx)
     {
-        auto outOfWindowBlock = allocatedBlocks.at(outOfWindowBlockIdx * beamWidth + beamIdx);
+        auto& blockSlot = allocatedBlocks.at(outOfWindowBlockIdx * beamWidth + beamIdx);
+        auto outOfWindowBlock = blockSlot;
         TLLM_LOG_DEBUG("%s::detachFrontBlock - Detaching block %d from sequence %d", mLogPrefix.c_str(),
             outOfWindowBlock->getBlockId(), requestId);
+
+        // Replace the real block in mAllocatedBlocksPerSeq with an on-demand SWA
+        // placeholder so that subsequent storeBlocks / storeNewBlock calls see a
+        // placeholder at this OOW position and advance via lookup, rather than
+        // trying to re-insert the real block. Use the
+        // kPlaceholderBlockId sentinel (not the real block's ID) to avoid
+        // mAllBlocksById aliasing.
+        if (outOfWindowBlock->isPlaceholder())
+        {
+            if (outOfWindowBlock->hasRefs())
+            {
+                outOfWindowBlock->decRefCount();
+            }
+            blockSlot = KVCacheBlock::createPlaceholder();
+            sequence.changeCacheBlock(mWindowSize, beamIdx, outOfWindowBlockIdx, KVCacheBlock::kPlaceholderBlockId);
+            setOffsets(offsetsPtr, offsetsShape, beamIdx, outOfWindowBlockIdx, KVCacheBlock::kPlaceholderBlockId);
+            continue;
+        }
+
+        blockSlot = KVCacheBlock::createPlaceholder();
+        sequence.changeCacheBlock(mWindowSize, beamIdx, outOfWindowBlockIdx, KVCacheBlock::kPlaceholderBlockId);
+        setOffsets(offsetsPtr, offsetsShape, beamIdx, outOfWindowBlockIdx, KVCacheBlock::kPlaceholderBlockId);
+
+        // Clear transient retention duration/expiration inherited from the
+        // in-window sequence state. Keep the user priority intact so later
+        // eviction decisions still honor the requested priority level.
+        outOfWindowBlock->setDurationMs(std::nullopt);
+        outOfWindowBlock->setExpirationTime(std::nullopt);
 
         outOfWindowBlock->decRefCount();
 
@@ -3534,90 +3657,6 @@ PrefixReuseSummary KVCacheManager::analyzePrefixReuse(
     VecUniqueTokens const& uniqueTokens, LlmRequest const& llmRequest) const
 {
     return mBlockManager.analyzePrefixReuse(uniqueTokens, llmRequest);
-}
-
-void KVCacheManager::addSequence(
-    RequestIdType requestId, SizeType32 inputLength, SizeType32 beamWidth, OptionalRef<LlmRequest> llmRequest)
-{
-    // TODO: add streamLLM support
-    auto kvCacheRetentionConfig = llmRequest
-        ? llmRequest->getKvCacheRetentionConfig().value_or(executor::KvCacheRetentionConfig())
-        : executor::KvCacheRetentionConfig();
-
-    auto const [seqIt, emplaceDone] = [&]
-    {
-        auto lck = std::scoped_lock(mSequencesMtx);
-        return mSequences.try_emplace(requestId, requestId, inputLength, beamWidth,
-            mBlockManager.getWindowSizesMetadata(), kvCacheRetentionConfig);
-    }();
-    TLLM_CHECK(emplaceDone);
-    auto& sequence = seqIt->second;
-
-    // Get statistics for block allocations/reuse pre request.
-    SizeType32 const numAllocTotalBlocksPreRequest = mBlockManager.getNumAllocTotalBlocks();
-    SizeType32 const numAllocNewBlocksPreRequest = mBlockManager.getNumAllocNewBlocks();
-    SizeType32 const numReusedBlocksPreRequest = mBlockManager.getNumReusedBlocks();
-    SizeType32 const numMissedBlocksPreRequest = mBlockManager.getNumMissedBlocks();
-
-    if (!mBlockManager.isSequenceHeld(requestId))
-    {
-        mBlockManager.holdSequence(requestId);
-        TLLM_LOG_DEBUG(
-            "[kv cache manager] Encounter new sequence %d, initialize sequence storage validity for all window sizes",
-            requestId);
-    }
-    else
-    {
-        TLLM_LOG_DEBUG(
-            "[kv cache manager] Encounter existing sequence %d, skip sequence storage validity initialization",
-            requestId);
-    }
-    // Track the minimum prepopulated length across all windows (for VSWA with mixed isSWA flags)
-    SizeType32 minPrepopulatedPromptLen = std::numeric_limits<SizeType32>::max();
-
-    for (auto const [windowSize, metadata] : mBlockManager.getWindowSizesMetadata())
-    {
-        // NOTE: Caller to KVCacheManager::addSequence should deal with the chunking
-        auto const maxTokenNum = metadata.maxTokenNum;
-        auto const temporaryAttentionWindow = metadata.temporaryAttentionWindow;
-
-        // Consider the temporaryAttentionWindow when allocating blocks.
-        auto const effectiveInputLength = std::min(inputLength, maxTokenNum + temporaryAttentionWindow);
-        auto const numContextBlocks = tc::ceilDiv(effectiveInputLength, getTokensPerBlock());
-        if (!mEnableBlockReuse && llmRequest && llmRequest->getKvCacheRetentionConfig().has_value())
-        {
-            TLLM_LOG_WARNING(
-                "Request %d has a retention configuration set, but block reuse is disabled. The retention "
-                "config will have no effect.",
-                llmRequest->mRequestId);
-        }
-        auto const prepopulatedLen = mBlockManager.addSequence(
-            sequence, effectiveInputLength, numContextBlocks, *llmRequest, windowSize, mEnableBlockReuse);
-        // Use the minimum prepopulated length across all windows to ensure correctness
-        // when there's a mix of SWA and non-SWA windows (e.g., VSWA case)
-        minPrepopulatedPromptLen = std::min(minPrepopulatedPromptLen, prepopulatedLen);
-        mBlockManager.updateSequenceCacheBlockOffsets(sequence, windowSize);
-    }
-
-    // Set the prepopulated prompt length once using the minimum across all windows
-    if (llmRequest && mEnableBlockReuse)
-    {
-        TLLM_LOG_DEBUG("KVCacheManager::addSequence: Setting prepopulatedPromptLen to %d", minPrepopulatedPromptLen);
-        llmRequest->setPrepopulatedPromptLen(minPrepopulatedPromptLen, getTokensPerBlock());
-        // Clear the scheduling estimate now that the authoritative value is set.
-        // This prevents subsequent chunks from double-counting reusable tokens.
-        llmRequest->setEstimatedReusableTokens(0);
-    }
-
-    if (llmRequest)
-    {
-        // Update statistics for block allocations/reuse per request.
-        llmRequest->updateAllocTotalBlocksPerRequest(
-            mBlockManager.getNumAllocTotalBlocks() - numAllocTotalBlocksPreRequest);
-        llmRequest->updateAllocNewBlocksPerRequest(mBlockManager.getNumAllocNewBlocks() - numAllocNewBlocksPreRequest);
-        llmRequest->updateReusedBlocksPerRequest(mBlockManager.getNumReusedBlocks() - numReusedBlocksPreRequest);
-        llmRequest->updateMissedBlocksPerRequest(mBlockManager.getNumMissedBlocks() - numMissedBlocksPreRequest);
-    }
 }
 
 void KVCacheManager::addSequenceBatch(
@@ -3653,16 +3692,14 @@ void KVCacheManager::addSequenceBatch(
         TLLM_CHECK(emplaceDone);
 
         sequences[i] = &seqIt->second;
-
-        if (!mBlockManager.isSequenceHeld(requestId))
-        {
-            mBlockManager.holdSequence(requestId);
-        }
     }
 
-    // Track the minimum prepopulated length across all windows per sequence
-    // (for VSWA with mixed isSWA flags, mirrors KVCacheManager::addSequence logic)
+    // Track reusable prefix by window family per sequence. SWA windows only
+    // require a bounded active tail, so mixed VSWA uses the non-SWA minimum for
+    // the request-level cached-prefix scalar.
     std::vector<SizeType32> minPrepopulatedLen(n, std::numeric_limits<SizeType32>::max());
+    std::vector<SizeType32> minNonSwaPrepopulatedLen(n, std::numeric_limits<SizeType32>::max());
+    std::vector<bool> hasNonSwaWindow(n, false);
     // Accumulate block allocation stats across all windows per sequence
     std::vector<SizeType32> totalAllocTotalDelta(n, 0);
     std::vector<SizeType32> totalAllocNewDelta(n, 0);
@@ -3670,24 +3707,29 @@ void KVCacheManager::addSequenceBatch(
     std::vector<SizeType32> totalMissedDelta(n, 0);
 
     // --- Iterate over all window sizes (single iteration for non-VSWA) ---
-    for (auto const& [windowSize, metadata] : mBlockManager.getWindowSizesMetadata())
+    auto const orderedWindowSizes = getReuseSafeWindowOrder(mBlockManager.getWindowSizesMetadata());
+    for (auto const windowSize : orderedWindowSizes)
     {
+        auto const metadata = mBlockManager.getWindowSizeMetadata(windowSize);
         auto const maxTokenNum = metadata.maxTokenNum;
         auto const temporaryAttentionWindow = metadata.temporaryAttentionWindow;
 
         // Compute per-sequence effective input length for this window
         std::vector<SizeType32> inputLengths(n);
         std::vector<SizeType32> numContextBlocksVec(n);
+        std::vector<SizeType32> firstRealBlockIdxVec(n);
         for (size_t i = 0; i < n; ++i)
         {
             auto const inputLength = std::get<1>(requestInfos[i]);
             inputLengths[i] = std::min(inputLength, maxTokenNum + temporaryAttentionWindow);
             numContextBlocksVec[i] = tc::ceilDiv(inputLengths[i], getTokensPerBlock());
+            firstRealBlockIdxVec[i] = getFirstRealBlockIdxForWindow(metadata, inputLength, getTokensPerBlock());
+            sequences[i]->setNumFrontBlocksRemoved(windowSize, firstRealBlockIdxVec[i]);
         }
 
         // Two-phase claim-then-onboard for this window
-        auto const windowResults = mBlockManager.addSequenceBatch(
-            sequences, inputLengths, numContextBlocksVec, llmRequests, windowSize, mEnableBlockReuse);
+        auto const windowResults = mBlockManager.addSequenceBatch(sequences, inputLengths, numContextBlocksVec,
+            firstRealBlockIdxVec, llmRequests, windowSize, mEnableBlockReuse);
 
         // Update offsets and accumulate stats
         for (size_t i = 0; i < n; ++i)
@@ -3696,6 +3738,11 @@ void KVCacheManager::addSequenceBatch(
 
             auto const& stats = windowResults[i];
             minPrepopulatedLen[i] = std::min(minPrepopulatedLen[i], stats.prepopulatedLen);
+            if (!metadata.isSWA)
+            {
+                hasNonSwaWindow[i] = true;
+                minNonSwaPrepopulatedLen[i] = std::min(minNonSwaPrepopulatedLen[i], stats.prepopulatedLen);
+            }
             totalAllocTotalDelta[i] += stats.allocTotalDelta;
             totalAllocNewDelta[i] += stats.allocNewDelta;
             totalReusedDelta[i] += stats.reusedDelta;
@@ -3710,9 +3757,11 @@ void KVCacheManager::addSequenceBatch(
 
         if (mEnableBlockReuse)
         {
+            auto const selectedPrepopulatedLen
+                = hasNonSwaWindow[i] ? minNonSwaPrepopulatedLen[i] : minPrepopulatedLen[i];
             TLLM_LOG_DEBUG("KVCacheManager::addSequenceBatch: Setting prepopulatedPromptLen to %d for request %lu",
-                minPrepopulatedLen[i], llmRequest.mRequestId);
-            llmRequest.setPrepopulatedPromptLen(minPrepopulatedLen[i], getTokensPerBlock());
+                selectedPrepopulatedLen, llmRequest.mRequestId);
+            llmRequest.setPrepopulatedPromptLen(selectedPrepopulatedLen, getTokensPerBlock());
             // Clear the scheduling estimate now that the authoritative value is set.
             // This prevents subsequent chunks from double-counting reusable tokens.
             llmRequest.setEstimatedReusableTokens(0);
@@ -3784,12 +3833,6 @@ std::optional<KVCacheBlock::IdType> KVCacheManager::removeSequence(
             lastStoredId = mBlockManager.releaseBlocks(sequenceNode.mapped(), std::nullopt, pinBlocks);
         }
     }
-    if (mBlockManager.isSequenceHeld(requestId))
-    {
-        mBlockManager.releaseSequence(requestId);
-        TLLM_LOG_DEBUG("Remove sequence %d, release sequence storage validity for all window sizes", requestId);
-    }
-    TLLM_CHECK(!mBlockManager.isSequenceHeld(requestId));
     TLLM_LOG_TRACE("[%s]::%s stop", isCrossKv() ? "CROSS" : "SELF", __PRETTY_FUNCTION__);
     return lastStoredId;
 }
@@ -3841,7 +3884,8 @@ tle::RetentionPriority KVCacheManager::getPriorityByBlockId(KVCacheBlock::IdType
     }
 }
 
-SizeType32 KVCacheManager::copyBlockOffsets(ITensor& output, SizeType32 outputSlotOffset, RequestIdType requestId) const
+SizeType32 KVCacheManager::copyBlockOffsets(ITensor& output, SizeType32 outputSlotOffset, RequestIdType requestId,
+    bool useSwaCyclicSlots, bool useSwaContextSlots) const
 {
     auto const& sequence = getSequence(requestId);
     auto const beamWidth = sequence.getBeamWidth();
@@ -3874,6 +3918,45 @@ SizeType32 KVCacheManager::copyBlockOffsets(ITensor& output, SizeType32 outputSl
                     auto const dstIndex
                         = tc::flat_index(dstShape.d, absolutePoolIdx, outputSlotOffset + beamIdx, xIdx, 0);
                     std::memcpy(dstPtr + dstIndex, srcPtr + srcIndex, copyChunkSize);
+                    if (metadata.isSWA && useSwaCyclicSlots)
+                    {
+                        // SWA stores only a bounded physical tail. For context
+                        // FMHA, fill every logical page-table slot by aliasing
+                        // it back into that valid cyclic tail; generation keeps
+                        // the compact cyclic view.
+                        auto const firstActiveBlockIdx = sequence.getNumFrontBlocksRemoved(ws);
+                        auto const maxBlocksPerSeq = static_cast<SizeType32>(srcShape.d[3]);
+                        auto const contextCyclicBlockCount
+                            = tc::ceilDiv(ws + metadata.temporaryAttentionWindow, getTokensPerBlock()) + kSWAExtraBlock;
+                        auto const generationCyclicBlockCount = tc::ceilDiv(ws, getTokensPerBlock()) + kSWAExtraBlock;
+                        auto const cyclicBlockCount = std::min(
+                            useSwaContextSlots ? contextCyclicBlockCount : generationCyclicBlockCount, maxBlocksPerSeq);
+                        TLLM_CHECK_WITH_INFO(cyclicBlockCount > 0,
+                            "SWA cyclic block count must be positive for window size %d and tokens per block %d", ws,
+                            getTokensPerBlock());
+                        for (SizeType32 blockIdx = firstActiveBlockIdx;
+                             blockIdx < static_cast<SizeType32>(beamBlockCount); ++blockIdx)
+                        {
+                            auto const cyclicBlockIdx = blockIdx % cyclicBlockCount;
+                            auto const srcBlockIndex = tc::flat_index(srcShape.d, poolIdx, beamIdx, xIdx, blockIdx);
+                            auto const dstBlockIndex = tc::flat_index(
+                                dstShape.d, absolutePoolIdx, outputSlotOffset + beamIdx, xIdx, cyclicBlockIdx);
+                            dstPtr[dstBlockIndex] = srcPtr[srcBlockIndex];
+                        }
+                        if (useSwaContextSlots)
+                        {
+                            for (SizeType32 blockIdx = 0; blockIdx < static_cast<SizeType32>(beamBlockCount);
+                                 ++blockIdx)
+                            {
+                                auto const cyclicBlockIdx = blockIdx % cyclicBlockCount;
+                                auto const srcBlockIndex = tc::flat_index(
+                                    dstShape.d, absolutePoolIdx, outputSlotOffset + beamIdx, xIdx, cyclicBlockIdx);
+                                auto const dstBlockIndex = tc::flat_index(
+                                    dstShape.d, absolutePoolIdx, outputSlotOffset + beamIdx, xIdx, blockIdx);
+                                dstPtr[dstBlockIndex] = dstPtr[srcBlockIndex];
+                            }
+                        }
+                    }
                 }
                 maxBlockCount = std::max<SizeType32>(maxBlockCount, static_cast<SizeType32>(beamBlockCount));
             }
@@ -3979,6 +4062,7 @@ BlocksPerWindow BaseKVCacheManager::calculateMaxNumBlocks(executor::KvCacheConfi
     SizeType32 tokensPerBlock, WorldConfig const& worldConfig,
     std::map<SizeType32, std::vector<SizeType32>> const& windowSizeToLayers, uint64_t allottedPrimaryMemBytes,
     uint64_t allottedSecondaryMemBytes, size_t extraCostMemory, SizeType32 kvFactor, SizeType32 maxBatchSize,
+    std::optional<TempAttentionWindowInputs> const& tempAttentionWindowInputs,
     std::optional<LinearAttentionMetadata> const& linearAttentionMetadata)
 {
     TLLM_LOG_DEBUG("Calculating max num blocks: {.allottedPrimaryMemBytes=%" PRIu64
@@ -4055,13 +4139,9 @@ BlocksPerWindow BaseKVCacheManager::calculateMaxNumBlocks(executor::KvCacheConfi
     };
 
     std::map<SizeType32, float> windowSizeToShare;
-    // By default, we allocate equal proportion shares of memory for all
-    // window sizes (see the else case). With TRTLLM_WINDOW_SIZE_SHARES,
-    // we can override this behavior to adjust the memory share of each
-    // window size. For example, if we have window size of [512, 32768],
-    // then setting TRTLLM_WINDOW_SIZE_SHARES=0.4,0.6 will be allocating
-    // 40% of the memory to window size 512 and 60% of the memory to window
-    // size 32768.
+    // By default, allocate memory proportional to each window's effective KV
+    // footprint. TRTLLM_WINDOW_SIZE_SHARES can override that distribution; for
+    // example, "0.4,0.6" assigns 40% and 60% to the sorted window sizes.
     if (auto envStr = std::getenv("TRTLLM_WINDOW_SIZE_SHARES"))
     {
         std::stringstream ss(envStr);
@@ -4097,13 +4177,9 @@ BlocksPerWindow BaseKVCacheManager::calculateMaxNumBlocks(executor::KvCacheConfi
     }
     else
     {
-        // NOTE: Righteously, blocks allocated should be proportional with
-        // regard to window size. Currently, we are first allocating identical
-        // number of blocks for all layers to achieve identical performance.
-        for (auto const& [windowSize, _] : windowSizeToLayers)
-        {
-            windowSizeToShare[windowSize] = 1.0f / windowSizeToLayers.size();
-        }
+        windowSizeToShare = BlockManager::calculateWindowSizeToShare(
+            windowSizeToLayers, cacheSizeBytesPerTokenPerWindow, tempAttentionWindowInputs);
+        TLLM_LOG_DEBUG("Using derived proportional allocation of memory to each effective window size.");
     }
 
     std::vector<SizeType32> blocksPrimary;

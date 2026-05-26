@@ -357,8 +357,9 @@ void TransformerBuffers::copyKvBlockOffsets(RequestVector const& contextRequests
             auto const requestId = llmReq->mRequestId;
             auto const isContextRequest = llmReq->isContextInitState();
             auto const beamWidth = isContextRequest ? contextBeamWidth : llmReq->getBeamWidthByIter();
-            auto const maxBeamBlockCount
-                = kvCacheManager->copyBlockOffsets(*kvCacheBlockOffsetsHost, numSequences, requestId);
+            auto const maxBeamBlockCount = kvCacheManager->copyBlockOffsets(*kvCacheBlockOffsetsHost, numSequences,
+                requestId, /*useSwaCyclicSlots=*/true,
+                /*useSwaContextSlots=*/isContextRequest);
             maxBlockCount = std::max(maxBlockCount, maxBeamBlockCount);
             if (crossKvCacheBlockOffsetsHost)
             {

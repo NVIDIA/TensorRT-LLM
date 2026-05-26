@@ -657,9 +657,15 @@ std::unique_ptr<kv_cache_manager::KVCacheManager> TrtGptModelInflightBatching::c
     auto const numLayers = static_cast<SizeType32>(numKvHeadsPerLayer.size());
     auto const windowSizeToLayers = KVCacheManager::groupLayersByWindowSize(maxAttentionWindowVec, numLayers);
     auto const sizePerHead = mModelConfig.getSizePerHead();
+
+    kv_cache_manager::TempAttentionWindowInputs tempAttentionWindowInputs;
+    tempAttentionWindowInputs.pagedContextFMHA = mModelConfig.getPagedContextFMHA();
+    tempAttentionWindowInputs.maxInputLen = getMaxInputLen();
+    tempAttentionWindowInputs.maxNumTokens = getMaxNumTokens().value();
+
     auto blocksPerWindow = KVCacheManager::calculateMaxNumBlocks(kvCacheConfig, kvDtype, numKvHeadsPerLayer,
         sizePerHead, tokensPerBlock, mWorldConfig, windowSizeToLayers, freePrimaryMemBytes, freeSecondaryMemBytes,
-        extraCostMemory, 2, getMaxBatchSize());
+        extraCostMemory, 2, getMaxBatchSize(), tempAttentionWindowInputs);
 
     // now we check if any of the window sizes is too large for at least one sequence to fit in kvCache
     // this can happen if e.g. maxSeqLen is deduced from the model and is too large
@@ -669,11 +675,6 @@ std::unique_ptr<kv_cache_manager::KVCacheManager> TrtGptModelInflightBatching::c
         std::tie(blocksPerWindow, maxAttentionWindowVec)
             = clampWindowSizesToFitAtLeastOneSequence(blocksPerWindow, failFastOnAttentionWindowTooLarge);
     }
-
-    kv_cache_manager::TempAttentionWindowInputs tempAttentionWindowInputs;
-    tempAttentionWindowInputs.pagedContextFMHA = mModelConfig.getPagedContextFMHA();
-    tempAttentionWindowInputs.maxInputLen = getMaxInputLen();
-    tempAttentionWindowInputs.maxNumTokens = getMaxNumTokens().value();
 
     if (kvCacheType == KvCacheType::kCROSS && kvCacheConfig.getEnableBlockReuse())
     {
