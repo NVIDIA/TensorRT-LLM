@@ -1075,12 +1075,44 @@ class DeepseekV4Indexer(Indexer):
         assert k_scale is not None, "FP8 blockwise indexer cache update requires scale tensor"
         self._update_k_cache(k_fp8, k_scale, metadata)
 
+    def precompute_aux(
+        self,
+        hidden_states: torch.Tensor,
+        metadata: DeepseekV4TrtllmAttentionMetadata,
+    ) -> Optional[Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]]:
+        """Pre-launch the qr-independent half of the indexer prepare phase.
+
+        Runs weights_proj + internal compressor + k_cache_update on
+        ``self.aux_stream`` and records ``weights_proj_event`` /
+        ``k_cache_update_event``.  The caller hands the returned tuple back to
+        ``forward()`` via the ``pre_aux`` kwarg, which makes the overlapped
+        prepare path skip its own aux-stream launch and consume these results
+        directly.
+
+        Returns ``None`` when multi-stream mode is off (caller should fall
+        back to the normal ``forward()`` call without ``pre_aux``).
+        """
+        if not (do_multi_stream() and self.aux_stream is not None):
+            return None
+        self.indexer_start_event.record()
+        with torch.cuda.stream(self.aux_stream):
+            self.indexer_start_event.wait()
+            weights = self.weights_proj(hidden_states)
+            self.weights_proj_event.record()
+            k_fp8, k_scale = self.compressor(hidden_states, metadata)
+            self._update_k_cache_if_needed(k_fp8, k_scale, metadata)
+            self.k_cache_update_event.record()
+        return (weights, k_fp8, k_scale)
+
     def _run_overlapped_indexer_prepare(
         self,
         qr: torch.Tensor,
         hidden_states: torch.Tensor,
         metadata: DeepseekV4TrtllmAttentionMetadata,
         position_ids: torch.Tensor,
+        pre_aux: Optional[
+            Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]
+        ] = None,
     ) -> Tuple[
         torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor], torch.Tensor
     ]:
@@ -1090,7 +1122,12 @@ class DeepseekV4Indexer(Indexer):
         the recorded launch point and owns weights projection, compressor, and
         the K-cache update.
 
-        Timeline:
+        When ``pre_aux`` is provided the aux-stream work has already been
+        launched (and ``weights_proj_event`` / ``k_cache_update_event``
+        recorded) by ``precompute_aux``; the aux-stream block here is skipped
+        and the precomputed tensors are consumed directly.
+
+        Timeline (pre_aux=None):
             current stream:
                 record indexer_start_event
                 q_proj + RoPE -> quant_q
@@ -1108,19 +1145,23 @@ class DeepseekV4Indexer(Indexer):
             weights_proj --------------------> weight_scale
             compressor -> update_k_cache ----> final wait
         """
-        self.indexer_start_event.record()
+        if pre_aux is None:
+            self.indexer_start_event.record()
 
-        q = self._qk_projection_and_rope(qr, position_ids)
+            q = self._qk_projection_and_rope(qr, position_ids)
 
-        with torch.cuda.stream(self.aux_stream):
-            self.indexer_start_event.wait()
+            with torch.cuda.stream(self.aux_stream):
+                self.indexer_start_event.wait()
 
-            weights = self.weights_proj(hidden_states)
-            self.weights_proj_event.record()
+                weights = self.weights_proj(hidden_states)
+                self.weights_proj_event.record()
 
-            k_fp8, k_scale = self.compressor(hidden_states, metadata)
-            self._update_k_cache_if_needed(k_fp8, k_scale, metadata)
-            self.k_cache_update_event.record()
+                k_fp8, k_scale = self.compressor(hidden_states, metadata)
+                self._update_k_cache_if_needed(k_fp8, k_scale, metadata)
+                self.k_cache_update_event.record()
+        else:
+            weights, k_fp8, k_scale = pre_aux
+            q = self._qk_projection_and_rope(qr, position_ids)
 
         q_fp8, q_scale = self._quantize_q(q)
 
@@ -1167,12 +1208,20 @@ class DeepseekV4Indexer(Indexer):
         hidden_states: torch.Tensor,
         metadata: DeepseekV4TrtllmAttentionMetadata,
         position_ids: torch.Tensor,
+        pre_aux: Optional[
+            Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]
+        ] = None,
     ):
         if do_multi_stream() and self.aux_stream is not None:
             q_fp8, q_scale, k_fp8, k_scale, weights = self._run_overlapped_indexer_prepare(
-                qr, hidden_states, metadata, position_ids
+                qr,
+                hidden_states,
+                metadata,
+                position_ids,
+                pre_aux=pre_aux,
             )
         else:
+            assert pre_aux is None, "pre_aux requires multi-stream mode"
             q_fp8, q_scale, k_fp8, k_scale, weights = self._run_serial_indexer_prepare(
                 qr, hidden_states, metadata, position_ids
             )

@@ -1484,10 +1484,12 @@ class MLA(nn.Module):
             and config.sparse_attention_config.compress_ratios[layer_idx] == 4)
         self.indexer_stream = None
         self.indexer_aux_stream = None
+        self.compressor_stream = None
         if self.has_dsv4_indexer and aux_stream is not None:
             self.indexer_stream = torch.cuda.Stream(device=aux_stream.device)
             self.indexer_aux_stream = torch.cuda.Stream(
                 device=aux_stream.device)
+            self.compressor_stream = torch.cuda.Stream(device=aux_stream.device)
         mqa_aux_stream = (self.indexer_aux_stream if self.indexer_aux_stream
                           is not None else aux_stream)
 
@@ -1521,6 +1523,7 @@ class MLA(nn.Module):
         self.aux_stream = aux_stream
         self.ln_events = [torch.cuda.Event(), torch.cuda.Event()]
         self.dsv4_overlap_start_event = torch.cuda.Event()
+        self.dsv4_compressor_start_event = torch.cuda.Event()
         self.dsv4_compressor_event = torch.cuda.Event()
         self.dsv4_indexer_event = torch.cuda.Event()
 
@@ -2247,6 +2250,47 @@ class MLA(nn.Module):
         if position_ids is not None:
             position_ids = position_ids[..., :num_tokens]
 
+        # TRTLLM_MLA_EXTRA_OVERLAP=1 reorders the V4 attention prologue so the
+        # outer compressor and the ratio-4 indexer can execute concurrently
+        # with q_b_proj + q_b_layernorm. The indexer is launched on a
+        # dedicated stream and still uses a different aux stream for its
+        # internal q-proj/weights-proj split.
+        _v4_extra_overlap = (os.environ.get("TRTLLM_MLA_EXTRA_OVERLAP", "1")
+                             == "1" and self.compressor is not None
+                             and self.aux_stream is not None)
+        _use_indexer_overlap = (_v4_extra_overlap and do_multi_stream()
+                                and self.indexer is not None
+                                and self.indexer_stream is not None)
+
+        # Pre-launch the outer compressor on compressor_stream BEFORE
+        # kv_a_proj_with_mqa. The compressor only reads hidden_states +
+        # attn_metadata, so it has no data dependency on the kv_a_proj GEMM or
+        # the downstream q_a/kv_a LN split. A dedicated stream (not aux_stream)
+        # keeps kv_a_layernorm free to run on aux_stream in parallel.
+        # _q_branch will be queued onto this same stream further down so it
+        # runs strictly serial after the compressor; dsv4_compressor_event is
+        # recorded only at the end of _q_branch, gating the caller's downstream
+        # waits on both compressor + _q_branch completion.
+        if _use_indexer_overlap:
+            self.dsv4_compressor_start_event.record()
+            with torch.cuda.stream(self.compressor_stream):
+                self.dsv4_compressor_start_event.wait()
+                self.compressor(hidden_states, attn_metadata)
+
+        # Pre-launch the qr-independent half of the indexer prepare phase
+        # (weights_proj + internal compressor + k_cache_update) on the
+        # indexer's aux stream (self.indexer_aux_stream — wired into the
+        # indexer module as its aux_stream). Only reads hidden_states +
+        # attn_metadata, so it can overlap with the kv_a_proj → LN → split
+        # chain on the caller stream and the outer compressor on
+        # compressor_stream. The returned tuple is fed back into
+        # self.indexer() via pre_aux so the later _indexer_branch skips its
+        # own aux-stream launch.
+        _indexer_pre_aux = None
+        if _use_indexer_overlap:
+            _indexer_pre_aux = self.indexer.precompute_aux(
+                hidden_states, attn_metadata)
+
         q, kv = self.kv_a_proj_with_mqa(hidden_states).split(
             [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim], -1)
 
@@ -2261,15 +2305,6 @@ class MLA(nn.Module):
             [self.kv_lora_rank, self.qk_rope_head_dim], -1)
         qr = q
         latent_cache = torch.concat([compressed_kv, k_pe], dim=-1)
-
-        # TRTLLM_MLA_EXTRA_OVERLAP=1 reorders the V4 attention prologue so the
-        # outer compressor and the ratio-4 indexer can execute concurrently
-        # with q_b_proj + q_b_layernorm. The indexer is launched on a
-        # dedicated stream and still uses a different aux stream for its
-        # internal q-proj/weights-proj split.
-        _v4_extra_overlap = (os.environ.get("TRTLLM_MLA_EXTRA_OVERLAP", "1")
-                             == "1" and self.compressor is not None
-                             and self.aux_stream is not None)
 
         def _q_branch():
             q_proj = self.q_b_proj(q)
@@ -2295,21 +2330,20 @@ class MLA(nn.Module):
                 hidden_states,
                 attn_metadata,
                 position_ids,
+                pre_aux=_indexer_pre_aux,
             )
 
         topk_indices = None
         indexer_ran = False
         if _v4_extra_overlap:
-            use_indexer_overlap = (do_multi_stream()
-                                   and self.indexer is not None
-                                   and self.indexer_stream is not None)
-            if use_indexer_overlap:
+            if _use_indexer_overlap:
+                # Compressor + indexer-aux are already in flight from the
+                # pre-launch block above; the indexer-aux tail events
+                # (weights_proj_event, k_cache_update_event) were recorded
+                # there. The outer compressor's tail (dsv4_compressor_event)
+                # is deferred to AFTER _q_branch so the single wait below
+                # gates the caller on both compressor + _q_branch.
                 self.dsv4_overlap_start_event.record()
-
-                with torch.cuda.stream(self.aux_stream):
-                    self.dsv4_overlap_start_event.wait()
-                    _compressor_branch()
-                    self.dsv4_compressor_event.record()
 
                 with torch.cuda.stream(self.indexer_stream):
                     self.dsv4_overlap_start_event.wait()
@@ -2317,7 +2351,17 @@ class MLA(nn.Module):
                     indexer_ran = True
                     self.dsv4_indexer_event.record()
 
-                q = _q_branch()
+                # _q_branch reads qr (post-q_a_layernorm), so it must wait
+                # for dsv4_overlap_start_event before running. Queuing it on
+                # compressor_stream (already holding the outer compressor)
+                # makes compressor → q_b_proj → q_b_layernorm a serial chain
+                # on a single stream, freeing the caller stream from the
+                # heaviest GEMM during the prologue window.
+                with torch.cuda.stream(self.compressor_stream):
+                    self.dsv4_overlap_start_event.wait()
+                    q = _q_branch()
+                    self.dsv4_compressor_event.record()
+
                 self.dsv4_compressor_event.wait()
                 self.dsv4_indexer_event.wait()
             else:
