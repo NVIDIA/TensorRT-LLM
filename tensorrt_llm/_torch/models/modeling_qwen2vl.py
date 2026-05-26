@@ -378,6 +378,23 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
     ) -> Tuple[List[int], Optional[ExtraProcessedInputs]]:
         text_prompt, mm_data, mm_processor_kwargs = inputs.get("prompt"), \
                         inputs.get("multi_modal_data", {}), inputs.get("mm_processor_kwargs", {})
+
+        # Text-only fast path: skip the multi-modal HF processor and call
+        # the tokenizer directly (their outputs match bit-exactly when
+        # ``images`` / ``videos`` are ``None``). mrope_config still needs
+        # to be populated since the LM is M-RoPE.
+        if not mm_data:
+            input_ids = self.tokenizer(text_prompt,
+                                       return_tensors="pt").input_ids
+            attention_mask = torch.ones_like(input_ids)
+            mrope_config = self.get_mrope_config(input_ids, None, None,
+                                                 attention_mask, None)
+            return input_ids[0].to(torch.int32).tolist(), {
+                "multimodal_data": {
+                    "mrope_config": mrope_config
+                },
+            }
+
         processed_inputs = self._preprocess(text_prompt, mm_data,
                                             mm_processor_kwargs)
 
