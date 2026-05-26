@@ -404,7 +404,7 @@ class ConfigurableMoE(MoE):
 
     @staticmethod
     def _dp_padded_num_rows(all_rank_num_tokens: List[int]) -> int:
-        """Padded total rows after DP dispatch: num_ranks * max_tokens_per_rank."""
+        """Padded total rows after DP dispatch: num_dp_ranks * max_tokens_per_rank."""
         return len(all_rank_num_tokens) * max(all_rank_num_tokens)
 
     def calculate_num_chunks(self, all_rank_num_tokens: List[int]) -> int:
@@ -412,7 +412,7 @@ class ConfigurableMoE(MoE):
         Calculate how many chunks are needed based on total tokens after dispatch.
 
         When using DP communication, the dispatch (AllGather/AllToAll) collects
-        tokens from all DP ranks, so total tokens = num_ranks * max_tokens_per_rank.
+        tokens from all DP ranks, so total tokens = num_dp_ranks * max_tokens_per_rank.
         """
         if self.use_dp and self.comm is not None:
             num_rows = self._dp_padded_num_rows(all_rank_num_tokens)
