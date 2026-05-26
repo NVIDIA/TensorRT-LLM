@@ -83,6 +83,7 @@ accuracy/test_llm_api_pytorch.py::TestGLM4_5Air::test_nvfp4_multi_gpus[throughpu
 accuracy/test_llm_api_pytorch.py::TestGLM4_6::test_nvfp4_2_model_mtp[2model] SKIP (https://nvbugs/5772993)
 accuracy/test_llm_api_pytorch.py::TestGLM4_6::test_nvfp4_2_model_mtp[2model_trtllm] SKIP (https://nvbugs/5772360)
 accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_dflash SKIP (https://nvbugs/6156233)
+accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_eagle3_4gpus[v1_kv_cache-trtllm-one_model-no_overlap_scheduler] SKIP (https://nvbugs/6220815)
 accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_eagle3_4gpus[v2_kv_cache-cutlass-two_model-no_overlap_scheduler] SKIP (https://nvbugs/6211880)
 accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_eagle3_4gpus[v2_kv_cache-trtllm-one_model-overlap_scheduler] SKIP (https://nvbugs/6215702)
 accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_eagle3_guided_decoding_4gpus[one_model] SKIP (https://nvbugs/5596343)
