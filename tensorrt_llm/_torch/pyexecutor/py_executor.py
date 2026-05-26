@@ -399,19 +399,16 @@ class PyExecutor:
         self.num_fetch_requests = 0
         self.shutdown_event = threading.Event()
 
-        # Rolling acceptance tracking for spec decode (disable speculation if rolling acceptance is below threshold)
-        spec_config = getattr(self.model_engine, 'spec_config', None)
-        self.acceptance_window = getattr(
-            spec_config, 'acceptance_window',
-            None) if spec_config is not None else None
-        self.acceptance_length_threshold = getattr(
-            spec_config, 'acceptance_length_threshold',
-            None) if spec_config is not None else None
+        # Rolling true acceptance-rate tracking for permanent speculation
+        # disable.
         self.speculation_permanently_disabled = False
         self.speculation_gate = None
-        if self.acceptance_window and self.acceptance_length_threshold is not None:
-            self.speculation_gate = SpeculationGate(
-                self.acceptance_window, self.acceptance_length_threshold)
+        spec_config = getattr(self.model_engine, 'spec_config', None)
+        if spec_config is not None:
+            window = getattr(spec_config, 'acceptance_rate_window_size', None)
+            threshold = getattr(spec_config, 'acceptance_rate_threshold', None)
+            if window and threshold is not None:
+                self.speculation_gate = SpeculationGate(window, threshold)
 
         # response used data
         self.response_lock = threading.Lock()
@@ -1666,6 +1663,42 @@ class PyExecutor:
 
         return stats
 
+    def _update_batch_acceptance_rate(
+            self,
+            scheduled_batch: ScheduledRequests,
+            sample_state: SampleState,
+            iteration_id: Optional[int] = None) -> Tuple[bool, Optional[float]]:
+        if (self.speculation_gate is None
+                or self.speculation_permanently_disabled or self.is_warmup):
+            return False, None
+
+        if (getattr(self.dist, 'has_pp', False)
+                and not self.dist.is_last_pp_rank):
+            return False, None
+        new_tokens_lens = getattr(sample_state.host, 'new_tokens_lens', None)
+        if new_tokens_lens is None:
+            return False, None
+        new_tokens_lens_list = (new_tokens_lens.tolist() if hasattr(
+            new_tokens_lens, 'tolist') else list(new_tokens_lens))
+        total_draft_tokens = 0
+        total_accepted_tokens = 0
+        for request in scheduled_batch.generation_requests:
+            draft_len = request.num_draft_tokens
+            if draft_len <= 0 or request.is_dummy:
+                continue
+            total_draft_tokens += draft_len
+            total_accepted_tokens += request.py_num_accepted_draft_tokens
+
+        if total_draft_tokens <= 0:
+            return False, None
+
+        acceptance_rate = total_accepted_tokens / total_draft_tokens
+        disabled_now, avg = self.speculation_gate.record_acceptance_rate(
+            acceptance_rate, sample_id=iteration_id)
+        if disabled_now:
+            self.speculation_permanently_disabled = True
+        return disabled_now, avg
+
     def _append_iter_stats(self,
                            stats: IterationStats,
                            req_stats: Optional[List[RequestStats]] = None,
@@ -2406,6 +2439,11 @@ class PyExecutor:
         if executed_batch is not None:
             with torch.cuda.nvtx.range("_handle_executed_batch_pp"):
                 self._update_requests(executed_batch.sample_state)
+                if self.speculation_gate is not None:
+                    self._update_batch_acceptance_rate(
+                        executed_batch.scheduled_requests,
+                        executed_batch.sample_state,
+                        iteration_id=self.iter_counter)
 
                 scheduled_requests = executed_batch.scheduled_requests
                 if self.kv_cache_transceiver:
@@ -2471,6 +2509,12 @@ class PyExecutor:
         set to max_draft_len (the static maximum).
         """
         if not hasattr(self.model_engine, 'max_draft_len'):
+            return
+
+        if self.speculation_permanently_disabled:
+            for request in scheduled_batch.generation_requests:
+                request.py_draft_tokens = []
+            self.model_engine.runtime_draft_len = 0
             return
 
         if (self.model_engine.spec_config is not None
@@ -2608,7 +2652,6 @@ class PyExecutor:
             # with dummy draft tokens to make the scheduler aware of the fact
             # that speculation is about to happen.
             self._prepare_draft_requests()
-
         scheduled_batch, fitting_disagg_gen_init_requests, num_fitting_reqs = self._schedule(
         )
 
@@ -2986,6 +3029,11 @@ class PyExecutor:
 
                     self._update_request_states(scheduled_batch)
                     self._update_requests(sample_state, self.resource_manager)
+                    if self.speculation_gate is not None:
+                        self._update_batch_acceptance_rate(
+                            scheduled_batch,
+                            sample_state,
+                            iteration_id=self.iter_counter)
 
                     self._send_kv_async(scheduled_batch.all_requests())
                     self._flush_pending_transfer_responses()
@@ -3368,6 +3416,13 @@ class PyExecutor:
 
                 if self.previous_batch is not None and should_process_previous_batch:
                     self._update_requests(self.previous_batch.sample_state)
+                    # Turning off speculative decoding when Acceptance Rate is low.
+                    # In overlap scheduler path, it will do an extra iter with spec decode on.
+                    if self.speculation_gate is not None:
+                        self._update_batch_acceptance_rate(
+                            self.previous_batch.scheduled_requests,
+                            self.previous_batch.sample_state,
+                            iteration_id=self.iter_counter)
 
                     self._send_kv_async(
                         self.previous_batch.scheduled_requests.all_requests())
@@ -5072,31 +5127,6 @@ class PyExecutor:
                     new_responses.append((req_id, response))
 
             if request_done:
-                if (self.drafter is not None and getattr(
-                        self.model_engine, 'enable_spec_decode', False)
-                        and not self.speculation_permanently_disabled
-                        and not request.is_dummy and not self.is_warmup):
-                    if self.speculation_gate is not None:
-                        # Response handling runs on multiple PP ranks. Only the last PP rank performs
-                        # sampling; restrict rolling stat updates to it to avoid overcounting.
-                        if (not getattr(self.dist, 'has_pp',
-                                        False)) or self.dist.is_last_pp_rank:
-                            avg_decoded = getattr(
-                                request, 'avg_decoded_tokens_per_iter', None)
-                            if avg_decoded is not None:
-                                disabled_now, _ = self.speculation_gate.record_avg_decoded(
-                                    avg_decoded,
-                                    request_id=getattr(request, 'py_request_id',
-                                                       None))
-                                if disabled_now:
-                                    # disable speculation permanently
-                                    # starting from next iteration, _prepare_and_schedule_batch will set self.use_spec_decode to False
-                                    self.speculation_permanently_disabled = True
-                            else:
-                                logger.debug(
-                                    f"Request {request.py_request_id} has no avg_decoded_tokens_per_iter"
-                                )
-
                 # TODO: Remove PP size == 1 gate for disagg + block reuse with PP > 1.
                 force_terminate_for_partial_reuse = (
                     self.enable_partial_reuse_for_disagg
