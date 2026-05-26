@@ -3344,7 +3344,24 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
                     | tar -C "${llmSrc}/tensorrt_llm" -xv
             """
             withEnv(["MYPY_REQUIRE_BINDINGS=1"]) {
-                sh "cd ${llmSrc} && python3 -m pre_commit run type-check --all-files || (cat /root/.cache/pre-commit/pre-commit.log && /bin/false)"
+                // Strip the wheel's tensorrt_llm/libs (and its ucx/ subdir) out of
+                // LD_LIBRARY_PATH for this stage. The tar above populated
+                // ${llmSrc}/tensorrt_llm/{libs,bindings.*.so} from the wheel, so the
+                // source tree now has its own copies. With the wheel libs path on
+                // LD_LIBRARY_PATH, bindings.so's DT_NEEDED resolves libth_common.so
+                // to <wheel>/tensorrt_llm/libs/ while _common.py explicitly loads
+                // <src>/tensorrt_llm/libs/libth_common.so via torch.classes.load_library
+                // — two different absolute paths register the same Torch op twice
+                // and PyTorch aborts. Removing the wheel paths lets DT_NEEDED fall
+                // back to bindings.so's RUNPATH ($ORIGIN/libs = <src>/tensorrt_llm/libs/),
+                // matching the explicit load. This restores pre-#722cbdd071 behavior
+                // for type-check only; UCX/NIXL kv_cache_transceiver tests above
+                // still see the new LD_LIBRARY_PATH.
+                sh """
+                    TRTLLM_WHEEL_LIBS=\$(pip3 show tensorrt_llm | awk -F': ' '/^Location:/ { print \$2 }')/tensorrt_llm/libs
+                    export LD_LIBRARY_PATH=\$(echo "\$LD_LIBRARY_PATH" | tr ':' '\\n' | grep -vxF "\$TRTLLM_WHEEL_LIBS" | grep -vxF "\$TRTLLM_WHEEL_LIBS/ucx" | paste -sd:)
+                    cd ${llmSrc} && python3 -m pre_commit run type-check --all-files || (cat /root/.cache/pre-commit/pre-commit.log && /bin/false)
+                """
             }
 	}
     }
