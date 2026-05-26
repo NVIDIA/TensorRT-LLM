@@ -4214,6 +4214,10 @@ class PyExecutor:
                 req.py_kv_transfer_timed_out = False
                 first_gen_tokens = req.context_phase_params.first_gen_tokens
                 ctx_draft_tokens = req.context_phase_params.draft_tokens
+                if not ctx_draft_tokens and self.model_engine.enable_spec_decode:
+                    # CTX has no MTP — fill dummy draft tokens so GEN's MTP
+                    # forward sees uniform draft_len. Dummies will be rejected.
+                    ctx_draft_tokens = [0] * self.model_engine.max_draft_len
                 req.py_draft_tokens = [] if ctx_draft_tokens is None else ctx_draft_tokens
                 beam_width = req.py_beam_width
                 for beam in range(0, beam_width):

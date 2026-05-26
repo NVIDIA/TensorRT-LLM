@@ -1717,6 +1717,11 @@ class RxSession(RxSessionBase):
             self._aux_buffer.get_slot_data(self.aux_slot)
         )
         request.py_first_gen_tokens = first_gen_tokens  # type: ignore[attr-defined]
+        # When CTX has no MTP but GEN does, draft_tokens will be empty.
+        # Pad with dummy zeros so GEN's MTP forward sees uniform draft_len
+        # across the batch. The dummy tokens will be rejected on first verify.
+        if not draft_tokens and self._aux_buffer._max_draft_len > 0:
+            draft_tokens = [0] * self._aux_buffer._max_draft_len
         request.py_draft_tokens = draft_tokens  # type: ignore[attr-defined]
         if request.py_disaggregated_params is not None:
             request.py_disaggregated_params.ctx_usage = {
