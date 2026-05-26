@@ -164,7 +164,13 @@ class OpenAIHttpClient(OpenAIClient):
         hooks: Optional[ResponseHooks] = None,
     ) -> AsyncGenerator[Any, None]:
         is_stream = request.stream
-        for attempt in range(self._max_retries + 1):
+        # Loop range must cover the transient-TCP extended budget (up to 5)
+        # so the conditional raise inside the except block can actually decide
+        # to keep retrying.  Non-transient errors still raise on the first
+        # attempt that reaches self._max_retries.
+        _TRANSIENT_TCP_BUDGET = 5
+        loop_max = max(self._max_retries, _TRANSIENT_TCP_BUDGET) + 1
+        for attempt in range(loop_max):
             # Regenerate disagg_request_id on retry to avoid ID collision on workers
             if attempt > 0 and self._disagg_id_generator is not None:
                 dp = getattr(request, "disaggregated_params", None)
@@ -215,15 +221,27 @@ class OpenAIHttpClient(OpenAIClient):
                         traceback.format_exc(),
                     )
                     raise
-                if attempt == self._max_retries:
+                # Selective retry budget: ServerDisconnectedError and
+                # ConnectionResetError are transient TCP races (typically at
+                # burst start when client keepalive vs server keepalive race).
+                # Give them an extended retry budget while preserving the
+                # original fail-fast for genuine upstream errors.
+                is_transient_tcp = isinstance(
+                    e,
+                    (aiohttp.ServerDisconnectedError, ConnectionResetError),
+                )
+                effective_max = self._max_retries
+                if is_transient_tcp:
+                    effective_max = max(self._max_retries, _TRANSIENT_TCP_BUDGET)
+                if attempt >= effective_max:
                     logger.error(
-                        f"Client error to {url}: {e} - last retry {attempt} of {self._max_retries}"
+                        f"Client error to {url}: {e} - last retry {attempt} of {effective_max}"
                         "failed",
                         traceback.format_exc(),
                     )
                     raise
                 logger.error(
-                    f"{self._role} client error to {url}: {e} - retry {attempt} of {self._max_retries}",
+                    f"{self._role} client error to {url}: {e} - retry {attempt} of {effective_max}",
                     traceback.format_exc(),
                 )
                 await asyncio.sleep(self._retry_interval_sec)
