@@ -10,6 +10,7 @@ import pytest
 import yaml
 from pydantic import BaseModel, TypeAdapter, ValidationError
 from utils.llm_data import llm_models_root
+from utils.util import force_ampere
 
 import tensorrt_llm.bindings.executor as tle
 import tensorrt_llm.llmapi.llm_args as llm_args_mod
@@ -314,7 +315,6 @@ def test_KvCacheConfig_declaration():
     config = KvCacheConfig(enable_block_reuse=True,
                            max_tokens=1024,
                            max_attention_window=[1024, 1024, 1024],
-                           sink_token_length=32,
                            free_gpu_memory_fraction=0.5,
                            host_cache_size=1024,
                            cross_kv_cache_fraction=0.5,
@@ -328,7 +328,6 @@ def test_KvCacheConfig_declaration():
     assert pybind_config.enable_block_reuse == True
     assert pybind_config.max_tokens == 1024
     assert pybind_config.max_attention_window == [1024, 1024, 1024]
-    assert pybind_config.sink_token_length == 32
     assert pybind_config.free_gpu_memory_fraction == 0.5
     assert pybind_config.host_cache_size == 1024
     assert pybind_config.cross_kv_cache_fraction == 0.5
@@ -379,6 +378,58 @@ def test_SleepConfig_restore_modes_normalized_from_defaultdict():
         ExecutorMemoryType.MODEL_WEIGHTS_MAIN] == RestoreMode.PINNED
     assert sleep_config.restore_modes[
         ExecutorMemoryType.SAMPLER] == RestoreMode.CPU
+
+
+@force_ampere
+def test_SleepConfig_is_picklable():
+    """SleepConfig with default construction must survive a pickle round-trip.
+
+    MPI worker initialisation serialises llm_args (including SleepConfig) via
+    pickle to distribute configuration to each rank.  The defaultdict inside
+    restore_modes previously used a closure lambda as its default_factory, which
+    is not picklable.  This test catches any regression to that pattern.
+    """
+    import pickle
+
+    cfg_default = SleepConfig()
+    rt = pickle.loads(pickle.dumps(cfg_default))  # noqa: S301
+    assert rt.restore_modes == cfg_default.restore_modes
+
+
+@force_ampere
+def test_SleepConfig_pickle_custom_restore_modes_roundtrip():
+    """SleepConfig with explicit per-key overrides must survive a pickle round-trip."""
+    import pickle
+
+    cfg_custom = SleepConfig(
+        restore_modes={
+            ExecutorMemoryType.KV_CACHE.value: "NONE",
+            ExecutorMemoryType.MODEL_WEIGHTS_MAIN.value: "CPU",
+        })
+    rt_custom = pickle.loads(pickle.dumps(cfg_custom))  # noqa: S301
+    assert rt_custom.restore_modes[
+        ExecutorMemoryType.KV_CACHE] == RestoreMode.NONE
+    assert rt_custom.restore_modes[
+        ExecutorMemoryType.MODEL_WEIGHTS_MAIN] == RestoreMode.CPU
+
+
+@force_ampere
+def test_SleepConfig_pickle_defaultfactory_survives_roundtrip():
+    """The defaultdict default_factory must remain functional after pickle.
+
+    Missing keys should return a valid RestoreMode rather than raising
+    KeyError, proving the factory (not just the already-present entries)
+    was serialised correctly.
+    """
+    import pickle
+
+    cfg_default = SleepConfig()
+    rt = pickle.loads(pickle.dumps(cfg_default))  # noqa: S301
+
+    missing_key = ExecutorMemoryType.SAMPLER
+    assert isinstance(rt.restore_modes[missing_key], RestoreMode)
+    assert rt.restore_modes[missing_key] == cfg_default.restore_modes[
+        missing_key]
 
 
 def test_DynamicBatchConfig_declaration():
@@ -1648,7 +1699,6 @@ class TestPydanticBestPractices:
             "checkpoint_loader",  # abstract base class type
         ],
         AutoDeployLlmArgs: [
-            "draft_checkpoint_loader",  # typed as object due to circular import
             "transforms",  # typed as Dict[str, Dict[str, Any]] for flexibility
             "model_kwargs",  # typed as Dict[str, Any] for flexibility
             "speculative_model_kwargs",  # typed as Dict[str, Any] for flexibility (overrides draft model HF config)

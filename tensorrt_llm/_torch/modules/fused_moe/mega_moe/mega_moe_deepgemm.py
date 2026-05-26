@@ -27,7 +27,7 @@ from typing import Dict, List, Optional, Tuple
 import torch
 import torch.distributed as dist
 
-from tensorrt_llm._utils import get_sm_version
+from tensorrt_llm._utils import get_sm_version, is_sm_100f
 from tensorrt_llm.logger import logger
 from tensorrt_llm.models.modeling_utils import QuantAlgo
 
@@ -137,10 +137,10 @@ class MegaMoEDeepGemm(MoE):
         # not a capability one, and ``__init__``'s ``_resolve_ep_pg`` will
         # surface a clear error if dist is not initialized by the launcher.
         sm = get_sm_version()
-        if sm != 100:
+        if not is_sm_100f(sm):
             return False, (
-                f"MegaMoEDeepGemm requires SM100 (only arch with "
-                f"sm100_fp8_fp4_mega_moe.cuh in DeepGEMM); got SM{sm}"
+                f"MegaMoEDeepGemm requires SM100 family (SM100 or SM103) "
+                f"for DeepGEMM's fp8_fp4_mega_moe kernel; got SM{sm}"
             )
         if dtype_activation not in cls._SUPPORTED_ACTIVATION_DTYPES:
             return False, (

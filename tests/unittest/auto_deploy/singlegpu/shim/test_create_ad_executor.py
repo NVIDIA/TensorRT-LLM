@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -58,12 +58,10 @@ class MockPyExecutor:
     disable_overlap_scheduler: bool
     max_input_len: int
     max_batch_size: int
-    max_draft_len: int
-    max_total_draft_tokens: int
     max_beam_width: int
     guided_decoder: Any
-    drafter: Any
     resource_governor_queue: Any = None
+    garbage_collection_gen0_threshold: Optional[int] = None
 
 
 @dataclass

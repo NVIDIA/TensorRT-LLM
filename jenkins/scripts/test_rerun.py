@@ -51,6 +51,55 @@ def process_xml_failed_tests(xml_filename, failSignaturesList, rerun_0_file,
     return ran_tests
 
 
+def extract_passed_tests(output_file, xml_filenames):
+    """Write the names of passed test cases from JUnit XMLs, one per line.
+
+    A testcase is considered passed if it has no ``<failure>``, ``<error>``,
+    or ``<skipped>`` child element. Names are deduplicated across all input
+    XMLs using the same ``parse_name`` helper as ``generate_rerun_tests_list``
+    so the output format matches the OpenSearch passed-test list consumed by
+    ``reusePassedTestResults`` in ``jenkins/L0_Test.groovy``.
+
+    Used to recover the partial set of passes from a prior retry attempt's
+    uploaded results tarball when the infra-failure retry loop fires — the
+    OpenSearch path only sees data from previously-completed pipeline runs.
+
+    Args:
+        output_file: Path to the output text file (created/overwritten).
+        xml_filenames: Iterable of JUnit XML file paths. Missing files and
+            malformed XML are skipped with a printed warning; a partial set
+            does not fail the function.
+    """
+    seen = set()
+    with open(output_file, 'w') as out_file:
+        for xml_filename in xml_filenames:
+            if not os.path.exists(xml_filename):
+                continue
+            try:
+                root = ET.parse(xml_filename).getroot()
+            except ET.ParseError as e:
+                print(f"Skipping malformed {xml_filename}: {e}")
+                continue
+            # Accept either <testsuites><testsuite>... or top-level <testsuite>.
+            suites = root.findall(
+                'testsuite') if root.tag == 'testsuites' else [root]
+            for suite in suites:
+                for case in suite.findall('testcase'):
+                    if case.find('failure') is not None:
+                        continue
+                    if case.find('error') is not None:
+                        continue
+                    if case.find('skipped') is not None:
+                        continue
+                    test_name = parse_name(case.attrib.get('classname', ''),
+                                           case.attrib.get('name', ''),
+                                           case.attrib.get('file', ''))
+                    if test_name in seen:
+                        continue
+                    seen.add(test_name)
+                    out_file.write(test_name + '\n')
+
+
 def generate_rerun_tests_list(outdir, xml_filename, failSignaturesList,
                               test_list_filename, unfinished_test_filename):
     # Generate rerun test lists:
@@ -534,3 +583,16 @@ if __name__ == '__main__':
         args = parser.parse_args(sys.argv[2:])
         input_files = args.input_files.split(',')
         generate_rerun_report(args.output_file, input_files)
+
+    elif (sys.argv[1] == "extract_passed_tests"):
+        parser = argparse.ArgumentParser()
+        parser.add_argument(
+            '--output-file',
+            required=True,
+            help='Output file listing passed test names, one per line')
+        parser.add_argument('--input-files',
+                            required=True,
+                            help='Comma-separated JUnit XML files to scan')
+        args = parser.parse_args(sys.argv[2:])
+        input_files = [p for p in args.input_files.split(',') if p]
+        extract_passed_tests(args.output_file, input_files)

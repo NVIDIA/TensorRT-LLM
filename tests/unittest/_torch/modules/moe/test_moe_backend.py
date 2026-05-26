@@ -139,11 +139,17 @@ def create_test_backend(
     pretrained_config.intermediate_size = intermediate_size
     pretrained_config.torch_dtype = dtype
 
+    # CUTE_DSL_B12X is internal-only: the user-facing API selects it on the
+    # CUTEDSL path when SM120/121 + NVFP4 + flashinfer is importable. Route
+    # through "CUTEDSL" so the test exercises the same code path users hit.
+    moe_backend_value = (
+        "CUTEDSL" if backend_type == MoeBackendType.CUTE_DSL_B12X else backend_type.value
+    )
     model_config = ModelConfig(
         pretrained_config=pretrained_config,
         quant_config=quant_config,
         mapping=mapping,
-        moe_backend=backend_type.value,
+        moe_backend=moe_backend_value,
     )
 
     return create_moe_backend(
@@ -280,6 +286,7 @@ QUANT_ALGOS_TO_TEST = [
     QuantAlgo.FP8_BLOCK_SCALES,
     QuantAlgo.W4A8_NVFP4_FP8,
     QuantAlgo.W4A16_MXFP4,
+    QuantAlgo.W4A8_MXFP4_FP8,
     QuantAlgo.W4A8_MXFP4_MXFP8,
     QuantAlgo.W8A16,
     QuantAlgo.W4A8_AWQ,
@@ -293,6 +300,7 @@ BACKEND_TYPES_TO_TEST = [
     MoeBackendType.DEEPGEMM,
     MoeBackendType.DENSEGEMM,
     MoeBackendType.MEGAMOE,
+    MoeBackendType.CUTE_DSL_B12X,
 ]
 
 # Data types to test
@@ -648,11 +656,14 @@ def test_moe_backend(
             activation_type=activation_type,
         )
 
-        # W4A8_MXFP4_MXFP8 requires backend-layout-aware weights. CUTLASS and
-        # MegaMoE use 128 hidden alignment; TRTLLMGen pads FC1 input to 512.
+        # W4A8_MXFP4_MXFP8 / W4A8_MXFP4_FP8 require backend-layout-aware
+        # weights. CUTLASS and MegaMoE use 128 hidden alignment; TRTLLMGen
+        # pads FC1 input to 512. MXFP4FP8QuantizeUtil inherits
+        # prepare_weights_from_backend from MXFP4MXFP8QuantizeUtil so the
+        # backend-vs-reference weight split applies to both variants.
         ref_cls = quant_kwargs.pop("ref_cls", None)
         ref_module_kwargs = {}
-        if quant_algo == QuantAlgo.W4A8_MXFP4_MXFP8:
+        if quant_algo in (QuantAlgo.W4A8_MXFP4_MXFP8, QuantAlgo.W4A8_MXFP4_FP8):
             weights, ref_weights, ref_module_kwargs = quantize_util.prepare_weights_from_backend(
                 backend, **quant_kwargs
             )

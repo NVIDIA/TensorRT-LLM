@@ -240,27 +240,37 @@ class TestCacheDiTRealPipelineForward:
 
     @staticmethod
     def _load_visual_gen_pipeline(checkpoint_dir: str, *, text_encoder_path: str = ""):
-        from tensorrt_llm._torch.visual_gen.config import (
+        from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineLoader
+        from tensorrt_llm.visual_gen.args import (
             CacheDiTConfig,
+            CompilationConfig,
             TorchCompileConfig,
             VisualGenArgs,
         )
-        from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineLoader
+
+        # text_encoder_path lives under pipeline_config and is only a
+        # legal key for the LTX2 family. Strict validation rejects it
+        # for Wan/Flux pipelines whose registry defaults are empty —
+        # so only emit the key when the caller supplied a non-empty
+        # value (LTX2 case).
+        pipeline_config: dict = {}
+        if text_encoder_path:
+            pipeline_config["text_encoder_path"] = text_encoder_path
 
         args = VisualGenArgs(
-            checkpoint_path=checkpoint_dir,
-            text_encoder_path=text_encoder_path,
-            cache=CacheDiTConfig(
+            model=checkpoint_dir,
+            pipeline_config=pipeline_config,
+            cache_config=CacheDiTConfig(
                 max_warmup_steps=0,
                 Fn_compute_blocks=1,
                 Bn_compute_blocks=0,
                 residual_diff_threshold=0.25,
             ),
-            torch_compile=TorchCompileConfig(
-                enable_torch_compile=False,
+            torch_compile_config=TorchCompileConfig(
+                enable=False,
                 enable_autotune=False,
             ),
-            skip_warmup=True,
+            compilation_config=CompilationConfig(skip_warmup=True),
         )
         loader = PipelineLoader(args)
         return loader.load(skip_warmup=True)

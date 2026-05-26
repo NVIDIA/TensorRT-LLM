@@ -10,11 +10,11 @@ import torch
 import torch.distributed as dist
 import zmq
 
-from tensorrt_llm._torch.visual_gen.config import VisualGenArgs
 from tensorrt_llm._torch.visual_gen.output import PipelineOutput
 from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineLoader
 from tensorrt_llm.executor.ipc import ZeroMqQueue
 from tensorrt_llm.logger import logger
+from tensorrt_llm.visual_gen.args import VisualGenArgs
 
 if TYPE_CHECKING:
     from tensorrt_llm.visual_gen.params import VisualGenParams
@@ -94,14 +94,14 @@ class DiffusionExecutor:
         request_queue_addr: str,
         response_queue_addr: str,
         device_id: int,
-        diffusion_args: "VisualGenArgs",
+        visual_gen_args: "VisualGenArgs",
         req_hmac_key: Optional[bytes] = None,
         resp_hmac_key: Optional[bytes] = None,
     ):
         self.request_queue_addr = request_queue_addr
         self.response_queue_addr = response_queue_addr
         self.device_id = device_id
-        self.diffusion_args = diffusion_args
+        self.visual_gen_args = visual_gen_args
         self.resp_hmac_key = resp_hmac_key
 
         self.pipeline = None  # initialized in _load_pipeline
@@ -155,10 +155,11 @@ class DiffusionExecutor:
         logger.info(f"Worker {self.device_id}: Loading pipeline")
 
         try:
-            args = self.diffusion_args.model_copy(update={"device": f"cuda:{self.device_id}"})
-
-            loader = PipelineLoader(args)
-            self.pipeline = loader.load(skip_warmup=args.skip_warmup)
+            args = self.visual_gen_args
+            loader = PipelineLoader(args, device=f"cuda:{self.device_id}")
+            self.pipeline = loader.load(
+                skip_warmup=args.compilation_config.skip_warmup,
+            )
 
         except Exception as e:
             logger.error(f"Worker {self.device_id}: Failed to load pipeline: {e}")
@@ -354,7 +355,7 @@ def run_diffusion_worker(
     master_port: int,
     request_queue_addr: Optional[str],
     response_queue_addr: Optional[str],
-    diffusion_args: "VisualGenArgs",
+    visual_gen_args: "VisualGenArgs",
     log_level: str = "info",
     req_hmac_key: Optional[bytes] = None,
     resp_hmac_key: Optional[bytes] = None,
@@ -398,7 +399,7 @@ def run_diffusion_worker(
             request_queue_addr=request_queue_addr,
             response_queue_addr=response_queue_addr,
             device_id=device_id,
-            diffusion_args=diffusion_args,
+            visual_gen_args=visual_gen_args,
             req_hmac_key=req_hmac_key,
             resp_hmac_key=resp_hmac_key,
         )

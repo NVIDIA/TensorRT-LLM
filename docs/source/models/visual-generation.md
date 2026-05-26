@@ -37,13 +37,13 @@ Models are auto-detected from the checkpoint directory. Diffusers-format models 
 
 ### Feature Matrix
 
-| Model | FP8 blockwise | NVFP4 | TeaCache | CFG Parallelism | Ulysses Parallelism | Parallel VAE | CUDA Graph | torch.compile | trtllm-serve |
-|---|---|---|---|---|---|---|---|---|---|
-| **FLUX.1** | Yes | Yes | Yes | No [^1] | Yes | No | Yes | Yes | Yes |
-| **FLUX.2** | Yes | Yes | Yes | No [^1] | Yes | No | Yes | Yes | Yes |
-| **Wan 2.1** | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes |
-| **Wan 2.2** | Yes | Yes | No | Yes | Yes | Yes | Yes | Yes | Yes |
-| **LTX-2** | Yes | Yes | No | Yes | Yes | No | No | Yes | Yes |
+| Model | FP8 blockwise | NVFP4 | TeaCache | CFG Parallelism | Ulysses Parallelism | Parallel VAE | CUDA Graph | torch.compile | trtllm-serve | Attention2D | Ring Attention |
+|---|---|---|---|---|---|---|---|---|---|--|--|
+| **FLUX.1** | Yes | Yes | Yes | No [^1] | Yes | No | Yes | Yes | Yes | Yes | Yes |
+| **FLUX.2** | Yes | Yes | Yes | No [^1] | Yes | No | Yes | Yes | Yes | Yes | Yes |
+| **Wan 2.1** | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes |
+| **Wan 2.2** | Yes | Yes | No | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes |
+| **LTX-2** | Yes | Yes | No | Yes | Yes | No | No | Yes | Yes | Yes | Yes |
 
 [^1]: FLUX models use embedded guidance and do not have a separate negative prompt path, so CFG parallelism is not applicable.
 
@@ -102,24 +102,33 @@ Programmatic usage via `VisualGenArgs.quant_config`:
 from tensorrt_llm import VisualGenArgs
 
 args = VisualGenArgs(
-    checkpoint_path="/path/to/model",
+    model="/path/to/model",
     quant_config={"quant_algo": "FP8", "dynamic": True},
 )
 ```
 
 ### TeaCache
 
-TeaCache caches transformer outputs when timestep embeddings change slowly between denoising steps, skipping redundant computation. Enable with `teacache.enable_teacache: true` (YAML config). The `teacache_thresh` parameter controls the similarity threshold.
+TeaCache caches transformer outputs when timestep embeddings change slowly between denoising steps, skipping redundant computation. Enable via `VisualGenArgs.cache_config` (YAML or programmatic):
+
+```yaml
+cache_config:
+  cache_backend: teacache
+  teacache_thresh: 0.2
+```
+
+The `teacache_thresh` parameter controls the similarity threshold. Cache-DiT is also supported via `cache_backend: cache_dit` with its own set of knobs (see `CacheDiTConfig`).
 
 ### Multi-GPU Parallelism
 
-Two parallelism modes can be combined:
+5 parallelism modes can be combined:
 
 - **CFG Parallelism** (`--cfg_size 2`): Splits positive/negative guidance prompts across GPUs.
 - **Ulysses Parallelism** (`--ulysses_size N`): Splits the sequence dimension across GPUs for longer sequences.
-
-Total GPU count = `cfg_size * ulysses_size`.
-
+- **Parallel VAE** (`--parallel_vae_size N`): Shards the final VAE decode along a spatial axis across GPUs, useful to reduce VAE latency and improve GPU utilization (Constraint: `parallel_vae_size ≤ world_size`). Currently only supported for WAN models.
+- **Attention Parallel**: There are 2 methods supported to run attention parallel. Both of these methods require the attention backend to support LSE (only FA4 currently) - 
+    - **Attention2D Parallelism** (`--attn2d_row_size N`, `--attn2d_col_size M`): Shards the sequence axis across a 2D `N x M` device mesh, all-gathering Q along rows and K/V along columns so each rank computes a sub-block of the attention matrix (total CP degree = `N * M`; not currently combinable with Ulysses).
+    - **Ring Attention Parallelism** (`--ring_size N`): Shards the sequence axis across a 1D ring of `N` ranks and streams K/V blocks around the ring so each rank computes its attention output without materializing the full K/V (mutually exclusive with Attention2D).
 ## Developer Guide
 
 ### Architecture Overview
@@ -139,7 +148,7 @@ Key components:
 | `BasePipeline` | `visual_gen/pipeline.py` | Base class: denoising loop, CFG handling, TeaCache, CUDA graph |
 | `AutoPipeline` | `visual_gen/pipeline_registry.py` | Factory: auto-detects model type, selects pipeline class |
 | `PipelineLoader` | `visual_gen/pipeline_loader.py` | Resolves checkpoint, loads config/weights, creates pipeline |
-| `TeaCacheBackend` | `visual_gen/teacache.py` | Runtime caching for transformer outputs |
+| `TeaCacheAccelerator` / `CacheDiTAccelerator` | `visual_gen/cache/` | Runtime caching backends (TeaCache, Cache-DiT) wrapping the transformer forward |
 | `WeightLoader` | `visual_gen/checkpoints/` | Loads transformer weights from safetensors/bin |
 
 VisualGen is a parallel inference subsystem within TensorRT-LLM. It shares low-level primitives (`Mapping`, `QuantConfig`, `Linear`, `RMSNorm`, `ZeroMqQueue`, `TrtllmAttention`) but has its own executor, scheduler (diffusers-based), request types, and pipeline architecture separate from the LLM autoregressive decode path.
@@ -171,5 +180,5 @@ After these steps, the framework automatically handles:
 
 - Weight loading with optional dynamic quantization via `PipelineLoader`
 - Multi-GPU execution via `DiffusionExecutor`
-- TeaCache integration (if you call `self._setup_teacache()` in `post_load_weights()`)
+- Cache acceleration (if you call `self._setup_cache_acceleration(self.transformer, coefficients=...)` in `post_load_weights()`; supports both TeaCache and Cache-DiT via `VisualGenArgs.cache_config`)
 - Serving via `trtllm-serve` with the full endpoint set

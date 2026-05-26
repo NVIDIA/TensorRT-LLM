@@ -620,50 +620,6 @@ class TestUlyssesAttention:
         """Test UlyssesAttention with attention mask."""
         run_test_in_distributed(world_size=2, test_fn=_logic_ulysses_with_mask, use_cuda=True)
 
-    def test_ulysses_vs_standard_attention_single_gpu(self):
-        """Compare UlyssesAttention with standard attention on single GPU."""
-        if not MODULES_AVAILABLE:
-            pytest.skip("Required modules not available")
-
-        if not torch.cuda.is_available():
-            pytest.skip("Test requires CUDA")
-
-        batch = 2
-        seq = 16
-        num_heads = 8
-        head_dim = 64
-        device = torch.device("cuda:0")
-
-        inner = VanillaAttention(num_heads=num_heads, head_dim=head_dim)
-        ulysses_attn = UlyssesAttention(
-            inner_backend=inner,
-            process_group=None,
-        )
-
-        torch.manual_seed(42)
-        q = torch.randn(batch, seq, num_heads, head_dim, device=device)
-        k = torch.randn(batch, seq, num_heads, head_dim, device=device)
-        v = torch.randn(batch, seq, num_heads, head_dim, device=device)
-
-        ulysses_output = ulysses_attn(q, k, v)
-
-        q_std = q.transpose(1, 2)  # [B, H, S, D]
-        k_std = k.transpose(1, 2)
-        v_std = v.transpose(1, 2)
-
-        std_output = F.scaled_dot_product_attention(
-            q_std, k_std, v_std, scale=1.0 / math.sqrt(head_dim), dropout_p=0.0
-        )
-        std_output = std_output.transpose(1, 2).contiguous()  # [B, S, H, D]
-
-        torch.testing.assert_close(
-            ulysses_output,
-            std_output,
-            rtol=1e-4,
-            atol=1e-4,
-            msg="Ulysses attention output differs from standard attention",
-        )
-
     def test_ulysses_vs_standard_attention_multi_gpu(self):
         """Compare UlyssesAttention across GPUs with standard attention on full sequence."""
         run_test_in_distributed(

@@ -164,20 +164,18 @@ class DFlashWorker(SpecWorkerBase):
         super().__init__(use_separate_draft_kv_cache)
         self.spec_config = spec_config
         self.mapping = mapping
-        self._mask_embed = None  # Cached mask token embedding (CUDA-graph safe)
         self._resolved_mask_token_id = None
         self._resolved_block_size = None
 
-        # Pre-allocated context buffers (lazy-init on first forward).
-        # Replaces per-request Python dicts with fixed-size CUDA buffers
-        # indexed by slot, enabling CUDA graph compatibility.
+        # Pre-allocated per-slot context K/V buffers, built lazily on the
+        # first forward. Fixed-size so slot-indexed reads/writes are CUDA
+        # graph compatible.
         self._ctx_buf_inited = False
-        self._ctx_buf = None  # [max_batch, max_ctx, proj_dim]
-        self._ctx_pos_buf = None  # [max_batch, max_ctx]
-        self._ctx_len = None  # [max_batch] actual context length per slot
-        self._batch_to_slot = None  # [max_batch] maps batch pos -> buffer slot
+        self._ctx_len = None
+        self._batch_to_slot = None
         self._max_ctx = 0
-        self._proj_dim = 0
+        self._ctx_k_buf = None  # [max_batch, L, max_ctx+block, nkv, hd]
+        self._ctx_v_buf = None
 
         # Slot management (Python, updated in prepare() and eager mode)
         self._req_to_slot = {}  # request_id -> slot index
@@ -193,49 +191,63 @@ class DFlashWorker(SpecWorkerBase):
 
     @property
     def _draft_tokens_per_req(self) -> int:
-        """Total tokens per gen request in the draft forward.
+        """Target-forward tokens per gen request: K drafts + 1 bonus.
 
-        Uses 2K to fit all accepted tokens (up to K+1) plus K-1 mask tokens,
-        ensuring K unique predictions regardless of how many tokens were accepted.
+        Previously this was 2K (K+1 accepted + K-1 mask fillers), but the
+        fillers contribute nothing beyond the K+1 prefix the acceptance
+        check and context store consume, so carrying them through every
+        target layer is wasted work that dominates step time at large batch.
         """
-        return 2 * self.max_draft_len
+        return self.max_draft_len + 1
 
-    def _lazy_init_ctx_buffers(self, draft_model, spec_metadata):
-        """Initialize pre-allocated context buffers on first forward."""
+    def _lazy_init_ctx_buffers(self, draft_model, spec_metadata, attn_metadata):
         if self._ctx_buf_inited:
             return
 
         max_batch = spec_metadata.max_num_requests
 
-        if hasattr(draft_model, "fc"):
-            self._proj_dim = draft_model.fc.weight.shape[0]
-        else:
-            self._proj_dim = spec_metadata.hidden_size
-
+        # Prefer runtime max_seq_len over max_position_embeddings: YaRN
+        # models advertise 100k+ positions, which would OOM the ctx buffer
+        # or, if silently capped, corrupt the slot cache on long prompts.
         config_max_ctx = getattr(self.spec_config, "max_ctx_len", None)
         if config_max_ctx is not None:
             self._max_ctx = config_max_ctx
         else:
             config = getattr(draft_model, "config", None)
-            max_pos = getattr(config, "max_position_embeddings", 8192) if config else 8192
-            self._max_ctx = min(max_pos, 8192)
+            max_pos = getattr(config, "max_position_embeddings", None) if config else None
+            runtime_max = getattr(attn_metadata, "max_seq_len", None)
+            candidates = [c for c in (runtime_max, max_pos) if c is not None]
+            self._max_ctx = min(candidates) if candidates else 8192
 
         dtype = draft_model.fc.weight.dtype if hasattr(draft_model, "fc") else torch.bfloat16
 
-        self._ctx_buf = torch.zeros(
-            (max_batch, self._max_ctx, self._proj_dim), dtype=dtype, device="cuda"
-        )
-        self._ctx_pos_buf = torch.zeros((max_batch, self._max_ctx), dtype=torch.long, device="cuda")
         self._ctx_len = torch.zeros(max_batch, dtype=torch.long, device="cuda")
         self._batch_to_slot = torch.zeros(max_batch, dtype=torch.long, device="cuda")
 
         self._free_slots = deque(range(max_batch))
         self._req_to_slot = {}
+
+        self._resolved_block_size = getattr(draft_model, "block_size", None) or (
+            self.max_draft_len + 1
+        )
+
+        # +block_size slack lets per-iter noise K/V scatter into the gathered
+        # view and flash_attn read it in place.
+        assert hasattr(draft_model, "_build_fused_kv_buffers"), (
+            "DFlash draft model must define _build_fused_kv_buffers."
+        )
+        draft_model._build_fused_kv_buffers()
+        L = draft_model._num_attn_layers
+        nkv = draft_model._num_kv_heads
+        hd = draft_model._head_dim
+        kv_shape = (max_batch, L, self._max_ctx + self._resolved_block_size, nkv, hd)
+        self._ctx_k_buf = torch.zeros(kv_shape, dtype=dtype, device="cuda")
+        self._ctx_v_buf = torch.zeros(kv_shape, dtype=dtype, device="cuda")
         self._ctx_buf_inited = True
 
         logger.info(
             f"DFlash: allocated ctx buffers: max_batch={max_batch}, "
-            f"max_ctx={self._max_ctx}, proj_dim={self._proj_dim}, dtype={dtype}"
+            f"max_ctx={self._max_ctx}, dtype={dtype}"
         )
 
     def _prepare_attn_metadata_for_dflash(self, attn_metadata, spec_metadata):
@@ -343,9 +355,16 @@ class DFlashWorker(SpecWorkerBase):
             end = min(cur + slen, self._max_ctx)
             actual = end - cur
             if actual > 0:
-                self._ctx_buf[slot, cur:end] = chunk_proj[:actual].to(self._ctx_buf.dtype)
-                self._ctx_pos_buf[slot, cur:end] = chunk_pos[:actual]
+                chunk_proj_cast = chunk_proj[:actual].to(self._ctx_k_buf.dtype)
                 self._ctx_len[slot] = end
+                # Precompute post-norm/post-RoPE K,V for this prefill chunk
+                # so decode iters can read without re-projecting.
+                chunk_k, chunk_v = draft_model.precompute_context_kv(
+                    chunk_proj_cast, chunk_pos[:actual]
+                )
+                # chunk_k/v: [actual, L, nkv, hd] → [L, actual, nkv, hd]
+                self._ctx_k_buf[slot, :, cur:end] = chunk_k.permute(1, 0, 2, 3)
+                self._ctx_v_buf[slot, :, cur:end] = chunk_v.permute(1, 0, 2, 3)
             offset += slen
 
     def forward(
@@ -367,7 +386,7 @@ class DFlashWorker(SpecWorkerBase):
         K = self.max_draft_len
 
         # Lazy init buffers and attach worker reference for prepare()
-        self._lazy_init_ctx_buffers(draft_model, spec_metadata)
+        self._lazy_init_ctx_buffers(draft_model, spec_metadata, attn_metadata)
         spec_metadata._dflash_worker = self
 
         # Save context lengths before warmup to prevent accumulation
@@ -377,22 +396,14 @@ class DFlashWorker(SpecWorkerBase):
 
         self._execute_guided_decoder_if_present(logits)
 
-        # draft_tokens buffer has (2K-1) entries per gen request; extract the K real drafts
+        # Target now emits K+1 logits per gen request and the previous step
+        # stored K draft tokens per gen request (no filler padding).
         if num_gens > 0:
-            draft_tokens_raw = spec_metadata.draft_tokens
-            draft_tokens = draft_tokens_raw.reshape(num_gens, 2 * K - 1)[:, :K]
+            draft_tokens = spec_metadata.draft_tokens.reshape(num_gens, K)
         else:
             draft_tokens = spec_metadata.draft_tokens.reshape(0, K)
 
-        # logits have 2K entries per gen request; extract K+1 for acceptance
-        if num_gens > 0:
-            ctx_logits = logits[:num_contexts]
-            vocab_size = logits.shape[-1]
-            gen_logits_2k = logits[num_contexts:].reshape(num_gens, 2 * K, vocab_size)
-            gen_logits_kp1 = gen_logits_2k[:, : K + 1, :].reshape(-1, vocab_size)
-            logits_for_accept = torch.cat([ctx_logits, gen_logits_kp1], dim=0)
-        else:
-            logits_for_accept = logits
+        logits_for_accept = logits
 
         accepted_tokens, num_accepted_tokens = self._sample_and_accept_draft_tokens_base(
             logits_for_accept, draft_tokens, num_contexts, batch_size, spec_metadata
@@ -405,13 +416,6 @@ class DFlashWorker(SpecWorkerBase):
                 num_accepted_tokens=num_accepted_tokens,
                 state_indices=attn_metadata.mamba_metadata.state_indices,
             )
-
-        # Pad accepted_tokens from (batch, K+1) to (batch, 2K) to match sampler buffer
-        if K > 1:
-            acc_padding = torch.zeros(
-                (batch_size, K - 1), dtype=accepted_tokens.dtype, device=accepted_tokens.device
-            )
-            accepted_tokens = torch.cat([accepted_tokens, acc_padding], dim=1)
 
         self._prepare_attn_metadata_for_dflash(attn_metadata, spec_metadata)
         self._prepare_kv_for_draft_forward(
@@ -458,13 +462,13 @@ class DFlashWorker(SpecWorkerBase):
 
         if num_gens > 0:
             with self.draft_kv_cache_context(attn_metadata, draft_kv_cache_manager):
-                # Use custom dflash_forward with cross-attention
                 hidden_states_out = draft_model.dflash_forward(
                     noise_embedding=inputs["noise_embedding"],
-                    target_hidden=inputs["target_hidden"],
                     query_positions=inputs["query_positions"],
-                    context_positions=inputs["context_positions"],
                     num_ctx_per_req=inputs["num_ctx_per_req"],
+                    ctx_k_cache=inputs["ctx_k_cache"],
+                    ctx_v_cache=inputs["ctx_v_cache"],
+                    ctx_cache_batch_idx=inputs["ctx_cache_batch_idx"],
                 )
 
                 # Gather K logits per gen request from mask positions (1..K).
@@ -491,23 +495,14 @@ class DFlashWorker(SpecWorkerBase):
 
                 gen_draft_tokens = gen_draft_tokens.type(torch.int32)
 
-                # Pad from (num_gens, K) to (num_gens, 2K-1).
-                if K > 1:
-                    pad = torch.zeros((num_gens, K - 1), dtype=torch.int32, device="cuda")
-                    gen_draft_tokens = torch.cat([gen_draft_tokens, pad], dim=1)
-
         else:
-            gen_draft_tokens = torch.empty((0, 2 * K - 1), dtype=torch.int32, device="cuda")
+            gen_draft_tokens = torch.empty((0, K), dtype=torch.int32, device="cuda")
 
         if num_contexts > 0 and num_gens > 0:
-            ctx_draft_tokens = torch.zeros(
-                (num_contexts, 2 * K - 1), dtype=torch.int32, device="cuda"
-            )
+            ctx_draft_tokens = torch.zeros((num_contexts, K), dtype=torch.int32, device="cuda")
             next_draft_tokens = torch.cat([ctx_draft_tokens, gen_draft_tokens], dim=0)
         elif num_contexts > 0:
-            next_draft_tokens = torch.zeros(
-                (num_contexts, 2 * K - 1), dtype=torch.int32, device="cuda"
-            )
+            next_draft_tokens = torch.zeros((num_contexts, K), dtype=torch.int32, device="cuda")
         else:
             next_draft_tokens = gen_draft_tokens
 
@@ -546,17 +541,14 @@ class DFlashWorker(SpecWorkerBase):
         draft_model: nn.Module,
         total_target_tokens: int = 0,
     ):
-        """
-        Prepare inputs for DFlash draft model with proper cross-attention.
+        """Prepare inputs for DFlash's draft forward.
 
         For gen requests, builds:
-        - noise_embedding: token embeddings for [accepted_tokens + mask_tokens] (2K per req)
-        - target_hidden: projected target features at accepted positions (context for cross-attn)
-        - query_positions: position IDs for all 2K query tokens
-        - context_positions: position IDs for the accepted (context) tokens
-        - num_ctx_per_req: per-request context token counts
-
-        The target_hidden stays CONSTANT across layers and provides K/V context.
+        - noise_embedding: token embeddings for [accepted + mask] tokens
+        - query_positions: position IDs for the query tokens
+        - num_ctx_per_req: per-request context length in the pool
+        - ctx_k_cache / ctx_v_cache / ctx_cache_batch_idx: slot-indexed
+          views of the persistent per-layer K/V pool.
         """
         num_contexts = attn_metadata.num_contexts
         batch_size = attn_metadata.num_seqs
@@ -580,11 +572,6 @@ class DFlashWorker(SpecWorkerBase):
                 )
         mask_token_id = self._resolved_mask_token_id
 
-        if self._resolved_block_size is None:
-            self._resolved_block_size = getattr(draft_model, "block_size", None) or (
-                self.max_draft_len + 1
-            )
-
         # Get the embed_tokens layer from the draft model
         embed_tokens = draft_model.draft_model_full.model.embed_tokens
         hidden_dim = (
@@ -595,7 +582,7 @@ class DFlashWorker(SpecWorkerBase):
             gen_num_accepted = num_accepted_tokens[num_contexts : num_contexts + num_gens]
             gen_accepted_tokens = accepted_tokens[num_contexts : num_contexts + num_gens, :]
 
-            total_tokens_per_req = self._draft_tokens_per_req  # 2K
+            total_tokens_per_req = self._draft_tokens_per_req  # K+1
             K = self.max_draft_len
 
             # Get captured multi-layer hidden states from spec_metadata
@@ -610,54 +597,45 @@ class DFlashWorker(SpecWorkerBase):
             block_size = self._resolved_block_size
             query_tokens_per_req = block_size
 
-            if self._mask_embed is None:
-                mask_token = torch.tensor([mask_token_id], dtype=torch.long, device="cuda")
-                self._mask_embed = embed_tokens(mask_token).detach()
-
-            # Start with all mask embeddings for block_size tokens
-            noise_embed_2d = self._mask_embed.expand(
-                num_gens * query_tokens_per_req, hidden_dim
-            ).clone()
-            noise_embed_2d = noise_embed_2d.reshape(num_gens, query_tokens_per_req, hidden_dim)
-
-            # Fill position 0 (bonus) with embedding of last accepted token
-            bonus_indices = (gen_num_accepted - 1).long().clamp(min=0).unsqueeze(1)
-            bonus_token_ids = gen_accepted_tokens.gather(1, bonus_indices).squeeze(1)
-            bonus_embeds = embed_tokens(bonus_token_ids.long())
-            noise_embed_2d[:, 0, :] = bonus_embeds.to(noise_embed_2d.dtype)
-
             # Get slots for gen requests from pre-computed mapping
             slots = self._batch_to_slot[num_contexts : num_contexts + num_gens]
 
-            # Position starts from accumulated context length (BEFORE
-            # adding current step's features).
-            gen_pos_starts = self._ctx_len[slots].int()
+            K_plus_1 = K + 1
 
-            # Context positions for storing new accepted tokens (reused below)
-            offsets_kp1 = torch.arange(K + 1, dtype=torch.long, device="cuda")
-            ctx_position_ids = (
-                gen_pos_starts.unsqueeze(1) + offsets_kp1.unsqueeze(0).int()
-            )  # [num_gens, K+1]
+            bonus_idx = (gen_num_accepted - 1).clamp_min(0).long().unsqueeze(1)
+            bonus = gen_accepted_tokens.gather(1, bonus_idx).squeeze(1).long()
 
-            # Query positions start AFTER the full context including current
-            # step's accepted features
-            gen_query_start = gen_pos_starts + gen_num_accepted.to(torch.int32)
-            query_offsets = torch.arange(query_tokens_per_req, dtype=torch.int32, device="cuda")
-            query_position_ids = gen_query_start.unsqueeze(1) + query_offsets.unsqueeze(0)
+            ctx_len_gen = self._ctx_len[slots]
+            j_block = torch.arange(query_tokens_per_req, dtype=torch.long, device="cuda")
+            offsets_kp1 = torch.arange(K_plus_1, dtype=torch.long, device="cuda")
+
+            query_position_ids = (
+                ctx_len_gen.unsqueeze(1)
+                + gen_num_accepted.long().unsqueeze(1)
+                + j_block.unsqueeze(0)
+            )
+            ctx_position_ids = ctx_len_gen.unsqueeze(1) + offsets_kp1.unsqueeze(0)
+
+            # Go through embed_tokens.forward (NOT .weight[...]) so TP-sharded
+            # vocabs mask out ranks that don't own the token id and all-reduce.
+            mask_tok = torch.full((1,), int(mask_token_id), dtype=torch.long, device="cuda")
+            combined_embed = embed_tokens(torch.cat([bonus, mask_tok], dim=0))
+            embed_bonus = combined_embed[:num_gens]
+            embed_mask = combined_embed[num_gens]
+            noise_embed_2d = embed_mask.expand(num_gens, query_tokens_per_req, -1).clone()
+            noise_embed_2d[:, 0, :] = embed_bonus
 
             # Accumulate new accepted features into context buffers
             if has_target_features:
                 gen_start = attn_metadata.num_ctx_tokens
+                # Target now processes exactly K+1 tokens per gen req, so the
+                # captured slice is already the full set we need to project.
                 gen_hs = captured_hs[gen_start : gen_start + num_gens * total_tokens_per_req]
-                gen_hs = gen_hs.reshape(num_gens, total_tokens_per_req, -1)
-
-                # Only project K+1 tokens (the accepted ones), not all 2K
-                gen_hs_to_project = gen_hs[:, : K + 1, :].reshape(-1, gen_hs.shape[-1])
+                gen_hs_to_project = gen_hs.reshape(-1, gen_hs.shape[-1])
                 projected_to_store = draft_model.fc(
                     gen_hs_to_project.to(draft_model.fc.weight.dtype)
                 )
                 projected_to_store = draft_model.hidden_norm(projected_to_store)
-                projected_to_store = projected_to_store.reshape(num_gens, K + 1, -1)
                 gen_num_accepted_long = gen_num_accepted.long()
                 col_idx = self._ctx_len[slots].unsqueeze(1) + offsets_kp1.unsqueeze(0)
                 write_mask = offsets_kp1.unsqueeze(0) < gen_num_accepted_long.unsqueeze(1)
@@ -669,44 +647,47 @@ class DFlashWorker(SpecWorkerBase):
                 # _ctx_len range, so they're harmless.
                 slot_flat = slots.unsqueeze(1).expand(-1, K + 1).reshape(-1)
                 col_flat = col_idx.reshape(-1)
-                proj_flat = projected_to_store.reshape(-1, self._proj_dim)
+                proj_flat = projected_to_store  # already [num_gens*(K+1), proj_dim]
                 pos_flat = ctx_position_ids.long().reshape(-1)
-
                 mask_1d = write_mask.reshape(-1)
-                proj_masked = proj_flat * mask_1d.unsqueeze(1).to(proj_flat.dtype)
-                pos_masked = pos_flat * mask_1d.long()
 
-                self._ctx_buf[slot_flat, col_flat] = proj_masked.to(self._ctx_buf.dtype)
-                self._ctx_pos_buf[slot_flat, col_flat] = pos_masked
+                # Fast path: store the pre-projected/pre-RoPE'd K/V.
+                # dflash_forward reads these directly via cache_batch_idx.
+                k_new, v_new = draft_model.precompute_context_kv(
+                    proj_flat.to(self._ctx_k_buf.dtype), pos_flat
+                )
+                mask_bc = mask_1d.view(-1, 1, 1, 1).to(k_new.dtype)
+                k_new.mul_(mask_bc)
+                v_new.mul_(mask_bc)
+                slot_long = slot_flat.long()
+                col_long = col_flat.long()
+                self._ctx_k_buf[slot_long, :, col_long] = k_new
+                self._ctx_v_buf[slot_long, :, col_long] = v_new
 
                 self._ctx_len[slots] += gen_num_accepted_long
                 self._ctx_len.clamp_(max=self._max_ctx)
 
-            # Read padded context from buffers (fixed shape for CUDA graph)
-            target_hidden = self._ctx_buf[slots]
-            context_positions = self._ctx_pos_buf[slots].long()
             num_ctx_per_req_t = self._ctx_len[slots]
-
-            # 3D padded tensors for CUDA graph compatible dflash_forward
             noise_embedding = noise_embed_2d
             query_positions = query_position_ids.long()
 
-            # Update seq_lens for gen requests to 2K
+            # Update seq_lens for gen requests to K+1 (the number of tokens
+            # the target forward actually processed).
             attn_metadata._seq_lens_cuda[num_contexts : num_contexts + num_gens] = (
                 total_tokens_per_req
             )
             attn_metadata._seq_lens[num_contexts : num_contexts + num_gens] = total_tokens_per_req
         else:
             noise_embedding = hidden_states.new_empty(0, 0, hidden_dim)
-            target_hidden = hidden_states.new_empty(0, 0, hidden_dim)
             query_positions = torch.empty(0, 0, dtype=torch.long, device="cuda")
-            context_positions = torch.empty(0, 0, dtype=torch.long, device="cuda")
             num_ctx_per_req_t = torch.empty(0, dtype=torch.long, device="cuda")
+            slots = torch.empty(0, dtype=torch.long, device="cuda")
 
         return {
             "noise_embedding": noise_embedding,
-            "target_hidden": target_hidden,
             "query_positions": query_positions,
-            "context_positions": context_positions,
             "num_ctx_per_req": num_ctx_per_req_t,
+            "ctx_k_cache": self._ctx_k_buf,
+            "ctx_v_cache": self._ctx_v_buf,
+            "ctx_cache_batch_idx": slots,
         }

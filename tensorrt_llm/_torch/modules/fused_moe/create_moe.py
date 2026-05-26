@@ -12,6 +12,7 @@ from ...model_config import ModelConfig
 from ...utils import ActivationType, AuxStreamType
 from .configurable_moe import ConfigurableMoE
 from .fused_moe_cute_dsl import CuteDslFusedMoE
+from .fused_moe_cute_dsl_b12x import CuteDslB12xFusedMoE
 from .fused_moe_cutlass import CutlassFusedMoE
 from .fused_moe_deepgemm import DeepGemmFusedMoE
 from .fused_moe_densegemm import DenseGEMMFusedMoE
@@ -40,6 +41,29 @@ def get_moe_cls(
         if quant_config is not None and (
                 quant_config.quant_mode.has_fp8_block_scales()
                 or quant_config.quant_mode.has_nvfp4()):
+            # On SM120 / SM121 + NVFP4 the cuteDSL family member is the
+            # hybrid CUTLASS-prefill / FlashInfer NVFP4 MoE decode backend
+            # (CuteDslB12xFusedMoE). Prefer it when flashinfer is importable;
+            # otherwise fall through to CuteDslFusedMoE for SM100 / SM103.
+            if quant_config.quant_mode.has_nvfp4():
+                from tensorrt_llm._utils import get_sm_version
+                sm_version = get_sm_version()
+                if sm_version in CuteDslB12xFusedMoE._SUPPORTED_SM_VERSIONS:
+                    try:
+                        import flashinfer  # noqa: F401
+                        logger.info(
+                            "Selecting CuteDslB12xFusedMoE for hybrid "
+                            "CUTLASS-prefill / FlashInfer NVFP4 MoE decode "
+                            "(SM%d + NVFP4).",
+                            sm_version,
+                        )
+                        return CuteDslB12xFusedMoE
+                    except ImportError:
+                        logger.warning(
+                            "CuteDslB12xFusedMoE eligible (SM%d + NVFP4) "
+                            "but flashinfer is not importable; using CuteDslFusedMoE.",
+                            sm_version,
+                        )
             return CuteDslFusedMoE
         else:
             logger.warning(
@@ -66,14 +90,23 @@ def get_moe_cls(
             return CutlassFusedMoE
         return DenseGEMMFusedMoE
     elif moe_backend.upper() == "TRTLLM":
-        if quant_config is not None and (
-                quant_config.quant_mode.has_fp8_block_scales()
-                or quant_config.quant_mode.has_nvfp4()
-                or quant_config.quant_mode.has_w4a16_mxfp4()
-                or quant_config.quant_mode.has_w4a8_nvfp4_fp8()
-                or quant_config.quant_mode.has_w4a8_mxfp4_fp8()
-                or quant_config.quant_mode.has_w4a8_mxfp4_mxfp8()):
+        has_quant = quant_config is not None and quant_config.quant_mode.has_any_quant(
+            exclude_kv_cache=True)
+        if has_quant and (quant_config.quant_mode.has_fp8_block_scales()
+                          or quant_config.quant_mode.has_nvfp4()
+                          or quant_config.quant_mode.has_w4a16_mxfp4()
+                          or quant_config.quant_mode.has_w4a8_nvfp4_fp8()
+                          or quant_config.quant_mode.has_w4a8_mxfp4_fp8()
+                          or quant_config.quant_mode.has_w4a8_mxfp4_mxfp8()):
             return TRTLLMGenFusedMoE
+        if not has_quant and model_config.pretrained_config is not None and getattr(
+                model_config.pretrained_config, "torch_dtype",
+                None) == torch.bfloat16:
+            if TRTLLMGenFusedMoE._is_flashinfer_fused_moe_available():
+                return TRTLLMGenFusedMoE
+            raise RuntimeError(
+                "TRTLLMGenFusedMoE BF16 path requires FlashInfer fused MoE with "
+                "trtllm_bf16_moe support, but it is not available.")
         else:
             logger.warning(
                 "TRTLLMGenFusedMoE only supports fp8_block_scales, nvfp4, w4a16_mxfp4, w4a8_nvfp4_fp8, w4a8_mxfp4_fp8, and w4a8_mxfp4_mxfp8. "
@@ -90,7 +123,7 @@ def get_moe_cls(
         # input), runs the fused dispatch+GEMM+act+GEMM+combine kernel.
         # Mirrors the TRTLLM/CUTEDSL pattern: fall back to CutlassFusedMoE
         # whenever the backend can't serve this model — unsupported quant,
-        # wrong SM, missing bundled DeepGEMM symbols — so we never allocate
+        # wrong SM family, missing bundled DeepGEMM symbols — so we never allocate
         # MegaMoE-specific weight tensors we can't use.
         if quant_config is None or not quant_config.quant_mode.has_w4a8_mxfp4_mxfp8(
         ):
@@ -99,7 +132,7 @@ def get_moe_cls(
                 f"Check out details in quant_config: {quant_config}. Using CutlassFusedMoE instead."
             )
             return CutlassFusedMoE
-        # Beyond quant: also require SM100 and the bundled DG mega_moe
+        # Beyond quant: also require SM100 family and the bundled DG mega_moe
         # surface. ``can_implement`` already does this full check; call it
         # with ``swiglu_gptoss_style=False`` (MegaMoE rejects that anyway,
         # and the create path doesn't know the model's SwiGLU flavor yet).
@@ -131,6 +164,25 @@ def get_moe_cls(
         return MegaMoEDeepGemm
     else:
         raise ValueError(f"Unsupported moe backend: {moe_backend}")
+
+
+def resolve_moe_cls(
+        model_config: ModelConfig,
+        routing_method: BaseMoeRoutingMethod,
+        dtype: Optional[torch.dtype],
+        override_quant_config: Optional[QuantConfig] = None) -> Type[MoE]:
+    moe_cls = get_moe_cls(model_config, override_quant_config)
+
+    effective_quant_config = override_quant_config or model_config.quant_config
+    has_quant = (effective_quant_config is not None
+                 and effective_quant_config.layer_quant_mode.has_any_quant(
+                     exclude_kv_cache=True))
+    if (moe_cls == TRTLLMGenFusedMoE and not has_quant
+            and not TRTLLMGenFusedMoE._supports_flashinfer_bf16_routing_method(
+                routing_method)):
+        return CutlassFusedMoE
+
+    return moe_cls
 
 
 def create_moe_backend(
@@ -252,7 +304,10 @@ def create_moe_backend(
             without_comm=without_comm,
             activation_type=activation_type,
         )
-    elif moe_cls == CutlassFusedMoE:
+    elif moe_cls is CutlassFusedMoE:
+        # CuteDslFusedMoE, DeepGemmFusedMoE, and CuteDslB12xFusedMoE
+        # also subclass CutlassFusedMoE but have narrower constructors, so
+        # they take their own branches below.
         return moe_cls(
             routing_method=routing_method,
             num_experts=num_experts,
@@ -303,7 +358,9 @@ def create_moe_backend(
             layer_idx=layer_idx,
             activation_type=activation_type,
         )
-    elif moe_cls == CuteDslFusedMoE:
+    elif moe_cls in (CuteDslFusedMoE, CuteDslB12xFusedMoE):
+        # CuteDslB12xFusedMoE subclasses CuteDslFusedMoE and shares
+        # its narrower constructor (no bias / swiglu_alpha-beta-limit args).
         return moe_cls(
             routing_method=routing_method,
             num_experts=num_experts,
@@ -459,13 +516,16 @@ def create_moe(
             pretrained_config, 'torch_dtype'):
         dtype = pretrained_config.torch_dtype
 
-    moe_cls = get_moe_cls(model_config, override_quant_config)
+    moe_cls = resolve_moe_cls(model_config, routing_method, dtype,
+                              override_quant_config)
 
     enable_configurable_moe = os.environ.get("ENABLE_CONFIGURABLE_MOE",
                                              "1") == "1"
-    if enable_configurable_moe or moe_cls == CuteDslFusedMoE:
+    if enable_configurable_moe or moe_cls in (CuteDslFusedMoE,
+                                              CuteDslB12xFusedMoE):
         if moe_cls in (DeepGemmFusedMoE, TRTLLMGenFusedMoE, CuteDslFusedMoE,
-                       CutlassFusedMoE, DenseGEMMFusedMoE, MegaMoEDeepGemm):
+                       CuteDslB12xFusedMoE, CutlassFusedMoE, DenseGEMMFusedMoE,
+                       MegaMoEDeepGemm):
             return ConfigurableMoE(
                 routing_method=routing_method,
                 num_experts=num_experts,

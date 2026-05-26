@@ -22,7 +22,6 @@ from .quantization import UnquantizedFusedMoEMethod
 
 # isort: off
 from .quantization import (DeepSeekFP8BlockScalesFusedMoEMethod,
-                           DeepSeekFP8BlockScalesFusedMoEMethodDeepGemm,
                            FP8QDQFusedMoEMethod, MoEWeightLoadingMode,
                            NVFP4CutlassFusedMoEMethod,
                            INT8WoqPerChannelFusedMoEMethod,
@@ -84,9 +83,6 @@ class CutlassFusedMoE(MoE):
             "dtypes": {torch.bfloat16},
         },
         # NVFP4: SM in {100, 103, 120, 121}
-        # SM 120 = desktop Blackwell (e.g. RTX 5090 / GB202)
-        # SM 121 = GB10 / DGX Spark
-        # C++ kernel: isValidSM120MOESpecialisation() supports FP4xFP4 and FP8xFP4
         QuantAlgo.NVFP4: {
             "sm_constraint": ("in", {100, 103, 120, 121}),
             "dtypes": {torch.float16, torch.bfloat16, torch.float8_e4m3fn},
@@ -111,9 +107,9 @@ class CutlassFusedMoE(MoE):
             "sm_constraint": ("in", {100, 103}),
             "dtypes": {torch.float16, torch.bfloat16, torch.float32},
         },
-        # W4A8_MXFP4_MXFP8: SM in {100, 103}
+        # W4A8_MXFP4_MXFP8: SM in {100, 103, 120, 121}
         QuantAlgo.W4A8_MXFP4_MXFP8: {
-            "sm_constraint": ("in", {100, 103}),
+            "sm_constraint": ("in", {100, 103, 120, 121}),
             "dtypes": {torch.float16, torch.bfloat16},
         },
     }
@@ -140,7 +136,7 @@ class CutlassFusedMoE(MoE):
         - W8A16: SM >= 80
         - W4A16_MXFP4: SM == 90 only
         - W4A8_MXFP4_FP8: SM in {100, 103}
-        - W4A8_MXFP4_MXFP8: SM in {100, 103}
+        - W4A8_MXFP4_MXFP8: SM in {100, 103, 120, 121}
 
         Args:
             quant_algo: The quantization algorithm to check (None for unquantized)
@@ -534,10 +530,7 @@ class CutlassFusedMoE(MoE):
             if self.quant_config.layer_quant_mode.has_fp8_qdq():
                 return FP8QDQFusedMoEMethod()
             elif self.quant_config.layer_quant_mode.has_fp8_block_scales():
-                if get_sm_version() == 120:
-                    return DeepSeekFP8BlockScalesFusedMoEMethodDeepGemm()
-                else:
-                    return DeepSeekFP8BlockScalesFusedMoEMethod()
+                return DeepSeekFP8BlockScalesFusedMoEMethod()
             elif self.quant_config.layer_quant_mode.has_nvfp4():
                 return NVFP4CutlassFusedMoEMethod()
             elif self.quant_config.layer_quant_mode.is_int4_weight_only_per_group(
@@ -606,6 +599,50 @@ class CutlassFusedMoE(MoE):
         Returns:
             final_hidden_states: Output tensor from MoE computation
         """
+        # SM120 + FP8 block scales: use Triton kernel (CUTLASS TMA fails on SM120
+        # for large token counts due to cuTensorMapEncodeTiled limitations).
+        if self.has_deepseek_fp8_block_scales and get_sm_version() == 120:
+            from .fused_moe_triton_fp8_block_scale import \
+                run_triton_fp8_block_scale_moe
+            _use_alltoall = (enable_alltoall if enable_alltoall is not None else
+                             self.enable_alltoall)
+            # forward_chunk sets token_final_scales=None when
+            # apply_router_weight_on_input=True (weights already folded into x);
+            # substitute ones so the Triton kernel's per-token scaling is a no-op.
+            if token_final_scales is None:
+                token_final_scales = torch.ones_like(token_selected_experts,
+                                                     dtype=torch.float32)
+            # token_selected_experts contains GLOBAL expert IDs in the non-alltoall
+            # path (slot_start .. slot_end-1 for this rank's local experts, plus
+            # IDs for other ranks).  The Triton kernel operates on LOCAL IDs
+            # (0 .. expert_size_per_partition-1), so remap and zero-scale any
+            # non-local token-expert pairs to suppress their contribution.
+            local_n = self.expert_size_per_partition
+            if _use_alltoall:
+                # After alltoall dispatch, IDs are already local; padding = local_n
+                local_ids = token_selected_experts.clamp(0, local_n - 1)
+                is_local = token_selected_experts < local_n
+            else:
+                slot_start = self.slot_start
+                local_ids = (token_selected_experts - slot_start).clamp(
+                    0, local_n - 1)
+                is_local = ((token_selected_experts >= slot_start)
+                            & (token_selected_experts < slot_start + local_n))
+            local_scales = token_final_scales * is_local.to(
+                token_final_scales.dtype)
+            result = run_triton_fp8_block_scale_moe(
+                x,
+                local_ids,
+                local_scales,
+                self.w3_w1_weight,
+                self.quant_scales.fc_weight_scales,
+                self.w2_weight,
+                self.quant_scales.proj_weight_scales,
+                activation_type=self.activation_type,
+                output_dtype=output_dtype,
+            )
+            return result
+
         # Pad input for mxfp4 alignment (128-aligned hidden_size).
         # Done here rather than in quantize_input so that dispatch sends
         # unpadded tensors and avoids NVLink workspace overallocation.

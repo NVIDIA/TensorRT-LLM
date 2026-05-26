@@ -296,8 +296,7 @@ def setup_llm(args, **kwargs):
             dynamic_tree_max_topK=args.dynamic_tree_max_topK,
             allow_advanced_sampling=args.allow_advanced_sampling,
             eagle3_model_arch=args.eagle3_model_arch,
-            max_total_draft_tokens=args.max_total_draft_tokens,
-            max_batch_size=args.max_batch_size)
+            max_total_draft_tokens=args.max_total_draft_tokens)
     elif spec_decode_algo == "DFLASH":
         spec_config = DFlashDecodingConfig(
             max_draft_len=args.spec_decode_max_draft_len,
