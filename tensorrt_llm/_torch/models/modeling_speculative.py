@@ -1794,12 +1794,17 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
                 True,
             )
 
-            spec_input_ids = input_ids
+            # VLM wrappers (e.g. Qwen3VLModelBase) replace input_ids with
+            # fused inputs_embeds; fall back to the pre-fusion token IDs
+            # they forward via `orig_input_ids` so MTP / Eagle drafters
+            # can still access the prompt tokens.
+            spec_input_ids = input_ids if input_ids is not None else kwargs.get(
+                "orig_input_ids")
             spec_position_ids = position_ids
             if attn_metadata.padded_num_tokens is not None:
-                if input_ids is not None:
+                if spec_input_ids is not None:
                     # Slice along the first dimension
-                    spec_input_ids = input_ids[:attn_metadata.num_tokens]
+                    spec_input_ids = spec_input_ids[:attn_metadata.num_tokens]
                 if position_ids is not None:
                     spec_position_ids = _slice_spec_position_ids(
                         position_ids, attn_metadata.num_tokens)
