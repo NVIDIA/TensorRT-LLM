@@ -43,9 +43,13 @@ def get_spec_metadata(spec_config,
                                      False)
     vocab_size = getattr(model_config, "vocab_size", 0)
     if spec_config.spec_dec_mode.is_mtp_eagle_one_model():
-        # MTP Eagle one-model now reuses Eagle3 one-model metadata so it
-        # picks up the unified worker, sampler, and slot_ids/subseq plumbing.
-        # Capture only the final layer's hidden state (MTP Eagle behavior).
+        # MTP Eagle one-model reuses Eagle3 one-model metadata for the
+        # unified worker/sampler/slot_ids plumbing, but skips per-layer
+        # hidden-state capture: the worker feeds the target model's
+        # hidden_states directly into the MTP layer, so we leave
+        # layers_to_capture unset and let Eagle3OneModelSpecMetadata default
+        # it to an empty tuple. This also keeps post-MLP/MoE fusion enabled
+        # on models that gate it on is_layer_capture().
         return Eagle3OneModelSpecMetadata(
             max_draft_len=spec_config.max_draft_len,
             max_total_draft_tokens=spec_config.tokens_per_gen_step - 1,
@@ -54,7 +58,6 @@ def get_spec_metadata(spec_config,
             num_layers=model_config.num_hidden_layers,
             hidden_size=model_config.hidden_size,
             max_num_tokens=max_num_tokens,
-            layers_to_capture={model_config.num_hidden_layers - 1},
             allow_advanced_sampling=spec_config.allow_advanced_sampling,
             use_rejection_sampling=use_rejection_sampling,
             vocab_size=vocab_size,

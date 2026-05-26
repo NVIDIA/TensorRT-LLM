@@ -398,8 +398,16 @@ class Eagle3OneModelSpecMetadata(SpecMetadata):
 
     def __post_init__(self):
         if self.layers_to_capture is None:
-            if self.spec_dec_mode.is_mtp_eagle_one_model(
-            ) or self.num_layers == 1:
+            if self.spec_dec_mode.is_mtp_eagle_one_model():
+                # MTP Eagle one-model feeds the target model's hidden_states
+                # directly to the MTP layer (see Eagle3OneModelWorker
+                # prepare_1st_drafter_inputs / _run_draft_forward, both gated
+                # on self.is_mtp_eagle). It never reads spec_metadata.hidden_states,
+                # so leave layers_to_capture empty: this makes is_layer_capture()
+                # return False everywhere and avoids the post-MLP/MoE fusion
+                # disable side effect in modeling_deepseekv3 / glm / etc.
+                self.layers_to_capture = ()
+            elif self.num_layers == 1:
                 self.layers_to_capture = (self.num_layers - 1, )
             else:
                 if self.num_layers <= 5:
@@ -411,8 +419,13 @@ class Eagle3OneModelSpecMetadata(SpecMetadata):
         else:
             self.layers_to_capture = sorted(list(self.layers_to_capture))
         self.num_capture_layers = len(self.layers_to_capture)
-        if (self.spec_resource_manager is not None
-                and self.spec_resource_manager.hidden_states is not None):
+        if self.num_capture_layers == 0:
+            # No layers to capture (MTP Eagle one-model). Skip buffer
+            # allocation entirely; nothing reads self.hidden_states on this
+            # path.
+            self.hidden_states = None
+        elif (self.spec_resource_manager is not None
+              and self.spec_resource_manager.hidden_states is not None):
             self.hidden_states = self.spec_resource_manager.hidden_states
             expected_cols = self.hidden_size * len(self.layers_to_capture)
             assert self.hidden_states.shape[1] == expected_cols, (

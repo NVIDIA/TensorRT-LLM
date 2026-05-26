@@ -1719,13 +1719,15 @@ class MTPDecodingConfig(DecodingBaseConfig):
 
     @property
     def num_capture_layers(self) -> int:
-        # MTP_EAGLE and MTP_EAGLE_ONE_MODEL both capture the target model's
-        # last hidden layer (see Eagle3OneModelSpecMetadata.__post_init__);
-        # the shared Eagle3ResourceManager must allocate hidden_states with
-        # matching column count.
-        mode = self.spec_dec_mode
-        return 1 if (mode.is_mtp_eagle()
-                     or mode.is_mtp_eagle_one_model()) else 0
+        # MTP_EAGLE (two-model) feeds captured target hidden states into the
+        # separate draft engine, so the shared Eagle3ResourceManager must
+        # allocate a hidden_states buffer for it. MTP_EAGLE_ONE_MODEL passes
+        # the target model's hidden_states straight to the MTP layer
+        # (see Eagle3OneModelWorker.prepare_1st_drafter_inputs / _run_draft_forward,
+        # both gated on self.is_mtp_eagle), so no capture buffer is needed
+        # and we should skip allocation to avoid disabling post-MLP/MoE
+        # fusion via the layer-capture hook.
+        return 1 if self.spec_dec_mode.is_mtp_eagle() else 0
 
     @property
     def spec_dec_mode(self):
