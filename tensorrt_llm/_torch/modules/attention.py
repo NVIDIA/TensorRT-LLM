@@ -1174,6 +1174,39 @@ def fp8_block_scaling_bmm_out(
         raise NotImplementedError(f"SM{sm_version} is not supported")
 
 
+_q_b_proj_cute_dsl_import_ok: Optional[bool] = None
+
+
+def _q_b_proj_cute_dsl_bf16(q: torch.Tensor,
+                            weight: torch.Tensor) -> torch.Tensor:
+    """BF16 dense GEMM via CuTe DSL.
+
+    Computes ``q @ weight.T`` for [M, K] @ [N, K]^T -> [M, N].
+
+    Delegates to ``torch.ops.trtllm.cute_dsl_bf16_gemm_blackwell`` (which
+    runs its own autotune over (use_2cta, mma_tiler, cluster_shape)). Falls
+    back to ``torch.nn.functional.linear`` if CuTe DSL is unavailable.
+    """
+    global _q_b_proj_cute_dsl_import_ok
+    if _q_b_proj_cute_dsl_import_ok is None:
+        try:
+            from ..cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
+            _q_b_proj_cute_dsl_import_ok = IS_CUTLASS_DSL_AVAILABLE
+        except Exception:
+            _q_b_proj_cute_dsl_import_ok = False
+    if not _q_b_proj_cute_dsl_import_ok or not is_sm_100f():
+        return torch.nn.functional.linear(q, weight)
+
+    assert q.dtype == torch.bfloat16 and weight.dtype == torch.bfloat16, \
+        "q_b_proj cute_dsl path requires bfloat16 inputs"
+    q = q.contiguous()
+    weight = weight.contiguous()
+    m, n = q.shape[0], weight.shape[0]
+    out = q.new_empty((m, n), dtype=torch.bfloat16)
+    torch.ops.trtllm.cute_dsl_bf16_gemm_blackwell(q, weight, out)
+    return out
+
+
 class MLA(nn.Module):
 
     def __init__(
@@ -2306,7 +2339,36 @@ class MLA(nn.Module):
         qr = q
         latent_cache = torch.concat([compressed_kv, k_pe], dim=-1)
 
+        # CuTe DSL path for q_b_proj (hardware-default cluster count).
+        # Restricted to DSv4 CSA layers with compress_ratio=4 so the kernel
+        # swap only kicks in where the prologue overlap is exercised — other
+        # layers keep the cuBLAS path. Set TRTLLM_MLA_Q_B_PROJ_USE_CUTE_DSL=0
+        # to disable. Bias / quantization not handled.
+        _use_q_b_cute = (self.has_dsv4_indexer and os.environ.get(
+            "TRTLLM_MLA_Q_B_PROJ_USE_CUTE_DSL", "1") == "1"
+                         and self.q_b_proj.bias is None
+                         and self.q_b_proj.weight.dtype == torch.bfloat16)
+
         def _q_branch():
+            # CuTe DSL bf16 path is bench-only and intentionally bypasses the
+            # FP8-fused-quant branch (weights are bf16, so the fused FP8 path
+            # would never apply anyway — but assert to make the contract
+            # explicit and catch any future config drift).
+            if _use_q_b_cute:
+                assert not self._is_fused_q_fp8_quant_enabled(
+                    num_generations=num_generations), (
+                        "CuTe DSL q_b_proj path is incompatible with the "
+                        "fused FP8 q-quant branch")
+                q_proj = _q_b_proj_cute_dsl_bf16(q, self.q_b_proj.weight)
+                # Cross-iter cleanup: forward_absorption_* downstream gates
+                # the fused-FP8 attention path on these attrs being non-None
+                # (see _fused_quant_q_buffer/_fused_q_pe readers below). The
+                # FP8 path can't actually trigger when weights are bf16, but
+                # clear them anyway so a stale buffer from a different code
+                # path can never silently re-enable fusion.
+                self._fused_quant_q_buffer = None
+                self._fused_q_pe = None
+                return self._deepseek_v4_q_b_layernorm(q_proj)
             q_proj = self.q_b_proj(q)
             if self._is_fused_q_fp8_quant_enabled(
                     num_generations=num_generations):
