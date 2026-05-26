@@ -1427,8 +1427,11 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
 
         self._ensure_rope_table_size(metadata.max_seq_len)
 
-        if metadata.spec_decoding_bl_tree_mask is not None and self.get_local_layer_idx(
-                metadata) == 0:
+        # Prime ``self.local_layer_idx`` so the ``thop.attention`` kwarg
+        # below reads a populated int rather than the ``None`` placeholder.
+        # The call is a fast cache hit after the first forward.
+        self.local_layer_idx = self.get_local_layer_idx(metadata)
+        if metadata.spec_decoding_bl_tree_mask is not None and self.local_layer_idx == 0:
             metadata.spec_decoding_bl_tree_mask.zero_()
 
         if self.print_skip_softmax_stat:
