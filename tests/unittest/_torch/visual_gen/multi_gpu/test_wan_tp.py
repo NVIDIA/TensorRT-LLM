@@ -1,13 +1,13 @@
 # SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Multi-GPU tests for WAN T2V Tensor Parallelism (TP).
+"""Multi-GPU tests for WAN Tensor Parallelism (TP).
 
-Tests that WAN T2V transformer produces correct outputs when using
+Tests that WAN T2V and I2V transformers produce correct outputs when using
 TP (sharding weights across GPUs), and combined TP + Ulysses.
 
 Run with:
-    pytest tests/unittest/_torch/visual_gen/multi_gpu/test_wan_t2v_tp.py -v
+    pytest tests/unittest/_torch/visual_gen/multi_gpu/test_wan_tp.py -v
 """
 
 import os
@@ -64,7 +64,17 @@ def init_distributed_worker(rank: int, world_size: int, backend: str = "nccl", p
 
 def cleanup_distributed():
     """Clean up distributed environment."""
+    # Reset the DeviceMesh singleton before destroying the process group
+    # to prevent NCCL process group destructor segfaults during interpreter exit.
+    try:
+        from tensorrt_llm._torch.device_mesh import DeviceMeshTopologyImpl
+
+        DeviceMeshTopologyImpl.device_mesh = None
+        DeviceMeshTopologyImpl.tp_mesh = None
+    except ImportError:
+        pass
     if dist.is_initialized():
+        dist.barrier()
         dist.destroy_process_group()
 
 
@@ -97,10 +107,10 @@ def run_test_in_distributed(world_size: int, test_fn: Callable, use_cuda: bool =
 
 
 # =============================================================================
-# Model config helpers
+# Model configs
 # =============================================================================
 
-# Small WAN T2V config for testing (reduced dims: 4 heads, 64 head_dim = 256 hidden)
+# Small WAN T2V config (4 heads, 64 head_dim = 256 hidden)
 _WAN_T2V_TEST_CONFIG = dict(
     num_attention_heads=4,
     attention_head_dim=64,
@@ -114,6 +124,18 @@ _WAN_T2V_TEST_CONFIG = dict(
     eps=1e-6,
     cross_attn_norm=True,
 )
+
+# Small WAN I2V config (same base + image embedding and added KV projections)
+_WAN_I2V_TEST_CONFIG = dict(
+    **_WAN_T2V_TEST_CONFIG,
+    image_dim=64,  # image embedder: image_dim -> hidden_size
+    added_kv_proj_dim=256,  # add_k_proj input dim = hidden_size (image embeds projected to hidden_size before blocks)
+)
+
+
+# =============================================================================
+# Model config + weight helpers
+# =============================================================================
 
 
 def _make_model_config(pretrained_dict, tp_size=1, ulysses_size=1, backend="VANILLA"):
@@ -223,7 +245,6 @@ def _copy_ref_weights_to_tp(ref_model, tp_model, tp_rank, tp_size):
             elif tp_param.ndim >= 2 and tp_param.shape[1] == ref_param.shape[1]:
                 # Column parallel: dim 0 is smaller (output dim sharded)
                 if "qkv_proj" in tp_name or "add_qkv_proj" in tp_name:
-                    # Fused QKV: Q=K=V dims for WAN self-attention
                     q_dim = ref_param.shape[0] // 3
                     tp_param.data.copy_(
                         _shard_fused_qkv(ref_param.data, tp_rank, tp_size, q_dim, q_dim)
@@ -257,7 +278,7 @@ def _copy_ref_weights_to_tp(ref_model, tp_model, tp_rank, tp_size):
 # =============================================================================
 
 
-def _logic_wan_tp_forward(rank, world_size):
+def _logic_wan_t2v_tp_forward(rank, world_size):
     """WAN T2V transformer forward with TP — verify shape and no NaN/Inf."""
     from tensorrt_llm._torch.visual_gen.models.wan.transformer_wan import WanTransformer3DModel
 
@@ -296,7 +317,7 @@ def _logic_wan_tp_forward(rank, world_size):
     assert not torch.isinf(output).any(), f"Rank {rank}: Inf in output"
 
 
-def _logic_wan_tp_vs_single_gpu(rank, world_size):
+def _logic_wan_t2v_tp_vs_single_gpu(rank, world_size):
     """WAN T2V: TP 2-GPU output matches single-GPU reference."""
     from tensorrt_llm._torch.visual_gen.models.wan.transformer_wan import WanTransformer3DModel
 
@@ -351,7 +372,7 @@ def _logic_wan_tp_vs_single_gpu(rank, world_size):
     )
 
 
-def _logic_wan_tp_ulysses_vs_single_gpu(rank, world_size):
+def _logic_wan_t2v_tp_ulysses_vs_single_gpu(rank, world_size):
     """WAN T2V: TP=2 + Ulysses=2 (4 GPUs) output matches single-GPU reference."""
     from tensorrt_llm._torch.visual_gen.models.wan.transformer_wan import WanTransformer3DModel
 
@@ -412,6 +433,116 @@ def _logic_wan_tp_ulysses_vs_single_gpu(rank, world_size):
 
 
 # =============================================================================
+# WAN I2V test logic functions (module-level for pickling)
+# =============================================================================
+
+
+def _logic_wan_i2v_tp_forward(rank, world_size):
+    """WAN I2V transformer forward with TP — verify shape and no NaN/Inf."""
+    from tensorrt_llm._torch.visual_gen.models.wan.transformer_wan import WanTransformer3DModel
+
+    device = torch.device(f"cuda:{rank}")
+    torch.manual_seed(42)
+
+    model_config = _make_model_config(_WAN_I2V_TEST_CONFIG, tp_size=world_size)
+    model = WanTransformer3DModel(model_config).to(device).to(torch.bfloat16)
+    _stabilize_model_weights(model)
+
+    batch = 1
+    T, H, W = 2, 4, 4
+    in_channels = 16
+    txt_seq = 8
+    img_seq = 4
+
+    torch.manual_seed(100)
+    hidden_states = (
+        torch.randn(batch, in_channels, T, H, W, device=device, dtype=torch.bfloat16) * 0.1
+    )
+    encoder_hidden_states = (
+        torch.randn(batch, txt_seq, 128, device=device, dtype=torch.bfloat16) * 0.1
+    )
+    encoder_hidden_states_image = (
+        torch.randn(batch, img_seq, 64, device=device, dtype=torch.bfloat16) * 0.1
+    )
+    timestep = torch.tensor([0.5], device=device, dtype=torch.bfloat16)
+
+    with torch.no_grad():
+        output = model(
+            hidden_states=hidden_states,
+            timestep=timestep,
+            encoder_hidden_states=encoder_hidden_states,
+            encoder_hidden_states_image=encoder_hidden_states_image,
+        )
+
+    assert output.shape == (batch, in_channels, T, H, W), (
+        f"Rank {rank}: Expected shape {(batch, in_channels, T, H, W)}, got {output.shape}"
+    )
+    assert not torch.isnan(output).any(), f"Rank {rank}: NaN in output"
+    assert not torch.isinf(output).any(), f"Rank {rank}: Inf in output"
+
+
+def _logic_wan_i2v_tp_vs_single_gpu(rank, world_size):
+    """WAN I2V: TP 2-GPU output matches single-GPU reference."""
+    from tensorrt_llm._torch.visual_gen.models.wan.transformer_wan import WanTransformer3DModel
+
+    device = torch.device(f"cuda:{rank}")
+    compute_dtype = torch.bfloat16
+
+    batch = 1
+    T, H, W = 2, 4, 4
+    in_channels = 16
+    txt_seq = 8
+    img_seq = 4
+
+    # Create single-GPU reference model
+    torch.manual_seed(123)
+    ref_config = _make_model_config(_WAN_I2V_TEST_CONFIG, tp_size=1)
+    ref_model = WanTransformer3DModel(ref_config).to(device).to(compute_dtype)
+    _stabilize_model_weights(ref_model)
+
+    # Create TP model and copy sharded weights from ref
+    torch.manual_seed(123)
+    tp_config = _make_model_config(_WAN_I2V_TEST_CONFIG, tp_size=world_size)
+    tp_model = WanTransformer3DModel(tp_config).to(device).to(compute_dtype)
+    _copy_ref_weights_to_tp(ref_model, tp_model, rank, world_size)
+
+    # Same inputs on all ranks
+    torch.manual_seed(456)
+    hidden_states = (
+        torch.randn(batch, in_channels, T, H, W, device=device, dtype=compute_dtype) * 0.1
+    )
+    encoder_hidden_states = (
+        torch.randn(batch, txt_seq, 128, device=device, dtype=compute_dtype) * 0.1
+    )
+    encoder_hidden_states_image = (
+        torch.randn(batch, img_seq, 64, device=device, dtype=compute_dtype) * 0.1
+    )
+    timestep = torch.tensor([0.5], device=device, dtype=compute_dtype)
+
+    with torch.no_grad():
+        ref_output = ref_model(
+            hidden_states=hidden_states,
+            timestep=timestep,
+            encoder_hidden_states=encoder_hidden_states,
+            encoder_hidden_states_image=encoder_hidden_states_image,
+        )
+        tp_output = tp_model(
+            hidden_states=hidden_states,
+            timestep=timestep,
+            encoder_hidden_states=encoder_hidden_states,
+            encoder_hidden_states_image=encoder_hidden_states_image,
+        )
+
+    torch.testing.assert_close(
+        tp_output,
+        ref_output,
+        rtol=1e-2,
+        atol=1e-2,
+        msg=f"Rank {rank}: WAN I2V TP output differs from single-GPU reference",
+    )
+
+
+# =============================================================================
 # Test classes
 # =============================================================================
 
@@ -421,11 +552,11 @@ class TestWanT2VTP:
 
     def test_wan_t2v_tp_forward(self):
         """WAN T2V TP forward: correct output shape and no NaN/Inf."""
-        run_test_in_distributed(world_size=2, test_fn=_logic_wan_tp_forward)
+        run_test_in_distributed(world_size=2, test_fn=_logic_wan_t2v_tp_forward)
 
     def test_wan_t2v_tp_vs_single_gpu(self):
         """WAN T2V TP 2-GPU output matches single-GPU reference."""
-        run_test_in_distributed(world_size=2, test_fn=_logic_wan_tp_vs_single_gpu)
+        run_test_in_distributed(world_size=2, test_fn=_logic_wan_t2v_tp_vs_single_gpu)
 
 
 class TestWanT2VTPUlyssesCombined:
@@ -433,7 +564,19 @@ class TestWanT2VTPUlyssesCombined:
 
     def test_wan_t2v_tp_ulysses_vs_single_gpu(self):
         """WAN T2V TP=2 + Ulysses=2 (4 GPUs) matches single-GPU reference."""
-        run_test_in_distributed(world_size=4, test_fn=_logic_wan_tp_ulysses_vs_single_gpu)
+        run_test_in_distributed(world_size=4, test_fn=_logic_wan_t2v_tp_ulysses_vs_single_gpu)
+
+
+class TestWanI2VTP:
+    """Tensor parallelism tests for WAN I2V transformer."""
+
+    def test_wan_i2v_tp_forward(self):
+        """WAN I2V TP forward: correct output shape and no NaN/Inf."""
+        run_test_in_distributed(world_size=2, test_fn=_logic_wan_i2v_tp_forward)
+
+    def test_wan_i2v_tp_vs_single_gpu(self):
+        """WAN I2V TP 2-GPU output matches single-GPU reference."""
+        run_test_in_distributed(world_size=2, test_fn=_logic_wan_i2v_tp_vs_single_gpu)
 
 
 if __name__ == "__main__":

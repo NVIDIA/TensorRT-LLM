@@ -9,7 +9,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from tensorrt_llm._torch.models.hf_parameter_utils import get_parameter_device
 from tensorrt_llm._torch.modules.layer_norm import LayerNorm
-from tensorrt_llm._torch.modules.linear import Linear
+from tensorrt_llm._torch.modules.linear import Linear, TensorParallelMode
 from tensorrt_llm._torch.modules.mlp import MLP
 from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
 from tensorrt_llm._torch.visual_gen.modules.attention import Attention, QKVMode
@@ -340,10 +340,12 @@ class WanBlock(nn.Module):
             reduce_output=(model_config.mapping.tp_size != 1),
         )
 
-        # I2V: Additional K/V projections for image embeddings
+        # I2V: Additional K/V projections for image embeddings.
+        # COLUMN parallel to match attn2's TP-sharded head count.
         self.add_k_proj = self.add_v_proj = None
         self.norm_added_k = None
         if added_kv_proj_dim is not None:
+            tp_mode = TensorParallelMode.COLUMN if tp_size > 1 else None
             self.add_k_proj = Linear(
                 added_kv_proj_dim,
                 hidden_size,
@@ -352,6 +354,7 @@ class WanBlock(nn.Module):
                 quant_config=quant_config,
                 skip_create_weights_in_init=skip_create_weights,
                 force_dynamic_quantization=force_dynamic_quant,
+                tensor_parallel_mode=tp_mode,
                 reduce_output=False,
             )
             self.add_v_proj = Linear(
@@ -362,10 +365,16 @@ class WanBlock(nn.Module):
                 quant_config=quant_config,
                 skip_create_weights_in_init=skip_create_weights,
                 force_dynamic_quantization=force_dynamic_quant,
+                tensor_parallel_mode=tp_mode,
                 reduce_output=False,
             )
             self.norm_added_k = RMSNorm(
-                hidden_size=hidden_size, eps=eps, dtype=dtype, has_weights=True
+                hidden_size=hidden_size,
+                eps=eps,
+                dtype=dtype,
+                has_weights=True,
+                enable_tp=(tp_size > 1),
+                mapping=model_config.mapping,
             )
 
         # Use torch.empty().normal_(std=...) instead of torch.randn()/scale for MetaInitMode compatibility
