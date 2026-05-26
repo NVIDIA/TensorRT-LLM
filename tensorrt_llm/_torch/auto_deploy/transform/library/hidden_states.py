@@ -130,16 +130,26 @@ class DetectHiddenStatesForCapture(BaseTransform):
             # using a future residual add node for the next layer.
             # 2. is the last add node in a 1 user chain (for last layer or layers with no following residual add)
             # This stops us before we go to the next layer.
+            #
+            # IR-aware models (e.g. modeling_nemotron_h.py post-IR-fication) insert
+            # ``torch.ops.auto_deploy.all_reduce`` between the closing linear and the residual add.
+            # That op is identity at world_size=1 and a sharding-injected collective otherwise, so
+            # walk transparently through it without recording it as the residual add.
             res_node = lin_node_closing
+            last_add: Optional[Node] = None
             while len(res_node.users) == 1:
                 user_node = list(res_node.users)[0]
-                if not is_op(user_node, torch.ops.aten.add):
+                if is_op(user_node, torch.ops.aten.add):
+                    last_add = user_node
+                    res_node = user_node
+                elif is_op(user_node, torch.ops.auto_deploy.all_reduce):
+                    res_node = user_node
+                else:
                     break
-                res_node = user_node
 
-            if is_op(res_node, torch.ops.aten.add):
+            if last_add is not None:
                 # this stores the last residual add node encountered for each layer
-                residual_add_nodes[layer_number] = res_node
+                residual_add_nodes[layer_number] = last_add
 
         return residual_add_nodes
 

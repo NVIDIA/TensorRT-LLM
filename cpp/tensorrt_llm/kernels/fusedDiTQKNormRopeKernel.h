@@ -74,6 +74,24 @@ void launchFusedDiTCrossHeadQKNormRope(void* qkv, // [num_tokens, (Hq+Hk+Hv)*hea
     bool interleave,                              // true = interleaved pairs, false = rotate_half
     cudaStream_t stream);
 
+// Full-dim variant for LTX-2: RMSNorm range = num_heads_per_side * head_dim.
+// Requires num_heads_q == num_heads_k. No dual-stream support.
+// per_head_cos=false: cos/sin shape [num_tokens, head_dim] (head broadcast).
+// per_head_cos=true:  cos/sin shape [num_tokens, num_heads*head_dim]
+//                     (LTX-2 INTERLEAVED 3D RoPE — different freqs per head).
+void launchFusedDiTQKNormRopeFullDim(void* qkv, // [num_tokens, (Hq+Hk+Hv)*head_dim], in-place
+    int num_tokens, int num_heads_q, int num_heads_k, int num_heads_v,
+    int head_dim,                               // Must be 64 or 128
+    float eps,
+    void const* q_weight,                       // [num_heads_q * head_dim]
+    void const* k_weight,                       // [num_heads_k * head_dim]
+    void const* cos_emb,                        // float32 or bfloat16 (selected by cos_is_bf16)
+    void const* sin_emb,                        // same dtype as cos_emb
+    bool interleave, bool per_head_cos,
+    bool cos_is_bf16,                           // true → cos/sin are bf16
+    int cos_seq_per_batch,                      // 0 = flat cos [num_tokens, …]; >0 = cos broadcast over B
+    cudaStream_t stream);
+
 } // namespace kernels
 
 TRTLLM_NAMESPACE_END

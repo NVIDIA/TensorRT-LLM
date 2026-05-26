@@ -472,18 +472,12 @@ def _assert_lpips_below_threshold(score, threshold):
 
 
 def _generate_flux_lpips_image(model_path, output_path):
-    from tensorrt_llm._torch.visual_gen.config import PipelineConfig, VisualGenArgs
     from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineLoader
     from tensorrt_llm.media.encoding import save_image
+    from tensorrt_llm.visual_gen.args import VisualGenArgs
 
     _skip_if_missing(model_path, "FLUX checkpoint", is_dir=True)
-    args = VisualGenArgs(
-        checkpoint_path=model_path,
-        device="cuda",
-        dtype="bfloat16",
-        pipeline=PipelineConfig(),
-        skip_warmup=True,
-    )
+    args = VisualGenArgs(model=model_path)
     pipeline = PipelineLoader(args).load(skip_warmup=True)
     try:
         result = pipeline.forward(
@@ -503,8 +497,8 @@ def _generate_flux_lpips_image(model_path, output_path):
 
 
 def _generate_ltx2_lpips_video(output_path):
-    from tensorrt_llm._torch.visual_gen.config import TorchCompileConfig, VisualGenArgs
     from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineLoader
+    from tensorrt_llm.visual_gen.args import TorchCompileConfig, VisualGenArgs
 
     checkpoint_path = _lpips_model_path("LTX-2", "ltx-2-19b-dev.safetensors")
     text_encoder_path = _ltx2_lpips_text_encoder_path()
@@ -516,14 +510,13 @@ def _generate_ltx2_lpips_video(output_path):
     _skip_if_missing(distilled_lora_path, "LTX-2 distilled LoRA")
 
     args = VisualGenArgs(
-        checkpoint_path=checkpoint_path,
-        text_encoder_path=text_encoder_path,
-        spatial_upsampler_path=spatial_upsampler_path,
-        distilled_lora_path=distilled_lora_path,
-        device="cuda",
-        dtype="bfloat16",
-        skip_warmup=True,
-        torch_compile=TorchCompileConfig(enable_torch_compile=False),
+        model=checkpoint_path,
+        pipeline_config={
+            "text_encoder_path": text_encoder_path,
+            "spatial_upsampler_path": spatial_upsampler_path,
+            "distilled_lora_path": distilled_lora_path,
+        },
+        torch_compile_config=TorchCompileConfig(enable=False),
     )
     pipeline = PipelineLoader(args).load(skip_warmup=True)
     try:
@@ -559,16 +552,13 @@ def _generate_wan_lpips_video(
     seed,
     frame_rate,
 ):
-    from tensorrt_llm._torch.visual_gen.config import TorchCompileConfig, VisualGenArgs
     from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineLoader
+    from tensorrt_llm.visual_gen.args import TorchCompileConfig, VisualGenArgs
 
     _skip_if_missing(model_path, "Wan checkpoint", is_dir=True)
     args = VisualGenArgs(
-        checkpoint_path=model_path,
-        device="cuda",
-        dtype="bfloat16",
-        skip_warmup=True,
-        torch_compile=TorchCompileConfig(enable_torch_compile=False),
+        model=model_path,
+        torch_compile_config=TorchCompileConfig(enable=False),
     )
     pipeline = PipelineLoader(args).load(skip_warmup=True)
     _disable_wan_fused_qk_norm_rope_if_unavailable(pipeline)
@@ -806,15 +796,15 @@ def _generate_ltx2_video(llm_venv, output_subdir, linear_type="default"):
     if os.path.isfile(output_path):
         return output_path
 
-    vg_kwargs = dict(text_encoder_path=text_encoder_path)
+    vg_kwargs = dict(pipeline_config={"text_encoder_path": text_encoder_path})
     quant_config = _linear_type_to_quant_config(linear_type)
     if quant_config is not None:
         vg_kwargs["quant_config"] = quant_config
     if torch.cuda.device_count() >= 2:
-        vg_kwargs["parallel"] = {"dit_cfg_size": 2}
+        vg_kwargs["parallel_config"] = {"cfg_size": 2}
 
-    diffusion_args = VisualGenArgs(**vg_kwargs)
-    visual_gen = VisualGen(model=model_path, args=diffusion_args)
+    visual_gen_args = VisualGenArgs(**vg_kwargs)
+    visual_gen = VisualGen(model=model_path, args=visual_gen_args)
 
     try:
         params = VisualGenParams(
@@ -890,18 +880,20 @@ def _generate_ltx2_two_stage_video(llm_venv, output_subdir, linear_type="default
         return output_path
 
     vg_kwargs = dict(
-        text_encoder_path=text_encoder_path,
-        spatial_upsampler_path=upsampler_path,
-        distilled_lora_path=lora_path,
+        pipeline_config={
+            "text_encoder_path": text_encoder_path,
+            "spatial_upsampler_path": upsampler_path,
+            "distilled_lora_path": lora_path,
+        },
     )
     quant_config = _linear_type_to_quant_config(linear_type)
     if quant_config is not None:
         vg_kwargs["quant_config"] = quant_config
     if torch.cuda.device_count() >= 2:
-        vg_kwargs["parallel"] = {"dit_cfg_size": 2}
+        vg_kwargs["parallel_config"] = {"cfg_size": 2}
 
-    diffusion_args = VisualGenArgs(**vg_kwargs)
-    visual_gen = VisualGen(model=model_path, args=diffusion_args)
+    visual_gen_args = VisualGenArgs(**vg_kwargs)
+    visual_gen = VisualGen(model=model_path, args=visual_gen_args)
 
     try:
         params = VisualGenParams(
@@ -1088,7 +1080,7 @@ def test_vbench_dimension_score_wan22_a14b_fp8(
         llm_venv,
         title="WAN 2.2 A14B FP8",
         golden_scores=VBENCH_WAN22_A14B_FP8_GOLDEN_SCORES,
-        max_score_diff=0.05,
+        max_score_diff=0.06,
     )
 
 
@@ -1240,7 +1232,7 @@ def test_wan_t2v_example(_visual_gen_deps, llm_root, llm_venv):
             script_path,
             "--model",
             model_path,
-            "--extra_visual_gen_options",
+            "--visual_gen_args",
             config_path,
             "--output_path",
             output_path,

@@ -1931,6 +1931,18 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
 
     @pytest.mark.skip_less_device_memory(60000)
     @parametrize_with_ids("enable_chunked_prefill", [False, True])
+    def test_bfloat16_flashinfer(self, enable_chunked_prefill):
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.75)
+        with LLM(self.MODEL_PATH,
+                 kv_cache_config=kv_cache_config,
+                 attn_backend="FLASHINFER",
+                 enable_chunked_prefill=enable_chunked_prefill,
+                 max_num_tokens=512 if enable_chunked_prefill else 8192) as llm:
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+
+    @pytest.mark.skip_less_device_memory(60000)
+    @parametrize_with_ids("enable_chunked_prefill", [False, True])
     @parametrize_with_ids("attention_dp,cuda_graph,overlap_scheduler",
                           [(False, False, False), (True, True, True)])
     @parametrize_with_ids("mtp_nextn", [0, 2])

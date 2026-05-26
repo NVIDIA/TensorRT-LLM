@@ -1,6 +1,7 @@
 # Adapted from
 # https://github.com/vllm-project/vllm/blob/4db5176d9758b720b05460c50ace3c01026eb158/vllm/entrypoints/openai/protocol.py
 import base64
+import math
 import re
 import time
 import uuid
@@ -45,6 +46,9 @@ from tensorrt_llm.llmapi.reasoning_parser import ReasoningParserFactory
 from tensorrt_llm.sampling_params import check_logprobs_limit
 from tensorrt_llm.scheduling_params import AgentHierarchy
 
+_LOGIT_BIAS_MIN = -100.0
+_LOGIT_BIAS_MAX = 100.0
+
 
 def _logit_bias_to_embedding_bias(
         logit_bias: Optional[Dict[str, float]],
@@ -58,6 +62,8 @@ def _logit_bias_to_embedding_bias(
             "without one (e.g. num_postprocess_workers > 0). "
             "Remove logit_bias from your request or set num_postprocess_workers=0."
         )
+    elif vocab_size <= 0:
+        raise ValueError("vocab_size must be positive when logit_bias is used")
 
     # Create 1D zeros tensor as expected by executor API (will be unsqueezed to [1, vocab_size] internally)
     embedding_bias = torch.zeros(vocab_size, dtype=torch.float32)
@@ -66,18 +72,30 @@ def _logit_bias_to_embedding_bias(
     for token_str, bias in logit_bias.items():
         try:
             token_id = int(token_str)
-            if 0 <= token_id < vocab_size:
-                embedding_bias[token_id] = bias
-            else:
-                raise ValueError(
-                    f"Token ID {token_id} out of vocabulary range [0, {vocab_size})"
-                )
         except ValueError as e:
             if "invalid literal" in str(e):
                 raise ValueError(
                     f"Invalid logit_bias key '{token_str}': must be a valid integer token ID"
                 )
             raise
+        if not 0 <= token_id < vocab_size:
+            raise ValueError(
+                f"Token ID {token_id} out of vocabulary range [0, {vocab_size})"
+            )
+        try:
+            bias_value = float(bias)
+        except (TypeError, ValueError) as e:
+            raise ValueError(
+                f"logit_bias value for token ID {token_id} must be a number"
+            ) from e
+        if not math.isfinite(bias_value):
+            raise ValueError(f"logit_bias value for token ID {token_id} "
+                             "must be finite")
+        if not _LOGIT_BIAS_MIN <= bias_value <= _LOGIT_BIAS_MAX:
+            raise ValueError(
+                f"logit_bias value for token ID {token_id} must be in "
+                f"[{_LOGIT_BIAS_MIN:g}, {_LOGIT_BIAS_MAX:g}]")
+        embedding_bias[token_id] = bias_value
 
     return embedding_bias
 
