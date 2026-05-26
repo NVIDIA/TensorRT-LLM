@@ -74,9 +74,12 @@ class RMSNorm(nn.Module):
         input_dtype = hidden_states.dtype
         hidden_states = hidden_states.to(torch.float32)
 
-        variance = hidden_states.pow(2).mean(-1, keepdim=True)
+        x2 = hidden_states.pow(2)
         if self.allreduce:
-            variance = self.allreduce(variance) / self.mapping.tp_size
+            x2_sum = x2.sum(-1, keepdim=True)
+            variance = self.allreduce(x2_sum) / self.full_size
+        else:
+            variance = x2.mean(-1, keepdim=True)
 
         hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
         if not self.use_gemma:

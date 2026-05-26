@@ -103,6 +103,10 @@ class FluxJointAttnMLPProj(nn.Module):
         At TP>1, splits the weight along the input dim (columns) into
         attn and mlp portions, then loads each as a vanilla ROW Linear.
         """
+        for sub in self.modules():
+            if callable(getattr(sub, "create_weights", None)):
+                sub.create_weights()
+
         if self.tp_size <= 1:
             loader.load_linear_weights(self.proj, "proj_out", [weight_dict])
         else:
@@ -111,8 +115,6 @@ class FluxJointAttnMLPProj(nn.Module):
             W_mlp = W[:, self.attn_dim :]
 
             for sub_module, sub_weight in [(self.attn_proj, W_attn), (self.mlp_proj, W_mlp)]:
-                if callable(getattr(sub_module, "create_weights", None)):
-                    sub_module.create_weights()
                 loader.load_linear_weights(sub_module, "proj_out", [{"weight": sub_weight}])
 
             if self.has_bias and "bias" in weight_dict:
@@ -237,6 +239,10 @@ class FluxJointQKVMLPProj(nn.Module):
         At TP>1: splits into QKV and MLP portions, then loads into
         column-parallel sub-Linears which handle per-rank sharding.
         """
+        for sub in self.modules():
+            if callable(getattr(sub, "create_weights", None)):
+                sub.create_weights()
+
         if self.tp_size <= 1:
             loader.load_linear_weights(self.proj, "to_qkv_mlp_proj", [weight_dict])
             return

@@ -877,7 +877,16 @@ class FluxTransformer2DModel(nn.Module):
 
         loader = DynamicLinearWeightLoader(self.model_config, params_map=params_map)
 
+        # Track prefixes of wrapper projectors whose sub-Linears are loaded
+        # by the parent's load_weights — the generic Linear loader must skip
+        # them (their FUSED weight modes would look for nonexistent checkpoint
+        # keys via params_map and error).
+        managed_prefixes = set()
+
         for name, module in tqdm(self.named_modules(), desc="Loading weights"):
+            if any(name.startswith(p) for p in managed_prefixes):
+                continue
+
             # Create weights for modules with skip_create_weights_in_init=True
             # This must be done before loading weights (following Wan pattern)
             if callable(getattr(module, "create_weights", None)):
@@ -885,6 +894,7 @@ class FluxTransformer2DModel(nn.Module):
 
             # Wrapper modules have no direct _parameters; handle before the guard.
             if isinstance(module, FluxJointAttnMLPProj):
+                managed_prefixes.add(name + ".")
                 module_weights = loader.filter_weights(name, weights)
                 module.load_weights(module_weights, loader)
                 continue
