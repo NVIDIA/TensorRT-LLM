@@ -1089,17 +1089,18 @@ xmp = ["defusedxml"]
 
 [[package]]
 name = "pulp"
-version = "3.3.1"
+version = "3.3.2"
 description = "PuLP is an LP modeler written in python. PuLP can generate MPS or LP files and call GLPK, COIN CLP/CBC, CPLEX, and GUROBI to solve linear problems."
 optional = false
-python-versions = ">=3.9"
+python-versions = ">=3.10"
 groups = ["main"]
 files = [
-    {file = "pulp-3.3.1-py3-none-any.whl", hash = "sha256:45aa73db3368eb13b156564e092784c8fa0c1feefa64c2afb0410d9dc0bb5cd9"},
-    {file = "pulp-3.3.1.tar.gz", hash = "sha256:a9ec237a56981b11c2096e8ba6bb72006833410ba5b400aa257426f85df5e293"},
+    {file = "pulp-3.3.2-py3-none-any.whl", hash = "sha256:631b166f72086971a9597f7a0233ababa99bb8d50a01cd543f7758be5a9f86c0"},
+    {file = "pulp-3.3.2.tar.gz", hash = "sha256:d0904700c207ac11e25e3b1213b70eae1d6fb25faa719d75f3f15054901258c0"},
 ]
 
 [package.extras]
+cbc = ["cbcbox"]
 copt = ["coptpy"]
 cplex = ["cplex ; sys_platform != \"darwin\" or python_full_version < \"3.12.0\""]
 gurobi = ["gurobipy"]

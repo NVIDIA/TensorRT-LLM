@@ -2974,6 +2974,164 @@ class NVFP4CuteDslFusedMoEMethod(NVFP4CutlassFusedMoEMethod):
                 module, module.w3_w1_weight_scale.data[expert_idx])
 
 
+class NVFP4CuteDslB12xFusedMoEMethod(NVFP4CutlassFusedMoEMethod):
+    """NVFP4 quant method for the FlashInfer B12x MoE backend (SM120 / SM121).
+
+    Inherits the full CUTLASS NVFP4 weight pipeline (cat + pad +
+    block_scale_interleave + setup_quant_scales) so the backend's
+    hybrid prefill path can continue to consume the standard CUTLASS
+    NVFP4 GroupGEMM layout via the inherited ``CutlassFusedMoE.run_moe``.
+
+    On top of that base layout, ``post_load_weights`` materialises the
+    b12x-specific weight tensors: SF un-normalization (multiply per-block
+    FP8 scales by ``weight_scale_2 = fc_alpha * fc_input_scale``),
+    ``convert_sf_to_mma_layout`` reshape, per-expert ``w*_alpha = 1 /
+    fc_input_scale`` vectors, and a ``B12xMoEWrapper`` instance with a
+    shared cross-layer output buffer. The wrapper and the bundled
+    weight dict are attached to the MoE module as ``module.b12x_wrapper``
+    / ``module._b12x_weights`` so the backend's ``run_moe`` can dispatch
+    to them on decode-shape inputs without holding any kernel-prep logic
+    of its own.
+    """
+
+    # b12x exposes two activation strings today: ``relu2`` (Nemotron-style
+    # ``x * relu(x)``) and ``silu`` (SwiGLU-style ``x * silu(gate)``).
+    _ACTIVATION_MAP = {
+        ActivationType.Relu2: "relu2",
+        ActivationType.Swiglu: "silu",
+    }
+
+    def post_load_weights(self, module: torch.nn.Module):
+        # Base class handles shared-weight finalize, load-balancer init,
+        # and setup_quant_scales. Leaves the standard CUTLASS NVFP4
+        # weight + SF layout in place for the inherited prefill path.
+        super().post_load_weights(module)
+
+        try:
+            from flashinfer import B12xMoEWrapper
+            from flashinfer.cute_dsl.utils import convert_sf_to_mma_layout
+        except ImportError as e:
+            raise RuntimeError(
+                "NVFP4CuteDslB12xFusedMoEMethod requires the `flashinfer` package "
+                "(B12xMoEWrapper, cute_dsl.utils.convert_sf_to_mma_layout). "
+                f"Original import error: {e}") from e
+
+        # ``_SHARED_MOE_OUTPUT_BUF`` lives next to the backend so all MoE
+        # layers across the model share one wrapper-owned output buffer.
+        from .fused_moe_cute_dsl_b12x import _SHARED_MOE_OUTPUT_BUF
+
+        num_local_experts = module.w3_w1_weight.shape[0]
+        # Tensor shapes use the *padded* per-rank dims because TP partitions
+        # may pad ``intermediate_size`` up to a kernel-friendly boundary.
+        # Recover them from the actual stored tensors rather than the logical
+        # model config so reshapes stay valid under TP > 1.
+        _, w3w1_out_dim, _ = module.w3_w1_weight.shape  # (E, 2*I_pad, H//16)
+        _, w2_out_dim, w2_in_packed = module.w2_weight.shape  # (E, H, I_pad//16)
+        w3w1_in_dim = module.hidden_size
+        w2_in_dim = w2_in_packed * 16
+
+        # b12x reuses the per-expert ``w1_alpha`` tensor as both (a) the
+        # online activation-quant ``global_scale`` and (b) the FC1 epilogue
+        # output-dequant multiplier. That dual use is only self-consistent
+        # when the FP4 weight block scales are stored in their *unnormalized*
+        # form (raw ``max_block / FP4_MAX``), not divided out by the
+        # per-tensor ``weight_scale_2``. HF / ModelOpt NVFP4 checkpoints
+        # store the normalized variant so the FP8 block scales fit in range,
+        # and TRT-LLM's NVFP4 loader preserves that form. To match b12x's
+        # convention we recover ``weight_scale_2 = fc_alpha * fc_input_scale``
+        # and multiply each expert's FP8 block scales by it before handing
+        # them to ``convert_sf_to_mma_layout``. With the un-normalized scales
+        # in place we pass ``w1_alpha = w2_alpha = 1 / fc_input_scale``
+        # (== ``s_in``) so the kernel's dual-use cancels algebraically and
+        # the stored input-side block scales remain FP8-representable.
+        w1_w_scale_2 = (module.fc31_alpha * module.fc31_input_scale).to(
+            torch.float32)
+        w2_w_scale_2 = (module.fc2_alpha * module.fc2_input_scale).to(
+            torch.float32)
+
+        w1_sf_fp8_norm = module.w3_w1_weight_scale.view(
+            torch.float8_e4m3fn).float()
+        w2_sf_fp8_norm = module.w2_weight_scale.view(
+            torch.float8_e4m3fn).float()
+
+        # Broadcast per-expert scalar over the trailing dims (E, *).
+        bcast1 = w1_w_scale_2.view(-1, *([1] * (w1_sf_fp8_norm.dim() - 1)))
+        bcast2 = w2_w_scale_2.view(-1, *([1] * (w2_sf_fp8_norm.dim() - 1)))
+        w1_sf_fp8 = (w1_sf_fp8_norm * bcast1).to(torch.float8_e4m3fn)
+        w2_sf_fp8 = (w2_sf_fp8_norm * bcast2).to(torch.float8_e4m3fn)
+
+        w1_sf_b12x = convert_sf_to_mma_layout(w1_sf_fp8,
+                                              m=w3w1_out_dim,
+                                              k=w3w1_in_dim,
+                                              num_groups=num_local_experts)
+        w2_sf_b12x = convert_sf_to_mma_layout(w2_sf_fp8,
+                                              m=w2_out_dim,
+                                              k=w2_in_dim,
+                                              num_groups=num_local_experts)
+
+        w1_alpha_b12x = ((1.0 / module.fc31_input_scale).expand(
+            module.num_experts).to(torch.float32).contiguous())
+        w2_alpha_b12x = ((1.0 / module.fc2_input_scale).expand(
+            module.num_experts).to(torch.float32).contiguous())
+        fc2_input_scale_b12x = (1.0 / module.fc2_input_scale).to(torch.float32)
+
+        # TRT-LLM packs 16 FP4 values per int64. flashinfer's internal
+        # ``view(torch.float4_e2m1fn_x2)`` requires byte-contiguous storage
+        # (stride[-1] == 1 in bytes); a uint8 view of the int64 tensor
+        # provides that without copying.
+        module._b12x_weights = dict(
+            w1_weight=module.w3_w1_weight.view(torch.uint8),
+            w1_weight_sf=w1_sf_b12x,
+            w1_alpha=w1_alpha_b12x,
+            w2_weight=module.w2_weight.view(torch.uint8),
+            w2_weight_sf=w2_sf_b12x,
+            w2_alpha=w2_alpha_b12x,
+            fc2_input_scale=fc2_input_scale_b12x,
+        )
+
+        if module.activation_type not in self._ACTIVATION_MAP:
+            supported = ", ".join(a.name for a in self._ACTIVATION_MAP)
+            raise ValueError(
+                f"NVFP4CuteDslB12xFusedMoEMethod does not support activation "
+                f"{ActivationType(module.activation_type).name}; "
+                f"supported: {supported}.")
+
+        module.b12x_wrapper = B12xMoEWrapper(
+            num_experts=module.num_experts,
+            top_k=module.routing_method.experts_per_token,
+            hidden_size=module.hidden_size,
+            intermediate_size=module.intermediate_size_per_partition,
+            use_cuda_graph=getattr(module, "_b12x_use_cuda_graph", False),
+            max_num_tokens=module.moe_max_num_tokens,
+            activation=self._ACTIVATION_MAP[module.activation_type],
+        )
+
+        # Replace the wrapper's per-instance output buffer with a shared one.
+        # Layers run sequentially on a single stream, so a single buffer of the
+        # right shape is correct and saves
+        # ``(num_moe_layers - 1) * max_num_tokens * hidden_size * 2`` bytes —
+        # ~2.5 GB on Nemotron-Super-120B with ``max_num_tokens=2048``,
+        # ``hidden=8192``, bf16, 80 MoE layers.
+        if module.b12x_wrapper._moe_output is not None:
+            buf = module.b12x_wrapper._moe_output
+            key = (buf.shape[0], buf.shape[1], buf.dtype, str(buf.device))
+            shared = _SHARED_MOE_OUTPUT_BUF.get(key)
+            if shared is None:
+                _SHARED_MOE_OUTPUT_BUF[key] = buf
+            else:
+                # Free the freshly allocated buffer; reuse the existing one.
+                module.b12x_wrapper._moe_output = shared
+
+        logger.info_once(
+            f"NVFP4CuteDslB12xFusedMoEMethod active: hidden={module.hidden_size}, "
+            f"intermediate={module.intermediate_size_per_partition}, "
+            f"experts={module.num_experts}, top_k="
+            f"{module.routing_method.experts_per_token}, "
+            f"activation={self._ACTIVATION_MAP[module.activation_type]}.",
+            key="cute_dsl_b12x_moe_active",
+        )
+
+
 class NVFP4TRTLLMGenFusedMoEBaseMethod(NVFP4FusedMoEMethod):
     weight_dtype = float4_sf_dtype
     block_scales_dtype = torch.float8_e4m3fn
