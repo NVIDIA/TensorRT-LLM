@@ -15,8 +15,8 @@ import torch._dynamo.config
 
 import tensorrt_llm.bindings.internal.userbuffers as ub
 from tensorrt_llm._utils import (is_trace_enabled, maybe_pin_memory, nvtx_range,
-                                 prefer_pinned, release_gc, torch_dtype_to_str,
-                                 trace_func)
+                                 prefer_pinned, release_gc, str_dtype_to_torch,
+                                 torch_dtype_to_str, trace_func)
 from tensorrt_llm.bindings.internal.runtime import TaskLayerModuleConfig
 from tensorrt_llm.inputs.multimodal import (MultimodalParams,
                                             MultimodalRuntimeData,
@@ -594,11 +594,20 @@ class PyTorchModelEngine(ModelEngine):
         ) or layer_quant_mode.has_int8_kv_cache():
             return 1
         elif layer_quant_mode.has_turboquant4_kv_cache():
-            # Used as packed-cache row stride for draft-token relocation;
-            # TurboQuant4 scale relocation is unsupported and rejected there.
-            return 1 / 2
+            model_dtype = getattr(self.model.config, "torch_dtype",
+                                  torch.float16)
+            if isinstance(model_dtype, str):
+                model_dtype = str_dtype_to_torch(model_dtype)
+            if isinstance(model_dtype, torch.dtype):
+                return torch.empty((), dtype=model_dtype).element_size()
+            return 2
         else:
             return 2
+
+    @staticmethod
+    def get_turboquant4_value_stride_byte_size() -> float:
+        """Return the packed value-cache byte stride for one scalar value."""
+        return 1 / 2
 
     def set_lora_model_config(self,
                               lora_target_modules: list[str],
@@ -3548,6 +3557,8 @@ class PyTorchModelEngine(ModelEngine):
                     anchor_len)
                 all_cache_indices = all_cache_indices[
                     num_kvblocks_per_ctx_block:]
+            all_cache_indices = (all_cache_indices[-num_kv_blocks:]
+                                 if num_kv_blocks > 0 else [])
             last_query_pos_id = request.ctx_position_blocks[-1][-1]
             position_ids.append(last_query_pos_id + request.gen_iters + 1)
             block_ids_per_seq.extend([all_cache_indices])

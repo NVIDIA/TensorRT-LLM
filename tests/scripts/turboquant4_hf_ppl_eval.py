@@ -191,7 +191,7 @@ def _quantize_past_key_values(
                 raise TypeError(
                     "TurboQuant4 HF perplexity eval cannot find keys/values "
                     f"on cache layer {layer_index}."
-            )
+                )
             _validate_cache_head_dim(key, layer_index)
             start = previous_seq_lens[layer_index] if previous_seq_lens else 0
             layer_cache.keys = _quantize_cache_slice_if_enabled(

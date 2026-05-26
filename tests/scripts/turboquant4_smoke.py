@@ -91,10 +91,10 @@ def _run_reference_smoke(turboquant4) -> None:
     cached_k = turboquant4.turboquant4_dequantize_cache(
         cache, cache_scales, block_ids[0], 0, 3, tokens_per_block, dtype=k.dtype
     )
-    assert cached_k.shape == (1, 3, num_kv_heads, head_dim)
+    assert cached_k.shape == (3, num_kv_heads, head_dim)
     torch.testing.assert_close(
         cached_k,
-        turboquant4.turboquant4_quantize_dequantize(k[:3].unsqueeze(0)),
+        turboquant4.turboquant4_quantize_dequantize(k[:3].unsqueeze(0)).squeeze(0),
     )
 
     q_batch_indices = torch.tensor([0, 0, 0, 1, 1], dtype=torch.int32)
@@ -117,7 +117,7 @@ def _run_reference_smoke(turboquant4) -> None:
     assert torch.isfinite(output).all()
     expected_outputs = []
     for query_idx, (batch_idx, query_pos) in enumerate(
-        zip(q_batch_indices.tolist(), query_positions.tolist())
+        zip(q_batch_indices.tolist(), query_positions.tolist(), strict=True)
     ):
         expected_outputs.append(
             turboquant4.turboquant4_attention(
@@ -255,7 +255,7 @@ def _run_native_smoke(turboquant4) -> None:
     q_batch_indices = []
     query_positions = []
     for batch_idx, (seq_len, q_len, block_ids) in enumerate(
-        zip(seq_lens, q_lens, block_ids_per_request)
+        zip(seq_lens, q_lens, block_ids_per_request, strict=True)
     ):
         k = torch.randn(seq_len, num_kv_heads, head_dim, device=device)
         v = torch.randn(seq_len, num_kv_heads, head_dim, device=device)

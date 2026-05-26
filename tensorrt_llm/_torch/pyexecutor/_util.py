@@ -1291,6 +1291,10 @@ def _create_kv_cache_manager(
             raise ValueError(
                 "TurboQuant4 KV cache is not supported with sliding-window attention."
             )
+        if spec_config is not None:
+            raise ValueError(
+                "TurboQuant4 KV cache is not supported with speculative decoding."
+            )
         if mapping.cp_size != 1 or bool(mapping.cp_config):
             raise ValueError(
                 "TurboQuant4 KV cache is not supported with context parallelism."

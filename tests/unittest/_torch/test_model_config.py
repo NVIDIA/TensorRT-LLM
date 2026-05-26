@@ -10,6 +10,7 @@ from tensorrt_llm._torch.pyexecutor.model_loader import (
 )
 from tensorrt_llm.llmapi import KvCacheConfig
 from tensorrt_llm.llmapi.llm_args import (CacheTransceiverConfig,
+                                          CudaGraphConfig,
                                           NGramDecodingConfig, TorchLlmArgs)
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
@@ -132,6 +133,12 @@ def test_validate_and_set_kv_cache_quant_rejects_invalid_dtype():
         validate_and_set_kv_cache_quant(model_config, "invalid_dtype")
 
 
+def test_validate_and_set_kv_cache_quant_accepts_dense_dtype():
+    model_config = _make_model_config_with_kv_quant(QuantAlgo.FP8)
+    validate_and_set_kv_cache_quant(model_config, "float16")
+    assert model_config.quant_config.kv_cache_quant_algo is None
+
+
 def test_sync_loaded_turboquant4_kv_cache_config_rewrites_loaded_config(tmp_path):
     model_config = ModelConfig(
         quant_config=QuantConfig(kv_cache_quant_algo=QuantAlgo.TURBOQUANT4),
@@ -143,6 +150,7 @@ def test_sync_loaded_turboquant4_kv_cache_config_rewrites_loaded_config(tmp_path
         model=str(tmp_path),
         attn_backend="FLASHINFER",
         kv_cache_config=KvCacheConfig(dtype="auto"),
+        cuda_graph_config=CudaGraphConfig(batch_sizes=[1]),
     )
 
     assert sync_loaded_turboquant4_kv_cache_config(llm_args, model_config)

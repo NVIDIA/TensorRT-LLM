@@ -315,11 +315,13 @@ def _register_fake():
             raise RuntimeError(
                 "TurboQuant4 cache tokens_per_block mismatch.")
 
-    def _check_turboquant4_block_capacity(block_ids: torch.Tensor,
-                                          seq_len: int,
-                                          tokens_per_block: int) -> None:
-        if not isinstance(seq_len, int) or not isinstance(block_ids.shape[-1],
-                                                         int):
+    def _check_turboquant4_block_capacity(
+        block_ids: torch.Tensor,
+        seq_len: int,
+        tokens_per_block: int,
+    ) -> None:
+        if (not isinstance(seq_len, int)
+                or not isinstance(block_ids.shape[-1], int)):
             return
         required_blocks = ((seq_len + tokens_per_block - 1) //
                            tokens_per_block if seq_len > 0 else 0)
@@ -365,18 +367,18 @@ def _register_fake():
                 "TurboQuant4 attention requires key and value cache entries.")
 
     @torch.library.register_fake("trtllm::turboquant4_quantize")
-    def _(input: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        if input.dim() < 1:
+    def _(tensor: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        if tensor.dim() < 1:
             raise RuntimeError(
                 "TurboQuant4 input must have at least one dimension.")
-        _check_turboquant4_activation_dtype(input.dtype, "quantize")
-        _check_turboquant4_head_dim(input.shape[-1])
-        code_shape = list(input.shape)
+        _check_turboquant4_activation_dtype(tensor.dtype, "quantize")
+        _check_turboquant4_head_dim(tensor.shape[-1])
+        code_shape = list(tensor.shape)
         code_shape[-1] = code_shape[-1] // 2
-        scale_shape = list(input.shape)
+        scale_shape = list(tensor.shape)
         scale_shape[-1] = 1
-        return (input.new_empty(code_shape, dtype=torch.uint8),
-                input.new_empty(scale_shape, dtype=torch.float32))
+        return (tensor.new_empty(code_shape, dtype=torch.uint8),
+                tensor.new_empty(scale_shape, dtype=torch.float32))
 
     @torch.library.register_fake("trtllm::turboquant4_dequantize")
     def _(codes: torch.Tensor,
@@ -406,11 +408,11 @@ def _register_fake():
         return codes.new_empty(output_shape, dtype=dtype)
 
     @torch.library.register_fake("trtllm::turboquant4_update_cache")
-    def _(input: torch.Tensor, cache: torch.Tensor, scales: torch.Tensor,
+    def _(tensor: torch.Tensor, cache: torch.Tensor, scales: torch.Tensor,
           block_ids: torch.Tensor, kv_index: int, start_pos: int,
           tokens_per_block: int) -> None:
-        _check_turboquant4_activation_dtype(input.dtype, "cache update")
-        if input.dim() != 3:
+        _check_turboquant4_activation_dtype(tensor.dtype, "cache update")
+        if tensor.dim() != 3:
             raise RuntimeError(
                 "TurboQuant4 cache update input must have shape [seq_len, heads, head_dim]."
             )
@@ -423,15 +425,15 @@ def _register_fake():
             cache, scales, block_ids, batched_block_ids=False, require_kv=False)
         _check_turboquant4_kv_index(kv_index, cache.shape[1])
         _check_turboquant4_tokens_per_block(cache, tokens_per_block)
-        _check_turboquant4_head_dim(input.shape[2])
-        if isinstance(input.shape[0], int):
+        _check_turboquant4_head_dim(tensor.shape[2])
+        if isinstance(tensor.shape[0], int):
             _check_turboquant4_block_capacity(
-                block_ids, start_pos + input.shape[0], tokens_per_block)
+                block_ids, start_pos + tensor.shape[0], tokens_per_block)
         _check_turboquant4_same_static_dim(
-            input.shape[1], cache.shape[3],
+            tensor.shape[1], cache.shape[3],
             "TurboQuant4 cache head count mismatch.")
         _check_turboquant4_same_static_dim(
-            input.shape[2], cache.shape[4] * 2,
+            tensor.shape[2], cache.shape[4] * 2,
             "TurboQuant4 cache head_dim mismatch.")
         return None
 
@@ -456,7 +458,7 @@ def _register_fake():
                                           tokens_per_block)
         dtype = _check_turboquant4_output_dtype(output_dtype)
         _check_turboquant4_head_dim(cache.shape[4] * 2)
-        output_shape = [1, seq_len, cache.shape[3], cache.shape[4] * 2]
+        output_shape = [seq_len, cache.shape[3], cache.shape[4] * 2]
         return cache.new_empty(output_shape, dtype=dtype)
 
     @torch.library.register_fake("trtllm::turboquant4_attention")

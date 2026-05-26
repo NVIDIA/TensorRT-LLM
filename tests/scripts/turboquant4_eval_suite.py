@@ -86,7 +86,10 @@ def _run_step(step: Step, env: dict[str, str]) -> StepResult:
     output = None
     if step.output_json is not None and step.output_json.exists():
         with step.output_json.open() as f:
-            output = json.load(f)
+            try:
+                output = json.load(f)
+            except json.JSONDecodeError:
+                output = None
     passed = process.returncode == 0
     if step.output_json is not None:
         passed = passed and output is not None and output.get("passed") is True

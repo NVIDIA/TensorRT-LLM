@@ -47,6 +47,7 @@ from tensorrt_llm._torch.pyexecutor._util import (
     get_kv_cache_manager_cls,
 )
 from tensorrt_llm._torch.pyexecutor.mamba_cache_manager import MambaHybridCacheManager
+from tensorrt_llm._torch.pyexecutor.model_engine import PyTorchModelEngine
 from tensorrt_llm._torch.pyexecutor.resource_manager import (
     CacheTypeCpp,
     DataType,
@@ -274,6 +275,12 @@ class TestTurboQuant4KVCacheManagerV2Buffers:
         assert value_cache.dtype == torch.uint8
         assert value_cache.shape == (4, 4, 3, 64)
 
+    def test_get_buffers_rejects_turboquant4(self):
+        manager = self._manager()
+
+        with pytest.raises(ValueError, match="asymmetric key/value buffers"):
+            manager.get_buffers(0)
+
     def test_get_num_free_blocks_uses_key_block_count(self):
         manager = self._manager()
 
@@ -314,6 +321,19 @@ class TestTurboQuant4KVCacheManagerV2Buffers:
                 SimpleNamespace(dtype="turboquant4"),
                 CacheTypeCpp.SELFKONLY,
             )
+
+    @pytest.mark.parametrize("torch_dtype", [torch.float32, "float32"])
+    def test_model_engine_turboquant4_kv_byte_size_uses_model_dtype(
+            self, torch_dtype):
+        engine = PyTorchModelEngine.__new__(PyTorchModelEngine)
+        engine.model = SimpleNamespace(
+            config=SimpleNamespace(torch_dtype=torch_dtype),
+            model_config=SimpleNamespace(
+                quant_config=QuantConfig(
+                    kv_cache_quant_algo=QuantAlgo.TURBOQUANT4)),
+        )
+
+        assert engine.get_kv_cache_dtype_byte_size() == 4
 
 
 class _FakeModelConfig:
@@ -1078,7 +1098,7 @@ class TestQuantizeDequantize:
             cached = torch.ops.trtllm.turboquant4_dequantize_cache(
                 cache, scale_cache, block_ids[0], 0, 7, 4, torch.float32
             )
-            assert cached.shape == (1, 7, 2, 128)
+            assert cached.shape == (7, 2, 128)
             assert cached.dtype == torch.float32
 
             single_out = torch.ops.trtllm.turboquant4_attention(
@@ -1321,7 +1341,9 @@ class TestPackedCache:
         torch.testing.assert_close(codes[2, 1, :3], expected_codes[0, 1:])
         torch.testing.assert_close(scales[0, 1, 2:], expected_scales[0, :1])
         torch.testing.assert_close(scales[2, 1, :3], expected_scales[0, 1:])
-        torch.testing.assert_close(result[:, 2:], turboquant4_quantize_dequantize(x.unsqueeze(0)))
+        torch.testing.assert_close(
+            result[2:],
+            turboquant4_quantize_dequantize(x.unsqueeze(0)).squeeze(0))
 
     def test_cache_helpers_validate_shape_contract(self):
         codes = torch.zeros(1, 2, 4, 2, 64, dtype=torch.uint8)
@@ -1570,10 +1592,10 @@ class TestPackedCache:
 
         key_states = turboquant4_dequantize_cache(
             codes, scales, block_ids, 0, 3, tokens_per_block, q.dtype
-        ).transpose(1, 2)
+        ).unsqueeze(0).transpose(1, 2)
         value_states = turboquant4_dequantize_cache(
             codes, scales, block_ids, 1, 3, tokens_per_block, q.dtype
-        ).transpose(1, 2)
+        ).unsqueeze(0).transpose(1, 2)
         key_states = repeat_kv(key_states, num_heads // num_kv_heads)
         value_states = repeat_kv(value_states, num_heads // num_kv_heads)
         expected = (
@@ -1619,10 +1641,10 @@ class TestPackedCache:
 
         key_states = turboquant4_dequantize_cache(
             codes, scales, block_ids, 0, seq_len, tokens_per_block, q.dtype
-        ).transpose(1, 2)
+        ).unsqueeze(0).transpose(1, 2)
         value_states = turboquant4_dequantize_cache(
             codes, scales, block_ids, 1, seq_len, tokens_per_block, q.dtype
-        ).transpose(1, 2)
+        ).unsqueeze(0).transpose(1, 2)
         key_states = repeat_kv(key_states, num_heads // num_kv_heads)
         value_states = repeat_kv(value_states, num_heads // num_kv_heads)
         allowed = torch.tensor([[[[False, False, False, True, True, True]]]])
@@ -2852,7 +2874,8 @@ class TestTrtllmPackedCache:
             key_cache, value_cache, value_scales, [0]
         )
         attention = self._make_attention(num_heads, num_kv_heads, head_dim)
-        attention.pos_embd_params = SimpleNamespace(type=SimpleNamespace(is_mrope=lambda: True))
+        attention.pos_embd_params = SimpleNamespace(
+            type=SimpleNamespace(is_mrope=lambda: True, is_rope=lambda: True))
         metadata = SimpleNamespace(
             beam_width=1,
             enable_helix=False,
@@ -2942,7 +2965,7 @@ class TestTrtllmPackedCache:
         attention.pos_embd_params = SimpleNamespace(
             rope=rope,
             is_neox=True,
-            type=SimpleNamespace(is_mrope=lambda: False),
+            type=SimpleNamespace(is_mrope=lambda: False, is_rope=lambda: True),
         )
         monkeypatch.setattr(trtllm_backend, "RotaryEmbedding",
                             FakeRotaryEmbedding)
@@ -2954,6 +2977,14 @@ class TestTrtllmPackedCache:
         assert isinstance(rotary_emb, FakeRotaryEmbedding)
         assert attention._get_turboquant4_rotary_emb() is rotary_emb
         assert calls == [(rope, 128, True)]
+
+    def test_turboquant4_rotary_embedding_rejects_non_rope(self):
+        attention = self._make_attention(head_dim=128)
+        attention.pos_embd_params = SimpleNamespace(
+            type=SimpleNamespace(is_mrope=lambda: False, is_rope=lambda: False))
+
+        with pytest.raises(NotImplementedError, match="RoPE positional"):
+            attention._get_turboquant4_rotary_emb()
 
     def test_trtllm_forward_intercepts_before_fused_attention(self):
         num_heads = 4
@@ -2997,6 +3028,32 @@ class TestTrtllmPackedCache:
 
         assert result is sentinel
         assert seen["mrope_config"] is not None
+
+    def test_trtllm_forward_rejects_turboquant4_quantized_output(self):
+        num_heads = 4
+        num_kv_heads = 2
+        head_dim = 128
+        attention = self._make_attention(num_heads, num_kv_heads, head_dim)
+        attention.has_turboquant4_kv_cache = True
+        attention.wrapper = SimpleNamespace()
+
+        metadata = TrtllmAttentionMetadata.__new__(TrtllmAttentionMetadata)
+        metadata._seq_lens = torch.tensor([1], dtype=torch.int32)
+        metadata._seq_lens_kv = None
+        metadata.runtime_features = None
+
+        with pytest.raises(NotImplementedError, match="quantized attention output"):
+            attention.forward(
+                torch.randn(1, num_heads * head_dim),
+                None,
+                None,
+                metadata,
+                output=None,
+                output_sf=None,
+                out_scale=torch.ones(1),
+                attention_mask=PredefinedAttentionMask.CAUSAL,
+                attention_input_type=AttentionInputType.context_only,
+            )
 
     def test_trtllm_gen_support_probe_rejects_turboquant4(self):
         supported, reason = trtllm_gen.is_supported(

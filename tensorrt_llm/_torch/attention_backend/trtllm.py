@@ -1106,8 +1106,8 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             return None
         if not pos_embd_params.type.is_rope():
             raise NotImplementedError(
-                "TurboQuant4 TRTLLM fallback only supports RoPE positional "
-                f"embeddings, got {pos_embd_params.type}.")
+                "TurboQuant4 TRTLLM fallback supports RoPE positional "
+                f"embeddings only, got {pos_embd_params.type}.")
         if pos_embd_params.type.is_mrope():
             self.turboquant4_rotary_emb = MRotaryEmbedding(
                 pos_embd_params.rope,

@@ -9,6 +9,8 @@ from tensorrt_llm.llmapi import KvCacheConfig
 from tensorrt_llm.llmapi.llm_args import (
     AttentionDpConfig,
     CacheTransceiverConfig,
+    CpConfig,
+    CudaGraphConfig,
     KvCacheConnectorConfig,
     NGramDecodingConfig,
     RocketSparseAttentionConfig,
@@ -100,6 +102,18 @@ def test_torch_llm_args_syncs_nvfp4_kv_cache_dtype(tmp_path):
 
 def test_torch_llm_args_syncs_turboquant4_kv_cache_dtype(tmp_path):
     llm_args = TorchLlmArgs(model=str(tmp_path), kv_cache_config=KvCacheConfig(dtype="turboquant4"))
+    assert llm_args.quant_config.kv_cache_quant_algo == QuantAlgo.TURBOQUANT4
+    assert llm_args.attn_backend == "TRTLLM"
+    assert llm_args.kv_cache_config.use_kv_cache_manager_v2
+    assert llm_args.cuda_graph_config is None
+    assert llm_args.torch_compile_config is None
+    assert not llm_args.kv_cache_config.enable_block_reuse
+
+    llm_args = TorchLlmArgs(
+        model=str(tmp_path),
+        kv_cache_config=KvCacheConfig(dtype="turboquant4"),
+        cuda_graph_config=CudaGraphConfig(batch_sizes=[1]),
+    )
     assert llm_args.quant_config.kv_cache_quant_algo == QuantAlgo.TURBOQUANT4
     assert llm_args.attn_backend == "TRTLLM"
     assert llm_args.kv_cache_config.use_kv_cache_manager_v2
@@ -264,6 +278,15 @@ def test_torch_llm_args_rejects_turboquant4_context_parallelism(tmp_path):
             model=str(tmp_path),
             kv_cache_config=KvCacheConfig(dtype="turboquant4"),
             context_parallel_size=2,
+        )
+
+
+def test_torch_llm_args_rejects_turboquant4_cp_config(tmp_path):
+    with pytest.raises(ValueError, match="context parallelism"):
+        TorchLlmArgs(
+            model=str(tmp_path),
+            kv_cache_config=KvCacheConfig(dtype="turboquant4"),
+            cp_config=CpConfig(),
         )
 
 

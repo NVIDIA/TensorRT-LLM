@@ -474,7 +474,10 @@ class VanillaAttention(AttentionBackend[VanillaAttentionMetadata]):
             scale_cache_indices = metadata.kv_cache_manager.get_batch_cache_indices_for_role(
                 metadata.request_ids, self.layer_idx, Role.VALUE_BLOCK_SCALE)
             cache_indices = list(
-                zip(key_cache_indices, value_cache_indices, scale_cache_indices))
+                zip(key_cache_indices,
+                    value_cache_indices,
+                    scale_cache_indices,
+                    strict=True))
         else:
             cache_indices = [
                 block_ids[0] for block_ids in metadata.block_ids_per_seq

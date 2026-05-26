@@ -785,8 +785,10 @@ class Runner:
         kv_cache_quant_algo = model_config.quant_config.kv_cache_quant_algo
         kv_cache_quant_algo_value = getattr(kv_cache_quant_algo, "value",
                                             kv_cache_quant_algo)
+        if isinstance(kv_cache_quant_algo_value, str):
+            kv_cache_quant_algo_value = kv_cache_quant_algo_value.upper()
         if (isinstance(kv_cache_quant_algo_value, str)
-                and kv_cache_quant_algo_value.upper() == "TURBOQUANT4"):
+                and kv_cache_quant_algo_value == "TURBOQUANT4"):
             raise ValueError(
                 "TurboQuant4 KV cache is not supported by layer-wise benchmarks "
                 "because the tool does not allocate packed KV scale buffers."
@@ -795,7 +797,7 @@ class Runner:
             "FP8": tensorrt_llm.bindings.DataType.FP8,
             "NVFP4": tensorrt_llm.bindings.DataType.NVFP4,
             None: torch_dtype_to_binding(config.torch_dtype),
-        }[kv_cache_quant_algo]
+        }[kv_cache_quant_algo_value]
         if is_mla(config):
             layer_mask = [i in layer_indices for i in range(config.num_hidden_layers)]
             num_layers = sum(layer_mask)

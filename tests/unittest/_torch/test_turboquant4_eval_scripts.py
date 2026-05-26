@@ -440,6 +440,27 @@ def test_eval_suite_run_step_does_not_reuse_stale_output_json(tmp_path):
     assert not output_json.exists()
 
 
+def test_eval_suite_run_step_marks_malformed_output_json_failed(tmp_path):
+    suite = _load_script("turboquant4_eval_suite.py")
+    output_json = tmp_path / "malformed.json"
+    step = suite.Step(
+        name="malformed_output",
+        category="proxy",
+        command=[
+            sys.executable,
+            "-c",
+            f"from pathlib import Path; Path({str(output_json)!r}).write_text('{{')",
+        ],
+        output_json=output_json,
+    )
+
+    result = suite._run_step(step, {})
+
+    assert result.returncode == 0
+    assert not result.passed
+    assert result.output is None
+
+
 def test_eval_suite_forwards_custom_eval_files_and_thresholds(tmp_path):
     suite = _load_script("turboquant4_eval_suite.py")
     text_file = tmp_path / "texts.jsonl"

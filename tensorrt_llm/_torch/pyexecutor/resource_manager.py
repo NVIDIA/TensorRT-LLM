@@ -3249,10 +3249,14 @@ class KVCacheManagerV2(BaseResourceManager):
         index_scale = self.impl.get_page_index_scale(layer_offset, data_role)
         res = []
         for req_id in request_ids:
+            base_page_indices = self.kv_cache_map[req_id].get_base_page_indices(
+                pool_id)
+            if hasattr(base_page_indices, "tolist"):
+                base_page_indices = base_page_indices.tolist()
             res.append([
-                idx * index_scale if idx != BAD_PAGE_INDEX else BAD_PAGE_INDEX
-                for idx in self.kv_cache_map[req_id].get_base_page_indices(
-                    pool_id)
+                index * index_scale
+                if index != BAD_PAGE_INDEX else BAD_PAGE_INDEX
+                for index in base_page_indices
             ])
         return res
 

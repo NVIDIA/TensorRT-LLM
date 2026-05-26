@@ -38,7 +38,7 @@ _KV_CACHE_MAP = {
     "float16": None,
     "float32": None,
     "bfloat16": None,
-    "auto": "auto"
+    "auto": "auto",
 }
 _VALID_KV_CACHE_DTYPES = tuple(_KV_CACHE_MAP)
 
@@ -167,8 +167,9 @@ def validate_and_set_mamba_ssm_cache_dtype(
     config.quant_config.mamba_ssm_philox_rounds = mamba_ssm_philox_rounds
 
 
-def validate_and_set_kv_cache_quant(model_config: ModelConfig,
-                                    pyt_kv_cache_dtype: str) -> QuantAlgo:
+def validate_and_set_kv_cache_quant(
+        model_config: ModelConfig,
+        pyt_kv_cache_dtype: str) -> Optional[QuantAlgo]:
     logger.info(
         f'Validating KV Cache config against kv_cache_dtype="{pyt_kv_cache_dtype}"'
     )

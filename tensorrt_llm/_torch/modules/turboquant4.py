@@ -591,10 +591,10 @@ def turboquant4_dequantize_cache(
     if not code_chunks:
         num_kv_heads = kv_cache_tensor.shape[-2]
         head_dim = kv_cache_tensor.shape[-1] * 2
-        return kv_cache_tensor.new_empty((1, 0, num_kv_heads, head_dim), dtype=dtype)
+        return kv_cache_tensor.new_empty((0, num_kv_heads, head_dim), dtype=dtype)
 
-    codes = torch.cat(code_chunks, dim=0).unsqueeze(0)
-    scales = torch.cat(scale_chunks, dim=0).unsqueeze(0)
+    codes = torch.cat(code_chunks, dim=0)
+    scales = torch.cat(scale_chunks, dim=0)
     return turboquant4_dequantize(codes, scales, dtype=dtype)
 
 
@@ -1209,10 +1209,10 @@ def turboquant4_attention(
 
     key_states = turboquant4_dequantize_cache(
         kv_cache_tensor, kv_cache_scales, block_ids, 0, seq_len, tokens_per_block, q.dtype
-    )
+    ).unsqueeze(0)
     value_states = turboquant4_dequantize_cache(
         kv_cache_tensor, kv_cache_scales, block_ids, 1, seq_len, tokens_per_block, q.dtype
-    )
+    ).unsqueeze(0)
     q_states = q.unsqueeze(0).transpose(1, 2)
     key_states = key_states.transpose(1, 2).to(q.dtype)
     value_states = value_states.transpose(1, 2).to(q.dtype)

@@ -225,7 +225,7 @@ def _quantize_past_key_values(
                 raise TypeError(
                     "TurboQuant4 HF cache eval cannot find keys/values on "
                     f"cache layer {layer_index}."
-            )
+                )
             _validate_cache_head_dim(key, layer_index)
             start = previous_seq_lens[layer_index] if previous_seq_lens else 0
             layer_cache.keys = _quantize_cache_slice_if_enabled(
@@ -349,7 +349,8 @@ def _compare_outputs(
     turbo_outputs: list[OutputRecord],
 ) -> tuple[list[PromptRecord], dict[str, Any]]:
     records = []
-    for prompt, baseline, turbo in zip(prompts, baseline_outputs, turbo_outputs):
+    for prompt, baseline, turbo in zip(
+            prompts, baseline_outputs, turbo_outputs, strict=True):
         max_text_len = max(len(baseline.text), len(turbo.text), 1)
         normalized_text_distance = _levenshtein_distance(baseline.text, turbo.text) / max_text_len
         reference_regressed = bool(

@@ -1295,7 +1295,7 @@ at::Tensor turboquant4_dequantize_cache(at::Tensor const& cache, at::Tensor cons
     checkTurboQuant4BlockIds(blockIds, blockCount, cache.sizes()[0]);
 
     auto dtype = outputDtype.value_or(at::ScalarType::Half);
-    at::Tensor output = at::detail::empty_cuda({1, seqLen, numHeads, headDim}, dtype, cache.device(), std::nullopt);
+    at::Tensor output = at::detail::empty_cuda({seqLen, numHeads, headDim}, dtype, cache.device(), std::nullopt);
 
     int64_t const numVectors = seqLen * numHeads;
     checkTurboQuant4VectorCount(numVectors);
