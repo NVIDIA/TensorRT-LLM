@@ -125,7 +125,7 @@ def _make_model_config(tp_size=1, ulysses_size=1, backend="VANILLA"):
     config = DiffusionModelConfig(
         pretrained_config=None,
         quant_config=QuantConfig(),
-        torch_compile=TorchCompileConfig(enable_torch_compile=False),
+        torch_compile=TorchCompileConfig(enable=False),
         attention=AttentionConfig(backend=backend),
         visual_gen_mapping=vgm,
         cache=None,
