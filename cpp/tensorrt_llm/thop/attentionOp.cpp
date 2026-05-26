@@ -913,10 +913,9 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
     int64_t const num_kv_heads, int64_t const head_size, std::optional<int64_t> const tokens_per_block,
     int64_t const max_num_requests, int64_t const max_context_length, int64_t const attention_window_size,
     int64_t const beam_width, int64_t const mask_type, int64_t const quant_mode, double const q_scaling,
-    int64_t const position_embedding_type, int64_t const rotary_embedding_dim, double const rotary_embedding_base,
-    int64_t const rotary_embedding_scale_type, double const rotary_embedding_scale,
-    double const rotary_embedding_short_m_scale, double const rotary_embedding_long_m_scale,
-    int64_t const rotary_embedding_max_positions, int64_t const rotary_embedding_original_max_positions,
+    int64_t const position_embedding_type, int64_t const rope_dim, double const rope_base,
+    int64_t const rope_scale_type, double const rope_scale, double const rope_short_m_scale,
+    double const rope_long_m_scale, int64_t const rope_max_positions, int64_t const rope_original_max_positions,
     bool const use_paged_context_fmha, std::optional<int64_t> attention_input_type, bool is_mla_enable,
     std::optional<int64_t> chunked_prefill_buffer_batch_size, std::optional<int64_t> q_lora_rank,
     std::optional<int64_t> kv_lora_rank, std::optional<int64_t> qk_nope_head_dim,
@@ -1042,15 +1041,14 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
     op->mQScaling = q_scaling;
     op->mPositionEmbeddingType
         = static_cast<tensorrt_llm::kernels::PositionEmbeddingType>(int8_t(position_embedding_type));
-    op->mRotaryEmbeddingDim = rotary_embedding_dim;
-    op->mRotaryEmbeddingBase = rotary_embedding_base;
-    op->mRotaryEmbeddingScaleType
-        = static_cast<tensorrt_llm::kernels::RotaryScalingType>(int8_t(rotary_embedding_scale_type));
-    op->mRotaryEmbeddingScale = rotary_embedding_scale;
-    op->mRotaryEmbeddingShortMscale = rotary_embedding_short_m_scale;
-    op->mRotaryEmbeddingLongMscale = rotary_embedding_long_m_scale;
-    op->mRotaryEmbeddingMaxPositions = rotary_embedding_max_positions;
-    op->mRotaryEmbeddingOriginalMaxPositions = rotary_embedding_original_max_positions;
+    op->mRotaryEmbeddingDim = rope_dim;
+    op->mRotaryEmbeddingBase = rope_base;
+    op->mRotaryEmbeddingScaleType = static_cast<tensorrt_llm::kernels::RotaryScalingType>(int8_t(rope_scale_type));
+    op->mRotaryEmbeddingScale = rope_scale;
+    op->mRotaryEmbeddingShortMscale = rope_short_m_scale;
+    op->mRotaryEmbeddingLongMscale = rope_long_m_scale;
+    op->mRotaryEmbeddingMaxPositions = rope_max_positions;
+    op->mRotaryEmbeddingOriginalMaxPositions = rope_original_max_positions;
     op->mFP8ContextFMHA = is_fp8_out || is_fp4_out || (op->mKVCacheQuantMode.hasFp8KvCache() && use_paged_context_fmha)
         || use_sage_attn;
     // SageAttention block sizes and quantization mode.
