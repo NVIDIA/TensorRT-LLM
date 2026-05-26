@@ -102,6 +102,11 @@ class Attention(nn.Module):
         self.q_dim = self.num_attention_heads * self.head_dim
         self.kv_dim = self.num_key_value_heads * self.head_dim
 
+        self.local_num_attention_heads = self.num_attention_heads // self.mapping.tp_size
+        self.local_num_key_value_heads = self.num_key_value_heads // self.mapping.tp_size
+        self.local_q_dim = self.local_num_attention_heads * self.head_dim
+        self.local_kv_dim = self.local_num_key_value_heads * self.head_dim
+
         self._init_qkv_proj()
 
         attention_metadata_state = getattr(config, "attention_metadata_state", None)
@@ -159,11 +164,11 @@ class Attention(nn.Module):
         # Ulysses shards heads across workers; inner backend sees sharded count
         # Attention2D gathers sequence (not heads); inner backend sees full count
         if use_ulysses:
-            backend_num_heads = self.num_attention_heads // ulysses_size
-            backend_num_kv_heads = self.num_key_value_heads // ulysses_size
+            backend_num_heads = self.local_num_attention_heads // ulysses_size
+            backend_num_kv_heads = self.local_num_key_value_heads // ulysses_size
         else:
-            backend_num_heads = self.num_attention_heads
-            backend_num_kv_heads = self.num_key_value_heads
+            backend_num_heads = self.local_num_attention_heads
+            backend_num_kv_heads = self.local_num_key_value_heads
 
         # Resolve sparse attention config for TRTLLM backend
         sparse_attention_config = None
@@ -180,19 +185,6 @@ class Attention(nn.Module):
                 sparse_attention_config = SkipSoftmaxAttentionConfig(
                     threshold_scale_factor={"prefill": threshold, "decode": 0}
                 )
-
-        if tp_size > 1:
-            assert backend_num_heads % tp_size == 0
-            backend_num_heads = backend_num_heads // tp_size
-
-            assert backend_num_kv_heads % tp_size == 0
-            backend_num_kv_heads = backend_num_kv_heads // tp_size
-
-            self.num_attention_heads //= tp_size
-            self.num_key_value_heads //= tp_size
-
-            self.q_dim = self.num_attention_heads * self.head_dim
-            self.kv_dim = self.num_key_value_heads * self.head_dim
 
         # Create compute backend
         self.attn = create_attention(
@@ -234,6 +226,9 @@ class Attention(nn.Module):
 
         if self.qkv_mode == QKVMode.FUSE_QKV:
             qkv_out_dim = self.q_dim + 2 * self.kv_dim
+
+            # Input / Output dims are the full tensor sizes
+            # fused_weight_shard_indices_mapping want indexes for just _this_ shard
             self.qkv_proj = Linear(
                 self.hidden_size,
                 qkv_out_dim,
@@ -247,9 +242,9 @@ class Attention(nn.Module):
                     weight_mode=WeightMode.FUSED_QKV_LINEAR
                 ),
                 fused_weight_shard_indices_mapping={
-                    "q": (0, self.q_dim),
-                    "k": (self.q_dim, self.kv_dim),
-                    "v": (self.q_dim + self.kv_dim, self.kv_dim),
+                    "q": (0, self.local_q_dim),
+                    "k": (self.local_q_dim, self.local_kv_dim),
+                    "v": (self.local_q_dim + self.local_kv_dim, self.local_kv_dim),
                 },
                 tensor_parallel_mode=tp_mode,
                 reduce_output=False,
@@ -299,7 +294,7 @@ class Attention(nn.Module):
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         if self.qkv_mode == QKVMode.FUSE_QKV:
             qkv = self.qkv_proj(hidden_states)
-            q, k, v = qkv.split([self.q_dim, self.kv_dim, self.kv_dim], dim=-1)
+            q, k, v = qkv.split([self.local_q_dim, self.local_kv_dim, self.local_kv_dim], dim=-1)
         else:
             kv_source = (
                 encoder_hidden_states if encoder_hidden_states is not None else hidden_states
@@ -337,6 +332,7 @@ class Attention(nn.Module):
         """
         B, S, D = qkv.shape
         tokens_per_batch = S if num_txt_tokens > 0 else 0
+        assert self.tp_size == 1, "fused_dit_split_norm_rope does not support TP"
         torch.ops.trtllm.fused_dit_qk_norm_rope(
             qkv.view(B * S, D),
             self.num_attention_heads,
@@ -373,6 +369,7 @@ class Attention(nn.Module):
         Caller passes raw cos/sin (any rank); the op reshapes internally.
         """
         B, T, _ = tensor.shape
+        assert self.tp_size == 1, "fused_dit_split_norm_rope does not support TP"
         torch.ops.trtllm.fused_dit_split_norm_rope(
             tensor.view(B * T, -1),
             num_heads,
@@ -396,6 +393,7 @@ class Attention(nn.Module):
         no RoPE -- e.g. LTX-2 text cross-attn (Q-norm with pe=None).
         """
         B, T, _ = tensor.shape
+        assert self.tp_size == 1, "fused_dit_split_norm does not support TP"
         torch.ops.trtllm.fused_dit_split_norm(
             tensor.view(B * T, -1),
             num_heads,
@@ -447,13 +445,19 @@ class Attention(nn.Module):
 
         # Reshape inputs: [B, S, H*D] -> backend's preferred 4D layout
         if backend_layout == AttentionTensorLayout.HND:
-            q = q.view(batch_size, -1, self.num_attention_heads, self.head_dim).transpose(1, 2)
-            k = k.view(batch_size, -1, self.num_key_value_heads, self.head_dim).transpose(1, 2)
-            v = v.view(batch_size, -1, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+            q = q.view(batch_size, -1, self.local_num_attention_heads, self.head_dim).transpose(
+                1, 2
+            )
+            k = k.view(batch_size, -1, self.local_num_key_value_heads, self.head_dim).transpose(
+                1, 2
+            )
+            v = v.view(batch_size, -1, self.local_num_key_value_heads, self.head_dim).transpose(
+                1, 2
+            )
         else:
-            q = q.view(batch_size, -1, self.num_attention_heads, self.head_dim)
-            k = k.view(batch_size, -1, self.num_key_value_heads, self.head_dim)
-            v = v.view(batch_size, -1, self.num_key_value_heads, self.head_dim)
+            q = q.view(batch_size, -1, self.local_num_attention_heads, self.head_dim)
+            k = k.view(batch_size, -1, self.local_num_key_value_heads, self.head_dim)
+            v = v.view(batch_size, -1, self.local_num_key_value_heads, self.head_dim)
 
         kwargs.update(
             {
@@ -498,7 +502,7 @@ class Attention(nn.Module):
             qkv = self.qkv_proj(hidden_states)
             freqs_cos, freqs_sin = freqs
             self.apply_packed_qk_norm_rope(qkv, freqs_cos, freqs_sin)
-            q, k, v = qkv.split([self.q_dim, self.kv_dim, self.kv_dim], dim=-1)
+            q, k, v = qkv.split([self.local_q_dim, self.local_kv_dim, self.local_kv_dim], dim=-1)
             out = self._attn_impl(q, k, v)
             return self.to_out[0](out)
 
@@ -509,8 +513,10 @@ class Attention(nn.Module):
         # Apply RoPE if provided (model handles RoPE, not attention backend)
         if freqs is not None:
             freqs_cos, freqs_sin = freqs
-            q = q.view(batch_size, seq_len, self.num_attention_heads, self.head_dim)  # [B, S, H, D]
-            k = k.view(batch_size, kv_seq_len, self.num_key_value_heads, self.head_dim)
+            q = q.view(
+                batch_size, seq_len, self.local_num_attention_heads, self.head_dim
+            )  # [B, S, H, D]
+            k = k.view(batch_size, kv_seq_len, self.local_num_key_value_heads, self.head_dim)
             q = apply_rotary_emb(q, freqs_cos, freqs_sin)
             k = apply_rotary_emb(k, freqs_cos, freqs_sin)
             q = q.flatten(2)

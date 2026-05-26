@@ -42,13 +42,13 @@ class FluxJointAttnMLPProj(nn.Module):
         config: Optional[DiffusionModelConfig] = None,
     ):
         super().__init__()
-        mapping = config.mapping
-        tp_size = mapping.tp_size
-        self.tp_size = tp_size
+        mapping = config.mapping if config else None
+        self.tp_size = getattr(mapping, "tp_size", 1)
+        self.tp_rank = getattr(mapping, "tp_rank", 0)
         self.attn_dim = attn_dim
         self.has_bias = bias
 
-        if tp_size <= 1:
+        if self.tp_size == 1:
             self.proj = Linear(
                 attn_dim + mlp_dim,
                 out_dim,
@@ -68,7 +68,7 @@ class FluxJointAttnMLPProj(nn.Module):
                 quant_config=quant_config,
                 skip_create_weights_in_init=skip_create_weights_in_init,
                 force_dynamic_quantization=force_dynamic_quantization,
-                mapping=mapping,
+                mapping=config.mapping,
                 tensor_parallel_mode=TensorParallelMode.ROW,
                 reduce_output=False,
             )
@@ -107,7 +107,7 @@ class FluxJointAttnMLPProj(nn.Module):
             if callable(getattr(sub, "create_weights", None)):
                 sub.create_weights()
 
-        if self.tp_size <= 1:
+        if self.tp_size == 1:
             loader.load_linear_weights(self.proj, "proj_out", [weight_dict])
         else:
             W = weight_dict["weight"]  # [out_dim, attn_dim + mlp_dim]
@@ -151,11 +151,8 @@ class FluxJointQKVMLPProj(nn.Module):
         mapping: Optional[Mapping] = None,
     ):
         super().__init__()
-        if mapping is None:
-            mapping = Mapping()
 
-        tp_size = mapping.tp_size
-        self.tp_size = tp_size
+        self.tp_size = mapping.tp_size if mapping else 1
 
         # Store full (pre-TP) dims for weight loading (splitting checkpoint weight)
         self.full_q_dim = q_dim
@@ -164,7 +161,7 @@ class FluxJointQKVMLPProj(nn.Module):
         self.full_mlp_dim = mlp_dim
         self.mlp_hidden_dim = mlp_dim // 2  # single gate or up dim
 
-        if tp_size <= 1:
+        if self.tp_size == 1:
             self.proj = Linear(
                 in_dim,
                 q_dim + 2 * kv_dim + mlp_dim,
@@ -219,12 +216,12 @@ class FluxJointQKVMLPProj(nn.Module):
                 tensor_parallel_mode=TensorParallelMode.COLUMN,
                 reduce_output=False,
             )
-            self.local_qkv_dim = (q_dim + 2 * kv_dim) // tp_size
-            self.local_mlp_dim = mlp_dim // tp_size
+            self.local_qkv_dim = (q_dim + 2 * kv_dim) // self.tp_size
+            self.local_mlp_dim = mlp_dim // self.tp_size
 
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """Returns (qkv, mlp_gate_up) with local (post-TP) sizes."""
-        if self.tp_size <= 1:
+        if self.tp_size == 1:
             out = self.proj(x)
             return out.split([self.local_qkv_dim, self.local_mlp_dim], dim=-1)
         return self.qkv_proj(x), self.mlp_proj(x)
@@ -243,7 +240,7 @@ class FluxJointQKVMLPProj(nn.Module):
             if callable(getattr(sub, "create_weights", None)):
                 sub.create_weights()
 
-        if self.tp_size <= 1:
+        if self.tp_size == 1:
             loader.load_linear_weights(self.proj, "to_qkv_mlp_proj", [weight_dict])
             return
 

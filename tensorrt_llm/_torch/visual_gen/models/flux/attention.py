@@ -81,12 +81,9 @@ class FluxJointAttention(Attention):
 
         # Text-stream projections for joint attention (dual-stream blocks only)
         if added_kv_proj_dim is not None:
-            # Use full (pre-TP) q_dim: after super().__init__(), self.q_dim is
-            # already divided by tp_size, but COLUMN mode will divide again.
-            full_q_dim = num_attention_heads * head_dim
             self.add_qkv_proj = Linear(
                 added_kv_proj_dim,
-                3 * full_q_dim,
+                self.q_dim + 2 * self.kv_dim,
                 bias=self.bias,
                 dtype=self.dtype,
                 quant_config=self.quant_config,
@@ -96,9 +93,9 @@ class FluxJointAttention(Attention):
                     weight_mode=WeightMode.FUSED_QKV_LINEAR
                 ),
                 fused_weight_shard_indices_mapping={
-                    "q": (0, full_q_dim),
-                    "k": (full_q_dim, full_q_dim),
-                    "v": (2 * full_q_dim, full_q_dim),
+                    "q": (0, self.local_q_dim),
+                    "k": (self.local_q_dim, self.local_kv_dim),
+                    "v": (self.local_q_dim + self.local_kv_dim, self.local_kv_dim),
                 },
                 mapping=config.mapping,
                 tensor_parallel_mode=TensorParallelMode.COLUMN,
@@ -121,7 +118,7 @@ class FluxJointAttention(Attention):
             )
 
             self.to_add_out = Linear(
-                full_q_dim,
+                self.kv_dim,
                 added_kv_proj_dim,
                 bias=self.bias,
                 dtype=self.dtype,
@@ -169,18 +166,18 @@ class FluxJointAttention(Attention):
         is_dual_stream = encoder_hidden_states is not None and self.added_kv_proj_dim is not None
 
         query, key, value = self.get_qkv(hidden_states)
-        query = query.view(batch_size, -1, self.num_attention_heads, self.head_dim)
-        key = key.view(batch_size, -1, self.num_attention_heads, self.head_dim)
-        value = value.view(batch_size, -1, self.num_attention_heads, self.head_dim)
+        query = query.view(batch_size, -1, self.local_num_attention_heads, self.head_dim)
+        key = key.view(batch_size, -1, self.local_num_attention_heads, self.head_dim)
+        value = value.view(batch_size, -1, self.local_num_attention_heads, self.head_dim)
 
         query, key = self.apply_qk_norm(query, key)
 
         if is_dual_stream:
             encoder_qkv = self.add_qkv_proj(encoder_hidden_states)
             enc_q, enc_k, enc_v = encoder_qkv.chunk(3, dim=-1)
-            enc_q = enc_q.view(batch_size, -1, self.num_attention_heads, self.head_dim)
-            enc_k = enc_k.view(batch_size, -1, self.num_attention_heads, self.head_dim)
-            enc_v = enc_v.view(batch_size, -1, self.num_attention_heads, self.head_dim)
+            enc_q = enc_q.view(batch_size, -1, self.local_num_attention_heads, self.head_dim)
+            enc_k = enc_k.view(batch_size, -1, self.local_num_attention_heads, self.head_dim)
+            enc_v = enc_v.view(batch_size, -1, self.local_num_attention_heads, self.head_dim)
 
             enc_q, enc_k = self.apply_qk_added_norm(enc_q, enc_k)
 
@@ -228,7 +225,9 @@ class FluxJointAttention(Attention):
             k_add_weight=k_add,
         )
 
-        query, key, value = qkv.split([self.q_dim, self.kv_dim, self.kv_dim], dim=-1)
+        query, key, value = qkv.split(
+            [self.local_q_dim, self.local_kv_dim, self.local_kv_dim], dim=-1
+        )
         return query, key, value
 
     def _prepare_qkv(
@@ -303,13 +302,6 @@ class Flux2ParallelSelfAttention(FluxJointAttention):
     This is a key architectural difference from FLUX.1:
     - FLUX.1: Separate attention and FFN
     - FLUX.2: Fused QKV+MLP projection for efficiency
-
-    Dimension lifecycle (important for TP correctness):
-    - Before super().__init__(): q_dim/kv_dim/mlp_hidden_dim are FULL (pre-TP)
-    - _init_qkv_proj() is called during super().__init__() with FULL dims
-    - After super().__init__(): q_dim/kv_dim are LOCAL (divided by tp_size)
-    - We divide mlp_hidden_dim to match, then construct to_out with FULL dims
-      (FluxJointAttnMLPProj uses ROW parallel which divides internally)
     """
 
     def __init__(
@@ -323,13 +315,12 @@ class Flux2ParallelSelfAttention(FluxJointAttention):
         config: Optional[DiffusionModelConfig] = None,
         layer_idx: int = 0,
     ):
+        tp_size = config.mapping.tp_size if config else 1
+
         # Set MLP dims BEFORE super().__init__() — _init_qkv_proj() needs them
         self.mlp_hidden_dim = int(hidden_size * mlp_ratio)
+        self.local_mlp_hidden_dim = self.mlp_hidden_dim // tp_size
         self.mlp_mult_factor = 2  # SwiGLU doubles input
-
-        # Save full (pre-TP) dims — super().__init__() divides q_dim/kv_dim
-        full_q_dim = num_attention_heads * head_dim
-        full_mlp_hidden_dim = self.mlp_hidden_dim
 
         super().__init__(
             hidden_size=hidden_size,
@@ -343,15 +334,10 @@ class Flux2ParallelSelfAttention(FluxJointAttention):
             layer_idx=layer_idx,
         )
 
-        # After super().__init__(): self.q_dim/kv_dim are LOCAL (divided by tp_size).
-        # Divide mlp_hidden_dim to match for forward path consistency.
-        if self.tp_size > 1:
-            self.mlp_hidden_dim //= self.tp_size
-
         # Output projection needs FULL dims (ROW parallel divides internally)
         self.to_out = FluxJointAttnMLPProj(
-            attn_dim=full_q_dim,
-            mlp_dim=full_mlp_hidden_dim,
+            attn_dim=self.q_dim,
+            mlp_dim=self.mlp_hidden_dim,
             out_dim=hidden_size,
             bias=bias,
             dtype=self.dtype,
@@ -362,12 +348,7 @@ class Flux2ParallelSelfAttention(FluxJointAttention):
         )
 
     def _init_qkv_proj(self):
-        """Override: fused QKV+MLP projection instead of standard QKV.
-
-        Called during Attention.__init__() BEFORE TP division, so
-        self.q_dim/kv_dim/mlp_hidden_dim are all FULL here — correct
-        for FluxJointQKVMLPProj which needs full dims for Linear construction.
-        """
+        """Override: fused QKV+MLP projection instead of standard QKV."""
         mlp_in_dim = self.mlp_hidden_dim * self.mlp_mult_factor
         self.to_qkv_mlp_proj = FluxJointQKVMLPProj(
             in_dim=self.hidden_size,
@@ -390,9 +371,9 @@ class Flux2ParallelSelfAttention(FluxJointAttention):
         """Apply separate norm + RoPE to packed QKV (unfused path)."""
         batch_size = qkv.shape[0]
         q, k, v = qkv.chunk(3, dim=-1)
-        q = q.view(batch_size, -1, self.num_attention_heads, self.head_dim)
-        k = k.view(batch_size, -1, self.num_attention_heads, self.head_dim)
-        v = v.view(batch_size, -1, self.num_attention_heads, self.head_dim)
+        q = q.view(batch_size, -1, self.local_num_attention_heads, self.head_dim)
+        k = k.view(batch_size, -1, self.local_num_attention_heads, self.head_dim)
+        v = v.view(batch_size, -1, self.local_num_attention_heads, self.head_dim)
 
         q, k = self.apply_qk_norm(q, k)
 
@@ -418,7 +399,7 @@ class Flux2ParallelSelfAttention(FluxJointAttention):
 
         self.apply_packed_qk_norm_rope(qkv, freqs_cos, freqs_sin, num_txt_tokens=-1)
 
-        q, k, v = qkv.split([self.q_dim, self.kv_dim, self.kv_dim], dim=-1)
+        q, k, v = qkv.split([self.local_q_dim, self.local_kv_dim, self.local_kv_dim], dim=-1)
         return q, k, v
 
     def _apply_norm_rope(
