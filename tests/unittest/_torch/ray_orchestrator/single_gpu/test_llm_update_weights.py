@@ -12,11 +12,57 @@ from utils.torch_ref import RefHFModel
 from utils.util import getSMVersion, skip_pre_blackwell, skip_pre_hopper
 
 from tensorrt_llm import LLM
-from tensorrt_llm._torch.auto_deploy.custom_ops.quantization.torch_quant import (
-    _quantize_nvfp4,
-)
 from tensorrt_llm._torch.utils import get_device_uuid
 from tensorrt_llm.llmapi import KvCacheConfig, MoeConfig, SamplingParams
+
+
+# E2M1 boundary midpoints — round to nearest E2M1 magnitude:
+#   0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0  (ord 0..7)
+_E2M1_BOUNDS = torch.tensor(
+    [0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0], dtype=torch.float32
+)
+
+
+def _quantize_w4a8_canonical(
+    weight_float: torch.Tensor,
+    block_size: int,
+    weight_scale_2: torch.Tensor,
+):
+    """W4A8 NVFP4 FP8 quantization compatible with ``fp4_fp8_gemm_trtllmgen``.
+
+    Reproduces the convention emitted by the C++ op
+    ``float_to_e2m1_and_ufp8sf_scale`` (which the kernel was developed
+    against):
+    - per-block FP8 scale is stored as a *pure power of 2* (E4M3 byte with
+      mantissa bits zeroed). The exponent is ``floor(log2(block_amax)) - 2``
+      after scaling the input up by ``448 / amax_weight``.
+    - per-tensor ``weight_scale_2`` is ``amax_weight / 448`` (NOT
+      ``amax_weight / (6 * 448)`` as in modelopt 0.x / auto_deploy
+      ``_quantize_nvfp4``).
+    - FP4 values are recomputed AGAINST the power-of-2 block scale so the
+      stored ``(packed_fp4, fp8_scale)`` pair is self-consistent.
+    """
+    n, k = weight_float.shape
+    assert k % block_size == 0
+    a_global_sf = 1.0 / weight_scale_2  # = 448 / amax_weight
+    scaled = weight_float * a_global_sf  # values in ~[-448, 448]
+    scaled_blocked = scaled.view(n, k // block_size, block_size)
+    block_amax = scaled_blocked.abs().amax(dim=-1).clamp(min=1e-20)  # [n, k/block]
+    # C++ uses ``scaleExp = floor(log2(amax)) - 2``; scale = 2^scaleExp ~= amax/4.
+    scale_exp = (torch.floor(torch.log2(block_amax)).long() - 2).clamp(min=-6, max=7)
+    # FP8 E4M3 byte: sign=0 (1 bit), exp (4 bits, bias 7), mantissa (3 bits)=0.
+    e4m3_byte = (((scale_exp + 7) & 0xFF).to(torch.uint8) << 3)  # [n, k/block]
+    block_scale_fp8 = e4m3_byte.view(torch.float8_e4m3fn)
+    # Recompute FP4 against the (mantissa-zero) power-of-2 scale.
+    scale_float = torch.pow(2.0, scale_exp.float())
+    scaled_norm = (scaled_blocked / scale_float.unsqueeze(-1)).clamp(min=-6.0, max=6.0)
+    abs_val = scaled_norm.abs()
+    sign_bit = (scaled_norm < 0).to(torch.uint8)
+    bounds = _E2M1_BOUNDS.to(weight_float.device)
+    ord_val = (abs_val.unsqueeze(-1) > bounds).sum(dim=-1).to(torch.uint8).clamp(max=7)
+    fp4 = ((sign_bit << 3) | ord_val).flatten(start_dim=-2)  # [n, k] uint8
+    fp4_packed = ((fp4[..., 1::2] & 0x0F) << 4) | (fp4[..., 0::2] & 0x0F)
+    return fp4_packed.to(torch.uint8), block_scale_fp8, weight_scale_2
 
 # Ray-backed LLM teardown spawns the executor main-loop, GC and log/error
 # listener threads in ray-core. These are torn down only when ``ray.shutdown()``
@@ -528,7 +574,9 @@ class RefW4A8NVFP4FP8ModelWithIPCHandles(RefHFModel):
 
     def _quantize_fusion_group(self, group: tuple, projs: dict) -> List[tuple]:
         all_amaxes = [v.float().abs().amax() for _, v in projs.values()]
-        unified_scale_2 = torch.stack(all_amaxes).amax() / (6.0 * 448.0)
+        # weight_scale_2 = amax/448 (NOT amax/(6*448)) — matches the convention
+        # the kernel's canonical quantizer (float_to_e2m1_and_ufp8sf_scale) uses.
+        unified_scale_2 = torch.stack(all_amaxes).amax() / 448.0
 
         results = []
         for proj_type in group:
@@ -545,13 +593,11 @@ class RefW4A8NVFP4FP8ModelWithIPCHandles(RefHFModel):
     ) -> List[tuple]:
         weight_float = weight.float()
         if weight_scale_2 is None:
-            weight_scale_2 = weight_float.abs().amax().float() / (6.0 * 448.0)
+            weight_scale_2 = weight_float.abs().amax().float() / 448.0
 
-        packed_weight, block_scale = _quantize_nvfp4(
+        packed_uint8, block_scale_fp8, _ws2 = _quantize_w4a8_canonical(
             weight_float, self.W4A8_BLOCK_SIZE, weight_scale_2
         )
-        packed_uint8 = packed_weight.to(torch.uint8)
-        block_scale_fp8 = block_scale.to(torch.float8_e4m3fn)
 
         self._dequantized_weights[name] = _dequantize_nvfp4_block32(
             packed_uint8,
