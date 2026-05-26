@@ -22,10 +22,10 @@ Run with:
     pytest tests/unittest/_torch/visual_gen/multi_gpu/test_wan_transformer_parallel.py -v -s
 
 By default weights are resolved from:
-    $LLM_MODELS_ROOT/Wan2.1-T2V-14B-Diffusers/transformer
+    $LLM_MODELS_ROOT/Wan2.2-T2V-A14B-Diffusers/transformer
 
 Override model subdir with:
-    WAN_TRANSFORMER_MODEL_SUBDIR=Wan2.1-T2V-14B-Diffusers
+    WAN_TRANSFORMER_MODEL_SUBDIR=Wan2.2-T2V-A14B-Diffusers
 """
 
 import gc
@@ -245,7 +245,7 @@ def _make_model_config(
     )
     config = DiffusionModelConfig(
         pretrained_config=pretrained_config,
-        torch_compile=TorchCompileConfig(enable_torch_compile=False),
+        torch_compile=TorchCompileConfig(enable=False),
         attention=AttentionConfig(backend=backend),
         visual_gen_mapping=vgm,
         skip_create_weights_in_init=False,

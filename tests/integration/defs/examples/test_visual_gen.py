@@ -549,7 +549,7 @@ def _run_wan_lpips_pipeline(
         torch_compile_config=TorchCompileConfig(enable=False),
     )
     if parallel is not None:
-        args_kwargs["parallel"] = parallel
+        args_kwargs["parallel_config"] = parallel
     args = VisualGenArgs(**args_kwargs)
     pipeline = PipelineLoader(args).load(skip_warmup=True)
     try:

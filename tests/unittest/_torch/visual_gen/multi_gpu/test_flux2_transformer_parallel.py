@@ -240,7 +240,7 @@ def _make_model_config(
     )
     config = DiffusionModelConfig(
         pretrained_config=pretrained_config,
-        torch_compile=TorchCompileConfig(enable_torch_compile=False),
+        torch_compile=TorchCompileConfig(enable=False),
         attention=AttentionConfig(backend=backend),
         visual_gen_mapping=vgm,
         cache=None,
