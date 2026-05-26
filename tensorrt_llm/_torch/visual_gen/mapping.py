@@ -10,6 +10,7 @@ process groups.
 
 from __future__ import annotations
 
+from socket import gethostname
 from typing import Optional
 
 import torch.distributed as dist
@@ -141,8 +142,37 @@ class VisualGenMapping(DeviceMeshTopologyImpl):
         }
 
         if dist.is_initialized() and world_size > 1:
+            self.setup_communicators()
             self.build_mesh()
             self._build_vae_group()
+
+    def setup_communicators(self):
+        hostname = gethostname()
+
+        all_hosts = [None for _ in range(self.world_size)]
+        dist.all_gather_object(all_hosts, (self._rank, hostname))
+
+        host_to_ranks = {}
+        for rank, host in all_hosts:
+            host_to_ranks.setdefault(host, []).append(rank)
+
+        self.local_comm = None
+        for ranks in host_to_ranks.values():
+            # All global ranks from the default process group to participate in the call,
+            # even if some ranks are not part of the new process group being created
+            pg = dist.new_group(ranks=ranks, backend="cuda:nccl,cpu:gloo")
+            if int(self._rank) in ranks:
+                logger.debug(
+                    f"[Rank {self._rank}] Done setting local comm. ip_to_ranks: {host_to_ranks}"
+                )
+                self.local_comm = pg
+
+        assert self.local_comm is not None
+
+        from tensorrt_llm._utils import torch_pybind11_abi
+        from tensorrt_llm.bindings.internal.process_group import init_pg
+
+        init_pg(dist.group.WORLD, self.local_comm, torch_pybind11_abi())
 
     # ------------------------------------------------------------------
     # Mesh construction

@@ -156,12 +156,6 @@ class PipelineLoader:
         config.visual_gen_mapping = vgm
         config.mapping = vgm.to_llm_mapping()
 
-        if dist.is_initialized() and ws > 1:
-            from tensorrt_llm._utils import torch_pybind11_abi
-            from tensorrt_llm.bindings.internal.process_group import init_pg
-
-            init_pg(dist.group.WORLD, dist.group.WORLD, torch_pybind11_abi())
-
     def load(
         self,
         checkpoint_dir: Optional[str] = None,
