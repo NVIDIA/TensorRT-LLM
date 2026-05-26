@@ -89,7 +89,3 @@ etcd-sdk-python==0.0.7
 python-multipart
 smg-grpc-proto>=0.4.2
 cache-dit>=1.3.5
-nltk==3.9.4
-better_profanity==0.7.0
-# NOTE: Should be updated to official release once PR in upstream is merged - https://github.com/andresprados/Pytorch_Retinaface/pull/2
-retinaface-py @ git+https://github.com/NVShreyas/Pytorch_Retinaface.git@a7c9c6bec4943cf5d2120128ad78f5542e7e317d

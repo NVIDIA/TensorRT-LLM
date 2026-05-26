@@ -33,14 +33,7 @@ from tensorrt_llm._utils import nvtx_range
 from tensorrt_llm.logger import logger
 
 from .defaults import COSMOS3_720P_PARAMS, COSMOS3_EXTRA_SPECS
-from .guardrails import (
-    GUARDRAIL_HF_REPO,
-    GUARDRAIL_HF_REVISION,
-    build_text_guardrail,
-    build_video_guardrail,
-    check_video_safety,
-    download_guardrail_checkpoint,
-)
+from .guardrails import check_video_safety, download_guardrail_checkpoint
 from .transformer_cosmos3 import Cosmos3VFMTransformer
 
 COSMOS3_DEFAULT_NEGATIVE_PROMPT = (
@@ -59,8 +52,22 @@ COSMOS3_DEFAULT_RESOLUTION_TEMPLATE = "This video is of {height}x{width} resolut
 TRTLLM_DISABLE_COSMOS3_GUARDRAILS = os.environ.get("TRTLLM_DISABLE_COSMOS3_GUARDRAILS", "0") == "1"
 
 
+if not TRTLLM_DISABLE_COSMOS3_GUARDRAILS:
+    try:
+        from cosmos_guardrail import CosmosSafetyChecker
+    except (ImportError, ModuleNotFoundError):
+        raise ValueError(
+            "Cosmos Guardrail is not installed. This is in violation of the "
+            "[NVIDIA Open Model License Agreement]"
+            "(https://www.nvidia.com/en-us/agreements/enterprise-software/nvidia-open-model-license). "
+            "Please run the following installation commands or "
+            "disable guardrails by setting TRTLLM_DISABLE_COSMOS3_GUARDRAILS=1."
+            "`pip install cosmos_guardrail==0.3.0 && pip uninstall opencv-python`"
+        )
+
+
 # TODO: add hf_ids
-@register_pipeline("Cosmos3OmniMoTPipeline", defaults={"guardrail_checkpoint_dir": None})
+@register_pipeline("Cosmos3OmniMoTPipeline")
 class Cosmos3OmniMoTPipeline(BasePipeline):
     def __init__(self, model_config):
         super().__init__(model_config)
@@ -114,26 +121,14 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
                 subfolder=PipelineComponent.SCHEDULER,
             )
 
-        self.text_guardrail = None
-        self.video_guardrail = None
         # Guardrails are only evaluated on rank 0; load them only there to avoid
         # dead model weights occupying GPU memory on every other rank.
-        if (
-            self.rank == 0
-            and not TRTLLM_DISABLE_COSMOS3_GUARDRAILS
-            and (
-                PipelineComponent.TEXT_GUARDRAIL not in skip_components
-                or PipelineComponent.VIDEO_GUARDRAIL not in skip_components
-            )
-        ):
-            guardrail_ckpt_dir = self.model_config.extra_attrs.get(
-                "guardrail_checkpoint_dir"
-            ) or download_guardrail_checkpoint(GUARDRAIL_HF_REPO, GUARDRAIL_HF_REVISION)
-            logger.info(f"Loading guardrails from {guardrail_ckpt_dir}")
-            if PipelineComponent.TEXT_GUARDRAIL not in skip_components:
-                self.text_guardrail = build_text_guardrail(guardrail_ckpt_dir)
-            if PipelineComponent.VIDEO_GUARDRAIL not in skip_components:
-                self.video_guardrail = build_video_guardrail(guardrail_ckpt_dir)
+        if self.rank == 0 and not TRTLLM_DISABLE_COSMOS3_GUARDRAILS:
+            # the download guardrail checkpoint will bypass CosmosSafetyChecker's checkpoint download.
+            # Both will use HF_HOME as the cache directory.
+            download_guardrail_checkpoint()
+            self.safety_checker = CosmosSafetyChecker()
+            self.safety_checker.to(device)
 
         self.video_processor = VideoProcessor(vae_scale_factor=self.vae_scale_factor_spatial)
 
@@ -476,14 +471,14 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
         # Text guardrail — check both positive and user-supplied negative prompts.
         # None negative_prompt means the hardcoded default will be used (safe); skip it.
         text_blocked = torch.zeros((), device=self.device, dtype=torch.int32)
-        if self.rank == 0 and use_guardrails and self.text_guardrail is not None:
+        if self.rank == 0 and use_guardrails and self.safety_checker is not None:
             prompts_to_check = list(prompt)
             if negative_prompt is not None:
                 prompts_to_check.append(negative_prompt)
             for p in prompts_to_check:
-                is_safe, msg = self.text_guardrail(p)
+                is_safe = self.safety_checker.check_text_safety(p)
                 if not is_safe:
-                    logger.warning(f"Text guardrail blocked prompt: {msg}")
+                    logger.warning("Text guardrail blocked prompt")
                     text_blocked.fill_(1)
                     break
 
@@ -623,8 +618,8 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
             logger.info(f"Video decoded in {time.time() - decode_start:.2f}s")
             logger.info(f"Total pipeline time: {time.time() - pipeline_start:.2f}s")
 
-            if use_guardrails and self.video_guardrail is not None:
-                video = check_video_safety(video, self.video_guardrail)
+            if use_guardrails and self.safety_checker is not None:
+                video = check_video_safety(video, self.safety_checker)
 
         timer.mark_end()
         return timer.fill(PipelineOutput(video=video, frame_rate=frame_rate))
