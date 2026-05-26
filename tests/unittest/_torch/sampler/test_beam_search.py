@@ -279,6 +279,31 @@ def validate_output(output: GenerationResult, input_prompt: list[int],
                              len(input_prompt), beam_idx)
 
 
+def validate_disagg_output(output: GenerationResult, input_prompt: list[int],
+                           sampling_params: SamplingParams) -> None:
+    """Validate disagg beam output without requiring full-run cache history."""
+    check_context_logits(output, sampling_params)
+    assert len(output.outputs) == sampling_params.n
+    expected_outputs = get_expected_outputs(
+        input_prompt[-1], num_iterations=sampling_params.max_tokens)
+
+    for beam_idx, beam_output in enumerate(output.outputs):
+        assert beam_output.finish_reason == "length"
+        check_generation_logits(beam_output, sampling_params, valid_tokens=None)
+        check_logprobs(beam_output, sampling_params, valid_tokens=None)
+        expected_token_ids = expected_outputs.outputs[beam_idx].tolist()
+        assert beam_output.token_ids == expected_token_ids, (
+            f"expected {expected_token_ids} token ids, "
+            f"got {beam_output.token_ids}")
+
+        assert beam_output.additional_generation_outputs is not None
+        cache_indirection = beam_output.additional_generation_outputs[
+            "cache_indirection"]
+        assert cache_indirection is not None
+        assert cache_indirection.shape[1] == sampling_params.best_of
+        assert cache_indirection.shape[0] == sampling_params.max_tokens - 1
+
+
 def validate_outputs(llm: LLM, input_prompts: list[list[int]],
                      sampling_params: SamplingParams,
                      monkeypatch: pytest.MonkeyPatch,
@@ -384,7 +409,8 @@ def validate_disagg_outputs(ctx_llm: LLM, gen_llm: LLM,
     assert isinstance(gen_outputs, list)
     assert len(gen_outputs) == len(input_prompts)
     for output_idx, output in enumerate(gen_outputs):
-        validate_output(output, input_prompts[output_idx], sampling_params)
+        validate_disagg_output(output, input_prompts[output_idx],
+                               sampling_params)
 
 
 ###########################################################################
