@@ -221,6 +221,12 @@ class ParallelConfig(StrictBaseModel):
             "column group. Mutually exclusive with ring_size > 1."
         ),
     )
+    tp_size: int = Field(
+        1,
+        ge=1,
+        status="prototype",
+        description=("Tensor parallel group size. Heads are sharded across tp_size GPUs."),
+    )
 
     @property
     def seq_parallel_size(self) -> int:
