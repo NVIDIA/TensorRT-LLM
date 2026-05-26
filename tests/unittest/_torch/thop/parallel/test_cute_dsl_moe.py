@@ -745,7 +745,7 @@ def test_nvfp4_grouped_gemm_swiglu_blackwell(
         local_expert_offset=0,
         tile_size=tile_size,
         scaling_vector_size=sf_vec_size,
-        swiglu_limit=swiglu_limit,
+        swiglu_limit_scalar=swiglu_limit,
     )
 
     match_ratio = (
@@ -930,7 +930,7 @@ def test_nvfp4_gather_grouped_gemm_act_fusion_blackwell(
         tile_size=tile_size,
         scaling_vector_size=sf_vec_size,
         activation_type=activation_type,
-        swiglu_limit=swiglu_limit,
+        swiglu_limit_scalar=swiglu_limit,
     )
 
     # Verify output (only compare valid tokens, skip padding tokens where permuted_idx_to_expanded_idx == -1)
@@ -993,7 +993,7 @@ def test_nvfp4_gather_grouped_gemm_act_fusion_blackwell(
                     tile_size=tile_size,
                     scaling_vector_size=sf_vec_size,
                     activation_type=activation_type,
-                    swiglu_limit=swiglu_limit,
+                    swiglu_limit_scalar=swiglu_limit,
                 )
             )
             c_multi_valid = c_multi[:num_valid_permuted_tokens].view(torch.uint8)[valid_token_mask]

@@ -64,11 +64,11 @@ class NvFp4WeightView:
 
 
 @torch.compile(options={"max-autotune": True})
-def swiglu_fused_moe(x, swiglu_limit: float = float("inf")):
+def swiglu_fused_moe(x, swiglu_limit_scalar: float = float("inf")):
     x, gate = x.chunk(2, dim=-1)
-    if swiglu_limit != float("inf"):
-        gate = gate.clamp(max=swiglu_limit)
-        x = x.clamp(min=-swiglu_limit, max=swiglu_limit)
+    if swiglu_limit_scalar != float("inf"):
+        gate = gate.clamp(max=swiglu_limit_scalar)
+        x = x.clamp(min=-swiglu_limit_scalar, max=swiglu_limit_scalar)
     return F.silu(gate) * x
 
 
@@ -431,16 +431,11 @@ class CuteDslFusedMoE(CutlassFusedMoE):
         VANILLA,
         apply_router_weight_on_input: bool = False,
         layer_idx: Optional[int] = None,
-        swiglu_alpha: Optional[torch.Tensor] = None,
-        swiglu_beta: Optional[torch.Tensor] = None,
-        swiglu_limit: Optional[torch.Tensor] = None,
+        swiglu_limit_scalar: Optional[float] = None,
         init_load_balancer: bool = True,
         without_comm: bool = False,
         activation_type: ActivationType = ActivationType.Swiglu,
     ):
-        assert swiglu_alpha is None and swiglu_beta is None, (
-            "CuteDslFusedMoE supports swiglu_limit only; swiglu_alpha and "
-            "swiglu_beta are not supported.")
         super().__init__(
             routing_method=routing_method,
             num_experts=num_experts,
@@ -453,12 +448,13 @@ class CuteDslFusedMoE(CutlassFusedMoE):
             weight_loading_mode=weight_loading_mode,
             apply_router_weight_on_input=apply_router_weight_on_input,
             layer_idx=layer_idx,
-            swiglu_limit=swiglu_limit,
+            swiglu_limit_scalar=swiglu_limit_scalar,
             init_load_balancer=init_load_balancer,
             without_comm=without_comm,
             activation_type=activation_type,
         )
-        self.swiglu_limit_value = self._get_uniform_swiglu_limit(swiglu_limit)
+        self.swiglu_limit_scalar = float(
+            "inf") if swiglu_limit_scalar is None else swiglu_limit_scalar
 
         if self.aux_stream_dict is None:
             self.aux_stream_dict = aux_stream_dict if aux_stream_dict is not None else {}
@@ -470,31 +466,6 @@ class CuteDslFusedMoE(CutlassFusedMoE):
         for key in [EventType.Main, EventType.MoeOutputMemset]:
             if key not in self.event_dict:
                 self.event_dict[key] = torch.cuda.Event()
-
-    @staticmethod
-    def _get_uniform_swiglu_limit(
-            swiglu_limit: Optional[Union[torch.Tensor, float]]) -> float:
-        if swiglu_limit is None:
-            return float("inf")
-        if isinstance(swiglu_limit, torch.Tensor):
-            if swiglu_limit.numel() == 0:
-                raise ValueError("swiglu_limit tensor must not be empty.")
-            swiglu_limit_tensor = swiglu_limit.detach().float()
-            first_limit = swiglu_limit_tensor.flatten()[0]
-            if not torch.all(swiglu_limit_tensor == first_limit).item():
-                raise ValueError(
-                    "CuteDslFusedMoE only supports a uniform swiglu_limit "
-                    "because the CuTe DSL kernel takes it as a compile-time scalar."
-                )
-            swiglu_limit_value = float(first_limit.item())
-        else:
-            swiglu_limit_value = float(swiglu_limit)
-
-        if not math.isinf(swiglu_limit_value) and swiglu_limit_value <= 0:
-            raise ValueError(
-                f"swiglu_limit must be positive or +inf, got {swiglu_limit_value}."
-            )
-        return swiglu_limit_value
 
     def _build_local_weight_view(self) -> NvFp4WeightView:
         """Build weight view for non-DWDP path (single-element lists)."""
@@ -683,7 +654,7 @@ class CuteDslFusedMoE(CutlassFusedMoE):
             local_expert_offset=slot_start,
             tile_size=tile_size,
             activation_type=self.activation_type,
-            swiglu_limit=self.swiglu_limit_value,
+            swiglu_limit_scalar=self.swiglu_limit_scalar,
         )
 
         if self.use_fused_finalize:
@@ -808,7 +779,7 @@ class CuteDslFusedMoE(CutlassFusedMoE):
             local_expert_offset=slot_start,
             tile_size=tile_size,
             activation_type=self.activation_type,
-            swiglu_limit=self.swiglu_limit_value,
+            swiglu_limit_scalar=self.swiglu_limit_scalar,
         )
 
         with torch.cuda.stream(
@@ -902,7 +873,7 @@ class CuteDslFusedMoE(CutlassFusedMoE):
             b_sf=self.quant_scales[0],
             offset_array=expert_first_token_offset,
         )
-        x = swiglu_fused_moe(x, self.swiglu_limit_value)
+        x = swiglu_fused_moe(x, self.swiglu_limit_scalar)
         x, x_sf = torch.ops.trtllm.fp8_quantize_1x128(x)
         x = cute_dsl_fp8_group_blockwise_gemm_ref(
             a=x,
