@@ -240,17 +240,25 @@ def _run_moe_with_alltoall(
     local_num_experts = fc1_expert_weights.shape[0]
     global_num_experts = local_num_experts * mapping.moe_ep_size
 
-    # runtime_max_tokens_per_rank: max(total_num_tokens) across DP ranks.
-    # Mirrors base TRT-LLM's `runtime_max_tokens_per_rank = max(all_rank_num_tokens)`
-    # in fused_moe_cutlass.py / fused_moe_trtllm_gen.py. AD's shim writes slot 13
-    # pre-forward via `tp_allgather` of `total_num_tokens` (when attention-DP is on);
-    # nest_sequences seeds slot 13 with the local total as a safe default.
-    if batch_info_host is not None:
-        runtime_max_tokens_per_rank = int(batch_info_host[13].item())
-        if runtime_max_tokens_per_rank <= 0:
-            runtime_max_tokens_per_rank = max_num_tokens
-    else:
-        runtime_max_tokens_per_rank = max_num_tokens
+    # Use the static max_num_tokens as the per-rank dispatch padding budget.
+    #
+    # The previous version of this code read ``batch_info_host[13]`` via
+    # ``.item()`` to use the cross-rank max from the AD shim's per-iter
+    # ``tp_allgather``. That works in eager mode but is INCORRECT under
+    # CUDA-graph capture: ``.item()`` is a host-side read whose result is
+    # baked into the kernel-launch arguments at capture time. The
+    # dispatched-tokens count, padding amount, and downstream kernel
+    # configurations all get frozen to the dummy-forward's value, and at
+    # replay the model attends to junk for any batch shape that differs
+    # from the dummy. The empirical signature is fluent generation that
+    # ignores the input prompt (0% GSM8K on Nemotron-Super-V3 NVFP4 + ADP).
+    #
+    # TODO(perf): to recover the cross-rank-max optimization under CUDA
+    # graphs, ``batch_info_host[13]`` (or equivalent) must reach the
+    # dispatch kernel through a *device* tensor argument so the value is
+    # actually runtime, not captured. Until then we over-pad to
+    # ``max_num_tokens`` -- correct but wasteful.
+    runtime_max_tokens_per_rank = max_num_tokens
 
     # Workspace must be sized for the LARGEST element type used by dispatch or combine.
     # The input x may be quantized (fp8/fp4), but combine outputs in the model dtype
@@ -421,12 +429,9 @@ def _run_trtllm_gen_nvfp4_moe_with_alltoall(
     hidden_size = x.shape[-1]
     local_num_experts = int(fc1_expert_weights_fp4.shape[0])
     global_num_experts = local_num_experts * mapping.moe_ep_size
-    if batch_info_host is not None:
-        runtime_max_tokens_per_rank = int(batch_info_host[13].item())
-        if runtime_max_tokens_per_rank <= 0:
-            runtime_max_tokens_per_rank = max_num_tokens
-    else:
-        runtime_max_tokens_per_rank = max_num_tokens
+    # See note on the cousin function above: reading slot 13 via .item()
+    # is unsafe under CUDA-graph capture. Use static max_num_tokens.
+    runtime_max_tokens_per_rank = max_num_tokens
 
     moe_a2a = _GlobalMoeAll2AllCache.get_alltoall(
         mapping=mapping,
