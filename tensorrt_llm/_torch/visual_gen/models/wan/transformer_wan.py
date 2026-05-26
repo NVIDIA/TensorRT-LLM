@@ -287,6 +287,10 @@ class WanBlock(nn.Module):
         # Self-attention with fused QKV. All WAN variants (1.3B 12h, 5B 24h, 14B 40h)
         # fit the default fused_dit_qk_norm_rope op's full-dim template now that
         # the num_heads cap is 64 (post-survey 2026-05).
+        # However, we must disable the fused QK norm + Rope for TP, since Wan QK norm
+        # is cross head, and thus a collective operation. This mode is not yet supported
+        # by the fused kernel.
+        tp_size = model_config.mapping.tp_size if model_config.mapping else 1
         self.attn1 = Attention(
             hidden_size=hidden_size,
             num_attention_heads=num_heads,
@@ -294,7 +298,7 @@ class WanBlock(nn.Module):
             qkv_mode=QKVMode.FUSE_QKV,
             qk_norm=True,
             eps=eps,
-            fuse_qk_norm_rope=True,
+            fuse_qk_norm_rope=(tp_size == 1),
             config=model_config,
             layer_idx=_layer_idx,
         )

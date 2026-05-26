@@ -76,6 +76,10 @@ class Attention(nn.Module):
         #   - full-dim template (LTX-2, WAN):    q/k_weight.shape == [num_heads * head_dim]
         # Full-dim template envelope: num_heads <= 64, head_dim in {64, 128}.
         self.fuse_qk_norm_rope = fuse_qk_norm_rope if fuse_qk_norm_rope is not None else False
+        assert not (self.fuse_qk_norm_rope and tp_size > 1 and qk_norm_mode == "full"), (
+            "fuse_qk_norm_rope + qk_norm_mode='full' + TP>1: fused kernel lacks cross-rank "
+            "all-reduce for cross-head RMSNorm variance. Disable fuse_qk_norm_rope for TP>1."
+        )
         self.interleave = interleave
 
         # Select compute backend (orthogonal to parallelism)
