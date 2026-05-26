@@ -28,8 +28,8 @@
   </noscript>
   
   <!-- Loaded before other Sphinx assets -->
-  <link href="../_static/styles/theme.css?digest=55c26ed414f5f8a31ebb" rel="stylesheet" />
-<link href="../_static/styles/pydata-sphinx-theme.css?digest=55c26ed414f5f8a31ebb" rel="stylesheet" />
+  <link href="../_static/styles/theme.css?digest=0790524f97105ba85085" rel="stylesheet" />
+<link href="../_static/styles/pydata-sphinx-theme.css?digest=0790524f97105ba85085" rel="stylesheet" />
 
     <link rel="stylesheet" type="text/css" href="../_static/pygments.css?v=8f2a1f02" />
     <link rel="stylesheet" type="text/css" href="../_static/styles/nvidia-sphinx-theme.css?v=933278ad" />
@@ -40,10 +40,10 @@
     <link rel="stylesheet" type="text/css" href="../_static/custom.css?v=19d20f17" />
   
   <!-- So that users can add custom icons -->
-  <script defer src="../_static/scripts/fontawesome.js?digest=55c26ed414f5f8a31ebb"></script>
+  <script defer src="../_static/scripts/fontawesome.js?digest=0790524f97105ba85085"></script>
   <!-- Pre-loaded scripts that we'll load fully later -->
-  <link rel="preload" as="script" href="../_static/scripts/bootstrap.js?digest=55c26ed414f5f8a31ebb" />
-<link rel="preload" as="script" href="../_static/scripts/pydata-sphinx-theme.js?digest=55c26ed414f5f8a31ebb" />
+  <link rel="preload" as="script" href="../_static/scripts/bootstrap.js?digest=0790524f97105ba85085" />
+<link rel="preload" as="script" href="../_static/scripts/pydata-sphinx-theme.js?digest=0790524f97105ba85085" />
 
 
 
@@ -61,9 +61,9 @@
     <script>var togglebuttonSelector = '.toggle, .admonition.dropdown';</script>
     <script>DOCUMENTATION_OPTIONS.pagename = 'features/sparse-attention';</script>
     <script>
-        DOCUMENTATION_OPTIONS.theme_version = '0.17.1';
+        DOCUMENTATION_OPTIONS.theme_version = '0.18.0';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc15';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc16';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -79,7 +79,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.3.0rc15" />
+  <meta name="docsearch:version" content="1.3.0rc16" />
   
     
     <script src="../_static/searchtools.js"></script>
@@ -210,11 +210,18 @@
       
         <div class="navbar-item">
 
-<button class="btn btn-sm nav-link pst-navbar-icon theme-switch-button pst-js-only" aria-label="Color mode" data-bs-title="Color mode"  data-bs-placement="bottom" data-bs-toggle="tooltip">
-  <i class="theme-switch fa-solid fa-sun                fa-lg" data-mode="light" title="Light"></i>
-  <i class="theme-switch fa-solid fa-moon               fa-lg" data-mode="dark"  title="Dark"></i>
-  <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg" data-mode="auto"  title="System Settings"></i>
-</button></div>
+<div class="theme-switch-container dropdown pst-js-only" data-bs-toggle="tooltip" data-bs-placement="bottom" title="Color mode">
+  <button class="btn btn-sm nav-link pst-navbar-icon theme-switch-button dropdown-toggle" aria-label="Color mode" data-bs-toggle="dropdown">
+    <i class="theme-switch fa-solid fa-sun fa-lg fa-fw" data-mode="light" title="Light"></i>
+    <i class="theme-switch fa-solid fa-moon fa-lg fa-fw" data-mode="dark" title="Dark"></i>
+    <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg fa-fw" data-mode="auto" title="System Settings"></i>
+  </button>
+  <ul class="dropdown-menu dropdown-menu-end">
+    <li><button class="dropdown-item d-flex align-items-center theme-change-button" data-mode="auto"><i class="fa-solid fa-circle-half-stroke fa-lg fa-fw me-1"></i>System Settings</button></li>
+    <li><button class="dropdown-item d-flex align-items-center theme-change-button" data-mode="light"><i class="fa-solid fa-sun fa-lg fa-fw me-1"></i>Light</button></li>
+    <li><button class="dropdown-item d-flex align-items-center theme-change-button" data-mode="dark"><i class="fa-solid fa-moon fa-lg fa-fw me-1"></i>Dark</button></li>
+  </ul>
+</div></div>
       
     </div>
     
@@ -315,11 +322,18 @@
         
           <div class="navbar-item">
 
-<button class="btn btn-sm nav-link pst-navbar-icon theme-switch-button pst-js-only" aria-label="Color mode" data-bs-title="Color mode"  data-bs-placement="bottom" data-bs-toggle="tooltip">
-  <i class="theme-switch fa-solid fa-sun                fa-lg" data-mode="light" title="Light"></i>
-  <i class="theme-switch fa-solid fa-moon               fa-lg" data-mode="dark"  title="Dark"></i>
-  <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg" data-mode="auto"  title="System Settings"></i>
-</button></div>
+<div class="theme-switch-container dropdown pst-js-only" data-bs-toggle="tooltip" data-bs-placement="bottom" title="Color mode">
+  <button class="btn btn-sm nav-link pst-navbar-icon theme-switch-button dropdown-toggle" aria-label="Color mode" data-bs-toggle="dropdown">
+    <i class="theme-switch fa-solid fa-sun fa-lg fa-fw" data-mode="light" title="Light"></i>
+    <i class="theme-switch fa-solid fa-moon fa-lg fa-fw" data-mode="dark" title="Dark"></i>
+    <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg fa-fw" data-mode="auto" title="System Settings"></i>
+  </button>
+  <ul class="dropdown-menu dropdown-menu-end">
+    <li><button class="dropdown-item d-flex align-items-center theme-change-button" data-mode="auto"><i class="fa-solid fa-circle-half-stroke fa-lg fa-fw me-1"></i>System Settings</button></li>
+    <li><button class="dropdown-item d-flex align-items-center theme-change-button" data-mode="light"><i class="fa-solid fa-sun fa-lg fa-fw me-1"></i>Light</button></li>
+    <li><button class="dropdown-item d-flex align-items-center theme-change-button" data-mode="dark"><i class="fa-solid fa-moon fa-lg fa-fw me-1"></i>Dark</button></li>
+  </ul>
+</div></div>
         
       </div>
     
@@ -910,6 +924,73 @@
 <li><p><strong>Hopper decode</strong>: <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/cpp/kernels/xqa">XQA</a></p></li>
 <li><p><strong>Blackwell</strong>: <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/cpp/tensorrt_llm/kernels/trtllmGenKernels">trtllm-gen</a></p></li>
 </ul>
+<section id="configuring-skip-softmax-attention">
+<h4>Configuring Skip Softmax Attention<a class="headerlink" href="#configuring-skip-softmax-attention" title="Link to this heading">#</a></h4>
+<p>The single tunable is the per-block <strong>threshold</strong> — the larger it is, the more KV
+blocks are skipped (higher sparsity, lower fidelity). You have three ways to
+set it, listed in priority order; the first match wins.</p>
+<p><strong>1. Raw threshold (LLM API or YAML).</strong> The simplest path: pass a fixed value
+that the kernel uses directly. Resolution-dependent; calibrate per workload.</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="c1"># LLM API</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm.llmapi</span><span class="w"> </span><span class="kn">import</span> <span class="n">SkipSoftmaxAttentionConfig</span>
+<span class="n">sparse_attention_config</span> <span class="o">=</span> <span class="n">SkipSoftmaxAttentionConfig</span><span class="p">(</span><span class="n">threshold_scale_factor</span><span class="o">=</span><span class="mf">1000.0</span><span class="p">)</span>
+<span class="c1"># Or per-phase:</span>
+<span class="n">sparse_attention_config</span> <span class="o">=</span> <span class="n">SkipSoftmaxAttentionConfig</span><span class="p">(</span>
+    <span class="n">threshold_scale_factor</span><span class="o">=</span><span class="p">{</span><span class="s2">&quot;prefill&quot;</span><span class="p">:</span> <span class="mf">1000.0</span><span class="p">,</span> <span class="s2">&quot;decode&quot;</span><span class="p">:</span> <span class="mf">500.0</span><span class="p">}</span>
+<span class="p">)</span>
+</pre></div>
+</div>
+<div class="highlight-yaml notranslate"><div class="highlight"><pre><span></span><span class="c1"># YAML (e.g., extra_llm_api_options for trtllm-serve / trtllm-bench)</span>
+<span class="nt">attention</span><span class="p">:</span>
+<span class="w">  </span><span class="nt">backend</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">TRTLLM</span>
+<span class="w">  </span><span class="nt">sparse_attention_config</span><span class="p">:</span>
+<span class="w">    </span><span class="nt">algorithm</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">skip_softmax</span>
+<span class="w">    </span><span class="nt">threshold_scale_factor</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">1000.0</span>
+</pre></div>
+</div>
+<p><strong>2. Target sparsity (visual-generation models).</strong> Visual-gen pipelines also
+accept a semantic <code class="docutils literal notranslate"><span class="pre">target_sparsity</span></code> (∈ [0, 1]). The threshold is computed from
+a calibration formula <code class="docutils literal notranslate"><span class="pre">threshold</span> <span class="pre">=</span> <span class="pre">exp(log_a</span> <span class="pre">+</span> <span class="pre">b</span> <span class="pre">·</span> <span class="pre">target_sparsity)</span></code> whose
+coefficients come from ModelOpt — either a sparse YAML
+(<code class="docutils literal notranslate"><span class="pre">sparse_config_path</span></code>) or the checkpoint’s <code class="docutils literal notranslate"><span class="pre">config.json</span></code>. You do <em>not</em> set
+the formula coefficients yourself; they are an internal ModelOpt-produced
+artifact.</p>
+<div class="highlight-yaml notranslate"><div class="highlight"><pre><span></span><span class="c1"># Point at a ModelOpt-produced sparse YAML and just set the sparsity target:</span>
+<span class="nt">attention</span><span class="p">:</span>
+<span class="w">  </span><span class="nt">backend</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">TRTLLM</span>
+<span class="w">  </span><span class="nt">sparse_config_path</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">/path/to/sparse.yaml</span>
+<span class="w">  </span><span class="nt">sparse_attention_config</span><span class="p">:</span>
+<span class="w">    </span><span class="nt">algorithm</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">skip_softmax</span>
+<span class="w">    </span><span class="nt">target_sparsity</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">0.70</span>
+</pre></div>
+</div>
+<p><code class="docutils literal notranslate"><span class="pre">sparse_config_path</span></code> is a path to the ModelOpt-produced sparse-attention
+artifact, not a second TRT-LLM runtime configuration file. For
+<code class="docutils literal notranslate"><span class="pre">trtllm-serve</span></code>/<code class="docutils literal notranslate"><span class="pre">trtllm-bench</span></code>, put this path inside the normal <code class="docutils literal notranslate"><span class="pre">--config</span></code>
+YAML. If a consolidated <code class="docutils literal notranslate"><span class="pre">sparse.yaml</span></code> is already present at the checkpoint
+root, omit <code class="docutils literal notranslate"><span class="pre">sparse_config_path</span></code> and let the loader auto-detect it.</p>
+<p><strong>3. Auto-detect from checkpoint.</strong> ModelOpt-calibrated checkpoints ship the
+calibration formula in their <code class="docutils literal notranslate"><span class="pre">config.json</span></code> under
+<code class="docutils literal notranslate"><span class="pre">sparse_attention_config.threshold_scale_factor.prefill</span> <span class="pre">=</span> <span class="pre">{a,</span> <span class="pre">b}</span></code>, or in a
+consolidated <code class="docutils literal notranslate"><span class="pre">sparse.yaml</span></code> at the checkpoint root. The pipeline loader picks
+either up automatically — no <code class="docutils literal notranslate"><span class="pre">sparse_config_path</span></code> needed for the common case.
+Auto-detection supplies calibration only; the user must still set
+<code class="docutils literal notranslate"><span class="pre">target_sparsity</span></code> or an explicit <code class="docutils literal notranslate"><span class="pre">threshold_scale_factor</span></code> to enable skip-softmax.</p>
+<div class="highlight-yaml notranslate"><div class="highlight"><pre><span></span><span class="c1"># With a ModelOpt-calibrated checkpoint, this is enough:</span>
+<span class="nt">attention</span><span class="p">:</span>
+<span class="w">  </span><span class="nt">backend</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">TRTLLM</span>
+<span class="w">  </span><span class="nt">sparse_attention_config</span><span class="p">:</span>
+<span class="w">    </span><span class="nt">algorithm</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">skip_softmax</span>
+<span class="w">    </span><span class="nt">target_sparsity</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">0.70</span><span class="w">   </span><span class="c1"># formula auto-resolved from checkpoint</span>
+</pre></div>
+</div>
+<p><strong>Per-layer overrides</strong> are part of the ModelOpt calibration output (the
+<code class="docutils literal notranslate"><span class="pre">disabled_layers</span></code> list in <code class="docutils literal notranslate"><span class="pre">sparse.yaml</span></code>), not a user-facing knob. To disable
+skip-softmax on specific layers, edit the ModelOpt sparse YAML — the pipeline
+loader will pick up the overrides automatically.</p>
+<p>For algorithm details, see the <a class="reference external" href="https://arxiv.org/pdf/2512.12087">paper</a> and
+the <a class="reference internal" href="../blogs/tech_blog/blog16_Accelerating_Long_Context_Inference_with_Skip_Softmax_Attention.html"><span class="std std-doc">tech blog</span></a>.</p>
+</section>
 </section>
 <section id="summary">
 <h3>Summary<a class="headerlink" href="#summary" title="Link to this heading">#</a></h3>
@@ -1029,7 +1110,10 @@
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#future-work">Future Work</a></li>
 </ul>
 </li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#kernel-level-sparse-attention">Kernel-Level Sparse Attention</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#kernel-level-sparse-attention">Kernel-Level Sparse Attention</a><ul class="nav section-nav flex-column">
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#configuring-skip-softmax-attention">Configuring Skip Softmax Attention</a></li>
+</ul>
+</li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#summary">Summary</a></li>
 </ul>
 </li>
@@ -1051,8 +1135,8 @@
   
 
   <!-- Scripts loaded after <body> so the DOM is not blocked -->
-  <script defer src="../_static/scripts/bootstrap.js?digest=55c26ed414f5f8a31ebb"></script>
-<script defer src="../_static/scripts/pydata-sphinx-theme.js?digest=55c26ed414f5f8a31ebb"></script>
+  <script defer src="../_static/scripts/bootstrap.js?digest=0790524f97105ba85085"></script>
+<script defer src="../_static/scripts/pydata-sphinx-theme.js?digest=0790524f97105ba85085"></script>
 
 
   <footer class="bd-footer">
@@ -1124,9 +1208,9 @@
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on May 20, 2026.</p>
+  <p>Last updated on May 25, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/c72d43d">c72d43d</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/4517988">4517988</a>.</p>
   
 </div></div>
       

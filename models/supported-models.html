@@ -28,8 +28,8 @@
   </noscript>
   
   <!-- Loaded before other Sphinx assets -->
-  <link href="../_static/styles/theme.css?digest=55c26ed414f5f8a31ebb" rel="stylesheet" />
-<link href="../_static/styles/pydata-sphinx-theme.css?digest=55c26ed414f5f8a31ebb" rel="stylesheet" />
+  <link href="../_static/styles/theme.css?digest=0790524f97105ba85085" rel="stylesheet" />
+<link href="../_static/styles/pydata-sphinx-theme.css?digest=0790524f97105ba85085" rel="stylesheet" />
 
     <link rel="stylesheet" type="text/css" href="../_static/pygments.css?v=8f2a1f02" />
     <link rel="stylesheet" type="text/css" href="../_static/styles/nvidia-sphinx-theme.css?v=933278ad" />
@@ -40,10 +40,10 @@
     <link rel="stylesheet" type="text/css" href="../_static/custom.css?v=19d20f17" />
   
   <!-- So that users can add custom icons -->
-  <script defer src="../_static/scripts/fontawesome.js?digest=55c26ed414f5f8a31ebb"></script>
+  <script defer src="../_static/scripts/fontawesome.js?digest=0790524f97105ba85085"></script>
   <!-- Pre-loaded scripts that we'll load fully later -->
-  <link rel="preload" as="script" href="../_static/scripts/bootstrap.js?digest=55c26ed414f5f8a31ebb" />
-<link rel="preload" as="script" href="../_static/scripts/pydata-sphinx-theme.js?digest=55c26ed414f5f8a31ebb" />
+  <link rel="preload" as="script" href="../_static/scripts/bootstrap.js?digest=0790524f97105ba85085" />
+<link rel="preload" as="script" href="../_static/scripts/pydata-sphinx-theme.js?digest=0790524f97105ba85085" />
 
 
 
@@ -61,9 +61,9 @@
     <script>var togglebuttonSelector = '.toggle, .admonition.dropdown';</script>
     <script>DOCUMENTATION_OPTIONS.pagename = 'models/supported-models';</script>
     <script>
-        DOCUMENTATION_OPTIONS.theme_version = '0.17.1';
+        DOCUMENTATION_OPTIONS.theme_version = '0.18.0';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc15';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc16';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -79,7 +79,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.3.0rc15" />
+  <meta name="docsearch:version" content="1.3.0rc16" />
   
     
     <script src="../_static/searchtools.js"></script>
@@ -210,11 +210,18 @@
       
         <div class="navbar-item">
 
-<button class="btn btn-sm nav-link pst-navbar-icon theme-switch-button pst-js-only" aria-label="Color mode" data-bs-title="Color mode"  data-bs-placement="bottom" data-bs-toggle="tooltip">
-  <i class="theme-switch fa-solid fa-sun                fa-lg" data-mode="light" title="Light"></i>
-  <i class="theme-switch fa-solid fa-moon               fa-lg" data-mode="dark"  title="Dark"></i>
-  <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg" data-mode="auto"  title="System Settings"></i>
-</button></div>
+<div class="theme-switch-container dropdown pst-js-only" data-bs-toggle="tooltip" data-bs-placement="bottom" title="Color mode">
+  <button class="btn btn-sm nav-link pst-navbar-icon theme-switch-button dropdown-toggle" aria-label="Color mode" data-bs-toggle="dropdown">
+    <i class="theme-switch fa-solid fa-sun fa-lg fa-fw" data-mode="light" title="Light"></i>
+    <i class="theme-switch fa-solid fa-moon fa-lg fa-fw" data-mode="dark" title="Dark"></i>
+    <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg fa-fw" data-mode="auto" title="System Settings"></i>
+  </button>
+  <ul class="dropdown-menu dropdown-menu-end">
+    <li><button class="dropdown-item d-flex align-items-center theme-change-button" data-mode="auto"><i class="fa-solid fa-circle-half-stroke fa-lg fa-fw me-1"></i>System Settings</button></li>
+    <li><button class="dropdown-item d-flex align-items-center theme-change-button" data-mode="light"><i class="fa-solid fa-sun fa-lg fa-fw me-1"></i>Light</button></li>
+    <li><button class="dropdown-item d-flex align-items-center theme-change-button" data-mode="dark"><i class="fa-solid fa-moon fa-lg fa-fw me-1"></i>Dark</button></li>
+  </ul>
+</div></div>
       
     </div>
     
@@ -315,11 +322,18 @@
         
           <div class="navbar-item">
 
-<button class="btn btn-sm nav-link pst-navbar-icon theme-switch-button pst-js-only" aria-label="Color mode" data-bs-title="Color mode"  data-bs-placement="bottom" data-bs-toggle="tooltip">
-  <i class="theme-switch fa-solid fa-sun                fa-lg" data-mode="light" title="Light"></i>
-  <i class="theme-switch fa-solid fa-moon               fa-lg" data-mode="dark"  title="Dark"></i>
-  <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg" data-mode="auto"  title="System Settings"></i>
-</button></div>
+<div class="theme-switch-container dropdown pst-js-only" data-bs-toggle="tooltip" data-bs-placement="bottom" title="Color mode">
+  <button class="btn btn-sm nav-link pst-navbar-icon theme-switch-button dropdown-toggle" aria-label="Color mode" data-bs-toggle="dropdown">
+    <i class="theme-switch fa-solid fa-sun fa-lg fa-fw" data-mode="light" title="Light"></i>
+    <i class="theme-switch fa-solid fa-moon fa-lg fa-fw" data-mode="dark" title="Dark"></i>
+    <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg fa-fw" data-mode="auto" title="System Settings"></i>
+  </button>
+  <ul class="dropdown-menu dropdown-menu-end">
+    <li><button class="dropdown-item d-flex align-items-center theme-change-button" data-mode="auto"><i class="fa-solid fa-circle-half-stroke fa-lg fa-fw me-1"></i>System Settings</button></li>
+    <li><button class="dropdown-item d-flex align-items-center theme-change-button" data-mode="light"><i class="fa-solid fa-sun fa-lg fa-fw me-1"></i>Light</button></li>
+    <li><button class="dropdown-item d-flex align-items-center theme-change-button" data-mode="dark"><i class="fa-solid fa-moon fa-lg fa-fw me-1"></i>Dark</button></li>
+  </ul>
+</div></div>
         
       </div>
     
@@ -573,7 +587,7 @@
 <td><p>Nemotron</p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">nvidia/Llama-3_1-Nemotron-51B-Instruct</span></code></p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">DeepSeekV2ForCausalLM</span></code> <a class="footnote-reference brackets" href="#id28" id="id1" role="doc-noteref"><span class="fn-bracket">[</span>5<span class="fn-bracket">]</span></a></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">DeepSeekV2ForCausalLM</span></code> <a class="footnote-reference brackets" href="#id27" id="id1" role="doc-noteref"><span class="fn-bracket">[</span>5<span class="fn-bracket">]</span></a></p></td>
 <td><p>DeepSeek V2</p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct</span></code></p></td>
 </tr>
@@ -585,7 +599,7 @@
 <td><p>DeepSeek-V3.2</p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">deepseek-ai/DeepSeek-V3.2</span></code></p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">ExaoneForCausalLM</span></code> <a class="footnote-reference brackets" href="#id28" id="id2" role="doc-noteref"><span class="fn-bracket">[</span>5<span class="fn-bracket">]</span></a></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">ExaoneForCausalLM</span></code> <a class="footnote-reference brackets" href="#id27" id="id2" role="doc-noteref"><span class="fn-bracket">[</span>5<span class="fn-bracket">]</span></a></p></td>
 <td><p>EXAONE 3.5</p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">LGAI-EXAONE/EXAONE-3.5-32B-Instruct</span></code></p></td>
 </tr>
@@ -601,19 +615,19 @@
 <td><p>Gemma 3</p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">google/gemma-3-1b-it</span></code></p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">Gemma3nForConditionalGeneration</span></code> <a class="footnote-reference brackets" href="#id30" id="id3" role="doc-noteref"><span class="fn-bracket">[</span>7<span class="fn-bracket">]</span></a></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">Gemma3nForConditionalGeneration</span></code> <a class="footnote-reference brackets" href="#id29" id="id3" role="doc-noteref"><span class="fn-bracket">[</span>7<span class="fn-bracket">]</span></a></p></td>
 <td><p>Gemma 3n</p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">google/gemma-3n-E2B-it</span></code>, <code class="docutils literal notranslate"><span class="pre">google/gemma-3n-E4B-it</span></code></p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">Gemma4ForConditionalGeneration</span></code> <a class="footnote-reference brackets" href="#id31" id="id4" role="doc-noteref"><span class="fn-bracket">[</span>8<span class="fn-bracket">]</span></a></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">Gemma4ForConditionalGeneration</span></code></p></td>
 <td><p>Gemma 4</p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">google/gemma-4-E2B-it</span></code>, <code class="docutils literal notranslate"><span class="pre">google/gemma-4-E4B-it</span></code>, <code class="docutils literal notranslate"><span class="pre">google/gemma-4-26B-A4B-it</span></code> <a class="footnote-reference brackets" href="#id29" id="id5" role="doc-noteref"><span class="fn-bracket">[</span>6<span class="fn-bracket">]</span></a>, <code class="docutils literal notranslate"><span class="pre">google/gemma-4-31B-it</span></code> <a class="footnote-reference brackets" href="#id29" id="id6" role="doc-noteref"><span class="fn-bracket">[</span>6<span class="fn-bracket">]</span></a></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">google/gemma-4-E2B-it</span></code>, <code class="docutils literal notranslate"><span class="pre">google/gemma-4-E4B-it</span></code>, <code class="docutils literal notranslate"><span class="pre">google/gemma-4-26B-A4B-it</span></code> <a class="footnote-reference brackets" href="#id28" id="id4" role="doc-noteref"><span class="fn-bracket">[</span>6<span class="fn-bracket">]</span></a>, <code class="docutils literal notranslate"><span class="pre">google/gemma-4-31B-it</span></code> <a class="footnote-reference brackets" href="#id28" id="id5" role="doc-noteref"><span class="fn-bracket">[</span>6<span class="fn-bracket">]</span></a></p></td>
 </tr>
 <tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">Glm4MoeForCausalLM</span></code></p></td>
 <td><p>GLM-4.5, GLM-4.6, GLM-4.7</p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">THUDM/GLM-4-100B-A10B</span></code></p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">Glm4MoeLiteForCausalLM</span></code> <a class="footnote-reference brackets" href="#id28" id="id7" role="doc-noteref"><span class="fn-bracket">[</span>5<span class="fn-bracket">]</span></a></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">Glm4MoeLiteForCausalLM</span></code> <a class="footnote-reference brackets" href="#id27" id="id6" role="doc-noteref"><span class="fn-bracket">[</span>5<span class="fn-bracket">]</span></a></p></td>
 <td><p>GLM-4.7-Flash</p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">zai-org/GLM-4.7-Flash</span></code></p></td>
 </tr>
@@ -621,11 +635,11 @@
 <td><p>GLM-5</p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">zai-org/GLM-5</span></code></p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">GraniteForCausalLM</span></code> <a class="footnote-reference brackets" href="#id28" id="id8" role="doc-noteref"><span class="fn-bracket">[</span>5<span class="fn-bracket">]</span></a></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">GraniteForCausalLM</span></code> <a class="footnote-reference brackets" href="#id27" id="id7" role="doc-noteref"><span class="fn-bracket">[</span>5<span class="fn-bracket">]</span></a></p></td>
 <td><p>Granite 3, Granite Guardian 3</p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">ibm-granite/granite-3.1-8b-instruct</span></code>, <code class="docutils literal notranslate"><span class="pre">ibm-granite/granite-3.3-8b-instruct</span></code>, <code class="docutils literal notranslate"><span class="pre">ibm-granite/granite-guardian-3.2-5b</span></code></p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">GraniteMoeHybridForCausalLM</span></code> <a class="footnote-reference brackets" href="#id28" id="id9" role="doc-noteref"><span class="fn-bracket">[</span>5<span class="fn-bracket">]</span></a></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">GraniteMoeHybridForCausalLM</span></code> <a class="footnote-reference brackets" href="#id27" id="id8" role="doc-noteref"><span class="fn-bracket">[</span>5<span class="fn-bracket">]</span></a></p></td>
 <td><p>Granite 4.0 Hybrid MoE</p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">ibm-granite/granite-4.0-h-small</span></code></p></td>
 </tr>
@@ -633,15 +647,15 @@
 <td><p>GPT-OSS</p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">openai/gpt-oss-20b</span></code>, <code class="docutils literal notranslate"><span class="pre">openai/gpt-oss-120b</span></code></p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">HunYuanDenseForCausalLM</span></code> <a class="footnote-reference brackets" href="#id28" id="id10" role="doc-noteref"><span class="fn-bracket">[</span>5<span class="fn-bracket">]</span></a></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">HunYuanDenseForCausalLM</span></code> <a class="footnote-reference brackets" href="#id27" id="id9" role="doc-noteref"><span class="fn-bracket">[</span>5<span class="fn-bracket">]</span></a></p></td>
 <td><p>Hunyuan Dense</p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">tencent/Hunyuan-7B-Instruct</span></code></p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">HunYuanMoEForCausalLM</span></code> <a class="footnote-reference brackets" href="#id28" id="id11" role="doc-noteref"><span class="fn-bracket">[</span>5<span class="fn-bracket">]</span></a></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">HunYuanMoEForCausalLM</span></code> <a class="footnote-reference brackets" href="#id27" id="id10" role="doc-noteref"><span class="fn-bracket">[</span>5<span class="fn-bracket">]</span></a></p></td>
 <td><p>Hunyuan MoE</p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">tencent/Hunyuan-A13B-Instruct</span></code></p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">InternLM3ForCausalLM</span></code> <a class="footnote-reference brackets" href="#id28" id="id12" role="doc-noteref"><span class="fn-bracket">[</span>5<span class="fn-bracket">]</span></a></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">InternLM3ForCausalLM</span></code> <a class="footnote-reference brackets" href="#id27" id="id11" role="doc-noteref"><span class="fn-bracket">[</span>5<span class="fn-bracket">]</span></a></p></td>
 <td><p>InternLM3</p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">internlm/internlm3-8b-instruct</span></code></p></td>
 </tr>
@@ -649,91 +663,95 @@
 <td><p>Kimi-K2.5</p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">moonshotai/Kimi-K2.5</span></code></p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">LlamaForCausalLM</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">LagunaForCausalLM</span></code></p></td>
+<td><p>Laguna-XS</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">poolside/laguna-XS.2</span></code></p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">LlamaForCausalLM</span></code></p></td>
 <td><p>Llama 3.1, Llama 3, Llama 2, LLaMA</p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">meta-llama/Meta-Llama-3.1-70B</span></code></p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">Llama4ForConditionalGeneration</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">Llama4ForConditionalGeneration</span></code></p></td>
 <td><p>Llama 4</p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">meta-llama/Llama-4-Scout-17B-16E-Instruct</span></code></p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MiniMaxM2ForCausalLM</span></code> <a class="footnote-reference brackets" href="#id28" id="id13" role="doc-noteref"><span class="fn-bracket">[</span>5<span class="fn-bracket">]</span></a></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">MiniMaxM2ForCausalLM</span></code> <a class="footnote-reference brackets" href="#id27" id="id12" role="doc-noteref"><span class="fn-bracket">[</span>5<span class="fn-bracket">]</span></a></p></td>
 <td><p>MiniMax M2/M2.1/M2.7</p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">MiniMaxAI/MiniMax-M2.7</span></code></p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">MistralForCausalLM</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MistralForCausalLM</span></code></p></td>
 <td><p>Mistral</p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">mistralai/Mistral-7B-v0.1</span></code></p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MixtralForCausalLM</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">MixtralForCausalLM</span></code></p></td>
 <td><p>Mixtral</p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">mistralai/Mixtral-8x7B-v0.1</span></code></p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">MllamaForConditionalGeneration</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MllamaForConditionalGeneration</span></code></p></td>
 <td><p>Llama 3.2</p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">meta-llama/Llama-3.2-11B-Vision</span></code></p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">NemotronForCausalLM</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">NemotronForCausalLM</span></code></p></td>
 <td><p>Nemotron-3, Nemotron-4, Minitron</p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">nvidia/Minitron-8B-Base</span></code></p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">NemotronHForCausalLM</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">NemotronHForCausalLM</span></code></p></td>
 <td><p>Nemotron-3-Nano, Nemotron-3-Super</p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">nvidia/nvidia-nemotron-v3</span></code></p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">NemotronNASForCausalLM</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">NemotronNASForCausalLM</span></code></p></td>
 <td><p>NemotronNAS</p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">nvidia/Llama-3_3-Nemotron-Super-49B-v1</span></code></p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">Olmo3ForCausalLM</span></code> <a class="footnote-reference brackets" href="#id28" id="id14" role="doc-noteref"><span class="fn-bracket">[</span>5<span class="fn-bracket">]</span></a></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">Olmo3ForCausalLM</span></code> <a class="footnote-reference brackets" href="#id27" id="id13" role="doc-noteref"><span class="fn-bracket">[</span>5<span class="fn-bracket">]</span></a></p></td>
 <td><p>OLMo 3, OLMo 3.1</p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">allenai/Olmo-3.1-32B-Instruct</span></code></p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">OpenELMForCausalLM</span></code> <a class="footnote-reference brackets" href="#id28" id="id15" role="doc-noteref"><span class="fn-bracket">[</span>5<span class="fn-bracket">]</span></a></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">OpenELMForCausalLM</span></code> <a class="footnote-reference brackets" href="#id27" id="id14" role="doc-noteref"><span class="fn-bracket">[</span>5<span class="fn-bracket">]</span></a></p></td>
 <td><p>OpenELM</p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">apple/OpenELM-270M-Instruct</span></code></p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">Phi3ForCausalLM</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">Phi3ForCausalLM</span></code></p></td>
 <td><p>Phi-4</p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">microsoft/Phi-4</span></code></p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">Qwen2ForCausalLM</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">Qwen2ForCausalLM</span></code></p></td>
 <td><p>QwQ, Qwen2</p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">Qwen/Qwen2-7B-Instruct</span></code></p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">Qwen2ForProcessRewardModel</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">Qwen2ForProcessRewardModel</span></code></p></td>
 <td><p>Qwen2-based</p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">Qwen/Qwen2.5-Math-PRM-7B</span></code></p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">Qwen2ForRewardModel</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">Qwen2ForRewardModel</span></code></p></td>
 <td><p>Qwen2-based</p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">Qwen/Qwen2.5-Math-RM-72B</span></code></p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">Qwen3ForCausalLM</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">Qwen3ForCausalLM</span></code></p></td>
 <td><p>Qwen3</p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">Qwen/Qwen3-8B</span></code></p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">Qwen3MoeForCausalLM</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">Qwen3MoeForCausalLM</span></code></p></td>
 <td><p>Qwen3MoE</p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">Qwen/Qwen3-30B-A3B</span></code></p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">Qwen3NextForCausalLM</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">Qwen3NextForCausalLM</span></code></p></td>
 <td><p>Qwen3Next</p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">Qwen/Qwen3-Next-80B-A3B-Thinking</span></code></p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">Qwen3_5MoeForCausalLM</span></code> <a class="footnote-reference brackets" href="#id28" id="id16" role="doc-noteref"><span class="fn-bracket">[</span>5<span class="fn-bracket">]</span></a></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">Qwen3_5MoeForCausalLM</span></code> <a class="footnote-reference brackets" href="#id27" id="id15" role="doc-noteref"><span class="fn-bracket">[</span>5<span class="fn-bracket">]</span></a></p></td>
 <td><p>Qwen3.5-MoE</p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">Qwen/Qwen3.5-397B-A17B</span></code></p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">SeedOssForCausalLM</span></code> <a class="footnote-reference brackets" href="#id28" id="id17" role="doc-noteref"><span class="fn-bracket">[</span>5<span class="fn-bracket">]</span></a></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">SeedOssForCausalLM</span></code> <a class="footnote-reference brackets" href="#id27" id="id16" role="doc-noteref"><span class="fn-bracket">[</span>5<span class="fn-bracket">]</span></a></p></td>
 <td><p>Seed OSS, Seed-Coder</p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">ByteDance-Seed/Seed-OSS-36B-Instruct</span></code></p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">SkyworkR1V2ForConditionalGeneration</span></code> <a class="footnote-reference brackets" href="#id28" id="id18" role="doc-noteref"><span class="fn-bracket">[</span>5<span class="fn-bracket">]</span></a></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">SkyworkR1V2ForConditionalGeneration</span></code> <a class="footnote-reference brackets" href="#id27" id="id17" role="doc-noteref"><span class="fn-bracket">[</span>5<span class="fn-bracket">]</span></a></p></td>
 <td><p>Skywork R1V2, Skywork SWE</p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">Skywork/Skywork-R1V2-38B</span></code></p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">SmolLM3ForCausalLM</span></code> <a class="footnote-reference brackets" href="#id28" id="id19" role="doc-noteref"><span class="fn-bracket">[</span>5<span class="fn-bracket">]</span></a></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">SmolLM3ForCausalLM</span></code> <a class="footnote-reference brackets" href="#id27" id="id18" role="doc-noteref"><span class="fn-bracket">[</span>5<span class="fn-bracket">]</span></a></p></td>
 <td><p>SmolLM3</p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">HuggingFaceTB/SmolLM3-3B</span></code></p></td>
 </tr>
@@ -769,14 +787,14 @@
 <td><p>Yes</p></td>
 <td><p>Yes</p></td>
 <td><p>Yes</p></td>
-<td><p>Yes <a class="footnote-reference brackets" href="#id25" id="id20" role="doc-noteref"><span class="fn-bracket">[</span>1<span class="fn-bracket">]</span></a></p></td>
+<td><p>Yes <a class="footnote-reference brackets" href="#id24" id="id19" role="doc-noteref"><span class="fn-bracket">[</span>1<span class="fn-bracket">]</span></a></p></td>
 <td><p>Yes</p></td>
 <td><p>No</p></td>
 <td><p>No</p></td>
 <td><p>No</p></td>
 <td><p>Yes</p></td>
 <td><p>Yes</p></td>
-<td><p>Yes <a class="footnote-reference brackets" href="#id26" id="id21" role="doc-noteref"><span class="fn-bracket">[</span>2<span class="fn-bracket">]</span></a></p></td>
+<td><p>Yes <a class="footnote-reference brackets" href="#id25" id="id20" role="doc-noteref"><span class="fn-bracket">[</span>2<span class="fn-bracket">]</span></a></p></td>
 <td><p>N/A</p></td>
 <td><p>Yes</p></td>
 <td><p>Yes</p></td>
@@ -832,7 +850,7 @@
 <td><p>Yes</p></td>
 <td><p>Yes</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">Qwen3NextForCausalLM</span></code> <a class="footnote-reference brackets" href="#id27" id="id22" role="doc-noteref"><span class="fn-bracket">[</span>3<span class="fn-bracket">]</span></a></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">Qwen3NextForCausalLM</span></code> <a class="footnote-reference brackets" href="#id26" id="id21" role="doc-noteref"><span class="fn-bracket">[</span>3<span class="fn-bracket">]</span></a></p></td>
 <td><p>Yes</p></td>
 <td><p>Yes</p></td>
 <td><p>Yes</p></td>
@@ -883,7 +901,7 @@
 <td><p>Yes</p></td>
 <td><p>Yes</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">Qwen3_5MoeForCausalLM</span></code> <a class="footnote-reference brackets" href="#id28" id="id23" role="doc-noteref"><span class="fn-bracket">[</span>5<span class="fn-bracket">]</span></a></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">Qwen3_5MoeForCausalLM</span></code> <a class="footnote-reference brackets" href="#id27" id="id22" role="doc-noteref"><span class="fn-bracket">[</span>5<span class="fn-bracket">]</span></a></p></td>
 <td><p>Yes</p></td>
 <td><p>Yes</p></td>
 <td><p>Untested</p></td>
@@ -900,7 +918,7 @@
 <td><p>Untested</p></td>
 <td><p>Untested</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">Glm4MoeLiteForCausalLM</span></code> <a class="footnote-reference brackets" href="#id28" id="id24" role="doc-noteref"><span class="fn-bracket">[</span>5<span class="fn-bracket">]</span></a></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">Glm4MoeLiteForCausalLM</span></code> <a class="footnote-reference brackets" href="#id27" id="id23" role="doc-noteref"><span class="fn-bracket">[</span>5<span class="fn-bracket">]</span></a></p></td>
 <td><p>Yes</p></td>
 <td><p>Yes</p></td>
 <td><p>Untested</p></td>
@@ -939,7 +957,7 @@
 <td><p>Yes</p></td>
 <td><p>Untested</p></td>
 <td><p>No</p></td>
-<td><p>No</p></td>
+<td><p>Yes</p></td>
 <td><p>No</p></td>
 <td><p>No</p></td>
 <td><p>No</p></td>
@@ -973,7 +991,18 @@
 </tr>
 </thead>
 <tbody>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">Gemma3ForConditionalGeneration</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">Exaone4_5_ForConditionalGeneration</span></code></p></td>
+<td><p>Yes</p></td>
+<td><p>Yes</p></td>
+<td><p>Yes</p></td>
+<td><p>Yes</p></td>
+<td><p>Yes</p></td>
+<td><p>Yes</p></td>
+<td><p>Yes</p></td>
+<td><p>No</p></td>
+<td><p>L + I + V</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">Gemma3ForConditionalGeneration</span></code></p></td>
 <td><p>Yes</p></td>
 <td><p>Yes</p></td>
 <td><p>N/A</p></td>
@@ -984,18 +1013,18 @@
 <td><p>No</p></td>
 <td><p>L + I</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">Gemma4ForConditionalGeneration</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">Gemma4ForConditionalGeneration</span></code></p></td>
 <td><p>Untested</p></td>
 <td><p>Yes</p></td>
-<td><p>No</p></td>
+<td><p>Yes</p></td>
 <td><p>Yes</p></td>
 <td><p>Untested</p></td>
 <td><p>No</p></td>
 <td><p>Untested</p></td>
 <td><p>No</p></td>
-<td><p>L + I + A <a class="footnote-reference brackets" href="#id32" id="id33" role="doc-noteref"><span class="fn-bracket">[</span>9<span class="fn-bracket">]</span></a></p></td>
+<td><p>L + I + V + A <a class="footnote-reference brackets" href="#id30" id="id31" role="doc-noteref"><span class="fn-bracket">[</span>9<span class="fn-bracket">]</span></a></p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">HCXVisionForCausalLM</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">HCXVisionForCausalLM</span></code></p></td>
 <td><p>Yes</p></td>
 <td><p>Yes</p></td>
 <td><p>No</p></td>
@@ -1006,7 +1035,7 @@
 <td><p>No</p></td>
 <td><p>L + I</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">LlavaLlamaModel</span> <span class="pre">(VILA)</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">LlavaLlamaModel</span> <span class="pre">(VILA)</span></code></p></td>
 <td><p>Yes</p></td>
 <td><p>Yes</p></td>
 <td><p>No</p></td>
@@ -1017,7 +1046,7 @@
 <td><p>No</p></td>
 <td><p>L + I + V</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">LlavaNextForConditionalGeneration</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">LlavaNextForConditionalGeneration</span></code></p></td>
 <td><p>Yes</p></td>
 <td><p>Yes</p></td>
 <td><p>Yes</p></td>
@@ -1028,7 +1057,7 @@
 <td><p>Yes</p></td>
 <td><p>L + I</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">Llama4ForConditionalGeneration</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">Llama4ForConditionalGeneration</span></code></p></td>
 <td><p>Yes</p></td>
 <td><p>Yes</p></td>
 <td><p>No</p></td>
@@ -1039,7 +1068,7 @@
 <td><p>No</p></td>
 <td><p>L + I</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">Mistral3ForConditionalGeneration</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">Mistral3ForConditionalGeneration</span></code></p></td>
 <td><p>Yes</p></td>
 <td><p>Yes</p></td>
 <td><p>Yes</p></td>
@@ -1050,7 +1079,7 @@
 <td><p>No</p></td>
 <td><p>L + I</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">NemotronH_Nano_VL_V2</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">NemotronH_Nano_VL_V2</span></code></p></td>
 <td><p>Yes</p></td>
 <td><p>Yes</p></td>
 <td><p>Yes</p></td>
@@ -1061,7 +1090,7 @@
 <td><p>No</p></td>
 <td><p>L + I + V</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">Phi4MMForCausalLM</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">Phi4MMForCausalLM</span></code></p></td>
 <td><p>Yes</p></td>
 <td><p>Yes</p></td>
 <td><p>Yes</p></td>
@@ -1072,7 +1101,7 @@
 <td><p>No</p></td>
 <td><p>L + I + A</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">Qwen2VLForConditionalGeneration</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">Qwen2VLForConditionalGeneration</span></code></p></td>
 <td><p>Yes</p></td>
 <td><p>Yes</p></td>
 <td><p>Yes</p></td>
@@ -1083,7 +1112,7 @@
 <td><p>No</p></td>
 <td><p>L + I + V</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">Qwen2_5_VLForConditionalGeneration</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">Qwen2_5_VLForConditionalGeneration</span></code></p></td>
 <td><p>Yes</p></td>
 <td><p>Yes</p></td>
 <td><p>Yes</p></td>
@@ -1094,7 +1123,7 @@
 <td><p>Yes</p></td>
 <td><p>L + I + V</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">Qwen3VLForConditionalGeneration</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">Qwen3VLForConditionalGeneration</span></code></p></td>
 <td><p>Yes</p></td>
 <td><p>Yes</p></td>
 <td><p>Yes</p></td>
@@ -1105,7 +1134,7 @@
 <td><p>Yes</p></td>
 <td><p>L + I + V</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">Qwen3VLMoeForConditionalGeneration</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">Qwen3VLMoeForConditionalGeneration</span></code></p></td>
 <td><p>Yes</p></td>
 <td><p>Yes</p></td>
 <td><p>Yes</p></td>
@@ -1131,8 +1160,8 @@
 <h1>Visual Generation Models<a class="headerlink" href="#visual-generation-models" title="Link to this heading">#</a></h1>
 <p>TensorRT-LLM provides beta support for diffusion-based image and video generation.
 For full documentation, see the <a class="reference internal" href="visual-generation.html"><span class="std std-doc">Visual Generation</span></a> page.</p>
-<section id="id34">
-<h2>Supported Models<a class="headerlink" href="#id34" title="Link to this heading">#</a></h2>
+<section id="id32">
+<h2>Supported Models<a class="headerlink" href="#id32" title="Link to this heading">#</a></h2>
 <div class="pst-scrollable-table-container"><table class="table">
 <thead>
 <tr class="row-odd"><th class="head"><p>HuggingFace Model ID</p></th>
@@ -1191,7 +1220,7 @@ For full documentation, see the <a class="reference internal" href="visual-gener
 <tbody>
 <tr class="row-even"><td><p><strong>FLUX.1</strong></p></td>
 <td><p>Yes</p></td>
-<td><p>No <a class="footnote-reference brackets" href="#vg1" id="id35" role="doc-noteref"><span class="fn-bracket">[</span>4<span class="fn-bracket">]</span></a></p></td>
+<td><p>No <a class="footnote-reference brackets" href="#vg1" id="id33" role="doc-noteref"><span class="fn-bracket">[</span>4<span class="fn-bracket">]</span></a></p></td>
 <td><p>Yes</p></td>
 <td><p>No</p></td>
 <td><p>Yes</p></td>
@@ -1200,7 +1229,7 @@ For full documentation, see the <a class="reference internal" href="visual-gener
 </tr>
 <tr class="row-odd"><td><p><strong>FLUX.2</strong></p></td>
 <td><p>Yes</p></td>
-<td><p>No <a class="footnote-reference brackets" href="#vg1" id="id36" role="doc-noteref"><span class="fn-bracket">[</span>4<span class="fn-bracket">]</span></a></p></td>
+<td><p>No <a class="footnote-reference brackets" href="#vg1" id="id34" role="doc-noteref"><span class="fn-bracket">[</span>4<span class="fn-bracket">]</span></a></p></td>
 <td><p>Yes</p></td>
 <td><p>No</p></td>
 <td><p>Yes</p></td>
@@ -1241,43 +1270,39 @@ For full documentation, see the <a class="reference internal" href="visual-gener
 </section>
 <hr class="footnotes docutils" />
 <aside class="footnote-list brackets">
-<aside class="footnote brackets" id="id25" role="doc-footnote">
-<span class="label"><span class="fn-bracket">[</span><a role="doc-backlink" href="#id20">1</a><span class="fn-bracket">]</span></span>
+<aside class="footnote brackets" id="id24" role="doc-footnote">
+<span class="label"><span class="fn-bracket">[</span><a role="doc-backlink" href="#id19">1</a><span class="fn-bracket">]</span></span>
 <p>Chunked Prefill for MLA can only be enabled on SM100/SM103.</p>
 </aside>
-<aside class="footnote brackets" id="id26" role="doc-footnote">
-<span class="label"><span class="fn-bracket">[</span><a role="doc-backlink" href="#id21">2</a><span class="fn-bracket">]</span></span>
+<aside class="footnote brackets" id="id25" role="doc-footnote">
+<span class="label"><span class="fn-bracket">[</span><a role="doc-backlink" href="#id20">2</a><span class="fn-bracket">]</span></span>
 <p>KV cache reuse for MLA can only be enabled on SM90/SM100/SM103 and in BF16/FP8 KV cache dtype.</p>
 </aside>
-<aside class="footnote brackets" id="id27" role="doc-footnote">
-<span class="label"><span class="fn-bracket">[</span><a role="doc-backlink" href="#id22">3</a><span class="fn-bracket">]</span></span>
+<aside class="footnote brackets" id="id26" role="doc-footnote">
+<span class="label"><span class="fn-bracket">[</span><a role="doc-backlink" href="#id21">3</a><span class="fn-bracket">]</span></span>
 <p>Qwen3-Next-80B-A3B exhibits relatively low accuracy on the SciCode-AA-v2 benchmark.</p>
 </aside>
 <aside class="footnote brackets" id="vg1" role="doc-footnote">
 <span class="label"><span class="fn-bracket">[</span>4<span class="fn-bracket">]</span></span>
-<span class="backrefs">(<a role="doc-backlink" href="#id35">1</a>,<a role="doc-backlink" href="#id36">2</a>)</span>
+<span class="backrefs">(<a role="doc-backlink" href="#id33">1</a>,<a role="doc-backlink" href="#id34">2</a>)</span>
 <p>FLUX models use embedded guidance and do not have a separate negative prompt path, so CFG parallelism is not applicable.</p>
 </aside>
-<aside class="footnote brackets" id="id28" role="doc-footnote">
+<aside class="footnote brackets" id="id27" role="doc-footnote">
 <span class="label"><span class="fn-bracket">[</span>5<span class="fn-bracket">]</span></span>
-<span class="backrefs">(<a role="doc-backlink" href="#id1">1</a>,<a role="doc-backlink" href="#id2">2</a>,<a role="doc-backlink" href="#id7">3</a>,<a role="doc-backlink" href="#id8">4</a>,<a role="doc-backlink" href="#id9">5</a>,<a role="doc-backlink" href="#id10">6</a>,<a role="doc-backlink" href="#id11">7</a>,<a role="doc-backlink" href="#id12">8</a>,<a role="doc-backlink" href="#id13">9</a>,<a role="doc-backlink" href="#id14">10</a>,<a role="doc-backlink" href="#id15">11</a>,<a role="doc-backlink" href="#id16">12</a>,<a role="doc-backlink" href="#id17">13</a>,<a role="doc-backlink" href="#id18">14</a>,<a role="doc-backlink" href="#id19">15</a>,<a role="doc-backlink" href="#id23">16</a>,<a role="doc-backlink" href="#id24">17</a>)</span>
+<span class="backrefs">(<a role="doc-backlink" href="#id1">1</a>,<a role="doc-backlink" href="#id2">2</a>,<a role="doc-backlink" href="#id6">3</a>,<a role="doc-backlink" href="#id7">4</a>,<a role="doc-backlink" href="#id8">5</a>,<a role="doc-backlink" href="#id9">6</a>,<a role="doc-backlink" href="#id10">7</a>,<a role="doc-backlink" href="#id11">8</a>,<a role="doc-backlink" href="#id12">9</a>,<a role="doc-backlink" href="#id13">10</a>,<a role="doc-backlink" href="#id14">11</a>,<a role="doc-backlink" href="#id15">12</a>,<a role="doc-backlink" href="#id16">13</a>,<a role="doc-backlink" href="#id17">14</a>,<a role="doc-backlink" href="#id18">15</a>,<a role="doc-backlink" href="#id22">16</a>,<a role="doc-backlink" href="#id23">17</a>)</span>
 <p>Supported via the <a class="reference internal" href="../features/auto_deploy/auto-deploy.html"><span class="std std-doc">AutoDeploy</span></a> backend. See <a class="reference internal" href="#../../../examples/auto_deploy/model_registry/configs"><span class="xref myst">AD Configs</span></a>.</p>
 </aside>
-<aside class="footnote brackets" id="id29" role="doc-footnote">
+<aside class="footnote brackets" id="id28" role="doc-footnote">
 <span class="label"><span class="fn-bracket">[</span>6<span class="fn-bracket">]</span></span>
-<span class="backrefs">(<a role="doc-backlink" href="#id5">1</a>,<a role="doc-backlink" href="#id6">2</a>)</span>
+<span class="backrefs">(<a role="doc-backlink" href="#id4">1</a>,<a role="doc-backlink" href="#id5">2</a>)</span>
 <p>Also supports text-only inference via the <a class="reference internal" href="../features/auto_deploy/auto-deploy.html"><span class="std std-doc">AutoDeploy</span></a> backend.</p>
 </aside>
-<aside class="footnote brackets" id="id30" role="doc-footnote">
+<aside class="footnote brackets" id="id29" role="doc-footnote">
 <span class="label"><span class="fn-bracket">[</span><a role="doc-backlink" href="#id3">7</a><span class="fn-bracket">]</span></span>
 <p>Text-only support via the <a class="reference internal" href="../features/auto_deploy/auto-deploy.html"><span class="std std-doc">AutoDeploy</span></a> backend.</p>
 </aside>
-<aside class="footnote brackets" id="id31" role="doc-footnote">
-<span class="label"><span class="fn-bracket">[</span><a role="doc-backlink" href="#id4">8</a><span class="fn-bracket">]</span></span>
-<p>Requires manually upgrading transformers to 5.5.3 for Gemma 4.</p>
-</aside>
-<aside class="footnote brackets" id="id32" role="doc-footnote">
-<span class="label"><span class="fn-bracket">[</span><a role="doc-backlink" href="#id33">9</a><span class="fn-bracket">]</span></span>
+<aside class="footnote brackets" id="id30" role="doc-footnote">
+<span class="label"><span class="fn-bracket">[</span><a role="doc-backlink" href="#id31">9</a><span class="fn-bracket">]</span></span>
 <p>Audio modality only supported on E2B/E4B variants.</p>
 </aside>
 </aside>
@@ -1337,7 +1362,7 @@ For full documentation, see the <a class="reference internal" href="visual-gener
 </li>
 <li class="toc-h1 nav-item toc-entry"><a class="reference internal nav-link" href="#multimodal-feature-support-matrix-pytorch-backend">Multimodal Feature Support Matrix (PyTorch Backend)</a></li>
 <li class="toc-h1 nav-item toc-entry"><a class="reference internal nav-link" href="#visual-generation-models">Visual Generation Models</a><ul class="pst-show_toc_level nav section-nav flex-column">
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#id34">Supported Models</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#id32">Supported Models</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#feature-matrix">Feature Matrix</a></li>
 </ul>
 </li>
@@ -1360,8 +1385,8 @@ For full documentation, see the <a class="reference internal" href="visual-gener
   
 
   <!-- Scripts loaded after <body> so the DOM is not blocked -->
-  <script defer src="../_static/scripts/bootstrap.js?digest=55c26ed414f5f8a31ebb"></script>
-<script defer src="../_static/scripts/pydata-sphinx-theme.js?digest=55c26ed414f5f8a31ebb"></script>
+  <script defer src="../_static/scripts/bootstrap.js?digest=0790524f97105ba85085"></script>
+<script defer src="../_static/scripts/pydata-sphinx-theme.js?digest=0790524f97105ba85085"></script>
 
 
   <footer class="bd-footer">
@@ -1433,9 +1458,9 @@ For full documentation, see the <a class="reference internal" href="visual-gener
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on May 20, 2026.</p>
+  <p>Last updated on May 25, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/c72d43d">c72d43d</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/4517988">4517988</a>.</p>
   
 </div></div>
       

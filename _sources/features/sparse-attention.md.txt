@@ -350,6 +350,83 @@ Skip Softmax Attention is supported only with the **trtllm** attention backend, 
 - **Hopper decode**: [XQA](https://github.com/NVIDIA/TensorRT-LLM/tree/main/cpp/kernels/xqa)
 - **Blackwell**: [trtllm-gen](https://github.com/NVIDIA/TensorRT-LLM/tree/main/cpp/tensorrt_llm/kernels/trtllmGenKernels)
 
+#### Configuring Skip Softmax Attention
+
+The single tunable is the per-block **threshold** — the larger it is, the more KV
+blocks are skipped (higher sparsity, lower fidelity). You have three ways to
+set it, listed in priority order; the first match wins.
+
+**1. Raw threshold (LLM API or YAML).** The simplest path: pass a fixed value
+that the kernel uses directly. Resolution-dependent; calibrate per workload.
+
+```python
+# LLM API
+from tensorrt_llm.llmapi import SkipSoftmaxAttentionConfig
+sparse_attention_config = SkipSoftmaxAttentionConfig(threshold_scale_factor=1000.0)
+# Or per-phase:
+sparse_attention_config = SkipSoftmaxAttentionConfig(
+    threshold_scale_factor={"prefill": 1000.0, "decode": 500.0}
+)
+```
+
+```yaml
+# YAML (e.g., extra_llm_api_options for trtllm-serve / trtllm-bench)
+attention:
+  backend: TRTLLM
+  sparse_attention_config:
+    algorithm: skip_softmax
+    threshold_scale_factor: 1000.0
+```
+
+**2. Target sparsity (visual-generation models).** Visual-gen pipelines also
+accept a semantic `target_sparsity` (∈ [0, 1]). The threshold is computed from
+a calibration formula `threshold = exp(log_a + b · target_sparsity)` whose
+coefficients come from ModelOpt — either a sparse YAML
+(`sparse_config_path`) or the checkpoint's `config.json`. You do *not* set
+the formula coefficients yourself; they are an internal ModelOpt-produced
+artifact.
+
+```yaml
+# Point at a ModelOpt-produced sparse YAML and just set the sparsity target:
+attention:
+  backend: TRTLLM
+  sparse_config_path: /path/to/sparse.yaml
+  sparse_attention_config:
+    algorithm: skip_softmax
+    target_sparsity: 0.70
+```
+
+`sparse_config_path` is a path to the ModelOpt-produced sparse-attention
+artifact, not a second TRT-LLM runtime configuration file. For
+`trtllm-serve`/`trtllm-bench`, put this path inside the normal `--config`
+YAML. If a consolidated `sparse.yaml` is already present at the checkpoint
+root, omit `sparse_config_path` and let the loader auto-detect it.
+
+**3. Auto-detect from checkpoint.** ModelOpt-calibrated checkpoints ship the
+calibration formula in their `config.json` under
+`sparse_attention_config.threshold_scale_factor.prefill = {a, b}`, or in a
+consolidated `sparse.yaml` at the checkpoint root. The pipeline loader picks
+either up automatically — no `sparse_config_path` needed for the common case.
+Auto-detection supplies calibration only; the user must still set
+`target_sparsity` or an explicit `threshold_scale_factor` to enable skip-softmax.
+
+```yaml
+# With a ModelOpt-calibrated checkpoint, this is enough:
+attention:
+  backend: TRTLLM
+  sparse_attention_config:
+    algorithm: skip_softmax
+    target_sparsity: 0.70   # formula auto-resolved from checkpoint
+```
+
+**Per-layer overrides** are part of the ModelOpt calibration output (the
+`disabled_layers` list in `sparse.yaml`), not a user-facing knob. To disable
+skip-softmax on specific layers, edit the ModelOpt sparse YAML — the pipeline
+loader will pick up the overrides automatically.
+
+For algorithm details, see the [paper](https://arxiv.org/pdf/2512.12087) and
+the [tech blog](../blogs/tech_blog/blog16_Accelerating_Long_Context_Inference_with_Skip_Softmax_Attention.md).
+
 
 ### Summary
 

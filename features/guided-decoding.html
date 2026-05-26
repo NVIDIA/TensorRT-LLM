@@ -28,8 +28,8 @@
   </noscript>
   
   <!-- Loaded before other Sphinx assets -->
-  <link href="../_static/styles/theme.css?digest=55c26ed414f5f8a31ebb" rel="stylesheet" />
-<link href="../_static/styles/pydata-sphinx-theme.css?digest=55c26ed414f5f8a31ebb" rel="stylesheet" />
+  <link href="../_static/styles/theme.css?digest=0790524f97105ba85085" rel="stylesheet" />
+<link href="../_static/styles/pydata-sphinx-theme.css?digest=0790524f97105ba85085" rel="stylesheet" />
 
     <link rel="stylesheet" type="text/css" href="../_static/pygments.css?v=8f2a1f02" />
     <link rel="stylesheet" type="text/css" href="../_static/styles/nvidia-sphinx-theme.css?v=933278ad" />
@@ -40,10 +40,10 @@
     <link rel="stylesheet" type="text/css" href="../_static/custom.css?v=19d20f17" />
   
   <!-- So that users can add custom icons -->
-  <script defer src="../_static/scripts/fontawesome.js?digest=55c26ed414f5f8a31ebb"></script>
+  <script defer src="../_static/scripts/fontawesome.js?digest=0790524f97105ba85085"></script>
   <!-- Pre-loaded scripts that we'll load fully later -->
-  <link rel="preload" as="script" href="../_static/scripts/bootstrap.js?digest=55c26ed414f5f8a31ebb" />
-<link rel="preload" as="script" href="../_static/scripts/pydata-sphinx-theme.js?digest=55c26ed414f5f8a31ebb" />
+  <link rel="preload" as="script" href="../_static/scripts/bootstrap.js?digest=0790524f97105ba85085" />
+<link rel="preload" as="script" href="../_static/scripts/pydata-sphinx-theme.js?digest=0790524f97105ba85085" />
 
 
 
@@ -61,9 +61,9 @@
     <script>var togglebuttonSelector = '.toggle, .admonition.dropdown';</script>
     <script>DOCUMENTATION_OPTIONS.pagename = 'features/guided-decoding';</script>
     <script>
-        DOCUMENTATION_OPTIONS.theme_version = '0.17.1';
+        DOCUMENTATION_OPTIONS.theme_version = '0.18.0';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc15';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc16';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -79,7 +79,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.3.0rc15" />
+  <meta name="docsearch:version" content="1.3.0rc16" />
   
     
     <script src="../_static/searchtools.js"></script>
@@ -210,11 +210,18 @@
       
         <div class="navbar-item">
 
-<button class="btn btn-sm nav-link pst-navbar-icon theme-switch-button pst-js-only" aria-label="Color mode" data-bs-title="Color mode"  data-bs-placement="bottom" data-bs-toggle="tooltip">
-  <i class="theme-switch fa-solid fa-sun                fa-lg" data-mode="light" title="Light"></i>
-  <i class="theme-switch fa-solid fa-moon               fa-lg" data-mode="dark"  title="Dark"></i>
-  <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg" data-mode="auto"  title="System Settings"></i>
-</button></div>
+<div class="theme-switch-container dropdown pst-js-only" data-bs-toggle="tooltip" data-bs-placement="bottom" title="Color mode">
+  <button class="btn btn-sm nav-link pst-navbar-icon theme-switch-button dropdown-toggle" aria-label="Color mode" data-bs-toggle="dropdown">
+    <i class="theme-switch fa-solid fa-sun fa-lg fa-fw" data-mode="light" title="Light"></i>
+    <i class="theme-switch fa-solid fa-moon fa-lg fa-fw" data-mode="dark" title="Dark"></i>
+    <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg fa-fw" data-mode="auto" title="System Settings"></i>
+  </button>
+  <ul class="dropdown-menu dropdown-menu-end">
+    <li><button class="dropdown-item d-flex align-items-center theme-change-button" data-mode="auto"><i class="fa-solid fa-circle-half-stroke fa-lg fa-fw me-1"></i>System Settings</button></li>
+    <li><button class="dropdown-item d-flex align-items-center theme-change-button" data-mode="light"><i class="fa-solid fa-sun fa-lg fa-fw me-1"></i>Light</button></li>
+    <li><button class="dropdown-item d-flex align-items-center theme-change-button" data-mode="dark"><i class="fa-solid fa-moon fa-lg fa-fw me-1"></i>Dark</button></li>
+  </ul>
+</div></div>
       
     </div>
     
@@ -315,11 +322,18 @@
         
           <div class="navbar-item">
 
-<button class="btn btn-sm nav-link pst-navbar-icon theme-switch-button pst-js-only" aria-label="Color mode" data-bs-title="Color mode"  data-bs-placement="bottom" data-bs-toggle="tooltip">
-  <i class="theme-switch fa-solid fa-sun                fa-lg" data-mode="light" title="Light"></i>
-  <i class="theme-switch fa-solid fa-moon               fa-lg" data-mode="dark"  title="Dark"></i>
-  <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg" data-mode="auto"  title="System Settings"></i>
-</button></div>
+<div class="theme-switch-container dropdown pst-js-only" data-bs-toggle="tooltip" data-bs-placement="bottom" title="Color mode">
+  <button class="btn btn-sm nav-link pst-navbar-icon theme-switch-button dropdown-toggle" aria-label="Color mode" data-bs-toggle="dropdown">
+    <i class="theme-switch fa-solid fa-sun fa-lg fa-fw" data-mode="light" title="Light"></i>
+    <i class="theme-switch fa-solid fa-moon fa-lg fa-fw" data-mode="dark" title="Dark"></i>
+    <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg fa-fw" data-mode="auto" title="System Settings"></i>
+  </button>
+  <ul class="dropdown-menu dropdown-menu-end">
+    <li><button class="dropdown-item d-flex align-items-center theme-change-button" data-mode="auto"><i class="fa-solid fa-circle-half-stroke fa-lg fa-fw me-1"></i>System Settings</button></li>
+    <li><button class="dropdown-item d-flex align-items-center theme-change-button" data-mode="light"><i class="fa-solid fa-sun fa-lg fa-fw me-1"></i>Light</button></li>
+    <li><button class="dropdown-item d-flex align-items-center theme-change-button" data-mode="dark"><i class="fa-solid fa-moon fa-lg fa-fw me-1"></i>Dark</button></li>
+  </ul>
+</div></div>
         
       </div>
     
@@ -555,7 +569,7 @@
 <p>Guided decoding (or interchangeably constrained decoding, structured generation) guarantees that the LLM outputs are amenable to a user-specified grammar (e.g., JSON schema, <a class="reference external" href="https://en.wikipedia.org/wiki/Regular_expression">regular expression</a> or <a class="reference external" href="https://en.wikipedia.org/wiki/Extended_Backus%E2%80%93Naur_form">EBNF</a> grammar).</p>
 <p>TensorRT LLM supports two grammar backends:</p>
 <ul class="simple">
-<li><p><a class="reference external" href="https://github.com/mlc-ai/xgrammar/blob/v0.1.21/python/xgrammar/matcher.py#L341-L350">XGrammar</a>: Supports JSON schema, regular expression, EBNF and <a class="reference external" href="https://xgrammar.mlc.ai/docs/tutorials/structural_tag.html">structural tag</a>.</p></li>
+<li><p><a class="reference external" href="https://github.com/mlc-ai/xgrammar/blob/v0.1.21/python/xgrammar/matcher.py#L341-L350">XGrammar</a>: Supports JSON schema, regular expression, EBNF and <a class="reference external" href="https://xgrammar.mlc.ai/docs/structural_tag/structural_tag_api.html">structural tag</a>.</p></li>
 <li><p><a class="reference external" href="https://github.com/guidance-ai/llguidance/blob/v1.1.1/python/llguidance/_lib.pyi#L363-L366">LLGuidance</a>: Supports JSON schema, regular expression, EBNF.</p></li>
 </ul>
 <section id="online-api-trtllm-serve">
@@ -721,7 +735,7 @@ trtllm-serve<span class="w"> </span>nvidia/Llama-3.1-8B-Instruct-FP8<span class=
 <section id="structural-tag">
 <h3>Structural tag<a class="headerlink" href="#structural-tag" title="Link to this heading">#</a></h3>
 <p>Define a structural tag and pass it to <code class="docutils literal notranslate"><span class="pre">response_format</span></code> when creating the OpenAI chat completion request.</p>
-<p>Structural tag is supported by <code class="docutils literal notranslate"><span class="pre">xgrammar</span></code> backend only. It is a powerful and flexible tool to represent the LLM output constraints. Please see <a class="reference external" href="https://xgrammar.mlc.ai/docs/tutorials/structural_tag.html">structural tag usage</a> for a comprehensive tutorial. Below is an example of function calling with customized function call format for <code class="docutils literal notranslate"><span class="pre">Llama-3.1-8B-Instruct</span></code>.</p>
+<p>Structural tag is supported by <code class="docutils literal notranslate"><span class="pre">xgrammar</span></code> backend only. It is a powerful and flexible tool to represent the LLM output constraints. Please see <a class="reference external" href="https://xgrammar.mlc.ai/docs/structural_tag/structural_tag_api.html">structural tag usage</a> for a comprehensive tutorial. Below is an example of function calling with customized function call format for <code class="docutils literal notranslate"><span class="pre">Llama-3.1-8B-Instruct</span></code>.</p>
 <div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">from</span><span class="w"> </span><span class="nn">openai</span><span class="w"> </span><span class="kn">import</span> <span class="n">OpenAI</span>
 
 <span class="n">client</span> <span class="o">=</span> <span class="n">OpenAI</span><span class="p">(</span>
@@ -984,7 +998,7 @@ trtllm-serve<span class="w"> </span>nvidia/Llama-3.1-8B-Instruct-FP8<span class=
 <section id="id4">
 <h3>Structural tag<a class="headerlink" href="#id4" title="Link to this heading">#</a></h3>
 <p>Create a <code class="docutils literal notranslate"><span class="pre">GuidedDecodingParams</span></code> with the <code class="docutils literal notranslate"><span class="pre">structural_tag</span></code> field specified with a structural tag string, use it to create <code class="docutils literal notranslate"><span class="pre">SamplingParams</span></code>, and then pass to <code class="docutils literal notranslate"><span class="pre">llm.generate</span></code> or <code class="docutils literal notranslate"><span class="pre">llm.generate_async</span></code>.</p>
-<p>Structural tag is supported by <code class="docutils literal notranslate"><span class="pre">xgrammar</span></code> backend only. It is a powerful and flexible tool to represent the LLM output constraints. Please see <a class="reference external" href="https://xgrammar.mlc.ai/docs/tutorials/structural_tag.html">structural tag usage</a> for a comprehensive tutorial. Below is an example of function calling with customized function call format for <code class="docutils literal notranslate"><span class="pre">Llama-3.1-8B-Instruct</span></code>.</p>
+<p>Structural tag is supported by <code class="docutils literal notranslate"><span class="pre">xgrammar</span></code> backend only. It is a powerful and flexible tool to represent the LLM output constraints. Please see <a class="reference external" href="https://xgrammar.mlc.ai/docs/structural_tag/structural_tag_api.html">structural tag usage</a> for a comprehensive tutorial. Below is an example of function calling with customized function call format for <code class="docutils literal notranslate"><span class="pre">Llama-3.1-8B-Instruct</span></code>.</p>
 <div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">import</span><span class="w"> </span><span class="nn">json</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm</span><span class="w"> </span><span class="kn">import</span> <span class="n">LLM</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm.sampling_params</span><span class="w"> </span><span class="kn">import</span> <span class="n">SamplingParams</span><span class="p">,</span> <span class="n">GuidedDecodingParams</span>
@@ -1196,8 +1210,8 @@ trtllm-serve<span class="w"> </span>nvidia/Llama-3.1-8B-Instruct-FP8<span class=
   
 
   <!-- Scripts loaded after <body> so the DOM is not blocked -->
-  <script defer src="../_static/scripts/bootstrap.js?digest=55c26ed414f5f8a31ebb"></script>
-<script defer src="../_static/scripts/pydata-sphinx-theme.js?digest=55c26ed414f5f8a31ebb"></script>
+  <script defer src="../_static/scripts/bootstrap.js?digest=0790524f97105ba85085"></script>
+<script defer src="../_static/scripts/pydata-sphinx-theme.js?digest=0790524f97105ba85085"></script>
 
 
   <footer class="bd-footer">
@@ -1269,9 +1283,9 @@ trtllm-serve<span class="w"> </span>nvidia/Llama-3.1-8B-Instruct-FP8<span class=
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on May 20, 2026.</p>
+  <p>Last updated on May 25, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/c72d43d">c72d43d</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/4517988">4517988</a>.</p>
   
 </div></div>
       
