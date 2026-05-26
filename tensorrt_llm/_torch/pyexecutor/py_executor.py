@@ -3582,6 +3582,8 @@ class PyExecutor:
                 for beam in range(0, beam_width):
                     req.add_new_token(first_gen_tokens[beam], beam)
                 self._seed_disagg_beam_cum_log_probs(req, beam_width)
+                self._seed_disagg_beam_original_tokens(
+                    req, beam_width, first_gen_tokens)
                 self._assert_disagg_beam_original_tokens(
                     req, beam_width, first_gen_tokens)
                 logger.info(
@@ -3601,6 +3603,47 @@ class PyExecutor:
             "tail": tokens[-max_tokens:],
         } for beam in range(beam_width)
                 for tokens in [list(req.get_tokens(beam))]]
+
+    def _seed_disagg_beam_original_tokens(self, req, beam_width,
+                                          first_gen_tokens):
+        """Seed beam-history storage with context-side first generated tokens."""
+        if beam_width <= 1:
+            return
+
+        seq_slot = req.py_seq_slot
+        if seq_slot is None:
+            logger.warning(
+                "Cannot seed disagg beam original_tokens for request "
+                f"{req.py_request_id}: seq slot is not assigned.")
+            return
+
+        sampler_store = getattr(self.sampler, 'store', None)
+        beam_search_store = getattr(sampler_store, 'beam_search_store', None)
+        if beam_search_store is None:
+            logger.warning(
+                "Cannot seed disagg beam original_tokens for request "
+                f"{req.py_request_id}: sampler has no beam search store.")
+            return
+
+        original_tokens = beam_search_store.original_tokens
+        values = torch.tensor(first_gen_tokens[:beam_width],
+                              device=original_tokens.device,
+                              dtype=original_tokens.dtype)
+        original_tokens[seq_slot, :beam_width, req.prompt_len].copy_(values)
+        cache_indirection = beam_search_store.cache_indirection
+        beam_idx_arange = torch.arange(beam_width,
+                                       device=original_tokens.device,
+                                       dtype=cache_indirection.dtype)
+        cache_indirection[seq_slot, :beam_width,
+                          req.prompt_len].copy_(beam_idx_arange)
+        logger.info(
+            "Seeded disagg generation beam original_tokens: "
+            f"request_id={req.py_request_id} seq_slot={seq_slot} "
+            f"prompt_len={req.prompt_len} "
+            f"first_gen_tokens={values.detach().cpu().tolist()} "
+            f"cache_indirection="
+            f"{beam_idx_arange.detach().cpu().tolist()}"
+        )
 
     def _assert_disagg_beam_original_tokens(self, req, beam_width,
                                             first_gen_tokens):
