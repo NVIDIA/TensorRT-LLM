@@ -3568,6 +3568,17 @@ class PyExecutor:
     def _check_kv_transfer_timeout(self):
         if not self.kv_cache_transceiver:
             return
+        # NVBug 6215218: the timeout-driven request-termination path can
+        # corrupt Python LlmRequest state under sustained high-concurrency
+        # disaggregated workloads, surfacing as SIGSEGV in
+        # `_PyObject_GenericGetAttrWithDict` or as
+        # `CUBLAS_STATUS_EXECUTION_FAILED` from a latched async CUDA error.
+        # Empirically, disabling this check eliminates the crash. Set
+        # `TRTLLM_DISABLE_KV_TRANSFER_TIMEOUT=1` as an escape hatch until
+        # the underlying use-after-free is properly fixed; legitimately
+        # stalled requests will then have to be cancelled by the caller.
+        if os.environ.get("TRTLLM_DISABLE_KV_TRANSFER_TIMEOUT") == "1":
+            return
         timeout_ms = self.kv_cache_transceiver.kv_transfer_timeout_ms
         if timeout_ms is None:
             return

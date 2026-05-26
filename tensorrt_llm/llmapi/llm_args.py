@@ -2787,8 +2787,12 @@ class CacheTransceiverConfig(StrictBaseModel, PybindMirror):
     kv_transfer_timeout_ms: Optional[PositiveInt] = Field(
         default=60000,
         description=
-        "Timeout in milliseconds for KV cache transfer. Requests exceeding this timeout will be cancelled."
-    )
+        "Timeout in milliseconds for KV cache transfer. Requests exceeding "
+        "this timeout will be cancelled. Set to None to disable the timeout "
+        "entirely. NOTE: the timeout-driven cancellation path has a known "
+        "use-after-free at high concurrency in disaggregated mode (NVBug "
+        "6215218); as a temporary workaround, set this to None or export "
+        "TRTLLM_DISABLE_KV_TRANSFER_TIMEOUT=1.")
 
     kv_transfer_sender_future_timeout_ms: Optional[PositiveInt] = Field(
         default=1000,
