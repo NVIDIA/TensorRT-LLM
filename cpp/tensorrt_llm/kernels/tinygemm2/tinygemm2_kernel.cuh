@@ -421,7 +421,7 @@ __global__ __launch_bounds__(384, 1) void tinygemm_kernel(__nv_bfloat16* output,
 
         __syncthreads();
 
-        if (threadIdx.x == 0)
+        if (threadIdx.x == 0) // one thread per block suffices
         {
             cudaTriggerProgrammaticLaunchCompletion();
         }
