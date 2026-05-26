@@ -709,13 +709,14 @@ class ModelConfig(Generic[TConfig]):
                 index_topk = pretrained_config.index_topk
                 indexer_max_chunk_size = None
                 skip_indexer_for_short_seqs = True
-                # Defaults match DeepSeekSparseAttentionConfig field defaults.
+                # Defaults match DeepSeekV4SparseAttentionConfig field defaults.
                 use_cute_dsl_topk = False
                 use_cute_dsl_paged_mqa_logits = False
                 q_split_threshold = 8192
                 indexer_rope_interleave = False
                 enable_heuristic_topk = False
-                indexer_k_dtype = "fp8"
+                indexer_k_dtype = DeepSeekV4SparseAttentionConfig.model_fields[
+                    'indexer_k_dtype'].default
             indexer_config = {}
             indexer_config['index_n_heads'] = index_n_heads
             indexer_config['index_head_dim'] = index_head_dim
