@@ -22,15 +22,16 @@ from dataclasses import dataclass, replace
 from enum import Enum
 from typing import TYPE_CHECKING, Any, Optional
 
+from tqdm import tqdm
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from tqdm import tqdm
-
-from tensorrt_llm._torch.modules.linear import Linear, WeightMode
+from tensorrt_llm._torch.modules.linear import Linear, TensorParallelMode, WeightMode
 from tensorrt_llm._torch.modules.mlp import MLP
 from tensorrt_llm._torch.visual_gen.attention_backend.utils import create_attention
 from tensorrt_llm._torch.visual_gen.modules.attention import Attention, QKVMode
+from tensorrt_llm._torch.visual_gen.modules.rms_norm import RMSNorm
 from tensorrt_llm._torch.visual_gen.quantization.loader import DynamicLinearWeightLoader
 from tensorrt_llm._torch.visual_gen.utils import SequenceSharder
 from tensorrt_llm.logger import logger
@@ -144,6 +145,7 @@ class LTX2Attention(Attention):
             self._has_dual_attn = True
 
         if apply_gated_attention:
+            tp_size = self.mapping.tp_size if self.mapping else 1
             self.to_gate_logits = Linear(
                 query_dim,
                 heads,
@@ -153,6 +155,8 @@ class LTX2Attention(Attention):
                 quant_config=self.quant_config,
                 skip_create_weights_in_init=self.skip_create_weights_in_init,
                 force_dynamic_quantization=self.force_dynamic_quantization,
+                tensor_parallel_mode=TensorParallelMode.COLUMN if tp_size > 1 else None,
+                reduce_output=False,
             )
         else:
             self.to_gate_logits = None
@@ -176,6 +180,8 @@ class LTX2Attention(Attention):
         if not self._is_cross_attn:
             super()._init_qkv_proj()
             return
+        tp_size = self.mapping.tp_size if self.mapping else 1
+        tp_mode = TensorParallelMode.COLUMN if tp_size > 1 else None
         self.to_q = Linear(
             self.hidden_size,
             self.q_dim,
@@ -185,6 +191,8 @@ class LTX2Attention(Attention):
             quant_config=self.quant_config,
             skip_create_weights_in_init=self.skip_create_weights_in_init,
             force_dynamic_quantization=self.force_dynamic_quantization,
+            tensor_parallel_mode=tp_mode,
+            reduce_output=False,
         )
         self.to_k = Linear(
             self._context_dim,
@@ -195,6 +203,8 @@ class LTX2Attention(Attention):
             quant_config=self.quant_config,
             skip_create_weights_in_init=self.skip_create_weights_in_init,
             force_dynamic_quantization=self.force_dynamic_quantization,
+            tensor_parallel_mode=tp_mode,
+            reduce_output=False,
         )
         self.to_v = Linear(
             self._context_dim,
@@ -205,6 +215,8 @@ class LTX2Attention(Attention):
             quant_config=self.quant_config,
             skip_create_weights_in_init=self.skip_create_weights_in_init,
             force_dynamic_quantization=self.force_dynamic_quantization,
+            tensor_parallel_mode=tp_mode,
+            reduce_output=False,
         )
 
     def project_kv(
@@ -409,6 +421,8 @@ class BasicAVTransformerBlock(nn.Module):
     @staticmethod
     def _make_mlp(cfg, model_config, idx):
         dtype = model_config.torch_dtype if model_config else None
+        mapping = getattr(model_config, "mapping", None) if model_config else None
+        tp_size = mapping.tp_size if mapping else 1
         return MLP(
             hidden_size=cfg.dim,
             intermediate_size=cfg.dim * 4,
@@ -417,6 +431,7 @@ class BasicAVTransformerBlock(nn.Module):
             dtype=dtype,
             config=model_config,
             layer_idx=idx,
+            reduce_output=(tp_size != 1),
         )
 
     def _init_video_modules(self, cfg, rope_type, eps, model_config, idx):
@@ -1046,6 +1061,7 @@ class LTXModel(nn.Module):
             quant_config=quant_config,
             skip_create_weights_in_init=skip_create,
             force_dynamic_quantization=force_dq,
+            reduce_output=False,
         )
 
     def _init_video(self, in_channels, out_channels, caption_channels, norm_eps):
@@ -1105,6 +1121,7 @@ class LTXModel(nn.Module):
     def _init_preprocessors(self, cross_pe_max_pos):
         if self.model_type.is_video_enabled() and self.model_type.is_audio_enabled():
             self.video_args_preprocessor = MultiModalTransformerArgsPreprocessor(
+                model_config=self.model_config,
                 patchify_proj=self.patchify_proj,
                 adaln=self.adaln_single,
                 caption_projection=self.caption_projection,
@@ -1123,6 +1140,7 @@ class LTXModel(nn.Module):
                 av_ca_timestep_scale_multiplier=self.av_ca_timestep_scale_multiplier,
             )
             self.audio_args_preprocessor = MultiModalTransformerArgsPreprocessor(
+                model_config=self.model_config,
                 patchify_proj=self.audio_patchify_proj,
                 adaln=self.audio_adaln_single,
                 caption_projection=self.audio_caption_projection,
@@ -1142,6 +1160,7 @@ class LTXModel(nn.Module):
             )
         elif self.model_type.is_video_enabled():
             self.video_args_preprocessor = TransformerArgsPreprocessor(
+                config=self.model_config,
                 patchify_proj=self.patchify_proj,
                 adaln=self.adaln_single,
                 caption_projection=self.caption_projection,
@@ -1156,6 +1175,7 @@ class LTXModel(nn.Module):
             )
         elif self.model_type.is_audio_enabled():
             self.audio_args_preprocessor = TransformerArgsPreprocessor(
+                config=self.model_config,
                 patchify_proj=self.audio_patchify_proj,
                 adaln=self.audio_adaln_single,
                 caption_projection=self.audio_caption_projection,
@@ -1698,6 +1718,9 @@ class LTXModel(nn.Module):
                 weight_dicts = loader.get_linear_weights(module, name, weights)
                 if weight_dicts:
                     loader.load_linear_weights(module, name, weight_dicts)
+            elif isinstance(module, RMSNorm):
+                module_weights = loader.filter_weights(name, weights)
+                module.load_weights(module_weights)
             else:
                 module_weights = loader.filter_weights(name, weights)
                 for param_name, param in module._parameters.items():

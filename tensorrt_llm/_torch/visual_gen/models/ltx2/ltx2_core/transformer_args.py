@@ -6,6 +6,10 @@
 # generation into a unified TransformerArgs dataclass for the transformer blocks.
 
 from dataclasses import dataclass, replace
+from typing import TYPE_CHECKING, Optional
+
+if TYPE_CHECKING:
+    from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
 
 import torch
 
@@ -43,6 +47,7 @@ class TransformerArgsPreprocessor:
 
     def __init__(
         self,
+        model_config: Optional["DiffusionModelConfig"],
         patchify_proj: torch.nn.Module,
         adaln: AdaLayerNormSingle,
         caption_projection: PixArtAlphaTextProjection,
@@ -55,6 +60,7 @@ class TransformerArgsPreprocessor:
         positional_embedding_theta: float,
         rope_type: LTXRopeType,
     ) -> None:
+        self.model_config = model_config
         self.patchify_proj = patchify_proj
         self.adaln = adaln
         self.caption_projection = caption_projection
@@ -111,7 +117,13 @@ class TransformerArgsPreprocessor:
         freq_grid_generator = (
             _generate_freq_grid_np if self.double_precision_rope else _generate_freq_grid_pytorch
         )
-        return precompute_freqs_cis(
+        tp_size = self.model_config.mapping.tp_size if self.model_config else 1
+        tp_rank = self.model_config.mapping.tp_rank if self.model_config else 0
+
+        # Generate full-dimension RoPE, then slice the per-rank chunk.
+        # Column-parallel QKV partitions heads contiguously across ranks,
+        # so each rank needs the frequency slice for its head subset
+        cos, sin = precompute_freqs_cis(
             positions,
             dim=inner_dim,
             out_dtype=x_dtype,
@@ -123,6 +135,20 @@ class TransformerArgsPreprocessor:
             freq_grid_generator=freq_grid_generator,
             freq_grid_cache=self._freq_grid_cache,
         )
+
+        if tp_size > 1:
+            if self.rope_type == LTXRopeType.INTERLEAVED:
+                # cos/sin: [B, T, inner_dim] — slice contiguous chunk on last dim
+                chunk = inner_dim // tp_size
+                cos = cos[..., tp_rank * chunk : (tp_rank + 1) * chunk]
+                sin = sin[..., tp_rank * chunk : (tp_rank + 1) * chunk]
+            else:
+                # SPLIT: cos/sin: [B, H, T, head_dim//2] — slice heads on dim 1
+                h_chunk = num_attention_heads // tp_size
+                cos = cos[:, tp_rank * h_chunk : (tp_rank + 1) * h_chunk]
+                sin = sin[:, tp_rank * h_chunk : (tp_rank + 1) * h_chunk]
+
+        return cos, sin
 
     def prepare_text_cache(
         self,
@@ -184,6 +210,7 @@ class MultiModalTransformerArgsPreprocessor:
 
     def __init__(
         self,
+        model_config: Optional["DiffusionModelConfig"],
         patchify_proj: torch.nn.Module,
         adaln: AdaLayerNormSingle,
         caption_projection: PixArtAlphaTextProjection,
@@ -202,6 +229,7 @@ class MultiModalTransformerArgsPreprocessor:
         av_ca_timestep_scale_multiplier: int,
     ) -> None:
         self.simple_preprocessor = TransformerArgsPreprocessor(
+            model_config=model_config,
             patchify_proj=patchify_proj,
             adaln=adaln,
             caption_projection=caption_projection,

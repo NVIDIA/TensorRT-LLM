@@ -238,6 +238,12 @@ def parse_args():
         "Cannot be combined with --attn2d_row_size / --attn2d_col_size (not yet implemented).",
     )
     parser.add_argument(
+        "--tp_size",
+        type=int,
+        default=1,
+        help="Tensor Parallel size",
+    )
+    parser.add_argument(
         "--attn2d_row_size",
         type=int,
         default=1,
@@ -359,6 +365,7 @@ def _build_visual_gen_args(args) -> VisualGenArgs:
             "cfg_size": args.cfg_size,
             "ulysses_size": args.ulysses_size,
             "attn2d_size": (args.attn2d_row_size, args.attn2d_col_size),
+            "tp_size": args.tp_size,
         },
         torch_compile_config={
             "enable": not args.disable_torch_compile,
@@ -385,14 +392,17 @@ def main():
 
     visual_gen_args = _build_visual_gen_args(args)
 
+    parallel_str = ""
+    if args.tp_size > 1:
+        parallel_str = f"TP(size={args.tp_size})"
     if args.ulysses_size > 1:
-        parallel_str = f"Ulysses(size={args.ulysses_size})"
+        parallel_str += f"Ulysses(size={args.ulysses_size})"
     elif attn2d_size > 1:
-        parallel_str = (
+        parallel_str += (
             f"Attention2D(row={args.attn2d_row_size}, col={args.attn2d_col_size}, "
             f"total={attn2d_size})"
         )
-    else:
+    elif not parallel_str:
         parallel_str = "None"
     logger.info(
         f"Initializing VisualGen (LTX2): cfg_size={args.cfg_size}, parallelism={parallel_str}"
