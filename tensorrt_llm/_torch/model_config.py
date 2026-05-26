@@ -969,7 +969,7 @@ class ModelConfig(Generic[TConfig]):
         else:
             return None
 
-    def get_num_attention_layers(self) -> int:
+    def get_num_attention_layers(self, **_kwargs) -> int:
         """Number of full-attention layers in the model.
 
         Pure model property: independent of which KV cache manager will run.

@@ -140,6 +140,13 @@ class GatedMLP(nn.Module):
                         f"GatedMLP._apply_activation: LoRA path active; forcing non-FP8 activation dtype bf16/fp16, layer_idx={self.layer_idx}"
                     )
                     return swiglu(x)
+                elif self.down_proj.force_dynamic_quantization:
+                    # Dynamic activation quantization: per-tensor input_scale is
+                    # not pre-computed (would be uninitialized memory), so swiglu
+                    # cannot pre-quantize to FP8 here. Emit bf16 and let
+                    # down_proj.apply do dynamic FP8 quantization with a
+                    # freshly-computed scale.
+                    return swiglu(x)
                 else:
                     return swiglu(x,
                                   quant_scale=self.down_proj.input_scale,
