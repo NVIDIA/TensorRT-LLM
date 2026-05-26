@@ -1952,9 +1952,9 @@ def test_forward_sparse_mla_unified(batch_name, kv_cache_dtype: str,
             max_batch_size=1,
             max_seq_len=max_seqlen,
         )
-        # HF DS4 reference does not apply Hadamard rotation in the attention or
-        # indexer compressor path.  TRTLLM may rotate both Q and K before FP8
-        # indexer scoring, but the independent oracle below follows HF math.
+        # The base DS4 compressor references follow HF math without Hadamard
+        # rotation. FP4 indexer scoring separately applies the TRTLLM Q/K
+        # rotation and MXFP4 QDQ before computing reference top-k.
         ref_compressor = RefCompressor(ref_args,
                                        compress_ratios[layer_idx],
                                        pretrained_config.head_size,
