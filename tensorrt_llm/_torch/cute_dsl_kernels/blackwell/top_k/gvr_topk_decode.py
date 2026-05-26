@@ -82,11 +82,10 @@ def _fmin_f32_inline(a, b):
 
 # =============================================================================
 # Constants (mirror heuristic_topk.cuh:157-167)
+# BLOCK_SIZE and WARP_SIZE moved into GvrTopKKernel class as class-level
+# attributes — see class body below. (BLOCK_SIZE is configurable per-instance
+# via num_threads; WARP_SIZE is a hardware constant.)
 # =============================================================================
-
-BLOCK_SIZE = 512
-WARP_SIZE = 32
-NUM_WARPS = BLOCK_SIZE // WARP_SIZE  # 16
 
 MAX_CANDIDATES = 6144  # K=2048 + SAFETY_MARGIN×2
 MAX_REFINE_ITERS = 15
@@ -155,29 +154,42 @@ class GvrTopKKernel:
         dtype: cutlass.Numeric,
         top_k: int,
         next_n: int = 1,
-        num_threads: int = BLOCK_SIZE,
+        num_threads: int = 512,
         enable_unroll_4: Optional[bool] = None,
         enable_unroll_2: Optional[bool] = None,
         enable_phase3_unroll: Optional[bool] = None,
         use_strided_layout: bool = True,
         use_constant_hint: bool = False,
         min_blocks_per_mp: int = 3,
+        use_256bit_load: bool = False,
     ):
         # cutlass.Numeric enum: cutlass.Float32 / cutlass.BFloat16 / cutlass.Float16
         self.dtype = dtype
         self.top_k = top_k
         self.next_n = next_n
+        # WARP_SIZE = 32 is a hardware constant on all NVIDIA GPUs.
+        self.WARP_SIZE = 32
         self.num_threads = num_threads
-        self.num_warps = num_threads // WARP_SIZE
+        self.num_warps = num_threads // self.WARP_SIZE
         # __launch_bounds__(num_threads, min_blocks_per_mp) hint to ptxas.
         # B200 sm_100: 65536 regs/SM, BS=512 → max_regs_per_thread caps at:
         #   min_blocks=1: 128  (loosest — allows ptxas to use many regs)
         #   min_blocks=2:  64
         #   min_blocks=3:  42  (current default — keeps 3 CTA/SM occupancy)
-        # When num_rows ≤ #SMs (148 on B200), grid is undersubscribed so high
+        # When num_rows ≤ #SMs (e.g., 148 on B200), grid is undersubscribed so high
         # occupancy isn't useful → set min_blocks=1 to let ptxas spend more
         # regs covering LDG latency (4-LDG back-to-back pattern survives).
         self.min_blocks_per_mp = min_blocks_per_mp
+        # Vector load width for Phase 2/3 vec loops:
+        #   False (default): 128-bit per LDG → LDG.E.128 (fp32: 4 elems; bf16/fp16: 8)
+        #   True:            256-bit per LDG → LDG.E.256 (fp32: 8 elems; bf16/fp16: 16)
+        # 256-bit halves the LDG count per byte loaded, but requires:
+        #   * 32-byte aligned addresses (we pass assumed_align=32 below)
+        #   * sm_90+ (Blackwell sm_100 supports it)
+        #   * fragment reg usage doubles → potentially more reg pressure
+        self.use_256bit_load = use_256bit_load
+        self.vec_bits = 256 if use_256bit_load else 128
+        self.vec_align_bytes = self.vec_bits // 8  # 32 for 256-bit, 16 for 128-bit
         # Vec-loop unrolling switches.
         #   * enable_unroll_4: 4-way fast path in block_count_ge (4 LDG.E.128
         #     in flight). Controls block_count_ge's fast path only.
@@ -202,8 +214,10 @@ class GvrTopKKernel:
         if enable_phase3_unroll is None:
             enable_phase3_unroll = True
         self.enable_unroll_4 = enable_unroll_4
+        # no use
         self.enable_unroll_2 = enable_unroll_2
         self.enable_phase3_unroll = enable_phase3_unroll
+        # no use
         self.use_strided_layout = use_strided_layout
         self.use_constant_hint = use_constant_hint
 
@@ -230,17 +244,19 @@ class GvrTopKKernel:
     # bind copy_atom in the same trace scope.
     # ------------------------------------------------------------------
     def _make_load_copy_atom(self):
+        # num_bits_per_copy matches self.vec_bits (128 default; 256 when
+        # use_256bit_load=True) so cute emits LDG.E.128 or LDG.E.256 per copy.
         if self.use_constant_hint:
             return cute.make_copy_atom(
                 cute.nvgpu.CopyG2ROp(),
                 self.dtype,
-                num_bits_per_copy=128,
+                num_bits_per_copy=self.vec_bits,
                 invariant=True,
             )
         return cute.make_copy_atom(
             cute.nvgpu.CopyUniversalOp(),
             self.dtype,
-            num_bits_per_copy=128,
+            num_bits_per_copy=self.vec_bits,
         )
 
     # ------------------------------------------------------------------
@@ -324,20 +340,36 @@ class GvrTopKKernel:
         local_cnt = cutlass.Int32(0)
 
         # Stride loop over preIdx with pre_idx_offset shift.
-        # pre_idx_count comes from pre_idx.shape[1] which is a compile-time
-        # constant (top_k baked into the JIT cache key). Supported top_k ∈
-        # {512, 1024, 2048} are all multiples of num_threads (512). Fully
-        # unroll into pre_idx_count // num_threads ∈ {1, 2, 4} iters so
-        # cute emits straight-line code (no BRA / ISETP / counter update).
-        # Mirrors nvcc/ptxas auto-partial-unroll on the CUDA side.
-        n_iters = cutlass.const_expr(pre_idx_count // self.num_threads)
-        for u in cutlass.range_constexpr(n_iters):
-            i = tidx + cutlass.Int32(u * self.num_threads)
-            raw = pre_idx_row[i]
-            idx = raw + pre_idx_offset
+        # pre_idx_count is compile-time constant (top_k from JIT key).
+        # Two cases:
+        #   (a) pre_idx_count >= num_threads: every thread loads ≥1 preIdx;
+        #       n_iters = pre_idx_count // num_threads ∈ {1, 2, 4, ...}.
+        #       Fully unrolled (straight-line code).
+        #   (b) pre_idx_count < num_threads (e.g. K=512, BS=1024): only first
+        #       pre_idx_count threads have a preIdx; guard with `if tidx<K`.
+        if cutlass.const_expr(pre_idx_count >= self.num_threads):
+            n_iters = cutlass.const_expr(pre_idx_count // self.num_threads)
+            for u in cutlass.range_constexpr(n_iters):
+                i = tidx + cutlass.Int32(u * self.num_threads)
+                raw = pre_idx_row[i]
+                idx = raw + pre_idx_offset
+                if idx >= 0 and idx < N:
+                    v = self._load_fp32(input_row, idx)
+                    local_max = cute.arch.fmax(local_max, v)
+                    local_min = _fmin_f32_inline(local_min, v)
+                    local_sum = local_sum + v
+                    local_cnt = local_cnt + 1
+        else:
+            # K < num_threads — only first K threads load a preIdx.
+            # cute DSL requires variables to exist before dynamic `if` blocks,
+            # so predeclare `idx` with an out-of-range sentinel and update
+            # it conditionally; the downstream `if idx >= 0 and idx < N`
+            # gate handles the sentinel naturally.
+            idx = cutlass.Int32(-1)
+            if tidx < cutlass.Int32(pre_idx_count):
+                idx = pre_idx_row[tidx] + pre_idx_offset
             if idx >= 0 and idx < N:
                 v = self._load_fp32(input_row, idx)
-                # cute.arch.fmax / negate-trick keep result as cutlass.Float32.
                 local_max = cute.arch.fmax(local_max, v)
                 local_min = _fmin_f32_inline(local_min, v)
                 local_sum = local_sum + v
@@ -433,9 +465,10 @@ class GvrTopKKernel:
         the N-mod-vec_w remainder.
         """
         num_threads = cutlass.const_expr(self.num_threads)
-        # 128-bit / dtype_bits = vec width
-        vec_w = cutlass.const_expr(128 // self.dtype.width)
+        # Vec width = (128 or 256) / dtype_bits, controlled by use_256bit_load
+        vec_w = cutlass.const_expr(self.vec_bits // self.dtype.width)
         elem_bytes = cutlass.const_expr(self.dtype.width // 8)
+        vec_align = cutlass.const_expr(self.vec_align_bytes)  # 16 or 32
         c = cutlass.Int32(0)
 
         # Vectorized main loop using cute.copy. use_constant_hint=True
@@ -556,13 +589,20 @@ class GvrTopKKernel:
                 big_iters = (N - i - cutlass.Int32(vec_w)) // cutlass.Int32(
                     step_elem
                 ) + cutlass.Int32(1)
-            for k in cutlass.range(big_iters, unroll=4):
+            # Unroll factor: 4 for 128-bit and fp32 256-bit (no cvt spill);
+            # 2 for 256-bit bf16/fp16 to avoid reg spill from cvt-to-fp32 doubling.
+            # 4 × 16 bf16/fp16 elems × cvt fp32 = 64 reg dest > 40 reg cap → spill.
+            # 2 × 16 bf16/fp16 elems × cvt fp32 = 32 reg dest, fits.
+            _UNROLL = cutlass.const_expr(
+                2 if (self.use_256bit_load and self.dtype != cutlass.Float32) else 4
+            )
+            for k in cutlass.range(big_iters, unroll=_UNROLL):
                 i_local = i + k * cutlass.Int32(step_elem)
                 src_ptr_k = cute.make_ptr(
                     self.dtype,
                     row_addr + cutlass.Int64(i_local) * cutlass.Int64(elem_bytes),
                     cute.AddressSpace.gmem,
-                    assumed_align=16,
+                    assumed_align=vec_align,
                 )
                 src_k = cute.make_tensor(src_ptr_k, cute.make_layout((vec_w,)))
                 cute.copy(copy_atom, src_k, rng_frag)
@@ -617,14 +657,16 @@ class GvrTopKKernel:
         #         i = i + cutlass.Int32(UNROLL_MID * step_elem)
 
         # Tail vec loop: 1-way, handles remainder < 2*step (= remaining 1
-        # full vec_w-stride or less).
+        # full vec_w-stride or less). i is always vec_w-aligned here (it
+        # advanced by multiples of step_elem = num_threads*vec_w), so the
+        # same vec_align bytes hold.
         tail_frag = cute.make_fragment((vec_w,), self.dtype)
         while i + cutlass.Int32(vec_w - 1) < N:
             src_ptr = cute.make_ptr(
                 self.dtype,
                 row_addr + cutlass.Int64(i) * cutlass.Int64(elem_bytes),
                 cute.AddressSpace.gmem,
-                assumed_align=16,
+                assumed_align=vec_align,
             )
             src = cute.make_tensor(src_ptr, cute.make_layout((vec_w,)))
             cute.copy(copy_atom, src, tail_frag)
@@ -924,7 +966,7 @@ class GvrTopKKernel:
         my_excl_offset = tp - my_total_qual
         # Warp total = lane 31's tp; broadcast via shfl_sync_bfly (or
         # cross-lane read: shuffle_sync_op with lane=31).
-        warp_total = cute.arch.shuffle_sync(tp, cutlass.Int32(WARP_SIZE - 1))
+        warp_total = cute.arch.shuffle_sync(tp, cutlass.Int32(self.WARP_SIZE - 1))
 
         if lane == 0:
             smem_wcnt[warp_id] = warp_total
@@ -953,8 +995,9 @@ class GvrTopKKernel:
         # advances thread-local wc; LDGs themselves are independent and
         # cute can pipeline them. Switches gate via self.* (set in __init__).
         thr_final = s_thr[0]
-        vec_w_p3 = cutlass.const_expr(128 // self.dtype.width)
+        vec_w_p3 = cutlass.const_expr(self.vec_bits // self.dtype.width)
         elem_bytes_p3 = cutlass.const_expr(self.dtype.width // 8)
+        vec_align_p3 = cutlass.const_expr(self.vec_align_bytes)
         # use_constant_hint=True → LDG.E.*.CONSTANT (same as block_count_ge).
         copy_atom_p3 = self._make_load_copy_atom()
         row_addr_p3 = input_row.iterator.toint()
@@ -1059,13 +1102,18 @@ class GvrTopKKernel:
                     big_iters_p3 = (N - ic2 - cutlass.Int32(vec_w_p3)) // cutlass.Int32(
                         step_elem_p3
                     ) + cutlass.Int32(1)
-                for k in cutlass.range(big_iters_p3, unroll=4):
+                # Unroll factor: same logic as block_count_ge (Phase 2):
+                # 2 for 256-bit bf16/fp16 to avoid cvt-to-fp32 spill; else 4.
+                _UNROLL_P3 = cutlass.const_expr(
+                    2 if (self.use_256bit_load and self.dtype != cutlass.Float32) else 4
+                )
+                for k in cutlass.range(big_iters_p3, unroll=_UNROLL_P3):
                     ic2_local = ic2 + k * cutlass.Int32(step_elem_p3)
                     src_ptr_k = cute.make_ptr(
                         self.dtype,
                         row_addr_p3 + cutlass.Int64(ic2_local) * cutlass.Int64(elem_bytes_p3),
                         cute.AddressSpace.gmem,
-                        assumed_align=16,
+                        assumed_align=vec_align_p3,
                     )
                     src_k = cute.make_tensor(src_ptr_k, cute.make_layout((vec_w_p3,)))
                     cute.copy(copy_atom_p3, src_k, rng_frag_p3)
@@ -1121,14 +1169,15 @@ class GvrTopKKernel:
             #                     wc = wc + cutlass.Int32(1)
             #             ic2 = ic2 + cutlass.Int32(UNROLL_MID * step_elem_p3)
 
-        # Tail vec loop: 1-way, handles remainder < 2*step.
+        # Tail vec loop: 1-way, handles remainder < 2*step. ic2 stays vec_w-
+        # aligned across the unroll loop (steps by num_threads*vec_w_p3).
         tail_frag_p3 = cute.make_fragment((vec_w_p3,), self.dtype)
         while ic2 + cutlass.Int32(vec_w_p3 - 1) < N:
             src_ptr_p3 = cute.make_ptr(
                 self.dtype,
                 row_addr_p3 + cutlass.Int64(ic2) * cutlass.Int64(elem_bytes_p3),
                 cute.AddressSpace.gmem,
-                assumed_align=16,
+                assumed_align=vec_align_p3,
             )
             src_p3 = cute.make_tensor(src_ptr_p3, cute.make_layout((vec_w_p3,)))
             cute.copy(copy_atom_p3, src_p3, tail_frag_p3)
@@ -1454,7 +1503,7 @@ class GvrTopKKernel:
             # `if mask_gt != 0` mirrors CUDA heuristic_topk.cuh:1020 — when no
             # lane in the warp emits, skip the popc + atomicAdd + shuffle round
             # trip (the atomicAdd alone is ~10-30 cycles on a SMEM atomic unit).
-            base_w = warp_id * cutlass.Int32(WARP_SIZE)
+            base_w = warp_id * cutlass.Int32(self.WARP_SIZE)
             while base_w < cand_count:
                 ix1 = base_w + lane
                 emit_gt = cutlass.Int32(0)
@@ -1485,7 +1534,7 @@ class GvrTopKKernel:
             # Pass 2: v == sel_thr (same pattern as Pass 1, same `if mask` guard).
             # Empty-iter case is much more common here because only tie-values
             # at the K-th rank emit.
-            base_w2 = warp_id * cutlass.Int32(WARP_SIZE)
+            base_w2 = warp_id * cutlass.Int32(self.WARP_SIZE)
             while base_w2 < cand_count:
                 ix2 = base_w2 + lane
                 emit_eq = cutlass.Int32(0)
@@ -1560,8 +1609,8 @@ class GvrTopKKernel:
         kC = cutlass.const_expr(self.kC)
         kNumBins = cutlass.const_expr(self.kNumBins)
 
-        warp_id = tidx // WARP_SIZE
-        lane = tidx & (WARP_SIZE - 1)
+        warp_id = tidx // self.WARP_SIZE
+        lane = tidx & (self.WARP_SIZE - 1)
 
         row_idx = bidx
         pre_idx_row_idx = row_idx // next_n
@@ -1818,12 +1867,15 @@ def gvr_topk_decode(
     next_n: int = 1,
     out_values: Optional[torch.Tensor] = None,
     out_indices: Optional[torch.Tensor] = None,
+    num_sms: int = 148,  # default number of sms in a B200
     enable_unroll_4: Optional[bool] = None,
     enable_unroll_2: Optional[bool] = None,
     enable_phase3_unroll: Optional[bool] = None,
     use_strided_layout: Optional[bool] = None,
     use_constant_hint: bool = False,
     min_blocks_per_mp: Optional[int] = None,
+    use_256bit_load: bool = False,
+    num_threads_per_block: int = 512,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """cuTe DSL GVR Top-K, drop-in for ``torch.ops.trtllm.indexer_topk_decode``.
 
@@ -1872,10 +1924,12 @@ def gvr_topk_decode(
     #     to separate-ptrs unroll-4 without cascade.
     if enable_unroll_4 is None:
         enable_unroll_4 = True
+    # enable_unroll_2 is no use
     if enable_unroll_2 is None:
         enable_unroll_2 = cute_dtype != cutlass.Float32
     if enable_phase3_unroll is None:
         enable_phase3_unroll = True
+    # use_strided_layout is no use
     if use_strided_layout is None:
         use_strided_layout = cute_dtype != cutlass.Float32
     # 3-tier reg-vs-occupancy heuristic (B200 has 148 SMs):
@@ -1916,11 +1970,13 @@ def gvr_topk_decode(
     # (e.g. =3 for a graph-safe single-kernel pick).
     # ────────────────────────────────────────────────────────────────────
     if min_blocks_per_mp is None:
-        vec_w_host = 128 // (32 if logits.dtype == torch.float32 else 16)
-        n_vec_iters = max(1, logits.shape[1] // (BLOCK_SIZE * vec_w_host))
+        # vec_bits depends on use_256bit_load; vec_w_host = vec_bits / dtype_bits
+        vec_bits_host = 256 if use_256bit_load else 128
+        vec_w_host = vec_bits_host // (32 if logits.dtype == torch.float32 else 16)
+        n_vec_iters = max(1, logits.shape[1] // (num_threads_per_block * vec_w_host))
         if n_vec_iters < 4:
             min_blocks_per_mp = 0  # no launch_bounds — natural ptxas allocation
-        elif num_rows <= 148:
+        elif num_rows <= num_sms:
             min_blocks_per_mp = 1
         else:
             min_blocks_per_mp = 3
@@ -1938,13 +1994,19 @@ def gvr_topk_decode(
         use_strided_layout,
         use_constant_hint,
         min_blocks_per_mp,
+        use_256bit_load,
+        num_threads_per_block,
     )
     if key not in _gvr_topk_compile_cache:
         n_rows = cute.sym_int()
         n_cols = cute.sym_int()
         n_batch = cute.sym_int()
+        # 256-bit vec loads require 32-byte aligned input addresses (PyTorch
+        # CUDA allocations are 256-byte aligned, and Phase 2/3 offsets are
+        # multiples of vec_w*elem_bytes = 32 bytes when use_256bit_load).
+        in_align = 32 if use_256bit_load else 16
         input_fake = cute.runtime.make_fake_compact_tensor(
-            cute_dtype, (n_rows, n_cols), stride_order=(1, 0), assumed_align=16
+            cute_dtype, (n_rows, n_cols), stride_order=(1, 0), assumed_align=in_align
         )
         pre_idx_fake = cute.runtime.make_fake_compact_tensor(
             cutlass.Int32, (n_batch, top_k), stride_order=(1, 0), assumed_align=16
@@ -1964,12 +2026,14 @@ def gvr_topk_decode(
             dtype=cute_dtype,
             top_k=top_k,
             next_n=next_n,
+            num_threads=num_threads_per_block,
             enable_unroll_4=enable_unroll_4,
             enable_unroll_2=enable_unroll_2,
             enable_phase3_unroll=enable_phase3_unroll,
             use_strided_layout=use_strided_layout,
             use_constant_hint=use_constant_hint,
             min_blocks_per_mp=min_blocks_per_mp,
+            use_256bit_load=use_256bit_load,
         )
         _gvr_topk_compile_cache[key] = cute.compile(
             kernel,

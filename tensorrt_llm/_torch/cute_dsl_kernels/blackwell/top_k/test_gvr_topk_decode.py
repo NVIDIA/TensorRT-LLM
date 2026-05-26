@@ -88,8 +88,16 @@ _SEEDS = [0, 1]
 @pytest.mark.parametrize("seed", _SEEDS)
 # limin expanded next_n test. originally, it is [1]
 @pytest.mark.parametrize("next_n", [1, 2, 3, 4])
+@pytest.mark.parametrize("use_256bit_load", [False])
+@pytest.mark.parametrize("num_threads_per_block", [1024])
 def test_gvr_topk_decode_correctness(
-    dtype: torch.dtype, top_k: int, N: int, seed: int, next_n: int
+    dtype: torch.dtype,
+    top_k: int,
+    N: int,
+    seed: int,
+    next_n: int,
+    use_256bit_load: bool,
+    num_threads_per_block: int,
 ) -> None:
     # Kernel scans `N_eff = seq_lens[0] - next_n + (row_idx % next_n) + 1`
     # columns for row 0 (= seq_lens[0] - next_n + 1). The degenerate
@@ -98,10 +106,19 @@ def test_gvr_topk_decode_correctness(
     if effective_len < top_k:
         pytest.skip("N_eff < top_k is degenerate; the kernel requires N_eff >= top_k")
     logits, pre_idx, seq_lens = _make_inputs(N, top_k, dtype, seed)
-    _, out_idxs = gvr_topk_decode(logits, pre_idx, seq_lens, top_k, next_n=next_n)
+    _, out_idxs = gvr_topk_decode(
+        logits,
+        pre_idx,
+        seq_lens,
+        top_k,
+        next_n=next_n,
+        use_256bit_load=use_256bit_load,
+        num_threads_per_block=num_threads_per_block,
+    )
     torch.cuda.synchronize()
     ok, err = _tie_aware_correct(out_idxs, logits, top_k, effective_len)
     assert ok, (
-        f"dtype={dtype} K={top_k} N={N} seed={seed} next_n={next_n}: "
+        f"dtype={dtype} K={top_k} N={N} seed={seed} next_n={next_n} "
+        f"use_256bit_load={use_256bit_load} num_threads_per_block={num_threads_per_block}: "
         f"tie-aware check failed (err_count={err})"
     )
