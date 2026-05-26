@@ -2359,9 +2359,11 @@ class MLA(nn.Module):
 
     @staticmethod
     @functools.cache
-    def cached_warmup_forward_context_with_chunked_prefill(
-            num_heads_tp, qk_nope_head_dim, qk_rope_head_dim, kv_lora_rank,
-            v_head_dim, dtype, device):
+    def cached_warmup_forward_context_with_cached_kv(num_heads_tp,
+                                                     qk_nope_head_dim,
+                                                     qk_rope_head_dim,
+                                                     kv_lora_rank, v_head_dim,
+                                                     dtype, device):
         """Warmup torch.compile for cat operations with different tensor layouts.
 
         Tensors are marked with torch._dynamo.maybe_mark_dynamic(..., 0) on the
@@ -2434,11 +2436,9 @@ class MLA(nn.Module):
             # the cached-kv path; without this, the cached-kv prefill
             # (block-reuse without chunked_prefill) recompiles per shape and
             # may stall inside inductor's compile worker.
-            if (trtllm_attention.is_chunked_prefill_mla_context_for_warmup(
-                    attn_metadata)
-                    or trtllm_attention.has_cached_kv_for_mla_context(
-                        attn_metadata)):
-                self.cached_warmup_forward_context_with_chunked_prefill(
+            if trtllm_attention.has_cached_kv_for_mla_context_warmup(
+                    attn_metadata):
+                self.cached_warmup_forward_context_with_cached_kv(
                     self.num_heads_tp, self.qk_nope_head_dim,
                     self.qk_rope_head_dim, self.kv_lora_rank, self.v_head_dim,
                     q.dtype, q.device)
