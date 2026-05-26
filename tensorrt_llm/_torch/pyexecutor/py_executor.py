@@ -2662,12 +2662,39 @@ class PyExecutor:
             return False
         return True
 
+    def _consume_previous_batch_for_rebalance(self) -> None:
+        """Drain ``previous_batch`` so its _KVCache instances are quiescent.
+
+        No-op when ``previous_batch is None`` -- i.e., always a no-op in
+        the non-overlap loop, since that loop never sets previous_batch.
+        In the overlap loop this fires when the rebalance hook catches a
+        pending in-flight iteration; we consume it inline so suspend can
+        safely run.
+
+        Mirrors the inline sequence in ``_executor_loop_overlap`` that
+        handles ``previous_batch``.  Unlike the inline code we are not
+        guarded by ``should_process_previous_batch``: the rebalance gate
+        already excludes the multi-rank-divergence cases that flag exists
+        to handle.
+        """
+        if self.previous_batch is None:
+            return
+        self._update_requests(self.previous_batch.sample_state)
+        self._send_kv_async(
+            self.previous_batch.scheduled_requests.all_requests())
+        self._flush_pending_transfer_responses()
+        self._process_previous_batch()
+        self.perf_manager.compute_batch_gpu_times(
+            self.previous_batch.scheduled_requests.all_requests())
+        self.previous_batch = None
+
     def _maybe_rebalance_kv_pools(self) -> None:
         """Rebalance KV pool ratios when the V2 auto-tuner asks for it.
 
         Fast path: ``need_adjustment`` checks the sample counter and the
         120s cooldown before doing any real work.  On the slow path we
-        drain pending GPU work, suspend every active request, call
+        drain pending GPU work, consume any in-flight ``previous_batch``
+        (overlap loop only), suspend every active request, call
         ``adjust()``, and resume.  Resume failures stay suspended; the
         scheduler reactivates them through prepare_context /
         try_allocate_generation on the next iteration, the same path it
@@ -2678,6 +2705,7 @@ class PyExecutor:
             return
 
         torch.cuda.current_stream().synchronize()
+        self._consume_previous_batch_for_rebalance()
 
         paused: List[LlmRequest] = []
         for req in self.active_requests:
@@ -2738,6 +2766,9 @@ class PyExecutor:
 
                 if self._resource_governor_enabled:
                     self._sync_and_process_resource_governor_queue()
+
+                if self._is_kv_manager_v2 and self._can_pause_for_rebalance():
+                    self._maybe_rebalance_kv_pools()
 
                 scheduled_batch, iter_stats = self._prepare_and_schedule_batch()
                 self._handle_control_request()
