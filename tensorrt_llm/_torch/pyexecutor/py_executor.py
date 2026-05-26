@@ -426,6 +426,12 @@ class PyExecutor:
         # responses and flushing them at a synchronised point in the executor
         # loop avoids the mismatch.
         self._pending_transfer_responses: List[Tuple[int, LlmResponse]] = []
+        # Same buffer-then-synced-flush pattern as _pending_transfer_responses
+        # above: _handle_responses and _append_iter_stats are reached from
+        # per-rank-divergent gates, so their tp_allgather collectives are
+        # lifted to _handle_kv_transfer_timeouts_synced / _flush_iter_stats_synced.
+        self._pending_timed_out_requests: List[LlmRequest] = []
+        self._pending_iter_stats_dict: Optional[Dict] = None
         # ADP dummy role for _pad_attention_dp_dummy_request. Default is gen;
         # updated from observed request types.
         self._adp_dummy_is_gen: bool = True
@@ -708,6 +714,52 @@ class PyExecutor:
             # collective when ADP is enabled so that the other rank's gather
             # can complete.
             self._enqueue_responses(responses)
+
+    def _handle_kv_transfer_timeouts_synced(self):
+        """ADP-safe drain of the KV-transfer-timeout consensus collective.
+
+        Lifted out of _handle_responses, which is reached from per-rank-
+        divergent gates (_process_previous_batch, _handle_executed_batch).
+        Non-ADP runs handle timeouts inline; the buffer is empty here.
+        """
+        if not (self.enable_attention_dp and self.dist.world_size != 1):
+            return
+        timed_out = self._pending_timed_out_requests
+        self._pending_timed_out_requests = []
+        any_timed_out = any(self.dist.tp_allgather(bool(timed_out)))
+        if any_timed_out:
+            self._handle_errors(error_msg="Request timed out (KV transfer)",
+                                requests=timed_out)
+
+    def _flush_iter_stats_synced(self):
+        """ADP-safe drain of the TLLM_METRICS_ALL_RANKS dict-gather collective.
+
+        Lifted out of _append_iter_stats (same divergent-gate problem as
+        _handle_kv_transfer_timeouts_synced).  Under ADP every rank sends
+        either the local dict or ``None`` every iter so the gather stays in
+        lockstep with peer collectives.  When the gate doesn't hold,
+        _append_iter_stats takes its legacy path and never populates the
+        buffer.
+        """
+        tp_size = self.dist.tp_size
+        gather_all_ranks = os.environ.get("TLLM_METRICS_ALL_RANKS", "0") == "1"
+        if not (gather_all_ranks and self.enable_iter_perf_stats and tp_size > 1
+                and self.enable_attention_dp):
+            return
+        local_dict = self._pending_iter_stats_dict
+        self._pending_iter_stats_dict = None
+        gathered = self.dist.tp_allgather(local_dict)
+        if self.dist.tp_rank != 0:
+            return
+        rank_dicts = [d for d in gathered if d is not None]
+        if not rank_dicts:
+            return
+        with self.stats_lock:
+            for d in rank_dicts:
+                self.stats.append(("per_rank_dict", d))
+            cap = self.max_stats_len * tp_size
+            if len(self.stats) > cap:
+                del self.stats[:len(self.stats) - cap]
 
     # Performance metrics methods are in PerfMetricsManager (self.perf_manager)
 
@@ -1434,23 +1486,9 @@ class PyExecutor:
             append_kv_cache_iteration_stats(local_dict,
                                             self._latest_kv_iter_stats)
             local_dict["rank"] = self.dist.tp_rank
-
-            gathered = self.dist.tp_allgather(local_dict)
-
-            if self.dist.tp_rank == 0:
-                with self.stats_lock:
-                    # Wrap as ("per_rank_dict", dict) so the serializer can
-                    # distinguish from the legacy (stats, req_stats, kv) tuple.
-                    # Trim before appending so every rank's entry for the
-                    # same iteration lands in the buffer atomically; evicting
-                    # during the append loop would let partial iterations
-                    # survive at the head of self.stats.
-                    cap = self.max_stats_len * tp_size
-                    overflow = max(0, len(self.stats) + len(gathered) - cap)
-                    if overflow:
-                        del self.stats[:overflow]
-                    for d in gathered:
-                        self.stats.append(("per_rank_dict", d))
+            # Buffer for _flush_iter_stats_synced; in-place tp_allgather would
+            # desync (reached from per-rank-divergent gates).
+            self._pending_iter_stats_dict = local_dict
             return
 
         # Legacy path: rank-0-only (single-rank or iter stats disabled).
@@ -2014,6 +2052,13 @@ class PyExecutor:
                 executed_batch.microbatch_id % self.dist.pp_size,
             )
 
+        # Drain the synced-collective buffers outside the per-rank-divergent
+        # ``executed_batch is not None`` branch.  handle_executed_batches
+        # invokes this helper the same number of times on every rank
+        # (broadcast count), so the flushes are rank-symmetric.
+        self._handle_kv_transfer_timeouts_synced()
+        self._flush_iter_stats_synced()
+
     @nvtx_range("wait_on_pp_send_handles")
     def wait_on_pp_send_handles(self, send_handles, microbatch_id):
         if send_handles[microbatch_id] is not None:
@@ -2569,6 +2614,10 @@ class PyExecutor:
                     if self.enable_kv_cache_events:
                         self._add_kv_cache_events()
 
+                # Drain timeout buffer outside ``if can_queue`` so the synced
+                # collective fires every iter regardless of future restructuring.
+                self._handle_kv_transfer_timeouts_synced()
+
                 if self.kv_cache_transceiver and self.async_transfer_manager.has_any_inflight_requests(
                 ):
                     self._check_kv_transfer_timeout()
@@ -2584,6 +2633,9 @@ class PyExecutor:
                                    sample_state=sample_state,
                                    iter_stats=iter_stats,
                                    iter_start_time=iter_start_time))
+                # Same lockstep guarantee for iter-stats; no-op when
+                # TLLM_METRICS_ALL_RANKS=0.
+                self._flush_iter_stats_synced()
 
                 self.iter_counter += 1
 
@@ -2891,6 +2943,12 @@ class PyExecutor:
                         self.previous_batch.scheduled_requests.all_requests())
                 else:
                     self._enqueue_responses([])
+
+                # Drain buffers from the (per-rank-divergent)
+                # _process_previous_batch above; rank-symmetric companion to
+                # the _enqueue_responses([]) call in the else branch.
+                self._handle_kv_transfer_timeouts_synced()
+                self._flush_iter_stats_synced()
 
                 # Call set_exclude_last_generation_logits after _process_previous_batch.
                 # If set before, the response of a request may be incorrect, as it will
@@ -4439,11 +4497,9 @@ class PyExecutor:
         for request in requests_to_terminate:
             self._terminate_request(request)
         if self.enable_attention_dp and self.dist.world_size != 1:
-            any_timed_out = any(self.dist.tp_allgather(
-                bool(timed_out_requests)))
-            if any_timed_out:
-                self._handle_errors(error_msg="Request timed out (KV transfer)",
-                                    requests=timed_out_requests)
+            # Buffer for _handle_kv_transfer_timeouts_synced; in-place
+            # tp_allgather would desync (reached from per-rank-divergent gates).
+            self._pending_timed_out_requests.extend(timed_out_requests)
         else:
             for req in timed_out_requests:
                 self._handle_errors(
