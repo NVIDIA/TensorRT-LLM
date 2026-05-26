@@ -1412,7 +1412,9 @@ def _(
 
 class FinegrainedMixedDtypeGemm(TunableRunner):
     _runner_dict = dict()
-    MAX_SUPPORTED_SM_VERSION = 103
+    MAX_SUPPORTED_SM_VERSION_W4A8 = 103
+    # W4A16 (FP16/BF16 activation): SM120/121 dispatch via cutlass::arch::Sm80.
+    MAX_SUPPORTED_SM_VERSION_W4A16 = 121
 
     def __init__(self, activation_dtype: torch.dtype, output_dtype: torch.dtype,
                  quant_mode: int):
@@ -1445,9 +1447,16 @@ class FinegrainedMixedDtypeGemm(TunableRunner):
                 do_preparation: bool = False,
                 **kwargs) -> torch.Tensor:
 
-        if get_sm_version() > self.MAX_SUPPORTED_SM_VERSION:
+        sm = get_sm_version()
+        if (self.activation_dtype == torch.float8_e4m3fn
+                and sm > self.MAX_SUPPORTED_SM_VERSION_W4A8):
             raise ValueError(
-                f"SM version {get_sm_version()} is not supported for W4A16/W4A8 finegrained mixed dtype GEMM"
+                f"SM version {sm} is not supported for W4A8 finegrained mixed dtype GEMM"
+            )
+        if (self.activation_dtype in (torch.float16, torch.bfloat16)
+                and sm > self.MAX_SUPPORTED_SM_VERSION_W4A16):
+            raise ValueError(
+                f"SM version {sm} is not supported for W4A16 finegrained mixed dtype GEMM"
             )
 
         activation, weights_packed, scales = inputs
@@ -1693,17 +1702,29 @@ class Fp8BlockScalingGemmRunner(TunableRunner):
             a, b, a_scale, b_scale)
 
 
-def get_fp8_block_scaling_gemm_constraint_spec():
-    # The implementation aligns with the fp8_quantize_1x128 custom op.
-    def fp8_quantize_1x128_sm90_constrant(inputs: List[List[int]]):
-        pad_m = fp4_utils.pad_up(inputs[0][0], 4)
-        blocked_n = (inputs[0][1] + 127) // 128
-        return fp4_utils.pad_up(pad_m * blocked_n * 4, 128) // 4
+def _fp8_block_scaling_gemm_sm100_constraint(inputs: List[List[int]]) -> int:
+    return inputs[0][0]
 
-    if get_sm_version() >= 100:
-        return (ConstraintSpec(2, 1, lambda inputs: inputs[0][0]), )
+
+def _fp8_quantize_1x128_sm90_constraint(inputs: List[List[int]]) -> int:
+    # The implementation aligns with the fp8_quantize_1x128 custom op.
+    pad_m = fp4_utils.pad_up(inputs[0][0], 4)
+    blocked_n = (inputs[0][1] + 127) // 128
+    return fp4_utils.pad_up(pad_m * blocked_n * 4, 128) // 4
+
+
+@lru_cache(maxsize=None)
+def _get_fp8_block_scaling_gemm_constraint_spec(
+        sm_version: int) -> Tuple[ConstraintSpec, ...]:
+    if sm_version >= 100:
+        return (ConstraintSpec(2, 1,
+                               _fp8_block_scaling_gemm_sm100_constraint), )
     else:
-        return (ConstraintSpec(2, 0, fp8_quantize_1x128_sm90_constrant), )
+        return (ConstraintSpec(2, 0, _fp8_quantize_1x128_sm90_constraint), )
+
+
+def get_fp8_block_scaling_gemm_constraint_spec() -> Tuple[ConstraintSpec, ...]:
+    return _get_fp8_block_scaling_gemm_constraint_spec(get_sm_version())
 
 
 @torch.library.custom_op("trtllm::fp8_block_scaling_gemm", mutates_args=())

@@ -45,7 +45,8 @@ from tensorrt_llm.media.encoding import image_to_bytes
 from tensorrt_llm.metrics.collector import MetricsCollector
 from tensorrt_llm.sampling_params import GuidedDecodingParams
 from tensorrt_llm.serve.chat_utils import (load_chat_template,
-                                           parse_chat_messages_coroutines)
+                                           parse_chat_messages_coroutines,
+                                           resolve_top_level_model_type)
 from tensorrt_llm.serve.cluster_storage import create_cluster_storage_client
 from tensorrt_llm.serve.disagg_auto_scaling import DisaggClusterWorker
 from tensorrt_llm.serve.metadata_server import create_metadata_server
@@ -213,6 +214,13 @@ class OpenAIServer(_VideoRoutesMixin):
         self.perf_metrics_lock = None
         self._iteration_stats_collector_task = None
         self._iteration_stats_wakeup_event = asyncio.Event()
+        # Bounded snapshot of iteration stats for the GET /metrics handler.
+        # When the background Prometheus collector loop is active, it is the
+        # sole consumer of the engine's stats queue and appends each drained
+        # stat here; /metrics then serves from this buffer instead of racing
+        # the loop for the queue. Created lazily when the loop starts.
+        # See nvbug 6102381.
+        self._iteration_stats_buffer: Optional[deque] = None
         # The steady clock offset (in seconds) between this server and the disagg server
         self.disagg_server_steady_clock_offset = 0
 
@@ -254,7 +262,6 @@ class OpenAIServer(_VideoRoutesMixin):
                 self.disagg_cluster_worker = DisaggClusterWorker(
                     self.server_role, self.host, self.port,
                     self.disagg_cluster_config, self.disagg_cluster_storage)
-                await self.disagg_cluster_worker.register_worker()
 
             # VisualGen has no args
             if not isinstance(self.generator, VisualGen):
@@ -274,12 +281,18 @@ class OpenAIServer(_VideoRoutesMixin):
                 # tensorrt backend does not have this attribute but it always has iter stats enabled.
                 if self.metrics_collector and getattr(
                         self.generator.args, "enable_iter_perf_stats", True):
+                    # The background loop becomes the sole consumer of the
+                    # engine stats queue; /metrics reads from a tee buffer
+                    # bounded by iter_stats_max_iterations to avoid racing
+                    # the loop for the queue (nvbug 6102381).
+                    max_buf = getattr(self.generator.args,
+                                      "iter_stats_max_iterations", 1000) or 1000
+                    self._iteration_stats_buffer = deque(maxlen=max_buf)
                     self._iteration_stats_collector_task = asyncio.create_task(
                         self._iteration_stats_collector_loop())
                     logger.info(
                         "Started background iteration stats collector task")
 
-            # terminate rank0 worker
             yield
 
             # Stop background iteration stats collector
@@ -374,10 +387,17 @@ class OpenAIServer(_VideoRoutesMixin):
         if disable_harmony or self.model_config is None:
             self.use_harmony = False
         else:
-            self.use_harmony = (self.model_config.model_type == "gpt_oss")
+            self.use_harmony = (type(self.model_config).model_type == "gpt_oss")
 
         self.tool_call_id_type = "random"  # default tool call id type is random
         if self.model_config is not None:
+            # NOTE: Use the instance-level ``model_type`` (JSON-derived) here, not
+            # ``type(cfg).model_type``. ``kimi_k2`` / ``deepseek_v32`` are aliases
+            # registered in ``_CONFIG_REGISTRY`` (config_utils.py) that reuse
+            # ``DeepseekV3Config``, whose class-level ``model_type`` is ``"deepseek_v3"``.
+            # Only the JSON ``model_type`` distinguishes these variants. Other call
+            # sites that consult multimodal/chat-template registries keyed on the
+            # canonical class attribute should keep using ``type(cfg).model_type``.
             if self.model_config.model_type == "kimi_k2":
                 self.tool_call_id_type = "kimi_k2"
             elif self.model_config.model_type == "deepseek_v32":
@@ -412,6 +432,14 @@ class OpenAIServer(_VideoRoutesMixin):
             if max_perf_metrics > 0:
                 self.perf_metrics = deque(maxlen=max_perf_metrics)
                 self.perf_metrics_lock = asyncio.Lock()
+
+    def _logit_bias_vocab_size(self) -> int:
+        for config in (self.model_config,
+                       getattr(self.model_config, "text_config", None)):
+            vocab_size = getattr(config, "vocab_size", None)
+            if vocab_size is not None:
+                return int(vocab_size)
+        return int(self.tokenizer.tokenizer.vocab_size)
 
     def _log_config_info_metrics(self) -> None:
         """Extract configuration from generator args and log as Prometheus info gauges."""
@@ -820,6 +848,18 @@ class OpenAIServer(_VideoRoutesMixin):
         return JSONResponse(content=model_list.model_dump())
 
     async def get_iteration_stats(self) -> JSONResponse:
+        # When the background collector loop is active it is the sole
+        # consumer of the engine stats queue; serve /metrics from the tee
+        # buffer it populates so we do not race it for queue items. Racing
+        # caused >80% iteration loss and ~2s per-call latency (nvbug 6102381).
+        # The caller receives the stats accumulated since the previous /metrics
+        # call (up to iter_stats_max_iterations) and the buffer is cleared.
+        if self._iteration_stats_buffer is not None:
+            stats = list(self._iteration_stats_buffer)
+            self._iteration_stats_buffer.clear()
+            return JSONResponse(content=stats)
+
+        # Legacy path: no background collector -> read the queue directly.
         stats = []
         async for stat in self.generator.get_stats_async(2):
             stats.append(stat)
@@ -1038,6 +1078,11 @@ class OpenAIServer(_VideoRoutesMixin):
                     async for llm_stat in self.generator.get_stats_async(
                             timeout=0.5):
                         self.metrics_collector.log_iteration_stats(llm_stat)
+                        # Tee into the /metrics snapshot buffer so the HTTP
+                        # handler can serve without competing for the engine
+                        # queue (nvbug 6102381).
+                        if self._iteration_stats_buffer is not None:
+                            self._iteration_stats_buffer.append(llm_stat)
                 except Exception as e:
                     # Log errors but continue collecting stats
                     logger.error(f"Error collecting iteration stats: {e}",
@@ -1092,13 +1137,13 @@ class OpenAIServer(_VideoRoutesMixin):
             tool_dicts = None if request.tools is None else [
                 tool.model_dump() for tool in request.tools
             ]
-            # Pass the tokenizer vocabulary size so ``logit_bias`` can be
+            # Pass the model vocabulary size so ``logit_bias`` can be
             # expanded into an embedding bias tensor in the sampler.
             vocab_size = getattr(self.tokenizer.tokenizer,
                                  "vocab_size", None) or getattr(
                                      self.tokenizer, "vocab_size", None)
             sampling_params = request.to_sampling_params(
-                vocab_size=vocab_size,
+                vocab_size=self._logit_bias_vocab_size(),
                 gather_generation_logits=self.generator.args.
                 gather_generation_logits,
                 reasoning_parser=self.generator.args.reasoning_parser,
@@ -1141,7 +1186,7 @@ class OpenAIServer(_VideoRoutesMixin):
                 prompt = request.prompt_token_ids
             else:
                 prompt: str = apply_chat_template(
-                    model_type=self.model_config.model_type,
+                    model_type=resolve_top_level_model_type(self.model_config),
                     tokenizer=self.tokenizer,
                     processor=self.processor,
                     conversation=conversation,
@@ -1291,7 +1336,7 @@ class OpenAIServer(_VideoRoutesMixin):
                 prompt = request.prompt_token_ids
             else:
                 prompt: str = apply_chat_template(
-                    model_type=self.model_config.model_type,
+                    model_type=resolve_top_level_model_type(self.model_config),
                     tokenizer=self.tokenizer,
                     processor=self.processor,
                     conversation=conversation,
@@ -1441,10 +1486,10 @@ class OpenAIServer(_VideoRoutesMixin):
 
             promises: List[RequestOutput] = []
             postproc_params_collection: List[Optional[PostprocParams]] = []
-            # Pass the tokenizer vocabulary size so ``logit_bias`` can be
+            # Pass the model vocabulary size so ``logit_bias`` can be
             # expanded into an embedding bias tensor in the sampler.
             sampling_params = request.to_sampling_params(
-                vocab_size=self._vocab_size,
+                vocab_size=self._logit_bias_vocab_size(),
                 gather_generation_logits=self.generator.args.
                 gather_generation_logits,
                 backend=self.generator.args.backend)
@@ -1578,7 +1623,8 @@ class OpenAIServer(_VideoRoutesMixin):
                 request.stop_token_ids = harmony_stop_tokens
 
             sampling_params = request.to_sampling_params(
-                vocab_size=self._vocab_size, reasoning_parser="gpt_oss")
+                vocab_size=self._logit_bias_vocab_size(),
+                reasoning_parser="gpt_oss")
             sampling_params.detokenize = False  # Harmony adapter handles detokenization
             disaggregated_params = to_llm_disaggregated_params(
                 request.disaggregated_params)
@@ -1922,4 +1968,17 @@ class OpenAIServer(_VideoRoutesMixin):
                                 port=port,
                                 log_level="info",
                                 timeout_keep_alive=TIMEOUT_KEEP_ALIVE)
-        await uvicorn.Server(config).serve(sockets=sockets)
+        server = uvicorn.Server(config)
+
+        async def _register_after_serving():
+            while not server.started:
+                await asyncio.sleep(0.1)
+            if self.disagg_cluster_worker:
+                try:
+                    await self.disagg_cluster_worker.register_worker()
+                except Exception as e:
+                    logger.error(f"Worker registration failed: {e}")
+                    server.should_exit = True
+
+        asyncio.create_task(_register_after_serving())
+        await server.serve(sockets=sockets)

@@ -47,9 +47,9 @@ b_enable_teacache
 b_enable_cuda_graph
 b_enable_torch_compile
 b_enable_two_stage
-b_enable_parallel_vae
 l_cfg_size
 l_ulysses_size
+l_parallel_vae_size
 s_generation_mode
 s_backend
 s_size
@@ -107,13 +107,13 @@ environment:
 server_configs:
   - name: wan21_14b_nvfp4_trtllm_cfg2_ulysses4_teacache_on
     model_path: Wan-AI/Wan2.1-T2V-14B-Diffusers
-    extra_visual_gen_options_path: examples/visual_gen/serve/configs/foo.yml
+    visual_gen_args_path: examples/visual_gen/serve/configs/foo.yml
     server_config:
-      attention:
+      attention_config:
         backend: TRTLLM
-      parallel:
-        dit_cfg_size: 2
-        dit_ulysses_size: 4
+      parallel_config:
+        cfg_size: 2
+        ulysses_size: 4
     client_configs:
       - name: 832x480_33f_50s_con1
         backend: openai-videos
@@ -138,10 +138,10 @@ server_configs:
 - `server_configs[].model_path` is optional and allows the runtime serve path to
   differ from the stable OpenSearch `model_name`; defaults to `model_name` when
   omitted
-- `extra_visual_gen_options_path` is optional; when present, it is merged with
+- `visual_gen_args_path` is optional; when present, it is merged with
   inline `server_config`, and the merged config is treated as the runtime truth
 - `hardware.gpus_per_node` must match the GPU count derived from
-  `server_config.parallel`
+  `server_config.parallel_config`
 - `client_configs[].generation_mode` should be set explicitly for stable
   bucketing, especially for `i2v` and `t2v`
 - `client_configs[].extra_body.input_reference` is the current way to express
@@ -234,7 +234,7 @@ Important:
    `client_configs` for stable bucketing.
 
 3. **Verify `hardware.gpus_per_node`** matches the GPU count implied by
-   `server_config.parallel` (cfg × ulysses).
+   `server_config.parallel_config` (cfg × ulysses).
 
 4. **Register the case in the test-db.** Add a line to
    `tests/integration/test_lists/test-db/l0_b200_visual_gen_perf_sanity.yml`

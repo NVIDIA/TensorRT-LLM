@@ -1,3 +1,17 @@
+# SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """Tests for basic graph sharding."""
 
 import copy
@@ -981,6 +995,18 @@ def _run_pattern_detection_job(
                         )
                     )
                 elif is_op(node, torch.ops.auto_deploy.torch_ssm):
+                    expected_transformations.append(
+                        WeightShardingInfo(
+                            target_node=node.name,
+                            split_dim=SplitDimension.COLUMN,
+                            config=config,
+                            dist_op=None,
+                            min_local_shape=1,
+                            layer_type=LayerType.SSM,
+                            fused_weight_dims=None,
+                        )
+                    )
+                elif is_op(node, torch.ops.auto_deploy.torch_rmsnorm_gated):
                     expected_transformations.append(
                         WeightShardingInfo(
                             target_node=node.name,

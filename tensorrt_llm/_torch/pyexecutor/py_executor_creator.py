@@ -446,9 +446,13 @@ def create_py_executor(
         has_draft_model_engine = spec_config.spec_dec_mode.has_draft_model()
         has_spec_drafter = spec_config.spec_dec_mode.has_spec_drafter()
 
-        if hasattr(spec_config,
-                   'max_batch_size') and spec_config.max_batch_size is None:
-            spec_config.max_batch_size = max_batch_size
+        # Eagle3DecodingConfig._max_batch_size is internally managed: the
+        # dynamic-tree worker pre-allocates batch-indexed CUDA buffers sized
+        # by this value, and runtime indexes them with no bounds check. It
+        # MUST equal the global max_batch_size to avoid OOB; we populate it
+        # here as the single source of truth.
+        if hasattr(spec_config, '_max_batch_size'):
+            spec_config._max_batch_size = max_batch_size
 
         # WAR for https://nvbugs/5807902
         # Disable separate draft KV cache in disaggregated mode
@@ -621,9 +625,10 @@ def create_py_executor(
     config = model_engine.model.model_config.pretrained_config
     if is_hybrid_linear(config) and kv_cache_config.enable_block_reuse and (
             cache_transceiver_config is not None
-            and cache_transceiver_config.backend is not None):
+            and cache_transceiver_config.backend is not None
+            and cache_transceiver_config.transceiver_runtime == "PYTHON"):
         logger.warning(
-            "Disabling block reuse for MambaHybridCacheManager-based models when disagg is enabled"
+            "Disabling block reuse for MambaHybridCacheManager-based models when disagg + Python transceiver enabled"
         )
         kv_cache_config.enable_block_reuse = False
         _set_model_engines_cache_reuse([model_engine, draft_model_engine],
@@ -817,22 +822,26 @@ def create_py_executor(
     if model_engine.model.model_config.is_generation:
         #NOTE: non-generation models do not have kv cache
 
-        # Use C++ MambaCacheManager by default for Disaggregated serving with hybrid model.
-        config = model_engine.model.model_config.pretrained_config
-
         is_disagg = (cache_transceiver_config is not None
                      and cache_transceiver_config.backend is not None)
-        is_hybrid = is_hybrid_linear(config)
+        is_hybrid = is_hybrid_linear(
+            model_engine.model.model_config.pretrained_config)
 
         if is_disagg and is_hybrid:
-            if cache_transceiver_config.transceiver_runtime != "PYTHON" or os.environ.get(
-                    "TRTLLM_USE_CPP_MAMBA") == "1":
-                logger.info("Disaggregated serving with hybrid model detected. "
-                            "Enabling C++ MambaCacheManager.")
-                os.environ["TRTLLM_USE_CPP_MAMBA"] = "1"
+            # NOTE: TRTLLM_USE_PY_MAMBA is an agg-mode-only override and has
+            # no effect in disagg. The disagg manager choice is driven solely
+            # by transceiver_runtime: PYTHON => PythonMambaCacheManager,
+            # otherwise CppMambaCacheManager. Clear the var here so the
+            # mutual-exclusion check in use_cpp_mamba_cache_manager() does
+            # not fire after we force TRTLLM_USE_CPP_MAMBA=1 below.
+            if os.environ.pop("TRTLLM_USE_PY_MAMBA", "0") == "1":
+                logger.warning(
+                    "TRTLLM_USE_PY_MAMBA is ignored in disaggregated serving; "
+                    "use cache_transceiver_config.transceiver_runtime='PYTHON' "
+                    "to select PythonMambaCacheManager.")
             else:
                 logger.info("Disaggregated serving with hybrid model detected. "
-                            "Enabling Python MambaCacheManager.")
+                            "Enabling CppMambaHybridCacheManager.")
 
         # Get draft config for one-engine speculative decoding if available
         draft_config = getattr(model_engine.model, 'draft_config', None)

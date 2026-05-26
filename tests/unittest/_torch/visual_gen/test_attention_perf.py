@@ -44,12 +44,11 @@ from tensorrt_llm._torch.visual_gen.attention_backend.flash_attn4 import (
     _flash_attn_fwd_import_error as _fa4_import_error,
 )
 from tensorrt_llm._torch.visual_gen.config import (
-    AttentionConfig,
     DiffusionModelConfig,
-    SageAttentionConfig,
     create_attention_metadata_state,
 )
 from tensorrt_llm._torch.visual_gen.modules.attention import Attention, QKVMode
+from tensorrt_llm.visual_gen.args import AttentionConfig, QuantAttentionConfig
 
 _flash_attn4_available = _fa4_fwd is not None
 
@@ -146,7 +145,7 @@ def create_model_config(
     head_dim: int,
     eps: float = 1e-6,
     attn_backend: str = "VANILLA",
-    sage_attention_config: "SageAttentionConfig | None" = None,
+    quant_attention_config: "QuantAttentionConfig | None" = None,
 ) -> DiffusionModelConfig:
     """Create a mock DiffusionModelConfig for testing."""
     pretrained_config = SimpleNamespace(
@@ -160,7 +159,7 @@ def create_model_config(
         pretrained_config=pretrained_config,
         attention=AttentionConfig(
             backend=attn_backend,
-            sage_attention_config=sage_attention_config,
+            quant_attention_config=quant_attention_config,
         ),
         skip_create_weights_in_init=False,
     )
@@ -203,7 +202,7 @@ def _is_sage_attention_enabled(model: Attention) -> bool:
     """Return whether the created attention model is using SageAttention."""
     attention_backend = getattr(model, "attn", None)
     inner_backend = getattr(attention_backend, "inner_backend", attention_backend)
-    return getattr(inner_backend, "sage_attention_config", None) is not None
+    return getattr(inner_backend, "quant_attention_config", None) is not None
 
 
 # ============================================================================
@@ -261,7 +260,7 @@ class WanAttentionPerformanceBenchmark:
         num_heads: int,
         head_dim: int,
         backend: str,
-        sage_attention_config: "SageAttentionConfig | None" = None,
+        quant_attention_config: "QuantAttentionConfig | None" = None,
     ) -> Attention:
         """Create a WAN self-attention model with specified backend."""
         config = create_model_config(
@@ -269,7 +268,7 @@ class WanAttentionPerformanceBenchmark:
             num_heads,
             head_dim,
             attn_backend=backend,
-            sage_attention_config=sage_attention_config,
+            quant_attention_config=quant_attention_config,
         )
         model = Attention(hidden_size, num_heads, qkv_mode=QKVMode.FUSE_QKV, config=config).to(
             self.device
@@ -391,7 +390,7 @@ class WanAttentionPerformanceBenchmark:
         head_dim: int,
         backend: str,
         verbose: bool = True,
-        sage_attention_config: "SageAttentionConfig | None" = None,
+        quant_attention_config: "QuantAttentionConfig | None" = None,
     ) -> Optional[Dict]:
         """Benchmark a single configuration.
 
@@ -410,7 +409,7 @@ class WanAttentionPerformanceBenchmark:
         try:
             # Create model and data
             model = self.create_attention_model(
-                hidden_size, num_heads, head_dim, backend, sage_attention_config
+                hidden_size, num_heads, head_dim, backend, quant_attention_config
             )
             hidden_states, freqs = self.create_test_data(batch_size, seq_len, hidden_size, head_dim)
 
@@ -871,27 +870,17 @@ _sm100_only = pytest.mark.skipif(
     reason="SageAttention cubins require SM100 (Blackwell).",
 )
 
-# All five supported (num_elts_per_blk_q, num_elts_per_blk_k, num_elts_per_blk_v, qk_int8) tuples.
-_SAGE_CONFIGS = [
-    SageAttentionConfig(
-        num_elts_per_blk_q=1, num_elts_per_blk_k=1, num_elts_per_blk_v=1, qk_int8=False
-    ),
-    SageAttentionConfig(
-        num_elts_per_blk_q=1, num_elts_per_blk_k=4, num_elts_per_blk_v=1, qk_int8=False
-    ),
-    SageAttentionConfig(
-        num_elts_per_blk_q=1, num_elts_per_blk_k=1, num_elts_per_blk_v=1, qk_int8=True
-    ),
-    SageAttentionConfig(
-        num_elts_per_blk_q=1, num_elts_per_blk_k=4, num_elts_per_blk_v=1, qk_int8=True
-    ),
-    SageAttentionConfig(
-        num_elts_per_blk_q=1, num_elts_per_blk_k=16, num_elts_per_blk_v=1, qk_int8=True
-    ),
+# All five supported (qk_dtype, v_dtype, (q_block_size, k_block_size, v_block_size)) recipes.
+_QUANT_CONFIGS = [
+    QuantAttentionConfig(qk_dtype="fp8", q_block_size=1, k_block_size=1, v_block_size=1),
+    QuantAttentionConfig(qk_dtype="fp8", q_block_size=1, k_block_size=4, v_block_size=1),
+    QuantAttentionConfig(qk_dtype="int8", q_block_size=1, k_block_size=1, v_block_size=1),
+    QuantAttentionConfig(qk_dtype="int8", q_block_size=1, k_block_size=4, v_block_size=1),
+    QuantAttentionConfig(qk_dtype="int8", q_block_size=1, k_block_size=16, v_block_size=1),
 ]
 
 # Human-readable labels for the five configs.
-_SAGE_CONFIG_IDS = ["fp8_k1", "fp8_k4", "int8_k1", "int8_k4", "int8_k16"]
+_QUANT_CONFIG_IDS = ["fp8_k1", "fp8_k4", "int8_k1", "int8_k4", "int8_k16"]
 
 
 @_sm100_only
@@ -931,7 +920,7 @@ class TestSageAttentionPerformance:
         num_heads: int,
         seq_len: int,
         head_dim: int,
-        sage_cfg: SageAttentionConfig,
+        quant_cfg: QuantAttentionConfig,
         verbose: bool = True,
     ) -> Optional[Dict]:
         return self.benchmark.benchmark_single(
@@ -941,14 +930,16 @@ class TestSageAttentionPerformance:
             head_dim,
             backend="TRTLLM",
             verbose=verbose,
-            sage_attention_config=sage_cfg,
+            quant_attention_config=quant_cfg,
         )
 
     # ------------------------------------------------------------------
     # Quick / CI tests
     # ------------------------------------------------------------------
 
-    @pytest.mark.parametrize("sage_cfg,cfg_id", zip(_SAGE_CONFIGS, _SAGE_CONFIG_IDS))
+    @pytest.mark.parametrize(
+        "quant_cfg,cfg_id", zip(_QUANT_CONFIGS, _QUANT_CONFIG_IDS, strict=True)
+    )
     @pytest.mark.parametrize(
         "batch,num_heads,seq_len,head_dim,desc",
         QUICK_SEQ_LENS,
@@ -960,14 +951,14 @@ class TestSageAttentionPerformance:
         seq_len: int,
         head_dim: int,
         desc: str,
-        sage_cfg: SageAttentionConfig,
+        quant_cfg: QuantAttentionConfig,
         cfg_id: str,
     ):
         """Verify every sage config produces a valid timing result at quick sizes."""
-        if sage_cfg.qk_int8 and torch.cuda.get_device_capability()[1] == 3:
+        if quant_cfg.qk_dtype == "int8" and torch.cuda.get_device_capability()[1] == 3:
             pytest.skip("SM103 does not have Int8 Tensor Cores.")
 
-        result = self._bench(batch, num_heads, seq_len, head_dim, sage_cfg)
+        result = self._bench(batch, num_heads, seq_len, head_dim, quant_cfg)
         assert result is not None, f"sage {cfg_id} failed for {desc}"
         assert result["uses_sage"], f"sage {cfg_id} fell back unexpected for {desc}"
         assert result["avg_ms"] > 0
@@ -975,14 +966,16 @@ class TestSageAttentionPerformance:
             f"  sage {cfg_id} ({desc}): avg={result['avg_ms']:.3f}ms  p95={result['p95_ms']:.3f}ms"
         )
 
-    @pytest.mark.parametrize("sage_cfg,cfg_id", zip(_SAGE_CONFIGS, _SAGE_CONFIG_IDS))
-    def test_sage_vs_vanilla_quick(self, sage_cfg: SageAttentionConfig, cfg_id: str):
+    @pytest.mark.parametrize(
+        "quant_cfg,cfg_id", zip(_QUANT_CONFIGS, _QUANT_CONFIG_IDS, strict=True)
+    )
+    def test_sage_vs_vanilla_quick(self, quant_cfg: QuantAttentionConfig, cfg_id: str):
         """Compare SageAttention timing against VANILLA at a quick size.
 
         Does not assert a minimum speedup — the goal is to catch regressions
         where sage unexpectedly becomes much slower than plain SDPA.
         """
-        if sage_cfg.qk_int8 and torch.cuda.get_device_capability()[1] == 3:
+        if quant_cfg.qk_dtype == "int8" and torch.cuda.get_device_capability()[1] == 3:
             pytest.skip("SM103 does not have Int8 Tensor Cores.")
 
         batch, num_heads, seq_len, head_dim = 1, 12, 4096, 128
@@ -993,7 +986,7 @@ class TestSageAttentionPerformance:
         trtllm = self.benchmark.benchmark_single(
             batch, num_heads, seq_len, head_dim, backend="TRTLLM", verbose=False
         )
-        sage = self._bench(batch, num_heads, seq_len, head_dim, sage_cfg)
+        sage = self._bench(batch, num_heads, seq_len, head_dim, quant_cfg)
 
         assert vanilla is not None, "VANILLA benchmark failed"
         assert trtllm is not None, "TRTLLM benchmark failed"
@@ -1013,7 +1006,9 @@ class TestSageAttentionPerformance:
     # Full WAN-shape benchmarks
     # ------------------------------------------------------------------
 
-    @pytest.mark.parametrize("sage_cfg,cfg_id", zip(_SAGE_CONFIGS, _SAGE_CONFIG_IDS))
+    @pytest.mark.parametrize(
+        "quant_cfg,cfg_id", zip(_QUANT_CONFIGS, _QUANT_CONFIG_IDS, strict=True)
+    )
     @pytest.mark.parametrize(
         "batch,num_heads,seq_len,head_dim,model_name",
         WAN_SEQ_LENS,
@@ -1025,17 +1020,17 @@ class TestSageAttentionPerformance:
         seq_len: int,
         head_dim: int,
         model_name: str,
-        sage_cfg: SageAttentionConfig,
+        quant_cfg: QuantAttentionConfig,
         cfg_id: str,
     ):
         """SageAttention vs TRTLLM on real WAN model sequence lengths."""
-        if sage_cfg.qk_int8 and torch.cuda.get_device_capability()[1] == 3:
+        if quant_cfg.qk_dtype == "int8" and torch.cuda.get_device_capability()[1] == 3:
             pytest.skip("SM103 does not have Int8 Tensor Cores.")
 
         trtllm = self.benchmark.benchmark_single(
             batch, num_heads, seq_len, head_dim, backend="TRTLLM", verbose=False
         )
-        sage = self._bench(batch, num_heads, seq_len, head_dim, sage_cfg)
+        sage = self._bench(batch, num_heads, seq_len, head_dim, quant_cfg)
 
         assert trtllm is not None, f"TRTLLM failed for {model_name}"
         assert sage is not None, f"sage {cfg_id} failed for {model_name}"

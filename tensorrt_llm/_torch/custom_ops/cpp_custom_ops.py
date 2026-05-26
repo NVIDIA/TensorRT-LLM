@@ -1075,7 +1075,6 @@ def _register_fake():
         head_size: int,
         tokens_per_block: int,
         attention_window_size: int,
-        sink_token_length: int,
         beam_width: int,
         quant_mode: int,
         q_scaling: float,
@@ -1148,20 +1147,6 @@ def _register_fake():
         output_sf = input.new_empty((scale_shape, ), dtype=torch.uint8)
         return output_fp4, output_sf
 
-    @torch.library.register_fake("trtllm::build_decoder_info")
-    def _(seq_q_offsets, seq_kv_offsets, padding_offsets, tokens_info,
-          encoder_padding_offsets, packed_mask_row_offsets,
-          seq_cp_partial_offsets, attention_mask, seq_q_lengths, seq_kv_lengths,
-          fmha_tile_counter, dequant_scale_qkv, quant_scale_o, fmha_bmm1_scale,
-          fmha_bmm2_scale, rotary_embedding_inv_freq,
-          rotary_embedding_inv_freq_cache, cp_size, separate_qkv_scales,
-          fmha_host_bmm1_scale, batch_size, max_q_seq_length,
-          max_encoder_q_seq_length, attention_window_size, sink_token_length,
-          num_tokens, remove_padding, attention_mask_type,
-          rotary_embedding_scale, rotary_embedding_base, rotary_embedding_dim,
-          rotary_scaling_type, rotary_embedding_max_positions):
-        return True
-
     @torch.library.register_fake("trtllm::convert_req_index_to_global")
     def _(req_id: torch.Tensor, block_table: torch.Tensor,
           token_indices: torch.Tensor, block_size: int, num_topk_tokens: int,
@@ -1190,3 +1175,72 @@ def _register_fake():
         out_shape = shape if shape is not None else list(like.shape)
         dtype = out_dtype if out_dtype is not None else like.dtype
         return like.new_empty(out_shape, dtype=dtype), output_buffer_kind
+
+    @torch.library.register_fake("trtllm::compute_probs_from_logits_op")
+    def _(logits: torch.Tensor,
+          temperatures: torch.Tensor,
+          top_k: Optional[torch.Tensor] = None,
+          top_p: Optional[torch.Tensor] = None,
+          skip_temperature: bool = False) -> torch.Tensor:
+        return logits.new_empty(list(logits.shape), dtype=torch.float32)
+
+    @torch.library.register_fake("trtllm::build_draft_prob_indices_out_op")
+    def _(topkScoreIndices: torch.Tensor, draftProbIndices: torch.Tensor,
+          topK: int, numDraftTokens: int) -> None:
+        return None
+
+    @torch.library.register_fake("trtllm::verify_dynamic_tree_rejection_out_op")
+    def _(candidates: torch.Tensor, draftProbs: torch.Tensor,
+          targetProbs: torch.Tensor, targetSupportIndices: torch.Tensor,
+          targetSupportLengths: torch.Tensor, draftProbIndices: torch.Tensor,
+          retrieveNextToken: torch.Tensor, retrieveNextSibling: torch.Tensor,
+          treeValid: torch.Tensor, acceptIndex: torch.Tensor,
+          acceptTokenNum: torch.Tensor, acceptToken: torch.Tensor,
+          numSpecStep: int, seed: torch.Tensor, offset: torch.Tensor) -> None:
+        return None
+
+    @torch.library.register_fake(
+        "trtllm::compute_draft_probs_for_dynamic_tree_rejection_op")
+    def _(draftLogits: torch.Tensor,
+          temperatures: torch.Tensor,
+          numDraftProbRows: int,
+          targetVocabSize: int,
+          top_k: Optional[torch.Tensor] = None,
+          top_p: Optional[torch.Tensor] = None,
+          skip_temperature: bool = False,
+          d2t: Optional[torch.Tensor] = None,
+          top_k_max: int = 0,
+          skip_all_sampling_params: bool = False) -> torch.Tensor:
+        batch_size = temperatures.shape[0]
+        return draftLogits.new_empty(
+            (batch_size, numDraftProbRows, targetVocabSize),
+            dtype=torch.float32)
+
+    @torch.library.register_fake(
+        "trtllm::compute_target_probs_for_dynamic_tree_rejection_op")
+    def _(
+        targetLogits: torch.Tensor,
+        temperatures: torch.Tensor,
+        numDraftTokens: int,
+        top_k: Optional[torch.Tensor] = None,
+        top_p: Optional[torch.Tensor] = None,
+        skip_temperature: bool = False,
+        top_k_max: int = 0,
+        skip_all_sampling_params: bool = False
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        batch_size = temperatures.shape[0]
+        target_vocab_size = targetLogits.shape[-1]
+        target_probs = targetLogits.new_empty(
+            (batch_size, numDraftTokens, target_vocab_size),
+            dtype=torch.float32)
+        has_filtering = (top_k is not None) or (top_p is not None)
+        if skip_all_sampling_params or not has_filtering:
+            support_indices = targetLogits.new_empty((0, ), dtype=torch.int32)
+            support_lengths = targetLogits.new_empty((0, ), dtype=torch.int32)
+        else:
+            support_dim = top_k_max if top_k_max > 0 else target_vocab_size
+            support_indices = targetLogits.new_empty(
+                (batch_size, numDraftTokens, support_dim), dtype=torch.int32)
+            support_lengths = targetLogits.new_empty(
+                (batch_size, numDraftTokens), dtype=torch.int32)
+        return target_probs, support_indices, support_lengths

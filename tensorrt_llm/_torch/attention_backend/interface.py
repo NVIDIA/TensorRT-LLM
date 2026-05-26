@@ -384,9 +384,15 @@ class AttentionMetadata:
             max_total_draft_tokens,
             model_is_wrapped: bool = False,
             spec_metadata: Optional['SpecMetadata'] = None,
-            spec_tree_manager: Optional['SpecTreeManager'] = None):
+            spec_tree_manager: Optional['SpecTreeManager'] = None,
+            num_contexts: int = 0):
         """
         Hook to be called when using TRTLLM attention backend in spec-dec mode.
+
+        ``num_contexts`` is the number of context (prefill) requests in the
+        mixed batch, occupying the leading rows of slot-storage buffers.
+        Backends that consume gen-only slots (e.g. dynamic tree) must skip
+        these rows to align with the XQA kernel's expected row layout.
         """
 
     def update_helix_param(
@@ -708,7 +714,8 @@ class AttentionForwardArgs:
 
     latent_cache: Optional[torch.Tensor] = None
     q_pe: Optional[torch.Tensor] = None
-    mrope_config: Optional[dict] = None
+    mrope_rotary_cos_sin: Optional[torch.Tensor] = None
+    mrope_position_deltas: Optional[torch.Tensor] = None
 
     softmax_stats_tensor: Optional[torch.Tensor] = None
     chunked_prefill_buffer_batch_size: int = 1
@@ -726,9 +733,7 @@ class AttentionForwardArgs:
     sage_attn_num_elts_per_blk_v: int = 0
     sage_attn_qk_int8: bool = False
 
-    enable_attn_nvfp4_output: bool = True
     topk_indices: Optional[torch.Tensor] = None
-    is_generation: bool = False
 
 
 _ATTENTION_FORWARD_ARGS_FIELDS = frozenset(

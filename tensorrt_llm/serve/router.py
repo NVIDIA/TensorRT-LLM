@@ -20,7 +20,6 @@ from collections import OrderedDict
 from typing import Awaitable, Callable, Dict, Iterable, List, Optional, Union
 
 import aiohttp
-from transformers import AutoTokenizer
 
 from tensorrt_llm.bindings.internal.batch_manager import (BlockKey,
                                                           BlockKeyHasher)
@@ -695,15 +694,15 @@ class BlockHashMixin:
                 self._tokenizers[model] = load_custom_tokenizer(
                     self._custom_tokenizer, model)
             else:
-                from tensorrt_llm.tokenizer import \
-                    maybe_fix_byte_level_tokenizer
-                tokenizer = AutoTokenizer.from_pretrained(
-                    model, trust_remote_code=True)
-                # Work around Transformers 5.x LlamaTokenizer overriding
-                # tokenizer.json's ByteLevel pre-tokenizer with Metaspace,
-                # which silently strips spaces from prompts (see tokenizer.py).
-                self._tokenizers[model] = maybe_fix_byte_level_tokenizer(
-                    tokenizer, model, trust_remote_code=True)
+                # Route through TransformersTokenizer so block-hash routing
+                # inherits the same post-load fixes as the rest of TRT-LLM
+                # (e.g. maybe_fix_byte_level_tokenizer for DeepSeek-V3
+                # Metaspace bug, _fallback_to_fast_tokenizer for DeepSeek-V3.2
+                # AttributeError on transformers >= 5.x). Peel off .tokenizer
+                # to return the raw HF tokenizer used by _tokenize() below.
+                from tensorrt_llm.tokenizer import TransformersTokenizer
+                self._tokenizers[model] = TransformersTokenizer.from_pretrained(
+                    model, trust_remote_code=True).tokenizer
         return self._tokenizers[model]
 
     def _tokenize(self, request: OpenAIRequest) -> list[list[int]]:
@@ -822,39 +821,49 @@ class KvCacheAwareRouter(BlockHashMixin, LoadBalancingMixin, Router):
                 server for server in self._server_state.keys()
                 if server != exclude_server
             ]
-        # Tokenize + block-hash is CPU-bound (~50 ms p50 for a 40 k-token
-        # chat request with a Rust-backed tokenizer). Running it directly
-        # inside the async handler blocks the orchestrator's event loop and
-        # serializes all concurrent requests through it; with HuggingFace
-        # tokenizers releasing the GIL, offloading to a thread lets multiple
-        # tokenize calls run in parallel and frees the event loop to
-        # dispatch HTTP traffic to the CTX/GEN workers meanwhile.
-        token_lists, block_hashes = await asyncio.to_thread(
-            self._tokenize_and_compute_block_hashes, request)
-        padded_tokens = sum(
-            len(hash_list)
-            for hash_list in block_hashes) * self._tokens_per_block
-        # select the server by (KV match - load)
-        # TODO: more options
-        workloads = [
-            state.num_active_requests()
-            for state in self._server_state.values()
-        ]
-        scores = []
+        block_hashes = []
+        token_lists = []
         matches = []
-        for i in range(len(servers)):
-            server = servers[i]
-            # https://github.com/ai-dynamo/dynamo/blob/main/docs/kv_cache_routing.md#kv-cache-routing-and-load-balancing
-            matches.append(
-                await self._server_state[server].matched_tokens(block_hashes))
-            score = matches[-1] / padded_tokens - workloads[
-                i] / self._max_batch_size
-            scores.append(score)
-        max_score = max(scores)
-        tied = [i for i, s in enumerate(scores) if s == max_score]
-        winner = tied[self._rr_counter % len(tied)]
-        self._rr_counter += 1
-        server = servers[winner]
+        if len(servers) == 0:
+            raise RuntimeError(
+                f"No available servers after excluding {exclude_server}")
+        elif len(servers) == 1:
+            server = servers[0]
+        else:
+            # Tokenize + block-hash is CPU-bound (~50 ms p50 for a 40 k-token
+            # chat request with a Rust-backed tokenizer). Running it directly
+            # inside the async handler blocks the orchestrator's event loop and
+            # serializes all concurrent requests through it; with HuggingFace
+            # tokenizers releasing the GIL, offloading to a thread lets multiple
+            # tokenize calls run in parallel and frees the event loop to
+            # dispatch HTTP traffic to the CTX/GEN workers meanwhile.
+            token_lists, block_hashes = await asyncio.to_thread(
+                self._tokenize_and_compute_block_hashes, request)
+            padded_tokens = sum(
+                len(hash_list)
+                for hash_list in block_hashes) * self._tokens_per_block
+            # select the server by (KV match - load)
+            # TODO: more options
+            workloads = [
+                state.num_active_requests()
+                for state in self._server_state.values()
+            ]
+            scores = []
+            matches = []
+            for i in range(len(servers)):
+                server = servers[i]
+                # https://github.com/ai-dynamo/dynamo/blob/main/docs/kv_cache_routing.md#kv-cache-routing-and-load-balancing
+                matches.append(
+                    await
+                    self._server_state[server].matched_tokens(block_hashes))
+                score = matches[-1] / padded_tokens - workloads[
+                    i] / self._max_batch_size
+                scores.append(score)
+            max_score = max(scores)
+            tied = [i for i, s in enumerate(scores) if s == max_score]
+            winner = tied[self._rr_counter % len(tied)]
+            self._rr_counter += 1
+            server = servers[winner]
         async with self._lock:
             await self._register_request(server, request)
         return server, {

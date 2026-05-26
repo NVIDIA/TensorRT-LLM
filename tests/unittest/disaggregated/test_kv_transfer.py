@@ -11,6 +11,7 @@ import pytest
 import torch
 
 import tensorrt_llm
+import tensorrt_llm._torch.disaggregation.native.transfer as transfer_mod
 import tensorrt_llm.bindings
 import tensorrt_llm.bindings.executor as trtllm
 import tensorrt_llm.tensorrt_llm_transfer_agent_binding  # TODO: remove it.  # noqa: F401
@@ -32,6 +33,14 @@ from tensorrt_llm.bindings import LayerType as LayerTypeCpp
 from tensorrt_llm.bindings import ModelConfig as ModelConfigCpp
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 from tensorrt_llm.logger import logger
+
+# Default to 4 worker threads for all KV transfer tests in this module.
+KV_TRANSFER_TEST_NUM_THREADS = 4
+
+
+@pytest.fixture(autouse=True)
+def _set_kv_transfer_num_threads(monkeypatch):
+    monkeypatch.setattr(transfer_mod, "KV_TRANSFER_NUM_THREADS", KV_TRANSFER_TEST_NUM_THREADS)
 
 
 @dataclass
