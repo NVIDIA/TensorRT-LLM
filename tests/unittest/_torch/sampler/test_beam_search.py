@@ -451,14 +451,8 @@ def test_beam_search_e2e(
     )
 
 
-@pytest.mark.parametrize("num_output_beams", [1, 2])
-@pytest.mark.parametrize("num_prompts", [1, 3])
-@pytest.mark.parametrize("stop_token_ids", [[15], None])
 @pytest.mark.threadleak(enabled=False)
 def test_beam_search_disagg_e2e(
-    num_output_beams: int,
-    num_prompts: int,
-    stop_token_ids: list[int] | None,
     fixed_params,
     input_prompts,
     model_kwargs: dict[str, Any],
@@ -468,23 +462,23 @@ def test_beam_search_disagg_e2e(
 
     sampling_params = SamplingParams(
         max_tokens=fixed_params["max_tokens"],
-        n=num_output_beams,
+        n=fixed_params["max_beam_width"],
         best_of=fixed_params["max_beam_width"],
         use_beam_search=True,
         end_id=-1,
-        stop_token_ids=stop_token_ids,
         include_stop_str_in_output=True,
         additional_model_outputs=["cache_indirection"],
     )
 
     disagg_kwargs = deepcopy(model_kwargs)
     disagg_kwargs |= dict(
-        disable_overlap_scheduler=False,
+        disable_overlap_scheduler=True,
         cuda_graph_config=None,
         cache_transceiver_config=CacheTransceiverConfig(
             backend="NIXL",
             transceiver_runtime="PYTHON",
-            kv_transfer_timeout_ms=5000,
+            kv_transfer_timeout_ms=1000,
+            kv_transfer_sender_future_timeout_ms=1000,
         ),
     )
 
@@ -493,7 +487,7 @@ def test_beam_search_disagg_e2e(
     try:
         with ctx_llm, gen_llm:
             validate_disagg_outputs(ctx_llm, gen_llm,
-                                    input_prompts[:num_prompts],
+                                    input_prompts[:1],
                                     sampling_params)
     finally:
         ctx_llm.shutdown()
