@@ -17,13 +17,28 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Qwen3 model with explicit sharding hint ops.
+"""Qwen3 (dense) model with explicit sharding hint ops.
 
-This is a rewrite of modeling_qwen3.py where all sharding-enabled operations use
-AutoDeploy custom ops with sharding hint kwargs. The graph produced by this
-model is a complete, self-contained specification of how this model should be
-sharded. The ``apply_sharding_hints`` transform reads the hints together with a
-runtime ``DistConfig`` to apply deterministic, node-local sharding.
+This is a sharding-aware rewrite of ``modeling_qwen3.py``: every shardable op
+uses an AutoDeploy custom op with explicit sharding hint kwargs. The exported
+FX graph is therefore a complete, self-contained specification of how the model
+should be sharded under tensor parallelism. The ``apply_sharding_hints``
+transform reads the hints together with a runtime ``DistConfig`` to apply
+deterministic, node-local sharding.
+
+Source of truth for model logic:
+https://huggingface.co/Qwen/Qwen3-0.6B (and the rest of the Qwen3 dense family).
+
+Differences from the original HuggingFace version:
+* Simplified for prefill-only inference (no KV caching)
+* Uses auto_deploy custom ops for export compatibility
+* Removed flash attention variants (uses torch_attention custom op)
+* Removed gradient checkpointing and training code paths
+* Removed attention dropout (inference only)
+* Removed sliding window attention (not needed for prefill-only)
+
+The Qwen3 model uses Grouped Query Attention (GQA) with per-head Q/K normalization
+(RMSNorm on head_dim), which distinguishes it from standard Llama-style models.
 
 Shardable custom ops used:
   - torch.ops.auto_deploy.torch_linear_simple  (tp_mode, tp_min_local_shape, layer_type)
@@ -90,7 +105,7 @@ class Qwen3RotaryEmbedding(RotaryEmbeddingBase):
 
 
 class Qwen3MLP(nn.Module):
-    """MLP layer for Qwen3 (SwiGLU) with sharding hints.
+    """MLP layer for Qwen3 (SwiGLU activation).
 
     Sharding strategy:
       gate_proj -> colwise
@@ -135,7 +150,11 @@ class Qwen3MLP(nn.Module):
 
 
 class Qwen3Attention(nn.Module):
-    """Grouped Query Attention for Qwen3 with per-head Q/K normalization and sharding hints.
+    """Grouped Query Attention for Qwen3 with per-head Q/K normalization.
+
+    Qwen3 applies RMSNorm to query and key states after projection and reshaping,
+    but before RoPE application. This per-head normalization on head_dim is a key
+    architectural difference from standard Llama-style models.
 
     Sharding strategy:
       q_proj -> colwise (+ tp_min_local_shape for GQA)
@@ -158,6 +177,7 @@ class Qwen3Attention(nn.Module):
         )
         self.scaling = self.head_dim ** (-0.5)
 
+        # Q/K/V/O projections
         self.q_proj = nn.Linear(
             self.hidden_size, self.num_heads * self.head_dim, bias=config.attention_bias
         )
@@ -171,6 +191,7 @@ class Qwen3Attention(nn.Module):
             self.num_heads * self.head_dim, self.hidden_size, bias=config.attention_bias
         )
 
+        # Per-head Q/K normalization (unique to Qwen3)
         self.q_norm = Qwen3RMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.k_norm = Qwen3RMSNorm(self.head_dim, eps=config.rms_norm_eps)
 
@@ -181,6 +202,7 @@ class Qwen3Attention(nn.Module):
     ) -> torch.Tensor:
         bsz, q_len, _ = hidden_states.size()
 
+        # Project Q/K/V and reshape to [B, S, N, head_dim] (BSND layout)
         q = torch.ops.auto_deploy.torch_linear_simple(
             hidden_states,
             self.q_proj.weight,
@@ -205,7 +227,6 @@ class Qwen3Attention(nn.Module):
             tp_min_local_shape=self.head_dim,
             layer_type="mha",
         )
-
         q = torch.ops.auto_deploy.view(
             q,
             [bsz, q_len, self.num_heads, self.head_dim],
@@ -225,40 +246,44 @@ class Qwen3Attention(nn.Module):
             layer_type="mha",
         )
 
+        # Apply per-head Q/K normalization (Qwen3-specific, on head_dim dimension)
         q = self.q_norm(q)
         k = self.k_norm(k)
 
-        cos, sin = position_embeddings
+        # Get pre-sliced cos/sin from position_embeddings (already indexed by position_ids)
+        cos, sin = position_embeddings  # [B, S, head_dim]
 
+        # Apply RoPE using custom op (BSND layout, unsqueeze_dim=2)
         q, k = torch.ops.auto_deploy.torch_rope_with_explicit_cos_sin(
             q,
             k,
             cos,
             sin,
-            2,
+            2,  # unsqueeze_dim=2 for BSND layout
         )
 
+        # Attention using custom op with GQA support (BSND layout)
         attn_output = torch.ops.auto_deploy.torch_attention(
-            q,
-            k,
-            v,
-            None,
-            0.0,
-            True,
-            self.scaling,
-            None,
-            None,
-            None,
-            "bsnd",
+            q,  # [B, S, N, head_dim]
+            k,  # [B, S, N_kv, head_dim]
+            v,  # [B, S, N_kv, head_dim]
+            None,  # attn_mask
+            0.0,  # dropout_p
+            True,  # is_causal
+            self.scaling,  # scale
+            None,  # sinks
+            None,  # sliding_window
+            None,  # logit_cap
+            "bsnd",  # layout
         )
 
+        # Reshape [B, S, N, head_dim] -> [B, S, N * head_dim] and project
         attn_output = torch.ops.auto_deploy.view(
             attn_output,
             [bsz, q_len, self.num_heads * self.head_dim],
             tp_scaled_dim=2,
             layer_type="mha",
         )
-
         attn_output = torch.ops.auto_deploy.torch_linear_simple(
             attn_output,
             self.o_proj.weight,
@@ -288,11 +313,13 @@ class Qwen3DecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         position_embeddings: Tuple[torch.Tensor, torch.Tensor],
     ) -> torch.Tensor:
+        # Self attention
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
         hidden_states = self.self_attn(hidden_states, position_embeddings)
         hidden_states = residual + hidden_states
 
+        # MLP
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
         hidden_states = self.mlp(hidden_states)
@@ -350,11 +377,17 @@ class Qwen3Model(Qwen3PreTrainedModel):
         )
         self.norm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
+        # Shared rotary embedding at model level. In transformers 4.x rope_theta
+        # sits on the config directly; in transformers 5.x it has been moved
+        # under ``rope_scaling`` (alongside ``rope_type``). Handle both layouts.
         head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
+        rope_theta = getattr(config, "rope_theta", None)
+        if rope_theta is None:
+            rope_theta = (config.rope_scaling or {}).get("rope_theta", 10000.0)
         self.rotary_emb = Qwen3RotaryEmbedding(
             head_dim,
             max_position_embeddings=config.max_position_embeddings,
-            base=config.rope_theta,
+            base=rope_theta,
         )
 
         self.post_init()
@@ -382,8 +415,11 @@ class Qwen3Model(Qwen3PreTrainedModel):
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
 
+        # Cast to compute dtype (e.g., bfloat16) for FP8 models where embedding
+        # output may be FP8 but downstream ops (RMSNorm, attention) require FP16/BF16
         inputs_embeds = inputs_embeds.to(self.norm.weight.dtype)
 
+        # Compute position embeddings once (sliced by position_ids in RoPE)
         position_embeddings = self.rotary_emb(inputs_embeds, position_ids)
 
         hidden_states = inputs_embeds
@@ -399,7 +435,7 @@ class Qwen3Model(Qwen3PreTrainedModel):
 class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
     """Qwen3 model with language modeling head."""
 
-    _tied_weights_keys = ["lm_head.weight"]
+    _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
 
     def __init__(self, config, **kwargs):
         super().__init__(config)
@@ -445,4 +481,5 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
         return Qwen3CausalLMOutput(logits=logits)
 
 
+# Register with AutoModelForCausalLMFactory
 AutoModelForCausalLMFactory.register_custom_model_cls("Qwen3Config", Qwen3ForCausalLM)

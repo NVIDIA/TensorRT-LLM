@@ -25,8 +25,8 @@ from typing import Optional, Type
 import torch
 
 from tensorrt_llm.models.modeling_utils import QuantConfig
+from tensorrt_llm.visual_gen.args import AttentionConfig
 
-from ..config import AttentionConfig
 from .interface import AttentionBackend
 
 
@@ -100,7 +100,7 @@ def create_attention(
             will automatically reallocate if larger batches are encountered.
         max_seq_len: Initial sequence length for metadata pre-allocation. The backend
             will automatically reallocate if longer sequences are encountered.
-        attention_config: Optional AttentionConfig; sage_attention_config is
+        attention_config: Optional AttentionConfig; quant_attention_config is
             extracted and forwarded to the TRTLLM backend when present.
         attention_metadata_state: Optional model-scoped metadata state from
             visual-gen config. Required for TRTLLM backend.
@@ -111,11 +111,11 @@ def create_attention(
     """
     attn_cls = get_visual_gen_attention_backend(backend)
 
-    # Extract sage_attention_config from AttentionConfig and pass to TRTLLM backend.
-    # AttentionConfig validation disables unsupported SageAttention configs by
-    # normalizing sage_attention_config to None.
-    if attention_config is not None and attention_config.sage_attention_config is not None:
-        kwargs["sage_attention_config"] = attention_config.sage_attention_config
+    # Extract quant_attention_config from AttentionConfig and pass to TRTLLM backend.
+    # AttentionConfig validation disables unsupported recipes by normalizing
+    # quant_attention_config to None.
+    if attention_config is not None and attention_config.quant_attention_config is not None:
+        kwargs["quant_attention_config"] = attention_config.quant_attention_config
     if backend.upper() == "TRTLLM":
         if attention_metadata_state is None:
             raise ValueError(
