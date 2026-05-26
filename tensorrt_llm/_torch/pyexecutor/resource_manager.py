@@ -188,9 +188,7 @@ _MROPE_NUM_AXES = 3
 
 def _make_warmup_mrope_position_ids(token_num: int) -> torch.Tensor:
     """Build (_MROPE_NUM_AXES, 1, token_num) mrope_position_ids for warmup."""
-    return (torch.arange(0,
-                         token_num,
-                         dtype=torch.int32,
+    return (torch.arange(0, token_num, dtype=torch.int32,
                          device="cuda").expand(_MROPE_NUM_AXES, 1, -1).clone())
 
 
