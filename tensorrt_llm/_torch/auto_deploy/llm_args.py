@@ -63,6 +63,7 @@ _TRANSFORMS_SHORTCUT_LOOKUP = {
     "attn_backend": ("insert_cached_attention.backend", "transformers_replace_cached_attn.backend"),
     "compile_backend": ("compile_model.backend",),
 }
+_PIECEWISE_COMPILE_BACKENDS = {"torch-cudagraph", "torch-opt"}
 
 
 def _shortcut_description(description: str, shortcut: str) -> str:
@@ -397,6 +398,13 @@ class LlmArgs(DynamicYamlMixInForSettings, TorchLlmArgs, BaseSettings):
             self.update_transforms_with_shortcuts()
         return self
 
+    @model_validator(mode="after")
+    def disable_piecewise_for_non_piecewise_backend(self):
+        compile_model = self.transforms.get("compile_model")
+        if compile_model is not None and self.compile_backend not in _PIECEWISE_COMPILE_BACKENDS:
+            compile_model["piecewise_enabled"] = False
+        return self
+
     ### UTILITY METHODS ############################################################################
     @property
     def requires_uniform_kv_caches(self) -> bool:
@@ -433,7 +441,7 @@ class LlmArgs(DynamicYamlMixInForSettings, TorchLlmArgs, BaseSettings):
         return factory
 
     def is_cuda_graph_enabled(self) -> bool:
-        return self.compile_backend in ["torch-cudagraph", "torch-opt"]
+        return self.compile_backend in _PIECEWISE_COMPILE_BACKENDS
 
     def init_dist_config(self, rank: int, world_size: int) -> DistConfig:
         """Build DistConfig from YAML transform config and runtime MPI info.
