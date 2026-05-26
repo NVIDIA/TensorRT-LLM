@@ -29,6 +29,7 @@
 #include <cmath>
 #include <numeric>
 #include <set>
+#include <utility>
 
 namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
 {
@@ -109,10 +110,11 @@ std::vector<std::vector<int>> computeSlotToPageIndices(StorageConfig const& conf
 // ---------------------------------------------------------------------------
 
 StorageManager::StorageManager(LifeCycleRegistry const& lifeCycles, StorageConfig const& config, int tokensPerBlock,
-    bool enableSwaScratchReuse, std::optional<BatchDesc> const& typicalBatch, std::vector<BatchDesc> const& constraints)
+    std::optional<SwaScratchReuseConfig> swaScratchReuse, std::optional<BatchDesc> const& typicalBatch,
+    std::vector<BatchDesc> const& constraints)
     : mLifeCycles(lifeCycles)
     , mStorageConfig(config)
-    , mEnableSwaScratchReuse(enableSwaScratchReuse)
+    , mSwaScratchReuse(std::move(swaScratchReuse))
 {
     mLifeCycleGrouping = config.lifeCycleGrouping();
     mLayerToLifeCycleIds = config.layerToLifeCycleIds();
@@ -154,13 +156,13 @@ StorageManager::StorageManager(LifeCycleRegistry const& lifeCycles, StorageConfi
     int gpuGranularity = CacheLevelManager::cacheTierGranularity(CacheTier::GPU_MEM, gpuQuota);
 
     // Compute min_slots from constraints.
-    mMinSlots = computeMinSlotsFromConstraints(constraints, tokensPerBlock, enableSwaScratchReuse);
+    mMinSlots = computeMinSlotsFromConstraints(constraints, tokensPerBlock, mSwaScratchReuse);
 
     // Compute init_ratio from typical_batch, constraints, or fallback.
     std::vector<float> initRatio;
     if (typicalBatch.has_value())
     {
-        initRatio = ratioFromBatch(*typicalBatch, tokensPerBlock, enableSwaScratchReuse, gpuGranularity);
+        initRatio = ratioFromBatch(*typicalBatch, tokensPerBlock, mSwaScratchReuse, gpuGranularity);
     }
     else if (!constraints.empty())
     {
@@ -173,7 +175,7 @@ StorageManager::StorageManager(LifeCycleRegistry const& lifeCycles, StorageConfi
         // Fallback: average history length 2048.
         BatchDesc fallback;
         fallback.kvCaches.push_back(KVCacheDesc{2049, 2048});
-        initRatio = ratioFromBatch(fallback, tokensPerBlock, enableSwaScratchReuse, gpuGranularity);
+        initRatio = ratioFromBatch(fallback, tokensPerBlock, mSwaScratchReuse, gpuGranularity);
     }
 
     int numLevels = static_cast<int>(config.cacheTiers.size());
@@ -970,10 +972,10 @@ std::vector<float> StorageManager::ratioFromLength(int tokensPerBlock, int histo
 // ratioFromBatch
 // ---------------------------------------------------------------------------
 
-std::vector<float> StorageManager::ratioFromBatch(
-    BatchDesc const& batch, int tokensPerBlock, bool enableScratch, int granularity) const
+std::vector<float> StorageManager::ratioFromBatch(BatchDesc const& batch, int tokensPerBlock,
+    std::optional<SwaScratchReuseConfig> const& swaScratchReuse, int granularity) const
 {
-    auto numSlots = computeSlotsForBatch(batch, tokensPerBlock, enableScratch);
+    auto numSlots = computeSlotsForBatch(batch, tokensPerBlock, swaScratchReuse);
     auto numBytes = slotsToBytes(numSlots, granularity);
     return normalizeToRatio(numBytes);
 }
@@ -982,8 +984,8 @@ std::vector<float> StorageManager::ratioFromBatch(
 // computeMinSlotsFromConstraints
 // ---------------------------------------------------------------------------
 
-std::vector<int> StorageManager::computeMinSlotsFromConstraints(
-    std::vector<BatchDesc> const& constraints, int tokensPerBlock, bool enableScratch) const
+std::vector<int> StorageManager::computeMinSlotsFromConstraints(std::vector<BatchDesc> const& constraints,
+    int tokensPerBlock, std::optional<SwaScratchReuseConfig> const& swaScratchReuse) const
 {
     // Default floor: 1 slot per life cycle in each pool group.
     std::vector<int> maxSlots(static_cast<size_t>(numPoolGroups()), 0);
@@ -991,7 +993,7 @@ std::vector<int> StorageManager::computeMinSlotsFromConstraints(
         maxSlots[static_cast<size_t>(pgIdx)] += 1;
     for (auto const& batch : constraints)
     {
-        auto slots = computeSlotsForBatch(batch, tokensPerBlock, enableScratch);
+        auto slots = computeSlotsForBatch(batch, tokensPerBlock, swaScratchReuse);
         for (int pg = 0; pg < numPoolGroups(); ++pg)
             maxSlots[pg] = std::max(maxSlots[pg], slots[pg]);
     }
@@ -1003,7 +1005,7 @@ std::vector<int> StorageManager::computeMinSlotsFromConstraints(
 // ---------------------------------------------------------------------------
 
 std::vector<int> StorageManager::computeSlotsForBatch(
-    BatchDesc const& batch, int tokensPerBlock, bool enableScratch) const
+    BatchDesc const& batch, int tokensPerBlock, std::optional<SwaScratchReuseConfig> const& swaScratchReuse) const
 {
     std::vector<int> numSlots(static_cast<size_t>(numPoolGroups()), 0);
     auto ssmLcId = mLifeCycles.ssmLifeCycleId();
@@ -1036,9 +1038,10 @@ std::vector<int> StorageManager::computeSlotsForBatch(
             int nonStale = totalBlocks - stale.length();
             int nonStaleSys = sysBlocks - intersect(stale, sysRange).length();
             int uniqueNonStale = std::max(0, nonStale - nonStaleSys);
-            if (enableScratch)
+            if (swaScratchReuse.has_value())
             {
-                auto scratch = computeScratchRange(lc, kv.historyLength, kv.capacity, tokensPerBlock);
+                auto scratch = computeScratchRange(
+                    lc, kv.historyLength, kv.capacity, tokensPerBlock, swaScratchReuse->maxRewindLen);
                 int numScratch = scratch.length();
                 // Scratch blocks share coalesced slots: actual slots = ceil(numScratch * fracMax).
                 numSlots[static_cast<size_t>(pgIdx)]

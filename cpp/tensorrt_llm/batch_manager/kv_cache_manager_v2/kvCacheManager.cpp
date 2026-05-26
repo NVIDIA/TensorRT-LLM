@@ -114,7 +114,7 @@ KvCacheManager::KvCacheManager(KVCacheManagerConfig const& config)
 
     StorageConfig storageConfig = createStorageConfig(mConfig);
     mStorage = std::make_shared<StorageManager>(mLifeCycles, storageConfig, mConfig.tokensPerBlock,
-        mConfig.enableSwaScratchReuse, mConfig.typicalStep, mConfig.constraints);
+        mConfig.swaScratchReuse, mConfig.typicalStep, mConfig.constraints);
 
     mTargetRatioListGpu = _currentGpuRatio();
     mTargetRatioListOther = _currentOtherRatios();
@@ -158,6 +158,17 @@ std::shared_ptr<KvCache> KvCacheManager::createKvCache(ReuseScope reuseScope,
     return std::make_shared<KvCache>(*this, std::move(reuseScope), inputTokens, std::move(id), std::move(priorityCb));
 }
 
+BlockRadixTree::ReuseMatch KvCacheManager::matchReuse(
+    ReuseScope const& reuseScope, std::vector<TokenIdExt> const& inputTokens) const
+{
+    return mRadixTree->match(reuseScope, inputTokens, enablePartialMatch());
+}
+
+int KvCacheManager::probeReuse(ReuseScope reuseScope, std::vector<TokenIdExt> const& inputTokens) const
+{
+    return matchReuse(reuseScope, inputTokens).numTokens;
+}
+
 // ---- Memory pool queries --------------------------------------------------
 
 MemAddress KvCacheManager::getMemPoolBaseAddress(
@@ -167,7 +178,7 @@ MemAddress KvCacheManager::getMemPoolBaseAddress(
 
     if (!indexMode.has_value())
     {
-        if (mConfig.enableSwaScratchReuse)
+        if (mConfig.enableSwaScratchReuse())
         {
             throw std::invalid_argument("index_mode must be provided when SWA scratch reuse is enabled");
         }
@@ -225,7 +236,7 @@ std::optional<bool> KvCacheManager::supportsIndexMode(PageIndexMode mode) const
     switch (mode)
     {
     case PageIndexMode::PER_LAYER: return true;
-    case PageIndexMode::SHARED: return mConfig.enableSwaScratchReuse ? std::optional<bool>(std::nullopt) : true;
+    case PageIndexMode::SHARED: return mConfig.enableSwaScratchReuse() ? std::optional<bool>(std::nullopt) : true;
     }
     return std::nullopt;
 }

@@ -226,6 +226,22 @@ struct HelixConfig
 };
 
 // ---------------------------------------------------------------------------
+// SWA scratch reuse configuration.
+// ---------------------------------------------------------------------------
+struct SwaScratchReuseConfig
+{
+    int maxRewindLen = 0;
+
+    void validate() const
+    {
+        if (maxRewindLen < 0)
+        {
+            throw std::invalid_argument("SwaScratchReuseConfig: max_rewind_len must be non-negative");
+        }
+    }
+};
+
+// ---------------------------------------------------------------------------
 // Top-level KV cache manager configuration (mirrors _config.py::KVCacheManagerConfig).
 // ---------------------------------------------------------------------------
 
@@ -254,12 +270,16 @@ struct KVCacheManagerConfig
     // Must be a positive multiple of tokensPerBlock. Only takes effect when SSM layers are present.
     int ssmReuseInterval = 512;
 
-    // When true, SWA layers reuse physical pages for out-of-window blocks during prefill.
+    // When set, SWA layers reuse physical pages for out-of-window blocks during prefill.
     // Scratch blocks share coalesced slot sub-pages across blocks for the currently executing
     // layer, reducing peak memory. Trade-off: KV cache reuse is degraded because scratch blocks
     // have no preserved data after the step.
-    // Mirrors _config.py::KVCacheManagerConfig.enable_swa_scratch_reuse.
-    bool enableSwaScratchReuse = false;
+    std::optional<SwaScratchReuseConfig> swaScratchReuse;
+
+    bool enableSwaScratchReuse() const noexcept
+    {
+        return swaScratchReuse.has_value();
+    }
 
     std::optional<HelixConfig> helixConfig; // unsupported yet
 

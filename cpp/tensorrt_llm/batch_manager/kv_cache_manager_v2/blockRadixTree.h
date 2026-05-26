@@ -96,7 +96,7 @@ std::vector<BlockKey> sequenceToBlockchainKeys(
 
 // Generate multi-modal token IDs (mirrors gen_multi_modal_tokens in Python).
 std::vector<TokenIdExt> genMultiModalTokens(
-    int idOffset, std::vector<uint8_t> const& multiModalDataDigest, int numTokens);
+    int idOffset, std::vector<uint8_t> const& multiModalDataDigest, int numTokens, int tokenOffset = 0);
 
 // ---------------------------------------------------------------------------
 // NodeBase — common base for RootBlock and Block (nodes in the radix tree).
@@ -242,7 +242,13 @@ public:
         int numMatchedTokens;
     };
 
-    std::vector<MatchResult> match(
+    struct ReuseMatch
+    {
+        std::vector<Block*> blocks;
+        int numTokens = 0;
+    };
+
+    ReuseMatch match(
         ReuseScope const& reuseScope, std::vector<TokenIdExt> const& tokens, bool enablePartialMatch = false) const;
 
     // Clear all cached pages. ~Block() handles excludeFromEviction for DROPPABLE pages.
@@ -274,6 +280,10 @@ public:
     }
 
 private:
+    std::vector<MatchResult> matchTokenPath(
+        ReuseScope const& reuseScope, std::vector<TokenIdExt> const& tokens, bool enablePartialMatch) const;
+    ReuseMatch pruneMatch(std::vector<MatchResult> matched) const;
+
     // Erase any pending empty root blocks from mRoots.
     // Const-qualified: deferred cleanup is not a logical mutation.
     void drainPendingRootErases() const;

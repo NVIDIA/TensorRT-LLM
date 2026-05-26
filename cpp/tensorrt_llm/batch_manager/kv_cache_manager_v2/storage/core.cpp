@@ -721,7 +721,33 @@ std::pair<int, int64_t> CacheLevelStorage::grainsToSlots(
     }
     assert(remainingPgGrains == 0);
     assert(numSlots > 0);
-    return {numSlots, grainsForSlots(numSlots, slotSizeList, granularity)};
+
+    auto slotsToGrains = [&](int slots) { return grainsForSlots(slots, slotSizeList, granularity); };
+    int lo = numSlots;
+    int step = 1;
+    int hi = lo + step;
+    while (slotsToGrains(hi) <= pgGrains)
+    {
+        lo = hi;
+        step *= 2;
+        hi = lo + step;
+    }
+    while (lo + 1 < hi)
+    {
+        int const mid = (lo + hi) / 2;
+        if (slotsToGrains(mid) <= pgGrains)
+        {
+            lo = mid;
+        }
+        else
+        {
+            hi = mid;
+        }
+    }
+    int64_t const used = slotsToGrains(lo);
+    assert(used <= pgGrains);
+    assert(slotsToGrains(lo + 1) > pgGrains);
+    return {lo, used};
 }
 
 // ---------------------------------------------------------------------------

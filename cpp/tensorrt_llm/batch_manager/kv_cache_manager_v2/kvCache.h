@@ -485,6 +485,7 @@ private:
 
     // Whether any lifecycle would require scratch blocks at the current state.
     bool _wouldUseSwaScratchBlocks() const;
+    int _swaScratchMaxRewindLen() const;
 
     // Page index table management.
     // _basePageIndices[beamIdx][lcId][blockOrdinal] = slotId or BAD

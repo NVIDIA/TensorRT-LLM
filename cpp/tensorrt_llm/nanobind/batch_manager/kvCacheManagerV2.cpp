@@ -426,14 +426,26 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         .def_rw("helix_shard_size", &kv::HelixConfig::helixShardSize)
         .def_rw("shared_comm_port", &kv::HelixConfig::sharedCommPort) DEF_COPY(kv::HelixConfig);
 
+    nb::class_<kv::SwaScratchReuseConfig>(m, "SwaScratchReuseConfig")
+        .def(
+            "__init__",
+            [](kv::SwaScratchReuseConfig* cfg, int maxRewindLen)
+            {
+                new (cfg) kv::SwaScratchReuseConfig();
+                cfg->maxRewindLen = maxRewindLen;
+                cfg->validate();
+            },
+            nb::arg("max_rewind_len") = 0)
+        .def_rw("max_rewind_len", &kv::SwaScratchReuseConfig::maxRewindLen) DEF_COPY(kv::SwaScratchReuseConfig);
+
     nb::class_<kv::KVCacheManagerConfig>(m, "KVCacheManagerConfig")
         .def(
             "__init__",
             [](kv::KVCacheManagerConfig* cfg, int tokensPerBlock, int vocabSize,
                 std::vector<kv::CacheTierConfig> cacheTiers, nb::list layers, float maxUtilForResume,
                 bool enablePartialReuse, std::optional<kv::BatchDesc> typicalStep,
-                std::vector<kv::BatchDesc> constraints, int ssmReuseInterval, bool enableSwaScratchReuse,
-                std::optional<kv::HelixConfig> helixConfig)
+                std::vector<kv::BatchDesc> constraints, int ssmReuseInterval,
+                std::optional<kv::SwaScratchReuseConfig> swaScratchReuse, std::optional<kv::HelixConfig> helixConfig)
             {
                 new (cfg) kv::KVCacheManagerConfig();
                 cfg->tokensPerBlock = tokensPerBlock;
@@ -452,13 +464,13 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
                 cfg->typicalStep = std::move(typicalStep);
                 cfg->constraints = std::move(constraints);
                 cfg->ssmReuseInterval = ssmReuseInterval;
-                cfg->enableSwaScratchReuse = enableSwaScratchReuse;
+                cfg->swaScratchReuse = std::move(swaScratchReuse);
                 cfg->helixConfig = std::move(helixConfig);
             },
             nb::arg("tokens_per_block"), nb::arg("vocab_size"), nb::arg("cache_tiers"), nb::arg("layers"),
             nb::arg("max_util_for_resume") = 0.97f, nb::arg("enable_partial_reuse") = true,
             nb::arg("typical_step") = std::nullopt, nb::arg("constraints") = std::vector<kv::BatchDesc>{},
-            nb::arg("ssm_reuse_interval") = 512, nb::arg("enable_swa_scratch_reuse") = false,
+            nb::arg("ssm_reuse_interval") = 512, nb::arg("swa_scratch_reuse").none() = std::nullopt,
             nb::arg("helix_config").none() = std::nullopt)
         .def_rw("tokens_per_block", &kv::KVCacheManagerConfig::tokensPerBlock)
         .def_rw("vocab_size", &kv::KVCacheManagerConfig::vocabSize)
@@ -469,7 +481,8 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         .def_rw("typical_step", &kv::KVCacheManagerConfig::typicalStep)
         .def_rw("constraints", &kv::KVCacheManagerConfig::constraints)
         .def_rw("ssm_reuse_interval", &kv::KVCacheManagerConfig::ssmReuseInterval)
-        .def_rw("enable_swa_scratch_reuse", &kv::KVCacheManagerConfig::enableSwaScratchReuse)
+        .def_rw("swa_scratch_reuse", &kv::KVCacheManagerConfig::swaScratchReuse)
+        .def_prop_ro("enable_swa_scratch_reuse", &kv::KVCacheManagerConfig::enableSwaScratchReuse)
         .def_prop_rw(
             "helix_config",
             [](kv::KVCacheManagerConfig const& self) -> nb::object
@@ -706,6 +719,20 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             },
             nb::arg("reuse_scope") = nb::none(), nb::arg("input_tokens") = nb::none(), nb::arg("id") = std::nullopt,
             nb::arg("custom_priority_callback") = nb::none())
+        .def(
+            "probe_reuse",
+            [](std::shared_ptr<kv::KvCacheManager> self, nb::object reuseScopeObj, nb::object inputTokens)
+            {
+                kv::ReuseScope reuseScope = castReuseScope(std::move(reuseScopeObj));
+                std::vector<kv::TokenIdExt> tokens;
+                if (!inputTokens.is_none())
+                {
+                    tokens = castTokenIterable(inputTokens);
+                }
+                nb::gil_scoped_release release;
+                return self->probeReuse(std::move(reuseScope), tokens);
+            },
+            nb::arg("reuse_scope") = nb::none(), nb::arg("input_tokens") = nb::none())
         .def("get_mem_pool_base_address", &kv::KvCacheManager::getMemPoolBaseAddress, nb::arg("layer_id"),
             nb::arg("data_role"), nb::arg("index_mode") = std::nullopt, nb::call_guard<nb::gil_scoped_release>())
         .def("get_page_stride", &kv::KvCacheManager::getPageStride, nb::arg("layer_id"), nb::arg("data_role"))

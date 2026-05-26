@@ -21,6 +21,7 @@
 #include "kv_cache_manager_v2/config.h"
 #include "kv_cache_manager_v2/utils/math.h"
 
+#include <algorithm>
 #include <map>
 #include <optional>
 #include <utility>
@@ -112,14 +113,16 @@ inline HalfOpenRange getStaleRange(LifeCycle const& lc, int historyLength, int t
 //   input_blocks: [divUp(historyLength, tpb), divUp(capacity, tpb)) — new blocks
 //     for the current chunk.
 // Mirrors _life_cycle_registry.py::compute_scratch_range().
-inline HalfOpenRange computeScratchRange(LifeCycle const& lc, int historyLength, int capacity, int tokensPerBlock)
+inline HalfOpenRange computeScratchRange(
+    LifeCycle const& lc, int historyLength, int capacity, int tokensPerBlock, int maxRewindLen)
 {
     auto const* attn = std::get_if<AttnLifeCycle>(&lc);
     if (!attn || !attn->windowSize.has_value())
     {
         return {0, 0};
     }
-    auto capStale = attn->getStaleRange(capacity, tokensPerBlock);
+    int const nonRewindableCapacity = std::max(0, capacity - maxRewindLen);
+    auto capStale = attn->getStaleRange(nonRewindableCapacity, tokensPerBlock);
     HalfOpenRange inputRange{divUp(historyLength, tokensPerBlock), divUp(capacity, tokensPerBlock)};
     return intersect(capStale, inputRange);
 }

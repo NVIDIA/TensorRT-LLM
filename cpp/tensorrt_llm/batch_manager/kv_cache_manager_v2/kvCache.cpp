@@ -584,9 +584,14 @@ bool KvCache::resize(std::optional<int> capacity, std::optional<int> historyLeng
 
     // Scratch reuse: enforce constraint.
     bool enableScratch = mEnableSwaScratchReuse;
-    if (enableScratch && newCap != mCapacity)
+    if (!gNdebug && enableScratch && newCap != mCapacity)
     {
-        assert(newHist == mCapacity && "SWA scratch requires history_length == old_capacity");
+        int const maxRewindLen = _swaScratchMaxRewindLen();
+        int const minHistoryLength = std::max(0, mCapacity - maxRewindLen);
+        bool const validSwaScratchHistory = minHistoryLength <= newHist && newHist <= mCapacity;
+        assert(validSwaScratchHistory
+            && "SWA scratch requires old_capacity - max_rewind_len <= history_length <= old_capacity");
+        (void) validSwaScratchHistory;
     }
 
     if (!enableScratch && _shortcutSetCapacity(newCap) && _shortcutSetHistoryLength(newHist))
@@ -1373,136 +1378,14 @@ void KvCache::_onStopCommitting()
 
 void KvCache::_setupForReuse(std::vector<TokenIdExt> const& inputTokens)
 {
-    auto matched = mManager->radixTree().match(mReuseScope, inputTokens, mManager->enablePartialMatch());
-    // Assert all non-last matched blocks are full (mirrors Python line ~1113).
-    if (!gNdebug && matched.size() > 1)
-    {
-        for (size_t i = 0; i + 1 < matched.size(); ++i)
-            assert(matched[i].numMatchedTokens == mTokensPerBlock);
-    }
+    auto match = mManager->radixTree().match(mReuseScope, inputTokens, mManager->enablePartialMatch());
+    auto const& matched = match.blocks;
+    int const numTokens = match.numTokens;
+
     auto& lifeCycles = mManager->lifeCycles();
     auto const& allLc = lifeCycles.getAll();
     int numLc = lifeCycles.size();
     auto ssmLcId = lifeCycles.ssmLifeCycleId();
-
-    // Helper: compute num matched tokens from current matched list.
-    auto getNumMatchedTokens = [&]() -> int
-    {
-        return matched.empty()
-            ? 0
-            : mTokensPerBlock * (static_cast<int>(matched.size()) - 1) + matched.back().numMatchedTokens;
-    };
-
-    auto hasPage = [](Block const& blk, LifeCycleId lcId) -> bool
-    { return blk.storage.at(static_cast<size_t>(lcId)) != nullptr; };
-
-    // Use attentionLifeCycles() for full-attention and SWA checks.
-    auto attnLcs = lifeCycles.attentionLifeCycles();
-
-    // --- Trim matched blocks based on page availability ---
-
-    // Check for full attention layers: trim if blocks lack pages.
-    {
-        std::vector<LifeCycleId> fullAttnLcList;
-        for (auto [lcId, attn] : attnLcs)
-        {
-            if (!attn->windowSize.has_value())
-                fullAttnLcList.push_back(lcId);
-        }
-        if (!fullAttnLcList.empty())
-        {
-            int n = findIndex(matched.begin(), matched.end(),
-                [&](auto const& m)
-                {
-                    for (auto lcId : fullAttnLcList)
-                    {
-                        if (!hasPage(*m.block, lcId))
-                            return true;
-                    }
-                    return false;
-                });
-            matched.resize(static_cast<size_t>(n));
-        }
-    }
-
-    // Collect SWA lifecycles.
-    std::vector<std::pair<LifeCycleId, AttnLifeCycle const*>> swaLcs;
-    for (auto [lcId, attn] : attnLcs)
-    {
-        if (attn->windowSize.has_value())
-            swaLcs.push_back({lcId, attn});
-    }
-
-    // Check for SWA sink blocks.
-    for (auto [lcId, attn] : swaLcs)
-    {
-        int sinkBlocks = attn->numSinkBlocks;
-        int limit = std::min(sinkBlocks, static_cast<int>(matched.size()));
-        int n = findIndex(
-            matched.begin(), matched.begin() + limit, [&](auto const& m) { return !hasPage(*m.block, lcId); });
-        if (n < sinkBlocks)
-            matched.resize(static_cast<size_t>(n));
-    }
-
-    // Check SWA window and SSM snapshot constraints together.
-    // SSM is checked first (intervals are large, so it prunes more).
-    while (!matched.empty())
-    {
-        // SSM truncation: truncate to the last block with an SSM snapshot.
-        if (ssmLcId.has_value())
-        {
-            int ssmTrunc = 0;
-            for (int i = static_cast<int>(matched.size()) - 1; i >= 0; --i)
-            {
-                if (hasPage(*matched[i].block, *ssmLcId))
-                {
-                    ssmTrunc = i + 1;
-                    break;
-                }
-            }
-            matched.resize(static_cast<size_t>(ssmTrunc));
-            if (matched.empty())
-                break;
-        }
-
-        // SWA window check.
-        int numTok = getNumMatchedTokens();
-        bool trimmed = false;
-        for (auto [lcId, attn] : swaLcs)
-        {
-            if (!attn->windowSize.has_value())
-                continue;
-
-            // Check tail: first block from end that HAS a page.
-            int n = findIndex(matched.rbegin(), matched.rend(), [&](auto const& m) { return hasPage(*m.block, lcId); });
-            if (n != 0)
-            {
-                matched.resize(matched.size() - static_cast<size_t>(n));
-                trimmed = true;
-                break;
-            }
-
-            // Check stale region: blocks after staleEnd should have pages.
-            auto staleRange = attn->getStaleRange(numTok, mTokensPerBlock);
-            auto staleEnd = staleRange.end;
-            if (staleEnd < static_cast<int>(matched.size()))
-            {
-                auto tailBegin = matched.begin() + staleEnd;
-                int nMissing = findIndex(std::make_reverse_iterator(matched.end()),
-                    std::make_reverse_iterator(tailBegin), [&](auto const& m) { return !hasPage(*m.block, lcId); });
-                if (static_cast<int>(matched.size()) - nMissing > staleEnd)
-                {
-                    matched.resize(matched.size() - static_cast<size_t>(nMissing));
-                    trimmed = true;
-                    break;
-                }
-            }
-        }
-        if (!trimmed)
-            break;
-    }
-
-    int numTokens = getNumMatchedTokens();
 
     // --- Build blocks with stale range handling ---
 
@@ -1511,7 +1394,7 @@ void KvCache::_setupForReuse(std::vector<TokenIdExt> const& inputTokens)
     for (size_t i = 0; i < matched.size(); ++i)
     {
         SeqBlock sb;
-        sb.treeBlock = matched[i].block->shared_from_this();
+        sb.treeBlock = matched[i]->shared_from_this();
         sb.pages.resize(1);
         sb.pages[0].resize(static_cast<size_t>(numLc));
         mBlocks.push_back(std::move(sb));
@@ -1533,7 +1416,7 @@ void KvCache::_setupForReuse(std::vector<TokenIdExt> const& inputTokens)
         // For partial blocks (last block, not full), defer the copy to first resume().
         auto processOrdinal = [&](int ordinal)
         {
-            auto& blk = *matched[ordinal].block;
+            auto& blk = *matched[ordinal];
             auto* page = blk.storage.at(static_cast<size_t>(lcId));
             assert(page && "Expected page in non-stale block");
             auto& bpSlot = mBlocks[ordinal].pages[beamIdx][lcId];
@@ -1549,7 +1432,7 @@ void KvCache::_setupForReuse(std::vector<TokenIdExt> const& inputTokens)
     // SSM reuse: hold the snapshot from the last matched block. Copy is deferred to first resume().
     if (ssmLcId.has_value() && !matched.empty())
     {
-        auto& snapshotBlock = *matched.back().block;
+        auto& snapshotBlock = *matched.back();
         auto* snapshotPage = snapshotBlock.storage[static_cast<size_t>(*ssmLcId)];
         assert(snapshotPage && "Last matched block must have SSM snapshot after truncation");
         mSsmBlocks[0][static_cast<size_t>(*ssmLcId)] = snapshotPage->hold();
@@ -1914,17 +1797,25 @@ HalfOpenRange KvCache::_getScratchRange(
         return {0, 0};
     int hist = hlOverride.value_or(mHistoryLength);
     int cap = capOverride.value_or(mCapacity);
-    return computeScratchRange(lc, hist, cap, mTokensPerBlock);
+    return computeScratchRange(lc, hist, cap, mTokensPerBlock, _swaScratchMaxRewindLen());
 }
 
 bool KvCache::_wouldUseSwaScratchBlocks() const
 {
+    int const maxRewindLen = _swaScratchMaxRewindLen();
     for (auto const& [lcId, lc] : mManager->lifeCycles())
     {
-        if (computeScratchRange(lc, mHistoryLength, mCapacity, mTokensPerBlock))
+        if (computeScratchRange(lc, mHistoryLength, mCapacity, mTokensPerBlock, maxRewindLen))
             return true;
     }
     return false;
+}
+
+int KvCache::_swaScratchMaxRewindLen() const
+{
+    auto const& cfg = mManager->config().swaScratchReuse;
+    assert(cfg.has_value());
+    return cfg->maxRewindLen;
 }
 
 std::optional<ScratchDesc> KvCache::getScratchDesc(LayerGroupId lgId) const

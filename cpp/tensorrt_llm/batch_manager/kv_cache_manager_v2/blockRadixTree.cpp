@@ -19,6 +19,7 @@
 #include "kv_cache_manager_v2/common.h"
 #include "kv_cache_manager_v2/page.h"
 #include "kv_cache_manager_v2/storageManager.h"
+#include "kv_cache_manager_v2/utils/math.h"
 
 #include "blake3.h"
 
@@ -147,22 +148,25 @@ BlockKey Hasher::digest() const
 // ---------------------------------------------------------------------------
 
 std::vector<TokenIdExt> genMultiModalTokens(
-    int idOffset, std::vector<uint8_t> const& multiModalDataDigest, int numTokens)
+    int idOffset, std::vector<uint8_t> const& multiModalDataDigest, int numTokens, int tokenOffset)
 {
     assert(numTokens > 0);
+    assert(tokenOffset >= 0);
     assert(multiModalDataDigest.size() == kDIGEST_LEN);
     std::vector<TokenIdExt> result;
     result.reserve(static_cast<size_t>(numTokens));
     for (int i = 0; i < numTokens; ++i)
     {
-        if (i == 0)
+        if (tokenOffset + i == 0)
         {
             Digest d;
             std::memcpy(d.data(), multiModalDataDigest.data(), kDIGEST_LEN);
             result.emplace_back(DigestToken(d));
         }
         else
-            result.emplace_back(TokenId(idOffset + i));
+        {
+            result.emplace_back(TokenId(idOffset + tokenOffset + i));
+        }
     }
     return result;
 }
@@ -607,7 +611,26 @@ std::pair<Block*, int> findBestPartialMatchInNextNodes(
     return {best, bestMatch};
 }
 
-std::vector<BlockRadixTree::MatchResult> BlockRadixTree::match(
+namespace
+{
+
+int numMatchedTokens(std::vector<BlockRadixTree::MatchResult> const& matched, int tokensPerBlock)
+{
+    if (matched.empty())
+    {
+        return 0;
+    }
+    return tokensPerBlock * (static_cast<int>(matched.size()) - 1) + matched.back().numMatchedTokens;
+}
+
+bool hasPage(Block const& block, LifeCycleId lcId)
+{
+    return block.storage.at(static_cast<size_t>(lcId)) != nullptr;
+}
+
+} // anonymous namespace
+
+std::vector<BlockRadixTree::MatchResult> BlockRadixTree::matchTokenPath(
     ReuseScope const& reuseScope, std::vector<TokenIdExt> const& tokens, bool enablePartialMatch) const
 {
     drainPendingRootErases();
@@ -658,6 +681,132 @@ std::vector<BlockRadixTree::MatchResult> BlockRadixTree::match(
     }
 
     return results;
+}
+
+BlockRadixTree::ReuseMatch BlockRadixTree::pruneMatch(std::vector<MatchResult> matched) const
+{
+    if (!gNdebug && matched.size() > 1)
+    {
+        for (size_t i = 0; i + 1 < matched.size(); ++i)
+        {
+            assert(matched[i].numMatchedTokens == mTokensPerBlock);
+        }
+    }
+
+    auto attnLcs = mLifeCycles.attentionLifeCycles();
+
+    // Full-attention layers require pages on every matched block.
+    std::vector<LifeCycleId> fullAttnLcList;
+    for (auto [lcId, attn] : attnLcs)
+    {
+        if (!attn->windowSize.has_value())
+        {
+            fullAttnLcList.push_back(lcId);
+        }
+    }
+    if (!fullAttnLcList.empty())
+    {
+        int n = findIndex(matched.begin(), matched.end(),
+            [&](auto const& match)
+            {
+                return std::any_of(fullAttnLcList.begin(), fullAttnLcList.end(),
+                    [&](LifeCycleId lcId) { return !hasPage(*match.block, lcId); });
+            });
+        matched.resize(static_cast<size_t>(n));
+    }
+
+    std::vector<std::pair<LifeCycleId, AttnLifeCycle const*>> swaLcs;
+    for (auto [lcId, attn] : attnLcs)
+    {
+        if (attn->windowSize.has_value())
+        {
+            swaLcs.push_back({lcId, attn});
+        }
+    }
+
+    // SWA sink blocks must all be available.
+    for (auto [lcId, attn] : swaLcs)
+    {
+        int sinkBlocks = attn->numSinkBlocks;
+        int limit = std::min(sinkBlocks, static_cast<int>(matched.size()));
+        int n = findIndex(
+            matched.begin(), matched.begin() + limit, [&](auto const& match) { return !hasPage(*match.block, lcId); });
+        if (n < sinkBlocks)
+        {
+            matched.resize(static_cast<size_t>(n));
+        }
+    }
+
+    auto ssmLcId = mLifeCycles.ssmLifeCycleId();
+    while (!matched.empty())
+    {
+        if (ssmLcId.has_value())
+        {
+            int ssmTrunc = 0;
+            for (int i = static_cast<int>(matched.size()) - 1; i >= 0; --i)
+            {
+                if (hasPage(*matched[static_cast<size_t>(i)].block, *ssmLcId))
+                {
+                    assert(gNdebug || matched[static_cast<size_t>(i)].numMatchedTokens == mTokensPerBlock);
+                    ssmTrunc = i + 1;
+                    break;
+                }
+            }
+            matched.resize(static_cast<size_t>(ssmTrunc));
+            if (matched.empty())
+            {
+                break;
+            }
+        }
+
+        int const numTok = numMatchedTokens(matched, mTokensPerBlock);
+        bool trimmed = false;
+        for (auto [lcId, attn] : swaLcs)
+        {
+            int n = findIndex(
+                matched.rbegin(), matched.rend(), [&](auto const& match) { return hasPage(*match.block, lcId); });
+            if (n != 0)
+            {
+                matched.resize(matched.size() - static_cast<size_t>(n));
+                trimmed = true;
+                break;
+            }
+
+            auto staleRange = attn->getStaleRange(numTok, mTokensPerBlock);
+            int const staleEnd = staleRange.end;
+            if (staleEnd < static_cast<int>(matched.size()))
+            {
+                auto tailBegin = matched.begin() + staleEnd;
+                int nMissing = findIndex(matched.rbegin(), std::make_reverse_iterator(tailBegin),
+                    [&](auto const& match) { return !hasPage(*match.block, lcId); });
+                if (static_cast<int>(matched.size()) - nMissing > staleEnd)
+                {
+                    matched.resize(matched.size() - static_cast<size_t>(nMissing) - 1);
+                    trimmed = true;
+                    break;
+                }
+            }
+        }
+        if (!trimmed)
+        {
+            break;
+        }
+    }
+
+    ReuseMatch result;
+    result.numTokens = numMatchedTokens(matched, mTokensPerBlock);
+    result.blocks.reserve(matched.size());
+    for (auto const& match : matched)
+    {
+        result.blocks.push_back(match.block);
+    }
+    return result;
+}
+
+BlockRadixTree::ReuseMatch BlockRadixTree::match(
+    ReuseScope const& reuseScope, std::vector<TokenIdExt> const& tokens, bool enablePartialMatch) const
+{
+    return pruneMatch(matchTokenPath(reuseScope, tokens, enablePartialMatch));
 }
 
 void BlockRadixTree::clear()

@@ -132,6 +132,10 @@ public:
     std::shared_ptr<KvCache> createKvCache(ReuseScope reuseScope = {}, std::vector<TokenIdExt> const& inputTokens = {},
         std::optional<int64_t> id = std::nullopt, KvCache::PriorityCb priorityCb = {});
 
+    BlockRadixTree::ReuseMatch matchReuse(
+        ReuseScope const& reuseScope, std::vector<TokenIdExt> const& inputTokens) const;
+    int probeReuse(ReuseScope reuseScope = {}, std::vector<TokenIdExt> const& inputTokens = {}) const;
+
     // ---- Memory pool queries -----------------------------------------------
 
     // Base address of the memory pool. When indexMode is PER_LAYER, returns pool group base
@@ -164,7 +168,7 @@ public:
 
     bool isSwaScratchReuseEnabled() const noexcept
     {
-        return mConfig.enableSwaScratchReuse;
+        return mConfig.enableSwaScratchReuse();
     }
 
     // Whether managed KV caches support the given page index mode.

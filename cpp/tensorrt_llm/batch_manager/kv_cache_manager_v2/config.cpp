@@ -38,6 +38,11 @@ void DiskCacheTierConfig::assertValid() const
 
 void KVCacheManagerConfig::validate() const
 {
+    if (swaScratchReuse.has_value())
+    {
+        swaScratchReuse->validate();
+    }
+
     if (cacheTiers.empty() || cacheTierOf(cacheTiers[0]) != CacheTier::GPU_MEM)
     {
         throw std::invalid_argument("KVCacheManagerConfig: first cache tier must be GPU memory");

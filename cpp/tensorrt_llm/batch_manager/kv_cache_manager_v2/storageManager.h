@@ -91,8 +91,8 @@ class StorageManager : public std::enable_shared_from_this<StorageManager>
 {
 public:
     StorageManager(LifeCycleRegistry const& lifeCycles, StorageConfig const& config, int tokensPerBlock,
-        bool enableSwaScratchReuse = false, std::optional<BatchDesc> const& typicalBatch = std::nullopt,
-        std::vector<BatchDesc> const& constraints = {});
+        std::optional<SwaScratchReuseConfig> swaScratchReuse = std::nullopt,
+        std::optional<BatchDesc> const& typicalBatch = std::nullopt, std::vector<BatchDesc> const& constraints = {});
     ~StorageManager();
 
     StorageManager(StorageManager const&) = delete;
@@ -187,8 +187,8 @@ public:
     std::vector<float> ratioFromLength(int tokensPerBlock, int historyLength, int capacity) const;
 
     // Compute ratio from a BatchDesc.
-    std::vector<float> ratioFromBatch(
-        BatchDesc const& batch, int tokensPerBlock, bool enableScratch, int granularity) const;
+    std::vector<float> ratioFromBatch(BatchDesc const& batch, int tokensPerBlock,
+        std::optional<SwaScratchReuseConfig> const& swaScratchReuse, int granularity) const;
 
     // Apply stored min_slots constraint to a ratio list for GPU level.
     std::vector<float> constrainRatio(std::vector<float> const& ratio) const;
@@ -234,9 +234,10 @@ public:
 
 private:
     // Constraint-based partitioning helpers.
-    std::vector<int> computeMinSlotsFromConstraints(
-        std::vector<BatchDesc> const& constraints, int tokensPerBlock, bool enableScratch) const;
-    std::vector<int> computeSlotsForBatch(BatchDesc const& batch, int tokensPerBlock, bool enableScratch) const;
+    std::vector<int> computeMinSlotsFromConstraints(std::vector<BatchDesc> const& constraints, int tokensPerBlock,
+        std::optional<SwaScratchReuseConfig> const& swaScratchReuse) const;
+    std::vector<int> computeSlotsForBatch(
+        BatchDesc const& batch, int tokensPerBlock, std::optional<SwaScratchReuseConfig> const& swaScratchReuse) const;
     std::vector<size_t> slotsToBytes(std::vector<int> const& numSlots, int granularity) const;
     std::vector<int> computeSlotCountForLevel(CacheTierConfig const& tierConfig,
         std::vector<std::vector<int>> const& slotSizeLists, std::vector<float> const& ratio) const;
@@ -269,7 +270,7 @@ private:
     std::vector<Rational> mSlotUtilFracMax;
 
     // Whether SWA scratch reuse is enabled.
-    bool mEnableSwaScratchReuse = false;
+    std::optional<SwaScratchReuseConfig> mSwaScratchReuse;
 
     // Get buffer attributes for a (LayerId, DataRole) pair. Throws std::out_of_range if not found.
     // Mirrors Python's get_buffer_attr().
