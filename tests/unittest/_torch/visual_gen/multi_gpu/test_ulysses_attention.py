@@ -310,6 +310,67 @@ def _logic_ulysses_vs_standard_multi_gpu(rank, world_size):
     )
 
 
+def _logic_ulysses_with_key_padding_mask_parity(rank, world_size):
+    """UlyssesAttention forwards ``key_padding_mask`` through a2a + sharded SDPA;
+    valid Q rows match plain SDPA on the unpadded prefix.
+
+    Mirrors LTX-2 audio_attn1 under ``audio_pad_for_ulysses=True``: audio is
+    padded so the seq dim divides ulysses_size, each rank holds
+    ``[B, S_padded/U, H, D]``, and ``key_padding_mask=[B, S_padded]`` zeroes
+    the padded K/V columns inside the wrapped backend. Catches regressions
+    where the wrapper would consume / shadow / misalign the mask across the
+    a2a + reverse-a2a pipeline.
+    """
+    batch = 2
+    s_real = 30  # deliberately not divisible by world_size
+    pad = (world_size - s_real % world_size) % world_size
+    s_padded = s_real + pad
+    seq_per_rank = s_padded // world_size
+    num_heads = world_size * 4
+    head_dim = 64
+    # CPU + gloo (use_cuda=False): the test validates wrapper math, not
+    # kernel perf. Forcing CPU avoids ``cuda:rank`` ordinal errors when fewer
+    # GPUs are visible than spawned ranks.
+    device = torch.device("cpu")
+
+    # Identical full tensors on every rank (same seed); the [s_real, s_padded)
+    # tail is junk but mask must zero its contribution.
+    torch.manual_seed(42)
+    x_full = torch.randn(batch, s_padded, num_heads, head_dim, device=device)
+    mask = torch.zeros(batch, s_padded, dtype=torch.bool, device=device)
+    mask[:, :s_real] = True
+
+    # Reference: plain SDPA on the unpadded prefix.
+    ref = F.scaled_dot_product_attention(
+        x_full[:, :s_real].transpose(1, 2),
+        x_full[:, :s_real].transpose(1, 2),
+        x_full[:, :s_real].transpose(1, 2),
+        scale=1.0 / math.sqrt(head_dim),
+        dropout_p=0.0,
+    ).transpose(1, 2)  # [B, s_real, H, D]
+
+    # Wrapped path: this rank holds the [rank*seq_per_rank, (rank+1)*seq_per_rank) shard.
+    inner = VanillaAttention(num_heads=num_heads // world_size, head_dim=head_dim)
+    attention = UlyssesAttention(inner_backend=inner, process_group=None)
+    x_shard = x_full[:, rank * seq_per_rank : (rank + 1) * seq_per_rank].contiguous()
+    out_shard = attention.forward(q=x_shard, k=x_shard, v=x_shard, key_padding_mask=mask)
+
+    # Compare this rank's valid Q rows (those that fall within s_real) to ref.
+    start, end = rank * seq_per_rank, (rank + 1) * seq_per_rank
+    valid_in_shard = max(0, min(end, s_real) - start)
+    if valid_in_shard > 0:
+        torch.testing.assert_close(
+            out_shard[:, :valid_in_shard],
+            ref[:, start : start + valid_in_shard],
+            rtol=1e-4,
+            atol=1e-4,
+            msg=(
+                f"Rank {rank}: UlyssesAttention with key_padding_mask diverges "
+                f"from unpadded SDPA on valid Q rows"
+            ),
+        )
+
+
 def _logic_ulysses_invalid_heads(rank, world_size):
     """Invalid head count (not divisible by world_size) cannot be sharded."""
     assert rank >= 0 and rank < world_size
@@ -624,6 +685,21 @@ class TestUlyssesAttention:
         """Compare UlyssesAttention across GPUs with standard attention on full sequence."""
         run_test_in_distributed(
             world_size=2, test_fn=_logic_ulysses_vs_standard_multi_gpu, use_cuda=True
+        )
+
+    def test_ulysses_with_key_padding_mask_parity(self):
+        """Padded Q=K=V + key_padding_mask: valid Q rows match unpadded SDPA.
+
+        Verifies that ``UlyssesAttention`` correctly forwards
+        ``key_padding_mask`` through its a2a + sharded SDPA + reverse-a2a
+        pipeline (the audio_attn1 path under ``audio_pad_for_ulysses=True``).
+        ws=2 exercises a single sharding boundary; CPU + gloo so the test
+        runs without GPUs.
+        """
+        run_test_in_distributed(
+            world_size=2,
+            test_fn=_logic_ulysses_with_key_padding_mask_parity,
+            use_cuda=False,
         )
 
     def test_ulysses_attention_invalid_heads(self):
