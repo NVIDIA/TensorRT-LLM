@@ -12,12 +12,16 @@ from typing import Optional, Tuple, Union
 
 import torch
 import torch.nn.functional as F
-
-from tensorrt_llm._torch.modules.linear import Linear, WeightMode, WeightsLoadingConfig
-from tensorrt_llm._torch.modules.rms_norm import RMSNorm
+from tensorrt_llm._torch.modules.linear import (
+    Linear,
+    TensorParallelMode,
+    WeightMode,
+    WeightsLoadingConfig,
+)
 from tensorrt_llm._torch.modules.swiglu import swiglu
 from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
 from tensorrt_llm._torch.visual_gen.modules.attention import Attention, QKVMode, apply_rotary_emb
+from tensorrt_llm._torch.visual_gen.modules.rms_norm import RMSNorm
 
 # =============================================================================
 # Joint Attention (shared by FLUX.1 and FLUX.2 dual-stream blocks)
@@ -66,15 +70,19 @@ class FluxJointAttention(Attention):
         self.pre_only = pre_only
         self.added_kv_proj_dim = added_kv_proj_dim
 
-        # Delete output projection for single-stream blocks
+        self.tp_size = getattr(config.mapping, "tp_size", 1)
+
         if self.pre_only:
             del self.to_out
 
         # Text-stream projections for joint attention (dual-stream blocks only)
         if added_kv_proj_dim is not None:
+            # Use full (pre-TP) q_dim: after super().__init__(), self.q_dim is
+            # already divided by tp_size, but COLUMN mode will divide again.
+            full_q_dim = num_attention_heads * head_dim
             self.add_qkv_proj = Linear(
                 added_kv_proj_dim,
-                3 * self.q_dim,
+                3 * full_q_dim,
                 bias=self.bias,
                 dtype=self.dtype,
                 quant_config=self.quant_config,
@@ -84,27 +92,42 @@ class FluxJointAttention(Attention):
                     weight_mode=WeightMode.FUSED_QKV_LINEAR
                 ),
                 fused_weight_shard_indices_mapping={
-                    "q": (0, self.q_dim),
-                    "k": (self.q_dim, self.q_dim),
-                    "v": (2 * self.q_dim, self.q_dim),
+                    "q": (0, full_q_dim),
+                    "k": (full_q_dim, full_q_dim),
+                    "v": (2 * full_q_dim, full_q_dim),
                 },
+                mapping=config.mapping,
+                tensor_parallel_mode=TensorParallelMode.COLUMN,
+                reduce_output=False,
             )
 
+            # Need not pass any mapping info since this is intra-head normalization
+            # Hence it is unaffected by TP which only changes cross-head work
             self.norm_added_q = RMSNorm(
-                hidden_size=head_dim, eps=eps, dtype=self.dtype, has_weights=True
+                hidden_size=head_dim,
+                eps=eps,
+                dtype=self.dtype,
+                has_weights=True,
             )
             self.norm_added_k = RMSNorm(
-                hidden_size=head_dim, eps=eps, dtype=self.dtype, has_weights=True
+                hidden_size=head_dim,
+                eps=eps,
+                dtype=self.dtype,
+                has_weights=True,
             )
 
             self.to_add_out = Linear(
-                self.q_dim,
+                full_q_dim,
                 added_kv_proj_dim,
                 bias=self.bias,
                 dtype=self.dtype,
                 quant_config=self.quant_config,
                 skip_create_weights_in_init=self.skip_create_weights_in_init,
                 force_dynamic_quantization=self.force_dynamic_quantization,
+                mapping=config.mapping,
+                allreduce_strategy=config.allreduce_strategy,
+                tensor_parallel_mode=TensorParallelMode.ROW,
+                reduce_output=True,
             )
 
     def apply_qk_norm(self, q: torch.Tensor, k: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -251,12 +274,14 @@ class FluxJointAttention(Attention):
 
             if not self.pre_only:
                 hidden_states = self.to_out[0](hidden_states)
+
             encoder_hidden_states_out = self.to_add_out(encoder_hidden_states_out)
 
             return hidden_states, encoder_hidden_states_out
         else:
             if not self.pre_only:
                 hidden_states = self.to_out[0](hidden_states)
+
             return hidden_states
 
 

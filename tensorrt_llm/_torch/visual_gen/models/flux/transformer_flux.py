@@ -19,20 +19,22 @@ Forward Pass Flow:
 
 from typing import Any, Dict, Optional, Tuple, Union
 
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
 from diffusers.models.embeddings import PixArtAlphaTextProjection as TextProjection
 from diffusers.models.embeddings import TimestepEmbedding, Timesteps
 from tqdm import tqdm
 
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from tensorrt_llm._torch.distributed.ops import AllReduce
 from tensorrt_llm._torch.modules.layer_norm import LayerNorm
-from tensorrt_llm._torch.modules.linear import Linear
+from tensorrt_llm._torch.modules.linear import Linear, TensorParallelMode
 from tensorrt_llm._torch.modules.mlp import MLP
 from tensorrt_llm._torch.utils import maybe_compile
 from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
 from tensorrt_llm._torch.visual_gen.models.flux.attention import FluxJointAttention
 from tensorrt_llm._torch.visual_gen.models.flux.pos_embed_flux import FluxPosEmbed
+from tensorrt_llm._torch.visual_gen.modules.rms_norm import RMSNorm
 from tensorrt_llm._torch.visual_gen.quantization.loader import DynamicLinearWeightLoader
 from tensorrt_llm._torch.visual_gen.utils import SequenceSharder
 from tensorrt_llm.models.modeling_utils import QuantConfig
@@ -94,6 +96,7 @@ class _AdaLayerNormBase(nn.Module):
             quant_config=quant_config,
             skip_create_weights_in_init=skip_create_weights,
             force_dynamic_quantization=force_dynamic_quant,
+            reduce_output=False,
         )
         self.norm = LayerNorm(
             hidden_size=embedding_dim,
@@ -322,7 +325,7 @@ class FluxTransformerBlock(nn.Module):
             dtype=dtype,
             config=config,
             layer_idx=layer_idx,
-            reduce_output=False,
+            reduce_output=(self.config.mapping.tp_size != 1),
         )
         self.ff_context = MLP(
             hidden_size=dim,
@@ -332,7 +335,7 @@ class FluxTransformerBlock(nn.Module):
             dtype=dtype,
             config=config,
             layer_idx=layer_idx,
-            reduce_output=False,
+            reduce_output=(self.config.mapping.tp_size != 1),
         )
 
     def forward(
@@ -404,6 +407,108 @@ class FluxTransformerBlock(nn.Module):
         return encoder_hidden_states, hidden_states
 
 
+class FluxJointAttnMLPProj(nn.Module):
+    """Output projection that accepts split attn + mlp inputs.
+
+    At TP=1, equivalent to a single Linear over cat([attn, mlp]).
+    At TP>1, splits into two ROW-parallel Linears (one per input) so the
+    preceding attention and MLP branches can stay sharded — avoiding an
+    allgather before the projection.  Bias is added after the allreduce.
+
+    Named ``proj_out`` on the parent block so that ``filter_weights`` finds
+    the checkpoint keys ``proj_out.weight`` / ``proj_out.bias`` automatically.
+    """
+
+    def __init__(
+        self,
+        attn_dim: int,
+        mlp_dim: int,
+        out_dim: int,
+        bias: bool = True,
+        dtype: torch.dtype = None,
+        quant_config=None,
+        skip_create_weights_in_init: bool = False,
+        force_dynamic_quantization: bool = False,
+        config: Optional[DiffusionModelConfig] = None,
+    ):
+        super().__init__()
+        mapping = config.mapping
+        tp_size = mapping.tp_size
+        self.tp_size = tp_size
+        self.attn_dim = attn_dim
+        self.has_bias = bias
+
+        if tp_size <= 1:
+            self.proj = Linear(
+                attn_dim + mlp_dim,
+                out_dim,
+                bias=bias,
+                dtype=dtype,
+                quant_config=quant_config,
+                skip_create_weights_in_init=skip_create_weights_in_init,
+                force_dynamic_quantization=force_dynamic_quantization,
+                reduce_output=False,
+            )
+        else:
+            self.attn_proj = Linear(
+                attn_dim,
+                out_dim,
+                bias=False,
+                dtype=dtype,
+                quant_config=quant_config,
+                skip_create_weights_in_init=skip_create_weights_in_init,
+                force_dynamic_quantization=force_dynamic_quantization,
+                mapping=mapping,
+                tensor_parallel_mode=TensorParallelMode.ROW,
+                reduce_output=False,
+            )
+            self.mlp_proj = Linear(
+                mlp_dim,
+                out_dim,
+                bias=False,
+                dtype=dtype,
+                quant_config=quant_config,
+                skip_create_weights_in_init=skip_create_weights_in_init,
+                force_dynamic_quantization=force_dynamic_quantization,
+                mapping=mapping,
+                tensor_parallel_mode=TensorParallelMode.ROW,
+                reduce_output=False,
+            )
+            self.allreduce = AllReduce(mapping, strategy=config.allreduce_strategy)
+            if bias:
+                self.bias = nn.Parameter(torch.zeros(out_dim, dtype=dtype))
+
+    def forward(self, attn_out: torch.Tensor, mlp_out: torch.Tensor) -> torch.Tensor:
+        if self.tp_size <= 1:
+            return self.proj(torch.cat([attn_out, mlp_out], dim=-1))
+        out = self.allreduce(self.attn_proj(attn_out) + self.mlp_proj(mlp_out))
+        if self.has_bias:
+            out = out + self.bias
+        return out
+
+    def load_weights(self, weight_dict: Dict[str, torch.Tensor], loader: DynamicLinearWeightLoader):
+        """Load from checkpoint proj_out.weight / proj_out.bias.
+
+        At TP=1, passes through to the inner Linear.
+        At TP>1, splits the weight along the input dim (columns) into
+        attn and mlp portions, then loads each as a vanilla ROW Linear.
+        """
+        if self.tp_size <= 1:
+            loader.load_linear_weights(self.proj, "proj_out", [weight_dict])
+        else:
+            W = weight_dict["weight"]  # [out_dim, attn_dim + mlp_dim]
+            W_attn = W[:, : self.attn_dim]
+            W_mlp = W[:, self.attn_dim :]
+
+            for sub_module, sub_weight in [(self.attn_proj, W_attn), (self.mlp_proj, W_mlp)]:
+                if callable(getattr(sub_module, "create_weights", None)):
+                    sub_module.create_weights()
+                loader.load_linear_weights(sub_module, "proj_out", [{"weight": sub_weight}])
+
+            if self.has_bias and "bias" in weight_dict:
+                self.bias.data.copy_(weight_dict["bias"].to(self.bias.dtype))
+
+
 class FluxSingleTransformerBlock(nn.Module):
     """Single-stream transformer block for FLUX.
 
@@ -455,18 +560,25 @@ class FluxSingleTransformerBlock(nn.Module):
             quant_config=quant_config,
             skip_create_weights_in_init=skip_create_weights,
             force_dynamic_quantization=force_dynamic_quant,
+            mapping=config.mapping,
+            tensor_parallel_mode=TensorParallelMode.COLUMN if config.mapping.tp_size > 1 else None,
+            reduce_output=False,
         )
         self.act_mlp = _gelu_tanh_eager
 
-        # Output projection (concat of attn + mlp) - TRT-LLM Linear
-        self.proj_out = Linear(
-            dim + self.mlp_hidden_dim,
-            dim,
+        q_dim = num_attention_heads * attention_head_dim
+
+        # MLP + Attn Output projection, requires special handling for TP
+        self.proj_out = FluxJointAttnMLPProj(
+            attn_dim=q_dim,
+            mlp_dim=self.mlp_hidden_dim,
+            out_dim=dim,
             bias=True,
             dtype=dtype,
             quant_config=quant_config,
             skip_create_weights_in_init=skip_create_weights,
             force_dynamic_quantization=force_dynamic_quant,
+            config=config,
         )
 
         # Attention (no added_kv_proj_dim since tokens are already concatenated)
@@ -523,9 +635,9 @@ class FluxSingleTransformerBlock(nn.Module):
         )
 
         # Concat and project
-        hidden_states = torch.cat([attn_output, mlp_hidden_states], dim=2)
+        hidden_states = self.proj_out(attn_output, mlp_hidden_states)
         gate = gate.unsqueeze(1)
-        hidden_states = gate * self.proj_out(hidden_states)
+        hidden_states = gate * hidden_states
 
         # Residual
         hidden_states = residual + hidden_states
@@ -650,6 +762,7 @@ class FluxTransformer2DModel(nn.Module):
             quant_config=quant_config,
             skip_create_weights_in_init=skip_create_weights,
             force_dynamic_quantization=force_dynamic_quant,
+            reduce_output=False,
         )
         # NOTE: x_embedder quantization is excluded when in_channels < 128.
         # FLUX.1 has in_channels=64, which is below the 128-block size required by
@@ -668,6 +781,7 @@ class FluxTransformer2DModel(nn.Module):
             quant_config=quant_config,
             skip_create_weights_in_init=skip_create_weights,
             force_dynamic_quantization=force_dynamic_quant,
+            reduce_output=False,
         )
 
         # Dual-stream transformer blocks
@@ -726,6 +840,7 @@ class FluxTransformer2DModel(nn.Module):
             quant_config=quant_config,
             skip_create_weights_in_init=skip_create_weights,
             force_dynamic_quantization=force_dynamic_quant,
+            reduce_output=False,
         )
 
         self.__post_init__()
@@ -878,6 +993,12 @@ class FluxTransformer2DModel(nn.Module):
 
                 if weight_dicts:
                     loader.load_linear_weights(module, name, weight_dicts)
+            elif isinstance(module, FluxJointAttnMLPProj):
+                module_weights = loader.filter_weights(name, weights)
+                module.load_weights(module_weights, loader)
+            elif isinstance(module, RMSNorm):
+                module_weights = loader.filter_weights(name, weights)
+                module.load_weights(module_weights)
             else:
                 module_weights = loader.filter_weights(name, weights)
                 for param_name, param in module._parameters.items():
