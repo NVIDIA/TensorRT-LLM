@@ -2114,8 +2114,7 @@ class W4A8NVFP4FP8LinearMethod(LinearMethodBase):
         # Concat per-shard weight_scales in canonical order, then swizzle.
         weight_mode = module.weights_loading_config.weight_mode
         ordered_scales = [
-            module.tmp_w4a8_weight_scales[key]
-            for key in weight_mode.shard_keys
+            module.tmp_w4a8_weight_scales[key] for key in weight_mode.shard_keys
         ]
         weight_scale = torch.cat(ordered_scales, 0)
         weight_scale = fp4_utils.shuffle_matrix_sf_a(weight_scale,
@@ -2146,8 +2145,7 @@ class W4A8NVFP4FP8LinearMethod(LinearMethodBase):
         gate_weight, up_weight = load_weights_fused_gate_up_helper(
             module, weights, allow_partial_loading=allow_partial_loading)
 
-        for shard_key, weight in zip(('gate', 'up'),
-                                     (gate_weight, up_weight)):
+        for shard_key, weight in zip(('gate', 'up'), (gate_weight, up_weight)):
             if weight is not None:
                 shard_offset, shard_size = module.fused_weight_shard_indices_mapping[
                     shard_key]
@@ -2172,8 +2170,7 @@ class W4A8NVFP4FP8LinearMethod(LinearMethodBase):
         # Concat per-shard weight_scales in canonical order, then swizzle.
         weight_mode = module.weights_loading_config.weight_mode
         ordered_scales = [
-            module.tmp_w4a8_weight_scales[key]
-            for key in weight_mode.shard_keys
+            module.tmp_w4a8_weight_scales[key] for key in weight_mode.shard_keys
         ]
         weight_scale = torch.cat(ordered_scales, 0)
         weight_scale = fp4_utils.shuffle_matrix_sf_a(weight_scale,

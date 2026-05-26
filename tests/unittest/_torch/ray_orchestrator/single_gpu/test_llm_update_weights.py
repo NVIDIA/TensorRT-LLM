@@ -16,12 +16,9 @@ from tensorrt_llm import LLM
 from tensorrt_llm._torch.utils import get_device_uuid
 from tensorrt_llm.llmapi import KvCacheConfig, MoeConfig, SamplingParams
 
-
 # E2M1 boundary midpoints — round to nearest E2M1 magnitude:
 #   0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0  (ord 0..7)
-_E2M1_BOUNDS = torch.tensor(
-    [0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0], dtype=torch.float32
-)
+_E2M1_BOUNDS = torch.tensor([0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0], dtype=torch.float32)
 
 
 def _quantize_w4a8_canonical(
@@ -52,7 +49,7 @@ def _quantize_w4a8_canonical(
     # C++ uses ``scaleExp = floor(log2(amax)) - 2``; scale = 2^scaleExp ~= amax/4.
     scale_exp = (torch.floor(torch.log2(block_amax)).long() - 2).clamp(min=-6, max=7)
     # FP8 E4M3 byte: sign=0 (1 bit), exp (4 bits, bias 7), mantissa (3 bits)=0.
-    e4m3_byte = (((scale_exp + 7) & 0xFF).to(torch.uint8) << 3)  # [n, k/block]
+    e4m3_byte = ((scale_exp + 7) & 0xFF).to(torch.uint8) << 3  # [n, k/block]
     block_scale_fp8 = e4m3_byte.view(torch.float8_e4m3fn)
     # Recompute FP4 against the (mantissa-zero) power-of-2 scale.
     scale_float = torch.pow(2.0, scale_exp.float())
@@ -64,6 +61,7 @@ def _quantize_w4a8_canonical(
     fp4 = ((sign_bit << 3) | ord_val).flatten(start_dim=-2)  # [n, k] uint8
     fp4_packed = ((fp4[..., 1::2] & 0x0F) << 4) | (fp4[..., 0::2] & 0x0F)
     return fp4_packed.to(torch.uint8), block_scale_fp8, weight_scale_2
+
 
 # Ray-backed LLM teardown spawns the executor main-loop, GC and log/error
 # listener threads in ray-core. These are torn down only when ``ray.shutdown()``
@@ -368,8 +366,7 @@ def test_llm_update_weights_with_quant_config(model_dir, fp8_model_dir, kv_cache
 
 # E2M1 lookup table for the 16 FP4 values, used by the W4A8 reference dequantize.
 _E2M1_VALUES = torch.tensor(
-    [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
-     -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0],
+    [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0],
     dtype=torch.float32,
 )
 
@@ -401,9 +398,7 @@ def _dequantize_nvfp4_block32(
 
     vals = _E2M1_VALUES.to(device)[idx]  # [N, K], float32
 
-    scale_real = (s1.to(torch.float32) * scale_2.to(torch.float32)).view(
-        n, k // block_size, 1
-    )
+    scale_real = (s1.to(torch.float32) * scale_2.to(torch.float32)).view(n, k // block_size, 1)
     vals = vals.view(n, k // block_size, block_size) * scale_real
     return vals.view(n, k).to(orig_dtype)
 
@@ -467,9 +462,7 @@ class RefW4A8NVFP4FP8ModelWithIPCHandles(RefHFModel):
         "The future of AI is",
     ]
 
-    def __init__(
-        self, model_dir: str, device_id: int = 0, num_hidden_layers: Optional[int] = None
-    ):
+    def __init__(self, model_dir: str, device_id: int = 0, num_hidden_layers: Optional[int] = None):
         self.device_id = device_id
         self.model_dir = model_dir
         config = AutoConfig.from_pretrained(model_dir)
@@ -506,6 +499,7 @@ class RefW4A8NVFP4FP8ModelWithIPCHandles(RefHFModel):
                     return
                 cur = x.detach().float().abs().amax().item()
                 amax[linear_name] = max(amax.get(linear_name, 0.0), cur)
+
             return hook
 
         for name, mod in self.model.named_modules():
@@ -517,9 +511,7 @@ class RefW4A8NVFP4FP8ModelWithIPCHandles(RefHFModel):
         self.model.eval()
         with torch.no_grad():
             for prompt in self.CALIBRATION_PROMPTS:
-                ids = torch.tensor(
-                    [tokenizer.encode(prompt)], dtype=torch.long, device=device
-                )
+                ids = torch.tensor([tokenizer.encode(prompt)], dtype=torch.long, device=device)
                 self.model(ids)
         for h in hooks:
             h.remove()
@@ -686,8 +678,7 @@ class RefW4A8NVFP4FP8ModelWithIPCHandles(RefHFModel):
         # how modelopt-emitted checkpoints carry these per-Linear tensors.
         if name.endswith(".weight") and name in self.input_scales:
             entries.append(
-                (name.replace(".weight", ".input_scale"),
-                 self.input_scales[name].clone())
+                (name.replace(".weight", ".input_scale"), self.input_scales[name].clone())
             )
         return entries
 
@@ -723,9 +714,7 @@ class RefW4A8NVFP4FP8ModelWithIPCHandles(RefHFModel):
 def test_llm_update_weights_w4a8_nvfp4_fp8(model_dir):
     model_dir = str(llm_models_root() / model_dir)
     num_hidden_layers = 1
-    hf_model = RefW4A8NVFP4FP8ModelWithIPCHandles(
-        model_dir, num_hidden_layers=num_hidden_layers
-    )
+    hf_model = RefW4A8NVFP4FP8ModelWithIPCHandles(model_dir, num_hidden_layers=num_hidden_layers)
     tokenizer = AutoTokenizer.from_pretrained(model_dir)
     kv_cache_config = KvCacheConfig(enable_block_reuse=True, free_gpu_memory_fraction=0.1)
     # TRTLLM (trtllm_gen) is the only MoE backend with a W4A8_NVFP4_FP8 dispatch
@@ -783,9 +772,7 @@ def test_llm_update_weights_w4a8_nvfp4_fp8(model_dir):
 def test_llm_partial_update_weights_w4a8_nvfp4_fp8(model_dir):
     model_dir = str(llm_models_root() / model_dir)
     num_hidden_layers = 1
-    hf_model = RefW4A8NVFP4FP8ModelWithIPCHandles(
-        model_dir, num_hidden_layers=num_hidden_layers
-    )
+    hf_model = RefW4A8NVFP4FP8ModelWithIPCHandles(model_dir, num_hidden_layers=num_hidden_layers)
     tokenizer = AutoTokenizer.from_pretrained(model_dir)
     kv_cache_config = KvCacheConfig(enable_block_reuse=True, free_gpu_memory_fraction=0.1)
     # See note in test_llm_update_weights_w4a8_nvfp4_fp8: only TRTLLM (trtllm_gen)
