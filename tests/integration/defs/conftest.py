@@ -18,6 +18,11 @@ import datetime
 import gc
 import logging
 import os
+
+# CI images do not ship cosmos_guardrail. Set before tensorrt_llm import (visual_gen loads cosmos3 at import time).
+if "JENKINS_HOME" in os.environ:
+    os.environ.setdefault("TRTLLM_DISABLE_COSMOS3_GUARDRAILS", "1")
+
 import platform
 import re
 import shutil

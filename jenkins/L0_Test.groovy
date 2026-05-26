@@ -854,6 +854,8 @@ def getPytestBaseCommandLine(
     extraInternalEnv += " NCCL_DEBUG=INFO"
     // Pass stage name to perf sanity tests for OpenSearch tracking
     extraInternalEnv += " stageName=${stageName}"
+    // CI images do not ship cosmos_guardrail; must be set before conftest imports tensorrt_llm.
+    extraInternalEnv += " TRTLLM_DISABLE_COSMOS3_GUARDRAILS=1"
 
     // Container port allocation environment variables for avoiding port conflicts
     def portEnvVars = ""
