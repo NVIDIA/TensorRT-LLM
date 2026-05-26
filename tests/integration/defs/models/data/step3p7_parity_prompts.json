@@ -1,0 +1,14 @@
+{
+  "decoding": {
+    "temperature": 0.0,
+    "top_k": 1,
+    "no_sampling": true
+  },
+  "prompts": [
+    {"id": "parity_p0", "prompt": "The capital of France is"},
+    {"id": "parity_p1", "prompt": "Q: 2 + 3 = ? A:"},
+    {"id": "parity_p2", "prompt": "Q: 7 + 5 = ? A:"},
+    {"id": "parity_p3", "prompt": "Q: 10 - 6 = ? A:"},
+    {"id": "parity_p4", "prompt": "Q: 100 + 200 = ? A:"}
+  ]
+}

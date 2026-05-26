@@ -36,11 +36,11 @@ from tensorrt_llm.llmapi.llm_args import (BaseLlmArgs, CacheTransceiverConfig,
                                           ExtendedRuntimePerfKnobConfig,
                                           KvCacheConfig,
                                           LookaheadDecodingConfig, MoeConfig,
-                                          PeftCacheConfig, PybindMirror,
-                                          RayPlacementConfig, SleepConfig,
-                                          SpeculativeConfig, StrictBaseModel,
-                                          TorchCompileConfig, TorchLlmArgs,
-                                          TrtLlmArgs,
+                                          MTPDecodingConfig, PeftCacheConfig,
+                                          PybindMirror, RayPlacementConfig,
+                                          SleepConfig, SpeculativeConfig,
+                                          StrictBaseModel, TorchCompileConfig,
+                                          TorchLlmArgs, TrtLlmArgs,
                                           UserProvidedDecodingConfig,
                                           update_llm_args_with_extra_dict)
 # fmt: on
@@ -77,6 +77,21 @@ def test_LookaheadDecodingConfig():
     assert pybind_config.max_window_size == 4
     assert pybind_config.max_ngram_size == 3
     assert pybind_config.max_verification_set_size == 4
+
+
+def test_MTPDecodingConfig_default_draft_len_is_not_user_set():
+    config = MTPDecodingConfig()
+
+    assert config.max_draft_len == 1
+    assert config.max_total_draft_tokens == 1
+    assert "max_draft_len" not in config.model_fields_set
+    assert "max_total_draft_tokens" not in config.model_fields_set
+
+    explicit_config = MTPDecodingConfig(max_draft_len=1)
+    assert explicit_config.max_draft_len == 1
+    assert explicit_config.max_total_draft_tokens == 1
+    assert "max_draft_len" in explicit_config.model_fields_set
+    assert "max_total_draft_tokens" not in explicit_config.model_fields_set
 
 
 class TestYaml:
