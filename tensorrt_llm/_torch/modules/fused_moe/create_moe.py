@@ -12,6 +12,7 @@ from ...model_config import ModelConfig
 from ...utils import ActivationType, AuxStreamType
 from .configurable_moe import ConfigurableMoE
 from .fused_moe_cute_dsl import CuteDslFusedMoE
+from .fused_moe_cute_dsl_b12x import CuteDslB12xFusedMoE
 from .fused_moe_cutlass import CutlassFusedMoE
 from .fused_moe_deepgemm import DeepGemmFusedMoE
 from .fused_moe_densegemm import DenseGEMMFusedMoE
@@ -40,6 +41,29 @@ def get_moe_cls(
         if quant_config is not None and (
                 quant_config.quant_mode.has_fp8_block_scales()
                 or quant_config.quant_mode.has_nvfp4()):
+            # On SM120 / SM121 + NVFP4 the cuteDSL family member is the
+            # hybrid CUTLASS-prefill / FlashInfer NVFP4 MoE decode backend
+            # (CuteDslB12xFusedMoE). Prefer it when flashinfer is importable;
+            # otherwise fall through to CuteDslFusedMoE for SM100 / SM103.
+            if quant_config.quant_mode.has_nvfp4():
+                from tensorrt_llm._utils import get_sm_version
+                sm_version = get_sm_version()
+                if sm_version in CuteDslB12xFusedMoE._SUPPORTED_SM_VERSIONS:
+                    try:
+                        import flashinfer  # noqa: F401
+                        logger.info(
+                            "Selecting CuteDslB12xFusedMoE for hybrid "
+                            "CUTLASS-prefill / FlashInfer NVFP4 MoE decode "
+                            "(SM%d + NVFP4).",
+                            sm_version,
+                        )
+                        return CuteDslB12xFusedMoE
+                    except ImportError:
+                        logger.warning(
+                            "CuteDslB12xFusedMoE eligible (SM%d + NVFP4) "
+                            "but flashinfer is not importable; using CuteDslFusedMoE.",
+                            sm_version,
+                        )
             return CuteDslFusedMoE
         else:
             logger.warning(
@@ -280,7 +304,10 @@ def create_moe_backend(
             without_comm=without_comm,
             activation_type=activation_type,
         )
-    elif moe_cls == CutlassFusedMoE:
+    elif moe_cls is CutlassFusedMoE:
+        # CuteDslFusedMoE, DeepGemmFusedMoE, and CuteDslB12xFusedMoE
+        # also subclass CutlassFusedMoE but have narrower constructors, so
+        # they take their own branches below.
         return moe_cls(
             routing_method=routing_method,
             num_experts=num_experts,
@@ -331,7 +358,9 @@ def create_moe_backend(
             layer_idx=layer_idx,
             activation_type=activation_type,
         )
-    elif moe_cls == CuteDslFusedMoE:
+    elif moe_cls in (CuteDslFusedMoE, CuteDslB12xFusedMoE):
+        # CuteDslB12xFusedMoE subclasses CuteDslFusedMoE and shares
+        # its narrower constructor (no bias / swiglu_alpha-beta-limit args).
         return moe_cls(
             routing_method=routing_method,
             num_experts=num_experts,
@@ -492,9 +521,11 @@ def create_moe(
 
     enable_configurable_moe = os.environ.get("ENABLE_CONFIGURABLE_MOE",
                                              "1") == "1"
-    if enable_configurable_moe or moe_cls == CuteDslFusedMoE:
+    if enable_configurable_moe or moe_cls in (CuteDslFusedMoE,
+                                              CuteDslB12xFusedMoE):
         if moe_cls in (DeepGemmFusedMoE, TRTLLMGenFusedMoE, CuteDslFusedMoE,
-                       CutlassFusedMoE, DenseGEMMFusedMoE, MegaMoEDeepGemm):
+                       CuteDslB12xFusedMoE, CutlassFusedMoE, DenseGEMMFusedMoE,
+                       MegaMoEDeepGemm):
             return ConfigurableMoE(
                 routing_method=routing_method,
                 num_experts=num_experts,

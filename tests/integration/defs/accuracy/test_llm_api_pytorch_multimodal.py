@@ -524,9 +524,13 @@ class TestKimiK25(LlmapiAccuracyTestHarness):
     )
     def test_nvfp4(self, ep_size, attention_dp):
         """NVFP4 accuracy on MMMU benchmark (8x B200)."""
+        # Do not pass ``max_num_tokens`` here: keep it at the LLM default
+        # (8192) so the resolved ``moe_max_num_tokens`` stays at
+        # ``8192 * dp_size`` and the per-call fused_moe workspace fits
+        # within activation headroom. Raising it pushed the workspace
+        # past the fragmented allocator budget on dep8 (NVBug 6182617).
         with LLM(
             self.MODEL_PATH,
-            max_num_tokens=self.MAX_NUM_TOKENS,
             kv_cache_config=self.kv_cache_config,
             tensor_parallel_size=8,
             pipeline_parallel_size=1,
