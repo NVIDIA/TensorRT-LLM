@@ -360,10 +360,10 @@ class LTX2Attention(Attention):
         if self.to_gate_logits is not None:
             gate_logits = self.to_gate_logits(x)
             b, t, _ = out.shape
-            out = out.view(b, t, self.num_attention_heads, self.head_dim)
+            out = out.view(b, t, self.local_num_attention_heads, self.head_dim)
             gates = 2.0 * torch.sigmoid(gate_logits)
             out = out * gates.unsqueeze(-1)
-            out = out.view(b, t, self.num_attention_heads * self.head_dim)
+            out = out.view(b, t, self.local_num_attention_heads * self.head_dim)
 
         return self.to_out[0](out)
 
@@ -1160,7 +1160,7 @@ class LTXModel(nn.Module):
             )
         elif self.model_type.is_video_enabled():
             self.video_args_preprocessor = TransformerArgsPreprocessor(
-                config=self.model_config,
+                model_config=self.model_config,
                 patchify_proj=self.patchify_proj,
                 adaln=self.adaln_single,
                 caption_projection=self.caption_projection,
@@ -1175,7 +1175,7 @@ class LTXModel(nn.Module):
             )
         elif self.model_type.is_audio_enabled():
             self.audio_args_preprocessor = TransformerArgsPreprocessor(
-                config=self.model_config,
+                model_config=self.model_config,
                 patchify_proj=self.audio_patchify_proj,
                 adaln=self.audio_adaln_single,
                 caption_projection=self.audio_caption_projection,

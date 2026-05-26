@@ -61,14 +61,17 @@ class Attention(nn.Module):
         self.mapping = getattr(config, "mapping", None)
         self.allreduce_strategy = config.allreduce_strategy
 
-        tp_size = self.mapping.tp_size if self.mapping else 1
-
         self.hidden_size = hidden_size
         self.num_attention_heads = num_attention_heads
         self.num_key_value_heads = num_key_value_heads or num_attention_heads
         self.head_dim = head_dim or (hidden_size // num_attention_heads)
         self.qkv_mode = QKVMode(qkv_mode) if isinstance(qkv_mode, str) else qkv_mode
         self.bias = bias
+
+        tp_size = self.mapping.tp_size if self.mapping else 1
+        assert (
+            self.num_attention_heads % tp_size == 0 and self.num_key_value_heads % tp_size == 0
+        ), "TP size must divide the number of Query and KV Heads"
 
         # Fused QK Norm + RoPE: each model class opts in via fuse_qk_norm_rope.
         # Backed by torch.ops.trtllm.fused_dit_qk_norm_rope which auto-dispatches:
