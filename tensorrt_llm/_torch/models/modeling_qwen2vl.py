@@ -997,9 +997,14 @@ class Qwen2_5_VisionModel(torch.nn.Module):
 
         # Pos_ids -> device for the freq_table gather. rotary_cos_sin is
         # created on CUDA in RopeParams.create_rope_const_params; this is
-        # the one H->D copy per unique (t, h, w).
+        # the one H->D copy per unique (t, h, w). ``async_tensor_h2d`` is
+        # the project-wide helper that guarantees pinned-host + async DMA
+        # (a bare ``.to(..., non_blocking=True)`` on pageable memory
+        # silently degrades to a staging copy).
         device = self.rotary_pos_emb.rotary_cos_sin.device
-        pos_ids_dev = pos_ids.to(device, non_blocking=True)
+        pos_ids_dev = async_tensor_h2d(pos_ids,
+                                       dtype=pos_ids.dtype,
+                                       device=device)
         max_grid_size = max(h, w)
         cos_sin = self.rotary_pos_emb.rotary_cos_sin[:max_grid_size]
         cos, sin = cos_sin[:, 0, :], cos_sin[:, 1, :]
@@ -1018,8 +1023,11 @@ class Qwen2_5_VisionModel(torch.nn.Module):
         )
 
         window_index_thw, seq_lens_thw = self.get_window_index_by_thw(t, h, w)
-        # Device-side window reorder; cached cos/sin stay on device.
-        window_index_thw_dev = window_index_thw.to(device, non_blocking=True)
+        # Device-side window reorder; cached cos/sin stay on device. Same
+        # pinned-host + async DMA pattern as the pos_ids transfer above.
+        window_index_thw_dev = async_tensor_h2d(window_index_thw,
+                                                dtype=window_index_thw.dtype,
+                                                device=device)
         cos_thw = cos_thw[window_index_thw_dev, :, :].reshape(
             -1, cos_thw.shape[-1])
         sin_thw = sin_thw[window_index_thw_dev, :, :].reshape(

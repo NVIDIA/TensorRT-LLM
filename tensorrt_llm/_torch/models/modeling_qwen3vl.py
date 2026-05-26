@@ -19,7 +19,7 @@ from tensorrt_llm._torch.models.modeling_multimodal_utils import _is_mm_disagg
 from tensorrt_llm.functional import PositionEmbeddingType
 from tensorrt_llm.mapping import Mapping
 
-from ..._utils import nvtx_range, nvtx_range_debug, prefer_pinned
+from ..._utils import async_tensor_h2d, nvtx_range, nvtx_range_debug, prefer_pinned
 from ...inputs import (
     BaseMultimodalDummyInputsBuilder,
     BaseMultimodalInputProcessor,
@@ -922,7 +922,10 @@ class Qwen3VisionModel(torch.nn.Module):
         pos_ids = self.rot_pos_ids(h, w, self.spatial_merge_size)
         if t > 1:
             pos_ids = pos_ids.repeat(t, 1)
-        pos_ids = pos_ids.to(self.device, non_blocking=True)
+        # Pinned-host + async DMA via the project helper; a bare
+        # ``.to(..., non_blocking=True)`` on pageable memory silently
+        # degrades to a staging copy.
+        pos_ids = async_tensor_h2d(pos_ids, dtype=pos_ids.dtype, device=self.device)
         # Gather pre-computed cos/sin from the standard ``RotaryEmbedding``
         # buffer. ``rotary_cos_sin`` has shape (max_pos, 2, freq_dim);
         # index 0 holds cos, index 1 holds sin. pos_ids has shape
