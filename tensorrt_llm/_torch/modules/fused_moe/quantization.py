@@ -2707,12 +2707,12 @@ class NVFP4CutlassFusedMoEMethod(NVFP4FusedMoEMethod):
         # Store raw shards in tmp. Cat + pad + interleave always done in
         # process_weights_after_loading() because padding the whole buffer
         # differs from padding each half independently.
-        # Use (id(dst_base), expert_idx) as key to distinguish regular vs shared experts,
+        # Use (dst_base, expert_idx) as key to distinguish regular vs shared experts,
         # since both use local_slot_id starting from 0 but point to different dst buffers.
         if not hasattr(module, 'tmp_cutlass_w3_w1_weight_scales'):
             module.tmp_cutlass_w3_w1_weight_scales = {}
         assert expert_idx >= 0, "expert_idx must be provided for stable dict key"
-        dst_base = dst_w3_w1_weight_scale.storage().data_ptr()
+        dst_base = dst_w3_w1_weight_scale.data_ptr()
         dict_key = (dst_base, expert_idx)
         expert_entry = module.tmp_cutlass_w3_w1_weight_scales.setdefault(
             dict_key, {})
@@ -2798,12 +2798,12 @@ class NVFP4CutlassFusedMoEMethod(NVFP4FusedMoEMethod):
 
         # Store raw shards in tmp. Cat + pad always done in process_weights_after_loading()
         # because padding the whole buffer differs from padding each half independently.
-        # Use (id(dst_base), expert_idx) as key to distinguish regular vs shared experts,
+        # Use (dst_base, expert_idx) as key to distinguish regular vs shared experts,
         # since both use local_slot_id starting from 0 but point to different dst buffers.
         if not hasattr(module, 'tmp_cutlass_w3_w1_weights'):
             module.tmp_cutlass_w3_w1_weights = {}
         assert expert_idx >= 0, "expert_idx must be provided for stable dict key"
-        dst_base = dst_w3_w1_weight.storage().data_ptr()
+        dst_base = dst_w3_w1_weight.data_ptr()
         dict_key = (dst_base, expert_idx)
         expert_entry = module.tmp_cutlass_w3_w1_weights.setdefault(dict_key, {})
         expert_entry['dst'] = dst_w3_w1_weight
