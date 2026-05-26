@@ -1150,6 +1150,7 @@ class Qwen3VLModelBase(PreTrainedModel, MultimodalModelMixin):
             "Qwen3VLMoeForConditionalGeneration": "Qwen3MoeForCausalLM",
             "QwenImageBenchForConditionalGeneration": "Qwen3_5ForCausalLM",
             "Cosmos3ForConditionalGeneration": "Qwen3ForCausalLM",
+            "Qwen3_5MoeForConditionalGeneration": "Qwen3_5MoeForCausalLM",
         }
         llm_arch = vlm_to_llm_arch.get(self.original_arch)
         if llm_arch is None:
@@ -1238,9 +1239,12 @@ class Qwen3VLModelBase(PreTrainedModel, MultimodalModelMixin):
             mrope_section=config.rope_scaling.get("mrope_section", None),
             mrope_interleaved=config.rope_scaling.get("mrope_interleaved", False),
         )
+        head_dim = getattr(config, "head_dim", None)
+        if not isinstance(head_dim, int):
+            head_dim = config.hidden_size // config.num_attention_heads
         self.rotary_emb = MRotaryEmbedding(
             pos_embd_params.rope,
-            head_dim=config.hidden_size // config.num_attention_heads,
+            head_dim=head_dim,
             is_neox=pos_embd_params.is_neox,
             mrope_section=pos_embd_params.mrope_section,
             mrope_interleaved=pos_embd_params.mrope_interleaved,
