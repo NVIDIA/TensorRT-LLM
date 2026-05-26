@@ -167,8 +167,7 @@ using tensorrt_llm::common::launchWithPdlWhenEnabled;
     }                                                                                                                  \
     else                                                                                                               \
     {                                                                                                                  \
-        using POLICY = WarpPolicy;                                                                                     \
-        __VA_ARGS__                                                                                                    \
+        TLLM_CHECK_WITH_INFO(false, "WarpPolicy is no longer supported for moe A2A");                                  \
     }
 
 #if DISABLE_TIMEOUT
@@ -200,29 +199,6 @@ __device__ int compute_target_rank_id(int expert_id, int num_experts_per_rank)
 // ============================================================================
 // Helper Functions for Vectorized Memory Operations
 // ============================================================================
-
-struct WarpPolicy
-{
-    __device__ static int stride()
-    {
-        return warpSize;
-    }
-
-    __device__ static int offset()
-    {
-        return (threadIdx.x % warpSize);
-    }
-
-    __device__ static int token_idx()
-    {
-        return (blockIdx.x * blockDim.x + threadIdx.x) / warpSize;
-    }
-
-    __device__ static void sync()
-    {
-        __syncwarp();
-    }
-};
 
 struct BlockPolicy
 {
@@ -423,20 +399,8 @@ __global__ void moeA2ADispatchKernel(int32_t const* token_selected_experts, // [
 
         // Prepare per-policy shared-memory tiles for this token
         extern __shared__ int smem[];
-        int* smem_topk_target_ranks;
-        int* smem_topk_send_indices;
-        int warps_per_block = blockDim.x / warpSize;
-        if constexpr (std::is_same<ThreadingPolicy, WarpPolicy>::value)
-        {
-            int lane_id = threadIdx.x / warpSize;
-            smem_topk_target_ranks = smem + lane_id * TOP_K;
-            smem_topk_send_indices = smem + warps_per_block * TOP_K + lane_id * TOP_K;
-        }
-        else
-        {
-            smem_topk_target_ranks = smem;
-            smem_topk_send_indices = smem + TOP_K;
-        }
+        int* smem_topk_target_ranks = smem;
+        int* smem_topk_send_indices = smem + TOP_K;
 
         uint64_t already_copied = 0;
         int num_experts_per_rank = num_experts / ep_size;
@@ -660,8 +624,6 @@ void moe_a2a_dispatch_launch(MoeA2ADispatchParams const& params)
     kernel_ptrs.eplb_local_stats = params.eplb_local_stats;
 
     int const kBlockSize = tensorrt_llm::common::getEnvMoeA2ADispatchBlockSize();
-    constexpr int kWarpSize = 32;
-    int const kWarpsPerBlock = kBlockSize / kWarpSize;
 
     // Configure kernel launch
     if (params.one_block_per_token)
@@ -683,20 +645,7 @@ void moe_a2a_dispatch_launch(MoeA2ADispatchParams const& params)
     }
     else
     {
-        int grid_size = ceilDiv(params.local_num_tokens, kWarpsPerBlock);
-        // If local_num_tokens is 0, we still need to launch a minimal kernel to participate in the synchronization.
-        if (grid_size == 0)
-        {
-            grid_size = 1;
-        }
-        int shared_bytes = 2 * kWarpsPerBlock * params.top_k * (int) sizeof(int);
-        SWITCH_BOOL(params.enable_eplb, EPLB_STATS, SWITCH_TOP_K(params.top_k, TOP_K, {
-            auto kernel_fn = moeA2ADispatchKernel<WarpPolicy, TOP_K, EPLB_STATS>;
-            launchWithPdlWhenEnabled("moeA2ADispatchKernel", kernel_fn, grid_size, kBlockSize, shared_bytes,
-                params.stream, params.token_selected_experts, kernel_ptrs, params.num_payloads,
-                params.max_tokens_per_rank, params.local_num_tokens, params.ep_rank, params.ep_size, params.num_experts,
-                params.eplb_stats_num_experts);
-        }))
+        TLLM_THROW("WarpPolicy is no longer supported for moe A2A");
     }
 }
 
@@ -1297,8 +1246,11 @@ void moe_a2a_prepare_combine_launch(MoeA2ACombineParams const& params)
             int const stride_per_token = low_precision_staged
                 ? params.elements_per_token
                 : params.elements_per_token * static_cast<int>(sizeof(SrcT));
-            auto kernel_fn = params.one_block_per_token ? moeA2APrepareCombineKernel<BlockPolicy, LOW_PRECISION, SrcT>
-                                                        : moeA2APrepareCombineKernel<WarpPolicy, LOW_PRECISION, SrcT>;
+            if (!params.one_block_per_token)
+            {
+                TLLM_THROW("WarpPolicy is no longer supported for moe A2A");
+            }
+            auto kernel_fn = moeA2APrepareCombineKernel<BlockPolicy, LOW_PRECISION, SrcT>;
             launchWithPdlWhenEnabled("moeA2APrepareCombineKernel", kernel_fn, grid, kBlockSize, 0, params.stream,
                 recv_buffer_bytes, payload, params.elements_per_token, params.ep_size, params.max_tokens_per_rank,
                 params.flag_val, params.recv_counters, stride_per_token);

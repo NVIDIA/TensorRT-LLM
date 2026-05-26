@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -532,13 +532,18 @@ bool getEnvDisableChunkedAttentionInGenPhase()
 
 bool getEnvMoeA2AOneBlockPerToken()
 {
-    // Default true; return false only if env set to "0"
-    static std::optional<int32_t> const val = getIntEnv("TLLM_MOE_A2A_ONE_BLOCK_PER_TOKEN");
-    if (!val.has_value())
+    static bool const enabled = []()
     {
+        std::optional<int32_t> const val = getIntEnv("TLLM_MOE_A2A_ONE_BLOCK_PER_TOKEN");
+        if (val.has_value())
+        {
+            TLLM_LOG_WARNING(
+                "Changing A2A block scheduling mode via TLLM_MOE_A2A_ONE_BLOCK_PER_TOKEN is no longer "
+                "supported. One-block-per-token mode is now always enabled.");
+        }
         return true;
-    }
-    return val.value() != 0;
+    }();
+    return enabled;
 }
 
 static int sanitizeBlockSize(std::optional<int32_t> const& val)
