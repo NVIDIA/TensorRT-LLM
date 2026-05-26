@@ -62,6 +62,11 @@ assert tuple(attn_type.value for attn_type in DEEPSEEK_V4_SLIDING_ATTENTION) == 
     range(len(DEEPSEEK_V4_SLIDING_ATTENTION))
 )
 
+DEEPSEEK_V4_FULL_ATTENTION = (
+    DeepseekV4AttentionType.COMPRESS,
+    DeepseekV4AttentionType.INDEXER_COMPRESS,
+)
+
 
 def is_overlap_compressor(compress_ratio: int) -> bool:
     """

@@ -53,6 +53,7 @@ from tensorrt_llm.runtime.kv_cache_manager_v2._common import BAD_PAGE_INDEX
 
 from .compressor import KVCacheDtype
 from .deepseek_v4 import (
+    DEEPSEEK_V4_FULL_ATTENTION,
     DEEPSEEK_V4_SLIDING_ATTENTION,
     DEEPSEEK_V4_SPARSE_RATIO,
     DeepseekV4AttentionType,
@@ -67,28 +68,66 @@ from .deepseek_v4 import (
 DSV4_ENABLE_SWA_SCRATCH_REUSE_ENV = "TRTLLM_DSV4_ENABLE_SWA_SCRATCH_REUSE"
 
 
-def _estimate_bytes_per_token(
+def _estimate_full_attn_size_per_token(
     head_dim: int,
     index_head_dim: int,
     compress_ratios: List[int],
     has_fp8_kv_cache,
-    attn_types: set[DeepseekV4AttentionType] | None = None,
     indexer_k_dtype: str = "fp8",
 ) -> int:
     total_bytes = 0
-    for ratio in compress_ratios:
-        for attn in DeepseekV4AttentionType:
-            if attn_types is not None and attn not in attn_types:
-                continue
-            if compress_ratio_has_attention(ratio, attn):
+    for compress_ratio in compress_ratios:
+        for attn_type in DEEPSEEK_V4_FULL_ATTENTION:
+            if compress_ratio_has_attention(compress_ratio, attn_type):
                 total_bytes += _get_attn_bytes_per_token(
                     head_dim,
                     index_head_dim,
-                    ratio,
-                    attn,
+                    compress_ratio,
+                    attn_type,
                     has_fp8_kv_cache,
                     indexer_k_dtype=indexer_k_dtype,
                 )
+    return total_bytes
+
+
+def _estimate_swa_size_per_request(
+    head_dim: int,
+    index_head_dim: int,
+    compress_ratios: List[int],
+    has_fp8_kv_cache,
+    tokens_per_block: int | None,
+    swa_window_size: int | None,
+    indexer_k_dtype: str = "fp8",
+) -> int:
+    if tokens_per_block is None:
+        return 0
+
+    tokens_per_block = int(tokens_per_block)
+    total_bytes = 0
+    for compress_ratio in compress_ratios:
+        for attn_type in DEEPSEEK_V4_SLIDING_ATTENTION:
+            if not compress_ratio_has_attention(compress_ratio, attn_type):
+                continue
+            if attn_type == DeepseekV4AttentionType.SWA:
+                if swa_window_size is None:
+                    continue
+                window_size = swa_window_size
+            else:
+                state_factor = 2 if is_overlap_compressor(compress_ratio) else 1
+                window_size = state_factor * compress_ratio
+            if window_size <= 0:
+                continue
+            window_tokens = (
+                (int(window_size) + tokens_per_block - 1) // tokens_per_block
+            ) * tokens_per_block
+            total_bytes += window_tokens * _get_attn_bytes_per_token(
+                head_dim,
+                index_head_dim,
+                compress_ratio,
+                attn_type,
+                has_fp8_kv_cache,
+                indexer_k_dtype=indexer_k_dtype,
+            )
     return total_bytes
 
 
@@ -721,11 +760,62 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
             kv_cache.get_scratch_desc(pool_id),
         )
 
-    def _get_cache_quota(self, max_tokens: int) -> int:
-        quota = int(max_tokens * self.get_cache_bytes_per_token())
-        # Add extra quota to ensure sufficient space for small max_tokens cases.
-        quota += len(DeepseekV4AttentionType) * (2 << 20)
-        return quota
+    def _get_extra_quota_padding(self) -> int:
+        """Ensure each attention type has minimal space when max_tokens is small."""
+        return len(DeepseekV4AttentionType) * (2 << 20)
+
+    def _get_quota_from_max_tokens(self, max_tokens: int) -> int:
+        compress_ratios = [self._compress_ratios[layer] for layer in self.pp_layers]
+        has_fp8_kv_cache = self.dtype == DataType.FP8
+        full_attn_size_per_token = _estimate_full_attn_size_per_token(
+            self.head_dim,
+            self.index_head_dim,
+            compress_ratios,
+            has_fp8_kv_cache,
+            indexer_k_dtype=self._indexer_k_dtype,
+        )
+        swa_size_per_request = _estimate_swa_size_per_request(
+            self.head_dim,
+            self.index_head_dim,
+            compress_ratios,
+            has_fp8_kv_cache,
+            self.tokens_per_block,
+            self._swa_window_size,
+            indexer_k_dtype=self._indexer_k_dtype,
+        )
+        padding = self._get_extra_quota_padding()
+        return int(
+            max_tokens * full_attn_size_per_token
+            + self.max_batch_size * swa_size_per_request
+            + padding
+        )
+
+    def _get_max_tokens_from_quota(self, quota: int) -> float:
+        compress_ratios = [self._compress_ratios[layer] for layer in self.pp_layers]
+        has_fp8_kv_cache = self.dtype == DataType.FP8
+        full_attn_size_per_token = _estimate_full_attn_size_per_token(
+            self.head_dim,
+            self.index_head_dim,
+            compress_ratios,
+            has_fp8_kv_cache,
+            indexer_k_dtype=self._indexer_k_dtype,
+        )
+        swa_size_per_request = _estimate_swa_size_per_request(
+            self.head_dim,
+            self.index_head_dim,
+            compress_ratios,
+            has_fp8_kv_cache,
+            self.tokens_per_block,
+            self._swa_window_size,
+            indexer_k_dtype=self._indexer_k_dtype,
+        )
+        padding = self._get_extra_quota_padding()
+        intercept = self.max_batch_size * swa_size_per_request + padding
+        if quota < intercept:
+            return 0
+        if full_attn_size_per_token == 0:
+            return float("inf")
+        return (quota - intercept) / full_attn_size_per_token
 
     def _build_cache_config(
         self,
@@ -1032,7 +1122,7 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
         """Get the average cache bytes per token for DeepSeek-V4."""
         has_fp8_kv_cache = self.dtype == DataType.FP8
         compress_ratios = [self._compress_ratios[layer] for layer in self.pp_layers]
-        return _estimate_bytes_per_token(
+        return _estimate_full_attn_size_per_token(
             self.head_dim,
             self.index_head_dim,
             compress_ratios,
@@ -1064,33 +1154,34 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
     def _get_context_bytes(self, request: llm_request.LlmRequest) -> int:
         prompt_len = max(0, request.prompt_len)
         total_tokens = prompt_len + self.num_extra_kv_tokens
-        return total_tokens * self.get_cache_bytes_per_token()
+        return self._get_cache_bytes_for_tokens(total_tokens)
 
     def _get_generation_bytes(self, request: llm_request.LlmRequest) -> int:
         prompt_len = max(0, request.prompt_len)
         max_new_tokens = max(0, request.max_new_tokens)
         total_tokens = prompt_len + max_new_tokens + self.num_extra_kv_tokens
+        return self._get_cache_bytes_for_tokens(total_tokens)
+
+    def _get_cache_bytes_for_tokens(self, total_tokens: int) -> int:
         has_fp8_kv_cache = self.dtype == DataType.FP8
-        total_bytes = 0
-        for layer in self.pp_layers:
-            compress_ratio = self._compress_ratios[layer]
-            for attn_type in DeepseekV4AttentionType:
-                if not compress_ratio_has_attention(compress_ratio, attn_type):
-                    continue
-                token_bytes = _get_attn_bytes_per_token(
-                    self.head_dim,
-                    self.index_head_dim,
-                    compress_ratio,
-                    attn_type,
-                    has_fp8_kv_cache,
-                    indexer_k_dtype=self._indexer_k_dtype,
-                )
-                attn_tokens = total_tokens
-                window_size = self._get_window_size(compress_ratio, attn_type)
-                if window_size is not None:
-                    attn_tokens = window_size
-                total_bytes += attn_tokens * token_bytes
-        return total_bytes
+        compress_ratios = [self._compress_ratios[layer] for layer in self.pp_layers]
+        full_attn_size_per_token = _estimate_full_attn_size_per_token(
+            self.head_dim,
+            self.index_head_dim,
+            compress_ratios,
+            has_fp8_kv_cache,
+            indexer_k_dtype=self._indexer_k_dtype,
+        )
+        swa_size_per_request = _estimate_swa_size_per_request(
+            self.head_dim,
+            self.index_head_dim,
+            compress_ratios,
+            has_fp8_kv_cache,
+            self.tokens_per_block,
+            self._swa_window_size,
+            indexer_k_dtype=self._indexer_k_dtype,
+        )
+        return int(total_tokens * full_attn_size_per_token + swa_size_per_request)
 
     def get_needed_resource_to_completion(self, request: llm_request.LlmRequest) -> int:
         if self._is_generation_request(request):
@@ -1340,13 +1431,24 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
         else:
             has_fp8_kv_cache = False
         indexer_k_dtype = model_config.sparse_attention_config.indexer_k_dtype
-        return _estimate_bytes_per_token(
+        full_attn_size_per_token = _estimate_full_attn_size_per_token(
             head_dim,
             index_head_dim,
             compress_ratios,
             has_fp8_kv_cache,
             indexer_k_dtype=indexer_k_dtype,
         )
+        swa_size_per_request = _estimate_swa_size_per_request(
+            head_dim,
+            index_head_dim,
+            compress_ratios,
+            has_fp8_kv_cache,
+            kwargs.get("tokens_per_block"),
+            getattr(model_config.sparse_attention_config, "window_size", None),
+            indexer_k_dtype=indexer_k_dtype,
+        )
+        max_batch_size = int(kwargs.get("max_batch_size") or 0)
+        return full_attn_size_per_token, swa_size_per_request * max_batch_size
 
     def check_invalid_values_in_kv_cache(self, fill_with_zero: bool = False) -> bool:
         some_checks_unavailable = False

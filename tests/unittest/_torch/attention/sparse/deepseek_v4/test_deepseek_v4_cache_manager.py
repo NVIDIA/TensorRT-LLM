@@ -24,6 +24,7 @@ from tensorrt_llm._torch.disaggregation.resource.kv_extractor import (
     build_page_table_from_manager,
 )
 from tensorrt_llm._torch.disaggregation.resource.page import MapperKind
+from tensorrt_llm._torch.pyexecutor._util import CacheCost
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestState
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm._utils import binding_to_torch_dtype
@@ -62,7 +63,109 @@ def test_cache_size_estimation_uses_model_attention_layer_count():
         is_disagg=True,
     )
 
-    assert size_per_token > 0
+    cost = CacheCost.from_raw(size_per_token)
+    assert cost.slope > 0
+    assert cost.intercept == 0
+
+
+def test_cache_size_estimation_returns_swa_fixed_cost_as_intercept():
+    class FakeModelConfig:
+        sparse_attention_config = SimpleNamespace(
+            index_head_dim=128,
+            compress_ratios=[1, 1],
+            indexer_k_dtype="fp8",
+            window_size=128,
+        )
+        pretrained_config = SimpleNamespace(
+            kv_lora_rank=512,
+            qk_rope_head_dim=64,
+        )
+        quant_config = None
+
+        def get_num_attention_layers(self) -> int:
+            return len(self.sparse_attention_config.compress_ratios)
+
+    size_per_token = DeepseekV4CacheManager.get_cache_size_per_token(
+        FakeModelConfig(),
+        Mapping(world_size=1, rank=0, tp_size=1, pp_size=1),
+        tokens_per_block=128,
+        max_batch_size=2,
+    )
+    short_seq_size_per_token = DeepseekV4CacheManager.get_cache_size_per_token(
+        FakeModelConfig(),
+        Mapping(world_size=1, rank=0, tp_size=1, pp_size=1),
+        tokens_per_block=128,
+        max_seq_len=1,
+        max_batch_size=2,
+    )
+
+    cost = CacheCost.from_raw(size_per_token)
+    assert cost.slope == 0
+    assert cost.intercept > 0
+    assert CacheCost.from_raw(short_seq_size_per_token) == cost
+
+
+def test_quota_from_max_tokens_models_swa_as_fixed_cost():
+    manager = object.__new__(DeepseekV4CacheManager)
+    manager.pp_layers = [0, 1]
+    manager._compress_ratios = [1, 1]
+    manager.dtype = DataType.BF16
+    manager.head_dim = 512 + 64
+    manager.index_head_dim = 128
+    manager._indexer_k_dtype = "fp8"
+    manager._swa_window_size = 128
+    manager._max_draft_len = 0
+    manager.tokens_per_block = 128
+    manager.max_batch_size = 2
+
+    small_quota = manager._get_quota_from_max_tokens(1)
+    large_quota = manager._get_quota_from_max_tokens(4096)
+
+    assert small_quota == large_quota
+    assert small_quota > manager._get_extra_quota_padding()
+    assert manager._get_max_tokens_from_quota(small_quota) == float("inf")
+
+
+def test_needed_resource_uses_full_slope_and_fixed_swa_cost():
+    manager = object.__new__(DeepseekV4CacheManager)
+    manager.pp_layers = [0, 1]
+    manager._compress_ratios = [4, 4]
+    manager.dtype = DataType.BF16
+    manager.head_dim = 512 + 64
+    manager.index_head_dim = 128
+    manager._indexer_k_dtype = "fp8"
+    manager._swa_window_size = 128
+    manager.tokens_per_block = 128
+    manager.num_extra_kv_tokens = 0
+
+    context_request = SimpleNamespace(
+        is_context_init_state=True,
+        is_generation_in_progress_state=False,
+        is_generation_to_complete_state=False,
+        is_disagg_generation_init_state=False,
+        state=LlmRequestState.CONTEXT_INIT,
+        prompt_len=10,
+        max_new_tokens=100,
+    )
+    generation_request = SimpleNamespace(
+        is_context_init_state=False,
+        is_generation_in_progress_state=True,
+        is_generation_to_complete_state=False,
+        is_disagg_generation_init_state=False,
+        state=LlmRequestState.GENERATION_IN_PROGRESS,
+        prompt_len=10,
+        max_new_tokens=20,
+    )
+
+    full_attn_size_per_token = manager.get_cache_bytes_per_token()
+    context_bytes = manager.get_needed_resource_to_completion(context_request)
+    generation_bytes = manager.get_needed_resource_to_completion(generation_request)
+
+    assert full_attn_size_per_token > 0
+    assert context_bytes > context_request.prompt_len * full_attn_size_per_token
+    assert generation_bytes - context_bytes == (
+        generation_request.max_new_tokens * full_attn_size_per_token
+    )
 
 
 def _view_fp8_as_uint8(buffer: torch.Tensor) -> torch.Tensor:

@@ -1873,6 +1873,96 @@ class KVCacheManager(BaseResourceManager):
         self.impl.reset_reuse_state()
 
 
+def _estimate_full_attn_size_per_token(
+        layer_sizes: Sequence[int],
+        attention_windows: Sequence[Optional[int]]) -> int:
+    return sum(
+        layer_size
+        for layer_size, window_size in zip(layer_sizes, attention_windows)
+        if window_size is None or window_size <= 0)
+
+
+def _estimate_swa_size_per_request(layer_sizes: Sequence[int],
+                                   attention_windows: Sequence[Optional[int]],
+                                   tokens_per_block: Optional[int]) -> int:
+    if tokens_per_block is None:
+        return 0
+
+    tokens_per_block = int(tokens_per_block)
+    swa_size_per_request = 0
+    for layer_size, window_size in zip(layer_sizes, attention_windows):
+        if window_size is not None and window_size > 0:
+            window_tokens = math.ceil(
+                window_size / tokens_per_block) * tokens_per_block
+            swa_size_per_request += window_tokens * layer_size
+    return swa_size_per_request
+
+
+def _get_static_cache_size_layer_components(
+        model_config: ModelConfigPython,
+        mapping: Mapping,
+        num_layers: Optional[int] = None,
+        **kwargs) -> Tuple[List[int], List[Optional[int]]]:
+    config = model_config.pretrained_config
+    max_seq_len = kwargs.get("max_seq_len")
+    kv_cache_config = kwargs.get("kv_cache_config")
+
+    num_key_value_heads = getattr(config, 'num_key_value_heads',
+                                  config.num_attention_heads)
+    if isinstance(num_key_value_heads, Iterable):
+        num_key_value_heads = sum(num_key_value_heads) / len(
+            num_key_value_heads)
+
+    mla = hasattr(config, "kv_lora_rank") and config.kv_lora_rank is not None
+    if mla:
+        head_dim = config.kv_lora_rank + config.qk_rope_head_dim
+        kv_factor = 1
+    else:
+        tp_size = 1 if mapping.enable_attention_dp else mapping.tp_size
+        head_dim = getattr(config, "head_dim", None)
+        if not isinstance(head_dim, int):
+            head_dim = config.hidden_size // config.num_attention_heads
+        head_dim = head_dim * num_key_value_heads // tp_size
+        kv_factor = 2
+
+    cache_size_per_token = kv_factor * head_dim
+    quant_config = model_config.quant_config
+    if quant_config is not None and quant_config.quant_mode.has_fp8_kv_cache():
+        layer_size = cache_size_per_token
+    elif quant_config is not None and quant_config.quant_mode.has_fp4_kv_cache(
+    ):
+        layer_size = (math.ceil(cache_size_per_token / 2) +
+                      math.ceil(cache_size_per_token / 16))
+    else:
+        assert quant_config is None or (
+            not quant_config.quant_mode.has_kv_cache_quant()
+        ), "Quantized kv cache is not expected"
+        layer_size = cache_size_per_token * 2
+
+    num_attention_layers = KVCacheManager._resolve_num_attention_layers(
+        model_config, mapping, num_layers)
+    layer_sizes = [layer_size] * num_attention_layers
+    window_pattern = (kv_cache_config.max_attention_window
+                      if kv_cache_config is not None else None)
+
+    def get_window_size(layer_idx: int) -> Optional[int]:
+        if window_pattern is None or not isinstance(window_pattern,
+                                                    (list, tuple)):
+            return None
+        window_size = window_pattern[layer_idx % len(window_pattern)]
+        if window_size is None or window_size <= 0:
+            return None
+        window_size = int(window_size)
+        if max_seq_len is not None and window_size == int(max_seq_len):
+            return None
+        return window_size
+
+    attention_windows = [
+        get_window_size(layer_idx) for layer_idx in range(num_attention_layers)
+    ]
+    return layer_sizes, attention_windows
+
+
 class KVCacheManagerV2(BaseResourceManager):
 
     def __init__(
@@ -2073,10 +2163,12 @@ class KVCacheManagerV2(BaseResourceManager):
         # bytes_per_token varies across PP ranks (different local layers).
         if mapping.world_size > 1:
             dist = Distributed.get(mapping)
-            bytes_per_token = self.get_cache_bytes_per_token()
-            max_tokens = quota / bytes_per_token
+            max_tokens = self._get_max_tokens_from_quota(quota)
             max_tokens = dist.allreduce(max_tokens, op=ReduceOp.MIN)
-            quota = max_tokens * bytes_per_token
+            # inf max_tokens means all layers are swa and in all ranks quota can fit all swa cache
+            # in this case, we dont have to modify quota
+            if not math.isinf(max_tokens):
+                quota = self._get_quota_from_max_tokens(max_tokens)
 
         logger.info(
             f"KV cache manager v2 device quota set to {quota / (1 << 30)}GiB")
@@ -2255,8 +2347,43 @@ class KVCacheManagerV2(BaseResourceManager):
 
         self._log_kv_cache_pool_lifecycle_mapping()
 
+    def _get_runtime_cache_size_layer_components(
+            self) -> Tuple[List[int], List[Optional[int]]]:
+        layer_sizes = []
+        attention_windows = []
+        pattern_len = len(self.max_attention_window_vec)
+        for local_layer_idx in range(self.num_local_layers):
+            layer_sizes.append(
+                self.get_layer_bytes_per_token(local_layer_idx=local_layer_idx,
+                                               data_role=Role.ALL))
+            attention_windows.append(
+                self.max_attention_window_vec[self.pp_layers[local_layer_idx] %
+                                              pattern_len])
+        return layer_sizes, attention_windows
+
+    def _get_max_tokens_from_quota(self, quota: int) -> float:
+        layer_sizes, attention_windows = self._get_runtime_cache_size_layer_components(
+        )
+        full_attn_size_per_token = _estimate_full_attn_size_per_token(
+            layer_sizes, attention_windows)
+        swa_size_per_request = _estimate_swa_size_per_request(
+            layer_sizes, attention_windows, self.tokens_per_block)
+        intercept = self.max_batch_size * swa_size_per_request
+        if quota < intercept:
+            return 0
+        if full_attn_size_per_token <= 0:
+            return float('inf')
+        return (quota - intercept) / full_attn_size_per_token
+
     def _get_quota_from_max_tokens(self, max_tokens: int) -> int:
-        return int(max_tokens * self.get_cache_bytes_per_token())
+        layer_sizes, attention_windows = self._get_runtime_cache_size_layer_components(
+        )
+        full_attn_size_per_token = _estimate_full_attn_size_per_token(
+            layer_sizes, attention_windows)
+        swa_size_per_request = _estimate_swa_size_per_request(
+            layer_sizes, attention_windows, self.tokens_per_block)
+        return int(max_tokens * full_attn_size_per_token +
+                   self.max_batch_size * swa_size_per_request)
 
     def _get_event_num_blocks_per_cache_level(
         self,
@@ -3741,42 +3868,14 @@ class KVCacheManagerV2(BaseResourceManager):
                                  mapping: Mapping,
                                  num_layers: Optional[int] = None,
                                  **kwargs):
-        # get kv cache dtype bytes
-        mem_per_token = 2
-        quant_config = model_config.quant_config
-        if quant_config is not None and quant_config.quant_mode.has_fp8_kv_cache(
-        ):
-            mem_per_token = 1
-
-        # get num key value heads
-        config = model_config.pretrained_config
-        num_key_value_heads = getattr(config, 'num_key_value_heads',
-                                      config.num_attention_heads)
-        if isinstance(num_key_value_heads, Iterable):
-            num_key_value_heads = sum(num_key_value_heads) / len(
-                num_key_value_heads)
-
-        # get head dim
-        mla = hasattr(config,
-                      "kv_lora_rank") and config.kv_lora_rank is not None
-        if mla:
-            head_dim = config.kv_lora_rank + config.qk_rope_head_dim
-            kv_factor = 1
-        else:
-            tp_size = 1 if mapping.enable_attention_dp else mapping.tp_size
-            head_dim = getattr(config, "head_dim", None)
-            if not isinstance(head_dim, int):
-                head_dim = config.hidden_size // config.num_attention_heads
-            head_dim = head_dim * num_key_value_heads // tp_size
-            kv_factor = 2
-
-        num_attention_layers = KVCacheManager._resolve_num_attention_layers(
-            model_config, mapping, num_layers)
-        mem_per_token *= num_attention_layers * head_dim
-
-        # K and V
-        mem_per_token *= kv_factor
-        return mem_per_token
+        layer_sizes, attention_windows = _get_static_cache_size_layer_components(
+            model_config, mapping, num_layers=num_layers, **kwargs)
+        slope = _estimate_full_attn_size_per_token(layer_sizes,
+                                                   attention_windows)
+        swa_size_per_request = _estimate_swa_size_per_request(
+            layer_sizes, attention_windows, kwargs.get("tokens_per_block"))
+        max_batch_size = int(kwargs.get("max_batch_size") or 0)
+        return slope, swa_size_per_request * max_batch_size
 
     def update_context_resources(self, scheduled_batch: ScheduledRequests):
         """Update KV cache for context requests in the current batch.

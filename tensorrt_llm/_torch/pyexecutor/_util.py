@@ -102,9 +102,10 @@ def get_kv_cache_manager_cls(model_config: ModelConfig,
 # KVCacheManager.get_cache_size_per_token may return either an ``int``
 # (legacy proportional model ``bytes = slope * tokens``) or an affine
 # ``(slope, intercept)`` tuple (CppMambaHybridCacheManager, where mamba
-# state introduces a per-batch fixed cost).  CacheCost normalizes both
-# shapes so the rest of the file does plain attribute access and method
-# calls instead of branching on type.
+# state introduces a per-batch fixed cost).  KVCacheManagerV2 reports
+# sliding-window attention fixed cost in the tuple intercept.  CacheCost
+# normalizes the combined shape so the rest of the file does plain attribute
+# access and method calls instead of branching on type.
 
 
 @dataclasses.dataclass(frozen=True)
@@ -246,8 +247,10 @@ class KvCacheCreator:
                 model_config,
                 self._mapping,
                 tokens_per_block=self._tokens_per_block,
+                max_seq_len=self._max_seq_len,
                 max_batch_size=self._max_batch_size,
                 kv_cache_config=self._kv_cache_config,
+                spec_config=self._speculative_config,
                 **extra_kwargs))
 
     def _get_kv_size_per_token(self) -> CacheCost:
