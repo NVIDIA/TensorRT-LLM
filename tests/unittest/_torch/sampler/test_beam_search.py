@@ -27,7 +27,7 @@ from test_beam_search_util import (BeamSearchTestOutput, DummyConfigLoader,
 from utils.llm_data import llm_models_root
 from utils.util import assert_no_cuda_sync, force_ampere, run_test_with_warmup
 
-from tensorrt_llm import LLM, SamplingParams, TorchLlmArgs
+from tensorrt_llm import DisaggregatedParams, LLM, SamplingParams, TorchLlmArgs
 from tensorrt_llm._torch.models.checkpoints import HfCheckpointLoader
 from tensorrt_llm._torch.pyexecutor.llm_request import (LlmRequest,
                                                         SamplingConfig)
@@ -39,7 +39,7 @@ from tensorrt_llm._torch.pyexecutor.sampling_utils import (
 from tensorrt_llm.bindings.executor import FinishReason
 from tensorrt_llm.executor import RequestError
 from tensorrt_llm.executor.result import CompletionOutput, GenerationResult
-from tensorrt_llm.llmapi import CudaGraphConfig, KvCacheConfig
+from tensorrt_llm.llmapi import CacheTransceiverConfig, CudaGraphConfig, KvCacheConfig
 
 
 @pytest.fixture(scope="module")
@@ -344,6 +344,49 @@ def validate_outputs(llm: LLM, input_prompts: list[list[int]],
         validate_output(output, input_prompts[output_idx], sampling_params)
 
 
+def validate_disagg_outputs(ctx_llm: LLM, gen_llm: LLM,
+                            input_prompts: list[list[int]],
+                            sampling_params: SamplingParams) -> None:
+    """Run context-only then generation-only beam search and validate outputs."""
+
+    ctx_disagg_params = [
+        DisaggregatedParams(request_type="context_only",
+                            disagg_request_id=1000 + idx)
+        for idx in range(len(input_prompts))
+    ]
+    ctx_outputs = ctx_llm.generate(
+        deepcopy(input_prompts),
+        sampling_params=deepcopy(sampling_params),
+        disaggregated_params=ctx_disagg_params,
+        use_tqdm=False,
+    )
+    assert isinstance(ctx_outputs, list)
+    assert len(ctx_outputs) == len(input_prompts)
+
+    gen_disagg_params = []
+    for ctx_output in ctx_outputs:
+        disagg_params = ctx_output.disaggregated_params
+        assert disagg_params is not None
+        assert disagg_params.first_gen_tokens is not None
+        assert disagg_params.first_gen_cum_log_probs is not None
+        assert len(disagg_params.first_gen_tokens) == sampling_params.best_of
+        assert len(disagg_params.first_gen_cum_log_probs
+                   ) == sampling_params.best_of
+        disagg_params.request_type = "generation_only"
+        gen_disagg_params.append(disagg_params)
+
+    gen_outputs = gen_llm.generate(
+        deepcopy(input_prompts),
+        sampling_params=deepcopy(sampling_params),
+        disaggregated_params=gen_disagg_params,
+        use_tqdm=False,
+    )
+    assert isinstance(gen_outputs, list)
+    assert len(gen_outputs) == len(input_prompts)
+    for output_idx, output in enumerate(gen_outputs):
+        validate_output(output, input_prompts[output_idx], sampling_params)
+
+
 ###########################################################################
 # End to end tests
 ###########################################################################
@@ -406,6 +449,55 @@ def test_beam_search_e2e(
         check_no_sync=single_process,
         monkeypatch=monkeypatch,
     )
+
+
+@pytest.mark.parametrize("num_output_beams", [1, 2])
+@pytest.mark.parametrize("num_prompts", [1, 3])
+@pytest.mark.parametrize("stop_token_ids", [[15], None])
+@pytest.mark.threadleak(enabled=False)
+def test_beam_search_disagg_e2e(
+    num_output_beams: int,
+    num_prompts: int,
+    stop_token_ids: list[int] | None,
+    fixed_params,
+    input_prompts,
+    model_kwargs: dict[str, Any],
+) -> None:
+    if model_kwargs["sampler_type"] != "TorchSampler":
+        pytest.skip("Disaggregated beam score handoff is implemented for TorchSampler")
+
+    sampling_params = SamplingParams(
+        max_tokens=fixed_params["max_tokens"],
+        n=num_output_beams,
+        best_of=fixed_params["max_beam_width"],
+        use_beam_search=True,
+        end_id=-1,
+        stop_token_ids=stop_token_ids,
+        include_stop_str_in_output=True,
+        additional_model_outputs=["cache_indirection"],
+    )
+
+    disagg_kwargs = deepcopy(model_kwargs)
+    disagg_kwargs |= dict(
+        disable_overlap_scheduler=False,
+        cuda_graph_config=None,
+        cache_transceiver_config=CacheTransceiverConfig(
+            backend="NIXL",
+            transceiver_runtime="PYTHON",
+            kv_transfer_timeout_ms=5000,
+        ),
+    )
+
+    ctx_llm = _build_llm(fixed_params, input_prompts, disagg_kwargs)
+    gen_llm = _build_llm(fixed_params, input_prompts, disagg_kwargs)
+    try:
+        with ctx_llm, gen_llm:
+            validate_disagg_outputs(ctx_llm, gen_llm,
+                                    input_prompts[:num_prompts],
+                                    sampling_params)
+    finally:
+        ctx_llm.shutdown()
+        gen_llm.shutdown()
 
 
 ###########################################################################
