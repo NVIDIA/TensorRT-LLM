@@ -6,11 +6,15 @@ verl_config:
   test_dir: "tests"
 
   install_commands:
-    # Install gdrcopy
+    # Install gdrcopy (skip if already installed; build as user, install with sudo
+    # so the install step works under both root and non-root LOCAL_USER setups)
     - >-
+      if [ ! -f /usr/local/lib/libgdrapi.so ]; then
+      rm -rf gdrcopy &&
       git clone -b v2.5.1 https://github.com/NVIDIA/gdrcopy.git &&
-      (cd gdrcopy && make prefix=/usr/local lib_install) &&
-      rm -rf gdrcopy
+      (cd gdrcopy && make lib && sudo make prefix=/usr/local lib_install) &&
+      rm -rf gdrcopy;
+      fi
     # DeepEP's deep_ep_cpp extension hard-links against the static device archive
     # (-l:libnvshmem_device.a) and the host lib (-l:libnvshmem_host.so), neither of
     # which the NGC PyTorch base image ships (it provides only libnvshmem_host.so.3
@@ -50,6 +54,7 @@ verl_config:
     - "PATH=\"${NVSHMEM_DIR}/bin:$PATH\""
     - "TRTLLM_TEST_MODEL_PATH_ROOT=/tmp/verl-models"
     - "TORCH_CUDA_ARCH_LIST="
+    - "RAY_enable_open_telemetry_on_core_worker=0"
 
   # Read-only CI model cache (flat layout: /scratch.../ModelName)
   ci_model_cache: "/scratch.trt_llm_data/llm-models"
