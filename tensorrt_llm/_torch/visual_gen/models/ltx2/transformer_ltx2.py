@@ -27,11 +27,10 @@ from tqdm import tqdm
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from tensorrt_llm._torch.modules.linear import Linear, TensorParallelMode, WeightMode
+from tensorrt_llm._torch.modules.linear import Linear, WeightMode
 from tensorrt_llm._torch.modules.mlp import MLP
 from tensorrt_llm._torch.visual_gen.attention_backend.utils import create_attention
 from tensorrt_llm._torch.visual_gen.modules.attention import Attention, QKVMode
-from tensorrt_llm._torch.visual_gen.modules.rms_norm import RMSNorm
 from tensorrt_llm._torch.visual_gen.quantization.loader import DynamicLinearWeightLoader
 from tensorrt_llm._torch.visual_gen.utils import SequenceSharder
 from tensorrt_llm.logger import logger
@@ -134,9 +133,9 @@ class LTX2Attention(Attention):
             self._plain_attn = create_attention(
                 backend=self.attn_backend,
                 layer_idx=self.layer_idx,
-                num_heads=self.num_local_attention_heads,
+                num_heads=self.num_attention_heads,
                 head_dim=self.head_dim,
-                num_kv_heads=self.num_local_key_value_heads,
+                num_kv_heads=self.num_key_value_heads,
                 quant_config=self.quant_config,
                 dtype=self.dtype,
                 attention_config=config.attention,
@@ -154,8 +153,6 @@ class LTX2Attention(Attention):
                 quant_config=self.quant_config,
                 skip_create_weights_in_init=self.skip_create_weights_in_init,
                 force_dynamic_quantization=self.force_dynamic_quantization,
-                tensor_parallel_mode=TensorParallelMode.COLUMN if self.tp_size > 1 else None,
-                reduce_output=False,
             )
         else:
             self.to_gate_logits = None
@@ -179,7 +176,6 @@ class LTX2Attention(Attention):
         if not self._is_cross_attn:
             super()._init_qkv_proj()
             return
-        tp_mode = TensorParallelMode.COLUMN if self.tp_size > 1 else None
         self.to_q = Linear(
             self.hidden_size,
             self.q_dim,
@@ -189,8 +185,6 @@ class LTX2Attention(Attention):
             quant_config=self.quant_config,
             skip_create_weights_in_init=self.skip_create_weights_in_init,
             force_dynamic_quantization=self.force_dynamic_quantization,
-            tensor_parallel_mode=tp_mode,
-            reduce_output=False,
         )
         self.to_k = Linear(
             self._context_dim,
@@ -201,8 +195,6 @@ class LTX2Attention(Attention):
             quant_config=self.quant_config,
             skip_create_weights_in_init=self.skip_create_weights_in_init,
             force_dynamic_quantization=self.force_dynamic_quantization,
-            tensor_parallel_mode=tp_mode,
-            reduce_output=False,
         )
         self.to_v = Linear(
             self._context_dim,
@@ -213,8 +205,6 @@ class LTX2Attention(Attention):
             quant_config=self.quant_config,
             skip_create_weights_in_init=self.skip_create_weights_in_init,
             force_dynamic_quantization=self.force_dynamic_quantization,
-            tensor_parallel_mode=tp_mode,
-            reduce_output=False,
         )
 
     def project_kv(
@@ -238,9 +228,8 @@ class LTX2Attention(Attention):
         # All cross-attn K-norm paths (with or without RoPE) go through the
         # split-fuse kernels. Fallback only kicks in for unsupported head_dim
         # — the fused kernel template covers {64, 128}; mini-config tests use
-        # head_dim=32 and must take the eager branch. However, these kernels
-        # do not support TP, which is a collective op due to cross-head RMSNorm.
-        if self.qk_norm and self.head_dim in (64, 128) and self.tp_size == 1:
+        # head_dim=32 and must take the eager branch.
+        if self.qk_norm and self.head_dim in (64, 128):
             self.apply_split_norm_or_norm_rope(k, self.norm_k.weight, self.num_key_value_heads, pe)
         else:
             if self.qk_norm:
@@ -266,10 +255,10 @@ class LTX2Attention(Attention):
             k_pe overrides pe for K (e.g. AV cross-attn) when provided.
         """
         # Fallback to the naive eager rope path when fusion is disabled or
-        # the kernel doesn't support this head_dim or TP is enabled. LTX-2 prod
-        # has fuse_qk_norm_rope=True and head_dim ∈ {64, 128}, so this branch
-        # only fires under mini-config unit tests (head_dim=32) or if TP is enabled.
-        if not self.fuse_qk_norm_rope or self.head_dim not in (64, 128) or self.tp_size > 1:
+        # the kernel doesn't support this head_dim. LTX-2 prod has
+        # fuse_qk_norm_rope=True and head_dim ∈ {64, 128}, so this branch
+        # only fires under mini-config unit tests (head_dim=32).
+        if not self.fuse_qk_norm_rope or self.head_dim not in (64, 128):
             return self._forward_unfused(x, context, pe, k_pe, pre_projected_kv)
 
         if self.qkv_mode == QKVMode.FUSE_QKV:
@@ -359,10 +348,10 @@ class LTX2Attention(Attention):
         if self.to_gate_logits is not None:
             gate_logits = self.to_gate_logits(x)
             b, t, _ = out.shape
-            out = out.view(b, t, self.local_num_attention_heads, self.head_dim)
+            out = out.view(b, t, self.num_attention_heads, self.head_dim)
             gates = 2.0 * torch.sigmoid(gate_logits)
             out = out * gates.unsqueeze(-1)
-            out = out.view(b, t, self.local_num_attention_heads * self.head_dim)
+            out = out.view(b, t, self.num_attention_heads * self.head_dim)
 
         return self.to_out[0](out)
 
@@ -420,7 +409,6 @@ class BasicAVTransformerBlock(nn.Module):
     @staticmethod
     def _make_mlp(cfg, model_config, idx):
         dtype = model_config.torch_dtype if model_config else None
-        tp_size = model_config.mapping.tp_size if model_config and model_config.mapping else 1
         return MLP(
             hidden_size=cfg.dim,
             intermediate_size=cfg.dim * 4,
@@ -429,7 +417,6 @@ class BasicAVTransformerBlock(nn.Module):
             dtype=dtype,
             config=model_config,
             layer_idx=idx,
-            reduce_output=(tp_size != 1),
         )
 
     def _init_video_modules(self, cfg, rope_type, eps, model_config, idx):
@@ -944,6 +931,9 @@ class LTXModel(nn.Module):
                 f"must be divisible by ulysses_size ({vgm.ulysses_size})"
             )
 
+        if self.model_config.mapping.tp_size > 1:
+            raise ValueError("LTX2 does not currently support TP.")
+
         self._audio_is_sharded = False
         self._cache_dit_video_args: Optional[TransformerArgs] = None
         self._cache_dit_audio_args: Optional[TransformerArgs] = None
@@ -1059,7 +1049,6 @@ class LTXModel(nn.Module):
             quant_config=quant_config,
             skip_create_weights_in_init=skip_create,
             force_dynamic_quantization=force_dq,
-            reduce_output=False,
         )
 
     def _init_video(self, in_channels, out_channels, caption_channels, norm_eps):
@@ -1119,7 +1108,6 @@ class LTXModel(nn.Module):
     def _init_preprocessors(self, cross_pe_max_pos):
         if self.model_type.is_video_enabled() and self.model_type.is_audio_enabled():
             self.video_args_preprocessor = MultiModalTransformerArgsPreprocessor(
-                model_config=self.model_config,
                 patchify_proj=self.patchify_proj,
                 adaln=self.adaln_single,
                 caption_projection=self.caption_projection,
@@ -1138,7 +1126,6 @@ class LTXModel(nn.Module):
                 av_ca_timestep_scale_multiplier=self.av_ca_timestep_scale_multiplier,
             )
             self.audio_args_preprocessor = MultiModalTransformerArgsPreprocessor(
-                model_config=self.model_config,
                 patchify_proj=self.audio_patchify_proj,
                 adaln=self.audio_adaln_single,
                 caption_projection=self.audio_caption_projection,
@@ -1158,7 +1145,6 @@ class LTXModel(nn.Module):
             )
         elif self.model_type.is_video_enabled():
             self.video_args_preprocessor = TransformerArgsPreprocessor(
-                model_config=self.model_config,
                 patchify_proj=self.patchify_proj,
                 adaln=self.adaln_single,
                 caption_projection=self.caption_projection,
@@ -1173,7 +1159,6 @@ class LTXModel(nn.Module):
             )
         elif self.model_type.is_audio_enabled():
             self.audio_args_preprocessor = TransformerArgsPreprocessor(
-                model_config=self.model_config,
                 patchify_proj=self.audio_patchify_proj,
                 adaln=self.audio_adaln_single,
                 caption_projection=self.audio_caption_projection,
@@ -1716,9 +1701,6 @@ class LTXModel(nn.Module):
                 weight_dicts = loader.get_linear_weights(module, name, weights)
                 if weight_dicts:
                     loader.load_linear_weights(module, name, weight_dicts)
-            elif isinstance(module, RMSNorm):
-                module_weights = loader.filter_weights(name, weights)
-                module.load_weights(module_weights)
             else:
                 module_weights = loader.filter_weights(name, weights)
                 for param_name, param in module._parameters.items():

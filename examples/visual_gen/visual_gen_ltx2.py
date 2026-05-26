@@ -390,6 +390,9 @@ def main():
             "Combining --ulysses_size with --attn2d_row_size/--attn2d_col_size is not yet implemented."
         )
 
+    if args.tp_size > 1:
+        raise ValueError("LTX2 does not currently support TP.")
+
     visual_gen_args = _build_visual_gen_args(args)
 
     parallel_str = ""
