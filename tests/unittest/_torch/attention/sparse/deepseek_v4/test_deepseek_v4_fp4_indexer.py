@@ -40,9 +40,9 @@ from tensorrt_llm.llmapi.llm_args import (
 # ---------------------------------------------------------------------------
 
 
-def test_indexer_k_dtype_default_is_fp8():
+def test_indexer_k_dtype_default_is_fp4():
     cfg = DeepSeekV4SparseAttentionConfig()
-    assert cfg.indexer_k_dtype == "fp8"
+    assert cfg.indexer_k_dtype == "fp4"
 
 
 def test_indexer_k_dtype_accepts_fp4():

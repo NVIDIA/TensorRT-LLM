@@ -30,7 +30,8 @@ from tensorrt_llm._torch.attention_backend.interface import (
     AttentionBackend, PositionalEmbeddingParams, RopeParams)
 from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4 import \
     DeepseekV4CacheManager
-from tensorrt_llm._torch.attention_backend.sparse.dsa import DSACacheManager
+from tensorrt_llm._torch.attention_backend.sparse.dsa import (HAS_FAST_HADAMARD,
+                                                              DSACacheManager)
 from tensorrt_llm._torch.attention_backend.utils import get_attention_backend
 from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.model_config import ModelConfig
@@ -46,6 +47,8 @@ from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
 
 from .deepseek_v4.test_compressor_module import RefCompressor
+from .deepseek_v4.test_compressor_module import \
+    rotate_activation as ref_rotate_activation
 
 # DSACacheManager creates background ThreadPoolExecutor threads.
 pytestmark = pytest.mark.threadleak(enabled=False)
@@ -280,6 +283,78 @@ def _topk_from_scores(scores: torch.Tensor, topk_tokens: int) -> torch.Tensor:
     return row
 
 
+def _ceil_pow2_scale(amax: torch.Tensor, max_value_inv: float,
+                     min_amax: float) -> torch.Tensor:
+    scaled = torch.clamp(amax.float(), min=min_amax) * max_value_inv
+    bits = scaled.contiguous().view(torch.int32)
+    exp_part = ((bits >> 23) & 0xFF) - 127
+    has_mantissa = (bits & 0x7FFFFF).ne(0).to(torch.int32)
+    log2_ceil = exp_part + has_mantissa
+    pow2_bits = (log2_ceil + 127) << 23
+    return pow2_bits.view(torch.float32)
+
+
+def _e2m1_nibbles_reference(x: torch.Tensor,
+                            round_ties_to_even: bool) -> torch.Tensor:
+    thresholds = torch.tensor([0.0, 0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0],
+                              device=x.device)
+    abs_x = x.abs().clamp(max=6.0)
+    idx = torch.zeros_like(abs_x, dtype=torch.uint8)
+    for level_idx in range(1, 8):
+        take_upper = abs_x > thresholds[level_idx]
+        if round_ties_to_even:
+            take_upper = take_upper | ((abs_x == thresholds[level_idx]) &
+                                       (level_idx % 2 == 0))
+        idx = torch.where(take_upper, torch.full_like(idx, level_idx), idx)
+    sign = torch.signbit(x).to(torch.uint8) << 3
+    return idx | sign
+
+
+def _mxfp4_quant_dequant_reference(
+    x: torch.Tensor,
+    *,
+    round_ties_to_even: bool,
+    min_amax: float,
+    block_size: int = 32,
+) -> torch.Tensor:
+    assert x.shape[-1] % block_size == 0
+    fp4_values = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0],
+                              device=x.device,
+                              dtype=torch.float32)
+    orig_shape = x.shape
+    blocks = x.float().reshape(-1, x.shape[-1] // block_size, block_size)
+    scale = _ceil_pow2_scale(blocks.abs().amax(dim=-1, keepdim=True), 1.0 / 6.0,
+                             min_amax)
+    nibbles = _e2m1_nibbles_reference(blocks / scale, round_ties_to_even)
+    value_idx = (nibbles & 0x07).to(torch.int64)
+    values = fp4_values[value_idx]
+    values = torch.where((nibbles & 0x08) != 0, -values, values)
+    return (values * scale).reshape(orig_shape)
+
+
+def _maybe_rotate_for_fp4_indexer(x: torch.Tensor) -> torch.Tensor:
+    if not HAS_FAST_HADAMARD:
+        return x
+    return ref_rotate_activation(x)
+
+
+def _prepare_fp4_indexer_q_reference(q: torch.Tensor) -> torch.Tensor:
+    q = _maybe_rotate_for_fp4_indexer(q)
+    # DSv4 Q uses fused_cat_fp4, whose E2M1 thresholds round ties down.
+    return _mxfp4_quant_dequant_reference(q,
+                                          round_ties_to_even=False,
+                                          min_amax=1.0e-12)
+
+
+def _prepare_fp4_indexer_k_reference(k: torch.Tensor) -> torch.Tensor:
+    k = _maybe_rotate_for_fp4_indexer(k)
+    fp4_min_amax = 6.0 * torch.finfo(torch.float32).tiny
+    # The compressor kernel uses the hardware E2M1 cast, which is RNE.
+    return _mxfp4_quant_dequant_reference(k,
+                                          round_ties_to_even=True,
+                                          min_amax=fp4_min_amax)
+
+
 def _reference_indexer_scores(q: torch.Tensor, k: torch.Tensor,
                               weights: torch.Tensor,
                               softmax_scale: float) -> torch.Tensor:
@@ -317,6 +392,9 @@ def calculate_reference_deepseek_v4_topk_indices(
     apply_rotary_emb(q_ref[..., -indexer.rope_dim:],
                      freqs_cis[position_ids.long()])
     q_ref = q_ref.squeeze(0)
+    use_fp4_indexer = indexer.indexer_k_dtype == "fp4"
+    if use_fp4_indexer:
+        q_ref = _prepare_fp4_indexer_q_reference(q_ref)
 
     weights = F.linear(hidden_states, indexer.weights_proj.weight)
     weights = weights.float() * (indexer.n_heads**-0.5)
@@ -337,10 +415,14 @@ def calculate_reference_deepseek_v4_topk_indices(
 
         if compressed_kv is not None:
             compressed_kv = compressed_kv.squeeze(0)
+            compressed_kv_for_scores = (
+                _prepare_fp4_indexer_k_reference(compressed_kv)
+                if use_fp4_indexer else compressed_kv)
             for token_idx in range(seq_len):
                 valid_len = (token_idx + 1) // compress_ratio
+                k_for_scores = compressed_kv_for_scores[:valid_len]
                 scores = _reference_indexer_scores(q_ref[offset + token_idx],
-                                                   compressed_kv[:valid_len],
+                                                   k_for_scores,
                                                    weights[offset + token_idx],
                                                    indexer.softmax_scale)
                 topk_indices[offset + token_idx] = _topk_from_scores(
@@ -382,8 +464,11 @@ def calculate_reference_deepseek_v4_topk_indices(
         if compressed_kv is None or valid_len == 0:
             continue
 
+        compressed_kv_for_scores = (
+            _prepare_fp4_indexer_k_reference(compressed_kv)
+            if use_fp4_indexer else compressed_kv)
         scores = _reference_indexer_scores(q_ref[token_idx],
-                                           compressed_kv[:valid_len],
+                                           compressed_kv_for_scores[:valid_len],
                                            weights[token_idx],
                                            indexer.softmax_scale)
         topk_indices[token_idx] = _topk_from_scores(scores, topk_tokens)
@@ -1867,9 +1952,9 @@ def test_forward_sparse_mla_unified(batch_name, kv_cache_dtype: str,
             max_batch_size=1,
             max_seq_len=max_seqlen,
         )
-        # HF DS4 reference does not apply Hadamard rotation in the attention or
-        # indexer compressor path.  TRTLLM may rotate both Q and K before FP8
-        # indexer scoring, but the independent oracle below follows HF math.
+        # The base DS4 compressor references follow HF math without Hadamard
+        # rotation. FP4 indexer scoring separately applies the TRTLLM Q/K
+        # rotation and MXFP4 QDQ before computing reference top-k.
         ref_compressor = RefCompressor(ref_args,
                                        compress_ratios[layer_idx],
                                        pretrained_config.head_size,
@@ -2198,12 +2283,13 @@ def test_forward_sparse_mla_unified(batch_name, kv_cache_dtype: str,
                 )
 
         if sparse_attn_algo == "deepseek_v4":
+            min_topk_overlap = 0.95
             topk_mismatch = get_deepseek_v4_topk_mismatch(
                 topk_indices_local, reference_topk_indices_local)
             topk_overlap_mismatch = get_deepseek_v4_topk_overlap_mismatch(
                 topk_indices_local,
                 reference_topk_indices_local,
-                min_overlap=0.95,
+                min_overlap=min_topk_overlap,
             )
             if topk_overlap_mismatch is not None:
                 if topk_mismatch is not None:
@@ -2213,7 +2299,7 @@ def test_forward_sparse_mla_unified(batch_name, kv_cache_dtype: str,
                 print("  ✓ Indexer top-k matches independent reference")
             else:
                 print("  ✓ Indexer top-k overlap with independent "
-                      "reference is at least 0.95")
+                      f"reference is at least {min_topk_overlap}")
                 print(f"  ! {topk_mismatch}")
 
         if (sparse_attn_algo == "deepseek_v4"

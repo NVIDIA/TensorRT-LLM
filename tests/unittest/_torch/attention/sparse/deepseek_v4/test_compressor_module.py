@@ -752,10 +752,12 @@ class CompressorWrapper:
         compress_ratios = [compress_ratio]
 
         # Create sparse attention config
+        indexer_k_dtype = "fp8" if self.kv_cache_dtype == "fp8_blockwise" else "fp4"
         sparse_attn_config = DeepSeekV4SparseAttentionConfig(
             index_head_dim=INDEX_HEAD_DIM,
             window_size=self.WINDOW_SIZE,
             compress_ratios=compress_ratios,
+            indexer_k_dtype=indexer_k_dtype,
         )
 
         # Create KV cache config
