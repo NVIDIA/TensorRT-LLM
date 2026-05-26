@@ -3582,6 +3582,8 @@ class PyExecutor:
                 for beam in range(0, beam_width):
                     req.add_new_token(first_gen_tokens[beam], beam)
                 self._seed_disagg_beam_cum_log_probs(req, beam_width)
+                self._assert_disagg_beam_original_tokens(
+                    req, beam_width, first_gen_tokens)
                 logger.info(
                     "disagg generation first tokens appended: "
                     f"request_id={req.py_request_id} "
@@ -3599,6 +3601,42 @@ class PyExecutor:
             "tail": tokens[-max_tokens:],
         } for beam in range(beam_width)
                 for tokens in [list(req.get_tokens(beam))]]
+
+    def _assert_disagg_beam_original_tokens(self, req, beam_width,
+                                            first_gen_tokens):
+        """Check that beam-history storage contains the transferred tokens."""
+        if beam_width <= 1:
+            return
+
+        seq_slot = req.py_seq_slot
+        assert seq_slot is not None, (
+            f"Cannot check original_tokens for request {req.py_request_id}: "
+            "seq slot is not assigned.")
+
+        sampler_store = getattr(self.sampler, 'store', None)
+        beam_search_store = getattr(sampler_store, 'beam_search_store', None)
+        assert beam_search_store is not None, (
+            f"Cannot check original_tokens for request {req.py_request_id}: "
+            "sampler has no beam search store.")
+
+        original_tokens = beam_search_store.original_tokens
+        original_first_tokens = original_tokens[
+            seq_slot, :beam_width, req.prompt_len].detach().cpu().tolist()
+        expected_first_tokens = list(first_gen_tokens[:beam_width])
+        logger.info(
+            "disagg generation original_tokens check: "
+            f"request_id={req.py_request_id} seq_slot={seq_slot} "
+            f"prompt_len={req.prompt_len} "
+            f"first_gen_tokens={expected_first_tokens} "
+            f"original_tokens_at_prompt_len={original_first_tokens}")
+        assert original_first_tokens == expected_first_tokens, (
+            "Disaggregated beam first_gen_tokens were appended to the "
+            "request, but beam_search_store.original_tokens was not seeded "
+            "for beam-history reconstruction: "
+            f"request_id={req.py_request_id}, seq_slot={seq_slot}, "
+            f"prompt_len={req.prompt_len}, "
+            f"expected={expected_first_tokens}, actual={original_first_tokens}"
+        )
 
     def _seed_disagg_beam_cum_log_probs(self, req, beam_width):
         """Seed gen-side beam scores from context-side first-token scores."""
