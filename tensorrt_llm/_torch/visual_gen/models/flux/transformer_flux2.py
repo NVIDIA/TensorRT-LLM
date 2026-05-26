@@ -32,6 +32,10 @@ from tensorrt_llm._torch.visual_gen.models.flux.attention import (
     Flux2ParallelSelfAttention,
     FluxJointAttention,
 )
+from tensorrt_llm._torch.visual_gen.models.flux.joint_proj import (
+    FluxJointAttnMLPProj,
+    FluxJointQKVMLPProj,
+)
 from tensorrt_llm._torch.visual_gen.models.flux.pos_embed_flux import FluxPosEmbed
 from tensorrt_llm._torch.visual_gen.models.flux.transformer_flux import (
     AdaLayerNormContinuous,
@@ -248,7 +252,7 @@ class Flux2TransformerBlock(nn.Module):
             dtype=dtype,
             config=config,
             layer_idx=layer_idx,
-            reduce_output=False,
+            reduce_output=(config.mapping.tp_size != 1),
         )
         # FFN for text stream
         self.ff_context = GatedMLP(
@@ -258,7 +262,7 @@ class Flux2TransformerBlock(nn.Module):
             dtype=dtype,
             config=config,
             layer_idx=layer_idx,
-            reduce_output=False,
+            reduce_output=(config.mapping.tp_size != 1),
         )
 
     def forward(
@@ -808,10 +812,26 @@ class Flux2Transformer2DModel(nn.Module):
 
         loader = DynamicLinearWeightLoader(self.model_config, params_map=params_map)
 
+        # Track prefixes of wrapper projectors whose sub-Linears are loaded
+        # by the parent's load_weights — the generic Linear loader must skip
+        # them (their FUSED weight modes would look for nonexistent checkpoint
+        # keys via params_map and error).
+        managed_prefixes = set()
+
         for name, module in tqdm(self.named_modules(), desc="Loading FLUX.2 weights"):
+            # Skip sub-modules of wrapper projectors (loaded by parent above)
+            if any(name.startswith(p) for p in managed_prefixes):
+                continue
+
             # Create weights for modules with skip_create_weights_in_init=True
             if callable(getattr(module, "create_weights", None)):
                 module.create_weights()
+
+            if isinstance(module, (FluxJointAttnMLPProj, FluxJointQKVMLPProj)):
+                managed_prefixes.add(name + ".")
+                module_weights = loader.filter_weights(name, weights)
+                module.load_weights(module_weights, loader)
+                continue
 
             if len(module._parameters) == 0:
                 continue

@@ -26,13 +26,13 @@ from tqdm import tqdm
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from tensorrt_llm._torch.distributed.ops import AllReduce
 from tensorrt_llm._torch.modules.layer_norm import LayerNorm
 from tensorrt_llm._torch.modules.linear import Linear, TensorParallelMode
 from tensorrt_llm._torch.modules.mlp import MLP
 from tensorrt_llm._torch.utils import maybe_compile
 from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
 from tensorrt_llm._torch.visual_gen.models.flux.attention import FluxJointAttention
+from tensorrt_llm._torch.visual_gen.models.flux.joint_proj import FluxJointAttnMLPProj
 from tensorrt_llm._torch.visual_gen.models.flux.pos_embed_flux import FluxPosEmbed
 from tensorrt_llm._torch.visual_gen.modules.rms_norm import RMSNorm
 from tensorrt_llm._torch.visual_gen.quantization.loader import DynamicLinearWeightLoader
@@ -405,108 +405,6 @@ class FluxTransformerBlock(nn.Module):
             encoder_hidden_states = encoder_hidden_states.clip(-65504, 65504)
 
         return encoder_hidden_states, hidden_states
-
-
-class FluxJointAttnMLPProj(nn.Module):
-    """Output projection that accepts split attn + mlp inputs.
-
-    At TP=1, equivalent to a single Linear over cat([attn, mlp]).
-    At TP>1, splits into two ROW-parallel Linears (one per input) so the
-    preceding attention and MLP branches can stay sharded — avoiding an
-    allgather before the projection.  Bias is added after the allreduce.
-
-    Named ``proj_out`` on the parent block so that ``filter_weights`` finds
-    the checkpoint keys ``proj_out.weight`` / ``proj_out.bias`` automatically.
-    """
-
-    def __init__(
-        self,
-        attn_dim: int,
-        mlp_dim: int,
-        out_dim: int,
-        bias: bool = True,
-        dtype: torch.dtype = None,
-        quant_config=None,
-        skip_create_weights_in_init: bool = False,
-        force_dynamic_quantization: bool = False,
-        config: Optional[DiffusionModelConfig] = None,
-    ):
-        super().__init__()
-        mapping = config.mapping
-        tp_size = mapping.tp_size
-        self.tp_size = tp_size
-        self.attn_dim = attn_dim
-        self.has_bias = bias
-
-        if tp_size <= 1:
-            self.proj = Linear(
-                attn_dim + mlp_dim,
-                out_dim,
-                bias=bias,
-                dtype=dtype,
-                quant_config=quant_config,
-                skip_create_weights_in_init=skip_create_weights_in_init,
-                force_dynamic_quantization=force_dynamic_quantization,
-                reduce_output=False,
-            )
-        else:
-            self.attn_proj = Linear(
-                attn_dim,
-                out_dim,
-                bias=False,
-                dtype=dtype,
-                quant_config=quant_config,
-                skip_create_weights_in_init=skip_create_weights_in_init,
-                force_dynamic_quantization=force_dynamic_quantization,
-                mapping=mapping,
-                tensor_parallel_mode=TensorParallelMode.ROW,
-                reduce_output=False,
-            )
-            self.mlp_proj = Linear(
-                mlp_dim,
-                out_dim,
-                bias=False,
-                dtype=dtype,
-                quant_config=quant_config,
-                skip_create_weights_in_init=skip_create_weights_in_init,
-                force_dynamic_quantization=force_dynamic_quantization,
-                mapping=mapping,
-                tensor_parallel_mode=TensorParallelMode.ROW,
-                reduce_output=False,
-            )
-            self.allreduce = AllReduce(mapping, strategy=config.allreduce_strategy)
-            if bias:
-                self.bias = nn.Parameter(torch.zeros(out_dim, dtype=dtype))
-
-    def forward(self, attn_out: torch.Tensor, mlp_out: torch.Tensor) -> torch.Tensor:
-        if self.tp_size <= 1:
-            return self.proj(torch.cat([attn_out, mlp_out], dim=-1))
-        out = self.allreduce(self.attn_proj(attn_out) + self.mlp_proj(mlp_out))
-        if self.has_bias:
-            out = out + self.bias
-        return out
-
-    def load_weights(self, weight_dict: Dict[str, torch.Tensor], loader: DynamicLinearWeightLoader):
-        """Load from checkpoint proj_out.weight / proj_out.bias.
-
-        At TP=1, passes through to the inner Linear.
-        At TP>1, splits the weight along the input dim (columns) into
-        attn and mlp portions, then loads each as a vanilla ROW Linear.
-        """
-        if self.tp_size <= 1:
-            loader.load_linear_weights(self.proj, "proj_out", [weight_dict])
-        else:
-            W = weight_dict["weight"]  # [out_dim, attn_dim + mlp_dim]
-            W_attn = W[:, : self.attn_dim]
-            W_mlp = W[:, self.attn_dim :]
-
-            for sub_module, sub_weight in [(self.attn_proj, W_attn), (self.mlp_proj, W_mlp)]:
-                if callable(getattr(sub_module, "create_weights", None)):
-                    sub_module.create_weights()
-                loader.load_linear_weights(sub_module, "proj_out", [{"weight": sub_weight}])
-
-            if self.has_bias and "bias" in weight_dict:
-                self.bias.data.copy_(weight_dict["bias"].to(self.bias.dtype))
 
 
 class FluxSingleTransformerBlock(nn.Module):
