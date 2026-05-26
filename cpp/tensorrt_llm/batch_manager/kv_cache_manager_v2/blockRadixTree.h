@@ -19,13 +19,13 @@
 
 #include "kv_cache_manager_v2/common.h"
 #include "kv_cache_manager_v2/lifeCycleRegistry.h"
+#include "kv_cache_manager_v2/utils/sharedPtr.h"
 
 #include "blake3.h"
 
 #include <array>
 #include <cstdint>
 #include <iterator>
-#include <memory>
 #include <optional>
 #include <unordered_map>
 #include <vector>
@@ -112,14 +112,14 @@ struct NodeBase
     };
 
     BlockKey key;
-    std::unordered_map<BlockKey, std::shared_ptr<Block>> next;
+    std::unordered_map<BlockKey, SharedPtr<Block>> next;
 
     virtual ~NodeBase();
 
     virtual Type type() const noexcept = 0;
     virtual BlockOrdinal ordinal() const noexcept = 0;
 
-    std::shared_ptr<Block> detachNext(BlockKey const& key);
+    SharedPtr<Block> detachNext(BlockKey const& key);
 
     /// RootBlock: delegates to tree. Block: len(prev->tokens) or prev->tokensPerBlock().
     virtual int tokensPerBlock() const noexcept = 0;
@@ -163,7 +163,7 @@ struct RootBlock : NodeBase
 // storage[lifeCycleId] = raw observer pointer to CommittedPage (null if not cached).
 // Mirrors Python's Block.
 // ---------------------------------------------------------------------------
-struct Block : NodeBase, std::enable_shared_from_this<Block>
+struct Block : NodeBase, EnableSharedFromThis<Block>
 {
     std::vector<TokenIdExt> tokens;
 
@@ -212,7 +212,7 @@ struct Block : NodeBase, std::enable_shared_from_this<Block>
 
     // Clear stale tree nodes after a lifecycle page has been unlinked.
     // Returns detached blocks that must stay alive until cleanup completes.
-    static std::vector<std::shared_ptr<Block>> clearStaleBlocksAfterPageUnlink(
+    static std::vector<SharedPtr<Block>> clearStaleBlocksAfterPageUnlink(
         Block& block, LifeCycleId lcIdx, LifeCycle const& lc);
 
 private:
@@ -267,7 +267,7 @@ public:
     }
 
     // Read-only access to the root map (used by nanobind introspection).
-    std::unordered_map<BlockKey, std::shared_ptr<RootBlock>> const& roots() const noexcept
+    std::unordered_map<BlockKey, SharedPtr<RootBlock>> const& roots() const noexcept
     {
         return mRoots;
     }
@@ -291,7 +291,7 @@ private:
     LifeCycleRegistry const& mLifeCycles;
     int mTokensPerBlock;
 
-    std::unordered_map<BlockKey, std::shared_ptr<RootBlock>> mRoots;
+    std::unordered_map<BlockKey, SharedPtr<RootBlock>> mRoots;
     mutable std::vector<BlockKey> mPendingRootErases;
 };
 
@@ -304,11 +304,11 @@ private:
 // prefix of an existing sibling — mirrors Python's UselessBlockError.
 // If isNew is non-null, *isNew is set to true if a new block was created, false
 // if an existing block was returned.
-std::shared_ptr<Block> addOrGetExistingBlock(
+SharedPtr<Block> addOrGetExistingBlock(
     NodeBase* prev, int numLifeCycles, std::vector<TokenIdExt> tokens, bool* isNew = nullptr);
 
 // Post-order traversal: remove a subtree rooted at `root` from its parent's
 // next map. ~Block() handles page cleanup. Mirrors Python's remove_subtree().
-std::shared_ptr<Block> removeSubtree(Block& root);
+SharedPtr<Block> removeSubtree(Block& root);
 
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager_v2

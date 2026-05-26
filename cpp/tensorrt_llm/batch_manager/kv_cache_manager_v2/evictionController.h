@@ -20,10 +20,10 @@
 #include "kv_cache_manager_v2/common.h"
 #include "kv_cache_manager_v2/exceptions.h"
 #include "kv_cache_manager_v2/storage/config.h"
+#include "kv_cache_manager_v2/utils/sharedPtr.h"
 
 #include <list>
 #include <map>
-#include <memory>
 #include <optional>
 #include <vector>
 
@@ -44,7 +44,7 @@ class Page;
 // IMPORTANT: A NodeRef is always tied to the specific list that issued it.
 // Never mix NodeRefs from different LRUEvictionPolicy instances.
 // ---------------------------------------------------------------------------
-using EvictionList = std::list<std::shared_ptr<Page>>;
+using EvictionList = std::list<SharedPtr<Page>>;
 using NodeRef = EvictionList::iterator;
 
 // ---------------------------------------------------------------------------
@@ -58,13 +58,13 @@ public:
     // Push a page into the eviction queue.
     // evictFirst=true puts it at the front (will be evicted first).
     // Returns a stable iterator (NodeRef) for later O(1) removal.
-    NodeRef push(std::shared_ptr<Page> page, bool evictFirst = false);
+    NodeRef push(SharedPtr<Page> page, bool evictFirst = false);
 
     // Remove and return the front (least-recently-used) page.
-    std::shared_ptr<Page> pop();
+    SharedPtr<Page> pop();
 
     // Remove an arbitrary page via its iterator. O(1).
-    std::shared_ptr<Page> remove(NodeRef node);
+    SharedPtr<Page> remove(NodeRef node);
 
     size_t size() const noexcept
     {
@@ -98,9 +98,9 @@ private:
 class PrioritizedEvictionPolicy
 {
 public:
-    NodeRef push(std::shared_ptr<Page> page, bool evictFirst = false);
-    std::shared_ptr<Page> pop();
-    std::shared_ptr<Page> remove(NodeRef node);
+    NodeRef push(SharedPtr<Page> page, bool evictFirst = false);
+    SharedPtr<Page> pop();
+    SharedPtr<Page> remove(NodeRef node);
 
     size_t size() const noexcept;
 
@@ -123,7 +123,7 @@ public:
             ++mapIt;
         if (mapIt != mapEnd)
             listIt = mapIt->second.cbegin();
-        return [=]() mutable -> std::shared_ptr<Page> const*
+        return [=]() mutable -> SharedPtr<Page> const*
         {
             if (mapIt == mapEnd)
                 return nullptr;
@@ -167,7 +167,7 @@ public:
     // Evict at least minNumPages[pgIdx] pages per pool group.
     // Returns evicted pages per pool group.
     // On failure, re-queues any already-evicted pages and throws OutOfPagesError.
-    std::vector<std::vector<std::shared_ptr<Page>>> evict(std::vector<int> const& minNumPages);
+    std::vector<std::vector<SharedPtr<Page>>> evict(std::vector<int> const& minNumPages);
 
     // Remove a page from the queue by its NodeRef.
     void remove(NodeRef node);

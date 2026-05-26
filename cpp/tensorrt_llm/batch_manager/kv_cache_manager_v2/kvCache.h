@@ -47,7 +47,7 @@ struct ScratchDesc;
 // ---------------------------------------------------------------------------
 using BlockPage = std::variant<std::monostate, // nullptr
     SharedPageLock,                            // locked
-    std::shared_ptr<PageHolder>                // held
+    SharedPtr<PageHolder>                      // held
     >;
 
 inline bool blockPageIsNull(BlockPage const& bp) noexcept
@@ -55,12 +55,12 @@ inline bool blockPageIsNull(BlockPage const& bp) noexcept
     return std::holds_alternative<std::monostate>(bp);
 }
 
-inline std::shared_ptr<Page> const& blockPageGetPage(BlockPage const& bp) noexcept
+inline SharedPtr<Page> const& blockPageGetPage(BlockPage const& bp) noexcept
 {
-    static const std::shared_ptr<Page> sNull{};
+    static SharedPtr<Page> const sNull{};
     if (auto* lock = std::get_if<SharedPageLock>(&bp))
         return lock->isValid() ? lock->page() : sNull;
-    if (auto* holder = std::get_if<std::shared_ptr<PageHolder>>(&bp))
+    if (auto* holder = std::get_if<SharedPtr<PageHolder>>(&bp))
         return holder->get() ? (*holder)->page : sNull;
     return sNull;
 }
@@ -74,7 +74,7 @@ struct SeqBlock
 {
     // [beamIdx][lcId]
     std::vector<std::vector<BlockPage>> pages;
-    std::shared_ptr<Block> treeBlock; // non-null iff committed
+    SharedPtr<Block> treeBlock; // non-null iff committed
 
     bool isCommitted() const noexcept
     {
@@ -90,7 +90,7 @@ struct SeqBlock
                         if (!blockPageIsNull(bp))
                         {
                             auto pg = blockPageGetPage(bp);
-                            assert(!pg || std::dynamic_pointer_cast<CommittedPage>(pg));
+                            assert(!pg || dynamicPointerCast<CommittedPage>(pg));
                         }
             }
             else
@@ -101,7 +101,7 @@ struct SeqBlock
                         if (!blockPageIsNull(bp))
                         {
                             auto pg = blockPageGetPage(bp);
-                            assert(!pg || std::dynamic_pointer_cast<UncommittedPage>(pg));
+                            assert(!pg || dynamicPointerCast<UncommittedPage>(pg));
                         }
             }
         }
@@ -390,7 +390,7 @@ private:
     void _setupForReuse(std::vector<TokenIdExt> const& inputTokens);
     void _clearBlocks();
     // Snapshot live SSM state to a new page and attach to radix tree block.
-    void _snapshotSsmToTreeBlock(std::shared_ptr<Block> const& treeBlock, LifeCycleId ssmLcId, BeamIndex beamIdx);
+    void _snapshotSsmToTreeBlock(SharedPtr<Block> const& treeBlock, LifeCycleId ssmLcId, BeamIndex beamIdx);
     // Returns [stale_begin, stale_end) block ordinal range for a SWA lifecycle.
     HalfOpenRange _getStaleRange(int historyLength, LifeCycle const& lc) const;
 
@@ -400,7 +400,7 @@ private:
         BlockOrdinal ordinal;
         BeamIndex beamIdx;
         LifeCycleId lcId;
-        std::shared_ptr<PageHolder> holder;
+        SharedPtr<PageHolder> holder;
     };
 
     // Unlock stale SWA blocks. Returns backup holders for rollback.
@@ -443,7 +443,7 @@ private:
 
     struct TakenPage
     {
-        std::shared_ptr<UncommittedPage> page;
+        SharedPtr<UncommittedPage> page;
         bool locked;
     };
 
@@ -454,7 +454,7 @@ private:
 
     // Get and validate the tree block at a committed ordinal.
     // Mirrors Python's _get_tree_block(). Asserts committed pages reference the correct block.
-    std::shared_ptr<Block> const& _getTreeBlock(BlockOrdinal ordinal) const;
+    SharedPtr<Block> const& _getTreeBlock(BlockOrdinal ordinal) const;
 
     // Comprehensive sanity check of KvCache invariants.
     // Mirrors Python's _check_sanity(). Returns true on success (asserts internally).

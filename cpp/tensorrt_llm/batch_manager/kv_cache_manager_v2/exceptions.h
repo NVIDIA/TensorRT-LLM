@@ -17,8 +17,9 @@
 
 #pragma once
 
+#include "kv_cache_manager_v2/utils/sharedPtr.h"
+
 #include <cuda.h>
-#include <memory>
 #include <stdexcept>
 #include <string>
 
@@ -130,9 +131,9 @@ struct Block;
 class UselessBlockError : public std::runtime_error
 {
 public:
-    std::shared_ptr<Block> block;
+    SharedPtr<Block> block;
 
-    explicit UselessBlockError(std::shared_ptr<Block> blk)
+    explicit UselessBlockError(SharedPtr<Block> blk)
         : std::runtime_error("Block is useless — covered by existing sibling")
         , block(std::move(blk))
     {
@@ -144,7 +145,7 @@ public:
 // Mirrors Python's unwrap_rawref(_utils.py:163).
 // ---------------------------------------------------------------------------
 template <typename T>
-std::shared_ptr<T> unwrap(std::weak_ptr<T> const& ref)
+SharedPtr<T> unwrap(WeakPtr<T> const& ref)
 {
     auto ptr = ref.lock();
     if (!ptr)

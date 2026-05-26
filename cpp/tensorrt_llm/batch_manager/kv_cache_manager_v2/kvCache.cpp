@@ -205,7 +205,7 @@ void KvCache::activate()
         {
             bp = &mBlocks[static_cast<size_t>(ap.ordinal)].pages[ap.beamIdx][static_cast<size_t>(ap.lcId)];
         }
-        auto& holder = std::get<std::shared_ptr<PageHolder>>(*bp);
+        auto& holder = std::get<SharedPtr<PageHolder>>(*bp);
         assert(holder);
         targets.push_back({holder->page, ap.beamIdx, ap.ordinal, ap.lcId});
     }
@@ -411,8 +411,8 @@ bool KvCache::resume(std::optional<CUstream> stream)
                 blockOrdinal = static_cast<BlockOrdinal>(lastOrdinal);
             }
 
-            auto newPage = std::make_shared<UncommittedPage>(
-                *this, blockOrdinal, static_cast<LifeCycleId>(lcIdx), kGpuLevel, beamIdx);
+            auto newPage
+                = makeShared<UncommittedPage>(*this, blockOrdinal, static_cast<LifeCycleId>(lcIdx), kGpuLevel, beamIdx);
             newPage->setSlot(newSlot);
             auto newLock
                 = newPage->lock(*this, beamIdx, blockOrdinal, static_cast<LifeCycleId>(lcIdx), /*skipWait=*/true);
@@ -518,7 +518,7 @@ void KvCache::_clearBlocks()
 // Called at ssm_reuse_interval boundaries during commit.
 // ---------------------------------------------------------------------------
 
-void KvCache::_snapshotSsmToTreeBlock(std::shared_ptr<Block> const& treeBlock, LifeCycleId ssmLcId, BeamIndex beamIdx)
+void KvCache::_snapshotSsmToTreeBlock(SharedPtr<Block> const& treeBlock, LifeCycleId ssmLcId, BeamIndex beamIdx)
 {
     auto& storageMgr = mManager->storage();
     auto* ssmLock = std::get_if<SharedPageLock>(&mSsmBlocks[beamIdx][static_cast<size_t>(ssmLcId)]);
@@ -548,7 +548,7 @@ void KvCache::_snapshotSsmToTreeBlock(std::shared_ptr<Block> const& treeBlock, L
         CachedCudaEvent readyEv(reinterpret_cast<CudaStream>(stream));
         assert(mTokensPerBlock * (treeBlock->ordinal() + 1) == static_cast<int>(mCommittedTokens.size()));
 
-        auto tempPage = std::make_shared<UncommittedPage>(*this, treeBlock->ordinal(), ssmLcId, lvl, beamIdx);
+        auto tempPage = makeShared<UncommittedPage>(*this, treeBlock->ordinal(), ssmLcId, lvl, beamIdx);
         tempPage->setSlot(newSlot);
         auto committed = tempPage->convertToCommitted(treeBlock, std::move(readyEv));
 
@@ -777,7 +777,7 @@ bool KvCache::resize(std::optional<int> capacity, std::optional<int> historyLeng
                     }
                     auto slot = std::move(slots[static_cast<size_t>(lc)].back());
                     slots[static_cast<size_t>(lc)].pop_back();
-                    auto page = std::make_shared<UncommittedPage>(
+                    auto page = makeShared<UncommittedPage>(
                         *this, static_cast<BlockOrdinal>(ord), static_cast<LifeCycleId>(lc), kGpuLevel, bi);
                     page->setSlot(slot);
                     sb.pages[bi][static_cast<size_t>(lc)]
@@ -935,7 +935,7 @@ void KvCache::_increaseCapacity(int newNumBlocks, int newHistoryLength)
 
             size_t si = slotCounters[static_cast<size_t>(lc)]++;
             auto& slot = allSlots[static_cast<size_t>(lc)][si];
-            auto page = std::make_shared<UncommittedPage>(
+            auto page = makeShared<UncommittedPage>(
                 *this, static_cast<BlockOrdinal>(ord), static_cast<LifeCycleId>(lc), kGpuLevel, /*bi=*/0);
             page->setSlot(slot);
             sb.pages[0][static_cast<size_t>(lc)]
@@ -1057,14 +1057,14 @@ std::vector<KvCache::TakenPage> KvCache::_takeUncommittedPage(
         auto& bp = sb.pages[beamIdx][lc];
         if (auto* lock = std::get_if<SharedPageLock>(&bp))
         {
-            auto up = std::dynamic_pointer_cast<UncommittedPage>(lock->page());
+            auto up = dynamicPointerCast<UncommittedPage>(lock->page());
             assert(up && "page must be UncommittedPage");
             result[lc] = {up, true};
         }
-        else if (auto* holder = std::get_if<std::shared_ptr<PageHolder>>(&bp))
+        else if (auto* holder = std::get_if<SharedPtr<PageHolder>>(&bp))
         {
             assert(*holder);
-            auto up = std::dynamic_pointer_cast<UncommittedPage>((*holder)->page);
+            auto up = dynamicPointerCast<UncommittedPage>((*holder)->page);
             assert(up && "page must be UncommittedPage");
             result[lc] = {up, false};
         }
@@ -1116,7 +1116,7 @@ void KvCache::_commitBlock(int ord, bool isLast)
     // Mirrors Python's try/except UselessBlockError pattern.
     // TODO: Replace with if-condition once Python is removed and C++ is the primary codebase.
     bool blockIsNew = false;
-    std::shared_ptr<Block> newBlock;
+    SharedPtr<Block> newBlock;
     try
     {
         newBlock = addOrGetExistingBlock(prevNode, numLc, tokenBlock, &blockIsNew);
@@ -1187,7 +1187,7 @@ void KvCache::_commitBlock(int ord, bool isLast)
                 // Existing page gone — put our uncommitted page into the tree block.
                 if (auto* lock = std::get_if<SharedPageLock>(&bp))
                 {
-                    auto up = std::dynamic_pointer_cast<UncommittedPage>(lock->page());
+                    auto up = dynamicPointerCast<UncommittedPage>(lock->page());
                     if (up)
                     {
                         bp = std::monostate{};
@@ -1197,11 +1197,11 @@ void KvCache::_commitBlock(int ord, bool isLast)
                                       : BlockPage{committed->hold()};
                     }
                 }
-                else if (auto* holder = std::get_if<std::shared_ptr<PageHolder>>(&bp))
+                else if (auto* holder = std::get_if<SharedPtr<PageHolder>>(&bp))
                 {
                     if (*holder)
                     {
-                        auto up = std::dynamic_pointer_cast<UncommittedPage>((*holder)->page);
+                        auto up = dynamicPointerCast<UncommittedPage>((*holder)->page);
                         if (up)
                         {
                             bp = std::monostate{};
@@ -1219,7 +1219,7 @@ void KvCache::_commitBlock(int ord, bool isLast)
                     auto holder = blockPageGetPage(bp)->hold();
                     bp = std::move(holder);
                 }
-                reuseTasks.push_back({existingPage->shared_from_this(), static_cast<BeamIndex>(0),
+                reuseTasks.push_back({existingPage->sharedFromThis(), static_cast<BeamIndex>(0),
                     static_cast<BlockOrdinal>(ord), static_cast<LifeCycleId>(lc)});
             }
         }
@@ -1364,7 +1364,7 @@ void KvCache::_onStopCommitting()
                     assert(mEnableSwaScratchReuse);
                     continue; // Scratch block — already handled
                 }
-                assert(gNdebug || std::holds_alternative<std::shared_ptr<PageHolder>>(bp));
+                assert(gNdebug || std::holds_alternative<SharedPtr<PageHolder>>(bp));
                 bp = std::monostate{};
             }
         }
@@ -1394,7 +1394,7 @@ void KvCache::_setupForReuse(std::vector<TokenIdExt> const& inputTokens)
     for (size_t i = 0; i < matched.size(); ++i)
     {
         SeqBlock sb;
-        sb.treeBlock = matched[i]->shared_from_this();
+        sb.treeBlock = matched[i]->sharedFromThis();
         sb.pages.resize(1);
         sb.pages[0].resize(static_cast<size_t>(numLc));
         mBlocks.push_back(std::move(sb));
@@ -1451,7 +1451,7 @@ void KvCache::_setupForReuse(std::vector<TokenIdExt> const& inputTokens)
 // Mirrors Python's _get_tree_block().
 // ---------------------------------------------------------------------------
 
-std::shared_ptr<Block> const& KvCache::_getTreeBlock(BlockOrdinal ordinal) const
+SharedPtr<Block> const& KvCache::_getTreeBlock(BlockOrdinal ordinal) const
 {
     assert(mBlocks[static_cast<size_t>(ordinal)].isCommitted());
     auto const& ret = mBlocks[static_cast<size_t>(ordinal)].treeBlock;
@@ -1469,7 +1469,7 @@ std::shared_ptr<Block> const& KvCache::_getTreeBlock(BlockOrdinal ordinal) const
             else if (!blockPageIsNull(beamBlock[lc]))
             {
                 auto page = blockPageGetPage(beamBlock[lc]);
-                auto committed = std::dynamic_pointer_cast<CommittedPage>(page);
+                auto committed = dynamicPointerCast<CommittedPage>(page);
                 assert(committed && committed->block == ret.get());
             }
         }
@@ -1543,7 +1543,7 @@ bool KvCache::_checkSanity() const
                     {
                         // For the decoder-side disagg case, for the first step, we will skip the
                         // out-of-window blocks.
-                        assert(std::holds_alternative<std::shared_ptr<PageHolder>>(bp)
+                        assert(std::holds_alternative<SharedPtr<PageHolder>>(bp)
                             || (blockPageIsNull(bp) && mCommittedTokens.empty()));
                     }
                 }
@@ -1552,13 +1552,13 @@ bool KvCache::_checkSanity() const
                     if (mStatus == Status::ACTIVE)
                         assert(std::holds_alternative<SharedPageLock>(bp));
                     else
-                        assert(std::holds_alternative<std::shared_ptr<PageHolder>>(bp));
+                        assert(std::holds_alternative<SharedPtr<PageHolder>>(bp));
                 }
 
                 if (!blockPageIsNull(bp))
                 {
                     auto page = blockPageGetPage(bp);
-                    assert(isCommitted == (std::dynamic_pointer_cast<CommittedPage>(page) != nullptr));
+                    assert(isCommitted == (dynamicPointerCast<CommittedPage>(page) != nullptr));
                 }
             }
         }
@@ -1575,15 +1575,15 @@ bool KvCache::_checkSanity() const
                 if (mNeverResumed)
                 {
                     // Deferred copy: SSM holds CommittedPage from matched snapshot.
-                    assert(std::holds_alternative<std::shared_ptr<PageHolder>>(bp));
+                    assert(std::holds_alternative<SharedPtr<PageHolder>>(bp));
                     auto page = blockPageGetPage(bp);
-                    assert(std::dynamic_pointer_cast<CommittedPage>(page) != nullptr);
+                    assert(dynamicPointerCast<CommittedPage>(page) != nullptr);
                 }
                 else
                 {
                     assert(std::holds_alternative<SharedPageLock>(bp));
                     auto page = blockPageGetPage(bp);
-                    assert(std::dynamic_pointer_cast<UncommittedPage>(page) != nullptr);
+                    assert(dynamicPointerCast<UncommittedPage>(page) != nullptr);
                 }
             }
         }

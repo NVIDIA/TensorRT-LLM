@@ -135,9 +135,9 @@ public:
 
     // Dynamic cache level resizing.
     void adjustCacheLevel(CacheLevel level, std::optional<size_t> newQuota, std::vector<float> const& ratioList,
-        std::vector<std::vector<std::shared_ptr<Page>>> const* persistentPages);
-    void shrinkPoolGroup(CacheLevel level, PoolGroupIndex pgIdx, int newNumSlots,
-        std::vector<std::shared_ptr<Page>> const& persistentPages);
+        std::vector<std::vector<SharedPtr<Page>>> const* persistentPages);
+    void shrinkPoolGroup(
+        CacheLevel level, PoolGroupIndex pgIdx, int newNumSlots, std::vector<SharedPtr<Page>> const& persistentPages);
     void expandPoolGroup(CacheLevel level, PoolGroupIndex pgIdx, int newNumSlots);
 
     // ---- Migration ---------------------------------------------------------
@@ -246,12 +246,12 @@ private:
     int mNumPools(PoolGroupIndex pgIdx) const;
 
     // Internal helpers.
-    void _prepareFreeSlots(std::vector<std::vector<int>>& goals,       // [level][pgIdx]
+    void _prepareFreeSlots(std::vector<std::vector<int>>& goals, // [level][pgIdx]
         CacheLevel lvlId,
-        std::vector<std::vector<std::shared_ptr<Page>>>& fallenPages); // [pgIdx]
+        std::vector<std::vector<SharedPtr<Page>>>& fallenPages); // [pgIdx]
 
     void _batchedMigrate(PoolGroupIndex pgIdx, CacheLevel dstLevel, CacheLevel srcLevel,
-        std::vector<std::shared_ptr<Page>> const& srcPages, bool updateSrc, bool defrag = false);
+        std::vector<SharedPtr<Page>> const& srcPages, bool updateSrc, bool defrag = false);
 
     PoolGroupBase& poolGroup(CacheLevel lvl, PoolGroupIndex pgIdx);
 

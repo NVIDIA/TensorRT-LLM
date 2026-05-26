@@ -337,7 +337,7 @@ void StorageManager::prepareFreeSlots(CacheLevel level, std::vector<int> const& 
     for (int pg = 0; pg < numPoolGroups(); ++pg)
         goals.at(static_cast<size_t>(level)).at(static_cast<size_t>(pg)) = requirements.at(static_cast<size_t>(pg));
 
-    std::vector<std::vector<std::shared_ptr<Page>>> fallenPages(static_cast<size_t>(numPoolGroups()));
+    std::vector<std::vector<SharedPtr<Page>>> fallenPages(static_cast<size_t>(numPoolGroups()));
     _prepareFreeSlots(goals, level, fallenPages);
 }
 
@@ -362,7 +362,7 @@ void StorageManager::forceEvict(CacheLevel level, std::vector<int> const& minNum
         static_cast<size_t>(numCacheLevels()), std::vector<int>(static_cast<size_t>(numPoolGroups()), 0));
     CacheLevel nextLvl = static_cast<CacheLevel>(level + 1);
 
-    std::vector<std::vector<std::shared_ptr<Page>>> fallen(static_cast<size_t>(numPoolGroups()));
+    std::vector<std::vector<SharedPtr<Page>>> fallen(static_cast<size_t>(numPoolGroups()));
     for (int pg = 0; pg < numPoolGroups(); ++pg)
     {
         for (auto& sp : evicted.at(static_cast<size_t>(pg)))
@@ -375,8 +375,8 @@ void StorageManager::forceEvict(CacheLevel level, std::vector<int> const& minNum
 // _prepareFreeSlots (recursive)
 // ---------------------------------------------------------------------------
 
-void StorageManager::_prepareFreeSlots(std::vector<std::vector<int>>& goals, CacheLevel lvlId,
-    std::vector<std::vector<std::shared_ptr<Page>>>& fallenPages)
+void StorageManager::_prepareFreeSlots(
+    std::vector<std::vector<int>>& goals, CacheLevel lvlId, std::vector<std::vector<SharedPtr<Page>>>& fallenPages)
 {
     // A7: goals dimensions must match [numCacheLevels][numPoolGroups].
     if (!gNdebug)
@@ -406,7 +406,7 @@ void StorageManager::_prepareFreeSlots(std::vector<std::vector<int>>& goals, Cac
     bool isLast = isLastLevel(lvlId);
 
     std::vector<int> numToEvict(static_cast<size_t>(numPoolGroups()), 0);
-    std::vector<std::vector<std::shared_ptr<Page>>> heldPages(static_cast<size_t>(numPoolGroups()));
+    std::vector<std::vector<SharedPtr<Page>>> heldPages(static_cast<size_t>(numPoolGroups()));
 
     for (int pg = 0; pg < numPoolGroups(); ++pg)
     {
@@ -422,7 +422,7 @@ void StorageManager::_prepareFreeSlots(std::vector<std::vector<int>>& goals, Cac
             // Separate held pages from fallen_pages (mirrors Python's remove_if).
             auto& fp = fallenPages.at(static_cast<size_t>(pg));
             heldPages.at(static_cast<size_t>(pg))
-                = stealIf(fp, [](std::shared_ptr<Page> const& p) { return p->status() == PageStatus::HELD; });
+                = stealIf(fp, [](SharedPtr<Page> const& p) { return p->status() == PageStatus::HELD; });
             fallenHeld = static_cast<int>(heldPages.at(static_cast<size_t>(pg)).size());
 
             if (fallenHeld > oldFree + evictable)
@@ -436,7 +436,7 @@ void StorageManager::_prepareFreeSlots(std::vector<std::vector<int>>& goals, Cac
     }
 
     auto evicted = ctrl.evict(numToEvict);
-    std::vector<std::vector<std::shared_ptr<Page>>> acceptedPages(static_cast<size_t>(numPoolGroups()));
+    std::vector<std::vector<SharedPtr<Page>>> acceptedPages(static_cast<size_t>(numPoolGroups()));
 
     if (isLast)
     {
@@ -527,7 +527,7 @@ void StorageManager::_prepareFreeSlots(std::vector<std::vector<int>>& goals, Cac
     {
         // Group by source level (mirrors Python's partition()).
         auto bySrcLevel = partition(
-            acceptedPages.at(static_cast<size_t>(pg)), [](std::shared_ptr<Page> const& p) { return p->cacheLevel; });
+            acceptedPages.at(static_cast<size_t>(pg)), [](SharedPtr<Page> const& p) { return p->cacheLevel; });
 
         for (auto& [srcLvl, pages] : bySrcLevel)
         {
@@ -547,7 +547,7 @@ void StorageManager::_prepareFreeSlots(std::vector<std::vector<int>>& goals, Cac
 // ---------------------------------------------------------------------------
 
 void StorageManager::_batchedMigrate(PoolGroupIndex pgIdx, CacheLevel dstLevel, CacheLevel srcLevel,
-    std::vector<std::shared_ptr<Page>> const& srcPages, bool updateSrc, bool defrag)
+    std::vector<SharedPtr<Page>> const& srcPages, bool updateSrc, bool defrag)
 {
     assert(defrag || dstLevel != srcLevel);
     int numSlots = static_cast<int>(srcPages.size());
@@ -647,7 +647,7 @@ void StorageManager::_batchedMigrate(PoolGroupIndex pgIdx, CacheLevel dstLevel, 
 void StorageManager::batchedMigrateToGpu(std::vector<BatchedLockTarget> const& targets, KvCache& /*kvCache*/)
 {
     // Group by (srcLevel, pgIdx).
-    std::map<std::pair<CacheLevel, PoolGroupIndex>, std::vector<std::shared_ptr<Page>>> groups;
+    std::map<std::pair<CacheLevel, PoolGroupIndex>, std::vector<SharedPtr<Page>>> groups;
     for (auto const& t : targets)
     {
         if (t.page->cacheLevel == kGpuLevel)
@@ -783,7 +783,7 @@ void StorageManager::expandPoolGroup(CacheLevel level, PoolGroupIndex pgIdx, int
 // ---------------------------------------------------------------------------
 
 void StorageManager::shrinkPoolGroup(
-    CacheLevel level, PoolGroupIndex pgIdx, int newNumSlots, std::vector<std::shared_ptr<Page>> const& persistentPages)
+    CacheLevel level, PoolGroupIndex pgIdx, int newNumSlots, std::vector<SharedPtr<Page>> const& persistentPages)
 {
     auto& pg = poolGroup(level, pgIdx);
     auto& allocator = pg.slotAllocator();
@@ -804,7 +804,7 @@ void StorageManager::shrinkPoolGroup(
 
     // Find overflow pages: scheduled pages with slot_id >= newNumSlots.
     auto gen = ctrl.pageGenerator(pgIdx);
-    std::deque<std::pair<int, std::shared_ptr<Page>>> overflowSlots;
+    std::deque<std::pair<int, SharedPtr<Page>>> overflowSlots;
     {
         int idx = 0;
         while (auto const* page = gen())
@@ -816,7 +816,7 @@ void StorageManager::shrinkPoolGroup(
     }
 
     // Persistent pages in overflow range.
-    std::vector<std::shared_ptr<Page>> overflowPersistent;
+    std::vector<SharedPtr<Page>> overflowPersistent;
     for (auto const& p : persistentPages)
     {
         if (p->slotId() >= newNumSlots)
@@ -853,7 +853,7 @@ void StorageManager::shrinkPoolGroup(
     forceEvict(level, evictReqs);
 
     // Remaining overflow pages to defragment.
-    std::vector<std::shared_ptr<Page>> overflowPages;
+    std::vector<SharedPtr<Page>> overflowPages;
     overflowPages.reserve(overflowSlots.size() + overflowPersistent.size());
     for (auto& [idx, p] : overflowSlots)
         overflowPages.push_back(p);
@@ -891,7 +891,7 @@ void StorageManager::shrinkPoolGroup(
 // ---------------------------------------------------------------------------
 
 void StorageManager::adjustCacheLevel(CacheLevel level, std::optional<size_t> newQuota,
-    std::vector<float> const& ratioList, std::vector<std::vector<std::shared_ptr<Page>>> const* persistentPages)
+    std::vector<float> const& ratioList, std::vector<std::vector<SharedPtr<Page>>> const* persistentPages)
 {
     auto& lvlStorage = *mLevels.at(static_cast<size_t>(level)).storage;
     auto oldNumSlots = lvlStorage.slotCountList();
@@ -914,7 +914,7 @@ void StorageManager::adjustCacheLevel(CacheLevel level, std::optional<size_t> ne
     {
         if (newNumSlots[pg] >= oldNumSlots[pg])
             continue;
-        std::vector<std::shared_ptr<Page>> pages;
+        std::vector<SharedPtr<Page>> pages;
         if (persistentPages)
             pages = (*persistentPages)[pg];
         shrinkPoolGroup(level, static_cast<PoolGroupIndex>(pg), newNumSlots[pg], pages);

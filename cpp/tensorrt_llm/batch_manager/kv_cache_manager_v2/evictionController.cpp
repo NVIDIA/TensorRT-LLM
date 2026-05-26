@@ -32,7 +32,7 @@ namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
 // LRUEvictionPolicy
 // ---------------------------------------------------------------------------
 
-NodeRef LRUEvictionPolicy::push(std::shared_ptr<Page> page, bool evictFirst)
+NodeRef LRUEvictionPolicy::push(SharedPtr<Page> page, bool evictFirst)
 {
     assert(!page->nodeRef.has_value() && "page must not already be scheduled for eviction");
     if (evictFirst)
@@ -49,7 +49,7 @@ NodeRef LRUEvictionPolicy::push(std::shared_ptr<Page> page, bool evictFirst)
     }
 }
 
-std::shared_ptr<Page> LRUEvictionPolicy::pop()
+SharedPtr<Page> LRUEvictionPolicy::pop()
 {
     assert(!mQueue.empty());
     auto page = mQueue.front();
@@ -57,7 +57,7 @@ std::shared_ptr<Page> LRUEvictionPolicy::pop()
     return page;
 }
 
-std::shared_ptr<Page> LRUEvictionPolicy::remove(NodeRef node)
+SharedPtr<Page> LRUEvictionPolicy::remove(NodeRef node)
 {
     auto page = *node;
     assert(page->nodeRef.has_value() && page->nodeRef.value() == node && "node's page must reference this node");
@@ -74,14 +74,14 @@ LRUEvictionPolicy& PrioritizedEvictionPolicy::getOrCreate(Priority p)
     return mPolicies[p]; // std::map default-constructs if not present
 }
 
-NodeRef PrioritizedEvictionPolicy::push(std::shared_ptr<Page> page, bool evictFirst)
+NodeRef PrioritizedEvictionPolicy::push(SharedPtr<Page> page, bool evictFirst)
 {
     Priority p = page->priority;
     LRUEvictionPolicy& policy = getOrCreate(p);
     return policy.push(std::move(page), evictFirst);
 }
 
-std::shared_ptr<Page> PrioritizedEvictionPolicy::pop()
+SharedPtr<Page> PrioritizedEvictionPolicy::pop()
 {
     assert(!mPolicies.empty());
     // Lowest priority key evicted first (std::map iterates in ascending key order)
@@ -94,7 +94,7 @@ std::shared_ptr<Page> PrioritizedEvictionPolicy::pop()
     return page;
 }
 
-std::shared_ptr<Page> PrioritizedEvictionPolicy::remove(NodeRef node)
+SharedPtr<Page> PrioritizedEvictionPolicy::remove(NodeRef node)
 {
     auto page = *node;
     Priority p = page->priority;
@@ -170,17 +170,17 @@ void PerLevelEvictionController::scheduleForEviction(Page& page, bool evictFirst
 {
     assert(page.nodeRef == std::nullopt);
     assert(page.cacheLevel == mCacheLevel);
-    auto sharedPage = page.shared_from_this();
+    auto sharedPage = page.sharedFromThis();
     NodeRef ref = getPolicy(page.lifeCycle).push(sharedPage, evictFirst);
     page.nodeRef = ref;
     assert(*ref == sharedPage && "stored iterator must dereference to this page");
 }
 
-std::vector<std::vector<std::shared_ptr<Page>>> PerLevelEvictionController::evict(std::vector<int> const& minNumPages)
+std::vector<std::vector<SharedPtr<Page>>> PerLevelEvictionController::evict(std::vector<int> const& minNumPages)
 {
     assert(static_cast<int>(minNumPages.size()) == numPoolGroups());
 
-    std::vector<std::vector<std::shared_ptr<Page>>> ret(static_cast<size_t>(numPoolGroups()));
+    std::vector<std::vector<SharedPtr<Page>>> ret(static_cast<size_t>(numPoolGroups()));
 
     try
     {

@@ -459,8 +459,8 @@ int KvCacheManager::clampMaxSeqLenForMem(int batchSize, int tokenNumUpperBound) 
 void KvCacheManager::_adjustLevel(CacheLevel level, size_t quota)
 {
     auto const& ratioList = _getTargetRatioList(level);
-    std::vector<std::vector<std::shared_ptr<Page>>> const* persistent = nullptr;
-    std::vector<std::vector<std::shared_ptr<Page>>> persistentPages;
+    std::vector<std::vector<SharedPtr<Page>>> const* persistent = nullptr;
+    std::vector<std::vector<SharedPtr<Page>>> persistentPages;
     if (mStorage->isLastLevel(level))
     {
         persistentPages = _gatherPersistentPages();
@@ -469,11 +469,11 @@ void KvCacheManager::_adjustLevel(CacheLevel level, size_t quota)
     mStorage->adjustCacheLevel(level, quota, ratioList, persistent);
 }
 
-std::vector<std::vector<std::shared_ptr<Page>>> KvCacheManager::_gatherPersistentPages() const
+std::vector<std::vector<SharedPtr<Page>>> KvCacheManager::_gatherPersistentPages() const
 {
     CacheLevel lastLevel = static_cast<CacheLevel>(mStorage->numCacheLevels() - 1);
     int numPg = mStorage->numPoolGroups();
-    std::vector<std::vector<std::shared_ptr<Page>>> result(static_cast<size_t>(numPg));
+    std::vector<std::vector<SharedPtr<Page>>> result(static_cast<size_t>(numPg));
 
     for (KvCache* kvc : mLivingKvCaches)
     {
@@ -487,7 +487,7 @@ std::vector<std::vector<std::shared_ptr<Page>>> KvCacheManager::_gatherPersisten
                     // Mirrors Python: holder must be _PageHolder type (suspended state).
                     if (blockPageIsNull(beamPages[lc]))
                         continue;
-                    assert(std::holds_alternative<std::shared_ptr<PageHolder>>(beamPages[lc])
+                    assert(std::holds_alternative<SharedPtr<PageHolder>>(beamPages[lc])
                         && "Non-null holder must be PageHolder in suspended state");
                     auto const& pg = blockPageGetPage(beamPages[lc]);
                     if (!pg)

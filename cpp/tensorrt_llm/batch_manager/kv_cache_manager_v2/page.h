@@ -23,9 +23,9 @@
 #include "kv_cache_manager_v2/lifeCycleRegistry.h"
 #include "kv_cache_manager_v2/storage/core.h"
 #include "kv_cache_manager_v2/utils/cudaEvent.h"
+#include "kv_cache_manager_v2/utils/sharedPtr.h"
 
 #include <functional>
-#include <memory>
 #include <optional>
 #include <vector>
 
@@ -44,15 +44,15 @@ class SharedPageLock;
 // Inherits from Slot (holds slotId + readyEvent).
 // Mirrors Python's Page(Slot) dataclass.
 // ---------------------------------------------------------------------------
-class Page : public Slot, public std::enable_shared_from_this<Page>
+class Page : public Slot, public EnableSharedFromThis<Page>
 {
 public:
     StorageManager* manager;
     LifeCycleId lifeCycle;
     CacheLevel cacheLevel;
     Priority priority;
-    std::weak_ptr<PageHolder> holder; // empty → DROPPABLE
-    std::optional<NodeRef> nodeRef;   // present → scheduled for eviction
+    WeakPtr<PageHolder> holder;     // empty → DROPPABLE
+    std::optional<NodeRef> nodeRef; // present → scheduled for eviction
 
     Page(StorageManager* mgr, LifeCycleId lc, CacheLevel level, Priority prio);
 
@@ -68,7 +68,7 @@ public:
     }
 
     // Prevent the page from being dropped (returns/creates a PageHolder).
-    std::shared_ptr<PageHolder> hold();
+    SharedPtr<PageHolder> hold();
 
     // Acquire a shared lock (migrates to GPU if needed).
     // skip_wait: caller guarantees the page is ready on kvCache's stream.
@@ -95,7 +95,7 @@ class CommittedPage : public Page
 public:
     Block* block;
 
-    CommittedPage(StorageManager* mgr, std::shared_ptr<Block> blk, LifeCycleId lc, CacheLevel level, Priority prio);
+    CommittedPage(StorageManager* mgr, SharedPtr<Block> blk, LifeCycleId lc, CacheLevel level, Priority prio);
 
     ~CommittedPage() override;
 
@@ -127,17 +127,17 @@ public:
 
     // Convert this UncommittedPage into a CommittedPage and attach to `block`.
     // The UncommittedPage becomes invalid (slot transferred to CommittedPage).
-    std::shared_ptr<CommittedPage> convertToCommitted(std::shared_ptr<Block> block, CachedCudaEvent readyEvent);
+    SharedPtr<CommittedPage> convertToCommitted(SharedPtr<Block> block, CachedCudaEvent readyEvent);
 };
 
 // ---------------------------------------------------------------------------
 // PageHolder — prevents a page from being dropped (HELD status).
 // Mirrors Python's _PageHolder.
 // ---------------------------------------------------------------------------
-class PageHolder : public std::enable_shared_from_this<PageHolder>
+class PageHolder : public EnableSharedFromThis<PageHolder>
 {
 public:
-    explicit PageHolder(std::shared_ptr<Page> page);
+    explicit PageHolder(SharedPtr<Page> page);
     ~PageHolder();
 
     PageHolder(PageHolder const&) = delete;
@@ -147,8 +147,8 @@ public:
     SharedPageLock lock(
         KvCache& kvCache, BeamIndex beamIndex, BlockOrdinal ordinal, LifeCycleId lifeCycle, bool skipWait = false);
 
-    std::shared_ptr<Page> page;
-    std::weak_ptr<UniqPageLock> uniqLock; // non-null → LOCKED
+    SharedPtr<Page> page;
+    WeakPtr<UniqPageLock> uniqLock; // non-null → LOCKED
 };
 
 // ---------------------------------------------------------------------------
@@ -156,10 +156,10 @@ public:
 // Owns finish events from all SharedPageLocks it issued.
 // Mirrors Python's _UniqPageLock.
 // ---------------------------------------------------------------------------
-class UniqPageLock : public std::enable_shared_from_this<UniqPageLock>
+class UniqPageLock : public EnableSharedFromThis<UniqPageLock>
 {
 public:
-    explicit UniqPageLock(std::shared_ptr<PageHolder> holder);
+    explicit UniqPageLock(SharedPtr<PageHolder> holder);
     ~UniqPageLock();
 
     UniqPageLock(UniqPageLock const&) = delete;
@@ -169,12 +169,12 @@ public:
     SharedPageLock share(
         KvCache& kvCache, BeamIndex beamIndex, BlockOrdinal ordinal, LifeCycleId lifeCycle, bool skipWait);
 
-    std::shared_ptr<Page> const& page() const;
+    SharedPtr<Page> const& page() const;
 
     // Append a finish event, merging when count exceeds 32 to prevent unbounded growth.
     void notifyFinish(CachedCudaEvent event);
 
-    std::shared_ptr<PageHolder> holder;
+    SharedPtr<PageHolder> holder;
     std::vector<CachedCudaEvent> finishEvents;
 };
 
@@ -196,7 +196,7 @@ struct LockOwner
 class SharedPageLock
 {
 public:
-    SharedPageLock(std::shared_ptr<UniqPageLock> uniqLock, KvCache& kvCache, BeamIndex beamIndex, BlockOrdinal ordinal,
+    SharedPageLock(SharedPtr<UniqPageLock> uniqLock, KvCache& kvCache, BeamIndex beamIndex, BlockOrdinal ordinal,
         LifeCycleId lifeCycle, bool skipWait);
 
     ~SharedPageLock();
@@ -208,9 +208,9 @@ public:
     SharedPageLock& operator=(SharedPageLock const&) = delete;
 
     // Explicitly release the lock (called by destructor if not already released).
-    std::shared_ptr<Page> unlock();
+    SharedPtr<Page> unlock();
 
-    std::shared_ptr<Page> const& page() const;
+    SharedPtr<Page> const& page() const;
 
     bool isValid() const noexcept
     {
@@ -222,7 +222,7 @@ private:
     void acquirePageIndex();
     void releasePageIndex();
 
-    std::shared_ptr<UniqPageLock> mUniqLock;
+    SharedPtr<UniqPageLock> mUniqLock;
     LockOwner mUser;
 };
 
@@ -231,7 +231,7 @@ private:
 // ---------------------------------------------------------------------------
 struct BatchedLockTarget
 {
-    std::shared_ptr<Page> page;
+    SharedPtr<Page> page;
     BeamIndex beamIndex;
     BlockOrdinal ordinal;
     LifeCycleId lifeCycle;

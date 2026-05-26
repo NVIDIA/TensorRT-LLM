@@ -65,15 +65,15 @@ PageStatus Page::status() const noexcept
     return PageStatus::LOCKED;
 }
 
-std::shared_ptr<PageHolder> Page::hold()
+SharedPtr<PageHolder> Page::hold()
 {
     // Return existing holder if any.
     auto h = holder.lock();
     if (h)
         return h;
 
-    auto self = shared_from_this();
-    h = std::make_shared<PageHolder>(self);
+    auto self = sharedFromThis();
+    h = makeShared<PageHolder>(self);
     holder = h;
 
     // If we were scheduled for eviction but are no longer evictable (just got held), remove.
@@ -97,8 +97,7 @@ SharedPageLock Page::lock(KvCache& kvCache, BeamIndex beamIndex, BlockOrdinal or
 // CommittedPage
 // ---------------------------------------------------------------------------
 
-CommittedPage::CommittedPage(
-    StorageManager* mgr, std::shared_ptr<Block> blk, LifeCycleId lc, CacheLevel level, Priority prio)
+CommittedPage::CommittedPage(StorageManager* mgr, SharedPtr<Block> blk, LifeCycleId lc, CacheLevel level, Priority prio)
     : Page(mgr, lc, level, prio)
     , block(blk.get())
 {
@@ -152,8 +151,8 @@ UncommittedPage::~UncommittedPage()
                 auto const& bp = kvCache->blocks()[static_cast<size_t>(ordinal)]
                                      .pages[static_cast<size_t>(beamIndex)][static_cast<size_t>(lifeCycle)];
                 auto page = blockPageGetPage(bp);
-                pageOk = blockPageIsNull(bp) || page.get() == this
-                    || std::dynamic_pointer_cast<CommittedPage>(page) != nullptr;
+                pageOk
+                    = blockPageIsNull(bp) || page.get() == this || dynamicPointerCast<CommittedPage>(page) != nullptr;
             }
             assert((blockRemoved || pageOk)
                 && "UncommittedPage destroyed but slot still holds a different uncommitted page");
@@ -162,7 +161,7 @@ UncommittedPage::~UncommittedPage()
     // Delegate slot release to Page::~Page().
 }
 
-std::shared_ptr<CommittedPage> UncommittedPage::convertToCommitted(std::shared_ptr<Block> blk, CachedCudaEvent readyEv)
+SharedPtr<CommittedPage> UncommittedPage::convertToCommitted(SharedPtr<Block> blk, CachedCudaEvent readyEv)
 {
     assert(!scheduledForEviction());
     assert(blk->storage.at(static_cast<size_t>(lifeCycle)) == nullptr
@@ -172,7 +171,7 @@ std::shared_ptr<CommittedPage> UncommittedPage::convertToCommitted(std::shared_p
     // Set the ready event before transfer (matches Python: self.ready_event = ready_event).
     this->readyEvent = std::move(readyEv);
 
-    auto committed = std::make_shared<CommittedPage>(manager, blk, lifeCycle, cacheLevel, priority);
+    auto committed = makeShared<CommittedPage>(manager, blk, lifeCycle, cacheLevel, priority);
     // Move slot id to the committed page; invalidate our slot.
     committed->setSlotId(slotId()); // asserts valid
     committed->readyEvent = std::move(readyEvent);
@@ -192,7 +191,7 @@ std::shared_ptr<CommittedPage> UncommittedPage::convertToCommitted(std::shared_p
 // PageHolder
 // ---------------------------------------------------------------------------
 
-PageHolder::PageHolder(std::shared_ptr<Page> p)
+PageHolder::PageHolder(SharedPtr<Page> p)
     : page(std::move(p))
 {
 }
@@ -233,7 +232,7 @@ SharedPageLock PageHolder::lock(
     auto ul = uniqLock.lock();
     if (!ul)
     {
-        ul = std::make_shared<UniqPageLock>(shared_from_this());
+        ul = makeShared<UniqPageLock>(sharedFromThis());
         uniqLock = ul;
     }
 
@@ -251,7 +250,7 @@ SharedPageLock PageHolder::lock(
 // UniqPageLock
 // ---------------------------------------------------------------------------
 
-UniqPageLock::UniqPageLock(std::shared_ptr<PageHolder> h)
+UniqPageLock::UniqPageLock(SharedPtr<PageHolder> h)
     : holder(std::move(h))
 {
     if (holder->page->cacheLevel != kGpuLevel)
@@ -297,7 +296,7 @@ void UniqPageLock::notifyFinish(CachedCudaEvent event)
     }
 }
 
-std::shared_ptr<Page> const& UniqPageLock::page() const
+SharedPtr<Page> const& UniqPageLock::page() const
 {
     assert(holder && holder->page);
     return holder->page;
@@ -306,15 +305,15 @@ std::shared_ptr<Page> const& UniqPageLock::page() const
 SharedPageLock UniqPageLock::share(
     KvCache& kvCache, BeamIndex beamIndex, BlockOrdinal ordinal, LifeCycleId lc, bool skipWait)
 {
-    return SharedPageLock(shared_from_this(), kvCache, beamIndex, ordinal, lc, skipWait);
+    return SharedPageLock(sharedFromThis(), kvCache, beamIndex, ordinal, lc, skipWait);
 }
 
 // ---------------------------------------------------------------------------
 // SharedPageLock
 // ---------------------------------------------------------------------------
 
-SharedPageLock::SharedPageLock(std::shared_ptr<UniqPageLock> ul, KvCache& kvCache, BeamIndex beamIndex,
-    BlockOrdinal ordinal, LifeCycleId lc, bool skipWait)
+SharedPageLock::SharedPageLock(SharedPtr<UniqPageLock> ul, KvCache& kvCache, BeamIndex beamIndex, BlockOrdinal ordinal,
+    LifeCycleId lc, bool skipWait)
     : mUniqLock(std::move(ul))
     , mUser{&kvCache, beamIndex, ordinal, lc}
 {
@@ -348,13 +347,13 @@ SharedPageLock& SharedPageLock::operator=(SharedPageLock&& other) noexcept
     return *this;
 }
 
-std::shared_ptr<Page> const& SharedPageLock::page() const
+SharedPtr<Page> const& SharedPageLock::page() const
 {
     assert(mUniqLock);
     return mUniqLock->page();
 }
 
-std::shared_ptr<Page> SharedPageLock::unlock()
+SharedPtr<Page> SharedPageLock::unlock()
 {
     assert(mUniqLock);
 

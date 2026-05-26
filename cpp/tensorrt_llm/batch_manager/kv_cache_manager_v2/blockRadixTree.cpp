@@ -257,7 +257,7 @@ NodeBase::~NodeBase()
     }
 }
 
-std::shared_ptr<Block> NodeBase::detachNext(BlockKey const& blockKey)
+SharedPtr<Block> NodeBase::detachNext(BlockKey const& blockKey)
 {
     auto it = next.find(blockKey);
     if (it == next.end())
@@ -374,10 +374,10 @@ CommittedPage* Block::unlinkPage(LifeCycleId lcIdx)
     return page;
 }
 
-std::vector<std::shared_ptr<Block>> Block::clearStaleBlocksAfterPageUnlink(
+std::vector<SharedPtr<Block>> Block::clearStaleBlocksAfterPageUnlink(
     Block& block, LifeCycleId lcIdx, LifeCycle const& lc)
 {
-    std::vector<std::shared_ptr<Block>> detachedBlocks;
+    std::vector<SharedPtr<Block>> detachedBlocks;
     assert(block.storage.at(static_cast<size_t>(lcIdx)) == nullptr);
     if (block.isOrphan())
     {
@@ -423,8 +423,7 @@ std::vector<std::shared_ptr<Block>> Block::clearStaleBlocksAfterPageUnlink(
 // addOrGetExistingBlock
 // ---------------------------------------------------------------------------
 
-std::shared_ptr<Block> addOrGetExistingBlock(
-    NodeBase* prev, int numLifeCycles, std::vector<TokenIdExt> tokens, bool* isNew)
+SharedPtr<Block> addOrGetExistingBlock(NodeBase* prev, int numLifeCycles, std::vector<TokenIdExt> tokens, bool* isNew)
 {
     assert(prev && "prev must not be null");
 
@@ -477,7 +476,7 @@ std::shared_ptr<Block> addOrGetExistingBlock(
     }
 
     // Create the new block. ordinal and tokensPerBlock are derived from prev inside the Block ctor.
-    auto block = std::make_shared<Block>(newKey, std::move(tokens), prev, numLifeCycles);
+    auto block = makeShared<Block>(newKey, std::move(tokens), prev, numLifeCycles);
 
     prevNext[newKey] = block;
     if (isNew)
@@ -489,10 +488,10 @@ std::shared_ptr<Block> addOrGetExistingBlock(
 // removeSubtree
 // ---------------------------------------------------------------------------
 
-std::shared_ptr<Block> removeSubtree(Block& root)
+SharedPtr<Block> removeSubtree(Block& root)
 {
     Block* current = &root;
-    std::shared_ptr<Block> detachedRoot;
+    SharedPtr<Block> detachedRoot;
 
     // Post-order traversal using prev/next links — O(1) extra space.
     // Descend to leaves first, remove on the way back up.
@@ -560,7 +559,7 @@ void BlockRadixTree::drainPendingRootErases() const
     // Move to local to allow re-entrancy (proposeToEraseEmptyRoot during erase).
     std::vector<BlockKey> pending;
     pending.swap(mPendingRootErases);
-    auto& roots = const_cast<std::unordered_map<BlockKey, std::shared_ptr<RootBlock>>&>(mRoots);
+    auto& roots = const_cast<std::unordered_map<BlockKey, SharedPtr<RootBlock>>&>(mRoots);
     for (auto const& key : pending)
     {
         auto it = roots.find(key);
@@ -583,7 +582,7 @@ RootBlock& BlockRadixTree::addOrGetExisting(ReuseScope const& reuseScope)
         return *it->second;
     }
 
-    auto rb = std::make_shared<RootBlock>(reuseScope, this);
+    auto rb = makeShared<RootBlock>(reuseScope, this);
     auto [newIt, inserted] = mRoots.emplace(key, std::move(rb));
     return *newIt->second;
 }
@@ -592,7 +591,7 @@ RootBlock& BlockRadixTree::addOrGetExisting(ReuseScope const& reuseScope)
 // Returns (block, numMatchedTokens) or (nullptr, 0) if no match.
 // Mirrors Python's find_best_partial_match_in_next_nodes().
 std::pair<Block*, int> findBestPartialMatchInNextNodes(
-    std::unordered_map<BlockKey, std::shared_ptr<Block>> const& nextMap, TokenIdExt const* tokens, size_t tokenCount)
+    std::unordered_map<BlockKey, SharedPtr<Block>> const& nextMap, TokenIdExt const* tokens, size_t tokenCount)
 {
     // Skip heuristic: too many children would be slow to iterate.
     if (nextMap.size() >= 32)
@@ -649,7 +648,7 @@ std::vector<BlockRadixTree::MatchResult> BlockRadixTree::matchTokenPath(
         return results;
 
     RootBlock const& root = *rootIt->second;
-    std::unordered_map<BlockKey, std::shared_ptr<Block>> const* currentNext = &root.next;
+    std::unordered_map<BlockKey, SharedPtr<Block>> const* currentNext = &root.next;
     // ordinal tracks which block we're on (0-based, after root).
     int ordinal = 0;
     bool missed = false;

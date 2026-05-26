@@ -851,7 +851,7 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
                     return nb::none();
                 if (self.prev->type() == kv::NodeBase::Type::kROOT_BLOCK)
                     return nb::cast(static_cast<kv::RootBlock*>(self.prev), nb::rv_policy::reference);
-                return nb::cast(static_cast<kv::Block*>(self.prev)->shared_from_this());
+                return nb::cast(toStd(static_cast<kv::Block*>(self.prev)->sharedFromThis()));
             })
         .def_prop_ro("storage",
             [](kv::Block const& self)
@@ -865,7 +865,7 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
                     }
                     else
                     {
-                        std::weak_ptr<kv::Page> weakPage = page->shared_from_this();
+                        kv::WeakPtr<kv::Page> weakPage = page->sharedFromThis();
                         // Return a callable: page() returns the Page object.
                         // This matches the rawref.ref[Page] protocol used in Python.
                         lst.append(nb::cpp_function(
@@ -874,7 +874,7 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
                                 auto strongPage = weakPage.lock();
                                 if (strongPage)
                                 {
-                                    return nb::cast(strongPage);
+                                    return nb::cast(toStd(strongPage));
                                 }
                                 return nb::none();
                             }));
