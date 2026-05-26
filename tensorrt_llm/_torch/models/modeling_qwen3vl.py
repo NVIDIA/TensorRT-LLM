@@ -19,7 +19,7 @@ from tensorrt_llm._torch.models.modeling_multimodal_utils import _is_mm_disagg
 from tensorrt_llm.functional import PositionEmbeddingType
 from tensorrt_llm.mapping import Mapping
 
-from ..._utils import async_tensor_h2d, nvtx_range, nvtx_range_debug, prefer_pinned
+from ..._utils import nvtx_range, nvtx_range_debug, prefer_pinned
 from ...inputs import (
     BaseMultimodalDummyInputsBuilder,
     BaseMultimodalInputProcessor,
@@ -40,7 +40,7 @@ from ..attention_backend.utils import get_attention_backend
 from ..modules.layer_norm import LayerNorm
 from ..modules.linear import Linear, TensorParallelMode
 from ..modules.mlp import MLP
-from ..modules.rotary_embedding import MRotaryEmbedding
+from ..modules.rotary_embedding import MRotaryEmbedding, RotaryEmbedding
 from .checkpoints.base_weight_mapper import BaseWeightMapper
 from .checkpoints.hf.qwen3vl_weight_mapper import Qwen3VLHfWeightMapper
 from .modeling_auto import AutoModelForCausalLM
@@ -569,13 +569,11 @@ class Qwen3VLVisionBlock(torch.nn.Module):
         position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         **kwargs,
     ) -> torch.Tensor:
-        # vLLM-style residual fusion (see vllm/model_executor/models/qwen2_5_vl
-        # Qwen2_5_VisionBlock.forward): collapse the post-attn ``residual +
-        # x_attn`` add into ``norm2``'s residual path. ``LayerNorm.forward``
-        # with ``residual=`` is torch.compile-fused so both the ``+`` and the
-        # LN run inside one Triton kernel -- saves one elementwise_kernel
-        # ``add<c10::BFloat16>`` launch per vision block (32 launches per
-        # executor iter at full-batch).
+        # Collapse the post-attn ``residual + x_attn`` add into ``norm2``'s
+        # residual path. ``LayerNorm.forward`` with ``residual=`` is
+        # torch.compile-fused so both the ``+`` and the LN run inside one
+        # Triton kernel -- saves one elementwise_kernel ``add<c10::BFloat16>``
+        # launch per vision block (32 launches per executor iter at full-batch).
         x_attn = self.attn(
             hidden_states=self.norm1(hidden_states),
             rotary_pos_emb=rotary_pos_emb,
@@ -649,8 +647,7 @@ class Qwen3VLVisionPatchMerger(torch.nn.Module):
 
 # ---------------------------------------------------------------------------
 # Fused bilinear position-embedding interpolation for the Qwen3-VL vision
-# tower. Ported from vLLM
-# (vllm/model_executor/models/qwen3_vl.py @ 21eb2c33).
+# tower.
 #
 # ``fast_pos_embed_interpolate`` resamples the learned grid of positional
 # embeddings onto each (t, h, w) image grid using bilinear interpolation and
@@ -781,174 +778,6 @@ def _triton_pos_embed_interpolate(
     return output
 
 
-@triton.jit
-def _bilinear_pos_embed_batched_kernel(
-    embed_ptr,
-    output_ptr,
-    starts_ptr,  # (num_images + 1,) int32, cumulative output-token offsets
-    hs_ptr,  # (num_images,) int32
-    ws_ptr,  # (num_images,) int32
-    h_scales_ptr,  # (num_images,) float32
-    w_scales_ptr,  # (num_images,) float32
-    NUM_IMAGES: tl.constexpr,
-    NUM_GRID: tl.constexpr,
-    M_SIZE: tl.constexpr,
-    HIDDEN_DIM: tl.constexpr,
-    BLOCK_D: tl.constexpr,
-):
-    """Single-launch variant of ``_bilinear_pos_embed_kernel``.
-
-    Replaces per-image kernel launches with one launch that covers the
-    entire (sum of t*h*w) output. Each program owns one output token.
-    The kernel finds its owning image via a linear scan over
-    ``starts_ptr``; ``NUM_IMAGES`` is a constexpr so the scan unrolls and
-    has no dynamic-bound branch.
-
-    Per-image (h, w, h_scale, w_scale) are loaded once per program. The
-    rest of the bilinear-interp + spatial-merge reorder math mirrors the
-    per-image kernel exactly, so the per-token output is bit-identical.
-    """
-    pid = tl.program_id(0)
-
-    # Linear scan finds the image whose [start, end) covers pid.
-    # tl.where keeps the update branch-free.
-    img_idx = 0
-    for i in tl.static_range(NUM_IMAGES):
-        end_i = tl.load(starts_ptr + i + 1)
-        img_idx = tl.where(pid >= end_i, i + 1, img_idx)
-
-    start = tl.load(starts_ptr + img_idx)
-    H = tl.load(hs_ptr + img_idx)
-    W = tl.load(ws_ptr + img_idx)
-    h_scale = tl.load(h_scales_ptr + img_idx)
-    w_scale = tl.load(w_scales_ptr + img_idx)
-
-    local_pid = pid - start
-
-    # The rest mirrors the per-image kernel. ``H``, ``W``, ``h_scale``,
-    # ``w_scale`` are now runtime values rather than constexpr, but the
-    # arithmetic structure is identical.
-    total_spatial = H * W
-    spatial_idx = local_pid % total_spatial
-
-    num_blocks_w = W // M_SIZE
-    block_idx = spatial_idx // (M_SIZE * M_SIZE)
-    local_idx = spatial_idx % (M_SIZE * M_SIZE)
-    br = block_idx // num_blocks_w
-    bc = block_idx % num_blocks_w
-    lr = local_idx // M_SIZE
-    lc = local_idx % M_SIZE
-    row = br * M_SIZE + lr
-    col = bc * M_SIZE + lc
-
-    h_frac = row.to(tl.float32) * h_scale
-    w_frac = col.to(tl.float32) * w_scale
-
-    hf = tl.math.floor(h_frac).to(tl.int32)
-    wf = tl.math.floor(w_frac).to(tl.int32)
-    hc = tl.minimum(hf + 1, NUM_GRID - 1)
-    wc = tl.minimum(wf + 1, NUM_GRID - 1)
-
-    dh = h_frac - hf.to(tl.float32)
-    dw = w_frac - wf.to(tl.float32)
-    w11 = dh * dw
-    w10 = dh - w11
-    w01 = dw - w11
-    w00 = 1.0 - dh - w01
-
-    off00 = (hf * NUM_GRID + wf) * HIDDEN_DIM
-    off01 = (hf * NUM_GRID + wc) * HIDDEN_DIM
-    off10 = (hc * NUM_GRID + wf) * HIDDEN_DIM
-    off11 = (hc * NUM_GRID + wc) * HIDDEN_DIM
-    out_off = pid * HIDDEN_DIM
-
-    out_dtype = output_ptr.dtype.element_ty
-    w00_c = w00.to(out_dtype)
-    w01_c = w01.to(out_dtype)
-    w10_c = w10.to(out_dtype)
-    w11_c = w11.to(out_dtype)
-
-    for d in tl.range(0, HIDDEN_DIM, BLOCK_D):
-        cols = d + tl.arange(0, BLOCK_D)
-        mask = cols < HIDDEN_DIM
-
-        e00 = tl.load(embed_ptr + off00 + cols, mask=mask)
-        e01 = tl.load(embed_ptr + off01 + cols, mask=mask)
-        e10 = tl.load(embed_ptr + off10 + cols, mask=mask)
-        e11 = tl.load(embed_ptr + off11 + cols, mask=mask)
-
-        val = w00_c * e00 + w01_c * e01 + w10_c * e10 + w11_c * e11
-        tl.store(output_ptr + out_off + cols, val, mask=mask)
-
-
-def _triton_pos_embed_interpolate_batched(
-    embed_weight: torch.Tensor,
-    grid_thw: list[list[int]],
-    num_grid_per_side: int,
-    m_size: int,
-    dtype: torch.dtype,
-) -> torch.Tensor:
-    """Single-launch fused bilinear pos-embed for a multi-image batch.
-
-    Builds five small per-image metadata tensors on CPU (cumulative
-    offsets, hs, ws, h/w scales), ships them in one pinned H->D copy
-    each, and dispatches a single ``_bilinear_pos_embed_batched_kernel``
-    over the full output. Equivalent to ``torch.cat([
-    _triton_pos_embed_interpolate(...) for t, h, w in grid_thw])`` but
-    with one kernel launch + zero ``torch.cat``.
-    """
-    hidden_dim = embed_weight.shape[1]
-    device = embed_weight.device
-
-    # Per-image metadata as plain Python lists; we ship them in one
-    # combined H->D transfer below.
-    starts = [0]
-    hs: list[int] = []
-    ws: list[int] = []
-    h_scales: list[float] = []
-    w_scales: list[float] = []
-    for t, h, w in grid_thw:
-        assert h % m_size == 0 and w % m_size == 0, (
-            f"h={h} and w={w} must be divisible by m_size={m_size}"
-        )
-        starts.append(starts[-1] + t * h * w)
-        hs.append(h)
-        ws.append(w)
-        h_scales.append(float(num_grid_per_side - 1) / float(h - 1) if h > 1 else 0.0)
-        w_scales.append(float(num_grid_per_side - 1) / float(w - 1) if w > 1 else 0.0)
-
-    total_out = starts[-1]
-    output = torch.empty(total_out, hidden_dim, device=device, dtype=dtype)
-
-    # Each metadata array lands in a pinned host buffer and then a real
-    # DMA H->D (no pageable staging). ``async_tensor_h2d`` wraps the
-    # ``torch.tensor(..., pin_memory=prefer_pinned()).to(..., non_blocking=True)``
-    # idiom centrally.
-    starts_t = async_tensor_h2d(starts, dtype=torch.int32, device=device)
-    hs_t = async_tensor_h2d(hs, dtype=torch.int32, device=device)
-    ws_t = async_tensor_h2d(ws, dtype=torch.int32, device=device)
-    h_scales_t = async_tensor_h2d(h_scales, dtype=torch.float32, device=device)
-    w_scales_t = async_tensor_h2d(w_scales, dtype=torch.float32, device=device)
-
-    BLOCK_D = triton.next_power_of_2(hidden_dim)
-
-    _bilinear_pos_embed_batched_kernel[(total_out,)](
-        embed_weight,
-        output,
-        starts_t,
-        hs_t,
-        ws_t,
-        h_scales_t,
-        w_scales_t,
-        len(grid_thw),
-        num_grid_per_side,
-        m_size,
-        hidden_dim,
-        BLOCK_D,
-    )
-    return output
-
-
 class Qwen3VisionModel(torch.nn.Module):
     def __init__(self, model_config: ModelConfig[PretrainedConfig]):
         super().__init__()
@@ -966,38 +795,32 @@ class Qwen3VisionModel(torch.nn.Module):
         self.pos_embed = nn.Embedding(self.config.num_position_embeddings, self.config.hidden_size)
         self.num_grid_per_side = int(self.config.num_position_embeddings**0.5)
 
-        # 2D rotary positional embedding for the vision tower. Mirrors the
-        # HF Qwen3-VL formula (theta=10000, dim=head_dim//2,
-        # inv_freq picks every other index across that dim) and pre-computes
-        # cos/sin into module buffers, vLLM-style
-        # (vllm/model_executor/layers/rotary_embedding/base.py
-        # ``_compute_cos_sin_cache``). ``forward`` then only gathers
-        # ``cos_cache[pos_ids]`` / ``sin_cache[pos_ids]`` -- no per-forward
-        # ``torch.outer`` or ``.cos()`` / ``.sin()`` kernels.
-        head_dim = self.config.hidden_size // self.config.num_heads
-        rope_dim = head_dim // 2
-        rope_theta = 10000.0
-        inv_freq = 1.0 / (
-            rope_theta ** (torch.arange(0, rope_dim, 2, dtype=torch.float32) / rope_dim)
+        # 2D rotary positional embedding for the vision tower. Reuse the
+        # generic ``RotaryEmbedding`` cos/sin buffer (sized to the text
+        # config's ``max_position_embeddings`` via ``RopeParams``) so
+        # ``forward`` only gathers ``rotary_cos_sin[pos_ids]`` -- no
+        # per-forward ``torch.outer`` or ``.cos()`` / ``.sin()`` kernels
+        # and no hard-coded upper bound on the per-axis image grid.
+        text_config = getattr(
+            model_config.pretrained_config, "text_config", model_config.pretrained_config
         )
-        # Cover the largest spatial extent the vision tower could plausibly
-        # see. 8192 is what vLLM's get_rope() defaults to for the Qwen3-VL
-        # vision tower; per-buffer it's
-        #   (8192, freq_dim=18) * fp32 = 576 KB, x2 buffers = 1.15 MB.
-        max_rope_seqlen = 8192
-        seq = torch.arange(max_rope_seqlen, dtype=torch.float32)
-        freqs = torch.outer(seq, inv_freq)  # (max_rope_seqlen, rope_dim/2)
-        # Store the gathered cos/sin caches in the model dtype (bf16) so the
-        # per-vision-block ``cos.to(dtype=q.dtype)`` / ``sin.to(dtype=q.dtype)``
-        # cast in ``Qwen2_5_VLVisionAttention.apply_rope`` becomes a no-op.
-        # Without this each call launches an ``elementwise_kernel<...
-        # direct_copy_kernel_cuda...c10::BFloat16>`` per (cos, sin) per block,
-        # which adds up to ~64 launches per executor iter at the vision tower.
-        # Trig in fp32 then cast keeps the precision identical to the lazy
-        # per-call cast we replaced.
-        cache_dtype = model_config.pretrained_config.text_config.dtype
-        self.register_buffer("rope_cos_cache", freqs.cos().to(cache_dtype), persistent=False)
-        self.register_buffer("rope_sin_cache", freqs.sin().to(cache_dtype), persistent=False)
+        self.config.max_position_embeddings = text_config.max_position_embeddings
+        # Vision RoPE uses half of head_dim (partial_rotary_factor=0.5),
+        # so the cos/sin tables hold ``head_dim/2`` columns -- which
+        # matches the per-token (h_pos, w_pos) layout produced by
+        # ``rot_pos_ids``.
+        self.config.partial_rotary_factor = 0.5
+        self.config.num_attention_heads = self.config.num_heads
+        self.head_dim = self.config.hidden_size // self.config.num_heads
+        self.pos_embd_params = PositionalEmbeddingParams(
+            type=PositionEmbeddingType.rope_gpt_neox,
+            rope=RopeParams.from_config(self.config),
+        )
+        self.rotary_pos_emb = RotaryEmbedding(
+            self.pos_embd_params.rope,
+            head_dim=self.head_dim,
+            is_neox=self.pos_embd_params.is_neox,
+        )
 
         self.blocks = nn.ModuleList(
             [
@@ -1040,7 +863,6 @@ class Qwen3VisionModel(torch.nn.Module):
     @staticmethod
     @lru_cache(maxsize=1024)
     def rot_pos_ids(h: int, w: int, spatial_merge_size: int) -> torch.Tensor:
-        # Adopted from https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/models/qwen3_vl.py
         # CPU-side numpy build; identical (h, w) hits the lru_cache, so the
         # per-image torch.arange/expand/stack chain only runs on first sight.
         hpos_ids = np.broadcast_to(np.arange(h).reshape(h, 1), (h, w))
@@ -1069,15 +891,14 @@ class Qwen3VisionModel(torch.nn.Module):
     def _rotary_pos_emb_thw(self, t: int, h: int, w: int) -> Tuple[torch.Tensor, torch.Tensor]:
         """Per-(t, h, w) rotary (cos, sin) pair, cached as device tensors.
 
-        Gathers from the pre-computed ``rope_cos_cache`` /
-        ``rope_sin_cache`` buffers populated in ``__init__`` -- so no
-        ``.cos()`` / ``.sin()`` kernels fire in forward. Mirrors vLLM's
-        ``get_rope_by_thw`` pattern: pos_ids are built CPU-side via
+        Gathers from ``self.rotary_pos_emb.rotary_cos_sin`` (sized to the
+        text config's ``max_position_embeddings``) -- so no ``.cos()`` /
+        ``.sin()`` kernels fire in forward. pos_ids are built CPU-side via
         ``rot_pos_ids`` (also lru_cached), the H->D copy happens here on
         the first miss, and subsequent calls return the cached on-device
         cos/sin tuple. ``rot_pos_emb`` over a multi-image grid becomes a
-        list lookup + per-half ``torch.cat`` -- no transfer, no
-        elementwise trig.
+        list lookup + per-half ``torch.cat`` -- no transfer, no elementwise
+        trig.
 
         GPU memory cost (measured on H200, head_dim=72 -> freq_dim=18,
         cos and sin each cached as (t*h*w, 36) after gather+flatten;
@@ -1097,24 +918,21 @@ class Qwen3VisionModel(torch.nn.Module):
         the cache settles around 4-10 MB. ``maxsize=1024`` is a safety
         cap; reaching it would require >1024 distinct (t, h, w) and
         even then LRU evicts.
-
-        Note: vLLM's ``get_rope_by_thw`` casts its rotary cos_sin_cache
-        to the model dtype (bf16) via ``get_rope(dtype=torch.get_default_dtype())``
-        -- so the equivalent vLLM cache is half the size (144 B/token).
-        ``RopeParams.create_rope_const_params`` hardcodes fp32;
-        switching to model dtype would halve this footprint but is a
-        separate change.
         """
         pos_ids = self.rot_pos_ids(h, w, self.spatial_merge_size)
         if t > 1:
             pos_ids = pos_ids.repeat(t, 1)
         pos_ids = pos_ids.to(self.device, non_blocking=True)
-        # Gather pre-computed cos/sin. pos_ids has shape (total, 2); the
-        # last-dim 2 holds the (h-pos, w-pos) freq indices, so after
-        # gather + flatten the per-token layout is
+        # Gather pre-computed cos/sin from the standard ``RotaryEmbedding``
+        # buffer. ``rotary_cos_sin`` has shape (max_pos, 2, freq_dim);
+        # index 0 holds cos, index 1 holds sin. pos_ids has shape
+        # (total, 2); the last-dim 2 holds the (h-pos, w-pos) freq
+        # indices, so after gather + flatten the per-token layout is
         # ``[cos(freq_h), cos(freq_w)]`` of size ``2*freq_dim``.
-        cos = self.rope_cos_cache[pos_ids].flatten(1)
-        sin = self.rope_sin_cache[pos_ids].flatten(1)
+        max_grid_size = max(h, w)
+        cos_sin = self.rotary_pos_emb.rotary_cos_sin[:max_grid_size]
+        cos = cos_sin[:, 0, :][pos_ids].flatten(1)
+        sin = cos_sin[:, 1, :][pos_ids].flatten(1)
         return cos, sin
 
     def rot_pos_emb(self, grid_thw: list[list[int]]) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -1129,22 +947,29 @@ class Qwen3VisionModel(torch.nn.Module):
             return cos_pieces[0], sin_pieces[0]
         return torch.cat(cos_pieces, dim=0), torch.cat(sin_pieces, dim=0)
 
-    # Adopted from https://github.com/vllm-project/vllm/blob/21eb2c3372fb6447ef36bee44ff7af79a330ffec/vllm/model_executor/models/qwen3_vl.py#L470)
     def fast_pos_embed_interpolate(self, grid_thw: list[list[int]]) -> torch.Tensor:
-        """Single-launch batched Triton bilinear pos-embed interpolation.
+        """Per-image fused Triton bilinear pos-embed interpolation.
 
-        Replaces the prior ``torch.cat([_triton_pos_embed_interpolate(...)
-        for ...])`` (N kernel launches + a cat) with one launch that owns
-        the entire output. Per-image params (h, w, h/w scales, cumulative
-        starts) ride one pinned H->D copy each.
+        Launches ``_triton_pos_embed_interpolate`` once per image with
+        ``(h, w, h_scale, w_scale)`` passed as scalar kernel args, so the
+        function performs zero H<->D transfers. ``torch.cat`` joins the
+        per-image outputs at the end.
         """
-        return _triton_pos_embed_interpolate_batched(
-            self.pos_embed.weight,
-            grid_thw,
-            self.num_grid_per_side,
-            self.spatial_merge_size,
-            self.pos_embed.weight.dtype,
-        )
+        pieces = [
+            _triton_pos_embed_interpolate(
+                self.pos_embed.weight,
+                t,
+                h,
+                w,
+                self.num_grid_per_side,
+                self.spatial_merge_size,
+                self.pos_embed.weight.dtype,
+            )
+            for t, h, w in grid_thw
+        ]
+        if len(pieces) == 1:
+            return pieces[0]
+        return torch.cat(pieces, dim=0)
 
     def prepare_attn_metadata(self, seq_lens, attn_metadata: AttentionMetadata):
         # NOTE: The single prompt is divided into multiple seq_lens, so pretending have many batch_sizes.

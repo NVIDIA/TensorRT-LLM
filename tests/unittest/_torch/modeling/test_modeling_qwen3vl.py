@@ -18,7 +18,6 @@ from tensorrt_llm._torch.models.modeling_qwen3vl import (
     Qwen3VLInputProcessorBase,
     Qwen3VLModel,
     _triton_pos_embed_interpolate,
-    _triton_pos_embed_interpolate_batched,
 )
 from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.models.modeling_utils import QuantConfig
@@ -657,9 +656,9 @@ def _make_qwen3_vision_model_for_l2():
     by going through `__new__` so the class-level decorators (`@staticmethod`
     on `rot_pos_ids` and `@lru_cache` on `_rotary_pos_emb_thw`) stay intact.
     The mock wires only the attrs those cached methods touch:
-    ``spatial_merge_size``, ``rope_cos_cache``/``rope_sin_cache`` (pre-
-    computed cos/sin buffers populated in the real ``__init__``), and
-    ``patch_embed.proj.weight`` (read by ``device``).
+    ``spatial_merge_size``, ``rotary_pos_emb`` (a stub exposing the
+    ``rotary_cos_sin`` cache that ``_rotary_pos_emb_thw`` indexes into),
+    and ``patch_embed.proj.weight`` (read by ``device``).
     """
     obj = Qwen3VisionModel.__new__(Qwen3VisionModel)
     torch.nn.Module.__init__(obj)
@@ -671,8 +670,13 @@ def _make_qwen3_vision_model_for_l2():
     max_rope_seqlen = 8192
     seq = torch.arange(max_rope_seqlen, dtype=torch.float32)
     freqs = torch.outer(seq, inv_freq)
-    obj.register_buffer("rope_cos_cache", freqs.cos().to("cuda"), persistent=False)
-    obj.register_buffer("rope_sin_cache", freqs.sin().to("cuda"), persistent=False)
+    # ``_rotary_pos_emb_thw`` slices ``rotary_pos_emb.rotary_cos_sin`` and
+    # indexes with ``pos_ids``. Stack cos/sin along dim 1 to match the
+    # real ``RotaryEmbedding`` buffer layout ``(max_pos, 2, freq_dim)``.
+    rotary_cos_sin = torch.stack([freqs.cos(), freqs.sin()], dim=1).to("cuda")
+    rotary_pos_emb = torch.nn.Module()
+    rotary_pos_emb.rotary_cos_sin = rotary_cos_sin
+    obj.rotary_pos_emb = rotary_pos_emb
 
     # patch_embed.proj.weight is what `Qwen3VisionModel.device` reads.
     obj.patch_embed = torch.nn.Module()
@@ -795,116 +799,31 @@ def test_rot_pos_emb_cos_sin_matches_old_repeat_chain():
 
 
 # ---------------------------------------------------------------------------
-# Single-launch batched Triton kernel for fast_pos_embed_interpolate.
-#
-# `_triton_pos_embed_interpolate_batched` replaces the per-image kernel
-# launch + torch.cat with one launch that owns the entire output. The
-# per-token output must match the per-image kernel exactly (bit-identical),
-# since both kernels share the same arithmetic; the only difference is the
-# program_id -> image_idx lookup and runtime (h, w) values.
-# ---------------------------------------------------------------------------
-
-
-_BATCHED_GRIDS = [
-    # Single image
-    [(1, 16, 16)],
-    [(1, 48, 48)],
-    [(3, 8, 12)],
-    # Multi-image, varied (h, w)
-    [(1, 16, 16), (1, 32, 32)],
-    [(1, 16, 16), (3, 8, 12), (1, 32, 32)],
-    [(1, 8, 12), (1, 14, 20), (1, 32, 32), (5, 16, 16)],
-]
-
-
-@pytest.mark.parametrize("dtype", _VIT_POS_EMBED_DTYPES, ids=lambda d: str(d).split(".")[-1])
-@pytest.mark.parametrize(
-    "grid_thw_list",
-    _BATCHED_GRIDS,
-    ids=["_".join(f"{t}x{h}x{w}" for t, h, w in cfg) for cfg in _BATCHED_GRIDS],
-)
-def test_batched_pos_embed_matches_per_image(grid_thw_list, dtype):
-    """Single-launch batched kernel output must equal torch.cat of the
-    per-image kernel outputs, bit-for-bit."""
-    device = "cuda"
-    torch.manual_seed(42)
-    embed_weight = (
-        torch.randn(
-            _VIT_POS_EMBED_NUM_GRID_PER_SIDE * _VIT_POS_EMBED_NUM_GRID_PER_SIDE,
-            _VIT_POS_EMBED_HIDDEN_DIM,
-            device=device,
-            dtype=dtype,
-        )
-        * 0.25
-    )
-
-    per_image = torch.cat(
-        [
-            _triton_pos_embed_interpolate(
-                embed_weight,
-                t,
-                h,
-                w,
-                _VIT_POS_EMBED_NUM_GRID_PER_SIDE,
-                _VIT_POS_EMBED_SPATIAL_MERGE_SIZE,
-                dtype,
-            )
-            for t, h, w in grid_thw_list
-        ],
-        dim=0,
-    )
-    batched = _triton_pos_embed_interpolate_batched(
-        embed_weight,
-        grid_thw_list,
-        _VIT_POS_EMBED_NUM_GRID_PER_SIDE,
-        _VIT_POS_EMBED_SPATIAL_MERGE_SIZE,
-        dtype,
-    )
-
-    assert batched.shape == per_image.shape
-    assert batched.dtype == per_image.dtype
-    # Same arithmetic, same program_id ordering. The per-image kernel
-    # receives ``h_scale``/``w_scale`` as JIT constants; the batched
-    # kernel loads them from an fp32 tensor (same precision, different
-    # codegen path), so FMA fusion choices can differ by a single ULP
-    # in fp32. The bf16 path stays within the same tolerance the
-    # per-image test uses (1e-2).
-    atol = {torch.float32: 5e-4, torch.bfloat16: 1e-2}[dtype]
-    rtol = {torch.float32: 5e-4, torch.bfloat16: 1e-2}[dtype]
-    torch.testing.assert_close(batched, per_image, atol=atol, rtol=rtol)
-
-
-# ---------------------------------------------------------------------------
-# rope_cos_cache / rope_sin_cache buffers (replace HF rotary + per-forward
-# .cos()/.sin()).
+# Pre-computed cos/sin buffer (RotaryEmbedding.rotary_cos_sin) used by
+# ``_rotary_pos_emb_thw`` to gather without firing per-forward
+# ``.cos()`` / ``.sin()`` kernels.
 # ---------------------------------------------------------------------------
 
 
 def test_rope_cos_sin_buffers_match_hf_rotary():
-    """Our pre-computed cos/sin buffers must bit-match HF's
-    ``Qwen3VLVisionRotaryEmbedding(dim=36)(max_hw).cos()/.sin()``
-    output. (The cos/sin split mirrors what
-    ``vllm.model_executor.layers.rotary_embedding.base._compute_cos_sin_cache``
-    does at init time.)"""
+    """The cos/sin cache exposed via ``rotary_pos_emb.rotary_cos_sin`` must
+    bit-match HF's ``Qwen3VLVisionRotaryEmbedding(dim=36)(max_hw).cos()``
+    / ``.sin()`` output."""
     from transformers.models.qwen3_vl.modeling_qwen3_vl import (
         Qwen3VLVisionRotaryEmbedding as HFQwen3VLVisionRotaryEmbedding,
     )
 
     vm = _make_qwen3_vision_model_for_l2()
     hf = HFQwen3VLVisionRotaryEmbedding(36).to("cuda")
-    # Our buffers are computed on CPU at init time and then moved to
-    # device; HF computes the outer product on-device in its forward.
-    # Same arithmetic, different host/device fp32 codegen -- expect
-    # single-ULP differences (~1e-7).
     atol = rtol = 1e-6
+    # ``rotary_cos_sin`` is stacked along dim 1 as (max_pos, 2, freq_dim);
+    # index 0 holds cos, index 1 holds sin.
+    cos_cache = vm.rotary_pos_emb.rotary_cos_sin[:, 0, :]
+    sin_cache = vm.rotary_pos_emb.rotary_cos_sin[:, 1, :]
     for max_hw in [16, 32, 48, 64, 100, 128]:
         ref_freqs = hf(max_hw)
-        torch.testing.assert_close(
-            vm.rope_cos_cache[:max_hw], ref_freqs.cos(), atol=atol, rtol=rtol
-        )
-        torch.testing.assert_close(
-            vm.rope_sin_cache[:max_hw], ref_freqs.sin(), atol=atol, rtol=rtol
-        )
+        torch.testing.assert_close(cos_cache[:max_hw], ref_freqs.cos(), atol=atol, rtol=rtol)
+        torch.testing.assert_close(sin_cache[:max_hw], ref_freqs.sin(), atol=atol, rtol=rtol)
 
 
 # ---------------------------------------------------------------------------

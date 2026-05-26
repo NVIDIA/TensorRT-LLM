@@ -776,12 +776,11 @@ class Qwen2_5_VLVisionBlock(torch.nn.Module):
         position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         **kwargs,
     ) -> torch.Tensor:
-        # vLLM-style residual fusion: collapse the post-attn residual add
-        # into ``norm2``'s residual path (``RMSNorm.forward`` with ``residual=``
-        # uses the FlashInfer ``fused_add_rmsnorm`` kernel). Saves one
-        # ``add<c10::BFloat16>`` launch per vision block (= 32 launches per
-        # executor iter at full-batch). Mirrors
-        # ``vllm/model_executor/models/qwen2_5_vl.py::Qwen2_5_VisionBlock``.
+        # Collapse the post-attn residual add into ``norm2``'s residual path
+        # (``RMSNorm.forward`` with ``residual=`` uses the FlashInfer
+        # ``fused_add_rmsnorm`` kernel). Saves one ``add<c10::BFloat16>``
+        # launch per vision block (= 32 launches per executor iter at
+        # full-batch).
         x_attn = self.attn(
             hidden_states=self.norm1(hidden_states),
             attn_metadata=attn_metadata,
@@ -954,9 +953,9 @@ class Qwen2_5_VisionModel(torch.nn.Module):
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Tuple[int, ...]]:
         """GPU (cos_thw, sin_thw); CPU (window_index_thw, seq_lens_thw).
 
-        Cached per ``(t, h, w)``. Mirrors vLLM's ``get_rope_by_thw`` pattern:
-        pos_ids and window_index are built on CPU, then moved to device once
-        per unique tile. The gather (``cos[pos_ids]``) and window reorder
+        Cached per ``(t, h, w)``. pos_ids and window_index are built on CPU,
+        then moved to device once per unique tile. The gather
+        (``cos[pos_ids]``) and window reorder
         (``cos_thw[window_index_thw_dev]``) run on device, so the cached
         cos/sin tensors are already-on-device -- ``forward``'s ``torch.cat``
         on them is a device-side cat with no H->D transfer. ``window_index``
@@ -981,13 +980,6 @@ class Qwen2_5_VisionModel(torch.nn.Module):
         bytes fp32). Typical production VLM serving has 10-30 unique tile
         shapes, so the cache settles around 10-20 MB. ``maxsize=1024`` is
         a safety cap; reaching it requires >1024 distinct (t, h, w).
-
-        Note: vLLM's equivalent ``get_rope_by_thw`` casts the rotary
-        cos_sin_cache to the model dtype (bf16) via ``get_rope(dtype=torch.
-        get_default_dtype())`` -- so the equivalent vLLM cache is half the
-        size (320 B/token, ~5-10 MB production). ``RopeParams.create_rope_
-        const_params`` hardcodes fp32; switching to model dtype would halve
-        this footprint but is a separate change.
         """
         hpos_ids = torch.arange(h, dtype=torch.long).unsqueeze(1).expand(-1, w)
         wpos_ids = torch.arange(w, dtype=torch.long).unsqueeze(0).expand(h, -1)
@@ -1034,9 +1026,8 @@ class Qwen2_5_VisionModel(torch.nn.Module):
             -1, sin_thw.shape[-1])
 
         # Cast once (per cached (t, h, w)) to the vision-tower dtype so the
-        # per-block ``cos.to(dtype=q.dtype)`` cast in ``apply_rope`` becomes a
-        # no-op. Mirrors vLLM's ``get_rope_by_thw`` which builds the rotary
-        # cache directly in the model dtype (see note above).
+        # per-block ``cos.to(dtype=q.dtype)`` cast in ``apply_rope`` becomes
+        # a no-op on the hot path.
         target_dtype = (
             self.model_config.pretrained_config.vision_config.torch_dtype
             if hasattr(self.model_config.pretrained_config.vision_config,
