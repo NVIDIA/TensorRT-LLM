@@ -82,9 +82,6 @@ def inplace_info():
         torch.ops.trtllm.fused_dit_qk_norm_rope.default: {
             1: "qkv"
         },
-        torch.ops.trtllm.fused_dit_cross_head_qk_norm_rope.default: {
-            1: "qkv"
-        },
         torch.ops.trtllm.fused_dit_split_norm_rope.default: {
             1: "tensor"
         },
