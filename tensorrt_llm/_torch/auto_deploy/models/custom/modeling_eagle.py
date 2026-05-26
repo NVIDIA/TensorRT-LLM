@@ -746,6 +746,12 @@ class EagleWrapperConfig:
     load_lm_head_from_target: bool
     normalize_target_hidden_state: bool = False
     sync_before_hidden_state_capture: bool = False
+    # When attention-DP is enabled, each rank holds a different slice of the
+    # global batch and produces legitimately different per-rank tokens. The
+    # rank-0 token broadcast applied for TP-replication consistency (see
+    # `sample_greedy`) must be skipped in that mode to avoid overwriting
+    # peers' real samples.
+    enable_attention_dp: bool = False
 
 
 class EagleWrapper(nn.Module):
@@ -767,6 +773,7 @@ class EagleWrapper(nn.Module):
         self.load_lm_head_from_target = config.load_lm_head_from_target
         self.normalize_target_hidden_state = config.normalize_target_hidden_state
         self.sync_before_hidden_state_capture = config.sync_before_hidden_state_capture
+        self.enable_attention_dp = config.enable_attention_dp
 
     @property
     def _draft_inner_model(self):
@@ -832,12 +839,19 @@ class EagleWrapper(nn.Module):
 
     def sample_greedy(self, logits: torch.Tensor) -> torch.Tensor:
         ret = torch.argmax(logits, dim=-1)
-        # Broadcast rank 0's sampled tokens to all ranks. We have observed slight
-        # differences in logits across ranks. This can cause different acceptance patterns,
-        # inconsistent input_pos, and a hang. This synchronizes every
-        # validation step to prevent this. See:
+        # Under TP-replication, all ranks compute the same logits but small
+        # floating-point differences can drive different argmax results,
+        # producing divergent acceptance patterns / input_pos and an
+        # eventual hang. The broadcast below synchronizes rank 0's tokens
+        # to all ranks each validation step. See:
         # https://github.com/NVIDIA/TensorRT-LLM/issues/13134
-        broadcast(ret, src=0)
+        #
+        # Under attention-DP, each rank holds a *different* slice of the
+        # global batch so per-rank tokens are legitimately different;
+        # broadcasting would overwrite peers' real samples with rank 0's
+        # values and corrupt per-request state.
+        if not self.enable_attention_dp:
+            broadcast(ret, src=0)
         return ret
 
     def forward(self, cache_seq_interface: Optional[CachedSequenceInterface] = None, **kwargs):

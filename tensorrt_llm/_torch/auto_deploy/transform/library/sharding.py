@@ -1233,6 +1233,27 @@ class Sharding(BaseTransform):
             if ShardingDim.EP in config.sharding_dims:
                 ad_logger.info("Running autodeploy EP sharding heuristics")
                 info += detect_ep_shard(gm, transform_container)
+                # Under attention-DP, EP-sharding the draft submodel forces its
+                # MoE op into the alltoall path. Target and draft share a
+                # single process-wide MoeAlltoAll workspace + flag_val counter
+                # (singleton in MoeAlltoAll._WORKSPACE), so a misconfigured
+                # draft alltoall corrupts the workspace and the subsequent
+                # target alltoall calls hang or fault. Replicating the draft
+                # (no EP sharding, no alltoall) is the safe choice: the draft
+                # is small enough that the 4x weight memory is negligible,
+                # and each rank computes its local-batch slice locally with no
+                # cross-rank communication needed.
+                if (
+                    _is_draft
+                    and config.dist_config.enable_attention_dp
+                    and transform_container.ep_transforms
+                ):
+                    ad_logger.info(
+                        "Reverting %d EP sharding transform(s) on draft submodel "
+                        "under attention_dp (replicating instead).",
+                        len(transform_container.ep_transforms),
+                    )
+                    transform_container.ep_transforms.clear()
             if ShardingDim.BMM in config.sharding_dims:
                 # While BMM nodes are most likely used for MoE (e.g. LLama4),
                 # technically, this is a different transformation.
