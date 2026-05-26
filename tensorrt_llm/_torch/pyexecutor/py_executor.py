@@ -1672,6 +1672,16 @@ class PyExecutor:
             raise RuntimeError(
                 "KV cache transceiver is not enabled, but current rank cannot run first PP's schedule result due to limited KV cache resources. This is not expected."
             )
+        # Non-blocking drain of terminal transceiver events before the
+        # has_any_inflight_requests() check below: a request can be removed
+        # from in-flight tracking while the underlying C++ async transfer /
+        # KV-cache release is still pending, which would spuriously trigger
+        # the "no inflight" RuntimeError. If the drain frees enough
+        # resources, skip the retry loop entirely.
+        self._check_disagg_ctx_cache_transfer_status(0)
+        self._check_kv_transfer_timeout()
+        if self.scheduler.can_schedule(scheduled_batch_requests):
+            return
         if not self.async_transfer_manager.has_any_inflight_requests():
             raise RuntimeError(
                 "No context cache transmission is in progress, but current rank cannot run first PP's schedule result due to limited KV cache resources. This is not expected."
