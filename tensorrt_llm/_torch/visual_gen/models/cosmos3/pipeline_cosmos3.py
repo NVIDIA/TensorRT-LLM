@@ -25,10 +25,9 @@ from diffusers.utils.torch_utils import randn_tensor
 from diffusers.video_processor import VideoProcessor
 from transformers import Qwen2Tokenizer
 
-from tensorrt_llm._torch.visual_gen.config import PipelineComponent
 from tensorrt_llm._torch.visual_gen.output import CudaPhaseTimer, PipelineOutput
 from tensorrt_llm._torch.visual_gen.pipeline import BasePipeline
-from tensorrt_llm._torch.visual_gen.pipeline_registry import register_pipeline
+from tensorrt_llm._torch.visual_gen.pipeline_registry import PipelineComponent, register_pipeline
 from tensorrt_llm._torch.visual_gen.utils import postprocess_video_tensor
 from tensorrt_llm._utils import nvtx_range
 from tensorrt_llm.logger import logger
@@ -60,7 +59,8 @@ COSMOS3_DEFAULT_RESOLUTION_TEMPLATE = "This video is of {height}x{width} resolut
 TRTLLM_DISABLE_COSMOS3_GUARDRAILS = os.environ.get("TRTLLM_DISABLE_COSMOS3_GUARDRAILS", "0") == "1"
 
 
-@register_pipeline("Cosmos3OmniMoTPipeline")
+# TODO: add hf_ids
+@register_pipeline("Cosmos3OmniMoTPipeline", defaults={"guardrail_checkpoint_dir": None})
 class Cosmos3OmniMoTPipeline(BasePipeline):
     def __init__(self, model_config):
         super().__init__(model_config)
@@ -78,6 +78,8 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
     def load_standard_components(
         self, checkpoint_dir: str, device: torch.device, skip_components: Optional[list] = []
     ) -> None:
+        skip_components = skip_components or []
+
         if PipelineComponent.TOKENIZER not in skip_components:
             logger.info("Loading tokenizer...")
             self.tokenizer = Qwen2Tokenizer.from_pretrained(

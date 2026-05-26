@@ -397,13 +397,10 @@ class DiffusionModelConfig(BaseModel):
         resolved_pipeline_config = kwargs.pop("pipeline_config", None)
         if resolved_pipeline_config is None:
             resolved_pipeline_config = dict(args.pipeline_config) if args else {}
-        for key in ("spatial_upsampler_path", "distilled_lora_path"):
+        for key in ("spatial_upsampler_path", "distilled_lora_path", "guardrail_checkpoint_dir"):
             value = resolved_pipeline_config.get(key)
             if value:
                 extra_attrs[key] = value
-
-        if args and args.guardrail_checkpoint_dir:
-            extra_attrs["guardrail_checkpoint_dir"] = args.guardrail_checkpoint_dir
 
         # Discover pipeline components (diffusers layout)
         components = discover_pipeline_components(checkpoint_path)

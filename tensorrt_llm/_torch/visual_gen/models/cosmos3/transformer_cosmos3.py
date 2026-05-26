@@ -992,18 +992,36 @@ class Cosmos3VFMTransformer(nn.Module):
         return self.unpatchify(self.llm2vae(hidden_gen), T, H, W)
 
     def load_weights(self, weights: dict) -> None:
-        """Load weights with key remapping from Diffusers/HF Cosmos3 checkpoints.
+        """Load weights with key remapping from Cosmos3-Nano / Diffusers checkpoints.
 
-        Expects tensor names under ``model.*`` (e.g. ``model.layers.{i}.self_attn.q_proj.weight``).
+        Expects tensor names as in ``diffusion_pytorch_model.safetensors.index.json``
+        (e.g. ``layers.{i}.self_attn.to_q.weight``, ``proj_in.weight``).
         Maps UND vs GEN blocks into this module's layout (causal self-attn vs cross-attn + MLPs).
         """
         remapped = {}
+        skip_prefixes = (
+            "lm_head.",
+            "action_modality_embed",
+            "action_proj_",
+            "audio_modality_embed",
+            "audio_proj_",
+        )
 
         for key, value in weights.items():
             k = key
 
+            if k.startswith(skip_prefixes):
+                continue
+
             if k.startswith(("vae2llm.", "llm2vae.")):
                 remapped[k] = value
+                continue
+
+            if k.startswith("proj_in."):
+                remapped[k.replace("proj_in.", "vae2llm.", 1)] = value
+                continue
+            if k.startswith("proj_out."):
+                remapped[k.replace("proj_out.", "llm2vae.", 1)] = value
                 continue
 
             if k.startswith("time_embedder.linear"):
@@ -1012,13 +1030,8 @@ class Cosmos3VFMTransformer(nn.Module):
                 remapped[k] = value
                 continue
 
-            if k.startswith("lm_head."):
-                continue
-
-            if not k.startswith("model."):
-                logger.warning(f"Skipping unknown checkpoint key: {key}")
-                continue
-            k = k[len("model.") :]
+            if k.startswith("model."):
+                k = k[len("model.") :]
 
             # embed_tokens and norm → language_model.*
             if k.startswith("embed_tokens.") or k.startswith("norm."):
@@ -1031,7 +1044,7 @@ class Cosmos3VFMTransformer(nn.Module):
                 continue
 
             if not k.startswith("layers."):
-                logger.warning(f"Skipping unknown LM key: {key}")
+                logger.warning(f"Skipping unknown checkpoint key: {key}")
                 continue
 
             parts = k.split(".", 2)  # ['layers', '{i}', '{rest}']
@@ -1045,22 +1058,22 @@ class Cosmos3VFMTransformer(nn.Module):
 
             # --- UND attention → language_model.layers.{i}.self_attn.* ---
             attn_und_map = {
-                "self_attn.q_proj.": f"{und_lp}.self_attn.to_q.",
-                "self_attn.k_proj.": f"{und_lp}.self_attn.to_k.",
-                "self_attn.v_proj.": f"{und_lp}.self_attn.to_v.",
-                "self_attn.o_proj.": f"{und_lp}.self_attn.to_out.0.",
-                "self_attn.q_norm.": f"{und_lp}.self_attn.norm_q.",
-                "self_attn.k_norm.": f"{und_lp}.self_attn.norm_k.",
+                "self_attn.to_q.": f"{und_lp}.self_attn.to_q.",
+                "self_attn.to_k.": f"{und_lp}.self_attn.to_k.",
+                "self_attn.to_v.": f"{und_lp}.self_attn.to_v.",
+                "self_attn.to_out.": f"{und_lp}.self_attn.to_out.0.",
+                "self_attn.norm_q.": f"{und_lp}.self_attn.norm_q.",
+                "self_attn.norm_k.": f"{und_lp}.self_attn.norm_k.",
             }
 
             # --- GEN attention → gen_layers.{i}.cross_attention.* ---
             attn_gen_map = {
-                "self_attn.q_proj_moe_gen.": f"{gen_lp}.cross_attention.to_q.",
-                "self_attn.k_proj_moe_gen.": f"{gen_lp}.cross_attention.to_k.",
-                "self_attn.v_proj_moe_gen.": f"{gen_lp}.cross_attention.to_v.",
-                "self_attn.o_proj_moe_gen.": f"{gen_lp}.cross_attention.to_out.0.",
-                "self_attn.q_norm_moe_gen.": f"{gen_lp}.cross_attention.norm_q.",
-                "self_attn.k_norm_moe_gen.": f"{gen_lp}.cross_attention.norm_k.",
+                "self_attn.add_q_proj.": f"{gen_lp}.cross_attention.to_q.",
+                "self_attn.add_k_proj.": f"{gen_lp}.cross_attention.to_k.",
+                "self_attn.add_v_proj.": f"{gen_lp}.cross_attention.to_v.",
+                "self_attn.to_add_out.": f"{gen_lp}.cross_attention.to_out.0.",
+                "self_attn.norm_added_q.": f"{gen_lp}.cross_attention.norm_q.",
+                "self_attn.norm_added_k.": f"{gen_lp}.cross_attention.norm_k.",
             }
 
             # --- Norms ---
