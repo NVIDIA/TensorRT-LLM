@@ -58,25 +58,41 @@ source "$config_file"
 : "${partition:=CHANGE_ME}"
 : "${account:=coreai_comparch_trtllm}"
 : "${job_name:=disagg_test}"
+: "${image:=}"
 : "${image_var:=LLM_DOCKER_IMAGE}"
 : "${mounts:=/lustre:/lustre,/home:/home}"
 : "${llm_models_path:=/path/to/models}"
-: "${test_id:=perf/test_perf_sanity.py::test_e2e[disagg-e2e-CHANGE_ME]}"
 : "${install_mode:=wheel}"
 : "${wheel_path:=CHANGE_ME}"
 : "${build_wheel_flag:=}"
 : "${capture_nsys_flag:=}"
 : "${time_limit:=02:00:00}"
 
+# Normalize test list: prefer 'test_ids' bash array if set, else fall back to
+# legacy single 'test_id'. Either declares a non-empty list at this point.
+if declare -p test_ids >/dev/null 2>&1 && [[ "$(declare -p test_ids)" == "declare -a"* ]]; then
+    :  # test_ids already an array
+elif [[ -n "${test_id:-}" ]]; then
+    test_ids=("$test_id")
+else
+    test_ids=("perf/test_perf_sanity.py::test_e2e[disagg-e2e-CHANGE_ME]")
+fi
+
 # ---------------- Sanity checks ----------------
 if [[ "$partition" == "CHANGE_ME" ]]; then
     echo "ERROR: please set 'partition' in $config_file." >&2
     exit 1
 fi
-if [[ "$test_id" == *"CHANGE_ME"* ]]; then
-    echo "ERROR: please set 'test_id' in $config_file." >&2
+if [[ ${#test_ids[@]} -eq 0 ]]; then
+    echo "ERROR: 'test_ids' is empty. Set 'test_id' or 'test_ids' in $config_file." >&2
     exit 1
 fi
+for _tid in "${test_ids[@]}"; do
+    if [[ "$_tid" == *"CHANGE_ME"* ]]; then
+        echo "ERROR: please set 'test_id'/'test_ids' in $config_file (got placeholder: $_tid)." >&2
+        exit 1
+    fi
+done
 if [[ ! -d "$trtllm" ]]; then
     echo "ERROR: trtllm directory not found: $trtllm" >&2
     exit 1
@@ -96,17 +112,30 @@ fi
 mkdir -p "$work_dir"
 
 # ---------------- Resolve docker image ----------------
-image_file="$trtllm/jenkins/current_image_tags.properties"
-if [[ ! -f "$image_file" ]]; then
-    echo "ERROR: image properties file not found: $image_file" >&2
-    exit 1
+# Two mutually-exclusive modes (image takes precedence if both set):
+#   (a) 'image' non-empty  → used verbatim. 'image_var' is ignored.
+#   (b) 'image' empty/unset → look up 'image_var' as a key in
+#       $trtllm/jenkins/current_image_tags.properties (CI-updated file).
+if [[ -n "$image" ]]; then
+    image_source="pinned in conf"
+else
+    image_file="$trtllm/jenkins/current_image_tags.properties"
+    if [[ ! -f "$image_file" ]]; then
+        echo "ERROR: image properties file not found: $image_file" >&2
+        exit 1
+    fi
+    # NOTE: grep returning no match would exit 1 and set -o pipefail+set -e would
+    # silently kill the script before our error message — append '|| true' to absorb.
+    image=$(grep "^${image_var}=" "$image_file" | head -1 | awk -F"=" '{print $2}' || true)
+    if [[ -z "$image" ]]; then
+        echo "ERROR: failed to parse '${image_var}' from $image_file" >&2
+        echo "       (Either fix image_var to a key in that file, or set 'image' directly in the conf.)" >&2
+        exit 1
+    fi
+    image_source="resolved from \$image_var=${image_var} via current_image_tags.properties"
 fi
-image=$(grep "^${image_var}=" "$image_file" | head -1 | awk -F"=" '{print $2}')
+# urm.nvidia.com/ → urm.nvidia.com# (enroot URI form). No-op if user already passed enroot form.
 image=${image//urm.nvidia.com\//urm.nvidia.com#}
-if [[ -z "$image" ]]; then
-    echo "ERROR: failed to parse ${image_var} from $image_file" >&2
-    exit 1
-fi
 
 echo "=== Configuration ==="
 echo "config_file      : $config_file"
@@ -115,14 +144,17 @@ echo "work_dir         : $work_dir"
 echo "partition        : $partition"
 echo "account          : $account"
 echo "job_name         : $job_name"
-echo "image_var        : $image_var"
 echo "image            : $image"
+echo "image_source     : $image_source"
 echo "mounts           : $mounts"
 echo "llm_models_path  : $llm_models_path"
-echo "test_id          : $test_id"
 echo "install_mode     : $install_mode"
 echo "wheel_path       : $wheel_path"
 echo "time_limit       : $time_limit"
+echo "num_tests        : ${#test_ids[@]}"
+for _i in "${!test_ids[@]}"; do
+    printf "  test[%02d]       : %s\n" "$_i" "${test_ids[$_i]}"
+done
 echo "======================"
 
 # Build install-mode / wheel-path args for submit.py
@@ -131,34 +163,98 @@ if [[ "$install_mode" == "wheel" ]]; then
     install_args+=(--wheel-path "$wheel_path")
 fi
 
-# 1. Generate slurm_launch.sh
-python3 "$trtllm/jenkins/scripts/perf/local/submit.py" \
-    --test-list "$test_id" \
-    --draft-launch-sh "$trtllm/jenkins/scripts/perf/disaggregated/slurm_launch_draft.sh" \
-    --launch-sh "$work_dir/slurm_launch.sh" \
-    --install-sh "$trtllm/jenkins/scripts/perf/local/slurm_install.sh" \
-    --run-sh "$trtllm/jenkins/scripts/perf/local/slurm_run.sh" \
-    --llm-src "$trtllm" \
-    --work-dir "$work_dir" \
-    --partition "$partition" \
-    --account "$account" \
-    --job-name "$job_name" \
-    --image "$image" \
-    --mounts "$mounts" \
-    --llm-models-root "$llm_models_path" \
-    --time "$time_limit" \
-    "${install_args[@]}" \
-    $build_wheel_flag \
-    $capture_nsys_flag
+# Default strip list — see note inside the loop.
+: "${strip_sbatch_opts:=--segment}"
+
+# Per-test loop: each test gets its own subdir (when >1), its own slurm_launch.sh,
+# and its own sbatch submission. Failures are collected, not fatal, so a bad
+# test_id doesn't stop the rest of the batch.
+num_tests=${#test_ids[@]}
+submitted_count=0
+failed_tests=()
+
+for idx in "${!test_ids[@]}"; do
+    tid="${test_ids[$idx]}"
+
+    # When running a single test, keep the flat layout (back-compat); for
+    # multi-test, drop each into its own subdir named by a slug of the test id.
+    if [[ $num_tests -gt 1 ]]; then
+        slug="${tid#*[}"      # strip everything up to and including '['
+        slug="${slug%]*}"     # strip trailing ']' and beyond
+        slug="${slug//[^a-zA-Z0-9_.-]/_}"
+        test_work_dir="$work_dir/$(printf '%02d_%s' "$idx" "$slug")"
+        test_job_name="${job_name}_${idx}"
+    else
+        test_work_dir="$work_dir"
+        test_job_name="$job_name"
+    fi
+    mkdir -p "$test_work_dir"
+
+    echo
+    echo "=== [$((idx+1))/$num_tests] $tid ==="
+    echo "    work_dir : $test_work_dir"
+    echo "    job_name : $test_job_name"
+
+    # 1. Generate slurm_launch.sh for this test.
+    # NOTE: we deliberately do NOT pass --draft-launch-sh — submit.py picks the
+    # right draft (disaggregated/ vs aggregated/) based on the runtime_mode it
+    # derives from the test id. Hard-coding the disagg draft here breaks
+    # 'aggr-ctx_only-*' tests, which run in aggregated mode but would otherwise
+    # be launched with the disagg orchestration (and produce no report.xml).
+    if ! python3 "$trtllm/jenkins/scripts/perf/local/submit.py" \
+        --test-list "$tid" \
+        --launch-sh "$test_work_dir/slurm_launch.sh" \
+        --install-sh "$trtllm/jenkins/scripts/perf/local/slurm_install.sh" \
+        --run-sh "$trtllm/jenkins/scripts/perf/local/slurm_run.sh" \
+        --llm-src "$trtllm" \
+        --work-dir "$test_work_dir" \
+        --partition "$partition" \
+        --account "$account" \
+        --job-name "$test_job_name" \
+        --image "$image" \
+        --mounts "$mounts" \
+        --llm-models-root "$llm_models_path" \
+        --time "$time_limit" \
+        "${install_args[@]}" \
+        $build_wheel_flag \
+        $capture_nsys_flag; then
+        echo "ERROR: submit.py failed for $tid — skipping." >&2
+        failed_tests+=("$tid (submit.py failed)")
+        continue
+    fi
+
+    # Strip SBATCH directives unsupported by this cluster's SLURM.
+    # Default '--segment': newer SLURM topology feature, missing on older clusters (e.g. EOS).
+    if [[ -n "$strip_sbatch_opts" ]]; then
+        IFS=',' read -ra _strip_arr <<< "$strip_sbatch_opts"
+        for opt in "${_strip_arr[@]}"; do
+            opt_trimmed="${opt#"${opt%%[![:space:]]*}"}"
+            opt_trimmed="${opt_trimmed%"${opt_trimmed##*[![:space:]]}"}"
+            [[ -z "$opt_trimmed" ]] && continue
+            sed -i.bak "s|^#SBATCH \(${opt_trimmed}\)|# (stripped) #SBATCH \1|" "$test_work_dir/slurm_launch.sh"
+        done
+        rm -f "$test_work_dir/slurm_launch.sh.bak"
+    fi
+
+    # 2. Submit
+    if ( cd "$test_work_dir" && sbatch slurm_launch.sh ); then
+        submitted_count=$((submitted_count + 1))
+    else
+        echo "ERROR: sbatch failed for $tid" >&2
+        failed_tests+=("$tid (sbatch failed)")
+    fi
+done
 
 echo
-echo "Generated: $work_dir/slurm_launch.sh"
-echo "Submitting to SLURM..."
-
-# 2. Submit
-cd "$work_dir"
-sbatch slurm_launch.sh
-
-echo
-echo "Done. Check status with:  squeue -u \$USER"
-echo "Logs and outputs will appear under: $work_dir"
+echo "=== Submission summary ==="
+echo "Submitted: $submitted_count / $num_tests"
+if [[ ${#failed_tests[@]} -gt 0 ]]; then
+    echo "Failed:"
+    for ft in "${failed_tests[@]}"; do
+        echo "  - $ft"
+    done
+fi
+echo "Check status with:  squeue -u \$USER"
+echo "Logs and outputs under: $work_dir"
+[[ ${#failed_tests[@]} -gt 0 ]] && exit 1
+exit 0
