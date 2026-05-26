@@ -1869,6 +1869,20 @@ class MLA(nn.Module):
                               and is_sm_100f())
         if fused_inv_rope_fp8:
             heads_per_group = self.num_heads_tp // self.n_local_groups
+            # CI #39877 triage: step-by-step sync+log around the fused
+            # inv-RoPE + cute_dsl_bmm + o_b_proj chain. Default-ON while
+            # debugging; pairs with the C++-side sync in
+            # inverseRopeFp8QuantOp. Set TRTLLM_INV_ROPE_FP8_DIAG=0 to
+            # disable once CI is resolved.
+            _diag = os.environ.get("TRTLLM_INV_ROPE_FP8_DIAG", "1") != "0"
+            if _diag:
+                torch.cuda.synchronize()
+                logger.info(
+                    "[inv-rope-diag] enter fused path: M=%d num_heads_tp=%d "
+                    "n_local_groups=%d hpg=%d nope=%d rope=%d is_neox=%s",
+                    num_tokens, self.num_heads_tp, self.n_local_groups,
+                    heads_per_group, self.qk_nope_head_dim,
+                    self.qk_rope_head_dim, self.inverse_rotary_emb.is_neox)
             attn_fp8, attn_scale = (
                 torch.ops.trtllm.fused_inv_rope_fp8_quant_vllm_port(
                     attn_out_latent,
@@ -1881,6 +1895,11 @@ class MLA(nn.Module):
                     128,
                     self.inverse_rotary_emb.is_neox,
                 ))
+            if _diag:
+                torch.cuda.synchronize()
+                logger.info(
+                    "[inv-rope-diag] fused inv-rope-fp8 OK: fp8=%s scale=%s",
+                    tuple(attn_fp8.shape), tuple(attn_scale.shape))
             o_lora = torch.empty(
                 [num_tokens, self.n_local_groups, self.o_lora_rank],
                 device=attn_out_latent.device,
@@ -1889,8 +1908,17 @@ class MLA(nn.Module):
                                                         attn_scale,
                                                         self.o_a_proj_scale,
                                                         o_lora.transpose(0, 1))
+            if _diag:
+                torch.cuda.synchronize()
+                logger.info("[inv-rope-diag] cute_dsl_fp8_bmm OK: o_lora=%s",
+                            tuple(o_lora.shape))
             o_lora = o_lora.flatten(1)
-            return self.o_b_proj(o_lora)
+            out = self.o_b_proj(o_lora)
+            if _diag:
+                torch.cuda.synchronize()
+                logger.info("[inv-rope-diag] o_b_proj OK: out=%s",
+                            tuple(out.shape))
+            return out
 
         # Fused in-place inverse RoPE on the rope portion of each head
         torch.ops.trtllm.mla_rope_inplace(
