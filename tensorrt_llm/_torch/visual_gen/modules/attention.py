@@ -68,9 +68,10 @@ class Attention(nn.Module):
         self.qkv_mode = QKVMode(qkv_mode) if isinstance(qkv_mode, str) else qkv_mode
         self.bias = bias
 
-        tp_size = self.mapping.tp_size if self.mapping else 1
+        self.tp_size = self.mapping.tp_size if self.mapping else 1
         assert (
-            self.num_attention_heads % tp_size == 0 and self.num_key_value_heads % tp_size == 0
+            self.num_attention_heads % self.tp_size == 0
+            and self.num_key_value_heads % self.tp_size == 0
         ), "TP size must divide the number of Query and KV Heads"
 
         # Fused QK Norm + RoPE: each model class opts in via fuse_qk_norm_rope.
@@ -79,7 +80,7 @@ class Attention(nn.Module):
         #   - full-dim template (LTX-2, WAN):    q/k_weight.shape == [num_heads * head_dim]
         # Full-dim template envelope: num_heads <= 64, head_dim in {64, 128}.
         self.fuse_qk_norm_rope = fuse_qk_norm_rope if fuse_qk_norm_rope is not None else False
-        assert not (self.fuse_qk_norm_rope and tp_size > 1 and qk_norm_mode == "full"), (
+        assert not (self.fuse_qk_norm_rope and self.tp_size > 1 and qk_norm_mode == "full"), (
             "fuse_qk_norm_rope + qk_norm_mode='full' + TP>1: fused kernel lacks cross-rank "
             "all-reduce for cross-head RMSNorm variance. Disable fuse_qk_norm_rope for TP>1."
         )
@@ -105,8 +106,8 @@ class Attention(nn.Module):
         self.q_dim = self.num_attention_heads * self.head_dim
         self.kv_dim = self.num_key_value_heads * self.head_dim
 
-        self.local_num_attention_heads = self.num_attention_heads // self.mapping.tp_size
-        self.local_num_key_value_heads = self.num_key_value_heads // self.mapping.tp_size
+        self.local_num_attention_heads = self.num_attention_heads // self.tp_size
+        self.local_num_key_value_heads = self.num_key_value_heads // self.tp_size
         self.local_q_dim = self.local_num_attention_heads * self.head_dim
         self.local_kv_dim = self.local_num_key_value_heads * self.head_dim
 
@@ -120,7 +121,7 @@ class Attention(nn.Module):
 
             q_norm_dim = self.head_dim if qk_norm_mode == "per_head" else self.q_dim
             k_norm_dim = self.head_dim if qk_norm_mode == "per_head" else self.kv_dim
-            enable_tp_rms = (tp_size > 1) and qk_norm_mode == "full"
+            enable_tp_rms = self.tp_size > 1 and qk_norm_mode == "full"
             self.norm_q = RMSNorm(
                 hidden_size=q_norm_dim,
                 eps=self.eps,
@@ -150,8 +151,8 @@ class Attention(nn.Module):
                     quant_config=self.quant_config,
                     skip_create_weights_in_init=self.skip_create_weights_in_init,
                     force_dynamic_quantization=self.force_dynamic_quantization,
-                    tensor_parallel_mode=TensorParallelMode.ROW if tp_size > 1 else None,
-                    reduce_output=(tp_size > 1),
+                    tensor_parallel_mode=TensorParallelMode.ROW if self.tp_size > 1 else None,
+                    reduce_output=(self.tp_size > 1),
                     allreduce_strategy=self.allreduce_strategy,
                 )
             ]
@@ -225,7 +226,7 @@ class Attention(nn.Module):
                     self.attn = UlyssesAttention(self.attn, process_group=vgm.ulysses_group)
 
     def _init_qkv_proj(self) -> None:
-        tp_mode = TensorParallelMode.COLUMN if self.mapping.tp_size > 1 else None
+        tp_mode = TensorParallelMode.COLUMN if self.tp_size > 1 else None
 
         if self.qkv_mode == QKVMode.FUSE_QKV:
             qkv_out_dim = self.q_dim + 2 * self.kv_dim

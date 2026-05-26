@@ -74,8 +74,6 @@ class FluxJointAttention(Attention):
         self.pre_only = pre_only
         self.added_kv_proj_dim = added_kv_proj_dim
 
-        self.tp_size = config.mapping.tp_size if config else 1
-
         if self.pre_only:
             del self.to_out
 

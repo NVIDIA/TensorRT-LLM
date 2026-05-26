@@ -134,9 +134,9 @@ class LTX2Attention(Attention):
             self._plain_attn = create_attention(
                 backend=self.attn_backend,
                 layer_idx=self.layer_idx,
-                num_heads=self.num_attention_heads,
+                num_heads=self.num_local_attention_heads,
                 head_dim=self.head_dim,
-                num_kv_heads=self.num_key_value_heads,
+                num_kv_heads=self.num_local_key_value_heads,
                 quant_config=self.quant_config,
                 dtype=self.dtype,
                 attention_config=config.attention,
@@ -145,7 +145,6 @@ class LTX2Attention(Attention):
             self._has_dual_attn = True
 
         if apply_gated_attention:
-            tp_size = self.mapping.tp_size if self.mapping else 1
             self.to_gate_logits = Linear(
                 query_dim,
                 heads,
@@ -155,7 +154,7 @@ class LTX2Attention(Attention):
                 quant_config=self.quant_config,
                 skip_create_weights_in_init=self.skip_create_weights_in_init,
                 force_dynamic_quantization=self.force_dynamic_quantization,
-                tensor_parallel_mode=TensorParallelMode.COLUMN if tp_size > 1 else None,
+                tensor_parallel_mode=TensorParallelMode.COLUMN if self.tp_size > 1 else None,
                 reduce_output=False,
             )
         else:
@@ -180,8 +179,7 @@ class LTX2Attention(Attention):
         if not self._is_cross_attn:
             super()._init_qkv_proj()
             return
-        tp_size = self.mapping.tp_size if self.mapping else 1
-        tp_mode = TensorParallelMode.COLUMN if tp_size > 1 else None
+        tp_mode = TensorParallelMode.COLUMN if self.tp_size > 1 else None
         self.to_q = Linear(
             self.hidden_size,
             self.q_dim,
@@ -240,8 +238,9 @@ class LTX2Attention(Attention):
         # All cross-attn K-norm paths (with or without RoPE) go through the
         # split-fuse kernels. Fallback only kicks in for unsupported head_dim
         # — the fused kernel template covers {64, 128}; mini-config tests use
-        # head_dim=32 and must take the eager branch.
-        if self.qk_norm and self.head_dim in (64, 128):
+        # head_dim=32 and must take the eager branch. However, these kernels
+        # do not support TP, which is a collective op due to cross-head RMSNorm.
+        if self.qk_norm and self.head_dim in (64, 128) and self.tp_size == 1:
             self.apply_split_norm_or_norm_rope(k, self.norm_k.weight, self.num_key_value_heads, pe)
         else:
             if self.qk_norm:
@@ -267,10 +266,10 @@ class LTX2Attention(Attention):
             k_pe overrides pe for K (e.g. AV cross-attn) when provided.
         """
         # Fallback to the naive eager rope path when fusion is disabled or
-        # the kernel doesn't support this head_dim. LTX-2 prod has
-        # fuse_qk_norm_rope=True and head_dim ∈ {64, 128}, so this branch
-        # only fires under mini-config unit tests (head_dim=32).
-        if not self.fuse_qk_norm_rope or self.head_dim not in (64, 128):
+        # the kernel doesn't support this head_dim or TP is enabled. LTX-2 prod
+        # has fuse_qk_norm_rope=True and head_dim ∈ {64, 128}, so this branch
+        # only fires under mini-config unit tests (head_dim=32) or if TP is enabled.
+        if not self.fuse_qk_norm_rope or self.head_dim not in (64, 128) or self.tp_size > 1:
             return self._forward_unfused(x, context, pe, k_pe, pre_projected_kv)
 
         if self.qkv_mode == QKVMode.FUSE_QKV:
@@ -421,8 +420,7 @@ class BasicAVTransformerBlock(nn.Module):
     @staticmethod
     def _make_mlp(cfg, model_config, idx):
         dtype = model_config.torch_dtype if model_config else None
-        mapping = getattr(model_config, "mapping", None) if model_config else None
-        tp_size = mapping.tp_size if mapping else 1
+        tp_size = model_config.mapping.tp_size if model_config and model_config.mapping else 1
         return MLP(
             hidden_size=cfg.dim,
             intermediate_size=cfg.dim * 4,
