@@ -13,25 +13,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import enum
-from types import EllipsisType  # https://stackoverflow.com/a/66636313
-from typing import Optional, Tuple, TypeAlias, Union, cast
+from typing import Optional
 
 import torch
-from tensorrt_llm._torch.cuda_tile_utils import IS_CUDA_TILE_AVAILABLE
 from tensorrt_llm._torch.distributed import AllReduce
-from tensorrt_llm._torch.flashinfer_utils import IS_FLASHINFER_AVAILABLE
-from tensorrt_llm._torch.utils import Fp4QuantizedTensor
-from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.functional import AllReduceStrategy
 from tensorrt_llm.mapping import Mapping
 from torch import nn
 
 
 class RMSNorm(nn.Module):
-    _ARGUMENT_NOT_SPECIFIED_SENTINEL = ...
-    _ArgumentNotSpecifiedSentinelType: TypeAlias = EllipsisType
-
     def __init__(
         self,
         *,
@@ -41,26 +32,34 @@ class RMSNorm(nn.Module):
         device: Optional[torch.device] = None,
         has_weights: bool = True,
         use_gemma: bool = False,
-        quantize_type: Optional[str] = None,
-        use_cuda_tile: bool = False,
-        return_hp_output: bool = False,
-        allreduce_variance: bool = False,
+        enable_tp: bool = False,
         mapping: Optional[Mapping] = None,
         allreduce_strategy: AllReduceStrategy = AllReduceStrategy.NCCL,
     ):
         super().__init__()
 
+        self.variance_epsilon = eps
+        self.use_gemma = use_gemma
+
+        self.mapping = mapping
+        self.enable_tp = enable_tp
+
+        if enable_tp:
+            assert mapping is not None
+            self.full_size = hidden_size
+            shard = hidden_size // mapping.tp_size
+            start = shard * mapping.tp_rank
+            end = min(shard * (mapping.tp_rank + 1), hidden_size)
+            hidden_size = end - start
+
+            self.allreduce = AllReduce(
+                mapping=mapping, strategy=allreduce_strategy, dtype=torch.float32
+            )
+        else:
+            self.allreduce = None
+
         if use_gemma and not has_weights:
             raise ValueError("has_weights must be True if use_gemma is True")
-        if quantize_type is not None:
-            if quantize_type != "nvfp4":
-                raise NotImplementedError(
-                    f"Quantize type {quantize_type} not implemented in RMSNorm"
-                )
-        self.is_nvfp4 = quantize_type == "nvfp4"
-        if use_cuda_tile and not IS_CUDA_TILE_AVAILABLE:
-            raise ValueError("cuda.tile is not available, please install cuda-tile pypi package")
-
         if has_weights:
             if not use_gemma:
                 self.weight = nn.Parameter(torch.ones(hidden_size, dtype=dtype, device=device))
@@ -70,260 +69,33 @@ class RMSNorm(nn.Module):
             self.register_buffer(
                 "weight", torch.ones(hidden_size, dtype=dtype, device=device), persistent=False
             )
-        self.variance_epsilon = eps
-        self.use_gemma = use_gemma
-        self.use_cuda_tile = use_cuda_tile
 
-        self.tp_size = mapping.tp_size if allreduce_variance else 1
-        self.tp_rank = mapping.tp_rank if allreduce_variance else 0
-        assert hidden_size % self.tp_size == 0
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        input_dtype = hidden_states.dtype
+        hidden_states = hidden_states.to(torch.float32)
 
-        tp_range = hidden_size // self.tp_size
-        # TODO: this weight approach should be changed to only load a chunk
-        # of the weights instead of just slicing out the relevant part
-        self.weight_start = tp_range * self.tp_rank
-        self.weight_end = tp_range * (self.tp_rank + 1)
-        self.allreduce = (
-            AllReduce(
-                mapping=mapping,
-                strategy=allreduce_strategy,
-                dtype=torch.float32,
-            )
-            if allreduce_variance
-            else None
-        )
+        variance = hidden_states.pow(2).mean(-1, keepdim=True)
+        if self.allreduce:
+            variance = self.allreduce(variance) / self.mapping.tp_size
 
-        # fused_add_rms_norm_quant only supports SM 9.x / 10.x because:
-        #  - Device code is guarded by is_major_v<9> || is_major_v<10>
-        #    (ws_layernorm.cuh:828, low_latency_layernorm.cuh:157).
-        # On unsupported SMs, fall back to flashinfer/generic RMSNorm and let
-        # the downstream linear layer handle FP4 quantization.
-        if self.is_nvfp4:
-            sm_version = get_sm_version()
-            if not (90 <= sm_version < 120):
-                self.is_nvfp4 = False
-                return_hp_output = False
-        self.return_hp_output = return_hp_output
-
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        residual: Union[
-            Optional[torch.Tensor], _ArgumentNotSpecifiedSentinelType
-        ] = _ARGUMENT_NOT_SPECIFIED_SENTINEL,
-    ) -> Union[
-        torch.Tensor,
-        Fp4QuantizedTensor,
-        Tuple[Union[torch.Tensor, Fp4QuantizedTensor], Optional[torch.Tensor]],
-        Tuple[Fp4QuantizedTensor, torch.Tensor, torch.Tensor],
-    ]:
-        has_residual = residual is not self._ARGUMENT_NOT_SPECIFIED_SENTINEL
-        if not has_residual:
-            residual = None
-
-        if self.is_nvfp4 and has_residual and not self.use_gemma and not self.allreduce:
-            nvfp4_scale = getattr(self, "nvfp4_scale", None)
-            if nvfp4_scale is None:
-                raise ValueError(
-                    f"layeridx={getattr(self, 'layer_idx', None)} RMSNorm NVFP4 output requested "
-                    "but no `nvfp4_scale` is attached; "
-                )
-
-            orig_shape = tuple(hidden_states.shape)
-            n = int(orig_shape[-1])
-            hs_2d = hidden_states.reshape(-1, n).contiguous()
-            res_2d = residual.reshape(-1, n)
-            gamma = self.weight
-
-            def _ensure_contiguous_with_dtype(t: torch.Tensor, key: str):
-                if t.dtype != hs_2d.dtype:
-                    raise ValueError(
-                        f"RMSNorm NVFP4 fused path: casting {key} from {t.dtype} to {hs_2d.dtype}."
-                    )
-                return t.contiguous()
-
-            res_2d = _ensure_contiguous_with_dtype(res_2d, "residual")
-            gamma = _ensure_contiguous_with_dtype(gamma, "gamma")
-
-            if hs_2d.device != res_2d.device or hs_2d.device != gamma.device:
-                raise RuntimeError(
-                    "RMSNorm NVFP4 fused path requires all tensors on the same device. "
-                    f"Got input={hs_2d.device}, residual={res_2d.device}, gamma={gamma.device}."
-                )
-
-            sf_scale = nvfp4_scale.contiguous()
-
-            results = torch.ops.trtllm.fused_add_rms_norm_quant(
-                hs_2d,
-                res_2d,
-                gamma,
-                sf_scale,
-                True,
-                eps=self.variance_epsilon,
-                output_hp_norm=self.return_hp_output,
-            )
-            normed_fp4_i32, residual_out_2d, sf_fused = results[:3]
-            normed_fp4_u8 = normed_fp4_i32.view(torch.uint8)
-            if len(orig_shape) != 2:
-                normed_fp4_u8 = normed_fp4_u8.reshape(*orig_shape[:-1], n // 2)
-                residual_out = residual_out_2d.reshape(orig_shape)
-            else:
-                residual_out = residual_out_2d
-
-            hidden_states_fused = Fp4QuantizedTensor(normed_fp4_u8, sf_fused)
-
-            outputs = [hidden_states_fused]
-            if has_residual:
-                outputs.append(residual_out)
-            if self.return_hp_output:
-                high_precision_normed_output = results[3].reshape(orig_shape)
-                outputs.append(high_precision_normed_output)
-            return outputs[0] if len(outputs) == 1 else tuple(outputs)
-
-        if self.return_hp_output:
-            raise ValueError(
-                "Auxiliary high precision output is only supported for NVFP4 fused path"
-            )
-
-        if self.use_cuda_tile:
-            assert not self.allreduce, "RMSNorm CUDA Tile does not support variance AllReduce"
-            if isinstance(residual, torch.Tensor):
-                # Use fused residual kernel
-                hidden_states = hidden_states.contiguous()
-                residual = residual.contiguous()
-                torch.ops.trtllm.cuda_tile_rms_norm_fuse_residual_(
-                    x=hidden_states,
-                    residual=residual,
-                    weight=self.weight,
-                    eps=self.variance_epsilon,
-                    static_persistent=True,
-                    gather=True,
-                    use_gemma=self.use_gemma,
-                )
-            else:
-                hidden_states = torch.ops.trtllm.cuda_tile_rms_norm(
-                    x=hidden_states,
-                    weight=self.weight,
-                    eps=self.variance_epsilon,
-                    static_persistent=True,
-                    gather=True,
-                    use_gemma=self.use_gemma,
-                )
-        elif IS_FLASHINFER_AVAILABLE and not self.allreduce:
-            from tensorrt_llm._torch.custom_ops import (
-                flashinfer_fused_add_rmsnorm,
-                flashinfer_gemma_fused_add_rmsnorm,
-                flashinfer_gemma_rmsnorm,
-                flashinfer_rmsnorm,
-            )
-
-            if residual is not None:
-                if not self.use_gemma:
-                    flashinfer_fused_add_rmsnorm(
-                        hidden_states, residual, self.weight, self.variance_epsilon
-                    )
-                else:
-                    flashinfer_gemma_fused_add_rmsnorm(
-                        hidden_states, residual, self.weight, self.variance_epsilon
-                    )
-            else:
-                if not self.use_gemma:
-                    hidden_states = flashinfer_rmsnorm(
-                        hidden_states, self.weight, self.variance_epsilon
-                    )
-                else:
-                    hidden_states = flashinfer_gemma_rmsnorm(
-                        hidden_states, self.weight, self.variance_epsilon
-                    )
+        hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
+        if not self.use_gemma:
+            hidden_states = self.weight * hidden_states.to(input_dtype)
         else:
-            input_dtype = hidden_states.dtype
-            hidden_states = hidden_states.to(torch.float32)
-            if residual is not None:
-                hidden_states = hidden_states + residual.to(torch.float32)
-                residual = hidden_states.to(input_dtype)
+            hidden_states = (self.weight + 1) * hidden_states.to(input_dtype)
 
-            variance = hidden_states.pow(2).mean(-1, keepdim=True)
-            # x2 = hidden_states.pow(2).sum(-1, keepdim=True)
-            if self.allreduce:
-                variance = self.allreduce(variance) / self.tp_size
-            hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
-            weight = self.weight[..., self.weight_start : self.weight_end]
+        return hidden_states
 
-            if not self.use_gemma:
-                hidden_states = weight * hidden_states.to(input_dtype)
+    def load_weights(self, weights: torch.Tensor):
+        for param_name, param in self._parameters.items():
+            if param is None or param_name not in weights:
+                continue
+            if param_name == "weight" and self.enable_tp:
+                shard = self.full_size // self.mapping.tp_size
+                start = shard * self.mapping.tp_rank
+                end = min(shard * (self.mapping.tp_rank + 1), self.full_size)
+                data = weights[param_name][..., start:end]
             else:
-                hidden_states = (weight + 1) * hidden_states.to(input_dtype)
+                data = weights[param_name]
 
-        if has_residual:
-            return hidden_states, cast(Optional[torch.Tensor], residual)
-        else:
-            return hidden_states
-
-    def skip_forward(
-        self,
-        hidden_states: torch.Tensor,
-        residual: Union[
-            Optional[torch.Tensor], _ArgumentNotSpecifiedSentinelType
-        ] = _ARGUMENT_NOT_SPECIFIED_SENTINEL,
-    ) -> Union[torch.Tensor, Tuple[torch.Tensor, Optional[torch.Tensor]]]:
-        if residual is self._ARGUMENT_NOT_SPECIFIED_SENTINEL:
-            return hidden_states
-        else:
-            return hidden_states, cast(Optional[torch.Tensor], residual)
-
-
-class GroupRMSNormKernelSelection(enum.Enum):
-    heuristic = 0
-    base = 1
-    large_batch = 2
-
-
-def group_rms_norm(
-    inputs: list[torch.Tensor],
-    weights: Optional[list[torch.Tensor]] = [],
-    eps: Optional[float] = 1e-5,
-    weight_bias: Optional[float] = 0.0,
-    kernel: GroupRMSNormKernelSelection = GroupRMSNormKernelSelection.heuristic,
-    outputs: Optional[list[torch.Tensor]] = None,
-) -> list[torch.Tensor]:
-    """Group RMS Normalization optimized for up to 2 inputs.
-
-    This function applies RMS normalization to multiple inputs simultaneously,
-    achieving better performance than normalizing each tensor separately with multi-stream.
-
-    Args:
-        inputs: List of input tensors to normalize
-        weights: Optional list of weight tensors corresponding to each input
-        eps: Small constant added to variance for numerical stability
-        weight_bias: Optional bias added to weights during normalization
-        kernel: Kernel selection strategy:
-            - heuristic: Automatically selects optimal kernel based on inputs and hardware
-            - base: Uses base kernel (optimal for most cases)
-            - large_batch: Uses large batch kernel (may be better for large batches)
-        outputs: Optional pre-allocated output tensors (created if None)
-
-    Returns:
-        List of normalized tensors with the same shapes as inputs
-
-    Technical Details:
-        Available kernel implementations:
-        - Base kernel: Allocates warps proportional to the sum of last dimensions,
-          providing better SM occupancy for most workloads.
-        - Large batch kernel: Allocates warps proportional to the maximum last dimension,
-          which can be more efficient for large batch sizes with 2 inputs.
-
-        The heuristic mode uses a logistic regression model trained on benchmark data
-        to dynamically select the optimal kernel based on batch size, input dimensions,
-        and GPU architecture. This selection is optimized for compute capabilities 9.x and 10.x.
-    """
-    out = outputs
-    if out is None:
-        out = [torch.empty_like(input) for input in inputs]
-    match kernel:
-        case GroupRMSNormKernelSelection.heuristic:
-            torch.ops.trtllm.group_rms_norm_heuristic(inputs, out, weights, eps, weight_bias)
-        case GroupRMSNormKernelSelection.base:
-            torch.ops.trtllm.group_rms_norm_base(inputs, out, weights, eps, weight_bias)
-        case GroupRMSNormKernelSelection.large_batch:
-            torch.ops.trtllm.group_rms_norm_large_batch(inputs, out, weights, eps, weight_bias)
-    return out
+            param.data.copy_(data.to(param.dtype))

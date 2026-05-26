@@ -108,13 +108,13 @@ class Attention(nn.Module):
 
             q_norm_dim = self.head_dim if qk_norm_mode == "per_head" else self.q_dim
             k_norm_dim = self.head_dim if qk_norm_mode == "per_head" else self.kv_dim
-            reduce_variance = (tp_size > 1) and qk_norm_mode == "full"
+            enable_tp_rms = (tp_size > 1) and qk_norm_mode == "full"
             self.norm_q = RMSNorm(
                 hidden_size=q_norm_dim,
                 eps=self.eps,
                 dtype=self.dtype,
                 has_weights=True,
-                allreduce_variance=reduce_variance,
+                enable_tp=enable_tp_rms,
                 mapping=self.mapping,
             )
             self.norm_k = RMSNorm(
@@ -122,7 +122,7 @@ class Attention(nn.Module):
                 eps=self.eps,
                 dtype=self.dtype,
                 has_weights=True,
-                allreduce_variance=reduce_variance,
+                enable_tp=enable_tp_rms,
                 mapping=self.mapping,
             )
 

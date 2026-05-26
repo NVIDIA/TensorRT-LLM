@@ -11,9 +11,9 @@ from tensorrt_llm._torch.models.hf_parameter_utils import get_parameter_device
 from tensorrt_llm._torch.modules.layer_norm import LayerNorm
 from tensorrt_llm._torch.modules.linear import Linear
 from tensorrt_llm._torch.modules.mlp import MLP
-from tensorrt_llm._torch.modules.rms_norm import RMSNorm
 from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
 from tensorrt_llm._torch.visual_gen.modules.attention import Attention, QKVMode
+from tensorrt_llm._torch.visual_gen.modules.rms_norm import RMSNorm
 from tensorrt_llm._torch.visual_gen.quantization.loader import DynamicLinearWeightLoader
 from tensorrt_llm._torch.visual_gen.utils import SequenceSharder
 from tensorrt_llm.logger import logger
@@ -777,6 +777,9 @@ class WanTransformer3DModel(nn.Module):
                     loader.load_linear_weights(module, name, weight_dicts)
                 elif "add_k_proj" in name or "add_v_proj" in name:
                     logger.info(f"[Weight Loading] No weights found for I2V module: {name}")
+            elif isinstance(module, RMSNorm):
+                module_weights = loader.filter_weights(name, weights)
+                module.load_weights(module_weights)
             else:
                 module_weights = loader.filter_weights(name, weights)
                 for param_name, param in module._parameters.items():
