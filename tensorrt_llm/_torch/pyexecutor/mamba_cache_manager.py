@@ -1527,6 +1527,19 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
         super().update_resources(scheduled_batch, attn_metadata,
                                  kv_cache_dtype_byte_size)
 
+    @staticmethod
+    def _context_request_indices(
+            scheduled_batch: ScheduledRequests) -> List[int]:
+        return list(range(len(scheduled_batch.context_requests)))
+
+    @staticmethod
+    def _fresh_context_state_indices(
+            scheduled_batch: ScheduledRequests) -> List[int]:
+        return [
+            i for i, req in enumerate(scheduled_batch.context_requests)
+            if req.is_first_context_chunk and req.context_current_position == 0
+        ]
+
     @nvtx_range("hybrid_prepare_resources")
     def _prepare_resources(self, scheduled_batch: ScheduledRequests):
         self.requests = scheduled_batch.context_requests + \
@@ -1542,18 +1555,26 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
         if self._pending_state_transfers:
             logger.info(f"Need to transfer mamba state blocks")
         self._setup_state_indices()
-        # Reset replay double-buffer state for fresh context blocks. A reused
-        # block (prefix-cache hit or block recycled across requests) may carry
-        # stale prev_num_accepted_tokens / cache_buf_idx values from a prior
-        # owner; the replay kernel reads these on the first decode step.
-        # Deterministically zero the per-slot stripes of all replay buffers so
-        # the kernel's unconditional loads (e.g. total_dA_cumsum at prev_k=0)
-        # never see Inf/NaN from a prior owner; this prevented intermittent
-        # SSM state corruption at higher concurrency (c=32) where slot reuse
-        # is frequent.
-        num_contexts = len(scheduled_batch.context_requests)
-        if num_contexts > 0:
-            ctx_slots = self.cuda_state_indices[:num_contexts].long()
+        # Reset only slots with no recurrent initial state.  Later chunks of a
+        # chunked-prefill request, and first chunks resumed from block reuse,
+        # intentionally read the previous recurrent state as their init state.
+        # Resetting them here corrupts long-context/chunked-prefill results.
+        bookkeeping_ctx_indices = self._context_request_indices(scheduled_batch)
+        fresh_state_ctx_indices = self._fresh_context_state_indices(
+            scheduled_batch)
+
+        def _select_ctx_slots(ctx_indices: List[int]) -> Optional[torch.Tensor]:
+            if not ctx_indices:
+                return None
+            ctx_indices_tensor = torch.tensor(
+                ctx_indices,
+                dtype=torch.long,
+                device=self.cuda_state_indices.device)
+            return self.cuda_state_indices.index_select(
+                0, ctx_indices_tensor).long()
+
+        fresh_state_ctx_slots = _select_ctx_slots(fresh_state_ctx_indices)
+        if fresh_state_ctx_slots is not None:
             # Zero the SSM/conv state stripes for fresh context slots so
             # neither the replay kernel nor the non-replay flashinfer SR
             # kernel observes stale state on the first decode step of a
@@ -1562,30 +1583,37 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
             # _use_replay_state_update caused token-id-0 / `<unk>` collapse
             # on greedy temp=0 replay-off at c=32 (cf. iter4 root cause).
             if self.all_ssm_states is not None:
-                self.all_ssm_states[:, ctx_slots] = 0
+                self.all_ssm_states[:, fresh_state_ctx_slots] = 0
             if self.all_conv_states is not None:
-                self.all_conv_states[:, ctx_slots] = 0
+                self.all_conv_states[:, fresh_state_ctx_slots] = 0
+
+        bookkeeping_ctx_slots = _select_ctx_slots(bookkeeping_ctx_indices)
+        if bookkeeping_ctx_slots is not None:
+            # Replay auxiliary buffers and SR seeds are per-slot bookkeeping,
+            # not recurrent initial state. Reset them for every
+            # scheduled context output slot so the first decode step never
+            # observes stale replay data from a prior slot owner.
             if self._use_replay_state_update and self.prev_num_accepted_tokens is not None:
-                self.prev_num_accepted_tokens[ctx_slots] = 0
-                self.cache_buf_idx[ctx_slots] = 0
+                self.prev_num_accepted_tokens[bookkeeping_ctx_slots] = 0
+                self.cache_buf_idx[bookkeeping_ctx_slots] = 0
                 if self.old_x is not None:
-                    self.old_x[:, ctx_slots] = 0
+                    self.old_x[:, bookkeeping_ctx_slots] = 0
                 if self.old_B is not None:
-                    self.old_B[:, ctx_slots] = 0
+                    self.old_B[:, bookkeeping_ctx_slots] = 0
                 if self.old_dt is not None:
-                    self.old_dt[:, ctx_slots] = 0
+                    self.old_dt[:, bookkeeping_ctx_slots] = 0
                 if self.old_dA_cumsum is not None:
-                    self.old_dA_cumsum[:, ctx_slots] = 0
-            # Deterministic per-context-slot seed rotation.  Runs whenever
-            # the seed buffer exists, including the non-replay SR path.
-            # Bump the host counter once per batch and write one new seed
-            # per fresh context slot from a pure function of
+                    self.old_dA_cumsum[:, bookkeeping_ctx_slots] = 0
+            # Deterministic per-context-output-slot seed rotation.  Runs
+            # whenever the seed buffer exists, including the non-replay SR
+            # path.  Bump the host counter once per batch and write one new
+            # seed per scheduled context slot from a pure function of
             # (counter, slot, rank).  No torch.randint involved.
             if self.mamba_ssm_rand_seed is not None:
                 self._seed_request_counter += 1
                 counter = self._seed_request_counter
                 rank_offset = self._seed_rank_offset
-                host_slots = ctx_slots.cpu().tolist()
+                host_slots = bookkeeping_ctx_slots.cpu().tolist()
                 new_seeds = [
                     _compute_deterministic_mamba_seed(counter, slot,
                                                       rank_offset)
@@ -1596,7 +1624,7 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
                     dtype=torch.int64,
                     device=self.mamba_ssm_rand_seed.device,
                 )
-                self.mamba_ssm_rand_seed[ctx_slots] = seed_tensor
+                self.mamba_ssm_rand_seed[bookkeeping_ctx_slots] = seed_tensor
 
     def prepare_resources(self, scheduled_batch: ScheduledRequests):
         super().prepare_resources(scheduled_batch)
