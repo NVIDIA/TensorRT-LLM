@@ -180,9 +180,7 @@ def _cache_multimodal_embeddings(
     logger.debug(
         f"Caching {len(split_embeddings)} multimodal embedding chunks in {len(multimodal_params)} params"
     )
-    for param, embed_chunk in zip(valid_params,
-                                  split_embeddings,
-                                  strict=True):
+    for param, embed_chunk in zip(valid_params, split_embeddings, strict=True):
         param.multimodal_data["multimodal_embedding"] = embed_chunk
 
     logger.debug(
@@ -414,8 +412,6 @@ def fuse_input_embeds(
         return input_ids, None
 
     mm_embed = torch.cat(mm_embeds, dim=0)
-    mm_embed_shapes = [tuple(embed.shape) for embed in mm_embeds]
-    multimodal_debug_info = kwargs.get("multimodal_debug_info")
 
     # TODO: support the case where only one index tensor is provided, the other is derived as the complement (try to avoid implicit host-device synchronization)
     if text_token_indices is None or mm_token_indices is None:
@@ -425,17 +421,9 @@ def fuse_input_embeds(
             vocab_size=embedding_layer.num_embeddings,
             mm_token_ids=mm_token_ids)
     if mm_token_indices.shape[0] != mm_embed.shape[0]:
-        debug_details = [
-            f"{mm_embed_shapes=}",
-            f"text_token_count={text_token_indices.shape[0]}",
-            f"{multimodal_debug_info=}",
-        ]
         raise ValueError(
             f"Multimodal token count mismatch: found {len(mm_token_indices)} image tokens in input_ids "
-            f"but received {mm_embed.shape[0]} image embeddings. "
-            f"{' '.join(debug_details)} "
-            "This is likely due to KV cache reuse, chunk prefill, or other optimizations that "
-            "cause token count mismatches within the inference batch.")
+            f"but received {mm_embed.shape[0]} image embeddings.")
 
     text_embed = embedding_layer(input_ids[text_token_indices])
     input_embeds = torch.empty(input_ids.shape[0],

@@ -47,13 +47,15 @@ from ..modules.embedding import Embedding, LMHead
 from .modeling_auto import AutoModelForCausalLM
 from .modeling_multimodal_encoder import (VisionTower, VisionTowerDynamicS2,
                                           VisionTowerS2)
+# yapf: disable
 from .modeling_multimodal_utils import (dynamic_preprocess_dispatch,
                                         dynamic_s2_preprocess_dispatch,
-                                        find_input_mm_embeds,
                                         filter_mm_token_from_input_ids,
-                                        fuse_input_embeds, merge_chessboard,
+                                        find_input_mm_embeds, fuse_input_embeds,
+                                        merge_chessboard,
                                         merge_features_for_dynamic_s2,
                                         preprocess_dispatch, split_chessboard)
+# yapf: enable
 from .modeling_utils import ModelConfig, register_auto_model
 
 SENTINEL_TOKEN = "<vila/sentinel>"  # nosec B105
@@ -63,89 +65,10 @@ MEDIA_TOKENS = {
 }
 
 
-def _build_vila_request_grouping(multimodal_params):
-    request_grouping = []
-    for request_index, multimodal_param in enumerate(multimodal_params):
-        runtime = multimodal_param.multimodal_runtime
-        request_grouping.append({
-            "request_index":
-            request_index,
-            "embedding_shape":
-            tuple(multimodal_param.multimodal_data[
-                "multimodal_embedding"].shape),
-            "num_unseen_mm_tokens":
-            getattr(runtime, "num_unseen_mm_tokens", None),
-            "num_mm_tokens_in_chunk":
-            getattr(runtime, "num_mm_tokens_in_chunk", None),
-            "total_mm_tokens_in_request":
-            getattr(runtime, "total_mm_tokens_in_request", None),
-            "num_unseen_special_tokens":
-            getattr(runtime, "num_unseen_special_tokens", None),
-            "num_special_tokens_in_chunk":
-            getattr(runtime, "num_special_tokens_in_chunk", None),
-            "total_special_tokens_in_request":
-            getattr(runtime, "total_special_tokens_in_request", None),
-        })
-    return request_grouping
-
-
-def _build_multimodal_debug_info(
-    multimodal_params,
-    num_context_requests: int,
-    num_generation_requests: int,
-):
-    return {
-        "batch_size": len(multimodal_params),
-        "num_context_requests": num_context_requests,
-        "num_generation_requests": num_generation_requests,
-        "request_grouping":
-        _build_vila_request_grouping(multimodal_params[:num_context_requests]),
-    }
-
-
-def _update_vila_sliced_debug_info(
-    multimodal_debug_info: dict,
-    context_multimodal_params,
-    mm_embeds: List[torch.Tensor],
-) -> None:
-    multimodal_debug_info["sliced_mm_embed_shapes"] = [
-        tuple(embed.shape) for embed in mm_embeds
-    ]
-    if len(mm_embeds) != len(context_multimodal_params):
-        raise RuntimeError(
-            "[VILA] Post-slice request grouping mismatch: "
-            f"context_requests={len(context_multimodal_params)}, "
-            f"sliced_embedding_groups={len(mm_embeds)}, "
-            f"{multimodal_debug_info=}")
-
-    for request_group, multimodal_param, mm_embed in zip(
-            multimodal_debug_info["request_grouping"],
-            context_multimodal_params,
-            mm_embeds,
-            strict=True):
-        runtime = multimodal_param.multimodal_runtime
-        expected_active_tokens = None
-        if runtime is not None:
-            expected_active_tokens = (
-                runtime.num_mm_tokens_in_chunk -
-                runtime.num_special_tokens_in_chunk)
-        request_group["expected_active_tokens"] = expected_active_tokens
-        request_group["actual_sliced_tokens"] = mm_embed.shape[0]
-        if (expected_active_tokens is not None
-                and expected_active_tokens != mm_embed.shape[0]):
-            raise RuntimeError(
-                "[VILA] Post-slice request mismatch: "
-                f"request_index={request_group['request_index']}, "
-                f"{expected_active_tokens=}, "
-                f"actual_sliced_tokens={mm_embed.shape[0]}, "
-                f"{multimodal_debug_info=}")
-
-
 def _validate_vila_mm_alignment(
     input_ids: torch.IntTensor,
     embedding_layer: Embedding,
     mm_embeds: List[torch.Tensor],
-    multimodal_debug_info: dict,
 ) -> Tuple[torch.IntTensor, torch.IntTensor]:
     # VILA expands multimodal placeholders into out-of-vocab ids during
     # preprocessing, so counting OOV ids here gives the active multimodal span
@@ -156,13 +79,11 @@ def _validate_vila_mm_alignment(
     )
     expected_tokens = mm_token_indices.shape[0]
     actual_embeds = sum(embed.shape[0] for embed in mm_embeds)
-    multimodal_debug_info["expected_mm_tokens"] = expected_tokens
-    multimodal_debug_info["actual_mm_embeds"] = actual_embeds
     if expected_tokens != actual_embeds:
-        raise RuntimeError(
-            "[VILA] Post-slice mismatch: "
-            f"{expected_tokens=}, {actual_embeds=}, "
-            f"{multimodal_debug_info=}")
+        raise ValueError(
+            "[VILA] Multimodal token count mismatch after slicing: "
+            f"found {expected_tokens} image tokens in input_ids but received "
+            f"{actual_embeds} image embeddings.")
     return text_token_indices, mm_token_indices
 
 
@@ -1077,10 +998,8 @@ class VilaInputProcessor(BaseMultimodalInputProcessor,
                 self.vision_tower, visual_features, block_sizes)
 
             visual_features = [
-                split_chessboard(x, block_size[0], block_size[1])
-                for x, block_size in zip(visual_features,
-                                         new_block_sizes,
-                                         strict=True)
+                split_chessboard(x, block_size[0], block_size[1]) for x,
+                block_size in zip(visual_features, new_block_sizes, strict=True)
             ]  # list of B * C * H * W tensors
             visual_features = torch.cat(
                 [rearrange(x, "b c h w -> b (h w) c") for x in visual_features],
@@ -1093,10 +1012,8 @@ class VilaInputProcessor(BaseMultimodalInputProcessor,
                 ],
                                       dim=0))
             visual_features = [
-                merge_chessboard(x, block_size[0], block_size[1])
-                for x, block_size in zip(visual_features,
-                                         new_block_sizes,
-                                         strict=True)
+                merge_chessboard(x, block_size[0], block_size[1]) for x,
+                block_size in zip(visual_features, new_block_sizes, strict=True)
             ]  # list of 1 * C * H * W tensors
             visual_features = [
                 rearrange(x, "1 c h w -> (h w) c") for x in visual_features
@@ -1324,44 +1241,24 @@ class VilaModel(PreTrainedModel):
         mm_embeds = []
         text_token_indices = None
         mm_token_indices = None
-        multimodal_debug_info = _build_multimodal_debug_info(
-            multimodal_params=multimodal_params,
-            num_context_requests=num_context_requests,
-            num_generation_requests=num_generation_requests,
-        )
         if len(context_multimodal_params) > 0:
             mm_embeds = [
                 multimodal_param.multimodal_data["multimodal_embedding"]
                 for multimodal_param in context_multimodal_params
             ]
-            mm_embed_shapes = [tuple(embed.shape) for embed in mm_embeds]
-            logger.debug(
-                "VILA multimodal forward before slicing: "
-                f"{mm_embed_shapes=}, {multimodal_debug_info=}")
             # Other multimodal models already slice batched embeddings with
             # find_input_mm_embeds() before fusion. VILA previously skipped
             # that step and could feed the full cached embedding tensor into a
             # chunked context batch, which breaks token/embed alignment.
-            mm_embeds = find_input_mm_embeds(mm_embeds, context_multimodal_params)
-            _update_vila_sliced_debug_info(multimodal_debug_info,
-                                           context_multimodal_params,
-                                           mm_embeds)
-            mm_embed_shapes = [tuple(embed.shape) for embed in mm_embeds]
-            logger.debug(
-                "VILA multimodal forward after slicing: "
-                f"{mm_embed_shapes=}, {multimodal_debug_info=}")
+            mm_embeds = find_input_mm_embeds(mm_embeds,
+                                             context_multimodal_params)
             if input_ids is not None:
                 text_token_indices, mm_token_indices = _validate_vila_mm_alignment(
                     input_ids=input_ids,
                     embedding_layer=self.llm.model.embed_tokens,
                     mm_embeds=mm_embeds,
-                    multimodal_debug_info=multimodal_debug_info,
                 )
-                logger.debug(
-                    "VILA multimodal alignment validated: "
-                    f"{multimodal_debug_info=}")
 
-        kwargs["multimodal_debug_info"] = multimodal_debug_info
         if text_token_indices is not None and mm_token_indices is not None:
             kwargs["text_token_indices"] = text_token_indices
             kwargs["mm_token_indices"] = mm_token_indices

@@ -256,8 +256,7 @@ class TestFindInputMmEmbed:
         mm_embeds = [torch.randn(total_mm_tokens, _EMBED_DIM)]
         multimodal_params = [
             _make_multimodal_params(num_unseen_mm_tokens,
-                                    num_mm_tokens_in_chunk,
-                                    [total_mm_tokens])
+                                    num_mm_tokens_in_chunk, [total_mm_tokens])
         ]
 
         result = find_input_mm_embeds(mm_embeds, multimodal_params)
