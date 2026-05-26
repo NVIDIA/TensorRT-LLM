@@ -1337,16 +1337,11 @@ class _KVCache:
             self._commit_state = self.CommitState.VIRTUAL_STOP
 
         if seq_block.is_committed:
-            ssm_lc_id_fix = self.manager._life_cycles.ssm_life_cycle_id
-            for beam_block_fix in seq_block.pages:
-                for lc_fix_idx, lc_fix_obj in self.manager._life_cycles.items():
-                    if lc_fix_idx == ssm_lc_id_fix:
-                        continue
-                    s_fix, e_fix = _KVCache._get_stale_range(
-                        tokens_per_block, self.history_length, lc_fix_obj
-                    )
-                    if s_fix <= ordinal < e_fix and beam_block_fix[lc_fix_idx] is not None:
-                        beam_block_fix[lc_fix_idx] = None
+            for lc_idx, lc in self.manager._life_cycles.attention_life_cycles():
+                stale_range = _KVCache._get_stale_range(tokens_per_block, self.history_length, lc)
+                if ordinal in stale_range:
+                    for beam_block in seq_block.pages:
+                        beam_block[lc_idx] = None
 
         if is_last or self._commit_state == self.CommitState.VIRTUAL_STOP:
             self._commit_state = self.CommitState.USER_STOP
