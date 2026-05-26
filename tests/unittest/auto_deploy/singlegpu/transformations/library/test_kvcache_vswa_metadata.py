@@ -94,7 +94,7 @@ def test_vswa_registers_per_group_seq_len_with_cache_placeholders():
     This is required so the SWA group's window-capped value reaches the
     kernel and the prepare-extra-metadata op.
     """
-    gm, info, cm = _run_transform(backend="triton")
+    gm, info, cm = _run_transform(backend="triton_paged")
     assert info.num_matches == 2, "expected 2 cached-attention insertions"
 
     names = _placeholder_names(gm)
@@ -118,7 +118,7 @@ def test_vswa_extra_metadata_is_per_group():
     This is the regression guard against the pre-fix transform behavior
     described in the autodeploy-kvcache-vswa-meta-nodes-extra backlog.
     """
-    gm, info, cm = _run_transform(backend="triton")
+    gm, info, cm = _run_transform(backend="triton_paged")
 
     prep_meta_op = torch.ops.auto_deploy.triton_paged_prepare_metadata.default
     prep_calls = [
@@ -161,7 +161,7 @@ def test_vswa_each_layer_routes_to_its_groups_extra_metadata():
     The cached-attn call for group 1 (the SWA layer) must consume the
     group-1 prepare-extra outputs, not group 0's.
     """
-    gm, info, cm = _run_transform(backend="triton")
+    gm, info, cm = _run_transform(backend="triton_paged")
 
     cached_op = torch.ops.auto_deploy.triton_paged_mha_with_cache.default
     cached_calls = [
