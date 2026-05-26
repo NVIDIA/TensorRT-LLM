@@ -90,7 +90,6 @@ l0_b200:
   - unittest/_torch/attention
   - unittest/_torch/compilation
   - unittest/_torch/debugger
-  - unittest/_torch/executor
   # ------------- modules (non-MoE) ---------------
   - unittest/_torch/modules/test_mla_helix.py
   - unittest/_torch/modules/test_fused_add_rms_norm_quant.py
