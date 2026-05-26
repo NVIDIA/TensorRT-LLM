@@ -584,6 +584,24 @@ def maybe_register_transformers_modules_by_value():
                        f"serialization: {e}")
 
 
+def _ensure_gpt2_bytes_to_unicode_compat() -> None:
+    """Restore ``bytes_to_unicode`` on ``transformers.models.gpt2.tokenization_gpt2``.
+
+    transformers 5.x removed it from that module, but some ``trust_remote_code``
+    tokenizers (e.g. Kimi-K2's ``tokenization_kimi.py``) still import it from
+    the legacy location. The function survives under
+    ``transformers.convert_slow_tokenizer``.
+    """
+    try:
+        from transformers.models.gpt2 import tokenization_gpt2
+        if hasattr(tokenization_gpt2, "bytes_to_unicode"):
+            return
+        from transformers.convert_slow_tokenizer import bytes_to_unicode
+    except ImportError:
+        return
+    tokenization_gpt2.bytes_to_unicode = bytes_to_unicode
+
+
 def load_hf_tokenizer(model_dir: str,
                       trust_remote_code: bool = True,
                       use_fast: bool = True,
@@ -598,6 +616,8 @@ def load_hf_tokenizer(model_dir: str,
     Returns:
         A TransformersTokenizer object if the tokenizer is loaded successfully.
     '''
+
+    _ensure_gpt2_bytes_to_unicode_compat()
 
     try:
         tokenizer = TransformersTokenizer.from_pretrained(

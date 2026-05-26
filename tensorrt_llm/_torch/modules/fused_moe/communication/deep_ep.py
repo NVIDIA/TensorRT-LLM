@@ -190,7 +190,12 @@ class DeepEP(Communication):
         if token_final_scales is not None and token_final_scales.dtype != torch.float32:
             token_final_scales = token_final_scales.to(torch.float32)
 
-        if not self.supports_post_quant_dispatch():
+        # Even when the comm strategy declares post-quant dispatch support, the
+        # caller may still pass `hidden_states_sf=None` if the local MoE module
+        # is excluded from quantization (e.g. an MTP layer with a non-quantized
+        # MoE in a partially-quantized checkpoint). In that case the data is
+        # actually unquantized, so dispatch the plain hidden_states.
+        if not self.supports_post_quant_dispatch() or hidden_states_sf is None:
             # Pre-quant dispatch (unquantized data)
             (
                 hidden_states,

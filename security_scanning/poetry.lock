@@ -568,14 +568,14 @@ serving = ["fastapi (>=0.104.0)", "peft", "pydantic (>=2.0.0)", "uvicorn (>=0.24
 
 [[package]]
 name = "cache-dit"
-version = "1.3.7"
+version = "1.3.8"
 description = "Cache-DiT: A PyTorch-native Inference Engine with Cache, Parallelism and Quantization for Diffusion Transformers."
 optional = false
 python-versions = ">=3.12"
 groups = ["main"]
 markers = "python_version == \"3.12\""
 files = [
-    {file = "cache_dit-1.3.7-py3-none-any.whl", hash = "sha256:58d1db7f6ee2560af73bf4a6cbe2206ad09a0eec6ef227f32dff9064519373bb"},
+    {file = "cache_dit-1.3.8-py3-none-any.whl", hash = "sha256:7c7b2804929c770bbcd4c12ca25697066a51b1b72aec841351c084109cb9fa6a"},
 ]
 
 [package.dependencies]
@@ -1242,31 +1242,28 @@ all = ["cuda-bindings[all] (>=13.2.0,<13.3.0)"]
 
 [[package]]
 name = "cuda-tile"
-version = "1.3.0"
+version = "1.1.0"
 description = "CUDA Tile Compiler"
 optional = false
 python-versions = "<3.14,>=3.10"
 groups = ["main"]
 files = [
-    {file = "cuda_tile-1.3.0-cp310-cp310-manylinux2014_aarch64.whl", hash = "sha256:c55616c648f06f84808648a521c67f2d7c790574d6b53ddf8c3bfbc995d36d45"},
-    {file = "cuda_tile-1.3.0-cp310-cp310-manylinux2014_x86_64.whl", hash = "sha256:8c71c2fd9b96c054c126a218f9927c8c8dde72441a532464551b865b416d452a"},
-    {file = "cuda_tile-1.3.0-cp310-cp310-win_amd64.whl", hash = "sha256:339769f95b3a5453b7f416da6d1285f24d0daf3a700a895b68dee3fa6fc93e8f"},
-    {file = "cuda_tile-1.3.0-cp311-cp311-manylinux2014_aarch64.whl", hash = "sha256:59d9843fa723ceb4d680ec246e12e3ded857266e4c2bf5c5d21e530d6d765060"},
-    {file = "cuda_tile-1.3.0-cp311-cp311-manylinux2014_x86_64.whl", hash = "sha256:2888d6b89fae053a53ca7bb703c508a5cf90671d266934573c5b6c25978022c4"},
-    {file = "cuda_tile-1.3.0-cp311-cp311-win_amd64.whl", hash = "sha256:791b363251fbc64db4402d92153ba3d14bc0aaa4d218cea66562af02a7a76bd9"},
-    {file = "cuda_tile-1.3.0-cp312-cp312-manylinux2014_aarch64.whl", hash = "sha256:375316b64c51ee7cfadb2f170a30c1547bc41eb39f1e233a6556713857d2e81f"},
-    {file = "cuda_tile-1.3.0-cp312-cp312-manylinux2014_x86_64.whl", hash = "sha256:e4865acbff1172aaee304bf9c550586088d8b4545a384423597a590899386709"},
-    {file = "cuda_tile-1.3.0-cp312-cp312-win_amd64.whl", hash = "sha256:93e20ed31e46e5bf704fb31d13e1c08338d2177838798876f7ee9ec4384b75ba"},
-    {file = "cuda_tile-1.3.0-cp313-cp313-manylinux2014_aarch64.whl", hash = "sha256:8a9bd4dae193cddf438f55d617b6f25b4b0b0fcf4ac4acde7d2695898e396c30"},
-    {file = "cuda_tile-1.3.0-cp313-cp313-manylinux2014_x86_64.whl", hash = "sha256:a44a81e255fdb7bf8e1f7511fe3a019e6045024574509ea8548e0f71f25f8473"},
-    {file = "cuda_tile-1.3.0-cp313-cp313-win_amd64.whl", hash = "sha256:efcb93c25563fe23d6aa083c22893fd703122eaf684b0d36874982d28a6dad0b"},
+    {file = "cuda_tile-1.1.0-cp310-cp310-manylinux2014_aarch64.whl", hash = "sha256:cb7a909bb76170f492537efccba89131022332c66acc4b0d56f3ec81f0f0f102"},
+    {file = "cuda_tile-1.1.0-cp310-cp310-manylinux2014_x86_64.whl", hash = "sha256:d0e0b1e49d57123c79403dae2aa3ce372d3f75298b4f1be904e3e8285a1161c5"},
+    {file = "cuda_tile-1.1.0-cp310-cp310-win_amd64.whl", hash = "sha256:0a923938864eba2f2c00a175da2ee7f9632f881581574cd7c637b458f2a650f4"},
+    {file = "cuda_tile-1.1.0-cp311-cp311-manylinux2014_aarch64.whl", hash = "sha256:8cc2d5c4e263d369514c577c175ee6458a80bd50357351f5104790b46933842b"},
+    {file = "cuda_tile-1.1.0-cp311-cp311-manylinux2014_x86_64.whl", hash = "sha256:eb75d3caf9555f0b160f009e0c2dd995ccb986e4a766fe4278eedb52d086c89f"},
+    {file = "cuda_tile-1.1.0-cp311-cp311-win_amd64.whl", hash = "sha256:4c4b09e0b9b6fb6514aa6192cf54113bcb5df4ca7fe7b1ff6c4773091fa0d13d"},
+    {file = "cuda_tile-1.1.0-cp312-cp312-manylinux2014_aarch64.whl", hash = "sha256:b5a777cfa88411ee12a77440f015ef5136a3c70208391f00626dd3f83bcdbb65"},
+    {file = "cuda_tile-1.1.0-cp312-cp312-manylinux2014_x86_64.whl", hash = "sha256:35b3e6a9368390339211ed7f1ee3416a829a44d1c1b335ef0df814a6e6ff4902"},
+    {file = "cuda_tile-1.1.0-cp312-cp312-win_amd64.whl", hash = "sha256:a38e09f6335a93fa94a41c07f3cf9f6089f75eeafce77443cf7e30bf1abadbab"},
+    {file = "cuda_tile-1.1.0-cp313-cp313-manylinux2014_aarch64.whl", hash = "sha256:9008968989e83ffe705c9c8ac0d3fb4d9218fd98468eeff85f50b1ecc062d4c9"},
+    {file = "cuda_tile-1.1.0-cp313-cp313-manylinux2014_x86_64.whl", hash = "sha256:2758aac91c7c5a9cdacd39c44c2876aa8cb96d72a8a861fbe240c50b5e9ba235"},
+    {file = "cuda_tile-1.1.0-cp313-cp313-win_amd64.whl", hash = "sha256:52458f9329fed18630fc16505d7a21462481ad98ce2bb91a88a38fe943a831a9"},
 ]
 
 [package.dependencies]
 typing-extensions = "*"
-
-[package.extras]
-tileiras = ["nvidia-cuda-nvcc (>=13.2,<13.3)", "nvidia-cuda-tileiras (>=13.2,<13.3)", "nvidia-nvvm (>=13.2,<13.3)"]
 
 [[package]]
 name = "cuda-toolkit"
@@ -1568,20 +1565,18 @@ files = [
 
 [[package]]
 name = "flashinfer-python"
-version = "0.6.11.post1"
+version = "0.6.12rc1"
 description = "FlashInfer: Kernel Library for LLM Serving"
 optional = false
 python-versions = "<4.0,>=3.10"
 groups = ["main"]
-files = [
-    {file = "flashinfer_python-0.6.11.post1-py3-none-any.whl", hash = "sha256:52c6dbd1262ff0d46dce0253996108e0c55e86faa7c25a1bed7072b31d23551a"},
-    {file = "flashinfer_python-0.6.11.post1.tar.gz", hash = "sha256:b16ac9a4f229a6a0d875a2fd76dfd935d5c62e4a99ea7b128fe4b457530a5aed"},
-]
+files = []
+develop = false
 
 [package.dependencies]
 apache-tvm-ffi = ">=0.1.6,<0.1.8 || >0.1.8,<0.1.8.post0 || >0.1.8.post0,<0.2"
 click = "*"
-cuda-tile = "*"
+cuda-tile = {version = "*", extras = ["tileiras"]}
 einops = "*"
 ninja = "*"
 numpy = "*"
@@ -1597,6 +1592,13 @@ tqdm = "*"
 [package.extras]
 cu12 = ["nvidia-cutlass-dsl (>=4.5.0)"]
 cu13 = ["nvidia-cutlass-dsl[cu13] (>=4.5.0)"]
+nvep = ["cuda-python (>=13.0)"]
+
+[package.source]
+type = "git"
+url = "https://github.com/flashinfer-ai/flashinfer.git"
+reference = "v0.6.12rc1"
+resolved_reference = "a94541edac53dd5b3e3c944d30ed290e3f7accf0"
 
 [[package]]
 name = "fonttools"
@@ -4789,17 +4791,18 @@ test = ["psleak", "pytest", "pytest-instafail", "pytest-xdist", "pywin32 ; os_na
 
 [[package]]
 name = "pulp"
-version = "3.3.1"
+version = "3.3.2"
 description = "PuLP is an LP modeler written in python. PuLP can generate MPS or LP files and call GLPK, COIN CLP/CBC, CPLEX, and GUROBI to solve linear problems."
 optional = false
-python-versions = ">=3.9"
+python-versions = ">=3.10"
 groups = ["main"]
 files = [
-    {file = "pulp-3.3.1-py3-none-any.whl", hash = "sha256:45aa73db3368eb13b156564e092784c8fa0c1feefa64c2afb0410d9dc0bb5cd9"},
-    {file = "pulp-3.3.1.tar.gz", hash = "sha256:a9ec237a56981b11c2096e8ba6bb72006833410ba5b400aa257426f85df5e293"},
+    {file = "pulp-3.3.2-py3-none-any.whl", hash = "sha256:631b166f72086971a9597f7a0233ababa99bb8d50a01cd543f7758be5a9f86c0"},
+    {file = "pulp-3.3.2.tar.gz", hash = "sha256:d0904700c207ac11e25e3b1213b70eae1d6fb25faa719d75f3f15054901258c0"},
 ]
 
 [package.extras]
+cbc = ["cbcbox"]
 copt = ["coptpy"]
 cplex = ["cplex ; sys_platform != \"darwin\" or python_full_version < \"3.12.0\""]
 gurobi = ["gurobipy"]
@@ -7308,4 +7311,4 @@ type = ["pytest-mypy (>=1.0.1) ; platform_python_implementation != \"PyPy\""]
 [metadata]
 lock-version = "2.1"
 python-versions = ">=3.10,<3.13"
-content-hash = "40d4bdcc33ff08c4d66194f59c11519f058eaa20245742bd97d0b102c52a3ad7"
+content-hash = "d869c67d8f42a41bbe0f7dc231030cbef327c25feb579b859866bf864492a3ae"

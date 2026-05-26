@@ -538,6 +538,7 @@ triton_server/test_triton_llm.py::test_llmapi_backend[1-0-disableDecoupleMode-te
 triton_server/test_triton_llm.py::test_llmapi_backend[1-0-enableDecoupleMode-tensorrt_llm]
 triton_server/test_triton_llm.py::test_llmapi_backend[4-0-disableDecoupleMode-tensorrt_llm]
 triton_server/test_triton_llm.py::test_llmapi_backend[4-0-enableDecoupleMode-tensorrt_llm]
+triton_server/test_triton_llm.py::test_llmapi_lora[1-tensorrt_llm]
 triton_server/test_triton_llm.py::test_llmapi_backend_multi_instance
 triton_server/test_triton_llm.py::test_tiny_llama_ifb_token_counts[tensorrtllm-input_only-False-1---False-True-False-0-128-enableDecoupleMode-inflight_fused_batching-disableTrtOverlap--guaranteed_no_evict---1-1-1-False-ensemble]
 triton_server/test_triton_llm.py::test_tiny_llama_ifb_token_counts[tensorrtllm-input_only-False-1---False-True-False-0-128-enableDecoupleMode-inflight_fused_batching-disableTrtOverlap--guaranteed_no_evict---1-1-1-False-tensorrt_llm_bls]
