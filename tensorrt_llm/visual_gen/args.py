@@ -247,7 +247,7 @@ class ParallelConfig(StrictBaseModel):
 
     @property
     def n_workers(self) -> int:
-        return self.cfg_size * self.seq_parallel_size
+        return self.cfg_size * self.seq_parallel_size * self.tp_size
 
     @property
     def total_parallel_size(self) -> int:
