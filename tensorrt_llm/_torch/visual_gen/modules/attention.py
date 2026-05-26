@@ -226,7 +226,6 @@ class Attention(nn.Module):
         tp_mode = TensorParallelMode.COLUMN if self.mapping.tp_size > 1 else None
 
         if self.qkv_mode == QKVMode.FUSE_QKV:
-            assert tp_mode is None, "fused QKV TP is not supported yet"
             qkv_out_dim = self.q_dim + 2 * self.kv_dim
             self.qkv_proj = Linear(
                 self.hidden_size,
@@ -245,7 +244,7 @@ class Attention(nn.Module):
                     "k": (self.q_dim, self.kv_dim),
                     "v": (self.q_dim + self.kv_dim, self.kv_dim),
                 },
-                # TODO: Fused QKV TP support
+                tensor_parallel_mode=tp_mode,
                 reduce_output=False,
             )
         else:
@@ -260,7 +259,6 @@ class Attention(nn.Module):
                 force_dynamic_quantization=self.force_dynamic_quantization,
                 tensor_parallel_mode=tp_mode,
                 reduce_output=False,
-                allreduce_strategy=self.allreduce_strategy,
             )
             self.to_k = Linear(
                 self.hidden_size,
@@ -273,7 +271,6 @@ class Attention(nn.Module):
                 force_dynamic_quantization=self.force_dynamic_quantization,
                 tensor_parallel_mode=tp_mode,
                 reduce_output=False,
-                allreduce_strategy=self.allreduce_strategy,
             )
             self.to_v = Linear(
                 self.hidden_size,
@@ -286,8 +283,19 @@ class Attention(nn.Module):
                 force_dynamic_quantization=self.force_dynamic_quantization,
                 tensor_parallel_mode=tp_mode,
                 reduce_output=False,
-                allreduce_strategy=self.allreduce_strategy,
             )
+
+    def split_qkv(self, qkv: torch.Tensor):
+        def calc_shard(dim):
+            shard = dim // self.mapping.tp_size
+            start = shard * self.mapping.tp_rank
+            end = min(shard * (self.mapping.tp_rank + 1), dim)
+            return end - start
+
+        q_shard = calc_shard(self.q_dim)
+        kv_shard = calc_shard(self.kv_dim)
+
+        return qkv.split([q_shard, kv_shard, kv_shard], dim=-1)
 
     def get_qkv(
         self,
@@ -296,7 +304,7 @@ class Attention(nn.Module):
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         if self.qkv_mode == QKVMode.FUSE_QKV:
             qkv = self.qkv_proj(hidden_states)
-            q, k, v = qkv.split([self.q_dim, self.kv_dim, self.kv_dim], dim=-1)
+            q, k, v = self.split_qkv(qkv)
         else:
             kv_source = (
                 encoder_hidden_states if encoder_hidden_states is not None else hidden_states
