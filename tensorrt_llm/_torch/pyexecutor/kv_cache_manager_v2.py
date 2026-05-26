@@ -45,7 +45,9 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     HostCacheTierConfig,
     KVCacheIterationStatsDelta,
     LayerId,
+    PageIndexMode,
     ReuseScope,
+    SwaScratchReuseConfig,
     TokenIdExt,
     _KVCache,
 )
@@ -73,6 +75,7 @@ from tensorrt_llm.sampling_params import SamplingParams
 from ..._utils import binding_to_torch_dtype, mpi_rank, nvtx_range, str_dtype_to_torch
 from ...logger import logger
 from ...mapping import CpType, Mapping
+from ..utils import maybe_compile
 from .connectors.kv_cache_connector import KvCacheConnectorManager
 from .kv_cache_stats import (
     KVCacheV2IterationStatsReport,
@@ -439,6 +442,58 @@ def _update_kv_cache_draft_token_location(
         )
 
 
+@maybe_compile(options={"max-autotune": True})
+def _copy_swa_block_offsets_with_scratch_compiled(
+    block_offsets: torch.Tensor,
+    copy_idx: torch.Tensor,
+    pool_ids: torch.Tensor,
+    scales: torch.Tensor,
+    layer_offsets: torch.Tensor,
+    scratch_pages: torch.Tensor,
+    block_positions: torch.Tensor,
+    scratch_begs: torch.Tensor,
+    scratch_ends: torch.Tensor,
+    scratch_slots: torch.Tensor,
+    num_contexts: torch.Tensor,
+    output: torch.Tensor,
+) -> None:
+    base = block_offsets[pool_ids[:, :, None], copy_idx[None, None, :], 0, :]
+    converted = torch.where(
+        base == BAD_PAGE_INDEX,
+        BAD_PAGE_INDEX,
+        base * scales[:, :, None, None] + layer_offsets[:, :, None, None],
+    )
+
+    context_positions = torch.arange(
+        scratch_begs.shape[1],
+        dtype=torch.int32,
+        device=scratch_begs.device,
+    )
+    active_context = context_positions < num_contexts
+    scratch_mask_by_pool = (
+        (block_positions >= scratch_begs[:, :, None])
+        & (block_positions < scratch_ends[:, :, None])
+        & active_context[None, :, None]
+    )
+    range_index = torch.where(
+        scratch_mask_by_pool,
+        block_positions - scratch_begs[:, :, None],
+        0,
+    )
+    total_offset = range_index[pool_ids] * scratch_pages[:, :, None, None]
+    slot_idx = (total_offset // scales[:, :, None, None]).clamp(max=scratch_slots.shape[-1] - 1)
+    slot_id = scratch_slots[pool_ids].gather(-1, slot_idx.long())
+    offset = total_offset % scales[:, :, None, None]
+    scratch_index = (
+        slot_id * scales[:, :, None, None]
+        + (offset + layer_offsets[:, :, None, None]) % scales[:, :, None, None]
+    )
+    scratch_mask = scratch_mask_by_pool[pool_ids]
+    converted = torch.where(scratch_mask, scratch_index, converted)
+
+    output.copy_(converted.permute(0, 2, 1, 3))
+
+
 class KVCacheManagerV2(BaseResourceManager):
     def __init__(
         self,
@@ -466,6 +521,7 @@ class KVCacheManagerV2(BaseResourceManager):
         execution_stream: Optional[torch.cuda.Stream] = None,
         is_disagg: bool = False,
         enable_stats: bool = False,
+        enable_swa_scratch_reuse: bool = False,
         **kwargs,
     ) -> None:
         self.mapping = mapping
@@ -488,6 +544,7 @@ class KVCacheManagerV2(BaseResourceManager):
             layer_mask=layer_mask,
         )
         self.is_draft = is_draft
+        self.enable_swa_scratch_reuse = enable_swa_scratch_reuse and not self.is_draft
         self.num_local_layers = len(self.pp_layers)
         self.layer_offsets = {idx: offset for offset, idx in enumerate(self.pp_layers)}
         self.max_beam_width = max_beam_width
@@ -746,6 +803,14 @@ class KVCacheManagerV2(BaseResourceManager):
             )
 
         self.num_pools = len(self.impl.layer_grouping)
+        # num_pools is the physical pool count owned by the KV cache manager.
+        # With SWA scratch reuse, scratch slot IDs are only valid with
+        # per-layer page indices, so the attention op sees one virtual pool per
+        # local layer while the underlying manager can still group layers.
+        if self.enable_swa_scratch_reuse:
+            self.num_attention_op_pools = self.num_local_layers
+        else:
+            self.num_attention_op_pools = self.num_pools
 
         num_layers = len(config.layers)
         self.layer_to_pool_mapping_dict: dict[int, int] = {
@@ -830,8 +895,8 @@ class KVCacheManagerV2(BaseResourceManager):
             self.index_scales[pool_id] = self.impl.get_page_index_scale(layer_id, Role.KEY)
             if self.kv_cache_type != CacheTypeCpp.SELFKONLY:
                 self.kv_offset[pool_id] = exact_div(
-                    self.impl.get_mem_pool_base_address(layer_id, Role.VALUE)
-                    - self.impl.get_mem_pool_base_address(layer_id, Role.KEY),
+                    self.impl.get_mem_pool_base_address(layer_id, Role.VALUE, PageIndexMode.SHARED)
+                    - self.impl.get_mem_pool_base_address(layer_id, Role.KEY, PageIndexMode.SHARED),
                     self.impl.get_page_stride(layer_id, Role.KEY),
                 )
             else:
@@ -847,6 +912,8 @@ class KVCacheManagerV2(BaseResourceManager):
             pin_memory=prefer_pinned(),
             device="cpu",
         )
+        if self.enable_swa_scratch_reuse:
+            self._prepare_swa_scratch_copy_tensors(index_mapper_capacity)
 
         self._log_kv_cache_pool_lifecycle_mapping()
 
@@ -906,77 +973,310 @@ class KVCacheManagerV2(BaseResourceManager):
         for entry in entries:
             logger.info(entry)
 
-    def _build_pool_mapping_tensors(self) -> Tuple[torch.Tensor, torch.Tensor]:
-        kv_cache_pool_pointers = torch.tensor(
-            [
-                [
-                    self.impl.get_mem_pool_base_address(
-                        self.impl.layer_grouping[pool_id][0], Role.KEY
-                    ),
-                    0,
-                ]
-                for pool_id in range(self.num_pools)
-            ],
-            dtype=torch.int64,
+    def _prepare_swa_scratch_copy_tensors(self, index_mapper_capacity: int) -> None:
+        pool_ids = torch.empty(
+            self.num_attention_op_pools,
+            2,
+            dtype=torch.long,
             device="cpu",
-            pin_memory=prefer_pinned(),
+        )
+        scales = torch.empty(
+            self.num_attention_op_pools,
+            2,
+            dtype=torch.int32,
+            device="cpu",
+        )
+        layer_offsets = torch.empty_like(scales)
+        scratch_pages = torch.empty_like(scales)
+        for local_layer_idx in range(self.num_local_layers):
+            layer_id = LayerId(local_layer_idx)
+            pool_id = self.layer_to_pool_mapping_dict[layer_id]
+            roles = [Role.KEY, Role.VALUE]
+            if self.kv_cache_type == CacheTypeCpp.SELFKONLY:
+                roles[1] = Role.KEY
+            for role_idx, role in enumerate(roles):
+                converter = self.impl.get_page_index_converter(layer_id, role)
+                if converter.expansion != 1:
+                    raise NotImplementedError(
+                        "SWA scratch block-table conversion does not support "
+                        f"expanded page indices yet: layer={layer_id}, role={role}, "
+                        f"expansion={converter.expansion}"
+                    )
+                pool_ids[local_layer_idx, role_idx] = pool_id
+                scales[local_layer_idx, role_idx] = int(converter.scale)
+                layer_offsets[local_layer_idx, role_idx] = int(converter.layer_offset)
+                scratch_pages[local_layer_idx, role_idx] = int(converter.scratch_pages_per_block)
+
+        staging_capacity = index_mapper_capacity * self.max_beam_width
+        device = torch.device("cuda", torch.cuda.current_device())
+        self._device_kv_cache_block_offsets_input = torch.empty_like(
+            self.host_kv_cache_block_offsets,
+            device=device,
+        )
+        self._device_attention_op_block_offsets_staging = torch.empty(
+            self.num_attention_op_pools,
+            staging_capacity,
+            2,
+            self.max_blocks_per_seq,
+            dtype=torch.int32,
+            device=device,
+        )
+        self._device_copy_idx_staging = torch.zeros(
+            staging_capacity,
+            dtype=torch.long,
+            device=device,
+        )
+        self._device_num_contexts = torch.empty((), dtype=torch.int32, device=device)
+        self._device_attention_op_pool_ids = pool_ids.to(device=device)
+        self._device_attention_op_scales = scales.to(device=device)
+        self._device_attention_op_layer_offsets = layer_offsets.to(device=device)
+        self._device_attention_op_scratch_pages = scratch_pages.to(device=device)
+        self._device_block_positions = torch.arange(
+            self.max_blocks_per_seq,
+            dtype=torch.int32,
+            device=device,
         )
 
-        if self.dtype == DataType.NVFP4:
-            kv_cache_pool_pointers = torch.stack(
-                [
-                    kv_cache_pool_pointers,
-                    torch.tensor(
-                        [
-                            [
-                                self.impl.get_mem_pool_base_address(
-                                    self.impl.layer_grouping[pool_id][0], Role.KEY_BLOCK_SCALE
-                                ),
-                                0,
-                            ]
-                            for pool_id in range(self.num_pools)
-                        ],
-                        dtype=torch.int64,
-                        device="cpu",
-                        pin_memory=prefer_pinned(),
-                    ),
-                ],
-                dim=-1,
-            )
+        min_scale = int(scales.min().item()) if scales.numel() > 0 else 1
+        max_scratch_pages = int(scratch_pages.max().item()) if scratch_pages.numel() > 0 else 1
+        self._max_scratch_slots = max(
+            1,
+            (self.max_blocks_per_seq * max_scratch_pages + min_scale - 1) // min_scale,
+        )
+        scratch_slots_shape = (
+            self.num_pools,
+            staging_capacity,
+            self._max_scratch_slots,
+        )
+        self._host_scratch_begs_staging = torch.zeros(
+            self.num_pools,
+            staging_capacity,
+            dtype=torch.int32,
+            pin_memory=prefer_pinned(),
+            device="cpu",
+        )
+        self._host_scratch_ends_staging = torch.zeros(
+            self.num_pools,
+            staging_capacity,
+            dtype=torch.int32,
+            pin_memory=prefer_pinned(),
+            device="cpu",
+        )
+        self._host_scratch_slots_staging = torch.zeros(
+            scratch_slots_shape,
+            dtype=torch.int32,
+            pin_memory=prefer_pinned(),
+            device="cpu",
+        )
+        self._device_scratch_begs_staging = torch.zeros(
+            self.num_pools,
+            staging_capacity,
+            dtype=torch.int32,
+            device=device,
+        )
+        self._device_scratch_ends_staging = torch.zeros(
+            self.num_pools,
+            staging_capacity,
+            dtype=torch.int32,
+            device=device,
+        )
+        self._device_scratch_slots_staging = torch.zeros(
+            scratch_slots_shape,
+            dtype=torch.int32,
+            device=device,
+        )
 
+    def _copy_idx_to_device(self, copy_idx: torch.Tensor) -> torch.Tensor:
+        self._device_copy_idx_staging[: copy_idx.size(0)].copy_(copy_idx, non_blocking=True)
+        return self._device_copy_idx_staging
+
+    def _copy_scratch_metadata_to_device(
+        self,
+        request_ids: List[int],
+        num_contexts: int,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        host_begs = self._host_scratch_begs_staging[:, :num_contexts]
+        host_ends = self._host_scratch_ends_staging[:, :num_contexts]
+        host_slots = self._host_scratch_slots_staging[:, :num_contexts, :]
+        host_begs.zero_()
+        host_ends.zero_()
+        host_slots.zero_()
+
+        for pool_id in range(self.num_pools):
+            for context_idx, request_id in enumerate(request_ids[:num_contexts]):
+                desc = self.kv_cache_map[request_id].get_scratch_desc(pool_id)
+                if desc is None:
+                    continue
+                slot_ids = desc.slot_ids
+                if len(slot_ids) > self._max_scratch_slots:
+                    raise RuntimeError(
+                        f"Scratch slot count {len(slot_ids)} exceeds staging capacity "
+                        f"{self._max_scratch_slots}"
+                    )
+                host_begs[pool_id, context_idx] = int(desc.range.beg)
+                host_ends[pool_id, context_idx] = int(desc.range.end)
+                for slot_idx, slot_id in enumerate(slot_ids):
+                    host_slots[pool_id, context_idx, slot_idx] = int(slot_id)
+
+        self._device_scratch_begs_staging.copy_(
+            self._host_scratch_begs_staging,
+            non_blocking=True,
+        )
+        self._device_scratch_ends_staging.copy_(
+            self._host_scratch_ends_staging,
+            non_blocking=True,
+        )
+        self._device_scratch_slots_staging.copy_(
+            self._host_scratch_slots_staging,
+            non_blocking=True,
+        )
+        return (
+            self._device_scratch_begs_staging,
+            self._device_scratch_ends_staging,
+            self._device_scratch_slots_staging,
+        )
+
+    def _copy_batch_block_offsets_per_layer(
+        self,
+        dst_tensor: torch.Tensor,
+        request_ids: List[int],
+        copy_idx: torch.Tensor,
+        num_contexts: int,
+        num_seqs: int,
+    ) -> None:
+        device_copy_idx = self._copy_idx_to_device(copy_idx)
+        self._device_kv_cache_block_offsets_input.copy_(
+            self.host_kv_cache_block_offsets,
+            non_blocking=True,
+        )
+        scratch_begs, scratch_ends, scratch_slots = self._copy_scratch_metadata_to_device(
+            request_ids,
+            num_contexts,
+        )
+        self._device_num_contexts.fill_(num_contexts)
+        _copy_swa_block_offsets_with_scratch_compiled(
+            self._device_kv_cache_block_offsets_input,
+            device_copy_idx,
+            self._device_attention_op_pool_ids,
+            self._device_attention_op_scales,
+            self._device_attention_op_layer_offsets,
+            self._device_attention_op_scratch_pages,
+            self._device_block_positions,
+            scratch_begs,
+            scratch_ends,
+            scratch_slots,
+            self._device_num_contexts,
+            self._device_attention_op_block_offsets_staging,
+        )
+        dst_tensor[: self.num_attention_op_pools, :num_seqs].copy_(
+            self._device_attention_op_block_offsets_staging[
+                : self.num_attention_op_pools,
+                :num_seqs,
+            ],
+            non_blocking=True,
+        )
+
+    def _build_pool_mapping_tensors(self) -> Tuple[torch.Tensor, torch.Tensor]:
+        kv_cache_pool_pointers_list = []
         kv_cache_pool_mapping_list = []
-        for layer_id in typed_range(LayerId(self.num_local_layers)):
-            layer_group_id = self.impl.get_layer_group_id(layer_id)
-            if self.dtype != DataType.NVFP4:
-                addr_offset = self.impl.get_mem_pool_base_address(layer_id, Role.KEY) - int(
-                    kv_cache_pool_pointers[layer_group_id][0]
+        block_scale_pool_pointers_list = []
+        if self.enable_swa_scratch_reuse:
+            for layer_id in typed_range(LayerId(self.num_local_layers)):
+                kv_cache_pool_pointers_list.append(
+                    [
+                        self.impl.get_mem_pool_base_address(
+                            layer_id, Role.KEY, PageIndexMode.PER_LAYER
+                        ),
+                        0,
+                    ]
                 )
-            else:
-                addr_offset = self.impl.get_mem_pool_base_address(layer_id, Role.KEY) - int(
-                    kv_cache_pool_pointers[layer_group_id][0][0]
+                if self.dtype == DataType.NVFP4:
+                    block_scale_pool_pointers_list.append(
+                        [
+                            self.impl.get_mem_pool_base_address(
+                                layer_id, Role.KEY_BLOCK_SCALE, PageIndexMode.PER_LAYER
+                            ),
+                            0,
+                        ]
+                    )
+                kv_cache_pool_mapping_list.append([int(layer_id), 0])
+        else:
+            for pool_id in range(self.num_pools):
+                layer_id = self.impl.layer_grouping[pool_id][0]
+                kv_cache_pool_pointers_list.append(
+                    [
+                        self.impl.get_mem_pool_base_address(
+                            layer_id, Role.KEY, PageIndexMode.SHARED
+                        ),
+                        0,
+                    ]
                 )
-                block_scale_addr_offset = self.impl.get_mem_pool_base_address(
-                    layer_id, Role.KEY_BLOCK_SCALE
-                ) - int(kv_cache_pool_pointers[layer_group_id][0][1])
-                block_scale_offset = exact_div(
-                    block_scale_addr_offset,
-                    self.get_layer_bytes_per_token(layer_id, Role.KEY_BLOCK_SCALE)
+                if self.dtype == DataType.NVFP4:
+                    block_scale_pool_pointers_list.append(
+                        [
+                            self.impl.get_mem_pool_base_address(
+                                layer_id, Role.KEY_BLOCK_SCALE, PageIndexMode.SHARED
+                            ),
+                            0,
+                        ]
+                    )
+
+            for layer_id in typed_range(LayerId(self.num_local_layers)):
+                layer_group_id = self.impl.get_layer_group_id(layer_id)
+                if self.dtype != DataType.NVFP4:
+                    key_base_addr = kv_cache_pool_pointers_list[layer_group_id][0]
+                    addr_offset = (
+                        self.impl.get_mem_pool_base_address(
+                            layer_id, Role.KEY, PageIndexMode.SHARED
+                        )
+                        - key_base_addr
+                    )
+                else:
+                    key_base_addr = kv_cache_pool_pointers_list[layer_group_id][0]
+                    block_scale_base_addr = block_scale_pool_pointers_list[layer_group_id][0]
+                    addr_offset = (
+                        self.impl.get_mem_pool_base_address(
+                            layer_id, Role.KEY, PageIndexMode.SHARED
+                        )
+                        - key_base_addr
+                    )
+                    block_scale_addr_offset = (
+                        self.impl.get_mem_pool_base_address(
+                            layer_id, Role.KEY_BLOCK_SCALE, PageIndexMode.SHARED
+                        )
+                        - block_scale_base_addr
+                    )
+                    block_scale_offset = exact_div(
+                        block_scale_addr_offset,
+                        self.get_layer_bytes_per_token(layer_id, Role.KEY_BLOCK_SCALE)
+                        * self.kv_factor
+                        * self.tokens_per_block,
+                    )
+                offset = exact_div(
+                    addr_offset,
+                    self.get_layer_bytes_per_token(layer_id, Role.KEY)
                     * self.kv_factor
                     * self.tokens_per_block,
                 )
-            offset = exact_div(
-                addr_offset,
-                self.get_layer_bytes_per_token(layer_id, Role.KEY)
-                * self.kv_factor
-                * self.tokens_per_block,
-            )
 
-            if self.dtype == DataType.NVFP4:
-                assert block_scale_offset == offset, (
-                    "Block scale offset and offset should be the same"
-                )
+                if self.dtype == DataType.NVFP4:
+                    assert block_scale_offset == offset, (
+                        "Block scale offset and offset should be the same"
+                    )
 
-            kv_cache_pool_mapping_list.append([layer_group_id, offset])
+                kv_cache_pool_mapping_list.append([layer_group_id, offset])
+
+        if self.dtype == DataType.NVFP4:
+            for pool_id, block_scale_pool_pointers in enumerate(block_scale_pool_pointers_list):
+                pool_pointers = kv_cache_pool_pointers_list[pool_id]
+                kv_cache_pool_pointers_list[pool_id] = [
+                    [pool_pointers[0], block_scale_pool_pointers[0]],
+                    [pool_pointers[1], block_scale_pool_pointers[1]],
+                ]
+
+        kv_cache_pool_pointers = torch.tensor(
+            kv_cache_pool_pointers_list, dtype=torch.int64, device="cpu", pin_memory=prefer_pinned()
+        )
 
         kv_cache_pool_mapping = torch.tensor(
             kv_cache_pool_mapping_list, dtype=torch.int32, device="cpu", pin_memory=prefer_pinned()
@@ -1002,6 +1302,12 @@ class KVCacheManagerV2(BaseResourceManager):
             buffer_type.append(Role.KEY_BLOCK_SCALE)
             if self.kv_cache_type != CacheTypeCpp.SELFKONLY:
                 buffer_type.append(Role.VALUE_BLOCK_SCALE)
+
+        scratch_reuse_config = None
+        if self.enable_swa_scratch_reuse:
+            # Context requests allocate num_extra_kv_tokens for spec decoding.
+            # They should not count toward the scratch range.
+            scratch_reuse_config = SwaScratchReuseConfig(max_rewind_len=self.num_extra_kv_tokens)
 
         # Subclasses (e.g. MiniMax-M3 sparse cache) can register additional
         # per-layer BufferConfig entries — for example a sparse index-K
@@ -1047,6 +1353,7 @@ class KVCacheManagerV2(BaseResourceManager):
             cache_tiers=cache_tiers,
             max_util_for_resume=kv_cache_config.max_util_for_resume,
             enable_stats=self.enable_stats,
+            swa_scratch_reuse=scratch_reuse_config,
             layers=layer_configs,
         )
 
@@ -1076,9 +1383,11 @@ class KVCacheManagerV2(BaseResourceManager):
 
     def get_buffers(self, layer_idx: int, kv_layout: str = "NHD") -> Optional[torch.Tensor]:
         layer_offset = self.layer_offsets[layer_idx]
-        addr_key = self.impl.get_mem_pool_base_address(layer_offset, Role.KEY)
+        addr_key = self.impl.get_mem_pool_base_address(layer_offset, Role.KEY, PageIndexMode.SHARED)
         if self.kv_cache_type != CacheTypeCpp.SELFKONLY:
-            addr_value = self.impl.get_mem_pool_base_address(layer_offset, Role.VALUE)
+            addr_value = self.impl.get_mem_pool_base_address(
+                layer_offset, Role.VALUE, PageIndexMode.SHARED
+            )
             page_size_key = self.impl.get_page_stride(layer_offset, Role.KEY)
             page_size_value = self.impl.get_page_stride(layer_offset, Role.VALUE)
 
@@ -1504,6 +1813,10 @@ class KVCacheManagerV2(BaseResourceManager):
                     kv_cache.num_committed_tokens, self.tokens_per_block
                 )
 
+            if req.is_disagg_generation_init_state:
+                # Disagg generation receives prompt KV from the context worker;
+                # scratch blocks are only valid for local prefill chunks.
+                kv_cache.enable_swa_scratch_reuse = False
             return self._resume_and_restore(req.py_request_id, kv_cache)
         else:
             # Subsequent chunk: cache must exist from first chunk.
@@ -2119,6 +2432,8 @@ class KVCacheManagerV2(BaseResourceManager):
                     return None
                 kv_cache.stop_committing()
                 dummy_capacity = token_num + self.num_extra_kv_tokens + num_extra_decoding_steps
+                if is_gen:
+                    kv_cache.enable_swa_scratch_reuse = False
                 # Need to hint the committed history to activate stale-block
                 # optimization and match the solver's pool budget.
                 success = kv_cache.resize(dummy_capacity, history_length=history_hint)
@@ -2456,6 +2771,11 @@ class KVCacheManagerV2(BaseResourceManager):
                         f"{req.py_request_id} to {req.context_current_position} tokens "
                         "at context update"
                     )
+            if req.context_remaining_length == 0:
+                # Scratch blocks are only for prefill chunks. Disable them at
+                # the context/generation boundary so generation uses normal KV
+                # pages before the first generation allocation.
+                kv_cache.enable_swa_scratch_reuse = False
 
     def update_resources(
         self,
@@ -2505,6 +2825,12 @@ class KVCacheManagerV2(BaseResourceManager):
 
         copy_idx = self.index_mapper.get_copy_index(request_ids, num_contexts, beam_width)
         assert copy_idx.shape[0] == num_seqs
+
+        if self.enable_swa_scratch_reuse:
+            self._copy_batch_block_offsets_per_layer(
+                dst_tensor, request_ids, copy_idx, num_contexts, num_seqs
+            )
+            return
 
         copy_batch_block_offsets_to_device(
             self.host_kv_cache_block_offsets,

@@ -301,10 +301,13 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             )
 
         if self.kv_cache_manager is not None:
+            num_attention_op_pools = getattr(self.kv_cache_manager,
+                                             "num_attention_op_pools",
+                                             self.kv_cache_manager.num_pools)
             self.kv_cache_block_offsets = self.get_empty(
                 buffers,
                 [
-                    self.kv_cache_manager.num_pools, self.max_num_sequences, 2,
+                    num_attention_op_pools, self.max_num_sequences, 2,
                     self.kv_cache_manager.max_blocks_per_seq
                 ],
                 cache_name="kv_cache_block_offsets",
@@ -318,11 +321,13 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             # Allocate separate block offset tensors for draft KV cache manager
             # Used in one-model speculative decoding with different KV cache layouts
             if self.draft_kv_cache_manager is not None:
+                num_draft_attention_op_pools = getattr(
+                    self.draft_kv_cache_manager, "num_attention_op_pools",
+                    self.draft_kv_cache_manager.num_pools)
                 self.draft_kv_cache_block_offsets = self.get_empty(
                     buffers,
                     [
-                        self.draft_kv_cache_manager.num_pools,
-                        self.max_num_sequences, 2,
+                        num_draft_attention_op_pools, self.max_num_sequences, 2,
                         self.draft_kv_cache_manager.max_blocks_per_seq
                     ],
                     cache_name="draft_kv_cache_block_offsets",
