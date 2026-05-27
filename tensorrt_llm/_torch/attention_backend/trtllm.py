@@ -1143,6 +1143,21 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         self.print_skip_softmax_stat = os.environ.get(
             "TRTLLM_PRINT_SKIP_SOFTMAX_STAT", "0") == "1"
 
+        # Layer-level fp8 KV-cache scales. Stay at 1.0 (no-op) for the
+        # PyTorch backend, which never overrides them. They guarantee the
+        # kernel always receives a valid pointer, since several non-MLA
+        # XQA kernels (cpp/kernels/xqa/mha.cu, mha_sm90.cu) deref
+        # ``kvCacheScale[0]`` whenever ``isKVCacheQuantized`` is true and
+        # do not check for nullptr. ``modules/attention.py`` only assigns
+        # ``forward_args.kv_scale_*`` for fp4 KV cache, so without this
+        # fallback the kernel takes nullptr on fp8-KV models → illegal
+        # memory access.
+        self.kv_cache_scaling_factor = torch.ones(1,
+                                                  dtype=torch.float32,
+                                                  device='cuda')
+        self.kv_scale_quant_orig = self.kv_cache_scaling_factor
+        self.kv_scale_orig_quant = 1.0 / self.kv_cache_scaling_factor
+
         self.local_layer_idx: Optional[int] = None
         if not skip_create_weights_in_init:
             self.update_quant_config(self.quant_config)
@@ -1448,6 +1463,17 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         # call site where ``output_sf`` is always ``None``.
         if forward_args.output_sf is not None and forward_args.out_scale_sf is not None:
             forward_args.out_scale = forward_args.out_scale_sf
+
+        # Default ``forward_args.kv_scale_*`` to the layer-level mirrors when
+        # the caller didn't populate them. ``modules/attention.py`` only sets
+        # these for fp4 KV cache; fp8-KV models leave them ``None``. Several
+        # XQA kernels (mha.cu, mha_sm90.cu) deref ``kvCacheScale[0]`` when
+        # ``isKVCacheQuantized`` is true and don't check for nullptr, so
+        # passing ``None`` crashes with illegal memory access.
+        if forward_args.kv_scale_orig_quant is None:
+            forward_args.kv_scale_orig_quant = self.kv_scale_orig_quant
+        if forward_args.kv_scale_quant_orig is None:
+            forward_args.kv_scale_quant_orig = self.kv_scale_quant_orig
 
         helix_active = metadata.helix_position_offsets is not None
         use_sage_attn = (forward_args.sage_attn_num_elts_per_blk_q > 0
