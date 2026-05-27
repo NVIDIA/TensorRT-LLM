@@ -37,6 +37,7 @@ from tensorrt_llm.llmapi.llm_args import PeftCacheConfig, WaitingQueuePolicy
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import CpType
 from tensorrt_llm.runtime.generation import CUASSERT
+from tensorrt_llm.runtime.kv_cache_manager_v2._exceptions import OutOfPagesError
 from tensorrt_llm.tools.layer_wise_benchmarks import get_calibrator
 from tensorrt_llm.tools.profiler.host_profile_tools.host_profiler import (
     get_global_profiler, host_profiler_context)
@@ -2720,7 +2721,7 @@ class PyExecutor:
 
         try:
             mgr.impl.adjust()
-        except Exception as e:
+        except OutOfPagesError as e:
             logger.warning(f"KV pool adjust() failed: {e!r}")
 
         for req in paused:
