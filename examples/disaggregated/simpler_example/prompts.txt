@@ -1,0 +1,46 @@
+curl http://localhost:8000/v1/completions \
+    -H "Content-Type: application/json" \
+    -d '{
+        "model": "TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+        "prompt": "The layers of the atmosphere are",
+        "use_beam_search": true,
+        "n": 4,
+        "max_tokens": 1024,
+        "temperature": 0
+    }' -w "\n" 2>&1 | tee atmosphere_output2.json
+
+curl http://localhost:8000/v1/completions \
+    -H "Content-Type: application/json" \
+    -d '{
+        "model": "TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+        "prompt": "Some times there is a bug in the context server, and the context server returns 4 choices, but the generation server returns 1 choice.  This is a test of the disaggregated server. We want to see if the disaggregated server can handle this situation and return the correct choice. Please return the correct choice. No mistakes.",
+        "use_beam_search": true,
+        "n": 4,
+        "max_tokens": 9000,
+        "temperature": 0
+    }' -w "\n" 2>&1 | tee long_output.json
+
+
+curl http://localhost:8000/v1/completions \
+    -H "Content-Type: application/json" \
+    -d '{
+        "model": "TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+        "prompt": "We’re excited to host Jonah Alben, SVP of GPU Engineering at NVIDIA! Jonah leads the development of next-gen GPU architectures and brings decades of experience (and 34 patents!)—this is a great opportunity to hear directly from a leader shaping",
+        "use_beam_search": true,
+        "n": 4,
+        "max_tokens": 2048,
+        "temperature": 0
+    }' -w "\n" 2>&1 | tee jonah_output.json
+
+
+
+curl http://localhost:8000/v1/completions \
+    -H "Content-Type: application/json" \
+    -d '{
+        "model": "TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+        "prompt": "Hello everyone, Please join me in welcoming Shubham Gandhi to the Deep Learning Algorithms Team! Shubham joined the team today as a Deep Learning Algorithms Engineer and will be working hybrid from HQ. Shubham just graduated from Cornell University with Masters degree in Computer Science. He will be focusing on agentic and algorithmic optimizations for Turbo NIMs. Were delighted to have Shubham joining us and cant wait to see all that hell accomplish at NVIDIA in the years ahead. Below are a few words from Shubham! Hello Team, Im Shubham, and Im so excited to be joining you all! A little about me: I just finished my masters at Cornell, where my work focused on the intersection of computer architecture and multimodal language modeling. During my time there, I built an agentic regulatory filing platform that won a startup award, and I also spent a summer interning at Amazon. Outside of work, I follow Formula 1, play video games, and am working towards running my first half marathon by the end of summer! Anahita has been super welcoming, and Im looking forward to learning from and working alongside such a talented team.",
+        "use_beam_search": true,
+        "n": 4,
+        "max_tokens": 9000,
+        "temperature": 0
+    }' -w "\n" 2>&1 | tee shubham_output.json

@@ -2,6 +2,7 @@ disable_overlap_scheduler: True
 max_beam_width: 4
 kv_cache_config:
   use_kv_cache_manager_v2: false
+  enable_block_reuse: true
 cache_transceiver_config:
   backend: NIXL
   transceiver_runtime: PYTHON
