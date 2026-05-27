@@ -260,6 +260,13 @@ transforms:
   fuse_rope_into_trtllm_mla:
     stage: post_load_fusion
     enabled: false
+  # DeepSeek-V3 / -R1: replicate PT's pre-fused q_a + kv_a_with_mqa GEMM,
+  # dispatching trtllm::dsv3_fused_a_gemm_op (custom kernel for bf16,
+  # num_tokens in [1,16], HD_IN=7168, HD_OUT=2112; falls back to cuBLAS
+  # otherwise).  Disabled by default; opt in per-model YAML.
+  fuse_dsv3_a_gemm:
+    stage: post_load_fusion
+    enabled: false
   optimize_rope:
     stage: post_load_fusion
   mlir_elementwise_fusion:
