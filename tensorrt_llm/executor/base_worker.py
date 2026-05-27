@@ -745,7 +745,7 @@ class BaseWorker(GenerationExecutor):
         from tensorrt_llm._torch.pyexecutor.py_executor import (
             _CONTROL_ACK_TAG, _CONTROL_ACTION_TAG)
         from tensorrt_llm._torch.virtual_memory import (materialize_with_tag,
-                                                         release_with_tag)
+                                                        release_with_tag)
 
         assert self.rank == 0, (
             "_multi_rank_sleep_wakeup must only be called on rank 0")
@@ -782,10 +782,8 @@ class BaseWorker(GenerationExecutor):
                     materialize_with_tag(*tags)
                     torch.cuda.synchronize()
             except Exception as exc:
-                local_error = (
-                    f"rank 0 '{action}' failed: {exc}\n"
-                    f"{traceback.format_exc()}"
-                )
+                local_error = (f"rank 0 '{action}' failed: {exc}\n"
+                               f"{traceback.format_exc()}")
                 logger.error(
                     f"_multi_rank_sleep_wakeup: rank-0 local {action} failed:",
                     exc_info=True,
@@ -800,14 +798,11 @@ class BaseWorker(GenerationExecutor):
                 ack = control_comm.recv(source=src, tag=_CONTROL_ACK_TAG)
                 if ack.get("status") != "ok":
                     errors.append(
-                        ack.get("error")
-                        or f"rank {src} returned unknown ACK"
-                    )
+                        ack.get("error") or f"rank {src} returned unknown ACK")
             if errors:
                 raise RuntimeError(
-                    f"{action}() failed on {len(errors)} rank(s):\n"
-                    + "\n".join(errors)
-                )
+                    f"{action}() failed on {len(errors)} rank(s):\n" +
+                    "\n".join(errors))
 
     def sleep(self, sleep_tags: List[str]) -> None:
         """Release GPU virtual memory for the specified memory type tags.
