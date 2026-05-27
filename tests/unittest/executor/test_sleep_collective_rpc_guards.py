@@ -93,11 +93,20 @@ class TestBaseWorkerSleepGuards:
         with pytest.raises(ValueError, match="Sleep feature is not enabled"):
             getattr(w, method)(["kv_cache"])
 
-    def test_multirank_raises(self, method):
-        """world_size > 1 must raise before control_action() is entered."""
+    def test_multirank_dispatches_to_helper(self, method):
+        """world_size > 1 must route to _multi_rank_sleep_wakeup, not raise.
+
+        The precondition check no longer blocks multi-rank; the helper
+        handles coordination via the control communicator.
+        """
+        from unittest.mock import patch
         w = _make_worker(world_size=2)
-        with pytest.raises(NotImplementedError, match="parallel_config.world_size == 1"):
+        with patch.object(w, "_multi_rank_sleep_wakeup") as mock_helper:
             getattr(w, method)(["kv_cache"])
+        mock_helper.assert_called_once()
+        call_action, call_tags = mock_helper.call_args[0]
+        assert call_action == method
+        assert len(call_tags) == 1
 
     def test_backend_checked_before_sleep_config(self, method):
         """Backend check fires even when sleep_config is also absent."""
@@ -105,14 +114,384 @@ class TestBaseWorkerSleepGuards:
         with pytest.raises(ValueError, match="only available for the PyTorch"):
             getattr(w, method)(["kv_cache"])
 
-    def test_sleep_config_checked_before_world_size(self, method):
-        """sleep_config check fires before world_size.
+    def test_sleep_config_check_fires_for_multirank(self, method):
+        """sleep_config check fires even for multi-rank callers.
 
-        The error should be actionable: set sleep_config, not "go to TP1".
+        The precondition check runs before the world_size dispatch, so a
+        multi-rank caller without sleep_config still gets an actionable error.
         """
         w = _make_worker(world_size=2, sleep_config=None)
         with pytest.raises(ValueError, match="Sleep feature is not enabled"):
             getattr(w, method)(["kv_cache"])
+
+
+# ---------------------------------------------------------------------------
+# _multi_rank_sleep_wakeup serialisation via _control_action_lock
+# ---------------------------------------------------------------------------
+
+
+class TestMultiRankSleepWakeupLock:
+    """Verify that _multi_rank_sleep_wakeup holds engine._control_action_lock.
+
+    The lock prevents two concurrent RPC calls from interleaving their
+    control_action + _control_comm send/recv sequences.  We test this by
+    spying on the lock's __enter__/__exit__ calls while driving
+    _multi_rank_sleep_wakeup directly (bypassing the sleep/wakeup dispatch
+    layer), with all MPI/CUDA machinery stubbed out.
+    """
+
+    def _make_multi_rank_worker(self):
+        """BaseWorker shell wired for a 2-rank deployment."""
+        import threading
+        from contextlib import contextmanager
+
+        from tensorrt_llm.executor.base_worker import BaseWorker
+
+        w = object.__new__(BaseWorker)
+        w._backend = "pytorch"
+        w.rank = 0
+        w.llm_args = SimpleNamespace(
+            backend="pytorch",
+            parallel_config=SimpleNamespace(world_size=2),
+            sleep_config=object(),
+        )
+
+        # A real lock so the actual acquire/release semantics are exercised.
+        real_lock = threading.Lock()
+        lock_events: list = []
+
+        class SpyLock:
+            """Wraps a real Lock and records enter/exit order."""
+
+            def __enter__(self_inner):
+                lock_events.append("acquire")
+                return real_lock.__enter__()
+
+            def __exit__(self_inner, *args):
+                lock_events.append("release")
+                return real_lock.__exit__(*args)
+
+        # Stub out _control_comm; send/recv are no-ops, recv returns ok ACK.
+        mock_comm = SimpleNamespace(
+            send=lambda *a, **kw: None,
+            recv=lambda *a, **kw: {"status": "ok"},
+        )
+
+        @contextmanager
+        def _noop_control_action():
+            yield None
+
+        w.engine = SimpleNamespace(
+            _control_action_lock=SpyLock(),
+            _control_comm=mock_comm,
+            control_action=_noop_control_action,
+        )
+
+        return w, lock_events
+
+    def test_lock_acquired_and_released(self):
+        """_control_action_lock must be acquired before and released after
+        the control_action + send/recv sequence."""
+        from unittest.mock import patch
+
+        w, lock_events = self._make_multi_rank_worker()
+
+        with patch(
+            "tensorrt_llm._torch.virtual_memory.release_with_tag"
+        ), patch(
+            "tensorrt_llm._torch.virtual_memory.materialize_with_tag"
+        ), patch(
+            "torch.cuda.synchronize"
+        ), patch(
+            "gc.collect"
+        ), patch(
+            "torch.cuda.empty_cache"
+        ):
+            from tensorrt_llm.llmapi.llm_args import ExecutorMemoryType
+
+            w._multi_rank_sleep_wakeup(
+                "sleep", [ExecutorMemoryType.KV_CACHE])
+
+        assert lock_events == ["acquire", "release"], (
+            f"Expected ['acquire', 'release'], got {lock_events}")
+
+    def test_concurrent_calls_do_not_interleave(self):
+        """Two concurrent _multi_rank_sleep_wakeup calls must not overlap.
+
+        We use a threading.Barrier to maximise the chance of a race, then
+        check that the critical section (between acquire and release) is
+        never entered by both threads simultaneously.
+
+        All CUDA/VMM patches are applied once in the main thread so both
+        worker threads share the same mock objects.  Per-thread patch contexts
+        for the same globals can restore each other's mocks in the wrong order
+        and leave patched state behind for later tests.
+        """
+        import threading
+        from unittest.mock import patch
+
+        from tensorrt_llm.llmapi.llm_args import ExecutorMemoryType
+
+        w, _ = self._make_multi_rank_worker()
+
+        overlap_detected = threading.Event()
+        inside = threading.Event()  # set while a thread is in the critical sec.
+
+        def slow_send(*args, **kwargs):
+            """Simulate work inside the critical section."""
+            if inside.is_set():
+                overlap_detected.set()
+            inside.set()
+            import time
+            time.sleep(0.01)
+            inside.clear()
+
+        w.engine._control_comm.send = slow_send
+        barrier = threading.Barrier(2)
+        thread_exceptions: list = []
+
+        def run():
+            barrier.wait()
+            try:
+                w._multi_rank_sleep_wakeup(
+                    "sleep", [ExecutorMemoryType.KV_CACHE])
+            except Exception as exc:  # noqa: BLE001
+                thread_exceptions.append(exc)
+
+        with patch("tensorrt_llm._torch.virtual_memory.release_with_tag"), \
+             patch("tensorrt_llm._torch.virtual_memory.materialize_with_tag"), \
+             patch("torch.cuda.synchronize"), \
+             patch("gc.collect"), \
+             patch("torch.cuda.empty_cache"):
+            t1 = threading.Thread(target=run)
+            t2 = threading.Thread(target=run)
+            t1.start()
+            t2.start()
+            t1.join()
+            t2.join()
+
+        if thread_exceptions:
+            raise AssertionError(
+                f"Worker thread(s) raised unexpected exceptions: "
+                f"{thread_exceptions}"
+            )
+        assert not overlap_detected.is_set(), (
+            "Two _multi_rank_sleep_wakeup calls overlapped in the critical "
+            "section; _control_action_lock is not being held correctly.")
+
+
+# ---------------------------------------------------------------------------
+# _multi_rank_sleep_wakeup protocol error paths
+# ---------------------------------------------------------------------------
+
+
+def _make_proto_worker(recv_responses, world_size=3):
+    """Return a BaseWorker shell whose _control_comm drives recv_responses.
+
+    ``recv_responses`` is a list consumed left-to-right by each recv() call.
+    send() is a no-op.  The engine has a real Lock and a no-op control_action.
+    ``world_size`` defaults to 3 so tests cover more than one peer ACK.
+    """
+    import threading
+    from contextlib import contextmanager
+
+    from tensorrt_llm.executor.base_worker import BaseWorker
+
+    responses = list(recv_responses)
+
+    w = object.__new__(BaseWorker)
+    w._backend = "pytorch"
+    w.rank = 0
+    w.llm_args = SimpleNamespace(
+        backend="pytorch",
+        parallel_config=SimpleNamespace(world_size=world_size),
+        sleep_config=object(),
+    )
+
+    recv_calls: list = []
+
+    def fake_recv(source, tag):
+        recv_calls.append(source)
+        return responses.pop(0)
+
+    @contextmanager
+    def _noop_control_action():
+        yield None
+
+    w.engine = SimpleNamespace(
+        _control_action_lock=threading.Lock(),
+        _control_comm=SimpleNamespace(send=lambda *a, **kw: None,
+                                      recv=fake_recv),
+        control_action=_noop_control_action,
+    )
+    return w, recv_calls
+
+
+class TestMultiRankAckErrorPropagation:
+    """Peer ACK errors must surface in the RuntimeError raised by
+    _multi_rank_sleep_wakeup()."""
+
+    def test_peer_error_ack_raises(self):
+        """A non-ok ACK from a peer rank must cause RuntimeError with detail."""
+        from unittest.mock import patch
+
+        from tensorrt_llm.llmapi.llm_args import ExecutorMemoryType
+
+        # Two peers (world_size=3): rank-1 ok, rank-2 error.
+        responses = [
+            {"status": "ok"},
+            {"status": "error", "error": "rank 2 exploded"},
+        ]
+        w, _ = _make_proto_worker(responses)
+
+        with patch("tensorrt_llm._torch.virtual_memory.release_with_tag"), \
+             patch("tensorrt_llm._torch.virtual_memory.materialize_with_tag"), \
+             patch("torch.cuda.synchronize"), \
+             patch("gc.collect"), \
+             patch("torch.cuda.empty_cache"):
+            with pytest.raises(RuntimeError, match="rank 2 exploded"):
+                w._multi_rank_sleep_wakeup(
+                    "sleep", [ExecutorMemoryType.KV_CACHE])
+
+    def test_multiple_peer_errors_aggregated(self):
+        """Errors from several peers must all appear in the raised message."""
+        from unittest.mock import patch
+
+        from tensorrt_llm.llmapi.llm_args import ExecutorMemoryType
+
+        responses = [
+            {"status": "error", "error": "rank 1 OOM"},
+            {"status": "error", "error": "rank 2 OOM"},
+        ]
+        w, _ = _make_proto_worker(responses)
+
+        with patch("tensorrt_llm._torch.virtual_memory.release_with_tag"), \
+             patch("tensorrt_llm._torch.virtual_memory.materialize_with_tag"), \
+             patch("torch.cuda.synchronize"), \
+             patch("gc.collect"), \
+             patch("torch.cuda.empty_cache"):
+            with pytest.raises(RuntimeError) as exc_info:
+                w._multi_rank_sleep_wakeup(
+                    "sleep", [ExecutorMemoryType.KV_CACHE])
+
+        msg = str(exc_info.value)
+        assert "rank 1 OOM" in msg
+        assert "rank 2 OOM" in msg
+
+
+class TestMultiRankRank0LocalFailureDrainsAcks:
+    """When rank-0's local VMM op raises, all peer ACKs must still be drained
+    before the error propagates."""
+
+    def test_local_failure_drains_all_peer_acks(self):
+        """release_with_tag() raises on rank-0; recv() must still be called
+        for every peer so the communicator stays clean."""
+        from unittest.mock import patch
+
+        from tensorrt_llm.llmapi.llm_args import ExecutorMemoryType
+
+        # Two peers return ok; we only care that recv() is called for both.
+        responses = [{"status": "ok"}, {"status": "ok"}]
+        w, recv_calls = _make_proto_worker(responses, world_size=3)
+
+        with patch(
+            "tensorrt_llm._torch.virtual_memory.release_with_tag",
+            side_effect=RuntimeError("rank 0 VMM fault"),
+        ), patch(
+            "tensorrt_llm._torch.virtual_memory.materialize_with_tag"
+        ), patch("torch.cuda.synchronize"), \
+             patch("gc.collect"), \
+             patch("torch.cuda.empty_cache"):
+            with pytest.raises(RuntimeError, match="rank 0 VMM fault"):
+                w._multi_rank_sleep_wakeup(
+                    "sleep", [ExecutorMemoryType.KV_CACHE])
+
+        # Both peers must have been ACK-drained despite the local failure.
+        assert len(recv_calls) == 2, (
+            f"Expected 2 recv() calls (one per peer), got {len(recv_calls)}; "
+            "stale ACKs would corrupt the next sleep/wakeup call.")
+
+    def test_local_failure_plus_peer_error_both_reported(self):
+        """When rank-0 fails locally and a peer also errors, both messages
+        must appear in the raised RuntimeError."""
+        from unittest.mock import patch
+
+        from tensorrt_llm.llmapi.llm_args import ExecutorMemoryType
+
+        responses = [
+            {"status": "ok"},
+            {"status": "error", "error": "rank 2 also failed"},
+        ]
+        w, _ = _make_proto_worker(responses)
+
+        with patch(
+            "tensorrt_llm._torch.virtual_memory.release_with_tag",
+            side_effect=RuntimeError("rank 0 VMM fault"),
+        ), patch(
+            "tensorrt_llm._torch.virtual_memory.materialize_with_tag"
+        ), patch("torch.cuda.synchronize"), \
+             patch("gc.collect"), \
+             patch("torch.cuda.empty_cache"):
+            with pytest.raises(RuntimeError) as exc_info:
+                w._multi_rank_sleep_wakeup(
+                    "sleep", [ExecutorMemoryType.KV_CACHE])
+
+        msg = str(exc_info.value)
+        assert "rank 0 VMM fault" in msg
+        assert "rank 2 also failed" in msg
+
+
+class TestSingleRankLockAcquired:
+    """sleep() / wakeup() with world_size == 1 must also hold
+    engine._control_action_lock, since the same Event-barrier race exists
+    on the single-rank path."""
+
+    @pytest.mark.parametrize("method", ["sleep", "wakeup"])
+    def test_single_rank_acquires_lock(self, method):
+        """The world_size == 1 branch enters _control_action_lock."""
+        import threading
+        from contextlib import contextmanager
+        from unittest.mock import patch
+
+        from tensorrt_llm.executor.base_worker import BaseWorker
+
+        w = object.__new__(BaseWorker)
+        w._backend = "pytorch"
+        w.llm_args = SimpleNamespace(
+            backend="pytorch",
+            parallel_config=SimpleNamespace(world_size=1),
+            sleep_config=object(),
+        )
+
+        lock_entered = []
+        real_lock = threading.Lock()
+
+        class SpyLock:
+            def __enter__(self_inner):
+                lock_entered.append(True)
+                return real_lock.__enter__()
+
+            def __exit__(self_inner, *args):
+                return real_lock.__exit__(*args)
+
+        @contextmanager
+        def _noop_control_action():
+            yield None
+
+        w.engine = SimpleNamespace(
+            _control_action_lock=SpyLock(),
+            control_action=_noop_control_action,
+        )
+
+        with patch("tensorrt_llm._torch.virtual_memory.release_with_tag"), \
+             patch("tensorrt_llm._torch.virtual_memory.materialize_with_tag"), \
+             patch("torch.cuda.synchronize"), \
+             patch("gc.collect"), \
+             patch("torch.cuda.empty_cache"):
+            getattr(w, method)(["kv_cache"])
+
+        assert lock_entered, (
+            f"{method}() with world_size=1 did not acquire _control_action_lock")
 
 
 # ---------------------------------------------------------------------------
@@ -124,11 +503,27 @@ class TestBaseWorkerSleepGuards:
 class TestProxyCollectiveRpcGuards:
     """Guard-path tests for both IPC and RPC proxy collective_rpc() shims."""
 
-    def test_raises_for_multirank(self, cls):
-        """Raises NotImplementedError when model_world_size > 1."""
+    def test_multirank_allowed_for_sleep_wakeup(self, cls):
+        """sleep and wakeup may be called with model_world_size > 1.
+
+        Both are in _MULTI_RANK_ALLOWED_METHODS; the guard must not raise
+        and the call must be forwarded to rpc_client.
+        """
+        from unittest.mock import MagicMock as _MM
+        for method_name in ("sleep", "wakeup"):
+            mock_call = _MM()
+            mock_call.remote.return_value = "ok"
+            mock_client = _MM()
+            getattr(mock_client, method_name).return_value = mock_call
+            p = _make_proxy(cls, model_world_size=2, rpc_client=mock_client)
+            result = p.collective_rpc(method_name, args=(["kv_cache"],))
+            assert result == ["ok"]
+
+    def test_multirank_raises_for_non_allowlisted_method(self, cls):
+        """Non-allowlisted methods still raise NotImplementedError for world_size > 1."""
         p = _make_proxy(cls, model_world_size=2, rpc_client=MagicMock())
-        with pytest.raises(NotImplementedError, match="model_world_size == 1"):
-            p.collective_rpc("sleep")
+        with pytest.raises(NotImplementedError):
+            p.collective_rpc("update_weights")
 
     def test_raises_for_unique_reply_rank(self, cls):
         """Raises NotImplementedError when unique_reply_rank is provided."""
