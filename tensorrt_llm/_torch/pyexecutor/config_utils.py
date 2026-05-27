@@ -496,18 +496,22 @@ def load_pretrained_config(model_name_or_path: str,
             # needed — model_config.rope_theta (if any) is already canonical.
             rope_theta = rope_scaling.get("rope_theta")
             if rope_theta is not None:
-                existing = getattr(model_config, "rope_theta", None)
-                if existing is None:
+                # When the user's config.json does not set a top-level
+                # `rope_theta` (transformers 5.x style — value lives only in
+                # `rope_parameters`), `model_config.rope_theta` was populated
+                # from the config class default and is NOT canonical. The
+                # canonical value is `rope_scaling.rope_theta`, which mirrors
+                # `rope_parameters.rope_theta`. Adopt it.
+                if config_dict.get("rope_theta") is None:
                     model_config.rope_theta = rope_theta
-                elif existing != rope_theta:
-                    # Both values are set but disagree. Keep the top-level value
-                    # (canonical in transformers 4.x and 5.x), but warn loudly
-                    # so that any future transformers upgrade that breaks this
-                    # invariant is easy to spot.
+                elif model_config.rope_theta != rope_theta:
+                    # User explicitly set both top-level rope_theta and
+                    # rope_parameters.rope_theta to disagreeing values — keep
+                    # the top-level value but warn loudly.
                     logger.warning(
                         f"rope_scaling.rope_theta ({rope_theta}) differs from "
-                        f"model_config.rope_theta ({existing}); keeping the "
-                        f"top-level value.")
+                        f"model_config.rope_theta ({model_config.rope_theta}); "
+                        f"keeping the top-level value.")
             model_config.rope_scaling = None
 
     return model_config
