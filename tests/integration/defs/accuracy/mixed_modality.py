@@ -53,15 +53,20 @@ except ImportError:
 ANNOTATIONS_FILE = "annotations.jsonl"
 AUDIO_WER_THRESHOLD = 50.0
 DEFAULT_NUM_FRAMES = 8
-SECTION_NAMES = ("image", "audio", "video")
-PROMPT_TEMPLATE = """You are given one image, one audio clip, and one video in this single request.
-Answer in exactly three labeled lines:
-image: <option letter for the image question>
-audio: <verbatim transcript of the audio>
-video: <option letter for the video question>
+MODALITY_IMAGE = "image"
+MODALITY_AUDIO = "audio"
+MODALITY_VIDEO = "video"
+SUPPORTED_MODALITIES = (MODALITY_IMAGE, MODALITY_AUDIO, MODALITY_VIDEO)
+MODALITY_DISPLAY_NAMES = {
+    MODALITY_IMAGE: "one image",
+    MODALITY_AUDIO: "one audio clip",
+    MODALITY_VIDEO: "one video",
+}
+PROMPT_TEMPLATE = """You are given {modality_list} in this single request.
+{distractor_line}
+Answer only the {target_modality} question below.
 
-Image question: {image_question}
-Video question: {video_question}
+{target_question}
 """
 
 
@@ -75,25 +80,31 @@ class MixedModalityInputSample(NamedTuple):
 
 class MixedModalitySample(NamedTuple):
     sample_id: str
-    image: Any
-    audio: Any
-    video_path: str
-    image_question: str
-    video_question: str
-    expected_keywords: dict[str, str]
-    source_paths: tuple[str, ...]
+    items: dict[str, MixedModalityInputSample]
+    target_modality: str
 
 
-class MixedModalitySampleResult(NamedTuple):
+class MixedModalityTargetResult(NamedTuple):
     sample_id: str
+    target_modality: str
     prediction: str
-    section_matches: dict[str, bool]
-    missing_sections: tuple[str, ...]
-    expected_keywords: dict[str, str]
+    is_correct: bool
+    expected_keyword: str
+    distractor_modalities: tuple[str, ...]
 
-    @property
-    def is_correct(self) -> bool:
-        return not self.missing_sections and all(self.section_matches.values())
+
+class MixedModalityTargetScoreSummary(NamedTuple):
+    target_accuracy: float
+    correct_targets: int
+    total_requests: int
+    target_correct_counts: dict[str, int]
+    target_total_counts: dict[str, int]
+
+
+class MixedModalityPairedBaselineSummary(NamedTuple):
+    mixed_minus_pure_accuracy: float
+    mixed_minus_pure_accuracy_by_target: dict[str, float]
+    paired_counts_by_target: dict[str, dict[str, int]]
 
 
 class _MixedModalityInputContext(NamedTuple):
@@ -103,26 +114,26 @@ class _MixedModalityInputContext(NamedTuple):
     chat_template_kwargs: dict[str, Any]
 
 
-class MixedModalityOmniEvaluator(Evaluator):
-    """Evaluator for one-request image+audio+video Nemotron Nano Omni coverage.
+class MixedModalityEvaluator(Evaluator):
+    """Evaluator for one-request mixed media coverage.
 
-    Validation procedure: first run with `TRTLLM_ACCURACY_NO_REFERENCE=1` to
-    confirm the evaluator and model path execute without thresholds, then collect
-    BF16 and NVFP4 on B200 when available, or B100 as a Blackwell fallback when
-    B200 is unavailable; collect FP8 on H100. Fill those measured scores in
-    `references/mixed_modality_omni.yaml` and re-run the three parametrized
-    `TestNanoV3Omni::test_auto_dtype` variants so `assert_passing` verifies the
-    final thresholds.
+    Validation uses target-only randomized query scoring: every request carries
+    all configured active modalities, but asks for one seeded random target
+    modality while the other media remain random distractors. Each mixed
+    request is also paired with a pure request containing only the selected
+    target modality, and the mixed-vs-pure delta is always gated.
     """
 
     def __init__(
         self,
-        mmmu_dataset_path: str,
-        voxpopuli_dataset_path: str,
-        videomme_dataset_path: str,
+        modality_dataset_paths: dict[str, str],
+        active_modalities: tuple[str, ...] = SUPPORTED_MODALITIES,
+        target_modalities: Optional[tuple[str, ...]] = None,
         num_samples: Optional[int] = None,
         random_seed: int = 0,
         num_frames: int = DEFAULT_NUM_FRAMES,
+        pure_baseline_max_accuracy_drop: float = 5.0,
+        pure_baseline_max_per_target_accuracy_drop: float = 10.0,
         chat_template_kwargs: Optional[dict[str, Any]] = None,
         output_dir: Optional[str] = None,
     ) -> None:
@@ -132,12 +143,18 @@ class MixedModalityOmniEvaluator(Evaluator):
             chat_template_kwargs=chat_template_kwargs,
             output_dir=output_dir,
         )
-        self.mmmu_dataset_path = Path(mmmu_dataset_path)
-        self.voxpopuli_dataset_path = voxpopuli_dataset_path
-        self.videomme_dataset_path = Path(videomme_dataset_path)
+        self.active_modalities = _normalize_modalities(active_modalities, "active", min_count=2)
+        self.target_modalities = _normalize_modalities(
+            target_modalities or self.active_modalities, "target", min_count=1
+        )
+        _validate_target_modalities(self.active_modalities, self.target_modalities)
+        self.modality_dataset_paths = dict(modality_dataset_paths)
+        _validate_dataset_paths(self.active_modalities, self.modality_dataset_paths)
         self.num_samples = num_samples
         self.random_seed = random_seed
         self.num_frames = num_frames
+        self.pure_baseline_max_accuracy_drop = pure_baseline_max_accuracy_drop
+        self.pure_baseline_max_per_target_accuracy_drop = pure_baseline_max_per_target_accuracy_drop
 
     def generate_samples(self) -> Iterable[tuple]:
         # Required by the abstract base, but `evaluate()` owns the multimodal
@@ -150,17 +167,37 @@ class MixedModalityOmniEvaluator(Evaluator):
         references: list[dict[str, str]],
         samples: list[MixedModalitySample],
     ) -> float:
+        _, target_summary = self._score_outputs(outputs, samples, label="MixedModality")
+        return target_summary.target_accuracy
+
+    def _score_outputs(
+        self,
+        outputs: list["RequestOutput"],
+        samples: list[MixedModalitySample],
+        label: str,
+    ) -> tuple[list[MixedModalityTargetResult], MixedModalityTargetScoreSummary]:
         predictions = [output.outputs[0].text for output in outputs]
-        sample_results = _score_predictions(predictions, samples)
-        correct_sections = sum(sum(result.section_matches.values()) for result in sample_results)
-        total_sections = len(sample_results) * len(SECTION_NAMES)
-        accuracy = 100.0 * correct_sections / total_sections if total_sections else 0.0
+        target_results = _score_target_predictions(predictions, samples)
+        target_summary = _summarize_target_results(target_results, self.target_modalities)
         logger.info(
-            f"MixedModality section accuracy: {accuracy:.2f} ({correct_sections}/{total_sections})"
+            f"{label} target accuracy: "
+            f"{target_summary.target_accuracy:.2f} "
+            f"({target_summary.correct_targets}/{target_summary.total_requests})"
         )
-        if correct_sections != total_sections:
-            logger.info(f"MixedModality mismatches:\n{_format_mismatch_report(sample_results)}")
-        return accuracy
+        logger.info(
+            f"{label} per-target correct counts: "
+            + ", ".join(
+                f"{modality}="
+                f"{target_summary.target_correct_counts[modality]}/"
+                f"{target_summary.target_total_counts[modality]}"
+                for modality in self.target_modalities
+            )
+        )
+        if target_summary.correct_targets != target_summary.total_requests:
+            logger.info(
+                f"{label} target mismatches:\n{_format_target_mismatch_report(target_results)}"
+            )
+        return target_results, target_summary
 
     def evaluate(
         self,
@@ -175,9 +212,18 @@ class MixedModalityOmniEvaluator(Evaluator):
         input_context = self._make_input_context(llm)
         samples = list(self._iter_samples())
         _log_source_digest(samples)
+        _log_target_modality_counts(samples, self.target_modalities)
         outputs = self._generate_outputs_serially(
             llm,
             samples,
+            input_context,
+            sampling_params,
+            streaming,
+        )
+        pure_samples = _make_pure_target_samples(samples)
+        pure_outputs = self._generate_outputs_serially(
+            llm,
+            pure_samples,
             input_context,
             sampling_params,
             streaming,
@@ -191,8 +237,21 @@ class MixedModalityOmniEvaluator(Evaluator):
         logger.info(f"TRTLLM execution time: {elapsed_time:.3f} seconds.")
         profiler.reset("trtllm exec")
 
-        references = [sample.expected_keywords for sample in samples]
-        return self.compute_score(outputs, references, samples)
+        mixed_results, mixed_summary = self._score_outputs(outputs, samples, label="MixedModality")
+        pure_results, pure_summary = self._score_outputs(
+            pure_outputs, pure_samples, label="MixedModality pure baseline"
+        )
+        _assert_pure_baseline_not_degraded(
+            mixed_results=mixed_results,
+            pure_results=pure_results,
+            mixed_summary=mixed_summary,
+            pure_summary=pure_summary,
+            target_modalities=self.target_modalities,
+            max_accuracy_drop=self.pure_baseline_max_accuracy_drop,
+            max_per_target_accuracy_drop=(self.pure_baseline_max_per_target_accuracy_drop),
+        )
+
+        return mixed_summary.target_accuracy
 
     def _generate_outputs_serially(
         self,
@@ -223,19 +282,18 @@ class MixedModalityOmniEvaluator(Evaluator):
 
     def _iter_samples(self) -> Iterable[MixedModalitySample]:
         source_sample_count = _target_source_sample_count(self.num_samples)
-        image_samples = _load_mmmu_input_samples(self.mmmu_dataset_path, source_sample_count)
-        audio_samples = _load_voxpopuli_input_samples(
-            self.voxpopuli_dataset_path, source_sample_count
-        )
-        video_samples = _load_videomme_input_samples(
-            self.videomme_dataset_path, source_sample_count
-        )
+        input_samples_by_modality = {
+            modality: _load_input_samples(
+                modality, self.modality_dataset_paths[modality], source_sample_count
+            )
+            for modality in self.active_modalities
+        }
         yield from select_mixed_modality_samples(
-            image_samples,
-            audio_samples,
-            video_samples,
+            input_samples_by_modality,
             self.num_samples,
             self.random_seed,
+            active_modalities=self.active_modalities,
+            target_modalities=self.target_modalities,
         )
 
     def _make_input_context(self, llm: Any) -> _MixedModalityInputContext:
@@ -266,35 +324,25 @@ class MixedModalityOmniEvaluator(Evaluator):
             MultimodalData,
             MultimodalDataTracker,
             add_multimodal_placeholders,
-            load_video,
         )
         from tensorrt_llm.inputs.content_format import ContentFormat
         from tensorrt_llm.inputs.utils import apply_chat_template as trtllm_apply_chat_template
-        from tensorrt_llm.inputs.utils import load_audio
 
         mm_data_tracker = MultimodalDataTracker(input_context.model_type)
-        image = _materialize_image(sample.image)
-        audio = load_audio(sample.audio) if isinstance(sample.audio, str) else sample.audio
-        video = video_cache.get(sample.video_path)
-        if video is None:
-            video = load_video(sample.video_path, num_frames=self.num_frames)
-            video_cache[sample.video_path] = video
-
         prompt_text = _format_mixed_modality_prompt(sample)
+        media = []
+        content_parts: list[Any] = []
+        for media_index, (modality, item) in enumerate(sample.items.items()):
+            media_data = _materialize_media(modality, item.media, video_cache, self.num_frames)
+            media.append(MultimodalData(modality=modality, data=media_data, is_embedding=False))
+            content_parts.append({"type": modality, "media_index": media_index})
+        content_parts.append(prompt_text)
+
         conv = ConversationMessage(
             role="user",
             content=prompt_text,
-            media=[
-                MultimodalData(modality="image", data=image, is_embedding=False),
-                MultimodalData(modality="video", data=video, is_embedding=False),
-                MultimodalData(modality="audio", data=audio, is_embedding=False),
-            ],
-            content_parts=[
-                {"type": "image", "media_index": 0},
-                {"type": "video", "media_index": 1},
-                {"type": "audio", "media_index": 2},
-                prompt_text,
-            ],
+            media=media,
+            content_parts=content_parts,
         )
         for mdata in conv["media"]:
             mm_data_tracker.add_data(
@@ -327,65 +375,128 @@ class MixedModalityOmniEvaluator(Evaluator):
 
 
 def select_mixed_modality_samples(
-    image_samples: list[MixedModalityInputSample],
-    audio_samples: list[MixedModalityInputSample],
-    video_samples: list[MixedModalityInputSample],
+    input_samples_by_modality: dict[str, list[MixedModalityInputSample]],
     num_samples: Optional[int],
     random_seed: int,
+    active_modalities: Optional[tuple[str, ...]] = None,
+    target_modalities: Optional[tuple[str, ...]] = None,
 ) -> list[MixedModalitySample]:
     rng = random.Random(random_seed)
-    image_samples = list(image_samples)
-    audio_samples = list(audio_samples)
-    video_samples = list(video_samples)
-    rng.shuffle(image_samples)
-    rng.shuffle(audio_samples)
-    rng.shuffle(video_samples)
+    active_modalities = _normalize_modalities(
+        active_modalities or tuple(input_samples_by_modality), "active", min_count=2
+    )
+    target_modalities = _normalize_modalities(
+        target_modalities or active_modalities, "target", min_count=1
+    )
+    _validate_target_modalities(active_modalities, target_modalities)
 
-    available_samples = min(len(image_samples), len(audio_samples), len(video_samples))
+    samples_by_modality = {
+        modality: list(input_samples_by_modality[modality]) for modality in active_modalities
+    }
+    for samples in samples_by_modality.values():
+        rng.shuffle(samples)
+
+    available_samples = min(len(samples) for samples in samples_by_modality.values())
     sample_count = available_samples if num_samples is None else num_samples
     if sample_count > available_samples:
+        counts = ", ".join(
+            f"{modality}={len(samples_by_modality[modality])}" for modality in active_modalities
+        )
         raise ValueError(
-            "Not enough mixed-modality source samples: "
-            f"requested={sample_count}, image={len(image_samples)}, "
-            f"audio={len(audio_samples)}, video={len(video_samples)}."
+            f"Not enough mixed-modality source samples: requested={sample_count}, {counts}."
         )
 
+    selected_targets = _select_target_modalities(sample_count, rng, target_modalities)
     selected = []
-    for image_sample, audio_sample, video_sample in zip(
-        image_samples[:sample_count],
-        audio_samples[:sample_count],
-        video_samples[:sample_count],
-        strict=True,
-    ):
+    for sample_idx, target_modality in enumerate(selected_targets):
+        items = {
+            modality: samples_by_modality[modality][sample_idx] for modality in active_modalities
+        }
         selected.append(
             MixedModalitySample(
-                sample_id=(
-                    f"{image_sample.sample_id}+{audio_sample.sample_id}+{video_sample.sample_id}"
-                ),
-                image=image_sample.media,
-                audio=audio_sample.media,
-                video_path=str(video_sample.media),
-                image_question=image_sample.question,
-                video_question=video_sample.question,
-                expected_keywords={
-                    "image": image_sample.keyword,
-                    "audio": audio_sample.keyword,
-                    "video": video_sample.keyword,
-                },
-                source_paths=(
-                    *image_sample.source_paths,
-                    *audio_sample.source_paths,
-                    *video_sample.source_paths,
-                ),
+                sample_id="+".join(item.sample_id for item in items.values()),
+                items=items,
+                target_modality=target_modality,
             )
         )
     return selected
+
+
+def _normalize_modalities(
+    modalities: tuple[str, ...], label: str, min_count: int
+) -> tuple[str, ...]:
+    if len(modalities) < min_count:
+        raise ValueError(
+            f"Mixed modality {label} set must contain at least {min_count} modality entries."
+        )
+    seen = set()
+    normalized = []
+    for modality in modalities:
+        if modality not in SUPPORTED_MODALITIES:
+            raise ValueError(
+                f"Unsupported mixed modality {label} entry: {modality!r}. "
+                f"Supported modalities: {SUPPORTED_MODALITIES}."
+            )
+        if modality in seen:
+            raise ValueError(f"Duplicate mixed modality {label} entry: {modality!r}.")
+        seen.add(modality)
+        normalized.append(modality)
+    return tuple(normalized)
+
+
+def _validate_target_modalities(
+    active_modalities: tuple[str, ...],
+    target_modalities: tuple[str, ...],
+) -> None:
+    missing_targets = set(target_modalities) - set(active_modalities)
+    if missing_targets:
+        raise ValueError(
+            "Mixed modality target modalities must be a subset of active modalities: "
+            f"active={active_modalities}, target={target_modalities}."
+        )
+
+
+def _validate_dataset_paths(
+    active_modalities: tuple[str, ...],
+    modality_dataset_paths: dict[str, str],
+) -> None:
+    missing_paths = [
+        modality for modality in active_modalities if modality not in modality_dataset_paths
+    ]
+    if missing_paths:
+        raise ValueError("Missing mixed modality dataset path(s): " + ", ".join(missing_paths))
+
+
+def _select_target_modalities(
+    sample_count: int,
+    rng: random.Random,
+    target_modalities: tuple[str, ...],
+) -> list[str]:
+    selected_targets = [
+        target_modalities[idx % len(target_modalities)] for idx in range(sample_count)
+    ]
+    rng.shuffle(selected_targets)
+    return selected_targets
 
 
 def _target_source_sample_count(num_samples: Optional[int]) -> Optional[int]:
     if num_samples is None:
         return None
     return max(num_samples * 2, num_samples + 8)
+
+
+def _load_input_samples(
+    modality: str,
+    dataset_path: str,
+    max_samples: Optional[int],
+) -> list[MixedModalityInputSample]:
+    if modality == MODALITY_IMAGE:
+        return _load_mmmu_input_samples(Path(dataset_path), max_samples)
+    if modality == MODALITY_AUDIO:
+        return _load_voxpopuli_input_samples(dataset_path, max_samples)
+    if modality == MODALITY_VIDEO:
+        return _load_videomme_input_samples(Path(dataset_path), max_samples)
+    raise ValueError(f"Unsupported mixed modality input loader: {modality!r}.")
 
 
 def _load_mmmu_input_samples(
@@ -514,6 +625,30 @@ def _get_mmmu_image(row: dict[str, Any]) -> Any:
     return None
 
 
+def _materialize_media(
+    modality: str,
+    media: Any,
+    video_cache: dict[str, Any],
+    num_frames: int,
+) -> Any:
+    if modality == MODALITY_IMAGE:
+        return _materialize_image(media)
+    if modality == MODALITY_AUDIO:
+        from tensorrt_llm.inputs.utils import load_audio
+
+        return load_audio(media) if isinstance(media, str) else media
+    if modality == MODALITY_VIDEO:
+        from tensorrt_llm.inputs import load_video
+
+        video_path = str(media)
+        video = video_cache.get(video_path)
+        if video is None:
+            video = load_video(video_path, num_frames=num_frames)
+            video_cache[video_path] = video
+        return video
+    raise ValueError(f"Unsupported mixed modality media: {modality!r}.")
+
+
 def _materialize_image(image: Any) -> Any:
     from tensorrt_llm.inputs.utils import load_image
 
@@ -542,10 +677,26 @@ def _get_media_source_paths(media: Any) -> tuple[str, ...]:
 
 
 def _format_mixed_modality_prompt(sample: MixedModalitySample) -> str:
+    target_modality = _require_target_modality(sample)
+    if len(sample.items) > 1:
+        distractor_line = "The non-target media are random distractors."
+    else:
+        distractor_line = "No distractor media are included."
     return PROMPT_TEMPLATE.format(
-        image_question=sample.image_question,
-        video_question=sample.video_question,
+        modality_list=_format_modality_list(tuple(sample.items)),
+        distractor_line=distractor_line,
+        target_modality=target_modality,
+        target_question=_target_question(sample, target_modality),
     )
+
+
+def _format_modality_list(modalities: tuple[str, ...]) -> str:
+    display_names = [MODALITY_DISPLAY_NAMES[modality] for modality in modalities]
+    if len(display_names) == 1:
+        return display_names[0]
+    if len(display_names) == 2:
+        return f"{display_names[0]} and {display_names[1]}"
+    return f"{', '.join(display_names[:-1])}, and {display_names[-1]}"
 
 
 def _format_mmmu_question(row: dict[str, Any]) -> str:
@@ -589,9 +740,28 @@ def _format_options(options: list[str]) -> str:
     return "\n".join(lines)
 
 
+def _format_target_mismatch_report(
+    target_results: list[MixedModalityTargetResult],
+    limit: int = 10,
+) -> str:
+    mismatches = [result for result in target_results if not result.is_correct][:limit]
+    lines = []
+    for result in mismatches:
+        prediction = re.sub(r"\s+", " ", result.prediction).strip()
+        if len(prediction) > 240:
+            prediction = f"{prediction[:237]}..."
+        lines.append(
+            f"sample={result.sample_id} target={result.target_modality} "
+            f"distractors={result.distractor_modalities} "
+            f"expected={result.expected_keyword!r} text={prediction!r}"
+        )
+    return "\n".join(lines)
+
+
 def _extract_response_sections(text: str) -> dict[str, str]:
+    modality_pattern = "|".join(SUPPORTED_MODALITIES)
     section_pattern = re.compile(
-        r"(?ims)^\s*(image|audio|video)\s*:\s*(.*?)(?=^\s*(?:image|audio|video)\s*:|\Z)"
+        rf"(?ims)^\s*({modality_pattern})\s*:\s*(.*?)(?=^\s*(?:{modality_pattern})\s*:|\Z)"
     )
     return {
         match.group(1).casefold(): re.sub(r"\s+", " ", match.group(2)).strip()
@@ -627,6 +797,20 @@ def _normalize_choice_answer(answer: str, max_choice: str) -> Optional[str]:
     if re.fullmatch(rf"[A-{max_choice.upper()}]", answer):
         return answer
     return _extract_choice_answer(answer, max_choice)
+
+
+def _require_target_modality(sample: MixedModalitySample) -> str:
+    target_modality = sample.target_modality
+    if target_modality not in sample.items:
+        raise ValueError(
+            f"Mixed modality target sample {sample.sample_id!r} has invalid "
+            f"target modality: {target_modality!r}; active={tuple(sample.items)}."
+        )
+    return target_modality
+
+
+def _target_question(sample: MixedModalitySample, target_modality: str) -> str:
+    return sample.items[target_modality].question
 
 
 def _audio_wer(prediction: str, reference: str) -> float:
@@ -665,70 +849,224 @@ def _levenshtein_distance(reference: list[str], hypothesis: list[str]) -> int:
     return previous_row[-1]
 
 
-def _score_predictions(
+def _score_target_predictions(
     predictions: list[str],
     samples: list[MixedModalitySample],
-) -> list[MixedModalitySampleResult]:
+) -> list[MixedModalityTargetResult]:
     results = []
     for prediction, sample in zip(predictions, samples, strict=True):
-        sections = _extract_response_sections(prediction)
-        missing_sections = tuple(section for section in SECTION_NAMES if section not in sections)
-        section_matches = {
-            "image": (
-                "image" in sections
-                and _extract_choice_answer(sections["image"], "E")
-                == sample.expected_keywords["image"]
-            ),
-            "audio": (
-                "audio" in sections
-                and _audio_wer(sections["audio"], sample.expected_keywords["audio"])
-                <= AUDIO_WER_THRESHOLD
-            ),
-            "video": (
-                "video" in sections
-                and _extract_choice_answer(sections["video"], "D")
-                == sample.expected_keywords["video"]
-            ),
-        }
+        target_modality = _require_target_modality(sample)
+        target_item = sample.items[target_modality]
         results.append(
-            MixedModalitySampleResult(
+            MixedModalityTargetResult(
                 sample_id=sample.sample_id,
+                target_modality=target_modality,
                 prediction=prediction,
-                section_matches=section_matches,
-                missing_sections=missing_sections,
-                expected_keywords=sample.expected_keywords,
+                is_correct=_score_target_answer(
+                    target_modality,
+                    prediction,
+                    target_item.keyword,
+                ),
+                expected_keyword=target_item.keyword,
+                distractor_modalities=tuple(
+                    modality for modality in sample.items if modality != target_modality
+                ),
             )
         )
     return results
 
 
+def _score_target_answer(
+    target_modality: str,
+    prediction: str,
+    expected_keyword: str,
+) -> bool:
+    sections = _extract_response_sections(prediction)
+    target_text = sections.get(target_modality, prediction)
+    if target_modality == MODALITY_IMAGE:
+        return _extract_choice_answer(target_text, "E") == expected_keyword
+    if target_modality == MODALITY_AUDIO:
+        return _audio_wer(target_text, expected_keyword) <= AUDIO_WER_THRESHOLD
+    if target_modality == MODALITY_VIDEO:
+        return _extract_choice_answer(target_text, "D") == expected_keyword
+    raise ValueError(f"Unsupported target modality: {target_modality!r}.")
+
+
+def _summarize_target_results(
+    target_results: list[MixedModalityTargetResult],
+    target_modalities: Optional[tuple[str, ...]] = None,
+) -> MixedModalityTargetScoreSummary:
+    if target_modalities is None:
+        target_modalities = tuple(
+            dict.fromkeys(result.target_modality for result in target_results)
+        )
+    total_requests = len(target_results)
+    target_total_counts = {
+        modality: sum(result.target_modality == modality for result in target_results)
+        for modality in target_modalities
+    }
+    target_correct_counts = {
+        modality: sum(
+            result.target_modality == modality and result.is_correct for result in target_results
+        )
+        for modality in target_modalities
+    }
+    correct_targets = sum(result.is_correct for result in target_results)
+    target_accuracy = 100.0 * correct_targets / total_requests if total_requests else 0.0
+    return MixedModalityTargetScoreSummary(
+        target_accuracy=target_accuracy,
+        correct_targets=correct_targets,
+        total_requests=total_requests,
+        target_correct_counts=target_correct_counts,
+        target_total_counts=target_total_counts,
+    )
+
+
+def _make_pure_target_samples(
+    samples: list[MixedModalitySample],
+) -> list[MixedModalitySample]:
+    pure_samples = []
+    for sample in samples:
+        target_modality = _require_target_modality(sample)
+        pure_samples.append(
+            MixedModalitySample(
+                sample_id=f"{sample.sample_id}|pure-{target_modality}",
+                items={target_modality: sample.items[target_modality]},
+                target_modality=target_modality,
+            )
+        )
+    return pure_samples
+
+
+def _summarize_paired_baseline(
+    mixed_results: list[MixedModalityTargetResult],
+    pure_results: list[MixedModalityTargetResult],
+    mixed_summary: MixedModalityTargetScoreSummary,
+    pure_summary: MixedModalityTargetScoreSummary,
+    target_modalities: tuple[str, ...],
+) -> MixedModalityPairedBaselineSummary:
+    mixed_minus_pure_by_target = {}
+    paired_counts_by_target = {}
+    for modality in target_modalities:
+        pairs = [
+            (mixed, pure)
+            for mixed, pure in zip(mixed_results, pure_results, strict=True)
+            if mixed.target_modality == modality
+        ]
+        if any(mixed.target_modality != pure.target_modality for mixed, pure in pairs):
+            raise AssertionError(f"Pure baseline target mismatch for modality {modality}.")
+        sample_count = len(pairs)
+        mixed_correct = sum(mixed.is_correct for mixed, _ in pairs)
+        pure_correct = sum(pure.is_correct for _, pure in pairs)
+        mixed_accuracy = 100.0 * mixed_correct / sample_count if sample_count else 0.0
+        pure_accuracy = 100.0 * pure_correct / sample_count if sample_count else 0.0
+        mixed_minus_pure_by_target[modality] = mixed_accuracy - pure_accuracy
+        paired_counts_by_target[modality] = {
+            "sample_count": sample_count,
+            "mixed_correct": mixed_correct,
+            "pure_correct": pure_correct,
+            "both_correct": sum(mixed.is_correct and pure.is_correct for mixed, pure in pairs),
+            "mixed_only": sum(mixed.is_correct and not pure.is_correct for mixed, pure in pairs),
+            "pure_only": sum(not mixed.is_correct and pure.is_correct for mixed, pure in pairs),
+            "both_wrong": sum(
+                not mixed.is_correct and not pure.is_correct for mixed, pure in pairs
+            ),
+        }
+    return MixedModalityPairedBaselineSummary(
+        mixed_minus_pure_accuracy=(mixed_summary.target_accuracy - pure_summary.target_accuracy),
+        mixed_minus_pure_accuracy_by_target=mixed_minus_pure_by_target,
+        paired_counts_by_target=paired_counts_by_target,
+    )
+
+
+def _assert_pure_baseline_not_degraded(
+    mixed_results: list[MixedModalityTargetResult],
+    pure_results: list[MixedModalityTargetResult],
+    mixed_summary: MixedModalityTargetScoreSummary,
+    pure_summary: MixedModalityTargetScoreSummary,
+    target_modalities: tuple[str, ...],
+    max_accuracy_drop: float,
+    max_per_target_accuracy_drop: float,
+) -> None:
+    paired_summary = _summarize_paired_baseline(
+        mixed_results=mixed_results,
+        pure_results=pure_results,
+        mixed_summary=mixed_summary,
+        pure_summary=pure_summary,
+        target_modalities=target_modalities,
+    )
+    logger.info(
+        "MixedModality pure baseline comparison: "
+        f"mixed={mixed_summary.target_accuracy:.2f}, "
+        f"pure={pure_summary.target_accuracy:.2f}, "
+        f"mixed_minus_pure={paired_summary.mixed_minus_pure_accuracy:.2f}, "
+        f"max_allowed_drop={max_accuracy_drop:.2f}"
+    )
+    logger.info(
+        "MixedModality pure baseline per-target comparison: "
+        + ", ".join(
+            f"{modality}=mixed_minus_pure "
+            f"{paired_summary.mixed_minus_pure_accuracy_by_target[modality]:.2f} "
+            f"counts={paired_summary.paired_counts_by_target[modality]}"
+            for modality in target_modalities
+        )
+    )
+
+    aggregate_drop = -paired_summary.mixed_minus_pure_accuracy
+    if aggregate_drop > max_accuracy_drop:
+        raise AssertionError(
+            "Mixed modality target accuracy regressed against pure baseline: "
+            f"mixed={mixed_summary.target_accuracy:.2f}, "
+            f"pure={pure_summary.target_accuracy:.2f}, "
+            f"drop={aggregate_drop:.2f}, max_allowed_drop={max_accuracy_drop:.2f}."
+        )
+
+    for modality in target_modalities:
+        sample_count = paired_summary.paired_counts_by_target[modality]["sample_count"]
+        if sample_count == 0:
+            raise AssertionError(
+                f"Mixed modality pure baseline did not exercise target modality {modality!r}."
+            )
+        modality_drop = -paired_summary.mixed_minus_pure_accuracy_by_target[modality]
+        if modality_drop > max_per_target_accuracy_drop:
+            raise AssertionError(
+                "Mixed modality target accuracy regressed against pure baseline "
+                f"for {modality}: drop={modality_drop:.2f}, "
+                f"max_allowed_drop={max_per_target_accuracy_drop:.2f}, "
+                f"counts={paired_summary.paired_counts_by_target[modality]}."
+            )
+
+
+def _expected_keywords(sample: MixedModalitySample) -> dict[str, str]:
+    return {modality: item.keyword for modality, item in sample.items.items()}
+
+
 def _log_source_digest(samples: list[MixedModalitySample]) -> None:
     entries = []
     for sample in samples:
-        for source_path in sample.source_paths:
-            path = Path(source_path)
-            if path.exists():
-                entries.append(f"{path.name}:{path.stat().st_size}")
-            else:
-                entries.append(f"{path.name}:missing")
+        for item in sample.items.values():
+            for source_path in item.source_paths:
+                path = Path(source_path)
+                if path.exists():
+                    entries.append(f"{path.name}:{path.stat().st_size}")
+                else:
+                    entries.append(f"{path.name}:missing")
     digest_input = "\n".join(sorted(entries)).encode("utf-8")
     digest = hashlib.sha256(digest_input).hexdigest()[:16]
     logger.info(f"MixedModality source digest: sha256={digest}; files={len(entries)}")
 
 
-def _format_mismatch_report(
-    sample_results: list[MixedModalitySampleResult],
-    limit: int = 10,
-) -> str:
-    mismatches = [result for result in sample_results if not result.is_correct][:limit]
-    lines = []
-    for result in mismatches:
-        prediction = re.sub(r"\s+", " ", result.prediction).strip()
-        if len(prediction) > 240:
-            prediction = f"{prediction[:237]}..."
-        lines.append(
-            f"sample={result.sample_id} missing={result.missing_sections} "
-            f"matches={result.section_matches} expected={result.expected_keywords} "
-            f"text={prediction!r}"
+def _log_target_modality_counts(
+    samples: list[MixedModalitySample],
+    target_modalities: tuple[str, ...],
+) -> None:
+    target_counts = {
+        modality: sum(sample.target_modality == modality for sample in samples)
+        for modality in target_modalities
+    }
+    logger.info(
+        "MixedModality target modality counts: "
+        + ", ".join(
+            f"{modality}={target_counts[modality]}/{len(samples)}" for modality in target_modalities
         )
-    return "\n".join(lines)
+    )

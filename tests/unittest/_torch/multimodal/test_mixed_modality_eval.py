@@ -14,7 +14,11 @@
 # limitations under the License.
 
 import importlib.util
+import inspect
+from collections import Counter
 from pathlib import Path
+
+import pytest
 
 _MODULE_PATH = Path(__file__).parents[3] / "integration" / "defs" / "accuracy" / "mixed_modality.py"
 _SPEC = importlib.util.spec_from_file_location("mixed_modality", _MODULE_PATH)
@@ -22,63 +26,87 @@ assert _SPEC is not None and _SPEC.loader is not None
 mixed_modality = importlib.util.module_from_spec(_SPEC)
 _SPEC.loader.exec_module(mixed_modality)
 
+MODALITY_AUDIO = mixed_modality.MODALITY_AUDIO
+MODALITY_IMAGE = mixed_modality.MODALITY_IMAGE
+MODALITY_VIDEO = mixed_modality.MODALITY_VIDEO
+MixedModalityEvaluator = mixed_modality.MixedModalityEvaluator
 MixedModalityInputSample = mixed_modality.MixedModalityInputSample
-MixedModalityOmniEvaluator = mixed_modality.MixedModalityOmniEvaluator
 MixedModalitySample = mixed_modality.MixedModalitySample
+MixedModalityTargetResult = mixed_modality.MixedModalityTargetResult
 _audio_wer = mixed_modality._audio_wer
+_assert_pure_baseline_not_degraded = mixed_modality._assert_pure_baseline_not_degraded
 _extract_choice_answer = mixed_modality._extract_choice_answer
-_extract_response_sections = mixed_modality._extract_response_sections
-_score_predictions = mixed_modality._score_predictions
+_format_mixed_modality_prompt = mixed_modality._format_mixed_modality_prompt
+_make_pure_target_samples = mixed_modality._make_pure_target_samples
+_score_target_predictions = mixed_modality._score_target_predictions
+_summarize_paired_baseline = mixed_modality._summarize_paired_baseline
+_summarize_target_results = mixed_modality._summarize_target_results
 select_mixed_modality_samples = mixed_modality.select_mixed_modality_samples
+
+
+def _input_sample(
+    modality: str, keyword: str, question: str, idx: int = 0
+) -> MixedModalityInputSample:
+    suffix = {
+        MODALITY_IMAGE: "jpg",
+        MODALITY_AUDIO: "wav",
+        MODALITY_VIDEO: "mp4",
+    }[modality]
+    return MixedModalityInputSample(
+        sample_id=f"{modality}-{idx}",
+        media=f"/tmp/{modality}-{idx}.{suffix}",
+        question=question,
+        keyword=keyword,
+        source_paths=(f"/tmp/{modality}-{idx}.{suffix}",),
+    )
 
 
 def _sample(
     sample_id: str = "mixed-0",
+    target_modality: str = MODALITY_IMAGE,
+    active_modalities: tuple[str, ...] = (MODALITY_IMAGE, MODALITY_AUDIO, MODALITY_VIDEO),
     image_keyword: str = "B",
     audio_keyword: str = "the speaker says democracy clearly",
     video_keyword: str = "C",
+    audio_question: str = "Transcribe the spoken audio exactly.",
 ) -> MixedModalitySample:
+    item_specs = {
+        MODALITY_IMAGE: (image_keyword, "Which subject is shown?"),
+        MODALITY_AUDIO: (audio_keyword, audio_question),
+        MODALITY_VIDEO: (video_keyword, "What happens in the basketball clip?"),
+    }
+    items = {
+        modality: _input_sample(modality, item_specs[modality][0], item_specs[modality][1])
+        for modality in active_modalities
+    }
     return MixedModalitySample(
         sample_id=sample_id,
-        image=object(),
-        audio=object(),
-        video_path="/tmp/video.mp4",
-        image_question="Which subject is shown?",
-        video_question="What happens in the basketball clip?",
-        expected_keywords={
-            "image": image_keyword,
-            "audio": audio_keyword,
-            "video": video_keyword,
-        },
-        source_paths=("/tmp/image.jpg", "/tmp/audio.wav", "/tmp/video.mp4"),
+        items=items,
+        target_modality=target_modality,
     )
 
 
-def test_parser_passes_three_labeled_sections():
-    sections = _extract_response_sections(
-        """
-        image: B
-        audio: the speaker says democracy clearly.
-        video: C
-        """
-    )
-
-    assert sections == {
-        "image": "B",
-        "audio": "the speaker says democracy clearly.",
-        "video": "C",
+def _input_samples_by_modality(
+    active_modalities: tuple[str, ...], sample_count: int
+) -> dict[str, list[MixedModalityInputSample]]:
+    return {
+        modality: [
+            _input_sample(
+                modality,
+                keyword=f"{modality}-answer-{idx}",
+                question=f"{modality} question {idx}",
+                idx=idx,
+            )
+            for idx in range(sample_count)
+        ]
+        for modality in active_modalities
     }
 
 
-def test_missing_section_fails_sample():
-    results = _score_predictions(
-        ["image: B\nvideo: C"],
-        [_sample()],
-    )
+def test_evaluator_has_no_optional_pure_baseline_switch():
+    signature = inspect.signature(MixedModalityEvaluator)
 
-    assert len(results) == 1
-    assert not results[0].is_correct
-    assert results[0].missing_sections == ("audio",)
+    assert "include_pure_baseline" not in signature.parameters
 
 
 def test_choice_extraction_accepts_common_answer_formats():
@@ -92,74 +120,245 @@ def test_audio_wer_scores_near_transcripts():
     assert _audio_wer("unrelated words", "the speaker says democracy clearly") > 50.0
 
 
-def test_score_requires_all_three_modalities_to_match():
-    results = _score_predictions(
+def test_target_prompt_only_asks_selected_query_modality():
+    sample = _sample(
+        target_modality=MODALITY_AUDIO,
+        audio_question="Transcribe the committee hearing exactly.",
+    )
+
+    prompt = _format_mixed_modality_prompt(sample)
+
+    assert "one image, one audio clip, and one video" in prompt
+    assert "random distractors" in prompt
+    assert "Answer only the audio question" in prompt
+    assert "Transcribe the committee hearing exactly." in prompt
+    assert sample.items[MODALITY_IMAGE].question not in prompt
+    assert sample.items[MODALITY_VIDEO].question not in prompt
+
+
+def test_image_video_prompt_omits_audio_for_qwen_vl_style_requests():
+    sample = _sample(
+        target_modality=MODALITY_VIDEO,
+        active_modalities=(MODALITY_IMAGE, MODALITY_VIDEO),
+    )
+
+    prompt = _format_mixed_modality_prompt(sample)
+
+    assert "one image and one video" in prompt
+    assert "audio" not in prompt
+    assert "Answer only the video question" in prompt
+    assert sample.items[MODALITY_IMAGE].question not in prompt
+    assert sample.items[MODALITY_VIDEO].question in prompt
+
+
+def test_pure_modality_prompt_has_no_distractor_line():
+    sample = _sample(
+        target_modality=MODALITY_AUDIO,
+        active_modalities=(MODALITY_AUDIO,),
+        audio_question="Transcribe the standalone clip exactly.",
+    )
+
+    prompt = _format_mixed_modality_prompt(sample)
+
+    assert "one audio clip" in prompt
+    assert "No distractor media are included." in prompt
+    assert "random distractors" not in prompt
+    assert "Answer only the audio question" in prompt
+    assert "Transcribe the standalone clip exactly." in prompt
+
+
+def test_target_only_scoring_uses_selected_modality_only():
+    results = _score_target_predictions(
         [
-            ("image: B\naudio: the speaker says democracy clearly\nvideo: Answer: C"),
-            ("image: B\naudio: unrelated words\nvideo: Answer: D"),
+            "image: B\naudio: unrelated words\nvideo: Answer: D",
+            "unrelated words",
+            "video: Answer: C",
         ],
         [
-            _sample("mixed-0"),
-            _sample("mixed-1"),
+            _sample("mixed-image", target_modality=MODALITY_IMAGE),
+            _sample("mixed-audio", target_modality=MODALITY_AUDIO),
+            _sample("mixed-video", target_modality=MODALITY_VIDEO),
         ],
     )
 
-    assert [result.is_correct for result in results] == [True, False]
+    summary = _summarize_target_results(results)
+
+    assert [result.is_correct for result in results] == [True, False, True]
+    assert results[0].distractor_modalities == (MODALITY_AUDIO, MODALITY_VIDEO)
+    assert summary.target_accuracy == 100.0 * 2.0 / 3.0
+    assert summary.correct_targets == 2
+    assert summary.total_requests == 3
+    assert summary.target_correct_counts == {
+        MODALITY_IMAGE: 1,
+        MODALITY_AUDIO: 0,
+        MODALITY_VIDEO: 1,
+    }
+    assert summary.target_total_counts == {
+        MODALITY_IMAGE: 1,
+        MODALITY_AUDIO: 1,
+        MODALITY_VIDEO: 1,
+    }
 
 
-def test_deterministic_sample_selection():
-    image_samples = [
-        MixedModalityInputSample(
-            sample_id=f"image-{idx}",
-            media=f"image-{idx}.jpg",
-            question=f"image question {idx}",
-            keyword=f"subject{idx}",
-            source_paths=(f"image-{idx}.jpg",),
-        )
-        for idx in range(5)
+def test_target_only_scoring_requires_selected_modality():
+    results = _score_target_predictions(
+        ["image: B\naudio: unrelated words\nvideo: Answer: D"],
+        [_sample("mixed-video", target_modality=MODALITY_VIDEO)],
+    )
+
+    assert not results[0].is_correct
+    assert results[0].expected_keyword == "C"
+    assert results[0].distractor_modalities == (MODALITY_IMAGE, MODALITY_AUDIO)
+
+
+def test_pure_target_samples_keep_only_selected_modality():
+    sample = _sample("mixed-audio", target_modality=MODALITY_AUDIO)
+
+    pure_samples = _make_pure_target_samples([sample])
+
+    assert len(pure_samples) == 1
+    pure_sample = pure_samples[0]
+    assert pure_sample.sample_id == "mixed-audio|pure-audio"
+    assert pure_sample.target_modality == MODALITY_AUDIO
+    assert tuple(pure_sample.items) == (MODALITY_AUDIO,)
+    assert pure_sample.items[MODALITY_AUDIO] == sample.items[MODALITY_AUDIO]
+
+    prompt = _format_mixed_modality_prompt(pure_sample)
+
+    assert "one audio clip" in prompt
+    assert "No distractor media are included." in prompt
+    assert "random distractors" not in prompt
+
+
+def test_paired_pure_baseline_summarizes_and_validates_each_target():
+    mixed_results = [
+        MixedModalityTargetResult(
+            sample_id="mixed-image",
+            target_modality=MODALITY_IMAGE,
+            prediction="B",
+            is_correct=True,
+            expected_keyword="B",
+            distractor_modalities=(MODALITY_AUDIO, MODALITY_VIDEO),
+        ),
+        MixedModalityTargetResult(
+            sample_id="mixed-audio",
+            target_modality=MODALITY_AUDIO,
+            prediction="wrong transcript",
+            is_correct=False,
+            expected_keyword="correct transcript",
+            distractor_modalities=(MODALITY_IMAGE, MODALITY_VIDEO),
+        ),
+        MixedModalityTargetResult(
+            sample_id="mixed-video",
+            target_modality=MODALITY_VIDEO,
+            prediction="C",
+            is_correct=True,
+            expected_keyword="C",
+            distractor_modalities=(MODALITY_IMAGE, MODALITY_AUDIO),
+        ),
     ]
-    audio_samples = [
-        MixedModalityInputSample(
-            sample_id=f"audio-{idx}",
-            media=f"audio-{idx}.wav",
-            question=f"audio question {idx}",
-            keyword=f"spoken{idx}",
-            source_paths=(f"audio-{idx}.wav",),
+    pure_results = [
+        result._replace(
+            sample_id=f"{result.sample_id}|pure-{result.target_modality}",
+            distractor_modalities=(),
         )
-        for idx in range(5)
+        for result in mixed_results
     ]
-    video_samples = [
-        MixedModalityInputSample(
-            sample_id=f"video-{idx}",
-            media=f"video-{idx}.mp4",
-            question=f"video question {idx}",
-            keyword=f"motion{idx}",
-            source_paths=(f"video-{idx}.mp4",),
+    pure_results[1] = pure_results[1]._replace(
+        prediction="correct transcript",
+        is_correct=True,
+    )
+    target_modalities = (MODALITY_IMAGE, MODALITY_AUDIO, MODALITY_VIDEO)
+    mixed_summary = _summarize_target_results(mixed_results, target_modalities)
+    pure_summary = _summarize_target_results(pure_results, target_modalities)
+
+    paired_summary = _summarize_paired_baseline(
+        mixed_results=mixed_results,
+        pure_results=pure_results,
+        mixed_summary=mixed_summary,
+        pure_summary=pure_summary,
+        target_modalities=target_modalities,
+    )
+
+    assert paired_summary.mixed_minus_pure_accuracy == pytest.approx(-100.0 / 3.0)
+    assert paired_summary.mixed_minus_pure_accuracy_by_target == {
+        MODALITY_IMAGE: 0.0,
+        MODALITY_AUDIO: -100.0,
+        MODALITY_VIDEO: 0.0,
+    }
+    assert paired_summary.paired_counts_by_target[MODALITY_AUDIO] == {
+        "sample_count": 1,
+        "mixed_correct": 0,
+        "pure_correct": 1,
+        "both_correct": 0,
+        "mixed_only": 0,
+        "pure_only": 1,
+        "both_wrong": 0,
+    }
+    _assert_pure_baseline_not_degraded(
+        mixed_results=mixed_results,
+        pure_results=pure_results,
+        mixed_summary=mixed_summary,
+        pure_summary=pure_summary,
+        target_modalities=target_modalities,
+        max_accuracy_drop=40.0,
+        max_per_target_accuracy_drop=100.0,
+    )
+    with pytest.raises(AssertionError, match="for audio"):
+        _assert_pure_baseline_not_degraded(
+            mixed_results=mixed_results,
+            pure_results=pure_results,
+            mixed_summary=mixed_summary,
+            pure_summary=pure_summary,
+            target_modalities=target_modalities,
+            max_accuracy_drop=40.0,
+            max_per_target_accuracy_drop=10.0,
         )
-        for idx in range(5)
-    ]
+
+
+def test_deterministic_sample_selection_for_omni_modalities():
+    input_samples = _input_samples_by_modality((MODALITY_IMAGE, MODALITY_AUDIO, MODALITY_VIDEO), 5)
 
     first = select_mixed_modality_samples(
-        image_samples,
-        audio_samples,
-        video_samples,
+        input_samples,
         num_samples=3,
         random_seed=7,
+        active_modalities=(MODALITY_IMAGE, MODALITY_AUDIO, MODALITY_VIDEO),
     )
     second = select_mixed_modality_samples(
-        image_samples,
-        audio_samples,
-        video_samples,
+        input_samples,
         num_samples=3,
         random_seed=7,
+        active_modalities=(MODALITY_IMAGE, MODALITY_AUDIO, MODALITY_VIDEO),
     )
 
     assert [sample.sample_id for sample in first] == [sample.sample_id for sample in second]
-    assert [sample.sample_id for sample in first] == [
-        "image-4+audio-2+video-3",
-        "image-0+audio-3+video-2",
-        "image-3+audio-1+video-0",
+    assert [sample.target_modality for sample in first] == [
+        sample.target_modality for sample in second
     ]
+    assert Counter(sample.target_modality for sample in first) == Counter(
+        {MODALITY_IMAGE: 1, MODALITY_AUDIO: 1, MODALITY_VIDEO: 1}
+    )
+    assert all(
+        tuple(sample.items) == (MODALITY_IMAGE, MODALITY_AUDIO, MODALITY_VIDEO) for sample in first
+    )
+
+
+def test_deterministic_sample_selection_for_image_video_modalities():
+    input_samples = _input_samples_by_modality((MODALITY_IMAGE, MODALITY_VIDEO), 6)
+
+    samples = select_mixed_modality_samples(
+        input_samples,
+        num_samples=4,
+        random_seed=11,
+        active_modalities=(MODALITY_IMAGE, MODALITY_VIDEO),
+    )
+
+    assert Counter(sample.target_modality for sample in samples) == Counter(
+        {MODALITY_IMAGE: 2, MODALITY_VIDEO: 2}
+    )
+    assert all(tuple(sample.items) == (MODALITY_IMAGE, MODALITY_VIDEO) for sample in samples)
+    assert all(MODALITY_AUDIO not in sample.items for sample in samples)
 
 
 def test_generate_outputs_waits_after_each_request(monkeypatch):
@@ -184,10 +383,12 @@ def test_generate_outputs_waits_after_each_request(monkeypatch):
             self.requests.append((request_input, sampling_params, streaming))
             return Future(self, f"output-{request_input}")
 
-    evaluator = MixedModalityOmniEvaluator(
-        mmmu_dataset_path="/tmp/mmmu",
-        voxpopuli_dataset_path="/tmp/voxpopuli",
-        videomme_dataset_path="/tmp/videomme",
+    evaluator = MixedModalityEvaluator(
+        modality_dataset_paths={
+            MODALITY_IMAGE: "/tmp/mmmu",
+            MODALITY_AUDIO: "/tmp/voxpopuli",
+            MODALITY_VIDEO: "/tmp/videomme",
+        },
         num_samples=2,
     )
     monkeypatch.setattr(
@@ -200,7 +401,10 @@ def test_generate_outputs_waits_after_each_request(monkeypatch):
 
     outputs = evaluator._generate_outputs_serially(
         llm,
-        [_sample("mixed-0"), _sample("mixed-1")],
+        [
+            _sample("mixed-0", target_modality=MODALITY_IMAGE),
+            _sample("mixed-1", target_modality=MODALITY_VIDEO),
+        ],
         input_context=object(),
         sampling_params=sampling_params,
         streaming=False,

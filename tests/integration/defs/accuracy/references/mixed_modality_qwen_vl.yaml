@@ -1,0 +1,7 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Target-only randomized query accuracy. Each request contains image and video
+# with one random distractor, but asks for one seeded random target modality.
+# Add model-specific references here after a source-built GPU measurement.
+{}
