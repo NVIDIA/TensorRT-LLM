@@ -594,13 +594,13 @@ class FlashInferTrtllmGenAttention:
         kv_cache_quant_mode = QuantMode(quant_mode)
         kv_scale_orig_quant = (
             attention_layer.kv_scale_orig_quant
-            if forward_args.kv_scales_sf_inv is None
-            else forward_args.kv_scales_sf_inv
+            if forward_args.kv_scale_orig_quant is None
+            else forward_args.kv_scale_orig_quant
         )
         kv_scale_quant_orig = (
             attention_layer.kv_scale_quant_orig
-            if forward_args.kv_scales_sf is None
-            else forward_args.kv_scales_sf
+            if forward_args.kv_scale_quant_orig is None
+            else forward_args.kv_scale_quant_orig
         )
         if (
             not kv_cache_quant_mode.has_kv_cache_quant()
