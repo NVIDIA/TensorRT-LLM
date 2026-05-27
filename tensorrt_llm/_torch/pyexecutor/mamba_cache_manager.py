@@ -635,14 +635,6 @@ class PythonMambaCacheManager(BaseResourceManager):
                 raise RuntimeError("run out of mamba cache blocks")
             block = self.mamba_cache_free_blocks.pop()
             self.mamba_cache_index[r] = block
-            # Defensive zero of the per-slot SSM/conv state stripes for fresh
-            # context blocks.  Without this, stale state from a prior occupant
-            # can leak into the first decode step of a recycled slot at high
-            # concurrency, which the non-replay flashinfer SR path reads as
-            # garbage and causes token-id-0 / `<unk>` collapse on greedy
-            # (temp=0.0) decoding.  Harmless when the prefill fully overwrites.
-            self.mamba_cache.conv[:, block] = 0
-            self.mamba_cache.temporal[:, block] = 0
             if (isinstance(self.mamba_cache, self.SpeculativeState)
                     and self._use_replay_state_update):
                 self.mamba_cache.prev_num_accepted_tokens[block] = 0
