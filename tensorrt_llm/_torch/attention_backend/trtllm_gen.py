@@ -616,12 +616,6 @@ class FlashInferTrtllmGenAttention:
 
         return kv_scale_orig_quant, kv_scale_quant_orig
 
-    @staticmethod
-    def _get_mrope_rotary_cos_sin(
-        forward_args: AttentionForwardArgs,
-    ) -> Optional[torch.Tensor]:
-        return forward_args.mrope_rotary_cos_sin
-
     def is_supported(
         self,
         q: torch.Tensor,
@@ -987,7 +981,7 @@ class FlashInferTrtllmGenAttention:
             params.forward, params.kv_cache_quant_mode
         )
         attention_output_orig_quant = params.forward.out_scale
-        mrope_rotary_cos_sin = self._get_mrope_rotary_cos_sin(params.forward)
+        mrope_rotary_cos_sin = params.forward.mrope_rotary_cos_sin
 
         (
             q_processed,
