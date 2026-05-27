@@ -517,3 +517,32 @@ def test_no_unexpected_other_kwargs():
         f"Allowed: source.attr[.attr...], int(source.attr), literal "
         f"constant, or one of {sorted(expected)}."
     )
+
+
+def _all_forward_args_field_names() -> set[str]:
+    """All dataclass field names reachable from ``AttentionForwardArgs``,
+    recursively descending into nested dataclass sub-bags."""
+    seen: set[str] = set()
+
+    def _walk(cls) -> None:
+        for f in fields(cls):
+            seen.add(f.name)
+            ftype = f.type if not isinstance(f.type, str) else None
+            if ftype is not None and dataclasses.is_dataclass(ftype):
+                _walk(ftype)
+
+    _walk(AttentionForwardArgs)
+    return seen
+
+
+def test_excluded_fields_match_real_fields():
+    """Every entry in ``_THOP_EXCLUDED_FIELDS`` must name a real field on
+    ``AttentionForwardArgs`` (or a nested sub-bag). Dead entries (typos,
+    fields removed in a refactor) silently allow newly-added real fields
+    to slip past ``test_every_forward_args_field_is_consumed``."""
+    stale = set(_THOP_EXCLUDED_FIELDS) - _all_forward_args_field_names()
+    assert not stale, (
+        f"_THOP_EXCLUDED_FIELDS entries that don't match any "
+        f"AttentionForwardArgs field: {sorted(stale)}. Drop them or "
+        f"restore the field."
+    )

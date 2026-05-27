@@ -36,7 +36,6 @@ _TRTLLM_ENABLE_TRTLLM_GEN_ATTENTION = (os.environ.get(
 # transitively reads; entries here are exempt.
 _THOP_EXCLUDED_FIELDS: frozenset = frozenset({
     "topk_indices",  # DSA-only
-    "is_generation",  # trtllm_gen dispatch flag
     "attention_mask_data",  # custom-mask code path
     "out_scale_sf",  # promoted into ``out_scale`` in ``_run`` for NVFP4 path
 })
