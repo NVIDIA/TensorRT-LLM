@@ -1778,8 +1778,8 @@ def gvr_topk_decode(
     enable_phase3_unroll: Optional[bool] = None,
     use_constant_hint: bool = False,
     min_blocks_per_mp: Optional[int] = None,
-    use_256bit_load: bool = False,
-    num_threads_per_block: int = 512,
+    use_256bit_load: Optional[bool] = None,
+    num_threads_per_block: Optional[int] = None,
     enable_warp_parallel_reduce: Optional[bool] = None,
     compress_ratio: int = 1,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -1801,6 +1801,15 @@ def gvr_topk_decode(
                    the serial tid==0 reduce is the bottleneck; at threads == 512
                    it stays off (synth-measured ~2pp regression). Pass explicit
                    ``True`` / ``False`` to override for A/B testing.
+        num_threads_per_block: ``None`` (default) auto-picks 1024 iff
+                   ``num_rows <= num_sms AND N >= 65536`` (small grid + large N
+                   so all 1024 threads have meaningful vec-loop work).
+                   Otherwise 512. Pass 512 / 1024 to override.
+        use_256bit_load: ``None`` (default) auto-picks True iff
+                   ``dtype == fp32 AND N >= 16384`` (LDG.E.256 helps fp32
+                   broadly above N=16K; half-prec cvt-fp32 doubles fragment
+                   reg footprint and regresses 5-11% at K=512/1024).
+                   Pass True / False to override.
         out_values, out_indices: Optional preallocated outputs.
         min_blocks_per_mp: Override ptxas ``__launch_bounds__(BS, min_blocks)``
             hint. ``None`` (default) → use the 3-tier shape-aware heuristic
@@ -1841,6 +1850,25 @@ def gvr_topk_decode(
         enable_unroll_4 = True
     if enable_phase3_unroll is None:
         enable_phase3_unroll = True
+    # ---- num_threads_per_block + use_256bit_load auto-heuristic ----
+    # Rule derived from sweep (sweep_tv_kineto/auto_speedup.csv):
+    #   T = 1024 when grid is small (num_rows <= num_sms; 1 CTA/SM bound) AND
+    #       N is large enough to give each of the 1024 threads meaningful
+    #       vec-loop work — empirically N >= 65536. Below that, T=1024's
+    #       extra 32-warp scheduling overhead dwarfs the per-thread work
+    #       savings and regresses by 5-20%.
+    #   V = 256-bit only for fp32: half-prec (bf16/fp16) cvt-to-fp32 doubles
+    #       fragment reg footprint and regresses by 5-11% at K=512/1024
+    #       (LDG hits saturate at 128-bit anyway). N >= 16384 skips the
+    #       fp32 N=8K dip (5-8% loss from 256-bit at small-grid small-N).
+    # Net: median speedup vs CUDA 1.09× (baseline) -> 1.10×; max 1.45× ->
+    # 1.52×; no regression introduced (~21 baseline sp<1 stay; 1 new at -1pp).
+    # Resolve here so the cache key sees the concrete values.
+    N_cols = logits.shape[1]
+    if num_threads_per_block is None:
+        num_threads_per_block = 1024 if (num_rows <= num_sms and N_cols >= 65536) else 512
+    if use_256bit_load is None:
+        use_256bit_load = logits.dtype == torch.float32 and N_cols >= 16384
     # enable_warp_parallel_reduce is tightly coupled to num_threads_per_block:
     # enabled iff num_threads == 1024 (32 warps), where the serial tid==0
     # reduce path becomes the bottleneck. At num_threads == 512 (16 warps)
