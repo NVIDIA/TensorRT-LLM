@@ -1,0 +1,528 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+"""End-to-end smoke tests for the routed-expert MoE LoRA path through
+`torch.ops.trtllm.fused_moe`.
+
+These tests require:
+  - CUDA-capable GPU
+  - Built TensorRT-LLM C++ extension (so the `trtllm::fused_moe` op is registered).
+
+They do NOT attempt full numerical equivalence with a hand-written reference
+(SwiGLU + top-k routing makes that involved); instead they verify:
+  1. The op accepts the new LoRA tensors without raising.
+  2. With LoRA tensors present, the output differs from the no-LoRA baseline.
+  3. Per-expert and shared-outer adapters both run.
+  4. The Python-side rejection (min_latency_mode + LoRA) fires correctly.
+"""
+
+import pytest
+import torch
+
+from tensorrt_llm._torch.peft.lora.moe_layout import make_per_expert_lora
+
+_TRTLLM_AVAILABLE = hasattr(torch.ops, "trtllm") and hasattr(
+    torch.ops.trtllm, "fused_moe")
+
+requires_cuda_and_op = pytest.mark.skipif(
+    not torch.cuda.is_available() or not _TRTLLM_AVAILABLE,
+    reason="Requires CUDA and built TensorRT-LLM C++ extension "
+    "(torch.ops.trtllm.fused_moe).")
+
+
+# ---------- shared fixtures ----------------------------------------------------
+
+
+def _build_base_inputs(num_tokens, hidden_size, inter_size, num_experts, top_k,
+                      dtype, device):
+    """Create base MoE inputs (no LoRA)."""
+    torch.manual_seed(0)
+    x = torch.randn(num_tokens, hidden_size, dtype=dtype, device=device)
+    w3_w1 = torch.randn(num_experts, 2 * inter_size, hidden_size,
+                        dtype=dtype, device=device) * 0.02
+    w2 = torch.randn(num_experts, hidden_size, inter_size,
+                     dtype=dtype, device=device) * 0.02
+    logits = torch.randn(num_tokens, num_experts, dtype=torch.float32,
+                         device=device)
+    topk_scores, topk_ids = torch.topk(logits, k=top_k, dim=-1)
+    topk_scores = torch.softmax(topk_scores, dim=-1)
+    # token_final_scales must be float32 (see CHECK_INPUT in moeOp.cpp::runMoe).
+    return x, w3_w1, w2, topk_ids.to(torch.int32), topk_scores.to(torch.float32)
+
+
+def _build_lora_request_buffers(num_tokens, fc1_a, fc1_b, fc2_a, fc2_b,
+                                rank, lora_max_low_rank=None,
+                                gated_a=None, gated_b=None):
+    """Pack LoRA into the per-request CPU tensors that the C++ op expects.
+
+    Single-request multi-LoRA disabled here; one request covers all tokens.
+    For gated activations (e.g. SwiGLU) the kernel requires three LoRA
+    modules per layer (fc1 = up, gated = gate, fc2 = down). When `gated_a` /
+    `gated_b` are not provided, they default to the same buffers as fc1.
+    """
+    if lora_max_low_rank is None:
+        lora_max_low_rank = rank
+    if gated_a is None:
+        gated_a = fc1_a
+    if gated_b is None:
+        gated_b = fc1_b
+    num_seqs = 1
+    fc1_ranks = torch.tensor([rank], dtype=torch.int32, device="cpu")
+    fc2_ranks = torch.tensor([rank], dtype=torch.int32, device="cpu")
+    gated_ranks = torch.tensor([rank], dtype=torch.int32, device="cpu")
+    fc1_ptrs = torch.tensor(
+        [[fc1_a.data_ptr(), fc1_b.data_ptr(), 0]],
+        dtype=torch.int64, device="cpu")
+    fc2_ptrs = torch.tensor(
+        [[fc2_a.data_ptr(), fc2_b.data_ptr(), 0]],
+        dtype=torch.int64, device="cpu")
+    gated_ptrs = torch.tensor(
+        [[gated_a.data_ptr(), gated_b.data_ptr(), 0]],
+        dtype=torch.int64, device="cpu")
+    host_request_types = torch.zeros(num_seqs, dtype=torch.int32, device="cpu")
+    host_context_lengths = torch.tensor([num_tokens], dtype=torch.int32,
+                                        device="cpu")
+    return dict(
+        fc1_lora_ranks=fc1_ranks,
+        fc1_lora_weight_ptrs=fc1_ptrs,
+        fc2_lora_ranks=fc2_ranks,
+        fc2_lora_weight_ptrs=fc2_ptrs,
+        gated_lora_ranks=gated_ranks,
+        gated_lora_weight_ptrs=gated_ptrs,
+        host_request_types=host_request_types,
+        host_context_lengths=host_context_lengths,
+        lora_max_low_rank=lora_max_low_rank,
+    )
+
+
+def _build_lora_slot_buffers(num_tokens, fc1_a, fc1_b, fc2_a, fc2_b, rank,
+                             max_lora_size=4, lora_max_low_rank=None,
+                             gated_a=None, gated_b=None):
+    """Pack a single LoRA into slot-indexed pinned CPU buffers (CUDA-graph mode).
+
+    All tokens are placed in slot 0; remaining slots are zero-filled and inactive.
+    For gated activations the gated buffers default to fc1 (matches
+    `_build_lora_request_buffers`).
+    """
+    if lora_max_low_rank is None:
+        lora_max_low_rank = rank
+    if gated_a is None:
+        gated_a = fc1_a
+    if gated_b is None:
+        gated_b = fc1_b
+    slot_ranks = torch.zeros(max_lora_size, dtype=torch.int32, device="cpu")
+    slot_ranks[0] = rank
+    fc1_slot_ptrs = torch.zeros(max_lora_size, 3, dtype=torch.int64, device="cpu")
+    fc1_slot_ptrs[0, 0] = fc1_a.data_ptr()
+    fc1_slot_ptrs[0, 1] = fc1_b.data_ptr()
+    fc2_slot_ptrs = torch.zeros(max_lora_size, 3, dtype=torch.int64, device="cpu")
+    fc2_slot_ptrs[0, 0] = fc2_a.data_ptr()
+    fc2_slot_ptrs[0, 1] = fc2_b.data_ptr()
+    gated_slot_ptrs = torch.zeros(max_lora_size, 3, dtype=torch.int64,
+                                  device="cpu")
+    gated_slot_ptrs[0, 0] = gated_a.data_ptr()
+    gated_slot_ptrs[0, 1] = gated_b.data_ptr()
+    token_to_slot = torch.zeros(num_tokens, dtype=torch.int32, device="cpu")
+    return dict(
+        fc1_slot_lora_ranks=slot_ranks,
+        fc1_slot_lora_weight_ptrs=fc1_slot_ptrs,
+        fc2_slot_lora_ranks=slot_ranks,
+        fc2_slot_lora_weight_ptrs=fc2_slot_ptrs,
+        gated_slot_lora_ranks=slot_ranks,
+        gated_slot_lora_weight_ptrs=gated_slot_ptrs,
+        token_to_slot=token_to_slot,
+        lora_max_low_rank=lora_max_low_rank,
+    )
+
+
+def _call_fused_moe(x, w3_w1, w2, topk_ids, topk_scores, output_dtype,
+                   lora_kwargs=None):
+    common = dict(
+        input=x,
+        token_selected_experts=topk_ids,
+        token_final_scales=topk_scores,
+        fc1_expert_weights=w3_w1,
+        fc1_expert_biases=None,
+        fc2_expert_weights=w2,
+        fc2_expert_biases=None,
+        output_dtype=output_dtype,
+        quant_scales=[],
+    )
+    if lora_kwargs is not None:
+        common.update(lora_kwargs)
+    return torch.ops.trtllm.fused_moe(**common)
+
+
+# ---------- tests --------------------------------------------------------------
+
+
+@requires_cuda_and_op
+def test_moe_per_expert_lora_changes_output():
+    device = torch.device("cuda")
+    dtype = torch.bfloat16
+    num_tokens, hidden_size, inter_size = 16, 128, 256
+    num_experts, top_k = 4, 2
+    rank = 8
+
+    x, w3_w1, w2, topk_ids, topk_scores = _build_base_inputs(
+        num_tokens, hidden_size, inter_size, num_experts, top_k, dtype, device)
+
+    # Baseline (no LoRA).
+    out_baseline = _call_fused_moe(x, w3_w1, w2, topk_ids, topk_scores,
+                                   output_dtype=dtype)[0]
+
+    fc1_adapter = make_per_expert_lora(num_experts, rank, hidden_size,
+                                       inter_size, dtype=dtype, device=device,
+                                       shared_side=None, seed=10)
+    fc2_adapter = make_per_expert_lora(num_experts, rank, inter_size,
+                                       hidden_size, dtype=dtype, device=device,
+                                       shared_side=None, seed=11)
+
+    lora_kwargs = _build_lora_request_buffers(
+        num_tokens, fc1_adapter["A"], fc1_adapter["B"],
+        fc2_adapter["A"], fc2_adapter["B"], rank=rank)
+
+    out_lora = _call_fused_moe(x, w3_w1, w2, topk_ids, topk_scores,
+                               output_dtype=dtype, lora_kwargs=lora_kwargs)[0]
+
+    assert out_lora.shape == out_baseline.shape
+    # The LoRA delta must move the output meaningfully (not bit-equal, not NaN).
+    assert torch.isfinite(out_lora).all()
+    diff = (out_lora.float() - out_baseline.float()).abs().mean().item()
+    assert diff > 1e-3, f"LoRA had no observable effect (mean abs diff={diff})"
+
+
+@requires_cuda_and_op
+def test_moe_shared_outer_lora_changes_output():
+    device = torch.device("cuda")
+    dtype = torch.bfloat16
+    num_tokens, hidden_size, inter_size = 16, 128, 256
+    num_experts, top_k = 4, 2
+    rank = 8
+
+    x, w3_w1, w2, topk_ids, topk_scores = _build_base_inputs(
+        num_tokens, hidden_size, inter_size, num_experts, top_k, dtype, device)
+
+    # Shared A on FC1 (residual-stream side), shared B on FC2 (residual-stream side).
+    fc1_adapter = make_per_expert_lora(num_experts, rank, hidden_size,
+                                       inter_size, dtype=dtype, device=device,
+                                       shared_side="A", seed=20)
+    fc2_adapter = make_per_expert_lora(num_experts, rank, inter_size,
+                                       hidden_size, dtype=dtype, device=device,
+                                       shared_side="B", seed=21)
+
+    # Sanity: replicated slice matches.
+    assert torch.equal(fc1_adapter["A"][0], fc1_adapter["A"][-1])
+    assert torch.equal(fc2_adapter["B"][0], fc2_adapter["B"][-1])
+
+    lora_kwargs = _build_lora_request_buffers(
+        num_tokens, fc1_adapter["A"], fc1_adapter["B"],
+        fc2_adapter["A"], fc2_adapter["B"], rank=rank)
+
+    out_baseline = _call_fused_moe(x, w3_w1, w2, topk_ids, topk_scores,
+                                   output_dtype=dtype)[0]
+    out_lora = _call_fused_moe(x, w3_w1, w2, topk_ids, topk_scores,
+                               output_dtype=dtype, lora_kwargs=lora_kwargs)[0]
+
+    assert torch.isfinite(out_lora).all()
+    diff = (out_lora.float() - out_baseline.float()).abs().mean().item()
+    assert diff > 1e-3
+
+
+@requires_cuda_and_op
+def test_moe_lora_rejected_in_min_latency_mode():
+    device = torch.device("cuda")
+    dtype = torch.bfloat16
+    num_tokens, hidden_size, inter_size = 8, 128, 256
+    num_experts, top_k = 4, 2
+    rank = 4
+
+    x, w3_w1, w2, topk_ids, topk_scores = _build_base_inputs(
+        num_tokens, hidden_size, inter_size, num_experts, top_k, dtype, device)
+
+    fc1_adapter = make_per_expert_lora(num_experts, rank, hidden_size,
+                                       inter_size, dtype=dtype, device=device,
+                                       seed=30)
+    fc2_adapter = make_per_expert_lora(num_experts, rank, inter_size,
+                                       hidden_size, dtype=dtype, device=device,
+                                       seed=31)
+    lora_kwargs = _build_lora_request_buffers(
+        num_tokens, fc1_adapter["A"], fc1_adapter["B"],
+        fc2_adapter["A"], fc2_adapter["B"], rank=rank)
+
+    with pytest.raises(RuntimeError, match="MoE LoRA is not supported in min-latency mode"):
+        torch.ops.trtllm.fused_moe(
+            input=x,
+            token_selected_experts=topk_ids,
+            token_final_scales=topk_scores,
+            fc1_expert_weights=w3_w1,
+            fc1_expert_biases=None,
+            fc2_expert_weights=w2,
+            fc2_expert_biases=None,
+            output_dtype=dtype,
+            quant_scales=[],
+            min_latency_mode=True,
+            **lora_kwargs,
+        )
+
+
+@requires_cuda_and_op
+def test_moe_lora_slot_indexed_matches_per_request():
+    """Slot-indexed mode must produce bit-identical output to per-request mode
+    when both express the same adapter assignment (single LoRA, all tokens
+    routed to slot 0)."""
+    device = torch.device("cuda")
+    dtype = torch.bfloat16
+    num_tokens, hidden_size, inter_size = 16, 128, 256
+    num_experts, top_k = 4, 2
+    rank = 8
+
+    x, w3_w1, w2, topk_ids, topk_scores = _build_base_inputs(
+        num_tokens, hidden_size, inter_size, num_experts, top_k, dtype, device)
+    fc1_adapter = make_per_expert_lora(num_experts, rank, hidden_size,
+                                       inter_size, dtype=dtype, device=device,
+                                       seed=50)
+    fc2_adapter = make_per_expert_lora(num_experts, rank, inter_size,
+                                       hidden_size, dtype=dtype, device=device,
+                                       seed=51)
+
+    per_request_kwargs = _build_lora_request_buffers(
+        num_tokens, fc1_adapter["A"], fc1_adapter["B"],
+        fc2_adapter["A"], fc2_adapter["B"], rank=rank)
+    slot_kwargs = _build_lora_slot_buffers(
+        num_tokens, fc1_adapter["A"], fc1_adapter["B"],
+        fc2_adapter["A"], fc2_adapter["B"], rank=rank)
+
+    out_per_request = _call_fused_moe(x, w3_w1, w2, topk_ids, topk_scores,
+                                      output_dtype=dtype,
+                                      lora_kwargs=per_request_kwargs)[0]
+    out_slot = _call_fused_moe(x, w3_w1, w2, topk_ids, topk_scores,
+                               output_dtype=dtype, lora_kwargs=slot_kwargs)[0]
+
+    torch.testing.assert_close(out_slot, out_per_request, rtol=0, atol=0)
+
+
+@requires_cuda_and_op
+def test_moe_lora_slot_indexed_multi_lora_mixed_batch():
+    """Slot-indexed mode with multiple distinct adapters in flight, half of the
+    tokens on slot 0 and half on slot 1. Compare each half against a
+    single-adapter per-request call to confirm slot dispatch is correct."""
+    device = torch.device("cuda")
+    dtype = torch.bfloat16
+    num_tokens, hidden_size, inter_size = 16, 128, 256
+    num_experts, top_k = 4, 2
+    rank = 8
+
+    x, w3_w1, w2, topk_ids, topk_scores = _build_base_inputs(
+        num_tokens, hidden_size, inter_size, num_experts, top_k, dtype, device)
+    fc1_a0 = make_per_expert_lora(num_experts, rank, hidden_size, inter_size,
+                                  dtype=dtype, device=device, seed=60)
+    fc2_a0 = make_per_expert_lora(num_experts, rank, inter_size, hidden_size,
+                                  dtype=dtype, device=device, seed=61)
+    fc1_a1 = make_per_expert_lora(num_experts, rank, hidden_size, inter_size,
+                                  dtype=dtype, device=device, seed=62)
+    fc2_a1 = make_per_expert_lora(num_experts, rank, inter_size, hidden_size,
+                                  dtype=dtype, device=device, seed=63)
+
+    # Single-adapter references (per-request mode, applies same adapter to all tokens).
+    ref0 = _call_fused_moe(
+        x, w3_w1, w2, topk_ids, topk_scores, output_dtype=dtype,
+        lora_kwargs=_build_lora_request_buffers(
+            num_tokens, fc1_a0["A"], fc1_a0["B"], fc2_a0["A"], fc2_a0["B"],
+            rank=rank))[0]
+    ref1 = _call_fused_moe(
+        x, w3_w1, w2, topk_ids, topk_scores, output_dtype=dtype,
+        lora_kwargs=_build_lora_request_buffers(
+            num_tokens, fc1_a1["A"], fc1_a1["B"], fc2_a1["A"], fc2_a1["B"],
+            rank=rank))[0]
+
+    # Slot-indexed mixed batch: tokens 0..3 -> slot 0, tokens 4..7 -> slot 1.
+    max_lora_size = 4
+    slot_ranks = torch.zeros(max_lora_size, dtype=torch.int32, device="cpu")
+    slot_ranks[0] = rank
+    slot_ranks[1] = rank
+    fc1_slot_ptrs = torch.zeros(max_lora_size, 3, dtype=torch.int64,
+                                device="cpu")
+    fc1_slot_ptrs[0, 0] = fc1_a0["A"].data_ptr()
+    fc1_slot_ptrs[0, 1] = fc1_a0["B"].data_ptr()
+    fc1_slot_ptrs[1, 0] = fc1_a1["A"].data_ptr()
+    fc1_slot_ptrs[1, 1] = fc1_a1["B"].data_ptr()
+    fc2_slot_ptrs = torch.zeros(max_lora_size, 3, dtype=torch.int64,
+                                device="cpu")
+    fc2_slot_ptrs[0, 0] = fc2_a0["A"].data_ptr()
+    fc2_slot_ptrs[0, 1] = fc2_a0["B"].data_ptr()
+    fc2_slot_ptrs[1, 0] = fc2_a1["A"].data_ptr()
+    fc2_slot_ptrs[1, 1] = fc2_a1["B"].data_ptr()
+    # Gated module is required for SwiGLU; reuse fc1 buffers per slot.
+    gated_slot_ptrs = fc1_slot_ptrs.clone()
+    # First half of tokens -> slot 0, second half -> slot 1.
+    half = num_tokens // 2
+    token_to_slot = torch.tensor(
+        [0] * half + [1] * (num_tokens - half), dtype=torch.int32,
+        device="cpu")
+    out_mixed = _call_fused_moe(
+        x, w3_w1, w2, topk_ids, topk_scores, output_dtype=dtype,
+        lora_kwargs=dict(
+            fc1_slot_lora_ranks=slot_ranks,
+            fc1_slot_lora_weight_ptrs=fc1_slot_ptrs,
+            fc2_slot_lora_ranks=slot_ranks,
+            fc2_slot_lora_weight_ptrs=fc2_slot_ptrs,
+            gated_slot_lora_ranks=slot_ranks,
+            gated_slot_lora_weight_ptrs=gated_slot_ptrs,
+            token_to_slot=token_to_slot,
+            lora_max_low_rank=rank,
+        ))[0]
+
+    # First half must match the slot-0-only reference (bit-identical).
+    torch.testing.assert_close(out_mixed[:half], ref0[:half], rtol=0, atol=0)
+    # Second half must match the slot-1-only reference (bit-identical).
+    torch.testing.assert_close(out_mixed[half:], ref1[half:], rtol=0, atol=0)
+
+
+@requires_cuda_and_op
+@pytest.mark.skip(
+    reason=
+    "MoE LoRA + CUDA graph capture is unsupported in the MVP. The fused-MoE kernel's "
+    "LoRA path performs a host-side cudaEventSynchronize after a D2H pointer-expansion "
+    "copy, which cannot be captured into a CUDA graph. The op rejects this combination "
+    "explicitly; native graph support requires the Phase 6 kernel patch that moves the "
+    "per-token adapter-pointer expansion onto the GPU. Slot-indexed eager execution "
+    "is exercised by the surrounding tests.")
+def test_moe_lora_slot_indexed_cuda_graph_replay_matches_eager():
+    """CUDA graph capture+replay of slot-indexed MoE LoRA must produce the same
+    output as eager execution. Verifies that the persistent pinned-host buffer
+    addresses survive capture and that re-writing slot pointers between
+    captures and replays takes effect."""
+    device = torch.device("cuda")
+    dtype = torch.bfloat16
+    num_tokens, hidden_size, inter_size = 16, 128, 256
+    num_experts, top_k = 4, 2
+    rank = 8
+    max_lora_size = 4
+
+    x, w3_w1, w2, topk_ids, topk_scores = _build_base_inputs(
+        num_tokens, hidden_size, inter_size, num_experts, top_k, dtype, device)
+    fc1_adapter = make_per_expert_lora(num_experts, rank, hidden_size,
+                                       inter_size, dtype=dtype, device=device,
+                                       seed=70)
+    fc2_adapter = make_per_expert_lora(num_experts, rank, inter_size,
+                                       hidden_size, dtype=dtype, device=device,
+                                       seed=71)
+
+    # Persistent pinned host buffers (addresses survive across captures/replays).
+    slot_ranks = torch.zeros(max_lora_size, dtype=torch.int32, device="cpu",
+                             pin_memory=True)
+    slot_ranks[0] = rank
+    fc1_slot_ptrs = torch.zeros(max_lora_size, 3, dtype=torch.int64,
+                                device="cpu", pin_memory=True)
+    fc1_slot_ptrs[0, 0] = fc1_adapter["A"].data_ptr()
+    fc1_slot_ptrs[0, 1] = fc1_adapter["B"].data_ptr()
+    fc2_slot_ptrs = torch.zeros(max_lora_size, 3, dtype=torch.int64,
+                                device="cpu", pin_memory=True)
+    fc2_slot_ptrs[0, 0] = fc2_adapter["A"].data_ptr()
+    fc2_slot_ptrs[0, 1] = fc2_adapter["B"].data_ptr()
+    # Gated module is required for SwiGLU; reuse fc1 buffers.
+    gated_slot_ptrs = fc1_slot_ptrs.clone()
+    token_to_slot = torch.zeros(num_tokens, dtype=torch.int32, device="cpu",
+                                pin_memory=True)
+
+    slot_kwargs = dict(
+        fc1_slot_lora_ranks=slot_ranks,
+        fc1_slot_lora_weight_ptrs=fc1_slot_ptrs,
+        fc2_slot_lora_ranks=slot_ranks,
+        fc2_slot_lora_weight_ptrs=fc2_slot_ptrs,
+        gated_slot_lora_ranks=slot_ranks,
+        gated_slot_lora_weight_ptrs=gated_slot_ptrs,
+        token_to_slot=token_to_slot,
+        lora_max_low_rank=rank,
+    )
+
+    # Eager reference.
+    out_eager = _call_fused_moe(x, w3_w1, w2, topk_ids, topk_scores,
+                                output_dtype=dtype, lora_kwargs=slot_kwargs)[0]
+
+    # Warm up to populate any lazy state (autotuner, LoraImpl cache, host buffer
+    # reservation). Without this the first capture would record allocations.
+    for _ in range(3):
+        _call_fused_moe(x, w3_w1, w2, topk_ids, topk_scores,
+                        output_dtype=dtype, lora_kwargs=slot_kwargs)
+
+    # Pre-allocate output tensor; the captured graph writes in place into this.
+    out_graph = torch.empty_like(out_eager)
+    graph = torch.cuda.CUDAGraph()
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        with torch.cuda.graph(graph, stream=stream):
+            captured = _call_fused_moe(x, w3_w1, w2, topk_ids, topk_scores,
+                                       output_dtype=dtype,
+                                       lora_kwargs=slot_kwargs)[0]
+            out_graph.copy_(captured)
+    torch.cuda.current_stream().wait_stream(stream)
+
+    graph.replay()
+    torch.cuda.synchronize()
+    torch.testing.assert_close(out_graph, out_eager, rtol=1e-2, atol=1e-2)
+
+
+@requires_cuda_and_op
+@pytest.mark.parametrize("missing_module", ["fc2", "host_request_types"])
+def test_moe_lora_rejects_incomplete_inputs(missing_module):
+    """Supplying fc1 LoRA but missing fc2 or host_request_types must raise."""
+    device = torch.device("cuda")
+    dtype = torch.bfloat16
+    num_tokens, hidden_size, inter_size = 8, 128, 256
+    num_experts, top_k = 4, 2
+    rank = 4
+
+    x, w3_w1, w2, topk_ids, topk_scores = _build_base_inputs(
+        num_tokens, hidden_size, inter_size, num_experts, top_k, dtype, device)
+
+    fc1_adapter = make_per_expert_lora(num_experts, rank, hidden_size,
+                                       inter_size, dtype=dtype, device=device,
+                                       seed=40)
+    fc2_adapter = make_per_expert_lora(num_experts, rank, inter_size,
+                                       hidden_size, dtype=dtype, device=device,
+                                       seed=41)
+    lora_kwargs = _build_lora_request_buffers(
+        num_tokens, fc1_adapter["A"], fc1_adapter["B"],
+        fc2_adapter["A"], fc2_adapter["B"], rank=rank)
+
+    if missing_module == "fc2":
+        lora_kwargs["fc2_lora_ranks"] = None
+        lora_kwargs["fc2_lora_weight_ptrs"] = None
+    elif missing_module == "host_request_types":
+        lora_kwargs["host_request_types"] = None
+
+    with pytest.raises(RuntimeError):
+        _call_fused_moe(x, w3_w1, w2, topk_ids, topk_scores,
+                        output_dtype=dtype, lora_kwargs=lora_kwargs)
+
+
+@requires_cuda_and_op
+def test_moe_lora_rejects_mixed_per_request_and_slot_indexed():
+    """Supplying both per-request and slot-indexed LoRA inputs is an error."""
+    device = torch.device("cuda")
+    dtype = torch.bfloat16
+    num_tokens, hidden_size, inter_size = 8, 128, 256
+    num_experts, top_k = 4, 2
+    rank = 4
+
+    x, w3_w1, w2, topk_ids, topk_scores = _build_base_inputs(
+        num_tokens, hidden_size, inter_size, num_experts, top_k, dtype, device)
+    fc1_adapter = make_per_expert_lora(num_experts, rank, hidden_size,
+                                       inter_size, dtype=dtype, device=device,
+                                       seed=80)
+    fc2_adapter = make_per_expert_lora(num_experts, rank, inter_size,
+                                       hidden_size, dtype=dtype, device=device,
+                                       seed=81)
+
+    lora_kwargs = _build_lora_request_buffers(
+        num_tokens, fc1_adapter["A"], fc1_adapter["B"],
+        fc2_adapter["A"], fc2_adapter["B"], rank=rank)
+    lora_kwargs.update(_build_lora_slot_buffers(
+        num_tokens, fc1_adapter["A"], fc1_adapter["B"],
+        fc2_adapter["A"], fc2_adapter["B"], rank=rank))
+
+    with pytest.raises(RuntimeError, match="mutually exclusive"):
+        _call_fused_moe(x, w3_w1, w2, topk_ids, topk_scores,
+                        output_dtype=dtype, lora_kwargs=lora_kwargs)
