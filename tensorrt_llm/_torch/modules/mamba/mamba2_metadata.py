@@ -14,6 +14,7 @@
 # limitations under the License.
 
 import math
+import os
 from typing import Tuple
 
 import torch
@@ -240,12 +241,75 @@ class Mamba2Metadata:
                 and hasattr(kv_cache_manager, 'get_state_indices')
                 and request_ids is not None):
             batch_request_ids = request_ids[:batch_size]
+            spec_config = getattr(kv_cache_manager, "spec_config", None)
+            max_draft_len = getattr(spec_config, "max_draft_len",
+                                    0) if spec_config is not None else 0
             is_padding = [
-                req_id == CUDA_GRAPH_DUMMY_REQUEST_ID
-                for req_id in batch_request_ids
+                CUDA_GRAPH_DUMMY_REQUEST_ID - max_draft_len <= req_id <=
+                CUDA_GRAPH_DUMMY_REQUEST_ID for req_id in batch_request_ids
             ]
             indices = kv_cache_manager.get_state_indices(
                 batch_request_ids, is_padding)
+            if os.environ.get("TRTLLM_MAMBA_DEBUG_STATE_INDICES", "0") == "1":
+                max_prints = int(
+                    os.environ.get("TRTLLM_MAMBA_DEBUG_STATE_INDICES_LIMIT",
+                                   "8"))
+                print_count = getattr(self, "_debug_state_indices_prints", 0)
+                try:
+                    if isinstance(indices, torch.Tensor):
+                        indices_cpu = indices[:batch_size].detach().cpu(
+                        ).tolist()
+                    else:
+                        indices_cpu = list(indices[:batch_size])
+                    real_indices = [
+                        idx for idx, padding in zip(indices_cpu, is_padding)
+                        if not padding
+                    ]
+                    real_index_set = set(real_indices)
+                    padding_indices = [(pos, req_id, indices_cpu[pos])
+                                       for pos, (req_id, padding) in enumerate(
+                                           zip(batch_request_ids, is_padding))
+                                       if padding]
+                    collisions = [
+                        item for item in padding_indices
+                        if item[2] in real_index_set
+                    ]
+                    positions_by_index = {}
+                    for pos, (req_id, state_idx, padding) in enumerate(
+                            zip(batch_request_ids, indices_cpu, is_padding)):
+                        positions_by_index.setdefault(state_idx, []).append(
+                            (pos, req_id, padding))
+                    duplicate_indices = [
+                        (state_idx, rows)
+                        for state_idx, rows in positions_by_index.items()
+                        if len(rows) > 1
+                    ]
+                    bad_duplicates = [(state_idx, rows)
+                                      for state_idx, rows in duplicate_indices
+                                      if any(not padding
+                                             for _, _, padding in rows)]
+                    should_print = (print_count < max_prints
+                                    and any(is_padding)) or bool(bad_duplicates)
+                    if should_print:
+                        print(
+                            "[MTP_REPRO_STATE_INDICES] "
+                            f"manager={type(kv_cache_manager).__name__} "
+                            f"batch_size={batch_size} "
+                            f"num_padding={sum(is_padding)} "
+                            f"real_state_indices_head={real_indices[:16]} "
+                            f"padding_state_indices_head={padding_indices[:16]} "
+                            f"padding_collisions_with_real={collisions[:16]} "
+                            f"duplicate_state_indices={duplicate_indices[:16]} "
+                            f"bad_duplicate_state_indices={bad_duplicates[:16]}",
+                            flush=True)
+                        self._debug_state_indices_prints = print_count + 1
+                except Exception as exc:
+                    if print_count < max_prints:
+                        print(
+                            "[MTP_REPRO_STATE_INDICES] failed to collect "
+                            f"state-index debug info: {exc!r}",
+                            flush=True)
+                        self._debug_state_indices_prints = print_count + 1
             if isinstance(indices,
                           torch.Tensor) and indices.device.type == 'cuda':
                 # Alias the cache manager's CUDA buffer directly instead of

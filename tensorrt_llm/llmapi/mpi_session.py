@@ -170,10 +170,23 @@ class MpiPoolSession(MpiSession):
     def _start_mpi_pool(self):
         assert not self.mpi_pool, 'MPI session already started'
 
+        env_passthrough_keys = {
+            "CPATH",
+            "CUDA_HOME",
+            "CUDA_INC_PATH",
+            "CUDA_PATH",
+            "CPLUS_INCLUDE_PATH",
+            "CUDACXX",
+            "LD_LIBRARY_PATH",
+            "LIBRARY_PATH",
+            "PATH",
+            "PYTHONPATH",
+            "VIRTUAL_ENV",
+        }
         env = {
             key: value
-            for key, value in os.environ.items()
-            if key.startswith("TRTLLM") or key.startswith("TLLM")
+            for key, value in os.environ.items() if key.startswith("TRTLLM")
+            or key.startswith("TLLM") or key in env_passthrough_keys
         }
         self.mpi_pool = MPIPoolExecutor(max_workers=self.n_workers,
                                         path=sys.path,

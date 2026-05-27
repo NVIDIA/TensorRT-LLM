@@ -1,5 +1,6 @@
 import argparse
 import json
+import os
 import time
 
 from tensorrt_llm import LLM, SamplingParams
@@ -166,7 +167,6 @@ def add_llm_args(parser):
     parser.add_argument('--apply_chat_template',
                         default=False,
                         action='store_true')
-
     # Sampling
     parser.add_argument("--max_tokens", type=int, default=64)
     parser.add_argument("--temperature", type=float, default=None)
@@ -256,6 +256,13 @@ def parse_arguments():
         default=None,
         required=False,
         help="Limit number of samples from dataset (for fast debugging).")
+    parser.add_argument(
+        "--output_jsonl",
+        type=str,
+        default=None,
+        help=
+        "Optional path to write one complete JSONL result row per input sample."
+    )
     args = parser.parse_args()
     return args
 
@@ -285,6 +292,7 @@ def setup_llm(args, **kwargs):
             relaxed_topk=args.relaxed_topk,
             relaxed_delta=args.relaxed_delta,
             mtp_eagle_one_model=args.use_one_model,
+            allow_advanced_sampling=args.allow_advanced_sampling,
             speculative_model=args.model_dir)
     elif spec_decode_algo == "EAGLE3":
         spec_config = Eagle3DecodingConfig(
@@ -329,6 +337,25 @@ def setup_llm(args, **kwargs):
         batching_wait_iters=args.attention_dp_batching_wait_iters,
     )
 
+    env_overrides = dict(kwargs.pop("env_overrides", {}) or {})
+    for key in (
+            "CUDA_HOME",
+            "CUDA_PATH",
+            "CUDA_INC_PATH",
+            "CPATH",
+            "CPLUS_INCLUDE_PATH",
+            "PATH",
+            "VIRTUAL_ENV",
+            "TRTLLM_USE_MAMBA_REPLAY",
+            "TRTLLM_MAMBA_DEBUG_STATE_INDICES",
+            "TRTLLM_MAMBA_DEBUG_STATE_INDICES_LIMIT",
+            "TRTLLM_USE_CPP_MAMBA",
+            "TRTLLM_FORCE_MIXED_MAMBA_HYBRID",
+            "TLLM_MAMBA_MANAGER_PREFERENCE",
+    ):
+        if key in os.environ:
+            env_overrides.setdefault(key, os.environ[key])
+
     llm = LLM(
         model=args.model_dir,
         backend='pytorch',
@@ -363,6 +390,7 @@ def setup_llm(args, **kwargs):
         gather_generation_logits=args.return_generation_logits,
         max_beam_width=args.max_beam_width,
         orchestrator_type=args.orchestrator_type,
+        env_overrides=env_overrides or None,
         **kwargs)
 
     use_beam_search = args.max_beam_width > 1
@@ -391,23 +419,216 @@ def setup_llm(args, **kwargs):
     return llm, sampling_params
 
 
+def json_safe(value):
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    if isinstance(value, (list, tuple)):
+        return [json_safe(item) for item in value]
+    if isinstance(value, dict):
+        return {str(key): json_safe(val) for key, val in value.items()}
+    if hasattr(value, "detach") and hasattr(value, "cpu"):
+        return value.detach().cpu().tolist()
+    if hasattr(value, "__dict__"):
+        return json_safe(vars(value))
+    return repr(value)
+
+
+def load_prompt_records(args):
+    if args.dataset:
+        records = []
+        with open(args.dataset, 'r') as f:
+            for line_idx, line in enumerate(f, start=1):
+                entry = json.loads(line.strip())
+                records.append({
+                    "dataset_line": line_idx,
+                    "dataset_entry": entry,
+                    "raw_prompt": entry["question"][-1],
+                })
+        if args.num_samples is not None:
+            records = records[:args.num_samples]
+        return records
+
+    prompts = args.prompt if args.prompt else example_prompts
+    return [{
+        "dataset_line": None,
+        "dataset_entry": {
+            "question_id": i,
+            "question": [prompt],
+        },
+        "raw_prompt": prompt,
+    } for i, prompt in enumerate(prompts)]
+
+
+def serialize_sequence(sequence):
+    return {
+        "index":
+        getattr(sequence, "index", None),
+        "text":
+        getattr(sequence, "text", ""),
+        "token_ids":
+        json_safe(getattr(sequence, "token_ids", None)),
+        "num_generated_tokens":
+        len(getattr(sequence, "token_ids", []) or []),
+        "finish_reason":
+        getattr(sequence, "finish_reason", None),
+        "stop_reason":
+        getattr(sequence, "stop_reason", None),
+        "cumulative_logprob":
+        getattr(sequence, "cumulative_logprob", None),
+        "logprobs":
+        json_safe(getattr(sequence, "logprobs", None)),
+        "prompt_logprobs":
+        json_safe(getattr(sequence, "prompt_logprobs", None)),
+        "generation_logits":
+        json_safe(getattr(sequence, "generation_logits", None)),
+        "additional_context_outputs":
+        json_safe(getattr(sequence, "additional_context_outputs", None)),
+        "additional_generation_outputs":
+        json_safe(getattr(sequence, "additional_generation_outputs", None)),
+        "request_perf_metrics":
+        json_safe(getattr(sequence, "request_perf_metrics", None)),
+    }
+
+
+def serialize_request_output(output):
+    if output is None:
+        return None
+    sequences = [serialize_sequence(sequence) for sequence in output.outputs]
+    return {
+        "request_id":
+        getattr(output, "request_id", getattr(output, "id", None)),
+        "prompt":
+        getattr(output, "prompt", None),
+        "prompt_token_ids":
+        json_safe(getattr(output, "prompt_token_ids", None)),
+        "finished":
+        getattr(output, "finished", None),
+        "error":
+        getattr(output, "error", None),
+        "context_logits":
+        json_safe(getattr(output, "context_logits", None)),
+        "outputs":
+        sequences,
+        "metrics_dict":
+        json_safe(getattr(output, "metrics_dict", None)),
+        "candidate_metrics":
+        json_safe(getattr(output, "candidate_metrics", None)),
+        "time_breakdown_metrics":
+        json_safe(getattr(output, "time_breakdown_metrics", None)),
+        "avg_decoded_tokens_per_iter":
+        getattr(output, "avg_decoded_tokens_per_iter", None),
+        "cached_tokens":
+        getattr(output, "cached_tokens", None),
+    }
+
+
+def first_sequence_summary(output):
+    if output is None or not getattr(output, "outputs", None):
+        return {
+            "generated_text": "",
+            "token_ids": [],
+            "num_generated_tokens": 0,
+            "finish_reason": None,
+        }
+    sequence = output.outputs[0]
+    token_ids = getattr(sequence, "token_ids", []) or []
+    return {
+        "generated_text": getattr(sequence, "text", ""),
+        "token_ids": json_safe(token_ids),
+        "num_generated_tokens": len(token_ids),
+        "finish_reason": getattr(sequence, "finish_reason", None),
+    }
+
+
+def write_result_row(output_file,
+                     args,
+                     record,
+                     prompt,
+                     output,
+                     *,
+                     sample_index,
+                     num_iterations,
+                     start_time,
+                     end_time,
+                     error=None):
+    if output_file is None:
+        return
+
+    dataset_entry = record["dataset_entry"]
+    summary = first_sequence_summary(output)
+    row = {
+        "sample_index":
+        sample_index,
+        "dataset_line":
+        record.get("dataset_line"),
+        "question_id":
+        dataset_entry.get("question_id"),
+        "source_line":
+        dataset_entry.get("source_line"),
+        "problem_id":
+        dataset_entry.get("problem_id"),
+        "problem_name":
+        dataset_entry.get("problem_name"),
+        "target_step":
+        dataset_entry.get("target_step"),
+        "source_jsonl":
+        dataset_entry.get("source_jsonl"),
+        "dataset_entry":
+        dataset_entry,
+        "raw_prompt":
+        record["raw_prompt"],
+        "prompt":
+        prompt,
+        "applied_chat_template":
+        args.apply_chat_template,
+        "trtllm_use_mamba_replay":
+        os.environ.get("TRTLLM_USE_MAMBA_REPLAY"),
+        "tllm_mamba_manager_preference":
+        os.environ.get("TLLM_MAMBA_MANAGER_PREFERENCE"),
+        "start_time":
+        start_time,
+        "end_time":
+        end_time,
+        "generation_time":
+        end_time - start_time,
+        "num_iterations":
+        num_iterations,
+        "accept_rate":
+        summary["num_generated_tokens"] /
+        num_iterations if num_iterations else None,
+        "generated_text":
+        summary["generated_text"],
+        "token_ids":
+        summary["token_ids"],
+        "num_generated_tokens":
+        summary["num_generated_tokens"],
+        "finish_reason":
+        summary["finish_reason"],
+        "error":
+        error,
+        "request_output":
+        serialize_request_output(output),
+        "args":
+        json_safe(vars(args)),
+    }
+    output_file.write(json.dumps(row, ensure_ascii=False) + "\n")
+    output_file.flush()
+
+
 def main():
     args = parse_arguments()
 
-    if args.dataset:
-        prompts = []
-        with open(args.dataset, 'r') as f:
-            for line in f:
-                entry = json.loads(line.strip())
-                prompts.append(entry["question"][-1])
-        if args.num_samples is not None:
-            prompts = prompts[:args.num_samples]
-    else:
-        prompts = args.prompt if args.prompt else example_prompts
+    prompt_records = load_prompt_records(args)
+    prompts = [record["raw_prompt"] for record in prompt_records]
 
     llm, sampling_params = setup_llm(args)
     new_prompts = []
     if args.apply_chat_template:
+        if llm.tokenizer is None:
+            raise RuntimeError(
+                "--apply_chat_template requires a loaded tokenizer. "
+                "This checkpoint should provide tokenizer metadata compatible "
+                "with the installed Transformers version.")
         for prompt in prompts:
             messages = [{"role": "user", "content": f"{prompt}"}]
             new_prompts.append(
@@ -415,7 +636,18 @@ def main():
                                                   tokenize=False,
                                                   add_generation_prompt=True))
         prompts = new_prompts
-    llm.generate(prompts, sampling_params)
+    output_file = None
+    if args.output_jsonl:
+        output_dir = os.path.dirname(os.path.abspath(args.output_jsonl))
+        if output_dir:
+            os.makedirs(output_dir, exist_ok=True)
+        output_file = open(args.output_jsonl, "w", encoding="utf-8")
+
+    if args.output_jsonl:
+        print("Skipping initial llm.generate; --output_jsonl captures "
+              "complete generate_async outputs.")
+    else:
+        llm.generate(prompts, sampling_params)
 
     accept_rates = []
     total_tokens = 0
@@ -425,12 +657,30 @@ def main():
         for i, prompt in enumerate(prompts):
             num_tokens = 0
             num_iterations = 0
-            for output in llm.generate_async(prompt,
-                                             sampling_params,
-                                             streaming=True):
-                new_tokens = output.outputs[0].token_ids
-                num_tokens = len(new_tokens)
-                num_iterations += 1
+            output = None
+            start_time = time.time()
+            error = None
+            try:
+                for output in llm.generate_async(prompt,
+                                                 sampling_params,
+                                                 streaming=True):
+                    new_tokens = output.outputs[0].token_ids
+                    num_tokens = len(new_tokens)
+                    num_iterations += 1
+            except Exception as exc:
+                error = repr(exc)
+                raise
+            finally:
+                write_result_row(output_file,
+                                 args,
+                                 prompt_records[i],
+                                 prompt,
+                                 output,
+                                 sample_index=i,
+                                 num_iterations=num_iterations,
+                                 start_time=start_time,
+                                 end_time=time.time(),
+                                 error=error)
             if num_iterations > 0:
                 accept_rate = num_tokens / num_iterations
                 accept_rates.append(accept_rate)
@@ -438,7 +688,7 @@ def main():
                 total_iterations += num_iterations
                 print(f"[{i}] Accept rate: {accept_rate:.2f} "
                       f"(tokens={num_tokens}, iterations={num_iterations})")
-            generated_text = output.outputs[0].text
+            generated_text = output.outputs[0].text if output else ""
             print(
                 f"[{i}] Prompt: {prompt[:80]!r}..., Generated text: {generated_text[:200]!r}..."
             )
@@ -455,6 +705,8 @@ def main():
             print(
                 f"Total tokens: {total_tokens}, Total iterations: {total_iterations}"
             )
+        if output_file:
+            output_file.close()
         return
 
     concurrency = args.concurrency
@@ -470,16 +722,33 @@ def main():
                 future = llm.generate_async(prompt,
                                             sampling_params,
                                             streaming=True)
-                futures.append(future)
+                futures.append((future, time.time()))
 
-            for j, future in enumerate(futures):
+            for j, (future, start_time) in enumerate(futures):
                 i = batch_start + j
                 num_tokens = 0
                 num_iterations = 0
-                for output in future:
-                    new_tokens = output.outputs[0].token_ids
-                    num_tokens = len(new_tokens)
-                    num_iterations += 1
+                output = None
+                error = None
+                try:
+                    for output in future:
+                        new_tokens = output.outputs[0].token_ids
+                        num_tokens = len(new_tokens)
+                        num_iterations += 1
+                except Exception as exc:
+                    error = repr(exc)
+                    raise
+                finally:
+                    write_result_row(output_file,
+                                     args,
+                                     prompt_records[i],
+                                     batch_prompts[j],
+                                     output,
+                                     sample_index=i,
+                                     num_iterations=num_iterations,
+                                     start_time=start_time,
+                                     end_time=time.time(),
+                                     error=error)
                 if num_iterations > 0:
                     accept_rate = num_tokens / num_iterations
                     accept_rates.append(accept_rate)
@@ -487,21 +756,39 @@ def main():
                     total_iterations += num_iterations
                     print(f"[{i}] Accept rate: {accept_rate:.2f} "
                           f"(tokens={num_tokens}, iterations={num_iterations})")
-                generated_text = output.outputs[0].text
+                generated_text = output.outputs[0].text if output else ""
                 print(
-                    f"[{i}] Prompt: {prompt[:80]!r}..., Generated text: {generated_text[:200]!r}..."
+                    f"[{i}] Prompt: {batch_prompts[j][:80]!r}..., Generated text: {generated_text[:200]!r}..."
                 )
     else:
         # Use streaming generate_async to count decode iterations for accept rate
         for i, prompt in enumerate(prompts):
             num_tokens = 0
             num_iterations = 0
-            for output in llm.generate_async(prompt,
-                                             sampling_params,
-                                             streaming=True):
-                new_tokens = output.outputs[0].token_ids
-                num_tokens = len(new_tokens)
-                num_iterations += 1
+            output = None
+            start_time = time.time()
+            error = None
+            try:
+                for output in llm.generate_async(prompt,
+                                                 sampling_params,
+                                                 streaming=True):
+                    new_tokens = output.outputs[0].token_ids
+                    num_tokens = len(new_tokens)
+                    num_iterations += 1
+            except Exception as exc:
+                error = repr(exc)
+                raise
+            finally:
+                write_result_row(output_file,
+                                 args,
+                                 prompt_records[i],
+                                 prompt,
+                                 output,
+                                 sample_index=i,
+                                 num_iterations=num_iterations,
+                                 start_time=start_time,
+                                 end_time=time.time(),
+                                 error=error)
             if num_iterations > 0:
                 accept_rate = num_tokens / num_iterations
                 accept_rates.append(accept_rate)
@@ -509,6 +796,8 @@ def main():
                 total_iterations += num_iterations
                 print(f"[{i}] Accept rate: {accept_rate:.2f} "
                       f"(tokens={num_tokens}, iterations={num_iterations})")
+            if output is None:
+                continue
             for sequence_idx, sequence in enumerate(output.outputs):
                 generated_text = sequence.text
                 sequence_id_text = f"[{sequence_idx}]" if args.max_beam_width > 1 or args.n > 1 else ""
@@ -548,6 +837,14 @@ def main():
         print("=== KV_CACHE_EVENTS_START ===")
         print(json.dumps(events, indent=2))
         print("=== KV_CACHE_EVENTS_END ===")
+
+    if output_file:
+        output_file.close()
+
+    try:
+        llm.shutdown()
+    except Exception as exc:
+        print(f"Warning: LLM shutdown failed: {exc!r}")
 
 
 if __name__ == '__main__':

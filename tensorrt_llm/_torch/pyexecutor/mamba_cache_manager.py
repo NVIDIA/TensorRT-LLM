@@ -1511,26 +1511,51 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
             self.requests.remove(request)
         super().free_resources(request, pin_on_release)
 
-    def _setup_state_indices(self) -> None:
+    def _get_state_block_index(self, request: LlmRequest) -> int:
+        if request.is_context_finished:
+            next_step = self.get_num_tokens(request) - 1
+        elif self.kv_cache_config.enable_block_reuse:
+            next_step = (request.context_current_position - 1 +
+                         request.context_chunk_size)
+        else:
+            next_step = request.prompt_len - 1
+        return next_step // self.tokens_per_block
+
+    def _is_padding_sentinel(self, request_id: int) -> bool:
+        from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import \
+            CUDA_GRAPH_DUMMY_REQUEST_ID
+        max_draft_len = getattr(self.spec_config, "max_draft_len",
+                                0) if self.spec_config is not None else 0
+        return (CUDA_GRAPH_DUMMY_REQUEST_ID - max_draft_len <= request_id <=
+                CUDA_GRAPH_DUMMY_REQUEST_ID)
+
+    def _copy_state_indices_for_request_ids(self, request_ids: List[int],
+                                            block_indices: List[int]) -> None:
         if self.local_num_mamba_layers == 0:
             return
-        block_indices = []
-        for req in self.requests:
-            if req.is_context_finished:
-                next_step = self.get_num_tokens(req) - 1
-            elif self.kv_cache_config.enable_block_reuse:
-                next_step = (req.context_current_position - 1 +
-                             req.context_chunk_size)
-            else:
-                next_step = req.prompt_len - 1
-            block_indices.append(next_step // self.tokens_per_block)
-        self.impl.copy_batch_block_offsets(
-            self.host_block_offsets,
-            [req.py_request_id for req in self.requests], 1, 0)
+        if len(request_ids) > self.max_batch_size:
+            raise RuntimeError(
+                f"Mamba state indices requested for batch size {len(request_ids)}, "
+                f"but max_batch_size is {self.max_batch_size}")
+        if len(request_ids) != len(block_indices):
+            raise RuntimeError(
+                f"request_ids length ({len(request_ids)}) must match "
+                f"block_indices length ({len(block_indices)})")
+
+        unique_request_ids = []
+        unique_positions = {}
+        for request_id in request_ids:
+            if request_id not in unique_positions:
+                unique_positions[request_id] = len(unique_request_ids)
+                unique_request_ids.append(request_id)
+
+        if unique_request_ids:
+            self.impl.copy_batch_block_offsets(self.host_block_offsets,
+                                               unique_request_ids, 1, 0)
 
         max_blocks = self.blocks_per_window[
             LinearCacheType.RECURRENT_STATES.value][0]
-        n = len(self.requests)
+        n = len(request_ids)
         self._host_state_indices.zero_()
         if n > 0:
             # Vectorized gather: replace per-element Python loop with a single
@@ -1538,35 +1563,85 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
             # torch.tensor() conversion here is O(n) at C level, much cheaper
             # than n round-trips through Python indexing.
             bi = torch.tensor(block_indices, dtype=torch.long)
-            rows = self._row_indices[:n]
+            rows = torch.tensor(
+                [unique_positions[request_id] for request_id in request_ids],
+                dtype=torch.long)
             # host_block_offsets: [num_pools, max_batch_size, 2, max_blocks_per_seq]
             values = self.host_block_offsets[self.recurrent_states_pool_index,
                                              rows, 0, bi]
             invalid_mask = (values < 0) | (values >= max_blocks)
             if invalid_mask.any():
                 bad_i = int(invalid_mask.nonzero(as_tuple=False)[0, 0])
-                req = self.requests[bad_i]
+                req = next((request for request in self.requests
+                            if request.py_request_id == request_ids[bad_i]),
+                           None)
                 value = int(values[bad_i])
+                if req is None:
+                    request_details = "request not present in prepared batch"
+                else:
+                    request_details = (
+                        f"prompt_len={req.prompt_len}, "
+                        f"is_context_finished={req.is_context_finished}, "
+                        f"context_current_position={req.context_current_position}, "
+                        f"prepopulated_token_num={req.prepopulated_prompt_len}, "
+                        f"context_chunk_size={req.context_chunk_size if not req.is_context_finished else 'N/A'}"
+                    )
                 raise RuntimeError(
                     f"Invalid recurrent state block index {value} "
                     f"(expected 0 <= index < {max_blocks}) for request {bad_i}, "
-                    f"prompt_len={req.prompt_len}, "
-                    f"is_context_finished={req.is_context_finished}, "
-                    f"context_current_position={req.context_current_position}, "
-                    f"prepopulated_token_num={req.prepopulated_prompt_len}, "
-                    f"context_chunk_size={req.context_chunk_size if not req.is_context_finished else 'N/A'}, "
+                    f"request_id={request_ids[bad_i]}, "
+                    f"{request_details}, "
                     f"block_index for next step is {block_indices[bad_i]}, "
-                    f"\nblock_ids={self.impl.get_cache_block_ids(req.py_request_id, LinearCacheType.RECURRENT_STATES.value)}"
+                    f"\nblock_ids={self.impl.get_cache_block_ids(request_ids[bad_i], LinearCacheType.RECURRENT_STATES.value)}"
                 )
             self._host_state_indices[:n] = values
 
         self.cuda_state_indices.copy_(self._host_state_indices,
                                       non_blocking=True)
 
+    def _setup_state_indices(self) -> None:
+        request_ids = [request.py_request_id for request in self.requests]
+        block_indices = [
+            self._get_state_block_index(request) for request in self.requests
+        ]
+        self._copy_state_indices_for_request_ids(request_ids, block_indices)
+
     def get_state_indices(
             self,
             request_ids: Optional[List[int]] = None,
             is_padding: Optional[List[bool]] = None) -> torch.Tensor:
+        if request_ids is None:
+            return self.cuda_state_indices
+
+        if is_padding is None:
+            is_padding = [False] * len(request_ids)
+        if len(request_ids) != len(is_padding):
+            raise RuntimeError(
+                f"request_ids length ({len(request_ids)}) must match "
+                f"is_padding length ({len(is_padding)})")
+
+        request_by_id = {
+            request.py_request_id: request
+            for request in self.requests
+        }
+        block_indices = []
+        missing_request_ids = []
+        for request_id, padding in zip(request_ids, is_padding):
+            request = request_by_id.get(request_id)
+            if request is not None:
+                block_indices.append(self._get_state_block_index(request))
+            elif padding or self._is_padding_sentinel(request_id):
+                block_indices.append(0)
+            else:
+                missing_request_ids.append(request_id)
+                block_indices.append(0)
+
+        if missing_request_ids:
+            raise RuntimeError(
+                "Mamba state indices requested for IDs that are not in the "
+                f"prepared batch: {missing_request_ids[:8]}")
+
+        self._copy_state_indices_for_request_ids(request_ids, block_indices)
         return self.cuda_state_indices
 
     def calc_next_context_chunk_size(self, request: LlmRequest) -> int:
