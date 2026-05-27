@@ -1033,16 +1033,15 @@ class FlashInferTrtllmGenAttention:
 
         # FlashInfer accepts a split K/V tuple; TensorRT-LLM stores both views
         # in one flat paged KV pool, so both tuple entries intentionally alias.
-        kv_block_scales = None
+        kv_cache_sf = None
         if kv_scale_pool is not None:
-            kv_block_scales = (kv_scale_pool, kv_scale_pool)
+            kv_cache_sf = (kv_scale_pool, kv_scale_pool)
 
         has_fp4_kv = QuantMode(params.kv_cache_quant_mode).has_fp4_kv_cache()
         if has_fp4_kv:
             q_processed = (
-                q_processed.view(torch.uint8)[
-                    : params.num_tokens * self._num_heads * self._head_dim
-                ]
+                q_processed.view(torch.uint8)
+                .flatten()[: params.num_tokens * self._num_heads * self._head_dim]
                 .view(torch.float8_e4m3fn)
                 .view(params.num_tokens, self._num_heads, self._head_dim)
             )
@@ -1067,7 +1066,7 @@ class FlashInferTrtllmGenAttention:
             kv_layout=self._layout,
             sinks=params.forward.attention_sinks,
             uses_shared_paged_kv_idx=self.USE_SHARED_PAGED_KV_IDX,
-            kv_block_scales=kv_block_scales,
+            kv_cache_sf=kv_cache_sf,
             enable_pdl=self._enable_pdl,
         )
 
@@ -1162,16 +1161,15 @@ class FlashInferTrtllmGenAttention:
         decode_cu_seqlens = cu_seqlens if is_multi_token_gen else None
         # FlashInfer accepts a split K/V tuple; TensorRT-LLM stores both views
         # in one flat paged KV pool, so both tuple entries intentionally alias.
-        kv_block_scales = None
+        kv_cache_sf = None
         if kv_scale_pool is not None:
-            kv_block_scales = (kv_scale_pool, kv_scale_pool)
+            kv_cache_sf = (kv_scale_pool, kv_scale_pool)
 
         has_fp4_kv = QuantMode(params.kv_cache_quant_mode).has_fp4_kv_cache()
         if has_fp4_kv:
             q_processed = (
-                q_processed.view(torch.uint8)[
-                    : params.num_tokens * self._num_heads * self._head_dim
-                ]
+                q_processed.view(torch.uint8)
+                .flatten()[: params.num_tokens * self._num_heads * self._head_dim]
                 .view(torch.float8_e4m3fn)
                 .view(params.num_tokens, self._num_heads, self._head_dim)
             )
@@ -1195,7 +1193,7 @@ class FlashInferTrtllmGenAttention:
             max_q_len=decode_max_q_len,
             cum_seq_lens_q=decode_cu_seqlens,
             uses_shared_paged_kv_idx=self.USE_SHARED_PAGED_KV_IDX,
-            kv_block_scales=kv_block_scales,
+            kv_cache_sf=kv_cache_sf,
             enable_pdl=self._enable_pdl,
             backend="trtllm-gen",
         )
