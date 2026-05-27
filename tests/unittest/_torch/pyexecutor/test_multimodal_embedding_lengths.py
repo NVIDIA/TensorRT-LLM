@@ -1,7 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-import gc
 from types import SimpleNamespace
 
 import pytest
@@ -9,18 +8,12 @@ import torch
 
 from tensorrt_llm._torch.pyexecutor.llm_request import (
     LlmRequestState,
-    LlmResponse,
-    LlmResult,
     PyResult,
     get_multimodal_embedding_lengths,
 )
 from tensorrt_llm._torch.pyexecutor.sampler import EarlyStopWithMMResult, MultimodalResult
 from tensorrt_llm._torch.shared_tensor import SharedTensorContainer
-from tensorrt_llm.bindings import executor as tllm
 from tensorrt_llm.bindings.executor import FinishReason
-from tensorrt_llm.executor import GenerationRequest, GenerationResult
-from tensorrt_llm.inputs.multimodal import MultimodalInput, MultimodalParams
-from tensorrt_llm.sampling_params import SamplingParams
 
 
 @pytest.mark.parametrize(
@@ -173,64 +166,6 @@ def test_py_result_mm_embedding_handles_use_shared_tensor_handles():
     assert torch.equal(torch.cat(restored, dim=0), source)
 
 
-def test_py_result_mm_embedding_handles_outlive_source_tensor():
-    result = PyResult(prompt_len=1, max_new_tokens=1)
-
-    def append_from_local_tensor():
-        source = torch.arange(8, dtype=torch.float32).reshape(4, 2)
-        result.append_mm_embeddings(source, [4])
-
-    append_from_local_tensor()
-    gc.collect()
-
-    restored = SharedTensorContainer.from_dict(result.mm_embedding_handles[0]).get_local_view()
-    assert torch.equal(restored, torch.arange(8, dtype=torch.float32).reshape(4, 2))
-
-
-def test_generation_result_owns_mm_embedding_handles_for_disagg_handoff():
-    py_result = PyResult(prompt_len=1, max_new_tokens=1)
-    source = torch.arange(8, dtype=torch.float32).reshape(4, 2)
-    py_result.append_mm_embeddings(source, [4])
-
-    result = tllm.Result()
-    result.output_token_ids = [[1]]
-    result.context_logits = None
-    result.generation_logits = None
-    result.log_probs = None
-    result.cum_log_probs = None
-    result.finish_reasons = [tllm.FinishReason.END_ID]
-    result.is_final = True
-    result.sequence_index = 0
-    response = LlmResponse(
-        request_id=0,
-        result=LlmResult(result, py_result, is_final=True),
-        client_id=0,
-    )
-
-    request = GenerationRequest(
-        prompt_token_ids=[1],
-        sampling_params=SamplingParams(max_tokens=1),
-        multimodal_params=MultimodalParams(
-            multimodal_input=MultimodalInput(
-                multimodal_hashes=[[1, 2, 3, 4, 5, 6, 7, 8]],
-                multimodal_positions=[0],
-                multimodal_lengths=[4],
-            )
-        ),
-    ).set_id(0)
-    generation_result = GenerationResult(request)
-    generation_result._handle_response(response)
-    disagg_params = generation_result.disaggregated_params
-
-    del response, py_result, source
-    gc.collect()
-
-    restored = SharedTensorContainer.from_dict(
-        disagg_params.multimodal_embedding_handles[0]
-    ).get_local_view()
-    assert torch.equal(restored, torch.arange(8, dtype=torch.float32).reshape(4, 2))
-
-
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_py_result_cuda_mm_embedding_handles_stay_cuda_backed():
     """CUDA MM encoder outputs should not move to CPU for handoff handles."""
@@ -242,9 +177,9 @@ def test_py_result_cuda_mm_embedding_handles_stay_cuda_backed():
     handles = result.mm_embedding_handles
     assert handles is not None
     assert [handle["method_key"] for handle in handles] == [1, 1]
-    assert len(result._shared_tensor_lifetime_refs) == 2
-    assert all(tensor.device.type == "cuda" for tensor in result._shared_tensor_lifetime_refs)
-    assert torch.equal(torch.cat(result._shared_tensor_lifetime_refs, dim=0), source)
+    restored = [SharedTensorContainer.from_dict(handle).get_local_view() for handle in handles]
+    assert all(tensor.device.type == "cuda" for tensor in restored)
+    assert torch.equal(torch.cat(restored, dim=0), source)
 
 
 class _FakeScheduledRequests:

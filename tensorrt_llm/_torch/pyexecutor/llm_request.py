@@ -31,14 +31,6 @@ ExecutorResponse = tllm_executor.Response
 ExecutorSamplingConfig = tllm_executor.SamplingConfig
 FinishReason = tllm_executor.FinishReason
 
-
-def _shared_tensor_handle(
-        tensor: torch.Tensor) -> tuple[Dict[str, Any], torch.Tensor]:
-    """Create a shared tensor handle and retain the producer tensor."""
-    tensor = tensor.detach()
-    return SharedTensorContainer.from_tensor(tensor).dump_to_dict(), tensor
-
-
 REQUEST_TYPE_MAPPING = {
     tllm_executor.RequestType.REQUEST_TYPE_CONTEXT_AND_GENERATION:
     LlmRequestType.LLMREQUEST_TYPE_CONTEXT_AND_GENERATION,
@@ -333,7 +325,6 @@ class PyResult:
             chunk_size=self._chunk_size) if return_generation_logits else None
         self._log_probs = LogProbStorage() if return_log_probs else None
         self._mm_embeddings: Optional[List[Dict[str, Any]]] = None
-        self._shared_tensor_lifetime_refs: List[torch.Tensor] = []
         self._mrope_position_ids = None
         self._mrope_position_deltas = None
         self._additional_context_outputs = {
@@ -416,12 +407,10 @@ class PyResult:
                                        mm_embedding_lengths,
                                        dim=0)
 
-        self._shared_tensor_lifetime_refs.clear()
-        self._mm_embeddings = []
-        for emb in split_embeddings:
-            handle, backing_tensor = _shared_tensor_handle(emb)
-            self._mm_embeddings.append(handle)
-            self._shared_tensor_lifetime_refs.append(backing_tensor)
+        self._mm_embeddings = [
+            SharedTensorContainer.from_tensor(emb).dump_to_dict()
+            for emb in split_embeddings
+        ]
         self.diff.mm_embeddings = self._mm_embeddings
 
     def set_mrope_position(
@@ -429,11 +418,10 @@ class PyResult:
         mrope_position_ids: torch.Tensor,
         mrope_position_deltas: torch.Tensor,
     ):
-        self._mrope_position_ids, ids_backing = _shared_tensor_handle(
-            mrope_position_ids)
-        self._mrope_position_deltas, deltas_backing = _shared_tensor_handle(
-            mrope_position_deltas)
-        self._shared_tensor_lifetime_refs.extend([ids_backing, deltas_backing])
+        self._mrope_position_ids = SharedTensorContainer.from_tensor(
+            mrope_position_ids).dump_to_dict()
+        self._mrope_position_deltas = SharedTensorContainer.from_tensor(
+            mrope_position_deltas).dump_to_dict()
         self.diff.mrope_position_ids = self._mrope_position_ids
         self.diff.mrope_position_deltas = self._mrope_position_deltas
 

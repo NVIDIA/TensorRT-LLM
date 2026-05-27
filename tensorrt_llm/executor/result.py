@@ -19,7 +19,6 @@ try:
 except ModuleNotFoundError:
     pass
 
-from .._torch.pyexecutor.llm_request import LlmResult
 from .._utils import nvtx_range_debug
 from ..bindings import executor as tllm
 from ..disaggregated_params import DisaggregatedParams
@@ -59,19 +58,6 @@ TokenLogprobs: TypeAlias = list[dict[int, Logprob]]
 # and the corresponding `logprobs` / `prompt_logprobs` is 0. Avoids the
 # per-token `dict[int, Logprob]` allocation overhead of `TokenLogprobs`.
 SimpleTokenLogprobs: TypeAlias = list[float]
-
-
-def _get_shared_tensor_lifetime_refs(result: LlmResult) -> List[torch.Tensor]:
-    return result._py_result._shared_tensor_lifetime_refs
-
-
-def _retain_shared_tensor_refs(params: DisaggregatedParams,
-                               refs: List[torch.Tensor],
-                               owner_refs: Optional[List[Any]] = None) -> None:
-    if refs:
-        params._shared_tensor_lifetime_refs.extend(refs)
-        if owner_refs is not None:
-            owner_refs.extend(refs)
 
 
 class LogProbsResult(NamedTuple):
@@ -222,7 +208,6 @@ class GenerationResultBase:
             CompletionOutput(i) for i in range(self.sampling_params.best_of)
         ]
         self._context_logits: Optional[torch.Tensor] = None
-        self._shared_tensor_lifetime_refs: List[Any] = []
         # Request-level time breakdown (PyTorch backend); not on CompletionOutput to avoid API churn.
         self.time_breakdown_metrics: Optional[Dict] = None
 
@@ -559,12 +544,6 @@ class GenerationResultBase:
             if response_result.context_logits is not None:
                 self._context_logits = response_result.context_logits
 
-            if isinstance(response_result, LlmResult):
-                lifetime_refs = _get_shared_tensor_lifetime_refs(
-                    response_result)
-            else:
-                lifetime_refs = []
-            retained_shared_tensor_handles = False
             if hasattr(response_result, "mm_embedding_handles"
                        ) and response_result.mm_embedding_handles is not None:
                 mm_embedding_handles = response_result.mm_embedding_handles
@@ -575,7 +554,6 @@ class GenerationResultBase:
                     self._disaggregated_params = DisaggregatedParams(
                         multimodal_embedding_handles=mm_embedding_handles,
                         multimodal_hashes=self._multimodal_hashes)
-                retained_shared_tensor_handles = True
 
             # Handle mrope handles for both:
             # 1. Regular mm_embedding case (disaggregated_params was just created/updated above)
@@ -587,13 +565,6 @@ class GenerationResultBase:
                     response_result.mrope_position_ids_handle)
                 self._disaggregated_params.mrope_position_deltas_handle = (
                     response_result.mrope_position_deltas_handle)
-                retained_shared_tensor_handles = True
-
-            if (retained_shared_tensor_handles
-                    and self._disaggregated_params is not None):
-                _retain_shared_tensor_refs(self._disaggregated_params,
-                                           lifetime_refs,
-                                           self._shared_tensor_lifetime_refs)
 
             # Processing background errors here ASAF during generation.
             if self._background_error_handler and (
@@ -853,23 +824,8 @@ class GenerationResult(GenerationResultBase):
             postproc_params=generation_request.postproc_params,
         )
         self._generation_request = generation_request
-        multimodal_params = getattr(generation_request, "multimodal_params",
-                                    None)
-        if multimodal_params is not None:
-            # `generate_async` deletes `request.multimodal_params` after
-            # submit(), but multiprocess workers may restore request-side shared
-            # tensor handles later. Keep only the producer-side tensor refs here.
-            self._shared_tensor_lifetime_refs.extend(
-                getattr(multimodal_params, "_shared_tensor_lifetime_refs", []))
         self._streaming = generation_request.streaming
         self._disaggregated_params = disaggregated_params
-        if disaggregated_params is not None:
-            # E/P/D prefill requests park encoder-produced embedding handles in
-            # `multimodal_params.multimodal_data`; the backing refs live on
-            # DisaggregatedParams, not on MultimodalParams.
-            self._shared_tensor_lifetime_refs.extend(
-                getattr(disaggregated_params, "_shared_tensor_lifetime_refs",
-                        []))
         # minimal sampling params needed for logprob calculation
         self._logprob_params = logprob_params
         self.trace_headers = generation_request.trace_headers

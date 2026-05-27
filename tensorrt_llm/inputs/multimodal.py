@@ -496,27 +496,11 @@ class MultimodalParams:
     multimodal_input: Optional[MultimodalInput] = None
     multimodal_data: Optional[Dict[str, Any]] = field(default_factory=dict)
     multimodal_runtime: Optional[MultimodalRuntimeData] = None
-    _shared_tensor_lifetime_refs: List[Any] = field(default_factory=list,
-                                                    repr=False,
-                                                    compare=False)
 
     def __post_init__(self):
         """Ensure default values are properly set."""
         if self.multimodal_data is None:
             self.multimodal_data = {}
-
-    def __getstate__(self) -> Dict[str, Any]:
-        state = {
-            name: getattr(self, name)
-            for name in self.__dataclass_fields__
-            if name != "_shared_tensor_lifetime_refs"
-        }
-        return state
-
-    def __setstate__(self, state: Dict[str, Any]) -> None:
-        for name, value in state.items():
-            setattr(self, name, value)
-        self._shared_tensor_lifetime_refs = []
 
     def _is_shared_tensor_dict(self, obj: Any) -> bool:
         """Check if an object is a shared tensor dictionary.
@@ -618,12 +602,8 @@ class MultimodalParams:
                     # Import here to avoid circular imports
                     from tensorrt_llm._torch.shared_tensor import \
                         SharedTensorContainer
-                    handle = SharedTensorContainer.from_tensor(
+                    return SharedTensorContainer.from_tensor(
                         input_data).dump_to_dict()
-                    lifetime_refs = kwargs.get("lifetime_refs")
-                    if lifetime_refs is not None:
-                        lifetime_refs.append(input_data)
-                    return handle
                 except Exception as e:
                     raise RuntimeError(
                         f"Failed to convert tensor to shared tensor: {e}")
@@ -666,9 +646,7 @@ class MultimodalParams:
         if data is None:
             return  # Nothing to convert
 
-        self._shared_tensor_lifetime_refs.clear()
-        transformed_data = self._apply_tensor_operation(
-            data, "to_handle", lifetime_refs=self._shared_tensor_lifetime_refs)
+        transformed_data = self._apply_tensor_operation(data, "to_handle")
         setattr(self, element, transformed_data)
 
     def to_tensor(self, element: str) -> None:
@@ -690,8 +668,7 @@ class MultimodalParams:
         if data is None:
             return  # Nothing to restore
 
-        restored_data = self._apply_tensor_operation(
-            data, "to_tensor", lifetime_refs=self._shared_tensor_lifetime_refs)
+        restored_data = self._apply_tensor_operation(data, "to_tensor")
         setattr(self, element, restored_data)
 
     def to_device(self,
