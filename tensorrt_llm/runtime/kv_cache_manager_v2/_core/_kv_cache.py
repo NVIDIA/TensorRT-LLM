@@ -1131,6 +1131,13 @@ class _KVCache:
             # We can't commit and can't reuse existing block. Just stop committing.
             self._commit_state = self.CommitState.VIRTUAL_STOP
 
+        if seq_block.is_committed:
+            for lc_idx, lc in self.manager._life_cycles.attention_life_cycles():
+                stale_range = _KVCache._get_stale_range(tokens_per_block, self.history_length, lc)
+                if ordinal in stale_range:
+                    for beam_block in seq_block.pages:
+                        beam_block[lc_idx] = None
+
         if is_last or self._commit_state == self.CommitState.VIRTUAL_STOP:
             self._commit_state = self.CommitState.USER_STOP
             self._on_stop_committing()
