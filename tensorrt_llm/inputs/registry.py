@@ -1137,8 +1137,8 @@ def create_input_processor_with_hash(
             multimodal_embedding_lengths = (
                 _find_mm_embedding_lengths_from_masks(mm_mask, embed_mask,
                                                       num_mm_tokens))
-        extra_processed_inputs["multimodal_data"].setdefault(
-            "multimodal_embedding_lengths", multimodal_embedding_lengths)
+        extra_processed_inputs["multimodal_data"][
+            "multimodal_embedding_lengths"] = multimodal_embedding_lengths
         # Store special token offsets if available
         if len(start_special_token_positions
                ) > 0 and mm_special_token_ids is not None:

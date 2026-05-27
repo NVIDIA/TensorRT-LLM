@@ -71,11 +71,14 @@ def _expand_prompt_token_ids_for_mm_handoff(
 ) -> DisaggPrefillMultimodalInputs:
     """Expand Qwen3-VL image/video placeholders and emit sparse MM layout.
 
-    Qwen3-VL needs a bespoke single-pass expander because the handoff must
-    preserve per-item image/video type and treat the preceding vision_start
-    token as an item-specific leading special token. Generic one-run-per-item
-    layouts do not carry that item type, and Nano's generic non-contiguous-run
-    path does not need to distinguish image vs video placeholders this way.
+    Qwen handoff has one coarse <image_pad> or <video_pad> token per item.
+    This helper expands that one token to the number of embedding rows in the
+    handoff handle, then returns the sparse layout metadata.
+
+    Agg gets this expansion from Qwen's HF processor taking raw images/videos
+    as inputs. Reusing that would be wasteful here, hence this helper that
+    expands based on the embedding handles row count.
+
     """
     placeholder_positions = [
         pos
@@ -355,37 +358,16 @@ class Qwen3VLInputProcessorBase(BaseMultimodalInputProcessor, BaseMultimodalDumm
         video_grid_thw: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> int:
-        merge = self.config.vision_config.spatial_merge_size
-        if video_grid_thw is not None:
-            grid_thw = torch.as_tensor(video_grid_thw)
-            if grid_thw.ndim == 1:
-                grid_thw = grid_thw.reshape(1, 3)
-            if grid_thw.ndim != 2 or grid_thw.shape[-1] != 3:
-                raise ValueError("video_grid_thw must have shape [3] or [num_segments, 3]")
-            return sum(
-                int(t) * (int(h) // merge) * (int(w) // merge) for t, h, w in grid_thw.tolist()
+        if video_grid_thw is None:
+            raise ValueError(
+                "Qwen3-VL video token count requires processor-produced video_grid_thw"
             )
 
-        # Must run the full processor: HF's Qwen3VLProcessor._get_num_multimodal_tokens
-        # (what the base class default delegates to) raises on video-only calls
-        # and returns a wrong-formula fallback that would break chunked prefill.
-        do_rescale = not (video and isinstance(video[0], torch.Tensor))
-        processed = self._processor(
-            text=["<|vision_start|><|video_pad|><|vision_end|>"],
-            videos=[video],
-            padding=True,
-            do_rescale=do_rescale,
-            return_tensors="pt",
-            **kwargs,
+        merge = self.config.vision_config.spatial_merge_size
+        token_counts = (
+            video_grid_thw[:, 0] * (video_grid_thw[:, 1] // merge) * (video_grid_thw[:, 2] // merge)
         )
-        vgt = processed.get("video_grid_thw")
-        if vgt is None or len(vgt) == 0:
-            raise RuntimeError(
-                "get_num_tokens_per_video: HF processor returned no "
-                "video_grid_thw for the provided video."
-            )
-        t, h, w = (int(x) for x in vgt[0].tolist())
-        return t * (h // merge) * (w // merge)
+        return int(token_counts.sum().item())
 
     def _preprocess(
         self, text: Dict[str, Any], mm_data: Dict[str, Any], mm_processor_kwargs: Dict[str, Any]

@@ -12,7 +12,10 @@ from tensorrt_llm.inputs.multimodal import (
     _find_mm_embedding_lengths_from_masks,
     find_mm_token_lengths,
 )
-from tensorrt_llm.inputs.registry import maybe_compute_mm_embed_cumsum
+from tensorrt_llm.inputs.registry import (
+    create_input_processor_with_hash,
+    maybe_compute_mm_embed_cumsum,
+)
 
 
 def test_maybe_compute_mm_embed_cumsum_populates_py_multimodal_data():
@@ -40,6 +43,56 @@ def test_maybe_compute_mm_embed_cumsum_populates_py_multimodal_data():
         rtol=0,
         atol=0,
     )
+
+
+def test_tokenized_multimodal_overwrites_stale_embedding_lengths():
+    """Final expanded prompt layout wins over dummy-placeholder metadata."""
+
+    class FakeProcessor:
+        multimodal_hashing_supported = True
+
+        def get_text_with_mm_placeholders(self, mm_counts):
+            assert mm_counts == {"image": 1}
+            return "<image>"
+
+        def __call__(self, inputs, sampling_params):
+            assert inputs["prompt"] == "<image>"
+            return [999], {
+                "multimodal_data": {
+                    "multimodal_embedding_lengths": [999],
+                }
+            }
+
+        def get_num_tokens_per_image(self, *, image):
+            torch.testing.assert_close(image, torch.tensor([1]))
+            return 4
+
+        def expand_prompt_token_ids_for_mm(self, prompt_token_ids, num_mm_tokens, **kwargs):
+            assert prompt_token_ids == [10, 98, 20]
+            assert num_mm_tokens == [4]
+            return [10, 101, 102, 200, 103, 20], None
+
+        def get_vocab_size(self):
+            return 100
+
+        def get_mm_token_ids(self):
+            return None
+
+        def get_mm_special_token_ids(self):
+            return torch.tensor([200])
+
+    input_processor = create_input_processor_with_hash(FakeProcessor())
+
+    prompt_token_ids, extra = input_processor(
+        {
+            "prompt_token_ids": [10, 98, 20],
+            "multi_modal_data": {"image": [torch.tensor([1])]},
+        },
+        sampling_params=None,
+    )
+
+    assert prompt_token_ids == [10, 101, 102, 200, 103, 20]
+    assert extra["multimodal_data"]["multimodal_embedding_lengths"] == [3]
 
 
 def test_multimodal_embedding_lengths_exclude_special_tokens():
@@ -72,6 +125,8 @@ def test_find_mm_token_lengths_passes_all_grid_rows_for_single_video():
     class FakeVideoProcessor:
         def get_num_tokens_per_video(self, *, video, video_grid_thw=None):
             assert video == ["frame"]
+            assert isinstance(video_grid_thw, torch.Tensor)
+            assert video_grid_thw.device.type == "cpu"
             torch.testing.assert_close(
                 video_grid_thw,
                 torch.tensor([[1, 8, 10], [1, 8, 10]]),
@@ -83,8 +138,25 @@ def test_find_mm_token_lengths_passes_all_grid_rows_for_single_video():
     assert find_mm_token_lengths(
         {"video": [["frame"]]},
         FakeVideoProcessor(),
-        multimodal_data={"video": {"video_grid_thw": torch.tensor([[1, 8, 10], [1, 8, 10]])}},
+        multimodal_data={"video": {"video_grid_thw": [[1, 8, 10], [1, 8, 10]]}},
     ) == {"video": [40]}
+
+
+def test_find_mm_token_lengths_preserves_2d_grid_rows_per_video():
+    """One-row-per-video grids stay as [1, 3] CPU tensors."""
+
+    class FakeVideoProcessor:
+        def get_num_tokens_per_video(self, *, video, video_grid_thw=None):
+            assert isinstance(video_grid_thw, torch.Tensor)
+            assert video_grid_thw.device.type == "cpu"
+            assert tuple(video_grid_thw.shape) == (1, 3)
+            return int(video_grid_thw[0, 0].item())
+
+    assert find_mm_token_lengths(
+        {"video": [["frame0"], ["frame1"]]},
+        FakeVideoProcessor(),
+        multimodal_data={"video": {"video_grid_thw": torch.tensor([[1, 8, 10], [2, 8, 10]])}},
+    ) == {"video": [1, 2]}
 
 
 def test_disagg_prefill_multimodal_inputs_builds_typed_handoff():

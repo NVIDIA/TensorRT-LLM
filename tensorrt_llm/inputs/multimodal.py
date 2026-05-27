@@ -950,6 +950,13 @@ def find_mm_token_lengths(
 
     mm_video_dict = (multimodal_data or {}).get("video") or {}
     video_grid_thw = mm_video_dict.get("video_grid_thw")
+    if video_grid_thw is not None:
+        video_grid_thw = torch.as_tensor(video_grid_thw)
+        assert video_grid_thw.device.type == "cpu", (
+            "video_grid_thw must be CPU-resident when computing "
+            f"multimodal metadata, got {video_grid_thw.device}.")
+        if video_grid_thw.ndim != 2 or video_grid_thw.shape[-1] != 3:
+            raise ValueError("video_grid_thw must have shape [num_segments, 3]")
 
     for modality, items in mm_items.items():
         if not hasattr(input_processor, f"get_num_tokens_per_{modality}"):
@@ -959,14 +966,14 @@ def find_mm_token_lengths(
 
         video_grid_thw_for_items = None
         if modality == "video" and video_grid_thw is not None:
-            if len(video_grid_thw) == len(items):
+            if len(items) == 1:
                 video_grid_thw_for_items = video_grid_thw
-            elif len(items) == 1:
-                video_grid_thw_for_items = [video_grid_thw]
+            elif video_grid_thw.shape[0] == len(items):
+                video_grid_thw_for_items = video_grid_thw
             else:
                 logger.warning(
                     "find_mm_token_lengths: video_grid_thw row count "
-                    f"({len(video_grid_thw)}) does not match number of "
+                    f"({video_grid_thw.shape[0]}) does not match number of "
                     f"videos in mm_data ({len(items)}); falling back to "
                     "per-item recompute without video_grid_thw.")
 
@@ -997,8 +1004,9 @@ def find_mm_token_lengths(
                     # metadata route. Keep this for now: Qwen3-VL needs the
                     # processor-produced video_grid_thw for correct video token
                     # counts.
-                    call_kwargs["video_grid_thw"] = video_grid_thw_for_items[
-                        idx]
+                    call_kwargs["video_grid_thw"] = (
+                        video_grid_thw_for_items if len(items) == 1 else
+                        video_grid_thw_for_items[idx:idx + 1])
                 num_tokens = input_processor.get_num_tokens_per_video(
                     **call_kwargs)
                 modality_token_lengths.append(num_tokens)
