@@ -52,6 +52,9 @@ def get_spec_metadata(spec_config,
             max_num_requests=max_num_requests,
             mtp_hidden_states_manager=spec_resource_manager,
             allow_advanced_sampling=spec_config.allow_advanced_sampling,
+            use_rejection_sampling=use_rejection_sampling
+            and spec_config.spec_dec_mode.is_mtp_eagle_one_model(),
+            vocab_size=vocab_size,
         )
     if spec_config.spec_dec_mode.is_mtp_eagle():
         return Eagle3SpecMetadata(

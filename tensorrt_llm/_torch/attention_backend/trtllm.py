@@ -13,13 +13,16 @@ if TYPE_CHECKING:
 
 from tensorrt_llm._torch.attention_backend import trtllm_gen
 from tensorrt_llm._utils import get_sm_version, maybe_pin_memory, prefer_pinned
+from tensorrt_llm.bindings import DataType
 from tensorrt_llm.bindings.internal import thop
 from tensorrt_llm.functional import AttentionMaskType
 from tensorrt_llm.llmapi import SkipSoftmaxAttentionConfig
+from tensorrt_llm.logger import logger
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
 from ..utils import (compute_swizzled_sf_shape, get_global_attrs,
                      get_model_extra_attrs)
+from .fp4_mla_kv import HP_BLOCK_SIZE, update_hp_kv_for_fp4_mla
 from .interface import (AttentionBackend, AttentionForwardArgs,
                         AttentionInputType, AttentionMask, AttentionMetadata,
                         KVCacheParams, MLAParams, PositionalEmbeddingParams,
@@ -120,6 +123,25 @@ class TrtllmAttentionMetadata(AttentionMetadata):
     kv_cache_block_offsets: Optional[torch.Tensor] = None
     host_kv_cache_block_offsets: Optional[torch.Tensor] = None
     draft_kv_cache_block_offsets: Optional[torch.Tensor] = None
+
+    # Per-request seq_slot from SeqSlotManager (stable across steps).
+    # GPU tensor with stable address for CUDA graph compatibility.
+    # Shape: [max_num_sequences], int32. Values copied each step.
+    seq_slots: Optional[torch.Tensor] = None
+    seq_slots_cpu: Optional[torch.Tensor] = None
+
+    # True during warmup forward passes (dummy requests, no real data).
+    is_warmup: bool = False
+
+    # High-precision BF16 KV pool for MLA FP4 models, indexed by seq_slot.
+    # Shape: [max_num_sequences, num_local_layers, kv_factor, HP_BLOCK_SIZE * head_dim]
+    # Standalone tensor, not part of the block-based paged KV cache.
+    high_precision_kv_pool: Optional[torch.Tensor] = None
+    fp4_mla_hp_snapshot_pool: Optional[torch.Tensor] = None
+    # Ownership tracking: maps seq_slot to request_id that last wrote it.
+    # Plain Python dict, updated during context phase, checked during decode.
+    # Debug only; runs outside CUDA graph.
+    hp_pool_owners: Optional[dict] = None
 
     # Pre-computed FlashMLA tile-scheduler metadata and num_splits.
     # Computed once per forward pass in TrtllmAttention.forward() and reused across layers.
@@ -344,6 +366,58 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                     device='cpu',
                     pin_memory=prefer_pinned(),
                 )
+
+        # Allocate high-precision BF16 KV pool for MLA FP4 models.
+        # Standalone tensor indexed by seq_slot, not part of block-based paged KV cache.
+        # Each sequence gets a circular buffer of HP_BLOCK_SIZE=16 recent tokens at BF16.
+        if (self.kv_cache_manager is not None
+                and self.kv_cache_manager.kv_factor == 1
+                and self.kv_cache_manager.dtype == DataType.NVFP4):
+
+            self.seq_slots = self.get_empty(
+                buffers,
+                (self.max_num_sequences, ),
+                cache_name="seq_slots",
+                dtype=torch.int32,
+                capture_graph=capture_graph,
+            )
+            self.seq_slots_cpu = torch.empty(
+                self.max_num_sequences,
+                dtype=torch.int32,
+                device='cpu',
+                pin_memory=prefer_pinned(),
+            )
+            self.hp_pool_owners = {}
+            num_local_layers = self.kv_cache_manager.num_local_layers
+            head_dim = self.kv_cache_manager.head_dim
+            kv_factor = self.kv_cache_manager.kv_factor
+            self.high_precision_kv_pool = self.get_empty(
+                buffers,
+                [
+                    self.max_num_sequences, num_local_layers, kv_factor,
+                    HP_BLOCK_SIZE * head_dim
+                ],
+                cache_name="high_precision_kv_pool",
+                dtype=torch.bfloat16,
+                capture_graph=capture_graph,
+            )
+            if capture_graph:
+                self.fp4_mla_hp_snapshot_pool = self.get_empty(
+                    buffers,
+                    [
+                        self.max_num_sequences, num_local_layers, kv_factor,
+                        HP_BLOCK_SIZE * head_dim
+                    ],
+                    cache_name="fp4_mla_hp_snapshot_pool",
+                    dtype=torch.bfloat16,
+                    capture_graph=capture_graph,
+                )
+            else:
+                self.fp4_mla_hp_snapshot_pool = None
+            logger.info(
+                f"Allocated high-precision BF16 KV pool: shape="
+                f"{list(self.high_precision_kv_pool.shape)}, "
+                f"size={self.high_precision_kv_pool.nbytes / (1 << 20):.1f} MB")
 
         # Allocate static buffers for helix parallelism support.
         if self.enable_helix:
@@ -1513,6 +1587,25 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                     f"SKIP_SOFTMAX_STAT: layer{self.layer_idx}: {skipped_blocks} / {total_blocks}"
                     f" = {skipped_blocks / total_blocks * 100: .2f}%")
 
+    def _update_high_precision_kv_for_fp4_mla(
+        self,
+        metadata: TrtllmAttentionMetadata,
+        latent_cache: Optional[torch.Tensor],
+        attention_input_type: AttentionInputType = AttentionInputType.mixed,
+    ) -> None:
+        """Thin wrapper over the shared HP-pool update helper (see
+        ``fp4_mla_kv.update_hp_kv_for_fp4_mla`` for the full contract)."""
+        if attention_input_type == AttentionInputType.context_only:
+            phase = "context"
+        elif attention_input_type == AttentionInputType.generation_only:
+            phase = "generation"
+        else:
+            phase = "all"
+        update_hp_kv_for_fp4_mla(metadata,
+                                 latent_cache,
+                                 self.get_local_layer_idx(metadata),
+                                 phase=phase)
+
     def forward(
         self,
         q: torch.Tensor,
@@ -1608,6 +1701,12 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                                is not None
                                and metadata._seq_lens_cuda is not None):
             metadata.update_blackwell_first_sparse_mask_offset()
+
+        # High-precision BF16 KV pool hooks (MLA FP4 only).
+        if metadata.high_precision_kv_pool is not None and self.is_mla_enable:
+            self._update_high_precision_kv_for_fp4_mla(
+                metadata, forward_args.latent_cache,
+                forward_args.attention_input_type)
 
         self._run(q, k, v, output, output_sf, metadata, forward_args,
                   use_paged_context_fmha, sparse_kv_indices, sparse_kv_offsets,
