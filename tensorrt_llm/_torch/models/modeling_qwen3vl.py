@@ -1245,6 +1245,17 @@ class Qwen3VLModelBase(PreTrainedModel):
 
         llm_model_config = copy.deepcopy(model_config)
         llm_model_config.pretrained_config = config.text_config
+        # The LM's attention modules look themselves up in the global
+        # ``extra_attrs`` that ``model_engine.model_forward`` binds via
+        # ``with_model_extra_attrs(self.model.extra_attrs)`` -- the
+        # outer wrapper's dict. Without sharing, ``llm_model_config``
+        # carries a deep-copied dict, so LM ``attn_custom_op_inplace``
+        # (used under ``set_torch_compiling(True)``) fails its layer
+        # lookup and the piecewise-CUDA-graph dynamo trace blows up
+        # at the LM's ``o_proj`` call. Vision attention unregisters
+        # itself from this dict in ``Qwen2_5_VLVisionAttention.__init__``
+        # so it does not poison LM lookups.
+        llm_model_config.extra_attrs = model_config.extra_attrs
         if self.original_arch == "Qwen3VLForConditionalGeneration":
             llm_model_config.pretrained_config.architectures = ["Qwen3ForCausalLM"]
         elif self.original_arch == "Qwen3VLMoeForConditionalGeneration":

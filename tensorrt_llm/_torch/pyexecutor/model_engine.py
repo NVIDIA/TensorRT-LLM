@@ -462,6 +462,19 @@ class PyTorchModelEngine(ModelEngine):
                         self.model.model,
                         backend=self._torch_compile_backend,
                         fullgraph=torch_compile_fullgraph)
+                elif hasattr(self.model, "llm") and isinstance(
+                        getattr(self.model.llm, "model", None),
+                        torch.nn.Module):
+                    # Multi-modal wrapper (e.g. Qwen2/3-VL): compile only the
+                    # text decoder. Tracing the outer wrapper pulls the
+                    # vision-tower output path + ``fuse_input_embeds`` into
+                    # the same graph, which lets the vision hidden_dim
+                    # propagate into the LM o_proj fake-tensor trace and
+                    # blows up the piecewise CUDA graph warmup.
+                    self.model.llm.model = torch.compile(
+                        self.model.llm.model,
+                        backend=self._torch_compile_backend,
+                        fullgraph=torch_compile_fullgraph)
                 else:
                     self.model = torch.compile(
                         self.model,
