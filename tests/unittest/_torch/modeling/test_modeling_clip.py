@@ -76,6 +76,8 @@ class TestCLIPVisionModel(unittest.TestCase):
         )
 
         tllm_model = CLIPVisionModel(model_config).to(dtype).to(device)
+        # Engine normally calls this after model load; standalone tests must do it themselves.
+        tllm_model.setup_attn_metadata(max_num_requests=8192, max_num_tokens=8192)
         # Use the load_weights method we are testing
         tllm_model.load_weights(hf_model.state_dict())
 
