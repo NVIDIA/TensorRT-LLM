@@ -30,6 +30,7 @@ from ...custom_ops.attention_interface import (
     AttentionRegistry,
     Constant,
     PrepareMetadataCallable,
+    ResourceHandler,
 )
 from ...custom_ops.semantic_mask_registry import SemanticMaskRegistry
 from ...models.factory import ModelFactory
@@ -196,9 +197,24 @@ class _InsertCachedOperator(BaseTransform):
             prep_meta_host_op, list(sig.parameters.keys())
         )
 
-    def _process_cache_node(self, gm: GraphModule, cache_name: str) -> Node:
-        """Process the cache nodes by inserting a cached attention replacement op."""
-        return add_graph_input(gm, cache_name)
+    def _process_cache_node(
+        self,
+        gm: GraphModule,
+        cm: CachedSequenceInterface,
+        cache_name: str,
+        resource_handler: ResourceHandler,
+    ) -> Node:
+        """Process the cache nodes by inserting a cached attention replacement op.
+
+        Sets ``node.meta['val']`` on the newly created placeholder so that FX shape
+        propagation can flow shapes through the cached attention op that will
+        consume this cache. The actual tensor is only allocated later (by
+        ``InitializeCache``); here we only seed a shape/dtype hint.
+        """
+        val = resource_handler.get_fake_val(cm.info)
+        if val is None:
+            return add_graph_input(gm, cache_name)
+        return add_graph_input(gm, cache_name, val=val)
 
     def _insert_cached_attn_node(
         self,
@@ -299,7 +315,9 @@ class _InsertCachedOperator(BaseTransform):
                     attn_node, cm.kv_cache_config
                 ).items():
                     resource_name = cm.add_resource(k, resource_handler)
-                    cache_in_nodes.append(self._process_cache_node(gm, resource_name))
+                    cache_in_nodes.append(
+                        self._process_cache_node(gm, cm, resource_name, resource_handler)
+                    )
                 if layer_idx is not None:
                     cache_nodes_by_layer_idx[layer_idx] = cache_in_nodes
 

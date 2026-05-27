@@ -247,7 +247,13 @@ class HFReplaceCachedAttn(_InsertCachedOperator):
         }
         return ret_names
 
-    def _process_cache_node(self, gm: GraphModule, cache_name: str) -> Node:
+    def _process_cache_node(
+        self,
+        gm: GraphModule,
+        cm: CachedSequenceInterface,
+        cache_name: str,
+        resource_handler,
+    ) -> Node:
         """We don't need to actually do anything here, just return the cache name."""
         return cache_name
 
