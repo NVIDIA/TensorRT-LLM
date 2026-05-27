@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -530,17 +530,6 @@ bool getEnvDisableChunkedAttentionInGenPhase()
     return getBoolEnv("TRTLLM_DISABLE_CHUNKED_ATTENTION_IN_GEN_PHASE");
 }
 
-bool getEnvMoeA2AOneBlockPerToken()
-{
-    // Default true; return false only if env set to "0"
-    static std::optional<int32_t> const val = getIntEnv("TLLM_MOE_A2A_ONE_BLOCK_PER_TOKEN");
-    if (!val.has_value())
-    {
-        return true;
-    }
-    return val.value() != 0;
-}
-
 static int sanitizeBlockSize(std::optional<int32_t> const& val)
 {
     // Default 256 when not set or invalid
@@ -557,15 +546,31 @@ static int sanitizeBlockSize(std::optional<int32_t> const& val)
     return block;
 }
 
+// Read an integer env var and sanitize it as a CUDA block size. Treats malformed
+// values (e.g. non-numeric strings that would throw inside std::stoi) as unset and
+// falls back to the default, so this debug knob never becomes a hard failure.
+static int getSanitizedBlockSizeFromEnv(char const* name)
+{
+    try
+    {
+        return sanitizeBlockSize(getIntEnv(name));
+    }
+    catch (std::exception const&)
+    {
+        TLLM_LOG_WARNING("Invalid value for %s. Falling back to default block size.", name);
+        return sanitizeBlockSize(std::nullopt);
+    }
+}
+
 int getEnvMoeA2ADispatchBlockSize()
 {
-    static int const kBlock = sanitizeBlockSize(getIntEnv("TLLM_MOE_A2A_DISPATCH_BLOCK_SIZE"));
+    static int const kBlock = getSanitizedBlockSizeFromEnv("TLLM_MOE_A2A_DISPATCH_BLOCK_SIZE");
     return kBlock;
 }
 
 int getEnvMoeA2ACombineBlockSize()
 {
-    static int const kBlock = sanitizeBlockSize(getIntEnv("TLLM_MOE_A2A_COMBINE_BLOCK_SIZE"));
+    static int const kBlock = getSanitizedBlockSizeFromEnv("TLLM_MOE_A2A_COMBINE_BLOCK_SIZE");
     return kBlock;
 }
 

@@ -17,18 +17,19 @@
 #pragma once
 
 #include <cute/layout.hpp>
-#include <cutlass/pipeline/pipeline.hpp>
-#include <cutlass/pipeline/sm90_pipeline.hpp>
 #include <cutlass/gemm_coord.h>
 #include <cutlass/cutlass.h>
-#include <cutlass/gemm/kernel/sm90_tile_scheduler.hpp>
-#include <cutlass/gemm/kernel/sm100_tile_scheduler.hpp>
+
+#include "CutlassSm90Pipeline.h"
+#include "CutlassSm100Pipeline.h"
+#include "CutlassSm90TileScheduler.h"
+#include "CutlassSm100TileScheduler.h"
 
 #include <cuda_ptx/cuda_ptx.h>
 
 #include "Utils.h"
 
-namespace cutlass {
+namespace trtllm::dev {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 // *************************************************************************************************
@@ -36,21 +37,21 @@ namespace cutlass {
 // *************************************************************************************************
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-// This class customizes cutlass::PipelineTmaUmmaAsync to allow for multiple UMMA consumers.
+// This class customizes PipelineTmaUmmaAsync to allow for multiple UMMA consumers.
 // The TMA producer is consumed by more than one UMMA consumers.
 template <int Stages_,
           cutlass::McastDirection mcastDirection = cutlass::McastDirection::kRowCol,
           class ClusterShape = cute::Shape<int, int, cute::_1>,
           class AtomThrShape_MNK_ = cute::Shape<cute::_1, cute::_1, cute::_1>>
 class PipelineTmaMultiUmmaAsync
-  : public cutlass::PipelineTmaUmmaAsync<Stages_, ClusterShape, AtomThrShape_MNK_> {
+  : public PipelineTmaUmmaAsync<Stages_, ClusterShape, AtomThrShape_MNK_> {
 
 public:
   static constexpr uint32_t Stages = Stages_;
   using AtomThrShape_MNK = AtomThrShape_MNK_;
 
 private:
-  using Base = cutlass::PipelineTmaUmmaAsync<Stages_, ClusterShape, AtomThrShape_MNK_>;
+  using Base = PipelineTmaUmmaAsync<Stages_, ClusterShape, AtomThrShape_MNK_>;
 
 public:
   using FullBarrier = typename Base::FullBarrier;
@@ -58,14 +59,11 @@ public:
   using ProducerBarrierType = typename Base::ProducerBarrierType;
   using ConsumerBarrierType = typename Base::ConsumerBarrierType;
   using PipelineState = typename Base::PipelineState;
-  using SharedStorage = typename Base::SharedStorage;
   using ThreadCategory = typename Base::ThreadCategory;
   using Params = typename Base::Params;
 
-  using McastDirection = cutlass::McastDirection;
-
-  // Helper function to initialize barriers.
-  static CUTLASS_DEVICE void init_barriers(SharedStorage& storage,
+  static CUTLASS_DEVICE void init_barriers(FullBarrier* full_barrier_ptr,
+                                           EmptyBarrier* empty_barrier_ptr,
                                            int warpId,
                                            Params params,
                                            ClusterShape cluster_shape) {
@@ -86,37 +84,33 @@ public:
           cute::size<0>(cluster_shape) / cute::size<0>(atom_thr_shape);
       }
 
-      cutlass::arch::detail::initialize_barrier_array_pair_aligned<decltype(storage.full_barrier_),
-                                                                   decltype(storage.empty_barrier_),
-                                                                   Stages>(
-        storage.full_barrier_,
-        storage.empty_barrier_,
-        producer_arv_cnt,
-        multicast_consumer_arrival_count * params.num_consumers); // Multi-UMMA consumers.
+      cutlass::arch::detail::
+        initialize_barrier_array_pair_aligned<FullBarrier*, EmptyBarrier*, Stages>(
+          full_barrier_ptr,
+          empty_barrier_ptr,
+          producer_arv_cnt,
+          multicast_consumer_arrival_count * params.num_consumers);
     }
   }
 
-  // Constructor by default initializes barriers and calculates masks.
-  // These operations can be explicity deferred by specifying InitBarriers and InitMasks.
-  // If deferred, user code needs to guarantee init_masks and/or init_barriers is/are called.
   template <typename InitBarriers = cute::true_type, typename InitMasks = cute::true_type>
-  CUTLASS_DEVICE PipelineTmaMultiUmmaAsync(SharedStorage& storage,
+  CUTLASS_DEVICE PipelineTmaMultiUmmaAsync(FullBarrier* full_barrier_ptr,
+                                           EmptyBarrier* empty_barrier_ptr,
                                            int32_t warpId,
                                            Params params,
                                            ClusterShape cluster_shape,
                                            InitBarriers = {},
                                            InitMasks = {})
-    : Base(storage, params, cluster_shape, cute::false_type{}, cute::false_type{}) {
+    : Base(full_barrier_ptr, empty_barrier_ptr, params, cluster_shape, cute::false_type{}) {
     static_assert(cute::is_same_v<InitBarriers, cute::true_type> ||
                   cute::is_same_v<InitBarriers, cute::false_type>);
     if constexpr (cute::is_same_v<InitBarriers, cute::true_type>) {
-      init_barriers(storage, warpId, params, cluster_shape);
+      init_barriers(full_barrier_ptr, empty_barrier_ptr, warpId, params, cluster_shape);
     }
-
     static_assert(cute::is_same_v<InitMasks, cute::true_type> ||
                   cute::is_same_v<InitMasks, cute::false_type>);
     if constexpr (cute::is_same_v<InitMasks, cute::true_type>) {
-      if constexpr (mcastDirection == McastDirection::kRowCol) {
+      if constexpr (mcastDirection == cutlass::McastDirection::kRowCol) {
         Base::init_masks(cluster_shape);
       } else {
         Base::init_masks(cluster_shape, mcastDirection);
@@ -124,14 +118,6 @@ public:
     }
   }
 };
-
-////////////////////////////////////////////////////////////////////////////////////////////////////
-
-} // namespace cutlass
-
-////////////////////////////////////////////////////////////////////////////////////////////////////
-
-namespace cutlass::gemm::kernel::detail {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 // *************************************************************************************************
@@ -153,7 +139,7 @@ private:
   using Base = cutlass::gemm::kernel::detail::StaticPersistentTileScheduler<
     StaticPersistentPipelinedTileSchedulerSm90<ClusterShape_, Stages_>>;
   using Self = StaticPersistentPipelinedTileSchedulerSm90<ClusterShape_, Stages_>;
-  using Sm90Scheduler = cutlass::gemm::kernel::detail::PersistentTileSchedulerSm90;
+  using Sm90Scheduler = PersistentTileSchedulerSm90;
 
 public:
   using typename Base::Arguments;
@@ -165,15 +151,11 @@ public:
   static constexpr uint32_t Stages = Stages_;
 
   // Work ID response stored in shared memory ring buffer
-  using WorkTileInfo =
-    typename cutlass::gemm::kernel::detail::PersistentTileSchedulerSm90::WorkTileInfo;
-  using CLCResponse =
-    typename cutlass::gemm::kernel::detail::PersistentTileSchedulerSm100<ClusterShape,
-                                                                         Stages>::CLCResponse;
+  using WorkTileInfo = typename PersistentTileSchedulerSm90::WorkTileInfo;
+  using CLCResponse = typename PersistentTileSchedulerSm100<ClusterShape, Stages>::CLCResponse;
 
   // Pipeline types for producer-consumer synchronization
-  using Pipeline = cutlass::PipelineCLCFetchAsync<Stages, ClusterShape>;
-  using SharedStorage = typename Pipeline::SharedStorage;
+  using Pipeline = PipelineCLCFetchAsync<Stages, ClusterShape>;
 
   static CUTLASS_DEVICE cute::tuple<int32_t, int32_t> get_work_idx_m_and_n(
     uint64_t blk_per_grid_dim,
@@ -211,10 +193,9 @@ public:
 
   // Producer API. Compute work ID and store in shared memory.
   CUTLASS_DEVICE
-  cutlass::PipelineState<Stages> advance_to_next_work(
-    Pipeline& pipeline,
-    cutlass::PipelineState<Stages> pipe_producer_state,
-    int32_t advance_count = 1) const {
+  PipelineState<Stages> advance_to_next_work(Pipeline& pipeline,
+                                             PipelineState<Stages> pipe_producer_state,
+                                             int32_t advance_count = 1) const {
     // HACK: can't touch parent class in CUTLASS; so cast to non-const and call.
     auto non_const_this = const_cast<Base*>(static_cast<Base const*>(this));
     // Advance the linear index.
@@ -222,6 +203,9 @@ public:
     // Calculate work id from linear index.
     typename Base::WorkTileInfo work_id = Base::get_current_work();
     // Wait for buffer slot to become empty.
+    // WARN: for CGA>1, the CUTLASS pipeline does not arrive with scope .release.cluster, even
+    // though it correctly set the memory space .shared::cluster. Cluster release fence will be
+    // needed.
     pipeline.producer_acquire(pipe_producer_state);
     // Convert WorkTileInfo struct to 16B CLCResponse.
     CLCResponse clc_response;
@@ -238,20 +222,20 @@ public:
       // Manually complete the transaction bytes that producer_acquire set up.
       pipeline.producer_commit(pipe_producer_state);
     } else {
-      CUTLASS_PRAGMA_UNROLL
-      for (uint32_t rank = 0; rank < ClusterSize; ++rank) {
+      // Fence arrive_and_expect_tx and st_async. This ensures full barrier is properly set.
+      cuda_ptx::fence(cuda_ptx::sem_release, cuda_ptx::scope_cluster);
+      uint32_t lane = cutlass::canonical_lane_idx();
+      if (lane < ClusterSize) {
         uint32_t* current_clc_response_ptr =
           reinterpret_cast<uint32_t*>(&clc_response_ptr_[pipe_producer_state.index()]);
         uint32_t* remote_addr =
-          cuda_ptx::mapa(cuda_ptx::space_cluster, current_clc_response_ptr, rank);
+          cuda_ptx::mapa(cuda_ptx::space_cluster, current_clc_response_ptr, lane);
         uint64_t* remote_bar =
           cuda_ptx::mapa(cuda_ptx::space_cluster,
                          reinterpret_cast<uint64_t*>(__cvta_shared_to_generic(
                            pipeline.producer_get_barrier(pipe_producer_state))),
-                         rank);
-        if (cute::elect_one_sync()) {
-          cuda_ptx::st_async(remote_addr, clc_response.data, remote_bar);
-        }
+                         lane);
+        cuda_ptx::st_async(remote_addr, clc_response.data, remote_bar);
       }
     }
     // Advance the pipeline state.
@@ -306,7 +290,7 @@ private:
   using Base = cutlass::gemm::kernel::detail::StaticPersistentTileScheduler<
     DynamicPersistentPipelinedTileSchedulerSm90<ClusterShape_, Stages_>>;
   using Self = DynamicPersistentPipelinedTileSchedulerSm90<ClusterShape_, Stages_>;
-  using Sm90Scheduler = cutlass::gemm::kernel::detail::PersistentTileSchedulerSm90;
+  using Sm90Scheduler = PersistentTileSchedulerSm90;
 
 public:
   using typename Base::Arguments;
@@ -318,15 +302,11 @@ public:
   static constexpr uint32_t Stages = Stages_;
 
   // Work ID response stored in shared memory ring buffer
-  using WorkTileInfo =
-    typename cutlass::gemm::kernel::detail::PersistentTileSchedulerSm90::WorkTileInfo;
-  using CLCResponse =
-    typename cutlass::gemm::kernel::detail::PersistentTileSchedulerSm100<ClusterShape,
-                                                                         Stages>::CLCResponse;
+  using WorkTileInfo = typename PersistentTileSchedulerSm90::WorkTileInfo;
+  using CLCResponse = typename PersistentTileSchedulerSm100<ClusterShape, Stages>::CLCResponse;
 
   // Pipeline types for producer-consumer synchronization
-  using Pipeline = cutlass::PipelineCLCFetchAsync<Stages, ClusterShape>;
-  using SharedStorage = typename Pipeline::SharedStorage;
+  using Pipeline = PipelineCLCFetchAsync<Stages, ClusterShape>;
 
   static CUTLASS_DEVICE cute::tuple<int32_t, int32_t> get_work_idx_m_and_n(
     uint64_t blk_per_grid_dim,
@@ -374,10 +354,9 @@ public:
 
   // Producer API. Atomically fetch next work index and store in shared memory.
   CUTLASS_DEVICE
-  cutlass::PipelineState<Stages> advance_to_next_work(
-    Pipeline& pipeline,
-    cutlass::PipelineState<Stages> pipe_producer_state,
-    int32_t advance_count = 1) const {
+  PipelineState<Stages> advance_to_next_work(Pipeline& pipeline,
+                                             PipelineState<Stages> pipe_producer_state,
+                                             int32_t advance_count = 1) const {
     // To bootstrap, get the current work id calculated from blockIdx to save one atomic operation.
     // To continue, fetch the next work id from the dynamic scheduler.
     if (advance_count > 0) {
@@ -393,6 +372,9 @@ public:
     typename Base::WorkTileInfo work_id =
       Base::get_current_work_for_linear_idx(current_linear_idx_);
     // Wait for buffer slot to become empty.
+    // WARN: for CGA>1, the CUTLASS pipeline does not arrive with scope .release.cluster, even
+    // though it correctly set the memory space .shared::cluster. Cluster release fence will be
+    // needed.
     pipeline.producer_acquire(pipe_producer_state);
     // Convert WorkTileInfo struct to 16B CLCResponse.
     CLCResponse clc_response;
@@ -409,20 +391,20 @@ public:
       // Manually complete the transaction bytes that producer_acquire set up.
       pipeline.producer_commit(pipe_producer_state);
     } else {
-      CUTLASS_PRAGMA_UNROLL
-      for (uint32_t rank = 0; rank < ClusterSize; ++rank) {
+      // Fence arrive_and_expect_tx and st_async. This ensures full barrier is properly set.
+      cuda_ptx::fence(cuda_ptx::sem_release, cuda_ptx::scope_cluster);
+      uint32_t lane = cutlass::canonical_lane_idx();
+      if (lane < ClusterSize) {
         uint32_t* current_clc_response_ptr =
           reinterpret_cast<uint32_t*>(&clc_response_ptr_[pipe_producer_state.index()]);
         uint32_t* remote_addr =
-          cuda_ptx::mapa(cuda_ptx::space_cluster, current_clc_response_ptr, rank);
+          cuda_ptx::mapa(cuda_ptx::space_cluster, current_clc_response_ptr, lane);
         uint64_t* remote_bar =
           cuda_ptx::mapa(cuda_ptx::space_cluster,
                          reinterpret_cast<uint64_t*>(__cvta_shared_to_generic(
                            pipeline.producer_get_barrier(pipe_producer_state))),
-                         rank);
-        if (cute::elect_one_sync()) {
-          cuda_ptx::st_async(remote_addr, clc_response.data, remote_bar);
-        }
+                         lane);
+        cuda_ptx::st_async(remote_addr, clc_response.data, remote_bar);
       }
     }
     // Advance the pipeline state.
@@ -469,13 +451,6 @@ private:
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-} // namespace cutlass::gemm::kernel::detail
-
-////////////////////////////////////////////////////////////////////////////////////////////////////
-
-namespace trtllm {
-namespace dev {
-
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 // *************************************************************************************************
 // CutlassPipelineState utility function.
@@ -508,54 +483,58 @@ template <typename PipelineState> __device__ PipelineState makeConsStartStateFro
 template <int SequenceDepth, int SequenceLength> class CutlassOrderedSequenceBarrier {
 
   // The CUTLASS pipeline.
-  using Pipeline = cutlass::OrderedSequenceBarrier<SequenceDepth, SequenceLength>;
+  using Pipeline = trtllm::dev::OrderedSequenceBarrier<SequenceDepth, SequenceLength>;
   // The parameters to initialize the pipeline.
   using Params = typename Pipeline::Params;
 
 public:
-  // The shared memory storage.
-  using SharedStorage = typename Pipeline::SharedStorage;
-
-public:
   // The ctor.
-  inline explicit __device__ CutlassOrderedSequenceBarrier(SharedStorage& sharedStorage,
+  template <typename InitBarriers = cute::true_type>
+  inline explicit __device__ CutlassOrderedSequenceBarrier(uint64_t* barrierPtr,
                                                            int warpId,
                                                            int group_id,
                                                            int group_size,
-                                                           int barInitWarpId = 0)
+                                                           int barInitWarpId = 0,
+                                                           InitBarriers = {})
     : mParams{static_cast<uint32_t>(group_id), static_cast<uint32_t>(group_size), barInitWarpId}
     , mPipeline(
-        /* storage */ sharedStorage,
+        reinterpret_cast<typename Pipeline::Barrier*>(barrierPtr),
         /* params */ mParams
       ) {
+    static_assert(cute::is_same_v<InitBarriers, cute::true_type> ||
+                  cute::is_same_v<InitBarriers, cute::false_type>);
+    if constexpr (cute::is_same_v<InitBarriers, cute::true_type>) {
+      auto barrier_ptr = reinterpret_cast<typename Pipeline::Barrier*>(barrierPtr);
 #if (__CUDA_ARCH__ >= 1000)
-    if (warpId == barInitWarpId) {
-      auto barrier_ptr = &sharedStorage.barrier_[0][0];
-      int arv_cnt = mParams.group_size;
-      constexpr int Stages = SequenceDepth * SequenceLength;
-      cutlass::arch::detail::initialize_barrier_array_aligned<decltype(barrier_ptr), Stages>(
-        barrier_ptr,
-        arv_cnt);
-    }
+      if (warpId == barInitWarpId) {
+        int arv_cnt = mParams.group_size;
+        constexpr int Stages = SequenceDepth * SequenceLength;
+        cutlass::arch::detail::initialize_barrier_array_aligned<decltype(barrier_ptr), Stages>(
+          barrier_ptr,
+          arv_cnt);
+      }
 #else
-    // Init is done only by the one elected thread of the block
-    int lane_predicate = cute::elect_one_sync();
-    if (warpId == barInitWarpId && lane_predicate) {
-      for (int d = 0; d < SequenceDepth; ++d) {
-        for (int l = 0; l < SequenceLength; ++l) {
-          sharedStorage.barrier_[d][l].init(mParams.group_size);
+      int lane_predicate = cute::elect_one_sync();
+      if (warpId == barInitWarpId && lane_predicate) {
+        for (int d = 0; d < SequenceDepth; ++d) {
+          for (int l = 0; l < SequenceLength; ++l) {
+            barrier_ptr[d * SequenceLength + l].init(mParams.group_size);
+          }
         }
       }
-    }
 #endif
-    // Note: fence_barrier_init() will be invoked once after all barriers are initialized.
+    }
   }
 
   // Signal completion of stage and move to the next stage
-  inline __device__ void arrive() { mPipeline.arrive(); }
+  inline __device__ void arrive() {
+    mPipeline.arrive();
+  }
 
   // Wait on a stage to be unlocked
-  inline __device__ void wait() { mPipeline.wait(); }
+  inline __device__ void wait() {
+    mPipeline.wait();
+  }
 
 private:
   Params mParams;
@@ -791,42 +770,42 @@ private:
 template <int32_t NumStages, bool UseCpAsyncWaitGroup = false> class CutlassCpAsyncPipeline {
 
   // The CUTLASS pipeline.
-  using Pipeline = cutlass::PipelineAsync<NumStages>;
+  using Pipeline = trtllm::dev::PipelineAsync<NumStages>;
   // The parameters to initialize the pipeline.
   using Params = typename Pipeline::Params;
+  using FullBarrier = typename Pipeline::FullBarrier;
+  using EmptyBarrier = typename Pipeline::EmptyBarrier;
 
 public:
   // The state.
   using PipelineState = typename Pipeline::PipelineState;
-  // The shared memory storage.
-  using SharedStorage = typename Pipeline::SharedStorage;
 
 public:
-  // Ctor. We may want to use mPipeline{sharedStorage, {}, cute::false_type{}} in the future.
-  inline explicit __device__ CutlassCpAsyncPipeline(SharedStorage& sharedStorage,
+  template <typename InitBarriers = cute::true_type>
+  inline explicit __device__ CutlassCpAsyncPipeline(uint64_t* fullBarrierPtr,
+                                                    uint64_t* emptyBarrierPtr,
                                                     int32_t warpId,
                                                     int32_t prodArvCnt = 1,
                                                     int32_t consArvCnt = 1,
-                                                    int32_t barInitWarpId = 0)
-    : mPipeline{sharedStorage,
+                                                    int32_t barInitWarpId = 0,
+                                                    InitBarriers = {})
+    : mPipeline{reinterpret_cast<FullBarrier*>(fullBarrierPtr),
+                reinterpret_cast<EmptyBarrier*>(emptyBarrierPtr),
                 Params{Pipeline::ThreadCategory::ProducerConsumer,
                        reinterpret_cast<uint32_t const&>(prodArvCnt),
                        reinterpret_cast<uint32_t const&>(consArvCnt),
-                       cute::block_rank_in_cluster() /* dst_block_id */,
-                       barInitWarpId},
-                cute::false_type{}} {
-    // Initialize barriers. Doing this here instead of in cutlass avoids unnecessary shuffle of warp
-    // id for each pipeline and redundant predicates and branches.
-    if (warpId == barInitWarpId) {
-      cutlass::arch::detail::initialize_barrier_array_pair_aligned<
-        decltype(sharedStorage.full_barrier_),
-        decltype(sharedStorage.empty_barrier_),
-        Pipeline::Stages>(sharedStorage.full_barrier_,
-                          sharedStorage.empty_barrier_,
-                          prodArvCnt,
-                          consArvCnt);
+                       cute::block_rank_in_cluster(),
+                       barInitWarpId}} {
+    if constexpr (cute::is_same_v<InitBarriers, cute::true_type>) {
+      if (warpId == barInitWarpId) {
+        cutlass::arch::detail::
+          initialize_barrier_array_pair_aligned<FullBarrier*, EmptyBarrier*, Pipeline::Stages>(
+            reinterpret_cast<FullBarrier*>(fullBarrierPtr),
+            reinterpret_cast<EmptyBarrier*>(emptyBarrierPtr),
+            prodArvCnt,
+            consArvCnt);
+      }
     }
-    // Note: fence_barrier_init() will be invoked once after all barriers are initialized.
   }
 
   // Consumer release the barrier.
@@ -896,9 +875,9 @@ template <int NumStages, class AtomThrShapeMNK = cute::Shape<cute::_1, cute::_1,
 class CutlassTmaAsyncPipeline {
   // The CUTLASS pipeline.
 #if (__CUDA_ARCH__ >= 1000) && (__CUDA_ARCH__ != 1040)
-  using Pipeline = cutlass::PipelineTmaTransformAsync<NumStages>;
+  using Pipeline = trtllm::dev::PipelineTmaTransformAsync<NumStages>;
 #else
-  using Pipeline = cutlass::PipelineTmaAsync<NumStages>;
+  using Pipeline = trtllm::dev::PipelineTmaAsync<NumStages>;
 #endif
   // The parameters to initialize the pipeline.
   using Params = typename Pipeline::Params;
@@ -906,21 +885,17 @@ class CutlassTmaAsyncPipeline {
 public:
   // The state.
   using PipelineState = typename Pipeline::PipelineState;
-  // The shared memory storage.
-  using SharedStorage = typename Pipeline::SharedStorage;
   // The producer's barrier type.
   using ProducerBarrier = typename Pipeline::ProducerBarrierType;
-  // The FULL barrier type.
   using FullBarrier = typename Pipeline::FullBarrier;
-  // The EMPTY barrier type.
   using EmptyBarrier = typename Pipeline::EmptyBarrier;
 
 public:
-  // Ctor.
   template <typename ClusterShape = cute::Shape<cute::_1, cute::_1, cute::_1>,
             typename InitBarriers = cute::true_type,
             typename InitMasks = cute::true_type>
-  inline explicit __device__ CutlassTmaAsyncPipeline(SharedStorage& sharedStorage,
+  inline explicit __device__ CutlassTmaAsyncPipeline(uint64_t* fullBarrierPtr,
+                                                     uint64_t* emptyBarrierPtr,
                                                      int32_t warpId,
                                                      int32_t transactionBytes = 0,
                                                      bool isLeader = false,
@@ -929,25 +904,19 @@ public:
                                                      InitBarriers = {},
                                                      InitMasks = {},
                                                      int32_t barInitWarpId = 0)
-    : mPipeline{sharedStorage,
+    : mPipeline{reinterpret_cast<FullBarrier*>(fullBarrierPtr),
+                reinterpret_cast<EmptyBarrier*>(emptyBarrierPtr),
                 Params{reinterpret_cast<uint32_t const&>(transactionBytes),
-                       // FIXME: ThreadCategory::Consumer is required for the pipeline to init the
-                       // multicast mask. That mask is passed by consumer_release to
-                       // umma_arrive_multicast (even if not needed). We need to find a way to set
-                       // it differently for consumer and producer (i.e. in the Task).
                        Pipeline::ThreadCategory::Consumer,
                        isLeader ? 1u : 0u,
                        reinterpret_cast<uint32_t const&>(numConsumers),
-                       /* num producers */ 1u,
+                       1u,
                        barInitWarpId},
                 clusterShape,
-                /*InitBarriers=*/cute::false_type{},
                 InitMasks{}}
-    , mEmptyBarrierPtr{&sharedStorage.empty_barrier_[0]}
+    , mEmptyBarrierPtr{reinterpret_cast<EmptyBarrier*>(emptyBarrierPtr)}
     , mIsSignalingThread{threadIdx.x % numConsumers == 0} {
     if constexpr (cute::is_same_v<InitBarriers, cute::true_type>) {
-      // Initialize barriers. Doing this here instead of in cutlass avoids unnecessary shuffle of
-      // warp id for each pipeline and redundant predicates and branches.
       if (warpId == barInitWarpId) {
         constexpr int NumThreadsPerWarpGroup = 4 * 32;
         uint32_t const producer_arv_cnt = 1u;
@@ -960,22 +929,20 @@ public:
            cute::size<1>(clusterShape) / cute::size<1>(atom_thr_shape) - 1) *
           num_consumer_per_cluster;
 #else
-        uint32_t multicast_consumer_arrival_count = numConsumers; // If cluster_size is 1
+        uint32_t multicast_consumer_arrival_count = numConsumers;
         if (cute::size(clusterShape) > 1) {
           multicast_consumer_arrival_count =
             (cute::size<0>(clusterShape) + cute::size<1>(clusterShape) - 1) *
             num_consumer_per_cluster;
         }
 #endif
-        cutlass::arch::detail::initialize_barrier_array_pair_aligned<
-          decltype(sharedStorage.full_barrier_),
-          decltype(sharedStorage.empty_barrier_),
-          Pipeline::Stages>(sharedStorage.full_barrier_,
-                            sharedStorage.empty_barrier_,
-                            producer_arv_cnt,
-                            multicast_consumer_arrival_count);
+        cutlass::arch::detail::
+          initialize_barrier_array_pair_aligned<FullBarrier*, EmptyBarrier*, Pipeline::Stages>(
+            reinterpret_cast<FullBarrier*>(fullBarrierPtr),
+            reinterpret_cast<EmptyBarrier*>(emptyBarrierPtr),
+            producer_arv_cnt,
+            multicast_consumer_arrival_count);
       }
-      // Note: fence_barrier_init() will be invoked once after all barriers are initialized.
     }
   }
 
@@ -1056,7 +1023,9 @@ public:
   }
 
   // Get pipeline
-  [[nodiscard]] inline __device__ Pipeline& get_pipeline() { return mPipeline; }
+  [[nodiscard]] inline __device__ Pipeline& get_pipeline() {
+    return mPipeline;
+  }
 
 private:
   // The pipeline.
@@ -1077,24 +1046,22 @@ template <int NumStages,
           class AtomThrShapeMNK = cute::Shape<cute::_1, cute::_1, cute::_1>>
 class CutlassTmaUmmaAsyncPipeline {
   // The CUTLASS pipeline.
-  using Pipeline = cutlass::PipelineTmaUmmaAsync<NumStages, ClusterShape, AtomThrShapeMNK>;
+  using Pipeline = trtllm::dev::PipelineTmaUmmaAsync<NumStages, ClusterShape, AtomThrShapeMNK>;
   // The parameters to initialize the pipeline.
   using Params = typename Pipeline::Params;
 
 public:
   // The state.
   using PipelineState = typename Pipeline::PipelineState;
-  // The shared memory storage.
-  using SharedStorage = typename Pipeline::SharedStorage;
   // The producer's barrier type.
   using ProducerBarrier = typename Pipeline::ProducerBarrierType;
-  // The EMPTY barrier type.
+  using FullBarrier = typename Pipeline::FullBarrier;
   using EmptyBarrier = typename Pipeline::EmptyBarrier;
 
 public:
-  // Ctor.
   template <typename InitBarriers = cute::true_type, typename InitMasks = cute::true_type>
-  inline explicit __device__ CutlassTmaUmmaAsyncPipeline(SharedStorage& sharedStorage,
+  inline explicit __device__ CutlassTmaUmmaAsyncPipeline(uint64_t* fullBarrierPtr,
+                                                         uint64_t* emptyBarrierPtr,
                                                          int32_t warpId,
                                                          uint32_t transactionBytes,
                                                          bool isLeader,
@@ -1102,47 +1069,36 @@ public:
                                                          InitBarriers = {},
                                                          InitMasks = {},
                                                          int32_t barInitWarpId = 0)
-    : mPipeline{sharedStorage,
+    : mPipeline{reinterpret_cast<FullBarrier*>(fullBarrierPtr),
+                reinterpret_cast<EmptyBarrier*>(emptyBarrierPtr),
                 Params{transactionBytes,
-                       // Set it to producer to not create the multicast mask as the umma_peer_mask
-                       // is used instead (see below).
                        Pipeline::ThreadCategory::Producer,
-                       // FIXME: This might not work if we are not using 2-CTA instructions, but
-                       // just use multiple CTAs in the X dimension of the cluster.
                        size(clusterShape) == 1 ||
                            (cute::block_id_in_cluster().x % cute::size<0>(AtomThrShapeMNK{}) == 0)
                          ? isLeader
-                         : 0u, // is_leader
-                       0u,     // num_consumers, unused
-                       0u,     // num_produces, unused
+                         : 0u,
+                       0u,
+                       0u,
                        barInitWarpId},
                 clusterShape,
-                /*InitBarriers=*/cute::false_type{},
                 InitMasks{}}
     , mBlockIdMask{0}
-    , mEmptyBarrierPtr{&sharedStorage.empty_barrier_[0]} {
-
+    , mEmptyBarrierPtr{reinterpret_cast<EmptyBarrier*>(emptyBarrierPtr)} {
     if constexpr (cute::is_same_v<InitBarriers, cute::true_type>) {
-      // Initialize barriers. Doing this here instead of in cutlass avoids unnecessary shuffle of
-      // warp id for each pipeline and redundant predicates and branches.
       if (warpId == barInitWarpId) {
         constexpr int producer_arv_cnt = 1;
         auto atom_thr_shape = typename Pipeline::AtomThrShape_MNK{};
         uint32_t const multicast_consumer_arrival_count =
           (cute::size<0>(clusterShape) / cute::size<0>(atom_thr_shape)) +
           (cute::size<1>(clusterShape) / cute::size<1>(atom_thr_shape)) - 1;
-        cutlass::arch::detail::initialize_barrier_array_pair_aligned<
-          decltype(sharedStorage.full_barrier_),
-          decltype(sharedStorage.empty_barrier_),
-          Pipeline::Stages>(sharedStorage.full_barrier_,
-                            sharedStorage.empty_barrier_,
-                            producer_arv_cnt,
-                            multicast_consumer_arrival_count);
+        cutlass::arch::detail::
+          initialize_barrier_array_pair_aligned<FullBarrier*, EmptyBarrier*, Pipeline::Stages>(
+            reinterpret_cast<FullBarrier*>(fullBarrierPtr),
+            reinterpret_cast<EmptyBarrier*>(emptyBarrierPtr),
+            producer_arv_cnt,
+            multicast_consumer_arrival_count);
       }
-      // Note: fence_barrier_init() will be invoked once after all barriers are initialized.
     }
-
-    // Initialize the blockId mask.
     init_block_id_mask(clusterShape);
   }
 
@@ -1234,22 +1190,22 @@ template <int NumStages,
 class CutlassTmaMultiUmmaAsyncPipeline {
   // The CUTLASS pipeline.
   using Pipeline =
-    cutlass::PipelineTmaMultiUmmaAsync<NumStages, mcastDirection, ClusterShape, AtomThrShapeMNK>;
+    PipelineTmaMultiUmmaAsync<NumStages, mcastDirection, ClusterShape, AtomThrShapeMNK>;
   // The parameters to initialize the pipeline.
   using Params = typename Pipeline::Params;
 
 public:
   // The state.
   using PipelineState = typename Pipeline::PipelineState;
-  // The shared memory storage.
-  using SharedStorage = typename Pipeline::SharedStorage;
   // The producer's barrier type.
   using ProducerBarrier = typename Pipeline::ProducerBarrierType;
+  using FullBarrier = typename Pipeline::FullBarrier;
+  using EmptyBarrier = typename Pipeline::EmptyBarrier;
 
 public:
-  // Ctor.
   template <typename InitBarriers = cute::true_type, typename InitMasks = cute::true_type>
-  inline explicit __device__ CutlassTmaMultiUmmaAsyncPipeline(SharedStorage& sharedStorage,
+  inline explicit __device__ CutlassTmaMultiUmmaAsyncPipeline(uint64_t* fullBarrierPtr,
+                                                              uint64_t* emptyBarrierPtr,
                                                               int32_t warpId,
                                                               uint32_t transactionBytes,
                                                               bool isLeader,
@@ -1258,22 +1214,17 @@ public:
                                                               InitBarriers = {},
                                                               InitMasks = {},
                                                               int32_t barInitWarpId = 0)
-    : mPipeline{sharedStorage,
+    : mPipeline{reinterpret_cast<FullBarrier*>(fullBarrierPtr),
+                reinterpret_cast<EmptyBarrier*>(emptyBarrierPtr),
                 warpId,
                 Params{reinterpret_cast<uint32_t const&>(transactionBytes),
-                       // FIXME: ThreadCategory::Consumer is required for the pipeline to init the
-                       // multicast mask. That mask is passed by consumer_release to
-                       // umma_arrive_multicast (even if not needed). We need to find a way to set
-                       // it differently for consumer and producer (i.e. in the Task).
                        Pipeline::ThreadCategory::Consumer,
-                       // FIXME: This might not work if we are not using 2-CTA instructions, but
-                       // just use multiple CTAs in the X dimension of the cluster.
                        size(clusterShape) == 1 ||
                            (cute::block_id_in_cluster().x % cute::size<0>(AtomThrShapeMNK{}) == 0)
                          ? isLeader
-                         : 0u,       // is_leader
-                       numConsumers, // num_consumers
-                       0u,           // num_producers, unused
+                         : 0u,
+                       numConsumers,
+                       0u,
                        barInitWarpId},
                 clusterShape,
                 InitBarriers{},
@@ -1325,7 +1276,9 @@ public:
   }
 
   // Get pipeline
-  [[nodiscard]] inline __device__ Pipeline& get_pipeline() { return mPipeline; }
+  [[nodiscard]] inline __device__ Pipeline& get_pipeline() {
+    return mPipeline;
+  }
 
 private:
   // The pipeline.
@@ -1341,26 +1294,24 @@ private:
 template <int NumStages, class AtomThrShapeMNK = cute::Shape<cute::_1, cute::_1, cute::_1>>
 class CutlassUmmaAsyncPipeline {
   // The CUTLASS pipeline.
-  using Pipeline = cutlass::PipelineUmmaAsync<NumStages, AtomThrShapeMNK>;
+  using Pipeline = trtllm::dev::PipelineUmmaAsync<NumStages, AtomThrShapeMNK>;
   // The parameters to initialize the pipeline.
   using Params = typename Pipeline::Params;
 
 public:
   // The state.
   using PipelineState = typename Pipeline::PipelineState;
-  // The shared memory storage.
-  using SharedStorage = typename Pipeline::SharedStorage;
   // The producer's barrier type.
   using ProducerBarrier = typename Pipeline::ProducerBarrierType;
-  // The EMPTY barrier type.
+  using FullBarrier = typename Pipeline::FullBarrier;
   using EmptyBarrier = typename Pipeline::EmptyBarrier;
 
 public:
-  // Ctor.
   template <typename ClusterShape,
             typename InitBarriers = cute::true_type,
             typename InitMasks = cute::true_type>
-  inline explicit __device__ CutlassUmmaAsyncPipeline(SharedStorage& sharedStorage,
+  inline explicit __device__ CutlassUmmaAsyncPipeline(uint64_t* fullBarrierPtr,
+                                                      uint64_t* emptyBarrierPtr,
                                                       int32_t warpId,
                                                       int32_t consArvCnt,
                                                       ClusterShape clusterShape,
@@ -1368,31 +1319,26 @@ public:
                                                       InitMasks = {},
                                                       int32_t barInitWarpId = 0,
                                                       int32_t prodArvCnt = 1)
-    : mPipeline{sharedStorage,
-                Params{Pipeline::ThreadCategory::Producer, // unused for UTCMMA.1CTA
-                       reinterpret_cast<uint32_t const&>(
-                         prodArvCnt), // prod_cnt (1 per warp via elect_one)
-                       reinterpret_cast<uint32_t const&>(consArvCnt), // cons_cnt
-                       cute::block_rank_in_cluster(),                 // dst block id
+    : mPipeline{reinterpret_cast<FullBarrier*>(fullBarrierPtr),
+                reinterpret_cast<EmptyBarrier*>(emptyBarrierPtr),
+                Params{Pipeline::ThreadCategory::Producer,
+                       reinterpret_cast<uint32_t const&>(prodArvCnt),
+                       reinterpret_cast<uint32_t const&>(consArvCnt),
+                       cute::block_rank_in_cluster(),
                        barInitWarpId},
                 clusterShape,
-                /*InitBarriers=*/cute::false_type{},
                 InitMasks{}}
-    , mEmptyBarrierPtr{&sharedStorage.empty_barrier_[0]} {
+    , mEmptyBarrierPtr{reinterpret_cast<EmptyBarrier*>(emptyBarrierPtr)} {
     if constexpr (cute::is_same_v<InitBarriers, cute::true_type>) {
-      // Initialize barriers. Doing this here instead of in cutlass avoids unnecessary shuffle of
-      // warp id for each pipeline and redundant predicates and branches.
       if (warpId == barInitWarpId) {
-        cutlass::arch::detail::initialize_barrier_array_pair_aligned<
-          decltype(sharedStorage.full_barrier_),
-          decltype(sharedStorage.empty_barrier_),
-          Pipeline::Stages>(sharedStorage.full_barrier_,
-                            sharedStorage.empty_barrier_,
-                            prodArvCnt,
-                            consArvCnt);
+        cutlass::arch::detail::
+          initialize_barrier_array_pair_aligned<FullBarrier*, EmptyBarrier*, Pipeline::Stages>(
+            reinterpret_cast<FullBarrier*>(fullBarrierPtr),
+            reinterpret_cast<EmptyBarrier*>(emptyBarrierPtr),
+            prodArvCnt,
+            consArvCnt);
       }
     }
-    // Note: fence_barrier_init() will be invoked once after all barriers are initialized.
   }
 
   // Consumer release the barrier.
@@ -1466,26 +1412,24 @@ template <int NumStages,
           class AtomThrShapeMNK = cute::Shape<cute::_1, cute::_1, cute::_1>>
 class CutlassUmmaConsumerAsyncPipeline {
   // The CUTLASS pipeline.
-  using Pipeline = cutlass::PipelineUmmaConsumerAsync<NumStages, AtomThrShapeMNK>;
+  using Pipeline = trtllm::dev::PipelineUmmaConsumerAsync<NumStages, AtomThrShapeMNK>;
   // The parameters to initialize the pipeline.
   using Params = typename Pipeline::Params;
 
 public:
   // The state.
   using PipelineState = typename Pipeline::PipelineState;
-  // The shared memory storage.
-  using SharedStorage = typename Pipeline::SharedStorage;
   // The producer's barrier type.
   using ProducerBarrier = typename Pipeline::ProducerBarrierType;
+  using FullBarrier = typename Pipeline::FullBarrier;
+  using EmptyBarrier = typename Pipeline::EmptyBarrier;
 
 public:
-  // Ctor.
-  // prodCnt: number of producer arrives expected (for LDS+STTM producers)
-  // consCnt: number of consumer arrives expected (for MMA consumers), default 1 for backward compat
   template <typename ClusterShape,
             typename InitBarriers = cute::true_type,
             typename InitMasks = cute::true_type>
-  inline explicit __device__ CutlassUmmaConsumerAsyncPipeline(SharedStorage& sharedStorage,
+  inline explicit __device__ CutlassUmmaConsumerAsyncPipeline(uint64_t* fullBarrierPtr,
+                                                              uint64_t* emptyBarrierPtr,
                                                               int32_t warpId,
                                                               int32_t prodCnt,
                                                               ClusterShape clusterShape,
@@ -1493,31 +1437,24 @@ public:
                                                               InitMasks = {},
                                                               int32_t barInitWarpId = 0,
                                                               int32_t consCnt = 1)
-    : mPipeline{sharedStorage,
-                // FIXME: ThreadCategory::Consumer is required for the pipeline to init the
-                // multicast mask. That mask is passed by consumer_release to
-                // umma_arrive_multicast (even if not needed). We need to find a way to set
-                // it differently for consumer and producer (i.e. in the Task).
+    : mPipeline{reinterpret_cast<FullBarrier*>(fullBarrierPtr),
+                reinterpret_cast<EmptyBarrier*>(emptyBarrierPtr),
                 Params{Pipeline::ThreadCategory::Consumer,
-                       reinterpret_cast<uint32_t const&>(prodCnt), // prod_cnt
-                       reinterpret_cast<uint32_t const&>(consCnt), // cons_cnt
-                       0u,                                         // dst block id
+                       reinterpret_cast<uint32_t const&>(prodCnt),
+                       reinterpret_cast<uint32_t const&>(consCnt),
+                       0u,
                        barInitWarpId},
                 clusterShape,
-                /*InitBarriers=*/cute::false_type{},
                 InitMasks{}}
     , mBlockIdMask{0} {
     if constexpr (cute::is_same_v<InitBarriers, cute::true_type>) {
-      // Initialize barriers. Doing this here instead of in cutlass avoids unnecessary shuffle of
-      // warp id for each pipeline and redundant predicates and branches.
       if (warpId == barInitWarpId) {
-        cutlass::arch::detail::initialize_barrier_array_pair_aligned<
-          decltype(sharedStorage.full_barrier_),
-          decltype(sharedStorage.empty_barrier_),
-          Pipeline::Stages>(sharedStorage.full_barrier_,
-                            sharedStorage.empty_barrier_,
-                            prodCnt,
-                            consCnt);
+        cutlass::arch::detail::
+          initialize_barrier_array_pair_aligned<FullBarrier*, EmptyBarrier*, Pipeline::Stages>(
+            reinterpret_cast<FullBarrier*>(fullBarrierPtr),
+            reinterpret_cast<EmptyBarrier*>(emptyBarrierPtr),
+            prodCnt,
+            consCnt);
       }
     }
     // Note: fence_barrier_init() will be invoked once after all barriers are initialized.
@@ -1708,34 +1645,51 @@ template <int32_t NumStages, class ClusterShape = cute::Shape<cute::_1, cute::_1
 class CutlassWorkIdPipeline {
 
   // The CUTLASS pipeline.
-  using Pipeline = cutlass::PipelineCLCFetchAsync<NumStages, ClusterShape>;
+  using Pipeline = trtllm::dev::PipelineCLCFetchAsync<NumStages, ClusterShape>;
   // The parameters to initialize the pipeline.
   using Params = typename Pipeline::Params;
+  using FullBarrier = typename Pipeline::FullBarrier;
+  using EmptyBarrier = typename Pipeline::EmptyBarrier;
 
 public:
   // The state.
   using PipelineState = typename Pipeline::PipelineState;
-  // The shared memory storage.
-  using SharedStorage = typename Pipeline::SharedStorage;
 
 public:
-  // Ctor.
-  inline explicit __device__ CutlassWorkIdPipeline(SharedStorage& sharedStorage,
+  template <typename InitBarriers = cute::true_type>
+  inline explicit __device__ CutlassWorkIdPipeline(uint64_t* fullBarrierPtr,
+                                                   uint64_t* emptyBarrierPtr,
                                                    ClusterShape clusterShape = ClusterShape{},
                                                    int32_t prodArvCnt = 1,
                                                    int32_t consArvCnt = 1,
                                                    int32_t prodBlkId = 0,
-                                                   int32_t barInitWarpId = 0)
-    : mPipeline{sharedStorage,
-                Params{/*transaction_bytes=*/16,
-                       /*role=*/Pipeline::ThreadCategory::NonParticipant,
-                       /*is_leader=*/0,
-                       /*num_consumers=*/0,
-                       /*producer_blockid=*/reinterpret_cast<uint32_t const&>(prodBlkId),
-                       /*producer_arv_count=*/reinterpret_cast<uint32_t const&>(prodArvCnt),
-                       /*consumer_arv_count=*/reinterpret_cast<uint32_t const&>(consArvCnt),
+                                                   int32_t barInitWarpId = 0,
+                                                   InitBarriers = {})
+    : mPipeline{reinterpret_cast<FullBarrier*>(fullBarrierPtr),
+                reinterpret_cast<EmptyBarrier*>(emptyBarrierPtr),
+                Params{16,
+                       Pipeline::ThreadCategory::NonParticipant,
+                       0,
+                       0,
+                       reinterpret_cast<uint32_t const&>(prodBlkId),
+                       reinterpret_cast<uint32_t const&>(prodArvCnt),
+                       reinterpret_cast<uint32_t const&>(consArvCnt),
                        barInitWarpId},
-                clusterShape} {}
+                clusterShape,
+                cute::false_type{}} {
+    if constexpr (cute::is_same_v<InitBarriers, cute::true_type>) {
+      Pipeline::init_barriers(reinterpret_cast<FullBarrier*>(fullBarrierPtr),
+                              reinterpret_cast<EmptyBarrier*>(emptyBarrierPtr),
+                              Params{16,
+                                     Pipeline::ThreadCategory::NonParticipant,
+                                     0,
+                                     0,
+                                     reinterpret_cast<uint32_t const&>(prodBlkId),
+                                     reinterpret_cast<uint32_t const&>(prodArvCnt),
+                                     reinterpret_cast<uint32_t const&>(consArvCnt),
+                                     barInitWarpId});
+    }
+  }
 
   // Consumer release the barrier.
   inline __device__ void consumer_release(PipelineState const& state) {
@@ -1800,5 +1754,4 @@ private:
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-} // namespace dev
-} // namespace trtllm
+} // namespace trtllm::dev

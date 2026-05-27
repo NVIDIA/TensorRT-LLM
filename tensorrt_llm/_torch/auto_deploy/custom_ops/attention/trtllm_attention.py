@@ -710,7 +710,6 @@ def trtllm_mha_with_cache(
         max_num_requests,  # max_num_requests
         max_context_length,  # max_context_length
         attention_window_size,  # attention_window_size
-        0,  # sink_token_length
         1,  # beam_width
         int(AttentionMaskType.causal),  # mask_type
         quant_mode,  # quant_mode

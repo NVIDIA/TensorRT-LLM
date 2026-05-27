@@ -84,9 +84,17 @@ class BudgetTracker:
         self.num_tokens += num_tokens
         self.num_requests += 1
         if peft_pages > 0:
-            lora_task_id = getattr(req, "lora_task_id", None)
-            self._claimed_peft_pages += peft_pages
-            self._seen_peft_task_ids.add(lora_task_id)
+            self.commit_peft(req, peft_pages)
+
+    def commit_peft(self, req: LlmRequest, peft_pages: int) -> None:
+        """Record only PEFT consumption without affecting token/request budgets.
+
+        Used by disagg_gen_init requests which need PEFT accounting but don't
+        participate in the forward pass.
+        """
+        lora_task_id = getattr(req, "lora_task_id", None)
+        self._claimed_peft_pages += peft_pages
+        self._seen_peft_task_ids.add(lora_task_id)
 
     # ---- PEFT budget ----
 
@@ -255,9 +263,6 @@ class KVCacheV2Scheduler(RequestScheduler):
 
         # --- Phase 1: generation / disagg only ---
         while req_it < req_it_end:
-            if budget.requests_full:
-                break
-
             req = requests_list[req_it]
 
             # --- Filter ---
@@ -267,22 +272,43 @@ class KVCacheV2Scheduler(RequestScheduler):
 
             req_state_value = req.state_value
 
-            # Disagg gen init bypasses normal state gating (same as C++ / V1 scheduler),
-            # but the V2 scheduler owns inline KV allocation so we must allocate here.
-            # V1 defers allocation to prepare_resources; V2 prepare_resources is a no-op
-            # for the primary manager, so allocation must happen in the scheduling loop.
+            # Disagg gen init bypasses both state gating and budget.requests_full
+            # (same as C++ / V1 scheduler), but the V2 scheduler owns inline KV
+            # allocation so we must allocate here. V1 defers allocation to
+            # prepare_resources; V2 prepare_resources is a no-op for the primary
+            # manager, so allocation must happen in the scheduling loop.
+            #
+            # Disagg does NOT count toward budget.num_requests because it
+            # doesn't participate in the forward pass. Capacity is gated by
+            # IndexMapper slot availability: prepare_context returns False when
+            # no free slots remain, so the request is skipped and retried next
+            # iteration. PEFT budget is still checked and committed.
             if req_state_value == self._disagg_gen_init_state_value:
-                if not self.kv_cache_manager.prepare_context(req):
-                    req_it += 1
-                    continue
-                if not self.kv_cache_manager.resize_context(
-                    req, req.context_remaining_length + get_draft_token_length(req)
-                ):
+                peft_pages = budget.peft_pages_needed(req)
+                if peft_pages is None:
+                    break
+
+                action, tokens = self._try_schedule_disagg_gen_init(req, budget)
+                if action is ScheduleAction.STOP:
+                    break
+                if action is ScheduleAction.SKIP:
                     req_it += 1
                     continue
                 disagg_candidates.append(req)
+                # Disagg requests only commit PEFT (not num_requests/num_tokens)
+                # because they don't participate in the forward pass. Counting
+                # them toward num_requests would steal batch slots from gen/ctx
+                # and delay KV transfer initiation. IndexMapper slot availability
+                # (via prepare_context) is the real capacity guard.
+                if peft_pages > 0:
+                    budget.commit_peft(req, peft_pages)
                 req_it += 1
                 continue
+
+            # Budget check for non-disagg requests (disagg bypasses this
+            # because it doesn't participate in the forward pass).
+            if budget.requests_full:
+                break
 
             if not (
                 req_state_value >= self._no_schedule_until_state_value
@@ -396,6 +422,31 @@ class KVCacheV2Scheduler(RequestScheduler):
             return ScheduleAction.STOP, 0
         return ScheduleAction.SCHEDULED, req_tokens
 
+    def _try_schedule_disagg_gen_init(
+        self, req: LlmRequest, budget: BudgetTracker
+    ) -> tuple[ScheduleAction, int]:
+        """Try to schedule a disagg generation init request.
+
+        Disagg gen init requests bypass normal state gating but still need
+        KV cache allocation inline (V2 prepare_resources is a no-op for
+        the primary manager).  Aligned with C++ CapacityScheduler which
+        treats disagg_gen_init identically to context_init for block/PEFT/
+        maxNumRequests accounting.
+
+        Returns ``(action, tokens)``.  *tokens* is 0 because disagg requests
+        don't participate in the forward pass token budget.
+        """
+        if not self.kv_cache_manager.prepare_context(req):
+            logger.debug("prepare_context failed for disagg gen init request %s", req.py_request_id)
+            return ScheduleAction.SKIP, 0
+
+        if not self.kv_cache_manager.resize_context(
+            req, req.context_remaining_length + get_draft_token_length(req)
+        ):
+            return ScheduleAction.SKIP, 0
+
+        return ScheduleAction.SCHEDULED, 0
+
     def _try_schedule_context(
         self, req: LlmRequest, budget: BudgetTracker
     ) -> tuple[ScheduleAction, int, bool]:
@@ -484,6 +535,16 @@ class KVCacheV2Scheduler(RequestScheduler):
             # only called from eviction (_try_evict_for_gen).
             return ScheduleAction.SKIP, 0, False
 
+        chunk_size = self._align_chunk_to_mm_block(
+            req, chunk_size, remaining_budget, context_remaining
+        )
+        # Alignment returns 0 when neither snap-up nor snap-down can preserve
+        # bidirectional MM attention this iteration — defer the request rather
+        # than schedule a chunk that would corrupt attention. Next iteration
+        # gets a fresh budget; under steady-state load this resolves quickly.
+        if chunk_size <= 0:
+            return ScheduleAction.SKIP, 0, False
+
         req.context_chunk_size = chunk_size
 
         # Draft tokens only matter for last chunk (budget + resize)
@@ -500,6 +561,169 @@ class KVCacheV2Scheduler(RequestScheduler):
         chunking_flag = req.context_chunk_size < req.context_remaining_length
 
         return ScheduleAction.SCHEDULED, chunk_tokens, chunking_flag
+
+    def _align_chunk_to_mm_block(
+        self,
+        req: LlmRequest,
+        chunk_size: int,
+        remaining_budget: Optional[int],
+        context_remaining: int,
+    ) -> int:
+        """Adjust *chunk_size* so a boundary never lands inside a multimodal
+        soft-token run that requires intact bidirectional attention.
+
+        Returns the adjusted chunk size, or ``0`` to signal that the caller
+        should SKIP this request this iteration (defer to next iteration with
+        a fresh budget).
+
+        Two-pronged strategy:
+          1. snap-UP: extend the chunk to swallow the rest of the block
+             (preferred — block lands wholly in this iteration).
+          2. snap-DOWN fallback: if budget / max_context_length / context_remaining
+             can't absorb snap-up, shrink the chunk to end *before* the block
+             starts; the block lands wholly in the next iteration.
+
+        Last-resort defer (return 0): if the block starts at the chunk's
+        left boundary (snap-down would zero the chunk anyway), defer the
+        request. We never let a bidirectional MM block straddle a chunk
+        boundary — it would silently break attention correctness.
+
+        Raises ``ValueError`` if the block itself exceeds max_context_length —
+        no chunk size can fit it, deferring would livelock; surface the
+        config error loudly rather than spin silently.
+
+        Gated on ``mm_bidirectional_blocks`` written by the input processor —
+        causal-MM models (Llava, Qwen-VL) skip this entirely.
+        """
+        # `getattr(..., None) or {}` is not enough: on a Mock req the attribute
+        # exists as a Mock (truthy) and `.get` returns another Mock (also
+        # truthy). Require an actual dict — that's also what the input
+        # processor writes in inputs/registry.py.
+        mm_data = getattr(req, "py_multimodal_data", None)
+        if not isinstance(mm_data, dict):
+            return chunk_size
+        if not mm_data.get("mm_bidirectional_blocks", False):
+            return chunk_size
+        cumsum = mm_data.get("multimodal_embed_mask_cumsum")
+        if cumsum is None:
+            return chunk_size
+
+        unit_size = self.chunk_unit_size
+        lo = req.context_current_position
+        end_abs = lo + chunk_size
+        prompt_len = lo + context_remaining
+        if end_abs >= prompt_len or end_abs <= 0:
+            return chunk_size
+
+        # Cumsum is INCLUSIVE [P] (length prompt_len) with
+        # cumsum[i] = sum(mask[0..i]). So mask[i] = cumsum[i]-cumsum[i-1] for
+        # i>=1, and mask[0] = cumsum[0]. Aligned with inputs/registry.py
+        # (``embed_mask.cumsum(0)``) and MultimodalRuntimeData.
+        #
+        # Three-cumsum boundary-in-block detection: positions end_abs-1 and
+        # end_abs are both MM iff mask[end_abs-1]==1 AND mask[end_abs]==1.
+        # Gemma4's HF processor wraps every soft-token run with non-MM
+        # specials (boi/eoi/boa/eoa, embed_mask=0), so two consecutive
+        # embed_mask=1 positions always belong to the same block.
+        cs_prev = int(cumsum[end_abs - 1].item())
+        cs_cur = int(cumsum[end_abs].item())
+        if (cs_cur - cs_prev) != 1:
+            return chunk_size  # mask[end_abs] != 1
+        if end_abs == 1:
+            if cs_prev != 1:
+                return chunk_size  # mask[0] != 1
+        else:
+            if (cs_prev - int(cumsum[end_abs - 2].item())) != 1:
+                return chunk_size  # mask[end_abs - 1] != 1
+
+        # --- compute block extent (forward + backward walks from end_abs) ---
+        # Forward walk: advance while position block_end_abs is MM
+        # (mask[block_end_abs] == cumsum[block_end_abs]-cumsum[block_end_abs-1]).
+        # Final block_end_abs is the first non-MM position (exclusive end),
+        # or prompt_len if the block extends through EOS.
+        # Backward walk uses ``> 0`` (not ``> lo``) so block_size below
+        # reflects the TRUE block size — important for the impossibility
+        # check, which must not be undercounted if a prior iteration somehow
+        # advanced into a block (would otherwise mask a real config error).
+        block_end_abs = end_abs
+        while block_end_abs < prompt_len:
+            if (int(cumsum[block_end_abs].item()) - int(cumsum[block_end_abs - 1].item())) != 1:
+                break
+            block_end_abs += 1
+
+        # Backward walk: decrement while position (block_start_abs - 1) is MM.
+        # Final block_start_abs is the first MM position (inclusive start),
+        # or 0 if the block extends to BOS.
+        block_start_abs = end_abs
+        while block_start_abs > 1:
+            if (
+                int(cumsum[block_start_abs - 1].item()) - int(cumsum[block_start_abs - 2].item())
+            ) != 1:
+                break
+            block_start_abs -= 1
+        # Position 0: mask[0] == cumsum[0]; no cumsum[-1] sentinel.
+        if block_start_abs == 1 and int(cumsum[0].item()) == 1:
+            block_start_abs = 0
+
+        # --- impossibility check ---
+        # If the block itself exceeds max_context_length, no chunk size can
+        # ever fit it. Deferring would livelock the request. Raise a clear
+        # config error rather than letting the scheduler thrash silently.
+        block_size = block_end_abs - block_start_abs
+        if self.max_context_length is not None and block_size > self.max_context_length:
+            raise ValueError(
+                f"req {req.py_request_id}: bidirectional multimodal block of "
+                f"{block_size} tokens exceeds max_context_length="
+                f"{self.max_context_length}. The block must fit in a single "
+                f"chunk to preserve bidirectional attention; deferring would "
+                f"livelock. Increase max_num_tokens to at least {block_size}."
+            )
+
+        # --- snap-up target ---
+        # Round up to unit_size so setPrepopulatedPromptLen's downstream
+        # floor() doesn't clip the extension back into the block.
+        if unit_size > 0 and block_end_abs < prompt_len:
+            up_block_end = ((block_end_abs + unit_size - 1) // unit_size) * unit_size
+        else:
+            up_block_end = block_end_abs
+        up_block_end = min(up_block_end, prompt_len)
+        up_chunk_size = up_block_end - lo
+
+        up_fits_budget = remaining_budget is None or up_chunk_size <= remaining_budget
+        up_fits_max_ctx = (
+            self.max_context_length is None or up_chunk_size <= self.max_context_length
+        )
+        up_fits_remaining = up_chunk_size <= context_remaining
+
+        if up_fits_budget and up_fits_max_ctx and up_fits_remaining and up_chunk_size > chunk_size:
+            return up_chunk_size
+
+        # --- snap-down fallback ---
+        # Round down to unit_size so the next chunk starts on a kv-block boundary.
+        if unit_size > 0:
+            down_block_start = (block_start_abs // unit_size) * unit_size
+        else:
+            down_block_start = block_start_abs
+
+        if down_block_start <= lo:
+            logger.warning(
+                "req %s: MM block at chunk left edge "
+                "(lo=%s, block=[%s, %s)); snap-up does not fit "
+                "(up_size=%s, budget=%s, max_ctx=%s, ctx_rem=%s) and "
+                "snap-down would zero the chunk. Deferring request to next "
+                "iteration to preserve bidirectional MM attention.",
+                req.py_request_id,
+                lo,
+                block_start_abs,
+                block_end_abs,
+                up_chunk_size,
+                remaining_budget,
+                self.max_context_length,
+                context_remaining,
+            )
+            return 0
+
+        return down_block_start - lo
 
     def _try_schedule_generation(
         self,

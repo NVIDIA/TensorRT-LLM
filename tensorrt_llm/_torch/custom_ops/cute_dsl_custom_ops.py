@@ -6014,9 +6014,15 @@ if IS_CUTLASS_DSL_AVAILABLE:
             max_blocks_per_seq = cute.sym_int()
             num_ctas = cute.sym_int()
 
-            kv_fake = cute.runtime.make_fake_compact_tensor(
+            # KV may come from the indexer K-cache pool view, which is
+            # strided in dim 0 (pool layout interleaves layers:
+            # [num_blocks, num_layers, kvFactor, blockSize]). Declare outer
+            # stride as sym so the actual per-block stride is read at
+            # runtime; innermost stride is fixed to 1 (byte-contig within a
+            # logical block view).
+            kv_fake = cute.runtime.make_fake_tensor(
                 cutlass.Uint8, (sym_num_phys_blocks, block_bytes),
-                stride_order=(1, 0))
+                stride=(cute.sym_int64(), 1))
 
             q_fake = cute.runtime.make_fake_compact_tensor(cutlass.Uint8,
                                                            (N, head_dim, sym_B),
@@ -6798,12 +6804,21 @@ if IS_CUTLASS_DSL_AVAILABLE:
         kernel_cache = dict()
 
         @classmethod
-        def _compile(cls, compute_block_kv, phys_block_kv, num_heads, head_dim,
-                     next_n, num_sms, num_epi_subtiles, epi_dtype,
-                     output_dtype):
+        def _compile(cls,
+                     compute_block_kv,
+                     phys_block_kv,
+                     num_heads,
+                     head_dim,
+                     next_n,
+                     num_sms,
+                     num_epi_subtiles,
+                     epi_dtype,
+                     output_dtype,
+                     remove_online_sf_transpose=False):
             """Compile kernel using fake tensors + TVM FFI."""
             key = (compute_block_kv, phys_block_kv, num_heads, head_dim, next_n,
-                   num_sms, num_epi_subtiles, epi_dtype, output_dtype)
+                   num_sms, num_epi_subtiles, epi_dtype, output_dtype,
+                   remove_online_sf_transpose)
             if key in cls.kernel_cache:
                 return
 
@@ -6819,9 +6834,15 @@ if IS_CUTLASS_DSL_AVAILABLE:
             max_blocks_per_seq = cute.sym_int()
             num_ctas = cute.sym_int()
 
-            kv_fake = cute.runtime.make_fake_compact_tensor(
+            # KV may come from the indexer K-cache pool view, which is
+            # strided in dim 0 (pool layout interleaves layers:
+            # [num_blocks, num_layers, kvFactor, blockSize]). Declare outer
+            # stride as sym so the actual per-block stride is read at
+            # runtime; innermost stride is fixed to 1 (byte-contig within a
+            # logical block view).
+            kv_fake = cute.runtime.make_fake_tensor(
                 cutlass.Uint8, (sym_num_phys_blocks, block_bytes),
-                stride_order=(1, 0))
+                stride=(cute.sym_int64(), 1))
 
             # Q is FP4 packed bytes: head_dim/2 bytes per row
             q_fake = cute.runtime.make_fake_compact_tensor(
@@ -6873,6 +6894,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 num_epi_subtiles=num_epi_subtiles,
                 epi_dtype=to_cutlass[epi_dtype],
                 output_dtype=to_cutlass[output_dtype],
+                remove_online_sf_transpose=remove_online_sf_transpose,
             )
 
             compiled = cute.compile(
@@ -6907,6 +6929,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             num_epi_subtiles: int = 1,
             epi_dtype: torch.dtype = torch.float32,
             output_dtype: torch.dtype = torch.float32,
+            remove_online_sf_transpose: bool = False,
         ) -> torch.Tensor:
             """Execute FP4 paged MQA logits kernel.
 
@@ -6974,10 +6997,20 @@ if IS_CUTLASS_DSL_AVAILABLE:
 
             # Compile if needed (fake tensors, no real data required)
             key = (compute_block_kv, phys_block_kv, H, D, next_n, num_sms,
-                   num_epi_subtiles, epi_dtype, output_dtype)
+                   num_epi_subtiles, epi_dtype, output_dtype,
+                   remove_online_sf_transpose)
             if key not in cls.kernel_cache:
-                cls._compile(compute_block_kv, phys_block_kv, H, D, next_n,
-                             num_sms, num_epi_subtiles, epi_dtype, output_dtype)
+                cls._compile(
+                    compute_block_kv,
+                    phys_block_kv,
+                    H,
+                    D,
+                    next_n,
+                    num_sms,
+                    num_epi_subtiles,
+                    epi_dtype,
+                    output_dtype,
+                    remove_online_sf_transpose=remove_online_sf_transpose)
             compiled = cls.kernel_cache[key]
 
             # TVM FFI: pass raw tensors, no dlpack/stream needed
@@ -7000,6 +7033,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         num_epi_subtiles: int = 1,
         epi_dtype: torch.dtype = torch.float32,
         output_dtype: torch.dtype = torch.float32,
+        remove_online_sf_transpose: bool = False,
     ) -> torch.Tensor:
         if not is_sm_100f():
             raise ValueError(
@@ -7036,7 +7070,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
             max_context_len,
             num_epi_subtiles=num_epi_subtiles,
             epi_dtype=epi_dtype,
-            output_dtype=output_dtype)
+            output_dtype=output_dtype,
+            remove_online_sf_transpose=remove_online_sf_transpose)
 
     @torch.library.register_fake("trtllm::cute_dsl_fp4_paged_mqa_logits")
     def _(
@@ -7051,6 +7086,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         num_epi_subtiles: int = 1,
         epi_dtype: torch.dtype = torch.float32,
         output_dtype: torch.dtype = torch.float32,
+        remove_online_sf_transpose: bool = False,
     ) -> torch.Tensor:
         B = q.shape[0]
         next_n = q.shape[1]

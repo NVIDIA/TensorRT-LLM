@@ -1016,5 +1016,6 @@ def create_autodeploy_executor(
         max_beam_width=ad_config.max_beam_width,
         guided_decoder=guided_decoder,
         resource_governor_queue=resource_governor_queue,
+        garbage_collection_gen0_threshold=ad_config.garbage_collection_gen0_threshold,
     )
     return py_executor

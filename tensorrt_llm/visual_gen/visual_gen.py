@@ -24,7 +24,7 @@ import time
 import traceback
 import weakref
 from pathlib import Path
-from typing import Dict, List, Literal, Optional, Set, Tuple, Union
+from typing import Any, Dict, List, Literal, Optional, Set, Tuple, Union
 
 import torch.multiprocessing as mp
 import zmq
@@ -33,6 +33,7 @@ from tensorrt_llm._torch.visual_gen import DiffusionRequest, DiffusionResponse
 from tensorrt_llm._torch.visual_gen.executor import run_diffusion_worker
 from tensorrt_llm._torch.visual_gen.output import split_visual_gen_output, to_visual_gen_output
 from tensorrt_llm._torch.visual_gen.pipeline import ExtraParamSchema
+from tensorrt_llm._torch.visual_gen.pipeline_registry import PIPELINE_REGISTRY, AutoPipeline
 from tensorrt_llm.visual_gen.args import VisualGenArgs
 from tensorrt_llm.visual_gen.output import VisualGenOutput
 from tensorrt_llm.visual_gen.params import VisualGenParams
@@ -144,7 +145,7 @@ class DiffusionRemoteClient:
         args: VisualGenArgs,
     ):
         self.args = args
-        self.n_workers = args.parallel.n_workers
+        self.n_workers = args.parallel_config.n_workers
 
         # --- Detect external launcher (torchrun / srun) ---
         ext = _detect_external_launch()
@@ -226,7 +227,7 @@ class DiffusionRemoteClient:
                         "master_port": self.master_port,
                         "request_queue_addr": self.req_addr_connect,
                         "response_queue_addr": self.resp_addr_connect,
-                        "diffusion_args": self.args,
+                        "visual_gen_args": self.args,
                         "req_hmac_key": self.req_hmac_key,
                         "resp_hmac_key": self.resp_hmac_key,
                         "log_level": logger.level,
@@ -248,7 +249,7 @@ class DiffusionRemoteClient:
                     "master_port": master_port,
                     "request_queue_addr": self.req_addr_connect,
                     "response_queue_addr": self.resp_addr_connect,
-                    "diffusion_args": self.args,
+                    "visual_gen_args": self.args,
                     "req_hmac_key": self.req_hmac_key,
                     "resp_hmac_key": self.resp_hmac_key,
                     "log_level": logger.level,
@@ -674,6 +675,46 @@ class VisualGenResult:
 class VisualGen:
     """High-level API for visual generation."""
 
+    @classmethod
+    @set_api_status("prototype")
+    def supported_models(cls) -> List[str]:
+        """Return canonical HuggingFace model IDs of every registered pipeline.
+
+        Fine-tunes inherit the parent's Diffusers ``_class_name`` and dispatch
+        automatically without needing to appear in this list. The result is
+        a fresh list — mutating it does not affect the underlying registry.
+        """
+        return [hf_id for entry in PIPELINE_REGISTRY.values() for hf_id in entry.hf_ids]
+
+    @classmethod
+    @set_api_status("prototype")
+    def pipeline_config(cls, model: Union[str, Path]) -> Dict[str, Any]:
+        """Return the default ``pipeline_config`` knobs for ``model``.
+
+        ``model`` may be:
+
+        * A canonical HuggingFace model id (looked up in each entry's
+          ``hf_ids`` list — the common user-facing path).
+        * A local checkpoint path (resolved to ``_class_name`` via the same
+          logic ``PipelineLoader`` uses).
+        * A registered Diffusers ``_class_name`` (e.g. ``"WanPipeline"``)
+          for callers that already know the family.
+
+        Raises ``KeyError`` when no entry matches. The returned dict is a
+        copy — mutating it does not affect the registry.
+        """
+        key = str(model)
+        # 1. HF id match — most common user path.
+        for entry in PIPELINE_REGISTRY.values():
+            if key in entry.hf_ids:
+                return dict(entry.defaults)
+        # 2. Direct _class_name match.
+        if key in PIPELINE_REGISTRY:
+            return dict(PIPELINE_REGISTRY[key].defaults)
+        # 3. Local path — defer to PipelineLoader's resolution logic.
+        class_name = AutoPipeline._detect_from_checkpoint(key)
+        return dict(PIPELINE_REGISTRY[class_name].defaults)
+
     @set_api_status("prototype")
     def __init__(
         self,
@@ -681,14 +722,14 @@ class VisualGen:
         args: Optional[VisualGenArgs] = None,
     ):
         self.model = str(model)
-        self.args = (args or VisualGenArgs()).model_copy(update={"checkpoint_path": self.model})
+        self.args = (args or VisualGenArgs()).model_copy(update={"model": self.model})
 
         # In external-launch mode (torchrun/srun), ranks 1..N-1 run as pure
         # workers and never return to user code.
         ext = _detect_external_launch()
         if ext is not None:
             rank, local_rank, world_size, master_addr, master_port = ext
-            n_workers = self.args.parallel.n_workers
+            n_workers = self.args.parallel_config.n_workers
             if world_size != n_workers:
                 raise ValueError(
                     f"Launcher world_size ({world_size}) does not match "
@@ -707,7 +748,7 @@ class VisualGen:
                     master_port=master_port,
                     request_queue_addr=None,  # unused: non-zero ranks receive requests via dist.broadcast_object_list
                     response_queue_addr=None,  # unused: only rank 0 sends responses over ZMQ
-                    diffusion_args=self.args,
+                    visual_gen_args=self.args,
                     req_hmac_key=None,
                     resp_hmac_key=None,
                     local_rank=local_rank,

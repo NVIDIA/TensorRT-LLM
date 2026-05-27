@@ -18,11 +18,11 @@
 quant_config:
   quant_algo: NVFP4
   dynamic: true
-attention:
+attention_config:
   backend: VANILLA
-parallel:
-  dit_cfg_size: 2
-  dit_ulysses_size: 2
+parallel_config:
+  cfg_size: 2
+  ulysses_size: 2
   parallel_vae_size: 4
-cuda_graph:
-  enable_cuda_graph: false
+cuda_graph_config:
+  enable: false

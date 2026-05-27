@@ -196,9 +196,7 @@ class VisualGenPerfSanityTestConfig:
         hardware = config.get("hardware", {})
         self.environment = config.get("environment", {})
         self.default_model_name = str(metadata.get("model_name", ""))
-        shared_extra_visual_gen_options_path = str(
-            config.get("extra_visual_gen_options_path", "") or ""
-        )
+        shared_visual_gen_args_path = str(config.get("visual_gen_args_path", "") or "")
 
         if not self.default_model_name:
             raise ValueError(f"metadata.model_name is required in {config_path}")
@@ -232,21 +230,19 @@ class VisualGenPerfSanityTestConfig:
 
             model_name = str(server_config_data.get("model_name") or self.default_model_name)
             model_path = str(server_config_data.get("model_path") or model_name)
-            extra_visual_gen_options_path = str(
-                server_config_data.get("extra_visual_gen_options_path")
-                or shared_extra_visual_gen_options_path
-                or ""
+            visual_gen_args_path = str(
+                server_config_data.get("visual_gen_args_path") or shared_visual_gen_args_path or ""
             )
             inline_server_config = server_config_data.get("server_config") or {}
-            server_config, resolved_extra_visual_gen_options_path = self._load_server_config(
-                extra_visual_gen_options_path, inline_server_config
+            server_config, resolved_visual_gen_args_path = self._load_server_config(
+                visual_gen_args_path, inline_server_config
             )
             server_config = self._resolve_server_config_paths(server_config)
             client_configs = server_config_data.get("client_configs") or []
 
-            if not server_config and not extra_visual_gen_options_path:
+            if not server_config and not visual_gen_args_path:
                 raise ValueError(
-                    "server_config or extra_visual_gen_options_path is required in "
+                    "server_config or visual_gen_args_path is required in "
                     f"{config_path} for {server_name}"
                 )
             if not client_configs:
@@ -257,7 +253,7 @@ class VisualGenPerfSanityTestConfig:
             if gpus_per_node != expected_num_gpus:
                 raise ValueError(
                     "hardware.gpus_per_node must match the GPU count derived from "
-                    f"server_config.parallel: got {gpus_per_node} vs {expected_num_gpus} "
+                    f"server_config.parallel_config: got {gpus_per_node} vs {expected_num_gpus} "
                     f"for {server_name}"
                 )
 
@@ -269,8 +265,8 @@ class VisualGenPerfSanityTestConfig:
                     "server_config": server_config,
                     "client_configs": client_configs,
                     "expected_num_gpus": expected_num_gpus,
-                    "extra_visual_gen_options_path": extra_visual_gen_options_path,
-                    "resolved_extra_visual_gen_options_path": resolved_extra_visual_gen_options_path,
+                    "visual_gen_args_path": visual_gen_args_path,
+                    "resolved_visual_gen_args_path": resolved_visual_gen_args_path,
                 }
             )
 
@@ -281,7 +277,7 @@ class VisualGenPerfSanityTestConfig:
 
         self.server_cases = server_cases
 
-    def _resolve_extra_visual_gen_options_path(self, path_value: str) -> str:
+    def _resolve_visual_gen_args_path(self, path_value: str) -> str:
         """Resolve the optional external VisualGen config path."""
         config_path = Path(path_value)
         if not config_path.is_absolute():
@@ -330,35 +326,46 @@ class VisualGenPerfSanityTestConfig:
         )
 
     def _resolve_server_config_paths(self, server_config: dict[str, Any]) -> dict[str, Any]:
-        """Resolve model asset paths embedded in the serve config."""
+        """Resolve model asset paths embedded in the serve config.
+
+        Top-level ``model`` lives on ``VisualGenArgs``; the per-architecture
+        asset paths (``text_encoder_path``, ``spatial_upsampler_path``,
+        ``distilled_lora_path``) live under the nested ``pipeline_config``
+        dict.
+        """
         resolved_config = copy.deepcopy(server_config)
-        for key in (
-            "checkpoint_path",
+        top_level_keys = ("model",)
+        pipeline_keys = (
             "text_encoder_path",
             "spatial_upsampler_path",
             "distilled_lora_path",
-        ):
+        )
+        for key in top_level_keys:
             value = resolved_config.get(key)
             if value:
                 resolved_config[key] = self._resolve_asset_path(str(value))
+        pipeline_config = resolved_config.get("pipeline_config")
+        if isinstance(pipeline_config, dict):
+            for key in pipeline_keys:
+                value = pipeline_config.get(key)
+                if value:
+                    pipeline_config[key] = self._resolve_asset_path(str(value))
         return resolved_config
 
     def _load_server_config(
         self,
-        extra_visual_gen_options_path: str,
+        visual_gen_args_path: str,
         inline_server_config: dict[str, Any],
     ) -> tuple[dict[str, Any], str]:
         """Load and merge the optional external VisualGen config with inline overrides."""
-        if not extra_visual_gen_options_path:
+        if not visual_gen_args_path:
             return inline_server_config, ""
 
-        resolved_path = self._resolve_extra_visual_gen_options_path(extra_visual_gen_options_path)
+        resolved_path = self._resolve_visual_gen_args_path(visual_gen_args_path)
         with open(resolved_path, encoding="utf-8") as f:
             extra_config = yaml.safe_load(f) or {}
         if not isinstance(extra_config, dict):
-            raise ValueError(
-                f"extra_visual_gen_options_path must point to a YAML mapping: {resolved_path}"
-            )
+            raise ValueError(f"visual_gen_args_path must point to a YAML mapping: {resolved_path}")
         return _merge_nested_dicts(extra_config, inline_server_config), resolved_path
 
     def _resolve_model_path(self, model_path: str) -> str:
@@ -366,8 +373,8 @@ class VisualGenPerfSanityTestConfig:
         return self._resolve_asset_path(model_path)
 
     def _write_server_config(self, output_dir: str, server_config: dict[str, Any]) -> str:
-        """Materialize server_config into a temporary extra_visual_gen_options YAML."""
-        config_path = Path(output_dir) / "extra_visual_gen_options.yaml"
+        """Materialize server_config into a temporary visual_gen_args YAML."""
+        config_path = Path(output_dir) / "visual_gen_args.yaml"
         with open(config_path, "w", encoding="utf-8") as f:
             yaml.safe_dump(server_config, f, default_flow_style=False, sort_keys=False)
         return str(config_path)
@@ -384,7 +391,7 @@ class VisualGenPerfSanityTestConfig:
         return [
             "trtllm-serve",
             model_path,
-            "--extra_visual_gen_options",
+            "--visual_gen_args",
             server_config_path,
             "--host",
             host,
@@ -722,7 +729,7 @@ class VisualGenPerfSanityTestConfig:
                     server_config=server_case["server_config"],
                     client_config=client_config,
                     result_data=result_data,
-                    extra_visual_gen_options_path=str(server_case["extra_visual_gen_options_path"]),
+                    visual_gen_args_path=str(server_case["visual_gen_args_path"]),
                 )
                 result_idx += 1
 

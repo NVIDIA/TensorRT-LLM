@@ -755,7 +755,7 @@ class CacheLevelStorage:
         slot_size_list: TypedIndexList[PoolIndex, int],
         granularity: int,
     ) -> tuple[int, int]:
-        """Distribute grains among pools within a pool group.
+        """Compute the maximum slots that fit in a pool group grain budget.
 
         Returns (num_slots, grains_consumed).
         """
@@ -779,9 +779,24 @@ class CacheLevelStorage:
             remaining_pg_grains -= pool_grains
         assert remaining_pg_grains == 0
         assert num_slots > 0
-        return num_slots, CacheLevelStorage._grains_for_slots(
-            num_slots, slot_size_list, granularity
-        )
+        _s2g = CacheLevelStorage._grains_for_slots
+        lo = num_slots
+        step = 1
+        hi = lo + step
+        while _s2g(hi, slot_size_list, granularity) <= pg_grains:
+            lo = hi
+            step *= 2
+            hi = lo + step
+        while lo + 1 < hi:
+            mid = (lo + hi) // 2
+            if _s2g(mid, slot_size_list, granularity) <= pg_grains:
+                lo = mid
+            else:
+                hi = mid
+        used = _s2g(lo, slot_size_list, granularity)
+        assert used <= pg_grains
+        assert _s2g(lo + 1, slot_size_list, granularity) > pg_grains
+        return lo, used
 
     @staticmethod
     def _grains_for_slots(

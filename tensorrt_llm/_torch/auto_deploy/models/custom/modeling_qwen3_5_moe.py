@@ -1,7 +1,11 @@
+# Copyright 2018 The HuggingFace Team
+# Licensed under the Apache License, Version 2.0.
+# Original source: https://github.com/huggingface/transformers
+#
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Qwen3.5 MoE model for auto_deploy (text + vision).
+"""Sharding-aware Qwen3.5 MoE model for AutoDeploy IR sharding (text + vision).
 
 Reference HF modeling file (not yet in a released transformers version):
   transformers/models/qwen3_5_moe/modeling_qwen3_5_moe.py
@@ -41,6 +45,7 @@ from transformers.modeling_outputs import BaseModelOutputWithPooling
 from transformers.modeling_utils import PreTrainedModel
 from transformers.utils import ModelOutput
 
+from ... import custom_ops  # noqa: F401 -- register all ops
 from ...custom_ops.attention_interface import BatchInfo
 from ..factory import ModelFactoryRegistry
 from ..hf import (
@@ -349,10 +354,35 @@ class Qwen3_5MoeGatedDeltaNet(nn.Module):
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         batch_size, seq_len, _ = hidden_states.shape
         # 1. Projections (separate, unlike Qwen3Next which uses combined in_proj_qkvz)
-        mixed_qkv = self.in_proj_qkv(hidden_states)  # [B, S, conv_dim]
-        z = self.in_proj_z(hidden_states)  # [B, S, value_dim]
-        b = self.in_proj_b(hidden_states)  # [B, S, num_v_heads]
-        a = self.in_proj_a(hidden_states)  # [B, S, num_v_heads]
+        mixed_qkv = torch.ops.auto_deploy.torch_linear_simple(
+            hidden_states,
+            self.in_proj_qkv.weight,
+            self.in_proj_qkv.bias,
+            tp_mode="colwise",
+            output_sizes=[self.key_dim, self.key_dim, self.value_dim],
+            layer_type="delta",
+        )  # [B, S, conv_dim]
+        z = torch.ops.auto_deploy.torch_linear_simple(
+            hidden_states,
+            self.in_proj_z.weight,
+            self.in_proj_z.bias,
+            tp_mode="colwise",
+            layer_type="delta",
+        )  # [B, S, value_dim]
+        b = torch.ops.auto_deploy.torch_linear_simple(
+            hidden_states,
+            self.in_proj_b.weight,
+            self.in_proj_b.bias,
+            tp_mode="colwise",
+            layer_type="delta",
+        )  # [B, S, num_v_heads]
+        a = torch.ops.auto_deploy.torch_linear_simple(
+            hidden_states,
+            self.in_proj_a.weight,
+            self.in_proj_a.bias,
+            tp_mode="colwise",
+            layer_type="delta",
+        )  # [B, S, num_v_heads]
 
         # 2. Causal Conv1d via autodeploy op
         # torch_causal_conv1d expects [B, S, C] input, handles transpose internally
@@ -365,34 +395,74 @@ class Qwen3_5MoeGatedDeltaNet(nn.Module):
             self.conv1d.dilation[0],
             self.conv1d.groups,
             self.conv1d.padding_mode,
+            enable_sharding=True,
+            output_sizes=[self.key_dim, self.key_dim, self.value_dim],
+            layer_type="delta",
         )
         mixed_qkv = F.silu(mixed_qkv)
 
         # Split back into Q, K, V
-        query, key, value = torch.split(
+        query, key, value = torch.ops.auto_deploy.split_with_sizes(
             mixed_qkv,
             [self.key_dim, self.key_dim, self.value_dim],
             dim=-1,
+            enable_sharding=True,
+            layer_type="delta",
         )
 
         # Reshape to per-head: [B, S, num_heads, head_dim]
-        query = query.reshape(batch_size, seq_len, -1, self.head_k_dim)
-        key = key.reshape(batch_size, seq_len, -1, self.head_k_dim)
-        value = value.reshape(batch_size, seq_len, -1, self.head_v_dim)
+        query = torch.ops.auto_deploy.view(
+            query,
+            [batch_size, seq_len, -1, self.head_k_dim],
+            tp_scaled_dim=2,
+            layer_type="delta",
+        )
+        key = torch.ops.auto_deploy.view(
+            key,
+            [batch_size, seq_len, -1, self.head_k_dim],
+            tp_scaled_dim=2,
+            layer_type="delta",
+        )
+        value = torch.ops.auto_deploy.view(
+            value,
+            [batch_size, seq_len, -1, self.head_v_dim],
+            tp_scaled_dim=2,
+            layer_type="delta",
+        )
 
         # 3. Gated Delta Rule via autodeploy custom op
         # L2 norm, GQA repeat-interleave, and g/beta computation are handled inside the op.
         core_attn_out = torch.ops.auto_deploy.torch_gated_delta_rule(
-            query, key, value, a, b, self.A_log, self.dt_bias
+            query,
+            key,
+            value,
+            a,
+            b,
+            self.A_log,
+            self.dt_bias,
+            enable_sharding=True,
+            layer_type="delta",
         )
 
         # 5. Gated RMSNorm + merge heads
-        z = z.reshape(batch_size, seq_len, -1, self.head_v_dim)  # [B, S, num_v_heads, head_v_dim]
+        z = torch.ops.auto_deploy.view(
+            z,
+            [batch_size, seq_len, -1, self.head_v_dim],
+            tp_scaled_dim=2,
+            layer_type="delta",
+        )  # [B, S, num_v_heads, head_v_dim]
         core_attn_out = self.norm(core_attn_out, z)
         core_attn_out = core_attn_out.reshape(batch_size, seq_len, -1)
 
         # 6. Output projection
-        output = self.out_proj(core_attn_out)
+        output = torch.ops.auto_deploy.torch_linear_simple(
+            core_attn_out,
+            self.out_proj.weight,
+            self.out_proj.bias,
+            tp_mode="rowwise",
+            layer_type="delta",
+        )
+        output = torch.ops.auto_deploy.all_reduce(output, layer_type="delta")
         return output
 
 
@@ -454,16 +524,50 @@ class Qwen3_5MoeAttention(nn.Module):
         bsz, q_len, _ = hidden_states.size()
 
         # Q projection with gate: output shape (B, S, N, 2*D)
-        qg = self.q_proj(hidden_states).view(bsz, q_len, -1, self.head_dim * 2)
+        qg = torch.ops.auto_deploy.torch_linear_simple(
+            hidden_states,
+            self.q_proj.weight,
+            self.q_proj.bias,
+            tp_mode="colwise",
+            layer_type="mha",
+        )
+        qg = torch.ops.auto_deploy.view(
+            qg,
+            [bsz, q_len, -1, self.head_dim * 2],
+            tp_scaled_dim=2,
+            layer_type="mha",
+        )
         query_states, gate = torch.chunk(qg, 2, dim=-1)  # each (B, S, N, D)
         gate = gate.reshape(bsz, q_len, -1)  # (B, S, N*D)
 
         # K, V projections in bsnd layout
-        key_states = self.k_proj(hidden_states).view(
-            bsz, q_len, self.num_key_value_heads, self.head_dim
+        key_states = torch.ops.auto_deploy.torch_linear_simple(
+            hidden_states,
+            self.k_proj.weight,
+            self.k_proj.bias,
+            tp_mode="colwise",
+            tp_min_local_shape=self.head_dim,
+            layer_type="mha",
         )
-        value_states = self.v_proj(hidden_states).view(
-            bsz, q_len, self.num_key_value_heads, self.head_dim
+        key_states = torch.ops.auto_deploy.view(
+            key_states,
+            [bsz, q_len, -1, self.head_dim],
+            tp_scaled_dim=2,
+            layer_type="mha",
+        )
+        value_states = torch.ops.auto_deploy.torch_linear_simple(
+            hidden_states,
+            self.v_proj.weight,
+            self.v_proj.bias,
+            tp_mode="colwise",
+            tp_min_local_shape=self.head_dim,
+            layer_type="mha",
+        )
+        value_states = torch.ops.auto_deploy.view(
+            value_states,
+            [bsz, q_len, -1, self.head_dim],
+            tp_scaled_dim=2,
+            layer_type="mha",
         )
 
         # Per-head Q/K norms (norm operates on last dim = head_dim)
@@ -492,7 +596,14 @@ class Qwen3_5MoeAttention(nn.Module):
         attn_output = attn_output * torch.sigmoid(gate)
 
         # Output projection
-        attn_output = self.o_proj(attn_output)
+        attn_output = torch.ops.auto_deploy.torch_linear_simple(
+            attn_output,
+            self.o_proj.weight,
+            self.o_proj.bias,
+            tp_mode="rowwise",
+            layer_type="mha",
+        )
+        attn_output = torch.ops.auto_deploy.all_reduce(attn_output, layer_type="mha")
         return attn_output
 
 
@@ -514,7 +625,27 @@ class Qwen3_5MoeMLP(nn.Module):
         self.act_fn = ACT2FN[config.hidden_act]
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
+        gate = torch.ops.auto_deploy.torch_linear_simple(
+            x,
+            self.gate_proj.weight,
+            self.gate_proj.bias,
+            tp_mode="colwise",
+            layer_type="moe",
+        )
+        up = torch.ops.auto_deploy.torch_linear_simple(
+            x,
+            self.up_proj.weight,
+            self.up_proj.bias,
+            tp_mode="colwise",
+            layer_type="moe",
+        )
+        return torch.ops.auto_deploy.torch_linear_simple(
+            self.act_fn(gate) * up,
+            self.down_proj.weight,
+            self.down_proj.bias,
+            tp_mode="rowwise",
+            layer_type="moe",
+        )
 
 
 class Qwen3_5MoeExpert(nn.Module):
@@ -631,9 +762,11 @@ class Qwen3_5MoeSparseMoeBlock(nn.Module):
             w2_weights,
             w3_weights,
             is_gated_mlp=True,
+            layer_type="moe",
         )
 
         expert_output = expert_output + shared_expert_output
+        expert_output = torch.ops.auto_deploy.all_reduce(expert_output, layer_type="moe")
 
         expert_output = expert_output.reshape(batch_size, sequence_length, hidden_dim)
         return expert_output

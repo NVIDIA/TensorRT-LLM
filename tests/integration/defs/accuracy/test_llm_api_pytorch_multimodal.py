@@ -100,6 +100,39 @@ class TestQwen2_5_VL_7B(LlmapiAccuracyTestHarness):
             task.evaluate(llm, sampling_params=self.sampling_params)
 
 
+class TestExaone4_5_33B(LlmapiAccuracyTestHarness):
+    MODEL_NAME = "LGAI-EXAONE/EXAONE-4.5-33B"
+    MODEL_PATH = f"{llm_models_root()}/EXAONE-4.5-33B"
+    MAX_NUM_TOKENS = 16384
+
+    # EXAONE 4.5 ends each assistant turn with `<|endofturn|>`.
+    sampling_params = SamplingParams(
+        max_tokens=MMMU.MAX_OUTPUT_LEN,
+        truncate_prompt_tokens=MMMU.MAX_INPUT_LEN,
+        stop="<|endofturn|>",
+    )
+
+    kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.6)
+
+    @pytest.mark.parametrize(
+        "enable_chunked_prefill,max_num_tokens",
+        [
+            (False, MAX_NUM_TOKENS),
+            (True, 1024),
+        ],
+        ids=["full_budget", "forced_chunked_prefill"],
+    )
+    def test_auto_dtype(self, enable_chunked_prefill, max_num_tokens):
+        with LLM(
+            self.MODEL_PATH,
+            enable_chunked_prefill=enable_chunked_prefill,
+            max_num_tokens=max_num_tokens,
+            kv_cache_config=self.kv_cache_config,
+        ) as llm:
+            task = MMMU(self.MODEL_NAME)
+            task.evaluate(llm, sampling_params=self.sampling_params)
+
+
 class TestLlava_V1_6_Mistral_7B(LlmapiAccuracyTestHarness):
     MODEL_NAME = "llava-hf/llava-v1.6-mistral-7b-hf"
     MODEL_PATH = f"{llm_models_root()}/llava-v1.6-mistral-7b-hf"
@@ -356,11 +389,14 @@ class TestQwen3VL_MOE(LlmapiAccuracyTestHarness):
         max_tokens=MAX_NUM_TOKENS, truncate_prompt_tokens=MMMU.MAX_INPUT_LEN, stop="<|endoftext|>"
     )
 
+    kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.4)
+
     @pytest.mark.skip_less_device_memory(140000)
     def test_auto_dtype(self):
         with LLM(
             self.MODEL_PATH,
             max_num_tokens=self.MAX_NUM_TOKENS,
+            kv_cache_config=self.kv_cache_config,
         ) as llm:
             task = MMMU(self.MODEL_NAME)
             task.evaluate(llm, sampling_params=self.sampling_params)
@@ -491,9 +527,13 @@ class TestKimiK25(LlmapiAccuracyTestHarness):
     )
     def test_nvfp4(self, ep_size, attention_dp):
         """NVFP4 accuracy on MMMU benchmark (8x B200)."""
+        # Do not pass ``max_num_tokens`` here: keep it at the LLM default
+        # (8192) so the resolved ``moe_max_num_tokens`` stays at
+        # ``8192 * dp_size`` and the per-call fused_moe workspace fits
+        # within activation headroom. Raising it pushed the workspace
+        # past the fragmented allocator budget on dep8 (NVBug 6182617).
         with LLM(
             self.MODEL_PATH,
-            max_num_tokens=self.MAX_NUM_TOKENS,
             kv_cache_config=self.kv_cache_config,
             tensor_parallel_size=8,
             pipeline_parallel_size=1,
@@ -544,6 +584,10 @@ class TestMistralSmall24B(LlmapiAccuracyTestHarness):
             task.evaluate(llm, sampling_params=self.sampling_params)
 
 
+# Skip for B300 / GB300:
+# * B300 coverage does not meaningfully extend what we test via B200.
+# * GB300 may not be entirely up to date for `llm-models`, leading to repo-wide CI errors.
+@skip_post_blackwell_ultra
 class TestNanoV3Omni(LlmapiAccuracyTestHarness):
     # The score here may be lower than VLMEvalKitMcore (official) runs. This path uses
     # lm_eval's MMMU task, prompt formatting, and scoring, while VLMEvalKitMcore
@@ -644,14 +688,7 @@ class TestNanoV3Omni(LlmapiAccuracyTestHarness):
                 128,
                 QuantAlgo.MIXED_PRECISION,
                 (MMMU_TASK_SPEC, VOXPOPULI_TASK_SPEC, VIDEOMME_TASK_SPEC),
-                marks=(
-                    skip_pre_blackwell,
-                    # Skip for B300 / GB300:
-                    # * B300 coverage does not meaningfully extend what we test via B200.
-                    # * GB300 may not be entirely up to date for `llm-models`, leading to repo-wide
-                    #   CI errors.
-                    skip_post_blackwell_ultra,
-                ),
+                marks=(skip_pre_blackwell,),
                 id="nvfp4",
             ),
         ],

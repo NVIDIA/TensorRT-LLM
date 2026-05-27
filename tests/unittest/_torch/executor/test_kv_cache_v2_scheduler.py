@@ -30,6 +30,7 @@ from tensorrt_llm.llmapi.llm_args import CapacitySchedulerPolicy
 # ---------------------------------------------------------------------------
 ENCODER_INIT = LlmRequestState.ENCODER_INIT.value  # 1
 DISAGG_GEN_INIT = LlmRequestState.DISAGG_GENERATION_INIT.value  # 8
+DISAGG_GEN_TRANS_IN_PROGRESS = LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS.value  # 9
 CONTEXT_INIT = LlmRequestState.CONTEXT_INIT.value  # 10
 GEN_IN_PROGRESS = LlmRequestState.GENERATION_IN_PROGRESS.value  # 13
 GEN_TO_COMPLETE = LlmRequestState.GENERATION_TO_COMPLETE.value  # 14
@@ -99,15 +100,18 @@ def make_encoder_request(request_id, encoder_output_len, lora_task_id=None):
     return req
 
 
-def make_disagg_request(request_id, context_remaining_length=1, num_draft_tokens=0):
+def make_disagg_request(
+    request_id, context_remaining_length=100, lora_task_id=None, num_draft_tokens=0
+):
     req = Mock()
     req.request_id = request_id
     req.py_request_id = request_id
     req.state_value = DISAGG_GEN_INIT
+    req.context_remaining_length = context_remaining_length
     req.is_context_init_state = False
     req.is_generation_in_progress_state = False
     req.is_first_context_chunk = True
-    req.context_remaining_length = context_remaining_length
+    req.lora_task_id = lora_task_id
     req.num_draft_tokens = num_draft_tokens
     req.has_draft_tokens = num_draft_tokens > 0
     req.py_draft_tokens = [0] * num_draft_tokens if num_draft_tokens > 0 else []
@@ -122,6 +126,7 @@ def make_filtered_request(request_id, state_value=0):
     req.is_context_init_state = False
     req.is_generation_in_progress_state = False
     req.is_first_context_chunk = True
+    req.py_draft_tokens = None
     return req
 
 
@@ -1049,6 +1054,11 @@ class TestDisagg:
         assert ids(out.fitting_disagg_gen_init_requests) == [0]
 
     def test_disagg_does_not_count_toward_batch(self):
+        """Disagg doesn't consume forward-batch request budget.
+
+        Capacity is gated by IndexMapper (via prepare_context), not
+        budget.num_requests, so disagg never blocks gen/ctx scheduling.
+        """
         mgr = make_kv_cache_manager()
         sched = make_scheduler(mgr, max_batch_size=1, max_num_tokens=100)
         reqs = [make_disagg_request(0), make_gen_request(1)]
@@ -1056,7 +1066,8 @@ class TestDisagg:
         assert ids(out.fitting_disagg_gen_init_requests) == [0]
         assert ids(out.generation_requests) == [1]
 
-    def test_disagg_does_not_consume_budget(self):
+    def test_disagg_does_not_consume_token_budget(self):
+        """Disagg uses 0 tokens so a tight token budget still allows gen."""
         mgr = make_kv_cache_manager()
         sched = make_scheduler(mgr, max_num_tokens=1)
         reqs = [make_disagg_request(0), make_gen_request(1)]
@@ -1085,17 +1096,201 @@ class TestDisagg:
         assert ids(out.generation_requests) == [1]
         assert ids(out.context_requests) == [2]
 
-    def test_disagg_skips_peft_check(self):
-        """Disagg req should NOT trigger PEFT check."""
+    def test_disagg_not_blocked_when_batch_full(self):
+        """Full gen batch does not block disagg — disagg bypasses budget."""
+        mgr = make_kv_cache_manager()
+        sched = make_scheduler(mgr, max_num_tokens=200, scheduler_capacity=2)
+        reqs = [
+            make_gen_request(0),
+            make_gen_request(1),
+            make_disagg_request(2),
+        ]
+        out = sched.schedule_request(reqs, set())
+        assert ids(out.generation_requests) == [0, 1]
+        assert ids(out.fitting_disagg_gen_init_requests) == [2]
+
+    def test_disagg_gated_by_prepare_context(self):
+        """Disagg is limited by KV cache / IndexMapper, not batch budget."""
+        call_count = [0]
+
+        def prepare_fn(req):
+            call_count[0] += 1
+            return call_count[0] <= 2  # first 2 succeed, rest fail
+
+        mgr = make_kv_cache_manager(prepare_context_fn=prepare_fn)
+        sched = make_scheduler(mgr, max_num_tokens=100)
+        reqs = [make_disagg_request(i) for i in range(4)]
+        out = sched.schedule_request(reqs, set())
+        assert ids(out.fitting_disagg_gen_init_requests) == [0, 1]
+
+    def test_disagg_checks_peft_budget(self):
+        """Disagg with LoRA blocked when PEFT pages exhausted (aligned with C++)."""
         mgr = make_kv_cache_manager()
         peft = make_peft_cache_manager(max_device_pages=0, pages_per_task=1)
         sched = make_scheduler(mgr, peft_cache_manager=peft)
-        req = make_disagg_request(0)
-        req.lora_task_id = 1
+        req = make_disagg_request(0, lora_task_id=1)
         out = sched.schedule_request([req], set())
-        assert ids(out.fitting_disagg_gen_init_requests) == [0]
-        # PEFT check is never called for disagg
-        peft.determine_num_pages.assert_not_called()
+        assert ids(out.fitting_disagg_gen_init_requests) == []
+        peft.determine_num_pages.assert_called_once()
+
+    def test_disagg_peft_shared_task_id(self):
+        """Two disagg reqs with same LoRA task ID share PEFT pages."""
+        mgr = make_kv_cache_manager()
+        peft = make_peft_cache_manager(max_device_pages=1, pages_per_task=1)
+        sched = make_scheduler(mgr, peft_cache_manager=peft)
+        reqs = [make_disagg_request(0, lora_task_id=42), make_disagg_request(1, lora_task_id=42)]
+        out = sched.schedule_request(reqs, set())
+        assert ids(out.fitting_disagg_gen_init_requests) == [0, 1]
+
+    def test_disagg_prepare_context_fails_skips(self):
+        """prepare_context failure skips the request, loop continues."""
+        call_count = [0]
+
+        def prepare_fn(req):
+            call_count[0] += 1
+            return call_count[0] > 1  # first fails, second succeeds
+
+        mgr = make_kv_cache_manager(prepare_context_fn=prepare_fn)
+        sched = make_scheduler(mgr, max_num_tokens=100)
+        reqs = [make_disagg_request(0), make_disagg_request(1)]
+        out = sched.schedule_request(reqs, set())
+        assert ids(out.fitting_disagg_gen_init_requests) == [1]
+
+    def test_disagg_resize_context_fails_skips(self):
+        """resize_context failure skips the request, loop continues."""
+        call_count = [0]
+
+        def resize_fn(req, n):
+            call_count[0] += 1
+            return call_count[0] > 1  # first fails, second succeeds
+
+        mgr = make_kv_cache_manager(resize_context_fn=resize_fn)
+        sched = make_scheduler(mgr, max_num_tokens=100)
+        reqs = [make_disagg_request(0), make_disagg_request(1)]
+        out = sched.schedule_request(reqs, set())
+        assert ids(out.fitting_disagg_gen_init_requests) == [1]
+
+    def test_disagg_exceeds_max_batch_size(self):
+        """Disagg count can exceed max_batch_size since it bypasses budget."""
+        mgr = make_kv_cache_manager()
+        sched = make_scheduler(mgr, max_batch_size=2, max_num_tokens=100)
+        reqs = [make_disagg_request(i) for i in range(5)]
+        out = sched.schedule_request(reqs, set())
+        # All 5 scheduled despite max_batch_size=2
+        assert ids(out.fitting_disagg_gen_init_requests) == [0, 1, 2, 3, 4]
+
+    def test_disagg_peft_does_not_reduce_batch_capacity(self):
+        """Disagg with PEFT commits pages but leaves batch slots for gen/ctx."""
+        mgr = make_kv_cache_manager()
+        peft = make_peft_cache_manager(max_device_pages=10, pages_per_task=1)
+        sched = make_scheduler(mgr, max_batch_size=2, max_num_tokens=200, peft_cache_manager=peft)
+        reqs = [
+            make_disagg_request(0, lora_task_id=1),
+            make_disagg_request(1, lora_task_id=2),
+            make_gen_request(2, lora_task_id=3),
+            make_ctx_request(3, context_remaining_length=50, lora_task_id=4),
+        ]
+        out = sched.schedule_request(reqs, set())
+        # Both disagg scheduled (don't consume batch budget)
+        assert ids(out.fitting_disagg_gen_init_requests) == [0, 1]
+        # Both gen/ctx fit within max_batch_size=2 (disagg didn't consume slots)
+        assert ids(out.generation_requests) == [2]
+        assert ids(out.context_requests) == [3]
+
+    def test_disagg_peft_reduces_peft_budget_for_later_requests(self):
+        """Disagg PEFT consumption reduces pages available for gen/ctx."""
+        mgr = make_kv_cache_manager()
+        peft = make_peft_cache_manager(max_device_pages=2, pages_per_task=1)
+        sched = make_scheduler(mgr, max_num_tokens=200, peft_cache_manager=peft)
+        reqs = [
+            make_disagg_request(0, lora_task_id=1),  # consumes 1 PEFT page
+            make_disagg_request(1, lora_task_id=2),  # consumes 1 PEFT page → total 2
+            make_ctx_request(
+                2, context_remaining_length=50, lora_task_id=3
+            ),  # needs 1 page, 2+1>2 → break
+        ]
+        out = sched.schedule_request(reqs, set())
+        assert ids(out.fitting_disagg_gen_init_requests) == [0, 1]
+        # ctx blocked because disagg consumed all PEFT pages
+        assert ids(out.context_requests) == []
+
+    def test_disagg_interleaved_gen_full_batch_continues(self):
+        """Disagg after gen fills batch still scheduled; gen after that is blocked."""
+        mgr = make_kv_cache_manager()
+        sched = make_scheduler(mgr, max_batch_size=1, max_num_tokens=200)
+        reqs = [
+            make_gen_request(0),  # fills batch (1/1)
+            make_disagg_request(1),  # bypasses batch → scheduled
+            make_ctx_request(2, context_remaining_length=50),  # batch full → blocked
+        ]
+        out = sched.schedule_request(reqs, set())
+        assert ids(out.generation_requests) == [0]
+        assert ids(out.fitting_disagg_gen_init_requests) == [1]
+        assert ids(out.context_requests) == []
+
+    def test_disagg_prepare_fail_continues_to_next_disagg(self):
+        """prepare_context failure for one disagg does not stop other disaggs."""
+        call_count = [0]
+
+        def selective_prepare(req):
+            call_count[0] += 1
+            # Fail for request 0 and 2, succeed for 1 and 3
+            return req.request_id in (1, 3)
+
+        mgr = make_kv_cache_manager(prepare_context_fn=selective_prepare)
+        sched = make_scheduler(mgr, max_num_tokens=200)
+        reqs = [make_disagg_request(i) for i in range(4)]
+        out = sched.schedule_request(reqs, set())
+        assert ids(out.fitting_disagg_gen_init_requests) == [1, 3]
+
+    def test_disagg_cross_iteration_slot_overflow(self):
+        """Reproduce IndexMapper slot overflow across iterations.
+
+        Simulates the real crash scenario:
+          Iter 1: disagg_gen_init scheduled → slots consumed → state becomes
+                  DISAGG_GENERATION_TRANS_IN_PROGRESS (value=9).
+          Iter 2: TRANS_IN_PROGRESS (9) is invisible to both the disagg branch
+                  (checks ==8) and state gating ([10,14)), so budget resets to
+                  0. New disagg_gen_init passes budget → prepare_context called
+                  again → IndexMapper would crash in production.
+
+        This test counts prepare_context calls across two iterations. With
+        scheduler_capacity=2 (simulating IndexMapper=3 slots, 1 dummy), a
+        correct implementation should cap total prepare_context calls to 2
+        (the IndexMapper capacity). The bug allows 4.
+        """
+        prepare_count = [0]
+
+        def counting_prepare(req):
+            prepare_count[0] += 1
+            return True
+
+        mgr = make_kv_cache_manager(prepare_context_fn=counting_prepare)
+        sched = make_scheduler(mgr, max_num_tokens=200, scheduler_capacity=2)
+
+        # Iteration 1: two disagg_gen_init requests
+        reqs_iter1 = [make_disagg_request(0), make_disagg_request(1)]
+        out1 = sched.schedule_request(reqs_iter1, set())
+        assert ids(out1.fitting_disagg_gen_init_requests) == [0, 1]
+        assert prepare_count[0] == 2  # 2 slots consumed
+
+        # Simulate state transition: both move to TRANS_IN_PROGRESS.
+        # In production, kv_cache_transceiver does this after scheduling.
+        for req in reqs_iter1:
+            req.state_value = DISAGG_GEN_TRANS_IN_PROGRESS
+
+        # Iteration 2: old requests (now TRANS_IN_PROGRESS) + 2 new disagg.
+        # TRANS_IN_PROGRESS (9) is invisible to scheduler: not ==8, not in [10,14).
+        new_reqs = [make_disagg_request(2), make_disagg_request(3)]
+        all_active = reqs_iter1 + new_reqs
+
+        out2 = sched.schedule_request(all_active, set())
+
+        # BUG: budget resets to 0, TRANS_IN_PROGRESS not counted, so
+        # both new disagg pass → prepare_context called 4 times total.
+        # In production, this would crash IndexMapper (only 3 slots = 2+1 dummy).
+        assert ids(out2.fitting_disagg_gen_init_requests) == [2, 3]
+        assert prepare_count[0] == 4  # <-- proves the overflow
 
 
 # ===========================================================================
@@ -1870,3 +2065,248 @@ class TestPartialReuse:
         assert ctx.context_chunk_size == 64
         # 64 + 1 = 65 <= 80: gen fits
         assert ids(out.generation_requests) == [1]
+
+
+# ===========================================================================
+# Bidirectional-MM chunk alignment (Gemma4-style)
+# ===========================================================================
+
+
+class TestMultimodalAwareChunkingV2:
+    """Tests for ``KVCacheV2Scheduler._align_chunk_to_mm_block`` — keeps
+    bidirectional MM blocks intact across chunk boundaries via snap-up,
+    snap-down, or last-resort straddle. Gated on the
+    ``mm_bidirectional_blocks`` marker propagated from the input processor."""
+
+    @staticmethod
+    def _build_cumsum(prompt_len, mm_runs):
+        """Build the int64 [P] embed-mask cumsum tensor (INCLUSIVE convention,
+        matching ``inputs/registry.py:embed_mask.cumsum(0)`` and
+        ``MultimodalRuntimeData``).
+
+        ``mm_runs`` is a list of half-open ``(start, end)`` ranges marking
+        embed_mask=1 positions.
+        """
+        import torch
+
+        mask = torch.zeros(prompt_len, dtype=torch.int64)
+        for start, end in mm_runs:
+            mask[start:end] = 1
+        return mask.cumsum(0, dtype=torch.int64)
+
+    def _make_mm_req(self, request_id, context_remaining, mm_runs, *, bidirectional=True):
+        req = make_ctx_request(
+            request_id,
+            context_remaining_length=context_remaining,
+            prompt_len=context_remaining,
+        )
+        req.py_multimodal_data = {
+            "multimodal_embed_mask_cumsum": self._build_cumsum(context_remaining, mm_runs),
+            "mm_bidirectional_blocks": bidirectional,
+        }
+        return req
+
+    def _make_sched(self, *, chunk_unit_size=4, max_num_tokens=128):
+        mgr = make_kv_cache_manager(tokens_per_block=chunk_unit_size)
+        return make_scheduler(
+            mgr,
+            max_num_tokens=max_num_tokens,
+            ctx_chunk_config=(None, chunk_unit_size),
+        )
+
+    # ---- snap-up ----
+
+    def test_snap_up_extends_chunk_to_block_end(self):
+        sched = self._make_sched(chunk_unit_size=4, max_num_tokens=64)
+        req = self._make_mm_req(0, context_remaining=32, mm_runs=[(8, 20)])
+        # Chunk ends at pos 12, mid-block. Block ends at 20 (unit-aligned).
+        out = sched._align_chunk_to_mm_block(
+            req, chunk_size=12, remaining_budget=64, context_remaining=32
+        )
+        assert out == 20
+
+    def test_snap_up_rounds_up_past_unaligned_block_end(self):
+        sched = self._make_sched(chunk_unit_size=8, max_num_tokens=128)
+        req = self._make_mm_req(0, context_remaining=64, mm_runs=[(8, 21)])
+        # Block ends at 21 → round up to 24.
+        out = sched._align_chunk_to_mm_block(
+            req, chunk_size=16, remaining_budget=128, context_remaining=64
+        )
+        assert out == 24
+
+    def test_snap_up_two_adjacent_blocks_only_swallows_first(self):
+        sched = self._make_sched(chunk_unit_size=4, max_num_tokens=128)
+        req = self._make_mm_req(0, context_remaining=64, mm_runs=[(8, 20), (24, 40)])
+        # Chunk ends at 12, mid-block-A. Snap-up should reach end of block A
+        # (20) only — text gap [20, 24) breaks the run.
+        out = sched._align_chunk_to_mm_block(
+            req, chunk_size=12, remaining_budget=128, context_remaining=64
+        )
+        assert out == 20
+
+    # ---- snap-down ----
+
+    def test_snap_down_when_budget_exceeded(self):
+        sched = self._make_sched(chunk_unit_size=4, max_num_tokens=128)
+        req = self._make_mm_req(0, context_remaining=64, mm_runs=[(16, 60)])
+        # Snap-up needs 60 (block end is unit-aligned), but budget is 33 →
+        # snap-down to block start = 16.
+        out = sched._align_chunk_to_mm_block(
+            req, chunk_size=32, remaining_budget=33, context_remaining=64
+        )
+        assert out == 16
+
+    def test_snap_down_floors_to_chunk_unit_size(self):
+        sched = self._make_sched(chunk_unit_size=4, max_num_tokens=128)
+        req = self._make_mm_req(0, context_remaining=64, mm_runs=[(17, 60)])
+        # Snap-up needs 60, budget is 33. Block start = 17 → floor to 16.
+        out = sched._align_chunk_to_mm_block(
+            req, chunk_size=32, remaining_budget=33, context_remaining=64
+        )
+        assert out == 16
+
+    def test_snap_down_when_max_context_length_exceeded(self):
+        # max_context_length is set from max_num_tokens by V2.
+        sched = self._make_sched(chunk_unit_size=4, max_num_tokens=20)
+        # block_size = 22 - 4 = 18 ≤ max_context_length=20 (no impossibility
+        # raise), but round_up(22, 4) = 24 > 20, so snap-up busts max ctx →
+        # snap-down to block_start=4.
+        req = self._make_mm_req(0, context_remaining=64, mm_runs=[(4, 22)])
+        out = sched._align_chunk_to_mm_block(
+            req, chunk_size=16, remaining_budget=200, context_remaining=64
+        )
+        assert out == 4
+
+    def test_up_block_end_clamps_to_prompt_end(self):
+        """Block runs to (prompt_len-1); round-up of block_end_abs must be
+        clamped to prompt_len so up_chunk_size doesn't exceed context_remaining.
+        """
+        sched = self._make_sched(chunk_unit_size=4, max_num_tokens=512)
+        # context_remaining=21, MM block at [8, 21). End_abs=12 is mid-block;
+        # block walks to 21 (=prompt_len). Without the min() clamp, round-up
+        # would push to 24 > prompt_len.
+        req = self._make_mm_req(0, context_remaining=21, mm_runs=[(8, 21)])
+        out = sched._align_chunk_to_mm_block(
+            req, chunk_size=12, remaining_budget=512, context_remaining=21
+        )
+        assert out == 21  # snap-up to prompt end (last chunk, no round-up)
+
+    # ---- impossibility (block > max_context_length) ----
+
+    def test_raises_when_block_exceeds_max_context_length(self):
+        """A bidirectional MM block bigger than max_context_length cannot
+        ever fit in a chunk; deferring would livelock. Raise a clear
+        ValueError so the user sees the misconfiguration immediately."""
+        # max_context_length = max_num_tokens = 16, but block is 60 tok.
+        sched = self._make_sched(chunk_unit_size=4, max_num_tokens=16)
+        req = self._make_mm_req(0, context_remaining=128, mm_runs=[(8, 68)])
+        with pytest.raises(ValueError, match=r"exceeds max_context_length=16"):
+            sched._align_chunk_to_mm_block(
+                req, chunk_size=12, remaining_budget=16, context_remaining=128
+            )
+
+    # ---- last-resort defer ----
+
+    def test_last_resort_defers_when_snap_down_would_starve(self):
+        """Block at chunk left edge + snap-up doesn't fit + snap-down would
+        zero → return 0 so caller SKIPs the request this iteration. Better
+        than straddling and corrupting bidirectional attention."""
+        sched = self._make_sched(chunk_unit_size=4, max_num_tokens=128)
+        # Block from 0 to 60 → block_start = 0 = lo → snap-down impossible.
+        req = self._make_mm_req(0, context_remaining=64, mm_runs=[(0, 60)])
+        # Snap-up needs 60 but budget=33 → snap-down → block_start=0 → defer.
+        out = sched._align_chunk_to_mm_block(
+            req, chunk_size=32, remaining_budget=33, context_remaining=64
+        )
+        assert out == 0
+
+    # ---- gates ----
+
+    def test_no_op_when_bidirectional_flag_false(self):
+        """Causal-MM models (most VLMs) — flag False suppresses alignment."""
+        sched = self._make_sched(chunk_unit_size=4, max_num_tokens=64)
+        req = self._make_mm_req(0, context_remaining=32, mm_runs=[(8, 20)], bidirectional=False)
+        out = sched._align_chunk_to_mm_block(
+            req, chunk_size=12, remaining_budget=64, context_remaining=32
+        )
+        assert out == 12
+
+    def test_no_op_when_no_multimodal_data(self):
+        sched = self._make_sched(chunk_unit_size=4, max_num_tokens=64)
+        req = make_ctx_request(0, context_remaining_length=32, prompt_len=32)
+        # py_multimodal_data unset
+        req.py_multimodal_data = None
+        out = sched._align_chunk_to_mm_block(
+            req, chunk_size=12, remaining_budget=64, context_remaining=32
+        )
+        assert out == 12
+
+    def test_no_op_when_cumsum_missing(self):
+        sched = self._make_sched(chunk_unit_size=4, max_num_tokens=64)
+        req = make_ctx_request(0, context_remaining_length=32, prompt_len=32)
+        req.py_multimodal_data = {"mm_bidirectional_blocks": True}
+        out = sched._align_chunk_to_mm_block(
+            req, chunk_size=12, remaining_budget=64, context_remaining=32
+        )
+        assert out == 12
+
+    def test_no_op_when_boundary_not_in_block(self):
+        sched = self._make_sched(chunk_unit_size=4, max_num_tokens=64)
+        req = self._make_mm_req(0, context_remaining=32, mm_runs=[(8, 20)])
+        # Chunk ends at 8: pos 7 is non-MM (specials), pos 8 is MM — boundary
+        # is at block start, not mid-block. Helper returns chunk untouched.
+        out = sched._align_chunk_to_mm_block(
+            req, chunk_size=8, remaining_budget=64, context_remaining=32
+        )
+        assert out == 8
+
+    def test_no_op_when_chunk_reaches_prompt_end(self):
+        sched = self._make_sched(chunk_unit_size=4, max_num_tokens=64)
+        req = self._make_mm_req(0, context_remaining=32, mm_runs=[(8, 20)])
+        out = sched._align_chunk_to_mm_block(
+            req, chunk_size=32, remaining_budget=64, context_remaining=32
+        )
+        assert out == 32
+
+    # ---- mid-prompt (partial reuse) ----
+
+    def test_aligns_relative_to_context_current_position(self):
+        """When block reuse moved context_current_position past 0, the helper
+        must reason in absolute prompt coordinates (cumsum is indexed there)."""
+        sched = self._make_sched(chunk_unit_size=4, max_num_tokens=128)
+        prompt_len = 96  # full prompt; first 32 already cached
+        req = make_ctx_request(0, context_remaining_length=64, prompt_len=prompt_len)
+        req.py_multimodal_data = {
+            "multimodal_embed_mask_cumsum": self._build_cumsum(prompt_len, [(40, 56)]),
+            "mm_bidirectional_blocks": True,
+        }
+        req.context_current_position = 32  # 32 tokens already cached
+        # Remaining starts at absolute pos 32. Chunk_size=16 → end_abs=48
+        # which lands mid-block [40,56). Snap-up to 56 (unit-aligned) →
+        # chunk_size = 56 - 32 = 24.
+        out = sched._align_chunk_to_mm_block(
+            req, chunk_size=16, remaining_budget=128, context_remaining=64
+        )
+        assert out == 24
+
+    # ---- end-to-end: defer propagates as SKIP through schedule_request ----
+
+    def test_defer_skips_request_in_schedule_request(self):
+        """When alignment returns 0 (last-resort defer), the caller must SKIP
+        the request — it must not appear in scheduled context_requests, and
+        resize_context must not be called for it."""
+        # block_size=18 ≤ max_context_length=20 (no impossibility raise),
+        # but unit_size=8 round-up pushes up_block_end to 24 > 20, so
+        # snap-up fails. Block at lo=0 → snap-down zeros → defer.
+        resize_calls = []
+
+        def track_resize(req, n):
+            resize_calls.append((req.request_id, n))
+            return True
+
+        mgr = make_kv_cache_manager(tokens_per_block=8, resize_context_fn=track_resize)
+        sched = make_scheduler(mgr, max_num_tokens=20, ctx_chunk_config=(None, 8))
+        req = self._make_mm_req(0, context_remaining=32, mm_runs=[(0, 18)])
+        out = sched.schedule_request([req], set())
+        assert ids(out.context_requests) == []
+        assert resize_calls == []  # SKIP path: no commit to KV cache

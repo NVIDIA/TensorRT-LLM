@@ -137,19 +137,26 @@ def compute_scratch_range(
     history_length: int,
     capacity: int,
     tokens_per_block: int,
+    max_rewind_len: int,
 ) -> HalfOpenRange[BlockOrdinal]:
     """
     Range of blocks that should use scratch (shared) slots during SWA prefill.
 
     Scratch = stale_at_capacity ∩ input_blocks, where:
-    - stale_at_capacity: blocks out-of-window when all capacity tokens become history.
+    - stale_at_capacity: blocks out-of-window when all non-rewindable capacity tokens
+      become history.
     - input_blocks: [div_up(history_length, tpb), div_up(capacity, tpb)) — new blocks
       for the current chunk. Blocks before this range already contain real KV data
       from previous chunks and must not be overwritten.
+
+    max_rewind_len protects the speculative tail from scratch reuse. Those tokens may
+    survive after rejected draft tokens are rewound, so their KV data must remain in
+    normal per-block pages.
     """
     if not isinstance(life_cycle, AttnLifeCycle) or life_cycle.window_size is None:
         return HalfOpenRange(BlockOrdinal(0), BlockOrdinal(0))
-    cap_stale = life_cycle.get_stale_range(capacity, tokens_per_block)
+    non_rewindable_capacity = max(0, capacity - max_rewind_len)
+    cap_stale = life_cycle.get_stale_range(non_rewindable_capacity, tokens_per_block)
     input_range = HalfOpenRange(
         BlockOrdinal(div_up(history_length, tokens_per_block)),
         BlockOrdinal(div_up(capacity, tokens_per_block)),
