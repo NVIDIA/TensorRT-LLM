@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2025-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -304,8 +304,6 @@ std::tuple<std::vector<torch::Tensor>, int64_t, torch::Tensor> moeA2ADispatchOp(
 
     // Setup dispatch parameters
     MoeA2ADispatchParams params{};
-    params.one_block_per_token
-        = tensorrt_llm::common::getEnvMoeA2AOneBlockPerToken(); // TODO: Decide this based on the workload
     params.ep_size = static_cast<int>(epSize);
     params.ep_rank = static_cast<int>(epRank);
     params.num_experts = static_cast<int>(numExperts);
@@ -492,8 +490,6 @@ torch::Tensor moeA2ACombineOp(torch::Tensor const& payload, int64_t localNumToke
 
     // Setup combine parameters
     MoeA2ACombineParams params{};
-    params.one_block_per_token
-        = tensorrt_llm::common::getEnvMoeA2AOneBlockPerToken(); // TODO: Decide this based on the workload
     params.ep_size = static_cast<int>(epSize);
     params.ep_rank = static_cast<int>(epRank);
     params.local_num_tokens = static_cast<int>(localNumTokens);
