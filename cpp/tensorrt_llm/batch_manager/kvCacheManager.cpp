@@ -3102,11 +3102,9 @@ std::optional<KVCacheBlock::IdType> WindowBlockManager::releaseBlocks(
         TLLM_LOG_DEBUG("%s::releaseBlocks Request %lu, %d blocks stored for reuse", mLogPrefix.c_str(),
             sequence.getRequestId(), numBlocksStoredForReuse);
     }
-    // Stop short of any front placeholder sentinels left by SWA detachFrontBlock for
-    // this window — they live at the front of allocatedBlocks (i.e. the tail of the
-    // reverse iteration) and have no ref counts to release.
-    for (auto it = allocatedBlocks.rbegin();
-         it != allocatedBlocks.rend() - sequence.getNumFrontBlocksRemoved(mWindowSize); ++it)
+    // Iterate all allocated blocks (including placeholder sentinels at OOW positions);
+    // EvictionPolicy::releaseBlock silently skips placeholders.
+    for (auto it = allocatedBlocks.rbegin(); it != allocatedBlocks.rend(); ++it)
     {
         auto& block = *it;
         // Decrease ref count
