@@ -78,6 +78,8 @@ def test_pixtral_vision_model_vs_hf():
     pixtral_model = (
         modeling_pixtral.PixtralVisionModel(model_config=pixtral_vision_config).eval().to(device)
     )
+    # Engine normally calls this after model load; standalone tests must do it themselves.
+    pixtral_model.setup_attn_metadata(max_num_requests=8192, max_num_tokens=8192)
     hf_pixtral_model = init_hf_model(
         cls=hf_modeling_pixtral.PixtralVisionModel,
         config=pretrained_config,
@@ -134,6 +136,7 @@ def test_tensor_parallelism(mpi_pool_executor, tmp_path):
     pixtral_model = (
         modeling_pixtral.PixtralVisionModel(model_config=pixtral_vision_config).eval().to("cuda")
     )
+    pixtral_model.setup_attn_metadata(max_num_requests=8192, max_num_tokens=8192)
     pixtral_model.load_weights(state_dict)
     # Save the number of params to check that the model gets shared in the workers.
     num_params = sum(p.numel() for p in pixtral_model.parameters())
@@ -204,6 +207,7 @@ def _run_pixtral_and_compare_against_ref(
     pixtral_model = (
         modeling_pixtral.PixtralVisionModel(model_config=pixtral_vision_config).eval().to("cuda")
     )
+    pixtral_model.setup_attn_metadata(max_num_requests=8192, max_num_tokens=8192)
     state_dict = torch.load(hf_weights_path, map_location="cuda")
     pixtral_model.load_weights(state_dict)
 

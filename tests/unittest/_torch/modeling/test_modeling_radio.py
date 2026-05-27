@@ -89,6 +89,8 @@ def test_radio_fp8_parent_kv_cache_does_not_leak_into_vit(tiny_vit_config):
     vision tower, FlashInfer raises at forward time about it not being supported.
     """
     vision_model = RADIOVisionModel(_make_fp8_model_config(), disable_quantization=True)
+    # Engine normally calls this after model load; standalone tests must do it themselves.
+    vision_model.setup_attn_metadata(max_num_requests=8192, max_num_tokens=8192)
 
     device = torch.device("cuda")
     dtype = torch.bfloat16
