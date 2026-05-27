@@ -14,7 +14,6 @@ accuracy/test_llm_api.py::TestMistralNemo12B::test_fp8 SKIP (https://nvbugs/5413
 accuracy/test_llm_api_autodeploy.py::TestGemma4MoE::test_bf16 SKIP (https://nvbugs/6158397)
 accuracy/test_llm_api_autodeploy.py::TestGemmaE2B::test_gemma4_e2b_it SKIP (https://nvbugs/6194934)
 accuracy/test_llm_api_autodeploy.py::TestMiniMaxM2::test_finegrained_fp8 SKIP (https://nvbugs/6158397)
-accuracy/test_llm_api_autodeploy.py::TestNemotronNanoV3::test_accuracy[nvfp4-1-trtllm] SKIP (https://nvbugs/6200112)
 accuracy/test_llm_api_autodeploy.py::TestNemotronSuperV3::test_functional_small[bf16] SKIP (https://nvbugs/6162114)
 accuracy/test_llm_api_autodeploy.py::TestNemotronSuperV3::test_functional_small[fp8] SKIP (https://nvbugs/6162114)
 accuracy/test_llm_api_autodeploy.py::TestNemotronSuperV3::test_mtp[nvfp4_ws4_80gb-trtllm] SKIP (https://nvbugs/6221483)
