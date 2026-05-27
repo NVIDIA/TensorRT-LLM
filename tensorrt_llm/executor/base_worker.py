@@ -768,8 +768,9 @@ class BaseWorker(GenerationExecutor):
             for dest in range(1, world_size):
                 control_comm.send(msg, dest=dest, tag=_CONTROL_ACTION_TAG)
 
-            # Execute locally on rank-0; capture error so ACKs are drained
-            # before raising.
+            # Execute locally on rank-0.  Only CUDA/VMM errors are captured
+            # as local_error; unexpected exceptions bypass the except clause
+            # and are re-raised after the finally has drained peer ACKs.
             local_error = None
             try:
                 torch.cuda.synchronize()
@@ -781,28 +782,29 @@ class BaseWorker(GenerationExecutor):
                 else:
                     materialize_with_tag(*tags)
                     torch.cuda.synchronize()
-            except Exception as exc:
+            except (RuntimeError, torch.OutOfMemoryError) as exc:
                 local_error = (f"rank 0 '{action}' failed: {exc}\n"
                                f"{traceback.format_exc()}")
                 logger.error(
                     f"_multi_rank_sleep_wakeup: rank-0 local {action} failed:",
                     exc_info=True,
                 )
-
-            # Always drain all ACKs to keep the communicator clean even if
-            # rank-0's local op failed.
-            errors = []
-            if local_error:
-                errors.append(local_error)
-            for src in range(1, world_size):
-                ack = control_comm.recv(source=src, tag=_CONTROL_ACK_TAG)
-                if ack.get("status") != "ok":
-                    errors.append(
-                        ack.get("error") or f"rank {src} returned unknown ACK")
-            if errors:
-                raise RuntimeError(
-                    f"{action}() failed on {len(errors)} rank(s):\n" +
-                    "\n".join(errors))
+            finally:
+                # Always drain all ACKs to keep the communicator clean even
+                # if rank-0's local op failed or raised unexpectedly.
+                errors = []
+                if local_error:
+                    errors.append(local_error)
+                for src in range(1, world_size):
+                    ack = control_comm.recv(source=src, tag=_CONTROL_ACK_TAG)
+                    if ack.get("status") != "ok":
+                        errors.append(
+                            ack.get("error")
+                            or f"rank {src} returned unknown ACK")
+                if errors:
+                    raise RuntimeError(
+                        f"{action}() failed on {len(errors)} rank(s):\n" +
+                        "\n".join(errors))
 
     def sleep(self, sleep_tags: List[str]) -> None:
         """Release GPU virtual memory for the specified memory type tags.

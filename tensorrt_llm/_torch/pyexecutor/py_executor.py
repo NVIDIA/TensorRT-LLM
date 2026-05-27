@@ -2115,13 +2115,19 @@ class PyExecutor:
             while True:
                 msg = self._control_comm.recv(
                     source=0, tag=_CONTROL_ACTION_TAG)
-                action: str = msg["action"]
-                if action == "shutdown":
+                # Check for shutdown before entering the ACK-guarded block so
+                # we can break cleanly without sending a spurious ACK.
+                if msg.get("action") == "shutdown":
                     break
-                tag_strings: list = msg["tags"]
-                tags = [ExecutorMemoryType(t) for t in tag_strings]
-                error_msg: Optional[str] = None
+                # Use .get() so a missing "action" key surfaces as an unknown
+                # action inside the try rather than a bare KeyError here.
+                action = msg.get("action", "<unknown>")
+                error_msg = None
                 try:
+                    # Decode tags inside the try so KeyError / ValueError from
+                    # a malformed message still results in an error ACK being
+                    # sent via the finally below, rather than deadlocking rank-0.
+                    tags = [ExecutorMemoryType(t) for t in msg["tags"]]
                     torch.cuda.synchronize()
                     if action == "sleep":
                         release_with_tag(*tags)
@@ -2135,7 +2141,8 @@ class PyExecutor:
                         error_msg = f"unknown action '{action}'"
                         logger.warning(
                             f"Control listener: {error_msg}, ignoring.")
-                except Exception as exc:
+                except (KeyError, TypeError, ValueError,
+                        RuntimeError, torch.OutOfMemoryError) as exc:
                     error_msg = (
                         f"rank {self.dist.rank} '{action}' failed: "
                         f"{exc}\n{traceback.format_exc()}")

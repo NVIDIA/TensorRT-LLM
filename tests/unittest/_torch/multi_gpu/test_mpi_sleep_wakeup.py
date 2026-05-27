@@ -56,9 +56,12 @@ def _per_device_gpu_memory() -> dict:
     """
     try:
         import pynvml
-        pynvml.nvmlInit()
-    except Exception:
+    except ImportError:
         return {}
+
+    # Let NVMLError from nvmlInit() propagate so real initialisation
+    # failures surface rather than silently returning empty results.
+    pynvml.nvmlInit()
 
     root_pid = os.getpid()
     targets = frozenset(
@@ -73,7 +76,10 @@ def _per_device_gpu_memory() -> dict:
             procs = pynvml.nvmlDeviceGetComputeRunningProcesses(handle)
             result[idx] = sum(
                 p.usedGpuMemory for p in procs if p.pid in targets)
-        except Exception:
+        except (pynvml.NVMLError_NotSupported,
+                pynvml.NVMLError_NoPermission):
+            # Device not queryable (e.g. MIG slice or insufficient permissions);
+            # treat as zero rather than failing the whole probe.
             result[idx] = 0
     return result
 
@@ -112,17 +118,22 @@ def test_mpi_sleep_wakeup_tp2(process_gpu_memory_info_available):
         generated_before = [o.outputs[0].text for o in outputs_before]
 
         mem_active = _per_device_gpu_memory()
+        active_devices = {dev for dev, b in mem_active.items() if b > 0}
+        if process_gpu_memory_info_available:
+            assert active_devices, (
+                "No active GPU devices found before sleep(); "
+                "_per_device_gpu_memory() returned zero for all devices. "
+                "Check pynvml setup or GPU visibility."
+            )
 
         llm._collective_rpc("sleep", (sleep_tags,))
 
         mem_sleep = _per_device_gpu_memory()
         if process_gpu_memory_info_available:
-            for dev, active_bytes in mem_active.items():
-                if active_bytes == 0:
-                    continue  # device not in use by this job
-                assert mem_sleep.get(dev, 0) < active_bytes, (
+            for dev in active_devices:
+                assert mem_sleep.get(dev, 0) < mem_active[dev], (
                     f"GPU {dev} memory did not decrease after sleep: "
-                    f"active={active_bytes / 2**20:.1f} MiB, "
+                    f"active={mem_active[dev] / 2**20:.1f} MiB, "
                     f"sleep={mem_sleep.get(dev, 0) / 2**20:.1f} MiB; "
                     f"rank assigned to GPU {dev} may not have called "
                     f"release_with_tag()"
@@ -132,12 +143,10 @@ def test_mpi_sleep_wakeup_tp2(process_gpu_memory_info_available):
 
         mem_wakeup = _per_device_gpu_memory()
         if process_gpu_memory_info_available:
-            for dev, sleep_bytes in mem_sleep.items():
-                if mem_active.get(dev, 0) == 0:
-                    continue
-                assert mem_wakeup.get(dev, 0) > sleep_bytes, (
+            for dev in active_devices:
+                assert mem_wakeup.get(dev, 0) > mem_sleep.get(dev, 0), (
                     f"GPU {dev} memory did not recover after wakeup: "
-                    f"sleep={sleep_bytes / 2**20:.1f} MiB, "
+                    f"sleep={mem_sleep.get(dev, 0) / 2**20:.1f} MiB, "
                     f"wakeup={mem_wakeup.get(dev, 0) / 2**20:.1f} MiB; "
                     f"rank assigned to GPU {dev} may not have called "
                     f"materialize_with_tag()"
