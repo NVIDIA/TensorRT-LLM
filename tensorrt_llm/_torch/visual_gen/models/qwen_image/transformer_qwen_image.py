@@ -184,6 +184,10 @@ class AdaLayerNormContinuous(nn.Module):
         eps: float = 1e-6,
         bias: bool = True,
         norm_type: str = "layer_norm",
+        dtype: torch.dtype = None,
+        quant_config=None,
+        skip_create_weights: bool = False,
+        force_dynamic_quant: bool = False,
     ):
         super().__init__()
         self.silu = nn.SiLU()
@@ -191,6 +195,10 @@ class AdaLayerNormContinuous(nn.Module):
             conditioning_embedding_dim,
             embedding_dim * 2,
             bias=bias,
+            dtype=dtype,
+            quant_config=quant_config,
+            skip_create_weights_in_init=skip_create_weights,
+            force_dynamic_quantization=force_dynamic_quant,
         )
         if norm_type == "layer_norm":
             self.norm = nn.LayerNorm(embedding_dim, eps=eps, elementwise_affine=elementwise_affine)
@@ -334,6 +342,12 @@ class QwenEmbedRope(nn.Module):
         )
         return torch.polar(torch.ones_like(freqs), freqs)
 
+    @functools.lru_cache(maxsize=8)
+    def _pos_freqs_for_device(self, device: Optional[torch.device]) -> torch.Tensor:
+        if device is None:
+            return self.pos_freqs
+        return self.pos_freqs.to(device)
+
     def forward(
         self,
         video_fhw,
@@ -357,7 +371,7 @@ class QwenEmbedRope(nn.Module):
                 max_vid_index = max(height, width, max_vid_index)
 
         max_txt_seq_len_int = int(max_txt_seq_len)
-        txt_freqs = self.pos_freqs.to(device)[
+        txt_freqs = self._pos_freqs_for_device(device)[
             max_vid_index : max_vid_index + max_txt_seq_len_int, ...
         ]
         vid_freqs = torch.cat(vid_freqs, dim=0)
@@ -787,7 +801,14 @@ class QwenImageTransformer2DModel(nn.Module):
         )
 
         self.norm_out = AdaLayerNormContinuous(
-            self.inner_dim, self.inner_dim, elementwise_affine=False, eps=1e-6
+            self.inner_dim,
+            self.inner_dim,
+            elementwise_affine=False,
+            eps=1e-6,
+            dtype=self.model_config.torch_dtype,
+            quant_config=self.model_config.get_quant_config(),
+            skip_create_weights=self.model_config.skip_create_weights_in_init,
+            force_dynamic_quant=self.model_config.force_dynamic_quantization,
         )
         self.proj_out = Linear(
             self.inner_dim,
@@ -826,6 +847,24 @@ class QwenImageTransformer2DModel(nn.Module):
             **kwargs,
         )
 
+    def to_inference_dtype(self) -> "QwenImageTransformer2DModel":
+        """Cast non-quantized parameters to the configured inference dtype.
+
+        A blanket ``module.to(torch.bfloat16)`` breaks quantized TRT-LLM
+        Linear modules by converting FP8/NVFP4 weights and FP32 scales.
+        """
+        target_dtype = self.model_config.torch_dtype
+        for module in self.modules():
+            if isinstance(module, Linear):
+                continue
+            for param in module.parameters(recurse=False):
+                if param is not None and param.is_floating_point():
+                    param.data = param.data.to(target_dtype)
+            for buffer in module.buffers(recurse=False):
+                if buffer.is_floating_point():
+                    buffer.data = buffer.data.to(target_dtype)
+        return self
+
     def load_weights(self, weights: Dict[str, torch.Tensor]) -> None:
         """Load HF ``transformer/*.safetensors`` state_dict.
 
@@ -844,7 +883,9 @@ class QwenImageTransformer2DModel(nn.Module):
         provided = set(weights)
         missing = sorted(expected - provided)
         unexpected = sorted(provided - expected)
-        if missing:
+        # Dynamic quantization creates scale parameters while loading Linear
+        # modules, so those keys are expected to be absent from BF16 checkpoints.
+        if missing and not self.model_config.dynamic_weight_quant:
             raise RuntimeError(f"Missing keys when loading transformer: {missing[:5]}...")
         if unexpected:
             raise RuntimeError(f"Unexpected keys when loading transformer: {unexpected[:5]}...")
@@ -854,7 +895,19 @@ class QwenImageTransformer2DModel(nn.Module):
             if isinstance(module, Linear):
                 weight_dicts = loader.get_linear_weights(module, name, weights)
                 if weight_dicts:
-                    loader.load_linear_weights(module, name, weight_dicts)
+                    try:
+                        loader.load_linear_weights(module, name, weight_dicts)
+                    except Exception as exc:
+                        src_weight = weight_dicts[0].get("weight")
+                        src_shape = tuple(src_weight.shape) if src_weight is not None else None
+                        src_dtype = src_weight.dtype if src_weight is not None else None
+                        raise RuntimeError(
+                            "Failed loading Qwen-Image Linear "
+                            f"{name}: target_weight_shape={tuple(module.weight.shape)}, "
+                            f"target_weight_dtype={module.weight.dtype}, "
+                            f"source_weight_shape={src_shape}, "
+                            f"source_weight_dtype={src_dtype}"
+                        ) from exc
             else:
                 module_weights = loader.filter_weights(name, weights)
                 for param_name, param in module._parameters.items():
@@ -862,9 +915,25 @@ class QwenImageTransformer2DModel(nn.Module):
                         param.data.copy_(module_weights[param_name].to(param.dtype))
 
     def post_load_weights(self) -> None:
-        for _, module in self.named_modules():
+        for name, module in self.named_modules():
             if isinstance(module, Linear):
-                module.post_load_weights()
+                try:
+                    module.post_load_weights()
+                except Exception as exc:
+                    weight = getattr(module, "weight", None)
+                    weight_scale = getattr(module, "weight_scale", None)
+                    weight_shape = tuple(weight.shape) if weight is not None else None
+                    weight_dtype = weight.dtype if weight is not None else None
+                    scale_shape = tuple(weight_scale.shape) if weight_scale is not None else None
+                    scale_dtype = weight_scale.dtype if weight_scale is not None else None
+                    raise RuntimeError(
+                        "Failed post_load_weights for Qwen-Image Linear "
+                        f"{name}: quant_method={type(module.quant_method).__name__}, "
+                        f"weight_shape={weight_shape}, "
+                        f"weight_dtype={weight_dtype}, "
+                        f"weight_scale_shape={scale_shape}, "
+                        f"weight_scale_dtype={scale_dtype}"
+                    ) from exc
 
     def forward(
         self,

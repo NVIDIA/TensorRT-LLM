@@ -230,11 +230,10 @@ class QwenImagePipeline(BasePipeline):
         if self.transformer is not None:
             transformer_weights = weights.get("transformer", weights)
             self.transformer.load_weights(transformer_weights)
-            # PipelineLoader materialises MetaInit tensors as fp32 by
-            # default; cast the transformer to the configured inference
-            # dtype (normally bf16 for Qwen-Image) so forward doesn't
-            # hit Float vs BFloat16 mat1/mat2 mismatches.
-            self.transformer.to(self.model_config.torch_dtype).eval()
+            # PipelineLoader materialises some MetaInit tensors as fp32 by
+            # default. Cast only non-quantized tensors so FP8/NVFP4 weights
+            # and FP32 scales keep the dtypes created by Linear.load_weights().
+            self.transformer.to_inference_dtype().eval()
         self._target_dtype = self.model_config.torch_dtype
 
     # ------------------------------------------------------------------
@@ -376,10 +375,11 @@ class QwenImagePipeline(BasePipeline):
         # Fan out by num_images_per_prompt so ``n > 1`` produces multiple
         # images in a single batched forward. Qwen-Image supports this
         # naturally via the batch dim of its transformer.
-        num_per = getattr(req, "num_images_per_prompt", 1) or 1
+        params = req.params
+        num_per = params.num_images_per_prompt or 1
         base_prompts = req.prompt if isinstance(req.prompt, list) else [req.prompt]
         prompts = [p for p in base_prompts for _ in range(num_per)]
-        negative = getattr(req, "negative_prompt", None)
+        negative = params.negative_prompt
         if negative is not None:
             negatives = negative if isinstance(negative, list) else [negative]
             if len(negatives) == 1:
@@ -394,12 +394,12 @@ class QwenImagePipeline(BasePipeline):
         return self.forward(
             prompt=prompts,
             negative_prompt=negative,
-            height=req.height,
-            width=req.width,
-            num_inference_steps=req.num_inference_steps,
-            true_cfg_scale=getattr(req, "guidance_scale", 4.0),
-            seed=req.seed,
-            max_sequence_length=req.max_sequence_length,
+            height=params.height,
+            width=params.width,
+            num_inference_steps=params.num_inference_steps,
+            true_cfg_scale=params.guidance_scale,
+            seed=params.seed,
+            max_sequence_length=params.max_sequence_length,
         )
 
     @torch.inference_mode()

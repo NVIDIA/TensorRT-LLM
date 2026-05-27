@@ -4,9 +4,10 @@
 
 r"""Qwen-Image text-to-image generation example using TensorRT-LLM VisualGen.
 
-This example supports the native BF16 reference path. FP8 / NVFP4 / CUDA
-graph / CFG+Ulysses / TeaCache are scheduled for follow-up PRs (see the
-feature matrix row in ``docs/source/models/visual-generation.md``).
+This example supports the native BF16 reference path, dynamic FP8 / NVFP4
+quantization, CUDA graph, and Ulysses sequence parallelism. CFG parallelism
+and TeaCache are scheduled for follow-up PRs (see the feature matrix row in
+``docs/source/models/visual-generation.md``).
 
 Single image:
 
@@ -25,7 +26,7 @@ import os
 import time
 
 from tensorrt_llm import VisualGen, VisualGenArgs, VisualGenParams, logger
-from tensorrt_llm.serve.media_storage import MediaStorage
+from tensorrt_llm.media.encoding import save_image
 
 logger.set_level("info")
 
@@ -126,6 +127,21 @@ def parse_args():
         action="store_true",
         help="Skip the warmup forward after pipeline load (faster startup)",
     )
+    parser.add_argument(
+        "--enable_cudagraph",
+        action="store_true",
+        help="Enable CUDA graph capture/replay for the transformer when torch.compile is disabled",
+    )
+    parser.add_argument(
+        "--linear_type",
+        type=str,
+        default="default",
+        choices=["default", "trtllm-fp8-per-tensor", "trtllm-fp8-blockwise", "trtllm-nvfp4"],
+        help=(
+            "Dynamic quantization mode for linear layers. "
+            "Quantizes weights on-the-fly during loading from an unquantized checkpoint."
+        ),
+    )
 
     args = parser.parse_args()
 
@@ -151,8 +167,18 @@ def load_prompts(prompts_file, num_prompts=None):
     return prompts
 
 
+def _linear_type_to_quant_config(linear_type: str):
+    """Map --linear_type CLI shortcut to quant_config dict for VisualGenArgs."""
+    mapping = {
+        "trtllm-fp8-per-tensor": {"quant_algo": "FP8", "dynamic": True},
+        "trtllm-fp8-blockwise": {"quant_algo": "FP8_BLOCK_SCALES", "dynamic": True},
+        "trtllm-nvfp4": {"quant_algo": "NVFP4", "dynamic": True},
+    }
+    return mapping.get(linear_type)
+
+
 def build_diffusion_args(args) -> VisualGenArgs:
-    return VisualGenArgs(
+    kwargs = dict(
         revision=args.revision,
         attention={"backend": args.attention_backend},
         parallel={"dit_ulysses_size": args.ulysses_size},
@@ -160,9 +186,13 @@ def build_diffusion_args(args) -> VisualGenArgs:
             "enable_torch_compile": not args.disable_torch_compile,
             "enable_autotune": not args.disable_autotune,
         },
-        cuda_graph={"enable_cuda_graph": False},
+        cuda_graph={"enable_cuda_graph": args.enable_cudagraph},
         skip_warmup=args.skip_warmup,
     )
+    quant_config = _linear_type_to_quant_config(args.linear_type)
+    if quant_config is not None:
+        kwargs["quant_config"] = quant_config
+    return VisualGenArgs(**kwargs)
 
 
 def main():
@@ -203,7 +233,7 @@ def main():
                 )
                 elapsed = time.time() - t0
                 output_path = os.path.join(args.output_dir, f"{i:02d}.png")
-                MediaStorage.save_image(output.image, output_path)
+                save_image(output.image, output_path)
                 logger.info(f"  Saved {output_path} ({elapsed:.1f}s)")
                 records.append(
                     {"index": i, "prompt": prompt, "time": round(elapsed, 2), "seed": args.seed + i}
@@ -239,7 +269,7 @@ def main():
             t0 = time.time()
             output = visual_gen.generate(inputs=args.prompt, params=params)
             elapsed = time.time() - t0
-            MediaStorage.save_image(output.image, args.output_path)
+            save_image(output.image, args.output_path)
             logger.info(f"Saved {args.output_path} ({elapsed:.1f}s)")
     finally:
         visual_gen.shutdown()

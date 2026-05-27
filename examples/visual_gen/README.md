@@ -76,9 +76,9 @@ python visual_gen_flux.py \
 ## Qwen-Image (Text-to-Image)
 
 20B MMDiT text-to-image model with a Qwen2.5-VL-7B text encoder and a
-16-channel 3D VAE. The Phase 1 reference implementation supports the
-native BF16 path through `VisualGen` / `trtllm-serve`; FP8/NVFP4,
-CUDA graph, CFG / Ulysses parallelism, and TeaCache are Phase 2
+16-channel 3D VAE. The implementation supports the native BF16 path,
+dynamic FP8 blockwise and NVFP4 quantization, CUDA graph, Ulysses
+parallelism, and `trtllm-serve`; CFG parallelism and TeaCache are
 follow-ups.
 
 ### Basic Usage
@@ -343,18 +343,19 @@ python visual_gen_ltx2.py \
 | `--parallel_vae_size` | — | — | ✓ | — | 1 | Parallelism used for VAE |
 | `--attn2d_row_size` | ✓ | — | ✓ | ✓ | 1 | Attention2D mesh row size |
 | `--attn2d_col_size` | ✓ | — | ✓ | ✓ | 1 | Attention2D mesh column size |
-| `--linear_type` | ✓ | — [^qi] | ✓ | ✓ | default | Quantization type |
+| `--linear_type` | ✓ | ✓ | ✓ | ✓ | default | Quantization type |
 | `--enhance_prompt` | — | — | — | ✓ | False | Gemma3 prompt enhancement |
 | `--stg_scale` | — | — | — | ✓ | 0.0 | Spatiotemporal guidance scale |
 | `--modality_scale` | — | — | — | ✓ | 1.0 | Cross-modal guidance scale |
 | `--rescale_scale` | — | — | — | ✓ | 0.0 | Variance-preserving rescale factor |
 
-[^qi]: Qwen-Image uses `--true_cfg_scale` (real classifier-free guidance) instead of FLUX's embedded `--guidance_scale`. FP8/NVFP4 quantization (`--linear_type`) is a follow-up; the reference implementation is BF16-only.
+[^qi]: Qwen-Image uses `--true_cfg_scale` (real classifier-free guidance)
+    instead of FLUX's embedded `--guidance_scale`.
 
 ## Troubleshooting
 
 **Out of Memory:**
-- Use quantization: `--linear_type trtllm-fp8-blockwise` (WAN) or `--linear_type trtllm-fp8-per-tensor` (FLUX)
+- Use quantization: `--linear_type trtllm-fp8-blockwise` or `--linear_type trtllm-nvfp4`
 - Reduce resolution or frames
 - Enable TeaCache: `--enable_teacache`
 - Use Ulysses parallelism with more GPUs
