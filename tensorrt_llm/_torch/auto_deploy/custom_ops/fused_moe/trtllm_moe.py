@@ -240,24 +240,12 @@ def _run_moe_with_alltoall(
     local_num_experts = fc1_expert_weights.shape[0]
     global_num_experts = local_num_experts * mapping.moe_ep_size
 
-    # Use the static max_num_tokens as the per-rank dispatch padding budget.
-    #
-    # The previous version of this code read ``batch_info_host[13]`` via
-    # ``.item()`` to use the cross-rank max from the AD shim's per-iter
-    # ``tp_allgather``. That works in eager mode but is INCORRECT under
-    # CUDA-graph capture: ``.item()`` is a host-side read whose result is
-    # baked into the kernel-launch arguments at capture time. The
-    # dispatched-tokens count, padding amount, and downstream kernel
-    # configurations all get frozen to the dummy-forward's value, and at
-    # replay the model attends to junk for any batch shape that differs
-    # from the dummy. The empirical signature is fluent generation that
-    # ignores the input prompt (0% GSM8K on Nemotron-Super-V3 NVFP4 + ADP).
-    #
-    # TODO(perf): to recover the cross-rank-max optimization under CUDA
-    # graphs, ``batch_info_host[13]`` (or equivalent) must reach the
-    # dispatch kernel through a *device* tensor argument so the value is
-    # actually runtime, not captured. Until then we over-pad to
-    # ``max_num_tokens`` -- correct but wasteful.
+    # ``runtime_max_tokens_per_rank`` controls the *workspace stride* and
+    # the *recv-tensor view shape* on the host side. Both must stay static
+    # to be capture-safe (changing either breaks downstream consumers that
+    # assume the static-stride workspace layout). We pin it to the static
+    # ``max_num_tokens``. The actual dispatch comm savings come from NOT
+    # padding ``x`` below -- see comment at the dispatch call site.
     runtime_max_tokens_per_rank = max_num_tokens
 
     # Workspace must be sized for the LARGEST element type used by dispatch or combine.
@@ -277,20 +265,17 @@ def _run_moe_with_alltoall(
 
     invalid_expert_id = global_num_experts
 
-    # Pad inputs to runtime_max_tokens_per_rank so all ranks send the same number
-    # of rows through dispatch.  Padding expert IDs must route to a VALID rank
-    # (the local rank's first expert), otherwise the dispatch kernel computes an
-    # out-of-bounds target rank.  Zero routing weights ensure padding tokens
-    # contribute nothing to the output.
+    # We pass ``runtime_max_tokens_per_rank = max_num_tokens`` (static workspace
+    # stride and recv-tensor view shape, capture-safe).  We do NOT pad ``x``
+    # to that budget though: the dispatch kernel processes only ``x.shape[0]``
+    # tokens and writes that many rows into each receiver's per-source slot.
+    # Receivers see stale data beyond ``recv_counters[src]`` in their slot but
+    # ``moe_a2a_sanitize_expert_ids`` rewrites those rows' expert IDs to
+    # ``invalid_expert_id`` so the downstream MoE GEMM treats them as skip.
+    # This eliminates the dispatch-write over-padding without touching the
+    # capture-time workspace layout, and without needing any C++ kernel
+    # changes.
     local_num_tokens = x.shape[0]
-    pad_expert_id = mapping.moe_ep_rank * local_num_experts  # routes to local rank
-    pad_size = runtime_max_tokens_per_rank - local_num_tokens
-    if pad_size > 0:
-        x = torch.nn.functional.pad(x, (0, 0, 0, pad_size))  # pad rows with zeros
-        selected_experts = torch.nn.functional.pad(
-            selected_experts, (0, 0, 0, pad_size), value=pad_expert_id
-        )
-        routing_weights = torch.nn.functional.pad(routing_weights, (0, 0, 0, pad_size))
 
     # Build payload list: x, selected_experts, routing_weights
     payloads = [x.contiguous(), selected_experts.contiguous(), routing_weights.contiguous()]
@@ -429,8 +414,9 @@ def _run_trtllm_gen_nvfp4_moe_with_alltoall(
     hidden_size = x.shape[-1]
     local_num_experts = int(fc1_expert_weights_fp4.shape[0])
     global_num_experts = local_num_experts * mapping.moe_ep_size
-    # See note on the cousin function above: reading slot 13 via .item()
-    # is unsafe under CUDA-graph capture. Use static max_num_tokens.
+    # See cousin function above: keep ``runtime_max_tokens_per_rank`` at the
+    # static ``max_num_tokens`` so the workspace stride / recv view shape stay
+    # capture-safe. Comm savings come from skipping the ``x`` padding below.
     runtime_max_tokens_per_rank = max_num_tokens
 
     moe_a2a = _GlobalMoeAll2AllCache.get_alltoall(
@@ -443,16 +429,12 @@ def _run_trtllm_gen_nvfp4_moe_with_alltoall(
         eplb_num_experts=None,
     )
 
+    # See cousin function above: skip the over-padding of ``x`` while keeping
+    # ``runtime_max_tokens_per_rank`` (workspace stride and recv-tensor view)
+    # at the static ``max_num_tokens``. Dispatch kernel writes only
+    # ``x.shape[0]`` rows per rank; sanitize handles stale rows.
     invalid_expert_id = global_num_experts
     local_num_tokens = x.shape[0]
-    pad_expert_id = mapping.moe_ep_rank * local_num_experts
-    pad_size = runtime_max_tokens_per_rank - local_num_tokens
-    if pad_size > 0:
-        x = torch.nn.functional.pad(x, (0, 0, 0, pad_size))
-        selected_experts = torch.nn.functional.pad(
-            selected_experts, (0, 0, 0, pad_size), value=pad_expert_id
-        )
-        routing_weights = torch.nn.functional.pad(routing_weights, (0, 0, 0, pad_size))
 
     recv_results = moe_a2a.dispatch(
         selected_experts,
