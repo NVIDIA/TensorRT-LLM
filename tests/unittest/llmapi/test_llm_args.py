@@ -172,14 +172,21 @@ model_kwargs:
 class TestEncoderRuntimeSizes:
     """Cover encoder runtime size fields and fallback to LLM limits.
 
-    `encoder_max_batch_size` / `encoder_max_num_tokens` are user-facing
-    knobs that size multimodal encoder AttentionMetadata; when unset they
-    fall back to the LLM-side `max_batch_size` / `max_num_tokens`.
+    `encoder_max_batch_size` is anchored at 64 to cap encoder
+    AttentionMetadata preallocation; `encoder_max_num_tokens` is unset by
+    default and falls back to the LLM-side `max_num_tokens`. Both knobs
+    are still overridable per user request; passing `encoder_max_batch_size
+    =None` restores the legacy "fall back to max_batch_size" behavior.
     """
 
-    def test_defaults_are_none(self, llm_args_cls):
+    def test_defaults(self, llm_args_cls):
         llm_args = llm_args_cls(model=llama_model_path)
-        assert llm_args.encoder_max_batch_size is None
+        # Anchored at 64: see commit "Default encoder_max_batch_size to 64
+        # to cap encoder prealloc" -- max_batch_size fallback (2048) made
+        # high-fan-out encoders (Qwen2/2.5-VL windowed attention) over-
+        # allocate AttentionMetadata.max_num_requests by ~160K.
+        assert llm_args.encoder_max_batch_size == 64
+        # Token cap still falls back to LLM-side max_num_tokens when unset.
         assert llm_args.encoder_max_num_tokens is None
 
     @pytest.mark.parametrize(
