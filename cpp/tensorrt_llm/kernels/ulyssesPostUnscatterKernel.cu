@@ -67,9 +67,10 @@ __global__ void ulyssesPostUnscatterKernel(T const* __restrict__ q_in, T const* 
     }
 
     // in[p, b, sp, h, d]: ((((p*B + b)*Sp + sp)*H + h)*D + vec_idx*VEC)
-    int const in_base = ((((p * B + b) * Sp + sp) * H + h) * D) + vec_idx * VEC;
     // out[b, h, p*Sp+sp, d]: (((b*H + h)*PSp + psp)*D + vec_idx*VEC)
-    int const out_base = (((b * H + h) * PSp) + psp) * D + vec_idx * VEC;
+    // int64_t: P*B*Sp*H*D can exceed 2^31 at large workloads.
+    int64_t const in_base = ((((static_cast<int64_t>(p) * B + b) * Sp + sp) * H + h) * D) + vec_idx * VEC;
+    int64_t const out_base = (((static_cast<int64_t>(b) * H + h) * PSp) + psp) * D + vec_idx * VEC;
 
     uint4 const* in_v4 = reinterpret_cast<uint4 const*>(in_ptr + in_base);
     uint4* out_v4 = reinterpret_cast<uint4*>(out_ptr + out_base);
