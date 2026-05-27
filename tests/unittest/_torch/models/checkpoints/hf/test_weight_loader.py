@@ -3,6 +3,7 @@ from unittest import mock
 import pytest
 
 from tensorrt_llm._torch.models.checkpoints import HfWeightLoader
+from tensorrt_llm._torch.models.checkpoints.hf import weight_loader
 from tensorrt_llm.mapping import Mapping
 
 
@@ -97,3 +98,62 @@ def test_load_weights_ignores_consolidated_ckpt_when_sharded_ckpt_exists(
     load_weights_in_parallel.assert_called_once()
     loaded_weight_files = load_weights_in_parallel.call_args[0][0]
     assert set(loaded_weight_files) == expected_safetensor_filenames
+
+
+def test_prefetch_one_file_reads_in_bounded_chunks(monkeypatch):
+    class FakeFile:
+        def __init__(self):
+            self.remaining_bytes = 10
+            self.read_sizes = []
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def readinto(self, buffer):
+            self.read_sizes.append(len(buffer))
+            if self.remaining_bytes == 0:
+                return 0
+            read_size = min(len(buffer), self.remaining_bytes)
+            buffer[:read_size] = b"x" * read_size
+            self.remaining_bytes -= read_size
+            return read_size
+
+    fake_file = FakeFile()
+
+    monkeypatch.setattr(weight_loader.os.path, "exists", lambda _: True)
+    monkeypatch.setattr(weight_loader, "_PREFETCH_CHUNK_SIZE", 4)
+    monkeypatch.setattr("builtins.open", lambda *_, **__: fake_file)
+
+    HfWeightLoader()._prefetch_one_file("checkpoint.safetensors")
+
+    assert fake_file.read_sizes == [4, 4, 4, 4]
+
+
+def test_prefetch_files_caps_per_rank_workers(monkeypatch):
+    class FakeThreadPoolExecutor:
+        def __init__(self, max_workers):
+            self.max_workers = max_workers
+
+        def __enter__(self):
+            observed_max_workers.append(self.max_workers)
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def map(self, _func, file_names):
+            return [None for _ in file_names]
+
+    observed_max_workers = []
+    file_names = [f"model-{idx}.safetensors" for idx in range(4)]
+
+    monkeypatch.setattr(weight_loader, "ThreadPoolExecutor", FakeThreadPoolExecutor)
+    monkeypatch.setattr(weight_loader, "local_mpi_rank", lambda: 0)
+    monkeypatch.setattr(weight_loader, "local_mpi_size", lambda: 1)
+
+    HfWeightLoader().prefetch_files(file_names)
+
+    assert observed_max_workers == [weight_loader._MAX_PREFETCH_WORKERS_PER_RANK]
