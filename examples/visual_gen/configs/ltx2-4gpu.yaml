@@ -21,9 +21,8 @@ attention_config:
 parallel_config:
   cfg_size: 2
   ulysses_size: 2
-  # Overlap V/Q/K projection compute with the Ulysses A2A on a side stream.
-  # Requires NVLink-connected ranks (CUDA IPC via _SymmetricMemory); on a
-  # single 4/8-GPU node or MNNVL domain this is fine.
   async_ulysses: true
+torch_compile_config:
+  enable: true
 cuda_graph_config:
-  enable: false
+  enable: true
