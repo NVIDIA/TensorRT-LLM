@@ -212,6 +212,9 @@ transforms:
   fuse_allreduce_residual_rmsnorm:
     stage: post_load_fusion
     requires_shape_prop: true
+  fuse_allreduce_residual_rmsnorm_quant_fp8:
+    stage: post_load_fusion
+    enabled: false
   fuse_rmsnorm:
     stage: post_load_fusion
     rmsnorm_backend: flashinfer

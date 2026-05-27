@@ -19,15 +19,17 @@ when TRT-LLM is available (MPI mode) since it provides optimized fused kernels.
 The torch backend (demollm mode) does not benefit from fusion.
 """
 
+import operator
 from functools import partial
-from typing import Tuple
+from typing import Optional, Tuple
 
 import torch
-from torch.fx import GraphModule
+from torch.fx import GraphModule, Node
 
 from ...models.factory import ModelFactory
 from ...shim.interface import CachedSequenceInterface
 from ...utils.logger import ad_logger
+from ...utils.node_utils import is_op
 from ...utils.pattern_matcher import ADPatternMatcherPass, register_ad_pattern
 from ..interface import BaseTransform, SharedConfig, TransformInfo, TransformRegistry
 
@@ -184,6 +186,140 @@ class FuseAllreduceResidualRMSNorm(BaseTransform):
 
         info = TransformInfo(
             skipped=False,
+            num_matches=num_matches,
+            is_clean=num_matches == 0,
+            has_valid_shapes=num_matches == 0,
+        )
+        return gm, info
+
+
+# ============================================================================
+# fuse_allreduce_residual_rmsnorm + downstream FP8 quant
+# ============================================================================
+
+
+def _get_single_norm_consumer(fused_node: Node) -> Optional[Node]:
+    """Return the unique downstream consumer of fused_node[0] when it's a single
+    trtllm_quant_fp8_linear with matching scalar input_scale; else None.
+
+    fused_node has 2 outputs: (norm, residual). We need to confirm getitem(0) is
+    the only consumer of the norm output, and that consumer is a single FP8
+    linear node.
+    """
+    norm_getitem: Optional[Node] = None
+    for user in fused_node.users:
+        if user.op == "call_function" and user.target is operator.getitem and len(user.args) >= 2:
+            idx = user.args[1]
+            if idx == 0:
+                if norm_getitem is not None:
+                    return None
+                norm_getitem = user
+
+    if norm_getitem is None:
+        return None
+    if len(norm_getitem.users) != 1:
+        return None
+    consumer = next(iter(norm_getitem.users))
+    if not is_op(consumer, torch.ops.auto_deploy.trtllm_quant_fp8_linear):
+        return None
+    return consumer
+
+
+@TransformRegistry.register("fuse_allreduce_residual_rmsnorm_quant_fp8")
+class FuseAllreduceResidualRMSNormQuantFP8(BaseTransform):
+    """Fuse (allreduce + residual + RMSNorm + FP8 quant) into one fused op.
+
+    Pattern (post ``fuse_allreduce_residual_rmsnorm``)::
+
+        fused = trtllm_fused_allreduce_residual_rmsnorm(x, residual, w, eps, strategy)
+        norm = fused[0]  # bf16
+        residual_out = fused[1]  # bf16
+        linear_out = trtllm_quant_fp8_linear(norm, w_fp8, bias, input_scale, ...)
+
+    The downstream FP8 linear internally calls ``static_quantize_e4m3_per_tensor``
+    to quantize ``norm`` to FP8 before the matmul. By folding that quantize into
+    the allreduce kernel (``AllReduceFusionOp.RESIDUAL_RMS_NORM_QUANT_FP8``) we
+    save one kernel launch per allreduce site - meaningful at small-batch
+    decode where launch count dominates allreduce wall time.
+    """
+
+    def _apply(
+        self,
+        gm: GraphModule,
+        cm: CachedSequenceInterface,
+        factory: ModelFactory,
+        shared_config: SharedConfig,
+    ) -> Tuple[GraphModule, TransformInfo]:
+        graph = gm.graph
+        num_matches = 0
+
+        fused_op_target = torch.ops.dist.trtllm_fused_allreduce_residual_rmsnorm.default
+        fused_quant_op_target = (
+            torch.ops.dist.trtllm_fused_allreduce_residual_rmsnorm_quant_fp8.default
+        )
+
+        for node in list(graph.nodes):
+            if node.op != "call_function" or node.target is not fused_op_target:
+                continue
+
+            linear_consumer = _get_single_norm_consumer(node)
+            if linear_consumer is None:
+                continue
+
+            # Extract scale from linear; quant_fp8_linear args:
+            # (input, weight_fp8, bias, input_scale, weight_scale, ...)
+            if len(linear_consumer.args) < 4:
+                continue
+            input_scale = linear_consumer.args[3]
+            if not isinstance(input_scale, Node):
+                continue
+
+            x_arg, residual_arg, weight_arg, eps_arg, strategy_arg = node.args
+
+            # Insert before the FP8 linear consumer. ``input_scale`` is a
+            # ``get_attr`` node defined upstream of the linear (the linear is
+            # what consumes it), so this position is safe for all operands and
+            # downstream of the original fused node's residual-only users.
+            with graph.inserting_before(linear_consumer):
+                fused_quant = graph.call_function(
+                    fused_quant_op_target,
+                    args=(
+                        x_arg,
+                        residual_arg,
+                        weight_arg,
+                        input_scale,
+                        eps_arg,
+                        strategy_arg,
+                    ),
+                )
+                new_norm = graph.call_function(operator.getitem, args=(fused_quant, 0))
+                new_residual = graph.call_function(operator.getitem, args=(fused_quant, 1))
+
+            # Rewire all users of the original getitem(0)/(1) to the new
+            # equivalents. Users of getitem(0) must consume the now-FP8 norm.
+            for user in list(node.users):
+                if user.op != "call_function" or user.target is not operator.getitem:
+                    continue
+                idx = user.args[1]
+                replacement = new_norm if idx == 0 else new_residual
+                user.replace_all_uses_with(replacement)
+                graph.erase_node(user)
+
+            # The lone consumer of the (now-FP8) norm is the FP8 linear. Tell
+            # it the output dtype explicitly so the op resolves the bf16
+            # accumulator without a bias hint.
+            new_kwargs = dict(linear_consumer.kwargs)
+            new_kwargs.setdefault("out_dtype", "bfloat16")
+            linear_consumer.kwargs = new_kwargs
+
+            graph.erase_node(node)
+            num_matches += 1
+
+        if num_matches > 0:
+            gm.recompile()
+
+        info = TransformInfo(
+            skipped=num_matches == 0,
             num_matches=num_matches,
             is_clean=num_matches == 0,
             has_valid_shapes=num_matches == 0,

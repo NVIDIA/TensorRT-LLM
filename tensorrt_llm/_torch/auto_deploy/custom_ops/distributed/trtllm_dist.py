@@ -200,6 +200,52 @@ def trtllm_fused_allreduce_residual_rmsnorm_fake(
     return torch.empty_like(tensor), torch.empty_like(tensor)
 
 
+# TRT-LLM fused allreduce + residual + RMSNorm + FP8 quant
+@torch.library.custom_op(
+    "dist::trtllm_fused_allreduce_residual_rmsnorm_quant_fp8",
+    mutates_args=(),
+    device_types="cuda",
+)
+def trtllm_fused_allreduce_residual_rmsnorm_quant_fp8(
+    tensor: torch.Tensor,
+    residual: torch.Tensor,
+    norm_weight: torch.Tensor,
+    scale: torch.Tensor,
+    eps: float,
+    strategy: str,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Fused allreduce + residual + RMSNorm + FP8 quant using TRT-LLM kernel.
+
+    Returns (norm_quant_fp8, residual_out). ``scale`` is the per-tensor FP8
+    quantization scale used by the downstream FP8 linear.
+    """
+    all_reduce_params = AllReduceParams(
+        fusion_op=AllReduceFusionOp.RESIDUAL_RMS_NORM_QUANT_FP8,
+        bias=None,
+        residual=residual,
+        norm_weight=norm_weight,
+        scale=scale,
+        eps=eps,
+    )
+    norm_quant, residual_out = trtllm_allreduce(
+        tensor, ReduceOp.SUM, strategy=strategy, all_reduce_params=all_reduce_params
+    )
+    return norm_quant, residual_out
+
+
+@trtllm_fused_allreduce_residual_rmsnorm_quant_fp8.register_fake
+def trtllm_fused_allreduce_residual_rmsnorm_quant_fp8_fake(
+    tensor: torch.Tensor,
+    residual: torch.Tensor,
+    norm_weight: torch.Tensor,
+    scale: torch.Tensor,
+    eps: float,
+    strategy: str,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    norm_quant = torch.empty(tensor.shape, dtype=torch.float8_e4m3fn, device=tensor.device)
+    return norm_quant, torch.empty_like(tensor)
+
+
 def is_trtllm_op_available():
     """Check if TRT-LLM ops are available and running with MPI."""
     return is_ompi()
