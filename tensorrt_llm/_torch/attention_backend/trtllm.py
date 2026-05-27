@@ -38,7 +38,7 @@ from tensorrt_llm.models.modeling_utils import QuantConfig
 
 from ..utils import (compute_swizzled_sf_shape, get_global_attrs,
                      get_model_extra_attrs)
-from .fp4_mla_kv import HP_BLOCK_SIZE, update_hp_kv_for_fp4_mla
+from .fp4_mla import HP_BLOCK_SIZE, update_hp_kv_for_fp4_mla
 from .interface import (AttentionBackend, AttentionForwardArgs,
                         AttentionInputType, AttentionMask, AttentionMetadata,
                         KVCacheParams, MLAParams, PositionalEmbeddingParams,
@@ -163,6 +163,7 @@ class TrtllmAttentionMetadata(AttentionMetadata):
     # Shape: [max_num_sequences, num_local_layers, kv_factor, HP_BLOCK_SIZE * head_dim]
     # Standalone tensor, not part of the block-based paged KV cache.
     high_precision_kv_pool: Optional[torch.Tensor] = None
+    fp4_mla_hp_snapshot_pool: Optional[torch.Tensor] = None
     # Ownership tracking: maps seq_slot to request_id that last wrote it.
     # Plain Python dict, updated during context phase, checked during decode.
     # Debug only; runs outside CUDA graph.
@@ -475,6 +476,19 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                 dtype=torch.bfloat16,
                 capture_graph=capture_graph,
             )
+            if capture_graph:
+                self.fp4_mla_hp_snapshot_pool = self.get_empty(
+                    buffers,
+                    [
+                        self.max_num_sequences, num_local_layers, kv_factor,
+                        HP_BLOCK_SIZE * head_dim
+                    ],
+                    cache_name="fp4_mla_hp_snapshot_pool",
+                    dtype=torch.bfloat16,
+                    capture_graph=capture_graph,
+                )
+            else:
+                self.fp4_mla_hp_snapshot_pool = None
             logger.info(
                 f"Allocated high-precision BF16 KV pool: shape="
                 f"{list(self.high_precision_kv_pool.shape)}, "
@@ -1489,7 +1503,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         attention_input_type: AttentionInputType = AttentionInputType.mixed,
     ) -> None:
         """Thin wrapper over the shared HP-pool update helper (see
-        ``fp4_mla_kv.update_hp_kv_for_fp4_mla`` for the full contract)."""
+        ``fp4_mla.update_hp_kv_for_fp4_mla`` for the full contract)."""
         if attention_input_type == AttentionInputType.context_only:
             phase = "context"
         elif attention_input_type == AttentionInputType.generation_only:

@@ -210,6 +210,13 @@ def _enable_fp4_mla_attention() -> bool:
     )
 
 
+def _is_fp4_mla_flashinfer_attention_requested(llm_args: TorchLlmArgs,
+                                               kv_cache_config) -> bool:
+    return (llm_args.attn_backend == "FLASHINFER"
+            and _has_fp4_kv_cache(llm_args, kv_cache_config)
+            and _enable_fp4_mla_attention())
+
+
 def _select_mla_tokens_per_block(config, model_config, kv_cache_config,
                                  tokens_per_block: int) -> int:
     if not is_mla(config):
@@ -459,14 +466,36 @@ def create_py_executor(
             )
             llm_args.disable_overlap_scheduler = True
 
-        # Check FLASHINFER compatibility with one-engine speculative decoding
-        if llm_args.attn_backend == "FLASHINFER":
+    if spec_config is not None and spec_config.spec_dec_mode.use_one_engine():
+        if not spec_config.allow_advanced_sampling:
+            logger.warning(
+                f"Falling back to greedy decoding for {spec_config.decoding_type}. If you "
+                "want to use non-greedy sampling, please set allow_advanced_sampling=True."
+            )
+        elif (spec_config.spec_dec_mode.is_mtp_eagle_one_model()
+              and not getattr(spec_config, "use_rejection_sampling", False)):
+            logger.warning(
+                "MTP-Eagle one-model advanced sampling is using strict "
+                "token-match acceptance. This can change the sampled output "
+                "distribution; set use_rejection_sampling=True to use exact "
+                "one-model speculative sampling.")
+        # Regular FlashInfer decode expects one query token per sequence.  The
+        # FP4 MLA no-dequant path has its own linear-MTP handling, so allow that
+        # explicit configuration through.
+        fp4_mla_flashinfer = _is_fp4_mla_flashinfer_attention_requested(
+            llm_args, kv_cache_config)
+        if llm_args.attn_backend == "FLASHINFER" and not fp4_mla_flashinfer:
             raise ValueError(
                 f"FLASHINFER attention backend is not supported with one-engine speculative "
                 f"decoding mode '{spec_config.spec_dec_mode.name}'. The FLASHINFER backend's "
                 f"decode path expects exactly 1 token per sequence, but one-engine speculative "
                 f"decoding requires multiple tokens per sequence. Please use 'TRTLLM' attention "
                 f"backend instead by setting attn_backend='TRTLLM'.")
+        if fp4_mla_flashinfer:
+            # FlashInfer metadata prepares page tables against one KV manager.
+            # Keep one-model MTP draft layers in the main manager so global
+            # draft layer ids are present in layer_offsets.
+            spec_config._allow_separate_draft_kv_cache = False
 
     if mm_encoder_only:
         llm_args.mm_encoder_only = True

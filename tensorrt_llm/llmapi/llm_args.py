@@ -4760,17 +4760,17 @@ class TorchLlmArgs(BaseLlmArgs):
                     exclude={"decoding_type"})
                 self.speculative_config = Eagle3DecodingConfig(**eagle_data)
 
-            if self.speculative_config.use_rejection_sampling and not isinstance(
-                    self.speculative_config, Eagle3DecodingConfig):
-                # Rejection sampling is only wired up for Eagle3 one-model paths.
-                # Silently fall back for other spec types so the new default
-                # (True) does not break them.
-                # TODO: extend rejection sampling to the remaining speculative
-                # decoding paths (MTP / DraftTarget / PARD / DFlash /
-                # SaveHiddenStates / SA) and unify the dispatch in SpecMetadata
-                # so new spec algorithms get rejection sampling for free; once
-                # all paths are covered this whitelist guard can be removed.
-                self.speculative_config.use_rejection_sampling = False
+            if self.speculative_config.use_rejection_sampling:
+                is_supported_rejection_path = isinstance(
+                    self.speculative_config, Eagle3DecodingConfig) or (
+                        isinstance(self.speculative_config, MTPDecodingConfig)
+                        and self.speculative_config.spec_dec_mode.
+                        is_mtp_eagle_one_model())
+                if not is_supported_rejection_path:
+                    raise ValueError(
+                        "use_rejection_sampling is only supported for "
+                        "PyTorch Eagle3 and MTP-Eagle one-model speculative "
+                        "decoding paths.")
 
             if isinstance(self.speculative_config, PARDDecodingConfig):
                 assert self.speculative_config.max_draft_len > 0, "PARD max_draft_len must be > 0"
