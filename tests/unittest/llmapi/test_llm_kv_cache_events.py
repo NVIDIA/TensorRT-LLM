@@ -330,11 +330,11 @@ def test_apply_mm_hashes_video_audio_affects_hash():
     audio_a_copy = audio_a.copy()
     audio_b = np.array([0.0, 0.25, -0.5, -1.0], dtype=np.float32)
 
-    def make_video(audio_samples=None, sample_rate=16000):
+    def make_video(audio_samples=None, sample_rate=16000, metadata=None):
         audio = None
         if audio_samples is not None:
             audio = AudioData(samples=audio_samples, sample_rate=sample_rate)
-        return VideoData(frames=frames, metadata={}, audio=audio)
+        return VideoData(frames=frames, metadata=metadata or {}, audio=audio)
 
     hashes_a, _ = apply_mm_hashes({"video": [make_video(audio_a)]})
     hashes_a_copy, _ = apply_mm_hashes({"video": [make_video(audio_a_copy)]})
@@ -343,11 +343,14 @@ def test_apply_mm_hashes_video_audio_affects_hash():
         {"video": [make_video(audio_a, sample_rate=8000)]})
     hashes_no_audio, _ = apply_mm_hashes({"video": [make_video()]})
     hashes_frame_list, _ = apply_mm_hashes({"video": [frames]})
+    hashes_metadata, _ = apply_mm_hashes(
+        {"video": [make_video(metadata={"frames_indices": [3, 9]})]})
 
     assert hashes_a["video"][0] == hashes_a_copy["video"][0]
     assert hashes_a["video"][0] != hashes_b["video"][0]
     assert hashes_a["video"][0] != hashes_a_different_rate["video"][0]
-    assert hashes_no_audio["video"][0] == hashes_frame_list["video"][0]
+    assert hashes_no_audio["video"][0] != hashes_frame_list["video"][0]
+    assert hashes_no_audio["video"][0] != hashes_metadata["video"][0]
 
     mm_uuids = {"video": ["shared-video-id"]}
     hashes_uuid_a, _ = apply_mm_hashes({"video": [make_video(audio_a)]},
@@ -355,6 +358,16 @@ def test_apply_mm_hashes_video_audio_affects_hash():
     hashes_uuid_b, _ = apply_mm_hashes({"video": [make_video(audio_b)]},
                                        mm_uuids)
     assert hashes_uuid_a["video"][0] != hashes_uuid_b["video"][0]
+
+
+def test_apply_mm_hashes_structural_content_affects_hash():
+    array_a = np.arange(6, dtype=np.uint8).reshape(2, 3)
+    array_b = array_a.reshape(3, 2)
+
+    hashes_a, _ = apply_mm_hashes({"image": [array_a]})
+    hashes_b, _ = apply_mm_hashes({"image": [array_b]})
+
+    assert hashes_a["image"][0] != hashes_b["image"][0]
 
 
 def test_apply_mm_hashes_audio_data_deterministic():
