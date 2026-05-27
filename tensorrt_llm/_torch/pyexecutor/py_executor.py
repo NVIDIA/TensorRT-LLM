@@ -904,8 +904,8 @@ class PyExecutor:
         # resource managers. atexit is a fallback, but firing here gives the
         # user a clean exit-success signal in trtllm-serve.
         try:
-            from tensorrt_llm._torch.attention_backend.trtllm import (
-                _peek_skip_softmax_stat_logger)
+            from tensorrt_llm._torch.attention_backend.trtllm import \
+                _peek_skip_softmax_stat_logger
         except ImportError as exc:
             logger.warning(
                 f"Skip-softmax stat logger import failed during shutdown: {exc!r}"

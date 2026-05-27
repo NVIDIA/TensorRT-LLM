@@ -383,8 +383,7 @@ struct Compute
             // Update threshold of Skip-Softmax
             if constexpr (Kernel_traits::ENABLE_SKIP_SOFTMAX)
             {
-                float const skip_softmax_threshold
-                    = params.skip_softmax_threshold_scale_factor / actual_kv_seqlen;
+                float const skip_softmax_threshold = params.skip_softmax_threshold_scale_factor / actual_kv_seqlen;
                 if constexpr (Kernel_traits::EXP2F_OPTIMIZATION)
                 {
                     softmax.skip_softmax_log_threshold = log2f(skip_softmax_threshold);

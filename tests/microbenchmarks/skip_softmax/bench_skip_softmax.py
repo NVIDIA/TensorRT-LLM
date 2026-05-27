@@ -77,8 +77,9 @@ DRY_RUN_ITERS = 5
 REPEAT_ITERS = 20
 
 
-def _load_configs(config: str, threshold_sweep: list[float] | None,
-                  batch_size: int | None) -> list[FmhaConfig]:
+def _load_configs(
+    config: str, threshold_sweep: list[float] | None, batch_size: int | None
+) -> list[FmhaConfig]:
     cfgs: list[FmhaConfig] = []
     if config in ("llm", "both"):
         cfgs.extend(llm_configs())
@@ -118,12 +119,14 @@ def _torch_op_configs(cfgs: list[FmhaConfig]) -> list[FmhaConfig]:
         if cfg.seq_len_q != cfg.seq_len_kv:
             _warn(
                 f"skipping {cfg.name}: torch-op backend is prefill-only "
-                f"(seq_len_q={cfg.seq_len_q}, seq_len_kv={cfg.seq_len_kv})")
+                f"(seq_len_q={cfg.seq_len_q}, seq_len_kv={cfg.seq_len_kv})"
+            )
             continue
         if cfg.dtype not in TORCH_SUPPORTED_DTYPES:
             _warn(
                 f"skipping {cfg.name}: torch-op backend supports bf16/fp16 "
-                f"inputs, not dtype={cfg.dtype!r}")
+                f"inputs, not dtype={cfg.dtype!r}"
+            )
             continue
         selected.append(cfg)
     return selected
@@ -148,7 +151,8 @@ def _import_trtllm_attention() -> tuple[type, object, object, Callable[[], int]]
     except ImportError as exc:
         raise RuntimeError(
             "The torch-op backend requires the TensorRT-LLM Python attention "
-            "stack and its compiled thop bindings.") from exc
+            "stack and its compiled thop bindings."
+        ) from exc
 
     trtllm_module._TRTLLM_ENABLE_TRTLLM_GEN_ATTENTION = False
     return (
@@ -163,56 +167,47 @@ class TorchOpFmhaRunner:
     def __init__(self, cfg: FmhaConfig) -> None:
         torch = _import_torch()
         wrapper_cls, attention_input_type, predefined_mask, get_sm_version = (
-            _import_trtllm_attention())
+            _import_trtllm_attention()
+        )
         self.cfg = cfg
         self.torch = torch
         self.attention_input_type = attention_input_type
-        self.attention_mask = (predefined_mask.CAUSAL
-                               if cfg.mask == "causal" else
-                               predefined_mask.FULL)
+        self.attention_mask = (
+            predefined_mask.CAUSAL if cfg.mask == "causal" else predefined_mask.FULL
+        )
         self.use_paged_context_fmha = get_sm_version() == 90
         self.num_tokens = cfg.batch * cfg.seq_len_q
-        self.qkv_hidden_size = (
-            cfg.num_heads_q + 2 * cfg.num_heads_kv) * cfg.head_size
+        self.qkv_hidden_size = (cfg.num_heads_q + 2 * cfg.num_heads_kv) * cfg.head_size
         self.output_hidden_size = cfg.num_heads_q * cfg.head_size
         dtype = {
             "bf16": torch.bfloat16,
             "fp16": torch.float16,
         }[cfg.dtype]
 
-        self.qkv = torch.empty((self.num_tokens, self.qkv_hidden_size),
-                               dtype=dtype,
-                               device="cuda")
+        self.qkv = torch.empty((self.num_tokens, self.qkv_hidden_size), dtype=dtype, device="cuda")
         self.qkv.normal_(mean=0.0, std=0.02)
-        self.output = torch.empty((self.num_tokens, self.output_hidden_size),
-                                  dtype=dtype,
-                                  device="cuda")
-        self.workspace = torch.empty((0, ), dtype=torch.int8, device="cuda")
+        self.output = torch.empty(
+            (self.num_tokens, self.output_hidden_size), dtype=dtype, device="cuda"
+        )
+        self.workspace = torch.empty((0,), dtype=torch.int8, device="cuda")
 
-        self.sequence_length = torch.full((cfg.batch, ),
-                                          cfg.seq_len_q,
-                                          dtype=torch.int32,
-                                          device="cuda")
+        self.sequence_length = torch.full(
+            (cfg.batch,), cfg.seq_len_q, dtype=torch.int32, device="cuda"
+        )
         self.context_lengths = self.sequence_length.clone()
-        self.host_context_lengths = torch.full((cfg.batch, ),
-                                               cfg.seq_len_q,
-                                               dtype=torch.int32,
-                                               device="cpu")
+        self.host_context_lengths = torch.full(
+            (cfg.batch,), cfg.seq_len_q, dtype=torch.int32, device="cpu"
+        )
         self.host_past_key_value_lengths = self.host_context_lengths.clone()
-        self.host_total_kv_lens = torch.tensor([self.num_tokens, 0],
-                                               dtype=torch.int32,
-                                               device="cpu")
-        self.host_request_types = torch.zeros((cfg.batch, ),
-                                              dtype=torch.int32,
-                                              device="cpu")
+        self.host_total_kv_lens = torch.tensor(
+            [self.num_tokens, 0], dtype=torch.int32, device="cpu"
+        )
+        self.host_request_types = torch.zeros((cfg.batch,), dtype=torch.int32, device="cpu")
 
-        self.wrapper = wrapper_cls(cfg.num_heads_q,
-                                   cfg.head_size,
-                                   num_kv_heads=cfg.num_heads_kv)
+        self.wrapper = wrapper_cls(cfg.num_heads_q, cfg.head_size, num_kv_heads=cfg.num_heads_kv)
         self.wrapper.update_quant_config(None)
 
-    def plan(self, threshold: float,
-             skip_softmax_stat: object | None = None) -> None:
+    def plan(self, threshold: float, skip_softmax_stat: object | None = None) -> None:
         threshold_arg = float(threshold) if threshold > 0 else None
         self.wrapper.plan(
             layer_idx=0,
@@ -252,14 +247,12 @@ class TorchOpFmhaRunner:
             num_ctx_tokens=self.num_tokens,
         )
 
-    def run(self, threshold: float,
-            skip_softmax_stat: object | None = None) -> None:
+    def run(self, threshold: float, skip_softmax_stat: object | None = None) -> None:
         self.plan(threshold, skip_softmax_stat=skip_softmax_stat)
         self.run_kernel()
 
 
-def _stat_row(cfg: FmhaConfig, threshold: float, total: int,
-              skipped: int) -> dict[str, object]:
+def _stat_row(cfg: FmhaConfig, threshold: float, total: int, skipped: int) -> dict[str, object]:
     return {
         "config": cfg.name,
         "dtype": cfg.dtype,
@@ -288,47 +281,46 @@ def _get_bench_gpu_time() -> Callable[..., list[float]]:
     return bench_gpu_time
 
 
-def _verify_single_fmha_kernel(runner: TorchOpFmhaRunner,
-                               threshold: float) -> None:
+def _verify_single_fmha_kernel(runner: TorchOpFmhaRunner, threshold: float) -> None:
     torch = runner.torch
     for _ in range(DRY_RUN_ITERS):
         runner.run(threshold, skip_softmax_stat=None)
     torch.cuda.synchronize()
 
-    with torch.inference_mode(), torch.profiler.profile(
-            activities=[torch.profiler.ProfilerActivity.CUDA]) as profiler:
+    with (
+        torch.inference_mode(),
+        torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CUDA]) as profiler,
+    ):
         runner.run(threshold, skip_softmax_stat=None)
     torch.cuda.synchronize()
 
     cuda_events = [
-        event for event in profiler.events()
+        event
+        for event in profiler.events()
         if getattr(event, "device_type", None) == torch.autograd.DeviceType.CUDA
     ]
-    event_names = [
-        str(getattr(event, "name", getattr(event, "key", "")))
-        for event in cuda_events
-    ]
-    fmha_events = [
-        name for name in event_names if "fmha" in name.lower()
-    ]
+    event_names = [str(getattr(event, "name", getattr(event, "key", ""))) for event in cuda_events]
+    fmha_events = [name for name in event_names if "fmha" in name.lower()]
     if len(fmha_events) != 1:
         raise AssertionError(
             f"expected exactly one FMHA CUDA event for {runner.cfg.name}, "
-            f"got {len(fmha_events)} from events: {event_names}")
+            f"got {len(fmha_events)} from events: {event_names}"
+        )
 
-    other_events = sorted({
-        name
-        for name in event_names
-        if "fmha" not in name.lower() and "memset" not in name.lower()
-    })
+    other_events = sorted(
+        {
+            name
+            for name in event_names
+            if "fmha" not in name.lower() and "memset" not in name.lower()
+        }
+    )
     if other_events:
         _warn(
-            f"{runner.cfg.name}: profiler saw non-FMHA CUDA events "
-            f"besides memset: {other_events}")
+            f"{runner.cfg.name}: profiler saw non-FMHA CUDA events besides memset: {other_events}"
+        )
 
 
-def _make_timed_fn(runner: TorchOpFmhaRunner,
-                   threshold: float) -> Callable[[], None]:
+def _make_timed_fn(runner: TorchOpFmhaRunner, threshold: float) -> Callable[[], None]:
     """Returns a callable that invokes plan() + wrapper.run() per iter.
 
     wrapper.run() calls self.plan() with no args at exit (line 890 in
@@ -339,6 +331,7 @@ def _make_timed_fn(runner: TorchOpFmhaRunner,
     computeSeqAndPaddingOffsets), which are constant overhead independent of
     the skip-softmax threshold.
     """
+
     def fn() -> None:
         runner.run(threshold, skip_softmax_stat=None)
 
@@ -351,8 +344,7 @@ def pass1_sparsity(cfgs: list[FmhaConfig]) -> list[dict[str, object]]:
         runner = TorchOpFmhaRunner(cfg)
         torch = runner.torch
         for threshold in cfg.threshold_sweep:
-            print(f"[pass1] {cfg.name} threshold={threshold:g} ...",
-                  flush=True)
+            print(f"[pass1] {cfg.name} threshold={threshold:g} ...", flush=True)
             stat = torch.zeros(2, dtype=torch.uint32, device="cuda")
             runner.run(threshold, skip_softmax_stat=stat)
             raw_stat = stat.cpu().tolist()
@@ -360,7 +352,8 @@ def pass1_sparsity(cfgs: list[FmhaConfig]) -> list[dict[str, object]]:
             if threshold > 0 and total == 0:
                 raise RuntimeError(
                     f"{cfg.name} threshold={threshold:g}: skip-softmax stat "
-                    f"counter total_blocks is 0, raw stat={raw_stat}")
+                    f"counter total_blocks is 0, raw stat={raw_stat}"
+                )
             rows.append(_stat_row(cfg, threshold, total, skipped))
         del runner
         torch.cuda.empty_cache()
@@ -385,39 +378,40 @@ def pass2_speedup(cfgs: list[FmhaConfig]) -> list[dict[str, object]]:
             # fmha.exe on H200 prefill bf16. CUPTI mode (enable_cupti=True)
             # over-counts at low-sparsity baselines for reasons we have not
             # tracked down; not used here.
-            times_ms = bench_gpu_time(_make_timed_fn(runner, threshold),
-                                      dry_run_iters=DRY_RUN_ITERS,
-                                      repeat_iters=REPEAT_ITERS,
-                                      enable_cupti=False,
-                                      use_cuda_graph=True,
-                                      num_iters_within_graph=10)
+            times_ms = bench_gpu_time(
+                _make_timed_fn(runner, threshold),
+                dry_run_iters=DRY_RUN_ITERS,
+                repeat_iters=REPEAT_ITERS,
+                enable_cupti=False,
+                use_cuda_graph=True,
+                num_iters_within_graph=10,
+            )
             elapsed_us = statistics.median(float(t) for t in times_ms) * 1000.0
             if threshold == 0:
                 baseline_us = elapsed_us
-            speedup = (baseline_us /
-                       elapsed_us) if baseline_us and elapsed_us else None
+            speedup = (baseline_us / elapsed_us) if baseline_us and elapsed_us else None
             print(
                 f"[pass2] {cfg.name} threshold={threshold:g} "
                 f"{elapsed_us:.2f}us speedup={speedup:.3f}x"
-                if speedup is not None else
-                f"[pass2] {cfg.name} threshold={threshold:g} "
-                f"{elapsed_us:.2f}us baseline",
+                if speedup is not None
+                else f"[pass2] {cfg.name} threshold={threshold:g} {elapsed_us:.2f}us baseline",
                 flush=True,
             )
-            rows.append({
-                "config": cfg.name,
-                "dtype": cfg.dtype,
-                "threshold_scale_factor": threshold,
-                "elapsed_us_median": elapsed_us,
-                "speedup": speedup,
-            })
+            rows.append(
+                {
+                    "config": cfg.name,
+                    "dtype": cfg.dtype,
+                    "threshold_scale_factor": threshold,
+                    "elapsed_us_median": elapsed_us,
+                    "speedup": speedup,
+                }
+            )
         del runner
         torch.cuda.empty_cache()
     return rows
 
 
-def write_csv(rows: list[dict[str, object]], path: Path,
-              columns: list[str]) -> None:
+def write_csv(rows: list[dict[str, object]], path: Path, columns: list[str]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=columns)
@@ -426,33 +420,32 @@ def write_csv(rows: list[dict[str, object]], path: Path,
     print(f"wrote {path} ({len(rows)} rows)")
 
 
-def _run_fmha_exe_backend(args: argparse.Namespace,
-                          cfgs: list[FmhaConfig]) -> int:
+def _run_fmha_exe_backend(args: argparse.Namespace, cfgs: list[FmhaConfig]) -> int:
     if not args.fmha_exe.exists():
         sys.stderr.write(
             f"fmha.exe not found at {args.fmha_exe}. Build it first via "
             f"`cd cpp/kernels/fmha_v2 && make fmha.exe` (after the wheel "
-            f"build runs setup.py to generate kernel sources).\n")
+            f"build runs setup.py to generate kernel sources).\n"
+        )
         return 2
 
     args.out_dir.mkdir(parents=True, exist_ok=True)
     started = time.time()
     if not args.skip_pass1:
         rows1 = bench_skip_softmax_fmha_exe.pass1_sparsity(
-            cfgs, args.fmha_exe, warm_up=args.warm_up)
-        bench_skip_softmax_fmha_exe.write_csv(
-            rows1, args.out_dir / "pass1_sparsity.csv")
+            cfgs, args.fmha_exe, warm_up=args.warm_up
+        )
+        bench_skip_softmax_fmha_exe.write_csv(rows1, args.out_dir / "pass1_sparsity.csv")
     if not args.skip_pass2:
         rows2 = bench_skip_softmax_fmha_exe.pass2_speedup(
-            cfgs, args.fmha_exe, runs=args.runs, warm_up=args.warm_up)
-        bench_skip_softmax_fmha_exe.write_csv(
-            rows2, args.out_dir / "pass2_speedup.csv")
+            cfgs, args.fmha_exe, runs=args.runs, warm_up=args.warm_up
+        )
+        bench_skip_softmax_fmha_exe.write_csv(rows2, args.out_dir / "pass2_speedup.csv")
     print(f"done in {time.time() - started:.1f}s")
     return 0
 
 
-def _run_torch_op_backend(args: argparse.Namespace,
-                          cfgs: list[FmhaConfig]) -> int:
+def _run_torch_op_backend(args: argparse.Namespace, cfgs: list[FmhaConfig]) -> int:
     cfgs = _torch_op_configs(cfgs)
     if not cfgs:
         _warn("no torch-op-compatible prefill configs selected")
@@ -483,24 +476,17 @@ def _run_torch_op_backend(args: argparse.Namespace,
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--config",
-                        choices=("llm", "diffusion", "both"),
-                        default="both")
-    parser.add_argument("--backend",
-                        choices=("torch-op", "fmha-exe"),
-                        default="torch-op")
+    parser.add_argument("--config", choices=("llm", "diffusion", "both"), default="both")
+    parser.add_argument("--backend", choices=("torch-op", "fmha-exe"), default="torch-op")
     parser.add_argument("--out-dir", required=True, type=Path)
-    parser.add_argument("--threshold-sweep",
-                        nargs="+",
-                        help="space- or comma-separated threshold values")
+    parser.add_argument(
+        "--threshold-sweep", nargs="+", help="space- or comma-separated threshold values"
+    )
     parser.add_argument("--batch-size", type=int)
-    parser.add_argument("--fmha-exe",
-                        type=Path,
-                        default=DEFAULT_FMHA_EXE)
-    parser.add_argument("--runs",
-                        type=int,
-                        default=20,
-                        help="inner-loop timed runs per fmha.exe invocation")
+    parser.add_argument("--fmha-exe", type=Path, default=DEFAULT_FMHA_EXE)
+    parser.add_argument(
+        "--runs", type=int, default=20, help="inner-loop timed runs per fmha.exe invocation"
+    )
     parser.add_argument("--warm-up", type=int, default=5)
     parser.add_argument("--skip-pass1", action="store_true")
     parser.add_argument("--skip-pass2", action="store_true")

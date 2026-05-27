@@ -3419,11 +3419,9 @@ def get_cubin_header(kernel_traits, specs_names):
                                         '').replace('ws_', '').replace(
                                             'softcapping_',
                                             '').replace('sage_', '').replace(
-                                                'skipSoftmaxStat_',
-                                                '').replace(
+                                                'skipSoftmaxStat_', '').replace(
                                                     'skipSoftmax_',
-                                                    '').replace(
-                                                        'output_', ''))
+                                                    '').replace('output_', ''))
         flash_attention = 'flash_attention' in kname
         warp_specialization = 'tma_ws' in kname
         toks = tname.split('_')

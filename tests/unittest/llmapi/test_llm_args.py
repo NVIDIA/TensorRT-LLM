@@ -2048,9 +2048,9 @@ class TestSkipSoftmaxAttentionConfig:
                                                   SkipSoftmaxAttentionConfig,
                                                   TorchLlmArgs)
 
-        cfg = SkipSoftmaxAttentionConfig(
-            threshold_scale_factor=0.001,
-            stat_log_path=str(tmp_path / "stat.json"))
+        cfg = SkipSoftmaxAttentionConfig(threshold_scale_factor=0.001,
+                                         stat_log_path=str(tmp_path /
+                                                           "stat.json"))
         with pytest.raises(
                 ValueError,
                 match="stat_log_path is incompatible with CUDA graphs"):
@@ -2062,9 +2062,9 @@ class TestSkipSoftmaxAttentionConfig:
         from tensorrt_llm.llmapi.llm_args import (SkipSoftmaxAttentionConfig,
                                                   TorchLlmArgs)
 
-        cfg = SkipSoftmaxAttentionConfig(
-            threshold_scale_factor=0.001,
-            stat_log_path=str(tmp_path / "stat.json"))
+        cfg = SkipSoftmaxAttentionConfig(threshold_scale_factor=0.001,
+                                         stat_log_path=str(tmp_path /
+                                                           "stat.json"))
         # User must explicitly disable CUDA graphs to collect stats; the
         # default cuda_graph_config auto-generates batch_sizes which would
         # otherwise trip the cross-config validator.

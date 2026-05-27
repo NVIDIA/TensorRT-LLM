@@ -31,8 +31,9 @@ def _read_csv(path: Path) -> List[Dict[str, str]]:
         return list(csv.DictReader(f))
 
 
-def _join_rows(p1: List[Dict[str, str]],
-               p2: List[Dict[str, str]]) -> Dict[str, List[Dict[str, str]]]:
+def _join_rows(
+    p1: List[Dict[str, str]], p2: List[Dict[str, str]]
+) -> Dict[str, List[Dict[str, str]]]:
     """Group joined rows by config name."""
     by_cfg: Dict[str, Dict[float, Dict[str, str]]] = defaultdict(dict)
     for r in p1:
@@ -42,7 +43,9 @@ def _join_rows(p1: List[Dict[str, str]],
     for r in p2:
         cfg = r["config"]
         thr = float(r["threshold_scale_factor"])
-        by_cfg[cfg].setdefault(thr, {"config": cfg, "threshold_scale_factor": r["threshold_scale_factor"]})
+        by_cfg[cfg].setdefault(
+            thr, {"config": cfg, "threshold_scale_factor": r["threshold_scale_factor"]}
+        )
         by_cfg[cfg][thr]["elapsed_us_median"] = r.get("elapsed_us_median", "")
         by_cfg[cfg][thr]["speedup"] = r.get("speedup", "")
     out: Dict[str, List[Dict[str, str]]] = {}
@@ -51,10 +54,10 @@ def _join_rows(p1: List[Dict[str, str]],
     return out
 
 
-def _plot_speedup_vs_sparsity(joined: Dict[str, List[Dict[str, str]]],
-                              out_png: Path) -> bool:
+def _plot_speedup_vs_sparsity(joined: Dict[str, List[Dict[str, str]]], out_png: Path) -> bool:
     try:
         import matplotlib
+
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
     except ImportError:
@@ -87,8 +90,7 @@ def _plot_speedup_vs_sparsity(joined: Dict[str, List[Dict[str, str]]],
     return True
 
 
-def render_markdown(joined: Dict[str, List[Dict[str, str]]], out_md: Path,
-                    plot_png: Path) -> None:
+def render_markdown(joined: Dict[str, List[Dict[str, str]]], out_md: Path, plot_png: Path) -> None:
     lines: List[str] = []
     lines.append("# Skip-softmax FMHA kernel microbench (sm90)")
     lines.append("")
@@ -98,7 +100,8 @@ def render_markdown(joined: Dict[str, List[Dict[str, str]]], out_md: Path,
         "production `_skipSoftmax` family. Inputs are random tensors so the "
         "achieved sparsity does not match the calibrated curves in blog 16 "
         "or the wan22 calibration doc - the relationship between achieved "
-        "sparsity and kernel speedup is what we are characterising.")
+        "sparsity and kernel speedup is what we are characterising."
+    )
     lines.append("")
     if plot_png.exists():
         lines.append(f"![speedup vs sparsity]({plot_png.name})")
@@ -106,9 +109,7 @@ def render_markdown(joined: Dict[str, List[Dict[str, str]]], out_md: Path,
     for cfg, rows in sorted(joined.items()):
         lines.append(f"## {cfg}")
         lines.append("")
-        lines.append(
-            "| threshold | skipped / total | achieved sparsity | latency (us) | speedup |"
-        )
+        lines.append("| threshold | skipped / total | achieved sparsity | latency (us) | speedup |")
         lines.append(
             "|----------:|------------------|------------------:|-------------:|--------:|"
         )
@@ -132,8 +133,7 @@ def render_markdown(joined: Dict[str, List[Dict[str, str]]], out_md: Path,
             except (ValueError, TypeError):
                 spd_str = "-"
             sk_total = f"{skipped} / {total}" if total else "-"
-            lines.append(
-                f"| {thr} | {sk_total} | {sp_pct} | {lat_str} | {spd_str} |")
+            lines.append(f"| {thr} | {sk_total} | {sp_pct} | {lat_str} | {spd_str} |")
         lines.append("")
     out_md.parent.mkdir(parents=True, exist_ok=True)
     out_md.write_text("\n".join(lines))

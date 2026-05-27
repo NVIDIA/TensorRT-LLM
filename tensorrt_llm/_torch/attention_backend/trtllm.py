@@ -1150,8 +1150,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         self.print_skip_softmax_stat = os.environ.get(
             "TRTLLM_PRINT_SKIP_SOFTMAX_STAT", "0") == "1"
         stat_log_path = None
-        if isinstance(self.sparse_attention_config,
-                      SkipSoftmaxAttentionConfig):
+        if isinstance(self.sparse_attention_config, SkipSoftmaxAttentionConfig):
             stat_log_path = self.sparse_attention_config.stat_log_path
         self.skip_softmax_stat_enabled = stat_log_path is not None
         if self.skip_softmax_stat_enabled:
@@ -1607,8 +1606,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             if self.skip_softmax_stat_enabled:
                 stat_logger = _peek_skip_softmax_stat_logger()
                 if stat_logger is not None:
-                    stat_logger.record(layer_idx, total_blocks,
-                                       skipped_blocks)
+                    stat_logger.record(layer_idx, total_blocks, skipped_blocks)
             if self.print_skip_softmax_stat and total_blocks != 0:
                 skipped_percent = skipped_blocks / total_blocks * 100
                 print(
@@ -1714,8 +1712,8 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         if self.skip_softmax_stat_enabled:
             stat_logger = _peek_skip_softmax_stat_logger()
             if stat_logger is not None:
-                num_total_tokens = (metadata.num_ctx_tokens
-                                    + metadata.num_generations)
+                num_total_tokens = (metadata.num_ctx_tokens +
+                                    metadata.num_generations)
                 num_gen_tokens = max(0,
                                      num_total_tokens - metadata.num_ctx_tokens)
                 stat_logger.record_step_meta(

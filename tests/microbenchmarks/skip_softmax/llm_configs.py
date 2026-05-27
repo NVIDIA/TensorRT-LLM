@@ -74,7 +74,8 @@ def llm_configs() -> List[FmhaConfig]:
                     seq_len_kv=seq_len,
                     mask="causal",
                     threshold_sweep=list(PREFILL_THRESHOLDS),
-                ))
+                )
+            )
     # Decode: bs=8 (lower than blog 16's 64 - fmha.exe test-bench scratch
     # allocates O(B*S*S) and OOMs on H200 at higher batches), q=1,
     # kv∈{16k,64k}, dtype∈{bf16,fp8}, causal mask, GQA(64/4)
@@ -92,5 +93,6 @@ def llm_configs() -> List[FmhaConfig]:
                     seq_len_kv=kv_len,
                     mask="causal",
                     threshold_sweep=list(DECODE_THRESHOLDS),
-                ))
+                )
+            )
     return cfgs

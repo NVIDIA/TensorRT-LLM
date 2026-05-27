@@ -34,6 +34,7 @@ template <bool ENABLE>
 struct Skip_softmax_stat_counters
 {
     inline __device__ void increment_total() {}
+
     inline __device__ void increment_skipped() {}
 };
 

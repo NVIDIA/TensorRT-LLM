@@ -85,8 +85,9 @@ option(USING_OSS_CUTLASS_MOE_GEMM "Using open sourced Cutlass moe gemm kernel"
 option(USING_OSS_CUTLASS_ALLREDUCE_GEMM
        "Using open sourced Cutlass AR gemm kernel" ON)
 # Opt-in macro that activates the legacy XQA-decoder skip-softmax stat path
-# (#ifdef SKIP_SOFTMAX_STAT in cpp/tensorrt_llm/kernels/decoderMaskedMultiheadAttention/).
-# The FMHA prefill path no longer depends on this — it has runtime variants.
+# (#ifdef SKIP_SOFTMAX_STAT in
+# cpp/tensorrt_llm/kernels/decoderMaskedMultiheadAttention/). The FMHA prefill
+# path no longer depends on this — it has runtime variants.
 option(SKIP_SOFTMAX_STAT "Enable legacy XQA-decoder Skip-Softmax stat path" OFF)
 
 message(STATUS "ENABLE_NVSHMEM is ${ENABLE_NVSHMEM}")

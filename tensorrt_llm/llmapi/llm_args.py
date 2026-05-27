@@ -478,8 +478,7 @@ class SkipSoftmaxAttentionConfig(BaseSparseAttentionConfig):
                 'threshold_scale_factor': {
                     'prefill': _compute('prefill',
                                         self.target_sparsity_prefill),
-                    'decode': _compute('decode',
-                                       self.target_sparsity_decode),
+                    'decode': _compute('decode', self.target_sparsity_decode),
                 }
             })
 

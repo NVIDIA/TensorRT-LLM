@@ -51,5 +51,6 @@ def diffusion_configs() -> List[FmhaConfig]:
                 seq_len_kv=seq_len,
                 mask="bidirectional",
                 threshold_sweep=list(DIFFUSION_THRESHOLDS),
-            ))
+            )
+        )
     return cfgs
