@@ -12,6 +12,7 @@ import transformers
 from test_modeling_multimodal import MultimodalScenario, TestModelingMultimodal
 from transformers import Qwen3_5MoeForConditionalGeneration as HFQwen3_5MoeForConditionalGeneration
 from utils.llm_data import llm_models_root
+from utils.util import skip_pre_hopper
 
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models import Qwen3_5MoeVLModel
@@ -254,6 +255,7 @@ QWEN3_5_VL_MOE_PARITY_CONFIG = {
 }
 
 
+@skip_pre_hopper
 class TestQwen3_5MoeVL(TestModelingMultimodal):
     """Forward-parity test for Qwen3.5-MoE-VL against HuggingFace.
 
