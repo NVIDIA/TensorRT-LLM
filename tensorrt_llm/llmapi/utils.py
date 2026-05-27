@@ -573,7 +573,9 @@ def get_numa_aware_cpu_affinity(device_id):
         # actually corresponds to physical GPU 3.
         cuda_visible = os.environ.get("CUDA_VISIBLE_DEVICES")
         if cuda_visible is not None and cuda_visible.strip():
-            visible_tokens = [x.strip() for x in cuda_visible.split(",") if x.strip()]
+            visible_tokens = [
+                x.strip() for x in cuda_visible.split(",") if x.strip()
+            ]
             if 0 <= device_id < len(visible_tokens):
                 token = visible_tokens[device_id]
                 if token.isdigit():
@@ -581,7 +583,8 @@ def get_numa_aware_cpu_affinity(device_id):
                 else:
                     logger.warning(
                         f"CUDA_VISIBLE_DEVICES token '{token}' is non-numeric; "
-                        f"falling back to device_id ({device_id}) as NVML index.")
+                        f"falling back to device_id ({device_id}) as NVML index."
+                    )
                     nvml_device_id = device_id
             else:
                 logger.warning(
