@@ -1,0 +1,4 @@
+  % Total    % Received % Xferd  Average Speed   Time    Time     Time  Current
+                                 Dload  Upload   Total   Spent    Left  Speed
+  0     0    0     0    0     0      0      0 --:--:-- --:--:-- --:--:--     0100   658  100   146  100   512   3952  13862 --:--:-- --:--:-- --:--:-- 18277
+{"detail":"Internal server error Invalid disaggregated params: ctx_request_id is None. finish_reason='stop', disagg_request_id=16816545327104008"}
