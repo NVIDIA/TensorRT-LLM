@@ -19,6 +19,7 @@
 import contextlib
 import math
 import os
+import threading
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union, cast
 
 import torch
@@ -54,6 +55,16 @@ _PROCESSOR_OUTPUT_KEYS = frozenset({
     "mm_token_type_ids",
 })
 
+# Reference-counted state for ``bypass_processor_output_validation``. The
+# patch mutates process-global module attributes, so concurrent entries from
+# multiple worker threads (e.g. ``asyncio.to_thread(llm.preprocess, ...)``)
+# must share a single patch install/restore — otherwise each entering thread
+# captures the already-patched function as its "original" and stacks a new
+# wrapper on top, producing unbounded recursion and corrupted restore on exit.
+_bypass_lock = threading.Lock()
+_bypass_depth = 0
+_bypass_saved_originals: Optional[Dict[Any, Callable]] = None
+
 
 @contextlib.contextmanager
 def bypass_processor_output_validation():
@@ -78,9 +89,17 @@ def bypass_processor_output_validation():
     across transformers versions (5.3.x re-binds it on
     ``image_processing_utils_fast``; 5.5.x dropped that module and re-binds
     it on ``image_processing_utils`` instead), so we discover the binders
-    by ``hasattr`` rather than hard-coding the list. The originals are
-    restored on exit.
+    by ``hasattr`` rather than hard-coding the list.
+
+    Thread-safety: preprocessing is dispatched via ``asyncio.to_thread`` so
+    multiple workers can sit inside this context manager concurrently. The
+    install/restore is reference-counted under a lock — the first entrant
+    installs the wrapper (closing over the true original), later entrants
+    only bump the counter, and the last leaver restores. This avoids both
+    recursive wrapper stacking and out-of-order restore corruption.
     """
+    global _bypass_depth, _bypass_saved_originals
+
     import transformers.processing_utils as _pu
     import transformers.video_processing_utils as _vpu
 
@@ -97,24 +116,38 @@ def bypass_processor_output_validation():
         raise RuntimeError(
             "No transformers module exposes validate_typed_dict; "
             "cannot patch processor output validation.")
-    originals = {b: b.validate_typed_dict for b in binders}
-    base_orig = next(iter(originals.values()))
 
-    def _filtered_validate(schema, data):
-        if isinstance(data, dict):
-            data = {
-                k: v
-                for k, v in data.items() if k not in _PROCESSOR_OUTPUT_KEYS
+    with _bypass_lock:
+        if _bypass_depth == 0:
+            _bypass_saved_originals = {
+                b: b.validate_typed_dict
+                for b in binders
             }
-        return base_orig(schema, data)
+            base_orig = next(iter(_bypass_saved_originals.values()))
 
-    for b in binders:
-        b.validate_typed_dict = _filtered_validate
+            def _filtered_validate(schema, data):
+                if isinstance(data, dict):
+                    data = {
+                        k: v
+                        for k, v in data.items()
+                        if k not in _PROCESSOR_OUTPUT_KEYS
+                    }
+                return base_orig(schema, data)
+
+            for b in binders:
+                b.validate_typed_dict = _filtered_validate
+        _bypass_depth += 1
+
     try:
         yield
     finally:
-        for b, orig in originals.items():
-            b.validate_typed_dict = orig
+        with _bypass_lock:
+            _bypass_depth -= 1
+            if _bypass_depth == 0:
+                assert _bypass_saved_originals is not None
+                for b, orig in _bypass_saved_originals.items():
+                    b.validate_typed_dict = orig
+                _bypass_saved_originals = None
 
 
 def _get_uncached_multimodal_params(
