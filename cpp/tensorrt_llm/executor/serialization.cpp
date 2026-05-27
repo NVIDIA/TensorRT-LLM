@@ -929,9 +929,10 @@ Tensor Serialization::deserializeTensor(std::istream& is)
     // Size in bytes
     size_t sizeInBytes{0};
     is.read(reinterpret_cast<char*>(&sizeInBytes), sizeof(size_t));
-    auto checkTensorSize = [sizeInBytes](Tensor const& tensor) {
-        TLLM_CHECK_WITH_INFO(sizeInBytes == tensor.getSizeInBytes(),
-            "Serialized tensor byte size does not match tensor shape.");
+    auto checkTensorSize = [sizeInBytes](Tensor const& tensor)
+    {
+        TLLM_CHECK_WITH_INFO(
+            sizeInBytes == tensor.getSizeInBytes(), "Serialized tensor byte size does not match tensor shape.");
     };
 
     Tensor tensor;
