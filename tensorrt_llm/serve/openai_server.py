@@ -1158,6 +1158,10 @@ class OpenAIServer(_VideoRoutesMixin):
                 tokenizer=self.tokenizer,
                 chat_template_kwargs=request.chat_template_kwargs,
             )
+            # Enable per-request perf metrics when the env var is set;
+            # without this the /perf_metrics deque stays empty on this path.
+            if len(os.getenv("TRTLLM_KVCACHE_TIME_OUTPUT_PATH", "")) > 0:
+                sampling_params.return_perf_metrics = True
             if self.tool_parser and request.tools:
                 tool_parser_cls = ToolParserFactory.parsers.get(
                     self.tool_parser.lower())
@@ -1595,8 +1599,8 @@ class OpenAIServer(_VideoRoutesMixin):
                 if not self.postproc_worker_enabled:
                     post_processor, args = postproc_params.post_processor, postproc_params.postproc_args
                 # Stamp first-token time on the first response, then append a
-                # /perf_metrics entry after [DONE]. The deque is only
-                # populated inside _extract_metrics.
+                # /perf_metrics entry after [DONE] (the deque is only
+                # populated inside _extract_metrics).
                 first_response = await anext(promise)
                 raw_request.state.server_first_token_time = (
                     get_steady_clock_now_in_seconds())
@@ -1636,9 +1640,8 @@ class OpenAIServer(_VideoRoutesMixin):
             # Get tool_choice from request
             tool_choice = getattr(request, 'tool_choice', None)
 
-            # Reuse pre-tokenized harmony tokens when forwarded by an upstream
-            # context worker (disaggregated serving). Otherwise, run the
-            # Harmony adapter on the request messages.
+            # Reuse pre-tokenized harmony tokens forwarded by the disagg
+            # ctx worker; only the agg path runs the adapter here.
             if request.prompt_token_ids is not None:
                 harmony_tokens = request.prompt_token_ids
             else:
