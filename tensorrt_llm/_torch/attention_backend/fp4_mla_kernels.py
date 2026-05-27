@@ -81,9 +81,13 @@ def _hp_kv_store_context_kernel(
 def _hp_kv_store_gen_kernel(
     pool_ptr,
     latent_cache_ptr,
-    seq_slots_ptr,  # int32 [num_gen], seq_slot for each gen seq
-    kv_lens_ptr,  # int32 [num_gen], total KV length after this decode step
-    gen_tok_start,  # int, offset in latent_cache where gen tokens begin
+    seq_slots_ptr,  # int32 [num_seqs], seq_slot for each sequence
+    batch_indices_ptr,  # int32 [metadata_num_tokens], sequence index per token
+    positions_ptr,  # int32 [metadata_num_tokens], absolute KV position per token
+    gen_tok_start,  # int, offset in latent_cache where generation tokens begin
+    token_offset,  # int, offset in metadata token arrays where generation tokens begin
+    num_tokens,  # int, number of generation tokens in latent_cache
+    metadata_num_tokens,
     num_seq_slots,
     num_layers,
     layer_idx,
@@ -95,25 +99,35 @@ def _hp_kv_store_gen_kernel(
     BLOCK_D: tl.constexpr,
     HP_BLOCK: tl.constexpr,
 ):
-    """Store the current generation token into the HP KV pool.
+    """Store generation tokens into the HP KV pool.
 
-    Grid: (num_gen_seqs,).
+    Grid: (num_generation_tokens,).
     Each program stores one token into the circular buffer position
-    (kv_len - 1) % HP_BLOCK, overwriting the oldest entry.
+    ``position % HP_BLOCK``, overwriting the oldest entry.  The token metadata
+    is read from the same batch_indices/positions arrays used by the KV scatter
+    path, so this supports linear MTP where each sequence contributes multiple
+    generation tokens.
     """
-    gen_idx = tl.program_id(0)
+    gen_token_idx = tl.program_id(0)
     if (layer_idx < 0) | (layer_idx >= num_layers):
         return
+    if gen_token_idx >= num_tokens:
+        return
 
-    seq_slot = tl.load(seq_slots_ptr + gen_idx).to(tl.int64)
+    metadata_token_idx = token_offset + gen_token_idx
+    if metadata_token_idx >= metadata_num_tokens:
+        return
+    batch_idx = tl.load(batch_indices_ptr + metadata_token_idx).to(tl.int64)
+    position = tl.load(positions_ptr + metadata_token_idx).to(tl.int64)
+    if (batch_idx < 0) | (position < 0):
+        return
+
+    seq_slot = tl.load(seq_slots_ptr + batch_idx).to(tl.int64)
     if (seq_slot < 0) | (seq_slot >= num_seq_slots):
         return
-    kv_len = tl.load(kv_lens_ptr + gen_idx)
-    if kv_len <= 0:
-        return
-    buf_pos = (kv_len - 1) % HP_BLOCK
+    buf_pos = position % HP_BLOCK
 
-    token_idx = tl.cast(gen_tok_start, tl.int64) + gen_idx.to(tl.int64)
+    token_idx = tl.cast(gen_tok_start, tl.int64) + gen_token_idx.to(tl.int64)
     offs_d = tl.arange(0, BLOCK_D)
     mask_d = offs_d < D
     safe_offs_d = tl.where(mask_d, offs_d, 0)
@@ -125,6 +139,141 @@ def _hp_kv_store_gen_kernel(
 
     dst_base = seq_slot * pool_stride_seq + layer_idx * pool_stride_layer + buf_pos * POOL_HEAD_D
     tl.store(pool_ptr + dst_base + safe_offs_d, src, mask=mask_d)
+
+
+@triton.jit
+def _hp_kv_restore_rejected_from_pool_kernel(
+    pool_ptr,
+    snapshot_pool_ptr,
+    batch_indices_ptr,
+    positions_ptr,
+    seq_slots_ptr,
+    kv_lens_ptr,
+    prompt_lens_ptr,
+    accepted_tokens_ptr,
+    token_offset,
+    num_tokens,
+    metadata_num_tokens,
+    num_seqs,
+    num_accepted_tokens,
+    num_seq_slots,
+    num_layers,
+    local_layer,
+    pool_stride_seq,
+    pool_stride_layer,
+    snapshot_stride_seq,
+    snapshot_stride_layer,
+    D: tl.constexpr,
+    POOL_HEAD_D: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+    HP_BLOCK: tl.constexpr,
+):
+    token_idx = tl.program_id(0)
+    metadata_token_idx = token_offset + token_idx
+    token_valid = (
+        (token_idx < num_tokens)
+        & (metadata_token_idx >= 0)
+        & (metadata_token_idx < metadata_num_tokens)
+        & (local_layer >= 0)
+        & (local_layer < num_layers)
+    )
+
+    batch_idx = tl.load(batch_indices_ptr + metadata_token_idx, mask=token_valid, other=-1).to(
+        tl.int64
+    )
+    position = tl.load(positions_ptr + metadata_token_idx, mask=token_valid, other=-1).to(tl.int64)
+    batch_valid = (
+        token_valid
+        & (batch_idx >= 0)
+        & (batch_idx < num_seqs)
+        & (batch_idx < num_accepted_tokens)
+        & (position >= 0)
+    )
+
+    seq_slot = tl.load(seq_slots_ptr + batch_idx, mask=batch_valid, other=-1).to(tl.int64)
+    kv_len = tl.load(kv_lens_ptr + batch_idx, mask=batch_valid, other=0).to(tl.int64)
+    prompt_len = tl.load(prompt_lens_ptr + batch_idx, mask=batch_valid, other=0).to(tl.int64)
+    accepted = tl.load(accepted_tokens_ptr + batch_idx, mask=batch_valid, other=0).to(tl.int64)
+
+    hp_slot = position % HP_BLOCK
+    first_new_position = kv_len - prompt_len
+    should_restore = (
+        batch_valid
+        & (seq_slot >= 0)
+        & (seq_slot < num_seq_slots)
+        & (hp_slot >= 0)
+        & (hp_slot < HP_BLOCK)
+        & (position >= first_new_position + accepted)
+    )
+
+    offs_d = tl.arange(0, BLOCK_D)
+    mask_d = offs_d < D
+    safe_offs_d = tl.where(mask_d, offs_d, 0)
+    src_base = (
+        seq_slot * snapshot_stride_seq + local_layer * snapshot_stride_layer + hp_slot * POOL_HEAD_D
+    )
+    dst_base = seq_slot * pool_stride_seq + local_layer * pool_stride_layer + hp_slot * POOL_HEAD_D
+    values = tl.load(
+        snapshot_pool_ptr + src_base + safe_offs_d, mask=should_restore & mask_d, other=0.0
+    )
+    tl.store(pool_ptr + dst_base + safe_offs_d, values, mask=should_restore & mask_d)
+
+
+@triton.jit
+def _hp_kv_restore_rejected_from_values_kernel(
+    pool_ptr,
+    values_ptr,
+    batch_indices_ptr,
+    positions_ptr,
+    seq_slots_ptr,
+    hp_slots_ptr,
+    first_new_positions_ptr,
+    accepted_tokens_ptr,
+    num_tokens,
+    num_accepted_tokens,
+    num_seq_slots,
+    num_layers,
+    local_layer,
+    pool_stride_seq,
+    pool_stride_layer,
+    values_stride_token,
+    values_stride_dim,
+    D: tl.constexpr,
+    POOL_HEAD_D: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+    HP_BLOCK: tl.constexpr,
+):
+    token_idx = tl.program_id(0)
+    token_valid = (token_idx < num_tokens) & (local_layer >= 0) & (local_layer < num_layers)
+
+    batch_idx = tl.load(batch_indices_ptr + token_idx, mask=token_valid, other=-1).to(tl.int64)
+    position = tl.load(positions_ptr + token_idx, mask=token_valid, other=-1).to(tl.int64)
+    seq_slot = tl.load(seq_slots_ptr + token_idx, mask=token_valid, other=-1).to(tl.int64)
+    hp_slot = tl.load(hp_slots_ptr + token_idx, mask=token_valid, other=-1).to(tl.int64)
+    first_new_position = tl.load(first_new_positions_ptr + token_idx, mask=token_valid, other=0).to(
+        tl.int64
+    )
+    batch_valid = token_valid & (batch_idx >= 0) & (batch_idx < num_accepted_tokens)
+    accepted = tl.load(accepted_tokens_ptr + batch_idx, mask=batch_valid, other=0).to(tl.int64)
+    should_restore = (
+        batch_valid
+        & (seq_slot >= 0)
+        & (seq_slot < num_seq_slots)
+        & (hp_slot >= 0)
+        & (hp_slot < HP_BLOCK)
+        & (position >= first_new_position + accepted)
+    )
+
+    offs_d = tl.arange(0, BLOCK_D)
+    mask_d = offs_d < D
+    safe_offs_d = tl.where(mask_d, offs_d, 0)
+    values = tl.load(
+        values_ptr + token_idx * values_stride_token + safe_offs_d * values_stride_dim,
+        mask=should_restore & mask_d,
+        other=0.0,
+    )
+    dst_base = seq_slot * pool_stride_seq + local_layer * pool_stride_layer + hp_slot * POOL_HEAD_D
+    tl.store(pool_ptr + dst_base + safe_offs_d, values, mask=should_restore & mask_d)
 
 
 @triton.jit
@@ -601,6 +750,178 @@ def _fp4_mla_v_scale_store_hp_tail_kernel(
 
 
 @triton.jit
+def _fp4_mla_v_scale_store_generation_tiles_kernel(
+    kv_cache_ptr,
+    sf_cache_ptr,
+    v_sf_ptr,
+    hp_pool_ptr,
+    latent_cache_ptr,
+    global_scale_ptr,
+    seq_slots_ptr,
+    kv_lens_ptr,
+    prompt_lens_ptr,
+    page_ids_ptr,
+    paged_kv_indptr_ptr,
+    page_ids_len,
+    indptr_len,
+    num_seq_slots,
+    num_pages,
+    num_layers,
+    local_layer,
+    page_size,
+    kv_s0,
+    kv_s2,
+    kv_s4,
+    sf_s0,
+    pool_s0,
+    pool_s1,
+    lc_s0,
+    lc_s1,
+    vsf_s0,
+    vsf_s1,
+    HEAD_D: tl.constexpr,
+    V_HEAD_D: tl.constexpr,
+    HP_BLOCK: tl.constexpr,
+    FP4_BLOCK: tl.constexpr,
+    SF_PER_TOKEN: tl.constexpr,
+    SF_PER_PAGE: tl.constexpr,
+):
+    seq_idx = tl.program_id(0)
+    tile_idx = tl.program_id(1)
+    dim_block = tl.program_id(2)
+    if (local_layer < 0) | (local_layer >= num_layers):
+        return
+    if seq_idx + 1 >= indptr_len:
+        return
+
+    kv_len = tl.load(kv_lens_ptr + seq_idx)
+    gen_len = tl.load(prompt_lens_ptr + seq_idx)
+    if gen_len <= 0:
+        return
+    first_new_pos = kv_len - gen_len
+    first_tile_pos = (first_new_pos // HP_BLOCK) * HP_BLOCK
+    block_base_pos = first_tile_pos + tile_idx * HP_BLOCK
+    if block_base_pos >= kv_len:
+        return
+    if block_base_pos + HP_BLOCK <= first_new_pos:
+        return
+
+    page_idx = block_base_pos // page_size
+    page_pos = block_base_pos - page_idx * page_size
+    page_start = tl.load(paged_kv_indptr_ptr + seq_idx).to(tl.int64)
+    page_end = tl.load(paged_kv_indptr_ptr + seq_idx + 1).to(tl.int64)
+    physical_page_offset = page_start + page_idx
+    if (
+        (page_pos < 0)
+        | (page_pos >= page_size)
+        | (physical_page_offset < page_start)
+        | (physical_page_offset >= page_end)
+        | (physical_page_offset < 0)
+        | (physical_page_offset >= page_ids_len)
+    ):
+        return
+    physical_page = tl.load(page_ids_ptr + physical_page_offset).to(tl.int64)
+    if (physical_page < 0) | (physical_page >= num_pages):
+        return
+    seq_slot = tl.load(seq_slots_ptr + seq_idx).to(tl.int64)
+    if (seq_slot < 0) | (seq_slot >= num_seq_slots):
+        return
+
+    byte_offsets = tl.arange(0, HP_BLOCK // 2)
+    token_offsets = tl.arange(0, HP_BLOCK)
+    even_d = dim_block * FP4_BLOCK + byte_offsets * 2
+    odd_d = even_d + 1
+    all_d = dim_block * FP4_BLOCK + tl.arange(0, FP4_BLOCK)
+    mask_even_d = even_d < HEAD_D
+    mask_odd_d = odd_d < HEAD_D
+    mask_all_d = all_d < HEAD_D
+    safe_even_d = tl.where(mask_even_d, even_d, 0)
+    safe_odd_d = tl.where(mask_odd_d, odd_d, 0)
+    safe_all_d = tl.where(mask_all_d, all_d, 0)
+
+    abs_positions = block_base_pos + token_offsets
+    valid_tokens = abs_positions < kv_len
+    from_latent = abs_positions >= first_new_pos
+    hp_slots = abs_positions % HP_BLOCK
+    new_token_offsets = abs_positions - first_new_pos
+    # Linear MTP uses a uniform generation length, so each sequence occupies a
+    # contiguous gen_len slice in latent_cache.
+    latent_tokens = seq_idx * gen_len + new_token_offsets
+    safe_latent_tokens = tl.where(valid_tokens & from_latent, latent_tokens, 0).to(tl.int64)
+
+    hp_even = tl.load(
+        hp_pool_ptr
+        + seq_slot * pool_s0
+        + local_layer * pool_s1
+        + hp_slots[:, None] * HEAD_D
+        + safe_even_d[None, :],
+        mask=valid_tokens[:, None] & (~from_latent)[:, None] & mask_even_d[None, :],
+        other=0.0,
+    ).to(tl.float32)
+    hp_odd = tl.load(
+        hp_pool_ptr
+        + seq_slot * pool_s0
+        + local_layer * pool_s1
+        + hp_slots[:, None] * HEAD_D
+        + safe_odd_d[None, :],
+        mask=valid_tokens[:, None] & (~from_latent)[:, None] & mask_odd_d[None, :],
+        other=0.0,
+    ).to(tl.float32)
+    latent_even = tl.load(
+        latent_cache_ptr + safe_latent_tokens[:, None] * lc_s0 + safe_even_d[None, :] * lc_s1,
+        mask=valid_tokens[:, None] & from_latent[:, None] & mask_even_d[None, :],
+        other=0.0,
+    ).to(tl.float32)
+    latent_odd = tl.load(
+        latent_cache_ptr + safe_latent_tokens[:, None] * lc_s0 + safe_odd_d[None, :] * lc_s1,
+        mask=valid_tokens[:, None] & from_latent[:, None] & mask_odd_d[None, :],
+        other=0.0,
+    ).to(tl.float32)
+    even_values = hp_even + latent_even
+    odd_values = hp_odd + latent_odd
+
+    amax_per_token = tl.maximum(
+        tl.max(tl.abs(even_values), axis=1),
+        tl.max(tl.abs(odd_values), axis=1),
+    )
+    tile_amax = tl.max(amax_per_token, axis=0)
+    global_scale = tl.load(global_scale_ptr)
+    shared_tile = dim_block * FP4_BLOCK < V_HEAD_D
+    tile_scale = tl.where(tile_amax > 0.0, tile_amax / 6.0, 1.0)
+    token_scale = tl.where(amax_per_token > 0.0, amax_per_token / 6.0, 1.0)
+    local_scale = tl.where(shared_tile, tile_scale, token_scale)
+    stored_scale = local_scale * global_scale
+    v_stored_scale = tile_scale * global_scale
+
+    low = _fp4_e2m1_quantize(even_values / local_scale[:, None])
+    high = _fp4_e2m1_quantize(odd_values / local_scale[:, None])
+    packed = low | (high << 4)
+
+    packed_cols = dim_block * (FP4_BLOCK // 2) + byte_offsets
+    page_positions = page_pos + token_offsets
+    kv_base = physical_page * kv_s0
+    tl.store(
+        kv_cache_ptr + kv_base + page_positions[:, None] * kv_s2 + packed_cols[None, :] * kv_s4,
+        packed,
+        mask=valid_tokens[:, None] & mask_even_d[None, :],
+    )
+
+    k_sf_offsets = _fp4_mla_swizzled_sf_offset(page_positions, dim_block, SF_PER_TOKEN)
+    tl.store(sf_cache_ptr + physical_page * sf_s0 + k_sf_offsets, stored_scale, mask=valid_tokens)
+
+    token_scale_col = page_pos // HP_BLOCK
+    sf_offsets = _fp4_mla_swizzled_sf_offset(safe_all_d, token_scale_col, SF_PER_PAGE)
+    v_sf_base = tl.cast(local_layer, tl.int64) * tl.cast(
+        vsf_s0, tl.int64
+    ) + physical_page * tl.cast(vsf_s1, tl.int64)
+    tl.store(
+        v_sf_ptr + v_sf_base + sf_offsets.to(tl.int64),
+        v_stored_scale,
+        mask=mask_all_d & (all_d < V_HEAD_D),
+    )
+
+
+@triton.jit
 def _fp4_mla_load_values(
     kv_cache_ptr,
     sf_cache_ptr,
@@ -860,21 +1181,25 @@ def _fp4_mla_attention_stats_kernel(
     FP4_BLOCK: tl.constexpr,
     Q_SF_PER_TOKEN: tl.constexpr,
     K_SF_PER_TOKEN: tl.constexpr,
+    QUERY_LEN_PER_SEQ: tl.constexpr,
     MAX_PAGES: tl.constexpr,
     BLOCK_H: tl.constexpr,
     BLOCK_T: tl.constexpr,
     BLOCK_K: tl.constexpr,
 ):
-    gen_idx = tl.program_id(0)
+    query_idx = tl.program_id(0)
     head_block = tl.program_id(1)
+    seq_idx = query_idx // QUERY_LEN_PER_SEQ
+    query_offset = query_idx - seq_idx * QUERY_LEN_PER_SEQ
 
     offs_h = head_block * BLOCK_H + tl.arange(0, BLOCK_H)
     mask_h = offs_h < NUM_HEADS
     safe_offs_h = tl.where(mask_h, offs_h, 0)
     offs_t = tl.arange(0, BLOCK_T)
-    q_row_base = gen_idx * NUM_HEADS
-    kv_len = tl.load(kv_lens_ptr + gen_idx)
-    page_table_start = tl.load(paged_kv_indptr_decode_ptr + gen_idx).to(tl.int64)
+    q_row_base = query_idx * NUM_HEADS
+    kv_len = tl.load(kv_lens_ptr + seq_idx) - (QUERY_LEN_PER_SEQ - 1 - query_offset)
+    kv_len = tl.maximum(kv_len, 0)
+    page_table_start = tl.load(paged_kv_indptr_decode_ptr + seq_idx).to(tl.int64)
 
     max_score = tl.full((BLOCK_H,), -float("inf"), dtype=tl.float32)
     denom = tl.zeros((BLOCK_H,), dtype=tl.float32)
@@ -922,8 +1247,8 @@ def _fp4_mla_attention_stats_kernel(
             )
             max_score = new_max
 
-    tl.store(max_ptr + gen_idx * stats_s0 + safe_offs_h, max_score, mask=mask_h)
-    tl.store(denom_ptr + gen_idx * stats_s0 + safe_offs_h, denom, mask=mask_h)
+    tl.store(max_ptr + query_idx * stats_s0 + safe_offs_h, max_score, mask=mask_h)
+    tl.store(denom_ptr + query_idx * stats_s0 + safe_offs_h, denom, mask=mask_h)
 
 
 @triton.jit
@@ -960,13 +1285,17 @@ def _fp4_mla_attention_prob_store_page_kernel(
     FP4_BLOCK: tl.constexpr,
     Q_SF_PER_TOKEN: tl.constexpr,
     K_SF_PER_TOKEN: tl.constexpr,
+    QUERY_LEN_PER_SEQ: tl.constexpr,
     BLOCK_H: tl.constexpr,
     BLOCK_K: tl.constexpr,
 ):
-    gen_idx = tl.program_id(0)
+    query_idx = tl.program_id(0)
     head_block = tl.program_id(1)
+    seq_idx = query_idx // QUERY_LEN_PER_SEQ
+    query_offset = query_idx - seq_idx * QUERY_LEN_PER_SEQ
 
-    kv_len = tl.load(kv_lens_ptr + gen_idx)
+    kv_len = tl.load(kv_lens_ptr + seq_idx) - (QUERY_LEN_PER_SEQ - 1 - query_offset)
+    kv_len = tl.maximum(kv_len, 0)
     page_start = page_rel * PAGE_SIZE
     if page_start >= kv_len:
         return
@@ -976,11 +1305,11 @@ def _fp4_mla_attention_prob_store_page_kernel(
     safe_offs_h = tl.where(mask_h, offs_h, 0)
     offs_t = tl.arange(0, PAGE_SIZE)
     valid_t = page_start + offs_t < kv_len
-    page_table_start = tl.load(paged_kv_indptr_decode_ptr + gen_idx).to(tl.int64)
+    page_table_start = tl.load(paged_kv_indptr_decode_ptr + seq_idx).to(tl.int64)
     compact_page = page_table_start + page_rel
     if (compact_page < 0) | (compact_page >= page_ids_len):
         return
-    q_row_base = gen_idx * NUM_HEADS
+    q_row_base = query_idx * NUM_HEADS
 
     scores = _fp4_mla_qk_scores_tile(
         q_fp4_ptr,
@@ -1011,8 +1340,8 @@ def _fp4_mla_attention_prob_store_page_kernel(
         BLOCK_K,
         NUM_HEADS,
     )
-    max_score = tl.load(max_ptr + gen_idx * stats_s0 + safe_offs_h, mask=mask_h, other=0.0)
-    denom = tl.load(denom_ptr + gen_idx * stats_s0 + safe_offs_h, mask=mask_h, other=1.0)
+    max_score = tl.load(max_ptr + query_idx * stats_s0 + safe_offs_h, mask=mask_h, other=0.0)
+    denom = tl.load(denom_ptr + query_idx * stats_s0 + safe_offs_h, mask=mask_h, other=1.0)
     global_scale = tl.load(global_scale_ptr)
     qk_scale = sm_scale / (global_scale * global_scale)
     denom_valid = denom > 0.0
@@ -1022,8 +1351,8 @@ def _fp4_mla_attention_prob_store_page_kernel(
     probs = tl.exp(scores - safe_max[:, None]) / safe_denom[:, None]
     probs = tl.where(mask_h[:, None] & valid_t[None, :] & denom_valid[:, None], probs, 0.0)
 
-    prob_rows = gen_idx * NUM_HEADS + offs_h
-    safe_prob_rows = tl.where(mask_h, prob_rows, gen_idx * NUM_HEADS)
+    prob_rows = query_idx * NUM_HEADS + offs_h
+    safe_prob_rows = tl.where(mask_h, prob_rows, query_idx * NUM_HEADS)
     tl.store(
         probs_ptr + safe_prob_rows[:, None] * probs_s0 + offs_t[None, :] * probs_s1,
         probs,
@@ -1049,18 +1378,23 @@ def _fp4_mla_attention_prob_pack_page_kernel(
     FP4_BLOCK: tl.constexpr,
     SF_PER_PAGE: tl.constexpr,
     P_GLOBAL_SCALE: tl.constexpr,
+    QUERY_LEN_PER_SEQ: tl.constexpr,
+    MAX_PAGES: tl.constexpr,
     BLOCK_H: tl.constexpr,
 ):
-    gen_idx = tl.program_id(0)
+    query_idx = tl.program_id(0)
     token_group = tl.program_id(1)
     head_block = tl.program_id(2)
+    seq_idx = query_idx // QUERY_LEN_PER_SEQ
+    query_offset = query_idx - seq_idx * QUERY_LEN_PER_SEQ
 
-    kv_len = tl.load(kv_lens_ptr + gen_idx)
+    kv_len = tl.load(kv_lens_ptr + seq_idx) - (QUERY_LEN_PER_SEQ - 1 - query_offset)
+    kv_len = tl.maximum(kv_len, 0)
     page_start = page_rel * PAGE_SIZE
     if page_start >= kv_len:
         return
 
-    page_table_start = tl.load(paged_kv_indptr_decode_ptr + gen_idx).to(tl.int64)
+    page_table_start = tl.load(paged_kv_indptr_decode_ptr + seq_idx).to(tl.int64)
     compact_page = page_table_start + page_rel
     if (compact_page < 0) | (compact_page >= page_ids_len):
         return
@@ -1074,8 +1408,8 @@ def _fp4_mla_attention_prob_pack_page_kernel(
     valid_even = page_start + even_t < kv_len
     valid_odd = page_start + odd_t < kv_len
 
-    prob_rows = gen_idx * NUM_HEADS + offs_h
-    safe_prob_rows = tl.where(mask_h, prob_rows, gen_idx * NUM_HEADS)
+    prob_rows = query_idx * NUM_HEADS + offs_h
+    safe_prob_rows = tl.where(mask_h, prob_rows, query_idx * NUM_HEADS)
     even_probs = tl.load(
         probs_ptr + safe_prob_rows[:, None] * probs_s0 + even_t[None, :] * probs_s1,
         mask=mask_h[:, None] & valid_even[None, :],
@@ -1090,8 +1424,9 @@ def _fp4_mla_attention_prob_pack_page_kernel(
     local_scale = tl.where(amax > 0.0, amax / 6.0, 1.0)
     stored_scale = tl.where(amax > 0.0, tl.minimum(local_scale * P_GLOBAL_SCALE, 448.0), 1.0)
 
-    p_rows = compact_page * NUM_HEADS + offs_h
-    safe_p_rows = tl.where(mask_h, p_rows, compact_page * NUM_HEADS)
+    p_page = query_idx * MAX_PAGES + page_rel
+    p_rows = p_page * NUM_HEADS + offs_h
+    safe_p_rows = tl.where(mask_h, p_rows, p_page * NUM_HEADS)
     sf_offsets = _fp4_mla_swizzled_sf_offset(safe_p_rows, token_group, SF_PER_PAGE)
     tl.store(p_sf_ptr + sf_offsets, stored_scale, mask=mask_h)
 
@@ -1133,14 +1468,17 @@ def _fp4_mla_attention_pv_kernel(
     PAGE_SIZE: tl.constexpr,
     FP4_BLOCK: tl.constexpr,
     SF_PER_PAGE: tl.constexpr,
+    QUERY_LEN_PER_SEQ: tl.constexpr,
     MAX_PAGES: tl.constexpr,
     P_GLOBAL_SCALE: tl.constexpr,
     BLOCK_H: tl.constexpr,
     BLOCK_V: tl.constexpr,
 ):
-    gen_idx = tl.program_id(0)
+    query_idx = tl.program_id(0)
     head_block = tl.program_id(1)
     dim_block = tl.program_id(2)
+    seq_idx = query_idx // QUERY_LEN_PER_SEQ
+    query_offset = query_idx - seq_idx * QUERY_LEN_PER_SEQ
 
     offs_h = head_block * BLOCK_H + tl.arange(0, BLOCK_H)
     offs_v = dim_block * BLOCK_V + tl.arange(0, BLOCK_V)
@@ -1155,8 +1493,9 @@ def _fp4_mla_attention_pv_kernel(
     v_packed_offsets = safe_offs_v // 2
     v_use_high_nibble = (safe_offs_v & 1) != 0
 
-    kv_len = tl.load(kv_lens_ptr + gen_idx)
-    page_table_start = tl.load(paged_kv_indptr_decode_ptr + gen_idx).to(tl.int64)
+    kv_len = tl.load(kv_lens_ptr + seq_idx) - (QUERY_LEN_PER_SEQ - 1 - query_offset)
+    kv_len = tl.maximum(kv_len, 0)
+    page_table_start = tl.load(paged_kv_indptr_decode_ptr + seq_idx).to(tl.int64)
     global_scale = tl.load(global_scale_ptr)
     acc = tl.zeros((BLOCK_H, BLOCK_V), dtype=tl.float32)
     for page_rel in tl.range(0, MAX_PAGES):
@@ -1173,8 +1512,9 @@ def _fp4_mla_attention_pv_kernel(
             )
             safe_physical_page = tl.where(valid_physical_page, physical_page, 0)
 
-            p_rows = safe_compact_page * NUM_HEADS + offs_h
-            safe_p_rows = tl.where(mask_h, p_rows, safe_compact_page * NUM_HEADS)
+            p_page = query_idx * MAX_PAGES + page_rel
+            p_rows = p_page * NUM_HEADS + offs_h
+            safe_p_rows = tl.where(mask_h, p_rows, p_page * NUM_HEADS)
             p_vals = tl.load(
                 p_fp4_ptr + safe_p_rows[:, None] * p_s0 + packed_t[None, :] * p_s1,
                 mask=valid_compact_page & mask_h[:, None],
@@ -1226,7 +1566,10 @@ def _fp4_mla_attention_pv_kernel(
             )
 
     tl.store(
-        out_ptr + gen_idx * out_s0 + safe_offs_h[:, None] * out_s1 + safe_offs_v[None, :] * out_s2,
+        out_ptr
+        + query_idx * out_s0
+        + safe_offs_h[:, None] * out_s1
+        + safe_offs_v[None, :] * out_s2,
         acc / (global_scale * P_GLOBAL_SCALE),
         mask=mask_h[:, None] & mask_v[None, :],
     )

@@ -47,6 +47,19 @@ def _select_mtp_position_ids(position_ids: torch.Tensor,
     return position_ids[..., token_indices]
 
 
+def _repair_fp4_mla_hp_kv_after_mtp_acceptance(
+        attn_metadata: Optional[AttentionMetadata],
+        num_accepted_tokens: torch.Tensor) -> None:
+    if attn_metadata is None or not getattr(attn_metadata,
+                                            "_fp4_mla_mtp_hp_snapshots", None):
+        return
+
+    from ..attention_backend.fp4_mla_kv import \
+        repair_fp4_mla_hp_kv_for_mtp_rejection
+
+    repair_fp4_mla_hp_kv_for_mtp_rejection(attn_metadata, num_accepted_tokens)
+
+
 class MTPHiddenStatesManager(BaseResourceManager):
 
     def __init__(self,
@@ -835,7 +848,10 @@ class MTPWorker(SpecWorkerBase):
 
         # Strict acceptance
         else:
-            if self.is_thop:
+            draft_tokens = spec_metadata.draft_tokens.reshape(
+                num_gens, mtp_num_modules)
+            if self.is_thop and not self._can_use_rejection_sampling(
+                    spec_metadata, num_contexts):
                 # Temporary buffer
                 target_tokens_cache = torch.zeros(batch_size *
                                                   (mtp_num_modules + 1),
@@ -850,12 +866,7 @@ class MTPWorker(SpecWorkerBase):
                     num_accepted_tokens, num_contexts,
                     spec_metadata.runtime_draft_len)
             else:
-                # Reshape draft tokens for base implementation
-                draft_tokens = spec_metadata.draft_tokens.reshape(
-                    num_gens, mtp_num_modules)
-
-                # Use base implementation for strict acceptance
-                accepted_tokens, num_accepted_tokens = self._sample_and_accept_draft_tokens_base(
+                accepted_tokens, num_accepted_tokens = self._accept_draft_tokens(
                     logits, draft_tokens, num_contexts, batch_size,
                     spec_metadata)
 
@@ -876,6 +887,8 @@ class MTPWorker(SpecWorkerBase):
 
     def change_attn_metadata(self, num_accepted_tokens: torch.Tensor,
                              attn_metadata: AttentionMetadata):
+        _repair_fp4_mla_hp_kv_after_mtp_acceptance(attn_metadata,
+                                                   num_accepted_tokens)
         self._prepare_attn_metadata_for_spec_dec(attn_metadata)
         batch_size = attn_metadata.num_seqs
         mtp_num_modules = self.spec_config.max_draft_len
@@ -893,6 +906,11 @@ class MTPWorker(SpecWorkerBase):
                 mtp_num_modules + 1 -
                 num_accepted_tokens[num_contexts:batch_size])
             attn_metadata.on_update_kv_lens()
+        elif getattr(attn_metadata, "kv_lens_cuda_runtime", None) is not None:
+            attn_metadata.kv_lens_cuda_runtime[num_contexts:batch_size] -= (
+                mtp_num_modules + 1 -
+                num_accepted_tokens[num_contexts:batch_size])
+            attn_metadata.update_for_spec_dec()
 
         if attn_metadata.kv_cache_params is not None and not attn_metadata.is_cuda_graph:
             for i in range(num_contexts, batch_size):
@@ -1192,6 +1210,8 @@ class MTPEagleWorker(MTPWorker):
         # Sample and verify draft tokens
         accepted_tokens, num_accepted_tokens = self.sample_and_accept_draft_tokens(
             input_ids, logits, spec_metadata, attn_metadata)
+        _repair_fp4_mla_hp_kv_after_mtp_acceptance(attn_metadata,
+                                                   num_accepted_tokens)
 
         if self._is_mamba_hybrid_cache is None:
             self._is_mamba_hybrid_cache = isinstance(
@@ -1221,6 +1241,7 @@ class MTPEagleWorker(MTPWorker):
 
         # Predict draft tokens
         next_draft_tokens = []
+        draft_logits_list = []
         with self.draft_kv_cache_context(attn_metadata, draft_kv_cache_manager):
             for i in range(self.mtp_num_modules):
                 if i == 0:
@@ -1288,11 +1309,16 @@ class MTPEagleWorker(MTPWorker):
                     getattr(self.model_config.mapping, 'enable_lm_head_tp_in_adp', False):
                     mapping_lm_head_tp = draft_model.mtp_layers[
                         0].shared_head.mapping_lm_head_tp
+                    draft_logits = logits[:token_count]
                     new_draft_token = self.draft_sampler(
                         logits, mapping_lm_head_tp)
                     new_draft_token = new_draft_token[:token_count]
                 else:
+                    draft_logits = logits
                     new_draft_token = self.draft_sampler(logits)
+
+                if spec_metadata.use_rejection_sampling:
+                    draft_logits_list.append(draft_logits.clone())
 
                 hidden_states, position_ids = self.update_draft_tokens(
                     next_draft_tokens, new_draft_token, hidden_states,
@@ -1306,8 +1332,11 @@ class MTPEagleWorker(MTPWorker):
                     has_kv_cache = inputs[
                         "attn_metadata"].kv_cache_manager is not None
                     if has_kv_cache:
-                        attn_metadata.host_request_types[:attn_metadata.
-                                                         num_contexts].fill_(1)
+                        host_request_types = getattr(attn_metadata,
+                                                     "host_request_types", None)
+                        if host_request_types is not None:
+                            host_request_types[:attn_metadata.
+                                               num_contexts].fill_(1)
                         attn_metadata.num_contexts = 0
                     # update kv_lens_cuda
                     if hasattr(attn_metadata, 'kv_lens_cuda'):
@@ -1315,6 +1344,13 @@ class MTPEagleWorker(MTPWorker):
                             self.mtp_num_modules -
                             num_accepted_tokens[num_contexts:])
                         attn_metadata.kv_lens_cuda[:num_contexts] += 1
+                    elif getattr(attn_metadata, "kv_lens_cuda_runtime",
+                                 None) is not None:
+                        attn_metadata.kv_lens_cuda_runtime[
+                            num_contexts:batch_size] -= (
+                                self.mtp_num_modules -
+                                num_accepted_tokens[num_contexts:])
+                        attn_metadata.kv_lens_cuda_runtime[:num_contexts] += 1
                     # update metadata for flash mla
                     if has_kv_cache and num_contexts > 0 and attn_metadata.enable_flash_mla:
                         reorder_block_ids_per_seq = torch.cat([
@@ -1337,6 +1373,10 @@ class MTPEagleWorker(MTPWorker):
                     # update metadata
                     # some attention metadata needs to be updated when changing kv_lens
                     attn_metadata.update_for_spec_dec()
+                elif getattr(attn_metadata, "kv_lens_cuda_runtime",
+                             None) is not None:
+                    attn_metadata.kv_lens_cuda_runtime[:batch_size] += 1
+                    attn_metadata.update_for_spec_dec()
                 inputs = {
                     "input_ids": new_draft_token,
                     "position_ids": position_ids,
@@ -1358,6 +1398,11 @@ class MTPEagleWorker(MTPWorker):
                 gen_draft_tokens)
             stacked[num_contexts:] = gen_draft_tokens
             next_draft_tokens = [stacked[:, i] for i in range(stacked.shape[1])]
+
+        if spec_metadata.use_rejection_sampling and draft_logits_list:
+            spec_metadata.d2t = None
+            self._compute_and_store_draft_probs(draft_logits_list,
+                                                spec_metadata, batch_size)
 
         next_draft_tokens, next_new_tokens = self._prepare_next_tokens(
             next_draft_tokens, accepted_tokens, spec_metadata, batch_size,

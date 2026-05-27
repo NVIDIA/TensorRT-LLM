@@ -17,7 +17,8 @@ from tensorrt_llm.models.modeling_utils import QuantConfig
 
 from ..metadata import KVCacheParams
 from ..utils import get_global_attrs, get_model_extra_attrs
-from .fp4_mla_kv import (FP4_MLA_KV_GLOBAL_SCALE, HP_BLOCK_SIZE,
+from .fp4_mla_kv import (FLASHINFER_FP4_MLA_ATTENTION_BACKEND_ENV,
+                         FP4_MLA_KV_GLOBAL_SCALE, HP_BLOCK_SIZE,
                          get_fp4_mla_decode_cache,
                          is_flashinfer_fp4_mla_attention_enabled,
                          run_fp4_mla_attention_decode, scatter_fp4_mla_kv_cache,
@@ -158,6 +159,8 @@ class FlashInferAttentionMetadata(AttentionMetadata):
     # uses it to requantize the active 16-token FP4 KV tile.
     high_precision_kv_pool: Optional[torch.Tensor] = field(init=False,
                                                            default=None)
+    fp4_mla_hp_snapshot_pool: Optional[torch.Tensor] = field(init=False,
+                                                             default=None)
     # Auxiliary FP4 MLA V-scale pool for the no-dequant PV path.  The
     # physical storage is flat per [local_layer, physical_page]; callers view
     # it with get_fp4_mla_v_scale_pool_view(..., v_head_dim=kv_lora_rank).
@@ -699,6 +702,16 @@ class FlashInferAttentionMetadata(AttentionMetadata):
                 dtype=torch.bfloat16,
                 capture_graph=capture_graph,
             )
+        if capture_graph:
+            self.fp4_mla_hp_snapshot_pool = self.get_empty(
+                buffers,
+                hp_pool_shape,
+                cache_name="fp4_mla_hp_snapshot_pool",
+                dtype=torch.bfloat16,
+                capture_graph=capture_graph,
+            )
+        else:
+            self.fp4_mla_hp_snapshot_pool = None
 
         max_num_pages = self.kv_cache_manager.blocks_in_primary_pool
         self._fp4_mla_decode_kv_indices_buf = self.get_empty(
@@ -820,11 +833,14 @@ class FlashInferAttentionMetadata(AttentionMetadata):
         kv_start = torch.repeat_interleave(kv_token_starts,
                                            seq_lens,
                                            output_size=self.num_tokens)
-        cached_start = torch.repeat_interleave(
-            self.cached_token_lens[:num_seqs].to(torch.int32),
-            seq_lens,
-            output_size=self.num_tokens,
-        )
+        if self.kv_lens_cuda_runtime is not None:
+            cached_token_lens = self.kv_lens_cuda_runtime[:num_seqs] - seq_lens
+        else:
+            cached_token_lens = self.cached_token_lens[:num_seqs].to(
+                torch.int32)
+        cached_start = torch.repeat_interleave(cached_token_lens,
+                                               seq_lens,
+                                               output_size=self.num_tokens)
         token_offsets = torch.arange(self.num_tokens,
                                      dtype=torch.int32,
                                      device=device)
@@ -833,6 +849,24 @@ class FlashInferAttentionMetadata(AttentionMetadata):
         self._batch_indices[:self.num_tokens].copy_(batch_indices,
                                                     non_blocking=True)
         self._positions[:self.num_tokens].copy_(positions, non_blocking=True)
+
+    def update_for_spec_dec(self) -> None:
+        if self.high_precision_kv_pool is None:
+            return
+        if self.kv_lens_cuda_runtime is None:
+            return
+
+        num_seqs = self.num_seqs
+        prompt_lens = self.seq_lens_kv_cuda[:num_seqs].to(torch.int32)
+        self._prompt_lens_cuda_buf[:num_seqs].copy_(prompt_lens,
+                                                    non_blocking=True)
+        self.prompt_lens_cuda_runtime = self._prompt_lens_cuda_buf[:num_seqs]
+        self._prompt_lens_cpu_buf[:num_seqs].copy_(prompt_lens.cpu(),
+                                                   non_blocking=False)
+        self.prompt_lens_cpu_runtime = self._prompt_lens_cpu_buf[:num_seqs]
+
+        if self.num_tokens > 0:
+            self._populate_fp4_mla_batch_indices_positions()
 
     def create_cuda_graph_metadata(self,
                                    max_batch_size: int,
@@ -1643,11 +1677,13 @@ class FlashInferAttention(AttentionBackend[FlashInferAttentionMetadata]):
                     f"shape [num_gen_tokens={num_gen_tokens}, ...] but got "
                     f"{list(latent_cache.shape)}. Did MLA.forward_impl stop "
                     f"pre-slicing latent_cache per phase?")
+                if (use_fp4_attention
+                        and num_gen_tokens != metadata.num_generations
+                        and os.getenv(
+                            FLASHINFER_FP4_MLA_ATTENTION_BACKEND_ENV,
+                            "triton").lower() not in ("triton", "cutile")):
+                    use_fp4_attention = False
                 if use_fp4_attention:
-                    update_hp_kv_for_fp4_mla(metadata,
-                                             latent_cache,
-                                             self._local_layer_idx(metadata),
-                                             phase="generation")
                     scatter_fp4_mla_kv_cache(
                         metadata,
                         latent_cache,
@@ -1657,6 +1693,10 @@ class FlashInferAttention(AttentionBackend[FlashInferAttentionMetadata]):
                         local_layer=self._local_layer_idx(metadata),
                         v_head_dim=self.kv_lora_rank,
                     )
+                    update_hp_kv_for_fp4_mla(metadata,
+                                             latent_cache,
+                                             self._local_layer_idx(metadata),
+                                             phase="generation")
                 else:
                     scatter_fp4_mla_kv_cache(
                         metadata,

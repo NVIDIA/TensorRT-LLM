@@ -30,7 +30,9 @@ from .fp4_mla_kernels import (
     _fp4_mla_overlay_hp_tail_kernel,
     _fp4_mla_scatter_kernel,
     _fp4_mla_v_scale_store_context_tokens_kernel,
-    _fp4_mla_v_scale_store_hp_tail_kernel,
+    _fp4_mla_v_scale_store_generation_tiles_kernel,
+    _hp_kv_restore_rejected_from_pool_kernel,
+    _hp_kv_restore_rejected_from_values_kernel,
     _hp_kv_store_context_kernel,
     _hp_kv_store_gen_kernel,
 )
@@ -46,8 +48,8 @@ FP4_MLA_Q_RESIDUAL_DIM: int = 64
 FLASHINFER_FP4_MLA_ATTENTION_ENV = "TRTLLM_FLASHINFER_FP4_MLA_ATTENTION"
 FLASHINFER_FP4_MLA_ATTENTION_BACKEND_ENV = "TRTLLM_FLASHINFER_FP4_MLA_ATTENTION_BACKEND"
 FLASHINFER_FP4_MLA_DEBUG_ENV = "TRTLLM_FLASHINFER_FP4_MLA_DEBUG"
-_FP4_MLA_CUTE_DSL_BACKEND = "cute_dsl"
 _HPUpdatePhase = Literal["all", "context", "generation"]
+_FP4_MLA_MTP_HP_SNAPSHOTS = "_fp4_mla_mtp_hp_snapshots"
 
 
 # Environment and debug helpers
@@ -327,6 +329,7 @@ def _scatter_fp4_mla_kv_cache_2d_context(
 
 def _scatter_fp4_mla_kv_cache_2d_generation(
     metadata: Any,
+    latent_cache: torch.Tensor,
     kv_cache: torch.Tensor,
     sf_cache: torch.Tensor,
     v_sf: torch.Tensor,
@@ -345,9 +348,31 @@ def _scatter_fp4_mla_kv_cache_2d_generation(
     num_gen = num_seqs - num_contexts
     if num_gen <= 0:
         return
-    if num_tokens != num_gen:
+    gen_token_lens = _host_int_list(
+        getattr(metadata, "prompt_lens_cpu_runtime", None), num_contexts, num_seqs
+    )
+    if gen_token_lens is not None:
+        expected_num_tokens = sum(gen_token_lens)
+        if num_tokens != expected_num_tokens:
+            raise RuntimeError(
+                "FP4 MLA 2D generation scatter token count mismatch: "
+                f"expected {expected_num_tokens} generation tokens from "
+                f"per-sequence lengths {gen_token_lens}, got {num_tokens}."
+            )
+        if min(gen_token_lens) != max(gen_token_lens):
+            raise NotImplementedError(
+                "FP4 MLA no-dequant generation scatter currently supports "
+                f"uniform linear MTP lengths only, got {gen_token_lens}."
+            )
+    elif num_tokens < num_gen:
         raise RuntimeError(
-            f"FP4 MLA 2D generation scatter expected {num_gen} generation tokens, got {num_tokens}."
+            f"FP4 MLA 2D generation scatter needs at least {num_gen} generation "
+            f"tokens, got {num_tokens}."
+        )
+    elif num_tokens % num_gen != 0:
+        raise NotImplementedError(
+            "FP4 MLA no-dequant generation scatter requires a uniform "
+            f"generation length, got {num_tokens} tokens for {num_gen} sequences."
         )
 
     pool = getattr(metadata, "high_precision_kv_pool", None)
@@ -360,21 +385,31 @@ def _scatter_fp4_mla_kv_cache_2d_generation(
             f"{hp_head_dim}."
         )
 
+    max_gen_len = max(gen_token_lens) if gen_token_lens is not None else num_tokens // num_gen
+    max_gen_tiles = _ceil_div(max_gen_len + HP_BLOCK_SIZE - 1, HP_BLOCK_SIZE)
     page_ids = metadata.paged_kv_indices[metadata.num_context_blocks :]
-    _fp4_mla_v_scale_store_hp_tail_kernel[(num_gen, num_dim_blocks)](
+    _fp4_mla_v_scale_store_generation_tiles_kernel[
+        (
+            num_gen,
+            max(max_gen_tiles, 1),
+            num_dim_blocks,
+        )
+    ](
         kv_cache,
         sf_cache,
         v_sf,
         pool,
+        latent_cache,
         global_scale,
         metadata.seq_slots[num_contexts:num_seqs],
         metadata.kv_lens_cuda_runtime[num_contexts:num_seqs],
+        metadata.prompt_lens_cuda_runtime[num_contexts:num_seqs],
         page_ids,
         metadata.paged_kv_indptr_decode,
         page_ids.shape[0],
         metadata.paged_kv_indptr_decode.shape[0],
-        v_sf.shape[1],
         pool.shape[0],
+        v_sf.shape[1],
         v_sf.shape[0],
         local_layer,
         metadata.page_size,
@@ -384,6 +419,8 @@ def _scatter_fp4_mla_kv_cache_2d_generation(
         sf_cache.stride(0),
         pool.stride(0),
         pool.stride(1),
+        latent_cache.stride(0),
+        latent_cache.stride(1),
         v_sf.stride(0),
         v_sf.stride(1),
         HEAD_D=hp_head_dim,
@@ -506,9 +543,9 @@ def scatter_fp4_mla_kv_cache(
     the final FP4 tile representation directly: dimensions below
     ``v_head_dim`` use one shared 16-token by 16-dim scale written into both
     K's token-major scale layout and V's dim-major scale layout.  Tail K-only
-    dimensions use K's per-token 1D scales.  Generation scatter rewrites the
-    active 16-token tile from the HP pool, so the caller must update the HP pool
-    before invoking this helper.
+    dimensions use K's per-token 1D scales.  Generation scatter rewrites each
+    touched 16-token tile by reading old tokens from the HP pool and new tokens
+    from ``latent_cache``; callers then update the HP pool after scatter.
     """
     if latent_cache is None or latent_cache.numel() == 0:
         return
@@ -596,6 +633,7 @@ def scatter_fp4_mla_kv_cache(
         else:
             _scatter_fp4_mla_kv_cache_2d_generation(
                 metadata,
+                latent_cache,
                 kv_cache,
                 sf_cache,
                 v_sf,
@@ -879,6 +917,50 @@ def _infer_cutile_assume_full_pages(metadata: Any, max_pages: int, page_size: in
     return bool(kv_lens) and min(kv_lens) == max(kv_lens) == max_pages * page_size
 
 
+def _get_linear_mtp_query_len_per_seq(
+    metadata: Any,
+    *,
+    num_queries: int,
+    num_gen_seqs: int,
+) -> int:
+    """Return the uniform generation query length required by linear MTP."""
+    if num_gen_seqs <= 0:
+        return 1
+
+    start = metadata.num_contexts
+    end = metadata.num_seqs
+    query_lens = _host_int_list(getattr(metadata, "prompt_lens_cpu_runtime", None), start, end)
+    if query_lens is None:
+        query_lens = _host_int_list(getattr(metadata, "seq_lens", None), start, end)
+
+    if query_lens is None:
+        if num_queries % num_gen_seqs != 0:
+            raise NotImplementedError(
+                "FP4 MLA linear MTP requires a uniform generation query length; "
+                f"got {num_queries} query tokens for {num_gen_seqs} sequences."
+            )
+        return num_queries // num_gen_seqs
+
+    if sum(query_lens) != num_queries and num_queries == num_gen_seqs:
+        return 1
+    if sum(query_lens) != num_queries:
+        raise RuntimeError(
+            "FP4 MLA generation query metadata does not match q shape: "
+            f"query_lens={query_lens}, total={sum(query_lens)}, "
+            f"q_tokens={num_queries}."
+        )
+    if not query_lens:
+        return 1
+    if min(query_lens) <= 0:
+        raise RuntimeError(f"FP4 MLA generation query lengths must be positive, got {query_lens}.")
+    if min(query_lens) != max(query_lens):
+        raise NotImplementedError(
+            "FP4 MLA no-dequant attention currently supports linear MTP with "
+            f"a uniform generation length per sequence, got {query_lens}."
+        )
+    return query_lens[0]
+
+
 def run_fp4_mla_attention_decode(
     metadata: Any,
     layer_idx: int,
@@ -912,21 +994,20 @@ def run_fp4_mla_attention_decode(
             f"got {metadata.page_size}."
         )
 
-    num_gen = q_nope.shape[0]
-    if num_gen == 0:
+    num_queries = q_nope.shape[0]
+    if num_queries == 0:
         return
     num_gen_seqs = metadata.num_seqs - metadata.num_contexts
-    if num_gen != num_gen_seqs:
-        raise NotImplementedError(
-            "FP4 MLA attention decode currently supports one query token per "
-            f"generation sequence, got {num_gen} query tokens for "
-            f"{num_gen_seqs} sequences."
-        )
+    query_len_per_seq = _get_linear_mtp_query_len_per_seq(
+        metadata,
+        num_queries=num_queries,
+        num_gen_seqs=num_gen_seqs,
+    )
 
     num_heads = q_nope.shape[1]
-    if q_pe.shape[:2] != (num_gen, num_heads):
+    if q_pe.shape[:2] != (num_queries, num_heads):
         raise ValueError("FP4 MLA attention q_nope/q_pe batch dimensions do not match.")
-    if output.shape[:2] != (num_gen, num_heads):
+    if output.shape[:2] != (num_queries, num_heads):
         raise ValueError("FP4 MLA attention output batch dimensions do not match.")
     if q_nope.shape[-1] != kv_lora_rank:
         raise ValueError(
@@ -950,13 +1031,13 @@ def run_fp4_mla_attention_decode(
     q_full = _ensure_workspace_tensor(
         metadata,
         "_fp4_mla_attention_q_buf",
-        (num_gen, num_heads, head_dim),
+        (num_queries, num_heads, head_dim),
         dtype=q_nope.dtype,
         device=q_nope.device,
     )
     q_full[..., :kv_lora_rank].copy_(q_nope)
     q_full[..., kv_lora_rank:].copy_(q_pe)
-    q_2d = q_full.reshape(num_gen * num_heads, head_dim)
+    q_2d = q_full.reshape(num_queries * num_heads, head_dim)
     if q_2d.dtype not in (torch.bfloat16, torch.float8_e4m3fn):
         raise TypeError(
             f"FP4 MLA residual Q quantization requires BF16 or FP8 Q; got {q_2d.dtype}."
@@ -989,14 +1070,14 @@ def run_fp4_mla_attention_decode(
     if backend == "cutile":
         from .fp4_mla_cutile import fp4_mla_paged_attention
 
-        total_p_rows = max(src_page_ids.shape[0] * num_heads, 1)
+        total_p_rows = num_queries * max_pages * num_heads
         p_fp4 = _ensure_workspace_tensor(
             metadata,
             "_fp4_mla_attention_p_buf",
-            (total_p_rows, metadata.page_size // 2),
+            (max(total_p_rows, 1), metadata.page_size // 2),
             dtype=torch.uint8,
             device=q_nope.device,
-        )
+        )[:total_p_rows]
         p_sf = _ensure_workspace_tensor(
             metadata,
             "_fp4_mla_attention_p_sf_buf",
@@ -1004,7 +1085,7 @@ def run_fp4_mla_attention_decode(
             dtype=torch.float8_e4m3fn,
             device=q_nope.device,
         )
-        stats_shape = (num_gen, num_heads)
+        stats_shape = (num_queries, num_heads)
         max_scores = _ensure_workspace_tensor(
             metadata,
             "_fp4_mla_attention_max_buf",
@@ -1022,7 +1103,7 @@ def run_fp4_mla_attention_decode(
         page_max = None
         page_sum = None
         if max_pages >= 8:
-            page_stats_shape = (num_gen, max_pages, num_heads)
+            page_stats_shape = (num_queries, max_pages, num_heads)
             page_max = _ensure_workspace_tensor(
                 metadata,
                 "_fp4_mla_attention_page_max_buf",
@@ -1037,15 +1118,19 @@ def run_fp4_mla_attention_decode(
                 dtype=torch.float32,
                 device=q_nope.device,
             )
-        assume_full_pages = _infer_cutile_assume_full_pages(
-            metadata,
-            max_pages,
-            metadata.page_size,
+        assume_full_pages = (
+            _infer_cutile_assume_full_pages(
+                metadata,
+                max_pages,
+                metadata.page_size,
+            )
+            and query_len_per_seq == 1
         )
         assume_valid_pages = False
         _fp4_mla_debug(
             "attention decode cutile launch: "
-            f"num_gen={num_gen} num_heads={num_heads} local_layer={local_layer} "
+            f"num_queries={num_queries} query_len_per_seq={query_len_per_seq} "
+            f"num_heads={num_heads} local_layer={local_layer} "
             f"layer_idx={layer_idx} head_dim={head_dim} kv_lora_rank={kv_lora_rank} "
             f"rope_dim={qk_rope_head_dim} max_pages={max_pages} "
             f"assume_full_pages={assume_full_pages} "
@@ -1068,6 +1153,7 @@ def run_fp4_mla_attention_decode(
             page_size=metadata.page_size,
             q_residual_dim=q_residual_dim,
             max_pages=max_pages,
+            query_len_per_seq=query_len_per_seq,
             assume_full_pages=assume_full_pages,
             assume_valid_pages=assume_valid_pages,
             p_fp4_workspace=p_fp4,
@@ -1079,7 +1165,7 @@ def run_fp4_mla_attention_decode(
         )
         _debug_sync("attention_cutile")
         return
-    total_p_rows = num_gen_blocks * num_heads
+    total_p_rows = num_queries * max_pages * num_heads
     p_fp4 = _ensure_workspace_tensor(
         metadata,
         "_fp4_mla_attention_p_buf",
@@ -1094,7 +1180,7 @@ def run_fp4_mla_attention_decode(
         dtype=torch.float8_e4m3fn,
         device=q_nope.device,
     )
-    stats_shape = (num_gen, num_heads)
+    stats_shape = (num_queries, num_heads)
     max_scores = _ensure_workspace_tensor(
         metadata,
         "_fp4_mla_attention_max_buf",
@@ -1110,10 +1196,15 @@ def run_fp4_mla_attention_decode(
         device=q_nope.device,
     )
 
-    if backend == _FP4_MLA_CUTE_DSL_BACKEND:
+    if backend == "cute_dsl":
+        if query_len_per_seq != 1:
+            raise NotImplementedError(
+                "FP4 MLA linear MTP no-dequant attention is currently "
+                "implemented for the Triton backend only."
+            )
         from .fp4_mla_cute import run_fp4_mla_attention_decode_cute
 
-        page_stats_shape = (num_gen, max_pages, num_heads)
+        page_stats_shape = (num_queries, max_pages, num_heads)
         page_max = _ensure_workspace_tensor(
             metadata,
             "_fp4_mla_attention_page_max_buf",
@@ -1164,10 +1255,10 @@ def run_fp4_mla_attention_decode(
     p_probs = _ensure_workspace_tensor(
         metadata,
         "_fp4_mla_attention_p_prob_buf",
-        (max(num_gen * num_heads, 1), metadata.page_size),
+        (max(num_queries * num_heads, 1), metadata.page_size),
         dtype=torch.float32,
         device=q_nope.device,
-    )[: num_gen * num_heads]
+    )[: num_queries * num_heads]
 
     block_h = 128
     block_t = metadata.page_size
@@ -1181,7 +1272,8 @@ def run_fp4_mla_attention_decode(
 
     _fp4_mla_debug(
         "attention decode: "
-        f"num_gen={num_gen} num_heads={num_heads} local_layer={local_layer} "
+        f"num_queries={num_queries} query_len_per_seq={query_len_per_seq} "
+        f"num_heads={num_heads} local_layer={local_layer} "
         f"layer_idx={layer_idx} head_dim={head_dim} q_head_dim={q_head_dim} "
         f"q_residual_dim={q_residual_dim} "
         f"kv_lora_rank={kv_lora_rank} rope_dim={qk_rope_head_dim} "
@@ -1205,10 +1297,10 @@ def run_fp4_mla_attention_decode(
 
     _fp4_mla_debug(
         "attention stats launch: "
-        f"grid=({num_gen}, {num_head_blocks}) "
+        f"grid=({num_queries}, {num_head_blocks}) "
         f"block_h={block_h} block_t={block_t} block_k={block_k}"
     )
-    _fp4_mla_attention_stats_kernel[(num_gen, num_head_blocks)](
+    _fp4_mla_attention_stats_kernel[(num_queries, num_head_blocks)](
         max_scores,
         denom,
         q_fp4,
@@ -1237,6 +1329,7 @@ def run_fp4_mla_attention_decode(
         FP4_BLOCK=FP4_BLOCK_SIZE,
         Q_SF_PER_TOKEN=q_sf_per_token,
         K_SF_PER_TOKEN=k_sf_per_token,
+        QUERY_LEN_PER_SEQ=query_len_per_seq,
         MAX_PAGES=max_pages,
         BLOCK_H=block_h,
         BLOCK_T=block_t,
@@ -1247,9 +1340,9 @@ def run_fp4_mla_attention_decode(
     for page_rel in range(max_pages):
         _fp4_mla_debug(
             "attention prob page store launch: "
-            f"page_rel={page_rel} grid=({num_gen}, {num_head_blocks})"
+            f"page_rel={page_rel} grid=({num_queries}, {num_head_blocks})"
         )
-        _fp4_mla_attention_prob_store_page_kernel[(num_gen, num_head_blocks)](
+        _fp4_mla_attention_prob_store_page_kernel[(num_queries, num_head_blocks)](
             p_probs,
             max_scores,
             denom,
@@ -1282,6 +1375,7 @@ def run_fp4_mla_attention_decode(
             FP4_BLOCK=FP4_BLOCK_SIZE,
             Q_SF_PER_TOKEN=q_sf_per_token,
             K_SF_PER_TOKEN=k_sf_per_token,
+            QUERY_LEN_PER_SEQ=query_len_per_seq,
             BLOCK_H=block_h,
             BLOCK_K=block_k,
         )
@@ -1289,12 +1383,12 @@ def run_fp4_mla_attention_decode(
 
         _fp4_mla_debug(
             "attention prob page pack launch: "
-            f"page_rel={page_rel} grid=({num_gen}, {sf_per_page}, "
+            f"page_rel={page_rel} grid=({num_queries}, {sf_per_page}, "
             f"{num_head_blocks})"
         )
         _fp4_mla_attention_prob_pack_page_kernel[
             (
-                num_gen,
+                num_queries,
                 sf_per_page,
                 num_head_blocks,
             )
@@ -1315,18 +1409,20 @@ def run_fp4_mla_attention_decode(
             FP4_BLOCK=FP4_BLOCK_SIZE,
             SF_PER_PAGE=sf_per_page,
             P_GLOBAL_SCALE=FP4_MLA_P_GLOBAL_SCALE,
+            QUERY_LEN_PER_SEQ=query_len_per_seq,
+            MAX_PAGES=max_pages,
             BLOCK_H=block_h,
         )
         _debug_sync(f"attention_prob_page_pack_{page_rel}")
 
     _fp4_mla_debug(
         "attention pv launch: "
-        f"grid=({num_gen}, {num_head_blocks}, "
+        f"grid=({num_queries}, {num_head_blocks}, "
         f"{triton.cdiv(kv_lora_rank, block_v)}) block_v={block_v}"
     )
     _fp4_mla_attention_pv_kernel[
         (
-            num_gen,
+            num_queries,
             num_head_blocks,
             triton.cdiv(kv_lora_rank, block_v),
         )
@@ -1356,12 +1452,190 @@ def run_fp4_mla_attention_decode(
         PAGE_SIZE=metadata.page_size,
         FP4_BLOCK=FP4_BLOCK_SIZE,
         SF_PER_PAGE=sf_per_page,
+        QUERY_LEN_PER_SEQ=query_len_per_seq,
         MAX_PAGES=max_pages,
         P_GLOBAL_SCALE=FP4_MLA_P_GLOBAL_SCALE,
         BLOCK_H=block_h,
         BLOCK_V=block_v,
     )
     _debug_sync("attention_pv")
+
+
+def _hp_pool_layer_view(
+    pool: torch.Tensor,
+    local_layer: int,
+    pool_head_dim: int,
+) -> torch.Tensor:
+    return pool[:, local_layer, 0, :].view(pool.shape[0], HP_BLOCK_SIZE, pool_head_dim)
+
+
+def _snapshot_hp_kv_for_mtp_generation(
+    metadata: Any,
+    pool: torch.Tensor,
+    local_layer: int,
+    *,
+    num_gen: int,
+    num_gen_tokens: int,
+    max_gen_len: int,
+    metadata_token_offset: int,
+    head_dim: int,
+    pool_head_dim: int,
+) -> None:
+    if getattr(metadata, "is_warmup", False):
+        return
+    if num_gen_tokens <= num_gen:
+        return
+    if max_gen_len > HP_BLOCK_SIZE:
+        raise NotImplementedError(
+            "FP4 MLA HP-pool rollback for linear MTP supports at most "
+            f"{HP_BLOCK_SIZE} generation tokens per sequence, got {max_gen_len}."
+        )
+
+    end_token_offset = metadata_token_offset + num_gen_tokens
+    if (
+        end_token_offset > metadata.batch_indices.shape[0]
+        or end_token_offset > metadata.positions.shape[0]
+    ):
+        raise RuntimeError(
+            "FP4 MLA HP-pool snapshot would read past generation metadata: "
+            f"token_offset={metadata_token_offset}, num_gen_tokens={num_gen_tokens}, "
+            f"batch_indices={metadata.batch_indices.shape[0]}, "
+            f"positions={metadata.positions.shape[0]}."
+        )
+
+    snapshots = getattr(metadata, _FP4_MLA_MTP_HP_SNAPSHOTS, None)
+    if snapshots is None:
+        snapshots = {}
+        setattr(metadata, _FP4_MLA_MTP_HP_SNAPSHOTS, snapshots)
+
+    snapshot_pool = getattr(metadata, "fp4_mla_hp_snapshot_pool", None)
+    if snapshot_pool is not None:
+        snapshot_pool[:, local_layer, :, :].copy_(pool[:, local_layer, :, :])
+        snapshots[int(local_layer)] = {
+            "mode": "pool",
+            "metadata_token_offset": metadata_token_offset,
+            "num_gen_tokens": num_gen_tokens,
+            "head_dim": head_dim,
+            "pool_head_dim": pool_head_dim,
+        }
+        return
+
+    device = pool.device
+    token_indices = torch.arange(
+        metadata_token_offset,
+        end_token_offset,
+        dtype=torch.long,
+        device=device,
+    )
+    batch_indices = metadata.batch_indices[token_indices].to(torch.long)
+    positions = metadata.positions[token_indices].to(torch.long)
+    seq_slots = metadata.seq_slots[batch_indices].to(torch.long)
+    hp_slots = torch.remainder(positions, HP_BLOCK_SIZE).to(torch.long)
+    first_new_positions = metadata.kv_lens_cuda_runtime[batch_indices].to(
+        torch.long
+    ) - metadata.prompt_lens_cuda_runtime[batch_indices].to(torch.long)
+    pool_view = _hp_pool_layer_view(pool, local_layer, pool_head_dim)
+    values = pool_view[seq_slots, hp_slots, :head_dim].clone()
+
+    snapshots[int(local_layer)] = {
+        "mode": "values",
+        "batch_indices": batch_indices,
+        "seq_slots": seq_slots,
+        "hp_slots": hp_slots,
+        "positions": positions,
+        "first_new_positions": first_new_positions,
+        "values": values,
+        "head_dim": head_dim,
+        "pool_head_dim": pool_head_dim,
+    }
+
+
+def repair_fp4_mla_hp_kv_for_mtp_rejection(
+    metadata: Any,
+    num_accepted_tokens: torch.Tensor,
+) -> None:
+    """Restore HP-pool slots that belonged to rejected linear-MTP tokens.
+
+    Packed FP4 pages past the accepted logical KV length are harmless because
+    later attention ignores them. The BF16 HP pool is a circular tail mirror, so
+    rejected speculative writes must be rolled back before the next tile rewrite.
+    """
+    snapshots = getattr(metadata, _FP4_MLA_MTP_HP_SNAPSHOTS, None)
+    if not snapshots:
+        return
+
+    keep_snapshots = False
+    try:
+        pool = getattr(metadata, "high_precision_kv_pool", None)
+        if pool is None:
+            return
+        accepted_tokens = num_accepted_tokens.to(device=pool.device)
+        for local_layer, snapshot in snapshots.items():
+            head_dim = snapshot["head_dim"]
+            pool_head_dim = snapshot["pool_head_dim"]
+            block_d = triton.next_power_of_2(head_dim)
+            if snapshot.get("mode") == "pool":
+                keep_snapshots = True
+                _hp_kv_restore_rejected_from_pool_kernel[(snapshot["num_gen_tokens"],)](
+                    pool,
+                    metadata.fp4_mla_hp_snapshot_pool,
+                    metadata.batch_indices,
+                    metadata.positions,
+                    metadata.seq_slots,
+                    metadata.kv_lens_cuda_runtime,
+                    metadata.prompt_lens_cuda_runtime,
+                    accepted_tokens,
+                    snapshot["metadata_token_offset"],
+                    snapshot["num_gen_tokens"],
+                    metadata.batch_indices.shape[0],
+                    metadata.num_seqs,
+                    accepted_tokens.shape[0],
+                    pool.shape[0],
+                    pool.shape[1],
+                    int(local_layer),
+                    pool.stride(0),
+                    pool.stride(1),
+                    metadata.fp4_mla_hp_snapshot_pool.stride(0),
+                    metadata.fp4_mla_hp_snapshot_pool.stride(1),
+                    D=head_dim,
+                    POOL_HEAD_D=pool_head_dim,
+                    BLOCK_D=block_d,
+                    HP_BLOCK=HP_BLOCK_SIZE,
+                )
+            else:
+                positions = snapshot["positions"]
+                batch_indices = snapshot["batch_indices"]
+                seq_slots = snapshot["seq_slots"]
+                hp_slots = snapshot["hp_slots"]
+                first_new_positions = snapshot["first_new_positions"]
+                if positions.shape[0] == 0:
+                    continue
+                _hp_kv_restore_rejected_from_values_kernel[(positions.shape[0],)](
+                    pool,
+                    snapshot["values"],
+                    batch_indices,
+                    positions,
+                    seq_slots,
+                    hp_slots,
+                    first_new_positions,
+                    accepted_tokens,
+                    positions.shape[0],
+                    accepted_tokens.shape[0],
+                    pool.shape[0],
+                    pool.shape[1],
+                    int(local_layer),
+                    pool.stride(0),
+                    pool.stride(1),
+                    snapshot["values"].stride(0),
+                    snapshot["values"].stride(1),
+                    D=head_dim,
+                    POOL_HEAD_D=pool_head_dim,
+                    BLOCK_D=block_d,
+                    HP_BLOCK=HP_BLOCK_SIZE,
+                )
+    finally:
+        if not keep_snapshots:
+            setattr(metadata, _FP4_MLA_MTP_HP_SNAPSHOTS, None)
 
 
 def update_hp_kv_for_fp4_mla(
@@ -1380,9 +1654,10 @@ def update_hp_kv_for_fp4_mla(
         each request into buffer positions [0, remainder). These are the
         tail tokens that do not fill a complete FP4 block of 16.
 
-    Generation phase stores the single new token for each request into
-        position ``(kv_len - 1) % HP_BLOCK_SIZE``, overwriting the oldest
-        entry in the circular buffer.
+    Generation phase stores every new token for each request into position
+        ``position % HP_BLOCK_SIZE``, overwriting the oldest entries in the
+        circular buffer.  This supports linear MTP where a request contributes
+        more than one generation token in a forward pass.
 
     The Triton kernels use the GPU ``seq_slots`` tensor for scatter indexing
     and are CUDA-graph-compatible for the generation phase.
@@ -1501,21 +1776,61 @@ def update_hp_kv_for_fp4_mla(
         )
         _debug_sync("hp_context")
 
-    # Generation phase: store current token at (kv_len - 1) % HP_BLOCK_SIZE.
+    # Generation phase: store current tokens at position % HP_BLOCK_SIZE.
     num_gen = num_seqs - num_contexts
     if update_generation and num_gen > 0:
         gen_tok_start = 0
+        metadata_token_offset = getattr(metadata, "num_ctx_tokens", 0)
         if phase == "all":
             # Scalar offset: number of context tokens packed before gen tokens.
             gen_tok_start = int(metadata.prompt_lens_cpu_runtime[:num_contexts].sum().item())
+            metadata_token_offset = gen_tok_start
+        num_gen_tokens = latent_cache.shape[0] - gen_tok_start
+        if num_gen_tokens < 0:
+            raise RuntimeError(
+                "FP4 MLA HP generation update received fewer latent tokens than "
+                f"the context prefix: latent_tokens={latent_cache.shape[0]}, "
+                f"context_tokens={gen_tok_start}."
+            )
+        if num_gen_tokens == 0:
+            return
 
-        _fp4_mla_debug(f"hp generation launch: grid=({num_gen},) gen_tok_start={gen_tok_start}")
-        _hp_kv_store_gen_kernel[(num_gen,)](
+        gen_token_lens = _host_int_list(
+            getattr(metadata, "prompt_lens_cpu_runtime", None), num_contexts, num_seqs
+        )
+        if gen_token_lens is not None:
+            max_gen_len = max(gen_token_lens)
+        elif num_gen_tokens % num_gen == 0:
+            max_gen_len = num_gen_tokens // num_gen
+        else:
+            max_gen_len = num_gen_tokens
+        _snapshot_hp_kv_for_mtp_generation(
+            metadata,
+            pool,
+            local_layer,
+            num_gen=num_gen,
+            num_gen_tokens=num_gen_tokens,
+            max_gen_len=max_gen_len,
+            metadata_token_offset=metadata_token_offset,
+            head_dim=head_dim,
+            pool_head_dim=pool_head_dim,
+        )
+
+        _fp4_mla_debug(
+            "hp generation launch: "
+            f"grid=({num_gen_tokens},) gen_tok_start={gen_tok_start} "
+            f"metadata_token_offset={metadata_token_offset}"
+        )
+        _hp_kv_store_gen_kernel[(num_gen_tokens,)](
             pool,
             latent_cache,
-            metadata.seq_slots[num_contexts:],
-            metadata.kv_lens_cuda_runtime[num_contexts:],
+            metadata.seq_slots,
+            metadata.batch_indices,
+            metadata.positions,
             gen_tok_start,
+            metadata_token_offset,
+            num_gen_tokens,
+            metadata.batch_indices.shape[0],
             pool.shape[0],
             pool.shape[1],
             local_layer,

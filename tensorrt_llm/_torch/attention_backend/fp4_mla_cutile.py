@@ -688,6 +688,7 @@ def _fp4_mla_attention_stats_kernel(
     FP4_BLOCK: tl.constexpr,
     Q_SF_PER_TOKEN: tl.constexpr,
     K_SF_PER_TOKEN: tl.constexpr,
+    QUERY_LEN_PER_SEQ: tl.constexpr,
     MAX_PAGES: tl.constexpr,
     BLOCK_H: tl.constexpr,
     BLOCK_T: tl.constexpr,
@@ -700,8 +701,10 @@ def _fp4_mla_attention_stats_kernel(
     ASSUME_VALID_PAGES: tl.constexpr,
     occupancy: tl.constexpr = 1,
 ):
-    gen_idx = tl.program_id(0)
+    query_idx = tl.program_id(0)
     head_block = tl.program_id(1)
+    seq_idx = query_idx // QUERY_LEN_PER_SEQ
+    query_offset = query_idx - seq_idx * QUERY_LEN_PER_SEQ
 
     offs_h = head_block * BLOCK_H + tl.arange(0, BLOCK_H)
     if ASSUME_FULL_HEADS:
@@ -711,9 +714,10 @@ def _fp4_mla_attention_stats_kernel(
         mask_h = offs_h < NUM_HEADS
         safe_offs_h = tl.where(mask_h, offs_h, 0)
     offs_t = tl.arange(0, BLOCK_T)
-    q_row_base = gen_idx * NUM_HEADS
-    kv_len = tl.load(kv_lens_ptr + gen_idx)
-    page_table_start = tl.load(paged_kv_indptr_decode_ptr + gen_idx).to(tl.int64)
+    q_row_base = query_idx * NUM_HEADS
+    kv_len = tl.load(kv_lens_ptr + seq_idx) - (QUERY_LEN_PER_SEQ - 1 - query_offset)
+    kv_len = tl.maximum(kv_len, 0)
+    page_table_start = tl.load(paged_kv_indptr_decode_ptr + seq_idx).to(tl.int64)
 
     max_score = tl.full((BLOCK_H,), -float("inf"), dtype=tl.float32)
     denom = tl.zeros((BLOCK_H,), dtype=tl.float32)
@@ -773,8 +777,8 @@ def _fp4_mla_attention_stats_kernel(
             )
             max_score = new_max
 
-    tl.store(max_ptr + gen_idx * stats_s0 + safe_offs_h, max_score, mask=mask_h)
-    tl.store(denom_ptr + gen_idx * stats_s0 + safe_offs_h, denom, mask=mask_h)
+    tl.store(max_ptr + query_idx * stats_s0 + safe_offs_h, max_score, mask=mask_h)
+    tl.store(denom_ptr + query_idx * stats_s0 + safe_offs_h, denom, mask=mask_h)
 
 
 @triton.jit
@@ -816,6 +820,8 @@ def _fp4_mla_attention_page_stats_kernel(
     K_SF_PER_TOKEN: tl.constexpr,
     SF_PER_PAGE: tl.constexpr,
     P_GLOBAL_SCALE: tl.constexpr,
+    QUERY_LEN_PER_SEQ: tl.constexpr,
+    MAX_PAGES: tl.constexpr,
     BLOCK_H: tl.constexpr,
     BLOCK_T: tl.constexpr,
     BLOCK_K: tl.constexpr,
@@ -828,9 +834,11 @@ def _fp4_mla_attention_page_stats_kernel(
     ASSUME_VALID_PAGES: tl.constexpr,
     occupancy: tl.constexpr = 1,
 ):
-    gen_idx = tl.program_id(0)
+    query_idx = tl.program_id(0)
     head_block = tl.program_id(1)
     page_rel = tl.program_id(2)
+    seq_idx = query_idx // QUERY_LEN_PER_SEQ
+    query_offset = query_idx - seq_idx * QUERY_LEN_PER_SEQ
 
     offs_h = head_block * BLOCK_H + tl.arange(0, BLOCK_H)
     if ASSUME_FULL_HEADS:
@@ -840,14 +848,15 @@ def _fp4_mla_attention_page_stats_kernel(
         mask_h = offs_h < NUM_HEADS
         safe_offs_h = tl.where(mask_h, offs_h, 0)
     offs_t = tl.arange(0, BLOCK_T)
-    q_row_base = gen_idx * NUM_HEADS
+    q_row_base = query_idx * NUM_HEADS
     if ASSUME_FULL_PAGES:
         kv_len = 0
     else:
-        kv_len = tl.load(kv_lens_ptr + gen_idx)
+        kv_len = tl.load(kv_lens_ptr + seq_idx) - (QUERY_LEN_PER_SEQ - 1 - query_offset)
+        kv_len = tl.maximum(kv_len, 0)
     page_start = page_rel * PAGE_SIZE
-    page_table_start = tl.load(paged_kv_indptr_decode_ptr + gen_idx).to(tl.int64)
-    out_offsets = gen_idx * page_stats_s0 + page_rel * page_stats_s1 + safe_offs_h
+    page_table_start = tl.load(paged_kv_indptr_decode_ptr + seq_idx).to(tl.int64)
+    out_offsets = query_idx * page_stats_s0 + page_rel * page_stats_s1 + safe_offs_h
 
     page_max = tl.full((BLOCK_H,), -float("inf"), dtype=tl.float32)
     page_sum = tl.zeros((BLOCK_H,), dtype=tl.float32)
@@ -928,23 +937,19 @@ def _fp4_mla_attention_page_stats_kernel(
             even_probs, odd_probs = tl.split(pairs)
             packed = _fp4_e2m1_quantize_packed(even_probs, odd_probs)
 
-            if ASSUME_VALID_PAGES:
-                safe_compact_page = page_table_start + page_rel
-            else:
+            if not ASSUME_VALID_PAGES:
                 valid_compact_page = (page_table_start + page_rel >= 0) & (
                     page_table_start + page_rel < page_ids_len
                 )
-                safe_compact_page = tl.where(valid_compact_page, page_table_start + page_rel, 0)
-            p_rows = safe_compact_page * NUM_HEADS + offs_h
+            p_page = query_idx * MAX_PAGES + page_rel
+            p_rows = p_page * NUM_HEADS + offs_h
             safe_p_rows = (
-                p_rows
-                if ASSUME_FULL_HEADS
-                else tl.where(mask_h, p_rows, safe_compact_page * NUM_HEADS)
+                p_rows if ASSUME_FULL_HEADS else tl.where(mask_h, p_rows, p_page * NUM_HEADS)
             )
             scale_cols = tl.arange(0, SF_PER_PAGE)
             if ASSUME_FULL_HEADS and ASSUME_VALID_PAGES and NUM_HEADS == 128 and BLOCK_H == 128:
                 sf_offsets = _fp4_mla_swizzled_sf_offset_row_block(
-                    safe_compact_page, offs_h[:, None], scale_cols[None, :], SF_PER_PAGE
+                    p_page, offs_h[:, None], scale_cols[None, :], SF_PER_PAGE
                 )
             else:
                 sf_offsets = _fp4_mla_swizzled_sf_offset(
@@ -968,7 +973,7 @@ def _fp4_mla_attention_page_stats_kernel(
             byte_cols = scale_cols[:, None] * (FP4_BLOCK // 2) + byte_offsets[None, :]
             if USE_TMA_DATA_LOAD and ASSUME_FULL_HEADS and ASSUME_VALID_PAGES:
                 p_desc.store(
-                    [(safe_compact_page * NUM_HEADS + head_block * BLOCK_H).to(tl.int32), 0],
+                    [(p_page * NUM_HEADS + head_block * BLOCK_H).to(tl.int32), 0],
                     tl.reshape(packed, (BLOCK_H, PAGE_SIZE // 2)),
                 )
             elif ASSUME_FULL_HEADS:
@@ -1070,25 +1075,30 @@ def _fp4_mla_attention_prob_scale_kernel(
     NUM_HEADS: tl.constexpr,
     PAGE_SIZE: tl.constexpr,
     SF_PER_PAGE: tl.constexpr,
+    QUERY_LEN_PER_SEQ: tl.constexpr,
+    MAX_PAGES: tl.constexpr,
     BLOCK_H: tl.constexpr,
     ASSUME_FULL_HEADS: tl.constexpr,
     ASSUME_FULL_PAGES: tl.constexpr,
     ASSUME_VALID_PAGES: tl.constexpr,
     occupancy: tl.constexpr = 1,
 ):
-    gen_idx = tl.program_id(0)
+    query_idx = tl.program_id(0)
     head_block = tl.program_id(1)
     page_rel = tl.program_id(2)
+    seq_idx = query_idx // QUERY_LEN_PER_SEQ
+    query_offset = query_idx - seq_idx * QUERY_LEN_PER_SEQ
 
     page_start = page_rel * PAGE_SIZE
     if ASSUME_FULL_PAGES:
         kv_len = 0
     else:
-        kv_len = tl.load(kv_lens_ptr + gen_idx)
+        kv_len = tl.load(kv_lens_ptr + seq_idx) - (QUERY_LEN_PER_SEQ - 1 - query_offset)
+        kv_len = tl.maximum(kv_len, 0)
         if page_start >= kv_len:
             return
 
-    page_table_start = tl.load(paged_kv_indptr_decode_ptr + gen_idx).to(tl.int64)
+    page_table_start = tl.load(paged_kv_indptr_decode_ptr + seq_idx).to(tl.int64)
     compact_page = page_table_start + page_rel
     if not ASSUME_VALID_PAGES:
         if (compact_page < 0) | (compact_page >= page_ids_len):
@@ -1102,24 +1112,23 @@ def _fp4_mla_attention_prob_scale_kernel(
         mask_h = offs_h < NUM_HEADS
         safe_offs_h = tl.where(mask_h, offs_h, 0)
     page_max = tl.load(
-        page_max_ptr + gen_idx * page_stats_s0 + page_rel * page_stats_s1 + safe_offs_h,
+        page_max_ptr + query_idx * page_stats_s0 + page_rel * page_stats_s1 + safe_offs_h,
         mask=mask_h,
         other=-float("inf"),
     )
-    max_score = tl.load(max_ptr + gen_idx * stats_s0 + safe_offs_h, mask=mask_h, other=0.0)
-    denom = tl.load(denom_ptr + gen_idx * stats_s0 + safe_offs_h, mask=mask_h, other=0.0)
+    max_score = tl.load(max_ptr + query_idx * stats_s0 + safe_offs_h, mask=mask_h, other=0.0)
+    denom = tl.load(denom_ptr + query_idx * stats_s0 + safe_offs_h, mask=mask_h, other=0.0)
     factor = tl.where(
         denom > 0.0, tl.math.exp2((page_max - max_score) * 1.4426950408889634) / denom, 0.0
     )
 
-    p_rows = compact_page * NUM_HEADS + offs_h
-    safe_p_rows = (
-        p_rows if ASSUME_FULL_HEADS else tl.where(mask_h, p_rows, compact_page * NUM_HEADS)
-    )
+    p_page = query_idx * MAX_PAGES + page_rel
+    p_rows = p_page * NUM_HEADS + offs_h
+    safe_p_rows = p_rows if ASSUME_FULL_HEADS else tl.where(mask_h, p_rows, p_page * NUM_HEADS)
     scale_cols = tl.arange(0, SF_PER_PAGE)
     if ASSUME_FULL_HEADS and ASSUME_VALID_PAGES and NUM_HEADS == 128 and BLOCK_H == 128:
         sf_offsets = _fp4_mla_swizzled_sf_offset_row_block(
-            compact_page, offs_h[:, None], scale_cols[None, :], SF_PER_PAGE
+            p_page, offs_h[:, None], scale_cols[None, :], SF_PER_PAGE
         )
     else:
         sf_offsets = _fp4_mla_swizzled_sf_offset(
@@ -1164,6 +1173,7 @@ def _fp4_mla_attention_prob_store_page_kernel(
     FP4_BLOCK: tl.constexpr,
     Q_SF_PER_TOKEN: tl.constexpr,
     K_SF_PER_TOKEN: tl.constexpr,
+    QUERY_LEN_PER_SEQ: tl.constexpr,
     BLOCK_H: tl.constexpr,
     BLOCK_K: tl.constexpr,
     FULL_BLOCK_END: tl.constexpr,
@@ -1174,10 +1184,13 @@ def _fp4_mla_attention_prob_store_page_kernel(
     ASSUME_VALID_PAGES: tl.constexpr,
     occupancy: tl.constexpr = 1,
 ):
-    gen_idx = tl.program_id(0)
+    query_idx = tl.program_id(0)
     head_block = tl.program_id(1)
+    seq_idx = query_idx // QUERY_LEN_PER_SEQ
+    query_offset = query_idx - seq_idx * QUERY_LEN_PER_SEQ
 
-    kv_len = tl.load(kv_lens_ptr + gen_idx)
+    kv_len = tl.load(kv_lens_ptr + seq_idx) - (QUERY_LEN_PER_SEQ - 1 - query_offset)
+    kv_len = tl.maximum(kv_len, 0)
     page_start = page_rel * PAGE_SIZE
     if (not ASSUME_FULL_PAGES) and page_start >= kv_len:
         return
@@ -1194,11 +1207,11 @@ def _fp4_mla_attention_prob_store_page_kernel(
         valid_t = tl.full([PAGE_SIZE], True, dtype=tl.int1)
     else:
         valid_t = page_start + offs_t < kv_len
-    page_table_start = tl.load(paged_kv_indptr_decode_ptr + gen_idx).to(tl.int64)
+    page_table_start = tl.load(paged_kv_indptr_decode_ptr + seq_idx).to(tl.int64)
     compact_page = page_table_start + page_rel
     if (compact_page < 0) | (compact_page >= page_ids_len):
         return
-    q_row_base = gen_idx * NUM_HEADS
+    q_row_base = query_idx * NUM_HEADS
 
     scores = _fp4_mla_qk_scores_tile(
         q_fp4_ptr,
@@ -1236,8 +1249,8 @@ def _fp4_mla_attention_prob_store_page_kernel(
         ASSUME_FULL_HEADS,
         ASSUME_VALID_PAGES,
     )
-    max_score = tl.load(max_ptr + gen_idx * stats_s0 + safe_offs_h, mask=mask_h, other=0.0)
-    denom = tl.load(denom_ptr + gen_idx * stats_s0 + safe_offs_h, mask=mask_h, other=1.0)
+    max_score = tl.load(max_ptr + query_idx * stats_s0 + safe_offs_h, mask=mask_h, other=0.0)
+    denom = tl.load(denom_ptr + query_idx * stats_s0 + safe_offs_h, mask=mask_h, other=1.0)
     global_scale = tl.load(global_scale_ptr)
     qk_scale = sm_scale / (global_scale * global_scale)
     denom_valid = denom > 0.0
@@ -1247,8 +1260,8 @@ def _fp4_mla_attention_prob_store_page_kernel(
     probs = tl.math.exp2((scores - safe_max[:, None]) * 1.4426950408889634) / safe_denom[:, None]
     probs = tl.where(mask_h[:, None] & valid_t[None, :] & denom_valid[:, None], probs, 0.0)
 
-    prob_rows = gen_idx * NUM_HEADS + offs_h
-    safe_prob_rows = tl.where(mask_h, prob_rows, gen_idx * NUM_HEADS)
+    prob_rows = query_idx * NUM_HEADS + offs_h
+    safe_prob_rows = tl.where(mask_h, prob_rows, query_idx * NUM_HEADS)
     tl.store(
         probs_ptr + safe_prob_rows[:, None] * probs_s0 + offs_t[None, :] * probs_s1,
         probs,
@@ -1274,21 +1287,26 @@ def _fp4_mla_attention_prob_pack_page_kernel(
     FP4_BLOCK: tl.constexpr,
     SF_PER_PAGE: tl.constexpr,
     P_GLOBAL_SCALE: tl.constexpr,
+    QUERY_LEN_PER_SEQ: tl.constexpr,
+    MAX_PAGES: tl.constexpr,
     BLOCK_H: tl.constexpr,
     ASSUME_FULL_HEADS: tl.constexpr,
     ASSUME_FULL_PAGES: tl.constexpr,
     occupancy: tl.constexpr = 1,
 ):
-    gen_idx = tl.program_id(0)
+    query_idx = tl.program_id(0)
     token_group = tl.program_id(1)
     head_block = tl.program_id(2)
+    seq_idx = query_idx // QUERY_LEN_PER_SEQ
+    query_offset = query_idx - seq_idx * QUERY_LEN_PER_SEQ
 
-    kv_len = tl.load(kv_lens_ptr + gen_idx)
+    kv_len = tl.load(kv_lens_ptr + seq_idx) - (QUERY_LEN_PER_SEQ - 1 - query_offset)
+    kv_len = tl.maximum(kv_len, 0)
     page_start = page_rel * PAGE_SIZE
     if (not ASSUME_FULL_PAGES) and page_start >= kv_len:
         return
 
-    page_table_start = tl.load(paged_kv_indptr_decode_ptr + gen_idx).to(tl.int64)
+    page_table_start = tl.load(paged_kv_indptr_decode_ptr + seq_idx).to(tl.int64)
     compact_page = page_table_start + page_rel
     if (compact_page < 0) | (compact_page >= page_ids_len):
         return
@@ -1305,8 +1323,8 @@ def _fp4_mla_attention_prob_pack_page_kernel(
     valid_even = page_start + even_t < kv_len
     valid_odd = page_start + odd_t < kv_len
 
-    prob_rows = gen_idx * NUM_HEADS + offs_h
-    safe_prob_rows = tl.where(mask_h, prob_rows, gen_idx * NUM_HEADS)
+    prob_rows = query_idx * NUM_HEADS + offs_h
+    safe_prob_rows = tl.where(mask_h, prob_rows, query_idx * NUM_HEADS)
     even_probs = tl.load(
         probs_ptr + safe_prob_rows[:, None] * probs_s0 + even_t[None, :] * probs_s1,
         mask=mask_h[:, None] & valid_even[None, :],
@@ -1321,8 +1339,9 @@ def _fp4_mla_attention_prob_pack_page_kernel(
     local_scale = tl.where(amax > 0.0, amax / 6.0, 1.0)
     stored_scale = tl.where(amax > 0.0, tl.minimum(local_scale * P_GLOBAL_SCALE, 448.0), 1.0)
 
-    p_rows = compact_page * NUM_HEADS + offs_h
-    safe_p_rows = tl.where(mask_h, p_rows, compact_page * NUM_HEADS)
+    p_page = query_idx * MAX_PAGES + page_rel
+    p_rows = p_page * NUM_HEADS + offs_h
+    safe_p_rows = tl.where(mask_h, p_rows, p_page * NUM_HEADS)
     sf_offsets = _fp4_mla_swizzled_sf_offset(safe_p_rows, token_group, SF_PER_PAGE)
     tl.store(p_sf_ptr + sf_offsets, stored_scale, mask=mask_h)
 
@@ -1375,6 +1394,8 @@ def _fp4_mla_attention_prob_pack_page_fused_kernel(
     K_SF_PER_TOKEN: tl.constexpr,
     SF_PER_PAGE: tl.constexpr,
     P_GLOBAL_SCALE: tl.constexpr,
+    QUERY_LEN_PER_SEQ: tl.constexpr,
+    MAX_PAGES: tl.constexpr,
     BLOCK_H: tl.constexpr,
     BLOCK_K: tl.constexpr,
     FULL_BLOCK_END: tl.constexpr,
@@ -1386,12 +1407,15 @@ def _fp4_mla_attention_prob_pack_page_fused_kernel(
     ASSUME_VALID_PAGES: tl.constexpr = False,
     occupancy: tl.constexpr = 1,
 ):
-    gen_idx = tl.program_id(0)
+    query_idx = tl.program_id(0)
     head_block = tl.program_id(1)
     if PAGE_REL_FROM_GRID:
         page_rel = tl.program_id(2)
+    seq_idx = query_idx // QUERY_LEN_PER_SEQ
+    query_offset = query_idx - seq_idx * QUERY_LEN_PER_SEQ
 
-    kv_len = tl.load(kv_lens_ptr + gen_idx)
+    kv_len = tl.load(kv_lens_ptr + seq_idx) - (QUERY_LEN_PER_SEQ - 1 - query_offset)
+    kv_len = tl.maximum(kv_len, 0)
     page_start = page_rel * PAGE_SIZE
     if (not ASSUME_FULL_PAGES) and page_start >= kv_len:
         return
@@ -1408,11 +1432,11 @@ def _fp4_mla_attention_prob_pack_page_fused_kernel(
         valid_t = tl.full([PAGE_SIZE], True, dtype=tl.int1)
     else:
         valid_t = page_start + offs_t < kv_len
-    page_table_start = tl.load(paged_kv_indptr_decode_ptr + gen_idx).to(tl.int64)
+    page_table_start = tl.load(paged_kv_indptr_decode_ptr + seq_idx).to(tl.int64)
     compact_page = page_table_start + page_rel
     if (compact_page < 0) | (compact_page >= page_ids_len):
         return
-    q_row_base = gen_idx * NUM_HEADS
+    q_row_base = query_idx * NUM_HEADS
 
     scores = _fp4_mla_qk_scores_tile(
         q_fp4_ptr,
@@ -1450,8 +1474,8 @@ def _fp4_mla_attention_prob_pack_page_fused_kernel(
         ASSUME_FULL_HEADS,
         ASSUME_VALID_PAGES,
     )
-    max_score = tl.load(max_ptr + gen_idx * stats_s0 + safe_offs_h, mask=mask_h, other=0.0)
-    denom = tl.load(denom_ptr + gen_idx * stats_s0 + safe_offs_h, mask=mask_h, other=1.0)
+    max_score = tl.load(max_ptr + query_idx * stats_s0 + safe_offs_h, mask=mask_h, other=0.0)
+    denom = tl.load(denom_ptr + query_idx * stats_s0 + safe_offs_h, mask=mask_h, other=1.0)
     global_scale = tl.load(global_scale_ptr)
     qk_scale = sm_scale / (global_scale * global_scale)
     denom_valid = denom > 0.0
@@ -1470,8 +1494,9 @@ def _fp4_mla_attention_prob_pack_page_fused_kernel(
     even_probs, odd_probs = tl.split(pairs)
     packed = _fp4_e2m1_quantize_packed(even_probs, odd_probs)
 
-    p_rows = compact_page * NUM_HEADS + offs_h
-    safe_p_rows = tl.where(mask_h, p_rows, compact_page * NUM_HEADS)
+    p_page = query_idx * MAX_PAGES + page_rel
+    p_rows = p_page * NUM_HEADS + offs_h
+    safe_p_rows = tl.where(mask_h, p_rows, p_page * NUM_HEADS)
     scale_cols = tl.arange(0, SF_PER_PAGE)
     sf_offsets = _fp4_mla_swizzled_sf_offset(safe_p_rows[:, None], scale_cols[None, :], SF_PER_PAGE)
     tl.store(p_sf_ptr + sf_offsets, stored_scale, mask=mask_h[:, None])
@@ -1514,6 +1539,7 @@ def _fp4_mla_attention_pv_kernel(
     PAGE_SIZE: tl.constexpr,
     FP4_BLOCK: tl.constexpr,
     SF_PER_PAGE: tl.constexpr,
+    QUERY_LEN_PER_SEQ: tl.constexpr,
     MAX_PAGES: tl.constexpr,
     P_GLOBAL_SCALE: tl.constexpr,
     BLOCK_H: tl.constexpr,
@@ -1527,9 +1553,11 @@ def _fp4_mla_attention_pv_kernel(
     ASSUME_VALID_PAGES: tl.constexpr,
     occupancy: tl.constexpr = 1,
 ):
-    gen_idx = tl.program_id(0)
+    query_idx = tl.program_id(0)
     head_block = tl.program_id(1)
     dim_block = tl.program_id(2)
+    seq_idx = query_idx // QUERY_LEN_PER_SEQ
+    query_offset = query_idx - seq_idx * QUERY_LEN_PER_SEQ
 
     offs_h = head_block * BLOCK_H + tl.arange(0, BLOCK_H)
     offs_v = dim_block * BLOCK_V + tl.arange(0, BLOCK_V)
@@ -1630,20 +1658,21 @@ def _fp4_mla_attention_pv_kernel(
             tile_shape=[1, PAGE_SIZE, BLOCK_V // 2],
             tile_dim_map=[0, 1, 2],
         )
-        page_table_start = tl.load(paged_kv_indptr_decode_ptr + gen_idx).to(tl.int64)
+        page_table_start = tl.load(paged_kv_indptr_decode_ptr + seq_idx).to(tl.int64)
         global_scale = tl.load(global_scale_ptr)
         out_scale = 1.0 / (global_scale * P_GLOBAL_SCALE)
         acc = tl.zeros((BLOCK_H, BLOCK_V), dtype=tl.float32)
         for page_rel in tl.range(0, MAX_PAGES, num_stages=PV_LOOP_STAGES):
             compact_page = page_table_start + page_rel
             physical_page = tl.load(src_page_ids_ptr + compact_page).to(tl.int64)
+            p_page = query_idx * MAX_PAGES + page_rel
 
             p_vals = tl.ext.load_view_tko(
                 p_view,
-                [(compact_page * NUM_HEADS + head_block * BLOCK_H).to(tl.int32), 0],
+                [(p_page * NUM_HEADS + head_block * BLOCK_H).to(tl.int32), 0],
             )
             p_vals = p_vals.to(tl.uint8, bitcast=True)
-            p_scales = tl.ext.load_view_tko(p_sf_view, [compact_page.to(tl.int32), 0, 0, 0])
+            p_scales = tl.ext.load_view_tko(p_sf_view, [p_page.to(tl.int32), 0, 0, 0])
             p_scales = p_scales.reshape([1, SF_PER_PAGE // 4, 32, 4, 4]).trans(0, 3, 2, 1, 4)
             p_scales = p_scales.reshape([BLOCK_H, SF_PER_PAGE])
 
@@ -1696,7 +1725,7 @@ def _fp4_mla_attention_pv_kernel(
             out_vals = out_vals.to(tl.float16)
         out_desc.store(
             [
-                (gen_idx * NUM_HEADS + head_block * BLOCK_H).to(tl.int32),
+                (query_idx * NUM_HEADS + head_block * BLOCK_H).to(tl.int32),
                 (dim_block * BLOCK_V).to(tl.int32),
             ],
             out_vals,
@@ -1706,8 +1735,9 @@ def _fp4_mla_attention_pv_kernel(
     if ASSUME_FULL_PAGES:
         kv_len = 0
     else:
-        kv_len = tl.load(kv_lens_ptr + gen_idx)
-    page_table_start = tl.load(paged_kv_indptr_decode_ptr + gen_idx).to(tl.int64)
+        kv_len = tl.load(kv_lens_ptr + seq_idx) - (QUERY_LEN_PER_SEQ - 1 - query_offset)
+        kv_len = tl.maximum(kv_len, 0)
+    page_table_start = tl.load(paged_kv_indptr_decode_ptr + seq_idx).to(tl.int64)
     global_scale = tl.load(global_scale_ptr)
     out_scale = 1.0 / (global_scale * P_GLOBAL_SCALE)
     acc = tl.zeros((BLOCK_H, BLOCK_V), dtype=tl.float32)
@@ -1730,16 +1760,13 @@ def _fp4_mla_attention_pv_kernel(
                 )
                 safe_physical_page = tl.where(valid_physical_page, physical_page, 0)
 
-            p_rows = safe_compact_page * NUM_HEADS + offs_h
+            p_page = query_idx * MAX_PAGES + page_rel
+            p_rows = p_page * NUM_HEADS + offs_h
             safe_p_rows = (
-                p_rows
-                if ASSUME_FULL_HEADS
-                else tl.where(mask_h, p_rows, safe_compact_page * NUM_HEADS)
+                p_rows if ASSUME_FULL_HEADS else tl.where(mask_h, p_rows, p_page * NUM_HEADS)
             )
             if USE_TMA_P_LOAD:
-                p_vals = p_desc.load(
-                    [(safe_compact_page * NUM_HEADS + head_block * BLOCK_H).to(tl.int32), 0]
-                )
+                p_vals = p_desc.load([(p_page * NUM_HEADS + head_block * BLOCK_H).to(tl.int32), 0])
             else:
                 p_vals = tl.load(
                     p_fp4_ptr + safe_p_rows[:, None] * p_s0 + packed_t[None, :] * p_s1,
@@ -1830,20 +1857,20 @@ def _fp4_mla_attention_pv_kernel(
                 out_vals = out_vals.to(tl.float16)
             out_desc.store(
                 [
-                    (gen_idx * NUM_HEADS + head_block * BLOCK_H).to(tl.int32),
+                    (query_idx * NUM_HEADS + head_block * BLOCK_H).to(tl.int32),
                     (dim_block * BLOCK_V).to(tl.int32),
                 ],
                 out_vals,
             )
         else:
             tl.store(
-                out_ptr + gen_idx * out_s0 + offs_h[:, None] * out_s1 + offs_v[None, :] * out_s2,
+                out_ptr + query_idx * out_s0 + offs_h[:, None] * out_s1 + offs_v[None, :] * out_s2,
                 out_vals,
             )
     else:
         tl.store(
             out_ptr
-            + gen_idx * out_s0
+            + query_idx * out_s0
             + safe_offs_h[:, None] * out_s1
             + safe_offs_v[None, :] * out_s2,
             acc * out_scale,
@@ -1887,6 +1914,7 @@ def fp4_mla_paged_attention_internal(
     pack_prob_in_page_stats: Optional[bool] = None,
     assume_full_pages: Optional[bool] = None,
     assume_valid_pages: Optional[bool] = None,
+    query_len_per_seq: int = 1,
     p_fp4_workspace: Optional[torch.Tensor] = None,
     p_sf_workspace: Optional[torch.Tensor] = None,
     p_probs_workspace: Optional[torch.Tensor] = None,
@@ -1908,24 +1936,32 @@ def fp4_mla_paged_attention_internal(
     if global_scale.numel() < 1:
         raise ValueError("global_scale must contain at least one element.")
     if q_fp4.dim() == 3:
-        inferred_num_gen, inferred_num_heads, packed_q_dim = q_fp4.shape
+        inferred_num_queries, inferred_num_heads, packed_q_dim = q_fp4.shape
         if num_heads is not None and num_heads != inferred_num_heads:
             raise ValueError(
                 f"num_heads={num_heads} does not match q_fp4.shape[1]={inferred_num_heads}."
             )
-        num_gen = inferred_num_gen
+        num_queries = inferred_num_queries
         num_heads = inferred_num_heads
-        q_fp4_2d = q_fp4.reshape(num_gen * num_heads, packed_q_dim)
+        q_fp4_2d = q_fp4.reshape(num_queries * num_heads, packed_q_dim)
     elif q_fp4.dim() == 2:
         if num_heads is None:
             raise ValueError("num_heads is required when q_fp4 is 2D.")
         if q_fp4.shape[0] % num_heads != 0:
             raise ValueError("q_fp4.shape[0] must be divisible by num_heads.")
-        num_gen = q_fp4.shape[0] // num_heads
+        num_queries = q_fp4.shape[0] // num_heads
         packed_q_dim = q_fp4.shape[1]
         q_fp4_2d = q_fp4
     else:
         raise ValueError("q_fp4 must be 2D or 3D.")
+    if query_len_per_seq <= 0:
+        raise ValueError(f"query_len_per_seq must be positive, got {query_len_per_seq}.")
+    if num_queries % query_len_per_seq != 0:
+        raise ValueError(
+            "q_fp4 query rows must be divisible by query_len_per_seq, got "
+            f"{num_queries} rows and query_len_per_seq={query_len_per_seq}."
+        )
+    num_gen_seqs = num_queries // query_len_per_seq
 
     num_pages, inferred_page_size, packed_k_dim, kv_s0, kv_s2, kv_s4 = _get_kv_cache_strides(
         kv_cache
@@ -1956,7 +1992,7 @@ def fp4_mla_paged_attention_internal(
     q_sf_flat = q_sf.contiguous().view(-1)
     if sf_cache.shape[0] < num_pages or v_sf.shape[0] < num_pages:
         raise ValueError("sf_cache and v_sf must have a leading physical-page dimension.")
-    if q_sf_flat.numel() < _swizzled_scale_size(num_gen * num_heads, q_head_dim):
+    if q_sf_flat.numel() < _swizzled_scale_size(num_queries * num_heads, q_head_dim):
         raise ValueError("q_sf is too small for the swizzled Q scale layout.")
     if sf_cache.numel() < sf_cache.shape[0] * _swizzled_scale_size(page_size, k_head_dim):
         raise ValueError("sf_cache is too small for the swizzled K scale layout.")
@@ -1965,14 +2001,14 @@ def fp4_mla_paged_attention_internal(
 
     if output is None:
         output = torch.empty(
-            (num_gen, num_heads, v_head_dim), dtype=output_dtype, device=q_fp4.device
+            (num_queries, num_heads, v_head_dim), dtype=output_dtype, device=q_fp4.device
         )
-    elif output.shape != (num_gen, num_heads, v_head_dim):
+    elif output.shape != (num_queries, num_heads, v_head_dim):
         raise ValueError(
-            f"output must have shape {(num_gen, num_heads, v_head_dim)}, got {tuple(output.shape)}."
+            f"output must have shape {(num_queries, num_heads, v_head_dim)}, got {tuple(output.shape)}."
         )
 
-    if num_gen == 0:
+    if num_queries == 0:
         return output
     triton_backend = "nvt"
     if block_k is None:
@@ -1981,11 +2017,13 @@ def fp4_mla_paged_attention_internal(
     tail_k = q_head_dim - full_block_end
     tail_block_k = 1 << (tail_k - 1).bit_length() if tail_k > 0 else block_k
     if max_pages is None:
-        if paged_kv_indptr_decode.numel() >= num_gen + 1:
-            page_counts = paged_kv_indptr_decode[1 : num_gen + 1] - paged_kv_indptr_decode[:num_gen]
+        if paged_kv_indptr_decode.numel() >= num_gen_seqs + 1:
+            page_counts = (
+                paged_kv_indptr_decode[1 : num_gen_seqs + 1] - paged_kv_indptr_decode[:num_gen_seqs]
+            )
             max_pages = int(page_counts.max().item()) if page_counts.numel() > 0 else 0
         else:
-            max_pages = _ceil_div(int(kv_lens[:num_gen].max().item()), page_size)
+            max_pages = _ceil_div(int(kv_lens[:num_gen_seqs].max().item()), page_size)
     if max_pages <= 0:
         output.zero_()
         return output
@@ -1993,18 +2031,19 @@ def fp4_mla_paged_attention_internal(
     q_sf_per_token = q_head_dim // FP4_BLOCK_SIZE
     k_sf_per_token = k_head_dim // FP4_BLOCK_SIZE
     sf_per_page = page_size // FP4_BLOCK_SIZE
+    block_t = page_size
     num_head_blocks = triton.cdiv(num_heads, block_h)
     assume_full_heads = num_heads % block_h == 0
     assume_full_v = v_head_dim % block_v == 0
     if assume_full_pages is None:
         assume_full_pages = False
-    assume_full_pages = bool(assume_full_pages)
+    assume_full_pages = bool(assume_full_pages) and query_len_per_seq == 1
     if assume_valid_pages is None:
         assume_valid_pages = False
     assume_valid_pages = bool(assume_valid_pages)
-    total_p_rows = max(src_page_ids.numel() * num_heads, 1)
+    total_p_rows = max(num_queries * max_pages * num_heads, 1)
     if page_pipeline_streams is None:
-        if triton_backend == "nvt" and max_pages >= 8 and num_gen >= 128:
+        if triton_backend == "nvt" and max_pages >= 8 and num_queries >= 128:
             page_pipeline_streams = 2
         else:
             page_pipeline_streams = 1
@@ -2051,7 +2090,7 @@ def fp4_mla_paged_attention_internal(
     if fused_prob_pack:
         p_probs = None
     else:
-        p_probs_shape = (max(num_gen * num_heads, 1), page_size)
+        p_probs_shape = (max(num_queries * num_heads, 1), page_size)
         if page_pipeline_streams > 1:
             p_probs = _workspace_tensor(
                 p_probs_workspace,
@@ -2070,14 +2109,14 @@ def fp4_mla_paged_attention_internal(
             )
     max_scores = _workspace_tensor(
         max_scores_workspace,
-        (num_gen, num_heads),
+        (num_queries, num_heads),
         dtype=torch.float32,
         device=q_fp4.device,
         name="max_scores",
     )
     denom = _workspace_tensor(
         denom_workspace,
-        (num_gen, num_heads),
+        (num_queries, num_heads),
         dtype=torch.float32,
         device=q_fp4.device,
         name="denom",
@@ -2091,7 +2130,7 @@ def fp4_mla_paged_attention_internal(
         pack_prob_in_page_stats and parallel_page_stats and fused_prob_pack
     )
     if parallel_page_stats:
-        page_stats_shape = (num_gen, max_pages, num_heads)
+        page_stats_shape = (num_queries, max_pages, num_heads)
         page_max = _workspace_tensor(
             page_max_workspace,
             page_stats_shape,
@@ -2106,7 +2145,7 @@ def fp4_mla_paged_attention_internal(
             device=q_fp4.device,
             name="page_sum",
         )
-        _fp4_mla_attention_page_stats_kernel[(num_gen, num_head_blocks, max_pages)](
+        _fp4_mla_attention_page_stats_kernel[(num_queries, num_head_blocks, max_pages)](
             page_max,
             page_sum,
             p_fp4,
@@ -2144,8 +2183,10 @@ def fp4_mla_paged_attention_internal(
             K_SF_PER_TOKEN=k_sf_per_token,
             SF_PER_PAGE=sf_per_page,
             P_GLOBAL_SCALE=p_global_scale,
+            QUERY_LEN_PER_SEQ=query_len_per_seq,
+            MAX_PAGES=max_pages,
             BLOCK_H=block_h,
-            BLOCK_T=page_size,
+            BLOCK_T=block_t,
             BLOCK_K=block_k,
             FULL_BLOCK_END=full_block_end,
             TAIL_BLOCK_K=tail_block_k,
@@ -2156,7 +2197,7 @@ def fp4_mla_paged_attention_internal(
             ASSUME_VALID_PAGES=assume_valid_pages,
             **launch_meta,
         )
-        _fp4_mla_attention_reduce_stats_kernel[(num_gen, num_head_blocks)](
+        _fp4_mla_attention_reduce_stats_kernel[(num_queries, num_head_blocks)](
             max_scores,
             denom,
             page_max,
@@ -2170,7 +2211,7 @@ def fp4_mla_paged_attention_internal(
             **launch_meta,
         )
         if pack_prob_in_page_stats:
-            _fp4_mla_attention_prob_scale_kernel[(num_gen, num_head_blocks, max_pages)](
+            _fp4_mla_attention_prob_scale_kernel[(num_queries, num_head_blocks, max_pages)](
                 p_sf,
                 max_scores,
                 denom,
@@ -2184,6 +2225,8 @@ def fp4_mla_paged_attention_internal(
                 NUM_HEADS=num_heads,
                 PAGE_SIZE=page_size,
                 SF_PER_PAGE=sf_per_page,
+                QUERY_LEN_PER_SEQ=query_len_per_seq,
+                MAX_PAGES=max_pages,
                 BLOCK_H=block_h,
                 ASSUME_FULL_HEADS=assume_full_heads,
                 ASSUME_FULL_PAGES=assume_full_pages,
@@ -2191,7 +2234,7 @@ def fp4_mla_paged_attention_internal(
                 **launch_meta,
             )
     else:
-        _fp4_mla_attention_stats_kernel[(num_gen, num_head_blocks)](
+        _fp4_mla_attention_stats_kernel[(num_queries, num_head_blocks)](
             max_scores,
             denom,
             q_fp4_2d,
@@ -2221,9 +2264,10 @@ def fp4_mla_paged_attention_internal(
             FP4_BLOCK=FP4_BLOCK_SIZE,
             Q_SF_PER_TOKEN=q_sf_per_token,
             K_SF_PER_TOKEN=k_sf_per_token,
+            QUERY_LEN_PER_SEQ=query_len_per_seq,
             MAX_PAGES=max_pages,
             BLOCK_H=block_h,
-            BLOCK_T=page_size,
+            BLOCK_T=block_t,
             BLOCK_K=block_k,
             FULL_BLOCK_END=full_block_end,
             TAIL_BLOCK_K=tail_block_k,
@@ -2236,7 +2280,7 @@ def fp4_mla_paged_attention_internal(
 
     def _launch_prob_page(page_rel: int, p_probs_slot: Optional[torch.Tensor] = None):
         if fused_prob_pack:
-            _fp4_mla_attention_prob_pack_page_fused_kernel[(num_gen, num_head_blocks)](
+            _fp4_mla_attention_prob_pack_page_fused_kernel[(num_queries, num_head_blocks)](
                 p_fp4,
                 p_sf,
                 max_scores,
@@ -2273,6 +2317,8 @@ def fp4_mla_paged_attention_internal(
                 K_SF_PER_TOKEN=k_sf_per_token,
                 SF_PER_PAGE=sf_per_page,
                 P_GLOBAL_SCALE=p_global_scale,
+                QUERY_LEN_PER_SEQ=query_len_per_seq,
+                MAX_PAGES=max_pages,
                 BLOCK_H=block_h,
                 BLOCK_K=block_k,
                 FULL_BLOCK_END=full_block_end,
@@ -2285,7 +2331,7 @@ def fp4_mla_paged_attention_internal(
             )
             return
         assert p_probs_slot is not None
-        _fp4_mla_attention_prob_store_page_kernel[(num_gen, num_head_blocks)](
+        _fp4_mla_attention_prob_store_page_kernel[(num_queries, num_head_blocks)](
             p_probs_slot,
             max_scores,
             denom,
@@ -2319,6 +2365,7 @@ def fp4_mla_paged_attention_internal(
             FP4_BLOCK=FP4_BLOCK_SIZE,
             Q_SF_PER_TOKEN=q_sf_per_token,
             K_SF_PER_TOKEN=k_sf_per_token,
+            QUERY_LEN_PER_SEQ=query_len_per_seq,
             BLOCK_H=block_h,
             BLOCK_K=block_k,
             FULL_BLOCK_END=full_block_end,
@@ -2329,7 +2376,7 @@ def fp4_mla_paged_attention_internal(
             ASSUME_VALID_PAGES=assume_valid_pages,
             **launch_meta,
         )
-        _fp4_mla_attention_prob_pack_page_kernel[(num_gen, sf_per_page, num_head_blocks)](
+        _fp4_mla_attention_prob_pack_page_kernel[(num_queries, sf_per_page, num_head_blocks)](
             p_fp4,
             p_sf,
             p_probs_slot,
@@ -2346,6 +2393,8 @@ def fp4_mla_paged_attention_internal(
             FP4_BLOCK=FP4_BLOCK_SIZE,
             SF_PER_PAGE=sf_per_page,
             P_GLOBAL_SCALE=p_global_scale,
+            QUERY_LEN_PER_SEQ=query_len_per_seq,
+            MAX_PAGES=max_pages,
             BLOCK_H=block_h,
             ASSUME_FULL_HEADS=assume_full_heads,
             ASSUME_FULL_PAGES=assume_full_pages,
@@ -2355,7 +2404,7 @@ def fp4_mla_paged_attention_internal(
     if pack_prob_in_page_stats:
         pass
     elif fused_prob_pack and fused_prob_pack_single_launch:
-        _fp4_mla_attention_prob_pack_page_fused_kernel[(num_gen, num_head_blocks, max_pages)](
+        _fp4_mla_attention_prob_pack_page_fused_kernel[(num_queries, num_head_blocks, max_pages)](
             p_fp4,
             p_sf,
             max_scores,
@@ -2392,6 +2441,8 @@ def fp4_mla_paged_attention_internal(
             K_SF_PER_TOKEN=k_sf_per_token,
             SF_PER_PAGE=sf_per_page,
             P_GLOBAL_SCALE=p_global_scale,
+            QUERY_LEN_PER_SEQ=query_len_per_seq,
+            MAX_PAGES=max_pages,
             BLOCK_H=block_h,
             BLOCK_K=block_k,
             FULL_BLOCK_END=full_block_end,
@@ -2400,6 +2451,7 @@ def fp4_mla_paged_attention_internal(
             PAGE_REL_FROM_GRID=True,
             ASSUME_FULL_HEADS=assume_full_heads,
             ASSUME_FULL_PAGES=assume_full_pages,
+            ASSUME_VALID_PAGES=assume_valid_pages,
             **launch_meta,
         )
     elif page_pipeline_streams == 1:
@@ -2424,7 +2476,7 @@ def fp4_mla_paged_attention_internal(
     num_dim_blocks = triton.cdiv(v_head_dim, block_v)
     _fp4_mla_attention_pv_kernel[
         (
-            num_gen,
+            num_queries,
             num_head_blocks,
             num_dim_blocks,
         )
@@ -2456,6 +2508,7 @@ def fp4_mla_paged_attention_internal(
         PAGE_SIZE=page_size,
         FP4_BLOCK=FP4_BLOCK_SIZE,
         SF_PER_PAGE=sf_per_page,
+        QUERY_LEN_PER_SEQ=query_len_per_seq,
         MAX_PAGES=max_pages,
         P_GLOBAL_SCALE=p_global_scale,
         BLOCK_H=block_h,

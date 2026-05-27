@@ -4149,11 +4149,16 @@ class TorchLlmArgs(BaseLlmArgs):
                 self.speculative_config = Eagle3DecodingConfig(**eagle_data)
 
             if self.speculative_config.use_rejection_sampling:
-                if not isinstance(self.speculative_config,
-                                  Eagle3DecodingConfig):
+                is_supported_rejection_path = isinstance(
+                    self.speculative_config, Eagle3DecodingConfig) or (
+                        isinstance(self.speculative_config, MTPDecodingConfig)
+                        and self.speculative_config.spec_dec_mode.
+                        is_mtp_eagle_one_model())
+                if not is_supported_rejection_path:
                     raise ValueError(
                         "use_rejection_sampling is only supported for "
-                        "PyTorch Eagle3 one-model speculative decoding paths.")
+                        "PyTorch Eagle3 and MTP-Eagle one-model speculative "
+                        "decoding paths.")
 
             if isinstance(self.speculative_config, PARDDecodingConfig):
                 assert self.speculative_config.max_draft_len > 0, "PARD max_draft_len must be > 0"

@@ -137,6 +137,7 @@ class TrtllmAttentionMetadata(AttentionMetadata):
     # Shape: [max_num_sequences, num_local_layers, kv_factor, HP_BLOCK_SIZE * head_dim]
     # Standalone tensor, not part of the block-based paged KV cache.
     high_precision_kv_pool: Optional[torch.Tensor] = None
+    fp4_mla_hp_snapshot_pool: Optional[torch.Tensor] = None
     # Ownership tracking: maps seq_slot to request_id that last wrote it.
     # Plain Python dict, updated during context phase, checked during decode.
     # Debug only; runs outside CUDA graph.
@@ -400,6 +401,19 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                 dtype=torch.bfloat16,
                 capture_graph=capture_graph,
             )
+            if capture_graph:
+                self.fp4_mla_hp_snapshot_pool = self.get_empty(
+                    buffers,
+                    [
+                        self.max_num_sequences, num_local_layers, kv_factor,
+                        HP_BLOCK_SIZE * head_dim
+                    ],
+                    cache_name="fp4_mla_hp_snapshot_pool",
+                    dtype=torch.bfloat16,
+                    capture_graph=capture_graph,
+                )
+            else:
+                self.fp4_mla_hp_snapshot_pool = None
             logger.info(
                 f"Allocated high-precision BF16 KV pool: shape="
                 f"{list(self.high_precision_kv_pool.shape)}, "
