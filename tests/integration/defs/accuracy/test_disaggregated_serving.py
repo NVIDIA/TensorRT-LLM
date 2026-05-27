@@ -14,6 +14,7 @@ from collections import namedtuple
 from concurrent.futures import ThreadPoolExecutor
 from typing import (Any, Dict, Iterator, List, NamedTuple, Optional, Protocol,
                     Union)
+from unittest import mock
 
 import openai
 import pytest
@@ -601,15 +602,14 @@ def launch_multimodal_encoder_pd_llm(
     env_updates = dict(extra_env or {})
     # Tell PD to consume encoder handles, not raw multimodal payloads.
     env_updates["TLLM_MULTIMODAL_DISAGGREGATED"] = "1"
-    with (
-            pytest.MonkeyPatch.context() as monkeypatch,
-            MyThreadPoolExecutor(max_workers=max_workers) as thread_pool,
-    ):
-        for key, value in env_updates.items():
-            monkeypatch.setenv(key, value)
+    with contextlib.ExitStack() as stack:
+        stack.enter_context(mock.patch.dict(os.environ, env_updates))
         if "TMPDIR" in env_updates:
             # tempfile caches TMPDIR. Keep the cache in sync with the env.
-            monkeypatch.setattr(tempfile, "tempdir", env_updates["TMPDIR"])
+            stack.enter_context(
+                mock.patch.object(tempfile, "tempdir", env_updates["TMPDIR"]))
+        thread_pool = stack.enter_context(
+            MyThreadPoolExecutor(max_workers=max_workers))
         encoder = MultimodalEncoder(model=model_name, **encoder_llm_config)
         pd_llm = LLM(model=model_name, **pd_llm_config)
         with encoder, pd_llm:

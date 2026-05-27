@@ -7,6 +7,7 @@ import torch
 
 import tensorrt_llm
 import tensorrt_llm.bindings.executor as trtllm
+from tensorrt_llm._torch.models.modeling_multimodal_utils import _is_mm_disagg
 from tensorrt_llm._torch.models.modeling_utils import \
     MODEL_CLASS_VISION_ENCODER_MAPPING
 from tensorrt_llm._utils import (confidential_compute_enabled, get_sm_version,
@@ -437,7 +438,7 @@ class KvCacheCreator:
         requests = []
         # Disaggregated workers receive multimodal embeddings instead of raw
         # pixel inputs, so capacity probing must use the text-only fallback.
-        if (not self._is_disagg
+        if (not _is_mm_disagg()
                 and hasattr(self._model_engine.model, "original_arch")
                 and MODEL_CLASS_VISION_ENCODER_MAPPING.get(
                     self._model_engine.model.original_arch, None)):
