@@ -30,8 +30,9 @@ from tensorrt_llm import LLM as LLM_torch
 from tensorrt_llm._tensorrt_engine import LLM
 from tensorrt_llm.bindings import executor as tllm
 from tensorrt_llm.executor import (GenerationExecutorWorker, GenerationRequest,
-                                   GenerationResult, LoRARequest,
-                                   PromptAdapterRequest, RequestError)
+                                   GenerationResult, GenerationResultBase,
+                                   LoRARequest, PromptAdapterRequest,
+                                   RequestError)
 from tensorrt_llm.llmapi import (BuildCacheConfig, EagleDecodingConfig,
                                  ExtendedRuntimePerfKnobConfig, KvCacheConfig,
                                  KvCacheRetentionConfig,
@@ -50,6 +51,8 @@ from tensorrt_llm.models.automodel import AutoConfig, AutoModelForCausalLM
 from tensorrt_llm.models.modeling_utils import SpeculativeDecodingMode
 from tensorrt_llm.sampling_params import (BatchedLogitsProcessor,
                                           LogitsProcessor, SamplingParams)
+from tensorrt_llm.serve.postprocess_handlers import (ChatPostprocArgs,
+                                                     chat_stream_post_processor)
 
 # isort: off
 sys.path.append(os.path.dirname(os.path.abspath(__file__)) + "/..")
@@ -2573,6 +2576,33 @@ def run_llm_with_postprocess_parallel(tp_size: int = 1):
 
 def test_llm_with_postprocess_parallel():
     run_llm_with_postprocess_parallel(tp_size=1)
+
+
+def test_chat_stream_post_processor_reuses_stream_metadata():
+    result = GenerationResultBase(123, SamplingParams())
+    output = result._outputs[0]
+    output.text = "x"
+    output.token_ids = [1]
+
+    args = ChatPostprocArgs(role="assistant", model="test-model")
+    chunks = chat_stream_post_processor(result, args)
+
+    output._last_text_len = len(output.text)
+    output._last_token_ids_len = len(output.token_ids)
+    output.text = "xy"
+    output.token_ids.append(2)
+    chunks += chat_stream_post_processor(result, args)
+
+    payloads = []
+    for chunk in chunks:
+        for line in chunk.splitlines():
+            if line.startswith("data: "):
+                payloads.append(json.loads(line[len("data: "):].strip()))
+
+    assert {payload["id"] for payload in payloads} == {"chatcmpl-123"}
+    assert len({payload["created"] for payload in payloads}) == 1
+    assert payloads[0]["choices"][0]["delta"]["role"] == "assistant"
+    assert payloads[-1]["choices"][0]["delta"]["content"] == "y"
 
 
 def run_llm_with_postprocess_parallel_and_result_handler(
