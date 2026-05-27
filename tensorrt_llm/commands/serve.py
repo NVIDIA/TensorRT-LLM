@@ -22,7 +22,6 @@ from torch.cuda import device_count
 from tensorrt_llm import LLM as PyTorchLLM
 from tensorrt_llm import MultimodalEncoder
 from tensorrt_llm._tensorrt_engine import LLM
-from tensorrt_llm._torch.visual_gen.config import VisualGenArgs
 from tensorrt_llm._utils import mpi_rank
 from tensorrt_llm.commands.utils import get_is_diffusion_model
 from tensorrt_llm.executor.utils import LlmLauncherEnvs
@@ -49,6 +48,7 @@ from tensorrt_llm.serve.tool_parser.tool_parser_factory import \
 from tensorrt_llm.tools.importlib_utils import import_custom_module_from_dir
 from tensorrt_llm.usage import config as _telemetry_config
 from tensorrt_llm.visual_gen import VisualGen
+from tensorrt_llm.visual_gen.args import VisualGenArgs
 
 # Global variable to store the Popen object of the child process
 _child_p_global: Optional[subprocess.Popen] = None
@@ -508,7 +508,7 @@ def launch_visual_gen_server(
         host: str,
         port: int,
         model: str,
-        diffusion_args: Optional[VisualGenArgs] = None,
+        visual_gen_args: Optional[VisualGenArgs] = None,
         metadata_server_cfg: Optional[MetadataServerConfig] = None,
         middleware: Sequence[str] = (),
 ):
@@ -518,18 +518,18 @@ def launch_visual_gen_server(
         host: Server hostname.
         port: Server port.
         model: Model path or HuggingFace Hub model ID.
-        diffusion_args: Optional validated VisualGenArgs for model configuration.
+        visual_gen_args: Optional validated VisualGenArgs for model configuration.
         metadata_server_cfg: Optional metadata server configuration.
     """
     logger.info(f"Initializing VisualGen ({model})")
 
-    visual_gen_model = VisualGen(model=model, args=diffusion_args)
+    visual_gen_model = VisualGen(model=model, args=visual_gen_args)
 
-    n_workers = visual_gen_model.args.parallel.n_workers
+    n_workers = visual_gen_model.args.parallel_config.n_workers
     logger.info(f"World size: {n_workers}")
-    logger.info(f"CFG size: {visual_gen_model.args.parallel.dit_cfg_size}")
+    logger.info(f"CFG size: {visual_gen_model.args.parallel_config.cfg_size}")
     logger.info(
-        f"Ulysses size: {visual_gen_model.args.parallel.dit_ulysses_size}")
+        f"Ulysses size: {visual_gen_model.args.parallel_config.ulysses_size}")
 
     server = OpenAIServer(generator=visual_gen_model,
                           model=model,
@@ -832,12 +832,17 @@ class ChoiceWithAlias(click.Choice):
         "The model name used in the API. If not specified, the model path is "
         "used as the model name. This is useful when the model path is long or "
         "when you want to expose a custom name to clients.", "prototype"))
-@click.option("--extra_visual_gen_options",
-              type=str,
-              default=None,
-              help=help_info_with_stability_tag(
-                  "Path to a YAML file with extra VISUAL_GEN model options.",
-                  "prototype"))
+@click.option(
+    "--visual_gen_args",
+    "--extra_visual_gen_options",
+    "visual_gen_args",
+    type=str,
+    default=None,
+    help=help_info_with_stability_tag(
+        "Path to a YAML file with VisualGen engine args.",
+        "prototype",
+    ),
+)
 @click.option(
     "--agent_percentage",
     type=float,
@@ -870,8 +875,7 @@ def serve(
         agent_types: Optional[str], video_pruning_rate: Optional[float],
         telemetry: bool, custom_module_dirs: list[Path],
         chat_template: Optional[str], middleware: tuple[str, ...], grpc: bool,
-        served_model_name: Optional[str],
-        extra_visual_gen_options: Optional[str]):
+        served_model_name: Optional[str], visual_gen_args: Optional[str]):
     """Running an OpenAI API compatible server
 
     MODEL: model name | HF checkpoint path | TensorRT engine path
@@ -1043,21 +1047,16 @@ def serve(
                           served_model_name=served_model_name)
 
     def _serve_visual_gen():
-        extra_args = {}
-        if extra_visual_gen_options is not None:
-            with open(extra_visual_gen_options, 'r') as f:
-                extra_args = yaml.safe_load(f) or {}
-
-        diffusion_args = VisualGenArgs(**extra_args) if extra_args else None
+        parsed_visual_gen_args = (VisualGenArgs.from_yaml(visual_gen_args)
+                                  if visual_gen_args is not None else None)
 
         metadata_server_cfg = parse_metadata_server_config_file(
             metadata_server_config_file)
 
-        launch_visual_gen_server(host, port, model, diffusion_args,
+        launch_visual_gen_server(host, port, model, parsed_visual_gen_args,
                                  metadata_server_cfg, middleware)
 
-    is_visual_gen = extra_visual_gen_options is not None or get_is_diffusion_model(
-        model)
+    is_visual_gen = visual_gen_args is not None or get_is_diffusion_model(model)
     if is_visual_gen:
         _serve_visual_gen()
     else:

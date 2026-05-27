@@ -71,15 +71,15 @@ DYNAMO_IMPORTS = [
     ("tensorrt_llm.inputs.utils", "load_image"),
     # -- bindings --
     ("tensorrt_llm.bindings.internal.batch_manager", "LlmRequest"),
-    # -- _torch / visual_gen --
-    ("tensorrt_llm._torch.visual_gen", "VisualGenArgs"),
+    # -- visual_gen (public configs) --
+    ("tensorrt_llm", "VisualGenArgs"),
+    ("tensorrt_llm.visual_gen", "CudaGraphConfig"),
+    ("tensorrt_llm.visual_gen", "ParallelConfig"),
+    ("tensorrt_llm.visual_gen", "TeaCacheConfig"),
+    ("tensorrt_llm.visual_gen", "TorchCompileConfig"),
+    ("tensorrt_llm.visual_gen", "AttentionConfig"),
+    # -- _torch / visual_gen (internals) --
     ("tensorrt_llm._torch.visual_gen", "PipelineLoader"),
-    ("tensorrt_llm._torch.visual_gen", "CudaGraphConfig"),
-    ("tensorrt_llm._torch.visual_gen", "ParallelConfig"),
-    ("tensorrt_llm._torch.visual_gen", "PipelineConfig"),
-    ("tensorrt_llm._torch.visual_gen", "TeaCacheConfig"),
-    ("tensorrt_llm._torch.visual_gen", "TorchCompileConfig"),
-    ("tensorrt_llm._torch.visual_gen.config", "AttentionConfig"),
     ("tensorrt_llm._torch.visual_gen.executor", "DiffusionRequest"),
     ("tensorrt_llm._torch.visual_gen.output", "PipelineOutput"),
     ("tensorrt_llm._torch.visual_gen.pipeline", "BasePipeline"),
