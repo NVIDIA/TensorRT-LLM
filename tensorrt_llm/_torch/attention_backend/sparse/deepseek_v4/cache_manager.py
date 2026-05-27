@@ -135,7 +135,7 @@ def _estimate_swa_cache_size(
             elif not scratch:
                 size_per_token += token_bytes
             else:
-                scratch_key = (int(window_size), token_bytes)
+                scratch_key = (attn_type, compress_ratio)
                 if scratch_key in scratch_keys:
                     size_per_request += window_tokens * token_bytes
                 else:
