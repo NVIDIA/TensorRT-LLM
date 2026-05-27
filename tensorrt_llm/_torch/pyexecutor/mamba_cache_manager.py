@@ -1542,29 +1542,9 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
         if self._pending_state_transfers:
             logger.info(f"Need to transfer mamba state blocks")
         self._setup_state_indices()
-        # Reset replay double-buffer state for fresh context blocks. A reused
-        # block (prefix-cache hit or block recycled across requests) may carry
-        # stale prev_num_accepted_tokens / cache_buf_idx values from a prior
-        # owner; the replay kernel reads these on the first decode step.
-        # Deterministically zero the per-slot stripes of all replay buffers so
-        # the kernel's unconditional loads (e.g. total_dA_cumsum at prev_k=0)
-        # never see Inf/NaN from a prior owner; this prevented intermittent
-        # SSM state corruption at higher concurrency (c=32) where slot reuse
-        # is frequent.
         num_contexts = len(scheduled_batch.context_requests)
         if num_contexts > 0:
             ctx_slots = self.cuda_state_indices[:num_contexts].long()
-            # Zero the SSM/conv state stripes for fresh context slots so
-            # neither the replay kernel nor the non-replay flashinfer SR
-            # kernel observes stale state on the first decode step of a
-            # recycled slot when the prefill does not fully overwrite the
-            # cache.  Must fire on BOTH paths — gating this behind
-            # _use_replay_state_update caused token-id-0 / `<unk>` collapse
-            # on greedy temp=0 replay-off at c=32 (cf. iter4 root cause).
-            if self.all_ssm_states is not None:
-                self.all_ssm_states[:, ctx_slots] = 0
-            if self.all_conv_states is not None:
-                self.all_conv_states[:, ctx_slots] = 0
             if self._use_replay_state_update and self.prev_num_accepted_tokens is not None:
                 self.prev_num_accepted_tokens[ctx_slots] = 0
                 self.cache_buf_idx[ctx_slots] = 0

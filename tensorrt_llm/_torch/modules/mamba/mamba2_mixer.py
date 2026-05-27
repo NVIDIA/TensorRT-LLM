@@ -348,6 +348,8 @@ class Mamba2Mixer(nn.Module):
             has_initial_states = mamba_metadata.has_initial_states[:
                                                                    num_prefills]
 
+            has_initial_states_p = has_initial_states[:num_prefills]
+            conv_states[state_indices_p[~has_initial_states_p]].zero_()
             # Fused kernel to avoid expensive .contiguous() call in causal_conv1d_fn.
             xbc_p_t = extract_transpose_xbc_prefill(zxbcdt, num_prefill_tokens,
                                                     self.tp_d_inner,
