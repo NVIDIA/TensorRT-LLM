@@ -267,6 +267,23 @@ class ParallelConfig(StrictBaseModel):
     def total_parallel_size(self) -> int:
         return self.cfg_size * self.seq_parallel_size
 
+    @model_validator(mode="after")
+    def _validate_async_ulysses(self) -> "ParallelConfig":
+        if self.async_ulysses:
+            if self.ulysses_size == 1:
+                raise ValueError(
+                    "async_ulysses=True requires ulysses_size > 1; got "
+                    f"ulysses_size={self.ulysses_size}."
+                )
+            if self.ring_size > 1:
+                raise ValueError(
+                    "async_ulysses=True is incompatible with ring_size > 1: "
+                    "async_ulysses forces SEPARATE_QKV which bypasses the "
+                    "RingAttention wrapper. Set ring_size=1 or async_ulysses=False "
+                    f"(got ring_size={self.ring_size})."
+                )
+        return self
+
     def validate_world_size(self, world_size: int) -> None:
         if self.total_parallel_size > world_size:
             raise ValueError(
