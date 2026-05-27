@@ -1782,6 +1782,7 @@ def gvr_topk_decode(
     num_threads_per_block: Optional[int] = None,
     enable_warp_parallel_reduce: Optional[bool] = None,
     compress_ratio: int = 1,
+    max_seq_len: Optional[int] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """cuTe DSL GVR Top-K, drop-in for ``torch.ops.trtllm.indexer_topk_decode``.
 
@@ -1810,6 +1811,22 @@ def gvr_topk_decode(
                    broadly above N=16K; half-prec cvt-fp32 doubles fragment
                    reg footprint and regresses 5-11% at K=512/1024).
                    Pass True / False to override.
+        max_seq_len: Graph-safe hint for the peak ``logits.shape[1]`` expected
+                   at replay time (same compressed-token-index space as
+                   ``logits``, i.e. already divided by ``compress_ratio`` for
+                   cr > 1).
+                   * CUDA Graph mode (e.g. decode in piecewise graph):
+                     **pass this**. Capture-time N typically << peak runtime N,
+                     so without a hint the captured kernel will miss the
+                     large-N (T=1024, V=256) optimization at replay.
+                   * Eager mode (per-call dispatch, no graph capture):
+                     **leave None**. The heuristic adapts to actual N each
+                     call and is always optimal for that N.
+                   For half-prec (bf16/fp16) the T=1024 threshold is raised to
+                   131072 to avoid small-N replay regression (small-N forced
+                   to T=1024 loses 14-16%). When omitted, the heuristic uses
+                   capture-time N and skips the dtype-split since per-call
+                   decisions never force T=1024 onto small-N inputs.
         out_values, out_indices: Optional preallocated outputs.
         min_blocks_per_mp: Override ptxas ``__launch_bounds__(BS, min_blocks)``
             hint. ``None`` (default) → use the 3-tier shape-aware heuristic
@@ -1863,12 +1880,34 @@ def gvr_topk_decode(
     #       fp32 N=8K dip (5-8% loss from 256-bit at small-grid small-N).
     # Net: median speedup vs CUDA 1.09× (baseline) -> 1.10×; max 1.45× ->
     # 1.52×; no regression introduced (~21 baseline sp<1 stay; 1 new at -1pp).
+    #
+    # max_seq_len (graph-safe hint): peak logits.shape[1] expected at replay,
+    # in the same compressed-token-index space as logits (already divided by
+    # compress_ratio if cr > 1).
+    #   CUDA Graph mode (e.g. decode in piecewise graph): CALLER MUST PASS
+    #     max_seq_len. Capture-time N is typically << peak runtime N, so
+    #     without the hint the captured kernel misses the large-N path.
+    #   Eager mode (per-call dispatch): leave max_seq_len=None. The heuristic
+    #     adapts to actual N each call and is always optimal for that N.
+    # When max_seq_len is provided, dtype-split kicks in to avoid half-prec
+    # K=512/1024 small-N replay regression (14-16% when small N is forced to
+    # T=1024). half-prec uses a higher T=1024 threshold (131072 vs 65536 for
+    # fp32). Without max_seq_len, no dtype-split — adaptive per-call decisions
+    # never force T=1024 onto small N (heuristic only fires for N >= 65536),
+    # so the half-prec N=65K-128K +4-6% T=1024 win is preserved.
     # Resolve here so the cache key sees the concrete values.
     N_cols = logits.shape[1]
+    N_dec = max_seq_len if max_seq_len is not None else N_cols
     if num_threads_per_block is None:
-        num_threads_per_block = 1024 if (num_rows <= num_sms and N_cols >= 65536) else 512
+        if max_seq_len is not None and logits.dtype != torch.float32:
+            # Graph-safe: half-prec needs higher T=1024 bar (peak-N gain must
+            # outweigh small-N replay regression).
+            n_thresh_t = 131072
+        else:
+            n_thresh_t = 65536
+        num_threads_per_block = 1024 if (num_rows <= num_sms and N_dec >= n_thresh_t) else 512
     if use_256bit_load is None:
-        use_256bit_load = logits.dtype == torch.float32 and N_cols >= 16384
+        use_256bit_load = logits.dtype == torch.float32 and N_dec >= 16384
     # enable_warp_parallel_reduce is tightly coupled to num_threads_per_block:
     # enabled iff num_threads == 1024 (32 warps), where the serial tid==0
     # reduce path becomes the bottleneck. At num_threads == 512 (16 warps)
