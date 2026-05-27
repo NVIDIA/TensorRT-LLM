@@ -19,10 +19,10 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Tuple
 
+import torch
 from pydantic import BaseModel, ConfigDict
 from pydantic import Field as PydanticField
 
-import torch
 from tensorrt_llm.functional import AllReduceStrategy
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping

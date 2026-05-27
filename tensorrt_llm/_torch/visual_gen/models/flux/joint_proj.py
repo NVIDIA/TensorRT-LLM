@@ -5,6 +5,7 @@ from typing import Dict, Optional, Tuple
 
 import torch
 import torch.nn as nn
+
 from tensorrt_llm._torch.distributed.ops import AllReduce
 from tensorrt_llm._torch.modules.linear import (
     Linear,

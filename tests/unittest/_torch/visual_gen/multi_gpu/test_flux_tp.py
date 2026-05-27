@@ -18,7 +18,6 @@ from types import SimpleNamespace
 from typing import Callable
 
 import pytest
-
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp

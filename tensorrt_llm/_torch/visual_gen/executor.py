@@ -6,10 +6,10 @@ import traceback
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, List, Optional
 
-import zmq
-
 import torch
 import torch.distributed as dist
+import zmq
+
 from tensorrt_llm._torch.visual_gen.output import PipelineOutput
 from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineLoader
 from tensorrt_llm.executor.ipc import ZeroMqQueue

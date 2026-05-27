@@ -19,11 +19,11 @@ All linear layers use bias=False to match HF weights.
 
 from typing import Any, Dict, Optional, Tuple, Union
 
+import torch
+import torch.nn as nn
 from diffusers.models.embeddings import TimestepEmbedding, Timesteps
 from tqdm import tqdm
 
-import torch
-import torch.nn as nn
 from tensorrt_llm._torch.modules.gated_mlp import GatedMLP
 from tensorrt_llm._torch.modules.layer_norm import LayerNorm
 from tensorrt_llm._torch.modules.linear import Linear

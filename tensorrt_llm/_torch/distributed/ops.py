@@ -5,6 +5,8 @@ import threading
 from typing import Dict, List, Optional, Tuple, Union
 
 import torch
+from torch import nn
+
 from tensorrt_llm._mnnvl_utils import HelixCpMnnvlMemory, MnnvlMemory
 from tensorrt_llm._torch.distributed.symm_mem_allreduce import \
     SymmetricMemoryAllReduce
@@ -18,7 +20,6 @@ from tensorrt_llm.functional import (AllReduceFusionOp, AllReduceParams,
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.plugin.plugin import CustomAllReduceHelper
-from torch import nn
 
 # Feature flag: GEMM→NCCL-window zero-copy (writes GEMM output directly into
 # the window buffer so the allreduce needs no extra copy).  Off by default

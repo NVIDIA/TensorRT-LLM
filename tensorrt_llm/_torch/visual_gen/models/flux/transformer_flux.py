@@ -19,13 +19,13 @@ Forward Pass Flow:
 
 from typing import Any, Dict, Optional, Tuple, Union
 
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
 from diffusers.models.embeddings import PixArtAlphaTextProjection as TextProjection
 from diffusers.models.embeddings import TimestepEmbedding, Timesteps
 from tqdm import tqdm
 
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
 from tensorrt_llm._torch.modules.layer_norm import LayerNorm
 from tensorrt_llm._torch.modules.linear import Linear, TensorParallelMode
 from tensorrt_llm._torch.modules.mlp import MLP

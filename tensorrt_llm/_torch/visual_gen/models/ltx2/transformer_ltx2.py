@@ -22,11 +22,11 @@ from dataclasses import dataclass, replace
 from enum import Enum
 from typing import TYPE_CHECKING, Any, Optional
 
-from tqdm import tqdm
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from tqdm import tqdm
+
 from tensorrt_llm._torch.modules.linear import Linear, WeightMode
 from tensorrt_llm._torch.modules.mlp import MLP
 from tensorrt_llm._torch.visual_gen.attention_backend.utils import create_attention

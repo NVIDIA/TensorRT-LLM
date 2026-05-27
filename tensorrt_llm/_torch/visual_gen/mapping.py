@@ -14,11 +14,12 @@ import os
 from typing import Optional
 
 import torch.distributed as dist
+from torch.distributed import ProcessGroup
+from torch.distributed.device_mesh import init_device_mesh
+
 from tensorrt_llm._torch.device_mesh import DeviceMeshTopologyImpl, SingleProcessGroup
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
-from torch.distributed import ProcessGroup
-from torch.distributed.device_mesh import init_device_mesh
 
 _VALID_DIM_NAMES = frozenset({"cfg", "tp", "cp", "ulysses"})
 # Outermost-to-innermost for init_device_mesh
