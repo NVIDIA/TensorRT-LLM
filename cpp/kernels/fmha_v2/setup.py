@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2020-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2020-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -157,6 +157,7 @@ spec_fields = (
     'output_dtype',
     'is_mtp',
     'enable_skip_softmax',
+    'enable_skip_softmax_stat',
 )
 kernel_spec = namedtuple('kernel_spec', spec_fields)
 kernel_spec.__new__.__defaults__ = (
@@ -184,6 +185,7 @@ kernel_spec.__new__.__defaults__ = (
     None,  # output_dtype, same as dtype by default.
     False,  # use MTP or not
     False,  # enable skip softmax
+    False,  # enable skip-softmax block-stat (debug variant)
 )
 
 generate_cu_trtllm = os.environ.get('GENERATE_CU_TRTLLM',
@@ -1574,6 +1576,7 @@ using Ktraits = {kernel_traits_header}
                 {enable_attn_logit_softcapping_flag},
                 {return_softmax_stats_flag},
                 {enable_skip_softmax_flag},
+                {enable_skip_softmax_stat_flag},
                 {output_dtype_},
                 {sage_block_size_q},
                 {sage_block_size_k},
@@ -1598,6 +1601,7 @@ using Ktraits_causal = {kernel_traits_header}
                        {enable_attn_logit_softcapping_flag},
                        {return_softmax_stats_flag},
                        {enable_skip_softmax_flag},
+                       {enable_skip_softmax_stat_flag},
                        {output_dtype_}>;
 
 using Ktraits_sliding_or_chunked_causal = {kernel_traits_header}
@@ -1619,6 +1623,7 @@ using Ktraits_sliding_or_chunked_causal = {kernel_traits_header}
                                       {enable_attn_logit_softcapping_flag},
                                       {return_softmax_stats_flag},
                                       {enable_skip_softmax_flag},
+                                      {enable_skip_softmax_stat_flag},
                                       {output_dtype_}>;
 
 using Ktraits_bidirectional_sliding_window = {kernel_traits_header}
@@ -1640,6 +1645,7 @@ using Ktraits_bidirectional_sliding_window = {kernel_traits_header}
                                       {enable_attn_logit_softcapping_flag},
                                       {return_softmax_stats_flag},
                                       {enable_skip_softmax_flag},
+                                      {enable_skip_softmax_stat_flag},
                                       {output_dtype_}>;
 
 using Ktraits_custom_mask = {kernel_traits_header}
@@ -1661,6 +1667,7 @@ using Ktraits_custom_mask = {kernel_traits_header}
                             {enable_attn_logit_softcapping_flag},
                             {return_softmax_stats_flag},
                             {enable_skip_softmax_flag},
+                            {enable_skip_softmax_stat_flag},
                             {output_dtype_}>;
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -2059,6 +2066,10 @@ def encode_name(kernel_spec):
         feature_tags += '_softcapping'
     if kernel_spec.enable_skip_softmax:
         feature_tags += '_skipSoftmax'
+    if kernel_spec.enable_skip_softmax_stat:
+        # Append "Stat" so the suffix is "_skipSoftmaxStat"; reverse-parser
+        # below uses substring match so '_skipSoftmax' still matches.
+        feature_tags += 'Stat'
     if kernel_spec.sage_block_sizes:
         feature_tags += f"_sage_{'_'.join(map(str, kernel_spec.sage_block_sizes))}"
     if kernel_spec.output_dtype:
@@ -2365,6 +2376,8 @@ def get_kernel_code(kspec, kname, lname):
     return_softmax_stats_flag = pythonBoolean2cpp[kspec.return_softmax_stats]
 
     enable_skip_softmax_flag = pythonBoolean2cpp[kspec.enable_skip_softmax]
+    enable_skip_softmax_stat_flag = pythonBoolean2cpp[
+        kspec.enable_skip_softmax_stat]
 
     # needed by warpspec kernels.
     fp8_kernel = kspec.dtype in ["e4m3", "e4m3_fp32"]
@@ -2567,6 +2580,7 @@ def get_api_code(specs_names):
                 f'&& sage_block_size_v == {sage_block_size_v} '
 
             il_check += '&& enable_skip_softmax ' if kspec.enable_skip_softmax else '&& !enable_skip_softmax '
+            il_check += '&& enable_skip_softmax_stat ' if kspec.enable_skip_softmax_stat else '&& !enable_skip_softmax_stat '
 
         il_check += '&& params.use_int8_scale_max ' if kspec.has_scale_max else '&& !params.use_int8_scale_max '
 
@@ -2845,6 +2859,7 @@ const bool use_tma                           = launch_params.use_tma;
 const bool use_flash_attention               = launch_params.flash_attention;
 const bool enable_attn_logit_softcapping     = launch_params.enable_attn_logit_softcapping;
 const bool enable_skip_softmax               = launch_params.enable_skip_softmax;
+const bool enable_skip_softmax_stat          = launch_params.enable_skip_softmax_stat;
 const int  attention_input_layout            = static_cast<int>(launch_params.attention_input_layout);
 // tiled variant uses ldgsts
 const bool  use_tiled            = launch_params.use_granular_tiling;
@@ -3024,6 +3039,8 @@ def get_kernel_traits_code(specs_names):
             kspec.enable_attn_logit_softcapping]
 
         enable_skip_softmax_flag = pythonBoolean2cpp[kspec.enable_skip_softmax]
+        enable_skip_softmax_stat_flag = pythonBoolean2cpp[
+            kspec.enable_skip_softmax_stat]
 
         tmp = dict(locals(), **kspec._asdict())
 
@@ -3149,7 +3166,8 @@ def get_kernel_traits_code(specs_names):
                                   __use_tma_store__ /* USE_TMA_STORE */,
                                   {enable_attn_logit_softcapping_flag},
                                   {return_softmax_stats_flag},
-                                  {enable_skip_softmax_flag}>;
+                                  {enable_skip_softmax_flag},
+                                  {enable_skip_softmax_stat_flag}>;
 
             printf("%s %d %d %s %d %d\\n",
                 \"{kname}\",
@@ -3401,8 +3419,9 @@ def get_cubin_header(kernel_traits, specs_names):
                                         '').replace('ws_', '').replace(
                                             'softcapping_',
                                             '').replace('sage_', '').replace(
-                                                'skipSoftmax_',
-                                                '').replace('output_', ''))
+                                                'skipSoftmaxStat_', '').replace(
+                                                    'skipSoftmax_',
+                                                    '').replace('output_', ''))
         flash_attention = 'flash_attention' in kname
         warp_specialization = 'tma_ws' in kname
         toks = tname.split('_')
@@ -3503,6 +3522,9 @@ def get_cubin_header(kernel_traits, specs_names):
 
         enable_skip_softmax = '_skipSoftmax' in kname
         enable_skip_softmax_flag = pythonBoolean2cpp[enable_skip_softmax]
+        enable_skip_softmax_stat = '_skipSoftmaxStat' in kname
+        enable_skip_softmax_stat_flag = pythonBoolean2cpp[
+            enable_skip_softmax_stat]
 
         # meta_unroll_step
         meta_unroll_step = unroll_step if ('_nl' in kname
@@ -3552,7 +3574,7 @@ def get_cubin_header(kernel_traits, specs_names):
 {sage_block_sizes[0]}, {sage_block_sizes[1]}, {sage_block_sizes[2]}, kSM_{sm}, {cubin_name}, \
 {cubin_name}_len, \"{kname}\", {smem}, {threads}, {meta_unroll_step}, {attention_mask_type_value}, \
 {attention_input_layout_value}, {is_il}, {is_flash_atten}, {is_warp_specialization}, {is_fp32_accu}, \
-{is_alibi_supported}, {is_tiled}, {has_softcapping_scale}, {return_softmax_stats_flag}, {enable_skip_softmax_flag}, {lname}}}\
+{is_alibi_supported}, {is_tiled}, {has_softcapping_scale}, {return_softmax_stats_flag}, {enable_skip_softmax_flag}, {enable_skip_softmax_stat_flag}, {lname}}}\
 '''.format(**locals()) if use_cubin_header(
                     int(sm), int(head_size), prec.lower(), output_prec.lower(),
                     enable_skip_softmax, attention_mask_type) else '''\
@@ -3560,7 +3582,7 @@ def get_cubin_header(kernel_traits, specs_names):
 {sage_block_sizes[0]}, {sage_block_sizes[1]}, {sage_block_sizes[2]}, kSM_{sm}, nullptr, \
 0, \"{kname}\", {smem}, {threads}, {meta_unroll_step}, {attention_mask_type_value}, \
 {attention_input_layout_value}, {is_il}, {is_flash_atten}, {is_warp_specialization}, {is_fp32_accu}, \
-{is_alibi_supported}, {is_tiled}, {has_softcapping_scale}, {return_softmax_stats_flag}, {enable_skip_softmax_flag}, {lname}}}\
+{is_alibi_supported}, {is_tiled}, {has_softcapping_scale}, {return_softmax_stats_flag}, {enable_skip_softmax_flag}, {enable_skip_softmax_stat_flag}, {lname}}}\
 '''.format(**locals())
             else:
                 code = '''\
@@ -3568,7 +3590,7 @@ def get_cubin_header(kernel_traits, specs_names):
 {sage_block_sizes[0]}, {sage_block_sizes[1]}, {sage_block_sizes[2]}, kSM_{sm}, {cubin_name}, \
 {cubin_name}_len, \"{kname}\", {smem}, {threads}, {meta_unroll_step}, {attention_mask_type_value}, \
 {attention_input_layout_value}, {is_il}, {is_flash_atten}, {is_warp_specialization}, {is_fp32_accu}, \
-{is_alibi_supported}, {is_tiled}, {has_softcapping_scale}, {return_softmax_stats_flag}, {enable_skip_softmax_flag}}}\
+{is_alibi_supported}, {is_tiled}, {has_softcapping_scale}, {return_softmax_stats_flag}, {enable_skip_softmax_flag}, {enable_skip_softmax_stat_flag}}}\
 '''.format(**locals())
             if sm in metadata_v2_dict:
                 metadata_v2_dict[sm].append(code)
@@ -3682,7 +3704,8 @@ static const struct FusedMultiHeadAttentionKernelMetaInfoV2
     bool mTiled;
     bool mEnableAttnLogitSoftcapping;
     bool mReturnSoftmaxStats;
-    bool mEnableSkipSoftmax;{launcher_line}
+    bool mEnableSkipSoftmax;
+    bool mEnableSkipSoftmaxStat;{launcher_line}
 }} sMhaKernelMetaInfosV2[] = {{
 {metadata_v2}
 }};
@@ -3744,6 +3767,7 @@ static const struct TestMetaV2
     bool mEnableAttnLogitSoftcapping;
     bool mReturnSoftmaxStats;
     bool mEnableSkipSoftmax;
+    bool mEnableSkipSoftmaxStat;
 }} metaV2[] = {{
 {metadata_v2}
 }};
@@ -3791,7 +3815,8 @@ struct FusedMultiHeadAttentionKernelMetaInfoV2
     bool mTiled;
     bool mEnableAttnLogitSoftcapping;
     bool mReturnSoftmaxStats;
-    bool mEnableSkipSoftmax;{launcher_line}
+    bool mEnableSkipSoftmax;
+    bool mEnableSkipSoftmaxStat;{launcher_line}
 }};
 
 extern const FusedMultiHeadAttentionKernelMetaInfoV2 sMhaKernelMetaInfosV2[];
@@ -3888,7 +3913,8 @@ struct FusedMultiHeadAttentionKernelMetaInfoV2
     bool mTiled;
     bool mEnableAttnLogitSoftcapping;
     bool mReturnSoftmaxStats;
-    bool mEnableSkipSoftmax;{launcher_line}
+    bool mEnableSkipSoftmax;
+    bool mEnableSkipSoftmaxStat;{launcher_line}
 }};
 
 extern const FusedMultiHeadAttentionKernelMetaInfoV2 sMhaKernelMetaInfosV2[] = {{
@@ -4112,7 +4138,8 @@ def enumerate_hgmma_ldgsts_kernels(specs, sm=90, dtype='fp16'):
 def enumerate_hgmma_flash_warpspec_kernels(specs,
                                            sm=90,
                                            dtype='fp16',
-                                           enable_skip_softmax=False):
+                                           enable_skip_softmax=False,
+                                           enable_skip_softmax_stat=False):
 
     scheduling_mode = int(os.getenv('SCHEDULING_MODE', '1'))
 
@@ -4163,7 +4190,8 @@ def enumerate_hgmma_flash_warpspec_kernels(specs,
                     return_softmax_stats=return_softmax,
                     scheduling_mode=scheduling_mode,
                     input_layout=input_layout,
-                    enable_skip_softmax=enable_skip_softmax))
+                    enable_skip_softmax=enable_skip_softmax,
+                    enable_skip_softmax_stat=enable_skip_softmax_stat))
 
             specs.append(
                 kernel_spec(
@@ -4196,7 +4224,8 @@ def enumerate_hgmma_flash_warpspec_kernels(specs,
                     return_softmax_stats=return_softmax,
                     scheduling_mode=scheduling_mode,
                     input_layout=input_layout,
-                    enable_skip_softmax=enable_skip_softmax))
+                    enable_skip_softmax=enable_skip_softmax,
+                    enable_skip_softmax_stat=enable_skip_softmax_stat))
 
             specs.append(
                 kernel_spec(
@@ -4229,7 +4258,8 @@ def enumerate_hgmma_flash_warpspec_kernels(specs,
                     return_softmax_stats=return_softmax,
                     scheduling_mode=scheduling_mode,
                     input_layout=input_layout,
-                    enable_skip_softmax=enable_skip_softmax))
+                    enable_skip_softmax=enable_skip_softmax,
+                    enable_skip_softmax_stat=enable_skip_softmax_stat))
         '''
         smem size = (q_step * d * q_buffers * NUM_COMPUTE_GROUPS
                     + (kv_step * d + kv_step * dv) * kv_buffers) * ele_size
@@ -4282,7 +4312,8 @@ def enumerate_qgmma_flash_warpspec_kernels(specs,
                                            dtype='e4m3',
                                            sage_block_sizes=None,
                                            output_dtype=None,
-                                           enable_skip_softmax=False):
+                                           enable_skip_softmax=False,
+                                           enable_skip_softmax_stat=False):
 
     scheduling_mode = int(os.getenv('SCHEDULING_MODE', '1'))
 
@@ -4337,7 +4368,8 @@ def enumerate_qgmma_flash_warpspec_kernels(specs,
                     input_layout=input_layout,
                     sage_block_sizes=sage_block_sizes,
                     output_dtype=output_dtype,
-                    enable_skip_softmax=enable_skip_softmax))
+                    enable_skip_softmax=enable_skip_softmax,
+                    enable_skip_softmax_stat=enable_skip_softmax_stat))
 
             # 64 < D <=128: KV_STEP = 128
             specs.append(
@@ -4373,7 +4405,8 @@ def enumerate_qgmma_flash_warpspec_kernels(specs,
                     input_layout=input_layout,
                     sage_block_sizes=sage_block_sizes,
                     output_dtype=output_dtype,
-                    enable_skip_softmax=enable_skip_softmax))
+                    enable_skip_softmax=enable_skip_softmax,
+                    enable_skip_softmax_stat=enable_skip_softmax_stat))
 
             # 128 < D <=256: KV_STEP = 128
             specs.append(
@@ -4410,7 +4443,8 @@ def enumerate_qgmma_flash_warpspec_kernels(specs,
                     input_layout=input_layout,
                     sage_block_sizes=sage_block_sizes,
                     output_dtype=output_dtype,
-                    enable_skip_softmax=enable_skip_softmax))
+                    enable_skip_softmax=enable_skip_softmax,
+                    enable_skip_softmax_stat=enable_skip_softmax_stat))
 
         if not skip_mla_combination:
             # context MLA (192x128)
@@ -6692,21 +6726,40 @@ def enumerate_kernels():
     enumerate_igmma_kernels(specs, sm=90)
     enumerate_qgmma_kernels(specs, sm=90)
     # need to add bf16 kernels if needed
-    for enable_skip_softmax in [False, True]:
-        if enable_skip_softmax and 'DISABLE_SKIP_SOFTMAX' in os.environ:
-            continue
+    # The (enable_skip_softmax, enable_skip_softmax_stat) axis is 3-valued:
+    #   (False, False)  - production cubin family.
+    #   (True,  False)  - production skip-softmax cubin family.
+    #   (True,  True)   - debug-only stat-collecting variant; selected at
+    #                     runtime by SkipSoftmaxAttentionConfig.stat_log_path.
+    # Stat without skip-softmax is meaningless and intentionally not generated.
+    for (enable_skip_softmax, enable_skip_softmax_stat) in [(False, False),
+                                                            (True, False),
+                                                            (True, True)]:
         enumerate_hgmma_flash_warpspec_kernels(
-            specs, sm=90, dtype='fp16', enable_skip_softmax=enable_skip_softmax)
+            specs,
+            sm=90,
+            dtype='fp16',
+            enable_skip_softmax=enable_skip_softmax,
+            enable_skip_softmax_stat=enable_skip_softmax_stat)
         enumerate_hgmma_flash_warpspec_kernels(
-            specs, sm=90, dtype='bf16', enable_skip_softmax=enable_skip_softmax)
+            specs,
+            sm=90,
+            dtype='bf16',
+            enable_skip_softmax=enable_skip_softmax,
+            enable_skip_softmax_stat=enable_skip_softmax_stat)
         enumerate_qgmma_flash_warpspec_kernels(
-            specs, sm=90, dtype='e4m3', enable_skip_softmax=enable_skip_softmax)
+            specs,
+            sm=90,
+            dtype='e4m3',
+            enable_skip_softmax=enable_skip_softmax,
+            enable_skip_softmax_stat=enable_skip_softmax_stat)
         enumerate_qgmma_flash_warpspec_kernels(
             specs,
             sm=90,
             dtype='e4m3',
             output_dtype="bf16",
-            enable_skip_softmax=enable_skip_softmax)
+            enable_skip_softmax=enable_skip_softmax,
+            enable_skip_softmax_stat=enable_skip_softmax_stat)
 
     # For now SageAttention only needs BF16
     # block_size_q should be divisible by 64
@@ -6880,6 +6933,28 @@ def enumerate_kernels():
             kspec._replace(head_interleaved=False) for kspec in specs_expanded
         ]
     # yapf: disable
+    # Optional filters for standalone fmha.exe builds where compiling all
+    # generated kernels can exceed the x86_64 small/medium code-model limits.
+    if os.environ.get('FMHA_SM90_ONLY', '0') == '1':
+        specs_expanded = [k for k in specs_expanded if k.sm == 90]
+    _dtype_filter = os.environ.get('FMHA_DTYPE_FILTER', '')
+    if _dtype_filter:
+        keep = set(_dtype_filter.split(','))
+        specs_expanded = [k for k in specs_expanded if k.dtype in keep]
+    _head_size_filter = os.environ.get('FMHA_HEAD_SIZE_FILTER', '')
+    if _head_size_filter:
+        keep = {int(value) for value in _head_size_filter.split(',')}
+        specs_expanded = [k for k in specs_expanded if k.head_size in keep]
+    _input_layout_filter = os.environ.get('FMHA_INPUT_LAYOUT_FILTER', '')
+    if _input_layout_filter:
+        layout_by_name = {
+            'packed_qkv': InputLayout.PACKED_QKV,
+            'contiguous_q_kv': InputLayout.CONTIGUOUS_Q_KV,
+            'q_paged_kv': InputLayout.Q_PAGED_KV,
+            'separate_q_k_v': InputLayout.SEPARATE_Q_K_V,
+        }
+        keep = {layout_by_name[value] for value in _input_layout_filter.split(',')}
+        specs_expanded = [k for k in specs_expanded if k.input_layout in keep]
     specs_names = [(kspec, *encode_name(kspec)) for kspec in specs_expanded
                   # Volta is deprecated in TRT-LLM.
                   if  (kspec.sm            in [80, 86, 89, 90, 120]

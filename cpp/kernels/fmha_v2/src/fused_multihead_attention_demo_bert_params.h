@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2023-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2023-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -181,9 +181,8 @@ struct Fused_multihead_attention_params_v2
     // Skip softmax when exp(local_max - global_max) < skip_softmax_threshold_scale_factor / seqlen.
     // A positive value means skip-softmax is enabled.
     float skip_softmax_threshold_scale_factor = 0;
-#ifdef SKIP_SOFTMAX_STAT
-    // Statistics of skip-softmax, pointers of device memory for output
-    uint32_t* skip_softmax_total_blocks;
-    uint32_t* skip_softmax_skipped_blocks;
-#endif
+    // Statistics of skip-softmax, pointers of device memory for output.
+    // Only written by the _skipSoftmaxStat kernel variants; nullptr otherwise.
+    uint32_t* skip_softmax_total_blocks = nullptr;
+    uint32_t* skip_softmax_skipped_blocks = nullptr;
 };

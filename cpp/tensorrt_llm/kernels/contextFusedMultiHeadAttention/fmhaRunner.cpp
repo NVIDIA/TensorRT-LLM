@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020-2025, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2020-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -294,10 +294,8 @@ void FusedMHARunnerV2::setupKernelParams(MHARunnerParams runnerParams)
 
     // for skip-softmax attention
     mKernelParams.skip_softmax_threshold_scale_factor = runnerParams.skipSoftmaxThresholdScaleFactor;
-#ifdef SKIP_SOFTMAX_STAT
     mKernelParams.skip_softmax_total_blocks = runnerParams.skipSoftmaxTotalBlocks;
     mKernelParams.skip_softmax_skipped_blocks = runnerParams.skipSoftmaxSkippedBlocks;
-#endif
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -500,6 +498,7 @@ void FusedMHARunnerV2::setupLaunchParams(MHARunnerParams runnerParams)
 
     // Setup launch params for skip softmax attention
     mLaunchParams.enableSkipSoftmax = false;
+    mLaunchParams.enableSkipSoftmaxStat = false;
     if (runnerParams.skipSoftmaxThresholdScaleFactor > 0)
     {
         if (!isSm90 || !mLaunchParams.warp_specialization || !mLaunchParams.flash_attention)
@@ -508,6 +507,8 @@ void FusedMHARunnerV2::setupLaunchParams(MHARunnerParams runnerParams)
                 "Skip softmax attention is only supported on Hopper with warp specialization and flash attention.");
         }
         mLaunchParams.enableSkipSoftmax = true;
+        // Stat collection is meaningful only when skip-softmax itself is on; the caller decides whether to opt in.
+        mLaunchParams.enableSkipSoftmaxStat = runnerParams.enableSkipSoftmaxStat;
     }
 }
 

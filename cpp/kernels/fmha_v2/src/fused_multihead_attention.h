@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2011-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2011-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -291,11 +291,10 @@ struct Fused_multihead_attention_params_v2 : Fused_multihead_attention_params_ba
     // A positive value means skip-softmax is enabled.
     float skip_softmax_threshold_scale_factor = 0;
 
-#ifdef SKIP_SOFTMAX_STAT
-    // Statistics of skip-softmax, pointers of device memory for output
-    uint32_t* skip_softmax_total_blocks;
-    uint32_t* skip_softmax_skipped_blocks;
-#endif
+    // Statistics of skip-softmax, pointers of device memory for output.
+    // Only written by the _skipSoftmaxStat kernel variants; nullptr otherwise.
+    uint32_t* skip_softmax_total_blocks = nullptr;
+    uint32_t* skip_softmax_skipped_blocks = nullptr;
 };
 
 #endif
@@ -337,6 +336,9 @@ struct Fused_multihead_attention_launch_params
     int device_l2_cache_size = 0;
     // skip softmax attention
     bool enable_skip_softmax = false;
+    // select the _skipSoftmaxStat cubin variant (atomic block-skip counters);
+    // implies enable_skip_softmax = true at runtime.
+    bool enable_skip_softmax_stat = false;
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////

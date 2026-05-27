@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020-2025, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2020-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -330,11 +330,12 @@ struct MHARunnerParams
 
     // Skip-softmax attention parameters
     float skipSoftmaxThresholdScaleFactor = 0;
-#ifdef SKIP_SOFTMAX_STAT
-    // Statistics of skip-softmax, pointers of device memory for output
-    uint32_t* skipSoftmaxTotalBlocks;
-    uint32_t* skipSoftmaxSkippedBlocks;
-#endif
+    // Statistics of skip-softmax, pointers of device memory for output.
+    // Filled by callers that opt into stat collection; nullptr otherwise.
+    uint32_t* skipSoftmaxTotalBlocks = nullptr;
+    uint32_t* skipSoftmaxSkippedBlocks = nullptr;
+    // Pick the _skipSoftmaxStat cubin variant (atomic block-skip counters).
+    bool enableSkipSoftmaxStat = false;
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -484,11 +485,10 @@ struct Fused_multihead_attention_params_v2
     // Skip softmax when exp(local_max - global_max) < skip_softmax_threshold_scale_factor / seqlen.
     // A positive value means skip-softmax is enabled.
     float skip_softmax_threshold_scale_factor = 0;
-#ifdef SKIP_SOFTMAX_STAT
-    // Statistics of skip-softmax, pointers of device memory for output
-    uint32_t* skip_softmax_total_blocks;
-    uint32_t* skip_softmax_skipped_blocks;
-#endif
+    // Statistics of skip-softmax, pointers of device memory for output.
+    // Only written by the _skipSoftmaxStat kernel variants; nullptr otherwise.
+    uint32_t* skip_softmax_total_blocks = nullptr;
+    uint32_t* skip_softmax_skipped_blocks = nullptr;
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -549,6 +549,9 @@ struct Launch_params
     bool supportReturnSoftmaxStats;
     // enable skip softmax attention feature
     bool enableSkipSoftmax = false;
+    // select the _skipSoftmaxStat cubin variant (atomic block-skip counters);
+    // implies enableSkipSoftmax = true at runtime. Debug-only: adds per-block atomics.
+    bool enableSkipSoftmaxStat = false;
 };
 
 } // namespace kernels

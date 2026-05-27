@@ -538,10 +538,13 @@ public:
     int mSageAttnNumEltsPerBlkK = 0;
     int mSageAttnNumEltsPerBlkV = 0;
     bool mSageAttnQkInt8 = false;
-#ifdef SKIP_SOFTMAX_STAT
-    uint32_t* mSkipSoftmaxTotalBlocks;
-    uint32_t* mSkipSoftmaxSkippedBlocks;
-#endif
+    // Skip-softmax block-skip counters (debug only). Always declared so the
+    // struct layout is independent of build flags; written by the
+    // _skipSoftmaxStat kernel variants when stat collection is requested.
+    uint32_t* mSkipSoftmaxTotalBlocks = nullptr;
+    uint32_t* mSkipSoftmaxSkippedBlocks = nullptr;
+    // Pick the _skipSoftmaxStat cubin variant for the prefill path.
+    bool mEnableSkipSoftmaxStat = false;
 
     [[nodiscard]] auto data() const
     {
@@ -561,7 +564,7 @@ public:
             mEnableContextFMHA, mFMHAForceFP32Acc, mMultiBlockMode, mEnableXQA, mUseKVCache, mSkipAttn, mFuseFp4Quant,
             mNbMultiBlockSemaphores, mAttentionChunkSize.value_or(-1), mSkipSoftmaxThresholdScaleFactorPrefill,
             mSkipSoftmaxThresholdScaleFactorDecode, mSageAttnNumEltsPerBlkQ, mSageAttnNumEltsPerBlkK,
-            mSageAttnNumEltsPerBlkV, mSageAttnQkInt8);
+            mSageAttnNumEltsPerBlkV, mSageAttnQkInt8, mEnableSkipSoftmaxStat);
     };
 
 private:

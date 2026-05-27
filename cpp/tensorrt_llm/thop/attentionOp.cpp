@@ -1083,10 +1083,23 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
         = static_cast<float>(skip_softmax_threshold_scale_factor_prefill.value_or(0));
     op->mSkipSoftmaxThresholdScaleFactorDecode
         = static_cast<float>(skip_softmax_threshold_scale_factor_decode.value_or(0));
-#ifdef SKIP_SOFTMAX_STAT
-    op->mSkipSoftmaxTotalBlocks = reinterpret_cast<uint32_t*>(skip_softmax_stat.value().data_ptr());
-    op->mSkipSoftmaxSkippedBlocks = op->mSkipSoftmaxTotalBlocks + 1;
-#endif
+    uint32_t* skipSoftmaxTotalBlocks = nullptr;
+    uint32_t* skipSoftmaxSkippedBlocks = nullptr;
+    bool enableSkipSoftmaxStat = false;
+    if (skip_softmax_stat.has_value())
+    {
+        auto const& stat = skip_softmax_stat.value();
+        TORCH_CHECK(stat.device().is_cuda(), "skip_softmax_stat must be a CUDA tensor");
+        TORCH_CHECK(stat.is_contiguous(), "skip_softmax_stat must be contiguous");
+        TORCH_CHECK(stat.element_size() == sizeof(uint32_t), "skip_softmax_stat must use 32-bit elements");
+        TORCH_CHECK(stat.numel() >= 2, "skip_softmax_stat must contain at least 2 elements");
+        skipSoftmaxTotalBlocks = reinterpret_cast<uint32_t*>(stat.data_ptr());
+        skipSoftmaxSkippedBlocks = skipSoftmaxTotalBlocks + 1;
+        enableSkipSoftmaxStat = true;
+    }
+    op->mSkipSoftmaxTotalBlocks = skipSoftmaxTotalBlocks;
+    op->mSkipSoftmaxSkippedBlocks = skipSoftmaxSkippedBlocks;
+    op->mEnableSkipSoftmaxStat = enableSkipSoftmaxStat;
     TORCH_CHECK(spec_decoding_bool_params.size() == 3,
         "Expecting 3 bools for spec-dec mode, is_spec_decoding_enabled, use_spec_decoding, and is_spec_dec_tree.");
     op->mIsSpecDecodingEnabled = spec_decoding_bool_params[0]; // is_spec_decoding_enabled
@@ -1173,6 +1186,9 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
         runner->prepare(*op);
         op_cache[cache_key] = op;
     }
+    op->mSkipSoftmaxTotalBlocks = skipSoftmaxTotalBlocks;
+    op->mSkipSoftmaxSkippedBlocks = skipSoftmaxSkippedBlocks;
+    op->mEnableSkipSoftmaxStat = enableSkipSoftmaxStat;
 
     int32_t const num_seqs = host_context_lengths.size(0);
     RequestType const* request_types = static_cast<RequestType const*>(host_request_types.data_ptr());
