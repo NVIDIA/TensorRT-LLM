@@ -756,10 +756,7 @@ class FlashInferTrtllmGenAttention:
             is_fp8_out
             or is_fp4_out
             or (
-                (
-                    kv_cache_quant_mode.has_fp8_kv_cache()
-                    or kv_cache_quant_mode.has_fp4_kv_cache()
-                )
+                (kv_cache_quant_mode.has_fp8_kv_cache() or kv_cache_quant_mode.has_fp4_kv_cache())
                 and use_paged_context_fmha
             )
         )
