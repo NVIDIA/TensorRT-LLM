@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -34,30 +34,13 @@ from defs.trt_test_alternative import print_info
 from tensorrt_llm._utils import get_free_port
 
 from ..conftest import get_llm_root, llm_models_root
+from ._model_paths import MODEL_PATH_DICT as _MODEL_PATH_DICT_BASE
 from .perf_regression_utils import process_and_upload_test_results
 
-# Model PATH of local dir synced from internal LLM models repo
+# Sanity-side path differs from test_perf for this key; preserve historical value.
 MODEL_PATH_DICT = {
-    "deepseek_r1_fp8": "DeepSeek-R1/DeepSeek-R1",
-    "deepseek_r1_nvfp4": "DeepSeek-R1/DeepSeek-R1-FP4",
-    "deepseek_r1_0528_fp8": "DeepSeek-R1/DeepSeek-R1-0528/",
-    "deepseek_r1_0528_fp4": "DeepSeek-R1/DeepSeek-R1-0528-FP4/",
-    "deepseek_r1_0528_fp4_v2": "DeepSeek-R1/DeepSeek-R1-0528-FP4-v2/",
-    "deepseek_v32_fp4": "DeepSeek-V3.2-Exp-FP4-v2",
-    "gpt_oss_120b_fp4": "gpt_oss/gpt-oss-120b",
-    "k2_thinking_fp4": "Kimi-K2-Thinking-NVFP4",
-    "k25_thinking_fp4": "Kimi-K2.5-NVFP4",
-    "qwen3_235b_a22b_fp4": "Qwen3/saved_models_Qwen3-235B-A22B_nvfp4_hf",  # Qwen3-235B-A22B-FP4
-    "super_nvfp4": "NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4",  # Super (Nemotron-H SSM+MoE) NvFP4
-    "super_fp8": "NVIDIA-Nemotron-3-Super-120B-A12B-FP8",
-    "super_bf16": "NVIDIA-Nemotron-3-Super-120B-A12B-BF16",
-    "qwen3_235b_a22b_fp8": "Qwen3/saved_models_Qwen3-235B-A22B_fp8_hf",  # Qwen3-235B-A22B-FP8
-    "qwen3_32b_fp8": "Qwen3/Qwen3-32B-FP8",
+    **_MODEL_PATH_DICT_BASE,
     "llama_v3.3_70b_instruct_fp4": "llama-3.3-models/Llama-3.3-70B-Instruct-FP4",
-    "deepseek_v3_lite_fp8": "DeepSeek-V3-Lite/fp8",
-    "llama_v3.1_8b_instruct": "llama-3.1-model/Llama-3.1-8B-Instruct",
-    "llama_v3.1_8b_instruct_fp8": "llama-3.1-model/Llama-3.1-8B-Instruct-FP8",
-    "glm_5_nvfp4": "GLM-5-NVFP4",
 }
 
 SUPPORTED_GPU_MAPPING = {
