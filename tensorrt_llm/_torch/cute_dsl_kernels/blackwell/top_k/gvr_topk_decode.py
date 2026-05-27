@@ -93,35 +93,42 @@ class GvrParams:
     kNumBins: int  # histogram bin count
 
     @staticmethod
-    def get(dtype_name: str, top_k: int) -> "GvrParams":
-        """Returns the per-(dtype, K) specialization parameters.
+    def get(dtype_name: str, top_k: int, compress_ratio: int = 1) -> "GvrParams":
+        """Returns the per-(dtype, K, cr) specialization parameters.
 
-        Mirrors CUDA template specialization GvrParams<T, K>.
+        Mirrors CUDA template specialization GvrParams<T, K>. For K ∈ {512, 1024},
+        cr=1 (DSv3.2) and cr=4 (DSv4, PR #14413) use different kFTarget values
+        — V4's kFTarget=kK alignment eliminates upper-clamp saturation on
+        tight-σ + high-A2 layers; cross-prompt swe-bench shows 1.5-2.2×
+        P2-iter reduction vs V3.2's kFTarget=384/2560. K=2048 is identical
+        across cr (V4 doesn't natively use K=2048; values reused for safety).
         """
-        # kFTarget=kK alignment for K=512/1024 (PR #14413, DSV4 data tuned params):
-        # eliminates upper-clamp saturation on tight-σ + high-A2 layers;
-        # cross-prompt swe-bench shows 1.5–2.2× P2-iter reduction with zero
-        # cap-hits and zero per-layer regression vs the prior kFTarget=384/2560.
         TABLE = {
-            # ("float32", 512): GvrParams(kFTarget=384, kC=5120, kNumBins=1024),    # pre-#14413, DSV3.2 data tuned.
-            # ("float32", 1024): GvrParams(kFTarget=2560, kC=5120, kNumBins=1024),  # pre-#14413, DSV3.2 data tuned.
-            ("float32", 512): GvrParams(kFTarget=512, kC=5120, kNumBins=1024),
-            ("float32", 1024): GvrParams(kFTarget=1024, kC=5120, kNumBins=1024),
-            ("float32", 2048): GvrParams(kFTarget=3072, kC=6144, kNumBins=2048),
-            # ("bfloat16", 512): GvrParams(kFTarget=384, kC=5120, kNumBins=512),    # pre-#14413, DSV3.2 data tuned.
-            # ("bfloat16", 1024): GvrParams(kFTarget=2560, kC=5120, kNumBins=512),  # pre-#14413, DSV3.2 data tuned.
-            ("bfloat16", 512): GvrParams(kFTarget=512, kC=5120, kNumBins=512),
-            ("bfloat16", 1024): GvrParams(kFTarget=1024, kC=5120, kNumBins=512),
-            ("bfloat16", 2048): GvrParams(kFTarget=4096, kC=5120, kNumBins=2048),
-            # ("float16", 512): GvrParams(kFTarget=384, kC=5120, kNumBins=512),    # pre-#14413, DSV3.2 data tuned.
-            # ("float16", 1024): GvrParams(kFTarget=2560, kC=5120, kNumBins=1024), # pre-#14413, DSV3.2 data tuned.
-            ("float16", 512): GvrParams(kFTarget=512, kC=5120, kNumBins=512),
-            ("float16", 1024): GvrParams(kFTarget=1024, kC=5120, kNumBins=1024),
-            ("float16", 2048): GvrParams(kFTarget=4096, kC=5120, kNumBins=2048),
+            # --- cr = 1 (DSv3.2): pre-#14413, tuned on V3.2 swe-bench data ---
+            ("float32", 512, 1): GvrParams(kFTarget=384, kC=5120, kNumBins=1024),
+            ("float32", 1024, 1): GvrParams(kFTarget=2560, kC=5120, kNumBins=1024),
+            ("float32", 2048, 1): GvrParams(kFTarget=3072, kC=6144, kNumBins=2048),
+            ("bfloat16", 512, 1): GvrParams(kFTarget=384, kC=5120, kNumBins=512),
+            ("bfloat16", 1024, 1): GvrParams(kFTarget=2560, kC=5120, kNumBins=512),
+            ("bfloat16", 2048, 1): GvrParams(kFTarget=4096, kC=5120, kNumBins=2048),
+            ("float16", 512, 1): GvrParams(kFTarget=384, kC=5120, kNumBins=512),
+            ("float16", 1024, 1): GvrParams(kFTarget=2560, kC=5120, kNumBins=1024),
+            ("float16", 2048, 1): GvrParams(kFTarget=4096, kC=5120, kNumBins=2048),
+            # --- cr = 4 (DSv4): post-#14413, tuned on V4 Flash/Pro swe-bench data ---
+            ("float32", 512, 4): GvrParams(kFTarget=512, kC=5120, kNumBins=1024),
+            ("float32", 1024, 4): GvrParams(kFTarget=1024, kC=5120, kNumBins=1024),
+            ("float32", 2048, 4): GvrParams(kFTarget=3072, kC=6144, kNumBins=2048),
+            ("bfloat16", 512, 4): GvrParams(kFTarget=512, kC=5120, kNumBins=512),
+            ("bfloat16", 1024, 4): GvrParams(kFTarget=1024, kC=5120, kNumBins=512),
+            ("bfloat16", 2048, 4): GvrParams(kFTarget=4096, kC=5120, kNumBins=2048),
+            ("float16", 512, 4): GvrParams(kFTarget=512, kC=5120, kNumBins=512),
+            ("float16", 1024, 4): GvrParams(kFTarget=1024, kC=5120, kNumBins=1024),
+            ("float16", 2048, 4): GvrParams(kFTarget=4096, kC=5120, kNumBins=2048),
         }
-        if (dtype_name, top_k) not in TABLE:
-            raise ValueError(f"Unsupported GvrParams<{dtype_name}, {top_k}>")
-        return TABLE[(dtype_name, top_k)]
+        key = (dtype_name, top_k, compress_ratio)
+        if key not in TABLE:
+            raise ValueError(f"Unsupported GvrParams<{dtype_name}, {top_k}, cr={compress_ratio}>")
+        return TABLE[key]
 
 
 # =============================================================================
@@ -157,11 +164,23 @@ class GvrTopKKernel:
         min_blocks_per_mp: int = 3,
         use_256bit_load: bool = False,
         enable_warp_parallel_reduce: bool = False,
+        compress_ratio: int = 1,
     ):
         # cutlass.Numeric enum: cutlass.Float32 / cutlass.BFloat16 / cutlass.Float16
         self.dtype = dtype
         self.top_k = top_k
         self.next_n = next_n
+        # KV compression ratio of the indexer feeding this kernel:
+        #   1 → DSv3.2 (no compressor); preIdxOffset = (row % next_n) + 1
+        #       reflects "newest token appended" + MTP windowing.
+        #   4 → DSv4 (overlap compressor); logits / preIdx live in compressed-
+        #       token-index space. New compressed entries are appended at the
+        #       end so prev-step indices remain valid as-is → preIdxOffset = 0.
+        # Mirror heuristicTopKDecode.cu PR #14219 cr-aware branch.
+        assert compress_ratio in (1, 4), (
+            f"compress_ratio must be 1 (V3.2) or 4 (V4); got {compress_ratio}"
+        )
+        self.compress_ratio = compress_ratio
         # WARP_SIZE = 32 is a hardware constant on all NVIDIA GPUs.
         self.WARP_SIZE = 32
         self.num_threads = num_threads
@@ -220,7 +239,7 @@ class GvrTopKKernel:
         else:
             raise ValueError(f"Unsupported dtype for GvrTopKKernel: {dtype}")
 
-        params = GvrParams.get(self._dtype_name, top_k)
+        params = GvrParams.get(self._dtype_name, top_k, self.compress_ratio)
         self.kC = params.kC
         self.kNumBins = params.kNumBins
         self.kFTarget = params.kFTarget
@@ -1480,11 +1499,28 @@ class GvrTopKKernel:
 
         row_idx = bidx
         pre_idx_row_idx = row_idx // next_n
-        pre_idx_offset = cutlass.Int32(row_idx % next_n) + cutlass.Int32(1)
+        # Temporal-shift offset, mirroring heuristicTopKDecode.cu PR #14219:
+        #   cr == 1 (V3.2): (row % next_n) + 1 maps prev-step indices into this
+        #     step's KV space (+1 for the newly appended token).
+        #   cr  > 1 (V4):   0 — in compressed-index space, new entries are
+        #     appended at the end so prev indices remain valid as-is.
+        if cutlass.const_expr(self.compress_ratio == 1):
+            pre_idx_offset = cutlass.Int32(row_idx % next_n) + cutlass.Int32(1)
+        else:
+            pre_idx_offset = cutlass.Int32(0)
 
-        # Per-row length
+        # Per-row length. seq_lens is in uncompressed-token space; logits/preIdx
+        # live in compressed-token-index space when cr > 1 → divide by cr.
+        # (For cr == 1, the divide is a no-op, but the explicit form mirrors
+        # the CUDA branch and keeps the IR straightforward to read.)
         seq_len = seq_lens[pre_idx_row_idx]
-        N = seq_len - cutlass.Int32(next_n) + cutlass.Int32(row_idx % next_n) + cutlass.Int32(1)
+        actual_kv_len = (
+            seq_len - cutlass.Int32(next_n) + cutlass.Int32(row_idx % next_n) + cutlass.Int32(1)
+        )
+        if cutlass.const_expr(self.compress_ratio == 1):
+            N = actual_kv_len
+        else:
+            N = actual_kv_len // cutlass.Int32(self.compress_ratio)
 
         # Slice per-row views.
         input_row = input_data[row_idx, None]
@@ -1741,6 +1777,7 @@ def gvr_topk_decode(
     use_256bit_load: bool = False,
     num_threads_per_block: int = 512,
     enable_warp_parallel_reduce: bool = False,
+    compress_ratio: int = 1,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """cuTe DSL GVR Top-K, drop-in for ``torch.ops.trtllm.indexer_topk_decode``.
 
@@ -1751,6 +1788,10 @@ def gvr_topk_decode(
         seq_lens:  ``[num_rows // next_n]`` int32. Effective sequence length per group.
         top_k:     K ∈ {512, 1024, 2048} — compile-time specialized.
         next_n:    Temporal stride for V3.2 ``preIdxOffset = (row % next_n) + 1``.
+        compress_ratio: KV-indexer compression factor (1 = DSv3.2, 4 = DSv4).
+                   When != 1, logits/preIdx live in compressed-token-index space:
+                   ``N`` is divided by ``compress_ratio`` and ``preIdxOffset``
+                   is forced to 0. Mirrors heuristicTopKDecode.cu PR #14219.
         out_values, out_indices: Optional preallocated outputs.
         min_blocks_per_mp: Override ptxas ``__launch_bounds__(BS, min_blocks)``
             hint. ``None`` (default) → use the 3-tier shape-aware heuristic
@@ -1854,6 +1895,7 @@ def gvr_topk_decode(
         use_256bit_load,
         num_threads_per_block,
         enable_warp_parallel_reduce,
+        compress_ratio,
     )
     if key not in _gvr_topk_compile_cache:
         n_rows = cute.sym_int()
@@ -1891,6 +1933,7 @@ def gvr_topk_decode(
             min_blocks_per_mp=min_blocks_per_mp,
             use_256bit_load=use_256bit_load,
             enable_warp_parallel_reduce=enable_warp_parallel_reduce,
+            compress_ratio=compress_ratio,
         )
         _gvr_topk_compile_cache[key] = cute.compile(
             kernel,
