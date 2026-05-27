@@ -147,12 +147,7 @@ class RPCClient:
 
     def shutdown_server(self):
         """Shutdown the server."""
-        if self._server_stopped:
-            return
-
-        self._rpc_shutdown().remote()
-
-        self._server_stopped = True
+        raise RuntimeError("Remote RPC server shutdown is not supported.")
 
     def close(self):
         """Gracefully close the client, cleaning up background tasks."""
