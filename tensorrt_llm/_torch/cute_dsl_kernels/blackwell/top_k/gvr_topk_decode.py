@@ -49,6 +49,7 @@ from cutlass.utils.distributed import atomicAdd
 from cutlass.utils.smem_allocator import SmemAllocator
 
 from ..utils import TRTLLM_ENABLE_PDL, griddepcontrol_launch_dependents, griddepcontrol_wait
+from .block_scan import warp_scan
 
 
 def float_as_uint32(float_val):
@@ -156,12 +157,11 @@ class GvrTopKKernel:
         next_n: int = 1,
         num_threads: int = 512,
         enable_unroll_4: Optional[bool] = None,
-        enable_unroll_2: Optional[bool] = None,
         enable_phase3_unroll: Optional[bool] = None,
-        use_strided_layout: bool = True,
         use_constant_hint: bool = False,
         min_blocks_per_mp: int = 3,
         use_256bit_load: bool = False,
+        enable_warp_parallel_reduce: bool = False,
     ):
         # cutlass.Numeric enum: cutlass.Float32 / cutlass.BFloat16 / cutlass.Float16
         self.dtype = dtype
@@ -193,33 +193,27 @@ class GvrTopKKernel:
         # Vec-loop unrolling switches.
         #   * enable_unroll_4: 4-way fast path in block_count_ge (4 LDG.E.128
         #     in flight). Controls block_count_ge's fast path only.
-        #   * enable_unroll_2: 2-way medium path in block_count_ge AND
-        #     phase3_collect (cascade between fast and tail).
         #   * enable_phase3_unroll: 4-way fast path in phase3_collect only.
         #     Independent of enable_unroll_4 because the perf trade-offs
         #     differ — phase3 has thread-local wc state and smem writes,
         #     making fast-path more expensive at large grid.
-        #   * use_strided_layout: True → single make_ptr + (UNROLL, vec_w)
-        #       strided layout (cute emits shared base + imm offsets); False →
-        #       UNROLL separate make_ptr calls (cute emits 4 independent base
-        #       regs, matches the b459a8ff2 commit style).
         #   * use_constant_hint: True → CopyG2ROp(invariant=True) → emits
         #       SASS LDG.E.*.CONSTANT (read-only data cache, matches CUDA
         #       __ldg path). False → CopyUniversalOp → plain LDG.E.* (no
         #       .CONSTANT modifier).
         if enable_unroll_4 is None:
             enable_unroll_4 = True
-        if enable_unroll_2 is None:
-            enable_unroll_2 = dtype != cutlass.Float32
         if enable_phase3_unroll is None:
             enable_phase3_unroll = True
         self.enable_unroll_4 = enable_unroll_4
-        # no use
-        self.enable_unroll_2 = enable_unroll_2
         self.enable_phase3_unroll = enable_phase3_unroll
-        # no use
-        self.use_strided_layout = use_strided_layout
         self.use_constant_hint = use_constant_hint
+        # Replace tid==0 serial loops over num_warps with warp-parallel
+        # reduce/scan in warp 0. Beneficial when num_warps is large (e.g.
+        # num_threads=1024 -> num_warps=32) so serial latency is meaningful;
+        # at num_threads=512 (num_warps=16) measured ~2pp regression on
+        # synth, so default off.
+        self.enable_warp_parallel_reduce = enable_warp_parallel_reduce
 
         # Map cutlass dtype → GvrParams lookup name
         if dtype == cutlass.Float32:
@@ -375,18 +369,39 @@ class GvrTopKKernel:
                 local_sum = local_sum + v
                 local_cnt = local_cnt + 1
 
-        # Warp-level reductions.
-        wmin = self.warp_reduce_min_f32(local_min)
-        wmax = self.warp_reduce_max_f32(local_max)
-        wsum = self.warp_reduce_sum_f32(local_sum)
-        wcnt = self.warp_reduce_sum_i32(local_cnt)
-
-        # Lane 0 of each warp writes warp result to typed smem buffers.
-        if lane == 0:
-            smem_wmin_f32[warp_id] = wmin
-            smem_wmax_f32[warp_id] = wmax
-            smem_wsum_f32[warp_id] = wsum
-            smem_wcnt_i32[warp_id] = wcnt
+        # Warp-level reductions + smem write.
+        # When pre_idx_count < num_threads (e.g. K=512 with num_threads=1024),
+        # only the first `active_preidx_warps` warps have real data; remaining
+        # warps would just reduce identity values + write identity to smem.
+        # Skip those dummy warps to save ~30 cy/warp. Full barrier below still
+        # required so all threads reach Phase 2 entry together. K ∈ {512,
+        # 1024, 2048} are all multiples of WARP_SIZE so no rounding needed.
+        # Clamp to num_warps so K > num_threads case (e.g. K=2048, threads=512)
+        # doesn't index past smem allocation (sized to num_warps).
+        active_preidx_warps = cutlass.const_expr(
+            min(pre_idx_count // self.WARP_SIZE, self.num_warps)
+        )
+        if cutlass.const_expr(active_preidx_warps < self.num_warps):
+            if warp_id < cutlass.Int32(active_preidx_warps):
+                wmin = self.warp_reduce_min_f32(local_min)
+                wmax = self.warp_reduce_max_f32(local_max)
+                wsum = self.warp_reduce_sum_f32(local_sum)
+                wcnt = self.warp_reduce_sum_i32(local_cnt)
+                if lane == 0:
+                    smem_wmin_f32[warp_id] = wmin
+                    smem_wmax_f32[warp_id] = wmax
+                    smem_wsum_f32[warp_id] = wsum
+                    smem_wcnt_i32[warp_id] = wcnt
+        else:
+            wmin = self.warp_reduce_min_f32(local_min)
+            wmax = self.warp_reduce_max_f32(local_max)
+            wsum = self.warp_reduce_sum_f32(local_sum)
+            wcnt = self.warp_reduce_sum_i32(local_cnt)
+            if lane == 0:
+                smem_wmin_f32[warp_id] = wmin
+                smem_wmax_f32[warp_id] = wmax
+                smem_wsum_f32[warp_id] = wsum
+                smem_wcnt_i32[warp_id] = wcnt
         cute.arch.barrier()
 
         # tid==0 aggregates NUM_WARPS warp results → pmin, pmax, psum, pcnt → pmean.
@@ -401,40 +416,81 @@ class GvrTopKKernel:
         #   s_iscalars[2] = cnt_lo seed = pre_idx_count + pre_idx_count // 4
         #   s_iscalars[3] = cnt_hi seed = 1
         #   s_iscalars[4] = out_count = 0
-        if tidx == 0:
-            pmin = cutlass.Float32(FLT_MAX)
-            pmax = cutlass.Float32(NEG_FLT_MAX)
-            psum = cutlass.Float32(0.0)
-            pcnt = cutlass.Int32(0)
-            # TODO: num_warps is 64. all unroll is ok?
-            for w in cutlass.range_constexpr(self.num_warps):
-                v_min = smem_wmin_f32[w]
-                v_max = smem_wmax_f32[w]
-                v_sum = smem_wsum_f32[w]
-                v_cnt = smem_wcnt_i32[w]
-                pmax = cute.arch.fmax(pmax, v_max)
-                pmin = _fmin_f32_inline(pmin, v_min)
-                psum = psum + v_sum
-                pcnt = pcnt + v_cnt
+        # Block aggregate: 4 reductions over num_warps slots. Gated by
+        # self.enable_warp_parallel_reduce — True picks warp-parallel reduce
+        # (warp 0 lanes do 4 REDUX.SYNC instructions); False keeps tid==0
+        # serial loop (default, since num_threads=512 measured a regression
+        # with the warp-parallel path; expected to win at num_threads=1024).
+        if cutlass.const_expr(self.enable_warp_parallel_reduce):
+            # NEW: warp-parallel 4-way reduce in warp 0. Read only the first
+            # `active_preidx_warps` slots (dummy warps above wrote nothing,
+            # so those smem slots are uninitialized).
+            if warp_id == cutlass.Int32(0):
+                v_min = cutlass.Float32(FLT_MAX)
+                v_max = cutlass.Float32(NEG_FLT_MAX)
+                v_sum = cutlass.Float32(0.0)
+                v_cnt = cutlass.Int32(0)
+                if lane < cutlass.Int32(active_preidx_warps):
+                    v_min = smem_wmin_f32[lane]
+                    v_max = smem_wmax_f32[lane]
+                    v_sum = smem_wsum_f32[lane]
+                    v_cnt = smem_wcnt_i32[lane]
+                pmin = self.warp_reduce_min_f32(v_min)
+                pmax = self.warp_reduce_max_f32(v_max)
+                psum = self.warp_reduce_sum_f32(v_sum)
+                pcnt = self.warp_reduce_sum_i32(v_cnt)
+                if lane == cutlass.Int32(0):
+                    pmean = cutlass.Float32(0.0)
+                    if pcnt > 0:
+                        pmean = psum / cutlass.Float32(pcnt)
+                    else:
+                        pmean = (pmin + pmax) * cutlass.Float32(0.5)
+                    cnt_lo_seed = pre_idx_count + (pre_idx_count >> 2)
+                    s_thr[0] = pmean
+                    s_thr[1] = pmin
+                    s_thr[2] = pmax
+                    s_thr_extra[0] = pmax
+                    s_iscalars[0] = cutlass.Int32(0)  # cand_count
+                    s_iscalars[1] = cutlass.Int32(0)  # done
+                    s_iscalars[2] = cutlass.Int32(cnt_lo_seed)  # cnt_lo
+                    s_iscalars[3] = cutlass.Int32(1)  # cnt_hi
+                    s_iscalars[4] = cutlass.Int32(0)  # out_count
+        else:
+            # OLD: tid==0 serial loop.
+            if tidx == 0:
+                pmin = cutlass.Float32(FLT_MAX)
+                pmax = cutlass.Float32(NEG_FLT_MAX)
+                psum = cutlass.Float32(0.0)
+                pcnt = cutlass.Int32(0)
+                # Iterate over active_preidx_warps (= num_warps when K >=
+                # num_threads; smaller when K < num_threads since dummy warps
+                # above no longer write smem).
+                for w in cutlass.range_constexpr(active_preidx_warps):
+                    v_min = smem_wmin_f32[w]
+                    v_max = smem_wmax_f32[w]
+                    v_sum = smem_wsum_f32[w]
+                    v_cnt = smem_wcnt_i32[w]
+                    pmax = cute.arch.fmax(pmax, v_max)
+                    pmin = _fmin_f32_inline(pmin, v_min)
+                    psum = psum + v_sum
+                    pcnt = pcnt + v_cnt
 
-            pmean = cutlass.Float32(0.0)
-            if pcnt > 0:
-                pmean = psum / cutlass.Float32(pcnt)
-            else:
-                pmean = (pmin + pmax) * cutlass.Float32(0.5)
+                pmean = cutlass.Float32(0.0)
+                if pcnt > 0:
+                    pmean = psum / cutlass.Float32(pcnt)
+                else:
+                    pmean = (pmin + pmax) * cutlass.Float32(0.5)
 
-            # cnt_lo seed: pre_idx_count + pre_idx_count // 4 (CUDA :702-703)
-            cnt_lo_seed = pre_idx_count + (pre_idx_count >> 2)
-
-            s_thr[0] = pmean
-            s_thr[1] = pmin
-            s_thr[2] = pmax
-            s_thr_extra[0] = pmax
-            s_iscalars[0] = cutlass.Int32(0)  # cand_count
-            s_iscalars[1] = cutlass.Int32(0)  # done
-            s_iscalars[2] = cutlass.Int32(cnt_lo_seed)  # cnt_lo
-            s_iscalars[3] = cutlass.Int32(1)  # cnt_hi
-            s_iscalars[4] = cutlass.Int32(0)  # out_count
+                cnt_lo_seed = pre_idx_count + (pre_idx_count >> 2)
+                s_thr[0] = pmean
+                s_thr[1] = pmin
+                s_thr[2] = pmax
+                s_thr_extra[0] = pmax
+                s_iscalars[0] = cutlass.Int32(0)
+                s_iscalars[1] = cutlass.Int32(0)
+                s_iscalars[2] = cutlass.Int32(cnt_lo_seed)
+                s_iscalars[3] = cutlass.Int32(1)
+                s_iscalars[4] = cutlass.Int32(0)
         cute.arch.barrier()
 
     # ------------------------------------------------------------------
@@ -696,16 +752,26 @@ class GvrTopKKernel:
             smem_wcnt[warp_id] = wc
         cute.arch.barrier()
 
-        # Block aggregate by tid==0. No trailing barrier: caller is
-        # expected to insert its own __syncthreads after its tid==0
-        # post-processing of cand_count, matching CUDA blockCountGE
+        # Block aggregate (sum reduce over num_warps slots). No trailing
+        # barrier: caller is expected to insert its own __syncthreads after
+        # its post-processing of cand_count, matching CUDA blockCountGE
         # (heuristic_topk.cuh:413-441 — no sync at function end).
-        if tidx == 0:
-            total = cutlass.Int32(0)
-            # TODO: num_warps is 64. all unroll is ok?
-            for w in cutlass.range_constexpr(self.num_warps):
-                total = total + smem_wcnt[w]
-            s_iscalars[0] = total
+        if cutlass.const_expr(self.enable_warp_parallel_reduce):
+            # NEW: warp-parallel sum reduce in warp 0.
+            if warp_id == cutlass.Int32(0):
+                v = cutlass.Int32(0)
+                if lane < cutlass.Int32(self.num_warps):
+                    v = smem_wcnt[lane]
+                total = self.warp_reduce_sum_i32(v)
+                if lane == cutlass.Int32(0):
+                    s_iscalars[0] = total
+        else:
+            # OLD: tid==0 serial sum.
+            if tidx == 0:
+                total = cutlass.Int32(0)
+                for w in cutlass.range_constexpr(self.num_warps):
+                    total = total + smem_wcnt[w]
+                s_iscalars[0] = total
 
     # ------------------------------------------------------------------
     # Phase 2: Secant-interpolation threshold search
@@ -972,16 +1038,27 @@ class GvrTopKKernel:
             smem_wcnt[warp_id] = warp_total
         cute.arch.barrier()
 
-        # TODO: let multiple threads do this.
-        # ---- Block prefix sum (tid==0 over NUM_WARPS warp totals) ----
-        if tidx == 0:
-            total = cutlass.Int32(0)
-            # TODO: num_warps is 64. all unroll is ok?
-            for w in cutlass.range_constexpr(self.num_warps):
-                cnt = smem_wcnt[w]
-                smem_wcnt[w] = total
-                total = total + cnt
-            s_iscalars[0] = total  # cand_count
+        # Exclusive prefix sum over num_warps warp totals.
+        if cutlass.const_expr(self.enable_warp_parallel_reduce):
+            # NEW: warp-parallel via block_scan.warp_scan (Hillis-Steele
+            # inclusive scan, log2(num_warps) shfl_up steps). Exclusive
+            # prefix = inclusive - val. Total = inclusive at last lane.
+            if warp_id == cutlass.Int32(0):
+                if lane < cutlass.Int32(self.num_warps):
+                    val = smem_wcnt[lane]
+                    inclusive = warp_scan(val, tidx, lane, num_threads_per_warp=self.num_warps)
+                    smem_wcnt[lane] = inclusive - val  # exclusive prefix
+                    if lane == cutlass.Int32(self.num_warps - 1):
+                        s_iscalars[0] = inclusive  # cand_count (total)
+        else:
+            # OLD: tid==0 serial exclusive prefix.
+            if tidx == 0:
+                total = cutlass.Int32(0)
+                for w in cutlass.range_constexpr(self.num_warps):
+                    cnt = smem_wcnt[w]
+                    smem_wcnt[w] = total
+                    total = total + cnt
+                s_iscalars[0] = total
         cute.arch.barrier()
 
         # Each thread's write base = warp-prefix + intra-warp exclusive offset.
@@ -1259,33 +1336,64 @@ class GvrTopKKernel:
             smem_hist[self.num_warps + warp_id] = float_as_uint32(s_down)
         cute.arch.barrier()
 
-        if tidx == 0:
-            tp = cutlass.Int32(0)
-            total_up = cutlass.Float32(FLT_MAX)
-            total_down = cutlass.Float32(NEG_FLT_MAX)
-            # TODO: num_warps is 64. all unroll is ok?
-            for w in cutlass.range_constexpr(self.num_warps):
-                tp = tp + smem_wcnt[w]
-                vu = llvm.bitcast(cutlass.Float32.mlir_type, smem_hist[w].ir_value())
-                vd = llvm.bitcast(
-                    cutlass.Float32.mlir_type, smem_hist[self.num_warps + w].ir_value()
-                )
-                vu_w = cutlass.Float32(vu)
-                vd_w = cutlass.Float32(vd)
-                total_up = _fmin_f32_inline(total_up, vu_w)
-                total_down = cute.arch.fmax(total_down, vd_w)
+        # 3-way block reduce + threshold bound update.
+        if cutlass.const_expr(self.enable_warp_parallel_reduce):
+            # NEW: warp-parallel 3-way reduce in warp 0.
+            if warp_id == cutlass.Int32(0):
+                v_tp = cutlass.Int32(0)
+                v_up = cutlass.Float32(FLT_MAX)
+                v_dn = cutlass.Float32(NEG_FLT_MAX)
+                if lane < cutlass.Int32(self.num_warps):
+                    v_tp = smem_wcnt[lane]
+                    vu_bits = smem_hist[lane]
+                    vd_bits = smem_hist[self.num_warps + lane]
+                    v_up = cutlass.Float32(
+                        llvm.bitcast(cutlass.Float32.mlir_type, vu_bits.ir_value())
+                    )
+                    v_dn = cutlass.Float32(
+                        llvm.bitcast(cutlass.Float32.mlir_type, vd_bits.ir_value())
+                    )
+                tp = self.warp_reduce_sum_i32(v_tp)
+                total_up = self.warp_reduce_min_f32(v_up)
+                total_down = self.warp_reduce_max_f32(v_dn)
+                if lane == cutlass.Int32(0):
+                    cge = tp >> cutlass.Int32(16)
+                    cgt = tp & cutlass.Int32(0xFFFF)
+                    s_iscalars[2] = cge
+                    s_iscalars[3] = cgt
+                    if cgt >= cutlass.Int32(kK):
+                        if total_up < cutlass.Float32(FLT_MAX):
+                            s_thr[0] = total_up
+                    elif cge < cutlass.Int32(kK):
+                        if total_down > cutlass.Float32(NEG_FLT_MAX):
+                            s_thr[0] = total_down
+        else:
+            # OLD: tid==0 serial 3-way reduce.
+            if tidx == 0:
+                tp = cutlass.Int32(0)
+                total_up = cutlass.Float32(FLT_MAX)
+                total_down = cutlass.Float32(NEG_FLT_MAX)
+                for w in cutlass.range_constexpr(self.num_warps):
+                    tp = tp + smem_wcnt[w]
+                    vu = llvm.bitcast(cutlass.Float32.mlir_type, smem_hist[w].ir_value())
+                    vd = llvm.bitcast(
+                        cutlass.Float32.mlir_type, smem_hist[self.num_warps + w].ir_value()
+                    )
+                    vu_w = cutlass.Float32(vu)
+                    vd_w = cutlass.Float32(vd)
+                    total_up = _fmin_f32_inline(total_up, vu_w)
+                    total_down = cute.arch.fmax(total_down, vd_w)
 
-            cge = tp >> cutlass.Int32(16)
-            cgt = tp & cutlass.Int32(0xFFFF)
-            s_iscalars[2] = cge
-            s_iscalars[3] = cgt
-
-            if cgt >= cutlass.Int32(kK):
-                if total_up < cutlass.Float32(FLT_MAX):
-                    s_thr[0] = total_up
-            elif cge < cutlass.Int32(kK):
-                if total_down > cutlass.Float32(NEG_FLT_MAX):
-                    s_thr[0] = total_down
+                cge = tp >> cutlass.Int32(16)
+                cgt = tp & cutlass.Int32(0xFFFF)
+                s_iscalars[2] = cge
+                s_iscalars[3] = cgt
+                if cgt >= cutlass.Int32(kK):
+                    if total_up < cutlass.Float32(FLT_MAX):
+                        s_thr[0] = total_up
+                elif cge < cutlass.Int32(kK):
+                    if total_down > cutlass.Float32(NEG_FLT_MAX):
+                        s_thr[0] = total_down
         cute.arch.barrier()
 
     # ------------------------------------------------------------------
@@ -1869,13 +1977,12 @@ def gvr_topk_decode(
     out_indices: Optional[torch.Tensor] = None,
     num_sms: int = 148,  # default number of sms in a B200
     enable_unroll_4: Optional[bool] = None,
-    enable_unroll_2: Optional[bool] = None,
     enable_phase3_unroll: Optional[bool] = None,
-    use_strided_layout: Optional[bool] = None,
     use_constant_hint: bool = False,
     min_blocks_per_mp: Optional[int] = None,
     use_256bit_load: bool = False,
     num_threads_per_block: int = 512,
+    enable_warp_parallel_reduce: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """cuTe DSL GVR Top-K, drop-in for ``torch.ops.trtllm.indexer_topk_decode``.
 
@@ -1924,14 +2031,8 @@ def gvr_topk_decode(
     #     to separate-ptrs unroll-4 without cascade.
     if enable_unroll_4 is None:
         enable_unroll_4 = True
-    # enable_unroll_2 is no use
-    if enable_unroll_2 is None:
-        enable_unroll_2 = cute_dtype != cutlass.Float32
     if enable_phase3_unroll is None:
         enable_phase3_unroll = True
-    # use_strided_layout is no use
-    if use_strided_layout is None:
-        use_strided_layout = cute_dtype != cutlass.Float32
     # 3-tier reg-vs-occupancy heuristic (B200 has 148 SMs):
     #   n_vec_iters < 4 (small N):
     #       → min_blocks=0 (no __launch_bounds__) — let ptxas pick natural
@@ -1989,13 +2090,12 @@ def gvr_topk_decode(
         top_k,
         next_n,
         enable_unroll_4,
-        enable_unroll_2,
         enable_phase3_unroll,
-        use_strided_layout,
         use_constant_hint,
         min_blocks_per_mp,
         use_256bit_load,
         num_threads_per_block,
+        enable_warp_parallel_reduce,
     )
     if key not in _gvr_topk_compile_cache:
         n_rows = cute.sym_int()
@@ -2028,12 +2128,11 @@ def gvr_topk_decode(
             next_n=next_n,
             num_threads=num_threads_per_block,
             enable_unroll_4=enable_unroll_4,
-            enable_unroll_2=enable_unroll_2,
             enable_phase3_unroll=enable_phase3_unroll,
-            use_strided_layout=use_strided_layout,
             use_constant_hint=use_constant_hint,
             min_blocks_per_mp=min_blocks_per_mp,
             use_256bit_load=use_256bit_load,
+            enable_warp_parallel_reduce=enable_warp_parallel_reduce,
         )
         _gvr_topk_compile_cache[key] = cute.compile(
             kernel,

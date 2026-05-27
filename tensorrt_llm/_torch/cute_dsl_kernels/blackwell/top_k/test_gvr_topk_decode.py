@@ -87,9 +87,10 @@ _SEEDS = [0, 1]
 @pytest.mark.parametrize("N", _NS)
 @pytest.mark.parametrize("seed", _SEEDS)
 # limin expanded next_n test. originally, it is [1]
-@pytest.mark.parametrize("next_n", [1, 2, 3, 4])
-@pytest.mark.parametrize("use_256bit_load", [False])
-@pytest.mark.parametrize("num_threads_per_block", [1024])
+@pytest.mark.parametrize("next_n", [1, 2])
+@pytest.mark.parametrize("use_256bit_load", [False, True])
+@pytest.mark.parametrize("num_threads_per_block", [512, 1024])
+@pytest.mark.parametrize("enable_warp_parallel_reduce", [False, True])
 def test_gvr_topk_decode_correctness(
     dtype: torch.dtype,
     top_k: int,
@@ -98,6 +99,7 @@ def test_gvr_topk_decode_correctness(
     next_n: int,
     use_256bit_load: bool,
     num_threads_per_block: int,
+    enable_warp_parallel_reduce: bool,
 ) -> None:
     # Kernel scans `N_eff = seq_lens[0] - next_n + (row_idx % next_n) + 1`
     # columns for row 0 (= seq_lens[0] - next_n + 1). The degenerate
@@ -114,11 +116,13 @@ def test_gvr_topk_decode_correctness(
         next_n=next_n,
         use_256bit_load=use_256bit_load,
         num_threads_per_block=num_threads_per_block,
+        enable_warp_parallel_reduce=enable_warp_parallel_reduce,
     )
     torch.cuda.synchronize()
     ok, err = _tie_aware_correct(out_idxs, logits, top_k, effective_len)
     assert ok, (
         f"dtype={dtype} K={top_k} N={N} seed={seed} next_n={next_n} "
-        f"use_256bit_load={use_256bit_load} num_threads_per_block={num_threads_per_block}: "
+        f"use_256bit_load={use_256bit_load} num_threads_per_block={num_threads_per_block} "
+        f"enable_warp_parallel_reduce={enable_warp_parallel_reduce}: "
         f"tie-aware check failed (err_count={err})"
     )
