@@ -70,6 +70,7 @@ from .draft_target import (
     DraftTargetOneModelSampler,
     DraftTargetOneModelSpecMetadata,
     DraftTargetOneModelWorker,
+    _context_prompt_token_batches,
 )
 from .interface import SpecMetadata
 
@@ -275,22 +276,18 @@ class PEARLOneModelWorker(DraftTargetOneModelWorker):
         if request_ids is None or len(request_ids) < num_contexts:
             return
 
-        flat = input_ids.reshape(-1)
-        seq_lens = getattr(attn_metadata, "_seq_lens", None)
-        if seq_lens is None:
-            seq_lens = getattr(attn_metadata, "seq_lens", None)
-        cursor = 0
+        context_prompts = _context_prompt_token_batches(
+            input_ids=input_ids,
+            attn_metadata=attn_metadata,
+            spec_metadata=spec_metadata,
+            request_ids=request_ids,
+            num_contexts=num_contexts,
+        )
         for row in range(num_contexts):
-            if seq_lens is not None:
-                length = int(seq_lens[row].item())
-            else:
-                length = int(getattr(attn_metadata, "num_ctx_tokens", flat.numel()))
-            prompt_tokens = flat[cursor : cursor + length].detach().cpu().tolist()
-            cursor += length
             try:
                 self._rdma_v2_offload_layer.push_prompt(
                     int(request_ids[row]),
-                    prompt_tokens,
+                    context_prompts[row],
                 )
             except RuntimeError as exc:
                 logger.warning(

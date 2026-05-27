@@ -2261,6 +2261,7 @@ class PyTorchModelEngine(ModelEngine):
         num_cached_tokens_per_seq = []  # per sequence
         draft_tokens = []
         draft_lens = []
+        context_prompt_token_ids = {}
         gen_request_seq_slots = []  # per generation request
         multimodal_params_list = []
         mrope_position_ids = [
@@ -2286,6 +2287,9 @@ class PyTorchModelEngine(ModelEngine):
         for request in scheduled_requests.context_requests:
             request_ids.append(request.py_request_id)
             all_prompt_tokens = request.get_tokens(0)
+            context_prompt_token_ids[int(request.py_request_id)] = [
+                int(token) for token in all_prompt_tokens
+            ]
             draft_lens.append(0)
             begin_compute = request.context_current_position
             end_compute = begin_compute + request.context_chunk_size
@@ -3067,6 +3071,7 @@ class PyTorchModelEngine(ModelEngine):
             if spec_metadata.spec_dec_mode.is_pearl_one_model():
                 spec_metadata.end_ids = self._get_request_end_ids(
                     scheduled_requests, request_ids)
+                spec_metadata.context_prompt_token_ids = context_prompt_token_ids
             spec_metadata.gather_ids = self.gather_ids_cuda[:len(gather_ids)]
             spec_metadata.num_generations = len(
                 scheduled_requests.generation_requests)

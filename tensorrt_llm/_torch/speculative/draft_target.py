@@ -22,7 +22,7 @@ layers are integrated into the target model's KV cache and run in a single forwa
 
 import os
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, List, Optional
 
 import torch
 from torch import nn
@@ -49,6 +49,71 @@ def _env_enabled(name: str, default: bool = False) -> bool:
     if value is None:
         return default
     return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _context_prompt_token_batches(
+    input_ids: torch.Tensor,
+    attn_metadata: AttentionMetadata,
+    spec_metadata: SpecMetadata,
+    request_ids,
+    num_contexts: int,
+) -> List[List[int]]:
+    """Return full prompt tokens for each context request.
+
+    ``input_ids`` only contains the tokens computed in this target step.  With
+    context cache reuse that can be just a suffix of the prompt, while the
+    remote draft server starts a fresh session and needs the full prompt.
+    ``SpecMetadata.context_prompt_token_ids`` is populated from
+    ``LlmRequest.get_tokens(0)`` before any chunking/cache-reuse slicing.
+    """
+
+    full_prompts = getattr(spec_metadata, "context_prompt_token_ids", None)
+    if full_prompts is not None:
+        tokens_by_row = []
+        found_all = True
+        for row in range(num_contexts):
+            tokens = full_prompts.get(int(request_ids[row]))
+            if tokens is None:
+                found_all = False
+                break
+            tokens_by_row.append([int(token) for token in tokens])
+        if found_all:
+            return tokens_by_row
+
+    flat = input_ids.reshape(-1)
+    num_ctx_tokens = int(getattr(attn_metadata, "num_ctx_tokens", 0) or 0)
+    if num_ctx_tokens <= 0 or num_ctx_tokens > int(flat.numel()):
+        num_ctx_tokens = int(flat.numel())
+    flat = flat[:num_ctx_tokens]
+
+    seq_lens = getattr(attn_metadata, "_seq_lens", None)
+    if seq_lens is None:
+        seq_lens = getattr(attn_metadata, "seq_lens", None)
+
+    lengths = []
+    if seq_lens is not None:
+        lengths = [int(seq_lens[row].item()) for row in range(num_contexts)]
+        if sum(lengths) != num_ctx_tokens:
+            lengths = []
+
+    if not lengths:
+        if num_contexts == 1:
+            lengths = [num_ctx_tokens]
+        else:
+            logger.warning(
+                "Unable to recover full context prompt lengths for %d requests; "
+                "falling back to packed context token slices",
+                num_contexts,
+            )
+            lengths = [0] * num_contexts
+            lengths[0] = num_ctx_tokens
+
+    tokens_by_row = []
+    cursor = 0
+    for length in lengths:
+        tokens_by_row.append(flat[cursor : cursor + length].detach().cpu().tolist())
+        cursor += length
+    return tokens_by_row
 
 
 @dataclass
@@ -628,9 +693,9 @@ class DraftTargetOneModelWorker(SpecWorkerBase):
             # the request is being prefilled on the target side this step,
             # so the draft side must also prefill before the first round
             # trip lands. We push the full prompt token sequence for each
-            # context row. Batch_size==1 today (see the multi-request
-            # caveat above); the multi-row generalization slices
-            # ``input_ids`` by ``attn_metadata.seq_lens[:num_contexts]``.
+            # context row. Prefer the original request prompt because context
+            # cache reuse can make ``input_ids`` contain only the tail chunk
+            # computed this step.
             #
             # PEARL pre-verify timeline:
             #   draft prompt_init precomputes d_f from the prompt;
@@ -641,23 +706,18 @@ class DraftTargetOneModelWorker(SpecWorkerBase):
             if attn_metadata is not None and input_ids is not None:
                 num_contexts = int(getattr(attn_metadata, "num_contexts", 0))
                 if num_contexts > 0:
-                    flat = input_ids.reshape(-1)
-                    seq_lens = getattr(attn_metadata, "_seq_lens", None)
-                    if seq_lens is None:
-                        seq_lens = getattr(attn_metadata, "seq_lens", None)
-                    cursor = 0
+                    context_prompts = _context_prompt_token_batches(
+                        input_ids=input_ids,
+                        attn_metadata=attn_metadata,
+                        spec_metadata=spec_metadata,
+                        request_ids=request_ids,
+                        num_contexts=num_contexts,
+                    )
                     for row in range(num_contexts):
-                        if seq_lens is not None:
-                            length = int(seq_lens[row].item())
-                        else:
-                            # Fall back to the single-request shortcut.
-                            length = int(getattr(attn_metadata, "num_ctx_tokens", flat.numel()))
-                        prompt_tokens = flat[cursor : cursor + length].detach().cpu().tolist()
-                        cursor += length
                         try:
                             self._rdma_v2_offload_layer.push_prompt(
                                 int(request_ids[row]),
-                                prompt_tokens,
+                                context_prompts[row],
                             )
                         except RuntimeError as exc:
                             logger.warning(

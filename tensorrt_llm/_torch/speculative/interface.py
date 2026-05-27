@@ -4,7 +4,7 @@ from abc import ABC, abstractmethod
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from enum import IntEnum, auto
-from typing import TYPE_CHECKING, List, Optional, Type
+from typing import TYPE_CHECKING, Dict, List, Optional, Type
 
 import torch
 from torch import nn
@@ -348,6 +348,10 @@ class SpecMetadata:
     request_ids: Optional[List[int]] = None
     # Sequence length for each request.
     seq_lens: Optional[List[int]] = None
+    # Full context prompt tokens by request id.  This can differ from the
+    # packed context tokens in ``input_ids`` when prefix/context cache reuse
+    # means the target only computes a tail chunk.
+    context_prompt_token_ids: Optional[Dict[int, List[int]]] = None
     # The gather ids for logits.
     gather_ids: Optional[torch.Tensor] = None
     # The number of accepted draft tokens for each request.
