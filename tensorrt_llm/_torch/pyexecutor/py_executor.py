@@ -3558,6 +3558,14 @@ class PyExecutor:
             if req.is_disagg_generation_transmission_complete:
                 req.state = LlmRequestState.GENERATION_IN_PROGRESS
                 req.context_current_position = req.prompt_len
+                logger.info(
+                    "disagg generation committing received context for reuse: "
+                    f"request_id={req.py_request_id} "
+                    f"beam_width={req.sampling_config.beam_width} "
+                    f"prompt_len={req.prompt_len} "
+                    f"context_current_position={req.context_current_position} "
+                    f"prepopulated_prompt_len={req.prepopulated_prompt_len}"
+                )
                 if self.kv_cache_transceiver is not None:
                     self.kv_cache_transceiver.commit_blocks_for_reuse(req)
                 req.decoding_iter = 1
@@ -3575,9 +3583,7 @@ class PyExecutor:
                     f"first_gen_cum_log_probs="
                     f"{getattr(getattr(req, 'py_disaggregated_params', None), 'first_gen_cum_log_probs', None)} "
                     f"draft_tokens={req.py_draft_tokens} "
-                    f"ctx_request_id={req.context_phase_params.req_id} "
-                    f"tokens_before="
-                    f"{self._debug_request_tokens(req, beam_width)}"
+                    f"ctx_request_id={req.context_phase_params.req_id}"
                 )
                 for beam in range(0, beam_width):
                     req.add_new_token(first_gen_tokens[beam], beam)
@@ -3588,9 +3594,7 @@ class PyExecutor:
                     req, beam_width, first_gen_tokens)
                 logger.info(
                     "disagg generation first tokens appended: "
-                    f"request_id={req.py_request_id} "
-                    f"tokens_after="
-                    f"{self._debug_request_tokens(req, beam_width)}"
+                    f"request_id={req.py_request_id}"
                 )
 
                 self._maybe_prepend_logprobs_and_logits(req, beam_width)

@@ -169,6 +169,12 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             if is_gen_only
             else [0] * len(layer_groups)
         )
+        logger.info(
+            f"create_kv_slice reuse state: py_request_id={req.py_request_id} "
+            f"is_gen_only={is_gen_only} prompt_len={req.prompt_len} "
+            f"prepopulated_prompt_len={req.prepopulated_prompt_len} "
+            f"tokens_per_block={tpb} cached_per_layer_group={cached_per_lg}"
+        )
 
         if token_range is None and req.prompt_len > 0:
             token_range = TokenRange(start=0, end=req.prompt_len)
@@ -231,6 +237,8 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                 f"create_kv_slice final block_ids: py_request_id={req.py_request_id} "
                 f"is_gen_only={is_gen_only} group_idx={idx} "
                 f"token_range={token_range} prompt_len={req.prompt_len} "
+                f"prepopulated_prompt_len={req.prepopulated_prompt_len} "
+                f"cached_tokens={cached_per_lg[idx]} "
                 f"tokens_per_block={tpb} beam_width={beam_width} "
                 f"cache_skip={cache_skip} window_size={window_size} "
                 f"shape={block_ids.shape} block_ids={block_ids.tolist()}")

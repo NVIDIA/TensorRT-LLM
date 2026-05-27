@@ -2524,6 +2524,17 @@ class KVCacheManagerV2(BaseResourceManager):
                 req.context_current_position = kv_cache.num_committed_tokens
                 req.set_prepopulated_prompt_len(kv_cache.num_committed_tokens,
                                                 self.tokens_per_block)
+                logger.info(
+                    "KVCacheManagerV2.prepare_context reuse state: "
+                    f"request_id={req.py_request_id} "
+                    f"is_generation_only={req.is_generation_only_request()} "
+                    f"prompt_len={req.prompt_len} "
+                    f"context_current_position={req.context_current_position} "
+                    f"prepopulated_prompt_len={req.prepopulated_prompt_len} "
+                    f"num_committed_tokens={kv_cache.num_committed_tokens} "
+                    f"tokens_per_block={self.tokens_per_block} "
+                    f"beam_width={req.sampling_config.beam_width}"
+                )
 
             return self._resume_and_restore(req.py_request_id, kv_cache)
         else:
