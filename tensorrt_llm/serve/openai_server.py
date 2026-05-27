@@ -14,7 +14,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime
 from http import HTTPStatus
 from pathlib import Path
-from typing import (Annotated, Any, AsyncGenerator, AsyncIterator, List,
+from typing import (Annotated, Any, AsyncGenerator, AsyncIterator, Dict, List,
                     Optional, Union)
 
 import uvicorn
@@ -441,6 +441,31 @@ class OpenAIServer(_VideoRoutesMixin):
                 return int(vocab_size)
         return int(self.tokenizer.tokenizer.vocab_size)
 
+    def _extract_speculative_config(self) -> Optional[Dict[str, str]]:
+        """Build a serializable speculative-decoding summary from generator args.
+
+        Returns None when the engine has no speculative/decoding config attached.
+        Used for both Prometheus config-info metrics and the /v1/models metadata
+        channel that benchmark clients (e.g. benchmark_serving.py) consult to
+        auto-resolve --ignore-eos for spec-dec runs.
+        """
+        args = self.generator.args
+        spec_config_obj = getattr(args, "speculative_config", None) or getattr(
+            args, "decoding_config", None)
+        if spec_config_obj is None:
+            return None
+        speculative_config: Dict[str, str] = {"spec_enabled": "true"}
+        decoding_type = getattr(spec_config_obj, "decoding_type", None)
+        if decoding_type is not None:
+            speculative_config["spec_method"] = str(decoding_type)
+        max_draft_len = getattr(spec_config_obj, "max_draft_len", None)
+        if max_draft_len is not None:
+            speculative_config["spec_num_tokens"] = str(max_draft_len)
+        draft_model = getattr(spec_config_obj, "speculative_model", None)
+        if draft_model is not None:
+            speculative_config["spec_draft_model"] = str(draft_model)
+        return speculative_config
+
     def _log_config_info_metrics(self) -> None:
         """Extract configuration from generator args and log as Prometheus info gauges."""
         args = self.generator.args
@@ -494,20 +519,7 @@ class OpenAIServer(_VideoRoutesMixin):
             parallel_config["expert_parallel_size"] = str(ep_size)
 
         # Speculative decoding config
-        spec_config_obj = getattr(args, "speculative_config", None) or getattr(
-            args, "decoding_config", None)
-        speculative_config = None
-        if spec_config_obj is not None:
-            speculative_config = {"spec_enabled": "true"}
-            decoding_type = getattr(spec_config_obj, "decoding_type", None)
-            if decoding_type is not None:
-                speculative_config["spec_method"] = str(decoding_type)
-            max_draft_len = getattr(spec_config_obj, "max_draft_len", None)
-            if max_draft_len is not None:
-                speculative_config["spec_num_tokens"] = str(max_draft_len)
-            draft_model = getattr(spec_config_obj, "speculative_model", None)
-            if draft_model is not None:
-                speculative_config["spec_draft_model"] = str(draft_model)
+        speculative_config = self._extract_speculative_config()
 
         # KV cache config
         kv_cache_config_obj = getattr(args, "kv_cache_config", None)
@@ -844,7 +856,12 @@ class OpenAIServer(_VideoRoutesMixin):
         return JSONResponse(content=ver)
 
     async def get_model(self) -> JSONResponse:
-        model_list = ModelList(data=[ModelCard(id=self.model)])
+        speculative_config = self._extract_speculative_config()
+        metadata = ({
+            "speculative_config": speculative_config
+        } if speculative_config else None)
+        model_list = ModelList(
+            data=[ModelCard(id=self.model, metadata=metadata)])
         return JSONResponse(content=model_list.model_dump())
 
     async def get_iteration_stats(self) -> JSONResponse:

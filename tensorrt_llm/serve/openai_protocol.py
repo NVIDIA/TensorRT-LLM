@@ -126,6 +126,7 @@ class ModelCard(OpenAIBaseModel):
     object: str = "model"
     created: int = Field(default_factory=lambda: int(time.time()))
     owned_by: str = "tensorrt_llm"
+    metadata: Optional[Dict[str, Any]] = None
 
 
 class ModelList(OpenAIBaseModel):

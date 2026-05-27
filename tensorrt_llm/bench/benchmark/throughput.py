@@ -45,6 +45,7 @@ from tensorrt_llm.bench.utils.data import (DatasetFormatError,
                                            update_metadata_for_multimodal)
 from tensorrt_llm.llmapi import CapacitySchedulerPolicy
 from tensorrt_llm.logger import logger
+from tensorrt_llm.models.modeling_utils import SpeculativeDecodingMode
 from tensorrt_llm.sampling_params import SamplingParams
 
 
@@ -154,10 +155,13 @@ from tensorrt_llm.sampling_params import SamplingParams
 @optgroup.option(
     "--eos_id",
     type=int,
-    default=-1,
+    default=None,
     required=False,
     help=
-    "Set the end-of-sequence token for the benchmark. Set to -1 to disable EOS.",
+    "Set the end-of-sequence token for the benchmark. Set to -1 to disable EOS. "
+    "If unset, the value is auto-resolved from the runtime decoding_mode: "
+    "tokenizer.eos_token_id when speculative decoding is enabled, otherwise -1 "
+    "(mirrors trtllm-bench latency).",
 )
 @optgroup.option(
     "--modality",
@@ -452,9 +456,20 @@ def throughput_command(
 
         llm = get_llm(runtime_config, kwargs)
 
+        # Auto-resolve eos_id when --eos_id was not passed (mirrors low_latency.py):
+        # honor EOS for spec-dec runs (clean acceptance-rate measurement), else -1
+        # for stable throughput numbers.
+        eos_id = options.eos_id
+        if eos_id is None:
+            decoding_config = runtime_config.decoding_config
+            spec_active = (decoding_config is not None
+                           and decoding_config.decoding_mode
+                           != SpeculativeDecodingMode.NONE)
+            eos_id = tokenizer.eos_token_id if spec_active else -1
+
         sampler_args = {
-            "end_id": options.eos_id,
-            "pad_id": options.eos_id,
+            "end_id": eos_id,
+            "pad_id": eos_id,
             "n": options.beam_width,
             "use_beam_search": options.beam_width > 1
         }

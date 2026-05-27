@@ -32,8 +32,11 @@ class GeneralExecSettings(BaseModel):
                                          description="Path to dataset file")
     engine_dir: Optional[Path] = Field(
         default=None, description="Path to a serialized TRT-LLM engine")
-    eos_id: int = Field(
-        default=-1, description="End-of-sequence token ID, -1 to disable EOS")
+    eos_id: Optional[int] = Field(
+        default=None,
+        description="End-of-sequence token ID. -1 disables EOS, "
+        "None auto-resolves based on the speculative decoding mode "
+        "(matches low_latency.py behavior).")
     iteration_log: Optional[Path] = Field(
         default=None, description="Path where iteration logging is written")
     kv_cache_percent: float = Field(
