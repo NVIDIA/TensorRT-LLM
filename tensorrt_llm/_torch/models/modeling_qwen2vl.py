@@ -50,12 +50,13 @@ from ..flashinfer_utils import IS_FLASHINFER_AVAILABLE
 # the pattern used in `custom_ops` itself.
 if IS_FLASHINFER_AVAILABLE:
     from ..custom_ops import flashinfer_apply_rope_with_cos_sin_cache_inplace
+
 from ..modules.gated_mlp import GatedMLP
 from ..modules.rotary_embedding import MRotaryEmbedding, RotaryEmbedding
 from .modeling_auto import AutoModelForCausalLM
-from .modeling_multimodal_utils import (bypass_processor_output_validation,
-                                        find_input_mm_embeds, fuse_input_embeds,
-                                        get_multimodal_embeddings)
+from .modeling_multimodal_utils import (find_input_mm_embeds, fuse_input_embeds,
+                                        get_multimodal_embeddings,
+                                        install_qwen_vl_processor_defaults_fix)
 from .modeling_utils import (ModelConfig, QuantConfig, _load_weights_impl,
                              filter_weights, register_auto_model,
                              register_vision_encoder)
@@ -85,6 +86,7 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
             model_path,
             use_fast=self.use_fast,
             trust_remote_code=trust_remote_code)
+        install_qwen_vl_processor_defaults_fix(self._processor)
 
         self.tllm_multimodal_token_id = self.get_vocab_size() + 1
         # temporal patch size for video frames
@@ -302,22 +304,18 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
             do_rescale = False
         if videos and isinstance(videos[0][0], torch.Tensor):
             do_rescale = False
-        # transformers 5.x's ``ProcessorMixin._merge_kwargs`` strictly
-        # validates per-modality kwargs against the processor's TypedDict.
-        # Processor *output* keys (``video_grid_thw``, ``pixel_values``, ...)
-        # round-trip into the validator via tokenizer ``init_kwargs`` /
-        # ``model_input_names`` and trip it with ``TypeError:
-        # merged_typed_dict.__init__() got an unexpected keyword argument
-        # 'video_grid_thw'``. Bypass the validator for our known output keys
-        # for the duration of the processor call.
-        with bypass_processor_output_validation():
-            return self.processor(text=[text],
-                                  images=images,
-                                  videos=videos,
-                                  padding=True,
-                                  do_rescale=do_rescale,
-                                  return_tensors='pt',
-                                  **mm_processor_kwargs)
+        # The TRT-LLM safe-processor subclass installed in __init__ prevents
+        # the upstream class-level _defaults mutation that would otherwise
+        # cause processor *output* keys to leak into per-modality kwargs and
+        # trip ProcessorMixin._merge_kwargs validation. So we can call the
+        # processor directly here.
+        return self.processor(text=[text],
+                              images=images,
+                              videos=videos,
+                              padding=True,
+                              do_rescale=do_rescale,
+                              return_tensors='pt',
+                              **mm_processor_kwargs)
 
     def _postprocess(self, input_ids: torch.IntTensor) -> torch.IntTensor:
         token_ids = [

@@ -17,7 +17,9 @@ from tensorrt_llm._torch.attention_backend.interface import AttentionRuntimeFeat
 from tensorrt_llm._torch.attention_backend.utils import get_attention_backend
 from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.model_config import ModelConfig
-from tensorrt_llm._torch.models.modeling_multimodal_utils import bypass_processor_output_validation
+from tensorrt_llm._torch.models.modeling_multimodal_utils import (
+    install_qwen_vl_processor_defaults_fix,
+)
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm._utils import str_dtype_to_torch
 from tensorrt_llm.bindings.executor import KvCacheConfig
@@ -431,6 +433,7 @@ class TestModelingMultimodal(unittest.TestCase, ABC):
             .get("_name_or_path", ""),
         )
         hf_processor = AutoProcessor.from_pretrained(model_path, use_fast=True)
+        install_qwen_vl_processor_defaults_fix(hf_processor)
         inputs = default_multimodal_input_loader(
             tokenizer=hf_processor.tokenizer,
             model_dir=model_path,
@@ -461,22 +464,20 @@ class TestModelingMultimodal(unittest.TestCase, ABC):
             pass
         else:
             raise ValueError(f"Invalid modality: {modality}")
-        # transformers 5.x's ``ProcessorMixin._merge_kwargs`` strictly
-        # validates per-modality kwargs against a TypedDict, and some
-        # Qwen2/3-VL checkpoints leak processor *output* keys (e.g.
-        # ``video_grid_thw``) into ``output_kwargs[<modality>]`` via the
-        # tokenizer's ``init_kwargs`` / ``model_input_names``, tripping
-        # validation. Bypass the validator for our known output keys for
-        # the duration of the processor call.
-        with bypass_processor_output_validation():
-            processor_inputs = hf_processor(
-                text=[input["prompt"] for input in inputs],
-                images=images,
-                videos=videos,
-                padding=True,
-                return_tensors="pt",
-                do_rescale=False,
-            ).to(self.device)
+        # ``hf_processor`` was patched above via
+        # ``install_qwen_vl_processor_defaults_fix`` so the upstream
+        # class-level ``_defaults`` mutation in
+        # ``_get_num_multimodal_tokens`` no longer pollutes per-modality
+        # output kwargs and the strict ``TypedDict`` validation in
+        # ``ProcessorMixin._merge_kwargs`` passes cleanly.
+        processor_inputs = hf_processor(
+            text=[input["prompt"] for input in inputs],
+            images=images,
+            videos=videos,
+            padding=True,
+            return_tensors="pt",
+            do_rescale=False,
+        ).to(self.device)
         # Transformers 5.5.x's `compute_3d_position_ids` raises a ValueError when
         # multimodal grids are passed without `mm_token_type_ids`. The processor
         # already returns this tensor for both image and video modalities, so

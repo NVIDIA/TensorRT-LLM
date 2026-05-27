@@ -16,7 +16,6 @@
 # This file is based on official VILA: https://github.com/NVlabs/VILA/
 # and s2wrapper: https://github.com/bfshi/scaling_on_scales
 
-import contextlib
 import math
 import os
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union, cast
@@ -39,13 +38,47 @@ def _is_disagg() -> bool:
     return os.getenv(_MULTIMODAL_ENV_NAME, "0") == "1"
 
 
-# Processor *output* keys that transformers 5.x's
-# ``ProcessorMixin._merge_kwargs`` strictly rejects when they leak into
-# ``output_kwargs[<modality>]`` and reach ``validate_typed_dict``. They
-# round-trip into call kwargs via saved tokenizer ``init_kwargs`` /
-# ``model_input_names``, sub-processor metadata, or per-item processed
-# fields, even when no caller passed them as inputs.
-_PROCESSOR_OUTPUT_KEYS = frozenset({
+# Qwen2/2.5/3-VL processors share an upstream bug: their
+# ``_get_num_multimodal_tokens`` does
+#   ``<ProcessorKwargs>._defaults.get("<modality>_kwargs", {}).update(kwargs)``
+# on the *class-level* default dict (instead of a copy). Once any caller
+# passes processor *output* keys (e.g. ``video_grid_thw``) to
+# ``get_num_multimodal_tokens``, those keys get baked into the per-modality
+# default and leak into every subsequent processor call's
+# ``output_kwargs[<modality>]`` — tripping ``ProcessorMixin._merge_kwargs``'s
+# strict per-modality ``TypedDict`` validation with
+#   ``TypeError: merged_typed_dict.__init__() got an unexpected keyword
+#    argument 'video_grid_thw'``
+# even when no caller passes such keys.
+#
+# We fix this at the source by re-classing the loaded processor instance to a
+# thin TRT-LLM subclass that overrides only ``_get_num_multimodal_tokens`` and
+# takes a defensive ``dict(...)`` copy of the defaults before mutating. No
+# global state is touched; the override runs entirely on instance methods and
+# local copies, so it is naturally thread-safe.
+
+# Optional dependencies — imported lazily so callers that don't use Qwen-VL
+# don't take the import cost (and so missing models don't break import).
+_QWEN_VL_KWARGS_CLASS_BY_PROCESSOR: Dict[str, Tuple[str, str]] = {
+    # processor class qualified name -> (module path, kwargs class name)
+    "transformers.models.qwen2_vl.processing_qwen2_vl.Qwen2VLProcessor":
+    ("transformers.models.qwen2_vl.processing_qwen2_vl",
+     "Qwen2VLProcessorKwargs"),
+    "transformers.models.qwen2_5_vl.processing_qwen2_5_vl.Qwen2_5_VLProcessor":
+    ("transformers.models.qwen2_5_vl.processing_qwen2_5_vl",
+     "Qwen2_5_VLProcessorKwargs"),
+    "transformers.models.qwen3_vl.processing_qwen3_vl.Qwen3VLProcessor":
+    ("transformers.models.qwen3_vl.processing_qwen3_vl",
+     "Qwen3VLProcessorKwargs"),
+}
+
+# Processor *output* keys that ``_get_num_multimodal_tokens`` may have already
+# baked into the class-level ``_defaults`` per-modality dicts before our fix
+# took effect (e.g. an earlier unpatched processor in the same process called
+# ``get_num_multimodal_tokens`` with a leaked kwarg). We scrub these from the
+# defaults at install time so the next ``_merge_kwargs`` call doesn't trip the
+# strict ``TypedDict`` validator on stale state.
+_QWEN_VL_PROCESSOR_OUTPUT_KEYS = frozenset({
     "image_grid_thw",
     "video_grid_thw",
     "pixel_values",
@@ -55,66 +88,122 @@ _PROCESSOR_OUTPUT_KEYS = frozenset({
 })
 
 
-@contextlib.contextmanager
-def bypass_processor_output_validation():
-    """Filter processor-output keys out of ``validate_typed_dict`` for the
-    duration of an HF processor call.
+def _make_safe_get_num_multimodal_tokens(kwargs_cls):
+    """Build a safe replacement for ``_get_num_multimodal_tokens`` that takes
+    a defensive copy of the class-level ``_defaults`` per-modality dicts
+    before merging caller kwargs. Mirrors upstream behavior in every other
+    respect."""
+    from transformers.processing_utils import MultiModalData
 
-    transformers 5.x added strict per-modality TypedDict validation in
-    ``ProcessorMixin._merge_kwargs``. The leak is an upstream bug: e.g.
-    ``Qwen2_5_VLProcessor._get_num_multimodal_tokens`` does
-    ``Qwen2_5_VLProcessorKwargs._defaults["videos_kwargs"].update(kwargs)``
-    on the class-level default dict (instead of a copy), so once any caller
-    passes ``video_grid_thw`` to ``get_num_multimodal_tokens`` it gets baked
-    into the per-modality default and leaks into every subsequent processor
-    call's ``output_kwargs[<modality>]`` — tripping the validator with
-    ``TypeError: merged_typed_dict.__init__() got an unexpected keyword
-    argument 'video_grid_thw'`` even when no caller passes such keys.
+    def _get_num_multimodal_tokens(self,
+                                   image_sizes=None,
+                                   video_sizes=None,
+                                   **kwargs):
+        vision_data: Dict[str, Any] = {}
+        merge_size = None
+        if image_sizes is not None:
+            # Defensive copy — was the source of the leak upstream.
+            images_kwargs = dict(kwargs_cls._defaults.get("images_kwargs", {}))
+            images_kwargs.update(kwargs)
+            merge_size = (images_kwargs.get("merge_size", None)
+                          or self.image_processor.merge_size)
+            num_image_patches = [
+                self.image_processor.get_number_of_image_patches(
+                    *image_size, images_kwargs) for image_size in image_sizes
+            ]
+            num_image_tokens = [(num_patches // merge_size**2)
+                                for num_patches in num_image_patches]
+            vision_data.update({
+                "num_image_tokens": num_image_tokens,
+                "num_image_patches": num_image_patches,
+            })
+        if video_sizes is not None:
+            # Defensive copy — same fix.
+            videos_kwargs = dict(kwargs_cls._defaults.get("videos_kwargs", {}))
+            videos_kwargs.update(kwargs)
+            if merge_size is None:
+                merge_size = (videos_kwargs.get("merge_size", None)
+                              or self.image_processor.merge_size)
+            num_video_patches = [
+                self.video_processor.get_number_of_video_patches(
+                    *video_size, videos_kwargs) for video_size in video_sizes
+            ]
+            num_video_tokens = [(num_patches // merge_size**2)
+                                for num_patches in num_video_patches]
+            vision_data["num_video_tokens"] = num_video_tokens
+        return MultiModalData(**vision_data)
 
-    Patches ``validate_typed_dict`` in *all* transformers modules that bind
-    it — each module has its own ``from huggingface_hub.dataclasses import
-    validate_typed_dict``, so patching only one is insufficient to cover
-    sub-processor validation paths. The set of binder modules differs
-    across transformers versions (5.3.x re-binds it on
-    ``image_processing_utils_fast``; 5.5.x dropped that module and re-binds
-    it on ``image_processing_utils`` instead), so we discover the binders
-    by ``hasattr`` rather than hard-coding the list. The originals are
-    restored on exit.
+    return _get_num_multimodal_tokens
+
+
+def install_qwen_vl_processor_defaults_fix(processor) -> bool:
+    """Re-class a freshly-loaded Qwen2/2.5/3-VL processor instance to a TRT-LLM
+    subclass that fixes the upstream in-place mutation of class-level
+    ``_defaults`` in ``_get_num_multimodal_tokens``.
+
+    Returns ``True`` if the fix was applied (i.e. the processor was a known
+    affected Qwen-VL processor) and ``False`` otherwise. Safe to call on any
+    processor — unknown types are passed through untouched. Idempotent across
+    repeated calls on the same instance.
     """
-    import transformers.processing_utils as _pu
-    import transformers.video_processing_utils as _vpu
+    cls = type(processor)
+    fq_name = f"{cls.__module__}.{cls.__qualname__}"
+    target = _QWEN_VL_KWARGS_CLASS_BY_PROCESSOR.get(fq_name)
+    if target is None:
+        # Walk MRO in case the loaded instance is a subclass of a known one
+        # (e.g. ``trust_remote_code`` checkpoints that subclass the upstream
+        # processor). Use the matched base only to pick the kwargs class;
+        # keep ``cls`` as the concrete instance type so we don't drop any
+        # remote-code overrides when re-classing below.
+        for base in cls.__mro__:
+            key = f"{base.__module__}.{base.__qualname__}"
+            target = _QWEN_VL_KWARGS_CLASS_BY_PROCESSOR.get(key)
+            if target is not None:
+                break
+        else:
+            return False
 
-    _candidate_binders = [_pu, _vpu]
-    for _name in ("transformers.image_processing_utils",
-                  "transformers.image_processing_utils_fast"):
-        try:
-            _candidate_binders.append(__import__(_name, fromlist=[""]))
-        except ImportError:
-            pass
-    binders = tuple(b for b in _candidate_binders
-                    if hasattr(b, "validate_typed_dict"))
-    if not binders:
-        raise RuntimeError(
-            "No transformers module exposes validate_typed_dict; "
-            "cannot patch processor output validation.")
-    originals = {b: b.validate_typed_dict for b in binders}
-    base_orig = next(iter(originals.values()))
-
-    def _filtered_validate(schema, data):
-        if isinstance(data, dict):
-            data = {
-                k: v
-                for k, v in data.items() if k not in _PROCESSOR_OUTPUT_KEYS
-            }
-        return base_orig(schema, data)
-
-    for b in binders:
-        b.validate_typed_dict = _filtered_validate
+    module_path, kwargs_cls_name = target
     try:
-        yield
-    finally:
-        for b, orig in originals.items():
-            b.validate_typed_dict = orig
+        import importlib
+        module = importlib.import_module(module_path)
+        kwargs_cls = getattr(module, kwargs_cls_name)
+    except (ImportError, AttributeError) as e:
+        logger.warning(
+            "install_qwen_vl_processor_defaults_fix: could not load %s.%s "
+            "(%s); leaving processor unpatched.", module_path, kwargs_cls_name,
+            e)
+        return False
+
+    # Scrub any already-leaked output keys from the class-level _defaults so
+    # the next _merge_kwargs call doesn't trip TypedDict validation on stale
+    # pollution from an earlier unpatched processor instance.
+    for modality_key in ("images_kwargs", "videos_kwargs", "common_kwargs"):
+        modality_defaults = kwargs_cls._defaults.get(modality_key)
+        if isinstance(modality_defaults, dict):
+            for leaked in _QWEN_VL_PROCESSOR_OUTPUT_KEYS:
+                modality_defaults.pop(leaked, None)
+
+    if getattr(type(processor), "_tllm_qwen_vl_defaults_fixed", False):
+        return True  # already re-classed by a prior call
+
+    safe_cls = type(
+        f"_TLLMSafe{cls.__name__}",
+        (cls, ),
+        {
+            "_get_num_multimodal_tokens":
+            _make_safe_get_num_multimodal_tokens(kwargs_cls),
+            "_tllm_qwen_vl_defaults_fixed":
+            True,
+            "__doc__":
+            (f"{cls.__name__} with TRT-LLM defensive-copy fix in "
+             "_get_num_multimodal_tokens. See "
+             "tensorrt_llm._torch.models.modeling_multimodal_utils."
+             "install_qwen_vl_processor_defaults_fix for the rationale."),
+        },
+    )
+    processor.__class__ = safe_cls
+    return True
 
 
 def _get_uncached_multimodal_params(
