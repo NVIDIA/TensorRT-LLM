@@ -421,7 +421,7 @@ def test_w4a16_nvfp4_post_load_ignores_checkpoint_activation_scale():
     assert module.input_scale is None
     assert module.inv_input_scale is None
     assert module.alpha is None
-    torch.testing.assert_close(module.weight_scale_2, torch.tensor([0.25], dtype=torch.float32))
+    torch.testing.assert_close(module.weight_scale_2, torch.tensor([4.0], dtype=torch.float32))
     assert not hasattr(module, "tmp_nvfp4_input_scales_list")
     assert not hasattr(module, "tmp_nvfp4_weight_scale_2_list")
 

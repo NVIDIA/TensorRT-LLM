@@ -3053,16 +3053,20 @@ class NVFP4CuteDslB12xFusedMoEMethod(NVFP4CutlassFusedMoEMethod):
         w2_w_scale_2 = (module.fc2_alpha * module.fc2_input_scale).to(
             torch.float32)
 
-        w1_sf_fp8_norm = module.w3_w1_weight_scale.view(
-            torch.float8_e4m3fn).float()
-        w2_sf_fp8_norm = module.w2_weight_scale.view(
-            torch.float8_e4m3fn).float()
+        w1_sf_fp8_src = module.w3_w1_weight_scale.view(torch.float8_e4m3fn)
+        w2_sf_fp8_src = module.w2_weight_scale.view(torch.float8_e4m3fn)
+        w1_sf_fp8_norm = w1_sf_fp8_src.float()
+        w2_sf_fp8_norm = w2_sf_fp8_src.float()
 
-        # Broadcast per-expert scalar over the trailing dims (E, *).
-        bcast1 = w1_w_scale_2.view(-1, *([1] * (w1_sf_fp8_norm.dim() - 1)))
-        bcast2 = w2_w_scale_2.view(-1, *([1] * (w2_sf_fp8_norm.dim() - 1)))
-        w1_sf_fp8 = (w1_sf_fp8_norm * bcast1).to(torch.float8_e4m3fn)
-        w2_sf_fp8 = (w2_sf_fp8_norm * bcast2).to(torch.float8_e4m3fn)
+        if is_w4a16_nvfp4:
+            w1_sf_fp8 = w1_sf_fp8_src
+            w2_sf_fp8 = w2_sf_fp8_src
+        else:
+            # Broadcast per-expert scalar over the trailing dims (E, *).
+            bcast1 = w1_w_scale_2.view(-1, *([1] * (w1_sf_fp8_norm.dim() - 1)))
+            bcast2 = w2_w_scale_2.view(-1, *([1] * (w2_sf_fp8_norm.dim() - 1)))
+            w1_sf_fp8 = (w1_sf_fp8_norm * bcast1).to(torch.float8_e4m3fn)
+            w2_sf_fp8 = (w2_sf_fp8_norm * bcast2).to(torch.float8_e4m3fn)
 
         w1_sf_b12x = convert_sf_to_mma_layout(w1_sf_fp8,
                                               m=w3w1_out_dim,
@@ -3075,18 +3079,18 @@ class NVFP4CuteDslB12xFusedMoEMethod(NVFP4CutlassFusedMoEMethod):
 
         if is_w4a16_nvfp4:
             # W4A16 path: BF16/FP16 activations multiplied by FP4 weights.
-            # There is no online activation quantization, so the wrapper uses
-            # ``w*_alpha`` only as FC1/FC2 epilogue dequant multipliers.
-            # Since we still un-normalize FP8 block scales by weight_scale_2
-            # above, alpha is unity. ``fc2_input_scale`` is ignored in this
-            # FlashInfer mode.
-            alpha_device = module.w3_w1_weight.device
-            w1_alpha_b12x = torch.ones(module.num_experts,
-                                       dtype=torch.float32,
-                                       device=alpha_device)
-            w2_alpha_b12x = torch.ones(module.num_experts,
-                                       dtype=torch.float32,
-                                       device=alpha_device)
+            # FlashInfer's W4A16 packer expects the ModelOpt scale contract:
+            # normalized FP8 block scales plus per-expert ``weight_global_scale``.
+            # TRT-LLM stores the reciprocal as ``weight_scale_2``; recover the
+            # ModelOpt value from the already computed dequant scale.
+            def _to_modelopt_global_scale(scale: torch.Tensor) -> torch.Tensor:
+                global_scale = torch.zeros_like(scale, dtype=torch.float32)
+                valid = scale > 0
+                global_scale[valid] = scale[valid].reciprocal()
+                return global_scale.contiguous()
+
+            w1_alpha_b12x = _to_modelopt_global_scale(w1_w_scale_2)
+            w2_alpha_b12x = _to_modelopt_global_scale(w2_w_scale_2)
             fc2_input_scale_b12x = None
         else:
             w1_alpha_b12x = ((1.0 / module.fc31_input_scale).expand(

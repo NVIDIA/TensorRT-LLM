@@ -252,7 +252,7 @@ def test_w4a16_nvfp4_prefill_quantize_input_stays_on_b12x():
     assert out_sf is None
 
 
-def test_w4a16_nvfp4_post_load_constructs_b12x_w4a16_wrapper(monkeypatch):
+def test_w4a16_nvfp4_post_load_uses_modelopt_scale_contract(monkeypatch):
     class _RoutingMethod:
         experts_per_token = 4
 
@@ -299,22 +299,24 @@ def test_w4a16_nvfp4_post_load_constructs_b12x_w4a16_wrapper(monkeypatch):
         padded_intermediate_size // 16,
         dtype=torch.int64,
     )
-    module.w3_w1_weight_scale = torch.ones(
+    w3_w1_weight_scale = torch.ones(
         num_experts,
         2 * padded_intermediate_size,
         hidden_size // 16,
         dtype=torch.float8_e4m3fn,
     )
-    module.w2_weight_scale = torch.ones(
+    w2_weight_scale = torch.ones(
         num_experts,
         hidden_size,
         padded_intermediate_size // 16,
         dtype=torch.float8_e4m3fn,
     )
-    module.fc31_alpha = torch.ones(num_experts)
-    module.fc2_alpha = torch.ones(num_experts)
-    module.fc31_input_scale = torch.ones(())
-    module.fc2_input_scale = torch.ones(())
+    module.w3_w1_weight_scale = w3_w1_weight_scale.clone()
+    module.w2_weight_scale = w2_weight_scale.clone()
+    module.fc31_alpha = torch.tensor([0.25, 0.5], dtype=torch.float32)
+    module.fc2_alpha = torch.tensor([0.125, 0.25], dtype=torch.float32)
+    module.fc31_input_scale = torch.tensor(2.0, dtype=torch.float32)
+    module.fc2_input_scale = torch.tensor(4.0, dtype=torch.float32)
 
     with patch.object(NVFP4CutlassFusedMoEMethod, "post_load_weights", return_value=None):
         NVFP4CuteDslB12xFusedMoEMethod().post_load_weights(module)
@@ -324,8 +326,22 @@ def test_w4a16_nvfp4_post_load_constructs_b12x_w4a16_wrapper(monkeypatch):
     assert wrapper_kwargs.get("quant_mode") == "w4a16", wrapper_kwargs
     assert wrapper_kwargs["intermediate_size"] == padded_intermediate_size
     assert module._b12x_weights["fc2_input_scale"] is None
-    assert torch.equal(module._b12x_weights["w1_alpha"], torch.ones(num_experts))
-    assert torch.equal(module._b12x_weights["w2_alpha"], torch.ones(num_experts))
+    assert torch.equal(
+        module._b12x_weights["w1_weight_sf"].float(),
+        w3_w1_weight_scale.float(),
+    )
+    assert torch.equal(
+        module._b12x_weights["w2_weight_sf"].float(),
+        w2_weight_scale.float(),
+    )
+    assert torch.allclose(
+        module._b12x_weights["w1_alpha"],
+        torch.tensor([2.0, 1.0], dtype=torch.float32),
+    )
+    assert torch.allclose(
+        module._b12x_weights["w2_alpha"],
+        torch.tensor([2.0, 1.0], dtype=torch.float32),
+    )
 
 
 def test_dispatch_rejects_non_tensor():
