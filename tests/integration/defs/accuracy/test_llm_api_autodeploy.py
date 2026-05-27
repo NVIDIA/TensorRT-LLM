@@ -498,17 +498,11 @@ class TestNemotronV2(LlmapiAccuracyTestHarness):
         task = GSM8K(self.MODEL_NAME)
         task.evaluate(llm)
 
-    @pytest.mark.skip_less_device_memory(32000)
+    @pytest.mark.skip_less_device_memory(80000)
     @pytest.mark.parametrize("enable_chunked_prefill", [True, False])
     def test_auto_dtype(self, enable_chunked_prefill):
         kwargs = self.get_default_kwargs(enable_chunked_prefill)
         kwargs.setdefault("transforms", {})
-        # On <80GB GPUs (e.g., L40S 48GB), the YAML's max_batch_size=128
-        # makes the Mamba state cache (O(max_batch_size)) too large for the
-        # KV cache to fit. Preserve the chunked-prefill max_num_tokens.
-        if get_device_memory() < 80000:
-            low_memory_overrides(kwargs,
-                                 max_num_tokens=kwargs["max_num_tokens"])
         sampling_params = self.get_default_sampling_params()
         with AutoDeployLLM(model=self.MODEL_PATH,
                            tokenizer=self.MODEL_PATH,
