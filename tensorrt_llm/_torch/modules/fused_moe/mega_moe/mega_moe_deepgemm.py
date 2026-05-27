@@ -283,22 +283,9 @@ class MegaMoEDeepGemm(MoE):
         self.swiglu_limit_scalar = swiglu_limit_scalar
         self.fast_math = fast_math
 
-        # Buffer sizing. MoE layers execute serially per forward; a single
-        # process-level pool sized to worst-case per-rank tokens serves all.
-        self.max_num_tokens = int(
-            getattr(model_config, "moe_max_num_tokens", 0)
-            or getattr(model_config, "max_num_tokens", 0)
-            or 4096
-        )
-        # Under attention DP, ``ModelConfig`` pre-multiplies
-        # ``moe_max_num_tokens`` by ``dp_size``. The DG SymmBuffer further
-        # scales the pool by ``num_ranks`` (= ep_size, which equals dp_size
-        # in the supported full-ADP topology asserted above). Without this
-        # divide the buffer is sized as ``dp_size * ep_size *
-        # max_num_tokens``, doubling the EP factor and exploding HBM (see
-        # ``layout::Workspace`` / ``get_num_max_pool_tokens`` in DG).
-        if self.use_dp and self.ep_size > 1:
-            self.max_num_tokens = max(1, (self.max_num_tokens + self.ep_size - 1) // self.ep_size)
+        # FUSED_COMM scheduler strips x to per-rank before run_moe, so the cap is
+        # the engine's max_num_tokens (not the dp_size-multiplied moe_max_num_tokens).
+        self.max_num_tokens = int(getattr(model_config, "max_num_tokens", 0) or 4096)
 
         # Resolve the EP ProcessGroup at module construction — creating a
         # group at forward time would be collective on a non-synchronous
