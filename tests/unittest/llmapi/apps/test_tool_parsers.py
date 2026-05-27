@@ -32,6 +32,8 @@ from tensorrt_llm.serve.tool_parser.glm4_parser import Glm4ToolParser
 from tensorrt_llm.serve.tool_parser.glm47_parser import Glm47ToolParser
 from tensorrt_llm.serve.tool_parser.kimi_k2_tool_parser import KimiK2ToolParser
 from tensorrt_llm.serve.tool_parser.minimax_m2_parser import MiniMaxM2ToolParser
+from tensorrt_llm.serve.tool_parser.poolside_v1_parser import \
+    PoolsideV1ToolParser
 from tensorrt_llm.serve.tool_parser.qwen3_coder_parser import \
     Qwen3CoderToolParser
 from tensorrt_llm.serve.tool_parser.qwen3_tool_parser import Qwen3ToolParser
@@ -2325,6 +2327,257 @@ class TestGlm47ToolParserFactory:
             ToolParserFactory
         parser = ToolParserFactory.create_tool_parser("glm47")
         assert isinstance(parser, Glm47ToolParser)
+
+
+# ============================================================================
+# PoolsideV1ToolParser Tests
+# ============================================================================
+
+
+class TestPoolsideV1ToolParser(BaseToolParserTestClass):
+    """Test suite for Poolside Laguna v1 tool calls."""
+
+    def make_parser(self):
+        return PoolsideV1ToolParser()
+
+    def make_tool_parser_test_cases(self):
+        return ToolParserTestCases(
+            has_tool_call_true=("Some text <tool_call>get_weather\n"
+                                "<arg_key>location</arg_key>\n"
+                                "<arg_value>NYC</arg_value>\n"
+                                "</tool_call>"),
+            detect_and_parse_single_tool=(
+                ("Normal text\n"
+                 "<tool_call>get_weather\n"
+                 "<arg_key>location</arg_key>\n"
+                 "<arg_value>NYC</arg_value>\n"
+                 "</tool_call>"),
+                "Normal text",
+                "get_weather",
+                {
+                    "location": "NYC"
+                },
+            ),
+            detect_and_parse_multiple_tools=(
+                ("<tool_call>get_weather\n"
+                 "<arg_key>location</arg_key>\n"
+                 "<arg_value>LA</arg_value>\n"
+                 "</tool_call>\n"
+                 "<tool_call>search_web\n"
+                 "<arg_key>query</arg_key>\n"
+                 "<arg_value>AI</arg_value>\n"
+                 "</tool_call>"),
+                ("get_weather", "search_web"),
+            ),
+            detect_and_parse_malformed_tool=("<tool_call>get_weather\n"
+                                             "<arg_key>location</arg_key>\n"
+                                             "<arg_value>NYC</arg_value>"),
+            detect_and_parse_with_parameters_key=(
+                ("<tool_call>search_web\n"
+                 "<arg_key>query</arg_key>\n"
+                 "<arg_value>test</arg_value>\n"
+                 "</tool_call>"),
+                "search_web",
+                {
+                    "query": "test"
+                },
+            ),
+            parse_streaming_increment_partial_bot_token="<tool",
+            undefined_tool=("<tool_call>undefined_func\n"
+                            "<arg_key>arg</arg_key>\n"
+                            "<arg_value>value</arg_value>\n"
+                            "</tool_call>"),
+        )
+
+    def test_initialization(self, parser):
+        assert parser.bot_token == "<tool_call>"
+        assert parser.eot_token == "</tool_call>"
+        assert parser.supports_structural_tag() is False
+
+    def test_no_newline_format(self, sample_tools, parser):
+        text = ("<tool_call>get_weather"
+                "<arg_key>location</arg_key>"
+                "<arg_value>Tokyo</arg_value>"
+                "</tool_call>")
+
+        result = parser.detect_and_parse(text, sample_tools)
+
+        assert len(result.calls) == 1
+        assert result.calls[0].name == "get_weather"
+        assert json.loads(result.calls[0].parameters) == {"location": "Tokyo"}
+
+    def test_zero_arg_tool_call(self, parser):
+        tools = [
+            ChatCompletionToolsParam(
+                type="function",
+                function=FunctionDefinition(
+                    name="get_time",
+                    description="Get current time",
+                    parameters={
+                        "type": "object",
+                        "properties": {},
+                    },
+                ),
+            )
+        ]
+        text = "<tool_call>get_time</tool_call>"
+
+        result = parser.detect_and_parse(text, tools)
+
+        assert len(result.calls) == 1
+        assert result.calls[0].name == "get_time"
+        assert json.loads(result.calls[0].parameters) == {}
+
+    def test_detect_and_parse_preserves_suffix(self, sample_tools, parser):
+        text = ("prefix "
+                "<tool_call>get_weather\n"
+                "<arg_key>location</arg_key>\n"
+                "<arg_value>NYC</arg_value>\n"
+                "</tool_call>"
+                " suffix")
+
+        result = parser.detect_and_parse(text, sample_tools)
+
+        assert "prefix" in result.normal_text
+        assert "suffix" in result.normal_text
+        assert len(result.calls) == 1
+
+    def test_schema_aware_argument_coercion(self, parser):
+        tools = [
+            ChatCompletionToolsParam(
+                type="function",
+                function=FunctionDefinition(
+                    name="set_values",
+                    description="Set typed values",
+                    parameters={
+                        "type": "object",
+                        "properties": {
+                            "string_value": {
+                                "type": "string"
+                            },
+                            "integer_value": {
+                                "type": "integer"
+                            },
+                            "number_value": {
+                                "type": "number"
+                            },
+                            "boolean_value": {
+                                "type": "boolean"
+                            },
+                            "array_value": {
+                                "type": "array"
+                            },
+                            "object_value": {
+                                "type": "object"
+                            },
+                        },
+                    },
+                ),
+            )
+        ]
+        text = ("<tool_call>set_values\n"
+                "<arg_key>string_value</arg_key>\n"
+                "<arg_value>true</arg_value>\n"
+                "<arg_key>integer_value</arg_key>\n"
+                "<arg_value>42</arg_value>\n"
+                "<arg_key>number_value</arg_key>\n"
+                "<arg_value>3.5</arg_value>\n"
+                "<arg_key>boolean_value</arg_key>\n"
+                "<arg_value>true</arg_value>\n"
+                "<arg_key>array_value</arg_key>\n"
+                "<arg_value>[1, 2]</arg_value>\n"
+                "<arg_key>object_value</arg_key>\n"
+                '<arg_value>{"k": 1}</arg_value>\n'
+                "</tool_call>")
+
+        result = parser.detect_and_parse(text, tools)
+        params = json.loads(result.calls[0].parameters)
+
+        assert params == {
+            "string_value": "true",
+            "integer_value": 42,
+            "number_value": 3.5,
+            "boolean_value": True,
+            "array_value": [1, 2],
+            "object_value": {
+                "k": 1
+            },
+        }
+
+    def test_parse_streaming_increment_split_tags(self, sample_tools, parser):
+        result = parser.parse_streaming_increment("<tool", sample_tools)
+        assert result.normal_text == ""
+        assert len(result.calls) == 0
+
+        result = parser.parse_streaming_increment("_call>get_weather\n<arg",
+                                                  sample_tools)
+        assert len(result.calls) == 1
+        assert result.calls[0].tool_index == 0
+        assert result.calls[0].name == "get_weather"
+        assert result.calls[0].parameters == ""
+
+        result = parser.parse_streaming_increment(
+            "_key>location</arg_key>"
+            "<arg_value>SF</arg_value>"
+            "</tool_call>", sample_tools)
+        assert len(result.calls) == 1
+        assert result.calls[0].tool_index == 0
+        assert json.loads(result.calls[0].parameters) == {"location": "SF"}
+
+    def test_parse_streaming_increment_multiple_tools(self, sample_tools,
+                                                      parser):
+        result = parser.parse_streaming_increment(
+            "<tool_call>get_weather\n"
+            "<arg_key>location</arg_key>\n"
+            "<arg_value>NYC</arg_value>\n"
+            "</tool_call>"
+            "<tool_call>search_web\n"
+            "<arg_key>query</arg_key>\n"
+            "<arg_value>AI</arg_value>\n"
+            "</tool_call>",
+            sample_tools,
+        )
+
+        assert [call.name for call in result.calls if call.name] == [
+            "get_weather",
+            "search_web",
+        ]
+        assert [call.tool_index for call in result.calls if call.name] == [0, 1]
+        params = [
+            json.loads(call.parameters) for call in result.calls
+            if call.parameters
+        ]
+        assert params == [{"location": "NYC"}, {"query": "AI"}]
+
+
+class TestPoolsideV1ToolParserFactory:
+    """Test that Poolside v1 parser is registered in the factory."""
+
+    def test_poolside_v1_registered(self):
+        from tensorrt_llm.serve.tool_parser.tool_parser_factory import \
+            ToolParserFactory
+        assert "poolside_v1" in ToolParserFactory.parsers
+
+    def test_create_poolside_v1_parser(self):
+        from tensorrt_llm.serve.tool_parser.tool_parser_factory import \
+            ToolParserFactory
+        parser = ToolParserFactory.create_tool_parser("poolside_v1")
+        assert isinstance(parser, PoolsideV1ToolParser)
+
+    def test_laguna_model_type_mapping(self):
+        from tensorrt_llm.serve.tool_parser.tool_parser_factory import \
+            MODEL_TYPE_TO_TOOL_PARSER
+        assert MODEL_TYPE_TO_TOOL_PARSER["laguna"] == "poolside_v1"
+
+    def test_auto_detect_laguna(self, tmp_path):
+        from tensorrt_llm.serve.tool_parser.tool_parser_factory import \
+            resolve_auto_tool_parser
+        model_dir = tmp_path / "Laguna"
+        model_dir.mkdir()
+        (model_dir / "config.json").write_text(
+            json.dumps({"model_type": "laguna"}))
+
+        assert resolve_auto_tool_parser(str(model_dir)) == "poolside_v1"
 
 
 # ============================================================================
