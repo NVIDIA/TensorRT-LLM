@@ -1963,10 +1963,14 @@ def gvr_topk_decode(
     # (e.g. =3 for a graph-safe single-kernel pick).
     # ────────────────────────────────────────────────────────────────────
     if min_blocks_per_mp is None:
-        # vec_bits depends on use_256bit_load; vec_w_host = vec_bits / dtype_bits
+        # vec_bits depends on use_256bit_load; vec_w_host = vec_bits / dtype_bits.
+        # Use N_dec (= max_seq_len if provided, else logits.shape[1]) for the
+        # same reason as the (T, V) heuristic above: in graph mode small
+        # capture-time N would stick this in tier-0 (mb=0) and stay there for
+        # large-N replays.
         vec_bits_host = 256 if use_256bit_load else 128
         vec_w_host = vec_bits_host // (32 if logits.dtype == torch.float32 else 16)
-        n_vec_iters = max(1, logits.shape[1] // (num_threads_per_block * vec_w_host))
+        n_vec_iters = max(1, N_dec // (num_threads_per_block * vec_w_host))
         if n_vec_iters < 4:
             min_blocks_per_mp = 0  # no launch_bounds — natural ptxas allocation
         elif num_rows <= num_sms:
