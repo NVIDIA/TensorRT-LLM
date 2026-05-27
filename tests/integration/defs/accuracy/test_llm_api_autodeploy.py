@@ -35,22 +35,6 @@ _AD_CONFIGS_DIR = (Path(get_llm_root()) / 'examples' / 'auto_deploy' /
                    'model_registry' / 'configs')
 _AD_MODEL_REGISTRY_DIR = Path(
     get_llm_root()) / 'examples' / 'auto_deploy' / 'model_registry'
-_PIECEWISE_COMPILE_BACKENDS = {"torch-cudagraph", "torch-opt"}
-
-
-def _disable_piecewise_for_non_piecewise_backend(config: dict,
-                                                 compile_backend: str) -> None:
-    if compile_backend in _PIECEWISE_COMPILE_BACKENDS:
-        return
-    config.setdefault("transforms",
-                      {}).setdefault("compile_model",
-                                     {})["piecewise_enabled"] = False
-
-
-def _disable_piecewise(config: dict) -> None:
-    config.setdefault("transforms",
-                      {}).setdefault("compile_model",
-                                     {})["piecewise_enabled"] = False
 
 
 def _load_ad_config(config_name):
@@ -284,8 +268,6 @@ class TestLlama3_1_8B(LlmapiAccuracyTestHarness):
                 },
             },
         }
-        _disable_piecewise_for_non_piecewise_backend(
-            config, backend_cfg["compile_backend"])
         if enable_chunked_prefill:
             config["enable_chunked_prefill"] = True
             # NOTE: must be > max(tokens_per_block, max_batch_size)
@@ -387,7 +369,9 @@ class TestLlama3_1_8B_Instruct_Eagle3(LlmapiAccuracyTestHarness):
                 "torch_dtype": "bfloat16"
             },
         }
-        _disable_piecewise(kwargs)
+        kwargs.setdefault("transforms",
+                          {}).setdefault("compile_model",
+                                         {})["piecewise_enabled"] = False
 
         return kwargs
 
@@ -675,7 +659,9 @@ class TestNemotronSuperV3(LlmapiAccuracyTestHarness):
         kwargs.setdefault("transforms", {}).setdefault(
             "detect_sharding", {})["enable_attention_dp"] = enable_attention_dp
         if enable_attention_dp:
-            _disable_piecewise(kwargs)
+            kwargs.setdefault("transforms",
+                              {}).setdefault("compile_model",
+                                             {})["piecewise_enabled"] = False
 
         print_memory_usage("test start")
         with AutoDeployLLM(model=model_path,
@@ -760,7 +746,6 @@ class TestNemotronSuperV3(LlmapiAccuracyTestHarness):
         # TODO: Fix. See: https://github.com/NVIDIA/TensorRT-LLM/issues/13133
         if attn_backend != "trtllm":
             kwargs["compile_backend"] = "torch-simple"
-            _disable_piecewise(kwargs)
 
         print(
             f"SuperV3 MTP params: world_size={world_size}, model_path={model_path}"

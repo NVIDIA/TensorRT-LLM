@@ -611,20 +611,6 @@ _SMALL_MODEL_CONFIGS = {
     },
 }
 
-_PIECEWISE_COMPILE_BACKENDS = {"torch-cudagraph", "torch-opt"}
-
-
-def _disable_piecewise_for_non_piecewise_backend(llm_args: Dict[str, Any]) -> None:
-    transforms = llm_args.get("transforms", {})
-    compile_model = transforms.get("compile_model", {})
-    compile_backend = llm_args.get("compile_backend", compile_model.get("backend"))
-    if compile_backend is None or compile_backend in _PIECEWISE_COMPILE_BACKENDS:
-        return
-
-    transforms = llm_args.setdefault("transforms", {})
-    compile_model = transforms.setdefault("compile_model", {})
-    compile_model.setdefault("piecewise_enabled", False)
-
 
 def get_small_model_config(model_hub_id: str, **llm_args_kwargs) -> Dict[str, Any]:
     """
@@ -658,7 +644,6 @@ def get_small_model_config(model_hub_id: str, **llm_args_kwargs) -> Dict[str, An
     llm_args["cuda_graph_config"] = {"max_batch_size": 2}  # Match max_batch_size
     # update with custom llm_args kwargs
     llm_args.update(llm_args_kwargs)
-    _disable_piecewise_for_non_piecewise_backend(llm_args)
 
     # add a couple of other defaults to the experiment config
     experiment_config = {
