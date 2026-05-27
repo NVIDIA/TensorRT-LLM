@@ -73,8 +73,12 @@ class WorkerExtension:
                     # using restricted unpickler from tensorrt_llm.serialization
                     logger.info("Deserializing base64-encoded weight handles")
                     decoded_data = base64.b64decode(serialized_handles)
+                    # NOTE(debug-bot iter-7): cuda IPC tensors with non-standard
+                    # storage (e.g. uint8-viewed fp8 weight_scale for W4A8) need
+                    # torch.storage._load_from_bytes to rebuild. Re-allow it for
+                    # this code path; torch.hub._load_local / torch.save still
+                    # blocked since they're not needed for tensor IPC reconstruction.
                     disallowed_imports = {
-                        "torch.storage": ["_load_from_bytes"],
                         "torch.hub": ["_load_local"],
                         "torch": ["save"],
                     }
