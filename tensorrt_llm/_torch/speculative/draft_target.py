@@ -320,44 +320,69 @@ class DraftTargetOneModelWorker(SpecWorkerBase):
         CPU.  If a multi-token verify window accepts an end_id in the middle,
         the offload request must use that end_id as the last accepted token
         instead of stepping past it.
+
+        Vectorized on GPU so the hot decode path pays one small H->D for
+        ``end_ids`` instead of (rows * 3) host<->device .item()/.numel() syncs.
         """
         end_ids = getattr(spec_metadata, "end_ids", None)
         if not end_ids:
             return num_accepted_tokens
 
-        new_counts = num_accepted_tokens.clone()
-        changes = []
         rows = min(int(batch_size), int(accepted_tokens.shape[0]), len(end_ids))
         width = int(accepted_tokens.shape[1])
-        for row in range(rows):
-            end_id = int(end_ids[row])
-            if end_id < 0:
-                continue
-            count = max(0, min(int(new_counts[row].item()), width))
-            if count == 0:
-                continue
-            matches = (accepted_tokens[row, :count] == end_id).nonzero(as_tuple=False)
-            if int(matches.numel()) == 0:
-                continue
-            truncated_count = int(matches[0].item()) + 1
-            if truncated_count < count:
-                new_counts[row] = truncated_count
-                changes.append(
-                    {
-                        "row": int(row),
-                        "end_id": int(end_id),
-                        "old_count": int(count),
-                        "new_count": int(truncated_count),
-                    }
-                )
+        if rows == 0:
+            return num_accepted_tokens
 
-        if changes:
-            _pearl_log(
-                "target",
-                "accepted_terminal_truncated",
-                changes=changes,
-                request_ids=[int(r) for r in getattr(spec_metadata, "request_ids", [])],
-            )
+        device = accepted_tokens.device
+        end_ids_gpu = torch.tensor(
+            [int(v) for v in end_ids[:rows]], device=device, dtype=accepted_tokens.dtype
+        )
+
+        # match_mask[row, col] = True iff accepted_tokens[row, col] == end_id[row]
+        # restricted to col < num_accepted_tokens[row] and end_id[row] >= 0.
+        rows_view = accepted_tokens[:rows]  # (rows, width)
+        match = rows_view == end_ids_gpu.unsqueeze(1)
+        col_idx = torch.arange(width, device=device).unsqueeze(0)  # (1, width)
+        counts_clamped = torch.clamp(num_accepted_tokens[:rows], min=0, max=width).unsqueeze(1)
+        within_count = col_idx < counts_clamped
+        end_id_valid = (end_ids_gpu >= 0).unsqueeze(1)
+        match = match & within_count & end_id_valid  # (rows, width) bool
+
+        any_match = match.any(dim=1)  # (rows,) bool
+        # argmax on bool: first True wins (True > False). When the whole row is
+        # False, argmax returns 0; we mask that away with any_match.
+        first_col = match.to(torch.int32).argmax(dim=1)
+        truncated = first_col + 1
+
+        orig_counts = num_accepted_tokens[:rows]
+        should_truncate = any_match & (truncated < orig_counts)
+        new_head = torch.where(should_truncate, truncated.to(orig_counts.dtype), orig_counts)
+        new_counts = num_accepted_tokens.clone()
+        new_counts[:rows] = new_head
+
+        if _pearl_trace_enabled("target"):
+            # Slow path: only sync when someone reads the trace.
+            should_mask = should_truncate.detach().cpu().tolist()
+            changed_rows = [i for i, flag in enumerate(should_mask) if flag]
+            if changed_rows:
+                old_counts_cpu = orig_counts.detach().cpu().tolist()
+                new_counts_cpu = new_head.detach().cpu().tolist()
+                end_ids_cpu = end_ids[:rows]
+                changes = [
+                    {
+                        "row": int(i),
+                        "end_id": int(end_ids_cpu[i]),
+                        "old_count": int(old_counts_cpu[i]),
+                        "new_count": int(new_counts_cpu[i]),
+                    }
+                    for i in changed_rows
+                ]
+                _pearl_log(
+                    "target",
+                    "accepted_terminal_truncated",
+                    changes=changes,
+                    request_ids=[int(r) for r in getattr(spec_metadata, "request_ids", [])],
+                )
         return new_counts
 
     def forward(
@@ -633,65 +658,51 @@ class DraftTargetOneModelWorker(SpecWorkerBase):
                 int(getattr(attn_metadata, "num_contexts", 0)) if attn_metadata is not None else 0
             )
             raw_per_request_positions = per_request_positions.clone()
-            raw_positions = [int(v) for v in raw_per_request_positions.detach().cpu().tolist()]
-            accepted_counts = [
-                int(v) for v in num_accepted_tokens.reshape(-1).detach().cpu().tolist()
-            ]
             is_pearl = bool(
                 spec_metadata is not None and spec_metadata.spec_dec_mode.is_pearl_one_model()
             )
+            # PEARL: position is the exact position of the token carried in
+            # this packet. Context rows = raw + 1 (target's sampled token sits
+            # one slot past last prompt position). Generation rows = raw -
+            # max_draft_len + clamp(accepted_count, 1, max_draft_len) -- TRT-LLM
+            # points position_ids at the last draft input in the verify window,
+            # so we walk back to the K-th accepted slot.
+            # Legacy draft-target offload: position is the slot immediately
+            # *before* the carried token. Context rows = raw, generation rows
+            # use accepted_count - 1 clamped to [0, max_draft_len].
+            #
+            # Both adjustments are pure tensor ops over per-row scalars, so we
+            # do them entirely on GPU and avoid the ~3 host<->device syncs/step
+            # that an int-list round trip would incur. Same goes for the
+            # trace-log fields below.
+            acc_cnt = num_accepted_tokens.reshape(-1)[: int(batch_size)]
+            mdl = int(self.max_draft_len)
             if is_pearl:
-                # PEARL's draft server interprets ``position`` as the exact
-                # position of the token carried in this packet.
-                #
-                # Context rows: raw position is the last prompt position; the
-                # sampled target token is at raw + 1.
-                #
-                # Generation rows: TRT-LLM's position_ids point at the last draft
-                # input in the verify window.  If raw is P+gamma and target
-                # returns the token at accepted count K, then the exact token
-                # position is P+K = raw - gamma + K.
-                adjusted_positions = []
-                for row, raw_pos in enumerate(raw_positions):
-                    if row < num_contexts:
-                        adjusted_positions.append(raw_pos + 1)
-                        continue
-                    accepted_count = max(
-                        1,
-                        min(int(self.max_draft_len), int(accepted_counts[row])),
-                    )
-                    adjusted_positions.append(
-                        max(0, raw_pos - int(self.max_draft_len) + accepted_count)
-                    )
+                acc_clamped = torch.clamp(acc_cnt, min=1, max=mdl)
+                gen_adj = torch.clamp(raw_per_request_positions - mdl + acc_clamped, min=0)
+                ctx_adj = raw_per_request_positions + 1
                 position_semantics = "exact_token_position"
             else:
-                # Legacy draft-target offload path: ``position`` is the token
-                # position immediately before the carried target token.
-                adjusted_positions = []
-                for row, raw_pos in enumerate(raw_positions):
-                    if row < num_contexts:
-                        adjusted_positions.append(raw_pos)
-                        continue
-                    accepted_draft_tokens = max(
-                        0,
-                        min(int(self.max_draft_len), int(accepted_counts[row]) - 1),
-                    )
-                    adjusted_positions.append(
-                        max(0, raw_pos - int(self.max_draft_len) + accepted_draft_tokens)
-                    )
+                acc_clamped = torch.clamp(acc_cnt - 1, min=0, max=mdl)
+                gen_adj = torch.clamp(raw_per_request_positions - mdl + acc_clamped, min=0)
+                ctx_adj = raw_per_request_positions
                 position_semantics = "previous_token_position"
-            per_request_positions = torch.tensor(
-                adjusted_positions, dtype=torch.int64, device=logits.device
-            )
+            row_idx = torch.arange(int(batch_size), device=logits.device, dtype=torch.int64)
+            is_ctx = row_idx < num_contexts
+            per_request_positions = torch.where(is_ctx, ctx_adj, gen_adj).to(torch.int64)
             if _pearl_trace_enabled("target"):
+                # Pay the syncs only when someone is reading the trace.
+                raw_positions = [int(v) for v in raw_per_request_positions.detach().cpu().tolist()]
+                accepted_counts = [int(v) for v in acc_cnt.detach().cpu().tolist()]
+                adjusted_positions = [int(v) for v in per_request_positions.detach().cpu().tolist()]
                 _pearl_log(
                     "target",
                     "offload_position_resolved",
                     raw_positions=raw_positions,
                     positions=adjusted_positions,
-                    accepted_token_counts=accepted_counts[: int(batch_size)],
+                    accepted_token_counts=accepted_counts,
                     num_contexts=int(num_contexts),
-                    max_draft_len=int(self.max_draft_len),
+                    max_draft_len=mdl,
                     position_semantics=position_semantics,
                 )
 

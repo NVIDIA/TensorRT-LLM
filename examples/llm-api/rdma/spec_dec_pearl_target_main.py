@@ -140,6 +140,28 @@ def main() -> int:
             "large per-token Python/launch overhead gap on multi-layer models."
         ),
     )
+    ap.add_argument(
+        "--nsys-profile",
+        dest="nsys_profile",
+        action="store_true",
+        default=False,
+        help=(
+            "Wrap the measured llm.generate(...) call with "
+            "torch.cuda.profiler.start()/stop(). Pair with "
+            "`nsys profile --capture-range=cudaProfilerApi ...` to record only "
+            "the steady-state inference (skips model load, CUDA graph capture, "
+            "and warmup)."
+        ),
+    )
+    ap.add_argument(
+        "--attn-backend",
+        dest="attn_backend",
+        default=None,
+        help=(
+            "Override LLM's default attention backend (e.g. TRTLLM, FLASHINFER, "
+            "FLASHATTENTION). Left empty means LLM picks its default."
+        ),
+    )
     args = ap.parse_args()
     if args.trace_log:
         os.environ["PEARL_TARGET_TRACE_PATH"] = args.trace_log
@@ -307,6 +329,8 @@ def main() -> int:
         )
         if not args.cuda_graph:
             llm_kwargs["cuda_graph_config"] = None
+        if args.attn_backend:
+            llm_kwargs["attn_backend"] = args.attn_backend
         llm = LLM(**llm_kwargs)
 
     if early_init_thread is not None:
@@ -352,8 +376,16 @@ def main() -> int:
         top_p=1.0,
     )
     pearl_trace_log("target", "run_start", **run_metadata)
+    if args.nsys_profile:
+        import torch
+
+        torch.cuda.profiler.start()
     start_time = time.perf_counter()
-    outputs = llm.generate([generation_input], sampling_params=sampling)
+    try:
+        outputs = llm.generate([generation_input], sampling_params=sampling)
+    finally:
+        if args.nsys_profile:
+            torch.cuda.profiler.stop()
     elapsed = max(time.perf_counter() - start_time, 1e-9)
     out = outputs[0].outputs[0]
     generated_tokens = len(out.token_ids)

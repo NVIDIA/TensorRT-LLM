@@ -24,6 +24,8 @@ RESPONSE_TIMEOUT_S="${RESPONSE_TIMEOUT_S:-30}"
 PROMPT="${PROMPT:-请讲一个约5000字的中文故事，要求情节完整、人物清楚、语言自然。}"
 CUDA_GRAPH="${CUDA_GRAPH:-0}"
 TRACE="${TRACE:-1}"
+NSYS="${NSYS:-0}"
+NSYS_OUT="${NSYS_OUT:-${OUT_DIR}/pearl_phase2}"
 
 TARGET_TRACE_LOG="${TARGET_TRACE_LOG:-${OUT_DIR}/target_trace.jsonl}"
 DRAFT_TRACE_LOG="${DRAFT_TRACE_LOG:-${OUT_DIR}/draft_trace.jsonl}"
@@ -57,6 +59,7 @@ echo "warmup_tokens: ${WARMUP_TOKENS}"
 echo "response_timeout_s: ${TLLM_RDMA_DRAFT_OFFLOAD_RESPONSE_TIMEOUT_S}"
 echo "cuda_graph: ${CUDA_GRAPH}"
 echo "trace: ${TRACE}"
+echo "nsys: ${NSYS}"
 
 EXTRA_ARGS=()
 if [[ "${CUDA_GRAPH}" == "1" || "${CUDA_GRAPH}" == "true" ]]; then
@@ -65,8 +68,28 @@ fi
 if [[ "${TRACE}" == "1" || "${TRACE}" == "true" ]]; then
   EXTRA_ARGS+=(--trace-log "${TARGET_TRACE_LOG}")
 fi
+if [[ -n "${ATTN_BACKEND:-}" ]]; then
+  EXTRA_ARGS+=(--attn-backend "${ATTN_BACKEND}")
+fi
 
-python3 examples/llm-api/rdma/spec_dec_pearl_target_main.py \
+LAUNCHER=()
+if [[ "${NSYS}" == "1" || "${NSYS}" == "true" ]]; then
+  # cudaProfilerStart in the launcher process does NOT cover MPI worker
+  # processes (workers spawn from a different proc tree and never see the
+  # API call). Use a time-window capture instead: skip the long setup
+  # (~5 min for 70B model load + CUDA graph capture + app warmup) and
+  # record ~25s spanning the measured run.
+  LAUNCHER=(nsys profile
+    -t cuda,nvtx,osrt
+    -o "${NSYS_OUT}"
+    --delay=${NSYS_DELAY:-280}
+    --duration=${NSYS_DURATION:-30}
+    --capture-range=none
+    --force-overwrite=true)
+  echo "nsys_out: ${NSYS_OUT}.nsys-rep (delay=${NSYS_DELAY:-280}s duration=${NSYS_DURATION:-30}s)"
+fi
+
+"${LAUNCHER[@]}" python3 examples/llm-api/rdma/spec_dec_pearl_target_main.py \
   --target-model "${TARGET_MODEL}" \
   --draft-model "${DRAFT_MODEL}" \
   --draft-host "${DRAFT_HOST}" \
