@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import tempfile
 from collections import defaultdict
 from dataclasses import is_dataclass
@@ -2010,6 +2013,30 @@ class TestSkipSoftmaxAttentionConfig:
         assert cfg.threshold_scale_factor_prefill == pytest.approx(0.001)
         assert cfg.threshold_scale_factor_decode == pytest.approx(0.002)
 
+    def test_resolve_target_sparsity_preserves_stat_log_path(self, tmp_path):
+        import math
+
+        from tensorrt_llm.llmapi.llm_args import SkipSoftmaxAttentionConfig
+
+        formula = {
+            'prefill': {
+                'a': 7e-5,
+                'b': 7.929109
+            },
+            'decode': {
+                'a': 7e-5,
+                'b': 16.9025
+            },
+        }
+        stat_log_path = str(tmp_path / "stat.json")
+        cfg = SkipSoftmaxAttentionConfig(target_sparsity=0.3,
+                                         stat_log_path=stat_log_path)
+        resolved = cfg.resolve_for_target_sparsity(formula)
+
+        assert resolved.stat_log_path == stat_log_path
+        assert resolved.threshold_scale_factor_prefill == pytest.approx(
+            7e-5 * math.exp(7.929109 * 0.3))
+
     def test_stat_log_path_default_none(self):
         from tensorrt_llm.llmapi.llm_args import SkipSoftmaxAttentionConfig
 
@@ -2021,9 +2048,9 @@ class TestSkipSoftmaxAttentionConfig:
                                                   SkipSoftmaxAttentionConfig,
                                                   TorchLlmArgs)
 
-        cfg = SkipSoftmaxAttentionConfig(threshold_scale_factor=0.001,
-                                         stat_log_path=str(tmp_path /
-                                                            "stat.json"))
+        cfg = SkipSoftmaxAttentionConfig(
+            threshold_scale_factor=0.001,
+            stat_log_path=str(tmp_path / "stat.json"))
         with pytest.raises(
                 ValueError,
                 match="stat_log_path is incompatible with CUDA graphs"):
@@ -2035,9 +2062,9 @@ class TestSkipSoftmaxAttentionConfig:
         from tensorrt_llm.llmapi.llm_args import (SkipSoftmaxAttentionConfig,
                                                   TorchLlmArgs)
 
-        cfg = SkipSoftmaxAttentionConfig(threshold_scale_factor=0.001,
-                                         stat_log_path=str(tmp_path /
-                                                            "stat.json"))
+        cfg = SkipSoftmaxAttentionConfig(
+            threshold_scale_factor=0.001,
+            stat_log_path=str(tmp_path / "stat.json"))
         # User must explicitly disable CUDA graphs to collect stats; the
         # default cuda_graph_config auto-generates batch_sizes which would
         # otherwise trip the cross-config validator.

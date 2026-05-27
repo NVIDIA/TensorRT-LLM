@@ -1,13 +1,16 @@
 #!/usr/bin/env python3
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Render the kernel microbench CSVs into a single markdown report.
 
-Reads ``pass1_sparsity.csv`` (skipped/total per shape × threshold) and
-``pass2_speedup.csv`` (median latency per shape × threshold), joins them,
+Reads ``pass1_sparsity.csv`` (skipped/total per shape x threshold) and
+``pass2_speedup.csv`` (median latency per shape x threshold), joins them,
 and emits a markdown file with one summary table per config plus a
 sparsity-vs-speedup scatter (matplotlib PNG when available, otherwise a
 text table).
 
-The report is intentionally not committed — store output under
+The report is intentionally not committed; store output under
 ``work/skip-softmax-stat/<date>/`` per the user's instructions.
 """
 
@@ -94,7 +97,7 @@ def render_markdown(joined: Dict[str, List[Dict[str, str]]], out_md: Path,
         "`_skipSoftmaxStat` cubin family; pass 2 measures latency on the "
         "production `_skipSoftmax` family. Inputs are random tensors so the "
         "achieved sparsity does not match the calibrated curves in blog 16 "
-        "or the wan22 calibration doc — the relationship between achieved "
+        "or the wan22 calibration doc - the relationship between achieved "
         "sparsity and kernel speedup is what we are characterising.")
     lines.append("")
     if plot_png.exists():
@@ -117,18 +120,18 @@ def render_markdown(joined: Dict[str, List[Dict[str, str]]], out_md: Path,
             try:
                 sp_pct = f"{float(sp) * 100:.2f} %"
             except (ValueError, TypeError):
-                sp_pct = "—"
+                sp_pct = "-"
             lat = r.get("elapsed_us_median", "") or ""
             spd = r.get("speedup", "") or ""
             try:
                 lat_str = f"{float(lat):.2f}"
             except (ValueError, TypeError):
-                lat_str = "—"
+                lat_str = "-"
             try:
                 spd_str = f"{float(spd):.3f}x"
             except (ValueError, TypeError):
-                spd_str = "—"
-            sk_total = f"{skipped} / {total}" if total else "—"
+                spd_str = "-"
+            sk_total = f"{skipped} / {total}" if total else "-"
             lines.append(
                 f"| {thr} | {sk_total} | {sp_pct} | {lat_str} | {spd_str} |")
         lines.append("")

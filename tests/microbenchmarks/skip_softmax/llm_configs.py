@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """LLM-shape sweep configs for the skip-softmax kernel microbench.
 
 Mirrors the "Performance Benchmark" table in
@@ -29,10 +32,10 @@ class FmhaConfig:
 
 
 # Threshold sweeps lifted directly from blog 16 §"Performance Benchmark"
-# (Qwen3-30B columns), which were calibrated to span 0% → 90% target sparsity
+# (Qwen3-30B columns), which were calibrated to span 0% -> 90% target sparsity
 # on real workloads. Random data does not produce the same achieved sparsity,
 # but the magnitude span is informative for kernel-level characterisation.
-# Clean log-spaced integer thresholds — chosen for good achieved-sparsity
+# Clean log-spaced integer thresholds - chosen for good achieved-sparsity
 # coverage on random data (the kernel skip predicate hits its transition
 # regime between ~10^4 and ~10^6 at head_dim=128 bf16).
 PREFILL_THRESHOLDS = [
@@ -72,7 +75,7 @@ def llm_configs() -> List[FmhaConfig]:
                     mask="causal",
                     threshold_sweep=list(PREFILL_THRESHOLDS),
                 ))
-    # Decode: bs=8 (lower than blog 16's 64 — fmha.exe test-bench scratch
+    # Decode: bs=8 (lower than blog 16's 64 - fmha.exe test-bench scratch
     # allocates O(B*S*S) and OOMs on H200 at higher batches), q=1,
     # kv∈{16k,64k}, dtype∈{bf16,fp8}, causal mask, GQA(64/4)
     for kv_len in (16384, 65536):

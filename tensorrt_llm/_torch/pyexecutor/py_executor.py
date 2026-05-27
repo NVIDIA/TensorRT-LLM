@@ -900,18 +900,24 @@ class PyExecutor:
         """
         Signals the server to shutdown.
         """
-        # Flush skip-softmax stat log (if any) before tearing down the worker
-        # thread and resource managers — atexit is a fallback but firing here
-        # gives the user a clean exit-success signal in trtllm-serve.
+        # Flush skip-softmax stat log before tearing down the worker thread and
+        # resource managers. atexit is a fallback, but firing here gives the
+        # user a clean exit-success signal in trtllm-serve.
         try:
             from tensorrt_llm._torch.attention_backend.trtllm import (
                 _peek_skip_softmax_stat_logger)
+        except ImportError as exc:
+            logger.warning(
+                f"Skip-softmax stat logger import failed during shutdown: {exc!r}"
+            )
+        else:
             stat_logger = _peek_skip_softmax_stat_logger()
             if stat_logger is not None:
-                stat_logger.dump()
-        except Exception as exc:  # noqa: BLE001
-            logger.warning(
-                f"Skip-softmax stat dump on shutdown failed: {exc!r}")
+                try:
+                    stat_logger.dump()
+                except (OSError, RuntimeError, TypeError, ValueError) as exc:
+                    logger.warning(
+                        f"Skip-softmax stat dump on shutdown failed: {exc!r}")
 
         self.executor_request_queue.enqueue_shutdown_request()
         self.shutdown_event.wait()

@@ -412,7 +412,7 @@ class SkipSoftmaxAttentionConfig(BaseSparseAttentionConfig):
         description=
         "If set, dump per-step / per-layer skip-softmax block statistics as "
         "JSON to this path on executor shutdown. Forces the _skipSoftmaxStat "
-        "kernel variants and is incompatible with CUDA graphs. Debug only — "
+        "kernel variants and is incompatible with CUDA graphs. Debug only; "
         "expect measurable attention-kernel slowdown.")
 
     def supports_backend(self, backend: str) -> bool:
@@ -473,12 +473,14 @@ class SkipSoftmaxAttentionConfig(BaseSparseAttentionConfig):
                     f"threshold_scale_factor from target_sparsity.")
             return coeffs['a'] * math.exp(coeffs['b'] * sparsity)
 
-        return SkipSoftmaxAttentionConfig(
-            algorithm=self.algorithm,
-            target_sparsity=self.target_sparsity,
-            threshold_scale_factor={
-                'prefill': _compute('prefill', self.target_sparsity_prefill),
-                'decode': _compute('decode', self.target_sparsity_decode),
+        return self.model_copy(
+            update={
+                'threshold_scale_factor': {
+                    'prefill': _compute('prefill',
+                                        self.target_sparsity_prefill),
+                    'decode': _compute('decode',
+                                       self.target_sparsity_decode),
+                }
             })
 
 
@@ -4143,7 +4145,7 @@ class TorchLlmArgs(BaseLlmArgs):
         if cfg.stat_log_path is None:
             return self
         # Stat collection performs per-layer .zero_() and host-side readback of
-        # (total, skipped) every step — both incompatible with CUDA graph capture.
+        # (total, skipped) every step, both incompatible with CUDA graph capture.
         graph_cfg = self.cuda_graph_config
         if graph_cfg is not None and graph_cfg.batch_sizes:
             raise ValueError(

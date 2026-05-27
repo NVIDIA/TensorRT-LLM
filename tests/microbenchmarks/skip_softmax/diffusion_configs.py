@@ -1,13 +1,16 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Diffusion-shape sweep configs for the skip-softmax kernel microbench.
 
 Mirrors the cubin family used by Wan2.2 T2V-A14B at 720x1280x81 frames per
-the wan22-a14b-v1-vs-v2-calibration doc — bf16, head_dim=128, q_step=64,
+the wan22-a14b-v1-vs-v2-calibration doc: bf16, head_dim=128, q_step=64,
 kv_step=128, bidirectional mask.
 
 The user explicitly said: ignore target_sparsity (which is the per-model
-calibration knob). On random tensors threshold_scale_factor → achieved
+calibration knob). On random tensors threshold_scale_factor to achieved
 sparsity is not the same curve, so we sweep threshold_scale_factor over a
-log-spaced range wide enough to bracket 0% → ~99% achieved sparsity.
+log-spaced range wide enough to bracket 0% to ~99% achieved sparsity.
 """
 
 from __future__ import annotations

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 #
-# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -355,7 +355,12 @@ def pass1_sparsity(cfgs: list[FmhaConfig]) -> list[dict[str, object]]:
                   flush=True)
             stat = torch.zeros(2, dtype=torch.uint32, device="cuda")
             runner.run(threshold, skip_softmax_stat=stat)
-            total, skipped = (int(value) for value in stat.cpu().tolist())
+            raw_stat = stat.cpu().tolist()
+            total, skipped = (int(value) for value in raw_stat)
+            if threshold > 0 and total == 0:
+                raise RuntimeError(
+                    f"{cfg.name} threshold={threshold:g}: skip-softmax stat "
+                    f"counter total_blocks is 0, raw stat={raw_stat}")
             rows.append(_stat_row(cfg, threshold, total, skipped))
         del runner
         torch.cuda.empty_cache()

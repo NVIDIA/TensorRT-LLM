@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 #
-# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -22,7 +22,7 @@ Pass 1 (sparsity)
 
 Pass 2 (speedup)
   Re-runs each config without `-skip-softmax-stat` so the production
-  _skipSoftmax cubin is selected — no atomic-counter overhead. Median latency
+  _skipSoftmax cubin is selected - no atomic-counter overhead. Median latency
   is computed from N=20 timed runs after M=5 warm-up runs. Speedup =
   latency(threshold=0) / latency(threshold).
 
@@ -117,8 +117,7 @@ def _build_cmd(fmha_exe: Path, cfg: FmhaConfig, threshold: float, *,
     return cmd
 
 
-def _run_once(cmd: List[str]) -> Tuple[Optional[float], Optional[Tuple[int,
-                                                                      int]]]:
+def _run_once(cmd: List[str]) -> Tuple[Optional[float], Optional[Tuple[int, int]]]:
     """Returns (elapsed_us, (skipped, total)). Either may be None if missing."""
     proc = subprocess.run(cmd,
                           capture_output=True,
@@ -154,7 +153,11 @@ def pass1_sparsity(cfgs: List[FmhaConfig], fmha_exe: Path,
                              runs=1,
                              warm_up=warm_up)
             print(f"[pass1] {cfg.name} threshold={thr:g} ...", flush=True)
-            elapsed, skip = _run_once(cmd)
+            _elapsed, skip = _run_once(cmd)
+            if thr > 0 and (skip is None or skip[1] == 0):
+                raise RuntimeError(
+                    f"{cfg.name} threshold={thr:g}: -skip-softmax-stat "
+                    f"produced no parsed counters, cmd={cmd}")
             row = {
                 "config": cfg.name,
                 "dtype": cfg.dtype,

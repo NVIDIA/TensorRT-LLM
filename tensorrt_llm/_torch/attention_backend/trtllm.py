@@ -97,7 +97,7 @@ class SkipSoftmaxStatLogger:
     def _atexit_dump(self) -> None:
         try:
             self.dump()
-        except Exception as exc:  # noqa: BLE001
+        except (OSError, RuntimeError, TypeError, ValueError) as exc:
             logger.warning(
                 f"SkipSoftmaxStatLogger: atexit dump failed: {exc!r}")
 
@@ -1607,12 +1607,12 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             if self.skip_softmax_stat_enabled:
                 stat_logger = _peek_skip_softmax_stat_logger()
                 if stat_logger is not None:
-                    stat_logger.record(self.layer_idx, total_blocks,
+                    stat_logger.record(layer_idx, total_blocks,
                                        skipped_blocks)
             if self.print_skip_softmax_stat and total_blocks != 0:
                 skipped_percent = skipped_blocks / total_blocks * 100
                 print(
-                    f"SKIP_SOFTMAX_STAT: layer{self.layer_idx}: {skipped_blocks} / {total_blocks}"
+                    f"SKIP_SOFTMAX_STAT: layer{layer_idx}: {skipped_blocks} / {total_blocks}"
                     f" = {skipped_percent: .2f}%")
 
     def forward(
@@ -1719,7 +1719,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                 num_gen_tokens = max(0,
                                      num_total_tokens - metadata.num_ctx_tokens)
                 stat_logger.record_step_meta(
-                    layer_idx=self.layer_idx,
+                    layer_idx=layer_idx,
                     num_contexts=int(metadata.num_contexts),
                     num_ctx_tokens=int(metadata.num_ctx_tokens),
                     num_gen_tokens=int(num_gen_tokens))

@@ -564,7 +564,7 @@ public:
             mEnableContextFMHA, mFMHAForceFP32Acc, mMultiBlockMode, mEnableXQA, mUseKVCache, mSkipAttn, mFuseFp4Quant,
             mNbMultiBlockSemaphores, mAttentionChunkSize.value_or(-1), mSkipSoftmaxThresholdScaleFactorPrefill,
             mSkipSoftmaxThresholdScaleFactorDecode, mSageAttnNumEltsPerBlkQ, mSageAttnNumEltsPerBlkK,
-            mSageAttnNumEltsPerBlkV, mSageAttnQkInt8);
+            mSageAttnNumEltsPerBlkV, mSageAttnQkInt8, mEnableSkipSoftmaxStat);
     };
 
 private:
