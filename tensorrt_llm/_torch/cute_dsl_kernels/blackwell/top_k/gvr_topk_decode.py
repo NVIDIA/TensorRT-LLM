@@ -163,7 +163,7 @@ class GvrTopKKernel:
         use_constant_hint: bool = False,
         min_blocks_per_mp: int = 3,
         use_256bit_load: bool = False,
-        enable_warp_parallel_reduce: bool = False,
+        enable_warp_parallel_reduce: Optional[bool] = None,
         compress_ratio: int = 1,
     ):
         # cutlass.Numeric enum: cutlass.Float32 / cutlass.BFloat16 / cutlass.Float16
@@ -223,10 +223,14 @@ class GvrTopKKernel:
         self.enable_phase3_unroll = enable_phase3_unroll
         self.use_constant_hint = use_constant_hint
         # Replace tid==0 serial loops over num_warps with warp-parallel
-        # reduce/scan in warp 0. Beneficial when num_warps is large (e.g.
-        # num_threads=1024 -> num_warps=32) so serial latency is meaningful;
-        # at num_threads=512 (num_warps=16) measured ~2pp regression on
-        # synth, so default off.
+        # reduce/scan in warp 0. Default policy is auto-coupled to
+        # num_threads: enabled iff num_threads == 1024 (32 warps), where
+        # the serial tid==0 cost is meaningful. At num_threads == 512
+        # (16 warps) the warp-parallel path measured a ~2pp regression on
+        # synth, so it stays off. Explicit True / False overrides the
+        # policy for A/B testing.
+        if enable_warp_parallel_reduce is None:
+            enable_warp_parallel_reduce = num_threads == 1024
         self.enable_warp_parallel_reduce = enable_warp_parallel_reduce
 
         # Map cutlass dtype → GvrParams lookup name
@@ -1776,7 +1780,7 @@ def gvr_topk_decode(
     min_blocks_per_mp: Optional[int] = None,
     use_256bit_load: bool = False,
     num_threads_per_block: int = 512,
-    enable_warp_parallel_reduce: bool = False,
+    enable_warp_parallel_reduce: Optional[bool] = None,
     compress_ratio: int = 1,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """cuTe DSL GVR Top-K, drop-in for ``torch.ops.trtllm.indexer_topk_decode``.
@@ -1792,6 +1796,11 @@ def gvr_topk_decode(
                    When != 1, logits/preIdx live in compressed-token-index space:
                    ``N`` is divided by ``compress_ratio`` and ``preIdxOffset``
                    is forced to 0. Mirrors heuristicTopKDecode.cu PR #14219.
+        enable_warp_parallel_reduce: ``None`` (default) auto-couples to
+                   ``num_threads_per_block``: enabled iff threads == 1024 where
+                   the serial tid==0 reduce is the bottleneck; at threads == 512
+                   it stays off (synth-measured ~2pp regression). Pass explicit
+                   ``True`` / ``False`` to override for A/B testing.
         out_values, out_indices: Optional preallocated outputs.
         min_blocks_per_mp: Override ptxas ``__launch_bounds__(BS, min_blocks)``
             hint. ``None`` (default) → use the 3-tier shape-aware heuristic
@@ -1832,21 +1841,38 @@ def gvr_topk_decode(
         enable_unroll_4 = True
     if enable_phase3_unroll is None:
         enable_phase3_unroll = True
-    # 3-tier reg-vs-occupancy heuristic (B200 has 148 SMs):
-    #   n_vec_iters < 4 (small N):
+    # enable_warp_parallel_reduce is tightly coupled to num_threads_per_block:
+    # enabled iff num_threads == 1024 (32 warps), where the serial tid==0
+    # reduce path becomes the bottleneck. At num_threads == 512 (16 warps)
+    # the warp-parallel path measured a ~2pp regression on synth data, so
+    # it stays off by default. Resolve here so the cache key sees the
+    # concrete bool and (None, 512) and (None, 1024) hash differently.
+    if enable_warp_parallel_reduce is None:
+        enable_warp_parallel_reduce = num_threads_per_block == 1024
+    # Reg-vs-occupancy heuristic (B200 has 148 SMs):
+    #   tier-0  n_vec_iters < 4 (small N):
     #       → min_blocks=0 (no __launch_bounds__) — let ptxas pick natural
     #       reg count. With <4 vec iters the LLVM unroll=4 fold doesn't fire
-    #       anyway, and any explicit cap (=1 or =3) just constrains the
-    #       compiler against its own optimum → matches phase3_unroll baseline.
-    #   n_vec_iters ≥ 4 AND num_rows ≤ 148:
-    #       → min_blocks=1 (allow many regs) — grid fits 1 CTA/SM, ptxas
-    #       gets 69+ regs and produces 4×LDG.E.128 back-to-back.
-    #   n_vec_iters ≥ 4 AND num_rows > 148:
-    #       → min_blocks=3 (keep 3 CTA/SM) — large grid needs warp diversity
-    #       for latency hiding; cap regs at 42.
+    #       anyway, and any explicit cap just constrains ptxas against its
+    #       own optimum.
+    #   tier-1  n_vec_iters ≥ 4 AND num_rows ≤ 148:
+    #       → min_blocks=1 — grid fits 1 CTA/SM (max anyway with small grid),
+    #       ptxas gets 69+ regs and produces 4×LDG.E.128 back-to-back.
+    #   tier-3  n_vec_iters ≥ 4 AND num_rows > 148:
+    #       (a) T=1024 OR dtype=fp32 → min_blocks=2
+    #         T=1024 mb=3 cap=21 is infeasible (ptxas violates hint, no
+    #         occupancy gain) → mb=2 (cap=32, 2 CTAs/SM) is the only winner.
+    #         T=512 + fp32 mb=3 cap=42 starves the 4-LDG-inflight ILP
+    #         pattern (fp32 vec_w=4 × 4 unroll → 16 frag + work regs needs
+    #         50+ reg) → 25-37% perf regression at large N/BS. mb=2 cap=64
+    #         leaves ILP intact.
+    #       (b) T=512 AND dtype in (bf16, fp16) → min_blocks=3
+    #         vec_w=8 × cvt-to-fp32 ILP fits in 40 regs; the extra CTA/SM
+    #         (3 vs 2) hides cvt latency → mb=3 wins by 2-6%.
     #
     # vec_w by dtype: fp32 → 128/32 = 4, bf16/fp16 → 128/16 = 8.
-    # num_threads = BLOCK_SIZE = 512.
+    # Derivation: bench sweep at BS={256,384,512} × N={16K,32K,65K} × all
+    # 9 (dtype, K). See gvr-topk-opt/sweep_tv_mb_kineto/mb_sweep.png.
     #
     # ── CUDA Graph behavior ─────────────────────────────────────────────
     # The heuristic reads `logits.shape[0]` and `logits.shape[1]` which are
@@ -1879,7 +1905,10 @@ def gvr_topk_decode(
         elif num_rows <= num_sms:
             min_blocks_per_mp = 1
         else:
-            min_blocks_per_mp = 3
+            # tier-3 (large grid + large N): per (T, dtype) — see comment above.
+            min_blocks_per_mp = (
+                2 if (num_threads_per_block == 1024 or logits.dtype == torch.float32) else 3
+            )
 
     # Cache key includes the unrolling + layout switches so different
     # settings share separate compiled kernels. Shapes (num_rows, num_tokens,
