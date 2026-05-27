@@ -33,22 +33,24 @@ import pytest
 
 from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
 
-
 # --------------------------------------------------------------------------- #
 # Helpers
 # --------------------------------------------------------------------------- #
 
-def _make_executor(*,
-                   enable_kv_pool_rebalance: bool = True,
-                   pp_size: int = 1,
-                   kv_cache_transceiver=None,
-                   is_warmup: bool = False,
-                   is_shutdown: bool = False,
-                   max_beam_width: int = 1,
-                   drafter=None,
-                   need_adjustment: bool = True,
-                   active_requests=None,
-                   previous_batch=None) -> MagicMock:
+
+def _make_executor(
+    *,
+    enable_kv_pool_rebalance: bool = True,
+    pp_size: int = 1,
+    kv_cache_transceiver=None,
+    is_warmup: bool = False,
+    is_shutdown: bool = False,
+    max_beam_width: int = 1,
+    drafter=None,
+    need_adjustment: bool = True,
+    active_requests=None,
+    previous_batch=None,
+) -> MagicMock:
     """Construct a MagicMock shaped like PyExecutor with exactly the
     attributes the rebalance code path reads.
     """
@@ -73,8 +75,7 @@ def _make_executor(*,
     # py_request_id attributes.
     exe.active_requests = active_requests or []
     active_ids = {r.py_request_id for r in exe.active_requests}
-    exe.kv_cache_manager.is_request_active.side_effect = (
-        lambda rid: rid in active_ids)
+    exe.kv_cache_manager.is_request_active.side_effect = lambda rid: rid in active_ids
 
     # Previous batch (overlap loop).
     exe.previous_batch = previous_batch
@@ -91,6 +92,7 @@ def _make_request(req_id: int) -> MagicMock:
 # --------------------------------------------------------------------------- #
 # Gate tests
 # --------------------------------------------------------------------------- #
+
 
 class TestCanPauseForRebalance:
     """Cover every short-circuit branch of ``_can_pause_for_rebalance``."""
@@ -132,12 +134,12 @@ class TestCanPauseForRebalance:
 # _maybe_rebalance_kv_pools
 # --------------------------------------------------------------------------- #
 
+
 class TestMaybeRebalanceKvPools:
     """The hook body: synchronize -> drain -> suspend -> adjust -> resume."""
 
     def test_no_op_when_need_adjustment_false(self, monkeypatch):
-        exe = _make_executor(need_adjustment=False,
-                             active_requests=[_make_request(1)])
+        exe = _make_executor(need_adjustment=False, active_requests=[_make_request(1)])
         monkeypatch.setattr("torch.cuda.current_stream", MagicMock())
 
         PyExecutor._maybe_rebalance_kv_pools(exe)
@@ -166,8 +168,7 @@ class TestMaybeRebalanceKvPools:
         exe = _make_executor(active_requests=[active])
         exe.active_requests = [active, suspended]
         # Override side_effect: only req 1 is active on GPU.
-        exe.kv_cache_manager.is_request_active.side_effect = (
-            lambda rid: rid == 1)
+        exe.kv_cache_manager.is_request_active.side_effect = lambda rid: rid == 1
         exe._consume_previous_batch_for_rebalance = MagicMock()
         monkeypatch.setattr("torch.cuda.current_stream", MagicMock())
 
@@ -194,6 +195,7 @@ class TestMaybeRebalanceKvPools:
 # --------------------------------------------------------------------------- #
 # _consume_previous_batch_for_rebalance
 # --------------------------------------------------------------------------- #
+
 
 class TestConsumePreviousBatch:
     """Overlap-mode drain helper."""

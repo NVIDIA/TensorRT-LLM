@@ -2668,8 +2668,7 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
         "When False (default) the rebalance hook is skipped entirely and "
         "pool ratios remain at their warmup-derived values. Beta: enable at "
         "your own risk. Only used when using KV cache manager v2 "
-        "(experimental)."
-    )
+        "(experimental).")
 
     def _to_pybind(self):
         config = _KvCacheConfig(
