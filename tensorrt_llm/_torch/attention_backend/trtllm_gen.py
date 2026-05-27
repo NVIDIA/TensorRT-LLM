@@ -231,11 +231,11 @@ class TrtllmGenSupportChecker:
         if cross_attention:
             return False, "Cross attention is not supported by trtllm-gen backend."
 
-        if (quant_config is not None
-                and quant_config.layer_quant_mode.has_turboquant4_kv_cache()):
+        if quant_config is not None and quant_config.layer_quant_mode.has_turboquant4_kv_cache():
             return False, (
                 "TurboQuant4 KV cache uses dedicated packed-cache kernels and "
-                "is not supported by trtllm-gen backend.")
+                "is not supported by trtllm-gen backend."
+            )
         has_fp4_kv = (
             quant_config.layer_quant_mode.has_fp4_kv_cache()
             if quant_config is not None

@@ -219,9 +219,9 @@ def turboquant4_quantize(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     # 5. Refit the scale to the selected centroids. This preserves the
     #    original Lloyd-Max bins while reducing value reconstruction error.
     quantized = centroids[indices]
-    refined_scale = (rotated_float * quantized).sum(
-        dim=-1, keepdim=True) / quantized.square().sum(
-            dim=-1, keepdim=True).clamp_min(1e-10)
+    refined_scale = (rotated_float * quantized).sum(dim=-1, keepdim=True) / quantized.square().sum(
+        dim=-1, keepdim=True
+    ).clamp_min(1e-10)
     scale = refined_scale.clamp_min(1e-10)
 
     # 6. Pack adjacent 4-bit indices into one uint8 container.
@@ -400,29 +400,24 @@ def _validate_batch_query_metadata(
     if bool(invalid_batch.any().item()):
         batch_idx = int(q_batch_indices[invalid_batch][0].item())
         raise RuntimeError(
-            f"TurboQuant4 batch index {batch_idx} is out of range "
-            f"for batch size {batch_size}."
+            f"TurboQuant4 batch index {batch_idx} is out of range for batch size {batch_size}."
         )
 
     invalid_query_position = query_positions < 0
     if bool(invalid_query_position.any().item()):
-        query_index = int(
-            torch.nonzero(invalid_query_position, as_tuple=False)[0].item())
+        query_index = int(torch.nonzero(invalid_query_position, as_tuple=False)[0].item())
         query_position = int(query_positions[query_index].item())
         raise RuntimeError(
-            f"TurboQuant4 query position {query_position} is "
-            f"negative at query index {query_index}."
+            f"TurboQuant4 query position {query_position} is negative at query index {query_index}."
         )
 
     metadata_device = q_batch_indices.device
     batch_indices = q_batch_indices.to(device=metadata_device, dtype=torch.long)
-    seq_lens_for_queries = seq_lens_cpu.to(
-        device=metadata_device)[batch_indices]
+    seq_lens_for_queries = seq_lens_cpu.to(device=metadata_device)[batch_indices]
     query_positions_for_check = query_positions.to(device=metadata_device)
     invalid_query_position = query_positions_for_check >= seq_lens_for_queries
     if bool(invalid_query_position.any().item()):
-        query_index = int(
-            torch.nonzero(invalid_query_position, as_tuple=False)[0].item())
+        query_index = int(torch.nonzero(invalid_query_position, as_tuple=False)[0].item())
         query_position = int(query_positions_for_check[query_index].item())
         seq_len = int(seq_lens_for_queries[query_index].item())
         raise RuntimeError(
@@ -604,8 +599,7 @@ def _validate_dense_key_cache_tensors(
 ) -> None:
     if key_cache_tensor.ndim != 4:
         raise ValueError(
-            "TurboQuant4 dense key cache must have shape "
-            "[blocks, tokens, heads, head_dim]."
+            "TurboQuant4 dense key cache must have shape [blocks, tokens, heads, head_dim]."
         )
     if tokens_per_block <= 0:
         raise ValueError("TurboQuant4 tokens_per_block must be positive.")
@@ -661,9 +655,7 @@ def update_turboquant4_dense_key_cache(
     if x.shape[1:] != key_cache_tensor.shape[2:]:
         raise ValueError("TurboQuant4 dense key cache shape mismatch.")
     required_blocks = (
-        (start_pos + x.shape[0] + tokens_per_block - 1) // tokens_per_block
-        if x.shape[0] > 0
-        else 0
+        (start_pos + x.shape[0] + tokens_per_block - 1) // tokens_per_block if x.shape[0] > 0 else 0
     )
     _validate_block_ids(block_ids, required_blocks, key_cache_tensor.shape[0])
 
@@ -752,9 +744,7 @@ def turboquant4_update_value_cache(
     if x.shape[2] != value_cache_tensor.shape[3] * 2:
         raise ValueError("TurboQuant4 value cache head_dim mismatch.")
     required_blocks = (
-        (start_pos + x.shape[0] + tokens_per_block - 1) // tokens_per_block
-        if x.shape[0] > 0
-        else 0
+        (start_pos + x.shape[0] + tokens_per_block - 1) // tokens_per_block if x.shape[0] > 0 else 0
     )
     _validate_block_ids(value_block_ids, required_blocks, value_cache_tensor.shape[0])
     _validate_block_ids(scale_block_ids, required_blocks, value_cache_scales.shape[0])
@@ -767,8 +757,10 @@ def turboquant4_update_value_cache(
     while token_offset < seq_len:
         token_pos = start_pos + token_offset
         block_list_pos = token_pos // tokens_per_block
-        if (block_list_pos >= value_block_ids_tensor.numel()
-                or block_list_pos >= scale_block_ids_tensor.numel()):
+        if (
+            block_list_pos >= value_block_ids_tensor.numel()
+            or block_list_pos >= scale_block_ids_tensor.numel()
+        ):
             raise RuntimeError(
                 "TurboQuant4 value cache block list is shorter than the "
                 f"requested cache position {token_pos}."
@@ -809,8 +801,10 @@ def turboquant4_dequantize_value_cache(
     token_offset = 0
     while token_offset < seq_len:
         block_list_pos = token_offset // tokens_per_block
-        if (block_list_pos >= value_block_ids_tensor.numel()
-                or block_list_pos >= scale_block_ids_tensor.numel()):
+        if (
+            block_list_pos >= value_block_ids_tensor.numel()
+            or block_list_pos >= scale_block_ids_tensor.numel()
+        ):
             raise RuntimeError(
                 "TurboQuant4 value cache block list is shorter than the "
                 f"requested sequence length {seq_len}."
@@ -932,13 +926,9 @@ def turboquant4_value_only_attention(
         )
     if dense_value_states is not None:
         if dense_value_start_pos is None:
-            raise ValueError(
-                "TurboQuant4 dense value suffix requires dense_value_start_pos."
-            )
+            raise ValueError("TurboQuant4 dense value suffix requires dense_value_start_pos.")
         if dense_value_start_pos < 0:
-            raise ValueError(
-                "TurboQuant4 dense value suffix start must be non-negative."
-            )
+            raise ValueError("TurboQuant4 dense value suffix start must be non-negative.")
         if dense_value_states.ndim != 3:
             raise ValueError(
                 "TurboQuant4 dense value suffix expects [seq, heads, dim], "
@@ -1038,21 +1028,13 @@ def turboquant4_value_only_batch_attention(
         raise ValueError("TurboQuant4 batch attention seq_lens must be 1D.")
     if dense_value_states_by_seq is not None:
         if dense_value_start_positions is None:
-            raise ValueError(
-                "TurboQuant4 dense value suffixes require start positions."
-            )
+            raise ValueError("TurboQuant4 dense value suffixes require start positions.")
         if len(dense_value_states_by_seq) != seq_lens.numel():
-            raise ValueError(
-                "TurboQuant4 dense value suffix batch size mismatch."
-            )
+            raise ValueError("TurboQuant4 dense value suffix batch size mismatch.")
         if len(dense_value_start_positions) != seq_lens.numel():
-            raise ValueError(
-                "TurboQuant4 dense value suffix start batch size mismatch."
-            )
+            raise ValueError("TurboQuant4 dense value suffix start batch size mismatch.")
     elif dense_value_start_positions is not None:
-        raise ValueError(
-            "TurboQuant4 dense value suffix starts require suffix tensors."
-        )
+        raise ValueError("TurboQuant4 dense value suffix starts require suffix tensors.")
     _validate_int32_tensor(q_batch_indices, "batch attention q_batch_indices")
     _validate_int32_tensor(query_positions, "batch attention query_positions")
     _validate_int32_tensor(seq_lens, "batch attention seq_lens")
@@ -1072,8 +1054,12 @@ def turboquant4_value_only_batch_attention(
             f"max seq_len is {actual_max_seq_len}."
         )
     _validate_batch_block_ids(key_block_ids, seq_lens, tokens_per_block, key_cache_tensor.shape[0])
-    _validate_batch_block_ids(value_block_ids, seq_lens, tokens_per_block, value_cache_tensor.shape[0])
-    _validate_batch_block_ids(scale_block_ids, seq_lens, tokens_per_block, value_cache_scales.shape[0])
+    _validate_batch_block_ids(
+        value_block_ids, seq_lens, tokens_per_block, value_cache_tensor.shape[0]
+    )
+    _validate_batch_block_ids(
+        scale_block_ids, seq_lens, tokens_per_block, value_cache_scales.shape[0]
+    )
     key_block_ids_tensor = _batch_block_ids_to_tensor(key_block_ids, q.device)
     value_block_ids_tensor = _batch_block_ids_to_tensor(value_block_ids, q.device)
     scale_block_ids_tensor = _batch_block_ids_to_tensor(scale_block_ids, q.device)
@@ -1092,8 +1078,7 @@ def turboquant4_value_only_batch_attention(
                 "TurboQuant4 KV cache block list is shorter than the requested "
                 f"batch sequence for {name}; need {required_blocks}, got {tensor.shape[1]}."
             )
-    _validate_batch_query_metadata(q_batch_indices, query_positions,
-                                   seq_lens_cpu)
+    _validate_batch_query_metadata(q_batch_indices, query_positions, seq_lens_cpu)
 
     output = torch.zeros_like(q)
     q_batch_indices_cpu = q_batch_indices.cpu()
@@ -1331,8 +1316,7 @@ def turboquant4_batch_attention(
             "TurboQuant4 KV cache block list is shorter than the requested "
             f"batch sequence; need {required_blocks}, got {block_ids_tensor.shape[1]}."
         )
-    _validate_batch_query_metadata(q_batch_indices, query_positions,
-                                   seq_lens_cpu)
+    _validate_batch_query_metadata(q_batch_indices, query_positions, seq_lens_cpu)
 
     q_batch_indices = q_batch_indices.to(device=q.device, non_blocking=True)
     query_positions = query_positions.to(device=q.device, non_blocking=True)

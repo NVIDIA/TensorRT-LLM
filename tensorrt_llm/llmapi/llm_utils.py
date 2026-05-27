@@ -368,15 +368,13 @@ class ModelLoader:
                 )
         else:
             if quant_config.kv_cache_quant_algo not in [
-                    None, QuantAlgo.FP8, QuantAlgo.NVFP4,
-                    QuantAlgo.TURBOQUANT4
+                    None, QuantAlgo.FP8, QuantAlgo.NVFP4, QuantAlgo.TURBOQUANT4
             ]:
                 raise ValueError(
                     f"Only kv_cache_quant_algo={QuantAlgo.FP8}, "
                     f"{QuantAlgo.NVFP4}, or {QuantAlgo.TURBOQUANT4} is "
                     "allowed for pre-quantized checkpoint, got "
-                    f"{quant_config.kv_cache_quant_algo}."
-                )
+                    f"{quant_config.kv_cache_quant_algo}.")
 
         # quantized_layers is handled separately (e.g. via LayerQuantConfig
         # in PretrainedConfig for TRT, or _torch/model_config.py for PyTorch)

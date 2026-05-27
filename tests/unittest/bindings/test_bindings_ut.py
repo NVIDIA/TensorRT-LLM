@@ -37,9 +37,11 @@ def test_quant_mode():
     quant_mode += _tb.QuantMode.int4_weights()
     assert quant_mode.has_int4_weights
 
-    quant_mode = _tb.QuantMode.from_description(
-        False, False, False, False, False, False, False, False, False, False,
-        False, False, False, False, False, False, True)
+    quant_mode = _tb.QuantMode.from_description(False, False, False, False,
+                                                False, False, False, False,
+                                                False, False, False, False,
+                                                False, False, False, False,
+                                                True)
     assert quant_mode.has_turboquant4_kv_cache
     assert quant_mode.has_kv_cache_quant
 

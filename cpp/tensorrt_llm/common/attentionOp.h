@@ -50,7 +50,7 @@ public:
     using PositionEmbeddingType = tensorrt_llm::kernels::PositionEmbeddingType;
     using AttentionMaskType = tensorrt_llm::kernels::AttentionMaskType;
 
-    AttentionOp() {};
+    AttentionOp(){};
     ~AttentionOp() = default;
 
     int initialize() noexcept;

@@ -51,8 +51,8 @@ def _has_turboquant4_kv_cache(quant_config) -> bool:
             and kv_cache_quant_algo_value.upper() == "TURBOQUANT4")
 
 
-def _sync_model_config_turboquant4_overrides(
-        llm_args: TorchLlmArgs, model_config: ModelConfig) -> None:
+def _sync_model_config_turboquant4_overrides(llm_args: TorchLlmArgs,
+                                             model_config: ModelConfig) -> None:
     was_frozen = model_config._frozen
     model_config._frozen = False
     try:
@@ -62,8 +62,8 @@ def _sync_model_config_turboquant4_overrides(
         model_config._frozen = was_frozen
 
 
-def sync_loaded_turboquant4_kv_cache_config(
-        llm_args: TorchLlmArgs, model_config: ModelConfig) -> bool:
+def sync_loaded_turboquant4_kv_cache_config(llm_args: TorchLlmArgs,
+                                            model_config: ModelConfig) -> bool:
     """Sync/check llm_args when TurboQuant4 comes from checkpoint config."""
     if not _has_turboquant4_kv_cache(model_config.quant_config):
         return False

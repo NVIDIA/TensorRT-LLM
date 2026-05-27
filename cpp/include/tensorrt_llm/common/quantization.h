@@ -252,8 +252,7 @@ public:
     static constexpr QuantMode fromDescription(bool quantizeWeights, bool quantizeActivations, bool perToken,
         bool perChannel, bool perGroup, bool useInt4Weights, bool useInt8KvCache, bool useFp8KvCache, bool useFp8Qdq,
         bool useFp8RowWise, bool useW4a8QServe, bool useFp4Quant, bool useFp8BlockScales, bool useW4a8Mxfp4Fp8,
-        bool useW4a8Mxfp4Mxfp8, bool useW4a16Mxfp4, bool useTurboQuant4KvCache = false,
-        bool useW4a8Nvfp4Fp8 = false)
+        bool useW4a8Mxfp4Mxfp8, bool useW4a16Mxfp4, bool useTurboQuant4KvCache = false, bool useW4a8Nvfp4Fp8 = false)
     {
         QuantMode quantMode{};
         if (quantizeWeights)

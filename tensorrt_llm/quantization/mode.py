@@ -50,8 +50,7 @@ class QuantAlgo(StrEnum, metaclass=BaseEnumMeta):
     NO_QUANT = auto()
 
 
-QUANT_ALGO_LIST = list(
-    set(QuantAlgo) - {QuantAlgo.INT8, QuantAlgo.TURBOQUANT4})
+QUANT_ALGO_LIST = list(set(QuantAlgo) - {QuantAlgo.INT8, QuantAlgo.TURBOQUANT4})
 KV_CACHE_QUANT_ALGO_LIST = [
     QuantAlgo.FP8, QuantAlgo.INT8, QuantAlgo.NVFP4, QuantAlgo.TURBOQUANT4
 ]
@@ -182,8 +181,7 @@ class QuantMode(IntFlag):
 
     def has_kv_cache_quant(self):
         return (self.has_int8_kv_cache() or self.has_fp8_kv_cache()
-                or self.has_fp4_kv_cache()
-                or self.has_turboquant4_kv_cache())
+                or self.has_fp4_kv_cache() or self.has_turboquant4_kv_cache())
 
     def has_fp8_qdq(self):
         return self._any(self.FP8_QDQ)

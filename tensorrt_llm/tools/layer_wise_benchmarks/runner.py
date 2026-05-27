@@ -783,12 +783,13 @@ class Runner:
         )
         kv_cache_manager_cls = get_kv_cache_manager_cls(model_config, kv_cache_config)
         kv_cache_quant_algo = model_config.quant_config.kv_cache_quant_algo
-        kv_cache_quant_algo_value = getattr(kv_cache_quant_algo, "value",
-                                            kv_cache_quant_algo)
+        kv_cache_quant_algo_value = getattr(kv_cache_quant_algo, "value", kv_cache_quant_algo)
         if isinstance(kv_cache_quant_algo_value, str):
             kv_cache_quant_algo_value = kv_cache_quant_algo_value.upper()
-        if (isinstance(kv_cache_quant_algo_value, str)
-                and kv_cache_quant_algo_value == "TURBOQUANT4"):
+        if (
+            isinstance(kv_cache_quant_algo_value, str)
+            and kv_cache_quant_algo_value == "TURBOQUANT4"
+        ):
             raise ValueError(
                 "TurboQuant4 KV cache is not supported by layer-wise benchmarks "
                 "because the tool does not allocate packed KV scale buffers."

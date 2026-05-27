@@ -991,8 +991,8 @@ void checkTurboQuant4BlockIds(at::Tensor const& blockIds, int64_t blockCount, in
         "), got range [", minBlockId, ", ", maxBlockId, "].");
 }
 
-void checkTurboQuant4BatchBlockIds(at::Tensor const& blockIds, at::Tensor const& seqLens, int64_t maxSeqLen,
-    int64_t tokensPerBlock, int64_t maxBlocks)
+void checkTurboQuant4BatchBlockIds(
+    at::Tensor const& blockIds, at::Tensor const& seqLens, int64_t maxSeqLen, int64_t tokensPerBlock, int64_t maxBlocks)
 {
     TORCH_CHECK(maxBlocks >= 0, "TurboQuant4 cache block count must be non-negative.");
     if (seqLens.numel() == 0)
@@ -1041,12 +1041,12 @@ void checkTurboQuant4BatchQueryMetadata(
     int64_t const minBatchIndex = qBatchIndices.min().item<int32_t>();
     int64_t const maxBatchIndex = qBatchIndices.max().item<int32_t>();
     TORCH_CHECK(minBatchIndex >= 0 && maxBatchIndex < batchSize,
-        "TurboQuant4 batch attention batch indices must be in [0, ", batchSize, "), got range [", minBatchIndex,
-        ", ", maxBatchIndex, "].");
+        "TurboQuant4 batch attention batch indices must be in [0, ", batchSize, "), got range [", minBatchIndex, ", ",
+        maxBatchIndex, "].");
 
     int64_t const minQueryPosition = queryPositions.min().item<int32_t>();
-    TORCH_CHECK(minQueryPosition >= 0,
-        "TurboQuant4 batch attention query positions must be non-negative, got ", minQueryPosition, ".");
+    TORCH_CHECK(minQueryPosition >= 0, "TurboQuant4 batch attention query positions must be non-negative, got ",
+        minQueryPosition, ".");
 
     at::Tensor seqLensForQueries = at::index_select(seqLens, 0, qBatchIndices.to(at::kLong));
     at::Tensor invalidQueryPositions = queryPositions >= seqLensForQueries;

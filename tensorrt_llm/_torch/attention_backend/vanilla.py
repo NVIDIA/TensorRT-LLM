@@ -155,12 +155,10 @@ class VanillaAttention(AttentionBackend[VanillaAttentionMetadata]):
         return k_states, v_states
 
     def _use_turboquant4_kv_cache(self):
-        return (self.quant_config is not None
-                and self.quant_config.layer_quant_mode.has_turboquant4_kv_cache(
-                ))
+        return (self.quant_config is not None and
+                self.quant_config.layer_quant_mode.has_turboquant4_kv_cache())
 
-    def _single_request_update_turboquant4_kv_cache(self, k, v,
-                                                    kv_cache_tensor,
+    def _single_request_update_turboquant4_kv_cache(self, k, v, kv_cache_tensor,
                                                     kv_cache_scales,
                                                     past_seen_token, kv_len,
                                                     cache_idx, dtype):
@@ -175,10 +173,8 @@ class VanillaAttention(AttentionBackend[VanillaAttentionMetadata]):
 
         from tensorrt_llm._torch.modules.turboquant4 import (
             read_turboquant4_dense_key_cache,
-            turboquant4_dequantize_value_cache,
-            turboquant4_update_value_cache,
-            update_turboquant4_dense_key_cache,
-        )
+            turboquant4_dequantize_value_cache, turboquant4_update_value_cache,
+            update_turboquant4_dense_key_cache)
 
         key_cache_tensor, value_cache_tensor = kv_cache_tensor
         key_cache_idx, value_cache_idx, scale_cache_idx = cache_idx
@@ -186,7 +182,7 @@ class VanillaAttention(AttentionBackend[VanillaAttentionMetadata]):
         seq_len = past_seen_token + kv_len
         tokens_per_block = key_cache_tensor.shape[1]
         key_block_ids = key_cache_idx if isinstance(key_cache_idx,
-                                                   list) else [key_cache_idx]
+                                                    list) else [key_cache_idx]
         value_block_ids = (value_cache_idx if isinstance(value_cache_idx, list)
                            else [value_cache_idx])
         scale_block_ids = (scale_cache_idx if isinstance(scale_cache_idx, list)
@@ -201,11 +197,14 @@ class VanillaAttention(AttentionBackend[VanillaAttentionMetadata]):
                                            scale_block_ids, past_seen_token,
                                            tokens_per_block)
 
-        k_states = read_turboquant4_dense_key_cache(
-            key_cache_tensor, key_block_ids, seq_len, tokens_per_block, dtype)
-        v_states = turboquant4_dequantize_value_cache(
-            value_cache_tensor, kv_cache_scales, value_block_ids,
-            scale_block_ids, seq_len, tokens_per_block, dtype)
+        k_states = read_turboquant4_dense_key_cache(key_cache_tensor,
+                                                    key_block_ids, seq_len,
+                                                    tokens_per_block, dtype)
+        v_states = turboquant4_dequantize_value_cache(value_cache_tensor,
+                                                      kv_cache_scales,
+                                                      value_block_ids,
+                                                      scale_block_ids, seq_len,
+                                                      tokens_per_block, dtype)
         if v is not None and kv_len > 0:
             v_states[:, past_seen_token:seq_len].copy_(v.to(dtype=dtype))
         return k_states, v_states
@@ -346,8 +345,8 @@ class VanillaAttention(AttentionBackend[VanillaAttentionMetadata]):
         # update kv cache
         if self._use_turboquant4_kv_cache():
             key_states, value_states = self._single_request_update_turboquant4_kv_cache(
-                k, v, kv_cache_tensor, kv_cache_scales, past_seen_token,
-                kv_len, cache_idx, q.dtype)
+                k, v, kv_cache_tensor, kv_cache_scales, past_seen_token, kv_len,
+                cache_idx, q.dtype)
         else:
             key_states, value_states = self._single_request_update_kv_cache(
                 k, v, kv_cache_tensor, past_seen_token, kv_len, cache_idx,
@@ -519,8 +518,8 @@ class VanillaAttention(AttentionBackend[VanillaAttentionMetadata]):
 
             attn_output = self._single_request_forward(
                 single_q, single_k, single_v, forward_args.attention_mask,
-                kv_cache_tensor, kv_cache_scales, past_seen_token, cache_idx, sample_idx,
-                metadata, forward_args.attention_window_size)
+                kv_cache_tensor, kv_cache_scales, past_seen_token, cache_idx,
+                sample_idx, metadata, forward_args.attention_window_size)
 
             attn_outputs.append(attn_output)
 

@@ -14,7 +14,7 @@ if TYPE_CHECKING:
 from tensorrt_llm._torch.attention_backend import trtllm_gen
 from tensorrt_llm._torch.modules.rotary_embedding import (MRotaryEmbedding,
                                                           RotaryEmbedding)
-from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager, Role
+from tensorrt_llm._torch.pyexecutor.resource_manager import Role
 from tensorrt_llm._utils import get_sm_version, maybe_pin_memory, prefer_pinned
 from tensorrt_llm.bindings.internal import thop
 from tensorrt_llm.functional import AttentionMaskType
@@ -1122,8 +1122,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                 is_neox=pos_embd_params.is_neox)
         return self.turboquant4_rotary_emb
 
-    def _split_turboquant4_qkv(self, q: torch.Tensor,
-                               k: Optional[torch.Tensor],
+    def _split_turboquant4_qkv(self, q: torch.Tensor, k: Optional[torch.Tensor],
                                v: Optional[torch.Tensor]):
         if k is not None or v is not None:
             assert k is not None and v is not None
@@ -1139,19 +1138,15 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                                  key_block_ids: List[int],
                                  value_block_ids: List[int],
                                  scale_block_ids: List[int], start_pos: int,
-                                 k_states: torch.Tensor,
-                                 v_states: torch.Tensor,
+                                 k_states: torch.Tensor, v_states: torch.Tensor,
                                  tokens_per_block: int) -> None:
         from tensorrt_llm._torch.modules.turboquant4 import (
-            turboquant4_update_value_cache,
-            update_turboquant4_dense_key_cache,
-        )
+            turboquant4_update_value_cache, update_turboquant4_dense_key_cache)
 
         update_turboquant4_dense_key_cache(k_states.squeeze(0),
                                            key_cache_tensor, key_block_ids,
                                            start_pos, tokens_per_block)
-        turboquant4_update_value_cache(v_states.squeeze(0),
-                                       value_cache_tensor,
+        turboquant4_update_value_cache(v_states.squeeze(0), value_cache_tensor,
                                        value_cache_scales, value_block_ids,
                                        scale_block_ids, start_pos,
                                        tokens_per_block)
@@ -1171,7 +1166,8 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         tokens_per_block: int,
         attention_mask: AttentionMask,
         attention_window_size: Optional[int],
-        dense_value_states_per_seq: Optional[List[Optional[torch.Tensor]]] = None,
+        dense_value_states_per_seq: Optional[List[Optional[
+            torch.Tensor]]] = None,
         dense_value_start_positions: Optional[List[Optional[int]]] = None,
     ) -> torch.Tensor:
         from tensorrt_llm._torch.modules.turboquant4 import \
@@ -1236,9 +1232,9 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                                     self.head_dim).transpose(1, 2)
             key_states = k_chunk.view(1, seq_len, self.num_kv_heads,
                                       self.head_dim).transpose(1, 2).to(q.dtype)
-            value_states = v_chunk.view(
-                1, seq_len, self.num_kv_heads,
-                self.head_dim).transpose(1, 2).to(q.dtype)
+            value_states = v_chunk.view(1, seq_len, self.num_kv_heads,
+                                        self.head_dim).transpose(1,
+                                                                 2).to(q.dtype)
             if kv_repeats != 1:
                 key_states = key_states[:, :, None, :, :].expand(
                     1, self.num_kv_heads, kv_repeats, seq_len, self.head_dim)
@@ -1259,9 +1255,9 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                     kv_positions = torch.arange(seq_len,
                                                 device=q.device).unsqueeze(0)
                     allowed = kv_positions <= cache_position.unsqueeze(-1)
-                    allowed = allowed & (
-                        kv_positions >
-                        cache_position.unsqueeze(-1) - attention_window_size)
+                    allowed = allowed & (kv_positions
+                                         > cache_position.unsqueeze(-1) -
+                                         attention_window_size)
                     attn_mask = allowed[None, None, :, :]
 
             outputs.append(
@@ -1327,8 +1323,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                     and pos_embd_params.type.is_mrope())
         if is_mrope or mrope_config is not None:
             raise NotImplementedError(
-                "TurboQuant4 TRTLLM fallback does not support MRoPE metadata."
-            )
+                "TurboQuant4 TRTLLM fallback does not support MRoPE metadata.")
         if metadata.kv_cache_manager is None:
             raise RuntimeError(
                 "TurboQuant4 TRTLLM fallback requires KVCacheManagerV2.")
@@ -1340,8 +1335,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                 )):
             raise RuntimeError(
                 "TurboQuant4 TRTLLM fallback requires KVCacheManagerV2 "
-                "asymmetric cache buffers."
-            )
+                "asymmetric cache buffers.")
         if output_sf is not None:
             raise NotImplementedError(
                 "TurboQuant4 TRTLLM fallback does not support NVFP4 attention output."
@@ -1352,8 +1346,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             )
         if kwargs.get("attention_sinks") is not None:
             raise NotImplementedError(
-                "TurboQuant4 TRTLLM fallback does not support attention sinks."
-            )
+                "TurboQuant4 TRTLLM fallback does not support attention sinks.")
 
         key_cache_tensor = metadata.kv_cache_manager.get_turboquant4_key_buffers(
             self.layer_idx)
@@ -1365,8 +1358,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                 or value_cache_scales is None):
             raise RuntimeError(
                 "TurboQuant4 TRTLLM fallback requires asymmetric KV buffers "
-                "from KVCacheManagerV2."
-            )
+                "from KVCacheManagerV2.")
 
         is_fused_qkv = k is None and v is None
         q, k, v = self._split_turboquant4_qkv(q, k, v)
@@ -1432,8 +1424,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                     key_block_ids_per_seq[sample_idx],
                     value_block_ids_per_seq[sample_idx],
                     scale_block_ids_per_seq[sample_idx], past_seen_token,
-                    k_states, v_states,
-                    tokens_per_block)
+                    k_states, v_states, tokens_per_block)
                 dense_value_states_per_seq.append(v_states.squeeze(0))
                 dense_value_start_positions.append(past_seen_token)
             else:
@@ -1443,8 +1434,8 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             total_kv_len = past_seen_token + kv_len
             seq_lens.append(total_kv_len)
             q_batch_indices.extend([sample_idx] * q_len)
-            query_positions.extend(range(past_seen_token,
-                                         past_seen_token + q_len))
+            query_positions.extend(
+                range(past_seen_token, past_seen_token + q_len))
             per_sample_state.append((sample_idx, offset_q, offset_kv, q_len,
                                      kv_len, past_seen_token, total_kv_len))
             offset_q += q_len
@@ -1478,8 +1469,8 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                 dense_value_start_positions,
             )
         else:
-            attn_output = q.new_empty((num_q_tokens,
-                                       self.num_heads * self.head_dim))
+            attn_output = q.new_empty(
+                (num_q_tokens, self.num_heads * self.head_dim))
             quant_q_chunks = []
             quant_key_block_ids_per_seq = []
             quant_value_block_ids_per_seq = []
@@ -1490,8 +1481,8 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             quant_output_spans = []
             quant_dense_value_states_per_seq = []
             quant_dense_value_start_positions = []
-            for (sample_idx, q_start, kv_start, q_len, kv_len,
-                 past_seen_token, total_kv_len) in per_sample_state:
+            for (sample_idx, q_start, kv_start, q_len, kv_len, past_seen_token,
+                 total_kv_len) in per_sample_state:
                 q_end = q_start + q_len
                 kv_end = kv_start + kv_len
                 if past_seen_token == 0:
@@ -2019,7 +2010,8 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                 mrope_config=({
                     "mrope_rotary_cos_sin":
                     forward_args.mrope_rotary_cos_sin,
-                    "mrope_position_deltas": forward_args.mrope_position_deltas,
+                    "mrope_position_deltas":
+                    forward_args.mrope_position_deltas,
                 } if forward_args.mrope_rotary_cos_sin is not None
                               or forward_args.mrope_position_deltas is not None
                               else None),

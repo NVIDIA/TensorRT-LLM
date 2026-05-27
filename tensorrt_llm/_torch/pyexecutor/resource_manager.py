@@ -79,6 +79,7 @@ def _resolve_cache_binding_dtype(dtype) -> DataType:
         return str_dtype_to_binding(dtype)
     return str_dtype_to_binding(torch_dtype_to_str(dtype))
 
+
 if TYPE_CHECKING:
     from tensorrt_llm._torch.attention_backend.interface import \
         AttentionMetadata
@@ -2640,7 +2641,8 @@ class KVCacheManagerV2(BaseResourceManager):
         return convert_to_torch_tensor(TensorWrapper(addr, dtype, shape))
 
     def get_turboquant4_key_buffers(
-            self, layer_idx: int,
+            self,
+            layer_idx: int,
             kv_layout: str = "NHD") -> Optional[torch.Tensor]:
         if not self.is_turboquant4:
             return None
@@ -2650,7 +2652,8 @@ class KVCacheManagerV2(BaseResourceManager):
                                      kv_layout)
 
     def get_turboquant4_value_buffers(
-            self, layer_idx: int,
+            self,
+            layer_idx: int,
             kv_layout: str = "NHD") -> Optional[torch.Tensor]:
         if not self.is_turboquant4:
             return None
@@ -2660,7 +2663,8 @@ class KVCacheManagerV2(BaseResourceManager):
                                      kv_layout)
 
     def get_turboquant4_value_scale_buffers(
-            self, layer_idx: int,
+            self,
+            layer_idx: int,
             kv_layout: str = "NHD") -> Optional[torch.Tensor]:
         if not self.is_turboquant4:
             return None
@@ -3241,9 +3245,9 @@ class KVCacheManagerV2(BaseResourceManager):
                                                         pool_id=pool_id,
                                                         is_kv_aggregate=True)
 
-    def get_batch_cache_indices_for_role(
-            self, request_ids: List[int], layer_id: int,
-            data_role: Role) -> List[List[int]]:
+    def get_batch_cache_indices_for_role(self, request_ids: List[int],
+                                         layer_id: int,
+                                         data_role: Role) -> List[List[int]]:
         layer_offset = self.layer_offsets[layer_id]
         pool_id = self.layer_to_pool_mapping_dict[layer_offset]
         index_scale = self.impl.get_page_index_scale(layer_offset, data_role)
@@ -3254,8 +3258,8 @@ class KVCacheManagerV2(BaseResourceManager):
             if hasattr(base_page_indices, "tolist"):
                 base_page_indices = base_page_indices.tolist()
             res.append([
-                index * index_scale
-                if index != BAD_PAGE_INDEX else BAD_PAGE_INDEX
+                index *
+                index_scale if index != BAD_PAGE_INDEX else BAD_PAGE_INDEX
                 for index in base_page_indices
             ])
         return res
@@ -3325,8 +3329,7 @@ class KVCacheManagerV2(BaseResourceManager):
             cache_size_per_token = self.num_kv_heads_per_layer[
                 local_layer_idx] * layer_head_dim
             if data_role == Role.ALL:
-                key_bytes = get_size_in_bytes(cache_size_per_token,
-                                              self.dtype)
+                key_bytes = get_size_in_bytes(cache_size_per_token, self.dtype)
                 value_bytes = get_size_in_bytes(cache_size_per_token,
                                                 DataType.NVFP4)
                 scale_bytes = self.calculate_scaling_factor_size_bytes(
@@ -3339,14 +3342,12 @@ class KVCacheManagerV2(BaseResourceManager):
                 return get_size_in_bytes(cache_size_per_token, self.dtype)
             if data_role == Role.VALUE:
                 assert self.kv_cache_type != CacheTypeCpp.SELFKONLY, (
-                    "VALUE data role is not supported for SELFKONLY cache type"
-                )
+                    "VALUE data role is not supported for SELFKONLY cache type")
                 return get_size_in_bytes(cache_size_per_token, DataType.NVFP4)
             if data_role == Role.VALUE_BLOCK_SCALE:
                 assert self.kv_cache_type != CacheTypeCpp.SELFKONLY, (
                     "VALUE_BLOCK_SCALE data role is not supported for "
-                    "SELFKONLY cache type"
-                )
+                    "SELFKONLY cache type")
                 return self.calculate_scaling_factor_size_bytes(
                     cache_size_per_token,
                     quant_vector_size=layer_head_dim,
@@ -3489,10 +3490,9 @@ class KVCacheManagerV2(BaseResourceManager):
                 head for head in num_key_value_heads_per_layer
                 if head is not None
             ]
-            num_key_value_heads = (
-                sum(valid_num_key_value_heads) /
-                len(valid_num_key_value_heads)
-                if valid_num_key_value_heads else 0)
+            num_key_value_heads = (sum(valid_num_key_value_heads) /
+                                   len(valid_num_key_value_heads)
+                                   if valid_num_key_value_heads else 0)
 
         # get head dim
         mla = hasattr(config,

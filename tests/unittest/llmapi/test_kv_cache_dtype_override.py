@@ -72,9 +72,7 @@ def test_get_llm_args_plumbs_kv_cache_dtype():
 
 
 def test_get_llm_args_plumbs_turboquant4_kv_cache_dtype():
-    llm_args, _ = get_llm_args(
-        model="dummy", gpus_per_node=1, kv_cache_dtype="turboquant4"
-    )
+    llm_args, _ = get_llm_args(model="dummy", gpus_per_node=1, kv_cache_dtype="turboquant4")
     assert llm_args["kv_cache_config"].dtype == "turboquant4"
 
 
@@ -357,9 +355,10 @@ def test_autodeploy_llm_args_rejects_turboquant4_kv_cache(tmp_path):
     device_props.major = 9
     device_props.minor = 0
 
-    with pytest.raises(
-        ValueError, match="TurboQuant4 KV cache is not supported with AutoDeploy"
-    ), mock.patch("torch.cuda.get_device_properties", return_value=device_props):
+    with (
+        pytest.raises(ValueError, match="TurboQuant4 KV cache is not supported with AutoDeploy"),
+        mock.patch("torch.cuda.get_device_properties", return_value=device_props),
+    ):
         AutoDeployLlmArgs(
             model=str(tmp_path),
             backend="_autodeploy",
@@ -372,9 +371,12 @@ def test_trt_llm_args_rejects_turboquant4_kv_cache(tmp_path):
     device_props.major = 9
     device_props.minor = 0
 
-    with pytest.raises(
-        ValueError, match="TurboQuant4 KV cache is supported only by the PyTorch backend"
-    ), mock.patch("torch.cuda.get_device_properties", return_value=device_props):
+    with (
+        pytest.raises(
+            ValueError, match="TurboQuant4 KV cache is supported only by the PyTorch backend"
+        ),
+        mock.patch("torch.cuda.get_device_properties", return_value=device_props),
+    ):
         TrtLlmArgs(
             model="dummy",
             skip_tokenizer_init=True,
@@ -387,9 +389,12 @@ def test_trt_llm_args_rejects_turboquant4_quant_config(tmp_path):
     device_props.major = 9
     device_props.minor = 0
 
-    with pytest.raises(
-        ValueError, match="TurboQuant4 KV cache is supported only by the PyTorch backend"
-    ), mock.patch("torch.cuda.get_device_properties", return_value=device_props):
+    with (
+        pytest.raises(
+            ValueError, match="TurboQuant4 KV cache is supported only by the PyTorch backend"
+        ),
+        mock.patch("torch.cuda.get_device_properties", return_value=device_props),
+    ):
         TrtLlmArgs(
             model="dummy",
             skip_tokenizer_init=True,

@@ -16,7 +16,8 @@
 import pytest
 from utils.runtime_defaults import assert_runtime_defaults_are_parsed_correctly
 
-from tensorrt_llm.models.modeling_utils import PretrainedConfig, QuantAlgo, QuantConfig
+from tensorrt_llm.models.modeling_utils import (PretrainedConfig, QuantAlgo,
+                                                QuantConfig)
 
 
 def test_pretrained_config_parses_runtime_defaults_correctly():

@@ -315,8 +315,7 @@ def _greedy_generate(
         logits = outputs.logits[:, -1, :]
         next_token = logits.argmax(dim=-1, keepdim=True)
         if step > 0:
-            token_logprob = torch.log_softmax(
-                logits.float(), dim=-1).gather(-1, next_token)
+            token_logprob = torch.log_softmax(logits.float(), dim=-1).gather(-1, next_token)
             decode_nll -= float(token_logprob.item())
             decode_token_count += 1
         generated = torch.cat([generated, next_token], dim=-1)
@@ -338,8 +337,7 @@ def _greedy_generate(
         token_ids=[int(token_id) for token_id in new_token_ids],
         contains_reference=_contains_reference(text, prompt.reference_contains),
         decode_token_count=decode_token_count,
-        decode_nll_per_token=(
-            decode_nll / decode_token_count if decode_token_count > 0 else None),
+        decode_nll_per_token=(decode_nll / decode_token_count if decode_token_count > 0 else None),
     )
 
 
@@ -349,8 +347,7 @@ def _compare_outputs(
     turbo_outputs: list[OutputRecord],
 ) -> tuple[list[PromptRecord], dict[str, Any]]:
     records = []
-    for prompt, baseline, turbo in zip(
-            prompts, baseline_outputs, turbo_outputs, strict=True):
+    for prompt, baseline, turbo in zip(prompts, baseline_outputs, turbo_outputs, strict=True):
         max_text_len = max(len(baseline.text), len(turbo.text), 1)
         normalized_text_distance = _levenshtein_distance(baseline.text, turbo.text) / max_text_len
         reference_regressed = bool(
@@ -380,19 +377,18 @@ def _compare_outputs(
         baseline = record.baseline
         turbo = record.turboquant4_qdq
         if baseline.decode_nll_per_token is not None:
-            baseline_decode_nll += (
-                baseline.decode_nll_per_token * baseline.decode_token_count)
+            baseline_decode_nll += baseline.decode_nll_per_token * baseline.decode_token_count
             baseline_decode_token_count += baseline.decode_token_count
         if turbo.decode_nll_per_token is not None:
-            turbo_decode_nll += (
-                turbo.decode_nll_per_token * turbo.decode_token_count)
+            turbo_decode_nll += turbo.decode_nll_per_token * turbo.decode_token_count
             turbo_decode_token_count += turbo.decode_token_count
 
     decode_nll_delta_per_token = None
     if baseline_decode_token_count > 0 and turbo_decode_token_count > 0:
         decode_nll_delta_per_token = (
             turbo_decode_nll / turbo_decode_token_count
-            - baseline_decode_nll / baseline_decode_token_count)
+            - baseline_decode_nll / baseline_decode_token_count
+        )
 
     summary = {
         "num_prompts": count,
@@ -536,11 +532,10 @@ def main() -> None:
         "max_reference_regressions": args.max_reference_regressions,
         "max_decode_nll_delta_per_token": args.max_decode_nll_delta_per_token,
     }
-    decode_nll_passed = (
-        args.max_decode_nll_delta_per_token is None
-        or (summary["decode_nll_delta_per_token"] is not None
-            and summary["decode_nll_delta_per_token"]
-            <= args.max_decode_nll_delta_per_token))
+    decode_nll_passed = args.max_decode_nll_delta_per_token is None or (
+        summary["decode_nll_delta_per_token"] is not None
+        and summary["decode_nll_delta_per_token"] <= args.max_decode_nll_delta_per_token
+    )
     passed = (
         summary["exact_token_match_rate"] >= args.min_exact_token_match_rate
         and summary["mean_token_prefix_agreement"] >= args.min_token_prefix_agreement

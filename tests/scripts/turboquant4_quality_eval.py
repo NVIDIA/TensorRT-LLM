@@ -256,9 +256,7 @@ def _resolve_sampling_token_ids(args: argparse.Namespace) -> None:
     try:
         from transformers import AutoTokenizer
     except ImportError as exc:
-        raise ValueError(
-            "--end-id is required when transformers is not available."
-        ) from exc
+        raise ValueError("--end-id is required when transformers is not available.") from exc
 
     tokenizer_name = args.tokenizer or args.model
     try:
@@ -272,15 +270,12 @@ def _resolve_sampling_token_ids(args: argparse.Namespace) -> None:
         ) from exc
 
     if tokenizer.eos_token_id is None:
-        raise ValueError(
-            "Tokenizer does not define eos_token_id. Pass --end-id explicitly."
-        )
+        raise ValueError("Tokenizer does not define eos_token_id. Pass --end-id explicitly.")
 
     args.end_id = int(tokenizer.eos_token_id)
     if args.pad_id is None:
         pad_token_id = tokenizer.pad_token_id
-        args.pad_id = int(
-            pad_token_id if pad_token_id is not None else args.end_id)
+        args.pad_id = int(pad_token_id if pad_token_id is not None else args.end_id)
 
 
 def _run_generation(

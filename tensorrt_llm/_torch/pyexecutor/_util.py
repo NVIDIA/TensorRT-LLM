@@ -75,14 +75,14 @@ def _sync_turboquant4_kv_cache_config(kv_cache_config: KvCacheConfig,
     kv_cache_quant_algo = getattr(quant_config, "kv_cache_quant_algo", None)
     kv_cache_quant_algo_value = getattr(kv_cache_quant_algo, "value",
                                         kv_cache_quant_algo)
-    has_turboquant4_quant_algo = (
-        isinstance(kv_cache_quant_algo_value, str)
-        and kv_cache_quant_algo_value.upper() == "TURBOQUANT4")
+    has_turboquant4_quant_algo = (isinstance(kv_cache_quant_algo_value, str)
+                                  and kv_cache_quant_algo_value.upper()
+                                  == "TURBOQUANT4")
     quant_mode = getattr(quant_config, "quant_mode", None)
-    has_turboquant4_kv_cache = (
-        kv_cache_config.dtype == "turboquant4" or
-        has_turboquant4_quant_algo or
-        (quant_mode is not None and quant_mode.has_turboquant4_kv_cache()))
+    has_turboquant4_kv_cache = (kv_cache_config.dtype == "turboquant4"
+                                or has_turboquant4_quant_algo
+                                or (quant_mode is not None
+                                    and quant_mode.has_turboquant4_kv_cache()))
     if has_turboquant4_kv_cache and kv_cache_config.dtype != "turboquant4":
         if kv_cache_config.dtype != "auto":
             logger.warning(
@@ -142,8 +142,7 @@ def get_kv_cache_manager_cls(
             )
         if sparse_attn_config is not None:
             raise ValueError(
-                "TurboQuant4 KV cache is not supported with sparse attention."
-            )
+                "TurboQuant4 KV cache is not supported with sparse attention.")
         if is_hybrid_model:
             raise ValueError(
                 "TurboQuant4 KV cache is not supported with hybrid Mamba "

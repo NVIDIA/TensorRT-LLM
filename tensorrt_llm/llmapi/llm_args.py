@@ -2701,15 +2701,13 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
                 '"turboquant4", or valid torch.dtype string')
 
         v = v.lower()
-        if v in ("auto", "fp8",
-                 "nvfp4",
+        if v in ("auto", "fp8", "nvfp4",
                  "turboquant4") or v in _str_to_torch_dtype_dict.keys():
             return v
 
         raise ValueError(
             'kv_cache_config.dtype must be one of "auto", "fp8", "nvfp4", '
-            '"turboquant4", or valid torch.dtype string'
-        )
+            '"turboquant4", or valid torch.dtype string')
 
     @field_validator('max_gpu_total_bytes')
     @classmethod

@@ -31,6 +31,7 @@ from tensorrt_llm._torch.modules.attention import Attention
 from tensorrt_llm._torch.modules.turboquant4 import (
     TURBOQUANT4_CENTROIDS,
     fwht,
+    read_turboquant4_dense_key_cache,
     turboquant4_attention,
     turboquant4_batch_attention,
     turboquant4_dequantize,
@@ -39,7 +40,6 @@ from tensorrt_llm._torch.modules.turboquant4 import (
     turboquant4_quantize,
     turboquant4_quantize_dequantize,
     turboquant4_update_cache,
-    read_turboquant4_dense_key_cache,
 )
 from tensorrt_llm._torch.pyexecutor import resource_manager as resource_manager_mod
 from tensorrt_llm._torch.pyexecutor._util import (
@@ -295,7 +295,9 @@ class TestTurboQuant4KVCacheManagerV2Buffers:
         assert manager.get_layer_bytes_per_token(0, Role.KEY) == key_bytes
         assert manager.get_layer_bytes_per_token(0, Role.VALUE) == value_bytes
         assert manager.get_layer_bytes_per_token(0, Role.VALUE_BLOCK_SCALE) == scale_bytes
-        assert manager.get_layer_bytes_per_token(0, Role.ALL) == key_bytes + value_bytes + scale_bytes
+        assert (
+            manager.get_layer_bytes_per_token(0, Role.ALL) == key_bytes + value_bytes + scale_bytes
+        )
         assert manager.get_cache_bytes_per_token() == key_bytes + value_bytes + scale_bytes
 
     def test_draft_token_relocation_rejects_turboquant4(self):
@@ -323,14 +325,13 @@ class TestTurboQuant4KVCacheManagerV2Buffers:
             )
 
     @pytest.mark.parametrize("torch_dtype", [torch.float32, "float32"])
-    def test_model_engine_turboquant4_kv_byte_size_uses_model_dtype(
-            self, torch_dtype):
+    def test_model_engine_turboquant4_kv_byte_size_uses_model_dtype(self, torch_dtype):
         engine = PyTorchModelEngine.__new__(PyTorchModelEngine)
         engine.model = SimpleNamespace(
             config=SimpleNamespace(torch_dtype=torch_dtype),
             model_config=SimpleNamespace(
-                quant_config=QuantConfig(
-                    kv_cache_quant_algo=QuantAlgo.TURBOQUANT4)),
+                quant_config=QuantConfig(kv_cache_quant_algo=QuantAlgo.TURBOQUANT4)
+            ),
         )
 
         assert engine.get_kv_cache_dtype_byte_size() == 4
@@ -603,9 +604,7 @@ class TestQuantizeDequantize:
         block_ids = torch.tensor([1], dtype=torch.int32, device="cuda")
 
         with pytest.raises(RuntimeError, match="block ids must be in"):
-            torch.ops.trtllm.turboquant4_update_cache(
-                x, codes, scales, block_ids, 0, 0, 4
-            )
+            torch.ops.trtllm.turboquant4_update_cache(x, codes, scales, block_ids, 0, 0, 4)
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     def test_native_batch_attention_rejects_out_of_range_block_id(self):
@@ -1342,8 +1341,8 @@ class TestPackedCache:
         torch.testing.assert_close(scales[0, 1, 2:], expected_scales[0, :1])
         torch.testing.assert_close(scales[2, 1, :3], expected_scales[0, 1:])
         torch.testing.assert_close(
-            result[2:],
-            turboquant4_quantize_dequantize(x.unsqueeze(0)).squeeze(0))
+            result[2:], turboquant4_quantize_dequantize(x.unsqueeze(0)).squeeze(0)
+        )
 
     def test_cache_helpers_validate_shape_contract(self):
         codes = torch.zeros(1, 2, 4, 2, 64, dtype=torch.uint8)
@@ -1590,12 +1589,16 @@ class TestPackedCache:
             attention_window_size=None,
         )
 
-        key_states = turboquant4_dequantize_cache(
-            codes, scales, block_ids, 0, 3, tokens_per_block, q.dtype
-        ).unsqueeze(0).transpose(1, 2)
-        value_states = turboquant4_dequantize_cache(
-            codes, scales, block_ids, 1, 3, tokens_per_block, q.dtype
-        ).unsqueeze(0).transpose(1, 2)
+        key_states = (
+            turboquant4_dequantize_cache(codes, scales, block_ids, 0, 3, tokens_per_block, q.dtype)
+            .unsqueeze(0)
+            .transpose(1, 2)
+        )
+        value_states = (
+            turboquant4_dequantize_cache(codes, scales, block_ids, 1, 3, tokens_per_block, q.dtype)
+            .unsqueeze(0)
+            .transpose(1, 2)
+        )
         key_states = repeat_kv(key_states, num_heads // num_kv_heads)
         value_states = repeat_kv(value_states, num_heads // num_kv_heads)
         expected = (
@@ -1639,12 +1642,20 @@ class TestPackedCache:
             attention_window_size=3,
         )
 
-        key_states = turboquant4_dequantize_cache(
-            codes, scales, block_ids, 0, seq_len, tokens_per_block, q.dtype
-        ).unsqueeze(0).transpose(1, 2)
-        value_states = turboquant4_dequantize_cache(
-            codes, scales, block_ids, 1, seq_len, tokens_per_block, q.dtype
-        ).unsqueeze(0).transpose(1, 2)
+        key_states = (
+            turboquant4_dequantize_cache(
+                codes, scales, block_ids, 0, seq_len, tokens_per_block, q.dtype
+            )
+            .unsqueeze(0)
+            .transpose(1, 2)
+        )
+        value_states = (
+            turboquant4_dequantize_cache(
+                codes, scales, block_ids, 1, seq_len, tokens_per_block, q.dtype
+            )
+            .unsqueeze(0)
+            .transpose(1, 2)
+        )
         key_states = repeat_kv(key_states, num_heads // num_kv_heads)
         value_states = repeat_kv(value_states, num_heads // num_kv_heads)
         allowed = torch.tensor([[[[False, False, False, True, True, True]]]])
@@ -2007,8 +2018,7 @@ class TestVanillaPackedCache:
         assert value_scales.shape[-1] == 1
 
         expected_k = torch.cat([prefill_k, decode_k], dim=1)
-        expected_v = torch.cat(
-            [turboquant4_quantize_dequantize(prefill_v), decode_v], dim=1)
+        expected_v = torch.cat([turboquant4_quantize_dequantize(prefill_v), decode_v], dim=1)
         torch.testing.assert_close(key_states, expected_k)
         torch.testing.assert_close(value_states, expected_v)
 
@@ -2018,7 +2028,9 @@ class TestVanillaPackedCache:
         tokens_per_block = 4
         block_ids = [0, 1]
         key_cache = torch.empty(2, tokens_per_block, num_kv_heads, head_dim)
-        value_cache = torch.empty(2, tokens_per_block, num_kv_heads, head_dim // 2, dtype=torch.uint8)
+        value_cache = torch.empty(
+            2, tokens_per_block, num_kv_heads, head_dim // 2, dtype=torch.uint8
+        )
         value_scales = torch.empty(2, tokens_per_block, num_kv_heads, 1)
         attention = VanillaAttention(
             layer_idx=0,
@@ -2053,14 +2065,11 @@ class TestVanillaPackedCache:
         q_len = 2
         tokens_per_block = 4
         key_cache = torch.empty(1, tokens_per_block, num_kv_heads, head_dim)
-        value_cache = torch.empty(1,
-                                  tokens_per_block,
-                                  num_kv_heads,
-                                  head_dim // 2,
-                                  dtype=torch.uint8)
+        value_cache = torch.empty(
+            1, tokens_per_block, num_kv_heads, head_dim // 2, dtype=torch.uint8
+        )
         value_scales = torch.empty(1, tokens_per_block, num_kv_heads, 1)
-        manager = _FakeTurboQuant4KVCacheManager(
-            key_cache, value_cache, value_scales, [0])
+        manager = _FakeTurboQuant4KVCacheManager(key_cache, value_cache, value_scales, [0])
         attention = VanillaAttention(
             layer_idx=0,
             num_heads=num_heads,
@@ -2218,12 +2227,12 @@ class TestTrtllmPackedCache:
         head_dim = 128
         tokens_per_block = 4
         key_cache = torch.empty(2, tokens_per_block, num_kv_heads, head_dim)
-        value_cache = torch.empty(2, tokens_per_block, num_kv_heads, head_dim // 2, dtype=torch.uint8)
+        value_cache = torch.empty(
+            2, tokens_per_block, num_kv_heads, head_dim // 2, dtype=torch.uint8
+        )
         value_scales = torch.empty(2, tokens_per_block, num_kv_heads, 1, dtype=torch.float32)
         block_ids = [0, 1]
-        kv_manager = _FakeTurboQuant4KVCacheManager(
-            key_cache, value_cache, value_scales, block_ids
-        )
+        kv_manager = _FakeTurboQuant4KVCacheManager(key_cache, value_cache, value_scales, block_ids)
         attention = self._make_attention(num_heads, num_kv_heads, head_dim)
 
         prefill_q = torch.randn(4, num_heads * head_dim)
@@ -2325,8 +2334,7 @@ class TestTrtllmPackedCache:
         q = decode_q.view(1, 1, num_heads, head_dim).transpose(1, 2)
         expected_key = repeat_kv(expected_k.transpose(1, 2), 2)
         expected_attention_v = expected_v.clone()
-        expected_attention_v[:, -1:] = decode_v.view(1, 1, num_kv_heads,
-                                                      head_dim)
+        expected_attention_v[:, -1:] = decode_v.view(1, 1, num_kv_heads, head_dim)
         expected_value = repeat_kv(expected_attention_v.transpose(1, 2), 2)
         expected_output = (
             torch.nn.functional.scaled_dot_product_attention(
@@ -2347,7 +2355,9 @@ class TestTrtllmPackedCache:
         head_dim = 128
         tokens_per_block = 4
         key_cache = torch.empty(2, tokens_per_block, num_kv_heads, head_dim)
-        value_cache = torch.empty(2, tokens_per_block, num_kv_heads, head_dim // 2, dtype=torch.uint8)
+        value_cache = torch.empty(
+            2, tokens_per_block, num_kv_heads, head_dim // 2, dtype=torch.uint8
+        )
         value_scales = torch.empty(2, tokens_per_block, num_kv_heads, 1, dtype=torch.float32)
         block_ids_per_request = [[0], [1]]
         kv_manager = _FakeTurboQuant4KVCacheManager(
@@ -2406,16 +2416,13 @@ class TestTrtllmPackedCache:
             torch.testing.assert_close(cached_k, expected_k)
             torch.testing.assert_close(cached_v, expected_v)
 
-            q_states = q[offset:offset + q_len].view(1, q_len, num_heads,
-                                                     head_dim).transpose(1, 2)
-            dense_k = k[offset:offset + q_len].view(1, q_len, num_kv_heads,
-                                                    head_dim)
-            dense_v = v[offset:offset + q_len].view(1, q_len, num_kv_heads,
-                                                    head_dim)
-            key_states = repeat_kv(dense_k.transpose(1, 2),
-                                   num_heads // num_kv_heads)
-            value_states = repeat_kv(dense_v.transpose(1, 2),
-                                     num_heads // num_kv_heads)
+            q_states = (
+                q[offset : offset + q_len].view(1, q_len, num_heads, head_dim).transpose(1, 2)
+            )
+            dense_k = k[offset : offset + q_len].view(1, q_len, num_kv_heads, head_dim)
+            dense_v = v[offset : offset + q_len].view(1, q_len, num_kv_heads, head_dim)
+            key_states = repeat_kv(dense_k.transpose(1, 2), num_heads // num_kv_heads)
+            value_states = repeat_kv(dense_v.transpose(1, 2), num_heads // num_kv_heads)
             expected_chunks.append(
                 torch.nn.functional.scaled_dot_product_attention(
                     q_states,
@@ -2437,7 +2444,9 @@ class TestTrtllmPackedCache:
         head_dim = 128
         tokens_per_block = 4
         key_cache = torch.empty(3, tokens_per_block, num_kv_heads, head_dim)
-        value_cache = torch.empty(3, tokens_per_block, num_kv_heads, head_dim // 2, dtype=torch.uint8)
+        value_cache = torch.empty(
+            3, tokens_per_block, num_kv_heads, head_dim // 2, dtype=torch.uint8
+        )
         value_scales = torch.empty(3, tokens_per_block, num_kv_heads, 1, dtype=torch.float32)
         block_ids_per_request = [[0, 1], [2]]
         kv_manager = _FakeTurboQuant4KVCacheManager(
@@ -2516,12 +2525,12 @@ class TestTrtllmPackedCache:
             mixed_q.dtype,
         )
         cached_v_decode_for_attention = cached_v_decode.clone()
-        cached_v_decode_for_attention[:, -1:] = mixed_v[:1].view(
-            1, 1, num_kv_heads, head_dim)
+        cached_v_decode_for_attention[:, -1:] = mixed_v[:1].view(1, 1, num_kv_heads, head_dim)
         decode_q = mixed_q[:1].view(1, 1, num_heads, head_dim).transpose(1, 2)
         decode_key = repeat_kv(cached_k_decode.transpose(1, 2), num_heads // num_kv_heads)
-        decode_value = repeat_kv(cached_v_decode_for_attention.transpose(1, 2),
-                                 num_heads // num_kv_heads)
+        decode_value = repeat_kv(
+            cached_v_decode_for_attention.transpose(1, 2), num_heads // num_kv_heads
+        )
         expected_decode = (
             torch.nn.functional.scaled_dot_product_attention(
                 decode_q,
@@ -2578,12 +2587,12 @@ class TestTrtllmPackedCache:
         head_dim = 128
         tokens_per_block = 4
         key_cache = torch.empty(2, tokens_per_block, num_kv_heads, head_dim)
-        value_cache = torch.empty(2, tokens_per_block, num_kv_heads, head_dim // 2, dtype=torch.uint8)
+        value_cache = torch.empty(
+            2, tokens_per_block, num_kv_heads, head_dim // 2, dtype=torch.uint8
+        )
         value_scales = torch.empty(2, tokens_per_block, num_kv_heads, 1, dtype=torch.float32)
         block_ids = [0, 1]
-        kv_manager = _FakeTurboQuant4KVCacheManager(
-            key_cache, value_cache, value_scales, block_ids
-        )
+        kv_manager = _FakeTurboQuant4KVCacheManager(key_cache, value_cache, value_scales, block_ids)
         attention = self._make_attention(num_heads, num_kv_heads, head_dim)
         q = torch.randn(2, num_heads * head_dim)
         k = torch.randn(1, num_kv_heads * head_dim)
@@ -2736,12 +2745,12 @@ class TestTrtllmPackedCache:
         head_dim = 128
         tokens_per_block = 4
         key_cache = torch.empty(1, tokens_per_block, num_kv_heads, head_dim)
-        value_cache = torch.empty(1, tokens_per_block, num_kv_heads, head_dim // 2, dtype=torch.uint8)
+        value_cache = torch.empty(
+            1, tokens_per_block, num_kv_heads, head_dim // 2, dtype=torch.uint8
+        )
         value_scales = torch.empty(1, tokens_per_block, num_kv_heads, 1, dtype=torch.float32)
         block_ids = [0]
-        kv_manager = _FakeTurboQuant4KVCacheManager(
-            key_cache, value_cache, value_scales, block_ids
-        )
+        kv_manager = _FakeTurboQuant4KVCacheManager(key_cache, value_cache, value_scales, block_ids)
         attention = self._make_attention(num_heads, num_kv_heads, head_dim)
         rotary = _FakeRotaryEmbedding()
         attention.turboquant4_rotary_emb = rotary
@@ -2790,11 +2799,11 @@ class TestTrtllmPackedCache:
         head_dim = 128
         tokens_per_block = 4
         key_cache = torch.empty(1, tokens_per_block, num_kv_heads, head_dim)
-        value_cache = torch.empty(1, tokens_per_block, num_kv_heads, head_dim // 2, dtype=torch.uint8)
-        value_scales = torch.empty(1, tokens_per_block, num_kv_heads, 1, dtype=torch.float32)
-        kv_manager = _FakeTurboQuant4KVCacheManager(
-            key_cache, value_cache, value_scales, [0]
+        value_cache = torch.empty(
+            1, tokens_per_block, num_kv_heads, head_dim // 2, dtype=torch.uint8
         )
+        value_scales = torch.empty(1, tokens_per_block, num_kv_heads, 1, dtype=torch.float32)
+        kv_manager = _FakeTurboQuant4KVCacheManager(key_cache, value_cache, value_scales, [0])
         attention = self._make_attention(num_heads, num_kv_heads, head_dim)
         metadata = SimpleNamespace(
             beam_width=1,
@@ -2829,11 +2838,11 @@ class TestTrtllmPackedCache:
         head_dim = 128
         tokens_per_block = 4
         key_cache = torch.empty(1, tokens_per_block, num_kv_heads, head_dim)
-        value_cache = torch.empty(1, tokens_per_block, num_kv_heads, head_dim // 2, dtype=torch.uint8)
-        value_scales = torch.empty(1, tokens_per_block, num_kv_heads, 1, dtype=torch.float32)
-        kv_manager = _FakeTurboQuant4KVCacheManager(
-            key_cache, value_cache, value_scales, [0]
+        value_cache = torch.empty(
+            1, tokens_per_block, num_kv_heads, head_dim // 2, dtype=torch.uint8
         )
+        value_scales = torch.empty(1, tokens_per_block, num_kv_heads, 1, dtype=torch.float32)
+        kv_manager = _FakeTurboQuant4KVCacheManager(key_cache, value_cache, value_scales, [0])
         attention = self._make_attention(num_heads, num_kv_heads, head_dim)
         metadata = SimpleNamespace(
             beam_width=1,
@@ -2868,14 +2877,15 @@ class TestTrtllmPackedCache:
         head_dim = 128
         tokens_per_block = 4
         key_cache = torch.empty(1, tokens_per_block, num_kv_heads, head_dim)
-        value_cache = torch.empty(1, tokens_per_block, num_kv_heads, head_dim // 2, dtype=torch.uint8)
-        value_scales = torch.empty(1, tokens_per_block, num_kv_heads, 1, dtype=torch.float32)
-        kv_manager = _FakeTurboQuant4KVCacheManager(
-            key_cache, value_cache, value_scales, [0]
+        value_cache = torch.empty(
+            1, tokens_per_block, num_kv_heads, head_dim // 2, dtype=torch.uint8
         )
+        value_scales = torch.empty(1, tokens_per_block, num_kv_heads, 1, dtype=torch.float32)
+        kv_manager = _FakeTurboQuant4KVCacheManager(key_cache, value_cache, value_scales, [0])
         attention = self._make_attention(num_heads, num_kv_heads, head_dim)
         attention.pos_embd_params = SimpleNamespace(
-            type=SimpleNamespace(is_mrope=lambda: True, is_rope=lambda: True))
+            type=SimpleNamespace(is_mrope=lambda: True, is_rope=lambda: True)
+        )
         metadata = SimpleNamespace(
             beam_width=1,
             enable_helix=False,
@@ -2967,8 +2977,7 @@ class TestTrtllmPackedCache:
             is_neox=True,
             type=SimpleNamespace(is_mrope=lambda: False, is_rope=lambda: True),
         )
-        monkeypatch.setattr(trtllm_backend, "RotaryEmbedding",
-                            FakeRotaryEmbedding)
+        monkeypatch.setattr(trtllm_backend, "RotaryEmbedding", FakeRotaryEmbedding)
 
         assert attention.turboquant4_rotary_emb is None
         assert calls == []
@@ -2981,7 +2990,8 @@ class TestTrtllmPackedCache:
     def test_turboquant4_rotary_embedding_rejects_non_rope(self):
         attention = self._make_attention(head_dim=128)
         attention.pos_embd_params = SimpleNamespace(
-            type=SimpleNamespace(is_mrope=lambda: False, is_rope=lambda: False))
+            type=SimpleNamespace(is_mrope=lambda: False, is_rope=lambda: False)
+        )
 
         with pytest.raises(NotImplementedError, match="RoPE positional"):
             attention._get_turboquant4_rotary_emb()

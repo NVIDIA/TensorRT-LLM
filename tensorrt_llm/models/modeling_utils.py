@@ -206,9 +206,8 @@ class QuantConfig(StrictBaseModel):
         return self.quant_algo in (set(QUANT_ALGO_LIST) - {
             QuantAlgo.W8A16, QuantAlgo.W4A16,
             QuantAlgo.FP8_PER_CHANNEL_PER_TOKEN
-        }) or self.kv_cache_quant_algo in (set(KV_CACHE_QUANT_ALGO_LIST) - {
-            QuantAlgo.TURBOQUANT4
-        })
+        }) or self.kv_cache_quant_algo in (set(KV_CACHE_QUANT_ALGO_LIST) -
+                                           {QuantAlgo.TURBOQUANT4})
 
     @property
     def _requires_modelopt_quantization(self):
