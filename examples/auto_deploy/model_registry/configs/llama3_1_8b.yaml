@@ -9,6 +9,19 @@ attn_backend: trtllm
 max_batch_size: 256
 max_seq_len: 16384
 transforms:
+  detect_sharding:
+    allreduce_strategy: SYMM_MEM
+    sharding_source: ['manual']
+    manual_config:
+      head_dim: 128
+      tp_plan:
+        "q_proj": "colwise"
+        "k_proj": "colwise"
+        "v_proj": "colwise"
+        "o_proj": "rowwise"
+        "gate_proj": "colwise"
+        "up_proj": "colwise"
+        "down_proj": "rowwise"
   fuse_trtllm_attn_quant_fp8:
     enabled: true
   fuse_fp8_gemms:
@@ -22,3 +35,10 @@ transforms:
   fuse_silu_mul:
     enabled: true
     backend: trtllm
+  compile_model:
+    piecewise_enabled: true
+  mlir_elementwise_fusion:
+    stage: post_load_fusion
+    enabled: true
+    run_shape_prop: false
+    bypass_ops: []
