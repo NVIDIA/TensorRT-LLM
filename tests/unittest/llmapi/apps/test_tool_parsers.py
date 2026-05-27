@@ -2442,6 +2442,22 @@ class TestPoolsideV1ToolParser(BaseToolParserTestClass):
         assert "suffix" in result.normal_text
         assert len(result.calls) == 1
 
+    def test_detect_and_parse_allows_end_tag_text_in_string_arg(
+            self, sample_tools, parser):
+        text = ("<tool_call>search_web\n"
+                "<arg_key>query</arg_key>\n"
+                "<arg_value>literal </tool_call> marker</arg_value>\n"
+                "</tool_call>")
+
+        result = parser.detect_and_parse(text, sample_tools)
+
+        assert result.normal_text == ""
+        assert len(result.calls) == 1
+        assert result.calls[0].name == "search_web"
+        assert json.loads(result.calls[0].parameters) == {
+            "query": "literal </tool_call> marker"
+        }
+
     def test_schema_aware_argument_coercion(self, parser):
         tools = [
             ChatCompletionToolsParam(
@@ -2511,18 +2527,50 @@ class TestPoolsideV1ToolParser(BaseToolParserTestClass):
 
         result = parser.parse_streaming_increment("_call>get_weather\n<arg",
                                                   sample_tools)
-        assert len(result.calls) == 1
-        assert result.calls[0].tool_index == 0
-        assert result.calls[0].name == "get_weather"
-        assert result.calls[0].parameters == ""
+        assert result.normal_text == ""
+        assert len(result.calls) == 0
 
         result = parser.parse_streaming_increment(
             "_key>location</arg_key>"
             "<arg_value>SF</arg_value>"
             "</tool_call>", sample_tools)
-        assert len(result.calls) == 1
+        assert len(result.calls) == 2
         assert result.calls[0].tool_index == 0
-        assert json.loads(result.calls[0].parameters) == {"location": "SF"}
+        assert result.calls[0].name == "get_weather"
+        assert result.calls[0].parameters == ""
+        assert result.calls[1].tool_index == 0
+        assert json.loads(result.calls[1].parameters) == {"location": "SF"}
+
+    def test_parse_streaming_increment_buffers_truncated_tool_call(
+            self, sample_tools, parser):
+        result = parser.parse_streaming_increment(
+            "<tool_call>get_weather\n"
+            "<arg_key>location</arg_key>\n"
+            "<arg_value>SF",
+            sample_tools,
+        )
+
+        assert result.normal_text == ""
+        assert len(result.calls) == 0
+
+    def test_parse_streaming_increment_allows_end_tag_text_in_string_arg(
+            self, sample_tools, parser):
+        result = parser.parse_streaming_increment(
+            "<tool_call>search_web\n"
+            "<arg_key>query</arg_key>\n"
+            "<arg_value>literal </tool_call> marker</arg_value>\n"
+            "</tool_call>",
+            sample_tools,
+        )
+
+        assert len(result.calls) == 2
+        assert result.calls[0].tool_index == 0
+        assert result.calls[0].name == "search_web"
+        assert result.calls[0].parameters == ""
+        assert result.calls[1].tool_index == 0
+        assert json.loads(result.calls[1].parameters) == {
+            "query": "literal </tool_call> marker"
+        }
 
     def test_parse_streaming_increment_multiple_tools(self, sample_tools,
                                                       parser):

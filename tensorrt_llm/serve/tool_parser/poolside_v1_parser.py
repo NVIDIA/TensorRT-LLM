@@ -14,7 +14,7 @@
 # limitations under the License.
 import json
 import re
-from typing import Any, List, Optional
+from typing import Any
 
 from tensorrt_llm.logger import logger
 from tensorrt_llm.serve.openai_protocol import ChatCompletionToolsParam as Tool
@@ -26,8 +26,16 @@ from tensorrt_llm.serve.tool_parser.core_types import (
 )
 from tensorrt_llm.serve.tool_parser.utils import infer_type_from_json_schema
 
+TOOL_CALL_START = "<tool_call>"  # nosec B105
+TOOL_CALL_END = "</tool_call>"  # nosec B105
+ARG_KEY_START = "<arg_key>"  # nosec B105
+ARG_KEY_END = "</arg_key>"  # nosec B105
+ARG_VALUE_START = "<arg_value>"  # nosec B105
+ARG_VALUE_END = "</arg_value>"  # nosec B105
 
-def _get_argument_type(func_name: str, arg_key: str, tools: List[Tool]) -> Optional[str]:
+
+def _get_argument_type(func_name: str, arg_key: str, tools: list[Tool]) -> str | None:
+    """Return the JSON-schema type for a tool argument, if declared."""
     name_to_tool = {tool.function.name: tool for tool in tools}
     tool = name_to_tool.get(func_name)
     if tool is None:
@@ -45,12 +53,14 @@ def _get_argument_type(func_name: str, arg_key: str, tools: List[Tool]) -> Optio
 
 
 def _convert_number(value: str) -> Any:
+    """Convert a numeric string to int or float."""
     if "." in value or "e" in value.lower():
         return float(value)
     return int(value)
 
 
-def _parse_argument_value(value: str, arg_type: Optional[str]) -> Any:
+def _parse_argument_value(value: str, arg_type: str | None) -> Any:
+    """Parse a raw argument value according to its schema type."""
     value = value.strip()
 
     if arg_type == "string":
@@ -95,7 +105,7 @@ def _parse_argument_value(value: str, arg_type: Optional[str]) -> Any:
 
 
 class PoolsideV1ToolParser(BaseToolParser):
-    r"""Tool parser for Poolside Laguna's v1 function call format.
+    """Tool parser for Poolside Laguna's function call format.
 
     The Laguna chat template asks the model to emit tool calls as:
 
@@ -110,36 +120,47 @@ class PoolsideV1ToolParser(BaseToolParser):
 
     def __init__(self):
         super().__init__()
-        self.bot_token = "<tool_call>"  # nosec B105
-        self.eot_token = "</tool_call>"  # nosec B105
-        self.func_call_regex = re.compile(r"<tool_call>.*?</tool_call>", re.DOTALL)
-        self.func_detail_regex = re.compile(
-            r"<tool_call>(.*?)(<arg_key>.*?)?</tool_call>", re.DOTALL
-        )
+        self.bot_token = TOOL_CALL_START
+        self.eot_token = TOOL_CALL_END
+        # Match each <arg_key>...</arg_key> / <arg_value>...</arg_value> pair,
+        # allowing either real whitespace or a literal "\n" between the tags.
         self.func_arg_regex = re.compile(
-            r"<arg_key>(.*?)</arg_key>(?:\\n|\s)*<arg_value>(.*?)</arg_value>",
+            rf"{ARG_KEY_START}(.*?){ARG_KEY_END}(?:\\n|\s)*{ARG_VALUE_START}(.*?){ARG_VALUE_END}",
             re.DOTALL,
         )
 
     def has_tool_call(self, text: str) -> bool:
         return self.bot_token in text
 
-    def detect_and_parse(self, text: str, tools: List[Tool]) -> StreamingParseResult:
+    def detect_and_parse(self, text: str, tools: list[Tool]) -> StreamingParseResult:
+        """Parse complete generated text.
+
+        Returns a StreamingParseResult containing normal text with tool blocks
+        removed and one ToolCallItem per complete Poolside v1 tool call.
+        """
         if self.bot_token not in text:
             return StreamingParseResult(normal_text=text, calls=[])
 
         normal_text_parts = []
         match_texts = []
-        last_end = 0
+        cursor = 0
 
-        for match in self.func_call_regex.finditer(text):
-            if match.start() > last_end:
-                normal_text_parts.append(text[last_end : match.start()])
-            last_end = match.end()
-            match_texts.append(match.group(0))
+        while cursor < len(text):
+            bot_idx = text.find(self.bot_token, cursor)
+            if bot_idx == -1:
+                normal_text_parts.append(text[cursor:])
+                break
 
-        if last_end < len(text):
-            normal_text_parts.append(text[last_end:])
+            normal_text_parts.append(text[cursor:bot_idx])
+            block_end = self._find_complete_tool_call_end(text, bot_idx)
+            if block_end is None:
+                # Non-streaming output cannot receive more chunks, so preserve
+                # the malformed/incomplete tool block as normal assistant text.
+                normal_text_parts.append(text[bot_idx:])
+                break
+
+            match_texts.append(text[bot_idx:block_end])
+            cursor = block_end
 
         calls = []
         for match_text in match_texts:
@@ -149,7 +170,13 @@ class PoolsideV1ToolParser(BaseToolParser):
 
         return StreamingParseResult(normal_text="".join(normal_text_parts).strip(), calls=calls)
 
-    def parse_streaming_increment(self, new_text: str, tools: List[Tool]) -> StreamingParseResult:
+    def parse_streaming_increment(self, new_text: str, tools: list[Tool]) -> StreamingParseResult:
+        """Parse one streaming text increment.
+
+        Returns normal text that can be emitted immediately plus tool-call
+        deltas for any complete tool-call blocks. Incomplete tool calls remain
+        buffered and produce no tool-call delta.
+        """
         self._buffer += new_text
         normal_text_parts: list[str] = []
         calls: list[ToolCallItem] = []
@@ -167,14 +194,10 @@ class PoolsideV1ToolParser(BaseToolParser):
                 normal_text_parts.append(self._buffer[:bot_idx])
                 self._buffer = self._buffer[bot_idx:]
 
-            eot_idx = self._buffer.find(self.eot_token)
-            if eot_idx == -1:
-                name = self._extract_partial_function_name(self._buffer)
-                if name and not self.current_tool_name_sent:
-                    calls.append(self._start_streaming_tool_call(name))
+            block_end = self._find_complete_tool_call_end(self._buffer, 0)
+            if block_end is None:
                 break
 
-            block_end = eot_idx + len(self.eot_token)
             block = self._buffer[:block_end]
             call = self._parse_tool_call_block(block, tools)
             if call is not None:
@@ -195,22 +218,35 @@ class PoolsideV1ToolParser(BaseToolParser):
         return StreamingParseResult(normal_text="".join(normal_text_parts), calls=calls)
 
     def supports_structural_tag(self) -> bool:
+        """Return whether this parser supports strict structural tags."""
         return False
 
     def structure_info(self) -> _GetInfoFunc:
+        """Return structural tag info for guided decoding."""
         raise NotImplementedError()
 
-    def _parse_tool_call_block(self, text: str, tools: List[Tool]) -> Optional[ToolCallItem]:
-        match = self.func_detail_regex.search(text)
-        if match is None:
+    def _parse_tool_call_block(self, text: str, tools: list[Tool]) -> ToolCallItem | None:
+        """Parse one complete <tool_call>...</tool_call> block.
+
+        Returns a ToolCallItem with JSON-encoded arguments, or None when the
+        block is malformed or has no function name.
+        """
+        if not text.startswith(self.bot_token) or not text.endswith(self.eot_token):
             return None
 
-        func_name = match.group(1).strip() if match.group(1) else ""
+        inner_text = text[len(self.bot_token) : -len(self.eot_token)]
+        arg_start_idx = inner_text.find(ARG_KEY_START)
+        if arg_start_idx == -1:
+            func_name = inner_text.strip()
+            func_args = ""
+        else:
+            func_name = inner_text[:arg_start_idx].strip()
+            func_args = inner_text[arg_start_idx:]
+
         if not func_name:
             logger.warning("Empty Poolside v1 tool call name detected, skipping tool call")
             return None
 
-        func_args = match.group(2) if match.group(2) else ""
         arguments = self._parse_argument_pairs(
             self.func_arg_regex.findall(func_args), func_name, tools
         )
@@ -225,7 +261,11 @@ class PoolsideV1ToolParser(BaseToolParser):
             parameters=json.dumps(arguments, ensure_ascii=False),
         )
 
-    def _parse_argument_pairs(self, pairs, func_name: str, tools: List[Tool]) -> dict[str, Any]:
+    def _parse_argument_pairs(self, pairs, func_name: str, tools: list[Tool]) -> dict[str, Any]:
+        """Convert regex argument key/value matches into a Python dict.
+
+        Returns argument names mapped to schema-coerced Python values.
+        """
         arguments = {}
         for arg_key, arg_value in pairs:
             arg_key = arg_key.strip()
@@ -233,18 +273,40 @@ class PoolsideV1ToolParser(BaseToolParser):
             arguments[arg_key] = _parse_argument_value(arg_value, arg_type)
         return arguments
 
-    def _extract_partial_function_name(self, text: str) -> str:
-        inner_text = text[len(self.bot_token) :]
-        arg_idx = inner_text.find("<arg_key>")
-        newline_idx = inner_text.find("\n")
+    def _find_complete_tool_call_end(self, text: str, start_idx: int) -> int | None:
+        """Find the end of a complete tool-call block.
 
-        candidates = [idx for idx in (arg_idx, newline_idx) if idx != -1]
-        if not candidates:
-            return ""
+        Returns the exclusive end index of the matching </tool_call>, or None
+        if the block is incomplete. </tool_call> text inside <arg_value> is
+        treated as argument content.
+        """
+        pos = start_idx + len(self.bot_token)
+        in_arg_value = False
+        while pos < len(text):
+            if in_arg_value:
+                arg_value_end_idx = text.find(ARG_VALUE_END, pos)
+                if arg_value_end_idx == -1:
+                    return None
+                pos = arg_value_end_idx + len(ARG_VALUE_END)
+                in_arg_value = False
+                continue
 
-        return inner_text[: min(candidates)].strip()
+            eot_idx = text.find(self.eot_token, pos)
+            arg_value_start_idx = text.find(ARG_VALUE_START, pos)
+            # Only treat </tool_call> as the block end when it appears before
+            # the next <arg_value>; otherwise it is part of the argument text.
+            if eot_idx != -1 and (arg_value_start_idx == -1 or eot_idx < arg_value_start_idx):
+                return eot_idx + len(self.eot_token)
+            if arg_value_start_idx == -1:
+                return None
+
+            pos = arg_value_start_idx + len(ARG_VALUE_START)
+            in_arg_value = True
+
+        return None
 
     def _start_streaming_tool_call(self, func_name: str) -> ToolCallItem:
+        """Create the streaming delta that announces a new tool name."""
         if self.current_tool_id == -1:
             self.current_tool_id = 0
 
