@@ -22,6 +22,8 @@ WARMUP_TOKENS="${WARMUP_TOKENS:-${MAX_TOKENS}}"
 KV_CACHE_FREE_FRACTION="${KV_CACHE_FREE_FRACTION:-0.25}"
 RESPONSE_TIMEOUT_S="${RESPONSE_TIMEOUT_S:-30}"
 PROMPT="${PROMPT:-请讲一个约5000字的中文故事，要求情节完整、人物清楚、语言自然。}"
+CUDA_GRAPH="${CUDA_GRAPH:-0}"
+TRACE="${TRACE:-1}"
 
 TARGET_TRACE_LOG="${TARGET_TRACE_LOG:-${OUT_DIR}/target_trace.jsonl}"
 DRAFT_TRACE_LOG="${DRAFT_TRACE_LOG:-${OUT_DIR}/draft_trace.jsonl}"
@@ -35,7 +37,9 @@ export TLLM_RDMA_DRAFT_OFFLOAD_RESPONSE_TIMEOUT_S="${TLLM_RDMA_DRAFT_OFFLOAD_RES
 # Keep the target trace/log scoped to this run. The draft server may be a
 # long-lived process, so its trace is filtered by target run_start/run_finish
 # in the summary below instead of being truncated here.
-: > "${TARGET_TRACE_LOG}"
+if [[ "${TRACE}" == "1" || "${TRACE}" == "true" ]]; then
+  : > "${TARGET_TRACE_LOG}"
+fi
 : > "${TARGET_LOG}"
 
 echo "===== PEARL target one case ====="
@@ -51,6 +55,16 @@ echo "max_draft_len: ${MAX_DRAFT_LEN}"
 echo "max_tokens: ${MAX_TOKENS}"
 echo "warmup_tokens: ${WARMUP_TOKENS}"
 echo "response_timeout_s: ${TLLM_RDMA_DRAFT_OFFLOAD_RESPONSE_TIMEOUT_S}"
+echo "cuda_graph: ${CUDA_GRAPH}"
+echo "trace: ${TRACE}"
+
+EXTRA_ARGS=()
+if [[ "${CUDA_GRAPH}" == "1" || "${CUDA_GRAPH}" == "true" ]]; then
+  EXTRA_ARGS+=(--cuda-graph)
+fi
+if [[ "${TRACE}" == "1" || "${TRACE}" == "true" ]]; then
+  EXTRA_ARGS+=(--trace-log "${TARGET_TRACE_LOG}")
+fi
 
 python3 examples/llm-api/rdma/spec_dec_pearl_target_main.py \
   --target-model "${TARGET_MODEL}" \
@@ -67,7 +81,7 @@ python3 examples/llm-api/rdma/spec_dec_pearl_target_main.py \
   --warmup-tokens "${WARMUP_TOKENS}" \
   --kv-cache-free-fraction "${KV_CACHE_FREE_FRACTION}" \
   --prompt "${PROMPT}" \
-  --trace-log "${TARGET_TRACE_LOG}" \
+  "${EXTRA_ARGS[@]}" \
   2>&1 | tee -a "${TARGET_LOG}"
 
 OUT_DIR="${OUT_DIR}" \

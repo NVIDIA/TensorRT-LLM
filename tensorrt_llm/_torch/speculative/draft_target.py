@@ -36,6 +36,7 @@ from ..distributed.ops import allgather
 from ..pyexecutor.sampler import TorchSampler
 from .interface import SpecMetadata, SpecWorkerBase
 from .mtp import MTPSampler
+from .pearl_trace import enabled as _pearl_trace_enabled
 from .pearl_trace import log as _pearl_log
 from .pearl_trace import tensor_rows as _pearl_tensor_rows
 from .pearl_trace import to_int_list as _pearl_to_int_list
@@ -398,7 +399,11 @@ class DraftTargetOneModelWorker(SpecWorkerBase):
                 spec_metadata,
                 batch_size,
             )
-        if self._rdma_offload_enabled and not bool(is_warmup):
+        # Eager kwarg evaluation here pays N host<->device syncs per decode step
+        # (_pearl_to_int_list / _pearl_tensor_rows each call .cpu()). Gate on
+        # the trace-enabled check so the syncs only fire when someone is
+        # actually consuming the trace JSONL.
+        if self._rdma_offload_enabled and not bool(is_warmup) and _pearl_trace_enabled("target"):
             draft_tokens_for_log = None
             if spec_metadata.draft_tokens is not None and num_gens > 0:
                 try:
@@ -678,16 +683,17 @@ class DraftTargetOneModelWorker(SpecWorkerBase):
             per_request_positions = torch.tensor(
                 adjusted_positions, dtype=torch.int64, device=logits.device
             )
-            _pearl_log(
-                "target",
-                "offload_position_resolved",
-                raw_positions=raw_positions,
-                positions=adjusted_positions,
-                accepted_token_counts=accepted_counts[: int(batch_size)],
-                num_contexts=int(num_contexts),
-                max_draft_len=int(self.max_draft_len),
-                position_semantics=position_semantics,
-            )
+            if _pearl_trace_enabled("target"):
+                _pearl_log(
+                    "target",
+                    "offload_position_resolved",
+                    raw_positions=raw_positions,
+                    positions=adjusted_positions,
+                    accepted_token_counts=accepted_counts[: int(batch_size)],
+                    num_contexts=int(num_contexts),
+                    max_draft_len=int(self.max_draft_len),
+                    position_semantics=position_semantics,
+                )
 
             # Auto prompt push on context phase: when ``num_contexts > 0``
             # the request is being prefilled on the target side this step,

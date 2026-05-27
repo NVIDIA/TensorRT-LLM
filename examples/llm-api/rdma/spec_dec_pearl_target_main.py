@@ -129,6 +129,17 @@ def main() -> int:
         default=True,
         help="Use the raw --prompt string instead of tokenizer.apply_chat_template.",
     )
+    ap.add_argument(
+        "--cuda-graph",
+        dest="cuda_graph",
+        action="store_true",
+        default=False,
+        help=(
+            "Use LLM's default CudaGraphConfig instead of disabling CUDA graphs. "
+            "PEARL is compatible with CUDA graphs and this typically closes a "
+            "large per-token Python/launch overhead gap on multi-layer models."
+        ),
+    )
     args = ap.parse_args()
     if args.trace_log:
         os.environ["PEARL_TARGET_TRACE_PATH"] = args.trace_log
@@ -288,13 +299,15 @@ def main() -> int:
         if args.transport in ("ibverbs", "doca"):
             spec_kwargs["draft_offload_nic_name"] = args.nic
         spec = PEARLDecodingConfig(**spec_kwargs)
-        llm = LLM(
+        llm_kwargs = dict(
             model=args.target_model,
             speculative_config=spec,
             kv_cache_config=common_kv,
-            cuda_graph_config=None,
             tensor_parallel_size=args.tp_size,
         )
+        if not args.cuda_graph:
+            llm_kwargs["cuda_graph_config"] = None
+        llm = LLM(**llm_kwargs)
 
     if early_init_thread is not None:
         early_init_thread.join()

@@ -324,8 +324,15 @@ class PEARLOneModelWorker(DraftTargetOneModelWorker):
         # accepted. In PEARL token/position mode, full acceptance means the
         # emitted length is gamma and the last emitted token equals the last
         # draft token.
+        #
+        # Skip this block while CUDA is capturing a graph: the only operations
+        # it performs are host<->device syncs (.cpu().item()/.tolist()) used
+        # for diagnostic counters and an informational pre_verify mask. Both
+        # are never read by the runtime decode path, so dropping them under
+        # CUDA-graph mode is correctness-neutral; keeping them would crash
+        # capture with cudaErrorStreamCaptureUnsupported.
         request_ids = getattr(spec_metadata, "request_ids", None)
-        if request_ids is not None:
+        if request_ids is not None and not torch.cuda.is_current_stream_capturing():
             num_gens = attn_metadata.num_seqs - attn_metadata.num_contexts
             if num_gens > 0:
                 gamma = (
