@@ -15,6 +15,7 @@ from types import SimpleNamespace
 
 from starlette.datastructures import Headers
 
+from tensorrt_llm.llmapi.disagg_utils import extract_disagg_cfg
 from tensorrt_llm.serve.openai_disagg_server import OpenAIDisaggServer
 from tensorrt_llm.serve.openai_protocol import CompletionRequest, DisaggregatedParams
 
@@ -112,3 +113,13 @@ def test_extract_conversation_id_populates_existing_disaggregated_params():
     )
 
     assert request.disaggregated_params.conversation_id == "multi-turn-session-id"
+
+
+def test_disagg_config_allows_request_chat_template_opt_in():
+    config = extract_disagg_cfg(
+        context_servers={"num_instances": 0},
+        generation_servers={"num_instances": 0},
+        allow_request_chat_template=True,
+    )
+
+    assert config.allow_request_chat_template is True

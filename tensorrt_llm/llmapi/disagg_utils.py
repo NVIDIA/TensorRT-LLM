@@ -89,6 +89,7 @@ class DisaggServerConfig():
     # If this causes collisions, users can set node_id manually within range [0, 1023] in config
     schedule_style: Literal['context_first',
                             'generation_first'] = 'context_first'
+    allow_request_chat_template: bool = False
 
 
 @dataclass
@@ -172,6 +173,7 @@ def extract_disagg_cfg(hostname: str = 'localhost',
                        schedule_style: Literal[
                            'context_first',
                            'generation_first'] = 'context_first',
+                       allow_request_chat_template: bool = False,
                        **kwargs: Any) -> DisaggServerConfig:
     context_servers = context_servers or {}
     generation_servers = generation_servers or {}
@@ -219,6 +221,7 @@ def extract_disagg_cfg(hostname: str = 'localhost',
         config.node_id = node_id
     if schedule_style:
         config.schedule_style = schedule_style
+    config.allow_request_chat_template = allow_request_chat_template
     return config
 
 

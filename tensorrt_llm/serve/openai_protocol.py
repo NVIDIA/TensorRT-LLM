@@ -48,6 +48,16 @@ from tensorrt_llm.scheduling_params import AgentHierarchy
 
 _LOGIT_BIAS_MIN = -100.0
 _LOGIT_BIAS_MAX = 100.0
+REQUEST_CHAT_TEMPLATE_DISABLED_ERROR = (
+    "chat_template cannot be supplied per request unless request-level "
+    "chat templates are enabled at server startup.")
+
+
+def ensure_request_chat_template_allowed(request: Any,
+                                         allow_request_chat_template: bool):
+    if (getattr(request, "chat_template", None) is not None
+            and not allow_request_chat_template):
+        raise ValueError(REQUEST_CHAT_TEMPLATE_DISABLED_ERROR)
 
 
 def _logit_bias_to_embedding_bias(
