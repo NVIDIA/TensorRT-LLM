@@ -104,7 +104,7 @@ class PPCommTag(IntEnum):
 # Because _control_comm is a duplicated communicator isolated from all other
 # MPI traffic, small tag values are safe and do not conflict with PPCommTag.
 _CONTROL_ACTION_TAG = 0  # rank-0 -> non-rank-0: sleep/wakeup/shutdown msg
-_CONTROL_ACK_TAG = 1     # non-rank-0 -> rank-0: ACK after action completes
+_CONTROL_ACK_TAG = 1  # non-rank-0 -> rank-0: ACK after action completes
 
 
 @functools.cache
@@ -951,12 +951,14 @@ class PyExecutor:
         # the worker thread has joined, which guarantees that the non-rank-0
         # executor loops have already processed the shutdown broadcast and are
         # no longer driving NCCL, so the control-comm send cannot deadlock.
-        if (self.dist.rank == 0
-                and self._control_comm is not None
+        if (self.dist.rank == 0 and self._control_comm is not None
                 and self.dist.world_size > 1):
             for dest in range(1, self.dist.world_size):
                 self._control_comm.send(
-                    {"action": "shutdown", "tags": []},
+                    {
+                        "action": "shutdown",
+                        "tags": []
+                    },
                     dest=dest,
                     tag=_CONTROL_ACTION_TAG,
                 )
@@ -2104,8 +2106,8 @@ class PyExecutor:
         """
         import gc
 
-        from tensorrt_llm._torch.virtual_memory import (
-            materialize_with_tag, release_with_tag)
+        from tensorrt_llm._torch.virtual_memory import (materialize_with_tag,
+                                                        release_with_tag)
         from tensorrt_llm.llmapi.llm_args import ExecutorMemoryType
 
         torch.cuda.set_device(self.device_id)
@@ -2113,8 +2115,7 @@ class PyExecutor:
         set_thread_local_mpi_comm(self._control_comm)
         try:
             while True:
-                msg = self._control_comm.recv(
-                    source=0, tag=_CONTROL_ACTION_TAG)
+                msg = self._control_comm.recv(source=0, tag=_CONTROL_ACTION_TAG)
                 # Check for shutdown before entering the ACK-guarded block so
                 # we can break cleanly without sending a spurious ACK.
                 if msg.get("action") == "shutdown":
@@ -2141,11 +2142,10 @@ class PyExecutor:
                         error_msg = f"unknown action '{action}'"
                         logger.warning(
                             f"Control listener: {error_msg}, ignoring.")
-                except (KeyError, TypeError, ValueError,
-                        RuntimeError, torch.OutOfMemoryError) as exc:
-                    error_msg = (
-                        f"rank {self.dist.rank} '{action}' failed: "
-                        f"{exc}\n{traceback.format_exc()}")
+                except (KeyError, TypeError, ValueError, RuntimeError,
+                        torch.OutOfMemoryError) as exc:
+                    error_msg = (f"rank {self.dist.rank} '{action}' failed: "
+                                 f"{exc}\n{traceback.format_exc()}")
                     logger.error(
                         f"Control listener: error executing '{action}':",
                         exc_info=True)
@@ -2153,8 +2153,10 @@ class PyExecutor:
                     # Always ACK so rank-0 does not deadlock; carry error
                     # details so rank-0 can raise after all ranks respond.
                     self._control_comm.send(
-                        {"status": "ok" if error_msg is None else "error",
-                         "error": error_msg},
+                        {
+                            "status": "ok" if error_msg is None else "error",
+                            "error": error_msg
+                        },
                         dest=0,
                         tag=_CONTROL_ACK_TAG,
                     )
