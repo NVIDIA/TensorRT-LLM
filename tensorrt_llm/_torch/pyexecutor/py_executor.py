@@ -2579,6 +2579,19 @@ class PyExecutor:
             the caller should ``continue`` to the next loop iteration.
         """
         if not self.is_warmup and not can_forward:
+            local_has_terminal_transfer_request = any(
+                req.state == LlmRequestState.DISAGG_TRANS_ERROR
+                or req.py_kv_transfer_timed_out for req in self.active_requests)
+            if self.enable_attention_dp:
+                all_ranks_have_terminal_transfer_request = self.dist.tp_allgather(
+                    int(local_has_terminal_transfer_request))
+                has_terminal_transfer_request = (
+                    max(all_ranks_have_terminal_transfer_request) == 1)
+            else:
+                has_terminal_transfer_request = (
+                    local_has_terminal_transfer_request)
+            if has_terminal_transfer_request:
+                self._handle_responses(emit_first_iter=False)
             can_forward = self._is_benchmark_disagg_fill_complete(
                 scheduled_batch)
             if can_forward:
@@ -3694,8 +3707,11 @@ class PyExecutor:
             elapsed_time = (current_time - req.py_kv_transfer_start_time) * 1000
             if elapsed_time > timeout_ms and not req.py_kv_transfer_timed_out:
                 logger.warning(
-                    f"Terminating {type} request {req.py_request_id} due to KV cache transfer timeout"
-                )
+                    f"Terminating {type} request {req.py_request_id} "
+                    f"due to KV cache transfer timeout "
+                    f"elapsed_ms={elapsed_time:.3f} timeout_ms={timeout_ms} "
+                    f"start_time={req.py_kv_transfer_start_time:.6f} "
+                    f"current_time={current_time:.6f}")
                 req.py_kv_transfer_timed_out = True
 
         for req in self.async_transfer_manager.requests_in_transfer().values():
@@ -3988,14 +4004,20 @@ class PyExecutor:
             if req.state == LlmRequestState.DISAGG_TRANS_ERROR
         ]
 
-    def _check_cache_transfer_errors(self, error_msg_prefix: str):
+    def _check_cache_transfer_errors(self,
+                                     error_msg_prefix: str,
+                                     defer_response: bool = False):
         """Common helper to check for and handle cache transfer errors."""
         error_requests = self._get_disagg_reqs_in_error_state()
         if error_requests:
-            self._handle_errors(
-                f"Error in kv cache transfer for {error_msg_prefix}",
-                requests=error_requests,
-                charge_budget=False)
+            error_msg = f"Error in kv cache transfer for {error_msg_prefix}"
+            if defer_response:
+                for req in error_requests:
+                    req.py_disagg_transfer_error_msg = error_msg
+                return
+            self._handle_errors(error_msg,
+                                requests=error_requests,
+                                charge_budget=False)
 
     @nvtx_range("_check_disagg_ctx_cache_transfer_status")
     def _check_disagg_ctx_cache_transfer_status(self, atLeastNum: int = 0):
@@ -4046,7 +4068,8 @@ class PyExecutor:
                 req_id = req.py_request_id if not req.is_child else req.parent_request_id
                 if req_id not in user_canceled_set:
                     req.state = LlmRequestState.DISAGG_TRANS_ERROR
-        self._check_cache_transfer_errors("generation requests")
+        self._check_cache_transfer_errors("generation requests",
+                                          defer_response=True)
 
     def _forward_step(
             self,
@@ -4421,18 +4444,48 @@ class PyExecutor:
         if 0 not in self.dist.mapping.tp_group and not self.gather_all_responses:
             return
 
+        def normalize_response_items(response_items):
+            normalized_responses = []
+            pending_req_id = None
+
+            if response_items is None:
+                return normalized_responses
+
+            if isinstance(response_items, dict):
+                return list(response_items.items())
+
+            for item in response_items:
+                if item is None:
+                    continue
+                if isinstance(item, dict):
+                    normalized_responses.extend(item.items())
+                elif (isinstance(item, tuple) and len(item) == 2
+                      and isinstance(item[1], LlmResponse)):
+                    normalized_responses.append(item)
+                elif isinstance(item, (list, tuple)):
+                    normalized_responses.extend(normalize_response_items(item))
+                elif pending_req_id is None:
+                    pending_req_id = item
+                else:
+                    normalized_responses.append((pending_req_id, item))
+                    pending_req_id = None
+
+            if pending_req_id is not None:
+                logger.warning(
+                    f"Drop malformed response item without response: {pending_req_id}"
+                )
+
+            return normalized_responses
+
         if self.enable_attention_dp and self.dist.world_size != 1:
             if not self.gather_all_responses:
                 responses_list = self.dist.tp_gather(responses)
             else:
                 responses_list = self.dist.allgather(responses)
             if self.dist.rank == 0 or self.gather_all_responses:
-                gather_responses = []
-                if responses_list is not None:
-                    for resp in responses_list:
-                        if resp is not None:
-                            gather_responses.extend(resp)
-                    responses = gather_responses
+                responses = normalize_response_items(responses_list)
+        else:
+            responses = normalize_response_items(responses)
         logger.debug(
             f'after gather, rank = {self.dist.rank}, responses = {responses}')
 
@@ -4552,14 +4605,37 @@ class PyExecutor:
                 requests_to_terminate.append(request)
                 continue
 
+            if request.state == LlmRequestState.DISAGG_TRANS_ERROR:
+                error_msg = getattr(request, "py_disagg_transfer_error_msg",
+                                    "Error in kv cache transfer")
+                logger.warning(
+                    f"Failing request {req_id} due to KV cache transfer error: "
+                    f"{error_msg}")
+                request.state = LlmRequestState.GENERATION_COMPLETE
+                request.decoding_iter = request.py_decoding_iter
+                new_responses.append(
+                    (req_id,
+                     LlmResponse(request_id=req_id,
+                                 error_msg=error_msg,
+                                 client_id=request.py_client_id)))
+                requests_to_terminate.append(request)
+                continue
+
             # Check if generation request needs cleanup due to KV cache transfer timeout
             if request.py_kv_transfer_timed_out:
                 is_cancelled = self.kv_cache_transceiver.cancel_request(request)
                 if is_cancelled:
-                    self._handle_errors(
-                        error_msg=f"Request {request.py_request_id} timed out",
-                        requests=[request],
-                        charge_budget=False)
+                    error_msg = f"Request {request.py_request_id} timed out"
+                    request.state = LlmRequestState.GENERATION_COMPLETE
+                    request.decoding_iter = request.py_decoding_iter
+                    new_responses.append(
+                        (req_id,
+                         LlmResponse(request_id=req_id,
+                                     error_msg=error_msg,
+                                     client_id=request.py_client_id)))
+                    requests_to_terminate.append(request)
+                else:
+                    new_active_requests.append(request)
                 continue
 
             if request.is_generation_only_request() and not request.is_finished:
