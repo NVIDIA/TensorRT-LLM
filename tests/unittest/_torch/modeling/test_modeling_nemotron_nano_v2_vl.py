@@ -69,7 +69,7 @@ def test_nemotron_nano_registers_native_multimodal_epd_components():
     assert NemotronH_Nano_VL_V2.support_mm_disagg is True
 
 
-def test_nemotron_nano_epd_handoff_preserves_non_contiguous_video_runs(monkeypatch):
+def test_nemotron_nano_epd_handoff_preserves_non_contiguous_video_runs():
     """Split video prompt runs stay grouped under one MM item."""
     processor = object.__new__(NanoV2VLInputProcessor)
     processor._config = SimpleNamespace(
@@ -85,15 +85,9 @@ def test_nemotron_nano_epd_handoff_preserves_non_contiguous_video_runs(monkeypat
     processor._sound_start_token_id = None
     processor._sound_end_token_id = None
 
-    monkeypatch.setattr(
-        processor,
-        "get_num_tokens_per_video",
-        MagicMock(return_value=8),
-    )
-    monkeypatch.setattr(
-        processor,
-        "expand_prompt_token_ids_for_mm",
-        MagicMock(return_value=([101, 30, 20, 20, 31, 55, 30, 20, 20, 31, 102], None)),
+    processor.get_num_tokens_per_video = MagicMock(return_value=8)
+    processor.expand_prompt_token_ids_for_mm = MagicMock(
+        return_value=([101, 30, 20, 20, 31, 55, 30, 20, 20, 31, 102], None)
     )
 
     video = VideoData(frames=[object()], metadata={}, audio=None)
@@ -115,20 +109,57 @@ def test_nemotron_nano_epd_handoff_preserves_non_contiguous_video_runs(monkeypat
     assert handoff.special_token_offsets == [0, 3, 4, 7]
 
 
-def test_nemotron_nano_loads_multimodal_encoder_for_normal_worker(monkeypatch):
-    """Normal workers load the vision encoder needed for raw MM prefill."""
-    monkeypatch.delenv("TLLM_MULTIMODAL_DISAGGREGATED", raising=False)
+def test_nemotron_nano_epd_handoff_accepts_prompt_token_ids_without_prompt():
+    """Tokenized EPD handoff does not require detokenized prompt text."""
+    processor = object.__new__(NanoV2VLInputProcessor)
+    processor._config = SimpleNamespace(
+        llm_config=SimpleNamespace(vocab_size=1000, hidden_size=16),
+    )
+    processor._tokenizer = SimpleNamespace(
+        encode=MagicMock(side_effect=AssertionError("tokenizer should not be called")),
+    )
+    processor.img_context_token_id = 20
+    processor._img_start_token_ids = [30]
+    processor._img_end_token_ids = [31]
+    processor._sound_context_token_id = None
+    processor._sound_start_token_id = None
+    processor._sound_end_token_id = None
 
+    processor.get_num_tokens_per_video = MagicMock(return_value=8)
+    expand_mock = MagicMock(return_value=([101, 30, 20, 20, 31, 55, 30, 20, 20, 31, 102], None))
+    processor.expand_prompt_token_ids_for_mm = expand_mock
+
+    video = VideoData(frames=[object()], metadata={}, audio=None)
+    handoff = processor.build_disagg_prefill_multimodal_inputs(
+        {
+            "prompt_token_ids": [101, 98, 102],
+            "multi_modal_data": {"video": [video]},
+        },
+        [{"tensor_size": (4, 16)}],
+    )
+
+    processor._tokenizer.encode.assert_not_called()
+    expand_mock.assert_called_once()
+    assert expand_mock.call_args.args[0] == [101, 98, 102]
+    assert handoff.prompt_token_ids == [101, 30, 20, 20, 31, 55, 30, 20, 20, 31, 102]
+    assert handoff.multimodal_lengths == [8]
+    assert handoff.multimodal_positions == [1]
+    assert handoff.multimodal_embedding_lengths == [4]
+    assert handoff.multimodal_item_run_cu_offsets == [0, 2]
+    assert handoff.multimodal_run_positions == [1, 6]
+    assert handoff.multimodal_run_lengths == [4, 4]
+    assert handoff.special_token_offsets == [0, 3, 4, 7]
+
+
+def test_nemotron_nano_loads_multimodal_encoder_for_normal_worker():
+    """Normal workers load the vision encoder needed for raw MM prefill."""
     fake_encoder = MagicMock()
     fake_encoder.eval.return_value = fake_encoder
     fake_encoder.to.return_value = fake_encoder
     vision_encoder_cls = MagicMock(return_value=fake_encoder)
-    monkeypatch.setattr(nemotron_nano, "NanoV2VLVisionEncoder", vision_encoder_cls)
 
     fake_mapper = MagicMock()
-    monkeypatch.setattr(
-        nemotron_nano, "NemotronHHfWeightMapper", MagicMock(return_value=fake_mapper)
-    )
+    mapper_cls = MagicMock(return_value=fake_mapper)
 
     model = SimpleNamespace(
         _mm_model_config=_make_minimal_nano_model_config(),
@@ -143,23 +174,23 @@ def test_nemotron_nano_loads_multimodal_encoder_for_normal_worker(monkeypatch):
         "language_model.weight": torch.empty(0),
     }
 
-    NemotronH_Nano_VL_V2.load_weights(model, weights)
+    with (
+        mock.patch.dict(os.environ, {"TLLM_MULTIMODAL_DISAGGREGATED": "0"}),
+        mock.patch.object(nemotron_nano, "NanoV2VLVisionEncoder", vision_encoder_cls),
+        mock.patch.object(nemotron_nano, "NemotronHHfWeightMapper", mapper_cls),
+    ):
+        NemotronH_Nano_VL_V2.load_weights(model, weights)
 
     vision_encoder_cls.assert_called_once_with(model._mm_model_config)
     fake_encoder.load_weights.assert_called_once_with(weights)
 
 
-def test_nemotron_nano_defers_multimodal_encoder_for_mm_epd_worker(monkeypatch):
+def test_nemotron_nano_defers_multimodal_encoder_for_mm_epd_worker():
     """MM E/P/D full-model workers consume attached embeddings instead of raw encoders."""
-    monkeypatch.setenv("TLLM_MULTIMODAL_DISAGGREGATED", "1")
-
     vision_encoder_cls = MagicMock()
-    monkeypatch.setattr(nemotron_nano, "NanoV2VLVisionEncoder", vision_encoder_cls)
 
     fake_mapper = MagicMock()
-    monkeypatch.setattr(
-        nemotron_nano, "NemotronHHfWeightMapper", MagicMock(return_value=fake_mapper)
-    )
+    mapper_cls = MagicMock(return_value=fake_mapper)
 
     model = SimpleNamespace(
         _mm_model_config=_make_minimal_nano_model_config(),
@@ -174,7 +205,12 @@ def test_nemotron_nano_defers_multimodal_encoder_for_mm_epd_worker(monkeypatch):
         "language_model.weight": torch.empty(0),
     }
 
-    NemotronH_Nano_VL_V2.load_weights(model, weights)
+    with (
+        mock.patch.dict(os.environ, {"TLLM_MULTIMODAL_DISAGGREGATED": "1"}),
+        mock.patch.object(nemotron_nano, "NanoV2VLVisionEncoder", vision_encoder_cls),
+        mock.patch.object(nemotron_nano, "NemotronHHfWeightMapper", mapper_cls),
+    ):
+        NemotronH_Nano_VL_V2.load_weights(model, weights)
 
     vision_encoder_cls.assert_not_called()
 

@@ -31,6 +31,7 @@ from ...inputs import (
     MultimodalPlaceholderMetadata,
     MultimodalPlaceholderPlacement,
     TextPrompt,
+    TokensPrompt,
     compute_retained_tokens_count,
     compute_retained_tokens_from_tubelet_budget,
     compute_retention_mask,
@@ -887,6 +888,14 @@ class NanoV2VLVisionEncoder(transformers.PreTrainedModel):
 
 
 class NanoV2VLMultimodalEncoder(NanoV2VLVisionEncoder):
+    """EPD-only encoder wrapper for Nano VL image/video handoff.
+
+    Full Nano V3 can support more modalities through the full model path.
+    This wrapper is only for the mm_encoder_only EPD worker. It returns one
+    vision embedding tensor for image/video inputs and does not run Nano audio
+    or video-audio interleave logic.
+    """
+
     def __init__(self, model_config: ModelConfig[transformers.PretrainedConfig], *args, **kwargs):
         super().__init__(model_config)
 
@@ -894,11 +903,13 @@ class NanoV2VLMultimodalEncoder(NanoV2VLVisionEncoder):
         for param in multimodal_params:
             modality_type = param.multimodal_data["modality_type"]
             if modality_type == "audio":
+                # EPD encoder-only handoff does not own the Nano audio encoder.
                 raise NotImplementedError(
                     "NanoV2VL MultimodalEncoder currently supports image/video inputs, not audio."
                 )
             audio_data = param.multimodal_data[modality_type].get("audio")
             if audio_data is not None:
+                # Video audio needs the full Nano model path to interleave sound.
                 raise NotImplementedError(
                     "NanoV2VL MultimodalEncoder does not yet encode audio extracted from video."
                 )
@@ -2261,11 +2272,12 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
         }
 
     def build_disagg_prefill_multimodal_inputs(
-        self, inputs: TextPrompt, mm_handles: List[Dict[str, Any]]
+        self, inputs: Union[TextPrompt, TokensPrompt], mm_handles: List[Dict[str, Any]]
     ) -> DisaggPrefillMultimodalInputs:
         text_prompt = inputs.get("prompt")
-        if not text_prompt:
-            raise ValueError("Text prompt is required but not provided")
+        prompt_token_ids = inputs.get("prompt_token_ids")
+        if prompt_token_ids is None and not text_prompt:
+            raise ValueError("Either prompt_token_ids or text prompt is required")
         if not isinstance(mm_handles, list):
             raise TypeError("mm_handles must be a list")
 
@@ -2304,7 +2316,6 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
                 )
             multimodal_embedding_lengths.append(tensor_size[0])
 
-        prompt_token_ids = inputs.get("prompt_token_ids")
         if prompt_token_ids is None:
             prompt_token_ids = self.tokenizer.encode(text_prompt, add_special_tokens=False)
         prompt_token_ids = list(prompt_token_ids)
