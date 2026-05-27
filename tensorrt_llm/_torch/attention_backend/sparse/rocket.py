@@ -7,7 +7,8 @@ from triton import next_power_of_2
 
 import tensorrt_llm
 import tensorrt_llm.bindings
-from tensorrt_llm._torch.attention_backend.interface import AttentionMetadata
+from tensorrt_llm._torch.attention_backend.interface import (
+    AttentionForwardArgs, AttentionMetadata)
 from tensorrt_llm._torch.attention_backend.trtllm import (
     TrtllmAttention, TrtllmAttentionMetadata)
 from tensorrt_llm._torch.attention_backend.vanilla import (
@@ -355,7 +356,7 @@ class RocketTrtllmAttention(TrtllmAttention):
         q: torch.Tensor,
         k: Optional[torch.Tensor],
         metadata: TrtllmAttentionMetadata,
-        **kwargs,
+        forward_args: AttentionForwardArgs,
     ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
         """
         Predict sparse KV indices using optimized SnapKV algorithm.
@@ -513,7 +514,7 @@ class RocketTrtllmAttention(TrtllmAttention):
         q: torch.Tensor,
         k: Optional[torch.Tensor],
         metadata: TrtllmAttentionMetadata,
-        **kwargs,
+        forward_args: AttentionForwardArgs,
     ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
         if metadata.num_generations == 0:
             return None, None
@@ -971,6 +972,7 @@ class RocketKVCacheManager(KVCacheManager):
         is_gen: bool = False,
         prepare_resource: bool = True,
         max_num_draft_tokens: int = 0,
+        kv_reserve_draft_tokens: Optional[int] = None,
         use_mrope: bool = False,
         max_beam_width: int = 1,
         num_extra_decoding_steps: int = 0,
@@ -982,6 +984,7 @@ class RocketKVCacheManager(KVCacheManager):
             is_gen=is_gen,
             prepare_resource=prepare_resource,
             max_num_draft_tokens=max_num_draft_tokens,
+            kv_reserve_draft_tokens=kv_reserve_draft_tokens,
             use_mrope=use_mrope,
             max_beam_width=max_beam_width,
             num_extra_decoding_steps=num_extra_decoding_steps,

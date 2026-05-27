@@ -6,7 +6,7 @@ from torch.nn.parameter import Parameter
 from tqdm import tqdm
 from transformers import GptOssConfig
 
-from tensorrt_llm._utils import get_sm_version
+from tensorrt_llm._utils import get_hf_rope_theta, get_sm_version
 from tensorrt_llm.functional import PositionEmbeddingType, RotaryScalingType
 
 from ..attention_backend import AttentionMetadata
@@ -51,7 +51,7 @@ class AttentionBlock(Attention):
             type=PositionEmbeddingType.yarn,
             rope=RopeParams(
                 dim=pretrained_config.head_dim,
-                theta=pretrained_config.rope_theta,
+                theta=get_hf_rope_theta(pretrained_config, 10000.0),
                 scale_type=RotaryScalingType.yarn,
                 scale=pretrained_config.rope_scaling['factor'],
                 max_positions=pretrained_config.max_position_embeddings,
@@ -79,6 +79,12 @@ class AttentionBlock(Attention):
             reduce_output=reduce_output,
             use_custom_cublas_mm=use_custom_cublas_mm,
         )
+
+        if self.attn_backend != "TRTLLM":
+            raise ValueError(
+                f"GPT-OSS model uses attention sinks, which are only supported "
+                f"with attn_backend='TRTLLM'. Current backend: {self.attn_backend}."
+            )
 
         # Only apply sliding window to every other layer
         self.sliding_window = pretrained_config.sliding_window if layer_idx % 2 == 0 else None

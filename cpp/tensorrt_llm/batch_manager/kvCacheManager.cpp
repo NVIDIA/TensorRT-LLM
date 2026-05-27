@@ -581,7 +581,8 @@ BlockManager::BlockManager(std::vector<SizeType32> const& numKvHeadsPerLayer, Si
     std::shared_ptr<KVCacheEventManager> eventManager, bool enablePartialReuse, bool copyOnPartialReuse,
     std::shared_ptr<kv_connector::KvCacheConnectorManager> kvCacheConnectorManager,
     std::optional<BaseAgentConfig> agentConfig, bool enableIndexerKCache, SizeType32 indexerKCacheQuantBlockSize,
-    SizeType32 indexerKCacheIndexHeadDim, std::optional<LinearAttentionMetadata> linearAttentionMetadata)
+    SizeType32 indexerKCacheIndexHeadDim, bool indexerKCacheUseFp4,
+    std::optional<LinearAttentionMetadata> linearAttentionMetadata)
     : mNumLayers{static_cast<SizeType32>(numKvHeadsPerLayer.size())}
     , mTokensPerBlock{tokensPerBlock}
     , mEventManager{std::move(eventManager)}
@@ -590,6 +591,7 @@ BlockManager::BlockManager(std::vector<SizeType32> const& numKvHeadsPerLayer, Si
     , mIsEnableIndexerKCache{enableIndexerKCache}
     , mIndexerKCacheQuantBlockSize{indexerKCacheQuantBlockSize}
     , mIndexerKCacheIndexHeadDim{indexerKCacheIndexHeadDim}
+    , mIndexerKCacheUseFp4{indexerKCacheUseFp4}
     , mLinearAttentionMetadata{linearAttentionMetadata}
 {
     if (mLinearAttentionMetadata.has_value())
@@ -661,7 +663,7 @@ BlockManager::BlockManager(std::vector<SizeType32> const& numKvHeadsPerLayer, Si
             /*isSWA=*/(windowSize < maxSequenceLength) && (windowSize >= 0), allottedPrimaryBlocks,
             allottedSecondaryBlocks, maxNumSequences, stream, cacheType, secondaryOffloadMinPriority, mEventManager,
             enablePartialReuse, copyOnPartialReuse, kvCacheConnectorManager, mLookupTree, mLoopbackAgent,
-            enableIndexerKCache, indexerKCacheQuantBlockSize, indexerKCacheIndexHeadDim,
+            enableIndexerKCache, indexerKCacheQuantBlockSize, indexerKCacheIndexHeadDim, indexerKCacheUseFp4,
             LinearAttentionMetadata::hasLinearCache(windowSize) ? linearAttentionMetadata : std::nullopt,
             numPlaceholderBlocks);
     }
@@ -717,7 +719,8 @@ WindowBlockManager::WindowBlockManager(nvinfer1::DataType dtype, SizeType32 wind
     std::shared_ptr<kv_connector::KvCacheConnectorManager> kvCacheConnectorManager,
     radix_block_tree::UnifiedBlockTree& lookupTree, std::shared_ptr<kvc::BaseLoopbackAgent> loopbackAgent,
     bool enableIndexerKCache, SizeType32 indexerKCacheQuantBlockSize, SizeType32 indexerKCacheIndexHeadDim,
-    std::optional<LinearAttentionMetadata> linearAttentionMetadata, SizeType32 numPlaceholderBlocks)
+    bool indexerKCacheUseFp4, std::optional<LinearAttentionMetadata> linearAttentionMetadata,
+    SizeType32 numPlaceholderBlocks)
     : mDataType{dtype}
     , mWindowSize{windowSize}
     , mNumPrimaryBlocks{blocksInPrimaryPool}
@@ -756,6 +759,7 @@ WindowBlockManager::WindowBlockManager(nvinfer1::DataType dtype, SizeType32 wind
     , mEnableIndexerKCache{enableIndexerKCache}
     , mIndexerKCacheQuantBlockSize{indexerKCacheQuantBlockSize}
     , mIndexerKCacheIndexHeadDim{indexerKCacheIndexHeadDim}
+    , mIndexerKCacheUseFp4{indexerKCacheUseFp4}
     , mLinearAttentionMetadata{std::move(linearAttentionMetadata)}
 {
     TLLM_LOG_DEBUG("Creating WindowBlockManager for windowSize=%d", windowSize);
@@ -841,7 +845,9 @@ WindowBlockManager::WindowBlockManager(nvinfer1::DataType dtype, SizeType32 wind
             mLogPrefix.c_str(), numPlaceholderBlocks, KVCacheBlock::kCachedBlocksRootId - 1 - numPlaceholderBlocks,
             KVCacheBlock::kCachedBlocksRootId - 2);
         TLLM_CHECK_WITH_INFO(isRecurrentState(),
-            "numPlaceholderBlocks > 0 is only supported for recurrent-state (kRecurrentStates) managers");
+            "numPlaceholderBlocks > 0 is only supported for recurrent-state (kRecurrentStates) managers, but this "
+            "manager has windowSize=%d and isSWA=%d",
+            windowSize, isSWA);
         mAllPlaceholderBlocksById.resize(numPlaceholderBlocks + 2, nullptr);
         for (SizeType32 i = 0; i < numPlaceholderBlocks; ++i)
         {
@@ -1030,10 +1036,15 @@ void WindowBlockManager::createIndexerKCachePools()
         {
             continue;
         }
+        // scaleSize evaluates to 4 at indexHeadDim=128 / quantBlockSize=128 for both
+        // FP8 (float32 scale) and FP4 (packed UE8M0 x4 stored as one int32). The
+        // data size is either indexHeadDim bytes (one FP8 byte per element) or
+        // indexHeadDim / 2 bytes (two packed FP4 E2M1 codes per byte).
         SizeType32 scaleSize = mIndexerKCacheIndexHeadDim / mIndexerKCacheQuantBlockSize * 4;
+        SizeType32 dataSize = mIndexerKCacheUseFp4 ? mIndexerKCacheIndexHeadDim / 2 : mIndexerKCacheIndexHeadDim;
+        SizeType32 perTokenSize = scaleSize + dataSize;
 
-        mPools.emplace_back(kvPool.numLayers, kvPool.kvFactor, 1, scaleSize + mIndexerKCacheIndexHeadDim,
-            kvPool.tokensPerBlock,
+        mPools.emplace_back(kvPool.numLayers, kvPool.kvFactor, 1, perTokenSize, kvPool.tokensPerBlock,
             /*primaryPool=*/nullptr,
             /*secondaryPool=*/nullptr,
             /*containsBlockScales=*/false,
@@ -1150,6 +1161,41 @@ void WindowBlockManager::freeLeafBlock(BlockPtr const& block)
     // The eviction policy needs blocks to still be linked to their old parents when they're reclaimed.
     // This is so it can check if the parent should be queued for eviction.
     block->freeLeafBlock();
+}
+
+void WindowBlockManager::releaseSubtree(BlockPtr const& block)
+{
+    // Iterative pre-order DFS over `block` and all its descendants.  Collect
+    // first, then detach in reverse order: cascade-prune in freeLeafBlock()
+    // removes empty parent nodes from the trie, so leaves must be detached
+    // before their parents to keep the mNextNodes map consistent.
+    std::vector<BlockPtr> subtree;
+    std::vector<BlockPtr> stack{block};
+    while (!stack.empty())
+    {
+        auto current = std::move(stack.back());
+        stack.pop_back();
+        for (auto const& [_, child] : current->getNextBlocks())
+        {
+            stack.push_back(child);
+        }
+        subtree.push_back(std::move(current));
+    }
+
+    for (auto it = subtree.rbegin(); it != subtree.rend(); ++it)
+    {
+        auto const& b = *it;
+        if (mEventManager && blockInRadixTree(b))
+        {
+            mEventManager->enqueueRemovedEvent(b, mWindowSize);
+        }
+        b->freeLeafBlock();
+        if (!b->hasRefs())
+        {
+            b->setPriority(executor::KvCacheRetentionConfig::kMinRetentionPriority);
+            mEvictionPolicy->releaseBlock(b, /*toFront=*/true);
+        }
+    }
 }
 
 BlockPtr WindowBlockManager::getFreeBlock(GenerationRequest& sequence, executor::RetentionPriority priority,
@@ -2064,6 +2110,48 @@ void WindowBlockManager::refreshBlocks()
     mTransferManager->syncTransfers();
 }
 
+void BlockManager::truncateBlocks(
+    LlmRequest::VecTokens const& targetTokens, SizeType32 numTokensToKeep, SizeType32 windowSize)
+{
+    mWindowBlockManagers.at(windowSize).truncateBlocks(targetTokens, numTokensToKeep);
+}
+
+void WindowBlockManager::truncateBlocks(LlmRequest::VecTokens const& targetTokens, SizeType32 numTokensToKeep)
+{
+    std::lock_guard<std::recursive_mutex> lock(mLookupTree->getMutex());
+
+    auto const numTokens = static_cast<SizeType32>(targetTokens.size());
+    auto blockedTokens = chopVectorIntoBlocks<TokenIdType>(targetTokens, numTokens, mTokensPerBlock, true);
+
+    std::vector<BlockKey> blockKeys;
+    blockKeys.reserve(blockedTokens.size());
+    for (auto const& blockedTokensList : blockedTokens)
+    {
+        blockKeys.emplace_back(blockedTokensList, std::nullopt);
+    }
+
+    SizeType32 numMatchedTokens = 0;
+    auto searchRoot = mCachedBlocksRoot;
+    for (auto const& blockKey : blockKeys)
+    {
+        auto [partialMatch, numMatched, matchingBlock] = searchRoot != nullptr
+            ? searchRoot->findMatchingBlock(blockKey, mEnablePartialReuse, mCopyOnPartialReuse)
+            : std::make_tuple(false, 0, nullptr);
+        if (matchingBlock == nullptr)
+        {
+            break;
+        }
+        if (numMatchedTokens > numTokensToKeep)
+        {
+            matchingBlock->setPriority(executor::KvCacheRetentionConfig::kMinRetentionPriority);
+            releaseSubtree(matchingBlock);
+            break;
+        }
+        numMatchedTokens += (numMatched > 0) ? numMatched : static_cast<SizeType32>(blockKey.uniqueTokens.size());
+        searchRoot = matchingBlock;
+    }
+}
+
 std::vector<WindowBlockManager::BatchSeqStats> BlockManager::addSequenceBatch(
     std::vector<GenerationRequest*> const& sequences, std::vector<SizeType32> const& inputLengths,
     std::vector<SizeType32> const& numContextBlocksVec,
@@ -2134,12 +2222,16 @@ void BlockManager::allocateBlock(GenerationRequest& sequence, SizeType32 windowS
     mWindowBlockManagers.at(windowSize).allocateBlock(sequence, false);
 }
 
-void BlockManager::copyLinearAttentionBlock(GenerationRequest& sequence, LlmRequest const& llmRequest)
+bool BlockManager::copyLinearAttentionBlock(GenerationRequest& sequence, LlmRequest const& llmRequest)
 {
+    bool didCopy = false;
     for (auto& [windowSize, manager] : mWindowBlockManagers)
     {
-        manager.copyLinearAttentionBlock(sequence, llmRequest);
+        // Use a temp to avoid short-circuiting; every window must run.
+        bool const windowDidCopy = manager.copyLinearAttentionBlock(sequence, llmRequest);
+        didCopy = didCopy || windowDidCopy;
     }
+    return didCopy;
 }
 
 bool WindowBlockManager::tryAllocatePlaceholderForLinearAttention(GenerationRequest& sequence, bool shareAmongBeams)
@@ -2199,7 +2291,7 @@ bool WindowBlockManager::tryAllocatePlaceholderForLinearAttention(GenerationRequ
     for (auto beamIdx = 0; beamIdx < beamWidth; ++beamIdx)
     {
         auto lastBlockId = lastBlockIds[beamIdx];
-        TLLM_CHECK(lastBlockId >= 0);
+        TLLM_CHECK_WITH_INFO(lastBlockId >= 0, "The last block should not be a placeholder");
         TLLM_LOG_DEBUG("%s::allocateBlock - Swapping placeholder with last block %d for beam %d", mLogPrefix.c_str(),
             lastBlockId, beamIdx);
         auto lastBlock = getBlockById(lastBlockId);
@@ -2275,11 +2367,11 @@ void WindowBlockManager::allocateBlock(GenerationRequest& sequence, bool shareAm
     }
 }
 
-void WindowBlockManager::copyLinearAttentionBlock(GenerationRequest& sequence, LlmRequest const& request)
+bool WindowBlockManager::copyLinearAttentionBlock(GenerationRequest& sequence, LlmRequest const& request)
 {
     if (!isRecurrentState())
     {
-        return;
+        return false;
     }
 
     auto const requestId = request.mRequestId;
@@ -2288,7 +2380,7 @@ void WindowBlockManager::copyLinearAttentionBlock(GenerationRequest& sequence, L
     if (mAllocatedBlocksPerSeq.find(requestId) == mAllocatedBlocksPerSeq.end())
     {
         TLLM_LOG_WARNING("%s::copyLinearAttentionBlock - Request %lu not found", mLogPrefix.c_str(), requestId);
-        return;
+        return false;
     }
 
     // It points to the next token to be processed/generated
@@ -2303,9 +2395,10 @@ void WindowBlockManager::copyLinearAttentionBlock(GenerationRequest& sequence, L
         if (TLLM_LIKELY(sequence.getBeamWidth() == 1))
         {
             // the block of beam0 is inherited from context phase, no need to copy
-            return;
+            return false;
         }
-        // copy beam 0 to other beams
+        // copy beam 0 to other beams: beamWidth >= 2 here, loop runs at least once
+        // with no skip path, so an onboard is always issued.
         auto beam0Block = getBlockById(sequence.getCacheBlockIds(mWindowSize).at(0).back());
         for (auto beamIdx = 1; beamIdx < sequence.getBeamWidth(); ++beamIdx)
         {
@@ -2318,17 +2411,18 @@ void WindowBlockManager::copyLinearAttentionBlock(GenerationRequest& sequence, L
                                  // transfer manager to copy the entire block.
                 sequence.getTransferMode(), sequence.getDirectory());
         }
-        return;
+        return true;
     }
 
     // copy only happens in context phase or the corner case above
     if (currentPosition % mTokensPerBlock != 0 || currentPosition > request.getPromptLen() || currentPosition == 0)
     {
-        return;
+        return false;
     }
 
     auto prevBlockIndex = currentPosition / mTokensPerBlock - 1; // signed
     std::set<std::pair<KVCacheBlock::IdType, KVCacheBlock::IdType>> onboardedBlocks;
+    bool didCopy = false;
     for (auto beamIdx = 0; beamIdx < sequence.getBeamWidth(); ++beamIdx)
     {
         auto const& beamBlockIds = sequence.getCacheBlockIds(mWindowSize).at(beamIdx);
@@ -2367,7 +2461,9 @@ void WindowBlockManager::copyLinearAttentionBlock(GenerationRequest& sequence, L
                              // manager to copy the entire block.
             sequence.getTransferMode(), sequence.getDirectory());
         onboardedBlocks.insert({prevBlockId, nextBlockId});
+        didCopy = true;
     }
+    return didCopy;
 }
 
 std::pair<SizeType32, std::vector<KVCacheBlock::IdType>> WindowBlockManager::storeBlocks(
@@ -2605,6 +2701,35 @@ void BlockManager::releaseLastBlock(GenerationRequest& sequence, SizeType32 wind
 
 void WindowBlockManager::releaseLastBlock(GenerationRequest& sequence)
 {
+    if (isRecurrentState())
+    {
+        // In recurrent state, the last block always contains the current state and should not be released.
+        // Since the only caller of releaseLastBlock is speculative decoding rewinding, it only happens in decoding
+        // phase. We pop up the second last block instead, which is supposed to be a placeholder.
+        auto const requestId = sequence.getRequestId();
+        auto& allocatedBlocks = mAllocatedBlocksPerSeq.at(requestId);
+        TLLM_CHECK(allocatedBlocks.size() >= 2);
+        auto it = allocatedBlocks.rbegin();
+        auto& secondLastBlock = *(++it);
+        TLLM_CHECK(secondLastBlock->isPlaceholder());
+        // Decrease ref count of the second last block (placeholder)
+        secondLastBlock->decRefCount();
+        if (!secondLastBlock->hasRefs())
+        {
+            mEvictionPolicy->releaseBlock(secondLastBlock, true);
+        }
+        // Remove the second last block from allocated blocks
+        allocatedBlocks.erase((++it).base());
+        // Remove stored block ids in sequence
+        auto beamWidth = sequence.getBeamWidth();
+        TLLM_CHECK_WITH_INFO(beamWidth == 1, "Spec decoding with linear attention does not support beam search");
+        for (auto beamIdx = 0; beamIdx < beamWidth; ++beamIdx)
+        {
+            sequence.getCacheBlockIds(mWindowSize)[beamIdx].erase(
+                sequence.getCacheBlockIds(mWindowSize)[beamIdx].end() - 2);
+        }
+        return;
+    }
     auto const requestId = sequence.getRequestId();
     auto& allocatedBlocks = mAllocatedBlocksPerSeq.at(requestId);
     auto it = allocatedBlocks.rbegin();
@@ -3007,12 +3132,13 @@ KVCacheManager::KVCacheManager(SizeType32 numLayers, SizeType32 numKvHeads, Size
     SizeType32 sinkTokenLength, int64_t stream, runtime::SizeType32 maxSequenceLength, SizeType32 chunkSize,
     bool enableBlockReuse, CacheType cacheType, bool enablePartialReuse, bool copyOnPartialReuse,
     bool enableIndexerKCache, SizeType32 indexerKCacheQuantBlockSize, SizeType32 indexerKCacheIndexHeadDim,
-    std::optional<LinearAttentionMetadata> linearAttentionMetadata)
+    bool indexerKCacheUseFp4, std::optional<LinearAttentionMetadata> linearAttentionMetadata)
     : KVCacheManager(std::vector<SizeType32>(numLayers, numKvHeads), sizePerHead, tokensPerBlock, blocksPerWindow,
         maxNumSequences, maxBeamWidth, maxAttentionWindowVec, dtype, sinkTokenLength,
         std::make_shared<runtime::CudaStream>(reinterpret_cast<cudaStream_t>(stream)), maxSequenceLength, chunkSize,
         enableBlockReuse, cacheType, std::nullopt, nullptr, enablePartialReuse, copyOnPartialReuse, nullptr,
-        enableIndexerKCache, indexerKCacheQuantBlockSize, indexerKCacheIndexHeadDim, linearAttentionMetadata)
+        enableIndexerKCache, indexerKCacheQuantBlockSize, indexerKCacheIndexHeadDim, indexerKCacheUseFp4,
+        linearAttentionMetadata)
 {
 }
 
@@ -3023,14 +3149,14 @@ KVCacheManager::KVCacheManager(std::vector<SizeType32> const& numKvHeadsPerLayer
     bool enableBlockReuse, CacheType cacheType, std::optional<executor::RetentionPriority> secondaryOffloadMinPriority,
     std::shared_ptr<KVCacheEventManager> eventManager, bool enablePartialReuse, bool copyOnPartialReuse,
     std::shared_ptr<kv_connector::KvCacheConnectorManager> kvCacheConnectorManager, bool enableIndexerKCache,
-    SizeType32 indexerKCacheQuantBlockSize, SizeType32 indexerKCacheIndexHeadDim,
+    SizeType32 indexerKCacheQuantBlockSize, SizeType32 indexerKCacheIndexHeadDim, bool indexerKCacheUseFp4,
     std::optional<LinearAttentionMetadata> linearAttentionMetadata)
     : KVCacheManager(numKvHeadsPerLayer, sizePerHead, tokensPerBlock, blocksPerWindow, maxNumSequences, maxBeamWidth,
         maxAttentionWindowVec, dtype, sinkTokenLength,
         std::make_shared<runtime::CudaStream>(reinterpret_cast<cudaStream_t>(stream)), maxSequenceLength, chunkSize,
         enableBlockReuse, cacheType, secondaryOffloadMinPriority, eventManager, enablePartialReuse, copyOnPartialReuse,
         kvCacheConnectorManager, enableIndexerKCache, indexerKCacheQuantBlockSize, indexerKCacheIndexHeadDim,
-        linearAttentionMetadata)
+        indexerKCacheUseFp4, linearAttentionMetadata)
 {
 }
 
@@ -3041,7 +3167,7 @@ KVCacheManager::KVCacheManager(std::vector<SizeType32> const& numKvHeadsPerLayer
     bool enableBlockReuse, CacheType cacheType, std::optional<executor::RetentionPriority> secondaryOffloadMinPriority,
     std::shared_ptr<KVCacheEventManager> eventManager, bool enablePartialReuse, bool copyOnPartialReuse,
     std::shared_ptr<kv_connector::KvCacheConnectorManager> kvCacheConnectorManager, bool enableIndexerKCache,
-    SizeType32 indexerKCacheQuantBlockSize, SizeType32 indexerKCacheIndexHeadDim,
+    SizeType32 indexerKCacheQuantBlockSize, SizeType32 indexerKCacheIndexHeadDim, bool indexerKCacheUseFp4,
     std::optional<LinearAttentionMetadata> linearAttentionMetadata)
     : mMaxBeamWidth(maxBeamWidth)
     , mDataType(dtype)
@@ -3054,7 +3180,7 @@ KVCacheManager::KVCacheManager(std::vector<SizeType32> const& numKvHeadsPerLayer
           std::move(stream), maxSequenceLength, maxBeamWidth, maxAttentionWindowVec, dtype, mSinkBubbleLength,
           mChunkSize, cacheType, secondaryOffloadMinPriority, std::move(eventManager), enablePartialReuse,
           copyOnPartialReuse, std::move(kvCacheConnectorManager), std::nullopt, enableIndexerKCache,
-          indexerKCacheQuantBlockSize, indexerKCacheIndexHeadDim, linearAttentionMetadata)
+          indexerKCacheQuantBlockSize, indexerKCacheIndexHeadDim, indexerKCacheUseFp4, linearAttentionMetadata)
     // disable block reuse for sink bubble since chopVectorIntoBlocks does not match KV cache blocks in this case
     , mEnableBlockReuse{mSinkBubbleLength > 0 ? false : enableBlockReuse}
 {
@@ -3081,13 +3207,13 @@ KVCacheManager::KVCacheManager(SizeType32 numLayers, SizeType32 numKvHeads, Size
     bool enableBlockReuse, CacheType cacheType, std::optional<executor::RetentionPriority> secondaryOffloadMinPriority,
     std::shared_ptr<KVCacheEventManager> eventManager, bool enablePartialReuse, bool copyOnPartialReuse,
     std::shared_ptr<kv_connector::KvCacheConnectorManager> kvCacheConnectorManager, bool enableIndexerKCache,
-    SizeType32 indexerKCacheQuantBlockSize, SizeType32 indexerKCacheIndexHeadDim,
+    SizeType32 indexerKCacheQuantBlockSize, SizeType32 indexerKCacheIndexHeadDim, bool indexerKCacheUseFp4,
     std::optional<LinearAttentionMetadata> linearAttentionMetadata)
     : KVCacheManager(std::vector<SizeType32>(numLayers, numKvHeads), sizePerHead, tokensPerBlock, blocksPerWindow,
         maxNumSequences, maxBeamWidth, maxAttentionWindowVec, dtype, sinkTokenLength, std::move(stream),
         maxSequenceLength, chunkSize, enableBlockReuse, cacheType, secondaryOffloadMinPriority, std::move(eventManager),
         enablePartialReuse, copyOnPartialReuse, std::move(kvCacheConnectorManager), enableIndexerKCache,
-        indexerKCacheQuantBlockSize, indexerKCacheIndexHeadDim, linearAttentionMetadata)
+        indexerKCacheQuantBlockSize, indexerKCacheIndexHeadDim, indexerKCacheUseFp4, linearAttentionMetadata)
 {
 }
 
@@ -3193,6 +3319,11 @@ SizeType32 KVCacheManager::getNeededBlocksOneStep(LlmRequest const& req, bool tw
             = std::min((isCrossKv() ? req.getEncoderOutputLen() : req.mPromptLen) + maxDraftTokensToAdd,
                   windowSize + mChunkSize)
             + mSinkBubbleLength;
+        if (LinearAttentionMetadata::hasLinearCache(windowSize))
+        {
+            return mBlockManager.getLinearAttentionMetadata()->calcNumBlocksNeededForReq(
+                promptCacheLen, getTokensPerBlock(), mEnableBlockReuse);
+        }
         auto const numSharedBlocks = promptCacheLen / getTokensPerBlock();
         auto const numUnSharedTokens = promptCacheLen % getTokensPerBlock();
         auto const numUnSharedBlocks
@@ -3237,6 +3368,12 @@ SizeType32 KVCacheManager::getNeededBlocksOneStep(LlmRequest const& req, bool tw
         auto const maxTokensToAdd = std::min((twoStepsLookAhead ? 2 : 1) * tokensPerStep, maxTokensToAddToKVCache);
         auto const numNextTokens = numCurrTokens + maxTokensToAdd;
 
+        if (LinearAttentionMetadata::hasLinearCache(windowSize))
+        {
+            return mBlockManager.getLinearAttentionMetadata()->calcNumAdditionalBlocksNeededForReq(
+                numCurrTokens, req.getPromptLen(), getTokensPerBlock(), mEnableBlockReuse);
+        }
+
         if (numNextTokens > mBlockManager.getWindowSizeMetadata(windowSize).maxTokenNum)
         {
             return 0;
@@ -3271,7 +3408,8 @@ SizeType32 KVCacheManager::getRemainingBlocksToCompletion(
     {
         if (req.isGenerationInProgressState())
         {
-            return 0; // no need to allocate blocks for recurrent states during generation
+            return mBlockManager.getLinearAttentionMetadata()->calcNumAdditionalBlocksNeededForReq(
+                req.getNumTokens(0), req.getPromptLen(), getTokensPerBlock(), mEnableBlockReuse);
         }
         else if (!req.isContextFinished())
         {
@@ -3281,12 +3419,8 @@ SizeType32 KVCacheManager::getRemainingBlocksToCompletion(
             {
                 return 0;
             }
-            if (mEnableBlockReuse)
-            {
-                return req.getPromptLen() / mBlockManager.getLinearAttentionMetadata()->statesSnapshotInterval + 1
-                    + (mBlockManager.getLinearAttentionMetadata()->saveLastSnapshot ? 1 : 0);
-            }
-            return 1;
+            return mBlockManager.getLinearAttentionMetadata()->calcNumBlocksNeededForReq(
+                req.mPromptLen, getTokensPerBlock(), mEnableBlockReuse);
         }
     }
 
@@ -3430,10 +3564,29 @@ void KVCacheManager::addToken(RequestIdType requestId)
     mBlockManager.adjustBlocksIfNeeded(sequence);
 }
 
-void KVCacheManager::copyLinearAttentionBlock(LlmRequest const& llmRequest)
+bool KVCacheManager::copyLinearAttentionBlock(LlmRequest const& llmRequest)
 {
+    if (!mEnableBlockReuse)
+    {
+        // When block reuse is disabled, we always use a single slot for a sequence and move it to
+        // the end of blocks list, so copying is not needed.
+        return false;
+    }
     auto& sequence = getSequence(llmRequest.mRequestId);
-    mBlockManager.copyLinearAttentionBlock(sequence, llmRequest);
+    return mBlockManager.copyLinearAttentionBlock(sequence, llmRequest);
+}
+
+bool KVCacheManager::copyLinearAttentionBlockBatch(std::vector<std::shared_ptr<LlmRequest>> const& llmRequests)
+{
+    bool copiedAny = false;
+    for (auto const& req : llmRequests)
+    {
+        if (copyLinearAttentionBlock(*req))
+        {
+            copiedAny = true;
+        }
+    }
+    return copiedAny;
 }
 
 void WindowBlockManager::detachFrontBlock(GenerationRequest& sequence)
@@ -3542,8 +3695,13 @@ void KVCacheManager::addSequenceBatch(
     std::vector<SizeType32> totalMissedDelta(n, 0);
 
     // --- Iterate over all window sizes (single iteration for non-VSWA) ---
-    for (auto const& [windowSize, metadata] : mBlockManager.getWindowSizesMetadata())
+    // Onboard longer windows first to match the assumption in setCurrentPrepopulatedPromptLen
+    // (longer windows can match longer tokens). Linear attention also benefits because it
+    // has more restrictions and is always the shortest match.
+    for (auto iter = mBlockManager.getWindowSizesMetadata().rbegin();
+         iter != mBlockManager.getWindowSizesMetadata().rend(); ++iter)
     {
+        auto const& [windowSize, metadata] = *iter;
         // Use maxTokenNum (= max(windowSize, maxSequenceLength) + sinkBubbleLength) as the cap.
         // For SWA, blocks are allocated linearly for the full prompt; out-of-window blocks are
         // only detached during generation in adjustBlocksIfNeeded.
@@ -3618,7 +3776,7 @@ void KVCacheManager::storeContextBlocks(LlmRequest const& llmRequest)
     }
     else
     {
-        TLLM_LOG_WARNING("[kv cache manager] storeContextBlocks: Can not find sequence for request %lu", requestId);
+        // TLLM_LOG_WARNING("[kv cache manager] storeContextBlocks: Can not find sequence for request %lu", requestId);
     }
 }
 
@@ -3777,6 +3935,14 @@ std::map<SizeType32, std::vector<SizeType32>> BaseKVCacheManager::groupLayersByW
     return uniqueWindowSizeToLayers;
 }
 
+void KVCacheManager::truncateBlocks(LlmRequest::VecTokens const& targetTokens, SizeType32 numTokensToKeep)
+{
+    for (auto const& [windowSize, metadata] : mBlockManager.getWindowSizesMetadata())
+    {
+        mBlockManager.truncateBlocks(targetTokens, numTokensToKeep, windowSize);
+    }
+}
+
 std::tuple<uint64_t, uint64_t> BaseKVCacheManager::calculateFreeMemBytes(
     runtime::BufferManager const& bufferManager, executor::KvCacheConfig const& config)
 {
@@ -3840,88 +4006,79 @@ bool isSortedVectorIdenticalAcrossAllRanks(WorldConfig const& worldConfig, std::
     }
     return true;
 }
-} // namespace
 
-BlocksPerWindow BaseKVCacheManager::calculateMaxNumBlocks(executor::KvCacheConfig const& config,
-    nvinfer1::DataType dtype, std::vector<SizeType32> const& numKvHeadsPerLayer, SizeType32 sizePerHead,
-    SizeType32 tokensPerBlock, WorldConfig const& worldConfig,
-    std::map<SizeType32, std::vector<SizeType32>> const& windowSizeToLayers, uint64_t allottedPrimaryMemBytes,
-    uint64_t allottedSecondaryMemBytes, size_t extraCostMemory, SizeType32 kvFactor, SizeType32 maxBatchSize,
-    std::optional<LinearAttentionMetadata> const& linearAttentionMetadata)
+/// Drive a min-allreduce so all ranks agree on the primary/secondary block counts per window size.
+/// No-op for single-rank world configs. @p windowSizes must be sorted identically across ranks.
+void synchronizeBlockCountsAcrossRanks(WorldConfig const& worldConfig, std::vector<SizeType32> const& windowSizes,
+    std::vector<SizeType32>& blocksPrimary, std::vector<SizeType32>& blocksSecondary)
 {
-    TLLM_LOG_DEBUG("Calculating max num blocks: {.allottedPrimaryMemBytes=%" PRIu64
-                   ", .allottedSecondaryMemBytes=%" PRIu64 "}",
-        allottedPrimaryMemBytes, allottedSecondaryMemBytes);
-
-    if (config.getMaxTokens().has_value() && windowSizeToLayers.size() > 1)
+    if (worldConfig.getSize() <= 1)
     {
-        TLLM_LOG_WARNING(
-            "Setting maxTokens when using Variable Sliding Window Attention is a strange concept, as it limits "
-            "the number of max tokens *per window size* [limiting the sum of all window sizes is even stranger]. "
-            "Anticipating the effects of this requires quite a complex calculation, and it probably isn't the "
-            "configuration you meant to use.");
+        return;
     }
+    TLLM_CHECK(worldConfig.validMpiConfig());
+    auto const rank = worldConfig.getRank();
+    using tensorrt_llm::common::vec2str;
+    TLLM_CHECK_WITH_INFO(isSortedVectorIdenticalAcrossAllRanks(worldConfig, windowSizes),
+        "[RANK %d] Asymmetrical pipeline parallelism detected: Ranks either have a different number of window "
+        "sizes, or differing values. This is not supported with Variable Sliding Window Attention. Local window "
+        "sizes for reference: %s",
+        rank, vec2str(windowSizes).c_str());
+    TLLM_LOG_DEBUG(
+        "[RANK %d] Before mpi::MpiOp::MIN reduction: window sizes %s / primary blocks %s / secondary blocks %s", rank,
+        vec2str(windowSizes).c_str(), vec2str(blocksPrimary).c_str(), vec2str(blocksSecondary).c_str());
+    // make sure all ranks use same value for max blocks
+    auto blocksWorld = blocksPrimary;
+    COMM_SESSION.allreduce(
+        blocksPrimary.data(), blocksWorld.data(), windowSizes.size(), mpi::MpiType::kINT32, mpi::MpiOp::MIN);
+    blocksPrimary = blocksWorld;
+    COMM_SESSION.allreduce(
+        blocksSecondary.data(), blocksWorld.data(), windowSizes.size(), mpi::MpiType::kINT32, mpi::MpiOp::MIN);
+    blocksSecondary = blocksWorld;
+    TLLM_LOG_DEBUG(
+        "[RANK %d] After mpi::MpiOp::MIN reduction: window sizes %s / primary blocks %s / secondary blocks %s", rank,
+        vec2str(windowSizes).c_str(), vec2str(blocksPrimary).c_str(), vec2str(blocksSecondary).c_str());
+}
 
-    std::map<SizeType32, SizeType32> cacheSizeBytesPerTokenPerWindow;
-    for (auto const& [windowSize, managedLayers] : windowSizeToLayers)
+/// Reserve static memory for recurrent-state blocks (maxBatchSize blocks, scaled by the number of linear-attention
+/// layers since allRecurrentStatesBytes is per-layer). Subtracts the reservation from @p allottedPrimaryMemBytes
+/// (in/out) and routes the recurrent-states window's share of the dynamic budget to the full-attention window.
+void reserveStaticHybridLinearStates(LinearAttentionMetadata const& linearAttentionMetadata,
+    std::map<SizeType32, std::vector<SizeType32>> const& windowSizeToLayers, SizeType32 maxBatchSize,
+    uint64_t& allottedPrimaryMemBytes, std::map<SizeType32, float>& windowSizeToShare)
+{
+    for (auto const& [windowSize, _] : windowSizeToLayers)
     {
-        if (LinearAttentionMetadata::hasLinearCache(windowSize))
-        {
-            cacheSizeBytesPerTokenPerWindow[windowSize] = 1;
-            continue;
-        }
-        auto const cacheSizePerToken = BaseKVCacheManager::calculateCacheSizePerTokenForSingleWindowSize(
-            numKvHeadsPerLayer, sizePerHead, managedLayers, kvFactor);
-        auto const cacheSizeBytesPerToken = cacheSizePerToken * BufferDataType(dtype).getSize();
-        cacheSizeBytesPerTokenPerWindow[windowSize] = cacheSizeBytesPerToken;
+        windowSizeToShare[windowSize] = 1.0f;
     }
-    bool const isVSWA = cacheSizeBytesPerTokenPerWindow.size() > 1;
+    windowSizeToShare[LinearAttentionMetadata::kRecurrentStates] = 0.0f;
 
-    TLLM_LOG_DEBUG("extraCostMemory [Gib]: %0.2f", extraCostMemory / static_cast<double>(1 << 30));
-    allottedPrimaryMemBytes = allottedPrimaryMemBytes - extraCostMemory;
-    auto const calculatePrimaryBlocks
-        = [&](SizeType32 windowSize, double windowSizeShare, SizeType32 cacheSizeBytesPerToken)
+    auto const numLinearLayers
+        = static_cast<uint64_t>(windowSizeToLayers.at(LinearAttentionMetadata::kRecurrentStates).size());
+    auto const staticMemoryBytes = static_cast<uint64_t>(maxBatchSize) * numLinearLayers
+        * static_cast<uint64_t>(linearAttentionMetadata.allRecurrentStatesBytes);
+    TLLM_CHECK_WITH_INFO(allottedPrimaryMemBytes > staticMemoryBytes,
+        "Not enough memory to allocate static cache for linear attention states. Required: %0.2f GiB, "
+        "Allotted: %0.2f GiB",
+        staticMemoryBytes / static_cast<double>(1 << 30), allottedPrimaryMemBytes / static_cast<double>(1 << 30));
+    allottedPrimaryMemBytes -= staticMemoryBytes;
+    TLLM_LOG_INFO(
+        "Hybrid model with linear attention (mamba) detected. Reserving %0.2f GiB of GPU memory for static "
+        "allocation of linear attention states, leaving %0.2f GiB for dynamically allocated blocks for KV cache.",
+        staticMemoryBytes / static_cast<double>(1 << 30), allottedPrimaryMemBytes / static_cast<double>(1 << 30));
+    if (std::getenv("TRTLLM_WINDOW_SIZE_SHARES"))
     {
-        TLLM_LOG_DEBUG("windowSizeShare: %lf, cacheSizeBytesPerToken: %d", windowSizeShare, cacheSizeBytesPerToken);
-        auto memoryBudget = static_cast<uint64_t>(allottedPrimaryMemBytes * windowSizeShare);
-        if (LinearAttentionMetadata::hasRecurrentStatesCache(windowSize))
-        {
-            TLLM_CHECK_WITH_INFO(linearAttentionMetadata.has_value(),
-                "Linear attention metadata must be provided when linear attention is used.");
-            return linearAttentionMetadata->calcMaxMemoryBlocks(
-                windowSize, tokensPerBlock, memoryBudget, windowSizeToLayers.at(windowSize).size());
-        }
-        auto maxTokens = static_cast<uint64_t>(memoryBudget / cacheSizeBytesPerToken);
+        TLLM_LOG_INFO("TRTLLM_WINDOW_SIZE_SHARES is ignored in this case");
+    }
+}
 
-        // kv_cache_config.max_tokens is not effective in VSWA scheme
-        if (config.getMaxTokens().has_value() && !isVSWA)
-        {
-            auto const maxTokensFromConfig = static_cast<uint64_t>(config.getMaxTokens().value());
-            if (maxTokensFromConfig < maxTokens)
-            {
-                TLLM_LOG_DEBUG("Maximum kv-cache token overridden by configuration as '%ld'.", maxTokensFromConfig);
-                maxTokens = std::min(maxTokensFromConfig, maxTokens);
-            }
-        }
-        TLLM_LOG_DEBUG("Primary maxTokens for windowSize %d: %ld", windowSize, maxTokens);
-        return static_cast<SizeType32>(tc::ceilDiv(maxTokens, tokensPerBlock));
-    };
-
-    auto const calculateSecondaryBlocks
-        = [&](SizeType32 windowSize, double windowSizeShare, SizeType32 cacheSizeBytesPerToken)
-    {
-        auto memoryBudget = static_cast<uint64_t>(allottedSecondaryMemBytes * windowSizeShare);
-        if (LinearAttentionMetadata::hasLinearCache(windowSize))
-        {
-            TLLM_CHECK_WITH_INFO(linearAttentionMetadata.has_value(),
-                "Linear attention metadata must be provided when linear attention is used.");
-            return linearAttentionMetadata->calcMaxMemoryBlocks(
-                windowSize, tokensPerBlock, memoryBudget, windowSizeToLayers.at(windowSize).size());
-        }
-        auto maxTokensSecondary = static_cast<SizeType32>(memoryBudget / cacheSizeBytesPerToken);
-        return std::max(0, maxTokensSecondary / tokensPerBlock);
-    };
-
+/// Compute each window's share of the dynamic primary-memory budget.
+///
+/// By default, all windows get equal shares. With TRTLLM_WINDOW_SIZE_SHARES, shares are taken from the env var
+/// (e.g. "0.4,0.6") and normalized to sum to 1.
+std::map<SizeType32, float> computeWindowSizeShares(
+    std::map<SizeType32, std::vector<SizeType32>> const& windowSizeToLayers)
+{
     std::map<SizeType32, float> windowSizeToShare;
     // By default, we allocate equal proportion shares of memory for all
     // window sizes (see the else case). With TRTLLM_WINDOW_SIZE_SHARES,
@@ -3973,6 +4130,107 @@ BlocksPerWindow BaseKVCacheManager::calculateMaxNumBlocks(executor::KvCacheConfi
             windowSizeToShare[windowSize] = 1.0f / windowSizeToLayers.size();
         }
     }
+    return windowSizeToShare;
+}
+} // namespace
+
+BlocksPerWindow BaseKVCacheManager::calculateMaxNumBlocks(executor::KvCacheConfig const& config,
+    nvinfer1::DataType dtype, std::vector<SizeType32> const& numKvHeadsPerLayer, SizeType32 sizePerHead,
+    SizeType32 tokensPerBlock, WorldConfig const& worldConfig,
+    std::map<SizeType32, std::vector<SizeType32>> const& windowSizeToLayers, uint64_t allottedPrimaryMemBytes,
+    uint64_t allottedSecondaryMemBytes, size_t extraCostMemory, SizeType32 kvFactor, SizeType32 maxBatchSize,
+    std::optional<LinearAttentionMetadata> const& linearAttentionMetadata)
+{
+    TLLM_LOG_DEBUG("Calculating max num blocks: {.allottedPrimaryMemBytes=%" PRIu64
+                   ", .allottedSecondaryMemBytes=%" PRIu64 "}",
+        allottedPrimaryMemBytes, allottedSecondaryMemBytes);
+
+    if (config.getMaxTokens().has_value() && windowSizeToLayers.size() > 1)
+    {
+        TLLM_LOG_WARNING(
+            "Setting maxTokens when using Variable Sliding Window Attention is a strange concept, as it limits "
+            "the number of max tokens *per window size* [limiting the sum of all window sizes is even stranger]. "
+            "Anticipating the effects of this requires quite a complex calculation, and it probably isn't the "
+            "configuration you meant to use.");
+    }
+
+    std::map<SizeType32, SizeType32> cacheSizeBytesPerTokenPerWindow;
+    for (auto const& [windowSize, managedLayers] : windowSizeToLayers)
+    {
+        auto const cacheSizePerToken = LinearAttentionMetadata::hasLinearCache(windowSize)
+            ? 1
+            : BaseKVCacheManager::calculateCacheSizePerTokenForSingleWindowSize(
+                numKvHeadsPerLayer, sizePerHead, managedLayers, kvFactor);
+        auto const cacheSizeBytesPerToken = cacheSizePerToken * BufferDataType(dtype).getSize();
+        cacheSizeBytesPerTokenPerWindow[windowSize] = cacheSizeBytesPerToken;
+    }
+
+    // When the model is mamba hybrid (i.e. has only 2 windows sizes: max_seq_len and
+    // LinearAttentionMetadata::kRecurrentStates), and block reuse is disabled, we can allocate static memory for the
+    // linear attention states - max_batch_size blocks.
+    bool const isStaticHybridNoReuseModel = windowSizeToLayers.size() == 2
+        && windowSizeToLayers.count(LinearAttentionMetadata::LinearCacheType::kRecurrentStates) == 1
+        && linearAttentionMetadata.has_value() && !config.getEnableBlockReuse();
+    bool const isVSWA = cacheSizeBytesPerTokenPerWindow.size() > 1;
+
+    TLLM_LOG_DEBUG("extraCostMemory [Gib]: %0.2f", extraCostMemory / static_cast<double>(1 << 30));
+    allottedPrimaryMemBytes = allottedPrimaryMemBytes - extraCostMemory;
+
+    auto windowSizeToShare = computeWindowSizeShares(windowSizeToLayers);
+
+    if (isStaticHybridNoReuseModel)
+    {
+        reserveStaticHybridLinearStates(
+            *linearAttentionMetadata, windowSizeToLayers, maxBatchSize, allottedPrimaryMemBytes, windowSizeToShare);
+    }
+
+    auto const calculatePrimaryBlocks
+        = [&](SizeType32 windowSize, double windowSizeShare, SizeType32 cacheSizeBytesPerToken)
+    {
+        TLLM_LOG_DEBUG("windowSizeShare: %lf, cacheSizeBytesPerToken: %d", windowSizeShare, cacheSizeBytesPerToken);
+        auto memoryBudget = static_cast<uint64_t>(allottedPrimaryMemBytes * windowSizeShare);
+        if (LinearAttentionMetadata::hasRecurrentStatesCache(windowSize))
+        {
+            TLLM_CHECK_WITH_INFO(linearAttentionMetadata.has_value(),
+                "Linear attention metadata must be provided when linear attention is used.");
+            return isStaticHybridNoReuseModel ? maxBatchSize
+                                              : linearAttentionMetadata->calcMaxMemoryBlocks(windowSize, tokensPerBlock,
+                                                  memoryBudget, windowSizeToLayers.at(windowSize).size());
+        }
+        auto maxTokens = static_cast<uint64_t>(memoryBudget / cacheSizeBytesPerToken);
+
+        // kv_cache_config.max_tokens is not effective in VSWA scheme
+        if (config.getMaxTokens().has_value() && !isVSWA)
+        {
+            auto const maxTokensFromConfig = static_cast<uint64_t>(config.getMaxTokens().value());
+            if (maxTokensFromConfig < maxTokens)
+            {
+                TLLM_LOG_DEBUG("Maximum kv-cache token overridden by configuration as '%ld'.", maxTokensFromConfig);
+                maxTokens = std::min(maxTokensFromConfig, maxTokens);
+            }
+        }
+        TLLM_LOG_DEBUG("Primary maxTokens for windowSize %d: %ld", windowSize, maxTokens);
+        return static_cast<SizeType32>(tc::ceilDiv(maxTokens, tokensPerBlock));
+    };
+
+    auto const calculateSecondaryBlocks
+        = [&](SizeType32 windowSize, double windowSizeShare, SizeType32 cacheSizeBytesPerToken)
+    {
+        auto memoryBudget = static_cast<uint64_t>(allottedSecondaryMemBytes * windowSizeShare);
+        if (LinearAttentionMetadata::hasLinearCache(windowSize))
+        {
+            if (isStaticHybridNoReuseModel && memoryBudget > 0)
+            {
+                TLLM_LOG_WARNING("It's meaningless to allocate secondary memory when block reuse is disabled.");
+            }
+            TLLM_CHECK_WITH_INFO(linearAttentionMetadata.has_value(),
+                "Linear attention metadata must be provided when linear attention is used.");
+            return linearAttentionMetadata->calcMaxMemoryBlocks(
+                windowSize, tokensPerBlock, memoryBudget, windowSizeToLayers.at(windowSize).size());
+        }
+        auto maxTokensSecondary = static_cast<SizeType32>(memoryBudget / cacheSizeBytesPerToken);
+        return std::max(0, maxTokensSecondary / tokensPerBlock);
+    };
 
     std::vector<SizeType32> blocksPrimary;
     std::vector<SizeType32> blocksSecondary;
@@ -3997,32 +4255,8 @@ BlocksPerWindow BaseKVCacheManager::calculateMaxNumBlocks(executor::KvCacheConfi
     {
         windowSizes.push_back(k);
     }
-    if (worldConfig.getSize() > 1)
-    {
-        TLLM_CHECK(worldConfig.validMpiConfig());
-        auto const rank = worldConfig.getRank();
-        using tensorrt_llm::common::vec2str;
-        TLLM_CHECK_WITH_INFO(isSortedVectorIdenticalAcrossAllRanks(
-                                 worldConfig, windowSizes), // sorted thanks to windowSizeToLayers being a std::map
-            "[RANK %d] Asymmetrical pipeline parallelism detected: Ranks either have a different number of window "
-            "sizes, or differing values. This is not supported with Variable Sliding Window Attention. Local window "
-            "sizes for reference: %s",
-            rank, vec2str(windowSizes).c_str());
-        TLLM_LOG_DEBUG(
-            "[RANK %d] Before mpi::MpiOp::MIN reduction: window sizes %s / primary blocks %s / secondary blocks %s",
-            rank, vec2str(windowSizes).c_str(), vec2str(blocksPrimary).c_str(), vec2str(blocksSecondary).c_str());
-        // make sure all ranks use same value for max blocks
-        auto blocksWorld = blocksPrimary;
-        COMM_SESSION.allreduce(
-            blocksPrimary.data(), blocksWorld.data(), windowSizes.size(), mpi::MpiType::kINT32, mpi::MpiOp::MIN);
-        blocksPrimary = blocksWorld;
-        COMM_SESSION.allreduce(
-            blocksSecondary.data(), blocksWorld.data(), windowSizes.size(), mpi::MpiType::kINT32, mpi::MpiOp::MIN);
-        blocksSecondary = blocksWorld;
-        TLLM_LOG_DEBUG(
-            "[RANK %d] After mpi::MpiOp::MIN reduction: window sizes %s / primary blocks %s / secondary blocks %s",
-            rank, vec2str(windowSizes).c_str(), vec2str(blocksPrimary).c_str(), vec2str(blocksSecondary).c_str());
-    }
+    // windowSizes is sorted thanks to windowSizeToLayers being a std::map.
+    synchronizeBlockCountsAcrossRanks(worldConfig, windowSizes, blocksPrimary, blocksSecondary);
 
     BlocksPerWindow windowSizeToBlocks;
     TLLM_LOG_INFO("Blocks per window size:");

@@ -1,6 +1,11 @@
-# Copyright (c) 2025-2026, NVIDIA CORPORATION. All rights reserved.
+# Copyright 2018 The HuggingFace Team
+# Licensed under the Apache License, Version 2.0.
+# Original source: https://github.com/huggingface/transformers
+#
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 
-"""Qwen3.5 MoE model for auto_deploy (text + vision).
+"""Sharding-aware Qwen3.5 MoE model for AutoDeploy IR sharding (text + vision).
 
 Reference HF modeling file (not yet in a released transformers version):
   transformers/models/qwen3_5_moe/modeling_qwen3_5_moe.py
@@ -40,6 +45,7 @@ from transformers.modeling_outputs import BaseModelOutputWithPooling
 from transformers.modeling_utils import PreTrainedModel
 from transformers.utils import ModelOutput
 
+from ... import custom_ops  # noqa: F401 -- register all ops
 from ...custom_ops.attention_interface import BatchInfo
 from ..factory import ModelFactoryRegistry
 from ..hf import (
@@ -56,10 +62,6 @@ except ModuleNotFoundError:
     apply_mm_hashes = None
     hexdigest_to_int32 = None
     VideoData = None
-
-# =============================================================================
-# Configuration
-# =============================================================================
 
 
 class Qwen3_5MoeTextConfig(PretrainedConfig):
@@ -352,10 +354,35 @@ class Qwen3_5MoeGatedDeltaNet(nn.Module):
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         batch_size, seq_len, _ = hidden_states.shape
         # 1. Projections (separate, unlike Qwen3Next which uses combined in_proj_qkvz)
-        mixed_qkv = self.in_proj_qkv(hidden_states)  # [B, S, conv_dim]
-        z = self.in_proj_z(hidden_states)  # [B, S, value_dim]
-        b = self.in_proj_b(hidden_states)  # [B, S, num_v_heads]
-        a = self.in_proj_a(hidden_states)  # [B, S, num_v_heads]
+        mixed_qkv = torch.ops.auto_deploy.torch_linear_simple(
+            hidden_states,
+            self.in_proj_qkv.weight,
+            self.in_proj_qkv.bias,
+            tp_mode="colwise",
+            output_sizes=[self.key_dim, self.key_dim, self.value_dim],
+            layer_type="delta",
+        )  # [B, S, conv_dim]
+        z = torch.ops.auto_deploy.torch_linear_simple(
+            hidden_states,
+            self.in_proj_z.weight,
+            self.in_proj_z.bias,
+            tp_mode="colwise",
+            layer_type="delta",
+        )  # [B, S, value_dim]
+        b = torch.ops.auto_deploy.torch_linear_simple(
+            hidden_states,
+            self.in_proj_b.weight,
+            self.in_proj_b.bias,
+            tp_mode="colwise",
+            layer_type="delta",
+        )  # [B, S, num_v_heads]
+        a = torch.ops.auto_deploy.torch_linear_simple(
+            hidden_states,
+            self.in_proj_a.weight,
+            self.in_proj_a.bias,
+            tp_mode="colwise",
+            layer_type="delta",
+        )  # [B, S, num_v_heads]
 
         # 2. Causal Conv1d via autodeploy op
         # torch_causal_conv1d expects [B, S, C] input, handles transpose internally
@@ -368,34 +395,74 @@ class Qwen3_5MoeGatedDeltaNet(nn.Module):
             self.conv1d.dilation[0],
             self.conv1d.groups,
             self.conv1d.padding_mode,
+            enable_sharding=True,
+            output_sizes=[self.key_dim, self.key_dim, self.value_dim],
+            layer_type="delta",
         )
         mixed_qkv = F.silu(mixed_qkv)
 
         # Split back into Q, K, V
-        query, key, value = torch.split(
+        query, key, value = torch.ops.auto_deploy.split_with_sizes(
             mixed_qkv,
             [self.key_dim, self.key_dim, self.value_dim],
             dim=-1,
+            enable_sharding=True,
+            layer_type="delta",
         )
 
         # Reshape to per-head: [B, S, num_heads, head_dim]
-        query = query.reshape(batch_size, seq_len, -1, self.head_k_dim)
-        key = key.reshape(batch_size, seq_len, -1, self.head_k_dim)
-        value = value.reshape(batch_size, seq_len, -1, self.head_v_dim)
+        query = torch.ops.auto_deploy.view(
+            query,
+            [batch_size, seq_len, -1, self.head_k_dim],
+            tp_scaled_dim=2,
+            layer_type="delta",
+        )
+        key = torch.ops.auto_deploy.view(
+            key,
+            [batch_size, seq_len, -1, self.head_k_dim],
+            tp_scaled_dim=2,
+            layer_type="delta",
+        )
+        value = torch.ops.auto_deploy.view(
+            value,
+            [batch_size, seq_len, -1, self.head_v_dim],
+            tp_scaled_dim=2,
+            layer_type="delta",
+        )
 
         # 3. Gated Delta Rule via autodeploy custom op
         # L2 norm, GQA repeat-interleave, and g/beta computation are handled inside the op.
         core_attn_out = torch.ops.auto_deploy.torch_gated_delta_rule(
-            query, key, value, a, b, self.A_log, self.dt_bias
+            query,
+            key,
+            value,
+            a,
+            b,
+            self.A_log,
+            self.dt_bias,
+            enable_sharding=True,
+            layer_type="delta",
         )
 
         # 5. Gated RMSNorm + merge heads
-        z = z.reshape(batch_size, seq_len, -1, self.head_v_dim)  # [B, S, num_v_heads, head_v_dim]
+        z = torch.ops.auto_deploy.view(
+            z,
+            [batch_size, seq_len, -1, self.head_v_dim],
+            tp_scaled_dim=2,
+            layer_type="delta",
+        )  # [B, S, num_v_heads, head_v_dim]
         core_attn_out = self.norm(core_attn_out, z)
         core_attn_out = core_attn_out.reshape(batch_size, seq_len, -1)
 
         # 6. Output projection
-        output = self.out_proj(core_attn_out)
+        output = torch.ops.auto_deploy.torch_linear_simple(
+            core_attn_out,
+            self.out_proj.weight,
+            self.out_proj.bias,
+            tp_mode="rowwise",
+            layer_type="delta",
+        )
+        output = torch.ops.auto_deploy.all_reduce(output, layer_type="delta")
         return output
 
 
@@ -457,16 +524,50 @@ class Qwen3_5MoeAttention(nn.Module):
         bsz, q_len, _ = hidden_states.size()
 
         # Q projection with gate: output shape (B, S, N, 2*D)
-        qg = self.q_proj(hidden_states).view(bsz, q_len, -1, self.head_dim * 2)
+        qg = torch.ops.auto_deploy.torch_linear_simple(
+            hidden_states,
+            self.q_proj.weight,
+            self.q_proj.bias,
+            tp_mode="colwise",
+            layer_type="mha",
+        )
+        qg = torch.ops.auto_deploy.view(
+            qg,
+            [bsz, q_len, -1, self.head_dim * 2],
+            tp_scaled_dim=2,
+            layer_type="mha",
+        )
         query_states, gate = torch.chunk(qg, 2, dim=-1)  # each (B, S, N, D)
         gate = gate.reshape(bsz, q_len, -1)  # (B, S, N*D)
 
         # K, V projections in bsnd layout
-        key_states = self.k_proj(hidden_states).view(
-            bsz, q_len, self.num_key_value_heads, self.head_dim
+        key_states = torch.ops.auto_deploy.torch_linear_simple(
+            hidden_states,
+            self.k_proj.weight,
+            self.k_proj.bias,
+            tp_mode="colwise",
+            tp_min_local_shape=self.head_dim,
+            layer_type="mha",
         )
-        value_states = self.v_proj(hidden_states).view(
-            bsz, q_len, self.num_key_value_heads, self.head_dim
+        key_states = torch.ops.auto_deploy.view(
+            key_states,
+            [bsz, q_len, -1, self.head_dim],
+            tp_scaled_dim=2,
+            layer_type="mha",
+        )
+        value_states = torch.ops.auto_deploy.torch_linear_simple(
+            hidden_states,
+            self.v_proj.weight,
+            self.v_proj.bias,
+            tp_mode="colwise",
+            tp_min_local_shape=self.head_dim,
+            layer_type="mha",
+        )
+        value_states = torch.ops.auto_deploy.view(
+            value_states,
+            [bsz, q_len, -1, self.head_dim],
+            tp_scaled_dim=2,
+            layer_type="mha",
         )
 
         # Per-head Q/K norms (norm operates on last dim = head_dim)
@@ -495,7 +596,14 @@ class Qwen3_5MoeAttention(nn.Module):
         attn_output = attn_output * torch.sigmoid(gate)
 
         # Output projection
-        attn_output = self.o_proj(attn_output)
+        attn_output = torch.ops.auto_deploy.torch_linear_simple(
+            attn_output,
+            self.o_proj.weight,
+            self.o_proj.bias,
+            tp_mode="rowwise",
+            layer_type="mha",
+        )
+        attn_output = torch.ops.auto_deploy.all_reduce(attn_output, layer_type="mha")
         return attn_output
 
 
@@ -517,7 +625,27 @@ class Qwen3_5MoeMLP(nn.Module):
         self.act_fn = ACT2FN[config.hidden_act]
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
+        gate = torch.ops.auto_deploy.torch_linear_simple(
+            x,
+            self.gate_proj.weight,
+            self.gate_proj.bias,
+            tp_mode="colwise",
+            layer_type="moe",
+        )
+        up = torch.ops.auto_deploy.torch_linear_simple(
+            x,
+            self.up_proj.weight,
+            self.up_proj.bias,
+            tp_mode="colwise",
+            layer_type="moe",
+        )
+        return torch.ops.auto_deploy.torch_linear_simple(
+            self.act_fn(gate) * up,
+            self.down_proj.weight,
+            self.down_proj.bias,
+            tp_mode="rowwise",
+            layer_type="moe",
+        )
 
 
 class Qwen3_5MoeExpert(nn.Module):
@@ -634,9 +762,11 @@ class Qwen3_5MoeSparseMoeBlock(nn.Module):
             w2_weights,
             w3_weights,
             is_gated_mlp=True,
+            layer_type="moe",
         )
 
         expert_output = expert_output + shared_expert_output
+        expert_output = torch.ops.auto_deploy.all_reduce(expert_output, layer_type="moe")
 
         expert_output = expert_output.reshape(batch_size, sequence_length, hidden_dim)
         return expert_output
@@ -759,9 +889,46 @@ class Qwen3_5MoeTextModel(Qwen3_5MoePreTrainedModel):
         self.norm = Qwen3_5MoeRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.rotary_emb = Qwen3_5MoeTextRotaryEmbedding(config=config)
         self.lm_head = None  # set by parent model via set_lm_head()
+        self._register_load_state_dict_pre_hook(
+            self._remap_checkpoint_hierarchy_for_exported_text_model, with_module=True
+        )
 
         # Initialize weights and apply final processing
         self.post_init()
+
+    @staticmethod
+    def _remap_checkpoint_hierarchy_for_exported_text_model(_module, state_dict, prefix, *args):
+        """Remap checkpoint keys when the text model is loaded under a different export root.
+
+        Qwen3.5-35B is used in two AD paths:
+        - full-model export, where the text model is nested under ``model.language_model``
+        - text-submodule export, where the same text model becomes the exported root
+
+        The HF checkpoint keeps text weights under ``model.language_model.*`` but keeps
+        ``lm_head.weight`` at the top level. Normalize both cases into the hierarchy expected
+        by the currently loading module before the more specific module/sharding hooks run.
+        """
+        checkpoint_text_prefix = "model.language_model."
+        keys_to_process = list(state_dict.keys())
+        num_text_keys_remapped = 0
+        for key in keys_to_process:
+            if not key.startswith(checkpoint_text_prefix):
+                continue
+
+            remapped_key = prefix + key[len(checkpoint_text_prefix) :]
+            if remapped_key == key:
+                continue
+
+            state_dict[remapped_key] = state_dict[key]
+            state_dict.pop(key)
+            num_text_keys_remapped += 1
+
+        checkpoint_lm_head_key = "lm_head.weight"
+        remapped_lm_head_key = prefix + checkpoint_lm_head_key
+        if checkpoint_lm_head_key in state_dict and remapped_lm_head_key != checkpoint_lm_head_key:
+            if remapped_lm_head_key not in state_dict:
+                state_dict[remapped_lm_head_key] = state_dict[checkpoint_lm_head_key]
+            state_dict.pop(checkpoint_lm_head_key)
 
     def set_lm_head(self, lm_head: nn.Module):
         """Set the lm_head from the parent model."""
@@ -828,7 +995,7 @@ class Qwen3_5MoeTextModel(Qwen3_5MoePreTrainedModel):
 class Qwen3_5MoeForCausalLM(Qwen3_5MoePreTrainedModel, GenerationMixin):
     """Qwen3.5 MoE causal language model (text model + lm_head)."""
 
-    _tied_weights_keys = ["lm_head.weight"]
+    _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
 
     def __init__(self, config: Qwen3_5MoeTextConfig, **kwargs):
         super().__init__(config)
@@ -1683,17 +1850,17 @@ def qwen3_mrope_delta_with_cache(
     num_seq = num_prefill + num_decode
     out = torch.zeros((num_seq, 1), dtype=torch.int32, device=mrope_delta_cache.device)
     video_grid_norm = _normalize_video_grid_for_mrope(video_grid_thw)
-    if num_prefill > 0:
-        has_mm_metadata = all(
-            arg is not None
-            for arg in (
-                mm_item_cu_seqlen,
-                mm_item_types,
-                mm_token_lengths,
-                mm_special_offsets_cu_seqlen,
-                mm_special_offsets,
-            )
+    has_mm_metadata = all(
+        arg is not None
+        for arg in (
+            mm_item_cu_seqlen,
+            mm_item_types,
+            mm_token_lengths,
+            mm_special_offsets_cu_seqlen,
+            mm_special_offsets,
         )
+    )
+    if num_prefill > 0:
         if has_mm_metadata:
             img_idx = 0
             vid_idx = 0
@@ -2589,9 +2756,21 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3_5MoePreTrainedModel):
         )
         # Share lm_head with the text model so it's inside the exported graph
         self.model.language_model.set_lm_head(self.lm_head)
+        self._register_load_state_dict_pre_hook(
+            self._mirror_lm_head_weight_into_text_alias, with_module=True
+        )
 
         # Initialize weights and apply final processing
         self.post_init()
+
+    @staticmethod
+    def _mirror_lm_head_weight_into_text_alias(_module, state_dict, prefix, *args):
+        """Mirror top-level ``lm_head.weight`` into the nested text-model alias before load."""
+
+        source_key = prefix + "lm_head.weight"
+        alias_key = prefix + "model.language_model.lm_head.weight"
+        if source_key in state_dict and alias_key not in state_dict:
+            state_dict[alias_key] = state_dict[source_key]
 
     def get_input_embeddings(self):
         return self.model.language_model.get_input_embeddings()
@@ -2887,8 +3066,8 @@ class Qwen3_5MoeFactory(AutoModelForImageTextToTextFactory):
 # Registration
 # =============================================================================
 
-AutoConfig.register("qwen3_5_moe", Qwen3_5MoeConfig)
-AutoConfig.register("qwen3_5_moe_text", Qwen3_5MoeTextConfig)
+AutoConfig.register("qwen3_5_moe", Qwen3_5MoeConfig, exist_ok=True)
+AutoConfig.register("qwen3_5_moe_text", Qwen3_5MoeTextConfig, exist_ok=True)
 
 AutoModelForCausalLMFactory.register_custom_model_cls("Qwen3_5MoeTextConfig", Qwen3_5MoeForCausalLM)
 AutoModelForCausalLMFactory.register_custom_model_cls(

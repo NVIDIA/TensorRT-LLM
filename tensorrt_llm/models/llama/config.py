@@ -18,6 +18,7 @@ import sys
 from pathlib import Path
 from typing import Optional, Union
 
+from ..._utils import get_hf_rope_theta
 from ...layers import MoeConfig
 from ...mapping import Mapping
 from ..convert_utils import infer_dtype
@@ -112,7 +113,8 @@ class LLaMAConfig(PretrainedConfig):
                 from llava.model import LlavaLlamaConfig  # noqa
                 from llava.model import LlavaLlamaModel
                 transformers.AutoConfig.register("llava_llama",
-                                                 LlavaLlamaConfig)
+                                                 LlavaLlamaConfig,
+                                                 exist_ok=True)
                 transformers.AutoModelForCausalLM.register(
                     LlavaLlamaConfig, LlavaLlamaModel)
 
@@ -160,7 +162,7 @@ class LLaMAConfig(PretrainedConfig):
         attn_bias = getattr(hf_config, 'bias', False) or getattr(
             hf_config, 'attention_bias', False)
         rotary_scaling = getattr(hf_config, "rope_scaling", None)
-        rotary_base = getattr(hf_config, "rope_theta", 10000.0)
+        rotary_base = get_hf_rope_theta(hf_config, 10000.0)
         residual_mlp = getattr(hf_config, "parallel_attn_mlp_res", False)
         disable_weight_only_quant_plugin = kwargs.pop(
             'disable_weight_only_quant_plugin', False)

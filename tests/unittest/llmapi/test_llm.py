@@ -320,7 +320,7 @@ class MyTokenizer(TokenizerBase):
         return self.tokenizer.decode(token_ids, **kwargs)
 
     def batch_encode_plus(self, texts: List[str], **kwargs) -> dict:
-        return self.tokenizer.batch_encode_plus(texts, **kwargs)
+        return self.tokenizer(texts, **kwargs)
 
 
 @pytest.mark.part0
@@ -752,30 +752,6 @@ def test_generate_with_cuda_graph_dynamic_beam_width():
                 f"got:       {got}")
     finally:
         llm.shutdown()
-
-
-@pytest.mark.skip(reason="https://nvbugs/5435714")
-@force_ampere
-@pytest.mark.part0
-def test_generate_with_streaming_llm():
-    # TODO[chunweiy]: Test with larger size when the underlying support is ready
-    build_config = BuildConfig()
-    build_config.plugin_config.streamingllm = True
-    build_config.max_batch_size = 8
-    build_config.max_seq_len = 512
-    kv_cache_config = KvCacheConfig(max_attention_window=[64],
-                                    sink_token_length=4)
-
-    # Check the plugin config is correctly set
-    assert build_config.plugin_config.streamingllm is True
-
-    sampling_params = SamplingParams(max_tokens=4)
-
-    llm_test_harness(llama_model_path,
-                     prompts, ["D E F G"],
-                     sampling_params=sampling_params,
-                     build_config=build_config,
-                     kv_cache_config=kv_cache_config)
 
 
 @pytest.mark.part0

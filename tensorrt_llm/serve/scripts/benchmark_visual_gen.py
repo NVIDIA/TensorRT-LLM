@@ -15,7 +15,7 @@
 """Benchmark online serving throughput for VisualGen (image/video generation).
 
 On the server side, run:
-    trtllm-serve Wan-AI/Wan2.2-T2V-A14B-Diffusers --extra_visual_gen_options <config.yaml>
+    trtllm-serve Wan-AI/Wan2.2-T2V-A14B-Diffusers --visual_gen_args <config.yaml>
 
 On the client side, run:
     python -m tensorrt_llm.serve.scripts.benchmark_visual_gen \
@@ -129,7 +129,7 @@ async def _do_post(
             if response.status == 200:
                 await response.read()
                 output.success = True
-                output.e2e_latency = time.perf_counter() - st
+                output.latency = time.perf_counter() - st
             else:
                 body = await response.text()
                 output.error = f"HTTP {response.status}: {body}"
@@ -319,8 +319,8 @@ def _resolve_num_gpus(args: argparse.Namespace) -> int:
     if args.num_gpus is not None:
         return args.num_gpus
 
-    if args.extra_visual_gen_options is not None:
-        with open(args.extra_visual_gen_options, encoding="utf-8") as f:
+    if args.visual_gen_args is not None:
+        with open(args.visual_gen_args, encoding="utf-8") as f:
             config = yaml.safe_load(f) or {}
         from tensorrt_llm.commands.utils import get_visual_gen_num_gpus
 
@@ -561,11 +561,13 @@ if __name__ == "__main__":
     )
 
     parser.add_argument(
+        "--visual-gen-args",
         "--extra-visual-gen-options",
+        dest="visual_gen_args",
         type=str,
         default=None,
         help="Path to the server config YAML (same file passed to trtllm-serve "
-        "via --extra_visual_gen_options). Parallelism settings are read to "
+        "via --visual_gen_args). Parallelism settings are read to "
         "automatically determine the number of GPUs.",
     )
     parser.add_argument(

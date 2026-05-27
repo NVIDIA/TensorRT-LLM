@@ -1,3 +1,7 @@
+# Copyright 2018 The HuggingFace Team
+# Licensed under the Apache License, Version 2.0.
+# Original source: https://github.com/huggingface/transformers
+#
 # SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
@@ -42,15 +46,14 @@ from transformers.models.starcoder2.configuration_starcoder2 import Starcoder2Co
 from transformers.utils import ModelOutput
 
 from ..hf import AutoModelForCausalLMFactory
+from .rotary_utils import RotaryEmbeddingBase, build_rope_cos_sin_cache
 
 
-class Starcoder2RotaryEmbedding(nn.Module):
+class Starcoder2RotaryEmbedding(RotaryEmbeddingBase):
     """Rotary Position Embedding for Starcoder2.
 
-    Precomputes and caches cos/sin values for the full max_position_embeddings.
-    Returns values indexed by position_ids to enable export.
-
-    Uses _ad_ prefix for buffer names to work with AutoDeploy's lift_to_meta.
+    Keeps only the small inv_freq buffer before graph-cache transforms. The full
+    cos/sin table is graph-computed and materialized by later RoPE transforms.
     """
 
     def __init__(
@@ -71,18 +74,9 @@ class Starcoder2RotaryEmbedding(nn.Module):
 
     def _set_cos_sin_cache(self, seq_len: int):
         self.max_seq_len_cached = seq_len
-        t = torch.arange(seq_len, dtype=self.inv_freq.dtype)
-        freqs = torch.outer(t, self.inv_freq)
-        emb = torch.cat((freqs, freqs), dim=-1)
-        self.register_buffer("_ad_cos_cached", emb.cos(), persistent=False)
-        self.register_buffer("_ad_sin_cached", emb.sin(), persistent=False)
 
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        # Return full cached tables — slicing by position_ids happens downstream in attention.
-        return (
-            self._ad_cos_cached.to(dtype=x.dtype, device=x.device),
-            self._ad_sin_cached.to(dtype=x.dtype, device=x.device),
-        )
+        return build_rope_cos_sin_cache(self.inv_freq, self.max_position_embeddings, x)
 
 
 class Starcoder2MLP(nn.Module):
@@ -254,7 +248,7 @@ class Starcoder2Model(PreTrainedModel):
         self.rotary_emb = Starcoder2RotaryEmbedding(
             head_dim,
             max_position_embeddings=config.max_position_embeddings,
-            base=config.rope_theta,
+            base=config.rope_parameters["rope_theta"],
         )
 
         self.post_init()
@@ -302,7 +296,7 @@ class Starcoder2ForCausalLM(PreTrainedModel, GenerationMixin):
     base_model_prefix = "model"
     _no_split_modules = ["Starcoder2DecoderLayer"]
     supports_gradient_checkpointing = False
-    _tied_weights_keys = ["lm_head.weight"]
+    _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
 
     def __init__(self, config: Starcoder2Config, **kwargs):
         super().__init__(config)

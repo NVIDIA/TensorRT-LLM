@@ -132,6 +132,18 @@ struct LinearAttentionMetadata
     // If set, overrides the automatic computation (fullAttention.primaryBlocks - this.primaryBlocks).
     std::optional<SizeType32> numPlaceholderBlocks;
 
+    /// RNN model params for disagg TP-mismatch split/concat (CUDA kernels need these individually).
+    /// Populated by CppMambaHybridCacheManager; default 0 for non-hybrid models.
+    SizeType32 rnnNumHeads{0};          // GLOBAL num heads (pre-TP)
+    SizeType32 rnnHeadDim{0};           // Head dimension
+    SizeType32 rnnDState{0};            // SSM state dimension
+    SizeType32 rnnDConv{0};             // Conv kernel size - 1
+    SizeType32 rnnNGroups{0};           // Number of groups (Mamba2)
+    SizeType32 rnnConvSectionLayout{0}; // 0=NONE, 1=NEMOTRON, 2=QWEN3_NEXT
+    SizeType32 rnnSsmBytes{0};      // SSM state bytes per layer (local, = numHeadsLocal * headDim * dState * dtypeSize)
+    SizeType32 rnnSsmDtypeSize{0};  // SSM state dtype size in bytes (e.g., 2 for fp16, 4 for fp32)
+    SizeType32 rnnConvDtypeSize{0}; // Conv state dtype size in bytes (e.g., 2 for bf16, 1 for fp8)
+
     [[nodiscard]] bool shouldAllocateRecurrentStates(
         SizeType32 currentBlockEndTokenIdx, SizeType32 promptLen, SizeType32 tokensPerBlock) const
     {
@@ -160,6 +172,46 @@ struct LinearAttentionMetadata
             return true;
         }
         return false;
+    }
+
+    [[nodiscard]] SizeType32 calcNumBlocksNeededForReq(
+        SizeType32 promptLen, SizeType32 tokensPerBlock, bool enableReuse) const
+    {
+        if (!enableReuse)
+        {
+            return 1;
+        }
+        SizeType32 count = 0;
+        if (statesSnapshotInterval > 0)
+        {
+            count += promptLen / statesSnapshotInterval; // round down
+        }
+        if (saveLastSnapshot
+            && (promptLen / tokensPerBlock * tokensPerBlock
+                != promptLen / statesSnapshotInterval * statesSnapshotInterval))
+        {
+            count += 1;
+        }
+        if (promptLen % tokensPerBlock == 0)
+        {
+            // corner case
+            count += 1;
+        }
+        return count;
+    }
+
+    [[nodiscard]] SizeType32 calcNumAdditionalBlocksNeededForReq(
+        SizeType32 numTokens, SizeType32 promptLen, SizeType32 tokensPerBlock, bool enableReuse) const
+    {
+        if (!enableReuse)
+        {
+            return 0;
+        }
+        if (promptLen % tokensPerBlock == 0 && numTokens <= promptLen + 1)
+        {
+            return 1;
+        }
+        return 0;
     }
 
     [[nodiscard]] bool hasRecurrentStatesCache() const
@@ -561,6 +613,11 @@ public:
         return mCacheBlockIds.at(windowSize);
     }
 
+    [[nodiscard]] std::vector<std::vector<SizeType32>>& getCacheBlockIds(SizeType32 windowSize)
+    {
+        return mCacheBlockIds.at(windowSize);
+    }
+
     [[nodiscard]] runtime::ITensor& getCacheBlockIndices(SizeType32 windowSize)
     {
         return *(mCacheBlockIndices.at(windowSize));
@@ -760,7 +817,7 @@ public:
         std::shared_ptr<kv_connector::KvCacheConnectorManager> kvCacheConnectorManager,
         radix_block_tree::UnifiedBlockTree& lookupTree, std::shared_ptr<kvc::BaseLoopbackAgent> loopbackAgent = nullptr,
         bool enableIndexerKCache = false, SizeType32 indexerKCacheQuantBlockSize = 128,
-        SizeType32 indexerKCacheIndexHeadDim = 0,
+        SizeType32 indexerKCacheIndexHeadDim = 0, bool indexerKCacheUseFp4 = false,
         std::optional<LinearAttentionMetadata> linearAttentionMetadata = std::nullopt,
         SizeType32 numPlaceholderBlocks = 0);
 
@@ -779,6 +836,11 @@ public:
     [[nodiscard]] SizeType32 getIndexerKCacheIndexHeadDim() const
     {
         return mIndexerKCacheIndexHeadDim;
+    }
+
+    [[nodiscard]] bool getIndexerKCacheUseFp4() const
+    {
+        return mIndexerKCacheUseFp4;
     }
 
     void allocatePools(bool useUvm);
@@ -862,7 +924,9 @@ public:
 
     //! \brief According to request's current position, copy data from the last full block to the next block (ignoring
     //! the placeholder block). It should be called after every context chunk is processed.
-    void copyLinearAttentionBlock(GenerationRequest& sequence, LlmRequest const& llmRequest);
+    //! \return true iff at least one async block transfer was actually issued. Callers can use this to decide
+    //! whether a subsequent refreshBlocks()/syncTransfers() is necessary.
+    bool copyLinearAttentionBlock(GenerationRequest& sequence, LlmRequest const& llmRequest);
 
     void replaceSharedBlock(GenerationRequest& sequence, SizeType32 blockIdx);
 
@@ -1106,6 +1170,8 @@ public:
     //! \brief Unpin blocks by block ids directly
     void unpinBlocksById(std::vector<KVCacheBlock::IdType> const& blockIds);
 
+    void truncateBlocks(LlmRequest::VecTokens const& targetTokens, SizeType32 numTokensToKeep);
+
     void resetReuseState()
     {
         std::lock_guard<std::recursive_mutex> lock(mLookupTree->getMutex());
@@ -1169,6 +1235,11 @@ private:
     //! \details Caller must hold mLookupTree->getMutex().
     [[nodiscard]] SizeType32 onboardAndAllocateBlocks(
         GenerationRequest& sequence, LlmRequest& llmRequest, ClaimResult& claimResult, bool isEnableBlockReuse);
+
+    //! \brief Detach \p block and all its descendants from the lookup tree, and return
+    //! unreferenced blocks to the eviction policy at min retention priority.
+    //! \details Caller must hold mLookupTree->getMutex().
+    void releaseSubtree(BlockPtr const& block);
 
     //! \brief Find block least likely to be reused, free it if necessary and return.
     //! \param sequence Sequence which the free block is allocated for
@@ -1292,6 +1363,9 @@ private:
     SizeType32 mIndexerKCacheQuantBlockSize;
     // Index head dim for indexer K cache
     SizeType32 mIndexerKCacheIndexHeadDim;
+    // Whether the indexer K cache stores FP4-packed data (half the byte count
+    // per token vs. FP8). Drives the createIndexerKCachePools() formula.
+    bool mIndexerKCacheUseFp4{false};
 
     std::optional<LinearAttentionMetadata> mLinearAttentionMetadata;
 };
@@ -1314,6 +1388,7 @@ public:
         std::shared_ptr<kv_connector::KvCacheConnectorManager> kvCacheConnectorManager = nullptr,
         std::optional<kvc::BaseAgentConfig> agentConfig = std::nullopt, bool enableIndexerKCache = false,
         SizeType32 indexerKCacheQuantBlockSize = 128, SizeType32 indexerKCacheIndexHeadDim = 0,
+        bool indexerKCacheUseFp4 = false,
         std::optional<LinearAttentionMetadata> linearAttentionMetadata = std::nullopt);
 
     [[nodiscard]] bool isEnableIndexerKCache() const
@@ -1329,6 +1404,11 @@ public:
     [[nodiscard]] SizeType32 getIndexerKCacheIndexHeadDim() const
     {
         return mIndexerKCacheIndexHeadDim;
+    }
+
+    [[nodiscard]] bool getIndexerKCacheUseFp4() const
+    {
+        return mIndexerKCacheUseFp4;
     }
 
     [[nodiscard]] bool isEnablePartialReuse() const
@@ -1361,7 +1441,8 @@ public:
 
     //! \brief According to request's current position, copy data from the last full block to the next block (ignoring
     //! the placeholder block). It should be called after every context chunk is processed.
-    void copyLinearAttentionBlock(GenerationRequest& sequence, LlmRequest const& llmRequest);
+    //! \return true iff at least one async block transfer was actually issued.
+    bool copyLinearAttentionBlock(GenerationRequest& sequence, LlmRequest const& llmRequest);
 
     void replaceSharedBlock(GenerationRequest& sequence, SizeType32 windowSize, SizeType32 blockIdx);
 
@@ -1680,6 +1761,8 @@ public:
     //! context block that goes OOW.
     void adjustBlocksIfNeeded(GenerationRequest& sequence);
 
+    void truncateBlocks(LlmRequest::VecTokens const& targetTokens, SizeType32 numTokensToKeep, SizeType32 windowSize);
+
     void resetReuseState()
     {
         // Reset the shared tree once; all blocks' LookupNodePtr references to the old
@@ -1733,6 +1816,7 @@ private:
     bool mIsEnableIndexerKCache{false};
     SizeType32 mIndexerKCacheQuantBlockSize{0};
     SizeType32 mIndexerKCacheIndexHeadDim{0};
+    bool mIndexerKCacheUseFp4{false};
     std::optional<LinearAttentionMetadata> mLinearAttentionMetadata;
 };
 
@@ -1854,6 +1938,7 @@ public:
     [[nodiscard]] virtual bool isEnableIndexerKCache() const = 0;
     [[nodiscard]] virtual SizeType32 getIndexerKCacheIndexHeadDim() const = 0;
     [[nodiscard]] virtual SizeType32 getIndexerKCacheQuantBlockSize() const = 0;
+    [[nodiscard]] virtual bool getIndexerKCacheUseFp4() const = 0;
 
     // void removeToken(SizeType32 seqSlotIdx);
     virtual void rewindKVCache(LlmRequest::RequestIdType requestId, SizeType32 rewindLengths) = 0;
@@ -1986,6 +2071,14 @@ public:
 
     virtual void unpinBlocksById(std::vector<KVCacheBlock::IdType> const& blockIds) = 0;
 
+    /// @brief Release cached blocks for a token sequence beyond a given prefix length.
+    /// @param targetTokens The full token sequence whose cached blocks are walked.
+    /// @param numTokensToKeep Number of prefix tokens to retain. Blocks whose cumulative
+    ///        token count exceeds this threshold (and all their descendants) are released.
+    ///        Because truncation operates at block granularity, the boundary block that
+    ///        spans the threshold is preserved.
+    virtual void truncateBlocks(LlmRequest::VecTokens const& targetTokens, SizeType32 numTokensToKeep) = 0;
+
     //! @brief Get the retention priority of a block by its ID.
     //! @param blockId The ID of the block.
     //! @param windowSize The attention window size this block belongs to.
@@ -2014,7 +2107,7 @@ public:
         bool copyOnpartialReuse = true,
         std::shared_ptr<kv_connector::KvCacheConnectorManager> kvCacheConnectorManager = nullptr,
         bool enableIndexerKCache = false, SizeType32 indexerKCacheQuantBlockSize = 128,
-        SizeType32 indexerKCacheIndexHeadDim = 0,
+        SizeType32 indexerKCacheIndexHeadDim = 0, bool indexerKCacheUseFp4 = false,
         std::optional<LinearAttentionMetadata> linearAttentionMetadata = std::nullopt);
 
     KVCacheManager(std::vector<SizeType32> const& numKvHeadsPerLayer, SizeType32 sizePerHead, SizeType32 tokensPerBlock,
@@ -2027,7 +2120,7 @@ public:
         bool copyOnpartialReuse = true,
         std::shared_ptr<kv_connector::KvCacheConnectorManager> kvCacheConnectorManager = nullptr,
         bool enableIndexerKCache = false, SizeType32 indexerKCacheQuantBlockSize = 128,
-        SizeType32 indexerKCacheIndexHeadDim = 0,
+        SizeType32 indexerKCacheIndexHeadDim = 0, bool indexerKCacheUseFp4 = false,
         std::optional<LinearAttentionMetadata> linearAttentionMetadata = std::nullopt);
 
     KVCacheManager(SizeType32 numLayers, SizeType32 numKvHeads, SizeType32 sizePerHead, SizeType32 tokensPerBlock,
@@ -2040,7 +2133,7 @@ public:
         bool copyOnpartialReuse = true,
         std::shared_ptr<kv_connector::KvCacheConnectorManager> kvCacheConnectorManager = nullptr,
         bool enableIndexerKCache = false, SizeType32 indexerKCacheQuantBlockSize = 128,
-        SizeType32 indexerKCacheIndexHeadDim = 0,
+        SizeType32 indexerKCacheIndexHeadDim = 0, bool indexerKCacheUseFp4 = false,
         std::optional<LinearAttentionMetadata> linearAttentionMetadata = std::nullopt);
 
     KVCacheManager(SizeType32 numLayers, SizeType32 numKvHeads, SizeType32 sizePerHead, SizeType32 tokensPerBlock,
@@ -2049,7 +2142,7 @@ public:
         int64_t stream, SizeType32 maxSequenceLength, SizeType32 chunkSize, bool enableBlockReuse = false,
         CacheType cacheType = CacheType::kSELF, bool enablePartialReuse = true, bool copyOnpartialReuse = true,
         bool enableIndexerKCache = false, SizeType32 indexerKCacheQuantBlockSize = 128,
-        SizeType32 indexerKCacheIndexHeadDim = 0,
+        SizeType32 indexerKCacheIndexHeadDim = 0, bool indexerKCacheUseFp4 = false,
         std::optional<LinearAttentionMetadata> linearAttentionMetadata = std::nullopt);
 
     ~KVCacheManager() override = default;
@@ -2179,7 +2272,12 @@ public:
 
     //! \brief According to request's current position, copy data from the last full block to the next block (ignoring
     //! the placeholder block). It should be called before every forward step, after adding new tokens.
-    void copyLinearAttentionBlock(LlmRequest const& llmRequest);
+    //! \return true iff at least one async block transfer was actually issued for this request. The caller can
+    //! aggregate this across requests and skip refreshBlocks() (which performs a stream sync) when no copies happened.
+    bool copyLinearAttentionBlock(LlmRequest const& llmRequest);
+
+    //! \brief Batch variant of copyLinearAttentionBlock. Returns true iff at least one copy was issued.
+    bool copyLinearAttentionBlockBatch(std::vector<std::shared_ptr<LlmRequest>> const& llmRequests);
 
     void addSequenceBatch(
         std::vector<std::tuple<LlmRequest::RequestIdType, SizeType32, SizeType32>> const& requestInfos,
@@ -2236,6 +2334,11 @@ public:
     [[nodiscard]] SizeType32 getIndexerKCacheQuantBlockSize() const override
     {
         return mBlockManager.getIndexerKCacheQuantBlockSize();
+    }
+
+    [[nodiscard]] bool getIndexerKCacheUseFp4() const override
+    {
+        return mBlockManager.getIndexerKCacheUseFp4();
     }
 
     void removeToken(LlmRequest::RequestIdType requestId);
@@ -2367,6 +2470,10 @@ public:
     /// @return SizeType32 A maximum attention window in number of tokens.
     [[nodiscard]] static SizeType32 calculateMaxAttentionWindow(SizeType32 inputLength, SizeType32 outputLength,
         SizeType32 sinkTokenLength, SizeType32 blockCapacity, SizeType32 beamWidth, SizeType32 tokensPerBlock);
+
+    /// @brief Release cached blocks for a token sequence beyond a given prefix length.
+    /// @copydetail BaseKVCacheManager::truncateBlocks
+    void truncateBlocks(LlmRequest::VecTokens const& targetTokens, SizeType32 numTokensToKeep) override;
 
 private:
     // Maximum number of sequences

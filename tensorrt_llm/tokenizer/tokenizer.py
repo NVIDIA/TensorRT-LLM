@@ -13,7 +13,6 @@ from ..logger import logger
 # Aliases for built-in custom tokenizers.
 TOKENIZER_ALIASES = {
     "deepseek_v32": "tensorrt_llm.tokenizer.deepseek_v32.DeepseekV32Tokenizer",
-    "glm_moe_dsa": "tensorrt_llm.tokenizer.glm_moe_dsa.GlmMoeDsaTokenizer",
 }
 
 TLLM_INCREMENTAL_DETOKENIZATION_BACKEND = os.environ.get(
@@ -39,6 +38,128 @@ def _reconstruct_transformers_tokenizer(inner_bytes: bytes):
     return TransformersTokenizer(pickle.loads(inner_bytes))  # nosec B301
 
 
+def _tokenizer_json_uses_byte_level(pretrained_model_dir: str) -> bool:
+    """Return True if tokenizer.json declares a ByteLevel pre-tokenizer."""
+    import json
+    tj_path = os.path.join(pretrained_model_dir, "tokenizer.json")
+    if not os.path.isfile(tj_path):
+        return False
+    try:
+        with open(tj_path) as f:
+            tj = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return False
+    pt = tj.get("pre_tokenizer") or {}
+    if pt.get("type") == "ByteLevel":
+        return True
+    if pt.get("type") == "Sequence":
+        return any(
+            sub.get("type") == "ByteLevel"
+            for sub in pt.get("pretokenizers", []))
+    return False
+
+
+# Keys forwarded from tokenizer_config.json to PreTrainedTokenizerFast when
+# falling back. LlamaTokenizerFast-style flags the bare fast tokenizer does
+# not read by default but AutoTokenizer would have honored.
+_TOKENIZER_CONFIG_INHERIT_KEYS = (
+    "add_bos_token",
+    "add_eos_token",
+    "padding_side",
+    "truncation_side",
+    "model_max_length",
+    "clean_up_tokenization_spaces",
+)
+
+
+def _load_tokenizer_config_inherits(
+        pretrained_model_dir: str) -> Dict[str, Any]:
+    """Return a dict of LlamaTokenizerFast-style flags from tokenizer_config.json."""
+    import json
+    tcfg_path = os.path.join(pretrained_model_dir, "tokenizer_config.json")
+    if not os.path.isfile(tcfg_path):
+        return {}
+    try:
+        with open(tcfg_path) as f:
+            tcfg = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return {k: tcfg[k] for k in _TOKENIZER_CONFIG_INHERIT_KEYS if k in tcfg}
+
+
+def _fallback_to_fast_tokenizer(pretrained_model_dir: str,
+                                original_error: BaseException, **kwargs):
+    """Bypass AutoTokenizer's HF-config path with PreTrainedTokenizerFast.
+
+    transformers 5.x converted PreTrainedConfig to a dataclass: only declared
+    fields survive __post_init__'s RoPE standardization. When a model uses a
+    model_type not registered in CONFIG_MAPPING_NAMES (e.g. DeepSeek-V3.2's
+    ``deepseek_v32``), AutoTokenizer.from_pretrained falls back to a bare
+    PreTrainedConfig whose RoPE path reads self.max_position_embeddings,
+    raising AttributeError.
+
+    PreTrainedTokenizerFast doesn't go through AutoConfig — it reads
+    tokenizer.json via the Rust tokenizers library — so it sidesteps this
+    entirely. We forward LlamaTokenizerFast-style flags (add_bos_token,
+    padding_side, ...) from tokenizer_config.json so the fast tokenizer
+    matches the behavior AutoTokenizer would have had pre-regression.
+    """
+    inherited = _load_tokenizer_config_inherits(pretrained_model_dir)
+    fast_kwargs = {
+        k: v
+        for k, v in kwargs.items() if k not in ("trust_remote_code", "use_fast")
+    }
+    # caller kwargs win over tokenizer_config.json inherited values
+    merged = {**inherited, **fast_kwargs}
+    logger.warning(
+        f"AutoTokenizer.from_pretrained({pretrained_model_dir}) raised "
+        f"{type(original_error).__name__}: {original_error}. Falling back to "
+        f"PreTrainedTokenizerFast to bypass HF dataclass regression "
+        f"(model_type likely not registered in CONFIG_MAPPING_NAMES). "
+        f"Inherited from tokenizer_config.json: {sorted(inherited)}")
+    return PreTrainedTokenizerFast.from_pretrained(pretrained_model_dir,
+                                                   **merged)
+
+
+def maybe_fix_byte_level_tokenizer(tokenizer, pretrained_model_dir: str,
+                                   **kwargs):
+    """Work around Transformers 5.x LlamaTokenizer overriding tokenizer.json.
+
+    Some model repos (e.g. DeepSeek-V3) declare ``tokenizer_class:
+    LlamaTokenizer`` in tokenizer_config.json but ship a ByteLevel BPE
+    tokenizer.json.  In Transformers 5.x, LlamaTokenizer forces a Metaspace
+    pre-tokenizer during __init__, silently replacing the ByteLevel one from
+    tokenizer.json.  The result is that spaces are stripped from prompts
+    (e.g. "hello world" tokenizes to "helloworld"), causing catastrophic
+    accuracy drops.
+
+    Detect this mismatch and reload through PreTrainedTokenizerFast, which
+    respects tokenizer.json verbatim.
+    """
+    if not os.path.isdir(pretrained_model_dir):
+        return tokenizer
+    backend = getattr(tokenizer, "backend_tokenizer", None)
+    if backend is None:
+        return tokenizer
+    pre_tok = getattr(backend, "pre_tokenizer", None)
+    if pre_tok is None:
+        return tokenizer
+    if type(pre_tok).__name__ != "Metaspace":
+        return tokenizer
+    if not _tokenizer_json_uses_byte_level(pretrained_model_dir):
+        return tokenizer
+    logger.warning(
+        f"Tokenizer at {pretrained_model_dir} loaded with Metaspace "
+        "pre-tokenizer but tokenizer.json declares ByteLevel. "
+        "Reloading via PreTrainedTokenizerFast to respect tokenizer.json.")
+    fast_kwargs = {
+        k: v
+        for k, v in kwargs.items() if k not in ("trust_remote_code", "use_fast")
+    }
+    return PreTrainedTokenizerFast.from_pretrained(pretrained_model_dir,
+                                                   **fast_kwargs)
+
+
 class TransformersTokenizer(TokenizerBase):
     ''' A wrapper for the Transformers' tokenizer.
     This is the default tokenizer for LLM. '''
@@ -50,6 +171,14 @@ class TransformersTokenizer(TokenizerBase):
                 self.tokenizer.all_special_tokens)
         else:
             self._all_special_tokens_set = set()
+        # Cache of special-token ids used by convert_ids_to_tokens to work
+        # around an O(N*K) bug in transformers 5.x's slow tokenizer path
+        # (see convert_ids_to_tokens below).  Computed once here so we don't
+        # rebuild it on every per-token streaming call.
+        try:
+            self._all_special_ids_set = set(self.tokenizer.all_special_ids)
+        except (AttributeError, NotImplementedError):
+            self._all_special_ids_set = set()
 
     def __reduce__(self):
         # In multi-node scenarios, AutoTokenizer.from_pretrained with
@@ -103,7 +232,8 @@ class TransformersTokenizer(TokenizerBase):
         return self.tokenizer.decode(token_ids, *args, **kwargs)
 
     def batch_encode_plus(self, texts: List[str], *args, **kwargs) -> dict:
-        return self.tokenizer.batch_encode_plus(texts, *args, **kwargs)
+        # transformers 5.x removed batch_encode_plus; __call__ has the same signature.
+        return self.tokenizer(texts, *args, **kwargs)
 
     def get_chat_template(self,
                           chat_template: Optional[str] = None,
@@ -121,8 +251,22 @@ class TransformersTokenizer(TokenizerBase):
 
     @classmethod
     def from_pretrained(cls, pretrained_model_dir: str, **kwargs):
-        tokenizer = AutoTokenizer.from_pretrained(pretrained_model_dir,
-                                                  **kwargs)
+        try:
+            tokenizer = AutoTokenizer.from_pretrained(pretrained_model_dir,
+                                                      **kwargs)
+        except AttributeError as e:
+            # transformers 5.x: bare PreTrainedConfig fallback (for model_types
+            # not in CONFIG_MAPPING_NAMES, e.g. deepseek_v32) hits
+            # modeling_rope_utils → self.max_position_embeddings → AttributeError
+            # because PreTrainedConfig is now a dataclass with declared fields.
+            # See deepseek-ai/DeepSeek-V3#1207.
+            if "max_position_embeddings" not in str(e):
+                raise
+            tokenizer = _fallback_to_fast_tokenizer(pretrained_model_dir, e,
+                                                    **kwargs)
+        tokenizer = maybe_fix_byte_level_tokenizer(tokenizer,
+                                                   pretrained_model_dir,
+                                                   **kwargs)
         return cls(tokenizer)
 
     def save_pretrained(self, pretrained_model_dir: str, **kwargs):
@@ -147,8 +291,26 @@ class TransformersTokenizer(TokenizerBase):
             self,
             ids: Union[int, List[int]],
             skip_special_tokens: bool = False) -> Union[str, List[str]]:
-        return self.tokenizer.convert_ids_to_tokens(
-            ids, skip_special_tokens=skip_special_tokens)
+        inner = self.tokenizer
+        if (isinstance(ids, int) or not skip_special_tokens
+                or getattr(inner, "is_fast", False)):
+            # Single id: no loop.  Fast tokenizer: tokenization_utils_tokenizers
+            # already caches all_special_ids before the loop.  Without skip:
+            # the buggy branch is short-circuited.
+            return inner.convert_ids_to_tokens(
+                ids, skip_special_tokens=skip_special_tokens)
+        # Slow PreTrainedTokenizer.convert_ids_to_tokens in transformers 5.x
+        # tests `index in self.all_special_ids` inside the per-id loop, and
+        # `all_special_ids` is an @property that rebuilds the list on every
+        # access via convert_tokens_to_ids(self.all_special_tokens).  The fast
+        # subclass already hoists this out of the loop (see
+        # tokenization_utils_tokenizers.py), but the slow base class wasn't
+        # updated.  Mirror that fix using the set we cached in __init__,
+        # which keeps streaming detokenization at O(1) all-special-ids cost
+        # per call regardless of batch size or stream_interval.
+        tokens = inner.convert_ids_to_tokens(ids, skip_special_tokens=False)
+        special_ids = self._all_special_ids_set
+        return [t for idx, t in zip(ids, tokens) if int(idx) not in special_ids]
 
     def convert_tokens_to_string(
             self,
@@ -422,6 +584,24 @@ def maybe_register_transformers_modules_by_value():
                        f"serialization: {e}")
 
 
+def _ensure_gpt2_bytes_to_unicode_compat() -> None:
+    """Restore ``bytes_to_unicode`` on ``transformers.models.gpt2.tokenization_gpt2``.
+
+    transformers 5.x removed it from that module, but some ``trust_remote_code``
+    tokenizers (e.g. Kimi-K2's ``tokenization_kimi.py``) still import it from
+    the legacy location. The function survives under
+    ``transformers.convert_slow_tokenizer``.
+    """
+    try:
+        from transformers.models.gpt2 import tokenization_gpt2
+        if hasattr(tokenization_gpt2, "bytes_to_unicode"):
+            return
+        from transformers.convert_slow_tokenizer import bytes_to_unicode
+    except ImportError:
+        return
+    tokenization_gpt2.bytes_to_unicode = bytes_to_unicode
+
+
 def load_hf_tokenizer(model_dir: str,
                       trust_remote_code: bool = True,
                       use_fast: bool = True,
@@ -436,6 +616,8 @@ def load_hf_tokenizer(model_dir: str,
     Returns:
         A TransformersTokenizer object if the tokenizer is loaded successfully.
     '''
+
+    _ensure_gpt2_bytes_to_unicode_compat()
 
     try:
         tokenizer = TransformersTokenizer.from_pretrained(

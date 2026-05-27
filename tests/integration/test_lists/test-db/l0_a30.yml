@@ -20,6 +20,7 @@ l0_a30:
   - unittest/_torch/modeling -k "modeling_qwen_moe"
   - unittest/_torch/modeling -k "modeling_out_of_tree"
   - unittest/_torch/sampler/test_beam_search.py
+  - unittest/_torch/sampler/test_beam_search_speculative_d2h.py
   - unittest/_torch/sampler/test_logits_logprobs.py
   - test_e2e.py::test_openai_completions_with_logit_bias[torch_sampler]
   - test_e2e.py::test_openai_chat_with_logit_bias[torch_sampler]
@@ -206,6 +207,7 @@ l0_a30:
   - triton_server/test_triton_llm.py::test_tiny_llama_ifb_token_counts[tensorrtllm-both-False-1---False-True-False-0-128-disableDecoupleMode-inflight_fused_batching-disableTrtOverlap--guaranteed_no_evict---1-1-1-False-tensorrt_llm_bls]
   - triton_server/test_triton_llm.py::test_llmapi_backend[1-0-disableDecoupleMode-tensorrt_llm]
   - triton_server/test_triton_llm.py::test_llmapi_backend[1-0-enableDecoupleMode-tensorrt_llm]
+  - triton_server/test_triton_llm.py::test_llmapi_lora[1-tensorrt_llm]
 # ------------- AutoDeploy Backend Stages ---------------
 - condition:
     ranges:

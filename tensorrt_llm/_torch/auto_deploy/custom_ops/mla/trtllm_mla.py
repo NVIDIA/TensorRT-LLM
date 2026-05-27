@@ -1051,7 +1051,6 @@ def _handle_prefill_thop(
         max_num_requests,  # max_num_requests
         max_context_length,  # max_context_length
         max_context_length,  # attention_window_size
-        0,  # sink_token_length
         1,  # beam_width
         int(AttentionMaskType.causal),  # mask_type
         quant_mode,  # quant_mode
@@ -1071,6 +1070,7 @@ def _handle_prefill_thop(
         qk_nope_head_dim,  # qk_nope_head_dim
         qk_rope_head_dim,  # qk_rope_head_dim
         v_head_dim,  # v_head_dim
+        True,  # rope_append
         None,  # mrope_rotary_cos_sin
         None,  # mrope_position_deltas
         mla_tensor_params,  # helix_tensor_params
@@ -1083,7 +1083,8 @@ def _handle_prefill_thop(
         None,  # sparse_attn_indices
         None,  # sparse_attn_offsets
         1,  # sparse_attn_indices_block_size
-        0,  # sparse_mla_topk
+        0,  # num_sparse_topk
+        None,  # sparse_mla_topk_lens
         None,  # skip_softmax_threshold_scale_factor_prefill
         None,  # skip_softmax_threshold_scale_factor_decode
         None,  # skip_softmax_stat
@@ -1211,7 +1212,6 @@ def _handle_prefill_thop_cached_kv(
         _CONTEXT_LAYER_OFFSET,
         tokens_per_block,
         max_context_length,
-        0,  # sink_token_length
         1,  # beam_width
         quant_mode,
     )
@@ -1285,8 +1285,7 @@ def _handle_prefill_thop_cached_kv(
             tokens_per_block,
             chunked_max_seq_len,
             max_context_length,
-            0,
-            1,
+            1,  # beam_width
             quant_mode,
         )
         chunk_kv = torch.nn.functional.linear(chunk_compressed_kv, w_grouped)
@@ -1341,7 +1340,6 @@ def _handle_prefill_thop_cached_kv(
             max_num_requests,
             max_context_length,
             max_context_length,
-            0,  # sink_token_length
             1,  # beam_width
             int(AttentionMaskType.padding),  # FULL mask: every Q attends to every K in this chunk
             quant_mode,
@@ -1361,6 +1359,7 @@ def _handle_prefill_thop_cached_kv(
             qk_nope_head_dim,
             qk_rope_head_dim,
             v_head_dim,
+            True,  # rope_append
             None,  # mrope_rotary_cos_sin
             None,  # mrope_position_deltas
             mla_tensor_params,
@@ -1373,7 +1372,8 @@ def _handle_prefill_thop_cached_kv(
             None,  # sparse_attn_indices
             None,  # sparse_attn_offsets
             1,  # sparse_attn_indices_block_size
-            0,  # sparse_mla_topk
+            0,  # num_sparse_topk
+            None,  # sparse_mla_topk_lens
             None,  # skip_softmax_threshold_scale_factor_prefill
             None,  # skip_softmax_threshold_scale_factor_decode
             None,  # skip_softmax_stat
@@ -1456,9 +1456,8 @@ def _handle_prefill_thop_cached_kv(
         tokens_per_block,
         max_num_requests,
         max_context_length,
-        max_context_length,
-        0,
-        1,
+        max_context_length,  # attention_window_size
+        1,  # beam_width
         int(AttentionMaskType.causal),  # CAUSAL: new Q tokens with causal mask over new K/V
         quant_mode,
         q_scaling,
@@ -1477,30 +1476,32 @@ def _handle_prefill_thop_cached_kv(
         qk_nope_head_dim,
         qk_rope_head_dim,
         v_head_dim,
-        None,
-        None,
+        True,  # rope_append
+        None,  # mrope_rotary_cos_sin
+        None,  # mrope_position_deltas
         mla_tensor_params,
-        None,
-        temp_softmax_stats,
+        None,  # attention_chunk_size
+        temp_softmax_stats,  # softmax_stats_tensor
         spec_decoding_bool_params,
         spec_decoding_tensor_params,
-        None,
-        None,
-        None,
-        None,
-        1,
-        0,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
+        None,  # sparse_kv_indices
+        None,  # sparse_kv_offsets
+        None,  # sparse_attn_indices
+        None,  # sparse_attn_offsets
+        1,  # sparse_attn_indices_block_size
+        0,  # num_sparse_topk
+        None,  # sparse_mla_topk_lens
+        None,  # skip_softmax_threshold_scale_factor_prefill
+        None,  # skip_softmax_threshold_scale_factor_decode
+        None,  # skip_softmax_stat
+        None,  # cu_q_seqlens
+        None,  # cu_kv_seqlens
+        None,  # fmha_scheduler_counter
+        None,  # mla_bmm1_scale
+        None,  # mla_bmm2_scale
+        None,  # quant_q_buffer
+        None,  # flash_mla_tile_scheduler_metadata
+        None,  # flash_mla_num_splits
         num_contexts=pf,
         num_ctx_tokens=num_tokens,
     )
@@ -1648,7 +1649,6 @@ def _handle_decode_impl(
         gen_head_size,
         tokens_per_block,
         max_context_length,  # attention_window_size
-        0,  # sink_token_length
         1,  # beam_width
         quant_mode,
         # q_scaling must match the value passed to thop.attention below:
@@ -1662,6 +1662,7 @@ def _handle_decode_impl(
         qk_nope_head_dim,
         qk_rope_head_dim,
         kv_lora_rank,  # v_head_dim (in latent space = kv_lora_rank)
+        True,  # rope_append
     )
 
     output_latent = planner.output_latent[:num_tokens]
@@ -1712,7 +1713,6 @@ def _handle_decode_impl(
         max_num_requests,  # max_num_requests
         max_context_length,  # max_context_length
         max_context_length,  # attention_window_size
-        0,  # sink_token_length
         1,  # beam_width
         int(AttentionMaskType.causal),  # mask_type
         quant_mode,  # quant_mode
@@ -1732,6 +1732,7 @@ def _handle_decode_impl(
         qk_nope_head_dim,  # qk_nope_head_dim
         qk_rope_head_dim,  # qk_rope_head_dim
         kv_lora_rank,  # v_head_dim (latent space)
+        True,  # rope_append
         None,  # mrope_rotary_cos_sin
         None,  # mrope_position_deltas
         mla_tensor_params,  # helix_tensor_params
@@ -1744,7 +1745,8 @@ def _handle_decode_impl(
         None,  # sparse_attn_indices
         None,  # sparse_attn_offsets
         1,  # sparse_attn_indices_block_size
-        0,  # sparse_mla_topk
+        0,  # num_sparse_topk
+        None,  # sparse_mla_topk_lens
         None,  # skip_softmax_threshold_scale_factor_prefill
         None,  # skip_softmax_threshold_scale_factor_decode
         None,  # skip_softmax_stat

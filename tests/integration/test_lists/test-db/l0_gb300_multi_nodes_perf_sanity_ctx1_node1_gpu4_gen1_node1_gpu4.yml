@@ -18,5 +18,5 @@ l0_gb300_multi_nodes_perf_sanity_ctx1_node1_gpu4_gen1_node1_gpu4:
   - perf/test_perf_sanity.py::test_e2e[disagg_upload-gen_only-gb300_deepseek-r1-fp4_1k1k_con3072_ctx1_dep4_gen1_dep4_eplb0_mtp1_ccb-NIXL] TIMEOUT (120)
   # deepseek-v32-fp4
   - perf/test_perf_sanity.py::test_e2e[disagg_upload-gen_only-gb300_deepseek-v32-fp4_1k1k_con2048_ctx1_dep4_gen1_dep4_eplb0_mtp1_ccb-NIXL] TIMEOUT (120)
-  # - perf/test_perf_sanity.py::test_e2e[disagg_upload-e2e-gb300_deepseek-r1-fp4_1k1k_con3072_ctx1_dep4_gen1_dep4_eplb0_mtp1_ccb-NIXL] TIMEOUT (120)
-  # - perf/test_perf_sanity.py::test_e2e[disagg_upload-e2e-gb300_deepseek-v32-fp4_1k1k_con2048_ctx1_dep4_gen1_dep4_eplb0_mtp1_ccb-NIXL] TIMEOUT (120)
+  - perf/test_perf_sanity.py::test_e2e[disagg_upload-e2e-gb300_deepseek-r1-fp4_1k1k_con3072_ctx1_dep4_gen1_dep4_eplb0_mtp1_ccb-NIXL] TIMEOUT (120)
+  - perf/test_perf_sanity.py::test_e2e[disagg_upload-e2e-gb300_deepseek-v32-fp4_1k1k_con2048_ctx1_dep4_gen1_dep4_eplb0_mtp1_ccb-NIXL] TIMEOUT (120)

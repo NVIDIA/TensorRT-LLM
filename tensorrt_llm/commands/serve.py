@@ -22,7 +22,6 @@ from torch.cuda import device_count
 from tensorrt_llm import LLM as PyTorchLLM
 from tensorrt_llm import MultimodalEncoder
 from tensorrt_llm._tensorrt_engine import LLM
-from tensorrt_llm._torch.visual_gen.config import VisualGenArgs
 from tensorrt_llm._utils import mpi_rank
 from tensorrt_llm.commands.utils import get_is_diffusion_model
 from tensorrt_llm.executor.utils import LlmLauncherEnvs
@@ -49,9 +48,13 @@ from tensorrt_llm.serve.tool_parser.tool_parser_factory import \
 from tensorrt_llm.tools.importlib_utils import import_custom_module_from_dir
 from tensorrt_llm.usage import config as _telemetry_config
 from tensorrt_llm.visual_gen import VisualGen
+from tensorrt_llm.visual_gen.args import VisualGenArgs
 
 # Global variable to store the Popen object of the child process
 _child_p_global: Optional[subprocess.Popen] = None
+
+# Bound gRPC messages while leaving room for multimodal image payloads.
+_GRPC_MAX_MESSAGE_LENGTH_BYTES = 32 * 1024 * 1024
 
 
 def _apply_fastapi_middlewares(app, middlewares: Sequence[str]) -> None:
@@ -187,6 +190,8 @@ def get_llm_args(
         enable_attention_dp: bool = False,
         video_pruning_rate: Optional[float] = None,
         telemetry: bool = True,
+        agent_percentage: float = 0.0,
+        agent_types: Optional[str] = None,
         **llm_args_extra_dict: Any):
 
     if gpus_per_node is None:
@@ -277,6 +282,10 @@ def get_llm_args(
         _telemetry_config.TelemetryConfig(
             disabled=not telemetry,
             usage_context=_telemetry_config.UsageContext.CLI_SERVE),
+        "agent_percentage":
+        agent_percentage,
+        "agent_types":
+        agent_types,
     }
 
     llm_args = {
@@ -411,8 +420,10 @@ def launch_grpc_server(host: str,
         # Create gRPC server
         server = grpc.aio.server(
             options=[
-                ("grpc.max_send_message_length", -1),  # Unlimited
-                ("grpc.max_receive_message_length", -1),  # Unlimited
+                ("grpc.max_send_message_length",
+                 _GRPC_MAX_MESSAGE_LENGTH_BYTES),
+                ("grpc.max_receive_message_length",
+                 _GRPC_MAX_MESSAGE_LENGTH_BYTES),
                 ("grpc.keepalive_time_ms", 30000),  # 30s keepalive
                 ("grpc.keepalive_timeout_ms", 10000),  # 10s timeout
                 ("grpc.keepalive_permit_without_calls", True),
@@ -497,7 +508,7 @@ def launch_visual_gen_server(
         host: str,
         port: int,
         model: str,
-        diffusion_args: Optional[VisualGenArgs] = None,
+        visual_gen_args: Optional[VisualGenArgs] = None,
         metadata_server_cfg: Optional[MetadataServerConfig] = None,
         middleware: Sequence[str] = (),
 ):
@@ -507,18 +518,18 @@ def launch_visual_gen_server(
         host: Server hostname.
         port: Server port.
         model: Model path or HuggingFace Hub model ID.
-        diffusion_args: Optional validated VisualGenArgs for model configuration.
+        visual_gen_args: Optional validated VisualGenArgs for model configuration.
         metadata_server_cfg: Optional metadata server configuration.
     """
     logger.info(f"Initializing VisualGen ({model})")
 
-    visual_gen_model = VisualGen(model=model, args=diffusion_args)
+    visual_gen_model = VisualGen(model=model, args=visual_gen_args)
 
-    n_workers = visual_gen_model.args.parallel.n_workers
+    n_workers = visual_gen_model.args.parallel_config.n_workers
     logger.info(f"World size: {n_workers}")
-    logger.info(f"CFG size: {visual_gen_model.args.parallel.dit_cfg_size}")
+    logger.info(f"CFG size: {visual_gen_model.args.parallel_config.cfg_size}")
     logger.info(
-        f"Ulysses size: {visual_gen_model.args.parallel.dit_ulysses_size}")
+        f"Ulysses size: {visual_gen_model.args.parallel_config.ulysses_size}")
 
     server = OpenAIServer(generator=visual_gen_model,
                           model=model,
@@ -821,12 +832,30 @@ class ChoiceWithAlias(click.Choice):
         "The model name used in the API. If not specified, the model path is "
         "used as the model name. This is useful when the model path is long or "
         "when you want to expose a custom name to clients.", "prototype"))
-@click.option("--extra_visual_gen_options",
-              type=str,
-              default=None,
-              help=help_info_with_stability_tag(
-                  "Path to a YAML file with extra VISUAL_GEN model options.",
-                  "prototype"))
+@click.option(
+    "--visual_gen_args",
+    "--extra_visual_gen_options",
+    "visual_gen_args",
+    type=str,
+    default=None,
+    help=help_info_with_stability_tag(
+        "Path to a YAML file with VisualGen engine args.",
+        "prototype",
+    ),
+)
+@click.option(
+    "--agent_percentage",
+    type=float,
+    default=0.0,
+    help=
+    "The percentage of agent requests to schedule. Defaults to 0.0. Should be between 0.0 and 1.0."
+)
+@click.option(
+    "--agent_types",
+    type=str,
+    default=None,
+    help=
+    "Types of agents to schedule. Now Only Support Open Deep Research agent.")
 def serve(
         model: str, tokenizer: Optional[str], custom_tokenizer: Optional[str],
         host: str, port: int, log_level: str, backend: str, max_beam_width: int,
@@ -842,11 +871,11 @@ def serve(
         fail_fast_on_attention_window_too_large: bool,
         otlp_traces_endpoint: Optional[str], enable_chunked_prefill: bool,
         enable_attention_dp: bool, disagg_cluster_uri: Optional[str],
-        media_io_kwargs: Optional[str], video_pruning_rate: Optional[float],
+        media_io_kwargs: Optional[str], agent_percentage: float,
+        agent_types: Optional[str], video_pruning_rate: Optional[float],
         telemetry: bool, custom_module_dirs: list[Path],
         chat_template: Optional[str], middleware: tuple[str, ...], grpc: bool,
-        served_model_name: Optional[str],
-        extra_visual_gen_options: Optional[str]):
+        served_model_name: Optional[str], visual_gen_args: Optional[str]):
     """Running an OpenAI API compatible server
 
     MODEL: model name | HF checkpoint path | TensorRT engine path
@@ -886,7 +915,8 @@ def serve(
                 f"Cannot auto-detect reasoning parser for model '{model}'. "
                 f"Supported model types for auto-detection: qwen3, qwen3_moe, "
                 f"qwen3_5, qwen3_5_moe, qwen3_next, deepseek_v3 (R1 only), "
-                f"deepseek_v32 (R1 only), nemotron_h. "
+                f"deepseek_v32 (R1 only), nemotron_h, gemma4, "
+                f"kimi_k2, kimi_k25. "
                 f"Please specify a parser explicitly: "
                 f"{list(ReasoningParserFactory.keys())}",
                 param_hint="--reasoning_parser")
@@ -932,7 +962,9 @@ def serve(
             enable_chunked_prefill=enable_chunked_prefill,
             enable_attention_dp=enable_attention_dp,
             video_pruning_rate=video_pruning_rate,
-            telemetry=telemetry)
+            telemetry=telemetry,
+            agent_percentage=agent_percentage,
+            agent_types=agent_types)
 
         llm_args_extra_dict = {}
         if extra_llm_api_options is not None:
@@ -1015,21 +1047,16 @@ def serve(
                           served_model_name=served_model_name)
 
     def _serve_visual_gen():
-        extra_args = {}
-        if extra_visual_gen_options is not None:
-            with open(extra_visual_gen_options, 'r') as f:
-                extra_args = yaml.safe_load(f) or {}
-
-        diffusion_args = VisualGenArgs(**extra_args) if extra_args else None
+        parsed_visual_gen_args = (VisualGenArgs.from_yaml(visual_gen_args)
+                                  if visual_gen_args is not None else None)
 
         metadata_server_cfg = parse_metadata_server_config_file(
             metadata_server_config_file)
 
-        launch_visual_gen_server(host, port, model, diffusion_args,
+        launch_visual_gen_server(host, port, model, parsed_visual_gen_args,
                                  metadata_server_cfg, middleware)
 
-    is_visual_gen = extra_visual_gen_options is not None or get_is_diffusion_model(
-        model)
+    is_visual_gen = visual_gen_args is not None or get_is_diffusion_model(model)
     if is_visual_gen:
         _serve_visual_gen()
     else:

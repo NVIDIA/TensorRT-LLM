@@ -16,11 +16,13 @@
 """Unit tests for Eagle3 model with AutoDeploy."""
 
 from pathlib import Path
+from typing import Any, ClassVar, Dict
 
 import pytest
 import torch
 from _model_test_utils import get_small_model_config
 from build_and_run_ad import ExperimentConfig, main
+from test_common.llm_data import hf_id_to_local_model_dir
 
 import tensorrt_llm._torch.auto_deploy.custom_ops  # noqa: F401
 from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
@@ -37,7 +39,6 @@ from tensorrt_llm._torch.auto_deploy.utils.node_utils import (
     infer_draft_embedding_size,
     is_any_lin_op,
 )
-from tests.test_common.llm_data import hf_id_to_local_model_dir
 
 EAGLE_MODEL_HUB_ID = "yuhuili/EAGLE3-LLaMA3.1-Instruct-8B"
 NEMOTRON_SUPER_MODEL_HUB_ID = "nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16"
@@ -79,7 +80,7 @@ class MockEagleConfig(EagleConfig):
     For standalone testing, we need to load these from the checkpoint.
     """
 
-    _drafter_defaults = {
+    _drafter_defaults: ClassVar[Dict[str, Dict[str, Any]]] = {
         "llama": {
             "load_embedding_from_target": False,
             "load_lm_head_from_target": False,
@@ -137,7 +138,9 @@ class MockEagleDrafterFactory(EagleDrafterFactory):
         from accelerate import init_empty_weights
 
         model_config, unused_kwargs = self._get_model_config()
-        model_config = MockEagleConfig(model_config, model_config.model_type)
+        # transformers>=5.5 applies @dataclass(kw_only=True) to PretrainedConfig
+        # subclasses, overriding EagleConfig.__init__. Use the factory classmethod.
+        model_config = MockEagleConfig.from_base_config(model_config, model_config.model_type)
 
         with (init_empty_weights if device == "meta" else nullcontext)():
             model = MockEagle3ModelForCausalLM._from_config(model_config, **unused_kwargs)
@@ -236,7 +239,7 @@ def test_eagle_model_torch_export():
     eagle_path = Path(eagle_model_path)
 
     # Setup
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = torch.device("cuda")
     dtype = torch.float16
 
     # Create model via EagleDrafterFactory (creates EagleDrafterForCausalLM)
