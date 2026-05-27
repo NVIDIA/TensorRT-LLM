@@ -447,8 +447,6 @@ unittest/llmapi/test_llm_pytorch.py::test_gqa_nemo_lora[cuda_graph_config0] SKIP
 unittest/llmapi/test_llm_pytorch.py::test_nemotron_nas_lora[None] SKIP (https://nvbugs/6140399)
 unittest/llmapi/test_llm_pytorch.py::test_nemotron_nas_lora[cuda_graph_config0] SKIP (https://nvbugs/6140399)
 unittest/llmapi/test_memory_profiling.py::test_profile_kvcache SKIP (https://nvbugs/5580781)
-unittest/tools/test_layer_wise_benchmarks.py::test_deepseek_r1_ctx_dep[1] SKIP (https://nvbugs/6162541)
-unittest/tools/test_layer_wise_benchmarks.py::test_nemotron_gen_dep[1] SKIP (https://nvbugs/6162527)
 unittest/tools/test_layer_wise_benchmarks.py::test_performance_alignment[1] SKIP (https://nvbugs/6127669)
 unittest/tools/test_layer_wise_benchmarks.py::test_qwen3_next_gen_tep[1] SKIP (https://nvbugs/6153575)
 visual_gen/test_visual_gen_benchmark.py::test_offline_benchmark SKIP (https://nvbugs/6050483)
