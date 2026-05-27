@@ -52,6 +52,7 @@ from ...custom_ops.attention_interface import (
     AttentionDescriptor,
     AttentionRegistry,
     Constant,
+    KVPagedResourceHandler,
     PrepareMetadataCallable,
 )
 from ...custom_ops.semantic_mask_registry import SemanticMaskRegistry
@@ -206,18 +207,96 @@ class _InsertCachedOperator(BaseTransform):
             gm, prep_meta_op, inputs_for_prep_meta, const_args, num_meta_out
         )
 
-    def _process_metadata_host(self, cm: CachedSequenceInterface):
-        """Process the host-side prepare metadata function."""
+    def _process_metadata_host(
+        self,
+        cm: CachedSequenceInterface,
+        handler_groups: Optional[List[KVPagedResourceHandler]] = None,
+    ):
+        """Process the host-side prepare metadata function.
+
+        When ``handler_groups`` has 2+ entries and the backend's host-prep
+        declares ``pool_window_left``, registers the host-prep once per pool:
+        pool 0 uses unsuffixed arg names, pools 1..N-1 use ``_g{i}`` /
+        ``_g{i}_host`` suffixed names plus a closure that remaps those
+        suffixed kwargs back to the function's canonical parameter names and
+        binds the pool's ``pool_window_left``.  Each invocation only refreshes
+        cached wrappers belonging to its pool.
+        """
         prep_meta_host_op = self.attn_descriptor.get_host_prepare_metadata_function()
         if prep_meta_host_op is None:
             return
 
-        # Register the host-side prepare metadata function with SequenceInfo.
-        # Arg availability is validated by require_copy() inside register_host_prepare.
         sig = inspect.signature(prep_meta_host_op)
-        cm.info.register_host_prepare_for_attention_forward(
-            prep_meta_host_op, list(sig.parameters.keys())
-        )
+        sig_arg_names = list(sig.parameters.keys())
+
+        # Backend opts in to per-pool dispatch by declaring `pool_window_left`.
+        backend_supports_per_pool = "pool_window_left" in sig.parameters
+        num_groups = len(handler_groups) if handler_groups is not None else 0
+
+        if not backend_supports_per_pool or num_groups < 2:
+            # Register the host-side prepare metadata function with SequenceInfo.
+            # Arg availability is validated by require_copy() inside register_host_prepare.
+            cm.info.register_host_prepare_for_attention_forward(
+                prep_meta_host_op,
+                [name for name in sig_arg_names if name != "pool_window_left"],
+            )
+            return
+
+        # VSWA: register one host-prep per pool with per-pool args + bound
+        # pool_window_left.  Mirrors the per-group prepare_extra_metadata wiring
+        # below (vswa_swappable_bases) to keep the two routing paths consistent.
+        #
+        # The framework's run_host_prepare_for_attention_forward calls each
+        # registered function as ``host_function(**{arg: get_arg(arg)})`` — i.e.
+        # the registered arg names become the *kwarg keys* at call time.  For
+        # pool > 0 the source tensors live under suffixed names
+        # (``cache_loc_g1_host`` etc.) but the underlying host-prep function
+        # only declares the unsuffixed parameter names.  Each per-pool
+        # registration therefore wraps the host-prep in a closure that remaps
+        # suffixed kwargs back to the function's canonical parameter names
+        # before delegating, and binds this pool's ``pool_window_left``.
+        swappable_bases = {
+            "cache_loc",
+            "cu_num_pages",
+            "last_page_len",
+            "seq_len_with_cache",
+        }
+        host_suffix = "_host"
+
+        def _make_pool_host_prep(canonical_op, pool_window_left, kwarg_remap):
+            """Closure: rename suffixed kwargs → canonical params, bind pool_window_left."""
+
+            def _invoke(**kwargs):
+                canonical = {kwarg_remap.get(k, k): v for k, v in kwargs.items()}
+                return canonical_op(**canonical, pool_window_left=pool_window_left)
+
+            return _invoke
+
+        for gi, handler in enumerate(handler_groups):
+            per_group_args: List[str] = []
+            kwarg_remap: Dict[str, str] = {}  # suffixed → canonical
+            for arg_name in sig_arg_names:
+                if arg_name == "pool_window_left":
+                    continue  # bound by closure
+                if gi == 0:
+                    per_group_args.append(arg_name)
+                    continue
+                base = arg_name.removesuffix(host_suffix)
+                if base in swappable_bases:
+                    is_host = arg_name.endswith(host_suffix)
+                    suffixed = f"{base}_g{gi}{host_suffix if is_host else ''}"
+                    per_group_args.append(suffixed)
+                    kwarg_remap[suffixed] = arg_name
+                else:
+                    per_group_args.append(arg_name)
+
+            # FlashInfer's _to_flashinfer_window_left convention:
+            # window_left = sliding_window - 1 for SWA, -1 for full attention.
+            sw = handler.sliding_window
+            pool_window_left = sw - 1 if isinstance(sw, int) and sw > 0 else -1
+
+            bound = _make_pool_host_prep(prep_meta_host_op, pool_window_left, kwarg_remap)
+            cm.info.register_host_prepare_for_attention_forward(bound, per_group_args)
 
     def _process_cache_node(self, gm: GraphModule, cache_name: str) -> Node:
         """Process the cache nodes by inserting a cached attention replacement op."""
@@ -278,9 +357,6 @@ class _InsertCachedOperator(BaseTransform):
 
         # insert metadata computation and extract each argument as a node
         meta_nodes_extra = self._process_metadata_extra(gm, cm, source_attn_nodes[0])
-
-        # Register host-side prepare_metadata function for attention descriptor.
-        self._process_metadata_host(cm)
 
         # Seed KvCacheConfig.max_attention_window from per-layer sliding_window
         # annotations so the rest of the KV-cache config plumbing (e.g.
@@ -415,6 +491,7 @@ class _InsertCachedOperator(BaseTransform):
             ]
             cm.info.register_window_groups(group_windows)
             cm.set_kv_groups(group_windows)
+            self._process_metadata_host(cm, handler_groups=handler_groups)
         elif has_unmanaged_paged:
             # MLA-only (and any future paged-handler family that does not contribute
             # to handler_groups): no KVPagedResourceHandler entries, but at least one
@@ -426,6 +503,7 @@ class _InsertCachedOperator(BaseTransform):
             group_windows = [cm.info.max_seq_len]
             cm.info.register_window_groups(group_windows)
             cm.set_kv_groups(group_windows)
+            self._process_metadata_host(cm, handler_groups=[])
         else:
             # No paged caches at all (cache-less or state-only models like Mamba
             # without attention). nest_sequences will correctly skip cache_loc
@@ -435,6 +513,7 @@ class _InsertCachedOperator(BaseTransform):
                 "cache_loc staging will be skipped. Expected for state-only or "
                 "cache-less models."
             )
+            self._process_metadata_host(cm, handler_groups=[])
 
         if is_multi_group:
             # Names that are routed per-group end-to-end.  seq_len_with_cache is
