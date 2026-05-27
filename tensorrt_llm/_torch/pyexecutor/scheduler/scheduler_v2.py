@@ -440,12 +440,14 @@ class KVCacheV2Scheduler(RequestScheduler):
             logger.debug("prepare_context failed for disagg gen init request %s", req.py_request_id)
             return ScheduleAction.SKIP, 0
 
-        # Prompt is already historic (processed by context server) — pass
-        # history_length so SWA layers skip pre-window block allocation.
+        # Whole prompt is already history on the ctx server; pass prompt_len
+        # so SWA stale range is non-empty at allocation time. context_current_position
+        # is still 0 here (only advanced in _prepare_disagg_gen_transmission_complete),
+        # so reading from it would degenerate history_length to 0 and defeat the fix.
         if not self.kv_cache_manager.resize_context(
             req,
             req.context_remaining_length + get_draft_token_length(req),
-            history_length=req.context_current_position,
+            history_length=req.prompt_len,
         ):
             return ScheduleAction.SKIP, 0
 
