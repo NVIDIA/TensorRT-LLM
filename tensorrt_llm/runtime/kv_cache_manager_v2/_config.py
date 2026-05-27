@@ -145,6 +145,7 @@ LayerConfig = AttentionLayerConfig | SsmLayerConfig
 class KVCacheDesc:
     capacity: int
     history_length: int
+    allow_scratch_reuse: bool = True
 
     def __post_init__(self) -> None:
         assert 0 <= self.history_length <= self.capacity

@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import math
 import os
 from collections import defaultdict
 from typing import Dict, List, Optional, Tuple
@@ -64,6 +65,21 @@ from .deepseek_v4 import (
 # Keep the env override so per-layer block tables can still be tested
 # without scratch-page remapping when needed.
 DSV4_ENABLE_SWA_SCRATCH_REUSE_ENV = "TRTLLM_DSV4_ENABLE_SWA_SCRATCH_REUSE"
+DSV4_GEN_HANDOFF_TYPICAL_STEP_REQUESTS_ENV = "TRTLLM_DSV4_GEN_HANDOFF_TYPICAL_STEP_REQUESTS"
+DSV4_GEN_HANDOFF_TYPICAL_STEP_DEFAULT_FRACTION = 0.25
+
+
+def _get_optional_non_negative_int_from_env(name: str) -> int | None:
+    value = os.environ.get(name)
+    if value is None:
+        return None
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be a non-negative integer, got {value!r}") from exc
+    if parsed < 0:
+        raise ValueError(f"{name} must be a non-negative integer, got {parsed}")
+    return parsed
 
 
 def _estimate_bytes_per_token(
@@ -775,13 +791,44 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
         # the typical step. An all-generation typical_step over-provisions the
         # compressed-cache pool at the expense of the SWA pool, starving the
         # SWA pool and artificially capping the achievable batch size.
-        ctx_capacity = max_num_tokens if max_num_tokens is not None else max_seq_len
-        typical_step = BatchDesc(
-            kv_caches=[
+        #
+        # Disaggregated GEN needs additional SWA / compressor-state headroom:
+        # transferred prompts can temporarily occupy received full KV chains
+        # before they are trimmed down to the steady-state sliding window.
+        # Model that admission pressure as full-length handoff requests, and
+        # do not apply prefill scratch reuse to them because the received KV
+        # chains are real transferred pages rather than scratch prefill pages.
+        if self.is_disagg:
+            handoff_requests = _get_optional_non_negative_int_from_env(
+                DSV4_GEN_HANDOFF_TYPICAL_STEP_REQUESTS_ENV
+            )
+            if handoff_requests is None:
+                handoff_requests = math.ceil(
+                    max_batch_size * DSV4_GEN_HANDOFF_TYPICAL_STEP_DEFAULT_FRACTION
+                )
+            handoff_requests = min(handoff_requests, max_batch_size)
+            context_descs = [
+                KVCacheDesc(
+                    capacity=max_seq_len,
+                    history_length=0,
+                    allow_scratch_reuse=False,
+                )
+            ] * handoff_requests
+            logger.info(
+                f"[RANK {self.mapping.rank}] DeepseekV4CacheManager "
+                "using disagg GEN handoff typical_step reserve: "
+                f"requests={handoff_requests}, capacity={max_seq_len}"
+            )
+        else:
+            ctx_capacity = max_num_tokens if max_num_tokens is not None else max_seq_len
+            context_descs = [
                 KVCacheDesc(capacity=ctx_capacity, history_length=0),
             ]
+
+        typical_step = BatchDesc(
+            kv_caches=context_descs
             + [KVCacheDesc(capacity=max_seq_len, history_length=max_seq_len - max_draft_len - 1)]
-            * (max_batch_size - 1),
+            * (max_batch_size - len(context_descs)),
         )
 
         constraints = []

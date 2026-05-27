@@ -1956,6 +1956,42 @@ class TestInitRatioConfig(unittest.TestCase):
         mgr_no.shutdown()
         mgr_yes.shutdown()
 
+    def test_typical_step_can_disable_scratch_for_handoff_requests(self):
+        """Received disagg KV handoff chains must not use scratch sizing."""
+        multi = dict(num_windowed_layers=16, num_full_layers=16)
+        scratchable_step = BatchDesc(kv_caches=[KVCacheDesc(capacity=4096, history_length=0)] * 4)
+        handoff_step = BatchDesc(
+            kv_caches=[
+                KVCacheDesc(
+                    capacity=4096,
+                    history_length=0,
+                    allow_scratch_reuse=False,
+                )
+            ]
+            * 4
+        )
+
+        cfg_scratchable = self._make_config(
+            typical_step=scratchable_step,
+            enable_swa_scratch_reuse=True,
+            **multi,
+        )
+        cfg_handoff = self._make_config(
+            typical_step=handoff_step,
+            enable_swa_scratch_reuse=True,
+            **multi,
+        )
+        mgr_scratchable = KVCacheManager(cfg_scratchable)
+        mgr_handoff = KVCacheManager(cfg_handoff)
+        ratio_scratchable = mgr_scratchable._current_gpu_ratio
+        ratio_handoff = mgr_handoff._current_gpu_ratio
+
+        self.assertGreater(ratio_handoff[0], ratio_scratchable[0])
+        self.assertLess(ratio_handoff[1], ratio_scratchable[1])
+
+        mgr_scratchable.shutdown()
+        mgr_handoff.shutdown()
+
     def test_constraint_with_scratch_accounts_for_scratch(self):
         """Constraint clamping uses scratch-aware slot counts.
 

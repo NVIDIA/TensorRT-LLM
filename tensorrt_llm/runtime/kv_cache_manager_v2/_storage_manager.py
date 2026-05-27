@@ -918,7 +918,7 @@ class StorageManager:
                 # Non-stale sys blocks for this request.
                 non_stale_sys = sys_blocks - len(intersect(stale, sys_range))
                 unique_non_stale = max(0, non_stale - non_stale_sys)
-                if swa_scratch_reuse is not None:
+                if swa_scratch_reuse is not None and kv.allow_scratch_reuse:
                     scratch = compute_scratch_range(
                         lc,
                         kv.history_length,
