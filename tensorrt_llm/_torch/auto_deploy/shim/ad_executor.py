@@ -840,14 +840,6 @@ class ADEngine(ModelEngine):
                 seq_len_with_cache_per_pool[pool_idx].append(active_token_count)
                 last_page_len_per_pool[pool_idx].append(lpl_i)
 
-                ad_logger.debug(
-                    f"[swa-trace] req={request.py_request_id} pool={pool_idx} "
-                    f"window={group_window} end_compute={end_compute_i} "
-                    f"front_removed={front_removed} num_active={num_active} "
-                    f"extra_page={extra_page} active_tokens={active_token_count} "
-                    f"last_page_len={lpl_i} len_all_indices={len(all_indices)}"
-                )
-
         # Store batch information based on prefill, decode, and extend requests.
         num_decode = len(generation_requests)
         num_decode_tokens = num_decode
