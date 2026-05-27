@@ -50,3 +50,31 @@ def test_autoconfig_from_pretrained_resolves_to_local_config(tmp_path, model_typ
     cfg = AutoConfig.from_pretrained(str(model_dir))
     assert isinstance(cfg, DeepseekV3Config)
     assert cfg.max_position_embeddings == 16384
+
+
+@pytest.mark.parametrize("model_type", ["deepseek_v32", "kimi_k2"])
+def test_load_hf_model_config_uses_autoconfig_dispatch(tmp_path, model_type):
+    # ModelLoader.load_hf_model_config is the llmapi/llm_utils entry point used
+    # by trtllm-serve to pre-load HF model configs. On transformers 5.5.x it
+    # must dispatch via AutoConfig (which CONFIG_MAPPING.register affects), not
+    # directly via PretrainedConfig.from_pretrained — the latter bypasses the
+    # mapping and returns a bare PretrainedConfig without
+    # `max_position_embeddings`, causing downstream AttributeError on the V3.2
+    # disagg gen_only GB200 post-merge perf-sanity test.
+    from tensorrt_llm.llmapi.llm_utils import ModelLoader
+
+    model_dir = tmp_path / model_type
+    model_dir.mkdir()
+    (model_dir / "config.json").write_text(
+        json.dumps(
+            {
+                "model_type": model_type,
+                "max_position_embeddings": 16384,
+            }
+        )
+    )
+
+    cfg = ModelLoader.load_hf_model_config(str(model_dir))
+    assert cfg is not None
+    assert isinstance(cfg, DeepseekV3Config)
+    assert cfg.max_position_embeddings == 16384

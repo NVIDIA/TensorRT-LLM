@@ -15,8 +15,9 @@ from tensorrt_llm.models.modeling_utils import QuantConfig
 from ..metadata import KVCacheParams
 from ..utils import get_global_attrs, get_model_extra_attrs
 from .interface import (AttentionBackend, AttentionForwardArgs,
-                        AttentionMetadata, CustomAttentionMask,
-                        PredefinedAttentionMask, merge_attention_forward_args)
+                        AttentionInputType, AttentionMetadata,
+                        CustomAttentionMask, MLAParams, PredefinedAttentionMask,
+                        merge_attention_forward_args)
 
 try:
     check_cuda_arch()
@@ -48,6 +49,36 @@ class PlanParams:
     window_left: Optional[int] = None
 
 
+@dataclass(kw_only=True, frozen=True)
+class RaggedPlanParams:
+    """
+    Parameters for MLA ragged prefill (context phase with expanded K, V).
+    """
+
+    num_heads: int
+    num_kv_heads: int
+    head_dim: int
+    head_dim_vo: int
+    q_dtype: torch.dtype
+    kv_dtype: torch.dtype
+    sm_scale: Optional[float] = None
+
+
+@dataclass(kw_only=True, frozen=True)
+class MLAPlanParams:
+    """
+    Parameters for FlashInfer MLA using BatchMLAPagedAttentionWrapper.
+    """
+
+    num_heads: int
+    kv_lora_rank: int
+    qk_rope_head_dim: int
+    page_size: int
+    q_dtype: torch.dtype
+    kv_dtype: torch.dtype
+    sm_scale: Optional[float] = None
+
+
 @dataclass(kw_only=True)
 class FlashInferWrappers:
     is_planned: bool
@@ -75,9 +106,30 @@ class FlashInferAttentionMetadata(AttentionMetadata):
     _qo_indptr: torch.Tensor = field(init=False)
     _kv_indptr: torch.Tensor = field(init=False)
     _cached_token_lens: torch.Tensor = field(init=False)
-
     _plan_params_to_wrappers: Dict[PlanParams,
                                    FlashInferWrappers] = field(init=False)
+
+    # MLA wrappers and stable buffers.
+    # Cached plan params + is-planned flag let prepare() refresh the plan
+    # outside stream capture (flashinfer plan() does device->host syncs).
+    _ragged_prefill_wrapper: Optional[
+        flashinfer.prefill.BatchPrefillWithRaggedKVCacheWrapper] = field(
+            init=False, default=None)
+    _mla_decode_wrapper: Optional[object] = field(init=False, default=None)
+    _mla_context_wrapper: Optional[object] = field(init=False, default=None)
+    _mla_ragged_plan_params: Optional[RaggedPlanParams] = field(init=False,
+                                                                default=None)
+    _mla_context_plan_params: Optional[MLAPlanParams] = field(init=False,
+                                                              default=None)
+    _mla_decode_plan_params: Optional[MLAPlanParams] = field(init=False,
+                                                             default=None)
+    num_ctx_cached_tokens: int = field(init=False, default=0)
+    _mla_ragged_planned: bool = field(init=False, default=False)
+    _mla_context_planned: bool = field(init=False, default=False)
+    _mla_decode_planned: bool = field(init=False, default=False)
+    _mla_qo_indptr_buf: Optional[torch.Tensor] = field(init=False, default=None)
+    _mla_kv_len_arr_buf: Optional[torch.Tensor] = field(init=False,
+                                                        default=None)
 
     def needs_plan(self, plan_params: PlanParams) -> bool:
         if plan_params not in self._plan_params_to_wrappers:
@@ -109,6 +161,214 @@ class FlashInferAttentionMetadata(AttentionMetadata):
             plan_params].ragged_prefill_wrapper
         assert result is not None, "Ragged prefill wrapper was not created in plan()"
         return result
+
+    def plan_ragged(
+        self,
+        qo_indptr: torch.Tensor,
+        kv_indptr: torch.Tensor,
+        plan_params: RaggedPlanParams,
+    ) -> flashinfer.prefill.BatchPrefillWithRaggedKVCacheWrapper:
+        """Plan MLA ragged prefill with expanded K, V (not paged)."""
+        if self._ragged_prefill_wrapper is None:
+            self._ragged_prefill_wrapper = flashinfer.prefill.BatchPrefillWithRaggedKVCacheWrapper(
+                self.workspace_buffer,
+                "NHD",
+            )
+        if self._mla_ragged_plan_params != plan_params:
+            self._mla_ragged_planned = False
+            self._mla_ragged_plan_params = plan_params
+
+        if self._mla_ragged_planned:
+            return self._ragged_prefill_wrapper
+
+        if self.is_cuda_graph and torch.cuda.is_current_stream_capturing():
+            raise ValueError(
+                "Cannot plan() flashinfer MLA ragged prefill while the stream "
+                "is capturing. Make sure prepare() has run at least one "
+                "warmup forward pass before capture.")
+
+        # Split append_paged_mla_kv_cache from plan() when this wrapper needs a
+        # new plan. Reusing a cached plan avoids this sync on later layers.
+        torch.cuda.current_stream().synchronize()
+
+        self._do_plan_ragged(qo_indptr, kv_indptr, plan_params)
+        self._mla_ragged_planned = True
+
+        return self._ragged_prefill_wrapper
+
+    def _do_plan_ragged(
+        self,
+        qo_indptr: torch.Tensor,
+        kv_indptr: torch.Tensor,
+        plan_params: RaggedPlanParams,
+    ) -> None:
+        assert self._ragged_prefill_wrapper is not None
+        self._ragged_prefill_wrapper.plan(
+            qo_indptr,
+            kv_indptr,
+            plan_params.num_heads,
+            plan_params.num_kv_heads,
+            plan_params.head_dim,
+            head_dim_vo=plan_params.head_dim_vo,
+            use_fp16_qk_reduction=False,
+            causal=True,
+            q_data_type=plan_params.q_dtype,
+            kv_data_type=plan_params.kv_dtype,
+            sm_scale=plan_params.sm_scale,
+        )
+
+    def plan_mla_decode(
+        self,
+        plan_params: MLAPlanParams,
+    ) -> object:
+        """Plan MLA decode using BatchMLAPagedAttentionWrapper.
+
+        Caches the wrapper and plan params; the actual plan() call is driven
+        by prepare() so it runs outside of CUDA graph capture.
+        """
+        if self._mla_decode_wrapper is None:
+            self._mla_decode_wrapper = flashinfer.mla.BatchMLAPagedAttentionWrapper(
+                self.workspace_buffer,
+                use_cuda_graph=self.is_cuda_graph,
+                qo_indptr=self._mla_qo_indptr_buf,
+                kv_indptr=self.paged_kv_indptr_decode,
+                kv_indices=self._paged_kv_indices,
+                kv_len_arr=self._mla_kv_len_arr_buf,
+                backend="auto",
+            )
+
+        if self._mla_decode_plan_params != plan_params:
+            self._mla_decode_planned = False
+
+        # Cache params so prepare() can re-plan on subsequent forward passes.
+        self._mla_decode_plan_params = plan_params
+
+        if self._mla_decode_planned:
+            return self._mla_decode_wrapper
+
+        if self.is_cuda_graph and torch.cuda.is_current_stream_capturing():
+            raise ValueError(
+                "Cannot plan() flashinfer MLA decode while the stream is "
+                "capturing. Make sure prepare() has run at least one warmup "
+                "forward pass before capture.")
+
+        # Split append_paged_mla_kv_cache from plan() on a cache miss. prepare()
+        # calls _do_plan_mla_decode() directly and does not need this sync.
+        torch.cuda.current_stream().synchronize()
+        self._do_plan_mla_decode(plan_params)
+        self._mla_decode_planned = True
+        return self._mla_decode_wrapper
+
+    def plan_mla_context(
+        self,
+        qo_indptr: torch.Tensor,
+        kv_indptr: torch.Tensor,
+        kv_indices: torch.Tensor,
+        kv_last_page_len: torch.Tensor,
+        plan_params: MLAPlanParams,
+    ) -> object:
+        """Plan MLA context with cached KV using BatchMLAPagedAttentionWrapper."""
+        if self._mla_context_wrapper is None:
+            self._mla_context_wrapper = flashinfer.mla.BatchMLAPagedAttentionWrapper(
+                self.workspace_buffer,
+                use_cuda_graph=False,
+                backend="auto",
+            )
+
+        if self._mla_context_plan_params != plan_params:
+            self._mla_context_planned = False
+            self._mla_context_plan_params = plan_params
+
+        if self._mla_context_planned:
+            return self._mla_context_wrapper
+
+        if self.is_cuda_graph and torch.cuda.is_current_stream_capturing():
+            raise ValueError(
+                "Cannot plan() flashinfer MLA context while the stream is "
+                "capturing. Make sure prepare() has run at least one warmup "
+                "forward pass before capture.")
+
+        # Split append_paged_mla_kv_cache from plan() when this wrapper needs a
+        # new plan. Reusing a cached plan avoids this sync on later layers.
+        torch.cuda.current_stream().synchronize()
+
+        self._do_plan_mla_context(
+            qo_indptr,
+            kv_indptr,
+            kv_indices,
+            kv_last_page_len,
+            plan_params,
+        )
+        self._mla_context_planned = True
+
+        return self._mla_context_wrapper
+
+    def _do_plan_mla_context(
+        self,
+        qo_indptr: torch.Tensor,
+        kv_indptr: torch.Tensor,
+        kv_indices: torch.Tensor,
+        kv_last_page_len: torch.Tensor,
+        plan_params: MLAPlanParams,
+    ) -> None:
+        assert self._mla_context_wrapper is not None
+
+        num_pages_per_seq = kv_indptr[1:] - kv_indptr[:-1]
+        kv_len_arr = (num_pages_per_seq -
+                      1) * plan_params.page_size + kv_last_page_len
+
+        self._mla_context_wrapper.plan(
+            qo_indptr,
+            kv_indptr,
+            kv_indices,
+            kv_len_arr,
+            plan_params.num_heads,
+            plan_params.kv_lora_rank,
+            plan_params.qk_rope_head_dim,
+            plan_params.page_size,
+            causal=True,
+            q_data_type=plan_params.q_dtype,
+            kv_data_type=plan_params.kv_dtype,
+            sm_scale=plan_params.sm_scale,
+        )
+
+    def _do_plan_mla_decode(self, plan_params: MLAPlanParams) -> None:
+        """Compute MLA decode plan inputs and call wrapper.plan().
+
+        Must run outside of CUDA graph capture.
+        """
+        num_gen = self.num_generations
+        kv_indptr = self.paged_kv_indptr_decode[:num_gen + 1]
+        kv_indices = self._paged_kv_indices[self.num_context_blocks:self.
+                                            num_context_blocks +
+                                            self.num_generation_blocks]
+        kv_last_page = self._paged_kv_last_page_len[self.num_contexts:self.
+                                                    num_contexts + num_gen]
+
+        # _qo_indptr is ordered [context_seqs..., generation_seqs...]; rebase
+        # the generation slice to 0.
+        num_ctx = self.num_contexts
+        qo_indptr = self._qo_indptr[num_ctx:num_ctx + num_gen +
+                                    1] - self._qo_indptr[num_ctx]
+
+        num_pages_per_seq = kv_indptr[1:] - kv_indptr[:-1]
+        kv_len_arr = (num_pages_per_seq -
+                      1) * plan_params.page_size + kv_last_page
+
+        self._mla_decode_wrapper.plan(
+            qo_indptr,
+            kv_indptr,
+            kv_indices,
+            kv_len_arr,
+            plan_params.num_heads,
+            plan_params.kv_lora_rank,
+            plan_params.qk_rope_head_dim,
+            plan_params.page_size,
+            causal=True,
+            q_data_type=plan_params.q_dtype,
+            kv_data_type=plan_params.kv_dtype,
+            sm_scale=plan_params.sm_scale,
+        )
 
     @property
     def paged_kv_indices(self) -> torch.Tensor:
@@ -285,6 +545,31 @@ class FlashInferAttentionMetadata(AttentionMetadata):
                             torch.empty(all_pool_pages,
                                         dtype=torch.int,
                                         device='cuda'))
+        # Stable buffers for FlashInfer MLA decode; required for CUDA graphs.
+        self._mla_qo_indptr_buf = self.get_empty(
+            buffers,
+            (self.max_num_requests + 1, ),
+            dtype=torch.int32,
+            cache_name="_mla_qo_indptr_buf",
+            capture_graph=capture_graph,
+        )
+        self._mla_kv_len_arr_buf = self.get_empty(
+            buffers,
+            (self.max_num_requests, ),
+            dtype=torch.int32,
+            cache_name="_mla_kv_len_arr_buf",
+            capture_graph=capture_graph,
+        )
+        # Rebind the wrapper to the freshly allocated buffers.
+        self._ragged_prefill_wrapper = None
+        self._mla_decode_wrapper = None
+        self._mla_context_wrapper = None
+        self._mla_ragged_plan_params = None
+        self._mla_context_plan_params = None
+        self._mla_decode_plan_params = None
+        self._mla_ragged_planned = False
+        self._mla_context_planned = False
+        self._mla_decode_planned = False
 
     def create_cuda_graph_metadata(self,
                                    max_batch_size: int,
@@ -403,6 +688,7 @@ class FlashInferAttentionMetadata(AttentionMetadata):
             self.kv_cache_params = KVCacheParams(use_cache=False)
             n = self.num_seqs
             self._cached_token_lens[:n].zero_()
+            self.num_ctx_cached_tokens = 0
             for plan_params in list(self._plan_params_to_wrappers.keys()):
                 if plan_params.attention_mask_data is None:
                     self._plan_params_to_wrappers[
@@ -422,6 +708,12 @@ class FlashInferAttentionMetadata(AttentionMetadata):
             self.kv_cache_params.num_cached_tokens_per_seq, dtype=torch.int)
         self._cached_token_lens[:cached_token_lens.size(0)].copy_(
             cached_token_lens, non_blocking=True)
+        if self.num_contexts > 0:
+            self.num_ctx_cached_tokens = sum(
+                self.kv_cache_params.num_cached_tokens_per_seq[:self.
+                                                               num_contexts])
+        else:
+            self.num_ctx_cached_tokens = 0
 
         # number of tokens needed in the kv cache for each sequence after the next pass
         kv_lens = self.cached_token_lens + self.seq_lens_kv_cuda
@@ -566,6 +858,43 @@ class FlashInferAttentionMetadata(AttentionMetadata):
             else:
                 del self._plan_params_to_wrappers[plan_params]
 
+        # Re-plan MLA wrappers outside of forward/capture using the params
+        # cached by prior warmup forwards. Forward still handles first-use or
+        # dtype/shape changes by syncing only on a plan cache miss.
+        self._mla_ragged_planned = False
+        self._mla_context_planned = False
+        self._mla_decode_planned = False
+        if (self.num_contexts > 0 and self._mla_ragged_plan_params is not None
+                and self._ragged_prefill_wrapper is not None):
+            ragged_indptr = self.qo_indptr[:self.num_contexts + 1]
+            self._do_plan_ragged(ragged_indptr, ragged_indptr,
+                                 self._mla_ragged_plan_params)
+            self._mla_ragged_planned = True
+
+        if (self.num_contexts > 0 and self._mla_context_plan_params is not None
+                and self._mla_context_wrapper is not None):
+            num_contexts = self.num_contexts
+            num_context_blocks = self.num_context_blocks
+            context_qo_indptr = self.qo_indptr[:num_contexts + 1]
+            context_kv_indptr = self.paged_kv_indptr_prefill[:num_contexts + 1]
+            context_kv_indices = self._paged_kv_indices[:num_context_blocks]
+            context_last_page_len = self._paged_kv_last_page_len[:num_contexts]
+            self._do_plan_mla_context(
+                qo_indptr=context_qo_indptr,
+                kv_indptr=context_kv_indptr,
+                kv_indices=context_kv_indices,
+                kv_last_page_len=context_last_page_len,
+                plan_params=self._mla_context_plan_params,
+            )
+            self._mla_context_planned = True
+
+        # Re-plan the MLA decode wrapper outside of any stream capture.
+        if (self.num_generations > 0
+                and self._mla_decode_plan_params is not None
+                and self._mla_decode_wrapper is not None):
+            self._do_plan_mla_decode(self._mla_decode_plan_params)
+            self._mla_decode_planned = True
+
         # VSWA: restore primary pool indices as the default.
         if (self._vswa_layer_to_pool is not None
                 and self._vswa_pool_indices_cache is not None):
@@ -613,7 +942,6 @@ class FlashInferAttentionMetadata(AttentionMetadata):
                         non_blocking=True)
                     if self.num_generations < bs:
                         kv_lens_buf[self.num_generations:bs].zero_()
-
         if self.cross is not None and self.cross is not self:
             self.cross.prepare()
 
@@ -802,6 +1130,10 @@ class FlashInferAttention(AttentionBackend[FlashInferAttentionMetadata]):
 
     Metadata = FlashInferAttentionMetadata
 
+    @classmethod
+    def support_mla(cls) -> bool:
+        return True
+
     def __init__(
         self,
         layer_idx: int,
@@ -811,6 +1143,7 @@ class FlashInferAttention(AttentionBackend[FlashInferAttentionMetadata]):
         quant_config: Optional[QuantConfig] = None,
         q_scaling: Optional[float] = None,
         skip_create_weights_in_init: bool = False,
+        mla_params: Optional[MLAParams] = None,
         **kwargs,
     ):
         self.flashinfer_backend = kwargs.pop('flashinfer_backend', "fa2")
@@ -820,12 +1153,288 @@ class FlashInferAttention(AttentionBackend[FlashInferAttentionMetadata]):
             self.update_quant_config(self.quant_config)
         self.q_scaling = q_scaling
 
+        self.is_mla_enable = mla_params is not None
+        if self.is_mla_enable:
+            self.kv_lora_rank = mla_params.kv_lora_rank
+            self.qk_rope_head_dim = mla_params.qk_rope_head_dim
+            self.qk_nope_head_dim = mla_params.qk_nope_head_dim
+            self.v_head_dim = mla_params.v_head_dim
+
     def update_quant_config(self, new_quant_config: Optional[QuantConfig]):
         self.quant_config = new_quant_config
         self.has_fp8_kv_cache = False
         if self.quant_config:
             self.has_fp8_kv_cache = self.quant_config.layer_quant_mode.has_fp8_kv_cache(
             )
+
+    def mla_rope_generation(
+        self,
+        fused_q: torch.Tensor,
+        q_pe: torch.Tensor,
+        latent_cache: torch.Tensor,
+        metadata,
+        cu_q_seqlens: torch.Tensor,
+        cu_kv_seqlens: torch.Tensor,
+        fmha_scheduler_counter: torch.Tensor,
+        mla_bmm1_scale,
+        mla_bmm2_scale,
+        quant_q_buffer,
+        out_scale=None,
+    ) -> None:
+        """Stub for MLA generation rope step used when FlashInfer is the mqa backend.
+
+        FlashInferAttention does not fuse RoPE (support_fused_rope returns False),
+        so RoPE is applied externally in MLA.forward_impl before this point.
+        q_pe already has RoPE applied; we just copy it into the rope slot of
+        fused_q so that forward_absorption_generation can pass fused_q directly
+        to _mla_forward_generation.  The latent_cache KV-cache append is handled
+        inside _mla_forward_generation when forward() is called.
+        """
+        # fused_q shape: [num_tokens, num_heads, kv_lora_rank + qk_rope_head_dim]
+        # q_pe shape:    [num_tokens, num_heads, qk_rope_head_dim]
+        fused_q[..., self.kv_lora_rank:] = q_pe
+
+    def _get_mla_caches(
+        self,
+        metadata: "FlashInferAttentionMetadata",
+    ):
+        """Derive per-instance MLA ckv/kpe cache views from the standard KV buffer.
+
+        For MLA models the KV cache manager allocates a single buffer per layer
+        with kv_factor=1 and head_dim = kv_lora_rank + qk_rope_head_dim.
+        get_buffers() (NHD layout) returns a tensor with shape
+        [num_pages, 1, page_size, 1, kv_lora_rank + qk_rope_head_dim].
+
+        We squeeze out the singleton kv_factor and num_kv_heads dimensions
+        to obtain [num_pages, page_size, kv_lora_rank + qk_rope_head_dim]
+        and then create non-allocating views for ckv and kpe.
+
+        Returns:
+            (ckv_cache, kpe_cache) with shapes
+            [num_pages, page_size, kv_lora_rank] and
+            [num_pages, page_size, qk_rope_head_dim].
+        """
+        # NHD layout: [num_pages, kv_factor=1, page_size, num_kv_heads=1, head_dim]
+        kv_buf = metadata.kv_cache_manager.get_buffers(self.layer_idx)
+        # [num_pages, page_size, kv_lora_rank + qk_rope_head_dim]
+        combined = kv_buf.squeeze(1).squeeze(2)
+        if self.has_fp8_kv_cache:
+            combined = combined.view(torch.float8_e4m3fn)
+        ckv_cache = combined[..., :self.kv_lora_rank]
+        kpe_cache = combined[..., self.kv_lora_rank:]
+        return ckv_cache, kpe_cache
+
+    def _mla_forward_context(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        metadata: FlashInferAttentionMetadata,
+        output: torch.Tensor,
+        latent_cache: torch.Tensor,
+    ) -> None:
+        """MLA context phase: append latent to MLA caches, run ragged prefill."""
+        # 1. Append latent_cache to separate ckv/kpe paged caches.
+        # latent_cache shape: [num_ctx_tokens, kv_lora_rank + qk_rope_head_dim]
+        num_ctx_tokens = metadata.num_ctx_tokens
+        append_ckv = latent_cache[:, :self.kv_lora_rank]
+        append_kpe = latent_cache[:, self.kv_lora_rank:]
+
+        kv_dtype = q.dtype
+        if self.has_fp8_kv_cache:
+            kv_dtype = torch.float8_e4m3fn
+            append_ckv = append_ckv.to(kv_dtype)
+            append_kpe = append_kpe.to(kv_dtype)
+
+        ckv_cache, kpe_cache = self._get_mla_caches(metadata)
+
+        ctx_batch_indices = metadata.batch_indices[:num_ctx_tokens]
+        ctx_positions = metadata.positions[:num_ctx_tokens]
+
+        flashinfer.page.append_paged_mla_kv_cache(
+            append_ckv,
+            append_kpe,
+            ctx_batch_indices,
+            ctx_positions,
+            ckv_cache,
+            kpe_cache,
+            metadata.paged_kv_indices,
+            metadata.paged_kv_indptr,
+            metadata.paged_kv_last_page_len,
+        )
+
+        # 2. Run ragged prefill with expanded q, k, v
+        num_contexts = metadata.num_contexts
+        qk_head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
+
+        q_ctx = q[:num_ctx_tokens].view(-1, self.num_heads, qk_head_dim)
+        k_ctx = k[:num_ctx_tokens].view(-1, self.num_kv_heads, qk_head_dim)
+        v_ctx = v[:num_ctx_tokens].view(-1, self.num_kv_heads, self.v_head_dim)
+
+        sm_scale = None
+        if self.q_scaling is not None:
+            sm_scale = 1 / (math.sqrt(qk_head_dim) * self.q_scaling)
+
+        ragged_params = RaggedPlanParams(
+            num_heads=self.num_heads,
+            num_kv_heads=self.num_kv_heads,
+            head_dim=qk_head_dim,
+            head_dim_vo=self.v_head_dim,
+            q_dtype=q.dtype,
+            kv_dtype=k.dtype,
+            sm_scale=sm_scale,
+        )
+
+        qo_indptr = metadata.qo_indptr[:num_contexts + 1]
+        kv_indptr = qo_indptr  # self-attention: same as qo
+
+        wrapper = metadata.plan_ragged(qo_indptr, kv_indptr, ragged_params)
+
+        out_view = output[:num_ctx_tokens].view(-1, self.num_heads,
+                                                self.v_head_dim)
+        wrapper.run(q_ctx, k_ctx, v_ctx, out=out_view)
+
+    def _mla_forward_generation(
+        self,
+        q: torch.Tensor,
+        metadata: FlashInferAttentionMetadata,
+        output: torch.Tensor,
+        latent_cache: Optional[torch.Tensor] = None,
+    ) -> None:
+        """MLA generation phase: append latent to MLA caches, then BatchMLAPagedAttentionWrapper decode."""
+        kv_dtype = q.dtype
+        if self.has_fp8_kv_cache:
+            kv_dtype = torch.float8_e4m3fn
+        ckv_cache, kpe_cache = self._get_mla_caches(metadata)
+
+        assert latent_cache is not None, (
+            "FlashInfer MLA generation requires latent_cache.")
+        # Append latent_cache to the paged MLA KV cache first.
+        # latent_cache shape: [num_tokens, kv_lora_rank + qk_rope_head_dim]
+        # RoPE must already be applied to the k_pe portion before calling this.
+        append_ckv = latent_cache[:, :self.kv_lora_rank]
+        append_kpe = latent_cache[:, self.kv_lora_rank:]
+        if self.has_fp8_kv_cache:
+            append_ckv = append_ckv.to(kv_dtype)
+            append_kpe = append_kpe.to(kv_dtype)
+        num_ctx_tokens = metadata.num_ctx_tokens
+        gen_batch_indices = metadata.batch_indices[num_ctx_tokens:]
+        gen_positions = metadata.positions[num_ctx_tokens:]
+        flashinfer.page.append_paged_mla_kv_cache(
+            append_ckv,
+            append_kpe,
+            gen_batch_indices,
+            gen_positions,
+            ckv_cache,
+            kpe_cache,
+            metadata.paged_kv_indices,
+            metadata.paged_kv_indptr,
+            metadata.paged_kv_last_page_len,
+        )
+
+        # fused_q layout: [num_tokens, num_heads * (kv_lora_rank + qk_rope_head_dim)]
+        # Split into q_nope (absorbed) and q_pe (rope)
+        num_tokens = q.shape[0]
+        q_3d = q.view(num_tokens, self.num_heads, self.head_dim)
+        q_nope = q_3d[..., :self.kv_lora_rank]
+        q_pe = q_3d[..., self.kv_lora_rank:]
+
+        # sm_scale is based on qk_head_dim = qk_nope_head_dim + qk_rope_head_dim
+        qk_head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
+        if self.q_scaling is not None:
+            sm_scale = 1.0 / (self.q_scaling * math.sqrt(qk_head_dim))
+        else:
+            sm_scale = 1.0 / math.sqrt(qk_head_dim)
+
+        plan_params = MLAPlanParams(
+            num_heads=self.num_heads,
+            kv_lora_rank=self.kv_lora_rank,
+            qk_rope_head_dim=self.qk_rope_head_dim,
+            page_size=metadata.page_size,
+            q_dtype=q.dtype,
+            kv_dtype=kv_dtype,
+            sm_scale=sm_scale,
+        )
+
+        wrapper = metadata.plan_mla_decode(plan_params)
+
+        # output: [num_tokens, num_heads, kv_lora_rank]
+        wrapper.run(q_nope,
+                    q_pe,
+                    ckv_cache,
+                    kpe_cache,
+                    out=output[:num_tokens].view(-1, self.num_heads,
+                                                 self.kv_lora_rank))
+
+    def _mla_forward_paged_context(
+        self,
+        q: torch.Tensor,
+        metadata: FlashInferAttentionMetadata,
+        output: torch.Tensor,
+        latent_cache: torch.Tensor,
+    ) -> None:
+        """MLA context phase with paged KV: append latent and run paged MLA."""
+        num_ctx_tokens = metadata.num_ctx_tokens
+        kv_dtype = q.dtype
+        if self.has_fp8_kv_cache:
+            kv_dtype = torch.float8_e4m3fn
+
+        ckv_cache, kpe_cache = self._get_mla_caches(metadata)
+
+        append_ckv = latent_cache[:, :self.kv_lora_rank]
+        append_kpe = latent_cache[:, self.kv_lora_rank:]
+        if self.has_fp8_kv_cache:
+            append_ckv = append_ckv.to(kv_dtype)
+            append_kpe = append_kpe.to(kv_dtype)
+
+        flashinfer.page.append_paged_mla_kv_cache(
+            append_ckv,
+            append_kpe,
+            metadata.batch_indices[:num_ctx_tokens],
+            metadata.positions[:num_ctx_tokens],
+            ckv_cache,
+            kpe_cache,
+            metadata.paged_kv_indices,
+            metadata.paged_kv_indptr,
+            metadata.paged_kv_last_page_len,
+        )
+
+        num_tokens = q.shape[0]
+        q_3d = q.view(num_tokens, self.num_heads, self.head_dim)
+        q_nope = q_3d[..., :self.kv_lora_rank]
+        q_pe = q_3d[..., self.kv_lora_rank:]
+
+        qk_head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
+        if self.q_scaling is not None:
+            sm_scale = 1.0 / (self.q_scaling * math.sqrt(qk_head_dim))
+        else:
+            sm_scale = 1.0 / math.sqrt(qk_head_dim)
+
+        plan_params = MLAPlanParams(
+            num_heads=self.num_heads,
+            kv_lora_rank=self.kv_lora_rank,
+            qk_rope_head_dim=self.qk_rope_head_dim,
+            page_size=metadata.page_size,
+            q_dtype=q.dtype,
+            kv_dtype=kv_dtype,
+            sm_scale=sm_scale,
+        )
+
+        num_contexts = metadata.num_contexts
+        wrapper = metadata.plan_mla_context(
+            qo_indptr=metadata.qo_indptr[:num_contexts + 1],
+            kv_indptr=metadata.paged_kv_indptr_prefill[:num_contexts + 1],
+            kv_indices=metadata.paged_kv_indices[:metadata.num_context_blocks],
+            kv_last_page_len=metadata.paged_kv_last_page_len[:num_contexts],
+            plan_params=plan_params,
+        )
+
+        wrapper.run(q_nope,
+                    q_pe,
+                    ckv_cache,
+                    kpe_cache,
+                    out=output[:num_tokens].view(-1, self.num_heads,
+                                                 self.kv_lora_rank))
 
     def forward_impl(
         self,
@@ -837,7 +1446,40 @@ class FlashInferAttention(AttentionBackend[FlashInferAttentionMetadata]):
         output: torch.Tensor,
         attention_mask_data: Optional[torch.Tensor] = None,
         attention_window_size: Optional[int] = None,
+        latent_cache: Optional[torch.Tensor] = None,
+        attention_input_type: AttentionInputType = AttentionInputType.mixed,
     ) -> None:
+        # MLA dispatch
+        if self.is_mla_enable:
+            if latent_cache is not None and k is not None and v is not None:
+                # MLA context phase: ragged prefill + cache append
+                self._mla_forward_context(q, k, v, metadata, output,
+                                          latent_cache)
+                return
+            elif k is None and v is None:
+                has_cached_context = (
+                    attention_input_type == AttentionInputType.context_only
+                    and metadata.enable_context_mla_with_cached_kv
+                    and metadata.num_ctx_cached_tokens > 0)
+                if has_cached_context:
+                    # Context MLA with cached KV uses paged MLA.
+                    assert latent_cache is not None, (
+                        "FlashInfer MLA paged context requires latent_cache.")
+                    self._mla_forward_paged_context(q, metadata, output,
+                                                    latent_cache)
+                elif attention_input_type == AttentionInputType.context_only:
+                    raise ValueError("FlashInfer MLA context without cached KV "
+                                     "requires key/value tensors.")
+                else:
+                    # MLA generation phase: paged decode + slice
+                    self._mla_forward_generation(q, metadata, output,
+                                                 latent_cache)
+                return
+            raise ValueError(
+                "FlashInfer MLA received an unsupported input combination: "
+                f"k is None={k is None}, v is None={v is None}, "
+                f"latent_cache is None={latent_cache is None}.")
+
         # Query
         q = q.view(-1, self.num_heads, self.head_dim)
 
@@ -1021,6 +1663,7 @@ class FlashInferAttention(AttentionBackend[FlashInferAttentionMetadata]):
         forward_args = merge_attention_forward_args(forward_args, kwargs)
 
         attention_mask_data = forward_args.attention_mask_data
+        latent_cache = forward_args.latent_cache
         if forward_args.attention_mask == CustomAttentionMask.CUSTOM:
             assert attention_mask_data is not None, "attention_mask_data is required for custom attention mask."
             attention_mask_type = int(AttentionMaskType.custom_mask)
@@ -1037,7 +1680,16 @@ class FlashInferAttention(AttentionBackend[FlashInferAttentionMetadata]):
 
         output = forward_args.output
         if output is None:
-            output = torch.empty_like(q)
+            if self.is_mla_enable and latent_cache is not None and k is not None and v is not None:
+                # MLA context: output has v_head_dim per head, not head_dim
+                output = q.new_empty(
+                    [q.shape[0], self.num_heads * self.v_head_dim])
+            elif self.is_mla_enable and k is None and v is None:
+                # MLA generation: output has kv_lora_rank per head
+                output = q.new_empty(
+                    [q.shape[0], self.num_heads * self.kv_lora_rank])
+            else:
+                output = torch.empty_like(q)
 
         # FlashInfer's sliding window attention is inclusive, while the attention window size defined in TRTLLM is exclusive.
         # So we need to subtract 1 from the attention window size for a consistent behavior.
@@ -1045,12 +1697,15 @@ class FlashInferAttention(AttentionBackend[FlashInferAttentionMetadata]):
         if attention_window_size is not None:
             attention_window_size = attention_window_size - 1
 
-        self.forward_impl(q=q,
-                          k=k,
-                          v=v,
-                          metadata=metadata,
-                          attention_mask_type=attention_mask_type,
-                          attention_mask_data=attention_mask_data,
-                          attention_window_size=attention_window_size,
-                          output=output)
+        self.forward_impl(
+            q=q,
+            k=k,
+            v=v,
+            metadata=metadata,
+            attention_mask_type=attention_mask_type,
+            attention_mask_data=attention_mask_data,
+            attention_window_size=attention_window_size,
+            output=output,
+            latent_cache=latent_cache,
+            attention_input_type=forward_args.attention_input_type)
         return output

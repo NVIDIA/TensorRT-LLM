@@ -26,7 +26,7 @@
 #    - Replace <account> with your SLURM account name
 #    - Replace <partition> with your SLURM partition name
 #    - Adjust -N, --ntasks-per-node, and --gpus-per-node to match your config
-#    - Total GPUs must equal: dit_cfg_size * dit_ulysses_size (set in SERVER_CONFIG)
+#    - Total GPUs must equal: cfg_size * ulysses_size (set in SERVER_CONFIG)
 #
 # 2. Environment Variables (set before running sbatch, or edit defaults below):
 #    - CONTAINER_IMAGE: Docker image or enroot .sqsh image with TensorRT-LLM installed
@@ -34,7 +34,7 @@
 #    - MOUNT_DEST:      mount destination path inside the container (default: $HOME)
 #    - PROJECT_ROOT:    path to TensorRT-LLM source on the shared filesystem
 #    - MODEL:           HuggingFace Hub model ID or local path (default: Wan-AI/Wan2.2-T2V-A14B-Diffusers)
-#    - SERVER_CONFIG:   YAML config for trtllm-serve; set dit_cfg_size * dit_ulysses_size
+#    - SERVER_CONFIG:   YAML config for trtllm-serve; set cfg_size * ulysses_size
 #                       to match total allocated GPUs (default: examples/visual_gen/serve/configs/wan.yml inside PROJECT_ROOT)
 #    - BACKEND:         benchmark backend (default: openai-videos)
 #    - SERVER_PORT:     HTTP port for trtllm-serve (default: 8000)

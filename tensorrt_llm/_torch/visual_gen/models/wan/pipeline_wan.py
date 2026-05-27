@@ -14,7 +14,6 @@ from tensorrt_llm._torch.visual_gen.cache.teacache import (
     ExtractorConfig,
     register_extractor_from_config,
 )
-from tensorrt_llm._torch.visual_gen.config import PipelineComponent
 from tensorrt_llm._torch.visual_gen.models.wan.defaults import (
     get_wan_default_params,
     get_wan_extra_param_specs,
@@ -22,7 +21,7 @@ from tensorrt_llm._torch.visual_gen.models.wan.defaults import (
 from tensorrt_llm._torch.visual_gen.models.wan.pipeline_wan_utils import retrieve_latents
 from tensorrt_llm._torch.visual_gen.output import CudaPhaseTimer, PipelineOutput
 from tensorrt_llm._torch.visual_gen.pipeline import BasePipeline
-from tensorrt_llm._torch.visual_gen.pipeline_registry import register_pipeline
+from tensorrt_llm._torch.visual_gen.pipeline_registry import PipelineComponent, register_pipeline
 from tensorrt_llm._torch.visual_gen.utils import postprocess_video_tensor
 from tensorrt_llm._utils import nvtx_range
 from tensorrt_llm.logger import logger
@@ -80,7 +79,16 @@ WAN_DEFAULT_NEGATIVE_PROMPT = (
 )
 
 
-@register_pipeline("WanPipeline")
+@register_pipeline(
+    "WanPipeline",
+    hf_ids=[
+        "Wan-AI/Wan2.1-T2V-1.3B-Diffusers",
+        "Wan-AI/Wan2.1-T2V-14B-Diffusers",
+        "Wan-AI/Wan2.2-T2V-A14B-Diffusers",
+        "Wan-AI/Wan2.2-TI2V-5B-Diffusers",
+    ],
+    doc="Wan 2.1 & 2.2 text-to-video family.",
+)
 class WanPipeline(BasePipeline):
     def __init__(self, model_config):
         # Wan2.2 A14B two-stage denoising parameters
@@ -207,7 +215,6 @@ class WanPipeline(BasePipeline):
         else:
             logger.info("Detected Wan 2.1 T2V (single-stage denoising)")
 
-        # Set default VAE scale factors (will be overridden if VAE is loaded)
         default_vae_scale_factor_spatial = 16 if self.is_wan22_5b else 8
         self.vae_scale_factor_temporal = 4
         self.vae_scale_factor_spatial = default_vae_scale_factor_spatial

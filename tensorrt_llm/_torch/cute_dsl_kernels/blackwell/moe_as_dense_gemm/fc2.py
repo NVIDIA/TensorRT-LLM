@@ -1947,8 +1947,8 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                             tRS_sC[(None, None, None, c_buffer)],
                         )
                         cute.arch.fence_proxy(
-                            cute.arch.ProxyKind.async_shared,
-                            space=cute.arch.SharedSpace.shared_cta,
+                            "async.shared",
+                            space="cta",
                         )
                         self.epilog_sync_barrier.arrive_and_wait()
 

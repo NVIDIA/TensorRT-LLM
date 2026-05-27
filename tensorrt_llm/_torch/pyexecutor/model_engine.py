@@ -228,6 +228,18 @@ class PyTorchModelEngine(ModelEngine):
         # Saved before zeroing for draft models; used by update_spec_dec_param.
         self._spec_dec_max_total_draft_tokens = spec_config.max_total_draft_tokens if spec_config is not None else 0
 
+        # Dynamic tree draft loop produces up to K * max_draft_len tokens,
+        # which may exceed max_total_draft_tokens. Use the larger value for
+        # KV cache reservation only; verify/tree output stays at max_total_draft_tokens.
+        if (spec_config is not None
+                and getattr(spec_config, 'use_dynamic_tree', False)
+                and getattr(spec_config, 'dynamic_tree_max_topK', 0) > 0):
+            self.max_draft_loop_tokens = max(
+                self.original_max_total_draft_tokens,
+                spec_config.dynamic_tree_max_topK * spec_config.max_draft_len)
+        else:
+            self.max_draft_loop_tokens = self.original_max_total_draft_tokens
+
         preserve_wrapped_eagle3_widths = (spec_config is not None
                                           and is_draft_model
                                           and drafting_loop_wrapper is not None
@@ -402,7 +414,7 @@ class PyTorchModelEngine(ModelEngine):
             self.spec_metadata = None
             update_spec_config_from_model_config(self.spec_config,
                                                  self.model.config)
-            max_num_draft_tokens = self.original_max_total_draft_tokens * self.batch_size
+            max_num_draft_tokens = self.max_draft_loop_tokens * self.batch_size
             self.draft_tokens_cuda = torch.empty((max_num_draft_tokens, ),
                                                  dtype=torch.int,
                                                  device='cuda')
@@ -751,7 +763,7 @@ class PyTorchModelEngine(ModelEngine):
             max_num_draft_tokens=self.original_max_draft_len)
         max_batch_size = min(
             self.batch_size, curr_max_num_tokens //
-            (1 + self.max_total_draft_tokens) // self.max_beam_width)
+            (1 + self.max_draft_loop_tokens) // self.max_beam_width)
 
         warmup_requests_configs = [
             (curr_max_num_tokens, 0),  # max_num_tokens, pure context
@@ -1260,6 +1272,7 @@ class PyTorchModelEngine(ModelEngine):
                 token_nums=ctx_token_nums,
                 is_gen=False,
                 max_num_draft_tokens=self.max_total_draft_tokens,
+                kv_reserve_draft_tokens=self.max_draft_loop_tokens,
                 use_mrope=self.use_mrope,
                 num_extra_decoding_steps=num_extra_decoding_steps,
                 draft_kv_cache_manager=draft_kv_cache_manager)
@@ -1279,6 +1292,7 @@ class PyTorchModelEngine(ModelEngine):
                 token_nums=[1] * num_gen_requests,
                 is_gen=True,
                 max_num_draft_tokens=self.max_total_draft_tokens,
+                kv_reserve_draft_tokens=self.max_draft_loop_tokens,
                 use_mrope=self.use_mrope,
                 max_beam_width=self.max_beam_width,
                 num_extra_decoding_steps=num_extra_decoding_steps,
@@ -1328,6 +1342,7 @@ class PyTorchModelEngine(ModelEngine):
             list(range(batch_size - 1)),
             is_gen=True,
             max_num_draft_tokens=draft_len,
+            kv_reserve_draft_tokens=self.max_draft_loop_tokens,
             use_mrope=self.use_mrope,
             max_beam_width=self.max_beam_width,
             num_extra_decoding_steps=num_extra_decoding_steps,
@@ -1341,29 +1356,32 @@ class PyTorchModelEngine(ModelEngine):
             self.max_seq_len if max_seq_len is None else max_seq_len,
             kv_cache_manager.max_seq_len)
 
+        # Use max_draft_loop_tokens for capacity estimation to account
+        # for the actual KV reservation per request.
+        _kv_draft = self.max_draft_loop_tokens
         available_tokens = kv_cache_manager.get_num_available_tokens(
             token_num_upper_bound=max_seq_len,
             batch_size=batch_size,
-            max_num_draft_tokens=draft_len)
+            max_num_draft_tokens=_kv_draft)
 
         # Also consider draft KV cache capacity when it exists
         if draft_kv_cache_manager is not None:
             draft_available_tokens = draft_kv_cache_manager.get_num_available_tokens(
                 batch_size=batch_size,
                 token_num_upper_bound=max_seq_len,
-                max_num_draft_tokens=draft_len)
+                max_num_draft_tokens=_kv_draft)
             available_tokens = min(available_tokens, draft_available_tokens)
 
         token_num = max(
             1,
             min(
                 available_tokens, max_seq_len - 1 -
-                get_num_extra_kv_tokens(self.spec_config) - draft_len))
+                get_num_extra_kv_tokens(self.spec_config) - _kv_draft))
         model_config = self.model.model_config.pretrained_config
         max_position_embeddings = getattr(model_config,
                                           'max_position_embeddings', None)
         if max_position_embeddings is not None:
-            token_num = min(token_num, max_position_embeddings - draft_len)
+            token_num = min(token_num, max_position_embeddings - _kv_draft)
 
         assert token_num > num_extra_decoding_steps, (
             "Cannot fuse drafting loop. Not enough KV cache space for all draft tokens."
@@ -1377,6 +1395,7 @@ class PyTorchModelEngine(ModelEngine):
             token_nums=[token_num],
             is_gen=True,
             max_num_draft_tokens=draft_len,
+            kv_reserve_draft_tokens=self.max_draft_loop_tokens,
             use_mrope=self.use_mrope,
             max_beam_width=self.max_beam_width,
             num_extra_decoding_steps=num_extra_decoding_steps,
@@ -3916,17 +3935,14 @@ class PyTorchModelEngine(ModelEngine):
                 sd_max_draft_len = self.original_max_draft_len
                 sd_max_total = self._spec_dec_max_total_draft_tokens
 
-            # Gather dynamic tree data from stable slots before target forward
+            # Fill slot-ID buffer for update_spec_dec_param
             if (spec_tree_manager is not None
                     and spec_tree_manager.use_dynamic_tree
                     and not self.is_draft_model):
-                gen_requests = list(scheduled_requests.generation_requests)
-                num_gens = len(gen_requests)
-                if num_gens > 0:
-                    gen_slot_ids, _ = spec_tree_manager.fill_gen_slot_ids(
-                        gen_requests)
-                    spec_tree_manager.gather_trees_from_slots(
-                        gen_slot_ids, num_gens)
+                spec_tree_manager.slot_storage.fill_all_slot_ids(
+                    scheduled_requests.context_requests,
+                    scheduled_requests.generation_requests,
+                )
 
             attn_metadata.update_spec_dec_param(
                 batch_size=scheduled_requests.batch_size,
@@ -3937,7 +3953,8 @@ class PyTorchModelEngine(ModelEngine):
                 max_total_draft_tokens=sd_max_total,
                 model_is_wrapped=self.model_is_wrapped,
                 spec_metadata=spec_metadata,
-                spec_tree_manager=spec_tree_manager)
+                spec_tree_manager=spec_tree_manager,
+                num_contexts=scheduled_requests.num_context_requests)
         else:
             spec_resource_manager = None
             spec_metadata = None
@@ -3990,19 +4007,10 @@ class PyTorchModelEngine(ModelEngine):
             if (self.enable_spec_decode and spec_tree_manager is not None
                     and spec_tree_manager.use_dynamic_tree
                     and not self.is_draft_model):
-                dummy_slot = spec_tree_manager._dummy_slot_id
-                idx = 0
-                for req in padded_requests.context_requests:
-                    spec_tree_manager._all_slot_ids_buf[idx] = (
-                        req.py_seq_slot
-                        if req.py_seq_slot is not None else dummy_slot)
-                    idx += 1
-                for req in padded_requests.generation_requests:
-                    slot = req.py_seq_slot if (
-                        not getattr(req, 'is_cuda_graph_dummy', False)
-                        and req.py_seq_slot is not None) else dummy_slot
-                    spec_tree_manager._all_slot_ids_buf[idx] = slot
-                    idx += 1
+                spec_tree_manager.slot_storage.fill_all_slot_ids(
+                    padded_requests.context_requests,
+                    padded_requests.generation_requests,
+                )
 
             inputs, gather_ids = self._prepare_inputs(
                 padded_requests, kv_cache_manager, attn_metadata, spec_metadata,

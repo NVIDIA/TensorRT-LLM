@@ -32,7 +32,8 @@ from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 from tensorrt_llm._torch.pyexecutor.resource_manager import (
     BaseResourceManager, CacheTypeCpp, DataType, KVCacheManager, get_pp_layers)
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
-from tensorrt_llm._utils import nvtx_range, torch_dtype_to_binding
+from tensorrt_llm._utils import (nvtx_range, prefer_pinned,
+                                 torch_dtype_to_binding)
 from tensorrt_llm.bindings.internal.batch_manager import (
     LinearAttentionMetadata, LinearCacheType)
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig
@@ -993,7 +994,6 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
     C++ KVCacheManager, enabling block reuse / prefix caching across attention
     and mamba layers. This is the default hybrid manager.
 
-    Disaggregated serving is not supported yet.
     """
 
     def __init__(
@@ -1025,7 +1025,9 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
         layer_mask: Optional[
             List[bool]] = None,  # this is the full attention layer mask
         is_estimating_kv_cache: bool = False,
+        is_draft: bool = False,
         use_replay_state_update: bool = False,
+        model_type: str = "nemotron_hybrid",
         **kwargs,
     ) -> None:
         # 3 kinds of layers:
@@ -1084,6 +1086,7 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
                 spec_config=spec_config,
                 layer_mask=full_attention_layer_mask,
                 is_estimating_kv_cache=is_estimating_kv_cache,
+                is_draft=is_draft,
             )
             return
 
@@ -1103,6 +1106,24 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
         self.conv_state_shape = [conv_dim, mamba_d_conv - 1]
         self.ssm_state_shape = [nheads, mamba_head_dim, mamba_d_state]
         self.conv_state_dtype = mamba_cache_dtype
+
+        # Store GLOBAL (pre-TP-division) mamba params for disagg RnnModelConfig.
+        # d_inner is computed at the top of __init__ before TP division.
+        d_inner_global = d_inner  # = mamba_head_dim * mamba_num_heads (GLOBAL)
+        conv_dim_global = d_inner_global + 2 * mamba_n_groups * mamba_d_state
+        self._rnn_d_state = mamba_d_state
+        self._rnn_d_conv = mamba_d_conv
+        self._rnn_num_heads = mamba_num_heads  # GLOBAL
+        self._rnn_n_groups = mamba_n_groups
+        self._rnn_head_dim = mamba_head_dim
+        self._rnn_hidden_size = d_inner_global  # GLOBAL = head_dim * num_heads
+        self._rnn_conv_dim_size = conv_dim_global  # GLOBAL conv dim
+        self._rnn_num_layers = mamba_num_layers
+
+        # Conv section layout for section-aware split/concat in TP mismatch.
+        # Section dims are derived from mHiddenSize and mNGroups*mDState in C++;
+        # we just need to tell C++ which ordering to use.
+        self._rnn_conv_section_layout = model_type  # "nemotron_hybrid" or "qwen3_next"
         self.ssm_count = math.prod(self.ssm_state_shape)
         self.conv_count = math.prod(self.conv_state_shape)
         self.ssm_bytes = self.ssm_count * self.ssm_state_dtype.itemsize
@@ -1125,6 +1146,18 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
         self.linear_attention_metadata.cache_type = LinearCacheType.RECURRENT_STATES.value
         self.linear_attention_metadata.all_recurrent_states_bytes = self.ssm_bytes + self.conv_bytes
         self.linear_attention_metadata.states_snapshot_interval = kv_cache_config.mamba_state_cache_interval if kv_cache_config.enable_block_reuse else 0
+        # RNN model params for disagg TP-mismatch split/concat.
+        conv_section_map = {"nemotron_hybrid": 1, "qwen3_next": 2}
+        self.linear_attention_metadata.rnn_num_heads = self._rnn_num_heads
+        self.linear_attention_metadata.rnn_head_dim = self._rnn_head_dim
+        self.linear_attention_metadata.rnn_d_state = self._rnn_d_state
+        self.linear_attention_metadata.rnn_d_conv = self._rnn_d_conv
+        self.linear_attention_metadata.rnn_n_groups = self._rnn_n_groups
+        self.linear_attention_metadata.rnn_conv_section_layout = conv_section_map.get(
+            self._rnn_conv_section_layout, 0)
+        self.linear_attention_metadata.rnn_ssm_bytes = self.ssm_bytes
+        self.linear_attention_metadata.rnn_ssm_dtype_size = self.ssm_state_dtype.itemsize
+        self.linear_attention_metadata.rnn_conv_dtype_size = self.conv_state_dtype.itemsize
         kv_cache_config = kv_cache_config.model_copy(deep=True)
         if kv_cache_config.enable_partial_reuse:
             logger.warning(
@@ -1172,6 +1205,7 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
             spec_config=spec_config,
             layer_mask=layer_mask,
             is_estimating_kv_cache=is_estimating_kv_cache,
+            is_draft=is_draft,
             linear_attention_metadata=self.linear_attention_metadata,
         )
 
@@ -1191,6 +1225,13 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
         self.cuda_state_indices = torch.zeros([self.max_batch_size],
                                               dtype=torch.int32,
                                               device="cuda")
+        self._host_state_indices = torch.zeros([self.max_batch_size],
+                                               dtype=torch.int32,
+                                               pin_memory=prefer_pinned())
+        self._row_indices = torch.arange(self.max_batch_size,
+                                         dtype=torch.long,
+                                         device="cpu")
+        self._request_id_to_state_index = {}
         self.kv_cache_config = kv_cache_config
         self.is_estimating_kv_cache = is_estimating_kv_cache
 
@@ -1245,9 +1286,13 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
 
         # Per-request fixed cost. STATIC_SLOTS_PER_REQUEST = 1 today (the
         # live mamba state); fixed-position snapshots are not yet
-        # implemented and would simply increment this constant.
+        # implemented and would simply increment this constant. With
+        # pipeline parallelism, multiple microbatches are in-flight
+        # concurrently on the same rank, so each rank holds Mamba state
+        # for up to ``max_batch_size * pp_size`` concurrent sequences.
         STATIC_SLOTS_PER_REQUEST = 1
-        intercept = (max_batch_size * state_bytes_per_rank *
+        pp_size = mapping.pp_size if mapping is not None else 1
+        intercept = (max_batch_size * pp_size * state_bytes_per_rank *
                      STATIC_SLOTS_PER_REQUEST)
 
         # Regular-snapshot bytes per token. None / non-positive intervals
@@ -1294,6 +1339,7 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
         is_gen: bool = False,
         prepare_resource: bool = True,
         max_num_draft_tokens: int = 0,
+        kv_reserve_draft_tokens: Optional[int] = None,
         use_mrope: bool = False,
         max_beam_width: int = 1,
         # For capturable drafting loops. During normal inference, the draft model always
@@ -1303,12 +1349,18 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
         num_extra_decoding_steps: int = 0,
         draft_kv_cache_manager: Optional[KVCacheManager] = None,
     ) -> List[LlmRequest]:
-        requests = super().add_dummy_requests(request_ids, token_nums, is_gen,
-                                              prepare_resource,
-                                              max_num_draft_tokens, use_mrope,
-                                              max_beam_width,
-                                              num_extra_decoding_steps,
-                                              draft_kv_cache_manager)
+        requests = super().add_dummy_requests(
+            request_ids=request_ids,
+            token_nums=token_nums,
+            is_gen=is_gen,
+            prepare_resource=prepare_resource,
+            max_num_draft_tokens=max_num_draft_tokens,
+            kv_reserve_draft_tokens=kv_reserve_draft_tokens,
+            use_mrope=use_mrope,
+            max_beam_width=max_beam_width,
+            num_extra_decoding_steps=num_extra_decoding_steps,
+            draft_kv_cache_manager=draft_kv_cache_manager,
+        )
         if requests:
             self.requests.extend(requests)
         self._setup_state_indices()
@@ -1325,9 +1377,16 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
     def _prepare_resources(self, scheduled_batch: ScheduledRequests):
         self.requests = scheduled_batch.context_requests + \
             scheduled_batch.generation_requests
-        for req in self.requests:
-            self.impl.copy_linear_attention_block(req)
-        self.impl.refresh_blocks()
+        # Issue all async block onboards; defer the syncTransfers() (refresh_blocks)
+        # until just before forward so the CPU-side prep (attn metadata, input
+        # tensor assembly, draft model prep, etc.) can overlap with the in-flight
+        # cudaMemcpyAsync calls instead of being serialized behind them.
+        # copy_linear_attention_block returns True iff it actually issued a copy;
+        # we skip refresh_blocks entirely when nothing was scheduled.
+        self._pending_state_transfers = self.impl.copy_linear_attention_block_batch(
+            self.requests)
+        if self._pending_state_transfers:
+            logger.info(f"Need to transfer mamba state blocks")
         self._setup_state_indices()
         # Reset replay double-buffer state for fresh context blocks. A reused
         # block (prefix-cache hit or block recycled across requests) may carry
@@ -1346,6 +1405,16 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
         if self.local_num_mamba_layers == 0:
             return
         self._prepare_resources(scheduled_batch)
+
+    @nvtx_range("hybrid_flush_state_transfers")
+    def flush_state_transfers(self) -> None:
+        """Complete any deferred state-block onboards scheduled by
+        prepare_resources(). Must be called before forward() reads recurrent
+        state blocks. Cheap no-op when nothing was scheduled.
+        """
+        if getattr(self, "_pending_state_transfers", False):
+            self.impl.refresh_blocks()
+            self._pending_state_transfers = False
 
     def is_speculative(self) -> bool:
         return self.spec_config is not None
@@ -1395,6 +1464,33 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
         accepted_conv = self.intermediate_conv_states[:, src_state_indices,
                                                       num_accepted_draft_tokens]
         self.all_conv_states[:, state_indices_d, :] = accepted_conv
+
+    def get_num_available_tokens(self,
+                                 token_num_upper_bound: int,
+                                 max_num_draft_tokens: int = 0,
+                                 **kwargs) -> int:
+        # Base bound from attention KV cache pool (the parent's behaviour).
+        result = super().get_num_available_tokens(token_num_upper_bound,
+                                                  max_num_draft_tokens,
+                                                  **kwargs)
+        # Also bound by the recurrent-state pool capacity: each request needs
+        # roughly ceil(N / states_snapshot_interval) recurrent-state blocks
+        # (+1 for the corner case where N is a multiple of tokens_per_block).
+        # When block reuse is disabled, only one snapshot is needed per
+        # request, so no additional capping is required here.
+        interval = (self.linear_attention_metadata.states_snapshot_interval
+                    if self.linear_attention_metadata is not None else 0)
+        if interval and interval > 0:
+            stats = self.impl.get_kv_cache_stats()
+            rs_free = stats.num_free_blocks_per_window_size.get(
+                LinearCacheType.RECURRENT_STATES.value, 0)
+            # Reserve 1 block for the always-allocated last block (corner case
+            # / final live state) so we don't promise more tokens than the
+            # pool can actually back at allocation time.
+            usable_rs_blocks = max(0, rs_free - 1)
+            rs_token_cap = usable_rs_blocks * interval
+            result = min(result, rs_token_cap)
+        return max(result, 0)
 
     def get_ssm_states(self, layer_idx: int) -> torch.Tensor:
         return self.all_ssm_states[self.mamba_layer_offsets[layer_idx]]
@@ -1451,6 +1547,7 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
     def free_resources(self, request: LlmRequest, pin_on_release: bool = False):
         if request in self.requests:
             self.requests.remove(request)
+            self._request_id_to_state_index.pop(request.py_request_id, None)
         super().free_resources(request, pin_on_release)
 
     def _setup_state_indices(self) -> None:
@@ -1469,39 +1566,57 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
         self.impl.copy_batch_block_offsets(
             self.host_block_offsets,
             [req.py_request_id for req in self.requests], 1, 0)
-        host_block_offsets = torch.zeros([len(self.requests)],
-                                         dtype=torch.int32,
-                                         device="cpu")
-        for i in range(len(self.requests)):
-            # With layer-first pool layout, setOffsets produces the block index directly
-            # (no longer multiplied by num_local_mamba_layers)
-            value = self.host_block_offsets[self.recurrent_states_pool_index, i,
-                                            0, block_indices[i]]
-            max_blocks = self.blocks_per_window[
-                LinearCacheType.RECURRENT_STATES.value][0]
-            if value < 0 or value >= max_blocks:
-                req = self.requests[i]
+
+        max_blocks = self.blocks_per_window[
+            LinearCacheType.RECURRENT_STATES.value][0]
+        n = len(self.requests)
+        self._host_state_indices.zero_()
+        if n > 0:
+            # Vectorized gather: replace per-element Python loop with a single
+            # tensor index op. block_indices is a small Python list so
+            # torch.tensor() conversion here is O(n) at C level, much cheaper
+            # than n round-trips through Python indexing.
+            bi = torch.tensor(block_indices, dtype=torch.long)
+            rows = self._row_indices[:n]
+            # host_block_offsets: [num_pools, max_batch_size, 2, max_blocks_per_seq]
+            values = self.host_block_offsets[self.recurrent_states_pool_index,
+                                             rows, 0, bi]
+            invalid_mask = (values < 0) | (values >= max_blocks)
+            if invalid_mask.any():
+                bad_i = int(invalid_mask.nonzero(as_tuple=False)[0, 0])
+                req = self.requests[bad_i]
+                value = int(values[bad_i])
                 raise RuntimeError(
                     f"Invalid recurrent state block index {value} "
-                    f"(expected 0 <= index < {max_blocks}) for request {i}, "
+                    f"(expected 0 <= index < {max_blocks}) for request {bad_i}, "
                     f"prompt_len={req.prompt_len}, "
                     f"is_context_finished={req.is_context_finished}, "
                     f"context_current_position={req.context_current_position}, "
                     f"prepopulated_token_num={req.prepopulated_prompt_len}, "
                     f"context_chunk_size={req.context_chunk_size if not req.is_context_finished else 'N/A'}, "
-                    f"block_index for next step is {block_indices[i]}, "
+                    f"block_index for next step is {block_indices[bad_i]}, "
                     f"\nblock_ids={self.impl.get_cache_block_ids(req.py_request_id, LinearCacheType.RECURRENT_STATES.value)}"
                 )
-            host_block_offsets[i] = value
+            self._host_state_indices[:n] = values
 
-        torch.fill_(self.cuda_state_indices, 0)
-        self.cuda_state_indices[:len(self.requests)] = host_block_offsets.cuda()
-        self._host_state_indices = host_block_offsets.clone()
+        self.cuda_state_indices.copy_(self._host_state_indices,
+                                      non_blocking=True)
 
-    def get_state_indices(
-            self,
-            request_ids: Optional[List[int]] = None,
-            is_padding: Optional[List[bool]] = None) -> torch.Tensor:
+        # Build request_id → pool block offset mapping so that
+        # get_state_indices can return indices in arbitrary request order.
+        for i, req in enumerate(self.requests):
+            self._request_id_to_state_index[
+                req.py_request_id] = self._host_state_indices[i].item()
+
+    def get_state_indices(self,
+                          request_ids: Optional[List[int]] = None,
+                          is_padding: Optional[List[bool]] = None) -> list:
+        if request_ids is not None:
+            # Return indices in the order of the caller's request_ids,
+            # not the internal self.requests order.  This is critical when
+            # the batch is reordered after prepare_resources (e.g. disagg
+            # serving sorts generation_requests by py_batch_idx).
+            return [self._request_id_to_state_index[rid] for rid in request_ids]
         return self.cuda_state_indices
 
     def calc_next_context_chunk_size(self, request: LlmRequest) -> int:

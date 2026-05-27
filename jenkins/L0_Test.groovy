@@ -107,13 +107,24 @@ REQUIRED_NO_DRIVER_TYPES = ["dgx-h100", "dgx-h200", "gh200", "gb10x"]
 // Maximum SLURM infra-failure retries (total attempts = SLURM_INFRA_RETRY_MAX + 1).
 // Recognised failure patterns are tagged with scope=SLURM or BOTH in the
 // shared-lib PATTERN_CATALOG.
-SLURM_INFRA_RETRY_MAX = 2
+//
+// Capped at 1 (2 attempts) because each SLURM attempt that times out at the
+// partition walltime burns ~4 hours, and the dominant retryable failure
+// (AgentOfflineException after test ran for hours) is a test-timeout
+// proxy — not a transient blip worth multi-retry. Cross-layer total is also
+// capped at 2: SLURM dispatcher pods pass singleAttempt:true to the outer
+// K8s pod retry, so 1 pod × 2 SLURM attempts = 2 total.
+SLURM_INFRA_RETRY_MAX = 1
 
 // Maximum K8s infra-failure retries (total attempts = K8S_INFRA_RETRY_MAX + 1).
 // Kept distinct from SLURM_INFRA_RETRY_MAX so the two paths can be tuned
 // independently as production telemetry comes in. Patterns tagged scope=K8S
 // or BOTH in the shared-lib PATTERN_CATALOG.
-K8S_INFRA_RETRY_MAX = 2
+//
+// Capped at 1 (2 attempts) so a non-SLURM K8s stage runs at most 2 pods.
+// For SLURM dispatcher pods this budget is bypassed (singleAttempt:true)
+// to avoid nesting with the inner SLURM retry.
+K8S_INFRA_RETRY_MAX = 1
 
 // Typed-exception hierarchy and FailureClassifier (PATTERN_CATALOG, classify(),
 // flattenThrowable) live in trtllm-jenkins-shared-lib under src/trtllm/. They
@@ -3647,11 +3658,25 @@ def runInKubernetes(pipeline, podSpec, containerName)
 // XML and junit() for intermediate retryable failures so the per-build test
 // report isn't poisoned by transient infra blips that the next attempt
 // recovers from.
-def runKubernetesPodWithInfraRetry(pipeline, podSpec, containerName, String stageName, Closure runner)
+//
+// Options (Map; all optional):
+//   singleAttempt (bool, default false) skip the retry loop entirely; run
+//                                       once with attemptTag="" and
+//                                       isFinalAttempt=true. Used by SLURM
+//                                       dispatcher closures so the outer
+//                                       pod-level retry does not nest on top
+//                                       of the inner SLURM retry and inflate
+//                                       the worst-case attempt budget.
+def runKubernetesPodWithInfraRetry(Map opts = [:], pipeline, podSpec, containerName, String stageName, Closure runner)
 {
+    boolean singleAttempt = opts.singleAttempt ?: false
+
     // DEBUG_MODE preserves the existing 2-hour-input human-inspection workflow
     // inside runLLMTestlistOnPlatform's finallyRunner: a single attempt only.
-    if (testFilter[(DEBUG_MODE)]) {
+    // singleAttempt (per-call opt) opts out of the retry loop for the same
+    // reason at the call site -- e.g. SLURM dispatcher pods rely on their
+    // inner SLURM retry and don't want an outer pod-level retry budget.
+    if (singleAttempt || testFilter[(DEBUG_MODE)]) {
         trtllm_utils.launchKubernetesPod(pipeline, podSpec, containerName, { runner("", true, null) })
         return
     }
@@ -3896,10 +3921,10 @@ def launchTestJobs(pipeline, testFilter)
         "DGX_B200-8_GPUs-PyTorch-2": ["auto:dgx-b200-flex", "l0_dgx_b200", 2, 2, 8, 1, true],
         "DGX_B200-8_GPUs-AutoDeploy-Post-Merge-1": ["auto:dgx-b200-flex", "l0_dgx_b200", 1, 1, 8, 1, true],
         "DGX_B200-4_GPUs-Verl-Post-Merge-1": ["auto:dgx-b200-flex", "l0_verl", 1, 1, 4, 1, true],
-        "B300-PyTorch-1": ["b300-single", "l0_b300", 1, 1],
-        "DGX_B300-4_GPUs-PyTorch-1": ["b300-x4", "l0_dgx_b300", 1, 1, 4],
-        "DGX_B300-4_GPUs-PyTorch-Post-Merge-1": ["b300-x4", "l0_dgx_b300", 1, 2, 4],
-        "DGX_B300-4_GPUs-PyTorch-Post-Merge-2": ["b300-x4", "l0_dgx_b300", 2, 2, 4],
+        "B300-PyTorch-1": ["auto:dgx-b300-flex", "l0_b300", 1, 1, 1, 1, true],
+        "DGX_B300-4_GPUs-PyTorch-1": ["auto:dgx-b300-flex", "l0_dgx_b300", 1, 1, 4, 1, true],
+        "DGX_B300-4_GPUs-PyTorch-Post-Merge-1": ["auto:dgx-b300-flex", "l0_dgx_b300", 1, 2, 4, 1, true],
+        "DGX_B300-4_GPUs-PyTorch-Post-Merge-2": ["auto:dgx-b300-flex", "l0_dgx_b300", 2, 2, 4, 1, true],
         // VisualGen PerfSanity post-merge test
         "DGX_B200-8_GPUs-PyTorch-VisualGen-PerfSanity-Post-Merge-1": ["auto:dgx-b200-flex", "l0_b200_visual_gen_perf_sanity", 1, 1, 8, 1, true],
         // PerfSanity post-merge tests
@@ -3922,11 +3947,11 @@ def launchTestJobs(pipeline, testFilter)
 
     parallelSlurmJobs = x86SlurmTestConfigs.collectEntries{key, values -> [key, [createKubernetesPodConfig(LLM_DOCKER_IMAGE, "slurm", "amd64"), { attemptTag, isFinalAttempt, retryContext = null ->
         // attemptTag comes from runKubernetesPodWithInfraRetry for the outer
-        // dispatcher pod and is threaded into runLLMTestlistOnSlurm so the
-        // inner SLURM retry can prefix its postTag with the outer attempt's
-        // tag. Without this, a new dispatcher pod's inner attempt 1 would
-        // compute postTag="" and collide with the dead pod's already-recorded
-        // upload in GlobalState.uploadResultStageNames.
+        // dispatcher pod (when retry is enabled — see opts below) and is
+        // threaded into runLLMTestlistOnSlurm so a future re-enable of outer
+        // pod retry composes a unique postTag instead of colliding with the
+        // dead pod's recorded upload. With singleAttempt:true (default for
+        // SLURM stages) the outer retry is off and attemptTag is always "".
         def config = VANILLA_CONFIG
         if (key.contains("single-device")) {
             config = SINGLE_DEVICE_CONFIG
@@ -3935,7 +3960,14 @@ def launchTestJobs(pipeline, testFilter)
             config = LLVM_CONFIG
         }
         runLLMTestlistOnSlurm(pipeline, values[0], values[1], config, key.contains("-Perf-"), key, values[2], values[3], values[4] ?: 1, values[5] ?: 1, values[6] ?: false, false, "cp312", attemptTag)
-    }]]}
+    }, [singleAttempt: true]]]}
+    // SLURM dispatcher pods run their own inner retry loop
+    // (runLLMTestlistOnSlurm with SLURM_INFRA_RETRY_MAX). Disabling the outer
+    // K8s pod retry (singleAttempt:true) here caps total attempts at
+    // SLURM_INFRA_RETRY_MAX+1 instead of (SLURM_INFRA_RETRY_MAX+1) *
+    // (K8S_INFRA_RETRY_MAX+1). Each SLURM attempt that hits the partition
+    // walltime burns ~4h, so nesting the two layers cost up to ~36h per stage
+    // on consistently-timing-out tests before this cap.
 
     parallelJobs += parallelSlurmJobs
 
@@ -4141,6 +4173,9 @@ def launchTestJobs(pipeline, testFilter)
         }]]}
 
         // Add SBSA Slurm jobs
+        // singleAttempt:true disables the outer K8s pod retry; see the x86
+        // SLURM closure above for the full rationale (cap nested retry budget
+        // so consistently-timing-out tests don't burn ~36h on retry cascades).
         parallelSlurmJobs = SBSASlurmTestConfigs.collectEntries{key, values -> [key, [createKubernetesPodConfig(LLM_DOCKER_IMAGE, "slurm", "arm64"), { attemptTag, isFinalAttempt, retryContext = null ->
             // attemptTag is threaded into runLLMTestlistOnSlurm as the outer
             // dispatcher pod's tag so the inner SLURM retry's postTag can't
@@ -4154,10 +4189,11 @@ def launchTestJobs(pipeline, testFilter)
                 config = LLVM_CONFIG
             }
             runLLMTestlistOnSlurm(pipeline, values[0], values[1], config, key.contains("-Perf-"), key, values[2], values[3], values[4] ?: 1, values[5] ?: 1, values[6] ?: false, false, "cp312", attemptTag)
-        }]]}
+        }, [singleAttempt: true]]]}
         parallelJobs += parallelSlurmJobs
 
         // Add SBSA multi node Slurm jobs
+        // singleAttempt:true disables the outer K8s pod retry; see above.
         parallelMultiNodesSBSAJobs = multiNodesSBSAConfigs.collectEntries{key, values -> [key, [createKubernetesPodConfig(LLM_DOCKER_IMAGE, "slurm", "arm64"), { attemptTag, isFinalAttempt, retryContext = null ->
             def config = LINUX_AARCH64_CONFIG
             if (key.contains("single-device")) {
@@ -4167,7 +4203,7 @@ def launchTestJobs(pipeline, testFilter)
                 config = LLVM_CONFIG
             }
             runLLMTestlistOnSlurm(pipeline, values[0], values[1], config, key.contains("-Perf-"), key, values[2], values[3], values[4] ?: 1, values[5] ?: 2, values[6] ?: false, false, "cp312", attemptTag)
-        }]]}
+        }, [singleAttempt: true]]]}
 
         parallelJobs += parallelMultiNodesSBSAJobs
     }
@@ -4565,7 +4601,12 @@ def launchTestJobs(pipeline, testFilter)
                     echo "Skip - Passed in the previous pipelines."
                 }
             } else if (values instanceof List) {
-                runKubernetesPodWithInfraRetry(pipeline, values[0], "trt-llm", key, { attemptTag, isFinalAttempt, retryContext = null ->
+                // parallelJobs entries are either [podSpec, runner] or
+                // [podSpec, runner, opts] where opts is a Map passed through
+                // to runKubernetesPodWithInfraRetry (e.g. singleAttempt:true
+                // for SLURM dispatcher pods to disable nested pod retry).
+                def opts = (values.size() >= 3 && values[2] instanceof Map) ? values[2] : [:]
+                runKubernetesPodWithInfraRetry(opts, pipeline, values[0], "trt-llm", key, { attemptTag, isFinalAttempt, retryContext = null ->
                     values[1](attemptTag, isFinalAttempt, retryContext)
                 })
             } else {
