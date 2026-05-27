@@ -2136,7 +2136,9 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             pp_partition[-1] = num_hidden_layers - sum(pp_partition[:-1])
         else:
             pp_partition = None
-        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.75)
+        free_gpu_memory_fraction = 0.6 if torch_compile else 0.75
+        kv_cache_config = KvCacheConfig(
+            free_gpu_memory_fraction=free_gpu_memory_fraction)
         torch_compile_config = _get_default_torch_compile_config(torch_compile)
         pytorch_config = dict(
             disable_overlap_scheduler=not overlap_scheduler,
@@ -6339,10 +6341,15 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
 @skip_pre_hopper
 class TestEXAONE4(LlmapiAccuracyTestHarness):
     MODEL_NAME = "LGAI-EXAONE/EXAONE-4.0-32B"
+    # 32B BF16 leaves little headroom on 80 GiB H100; reduce KV cache and
+    # use expandable_segments to avoid autotuner warmup OOM (nvbugs/6164924).
     kv_cache_config = KvCacheConfig(enable_block_reuse=False,
-                                    enable_partial_reuse=False)
+                                    enable_partial_reuse=False,
+                                    free_gpu_memory_fraction=0.8)
 
-    def test_auto_dtype(self):
+    def test_auto_dtype(self, mocker):
+        patch_mpi_pool_session_for_env(
+            mocker, {"PYTORCH_ALLOC_CONF": "expandable_segments:True"})
         model_path = f"{llm_models_root()}/EXAONE-4.0-32B"
         with LLM(model_path, kv_cache_config=self.kv_cache_config) as llm:
             task = MMLU(self.MODEL_NAME)
@@ -7206,7 +7213,7 @@ class TestMistralLarge3_675B(LlmapiAccuracyTestHarness):
                 eagle3_model_arch="mistral_large3")
         with LLM(
                 f"{llm_models_root()}/Mistral-Large-3-675B/Mistral-Large-3-675B-Instruct-2512/",
-                checkpoint_format="mistral",
+                checkpoint_format="mistral_large_3",
                 tensor_parallel_size=tp_size,
                 pipeline_parallel_size=pp_size,
                 moe_expert_parallel_size=ep_size,
