@@ -722,6 +722,27 @@ RequestStatuses CacheTransceiver::checkContextTransferStatus(
                 {
                     effectiveSliceMs = std::numeric_limits<int64_t>::max();
                 }
+                // Cap the per-call wait slice so the polling thread always
+                // cycles back to drive MPI/UCX forward progress. Transports
+                // without a dedicated progress thread (notably mpi_kvcache
+                // over UCX-over-shm) rely on the app thread calling MPI
+                // functions to advance in-flight transfers. If the slice is
+                // unbounded (the fall-through above sets INT64_MAX when no
+                // timeout is configured), a single wait_for on a not-yet-
+                // ready future blocks the thread forever -- which means no
+                // MPI progress -- which means the future never becomes
+                // ready. The death spiral was empirically observed as
+                // test_asymmetric_executor[mpi_kvcache] wedging at its
+                // 300s gtest timeout despite the test's CacheTransceiverConfig
+                // having neither senderFutureTimeoutMs nor kvTransferTimeoutMs
+                // configured (nvbug-6104831).
+                //
+                // The deadline-check observability above is UNCHANGED: if
+                // kvTransferTimeoutMs is set, the deadline still fires within
+                // kMaxPollSliceMs of true expiry. Cancellation semantics
+                // (gated by TRTLLM_DISAGG_ENABLE_INFLIGHT_CANCEL) unchanged.
+                static constexpr int64_t kMaxPollSliceMs = 50;
+                effectiveSliceMs = std::min<int64_t>(effectiveSliceMs, kMaxPollSliceMs);
                 auto status = future.wait_for(std::chrono::milliseconds(effectiveSliceMs));
                 if (status == std::future_status::ready)
                 {
@@ -1048,6 +1069,13 @@ void CacheTransceiver::checkGenTransferStatus(std::optional<int> const& atLeastR
                 {
                     effectiveSliceMs = std::numeric_limits<int64_t>::max();
                 }
+                // Cap the per-call wait slice so the polling thread always
+                // cycles back to drive MPI/UCX forward progress -- see the
+                // long comment at the analogous site in
+                // checkContextTransferStatus for the rationale and the
+                // empirical mpi_kvcache wedge that motivated this cap.
+                static constexpr int64_t kMaxPollSliceMs = 50;
+                effectiveSliceMs = std::min<int64_t>(effectiveSliceMs, kMaxPollSliceMs);
                 auto status = future.wait_for(std::chrono::milliseconds(effectiveSliceMs));
                 if (status == std::future_status::ready)
                 {
