@@ -271,13 +271,22 @@ __device__ bool processHistogramStep(int const* indices, InputT const* logits, i
     // The threshold bin.
     thresholdBinIdx = smemThresholdBinIdx[0];
 
+    // At step 0, auto-promoting items in higher half-precision bins is only
+    // safe if no subsequent step will run — otherwise step 2's
+    // isPartialMatch<21> filter cannot exclude them (half-precision binning
+    // does not correspond to bits[31:21] of full-precision), and they would
+    // be auto-promoted a second time at step 2. When step 0 will continue,
+    // defer all promotion to the later steps (whose bit-pattern filters
+    // correctly carry forward).
+    bool const step0WillContinue = (step == 0) && (smemFinalBinSize[0] > kNumFinalItems);
+
     auto processBins = [&](InputT logitIn, int idx)
     {
         float const logit = static_cast<float>(logitIn);
         if (isPartialMatch<patternShift>(logit, logitPattern))
         {
             uint32_t binIdx = extractBinIdx<step>(logit);
-            if (binIdx < thresholdBinIdx)
+            if (binIdx < thresholdBinIdx && !step0WillContinue)
             {
                 // The element is part of the top-k selection
                 int dstIdx = atomicAdd(&smemFoundTopKValues[0], 1);
@@ -620,6 +629,38 @@ static __device__ void topKPerRowJob(int const* indices, InputT const* logits, i
     }
 }
 } // namespace
+
+// Per-row block count picked by the fused split-work dispatcher (see
+// invokeIndexerTopKDecodeImpl). Defaults to 10 (matching the legacy
+// 2-launch split-work tier); bumped at very-low-bs corners where 10
+// blocks/row leaves the GPU under-filled. The merge phase processes
+// numBlocksPerRow * topK candidates in a single block, so we never bump
+// past where the merge would dominate. Cutoffs come from the
+// mid-long-decode sweep. Exposed here so callers can size the aux
+// buffers (outIndicesAux / outLogitsAux) to numRows × numBlocksPerRow ×
+// topK — sizing them at the legacy 10 blocks/row triggers OOB writes for
+// the bumped tiers.
+int indexerTopKDecodeFusedAuxBlocksPerRow(int numRows, int numColumns)
+{
+    int numBlocksPerRow = 10;
+    if (numRows == 1)
+    {
+        // 132 SMs / 1 row → cap at 32 (aux buffer max), gated so per-block
+        // scan stays >= 30k (the 1024-thread wide-block threshold).
+        int target = 32;
+        if (target > numColumns / 30000)
+            target = numColumns / 30000;
+        if (target > numBlocksPerRow)
+            numBlocksPerRow = target;
+    }
+    else if (numRows == 2 && numColumns >= 400000)
+        numBlocksPerRow = 16;
+    else if (numRows == 4 && numColumns >= 400000)
+        numBlocksPerRow = 14;
+    else if (numRows == 8 && numColumns >= 500000)
+        numBlocksPerRow = 12;
+    return numBlocksPerRow;
+}
 
 template <int kNumThreadsPerBlock, typename InputT = float>
 static __global__ __launch_bounds__(kNumThreadsPerBlock) void topKPerRowPrefill(InputT const* logits,
@@ -1424,23 +1465,7 @@ void invokeIndexerTopKDecodeImpl(InputT const* logits, int const* seqLens, int* 
         // come from the mid-long-decode sweep.
         TLLM_CHECK_WITH_INFO(outLogitsAux != nullptr && outIndicesAux != nullptr,
             "Fused split-work path requires both outLogitsAux and outIndicesAux to be non-null.");
-        int numBlocksPerRow = 10;
-        if (numRows == 1)
-        {
-            // 132 SMs / 1 row → cap at 32 (aux buffer max), gated so per-block
-            // scan stays >= 30k (the 1024-thread wide-block threshold).
-            int target = 32;
-            if (target > numColumns / 30000)
-                target = numColumns / 30000;
-            if (target > numBlocksPerRow)
-                numBlocksPerRow = target;
-        }
-        else if (numRows == 2 && numColumns >= 400000)
-            numBlocksPerRow = 16;
-        else if (numRows == 4 && numColumns >= 400000)
-            numBlocksPerRow = 14;
-        else if (numRows == 8 && numColumns >= 500000)
-            numBlocksPerRow = 12;
+        int const numBlocksPerRow = indexerTopKDecodeFusedAuxBlocksPerRow(numRows, numColumns);
 
         // 1024-thread variant wins once per-block scan is large enough to
         // amortize block-scope syncs (~30k); below that the 512-thread
@@ -1451,18 +1476,30 @@ void invokeIndexerTopKDecodeImpl(InputT const* logits, int const* seqLens, int* 
 
         auto* kernel_512 = &topKPerRowDecodeFused<kFusedNarrowThreadsPerBlock, InputT>;
         auto* kernel_1024 = &topKPerRowDecodeFused<1024, InputT>;
+        // Opt-in to the smem budget the kernel actually needs. The kernel's
+        // static smem (≈19KB for the 512-thread variant, ≈38KB for the
+        // 1024-thread one) plus the 2*topK*sizeof(int32_t) dynamic smem
+        // requested at launch can exceed the default per-block cap (48KB on
+        // many archs, including sm_120). Setting MaxDynamicSharedMemorySize
+        // to a value that, together with the kernel's static smem, exceeds
+        // cudaDevAttrMaxSharedMemoryPerBlockOptin causes cudaFuncSetAttribute
+        // to fail and the subsequent cudaLaunchKernelEx to return
+        // cudaErrorInvalidValue. Sizing the attribute to exactly the dynamic
+        // smem the launch uses keeps this comfortably under the optin cap on
+        // every Hopper / Blackwell arch we target.
+        size_t const fusedDynamicSmemBytes = 2 * topK * sizeof(int32_t);
         static bool s_attr_512 = false;
         static bool s_attr_1024 = false;
         if (useWideBlock && !s_attr_1024)
         {
-            cudaFuncSetAttribute(
-                reinterpret_cast<void const*>(kernel_1024), cudaFuncAttributeMaxDynamicSharedMemorySize, 96 * 1024);
+            cudaFuncSetAttribute(reinterpret_cast<void const*>(kernel_1024),
+                cudaFuncAttributeMaxDynamicSharedMemorySize, fusedDynamicSmemBytes);
             s_attr_1024 = true;
         }
         else if (!useWideBlock && !s_attr_512)
         {
-            cudaFuncSetAttribute(
-                reinterpret_cast<void const*>(kernel_512), cudaFuncAttributeMaxDynamicSharedMemorySize, 96 * 1024);
+            cudaFuncSetAttribute(reinterpret_cast<void const*>(kernel_512),
+                cudaFuncAttributeMaxDynamicSharedMemorySize, fusedDynamicSmemBytes);
             s_attr_512 = true;
         }
 

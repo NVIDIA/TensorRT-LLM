@@ -144,15 +144,20 @@ void indexer_topk_decode(th::Tensor const& logits, th::Tensor const& seq_lens, t
     // Split-work aux buffers (used by the 2-launch and fused-split-work tiers;
     // also handed to GVR / single-block / insertion-sort paths as zero-sized
     // placeholders). The buffers are always fp32 regardless of input dtype.
-    constexpr auto multipleBlocksPerRowConfig = 10;
+    // The 2-launch tier uses a fixed 10 blocks/row; the fused tier bumps the
+    // count at very-low-bs corners and exposes the chosen value through
+    // `indexerTopKDecodeFusedAuxBlocksPerRow` so the buffer matches the
+    // kernel's actual writes.
     th::Tensor aux_indices = th::empty({0}, th::TensorOptions().dtype(th::kInt32).device(logits.device()));
     th::Tensor aux_logits = th::empty({0}, th::TensorOptions().dtype(th::kFloat32).device(logits.device()));
     if (num_columns >= splitWorkThreshold)
     {
-        aux_indices = th::empty({num_rows, multipleBlocksPerRowConfig, index_topk},
-            th::TensorOptions().dtype(th::kInt32).device(logits.device()));
-        aux_logits = th::empty({num_rows, multipleBlocksPerRowConfig, index_topk},
-            th::TensorOptions().dtype(th::kFloat32).device(logits.device()));
+        int const blocksPerRow
+            = doneCounterPtr != nullptr ? tk::indexerTopKDecodeFusedAuxBlocksPerRow(num_rows, num_columns) : 10;
+        aux_indices = th::empty(
+            {num_rows, blocksPerRow, index_topk}, th::TensorOptions().dtype(th::kInt32).device(logits.device()));
+        aux_logits = th::empty(
+            {num_rows, blocksPerRow, index_topk}, th::TensorOptions().dtype(th::kFloat32).device(logits.device()));
     }
 
     if (logits_dtype == at::ScalarType::Float)

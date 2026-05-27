@@ -88,6 +88,13 @@ void invokeIndexerTopKPrefill(float const* logits, int const* rowStarts, int con
     int const numRows, int const numColumns, int const stride0, int const stride1, int const topK = 2048,
     cudaStream_t const stream = 0);
 
+/// Per-row block count the fused split-work tier of invokeIndexerTopKDecode
+/// will use for this (numRows, numColumns). Defaults to 10; bumped at the
+/// very-low-bs / long-seq corners (bs=1/2/4/8). Callers should size
+/// outIndicesAux / outLogitsAux as `numRows × <returned> × topK` so the
+/// kernel's per-block writes stay in-bounds.
+int indexerTopKDecodeFusedAuxBlocksPerRow(int numRows, int numColumns);
+
 /// Returns true iff invokeIndexerTopKDecode would route to the GVR Heuristic
 /// kernel for this (numRows, numColumns, topK) triple, assuming valid preIdx
 /// is provided and stride1 == 1. Useful for callers that need to provision a
