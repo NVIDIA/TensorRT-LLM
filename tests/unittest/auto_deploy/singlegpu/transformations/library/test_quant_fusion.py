@@ -35,7 +35,11 @@ from tensorrt_llm._torch.auto_deploy.transform.library.fuse_rmsnorm_quant_nvfp4 
     FuseRMSNormQuantNVFP4,
 )
 from tensorrt_llm._torch.auto_deploy.transform.optimizer import InferenceOptimizer
-from tensorrt_llm._torch.auto_deploy.utils.node_utils import is_op
+from tensorrt_llm._torch.auto_deploy.utils.node_utils import (
+    collect_terminal_users_through_passthrough,
+    is_op,
+    unwrap_input_through_passthrough,
+)
 from tensorrt_llm._torch.auto_deploy.utils.quantization_utils import fp4_global_scale, fp8_scale
 
 
@@ -753,6 +757,33 @@ def test_get_out_dtype_str_returns_none_when_norm_meta_missing():
     assert _get_out_dtype_str(norm) is None
 
 
+def test_passthrough_helpers_handle_method_views_and_optional_dtype_cast():
+    graph = torch.fx.Graph()
+    x = graph.placeholder("x")
+    view = graph.call_method("reshape", args=(x, (2, 4)))
+    cast = graph.call_function(torch.ops.aten.to.dtype, args=(view, torch.bfloat16))
+    user = graph.call_function(torch.ops.aten.neg.default, args=(cast,))
+    graph.output(user)
+
+    source, post_nodes = unwrap_input_through_passthrough(view)
+    assert source is x
+    assert post_nodes == [view]
+
+    source, post_nodes = unwrap_input_through_passthrough(cast, allow_dtype_cast=True)
+    assert source is x
+    assert post_nodes == [cast, view]
+
+    terminal_users, traversal_ok = collect_terminal_users_through_passthrough(x)
+    assert traversal_ok
+    assert terminal_users == [cast]
+
+    terminal_users, traversal_ok = collect_terminal_users_through_passthrough(
+        x, allow_dtype_cast=True
+    )
+    assert traversal_ok
+    assert terminal_users == [user]
+
+
 def _make_nvfp4_graph_root(hidden_size=64):
     root = nn.Module()
     root.register_buffer("norm_weight", torch.empty(hidden_size, dtype=torch.bfloat16))
@@ -761,6 +792,21 @@ def _make_nvfp4_graph_root(hidden_size=64):
     root.register_buffer("weight_scale", torch.empty(128, 4, dtype=torch.uint8))
     root.register_buffer("alpha", torch.empty(1, dtype=torch.float32))
     return root
+
+
+def _get_fused_getitem(gm, fused_op, index):
+    matches = [
+        n
+        for n in gm.graph.nodes
+        if n.op == "call_function"
+        and n.target is operator.getitem
+        and len(n.args) == 2
+        and isinstance(n.args[0], torch.fx.Node)
+        and is_op(n.args[0], fused_op)
+        and n.args[1] == index
+    ]
+    assert len(matches) == 1
+    return matches[0]
 
 
 def test_fuse_gated_rmsnorm_quant_nvfp4_rewrites_graph():
@@ -798,6 +844,16 @@ def test_fuse_gated_rmsnorm_quant_nvfp4_rewrites_graph():
     assert any(is_op(n, torch.ops.auto_deploy.trtllm_nvfp4_prequant_linear) for n in gm.graph.nodes)
     assert not any(is_op(n, torch.ops.auto_deploy.torch_quant_nvfp4_linear) for n in gm.graph.nodes)
     assert not any(is_op(n, torch.ops.auto_deploy.triton_rmsnorm_gated) for n in gm.graph.nodes)
+    fp4_node = _get_fused_getitem(
+        gm, torch.ops.auto_deploy.trtllm_fused_gated_rmsnorm_quant_nvfp4, 0
+    )
+    scale_node = _get_fused_getitem(
+        gm, torch.ops.auto_deploy.trtllm_fused_gated_rmsnorm_quant_nvfp4, 1
+    )
+    assert tuple(fp4_node.meta["val"].shape) == (2, 32)
+    assert fp4_node.meta["val"].dtype == torch.uint8
+    assert tuple(scale_node.meta["val"].shape) == (512,)
+    assert scale_node.meta["val"].dtype == torch.uint8
 
 
 def test_fuse_gated_rmsnorm_quant_nvfp4_accepts_dtype_cast():
