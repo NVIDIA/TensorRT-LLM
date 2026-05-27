@@ -1038,9 +1038,9 @@ class Qwen3VisionModel(torch.nn.Module):
         # (head_dim=72) the gate misses and we fall through to the
         # PyTorch path, which broadcasts cos/sin over the chunked q/k.
         seq_len = hidden_states.shape[0]
-        rope_position_ids = torch.arange(seq_len, dtype=torch.int32, pin_memory=prefer_pinned()).to(
-            device=self.device, non_blocking=True
-        )
+        rope_position_ids = async_tensor_h2d(
+            torch.arange(seq_len, dtype=torch.int32),
+            dtype=torch.int32, device=self.device)
         position_embeddings = (cos, sin)
 
         deepstack_feature_lists = []
