@@ -141,23 +141,26 @@ void indexer_topk_decode(th::Tensor const& logits, th::Tensor const& seq_lens, t
     int32_t splitWorkThreshold = 200 * 1000;
     auto stream = at::cuda::getCurrentCUDAStream(logits.get_device());
 
-    // Split-work aux buffers (used by the 2-launch and fused-split-work tiers;
-    // also handed to GVR / single-block / insertion-sort paths as zero-sized
-    // placeholders). The buffers are always fp32 regardless of input dtype.
-    // The 2-launch tier uses a fixed 10 blocks/row; the fused tier bumps the
-    // count at very-low-bs corners and exposes the chosen value through
-    // `indexerTopKDecodeFusedAuxBlocksPerRow` so the buffer matches the
-    // kernel's actual writes.
+    // Split-work aux buffers + done-counter, sized via the kernel's
+    // per-row block-count helper so part-1 writes stay in bounds. Allocated
+    // only when split-work is reachable (numColumns >= splitWorkThreshold);
+    // GVR / single-block paths see zero-sized placeholders.
     th::Tensor aux_indices = th::empty({0}, th::TensorOptions().dtype(th::kInt32).device(logits.device()));
     th::Tensor aux_logits = th::empty({0}, th::TensorOptions().dtype(th::kFloat32).device(logits.device()));
+    th::Tensor done_counter_internal;
     if (num_columns >= splitWorkThreshold)
     {
-        int const blocksPerRow
-            = doneCounterPtr != nullptr ? tk::indexerTopKDecodeFusedAuxBlocksPerRow(num_rows, num_columns) : 10;
+        int const blocksPerRow = tk::indexerTopKDecodeFusedAuxBlocksPerRow(num_rows, num_columns);
         aux_indices = th::empty(
             {num_rows, blocksPerRow, index_topk}, th::TensorOptions().dtype(th::kInt32).device(logits.device()));
         aux_logits = th::empty(
             {num_rows, blocksPerRow, index_topk}, th::TensorOptions().dtype(th::kFloat32).device(logits.device()));
+        if (doneCounterPtr == nullptr)
+        {
+            done_counter_internal
+                = th::zeros({num_rows}, th::TensorOptions().dtype(th::kInt32).device(logits.device()));
+            doneCounterPtr = done_counter_internal.data_ptr<int32_t>();
+        }
     }
 
     if (logits_dtype == at::ScalarType::Float)

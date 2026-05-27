@@ -27,34 +27,30 @@ TRTLLM_NAMESPACE_BEGIN
 
 namespace kernels
 {
-/// Indexer TopK decode — GVR ↔ TPR dispatcher with five fallback tiers, all
+/// Indexer TopK decode — GVR ↔ TPR dispatcher with four tiers, all
 /// available for fp32, bf16, and fp16 inputs:
-///   - GVR Heuristic      (preIdx provided, numColumns > 16384 ∧ numRows > 32, K ∈ {512,1024,2048})
+///   - GVR Heuristic      (preIdx provided, numRows >= 64 ∧ numColumns >= 32768, K ∈ {512,1024,2048})
 ///   - Multi-pass radix   (scratch provided, low-bs/long-seq corner; opt-in)
-///   - Insertion sort     (N < kSortingAlgorithmThreshold, see .cu file)
-///   - Single-block radix (kSortingAlgorithmThreshold ≤ N < splitWork)
-///   - Split-work radix   (N ≥ splitWork — uses outLogitsAux / outIndicesAux,
-///                         which stay fp32 regardless of input dtype.
-///                         Fused single-launch when doneCounterScratch != nullptr,
-///                         else legacy 2-launch part1 + part2.)
+///   - Single-block adaptive (numColumns < splitWork — sort algorithm picked
+///                            at runtime inside topKPerRowJob)
+///   - Fused split-work   (numColumns ≥ splitWork — single launch, last block
+///                         per row performs an in-kernel merge over per-block
+///                         top-K aux. Requires doneCounterScratch (one int
+///                         per row, zero-initialized). outLogitsAux /
+///                         outIndicesAux stay fp32 regardless of input dtype.)
 ///
 /// All TPR-family kernels accept `InputT` (fp32 / bf16 / fp16); logits are
 /// cast to float at HBM-read sites and the histogram/sort run on float keys.
-/// Aux buffers (`outLogitsAux` for split-work, `scratch` for multi-pass radix)
-/// stay fp32 across all three entries.
 ///
 /// Optional buffers (defaults preserve original behavior):
-///   - doneCounterScratch: one int per row, zero-initialized. When provided,
-///     the N ≥ splitWork tier uses a fused single-launch variant where the
-///     last block in each row performs an in-kernel merge. Up to 20% faster
-///     than the 2-launch part1+part2 path on H100/B200 for typical BS×N
-///     shapes (BS≥1, N≥splitWork).
+///   - doneCounterScratch: one int per row, zero-initialized. Required by the
+///     fused split-work tier; pass nullptr if numColumns < splitWork.
 ///   - scratch / scratchBytes: optional uint8 scratch for the multi-pass
 ///     radix path used at low-bs / long-seq decode shapes
-///     (BS≤32 / N≥65k, BS≤64 / N≥131k, BS≤256 / N≥524k). When non-null AND
-///     !is_prefill AND the shape is in the multi-pass-radix-eligible zone,
-///     the kernel uses this path instead of the single-block radix.
-///     Required size can be queried via `indexerTopKDecodeScratchBytes`.
+///     (BS≤32 / N≥65k, BS≤64 / N≥131k). When non-null AND !is_prefill AND
+///     the shape is in the multi-pass-radix-eligible zone, the kernel uses
+///     this path instead of the single-block radix. Required size can be
+///     queried via `indexerTopKDecodeScratchBytes`.
 ///   - is_prefill: hint that the actual rows are tiny (lengths = [1..bs]).
 ///     Suppresses the multi-pass radix path; the fused / single-block paths'
 ///     short-row short-circuit handles tiny rows faster.
@@ -102,7 +98,7 @@ int indexerTopKDecodeFusedAuxBlocksPerRow(int numRows, int numColumns);
 ///
 /// The rule is identical for fp32 / bf16 / fp16 (all TPR tiers are
 /// InputT-templated): GVR is preferred when K ∈ {512, 1024, 2048} AND
-/// numColumns > 16384 AND numRows > 32.
+/// numColumns >= 32768 AND numRows >= 64.
 ///
 /// @param numRows       logits rows (batch · next_n)
 /// @param numColumns    logits columns (max sequence length)

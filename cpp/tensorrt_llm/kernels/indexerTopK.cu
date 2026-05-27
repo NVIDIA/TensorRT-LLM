@@ -865,16 +865,13 @@ namespace
 // Eligibility (require !is_prefill): three nested tiers where the
 // single-block radix-final pass and the fused last-block-merge kernel both
 // under-use the GPU.
-//   inner: bs ≤  32 / seq ≥  65k
-//   mid  : bs ≤  64 / seq ≥ 131k
-//   high : bs ≤ 256 / seq ≥ 524k
+//   inner: bs ≤ 32 / seq ≥  65k
+//   mid  : bs ≤ 64 / seq ≥ 131k
 // ===========================================================================
 static constexpr int kMultiPassRadixLowMaxRows = 32;
 static constexpr int kMultiPassRadixLowMinSeqLen = 65536;
 static constexpr int kMultiPassRadixMidMaxRows = 64;
 static constexpr int kMultiPassRadixMidMinSeqLen = 131072;
-static constexpr int kMultiPassRadixHighMaxRows = 256;
-static constexpr int kMultiPassRadixHighMinSeqLen = 524288;
 
 static constexpr int kRadixBins = 2048;
 
@@ -883,8 +880,6 @@ static inline bool multi_pass_radix_eligible(int numRows, int numColumns)
     if (numRows <= kMultiPassRadixLowMaxRows && numColumns >= kMultiPassRadixLowMinSeqLen)
         return true;
     if (numRows <= kMultiPassRadixMidMaxRows && numColumns >= kMultiPassRadixMidMinSeqLen)
-        return true;
-    if (numRows <= kMultiPassRadixHighMaxRows && numColumns >= kMultiPassRadixHighMinSeqLen)
         return true;
     return false;
 }
@@ -1327,35 +1322,21 @@ void invokeIndexerTopKDecodeImpl(InputT const* logits, int const* seqLens, int* 
 
     // kSortingAlgorithmThreshold no longer selects the final-sort algorithm
     // (that's runtime now — see the sort-selection block in topKPerRowJob).
-    // It now gates the CTA-width choice inside the single-block tier between
-    // a 256-thread "narrow" block (more occupancy, used when the per-row scan
+    // Gates the CTA-width choice inside the single-block tier between a
+    // 256-thread "narrow" block (more occupancy, used when the per-row scan
     // is short) and a 512-thread "wide" block (more per-row parallelism).
-    // The numRows + is_prefill aware thresholds are kept from the previous
-    // insertion-vs-radix tuning since they correspond to the same shape
-    // boundaries where narrow CTAs stay profitable.
-    //
-    //   is_prefill:           per-row work is bounded by the small (1..bs)
-    //                         row lengths the prefill harness emits, so the
-    //                         inner short-row short-circuit handles it; lift
-    //                         the threshold out of the way so the narrow
-    //                         block stays in use.
-    //   numRows >= 4096:      narrow block stretches up to the split-work
-    //                         boundary; the cheap path saturates the GPU.
-    //   numRows >= 1024:      narrow block to 100k (covers seq~64k-98k).
-    //   else:                 12288 (upstream default).
-    int const kSortingAlgorithmThreshold = is_prefill ? (1 << 30)
-        : (numRows >= 4096)                           ? 200 * 1000
-        : (numRows >= 1024)                           ? 100 * 1000
-                                                      : 12288;
+    // High-bs tiers were dropped because GVR owns numRows >= 64 ∧
+    // numColumns >= 32k; for the remaining shapes the upstream default
+    // 12288 is correct.
+    int const kSortingAlgorithmThreshold = is_prefill ? (1 << 30) : 12288;
     // Split-work tier cutoff: callers can still override with `splitWorkThreshold > 0`.
-    //   numRows >= 128:       single-block always saturates; never split.
-    //   numRows >= 64:        single-block to ~524k.
     //   numRows > 8:          200k (upstream default).
     //   numRows <= 8:         fused split-work earlier (65k) — low-bs path
     //                         under-uses the GPU otherwise.
+    // The high-bs tiers were dropped: bs >= 64 with seq >= 32k is owned by
+    // GVR; bs >= 64 with seq < 32k always falls into single-block (32k <
+    // 200k).
     int const adaptiveSplitWorkThreshold = is_prefill ? (1 << 30)
-        : (numRows >= 128)                            ? (1 << 30)
-        : (numRows >= 64)                             ? 524 * 1024
         : (numRows > 8)                               ? 200 * 1000
                                                       : 65 * 1024;
     int const effectiveSplitWorkThreshold = splitWorkThreshold > 0 ? splitWorkThreshold : adaptiveSplitWorkThreshold;
@@ -1371,19 +1352,12 @@ void invokeIndexerTopKDecodeImpl(InputT const* logits, int const* seqLens, int* 
         && (static_cast<int64_t>(numRows) * numColumns >= (4LL << 20))
         && (numColumns < kSortingAlgorithmThreshold);
 
-    // GVR ↔ TPR routing rule (applies to fp32, bf16, fp16 alike now that all
-    // TPR tiers are InputT-templated):
-    //   numColumns <= 16384  → TPR (small-N: GVR's fixed Phase-1/4 overhead
-    //                                ~11 µs dominates; insertion / single-block
-    //                                radix wins. 16K itself stays on TPR.)
-    //   numRows    <= 32     → TPR (low-BS: GVR can't recoup setup at any N;
-    //                                also keeps the multi-pass radix path
-    //                                eligibility zone (BS ≤ 32) reachable.)
-    //   otherwise            → GVR (when its eligibility predicate also holds;
-    //                                otherwise fall through to TPR).
+    // GVR ↔ TPR routing rule: GVR for bs >= 64 ∧ seq >= 32k (its
+    // fixed-overhead Phase-1/4 pays back at this size). Everything below
+    // falls through to TPR (single-block or fused split-work).
     bool const isSupportedTopK = (topK == 512 || topK == 1024 || topK == 2048);
     bool const canUseHeuristic = preIdx != nullptr && stride1 == 1 && isSupportedTopK && preIdxCount == topK
-        && preIdxStride >= preIdxCount && heuristicScratch != nullptr && numColumns > 16384 && numRows > 32;
+        && preIdxStride >= preIdxCount && heuristicScratch != nullptr && numColumns >= 32768 && numRows >= 64;
 
     // Optional env-gated dispatch trace (set TRTLLM_SCHEMEX_DEBUG=1 to enable)
     {
@@ -1452,19 +1426,19 @@ void invokeIndexerTopKDecodeImpl(InputT const* logits, int const* seqLens, int* 
                 kNumThreadsPerBlock);
         }
     }
-    else if (doneCounterScratch != nullptr)
+    else
     {
         // Fused multi-block path: per-block top-k followed by last-block
         // in-kernel merge via a global atomic counter on doneCounterScratch.
-        // Single launch replaces the two-launch part1+part2 split-work below.
         //
         // numBlocksPerRow defaults to 10; bumped at the very-low-bs corners
         // where 10 blocks/row leaves the GPU under-filled. The merge phase
         // processes (numBlocksPerRow * topK) candidates in a single block, so
         // we never bump past where the merge would dominate. Cutoffs below
         // come from the mid-long-decode sweep.
-        TLLM_CHECK_WITH_INFO(outLogitsAux != nullptr && outIndicesAux != nullptr,
-            "Fused split-work path requires both outLogitsAux and outIndicesAux to be non-null.");
+        TLLM_CHECK_WITH_INFO(
+            outLogitsAux != nullptr && outIndicesAux != nullptr && doneCounterScratch != nullptr,
+            "Split-work path requires outLogitsAux, outIndicesAux, and doneCounterScratch to be non-null.");
         int const numBlocksPerRow = indexerTopKDecodeFusedAuxBlocksPerRow(numRows, numColumns);
 
         // 1024-thread variant wins once per-block scan is large enough to
@@ -1521,49 +1495,6 @@ void invokeIndexerTopKDecodeImpl(InputT const* logits, int const* seqLens, int* 
         else
             cudaLaunchKernelEx(&config, kernel_512, logits, seqLens, indices, outIndicesAux, outLogitsAux,
                 doneCounterScratch, stride0, stride1, topK, next_n, numBlocksPerRow);
-    }
-    else
-    {
-        // Long sequences are run in two steps.
-        TLLM_CHECK_WITH_INFO(outLogitsAux != nullptr && outIndicesAux != nullptr,
-            "Split-work path requires both outLogitsAux and outIndicesAux to be non-null.");
-        constexpr auto multipleBlocksPerRowConfig = 10;
-        // Part 1: reads InputT logits, writes per-block top-K into the fp32
-        // aux buffers (outLogitsAux / outIndicesAux).
-        auto* kernel_instance_part1
-            = &topKPerRowDecode<kNumThreadsPerBlock, /*multipleBlocksPerRow=*/true,
-                /*mergeBlocks=*/false, InputT>;
-        cudaLaunchConfig_t config_part1;
-        config_part1.gridDim = dim3(numRows, multipleBlocksPerRowConfig);
-        config_part1.blockDim = kNumThreadsPerBlock;
-        config_part1.dynamicSmemBytes = 2 * topK * sizeof(int32_t);
-        config_part1.stream = stream;
-        cudaLaunchAttribute attrs[1];
-        attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
-        attrs[0].val.programmaticStreamSerializationAllowed = tensorrt_llm::common::getEnvEnablePDL();
-        config_part1.numAttrs = 1;
-        config_part1.attrs = attrs;
-
-        cudaLaunchKernelEx(&config_part1, kernel_instance_part1, logits, seqLens, outIndicesAux, stride0, stride1, topK,
-            next_n, outLogitsAux, 0, nullptr);
-
-        // Part 2 (merge): reads the fp32 aux buffer as its "logits" input, so
-        // it always runs with InputT=float regardless of the original input
-        // dtype.
-        constexpr int kNumThreadsPerBlockMerge = 1024;
-        auto* kernel_instance_part2 = &topKPerRowDecode<kNumThreadsPerBlockMerge,
-            /*multipleBlocksPerRow=*/false, /*mergeBlocks=*/true>;
-        cudaLaunchConfig_t config_part2;
-        config_part2.gridDim = numRows;
-        config_part2.blockDim = kNumThreadsPerBlockMerge;
-        config_part2.dynamicSmemBytes = topK * sizeof(int32_t);
-        config_part2.stream = stream;
-        // Reuse attrs array since part1 kernel has already been launched
-        config_part2.numAttrs = 1;
-        config_part2.attrs = attrs;
-
-        cudaLaunchKernelEx(&config_part2, kernel_instance_part2, outLogitsAux, seqLens, indices,
-            multipleBlocksPerRowConfig * topK, 1, topK, next_n, nullptr, multipleBlocksPerRowConfig, outIndicesAux);
     }
     sync_check_cuda_error(stream);
 }
@@ -1643,7 +1574,7 @@ bool canIndexerTopKDecodeUseGvr(int numRows, int numColumns, int topK, int /*byt
     {
         return false;
     }
-    return numColumns > 16384 && numRows > 32;
+    return numColumns >= 32768 && numRows >= 64;
 }
 
 } // namespace kernels
