@@ -794,12 +794,20 @@ class ADEngine(ModelEngine):
         )
         self.iter_counter += 1
 
-        # Compute DP-aware max(total_num_tokens) and write to BatchInfo slot 13.
-        # Mirrors base TRT-LLM's pattern in `model_engine._get_all_rank_num_tokens`:
-        # MoE all-to-all needs the cross-rank max to size dispatch padding without
-        # over-padding to the static config max_num_tokens. nest_sequences already
-        # initialized slot 13 to the local total_num_tokens; this overrides with
-        # the cross-rank max only when attention-DP requires it.
+        # Per-forward DP-rank sync barrier, structured as the
+        # ``model_engine._get_all_rank_num_tokens`` pattern so the slot-13 write
+        # remains a drop-in if a future MoE alltoall path wants the cross-rank max.
+        #
+        # As of commit ``5504cf859c`` the MoE alltoall stopped over-padding ``x``,
+        # so ``runtime_max_tokens_per_rank`` is now always the static
+        # ``max_num_tokens`` and slot 13 has no on-path consumer. The collective
+        # is intentionally kept anyway: empirically it acts as a per-iter cross-
+        # rank barrier, and dropping it costs significant throughput (measured
+        # c=8 OTPS -38%, c=32 -13% on NVFP4 SuperV3 MTP+ADP). The barrier appears
+        # to be papering over serialization in the captured MoE alltoall path
+        # under rank drift. If a cheaper explicit barrier is identified, this
+        # call can be replaced; until then the small per-iter MPI cost is the
+        # better trade.
         if self.enable_attention_dp and self.dist_config.tp_size > 1:
             assert self.dist is not None, "Distributed object is required for attention DP mode"
             info = self.cache_seq_interface.info
