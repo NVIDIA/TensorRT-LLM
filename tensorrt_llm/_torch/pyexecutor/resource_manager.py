@@ -2510,8 +2510,13 @@ class KVCacheManagerV2(BaseResourceManager):
                 # the input tokens to look up for the block that can be reused.
                 if self.enable_block_reuse:
                     all_tokens = req.get_tokens(DEFAULT_BEAM_INDEX)
+                    lookup_end = len(all_tokens) - 1
+                    if (req.is_generation_only_request()
+                            and req.sampling_config.beam_width > 1):
+                        lookup_end = (lookup_end //
+                                      self.tokens_per_block) * self.tokens_per_block
                     tokens = self._augment_tokens_for_block_reuse(
-                        all_tokens, req, end=len(all_tokens) - 1)
+                        all_tokens, req, end=lookup_end)
                 else:
                     tokens = None
                 kv_cache = self._create_kv_cache(req.py_request_id,

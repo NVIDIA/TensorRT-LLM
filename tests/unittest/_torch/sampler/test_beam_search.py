@@ -83,6 +83,13 @@ def with_cuda_graph_and_overlap(request):
 
 
 def _build_llm(fixed_params, input_prompts, llm_kwargs: dict[str, Any]):
+    llm_kwargs = llm_kwargs.copy()
+    kv_cache_config = llm_kwargs.pop(
+        "kv_cache_config",
+        KvCacheConfig(
+            max_tokens=10000,  # pyright: ignore
+        ),
+    )
     if "max_batch_size" not in llm_kwargs:
         llm_kwargs = llm_kwargs | dict(
             max_batch_size=fixed_params["max_beam_width"] * len(
@@ -91,9 +98,7 @@ def _build_llm(fixed_params, input_prompts, llm_kwargs: dict[str, Any]):
         )
     return LLM(
         **llm_kwargs,
-        kv_cache_config=KvCacheConfig(
-            max_tokens=10000,  # pyright: ignore
-        ),
+        kv_cache_config=kv_cache_config,
         max_seq_len=32,
         max_beam_width=fixed_params["max_beam_width"],
     )
@@ -500,6 +505,10 @@ def test_beam_search_disagg_e2e(
     disagg_kwargs |= dict(
         disable_overlap_scheduler=True,
         cuda_graph_config=None,
+        kv_cache_config=KvCacheConfig(max_tokens=10000,
+                                      enable_block_reuse=True,
+                                      enable_partial_reuse=True,
+                                      use_kv_cache_manager_v2=True),
         cache_transceiver_config=CacheTransceiverConfig(
             backend="NIXL",
             transceiver_runtime="PYTHON",
@@ -508,12 +517,17 @@ def test_beam_search_disagg_e2e(
         ),
     )
 
-    ctx_llm = _build_llm(fixed_params, input_prompts, disagg_kwargs)
-    gen_llm = _build_llm(fixed_params, input_prompts, disagg_kwargs)
+    partial_reuse_prompts = [[1, 2, 3], [1, 5, 6]]
+
+    ctx_llm = _build_llm(fixed_params, partial_reuse_prompts, disagg_kwargs)
+    gen_llm = _build_llm(fixed_params, partial_reuse_prompts, disagg_kwargs)
     try:
         with ctx_llm, gen_llm:
             validate_disagg_outputs(ctx_llm, gen_llm,
-                                    input_prompts[:1],
+                                    partial_reuse_prompts[:1],
+                                    sampling_params)
+            validate_disagg_outputs(ctx_llm, gen_llm,
+                                    partial_reuse_prompts[1:],
                                     sampling_params)
     finally:
         ctx_llm.shutdown()
