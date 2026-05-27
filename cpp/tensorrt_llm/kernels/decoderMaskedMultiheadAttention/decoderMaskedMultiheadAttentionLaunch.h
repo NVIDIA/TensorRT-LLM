@@ -15,6 +15,7 @@
  */
 #pragma once
 
+#include "cascadeAttentionKernel.h"
 #include "decoderMaskedMultiheadAttentionTemplate.h"
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/config.h"

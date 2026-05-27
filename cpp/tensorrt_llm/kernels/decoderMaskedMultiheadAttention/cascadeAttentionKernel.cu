@@ -331,6 +331,15 @@ __global__ void cascade_prefix_mqa_kernel(Multihead_attention_params<T, false> p
     int const* __restrict__ d_input_lengths, float* __restrict__ partial_out, float* __restrict__ partial_m,
     float* __restrict__ partial_l)
 {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
+    if (blockIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0 && threadIdx.x == 0 && threadIdx.y == 0
+        && threadIdx.z == 0)
+    {
+        printf("cascade_prefix_mqa_kernel: requires SM_80+ but launched on an unsupported device.\n");
+        __trap();
+    }
+    return;
+#else
     using Cfg = CascadeConfig<Dh>;
     constexpr int THDS = Cfg::THDS_PER_BLOCK;    // 128
     constexpr int BEAM_TILE = Cfg::BEAM_TILE;    // 16
@@ -739,6 +748,7 @@ __global__ void cascade_prefix_mqa_kernel(Multihead_attention_params<T, false> p
             }
         }
     }
+#endif // __CUDA_ARCH__ < 800
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -763,6 +773,15 @@ __global__ void cascade_suffix_decode_kernel(Multihead_attention_params<T, false
     int const* __restrict__ d_input_lengths, float const* __restrict__ partial_out_p,
     float const* __restrict__ partial_m_p, float const* __restrict__ partial_l_p)
 {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
+    if (blockIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0 && threadIdx.x == 0 && threadIdx.y == 0
+        && threadIdx.z == 0)
+    {
+        printf("cascade_suffix_decode_kernel: requires SM_80+ but launched on an unsupported device.\n");
+        __trap();
+    }
+    return;
+#else
     using Cfg = CascadeConfig<Dh>;
     constexpr int THDS = Cfg::THDS_PER_BLOCK;
 
@@ -995,6 +1014,7 @@ __global__ void cascade_suffix_decode_kernel(Multihead_attention_params<T, false
 
     int const out_offset = seq * num_heads * Dh + head_idx * Dh + tid;
     reinterpret_cast<T*>(params.out)[out_offset] = from_float<T>(out_val);
+#endif // __CUDA_ARCH__ < 800
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -1026,6 +1046,28 @@ bool cascade_eligible(KernelParamsType const& params)
             TLLM_LOG_WARNING("cascade_eligible REJECT: TRTLLM_ENABLE_CASCADE_MMHA not set or =0");
         }
         return false;
+    }
+    {
+        static std::atomic<int> cached_sm{-1};
+        int sm = cached_sm.load(std::memory_order_relaxed);
+        if (sm < 0)
+        {
+            sm = tensorrt_llm::common::getSMVersion();
+            cached_sm.store(sm, std::memory_order_relaxed);
+        }
+        if (sm < 80)
+        {
+            static std::atomic<bool> once{false};
+            bool exp = false;
+            if (once.compare_exchange_strong(exp, true))
+            {
+                TLLM_LOG_WARNING(
+                    "cascade_eligible REJECT: device SM=%d < 80 (cascade kernels require mma.m16n8k16 / cp.async, "
+                    "Ampere or newer)",
+                    sm);
+            }
+            return false;
+        }
     }
     if (params.position_shift_enabled || params.block_sparse_attention)
     {
