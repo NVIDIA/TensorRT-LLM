@@ -19,7 +19,10 @@ from tensorrt_llm.bindings.executor import FinishReason
 @pytest.mark.parametrize(
     "req,expected",
     [
-        (SimpleNamespace(multimodal_lengths=[3, 5]), None),
+        (
+            SimpleNamespace(multimodal_lengths=[3, 5], py_multimodal_data=None),
+            None,
+        ),
         (
             SimpleNamespace(
                 multimodal_lengths=[6, 5],
@@ -109,9 +112,13 @@ def test_multimodal_embedding_lengths_rejects_invalid_metadata(req, exception, m
 class _FakePyResult:
     def __init__(self):
         self.mm_embeddings = []
+        self.mrope_position = None
 
     def append_mm_embeddings(self, mm_embedding, mm_embedding_lengths):
         self.mm_embeddings.append((mm_embedding, mm_embedding_lengths))
+
+    def set_mrope_position(self, position_ids, position_deltas):
+        self.mrope_position = (position_ids, position_deltas)
 
 
 class _FakeRequest:
@@ -136,7 +143,10 @@ def test_mm_encoder_sampler_aligns_mixed_batch_by_request_index():
             mm_embeddings=[torch.ones(4, 2)],
             mm_embedding_request_indices=[1],
             mm_embedding_lengths=[[4]],
-            extra_data={},
+            extra_data={
+                "mrope_position_ids": ["text-pos", "mm-pos"],
+                "mrope_position_deltas": ["text-delta", "mm-delta"],
+            },
         ),
     )
 
@@ -150,6 +160,8 @@ def test_mm_encoder_sampler_aligns_mixed_batch_by_request_index():
     [(mm_embedding, mm_embedding_lengths)] = mm_request.py_result.mm_embeddings
     assert mm_embedding.shape == (4, 2)
     assert mm_embedding_lengths == [4]
+    assert text_request.py_result.mrope_position is None
+    assert mm_request.py_result.mrope_position == ("mm-pos", "mm-delta")
 
 
 def test_py_result_mm_embedding_handles_use_shared_tensor_handles():
@@ -195,20 +207,27 @@ class _FakeScheduledRequests:
 def test_mm_encoder_sampler_builds_typed_result_from_model_outputs():
     """Sampler converts raw model-output dicts into typed MM results."""
     sampler = EarlyStopWithMMResult()
+    model_outputs = {
+        "mm_embeddings": [torch.ones(4, 2)],
+        "mm_embedding_request_indices": [1],
+        "mm_embedding_lengths": [[4]],
+        "mrope_position_ids": ["pos"],
+    }
     state = sampler.sample_async(
         _FakeScheduledRequests(2),
-        {
-            "mm_embeddings": [torch.ones(4, 2)],
-            "mm_embedding_request_indices": [1],
-            "mm_embedding_lengths": [[4]],
-            "mrope_position_ids": ["pos"],
-        },
+        model_outputs,
         [],
     )
 
     assert state.data.mm_embedding_request_indices == [1]
     assert state.data.mm_embedding_lengths == [[4]]
     assert state.data.extra_data == {"mrope_position_ids": ["pos"]}
+    assert set(model_outputs) == {
+        "mm_embeddings",
+        "mm_embedding_request_indices",
+        "mm_embedding_lengths",
+        "mrope_position_ids",
+    }
 
 
 def test_mm_encoder_sampler_rejects_typed_result_batch_mismatch():

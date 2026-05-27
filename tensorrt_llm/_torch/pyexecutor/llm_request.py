@@ -950,9 +950,10 @@ def _validate_optional_int_list(values: Any,
     return values
 
 
-def get_multimodal_embedding_lengths(request: Any) -> Optional[List[int]]:
+def get_multimodal_embedding_lengths(
+        request: LlmRequest) -> Optional[List[int]]:
     """Return explicit per-item encoder-output lengths for a multimodal request."""
-    py_multimodal_data = getattr(request, "py_multimodal_data", None)
+    py_multimodal_data = request.py_multimodal_data
     if py_multimodal_data is not None and not isinstance(
             py_multimodal_data, dict):
         raise TypeError("py_multimodal_data must be a dict")
@@ -967,7 +968,7 @@ def get_multimodal_embedding_lengths(request: Any) -> Optional[List[int]]:
 
     if any(length < 0 for length in multimodal_embedding_lengths):
         raise ValueError("multimodal_embedding_lengths must be non-negative")
-    multimodal_lengths = getattr(request, "multimodal_lengths", None)
+    multimodal_lengths = request.multimodal_lengths
     if multimodal_lengths is not None:
         if len(multimodal_embedding_lengths) != len(multimodal_lengths):
             raise ValueError("multimodal_embedding_lengths length must match "

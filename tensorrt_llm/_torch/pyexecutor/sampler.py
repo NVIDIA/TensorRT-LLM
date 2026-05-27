@@ -291,37 +291,61 @@ class EarlyStopSampler(Sampler[SampleState[SampleStateTensors, SampleStateTensor
 @dataclass(kw_only=True)
 class MultimodalResult:
     mm_embeddings: List[torch.Tensor]
+    # needed to torch.split the mm_embeddings into item-wise chunks
     mm_embedding_lengths: List[List[int]]
+    # needed when requests mix text-only and multimodal ones
     mm_embedding_request_indices: List[int]
     # Can be used to include e.g. `mrope_position_ids`, etc.
     extra_data: Optional[Dict[str, Any]] = None
 
     def __post_init__(self) -> None:
-        if len(self.mm_embedding_lengths) != len(self.mm_embeddings):
-            raise ValueError("mm_embedding_lengths batch size does not match mm_embeddings")
-        if len(self.mm_embedding_request_indices) != len(self.mm_embeddings):
-            raise ValueError("mm_embedding_request_indices batch size does not match mm_embeddings")
-        for mm_embedding, mm_embedding_lengths in zip(
-            self.mm_embeddings, self.mm_embedding_lengths
+        num_embeddings = len(self.mm_embeddings)
+        num_lengths = len(self.mm_embedding_lengths)
+        if num_lengths != num_embeddings:
+            raise ValueError(
+                "mm_embedding_lengths batch size does not match mm_embeddings: "
+                f"{num_lengths} != {num_embeddings}"
+            )
+        num_request_indices = len(self.mm_embedding_request_indices)
+        if num_request_indices != num_embeddings:
+            raise ValueError(
+                "mm_embedding_request_indices batch size does not match "
+                f"mm_embeddings: {num_request_indices} != {num_embeddings}"
+            )
+        for result_index, (mm_embedding, mm_embedding_lengths) in enumerate(
+            zip(self.mm_embeddings, self.mm_embedding_lengths, strict=True)
         ):
-            if len(mm_embedding) != sum(mm_embedding_lengths):
+            actual_rows = len(mm_embedding)
+            expected_rows = sum(mm_embedding_lengths)
+            if actual_rows != expected_rows:
                 raise ValueError(
-                    f"mm_embedding shape mismatch: {len(mm_embedding)} != {sum(mm_embedding_lengths)}"
+                    f"mm_embedding shape mismatch for result {result_index}: "
+                    f"{actual_rows} != {expected_rows}"
                 )
 
     @classmethod
     def from_model_outputs(
         cls, model_outputs: Dict[str, Any], num_context_requests: int
     ) -> "MultimodalResult":
+        result_keys = {
+            "mm_embeddings",
+            "mm_embedding_lengths",
+            "mm_embedding_request_indices",
+        }
         result = cls(
-            mm_embeddings=model_outputs.pop("mm_embeddings"),
-            mm_embedding_lengths=model_outputs.pop("mm_embedding_lengths"),
-            mm_embedding_request_indices=model_outputs.pop("mm_embedding_request_indices"),
-            extra_data={**model_outputs},
+            mm_embeddings=model_outputs["mm_embeddings"],
+            mm_embedding_lengths=model_outputs["mm_embedding_lengths"],
+            mm_embedding_request_indices=model_outputs["mm_embedding_request_indices"],
+            extra_data={
+                key: value for key, value in model_outputs.items() if key not in result_keys
+            },
         )
         for request_index in result.mm_embedding_request_indices:
             if request_index < 0 or request_index >= num_context_requests:
-                raise ValueError("mm_embedding_request_indices contains an invalid request index")
+                raise ValueError(
+                    "mm_embedding_request_indices contains an invalid request "
+                    f"index: {request_index} not in [0, {num_context_requests})"
+                )
         return result
 
 
@@ -392,7 +416,7 @@ class EarlyStopWithMMResult(Sampler[SampleStateWithMMResult]):
 
         request_indices = state.data.mm_embedding_request_indices
         for result_index, (request_index, mm_embedding) in enumerate(
-            zip(request_indices, mm_embeddings)
+            zip(request_indices, mm_embeddings, strict=True)
         ):
             request = requests[request_index]
             mm_embedding_lengths = state.data.mm_embedding_lengths[result_index]
@@ -402,7 +426,8 @@ class EarlyStopWithMMResult(Sampler[SampleStateWithMMResult]):
             # Store mrope data if available
             if mrope_position_ids is not None and mrope_position_deltas is not None:
                 request.py_result.set_mrope_position(
-                    mrope_position_ids[result_index], mrope_position_deltas[result_index]
+                    mrope_position_ids[request_index],
+                    mrope_position_deltas[request_index],
                 )
 
     @override
