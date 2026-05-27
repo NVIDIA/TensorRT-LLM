@@ -745,13 +745,16 @@ class Attention(nn.Module):
         # FP8/FP4 output and keeps attention output in BF16 for better
         # precision when applying pre_quant_scale. Also don't set out_scale
         # if LoRA is active — LoRA grouped_gemm doesn't support FP8.
-        # When ``output_sf`` is set the kernel writes NVFP4 output and reads
-        # ``input_scale`` as its scaling factor; otherwise it reads
-        # ``inv_input_scale``.
+        # Pass both scales; the backend selects ``out_scale_sf`` when the
+        # kernel writes NVFP4 output (``forward_args.output_sf`` is
+        # allocated downstream by ``create_output``) and ``out_scale``
+        # otherwise. Deciding here would be premature — ``output_sf`` is
+        # not populated yet at this call site.
         out_scale = None
+        out_scale_sf = None
         if self._use_quantize_output() and not has_lora:
-            out_scale = (self.o_proj.input_scale if output_sf is not None else
-                         self.o_proj.inv_input_scale)
+            out_scale = self.o_proj.inv_input_scale
+            out_scale_sf = self.o_proj.input_scale
 
         kv_scale_orig_quant = None
         kv_scale_quant_orig = None
@@ -767,6 +770,7 @@ class Attention(nn.Module):
             attn_metadata,
             forward_args=AttentionForwardArgs(
                 out_scale=out_scale,
+                out_scale_sf=out_scale_sf,
                 kv_scale_orig_quant=kv_scale_orig_quant,
                 kv_scale_quant_orig=kv_scale_quant_orig,
                 attention_mask=attention_mask,

@@ -38,6 +38,7 @@ _THOP_EXCLUDED_FIELDS: frozenset = frozenset({
     "topk_indices",  # DSA-only
     "is_generation",  # trtllm_gen dispatch flag
     "attention_mask_data",  # custom-mask code path
+    "out_scale_sf",  # promoted into ``out_scale`` in ``_run`` for NVFP4 path
 })
 
 # ``thop.attention`` kwargs hard-wired to a literal at the call site (no
@@ -1439,6 +1440,15 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
 
         if forward_args.attention_window_size is None:
             forward_args.attention_window_size = metadata.max_seq_len
+
+        # Promote ``out_scale_sf`` -> ``out_scale`` for the NVFP4-output path
+        # (kernel reads a single ``out_scale`` and interprets it as the SF
+        # quant scale when ``output_sf`` is allocated). ``output_sf`` is
+        # populated by ``create_output`` in ``forward`` above, so the
+        # decision is correct only here, not at the modules/attention.py
+        # call site where ``output_sf`` is always ``None``.
+        if forward_args.output_sf is not None and forward_args.out_scale_sf is not None:
+            forward_args.out_scale = forward_args.out_scale_sf
 
         helix_active = metadata.helix_position_offsets is not None
         use_sage_attn = (forward_args.sage_attn_num_elts_per_blk_q > 0

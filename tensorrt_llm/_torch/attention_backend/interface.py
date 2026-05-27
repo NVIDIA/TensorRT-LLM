@@ -716,6 +716,7 @@ class AttentionForwardArgs:
     output_sf: Optional[torch.Tensor] = None
 
     out_scale: Optional[torch.Tensor] = None
+    out_scale_sf: Optional[torch.Tensor] = None
     kv_scale_orig_quant: Optional[torch.Tensor] = None
     kv_scale_quant_orig: Optional[torch.Tensor] = None
 
