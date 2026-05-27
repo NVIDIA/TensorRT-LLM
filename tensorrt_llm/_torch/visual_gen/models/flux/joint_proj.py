@@ -1,5 +1,17 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
 from typing import Dict, Optional, Tuple
 
@@ -176,6 +188,9 @@ class FluxJointQKVMLPProj(nn.Module):
             self.local_qkv_dim = q_dim + 2 * kv_dim
             self.local_mlp_dim = mlp_dim
         else:
+            local_q_dim = q_dim // self.tp_size
+            local_kv_dim = kv_dim // self.tp_size
+            shard_mlp_hidden_dim = self.mlp_hidden_dim // self.tp_size
             # QKV: column-parallel with fused Q/K/V sharding
             self.qkv_proj = Linear(
                 in_dim,
@@ -189,9 +204,9 @@ class FluxJointQKVMLPProj(nn.Module):
                     weight_mode=WeightMode.FUSED_QKV_LINEAR,
                 ),
                 fused_weight_shard_indices_mapping={
-                    "q": (0, q_dim),
-                    "k": (q_dim, kv_dim),
-                    "v": (q_dim + kv_dim, kv_dim),
+                    "q": (0, local_q_dim),
+                    "k": (local_q_dim, local_kv_dim),
+                    "v": (local_q_dim + local_kv_dim, local_kv_dim),
                 },
                 mapping=mapping,
                 tensor_parallel_mode=TensorParallelMode.COLUMN,
@@ -210,8 +225,8 @@ class FluxJointQKVMLPProj(nn.Module):
                     weight_mode=WeightMode.FUSED_GATE_UP_LINEAR,
                 ),
                 fused_weight_shard_indices_mapping={
-                    "gate": (0, self.mlp_hidden_dim),
-                    "up": (self.mlp_hidden_dim, self.mlp_hidden_dim),
+                    "gate": (0, shard_mlp_hidden_dim),
+                    "up": (shard_mlp_hidden_dim, shard_mlp_hidden_dim),
                 },
                 mapping=mapping,
                 tensor_parallel_mode=TensorParallelMode.COLUMN,

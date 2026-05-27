@@ -336,7 +336,7 @@ class Flux2ParallelSelfAttention(FluxJointAttention):
 
         # Output projection needs FULL dims (ROW parallel divides internally)
         self.to_out = FluxJointAttnMLPProj(
-            attn_dim=self.kv_dim,
+            attn_dim=self.q_dim,
             mlp_dim=self.mlp_hidden_dim,
             out_dim=hidden_size,
             bias=bias,

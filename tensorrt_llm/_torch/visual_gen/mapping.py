@@ -143,7 +143,8 @@ class VisualGenMapping(DeviceMeshTopologyImpl):
         }
 
         if dist.is_initialized() and world_size > 1:
-            self.setup_communicators()
+            if self.tp_size > 1:
+                self.setup_communicators()
             self.build_mesh()
             self._build_vae_group()
 
