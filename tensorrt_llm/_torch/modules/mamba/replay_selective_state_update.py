@@ -180,16 +180,8 @@ def _replay_precompute_kernel(
             dt = dt + dt_bias
         if DT_SOFTPLUS:
             dt = softplus(dt)
-        # softplus guarantees dt >= 0 mathematically; sanitize Inf/NaN that
-        # could leak through if upstream activation drifted catastrophically.
-        dt = tl.where((dt == dt) & (tl.abs(dt) < 1e30), dt, 0.0)
 
         A = tl.load(A_ptr + head_idx * stride_A_head).to(tl.float32)
-        # SSM stability requires A < 0; sanitize Inf/NaN and clamp at 0 so
-        # dA_cumsum = cumsum(A * dt) stays <= 0 by construction, preventing
-        # exp(dA_cumsum) from overflowing to +Inf downstream.
-        A = tl.where((A == A) & (tl.abs(A) < 1e30), A, 0.0)
-        A = tl.minimum(A, 0.0)
         dA_cumsum = tl.cumsum(A * dt, axis=0)
         decay_vec = tl.exp(dA_cumsum)
 
@@ -235,11 +227,7 @@ def _replay_precompute_kernel(
     )
 
     # Compute raw CB once — shared across all heads in this block
-    raw_CB = tl.dot(
-        C_all.to(tl.float32),
-        tl.trans(B_all).to(tl.float32),
-        input_precision="ieee",
-    )
+    raw_CB = tl.dot(C_all.to(tl.bfloat16), tl.trans(B_all).to(tl.bfloat16))
 
     # Store B to cache (once per group, only if this block covers the first heads)
     if first_head % nheads_ngroups_ratio == 0:
@@ -282,8 +270,6 @@ def _replay_precompute_kernel(
         # Scale raw_CB with per-head decay and dt
         decay_matrix = tl.exp(dA_cumsum[:, None] - dA_cumsum[None, :])
         CB_scaled = tl.where(valid_mask, raw_CB * decay_matrix * dt[None, :], 0.0)
-        # Filter both NaN and Inf for the same reason as `coeff` above.
-        CB_scaled = tl.where((CB_scaled == CB_scaled) & (tl.abs(CB_scaled) < 1e30), CB_scaled, 0.0)
 
         cb_scaled_base = cb_scaled_ptr + pid_b * stride_cb_batch + head_idx * stride_cb_head
         tl.store(
@@ -435,10 +421,6 @@ def _replay_state_update_kernel(
     )
     state_mask = m_mask[:, None] & n_mask[None, :]
     state = tl.load(state_ptrs, mask=state_mask, other=0.0).to(tl.float32)
-    # Defensive sanitize: a prior step's fp16 store may have saturated to Inf
-    # (or rarely a NaN slipped through).  Reset such elements to zero so the
-    # corruption does not persist forever in this slot's SSM cache.
-    state = tl.where((state == state) & (tl.abs(state) < 65504.0), state, 0.0)
     prev_num_accepted_tokens = tl.load(prev_num_accepted_tokens_ptr + cache_batch_idx)
 
     # Phase 1: Replay via tl.dot fast-forward (reads from READ buffer)
@@ -454,14 +436,6 @@ def _replay_state_update_kernel(
     old_dt_all = tl.load(old_dt_base + offs_t * stride_old_dt_T, mask=t_mask, other=0.0).to(
         tl.float32
     )
-    # Sanitize Inf/NaN loaded from the dt cache.  A prior step could have
-    # stored junk if upstream activations drifted; without this, `coeff =
-    # exp(dA) * dt` propagates Inf into the state update.
-    old_dt_all = tl.where(
-        (old_dt_all == old_dt_all) & (tl.abs(old_dt_all) < 1e30),
-        old_dt_all,
-        0.0,
-    )
 
     old_dA_cumsum_base = (
         old_dA_cumsum_ptr
@@ -472,16 +446,6 @@ def _replay_state_update_kernel(
     old_dA_cumsum_all = tl.load(
         old_dA_cumsum_base + offs_t * stride_old_dA_cumsum_T, mask=t_mask, other=0.0
     ).to(tl.float32)
-    # dA_cumsum = sum of (A * dt) and A is required to be negative for SSM
-    # stability; sanitize Inf/NaN then clamp to <= 0 to keep
-    # `exp(total_dA_cumsum - old_dA_cumsum_all)` in the safe range (0, 1].
-    # An out-of-range positive value here makes coeff = exp(positive) explode.
-    old_dA_cumsum_all = tl.where(
-        (old_dA_cumsum_all == old_dA_cumsum_all) & (tl.abs(old_dA_cumsum_all) < 1e30),
-        old_dA_cumsum_all,
-        0.0,
-    )
-    old_dA_cumsum_all = tl.minimum(old_dA_cumsum_all, 0.0)
 
     # Load dA_cumsum at prev_k-1 directly via pointer math (avoids masked reduction).
     # Clamp to [0, T-1] defensively — out-of-contract PNAT > T would read OOB.
@@ -489,32 +453,18 @@ def _replay_state_update_kernel(
     total_dA_cumsum = tl.load(old_dA_cumsum_base + prev_k_idx * stride_old_dA_cumsum_T).to(
         tl.float32
     )
-    # Same sanitize+clamp as old_dA_cumsum_all.  total_decay = exp(total_dA_cumsum);
-    # without the clamp, a positive Inf here yields total_decay = +Inf which
-    # then poisons state via `state *= total_decay`.
-    total_dA_cumsum = tl.where(
-        (total_dA_cumsum == total_dA_cumsum) & (tl.abs(total_dA_cumsum) < 1e30),
-        total_dA_cumsum,
-        0.0,
-    )
-    total_dA_cumsum = tl.minimum(total_dA_cumsum, 0.0)
 
     # Step 0 invariant: PNAT=0 means `state` is already last step's state (not
     # two back).  coeff is all-zero (offs_t < 0), total_decay is 1.0, so the
     # replay leaves `state` unchanged — cache contents don't matter on step 0.
     coeff = tl.exp(total_dA_cumsum - old_dA_cumsum_all) * old_dt_all
-    pnat_t_mask = offs_t < prev_num_accepted_tokens
-    coeff = tl.where(pnat_t_mask, coeff, 0.0)
-    # Filter both NaN and Inf; `coeff == coeff` alone passes Inf since
-    # Inf == Inf is True.  Inf reaching dB_scaled corrupts the SSM state
-    # via tl.dot and propagates to fp16 storage after SR.
-    coeff = tl.where((coeff == coeff) & (tl.abs(coeff) < 1e30), coeff, 0.0)
+    coeff = tl.where(offs_t < prev_num_accepted_tokens, coeff, 0.0)
 
     # Load old_x: (BLOCK_SIZE_T, BLOCK_SIZE_M) — single-buffered
     old_x_base = old_x_ptr + cache_batch_idx * stride_old_x_cache + pid_h * stride_old_x_head
     old_x_all = tl.load(
         old_x_base + offs_t[:, None] * stride_old_x_T + offs_m[None, :] * stride_old_x_dim,
-        mask=pnat_t_mask[:, None] & m_mask[None, :],
+        mask=t_mask[:, None] & m_mask[None, :],
         other=0.0,
     )
 
@@ -527,7 +477,7 @@ def _replay_state_update_kernel(
     )
     old_B_all = tl.load(
         old_B_base + offs_t[:, None] * stride_old_B_T + offs_n[None, :] * stride_old_B_dstate,
-        mask=pnat_t_mask[:, None] & n_mask[None, :],
+        mask=t_mask[:, None] & n_mask[None, :],
         other=0.0,
     ).to(tl.float32)
 
@@ -539,19 +489,7 @@ def _replay_state_update_kernel(
     state *= total_decay
 
     # tl.dot fast-forward: old_x^T @ dB_scaled → (M, dstate)
-    state += tl.dot(
-        tl.trans(old_x_all).to(tl.float32),
-        dB_scaled.to(tl.float32),
-        input_precision="ieee",
-    )
-
-    # Sanitize state before storage to prevent Inf/NaN from persisting in the
-    # fp16 SSM cache and corrupting every subsequent decode step for this slot.
-    # NaN gets reset to zero (uncorrupted but useless on its own), while finite
-    # values are clamped to the fp16 normal range so they survive the cast
-    # below instead of saturating to fp16 Inf.  Zeroing legitimate large finite
-    # values would discard information; clamping preserves it.
-    state = tl.where(state == state, tl.minimum(tl.maximum(state, -65504.0), 65504.0), 0.0)
+    state += tl.dot(tl.trans(old_x_all).to(tl.bfloat16), dB_scaled.to(tl.bfloat16))
 
     # Write post-replay state
     if USE_RS_ROUNDING:
@@ -635,35 +573,15 @@ def _replay_state_update_kernel(
     )
 
     # init_out = C_all @ state^T * decay_vec
-    init_out = (
-        tl.dot(
-            C_all.to(tl.float32),
-            tl.trans(state).to(tl.float32),
-            input_precision="ieee",
-        )
-        * decay_vec[:, None]
-    )
+    init_out = tl.dot(C_all.to(tl.bfloat16), tl.trans(state).to(tl.bfloat16)) * decay_vec[:, None]
 
     # cb_out = CB_scaled @ x_all
-    cb_out = tl.dot(
-        CB_scaled.to(tl.float32),
-        x_all.to(tl.float32),
-        input_precision="ieee",
-    )
+    cb_out = tl.dot(CB_scaled.to(tl.bfloat16), x_all.to(tl.bfloat16))
 
     out_all = init_out + cb_out
 
     if HAS_D:
         out_all = out_all + x_all * D[None, :]
-
-    # Sanitize the SSM output before it leaves the kernel.  If any element is
-    # NaN or saturates the downstream bf16/fp16 path it cascades into the next
-    # layer's residual stream, in_proj produces garbage dt, and the model
-    # collapses to `<unk>`.  Reset NaN to zero and clamp finite values to fp16
-    # normal range; the post-RMSNorm path then sees a well-conditioned signal
-    # regardless of whether the state itself drifted toward a degenerate
-    # region during long c=32 generations.
-    out_all = tl.where(out_all == out_all, tl.minimum(tl.maximum(out_all, -65504.0), 65504.0), 0.0)
 
     if HAS_Z:
         for t in range(T):
