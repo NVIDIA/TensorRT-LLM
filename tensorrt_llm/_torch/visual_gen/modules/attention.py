@@ -534,3 +534,73 @@ class Attention(nn.Module):
         out = self._attn_impl(q, k, v)
         out = self.to_out[0](out)
         return out
+
+    def forward_async(
+        self,
+        hidden_states: torch.Tensor,
+        freqs: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+    ) -> torch.Tensor:
+        """Async-Ulysses self-attn driver. Structurally mirrors ``forward``:
+        each closure does ``to_{q,k,v}`` + (optional) fused norm+RoPE on the
+        default stream while the previous tensor's peer push runs on a side
+        stream, so V/Q/K projections overlap with the all-to-all.
+
+        Fused path: ``apply_split_norm_rope`` (SEPARATE_QKV analog of
+        ``apply_packed_qk_norm_rope``) does in-place RMSNorm + RoPE in one
+        kernel launch per Q/K. Same math as the packed kernel, just split
+        across two launches instead of one packed launch.
+
+        Unfused path: naive ``norm_q`` + ``apply_rotary_emb``, mirroring
+        ``forward``'s unfused branch.
+
+        Precondition: caller gates on ``_use_async_ulysses`` so ``self.attn``
+        is a ``UlyssesAttention`` with ``async_pipeline=True``.
+
+        Returns 3D ``[B, S, H*D]`` matching ``forward``'s output contract.
+
+        TODO (kernel follow-up): the fused split kernel below writes Q/K to an
+        intermediate tensor, then ``UlyssesAttention._issue_async`` permutes
+        and scatters that tensor into the symm-mem slot. Folding the
+        permute+scatter into a "ulyssesPermuteScatter" epilogue inside the
+        fused norm+RoPE kernel would let it write directly into the slot,
+        saving one alloc + one copy + one kernel launch per Q/K closure.
+        """
+        B, S, _ = hidden_states.shape
+        H = self.num_attention_heads
+        KV = self.num_key_value_heads
+        D = self.head_dim
+        # Mirrors forward()'s fused gate. qkv_mode is implicitly SEPARATE_QKV
+        # under async (caller-enforced), so the FUSE_QKV check in forward()
+        # has no async analog here.
+        use_fused = self.fuse_qk_norm_rope and freqs is not None and self.qk_norm
+
+        def compute_q():
+            q = self.to_q(hidden_states)
+            if use_fused:
+                self.apply_split_norm_rope(q, self.norm_q.weight, H, freqs[0], freqs[1])
+                return q.view(B, S, H, D)
+            if self.qk_norm:
+                q = self.norm_q(q)
+            q = q.view(B, S, H, D)
+            if freqs is not None:
+                q = apply_rotary_emb(q, freqs[0], freqs[1])
+            return q
+
+        def compute_k():
+            k = self.to_k(hidden_states)
+            if use_fused:
+                self.apply_split_norm_rope(k, self.norm_k.weight, KV, freqs[0], freqs[1])
+                return k.view(B, S, KV, D)
+            if self.qk_norm:
+                k = self.norm_k(k)
+            k = k.view(B, S, KV, D)
+            if freqs is not None:
+                k = apply_rotary_emb(k, freqs[0], freqs[1])
+            return k
+
+        def compute_v():
+            return self.to_v(hidden_states).view(B, S, KV, D)
+
+        out_4d = self.attn.forward_async(compute_q, compute_k, compute_v)
+        b, t = out_4d.shape[:2]
+        return self.to_out[0](out_4d.reshape(b, t, H * D))
