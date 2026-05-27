@@ -384,6 +384,17 @@ class Qwen3VLInputProcessorBase(BaseMultimodalInputProcessor, BaseMultimodalDumm
             do_rescale = False
         if videos and isinstance(videos[0][0], torch.Tensor):
             do_rescale = False
+        # Forward the IO loader's video metadata so sample_frames sees the real source fps
+        # rather than the HF default of 24 fps.
+        video_metadata = [vd.metadata for vd in video_datas] if video_datas else None
+
+        # num_frames and fps are mutually exclusive in the HF processor's sample_frames.
+        # If the caller set num_frames without fps, null fps explicitly so the class-level
+        # default fps=2 does not interfere.
+        proc_kwargs = dict(mm_processor_kwargs)
+        if "num_frames" in proc_kwargs and "fps" not in proc_kwargs:
+            proc_kwargs["fps"] = None
+
         # transformers 5.x's ``ProcessorMixin._merge_kwargs`` strictly
         # validates per-modality kwargs against the processor's TypedDict.
         # Processor *output* keys (``video_grid_thw``, ``pixel_values``, ...)
@@ -400,7 +411,8 @@ class Qwen3VLInputProcessorBase(BaseMultimodalInputProcessor, BaseMultimodalDumm
             padding=True,
             do_rescale=do_rescale,
             return_tensors="pt",
-            **mm_processor_kwargs,
+            video_metadata=video_metadata,
+            **proc_kwargs,
         )
 
     def _postprocess(self, input_ids: torch.IntTensor) -> torch.IntTensor:
