@@ -85,9 +85,19 @@ class CudaGraphLoraParams:
         # max_batch_size * max_tokens_per_seq) so all tokens of a sequence stay
         # together when sorted by slot.
         max_num_tokens = max_batch_size * max_tokens_per_seq
+        self.max_num_tokens = max_num_tokens
         self.sorted_ids = torch.zeros(max_num_tokens, dtype=torch.int64, device=device)
         self.sorted_ids_host = torch.zeros_like(
             self.sorted_ids, device="cpu", pin_memory=prefer_pinned()
+        )
+
+        # token_to_slot maps an *unsorted* token index to its adapter slot id.
+        # Used by the routed-expert MoE LoRA path to look up per-token rank /
+        # weight pointers from slot-indexed tables. Pinned host so the C++ op
+        # can dereference it directly and the address stays stable across CUDA
+        # graph captures and replays.
+        self.token_to_slot_host = torch.zeros(
+            max_num_tokens, dtype=torch.int32, device="cpu", pin_memory=prefer_pinned()
         )
 
         # persistent values for gen-only batch with cuda graph
@@ -211,6 +221,19 @@ class CudaGraphLoraParams:
         sorted_ids_host = self.sorted_ids_host[:num_tokens]
         sorted_ids_host.copy_(token_sorted_ids)
         self.sorted_ids[:num_tokens].copy_(sorted_ids_host, non_blocking=True)
+
+        # Populate token_to_slot for the routed-expert MoE LoRA path. Each
+        # sequence contributes tokens_per_seq tokens carrying its slot id.
+        # Update in place to preserve the pinned-host address (graph-capture safe).
+        slot_ids_t = torch.as_tensor(slot_ids, dtype=torch.int32)
+        if tokens_per_seq > 1:
+            token_slots = slot_ids_t.repeat_interleave(tokens_per_seq)
+        else:
+            token_slots = slot_ids_t
+        self.token_to_slot_host[:num_tokens].copy_(token_slots)
+        # Padding region is zeroed once at construction; leave it untouched so
+        # the address arithmetic in the C++ op never reads stale slot ids past
+        # the active num_tokens.
 
     def update_weight_pointers(
         self,
@@ -362,3 +385,65 @@ class CudaGraphLoraParams:
             LoraLayerParams for the specified layer, or None if layer has no LoRA modules
         """
         return self.layer_params.get(layer_key)
+
+    def get_moe_slot_inputs(
+        self,
+        layer_idx: int,
+        module_id: int,
+    ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
+        """Return slot-indexed LoRA tables for an MoE module on a given layer.
+
+        Used by the routed-expert MoE LoRA path in CUDA-graph decode mode. The
+        returned tensors are pinned host views over the persistent buffers held
+        by this instance — their `.data_ptr()` is stable across CUDA graph
+        captures and replays.
+
+        Args:
+            layer_idx: Decoder layer index.
+            module_id: One of `MOE_H_TO_4H`, `MOE_4H_TO_H`, `MOE_GATE`
+                (`LoraModuleType` int values).
+
+        Returns:
+            A tuple `(slot_ranks_host, slot_weight_ptrs_host)` where
+              - `slot_ranks_host`: `[max_lora_size]` int32 (alias to
+                `self.slot_ranks_host`; same rank-per-slot as the rest of the
+                LoRA infra).
+              - `slot_weight_ptrs_host`: `[max_lora_size, 3]` int64. Columns
+                are `(A_ptr, B_ptr, dora_ptr)` with `dora_ptr` always 0 (DoRA
+                with MoE is rejected upstream by `lora_manager.py`).
+            Returns `None` if `(layer_idx, module_id)` is not in this layer
+            map (e.g. the model has no MoE LoRA on that layer).
+        """
+        key = self.layer_module2key.get((layer_idx, module_id))
+        if key is None:
+            return None
+        layer_param = self.layer_params.get(key)
+        if layer_param is None:
+            return None
+        local_module_id = key.module_ids.index(module_id)
+        # Slice `[max_lora_size]` views for the requested module.
+        ptrs_a = layer_param.h_b_ptrs[local_module_id]
+        ptrs_b = layer_param.h_b_prime_ptrs[local_module_id]
+        # Pack into `[max_lora_size, 3]`. We allocate a new tensor here because
+        # the existing storage isn't laid out as (A, B, dora) per slot. To
+        # keep this graph-capture safe, cache the packed buffer per (layer_idx,
+        # module_id) so its address is stable across calls.
+        cache = getattr(self, "_moe_slot_ptrs_cache", None)
+        if cache is None:
+            cache = {}
+            self._moe_slot_ptrs_cache = cache
+        cache_key = (layer_idx, module_id)
+        packed = cache.get(cache_key)
+        if packed is None:
+            packed = torch.zeros(
+                (self.max_lora_size, 3),
+                dtype=torch.int64,
+                device="cpu",
+                pin_memory=prefer_pinned(),
+            )
+            cache[cache_key] = packed
+        # In-place update (graph-capture safe).
+        packed[:, 0].copy_(ptrs_a.to(torch.int64))
+        packed[:, 1].copy_(ptrs_b.to(torch.int64))
+        # Column 2 (dora) stays zero.
+        return self.slot_ranks_host, packed

@@ -230,8 +230,30 @@ def fused_moe(
     unpadded_hidden_size: Optional[int] = None,
     out_tensor: Optional[torch.Tensor] = None,
     use_dynamic_fc2_scale: bool = False,
+    # Routed-expert LoRA inputs (all optional; presence of fc1_lora_ranks activates LoRA).
+    # Each *_ranks   : CPU int32  [num_seqs]
+    # Each *_weights : CPU int64  [num_seqs, 3]  -- (A_ptr, B_ptr, DoRA_ptr unused)
+    fc1_lora_ranks: Optional[torch.Tensor] = None,
+    fc1_lora_weight_ptrs: Optional[torch.Tensor] = None,
+    fc2_lora_ranks: Optional[torch.Tensor] = None,
+    fc2_lora_weight_ptrs: Optional[torch.Tensor] = None,
+    gated_lora_ranks: Optional[torch.Tensor] = None,
+    gated_lora_weight_ptrs: Optional[torch.Tensor] = None,
+    host_request_types: Optional[torch.Tensor] = None,
+    host_context_lengths: Optional[torch.Tensor] = None,
+    lora_max_low_rank: int = 0,
+    # Slot-indexed CUDA-graph LoRA inputs (mutually exclusive with the per-request schema).
+    # Each slot_*_ranks   : CPU pinned int32 [max_lora_size]
+    # Each slot_*_weight_ptrs : CPU pinned int64 [max_lora_size, 3]  (A_ptr, B_ptr, dora_ptr)
+    # token_to_slot       : CPU pinned int32 [>=num_tokens]
+    fc1_slot_lora_ranks: Optional[torch.Tensor] = None,
+    fc1_slot_lora_weight_ptrs: Optional[torch.Tensor] = None,
+    fc2_slot_lora_ranks: Optional[torch.Tensor] = None,
+    fc2_slot_lora_weight_ptrs: Optional[torch.Tensor] = None,
+    gated_slot_lora_ranks: Optional[torch.Tensor] = None,
+    gated_slot_lora_weight_ptrs: Optional[torch.Tensor] = None,
+    token_to_slot: Optional[torch.Tensor] = None,
 ) -> List[torch.Tensor]:
-
     tuner = AutoTuner.get()
     # Only the non-alltoall case is considered for profiling in the warmup phase.
     # Therefore, to get the correct tactics during the actual inference, the inputs to the tuner should be the same as when not using alltoall.
@@ -291,17 +313,46 @@ def fused_moe(
         gemm_idx=2,
     )
 
+    lora_active = (fc1_lora_ranks is not None) or (fc1_slot_lora_ranks
+                                                   is not None)
+    if min_latency_mode and lora_active:
+        # Mirror the C++ rejection so the error surfaces before the kernel allocates anything.
+        raise RuntimeError(
+            "MoE LoRA is not supported in min-latency mode. Disable min_latency_mode or pass no LoRA tensors."
+        )
+    if (fc1_lora_ranks is not None) and (fc1_slot_lora_ranks is not None):
+        raise RuntimeError(
+            "MoE LoRA: per-request and slot-indexed input schemas are mutually exclusive. "
+            "Provide either (fc1_lora_ranks, ...) or (fc1_slot_lora_ranks, ..., token_to_slot), not both."
+        )
     run_moe = moe_runner.fused_moe_runner.run_moe_min_latency if min_latency_mode else moe_runner.fused_moe_runner.run_moe
     try:
-        output = run_moe(input, token_selected_experts, token_final_scales,
-                         fc1_expert_weights, fc1_expert_biases,
-                         fc2_expert_weights, fc2_expert_biases, quant_scales,
-                         input_sf, swizzled_input_sf, swiglu_alpha, swiglu_beta,
-                         swiglu_limit, tp_size, tp_rank, ep_size, ep_rank,
-                         cluster_size, cluster_rank, enable_alltoall,
-                         min_latency_mode, [gemm_tactic_1, gemm_tactic_2],
-                         activation_type, unpadded_hidden_size,
-                         tuner_num_tokens, out_tensor, use_dynamic_fc2_scale)
+        if min_latency_mode:
+            output = run_moe(input, token_selected_experts, token_final_scales,
+                             fc1_expert_weights, fc1_expert_biases,
+                             fc2_expert_weights, fc2_expert_biases, quant_scales,
+                             input_sf, swizzled_input_sf, swiglu_alpha,
+                             swiglu_beta, swiglu_limit, tp_size, tp_rank,
+                             ep_size, ep_rank, cluster_size, cluster_rank,
+                             enable_alltoall, min_latency_mode,
+                             [gemm_tactic_1, gemm_tactic_2], activation_type,
+                             unpadded_hidden_size, tuner_num_tokens, out_tensor)
+        else:
+            output = run_moe(
+                input, token_selected_experts, token_final_scales,
+                fc1_expert_weights, fc1_expert_biases, fc2_expert_weights,
+                fc2_expert_biases, quant_scales, input_sf, swizzled_input_sf,
+                swiglu_alpha, swiglu_beta, swiglu_limit, tp_size, tp_rank,
+                ep_size, ep_rank, cluster_size, cluster_rank, enable_alltoall,
+                min_latency_mode, [gemm_tactic_1, gemm_tactic_2],
+                activation_type, unpadded_hidden_size, tuner_num_tokens,
+                out_tensor, use_dynamic_fc2_scale, fc1_lora_ranks,
+                fc1_lora_weight_ptrs, fc2_lora_ranks, fc2_lora_weight_ptrs,
+                gated_lora_ranks, gated_lora_weight_ptrs, host_request_types,
+                host_context_lengths, lora_max_low_rank, fc1_slot_lora_ranks,
+                fc1_slot_lora_weight_ptrs, fc2_slot_lora_ranks,
+                fc2_slot_lora_weight_ptrs, gated_slot_lora_ranks,
+                gated_slot_lora_weight_ptrs, token_to_slot)
     except RuntimeError as e:
         error_msg = str(e)
         if "DeepGEMM only supports Hopper" in error_msg:
@@ -356,7 +407,23 @@ def _(input: torch.Tensor,
       activation_type: ActivationType = ActivationType.Swiglu,
       unpadded_hidden_size: Optional[int] = None,
       out_tensor: Optional[torch.Tensor] = None,
-      use_dynamic_fc2_scale: bool = False):
+      use_dynamic_fc2_scale: bool = False,
+      fc1_lora_ranks: Optional[torch.Tensor] = None,
+      fc1_lora_weight_ptrs: Optional[torch.Tensor] = None,
+      fc2_lora_ranks: Optional[torch.Tensor] = None,
+      fc2_lora_weight_ptrs: Optional[torch.Tensor] = None,
+      gated_lora_ranks: Optional[torch.Tensor] = None,
+      gated_lora_weight_ptrs: Optional[torch.Tensor] = None,
+      host_request_types: Optional[torch.Tensor] = None,
+      host_context_lengths: Optional[torch.Tensor] = None,
+      lora_max_low_rank: int = 0,
+      fc1_slot_lora_ranks: Optional[torch.Tensor] = None,
+      fc1_slot_lora_weight_ptrs: Optional[torch.Tensor] = None,
+      fc2_slot_lora_ranks: Optional[torch.Tensor] = None,
+      fc2_slot_lora_weight_ptrs: Optional[torch.Tensor] = None,
+      gated_slot_lora_ranks: Optional[torch.Tensor] = None,
+      gated_slot_lora_weight_ptrs: Optional[torch.Tensor] = None,
+      token_to_slot: Optional[torch.Tensor] = None):
     seq_len = input.shape[0]
     if use_int8_woq_per_channel:
         # Note: The weight shape for INT8 weight only quantization is different, i.e.,
