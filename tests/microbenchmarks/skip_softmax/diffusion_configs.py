@@ -1,23 +1,33 @@
-# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: Apache-2.0
-
+#
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """Diffusion-shape sweep configs for the skip-softmax kernel microbench.
 
-Mirrors the cubin family used by Wan2.2 T2V-A14B at 720x1280x81 frames per
-the wan22-a14b-v1-vs-v2-calibration doc: bf16, head_dim=128, q_step=64,
-kv_step=128, bidirectional mask.
+Mirrors the Wan2.2 T2V-A14B 720p report:
+720x1280 resolution, 81 frames, token grid 45x80x21 = 75,600 tokens.
 
-The user explicitly said: ignore target_sparsity (which is the per-model
-calibration knob). On random tensors threshold_scale_factor to achieved
-sparsity is not the same curve, so we sweep threshold_scale_factor over a
-log-spaced range wide enough to bracket 0% to ~99% achieved sparsity.
+This is an attention-kernel microbench of the self-attention shape, not an
+end-to-end visual generation benchmark. The report's target_sparsity YAML
+calibration is intentionally not used here; the harness sweeps raw
+threshold_scale_factor values and reports achieved block sparsity.
 """
 
 from __future__ import annotations
 
-from typing import List
-
 from .llm_configs import FmhaConfig
+
+WAN22_A14B_720P_SEQ_LEN = 45 * 80 * 21
 
 DIFFUSION_THRESHOLDS = [
     0.0,
@@ -36,21 +46,18 @@ DIFFUSION_THRESHOLDS = [
 ]
 
 
-def diffusion_configs() -> List[FmhaConfig]:
-    cfgs: List[FmhaConfig] = []
-    for seq_len in (16384, 32768, 41472, 65536):
-        cfgs.append(
-            FmhaConfig(
-                name=f"diff_bf16_s{seq_len}",
-                dtype="bf16",
-                batch=1,
-                num_heads_q=24,
-                num_heads_kv=24,  # Wan2.2 attn1 is MHA, not GQA
-                head_size=128,
-                seq_len_q=seq_len,
-                seq_len_kv=seq_len,
-                mask="bidirectional",
-                threshold_sweep=list(DIFFUSION_THRESHOLDS),
-            )
+def diffusion_configs() -> list[FmhaConfig]:
+    return [
+        FmhaConfig(
+            name=f"wan22_a14b_720p_bf16_s{WAN22_A14B_720P_SEQ_LEN}",
+            dtype="bf16",
+            batch=1,
+            num_heads_q=40,
+            num_heads_kv=40,
+            head_size=128,
+            seq_len_q=WAN22_A14B_720P_SEQ_LEN,
+            seq_len_kv=WAN22_A14B_720P_SEQ_LEN,
+            mask="bidirectional",
+            threshold_sweep=list(DIFFUSION_THRESHOLDS),
         )
-    return cfgs
+    ]

@@ -1,5 +1,5 @@
 # ##################################################################################################
-# SPDX-FileCopyrightText: Copyright (c) 2011-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2011-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -72,7 +72,7 @@ PREPROCESSOR_FLAGS += -DHALF_ACCUMULATION_FOR_FLASH_ATTENTION
 # Skip-Softmax block statistics are now compiled in by default as a separate
 # kernel family (`_skipSoftmaxStat` cubins). To exercise them from bin/fmha.exe
 # pass `-skip-softmax-stat` (in addition to `-skip-softmax-threshold-scale-factor`)
-# at runtime — no preprocessor flag required.
+# at runtime; no preprocessor flag required.
 
 # Add FLAGS when generating cubins.
 ifdef GENERATE_CUBIN
@@ -235,7 +235,9 @@ train_ops:
 ###################################################################################################
 
 bin/fmha.exe: $(OBJECTS_MHA)
-	$(CXX) $(CXX_FLAGS) -o $@ $^ -L$(CUDA)/lib64 -Wl,-rpath=$(CUDA)/lib64 -lcudart -lcudart -lcublas -lcublasLt
+	$(file >$@.objs,$^)
+	$(CXX) $(CXX_FLAGS) -o $@ @$@.objs -L$(CUDA)/lib64 -Wl,-rpath=$(CUDA)/lib64 -lcudart -lcudart -lcublas -lcublasLt
+	@rm -f $@.objs
 
 bin/fmhca.exe: $(OBJECTS_MHCA)
 	$(CXX) $(CXX_FLAGS) -o $@ $^ -L$(CUDA)/lib64 -Wl,-rpath=$(CUDA)/lib64 -lcudart -lcudart -lcublas -lcublasLt

@@ -76,10 +76,10 @@ def _mask_flag(mask: str) -> List[str]:
     if mask == "causal":
         return ["-causal-mask"]
     if mask == "bidirectional":
-        # The kernel's bidirectional-sliding-window mask covers the full
-        # sequence when sliding_window_size >= seq_len; we set it equal to
-        # seq_len at the call site.
-        return ["-bidirectional-sliding-window-mask"]
+        # PredefinedAttentionMask.FULL maps to the padding/no-mask path in the
+        # TRTLLM torch backend. Leave fmha.exe on its default padding mask path
+        # to match that behavior; bidirectional sliding-window is a local mask.
+        return []
     raise ValueError(f"Unknown mask: {mask}")
 
 
@@ -108,8 +108,6 @@ def _build_cmd(
         # for decode-style shapes.
         cmd += ["-s-q", str(cfg.seq_len_q), "-contiguous-q-kv"]
     cmd += _mask_flag(cfg.mask)
-    if cfg.mask == "bidirectional":
-        cmd += ["-sliding-window-size", str(cfg.seq_len_kv)]
     if cfg.num_heads_kv != cfg.num_heads_q:
         cmd += ["-gqa", str(cfg.num_heads_kv)]
     if threshold > 0:

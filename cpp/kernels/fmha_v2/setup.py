@@ -6933,6 +6933,28 @@ def enumerate_kernels():
             kspec._replace(head_interleaved=False) for kspec in specs_expanded
         ]
     # yapf: disable
+    # Optional filters for standalone fmha.exe builds where compiling all
+    # generated kernels can exceed the x86_64 small/medium code-model limits.
+    if os.environ.get('FMHA_SM90_ONLY', '0') == '1':
+        specs_expanded = [k for k in specs_expanded if k.sm == 90]
+    _dtype_filter = os.environ.get('FMHA_DTYPE_FILTER', '')
+    if _dtype_filter:
+        keep = set(_dtype_filter.split(','))
+        specs_expanded = [k for k in specs_expanded if k.dtype in keep]
+    _head_size_filter = os.environ.get('FMHA_HEAD_SIZE_FILTER', '')
+    if _head_size_filter:
+        keep = {int(value) for value in _head_size_filter.split(',')}
+        specs_expanded = [k for k in specs_expanded if k.head_size in keep]
+    _input_layout_filter = os.environ.get('FMHA_INPUT_LAYOUT_FILTER', '')
+    if _input_layout_filter:
+        layout_by_name = {
+            'packed_qkv': InputLayout.PACKED_QKV,
+            'contiguous_q_kv': InputLayout.CONTIGUOUS_Q_KV,
+            'q_paged_kv': InputLayout.Q_PAGED_KV,
+            'separate_q_k_v': InputLayout.SEPARATE_Q_K_V,
+        }
+        keep = {layout_by_name[value] for value in _input_layout_filter.split(',')}
+        specs_expanded = [k for k in specs_expanded if k.input_layout in keep]
     specs_names = [(kspec, *encode_name(kspec)) for kspec in specs_expanded
                   # Volta is deprecated in TRT-LLM.
                   if  (kspec.sm            in [80, 86, 89, 90, 120]
