@@ -200,6 +200,18 @@ class Qwen3VLInputProcessorBase(BaseMultimodalInputProcessor, BaseMultimodalDumm
         # post-merger units bounds the inner loop and lets us reuse the
         # familiar near-square factor pair for aspect ratio bounds.
         post_merger_budget = max(max_tokens // (merge_size * merge_size), 1)
+
+        # HF ``smart_resize`` upscales any image whose pixel area falls below
+        # the processor's ``min_pixels``. Returning a sub-min_pixels size here
+        # would silently grow inside the processor and break the dummy's
+        # token-count invariant. Floor ``post_merger_budget`` to the smallest
+        # near-square grid that already meets that area.
+        min_pixels = self._get_processor_min_pixels()
+        if min_pixels and min_pixels > 0:
+            min_dim_post_merger = math.ceil(math.sqrt(min_pixels) / unit)
+            post_merger_budget = max(post_merger_budget,
+                                     min_dim_post_merger * min_dim_post_merger)
+
         h_factor, w_factor = closest_factor_pair(post_merger_budget)
         for seq_len in range(post_merger_budget, 0, -1):
             h_f, w_f = closest_factor_pair(seq_len)
@@ -212,6 +224,29 @@ class Qwen3VLInputProcessorBase(BaseMultimodalInputProcessor, BaseMultimodalDumm
             "height": unit * h_factor,
             "num_frames": 1,
         }
+
+    def _get_processor_min_pixels(self) -> Optional[int]:
+        """Return the HF image processor's per-image min-pixels floor.
+
+        HF Qwen3-VL's ``smart_resize`` (inherited from Qwen2-VL) upscales any
+        image whose pixel area drops below this floor (``size["shortest_edge"]``
+        in transformers>=5, ``min_pixels`` attribute in <5). A dummy picked
+        below the floor will silently grow inside the processor, breaking
+        ``get_num_mm_tokens``'s assumed-grid invariant: see
+        ``get_size_with_most_features`` for the clamp that consumes this.
+        """
+        image_proc = getattr(self.processor, "image_processor", None)
+        if image_proc is None:
+            return None
+        if hasattr(image_proc, "min_pixels"):
+            return image_proc.min_pixels
+        size = getattr(image_proc, "size", None)
+        if size is None:
+            return None
+        try:
+            return size["shortest_edge"]
+        except (KeyError, TypeError):
+            return None
 
     @classmethod
     def get_rope_index(
