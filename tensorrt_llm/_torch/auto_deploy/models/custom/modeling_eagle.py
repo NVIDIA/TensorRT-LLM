@@ -42,6 +42,7 @@ from transformers.activations import ACT2FN
 from transformers.utils import ModelOutput
 
 from tensorrt_llm._torch.pyexecutor.mamba_cache_manager import MambaHybridCacheManager
+from tensorrt_llm._torch.speculative.sa_enhancer import SADraftEnhancer
 
 from ...distributed.common import broadcast
 from ...shim.interface import CachedSequenceInterface
@@ -746,6 +747,7 @@ class EagleWrapperConfig:
     load_lm_head_from_target: bool
     normalize_target_hidden_state: bool = False
     sync_before_hidden_state_capture: bool = False
+    sa_config: Optional[Any] = None
 
 
 class EagleWrapper(nn.Module):
@@ -767,6 +769,9 @@ class EagleWrapper(nn.Module):
         self.load_lm_head_from_target = config.load_lm_head_from_target
         self.normalize_target_hidden_state = config.normalize_target_hidden_state
         self.sync_before_hidden_state_capture = config.sync_before_hidden_state_capture
+        self.sa_enhancer: Optional[SADraftEnhancer] = None
+        if config.sa_config is not None:
+            self.sa_enhancer = SADraftEnhancer(config.sa_config.threshold)
 
     @property
     def _draft_inner_model(self):
@@ -846,8 +851,9 @@ class EagleWrapper(nn.Module):
         - If seq_info is provided: inference mode (after graph transforms + cache init).
         - Otherwise: prefill-only mode (export time, before caches are inserted).
         """
+        sa_manager = kwargs.pop("sa_manager", None)
         if cache_seq_interface is not None:
-            return self._forward_with_kv_cache(cache_seq_interface)
+            return self._forward_with_kv_cache(cache_seq_interface, sa_manager=sa_manager)
         else:
             return self._forward_prefill_only(**kwargs)
 
@@ -946,7 +952,21 @@ class EagleWrapper(nn.Module):
             return layer_hidden_states[0]
         return torch.cat(layer_hidden_states, dim=1)
 
-    def _forward_with_kv_cache(self, csi: CachedSequenceInterface):
+    def _maybe_apply_sa_draft_override(
+        self,
+        next_new_tokens: torch.Tensor,
+        num_prefill: int,
+        sa_manager,
+    ) -> None:
+        if self.sa_enhancer is None or sa_manager is None:
+            return
+
+        next_draft_tokens = self.sa_enhancer.maybe_override_all_draft_tokens(
+            next_new_tokens[num_prefill:, 1:]
+        )
+        next_new_tokens[num_prefill:, 1:] = next_draft_tokens
+
+    def _forward_with_kv_cache(self, csi: CachedSequenceInterface, sa_manager=None):
         """Forward pass with KV cache (inference after graph transforms).
 
         Phases: target forward -> collect hidden states -> gather + sample + verify ->
@@ -1050,6 +1070,20 @@ class EagleWrapper(nn.Module):
             if num_extend > 0:
                 new_tokens_lens[num_prefill:] = new_tokens_lens_extend
 
+        if self.sa_enhancer is not None and sa_manager is not None:
+            self.sa_enhancer.extend_and_prepare(
+                sa_manager=sa_manager,
+                # Match the PyTorch backend's full-batch call shape. ADEngine has
+                # already prepared real manager slots for the extend requests, and
+                # the ID values are not read during the enhancer's extend path.
+                request_ids=list(range(num_sequences)),
+                accepted_tokens=new_tokens_2d,
+                num_accepted_tokens=new_tokens_lens,
+                num_gens=num_extend,
+                num_contexts=num_prefill,
+                max_draft_len=self.max_draft_len,
+            )
+
         # MTP state promotion: commit accepted intermediate mamba states to base state
         # Must do this before num_prefill is updated by the drafting loop.
         kv_cache_manager = csi.kv_cache_manager
@@ -1131,6 +1165,8 @@ class EagleWrapper(nn.Module):
                 csi.info.switch_to_generate_(active_args_override=draft_arg_names)
                 csi.info.copy_("input_ids", draft_tokens)
                 csi.info.offset_pos_and_cache_(c_offset, active_args_override=draft_arg_names)
+
+        self._maybe_apply_sa_draft_override(next_new_tokens, num_prefill, sa_manager)
 
         # ---- Phase 6: Package output ----
         return EagleWrapperOutput(

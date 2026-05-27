@@ -45,6 +45,7 @@ from tensorrt_llm._torch.pyexecutor.scheduler import (
 )
 from tensorrt_llm._torch.pyexecutor.seq_slot_manager import SeqSlotManager
 from tensorrt_llm._torch.speculative.eagle3 import Eagle3OneModelSampler
+from tensorrt_llm._torch.speculative.suffix_automaton import SuffixAutomatonManager
 from tensorrt_llm._utils import get_free_port, mpi_rank, mpi_world_size, nvtx_range
 from tensorrt_llm.inputs.multimodal import MultimodalRuntimeData, check_mm_embed_cumsum_if_needed
 from tensorrt_llm.llmapi.llm_args import ContextChunkingPolicy, SamplerType
@@ -444,6 +445,7 @@ class ADEngine(ModelEngine):
         self.llm_args.max_seq_len = cache_seq_interface.info.max_seq_len
         self.iter_counter = 0
         self.iter_states = {}
+        self.sa_manager = None
 
         # NOTE (lucaslie): not a declared base member in the base class; required by PyExecutor...
         self.enable_attention_dp = dist_config.enable_attention_dp if dist_config else False
@@ -953,6 +955,16 @@ class ADEngine(ModelEngine):
             **extra_args,
         )
 
+        if getattr(self.spec_config, "sa_config", None) is not None:
+            if self.sa_manager is None:
+                self.sa_manager = resource_manager.get_resource_manager(
+                    ResourceManagerType.SPEC_RESOURCE_MANAGER
+                )
+
+        if self.sa_manager is not None and num_extend > 0:
+            gen_request_ids = [request.py_request_id for request in extend_requests]
+            self.sa_manager.prepare(gen_request_ids, self.spec_config.max_draft_len)
+
         self.iter_states["num_ctx_requests"] = num_prefill
         self.iter_states["num_ctx_tokens"] = num_prefill_tokens
         self.iter_states["has_context_multimodal_data"] = has_context_multimodal_data
@@ -966,7 +978,11 @@ class ADEngine(ModelEngine):
         csi = self.cache_seq_interface
 
         if self.spec_config is not None:
-            model_output = self.model(**csi.named_args, cache_seq_interface=csi)
+            model_output = self.model(
+                **csi.named_args,
+                cache_seq_interface=csi,
+                sa_manager=self.sa_manager,
+            )
         else:
             model_output = self.model(**csi.named_args)
         if self.iter_states.get("has_context_multimodal_data", False):
@@ -1167,12 +1183,17 @@ def create_autodeploy_executor(
     kv_cache_config_tuned = engine.cache_seq_interface.kv_cache_config_tuned
     seq_slot_manager = SeqSlotManager(max_num_sequences=max_num_sequences)
 
-    resource_manager = ResourceManager(
-        {
-            ResourceManagerType.KV_CACHE_MANAGER: kv_cache_manager,
-            ResourceManagerType.SEQ_SLOT_MANAGER: seq_slot_manager,
-        }
-    )
+    resource_managers = {
+        ResourceManagerType.KV_CACHE_MANAGER: kv_cache_manager,
+        ResourceManagerType.SEQ_SLOT_MANAGER: seq_slot_manager,
+    }
+    if spec_config is not None and getattr(spec_config, "sa_config", None) is not None:
+        resource_managers[ResourceManagerType.SPEC_RESOURCE_MANAGER] = SuffixAutomatonManager(
+            spec_config.sa_config,
+            max_num_sequences,
+            ad_config.max_seq_len,
+        )
+    resource_manager = ResourceManager(resource_managers)
     resource_manager.resource_managers.move_to_end(ResourceManagerType.KV_CACHE_MANAGER, last=True)
 
     # TODO: consider passing through scheduler_config arguments here. Not doing this for now since

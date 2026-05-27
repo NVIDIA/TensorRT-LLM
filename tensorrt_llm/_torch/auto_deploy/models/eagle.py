@@ -335,6 +335,7 @@ class EagleOneModelFactory(ModelFactory):
                 draft_config, "normalize_target_hidden_state", False
             ),
             sync_before_hidden_state_capture=self.sync_before_hidden_state_capture,
+            sa_config=getattr(self.speculative_config, "sa_config", None),
         )
 
         return EagleWrapper(

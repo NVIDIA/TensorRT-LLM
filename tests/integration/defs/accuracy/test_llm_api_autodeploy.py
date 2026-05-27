@@ -24,7 +24,7 @@ from defs.conftest import (get_device_count, get_device_memory, get_llm_root,
 from test_common.llm_data import hf_id_to_local_model_dir
 
 from tensorrt_llm._torch.auto_deploy import LLM as AutoDeployLLM
-from tensorrt_llm.llmapi import Eagle3DecodingConfig
+from tensorrt_llm.llmapi import Eagle3DecodingConfig, SAEnhancerConfig
 from tensorrt_llm.quantization import QuantAlgo
 from tensorrt_llm.sampling_params import SamplingParams
 
@@ -339,13 +339,15 @@ class TestLlama3_1_8B_Instruct_Eagle3(LlmapiAccuracyTestHarness):
     EAGLE_MODEL_PATH = hf_id_to_local_model_dir(
         "yuhuili/EAGLE3-LLaMA3.1-Instruct-8B")
 
-    def get_default_kwargs(self, attn_backend="flashinfer"):
+    def get_default_kwargs(self, attn_backend="flashinfer", enable_sa=False):
         yaml_paths, _ = _get_registry_yaml_extra(self.MODEL_NAME)
+        sa_config = SAEnhancerConfig(threshold=1) if enable_sa else None
         speculative_config = Eagle3DecodingConfig(
             max_draft_len=3,
             speculative_model=self.EAGLE_MODEL_PATH,
             eagle3_one_model=True,
             eagle3_layers_to_capture={1, 15, 28},
+            sa_config=sa_config,
         )
         # Note: Test crashes with trtllm attn_backend + torch-simple
         # See: https://github.com/NVIDIA/TensorRT-LLM/issues/13135
@@ -397,6 +399,24 @@ class TestLlama3_1_8B_Instruct_Eagle3(LlmapiAccuracyTestHarness):
         ) as llm:
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
+
+            self.check_acceptance_rate(llm, min_acceptance_rate=0.18)
+
+    @skip_pre_hopper
+    @pytest.mark.skip_less_device_memory(32000)
+    @pytest.mark.parametrize("attn_backend", ["flashinfer", "trtllm"])
+    def test_eagle3_one_model_sa(self, attn_backend):
+        """Test Eagle3 one-model speculative decoding with SA on GSM8K."""
+        kwargs = self.get_default_kwargs(attn_backend=attn_backend,
+                                         enable_sa=True)
+
+        with AutoDeployLLM(
+                model=self.MODEL_PATH,
+                tokenizer=self.MODEL_PATH,
+                **kwargs,
+        ) as llm:
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm, extra_acc_spec="use_sa_spec")
 
             self.check_acceptance_rate(llm, min_acceptance_rate=0.18)
 
