@@ -67,6 +67,15 @@ def _compute_ep_partition(num_experts: int, ep_size: int,
     Returns:
         (expert_size, slot_start, slot_end)
     """
+    # Reject num_experts < ep_size: would yield zero-expert ranks, which no
+    # MoE backend / comm strategy supports end-to-end. The downstream alltoall
+    # op has a backstop check (numExperts >= epSize) but the AllGatherReduceScatter
+    # fallback path bypasses it, so guard upfront here.
+    if num_experts < ep_size:
+        raise ValueError(
+            f"num_experts ({num_experts}) must be >= ep_size ({ep_size}); "
+            f"configurations producing ranks with zero local experts are not supported."
+        )
     base = num_experts // ep_size
     remainder = num_experts % ep_size
     expert_size = base + (1 if ep_rank < remainder else 0)
