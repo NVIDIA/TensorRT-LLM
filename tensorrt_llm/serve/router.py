@@ -20,7 +20,6 @@ from collections import OrderedDict
 from typing import Awaitable, Callable, Dict, Iterable, List, Optional, Union
 
 import aiohttp
-from transformers import AutoTokenizer
 
 from tensorrt_llm.bindings.internal.batch_manager import (BlockKey,
                                                           BlockKeyHasher)
@@ -695,15 +694,15 @@ class BlockHashMixin:
                 self._tokenizers[model] = load_custom_tokenizer(
                     self._custom_tokenizer, model)
             else:
-                from tensorrt_llm.tokenizer import \
-                    maybe_fix_byte_level_tokenizer
-                tokenizer = AutoTokenizer.from_pretrained(
-                    model, trust_remote_code=True)
-                # Work around Transformers 5.x LlamaTokenizer overriding
-                # tokenizer.json's ByteLevel pre-tokenizer with Metaspace,
-                # which silently strips spaces from prompts (see tokenizer.py).
-                self._tokenizers[model] = maybe_fix_byte_level_tokenizer(
-                    tokenizer, model, trust_remote_code=True)
+                # Route through TransformersTokenizer so block-hash routing
+                # inherits the same post-load fixes as the rest of TRT-LLM
+                # (e.g. maybe_fix_byte_level_tokenizer for DeepSeek-V3
+                # Metaspace bug, _fallback_to_fast_tokenizer for DeepSeek-V3.2
+                # AttributeError on transformers >= 5.x). Peel off .tokenizer
+                # to return the raw HF tokenizer used by _tokenize() below.
+                from tensorrt_llm.tokenizer import TransformersTokenizer
+                self._tokenizers[model] = TransformersTokenizer.from_pretrained(
+                    model, trust_remote_code=True).tokenizer
         return self._tokenizers[model]
 
     def _tokenize(self, request: OpenAIRequest) -> list[list[int]]:
