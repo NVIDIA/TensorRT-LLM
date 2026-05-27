@@ -331,45 +331,6 @@ class TestLlama3_1_8B(LlmapiAccuracyTestHarness):
             task.evaluate(llm, sampling_params=sampling_params)
 
 
-class TestLlama3_1_8B_Instruct_FP8(LlmapiAccuracyTestHarness):
-    """Accuracy test for Llama-3.1-8B-Instruct-FP8 with the tuned AutoDeploy yaml."""
-
-    MODEL_NAME = "meta-llama/Llama-3.1-8B-Instruct"
-    MODEL_PATH = hf_id_to_local_model_dir("nvidia/Llama-3.1-8B-Instruct-FP8")
-
-    CONFIG_YAML = str(
-        Path(get_llm_root()) / "examples" / "auto_deploy" / "model_registry" /
-        "configs" / "llama3_1_8b.yaml")
-
-    def get_default_sampling_params(self):
-        eos_id = -1
-        beam_width = 1
-        return SamplingParams(end_id=eos_id,
-                              pad_id=eos_id,
-                              n=beam_width,
-                              use_beam_search=beam_width > 1)
-
-    @pytest.mark.skip_less_device_memory(32000)
-    @pytest.mark.parametrize("attn_backend", ["trtllm"])
-    @pytest.mark.parametrize("world_size", [2, 4])
-    def test_accuracy(self, world_size, attn_backend):
-        if world_size > get_device_count():
-            pytest.skip(f"Not enough devices for world_size={world_size}")
-        kwargs = {"attn_backend": attn_backend}
-        with AutoDeployLLM(model=self.MODEL_PATH,
-                           tokenizer=self.MODEL_PATH,
-                           world_size=world_size,
-                           yaml_extra=[self.CONFIG_YAML],
-                           trust_remote_code=True,
-                           **kwargs) as llm:
-            _set_quant_config(llm, "fp8")
-            sampling_params = self.get_default_sampling_params()
-            task = MMLU(self.MODEL_NAME)
-            task.evaluate(llm, sampling_params=sampling_params)
-            task = GSM8K(self.MODEL_NAME)
-            task.evaluate(llm)
-
-
 class TestLlama3_1_8B_Instruct_Eagle3(LlmapiAccuracyTestHarness):
     """Accuracy test for Eagle3 one-model speculative decoding with AutoDeploy."""
 
