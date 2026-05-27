@@ -1,3 +1,4 @@
+import base64
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -126,6 +127,22 @@ def test_disaggregated_params_conversation_id():
     llm_params = to_llm_disaggregated_params(openai_params)
     assert llm_params.conversation_id == "conv-roundtrip"
     assert to_disaggregated_params(llm_params).conversation_id == "conv-roundtrip"
+
+
+def test_opaque_state_requires_valid_tag(monkeypatch):
+    from tensorrt_llm.serve.openai_protocol import DisaggregatedParams as OpenAIDisaggregatedParams
+    from tensorrt_llm.serve.openai_protocol import to_disaggregated_params, to_llm_disaggregated_params
+
+    encoded = base64.b64encode(b"opaque").decode("utf-8")
+    openai_params = OpenAIDisaggregatedParams(
+        request_type="generation_only", encoded_opaque_state=encoded)
+    with pytest.raises(ValueError, match="valid tag"):
+        to_llm_disaggregated_params(openai_params)
+
+    monkeypatch.setenv("TLLM_DISAGG_OPAQUE_STATE_HMAC_KEY", "test-key")
+    signed = to_disaggregated_params(
+        DisaggregatedParams(request_type="context_only", opaque_state=b"opaque"))
+    assert to_llm_disaggregated_params(signed).opaque_state == b"opaque"
 
 
 @patch("tensorrt_llm.disaggregated_params.tllme")
