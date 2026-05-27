@@ -7,12 +7,8 @@ trust_remote_code: true
 kv_cache_config:
   enable_block_reuse: false
   free_gpu_memory_fraction: 0.7
-  # Use float32 for the SSM state cache. The Triton SSM kernel (used here
-  # because the FlashInfer SSM kernel only supports head_dim in {64, 128}
-  # and this model has head_dim=80) accumulates state across the entire
-  # prefill in a single forward pass; bf16 underflow on H20/Hopper produces
-  # garbage logits for long contexts (manifested as catastrophic MMLU drop
-  # for full-prefill, partial drop for chunked prefill).
+  # H20 shows an MMLU accuracy drop with the default BF16 recurrent SSM cache.
+  # Keep SSM state in FP32 for stable Triton SSM generation.
   mamba_ssm_cache_dtype: float32
 
 # Keep max_batch_size as in the PyTorch test to avoid OOM
