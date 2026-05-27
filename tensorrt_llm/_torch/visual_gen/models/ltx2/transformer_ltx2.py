@@ -330,9 +330,7 @@ class LTX2Attention(Attention):
         # fuse_qk_norm_rope=True and head_dim ∈ {64, 128}, so this branch
         # only fires under mini-config unit tests (head_dim=32).
         if not self.fuse_qk_norm_rope or self.head_dim not in (64, 128):
-            return self._forward_unfused(
-                x, context, pe, k_pe, pre_projected_kv, key_padding_mask
-            )
+            return self._forward_unfused(x, context, pe, k_pe, pre_projected_kv, key_padding_mask)
 
         if self.qkv_mode == QKVMode.FUSE_QKV:
             # ─── self-attn → packed kernel (norm + rope on QKV in-place) ───
@@ -839,10 +837,7 @@ class BasicAVTransformerBlock(nn.Module):
                 k_v2a, v_v2a = self.video_to_audio_attn.project_kv(
                     vx_scaled, pe=video.cross_positional_embeddings
                 )
-                if (
-                    not self.video_to_audio_attn.is_ulysses_active()
-                    and self._sharder.is_active
-                ):
+                if not self.video_to_audio_attn.is_ulysses_active() and self._sharder.is_active:
                     # Fallback: wrapper inactive → all-gather sharded video
                     # K/V to full so plain backend can run.
                     k_v2a = self._sp_all_gather(k_v2a)
