@@ -13,10 +13,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import io
+from unittest import mock
 
 import pytest
 
-from tensorrt_llm.bench.utils.data import DatasetFormatError, create_dataset_from_stream
+from tensorrt_llm.bench.utils.data import (
+    DatasetFormatError,
+    create_dataset_from_stream,
+    initialize_tokenizer,
+)
 
 
 class _FakeTokenizer:
@@ -36,3 +41,28 @@ def test_empty_stream_raises_dataset_format_error():
 
     with pytest.raises(DatasetFormatError, match="No data was read from the dataset stream"):
         create_dataset_from_stream(tokenizer, empty_stream)
+
+
+def test_initialize_tokenizer_routes_through_transformers_tokenizer():
+    """``initialize_tokenizer`` must call ``TransformersTokenizer.from_pretrained``.
+
+    Routing through ``TransformersTokenizer`` is what lets ``trtllm-bench``
+    inherit the post-load fixes (e.g. ``maybe_fix_byte_level_tokenizer``,
+    which prevents DeepSeek-V3 from loading with a Metaspace pre-tokenizer
+    that silently strips spaces -- "hello world" -> "helloworld" -- on
+    transformers >= 5.x). Without this routing the bench would see a
+    different tokenizer than the rest of TRT-LLM uses.
+    """
+    inner = mock.MagicMock()
+    inner.pad_token_id = 0  # already set => add_special_tokens not invoked
+    wrapper = mock.MagicMock(tokenizer=inner)
+
+    with mock.patch(
+        "tensorrt_llm.bench.utils.data.TransformersTokenizer.from_pretrained", return_value=wrapper
+    ) as routed:
+        out = initialize_tokenizer("dummy/model")
+
+    routed.assert_called_once_with("dummy/model", padding_side="left", trust_remote_code=True)
+    # Bench code uses the raw HF tokenizer (calls __call__, encode,
+    # add_special_tokens on it), so the wrapper must be peeled off.
+    assert out is inner
