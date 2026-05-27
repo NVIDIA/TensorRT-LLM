@@ -1608,10 +1608,17 @@ class SequenceInfo:
             last_page_len = self.get_arg("last_page_len", truncate=True)
             last_page_len += offset
             delta = (last_page_len > self.tokens_per_block).int() - (last_page_len <= 0).int()
+            extra_idx_p0 = self.get_arg("extra_page_per_seq")
+            if (delta != 0).any():
+                ad_logger.debug(
+                    f"[swa-trace] offset_pos_and_cache_ pool=0 "
+                    f"delta={delta.tolist()} extra_idx={extra_idx_p0.tolist()} "
+                    f"-1_rotates_into_cache_loc={bool(((delta == 1) & (extra_idx_p0 == -1)).any().item())}"
+                )
             torch.ops.auto_deploy.adjust_ragged_triton(
                 cache_loc=self.get_arg("cache_loc"),
                 cu_num_blocks=self.get_arg("cu_num_pages"),
-                extra_idx=self.get_arg("extra_page_per_seq"),
+                extra_idx=extra_idx_p0,
                 delta=delta,
                 num_sequences=num_sequences,
                 max_blocks_per_seq=self.max_blocks_per_seq,
@@ -1627,10 +1634,17 @@ class SequenceInfo:
                     lpl_g = self.get_arg(f"last_page_len{suffix}", truncate=True)
                     lpl_g += offset
                     delta_g = (lpl_g > self.tokens_per_block).int() - (lpl_g <= 0).int()
+                    extra_idx_g = self.get_arg(f"extra_page_per_seq{suffix}")
+                    if (delta_g != 0).any():
+                        ad_logger.debug(
+                            f"[swa-trace] offset_pos_and_cache_ pool={group_idx} "
+                            f"delta={delta_g.tolist()} extra_idx={extra_idx_g.tolist()} "
+                            f"-1_rotates_into_cache_loc={bool(((delta_g == 1) & (extra_idx_g == -1)).any().item())}"
+                        )
                     torch.ops.auto_deploy.adjust_ragged_triton(
                         cache_loc=self.get_arg(f"cache_loc{suffix}"),
                         cu_num_blocks=self.get_arg(f"cu_num_pages{suffix}"),
-                        extra_idx=self.get_arg(f"extra_page_per_seq{suffix}"),
+                        extra_idx=extra_idx_g,
                         delta=delta_g,
                         num_sequences=num_sequences,
                         max_blocks_per_seq=self.max_blocks_per_seq,
