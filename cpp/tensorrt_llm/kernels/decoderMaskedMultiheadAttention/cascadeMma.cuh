@@ -133,8 +133,8 @@ __device__ __forceinline__ void ldmatrix_x2(unsigned& r0, unsigned& r1, unsigned
 //         a[3] -> (row = t/4 + 8, col = 2*(t%4) + {8,9})  (within K=8..15)
 //   B (K=16, N=8, col-major, bf16):
 //       Thread t owns 4 bf16 = 2 uint32:
-//         b[0] -> (col = t%4,     row = ??) covering K=0..7
-//         b[1] -> (col = t%4,     row = ??) covering K=8..15
+//         b[0] -> (col = t/4,     row = 2*(t%4) + {0,1})  covering K=0..7
+//         b[1] -> (col = t/4,     row = 2*(t%4) + {8,9})  covering K=8..15
 //   C (M=16, N=8, f32):
 //       Thread t owns 4 f32:
 //         c[0] -> (row = t/4,     col = 2*(t%4))

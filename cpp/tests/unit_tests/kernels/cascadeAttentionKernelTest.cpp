@@ -110,19 +110,12 @@ static bool readEnvDirect(char const* k)
     return (v != nullptr && v[0] == '1' && v[1] == '\0');
 }
 
-TEST(CascadeAttentionEligibilityTest, RejectsBeamOne)
-{
-    auto p = makeBaselineParams<float>();
-    p.beam_width = 1;
-    EXPECT_FALSE(tk::mmha::cascade::cascade_eligible<float>(p));
-}
-
 TEST(CascadeAttentionEligibilityTest, RejectsRopePositionEmbedding)
 {
     // GPTJ-style interleaved RoPE is NOT supported in v0.1 (only GPT-NeoX).
     auto p = makeBaselineParams<float>();
     p.position_embedding_type = tk::PositionEmbeddingType::kROPE_GPTJ;
-    EXPECT_FALSE(tk::mmha::cascade::cascade_eligible<float>(p));
+    EXPECT_FALSE(tk::mmha::cascade::cascade_eligible(p));
 }
 
 TEST(CascadeAttentionEligibilityTest, AcceptsRopeGptNeox)
@@ -141,7 +134,7 @@ TEST(CascadeAttentionEligibilityTest, AcceptsRopeGptNeox)
     // The kernel-level RoPE support is verified in end-to-end tests.
     if (tc::getEnvEnableCascadeMmha())
     {
-        EXPECT_TRUE(tk::mmha::cascade::cascade_eligible<float>(p));
+        EXPECT_TRUE(tk::mmha::cascade::cascade_eligible(p));
     }
 }
 
@@ -150,7 +143,7 @@ TEST(CascadeAttentionEligibilityTest, RejectsRopePartialRotation)
     auto p = makeBaselineParams<float>();
     p.position_embedding_type = tk::PositionEmbeddingType::kROPE_GPT_NEOX;
     p.rotary_embedding_dim = p.hidden_size_per_head / 2; // partial RoPE
-    EXPECT_FALSE(tk::mmha::cascade::cascade_eligible<float>(p));
+    EXPECT_FALSE(tk::mmha::cascade::cascade_eligible(p));
 }
 
 TEST(CascadeAttentionEligibilityTest, RejectsRopeDynamicScaling)
@@ -159,7 +152,7 @@ TEST(CascadeAttentionEligibilityTest, RejectsRopeDynamicScaling)
     p.position_embedding_type = tk::PositionEmbeddingType::kROPE_GPT_NEOX;
     p.rotary_embedding_dim = p.hidden_size_per_head;
     p.rotary_embedding_scale_type = tk::RotaryScalingType::kDYNAMIC;
-    EXPECT_FALSE(tk::mmha::cascade::cascade_eligible<float>(p));
+    EXPECT_FALSE(tk::mmha::cascade::cascade_eligible(p));
 }
 
 TEST(CascadeAttentionEligibilityTest, AcceptsRopeWithCosSinCache)
@@ -180,7 +173,7 @@ TEST(CascadeAttentionEligibilityTest, AcceptsRopeWithCosSinCache)
     ScopedEnv enable("TRTLLM_ENABLE_CASCADE_MMHA", "1");
     if (tc::getEnvEnableCascadeMmha())
     {
-        EXPECT_TRUE(tk::mmha::cascade::cascade_eligible<float>(p));
+        EXPECT_TRUE(tk::mmha::cascade::cascade_eligible(p));
     }
 }
 
@@ -188,35 +181,35 @@ TEST(CascadeAttentionEligibilityTest, RejectsFp8KvCache)
 {
     auto p = makeBaselineParams<float>();
     p.fp8_kv_cache = true;
-    EXPECT_FALSE(tk::mmha::cascade::cascade_eligible<float>(p));
+    EXPECT_FALSE(tk::mmha::cascade::cascade_eligible(p));
 }
 
 TEST(CascadeAttentionEligibilityTest, RejectsInt8KvCache)
 {
     auto p = makeBaselineParams<float>();
     p.int8_kv_cache = true;
-    EXPECT_FALSE(tk::mmha::cascade::cascade_eligible<float>(p));
+    EXPECT_FALSE(tk::mmha::cascade::cascade_eligible(p));
 }
 
 TEST(CascadeAttentionEligibilityTest, RejectsBlockSparse)
 {
     auto p = makeBaselineParams<float>();
     p.block_sparse_attention = true;
-    EXPECT_FALSE(tk::mmha::cascade::cascade_eligible<float>(p));
+    EXPECT_FALSE(tk::mmha::cascade::cascade_eligible(p));
 }
 
 TEST(CascadeAttentionEligibilityTest, RejectsLogitSoftcap)
 {
     auto p = makeBaselineParams<float>();
     p.attn_logit_softcapping_scale = 1.0f;
-    EXPECT_FALSE(tk::mmha::cascade::cascade_eligible<float>(p));
+    EXPECT_FALSE(tk::mmha::cascade::cascade_eligible(p));
 }
 
 TEST(CascadeAttentionEligibilityTest, RejectsUnsupportedHeadDim)
 {
     auto p = makeBaselineParams<float>();
     p.hidden_size_per_head = 96;
-    EXPECT_FALSE(tk::mmha::cascade::cascade_eligible<float>(p));
+    EXPECT_FALSE(tk::mmha::cascade::cascade_eligible(p));
 }
 
 TEST(CascadeAttentionEligibilityTest, RejectsAttentionMask)
@@ -224,14 +217,14 @@ TEST(CascadeAttentionEligibilityTest, RejectsAttentionMask)
     auto p = makeBaselineParams<float>();
     static bool fake_mask[1] = {false};
     p.attention_mask = fake_mask;
-    EXPECT_FALSE(tk::mmha::cascade::cascade_eligible<float>(p));
+    EXPECT_FALSE(tk::mmha::cascade::cascade_eligible(p));
 }
 
 TEST(CascadeAttentionEligibilityTest, RejectsMissingInputLengths)
 {
     auto p = makeBaselineParams<float>();
     p.input_lengths = nullptr;
-    EXPECT_FALSE(tk::mmha::cascade::cascade_eligible<float>(p));
+    EXPECT_FALSE(tk::mmha::cascade::cascade_eligible(p));
 }
 
 // Sanity checks on env-var defaults (no override).

@@ -966,9 +966,8 @@ __global__ void cascade_suffix_decode_kernel(Multihead_attention_params<T, false
     float const l_p = __ldg(&partial_l_p[out_row]);
     float const v_p = __ldg(&partial_out_p[out_row * Dh + tid]);
 
-    // Identical logic to the former cascade_merge_kernel (kept below for
-    // reference).  Empty-side guards preserve semantics when prefix or suffix
-    // contributes zero tokens (e.g. first decode step, or prefix_len > tlength).
+    // Empty-side guards preserve semantics when prefix or suffix contributes
+    // zero tokens (e.g. first decode step, or prefix_len > tlength).
     bool const has_p = (l_p > 0.f) && (m_p > -FLT_MAX / 2.f);
     bool const has_s = (l_s > 0.f) && (m_s > -FLT_MAX / 2.f);
 
@@ -1004,12 +1003,12 @@ __global__ void cascade_suffix_decode_kernel(Multihead_attention_params<T, false
 //
 // Note: The former Phase 3 `cascade_merge_kernel` has been removed.  Its
 // online-softmax merge logic is now fused into the tail of
-// `cascade_suffix_decode_kernel` (see P1 fusion comment there), so the merge
+// `cascade_suffix_decode_kernel` , so the merge
 // happens in registers without an extra kernel launch / DRAM round-trip.
 //
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-template <typename T, typename KernelParamsType>
+template <typename KernelParamsType>
 bool cascade_eligible(KernelParamsType const& params)
 {
     if constexpr (KernelParamsType::DO_CROSS_ATTENTION)
@@ -1026,12 +1025,6 @@ bool cascade_eligible(KernelParamsType const& params)
         {
             TLLM_LOG_WARNING("cascade_eligible REJECT: TRTLLM_ENABLE_CASCADE_MMHA not set or =0");
         }
-        return false;
-    }
-    if (params.beam_width < tensorrt_llm::common::getEnvCascadeMmhaMinBeam())
-    {
-        TLLM_LOG_WARNING("cascade_eligible REJECT: beam_width=%d < min_beam=%d", params.beam_width,
-            tensorrt_llm::common::getEnvCascadeMmhaMinBeam());
         return false;
     }
     if (params.position_shift_enabled || params.block_sparse_attention)
@@ -1174,12 +1167,11 @@ bool launch_cascade_attention(
     Multihead_attention_params<T, false> const& params, KVCacheBuffer const& kv_cache_buffer, cudaStream_t stream)
 {
     // Hard guard: the kernel implementation supports T_cache == T only in v0.
-    if constexpr (!std::is_same_v<T, T_cache>)
-    {
-        return false;
-    }
+    // The dispatcher only instantiates this with T == T_cache, so make it a
+    // compile-time error if a future caller forgets.
+    static_assert(std::is_same_v<T, T_cache>, "cascade kernel requires T_cache == T");
 
-    if (!cascade_eligible<T>(params))
+    if (!cascade_eligible(params))
     {
         return false;
     }
@@ -1241,19 +1233,6 @@ bool launch_cascade_attention(
     constexpr int THDS = Cfg::THDS_PER_BLOCK;
     constexpr int BEAM_TILE = Cfg::BEAM_TILE;
 
-    // Host-side banner: print exactly once per process per template instance.
-    // Uses fprintf(stderr) so it is visible regardless of TLLM_LOG_LEVEL.  If
-    // this line does not appear when cascade is eligible, the loaded .so is
-    // NOT the freshly rebuilt one.
-    {
-        static std::atomic<bool> banner_printed{false};
-        if (!banner_printed.exchange(true))
-        {
-            fprintf(stderr, "[CASCADE BANNER] [CASCADE BANNER] build=%s %s Dh=%d\n", __DATE__, __TIME__, Dh);
-            fflush(stderr);
-        }
-    }
-
     // Phase 1: shared-prefix attention (all beams share the same KV prefix).
     // Grid Y = num_requests (NOT total_seqs!): each Y-block handles one request's
     // shared prefix, processing BEAM_TILE beams per Z-block.
@@ -1299,10 +1278,11 @@ bool launch_cascade_attention(
             <<<grid, block, smem_bytes, stream>>>(params, kv_cache_buffer, d_input_lengths, ws_out_p, ws_m_p, ws_l_p);
     }
 
-    // Phase 0 + Phase 3 removed: current-step K/V write is now done in the
-    // suffix kernel's prologue (leader-elected), and the prefix/suffix merge
-    // is fused into the suffix kernel's epilogue.  The workspace only carries
-    // prefix-side buffers, and we never leave the stream for launches.
+    // Phase 0 + Phase 3 removed: current-step K/V write is now done inside
+    // the suffix kernel before the attention loop (leader-elected), and the
+    // prefix/suffix merge is fused into the suffix kernel's epilogue.  The
+    // workspace only carries prefix-side buffers, and we never leave the
+    // stream for launches.
 
     // No synchronization or deallocation needed. The workspace persists
     // across calls, and stream ordering guarantees correctness.
@@ -1331,13 +1311,12 @@ INSTANTIATE_CASCADE(__nv_bfloat16, KVBlockArray, 64)
 INSTANTIATE_CASCADE(__nv_bfloat16, KVBlockArray, 128)
 #endif
 
-template bool cascade_eligible<half, Masked_multihead_attention_params<half>>(
-    Masked_multihead_attention_params<half> const&);
+template bool cascade_eligible<Masked_multihead_attention_params<half>>(Masked_multihead_attention_params<half> const&);
 #ifdef ENABLE_BF16
-template bool cascade_eligible<__nv_bfloat16, Masked_multihead_attention_params<__nv_bfloat16>>(
+template bool cascade_eligible<Masked_multihead_attention_params<__nv_bfloat16>>(
     Masked_multihead_attention_params<__nv_bfloat16> const&);
 #endif
-template bool cascade_eligible<float, Masked_multihead_attention_params<float>>(
+template bool cascade_eligible<Masked_multihead_attention_params<float>>(
     Masked_multihead_attention_params<float> const&);
 
 #undef INSTANTIATE_CASCADE

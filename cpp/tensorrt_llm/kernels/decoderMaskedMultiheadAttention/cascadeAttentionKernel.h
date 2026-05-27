@@ -30,9 +30,11 @@ namespace cascade
 //
 // Cascade Attention Kernel
 //
-// Implements the three-stage divide-and-conquer attention from
+// Implements the divide-and-conquer attention from
 // "Cascade Inference: Memory Bandwidth Efficient Shared Prefix Batch Decoding"
-// (https://flashinfer.ai/2024/02/02/cascade-inference.html).
+// (https://flashinfer.ai/2024/02/02/cascade-inference.html), specialized to
+// beam-search decode and fused down to two kernels (the original Phase 0
+// KV-write and Phase 3 merge are absorbed into the suffix-decode kernel).
 //
 // Phase 1 (cascade_prefix_mqa_kernel):
 //     For each request, all `beam_width` queries attend to the *shared* prompt
@@ -43,10 +45,9 @@ namespace cascade
 // Phase 2 (cascade_suffix_decode_kernel):
 //     Each (head, beam) pair processes its own suffix KV [L_p, T) following
 //     `cache_indir`. This is a regular single-query decode with no sharing.
-//
-// Phase 3 (cascade_merge_kernel):
-//     Combine the prefix and suffix attention states using the numerically
-//     stable online-softmax merge operator.
+//     The numerically stable online-softmax merge with the prefix partial
+//     state is fused at the end of this kernel (in-register), so no separate
+//     merge kernel launch is needed.
 //
 // This first version intentionally targets a *narrow* feature subset and
 // falls back to MMHA otherwise:
@@ -68,15 +69,14 @@ namespace cascade
 
 // Returns true if the cascade pipeline launched and produced the final output.
 // Returns false if the caller should fall back to the standard MMHA path
-// (either because gating is off, the params are unsupported, or no shared
-// prefix is available).
+// (either because gating is off or the params are unsupported).
 template <typename T, typename T_cache, typename KVCacheBuffer, int Dh>
 bool launch_cascade_attention(
     Multihead_attention_params<T, false> const& params, KVCacheBuffer const& kv_cache_buffer, cudaStream_t stream);
 
 // Convenience predicate that does *not* allocate any workspace and only
 // inspects host-side params. Used by the dispatcher to short-circuit cleanly.
-template <typename T, typename KernelParamsType>
+template <typename KernelParamsType>
 bool cascade_eligible(KernelParamsType const& params);
 
 } // namespace cascade

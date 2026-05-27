@@ -433,7 +433,7 @@ void mmha_launch_kernel(KernelParamsType const& params, KVCacheBuffer const& kv_
     if constexpr (!KernelParamsType::DO_CROSS_ATTENTION && !BLOCK_SPARSE_ATTN && !IMPLICIT_REL_ATTN_BIAS
         && !ATTN_LOGIT_SOFTCAPPING && (Dh == 64 || Dh == 128) && kCascadeTypeOk)
     {
-        if (params.beam_width > 1 && cascade::cascade_eligible<T>(params))
+        if (params.beam_width > 1 && cascade::cascade_eligible(params))
         {
             if (cascade::launch_cascade_attention<T, T, KVCacheBuffer, Dh>(params, kv_cache_buffer, stream))
             {
