@@ -1194,34 +1194,6 @@ class EagleDecodingConfig(DecodingBaseConfig):
         default="llama3",
         description="The model architecture of the eagle3 model.")
 
-    # Relaxed acceptance settings (mirrors MTPDecodingConfig for thinking models)
-    use_relaxed_acceptance_for_thinking: bool = Field(
-        default=False,
-        description=
-        "Enable relaxed acceptance during thinking phase for reasoning models. "
-        "Accepts draft tokens matching any top-K candidate instead of exact top-1."
-    )
-    relaxed_topk: PositiveInt = Field(
-        default=1,
-        description=
-        "Number of top candidate tokens to consider for relaxed acceptance. "
-        "Draft token is accepted if it matches any of these.")
-    relaxed_delta: NonNegativeFloat = Field(
-        default=0.0,
-        description=
-        "Probability threshold for relaxed acceptance. Only candidates with "
-        "prob >= (top-1 prob - delta) are kept.")
-    begin_thinking_phase_token: NonNegativeInt = Field(
-        default=128798,
-        description=
-        "Token ID marking start of thinking phase. Relaxed acceptance only applies within this phase."
-    )
-    end_thinking_phase_token: NonNegativeInt = Field(
-        default=128799,
-        description=
-        "Token ID marking end of thinking phase. Strict acceptance resumes after this."
-    )
-
     @field_validator('eagle_choices', mode='before')
     @classmethod
     def validate_eagle_choices(cls, v):

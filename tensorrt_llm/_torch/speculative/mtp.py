@@ -1135,14 +1135,3 @@ class MTPWorker(SpecWorkerBase):
             draft_tokens = self._draft_sampler_greedy(logits)
 
         return draft_tokens
-
-
-# ``MTPEagleWorker`` moved to ``eagle3.py`` as part of the Eagle3/MTP-Eagle
-# merge (TRTLLM-11508). Preserve the historical import path so external
-# callers like ``from tensorrt_llm._torch.speculative.mtp import MTPEagleWorker``
-# keep working without a hard dependency cycle.
-def __getattr__(name):
-    if name == "MTPEagleWorker":
-        from .eagle3 import MTPEagleWorker
-        return MTPEagleWorker
-    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

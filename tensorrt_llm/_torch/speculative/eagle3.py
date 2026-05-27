@@ -487,8 +487,12 @@ class Eagle3OneModelSpecMetadata(SpecMetadata):
                                      pin_memory=prefer_pinned())
         self.batch_indices_cuda[:num_seqs].copy_(batch_indices,
                                                  non_blocking=True)
-        # MTP Eagle uses max_draft_len + 1 tokens in the first draft forward so
-        # it must not subtract here; Eagle3 follows the standard tree/linear path.
+        # `num_tokens` here only feeds the attention-DP shape hint
+        # (allgathered in model_engine and overridden into
+        # `attn_metadata.all_rank_num_tokens` on the step-0 draft forward).
+        # Each mode uses a different convention:
+        #   - MTP Eagle: keep the 1st-iter shape (matches input_ids).
+        #   - Eagle3: subtract to the subseq shape.
         if not self.spec_dec_mode.is_mtp_eagle_one_model():
             if self.is_spec_dec_tree:
                 self.num_tokens -= (
@@ -593,11 +597,6 @@ class Eagle3OneModelWorker(SpecWorkerBase):
 
     def _prepare_attn_metadata_for_spec_dec(self, attn_metadata):
         attn_metadata.prepare_for_spec_dec("_seq_lens", "_seq_lens_cuda")
-        # NOTE: the previous kv_lens_cuda save/restore was removed during the
-        # Eagle3/MTP-eagle merge. The drafting loop now updates kv_lens_cuda
-        # incrementally and calls attn_metadata.update_for_spec_dec() to keep
-        # the runtime view consistent. Verify under Eagle3 regressions if any
-        # kv-lens drift is observed.
         batch_size = attn_metadata.num_seqs
 
         # Save spec-dec params that the drafting loop will overwrite.
@@ -677,18 +676,19 @@ class Eagle3OneModelWorker(SpecWorkerBase):
         accepted_tokens, num_accepted_tokens = self.sample_and_accept_draft_tokens(
             input_ids, logits, attn_metadata, spec_metadata)
 
-        # MTP Eagle only: Mamba hybrid models need state updates after token
-        # acceptance because accepted token count affects which Mamba states
-        # are valid; Eagle3 does not use Mamba layers.
-        if self.is_mtp_eagle:
-            if self._is_mamba_hybrid_cache is None:
-                self._is_mamba_hybrid_cache = isinstance(
-                    attn_metadata.kv_cache_manager, MambaHybridCacheManager)
-            if num_gens > 0 and self._is_mamba_hybrid_cache:
-                attn_metadata.kv_cache_manager.update_mamba_states(
-                    attn_metadata=attn_metadata,
-                    num_accepted_tokens=num_accepted_tokens,
-                    state_indices=attn_metadata.mamba_metadata.state_indices)
+        # Mamba hybrid models need state updates after token acceptance because
+        # the accepted token count affects which Mamba states are valid. The
+        # isinstance check below naturally no-ops on non-Mamba kv_cache_managers,
+        # so this is safe to run unconditionally regardless of spec mode (Eagle3
+        # over a Mamba-style draft is plausible, even if no such draft exists today).
+        if self._is_mamba_hybrid_cache is None:
+            self._is_mamba_hybrid_cache = isinstance(
+                attn_metadata.kv_cache_manager, MambaHybridCacheManager)
+        if num_gens > 0 and self._is_mamba_hybrid_cache:
+            attn_metadata.kv_cache_manager.update_mamba_states(
+                attn_metadata=attn_metadata,
+                num_accepted_tokens=num_accepted_tokens,
+                state_indices=attn_metadata.mamba_metadata.state_indices)
 
         sa_manager = getattr(spec_metadata.spec_resource_manager, 'sa_manager',
                              None)
@@ -924,10 +924,11 @@ class Eagle3OneModelWorker(SpecWorkerBase):
                     if hasattr(attn_metadata, 'kv_lens_cuda'):
                         attn_metadata.update_for_spec_dec()
 
-                    # Eagle engine takes ``draft_len`` tokens from the previous
-                    # step, runs spec-dec mode with those tokens, then later
-                    # steps use regular decoding mode. Disable spec_decoding so
-                    # the masks/positions stay correct on subsequent iters.
+                    # Both Eagle3 and MTP Eagle drafters take ``draft_len + 1``
+                    # tokens in the first draft step (attention runs in spec-dec
+                    # mode), then 1 token per step in subsequent iterations.
+                    # Disable spec_decoding here so the masks/positions stay
+                    # correct on subsequent iters.
                     attn_metadata.use_spec_decoding = False
                 else:
                     if hasattr(attn_metadata, 'kv_lens_cuda'):
