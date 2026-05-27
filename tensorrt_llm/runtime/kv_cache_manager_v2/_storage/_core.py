@@ -434,9 +434,9 @@ class SlotAllocator:
         # (_num_active_slots <= _target_capacity) collapses to zero.
         expected_overflow = max(0, self._num_active_slots - self._target_capacity)
         if self.shrink_in_progress and len(self._overflow_slots) == expected_overflow:
-            assert len(set(s.slot_id for s in self._overflow_slots)) == len(
-                self._overflow_slots
-            ), "Some slots are still in use."
+            assert len(set(s.slot_id for s in self._overflow_slots)) == len(self._overflow_slots), (
+                "Some slots are still in use."
+            )
             for ev in set(s.ready_event for s in self._overflow_slots):
                 ev.synchronize()
             for slot in self._overflow_slots:
