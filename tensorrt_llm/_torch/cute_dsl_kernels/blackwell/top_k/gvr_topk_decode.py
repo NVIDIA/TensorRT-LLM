@@ -113,15 +113,25 @@ class GvrParams:
 
         Mirrors CUDA template specialization GvrParams<T, K>.
         """
+        # kFTarget=kK alignment for K=512/1024 (PR #14413, 2026-05-25):
+        # eliminates upper-clamp saturation on tight-σ + high-A2 layers;
+        # cross-prompt swe-bench shows 1.5–2.2× P2-iter reduction with zero
+        # cap-hits and zero per-layer regression vs the prior kFTarget=384/2560.
         TABLE = {
-            ("float32", 512): GvrParams(kFTarget=384, kC=5120, kNumBins=1024),
-            ("float32", 1024): GvrParams(kFTarget=2560, kC=5120, kNumBins=1024),
+            # ("float32", 512): GvrParams(kFTarget=384, kC=5120, kNumBins=1024),    # pre-#14413
+            # ("float32", 1024): GvrParams(kFTarget=2560, kC=5120, kNumBins=1024),  # pre-#14413
+            ("float32", 512): GvrParams(kFTarget=512, kC=5120, kNumBins=1024),
+            ("float32", 1024): GvrParams(kFTarget=1024, kC=5120, kNumBins=1024),
             ("float32", 2048): GvrParams(kFTarget=3072, kC=6144, kNumBins=NUM_BINS_DEFAULT),
-            ("bfloat16", 512): GvrParams(kFTarget=384, kC=5120, kNumBins=512),
-            ("bfloat16", 1024): GvrParams(kFTarget=2560, kC=5120, kNumBins=512),
+            # ("bfloat16", 512): GvrParams(kFTarget=384, kC=5120, kNumBins=512),    # pre-#14413
+            # ("bfloat16", 1024): GvrParams(kFTarget=2560, kC=5120, kNumBins=512),  # pre-#14413
+            ("bfloat16", 512): GvrParams(kFTarget=512, kC=5120, kNumBins=512),
+            ("bfloat16", 1024): GvrParams(kFTarget=1024, kC=5120, kNumBins=512),
             ("bfloat16", 2048): GvrParams(kFTarget=4096, kC=5120, kNumBins=NUM_BINS_DEFAULT),
-            ("float16", 512): GvrParams(kFTarget=384, kC=5120, kNumBins=512),
-            ("float16", 1024): GvrParams(kFTarget=2560, kC=5120, kNumBins=1024),
+            # ("float16", 512): GvrParams(kFTarget=384, kC=5120, kNumBins=512),    # pre-#14413
+            # ("float16", 1024): GvrParams(kFTarget=2560, kC=5120, kNumBins=1024), # pre-#14413
+            ("float16", 512): GvrParams(kFTarget=512, kC=5120, kNumBins=512),
+            ("float16", 1024): GvrParams(kFTarget=1024, kC=5120, kNumBins=1024),
             ("float16", 2048): GvrParams(kFTarget=4096, kC=5120, kNumBins=NUM_BINS_DEFAULT),
         }
         if (dtype_name, top_k) not in TABLE:
