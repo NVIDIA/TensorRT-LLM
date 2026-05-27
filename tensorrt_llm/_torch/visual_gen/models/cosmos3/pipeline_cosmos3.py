@@ -52,20 +52,6 @@ COSMOS3_DEFAULT_RESOLUTION_TEMPLATE = "This video is of {height}x{width} resolut
 TRTLLM_DISABLE_COSMOS3_GUARDRAILS = os.environ.get("TRTLLM_DISABLE_COSMOS3_GUARDRAILS", "0") == "1"
 
 
-if not TRTLLM_DISABLE_COSMOS3_GUARDRAILS:
-    try:
-        from cosmos_guardrail import CosmosSafetyChecker
-    except (ImportError, ModuleNotFoundError):
-        raise ValueError(
-            "Cosmos Guardrail is not installed. This is in violation of the "
-            "[NVIDIA Open Model License Agreement]"
-            "(https://www.nvidia.com/en-us/agreements/enterprise-software/nvidia-open-model-license). "
-            "Please run the following installation commands or "
-            "disable guardrails by setting TRTLLM_DISABLE_COSMOS3_GUARDRAILS=1."
-            "`pip install cosmos_guardrail==0.3.0 && pip uninstall opencv-python`"
-        )
-
-
 # TODO: add hf_ids
 @register_pipeline("Cosmos3OmniMoTPipeline")
 class Cosmos3OmniMoTPipeline(BasePipeline):
@@ -121,14 +107,28 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
                 subfolder=PipelineComponent.SCHEDULER,
             )
 
-        # Guardrails are only evaluated on rank 0; load them only there to avoid
-        # dead model weights occupying GPU memory on every other rank.
-        if self.rank == 0 and not TRTLLM_DISABLE_COSMOS3_GUARDRAILS:
-            # the download guardrail checkpoint will bypass CosmosSafetyChecker's checkpoint download.
-            # Both will use HF_HOME as the cache directory.
-            download_guardrail_checkpoint()
-            self.safety_checker = CosmosSafetyChecker()
-            self.safety_checker.to(device)
+        if not TRTLLM_DISABLE_COSMOS3_GUARDRAILS:
+            # lazy import
+            try:
+                from cosmos_guardrail import CosmosSafetyChecker
+            except (ImportError, ModuleNotFoundError):
+                raise ValueError(
+                    "Cosmos Guardrail is not installed. This is in violation of the "
+                    "[NVIDIA Open Model License Agreement]"
+                    "(https://www.nvidia.com/en-us/agreements/enterprise-software/nvidia-open-model-license). "
+                    "Please run the following installation commands or "
+                    "explicitly disable guardrails by setting TRTLLM_DISABLE_COSMOS3_GUARDRAILS=1 "
+                    "(user is responsible for deploying the model without guardrails). "
+                    "- `pip install cosmos_guardrail==0.3.0 && pip uninstall opencv-python`"
+                )
+            # Guardrails are only evaluated on rank 0; load them only there to avoid
+            # dead model weights occupying GPU memory on every other rank.
+            if self.rank == 0:
+                # the download guardrail checkpoint will bypass CosmosSafetyChecker's checkpoint download.
+                # Both will use HF_HOME as the cache directory.
+                download_guardrail_checkpoint()
+                self.safety_checker = CosmosSafetyChecker()
+                self.safety_checker.to(device)
 
         self.video_processor = VideoProcessor(vae_scale_factor=self.vae_scale_factor_spatial)
 

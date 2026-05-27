@@ -14,11 +14,6 @@
 # limitations under the License.
 # # Force resource release after test
 import os
-
-# CI images do not ship cosmos_guardrail. Set before any tensorrt_llm import.
-if "JENKINS_HOME" in os.environ:
-    os.environ.setdefault("TRTLLM_DISABLE_COSMOS3_GUARDRAILS", "1")
-
 import signal
 import sys
 import traceback
