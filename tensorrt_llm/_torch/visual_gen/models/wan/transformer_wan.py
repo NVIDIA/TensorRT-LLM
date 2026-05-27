@@ -281,9 +281,9 @@ class WanBlock(nn.Module):
             hidden_size=hidden_size, eps=eps, dtype=torch.float32, has_weights=False, has_bias=False
         )
 
-        # Self-attention with fused QKV.
-        # fuse_qk_norm_rope=True: use fused cross-head QK Norm + RoPE CUDA kernel
-        # to eliminate extra global memory round-trip between separate norm and RoPE.
+        # Self-attention with fused QKV. All WAN variants (1.3B 12h, 5B 24h, 14B 40h)
+        # fit the default fused_dit_qk_norm_rope op's full-dim template now that
+        # the num_heads cap is 64 (post-survey 2026-05).
         self.attn1 = Attention(
             hidden_size=hidden_size,
             num_attention_heads=num_heads,

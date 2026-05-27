@@ -290,6 +290,12 @@ public:
     /// @param isReady Whether the request is ready to be received.
     virtual void sendReadySignal(LlmRequest::RequestIdType requestId, bool isReady);
 
+    /// @brief Update the RNN config on the internal CacheState copies.
+    /// Used by CppMambaHybridCacheManager path where RNN config is set after construction.
+    void setRnnConfig(executor::kv_cache::CacheState::RnnModelConfig rnnModelConfig,
+        std::vector<SizeType32> rnnLayerNumPerPP, nvinfer1::DataType convStateDataType,
+        nvinfer1::DataType ssmStateDataType);
+
     /// @brief Destructor.
     virtual ~CacheSender();
 
@@ -337,6 +343,12 @@ public:
     /// @param session The session object.
     /// @return Whether the request is ready to be received.
     virtual bool receiveReadySignal(TransferSession& session);
+
+    /// @brief Update the RNN config on the internal CacheState copies.
+    /// Used by CppMambaHybridCacheManager path where RNN config is set after construction.
+    void setRnnConfig(executor::kv_cache::CacheState::RnnModelConfig rnnModelConfig,
+        std::vector<SizeType32> rnnLayerNumPerPP, nvinfer1::DataType convStateDataType,
+        nvinfer1::DataType ssmStateDataType);
 
     /// @brief Destructor.
     virtual ~CacheReceiver();

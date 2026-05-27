@@ -860,6 +860,15 @@ private:
         return mReadyResponses.find(getCurrentRequestId());
     }
 
+public:
+    void setRnnConfig(executor::kv_cache::CacheState::RnnModelConfig rnnModelConfig,
+        std::vector<SizeType32> rnnLayerNumPerPP, nvinfer1::DataType convStateDataType,
+        nvinfer1::DataType ssmStateDataType)
+    {
+        mCacheTransferLayer.setRnnConfig(rnnModelConfig, rnnLayerNumPerPP, convStateDataType, ssmStateDataType);
+        mSelfState.setCacheState(mCacheTransferLayer.getCacheState());
+    }
+
 private:
     std::optional<RequestIdType> mCurrentRequest;
     std::set<LlmRequest::RequestIdType> mCancelledRequests;
@@ -1652,6 +1661,16 @@ private:
         }
     }
 
+public:
+    void setRnnConfig(executor::kv_cache::CacheState::RnnModelConfig rnnModelConfig,
+        std::vector<SizeType32> rnnLayerNumPerPP, nvinfer1::DataType convStateDataType,
+        nvinfer1::DataType ssmStateDataType)
+    {
+        mCacheTransferLayer.setRnnConfig(rnnModelConfig, rnnLayerNumPerPP, convStateDataType, ssmStateDataType);
+        mSelfState.setCacheState(mCacheTransferLayer.getCacheState());
+    }
+
+private:
     int mDeviceId{-1};
     static constexpr char const* kDefaultProcessInfo = "default";
     std::vector<std::future<void>> mRequestFutures;
@@ -1725,6 +1744,12 @@ void CacheSender::sendReadySignal(LlmRequest::RequestIdType requestId, bool isRe
     mImpl->sendReadySignal(requestId, isReady);
 }
 
+void CacheSender::setRnnConfig(executor::kv_cache::CacheState::RnnModelConfig rnnModelConfig,
+    std::vector<SizeType32> rnnLayerNumPerPP, nvinfer1::DataType convStateDataType, nvinfer1::DataType ssmStateDataType)
+{
+    mImpl->setRnnConfig(std::move(rnnModelConfig), std::move(rnnLayerNumPerPP), convStateDataType, ssmStateDataType);
+}
+
 CacheReceiver::CacheReceiver(
     executor::kv_cache::ConnectionManager* manager, SizeType32 selfIndex, CacheTransferLayer cacheLayer)
     : mImpl{std::unique_ptr<Impl, ImplDeleter>(new Impl(manager, selfIndex, std::move(cacheLayer)))}
@@ -1756,6 +1781,12 @@ bool CacheReceiver::cancelRequest(LlmRequest const& llmRequest)
 bool CacheReceiver::receiveReadySignal(TransferSession& session)
 {
     return mImpl->receiveReadySignal(session);
+}
+
+void CacheReceiver::setRnnConfig(executor::kv_cache::CacheState::RnnModelConfig rnnModelConfig,
+    std::vector<SizeType32> rnnLayerNumPerPP, nvinfer1::DataType convStateDataType, nvinfer1::DataType ssmStateDataType)
+{
+    mImpl->setRnnConfig(std::move(rnnModelConfig), std::move(rnnLayerNumPerPP), convStateDataType, ssmStateDataType);
 }
 
 } // namespace tensorrt_llm::batch_manager

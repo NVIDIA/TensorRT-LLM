@@ -238,7 +238,9 @@ def _compute_rotary_cos_sin_from_config(
     rope_scaling = getattr(model_config, "rope_scaling", None)
     mscale = 1.0
     if rope_scaling is not None:
-        scaling_type = rope_scaling.get("type", "")
+        scaling_type = rope_scaling.get(
+            "type", rope_scaling.get("rope_type", "yarn" if "factor" in rope_scaling else "")
+        )
         if scaling_type == "yarn":
             factor = rope_scaling.get("factor", 1.0)
             mscale_factor = rope_scaling.get("mscale", 1.0)
@@ -271,14 +273,15 @@ def _compute_rotary_cos_sin_from_config(
                 _yarn_find_correction_dim(beta_slow, half_dim * 2, rope_theta, original_max)
             )
             low = max(low, 0)
-            high = min(high, half_dim - 1)
+            high = min(high, qk_rope_head_dim - 1)
+            if low == high:
+                high += 0.001
 
-            if low < high:
-                smooth = (torch.arange(half_dim, dtype=torch.float32) - low) / (high - low)
-                smooth = smooth.clamp(0, 1)
-                inv_freq = inv_freq / factor * (1 - smooth) + inv_freq * smooth
-            else:
-                inv_freq = inv_freq / factor
+            smooth = (torch.arange(half_dim, dtype=torch.float32) - low) / (high - low)
+            smooth = smooth.clamp(0, 1)
+            freq_extra = inv_freq
+            freq_inter = inv_freq / factor
+            inv_freq = freq_inter * smooth + freq_extra * (1 - smooth)
 
     t = torch.arange(max_position, dtype=torch.float32)
     freqs = torch.outer(t, inv_freq)

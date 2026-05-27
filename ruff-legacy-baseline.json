@@ -1,8 +1,8 @@
 {
   "_meta": {
     "generated_by": "scripts/legacy_utils.py lint-update-violations",
-    "total_violations": 5231,
-    "total_files": 481
+    "total_violations": 5172,
+    "total_files": 480
   },
   ".github/scripts/label_community_user.py": {
     "D212": 1
@@ -552,9 +552,6 @@
   "tensorrt_llm/_torch/models/modeling_nemotron.py": {
     "E731": 1
   },
-  "tensorrt_llm/_torch/models/modeling_qwen2vl.py": {
-    "F811": 1
-  },
   "tensorrt_llm/_torch/models/modeling_siglip.py": {
     "F811": 1
   },
@@ -608,7 +605,7 @@
   "tensorrt_llm/_torch/pyexecutor/py_executor.py": {
     "E712": 1,
     "E721": 1,
-    "F821": 3
+    "F821": 2
   },
   "tensorrt_llm/_torch/pyexecutor/resource_manager.py": {
     "F821": 2
@@ -891,21 +888,19 @@
     "D205": 4
   },
   "tensorrt_llm/llmapi/llm_args.py": {
-    "D200": 24,
     "D202": 1,
     "D205": 10,
     "D208": 2,
     "D210": 7,
-    "D212": 36,
+    "D212": 14,
     "D300": 8,
     "D415": 2
   },
   "tensorrt_llm/llmapi/llm_utils.py": {
     "D200": 2,
-    "D205": 4,
     "D209": 1,
     "D210": 9,
-    "D212": 3,
+    "D212": 2,
     "D300": 12
   },
   "tensorrt_llm/llmapi/mgmn_leader_node.py": {
@@ -1683,7 +1678,6 @@
     "E741": 2
   },
   "tests/integration/defs/disaggregated/test_disaggregated.py": {
-    "D202": 2,
     "D205": 3,
     "D209": 1,
     "D212": 5,
@@ -1962,7 +1956,7 @@
   },
   "tests/integration/defs/triton_server/test_triton_llm.py": {
     "F403": 2,
-    "F405": 169
+    "F405": 174
   },
   "tests/integration/defs/triton_server/test_triton_memleak.py": {
     "F403": 2,
@@ -2374,9 +2368,6 @@
     "D205": 1
   },
   "triton_backend/all_models/llmapi/tensorrt_llm/1/helpers.py": {
-    "D205": 3,
-    "D212": 3,
-    "D415": 3,
     "E722": 1
   },
   "triton_backend/all_models/llmapi/tensorrt_llm/1/model.py": {

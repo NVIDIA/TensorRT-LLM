@@ -384,9 +384,15 @@ class AttentionMetadata:
             max_total_draft_tokens,
             model_is_wrapped: bool = False,
             spec_metadata: Optional['SpecMetadata'] = None,
-            spec_tree_manager: Optional['SpecTreeManager'] = None):
+            spec_tree_manager: Optional['SpecTreeManager'] = None,
+            num_contexts: int = 0):
         """
         Hook to be called when using TRTLLM attention backend in spec-dec mode.
+
+        ``num_contexts`` is the number of context (prefill) requests in the
+        mixed batch, occupying the leading rows of slot-storage buffers.
+        Backends that consume gen-only slots (e.g. dynamic tree) must skip
+        these rows to align with the XQA kernel's expected row layout.
         """
 
     def update_helix_param(

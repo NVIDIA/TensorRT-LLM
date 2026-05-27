@@ -56,29 +56,53 @@ def test_to_disaggregated_params():
         first_gen_tokens=[1, 2],
         ctx_dp_rank=5,
         ctx_info_endpoint="tcp://10.0.0.1:5000",
+        ctx_usage={
+            "prompt_tokens": 10,
+            "completion_tokens": 0,
+            "total_tokens": 10,
+            "prompt_tokens_details": {
+                "cached_tokens": 4,
+            },
+        },
     )
     openai_params = to_disaggregated_params(llm_params)
 
+    print(f"[usage_check] to_disaggregated_params: ctx_usage={openai_params.ctx_usage}")
     assert openai_params.request_type == "context_only"
     assert openai_params.first_gen_tokens == [1, 2]
     assert openai_params.ctx_dp_rank == 5
     assert openai_params.ctx_info_endpoint == "tcp://10.0.0.1:5000"
+    assert openai_params.ctx_usage.prompt_tokens == 10
+    assert openai_params.ctx_usage.prompt_tokens_details.cached_tokens == 4
 
 
 def test_to_llm_disaggregated_params():
     from tensorrt_llm.serve.openai_protocol import DisaggregatedParams as OpenAIDisaggregatedParams
-    from tensorrt_llm.serve.openai_protocol import to_llm_disaggregated_params
+    from tensorrt_llm.serve.openai_protocol import (
+        PromptTokensDetails,
+        UsageInfo,
+        to_llm_disaggregated_params,
+    )
 
     openai_params = OpenAIDisaggregatedParams(
         request_type="generation_only",
         ctx_dp_rank=2,
         ctx_info_endpoint="tcp://10.0.0.1:5000",
+        ctx_usage=UsageInfo(
+            prompt_tokens=10,
+            completion_tokens=0,
+            total_tokens=10,
+            prompt_tokens_details=PromptTokensDetails(cached_tokens=4),
+        ),
     )
     llm_params = to_llm_disaggregated_params(openai_params)
 
+    print(f"[usage_check] to_llm_disaggregated_params: ctx_usage={llm_params.ctx_usage}")
     assert llm_params.request_type == "generation_only"
     assert llm_params.ctx_dp_rank == 2
     assert llm_params.ctx_info_endpoint == "tcp://10.0.0.1:5000"
+    assert llm_params.ctx_usage["prompt_tokens"] == 10
+    assert llm_params.ctx_usage["prompt_tokens_details"]["cached_tokens"] == 4
 
 
 @patch("tensorrt_llm.disaggregated_params.tllme")

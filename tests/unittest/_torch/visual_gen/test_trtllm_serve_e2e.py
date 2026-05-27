@@ -87,7 +87,7 @@ class RemoteVisualGenServer:
     def __init__(
         self,
         model: str,
-        extra_visual_gen_options: Optional[dict] = None,
+        visual_gen_args: Optional[dict] = None,
         cli_args: Optional[List[str]] = None,
         host: str = "localhost",
         port: Optional[int] = None,
@@ -103,11 +103,11 @@ class RemoteVisualGenServer:
             args += cli_args
 
         # Write the visual-gen YAML config to a temp file
-        if extra_visual_gen_options:
+        if visual_gen_args:
             fd, self._config_file = tempfile.mkstemp(suffix=".yml", prefix="vg_cfg_")
             with os.fdopen(fd, "w") as f:
-                yaml.dump(extra_visual_gen_options, f)
-            args += ["--extra_visual_gen_options", self._config_file]
+                yaml.dump(visual_gen_args, f)
+            args += ["--visual_gen_args", self._config_file]
 
         launch_cmd = ["trtllm-serve", model] + args
 
@@ -198,9 +198,9 @@ def _assert_b64_image_response(data: dict) -> None:
 
 
 def _make_visual_gen_options(**extra) -> dict:
-    """Build the YAML dict passed via ``--extra_visual_gen_options``."""
+    """Build the YAML dict passed via ``--visual_gen_args``."""
     config = {
-        "parallel": {"dit_cfg_size": 1, "dit_ulysses_size": 1},
+        "parallel_config": {"cfg_size": 1, "ulysses_size": 1},
     }
     config.update(extra)
     return config
@@ -218,7 +218,7 @@ class TestWanTextToVideo:
     def server(self):
         with RemoteVisualGenServer(
             model=str(_WAN_T2V_PATH),
-            extra_visual_gen_options=_make_visual_gen_options(),
+            visual_gen_args=_make_visual_gen_options(),
         ) as srv:
             yield srv
 
@@ -338,7 +338,7 @@ class TestWanImageToVideo:
     def server(self):
         with RemoteVisualGenServer(
             model=str(_WAN_I2V_PATH),
-            extra_visual_gen_options=_make_visual_gen_options(),
+            visual_gen_args=_make_visual_gen_options(),
         ) as srv:
             yield srv
 
@@ -459,7 +459,7 @@ class TestFlux1TextToImage:
     def server(self):
         with RemoteVisualGenServer(
             model=str(_FLUX1_PATH),
-            extra_visual_gen_options=_make_visual_gen_options(),
+            visual_gen_args=_make_visual_gen_options(),
         ) as srv:
             yield srv
 
@@ -517,7 +517,7 @@ class TestFlux2TextToImage:
     def server(self):
         with RemoteVisualGenServer(
             model=str(_FLUX2_PATH),
-            extra_visual_gen_options=_make_visual_gen_options(),
+            visual_gen_args=_make_visual_gen_options(),
         ) as srv:
             yield srv
 

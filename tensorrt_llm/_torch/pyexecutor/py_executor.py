@@ -62,7 +62,8 @@ from .kv_cache_transceiver import (KvCacheTransceiver,
                                    is_disagg_inflight_cancel_enabled)
 from .llm_request import (ExecutorRequest, LlmRequest, LlmRequestState,
                           LlmResponse, get_draft_token_length)
-from .mamba_cache_manager import BaseMambaCacheManager, MambaHybridCacheManager
+from .mamba_cache_manager import (BaseMambaCacheManager,
+                                  MixedMambaHybridCacheManager)
 from .model_engine import ModelEngine
 from .perf_metrics_manager import PerfMetricsManager
 from .request_utils import (RequestBroadcaster, attach_py_objects_to_requests,
@@ -1193,16 +1194,22 @@ class PyExecutor:
                 host_step_time = (end_time - start_time) * 1000  # milliseconds
                 formatted_timestamp = datetime.datetime.now().strftime(
                     "%Y-%m-%d %H:%M:%S")
+                kv_util_str = "N/A"
+                if self.kv_cache_manager is not None:
+                    kv_stats = self.kv_cache_manager.get_kv_cache_stats()
+                    if kv_stats.max_num_blocks > 0:
+                        kv_util_str = f"{1.0 - kv_stats.free_num_blocks / kv_stats.max_num_blocks:.3f}"
                 logger.info(
                     f"iter = {self.iter_counter}, "
                     f"global_rank = {self.global_rank}, "
                     f"rank = {self.dist.rank}, "
+                    f"num_scheduled_requests = {self.num_scheduled_requests}, "
+                    f"kv_cache_util = {kv_util_str}, "
                     f"currank_total_requests = {self.num_fetch_requests_cur_rank}/"
                     f"{self.num_fetch_requests}, "
                     f"host_step_time = {host_step_time}ms, "
                     f"prev_device_step_time = {prev_device_step_time}, "
                     f"timestamp = {formatted_timestamp}, "
-                    f"num_scheduled_requests: {self.num_scheduled_requests}, "
                     f"states = {self.model_engine.iter_states}")
 
             it += 1
@@ -3621,8 +3628,9 @@ class PyExecutor:
 
         num_fitting = scheduler_output.num_fitting_requests
         #TODO(TRTLLM-12359): remove the WAR when PythonMambaCacheManager is deprecated.
-        if isinstance(self.kv_cache_manager,
-                      MambaHybridCacheManager) and self.kv_cache_transceiver:
+        if isinstance(
+                self.kv_cache_manager,
+                MixedMambaHybridCacheManager) and self.kv_cache_transceiver:
             if len(scheduled_context_requests) > 0:
                 scheduled_context_requests = self.kv_cache_manager.filter_ctx_requests_by_capacity(
                     scheduled_context_requests)
@@ -4142,8 +4150,11 @@ class PyExecutor:
             num_accepted_tokens_device: Optional[torch.Tensor] = None):
         ExpertStatistic.set_iter(self.iter_counter)
 
+        num_ctx_tokens = sum(req.context_chunk_size
+                             for req in scheduled_requests.context_requests)
+
         @nvtx_range(
-            f"[Executor] _forward_step {self.iter_counter}: {scheduled_requests.num_context_requests} ctx reqs, {scheduled_requests.num_generation_requests} gen reqs"
+            f"[Executor] _forward_step {self.iter_counter}: {scheduled_requests.num_context_requests} ctx reqs, {num_ctx_tokens} ctx tokens, {scheduled_requests.num_generation_requests} gen reqs"
         )
         def forward(scheduled_requests, resource_manager, new_tensors_device,
                     gather_context_logits, cache_indirection_buffer,
