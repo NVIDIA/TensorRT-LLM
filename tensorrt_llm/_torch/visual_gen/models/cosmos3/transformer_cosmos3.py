@@ -221,7 +221,7 @@ class Cosmos3CausalAttention(Attention):
             num_key_value_heads=num_key_value_heads,
             head_dim=head_dim,
             qkv_mode=QKVMode.SEPARATE_QKV,
-            qk_norm=True,
+            qk_norm=False,
             qk_norm_mode="per_head",
             bias=False,
             config=model_config,
@@ -247,9 +247,9 @@ class Cosmos3CausalAttention(Attention):
 
         q, k, v = self.get_qkv(hidden_states)
 
-        q = q.view(batch_size, seq_len, self.num_attention_heads, self.head_dim)
-        k = k.view(batch_size, seq_len, self.num_key_value_heads, self.head_dim)
-        v = v.view(batch_size, seq_len, self.num_key_value_heads, self.head_dim)
+        q = q.view(batch_size, seq_len, self.local_num_attention_heads, self.head_dim)
+        k = k.view(batch_size, seq_len, self.local_num_key_value_heads, self.head_dim)
+        v = v.view(batch_size, seq_len, self.local_num_key_value_heads, self.head_dim)
 
         q, k = self.apply_qk_norm(q, k)
         q, k = qwen3_apply_rotary_pos_emb(q, k, freqs_cos, freqs_sin)
@@ -300,7 +300,7 @@ class Cosmos3CrossAttention(Attention):
             num_key_value_heads=num_key_value_heads,
             head_dim=head_dim,
             qkv_mode=QKVMode.FUSE_QKV,
-            qk_norm=True,
+            qk_norm=False,
             qk_norm_mode="per_head",
             bias=False,
             config=model_config,
@@ -341,9 +341,9 @@ class Cosmos3CrossAttention(Attention):
 
         q, k, v = self.get_qkv(hidden_states)
 
-        q = q.view(batch_size, seq_len_gen, self.num_attention_heads, self.head_dim)
-        k = k.view(batch_size, seq_len_gen, self.num_key_value_heads, self.head_dim)
-        v = v.view(batch_size, seq_len_gen, self.num_key_value_heads, self.head_dim)
+        q = q.view(batch_size, seq_len_gen, self.local_num_attention_heads, self.head_dim)
+        k = k.view(batch_size, seq_len_gen, self.local_num_key_value_heads, self.head_dim)
+        v = v.view(batch_size, seq_len_gen, self.local_num_key_value_heads, self.head_dim)
 
         q, k = self.apply_qk_norm(q, k)
         q, k = qwen3_apply_rotary_pos_emb(q, k, freqs_cos, freqs_sin)
@@ -395,6 +395,7 @@ class Cosmos3UndDecoderLayer(nn.Module):
             dtype=torch.bfloat16,
             config=model_config,
             layer_idx=layer_idx,
+            reduce_output=model_config.mapping.tp_size > 1,
         )
 
     def forward(
@@ -457,6 +458,7 @@ class Cosmos3GenDecoderLayer(nn.Module):
             dtype=torch.bfloat16,
             config=model_config,
             layer_idx=layer_idx,
+            reduce_output=model_config.mapping.tp_size > 1,
         )
 
     def forward(
@@ -670,16 +672,30 @@ class Cosmos3VFMTransformer(nn.Module):
 
         vgm = model_config.visual_gen_mapping
 
-        if vgm is not None and vgm.tp_size > 1:
-            raise ValueError(
-                f"Cosmos3 does not support tensor parallelism. Got tp_size={vgm.tp_size}"
-            )
-
         self.sharder = SequenceSharder.from_vgm(
             vgm,
             num_attention_heads=self.num_attention_heads,
             num_kv_heads=self.num_kv_heads,
         )
+        tp_size = vgm.tp_size if vgm else 1
+        ulysses_size = vgm.ulysses_size if vgm else 1
+        cp_size = vgm.cp_size if vgm else 1
+        head_divisibility_factor = tp_size * ulysses_size
+
+        if (ulysses_size > 1 or tp_size > 1) and (
+            self.num_attention_heads % head_divisibility_factor != 0
+            or self.num_kv_heads % head_divisibility_factor != 0
+        ):
+            raise ValueError(
+                f"num_attention_heads ({self.num_attention_heads}) and "
+                f"num_kv_heads ({self.num_kv_heads}) must be divisible by "
+                f"TP * Ulysses size ({tp_size} * {ulysses_size})"
+            )
+
+        if cp_size > 1:
+            # Context parallelism is not compatible with Cosmos3 cross-attention: its forward()
+            # TODO: Re-enable once Ring/Attn2D PRs with cross-attention support have landed.
+            raise NotImplementedError("Context parallelism is not supported for Cosmos3. ")
 
         self.language_model = Cosmos3LanguageModel(model_config)
 

@@ -23,7 +23,7 @@ import os
 import tempfile
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Callable, List, Tuple
+from typing import Callable, List, Optional, Tuple
 
 os.environ["TLLM_DISABLE_MPI"] = "1"
 os.environ["TRTLLM_DISABLE_COSMOS3_GUARDRAILS"] = "1"
@@ -214,18 +214,24 @@ def _make_model_config(
     pretrained_dict,
     *,
     cfg_size=1,
+    tp_size=1,
     ulysses_size=1,
     backend="VANILLA",
     force_single_gpu=False,
     **parallel_kwargs,
 ):
     cfg_size = parallel_kwargs.pop("dit_cfg_size", cfg_size)
+    tp_size = parallel_kwargs.pop("dit_tp_size", tp_size)
     ulysses_size = parallel_kwargs.pop("dit_ulysses_size", ulysses_size)
     if parallel_kwargs:
         raise TypeError(f"Unexpected parallel config args: {sorted(parallel_kwargs.keys())}")
 
     pretrained_config = SimpleNamespace(**pretrained_dict)
-    use_dist = not force_single_gpu and (cfg_size > 1 or ulysses_size > 1) and dist.is_initialized()
+    use_dist = (
+        not force_single_gpu
+        and (cfg_size > 1 or tp_size > 1 or ulysses_size > 1)
+        and dist.is_initialized()
+    )
     if force_single_gpu or not use_dist:
         ws = 1
         rk = 0
@@ -237,6 +243,7 @@ def _make_model_config(
         world_size=ws,
         rank=rk,
         cfg_size=cfg_size,
+        tp_size=tp_size,
         ulysses_size=ulysses_size,
     )
     config = DiffusionModelConfig(
@@ -259,9 +266,10 @@ def _load_transformer_weights(checkpoint_dir: Path, mapping) -> dict:
 def _rank_text_and_ref_key(rank: int, parallel_cfg_kwargs: dict) -> Tuple[int, str]:
     """Map global rank to CFG text seed and reference tensor key."""
     cfg_size = parallel_cfg_kwargs.get("dit_cfg_size", 1)
+    tp_size = parallel_cfg_kwargs.get("dit_tp_size", 1)
     ulysses_size = parallel_cfg_kwargs.get("dit_ulysses_size", 1)
     if cfg_size > 1:
-        cfg_rank = rank // ulysses_size
+        cfg_rank = rank // (tp_size * ulysses_size)
         text_seed = SEED_COND_TEXT if cfg_rank == 0 else SEED_UNCOND_TEXT
         ref_key = "cond" if cfg_rank == 0 else "uncond"
     else:
@@ -452,53 +460,92 @@ def _logic_cosmos3_parallel_only(
 @pytest.mark.gpu2
 @pytest.mark.high_cuda_memory
 class TestCosmos3TransformerParallel:
-    """Transformer-only Cosmos3 correctness for Ulysses and CFG+Ulysses."""
+    """Transformer-only Cosmos3 correctness for TP, Ulysses, CFG, and combinations."""
 
     def _skip_if_unavailable(self):
         if not MODULES_AVAILABLE:
             pytest.skip("Required modules not available")
 
-    def test_ulysses2_vs_single_gpu(self):
-        self._skip_if_unavailable()
-        checkpoint_dir = _transformer_checkpoint_dir()
-        ref_outputs = _compute_references_in_subprocess(checkpoint_dir, [SEED_COND_TEXT])
+    def _run_parallel_vs_single_gpu(
+        self,
+        *,
+        world_size: int,
+        parallel_cfg_kwargs: dict,
+        label: str,
+        text_seeds: Optional[List[int]] = None,
+    ) -> None:
+        if text_seeds is None:
+            text_seeds = [SEED_COND_TEXT]
 
-        with tempfile.NamedTemporaryFile(suffix=".pt", delete=False) as f:
-            ref_path = f.name
-        try:
-            torch.save(ref_outputs[0], ref_path)
-            run_test_in_distributed(
-                world_size=2,
-                test_fn=_logic_cosmos3_parallel_only,
-                checkpoint_dir=str(checkpoint_dir),
-                ref_paths={"default": ref_path},
-                parallel_cfg_kwargs=dict(dit_ulysses_size=2),
-                label="ulysses=2-2gpu",
-            )
-        finally:
-            os.unlink(ref_path)
-
-    @pytest.mark.gpu4
-    def test_cfg2_ulysses2_vs_single_gpu(self):
-        self._skip_if_unavailable()
         checkpoint_dir = _transformer_checkpoint_dir()
-        ref_cond, ref_uncond = _compute_references_in_subprocess(
-            checkpoint_dir, [SEED_COND_TEXT, SEED_UNCOND_TEXT]
-        )
+        ref_outputs = _compute_references_in_subprocess(checkpoint_dir, text_seeds)
+
+        if len(text_seeds) == 1:
+            with tempfile.NamedTemporaryFile(suffix=".pt", delete=False) as f:
+                ref_path = f.name
+            try:
+                torch.save(ref_outputs[0], ref_path)
+                ref_paths = {"default": ref_path}
+                run_test_in_distributed(
+                    world_size=world_size,
+                    test_fn=_logic_cosmos3_parallel_only,
+                    checkpoint_dir=str(checkpoint_dir),
+                    ref_paths=ref_paths,
+                    parallel_cfg_kwargs=parallel_cfg_kwargs,
+                    label=label,
+                )
+            finally:
+                os.unlink(ref_path)
+            return
 
         with tempfile.TemporaryDirectory() as tmpdir:
             cond_path = os.path.join(tmpdir, "ref_cond.pt")
             uncond_path = os.path.join(tmpdir, "ref_uncond.pt")
-            torch.save(ref_cond, cond_path)
-            torch.save(ref_uncond, uncond_path)
+            torch.save(ref_outputs[0], cond_path)
+            torch.save(ref_outputs[1], uncond_path)
             run_test_in_distributed(
-                world_size=4,
+                world_size=world_size,
                 test_fn=_logic_cosmos3_parallel_only,
                 checkpoint_dir=str(checkpoint_dir),
                 ref_paths={"cond": cond_path, "uncond": uncond_path},
-                parallel_cfg_kwargs=dict(dit_cfg_size=2, dit_ulysses_size=2),
-                label="cfg=2,ulysses=2-4gpu",
+                parallel_cfg_kwargs=parallel_cfg_kwargs,
+                label=label,
             )
+
+    def test_tp2_vs_single_gpu(self):
+        self._skip_if_unavailable()
+        self._run_parallel_vs_single_gpu(
+            world_size=2,
+            parallel_cfg_kwargs=dict(dit_tp_size=2),
+            label="tp=2-2gpu",
+        )
+
+    def test_ulysses2_vs_single_gpu(self):
+        self._skip_if_unavailable()
+        self._run_parallel_vs_single_gpu(
+            world_size=2,
+            parallel_cfg_kwargs=dict(dit_ulysses_size=2),
+            label="ulysses=2-2gpu",
+        )
+
+    @pytest.mark.gpu4
+    def test_tp2_ulysses2_vs_single_gpu(self):
+        self._skip_if_unavailable()
+        self._run_parallel_vs_single_gpu(
+            world_size=4,
+            parallel_cfg_kwargs=dict(dit_tp_size=2, dit_ulysses_size=2),
+            label="tp=2,ulysses=2-4gpu",
+        )
+
+    @pytest.mark.gpu4
+    def test_cfg2_ulysses2_vs_single_gpu(self):
+        self._skip_if_unavailable()
+        self._run_parallel_vs_single_gpu(
+            world_size=4,
+            parallel_cfg_kwargs=dict(dit_cfg_size=2, dit_ulysses_size=2),
+            label="cfg=2,ulysses=2-4gpu",
+            text_seeds=[SEED_COND_TEXT, SEED_UNCOND_TEXT],
+        )
 
 
 if __name__ == "__main__":
