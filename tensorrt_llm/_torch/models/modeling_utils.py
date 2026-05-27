@@ -756,7 +756,6 @@ def register_vision_encoder(
 
     def wrapper(model_cls: Type[nn.Module]) -> Type[nn.Module]:
         registered = False
-        # One class can have many arch aliases. Keep scanning; break-first drops aliases.
         for arch_name, registered_cls in MODEL_CLASS_MAPPING.items():
             if registered_cls.__name__ == model_cls.__name__:
                 MODEL_CLASS_VISION_ENCODER_MAPPING[arch_name] = (
