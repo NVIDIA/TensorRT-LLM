@@ -144,12 +144,6 @@ class LTX2Attention(Attention):
             eps=norm_eps,
             bias=True,
             interleave=(rope_type == LTXRopeType.INTERLEAVED),
-            # TODO: fuse_qk_norm_rope is currently inert when
-            # _use_async_ulysses is set (qkv_mode forced to SEPARATE_QKV above),
-            # so the closures run to_q -> norm_q -> view -> apply_rotary_emb
-            # as 4 ops instead of the fused kernel. See PR #13978 follow-up #3
-            # for the plan to feed the fused norm+rope kernel output directly
-            # into the symm-mem slot via the ulyssesPermuteScatter epilogue.
             fuse_qk_norm_rope=True,
             config=config,
             layer_idx=layer_idx,
@@ -312,7 +306,9 @@ class LTX2Attention(Attention):
         Caller contract:
           - FUSE_QKV (self-attn): pe must be set; k_pe and pre_projected_kv unused.
           - SEPARATE_QKV (cross-attn): cached path requires pre_projected_kv;
-            uncached path requires `context`. pe optional (None = norm-only).
+            uncached path uses ``context`` (may be None when the async-Ulysses
+            inner backend was swapped to a non-async one — falls back to
+            self-attn via kv_source=x). pe optional (None = norm-only).
             k_pe overrides pe for K (e.g. AV cross-attn) when provided.
 
         Args:
@@ -323,144 +319,92 @@ class LTX2Attention(Attention):
                 silently ignores it. ``LTX2Attention`` constructs ``audio_attn1``
                 with a VANILLA backend whenever Ulysses is active under a
                 TRTLLM backend config (see ``_init_audio_modules``).
+
+        Routing:
+          1. Async-Ulysses self-attn → ``forward_async`` (V/Q/K rolling A2A).
+          2. FUSE_QKV self-attn → packed fused kernel (or naive mini-config).
+          3. SEPARATE_QKV cross-attn → split fused kernel (or naive mini-config).
         """
-        # Fallback to the naive eager rope path when fusion is disabled or
-        # the kernel doesn't support this head_dim. LTX-2 prod has
-        # fuse_qk_norm_rope=True and head_dim ∈ {64, 128}, so this branch
-        # only fires under mini-config unit tests (head_dim=32).
-        if not self.fuse_qk_norm_rope or self.head_dim not in (64, 128):
-            return self._forward_unfused(x, context, pe, k_pe, pre_projected_kv, key_padding_mask)
-
-        if self.qkv_mode == QKVMode.FUSE_QKV:
-            # ─── self-attn → packed kernel (norm + rope on QKV in-place) ───
-            qkv = self.qkv_proj(x)
-            cos, sin = pe
-            self.apply_packed_qk_norm_rope(qkv, cos, sin)
-            q, k, v = qkv.split([self.q_dim, self.kv_dim, self.kv_dim], dim=-1)
-
-        elif self.qkv_mode == QKVMode.SEPARATE_QKV:
-            # ─── cross-attn → split kernel (norm or norm+rope based on pe) ───
-            if pre_projected_kv is not None:
-                # K/V cached by caller (text cross-attn + AV cross-attn).
-                # The caller is responsible for any K-norm + K-rope on the
-                # cached tensor; we only fuse Q here.
-                k, v = pre_projected_kv
-                q = self.to_q(x)
-                self.apply_split_norm_or_norm_rope(
-                    q, self.norm_q.weight, self.num_attention_heads, pe
-                )
-            else:
-                # Uncached cross-attn (not exercised by LTX-2 in practice; kept for fuse-dispatch consistency).
-                q = self.to_q(x)
-                k = self.to_k(context)
-                v = self.to_v(context)
-                self.apply_split_norm_or_norm_rope(
-                    q, self.norm_q.weight, self.num_attention_heads, pe
-                )
-                self.apply_split_norm_or_norm_rope(
-                    k,
-                    self.norm_k.weight,
-                    self.num_key_value_heads,
-                    k_pe if k_pe is not None else pe,
-                )
-
-        attn_kwargs = {}
-        if key_padding_mask is not None:
-            attn_kwargs["key_padding_mask"] = key_padding_mask
-        out = self._attn_impl(q, k, v, **attn_kwargs)
-
-        if self.to_gate_logits is not None:
-            gate_logits = self.to_gate_logits(x)
-            b, t, _ = out.shape
-            out = out.view(b, t, self.num_attention_heads, self.head_dim)
-            gates = 2.0 * torch.sigmoid(gate_logits)
-            out = out * gates.unsqueeze(-1)
-            out = out.view(b, t, self.num_attention_heads * self.head_dim)
-
-        return self.to_out[0](out)
-
-    def _forward_unfused(
-        self,
-        x: torch.Tensor,
-        context: torch.Tensor | None,
-        pe: tuple[torch.Tensor, torch.Tensor] | None,
-        k_pe: tuple[torch.Tensor, torch.Tensor] | None,
-        pre_projected_kv: tuple[torch.Tensor, torch.Tensor] | None,
-        key_padding_mask: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        """Fallback path for unsupported configs (head_dim ∉ {64, 128} or
-        ``fuse_qk_norm_rope=False``).
-
-        LTX-2 prod hardcodes ``fuse_qk_norm_rope=True`` and head_dim ∈
-        {64, 128}, so in production this is never entered. Exercised by the
-        mini-config unit tests in ``test_ltx2_transformer.py`` (head_dim=32)
-        and by ablation tests that explicitly disable fusion.
-
-        Contract: caller must pass *pe* / *k_pe* in 4D layout
-        ([B, T, H, D] for SPLIT rope, [B, T, D] for INTERLEAVED). The fused
-        kernel's 2D form is not compatible with the naive ``apply_rotary_emb``.
-        """
-        # Pipeline routing: async ulysses self-attn (V/Q/K rolling A2A).
-        # `hasattr` guard: when audio seq len is not divisible by ulysses_size,
-        # `set_ulysses_active(False)` swaps `self.attn` to plain `VanillaAttention`
-        # which lacks `forward_async`. Fall through in that case.
+        # Async-Ulysses self-attn dispatch. ``hasattr`` guard: audio_attn1 may
+        # have ``set_ulysses_active(False)`` swap ``self.attn`` to a plain
+        # backend that lacks ``forward_async`` — fall through to the sync
+        # uncached SEPARATE_QKV branch, which handles context=None via
+        # kv_source=x.
         if (
-            self._use_async_ulysses
+            self.qkv_mode == QKVMode.SEPARATE_QKV
+            and self._use_async_ulysses
             and context is None
             and pre_projected_kv is None
             and hasattr(self.attn, "forward_async")
         ):
-            B, Sp = x.shape[0], x.shape[1]
-            num_heads = self.num_attention_heads
-            num_kv_heads = self.num_key_value_heads
-            head_dim = self.head_dim
-            rope_type = self.rope_type
-            k_pe_use = k_pe if k_pe is not None else pe
+            return self.forward_async(x, freqs=pe)
 
-            def compute_q():
-                q = self.to_q(x)
+        # Fused gate: prod uses fused kernels (head_dim ∈ {64, 128}); mini-config
+        # tests (head_dim=32) fall to naive ops.
+        use_fused = self.fuse_qk_norm_rope and self.head_dim in (64, 128) and self.qk_norm
+
+        if self.qkv_mode == QKVMode.FUSE_QKV:
+            # ─── sync self-attn ───
+            if use_fused and pe is not None:
+                # Fused packed kernel: norm + RoPE on QKV in-place.
+                qkv = self.qkv_proj(x)
+                cos, sin = pe
+                self.apply_packed_qk_norm_rope(qkv, cos, sin)
+                q, k, v = qkv.split([self.q_dim, self.kv_dim, self.kv_dim], dim=-1)
+            else:
+                # Naive (mini-config head_dim ∉ {64, 128}).
+                q, k, v = self.get_qkv(x)
                 if self.qk_norm:
                     q = self.norm_q(q)
-                if pe is not None:
-                    q = apply_rotary_emb(q, pe, rope_type)
-                return q.view(B, Sp, num_heads, head_dim)
-
-            def compute_k():
-                k = self.to_k(x)
-                if self.qk_norm:
                     k = self.norm_k(k)
-                if k_pe_use is not None:
-                    k = apply_rotary_emb(k, k_pe_use, rope_type)
-                return k.view(B, Sp, num_kv_heads, head_dim)
+                if pe is not None:
+                    q = apply_rotary_emb(q, pe, self.rope_type)
+                    k = apply_rotary_emb(k, pe, self.rope_type)
 
-            def compute_v():
-                return self.to_v(x).view(B, Sp, num_kv_heads, head_dim)
-
-            attn_out_4d = self.attn.forward_async(compute_q, compute_k, compute_v)
-            b, t = attn_out_4d.shape[0], attn_out_4d.shape[1]
-            if self.to_gate_logits is not None:
-                gate_logits = self.to_gate_logits(x)
-                gates = 2.0 * torch.sigmoid(gate_logits)
-                attn_out_4d = attn_out_4d * gates.unsqueeze(-1)
-            out = attn_out_4d.reshape(b, t, self.num_attention_heads * self.head_dim)
-            return self.to_out[0](out)
-
-        if pre_projected_kv is not None:
-            k, v = pre_projected_kv
-            q = self.to_q(x)
-            if self.qk_norm:
-                q = self.norm_q(q)
-        else:
-            q, k, v = self.get_qkv(x, context)
-            q, k = self.apply_qk_norm(q, k)
-
-        if pe is not None:
-            q = apply_rotary_emb(q, pe, self.rope_type)
-            # k_pe=None with pre_projected_kv signals K already rotated.
-            if k_pe is not None:
-                k = apply_rotary_emb(k, k_pe, self.rope_type)
-            elif pre_projected_kv is None:
-                k = apply_rotary_emb(k, pe, self.rope_type)
+        elif self.qkv_mode == QKVMode.SEPARATE_QKV:
+            if pre_projected_kv is not None:
+                # ─── cached cross-attn (text + AV cross-attn) ───
+                # K/V cached by caller; we only norm+RoPE Q here.
+                k, v = pre_projected_kv
+                q = self.to_q(x)
+                if use_fused:
+                    self.apply_split_norm_or_norm_rope(
+                        q, self.norm_q.weight, self.num_attention_heads, pe
+                    )
+                else:
+                    if self.qk_norm:
+                        q = self.norm_q(q)
+                    if pe is not None:
+                        q = apply_rotary_emb(q, pe, self.rope_type)
+            else:
+                # ─── uncached cross-attn / async self-attn fallback ───
+                # LTX-2 prod doesn't use uncached cross-attn (always pre-projects
+                # K/V). This branch also catches async self-attn when the inner
+                # backend lacks forward_async (audio Ulysses-inactive swap):
+                # context=None then, fall back to self-attn via kv_source=x.
+                kv_source = context if context is not None else x
+                q = self.to_q(x)
+                k = self.to_k(kv_source)
+                v = self.to_v(kv_source)
+                if use_fused:
+                    self.apply_split_norm_or_norm_rope(
+                        q, self.norm_q.weight, self.num_attention_heads, pe
+                    )
+                    self.apply_split_norm_or_norm_rope(
+                        k,
+                        self.norm_k.weight,
+                        self.num_key_value_heads,
+                        k_pe if k_pe is not None else pe,
+                    )
+                else:
+                    if self.qk_norm:
+                        q = self.norm_q(q)
+                        k = self.norm_k(k)
+                    if pe is not None:
+                        q = apply_rotary_emb(q, pe, self.rope_type)
+                    k_pe_use = k_pe if k_pe is not None else pe
+                    if k_pe_use is not None:
+                        k = apply_rotary_emb(k, k_pe_use, self.rope_type)
 
         attn_kwargs = {}
         if key_padding_mask is not None:
@@ -476,6 +420,74 @@ class LTX2Attention(Attention):
             out = out.view(b, t, self.num_attention_heads * self.head_dim)
 
         return self.to_out[0](out)
+
+    def forward_async(
+        self,
+        x: torch.Tensor,
+        freqs: tuple[torch.Tensor, torch.Tensor] | None = None,
+    ) -> torch.Tensor:
+        """LTX-2 async-Ulysses self-attn driver. Structurally mirrors base
+        ``Attention.forward_async`` (single function, fused/unfused branches)
+        but uses LTX-2's ``apply_rotary_emb`` (with ``rope_type``) on the
+        unfused fallback and injects gated-attention scaling in 4D between
+        the attn output and ``to_out``.
+
+        Precondition: caller in ``LTX2Attention.forward`` gates on
+        ``_use_async_ulysses`` + ``hasattr(self.attn, "forward_async")``.
+
+        Returns 3D ``[B, S, H*D]`` matching ``forward``'s output contract.
+        """
+        B, S, _ = x.shape
+        H = self.num_attention_heads
+        KV = self.num_key_value_heads
+        D = self.head_dim
+        # Mirrors LTX2Attention.forward's fused gate; qkv_mode is implicitly
+        # SEPARATE_QKV under async (caller-enforced). head_dim check matches
+        # the fused split kernel's HEAD_DIM template instantiations {64, 128}.
+        use_fused = (
+            self.fuse_qk_norm_rope
+            and self.head_dim in (64, 128)
+            and freqs is not None
+            and self.qk_norm
+        )
+
+        def compute_q():
+            q = self.to_q(x)
+            if use_fused:
+                self.apply_split_norm_rope(q, self.norm_q.weight, H, freqs[0], freqs[1])
+                return q.view(B, S, H, D)
+            # Unfused fallback (mini-config); LTX-2 RoPE with rope_type.
+            if self.qk_norm:
+                q = self.norm_q(q)
+            q = q.view(B, S, H, D)
+            if freqs is not None:
+                q = apply_rotary_emb(q, freqs, self.rope_type)
+            return q
+
+        def compute_k():
+            k = self.to_k(x)
+            if use_fused:
+                self.apply_split_norm_rope(k, self.norm_k.weight, KV, freqs[0], freqs[1])
+                return k.view(B, S, KV, D)
+            if self.qk_norm:
+                k = self.norm_k(k)
+            k = k.view(B, S, KV, D)
+            if freqs is not None:
+                k = apply_rotary_emb(k, freqs, self.rope_type)
+            return k
+
+        def compute_v():
+            return self.to_v(x).view(B, S, KV, D)
+
+        out_4d = self.attn.forward_async(compute_q, compute_k, compute_v)
+
+        # LTX-2 gated-attention scaling in 4D before to_out.
+        if self.to_gate_logits is not None:
+            gates = 2.0 * torch.sigmoid(self.to_gate_logits(x))
+            out_4d = out_4d * gates.unsqueeze(-1)
+
+        b, t = out_4d.shape[:2]
+        return self.to_out[0](out_4d.reshape(b, t, H * D))
 
 
 # ---------------------------------------------------------------------------
