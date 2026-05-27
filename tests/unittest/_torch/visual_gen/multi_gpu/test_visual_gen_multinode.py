@@ -11,8 +11,8 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from tensorrt_llm._torch.visual_gen.config import VisualGenArgs
 from tensorrt_llm._torch.visual_gen.executor import run_diffusion_worker
+from tensorrt_llm.visual_gen.args import VisualGenArgs
 from tensorrt_llm.visual_gen.visual_gen import DiffusionRemoteClient, _detect_external_launch
 
 # =============================================================================
@@ -140,7 +140,7 @@ class TestRunDiffusionWorkerDeviceAssignment:
                 master_port=29500,
                 request_queue_addr="tcp://127.0.0.1:29501",
                 response_queue_addr="tcp://127.0.0.1:29502",
-                diffusion_args=VisualGenArgs(checkpoint_path="/tmp/model"),
+                visual_gen_args=VisualGenArgs(model="/tmp/model"),
                 local_rank=local_rank,
             )
 
@@ -198,7 +198,7 @@ class TestSingleNodeSpawnLocalRank:
         """Each mp.Process must receive local_rank=rank, not inherit LOCAL_RANK from env."""
         monkeypatch.setenv("LOCAL_RANK", "0")  # stale env — would assign all workers device 0
 
-        n_workers = 4  # dit_cfg_size=2 * dit_ulysses_size=2
+        n_workers = 4  # cfg_size=2 * ulysses_size=2
 
         captured_kwargs = []
         mock_proc = MagicMock()
@@ -210,8 +210,8 @@ class TestSingleNodeSpawnLocalRank:
         )
 
         args = VisualGenArgs(
-            checkpoint_path="/tmp/model",
-            parallel={"dit_cfg_size": 2, "dit_ulysses_size": 2},
+            model="/tmp/model",
+            parallel_config={"cfg_size": 2, "ulysses_size": 2},
         )
 
         # Pre-set all threading.Event instances so event_loop_ready.wait() returns immediately.

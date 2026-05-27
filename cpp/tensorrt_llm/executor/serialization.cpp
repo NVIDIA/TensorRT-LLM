@@ -639,6 +639,8 @@ kv_cache::CacheState Serialization::deserializeCacheState(std::istream& is)
         rnnCfg.mNGroups = su::deserialize<decltype(CacheState::RnnModelConfig::mNGroups)>(is);
         rnnCfg.mNumLayers = su::deserialize<decltype(CacheState::RnnModelConfig::mNumLayers)>(is);
         rnnCfg.mNumHeads = su::deserialize<decltype(CacheState::RnnModelConfig::mNumHeads)>(is);
+        rnnCfg.mConvSectionLayout
+            = static_cast<CacheState::RnnModelConfig::ConvSectionLayout>(su::deserialize<SizeType32>(is));
         convStateDataType = su::deserialize<nvinfer1::DataType>(is);
         ssmStateDataType = su::deserialize<nvinfer1::DataType>(is);
         rnnLayerNumPerPP = su::deserialize<std::vector<SizeType32>>(is);
@@ -690,6 +692,7 @@ void Serialization::serialize(kv_cache::CacheState const& state, std::ostream& o
         su::serialize(rnn.mNGroups, os);
         su::serialize(rnn.mNumLayers, os);
         su::serialize(rnn.mNumHeads, os);
+        su::serialize(static_cast<SizeType32>(rnn.mConvSectionLayout), os);
         su::serialize(state.mRnnCacheState->mConvStateDataType, os);
         su::serialize(state.mRnnCacheState->mSsmStateDataType, os);
         su::serialize(state.mRnnCacheState->mLayerNumPerPP, os);
@@ -731,6 +734,7 @@ size_t Serialization::serializedSize(kv_cache::CacheState const& state)
         totalSize += su::serializedSize(rnn.mNGroups);
         totalSize += su::serializedSize(rnn.mNumLayers);
         totalSize += su::serializedSize(rnn.mNumHeads);
+        totalSize += su::serializedSize(static_cast<SizeType32>(rnn.mConvSectionLayout));
         totalSize += su::serializedSize(state.mRnnCacheState->mConvStateDataType);
         totalSize += su::serializedSize(state.mRnnCacheState->mSsmStateDataType);
         totalSize += su::serializedSize(state.mRnnCacheState->mLayerNumPerPP);

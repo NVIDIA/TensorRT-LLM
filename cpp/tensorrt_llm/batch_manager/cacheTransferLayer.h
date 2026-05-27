@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -47,7 +47,7 @@ public:
     /// @brief Constructor.
     /// @param cacheState The cache state (KV, and optionally RNN if hasRnnConfig() is true).
     /// @param kvFormatter The KV cache formatter.
-    /// @param rnnFormatter Optional RNN cache formatter.
+    /// @param rnnFormatter Optional RNN cache formatter (for separate RnnStateManager pool).
     CacheTransferLayer(executor::kv_cache::CacheState cacheState, std::unique_ptr<BaseCacheFormatter> kvFormatter,
         std::unique_ptr<RnnCacheFormatter> rnnFormatter = nullptr);
 
@@ -75,6 +75,12 @@ public:
     void unformat(TransferSession& session) const;
 
     [[nodiscard]] executor::kv_cache::CacheState const& getCacheState() const noexcept;
+
+    /// @brief Update the RNN config on the internal CacheState.
+    /// Used by CppMambaHybridCacheManager path where RNN config is set after construction.
+    void setRnnConfig(executor::kv_cache::CacheState::RnnModelConfig rnnModelConfig,
+        std::vector<SizeType32> rnnLayerNumPerPP, nvinfer1::DataType convStateDataType,
+        nvinfer1::DataType ssmStateDataType);
 
     [[nodiscard]] kv_cache_manager::BaseKVCacheManager* getCacheManager() const noexcept;
 
