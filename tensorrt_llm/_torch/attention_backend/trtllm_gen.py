@@ -1041,10 +1041,10 @@ class FlashInferTrtllmGenAttention:
         if has_fp4_kv:
             q_processed = (
                 q_processed.view(torch.uint8)[
-                    : params.num_tokens * params.num_heads * params.head_size
+                    : params.num_tokens * self._num_heads * self._head_dim
                 ]
                 .view(torch.float8_e4m3fn)
-                .view(params.num_tokens, params.num_heads, params.head_size)
+                .view(params.num_tokens, self._num_heads, self._head_dim)
             )
         ctx_bmm1_scale = bmm1_scale if has_fp4_kv and bmm1_scale is not None else self._bmm1_scale
         ctx_bmm2_scale = bmm2_scale if has_fp4_kv and bmm2_scale is not None else 1.0
@@ -1170,10 +1170,10 @@ class FlashInferTrtllmGenAttention:
         if has_fp4_kv:
             q_processed = (
                 q_processed.view(torch.uint8)[
-                    : params.num_tokens * params.num_heads * params.head_size
+                    : params.num_tokens * self._num_heads * self._head_dim
                 ]
                 .view(torch.float8_e4m3fn)
-                .view(params.num_tokens, params.num_heads, params.head_size)
+                .view(params.num_tokens, self._num_heads, self._head_dim)
             )
         gen_bmm1_scale = bmm1_scale if has_fp4_kv else self._bmm1_scale
         gen_bmm2_scale = bmm2_scale if has_fp4_kv else 1.0
