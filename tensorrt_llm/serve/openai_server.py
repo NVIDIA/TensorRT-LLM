@@ -1051,6 +1051,10 @@ class OpenAIServer:
                 gather_generation_logits,
                 reasoning_parser=self.generator.args.reasoning_parser,
                 backend=self.generator.args.backend)
+            # Enable per-request perf metrics when the env var is set;
+            # without this the /perf_metrics deque stays empty on this path.
+            if len(os.getenv("TRTLLM_KVCACHE_TIME_OUTPUT_PATH", "")) > 0:
+                sampling_params.return_perf_metrics = True
             if self.tool_parser and request.tools:
                 tool_parser_cls = ToolParserFactory.parsers.get(
                     self.tool_parser.lower())
@@ -1466,16 +1470,32 @@ class OpenAIServer:
 
         async def create_streaming_generator(promise: RequestOutput,
                                              postproc_params: PostprocParams):
-            async for res in promise:
+            try:
                 if not self.postproc_worker_enabled:
                     post_processor, args = postproc_params.post_processor, postproc_params.postproc_args
-                    pp_results = post_processor(res, args)
-                else:
-                    pp_results = res.outputs[0]._postprocess_result
+                # Stamp first-token time on the first response, then append a
+                # /perf_metrics entry after [DONE] (the deque is only
+                # populated inside _extract_metrics).
+                first_response = await anext(promise)
+                raw_request.state.server_first_token_time = (
+                    get_steady_clock_now_in_seconds())
+                pp_results = (first_response.outputs[0]._postprocess_result if
+                              self.postproc_worker_enabled else post_processor(
+                                  first_response, args))
                 for pp_res in pp_results:
                     yield pp_res
-
-            yield "data: [DONE]\n\n"
+                res = first_response
+                async for res in promise:
+                    pp_results = (res.outputs[0]._postprocess_result
+                                  if self.postproc_worker_enabled else
+                                  post_processor(res, args))
+                    for pp_res in pp_results:
+                        yield pp_res
+                yield "data: [DONE]\n\n"
+                await self._extract_metrics(res, raw_request)
+            except:
+                logger.error(traceback.format_exc())
+                raise
 
         try:
             # Initialize HarmonyAdapter
@@ -1493,17 +1513,22 @@ class OpenAIServer:
             # Get tool_choice from request
             tool_choice = getattr(request, 'tool_choice', None)
 
-            try:
-                harmony_tokens = self.harmony_adapter.openai_to_harmony_tokens(
-                    request.messages,
-                    tools_dict,
-                    reasoning_effort=reasoning_effort,
-                    tool_choice=tool_choice)
-            except Exception as e:
-                logger.error(f"messages_dict: {request.messages}")
-                logger.error(f"tools_dict: {tools_dict}")
-                logger.error(f"request: {request}")
-                raise e
+            # Reuse pre-tokenized harmony tokens forwarded by the disagg
+            # ctx worker; only the agg path runs the adapter here.
+            if request.prompt_token_ids is not None:
+                harmony_tokens = request.prompt_token_ids
+            else:
+                try:
+                    harmony_tokens = self.harmony_adapter.openai_to_harmony_tokens(
+                        request.messages,
+                        tools_dict,
+                        reasoning_effort=reasoning_effort,
+                        tool_choice=tool_choice)
+                except Exception as e:
+                    logger.error(f"messages_dict: {request.messages}")
+                    logger.error(f"tools_dict: {tools_dict}")
+                    logger.error(f"request: {request}")
+                    raise e
 
             # Get harmony stop tokens
             harmony_stop_tokens = self.harmony_adapter.get_stop_tokens()
@@ -1516,6 +1541,10 @@ class OpenAIServer:
                 vocab_size=self.tokenizer.tokenizer.vocab_size,
                 reasoning_parser="gpt_oss")
             sampling_params.detokenize = False  # Harmony adapter handles detokenization
+            # Enable per-request perf metrics when the env var is set;
+            # without this the /perf_metrics deque stays empty on this path.
+            if len(os.getenv("TRTLLM_KVCACHE_TIME_OUTPUT_PATH", "")) > 0:
+                sampling_params.return_perf_metrics = True
             disaggregated_params = to_llm_disaggregated_params(
                 request.disaggregated_params)
             trace_headers = (None if raw_request is None else
