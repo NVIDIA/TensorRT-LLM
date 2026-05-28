@@ -402,7 +402,7 @@ __global__ void cascade_prefix_mqa_kernel(Multihead_attention_params<T, false> p
     // =====================================================================
     // Main loop over prefix tokens in tiles of TOKEN_TILE.
     //
-    // M3 pipeline: while block computes on K/V_smem[tile_idx & 1], tile t+1's
+    // while block computes on K/V_smem[tile_idx & 1], tile t+1's
     // HBM->SMEM transfer is issued via cp.async into K/V_smem[(tile_idx+1)&1].
     // Per-iter timeline:
     //   1. (if next exists) issue async load for tile t+1, commit -> 2 groups
@@ -688,7 +688,7 @@ __global__ void cascade_prefix_mqa_kernel(Multihead_attention_params<T, false> p
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 template <typename T, typename T_cache, typename KVCacheBuffer, int Dh>
-// P1 fusion: suffix kernel now merges the prefix partial state in-register at
+// fusion: suffix kernel now merges the prefix partial state in-register at
 // the end and writes the final params.out directly.  This eliminates Phase 3
 // (cascade_merge_kernel) and saves a full kernel launch + one DRAM write +
 // three DRAM reads per (seq, head).  The suffix partial values (m_s, l_s,
@@ -909,7 +909,7 @@ __global__ void cascade_suffix_decode_kernel(Multihead_attention_params<T, false
     }
 
     // -------------------------------------------------------------------
-    // P1 fusion: merge with prefix partial (formerly cascade_merge_kernel)
+    // fusion: merge with prefix partial (formerly cascade_merge_kernel)
     // -------------------------------------------------------------------
     // Suffix partial is in registers: m (suffix max), l (suffix denom), v_acc
     // (suffix weighted V sum).  Prefix partial comes from Phase 1's workspace.
@@ -1190,7 +1190,7 @@ bool launch_cascade_attention(
     {
         dim3 grid(num_heads, num_requests, (beam + BEAM_TILE - 1) / BEAM_TILE);
         dim3 block(THDS);
-        // M3 Tensor-Core SMEM layout: Q + K[2] + V[2] + P (bf16/half), then
+        // Tensor-Core SMEM layout: Q + K[2] + V[2] + P (bf16/half), then
         // stats/alpha (fp32).  K/V double-buffered for cp.async pipelining.
         // P0-1: Q/K/V rows carry 16B of padding to break bank conflicts, so
         // account for it via cascade_smem_row_stride<T>(Dh) here as well.
@@ -1204,9 +1204,6 @@ bool launch_cascade_attention(
                                    + BEAM_TILE)                        // alpha_s
             * sizeof(float);
         size_t const smem_bytes = t_bytes + f_bytes;
-        // Opt in to >48 KB dynamic shared memory.  cudaFuncSetAttribute is
-        // idempotent on the driver side, so we just call it unconditionally
-        // every launch and let TLLM_CUDA_CHECK surface any error.
         TLLM_CUDA_CHECK(cudaFuncSetAttribute(cascade_prefix_mqa_kernel<T, T_cache, KVCacheBuffer, Dh>,
             cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(smem_bytes)));
         cascade_prefix_mqa_kernel<T, T_cache, KVCacheBuffer, Dh>
