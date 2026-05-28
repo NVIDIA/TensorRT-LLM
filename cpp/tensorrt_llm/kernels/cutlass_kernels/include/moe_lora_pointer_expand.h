@@ -16,10 +16,13 @@
 
 #pragma once
 
+#include "tensorrt_llm/common/config.h"
+
 #include <cstdint>
 #include <cuda_runtime.h>
 
-namespace tensorrt_llm::kernels::cutlass_kernels
+TRTLLM_NAMESPACE_BEGIN
+namespace kernels::cutlass_kernels
 {
 
 // Device-side description of one LoRA module (fc1, fc2, or gated) for the
@@ -85,4 +88,5 @@ void launchMoeLoraPointerExpand(int32_t const* permuted_rows, int64_t const* exp
     int64_t lora_dtype_bytes, MoeLoraExpandModule const& fc1, MoeLoraExpandModule const& fc2,
     MoeLoraExpandModule const* gated, cudaStream_t stream);
 
-} // namespace tensorrt_llm::kernels::cutlass_kernels
+} // namespace kernels::cutlass_kernels
+TRTLLM_NAMESPACE_END

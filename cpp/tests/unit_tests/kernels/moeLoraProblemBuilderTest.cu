@@ -86,7 +86,7 @@ RefOutputs cpuReference(std::vector<int32_t> const& ranks, std::vector<int64_t> 
         r.lda_in[i] = in_hidden_size;
         r.ldb_in[i] = in_hidden_size;
         r.ldd_in[i] = max_lora_rank;
-        r.ldb_out[i] = out_hidden_size;
+        r.ldb_out[i] = rank;
         r.ldd_out[i] = out_hidden_size;
 
         r.splitk_offsets[i] = i * max_lora_rank * splitk_slices;

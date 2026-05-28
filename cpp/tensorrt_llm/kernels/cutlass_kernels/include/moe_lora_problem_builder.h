@@ -16,12 +16,15 @@
 
 #pragma once
 
+#include "tensorrt_llm/common/config.h"
+
 #include "cutlass/gemm_coord.h"
 
 #include <cstdint>
 #include <cuda_runtime.h>
 
-namespace tensorrt_llm::kernels::cutlass_kernels
+TRTLLM_NAMESPACE_BEGIN
+namespace kernels::cutlass_kernels
 {
 
 // Caller-owned device-output bundle for one LoRA module. Each array is sized
@@ -61,9 +64,9 @@ struct MoeLoraGemmGroupArrays
     // Leading dimensions. All row-major, fixed per problem given uniform
     // input / lowrank-workspace / output strides.
     int64_t* lda_in = nullptr;                                // [P]: in_hidden_size
-    int64_t* ldb_in = nullptr;                                // [P]: in_hidden_size
+    int64_t* ldb_in = nullptr;                                // [P]: in_hidden_size (stride in adapter-A storage)
     int64_t* ldd_in = nullptr;                                // [P]: max_lora_rank (workspace stride)
-    int64_t* ldb_out = nullptr;                               // [P]: out_hidden_size
+    int64_t* ldb_out = nullptr;                               // [P]: per-token rank (stride in adapter-B storage)
     int64_t* ldd_out = nullptr;                               // [P]: out_hidden_size
 
     // Per-problem exclusive prefix offset into the split-K scratch buffer
@@ -112,4 +115,5 @@ void launchMoeLoraProblemBuilder(int32_t const* ranks_dev, int64_t const* ptrs_d
     int64_t out_hidden_size, int64_t max_lora_rank, int64_t dtype_bytes, int64_t splitk_slices,
     MoeLoraGemmGroupArrays const& out, cudaStream_t stream);
 
-} // namespace tensorrt_llm::kernels::cutlass_kernels
+} // namespace kernels::cutlass_kernels
+TRTLLM_NAMESPACE_END

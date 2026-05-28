@@ -649,3 +649,65 @@ def test_moe_native_shared_outer_differs_from_no_lora():
     assert torch.isfinite(out_lora).all()
     diff = (out_lora.float() - out_baseline.float()).abs().mean().item()
     assert diff > 1e-3, f"native shared-outer LoRA had no observable effect (mean abs diff={diff})"
+
+
+@requires_cuda_and_op
+def test_moe_lora_device_path_matches_host_path(monkeypatch):
+    """Phase 6b.C.2.b: eager-mode parity between the device LoRA path
+    (TLLM_MOE_LORA_USE_DEVICE_PATH=1, runs launchMoeLoraPointerExpand +
+    launchMoeLoraProblemBuilder + cudaGraph(SplitK)GroupedGemm) and the
+    legacy host LoRA path (LoraImpl::run reading pinned-host per-token
+    pointer tables).
+
+    The two paths exercise different GEMM kernels (CUTLASS-based
+    cuda_graph_grouped_gemm vs cuBLAS via LoraImpl), so we don't expect
+    bit-identical results in bf16; we require closeness within a wide
+    bf16 tolerance.
+    """
+    # Avoid circular-import surprises by importing here; the runner cache
+    # has to be clearable so the FusedMoeRunner re-reads the env var.
+    from tensorrt_llm._torch.custom_ops.torch_custom_ops import MoERunner
+
+    device = torch.device("cuda")
+    dtype = torch.bfloat16
+    num_tokens, hidden_size, inter_size = 16, 128, 256
+    num_experts, top_k = 4, 2
+    rank = 8
+
+    x, w3_w1, w2, topk_ids, topk_scores = _build_base_inputs(
+        num_tokens, hidden_size, inter_size, num_experts, top_k, dtype, device)
+    fc1_adapter = make_per_expert_lora(num_experts, rank, hidden_size,
+                                       inter_size, dtype=dtype, device=device,
+                                       seed=200)
+    fc2_adapter = make_per_expert_lora(num_experts, rank, inter_size,
+                                       hidden_size, dtype=dtype, device=device,
+                                       seed=201)
+    lora_kwargs = _build_lora_request_buffers(
+        num_tokens, fc1_adapter["A"], fc1_adapter["B"],
+        fc2_adapter["A"], fc2_adapter["B"], rank=rank)
+
+    def _compute(env_value):
+        # The C++ FusedMoeRunner reads TLLM_MOE_LORA_USE_DEVICE_PATH once at
+        # construction and caches the result; dropping the only Python
+        # reference (via runner_dict.clear()) lets the next call construct
+        # a fresh runner that picks up the new env value.
+        MoERunner.runner_dict.clear()
+        if env_value is None:
+            monkeypatch.delenv("TLLM_MOE_LORA_USE_DEVICE_PATH", raising=False)
+        else:
+            monkeypatch.setenv("TLLM_MOE_LORA_USE_DEVICE_PATH", env_value)
+        return _call_fused_moe(x, w3_w1, w2, topk_ids, topk_scores,
+                               output_dtype=dtype, lora_kwargs=lora_kwargs)[0]
+
+    out_host = _compute(None)
+    out_device = _compute("1")
+    # Restore for any follow-up tests that may share runner_dict state.
+    MoERunner.runner_dict.clear()
+
+    assert torch.isfinite(out_device).all()
+    assert torch.isfinite(out_host).all()
+    # bf16 cross-kernel tolerance. The LoRA delta itself is on the order of
+    # 1e-2 (rank-8 adapters fed through small dims), and the two GEMM
+    # backends use different reduction orders, so we accept ~5% relative
+    # error.
+    torch.testing.assert_close(out_device, out_host, rtol=5e-2, atol=5e-2)

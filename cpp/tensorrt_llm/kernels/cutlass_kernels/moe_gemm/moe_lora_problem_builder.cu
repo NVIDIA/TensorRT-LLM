@@ -21,7 +21,8 @@
 
 #include <cstdint>
 
-namespace tensorrt_llm::kernels::cutlass_kernels
+TRTLLM_NAMESPACE_BEGIN
+namespace kernels::cutlass_kernels
 {
 
 namespace
@@ -80,13 +81,20 @@ __global__ void moeLoraProblemBuilderKernel(int32_t const* __restrict__ ranks, i
     b_ptrs_out[i] = reinterpret_cast<void*>(b_ptr_bits);
     d_ptrs_out[i] = reinterpret_cast<void*>(output_base + i * out_row_stride);
 
-    // Leading dimensions. Constant per problem since the input / workspace /
-    // output buffers all share a flat row layout -- the per-row offset is
-    // already baked into the pointer above.
+    // Leading dimensions. For the in-/out- GEMMs, lda/ldd correspond to the
+    // input row-stride / workspace row-stride / output row-stride; ldb is
+    // the per-problem stride in the LoRA adapter's storage and matches
+    // the cuda_graph_grouped_gemm convention used by attention LoRA
+    // (loraOp.cpp):
+    //   in-GEMM:  adapter A stored as [rank, in_hidden_size]
+    //             -> ldb_in = in_hidden_size
+    //   out-GEMM: adapter B stored as [out_hidden_size, rank]
+    //             -> ldb_out = rank (per-token, since per-token rank
+    //                          can differ in slot-indexed multi-LoRA mode)
     lda_in[i] = in_hidden_size;
     ldb_in[i] = in_hidden_size;
     ldd_in[i] = max_lora_rank;
-    ldb_out[i] = out_hidden_size;
+    ldb_out[i] = rank;
     ldd_out[i] = out_hidden_size;
 
     // Split-K scratch offsets. Worst-case fixed stride (independent of
@@ -137,4 +145,5 @@ void launchMoeLoraProblemBuilder(int32_t const* ranks_dev, int64_t const* ptrs_d
     sync_check_cuda_error(stream);
 }
 
-} // namespace tensorrt_llm::kernels::cutlass_kernels
+} // namespace kernels::cutlass_kernels
+TRTLLM_NAMESPACE_END

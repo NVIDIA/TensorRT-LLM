@@ -21,7 +21,8 @@
 
 #include <cstdint>
 
-namespace tensorrt_llm::kernels::cutlass_kernels
+TRTLLM_NAMESPACE_BEGIN
+namespace kernels::cutlass_kernels
 {
 
 namespace
@@ -172,4 +173,5 @@ void launchMoeLoraPointerExpand(int32_t const* permuted_rows, int64_t const* exp
     sync_check_cuda_error(stream);
 }
 
-} // namespace tensorrt_llm::kernels::cutlass_kernels
+} // namespace kernels::cutlass_kernels
+TRTLLM_NAMESPACE_END

@@ -23,6 +23,7 @@
 // Always include the public header for moe_gemm_kernels.h
 #include "tensorrt_llm/kernels/cutlass_kernels/include/moe_gemm_kernels.h"
 #include "tensorrt_llm/kernels/cutlass_kernels/include/moe_lora_device_path.h"
+#include "tensorrt_llm/kernels/cutlass_kernels/include/moe_lora_problem_builder.h"
 
 #include "cutlass/gemm_coord.h"
 
@@ -31,6 +32,7 @@
 #include "tensorrt_llm/common/dataType.h"
 #include "tensorrt_llm/common/opUtils.h"
 #include "tensorrt_llm/common/workspace.h"
+#include "tensorrt_llm/kernels/cuda_graph_grouped_gemm.h"
 #include "tensorrt_llm/kernels/cutlass_kernels/fp8_blockscale_gemm/fp8_blockscale_gemm.h"
 #include "tensorrt_llm/kernels/cutlass_kernels/include/cutlass_kernel_selector.h"
 #include "tensorrt_llm/kernels/lora/lora.h"
@@ -71,6 +73,74 @@ enum class MoeLoraRequestType : int32_t
     kCONTEXT = 0,
     kGENERATION = 1
 };
+
+// ---------------------------------------------------------------------------
+// Phase 6b.C.2.b: libtorch-bound implementation of `MoeLoraDeviceRunFn`.
+//
+// This is the per-module GEMM dispatch the device LoRA path uses: it
+// builds the per-token problem descriptors on device (via the libtorch-
+// free `launchMoeLoraProblemBuilder`) and then dispatches
+// `cudaGraph(SplitK)GroupedGemm`. The latter allocates workspace via
+// `at::Tensor`, so this function MUST live in `th_common` (which links
+// libtorch). `moe_kernels.cu` reaches it indirectly through the function
+// pointer stored in `LoraParams::device_path.run`; that indirection
+// prevents `libmoe_gemm_src.a` (which is also linked into the TensorRT
+// plugin `.so`) from acquiring a transitive dependency on libtorch.
+// ---------------------------------------------------------------------------
+inline void moeLoraDeviceRunImpl(::tensorrt_llm::kernels::cutlass_kernels::MoeLoraDevicePathModule const& mod,
+    int64_t num_permuted_tokens, int64_t in_hidden_size, int64_t max_lora_rank, int64_t dtype_bytes,
+    int64_t splitk_slices, void const* input_base, void* output_base, nvinfer1::DataType data_type, cudaStream_t stream)
+{
+    TLLM_CHECK_WITH_INFO(mod.permuted_ranks_dev != nullptr,
+        "Device-path LoRA module is missing permuted ranks buffer (forgot to populate device_path?).");
+
+    // Repack the 6b.C.1 device-resident scratch into the bundle the
+    // problem-builder consumes; the typed casts recover the originals
+    // (the void* in MoeLoraDevicePathModule is for header-decoupling).
+    ::tensorrt_llm::kernels::cutlass_kernels::MoeLoraGemmGroupArrays arrays{};
+    arrays.problem_sizes_in = static_cast<cutlass::gemm::GemmCoord*>(mod.problem_sizes_in_dev);
+    arrays.problem_sizes_out = static_cast<cutlass::gemm::GemmCoord*>(mod.problem_sizes_out_dev);
+    arrays.a_ptrs_in = mod.a_ptrs_in_dev;
+    arrays.b_ptrs_in = mod.b_ptrs_in_dev;
+    arrays.d_ptrs_in = mod.d_ptrs_in_dev;
+    arrays.b_ptrs_out = mod.b_ptrs_out_dev;
+    arrays.d_ptrs_out = mod.d_ptrs_out_dev;
+    arrays.lda_in = mod.lda_in_dev;
+    arrays.ldb_in = mod.ldb_in_dev;
+    arrays.ldd_in = mod.ldd_in_dev;
+    arrays.ldb_out = mod.ldb_out_dev;
+    arrays.ldd_out = mod.ldd_out_dev;
+    arrays.splitk_offsets = mod.splitk_offsets_dev;
+
+    ::tensorrt_llm::kernels::cutlass_kernels::launchMoeLoraProblemBuilder(mod.permuted_ranks_dev, mod.permuted_ptrs_dev,
+        input_base, mod.lowrank_workspace_dev, output_base, num_permuted_tokens, in_hidden_size, mod.out_hidden_size,
+        max_lora_rank, dtype_bytes, splitk_slices, arrays, stream);
+    sync_check_cuda_error(stream);
+
+    // The cuda_graph_(split_k_)grouped_gemm wrappers accept ldc == ldd
+    // when C aliases D (no-bias case). The problem-builder produces a
+    // single ldd_in / ldd_out per stage; we reuse them for ldcGpu below.
+    auto* host_max_in = static_cast<cutlass::gemm::GemmCoord*>(mod.host_max_problem_in_pinned);
+    auto* host_max_out = static_cast<cutlass::gemm::GemmCoord*>(mod.host_max_problem_out_pinned);
+
+    // `minKN` mirrors the value attention LoRA uses for kernel selection.
+    // The wrappers fall back to the smaller-tile family when min(K, N) <
+    // minKN; 16 is the default for adapter ranks the MVP supports (<= 64).
+    constexpr int kMinKN = 16;
+
+    ::tensorrt_llm::kernels::cudaGraphSplitKGroupedGemm(arrays.problem_sizes_in, static_cast<int>(num_permuted_tokens),
+        arrays.a_ptrs_in, arrays.b_ptrs_in, arrays.d_ptrs_in, arrays.d_ptrs_in, arrays.lda_in, arrays.ldb_in,
+        arrays.ldd_in, arrays.ldd_in,
+        /*isLoraIn=*/true, data_type, static_cast<int>(splitk_slices), kMinKN, host_max_in, arrays.splitk_offsets,
+        stream);
+    sync_check_cuda_error(stream);
+
+    ::tensorrt_llm::kernels::cudaGraphGroupedGemm(arrays.problem_sizes_out, static_cast<int>(num_permuted_tokens),
+        arrays.d_ptrs_in /*== a_ptrs_out*/, arrays.b_ptrs_out, arrays.d_ptrs_out, arrays.d_ptrs_out, arrays.ldd_in,
+        arrays.ldb_out, arrays.ldd_out, arrays.ldd_out,
+        /*isLoraIn=*/false, data_type, kMinKN, host_max_out, stream);
+    sync_check_cuda_error(stream);
+}
 
 class FusedMoeRunner : public torch::CustomClassHolder
 {
@@ -1754,11 +1824,65 @@ private:
             dp.dtype_bytes = dtype_bytes;
             dp.splitk_slices = kDevicePathSplitKSlices;
             dp.has_gated = has_gated;
+            // Populate the libtorch-bound GEMM dispatch entry point so
+            // `runMoeLoraDeviceModule` in moe_kernels.cu can call through
+            // it without dragging libtorch into libmoe_gemm_src.a.
+            dp.run = &moeLoraDeviceRunImpl;
             populateLoraDevicePathModule(mFc1DeviceBuf, dp.fc1);
             populateLoraDevicePathModule(mFc2DeviceBuf, dp.fc2);
             if (has_gated)
             {
                 populateLoraDevicePathModule(mGatedDeviceBuf, dp.gated);
+            }
+
+            // Per-module dim_a/dim_b describe the LoRA adapter shape the
+            // pointer-expand kernel offsets into; per-module output_base
+            // (and out_hidden_size) describe the LoRA delta sink the
+            // problem-builder kernel writes into. The runner overrides
+            // `output_base_dev` with `lora_fc1_result_` / `lora_fc2_result_` /
+            // `lora_gated_out` at the loraFC1/loraFC2 call sites so the
+            // GEMMs land where the downstream bias/reorder kernels expect.
+            //
+            // For fc1 (and gated): adapter A is [hidden, rank], B is [rank, inter].
+            // For fc2:             adapter A is [inter,  rank], B is [rank, hidden].
+            dp.fc1.dim_a = hidden_size;
+            dp.fc1.dim_b = inter_size;
+            dp.fc1.ranks_src_dev = mLoraExpandFC1RanksDevice.data_ptr<int32_t>();
+            dp.fc1.ptrs_src_dev = mLoraExpandFC1WeightPtrsDevice.data_ptr<int64_t>();
+            dp.fc1.out_hidden_size = inter_size;
+
+            dp.fc2.dim_a = inter_size;
+            dp.fc2.dim_b = hidden_size;
+            dp.fc2.ranks_src_dev = mLoraExpandFC2RanksDevice.data_ptr<int32_t>();
+            dp.fc2.ptrs_src_dev = mLoraExpandFC2WeightPtrsDevice.data_ptr<int64_t>();
+            dp.fc2.out_hidden_size = hidden_size;
+
+            if (has_gated)
+            {
+                dp.gated.dim_a = hidden_size;
+                dp.gated.dim_b = inter_size;
+                dp.gated.ranks_src_dev = mLoraExpandGatedRanksDevice.data_ptr<int32_t>();
+                dp.gated.ptrs_src_dev = mLoraExpandGatedWeightPtrsDevice.data_ptr<int64_t>();
+                dp.gated.out_hidden_size = inter_size;
+            }
+
+            // Pinned-host max-problem-size hints used by cuda_graph_*_grouped_gemm
+            // for kernel selection. Values are upper bounds safe to fix at
+            // warmup time (M=1 since each problem is one row; N/K depend on
+            // module direction and max_lora_rank).
+            auto fill_max_problem = [](void* host_ptr, int m, int n, int k) {
+                auto* coord = static_cast<cutlass::gemm::GemmCoord*>(host_ptr);
+                *coord = cutlass::gemm::GemmCoord(m, n, k);
+            };
+            // In-GEMM: M=1, N=max_lora_rank, K=in_dim. Out-GEMM: M=1, N=out_dim, K=max_lora_rank.
+            fill_max_problem(dp.fc1.host_max_problem_in_pinned, 1, lora_max_low_rank, hidden_size);
+            fill_max_problem(dp.fc1.host_max_problem_out_pinned, 1, inter_size, lora_max_low_rank);
+            fill_max_problem(dp.fc2.host_max_problem_in_pinned, 1, lora_max_low_rank, inter_size);
+            fill_max_problem(dp.fc2.host_max_problem_out_pinned, 1, hidden_size, lora_max_low_rank);
+            if (has_gated)
+            {
+                fill_max_problem(dp.gated.host_max_problem_in_pinned, 1, lora_max_low_rank, hidden_size);
+                fill_max_problem(dp.gated.host_max_problem_out_pinned, 1, inter_size, lora_max_low_rank);
             }
         }
 

@@ -58,7 +58,17 @@
 #include "tensorrt_llm/kernels/preQuantScaleKernel.h"
 #include "tensorrt_llm/kernels/quantization.cuh"
 
+#include "tensorrt_llm/kernels/cutlass_kernels/include/moe_lora_pointer_expand.h"
 #include "tensorrt_llm/kernels/cutlass_kernels/include/moe_util_kernels.h"
+// NOTE: the MoE LoRA device path's GEMM dispatch (`cudaGraph(SplitK)GroupedGemm`
+// + `launchMoeLoraProblemBuilder`) is intentionally NOT called from this
+// translation unit. Those wrappers pull in libtorch via `at::Tensor`, but
+// `moe_kernels.cu` is archived into `libmoe_gemm_src.a`, which is also
+// linked into `libnvinfer_plugin_tensorrt_llm.so` -- a TensorRT plugin that
+// must not depend on libtorch. Instead, the device path is invoked through
+// the `MoeLoraDeviceRunFn` function pointer stored in
+// `LoraParams::device_path.run`, populated from the th_common-side
+// implementation in `moeOp.cpp`.
 
 #ifndef CUDART_VERSION
 #error CUDART_VERSION Undefined!
@@ -3657,6 +3667,58 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enab
     sync_check_cuda_error(stream);
 }
 
+// Phase 6b.C.2.b: device-path LoRA GEMM dispatch is delegated to the
+// `MoeLoraDeviceRunFn` function pointer stored in
+// `LoraParams::device_path.run` and populated from the th_common-side
+// `moeOp.cpp`. We intentionally do NOT call `cudaGraph(SplitK)GroupedGemm`
+// or `launchMoeLoraProblemBuilder` directly from this translation unit:
+// those wrappers allocate workspace via `at::Tensor`, and pulling the
+// resulting `.o` into `libmoe_gemm_src.a` would force the TensorRT plugin
+// (`libnvinfer_plugin_tensorrt_llm.so`) to link libtorch -- which it
+// deliberately does not.
+inline void runMoeLoraDeviceModule(
+    ::tensorrt_llm::kernels::cutlass_kernels::MoeLoraDevicePathModule const& mod, int64_t num_permuted_tokens,
+    int64_t in_hidden_size, int64_t max_lora_rank, int64_t dtype_bytes, int64_t splitk_slices,
+    void const* input_base, void* output_base, ::tensorrt_llm::kernels::cutlass_kernels::MoeLoraDeviceRunFn run,
+    nvinfer1::DataType data_type, cudaStream_t stream)
+{
+    TLLM_CHECK_WITH_INFO(mod.permuted_ranks_dev != nullptr,
+        "Device-path LoRA module is missing permuted ranks buffer (forgot to populate device_path?).");
+    TLLM_CHECK_WITH_INFO(run != nullptr,
+        "Device-path LoRA GEMM dispatch is unavailable: device_path.run was not populated (this consumer of "
+        "libmoe_gemm_src.a does not link libtorch).");
+    run(mod, num_permuted_tokens, in_hidden_size, max_lora_rank, dtype_bytes, splitk_slices, input_base, output_base,
+        data_type, stream);
+}
+
+// Map the templated activation/back-bone type to the nvinfer1 enum the
+// cuda_graph_grouped_gemm wrappers expect. Only the dtypes MoE LoRA
+// currently supports (fp16/bf16/fp32) are handled; everything else is a
+// compile-time hard-error so a future quant addition can't silently fall
+// through.
+template <class ScaleBiasType>
+constexpr nvinfer1::DataType moeLoraNvInferType()
+{
+    if constexpr (std::is_same_v<ScaleBiasType, half>)
+    {
+        return nvinfer1::DataType::kHALF;
+    }
+#if defined(ENABLE_BF16)
+    else if constexpr (std::is_same_v<ScaleBiasType, __nv_bfloat16>)
+    {
+        return nvinfer1::DataType::kBF16;
+    }
+#endif
+    else if constexpr (std::is_same_v<ScaleBiasType, float>)
+    {
+        return nvinfer1::DataType::kFLOAT;
+    }
+    else
+    {
+        static_assert(sizeof(ScaleBiasType) == 0, "MoE LoRA device path supports fp16/bf16/fp32 only.");
+    }
+}
+
 template <class T, class WeightType, class OutputType, class InputType, class BackBoneType, class Enable>
 bool CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enable>::setupLoraWorkspace(
     int64_t expanded_num_rows, int64_t num_rows, int64_t inter_size, int64_t hidden_size, int start_expert,
@@ -3674,6 +3736,62 @@ bool CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enab
     std::vector<int64_t>& host_expert_first_token_offset = host_lora_workspace_.host_expert_first_token_offset;
 
     bool all_token_without_lora = true;
+
+    // Phase 6b.C.2.b: device-path early return. When the FusedMoeRunner has
+    // opted in via TLLM_MOE_LORA_USE_DEVICE_PATH, the pointer-expand kernel
+    // produces every consumer's input on-device, so we can skip the host
+    // pointer fan-out *and* the cudaEventSynchronize that gates it. The
+    // host-side `all_token_without_lora` short-circuit is dropped on this
+    // path (returning false here is conservative -- if all ranks are zero,
+    // the grouped-GEMM problem sizes inside loraFC1/loraFC2 collapse to
+    // (0,0,0) and the kernels become no-ops at near-zero cost).
+    if (lora_params.device_path.enabled)
+    {
+        auto const& dp = lora_params.device_path;
+        // Translate per-module device-path metadata into the
+        // `MoeLoraExpandModule` API the pointer-expand kernel expects. The
+        // shared_a/shared_b flags live on LoraParams (set by the loader
+        // via the lora_layout.json sidecar) so a single MoE LoRA op call
+        // can mix shared-outer and per-expert adapters.
+        ::tensorrt_llm::kernels::cutlass_kernels::MoeLoraExpandModule fc1_mod{};
+        fc1_mod.ranks_src = dp.fc1.ranks_src_dev;
+        fc1_mod.ptrs_src = dp.fc1.ptrs_src_dev;
+        fc1_mod.dim_a = dp.fc1.dim_a;
+        fc1_mod.dim_b = dp.fc1.dim_b;
+        fc1_mod.shared_a = lora_params.fc1_shared_a;
+        fc1_mod.shared_b = lora_params.fc1_shared_b;
+        fc1_mod.ranks_out = dp.fc1.permuted_ranks_dev;
+        fc1_mod.ptrs_out = dp.fc1.permuted_ptrs_dev;
+
+        ::tensorrt_llm::kernels::cutlass_kernels::MoeLoraExpandModule fc2_mod{};
+        fc2_mod.ranks_src = dp.fc2.ranks_src_dev;
+        fc2_mod.ptrs_src = dp.fc2.ptrs_src_dev;
+        fc2_mod.dim_a = dp.fc2.dim_a;
+        fc2_mod.dim_b = dp.fc2.dim_b;
+        fc2_mod.shared_a = lora_params.fc2_shared_a;
+        fc2_mod.shared_b = lora_params.fc2_shared_b;
+        fc2_mod.ranks_out = dp.fc2.permuted_ranks_dev;
+        fc2_mod.ptrs_out = dp.fc2.permuted_ptrs_dev;
+
+        ::tensorrt_llm::kernels::cutlass_kernels::MoeLoraExpandModule gated_mod{};
+        if (is_gated_activation)
+        {
+            gated_mod.ranks_src = dp.gated.ranks_src_dev;
+            gated_mod.ptrs_src = dp.gated.ptrs_src_dev;
+            gated_mod.dim_a = dp.gated.dim_a;
+            gated_mod.dim_b = dp.gated.dim_b;
+            gated_mod.shared_a = lora_params.gated_shared_a;
+            gated_mod.shared_b = lora_params.gated_shared_b;
+            gated_mod.ranks_out = dp.gated.permuted_ranks_dev;
+            gated_mod.ptrs_out = dp.gated.permuted_ptrs_dev;
+        }
+
+        ::tensorrt_llm::kernels::cutlass_kernels::launchMoeLoraPointerExpand(permuted_row_to_unpermuted_row_,
+            expert_first_token_offset_, num_experts_per_node, start_expert, num_rows, expanded_num_rows,
+            dp.dtype_bytes, fc1_mod, fc2_mod, is_gated_activation ? &gated_mod : nullptr, stream);
+        sync_check_cuda_error(stream);
+        return /*all_token_without_lora=*/false;
+    }
 
     host_permuted_fc1_weight_ptrs.resize(expanded_num_rows * 2);
     host_permuted_fc1_lora_ranks.resize(expanded_num_rows);
@@ -3803,21 +3921,45 @@ auto CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enab
         input = reinterpret_cast<ScaleBiasType*>(permuted_data_);
     }
 
-    void* lora_workspace = lora_params.workspace;
-    void* tmp_lora_fc_result = static_cast<void*>(lora_fc1_result);
-    int64_t num_valid_tokens = host_expert_first_token_offset[num_experts_per_node];
-    int64_t num_reqs_lora = std::min(num_valid_tokens, static_cast<int64_t>(num_reqs * num_experts_per_node));
-
-    ::tensorrt_llm::kernels::Lora_run(fc1_lora_impl.get(), num_valid_tokens, num_reqs_lora, input,
-        host_permuted_fc1_lora_ranks.data(), host_permuted_fc1_weight_ptrs.data(), 0, &tmp_lora_fc_result,
-        lora_workspace, stream);
-
-    if (is_gated_activation)
+    // Phase 6b.C.2.b: device-path branch. Runs entirely on `stream`; no
+    // cudaEventSynchronize, no host-pointer aggregation, no pageable
+    // staging buffer. setupLoraWorkspace has already populated the
+    // per-permuted-row ranks/ptrs in `lora_params.device_path.fc1`/`.gated`
+    // via launchMoeLoraPointerExpand.
+    if (lora_params.device_path.enabled)
     {
-        void* tmp_lora_gated_result = static_cast<void*>(lora_gated_out);
+        auto const& dp = lora_params.device_path;
+        nvinfer1::DataType const data_type = moeLoraNvInferType<ScaleBiasType>();
+
+        runMoeLoraDeviceModule(dp.fc1, expanded_num_rows, /*in_hidden_size=*/hidden_size, dp.max_lora_rank,
+            dp.dtype_bytes, dp.splitk_slices, /*input_base=*/static_cast<void const*>(input),
+            /*output_base=*/static_cast<void*>(lora_fc1_result), dp.run, data_type, stream);
+
+        if (is_gated_activation)
+        {
+            runMoeLoraDeviceModule(dp.gated, expanded_num_rows, /*in_hidden_size=*/hidden_size, dp.max_lora_rank,
+                dp.dtype_bytes, dp.splitk_slices, /*input_base=*/static_cast<void const*>(input),
+                /*output_base=*/static_cast<void*>(lora_gated_out), dp.run, data_type, stream);
+        }
+    }
+    else
+    {
+        void* lora_workspace = lora_params.workspace;
+        void* tmp_lora_fc_result = static_cast<void*>(lora_fc1_result);
+        int64_t num_valid_tokens = host_expert_first_token_offset[num_experts_per_node];
+        int64_t num_reqs_lora = std::min(num_valid_tokens, static_cast<int64_t>(num_reqs * num_experts_per_node));
+
         ::tensorrt_llm::kernels::Lora_run(fc1_lora_impl.get(), num_valid_tokens, num_reqs_lora, input,
-            host_permuted_gated_lora_ranks.data(), host_permuted_gated_weight_ptrs.data(), 0, &tmp_lora_gated_result,
+            host_permuted_fc1_lora_ranks.data(), host_permuted_fc1_weight_ptrs.data(), 0, &tmp_lora_fc_result,
             lora_workspace, stream);
+
+        if (is_gated_activation)
+        {
+            void* tmp_lora_gated_result = static_cast<void*>(lora_gated_out);
+            ::tensorrt_llm::kernels::Lora_run(fc1_lora_impl.get(), num_valid_tokens, num_reqs_lora, input,
+                host_permuted_gated_lora_ranks.data(), host_permuted_gated_weight_ptrs.data(), 0,
+                &tmp_lora_gated_result, lora_workspace, stream);
+        }
     }
 
     // add bias and reorder
@@ -3863,6 +4005,21 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enab
     {
         TLLM_CHECK(!lora_input_);
         input = reinterpret_cast<ScaleBiasType*>(fc1_result_);
+    }
+
+    // Phase 6b.C.2.b: device-path branch. Same shape as loraFC1's branch
+    // -- consumes the per-permuted-row ranks/ptrs produced by
+    // launchMoeLoraPointerExpand from setupLoraWorkspace. expanded_num_rows
+    // is passed in as `num_tokens` from runMoe (== top_k * num_rows).
+    if (lora_params.device_path.enabled)
+    {
+        auto const& dp = lora_params.device_path;
+        nvinfer1::DataType const data_type = moeLoraNvInferType<ScaleBiasType>();
+        runMoeLoraDeviceModule(dp.fc2, num_tokens, /*in_hidden_size=*/inter_size, dp.max_lora_rank, dp.dtype_bytes,
+            dp.splitk_slices, /*input_base=*/static_cast<void const*>(input),
+            /*output_base=*/static_cast<void*>(lora_fc2_result_), dp.run, data_type, stream);
+        sync_check_cuda_error(stream);
+        return;
     }
 
     void* lora_workspace = lora_params.workspace;
