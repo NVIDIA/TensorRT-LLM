@@ -4745,6 +4745,14 @@ class PyTorchModelEngine(ModelEngine):
             if mrope_position_deltas is not None:
                 mrope_position_deltas_list.append(mrope_position_deltas)
 
+        # mrope lists must align 1:1 with multimodal_params (or be empty);
+        # the sampler indexes them by per-MM-result position into mm_embeddings.
+        assert (len(mrope_position_ids_list) == len(mrope_position_deltas_list)
+                and len(mrope_position_ids_list) in (0, len(multimodal_params))
+                ), (f"mrope alignment: got {len(mrope_position_ids_list)} ids, "
+                    f"{len(mrope_position_deltas_list)} deltas, "
+                    f"{len(multimodal_params)} mm params")
+
         result = {
             'mm_embeddings':
             mm_embeddings,
