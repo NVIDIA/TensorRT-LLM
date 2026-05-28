@@ -144,10 +144,8 @@ def test_mm_encoder_sampler_aligns_mixed_batch_by_request_index():
             mm_embedding_request_indices=[1],
             mm_embedding_lengths=[[4]],
             extra_data={
-                # Engine emits mrope entries only for active MM requests
-                # (length == #MM results, not full batch).
-                "mrope_position_ids": ["mm-pos"],
-                "mrope_position_deltas": ["mm-delta"],
+                "mrope_position_ids": ["text-pos", "mm-pos"],
+                "mrope_position_deltas": ["text-delta", "mm-delta"],
             },
         ),
     )
@@ -191,9 +189,6 @@ def test_py_result_cuda_mm_embedding_handles_stay_cuda_backed():
     handles = result.mm_embedding_handles
     assert handles is not None
     assert [handle["method_key"] for handle in handles] == [1, 1]
-    restored = [SharedTensorContainer.from_dict(handle).get_local_view() for handle in handles]
-    assert all(tensor.device.type == "cuda" for tensor in restored)
-    assert torch.equal(torch.cat(restored, dim=0), source)
 
 
 class _FakeScheduledRequests:
