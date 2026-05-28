@@ -55,7 +55,7 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
     std::optional<torch::Tensor> rotary_cos_sin, std::optional<torch::Tensor> latent_cache,
     std::optional<torch::Tensor> q_pe, std::optional<torch::Tensor> block_ids_per_seq,
     std::optional<torch::Tensor> attention_sinks, bool const is_fused_qkv, bool const update_kv_cache,
-    int64_t const predicted_tokens_per_seq, int64_t const layer_idx, int64_t const num_heads,
+    int64_t const predicted_tokens_per_seq, int64_t const local_layer_idx, int64_t const num_heads,
     int64_t const num_kv_heads, int64_t const head_size, std::optional<int64_t> const tokens_per_block,
     int64_t const max_num_requests, int64_t const max_context_length, int64_t const attention_window_size,
     int64_t const beam_width, int64_t const mask_type, int64_t const quant_mode, double const q_scaling,
