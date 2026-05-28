@@ -59,6 +59,13 @@ side) only opens / closes the IPC handles and detaches from
 from __future__ import annotations
 
 import ctypes
+
+# Env knob — stage 2 swaps the send path from cudaMemcpyAsync(host->dev)
+# to a single-thread CUDA kernel that takes the packet as kernel-arg
+# (carried via the kernel param buffer, no host staging buffer touched).
+# Set ``PEARL_CUDAIPC_KERNEL_SEND=0`` to fall back to the stage-1 memcpy
+# path for A/B comparison or debugging.
+import os as _os
 import struct
 import sys
 import time
@@ -70,6 +77,14 @@ from typing import Optional
 from .draft_api_protocol import DraftApiProtocol
 from .shm_endpoint import _detach_from_resource_tracker
 from .spec_decode_channel import EndpointPacket, EndpointStatus
+
+_USE_KERNEL_SEND = _os.environ.get("PEARL_CUDAIPC_KERNEL_SEND", "1").strip() not in (
+    "0",
+    "false",
+    "no",
+    "off",
+    "",
+)
 
 # ---------------------------------------------------------------------------
 # CUDA runtime API binding -- imported lazily so this module stays importable
@@ -214,6 +229,9 @@ class _CudaIpcBackend:
         self._pinned_send: int = 0
         self._pinned_recv: int = 0
         self._stream: int = 0
+
+        # Stage 2: lazily-initialized reusable kernel launcher.
+        self._ring_launcher = None  # RingWriteLauncher | None
 
         self._recv_credits = 0
         self._started = False
@@ -410,10 +428,68 @@ class _CudaIpcBackend:
             return EndpointStatus.kQueueFull
 
         cudart = _load_cudart()
-        # Stage the frame in the pinned host buffer, then push it to the
-        # ring slot on whichever GPU owns that ring.
-        ctypes.memmove(self._pinned_send, frame, _FRAME_BYTES)
         slot_offset = (head % _RING_SLOTS) * _FRAME_BYTES
+
+        if _USE_KERNEL_SEND:
+            # Stage 2 path: launch a single-thread kernel that copies the
+            # 100-byte frame from the kernel parameter buffer (i.e. it
+            # arrives on the GPU via the launch path, not via a separate
+            # cudaMemcpy) into the peer ring slot. The kernel ends with
+            # __threadfence_system() so a peer-process reader sees the
+            # data before our head bump below.
+            if self._ring_launcher is None:
+                try:
+                    from .pearl_ring_kernel import RingWriteLauncher
+
+                    self._ring_launcher = RingWriteLauncher(self._stream)
+                except Exception:
+                    # Kernel infra unavailable; fall back to stage 1.
+                    return self._send_via_memcpy(frame, slot_offset, head)
+            try:
+                self._ring_launcher.write(
+                    self._dev_out,
+                    slot_offset,
+                    int(packet.imm_data) & 0xFFFFFFFF,
+                    payload,
+                )
+            except Exception:
+                # Kernel launch failed; bubble up as endpoint error so the
+                # channel layer can surface it through its normal path.
+                return EndpointStatus.kError
+            (status,) = cudart.cudaStreamSynchronize(self._stream)
+            if int(status) != 0:
+                return EndpointStatus.kError
+        else:
+            # Stage-1 fallback path; kept for A/B comparison via
+            # PEARL_CUDAIPC_KERNEL_SEND=0.
+            ctypes.memmove(self._pinned_send, frame, _FRAME_BYTES)
+            (status,) = cudart.cudaMemcpyAsync(
+                self._dev_out + slot_offset,
+                self._pinned_send,
+                _FRAME_BYTES,
+                cudart.cudaMemcpyKind.cudaMemcpyHostToDevice,
+                self._stream,
+            )
+            if int(status) != 0:
+                return EndpointStatus.kError
+            (status,) = cudart.cudaStreamSynchronize(self._stream)
+            if int(status) != 0:
+                return EndpointStatus.kError
+
+        # Stream sync above acts as the release fence: every byte of the
+        # frame is committed to GPU memory before the consumer observes
+        # the head bump below.
+        self._meta_out.set_head(head + 1)
+        self._recv_credits -= 1
+        return EndpointStatus.kOk
+
+    def _send_via_memcpy(self, frame: bytes, slot_offset: int, head: int):
+        """Stage-1 send fallback for when the kernel module can't be loaded
+        (e.g. ``cuda.bindings.nvrtc`` import error). Same semantics as the
+        stage-1 path but factored out so it stays the single source of
+        truth for the cudaMemcpy-based send."""
+        cudart = _load_cudart()
+        ctypes.memmove(self._pinned_send, frame, _FRAME_BYTES)
         (status,) = cudart.cudaMemcpyAsync(
             self._dev_out + slot_offset,
             self._pinned_send,
@@ -426,9 +502,6 @@ class _CudaIpcBackend:
         (status,) = cudart.cudaStreamSynchronize(self._stream)
         if int(status) != 0:
             return EndpointStatus.kError
-        # Stream sync above acts as the release fence: every byte of the
-        # frame is committed to GPU memory before the consumer observes
-        # the head bump below.
         self._meta_out.set_head(head + 1)
         self._recv_credits -= 1
         return EndpointStatus.kOk
