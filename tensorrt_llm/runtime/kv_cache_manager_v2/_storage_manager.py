@@ -211,6 +211,7 @@ class StorageManager:
         swa_scratch_reuse: SwaScratchReuseConfig | None,
         typical_batch: BatchDesc | None = None,
         constraints: list[BatchDesc] | None = None,
+        initial_pool_ratio: list[float] | None = None,
         event_manager: "KVCacheEventManager | None" = None,
     ) -> None:
         self.__rawref__ = rawref.NULL
@@ -237,12 +238,24 @@ class StorageManager:
         gpu_quota = config.cache_tiers[GPU_LEVEL].quota
         gpu_granularity = CacheLevelManager.cache_tier_granularity(CacheTier.GPU_MEM, gpu_quota)
 
+        constraints_for_min_slots = [] if initial_pool_ratio is not None else constraints or []
         self._min_slots = self._compute_min_slots_from_constraints(
-            constraints or [], tokens_per_block, swa_scratch_reuse
+            constraints_for_min_slots, tokens_per_block, swa_scratch_reuse
         )
 
-        # Compute init_ratio from typical_batch, constraints, or fallback.
-        if typical_batch is not None:
+        # Compute init_ratio from explicit config, typical_batch, constraints, or fallback.
+        if initial_pool_ratio is not None:
+            if len(initial_pool_ratio) != self.num_pool_groups:
+                raise ValueError(
+                    f"initial_pool_ratio length must match number of pool groups "
+                    f"({self.num_pool_groups}), got {len(initial_pool_ratio)}"
+                )
+            if any(r <= 0 for r in initial_pool_ratio):
+                raise ValueError("initial_pool_ratio values must be positive")
+            if not math.isclose(sum(initial_pool_ratio), 1.0, rel_tol=0.0, abs_tol=1e-6):
+                raise ValueError("initial_pool_ratio values must sum to 1.0")
+            init_ratio = cast(TypedIndexList[PoolGroupIndex, float], list(initial_pool_ratio))
+        elif typical_batch is not None:
             init_ratio = self.ratio_from_batch(
                 typical_batch, tokens_per_block, swa_scratch_reuse, gpu_granularity
             )

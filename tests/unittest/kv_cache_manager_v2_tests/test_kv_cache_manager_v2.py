@@ -64,7 +64,9 @@ if not TYPE_CHECKING and find_spec("kv_cache_manager_v2") is not None:
     )
     from kv_cache_manager_v2._copy_engine import CopyTask, batched_copy
     from kv_cache_manager_v2._exceptions import OutOfPagesError
-    from kv_cache_manager_v2._life_cycle_registry import SsmLifeCycle
+    from kv_cache_manager_v2._life_cycle_registry import LifeCycleRegistry, SsmLifeCycle
+    from kv_cache_manager_v2._storage._config import create_storage_config
+    from kv_cache_manager_v2._storage_manager import StorageManager
     from kv_cache_manager_v2._utils import (
         CachedCudaStream,
         HalfOpenRange,
@@ -116,7 +118,12 @@ else:
     )
     from tensorrt_llm.runtime.kv_cache_manager_v2._copy_engine import CopyTask, batched_copy
     from tensorrt_llm.runtime.kv_cache_manager_v2._exceptions import OutOfPagesError
-    from tensorrt_llm.runtime.kv_cache_manager_v2._life_cycle_registry import SsmLifeCycle
+    from tensorrt_llm.runtime.kv_cache_manager_v2._life_cycle_registry import (
+        LifeCycleRegistry,
+        SsmLifeCycle,
+    )
+    from tensorrt_llm.runtime.kv_cache_manager_v2._storage._config import create_storage_config
+    from tensorrt_llm.runtime.kv_cache_manager_v2._storage_manager import StorageManager
     from tensorrt_llm.runtime.kv_cache_manager_v2._utils import (
         CachedCudaStream,
         HalfOpenRange,
@@ -1633,6 +1640,7 @@ class TestInitRatioConfig(unittest.TestCase):
         num_windowed_layers: int = 1,
         num_full_layers: int = 1,
         enable_swa_scratch_reuse: bool = False,
+        initial_pool_ratio: list[float] | None = None,
     ) -> KVCacheManagerConfig:
         """Create a config with two pool groups (windowed vs non-windowed).
 
@@ -1673,6 +1681,7 @@ class TestInitRatioConfig(unittest.TestCase):
             layers=layers,
             typical_step=typical_step,
             constraints=constraints or [],
+            initial_pool_ratio=initial_pool_ratio,
             swa_scratch_reuse=(SwaScratchReuseConfig() if enable_swa_scratch_reuse else None),
         )
 
@@ -1729,6 +1738,38 @@ class TestInitRatioConfig(unittest.TestCase):
         self.assertAlmostEqual(sum(ratio_constrained), 1.0, places=6)
         mgr_unconstrained.shutdown()
         mgr_constrained.shutdown()
+
+    def test_initial_pool_ratio_overrides_typical_step_and_constraints(self):
+        """Explicit initial_pool_ratio takes precedence over inferred sizing inputs."""
+        typical = BatchDesc(kv_caches=[KVCacheDesc(capacity=4096, history_length=4000)] * 32)
+        constraint = BatchDesc(kv_caches=[KVCacheDesc(capacity=256, history_length=128)] * 256)
+        cfg = self._make_config(
+            typical_step=typical,
+            constraints=[constraint],
+            initial_pool_ratio=[0.8, 0.2],
+        )
+        manager = KVCacheManager(cfg)
+        ratio = manager._current_gpu_ratio
+
+        self.assertGreater(ratio[0], ratio[1])
+        self.assertAlmostEqual(sum(ratio), 1.0, places=6)
+        manager.shutdown()
+
+    def test_initial_pool_ratio_length_must_match_pool_groups(self):
+        cfg = self._make_config(initial_pool_ratio=[1.0])
+        life_cycles = LifeCycleRegistry(cfg)
+        storage_config = create_storage_config(cfg)
+
+        with self.assertRaisesRegex(ValueError, "initial_pool_ratio length"):
+            StorageManager(
+                life_cycles,
+                storage_config,
+                cfg.tokens_per_block,
+                cfg.swa_scratch_reuse,
+                typical_batch=cfg.typical_step,
+                constraints=cfg.constraints,
+                initial_pool_ratio=cfg.initial_pool_ratio,
+            )
 
     @parameterized.expand([(0,), (64,), (50,), (256,)])
     def test_constraint_guarantees_batch_can_run(self, system_prompt_length: int):
