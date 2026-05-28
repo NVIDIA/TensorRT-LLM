@@ -180,14 +180,14 @@ def _linear_type_to_quant_config(linear_type: str):
 def build_diffusion_args(args) -> VisualGenArgs:
     kwargs = dict(
         revision=args.revision,
-        attention={"backend": args.attention_backend},
-        parallel={"dit_ulysses_size": args.ulysses_size},
-        torch_compile={
-            "enable_torch_compile": not args.disable_torch_compile,
+        attention_config={"backend": args.attention_backend},
+        parallel_config={"ulysses_size": args.ulysses_size},
+        torch_compile_config={
+            "enable": not args.disable_torch_compile,
             "enable_autotune": not args.disable_autotune,
         },
-        cuda_graph={"enable_cuda_graph": args.enable_cudagraph},
-        skip_warmup=args.skip_warmup,
+        cuda_graph_config={"enable": args.enable_cudagraph},
+        compilation_config={"skip_warmup": args.skip_warmup},
     )
     quant_config = _linear_type_to_quant_config(args.linear_type)
     if quant_config is not None:

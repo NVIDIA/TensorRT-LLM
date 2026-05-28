@@ -18,7 +18,7 @@ from typing import List, Optional, Tuple, Union
 import numpy as np
 import torch
 
-from tensorrt_llm._torch.visual_gen.output import PipelineOutput
+from tensorrt_llm._torch.visual_gen.output import CudaPhaseTimer, PipelineOutput
 from tensorrt_llm._torch.visual_gen.pipeline import BasePipeline
 from tensorrt_llm._torch.visual_gen.pipeline_registry import PipelineComponent, register_pipeline
 from tensorrt_llm.logger import logger
@@ -420,6 +420,8 @@ class QwenImagePipeline(BasePipeline):
         with the FlowMatchEuler sampler and real CFG (``true_cfg_scale``).
         """
         pipeline_start = time.time()
+        timer = CudaPhaseTimer()
+        timer.mark_pre_start()
 
         if isinstance(prompt, str):
             prompt = [prompt]
@@ -483,6 +485,7 @@ class QwenImagePipeline(BasePipeline):
         self.scheduler.set_begin_index(0)
 
         # Denoise loop.
+        timer.mark_denoise_start()
         logger.info("Denoising (%d steps)...", len(timesteps))
         for i, t in enumerate(timesteps):
             timestep = t.expand(latents.shape[0]).to(latents.dtype)
@@ -514,10 +517,12 @@ class QwenImagePipeline(BasePipeline):
             if latents.dtype != latents_dtype:
                 latents = latents.to(latents_dtype)
 
+        timer.mark_post_start()
         logger.info("Decoding...")
         image = self._decode_latents(latents, height, width)
 
         if getattr(self, "rank", 0) == 0:
             logger.info("Pipeline total: %.2fs", time.time() - pipeline_start)
 
-        return PipelineOutput(image=image)
+        timer.mark_end()
+        return timer.fill(PipelineOutput(image=image))

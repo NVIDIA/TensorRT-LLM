@@ -28,7 +28,7 @@ from tensorrt_llm._torch.visual_gen.pipeline_registry import PIPELINE_REGISTRY, 
 def test_qwen_image_pipeline_is_registered():
     """@register_pipeline("QwenImagePipeline") must have been applied."""
     assert "QwenImagePipeline" in PIPELINE_REGISTRY
-    assert PIPELINE_REGISTRY["QwenImagePipeline"] is QwenImagePipeline
+    assert PIPELINE_REGISTRY["QwenImagePipeline"].pipeline_cls is QwenImagePipeline
 
 
 def test_auto_pipeline_detects_qwen_image_class_name(tmp_path):
