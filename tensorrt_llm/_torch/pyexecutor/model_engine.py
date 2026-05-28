@@ -3670,12 +3670,15 @@ class PyTorchModelEngine(ModelEngine):
             peft_table = peft_cache_manager.get_and_reset_batch_peft_table(
             ) if peft_cache_manager is not None else None
             return peft_table and self._get_eager_lora_params_from_requests(
-                scheduled_requests, attn_metadata, peft_table)
+                scheduled_requests, attn_metadata, peft_table,
+                peft_cache_manager)
 
     def _get_eager_lora_params_from_requests(
-            self, scheduled_requests: ScheduledRequests,
+            self,
+            scheduled_requests: ScheduledRequests,
             attn_metadata: AttentionMetadata,
-            peft_table: Dict[int, list[TaskLayerModuleConfig]]):
+            peft_table: Dict[int, list[TaskLayerModuleConfig]],
+            peft_cache_manager: Optional[PeftCacheManager] = None):
         '''
         Eager mode LoRA parameter preparation logic.
 
@@ -3690,6 +3693,12 @@ class PyTorchModelEngine(ModelEngine):
                 }
             }
         }
+
+        When ``peft_cache_manager`` is supplied and one or more active LoRA
+        uids carry a ``lora_layout.json`` sidecar, ``lora_params`` also
+        contains a top-level ``moe_shared_flags`` dict consumed by the
+        fused-MoE op. All active uids in a single batch must agree on the
+        flags; mismatches raise.
         '''
         lora_params = {}
         tmp_lora_params = {}
@@ -3788,6 +3797,32 @@ class PyTorchModelEngine(ModelEngine):
             lora_params['host_request_types'] = host_request_types
             lora_params['prompt_lens_cpu'] = prompt_lens_cpu
             lora_params['num_seqs'] = num_seqs
+
+            # MoE shared-outer flags: forward the per-uid kernel flags read
+            # from the optional ``lora_layout.json`` sidecar into
+            # ``lora_params``. The fused-MoE op zero-offsets the per-expert
+            # pointer arithmetic when a side is shared, so all active uids
+            # in a batch must agree on the flag pattern. Adapters without a
+            # sidecar yield all-False (the existing per-expert path).
+            if peft_cache_manager is not None:
+                lora_manager = peft_cache_manager.get_lora_manager()
+                active_uids = sorted({
+                    str(req.lora_task_id)
+                    for req in request_list if req.lora_task_id is not None
+                })
+                union_flags = None
+                for uid in active_uids:
+                    flags = lora_manager.get_moe_shared_flags(uid)
+                    if union_flags is None:
+                        union_flags = flags
+                    elif union_flags != flags:
+                        raise ValueError(
+                            "MoE LoRA shared-outer flags must match across "
+                            "all adapters in a batch; got mismatched flags "
+                            f"for active uids {active_uids}. The fused-MoE "
+                            "op applies one global flag set per call.")
+                if union_flags is not None and any(union_flags.values()):
+                    lora_params['moe_shared_flags'] = union_flags
 
         return lora_params
 

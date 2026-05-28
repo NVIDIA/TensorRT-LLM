@@ -29,6 +29,7 @@ from unittest.mock import MagicMock
 import torch
 from safetensors.torch import save_file
 
+from tensorrt_llm.lora_layout_sidecar import LORA_LAYOUT_FILENAME, all_false_flags
 from tensorrt_llm.lora_manager import LoraManager
 from tensorrt_llm.mapping import Mapping
 
@@ -160,6 +161,189 @@ class TestLoraManagerRetainDeviceTensors(unittest.TestCase):
 
         self.assertEqual(len(manager._lora_weights), 0)
         self.assertEqual(len(manager._cpp_lora_weights), num_adapters)
+
+
+@dataclass
+class MockMoeModelConfig:
+    """Minimal model config for MoE LoRA tests.
+
+    Mirrors the fields ``LoraManager.load_from_hf`` reads but with a single
+    MoE up-projection target so the fixture stays small.
+    """
+
+    lora_target_modules: list = field(
+        default_factory=lambda: ["moe_h_to_4h", "moe_gate", "moe_4h_to_h"])
+    trtllm_modules_to_hf_modules: dict = field(
+        default_factory=lambda: {
+            "moe_h_to_4h": "w1",
+            "moe_4h_to_h": "w2",
+            "moe_gate": "w3",
+        })
+    hidden_size: int = 64
+    dtype: str = "float16"
+    swap_gate_up_proj_lora_b_weight: bool = False
+
+
+def _create_dummy_moe_hf_lora_adapter(
+    adapter_dir: Path,
+    hidden_size: int = 64,
+    intermediate_size: int = 128,
+    rank: int = 8,
+    num_layers: int = 2,
+    num_experts: int = 4,
+    layout_sidecar: dict = None,
+):
+    """Create a minimal HF-format MoE LoRA adapter on disk.
+
+    The on-disk weights are always materialized per-expert (the C++ LoRA
+    cache row size requires this in this release); the optional
+    ``layout_sidecar`` dict only marks per-side sharing for the runtime
+    kernel flags.
+    """
+    config = {
+        "r": rank,
+        "lora_alpha": rank,
+        "target_modules": ["w1", "w2", "w3"],
+        "bias": "none",
+        "peft_type": "LORA",
+        "task_type": "CAUSAL_LM",
+    }
+    with open(adapter_dir / "adapter_config.json", "w") as f:
+        json.dump(config, f)
+
+    weights = {}
+    for layer_idx in range(num_layers):
+        for expert_idx in range(num_experts):
+            base = (f"base_model.model.model.layers.{layer_idx}"
+                    f".mlp.experts.{expert_idx}")
+            # Up-projections (w1, w3): in_dim=hidden, out_dim=intermediate.
+            for module in ("w1", "w3"):
+                weights[f"{base}.{module}.lora_A.weight"] = torch.randn(
+                    rank, hidden_size, dtype=torch.float16)
+                weights[f"{base}.{module}.lora_B.weight"] = torch.randn(
+                    intermediate_size, rank, dtype=torch.float16)
+            # Down-projection (w2): in_dim=intermediate, out_dim=hidden.
+            weights[f"{base}.w2.lora_A.weight"] = torch.randn(
+                rank, intermediate_size, dtype=torch.float16)
+            weights[f"{base}.w2.lora_B.weight"] = torch.randn(
+                hidden_size, rank, dtype=torch.float16)
+
+    save_file(weights, str(adapter_dir / "adapter_model.safetensors"))
+
+    if layout_sidecar is not None:
+        with open(adapter_dir / LORA_LAYOUT_FILENAME, "w") as f:
+            json.dump(layout_sidecar, f)
+
+
+@unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
+class TestLoraManagerMoeSharedFlags(unittest.TestCase):
+    """Tests for ``lora_layout.json`` sidecar handling in the HF MoE loader."""
+
+    def _create_manager(self):
+        # cpp_peft_cache_manager mocked so the manager skips the
+        # legacy-TRT retain-GPU-tensors path; matches PyTorch runtime usage.
+        mapping = Mapping(world_size=1, rank=0, tp_size=1)
+        model_config = MockMoeModelConfig()
+        return LoraManager(
+            mapping=mapping,
+            model_config=model_config,
+            cpp_peft_cache_manager=MagicMock(),
+        )
+
+    def test_no_sidecar_yields_all_false_flags(self):
+        manager = self._create_manager()
+        model_config = MockMoeModelConfig()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            adapter_dir = Path(tmpdir) / "adapter_no_sidecar"
+            adapter_dir.mkdir()
+            _create_dummy_moe_hf_lora_adapter(adapter_dir)
+            manager.load_from_hf(
+                model_dirs=[str(adapter_dir)],
+                model_config=model_config,
+                uids=["uid-no-sidecar"],
+            )
+        self.assertEqual(manager.get_moe_shared_flags("uid-no-sidecar"),
+                         all_false_flags())
+
+    def test_sidecar_flags_propagate_to_manager(self):
+        manager = self._create_manager()
+        model_config = MockMoeModelConfig()
+        sidecar = {
+            "version": 1,
+            "moe_shared_outer": {
+                "moe_h_to_4h": {
+                    "shared_side": "A"
+                },
+                "moe_gate": {
+                    "shared_side": "A"
+                },
+                "moe_4h_to_h": {
+                    "shared_side": "B"
+                },
+            },
+        }
+        with tempfile.TemporaryDirectory() as tmpdir:
+            adapter_dir = Path(tmpdir) / "adapter_shared_outer"
+            adapter_dir.mkdir()
+            _create_dummy_moe_hf_lora_adapter(adapter_dir,
+                                              layout_sidecar=sidecar)
+            manager.load_from_hf(
+                model_dirs=[str(adapter_dir)],
+                model_config=model_config,
+                uids=["uid-shared"],
+            )
+        flags = manager.get_moe_shared_flags("uid-shared")
+        self.assertEqual(
+            flags,
+            {
+                "fc1_shared_a": True,
+                "fc1_shared_b": False,
+                "fc2_shared_a": False,
+                "fc2_shared_b": True,
+                "gated_shared_a": True,
+                "gated_shared_b": False,
+            },
+        )
+
+    def test_sidecar_does_not_change_cached_weights(self):
+        # Loading with vs without the sidecar should produce bit-identical
+        # `_cpp_lora_weights` rows: the sidecar is metadata-only in this
+        # release (still load-time replicated to match the C++ cache).
+        manager_a = self._create_manager()
+        manager_b = self._create_manager()
+        model_config = MockMoeModelConfig()
+        sidecar = {
+            "version": 1,
+            "moe_shared_outer": {
+                "moe_h_to_4h": {
+                    "shared_side": "A"
+                },
+            },
+        }
+        with tempfile.TemporaryDirectory() as tmpdir:
+            adapter_dir_a = Path(tmpdir) / "adapter_a"
+            adapter_dir_b = Path(tmpdir) / "adapter_b"
+            adapter_dir_a.mkdir()
+            adapter_dir_b.mkdir()
+            torch.manual_seed(0)
+            _create_dummy_moe_hf_lora_adapter(adapter_dir_a)
+            torch.manual_seed(0)
+            _create_dummy_moe_hf_lora_adapter(adapter_dir_b,
+                                              layout_sidecar=sidecar)
+            manager_a.load_from_hf(model_dirs=[str(adapter_dir_a)],
+                                   model_config=model_config,
+                                   uids=["uid-a"])
+            manager_b.load_from_hf(model_dirs=[str(adapter_dir_b)],
+                                   model_config=model_config,
+                                   uids=["uid-b"])
+        self.assertTrue(
+            torch.equal(manager_a.cpp_lora_weights["uid-a"],
+                        manager_b.cpp_lora_weights["uid-b"]))
+
+    def test_unknown_uid_returns_all_false(self):
+        manager = self._create_manager()
+        self.assertEqual(manager.get_moe_shared_flags("never-loaded"),
+                         all_false_flags())
 
 
 if __name__ == "__main__":

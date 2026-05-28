@@ -24,6 +24,15 @@ from .lora_helper import (
     get_default_trtllm_modules_to_hf_modules,
     get_missing_qkv_modules_from_lora_modules,
 )
+from .lora_layout_sidecar import (
+    all_false_flags as _moe_all_false_shared_flags,
+)
+from .lora_layout_sidecar import (
+    layout_to_kernel_flags as _moe_layout_to_kernel_flags,
+)
+from .lora_layout_sidecar import (
+    load_lora_layout_sidecar as _load_lora_layout_sidecar,
+)
 from .mapping import Mapping
 from .models.convert_utils import get_model_path, load_state_dict, split_matrix_tp
 
@@ -732,6 +741,13 @@ class LoraManager(object):
 
         self._lora_uid_counter = 0
         self._lora_uid_to_low_ranks: Dict[str, Dict[int, Dict[str, int]]] = {}
+        # MoE routed-expert shared-outer flags per adapter uid. Populated by
+        # the HF loader when an adapter ships a ``lora_layout.json`` sidecar;
+        # consumed by the per-request assembler in ``model_engine.py`` to set
+        # ``lora_params["moe_shared_flags"]`` for the fused-MoE op. Adapters
+        # without the sidecar get an all-False entry, matching pre-existing
+        # per-expert kernel behavior. See ``lora_layout_sidecar.py``.
+        self._uid_to_moe_shared_flags: Dict[str, Dict[str, bool]] = {}
         # When cpp_peft_cache_manager is provided (PyTorch backend), the C++
         # PeftCacheManager manages its own GPU cache with proper eviction.
         # The Python-side GPU tensors are only needed by the legacy TRT backend
@@ -1073,6 +1089,16 @@ class LoraManager(object):
             if uid not in self._cpp_lora_config:
                 self._cpp_lora_config[uid] = []  # Will be converted to tensor later
 
+            # Optional `lora_layout.json` sidecar declares which MoE LoRA
+            # modules use shared-outer storage (one side A or B shared across
+            # experts). The on-disk weight layout is unchanged in this release
+            # -- the loader still replicates shared sides to match the C++
+            # cache row size -- so the sidecar only sets per-uid kernel flags
+            # that the per-request assembler later forwards to fused-MoE.
+            moe_shared_layout = _load_lora_layout_sidecar(model_dir)
+            self._uid_to_moe_shared_flags[uid] = _moe_layout_to_kernel_flags(
+                moe_shared_layout)
+
             lora_model = load_state_dict(get_model_path(model_dir, "adapter_model"))
             if lora_model is None:
                 raise ValueError(f"Failed to load adapter_model from {model_dir}")
@@ -1230,6 +1256,24 @@ class LoraManager(object):
     def uid_to_low_ranks(self, uid: str):
         assert isinstance(uid, str)
         return self._lora_uid_to_low_ranks[uid]
+
+    def get_moe_shared_flags(self, uid: str) -> Dict[str, bool]:
+        """Return the six-bool fused-MoE shared-outer flag dict for an
+        adapter uid.
+
+        Returns all-False when ``uid`` was loaded without a
+        ``lora_layout.json`` sidecar or is unknown to this manager,
+        preserving the default per-expert kernel offset behavior.
+
+        The keys match the kwargs accepted by ``torch.ops.trtllm.fused_moe``
+        (``fc1_shared_a``, ``fc1_shared_b``, ``fc2_shared_a``,
+        ``fc2_shared_b``, ``gated_shared_a``, ``gated_shared_b``). See
+        ``lora_layout_sidecar.py`` for the schema.
+        """
+        flags = self._uid_to_moe_shared_flags.get(uid)
+        if flags is None:
+            return _moe_all_false_shared_flags()
+        return dict(flags)
 
     def _generate_uid(self):
         while str(self._lora_uid_counter) in self._lora_uid_to_low_ranks:
