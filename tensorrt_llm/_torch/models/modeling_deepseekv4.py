@@ -1472,13 +1472,10 @@ class DeepseekV4MoE(nn.Module):
                 WideEPMoE,
                 DeepGemmFusedMoE,
             )
-            # NVFP4 routed-expert path: the TRTLLM-Gen fp4-block-scale fused-MoE
-            # cubin produces near-zero accuracy without bias even when
-            # swiglu_limit is supplied; drop the limit there until the cubin
-            # gains a no-bias clamp variant. MXFP4 variants are unaffected.
+            # WideEPMoE NVFP4 (NVFP4CutlassFusedMoEMethod) swiglu_limit path
+            # not re-validated end-to-end.
             kernel_requires_bias_for_swiglu_limit = (
-                moe_cls in (TRTLLMGenFusedMoE, WideEPMoE)
-                and experts_quant_config.quant_mode.has_nvfp4()
+                moe_cls is WideEPMoE and experts_quant_config.quant_mode.has_nvfp4()
             )
             if supports_swiglu_limit and not kernel_requires_bias_for_swiglu_limit:
                 moe_load_balancer_config = getattr(model_config, "moe_load_balancer", None)
