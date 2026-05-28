@@ -398,6 +398,38 @@ class CutlassFusedMoE(MoE):
             return None
         return MoeLoraLayer(active_modules, active_out_sizes)
 
+    # Keys in lora_params["moe_shared_flags"] that signal native shared-outer
+    # mode for each (module, side) pair. When True, the fused-MoE op zero-
+    # offsets the corresponding pointer arithmetic, so the adapter tensor is
+    # read as a single unreplicated buffer instead of the default [E, ...]
+    # layout. Default False preserves the load-time-replication behavior.
+    _MOE_SHARED_FLAG_KEYS = (
+        "fc1_shared_a",
+        "fc1_shared_b",
+        "fc2_shared_a",
+        "fc2_shared_b",
+        "gated_shared_a",
+        "gated_shared_b",
+    )
+
+    @classmethod
+    def _resolve_moe_shared_flags(cls, lora_params: Optional[Dict]) -> Dict[str, bool]:
+        """Return the 6-bool dict of native shared-outer flags, defaulted to False.
+
+        Picks up `lora_params["moe_shared_flags"]` if present; this is populated
+        by the loader (lora_layout.json sidecar) to mark per-side sharing for
+        each MoE module. Unknown keys are ignored; missing keys default to
+        False (load-time replication).
+        """
+        flags = {key: False for key in cls._MOE_SHARED_FLAG_KEYS}
+        if not lora_params:
+            return flags
+        provided = lora_params.get("moe_shared_flags") or {}
+        for key in cls._MOE_SHARED_FLAG_KEYS:
+            if provided.get(key):
+                flags[key] = True
+        return flags
+
     def _extract_moe_lora_tensors(
         self, lora_params: Optional[Dict]
     ) -> Optional[Dict[str, object]]:
@@ -411,6 +443,11 @@ class CutlassFusedMoE(MoE):
             host_request_types   : int32  [num_seqs]      (0=CTX, 1=GEN)
             host_context_lengths : int32  [num_seqs]
             lora_max_low_rank    : int (max rank across the active modules)
+
+        For native shared-outer adapters, `lora_params["moe_shared_flags"]`
+        is a dict with up to 6 boolean entries (fc1_shared_a, fc1_shared_b,
+        fc2_shared_a, fc2_shared_b, gated_shared_a, gated_shared_b). When set,
+        the corresponding side is treated as a single unreplicated buffer.
         """
         if not lora_params:
             return None
@@ -470,6 +507,7 @@ class CutlassFusedMoE(MoE):
             )
 
         num_seqs = lora_params["num_seqs"]
+        shared_flags = self._resolve_moe_shared_flags(lora_params)
         return {
             "fc1_lora_ranks": kernel_ranks["fc1"][:num_seqs].contiguous(),
             "fc1_lora_weight_ptrs": kernel_ptrs["fc1"][:num_seqs].contiguous(),
@@ -485,6 +523,7 @@ class CutlassFusedMoE(MoE):
             "host_context_lengths":
             lora_params["prompt_lens_cpu"][:num_seqs].contiguous(),
             "lora_max_low_rank": active_max_rank,
+            **shared_flags,
         }
 
     def _extract_moe_lora_tensors_cuda_graph(
@@ -547,6 +586,7 @@ class CutlassFusedMoE(MoE):
         if active_max_rank <= 0:
             return None
 
+        shared_flags = self._resolve_moe_shared_flags(lora_params)
         return {
             "fc1_slot_lora_ranks": slot_ranks["fc1"].contiguous(),
             "fc1_slot_lora_weight_ptrs": slot_ptrs["fc1"].contiguous(),
@@ -560,6 +600,7 @@ class CutlassFusedMoE(MoE):
              if slot_ptrs["gated"] is not None else None),
             "token_to_slot": token_to_slot,
             "lora_max_low_rank": active_max_rank,
+            **shared_flags,
         }
 
     def _check_configs(self):

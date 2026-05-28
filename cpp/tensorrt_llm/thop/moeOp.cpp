@@ -319,7 +319,13 @@ public:
         torch::optional<torch::Tensor> const& fc2_slot_lora_weight_ptrs = torch::nullopt,
         torch::optional<torch::Tensor> const& gated_slot_lora_ranks = torch::nullopt,
         torch::optional<torch::Tensor> const& gated_slot_lora_weight_ptrs = torch::nullopt,
-        torch::optional<torch::Tensor> const& token_to_slot = torch::nullopt)
+        torch::optional<torch::Tensor> const& token_to_slot = torch::nullopt,
+        // Native shared-outer flags. When set, the corresponding side's adapter
+        // tensor is read as a single unreplicated buffer (e.g. A: [rank, in],
+        // B: [out, rank]) instead of the default per-expert [E, ...] layout.
+        // See LoraParams docs and Phase 6 in moe-lora-preflight.md.
+        bool fc1_shared_a = false, bool fc1_shared_b = false, bool fc2_shared_a = false, bool fc2_shared_b = false,
+        bool gated_shared_a = false, bool gated_shared_b = false)
     {
         std::lock_guard<std::mutex> lock(mMutex);
         // Free the profile workspace to save memory
@@ -530,7 +536,8 @@ public:
             fc2_lora_weight_ptrs, gated_lora_ranks, gated_lora_weight_ptrs, host_request_types, host_context_lengths,
             fc1_slot_lora_ranks, fc1_slot_lora_weight_ptrs, fc2_slot_lora_ranks, fc2_slot_lora_weight_ptrs,
             gated_slot_lora_ranks, gated_slot_lora_weight_ptrs, token_to_slot,
-            /*num_tokens=*/num_rows, hidden_size, inter_size, mActivationDtype, lora_max_low_rank, is_gated_act);
+            /*num_tokens=*/num_rows, hidden_size, inter_size, mActivationDtype, lora_max_low_rank, is_gated_act,
+            fc1_shared_a, fc1_shared_b, fc2_shared_a, fc2_shared_b, gated_shared_a, gated_shared_b);
         size_t lora_workspace_size = 0;
         if (lora_params_opt.has_value())
         {
@@ -1260,7 +1267,9 @@ private:
         torch::optional<torch::Tensor> const& gated_slot_lora_ranks,
         torch::optional<torch::Tensor> const& gated_slot_lora_weight_ptrs,
         torch::optional<torch::Tensor> const& token_to_slot, int64_t num_tokens, int64_t hidden_size, int64_t inter_size,
-        c10::ScalarType act_dtype, int64_t lora_max_low_rank, bool is_gated_activation)
+        c10::ScalarType act_dtype, int64_t lora_max_low_rank, bool is_gated_activation, bool fc1_shared_a = false,
+        bool fc1_shared_b = false, bool fc2_shared_a = false, bool fc2_shared_b = false, bool gated_shared_a = false,
+        bool gated_shared_b = false)
     {
         bool const has_per_request = fc1_lora_ranks.has_value();
         bool const has_slot_indexed = fc1_slot_lora_ranks.has_value();
@@ -1388,6 +1397,15 @@ private:
             has_gated ? mLoraExpandGatedRanks.data() : nullptr,
             has_gated ? mLoraExpandGatedWeightPtrs.data() : nullptr,
         };
+        // Shared-outer flags: when a side is shared across experts, the kernel
+        // skips the `weight_index * dim * lora_rank` offset so a single
+        // unreplicated weight buffer is read by every expert.
+        lora_params.fc1_shared_a = fc1_shared_a;
+        lora_params.fc1_shared_b = fc1_shared_b;
+        lora_params.fc2_shared_a = fc2_shared_a;
+        lora_params.fc2_shared_b = fc2_shared_b;
+        lora_params.gated_shared_a = gated_shared_a;
+        lora_params.gated_shared_b = gated_shared_b;
         return lora_params;
     }
 

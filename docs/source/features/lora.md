@@ -193,21 +193,37 @@ Two adapter layouts are supported:
   - For up-projections (`moe_h_to_4h`, `moe_gate`), `A` is shared (`[rank, hidden_size]`) and `B` is per expert.
   - For the down-projection (`moe_4h_to_h`), `B` is shared (`[hidden_size, rank]`) and `A` is per expert.
 
-In the MVP, shared-outer is supported via **load-time replication**: replicate the shared tensor `num_experts` times before saving the adapter so it looks per-expert on disk. The MoE kernel reads each expert's slice at offset `expert_index * dim * rank`, so a correctly replicated checkpoint is bit-identical in behavior to a per-expert one. A native single-copy kernel path is planned for a later release.
+Two encodings of shared-outer are supported:
 
-A helper for assembling synthetic adapters (for unit tests and experimentation) is provided at `tensorrt_llm._torch.peft.lora.moe_layout`:
+1. **Load-time replication.** Replicate the shared tensor `num_experts` times before saving the adapter so it looks per-expert on disk. The MoE kernel reads each expert's slice at offset `expert_index * dim * rank`, so a correctly replicated checkpoint is bit-identical in behavior to a per-expert one. Simple, but spends `num_experts - 1` extra copies of the shared matrix in device memory.
+2. **Native shared-outer.** The shared tensor is stored once. The fused MoE op accepts six boolean flags (`fc1_shared_a`, `fc1_shared_b`, `fc2_shared_a`, `fc2_shared_b`, `gated_shared_a`, `gated_shared_b`); when a flag is set, the kernel zero-offsets the corresponding per-expert pointer arithmetic and every expert reads the same single buffer. Mathematically identical to replication, no extra memory.
+
+Helpers for assembling synthetic adapters live at `tensorrt_llm._torch.peft.lora.moe_layout`:
 
 ```python
-from tensorrt_llm._torch.peft.lora.moe_layout import make_per_expert_lora
+from tensorrt_llm._torch.peft.lora.moe_layout import (
+    make_per_expert_lora,        # replicated layout
+    make_native_shared_lora,     # native unreplicated layout
+)
 
-# Shared-A adapter for the up projection (residual-stream-side shared).
-fc1_adapter = make_per_expert_lora(
+# Replicated shared-A adapter for the up projection.
+fc1_replicated = make_per_expert_lora(
     num_experts=8, rank=16, in_dim=2048, out_dim=5632,
-    shared_side="A",   # or "B" for down-projection, or None for fully per-expert
+    shared_side="A",   # or "B", or None for fully per-expert
     dtype=torch.bfloat16,
 )
-# fc1_adapter["A"].shape == (8, 16, 2048)  -- replicated 8 times, all slices identical
-# fc1_adapter["B"].shape == (8, 5632, 16)  -- independent per expert
+# fc1_replicated["A"].shape == (8, 16, 2048)  -- replicated 8 times, all slices identical
+# fc1_replicated["B"].shape == (8, 5632, 16)  -- independent per expert
+
+# Native shared-A adapter (single A tensor, no replication).
+fc1_native = make_native_shared_lora(
+    num_experts=8, rank=16, in_dim=2048, out_dim=5632,
+    shared_side="A",
+    dtype=torch.bfloat16,
+)
+# fc1_native["A"].shape == (16, 2048)   -- single shared matrix
+# fc1_native["B"].shape == (8, 5632, 16) -- independent per expert
+# fc1_native["shared_a"] is True; pass alongside the adapter to the op.
 ```
 
 #### CUDA-graph decode

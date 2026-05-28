@@ -18,7 +18,8 @@ They do NOT attempt full numerical equivalence with a hand-written reference
 import pytest
 import torch
 
-from tensorrt_llm._torch.peft.lora.moe_layout import make_per_expert_lora
+from tensorrt_llm._torch.peft.lora.moe_layout import (
+    make_native_shared_lora, make_per_expert_lora)
 
 _TRTLLM_AVAILABLE = hasattr(torch.ops, "trtllm") and hasattr(
     torch.ops.trtllm, "fused_moe")
@@ -526,3 +527,125 @@ def test_moe_lora_rejects_mixed_per_request_and_slot_indexed():
     with pytest.raises(RuntimeError, match="mutually exclusive"):
         _call_fused_moe(x, w3_w1, w2, topk_ids, topk_scores,
                         output_dtype=dtype, lora_kwargs=lora_kwargs)
+
+
+# -------- Phase 6a: native shared-outer kernel flag ---------------------------
+
+
+@requires_cuda_and_op
+def test_moe_native_shared_outer_matches_replicated_bitidentical():
+    """Bit-identity check between the two equivalent shared-outer encodings:
+
+      (a) Load-time replication: shared side is materialized as `[E, ...]`
+          and the kernel applies the standard `weight_index * dim * rank`
+          offset (default behavior, MVP path).
+      (b) Native shared-outer: shared side is stored once and the kernel
+          zero-offsets that side via `LoraParams::*_shared_a/b` (Phase 6a).
+
+    Both paths receive the same underlying weights, so the kernel output
+    must be bit-identical. This validates the offset gating in
+    `setupLoraWorkspace` and the threading of the 6 bool flags through
+    `runMoe` -> `buildMoeLoraParams` -> `LoraParams`.
+    """
+    device = torch.device("cuda")
+    dtype = torch.bfloat16
+    num_tokens, hidden_size, inter_size = 16, 128, 256
+    num_experts, top_k = 4, 2
+    rank = 8
+
+    x, w3_w1, w2, topk_ids, topk_scores = _build_base_inputs(
+        num_tokens, hidden_size, inter_size, num_experts, top_k, dtype, device)
+
+    # Native shared-outer adapters: fc1.A shared, fc2.B shared, gated.A shared
+    # (gated mirrors fc1 by convention since both are up-projections).
+    fc1_native = make_native_shared_lora(num_experts, rank, hidden_size,
+                                         inter_size, shared_side="A",
+                                         dtype=dtype, device=device, seed=70)
+    fc2_native = make_native_shared_lora(num_experts, rank, inter_size,
+                                         hidden_size, shared_side="B",
+                                         dtype=dtype, device=device, seed=71)
+    gated_native = make_native_shared_lora(num_experts, rank, hidden_size,
+                                           inter_size, shared_side="A",
+                                           dtype=dtype, device=device, seed=72)
+
+    # ---- Path (b): native, with shared flags set on the op ----
+    lora_kwargs_native = _build_lora_request_buffers(
+        num_tokens, fc1_native["A"], fc1_native["B"],
+        fc2_native["A"], fc2_native["B"], rank=rank,
+        gated_a=gated_native["A"], gated_b=gated_native["B"])
+    lora_kwargs_native.update(dict(
+        fc1_shared_a=True, fc1_shared_b=False,
+        fc2_shared_a=False, fc2_shared_b=True,
+        gated_shared_a=True, gated_shared_b=False,
+    ))
+
+    out_native = _call_fused_moe(x, w3_w1, w2, topk_ids, topk_scores,
+                                 output_dtype=dtype,
+                                 lora_kwargs=lora_kwargs_native)[0]
+
+    # ---- Path (a): replicate shared sides into [E, ...] and run with default flags ----
+    fc1_a_replicated = (
+        fc1_native["A"].unsqueeze(0).expand(num_experts, -1, -1).contiguous())
+    fc2_b_replicated = (
+        fc2_native["B"].unsqueeze(0).expand(num_experts, -1, -1).contiguous())
+    gated_a_replicated = (
+        gated_native["A"].unsqueeze(0).expand(num_experts, -1, -1).contiguous())
+
+    lora_kwargs_repl = _build_lora_request_buffers(
+        num_tokens, fc1_a_replicated, fc1_native["B"],
+        fc2_native["A"], fc2_b_replicated, rank=rank,
+        gated_a=gated_a_replicated, gated_b=gated_native["B"])
+    # Default: all *_shared_* = False.
+    out_repl = _call_fused_moe(x, w3_w1, w2, topk_ids, topk_scores,
+                               output_dtype=dtype,
+                               lora_kwargs=lora_kwargs_repl)[0]
+
+    assert torch.isfinite(out_native).all()
+    assert torch.isfinite(out_repl).all()
+    # Same kernel math, same offsets (the native path zeros what the replicated
+    # path makes redundant). Outputs must be bit-identical.
+    torch.testing.assert_close(out_native, out_repl, rtol=0, atol=0)
+
+
+@requires_cuda_and_op
+def test_moe_native_shared_outer_differs_from_no_lora():
+    """A sanity smoke for the native shared-outer path: the LoRA delta must
+    move the output meaningfully vs the no-LoRA baseline, with NO replication
+    on either side."""
+    device = torch.device("cuda")
+    dtype = torch.bfloat16
+    num_tokens, hidden_size, inter_size = 16, 128, 256
+    num_experts, top_k = 4, 2
+    rank = 8
+
+    x, w3_w1, w2, topk_ids, topk_scores = _build_base_inputs(
+        num_tokens, hidden_size, inter_size, num_experts, top_k, dtype, device)
+
+    fc1_native = make_native_shared_lora(num_experts, rank, hidden_size,
+                                         inter_size, shared_side="A",
+                                         dtype=dtype, device=device, seed=90)
+    fc2_native = make_native_shared_lora(num_experts, rank, inter_size,
+                                         hidden_size, shared_side="B",
+                                         dtype=dtype, device=device, seed=91)
+    gated_native = make_native_shared_lora(num_experts, rank, hidden_size,
+                                           inter_size, shared_side="A",
+                                           dtype=dtype, device=device, seed=92)
+
+    lora_kwargs = _build_lora_request_buffers(
+        num_tokens, fc1_native["A"], fc1_native["B"],
+        fc2_native["A"], fc2_native["B"], rank=rank,
+        gated_a=gated_native["A"], gated_b=gated_native["B"])
+    lora_kwargs.update(dict(
+        fc1_shared_a=True,
+        fc2_shared_b=True,
+        gated_shared_a=True,
+    ))
+
+    out_baseline = _call_fused_moe(x, w3_w1, w2, topk_ids, topk_scores,
+                                   output_dtype=dtype)[0]
+    out_lora = _call_fused_moe(x, w3_w1, w2, topk_ids, topk_scores,
+                               output_dtype=dtype, lora_kwargs=lora_kwargs)[0]
+
+    assert torch.isfinite(out_lora).all()
+    diff = (out_lora.float() - out_baseline.float()).abs().mean().item()
+    assert diff > 1e-3, f"native shared-outer LoRA had no observable effect (mean abs diff={diff})"

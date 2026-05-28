@@ -3691,6 +3691,16 @@ bool CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enab
     size_t num_valid_tokens
         = needs_num_valid ? host_expert_first_token_offset[num_experts_per_node] : expanded_num_rows;
 
+    // Shared-outer LoRA: when a side is shared across experts, zero out the
+    // per-expert `weight_index * dim * lora_rank` offset so all experts read
+    // the same (unreplicated) buffer. See LoraParams documentation.
+    bool const fc1_shared_a = lora_params.fc1_shared_a;
+    bool const fc1_shared_b = lora_params.fc1_shared_b;
+    bool const fc2_shared_a = lora_params.fc2_shared_a;
+    bool const fc2_shared_b = lora_params.fc2_shared_b;
+    bool const gated_shared_a = lora_params.gated_shared_a;
+    bool const gated_shared_b = lora_params.gated_shared_b;
+
     for (int expert_idx = 0; expert_idx < num_experts_per_node; ++expert_idx)
     {
         int weight_index = expert_idx + start_expert;
@@ -3699,21 +3709,25 @@ bool CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enab
         {
             int source_index = host_permuted_rows[i] % num_rows;
             int32_t lora_rank = lora_params.fc1_lora_ranks[source_index];
+            int64_t const fc1_a_offset = fc1_shared_a ? 0 : weight_index * hidden_size * lora_rank;
+            int64_t const fc1_b_offset = fc1_shared_b ? 0 : weight_index * lora_rank * inter_size;
             host_permuted_fc1_weight_ptrs[i * 2]
                 = reinterpret_cast<ScaleBiasType const*>(lora_params.fc1_lora_weight_ptrs[source_index * 2])
-                + weight_index * hidden_size * lora_rank;
+                + fc1_a_offset;
             host_permuted_fc1_weight_ptrs[i * 2 + 1]
                 = reinterpret_cast<ScaleBiasType const*>(lora_params.fc1_lora_weight_ptrs[source_index * 2 + 1])
-                + weight_index * lora_rank * inter_size;
+                + fc1_b_offset;
             host_permuted_fc1_lora_ranks[i] = lora_rank;
 
             lora_rank = lora_params.fc2_lora_ranks[source_index];
+            int64_t const fc2_a_offset = fc2_shared_a ? 0 : weight_index * inter_size * lora_rank;
+            int64_t const fc2_b_offset = fc2_shared_b ? 0 : weight_index * lora_rank * hidden_size;
             host_permuted_fc2_weight_ptrs[i * 2]
                 = reinterpret_cast<ScaleBiasType const*>(lora_params.fc2_lora_weight_ptrs[source_index * 2])
-                + weight_index * inter_size * lora_rank;
+                + fc2_a_offset;
             host_permuted_fc2_weight_ptrs[i * 2 + 1]
                 = reinterpret_cast<ScaleBiasType const*>(lora_params.fc2_lora_weight_ptrs[source_index * 2 + 1])
-                + weight_index * lora_rank * hidden_size;
+                + fc2_b_offset;
             host_permuted_fc2_lora_ranks[i] = lora_rank;
 
             if (host_permuted_fc1_lora_ranks[i] || host_permuted_fc2_lora_ranks[i])
@@ -3724,12 +3738,14 @@ bool CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enab
             if (is_gated_activation)
             {
                 lora_rank = lora_params.gated_lora_ranks[source_index];
+                int64_t const gated_a_offset = gated_shared_a ? 0 : weight_index * hidden_size * lora_rank;
+                int64_t const gated_b_offset = gated_shared_b ? 0 : weight_index * lora_rank * inter_size;
                 host_permuted_gated_weight_ptrs[i * 2]
                     = reinterpret_cast<ScaleBiasType const*>(lora_params.gated_lora_weight_ptrs[source_index * 2])
-                    + weight_index * hidden_size * lora_rank;
+                    + gated_a_offset;
                 host_permuted_gated_weight_ptrs[i * 2 + 1]
                     = reinterpret_cast<ScaleBiasType const*>(lora_params.gated_lora_weight_ptrs[source_index * 2 + 1])
-                    + weight_index * lora_rank * inter_size;
+                    + gated_b_offset;
                 host_permuted_gated_lora_ranks[i] = lora_rank;
 
                 if (host_permuted_gated_lora_ranks[i])
