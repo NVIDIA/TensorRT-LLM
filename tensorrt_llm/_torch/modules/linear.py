@@ -179,15 +179,18 @@ def load_weights_vanilla_helper(module: Linear,
                                 bias_transform=lambda x: x,
                                 allow_partial_loading: bool = False):
     assert len(weights) == 1
+    # NOTE(debug-bot iter-20): W4A8 emitters publish 'weight_packed'.
+    _wk = "weight" if "weight" in weights[0] else (
+        "weight_packed" if "weight_packed" in weights[0] else None)
     if not allow_partial_loading:
-        assert "weight" in weights[0]
+        assert _wk is not None
         if module.bias is not None:
             assert "bias" in weights[0]
     device = torch.device('cuda')
 
-    weight = load_weight_shard(weights[0]['weight'], module.tp_size,
+    weight = load_weight_shard(weights[0][_wk], module.tp_size,
                                module.tp_rank, module.tp_mode,
-                               device) if "weight" in weights[0] else None
+                               device) if _wk is not None else None
 
     if weight is not None:
         if module.has_weight_only_quant:
