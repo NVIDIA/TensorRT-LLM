@@ -536,7 +536,7 @@ public:
             fc2_lora_weight_ptrs, gated_lora_ranks, gated_lora_weight_ptrs, host_request_types, host_context_lengths,
             fc1_slot_lora_ranks, fc1_slot_lora_weight_ptrs, fc2_slot_lora_ranks, fc2_slot_lora_weight_ptrs,
             gated_slot_lora_ranks, gated_slot_lora_weight_ptrs, token_to_slot,
-            /*num_tokens=*/num_rows, hidden_size, inter_size, mActivationDtype, lora_max_low_rank, is_gated_act,
+            /*num_tokens=*/num_rows, hidden_size, inter_size, mActivationDtype, lora_max_low_rank, is_gated_act, stream,
             fc1_shared_a, fc1_shared_b, fc2_shared_a, fc2_shared_b, gated_shared_a, gated_shared_b);
         size_t lora_workspace_size = 0;
         if (lora_params_opt.has_value())
@@ -941,14 +941,45 @@ private:
     // Sync event used by setupLoraWorkspace (kernel waits on this before reading
     // host-side permuted_rows arrays). Created lazily.
     cudaEvent_t mLoraMemcpyEvent = nullptr;
+
+    // Phase 6b.A foundation -- pinned-host + persistent-device buffers for the
+    // capture-safe MoE LoRA path. The pinned-host tensors hold the per-token
+    // expanded LoRA tables (ranks + weight-pointer pairs) so the inside-op
+    // async H2D into the device mirrors is graph-capturable; an async H2D from
+    // pageable host (the previous std::vector<>) silently becomes synchronous
+    // and breaks capture. Both tensors are sized at mLoraHostBufCapacity
+    // (max_num_tokens) and reused across calls so the source/destination
+    // addresses are stable across capture/replay. Only the first num_tokens
+    // entries are valid each call; downstream consumers must respect num_seqs.
+    //
+    // Device mirrors are allocated alongside the pinned host tensors but are
+    // currently unused -- they are wired up by the device-side pointer-builder
+    // kernel in checkpoint 6b.B and the cudaGraphGroupedGemm path in 6b.C. The
+    // H2D is queued unconditionally so the data flow is exercised in eager
+    // mode (capture is still rejected by runMoe for now).
+    at::Tensor mLoraExpandFC1RanksPinned;       // [max_num_tokens]      int32
+    at::Tensor mLoraExpandFC1WeightPtrsPinned;  // [max_num_tokens * 2]  int64 (A, B)
+    at::Tensor mLoraExpandFC2RanksPinned;       // [max_num_tokens]      int32
+    at::Tensor mLoraExpandFC2WeightPtrsPinned;  // [max_num_tokens * 2]  int64
+    at::Tensor mLoraExpandGatedRanksPinned;     // [max_num_tokens]      int32
+    at::Tensor mLoraExpandGatedWeightPtrsPinned;// [max_num_tokens * 2]  int64
+    at::Tensor mLoraExpandFC1RanksDevice;
+    at::Tensor mLoraExpandFC1WeightPtrsDevice;
+    at::Tensor mLoraExpandFC2RanksDevice;
+    at::Tensor mLoraExpandFC2WeightPtrsDevice;
+    at::Tensor mLoraExpandGatedRanksDevice;
+    at::Tensor mLoraExpandGatedWeightPtrsDevice;
+    // Tracks how many entries were populated this call so the H2D copies only
+    // the live portion. Per FC -- gated may be inactive for non-gated layers.
+    int64_t mLoraExpandFC1Size = 0;
+    int64_t mLoraExpandFC2Size = 0;
+    int64_t mLoraExpandGatedSize = 0;
     // Scratch storage for the per-token expanded LoRA pointer/rank arrays.
     // Re-used across calls; .clear() drops content but retains capacity.
-    std::vector<void const*> mLoraExpandFC1WeightPtrs;
-    std::vector<void const*> mLoraExpandFC2WeightPtrs;
-    std::vector<void const*> mLoraExpandGatedWeightPtrs;
-    std::vector<int32_t> mLoraExpandFC1Ranks;
-    std::vector<int32_t> mLoraExpandFC2Ranks;
-    std::vector<int32_t> mLoraExpandGatedRanks;
+    // Legacy std::vector<> mLoraExpand* fields were replaced in checkpoint 6b.A
+    // by the pinned/device tensor pairs above. The pinned tensors fulfill the
+    // same role for the existing host-side LoRA path (their .data_ptr() is read
+    // by LoraImpl::run via the LoraParams struct just as the vector .data() was).
     // Highest max_num_tokens we've reserved storage for. Callers can bump this
     // via reserveLoraHostBuffers() before CUDA graph capture so subsequent
     // in-place resize() calls don't reallocate (which would invalidate the
@@ -1123,9 +1154,14 @@ private:
     //   num_tokens:            total tokens flowing through this op (used as a consistency check)
     //
     // Outputs the two `expand_*` vectors with shapes [num_tokens] / [num_tokens * 2].
+    // Writes the [num_tokens] expanded LoRA tables into the caller-owned
+    // pinned-host buffers `expand_ranks_data` ([num_tokens] int32) and
+    // `expand_ptrs_data` ([num_tokens * 2] int64; each pair is (A, B) as
+    // raw pointer bits stored in int64). The buffers must already be
+    // allocated to at least `num_tokens` / `num_tokens * 2` elements.
     void expandPerRequestLoraTo(torch::Tensor const& ranks, torch::Tensor const& weight_ptrs,
         torch::Tensor const& host_request_types, torch::Tensor const& host_context_lengths, int64_t num_tokens,
-        std::vector<int32_t>& expand_ranks, std::vector<void const*>& expand_ptrs)
+        int32_t* expand_ranks_data, int64_t* expand_ptrs_data)
     {
         CHECK_CPU_INPUT(ranks, at::ScalarType::Int)
         CHECK_CPU_INPUT(weight_ptrs, at::ScalarType::Long)
@@ -1146,17 +1182,12 @@ private:
         auto const* req_types = static_cast<int32_t const*>(host_request_types.data_ptr());
         auto const* ctx_lens = static_cast<int32_t const*>(host_context_lengths.data_ptr());
 
-        expand_ranks.clear();
-        expand_ptrs.clear();
-        expand_ranks.reserve(num_tokens);
-        expand_ptrs.reserve(num_tokens * 2);
-
         int64_t produced = 0;
         for (int64_t req_id = 0; req_id < num_seqs; ++req_id)
         {
             int32_t const rank = rank_data[req_id];
-            void const* const a_ptr = reinterpret_cast<void const*>(ptr_data[req_id * 3 + 0]);
-            void const* const b_ptr = reinterpret_cast<void const*>(ptr_data[req_id * 3 + 1]);
+            int64_t const a_ptr = ptr_data[req_id * 3 + 0];
+            int64_t const b_ptr = ptr_data[req_id * 3 + 1];
             // ptr_data[req_id * 3 + 2] is the optional DoRA magnitude vector pointer; ignored here
             // (MoE+DoRA is rejected at load time, see tensorrt_llm/lora_manager.py).
 
@@ -1165,9 +1196,10 @@ private:
                 = (req_type == MoeLoraRequestType::kGENERATION) ? int64_t{1} : static_cast<int64_t>(ctx_lens[req_id]);
             for (int64_t i = 0; i < repeat; ++i)
             {
-                expand_ranks.push_back(rank);
-                expand_ptrs.push_back(a_ptr);
-                expand_ptrs.push_back(b_ptr);
+                int64_t const t = produced + i;
+                expand_ranks_data[t] = rank;
+                expand_ptrs_data[2 * t + 0] = a_ptr;
+                expand_ptrs_data[2 * t + 1] = b_ptr;
             }
             produced += repeat;
         }
@@ -1183,14 +1215,15 @@ private:
     //   token_to_slot:     int32 [>=num_tokens]
     //   num_tokens:        active token count for this call
     //
-    // Writes per-token ranks/ptrs into `expand_ranks` (size num_tokens) and
-    // `expand_ptrs` (size num_tokens * 2). The vectors are resized in place;
-    // callers are expected to have reserved enough capacity ahead of CUDA graph
-    // capture via `reserveLoraHostBuffers` so the underlying storage address
-    // is stable across captures and replays.
+    // Writes per-token ranks/ptrs into the caller-owned pinned-host buffers
+    // `expand_ranks_data` ([num_tokens] int32) and `expand_ptrs_data`
+    // ([num_tokens * 2] int64). The buffers must already be sized to at
+    // least num_tokens / num_tokens * 2; callers reserve via
+    // `reserveLoraHostBuffers` so the storage addresses are stable across
+    // CUDA-graph captures and replays.
     void materializeSlotIndexedLoraTo(torch::Tensor const& slot_ranks, torch::Tensor const& slot_weight_ptrs,
-        torch::Tensor const& token_to_slot, int64_t num_tokens, std::vector<int32_t>& expand_ranks,
-        std::vector<void const*>& expand_ptrs)
+        torch::Tensor const& token_to_slot, int64_t num_tokens, int32_t* expand_ranks_data,
+        int64_t* expand_ptrs_data)
     {
         CHECK_CPU_INPUT(slot_ranks, at::ScalarType::Int)
         CHECK_CPU_INPUT(slot_weight_ptrs, at::ScalarType::Long)
@@ -1206,27 +1239,28 @@ private:
         auto const* slot_ptr_data = static_cast<int64_t const*>(slot_weight_ptrs.data_ptr());
         auto const* token2slot_data = static_cast<int32_t const*>(token_to_slot.data_ptr());
 
-        expand_ranks.resize(num_tokens);
-        expand_ptrs.resize(num_tokens * 2);
         for (int64_t t = 0; t < num_tokens; ++t)
         {
             int32_t const slot = token2slot_data[t];
             TORCH_CHECK(slot >= 0 && slot < num_slots, "MoE LoRA token_to_slot[", t, "]=", slot,
                 " is out of range [0, ", num_slots, ").");
-            expand_ranks[t] = slot_rank_data[slot];
-            expand_ptrs[2 * t + 0] = reinterpret_cast<void const*>(slot_ptr_data[slot * 3 + 0]);
-            expand_ptrs[2 * t + 1] = reinterpret_cast<void const*>(slot_ptr_data[slot * 3 + 1]);
+            expand_ranks_data[t] = slot_rank_data[slot];
+            expand_ptrs_data[2 * t + 0] = slot_ptr_data[slot * 3 + 0];
+            expand_ptrs_data[2 * t + 1] = slot_ptr_data[slot * 3 + 1];
         }
     }
 
-    // Pre-reserve the mLoraExpand* host vectors so subsequent in-place resizes
-    // do not reallocate. Required for CUDA graph capture/replay safety: the
-    // kernel records cudaMemcpyAsync from these vectors' .data() pointers at
-    // capture time and replays from the same addresses.
+    // Pre-allocate the pinned-host and persistent-device LoRA expansion
+    // buffers at a fixed capacity. Required for CUDA-graph capture/replay
+    // safety: the captured stream records cudaMemcpyAsync at the source
+    // (pinned host) and destination (device) addresses observed during
+    // capture, so those addresses must remain valid for the lifetime of the
+    // graph -- in particular, no realloc between captures.
     //
-    // This method is public so it can be bound to Python; callers should invoke
-    // it once during warmup before any CUDA-graph capture that exercises
-    // routed-expert MoE LoRA.
+    // This method is public so it can be bound to Python; callers should
+    // invoke it once during warmup before any CUDA-graph capture that
+    // exercises routed-expert MoE LoRA. It is idempotent at or below the
+    // current capacity.
 public:
     void reserveLoraHostBuffers(int64_t max_num_tokens)
     {
@@ -1236,21 +1270,44 @@ public:
         {
             return;
         }
-        mLoraExpandFC1Ranks.reserve(max_num_tokens);
-        mLoraExpandFC1WeightPtrs.reserve(max_num_tokens * 2);
-        mLoraExpandFC2Ranks.reserve(max_num_tokens);
-        mLoraExpandFC2WeightPtrs.reserve(max_num_tokens * 2);
-        mLoraExpandGatedRanks.reserve(max_num_tokens);
-        mLoraExpandGatedWeightPtrs.reserve(max_num_tokens * 2);
+        ensureLoraExpandBuffers(max_num_tokens);
         mLoraHostBufCapacity = max_num_tokens;
     }
 
 private:
+    // Internal helper: (re)allocate the six pinned-host + six device tensor
+    // pairs to hold `capacity` expanded tokens. Called by reserveLoraHostBuffers
+    // (public warmup) and by buildMoeLoraParams (lazy on first capture-sized
+    // call). The (re)allocation drops the previous storage; callers must make
+    // sure any in-flight CUDA graph that references the old addresses has
+    // either been destroyed or never replays again.
+    void ensureLoraExpandBuffers(int64_t capacity)
+    {
+        auto const pinned_int_opts = at::TensorOptions().dtype(at::kInt).pinned_memory(true);
+        auto const pinned_long_opts = at::TensorOptions().dtype(at::kLong).pinned_memory(true);
+        auto const dev_int_opts = at::TensorOptions().dtype(at::kInt).device(at::kCUDA);
+        auto const dev_long_opts = at::TensorOptions().dtype(at::kLong).device(at::kCUDA);
+
+        mLoraExpandFC1RanksPinned = at::empty({capacity}, pinned_int_opts);
+        mLoraExpandFC2RanksPinned = at::empty({capacity}, pinned_int_opts);
+        mLoraExpandGatedRanksPinned = at::empty({capacity}, pinned_int_opts);
+        mLoraExpandFC1WeightPtrsPinned = at::empty({capacity * 2}, pinned_long_opts);
+        mLoraExpandFC2WeightPtrsPinned = at::empty({capacity * 2}, pinned_long_opts);
+        mLoraExpandGatedWeightPtrsPinned = at::empty({capacity * 2}, pinned_long_opts);
+
+        mLoraExpandFC1RanksDevice = at::empty({capacity}, dev_int_opts);
+        mLoraExpandFC2RanksDevice = at::empty({capacity}, dev_int_opts);
+        mLoraExpandGatedRanksDevice = at::empty({capacity}, dev_int_opts);
+        mLoraExpandFC1WeightPtrsDevice = at::empty({capacity * 2}, dev_long_opts);
+        mLoraExpandFC2WeightPtrsDevice = at::empty({capacity * 2}, dev_long_opts);
+        mLoraExpandGatedWeightPtrsDevice = at::empty({capacity * 2}, dev_long_opts);
+    }
 
     // Build a populated LoraParams from the optional CPU tensors. Caller is
     // responsible for setting `lora_params.workspace` (the cuBLAS scratch).
     // Returns std::nullopt when LoRA is inactive (no fc1 ranks tensor).
-    // Mutates the mLoraExpand* member vectors.
+    // Mutates the mLoraExpand* pinned tensors and queues an async H2D into
+    // the device mirrors on `stream`.
     std::optional<::tensorrt_llm::kernels::LoraParams> buildMoeLoraParams(
         torch::optional<torch::Tensor> const& fc1_lora_ranks,
         torch::optional<torch::Tensor> const& fc1_lora_weight_ptrs,
@@ -1267,7 +1324,8 @@ private:
         torch::optional<torch::Tensor> const& gated_slot_lora_ranks,
         torch::optional<torch::Tensor> const& gated_slot_lora_weight_ptrs,
         torch::optional<torch::Tensor> const& token_to_slot, int64_t num_tokens, int64_t hidden_size, int64_t inter_size,
-        c10::ScalarType act_dtype, int64_t lora_max_low_rank, bool is_gated_activation, bool fc1_shared_a = false,
+        c10::ScalarType act_dtype, int64_t lora_max_low_rank, bool is_gated_activation, cudaStream_t stream,
+        bool fc1_shared_a = false,
         bool fc1_shared_b = false, bool fc2_shared_a = false, bool fc2_shared_b = false, bool gated_shared_a = false,
         bool gated_shared_b = false)
     {
@@ -1311,19 +1369,33 @@ private:
             num_seqs = fc1_lora_ranks->size(0);
             has_gated = is_gated_activation && gated_lora_ranks.has_value();
 
+            // Ensure pinned/device buffers can hold num_tokens entries.
+            // Reserve is idempotent at-or-below current capacity.
+            if (num_tokens > mLoraHostBufCapacity)
+            {
+                ensureLoraExpandBuffers(num_tokens);
+                mLoraHostBufCapacity = num_tokens;
+            }
+
             expandPerRequestLoraTo(*fc1_lora_ranks, *fc1_lora_weight_ptrs, *host_request_types, *host_context_lengths,
-                num_tokens, mLoraExpandFC1Ranks, mLoraExpandFC1WeightPtrs);
+                num_tokens, mLoraExpandFC1RanksPinned.data_ptr<int32_t>(),
+                mLoraExpandFC1WeightPtrsPinned.data_ptr<int64_t>());
             expandPerRequestLoraTo(*fc2_lora_ranks, *fc2_lora_weight_ptrs, *host_request_types, *host_context_lengths,
-                num_tokens, mLoraExpandFC2Ranks, mLoraExpandFC2WeightPtrs);
+                num_tokens, mLoraExpandFC2RanksPinned.data_ptr<int32_t>(),
+                mLoraExpandFC2WeightPtrsPinned.data_ptr<int64_t>());
+            mLoraExpandFC1Size = num_tokens;
+            mLoraExpandFC2Size = num_tokens;
             if (has_gated)
             {
                 expandPerRequestLoraTo(*gated_lora_ranks, *gated_lora_weight_ptrs, *host_request_types,
-                    *host_context_lengths, num_tokens, mLoraExpandGatedRanks, mLoraExpandGatedWeightPtrs);
+                    *host_context_lengths, num_tokens,
+                    mLoraExpandGatedRanksPinned.data_ptr<int32_t>(),
+                    mLoraExpandGatedWeightPtrsPinned.data_ptr<int64_t>());
+                mLoraExpandGatedSize = num_tokens;
             }
             else
             {
-                mLoraExpandGatedRanks.clear();
-                mLoraExpandGatedWeightPtrs.clear();
+                mLoraExpandGatedSize = 0;
             }
         }
         else
@@ -1349,17 +1421,14 @@ private:
                 TORCH_CHECK(!gated_slot_lora_ranks.has_value(),
                     "MoE LoRA gated_slot_lora_* is only supported for gated activations.");
             }
-            // Ensure host buffers have enough capacity to materialize per-token arrays
-            // without reallocating. Idempotent if already at capacity.
-            // This is graph-capture safe: the reserve happens BEFORE the resize.
+            // Ensure pinned/device buffers can hold num_tokens entries.
+            // Idempotent at-or-below current capacity. Performed BEFORE the
+            // first H2D so that addresses are stable for any subsequent
+            // CUDA-graph capture; callers should invoke `reserveLoraHostBuffers`
+            // during warmup to avoid the lazy reallocation here.
             if (num_tokens > mLoraHostBufCapacity)
             {
-                mLoraExpandFC1Ranks.reserve(num_tokens);
-                mLoraExpandFC1WeightPtrs.reserve(num_tokens * 2);
-                mLoraExpandFC2Ranks.reserve(num_tokens);
-                mLoraExpandFC2WeightPtrs.reserve(num_tokens * 2);
-                mLoraExpandGatedRanks.reserve(num_tokens);
-                mLoraExpandGatedWeightPtrs.reserve(num_tokens * 2);
+                ensureLoraExpandBuffers(num_tokens);
                 mLoraHostBufCapacity = num_tokens;
             }
 
@@ -1367,35 +1436,71 @@ private:
             has_gated = is_gated_activation && gated_slot_lora_ranks.has_value();
 
             materializeSlotIndexedLoraTo(*fc1_slot_lora_ranks, *fc1_slot_lora_weight_ptrs, *token_to_slot, num_tokens,
-                mLoraExpandFC1Ranks, mLoraExpandFC1WeightPtrs);
+                mLoraExpandFC1RanksPinned.data_ptr<int32_t>(),
+                mLoraExpandFC1WeightPtrsPinned.data_ptr<int64_t>());
             materializeSlotIndexedLoraTo(*fc2_slot_lora_ranks, *fc2_slot_lora_weight_ptrs, *token_to_slot, num_tokens,
-                mLoraExpandFC2Ranks, mLoraExpandFC2WeightPtrs);
+                mLoraExpandFC2RanksPinned.data_ptr<int32_t>(),
+                mLoraExpandFC2WeightPtrsPinned.data_ptr<int64_t>());
+            mLoraExpandFC1Size = num_tokens;
+            mLoraExpandFC2Size = num_tokens;
             if (has_gated)
             {
                 materializeSlotIndexedLoraTo(*gated_slot_lora_ranks, *gated_slot_lora_weight_ptrs, *token_to_slot,
-                    num_tokens, mLoraExpandGatedRanks, mLoraExpandGatedWeightPtrs);
+                    num_tokens,
+                    mLoraExpandGatedRanksPinned.data_ptr<int32_t>(),
+                    mLoraExpandGatedWeightPtrsPinned.data_ptr<int64_t>());
+                mLoraExpandGatedSize = num_tokens;
             }
             else
             {
-                mLoraExpandGatedRanks.resize(0);
-                mLoraExpandGatedWeightPtrs.resize(0);
+                mLoraExpandGatedSize = 0;
             }
         }
 
+        // Phase 6b.A: queue an async H2D into the persistent device mirrors.
+        // The copy source is pinned (from `at::TensorOptions().pinned_memory(true)`)
+        // so the async API is truly async and capturable. The destination is
+        // a persistent device buffer with a stable address across captures.
+        //
+        // The device mirrors are not yet consumed -- the kernel still reads
+        // from the pinned host pointers via LoraParams below, exactly as it
+        // did with the previous std::vector<>s. The H2D is wired up here
+        // (rather than waiting for checkpoint 6b.C) so the data-flow plumbing
+        // is exercised in eager mode and so the next checkpoint can read from
+        // the device mirrors without reshuffling control flow.
+        auto issue_h2d = [&](at::Tensor const& src, at::Tensor& dst, int64_t numel) {
+            if (numel == 0)
+            {
+                return;
+            }
+            TLLM_CUDA_CHECK(cudaMemcpyAsync(dst.data_ptr(), src.data_ptr(),
+                static_cast<size_t>(numel) * src.element_size(), cudaMemcpyHostToDevice, stream));
+        };
+        issue_h2d(mLoraExpandFC1RanksPinned, mLoraExpandFC1RanksDevice, mLoraExpandFC1Size);
+        issue_h2d(mLoraExpandFC1WeightPtrsPinned, mLoraExpandFC1WeightPtrsDevice, mLoraExpandFC1Size * 2);
+        issue_h2d(mLoraExpandFC2RanksPinned, mLoraExpandFC2RanksDevice, mLoraExpandFC2Size);
+        issue_h2d(mLoraExpandFC2WeightPtrsPinned, mLoraExpandFC2WeightPtrsDevice, mLoraExpandFC2Size * 2);
+        issue_h2d(mLoraExpandGatedRanksPinned, mLoraExpandGatedRanksDevice, mLoraExpandGatedSize);
+        issue_h2d(mLoraExpandGatedWeightPtrsPinned, mLoraExpandGatedWeightPtrsDevice, mLoraExpandGatedSize * 2);
+
         auto impls = getOrCreateLoraImpls(hidden_size, inter_size, act_dtype, static_cast<int>(lora_max_low_rank));
 
+        // The existing host-side LoRA path (LoraImpl::run) reads the per-token
+        // ranks/ptrs through these raw pointers. Pointing at the pinned host
+        // tensors is API-compatible with the previous std::vector<> .data()
+        // -- a host pointer is a host pointer, regardless of allocation type.
         ::tensorrt_llm::kernels::LoraParams lora_params{
             static_cast<int>(num_seqs),
-            mLoraExpandFC1Ranks.data(),
-            mLoraExpandFC1WeightPtrs.data(),
-            mLoraExpandFC2Ranks.data(),
-            mLoraExpandFC2WeightPtrs.data(),
+            mLoraExpandFC1RanksPinned.data_ptr<int32_t>(),
+            reinterpret_cast<void const**>(mLoraExpandFC1WeightPtrsPinned.data_ptr<int64_t>()),
+            mLoraExpandFC2RanksPinned.data_ptr<int32_t>(),
+            reinterpret_cast<void const**>(mLoraExpandFC2WeightPtrsPinned.data_ptr<int64_t>()),
             impls.first,
             impls.second,
             /*workspace=*/nullptr, // caller fills in
             &mLoraMemcpyEvent,
-            has_gated ? mLoraExpandGatedRanks.data() : nullptr,
-            has_gated ? mLoraExpandGatedWeightPtrs.data() : nullptr,
+            has_gated ? mLoraExpandGatedRanksPinned.data_ptr<int32_t>() : nullptr,
+            has_gated ? reinterpret_cast<void const**>(mLoraExpandGatedWeightPtrsPinned.data_ptr<int64_t>()) : nullptr,
         };
         // Shared-outer flags: when a side is shared across experts, the kernel
         // skips the `weight_index * dim * lora_rank` offset so a single
