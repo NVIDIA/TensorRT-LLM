@@ -110,11 +110,8 @@ void indexer_topk_decode(th::Tensor const& logits, th::Tensor const& seq_lens, t
         heuristicScratchPtr = scratchTensor.data_ptr();
     }
 
-    // Multi-pass radix scratch — required by invokeIndexerTopKDecode whenever
-    // num_columns >= splitWorkThreshold. When the caller does not pass one,
-    // the wrapper allocates it internally so existing callers don't need to
-    // be updated; passing it explicitly is preferred under CUDA-graph capture
-    // for stable device addresses.
+    // Multi-pass radix scratch. Pre-allocate it for CUDA-graph stable
+    // addresses, or let the wrapper allocate internally below.
     void* multiPassScratchPtr = nullptr;
     size_t multiPassScratchBytes = 0;
     if (scratch.has_value())
@@ -128,32 +125,26 @@ void indexer_topk_decode(th::Tensor const& logits, th::Tensor const& seq_lens, t
         multiPassScratchBytes = static_cast<size_t>(t.numel());
     }
 
-    // 0 lets invokeIndexerTopKDecode pick its numRows-aware adaptive
-    // threshold (200k for bs > 8, 65k for bs <= 8).
+    // 0 lets invokeIndexerTopKDecode pick its numRows-aware threshold.
     int32_t const splitWorkThreshold = 0;
     auto stream = at::cuda::getCurrentCUDAStream(logits.get_device());
 
-    // Mirror the kernel's adaptive threshold to decide whether the split-work
-    // tier is reachable from this call; allocate scratch only then.
+    // Mirror the kernel's threshold so we only allocate when split-work fires.
     int32_t const adaptiveSplitWorkThreshold = (num_rows > 8) ? 200 * 1000 : 65 * 1024;
     th::Tensor scratch_internal;
     if (num_columns >= adaptiveSplitWorkThreshold && multiPassScratchPtr == nullptr)
     {
         size_t const bytes
             = tk::indexerTopKDecodeScratchBytes(num_rows, num_columns, static_cast<int32_t>(index_topk));
-        // Zero-init: the multi-pass radix kernel relies on a clean per-row
-        // state struct + histogram on the first call (pass-3's trailer keeps
-        // them clean on subsequent calls).
+        // Zero-init: the radix kernel reads the per-row state on first call.
         scratch_internal = th::zeros(
             {static_cast<int64_t>(bytes)}, th::TensorOptions().dtype(th::kByte).device(logits.device()));
         multiPassScratchPtr = scratch_internal.data_ptr();
         multiPassScratchBytes = bytes;
     }
 
-    // The `done_counter_scratch` parameter is preserved on the op signature
-    // for backward compatibility but is no longer used by the dispatcher; the
-    // split-work tier now always routes to the multi-pass radix path which
-    // tracks its per-pass synchronisation in `scratch` instead.
+    // `done_counter_scratch` is kept on the op signature for source compat
+    // but unused since the fused split-work tier was removed.
     (void) done_counter_scratch;
 
     if (logits_dtype == at::ScalarType::Float)

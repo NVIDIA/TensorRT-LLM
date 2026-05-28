@@ -271,13 +271,9 @@ __device__ bool processHistogramStep(int const* indices, InputT const* logits, i
     // The threshold bin.
     thresholdBinIdx = smemThresholdBinIdx[0];
 
-    // At step 0, auto-promoting items in higher half-precision bins is only
-    // safe if no subsequent step will run — otherwise step 2's
-    // isPartialMatch<21> filter cannot exclude them (half-precision binning
-    // does not correspond to bits[31:21] of full-precision), and they would
-    // be auto-promoted a second time at step 2. When step 0 will continue,
-    // defer all promotion to the later steps (whose bit-pattern filters
-    // correctly carry forward).
+    // Skip auto-promote at step 0 when we'll continue: half-precision bins
+    // don't align with step 2's full-precision bit-pattern filter, so a
+    // step-0 promote would be double-counted at step 2.
     bool const step0WillContinue = (step == 0) && (smemFinalBinSize[0] > kNumFinalItems);
 
     auto processBins = [&](InputT logitIn, int idx)
@@ -372,14 +368,9 @@ __device__ bool processHistogramStep(int const* indices, InputT const* logits, i
     return smemFinalBinSize[0] > kNumFinalItems;
 }
 
-// Type holder for the per-block "final" union used by topKPerRowJob. The
-// union always carries the BlockRadixSort temp storage so the final-sort
-// step in topKPerRowJob can pick insertion vs radix sort entirely at
-// runtime based on the actual candidate count (see the sort-selection block
-// further below). In practice BlockRadixSort::TempStorage stays under
-// FinalItems = 16KB at our shapes (kNumFinalItems=2048,
-// kNumThreadsPerBlock ∈ {256, 512, 1024}), so the union size does not grow
-// versus the previous useRadixSort=false layout.
+// Smem holder for topKPerRowJob's final-sort. Always reserves
+// BlockRadixSort::TempStorage so the sort algorithm can be picked at runtime
+// (the union's size is dominated by FinalItems = 16 KB at our shapes).
 template <int kNumThreadsPerBlock, int kNumBins>
 struct TopKSmem
 {
@@ -513,15 +504,9 @@ static __device__ void topKPerRowJob(int const* indices, InputT const* logits, i
 
     if (!continueToNextStep)
     {
-        // The histogram did not proceed to the final 10 bits, so we now sort
-        // the candidates that landed in the threshold bin. Runtime branch on
-        // `smemFinalDstIdx[0]` (count bounded by kNumFinalItems=2048): for
-        // small counts the O(n²/T) insertion sort beats BlockRadixSort, which
-        // always pays its full kNumFinalItems-padded cost regardless of n.
-        //
-        // Threshold 512 picked from a 3-run averaged sweep over bs=1..128 /
-        // seq=1k..256k (gaussian, k=2048) on Blackwell sm_100. Matches the
-        // theoretical breakeven n²/T ≈ const BlockRadixSort cost at n ~ 450-500.
+        // Sort the threshold-bin candidates. Insertion sort wins below ~512
+        // items (O(n^2/T) with no fixed cost); BlockRadixSort wins above
+        // (constant cost padded to kNumFinalItems = 2048).
         constexpr int kInsertionSortBranchThreshold = 512;
         int const finalCount = smemFinalDstIdx[0];
         if (finalCount > kInsertionSortBranchThreshold)
@@ -712,36 +697,24 @@ static __global__ __launch_bounds__(kNumThreadsPerBlock) void topKPerRowDecode(I
 namespace
 {
 
-// ===========================================================================
-// Multi-pass radix path — the only split-work tier (chosen whenever the
-// caller-provided `scratch` is sized for it and numColumns exceeds the
-// single-block / split-work boundary).
-//
-// One launch per radix pass (top-11 half-precision bits, then bits [21..32),
-// [10..21), [0..10)). State per row lives in a small RadixState struct in
-// DRAM; the candidate data is two ping-pong buffers sized to the input row
-// length. After 4 passes any remaining bit-level ties are emitted directly
-// to fill the top-k.
-// ===========================================================================
+// Multi-pass radix: 4 launches (half-precision top-11 bits, then float bits
+// [21..32), [10..21), [0..10)). Per-row state lives in DRAM scratch; candidate
+// data uses two ping-pong buffers. Pass 3's last block emits the final top-K.
 static constexpr int kRadixBins = 2048;
 
-// Per-row state for the multi-pass radix path (in DRAM scratch). Each pass's
-// last block (selected via the `finishedBlocks` atomic) prefix-scans the
-// global histogram and picks the threshold for the next pass.
+// Per-row scratch state. The last block of each pass (picked via
+// `finishedBlocks`) scans the global histogram and writes the next pass's
+// threshold.
 struct alignas(64) RadixState
 {
     int candCount;      // candidates entering current pass
     int outIdx;         // running outIndices write position
-    int kRemaining;     // top-k slots remaining; equals topK - outIdx
+    int kRemaining;     // topK - outIdx
     int filterCnt;      // running candidate-buf write position
-    int thresholdBin;   // threshold bin from PRIOR pass (read at filter
-                        // time; overwritten at last-block stage with this
-                        // pass's threshold for the next pass to consume)
-    int finishedBlocks; // last-block atomic counter, reset between passes
-    int thresholdLess;  // cumsum prefix at thresholdBin (count of bins below it);
-                        // used by pass-3 final-emit to route ties (bin == threshold)
-                        // into a disjoint slot range so they don't race definite
-                        // top-k items on the output counter.
+    int thresholdBin;   // prior pass's threshold; overwritten this pass's last block
+    int finishedBlocks; // last-block atomic, reset between passes
+    int thresholdLess;  // count of bins below thresholdBin; pass-3 emit routes
+                        // ties (bin == threshold) into a disjoint slot range.
     int padding[1];
 };
 
@@ -1131,42 +1104,28 @@ static void launchMultiPassRadix(void* scratch, InputT const* logits, int const*
         reinterpret_cast<void const*>(&radixPassKernel<kPassThreads, 3, InputT>), (int const*) candBuf1, candBuf2);
 }
 
-// ============================================================================
-// Unified dispatcher (fp32, bf16, fp16 all go through this).
-// ============================================================================
-// The TPR-family kernels (insertion-sort, single-block radix, 2-launch
-// split-work, multi-pass radix) are all templated on `InputT` — logits are
-// read with `static_cast<float>(InputT)` at HBM-read sites, so accuracy is
-// identical to up-casting the input tensor to fp32 before invoking the
-// kernel. The multi-pass radix scratch buffer stays uint8 regardless of
-// InputT.
+// Unified dispatcher (fp32 / bf16 / fp16). Each tier's kernel is templated on
+// InputT and casts to float at HBM-read sites; the scratch buffer is uint8.
 template <typename InputT>
 void invokeIndexerTopKDecodeImpl(InputT const* logits, int const* seqLens, int* indices, int const splitWorkThreshold,
     int const numRows, int const numColumns, int const stride0, int const stride1, int const next_n, int const topK,
     int const* preIdx, int const preIdxStride, int const preIdxCount, InputT* heuristicScratch,
     cudaStream_t const stream, void* scratch, size_t scratchBytes, bool is_prefill)
 {
-    // Split-work tier cutoff: callers can still override with `splitWorkThreshold > 0`.
-    //   numRows > 8:          200k (upstream default).
-    //   numRows <= 8:         multi-pass radix kicks in earlier (65k) —
-    //                         low-bs path under-uses the GPU otherwise.
-    // The high-bs tiers were dropped: bs >= 64 with seq >= 32k is owned by
-    // GVR; bs >= 64 with seq < 32k always falls into single-block (32k <
-    // 200k).
+    // Split-work cutoff: 200k for bs > 8, 65k for bs <= 8 (low-bs under-uses
+    // the GPU otherwise). is_prefill forces single-block.
     int const adaptiveSplitWorkThreshold = is_prefill ? (1 << 30)
         : (numRows > 8)                               ? 200 * 1000
                                                       : 65 * 1024;
     int const effectiveSplitWorkThreshold = splitWorkThreshold > 0 ? splitWorkThreshold : adaptiveSplitWorkThreshold;
     constexpr int kNumThreadsPerBlock = 512;
 
-    // GVR ↔ TPR routing rule: GVR for bs >= 64 ∧ seq >= 32k (its
-    // fixed-overhead Phase-1/4 pays back at this size). Everything below
-    // falls through to TPR (single-block or multi-pass radix).
+    // GVR is preferred when it'll pay back its fixed Phase-1/4 overhead.
     bool const isSupportedTopK = (topK == 512 || topK == 1024 || topK == 2048);
     bool const canUseHeuristic = preIdx != nullptr && stride1 == 1 && isSupportedTopK && preIdxCount == topK
         && preIdxStride >= preIdxCount && heuristicScratch != nullptr && numColumns >= 32768 && numRows >= 64;
 
-    // Optional env-gated dispatch trace (set TRTLLM_SCHEMEX_DEBUG=1 to enable)
+    // Env-gated dispatch trace (TRTLLM_SCHEMEX_DEBUG=1).
     {
         static std::once_flag sDebugOnceFlag;
         static bool sDebug = false;
@@ -1208,19 +1167,10 @@ void invokeIndexerTopKDecodeImpl(InputT const* logits, int const* seqLens, int* 
     }
     else
     {
-        // Multi-pass radix path. Each pass is a flat grid that fills the GPU;
-        // the last block of each pass merges via a global atomic counter, and
-        // pass 3's trailer emits the final top-K inline. Beats the previous
-        // fused split-work tier by ~1.05-1.42x at every shape this branch
-        // takes (see plots/fused_vs_multipass in the topk scratch project).
-        // Caller must provide `scratch` of at least
-        // `indexerTopKDecodeScratchBytes(numRows, numColumns, topK)` bytes.
-        // The multi-pass radix kernels read each row contiguously
-        // (`radixPassKernel` indexes `logits[i]`), so a strided source would
-        // rank the wrong values. The single-block tier handles stride1 != 1
-        // via the strided fallback in `topKPerRowJob`; if we ever need
-        // split-work-sized strided inputs, the right answer is to lift the
-        // strided fallback into the radix kernels too.
+        // Multi-pass radix. radixPassKernel reads logits contiguously, so
+        // strided inputs would rank the wrong values — gate on stride1 == 1.
+        // (The single-block tier handles stride1 != 1 via topKPerRowJob's
+        // strided fallback.)
         TLLM_CHECK_WITH_INFO(
             stride1 == 1, "indexer top-k split-work tier (multi-pass radix) requires stride1 == 1.");
         TLLM_CHECK_WITH_INFO(scratch != nullptr && scratchBytes >= radixScratchBytes(numRows, numColumns),
@@ -1248,13 +1198,9 @@ void invokeIndexerTopKDecode(float const* logits, int const* seqLens, int* indic
 
 size_t indexerTopKDecodeScratchBytes(int numRows, int numColumns, int /*topK*/)
 {
-    // Returns the bytes the multi-pass radix path needs (state +
-    // histograms + two candidate buffers).
     return radixScratchBytes(numRows, numColumns);
 }
 
-// bf16 / fp16 entries — full feature parity with fp32 via the unified
-// invokeIndexerTopKDecodeImpl<InputT> template.
 void invokeIndexerTopKDecode(__nv_bfloat16 const* logits, int const* seqLens, int* indices,
     int const splitWorkThreshold, int const numRows, int const numColumns, int const stride0, int const stride1,
     int const next_n, int const topK, int const* preIdx, int const preIdxStride, int const preIdxCount,
@@ -1281,10 +1227,8 @@ void invokeIndexerTopKPrefill(float const* logits, int const* rowStarts, int con
 {
     constexpr int kNumThreadsPerBlock = 512;
 
-    // Single launch over all rows: topKPerRowPrefill / topKPerRowJob runtime-picks
-    // insertion vs radix sort per row based on the threshold-bin candidate count
-    // (see the sort-selection block in topKPerRowJob). Previously this function
-    // split the row range at 12288 to compile-time-select the sort algorithm.
+    // One launch over all rows; the per-row sort algorithm is picked at
+    // runtime inside topKPerRowJob.
     topKPerRowPrefill<kNumThreadsPerBlock>
         <<<numRows, kNumThreadsPerBlock, topK * sizeof(int32_t), stream>>>(
             logits, rowStarts, rowEnds, indices, stride0, stride1, topK, 0);
@@ -1294,9 +1238,7 @@ void invokeIndexerTopKPrefill(float const* logits, int const* rowStarts, int con
 
 bool canIndexerTopKDecodeUseGvr(int numRows, int numColumns, int topK, int /*bytesPerElem*/)
 {
-    // The dispatcher now applies the same GVR ↔ TPR routing rule for fp32,
-    // bf16, and fp16 (all TPR tiers are InputT-templated). `bytesPerElem` is
-    // kept in the signature for source compatibility but no longer affects
+    // `bytesPerElem` is kept in the signature for source compatibility but no longer affects
     // the answer.
     bool const isSupportedTopK = (topK == 512 || topK == 1024 || topK == 2048);
     if (!isSupportedTopK)
