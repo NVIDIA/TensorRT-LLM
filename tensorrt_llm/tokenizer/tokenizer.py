@@ -635,6 +635,12 @@ def load_hf_tokenizer(model_dir: str,
     '''
 
     _ensure_gpt2_bytes_to_unicode_compat()
+    # AutoTokenizer.from_pretrained internally calls AutoConfig.from_pretrained,
+    # which triggers transformers 5.x LlamaConfig.validate_architecture.
+    # Relax it so models with explicit `head_dim` (e.g. kanana-1.5-2.1b) load.
+    from tensorrt_llm._torch.pyexecutor.config_utils import \
+        _relax_llama_validate_architecture
+    _relax_llama_validate_architecture()
 
     try:
         tokenizer = TransformersTokenizer.from_pretrained(
