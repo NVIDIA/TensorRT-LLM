@@ -35,12 +35,13 @@ from typing import Optional, Tuple
 import torch
 from torch.fx import GraphModule, Node
 
-from ...custom_ops.mla.trtllm_mla import _TRTLLM_MLA_ROPE_INFO_KEY
 from ...models.factory import ModelFactory
 from ...shim.interface import CachedSequenceInterface
 from ...utils.logger import ad_logger
 from ...utils.node_utils import is_op
 from ..interface import BaseTransform, SharedConfig, TransformInfo, TransformRegistry
+
+_TRTLLM_MLA_ROPE_INFO_KEY = "_trtllm_mla_rope_info"
 
 # At post_load_fusion, only the backend-agnostic torch_rope_* IR ops are
 # present (optimize_rope has not yet replaced them with flashinfer_rope).
