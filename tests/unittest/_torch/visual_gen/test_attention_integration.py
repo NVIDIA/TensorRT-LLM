@@ -303,9 +303,7 @@ class TestSeparateQkvSequenceParallelGuard:
         assert not isinstance(attn.attn, (UlyssesAttention, RingAttention, Attention2DAttention))
 
     def test_attn2d_with_sequence_parallel_disabled_allowed(self):
-        vgm = VisualGenMapping(
-            world_size=4, rank=0, attn2d_row_size=2, attn2d_col_size=2
-        )
+        vgm = VisualGenMapping(world_size=4, rank=0, attn2d_row_size=2, attn2d_col_size=2)
 
         attn = _make_cross_attention_with_mapping(vgm, enable_sequence_parallel=False)
 

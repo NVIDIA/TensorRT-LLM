@@ -200,11 +200,7 @@ class Attention(nn.Module):
             sparse_attention_config=sparse_attention_config,
         )
 
-        if (
-            enable_sequence_parallel
-            and self.qkv_mode == QKVMode.SEPARATE_QKV
-            and vgm is not None
-        ):
+        if enable_sequence_parallel and self.qkv_mode == QKVMode.SEPARATE_QKV and vgm is not None:
             ring_size = vgm.ring_size
             attn2d_size = vgm.attn2d_row_size * vgm.attn2d_col_size
             if ring_size > 1 or attn2d_size > 1:
