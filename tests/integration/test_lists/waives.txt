@@ -77,7 +77,6 @@ cpp/test_multi_gpu.py::test_cache_transceiver[8proc-mooncake_kvcache-90] SKIP (h
 cpp/test_multi_gpu.py::test_cache_transceiver[8proc-ucx_kvcache-90] SKIP (https://nvbugs/5838199)
 cpp/test_unit_tests.py::test_unit_tests[batch_manager-80] SKIP (https://nvbugs/6674826)
 disaggregated/test_auto_scaling.py::test_disagg_server_restart[etcd-round_robin] SKIP (https://nvbugs/6611817)
-disaggregated/test_disaggregated.py::test_disaggregated_cancel_large_context_requests[DeepSeek-V3-Lite-bf16] SKIP (https://nvbugs/6105768)
 disaggregated/test_disaggregated.py::test_disaggregated_ctxpp4_genpp4[TinyLlama-1.1B-Chat-v1.0] SKIP (https://nvbugs/6428069)
 disaggregated/test_disaggregated.py::test_disaggregated_ctxtp2pp2_gentp2pp2[TinyLlama-1.1B-Chat-v1.0] SKIP (https://nvbugs/6428069)
 disaggregated/test_disaggregated.py::test_disaggregated_deepseek_v3_lite_bf16_cache_aware_balance[DeepSeek-V3-Lite-bf16] SKIP (https://nvbugs/6162322)
