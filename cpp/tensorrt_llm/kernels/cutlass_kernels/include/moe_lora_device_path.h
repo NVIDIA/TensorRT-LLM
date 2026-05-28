@@ -1,0 +1,104 @@
+/*
+ * Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#pragma once
+
+#include <cstdint>
+
+namespace tensorrt_llm::kernels::cutlass_kernels
+{
+
+// Per-module device-resident scratch for the MoE LoRA capture-safe path
+// introduced in Phase 6b.C. Pointers refer to device memory unless noted.
+//
+// The struct is intentionally typed with `void*` rather than the concrete
+// `cutlass::gemm::GemmCoord*` / `int64_t*` types so this header can be
+// included from `moe_kernels.h` without dragging in cutlass headers. The
+// concrete types are recovered at the call site (matching the contract
+// already documented in `moe_lora_problem_builder.h`):
+//
+//   problem_sizes_*  -> cutlass::gemm::GemmCoord* (device, [P_max])
+//   a_ptrs_*/b/d     -> void**                    (device, [P_max])
+//   lda/ldb/ldd_*    -> int64_t*                  (device, [P_max])
+//   splitk_offsets   -> int64_t*                  (device, [P_max + 1])
+//   lowrank_ws_dev   -> void*                     (device, [P_max, max_lora_rank, dtype_bytes])
+//   splitk_ws_dev    -> void*                     (device, [P_max, max_lora_rank * splitk_slices], fp32)
+//   host_max_*       -> cutlass::gemm::GemmCoord* (pinned host, [1])
+//
+// `output_base_dev` points at the device buffer that consumes this
+// module's LoRA delta (e.g. `lora_fc1_result_`, `lora_fc2_result_`,
+// `lora_gated_result_`). `out_hidden_size` is the trailing dimension of
+// that buffer; it differs per module (fc1/gated -> inter_size,
+// fc2 -> hidden_size).
+struct MoeLoraDevicePathModule
+{
+    // 6b.B outputs: per-permuted-row (rank, A_ptr+offset, B_ptr+offset).
+    int32_t* permuted_ranks_dev = nullptr;
+    int64_t* permuted_ptrs_dev = nullptr;
+
+    // 6b.C.1 outputs: cuda_graph_(split_k_)grouped_gemm-ready bundle.
+    void* problem_sizes_in_dev = nullptr;
+    void* problem_sizes_out_dev = nullptr;
+    void** a_ptrs_in_dev = nullptr;
+    void** b_ptrs_in_dev = nullptr;
+    void** d_ptrs_in_dev = nullptr;
+    void** b_ptrs_out_dev = nullptr;
+    void** d_ptrs_out_dev = nullptr;
+    int64_t* lda_in_dev = nullptr;
+    int64_t* ldb_in_dev = nullptr;
+    int64_t* ldd_in_dev = nullptr;
+    int64_t* ldb_out_dev = nullptr;
+    int64_t* ldd_out_dev = nullptr;
+    int64_t* splitk_offsets_dev = nullptr;
+
+    // Workspaces that participate in the in/out GEMM data flow.
+    void* lowrank_workspace_dev = nullptr;
+    void* splitk_workspace_dev = nullptr;
+
+    // Host (pinned) per-call max problem size hints, required by the
+    // cuda_graph_*_grouped_gemm wrappers for kernel selection. The
+    // values are upper bounds (max_M, max_N, max_K) safe to fix at
+    // warmup time.
+    void* host_max_problem_in_pinned = nullptr;
+    void* host_max_problem_out_pinned = nullptr;
+
+    // Module-local data-flow knobs.
+    void* output_base_dev = nullptr;
+    int64_t out_hidden_size = 0;
+};
+
+// Top-level device-path bundle attached to LoraParams when the device
+// LoRA path is active. nullptr / `enabled == false` means the
+// FusedMoeRunner is running the legacy host path (unchanged behavior).
+struct MoeLoraDevicePath
+{
+    bool enabled = false;
+
+    // Shared scalars across all three modules. Static for the lifetime
+    // of the FusedMoeRunner once the scratch is allocated.
+    int64_t in_hidden_size = 0;
+    int64_t max_lora_rank = 0;
+    int64_t dtype_bytes = 0;
+    int64_t splitk_slices = 0;
+
+    bool has_gated = false;
+
+    MoeLoraDevicePathModule fc1;
+    MoeLoraDevicePathModule fc2;
+    MoeLoraDevicePathModule gated;
+};
+
+} // namespace tensorrt_llm::kernels::cutlass_kernels

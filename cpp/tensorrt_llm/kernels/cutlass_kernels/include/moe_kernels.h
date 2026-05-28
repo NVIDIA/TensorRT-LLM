@@ -16,6 +16,7 @@
 
 #pragma once
 #include "./moe_gemm_kernels.h"
+#include "tensorrt_llm/kernels/cutlass_kernels/include/moe_lora_device_path.h"
 #include "cutlass/gemm/gemm.h"
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/cudaUtils.h"
@@ -80,6 +81,19 @@ struct LoraParams
     void* workspace;
 
     cudaEvent_t* memcpy_event_ptr;
+
+    // Phase 6b.C: device-side capture-safe LoRA path scratch. When
+    // `device_path.enabled` is true the kernel uses launchMoeLoraPointerExpand
+    // + launchMoeLoraProblemBuilder + cudaGraph(SplitK)GroupedGemm instead of
+    // the legacy host-pointer LoraImpl::run path. The struct's pointers refer
+    // to persistent allocations owned by the calling FusedMoeRunner (their
+    // addresses are stable across CUDA-graph captures and replays).
+    //
+    // 6b.C.2.a: the struct is populated and propagated end-to-end, but the
+    // kernel does not branch on it yet -- runMoe still drives the legacy
+    // host path. 6b.C.2.b flips setupLoraWorkspace / loraFC1 / loraFC2 to
+    // consume these buffers behind the env-flag toggle.
+    ::tensorrt_llm::kernels::cutlass_kernels::MoeLoraDevicePath device_path;
 
     LoraParams() = default;
 

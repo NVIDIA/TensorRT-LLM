@@ -22,9 +22,13 @@
 #endif
 // Always include the public header for moe_gemm_kernels.h
 #include "tensorrt_llm/kernels/cutlass_kernels/include/moe_gemm_kernels.h"
+#include "tensorrt_llm/kernels/cutlass_kernels/include/moe_lora_device_path.h"
+
+#include "cutlass/gemm_coord.h"
 
 #include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/cublasMMWrapper.h"
+#include "tensorrt_llm/common/dataType.h"
 #include "tensorrt_llm/common/opUtils.h"
 #include "tensorrt_llm/common/workspace.h"
 #include "tensorrt_llm/kernels/cutlass_kernels/fp8_blockscale_gemm/fp8_blockscale_gemm.h"
@@ -249,6 +253,16 @@ public:
         mGemm1Profiles = mKernelRunner->getTactics(MoeGemmId::GEMM_1);
         mGemm2Profiles = mKernelRunner->getTactics(MoeGemmId::GEMM_2);
         cuInit(0);
+
+        // Phase 6b.C: pick up the device-LoRA-path opt-in. The env var is the
+        // only toggle in 6b.C-D and goes away in 6b.E once the device path
+        // replaces the host path wholesale. Any non-empty value other than
+        // "0" or "OFF" enables the new path, mirroring LORA_USE_UNIFIED_GEMM.
+        if (char const* envv = std::getenv("TLLM_MOE_LORA_USE_DEVICE_PATH"))
+        {
+            std::string val(envv);
+            mUseDeviceLoraPath = !val.empty() && val != "0" && val != "OFF" && val != "off";
+        }
     }
 
     ~FusedMoeRunner()
@@ -537,7 +551,8 @@ public:
             fc1_slot_lora_ranks, fc1_slot_lora_weight_ptrs, fc2_slot_lora_ranks, fc2_slot_lora_weight_ptrs,
             gated_slot_lora_ranks, gated_slot_lora_weight_ptrs, token_to_slot,
             /*num_tokens=*/num_rows, hidden_size, inter_size, mActivationDtype, lora_max_low_rank, is_gated_act, stream,
-            fc1_shared_a, fc1_shared_b, fc2_shared_a, fc2_shared_b, gated_shared_a, gated_shared_b);
+            static_cast<int>(experts_per_token), fc1_shared_a, fc1_shared_b, fc2_shared_a, fc2_shared_b, gated_shared_a,
+            gated_shared_b);
         size_t lora_workspace_size = 0;
         if (lora_params_opt.has_value())
         {
@@ -986,6 +1001,67 @@ private:
     // captured cudaMemcpyAsync source addresses).
     int64_t mLoraHostBufCapacity = 0;
 
+    // Phase 6b.C.2.a: persistent device-resident scratch backing the
+    // capture-safe MoE LoRA path. One LoraDevicePathBuffers per module
+    // (fc1, fc2, gated). All at::Tensor members are allocated by
+    // `ensureLoraDeviceScratch` and reused across calls so the addresses
+    // baked into a captured graph remain valid for replay. Pointers from
+    // these tensors are packed into `LoraParams::device_path` by
+    // `buildMoeLoraParams` when `mUseDeviceLoraPath` is true.
+    //
+    // 6b.C.2.a populates the bundle but leaves it unconsumed -- runMoe
+    // still runs the legacy host LoRA path. 6b.C.2.b will branch
+    // setupLoraWorkspace / loraFC1 / loraFC2 on `device_path.enabled`.
+    struct LoraDevicePathBuffers
+    {
+        // 6b.B output mirrors: per-permuted-row (rank, A_ptr+offset, B_ptr+offset).
+        at::Tensor permuted_ranks;          // int32  [P_max]
+        at::Tensor permuted_ptrs;           // int64  [2 * P_max]
+
+        // 6b.C.1 outputs. Concrete types restored at the LoraParams boundary.
+        at::Tensor problem_sizes_in;        // int8   [P_max * sizeof(GemmCoord)]
+        at::Tensor problem_sizes_out;       // int8   [P_max * sizeof(GemmCoord)]
+        at::Tensor a_ptrs_in;               // int64  [P_max]
+        at::Tensor b_ptrs_in;               // int64  [P_max]
+        at::Tensor d_ptrs_in;               // int64  [P_max]
+        at::Tensor b_ptrs_out;              // int64  [P_max]
+        at::Tensor d_ptrs_out;              // int64  [P_max]
+        at::Tensor lda_in;                  // int64  [P_max]
+        at::Tensor ldb_in;                  // int64  [P_max]
+        at::Tensor ldd_in;                  // int64  [P_max]
+        at::Tensor ldb_out;                 // int64  [P_max]
+        at::Tensor ldd_out;                 // int64  [P_max]
+        at::Tensor splitk_offsets;          // int64  [P_max + 1]
+
+        // GEMM data-flow buffers.
+        at::Tensor lowrank_workspace;       // dtype  [P_max * max_lora_rank]
+        at::Tensor splitk_workspace;        // float  [P_max * max_lora_rank * splitk_slices]
+
+        // Pinned-host single GemmCoord upper bounds; required by the
+        // cuda_graph_*_grouped_gemm wrappers for kernel selection.
+        at::Tensor host_max_problem_in;     // int8 pinned [sizeof(GemmCoord)]
+        at::Tensor host_max_problem_out;    // int8 pinned [sizeof(GemmCoord)]
+    };
+
+    LoraDevicePathBuffers mFc1DeviceBuf;
+    LoraDevicePathBuffers mFc2DeviceBuf;
+    LoraDevicePathBuffers mGatedDeviceBuf;
+
+    // Tracks the shape parameters baked into the current scratch
+    // allocation. (Re)allocation is required if any of these grows or if
+    // the dtype changes.
+    int64_t mLoraDeviceScratchCapacity = 0;        // P_max = max(num_tokens * top_k)
+    int64_t mLoraDeviceScratchMaxLoraRank = 0;
+    int64_t mLoraDeviceScratchDtypeBytes = 0;
+    int64_t mLoraDeviceScratchSplitKSlices = 0;
+    bool mLoraDeviceScratchHasGated = false;
+
+    // Set from the TLLM_MOE_LORA_USE_DEVICE_PATH environment variable at
+    // construction time. The env-var is the ONLY toggle in 6b.C; it
+    // disappears in 6b.E once the device path replaces the host path
+    // wholesale.
+    bool mUseDeviceLoraPath = false;
+
     void freeProfileWorkspace()
     {
         if (mProfileWorkspace != nullptr)
@@ -1303,6 +1379,147 @@ private:
         mLoraExpandGatedWeightPtrsDevice = at::empty({capacity * 2}, dev_long_opts);
     }
 
+    // Phase 6b.C.2.a: allocate the per-module device-path scratch needed by
+    // the upcoming capture-safe LoRA path. The buffers are sized in
+    // permuted tokens (P = num_tokens * top_k) and the per-token LoRA rank
+    // upper bound `max_lora_rank`; both feed multiple downstream kernels
+    // (pointer-expand, problem-builder, cuda_graph_*_grouped_gemm).
+    //
+    // The function is idempotent at-or-below the current capacity and
+    // re-allocates only when one of (capacity, max_lora_rank, dtype_bytes,
+    // splitk_slices, has_gated) grows. Re-allocation drops the previous
+    // storage; callers must make sure any in-flight CUDA graph referencing
+    // the old addresses has been destroyed or will not replay.
+    //
+    // The host-side max-problem-size pins are sized for one GemmCoord
+    // each; the value is filled in 6b.C.2.b (worst-case upper bound is
+    // independent of per-call data).
+    void ensureLoraDeviceScratch(int64_t capacity, int64_t max_lora_rank, int64_t dtype_bytes, int64_t splitk_slices,
+        bool has_gated)
+    {
+        TORCH_CHECK(capacity > 0, "device-path capacity must be positive; got ", capacity);
+        TORCH_CHECK(max_lora_rank > 0, "device-path max_lora_rank must be positive; got ", max_lora_rank);
+        TORCH_CHECK(dtype_bytes > 0, "device-path dtype_bytes must be positive; got ", dtype_bytes);
+        TORCH_CHECK(splitk_slices > 0, "device-path splitk_slices must be positive; got ", splitk_slices);
+
+        bool const need_resize = capacity > mLoraDeviceScratchCapacity
+            || max_lora_rank > mLoraDeviceScratchMaxLoraRank || dtype_bytes != mLoraDeviceScratchDtypeBytes
+            || splitk_slices != mLoraDeviceScratchSplitKSlices
+            || (has_gated && !mLoraDeviceScratchHasGated);
+        if (!need_resize)
+        {
+            return;
+        }
+
+        // Grow each field to the requested upper bound and remember the
+        // dtype/rank/splitk combo so subsequent calls can early-exit.
+        int64_t const new_capacity = std::max(capacity, mLoraDeviceScratchCapacity);
+        int64_t const new_max_lora_rank = std::max(max_lora_rank, mLoraDeviceScratchMaxLoraRank);
+        bool const new_has_gated = mLoraDeviceScratchHasGated || has_gated;
+
+        // c10::ScalarType for the lowrank workspace. The kernel treats the
+        // buffer opaquely (per-byte stride is `dtype_bytes`), so we pick a
+        // dtype with matching element size to keep at::Tensor accounting
+        // sensible; consumers cast via .data_ptr().
+        c10::ScalarType const dtype_scalar
+            = (dtype_bytes == 2) ? at::kBFloat16 : (dtype_bytes == 4) ? at::kFloat : at::kByte;
+        // Validate: callers should be passing bf16/fp16 (=2 bytes) for the
+        // MVP. Anything else still works at the byte level but the
+        // assertion below catches accidental misuse.
+        TORCH_CHECK(dtype_bytes == 1 || dtype_bytes == 2 || dtype_bytes == 4,
+            "device-path lowrank workspace dtype_bytes must be 1/2/4; got ", dtype_bytes);
+
+        auto const dev_int8_opts = at::TensorOptions().dtype(at::kByte).device(at::kCUDA);
+        auto const dev_int32_opts = at::TensorOptions().dtype(at::kInt).device(at::kCUDA);
+        auto const dev_int64_opts = at::TensorOptions().dtype(at::kLong).device(at::kCUDA);
+        auto const dev_float_opts = at::TensorOptions().dtype(at::kFloat).device(at::kCUDA);
+        auto const dev_dtype_opts = at::TensorOptions().dtype(dtype_scalar).device(at::kCUDA);
+        auto const pinned_int8_opts = at::TensorOptions().dtype(at::kByte).pinned_memory(true);
+
+        // sizeof(cutlass::gemm::GemmCoord) == sizeof(int) * 3 in practice;
+        // we ask for the exact byte count at allocation time so the bound
+        // tracks any cutlass struct-layout change.
+        int64_t const gemm_coord_bytes = static_cast<int64_t>(sizeof(cutlass::gemm::GemmCoord));
+
+        auto alloc_one = [&](LoraDevicePathBuffers& mod) {
+            mod.permuted_ranks = at::empty({new_capacity}, dev_int32_opts);
+            mod.permuted_ptrs = at::empty({new_capacity * 2}, dev_int64_opts);
+
+            mod.problem_sizes_in = at::empty({new_capacity * gemm_coord_bytes}, dev_int8_opts);
+            mod.problem_sizes_out = at::empty({new_capacity * gemm_coord_bytes}, dev_int8_opts);
+
+            mod.a_ptrs_in = at::empty({new_capacity}, dev_int64_opts);
+            mod.b_ptrs_in = at::empty({new_capacity}, dev_int64_opts);
+            mod.d_ptrs_in = at::empty({new_capacity}, dev_int64_opts);
+            mod.b_ptrs_out = at::empty({new_capacity}, dev_int64_opts);
+            mod.d_ptrs_out = at::empty({new_capacity}, dev_int64_opts);
+
+            mod.lda_in = at::empty({new_capacity}, dev_int64_opts);
+            mod.ldb_in = at::empty({new_capacity}, dev_int64_opts);
+            mod.ldd_in = at::empty({new_capacity}, dev_int64_opts);
+            mod.ldb_out = at::empty({new_capacity}, dev_int64_opts);
+            mod.ldd_out = at::empty({new_capacity}, dev_int64_opts);
+            mod.splitk_offsets = at::empty({new_capacity + 1}, dev_int64_opts);
+
+            mod.lowrank_workspace = at::empty({new_capacity * new_max_lora_rank}, dev_dtype_opts);
+            mod.splitk_workspace = at::empty({new_capacity * new_max_lora_rank * splitk_slices}, dev_float_opts);
+
+            mod.host_max_problem_in = at::empty({gemm_coord_bytes}, pinned_int8_opts);
+            mod.host_max_problem_out = at::empty({gemm_coord_bytes}, pinned_int8_opts);
+        };
+
+        alloc_one(mFc1DeviceBuf);
+        alloc_one(mFc2DeviceBuf);
+        if (new_has_gated)
+        {
+            alloc_one(mGatedDeviceBuf);
+        }
+
+        mLoraDeviceScratchCapacity = new_capacity;
+        mLoraDeviceScratchMaxLoraRank = new_max_lora_rank;
+        mLoraDeviceScratchDtypeBytes = dtype_bytes;
+        mLoraDeviceScratchSplitKSlices = splitk_slices;
+        mLoraDeviceScratchHasGated = new_has_gated;
+    }
+
+    // Pack the per-module at::Tensor scratch into the typed pointer bundle
+    // attached to LoraParams. Caller-owned by FusedMoeRunner -- the
+    // resulting struct's pointers stay valid as long as the FusedMoeRunner
+    // outlives the LoraParams use. `output_base_dev` and `out_hidden_size`
+    // are filled in 6b.C.2.b once the runner exposes the per-module
+    // output buffers; for now they are left at their default (nullptr/0)
+    // and the device path stays unconsumed.
+    void populateLoraDevicePathModule(LoraDevicePathBuffers& mod,
+        ::tensorrt_llm::kernels::cutlass_kernels::MoeLoraDevicePathModule& out) const
+    {
+        out.permuted_ranks_dev = mod.permuted_ranks.data_ptr<int32_t>();
+        out.permuted_ptrs_dev = mod.permuted_ptrs.data_ptr<int64_t>();
+
+        out.problem_sizes_in_dev = mod.problem_sizes_in.data_ptr();
+        out.problem_sizes_out_dev = mod.problem_sizes_out.data_ptr();
+        out.a_ptrs_in_dev = reinterpret_cast<void**>(mod.a_ptrs_in.data_ptr<int64_t>());
+        out.b_ptrs_in_dev = reinterpret_cast<void**>(mod.b_ptrs_in.data_ptr<int64_t>());
+        out.d_ptrs_in_dev = reinterpret_cast<void**>(mod.d_ptrs_in.data_ptr<int64_t>());
+        out.b_ptrs_out_dev = reinterpret_cast<void**>(mod.b_ptrs_out.data_ptr<int64_t>());
+        out.d_ptrs_out_dev = reinterpret_cast<void**>(mod.d_ptrs_out.data_ptr<int64_t>());
+        out.lda_in_dev = mod.lda_in.data_ptr<int64_t>();
+        out.ldb_in_dev = mod.ldb_in.data_ptr<int64_t>();
+        out.ldd_in_dev = mod.ldd_in.data_ptr<int64_t>();
+        out.ldb_out_dev = mod.ldb_out.data_ptr<int64_t>();
+        out.ldd_out_dev = mod.ldd_out.data_ptr<int64_t>();
+        out.splitk_offsets_dev = mod.splitk_offsets.data_ptr<int64_t>();
+
+        out.lowrank_workspace_dev = mod.lowrank_workspace.data_ptr();
+        out.splitk_workspace_dev = mod.splitk_workspace.data_ptr();
+        out.host_max_problem_in_pinned = mod.host_max_problem_in.data_ptr();
+        out.host_max_problem_out_pinned = mod.host_max_problem_out.data_ptr();
+
+        // Filled by 6b.C.2.b once the templated runner exposes the
+        // module-specific output buffer addresses.
+        out.output_base_dev = nullptr;
+        out.out_hidden_size = 0;
+    }
+
     // Build a populated LoraParams from the optional CPU tensors. Caller is
     // responsible for setting `lora_params.workspace` (the cuBLAS scratch).
     // Returns std::nullopt when LoRA is inactive (no fc1 ranks tensor).
@@ -1325,7 +1542,7 @@ private:
         torch::optional<torch::Tensor> const& gated_slot_lora_weight_ptrs,
         torch::optional<torch::Tensor> const& token_to_slot, int64_t num_tokens, int64_t hidden_size, int64_t inter_size,
         c10::ScalarType act_dtype, int64_t lora_max_low_rank, bool is_gated_activation, cudaStream_t stream,
-        bool fc1_shared_a = false,
+        int experts_per_token, bool fc1_shared_a = false,
         bool fc1_shared_b = false, bool fc2_shared_a = false, bool fc2_shared_b = false, bool gated_shared_a = false,
         bool gated_shared_b = false)
     {
@@ -1511,6 +1728,40 @@ private:
         lora_params.fc2_shared_b = fc2_shared_b;
         lora_params.gated_shared_a = gated_shared_a;
         lora_params.gated_shared_b = gated_shared_b;
+
+        // Phase 6b.C.2.a: opt-in device-LoRA-path scratch. Allocate the
+        // per-module device-resident buffers and pack their pointers into
+        // `lora_params.device_path`. The struct is consumed by the runner
+        // in 6b.C.2.b; for now it is filled but unread, so the only effect
+        // here is the GPU memory allocation. We keep the toggle gated on
+        // the env-var so users who don't opt in see no behavior change.
+        if (mUseDeviceLoraPath)
+        {
+            int64_t const dtype_bytes
+                = static_cast<int64_t>(common::getDTypeSize(loraTypeFromActDtype(act_dtype)));
+            // mSplitKSlices default in LoraImpl is 16; we mirror that here
+            // so the device-path workspace is sized identically until
+            // 6b.E adds a runtime knob.
+            constexpr int64_t kDevicePathSplitKSlices = 16;
+            int64_t const capacity = num_tokens * static_cast<int64_t>(experts_per_token);
+            ensureLoraDeviceScratch(capacity, lora_max_low_rank, dtype_bytes, kDevicePathSplitKSlices,
+                /*has_gated=*/has_gated);
+
+            auto& dp = lora_params.device_path;
+            dp.enabled = true;
+            dp.in_hidden_size = hidden_size;
+            dp.max_lora_rank = lora_max_low_rank;
+            dp.dtype_bytes = dtype_bytes;
+            dp.splitk_slices = kDevicePathSplitKSlices;
+            dp.has_gated = has_gated;
+            populateLoraDevicePathModule(mFc1DeviceBuf, dp.fc1);
+            populateLoraDevicePathModule(mFc2DeviceBuf, dp.fc2);
+            if (has_gated)
+            {
+                populateLoraDevicePathModule(mGatedDeviceBuf, dp.gated);
+            }
+        }
+
         return lora_params;
     }
 
