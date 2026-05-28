@@ -333,11 +333,10 @@ public:
     int32_t beam_width;
     int32_t max_num_requests;
     int32_t attention_window_size;
-    int32_t sink_token_length;
 
     auto data() const
     {
-        return std::make_tuple(beam_width, max_num_requests, attention_window_size, sink_token_length);
+        return std::make_tuple(beam_width, max_num_requests, attention_window_size);
     };
 
     virtual ~RunnerBase() = default;
@@ -385,7 +384,6 @@ public:
         enqueueParams.max_attention_window_size = attention_window_size;
         enqueueParams.cyclic_attention_window_size = attention_window_size;
         enqueueParams.max_cyclic_attention_window_size = attention_window_size;
-        enqueueParams.sink_token_length = sink_token_length;
         enqueueParams.beam_width = beam_width;
         enqueueParams.num_requests = max_num_requests;
 
@@ -702,7 +700,6 @@ public:
         common_enqueue_params.cyclic_attention_window_size = cyclic_attention_window_size;
         common_enqueue_params.max_cyclic_attention_window_size = cyclic_attention_window_size;
         common_enqueue_params.can_use_one_more_block = can_use_one_more_block;
-        common_enqueue_params.sink_token_length = sink_token_length;
         common_enqueue_params.kv_scale_orig_quant = kv_scale_orig_quant_ptr;
         common_enqueue_params.kv_scale_quant_orig = kv_scale_quant_orig_ptr;
         common_enqueue_params.attention_output_orig_quant = out_scale_ptr;
@@ -930,14 +927,14 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
     std::optional<torch::Tensor> rotary_cos_sin, std::optional<torch::Tensor> latent_cache,
     std::optional<torch::Tensor> q_pe, std::optional<torch::Tensor> block_ids_per_seq,
     std::optional<torch::Tensor> attention_sinks, bool const is_fused_qkv, bool const update_kv_cache,
-    int64_t const predicted_tokens_per_seq, int64_t const layer_idx, int64_t const num_heads,
+    int64_t const predicted_tokens_per_seq, int64_t const local_layer_idx, int64_t const num_heads,
     int64_t const num_kv_heads, int64_t const head_size, std::optional<int64_t> const tokens_per_block,
     int64_t const max_num_requests, int64_t const max_context_length, int64_t const attention_window_size,
-    int64_t const sink_token_length, int64_t const beam_width, int64_t const mask_type, int64_t const quant_mode,
-    double const q_scaling, int64_t const position_embedding_type, int64_t const rotary_embedding_dim,
-    double const rotary_embedding_base, int64_t const rotary_embedding_scale_type,
-    std::vector<double> rotary_embedding_scales, std::vector<int64_t> rotary_embedding_max_position_info,
-    bool const use_paged_context_fmha, std::optional<int64_t> attention_input_type, bool is_mla_enable,
+    int64_t const beam_width, int64_t const mask_type, int64_t const quant_mode, double const q_scaling,
+    int64_t const position_embedding_type, int64_t const rotary_embedding_dim, double const rotary_embedding_base,
+    int64_t const rotary_embedding_scale_type, std::vector<double> rotary_embedding_scales,
+    std::vector<int64_t> rotary_embedding_max_position_info, bool const use_paged_context_fmha,
+    std::optional<int64_t> attention_input_type, bool is_mla_enable,
     std::optional<int64_t> chunked_prefill_buffer_batch_size, std::optional<int64_t> q_lora_rank,
     std::optional<int64_t> kv_lora_rank, std::optional<int64_t> qk_nope_head_dim,
     std::optional<int64_t> qk_rope_head_dim, std::optional<int64_t> v_head_dim, std::optional<bool> rope_append,
@@ -959,7 +956,7 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
     bool sage_attn_qk_int8, int64_t num_contexts, int64_t num_ctx_tokens,
     std::optional<int64_t> compressed_kv_cache_pool_ptr)
 {
-    TLLM_LOG_TRACE("Attention op starts at layer %d", layer_idx);
+    TLLM_LOG_TRACE("Attention op starts at layer %d", local_layer_idx);
     // Use these tensors to infer if the attention is using KV cache
     bool const use_kv_cache = kv_cache_block_offsets.has_value() && host_kv_cache_pool_pointers.has_value()
         && host_kv_cache_pool_mapping.has_value();
@@ -1037,7 +1034,6 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
     runner->beam_width = beam_width;
     runner->max_num_requests = max_num_requests;
     runner->attention_window_size = attention_window_size;
-    runner->sink_token_length = sink_token_length;
 
     double const rotary_embedding_scale = rotary_embedding_scales[0];
     double const rotary_embedding_short_m_scale = rotary_embedding_scales[1];
@@ -1048,7 +1044,7 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
     auto op = std::make_shared<AttentionOp>();
     op->mType = dtype;
     op->mFMHAForceFP32Acc = dtype == nvinfer1::DataType::kBF16;
-    op->mLayerIdx = layer_idx;
+    op->mLayerIdx = local_layer_idx;
     op->mNumHeads = num_heads;
     op->mNumKVHeads = num_kv_heads;
     op->mHeadSize = head_size;
@@ -1166,13 +1162,13 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
     static std::unordered_map<CacheKey, std::shared_ptr<AttentionOp>, hash<CacheKey>> op_cache;
     if (auto it = op_cache.find(cache_key); it != op_cache.end())
     {
-        TLLM_LOG_TRACE("Attention op for layer %d is cached", layer_idx);
+        TLLM_LOG_TRACE("Attention op for layer %d is cached", local_layer_idx);
         op = it->second;
     }
     else
     {
-        TLLM_LOG_TRACE(
-            "Preparing new attention op for layer %d with cache key: %s", layer_idx, to_string(cache_key).c_str());
+        TLLM_LOG_TRACE("Preparing new attention op for layer %d with cache key: %s", local_layer_idx,
+            to_string(cache_key).c_str());
         op->initialize();
         runner->prepare(*op);
         op_cache[cache_key] = op;
@@ -1261,7 +1257,7 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
             flash_mla_tile_scheduler_metadata, flash_mla_num_splits, compressed_kv_cache_pool_ptr);
     }
 
-    TLLM_LOG_TRACE("Attention op stops at layer %d", layer_idx);
+    TLLM_LOG_TRACE("Attention op stops at layer %d", local_layer_idx);
 }
 
 bool attention_supports_nvfp4_output(int64_t const num_heads, int64_t const num_kv_heads, int64_t const head_size,
@@ -1363,8 +1359,8 @@ common::op::KvCacheBuffers<kernels::KVBlockArray> buildPagedKvCacheBuffers(
     std::optional<torch::Tensor> const& host_kv_cache_pool_pointers,
     std::optional<torch::Tensor> const& host_kv_cache_pool_mapping, common::QuantMode quantMode, int64_t layer_idx,
     int64_t batch_size, int64_t tokens_per_block, int64_t kv_head_num, int64_t size_per_head,
-    int64_t cyclic_attention_window_size, int64_t max_attention_window_size, int64_t sink_token_length,
-    int64_t beam_width, int64_t seq_offset, bool is_mla_enable, size_t elem_size)
+    int64_t cyclic_attention_window_size, int64_t max_attention_window_size, int64_t beam_width, int64_t seq_offset,
+    bool is_mla_enable, size_t elem_size)
 {
     using kernels::KVBlockArray;
 
@@ -1397,9 +1393,9 @@ common::op::KvCacheBuffers<kernels::KVBlockArray> buildPagedKvCacheBuffers(
         maxBlocksPerSequence, static_cast<int32_t>(tokens_per_block), sizePerToken,
         static_cast<int32_t>(cyclic_attention_window_size),
         static_cast<int32_t>(std::max(cyclic_attention_window_size, max_attention_window_size)),
-        static_cast<int32_t>(sink_token_length), beam_width > 1, poolPointers.primaryPoolPtr,
-        poolPointers.secondaryPoolPtr, poolPointers.primaryBlockScalePoolPtr, poolPointers.secondaryBlockScalePoolPtr,
-        blockOffsets, quantMode.hasFp4KvCache());
+        /*sink_token_length=*/0, beam_width > 1, poolPointers.primaryPoolPtr, poolPointers.secondaryPoolPtr,
+        poolPointers.primaryBlockScalePoolPtr, poolPointers.secondaryBlockScalePoolPtr, blockOffsets,
+        quantMode.hasFp4KvCache());
 }
 
 at::Tensor buildFlashinferTrtllmGenPagedKvCacheBuffers(at::Tensor host_kv_cache_pool_pointers,

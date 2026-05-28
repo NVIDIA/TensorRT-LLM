@@ -188,7 +188,6 @@ class TrtllmGenSupportChecker:
         out_dtype: Optional[torch.dtype] = None,
         mask_type: int = 1,
         beam_width: int = 1,
-        sink_token_length: int = 0,
         tokens_per_block: Optional[int] = 64,
         use_paged_kv_cache: bool = True,
         is_mla_enable: bool = False,
@@ -285,11 +284,6 @@ class TrtllmGenSupportChecker:
                 )
             if position_shift_enabled:
                 return False, "[Generation] Position shift is not supported."
-            if sink_token_length != 0:
-                return (
-                    False,
-                    f"[Generation] StreamingLLM (sink_token_length={sink_token_length}) is not supported.",
-                )
             if tokens_per_block < cls.MIN_TOKENS_PER_BLOCK:
                 return (
                     False,
@@ -482,7 +476,6 @@ class EnqueueParams:
     max_past_kv_length: int = 0
     max_attention_window_size: int = 0
     cyclic_attention_window_size: int = 0
-    sink_token_length: int = 0
     num_tokens: int = 0
     seq_offset: int = 0
     tokens_per_block: int = 64
@@ -597,18 +590,9 @@ class FlashInferTrtllmGenAttention:
         forward_args: AttentionForwardArgs,
         quant_mode: int,
     ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
-        attention_layer = self._get_attention_layer()
         kv_cache_quant_mode = QuantMode(quant_mode)
-        kv_scale_orig_quant = (
-            attention_layer.kv_scale_orig_quant
-            if forward_args.kv_scales_sf_inv is None
-            else forward_args.kv_scales_sf_inv
-        )
-        kv_scale_quant_orig = (
-            attention_layer.kv_scale_quant_orig
-            if forward_args.kv_scales_sf is None
-            else forward_args.kv_scales_sf
-        )
+        kv_scale_orig_quant = forward_args.kv_scale_orig_quant
+        kv_scale_quant_orig = forward_args.kv_scale_quant_orig
         if (
             not kv_cache_quant_mode.has_kv_cache_quant()
             or kv_scale_orig_quant is None
@@ -627,22 +611,10 @@ class FlashInferTrtllmGenAttention:
         return kv_scale_orig_quant, kv_scale_quant_orig
 
     @staticmethod
-    def _get_attention_output_orig_quant(
-        forward_args: AttentionForwardArgs,
-    ) -> Optional[torch.Tensor]:
-        return (
-            forward_args.out_scale_sf
-            if forward_args.output_sf is not None
-            else forward_args.out_scale
-        )
-
-    @staticmethod
     def _get_mrope_rotary_cos_sin(
         forward_args: AttentionForwardArgs,
     ) -> Optional[torch.Tensor]:
-        if forward_args.mrope_config is None:
-            return None
-        return forward_args.mrope_config.get("mrope_rotary_cos_sin")
+        return forward_args.mrope_rotary_cos_sin
 
     def is_supported(
         self,
@@ -693,7 +665,6 @@ class FlashInferTrtllmGenAttention:
             out_dtype=output.dtype,
             mask_type=mask_type,
             beam_width=metadata.beam_width,
-            sink_token_length=0,
             tokens_per_block=metadata.tokens_per_block,
             use_paged_kv_cache=use_paged_kv_cache,
             is_mla_enable=self._is_mla_enable,
@@ -997,7 +968,7 @@ class FlashInferTrtllmGenAttention:
         kv_scale_orig_quant, kv_scale_quant_orig = self._get_kv_scale_params(
             params.forward, params.kv_cache_quant_mode
         )
-        attention_output_orig_quant = self._get_attention_output_orig_quant(params.forward)
+        attention_output_orig_quant = params.forward.out_scale
         mrope_rotary_cos_sin = self._get_mrope_rotary_cos_sin(params.forward)
 
         (
@@ -1030,7 +1001,6 @@ class FlashInferTrtllmGenAttention:
             kv_cache_quant_mode=params.kv_cache_quant_mode,
             max_attention_window_size=params.max_attention_window_size,
             cyclic_attention_window_size=params.cyclic_attention_window_size,
-            sink_token_length=params.sink_token_length,
             num_tokens=params.num_tokens,
             batch_size=params.batch_size,
             input_seq_length=params.input_seq_length,
@@ -1088,7 +1058,6 @@ class FlashInferTrtllmGenAttention:
             kv_cache_quant_mode=params.kv_cache_quant_mode,
             max_attention_window_size=params.max_attention_window_size,
             cyclic_attention_window_size=params.cyclic_attention_window_size,
-            sink_token_length=params.sink_token_length,
             num_tokens=params.num_tokens,
             batch_size=params.batch_size,
             input_seq_length=params.input_seq_length,
@@ -1108,7 +1077,7 @@ class FlashInferTrtllmGenAttention:
         kv_scale_orig_quant, kv_scale_quant_orig = self._get_kv_scale_params(
             params.forward, params.kv_cache_quant_mode
         )
-        attention_output_orig_quant = self._get_attention_output_orig_quant(params.forward)
+        attention_output_orig_quant = params.forward.out_scale
         (
             q_processed,
             kv_pool,
@@ -1139,7 +1108,6 @@ class FlashInferTrtllmGenAttention:
             kv_cache_quant_mode=params.kv_cache_quant_mode,
             max_attention_window_size=params.max_attention_window_size,
             cyclic_attention_window_size=params.cyclic_attention_window_size,
-            sink_token_length=params.sink_token_length,
             num_tokens=params.num_tokens,
             batch_beam=batch_beam,
             input_seq_length=params.input_seq_length,

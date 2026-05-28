@@ -146,7 +146,8 @@ class Eagle3OneModelDynamicTreeResourceManager(BaseResourceManager):
     def free_resources(self, request: LlmRequest):
         """Clear tree validity for the freed request slot."""
         if request.py_seq_slot is not None:
-            self.spec_tree_manager.mark_tree_invalid(request.py_seq_slot)
+            self.spec_tree_manager.slot_storage.mark_invalid(
+                request.py_seq_slot)
 
     def add_dummy_requests(self, request_ids: List[int]):
         """Handle CUDA graph dummy request registration.
@@ -512,8 +513,11 @@ class Eagle3OneModelWorker(SpecWorkerBase):
         if attn_metadata.spec_decoding_position_offsets is not None:
             self._saved_position_offsets = attn_metadata.spec_decoding_position_offsets.clone(
             )
+            self._saved_position_offsets_cpp = (
+                attn_metadata.spec_decoding_position_offsets_cpp)
         else:
             self._saved_position_offsets = None
+            self._saved_position_offsets_cpp = None
         if attn_metadata.spec_decoding_generation_lengths is not None:
             self._saved_generation_lengths = attn_metadata.spec_decoding_generation_lengths[:batch_size].clone(
             )
@@ -536,7 +540,10 @@ class Eagle3OneModelWorker(SpecWorkerBase):
         if self._saved_position_offsets is not None:
             attn_metadata.spec_decoding_position_offsets.copy_(
                 self._saved_position_offsets)
+            attn_metadata.spec_decoding_position_offsets_cpp = (
+                self._saved_position_offsets_cpp)
             self._saved_position_offsets = None
+            self._saved_position_offsets_cpp = None
         if self._saved_generation_lengths is not None:
             batch_size = self._saved_generation_lengths.shape[0]
             attn_metadata.spec_decoding_generation_lengths[:batch_size].copy_(

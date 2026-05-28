@@ -173,8 +173,8 @@ class DemoEngine(ADEngine):
             input_ids=input_ids_flat,
             cu_seqlen=cu_seqlen,
             input_pos=[0] * len(total_lens),
-            cache_loc=cache_loc,
-            cu_num_pages=cu_num_pages,
+            cache_loc_per_pool=[cache_loc],
+            cu_num_pages_per_pool=[cu_num_pages],
             slot_idx=list(range(len(total_lens))),
             **extra_args,
         )
@@ -217,8 +217,8 @@ class DemoEngine(ADEngine):
                 input_ids=input_ids_flat,
                 cu_seqlen=cu_seqlen,
                 input_pos=input_pos_next,
-                cache_loc=cache_loc,
-                cu_num_pages=cu_num_pages,
+                cache_loc_per_pool=[cache_loc],
+                cu_num_pages_per_pool=[cu_num_pages],
                 slot_idx=list(range(batch_size)),
                 prompt_lens=total_lens,
             )

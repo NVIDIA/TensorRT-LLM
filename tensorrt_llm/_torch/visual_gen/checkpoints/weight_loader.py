@@ -8,7 +8,7 @@ import torch
 import tqdm
 
 from tensorrt_llm._torch.models.checkpoints.base_weight_loader import BaseWeightLoader
-from tensorrt_llm._torch.visual_gen.config import PipelineComponent
+from tensorrt_llm._torch.visual_gen.pipeline_registry import PipelineComponent
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 

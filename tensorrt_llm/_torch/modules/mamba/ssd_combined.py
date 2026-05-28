@@ -437,9 +437,16 @@ def mamba_chunk_scan_combined(
     # FlashInfer fused CUTLASS kernel on Blackwell (SM100+); both varlen and
     # non-varlen route here based on cu_seqlens. Falls back to Triton when the
     # MMA tile constraints on (chunk_size, dstate, headdim) aren't met.
+    #
+    # DISABLED: The FlashInfer SSD kernel hardcodes state_dtype=bf16 while the
+    # Triton path accumulates in fp32 (states_in_fp32=True), causing silent
+    # precision loss during prefill.
+    # TODO: Re-enable once _get_flashinfer_ssd_kernel uses state_dtype=float32.
+    _USE_FLASHINFER_SSD_PREFILL = False
     dstate = B.shape[-1]
     headdim = x.shape[-1]
-    flashinfer_eligible = (z is None and is_sm_100f())
+    flashinfer_eligible = (_USE_FLASHINFER_SSD_PREFILL and z is None
+                           and is_sm_100f())
     if flashinfer_eligible and _flashinfer_ssd_supported(
             chunk_size, dstate, headdim):
         return _mamba_chunk_scan_flashinfer_fwd(

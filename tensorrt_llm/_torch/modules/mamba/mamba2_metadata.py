@@ -69,6 +69,20 @@ def _cu_seqlens_triton_kernel(
     tl.store(chunk_offsets_ptr + offsets, chunk_offsets.to(tl.int32), mask=mask)
 
 
+def compute_extra_chunks_cpu(seq_lens, num_seqs: int, chunk_size: int) -> int:
+    """Count extra chunks caused by misaligned sequence boundaries.
+
+    Computes from CPU seq_lens to avoid GPU->CPU synchronization.
+    """
+    cumsum = 0
+    extra = 0
+    for i in range(num_seqs - 1):
+        cumsum += int(seq_lens[i])
+        if cumsum % chunk_size != 0:
+            extra += 1
+    return extra
+
+
 def cu_seqlens_to_chunk_indices_offsets_triton(
         cu_seqlens: torch.Tensor,
         chunk_size: int,
@@ -392,15 +406,8 @@ class Mamba2Metadata:
                 self.has_initial_states_cpu[:num_contexts].any())
 
             if self.use_initial_states:
-                # Compute extra_chunks using pure Python arithmetic on CPU
-                # seq_lens to avoid any GPU->CPU sync point.
-                _cs = self.chunk_size
-                _cumsum = 0
-                _extra = 0
-                for i in range(num_contexts - 1):
-                    _cumsum += int(attn_metadata.seq_lens[i])
-                    if _cumsum % _cs != 0:
-                        _extra += 1
+                _extra = compute_extra_chunks_cpu(attn_metadata.seq_lens,
+                                                  num_contexts, self.chunk_size)
 
                 self.chunk_indices, self.chunk_offsets = cu_seqlens_to_chunk_indices_offsets_triton(
                     self.cu_seqlens[:num_contexts + 1],

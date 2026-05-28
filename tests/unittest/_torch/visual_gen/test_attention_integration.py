@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 """Test WAN Attention Integration.
 
@@ -20,14 +20,13 @@ from tensorrt_llm._torch.modules.rms_norm import RMSNorm
 # ============================================================================
 from tensorrt_llm._torch.visual_gen.attention_backend.flash_attn4 import _flash_attn_fwd as _fa4_fwd
 from tensorrt_llm._torch.visual_gen.config import (
-    AttentionConfig,
     DiffusionModelConfig,
-    SageAttentionConfig,
     create_attention_metadata_state,
 )
 
 # Import new integrated versions
 from tensorrt_llm._torch.visual_gen.modules.attention import Attention, QKVMode, apply_rotary_emb
+from tensorrt_llm.visual_gen.args import AttentionConfig, QuantAttentionConfig
 
 _flash_attn4_available = _fa4_fwd is not None
 
@@ -118,7 +117,7 @@ def create_model_config(
     head_dim: int,
     eps: float = 1e-6,
     attn_backend: str = "VANILLA",
-    sage_attention_config: "SageAttentionConfig | None" = None,
+    quant_attention_config: "QuantAttentionConfig | None" = None,
 ):
     """Create a mock DiffusionModelConfig for testing."""
     pretrained_config = SimpleNamespace(
@@ -133,7 +132,7 @@ def create_model_config(
         pretrained_config=pretrained_config,
         attention=AttentionConfig(
             backend=attn_backend,
-            sage_attention_config=sage_attention_config,
+            quant_attention_config=quant_attention_config,
         ),
         skip_create_weights_in_init=False,
     )
@@ -290,9 +289,9 @@ def test_self_attention_equivalence(attn_backend: str):
 # batch_size: B=1 (cfg_size=2, split across GPUs) / B=2 (cfg_size=1, single GPU)
 @pytest.mark.parametrize("seq_len", [256, 512, 1560, 3600, 4096, 16384, 32760])
 @pytest.mark.parametrize("batch_size", [1, 2])
-@pytest.mark.parametrize("qk_int8", [False, True])
-def test_sage_attention_self_attention(qk_int8: bool, batch_size: int, seq_len: int):
-    """Test SageAttention (TRTLLM + sage_attention_config) self-attention.
+@pytest.mark.parametrize("qk_dtype", ["fp8", "int8"])
+def test_sage_attention_self_attention(qk_dtype: str, batch_size: int, seq_len: int):
+    """Test SageAttention (TRTLLM + quant_attention_config) self-attention.
 
     SageAttention quantizes Q/K/V with per-block scaling factors, so outputs
     are expected to differ from the naive SDPA reference. We verify:
@@ -302,7 +301,7 @@ def test_sage_attention_self_attention(qk_int8: bool, batch_size: int, seq_len: 
     4. Approximate agreement with naive (cosine similarity > 0.99)
     """
     print("\n" + "=" * 60)
-    print(f"Testing SageAttention (qk_int8={qk_int8}, B={batch_size}, S={seq_len})")
+    print(f"Testing SageAttention (qk_dtype={qk_dtype}, B={batch_size}, S={seq_len})")
     print("=" * 60)
 
     # The sm100 sage kernel only has cubins for head_dim=128,
@@ -316,11 +315,11 @@ def test_sage_attention_self_attention(qk_int8: bool, batch_size: int, seq_len: 
     print(f"Config: B={batch_size}, S={seq_len}, H={hidden_size}, heads={num_heads}, D={head_dim}")
     print(f"Device: {device}, dtype: {dtype}")
 
-    sage_cfg = SageAttentionConfig(
-        num_elts_per_blk_q=1,
-        num_elts_per_blk_k=16 if qk_int8 else 1,
-        num_elts_per_blk_v=1,
-        qk_int8=qk_int8,
+    quant_cfg = QuantAttentionConfig(
+        qk_dtype=qk_dtype,
+        q_block_size=1,
+        k_block_size=16 if qk_dtype == "int8" else 1,
+        v_block_size=1,
     )
 
     # Create models
@@ -331,7 +330,7 @@ def test_sage_attention_self_attention(qk_int8: bool, batch_size: int, seq_len: 
         num_heads,
         head_dim,
         attn_backend="TRTLLM",
-        sage_attention_config=sage_cfg,
+        quant_attention_config=quant_cfg,
     )
     integrated = Attention(
         hidden_size, num_heads, qkv_mode=QKVMode.FUSE_QKV, config=model_config
@@ -382,7 +381,7 @@ def test_sage_attention_self_attention(qk_int8: bool, batch_size: int, seq_len: 
 
     assert cos_sim > 0.99, (
         f"SageAttention cosine similarity too low: {cos_sim:.4f} < 0.99 "
-        f"(B={batch_size}, S={seq_len}, qk_int8={qk_int8})"
+        f"(B={batch_size}, S={seq_len}, qk_dtype={qk_dtype})"
     )
     return cos_sim > 0.99
 
@@ -693,10 +692,10 @@ def run_all_tests():
     # Run SageAttention self-attention tests (subset for manual runner)
     for batch_size in [1, 2]:
         for seq_len in [4096, 32760]:
-            for qk_int8 in [False, True]:
-                label = f"sage_B{batch_size}_S{seq_len}_QkInt8{qk_int8}"
+            for qk_dtype in ["fp8", "int8"]:
+                label = f"sage_B{batch_size}_S{seq_len}_QkDtype{qk_dtype}"
                 results[label] = test_sage_attention_self_attention(
-                    qk_int8=qk_int8, batch_size=batch_size, seq_len=seq_len
+                    qk_dtype=qk_dtype, batch_size=batch_size, seq_len=seq_len
                 )
 
     # Run cross-attention tests

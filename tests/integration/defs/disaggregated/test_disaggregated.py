@@ -16,6 +16,7 @@
 import asyncio
 import json
 import os
+import platform
 import re
 import shutil
 import subprocess
@@ -23,7 +24,7 @@ import tempfile
 import time
 from collections import namedtuple
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Optional
 
 import aiohttp
 import numpy as np
@@ -51,6 +52,9 @@ class TestConfig:
     test_desc: str
     request_count: int
     accuracy_threshold: float
+    speculative_model_path: Optional[str] = None
+    cancellation_rate: Optional[int] = None
+    cancellation_delay: Optional[float] = None
 
     def __str__(self):
         return self.test_desc
@@ -65,7 +69,7 @@ def get_ucx_tls():
     """
     ON some gb300 cluster,  we need to set `cuda_copy,cuda_ipc,sm,self,tcp` for UCX_TLS
     """
-    if sm == 103:
+    if sm == 103 and "aarch" in platform.machine().lower():
         return "cuda_copy,cuda_ipc,sm,self,tcp"
     if sm < 90:
         return "^cuda_ipc,ib,gdr_copy"
@@ -79,6 +83,41 @@ def cleanup_output_files():
             os.remove(file)
         except FileNotFoundError:
             pass
+
+
+# Fatal patterns whose presence in worker/server logs after a stress run
+# indicates the cluster did not stay healthy and the test should be failed.
+_FATAL_LOG_PATTERNS = (
+    "Hang detected on rank",
+    "RuntimeError: Cluster is not ready",
+    "Internal server error",
+)
+
+
+def scan_logs_for_fatal_errors(processes):
+    """Scan saved process logs for fatal disagg/worker error patterns.
+
+    Returns a dict mapping log path -> {pattern: count} for any pattern that
+    appears at least once. Skips processes that did not save a log file.
+    """
+    findings: dict[str, dict[str, int]] = {}
+    for proc in processes:
+        log_path = getattr(proc, "log_path", None)
+        if not log_path or not os.path.exists(log_path):
+            continue
+        counts = {pat: 0 for pat in _FATAL_LOG_PATTERNS}
+        try:
+            with open(log_path, "r", errors="replace") as f:
+                for line in f:
+                    for pat in _FATAL_LOG_PATTERNS:
+                        if pat in line:
+                            counts[pat] += 1
+        except OSError:
+            continue
+        hits = {pat: c for pat, c in counts.items() if c > 0}
+        if hits:
+            findings[log_path] = hits
+    return findings
 
 
 def get_default_disagg_cluster_config():
@@ -257,8 +296,16 @@ def get_test_config(test_desc, example_dir, test_root):
         f"{test_configs_root}/disagg_config_ctxtp2_gentp1cp2_deepseek_v3_lite_bf16_tllm_gen.yaml",
         "deepseek_r1_v2_fp4_stress":
         f"{test_configs_root}/disagg_config_ctxtp4_gentp4_deepseek_r1_v2_fp4_tllm.yaml",
+        "deepseek_r1_v2_fp4_mtp_stress":
+        f"{test_configs_root}/disagg_config_ctxtp4_gentp4_deepseek_r1_v2_fp4_tllm_mtp.yaml",
         "gpt_oss_120b_stress":
         f"{test_configs_root}/disagg_config_ctxtp2_gentp2_gptoss_tllm.yaml",
+        "gpt_oss_120b_eagle_stress":
+        f"{test_configs_root}/disagg_config_ctxtp2_gentp2_gptoss_tllm_eagle.yaml",
+        "gpt_oss_120b_cutlass_stress":
+        f"{test_configs_root}/disagg_config_ctxtp2_gentp2_gptoss_tllm_cutlass.yaml",
+        "qwen3_5_4b_fp8_stress":
+        f"{test_configs_root}/disagg_config_ctxtp1_gentp1_qwen3_5_4b_fp8_tllm.yaml",
         "gpt_oss_120b_harmony":
         f"{test_configs_root}/disagg_config_ctxtp2_gentp2_gptoss_tllm.yaml",
         "cancel_stress_test":
@@ -460,6 +507,82 @@ def run_client_tests(example_dir,
                     assert not_expected_string not in content, f"Unexpected string '{not_expected_string}' found in {output_file}"
 
 
+def verify_usage_with_cache_reuse(server_url: str, model: str):
+    """Verify repeated requests report context-side usage after cache reuse."""
+    prompt = "Explain why a repeated disaggregated request should reuse cached KV blocks."
+    max_tokens = 4
+    timeout = aiohttp.ClientTimeout(total=120)
+
+    async def send_request(session: aiohttp.ClientSession, endpoint: str):
+        if endpoint == "completions":
+            payload = {
+                "model": model,
+                "prompt": prompt,
+                "max_tokens": max_tokens,
+                "temperature": 0.0,
+                "ignore_eos": True,
+            }
+        else:
+            payload = {
+                "model": model,
+                "messages": [{
+                    "role": "user",
+                    "content": prompt,
+                }],
+                "max_tokens": max_tokens,
+                "temperature": 0.0,
+                "ignore_eos": True,
+            }
+
+        async with session.post(f"{server_url}/v1/{endpoint}",
+                                json=payload,
+                                timeout=timeout) as resp:
+            assert resp.status == 200, \
+                f"{endpoint} request failed with {resp.status}: {await resp.text()}"
+            return await resp.json()
+
+    def validate_usage(endpoint: str, first_response: dict[str, Any],
+                       second_response: dict[str, Any]):
+        first_usage = first_response.get("usage")
+        second_usage = second_response.get("usage")
+        print(f"[usage_check] {endpoint} first_usage={first_usage}")
+        print(f"[usage_check] {endpoint} second_usage={second_usage}")
+        assert first_usage is not None, f"{endpoint} first response missing usage"
+        assert second_usage is not None, f"{endpoint} second response missing usage"
+        assert second_usage["prompt_tokens"] == first_usage["prompt_tokens"], \
+            (f"{endpoint} prompt_tokens mismatch: second={second_usage['prompt_tokens']} "
+             f"!= first={first_usage['prompt_tokens']}")
+        assert second_usage["completion_tokens"] == max_tokens, \
+            (f"{endpoint} completion_tokens mismatch: "
+             f"got={second_usage['completion_tokens']} expected={max_tokens}")
+        assert second_usage["total_tokens"] == (
+            second_usage["prompt_tokens"] + second_usage["completion_tokens"]), \
+            (f"{endpoint} total_tokens mismatch: "
+             f"got={second_usage['total_tokens']} expected="
+             f"{second_usage['prompt_tokens'] + second_usage['completion_tokens']}")
+
+        prompt_tokens_details = second_usage.get("prompt_tokens_details")
+        assert prompt_tokens_details is not None, \
+            f"{endpoint} second response missing prompt_tokens_details"
+        print(
+            f"[usage_check] {endpoint} prompt_tokens_details={prompt_tokens_details}"
+        )
+        assert prompt_tokens_details["cached_tokens"] == (
+            second_usage["prompt_tokens"] - 1), \
+            (f"{endpoint} cached_tokens mismatch: "
+             f"got={prompt_tokens_details['cached_tokens']} "
+             f"expected={second_usage['prompt_tokens'] - 1}")
+
+    async def check_usage():
+        async with aiohttp.ClientSession() as session:
+            for endpoint in ("completions", "chat/completions"):
+                first_response = await send_request(session, endpoint)
+                second_response = await send_request(session, endpoint)
+                validate_usage(endpoint, first_response, second_response)
+
+    asyncio.run(check_usage())
+
+
 # TODO: add test for disaggregated server prometheus metrics
 def fetch_prometheus_metrics(server_url: str):
     import requests
@@ -475,6 +598,7 @@ def setup_disagg_cluster(
     cwd: str | None = None,
     server_start_timeout: int = 300,
     schedule_style: str | None = None,
+    save_log: bool = False,
 ) -> tuple[dict[str, Any], list[ProcessWrapper], list[ProcessWrapper],
            ProcessWrapper, int, str]:
     """Load config, launch workers + disagg server, wait for ready.
@@ -541,7 +665,8 @@ def setup_disagg_cluster(
                                work_dir,
                                port=0,
                                device=device_ids,
-                               env=env))
+                               env=env,
+                               save_log=save_log))
             next_device += gpus_per_ctx
 
         for i in range(num_gen_instances):
@@ -554,7 +679,8 @@ def setup_disagg_cluster(
                                work_dir,
                                port=0,
                                device=device_ids,
-                               env=env))
+                               env=env,
+                               save_log=save_log))
             next_device += gpus_per_gen
 
         # Build minimal server config and launch
@@ -581,6 +707,7 @@ def setup_disagg_cluster(
         disagg_server = run_disagg_server(server_config,
                                           work_dir,
                                           server_port,
+                                          save_log=save_log,
                                           env=env,
                                           cwd=cwd)
 
@@ -603,9 +730,9 @@ def run_disaggregated_test(example_dir,
                            extra_endpoints_test=None,
                            model_path=None,
                            cwd=None,
-                           disagg_schedule_style=None):
+                           disagg_schedule_style=None,
+                           post_client_test=None):
     """Run disaggregated test using service discovery instead of MPI."""
-
     if mpi_disabled():
         pytest.skip(
             "https://nvbugs/5584607 Ray orchestrator is not supported with NIXL(DEFAULT) cache transceiver backend."
@@ -652,6 +779,8 @@ def run_disaggregated_test(example_dir,
             all_worker_procs,
             disagg_server.process,
             use_ray=True)
+        if post_client_test is not None:
+            post_client_test(server_url)
     finally:
         terminate(*ctx_workers, *gen_workers, disagg_server)
         shutil.rmtree(work_dir, ignore_errors=True)
@@ -920,9 +1049,14 @@ def test_disaggregated_overlap(disaggregated_test_root, llm_venv,
     setup_model_symlink(llm_venv, llama_model_root,
                         "TinyLlama/TinyLlama-1.1B-Chat-v1.0")
 
+    def post_client_test(server_url: str):
+        verify_usage_with_cache_reuse(server_url,
+                                      "TinyLlama/TinyLlama-1.1B-Chat-v1.0")
+
     run_disaggregated_test(disaggregated_example_root,
                            "overlap",
                            env=llm_venv._new_env,
+                           post_client_test=post_client_test,
                            model_path=llama_model_root,
                            cwd=llm_venv.get_working_directory())
 
@@ -944,13 +1078,18 @@ def test_disaggregated_overlap_gen_first(disaggregated_test_root,
             os.makedirs(os.path.dirname(dst), exist_ok=True)
             os.symlink(src, dst, target_is_directory=True)
 
+    def post_client_test(server_url: str):
+        verify_usage_with_cache_reuse(server_url,
+                                      "TinyLlama/TinyLlama-1.1B-Chat-v1.0")
+
     run_disaggregated_test(
         disaggregated_example_root,
         "overlap_gen_first" if ctx_pp == 1 else "overlap_gen_first_pp4",
         env=llm_venv._new_env,
         model_path=llama_model_root,
         cwd=llm_venv.get_working_directory(),
-        disagg_schedule_style="generation_first")
+        disagg_schedule_style="generation_first",
+        post_client_test=post_client_test)
 
 
 @pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
@@ -1736,6 +1875,8 @@ def run_disaggregated_aiperf(config_file,
                              server_start_timeout=1200,
                              input_tokens=128,
                              output_tokens=100,
+                             input_tokens_stddev=0,
+                             output_tokens_stddev=0,
                              concurrency=1,
                              endpoint_type='chat',
                              request_count=None,
@@ -1744,6 +1885,8 @@ def run_disaggregated_aiperf(config_file,
                              random_seed=100,
                              accuracy_test=False,
                              threshold=0.8,
+                             cancellation_rate=None,
+                             cancellation_delay=None,
                              env=None,
                              cwd=None):
     """Run disaggregated test with genai-perf for performance/stress testing.
@@ -1765,7 +1908,6 @@ def run_disaggregated_aiperf(config_file,
         env: Environment variables dict
         cwd: Working directory
     """
-
     cleanup_output_files()
     run_env = env.copy()
     run_env["UCX_TLS"] = get_ucx_tls()
@@ -1773,7 +1915,8 @@ def run_disaggregated_aiperf(config_file,
 
     config, ctx_workers, gen_workers, disagg_server, server_port, work_dir = \
         setup_disagg_cluster(config_file, model_name=model_path, env=run_env, cwd=cwd,
-                             server_start_timeout=server_start_timeout)
+                             server_start_timeout=server_start_timeout,
+                             save_log=True)
 
     server_host = config.get("hostname", "localhost")
     artifact_dir = os.path.join(cwd or ".", "benchmark-results")
@@ -1802,16 +1945,34 @@ def run_disaggregated_aiperf(config_file,
 
         # Add common parameters
         aiperf_cmd.extend([
-            '--url', f'{server_host}:{server_port}',
+            '--url',
+            f'{server_host}:{server_port}',
             '--synthetic-input-tokens-mean',
-            str(input_tokens), '--synthetic-input-tokens-stddev', '0',
+            str(input_tokens),
+            '--synthetic-input-tokens-stddev',
+            str(input_tokens_stddev),
             '--output-tokens-mean',
-            str(output_tokens), '--output-tokens-stddev', '0', '--extra-inputs',
-            f'max_tokens:{output_tokens}', '--extra-inputs',
-            f'min_tokens:{output_tokens}', '--extra-inputs', 'ignore_eos:true',
+            str(output_tokens),
+            '--output-tokens-stddev',
+            str(output_tokens_stddev),
+            '--extra-inputs',
+            'ignore_eos:true',
+        ])
+        # When output length is fixed (stddev == 0) pin max/min tokens so the
+        # server returns exactly output_tokens. When non-zero, let aiperf
+        # sample the per-request max_tokens from the mean/stddev distribution.
+        if output_tokens_stddev == 0:
+            aiperf_cmd.extend([
+                '--extra-inputs',
+                f'max_tokens:{output_tokens}',
+                '--extra-inputs',
+                f'min_tokens:{output_tokens}',
+            ])
+        aiperf_cmd.extend([
             '--concurrency',
-            str(concurrency), '--warmup-request-count',
-            str(warmup_request_count)
+            str(concurrency),
+            '--warmup-request-count',
+            str(warmup_request_count),
         ])
 
         # Use request-count or num-dataset-entries
@@ -1820,6 +1981,15 @@ def run_disaggregated_aiperf(config_file,
         else:
             # Default: use num-dataset-entries for compatibility
             aiperf_cmd.extend(['--num-dataset-entries', '64'])
+
+        if cancellation_rate is not None:
+            aiperf_cmd.extend(
+                ['--request-cancellation-rate',
+                 str(cancellation_rate)])
+        if cancellation_delay is not None:
+            aiperf_cmd.extend(
+                ['--request-cancellation-delay',
+                 str(cancellation_delay)])
 
         aiperf_cmd.extend(
             ['--random-seed',
@@ -1831,6 +2001,20 @@ def run_disaggregated_aiperf(config_file,
                    env=env,
                    poll_procs=all_worker_procs + [disagg_server.process])
 
+        # Catch cases where aiperf finished but the disagg cluster was unhealthy
+        # during the run (e.g. context-side hangs, KV transfer timeouts) which
+        # would otherwise be swallowed because aiperf records 500s as completed.
+        fatal_findings = scan_logs_for_fatal_errors(
+            [*ctx_workers, *gen_workers, disagg_server])
+        if fatal_findings:
+            summary = "\n".join(f"  {path}: " +
+                                ", ".join(f"{pat}={cnt}"
+                                          for pat, cnt in hits.items())
+                                for path, hits in fatal_findings.items())
+            raise AssertionError(
+                "Fatal error patterns detected in disaggregated worker/server "
+                f"logs:\n{summary}")
+
         if accuracy_test:
             accuracy_test_result, accuracy_value = run_accuracy_test(
                 model_path=model_path,
@@ -1841,33 +2025,46 @@ def run_disaggregated_aiperf(config_file,
                 max_gen_toks=256,
                 max_length=4096)
 
-            # only raise error if accuracy test passed and accuracy value is less than threshold
-            if accuracy_test_result and (accuracy_value < threshold):
+            if not accuracy_test_result:
+                raise AssertionError(
+                    "Accuracy test failed to complete (likely worker hang or "
+                    "crash); inspect saved logs under work_dir "
+                    f"({work_dir}): worker_ctx_*.log, worker_gen_*.log, "
+                    "disagg_server.log")
+            if accuracy_value < threshold:
                 raise AssertionError(
                     f"Accuracy test failed: accuracy value {accuracy_value} is less than test threshold {threshold}"
                 )
 
-    except Exception:
-        # Print outputs on error
-        logger.error("-------- Workers output (last 30 lines) --------")
-        try:
-            with open('output_workers.log', 'r') as f:
-                lines = f.read().split('\n')
-                for line in lines[-30:]:
-                    if line.strip():
-                        logger.error(line)
-        except FileNotFoundError:
-            pass
+            # Re-scan logs after the accuracy run to catch issues (e.g.
+            # cluster-not-ready, internal server errors) that only surfaced
+            # while lm_eval was driving the server.
+            fatal_findings = scan_logs_for_fatal_errors(
+                [*ctx_workers, *gen_workers, disagg_server])
+            if fatal_findings:
+                summary = "\n".join(f"  {path}: " +
+                                    ", ".join(f"{pat}={cnt}"
+                                              for pat, cnt in hits.items())
+                                    for path, hits in fatal_findings.items())
+                raise AssertionError(
+                    "Fatal error patterns detected in disaggregated "
+                    f"worker/server logs after accuracy run:\n{summary}")
 
-        logger.error("-------- Disagg server output (last 30 lines) --------")
-        try:
-            with open('output_disagg.log', 'r') as f:
-                lines = f.read().split('\n')
-                for line in lines[-30:]:
-                    if line.strip():
-                        logger.error(line)
-        except FileNotFoundError:
-            pass
+    except Exception:
+        # Print tail of each captured worker/server log to aid triage.
+        for proc in [*ctx_workers, *gen_workers, disagg_server]:
+            log_path = getattr(proc, "log_path", None)
+            if not log_path or not os.path.exists(log_path):
+                continue
+            logger.error(f"-------- {log_path} (last 30 lines) --------")
+            try:
+                from collections import deque
+                with open(log_path, "r", errors="replace") as f:
+                    for line in deque(f, maxlen=30):
+                        if line.strip():
+                            logger.error(line.rstrip())
+            except OSError:
+                pass
         raise
     finally:
         terminate(*ctx_workers, *gen_workers, disagg_server)
@@ -1944,6 +2141,19 @@ def run_accuracy_test(model_path: str, server_url: str, concurrency: int,
                                 timeout=timeout)
 
         print_info(f"Accuracy test result is: {result}")
+
+        # lm_eval's async request retry path crashes on certain transport-level
+        # errors with "UnboundLocalError: cannot access local variable 'outputs'".
+        # When this happens individual requests are silently dropped but the
+        # process can still exit 0, so the score is computed against a partial
+        # set. Treat the presence of this trace as an inconclusive run.
+        combined_output = (result.stdout or "") + (result.stderr or "")
+        if ("UnboundLocalError" in combined_output
+                and "outputs" in combined_output):
+            logger.warning(
+                "lm_eval reported UnboundLocalError on 'outputs' "
+                "(request retry crashed); treating accuracy run as failed")
+            return False, accuracy_value
 
         # Check if process completed successfully
         if result.returncode == 0:
@@ -2075,13 +2285,50 @@ def test_disaggregated_gpt_oss_120b_harmony(disaggregated_test_root,
     pytest.param(TestConfig(model_path='DeepSeek-R1/DeepSeek-R1-0528-FP4-v2',
                             test_desc='deepseek_r1_v2_fp4_stress',
                             request_count=35000,
-                            accuracy_threshold=0.92),
+                            accuracy_threshold=0.92,
+                            cancellation_rate=10,
+                            cancellation_delay=0.5),
+                 marks=(pytest.mark.skip_less_device(8), skip_pre_blackwell)),
+    pytest.param(TestConfig(model_path='DeepSeek-R1/DeepSeek-R1-0528-FP4-v2',
+                            test_desc='deepseek_r1_v2_fp4_mtp_stress',
+                            request_count=35000,
+                            accuracy_threshold=0.90,
+                            cancellation_rate=10,
+                            cancellation_delay=0.5),
                  marks=(pytest.mark.skip_less_device(8), skip_pre_blackwell)),
     pytest.param(TestConfig(model_path='gpt_oss/gpt-oss-120b',
                             test_desc='gpt_oss_120b_stress',
                             request_count=60000,
-                            accuracy_threshold=0.42),
+                            accuracy_threshold=0.42,
+                            cancellation_rate=10,
+                            cancellation_delay=0.5),
                  marks=(pytest.mark.skip_less_device(4), skip_pre_blackwell)),
+    pytest.param(
+        TestConfig(
+            model_path='gpt_oss/gpt-oss-120b',
+            test_desc='gpt_oss_120b_eagle_stress',
+            request_count=60000,
+            accuracy_threshold=0.42,
+            speculative_model_path='gpt_oss/gpt-oss-120b-Eagle3',
+            cancellation_rate=10,
+            cancellation_delay=0.5,
+        ),
+        marks=(pytest.mark.skip_less_device(8), skip_pre_hopper),
+    ),
+    pytest.param(TestConfig(model_path='gpt_oss/gpt-oss-120b',
+                            test_desc='gpt_oss_120b_cutlass_stress',
+                            request_count=60000,
+                            accuracy_threshold=0.42,
+                            cancellation_rate=10,
+                            cancellation_delay=0.5),
+                 marks=(pytest.mark.skip_less_device(4), skip_pre_hopper)),
+    pytest.param(TestConfig(model_path='Qwen3.5-4B-FP8',
+                            test_desc='qwen3_5_4b_fp8_stress',
+                            request_count=3000,
+                            accuracy_threshold=0.72,
+                            cancellation_rate=10,
+                            cancellation_delay=0.5),
+                 marks=(pytest.mark.skip_less_device(2), skip_no_hopper)),
 ],
                          ids=lambda x: x.test_desc)
 @pytest.mark.parametrize("concurrency", [512], ids=lambda x: f"conc{x}")
@@ -2102,11 +2349,36 @@ def test_disaggregated_stress_test(disaggregated_test_root,
     config_file = get_test_config(test_desc, disaggregated_example_root,
                                   os.path.dirname(__file__))
 
+    # Resolve speculative_model to an absolute path for worker processes.
+    if test_config.speculative_model_path is not None:
+        spec_model_dir = f"{llm_models_root()}/{test_config.speculative_model_path}"
+        setup_model_symlink(llm_venv, spec_model_dir,
+                            test_config.speculative_model_path)
+        with open(config_file, 'r') as f:
+            patched_config = yaml.safe_load(f)
+        patched_sections = []
+        for section in ('context_servers', 'generation_servers'):
+            spec = patched_config.get(section, {}).get('speculative_config')
+            if spec is not None and 'speculative_model' in spec:
+                spec['speculative_model'] = spec_model_dir
+                patched_sections.append(section)
+        if not patched_sections:
+            raise AssertionError(
+                f"{test_desc} sets speculative_model_path, but no "
+                "speculative_config.speculative_model field was patched")
+        patched_path = os.path.join(llm_venv.get_working_directory(),
+                                    f"{test_desc}_patched.yaml")
+        with open(patched_path, 'w') as f:
+            yaml.safe_dump(patched_config, f)
+        config_file = patched_path
+
     run_disaggregated_aiperf(config_file=config_file,
                              model_path=model_dir,
                              server_start_timeout=7200,
                              input_tokens=input_tokens,
                              output_tokens=output_tokens,
+                             input_tokens_stddev=0,
+                             output_tokens_stddev=output_tokens // 10,
                              concurrency=concurrency,
                              endpoint_type='completions',
                              request_count=test_config.request_count,
@@ -2114,6 +2386,8 @@ def test_disaggregated_stress_test(disaggregated_test_root,
                              streaming=False,
                              accuracy_test=True,
                              threshold=test_config.accuracy_threshold,
+                             cancellation_rate=test_config.cancellation_rate,
+                             cancellation_delay=test_config.cancellation_delay,
                              env=llm_venv._new_env,
                              cwd=llm_venv.get_working_directory())
 
