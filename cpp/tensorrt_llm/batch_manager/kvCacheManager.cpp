@@ -25,6 +25,7 @@
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/common/memoryUtils.h"
+#include "tensorrt_llm/common/stringUtils.h"
 #include "tensorrt_llm/executor/executor.h"
 #include "tensorrt_llm/kernels/kvCacheIndex.h"
 #include "tensorrt_llm/runtime/common.h"
@@ -990,6 +991,8 @@ void WindowBlockManager::storeContextBlocks(GenerationRequest& sequence, LlmRequ
     auto const& beamBlockIds = cacheBlockIds[beamIdx];
     std::vector<BlockPtr> beam0Blocks;
     beam0Blocks.reserve(std::min<std::size_t>(beamBlockIds.size(), blockKeys.size()));
+    std::vector<KVCacheBlock::IdType> contextBlockIds;
+    contextBlockIds.reserve(std::min<std::size_t>(beamBlockIds.size(), blockKeys.size()));
     for (std::size_t i = 0; i < beamBlockIds.size() && i < blockKeys.size(); ++i)
     {
         auto block = getBlockById(beamBlockIds[i]);
@@ -997,9 +1000,17 @@ void WindowBlockManager::storeContextBlocks(GenerationRequest& sequence, LlmRequ
         {
             break;
         }
+        contextBlockIds.push_back(block->getBlockId());
         beam0Blocks.push_back(std::move(block));
     }
     blockKeys.resize(beam0Blocks.size());
+    if (!llmRequest.isContextOnlyRequest() && !llmRequest.isGenerationOnlyRequest())
+    {
+        TLLM_LOG_DEBUG(
+            "%s::storeContextBlocks - aggregated serving context block ids: requestId=%lu, windowSize=%d, beamIdx=%d, "
+            "blockIds=%s",
+            mLogPrefix.c_str(), llmRequest.mRequestId, mWindowSize, beamIdx, tc::vec2str(contextBlockIds).c_str());
+    }
     (void) storeBlocks(std::move(blockKeys), beam0Blocks);
 }
 
