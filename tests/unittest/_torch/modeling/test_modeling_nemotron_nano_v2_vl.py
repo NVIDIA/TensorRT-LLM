@@ -69,15 +69,43 @@ def test_nemotron_nano_registers_native_multimodal_epd_components():
     assert NemotronH_Nano_VL_V2.support_mm_disagg is True
 
 
-def test_nemotron_nano_epd_handoff_preserves_non_contiguous_video_runs():
-    """Split video prompt runs stay grouped under one MM item."""
+def _assert_nano_video_handoff(handoff):
+    """Shared assertions for the EPD video handoff: split runs stay grouped under one MM item."""
+    assert handoff.prompt_token_ids == [101, 30, 20, 20, 31, 55, 30, 20, 20, 31, 102]
+    assert handoff.multimodal_lengths == [8]
+    assert handoff.multimodal_positions == [1]
+    assert handoff.multimodal_embedding_lengths == [4]
+    assert handoff.multimodal_item_run_cu_offsets == [0, 2]
+    assert handoff.multimodal_run_positions == [1, 6]
+    assert handoff.multimodal_run_lengths == [4, 4]
+    assert handoff.special_token_offsets == [0, 3, 4, 7]
+
+
+@pytest.mark.parametrize(
+    "input_field, input_value, asserts_encode_not_called",
+    [
+        # Detokenized prompt text path: the tokenizer may encode the prompt.
+        ("prompt", "Question <video> answer", False),
+        # Tokenized handoff path: prompt text is absent, so encode must not be called.
+        ("prompt_token_ids", [101, 98, 102], True),
+    ],
+    ids=["prompt", "prompt_token_ids"],
+)
+def test_nemotron_nano_epd_handoff_preserves_non_contiguous_video_runs(
+    input_field, input_value, asserts_encode_not_called
+):
+    """Split video prompt runs stay grouped under one MM item, with or without prompt text."""
     processor = object.__new__(NanoV2VLInputProcessor)
     processor._config = SimpleNamespace(
         llm_config=SimpleNamespace(vocab_size=1000, hidden_size=16),
     )
-    processor._tokenizer = SimpleNamespace(
-        encode=MagicMock(return_value=[101, 98, 102]),
-    )
+    if asserts_encode_not_called:
+        # In the tokenized path the tokenizer must never be invoked; a side effect
+        # turns any accidental call into a hard failure.
+        encode_mock = MagicMock(side_effect=AssertionError("tokenizer should not be called"))
+    else:
+        encode_mock = MagicMock(return_value=[101, 98, 102])
+    processor._tokenizer = SimpleNamespace(encode=encode_mock)
     processor.img_context_token_id = 20
     processor._img_start_token_ids = [30]
     processor._img_end_token_ids = [31]
@@ -93,66 +121,31 @@ def test_nemotron_nano_epd_handoff_preserves_non_contiguous_video_runs():
     video = VideoData(frames=[object()], metadata={}, audio=None)
     handoff = processor.build_disagg_prefill_multimodal_inputs(
         {
-            "prompt": "Question <video> answer",
+            input_field: input_value,
             "multi_modal_data": {"video": [video]},
         },
         [{"tensor_size": (4, 16)}],
     )
 
-    assert handoff.prompt_token_ids == [101, 30, 20, 20, 31, 55, 30, 20, 20, 31, 102]
-    assert handoff.multimodal_lengths == [8]
-    assert handoff.multimodal_positions == [1]
-    assert handoff.multimodal_embedding_lengths == [4]
-    assert handoff.multimodal_item_run_cu_offsets == [0, 2]
-    assert handoff.multimodal_run_positions == [1, 6]
-    assert handoff.multimodal_run_lengths == [4, 4]
-    assert handoff.special_token_offsets == [0, 3, 4, 7]
+    if asserts_encode_not_called:
+        processor._tokenizer.encode.assert_not_called()
+        processor.expand_prompt_token_ids_for_mm.assert_called_once()
+        assert processor.expand_prompt_token_ids_for_mm.call_args.args[0] == [101, 98, 102]
+    _assert_nano_video_handoff(handoff)
 
 
-def test_nemotron_nano_epd_handoff_accepts_prompt_token_ids_without_prompt():
-    """Tokenized EPD handoff does not require detokenized prompt text."""
-    processor = object.__new__(NanoV2VLInputProcessor)
-    processor._config = SimpleNamespace(
-        llm_config=SimpleNamespace(vocab_size=1000, hidden_size=16),
-    )
-    processor._tokenizer = SimpleNamespace(
-        encode=MagicMock(side_effect=AssertionError("tokenizer should not be called")),
-    )
-    processor.img_context_token_id = 20
-    processor._img_start_token_ids = [30]
-    processor._img_end_token_ids = [31]
-    processor._sound_context_token_id = None
-    processor._sound_start_token_id = None
-    processor._sound_end_token_id = None
-
-    processor.get_num_tokens_per_video = MagicMock(return_value=8)
-    expand_mock = MagicMock(return_value=([101, 30, 20, 20, 31, 55, 30, 20, 20, 31, 102], None))
-    processor.expand_prompt_token_ids_for_mm = expand_mock
-
-    video = VideoData(frames=[object()], metadata={}, audio=None)
-    handoff = processor.build_disagg_prefill_multimodal_inputs(
-        {
-            "prompt_token_ids": [101, 98, 102],
-            "multi_modal_data": {"video": [video]},
-        },
-        [{"tensor_size": (4, 16)}],
-    )
-
-    processor._tokenizer.encode.assert_not_called()
-    expand_mock.assert_called_once()
-    assert expand_mock.call_args.args[0] == [101, 98, 102]
-    assert handoff.prompt_token_ids == [101, 30, 20, 20, 31, 55, 30, 20, 20, 31, 102]
-    assert handoff.multimodal_lengths == [8]
-    assert handoff.multimodal_positions == [1]
-    assert handoff.multimodal_embedding_lengths == [4]
-    assert handoff.multimodal_item_run_cu_offsets == [0, 2]
-    assert handoff.multimodal_run_positions == [1, 6]
-    assert handoff.multimodal_run_lengths == [4, 4]
-    assert handoff.special_token_offsets == [0, 3, 4, 7]
-
-
-def test_nemotron_nano_loads_multimodal_encoder_for_normal_worker():
-    """Normal workers load the vision encoder needed for raw MM prefill."""
+@pytest.mark.parametrize(
+    "env_value, expects_encoder",
+    [
+        # Normal worker: the vision encoder must be built and loaded for raw MM prefill.
+        ("0", True),
+        # MM E/P/D full-model worker: consumes attached embeddings, so the encoder is deferred.
+        ("1", False),
+    ],
+    ids=["normal_worker", "mm_epd_worker"],
+)
+def test_nemotron_nano_multimodal_encoder_load_by_worker_role(env_value, expects_encoder):
+    """Encoder load depends on whether the worker runs raw MM prefill or consumes embeddings."""
     fake_encoder = MagicMock()
     fake_encoder.eval.return_value = fake_encoder
     fake_encoder.to.return_value = fake_encoder
@@ -175,44 +168,17 @@ def test_nemotron_nano_loads_multimodal_encoder_for_normal_worker():
     }
 
     with (
-        mock.patch.dict(os.environ, {"TLLM_MULTIMODAL_DISAGGREGATED": "0"}),
+        mock.patch.dict(os.environ, {"TLLM_MULTIMODAL_DISAGGREGATED": env_value}),
         mock.patch.object(nemotron_nano, "NanoV2VLVisionEncoder", vision_encoder_cls),
         mock.patch.object(nemotron_nano, "NemotronHHfWeightMapper", mapper_cls),
     ):
         NemotronH_Nano_VL_V2.load_weights(model, weights)
 
-    vision_encoder_cls.assert_called_once_with(model._mm_model_config)
-    fake_encoder.load_weights.assert_called_once_with(weights)
-
-
-def test_nemotron_nano_defers_multimodal_encoder_for_mm_epd_worker():
-    """MM E/P/D full-model workers consume attached embeddings instead of raw encoders."""
-    vision_encoder_cls = MagicMock()
-
-    fake_mapper = MagicMock()
-    mapper_cls = MagicMock(return_value=fake_mapper)
-
-    model = SimpleNamespace(
-        _mm_model_config=_make_minimal_nano_model_config(),
-        vision_encoder=None,
-        sound_encoder=None,
-        llm=MagicMock(),
-        model_config=SimpleNamespace(),
-    )
-    weights = {
-        "vision_model.weight": torch.empty(0),
-        "mlp1.weight": torch.empty(0),
-        "language_model.weight": torch.empty(0),
-    }
-
-    with (
-        mock.patch.dict(os.environ, {"TLLM_MULTIMODAL_DISAGGREGATED": "1"}),
-        mock.patch.object(nemotron_nano, "NanoV2VLVisionEncoder", vision_encoder_cls),
-        mock.patch.object(nemotron_nano, "NemotronHHfWeightMapper", mapper_cls),
-    ):
-        NemotronH_Nano_VL_V2.load_weights(model, weights)
-
-    vision_encoder_cls.assert_not_called()
+    if expects_encoder:
+        vision_encoder_cls.assert_called_once_with(model._mm_model_config)
+        fake_encoder.load_weights.assert_called_once_with(weights)
+    else:
+        vision_encoder_cls.assert_not_called()
 
 
 def test_nemotron_nano_rejects_evs_attached_video_embeddings():
