@@ -60,6 +60,16 @@ def _has_sparse_tensor(tensor: torch.Tensor) -> bool:
     return tensor is not None and tensor.numel() > 0
 
 
+def _clear_multi_ctas_kv_counter_workspace(
+    fmha_workspace: torch.Tensor,
+    num_heads: int,
+    max_num_requests: int,
+    multi_processor_count: Optional[int],
+) -> None:
+    counter_size = max(num_heads * max_num_requests, multi_processor_count or 0)
+    fmha_workspace.narrow(0, 0, counter_size).zero_()
+
+
 @lru_cache(maxsize=128)
 def _get_context_workspace_layout(
     dtype: torch.dtype,
@@ -222,6 +232,7 @@ class FmhaParams:
     # Context-only fields
     batch_size: int = 0
     # Generation-only fields
+    max_num_requests: int = 0
     beam_width: int = 1
     num_requests: int = 0
     predicted_tokens_per_seq: int = 1
@@ -754,6 +765,7 @@ class FlashInferTrtllmGenAttention:
             paged_context_fmha=meta.use_paged_context_fmha,
             kv_factor=self._kv_factor,
             total_num_blocks=total_num_blocks,
+            max_num_requests=max_num_requests,
         )
 
         sequence_length = meta.kv_lens_cuda_runtime
@@ -902,7 +914,6 @@ class FlashInferTrtllmGenAttention:
             params.kv_cache_quant_mode,  # kv_cache_quant_mode
             params.max_attention_window_size,  # max_attention_window_size
             params.cyclic_attention_window_size,  # cyclic_attention_window_size
-            params.sink_token_length,  # sink_token_length
             params.num_tokens,  # num_tokens
             params.batch_size,  # batch_size
             params.input_seq_length,  # input_seq_length
@@ -990,7 +1001,6 @@ class FlashInferTrtllmGenAttention:
             params.kv_cache_quant_mode,  # kv_cache_quant_mode
             params.max_attention_window_size,  # max_attention_window_size
             params.cyclic_attention_window_size,  # cyclic_attention_window_size
-            params.sink_token_length,  # sink_token_length
             params.num_tokens,  # num_tokens
             params.batch_size,  # batch_size
             params.input_seq_length,  # input_seq_length
@@ -1050,7 +1060,6 @@ class FlashInferTrtllmGenAttention:
             params.kv_cache_quant_mode,  # kv_cache_quant_mode
             params.max_attention_window_size,  # max_attention_window_size
             params.cyclic_attention_window_size,  # cyclic_attention_window_size
-            params.sink_token_length,  # sink_token_length
             params.num_tokens,  # num_tokens
             batch_beam,  # batch_beam
             params.input_seq_length,  # input_seq_length
@@ -1070,6 +1079,13 @@ class FlashInferTrtllmGenAttention:
             params.total_num_blocks,  # total_num_blocks
             params.kv_factor,  # kv_factor
             True,  # need_build_kv_cache_metadata
+        )
+
+        _clear_multi_ctas_kv_counter_workspace(
+            fmha_workspace,
+            self._num_heads,
+            params.max_num_requests,
+            self._multi_processor_count,
         )
 
         q_len_per_req = None if is_multi_token_gen else params.input_seq_length

@@ -50,15 +50,6 @@ using tensorrt_llm::runtime::TorchUtils;
 namespace
 {
 
-// FlashInfer's trtllm-gen launcher keeps a fixed 8 MiB counter slab at the head of the workspace:
-//   8192 batches * 256 counter slots per batch * sizeof(uint32_t).
-// The fixed reservation is a workspace-layout contract; it is not the amount that every launch
-// actually touches.
-constexpr int64_t kFlashinferTrtllmGenMaxBatchSize = 8192;
-constexpr int64_t kFlashinferTrtllmGenMaxCounterSlotsPerBatch = 256;
-constexpr size_t kFlashinferTrtllmGenCounterWorkspaceSize = static_cast<size_t>(kFlashinferTrtllmGenMaxBatchSize)
-    * static_cast<size_t>(kFlashinferTrtllmGenMaxCounterSlotsPerBatch) * sizeof(uint32_t);
-
 int64_t computeWindowLeft(
     int64_t const cyclicAttentionWindowSize, int64_t const maxKvLength, int64_t const attentionChunkSize)
 {
@@ -86,47 +77,6 @@ T const* optPtr(OptTensorT&& t, std::enable_if_t<std::is_const_v<OptTensorT>>* =
 cudaStream_t currentStreamFor(at::Tensor const& tensor)
 {
     return at::cuda::getCurrentCUDAStream(tensor.get_device()).stream();
-}
-
-inline size_t computeFlashinferTrtllmGenCounterWorkspaceBytes(int64_t const batchSize)
-{
-    TORCH_CHECK(batchSize >= 0, "Batch size must be non-negative.");
-    if (batchSize == 0)
-    {
-        return 0;
-    }
-
-    // FlashInfer places multi-CTA-KV counters at the beginning of the trtllm-gen workspace. The
-    // generator indexes them as:
-    //   ((batchIdx * numCtasForAllHeads + headCtaIdx) * maxNumCtasQ + ctaIdxQ).
-    // The exact per-batch width depends on kernel selection details such as grouped heads, spec
-    // decode maxNumCtasQ, and V head-dim splitting. FlashInfer reserves 256 counter slots per
-    // batch as the ABI bound, so clear the whole active-batch row instead of trying to mirror those
-    // kernel heuristics here. This is conservative but still tiny for decode batches
-    // (batch=8 => 8 KiB, rather than the old fixed 8 MiB).
-    //
-    // The trtllm-gen kernel self-resets touched counters to zero at successful completion with
-    // atom.inc wraparound. We still clear the touched prefix before every launch, including CUDA
-    // graph capture: graph replay can otherwise observe a dirty counter after an interrupted run or
-    // overlap pattern and crash much later at an unrelated synchronization point. The optimization
-    // here is therefore only the clear size, not the clear frequency. MLA generation uses a separate
-    // path.
-    auto const counterBytes = static_cast<size_t>(batchSize)
-        * static_cast<size_t>(kFlashinferTrtllmGenMaxCounterSlotsPerBatch) * sizeof(uint32_t);
-    return counterBytes < kFlashinferTrtllmGenCounterWorkspaceSize ? counterBytes
-                                                                   : kFlashinferTrtllmGenCounterWorkspaceSize;
-}
-
-inline void zeroFlashinferTrtllmGenCounterWorkspaceAsync(
-    at::Tensor const& workspace, size_t const counterWorkspaceBytes, cudaStream_t stream)
-{
-    auto const workspaceBytes = static_cast<size_t>(workspace.nbytes());
-    auto const counterBytes = workspaceBytes < counterWorkspaceBytes ? workspaceBytes : counterWorkspaceBytes;
-    if (counterBytes == 0)
-    {
-        return;
-    }
-    check_cuda_error(cudaMemsetAsync(workspace.data_ptr(), 0, counterBytes, stream));
 }
 
 struct WorkspaceAccessor
@@ -799,10 +749,6 @@ trtllmGenGenerationPreprocess(torch::Tensor qkv_input, torch::Tensor workspace, 
     }
 
     auto qProcessed = views.qBuf.view({num_tokens, num_heads, head_size});
-    // Keep this memset scoped to the active batch rows. FlashInfer still expects the fixed 8 MiB
-    // counter slab to exist at workspace offset 0; the inactive batch rows do not need clearing.
-    auto const counterWorkspaceBytes = computeFlashinferTrtllmGenCounterWorkspaceBytes(batch_beam);
-    zeroFlashinferTrtllmGenCounterWorkspaceAsync(views.trtllmGenWorkspace, counterWorkspaceBytes, stream);
 
     auto const windowLeft = computeWindowLeft(cyclic_attention_window_size, max_past_kv_length, attention_chunk_size);
     return {qProcessed, kvPool, blockTables, kvScalePool, views.bmm1Scale, views.bmm2Scale, views.trtllmGenWorkspace,
