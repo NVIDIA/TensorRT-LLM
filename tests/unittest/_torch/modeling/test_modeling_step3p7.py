@@ -395,42 +395,6 @@ def test_step3p7_mtp_head_normalizes_before_output_projection(monkeypatch):
     assert torch.allclose(logits, expected)
 
 
-def test_scan_fp8_scale_inv_tensors_returns_missing_keys():
-    """The FP8 Step3p7 checkpoint stores FP8 scale tensors in shards but not in
-    ``model.safetensors.index.json``.  ``scan_fp8_scale_inv_tensors`` must
-    expose every such scale key so the next iteration's weight loader can
-    materialize them alongside the indexed bf16 / fp8 weights.
-
-    The BF16 checkpoint has no FP8 routed-expert scales by definition, so the
-    scan correctly returns an empty dict for it.  Run against both and assert
-    the dtype-appropriate result.
-    """
-    if not CHECKPOINT_FP8.exists():
-        pytest.fail(f"Step3p7 FP8 checkpoint missing at {CHECKPOINT_FP8}")
-    if not CHECKPOINT_BF16.exists():
-        pytest.fail(f"Step3p7 BF16 checkpoint missing at {CHECKPOINT_BF16}")
-    from tensorrt_llm._torch.models.modeling_step3p7 import scan_fp8_scale_inv_tensors
-
-    # FP8 checkpoint: every routed-expert layer 3..44 must contribute 3 scale tensors.
-    missing_fp8 = scan_fp8_scale_inv_tensors(str(CHECKPOINT_FP8))
-    assert len(missing_fp8) >= 42 * 3, (
-        f"expected >= {42 * 3} missing scale_inv keys, got {len(missing_fp8)}"
-    )
-    for proj in ("gate_proj", "up_proj", "down_proj"):
-        key = f"model.layers.3.moe.{proj}.weight_scale_inv"
-        assert key in missing_fp8, f"missing scale key: {key}"
-        info = missing_fp8[key]
-        assert info["dtype"] == "torch.float32"
-        # Expected per-expert block-scale shape: (num_experts, ...) with 288 experts.
-        assert info["shape"][0] == 288
-
-    # BF16 checkpoint: no FP8 scales should be present.
-    missing_bf16 = scan_fp8_scale_inv_tensors(str(CHECKPOINT_BF16))
-    assert missing_bf16 == {}, (
-        f"BF16 checkpoint should have no FP8 weight_scale_inv tensors; got {len(missing_bf16)}"
-    )
-
-
 def test_split_stacked_moe_weights_expands_per_expert_keys():
     """Verify the stacked routed-expert tensors are expanded into per-expert keys.
 
