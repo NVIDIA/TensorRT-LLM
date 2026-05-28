@@ -2924,6 +2924,11 @@ class PyExecutor:
                     # causing _sample_async to fail when accessing context_chunk_size property.
                     self._handle_guided_decoder_errors(
                         scheduled_batch, guided_decoder_failed_requests)
+                    # _update_request_states() can terminate attention-DP
+                    # dummy requests, which frees V2 KV pages and overwrites
+                    # host page-index entries with BAD_PAGE_INDEX. Wait until
+                    # the current input preparation has consumed those buffers.
+                    self.model_engine.wait_for_input_copy()
                     self._update_request_states(scheduled_batch)
 
                     # Update context requests' KV cache so that sliding-window
@@ -2938,6 +2943,10 @@ class PyExecutor:
                 if self.previous_batch is not None and should_process_previous_batch:
                     self._commit_kv_cache_stats(
                         self.previous_batch.scheduled_requests)
+                    # _process_previous_batch may terminate requests or resize
+                    # generation KV caches, both of which can mutate V2 page
+                    # indices used by the current batch's input preparation.
+                    self.model_engine.wait_for_input_copy()
                     self._process_previous_batch()
                     self.perf_manager.compute_batch_gpu_times(
                         self.previous_batch.scheduled_requests.all_requests())
