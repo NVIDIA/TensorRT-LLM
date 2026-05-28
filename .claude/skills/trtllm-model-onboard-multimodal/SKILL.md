@@ -208,7 +208,7 @@ Read `config.json`'s `architectures` and `model_type`. If a `_torch/models/model
 
 ### Phase 2 — Model wrapper
 
-Create `tensorrt_llm/_torch/models/modeling_{name}.py`. The default pattern below mirrors `modeling_llava_next.py` and `modeling_gemma3vl.py` — a single wrapper class that composes a multimodal encoder + an LLM resolved through `AutoModelForCausalLM.from_config(text_config)`. The `*ModelBase + *Model` Base/non-Base split in `modeling_qwen2vl.py` and `modeling_qwen3vl.py` is an implementation detail for sharing one wrapper between two variants of the same family (Qwen2-VL ↔ Qwen2.5-VL; Qwen3-VL ↔ Qwen3-VL-MoE) — keep the wrapper a single class unless you have the same multi-variant need. Import `_is_mm_disagg` from `modeling_multimodal_utils` instead of defining a model-local environment helper.
+Create `tensorrt_llm/_torch/models/modeling_{name}.py`. The default pattern below mirrors `modeling_llava_next.py` and `modeling_gemma3vl.py` — a single wrapper class that composes a multimodal encoder + an LLM resolved through `AutoModelForCausalLM.from_config(text_config)`. The `*ModelBase + *Model` Base/non-Base split in `modeling_qwen2vl.py` and `modeling_qwen3vl.py` is an implementation detail for sharing one wrapper between two variants of the same family (Qwen2-VL ↔ Qwen2.5-VL; Qwen3-VL ↔ Qwen3-VL-MoE) — keep the wrapper a single class unless you have the same multi-variant need.
 
 ```python
 class {Name}VisionModel(nn.Module):
