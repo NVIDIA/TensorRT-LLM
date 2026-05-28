@@ -127,15 +127,15 @@ class TestBaseWorkerSleepGuards:
 
 
 # ---------------------------------------------------------------------------
-# _multi_rank_sleep_wakeup serialisation via _control_action_lock
+# _multi_rank_sleep_wakeup serialisation via _sleep_wakeup_lock
 # ---------------------------------------------------------------------------
 
 
 class TestMultiRankSleepWakeupLock:
-    """Verify that _multi_rank_sleep_wakeup holds engine._control_action_lock.
+    """Verify that _multi_rank_sleep_wakeup holds engine._sleep_wakeup_lock.
 
     The lock prevents two concurrent RPC calls from interleaving their
-    control_action + _control_comm send/recv sequences.  We test this by
+    control_action + _sleep_wakeup_comm send/recv sequences.  We test this by
     spying on the lock's __enter__/__exit__ calls while driving
     _multi_rank_sleep_wakeup directly (bypassing the sleep/wakeup dispatch
     layer), with all MPI/CUDA machinery stubbed out.
@@ -172,7 +172,7 @@ class TestMultiRankSleepWakeupLock:
                 lock_events.append("release")
                 return real_lock.__exit__(*args)
 
-        # Stub out _control_comm; send/recv are no-ops, recv returns ok ACK.
+        # Stub out _sleep_wakeup_comm; send/recv are no-ops, recv returns ok ACK.
         mock_comm = SimpleNamespace(
             send=lambda *a, **kw: None,
             recv=lambda *a, **kw: {"status": "ok"},
@@ -183,15 +183,15 @@ class TestMultiRankSleepWakeupLock:
             yield None
 
         w.engine = SimpleNamespace(
-            _control_action_lock=SpyLock(),
-            _control_comm=mock_comm,
+            _sleep_wakeup_lock=SpyLock(),
+            _sleep_wakeup_comm=mock_comm,
             control_action=_noop_control_action,
         )
 
         return w, lock_events
 
     def test_lock_acquired_and_released(self):
-        """_control_action_lock must be acquired before and released after.
+        """_sleep_wakeup_lock must be acquired before and released after.
 
         Covers the full control_action + send/recv sequence.
         """
@@ -246,7 +246,7 @@ class TestMultiRankSleepWakeupLock:
             time.sleep(0.01)
             inside.clear()
 
-        w.engine._control_comm.send = slow_send
+        w.engine._sleep_wakeup_comm.send = slow_send
         barrier = threading.Barrier(2)
         thread_exceptions: list = []
 
@@ -277,7 +277,7 @@ class TestMultiRankSleepWakeupLock:
             )
         assert not overlap_detected.is_set(), (
             "Two _multi_rank_sleep_wakeup calls overlapped in the critical "
-            "section; _control_action_lock is not being held correctly."
+            "section; _sleep_wakeup_lock is not being held correctly."
         )
 
 
@@ -287,7 +287,7 @@ class TestMultiRankSleepWakeupLock:
 
 
 def _make_proto_worker(recv_responses, world_size=3):
-    """Return a BaseWorker shell whose _control_comm drives recv_responses.
+    """Return a BaseWorker shell whose _sleep_wakeup_comm drives recv_responses.
 
     ``recv_responses`` is a list consumed left-to-right by each recv() call.
     send() is a no-op.  The engine has a real Lock and a no-op control_action.
@@ -320,8 +320,8 @@ def _make_proto_worker(recv_responses, world_size=3):
         yield None
 
     w.engine = SimpleNamespace(
-        _control_action_lock=threading.Lock(),
-        _control_comm=SimpleNamespace(send=lambda *a, **kw: None, recv=fake_recv),
+        _sleep_wakeup_lock=threading.Lock(),
+        _sleep_wakeup_comm=SimpleNamespace(send=lambda *a, **kw: None, recv=fake_recv),
         control_action=_noop_control_action,
     )
     return w, recv_calls
@@ -455,14 +455,14 @@ class TestMultiRankRank0LocalFailureDrainsAcks:
 
 
 class TestSingleRankLockAcquired:
-    """sleep() / wakeup() with world_size == 1 must also hold engine._control_action_lock.
+    """sleep() / wakeup() with world_size == 1 must also hold engine._sleep_wakeup_lock.
 
     The same Event-barrier race exists on the single-rank path.
     """
 
     @pytest.mark.parametrize("method", ["sleep", "wakeup"])
     def test_single_rank_acquires_lock(self, method):
-        """The world_size == 1 branch enters _control_action_lock."""
+        """The world_size == 1 branch enters _sleep_wakeup_lock."""
         import threading
         from contextlib import contextmanager
         from unittest.mock import patch
@@ -493,7 +493,7 @@ class TestSingleRankLockAcquired:
             yield None
 
         w.engine = SimpleNamespace(
-            _control_action_lock=SpyLock(),
+            _sleep_wakeup_lock=SpyLock(),
             control_action=_noop_control_action,
         )
 
@@ -506,7 +506,7 @@ class TestSingleRankLockAcquired:
         ):
             getattr(w, method)(["kv_cache"])
 
-        assert lock_entered, f"{method}() with world_size=1 did not acquire _control_action_lock"
+        assert lock_entered, f"{method}() with world_size=1 did not acquire _sleep_wakeup_lock"
 
 
 # ---------------------------------------------------------------------------

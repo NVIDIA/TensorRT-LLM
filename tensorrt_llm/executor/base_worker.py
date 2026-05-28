@@ -730,7 +730,7 @@ class BaseWorker(GenerationExecutor):
            rank-0's event loop.  Non-rank-0 event loops become idle (starved
            of NCCL collectives from rank-0) once the current iteration drains.
         2. Broadcast the control message to every non-rank-0 rank via the
-           dedicated ``_control_comm`` communicator.
+           dedicated ``_sleep_wakeup_comm`` communicator.
         3. Execute the VMM operation (``release_with_tag`` or
            ``materialize_with_tag``) locally on rank-0.
         4. Collect ACKs from all non-rank-0 ranks to confirm they have
@@ -743,30 +743,32 @@ class BaseWorker(GenerationExecutor):
                 values; forwarded verbatim to each rank's VMM call.
         """
         from tensorrt_llm._torch.pyexecutor.py_executor import (
-            _CONTROL_ACK_TAG, _CONTROL_ACTION_TAG)
+            _SLEEP_WAKEUP_ACK_TAG, _SLEEP_WAKEUP_ACTION_TAG, _SleepWakeupAction)
         from tensorrt_llm._torch.virtual_memory import (materialize_with_tag,
                                                         release_with_tag)
 
         assert self.rank == 0, (
             "_multi_rank_sleep_wakeup must only be called on rank 0")
 
-        control_comm = self.engine._control_comm
-        assert control_comm is not None, (
-            "_control_comm not initialised; was start_worker() called?")
+        sleep_wakeup_comm = self.engine._sleep_wakeup_comm
+        assert sleep_wakeup_comm is not None, (
+            "_sleep_wakeup_comm not initialised; was start_worker() called?")
 
         world_size = self.llm_args.parallel_config.world_size
         tag_strings = [t.value for t in tags]
-        msg = {"action": action, "tags": tag_strings}
+        msg = {"action": _SleepWakeupAction(action), "tags": tag_strings}
 
-        # Serialise concurrent control actions.  control_action() uses an
+        # Serialise concurrent sleep/wakeup calls.  control_action() uses an
         # Event-based barrier, not a mutex, so two concurrent callers can both
-        # pass the barrier and then interleave sends/recvs on _control_comm,
+        # pass the barrier and then interleave sends/recvs on _sleep_wakeup_comm,
         # consuming the wrong ACKs or resuming the event loop prematurely.
-        # _control_action_lock turns the whole sequence into a critical section.
-        with self.engine._control_action_lock, self.engine.control_action():
+        # _sleep_wakeup_lock turns the whole sequence into a critical section.
+        with self.engine._sleep_wakeup_lock, self.engine.control_action():
             # Broadcast control message to non-rank-0 listeners.
             for dest in range(1, world_size):
-                control_comm.send(msg, dest=dest, tag=_CONTROL_ACTION_TAG)
+                sleep_wakeup_comm.send(msg,
+                                       dest=dest,
+                                       tag=_SLEEP_WAKEUP_ACTION_TAG)
 
             # Execute locally on rank-0.  Only CUDA/VMM errors are captured
             # as local_error; unexpected exceptions bypass the except clause
@@ -774,7 +776,7 @@ class BaseWorker(GenerationExecutor):
             local_error = None
             try:
                 torch.cuda.synchronize()
-                if action == "sleep":
+                if action == _SleepWakeupAction.SLEEP:
                     release_with_tag(*tags)
                     torch.cuda.synchronize()
                     gc.collect()
@@ -786,7 +788,8 @@ class BaseWorker(GenerationExecutor):
                 local_error = (f"rank 0 '{action}' failed: {exc}\n"
                                f"{traceback.format_exc()}")
                 logger.error(
-                    f"_multi_rank_sleep_wakeup: rank-0 local {action} failed:",
+                    "_multi_rank_sleep_wakeup: rank-0 local %s failed:",
+                    action,
                     exc_info=True,
                 )
             finally:
@@ -796,7 +799,8 @@ class BaseWorker(GenerationExecutor):
                 if local_error:
                     errors.append(local_error)
                 for src in range(1, world_size):
-                    ack = control_comm.recv(source=src, tag=_CONTROL_ACK_TAG)
+                    ack = sleep_wakeup_comm.recv(source=src,
+                                                 tag=_SLEEP_WAKEUP_ACK_TAG)
                     if ack.get("status") != "ok":
                         errors.append(
                             ack.get("error")
@@ -848,7 +852,7 @@ class BaseWorker(GenerationExecutor):
         if self.llm_args.parallel_config.world_size > 1:
             self._multi_rank_sleep_wakeup("sleep", tags)
         else:
-            with self.engine._control_action_lock, self.engine.control_action():
+            with self.engine._sleep_wakeup_lock, self.engine.control_action():
                 torch.cuda.synchronize()
                 release_with_tag(*tags)
                 torch.cuda.synchronize()
@@ -886,7 +890,7 @@ class BaseWorker(GenerationExecutor):
         if self.llm_args.parallel_config.world_size > 1:
             self._multi_rank_sleep_wakeup("wakeup", tags)
         else:
-            with self.engine._control_action_lock, self.engine.control_action():
+            with self.engine._sleep_wakeup_lock, self.engine.control_action():
                 torch.cuda.synchronize()
                 materialize_with_tag(*tags)
                 torch.cuda.synchronize()
