@@ -269,8 +269,18 @@ def load_weights_fused_gate_up_helper(
         bias_transform=lambda x: x,
         allow_partial_loading: bool = False
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    # NOTE(debug-bot iter-18): W4A8 emitters publish the quantized weight under
+    # the key "weight_packed" (per modelopt naming) rather than "weight". Accept
+    # either so this helper works for both the unquantized and W4A8 paths.
+    def _weight_key(w):
+        if "weight" in w:
+            return "weight"
+        if "weight_packed" in w:
+            return "weight_packed"
+        return None
+
     if not allow_partial_loading:
-        assert all('weight' in weights[i] for i in range(2))
+        assert all(_weight_key(weights[i]) is not None for i in range(2))
         if module.bias is not None:
             assert all('bias' in weights[i] for i in range(2))
     else:
@@ -279,12 +289,14 @@ def load_weights_fused_gate_up_helper(
         ) is not None, "Fused weight shard indices mapping is required in partial loading"
     device = torch.device('cuda')
 
-    gate_weight = load_weight_shard(weights[0]['weight'], module.tp_size,
+    _gk = _weight_key(weights[0])
+    _uk = _weight_key(weights[1])
+    gate_weight = load_weight_shard(weights[0][_gk], module.tp_size,
                                     module.tp_rank, module.tp_mode,
-                                    device) if "weight" in weights[0] else None
-    up_weight = load_weight_shard(weights[1]['weight'], module.tp_size,
+                                    device) if _gk is not None else None
+    up_weight = load_weight_shard(weights[1][_uk], module.tp_size,
                                   module.tp_rank, module.tp_mode,
-                                  device) if "weight" in weights[1] else None
+                                  device) if _uk is not None else None
     if module.bias is not None:
         gate_bias = load_weight_shard(weights[0]['bias'], module.tp_size,
                                       module.tp_rank, module.tp_mode,
