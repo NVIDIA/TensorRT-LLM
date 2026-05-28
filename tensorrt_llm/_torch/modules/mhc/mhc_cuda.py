@@ -22,6 +22,7 @@ import torch
 from tensorrt_llm._torch.autotuner import (
     AutoTuner,
     ConstraintSpec,
+    DistributedTuningStrategy,
     DynamicTensorSpec,
     OptimizationProfile,
     TunableRunner,
@@ -271,6 +272,9 @@ class MhcPreMappingRunner(TunableRunner):
                 infer_shape=lambda shapes: shapes[0][0],
             ),
         ),
+        # PARALLEL fans tactics out across TP ranks (each rank times a
+        # disjoint subset, then merge picks the global best).
+        distributed_tuning_strategy=DistributedTuningStrategy.PARALLEL,
     )
 
     def __init__(
@@ -844,6 +848,7 @@ class MhcFusedHcRunner(TunableRunner):
             # comb_mix_prev (input[3]) dim 0 = M
             ConstraintSpec(input_idx=3, dim_idx=0, infer_shape=lambda shapes: shapes[0][0]),
         ),
+        distributed_tuning_strategy=DistributedTuningStrategy.PARALLEL,
     )
 
     def __init__(
