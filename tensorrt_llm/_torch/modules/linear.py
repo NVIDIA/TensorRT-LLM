@@ -2810,8 +2810,8 @@ class MarlinNVFP4LinearMethod(NVFP4LinearMethod):
         size_k = module.in_features
         group_size = module.scaling_vector_size  # 16
 
-        assert size_k >= 64 and size_k % 64 == 0, "size_k must be >= 64 and divisible by 64"
-        assert size_n >= 64 and size_n % 64 == 0, "size_n must be >= 64 and divisible by 64"
+        assert size_k >= 64 and size_k % 64 == 0, f"size_k {size_k} must be >= 64 and divisible by 64"
+        assert size_n >= 64 and size_n % 64 == 0, f"size_n {size_n} must be >= 64 and divisible by 64"
 
         qweight_int32 = weight.view(torch.int32).T.contiguous()  # [K/4, N]
         perm = torch.empty(0, dtype=torch.int32, device=weight.device)
