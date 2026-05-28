@@ -480,6 +480,12 @@ def run_single_rank_ar_rms_norm_fp8_live_scale_compile(tensor_parallel_size, a,
                     ))
                 q_norm, q_scale = torch.ops.tensorrt_llm.static_quantize_e4m3_per_tensor(
                     norm, scale)
+                # static_quantize_e4m3_per_tensor leaves its 2nd output
+                # uninitialized (see fp8Op.cpp:112). Keep q_scale live so the
+                # live-scale fusion pattern still matches, but override its
+                # value with the input scale (in input.dtype) so eager and
+                # fused outputs are comparable.
+                q_scale = q_scale.to(input.dtype) * 0 + scale.to(input.dtype)
                 dequantized = dequant(q_norm, q_scale, input.dtype)
                 return dequantized, fused_residual, q_scale
 
