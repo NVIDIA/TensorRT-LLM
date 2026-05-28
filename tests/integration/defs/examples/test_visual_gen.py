@@ -537,16 +537,23 @@ def _run_wan_lpips_pipeline(
     num_inference_steps,
     guidance_scale,
     seed,
+    attention_backend="VANILLA",
     parallel=None,
 ):
     from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineLoader
-    from tensorrt_llm.visual_gen.args import CompilationConfig, TorchCompileConfig, VisualGenArgs
+    from tensorrt_llm.visual_gen.args import (
+        AttentionConfig,
+        CompilationConfig,
+        TorchCompileConfig,
+        VisualGenArgs,
+    )
 
     _skip_if_missing(model_path, "Wan checkpoint", is_dir=True)
     args_kwargs = dict(
         model=model_path,
         compilation_config=CompilationConfig(skip_warmup=True),
         torch_compile_config=TorchCompileConfig(enable=False),
+        attention_config=AttentionConfig(backend=attention_backend),
     )
     if parallel is not None:
         args_kwargs["parallel_config"] = parallel

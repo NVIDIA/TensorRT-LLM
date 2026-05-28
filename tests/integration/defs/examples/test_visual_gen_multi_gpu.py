@@ -52,15 +52,12 @@ except ImportError:
 # Keep it as 0.25 as the worst case scenario at NVL72 scale
 WAN_MULTI_GPU_LPIPS_THRESHOLD = 0.25
 WAN22_LPIPS_MULTI_GPU_VARIANTS = [
-    ("ulysses4", {"dit_ulysses_size": 4}),
-    ("cfg2_ulysses2", {"dit_cfg_size": 2, "dit_ulysses_size": 2}),
-    ("ulysses2_ring2", {"dit_ulysses_size": 2, "dit_ring_size": 2}),
-    ("attn2d_2x2", {"dit_attn2d_row_size": 2, "dit_attn2d_col_size": 2}),
-    ("cfg2_ulysses2_ring2", {"dit_cfg_size": 2, "dit_ulysses_size": 2, "dit_ring_size": 2}),
-    (
-        "attn2d_2x2_ulysses2",
-        {"dit_attn2d_row_size": 2, "dit_attn2d_col_size": 2, "dit_ulysses_size": 2},
-    ),
+    ("ulysses4", {"ulysses_size": 4}),
+    ("cfg2_ulysses2", {"cfg_size": 2, "ulysses_size": 2}),
+    ("ulysses2_ring2", {"ulysses_size": 2, "ring_size": 2}),
+    ("attn2d_2x2", {"attn2d_size": (2, 2)}),
+    ("cfg2_ulysses2_ring2", {"cfg_size": 2, "ulysses_size": 2, "ring_size": 2}),
+    ("attn2d_2x2_ulysses2", {"attn2d_size": (2, 2), "ulysses_size": 2}),
 ]
 
 
@@ -139,6 +136,7 @@ def _wan22_lpips_distributed_worker(rank: int, world_size: int, **kwargs) -> Non
         kwargs["num_inference_steps"],
         kwargs["guidance_scale"],
         kwargs["seed"],
+        attention_backend="FA4",
         parallel=parallel,
     )
 
