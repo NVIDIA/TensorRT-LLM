@@ -2909,16 +2909,21 @@ class Gemma4TextExportInfo(TextModelExportInfo):
     def post_process(self, sub_mod: nn.Module, sub_gm: GraphModule):
         super().post_process(sub_mod, sub_gm)
 
+        # Gemma4Model.forward calls language_model.get_per_layer_inputs unconditionally,
+        # so the GraphModule must expose it on every variant. The method itself short-circuits
+        # to None when embed_tokens_per_layer is None, which is the non-E2B case.
         embed_tokens_per_layer = getattr(sub_mod, "embed_tokens_per_layer", None)
+        sub_gm.get_per_layer_inputs = types.MethodType(
+            sub_mod.get_per_layer_inputs.__func__, sub_gm
+        )
+
         if embed_tokens_per_layer is None:
+            sub_gm.embed_tokens_per_layer = None
             return
 
         sub_gm.config = sub_mod.config
         sub_gm.hidden_size_per_layer_input = sub_mod.hidden_size_per_layer_input
         sub_gm.vocab_size_per_layer_input = sub_mod.vocab_size_per_layer_input
-        sub_gm.get_per_layer_inputs = types.MethodType(
-            sub_mod.get_per_layer_inputs.__func__, sub_gm
-        )
 
         for embed_name, subsubmod in sub_mod.named_modules():
             if subsubmod is embed_tokens_per_layer:
