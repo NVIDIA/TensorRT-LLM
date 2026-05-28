@@ -54,7 +54,7 @@ def _get_free_gpu_memory_gib() -> Optional[float]:
 
     try:
         free_bytes, _ = torch.cuda.mem_get_info()
-    except Exception as exc:
+    except (RuntimeError, OSError) as exc:
         logger.warning(f"Unable to query CUDA free memory for BF16 weight snapshots: {exc}")
         return None
 
@@ -375,8 +375,7 @@ def _apply_lora_deltas(
     """Add (sign=+1) or remove (sign=-1) pre-computed LoRA deltas.
 
     For BF16 weights the delta is added directly and later removed either
-    by restoring an optional saved snapshot or by subtracting the same
-    delta. Other dense floating-point weights are restored by subtraction.
+    by restoring an optional saved snapshot or by subtracting the same delta.
     For FP8-quantized weights (same shape, float8 dtype), we
     dequantize → apply → requantize.  FP4 weights are handled through
     the packed-FP4 branch because the current static and dynamic NVFP4
