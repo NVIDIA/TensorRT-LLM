@@ -166,3 +166,72 @@ def test_add_thinking_budget_logits_processor_uses_reasoning_parser_tokens():
     )
 
     assert isinstance(sampling_params.logits_processor, ThinkingBudgetLogitsProcessor)
+
+
+@pytest.mark.parametrize("thinking_token_budget", [0, 2])
+def test_thinking_budget_text_generation_caps_reasoning_tokens(thinking_token_budget):
+    class FakeTokenizer:
+        token_to_id = {
+            "Question:": 0,
+            "<think>": 1,
+            "</think>": 2,
+            "alpha": 3,
+            "beta": 4,
+            "gamma": 5,
+            "delta": 6,
+            "answer": 7,
+        }
+        id_to_token = {token_id: token for token, token_id in token_to_id.items()}
+
+        def encode(self, text, add_special_tokens=False):
+            del add_special_tokens
+            return [self.token_to_id[token] for token in text.split()]
+
+        def decode(self, token_ids):
+            return " ".join(self.id_to_token[token_id] for token_id in token_ids)
+
+    tokenizer = FakeTokenizer()
+    sampling_params = SamplingParams(thinking_token_budget=thinking_token_budget)
+    add_thinking_budget_logits_processor(
+        sampling_params,
+        reasoning_parser="qwen3",
+        tokenizer=tokenizer,
+    )
+
+    prompt_ids = tokenizer.encode("Question:")
+    generated_ids = []
+    reasoning_plan = tokenizer.encode("alpha beta gamma delta")
+    start_id = tokenizer.encode("<think>")[0]
+    end_id = tokenizer.encode("</think>")[0]
+    answer_id = tokenizer.encode("answer")[0]
+
+    def next_model_token():
+        if not generated_ids:
+            return start_id
+        if end_id in generated_ids:
+            return answer_id
+        reasoning_tokens = generated_ids[generated_ids.index(start_id) + 1 :]
+        if len(reasoning_tokens) < len(reasoning_plan):
+            return reasoning_plan[len(reasoning_tokens)]
+        return end_id
+
+    for _ in range(8):
+        logits = torch.full((1, 1, len(tokenizer.token_to_id)), -100.0)
+        logits[0, 0, next_model_token()] = 100.0
+        sampling_params.logits_processor(0, logits, [prompt_ids + generated_ids], None, None)
+        generated_ids.append(int(torch.argmax(logits[0, 0]).item()))
+        if generated_ids[-1] == answer_id:
+            break
+
+    start_idx = generated_ids.index(start_id)
+    end_idx = generated_ids.index(end_id)
+    reasoning_ids = generated_ids[start_idx + 1 : end_idx]
+    expected_reasoning_ids = reasoning_plan[:thinking_token_budget]
+
+    assert tokenizer.decode(prompt_ids) == "Question:"
+    assert reasoning_ids == expected_reasoning_ids
+    assert len(reasoning_ids) <= thinking_token_budget
+    assert generated_ids[end_idx + 1 :] == [answer_id]
+    assert tokenizer.decode(generated_ids) == tokenizer.decode(
+        [start_id, *expected_reasoning_ids, end_id, answer_id]
+    )
