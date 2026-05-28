@@ -144,8 +144,10 @@ def test_mm_encoder_sampler_aligns_mixed_batch_by_request_index():
             mm_embedding_request_indices=[1],
             mm_embedding_lengths=[[4]],
             extra_data={
-                "mrope_position_ids": ["text-pos", "mm-pos"],
-                "mrope_position_deltas": ["text-delta", "mm-delta"],
+                # Engine emits mrope entries only for active MM requests
+                # (length == #MM results, not full batch).
+                "mrope_position_ids": ["mm-pos"],
+                "mrope_position_deltas": ["mm-delta"],
             },
         ),
     )

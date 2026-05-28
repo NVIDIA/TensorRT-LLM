@@ -426,8 +426,8 @@ class EarlyStopWithMMResult(Sampler[SampleStateWithMMResult]):
             # Store mrope data if available
             if mrope_position_ids is not None and mrope_position_deltas is not None:
                 request.py_result.set_mrope_position(
-                    mrope_position_ids[request_index],
-                    mrope_position_deltas[request_index],
+                    mrope_position_ids[result_index],
+                    mrope_position_deltas[result_index],
                 )
 
     @override
