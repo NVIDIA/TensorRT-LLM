@@ -1014,9 +1014,10 @@ def _register_fake():
         return None
 
     @torch.library.register_fake("trtllm::ulysses_post_unscatter_qkv")
-    def _(q_in, k_in, v_in):
+    def _(q_in, k_in, v_in, layout=0):
+        # layout: 0 = HND [B, H, P*Sp, D], 1 = NHD [B, P*Sp, H, D]
         P, B, Sp, H, D = q_in.shape
-        shape = (B, H, P * Sp, D)
+        shape = (B, H, P * Sp, D) if layout == 0 else (B, P * Sp, H, D)
         return (q_in.new_empty(shape), k_in.new_empty(shape),
                 v_in.new_empty(shape))
 

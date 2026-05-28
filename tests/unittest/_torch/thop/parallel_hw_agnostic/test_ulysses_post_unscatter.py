@@ -11,18 +11,21 @@ import pytest
 import torch
 
 
-def torch_ref(q_5d, k_5d, v_5d):
-    """Eager reference: the permute+reshape+contiguous+transpose+contig chain
-    that the kernel replaces."""
+def torch_ref(q_5d, k_5d, v_5d, is_hnd):
+    """Eager reference: the permute+reshape+contiguous (+transpose+contig for HND)
+    chain that the kernel replaces."""
 
     def post(t):
         P, B, Sp, H, D = t.shape
-        out = t.permute(1, 0, 2, 3, 4).reshape(B, P * Sp, H, D).contiguous()
-        return out.transpose(1, 2).contiguous()  # [B, H, P*Sp, D]
+        out = t.permute(1, 0, 2, 3, 4).reshape(B, P * Sp, H, D).contiguous()  # NHD
+        if is_hnd:
+            return out.transpose(1, 2).contiguous()  # [B, H, P*Sp, D]
+        return out  # [B, P*Sp, H, D]
 
     return post(q_5d), post(k_5d), post(v_5d)
 
 
+@pytest.mark.parametrize("layout", [0, 1], ids=["HND", "NHD"])
 @pytest.mark.parametrize(
     "P,B,Sp,H,D",
     [
@@ -40,24 +43,35 @@ def torch_ref(q_5d, k_5d, v_5d):
     ],
 )
 @torch.inference_mode()
-def test_ulysses_post_unscatter_exact_match(P, B, Sp, H, D):
+def test_ulysses_post_unscatter_exact_match(P, B, Sp, H, D, layout):
     """The op is a pure data movement, so output must match the eager
-    permute+reshape+contiguous+transpose+contig chain exactly
-    (max_diff == 0)."""
+    permute+reshape+contiguous (+transpose+contig for HND) chain exactly
+    (max_diff == 0). Both HND (layout=0) and NHD (layout=1) outputs are
+    exercised."""
+    is_hnd = layout == 0
     torch.manual_seed(0)
     q = torch.randn(P, B, Sp, H, D, device="cuda", dtype=torch.bfloat16).contiguous()
     k = torch.randn(P, B, Sp, H, D, device="cuda", dtype=torch.bfloat16).contiguous()
     v = torch.randn(P, B, Sp, H, D, device="cuda", dtype=torch.bfloat16).contiguous()
 
-    q_ref, k_ref, v_ref = torch_ref(q, k, v)
-    q_out, k_out, v_out = torch.ops.trtllm.ulysses_post_unscatter_qkv(q, k, v)
+    q_ref, k_ref, v_ref = torch_ref(q, k, v, is_hnd=is_hnd)
+    q_out, k_out, v_out = torch.ops.trtllm.ulysses_post_unscatter_qkv(q, k, v, layout)
 
-    assert q_out.shape == (B, H, P * Sp, D)
+    expected_shape = (B, H, P * Sp, D) if is_hnd else (B, P * Sp, H, D)
+    assert q_out.shape == expected_shape
     assert q_out.is_contiguous() and k_out.is_contiguous() and v_out.is_contiguous()
     assert q_out.dtype == torch.bfloat16
     for name, ref, got in [("Q", q_ref, q_out), ("K", k_ref, k_out), ("V", v_ref, v_out)]:
         max_diff = (ref - got).abs().max().item()
         assert max_diff == 0, f"{name}: max_diff={max_diff} (expected exact match)"
+
+
+@torch.inference_mode()
+def test_ulysses_post_unscatter_rejects_invalid_layout():
+    """layout must be 0 (HND) or 1 (NHD)."""
+    q = torch.randn(2, 1, 128, 8, 64, device="cuda", dtype=torch.bfloat16)
+    with pytest.raises(RuntimeError):
+        torch.ops.trtllm.ulysses_post_unscatter_qkv(q, q, q, 2)
 
 
 @torch.inference_mode()

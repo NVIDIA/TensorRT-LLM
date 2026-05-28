@@ -29,10 +29,11 @@ namespace
 
 // Each block handles one (p, b, sp) tile across all H heads.
 // Reads H*D bf16 contiguous from input; writes the same bytes scattered across
-// H rows of the output layout [B, H, P*Sp, D].
+// H rows of the output, in either HND layout [B, H, P*Sp, D] or NHD layout
+// [B, P*Sp, H, D] depending on IsHnd.
 //
 // threads/block = H * (D / 8); each thread copies one uint4 (8 bf16).
-template <typename T>
+template <typename T, bool IsHnd>
 __global__ void ulyssesPostUnscatterKernel(T const* __restrict__ q_in, T const* __restrict__ k_in,
     T const* __restrict__ v_in, T* __restrict__ q_out, T* __restrict__ k_out, T* __restrict__ v_out, int const P,
     int const B, int const Sp, int const H, int const D, int const vec_per_row)
@@ -67,10 +68,19 @@ __global__ void ulyssesPostUnscatterKernel(T const* __restrict__ q_in, T const* 
     }
 
     // in[p, b, sp, h, d]: ((((p*B + b)*Sp + sp)*H + h)*D + vec_idx*VEC)
-    // out[b, h, p*Sp+sp, d]: (((b*H + h)*PSp + psp)*D + vec_idx*VEC)
+    // HND out[b, h, p*Sp+sp, d]: (((b*H + h)*PSp + psp)*D + vec_idx*VEC)
+    // NHD out[b, p*Sp+sp, h, d]: (((b*PSp + psp)*H + h)*D + vec_idx*VEC)
     // int64_t: P*B*Sp*H*D can exceed 2^31 at large workloads.
     int64_t const in_base = ((((static_cast<int64_t>(p) * B + b) * Sp + sp) * H + h) * D) + vec_idx * VEC;
-    int64_t const out_base = (((static_cast<int64_t>(b) * H + h) * PSp) + psp) * D + vec_idx * VEC;
+    int64_t out_base;
+    if constexpr (IsHnd)
+    {
+        out_base = (((static_cast<int64_t>(b) * H + h) * PSp) + psp) * D + vec_idx * VEC;
+    }
+    else
+    {
+        out_base = (((static_cast<int64_t>(b) * PSp + psp) * H + h) * D) + vec_idx * VEC;
+    }
 
     uint4 const* in_v4 = reinterpret_cast<uint4 const*>(in_ptr + in_base);
     uint4* out_v4 = reinterpret_cast<uint4*>(out_ptr + out_base);
@@ -80,7 +90,7 @@ __global__ void ulyssesPostUnscatterKernel(T const* __restrict__ q_in, T const* 
 } // namespace
 
 void launchUlyssesPostUnscatter(void const* q_in, void const* k_in, void const* v_in, void* q_out, void* k_out,
-    void* v_out, int P, int B, int Sp, int H, int D, cudaStream_t stream)
+    void* v_out, int P, int B, int Sp, int H, int D, bool is_hnd, cudaStream_t stream)
 {
     constexpr int VEC = 8;
     TLLM_CHECK_WITH_INFO(D % VEC == 0, "ulyssesPostUnscatter: D must be a multiple of 8 (uint4 vec), got %d", D);
@@ -92,10 +102,23 @@ void launchUlyssesPostUnscatter(void const* q_in, void const* k_in, void const* 
     dim3 const grid(P * Sp, B, 3);
     dim3 const block(threads);
 
-    ulyssesPostUnscatterKernel<__nv_bfloat16><<<grid, block, 0, stream>>>(reinterpret_cast<__nv_bfloat16 const*>(q_in),
-        reinterpret_cast<__nv_bfloat16 const*>(k_in), reinterpret_cast<__nv_bfloat16 const*>(v_in),
-        reinterpret_cast<__nv_bfloat16*>(q_out), reinterpret_cast<__nv_bfloat16*>(k_out),
-        reinterpret_cast<__nv_bfloat16*>(v_out), P, B, Sp, H, D, vec_per_row);
+    auto* q_in_typed = reinterpret_cast<__nv_bfloat16 const*>(q_in);
+    auto* k_in_typed = reinterpret_cast<__nv_bfloat16 const*>(k_in);
+    auto* v_in_typed = reinterpret_cast<__nv_bfloat16 const*>(v_in);
+    auto* q_out_typed = reinterpret_cast<__nv_bfloat16*>(q_out);
+    auto* k_out_typed = reinterpret_cast<__nv_bfloat16*>(k_out);
+    auto* v_out_typed = reinterpret_cast<__nv_bfloat16*>(v_out);
+
+    if (is_hnd)
+    {
+        ulyssesPostUnscatterKernel<__nv_bfloat16, true><<<grid, block, 0, stream>>>(
+            q_in_typed, k_in_typed, v_in_typed, q_out_typed, k_out_typed, v_out_typed, P, B, Sp, H, D, vec_per_row);
+    }
+    else
+    {
+        ulyssesPostUnscatterKernel<__nv_bfloat16, false><<<grid, block, 0, stream>>>(
+            q_in_typed, k_in_typed, v_in_typed, q_out_typed, k_out_typed, v_out_typed, P, B, Sp, H, D, vec_per_row);
+    }
 }
 
 } // namespace kernels

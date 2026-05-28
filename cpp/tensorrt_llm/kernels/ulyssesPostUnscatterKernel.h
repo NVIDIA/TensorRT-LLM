@@ -27,15 +27,19 @@ namespace kernels
 
 // Post-Ulysses A2A unscatter for Q/K/V. Pairs with ulyssesPermuteScatter:
 // PermuteScatter prepares send_buf pre-A2A; PostUnscatter consumes recv_buf
-// post-A2A and produces SDPA-ready HND tensors.
+// post-A2A and produces SDPA-ready tensors in either HND or NHD layout.
 //
 // After the head-dim → seq-dim all-to-all, each rank holds tensors of shape
 // [P, B, Sp, H, D] where P = sequence-parallel world size, Sp = local seq
-// len, H = heads-per-rank, D = head dim. SDPA needs them in HND layout
-// [B, H, P*Sp, D]. This kernel fuses the equivalent of
-//   t.permute(1, 0, 2, 3, 4).reshape(B, P * Sp, H, D).contiguous()
-//   .transpose(1, 2).contiguous()
-// into a single launch handling Q + K + V together.
+// len, H = heads-per-rank, D = head dim. Different attention backends prefer
+// different output layouts:
+//   - is_hnd=true  → HND [B, H, P*Sp, D]   (VANILLA / torch SDPA)
+//   - is_hnd=false → NHD [B, P*Sp, H, D]   (TRTLLM / FA4)
+//
+// Equivalent eager expressions this kernel replaces:
+//   HND: t.permute(1, 0, 2, 3, 4).reshape(B, P*Sp, H, D).contiguous()
+//         .transpose(1, 2).contiguous()
+//   NHD: t.permute(1, 0, 2, 3, 4).reshape(B, P*Sp, H, D).contiguous()
 //
 // Layout:
 //   - Each block reads one fully contiguous (p, b, sp, :H, :D) tile of
@@ -49,8 +53,8 @@ namespace kernels
 //   - threads/block = H * (D / 8) must be <= 1024 (CUDA hw limit)
 void launchUlyssesPostUnscatter(void const* q_in, // [P, B, Sp, H, D]
     void const* k_in, void const* v_in,
-    void* q_out,                                  // [B, H, P*Sp, D]
-    void* k_out, void* v_out, int P, int B, int Sp, int H, int D, cudaStream_t stream);
+    void* q_out,                                  // [B, H, P*Sp, D] or [B, P*Sp, H, D]
+    void* k_out, void* v_out, int P, int B, int Sp, int H, int D, bool is_hnd, cudaStream_t stream);
 
 } // namespace kernels
 

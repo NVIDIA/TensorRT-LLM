@@ -51,9 +51,14 @@ def post_permute_5d_to_4d(out_5d, P):
     return out_5d.permute(1, 0, 2, 3, 4).contiguous().view(Bt, _P * Spt, HpP, Dt)
 
 
-def _ulysses_post_unscatter_to_hnd(q_5d, k_5d, v_5d):
-    """One-launch fused replacement for the post-A2A 5D -> 4D HND chain."""
-    return torch.ops.trtllm.ulysses_post_unscatter_qkv(q_5d, k_5d, v_5d)
+def _ulysses_post_unscatter(q_5d, k_5d, v_5d, *, is_hnd):
+    """One-launch fused replacement for the post-A2A 5D -> 4D chain.
+
+    is_hnd=True  -> output [B, H, P*Sp, D] (VANILLA / torch SDPA)
+    is_hnd=False -> output [B, P*Sp, H, D] (TRTLLM / FA4)
+    """
+    layout = 0 if is_hnd else 1
+    return torch.ops.trtllm.ulysses_post_unscatter_qkv(q_5d, k_5d, v_5d, layout)
 
 
 class UlyssesAttention(AttentionBackend):
@@ -276,16 +281,15 @@ class UlyssesAttention(AttentionBackend):
 
         self._join_async()
 
-        # Fast path: one fused kernel replaces the 6-kernel HND chain (3
-        # permute+reshape+contig + 3 transpose+contig). NHD backends keep
-        # the 3-copy eager permute path (kernel only outputs HND).
+        # Fast path: one fused kernel replaces the eager post-A2A chain
+        # (6 ops for HND target: permute+reshape+contig + transpose+contig
+        # per Q/K/V; 3 ops for NHD target). bf16-only because the kernel is
+        # only instantiated for __nv_bfloat16.
         _, B_q, Sp_q, HpP_q, D_q = q_5d.shape
-        use_fused_op = (
-            self.inner_backend.preferred_layout == AttentionTensorLayout.HND
-            and q_5d.dtype == torch.bfloat16
-        )
-        if use_fused_op:
-            q_out, k_out, v_out = _ulysses_post_unscatter_to_hnd(q_5d, k_5d, v_5d)
+        is_hnd = self.inner_backend.preferred_layout == AttentionTensorLayout.HND
+        use_fused_post_unscatter = q_5d.dtype == torch.bfloat16
+        if use_fused_post_unscatter:
+            q_out, k_out, v_out = _ulysses_post_unscatter(q_5d, k_5d, v_5d, is_hnd=is_hnd)
             B = B_q
             seq_len_full = P * Sp_q
         else:
@@ -295,7 +299,7 @@ class UlyssesAttention(AttentionBackend):
 
             B = q_out.shape[0]
             seq_len_full = q_out.shape[1]
-            if self.inner_backend.preferred_layout == AttentionTensorLayout.HND:
+            if is_hnd:
                 q_out = q_out.transpose(1, 2).contiguous()
                 k_out = k_out.transpose(1, 2).contiguous()
                 v_out = v_out.transpose(1, 2).contiguous()

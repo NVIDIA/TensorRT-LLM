@@ -26,19 +26,24 @@ namespace torch_ext
 {
 
 // Post-Ulysses A2A unscatter: take Q/K/V tensors of shape [P, B, Sp, H, D]
-// (output of the head-dim -> seq-dim all-to-all) and produce their HND form
-// [B, H, P*Sp, D] expected by SDPA. Replaces the eager chain
-//     t.permute(1, 0, 2, 3, 4).reshape(B, P * Sp, H, D).contiguous()
-//     .transpose(1, 2).contiguous()
+// (output of the head-dim -> seq-dim all-to-all) and produce SDPA-ready Q/K/V
+// in the layout selected by ``layout``:
+//   layout=0 → HND [B, H, P*Sp, D]  (VANILLA / torch SDPA)
+//   layout=1 → NHD [B, P*Sp, H, D]  (TRTLLM / FA4)
+// Replaces the eager chain
+//     t.permute(1, 0, 2, 3, 4).reshape(B, P * Sp, H, D).contiguous()           // NHD
+//     [.transpose(1, 2).contiguous()]                                          // HND extra step
 // for Q, K, V in one kernel launch.
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> ulysses_post_unscatter_qkv(
     torch::Tensor& q_in, // [P, B, Sp, H, D]
     torch::Tensor& k_in, // [P, B, Sp, H, D]
-    torch::Tensor& v_in) // [P, B, Sp, H, D]
+    torch::Tensor& v_in, // [P, B, Sp, H, D]
+    int64_t layout)      // 0 = HND, 1 = NHD
 {
     TORCH_CHECK(q_in.dim() == 5 && k_in.dim() == 5 && v_in.dim() == 5,
         "ulysses_post_unscatter_qkv expects 5D tensors [P, B, Sp, H, D]");
     TORCH_CHECK(q_in.sizes() == k_in.sizes() && q_in.sizes() == v_in.sizes(), "Q/K/V must share the same shape");
+    TORCH_CHECK(layout == 0 || layout == 1, "layout must be 0 (HND) or 1 (NHD), got ", layout);
 
     CHECK_INPUT(q_in, torch::kBFloat16);
     CHECK_INPUT(k_in, torch::kBFloat16);
@@ -56,15 +61,17 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> ulysses_post_unscatter_q
     int64_t const H = q_in.size(3);
     int64_t const D = q_in.size(4);
 
+    bool const is_hnd = (layout == 0);
     auto opts = q_in.options();
-    auto q_out = torch::empty({B, H, P * Sp, D}, opts);
-    auto k_out = torch::empty({B, H, P * Sp, D}, opts);
-    auto v_out = torch::empty({B, H, P * Sp, D}, opts);
+    auto const out_shape = is_hnd ? std::vector<int64_t>{B, H, P * Sp, D} : std::vector<int64_t>{B, P * Sp, H, D};
+    auto q_out = torch::empty(out_shape, opts);
+    auto k_out = torch::empty(out_shape, opts);
+    auto v_out = torch::empty(out_shape, opts);
 
     // Empty-tensor no-op: P=0/B=0/Sp=0 produces zero grid extent in the
     // kernel launcher (undefined cuLaunchKernel behavior across CUDA versions).
     // The three output tensors above are already empty-shaped via P*Sp=0 or B=0,
-    // so returning them directly preserves the (B, H, P*Sp, D) contract.
+    // so returning them directly preserves the output-shape contract.
     if (q_in.numel() == 0)
     {
         return std::make_tuple(q_out, k_out, v_out);
@@ -73,14 +80,17 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> ulysses_post_unscatter_q
     auto stream = at::cuda::getCurrentCUDAStream();
     tensorrt_llm::kernels::launchUlyssesPostUnscatter(q_in.data_ptr(), k_in.data_ptr(), v_in.data_ptr(),
         q_out.data_ptr(), k_out.data_ptr(), v_out.data_ptr(), static_cast<int>(P), static_cast<int>(B),
-        static_cast<int>(Sp), static_cast<int>(H), static_cast<int>(D), stream);
+        static_cast<int>(Sp), static_cast<int>(H), static_cast<int>(D), is_hnd, stream);
 
     return std::make_tuple(q_out, k_out, v_out);
 }
 
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
-    m.def("ulysses_post_unscatter_qkv(Tensor q_in, Tensor k_in, Tensor v_in) -> (Tensor, Tensor, Tensor)");
+    // layout: 0 = HND [B, H, P*Sp, D], 1 = NHD [B, P*Sp, H, D]. Default 0 keeps
+    // backward compatibility with the original HND-only callers.
+    m.def(
+        "ulysses_post_unscatter_qkv(Tensor q_in, Tensor k_in, Tensor v_in, int layout=0) -> (Tensor, Tensor, Tensor)");
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
