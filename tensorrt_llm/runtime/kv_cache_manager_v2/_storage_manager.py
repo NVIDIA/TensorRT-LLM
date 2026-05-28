@@ -171,6 +171,9 @@ class StorageStatistics:
 
 
 MigrationRecorder = Callable[[Sequence[Page], Sequence[Slot], CacheLevel, CacheLevel], None]
+# Invoked when pages at the last cache level are released to free their slots
+# without being migrated to any further tier (i.e. dropped from the cache hierarchy).
+DropRecorder = Callable[[Sequence[Page], CacheLevel], None]
 
 
 class StorageManager:
@@ -308,14 +311,16 @@ class StorageManager:
         self,
         num_slots: TypedIndexList[LifeCycleId, int],
         migration_recorder: MigrationRecorder | None = None,
+        drop_recorder: DropRecorder | None = None,
     ) -> TypedIndexList[LifeCycleId, list[Slot]]:
-        return self.new_slots(GPU_LEVEL, num_slots, migration_recorder)
+        return self.new_slots(GPU_LEVEL, num_slots, migration_recorder, drop_recorder)
 
     def new_slots(
         self,
         level: CacheLevel,
         num_slots: TypedIndexList[LifeCycleId, int],
         migration_recorder: MigrationRecorder | None = None,
+        drop_recorder: DropRecorder | None = None,
     ) -> TypedIndexList[LifeCycleId, list[Slot]]:
         lc2pg = self._life_cycle_grouping
         pg_num_slots = filled_list(0, self.num_pool_groups)
@@ -326,7 +331,7 @@ class StorageManager:
             pg_num_slots[pg] > storage.get_num_free_slots(pg)
             for pg in typed_range(self.num_pool_groups)
         ):
-            self.prepare_free_slots(level, pg_num_slots, migration_recorder)
+            self.prepare_free_slots(level, pg_num_slots, migration_recorder, drop_recorder)
         assert all(
             pg_num_slots[pg] <= storage.get_num_free_slots(pg)
             for pg in typed_range(self.num_pool_groups)
@@ -351,12 +356,13 @@ class StorageManager:
         pg_idx: PoolGroupIndex,
         num_slots: int,
         migration_recorder: MigrationRecorder | None = None,
+        drop_recorder: DropRecorder | None = None,
     ) -> list[Slot]:
         storage = self._levels[level].storage
         if num_slots > storage.get_num_free_slots(pg_idx):
             num_slots_list = filled_list(0, self.num_pool_groups)
             num_slots_list[pg_idx] = num_slots
-            self.prepare_free_slots(level, num_slots_list, migration_recorder)
+            self.prepare_free_slots(level, num_slots_list, migration_recorder, drop_recorder)
         assert num_slots <= storage.get_num_free_slots(pg_idx)
         try:
             return storage.allocate_multiple(pg_idx, num_slots)
@@ -408,15 +414,19 @@ class StorageManager:
         level: CacheLevel,
         requirements: TypedIndexList[PoolGroupIndex, int],
         migration_recorder: MigrationRecorder | None = None,
+        drop_recorder: DropRecorder | None = None,
     ) -> None:
         goals = filled_array2d(self.num_cache_levels, self.num_pool_groups, 0)
         for pg in typed_range(self.num_pool_groups):
             goals[level, pg] = requirements[pg]
         fallen_pages = make_typed(lambda _: list[Page](), self.num_pool_groups)
-        self._prepare_free_slots(goals, level, fallen_pages, migration_recorder)
+        self._prepare_free_slots(goals, level, fallen_pages, migration_recorder, drop_recorder)
 
     def force_evict(
-        self, level: CacheLevel, min_num_pages: TypedIndexList[PoolGroupIndex, int]
+        self,
+        level: CacheLevel,
+        min_num_pages: TypedIndexList[PoolGroupIndex, int],
+        drop_recorder: DropRecorder | None = None,
     ) -> None:
         # If we break inside this function with debugpy, pages in `evicted` won't be
         # released even after the function returns. This is a debugpy artifact.
@@ -425,11 +435,18 @@ class StorageManager:
             assert all(p.status == PageStatus.DROPPABLE for pages in evicted for p in pages), (
                 "Corrupted eviction controller"
             )
+            if drop_recorder is not None:
+                for pg_idx in typed_range(self.num_pool_groups):
+                    if evicted[pg_idx]:
+                        drop_recorder(evicted[pg_idx], level)
             return
         next_lvl = CacheLevel(level + 1)
         goals = filled_array2d(self.num_cache_levels, self.num_pool_groups, 0)
         self._prepare_free_slots(
-            goals, next_lvl, cast(TypedIndexList[PoolGroupIndex, list[Page]], evicted)
+            goals,
+            next_lvl,
+            cast(TypedIndexList[PoolGroupIndex, list[Page]], evicted),
+            drop_recorder=drop_recorder,
         )
 
     def _prepare_free_slots(
@@ -438,6 +455,7 @@ class StorageManager:
         lvl_id: CacheLevel,
         fallen_pages: TypedIndexList[PoolGroupIndex, list[Page]],
         migration_recorder: MigrationRecorder | None = None,
+        drop_recorder: DropRecorder | None = None,
     ) -> None:
         assert NDEBUG or goals.rows == self.num_cache_levels and goals.cols == self.num_pool_groups
         assert NDEBUG or all(
@@ -478,6 +496,10 @@ class StorageManager:
                 assert NDEBUG or all(p.status == PageStatus.DROPPABLE for p in evicted[pg_idx])
                 if not NDEBUG:
                     dbg_rawrefs = [rawref.ref(p) for p in evicted[pg_idx]]
+                # Record the drop event before releasing — these pages are leaving the
+                # cache hierarchy entirely without being onboarded back to GPU.
+                if drop_recorder is not None and num_evicted > 0:
+                    drop_recorder(evicted[pg_idx], lvl_id)
                 evicted[pg_idx].clear()
                 if not NDEBUG:
                     assert all(p() is None for p in dbg_rawrefs)  # pyright: ignore
@@ -514,6 +536,7 @@ class StorageManager:
                 CacheLevel(lvl_id + 1),
                 fallen_pages,
                 migration_recorder,
+                drop_recorder,
             )
         assert all(len(f) == 0 for f in fallen_pages)
         # migrate pages

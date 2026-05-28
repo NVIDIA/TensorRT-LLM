@@ -28,9 +28,11 @@ KV_CACHE_ITERATION_STATS_POOL_GROUP_KEYS = (
     "primaryMaxNumBlocks",
     "primaryFreeNumBlocks",
     "primaryUsedNumBlocks",
+    "primaryEvictableNumBlocks",
     "secondaryMaxNumBlocks",
     "secondaryFreeNumBlocks",
     "secondaryUsedNumBlocks",
+    "secondaryEvictableNumBlocks",
     "iterAllocTotalBlocks",
     "iterAllocNewBlocks",
     "iterGenAllocBlocks",
@@ -40,6 +42,8 @@ KV_CACHE_ITERATION_STATS_POOL_GROUP_KEYS = (
     "iterOffloadBytes",
     "iterIntraDeviceCopyBlocks",
     "iterIntraDeviceCopyBytes",
+    "iterHostDroppedBlocks",
+    "iterHostDroppedBytes",
 )
 
 
@@ -72,9 +76,11 @@ def serialize_kv_cache_iteration_stats(stats, keys: tuple[str, ...] | None = Non
         "primaryMaxNumBlocks": stats.primary_max_num_blocks,
         "primaryFreeNumBlocks": stats.primary_free_num_blocks,
         "primaryUsedNumBlocks": stats.primary_used_num_blocks,
+        "primaryEvictableNumBlocks": stats.primary_evictable_num_blocks,
         "secondaryMaxNumBlocks": stats.secondary_max_num_blocks,
         "secondaryFreeNumBlocks": stats.secondary_free_num_blocks,
         "secondaryUsedNumBlocks": stats.secondary_used_num_blocks,
+        "secondaryEvictableNumBlocks": stats.secondary_evictable_num_blocks,
         "iterAllocTotalBlocks": stats.iter_alloc_total_blocks,
         "iterAllocNewBlocks": stats.iter_alloc_new_blocks,
         "iterReusedBlocks": stats.iter_reused_blocks,
@@ -89,6 +95,8 @@ def serialize_kv_cache_iteration_stats(stats, keys: tuple[str, ...] | None = Non
         "iterOffloadBytes": stats.iter_offload_bytes,
         "iterIntraDeviceCopyBlocks": stats.iter_intra_device_copy_blocks,
         "iterIntraDeviceCopyBytes": stats.iter_intra_device_copy_bytes,
+        "iterHostDroppedBlocks": stats.iter_host_dropped_blocks,
+        "iterHostDroppedBytes": stats.iter_host_dropped_bytes,
     }
     if keys is None:
         return fields

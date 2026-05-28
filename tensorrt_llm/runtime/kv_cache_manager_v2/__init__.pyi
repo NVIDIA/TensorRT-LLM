@@ -86,6 +86,8 @@ class KVCacheIterationStatsDelta:
     iter_offload_bytes: int = 0
     iter_intra_device_copy_blocks: int = 0
     iter_intra_device_copy_bytes: int = 0
+    iter_host_dropped_blocks: int = 0
+    iter_host_dropped_bytes: int = 0
 
 # From _config.py
 DataRole = NewType("DataRole", str)

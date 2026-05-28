@@ -484,6 +484,32 @@ class _KVCache:
             if not stats.empty or not iteration_stats.empty:
                 self.manager.commit_stats(stats, {life_cycle_key: iteration_stats})
 
+    def _record_dropped_pages(
+        self,
+        pages: Sequence[Page],
+        cache_level: CacheLevel,
+    ) -> None:
+        """Record host-tier LRU drops (pages released without onboarding back to GPU).
+
+        Mirrors _record_migrated_slots in structure: per-life-cycle attribution,
+        gated on _should_record_stats(), per-page bytes computed from slot_size.
+        cache_level is unused for now (we only have a 2-tier setup in practice;
+        all last-level drops are host drops) but kept in the signature for future
+        per-tier disambiguation.
+        """
+        if not self._should_record_stats() or not pages:
+            return
+        for page in pages:
+            life_cycle_key = self._stats_life_cycle_key(page.life_cycle)
+            if life_cycle_key is None:
+                continue
+            pg_idx = self.manager._storage.get_pool_group_index(page.life_cycle)
+            page_size = sum(self.manager._storage.slot_size(pg_idx))
+            iteration_stats = KVCacheIterationStatsDelta()
+            iteration_stats.iter_host_dropped_blocks = 1
+            iteration_stats.iter_host_dropped_bytes = page_size
+            self.manager.commit_stats(KVCacheStatsDelta(), {life_cycle_key: iteration_stats})
+
     # destroy ownership of memory blocks, so KV cache manager can decide to evict or drop them. After
     # close, uncommitted data in blocks for (beam_index >= beam_width) will be lost.
     def close(self) -> None:
@@ -734,6 +760,7 @@ class _KVCache:
                     new_slots = storage.new_gpu_slots(
                         make_typed(lambda lc: max(0, net_alloc_counts[lc]), num_life_cycles),
                         self._record_migrated_slots,
+                        self._record_dropped_pages,
                     )
                 except OutOfPagesError:
                     self._recover_excess_scratch_slots(excess_scratch_slots)
@@ -996,7 +1023,9 @@ class _KVCache:
 
         if any(c > 0 for c in num_slots):
             try:
-                tmp_slots = storage.new_gpu_slots(num_slots, self._record_migrated_slots)
+                tmp_slots = storage.new_gpu_slots(
+                    num_slots, self._record_migrated_slots, self._record_dropped_pages
+                )
             except OutOfPagesError:
                 return False
 
@@ -1029,7 +1058,9 @@ class _KVCache:
             page = expect_type(_PageHolder, beam_block[lc_idx]).page
             tasks.append(BatchedLockTarget(page, beam_idx, ordinal, lc_idx))
         try:
-            locks = batched_lock_to_gpu(self, tasks, self._record_migrated_slots)
+            locks = batched_lock_to_gpu(
+                self, tasks, self._record_migrated_slots, self._record_dropped_pages
+            )
         except OutOfPagesError:
             for lc_idx, slot in typed_enumerate(deferred_slots):
                 if slot is not None:
@@ -1326,6 +1357,7 @@ class _KVCache:
                 self,
                 [BatchedLockTarget(p, beam_idx, ordinal, lc) for lc, p in reuse_list],
                 self._record_migrated_slots,
+                self._record_dropped_pages,
             )
             for (lc, _), lock in zip(reuse_list, locks):
                 beam_block[lc] = lock
@@ -1416,6 +1448,7 @@ class _KVCache:
                 for ordinal, beam_idx, lc, holder in backup_holders
             ],
             self._record_migrated_slots,
+            self._record_dropped_pages,
         )
         for lock in locks:
             user = lock._user
