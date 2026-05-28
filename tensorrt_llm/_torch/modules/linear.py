@@ -3036,7 +3036,7 @@ class Linear(nn.Module):
         weight_mode = self.weights_loading_config.weight_mode
         if not isinstance(self.quant_method,
                           (UnquantizedLinearMethod, FP8BlockScalesLinearMethod,
-                           NVFP4LinearMethod)):
+                           NVFP4LinearMethod, W4A8NVFP4FP8LinearMethod)):
             assert allow_partial_loading is False, (
                 f"{type(self.quant_method).__name__} does not support "
                 "allow_partial_loading")
