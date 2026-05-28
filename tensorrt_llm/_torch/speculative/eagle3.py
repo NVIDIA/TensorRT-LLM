@@ -189,6 +189,7 @@ class Eagle3SpecMetadata(SpecMetadata):
 
     def __post_init__(self):
         if self.is_draft_model:
+            # If it is the draft model, it only captures the last layer.
             self.layers_to_capture = (self.num_layers - 1, )
         elif self.layers_to_capture is None:
             if self.num_layers == 1 or self.is_mtp_eagle:
@@ -197,6 +198,7 @@ class Eagle3SpecMetadata(SpecMetadata):
                 if self.num_layers <= 5:
                     raise ValueError(
                         "Not enough hidden layers for default EAGLE3 capture")
+                # Capture an early layer, a middle layer, and a late layer.
                 self.layers_to_capture = _get_eagle3_default_capture_layers(
                     self.num_layers)
         else:

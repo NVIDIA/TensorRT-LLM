@@ -2685,17 +2685,29 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
             )
         return v
 
-    @field_validator('dtype')
+    @field_validator('dtype', mode='before')
     @classmethod
-    def validate_dtype(cls, v: str):
+    def validate_dtype(cls, v: Any):
+        if isinstance(v, torch.dtype):
+            for dtype_name, dtype in _str_to_torch_dtype_dict.items():
+                if v is dtype:
+                    return dtype_name
+            raise ValueError(
+                'kv_cache_config.dtype must be one of "auto", "fp8", "nvfp4", '
+                '"turboquant4", or valid torch.dtype string')
+        if not isinstance(v, str):
+            raise ValueError(
+                'kv_cache_config.dtype must be one of "auto", "fp8", "nvfp4", '
+                '"turboquant4", or valid torch.dtype string')
+
         v = v.lower()
-        if v in ("auto", "fp8",
-                 "nvfp4") or v in _str_to_torch_dtype_dict.keys():
+        if v in ("auto", "fp8", "nvfp4",
+                 "turboquant4") or v in _str_to_torch_dtype_dict.keys():
             return v
 
         raise ValueError(
-            'kv_cache_config.dtype must be one of "auto", "fp8", "nvfp4", or valid torch.dtype string'
-        )
+            'kv_cache_config.dtype must be one of "auto", "fp8", "nvfp4", '
+            '"turboquant4", or valid torch.dtype string')
 
     @field_validator('max_gpu_total_bytes')
     @classmethod
@@ -3652,7 +3664,21 @@ class TrtLlmArgs(BaseLlmArgs):
 
     @model_validator(mode="after")
     def validate_kv_cache_dtype(self):
-        assert self.kv_cache_config.dtype == "auto", "KvCacheConfig.dtype is not supported by the TensorRT backend."
+        kv_cache_quant_algo = (self.quant_config.kv_cache_quant_algo
+                               if self.quant_config is not None else None)
+        if kv_cache_quant_algo == QuantAlgo.TURBOQUANT4:
+            raise ValueError(
+                "TurboQuant4 KV cache is supported only by the PyTorch "
+                "backend. Use backend='pytorch' with TRTLLM attention backend.")
+        if self.kv_cache_config.dtype != "auto":
+            if self.kv_cache_config.dtype == "turboquant4":
+                raise ValueError(
+                    "TurboQuant4 KV cache is supported only by the PyTorch "
+                    "backend. Use backend='pytorch' with TRTLLM attention backend."
+                )
+            raise ValueError(
+                "KvCacheConfig.dtype is not supported by the TensorRT backend; "
+                f"got {self.kv_cache_config.dtype}.")
         return self
 
 
@@ -4050,8 +4076,9 @@ class TorchLlmArgs(BaseLlmArgs):
         status="prototype",
     )
 
-    # PrivateVars
-    _quant_config: Optional[QuantConfig] = PrivateAttr(default=None)
+    quant_config: QuantConfig = Field(default_factory=QuantConfig,
+                                      description="Quantization config.",
+                                      status="prototype")
 
     disable_flashinfer_sampling: bool = Field(
         default=False,
@@ -4079,16 +4106,6 @@ class TorchLlmArgs(BaseLlmArgs):
         "Applied by Efficient Video Sampling (EVS) in NemotronH_Nano_VL_V2. "
         "None (default) disables EVS, values in [0, 1) enable pruning.",
         status="prototype")
-
-    @property
-    def quant_config(self) -> QuantConfig:
-        if self._quant_config is None:
-            self._quant_config = QuantConfig()
-        return self._quant_config
-
-    @quant_config.setter
-    def quant_config(self, value: QuantConfig):
-        self._quant_config = value
 
     # TODO: remove backend later
     backend: Literal["pytorch"] = Field(
@@ -4323,11 +4340,108 @@ class TorchLlmArgs(BaseLlmArgs):
             self.quant_config.kv_cache_quant_algo = QuantAlgo.FP8
         elif self.kv_cache_config.dtype == 'nvfp4':
             self.quant_config.kv_cache_quant_algo = QuantAlgo.NVFP4
+        elif self.kv_cache_config.dtype == 'turboquant4':
+            self.quant_config.kv_cache_quant_algo = QuantAlgo.TURBOQUANT4
         else:
             logger.warning(
                 f"Cannot sync quant_config.kv_cache_quant_algo with kv_cache_config.dtype of {self.kv_cache_config.dtype}, "
                 "please update the validator")
 
+        return self
+
+    @model_validator(mode='after')
+    def sync_attn_backend_with_turboquant4_kv_cache(self) -> 'TorchLlmArgs':
+        has_turboquant4_kv_cache = (
+            (self.kv_cache_config is not None
+             and self.kv_cache_config.dtype == 'turboquant4')
+            or (self.quant_config is not None and
+                self.quant_config.kv_cache_quant_algo == QuantAlgo.TURBOQUANT4))
+        if not has_turboquant4_kv_cache:
+            return self
+
+        if self.sparse_attention_config is not None:
+            raise ValueError(
+                "TurboQuant4 KV cache is not supported with sparse attention.")
+        if self.speculative_config is not None:
+            raise ValueError(
+                "TurboQuant4 KV cache is not supported with speculative "
+                "decoding because draft-token KV relocation does not move "
+                "TurboQuant4 scale buffers.")
+        if (self.kv_cache_config is not None
+                and self.kv_cache_config.max_attention_window is not None):
+            raise ValueError(
+                "TurboQuant4 KV cache is not supported with sliding-window "
+                "attention because evicted KV blocks do not preserve the "
+                "separate scale buffers.")
+        if self.context_parallel_size > 1 or self.cp_config is not None:
+            raise ValueError(
+                "TurboQuant4 KV cache is not supported with context parallelism."
+            )
+        if self.max_beam_width is not None and self.max_beam_width > 1:
+            raise ValueError(
+                "TurboQuant4 KV cache is not supported with beam search "
+                "because beam KV indirection does not move TurboQuant4 scale "
+                "buffers.")
+        if self.cache_transceiver_config is not None:
+            raise ValueError(
+                "TurboQuant4 KV cache is not supported with cache transceiver "
+                "because disaggregated KV transfer does not serialize "
+                "TurboQuant4 scale buffers.")
+        if self.kv_connector_config is not None:
+            raise ValueError(
+                "TurboQuant4 KV cache is not supported with KV cache connector "
+                "because connector transfers do not serialize TurboQuant4 "
+                "scale buffers.")
+        if (self.attention_dp_config is not None
+                and self.attention_dp_config.enable_kv_cache_aware_routing):
+            raise ValueError(
+                "TurboQuant4 KV cache is not supported with KV-cache-aware "
+                "attention DP routing.")
+        if (self.kv_cache_config is not None
+                and self.kv_cache_config.event_buffer_max_size > 0):
+            raise ValueError(
+                "TurboQuant4 KV cache is not supported with KV cache event buffers."
+            )
+        if self.attn_backend.upper() not in ('TRTLLM', 'VANILLA'):
+            logger.warning(
+                "TurboQuant4 KV cache is supported only with TRTLLM or "
+                "VANILLA attention backend. "
+                f"Overriding attn_backend={self.attn_backend} to TRTLLM.")
+            self.attn_backend = 'TRTLLM'
+        if self.cuda_graph_config is not None:
+            logger.warning(
+                "TurboQuant4 KV cache currently uses a Python-side TRTLLM "
+                "fallback and does not support CUDA graph capture. "
+                "Overriding cuda_graph_config=None.")
+            self.cuda_graph_config = None
+        if self.torch_compile_config is not None:
+            logger.warning(
+                "TurboQuant4 KV cache currently uses a Python-side TRTLLM "
+                "fallback and does not support torch.compile or piecewise "
+                "CUDA graph capture. Overriding torch_compile_config=None.")
+            self.torch_compile_config = None
+        if self.kv_cache_config is None:
+            return self
+
+        if self.kv_cache_config.dtype != "turboquant4":
+            if self.kv_cache_config.dtype != "auto":
+                logger.warning(
+                    "TurboQuant4 KV cache requires "
+                    "kv_cache_config.dtype='turboquant4'. "
+                    f"Overriding kv_cache_config.dtype={self.kv_cache_config.dtype}."
+                )
+            self.kv_cache_config.dtype = "turboquant4"
+        if self.kv_cache_config.enable_block_reuse:
+            logger.warning(
+                "TurboQuant4 KV cache currently uses packed data plus "
+                "separate scale buffers and does not support KV block "
+                "reuse. Overriding kv_cache_config.enable_block_reuse=False.")
+            self.kv_cache_config.enable_block_reuse = False
+        if not self.kv_cache_config.use_kv_cache_manager_v2:
+            logger.warning(
+                "TurboQuant4 KV cache requires KVCacheManagerV2. "
+                "Overriding kv_cache_config.use_kv_cache_manager_v2=True.")
+            self.kv_cache_config.use_kv_cache_manager_v2 = True
         return self
 
     @model_validator(mode='after')
@@ -4372,7 +4486,7 @@ class TorchLlmArgs(BaseLlmArgs):
     def validate_ray_worker_extension_cls(self) -> 'TorchLlmArgs':
         if self.ray_worker_extension_cls is not None and self.orchestrator_type != "ray":
             raise ValueError(
-                f"ray_worker_extension_cls is only supported with orchestrator_type='ray'"
+                "ray_worker_extension_cls is only supported with orchestrator_type='ray'"
             )
         return self
 
@@ -4468,7 +4582,9 @@ def update_llm_args_with_extra_dict(
     }
     for field_name, field_type in field_mapping.items():
         if field_name in llm_args_dict:
-            llm_args_dict[field_name] = field_type(**llm_args_dict[field_name])
+            field_value = llm_args_dict[field_name]
+            if not isinstance(field_value, field_type):
+                llm_args_dict[field_name] = field_type(**field_value)
             extra_llm_str = f"because it's specified in {extra_llm_api_options}" if extra_llm_api_options else ""
             logger.warning(f"Overriding {field_name} {extra_llm_str}")
 

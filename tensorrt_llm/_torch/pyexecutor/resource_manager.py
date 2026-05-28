@@ -18,7 +18,8 @@ import tensorrt_llm.bindings
 from tensorrt_llm._torch.distributed.communicator import Distributed, ReduceOp
 from tensorrt_llm._utils import (TensorWrapper, convert_to_torch_tensor,
                                  get_size_in_bytes, mpi_comm, mpi_disabled,
-                                 prefer_pinned, torch_comm)
+                                 prefer_pinned, str_dtype_to_binding,
+                                 torch_comm, torch_dtype_to_str)
 from tensorrt_llm.bindings.internal.batch_manager import (
     KvCacheStats, LinearAttentionMetadata, LinearCacheType)
 from tensorrt_llm.bindings.internal.batch_manager.kv_cache_manager_v2_utils import (
@@ -67,9 +68,22 @@ RequestList = list[LlmRequest]
 PeftCacheManagerCpp = tensorrt_llm.bindings.internal.batch_manager.PeftCacheManager
 WorldConfig = tensorrt_llm.bindings.WorldConfig
 
+
+def _resolve_cache_binding_dtype(dtype) -> DataType:
+    if dtype is None:
+        return DataType.HALF
+    if dtype in (DataType.FP8, DataType.HALF, DataType.BF16, DataType.FLOAT,
+                 DataType.NVFP4):
+        return dtype
+    if isinstance(dtype, str):
+        return str_dtype_to_binding(dtype)
+    return str_dtype_to_binding(torch_dtype_to_str(dtype))
+
+
 if TYPE_CHECKING:
     from tensorrt_llm._torch.attention_backend.interface import \
         AttentionMetadata
+    from tensorrt_llm.llmapi.llm_args import DecodingBaseConfig
 
 BlocksPerWindow = Dict[int, Tuple[
     int,
@@ -475,6 +489,9 @@ def _update_kv_cache_draft_token_location(cache_manager,
                 run_kv_cache_relocation = True
     if not run_kv_cache_relocation:
         return
+    if getattr(cache_manager, "is_turboquant4", False):
+        raise RuntimeError(
+            "TurboQuant4 KV cache does not support draft-token relocation.")
     requests = scheduled_batch.all_requests()
     accepted_draft_token_offsets, packed_accepted_draft_tokens_indices, rewind_draft_token_separate_adjustments = _locate_accepted_draft_tokens(
         requests)
@@ -2099,6 +2116,8 @@ class KVCacheManagerV2(BaseResourceManager):
         self.mapping = mapping
         self.dtype = dtype
         self.is_disagg = is_disagg
+        self.is_turboquant4 = kv_cache_config.dtype == "turboquant4"
+        self._validate_turboquant4_cache_type(kv_cache_config, kv_cache_type)
 
         assert kv_connector_manager is None, "kv_connector_manager is not supported for KVCacheManagerV2"
         assert max_beam_width == 1, "max_beam_width must be 1 for KVCacheManagerV2"
@@ -2379,7 +2398,9 @@ class KVCacheManagerV2(BaseResourceManager):
             layer_id = self.impl.layer_grouping[pool_id][0]
             self.index_scales[pool_id] = self.impl.get_page_index_scale(
                 layer_id, Role.KEY)
-            if self.kv_cache_type != CacheTypeCpp.SELFKONLY:
+            if self.is_turboquant4:
+                self.kv_offset[pool_id] = 0
+            elif self.kv_cache_type != CacheTypeCpp.SELFKONLY:
                 self.kv_offset[pool_id] = exact_div(
                     self.impl.get_mem_pool_base_address(layer_id, Role.VALUE) -
                     self.impl.get_mem_pool_base_address(layer_id, Role.KEY),
@@ -2397,6 +2418,15 @@ class KVCacheManagerV2(BaseResourceManager):
             pin_memory=prefer_pinned(),
             device='cpu')
 
+    @staticmethod
+    def _validate_turboquant4_cache_type(kv_cache_config: KvCacheConfig,
+                                         kv_cache_type: CacheTypeCpp) -> None:
+        if (kv_cache_config.dtype == "turboquant4"
+                and kv_cache_type == CacheTypeCpp.SELFKONLY):
+            raise ValueError(
+                "TurboQuant4 KV cache requires both key and value cache "
+                "buffers; SELFKONLY cache is not supported.")
+
     def _get_quota_from_max_tokens(self, max_tokens: int) -> int:
         return int(max_tokens * self.get_cache_bytes_per_token())
 
@@ -2409,13 +2439,15 @@ class KVCacheManagerV2(BaseResourceManager):
                                               device="cpu",
                                               pin_memory=prefer_pinned())
 
-        if self.dtype == DataType.NVFP4:
+        has_block_scales = self.dtype == DataType.NVFP4 or self.is_turboquant4
+        scale_role = (Role.VALUE_BLOCK_SCALE
+                      if self.is_turboquant4 else Role.KEY_BLOCK_SCALE)
+        if has_block_scales:
             kv_cache_pool_pointers = torch.stack([
                 kv_cache_pool_pointers,
                 torch.tensor([[
                     self.impl.get_mem_pool_base_address(
-                        self.impl.layer_grouping[pool_id][0],
-                        Role.KEY_BLOCK_SCALE), 0
+                        self.impl.layer_grouping[pool_id][0], scale_role), 0
                 ] for pool_id in range(self.num_pools)],
                              dtype=torch.int64,
                              device="cpu",
@@ -2426,7 +2458,7 @@ class KVCacheManagerV2(BaseResourceManager):
         kv_cache_pool_mapping_list = []
         for layer_id in typed_range(LayerId(self.num_local_layers)):
             layer_group_id = self.impl.get_layer_group_id(layer_id)
-            if self.dtype != DataType.NVFP4:
+            if not has_block_scales:
                 addr_offset = self.impl.get_mem_pool_base_address(
                     layer_id, Role.KEY) - int(
                         kv_cache_pool_pointers[layer_group_id][0])
@@ -2435,19 +2467,20 @@ class KVCacheManagerV2(BaseResourceManager):
                     layer_id, Role.KEY) - int(
                         kv_cache_pool_pointers[layer_group_id][0][0])
                 block_scale_addr_offset = self.impl.get_mem_pool_base_address(
-                    layer_id, Role.KEY_BLOCK_SCALE) - int(
+                    layer_id, scale_role) - int(
                         kv_cache_pool_pointers[layer_group_id][0][1])
                 block_scale_offset = exact_div(
                     block_scale_addr_offset,
-                    self.get_layer_bytes_per_token(
-                        layer_id, Role.KEY_BLOCK_SCALE) * self.kv_factor *
+                    self.get_layer_bytes_per_token(layer_id, scale_role) *
+                    (1 if self.is_turboquant4 else self.kv_factor) *
                     self.tokens_per_block)
             offset = exact_div(
                 addr_offset,
                 self.get_layer_bytes_per_token(layer_id, Role.KEY) *
-                self.kv_factor * self.tokens_per_block)
+                (1 if self.is_turboquant4 else self.kv_factor) *
+                self.tokens_per_block)
 
-            if self.dtype == DataType.NVFP4:
+            if has_block_scales:
                 assert block_scale_offset == offset, "Block scale offset and offset should be the same"
 
             kv_cache_pool_mapping_list.append([layer_group_id, offset])
@@ -2469,10 +2502,23 @@ class KVCacheManagerV2(BaseResourceManager):
         buffer_type = [Role.KEY]
         if self.kv_cache_type != CacheTypeCpp.SELFKONLY:
             buffer_type.append(Role.VALUE)
-        if kv_cache_config.dtype == "nvfp4":
+        if kv_cache_config.dtype == "turboquant4":
             for layer_idx, hd in enumerate(self.head_dim_per_layer):
-                assert hd % 2 == 0, \
-                    f"head_dim must be divisible by 2 for nvfp4 kv cache, but layer {layer_idx} has head_dim={hd}"
+                if hd % 2 != 0:
+                    raise ValueError(
+                        "head_dim must be divisible by 2 for turboquant4 "
+                        f"kv cache, but layer {layer_idx} has head_dim={hd}")
+                if hd & (hd - 1) != 0:
+                    raise ValueError(
+                        "head_dim must be a power of 2 for turboquant4 "
+                        f"kv cache, but layer {layer_idx} has head_dim={hd}")
+            buffer_type.append(Role.VALUE_BLOCK_SCALE)
+        elif kv_cache_config.dtype == "nvfp4":
+            for layer_idx, hd in enumerate(self.head_dim_per_layer):
+                if hd % 2 != 0:
+                    raise ValueError(
+                        "head_dim must be divisible by 2 for nvfp4 kv cache, "
+                        f"but layer {layer_idx} has head_dim={hd}")
             buffer_type.append(Role.KEY_BLOCK_SCALE)
             if self.kv_cache_type != CacheTypeCpp.SELFKONLY:
                 buffer_type.append(Role.VALUE_BLOCK_SCALE)
@@ -2511,6 +2557,12 @@ class KVCacheManagerV2(BaseResourceManager):
     def get_buffers(self,
                     layer_idx: int,
                     kv_layout: str = "NHD") -> Optional[torch.Tensor]:
+        if self.is_turboquant4:
+            raise ValueError(
+                "TurboQuant4 KV cache uses asymmetric key, value, and value "
+                "scale buffers. Use get_turboquant4_key_buffers(), "
+                "get_turboquant4_value_buffers(), or "
+                "get_turboquant4_value_scale_buffers().")
         layer_offset = self.layer_offsets[layer_idx]
         addr_key = self.impl.get_mem_pool_base_address(layer_offset, Role.KEY)
         if self.kv_cache_type != CacheTypeCpp.SELFKONLY:
@@ -2527,7 +2579,10 @@ class KVCacheManagerV2(BaseResourceManager):
 
         element_per_container = 1
         dtype = self.dtype
-        if dtype == DataType.NVFP4:
+        if self.is_turboquant4:
+            element_per_container = 2
+            dtype = torch.uint8
+        elif dtype == DataType.NVFP4:
             element_per_container = 2
             dtype = torch.int8
 
@@ -2557,6 +2612,72 @@ class KVCacheManagerV2(BaseResourceManager):
             shape,
         ))
 
+    def _get_role_buffer(self,
+                         layer_idx: int,
+                         data_role: Role,
+                         dtype,
+                         last_dim: int,
+                         kv_layout: str = "NHD") -> torch.Tensor:
+        layer_offset = self.layer_offsets[layer_idx]
+        addr = self.impl.get_mem_pool_base_address(layer_offset, data_role)
+        assert kv_layout in ["NHD",
+                             "HND"], f"Unsupported kv_layout: {kv_layout}"
+        num_blocks = self.impl.get_page_index_upper_bound(
+            layer_offset, data_role)
+        if kv_layout == "NHD":
+            shape = [
+                num_blocks,
+                self.tokens_per_block,
+                self.num_kv_heads_per_layer[layer_offset],
+                last_dim,
+            ]
+        else:
+            shape = [
+                num_blocks,
+                self.num_kv_heads_per_layer[layer_offset],
+                self.tokens_per_block,
+                last_dim,
+            ]
+        return convert_to_torch_tensor(TensorWrapper(addr, dtype, shape))
+
+    def get_turboquant4_key_buffers(
+            self,
+            layer_idx: int,
+            kv_layout: str = "NHD") -> Optional[torch.Tensor]:
+        if not self.is_turboquant4:
+            return None
+        layer_offset = self.layer_offsets[layer_idx]
+        return self._get_role_buffer(layer_idx, Role.KEY, self.dtype,
+                                     self.head_dim_per_layer[layer_offset],
+                                     kv_layout)
+
+    def get_turboquant4_value_buffers(
+            self,
+            layer_idx: int,
+            kv_layout: str = "NHD") -> Optional[torch.Tensor]:
+        if not self.is_turboquant4:
+            return None
+        layer_offset = self.layer_offsets[layer_idx]
+        return self._get_role_buffer(layer_idx, Role.VALUE, torch.uint8,
+                                     self.head_dim_per_layer[layer_offset] // 2,
+                                     kv_layout)
+
+    def get_turboquant4_value_scale_buffers(
+            self,
+            layer_idx: int,
+            kv_layout: str = "NHD") -> Optional[torch.Tensor]:
+        if not self.is_turboquant4:
+            return None
+        return self._get_role_buffer(layer_idx, Role.VALUE_BLOCK_SCALE,
+                                     DataType.FLOAT, 1, kv_layout)
+
+    def get_scale_buffers(self,
+                          layer_idx: int,
+                          kv_layout: str = "NHD") -> Optional[torch.Tensor]:
+        if not self.is_turboquant4:
+            return None
+        return self.get_turboquant4_value_scale_buffers(layer_idx, kv_layout)
+
     def get_num_available_tokens(self,
                                  *,
                                  token_num_upper_bound: int,
@@ -2584,6 +2705,8 @@ class KVCacheManagerV2(BaseResourceManager):
             self.impl.get_page_index_upper_bound(layer_id, Role.KEY)
             for layer_id in typed_range(LayerId(self.num_local_layers))
         ])
+        if self.is_turboquant4:
+            return max_num_pages
         return max_num_pages // self.kv_factor
 
     # ---- Scheduling API (called by KVCacheV2Scheduler) ----
@@ -3122,6 +3245,25 @@ class KVCacheManagerV2(BaseResourceManager):
                                                         pool_id=pool_id,
                                                         is_kv_aggregate=True)
 
+    def get_batch_cache_indices_for_role(self, request_ids: List[int],
+                                         layer_id: int,
+                                         data_role: Role) -> List[List[int]]:
+        layer_offset = self.layer_offsets[layer_id]
+        pool_id = self.layer_to_pool_mapping_dict[layer_offset]
+        index_scale = self.impl.get_page_index_scale(layer_offset, data_role)
+        res = []
+        for req_id in request_ids:
+            base_page_indices = self.kv_cache_map[req_id].get_base_page_indices(
+                pool_id)
+            if hasattr(base_page_indices, "tolist"):
+                base_page_indices = base_page_indices.tolist()
+            res.append([
+                index *
+                index_scale if index != BAD_PAGE_INDEX else BAD_PAGE_INDEX
+                for index in base_page_indices
+            ])
+        return res
+
     def _get_batch_cache_indices_by_pool_id(
             self,
             request_ids: List[int],
@@ -3148,6 +3290,16 @@ class KVCacheManagerV2(BaseResourceManager):
         return res
 
     def get_cache_bytes_per_token(self) -> int:
+        if self.is_turboquant4:
+            data_roles = [Role.KEY, Role.VALUE_BLOCK_SCALE]
+            if self.kv_cache_type != CacheTypeCpp.SELFKONLY:
+                data_roles.append(Role.VALUE)
+            return sum(
+                self.get_layer_bytes_per_token(local_layer_idx=local_layer_idx,
+                                               data_role=data_role)
+                for local_layer_idx in range(self.num_local_layers)
+                for data_role in data_roles)
+
         data_roles = [Role.KEY]
         if self.kv_cache_type != CacheTypeCpp.SELFKONLY:
             data_roles.append(Role.VALUE)
@@ -3171,6 +3323,38 @@ class KVCacheManagerV2(BaseResourceManager):
                 DataType.NVFP4,
         ):
             raise ValueError(f"Cannot support {self.dtype} KV cache.")
+
+        if self.is_turboquant4:
+            layer_head_dim = self.head_dim_per_layer[local_layer_idx]
+            cache_size_per_token = self.num_kv_heads_per_layer[
+                local_layer_idx] * layer_head_dim
+            if data_role == Role.ALL:
+                key_bytes = get_size_in_bytes(cache_size_per_token, self.dtype)
+                value_bytes = get_size_in_bytes(cache_size_per_token,
+                                                DataType.NVFP4)
+                scale_bytes = self.calculate_scaling_factor_size_bytes(
+                    cache_size_per_token,
+                    quant_vector_size=layer_head_dim,
+                    scaling_factor_dtype=DataType.FLOAT,
+                )
+                return key_bytes + value_bytes + scale_bytes
+            if data_role == Role.KEY:
+                return get_size_in_bytes(cache_size_per_token, self.dtype)
+            if data_role == Role.VALUE:
+                assert self.kv_cache_type != CacheTypeCpp.SELFKONLY, (
+                    "VALUE data role is not supported for SELFKONLY cache type")
+                return get_size_in_bytes(cache_size_per_token, DataType.NVFP4)
+            if data_role == Role.VALUE_BLOCK_SCALE:
+                assert self.kv_cache_type != CacheTypeCpp.SELFKONLY, (
+                    "VALUE_BLOCK_SCALE data role is not supported for "
+                    "SELFKONLY cache type")
+                return self.calculate_scaling_factor_size_bytes(
+                    cache_size_per_token,
+                    quant_vector_size=layer_head_dim,
+                    scaling_factor_dtype=DataType.FLOAT,
+                )
+            raise ValueError(
+                f"Invalid data role for TurboQuant4 KV cache: {data_role}")
 
         if data_role == Role.ALL:
             kv_factor = self.kv_factor
@@ -3214,7 +3398,8 @@ class KVCacheManagerV2(BaseResourceManager):
     def calculate_scaling_factor_size_bytes(
             cache_size: int, quant_vector_size: int,
             scaling_factor_dtype: DataType) -> int:
-        assert cache_size % quant_vector_size == 0, "NVFP4 cache size must be divisible by quant vector size"
+        assert cache_size % quant_vector_size == 0, \
+            "Quantized cache size must be divisible by quant vector size"
         return get_size_in_bytes(cache_size // quant_vector_size,
                                  scaling_factor_dtype)
 
@@ -3231,19 +3416,27 @@ class KVCacheManagerV2(BaseResourceManager):
             pool_id = self.layer_to_pool_mapping_dict[layer_offset]
             if pool_id in pool_handled:
                 continue
-            buffer = self.get_buffers(layer_id)
+            if self.is_turboquant4:
+                buffers = [
+                    self.get_turboquant4_key_buffers(layer_id),
+                    self.get_turboquant4_value_buffers(layer_id),
+                    self.get_turboquant4_value_scale_buffers(layer_id),
+                ]
+            else:
+                buffers = [self.get_buffers(layer_id)]
             # process in chunks of 256 pages to avoid OoM
-            for i in range(0, buffer.shape[0], 256):
-                buffer_slice = buffer[i:i + 256]
-                try:
-                    has_invalid_values.logical_or_(
-                        torch.isnan(buffer_slice).any())
-                    has_invalid_values.logical_or_(
-                        torch.isinf(buffer_slice).any())
-                except NotImplementedError:
-                    some_checks_unavailable = True
-            if fill_with_zero:
-                buffer.zero_()
+            for buffer in buffers:
+                for i in range(0, buffer.shape[0], 256):
+                    buffer_slice = buffer[i:i + 256]
+                    try:
+                        has_invalid_values.logical_or_(
+                            torch.isnan(buffer_slice).any())
+                        has_invalid_values.logical_or_(
+                            torch.isinf(buffer_slice).any())
+                    except NotImplementedError:
+                        some_checks_unavailable = True
+                if fill_with_zero:
+                    buffer.zero_()
             pool_handled.add(pool_id)
         torch.cuda.synchronize()
 
@@ -3290,9 +3483,16 @@ class KVCacheManagerV2(BaseResourceManager):
         config = model_config.pretrained_config
         num_key_value_heads = getattr(config, 'num_key_value_heads',
                                       config.num_attention_heads)
+        num_key_value_heads_per_layer = None
         if isinstance(num_key_value_heads, Iterable):
-            num_key_value_heads = sum(num_key_value_heads) / len(
-                num_key_value_heads)
+            num_key_value_heads_per_layer = list(num_key_value_heads)
+            valid_num_key_value_heads = [
+                head for head in num_key_value_heads_per_layer
+                if head is not None
+            ]
+            num_key_value_heads = (sum(valid_num_key_value_heads) /
+                                   len(valid_num_key_value_heads)
+                                   if valid_num_key_value_heads else 0)
 
         # get head dim
         mla = hasattr(config,
@@ -3305,13 +3505,46 @@ class KVCacheManagerV2(BaseResourceManager):
             head_dim = getattr(config, "head_dim", None)
             if not isinstance(head_dim, int):
                 head_dim = config.hidden_size // config.num_attention_heads
-            head_dim = head_dim * num_key_value_heads // tp_size
+            local_num_kv_heads = math.ceil(num_key_value_heads / tp_size)
+            head_dim = head_dim * local_num_kv_heads
             kv_factor = 2
 
         num_attention_layers = KVCacheManager._resolve_num_attention_layers(
             model_config, mapping, num_layers)
-        mem_per_token *= num_attention_layers * head_dim
+        if (quant_config is not None
+                and quant_config.quant_mode.has_turboquant4_kv_cache()):
+            if num_key_value_heads_per_layer is None:
+                local_num_kv_heads_sum = num_attention_layers * math.ceil(
+                    num_key_value_heads /
+                    (1 if mapping.enable_attention_dp else mapping.tp_size))
+            else:
+                layer_ids = (list(range(num_attention_layers))
+                             if num_layers is not None else list(
+                                 mapping.pp_layers(
+                                     model_config.get_num_attention_layers())))
+                if not layer_ids:
+                    layer_ids = [0]
+                tp_size = 1 if mapping.enable_attention_dp else mapping.tp_size
+                local_num_kv_heads_sum = sum(
+                    math.ceil(num_key_value_heads_per_layer[layer_id] / tp_size)
+                    for layer_id in layer_ids
+                    if layer_id < len(num_key_value_heads_per_layer)
+                    and num_key_value_heads_per_layer[layer_id] is not None)
+            if mla:
+                head_dim_per_head = head_dim
+            else:
+                head_dim_per_head = getattr(config, "head_dim", None)
+                if not isinstance(head_dim_per_head, int):
+                    head_dim_per_head = config.hidden_size // config.num_attention_heads
+            key_dtype = _resolve_cache_binding_dtype(
+                getattr(config, "torch_dtype", None))
+            key_bytes = get_size_in_bytes(
+                local_num_kv_heads_sum * head_dim_per_head, key_dtype)
+            value_bytes = local_num_kv_heads_sum * (head_dim_per_head // 2)
+            scale_bytes = local_num_kv_heads_sum * 4
+            return key_bytes + value_bytes + scale_bytes
 
+        mem_per_token *= num_attention_layers * head_dim
         # K and V
         mem_per_token *= kv_factor
         return mem_per_token

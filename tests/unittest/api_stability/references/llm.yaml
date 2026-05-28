@@ -127,6 +127,10 @@ methods:
         annotation: tensorrt_llm.llmapi.llm_args.Nvfp4GemmConfig
         status: beta
         default: null
+      quant_config:
+        annotation: tensorrt_llm.models.modeling_utils.QuantConfig
+        default: null
+        status: prototype
       attn_backend:
         annotation: str
         default: TRTLLM

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020-2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2020-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,6 +15,7 @@
  */
 #pragma once
 
+#include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/quantization.h"
 #include "tensorrt_llm/kernels/gptKernels.h"
@@ -77,6 +78,11 @@ inline KvCacheDataType cacheTypeFromQuantMode(common::QuantMode quantMode)
         return KvCacheDataType::FP8;
     else if (quantMode.hasFp4KvCache())
         return KvCacheDataType::NVFP4;
+    else if (quantMode.hasTurboQuant4KvCache())
+    {
+        TLLM_CHECK_WITH_INFO(false, "TurboQuant4 KV cache requires dedicated packed-cache kernels and scale buffers.");
+        return KvCacheDataType::BASE;
+    }
     else
         return KvCacheDataType::BASE;
 }
@@ -335,7 +341,7 @@ template <typename T>
 void invokeAddFusedQKVBiasTranspose(T* q_buf, T* k_buf, T* v_buf, T* QKV, T const* qkv_bias, int const* seq_lens,
     int const* padding_offset, int const batch_size, int const seq_len, int const token_num, int const head_num,
     int const kv_head_num, int const size_per_head, int const rotary_embedding_dim, float rotary_embedding_base,
-    const RotaryScalingType rotary_scale_type, float rotary_embedding_scale, int const rotary_embedding_max_positions,
+    RotaryScalingType const rotary_scale_type, float rotary_embedding_scale, int const rotary_embedding_max_positions,
     PositionEmbeddingType const position_embedding_type, float const* scale, int const int8_mode, cudaStream_t stream);
 
 template <typename T>
@@ -351,7 +357,7 @@ template <typename T>
 void invokeAddFusedQKVBiasTranspose(T* q_buf, T* k_buf, T* v_buf, T* QKV, int const* seq_lens,
     int const* padding_offset, int const batch_size, int const seq_len, int const token_num, int const head_num,
     int const kv_head_num, int const size_per_head, int const rotary_embedding_dim, float rotary_embedding_base,
-    const RotaryScalingType rotary_scale_type, float rotary_embedding_scale, int const rotary_embedding_max_positions,
+    RotaryScalingType const rotary_scale_type, float rotary_embedding_scale, int const rotary_embedding_max_positions,
     PositionEmbeddingType const position_embedding_type, float const* scale, int const int8_mode, cudaStream_t stream)
 {
     invokeAddFusedQKVBiasTranspose(q_buf, k_buf, v_buf, QKV, (T const*) nullptr, seq_lens, padding_offset, batch_size,
@@ -363,7 +369,7 @@ void invokeAddFusedQKVBiasTranspose(T* q_buf, T* k_buf, T* v_buf, T* QKV, int co
 template <typename T, typename KVCacheBuffer>
 void invokeTranspose4dBatchMajor(T const* k_src, T const* v_src, KVCacheBuffer& kvTable, int const local_batch_size,
     int const seq_len, int const max_attention_window_size, int const size_per_head, int const local_head_num,
-    const KvCacheDataType cache_type, float const* kvScaleOrigQuant, int const* sequence_lengths, cudaStream_t stream);
+    KvCacheDataType const cache_type, float const* kvScaleOrigQuant, int const* sequence_lengths, cudaStream_t stream);
 
 template <typename T, typename T_cache, typename KVCacheBuffer>
 void invokeApplyBiasRopeUpdateKVCacheDispatch(QKVPreprocessingParams<T, KVCacheBuffer> params, cudaStream_t stream);
@@ -449,7 +455,7 @@ void invokeAddRelativeAttentionBiasUnaligned(T* qk_buf, const BT* relative_atten
 
 template <typename T, typename KVCacheBuffer>
 void invokeShiftKCache(KVCacheBuffer const& kvCacheBuffer, KVLinearBuffer const& shiftKCacheBuffer,
-    const KvCacheDataType cache_type, int const sizePerHead, int const timestep, int const batch_beam,
+    KvCacheDataType const cache_type, int const sizePerHead, int const timestep, int const batch_beam,
     int const kv_head_num, int const beam_width, int const maxKCacheLen, int const sinkTokenLen,
     float const* kScaleQuantOrig, int const* sequence_lengths, int const* input_lengths, int const rotary_embedding_dim,
     float rotary_embedding_base, RotaryScalingType const rotary_scale_type, float rotary_embedding_scale,

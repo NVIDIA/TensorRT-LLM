@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import copy
+import json
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -25,6 +26,10 @@ from transformers.models.llama4.configuration_llama4 import Llama4Config
 from tensorrt_llm._torch.auto_deploy.models.hf import (
     AutoModelForCausalLMFactory,
     hf_load_state_dict_with_device,
+)
+from tensorrt_llm._torch.auto_deploy.models.quant_config_reader import (
+    ModelOPTQuantConfigReader,
+    autodetect_quant_config_reader,
 )
 
 
@@ -78,6 +83,41 @@ def test_hf_load_state_dict_with_device():
                 original_load_state_dict.assert_called_once_with(
                     "dummy_checkpoint", device_map={"": "cuda"}
                 )
+
+
+def test_modelopt_quant_reader_rejects_turboquant4_kv_cache(tmp_path):
+    with open(tmp_path / "hf_quant_config.json", "w") as f:
+        json.dump(
+            {
+                "producer": {
+                    "name": "modelopt",
+                },
+                "quantization": {
+                    "quant_algo": "FP8",
+                    "kv_cache_quant_algo": "TURBOQUANT4",
+                },
+            },
+            f,
+        )
+
+    with pytest.raises(ValueError, match="TurboQuant4 KV cache is not supported with AutoDeploy"):
+        ModelOPTQuantConfigReader.from_file(str(tmp_path))
+
+
+def test_hf_quant_reader_rejects_turboquant4_kv_cache(tmp_path):
+    with open(tmp_path / "config.json", "w") as f:
+        json.dump(
+            {
+                "quantization_config": {
+                    "quant_method": "fp8",
+                    "kv_cache_quant_algo": "TURBOQUANT4",
+                },
+            },
+            f,
+        )
+
+    with pytest.raises(ValueError, match="TurboQuant4 KV cache is not supported with AutoDeploy"):
+        autodetect_quant_config_reader(str(tmp_path))
 
 
 @pytest.fixture

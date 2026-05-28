@@ -16,6 +16,7 @@
  */
 #pragma once
 
+#include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/cublasMMWrapper.h"
 #include "tensorrt_llm/common/opUtils.h"
@@ -283,6 +284,12 @@ public:
 
     static int getKvCacheElemSizeInBits(tensorrt_llm::common::QuantMode quantMode, size_t dTypeSize)
     {
+        if (quantMode.hasTurboQuant4KvCache())
+        {
+            TLLM_CHECK_WITH_INFO(
+                false, "TurboQuant4 KV cache requires dedicated packed-cache kernels and scale buffers.");
+            return 0;
+        }
         if (quantMode.hasInt8KvCache() || quantMode.hasFp8KvCache())
         {
             return 8;

@@ -23,6 +23,8 @@ def test_quant_mode():
     assert _tb.QuantMode.per_group_scaling().has_per_group_scaling
     assert _tb.QuantMode.int8_kv_cache().has_int8_kv_cache
     assert _tb.QuantMode.fp8_kv_cache().has_fp8_kv_cache
+    assert _tb.QuantMode.turboquant4_kv_cache().has_turboquant4_kv_cache
+    assert _tb.QuantMode.turboquant4_kv_cache().value == 1 << 18
     assert _tb.QuantMode.fp8_qdq().has_fp8_qdq
 
     quant_mode = _tb.QuantMode.from_description(True, True, True, True, True,
@@ -34,6 +36,22 @@ def test_quant_mode():
     assert not quant_mode.has_int4_weights
     quant_mode += _tb.QuantMode.int4_weights()
     assert quant_mode.has_int4_weights
+
+    quant_mode = _tb.QuantMode.from_description(False, False, False, False,
+                                                False, False, False, False,
+                                                False, False, False, False,
+                                                False, False, False, False,
+                                                True)
+    assert quant_mode.has_turboquant4_kv_cache
+    assert quant_mode.has_kv_cache_quant
+
+    quant_mode = _tb.QuantMode.from_quant_algo(
+        kv_cache_quant_algo="TURBOQUANT4")
+    assert quant_mode.has_turboquant4_kv_cache
+    assert quant_mode.has_kv_cache_quant
+
+    quant_mode = _tb.QuantMode.from_quant_algo(quant_algo="W4A8_NVFP4_FP8")
+    assert quant_mode.has_w4a8_nvfp4_fp8
 
     assert _tb.QuantMode.none() == _tb.QuantMode.none()
 

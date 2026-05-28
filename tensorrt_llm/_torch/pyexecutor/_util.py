@@ -70,6 +70,42 @@ def _non_hybrid_kv_cache_manager_cls(config, kv_cache_config: KvCacheConfig):
     return KVCacheManagerV2 if needs_v2 else KVCacheManager
 
 
+def _sync_turboquant4_kv_cache_config(kv_cache_config: KvCacheConfig,
+                                      quant_config) -> bool:
+    kv_cache_quant_algo = getattr(quant_config, "kv_cache_quant_algo", None)
+    kv_cache_quant_algo_value = getattr(kv_cache_quant_algo, "value",
+                                        kv_cache_quant_algo)
+    has_turboquant4_quant_algo = (isinstance(kv_cache_quant_algo_value, str)
+                                  and kv_cache_quant_algo_value.upper()
+                                  == "TURBOQUANT4")
+    quant_mode = getattr(quant_config, "quant_mode", None)
+    has_turboquant4_kv_cache = (kv_cache_config.dtype == "turboquant4"
+                                or has_turboquant4_quant_algo
+                                or (quant_mode is not None
+                                    and quant_mode.has_turboquant4_kv_cache()))
+    if has_turboquant4_kv_cache and kv_cache_config.dtype != "turboquant4":
+        if kv_cache_config.dtype != "auto":
+            logger.warning(
+                "TurboQuant4 KV cache requires "
+                "kv_cache_config.dtype='turboquant4'. "
+                f"Overriding kv_cache_config.dtype={kv_cache_config.dtype}.")
+        kv_cache_config.dtype = "turboquant4"
+    if (has_turboquant4_kv_cache
+            and getattr(kv_cache_config, "enable_block_reuse", False)):
+        logger.warning(
+            "TurboQuant4 KV cache currently uses packed data plus separate "
+            "scale buffers and does not support KV block reuse. Overriding "
+            "kv_cache_config.enable_block_reuse=False.")
+        kv_cache_config.enable_block_reuse = False
+    if (has_turboquant4_kv_cache
+            and not getattr(kv_cache_config, "use_kv_cache_manager_v2", False)):
+        logger.warning(
+            "TurboQuant4 KV cache requires KVCacheManagerV2. Overriding "
+            "kv_cache_config.use_kv_cache_manager_v2=True.")
+        kv_cache_config.use_kv_cache_manager_v2 = True
+    return has_turboquant4_kv_cache
+
+
 def get_kv_cache_manager_cls(
         model_config: ModelConfig,
         kv_cache_config: KvCacheConfig,
@@ -88,6 +124,31 @@ def get_kv_cache_manager_cls(
     """
     config = model_config.pretrained_config
     sparse_attn_config = model_config.sparse_attention_config
+    quant_config = model_config.quant_config
+    has_turboquant4_kv_cache = _sync_turboquant4_kv_cache_config(
+        kv_cache_config, quant_config)
+    is_hybrid_model = is_nemotron_hybrid(config) or is_qwen3_hybrid(config)
+    if has_turboquant4_kv_cache:
+        if is_mla(config):
+            raise ValueError(
+                "TurboQuant4 KV cache is not supported with MLA models.")
+        if getattr(kv_cache_config, "max_attention_window", None) is not None:
+            raise ValueError(
+                "TurboQuant4 KV cache is not supported with sliding-window attention."
+            )
+        if getattr(kv_cache_config, "event_buffer_max_size", 0) > 0:
+            raise ValueError(
+                "TurboQuant4 KV cache is not supported with KV cache event buffers."
+            )
+        if sparse_attn_config is not None:
+            raise ValueError(
+                "TurboQuant4 KV cache is not supported with sparse attention.")
+        if is_hybrid_model:
+            raise ValueError(
+                "TurboQuant4 KV cache is not supported with hybrid Mamba "
+                "models because MambaHybridCacheManager does not allocate "
+                "TurboQuant4 scale buffers.")
+        return KVCacheManagerV2
     if sparse_attn_config is not None:
         return get_sparse_attn_kv_cache_manager(sparse_attn_config)
     elif is_hybrid_linear(config):
@@ -255,6 +316,11 @@ class KvCacheCreator:
                     > 1) or self._kv_cache_config.event_buffer_max_size > 0 or (
                         self._cache_transceiver_config is not None
                         and self._cache_transceiver_config.backend is not None):
+                if self._kv_cache_config.dtype == "turboquant4":
+                    raise ValueError(
+                        "TurboQuant4 KV cache is not supported with "
+                        "kv_connector_manager, beam width > 1, KV cache "
+                        "event buffers, or cache transceiver.")
                 # Per-layer head_dim models (e.g., Gemma4 hybrid) require V2's
                 # split-pool layout. KVCacheManager (V1) coerces head_dim list
                 # to max(head_dim), changing per-layer KV byte sizes — which
@@ -1140,6 +1206,8 @@ def _create_kv_cache_manager(
         config = model_engine.model.model_config.pretrained_config
         quant_config = model_engine.model.model_config.quant_config
         _model_config = model_engine.model.model_config
+    has_turboquant4_kv_cache = _sync_turboquant4_kv_cache_config(
+        kv_cache_config, quant_config)
 
     if dtype is None:
         dtype = model_engine.dtype
@@ -1209,8 +1277,42 @@ def _create_kv_cache_manager(
     elif quant_config is not None and quant_config.quant_mode.has_fp4_kv_cache(
     ):
         kv_cache_dtype = tensorrt_llm.bindings.DataType.NVFP4
+    elif has_turboquant4_kv_cache:
+        kv_cache_dtype = str_dtype_to_binding(torch_dtype_to_str(dtype))
     else:
         kv_cache_dtype = str_dtype_to_binding(torch_dtype_to_str(dtype))
+
+    if has_turboquant4_kv_cache:
+        if is_mla(config):
+            raise ValueError(
+                "TurboQuant4 KV cache is not supported with MLA models.")
+        if kv_cache_config.max_attention_window is not None:
+            raise ValueError(
+                "TurboQuant4 KV cache is not supported with sliding-window attention."
+            )
+        if spec_config is not None:
+            raise ValueError(
+                "TurboQuant4 KV cache is not supported with speculative decoding."
+            )
+        if mapping.cp_size != 1 or bool(mapping.cp_config):
+            raise ValueError(
+                "TurboQuant4 KV cache is not supported with context parallelism."
+            )
+        if max_beam_width is not None and max_beam_width > 1:
+            raise ValueError(
+                "TurboQuant4 KV cache is not supported with beam search.")
+        if kv_connector_manager is not None:
+            raise ValueError(
+                "TurboQuant4 KV cache is not supported with KV cache connector."
+            )
+        if kv_cache_config.event_buffer_max_size > 0:
+            raise ValueError(
+                "TurboQuant4 KV cache is not supported with KV cache event buffers."
+            )
+        if spec_config is not None:
+            raise ValueError(
+                "TurboQuant4 KV cache is not supported with speculative decoding."
+            )
 
     # Use provided num_layers if available, otherwise use config.
     # When layer_mask is set (e.g., KV sharing), num_layers for the cache

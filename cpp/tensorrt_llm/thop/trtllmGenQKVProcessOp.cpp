@@ -460,6 +460,9 @@ void trtllmGenContextPostprocess(torch::Tensor qkv_input, torch::Tensor workspac
     auto const qkvScalarType = qkv_input.scalar_type();
     auto const qkvElementSize = static_cast<size_t>(qkv_input.element_size());
     auto const quantMode = tensorrt_llm::common::QuantMode(static_cast<uint32_t>(kv_cache_quant_mode));
+    TORCH_CHECK(!quantMode.hasTurboQuant4KvCache(),
+        "TurboQuant4 KV cache uses dedicated packed-cache update kernels and is not supported by "
+        "trtllm_gen_qkv_process.");
     auto const ptrs = [&]
     {
         auto const layout = TrtllmAttentionWorkspaceManager::buildContextLayout(

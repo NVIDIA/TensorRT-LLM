@@ -368,11 +368,13 @@ class ModelLoader:
                 )
         else:
             if quant_config.kv_cache_quant_algo not in [
-                    None, QuantAlgo.FP8, QuantAlgo.NVFP4
+                    None, QuantAlgo.FP8, QuantAlgo.NVFP4, QuantAlgo.TURBOQUANT4
             ]:
                 raise ValueError(
-                    f"Only kv_cache_quant_algo={QuantAlgo.FP8} or {QuantAlgo.NVFP4} is allowed for pre-quantized checkpoint, got {quant_config.kv_cache_quant_algo}."
-                )
+                    f"Only kv_cache_quant_algo={QuantAlgo.FP8}, "
+                    f"{QuantAlgo.NVFP4}, or {QuantAlgo.TURBOQUANT4} is "
+                    "allowed for pre-quantized checkpoint, got "
+                    f"{quant_config.kv_cache_quant_algo}.")
 
         # quantized_layers is handled separately (e.g. via LayerQuantConfig
         # in PretrainedConfig for TRT, or _torch/model_config.py for PyTorch)
@@ -389,7 +391,17 @@ class ModelLoader:
                 f"Setting {key}={str(value)[:100]}{'...' if len(str(value)) > 100 else ''} from HF quant config."
             )
             setattr(quant_config, key, value)
+
+        if (isinstance(self.llm_args, TrtLlmArgs)
+                and quant_config.kv_cache_quant_algo == QuantAlgo.TURBOQUANT4):
+            raise ValueError(
+                "TurboQuant4 KV cache is supported only by the PyTorch backend."
+            )
         self.llm_args.quant_config = quant_config
+        if quant_config.kv_cache_quant_algo == QuantAlgo.TURBOQUANT4:
+            if hasattr(self.llm_args,
+                       "sync_attn_backend_with_turboquant4_kv_cache"):
+                self.llm_args.sync_attn_backend_with_turboquant4_kv_cache()
 
     def _update_from_hf_quant_config(self) -> bool:
         """Update quant_config from the config file of pre-quantized HF checkpoint.
@@ -401,6 +413,7 @@ class ModelLoader:
         explicit_kv_cache_quant_algo = {
             "fp8": QuantAlgo.FP8,
             "nvfp4": QuantAlgo.NVFP4,
+            "turboquant4": QuantAlgo.TURBOQUANT4,
         }.get(kv_cache_dtype)
 
         hf_quant_config_path = f"{self._model_dir}/hf_quant_config.json"
@@ -907,7 +920,7 @@ class CachedModelLoader:
 
                     if not has_storage:
                         print_colored(
-                            f"Build cache is disabled since the cache storage is too small.\n ",
+                            "Build cache is disabled since the cache storage is too small.\n ",
                             'yellow')
                         print_colored(
                             f"Free storage: {free_storage}GB, Required storage: {require_size}GB\n",

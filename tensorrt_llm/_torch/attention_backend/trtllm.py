@@ -12,6 +12,9 @@ if TYPE_CHECKING:
     from ..speculative.spec_tree_manager import SpecTreeManager
 
 from tensorrt_llm._torch.attention_backend import trtllm_gen
+from tensorrt_llm._torch.modules.rotary_embedding import (MRotaryEmbedding,
+                                                          RotaryEmbedding)
+from tensorrt_llm._torch.pyexecutor.resource_manager import Role
 from tensorrt_llm._utils import get_sm_version, maybe_pin_memory, prefer_pinned
 from tensorrt_llm.bindings.internal import thop
 from tensorrt_llm.functional import AttentionMaskType
@@ -1062,6 +1065,8 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         self.print_skip_softmax_stat = os.environ.get(
             "TRTLLM_PRINT_SKIP_SOFTMAX_STAT", "0") == "1"
 
+        self.pos_embd_params = pos_embd_params
+        self.turboquant4_rotary_emb = None
         self.kv_cache_scaling_factor = torch.ones(1,
                                                   dtype=torch.float32,
                                                   device='cuda')
@@ -1075,10 +1080,13 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         self.quant_mode = int(self.quant_config.layer_quant_mode)
 
         self.has_fp8_qdq = self.has_fp8_kv_cache = self.has_nvfp4 = False
+        self.has_fp4_kv_cache = self.has_turboquant4_kv_cache = False
         if self.quant_config is not None:
             self.has_fp8_kv_cache = self.quant_config.layer_quant_mode.has_fp8_kv_cache(
             )
             self.has_fp4_kv_cache = self.quant_config.layer_quant_mode.has_fp4_kv_cache(
+            )
+            self.has_turboquant4_kv_cache = self.quant_config.layer_quant_mode.has_turboquant4_kv_cache(
             )
 
             self.has_fp8_qdq = self.quant_config.layer_quant_mode.has_fp8_qdq()
@@ -1089,6 +1097,452 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             self.has_nvfp4 = self.quant_config.layer_quant_mode.has_nvfp4()
             self.has_w4a8_nvfp4_fp8 = self.quant_config.layer_quant_mode.has_w4a8_nvfp4_fp8(
             )
+
+    def _get_turboquant4_rotary_emb(self):
+        if self.turboquant4_rotary_emb is not None:
+            return self.turboquant4_rotary_emb
+        pos_embd_params = getattr(self, "pos_embd_params", None)
+        if pos_embd_params is None:
+            return None
+        if not pos_embd_params.type.is_rope():
+            raise NotImplementedError(
+                "TurboQuant4 TRTLLM fallback supports RoPE positional "
+                f"embeddings only, got {pos_embd_params.type}.")
+        if pos_embd_params.type.is_mrope():
+            self.turboquant4_rotary_emb = MRotaryEmbedding(
+                pos_embd_params.rope,
+                head_dim=self.head_dim,
+                is_neox=pos_embd_params.is_neox,
+                mrope_section=pos_embd_params.mrope_section,
+                mrope_interleaved=pos_embd_params.mrope_interleaved)
+        else:
+            self.turboquant4_rotary_emb = RotaryEmbedding(
+                pos_embd_params.rope,
+                head_dim=self.head_dim,
+                is_neox=pos_embd_params.is_neox)
+        return self.turboquant4_rotary_emb
+
+    def _split_turboquant4_qkv(self, q: torch.Tensor, k: Optional[torch.Tensor],
+                               v: Optional[torch.Tensor]):
+        if k is not None or v is not None:
+            assert k is not None and v is not None
+            return q, k, v
+
+        q_size = self.num_heads * self.head_dim
+        kv_size = self.num_kv_heads * self.head_dim
+        return q.split([q_size, kv_size, kv_size], dim=-1)
+
+    def _write_turboquant4_cache(self, key_cache_tensor: torch.Tensor,
+                                 value_cache_tensor: torch.Tensor,
+                                 value_cache_scales: torch.Tensor,
+                                 key_block_ids: List[int],
+                                 value_block_ids: List[int],
+                                 scale_block_ids: List[int], start_pos: int,
+                                 k_states: torch.Tensor, v_states: torch.Tensor,
+                                 tokens_per_block: int) -> None:
+        from tensorrt_llm._torch.modules.turboquant4 import (
+            turboquant4_update_value_cache, update_turboquant4_dense_key_cache)
+
+        update_turboquant4_dense_key_cache(k_states.squeeze(0),
+                                           key_cache_tensor, key_block_ids,
+                                           start_pos, tokens_per_block)
+        turboquant4_update_value_cache(v_states.squeeze(0), value_cache_tensor,
+                                       value_cache_scales, value_block_ids,
+                                       scale_block_ids, start_pos,
+                                       tokens_per_block)
+
+    def _turboquant4_batch_attention(
+        self,
+        q: torch.Tensor,
+        key_cache_tensor: torch.Tensor,
+        value_cache_tensor: torch.Tensor,
+        value_cache_scales: torch.Tensor,
+        key_block_ids_per_seq: List[List[int]],
+        value_block_ids_per_seq: List[List[int]],
+        scale_block_ids_per_seq: List[List[int]],
+        q_batch_indices: List[int],
+        query_positions: List[int],
+        seq_lens: List[int],
+        tokens_per_block: int,
+        attention_mask: AttentionMask,
+        attention_window_size: Optional[int],
+        dense_value_states_per_seq: Optional[List[Optional[
+            torch.Tensor]]] = None,
+        dense_value_start_positions: Optional[List[Optional[int]]] = None,
+    ) -> torch.Tensor:
+        from tensorrt_llm._torch.modules.turboquant4 import \
+            turboquant4_value_only_batch_attention
+
+        is_causal = attention_mask == PredefinedAttentionMask.CAUSAL
+        if attention_mask not in (PredefinedAttentionMask.CAUSAL,
+                                  PredefinedAttentionMask.FULL):
+            raise ValueError("Unexpected attention mask type")
+        window_size = attention_window_size if is_causal else None
+        q_states = q.view(q.shape[0], self.num_heads, self.head_dim)
+        return turboquant4_value_only_batch_attention(
+            q_states,
+            key_cache_tensor,
+            value_cache_tensor,
+            value_cache_scales,
+            key_block_ids_per_seq,
+            value_block_ids_per_seq,
+            scale_block_ids_per_seq,
+            torch.tensor(q_batch_indices, dtype=torch.int32),
+            torch.tensor(query_positions, dtype=torch.int32),
+            torch.tensor(seq_lens, dtype=torch.int32),
+            tokens_per_block,
+            self.q_scaling or 1.0,
+            is_causal,
+            window_size,
+            max(seq_lens) if seq_lens else 0,
+            dense_value_states_per_seq,
+            dense_value_start_positions,
+        ).view(q.shape[0], self.num_heads * self.head_dim)
+
+    def _turboquant4_dense_context_attention(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        seq_lens: List[int],
+        attention_mask: AttentionMask,
+        attention_window_size: Optional[int],
+    ) -> torch.Tensor:
+        if attention_mask not in (PredefinedAttentionMask.CAUSAL,
+                                  PredefinedAttentionMask.FULL):
+            raise ValueError("Unexpected attention mask type")
+        if attention_window_size is not None and attention_window_size < 0:
+            raise ValueError("Unexpected negative attention window size")
+
+        q_scaling = self.q_scaling or 1.0
+        scale = 1 / (math.sqrt(self.head_dim) * q_scaling)
+        outputs = []
+        offset = 0
+        kv_repeats = self.num_heads // self.num_kv_heads
+        is_causal = attention_mask == PredefinedAttentionMask.CAUSAL
+        for seq_len in seq_lens:
+            q_chunk = q[offset:offset + seq_len]
+            k_chunk = k[offset:offset + seq_len]
+            v_chunk = v[offset:offset + seq_len]
+            offset += seq_len
+            if seq_len == 0:
+                continue
+
+            q_states = q_chunk.view(1, seq_len, self.num_heads,
+                                    self.head_dim).transpose(1, 2)
+            key_states = k_chunk.view(1, seq_len, self.num_kv_heads,
+                                      self.head_dim).transpose(1, 2).to(q.dtype)
+            value_states = v_chunk.view(1, seq_len, self.num_kv_heads,
+                                        self.head_dim).transpose(1,
+                                                                 2).to(q.dtype)
+            if kv_repeats != 1:
+                key_states = key_states[:, :, None, :, :].expand(
+                    1, self.num_kv_heads, kv_repeats, seq_len, self.head_dim)
+                key_states = key_states.reshape(1, self.num_heads, seq_len,
+                                                self.head_dim)
+                value_states = value_states[:, :, None, :, :].expand(
+                    1, self.num_kv_heads, kv_repeats, seq_len, self.head_dim)
+                value_states = value_states.reshape(1, self.num_heads, seq_len,
+                                                    self.head_dim)
+
+            sdpa_is_causal = False
+            attn_mask = None
+            if is_causal:
+                if attention_window_size is None or attention_window_size == 0:
+                    sdpa_is_causal = True
+                else:
+                    cache_position = torch.arange(seq_len, device=q.device)
+                    kv_positions = torch.arange(seq_len,
+                                                device=q.device).unsqueeze(0)
+                    allowed = kv_positions <= cache_position.unsqueeze(-1)
+                    allowed = allowed & (kv_positions
+                                         > cache_position.unsqueeze(-1) -
+                                         attention_window_size)
+                    attn_mask = allowed[None, None, :, :]
+
+            outputs.append(
+                torch.nn.functional.scaled_dot_product_attention(
+                    q_states,
+                    key_states,
+                    value_states,
+                    is_causal=sdpa_is_causal,
+                    attn_mask=attn_mask,
+                    scale=scale,
+                ).transpose(1, 2).contiguous().view(
+                    seq_len, self.num_heads * self.head_dim))
+
+        if not outputs:
+            return q.new_empty((0, self.num_heads * self.head_dim))
+        return torch.cat(outputs, dim=0)
+
+    def _turboquant4_forward(
+        self,
+        q: torch.Tensor,
+        k: Optional[torch.Tensor],
+        v: Optional[torch.Tensor],
+        metadata: TrtllmAttentionMetadata,
+        output: Optional[torch.Tensor],
+        output_sf: Optional[torch.Tensor],
+        attention_mask: AttentionMask,
+        attention_window_size: Optional[int],
+        position_ids: Optional[torch.Tensor] = None,
+        mrope_config: Optional[dict] = None,
+        **kwargs,
+    ) -> torch.Tensor:
+        if self.is_mla_enable:
+            raise NotImplementedError(
+                "TurboQuant4 TRTLLM fallback does not support MLA.")
+        if self.sparse_attention_config is not None:
+            raise NotImplementedError(
+                "TurboQuant4 TRTLLM fallback does not support sparse attention."
+            )
+        if metadata.beam_width != 1:
+            raise NotImplementedError(
+                "TurboQuant4 TRTLLM fallback currently supports beam_width=1 only."
+            )
+        if metadata.enable_helix:
+            raise NotImplementedError(
+                "TurboQuant4 TRTLLM fallback does not support Helix parallelism."
+            )
+        if metadata.is_spec_decoding_enabled or metadata.use_spec_decoding:
+            raise NotImplementedError(
+                "TurboQuant4 TRTLLM fallback does not support speculative decoding."
+            )
+        if getattr(metadata, "is_cuda_graph", False):
+            raise NotImplementedError(
+                "TurboQuant4 TRTLLM fallback does not support CUDA graph capture."
+            )
+        if position_ids is None:
+            position_ids = getattr(metadata, "position_ids", None)
+        if self.attention_chunk_size:
+            raise NotImplementedError(
+                "TurboQuant4 TRTLLM fallback does not support chunked attention."
+            )
+        pos_embd_params = getattr(self, "pos_embd_params", None)
+        is_mrope = (pos_embd_params is not None
+                    and pos_embd_params.type.is_mrope())
+        if is_mrope or mrope_config is not None:
+            raise NotImplementedError(
+                "TurboQuant4 TRTLLM fallback does not support MRoPE metadata.")
+        if metadata.kv_cache_manager is None:
+            raise RuntimeError(
+                "TurboQuant4 TRTLLM fallback requires KVCacheManagerV2.")
+        if not all(
+                hasattr(metadata.kv_cache_manager, name) for name in (
+                    "get_turboquant4_key_buffers",
+                    "get_turboquant4_value_buffers",
+                    "get_turboquant4_value_scale_buffers",
+                )):
+            raise RuntimeError(
+                "TurboQuant4 TRTLLM fallback requires KVCacheManagerV2 "
+                "asymmetric cache buffers.")
+        if output_sf is not None:
+            raise NotImplementedError(
+                "TurboQuant4 TRTLLM fallback does not support NVFP4 attention output."
+            )
+        if kwargs.get("attention_mask_data") is not None:
+            raise NotImplementedError(
+                "TurboQuant4 TRTLLM fallback does not support explicit attention masks."
+            )
+        if kwargs.get("attention_sinks") is not None:
+            raise NotImplementedError(
+                "TurboQuant4 TRTLLM fallback does not support attention sinks.")
+
+        key_cache_tensor = metadata.kv_cache_manager.get_turboquant4_key_buffers(
+            self.layer_idx)
+        value_cache_tensor = metadata.kv_cache_manager.get_turboquant4_value_buffers(
+            self.layer_idx)
+        value_cache_scales = metadata.kv_cache_manager.get_turboquant4_value_scale_buffers(
+            self.layer_idx)
+        if (key_cache_tensor is None or value_cache_tensor is None
+                or value_cache_scales is None):
+            raise RuntimeError(
+                "TurboQuant4 TRTLLM fallback requires asymmetric KV buffers "
+                "from KVCacheManagerV2.")
+
+        is_fused_qkv = k is None and v is None
+        q, k, v = self._split_turboquant4_qkv(q, k, v)
+        num_q_tokens = int(metadata.seq_lens.sum().item())
+        num_kv_tokens = int(metadata.seq_lens_kv.sum().item())
+        if is_fused_qkv and num_q_tokens != num_kv_tokens:
+            raise NotImplementedError(
+                "TurboQuant4 TRTLLM fallback requires separate Q/K/V tensors "
+                "when query and KV token counts differ.")
+        q = q[:num_q_tokens]
+        k = k[:num_kv_tokens]
+        v = v[:num_kv_tokens]
+        turboquant4_rotary_emb = self._get_turboquant4_rotary_emb()
+        if turboquant4_rotary_emb is not None:
+            if num_q_tokens != num_kv_tokens:
+                raise NotImplementedError(
+                    "TurboQuant4 TRTLLM fallback does not support RoPE with "
+                    "different query and KV token counts.")
+            if position_ids is None:
+                raise RuntimeError(
+                    "TurboQuant4 TRTLLM fallback requires position_ids when "
+                    "RoPE fusion is enabled.")
+            q, k = turboquant4_rotary_emb(position_ids[..., :num_q_tokens],
+                                          [q, k])
+
+        assert metadata.request_ids is not None
+        key_block_ids_per_seq = metadata.kv_cache_manager.get_batch_cache_indices_for_role(
+            metadata.request_ids, self.layer_idx, Role.KEY)
+        value_block_ids_per_seq = metadata.kv_cache_manager.get_batch_cache_indices_for_role(
+            metadata.request_ids, self.layer_idx, Role.VALUE)
+        scale_block_ids_per_seq = metadata.kv_cache_manager.get_batch_cache_indices_for_role(
+            metadata.request_ids, self.layer_idx, Role.VALUE_BLOCK_SCALE)
+        past_seen_tokens = metadata.kv_cache_params.num_cached_tokens_per_seq
+        tokens_per_block = metadata.tokens_per_block
+
+        offset_q = 0
+        offset_kv = 0
+        q_batch_indices = []
+        query_positions = []
+        seq_lens = []
+        per_sample_state = []
+        dense_value_states_per_seq = []
+        dense_value_start_positions = []
+        for sample_idx, (seq_len, seq_len_kv) in enumerate(
+                zip(metadata.seq_lens, metadata.seq_lens_kv, strict=True)):
+            q_len = int(seq_len.item())
+            kv_len = int(seq_len_kv.item())
+            if q_len != kv_len:
+                raise NotImplementedError(
+                    "TurboQuant4 TRTLLM fallback requires matching query and "
+                    "new KV token counts per request.")
+            single_k = k[offset_kv:offset_kv + kv_len]
+            single_v = v[offset_kv:offset_kv + kv_len]
+
+            past_seen_token = int(past_seen_tokens[sample_idx])
+            if kv_len > 0:
+                k_states = single_k.view(1, kv_len, self.num_kv_heads,
+                                         self.head_dim)
+                v_states = single_v.view(1, kv_len, self.num_kv_heads,
+                                         self.head_dim)
+                self._write_turboquant4_cache(
+                    key_cache_tensor, value_cache_tensor, value_cache_scales,
+                    key_block_ids_per_seq[sample_idx],
+                    value_block_ids_per_seq[sample_idx],
+                    scale_block_ids_per_seq[sample_idx], past_seen_token,
+                    k_states, v_states, tokens_per_block)
+                dense_value_states_per_seq.append(v_states.squeeze(0))
+                dense_value_start_positions.append(past_seen_token)
+            else:
+                dense_value_states_per_seq.append(None)
+                dense_value_start_positions.append(None)
+
+            total_kv_len = past_seen_token + kv_len
+            seq_lens.append(total_kv_len)
+            q_batch_indices.extend([sample_idx] * q_len)
+            query_positions.extend(
+                range(past_seen_token, past_seen_token + q_len))
+            per_sample_state.append((sample_idx, offset_q, offset_kv, q_len,
+                                     kv_len, past_seen_token, total_kv_len))
+            offset_q += q_len
+            offset_kv += kv_len
+
+        if all(sample_state[5] == 0 for sample_state in per_sample_state):
+            attn_output = self._turboquant4_dense_context_attention(
+                q,
+                k,
+                v,
+                seq_lens,
+                attention_mask,
+                attention_window_size,
+            )
+        elif all(sample_state[5] > 0 for sample_state in per_sample_state):
+            attn_output = self._turboquant4_batch_attention(
+                q,
+                key_cache_tensor,
+                value_cache_tensor,
+                value_cache_scales,
+                key_block_ids_per_seq,
+                value_block_ids_per_seq,
+                scale_block_ids_per_seq,
+                q_batch_indices,
+                query_positions,
+                seq_lens,
+                tokens_per_block,
+                attention_mask,
+                attention_window_size,
+                dense_value_states_per_seq,
+                dense_value_start_positions,
+            )
+        else:
+            attn_output = q.new_empty(
+                (num_q_tokens, self.num_heads * self.head_dim))
+            quant_q_chunks = []
+            quant_key_block_ids_per_seq = []
+            quant_value_block_ids_per_seq = []
+            quant_scale_block_ids_per_seq = []
+            quant_q_batch_indices = []
+            quant_query_positions = []
+            quant_seq_lens = []
+            quant_output_spans = []
+            quant_dense_value_states_per_seq = []
+            quant_dense_value_start_positions = []
+            for (sample_idx, q_start, kv_start, q_len, kv_len, past_seen_token,
+                 total_kv_len) in per_sample_state:
+                q_end = q_start + q_len
+                kv_end = kv_start + kv_len
+                if past_seen_token == 0:
+                    attn_output[q_start:q_end].copy_(
+                        self._turboquant4_dense_context_attention(
+                            q[q_start:q_end],
+                            k[kv_start:kv_end],
+                            v[kv_start:kv_end],
+                            [total_kv_len],
+                            attention_mask,
+                            attention_window_size,
+                        ))
+                    continue
+
+                quant_batch_idx = len(quant_key_block_ids_per_seq)
+                quant_q_chunks.append(q[q_start:q_end])
+                quant_key_block_ids_per_seq.append(
+                    key_block_ids_per_seq[sample_idx])
+                quant_value_block_ids_per_seq.append(
+                    value_block_ids_per_seq[sample_idx])
+                quant_scale_block_ids_per_seq.append(
+                    scale_block_ids_per_seq[sample_idx])
+                quant_q_batch_indices.extend([quant_batch_idx] * q_len)
+                quant_query_positions.extend(
+                    range(past_seen_token, past_seen_token + q_len))
+                quant_seq_lens.append(total_kv_len)
+                quant_output_spans.append((q_start, q_end))
+                quant_dense_value_states_per_seq.append(
+                    dense_value_states_per_seq[sample_idx])
+                quant_dense_value_start_positions.append(
+                    dense_value_start_positions[sample_idx])
+
+            if quant_q_chunks:
+                quant_output = self._turboquant4_batch_attention(
+                    torch.cat(quant_q_chunks, dim=0),
+                    key_cache_tensor,
+                    value_cache_tensor,
+                    value_cache_scales,
+                    quant_key_block_ids_per_seq,
+                    quant_value_block_ids_per_seq,
+                    quant_scale_block_ids_per_seq,
+                    quant_q_batch_indices,
+                    quant_query_positions,
+                    quant_seq_lens,
+                    tokens_per_block,
+                    attention_mask,
+                    attention_window_size,
+                    quant_dense_value_states_per_seq,
+                    quant_dense_value_start_positions,
+                )
+                quant_offset = 0
+                for q_start, q_end in quant_output_spans:
+                    q_len = q_end - q_start
+                    attn_output[q_start:q_end].copy_(
+                        quant_output[quant_offset:quant_offset + q_len])
+                    quant_offset += q_len
+        if output is not None:
+            output[:num_q_tokens].copy_(attn_output)
+            return output
+        return attn_output
 
     def get_local_layer_idx(self, metadata: TrtllmAttentionMetadata) -> int:
         if metadata.kv_cache_manager is None:
@@ -1535,6 +1989,35 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             or metadata.runtime_features.cache_reuse
             or metadata.runtime_features.has_speculative_draft_tokens
         ) if metadata.runtime_features else False
+
+        if self.has_turboquant4_kv_cache:
+            if (forward_args.out_scale is not None
+                    or forward_args.out_scale_sf is not None
+                    or forward_args.output_sf is not None):
+                raise NotImplementedError(
+                    "TurboQuant4 TRTLLM fallback does not support quantized "
+                    "attention output.")
+            return self._turboquant4_forward(
+                q,
+                k,
+                v,
+                metadata,
+                forward_args.output,
+                forward_args.output_sf,
+                forward_args.attention_mask,
+                forward_args.attention_window_size,
+                getattr(metadata, "position_ids", None),
+                mrope_config=({
+                    "mrope_rotary_cos_sin":
+                    forward_args.mrope_rotary_cos_sin,
+                    "mrope_position_deltas":
+                    forward_args.mrope_position_deltas,
+                } if forward_args.mrope_rotary_cos_sin is not None
+                              or forward_args.mrope_position_deltas is not None
+                              else None),
+                attention_mask_data=forward_args.attention_mask_data,
+                attention_sinks=forward_args.attention_sinks,
+            )
 
         # This is a workaround for https://nvbugs/5624818
         # Paged context FMHA is forced on SM90 for correctness
