@@ -86,6 +86,8 @@ class KVCacheIterationStatsDelta:
     iter_offload_bytes: int = 0
     iter_intra_device_copy_blocks: int = 0
     iter_intra_device_copy_bytes: int = 0
+    iter_host_dropped_blocks: int = 0
+    iter_host_dropped_bytes: int = 0
 
 # From _config.py
 DataRole = NewType("DataRole", str)
@@ -171,6 +173,7 @@ class KVCacheManagerConfig:
     enable_partial_reuse: bool = True
     constraints: list[BatchDesc] = ...
     typical_step: BatchDesc | None = None
+    initial_pool_ratio: list[float] | None = None
     ssm_reuse_interval: int = 512
     swa_scratch_reuse: SwaScratchReuseConfig | None = None
     enable_stats: bool = True

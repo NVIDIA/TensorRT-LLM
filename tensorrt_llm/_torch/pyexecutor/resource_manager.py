@@ -2476,6 +2476,7 @@ class KVCacheManagerV2(BaseResourceManager):
             max_util_for_resume=kv_cache_config.max_util_for_resume,
             enable_stats=self.enable_stats,
             swa_scratch_reuse=scratch_reuse_config,
+            initial_pool_ratio=kv_cache_config.pool_ratio,
             layers=[
                 AttentionLayerConfig(
                     layer_id=layer_id,
@@ -3135,6 +3136,9 @@ class KVCacheManagerV2(BaseResourceManager):
             for pool_group_id in pool_group_ids)
         stats.primary_used_num_blocks = (stats.primary_max_num_blocks -
                                          stats.primary_free_num_blocks)
+        stats.primary_evictable_num_blocks = sum(
+            primary_stats[pool_group_id].evictable
+            for pool_group_id in pool_group_ids)
         stats.secondary_max_num_blocks = sum(
             level_stats[pool_group_id].total
             for level_stats in secondary_stats_by_level
@@ -3145,6 +3149,10 @@ class KVCacheManagerV2(BaseResourceManager):
             for pool_group_id in pool_group_ids)
         stats.secondary_used_num_blocks = (stats.secondary_max_num_blocks -
                                            stats.secondary_free_num_blocks)
+        stats.secondary_evictable_num_blocks = sum(
+            level_stats[pool_group_id].evictable
+            for level_stats in secondary_stats_by_level
+            for pool_group_id in pool_group_ids)
         self._apply_iteration_stats_delta(stats, delta, field_names)
         return stats
 

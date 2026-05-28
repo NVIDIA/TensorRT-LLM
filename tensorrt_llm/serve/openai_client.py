@@ -85,8 +85,12 @@ class OpenAIClient(ABC):
     async def shutdown(self) -> None: ...
 
     @abstractmethod
-    async def _finish_request(self, request: UCompletionRequest) -> None:
-        """Finish the request in the router."""
+    async def _finish_request(self, request: UCompletionRequest, success: bool = True) -> None:
+        """Finish the request in the router.
+
+        ``success`` lets the router distinguish completed vs failed requests
+        (e.g. for cache backfill).
+        """
         ...
 
 
@@ -129,9 +133,10 @@ class OpenAIHttpClient(OpenAIClient):
         if server is None:
             server, _ = await self._router.get_next_server(request)
         url = f"http://{server}/{endpoint}"
-        logger.debug(
-            f"Sending {self._role} request {request.disaggregated_params.ctx_request_id} to {url}"
-        )
+        # disaggregated_params is None when conditional_disagg bypasses ctx.
+        _dp = request.disaggregated_params
+        _ctx_rid = _dp.ctx_request_id if _dp is not None else None
+        logger.debug(f"Sending {self._role} request {_ctx_rid} to {url}")
         try:
             self._metrics_collector.total_requests.inc()
             resp_generator = self._post_with_retry(server, url, request, hooks)
@@ -153,7 +158,7 @@ class OpenAIHttpClient(OpenAIClient):
         except Exception:
             self._metrics_collector.error_requests.inc()
             # finish the request upon error
-            await self._finish_request(request)
+            await self._finish_request(request, success=False)
             raise
 
     async def _post_with_retry(
@@ -164,7 +169,13 @@ class OpenAIHttpClient(OpenAIClient):
         hooks: Optional[ResponseHooks] = None,
     ) -> AsyncGenerator[Any, None]:
         is_stream = request.stream
-        for attempt in range(self._max_retries + 1):
+        # Loop range must cover the transient-TCP extended budget (up to 5)
+        # so the conditional raise inside the except block can actually decide
+        # to keep retrying.  Non-transient errors still raise on the first
+        # attempt that reaches self._max_retries.
+        _TRANSIENT_TCP_BUDGET = 5
+        loop_max = max(self._max_retries, _TRANSIENT_TCP_BUDGET) + 1
+        for attempt in range(loop_max):
             # Regenerate disagg_request_id on retry to avoid ID collision on workers
             if attempt > 0 and self._disagg_id_generator is not None:
                 dp = getattr(request, "disaggregated_params", None)
@@ -215,15 +226,27 @@ class OpenAIHttpClient(OpenAIClient):
                         traceback.format_exc(),
                     )
                     raise
-                if attempt == self._max_retries:
+                # Selective retry budget: ServerDisconnectedError and
+                # ConnectionResetError are transient TCP races (typically at
+                # burst start when client keepalive vs server keepalive race).
+                # Give them an extended retry budget while preserving the
+                # original fail-fast for genuine upstream errors.
+                is_transient_tcp = isinstance(
+                    e,
+                    (aiohttp.ServerDisconnectedError, ConnectionResetError),
+                )
+                effective_max = self._max_retries
+                if is_transient_tcp:
+                    effective_max = max(self._max_retries, _TRANSIENT_TCP_BUDGET)
+                if attempt >= effective_max:
                     logger.error(
-                        f"Client error to {url}: {e} - last retry {attempt} of {self._max_retries}"
+                        f"Client error to {url}: {e} - last retry {attempt} of {effective_max}"
                         "failed",
                         traceback.format_exc(),
                     )
                     raise
                 logger.error(
-                    f"{self._role} client error to {url}: {e} - retry {attempt} of {self._max_retries}",
+                    f"{self._role} client error to {url}: {e} - retry {attempt} of {effective_max}",
                     traceback.format_exc(),
                 )
                 await asyncio.sleep(self._retry_interval_sec)
@@ -246,6 +269,7 @@ class OpenAIHttpClient(OpenAIClient):
         assert "text/event-stream" in http_response.headers.get("Content-Type", ""), (
             "Response is not streaming"
         )
+        success = True
         try:
             last_token_time = start_time
             i = 0
@@ -276,17 +300,19 @@ class OpenAIHttpClient(OpenAIClient):
             # a client error is expected when the response stream is done if the connector has close=True
             logger.error(f"{self._role} client {server} error: {e}")
             self._metrics_collector.error_requests.inc()
+            success = False
             raise
         except Exception:
             self._metrics_collector.error_requests.inc()
+            success = False
             raise
         finally:
             # finish the request after streaming response is done or error is raised
-            await self._finish_request(request)
+            await self._finish_request(request, success=success)
 
-    async def _finish_request(self, request: UCompletionRequest) -> None:
+    async def _finish_request(self, request: UCompletionRequest, success: bool = True) -> None:
         self._metrics_collector.completed_requests.inc()
-        await self._router.finish_request(request, self._session)
+        await self._router.finish_request(request, self._session, success=success)
 
     async def collect_metrics(self) -> Dict[str, Any]:
         metrics = {}

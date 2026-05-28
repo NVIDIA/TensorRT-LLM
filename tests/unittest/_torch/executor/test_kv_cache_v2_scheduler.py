@@ -101,13 +101,18 @@ def make_encoder_request(request_id, encoder_output_len, lora_task_id=None):
 
 
 def make_disagg_request(
-    request_id, context_remaining_length=100, lora_task_id=None, num_draft_tokens=0
+    request_id,
+    context_remaining_length=100,
+    lora_task_id=None,
+    num_draft_tokens=0,
+    prompt_len=None,
 ):
     req = Mock()
     req.request_id = request_id
     req.py_request_id = request_id
     req.state_value = DISAGG_GEN_INIT
     req.context_remaining_length = context_remaining_length
+    req.prompt_len = prompt_len if prompt_len is not None else context_remaining_length
     req.is_context_init_state = False
     req.is_generation_in_progress_state = False
     req.is_first_context_chunk = True
@@ -1181,8 +1186,8 @@ class TestDisagg:
         mgr = make_kv_cache_manager(resize_context_fn=resize_fn)
         sched = make_scheduler(mgr, max_num_tokens=100)
         reqs = [
-            make_disagg_request(0, context_remaining_length=200),
-            make_disagg_request(1, context_remaining_length=512),
+            make_disagg_request(0, context_remaining_length=200, prompt_len=200),
+            make_disagg_request(1, context_remaining_length=512, prompt_len=512),
         ]
         sched.schedule_request(reqs, set())
         assert captured[0] == 200

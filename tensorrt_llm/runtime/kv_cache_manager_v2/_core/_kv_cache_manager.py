@@ -260,6 +260,7 @@ class KVCacheManager:
             config.swa_scratch_reuse,
             typical_batch=config.typical_step,
             constraints=config.constraints,
+            initial_pool_ratio=config.initial_pool_ratio,
             event_manager=event_manager,
         )
         self._living_kv_caches = set[rawref.ref[_KVCache]]()
