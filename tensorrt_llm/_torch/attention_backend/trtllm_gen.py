@@ -590,18 +590,9 @@ class FlashInferTrtllmGenAttention:
         forward_args: AttentionForwardArgs,
         quant_mode: int,
     ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
-        attention_layer = self._get_attention_layer()
         kv_cache_quant_mode = QuantMode(quant_mode)
-        kv_scale_orig_quant = (
-            attention_layer.kv_scale_orig_quant
-            if forward_args.kv_scales_sf_inv is None
-            else forward_args.kv_scales_sf_inv
-        )
-        kv_scale_quant_orig = (
-            attention_layer.kv_scale_quant_orig
-            if forward_args.kv_scales_sf is None
-            else forward_args.kv_scales_sf
-        )
+        kv_scale_orig_quant = forward_args.kv_scale_orig_quant
+        kv_scale_quant_orig = forward_args.kv_scale_quant_orig
         if (
             not kv_cache_quant_mode.has_kv_cache_quant()
             or kv_scale_orig_quant is None
@@ -620,22 +611,10 @@ class FlashInferTrtllmGenAttention:
         return kv_scale_orig_quant, kv_scale_quant_orig
 
     @staticmethod
-    def _get_attention_output_orig_quant(
-        forward_args: AttentionForwardArgs,
-    ) -> Optional[torch.Tensor]:
-        return (
-            forward_args.out_scale_sf
-            if forward_args.output_sf is not None
-            else forward_args.out_scale
-        )
-
-    @staticmethod
     def _get_mrope_rotary_cos_sin(
         forward_args: AttentionForwardArgs,
     ) -> Optional[torch.Tensor]:
-        if forward_args.mrope_config is None:
-            return None
-        return forward_args.mrope_config.get("mrope_rotary_cos_sin")
+        return forward_args.mrope_rotary_cos_sin
 
     def is_supported(
         self,
@@ -989,7 +968,7 @@ class FlashInferTrtllmGenAttention:
         kv_scale_orig_quant, kv_scale_quant_orig = self._get_kv_scale_params(
             params.forward, params.kv_cache_quant_mode
         )
-        attention_output_orig_quant = self._get_attention_output_orig_quant(params.forward)
+        attention_output_orig_quant = params.forward.out_scale
         mrope_rotary_cos_sin = self._get_mrope_rotary_cos_sin(params.forward)
 
         (
@@ -1098,7 +1077,7 @@ class FlashInferTrtllmGenAttention:
         kv_scale_orig_quant, kv_scale_quant_orig = self._get_kv_scale_params(
             params.forward, params.kv_cache_quant_mode
         )
-        attention_output_orig_quant = self._get_attention_output_orig_quant(params.forward)
+        attention_output_orig_quant = params.forward.out_scale
         (
             q_processed,
             kv_pool,
