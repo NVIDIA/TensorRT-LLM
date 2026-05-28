@@ -899,6 +899,7 @@ private:
         case DATA_TYPE_E2M1: return tg::Dtype::E2m1;
         case DATA_TYPE_E4M3: return tg::Dtype::E4m3;
         case DATA_TYPE_E5M2: return tg::Dtype::E5m2;
+        case DATA_TYPE_MXE4M3: return tg::Dtype::MxE4m3;
         default:
             // Fallback or throw error
             return tg::Dtype::Void;
