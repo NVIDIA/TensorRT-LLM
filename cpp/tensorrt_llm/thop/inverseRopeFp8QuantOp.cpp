@@ -5,12 +5,8 @@
  */
 #include "tensorrt_llm/kernels/inverseRopeFp8QuantKernel.h"
 
-#include "tensorrt_llm/common/logger.h"
-
 #include <ATen/cuda/CUDAContext.h>
 #include <torch/extension.h>
-
-#include <cstdlib>
 
 TRTLLM_NAMESPACE_BEGIN
 
@@ -25,18 +21,6 @@ constexpr int kQuantGroupSize = 128;
 inline int64_t pad_up(int64_t x, int64_t a)
 {
     return (x + a - 1) / a * a;
-}
-
-// Synchronous error check for CI / production triage of async CUDA
-// crashes ("illegal memory access" reported on the next launch).
-// Default-ON while debugging CI #39877: forces a stream synchronize and
-// `cudaGetLastError()` check immediately after launch, so the crash is
-// attributed to this kernel rather than blamed on the next launch site.
-// Set `TRTLLM_INV_ROPE_FP8_SYNC=0` to disable once the CI bug is resolved.
-inline bool inv_rope_sync_enabled()
-{
-    char const* v = std::getenv("TRTLLM_INV_ROPE_FP8_SYNC");
-    return v == nullptr || v[0] != '0';
 }
 } // namespace
 
@@ -138,52 +122,12 @@ std::tuple<torch::Tensor, torch::Tensor> fusedInvRopeFp8Quant( //
     int const scale_stride_group = static_cast<int>(scale_buf.stride(0));
     int const scale_stride_k = static_cast<int>(scale_buf.stride(1));
 
-    // CI #39877 triage: when `TRTLLM_INV_ROPE_FP8_SYNC=1` is set, drain any
-    // pre-existing async error before launch so we don't blame ourselves
-    // for a prior kernel's fault.
-    bool const sync_diag = inv_rope_sync_enabled();
-    if (sync_diag)
-    {
-        cudaError_t const pre = cudaGetLastError();
-        if (pre != cudaSuccess)
-        {
-            TLLM_LOG_WARNING(
-                "inverseRopeFp8Quant: pre-launch pending CUDA error: %s (M=%ld, num_heads=%ld, n_groups=%ld, "
-                "heads_per_group=%ld, head_dim=%ld, is_neox=%d)",
-                cudaGetErrorString(pre), (long) num_tokens, (long) num_heads, (long) n_groups, (long) heads_per_group,
-                (long) head_dim, (int) is_neox);
-        }
-    }
-
     tensorrt_llm::kernels::invokeInverseRopeFp8Quant(o.data_ptr(),                                    //
         positions_i64.data_ptr(), cos_sin_cache.data_ptr(), fp8_buf.data_ptr(), scale_buf.data_ptr(), //
         static_cast<int>(num_tokens), static_cast<int>(num_heads), static_cast<int>(heads_per_group), //
         static_cast<int>(chunks_per_head), is_neox, static_cast<int>(tma_aligned_T),                  //
         o_stride_token, o_stride_head, fp8_stride_group, fp8_stride_token, scale_stride_group,        //
         scale_stride_k, stream);
-
-    if (sync_diag)
-    {
-        cudaError_t const launch_err = cudaGetLastError();
-        if (launch_err != cudaSuccess)
-        {
-            TORCH_CHECK(false, "inverseRopeFp8Quant launch FAILED: ", cudaGetErrorString(launch_err),
-                " (M=", num_tokens, ", num_heads=", num_heads, ", n_groups=", n_groups,
-                ", heads_per_group=", heads_per_group, ", head_dim=", head_dim, ", is_neox=", (int) is_neox,
-                ", chunks=", chunks_per_head, ")");
-        }
-        cudaError_t const sync_err = cudaStreamSynchronize(stream);
-        if (sync_err != cudaSuccess)
-        {
-            TORCH_CHECK(false, "inverseRopeFp8Quant execution FAILED on sync: ", cudaGetErrorString(sync_err),
-                " (M=", num_tokens, ", num_heads=", num_heads, ", n_groups=", n_groups,
-                ", heads_per_group=", heads_per_group, ", head_dim=", head_dim, ", is_neox=", (int) is_neox,
-                ", chunks=", chunks_per_head, ")");
-        }
-        TLLM_LOG_INFO("inverseRopeFp8Quant OK: M=%ld num_heads=%ld n_groups=%ld hpg=%ld hd=%ld is_neox=%d chunks=%ld",
-            (long) num_tokens, (long) num_heads, (long) n_groups, (long) heads_per_group, (long) head_dim,
-            (int) is_neox, (long) chunks_per_head);
-    }
 
     return {fp8_buf, scale_buf};
 }
