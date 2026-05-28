@@ -77,7 +77,6 @@ cpp/test_multi_gpu.py::TestDisagg::test_symmetric_executor[gpt-2proc-mpi_kvcache
 cpp/test_multi_gpu.py::TestDisagg::test_symmetric_executor[gpt-2proc-nixl_kvcache-90] SKIP (https://nvbugs/6093820)
 cpp/test_multi_gpu.py::TestDisagg::test_symmetric_executor[gpt-2proc-ucx_kvcache-90] SKIP (https://nvbugs/6093820)
 cpp/test_multi_gpu.py::test_cache_transceiver[8proc-mooncake_kvcache-90] SKIP (https://nvbugs/5838199)
-disaggregated/test_disaggregated.py::test_disaggregated_cancel_large_context_requests[DeepSeek-V3-Lite-bf16] SKIP (https://nvbugs/6105768)
 disaggregated/test_disaggregated.py::test_disaggregated_deepseek_v3_lite_bf16_cache_aware_balance[DeepSeek-V3-Lite-bf16] SKIP (https://nvbugs/6162322)
 disaggregated/test_disaggregated.py::test_disaggregated_deepseek_v3_lite_bf16_conditional[DeepSeek-V3-Lite-bf16] SKIP (https://nvbugs/6162322)
 disaggregated/test_disaggregated.py::test_disaggregated_deepseek_v3_lite_fp8_attention_dp_gen_only[DeepSeek-V3-Lite-fp8] SKIP (https://nvbugs/6162322)
