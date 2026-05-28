@@ -630,38 +630,6 @@ static __device__ void topKPerRowJob(int const* indices, InputT const* logits, i
 }
 } // namespace
 
-// Per-row block count picked by the fused split-work dispatcher (see
-// invokeIndexerTopKDecodeImpl). Defaults to 10 (matching the legacy
-// 2-launch split-work tier); bumped at very-low-bs corners where 10
-// blocks/row leaves the GPU under-filled. The merge phase processes
-// numBlocksPerRow * topK candidates in a single block, so we never bump
-// past where the merge would dominate. Cutoffs come from the
-// mid-long-decode sweep. Exposed here so callers can size the aux
-// buffers (outIndicesAux / outLogitsAux) to numRows × numBlocksPerRow ×
-// topK — sizing them at the legacy 10 blocks/row triggers OOB writes for
-// the bumped tiers.
-int indexerTopKDecodeFusedAuxBlocksPerRow(int numRows, int numColumns)
-{
-    int numBlocksPerRow = 10;
-    if (numRows == 1)
-    {
-        // 132 SMs / 1 row → cap at 32 (aux buffer max), gated so per-block
-        // scan stays >= 30k (the 1024-thread wide-block threshold).
-        int target = 32;
-        if (target > numColumns / 30000)
-            target = numColumns / 30000;
-        if (target > numBlocksPerRow)
-            numBlocksPerRow = target;
-    }
-    else if (numRows == 2 && numColumns >= 400000)
-        numBlocksPerRow = 16;
-    else if (numRows == 4 && numColumns >= 400000)
-        numBlocksPerRow = 14;
-    else if (numRows == 8 && numColumns >= 500000)
-        numBlocksPerRow = 12;
-    return numBlocksPerRow;
-}
-
 template <int kNumThreadsPerBlock, typename InputT = float>
 static __global__ __launch_bounds__(kNumThreadsPerBlock) void topKPerRowPrefill(InputT const* logits,
     int const* rowStarts, int const* rowEnds, int* outIndices, int stride0, int stride1, int const topK,
@@ -741,153 +709,25 @@ static __global__ __launch_bounds__(kNumThreadsPerBlock) void topKPerRowDecode(I
 #endif
 }
 
-template <int kNumThreadsPerBlock, typename InputT = float>
-static __global__ __launch_bounds__(kNumThreadsPerBlock) void topKPerRowDecodeFused(InputT const* logits,
-    int const* seqLens, int* outIndices, int* outIndicesAux, float* outLogitsAux, int* doneCounter, int stride0,
-    int stride1, int const topK, int const next_n, int const numBlocksPerRow)
-{
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-    cudaGridDependencySynchronize();
-#endif
-    static constexpr int kNumBins = 2048;
-
-    int rowIdx = blockIdx.x;
-    int blockInRow = blockIdx.y;
-
-    int seq_len = seqLens[rowIdx / next_n];
-    int rowEndFull = seq_len - next_n + (rowIdx % next_n) + 1;
-
-    InputT const* rowLogits = logits + static_cast<int64_t>(rowIdx) * stride0;
-
-    // One smem allocation shared between part1 and the merge phase. Both calls
-    // use the same kNumThreadsPerBlock/kNumBins, and the multipleBlocksPerRow /
-    // mergeBlocks template flags don't affect smem layout, so the union /
-    // scratch can be reused (each call re-initializes its working slots at
-    // entry).
-    __shared__ TopKSmem<kNumThreadsPerBlock, kNumBins> smem;
-
-    // Short-row short-circuit: if the actual row is too small to benefit from
-    // multi-block fan-out (e.g. the prefill harness uses lengths=1..bs which
-    // are tiny no matter how large numColumns is), have block 0 do the full
-    // single-block top-k and have all other blocks bail without touching the
-    // atomic counter. Without this, fused-path overhead dominates for these
-    // configs.
-    constexpr int kFusedShortRowThreshold = 16384;
-    if (rowEndFull < kFusedShortRowThreshold)
-    {
-        if (blockInRow == 0)
-        {
-            int* mergedOut = outIndices + static_cast<int64_t>(rowIdx) * topK;
-            topKPerRowJob<kNumThreadsPerBlock, kNumBins,
-                /*multipleBlocksPerRow=*/false, /*mergeBlocks=*/false>(nullptr, rowLogits, /*rowStart=*/0, rowEndFull,
-                mergedOut,
-                /*outLogits=*/nullptr, stride1, topK, smem);
-        }
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-        cudaTriggerProgrammaticLaunchCompletion();
-#endif
-        return;
-    }
-
-    int blockSize = rowEndFull / numBlocksPerRow;
-    int rowStart = blockSize * blockInRow;
-    int rowEnd = (blockInRow == numBlocksPerRow - 1) ? rowEndFull : rowStart + blockSize;
-
-    int64_t auxOffset = (static_cast<int64_t>(rowIdx) * numBlocksPerRow + blockInRow) * topK;
-    int* myOutIndicesAux = outIndicesAux + auxOffset;
-    float* myOutLogitsAux = outLogitsAux + auxOffset;
-
-    // Part 1: per-block top-k into aux buffers.
-    topKPerRowJob<kNumThreadsPerBlock, kNumBins, /*multipleBlocksPerRow=*/true,
-        /*mergeBlocks=*/false>(
-        nullptr, rowLogits, rowStart, rowEnd, myOutIndicesAux, myOutLogitsAux, stride1, topK, smem);
-
-    // Make sure all writes from this block to outIndicesAux/outLogitsAux are
-    // visible to every other block before we publish via the counter.
-    __threadfence();
-    __syncthreads();
-
-    __shared__ int s_isLast;
-    if (threadIdx.x == 0)
-    {
-        int prev = atomicAdd(&doneCounter[rowIdx], 1);
-        s_isLast = (prev == numBlocksPerRow - 1) ? 1 : 0;
-    }
-    __syncthreads();
-
-    if (!s_isLast)
-    {
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-        cudaTriggerProgrammaticLaunchCompletion();
-#endif
-        return;
-    }
-
-    // Reset the counter so the buffer is reusable on the next call without
-    // requiring an external memset.
-    if (threadIdx.x == 0)
-    {
-        doneCounter[rowIdx] = 0;
-    }
-
-    // Last block: merge the numBlocksPerRow per-block top-ks into the final
-    // top-k. Same shared-memory union is reused (the part1 phase already
-    // returned smemFinal/smemThresholdBinIdx/etc to a known-undefined state,
-    // and topKPerRowJob initializes them again at entry).
-    int64_t mergeBase = static_cast<int64_t>(rowIdx) * numBlocksPerRow * topK;
-    int* mergeIndicesIn = outIndicesAux + mergeBase;
-    float* mergeLogitsIn = outLogitsAux + mergeBase;
-    int* mergedOut = outIndices + static_cast<int64_t>(rowIdx) * topK;
-    int mergeRowEnd = numBlocksPerRow * topK;
-
-    topKPerRowJob<kNumThreadsPerBlock, kNumBins, /*multipleBlocksPerRow=*/false,
-        /*mergeBlocks=*/true>(mergeIndicesIn, mergeLogitsIn, /*rowStart=*/0, mergeRowEnd, mergedOut,
-        /*outLogits=*/nullptr,
-        /*stride1=*/1, topK, smem);
-
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-    cudaTriggerProgrammaticLaunchCompletion();
-#endif
-}
-
 namespace
 {
 
 // ===========================================================================
-// Multi-pass radix path (opt-in via scratch != nullptr).
+// Multi-pass radix path — the only split-work tier (chosen whenever the
+// caller-provided `scratch` is sized for it and numColumns exceeds the
+// single-block / split-work boundary).
 //
 // One launch per radix pass (top-11 half-precision bits, then bits [21..32),
 // [10..21), [0..10)). State per row lives in a small RadixState struct in
 // DRAM; the candidate data is two ping-pong buffers sized to the input row
 // length. After 4 passes any remaining bit-level ties are emitted directly
 // to fill the top-k.
-//
-// Eligibility (require !is_prefill): three nested tiers where the
-// single-block radix-final pass and the fused last-block-merge kernel both
-// under-use the GPU.
-//   inner: bs ≤ 32 / seq ≥  65k
-//   mid  : bs ≤ 64 / seq ≥ 131k
 // ===========================================================================
-static constexpr int kMultiPassRadixLowMaxRows = 32;
-static constexpr int kMultiPassRadixLowMinSeqLen = 65536;
-static constexpr int kMultiPassRadixMidMaxRows = 64;
-static constexpr int kMultiPassRadixMidMinSeqLen = 131072;
-
 static constexpr int kRadixBins = 2048;
-
-static inline bool multi_pass_radix_eligible(int numRows, int numColumns)
-{
-    if (numRows <= kMultiPassRadixLowMaxRows && numColumns >= kMultiPassRadixLowMinSeqLen)
-        return true;
-    if (numRows <= kMultiPassRadixMidMaxRows && numColumns >= kMultiPassRadixMidMinSeqLen)
-        return true;
-    return false;
-}
 
 // Per-row state for the multi-pass radix path (in DRAM scratch). Each pass's
 // last block (selected via the `finishedBlocks` atomic) prefix-scans the
-// global histogram and picks the threshold for the next pass — same pattern
-// as `topKPerRowDecodeFused`'s in-block merge, generalised across passes.
+// global histogram and picks the threshold for the next pass.
 struct alignas(64) RadixState
 {
     int candCount;      // candidates entering current pass
@@ -1295,31 +1135,17 @@ static void launchMultiPassRadix(void* scratch, InputT const* logits, int const*
 // Unified dispatcher (fp32, bf16, fp16 all go through this).
 // ============================================================================
 // The TPR-family kernels (insertion-sort, single-block radix, 2-launch
-// split-work, fused split-work, multi-pass radix) are all templated on
-// `InputT` — logits are read with `static_cast<float>(InputT)` at HBM-read
-// sites, so accuracy is identical to up-casting the input tensor to fp32
-// before invoking the kernel. Aux buffers (outLogitsAux / scratch) stay fp32
-// regardless of InputT.
+// split-work, multi-pass radix) are all templated on `InputT` — logits are
+// read with `static_cast<float>(InputT)` at HBM-read sites, so accuracy is
+// identical to up-casting the input tensor to fp32 before invoking the
+// kernel. The multi-pass radix scratch buffer stays uint8 regardless of
+// InputT.
 template <typename InputT>
-void invokeIndexerTopKDecodeImpl(InputT const* logits, int const* seqLens, int* indices, float* outLogitsAux,
-    int* outIndicesAux, int const splitWorkThreshold, int const numRows, int const numColumns, int const stride0,
-    int const stride1, int const next_n, int const topK, int const* preIdx, int const preIdxStride,
-    int const preIdxCount, InputT* heuristicScratch, int* doneCounterScratch, cudaStream_t const stream, void* scratch,
-    size_t scratchBytes, bool is_prefill)
+void invokeIndexerTopKDecodeImpl(InputT const* logits, int const* seqLens, int* indices, int const splitWorkThreshold,
+    int const numRows, int const numColumns, int const stride0, int const stride1, int const next_n, int const topK,
+    int const* preIdx, int const preIdxStride, int const preIdxCount, InputT* heuristicScratch,
+    cudaStream_t const stream, void* scratch, size_t scratchBytes, bool is_prefill)
 {
-    // Opt-in fast paths (added in the TPRv2 port — see commit message):
-    //   - multi-pass radix path (low-bs/long-seq corner that the
-    //     single-block radix loses on). Requires the caller to provide
-    //     `scratch` of at least `indexerTopKDecodeScratchBytes(numRows,
-    //     numColumns, topK)` bytes. Suppressed when is_prefill (the prefill
-    //     entry handles tiny rows with its own short-row short-circuit).
-    //   - Fused single-launch multi-block + last-block-merge variant of the
-    //     `numColumns ≥ splitWorkThreshold` tier. Requires the caller to
-    //     provide `doneCounterScratch` (one int per row, zero-initialized).
-    //     When omitted, the original 2-launch split-work path is used.
-    bool const useMultiPassRadixPath
-        = !is_prefill && multi_pass_radix_eligible(numRows, numColumns) && scratch != nullptr && scratchBytes > 0;
-
     // kSortingAlgorithmThreshold no longer selects the final-sort algorithm
     // (that's runtime now — see the sort-selection block in topKPerRowJob).
     // Gates the CTA-width choice inside the single-block tier between a
@@ -1354,7 +1180,7 @@ void invokeIndexerTopKDecodeImpl(InputT const* logits, int const* seqLens, int* 
 
     // GVR ↔ TPR routing rule: GVR for bs >= 64 ∧ seq >= 32k (its
     // fixed-overhead Phase-1/4 pays back at this size). Everything below
-    // falls through to TPR (single-block or fused split-work).
+    // falls through to TPR (single-block or multi-pass radix).
     bool const isSupportedTopK = (topK == 512 || topK == 1024 || topK == 2048);
     bool const canUseHeuristic = preIdx != nullptr && stride1 == 1 && isSupportedTopK && preIdxCount == topK
         && preIdxStride >= preIdxCount && heuristicScratch != nullptr && numColumns >= 32768 && numRows >= 64;
@@ -1380,16 +1206,6 @@ void invokeIndexerTopKDecodeImpl(InputT const* logits, int const* seqLens, int* 
     {
         launchHeuristicTopKDecode(logits, seqLens, preIdx, indices, heuristicScratch, stride0, next_n, topK,
             preIdxStride, preIdxCount, numRows, stream);
-    }
-    else if (useMultiPassRadixPath)
-    {
-        TLLM_CHECK_WITH_INFO(scratchBytes >= radixScratchBytes(numRows, numColumns),
-            "indexer top-k multi-pass radix path: scratch buffer too small.");
-        cudaLaunchAttribute radixAttrs[1];
-        radixAttrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
-        radixAttrs[0].val.programmaticStreamSerializationAllowed = tensorrt_llm::common::getEnvEnablePDL();
-        launchMultiPassRadix<InputT>(
-            scratch, logits, seqLens, indices, numRows, numColumns, topK, stride0, next_n, radixAttrs, stream);
     }
     else if (numColumns < effectiveSplitWorkThreshold)
     {
@@ -1428,88 +1244,34 @@ void invokeIndexerTopKDecodeImpl(InputT const* logits, int const* seqLens, int* 
     }
     else
     {
-        // Fused multi-block path: per-block top-k followed by last-block
-        // in-kernel merge via a global atomic counter on doneCounterScratch.
-        //
-        // numBlocksPerRow defaults to 10; bumped at the very-low-bs corners
-        // where 10 blocks/row leaves the GPU under-filled. The merge phase
-        // processes (numBlocksPerRow * topK) candidates in a single block, so
-        // we never bump past where the merge would dominate. Cutoffs below
-        // come from the mid-long-decode sweep.
-        TLLM_CHECK_WITH_INFO(
-            outLogitsAux != nullptr && outIndicesAux != nullptr && doneCounterScratch != nullptr,
-            "Split-work path requires outLogitsAux, outIndicesAux, and doneCounterScratch to be non-null.");
-        int const numBlocksPerRow = indexerTopKDecodeFusedAuxBlocksPerRow(numRows, numColumns);
-
-        // 1024-thread variant wins once per-block scan is large enough to
-        // amortize block-scope syncs (~30k); below that the 512-thread
-        // narrow block hides sync cost better.
-        bool const useWideBlock = (numColumns / numBlocksPerRow) >= 30000;
-        constexpr int kFusedNarrowThreadsPerBlock = 512;
-        int const blockDim = useWideBlock ? 1024 : kFusedNarrowThreadsPerBlock;
-
-        auto* kernel_512 = &topKPerRowDecodeFused<kFusedNarrowThreadsPerBlock, InputT>;
-        auto* kernel_1024 = &topKPerRowDecodeFused<1024, InputT>;
-        // Opt-in to the smem budget the kernel actually needs. The kernel's
-        // static smem (≈19KB for the 512-thread variant, ≈38KB for the
-        // 1024-thread one) plus the 2*topK*sizeof(int32_t) dynamic smem
-        // requested at launch can exceed the default per-block cap (48KB on
-        // many archs, including sm_120). Setting MaxDynamicSharedMemorySize
-        // to a value that, together with the kernel's static smem, exceeds
-        // cudaDevAttrMaxSharedMemoryPerBlockOptin causes cudaFuncSetAttribute
-        // to fail and the subsequent cudaLaunchKernelEx to return
-        // cudaErrorInvalidValue. Sizing the attribute to exactly the dynamic
-        // smem the launch uses keeps this comfortably under the optin cap on
-        // every Hopper / Blackwell arch we target.
-        size_t const fusedDynamicSmemBytes = 2 * topK * sizeof(int32_t);
-        static bool s_attr_512 = false;
-        static bool s_attr_1024 = false;
-        if (useWideBlock && !s_attr_1024)
-        {
-            cudaFuncSetAttribute(reinterpret_cast<void const*>(kernel_1024),
-                cudaFuncAttributeMaxDynamicSharedMemorySize, fusedDynamicSmemBytes);
-            s_attr_1024 = true;
-        }
-        else if (!useWideBlock && !s_attr_512)
-        {
-            cudaFuncSetAttribute(reinterpret_cast<void const*>(kernel_512),
-                cudaFuncAttributeMaxDynamicSharedMemorySize, fusedDynamicSmemBytes);
-            s_attr_512 = true;
-        }
-
-        cudaLaunchAttribute attrs[1];
-        attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
-        attrs[0].val.programmaticStreamSerializationAllowed = tensorrt_llm::common::getEnvEnablePDL();
-
-        cudaLaunchConfig_t config{};
-        config.gridDim = dim3(numRows, numBlocksPerRow);
-        config.blockDim = blockDim;
-        config.dynamicSmemBytes = 2 * topK * sizeof(int32_t);
-        config.stream = stream;
-        config.numAttrs = 1;
-        config.attrs = attrs;
-
-        if (useWideBlock)
-            cudaLaunchKernelEx(&config, kernel_1024, logits, seqLens, indices, outIndicesAux, outLogitsAux,
-                doneCounterScratch, stride0, stride1, topK, next_n, numBlocksPerRow);
-        else
-            cudaLaunchKernelEx(&config, kernel_512, logits, seqLens, indices, outIndicesAux, outLogitsAux,
-                doneCounterScratch, stride0, stride1, topK, next_n, numBlocksPerRow);
+        // Multi-pass radix path. Each pass is a flat grid that fills the GPU;
+        // the last block of each pass merges via a global atomic counter, and
+        // pass 3's trailer emits the final top-K inline. Beats the previous
+        // fused split-work tier by ~1.05-1.42x at every shape this branch
+        // takes (see plots/fused_vs_multipass in the topk scratch project).
+        // Caller must provide `scratch` of at least
+        // `indexerTopKDecodeScratchBytes(numRows, numColumns, topK)` bytes.
+        TLLM_CHECK_WITH_INFO(scratch != nullptr && scratchBytes >= radixScratchBytes(numRows, numColumns),
+            "indexer top-k split-work tier: scratch buffer missing or too small.");
+        cudaLaunchAttribute radixAttrs[1];
+        radixAttrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+        radixAttrs[0].val.programmaticStreamSerializationAllowed = tensorrt_llm::common::getEnvEnablePDL();
+        launchMultiPassRadix<InputT>(
+            scratch, logits, seqLens, indices, numRows, numColumns, topK, stride0, next_n, radixAttrs, stream);
     }
     sync_check_cuda_error(stream);
 }
 
 } // anonymous namespace
 
-void invokeIndexerTopKDecode(float const* logits, int const* seqLens, int* indices, float* outLogitsAux,
-    int* outIndicesAux, int const splitWorkThreshold, int const numRows, int const numColumns, int const stride0,
-    int const stride1, int const next_n, int const topK, int const* preIdx, int const preIdxStride,
-    int const preIdxCount, float* heuristicScratch, int* doneCounterScratch, cudaStream_t const stream, void* scratch,
-    size_t scratchBytes, bool is_prefill)
+void invokeIndexerTopKDecode(float const* logits, int const* seqLens, int* indices, int const splitWorkThreshold,
+    int const numRows, int const numColumns, int const stride0, int const stride1, int const next_n, int const topK,
+    int const* preIdx, int const preIdxStride, int const preIdxCount, float* heuristicScratch,
+    cudaStream_t const stream, void* scratch, size_t scratchBytes, bool is_prefill)
 {
-    invokeIndexerTopKDecodeImpl<float>(logits, seqLens, indices, outLogitsAux, outIndicesAux, splitWorkThreshold,
-        numRows, numColumns, stride0, stride1, next_n, topK, preIdx, preIdxStride, preIdxCount, heuristicScratch,
-        doneCounterScratch, stream, scratch, scratchBytes, is_prefill);
+    invokeIndexerTopKDecodeImpl<float>(logits, seqLens, indices, splitWorkThreshold, numRows, numColumns, stride0,
+        stride1, next_n, topK, preIdx, preIdxStride, preIdxCount, heuristicScratch, stream, scratch, scratchBytes,
+        is_prefill);
 }
 
 size_t indexerTopKDecodeScratchBytes(int numRows, int numColumns, int /*topK*/)
@@ -1520,30 +1282,25 @@ size_t indexerTopKDecodeScratchBytes(int numRows, int numColumns, int /*topK*/)
 }
 
 // bf16 / fp16 entries — full feature parity with fp32 via the unified
-// invokeIndexerTopKDecodeImpl<InputT> template. All TPR-family kernels
-// (insertion / single-block radix / 2-launch split-work / fused split-work /
-// multi-pass radix) accept InputT now; aux buffers (outLogitsAux / scratch)
-// remain fp32 regardless of dtype.
-void invokeIndexerTopKDecode(__nv_bfloat16 const* logits, int const* seqLens, int* indices, float* outLogitsAux,
-    int* outIndicesAux, int const splitWorkThreshold, int const numRows, int const numColumns, int const stride0,
-    int const stride1, int const next_n, int const topK, int const* preIdx, int const preIdxStride,
-    int const preIdxCount, __nv_bfloat16* heuristicScratch, int* doneCounterScratch, cudaStream_t const stream,
-    void* scratch, size_t scratchBytes, bool is_prefill)
+// invokeIndexerTopKDecodeImpl<InputT> template.
+void invokeIndexerTopKDecode(__nv_bfloat16 const* logits, int const* seqLens, int* indices,
+    int const splitWorkThreshold, int const numRows, int const numColumns, int const stride0, int const stride1,
+    int const next_n, int const topK, int const* preIdx, int const preIdxStride, int const preIdxCount,
+    __nv_bfloat16* heuristicScratch, cudaStream_t const stream, void* scratch, size_t scratchBytes, bool is_prefill)
 {
-    invokeIndexerTopKDecodeImpl<__nv_bfloat16>(logits, seqLens, indices, outLogitsAux, outIndicesAux, splitWorkThreshold,
-        numRows, numColumns, stride0, stride1, next_n, topK, preIdx, preIdxStride, preIdxCount, heuristicScratch,
-        doneCounterScratch, stream, scratch, scratchBytes, is_prefill);
+    invokeIndexerTopKDecodeImpl<__nv_bfloat16>(logits, seqLens, indices, splitWorkThreshold, numRows, numColumns,
+        stride0, stride1, next_n, topK, preIdx, preIdxStride, preIdxCount, heuristicScratch, stream, scratch,
+        scratchBytes, is_prefill);
 }
 
-void invokeIndexerTopKDecode(__half const* logits, int const* seqLens, int* indices, float* outLogitsAux,
-    int* outIndicesAux, int const splitWorkThreshold, int const numRows, int const numColumns, int const stride0,
-    int const stride1, int const next_n, int const topK, int const* preIdx, int const preIdxStride,
-    int const preIdxCount, __half* heuristicScratch, int* doneCounterScratch, cudaStream_t const stream, void* scratch,
-    size_t scratchBytes, bool is_prefill)
+void invokeIndexerTopKDecode(__half const* logits, int const* seqLens, int* indices, int const splitWorkThreshold,
+    int const numRows, int const numColumns, int const stride0, int const stride1, int const next_n, int const topK,
+    int const* preIdx, int const preIdxStride, int const preIdxCount, __half* heuristicScratch,
+    cudaStream_t const stream, void* scratch, size_t scratchBytes, bool is_prefill)
 {
-    invokeIndexerTopKDecodeImpl<__half>(logits, seqLens, indices, outLogitsAux, outIndicesAux, splitWorkThreshold,
-        numRows, numColumns, stride0, stride1, next_n, topK, preIdx, preIdxStride, preIdxCount, heuristicScratch,
-        doneCounterScratch, stream, scratch, scratchBytes, is_prefill);
+    invokeIndexerTopKDecodeImpl<__half>(logits, seqLens, indices, splitWorkThreshold, numRows, numColumns, stride0,
+        stride1, next_n, topK, preIdx, preIdxStride, preIdxCount, heuristicScratch, stream, scratch, scratchBytes,
+        is_prefill);
 }
 
 void invokeIndexerTopKPrefill(float const* logits, int const* rowStarts, int const* rowEnds, int* indices,

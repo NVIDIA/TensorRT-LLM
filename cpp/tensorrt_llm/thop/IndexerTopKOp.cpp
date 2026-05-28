@@ -110,21 +110,11 @@ void indexer_topk_decode(th::Tensor const& logits, th::Tensor const& seq_lens, t
         heuristicScratchPtr = scratchTensor.data_ptr();
     }
 
-    // Optional buffers for the opt-in fast paths added by the TPRv2 port
-    // (fused single-launch split-work + multi-pass radix). Both are dtype-
-    // agnostic now — the kernels are InputT-templated and aux buffers stay
-    // fp32 regardless of the input dtype.
-    int32_t* doneCounterPtr = nullptr;
-    if (done_counter_scratch.has_value())
-    {
-        auto const& t = done_counter_scratch.value();
-        TORCH_CHECK(t.is_cuda(), "done_counter_scratch must be a CUDA tensor");
-        TORCH_CHECK(t.device() == logits.device(), "done_counter_scratch must be on the same device as logits");
-        TORCH_CHECK(t.is_contiguous(), "done_counter_scratch must be contiguous");
-        TORCH_CHECK(t.scalar_type() == at::ScalarType::Int, "done_counter_scratch must be int32");
-        TORCH_CHECK(t.numel() >= numRows64, "done_counter_scratch must have at least numRows entries");
-        doneCounterPtr = t.data_ptr<int32_t>();
-    }
+    // Multi-pass radix scratch — required by invokeIndexerTopKDecode whenever
+    // num_columns >= splitWorkThreshold. When the caller does not pass one,
+    // the wrapper allocates it internally so existing callers don't need to
+    // be updated; passing it explicitly is preferred under CUDA-graph capture
+    // for stable device addresses.
     void* multiPassScratchPtr = nullptr;
     size_t multiPassScratchBytes = 0;
     if (scratch.has_value())
@@ -141,53 +131,48 @@ void indexer_topk_decode(th::Tensor const& logits, th::Tensor const& seq_lens, t
     int32_t splitWorkThreshold = 200 * 1000;
     auto stream = at::cuda::getCurrentCUDAStream(logits.get_device());
 
-    // Split-work aux buffers + done-counter, sized via the kernel's
-    // per-row block-count helper so part-1 writes stay in bounds. Allocated
-    // only when split-work is reachable (numColumns >= splitWorkThreshold);
-    // GVR / single-block paths see zero-sized placeholders.
-    th::Tensor aux_indices = th::empty({0}, th::TensorOptions().dtype(th::kInt32).device(logits.device()));
-    th::Tensor aux_logits = th::empty({0}, th::TensorOptions().dtype(th::kFloat32).device(logits.device()));
-    th::Tensor done_counter_internal;
-    if (num_columns >= splitWorkThreshold)
+    th::Tensor scratch_internal;
+    if (num_columns >= splitWorkThreshold && multiPassScratchPtr == nullptr)
     {
-        int const blocksPerRow = tk::indexerTopKDecodeFusedAuxBlocksPerRow(num_rows, num_columns);
-        aux_indices = th::empty(
-            {num_rows, blocksPerRow, index_topk}, th::TensorOptions().dtype(th::kInt32).device(logits.device()));
-        aux_logits = th::empty(
-            {num_rows, blocksPerRow, index_topk}, th::TensorOptions().dtype(th::kFloat32).device(logits.device()));
-        if (doneCounterPtr == nullptr)
-        {
-            done_counter_internal
-                = th::zeros({num_rows}, th::TensorOptions().dtype(th::kInt32).device(logits.device()));
-            doneCounterPtr = done_counter_internal.data_ptr<int32_t>();
-        }
+        size_t const bytes
+            = tk::indexerTopKDecodeScratchBytes(num_rows, num_columns, static_cast<int32_t>(index_topk));
+        // Zero-init: the multi-pass radix kernel relies on a clean per-row
+        // state struct + histogram on the first call (pass-3's trailer keeps
+        // them clean on subsequent calls).
+        scratch_internal = th::zeros(
+            {static_cast<int64_t>(bytes)}, th::TensorOptions().dtype(th::kByte).device(logits.device()));
+        multiPassScratchPtr = scratch_internal.data_ptr();
+        multiPassScratchBytes = bytes;
     }
+
+    // The `done_counter_scratch` parameter is preserved on the op signature
+    // for backward compatibility but is no longer used by the dispatcher; the
+    // split-work tier now always routes to the multi-pass radix path which
+    // tracks its per-pass synchronisation in `scratch` instead.
+    (void) done_counter_scratch;
 
     if (logits_dtype == at::ScalarType::Float)
     {
         tk::invokeIndexerTopKDecode(logits.data_ptr<float>(), seq_lens.data_ptr<int32_t>(), indices.data_ptr<int32_t>(),
-            aux_logits.data_ptr<float>(), aux_indices.data_ptr<int32_t>(), splitWorkThreshold, num_rows, num_columns,
-            logits_stride_0, logits_stride_1, static_cast<int32_t>(next_n), static_cast<int32_t>(index_topk), preIdxPtr,
-            preIdxStride, preIdxCount, static_cast<float*>(heuristicScratchPtr), doneCounterPtr, stream,
-            multiPassScratchPtr, multiPassScratchBytes, is_prefill);
+            splitWorkThreshold, num_rows, num_columns, logits_stride_0, logits_stride_1,
+            static_cast<int32_t>(next_n), static_cast<int32_t>(index_topk), preIdxPtr, preIdxStride, preIdxCount,
+            static_cast<float*>(heuristicScratchPtr), stream, multiPassScratchPtr, multiPassScratchBytes, is_prefill);
     }
     else if (logits_dtype == at::ScalarType::BFloat16)
     {
         tk::invokeIndexerTopKDecode(reinterpret_cast<__nv_bfloat16 const*>(logits.data_ptr()),
-            seq_lens.data_ptr<int32_t>(), indices.data_ptr<int32_t>(), aux_logits.data_ptr<float>(),
-            aux_indices.data_ptr<int32_t>(), splitWorkThreshold, num_rows, num_columns, logits_stride_0,
-            logits_stride_1, static_cast<int32_t>(next_n), static_cast<int32_t>(index_topk), preIdxPtr, preIdxStride,
-            preIdxCount, static_cast<__nv_bfloat16*>(heuristicScratchPtr), doneCounterPtr, stream, multiPassScratchPtr,
-            multiPassScratchBytes, is_prefill);
+            seq_lens.data_ptr<int32_t>(), indices.data_ptr<int32_t>(), splitWorkThreshold, num_rows, num_columns,
+            logits_stride_0, logits_stride_1, static_cast<int32_t>(next_n), static_cast<int32_t>(index_topk),
+            preIdxPtr, preIdxStride, preIdxCount, static_cast<__nv_bfloat16*>(heuristicScratchPtr), stream,
+            multiPassScratchPtr, multiPassScratchBytes, is_prefill);
     }
     else // Half
     {
         tk::invokeIndexerTopKDecode(reinterpret_cast<__half const*>(logits.data_ptr()), seq_lens.data_ptr<int32_t>(),
-            indices.data_ptr<int32_t>(), aux_logits.data_ptr<float>(), aux_indices.data_ptr<int32_t>(),
-            splitWorkThreshold, num_rows, num_columns, logits_stride_0, logits_stride_1, static_cast<int32_t>(next_n),
-            static_cast<int32_t>(index_topk), preIdxPtr, preIdxStride, preIdxCount,
-            static_cast<__half*>(heuristicScratchPtr), doneCounterPtr, stream, multiPassScratchPtr,
-            multiPassScratchBytes, is_prefill);
+            indices.data_ptr<int32_t>(), splitWorkThreshold, num_rows, num_columns, logits_stride_0,
+            logits_stride_1, static_cast<int32_t>(next_n), static_cast<int32_t>(index_topk), preIdxPtr, preIdxStride,
+            preIdxCount, static_cast<__half*>(heuristicScratchPtr), stream, multiPassScratchPtr, multiPassScratchBytes,
+            is_prefill);
     }
 }
 
