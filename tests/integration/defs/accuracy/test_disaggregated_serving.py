@@ -624,7 +624,7 @@ class VideoMMEEPDTestConfig(NamedTuple):
     sampling_params: SamplingParams
     extra_evaluator_kwargs: Dict[str, Any]
     max_workers: int
-    expected_quant_algo: QuantAlgo
+    expected_quant_algo: Optional[QuantAlgo]
 
 
 def make_videomme_epd_test_config(
@@ -632,7 +632,8 @@ def make_videomme_epd_test_config(
     model_path: str,
     kv_cache_config: KvCacheConfig,
     max_batch_size: int,
-    expected_quant_algo: QuantAlgo,
+    expected_quant_algo: Optional[QuantAlgo],
+    max_workers: Optional[int] = None,
 ) -> VideoMMEEPDTestConfig:
     encoder_llm_config = {
         "trust_remote_code": True,
@@ -670,9 +671,46 @@ def make_videomme_epd_test_config(
         pd_llm_config=pd_llm_config,
         sampling_params=sampling_params,
         extra_evaluator_kwargs=extra_evaluator_kwargs,
-        max_workers=VideoMME.MAX_BATCH_SIZE,
+        max_workers=max_workers
+        if max_workers is not None else VideoMME.MAX_BATCH_SIZE,
         expected_quant_algo=expected_quant_algo,
     )
+
+
+def make_qwen3vl_2b_videomme_epd_test_config() -> VideoMMEEPDTestConfig:
+    test_config = make_videomme_epd_test_config(
+        "Qwen/Qwen3-VL-2B-Instruct",
+        f"{llm_models_root()}/Qwen3/Qwen3-VL-2B-Instruct",
+        KvCacheConfig(
+            free_gpu_memory_fraction=0.8,
+            enable_block_reuse=False,
+            dtype="auto",
+        ),
+        16,
+        None,
+        16,
+    )
+    test_config.encoder_llm_config["attn_backend"] = "VANILLA"
+    test_config.pd_llm_config["attn_backend"] = "VANILLA"
+    # Qwen3-VL VideoMME prompts can exceed 1024 tokens after visual expansion;
+    # avoid splitting a single context across vanilla SDPA chunks in the E/P handoff path.
+    test_config.pd_llm_config["max_num_tokens"] = 2048
+    return test_config
+
+
+def test_videomme_epd_harness_has_qwen3vl_2b_config():
+    """Keep the smallest Qwen video-capable E/P/D row in the harness."""
+    test_config = make_qwen3vl_2b_videomme_epd_test_config()
+
+    assert test_config.model_name == "Qwen/Qwen3-VL-2B-Instruct"
+    assert test_config.model_path.endswith("/Qwen3/Qwen3-VL-2B-Instruct")
+    assert test_config.expected_quant_algo is None
+    assert test_config.pd_llm_config["kv_cache_config"].dtype == "auto"
+    assert test_config.encoder_llm_config["attn_backend"] == "VANILLA"
+    assert test_config.pd_llm_config["attn_backend"] == "VANILLA"
+    assert test_config.pd_llm_config["max_batch_size"] == 16
+    assert test_config.pd_llm_config["max_num_tokens"] == 2048
+    assert test_config.max_workers == 16
 
 
 @pytest.mark.timeout(DEFAULT_TEST_TIMEOUT)
@@ -682,6 +720,11 @@ def make_videomme_epd_test_config(
 @pytest.mark.parametrize(
     "test_config",
     [
+        pytest.param(
+            make_qwen3vl_2b_videomme_epd_test_config(),
+            marks=skip_pre_blackwell,
+            id="qwen3vl_2b_instruct",
+        ),
         pytest.param(
             make_videomme_epd_test_config(
                 "nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-FP8",
@@ -717,9 +760,9 @@ def make_videomme_epd_test_config(
     ],
 )
 # TODO(venky): Add E/P/D VideoMME accuracy rows for the other supported VLM
-# families (Qwen*-VL, LLaVA-Next, and Kimi K2.5) once their baselines and model
-# fixtures are available. This CI matrix is currently thresholded only for
-# Nemotron Nano Omni.
+# families (LLaVA-Next and Kimi K2.5) once their baselines and model
+# fixtures are available. This CI matrix is currently thresholded for
+# Nemotron Nano Omni plus Qwen3-VL-2B.
 def test_disaggregated_videomme_vlm_epd(test_config: VideoMMEEPDTestConfig, ):
     """Run VideoMME shard through a model-specific llmapi E/PD config."""
     with launch_multimodal_encoder_pd_llm(
@@ -729,7 +772,9 @@ def test_disaggregated_videomme_vlm_epd(test_config: VideoMMEEPDTestConfig, ):
             max_workers=test_config.max_workers,
             extra_env={"TMPDIR": "/tmp"},
     ) as llm:
-        assert llm.args.quant_config.quant_algo == test_config.expected_quant_algo
+        actual_quant_algo = (llm.args.quant_config.quant_algo
+                             if llm.args.quant_config is not None else None)
+        assert actual_quant_algo == test_config.expected_quant_algo
         task = VideoMME(test_config.model_name)
         task.evaluate(
             llm,
