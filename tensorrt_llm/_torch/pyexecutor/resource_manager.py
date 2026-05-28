@@ -161,6 +161,8 @@ def _ensure_int64_cpu_tensor(
 
 def _resolve_multimodal_run_metadata(
         req: LlmRequest) -> Optional[_MmRunMetadata]:
+    # TODO(perf): cache per request; block-reuse invokes this once per block,
+    # repeatedly rebuilding identical tensors for the same request metadata.
     # Worked example for one logical multimodal item split by text:
     #
     #   prompt index: 0    1      2      3    4      5
