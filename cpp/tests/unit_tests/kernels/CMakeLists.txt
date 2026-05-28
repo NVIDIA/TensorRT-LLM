@@ -97,6 +97,7 @@ add_gtest(moeLoadBalanceKernelTest moeLoadBalanceKernelTest.cpp)
 
 if(USING_OSS_CUTLASS_MOE_GEMM)
   add_gtest(moeLoraPointerExpandTest moeLoraPointerExpandTest.cu)
+  add_gtest(moeLoraProblemBuilderTest moeLoraProblemBuilderTest.cu)
 endif()
 
 add_gtest(eaglePackDataTest eaglePackDataTest.cpp)
