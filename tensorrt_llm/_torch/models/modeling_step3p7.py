@@ -6,47 +6,29 @@
 # You may obtain a copy of the License at
 #
 # http://www.apache.org/licenses/LICENSE-2.0
-"""TensorRT-LLM PyTorch backend bring-up for the Step3p7 Flash checkpoints.
+"""TensorRT-LLM PyTorch backend for the Step3p7 Flash checkpoints.
 
-Source semantics live in ``/home/scratch.kevxie_sw_1/workspace/quiet_harbor/
-step-3-7-flash-fp8_vv1/modeling_step3p7.py``.  Highlights:
+Step3p7 has three notable per-layer behaviors not shared with other models:
 
-- 45 text decoder layers; layer 0,4,8,...,44 are full-attention (Q=64, KV=8)
-  and the rest are sliding-attention (Q=96, KV=8, window=512).
-- Per-layer RoPE: full layers use partial rotary 0.5 with llama3 scaling
-  (theta 5e6); sliding layers use full rotary 1.0 with theta 1e4 and no
-  scaling.
-- Gemma-style Q/K RMSNorm (``weight + 1``) and a head-wise output gate
-  (``sigmoid(g_proj(hidden))`` multiplied per attention head before
-  ``o_proj``).
-- Layers 0..2 use dense SwiGLU MLPs; layers 3..44 mix routed quantized MoE
-  (288 experts, top-k 8, sigmoid+bias top-k, renormalized weights times
-  routed_scaling_factor=3.0, fp32 gate) with a bf16 shared expert.
-- Late layers 43/44 carry non-zero SwiGLU clamp limits for the routed and
-  shared experts.
+- Per-layer RoPE: full-attention layers (0, 4, 8, ..., 44) use partial rotary
+  with llama3 scaling and theta 5e6; sliding-attention layers use full rotary
+  with theta 1e4 and no scaling.
+- Gemma-style RMSNorm (``weight + 1``) on Q/K and all layer norms, and a
+  head-wise output gate (``sigmoid(g_proj(hidden))`` multiplied per attention
+  head before ``o_proj``).
+- Layers 43/44 carry non-zero SwiGLU clamp limits for routed and shared
+  experts; routed experts use sigmoid+bias top-k routing with renormalization
+  and ``routed_scaling_factor=3.0``.
 
-Three checkpoint variants are supported by this single module:
-
-- **BF16 reference** (``step-3-7-flash-bf16_vv1``): unquantized text decoder,
-  no FP8 KV cache.
-- **FP8 block-scale flash** (``step-3-7-flash-fp8_vv1``): routed MoE experts
-  in FP8 with 128x128 block scales; attention / dense MLP / shared expert
-  stay BF16.
-- **NVFP4 multimodal NIM/VNIM** (``step-3.7-flash-nim_vnim-nvfp4-260528``):
-  routed MoE experts in NVFP4 (e2m1 + per-16 FP8 block scale + per-tensor
-  FP32 global scale) with FP8 KV cache.  The on-disk checkpoint nests the
-  text decoder under ``model.language_model.*`` and the vision tower under
-  ``model.vision_model.*``; ``rewrite_language_model_keys`` flattens the
-  namespace at load time so the TRT-LLM module tree (still rooted at
-  ``model.layers.*``) is reused unchanged.
-
-The on-disk checkpoints also contain 3 MTP layers (45..47) and a vision
-tower.  The vision tower is ignored for text-only generation; MTP layers
-are loaded when ``MTPDecodingConfig`` is enabled.
+Supported checkpoint variants: BF16 reference, FP8 block-scale flash, and
+NVFP4 multimodal (with text decoder under ``model.language_model.*``,
+flattened at load time). The on-disk checkpoints also carry 3 MTP layers
+(loaded when ``MTPDecodingConfig`` is enabled) and a vision tower (ignored).
 """
 
 from __future__ import annotations
 
+import copy
 import os
 from typing import Dict, List, Optional, Tuple
 
@@ -82,31 +64,34 @@ from .modeling_utils import DecoderModel, DecoderModelForCausalLM, register_auto
 # FP8 / NVFP4 dequant helpers (used by the layer-43/44 SwiGLU-clamp path)
 # ---------------------------------------------------------------------------
 
+_DEFAULT_FULL_ATTENTION_PERIOD = 4
+_DEFAULT_ROPE_THETA = 10000.0
+_FP8_BLOCK_SIZE = 128
+_PYTHON_FALLBACK_DISABLED_LAYER = 999
+_PYTHON_FALLBACK_THRESHOLD_ENV = "STEP3P7_PYTHON_FALLBACK_THRESHOLD"
+_KV_SCALE_SUFFIXES = (".k_scale", ".v_scale")
+
 
 def _fp8_block_dequant_3d(
-    weight_fp8: torch.Tensor, scale_inv: torch.Tensor, block: int = 128
+    weight_fp8: torch.Tensor, scale_inv: torch.Tensor, block: int = _FP8_BLOCK_SIZE
 ) -> torch.Tensor:
-    """Dequantise a 3D per-expert FP8 e4m3 block-scale tensor to bf16.
-
-    Args:
-        weight_fp8: ``(E, M, K)`` FP8 weight tensor.
-        scale_inv: ``(E, ceil(M/block), ceil(K/block))`` FP32 scale tensor.
-        block: per-axis block size (default 128 -- DeepSeek/Step3p7 convention).
-    Returns:
-        ``(E, M, K)`` bf16 tensor on the same device as ``weight_fp8``.
-    """
+    """Dequantise ``(E, M, K)`` FP8 e4m3 block-scale tensor to bf16."""
     _, M, K = weight_fp8.shape
     scale = scale_inv.to(torch.float32).repeat_interleave(block, dim=-2)
     scale = scale[..., :M, :].repeat_interleave(block, dim=-1)[..., :K]
     return (weight_fp8.to(torch.float32) * scale).to(torch.bfloat16)
 
 
-# NVFP4 / e2m1 nibble lookup. Index 0-15 are the 16 representable values for
-# the e2m1 format used by NVFP4 (1 sign bit + 2 exponent + 1 mantissa).
+# e2m1 nibble lookup: the 16 representable values for the NVFP4 4-bit float
+# (1 sign + 2 exponent + 1 mantissa).
 _E2M1_VALUES = torch.tensor(
     [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, 0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0],
     dtype=torch.float32,
 )
+
+
+def _ceil_div(x: int, y: int) -> int:
+    return (x + y - 1) // y
 
 
 def _nvfp4_dequant_batched(
@@ -117,43 +102,30 @@ def _nvfp4_dequant_batched(
 ) -> torch.Tensor:
     """Dequantise an N-D NVFP4 weight tensor to bf16 in one batched op.
 
-    Matches modelopt's ``_dequantize_nvfp4`` reference: per-16 block scale
-    (fp8_e4m3) and per-tensor (or per-expert) global scale (fp32) multiply
-    directly into the e2m1 nibble values, then cast to bf16.
-
-    Args:
-        weight_uint8: ``(*B, M, K/2)`` packed weight (two e2m1 nibbles/byte).
-        block_scale_fp8: ``(*B, M, K/16)`` per-16 block scale (fp8_e4m3).
-        global_scale_fp32: scalar fp32 or ``(B,)`` per-expert fp32.
-        target_device: device to run the dequant on. Defaults to
-            ``weight_uint8.device``. For checkpoint tensors that live on
-            CPU it is *much* faster to move the inputs to GPU first because
-            the per-element ``lut[idx]`` gather costs ~50ms per expert
-            tensor on CPU but <1ms on B200.
-    Returns:
-        ``(*B, M, K)`` bf16 tensor on ``target_device``.
+    ``weight_uint8`` is ``(*B, M, K/2)`` packed (two e2m1 nibbles per byte),
+    ``block_scale_fp8`` is ``(*B, M, K/16)`` (fp8_e4m3), and
+    ``global_scale_fp32`` is scalar or ``(B,)``. For checkpoint tensors that
+    live on CPU, pass ``target_device='cuda'`` -- the per-element ``lut[idx]``
+    gather costs ~50ms per expert on CPU but <1ms on B200.
     """
     device = target_device or weight_uint8.device
     w = weight_uint8.to(device=device, non_blocking=True)
     s1 = block_scale_fp8.to(device=device, non_blocking=True)
     s2 = global_scale_fp32.to(device=device, non_blocking=True)
 
-    K_half = w.shape[-1]
-    K = K_half * 2
+    K = w.shape[-1] * 2
     lut = _E2M1_VALUES.to(device=device)
 
     high = (w >> 4) & 0x0F
     low = w & 0x0F
-    # gather → (*shape_of_w, ) float32; then interleave low/high along K.
     vals = torch.empty(*w.shape[:-1], K, dtype=torch.float32, device=device)
     vals[..., 0::2] = lut[low.long()]
     vals[..., 1::2] = lut[high.long()]
 
-    # Broadcast (*B,) global scale to (*B, 1, 1) so it multiplies (*B, M, K/16).
     s2_b = s2.to(torch.float32)
     for _ in range(s1.dim() - s2_b.dim()):
         s2_b = s2_b.unsqueeze(-1)
-    scale = (s1.to(torch.float32) * s2_b).unsqueeze(-1)  # (*B, M, K/16, 1)
+    scale = (s1.to(torch.float32) * s2_b).unsqueeze(-1)
 
     vals = vals.view(*w.shape[:-1], K // 16, 16) * scale
     return vals.view(*w.shape[:-1], K).to(torch.bfloat16)
@@ -166,14 +138,7 @@ def _nvfp4_stack_dequant(
     expert_ids: list,
     target_device: Optional[torch.device] = None,
 ) -> torch.Tensor:
-    """Dequant NVFP4 expert tensors for ``expert_ids`` and stack along dim 0.
-
-    Reads ``{base}.<e>.<w_name>.{weight,weight_scale,weight_scale_2}`` for
-    each ``e``, stacks once on CPU (with ``torch.stack`` over views), then
-    runs a single batched GPU dequant. Returns ``(len(expert_ids), M, K)``
-    bf16 on ``target_device``. Used by the Python SwiGLU-clamp fallback on
-    layers with non-zero ``swiglu_limits``.
-    """
+    """Stack and dequant NVFP4 experts ``expert_ids`` for ``{base}.<e>.<w_name>``."""
     w_stack = torch.stack([weights[f"{base}.{e}.{w_name}.weight"] for e in expert_ids])
     s1_stack = torch.stack([weights[f"{base}.{e}.{w_name}.weight_scale"] for e in expert_ids])
     s2_stack = torch.stack(
@@ -190,48 +155,37 @@ def _nvfp4_stack_dequant(
 def _normalize_torch_dtype(cfg) -> None:
     """Normalize ``cfg.torch_dtype`` from a string (HF JSON form) to ``torch.dtype``."""
     dt = getattr(cfg, "torch_dtype", None)
+    if dt is None:
+        cfg.torch_dtype = torch.bfloat16
+        return
     if isinstance(dt, str):
-        try:
-            mapped = getattr(torch, dt)
-            if isinstance(mapped, torch.dtype):
-                cfg.torch_dtype = mapped
-                return
-        except AttributeError:
-            pass
-        # Fall back: try Transformers' canonical mapping
+        mapped = getattr(torch, dt, None)
+        if isinstance(mapped, torch.dtype):
+            cfg.torch_dtype = mapped
+            return
         try:
             from transformers.utils import STR_TO_DTYPE  # type: ignore
 
             cfg.torch_dtype = STR_TO_DTYPE.get(dt, torch.bfloat16)
-            return
-        except Exception:
-            pass
-        cfg.torch_dtype = torch.bfloat16
-    elif dt is None:
-        cfg.torch_dtype = torch.bfloat16
+        except ImportError:
+            cfg.torch_dtype = torch.bfloat16
 
 
 def _mirror_step3p7_text_aliases(pretrained_config: PretrainedConfig) -> None:
-    """Promote ``text_config`` aliases the runtime expects on the top-level config.
+    """Promote Step3p7 ``text_config`` aliases the runtime expects on the top level.
 
-    The HF checkpoint stores text decoder fields (``hidden_size``,
-    ``num_hidden_layers``, ``vocab_size``, ``rope_theta`` per-layer, etc.) under
-    ``text_config``.  TensorRT-LLM ``model_config.from_pretrained`` already
-    runs ``_mirror_text_subconfig_attrs`` for unknown attributes; this helper
-    plugs in Step3p7-specific aliases that need explicit defaults.
+    Complements ``ModelConfig.from_pretrained``'s generic ``_mirror_text_subconfig_attrs``
+    by plugging in Step3p7-specific aliases (``num_key_value_heads`` from
+    ``num_attention_groups``, ``num_nextn_predict_layers``, etc.) and normalising
+    ``torch_dtype`` from the raw HF JSON string to ``torch.dtype``.
     """
     text_config = getattr(pretrained_config, "text_config", None)
     if text_config is None:
         return
 
-    # Normalize torch_dtype string -> torch.dtype on both top-level and text.
-    # HF transformers 5.x keeps torch_dtype as the raw JSON string when read
-    # via ``trust_remote_code``; TRT-LLM module constructors (Embedding,
-    # Linear, RMSNorm) require an actual ``torch.dtype``.
     _normalize_torch_dtype(pretrained_config)
     _normalize_torch_dtype(text_config)
 
-    # `num_key_value_heads` is what the rest of TRT-LLM expects.
     if not hasattr(pretrained_config, "num_key_value_heads") and hasattr(
         text_config, "num_attention_groups"
     ):
@@ -241,7 +195,6 @@ def _mirror_step3p7_text_aliases(pretrained_config: PretrainedConfig) -> None:
     ):
         text_config.num_key_value_heads = text_config.num_attention_groups
 
-    # Some downstream code reads ``max_position_embeddings`` from the top.
     if not hasattr(pretrained_config, "max_position_embeddings") and hasattr(
         text_config, "max_position_embeddings"
     ):
@@ -265,7 +218,9 @@ def _layer_attention_type(text_config: PretrainedConfig, layer_idx: int) -> str:
     if layer_idx < len(layer_types):
         return layer_types[layer_idx]
     # Default: layer 0,4,8,... are full attention.
-    return "full_attention" if (layer_idx % 4 == 0) else "sliding_attention"
+    if layer_idx % _DEFAULT_FULL_ATTENTION_PERIOD == 0:
+        return "full_attention"
+    return "sliding_attention"
 
 
 def _layer_query_heads(text_config: PretrainedConfig, layer_idx: int) -> int:
@@ -286,18 +241,24 @@ def _layer_kv_heads(text_config: PretrainedConfig, layer_idx: int) -> int:
     )
 
 
+def _per_layer_lookup(text_config: PretrainedConfig, values, layer_idx: int) -> float:
+    """Pick ``values[layer_idx]`` from a per-layer list, falling back to the most
+    recent entry that matches the current layer's attention type."""
+    if layer_idx < len(values):
+        return float(values[layer_idx])
+    layer_types = getattr(text_config, "layer_types", None)
+    if layer_types:
+        cur_type = _layer_attention_type(text_config, layer_idx)
+        for prev_idx in range(min(len(values), len(layer_types)) - 1, -1, -1):
+            if layer_types[prev_idx] == cur_type:
+                return float(values[prev_idx])
+    return float(values[-1])
+
+
 def _layer_rope_theta(text_config: PretrainedConfig, layer_idx: int) -> float:
-    theta = getattr(text_config, "rope_theta", 10000.0)
-    if isinstance(theta, (list, tuple)) and layer_idx < len(theta):
-        return float(theta[layer_idx])
+    theta = getattr(text_config, "rope_theta", _DEFAULT_ROPE_THETA)
     if isinstance(theta, (list, tuple)):
-        layer_types = getattr(text_config, "layer_types", None)
-        cur_layer_type = _layer_attention_type(text_config, layer_idx)
-        if layer_types:
-            for prev_idx in range(min(len(theta), len(layer_types)) - 1, -1, -1):
-                if layer_types[prev_idx] == cur_layer_type:
-                    return float(theta[prev_idx])
-        return float(theta[-1])
+        return _per_layer_lookup(text_config, theta, layer_idx)
     return float(theta)
 
 
@@ -305,15 +266,7 @@ def _layer_partial_rotary(text_config: PretrainedConfig, layer_idx: int) -> floa
     factors = getattr(text_config, "partial_rotary_factors", None)
     if factors is None:
         return 1.0
-    if layer_idx < len(factors):
-        return float(factors[layer_idx])
-    layer_types = getattr(text_config, "layer_types", None)
-    cur_layer_type = _layer_attention_type(text_config, layer_idx)
-    if layer_types:
-        for prev_idx in range(min(len(factors), len(layer_types)) - 1, -1, -1):
-            if layer_types[prev_idx] == cur_layer_type:
-                return float(factors[prev_idx])
-    return float(factors[-1])
+    return _per_layer_lookup(text_config, factors, layer_idx)
 
 
 def _layer_uses_rope_scaling(text_config: PretrainedConfig, layer_idx: int) -> bool:
@@ -348,26 +301,50 @@ def _is_moe_layer(text_config: PretrainedConfig, layer_idx: int) -> bool:
     return layer_idx in moe_layers
 
 
+def _parse_python_fallback_threshold() -> int:
+    try:
+        return int(
+            os.environ.get(_PYTHON_FALLBACK_THRESHOLD_ENV, str(_PYTHON_FALLBACK_DISABLED_LAYER))
+        )
+    except ValueError:
+        return _PYTHON_FALLBACK_DISABLED_LAYER
+
+
+def _select_python_expert_path(
+    model_config: ModelConfig,
+    text_config: PretrainedConfig,
+    layer_idx: int,
+) -> tuple[float | None, bool, str]:
+    """Return ``(swiglu_limit, use_python_path, reason)`` for a routed MoE layer.
+
+    The Python expert loop is selected for clamp-active layers (no FP8 backend
+    on B200 supports ``swiglu_limit``), for BF16 checkpoints (the FP8 kernel
+    can't run against bf16 weights), and via an env-var diagnostic override.
+    """
+    swiglu_limit = _layer_swiglu_limit(text_config, layer_idx, shared=False)
+    qc = getattr(model_config, "quant_config", None)
+    is_bf16_checkpoint = qc is None or getattr(qc, "quant_algo", None) is None
+
+    if swiglu_limit is not None and swiglu_limit > 0:
+        return swiglu_limit, True, "clamp"
+    if layer_idx >= _parse_python_fallback_threshold():
+        return swiglu_limit, True, "late_layer"
+    if is_bf16_checkpoint:
+        return swiglu_limit, True, "bf16_kernel_workaround"
+    return swiglu_limit, False, ""
+
+
 # ---------------------------------------------------------------------------
 # MoE routing
 # ---------------------------------------------------------------------------
 
 
 class Step3p7RouterBiasHolder(nn.Module):
-    """Standalone parameter holder for ``router_bias``.
+    """Standalone parameter holder for ``router_bias`` (mirrors MiniMaxM2).
 
-    Mirrors MiniMaxM2's ``_EScoreCorrectionBiasHolder`` so the generic weight
-    loader has a narrow prefix to mark consumed without dropping the rest of
-    the MoE block (see the comment in MiniMaxM2 about issue #11119).
-
-    The holder module is named ``router_bias`` on the parent ``Step3p7MoE``
-    (NOT ``router_bias_holder``), so the resulting parameter path is
-    ``...moe.router_bias.router_bias``.  The HF source key is
-    ``...moe.router_bias`` (a 1-D tensor).  When the generic loader visits
-    this module with prefix ``...moe.router_bias`` and calls ``filter_weights``,
-    that prefix matches the source key exactly, so the filter yields
-    ``{"": tensor}`` (empty subkey).  The ``""`` branch below handles that case
-    and the explicit ``router_bias`` branch handles the per-rank shard format.
+    The holder is attached as ``moe.router_bias`` so the resulting parameter
+    path ``moe.router_bias.router_bias`` matches the HF source key
+    ``moe.router_bias`` exactly when the generic loader filters weights.
     """
 
     def __init__(self, num_experts: int):
@@ -392,19 +369,12 @@ class Step3p7RouterBiasHolder(nn.Module):
 class Step3p7MoeRoutingMethod(MiniMaxM2MoeRoutingMethod):
     """Step3p7 routing: ``sigmoid -> add bias -> top-k -> renormalize -> scale``.
 
-    Mirrors the source ``router_bias_func`` semantics in modeling_step3p7.py.
-    The unbiased sigmoid probabilities are gathered (not the biased ones);
-    renormalization uses ``sum + 1e-20`` and the final weights are multiplied
-    by ``routed_scaling_factor`` (3.0 for Step3p7).
-
     Inherits from ``MiniMaxM2MoeRoutingMethod`` so the TRTLLMGen
-    ``_extract_routing_params`` helper recognises us via ``isinstance(...)``
-    and feeds the bias pointer to the kernel.  The ``MiniMax2`` C++ routing
-    path hard-codes ``routeScale = 1.0f`` (see ``runner.cu``), so the
-    constant ``routed_scaling_factor`` is applied to the MoE output in
-    ``Step3p7MoE.forward`` rather than in ``apply`` here — the Python
-    ``apply`` is only invoked in the post-quant-comm path, while the no-comm
-    path executes routing inside the kernel.
+    ``_extract_routing_params`` helper recognises us via ``isinstance`` and
+    feeds the bias pointer to the kernel. The MiniMax2 C++ routing path
+    hard-codes ``routeScale = 1.0f`` (see ``runner.cu``), so
+    ``routed_scaling_factor`` is applied to the MoE output in
+    ``Step3p7MoE.forward`` instead of inside the kernel.
     """
 
     def __init__(
@@ -415,9 +385,6 @@ class Step3p7MoeRoutingMethod(MiniMaxM2MoeRoutingMethod):
         routed_scaling_factor: float = 1.0,
         output_dtype: torch.dtype = torch.float32,
     ):
-        # ``MiniMaxM2MoeRoutingMethod`` exposes the bias via the
-        # ``e_score_correction_bias`` attribute name (see its docstring); we
-        # name our callable to match so ``isinstance``-based lookups work.
         super().__init__(
             top_k=top_k,
             num_experts=num_experts,
@@ -426,9 +393,6 @@ class Step3p7MoeRoutingMethod(MiniMaxM2MoeRoutingMethod):
         )
         self.routed_scaling_factor = float(routed_scaling_factor)
 
-    # Apply path (used in the post-quant-comm branch only) reuses
-    # MiniMaxM2's apply for the bias-renormalize math, then multiplies the
-    # weights by ``routed_scaling_factor`` to match source semantics.
     def apply(
         self,
         router_logits: torch.Tensor,
@@ -445,7 +409,6 @@ class Step3p7MoeRoutingMethod(MiniMaxM2MoeRoutingMethod):
 
     @property
     def router_bias(self) -> torch.Tensor:
-        # Alias for callers that read the bias under the Step3p7-native name.
         return self.callable_e_score_correction_bias()
 
 
@@ -454,53 +417,45 @@ class Step3p7MoeRoutingMethod(MiniMaxM2MoeRoutingMethod):
 # ---------------------------------------------------------------------------
 
 
-class _PerLayerRopeShim:
-    """Materialise per-layer RoPE/q-head fields onto a copy of the config.
+_LLAMA3_ROPE_PARAM_KEYS = frozenset(
+    {
+        "rope_type",
+        "factor",
+        "original_max_position_embeddings",
+        "low_freq_factor",
+        "high_freq_factor",
+    }
+)
 
-    TensorRT-LLM's ``RopeParams.from_config`` and ``Attention.__init__`` read
-    ``num_attention_heads``, ``num_key_value_heads``, ``rope_theta``, etc. as
-    top-level scalars.  Step3p7 carries them as per-layer lists; this helper
-    builds a shallow copy with the layer-specific scalars applied so existing
-    TRT-LLM machinery composes unchanged.
+
+def _build_per_layer_config(text_config: PretrainedConfig, layer_idx: int) -> PretrainedConfig:
+    """Shallow-copy ``text_config`` with per-layer RoPE / head scalars applied.
+
+    Step3p7 stores ``num_attention_heads``, ``rope_theta`` etc. as per-layer
+    lists, while TRT-LLM's ``RopeParams.from_config`` and ``Attention.__init__``
+    read them as top-level scalars. Transformers 5.x also keeps the per-layer
+    list inside the ``rope_parameters`` dict; ``RopeParams.from_config`` does
+    ``config.update(rope_parameters)``, so we must materialise a per-layer
+    ``rope_parameters`` too — otherwise the scalar gets overwritten by the list.
     """
+    cfg = copy.copy(text_config)
+    cfg.num_attention_heads = _layer_query_heads(text_config, layer_idx)
+    cfg.num_key_value_heads = _layer_kv_heads(text_config, layer_idx)
+    theta_scalar = _layer_rope_theta(text_config, layer_idx)
+    cfg.rope_theta = theta_scalar
+    cfg.partial_rotary_factor = _layer_partial_rotary(text_config, layer_idx)
 
-    @staticmethod
-    def build(text_config: PretrainedConfig, layer_idx: int) -> PretrainedConfig:
-        import copy
+    src_rope_params = getattr(text_config, "rope_parameters", None)
+    if isinstance(src_rope_params, dict):
+        cfg.rope_parameters = {**src_rope_params, "rope_theta": theta_scalar}
 
-        cfg = copy.copy(text_config)
-        cfg.num_attention_heads = _layer_query_heads(text_config, layer_idx)
-        cfg.num_key_value_heads = _layer_kv_heads(text_config, layer_idx)
-        theta_scalar = _layer_rope_theta(text_config, layer_idx)
-        cfg.rope_theta = theta_scalar
-        cfg.partial_rotary_factor = _layer_partial_rotary(text_config, layer_idx)
-        # Transformers 5.x stores rope_parameters as a nested dict that includes
-        # the per-layer ``rope_theta`` list.  ``RopeParams.from_config`` does
-        # ``config.update(rope_parameters)`` and would overwrite our scalar
-        # back to the list.  Materialize a per-layer rope_parameters dict here.
-        src_rope_params = getattr(text_config, "rope_parameters", None)
-        if isinstance(src_rope_params, dict):
-            new_params = {k: v for k, v in src_rope_params.items()}
-            new_params["rope_theta"] = theta_scalar
-            cfg.rope_parameters = new_params
-        if not _layer_uses_rope_scaling(text_config, layer_idx):
-            cfg.rope_scaling = None
-            if isinstance(getattr(cfg, "rope_parameters", None), dict):
-                # Strip llama3 scaling so sliding layers fall back to plain RoPE.
-                stripped = {
-                    k: v
-                    for k, v in cfg.rope_parameters.items()
-                    if k
-                    not in {
-                        "rope_type",
-                        "factor",
-                        "original_max_position_embeddings",
-                        "low_freq_factor",
-                        "high_freq_factor",
-                    }
-                }
-                cfg.rope_parameters = stripped
-        return cfg
+    if not _layer_uses_rope_scaling(text_config, layer_idx):
+        cfg.rope_scaling = None
+        if isinstance(getattr(cfg, "rope_parameters", None), dict):
+            cfg.rope_parameters = {
+                k: v for k, v in cfg.rope_parameters.items() if k not in _LLAMA3_ROPE_PARAM_KEYS
+            }
+    return cfg
 
 
 class Step3p7Attention(Attention):
@@ -514,7 +469,7 @@ class Step3p7Attention(Attention):
 
     def __init__(self, model_config: ModelConfig, layer_idx: int):
         text_config = _get_text_config(model_config)
-        per_layer_cfg = _PerLayerRopeShim.build(text_config, layer_idx)
+        per_layer_cfg = _build_per_layer_config(text_config, layer_idx)
         self.text_config = text_config
         self.layer_attention_type = _layer_attention_type(text_config, layer_idx)
         self.sliding_window = (
@@ -527,28 +482,23 @@ class Step3p7Attention(Attention):
         )
         self.use_head_wise_gate = bool(getattr(text_config, "use_head_wise_attn_gate", False))
 
-        # RoPE: theta is per-layer; rope_scaling is per-layer-type.
         rope_params = RopeParams.from_config(per_layer_cfg)
         rope_params.theta = per_layer_cfg.rope_theta
-        if not _layer_uses_rope_scaling(text_config, layer_idx):
+        if _layer_uses_rope_scaling(text_config, layer_idx):
+            rope_params.scale_type = RotaryScalingType.llama3
+        else:
             rope_params.scale_type = RotaryScalingType.none
             rope_params.scale = 1.0
-        else:
-            rope_params.scale_type = RotaryScalingType.llama3
-        partial = _layer_partial_rotary(text_config, layer_idx)
-        rope_params.dim = int(self.head_dim * partial)
+        rope_params.dim = int(self.head_dim * _layer_partial_rotary(text_config, layer_idx))
 
         pos_embd_params = PositionalEmbeddingParams(
             type=PositionEmbeddingType.rope_gpt_neox,
             rope=rope_params,
         )
 
-        # Build a wrapped ModelConfig view so super().__init__ sees the
-        # per-layer scalars when it consults pretrained_config.
-        # ``ModelConfig`` is frozen; ``pretrained_config`` is exempt from the
-        # freeze (see ``ModelConfig.__setattr__``), so we can swap it in place
-        # for the duration of the base Attention constructor and restore it
-        # immediately after.
+        # Swap in the per-layer pretrained_config for the duration of the base
+        # constructor so it sees scalar (not per-layer-list) head/RoPE fields.
+        # ``ModelConfig`` is frozen but ``pretrained_config`` is exempt.
         original_pretrained_config = model_config.pretrained_config
         model_config.pretrained_config = per_layer_cfg
         try:
@@ -569,7 +519,6 @@ class Step3p7Attention(Attention):
         finally:
             model_config.pretrained_config = original_pretrained_config
 
-        # Gemma-style Q/K norm (`weight + 1`).
         self.q_norm = RMSNorm(
             hidden_size=self.head_dim,
             eps=text_config.rms_norm_eps,
@@ -583,7 +532,6 @@ class Step3p7Attention(Attention):
             use_gemma=True,
         )
 
-        # Head-wise output gate projection.  Hidden_size -> num_heads.
         if self.use_head_wise_gate:
             self.g_proj = Linear(
                 in_features=text_config.hidden_size,
@@ -610,14 +558,10 @@ class Step3p7Attention(Attention):
         v: Optional[torch.Tensor],
         position_ids: torch.Tensor,
     ):
-        # Split (q,k,v) first because module-side QK norm requires the
-        # heads-separated layout.  Apply Gemma RMSNorm, then defer to the
-        # base Attention's unfused RoPE path so backend selection still
-        # owns the actual rotation.
+        # Split before QK-norm: Gemma RMSNorm needs the heads-separated layout.
         q, k, v = self.split_qkv(q, k, v)
         q, k = self.apply_qk_norm(q, k)
-        q, k, v = super().apply_rope(q, k, v, position_ids)
-        return q, k, v
+        return super().apply_rope(q, k, v, position_ids)
 
     def forward(
         self,
@@ -630,17 +574,10 @@ class Step3p7Attention(Attention):
     ) -> torch.Tensor:
         """Step3p7 attention with module-side QK-norm + RoPE + head gate.
 
-        We bypass the base ``Attention.forward`` so we can apply the source's
-        per-head output gate between the attention backend and ``o_proj``.
-        The gate is computed from the *pre-attention* hidden states via
-        ``g_proj`` (output = num_heads), broadcast over head_dim, and
-        multiplied into the attention output before the o_proj.
-
-        Helix CP, LoRA, and attention sinks from the base class are
-        intentionally *not* plumbed here.  Future iterations can re-enable
-        those by upstreaming a per-head gate hook into ``Attention.forward``.
+        Bypasses the base ``Attention.forward`` to apply the per-head output
+        gate (``sigmoid(g_proj(hidden))``) between the attention backend and
+        ``o_proj``. Helix CP, LoRA, and attention sinks are not plumbed here.
         """
-        # Use the per-layer sliding window unless explicitly overridden.
         effective_window = (
             attention_window_size if attention_window_size is not None else self.sliding_window
         )
@@ -662,8 +599,7 @@ class Step3p7Attention(Attention):
             position_ids = position_ids.clamp_min(0)
 
         qkv = self.qkv_proj(hidden_states)
-        q, k, v = qkv, None, None
-        q, k, v = self.apply_rope(q, k, v, position_ids)
+        q, k, v = self.apply_rope(qkv, None, None, position_ids)
         q, k, v = self.convert_qkv(q, k, v)
 
         attn_output = self.forward_impl(
@@ -680,24 +616,14 @@ class Step3p7Attention(Attention):
         )
 
         if self.use_head_wise_gate:
+            # self.num_heads is already per-rank after TP sharding.
             gate = self.g_proj(hidden_states)
-            head_dim = self.head_dim
-            # ``self.num_heads`` is already the per-rank head count after
-            # Attention.__init__ shards by tp_size; do NOT divide again.
-            num_heads_tp = self.num_heads
-            # attn_output is [tokens, num_heads_tp * head_dim].  Reshape so
-            # we can broadcast the per-head gate scalar over head_dim.
             orig_shape = attn_output.shape
-            attn_output = attn_output.view(*orig_shape[:-1], num_heads_tp, head_dim)
-            # Source semantics: ``gate_states.unsqueeze(-1).sigmoid()``
-            # broadcasts the per-head scalar over ``head_dim``.  gate has
-            # shape ``(tokens, num_heads_tp)``, unsqueeze to
-            # ``(tokens, num_heads_tp, 1)``, then sigmoid.
+            attn_output = attn_output.view(*orig_shape[:-1], self.num_heads, self.head_dim)
             attn_output = attn_output * gate.unsqueeze(-1).sigmoid()
             attn_output = attn_output.view(*orig_shape)
 
-        attn_output = self.o_proj(attn_output)
-        return attn_output
+        return self.o_proj(attn_output)
 
 
 # ---------------------------------------------------------------------------
@@ -708,15 +634,9 @@ class Step3p7Attention(Attention):
 class _ClampedGatedMLP(GatedMLP):
     """Dense SwiGLU MLP with optional per-layer clamp on gate/up activations.
 
-    Mirrors source ``Step3p7MLP``: when ``swiglu_limit`` is set, ``gate`` is
-    clamped to ``[-, limit]`` and ``up`` is clamped to ``[-limit, limit]``
-    before the elementwise multiply.  Otherwise it behaves exactly like the
-    standard ``GatedMLP``.
-
-    The class **inherits** from ``GatedMLP`` rather than wrapping it so that
-    the weight loader sees the standard module path
-    ``...mlp.gate_up_proj`` / ``...mlp.down_proj`` matching the HF source
-    convention with ``params_map['gate_up_proj'] = ['gate_proj', 'up_proj']``.
+    When ``swiglu_limit`` is set, ``gate`` is clamped to ``[-inf, limit]`` and
+    ``up`` is clamped to ``[-limit, limit]`` before the elementwise multiply
+    (matching source ``Step3p7MLP``). Otherwise this is a standard ``GatedMLP``.
     """
 
     def __init__(
@@ -735,7 +655,7 @@ class _ClampedGatedMLP(GatedMLP):
             dtype=text_config.torch_dtype,
             config=model_config,
             layer_idx=layer_idx,
-            # Shared experts must not all-reduce; the routed MoE call does it.
+            # Shared expert defers all-reduce to the routed MoE call.
             reduce_output=not is_shared_expert,
             overridden_tp_size=None,
             is_shared_expert=is_shared_expert,
@@ -745,34 +665,27 @@ class _ClampedGatedMLP(GatedMLP):
     def forward(self, hidden_states: torch.Tensor, **kwargs) -> torch.Tensor:
         if self.swiglu_limit is None:
             return super().forward(hidden_states, **kwargs)
-        # Compute gate/up separately to apply the clamp like the source does.
-        gate_up = self.gate_up_proj(hidden_states)
-        gate, up = gate_up.chunk(2, dim=-1)
-        gate = torch.nn.functional.silu(gate)
-        gate = gate.clamp(max=self.swiglu_limit)
+        gate, up = self.gate_up_proj(hidden_states).chunk(2, dim=-1)
+        gate = torch.nn.functional.silu(gate).clamp(max=self.swiglu_limit)
         up = up.clamp(min=-self.swiglu_limit, max=self.swiglu_limit)
-        hidden = gate * up
-        return self.down_proj(hidden)
+        return self.down_proj(gate * up)
 
 
 class Step3p7MoE(nn.Module):
-    """Routed FP8 block-scale MoE block (router gate + routed experts).
+    """Routed MoE block: router gate + bias-holder + routed experts.
 
-    Routing is sigmoid + bias top-k with renormalization and scaling.
-    Routed experts are FP8 block-scale.
-
-    The shared expert is intentionally **not** owned by this module — it lives
-    on the decoder layer because the HF source stores it at
-    ``model.layers.<i>.share_expert.{gate,up,down}_proj.weight`` (no ``moe.``
-    prefix) and TensorRT-LLM's weight loader works module path by module path.
+    The shared expert is owned by the decoder layer (HF source stores it
+    under ``share_expert.*``, not ``moe.share_expert.*``).
     """
+
+    _CLAMP_BUFFER_NAMES = ("_clamp_gate_proj", "_clamp_up_proj", "_clamp_down_proj")
 
     def __init__(
         self,
         model_config: ModelConfig,
         layer_idx: int,
         aux_stream_dict: Dict[AuxStreamType, torch.cuda.Stream],
-    ):
+    ) -> None:
         super().__init__()
         text_config = _get_text_config(model_config)
         self.layer_idx = layer_idx
@@ -785,7 +698,6 @@ class Step3p7MoE(nn.Module):
         self.mapping = model_config.mapping
         self.enable_attention_dp = self.mapping.enable_attention_dp
 
-        # Router (gate) projection.  Source computes router logits in fp32.
         gate_dtype = torch.float32 if self.need_fp32_gate else text_config.torch_dtype
         self.gate = Linear(
             in_features=self.hidden_size,
@@ -795,9 +707,6 @@ class Step3p7MoE(nn.Module):
             quant_config=None,
         )
 
-        # Router bias holder: name the holder ``router_bias`` so the resulting
-        # parameter path matches the HF source key prefix exactly.  See the
-        # docstring of ``Step3p7RouterBiasHolder`` for the loader contract.
         self.router_bias = Step3p7RouterBiasHolder(self.num_experts)
         routing_method = Step3p7MoeRoutingMethod(
             top_k=self.top_k,
@@ -806,55 +715,11 @@ class Step3p7MoE(nn.Module):
             routed_scaling_factor=self.routed_scaling_factor,
         )
 
-        # Per-layer SwiGLU clamp limit for routed experts.  Source ``Step3p7MoEMLP``
-        # applies ``gate = gate.clamp(max=limit)`` and ``up = up.clamp(-limit, limit)``
-        # when ``swiglu_limits[layer_idx]`` is non-zero -- needed for layers 43/44
-        # of Step3p7-Flash-FP8 (limit=7).  Neither TRTLLMGen FP8-block-scale
-        # (the production B200 path) nor Cutlass FP8-block-scale (DeepGEMM is
-        # Hopper-only) accepts ``swiglu_limit`` for fp8_block_scales today.  As
-        # the design-review's MoE Direction C explicitly allows, those two
-        # clamp-active layers run a local Python expert path on bf16-dequant
-        # weights so the source-defined clamp can be expressed.
-        #
-        # The optional ``STEP3P7_PYTHON_FALLBACK_THRESHOLD`` knob extends the
-        # same Python fp32 expert path to later layers when HF-matching expert
-        # math is needed.  It defaults to ``999`` (disabled).  The FP8 backend
-        # tensors stay allocated for clamp and fallback layers because backend
-        # metadata and CUDA graph setup expect those tensors to remain present.
-        scalar_limit = _layer_swiglu_limit(text_config, layer_idx, shared=False)
-        self._routed_swiglu_limit: Optional[float] = scalar_limit
-        _clamp_active = scalar_limit is not None and scalar_limit > 0
-        try:
-            _python_threshold = int(os.environ.get("STEP3P7_PYTHON_FALLBACK_THRESHOLD", "999"))
-        except ValueError:
-            _python_threshold = 999
-        _late_layer = layer_idx >= _python_threshold
-        # BF16 checkpoint kernel workaround.  The flashinfer
-        # ``trtllm_bf16_moe`` kernel (selected by ``BF16TRTLLMGenFusedMoEMethod``
-        # for the unquantized routed-expert path) produces functionally wrong
-        # tokens for Step3p7's geometry / routing combination
-        # (288 experts, top-k 8, MiniMax2 sigmoid+bias routing, no
-        # routed_scaling_factor inside the kernel, hidden=4096,
-        # moe_intermediate=1280, BlockMajorK shuffle).  The FP8 path goes
-        # through a different kernel (``run_fp8_block_scale_moe``).  Until the
-        # BF16-kernel root cause is fixed upstream, the BF16 checkpoint forces
-        # the Python fp32 expert path for every MoE layer.  The Python path is
-        # CUDA-graph safe (fixed iteration count, no ``.nonzero()`` / ``.any()``
-        # / variable indexing), so it composes with ``CudaGraphConfig()``.
-        quant_config_obj = getattr(model_config, "quant_config", None)
-        quant_algo_val = (
-            getattr(quant_config_obj, "quant_algo", None) if quant_config_obj is not None else None
-        )
-        is_bf16_checkpoint = quant_algo_val is None
-        self._use_python_clamp: bool = bool(_clamp_active or _late_layer or is_bf16_checkpoint)
-        if _clamp_active:
-            self._python_path_reason: str = "clamp"
-        elif _late_layer:
-            self._python_path_reason = "late_layer"
-        elif is_bf16_checkpoint:
-            self._python_path_reason = "bf16_kernel_workaround"
-        else:
-            self._python_path_reason = ""
+        (
+            self._routed_swiglu_limit,
+            self._use_python_clamp,
+            self._python_path_reason,
+        ) = _select_python_expert_path(model_config, text_config, layer_idx)
 
         self.experts = create_moe(
             num_experts=self.num_experts,
@@ -869,58 +734,8 @@ class Step3p7MoE(nn.Module):
             weight_loading_mode=MoEWeightLoadingMode.VANILLA,
         )
 
-        # When the layer has a non-zero SwiGLU clamp limit, allocate a parallel
-        # bf16 expert weight set.  These are filled at weight-load time by
-        # dequantising the on-disk FP8 block-scale tensors via
-        # ``_fp8_block_dequant``.  The forward path for these layers replaces
-        # the FP8 MoE call with a Python expert loop that applies the source
-        # clamp.  Total bf16 storage per layer per rank:
-        # ``num_local_experts * (2*moe_moe_interediate_size + hidden_size)
-        #  * moe_moe_interediate_size * 2 bytes``  -- about 1.1 GiB at
-        # ``num_local_experts=36``.
         if self._use_python_clamp:
-            num_local_experts = max(1, self.num_experts // max(1, self.mapping.moe_ep_size))
-            # Match HF's expert-local weight orientation: gate_proj (w1)
-            # is (moe_interediate, hidden); up_proj (w3) is (moe_interediate,
-            # hidden); down_proj (w2) is (hidden, moe_interediate).
-            # Use non-persistent buffers (NOT nn.Parameters) so the generic
-            # checkpoint loader skips them (it only walks ``_parameters``,
-            # not ``_buffers``).  We fill them ourselves in
-            # ``load_clamp_weights_from_fp8_experts`` after the FP8 backend
-            # has materialised its quantised tensors.
-            self._clamp_num_local_experts = num_local_experts
-            self.register_buffer(
-                "_clamp_gate_proj",
-                torch.empty(
-                    num_local_experts,
-                    self.moe_intermediate_size,
-                    self.hidden_size,
-                    dtype=text_config.torch_dtype,
-                ),
-                persistent=False,
-            )
-            self.register_buffer(
-                "_clamp_up_proj",
-                torch.empty(
-                    num_local_experts,
-                    self.moe_intermediate_size,
-                    self.hidden_size,
-                    dtype=text_config.torch_dtype,
-                ),
-                persistent=False,
-            )
-            self.register_buffer(
-                "_clamp_down_proj",
-                torch.empty(
-                    num_local_experts,
-                    self.hidden_size,
-                    self.moe_intermediate_size,
-                    dtype=text_config.torch_dtype,
-                ),
-                persistent=False,
-            )
-            self._clamp_local_expert_ids: Optional[torch.Tensor] = None
-            self._clamp_weights_loaded: bool = False
+            self._allocate_clamp_buffers(text_config.torch_dtype)
 
         self.allreduce = None
         if not self.enable_attention_dp and self.mapping.tp_size > 1:
@@ -928,48 +743,72 @@ class Step3p7MoE(nn.Module):
                 mapping=self.mapping, strategy=model_config.allreduce_strategy
             )
 
+    def _allocate_clamp_buffers(
+        self,
+        dtype: torch.dtype,
+        shapes: Optional[Tuple[tuple, tuple, tuple]] = None,
+        device: Optional[torch.device] = None,
+    ) -> None:
+        """Allocate non-persistent expert buffers for the Python clamp path."""
+        if shapes is None:
+            num_local = max(1, self.num_experts // max(1, self.mapping.moe_ep_size))
+            gw_shape = (num_local, self.moe_intermediate_size, self.hidden_size)
+            up_shape = (num_local, self.moe_intermediate_size, self.hidden_size)
+            dn_shape = (num_local, self.hidden_size, self.moe_intermediate_size)
+        else:
+            gw_shape, up_shape, dn_shape = shapes
+        for name, shape in zip(self._CLAMP_BUFFER_NAMES, (gw_shape, up_shape, dn_shape)):
+            self.register_buffer(
+                name, torch.empty(shape, dtype=dtype, device=device), persistent=False
+            )
+        self._clamp_num_local_experts = int(gw_shape[0])
+        self._clamp_weights_loaded = False
+
+    def _copy_clamp_weights(self, gate: torch.Tensor, up: torch.Tensor, down: torch.Tensor) -> None:
+        if self._clamp_gate_proj.shape != gate.shape:
+            self._allocate_clamp_buffers(
+                self._clamp_gate_proj.dtype,
+                shapes=(tuple(gate.shape), tuple(up.shape), tuple(down.shape)),
+                device=self._clamp_gate_proj.device,
+            )
+        dev, dt = self._clamp_gate_proj.device, self._clamp_gate_proj.dtype
+        self._clamp_gate_proj.copy_(gate.to(device=dev, dtype=dt))
+        self._clamp_up_proj.copy_(up.to(device=dev, dtype=dt))
+        self._clamp_down_proj.copy_(down.to(device=dev, dtype=dt))
+        self._clamp_weights_loaded = True
+
+    def _clamp_weight_device(self) -> torch.device:
+        dev = self._clamp_gate_proj.device
+        if dev.type == "meta":
+            return torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
+        return dev
+
+    def _local_expert_ids(self) -> list[int]:
+        ep_size = max(1, self.mapping.moe_ep_size)
+        num_local = max(1, self.num_experts // ep_size)
+        local_start = int(self.mapping.moe_ep_rank) * num_local
+        return list(range(local_start, local_start + num_local))
+
     def load_clamp_weights_from_fp8_experts(self) -> None:
-        """Populate ``_clamp_{gate,up,down}_proj`` by dequantising FP8 experts.
+        """Populate clamp buffers by dequantising the backend's expert weights.
 
-        Called once by the model loader after ``super().load_weights`` finishes
-        materialising the FP8 routed-expert weights in ``self.experts``.  For
-        every layer with a non-zero SwiGLU clamp limit, we dequantise the
-        rank-local subset of FP8 expert weights to bf16 and store them in the
-        pre-allocated ``_clamp_*_proj`` parameters.  The forward path for those
-        layers replaces the FP8 MoE op (which the production B200 backends
-        cannot pair with ``swiglu_limit``) with a Python expert loop that
-        applies ``gate.clamp(max=limit)`` and ``up.clamp(-limit,limit)``.
-
-        For the bf16 reference checkpoint, the TRTLLMGen-Bf16 backend's
-        ``post_load_weights`` reshuffles ``w3_w1_weight`` into a 4D
-        BlockMajorK layout that cannot be sliced/transposed back to 2D in
-        place.  In that case ``Step3p7ForCausalLM.load_weights`` calls
-        ``_capture_bf16_clamp_weights`` earlier (before the backend layout
-        transform runs) to populate the buffers directly from the HF
-        weights dict, sets ``_clamp_weights_loaded=True``, and we short-
-        circuit here.
+        Called once by the model loader after ``super().load_weights`` has
+        materialised the backend tensors. For the bf16 reference checkpoint
+        the TRTLLMGen-Bf16 backend reshuffles ``w3_w1_weight`` into a 4D
+        BlockMajorK layout that can't be sliced back; in that case
+        ``Step3p7ForCausalLM._capture_bf16_clamp_weights`` runs earlier (from
+        the raw HF tensors) and this method short-circuits.
         """
-        if not self._use_python_clamp:
+        if not self._use_python_clamp or self._clamp_weights_loaded:
             return
-        if self._clamp_weights_loaded:
-            return
-        # ``self.experts`` is a ``ConfigurableMoE`` wrapper around the actual
-        # backend (TRTLLMGenFusedMoE / CutlassFusedMoE).  The expert weight
-        # tensors live on the backend.
+        # ``self.experts`` is a ConfigurableMoE wrapper; weights live on the backend.
         e = getattr(self.experts, "backend", None) or self.experts
         if not hasattr(e, "w3_w1_weight") or not hasattr(e, "w2_weight"):
-            # The backend has not exposed the expert weight tensors yet.  Skip;
-            # the forward path will fall back to ``self.experts`` (which will
-            # at least produce output, even if without the clamp).
             return
         w3_w1 = e.w3_w1_weight.data
         w2 = e.w2_weight.data
         moe_inter = self.moe_intermediate_size
-        # Slice w3 (up) and w1 (gate) halves along the moe_interediate dim.
-        # ``w3_w1`` layout is ``[w3 (up), w1 (gate)]`` -- see
-        # ``DeepSeekFP8BlockScalesFusedMoEMethod.load_expert_all_*`` in
-        # ``fused_moe/quantization.py`` (the ``chunk(2, dim=0)`` yields
-        # ``(w3, w1)``).  Same layout is used by the bf16 backend.
+        # w3_w1 layout is [w3 (up), w1 (gate)] along dim 1, same for FP8 and bf16 backends.
         w3 = w3_w1[:, :moe_inter, :]
         w1 = w3_w1[:, moe_inter:, :]
         scale_w3_w1 = getattr(e, "w3_w1_weight_scaling_factor", None)
@@ -978,97 +817,45 @@ class Step3p7MoE(nn.Module):
             scale_w3_w1 is not None and scale_w2 is not None and w3_w1.dtype == torch.float8_e4m3fn
         )
         if is_fp8:
-            # FP8 block-scale path: dequantize per-block to bf16.
-            BLOCK = 128
-            Iblk = (moe_inter + BLOCK - 1) // BLOCK
-            w3_scale = scale_w3_w1.data[:, :Iblk, :]
-            w1_scale = scale_w3_w1.data[:, Iblk:, :]
-            up_bf16 = _fp8_block_dequant_3d(w3, w3_scale, BLOCK)
-            gate_bf16 = _fp8_block_dequant_3d(w1, w1_scale, BLOCK)
-            down_bf16 = _fp8_block_dequant_3d(w2, scale_w2.data, BLOCK)
+            intermediate_blocks = _ceil_div(moe_inter, _FP8_BLOCK_SIZE)
+            w3_scale = scale_w3_w1.data[:, :intermediate_blocks, :]
+            w1_scale = scale_w3_w1.data[:, intermediate_blocks:, :]
+            up_bf16 = _fp8_block_dequant_3d(w3, w3_scale)
+            gate_bf16 = _fp8_block_dequant_3d(w1, w1_scale)
+            down_bf16 = _fp8_block_dequant_3d(w2, scale_w2.data)
         else:
-            # Unquantized bf16/fp16 backend: weights are already in compute
-            # dtype, just slice and copy.  Used by the bf16 reference
-            # checkpoint (``step-3-7-flash-bf16``) where no FP8
-            # weight_scale_inv tensors exist.
             up_bf16 = w3.to(torch.bfloat16).contiguous()
             gate_bf16 = w1.to(torch.bfloat16).contiguous()
             down_bf16 = w2.to(torch.bfloat16).contiguous()
-        # Resize self._clamp_* buffers if the FP8 backend's actual local-
-        # expert count differs from what __init__ guessed (some EP modes
-        # round to a multiple of TP).  We trust the backend's tensor shapes.
-        if self._clamp_gate_proj.shape != gate_bf16.shape:
-            self.register_buffer("_clamp_gate_proj", torch.empty_like(gate_bf16), persistent=False)
-            self.register_buffer("_clamp_up_proj", torch.empty_like(up_bf16), persistent=False)
-            self.register_buffer("_clamp_down_proj", torch.empty_like(down_bf16), persistent=False)
-            self._clamp_num_local_experts = int(gate_bf16.shape[0])
-        self._clamp_gate_proj.copy_(gate_bf16)
-        self._clamp_up_proj.copy_(up_bf16)
-        self._clamp_down_proj.copy_(down_bf16)
-        self._clamp_weights_loaded = True
-        del up_bf16, gate_bf16, down_bf16
-        # Keep the FP8 backend tensors allocated for clamp layers.  Autotuning,
-        # CUDA-graph setup, and backend metadata can still depend on their
-        # shapes after weight loading.
+        self._copy_clamp_weights(gate_bf16, up_bf16, down_bf16)
 
     def _python_clamped_moe_forward(
         self, h: torch.Tensor, router_logits: torch.Tensor
     ) -> torch.Tensor:
         """Python expert path with explicit SwiGLU clamp.
 
-        Mirrors HF source ``Step3p7MoEMLP.get_expert_output``:
+        Mirrors HF source ``Step3p7MoEMLP.get_expert_output`` and produces a
+        per-rank partial sum (the decoder layer's all-reduce combines partials
+        across EP ranks).
 
-            gate = silu(gate_proj(x)).clamp(max=limit)
-            up   = up_proj(x).clamp(-limit, limit)
-            out  = down_proj(gate * up)
-
-        Uses rank-local bf16 expert weights and produces a per-rank partial
-        sum compatible with the FP8 backend's pre-allreduce semantics: the
-        decoder layer's all-reduce on ``hidden_states = routed + shared``
-        will combine partials across EP ranks.
-
-        **CUDA-graph capture friendly:** the per-expert loop has a fixed
-        Python iteration count (``num_local`` is constant per layer), and
-        every op inside the loop produces a fixed-shape tensor.  In
-        particular we avoid ``mask.any()`` / ``mask.nonzero()`` /
-        ``index_add_`` with variable token indices -- those trigger host
-        sync and are illegal during ``torch.cuda.graph`` capture.  Instead
-        we precompute a dense ``weight_per_expert`` matrix of shape
-        ``(N, num_experts)`` via ``scatter_add_`` (fixed shape), then for
-        every local expert compute its output for all N tokens and
-        multiply by the corresponding column (zero for tokens not routed
-        to that expert).  Wasted compute scales by
-        ``num_local / top_k = 36 / 8 = 4.5x`` over the masked version,
-        which is negligible at Step3p7 layer dimensions (~37 GFLOPs/layer/
-        rank/forward at N=68 prefill tokens).
+        CUDA-graph capture safe: the per-expert loop has a fixed Python count,
+        and routing is materialised as a dense ``(N, num_experts)`` matrix via
+        ``scatter_add_`` so each iteration multiplies by a fixed-shape column.
+        Wasted compute is ``num_local / top_k`` over the masked version,
+        negligible at Step3p7 layer dimensions.
         """
-        routing = self.experts.routing_method
-        topk_idx, topk_weights = routing.apply(router_logits)
-        # topk_idx: (N, top_k) int32 global expert IDs;
-        # topk_weights: (N, top_k) float32 already-scaled weights
-        N, _ = topk_idx.shape
-        ep_rank = self.mapping.moe_ep_rank
+        topk_idx, topk_weights = self.experts.routing_method.apply(router_logits)
+        N = topk_idx.shape[0]
         num_local = self._clamp_num_local_experts
-        local_start = ep_rank * num_local
+        local_start = self.mapping.moe_ep_rank * num_local
         limit = float(self._routed_swiglu_limit or 0.0)
 
-        # Build the dense (N, num_experts) routing matrix: entry [i, e] is
-        # the routing weight for token i if expert e is in the top-k of
-        # token i, else 0.  ``scatter_add_`` keeps the operation
-        # fixed-shape (independent of how many tokens route to expert e).
         weight_per_expert = torch.zeros((N, self.num_experts), dtype=torch.float32, device=h.device)
         weight_per_expert.scatter_add_(1, topk_idx.long(), topk_weights.to(torch.float32))
 
-        # HF source computes experts in fp32 (``MoELinear.forward`` casts
-        # both ``x`` and ``self.weight[expert_id]`` to float before
-        # ``F.linear``).  Cast once for all experts; reused across the
-        # num_local matmuls below.
+        # HF source computes experts in fp32 and casts each result back to
+        # bf16 before accumulation -- keep that rounding point.
         x_f32 = h.to(torch.float32)
-
-        # Source ``Step3p7MoEMLP`` accumulates into a tensor with the same
-        # dtype as ``hidden_states``: each fp32 expert result is cast back to
-        # bf16 before ``index_add_``.  Keep that rounding point here instead
-        # of accumulating all local experts in fp32 and casting only once.
         output = torch.zeros((N, self.hidden_size), dtype=h.dtype, device=h.device)
         for local_e in range(num_local):
             global_e = local_start + local_e
@@ -1081,9 +868,6 @@ class Step3p7MoE(nn.Module):
                 gate = gate.clamp(max=limit)
                 up = up.clamp(min=-limit, max=limit)
             expert_out = (gate * up) @ down_w.t()
-            # weight_per_expert[:, global_e] is zero for tokens not routed
-            # to this expert, so the multiply masks out their contribution
-            # without any dynamic-shape indexing.
             expert_out = expert_out * weight_per_expert[:, global_e : global_e + 1]
             output = output + expert_out.to(h.dtype)
         return output
@@ -1099,67 +883,48 @@ class Step3p7MoE(nn.Module):
         orig_shape = hidden_states.shape
         h = hidden_states.view(-1, self.hidden_size)
 
-        if self.need_fp32_gate:
-            router_logits = self.gate(h.to(torch.float32))
-        else:
-            router_logits = self.gate(h)
+        gate_input = h.to(torch.float32) if self.need_fp32_gate else h
+        router_logits = self.gate(gate_input)
 
-        # The Python SwiGLU-clamp forward is CUDA-graph capture safe: it
-        # uses only fixed-shape ops (``scatter_add_`` for the dense
-        # weight-per-expert matrix, a Python-level loop over the constant
-        # ``num_local`` count, and per-iteration matmul + clamp).  No
-        # ``.nonzero()`` / ``.any()`` / variable ``index_add_`` calls --
-        # all of which would trigger host sync during capture.
         if self._use_python_clamp and self._clamp_weights_loaded:
-            routed = self._python_clamped_moe_forward(h, router_logits)
-            # ``Step3p7MoeRoutingMethod.apply`` (used by the Python forward)
-            # already multiplies the per-expert weights by
-            # ``routed_scaling_factor``, so the outer scaling below must be
-            # skipped for this path (otherwise the scaling is doubled).
-            _routed_scaling_already_applied = True
-        else:
-            routed = self.experts(
-                h,
-                router_logits,
-                all_rank_num_tokens=attn_metadata.all_rank_num_tokens,
-                use_dp_padding=False,
-            )
-            _routed_scaling_already_applied = False
-        # The TRTLLMGen MiniMax2 routing path hard-codes ``routeScale = 1.0`` in
-        # ``runner.cu`` — see the routing impl comment in
-        # ``Step3p7MoeRoutingMethod``.  Apply the source ``routed_scaling_factor``
-        # to the MoE output here so the no-comm path matches semantics.  This is
-        # mathematically equivalent to scaling every topk_weight (sum of
-        # scaled_weight × expert_out == scale × sum of unscaled_weight × expert_out).
-        if self.routed_scaling_factor != 1.0 and not _routed_scaling_already_applied:
+            # Python path's routing.apply already scales topk_weights.
+            return self._python_clamped_moe_forward(h, router_logits).view(orig_shape)
+
+        routed = self.experts(
+            h,
+            router_logits,
+            all_rank_num_tokens=attn_metadata.all_rank_num_tokens,
+            use_dp_padding=False,
+        )
+        # TRTLLMGen MiniMax2 kernel hard-codes routeScale=1.0, so apply
+        # ``routed_scaling_factor`` to the MoE output here (mathematically
+        # equivalent to scaling each topk weight).
+        if self.routed_scaling_factor != 1.0:
             routed = routed * self.routed_scaling_factor
         return routed.view(orig_shape)
 
 
-def _model_config_without_quant(model_config: ModelConfig) -> ModelConfig:
-    """Return a shallow copy of ``model_config`` with ``quant_config=None``.
+def _copy_model_config_with_quant(model_config: ModelConfig, quant_config: object) -> ModelConfig:
+    """Shallow-copy ``model_config`` with a replacement ``quant_config``.
 
-    Used to keep the bf16 paths (attention, shared expert, dense MLP, router
-    gate) out of the FP8 quantization the routed experts use.
-
-    ``ModelConfig`` is a frozen dataclass except for ``quant_config`` /
-    ``pretrained_config`` / ``extra_attrs`` / ``_frozen`` (see
-    ``ModelConfig.__setattr__``).  We work around the freeze by temporarily
-    flipping ``_frozen`` on the clone to clear ``quant_config_dict`` too.
+    ``ModelConfig`` is frozen but ``quant_config`` is exempt; we also need to
+    clear ``quant_config_dict``, which requires bypassing the freeze.
     """
-    import copy as _copy
-
-    from tensorrt_llm.models.modeling_utils import QuantConfig
-
-    cloned = _copy.copy(model_config)
-    # quant_config is exempt from the freeze; force it to a no-op QuantConfig.
-    cloned.quant_config = QuantConfig()
+    cloned = copy.copy(model_config)
+    cloned.quant_config = quant_config
     object.__setattr__(cloned, "_frozen", False)
     try:
         cloned.quant_config_dict = None
     finally:
         object.__setattr__(cloned, "_frozen", True)
     return cloned
+
+
+def _model_config_without_quant(model_config: ModelConfig) -> ModelConfig:
+    """Shallow copy with a no-op quant config (for bf16 paths like attention)."""
+    from tensorrt_llm.models.modeling_utils import QuantConfig
+
+    return _copy_model_config_with_quant(model_config, QuantConfig())
 
 
 class Step3p7DecoderLayer(DecoderLayer):
@@ -1174,37 +939,29 @@ class Step3p7DecoderLayer(DecoderLayer):
         self.layer_idx = layer_idx
         self.hidden_size = text_config.hidden_size
 
-        # Attention, dense MLPs, and shared experts are NOT routed-expert FP8
-        # / NVFP4.  The attention block still wants ``kv_cache_quant_algo`` so
-        # FP8 KV cache (set by modelopt) flows through the attention backend.
+        # Attention/dense MLP/shared expert stay bf16 (only routed experts
+        # are FP8/NVFP4). Attention still needs ``kv_cache_quant_algo`` so
+        # FP8 KV cache (set by modelopt) reaches the attention backend.
         bf16_model_config = _model_config_without_quant(model_config)
         attn_model_config = _model_config_keep_kv_quant(model_config)
         self.self_attn = Step3p7Attention(attn_model_config, layer_idx)
 
         self.is_moe_layer = _is_moe_layer(text_config, layer_idx)
         if self.is_moe_layer:
-            # Routed experts may be FP8; router gate + bias holder live inside
-            # ``moe`` and the shared expert lives on the decoder layer (the
-            # HF source stores its weights at ``share_expert.*``, not
-            # ``moe.share_expert.*``).
             self.moe = Step3p7MoE(
                 model_config, layer_idx=layer_idx, aux_stream_dict=aux_stream_dict
             )
-            shared_intermediate_size = int(
-                getattr(text_config, "share_expert_dim", text_config.moe_intermediate_size)
-            )
-            shared_swiglu_limit = _layer_swiglu_limit(text_config, layer_idx, shared=True)
             self.share_expert = _ClampedGatedMLP(
                 bf16_model_config,
                 layer_idx=layer_idx,
-                intermediate_size=shared_intermediate_size,
-                swiglu_limit=shared_swiglu_limit,
+                intermediate_size=int(
+                    getattr(text_config, "share_expert_dim", text_config.moe_intermediate_size)
+                ),
+                swiglu_limit=_layer_swiglu_limit(text_config, layer_idx, shared=True),
                 is_shared_expert=True,
             )
             self.mlp = None
         else:
-            # Dense MLP layers (0..2) use the model's main ``intermediate_size``,
-            # not the per-expert ``moe_intermediate_size``.
             self.mlp = _ClampedGatedMLP(
                 bf16_model_config,
                 layer_idx=layer_idx,
@@ -1215,12 +972,8 @@ class Step3p7DecoderLayer(DecoderLayer):
             self.moe = None
             self.share_expert = None
 
-        # All Step3p7 RMSNorms use Gemma-style ``(weight + 1)`` scaling.
-        # The source ``Step3p7RMSNorm`` (in modeling_step3p7.py at the
-        # checkpoint root) defines exactly this formula, and the layer
-        # norms (input_layernorm, post_attention_layernorm, final norm) all
-        # use it -- not just the Q/K norms.  Regular RMSNorm multiplies by
-        # ``weight`` alone instead of ``(weight + 1)``.
+        # All Step3p7 RMSNorms (Q/K norms and every layer norm) use Gemma-style
+        # ``(weight + 1)`` scaling, not the standard ``weight`` form.
         self.input_layernorm = RMSNorm(
             hidden_size=text_config.hidden_size,
             eps=text_config.rms_norm_eps,
@@ -1234,7 +987,6 @@ class Step3p7DecoderLayer(DecoderLayer):
             use_gemma=True,
         )
 
-        # Optional final all-reduce when running TP without attention DP.
         self.allreduce = None
         if (
             self.is_moe_layer
@@ -1304,7 +1056,6 @@ class Step3p7TextModel(DecoderModel):
                 for idx in range(self.num_hidden_layers)
             ]
         )
-        # Final RMSNorm is also Gemma-style ``(weight + 1)``.
         self.norm = RMSNorm(
             hidden_size=int(text_config.hidden_size),
             eps=text_config.rms_norm_eps,
@@ -1518,10 +1269,9 @@ _STACKED_MOE_PROJ_TO_W = {
     "down_proj": "w2",
 }
 
-
-# Suffixes carried by stacked routed-expert tensors that need per-expert split.
-# Covers FP8 block-scale (``weight_scale_inv``) and NVFP4
-# (``weight_scale`` + ``weight_scale_2`` + ``input_scale``) checkpoints.
+# Per-expert suffixes that may accompany the stacked weights — covers FP8
+# block-scale (``weight_scale_inv``) and NVFP4 (``weight_scale``,
+# ``weight_scale_2``, ``input_scale``) checkpoints.
 _STACKED_MOE_WEIGHT_SUFFIXES = (
     "weight",
     "weight_scale_inv",
@@ -1534,38 +1284,20 @@ _STACKED_MOE_WEIGHT_SUFFIXES = (
 def split_stacked_moe_weights(weights, text_config: PretrainedConfig) -> int:
     """Expand stacked routed-expert tensors into per-expert keys, in place.
 
-    The HF source stores each routed-expert projection as a single stacked
-    tensor of shape ``(num_experts, ...)``:
-
-    - ``model.layers.<i>.moe.gate_proj.weight`` shape ``(N, moe_interediate, hidden[/2])``
-    - FP8 block scale checkpoints also carry
-      ``model.layers.<i>.moe.gate_proj.weight_scale_inv`` shape ``(N, I/128, H/128)``.
-    - NVFP4 checkpoints carry ``weight_scale`` (FP8 per-16 block scale),
-      ``weight_scale_2`` (FP32 per-tensor global scale, shape ``(N,)``), and
-      ``input_scale`` (FP32 per-tensor activation scale, shape ``(N,)``).
-
-    The TensorRT-LLM ``VANILLA`` MoE loader expects per-expert keys
-    ``experts.<e>.w{1,2,3}.<suffix>``.  This helper slices the stacked tensors
-    along dim 0 and writes one view per expert under the per-expert key, then
-    deletes the stacked keys so the generic loader's ``mark_consumed`` path
-    stays consistent.
-
-    Returns the number of MoE layers split (for diagnostics / tests).
+    HF source stores each projection as a single ``(num_experts, ...)`` tensor;
+    the VANILLA MoE loader expects per-expert keys
+    ``experts.<e>.w{1,2,3}.<suffix>``. Slices along dim 0 (zero-copy view) and
+    deletes the stacked keys. Returns the number of MoE layers split.
     """
     num_layers = int(text_config.num_hidden_layers)
     num_experts = int(text_config.moe_num_experts)
 
-    moe_layer_indices = [i for i in range(num_layers) if _is_moe_layer(text_config, i)]
-
     layers_split = 0
-    for layer_idx in moe_layer_indices:
+    for layer_idx in range(num_layers):
+        if not _is_moe_layer(text_config, layer_idx):
+            continue
         prefix = f"model.layers.{layer_idx}.moe."
-        # First pass: collect available stacked keys so we don't half-split.
-        proj_present = []
-        for proj in _STACKED_MOE_PROJ_TO_W:
-            stacked_w = f"{prefix}{proj}.weight"
-            if stacked_w in weights:
-                proj_present.append(proj)
+        proj_present = [p for p in _STACKED_MOE_PROJ_TO_W if f"{prefix}{p}.weight" in weights]
         if not proj_present:
             continue
         layers_split += 1
@@ -1577,17 +1309,13 @@ def split_stacked_moe_weights(weights, text_config: PretrainedConfig) -> int:
                 if stacked_key not in weights:
                     continue
                 stacked = weights[stacked_key]
-                # Tensor shape (N, ...); torch tensors support direct view
-                # indexing along dim 0 cheaply (no data copy).
                 if stacked.shape[0] != num_experts:
                     raise RuntimeError(
                         f"Step3p7 stacked MoE tensor {stacked_key} has "
-                        f"leading dim {stacked.shape[0]} but "
-                        f"num_experts={num_experts}."
+                        f"leading dim {stacked.shape[0]} but num_experts={num_experts}."
                     )
                 for expert_id in range(num_experts):
-                    new_key = f"{prefix}experts.{expert_id}.{dst_w}.{suffix}"
-                    weights[new_key] = stacked[expert_id]
+                    weights[f"{prefix}experts.{expert_id}.{dst_w}.{suffix}"] = stacked[expert_id]
                 del weights[stacked_key]
     return layers_split
 
@@ -1619,17 +1347,12 @@ _MTP_DIRECT_WEIGHT_PREFIXES = (
 )
 
 
-# Some Step3p7 checkpoints (multimodal / NIM-VNIM packaging, e.g. the NVFP4
-# release ``step-3.7-flash-nim_vnim-nvfp4-260528``) nest the text decoder
-# under ``model.language_model.*`` instead of ``model.*``, and the vision
-# tower / projector under ``model.vision_model.*`` and
-# ``model.vit_large_projector.*``.  The TRT-LLM module tree mirrors the
-# text-only Flash-FP8 layout (``model.layers.*``, ``model.norm`` etc.) so we
-# normalize keys in place once at load time.
+# Multimodal Step3p7 checkpoints (e.g. NVFP4 NIM/VNIM) nest the text decoder
+# under ``model.language_model.*`` instead of ``model.*``; flatten at load time.
 _LANGUAGE_MODEL_RENAMES = (
-    ("model.language_model.", "model."),  # text decoder weights
-    ("model.vision_model.", "vision_model."),  # ignored vision tower
-    ("model.vit_large_projector", "vit_large_projector"),  # ignored projector
+    ("model.language_model.", "model."),
+    ("model.vision_model.", "vision_model."),
+    ("model.vit_large_projector", "vit_large_projector"),
 )
 
 
@@ -1657,59 +1380,37 @@ def rewrite_language_model_keys(weights) -> int:
 
 
 def strip_language_model_prefix_from_exclude_modules(exclude_modules):
-    """Drop the ``language_model.`` segment from quant-config exclude patterns.
+    """Drop ``language_model.`` from quant-config exclude patterns.
 
-    ModelOpt's ``hf_quant_config.json`` for the multimodal Step3p7 NVFP4
-    checkpoint expresses ``exclude_modules`` using the on-disk
-    ``model.language_model.layers.<i>.*`` namespace.  TRT-LLM's
-    ``is_module_excluded_from_quantization`` matches against the runtime
-    module path (``model.layers.<i>.*``) so we drop the ``language_model.``
-    segment to keep the patterns aligned.
-
-    Returns a new list (or ``None`` if input was ``None``).
+    ModelOpt's ``hf_quant_config.json`` for the multimodal NVFP4 checkpoint
+    expresses ``exclude_modules`` against the on-disk namespace; TRT-LLM matches
+    against the runtime module path, so we strip the prefix. ``re:`` entries are
+    passed through untouched (they opt out of glob processing).
     """
     if exclude_modules is None:
         return None
-    rewritten = []
-    for entry in exclude_modules:
-        # ``re:`` prefixed entries opt out of glob processing; leave them alone.
-        if isinstance(entry, str) and not entry.startswith("re:"):
-            entry = entry.replace("model.language_model.", "model.")
-        rewritten.append(entry)
-    return rewritten
+    return [
+        e.replace("model.language_model.", "model.")
+        if isinstance(e, str) and not e.startswith("re:")
+        else e
+        for e in exclude_modules
+    ]
 
 
 def _model_config_keep_kv_quant(model_config: ModelConfig) -> ModelConfig:
-    """Like ``_model_config_without_quant`` but preserves ``kv_cache_quant_algo``.
-
-    Used by Step3p7's attention block so the production attention backend
-    still picks up FP8 (or future NVFP4) KV cache when the checkpoint quant
-    config sets ``kv_cache_quant_algo`` even though the QKV weights
-    themselves remain BF16.
-    """
-    import copy as _copy
-
+    """Strip weight quant but preserve ``kv_cache_quant_algo`` for attention."""
     from tensorrt_llm.models.modeling_utils import QuantConfig
 
-    cloned = _copy.copy(model_config)
-    src_kv = getattr(model_config.quant_config, "kv_cache_quant_algo", None)
-    cloned.quant_config = QuantConfig(kv_cache_quant_algo=src_kv)
-    object.__setattr__(cloned, "_frozen", False)
-    try:
-        cloned.quant_config_dict = None
-    finally:
-        object.__setattr__(cloned, "_frozen", True)
-    return cloned
+    src_kv = getattr(getattr(model_config, "quant_config", None), "kv_cache_quant_algo", None)
+    return _copy_model_config_with_quant(model_config, QuantConfig(kv_cache_quant_algo=src_kv))
 
 
 def rewrite_mtp_weights_for_step3p7(weights, text_config: PretrainedConfig) -> int:
     """Rewrite Step3p7 MTP checkpoint keys to the TRT-LLM module layout.
 
-    Source keys store the transformer block directly under
-    ``model.layers.<idx>`` and the draft head under
-    ``transformer.shared_head``.  TRT-LLM follows the Step3p5-MTP structure
-    used by vLLM: non-projection block weights live under ``mtp_block`` and
-    the head lives under ``shared_head``.
+    Source stores the transformer block directly under ``model.layers.<idx>``
+    and the head under ``transformer.shared_head``; TRT-LLM uses ``mtp_block``
+    and ``shared_head`` (matching the Step3p5-MTP layout used by vLLM).
     """
     if weights is None or not hasattr(weights, "keys"):
         return 0
@@ -1746,16 +1447,9 @@ def rewrite_mtp_weights_for_step3p7(weights, text_config: PretrainedConfig) -> i
 class Step3p7ForCausalLM(SpecDecOneEngineForCausalLM[Step3p7TextModel, PretrainedConfig]):
     """Top-level Step3p7 text-generation entry point.
 
-    GSM8K is text-only.  The vision tower carried in the checkpoint is
-    intentionally ignored.  MTP layers (45..47) are ignored by the plain text
-    path and loaded when ``MTPDecodingConfig`` enables one-engine MTP.
+    The vision tower carried in the checkpoint is ignored. MTP layers are
+    loaded only when ``MTPDecodingConfig`` enables one-engine MTP.
     """
-
-    # Step3p7Attention overrides the base ``Attention.forward`` to plumb the
-    # source's per-head output gate between the attention backend and
-    # ``o_proj``.  Helix CP, LoRA, and attention sinks from the base class are
-    # intentionally not exercised by this bring-up; they can be re-enabled by
-    # upstreaming a per-head gate hook into ``Attention.forward``.
 
     def forward(
         self,
@@ -1820,38 +1514,32 @@ class Step3p7ForCausalLM(SpecDecOneEngineForCausalLM[Step3p7TextModel, Pretraine
         )
 
     def __init__(self, model_config: ModelConfig):
-        # Promote text-config aliases the rest of TRT-LLM expects.
         _mirror_step3p7_text_aliases(model_config.pretrained_config)
-        # The multimodal NVFP4 checkpoint expresses ``exclude_modules`` against
-        # the on-disk ``model.language_model.*`` namespace; normalize to the
-        # TRT-LLM runtime namespace so module-name matching works correctly.
+
         qc = getattr(model_config, "quant_config", None)
         if qc is not None and qc.exclude_modules is not None:
             qc.exclude_modules = strip_language_model_prefix_from_exclude_modules(
                 qc.exclude_modules
             )
-        # ``model_loader.py`` reads ``pretrained_config.torch_dtype`` *before*
-        # the model is constructed and stashes the value in
-        # ``extra_attrs['allreduce_dtype']`` so the NCCL window prealloc path
-        # can size buffers.  HF 5.x keeps ``torch_dtype`` as a string when the
-        # config is loaded via ``trust_remote_code``, so when we run our own
-        # normalisation here we must also refresh the extra_attrs entry that
-        # was captured under the unnormalised string.
+
+        # ``model_loader.py`` snapshots ``pretrained_config.torch_dtype`` into
+        # ``extra_attrs['allreduce_dtype']`` before construction; when HF 5.x
+        # keeps it as a string (trust_remote_code path), refresh the snapshot
+        # so the NCCL window prealloc path sees a real ``torch.dtype``.
         if hasattr(model_config, "extra_attrs") and isinstance(model_config.extra_attrs, dict):
             cur = model_config.extra_attrs.get("allreduce_dtype")
             if isinstance(cur, str):
-                try:
-                    mapped = getattr(torch, cur)
-                    if isinstance(mapped, torch.dtype):
-                        model_config.extra_attrs["allreduce_dtype"] = mapped
-                except AttributeError:
-                    model_config.extra_attrs["allreduce_dtype"] = torch.bfloat16
+                mapped = getattr(torch, cur, None)
+                model_config.extra_attrs["allreduce_dtype"] = (
+                    mapped if isinstance(mapped, torch.dtype) else torch.bfloat16
+                )
+
         _prepare_step3p7_mtp_spec_config(model_config)
         text_config = _get_text_config(model_config)
-        # Stash text_config so loaders/tests can reach it through the model.
         super().__init__(Step3p7TextModel(model_config), model_config)
         self.text_config = text_config
         self.num_hidden_layers = int(text_config.num_hidden_layers)
+
         active_mtp_layers = 0
         if (
             model_config.spec_config is not None
@@ -1862,72 +1550,40 @@ class Step3p7ForCausalLM(SpecDecOneEngineForCausalLM[Step3p7TextModel, Pretraine
             self.epilogue.append(self.spec_worker)
             active_mtp_layers = len(self.draft_model.mtp_layers)
 
-        # Recognized ignored key prefixes (for the weight accounting test).
+        num_mtp = int(getattr(text_config, "num_nextn_predict_layers", 0))
         mtp_prefixes = tuple(
             f"model.layers.{idx}."
-            for idx in range(
-                int(text_config.num_hidden_layers),
-                int(text_config.num_hidden_layers)
-                + int(getattr(text_config, "num_nextn_predict_layers", 0)),
-            )
+            for idx in range(self.num_hidden_layers, self.num_hidden_layers + num_mtp)
         )
-        if active_mtp_layers > 0:
-            inactive_mtp_prefixes = mtp_prefixes[active_mtp_layers:]
-            self.ignored_key_prefixes = (
-                "vision_model.",
-                "vit_large_projector.",
-                *inactive_mtp_prefixes,
-            )
-        else:
-            self.ignored_key_prefixes = ("vision_model.", "vit_large_projector.", *mtp_prefixes)
-
-    # ------------------------------------------------------------------
-    # Weight loading helpers
-    # ------------------------------------------------------------------
+        self.ignored_key_prefixes = (
+            "vision_model.",
+            "vit_large_projector.",
+            *mtp_prefixes[active_mtp_layers:],
+        )
 
     def get_ignored_key_prefixes(self) -> Tuple[str, ...]:
         return self.ignored_key_prefixes
 
     def _capture_bf16_clamp_weights(self, weights) -> List[int]:
-        """Pre-load 2D bf16 expert weights for Python-clamp layers.
+        """Pre-load 2D expert weights for Python-clamp layers, before backend layout transforms.
 
-        Walks each MoE layer that uses the Python clamp expert path
-        (``_use_python_clamp=True``), probes the dtype of one expert
-        weight in ``weights``, and if it is **not** FP8 then captures the
-        local-EP-rank subset of original 2D bf16 expert weights from the
-        HF weights dict and copies them into the pre-allocated
-        ``_clamp_{gate,up,down}_proj`` buffers.  Sets
-        ``_clamp_weights_loaded=True`` so ``load_clamp_weights_from_fp8_experts``
-        is a no-op.
+        The bf16 reference checkpoint's TRTLLMGen-Bf16 backend reshuffles
+        ``w3_w1_weight`` into a 4D BlockMajorK layout during
+        ``post_load_weights``; the NVFP4 backend likewise transforms its
+        weights. The Python clamp path needs the original 2D ``(I, H)``
+        per-expert tensors, so we capture them here before
+        ``super().load_weights`` runs. FP8 layers are skipped because the FP8
+        backend keeps a 3D layout that ``load_clamp_weights_from_fp8_experts``
+        can dequantize directly post-load.
 
-        Why this path exists: the bf16 reference checkpoint uses
-        ``BF16TRTLLMGenFusedMoEMethod``, whose ``post_load_weights`` (run
-        inside ``super().load_weights``) reshuffles ``w3_w1_weight`` into
-        a 4D BlockMajorK layout for the TRTLLM-Gen-Bf16 cubins.  The
-        Python clamp path needs 2D ``(I, H)`` per expert -- attempting to
-        ``[expert_idx]`` and ``.t()`` the 4D tensor crashes with
-        "t() expects a tensor with <= 2 dimensions, but self is 3D".  By
-        capturing **before** ``super().load_weights`` is called, we see
-        the original 2D HF tensors (after ``split_stacked_moe_weights``
-        but before any backend layout transform).
-
-        FP8 checkpoint: the FP8 backend keeps a 3D
-        ``(num_local_experts, 2*I, H)`` layout that
-        ``load_clamp_weights_from_fp8_experts`` can dequantize directly,
-        so this method skips FP8 layers and the post-load dequant runs as
-        usual.
-
-        Returns the list of layer indices for which bf16 weights were
-        captured (for diagnostic logging).
+        Returns the list of layer indices captured (for diagnostic logging).
         """
         if weights is None or not hasattr(weights, "__getitem__"):
             return []
         captured: List[int] = []
         for layer in self.model.layers:
             moe = getattr(layer, "moe", None)
-            if moe is None:
-                continue
-            if not getattr(moe, "_use_python_clamp", False):
+            if moe is None or not getattr(moe, "_use_python_clamp", False):
                 continue
             if getattr(moe, "_clamp_weights_loaded", False):
                 continue
@@ -1935,79 +1591,25 @@ class Step3p7ForCausalLM(SpecDecOneEngineForCausalLM[Step3p7TextModel, Pretraine
             if probe_key not in weights:
                 continue
             probe = weights[probe_key]
-            # FP8 block-scale routed experts (dtype ``float8_e4m3fn``) are
-            # handled post-load by ``load_clamp_weights_from_fp8_experts``
-            # because the FP8 backend keeps a 3D layout we can slice.  The
-            # BF16 reference and the NVFP4 (modelopt) checkpoint both need
-            # the pre-load capture: NVFP4 weights are ``uint8`` (each byte
-            # = 2 fp4 nibbles) and the NVFP4 backend's post-load layout
-            # transform (block-scale interleave, padding) can't be reversed
-            # for the Python clamp loop.
             if probe.dtype == torch.float8_e4m3fn:
                 continue
             try:
-                ep_size = max(1, moe.mapping.moe_ep_size)
-                ep_rank = int(moe.mapping.moe_ep_rank)
-                num_local = max(1, moe.num_experts // ep_size)
-                local_start = ep_rank * num_local
-                local_ids = list(range(local_start, local_start + num_local))
+                local_ids = moe._local_expert_ids()
                 base = f"model.layers.{moe.layer_idx}.moe.experts"
                 if probe.dtype == torch.uint8:
-                    # NVFP4: dequant the rank-local subset on the same device
-                    # the clamp buffers live on (GPU when running on a node;
-                    # ``meta`` during dry-init).  Per-element ``lut[idx]``
-                    # gather is orders of magnitude faster on B200 than on
-                    # CPU, so we always batch the per-expert ops into one
-                    # tensor before moving to device.
-                    target_dev = moe._clamp_gate_proj.device
-                    if target_dev.type == "meta":
-                        target_dev = (
-                            torch.device("cuda")
-                            if torch.cuda.is_available()
-                            else torch.device("cpu")
-                        )
-                    gate_stack = _nvfp4_stack_dequant(
-                        weights, base, "w1", local_ids, target_device=target_dev
-                    )
-                    up_stack = _nvfp4_stack_dequant(
-                        weights, base, "w3", local_ids, target_device=target_dev
-                    )
-                    down_stack = _nvfp4_stack_dequant(
-                        weights, base, "w2", local_ids, target_device=target_dev
-                    )
+                    # NVFP4: batch the per-element ``lut[idx]`` gather on GPU
+                    # (orders of magnitude faster than CPU).
+                    target_dev = moe._clamp_weight_device()
+                    gate_stack = _nvfp4_stack_dequant(weights, base, "w1", local_ids, target_dev)
+                    up_stack = _nvfp4_stack_dequant(weights, base, "w3", local_ids, target_dev)
+                    down_stack = _nvfp4_stack_dequant(weights, base, "w2", local_ids, target_dev)
                 else:
                     gate_stack = torch.stack([weights[f"{base}.{e}.w1.weight"] for e in local_ids])
                     up_stack = torch.stack([weights[f"{base}.{e}.w3.weight"] for e in local_ids])
                     down_stack = torch.stack([weights[f"{base}.{e}.w2.weight"] for e in local_ids])
             except KeyError:
                 continue
-            target_dev = moe._clamp_gate_proj.device
-            target_dtype = moe._clamp_gate_proj.dtype
-            # Re-register buffers if the on-disk per-expert shape disagrees
-            # with the __init__ guess (e.g. unusual EP rounding).  This
-            # mirrors the resize logic in ``load_clamp_weights_from_fp8_experts``.
-            target_shape = gate_stack.shape
-            if moe._clamp_gate_proj.shape != target_shape:
-                moe.register_buffer(
-                    "_clamp_gate_proj",
-                    torch.empty(target_shape, dtype=target_dtype, device=target_dev),
-                    persistent=False,
-                )
-                moe.register_buffer(
-                    "_clamp_up_proj",
-                    torch.empty(up_stack.shape, dtype=target_dtype, device=target_dev),
-                    persistent=False,
-                )
-                moe.register_buffer(
-                    "_clamp_down_proj",
-                    torch.empty(down_stack.shape, dtype=target_dtype, device=target_dev),
-                    persistent=False,
-                )
-                moe._clamp_num_local_experts = int(target_shape[0])
-            moe._clamp_gate_proj.copy_(gate_stack.to(device=target_dev, dtype=target_dtype))
-            moe._clamp_up_proj.copy_(up_stack.to(device=target_dev, dtype=target_dtype))
-            moe._clamp_down_proj.copy_(down_stack.to(device=target_dev, dtype=target_dtype))
-            moe._clamp_weights_loaded = True
+            moe._copy_clamp_weights(gate_stack, up_stack, down_stack)
             captured.append(moe.layer_idx)
         return captured
 
@@ -2021,52 +1623,24 @@ class Step3p7ForCausalLM(SpecDecOneEngineForCausalLM[Step3p7TextModel, Pretraine
     ):
         """Step3p7 weight loader.
 
-        Performs two transformations before delegating to the generic loader:
-
-        1. **Drop ignored prefixes.** The on-disk checkpoint includes vision
-           tower weights, and the plain text path also ignores MTP layer
-           weights (layers 45..47).  We remove inactive keys so
-           ``mark_consumed`` accounting stays focused on the active path.
-        2. **Rewrite active MTP weights.** Step3p7 stores the draft block
-           directly under ``model.layers.<idx>`` and the draft head under
-           ``transformer.shared_head``; TRT-LLM modules use ``mtp_block`` and
-           ``shared_head``.
-        3. **Split stacked routed-expert tensors.** Source stores
-           ``...moe.{gate,up,down}_proj.{weight,weight_scale_inv}`` as a
-           single tensor with leading dim ``num_experts``.  The generic
-           ``VANILLA`` MoE backend expects per-expert keys
-           ``...moe.experts.<e>.w{1,3,2}.{weight,weight_scale_inv}``.  We
-           materialize per-expert views before delegating so the FP8
-           block-scale kernel sees both the weights and their scales.
+        Pre-processing before delegating to the generic loader:
+        1. Flatten multimodal ``model.language_model.*`` keys to ``model.*``.
+        2. Drop ignored prefixes (vision tower, inactive MTP) and FP8 KV scales.
+        3. Rewrite active MTP keys to the TRT-LLM ``mtp_block`` / ``shared_head`` layout.
+        4. Split stacked routed-expert tensors into per-expert keys.
+        5. Capture 2D bf16/NVFP4 expert weights for Python-clamp layers.
         """
         from tensorrt_llm.logger import logger as _logger
 
         skip_modules = list(skip_modules) if skip_modules else []
-
-        # Flatten any multimodal ``model.language_model.*`` namespace before
-        # the ignored-prefix sweep so the existing ignore list (``vision_model.``,
-        # ``vit_large_projector.``) keeps matching.
         rewrite_language_model_keys(weights)
 
         if hasattr(weights, "keys"):
-            keys_snapshot = list(weights.keys())
-            for k in keys_snapshot:
-                if any(k.startswith(p) for p in self.ignored_key_prefixes):
-                    try:
-                        del weights[k]
-                    except KeyError:
-                        pass
-                    continue
-                # FP8 KV cache calibration scales (``...k_proj.k_scale`` /
-                # ``...v_proj.v_scale``) live on the QKV linears in the
-                # checkpoint but our attention runs as BF16 (its kv_scales
-                # parameter is only allocated for NVFP4 KV cache today), so
-                # nothing in the loader consumes them.  Drop them up front so
-                # the generic loader's ``mark_consumed`` accounting stays
-                # clean.  KV cache stays FP8 with the default 1.0 scale; a
-                # future change can plumb these into the trtllm attention
-                # backend's ``kv_cache_scaling_factor``.
-                if k.endswith(".k_scale") or k.endswith(".v_scale"):
+            for k in list(weights.keys()):
+                drop = any(k.startswith(p) for p in self.ignored_key_prefixes) or k.endswith(
+                    _KV_SCALE_SUFFIXES
+                )
+                if drop:
                     try:
                         del weights[k]
                     except KeyError:
@@ -2074,14 +1648,6 @@ class Step3p7ForCausalLM(SpecDecOneEngineForCausalLM[Step3p7TextModel, Pretraine
 
         rewrite_mtp_weights_for_step3p7(weights, self.text_config)
         split_stacked_moe_weights(weights, self.text_config)
-
-        # Capture original 2D bf16 expert weights for Python-clamp layers
-        # before the backend transforms them into a layout that the Python
-        # expert path cannot read directly (see TRTLLMGen-Bf16 BlockMajorK
-        # 4D layout in `BF16TRTLLMGenFusedMoEMethod.process_weights_after_loading`).
-        # No-op for the FP8 checkpoint -- the FP8 backend keeps a 3D layout
-        # that the post-load `load_clamp_weights_from_fp8_experts` path can
-        # dequantize directly.
         self._capture_bf16_clamp_weights(weights)
 
         rc = DecoderModelForCausalLM.load_weights(
@@ -2092,55 +1658,35 @@ class Step3p7ForCausalLM(SpecDecOneEngineForCausalLM[Step3p7TextModel, Pretraine
             params_map=params_map,
             allow_partial_loading=allow_partial_loading,
         )
-        # Populate bf16 expert weights for the Python expert path:
-        #  * Layers with ``swiglu_limits`` set (e.g. 43/44) where the source
-        #    clamp must be expressed and no FP8-block-scale backend on B200
-        #    supports ``swiglu_limit``.
-        #  * Layers ``layer_idx >= STEP3P7_PYTHON_FALLBACK_THRESHOLD`` when the
-        #    optional fallback knob is enabled.
-        # Must run AFTER the FP8 backend has materialised its w3_w1/w2 tensors.
+        # Must run after the backend materialises w3_w1/w2.
         for layer in self.model.layers:
             moe = getattr(layer, "moe", None)
-            if moe is None:
+            if moe is None or not getattr(moe, "_use_python_clamp", False):
                 continue
-            if not getattr(moe, "_use_python_clamp", False):
-                continue
-            reason = getattr(moe, "_python_path_reason", "")
             try:
                 moe.load_clamp_weights_from_fp8_experts()
-            except Exception as e:
+            except (AttributeError, KeyError, RuntimeError, ValueError) as e:
                 _logger.warning(
-                    "[Step3p7] failed to populate bf16 expert weights "
-                    "for layer %d (%s): %s.  Forward will fall back to "
-                    "the FP8 backend without the Python path.",
+                    "[Step3p7] failed to populate bf16 expert weights for layer %d (%s): %s. "
+                    "Forward will fall back to the FP8 backend without the Python path.",
                     moe.layer_idx,
-                    reason,
+                    getattr(moe, "_python_path_reason", ""),
                     str(e)[:256],
                 )
         return rc
 
 
 def scan_fp8_scale_inv_tensors(checkpoint_dir: str):
-    """Enumerate FP8 ``weight_scale_inv`` tensors missing from the safetensors index.
+    """Enumerate FP8 scale tensors present in safetensors shards but missing from the index.
 
     The Step3p7 Flash FP8 checkpoint stores routed-expert ``weight_scale_inv``
-    tensors **inside** the safetensors shards but does **not** list them in
-    ``model.safetensors.index.json``.  The standard HF weight loader iterates
-    only over the index, so the FP8 scales never reach the model and the
-    TRTLLMGen block-scale batched-GEMM aborts at warm-up with
-    ``CUDA_ERROR_INVALID_HANDLE``.
+    tensors inside the shards without listing them in
+    ``model.safetensors.index.json``; the standard HF loader only iterates the
+    index, so the scales never reach the model and the TRTLLMGen block-scale
+    batched-GEMM aborts with ``CUDA_ERROR_INVALID_HANDLE`` at warm-up.
 
-    This helper scans every ``model-*.safetensors`` shard and returns a
-    mapping ``{key: (filename, dtype, shape)}`` for every scale_inv key it
-    finds that is **not** already in the index.  The next iteration's weight
-    loader can then materialize those tensors and inject them into the
-    weights stream alongside the index-listed weights.
-
-    Returns
-    -------
-    dict[str, dict]
-        ``{full_key: {"shard": str, "dtype": str, "shape": tuple}}`` for each
-        scale tensor missing from the index.
+    Returns ``{full_key: {"shard": str, "dtype": str, "shape": tuple}}`` so the
+    caller can inject the missing tensors into the weights stream.
     """
     import glob
     import json as _json
