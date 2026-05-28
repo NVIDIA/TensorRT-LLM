@@ -1,0 +1,36 @@
+# Example Slurm brief for the modeling-bringup workflow. Copy this file to
+# `task.yaml`, fill in your paths, criteria, tips, and Slurm environment, then
+# run:
+#
+#     modeling-bringup \
+#         --task path/to/your/task.yaml \
+#         --workspace workspace/<model-name>-bringup
+#
+# Required: the three source paths below. The workflow refuses to start
+# if any of them is missing or does not point at an existing path.
+# For Slurm runs, `trtllm_repo_path` is the host/login-node path to the
+# TensorRT-LLM checkout. Slurm jobs should bind-mount it into the container
+# at the same absolute path, then `cd` to that path inside the container.
+
+reference_code_path: /path/to/transformers/src/transformers/models/<model_name>/modeling_<model_name>.py
+checkpoint_path:     /path/to/checkpoints/<ModelName>-<Variant>
+trtllm_repo_path:    /path/to/TensorRT-LLM
+
+# Required for Slurm runs. The presence of this section enables the
+# Slurm/container prompt block and the Slurm-only `test_command.md` cache.
+slurm-environment:
+  slurm_partition: <partition>
+  docker_image: /path/to/trtllm-pytorch-<version>.sqsh
+
+# Optional: pass/fail bars QA verifies at runtime. Outcome-bound items only
+# -- no implementation prescriptions (those belong in implements_tips or
+# plan.md).
+completion_criteria:
+  - "GSM8K score measured via `trtllm-eval` is greater than 95"
+
+# Optional: free-form guidance for the PlanDrafter and Coder. Not a QA
+# gate -- use this for hints about which kernels to prefer, which
+# subsystems to favor, etc.
+implements_tips:
+  - "Use KVCacheManagerV2"
+  - "Support common features, such as CUDA graph and scheduler overlap"

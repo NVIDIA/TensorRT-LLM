@@ -1,0 +1,53 @@
+[project]
+name = "agent-flow"
+version = "0.1.0"
+description = "Torch-like framework for composing Claude and Codex agent layers"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "anyio>=4.0",
+    "pyyaml>=6.0",
+    "rich>=13.0",
+    "claude-agent-sdk==0.2.82",
+    "openai-codex-app-server-sdk @ git+https://github.com/openai/codex.git@58573da43ab697e8b79f152c53df4b42230395a8#subdirectory=sdk/python",
+]
+
+[project.optional-dependencies]
+test = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+]
+
+[project.scripts]
+agent-team = "agent_flow.workflows.agent_team.cli:main"
+modeling-bringup = "agent_flow.workflows.modeling_bringup.cli:main"
+
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["agent_flow*"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+addopts = "-p no:rerunfailures"
+
+####################################################################################################
+###############################  LINTING, FORMATTING AND TESTING CONFIGURATION  ####################
+####################################################################################################
+[tool.isort]
+line_length = 80
+
+[tool.yapf]
+based_on_style = "pep8"
+column_limit = 80
+
+[tool.codespell]
+skip = ".git,*.svg"
+ignore-words-list = "te"
+
+[tool.autoflake]
+in-place = true
+remove_all_unused_imports = true
+remove_unused_variables = true
