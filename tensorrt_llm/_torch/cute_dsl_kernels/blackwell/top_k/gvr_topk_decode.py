@@ -20,7 +20,7 @@ TODO: could see if smem_ptcnt part and fmin/fmax vectorization could be improved
 """
 
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import Optional
 
 import cutlass
 import cutlass.cute as cute
@@ -886,17 +886,17 @@ class GvrTopKKernel:
 
         # ---- Stream-write loop ----
         thr_final = s_thr[0]
-        vec_w_p3 = cutlass.const_expr(self.vec_bits // self.dtype.width)
-        elem_bytes_p3 = cutlass.const_expr(self.dtype.width // 8)
-        vec_align_p3 = cutlass.const_expr(self.vec_align_bytes)
-        copy_atom_p3 = self._make_load_copy_atom()
-        row_addr_p3 = input_row.iterator.toint()
-        step_elem_p3 = cutlass.const_expr(num_threads * vec_w_p3)
+        vec_w = cutlass.const_expr(self.vec_bits // self.dtype.width)
+        elem_bytes = cutlass.const_expr(self.dtype.width // 8)
+        vec_align = cutlass.const_expr(self.vec_align_bytes)
+        copy_atom = self._make_load_copy_atom()
+        row_addr = input_row.iterator.toint()
+        step_elem = cutlass.const_expr(num_threads * vec_w)
 
-        n_aligned = (N // cutlass.Int32(vec_w_p3)) * cutlass.Int32(vec_w_p3)
+        n_aligned = (N // cutlass.Int32(vec_w)) * cutlass.Int32(vec_w)
         wc = my_write_pos
-        ic2 = tidx * cutlass.Int32(vec_w_p3)
-        step = cutlass.Int32(step_elem_p3)
+        ic = tidx * cutlass.Int32(vec_w)
+        step = cutlass.Int32(step_elem)
 
         # Phase3 unrolling: master gated by self.enable_phase3_unroll.
         # When OFF, only the tail 1-way loop runs (matches the pre-unroll
@@ -907,70 +907,70 @@ class GvrTopKKernel:
             if self.enable_unroll_4:
                 # =============================================================
                 # unroll: cutlass.range(unroll=4).
-                # Each body loads 1 vec_w_p3 chunk; LLVM unrolls 4 iters at IR
+                # Each body loads 1 vec_w chunk; LLVM unrolls 4 iters at IR
                 # level. Same intent as the Phase-2 rewrite above.
                 # =============================================================
-                rng_frag_p3 = cute.make_fragment((vec_w_p3,), self.dtype)
-                big_iters_p3 = cutlass.Int32(0)
-                if N > ic2 + cutlass.Int32(vec_w_p3 - 1):
-                    big_iters_p3 = (N - ic2 - cutlass.Int32(vec_w_p3)) // cutlass.Int32(
-                        step_elem_p3
+                rng_frag = cute.make_fragment((vec_w,), self.dtype)
+                big_iters = cutlass.Int32(0)
+                if N > ic + cutlass.Int32(vec_w - 1):
+                    big_iters = (N - ic - cutlass.Int32(vec_w)) // cutlass.Int32(
+                        step_elem
                     ) + cutlass.Int32(1)
 
-                for k in cutlass.range(big_iters_p3, unroll=4):
-                    ic2_local = ic2 + k * cutlass.Int32(step_elem_p3)
+                for k in cutlass.range(big_iters, unroll=4):
+                    ic_local = ic + k * cutlass.Int32(step_elem)
                     src_ptr_k = cute.make_ptr(
                         self.dtype,
-                        row_addr_p3 + cutlass.Int64(ic2_local) * cutlass.Int64(elem_bytes_p3),
+                        row_addr + cutlass.Int64(ic_local) * cutlass.Int64(elem_bytes),
                         cute.AddressSpace.gmem,
-                        assumed_align=vec_align_p3,
+                        assumed_align=vec_align,
                     )
-                    src_k = cute.make_tensor(src_ptr_k, cute.make_layout((vec_w_p3,)))
-                    cute.copy(copy_atom_p3, src_k, rng_frag_p3)
-                    for j in cutlass.range_constexpr(vec_w_p3):
+                    src_k = cute.make_tensor(src_ptr_k, cute.make_layout((vec_w,)))
+                    cute.copy(copy_atom, src_k, rng_frag)
+                    for j in cutlass.range_constexpr(vec_w):
                         if cutlass.const_expr(self.dtype == cutlass.Float32):
-                            vj_p3 = rng_frag_p3[j]
+                            vj = rng_frag[j]
                         else:
-                            vj_p3 = cutlass.Float32(rng_frag_p3[j])
-                        if vj_p3 >= thr_final and wc < cutlass.Int32(kCC):
-                            smem_keys[wc] = vj_p3
-                            smem_vals[wc] = ic2_local + cutlass.Int32(j)
+                            vj = cutlass.Float32(rng_frag[j])
+                        if vj >= thr_final and wc < cutlass.Int32(kCC):
+                            smem_keys[wc] = vj
+                            smem_vals[wc] = ic_local + cutlass.Int32(j)
                             wc = wc + cutlass.Int32(1)
-                # Advance ic2 past all consumed vec_w-aligned positions.
-                ic2 = ic2 + big_iters_p3 * cutlass.Int32(step_elem_p3)
+                # Advance ic past all consumed vec_w-aligned positions.
+                ic = ic + big_iters * cutlass.Int32(step_elem)
 
-        # Tail vec loop: 1-way, handles remainder < 2*step. ic2 stays vec_w-
-        # aligned across the unroll loop (steps by num_threads*vec_w_p3).
-        tail_frag_p3 = cute.make_fragment((vec_w_p3,), self.dtype)
-        while ic2 + cutlass.Int32(vec_w_p3 - 1) < N:
-            src_ptr_p3 = cute.make_ptr(
+        # Tail vec loop: 1-way, handles remainder < 2*step. ic stays vec_w-
+        # aligned across the unroll loop (steps by num_threads*vec_w).
+        tail_frag = cute.make_fragment((vec_w,), self.dtype)
+        while ic + cutlass.Int32(vec_w - 1) < N:
+            src_ptr = cute.make_ptr(
                 self.dtype,
-                row_addr_p3 + cutlass.Int64(ic2) * cutlass.Int64(elem_bytes_p3),
+                row_addr + cutlass.Int64(ic) * cutlass.Int64(elem_bytes),
                 cute.AddressSpace.gmem,
-                assumed_align=vec_align_p3,
+                assumed_align=vec_align,
             )
-            src_p3 = cute.make_tensor(src_ptr_p3, cute.make_layout((vec_w_p3,)))
-            cute.copy(copy_atom_p3, src_p3, tail_frag_p3)
-            for j in cutlass.range_constexpr(vec_w_p3):
+            src = cute.make_tensor(src_ptr, cute.make_layout((vec_w,)))
+            cute.copy(copy_atom, src, tail_frag)
+            for j in cutlass.range_constexpr(vec_w):
                 if cutlass.const_expr(self.dtype == cutlass.Float32):
-                    vj_p3 = tail_frag_p3[j]
+                    vj = tail_frag[j]
                 else:
-                    vj_p3 = cutlass.Float32(tail_frag_p3[j])
-                if vj_p3 >= thr_final and wc < cutlass.Int32(kCC):
-                    smem_keys[wc] = vj_p3
-                    smem_vals[wc] = ic2 + cutlass.Int32(j)
+                    vj = cutlass.Float32(tail_frag[j])
+                if vj >= thr_final and wc < cutlass.Int32(kCC):
+                    smem_keys[wc] = vj
+                    smem_vals[wc] = ic + cutlass.Int32(j)
                     wc = wc + cutlass.Int32(1)
-            ic2 = ic2 + step
+            ic = ic + step
 
         # Tail scalar loop (N % vec_w)
-        it2 = n_aligned + tidx
-        while it2 < N:
-            v = self._load_fp32(input_row, it2)
+        it = n_aligned + tidx
+        while it < N:
+            v = self._load_fp32(input_row, it)
             if v >= thr_final and wc < cutlass.Int32(kCC):
                 smem_keys[wc] = v
-                smem_vals[wc] = it2
+                smem_vals[wc] = it
                 wc = wc + cutlass.Int32(1)
-            it2 = it2 + cutlass.Int32(num_threads)
+            it = it + cutlass.Int32(num_threads)
         cute.arch.barrier()
 
     # ------------------------------------------------------------------
@@ -1651,354 +1651,4 @@ class GvrTopKKernel:
         )
 
 
-# =============================================================================
-# Public Python entrypoint
-# =============================================================================
-
-import torch  # noqa: E402
-
-_DTYPE_TORCH_TO_CUTE = {
-    torch.float32: cutlass.Float32,
-    torch.bfloat16: cutlass.BFloat16,
-    torch.float16: cutlass.Float16,
-}
-
-# Compile cache keyed by (cute_dtype, top_k, next_n). Each entry is a JIT-compiled
-# kernel callable; same (dtype, K, next_n) reuse avoids re-JIT.
-_gvr_topk_compile_cache: dict = {}
-
-
-def gvr_topk_decode(
-    logits: torch.Tensor,
-    pre_idx: torch.Tensor,
-    seq_lens: torch.Tensor,
-    top_k: int,
-    next_n: int = 1,
-    out_values: Optional[torch.Tensor] = None,
-    out_indices: Optional[torch.Tensor] = None,
-    num_sms: int = 148,  # default number of sms in a B200
-    enable_unroll_4: Optional[bool] = None,
-    enable_phase3_unroll: Optional[bool] = None,
-    use_constant_hint: bool = False,
-    min_blocks_per_mp: Optional[int] = None,
-    use_256bit_load: Optional[bool] = None,
-    num_threads_per_block: Optional[int] = None,
-    enable_warp_parallel_reduce: Optional[bool] = None,
-    compress_ratio: int = 1,
-    max_seq_len: Optional[int] = None,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """cuTe DSL GVR Top-K, drop-in for ``torch.ops.trtllm.indexer_topk_decode``.
-
-    Args:
-        logits:    ``[num_rows, max_S]`` float32 / bfloat16 / float16.
-        pre_idx:   ``[num_rows // next_n, pre_idx_count]`` int32.
-                   ``pre_idx[..., 0]`` must be the argmax index — indexer invariant.
-        seq_lens:  ``[num_rows // next_n]`` int32. Effective sequence length per group.
-        top_k:     K ∈ {512, 1024, 2048} — compile-time specialized.
-        next_n:    Temporal stride for V3.2 ``preIdxOffset = (row % next_n) + 1``.
-        compress_ratio: KV-indexer compression factor (1 = DSv3.2, 4 = DSv4).
-                   When != 1, logits/preIdx live in compressed-token-index space:
-                   ``N`` is divided by ``compress_ratio`` and ``preIdxOffset``
-                   is forced to 0. Mirrors heuristicTopKDecode.cu PR #14219.
-        enable_warp_parallel_reduce: ``None`` (default) auto-couples to
-                   ``num_threads_per_block``: enabled iff threads == 1024 where
-                   the serial tid==0 reduce is the bottleneck; at threads == 512
-                   it stays off (synth-measured ~2pp regression). Pass explicit
-                   ``True`` / ``False`` to override for A/B testing.
-        num_threads_per_block: ``None`` (default) auto-picks 1024 iff
-                   ``num_rows <= num_sms AND N >= 65536`` (small grid + large N
-                   so all 1024 threads have meaningful vec-loop work).
-                   Otherwise 512. Pass 512 / 1024 to override.
-        use_256bit_load: ``None`` (default) auto-picks True iff
-                   ``dtype == fp32 AND N >= 16384`` (LDG.E.256 helps fp32
-                   broadly above N=16K; half-prec cvt-fp32 doubles fragment
-                   reg footprint and regresses 5-11% at K=512/1024).
-                   Pass True / False to override.
-        max_seq_len: Graph-safe hint for the peak ``logits.shape[1]`` expected
-                   at replay time (same compressed-token-index space as
-                   ``logits``, i.e. already divided by ``compress_ratio`` for
-                   cr > 1).
-                   * CUDA Graph mode (e.g. decode in piecewise graph):
-                     **pass this**. Capture-time N typically << peak runtime N,
-                     so without a hint the captured kernel will miss the
-                     large-N (T=1024, V=256) optimization at replay.
-                   * Eager mode (per-call dispatch, no graph capture):
-                     **leave None**. The heuristic adapts to actual N each
-                     call and is always optimal for that N.
-                   For half-prec (bf16/fp16) the T=1024 threshold is raised to
-                   131072 to avoid small-N replay regression (small-N forced
-                   to T=1024 loses 14-16%). When omitted, the heuristic uses
-                   capture-time N and skips the dtype-split since per-call
-                   decisions never force T=1024 onto small-N inputs.
-        out_values, out_indices: Optional preallocated outputs.
-        min_blocks_per_mp: Override ptxas ``__launch_bounds__(BS, min_blocks)``
-            hint. ``None`` (default) → use the 3-tier shape-aware heuristic
-            (see in-function comment). For dynamic-shape CUDA graphs where
-            the captured shape may not match replay shape, pass an explicit
-            value (e.g. ``3`` for a graph-safe single-kernel selection).
-
-    Returns:
-        Tuple ``(out_values, out_indices)`` where ``out_values`` is shaped
-        ``[num_rows, top_k]`` with the same dtype as ``logits`` and
-        ``out_indices`` is ``[num_rows, top_k]`` int32.
-
-    Indices are unordered within each row (top-K set, not sorted).
-    """
-    assert logits.is_cuda, "logits must be on CUDA"
-    assert logits.dim() == 2, f"logits must be 2D, got {logits.shape}"
-    assert pre_idx.dim() == 2 and pre_idx.dtype == torch.int32
-    assert seq_lens.dim() == 1 and seq_lens.dtype == torch.int32
-
-    if logits.dtype not in _DTYPE_TORCH_TO_CUTE:
-        raise ValueError(f"Unsupported logits dtype: {logits.dtype}")
-    cute_dtype = _DTYPE_TORCH_TO_CUTE[logits.dtype]
-
-    num_rows = logits.shape[0]
-    if out_values is None:
-        out_values = torch.empty((num_rows, top_k), dtype=logits.dtype, device=logits.device)
-    if out_indices is None:
-        out_indices = torch.empty((num_rows, top_k), dtype=torch.int32, device=logits.device)
-
-    # Resolve defaults (must be concrete for cache key).
-    # Dtype-based policy validated via A/B testing on B200:
-    #   * bf16/fp16: strided layout + cascade (unroll_4 + unroll_2) gives
-    #     consistent wins across all grid sizes (small +1pp, large +6pp).
-    #   * fp32: strided layout REGRESSES large-grid configs by 30-60pp
-    #     (worst: K=1024 BS=128 → 0.753 vs 1.364 separate-ptrs). Default
-    #     to separate-ptrs unroll-4 without cascade.
-    if enable_unroll_4 is None:
-        enable_unroll_4 = True
-    if enable_phase3_unroll is None:
-        enable_phase3_unroll = True
-    # ---- num_threads_per_block + use_256bit_load auto-heuristic ----
-    # Rule derived from sweep (sweep_tv_kineto/auto_speedup.csv):
-    #   T = 1024 when grid is small (num_rows <= num_sms; 1 CTA/SM bound) AND
-    #       N is large enough to give each of the 1024 threads meaningful
-    #       vec-loop work — empirically N >= 65536. Below that, T=1024's
-    #       extra 32-warp scheduling overhead dwarfs the per-thread work
-    #       savings and regresses by 5-20%.
-    #   V = 256-bit only for fp32: half-prec (bf16/fp16) cvt-to-fp32 doubles
-    #       fragment reg footprint and regresses by 5-11% at K=512/1024
-    #       (LDG hits saturate at 128-bit anyway). N >= 16384 skips the
-    #       fp32 N=8K dip (5-8% loss from 256-bit at small-grid small-N).
-    # Net: median speedup vs CUDA 1.09× (baseline) -> 1.10×; max 1.45× ->
-    # 1.52×; no regression introduced (~21 baseline sp<1 stay; 1 new at -1pp).
-    #
-    # max_seq_len (graph-safe hint): peak logits.shape[1] expected at replay,
-    # in the same compressed-token-index space as logits (already divided by
-    # compress_ratio if cr > 1).
-    #   CUDA Graph mode (e.g. decode in piecewise graph): CALLER MUST PASS
-    #     max_seq_len. Capture-time N is typically << peak runtime N, so
-    #     without the hint the captured kernel misses the large-N path.
-    #   Eager mode (per-call dispatch): leave max_seq_len=None. The heuristic
-    #     adapts to actual N each call and is always optimal for that N.
-    # When max_seq_len is provided, dtype-split kicks in to avoid half-prec
-    # K=512/1024 small-N replay regression (14-16% when small N is forced to
-    # T=1024). half-prec uses a higher T=1024 threshold (131072 vs 65536 for
-    # fp32). Without max_seq_len, no dtype-split — adaptive per-call decisions
-    # never force T=1024 onto small N (heuristic only fires for N >= 65536),
-    # so the half-prec N=65K-128K +4-6% T=1024 win is preserved.
-    # Resolve here so the cache key sees the concrete values.
-    N_cols = logits.shape[1]
-    N_dec = max_seq_len if max_seq_len is not None else N_cols
-    if num_threads_per_block is None:
-        if max_seq_len is not None and logits.dtype != torch.float32:
-            # Graph-safe: half-prec needs higher T=1024 bar (peak-N gain must
-            # outweigh small-N replay regression).
-            n_thresh_t = 131072
-        else:
-            n_thresh_t = 65536
-        num_threads_per_block = 1024 if (num_rows <= num_sms and N_dec >= n_thresh_t) else 512
-    if use_256bit_load is None:
-        use_256bit_load = logits.dtype == torch.float32 and N_dec >= 16384
-    # enable_warp_parallel_reduce is tightly coupled to num_threads_per_block:
-    # enabled iff num_threads == 1024 (32 warps), where the serial tid==0
-    # reduce path becomes the bottleneck. At num_threads == 512 (16 warps)
-    # the warp-parallel path measured a ~2pp regression on synth data, so
-    # it stays off by default. Resolve here so the cache key sees the
-    # concrete bool and (None, 512) and (None, 1024) hash differently.
-    if enable_warp_parallel_reduce is None:
-        enable_warp_parallel_reduce = num_threads_per_block == 1024
-    # Reg-vs-occupancy heuristic (B200 has 148 SMs):
-    #   tier-0  n_vec_iters < 4 (small N):
-    #       → min_blocks=0 (no __launch_bounds__) — let ptxas pick natural
-    #       reg count. With <4 vec iters the LLVM unroll=4 fold doesn't fire
-    #       anyway, and any explicit cap just constrains ptxas against its
-    #       own optimum.
-    #   tier-1  n_vec_iters ≥ 4 AND num_rows ≤ 148:
-    #       → min_blocks=1 — grid fits 1 CTA/SM (max anyway with small grid),
-    #       ptxas gets 69+ regs and produces 4×LDG.E.128 back-to-back.
-    #   tier-3  n_vec_iters ≥ 4 AND num_rows > 148:
-    #       (a) T=1024 OR dtype=fp32 → min_blocks=2
-    #         T=1024 mb=3 cap=21 is infeasible (ptxas violates hint, no
-    #         occupancy gain) → mb=2 (cap=32, 2 CTAs/SM) is the only winner.
-    #         T=512 + fp32 mb=3 cap=42 starves the 4-LDG-inflight ILP
-    #         pattern (fp32 vec_w=4 × 4 unroll → 16 frag + work regs needs
-    #         50+ reg) → 25-37% perf regression at large N/BS. mb=2 cap=64
-    #         leaves ILP intact.
-    #       (b) T=512 AND dtype in (bf16, fp16) → min_blocks=3
-    #         vec_w=8 × cvt-to-fp32 ILP fits in 40 regs; the extra CTA/SM
-    #         (3 vs 2) hides cvt latency → mb=3 wins by 2-6%.
-    #
-    # vec_w by dtype: fp32 → 128/32 = 4, bf16/fp16 → 128/16 = 8.
-    # Derivation: bench sweep at BS={256,384,512} × N={16K,32K,65K} × all
-    # 9 (dtype, K). See gvr-topk-opt/sweep_tv_mb_kineto/mb_sweep.png.
-    #
-    # ── CUDA Graph behavior ─────────────────────────────────────────────
-    # The heuristic reads `logits.shape[0]` and `logits.shape[1]` which are
-    # host-side Python ints (tensor metadata). Reading them does NOT touch
-    # the GPU or trigger a host-device sync, so it is safe inside a CUDA
-    # graph capture region. The branch resolves at capture time and the
-    # corresponding compiled kernel is recorded into the graph.
-    #
-    # Per-graph capture (e.g. TRT-LLM piecewise CUDA graphs that bucket by
-    # batch size) is the intended usage — each capture sees the right
-    # shape and selects the optimal kernel. The recorded launch is fixed
-    # for that graph.
-    #
-    # Dynamic-shape graphs (single graph replayed at different shapes
-    # than capture) bypass this heuristic at replay — the captured kernel
-    # is reused regardless of the new shape's `min_blocks` "preference".
-    # The kernel itself uses `sym_int` shape symbols so it remains
-    # FUNCTIONALLY correct under any (num_rows, N), but may be sub-optimal
-    # if the dominant runtime shape is in a different tier than capture.
-    # Caller can override by passing `min_blocks_per_mp=` explicitly
-    # (e.g. =3 for a graph-safe single-kernel pick).
-    # ────────────────────────────────────────────────────────────────────
-    if min_blocks_per_mp is None:
-        # vec_bits depends on use_256bit_load; vec_w_host = vec_bits / dtype_bits.
-        # Use N_dec (= max_seq_len if provided, else logits.shape[1]) for the
-        # same reason as the (T, V) heuristic above: in graph mode small
-        # capture-time N would stick this in tier-0 (mb=0) and stay there for
-        # large-N replays.
-        vec_bits_host = 256 if use_256bit_load else 128
-        vec_w_host = vec_bits_host // (32 if logits.dtype == torch.float32 else 16)
-        n_vec_iters = max(1, N_dec // (num_threads_per_block * vec_w_host))
-        # ---- OLD tier ordering (kept for reference, see NCU analysis at
-        # ---- gvr-topk-opt/auto_full_bench/bf16_k1024n8KBS384/analysis.md).
-        # ---- Bug: tier-0 (n_vec_iters < 4) → mb=0 took precedence over
-        # ---- tier-3 (num_rows > num_sms). For half-prec K=1024 BS=384 N=8K,
-        # ---- ptxas's natural 44 reg/thread → 2 CTAs/SM → 50% theo occupancy
-        # ---- vs CUDA's __launch_bounds__(512, 3) → 3 CTAs/SM → 75%.
-        # if n_vec_iters < 4:
-        #     min_blocks_per_mp = 0
-        # elif num_rows <= num_sms:
-        #     min_blocks_per_mp = 1
-        # else:
-        #     min_blocks_per_mp = (
-        #         2 if (num_threads_per_block == 1024 or logits.dtype == torch.float32) else 3
-        #     )
-        # ---- NEW: dtype-split tier ordering.
-        # half-prec (bf16/fp16): tier-3 takes precedence over tier-0. Their
-        #   vec_w=8 + cvt-to-fp32 ILP fits in 40 regs; the extra CTA/SM from
-        #   mb=3 cap=42 gains occupancy. Verified fix for bf16 K=1024 BS=384
-        #   N=4-8K (~+30pp speedup).
-        # fp32: tier-0 keeps precedence. fp32 vec_w=4 → 4-LDG-inflight ILP
-        #   wants ~70 regs; mb=2 cap=64 limits ILP and regresses small-N
-        #   large-grid cases by 20-26pp (verified at fp32 K=512 N=4K BS=384).
-        is_fp32 = logits.dtype == torch.float32
-        if is_fp32:
-            # fp32: old ordering — tier-0 first.
-            if n_vec_iters < 4:
-                min_blocks_per_mp = 0
-            elif num_rows <= num_sms:
-                min_blocks_per_mp = 1
-            elif num_sms * 2 < num_rows <= num_sms * 3 and N_dec <= 32768:
-                # Wave-fit sweet spot + latency-bound (small/medium N):
-                # mb=3 → 3 CTAs/SM cap fits all num_rows CTAs in 1 wave;
-                # mb=2 would need partial 2nd wave wasting ~70% SMs.
-                # The N cutoff handles the bandwidth/occupancy trade-off:
-                # at large N (≥65K) the per-CTA work is bandwidth-bound and
-                # mb=3's 3-way L2 sharing causes contention while mb=2's
-                # lower occupancy gives each CTA more bandwidth (mb=2 wins
-                # +21-30% at fp32 K=512 N=65K BS=384).
-                # See gvr-topk-opt/auto_full_bench/fp32_bs384_cluster/.
-                min_blocks_per_mp = 3
-            else:
-                # tier-3 for fp32 (BS ≤ 2*num_sms: mb=2 also fits 1 wave;
-                # BS > 3*num_sms: both need >1 wave, mb=2's larger reg
-                # budget helps ILP). T=1024 path also resolves to mb=2.
-                min_blocks_per_mp = 2
-        else:
-            # half-prec: new ordering — tier-3 first (occupancy gain wins).
-            if num_rows > num_sms:
-                # tier-3 → mb=3. (T=1024 path requires num_rows ≤ num_sms,
-                # so T==1024 here is impossible; mb=3 is the half-prec choice.)
-                min_blocks_per_mp = 3
-            elif n_vec_iters < 4:
-                min_blocks_per_mp = 0
-            else:
-                min_blocks_per_mp = 1
-
-    # Cache key includes the unrolling + layout switches so different
-    # settings share separate compiled kernels. Shapes (num_rows, num_tokens,
-    # batch) are made dynamic via `sym_int` placeholders.
-    key = (
-        cute_dtype,
-        top_k,
-        next_n,
-        enable_unroll_4,
-        enable_phase3_unroll,
-        use_constant_hint,
-        min_blocks_per_mp,
-        use_256bit_load,
-        num_threads_per_block,
-        enable_warp_parallel_reduce,
-        compress_ratio,
-    )
-    if key not in _gvr_topk_compile_cache:
-        n_rows = cute.sym_int()
-        n_cols = cute.sym_int()
-        n_batch = cute.sym_int()
-        # 256-bit vec loads require 32-byte aligned input addresses (PyTorch
-        # CUDA allocations are 256-byte aligned, and Phase 2/3 offsets are
-        # multiples of vec_w*elem_bytes = 32 bytes when use_256bit_load).
-        in_align = 32 if use_256bit_load else 16
-        input_fake = cute.runtime.make_fake_compact_tensor(
-            cute_dtype, (n_rows, n_cols), stride_order=(1, 0), assumed_align=in_align
-        )
-        pre_idx_fake = cute.runtime.make_fake_compact_tensor(
-            cutlass.Int32, (n_batch, top_k), stride_order=(1, 0), assumed_align=16
-        )
-        seq_lens_fake = cute.runtime.make_fake_compact_tensor(
-            cutlass.Int32, (n_batch,), stride_order=(0,)
-        )
-        out_values_fake = cute.runtime.make_fake_compact_tensor(
-            cute_dtype, (n_rows, top_k), stride_order=(1, 0), assumed_align=16
-        )
-        out_indices_fake = cute.runtime.make_fake_compact_tensor(
-            cutlass.Int32, (n_rows, top_k), stride_order=(1, 0), assumed_align=16
-        )
-        fake_stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
-
-        kernel = GvrTopKKernel(
-            dtype=cute_dtype,
-            top_k=top_k,
-            next_n=next_n,
-            num_threads=num_threads_per_block,
-            enable_unroll_4=enable_unroll_4,
-            enable_phase3_unroll=enable_phase3_unroll,
-            use_constant_hint=use_constant_hint,
-            min_blocks_per_mp=min_blocks_per_mp,
-            use_256bit_load=use_256bit_load,
-            enable_warp_parallel_reduce=enable_warp_parallel_reduce,
-            compress_ratio=compress_ratio,
-        )
-        _gvr_topk_compile_cache[key] = cute.compile(
-            kernel,
-            input_fake,
-            pre_idx_fake,
-            seq_lens_fake,
-            out_values_fake,
-            out_indices_fake,
-            stream=fake_stream,
-            options="--enable-tvm-ffi",
-        )
-
-    # TVM FFI path: pass raw torch tensors directly (no from_dlpack), no
-    # stream argument (env stream is picked up automatically).
-    _gvr_topk_compile_cache[key](logits, pre_idx, seq_lens, out_values, out_indices)
-    return out_values, out_indices
-
-
-__all__ = ["GvrTopKKernel", "GvrParams", "gvr_topk_decode"]
+__all__ = ["GvrTopKKernel", "GvrParams"]
