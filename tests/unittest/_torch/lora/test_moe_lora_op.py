@@ -379,20 +379,56 @@ def test_moe_lora_slot_indexed_multi_lora_mixed_batch():
     torch.testing.assert_close(out_mixed[half:], ref1[half:], rtol=0, atol=0)
 
 
+@pytest.fixture
+def moe_device_lora_env(monkeypatch):
+    """Enable the device LoRA path for the duration of a test and bulletproof
+    the cleanup. The C++ ``FusedMoeRunner`` reads
+    ``TLLM_MOE_LORA_USE_DEVICE_PATH`` once at construction and caches the
+    flag; ``MoERunner.runner_dict`` then memoizes the runner per input
+    shape. Clearing the dict before *and* after the test (including on
+    assertion failure) guarantees that the env-var-aware runner does not
+    leak into subsequent tests that share the same input shape but rely on
+    the legacy host path (e.g. shared-outer bit-identity tests).
+    """
+    from tensorrt_llm._torch.custom_ops.torch_custom_ops import MoERunner
+    MoERunner.runner_dict.clear()
+    monkeypatch.setenv("TLLM_MOE_LORA_USE_DEVICE_PATH", "1")
+    try:
+        yield MoERunner
+    finally:
+        MoERunner.runner_dict.clear()
+
+
 @requires_cuda_and_op
 @pytest.mark.skip(
     reason=
-    "MoE LoRA + CUDA graph capture is unsupported in the MVP. The fused-MoE kernel's "
-    "LoRA path performs a host-side cudaEventSynchronize after a D2H pointer-expansion "
-    "copy, which cannot be captured into a CUDA graph. The op rejects this combination "
-    "explicitly; native graph support requires the Phase 6 kernel patch that moves the "
-    "per-token adapter-pointer expansion onto the GPU. Slot-indexed eager execution "
-    "is exercised by the surrounding tests.")
-def test_moe_lora_slot_indexed_cuda_graph_replay_matches_eager():
+    "Phase 6b.D lifted the op-level `TORCH_CHECK(!isCapturing)` so the device "
+    "LoRA path (`TLLM_MOE_LORA_USE_DEVICE_PATH=1`) can be captured into a CUDA "
+    "graph, but capture+replay still produces scattered bf16 outliers in the "
+    "fused output (observed: 10/2048 elements off, up to ~2.8e7 absolute diff "
+    "at column 0 of specific tokens). The most likely culprit is workspace "
+    "lifetime / aliasing inside `cuda_graph_(split_k_)grouped_gemm`'s "
+    "`at::empty` workspace allocation under the graph mempool, but root-cause "
+    "is still pending. 6b.E will either fix this or pin it down before "
+    "un-skipping. The `moe_device_lora_env` fixture is intentionally kept so "
+    "that flipping this marker off is the only change needed to re-run the "
+    "check.")
+def test_moe_lora_slot_indexed_cuda_graph_replay_matches_eager(
+        moe_device_lora_env):
     """CUDA graph capture+replay of slot-indexed MoE LoRA must produce the same
     output as eager execution. Verifies that the persistent pinned-host buffer
     addresses survive capture and that re-writing slot pointers between
-    captures and replays takes effect."""
+    captures and replays takes effect.
+
+    Phase 6b.D: this requires the device LoRA path
+    (`TLLM_MOE_LORA_USE_DEVICE_PATH=1`, set by `moe_device_lora_env`). The
+    legacy host path performs a host-side `cudaEventSynchronize` in
+    `setupLoraWorkspace` and host-side pointer aggregation in
+    `LoraImpl::run` -- neither is capturable, and the op-level
+    `TORCH_CHECK` rejects that combination explicitly. The device path
+    replaces both with `launchMoeLoraPointerExpand` +
+    `runMoeLoraDeviceModule`, which run entirely on the stream.
+    """
     device = torch.device("cuda")
     dtype = torch.bfloat16
     num_tokens, hidden_size, inter_size = 16, 128, 256
@@ -699,10 +735,13 @@ def test_moe_lora_device_path_matches_host_path(monkeypatch):
         return _call_fused_moe(x, w3_w1, w2, topk_ids, topk_scores,
                                output_dtype=dtype, lora_kwargs=lora_kwargs)[0]
 
-    out_host = _compute(None)
-    out_device = _compute("1")
-    # Restore for any follow-up tests that may share runner_dict state.
-    MoERunner.runner_dict.clear()
+    # try/finally so the env-var-aware runner cannot leak into subsequent
+    # tests sharing the same input shape, even if the assertion below fails.
+    try:
+        out_host = _compute(None)
+        out_device = _compute("1")
+    finally:
+        MoERunner.runner_dict.clear()
 
     assert torch.isfinite(out_device).all()
     assert torch.isfinite(out_host).all()

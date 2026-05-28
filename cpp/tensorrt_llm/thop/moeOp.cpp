@@ -603,17 +603,19 @@ public:
                 "MoE LoRA MVP only supports fp16 and bf16 activation dtypes.");
             TORCH_CHECK(mWeightDtype == c10::ScalarType::Half || mWeightDtype == c10::ScalarType::BFloat16,
                 "MoE LoRA MVP only supports unquantized fp16/bf16 expert weights.");
-            // CUDA-graph capture is incompatible with the kernel's LoRA path,
-            // which performs a host-side `cudaEventSynchronize` and CPU-side
-            // per-token pointer expansion inside `setupLoraWorkspace`. The
-            // event-synchronize cannot be recorded into a graph. See Phase 6
-            // in moe-lora-preflight.md for the kernel patch that lifts this
-            // limitation. We reject here with a clear message to avoid the
-            // segfault that would otherwise occur during capture.
-            TORCH_CHECK(!tensorrt_llm::common::isCapturing(stream),
-                "MoE LoRA is not supported under CUDA graph capture in this MVP. The fused-MoE kernel's "
-                "LoRA path performs a host-side cudaEventSynchronize after a D2H pointer-expansion copy, "
-                "which is not capturable. Run the LoRA path eagerly, or disable MoE LoRA when capturing.");
+            // Phase 6b.D: CUDA-graph capture is only safe when the device LoRA
+            // path is in use. The legacy host path performs a host-side
+            // `cudaEventSynchronize` and CPU-side per-token pointer expansion
+            // in `setupLoraWorkspace`, plus host-side run-length encoding in
+            // `LoraImpl::run` -- none of which is capturable. The device path
+            // bypasses all of those (see `launchMoeLoraPointerExpand` +
+            // `runMoeLoraDeviceModule` in moe_kernels.cu), so we lift the
+            // capture rejection there. Toggle via `TLLM_MOE_LORA_USE_DEVICE_PATH`.
+            TORCH_CHECK(mUseDeviceLoraPath || !tensorrt_llm::common::isCapturing(stream),
+                "MoE LoRA + CUDA graph capture requires the device LoRA path "
+                "(set TLLM_MOE_LORA_USE_DEVICE_PATH=1). The legacy host path performs a host-side "
+                "cudaEventSynchronize after a D2H pointer-expansion copy, which is not capturable. "
+                "Either enable the device path, run LoRA eagerly, or disable MoE LoRA when capturing.");
         }
         // Build LoraParams up-front so we can compute the required cuBLAS workspace before allocation.
         auto lora_params_opt = buildMoeLoraParams(fc1_lora_ranks, fc1_lora_weight_ptrs, fc2_lora_ranks,
