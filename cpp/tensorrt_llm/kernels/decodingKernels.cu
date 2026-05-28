@@ -340,6 +340,13 @@ __global__ void insertUnfinishedPathKernel(BeamHypotheses bh)
         return;
     }
 
+    // logProbsTiled is the joint (un-sliced) per-step output buffer. All other tensors
+    // accessed via bid below are already sliced to this slot's view; logProbsTiled is
+    // the only one that requires the actual batch slot for indexing along the slot
+    // dimension. Fall back to bid when batchSlots is unset, which preserves the
+    // legacy behaviour for callers that don't yet provide it.
+    int const slotForLogProbsTiled = (bh.batchSlots != nullptr) ? bh.batchSlots[bid] : bid;
+
     for (int i = 0; i < nBM; ++i)
     {
         int const srcBeam = bid * nBM + i;
@@ -353,7 +360,7 @@ __global__ void insertUnfinishedPathKernel(BeamHypotheses bh)
         bh.outputIdsCBA[dstId] = bh.outputIdsUnfinish[srcId];
         if (bOutputLogProbs)
         {
-            bh.logProbsCBA[dstId] = bh.logProbsTiled[step * nMBS * nBM + srcBeam];
+            bh.logProbsCBA[dstId] = bh.logProbsTiled[step * nMBS * nBM + slotForLogProbsTiled * nBM + i];
         }
         // Previous tokens
         int prevId = bh.parentIdsUnfinish[srcId];
@@ -369,7 +376,8 @@ __global__ void insertUnfinishedPathKernel(BeamHypotheses bh)
             for (int j = step - 1; j >= inputLength; --j)
             {
                 int const index = bid * nBM * nMSL + prevId * nMSL + j;
-                bh.logProbsCBA[dstBeam * nMSL + j] = bh.logProbsTiled[j * nMBS * nBM + bid * nBM + prevId];
+                bh.logProbsCBA[dstBeam * nMSL + j]
+                    = bh.logProbsTiled[j * nMBS * nBM + slotForLogProbsTiled * nBM + prevId];
                 prevId = bh.parentIdsUnfinish[index];
             }
         }
@@ -728,7 +736,8 @@ namespace tensorrt_llm::runtime::kernels
 {
 // Must be similar to [cpp/tensorrt_llm/thop/gatherTreeOp.cpp] gatherTree
 void gatherTree(DecodingOutput const& decodingOutput, DecodingInput const& decodingInput,
-    SamplingConfig const& samplingConfig, runtime::CudaStream const& cudaStream)
+    SamplingConfig const& samplingConfig, runtime::CudaStream const& cudaStream,
+    runtime::SizeType32 batchSlot)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
@@ -803,6 +812,17 @@ void gatherTree(DecodingOutput const& decodingOutput, DecodingInput const& decod
     bh.finished = bufferCast<tensorrt_llm::kernels::FinishedState>(*decodingOutput.finishReasons);
     bh.outputIdsUnfinish = bufferCast<TokenIdType>(*decodingOutput.ids);
     bh.parentIdsUnfinish = bufferCast<TokenIdType>(*decodingOutput.parentIds);
+
+    // logProbsTiled is the only joint (un-sliced) tensor read by the gather kernel.
+    // The kernel is launched with one block per batch entry (here, a single block since
+    // we are gathering one slot at a time), so blockIdx.x is always 0. To index the
+    // correct slot of the joint tensor, expose the actual slot via bh.batchSlots.
+    auto batchSlotsPtr = manager.gpu(ITensor::makeShape({1}), TRTDataType<SizeType32>::value);
+    {
+        std::vector<SizeType32> hostBatchSlots{batchSlot};
+        manager.copy(hostBatchSlots.data(), *batchSlotsPtr);
+    }
+    bh.batchSlots = bufferCast<SizeType32>(*batchSlotsPtr);
 
     // This is where transpose is done
     tensorrt_llm::kernels::invokeInsertUnfinishedPath(bh, stream);

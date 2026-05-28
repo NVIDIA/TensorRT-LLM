@@ -131,7 +131,10 @@ namespace tensorrt_llm::runtime::kernels
 //! \param decodingInput used for endIds and input lengths.
 //! \param samplingConfig the usual buffer samplingConfig.
 //! \param cudaStream the CUDA stream on which to perform the operation.
+//! \param batchSlot the batch slot index this gather corresponds to. Required to index the
+//! joint logProbsTiled tensor at the correct slot when populating logProbsCBA.
 
 void gatherTree(DecodingOutput const& decodingOutput, DecodingInput const& decodingInput,
-    SamplingConfig const& samplingConfig, runtime::CudaStream const& cudaStream);
+    SamplingConfig const& samplingConfig, runtime::CudaStream const& cudaStream,
+    runtime::SizeType32 batchSlot);
 } // namespace tensorrt_llm::runtime::kernels

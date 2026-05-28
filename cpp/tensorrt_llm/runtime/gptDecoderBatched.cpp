@@ -247,7 +247,7 @@ CudaEvent GptDecoderBatched::finalize(decoder::DecoderState const& decoderState,
 
     auto [dInput, dOutput] = prepareGatherTree(decoderState, batchSlot, streaming, *mRuntimeStream);
 
-    kernels::gatherTree(dOutput, dInput, samplingConfig, *mRuntimeStream);
+    kernels::gatherTree(dOutput, dInput, samplingConfig, *mRuntimeStream, batchSlot);
 
     CudaEvent event{};
     mRuntimeStream->record(event);
