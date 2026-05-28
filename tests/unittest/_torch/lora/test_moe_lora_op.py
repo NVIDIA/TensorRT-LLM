@@ -404,15 +404,18 @@ def moe_device_lora_env(monkeypatch):
     reason=
     "Phase 6b.D lifted the op-level `TORCH_CHECK(!isCapturing)` so the device "
     "LoRA path (`TLLM_MOE_LORA_USE_DEVICE_PATH=1`) can be captured into a CUDA "
-    "graph, but capture+replay still produces scattered bf16 outliers in the "
-    "fused output (observed: 10/2048 elements off, up to ~2.8e7 absolute diff "
-    "at column 0 of specific tokens). The most likely culprit is workspace "
-    "lifetime / aliasing inside `cuda_graph_(split_k_)grouped_gemm`'s "
-    "`at::empty` workspace allocation under the graph mempool, but root-cause "
-    "is still pending. 6b.E will either fix this or pin it down before "
-    "un-skipping. The `moe_device_lora_env` fixture is intentionally kept so "
-    "that flipping this marker off is the only change needed to re-run the "
-    "check.")
+    "graph, and capture+replay completes without error. Numerical parity is "
+    "gated on an upstream kernel fix: Phase 6b.E pinned the residual mismatch "
+    "down to an eager-mode non-determinism in the FC2 main GEMM (CUTLASS "
+    "Hopper TMA-WS grouped GEMM running with `EpilogueFusion::NONE` on the "
+    "LoRA path's tiny per-expert problem shapes). The graph faithfully "
+    "captures one such non-deterministic eager run; `out_eager` is taken from "
+    "a different eager run and disagrees at the same lanes. See "
+    "docs/source/_dev_notes/moe-lora-preflight.md `#phase-6be-investigation-"
+    "of-the-graph-parity-mismatch` for the full bisection and the proposed "
+    "workarounds. The `moe_device_lora_env` fixture is intentionally kept so "
+    "that flipping this marker off is the only change needed once the kernel "
+    "fix lands.")
 def test_moe_lora_slot_indexed_cuda_graph_replay_matches_eager(
         moe_device_lora_env):
     """CUDA graph capture+replay of slot-indexed MoE LoRA must produce the same

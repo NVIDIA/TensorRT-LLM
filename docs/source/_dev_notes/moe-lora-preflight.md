@@ -16,7 +16,7 @@ Companion to the plan at [`cutlass-moe-shared-outer-lora.plan.md`](../../../cutl
 | 5 — Tests | done (MVP) | CPU validator + layout tests, GPU smoke for fused-moe op. CUDA-graph capture+replay test skipped pending Phase 6. See Phase 5 log. |
 | 6a — Native shared-outer kernel flag (kernel + op + test fixture) | done | `LoraParams::*_shared_a/b` zeros the per-expert offset in `setupLoraWorkspace`; 6 op kwargs threaded; native helper in `moe_layout.py`; bit-identity GPU test. |
 | 6a follow-up — Loader plumbing (`lora_layout.json`) | done (metadata-only) | New `lora_layout_sidecar.py` parser; `LoraManager.get_moe_shared_flags(uid)`; `model_engine` per-request assembler populates `lora_params["moe_shared_flags"]`. Cache row still load-time replicated -- skipping the stack and accepting native unreplicated on-disk shapes requires changing `LoraModule::localTotalSize` and is a separate follow-up PR. |
-| 6b — GPU-side LoRA expansion (lift host-sync, enable graph capture) | 6b.A done; 6b.B done; 6b.C.1 done; 6b.C.2.a done; 6b.C.2.b done; 6b.D partial (rejection lifted for device path; graph-parity test still skipped pending root-cause of bf16 outliers under capture, see F7); 6b.E in progress. | Replaces the `setupLoraWorkspace` / `LoraImpl::run` host-CPU branching with a device-side problem-builder kernel. Re-enables the skipped graph-capture parity test. |
+| 6b — GPU-side LoRA expansion (lift host-sync, enable graph capture) | 6b.A–6b.D done; 6b.E investigation done, kernel fix deferred to a separate workstream | The device-path stack (capture-safe pointer expand + problem builder + `cudaGraph(SplitK)GroupedGemm`) is in tree and gated on `TLLM_MOE_LORA_USE_DEVICE_PATH=1`. The op-level `TORCH_CHECK(!isCapturing)` is lifted for the device path. Eager-mode parity vs. the legacy host path is covered by `test_moe_lora_device_path_matches_host_path`. The capture+replay parity test stays `pytest.mark.skip`'d: 6b.E pinned the residual mismatch down to an eager-mode non-determinism inside the Hopper TMA-WS grouped GEMM (`EpilogueFusion::NONE`) used by the LoRA path, which is upstream of the graph machinery and is owned by a separate CUTLASS-side workstream. See the rewritten Phase 6b section below for the full implementation memo. |
 | 7 — Docs | done | Routed-Expert MoE LoRA section added to [`docs/source/features/lora.md`](../features/lora.md). |
 
 
@@ -128,7 +128,7 @@ Slot-indexed pointer mode (Phase 3) addresses the **input-layout** half of graph
 
 What's still open after 6b.D:
 
-- `test_moe_lora_slot_indexed_cuda_graph_replay_matches_eager` is renamed-but-still-skipped. The op no longer rejects capture, and the test (now using the `moe_device_lora_env` fixture) sets `TLLM_MOE_LORA_USE_DEVICE_PATH=1` and clears `MoERunner.runner_dict`. Capture + replay completes without error, but the replayed output disagrees with eager on a small handful of bf16 elements (observed: 10/2048 elements off, up to ~2.8e7 absolute diff at column 0 of specific tokens). The eager-mode device path itself is parity-correct (covered by `test_moe_lora_device_path_matches_host_path`), so the discrepancy is graph-capture-specific. Most likely candidates: workspace lifetime / aliasing inside `cuda_graph_(split_k_)grouped_gemm`'s `at::empty` allocation under the graph mempool, or cross-stream state in `lora_fc1_result_` that's stable in eager but not under replay. Pinning the root cause is the headline work for 6b.E.
+- `test_moe_lora_slot_indexed_cuda_graph_replay_matches_eager` is renamed-but-still-skipped. The op no longer rejects capture, and the test (now using the `moe_device_lora_env` fixture) sets `TLLM_MOE_LORA_USE_DEVICE_PATH=1` and clears `MoERunner.runner_dict`. Capture + replay completes without error, but the replayed output disagrees with the first eager call on a handful of bf16 elements. Phase 6b.E (below) bisected this all the way through the FC2 LoRA pipeline; the mismatch is **not** a graph-capture artefact at all. It is an eager-mode non-determinism inside the FC2 main GEMM (the CUTLASS Hopper TMA-WS grouped GEMM running with `EpilogueFusion::NONE` on the LoRA path's tiny per-expert problem shapes). The graph faithfully captures one such non-deterministic eager run; the test's `out_eager` is taken from a *different* eager run and happens to disagree. Un-skipping the test requires fixing the underlying kernel and is owned by a separate CUTLASS-side workstream.
 - Slot-indexed eager execution is unchanged on the host path and remains exercised by the surrounding tests.
 
 A small `moe_device_lora_env` pytest fixture wraps env-var setup with bulletproof cleanup of `MoERunner.runner_dict` so that an env-var-aware runner cannot leak into subsequent tests if the env-var test fails. This was added in 6b.D after a regression where a failing graph test left a `mUseDeviceLoraPath=true` runner in the cache, which silently swapped the legacy host path for the device path in later same-shape tests (e.g. `test_moe_native_shared_outer_matches_replicated_bitidentical`) and broke them.
@@ -328,7 +328,97 @@ The Phase 6b PR is built up over the following internal checkpoints (squashed in
 - **6b.D — lift the CUDA-graph rejection (this checkpoint, partial).** The `TORCH_CHECK(!isCapturing)` in `moeOp.cpp` was relaxed to `mUseDeviceLoraPath || !isCapturing(stream)`: capture is allowed on the device path (`launchMoeLoraPointerExpand` + `runMoeLoraDeviceModule` are stream-only), while the legacy host path keeps the rejection with an updated error message pointing users at `TLLM_MOE_LORA_USE_DEVICE_PATH=1`. `test_moe_lora_slot_indexed_cuda_graph_replay_matches_eager` was switched onto a new `moe_device_lora_env` fixture that sets the env var and clears `MoERunner.runner_dict` in a `try`/`finally` (so a failed assertion cannot leak an env-aware runner into the next test). The test now runs to completion (no longer rejected by the op) but capture+replay disagrees with eager on ~10/2048 bf16 elements with up to ~2.8e7 absolute diff at column 0 of specific tokens, so it is `pytest.mark.skip`'d again with an updated reason that documents the open work. F7 is marked **partially addressed** in this file. Root-cause + un-skip is the headline work for 6b.E.
 
   Regression context worth recording: the first attempt at 6b.D shipped the test un-skipped and *without* the fixture, putting the `MoERunner.runner_dict.clear()` only at the end of the test body. On GPU the test failed at the assertion, which short-circuited the cleanup; the next same-shape test (`test_moe_native_shared_outer_matches_replicated_bitidentical`) then picked up the cached device-path runner via shape-based memoization and produced ~98% mismatched output. The fixture-driven `try`/`finally` is the durable fix.
-- **6b.E — cleanup + docs (planned).** Remove now-dead code paths (e.g. `cudaEventSynchronize` site, host RLE branch), update `docs/source/features/lora.md` to drop the CUDA-graph caveat, and stamp this section as complete.
+- **6b.E — root-cause investigation of the residual graph-vs-eager mismatch (done; kernel fix deferred).** This checkpoint started life as "cleanup + docs". After 6b.D the op no longer rejected capture but the parity test still saw ~10/2048 bf16 elements off the eager reference, all at column 0 of specific permuted rows. 6b.E was the bisection that pinned the cause. The full chain is documented in the [6b.E investigation](#phase-6be-investigation-of-the-graph-parity-mismatch) subsection below; the headline result is that the discrepancy is **not** a graph-capture artefact, it is an eager-mode non-determinism in the FC2 main GEMM kernel (CUTLASS Hopper TMA-WS grouped GEMM, `EpilogueFusion::NONE` path), which is upstream of anything Phase 6b touches. Fixing it is owned by a separate CUTLASS-side workstream; the parity test stays `pytest.mark.skip`'d with a reason that points at this section.
+
+### Device path architecture (end-to-end walkthrough)
+
+The device LoRA path replaces the host-CPU pointer-fanout in `setupLoraWorkspace` and the cuBLAS-driven `LoraImpl::run` with a stream-only chain. With `TLLM_MOE_LORA_USE_DEVICE_PATH=1`, the LoRA stage for one MoE layer looks like this:
+
+```text
+runMoe (moeOp.cpp)
+ └─ buildMoeLoraParams           (moeOp.cpp; populates LoraParams.device_path)
+      ├─ ensureLoraExpandBuffers    (pinned-host + persistent-device mirrors of the per-permuted-row tables)
+      ├─ ensureLoraDeviceScratch    (per-module MoeLoraDevicePathBuffers; problem-builder / GEMM scratch)
+      └─ populateLoraDevicePathModule (packs the at::Tensor scratch into the typed pointer bundle)
+ └─ mKernelRunner->runMoe        (moe_kernels.cu)
+      └─ setupLoraWorkspace
+           ├─ legacy host path: D2H copy of permuted_rows → cudaEventSynchronize → CPU fan-out → H2D
+           └─ device path: launchMoeLoraPointerExpand
+                              (one thread per permuted row; reads permuted_rows on device,
+                               looks up expert via expert_first_token_offset, applies the per-expert
+                               byte offset, writes per-row (rank, A_ptr, B_ptr) for fc1/fc2/+gated)
+      └─ loraFC1 / loraFC2
+           ├─ legacy host path: LoraImpl::run (cuBLAS grouped-gemm with host pointer arrays)
+           └─ device path: runMoeLoraDeviceModule  (function-pointer indirection back into th_common)
+                              ├─ launchMoeLoraProblemBuilder
+                              │     (turns the per-row (rank, A_ptr, B_ptr) + the uniform
+                              │      input/lowrank-workspace/output bases into the 13-array
+                              │      MoeLoraGemmGroupArrays bundle that cudaGraph*GroupedGemm wants)
+                              ├─ cudaGraphSplitKGroupedGemm   (LoRA-IN: x @ A → rank-K intermediate)
+                              └─ cudaGraphGroupedGemm         (LoRA-OUT: intermediate @ B → delta)
+      └─ (FC2 main GEMM + loraBiasApplyFunc + finalize)
+```
+
+Source-of-truth files (one-line each):
+
+- [`cpp/tensorrt_llm/kernels/cutlass_kernels/include/moe_lora_device_path.h`](../../../cpp/tensorrt_llm/kernels/cutlass_kernels/include/moe_lora_device_path.h) — `MoeLoraDevicePath{,Module}` and the `LoraParams::device_path` field.
+- [`cpp/tensorrt_llm/kernels/cutlass_kernels/include/moe_lora_pointer_expand.h`](../../../cpp/tensorrt_llm/kernels/cutlass_kernels/include/moe_lora_pointer_expand.h) + [`moe_gemm/moe_lora_pointer_expand.cu`](../../../cpp/tensorrt_llm/kernels/cutlass_kernels/moe_gemm/moe_lora_pointer_expand.cu) — the on-device replacement for the `setupLoraWorkspace` host loop. One thread per permuted row; dtype-agnostic via `lora_dtype_bytes`. Tested by `moeLoraPointerExpandTest.cu`.
+- [`cpp/tensorrt_llm/kernels/cutlass_kernels/include/moe_lora_problem_builder.h`](../../../cpp/tensorrt_llm/kernels/cutlass_kernels/include/moe_lora_problem_builder.h) + [`moe_gemm/moe_lora_problem_builder.cu`](../../../cpp/tensorrt_llm/kernels/cutlass_kernels/moe_gemm/moe_lora_problem_builder.cu) — turns the per-row outputs of the pointer expand kernel into the full `MoeLoraGemmGroupArrays` bundle consumed by `cudaGraph(SplitK)GroupedGemm`. Tested by `moeLoraProblemBuilderTest.cu`.
+- [`cpp/tensorrt_llm/thop/moeOp.cpp`](../../../cpp/tensorrt_llm/thop/moeOp.cpp) — `FusedMoeRunner` owns the persistent scratch (`ensureLoraExpandBuffers`, `ensureLoraDeviceScratch`), reads `TLLM_MOE_LORA_USE_DEVICE_PATH` once at construction, and supplies the `MoeLoraDeviceRunFn` function pointer (`moeLoraDeviceRunImpl`) that the kernel calls back into for the per-module GEMM stages.
+- [`cpp/tensorrt_llm/kernels/cutlass_kernels/moe_gemm/moe_kernels.cu`](../../../cpp/tensorrt_llm/kernels/cutlass_kernels/moe_gemm/moe_kernels.cu) — `setupLoraWorkspace`, `loraFC1`, `loraFC2` each grow a `if (lora_params.device_path.enabled)` branch that early-returns through the new stream-only path; the legacy host path is preserved verbatim for the env-var-off case.
+- [`tests/unittest/_torch/lora/test_moe_lora_op.py`](../../../tests/unittest/_torch/lora/test_moe_lora_op.py) — `test_moe_lora_device_path_matches_host_path` covers eager-mode parity (the device path is compared against the legacy host path within bf16 cross-kernel tolerance); `test_moe_lora_slot_indexed_cuda_graph_replay_matches_eager` (skipped) is the gating test for full capture+replay parity.
+
+### Linker / layering rule (`th_common` vs `libmoe_gemm_src.a`)
+
+The `cudaGraph(SplitK)GroupedGemm` wrappers in `cpp/tensorrt_llm/kernels/cuda_graph_grouped_gemm.cu` allocate their workspace via `at::Tensor` (libtorch). The MoE kernel library `libmoe_gemm_src.a` is also linked from the TensorRT plugin `.so`, which deliberately does **not** depend on libtorch. We cannot call `cudaGraph*GroupedGemm` directly from `moe_kernels.cu`. The device path resolves this with a function-pointer indirection:
+
+- `LoraParams::device_path.run` is a `MoeLoraDeviceRunFn` populated by `moeOp.cpp` (in `th_common`).
+- `moe_kernels.cu`'s `runMoeLoraDeviceModule` helper invokes the function pointer from inside `loraFC1` / `loraFC2`.
+- The function-pointer body lives in `moeOp.cpp` (`moeLoraDeviceRunImpl`), which is free to call `cudaGraph*GroupedGemm` because `th_common` already links libtorch.
+
+If you ever need to add another callback from `moe_kernels.cu` into libtorch-bound code, follow the same pattern — extend `MoeLoraDevicePath` with another function pointer and populate it from `moeOp.cpp`.
+
+### Test cleanup discipline for env-var-aware runners
+
+`FusedMoeRunner` reads `TLLM_MOE_LORA_USE_DEVICE_PATH` once at construction and `MoERunner.runner_dict` (Python side) memoizes the C++ runner by `(x_dtype, weight_dtype, output_dtype, …)`. A test that flips the env var must clear `MoERunner.runner_dict` at both entry and exit; the first 6b.D attempt did the clear only at the end of the test body, which short-circuited on assertion failure and let a `mUseDeviceLoraPath=true` runner leak into the next same-shape test (`test_moe_native_shared_outer_matches_replicated_bitidentical` then saw the device path silently substituted for the host path and failed with ~98 % mismatched output). The `moe_device_lora_env` pytest fixture is the durable fix: it sets the env var with `monkeypatch.setenv`, clears the dict, `yield`s, and clears the dict again from a `finally`. Reuse this fixture (or copy its pattern) for any new test that touches `TLLM_MOE_LORA_USE_DEVICE_PATH`.
+
+### Phase 6b.E investigation of the graph-parity mismatch
+
+The 6b.D test failure reported "10/2048 bf16 elements off, up to ~2.8e7 absolute diff at column 0 of specific tokens". The investigation chain that pinned the cause:
+
+1. **Probe scaffolding.** A standalone diagnostic script (kept in `scripts_local/` — workspace-private, not in tree) was written that drives `_call_fused_moe` directly in lora_full / no_lora / zero_lora modes, runs 4 eager calls + 1 capture + 1 replay per round, and compares the per-stage device dumps stage-by-stage and across all (eager × replay) pairs. Routing-table and per-expert tally output is included so the diff can be localized to a specific expert.
+2. **Adapter memory integrity.** First-bytes-before/after snapshots of the LoRA A/B tensors confirmed the adapters were unchanged across capture and replay. The discrepancy was upstream of any GPU-side adapter mutation.
+3. **Bisection across the FC2 LoRA pipeline.** A capture-safe debug-dump path was added (env-var-gated, persistent `at::Tensor` buffers, `cudaMemcpyAsyncSanitized` queued on the same stream) to snapshot four stages: `fc2_in_input` (fc1_result_ at the entry of `loraFC2`), `fc2_lora_in` (the rank-K intermediate from the LoRA-IN GEMM), `fc2_lora_out` (the LoRA delta after the LoRA-OUT GEMM), and `fc2_post_gemm2` (fc2_result_ after FC2 main GEMM + `loraBiasApplyFunc`, before finalize). Across 4 eager calls and 1 replay: the first three stages were bit-identical for every pair; `fc2_post_gemm2` was unstable. Conclusion: the corruption enters between LoRA-OUT and finalize, i.e. inside the FC2 main GEMM or `loraBiasApplyFunc`.
+4. **Split-bisect of the FC2 main GEMM.** A fifth dump (`fc2_post_main_gemm`) was added between the FC2 main GEMM (`gemm_runner.moeGemmBiasAct`) and `loraBiasApplyFunc`. This dump was also unstable across eager calls (max abs diff ≈ 7e8 between e.g. eager[0] and eager[2]). Conclusion: the FC2 main GEMM itself is the source.
+5. **Stale-memory hypothesis tests.** Two env-var-gated `cudaMemsetAsync` experiments were attempted: (a) zero the FC2 main GEMM's output region with both `0x00` and `0xFF` (bf16 NaN) sentinel patterns just before the GEMM ran, (b) zero the entire ~34 MB MoE workspace before every `runMoe` call. Neither made any difference — the GEMM overwrites every byte of its output (no NaN sentinel survives), and zeroing the workspace does not stabilize the output. The varying state is not in any buffer this op owns.
+6. **Which eager call does the replay match.** A graph-replay-vs-each-eager-call table revealed that the replay's `fc2_post_main_gemm` and final output are bit-identical to **eager\[3]** (the last eager call before capture) and differ from eager[0/1/2]. The graph captures one specific eager invocation; the test's `out_eager` was taken from eager[0]; the comparison is apples-to-oranges, and the underlying GEMM is the variable.
+7. **Numerical signature.** The unstable lanes are exactly one bf16 column per 8-column chunk (cols 1, 9, 17, …, 97 of the affected permuted rows), and they hold garbage-sized magnitudes (~1e7–1e8) alongside correct ~1e3-magnitude neighbours. This is the classic signature of an uninitialized accumulator register / overlapping tile write in one specific MMA lane, isolated to the kernel template instantiated for the LoRA path (`use_lora && !fuse_lora_bias` → `EpilogueFusion::NONE`, M ≈ 10 per expert, N = 128, K = 256).
+
+What this implies for any future continuation:
+
+- **The discrepancy is not capture-vs-eager.** Eager-mode is also producing non-deterministic output at the same lanes; the existing eager parity tests (`test_moe_lora_device_path_matches_host_path` at rtol=5e-2, plus the unit smoke tests) only pass because both the host and device LoRA paths route through the same FC2 main GEMM kernel and end up at similar (but mutually non-deterministic) outputs.
+- **Workspace-level fixes will not help.** Both `fc2_result_`-targeted and full-workspace memsets were tried; they do not stabilize the output. The varying state is inside the CUTLASS persistent grid / tile scheduler, not in any buffer this op allocates.
+- **The fix belongs in CUTLASS.** The Hopper TMA-WS grouped GEMM's `EpilogueFusion::NONE` instantiation for these tiny per-expert shapes needs a closer look — likely an accumulator-init or tile-mapping issue in the NONE epilogue specifically (`EpilogueFusion::FINALIZE`, used by the no-LoRA Hopper path with the same M/N/K shape on the same GPU, is stable in eager mode).
+- **Workarounds that were considered but not pursued:** (a) switch the LoRA path onto `EpilogueFusion::FINALIZE` by pre-summing `Σₖ scale_k · lora_delta_k` into `final_output` and atomically accumulating the GEMM result via the existing finalize epilogue; (b) drop back to the Ampere (non-TMA-WS) kernel for the LoRA path. Both are doable but invasive and were judged out of scope for the multi-LoRA MVP, which is functionally complete with eager-mode-only graph guidance.
+
+### Phase 6b outcome (what landed, what didn't)
+
+What landed in tree (commits `83a7e5210c` → `be86076e81`):
+
+- Capture-safe pinned-host + persistent-device pointer mirrors (`mLoraExpand*Pinned` / `mLoraExpand*Device`).
+- Capture-safe device pointer-expand kernel (`launchMoeLoraPointerExpand`).
+- Capture-safe device problem-builder kernel (`launchMoeLoraProblemBuilder`).
+- Persistent device LoRA scratch on `FusedMoeRunner` (`mLoraDeviceScratch`) and the typed `LoraParams::device_path` bundle.
+- Device-path branches in `setupLoraWorkspace`, `loraFC1`, `loraFC2` calling `cudaGraph(SplitK)GroupedGemm` via the `MoeLoraDeviceRunFn` indirection.
+- Lifted op-level `TORCH_CHECK(!isCapturing)` for the device path; legacy host path still rejected with a clear error hinting at `TLLM_MOE_LORA_USE_DEVICE_PATH=1`.
+- `test_moe_lora_device_path_matches_host_path` for eager-mode parity (passing).
+- `moe_device_lora_env` fixture so any future env-var-aware test inherits bulletproof runner-cache cleanup.
+
+What did not land (deferred):
+
+- Removing the legacy host LoRA path (the `cudaEventSynchronize` + host RLE branch in `setupLoraWorkspace` and the `LoraImpl::run` call sites in `loraFC1` / `loraFC2`). The legacy path is still the default; flipping it requires the kernel-level fix above so that the device path's CUDA-graph parity story is complete.
+- The user-facing recommendation in `docs/source/features/lora.md` to keep CUDA-graph decode disabled when MoE LoRA is active. The op-level rejection is now lifted on the device path, but until the kernel-level parity work lands, "disable CUDA-graph capture" is still the right guidance for production callers.
+- Un-skipping `test_moe_lora_slot_indexed_cuda_graph_replay_matches_eager`. The fixture is in place; flipping the marker off is the only change needed once the kernel-level work lands.
 
 ### Phase 7 — Docs
 

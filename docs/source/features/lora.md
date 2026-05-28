@@ -249,13 +249,18 @@ At runtime, the per-request assembler reads the flags from the manager and forwa
 
 #### CUDA-graph decode
 
-In this release, MoE LoRA runs in eager mode. CUDA-graph **capture** of LoRA-active routed-expert MoE layers is not supported: the fused MoE kernel's LoRA path performs a host-side `cudaEventSynchronize` after a device-to-host pointer-expansion copy, which is not capturable. When CUDA-graph decode is enabled and an MoE LoRA is active, the fused MoE op detects the capturing stream and raises a clear error.
+In this release, **MoE LoRA is supported in eager mode only**. Keep CUDA-graph decode disabled (e.g. by running with `--cuda_graph_disabled` or the equivalent config option) when MoE LoRA is active. No user-facing API change is needed — `LLM(...)` with `lora_config` already wires everything through; you just need to leave CUDA-graph capture off for now.
 
-The slot-indexed input plumbing (a `token_to_slot` map plus per-slot pointer tables that live in persistent pinned host memory) is already in place inside the op and provides stable input layouts for eager replay. The kernel-side host-sync removal that unlocks full graph capture is tracked as a follow-up; it will be transparent to callers when it lands. No user-facing API change is needed — `LLM(...)` with `lora_config` already wires everything through; you just need to disable CUDA-graph capture for now (e.g. by running with `--cuda_graph_disabled` or the equivalent config option) if MoE LoRA is active.
+Two layers of infrastructure work are sequenced behind this guidance and visible to anyone exploring the code:
+
+- *Op-level capture rejection.* On the default (legacy host) LoRA path, the fused MoE op detects the capturing stream and raises a clear error pointing at the device-path env-var below. The reason is that the kernel's `setupLoraWorkspace` performs a host-side `cudaEventSynchronize` after a device-to-host pointer-expansion copy, which is not capturable.
+- *Capture-safe device LoRA path.* A stream-only replacement of that host fan-out lives behind the `TLLM_MOE_LORA_USE_DEVICE_PATH=1` environment variable. With it set, the fused MoE op no longer rejects CUDA-graph capture, and a capture+replay completes without error. Eager-mode parity vs. the legacy host path is covered by a dedicated unit test. **However**, full numerical parity between an eager call and a replayed capture is gated on a separate kernel-level fix (an upstream CUTLASS issue in the Hopper TMA-WS grouped GEMM `EpilogueFusion::NONE` path used by MoE LoRA on these per-expert problem shapes). Until that lands, the public recommendation is still to keep CUDA-graph capture disabled when MoE LoRA is active. The `TLLM_MOE_LORA_USE_DEVICE_PATH=1` env var is intentionally undocumented as a user-facing knob and is for development / continuation work only.
+
+The slot-indexed input plumbing (a `token_to_slot` map plus per-slot pointer tables that live in persistent pinned host memory) is already in place inside the op and provides stable input layouts for eager replay regardless of which LoRA path is used.
 
 #### What is rejected, and where
 
-If you supply MoE LoRA on a non-Cutlass backend or with quantization, `create_moe` raises at construction with a message pointing at the offending setting. At runtime, the fused MoE op also rejects min-latency mode + LoRA, alltoall + LoRA, (per-request, slot-indexed) mixed inputs, and CUDA-graph capture + LoRA.
+If you supply MoE LoRA on a non-Cutlass backend or with quantization, `create_moe` raises at construction with a message pointing at the offending setting. At runtime, the fused MoE op also rejects min-latency mode + LoRA, alltoall + LoRA, (per-request, slot-indexed) mixed inputs, and (legacy host path only) CUDA-graph capture + LoRA.
 
 ### Cache Management
 
