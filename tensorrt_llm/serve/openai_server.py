@@ -40,6 +40,8 @@ from tensorrt_llm.llmapi import MultimodalEncoder, SchedulingParams, tracing
 from tensorrt_llm.llmapi.disagg_utils import (DisaggClusterConfig,
                                               MetadataServerConfig, ServerRole)
 from tensorrt_llm.llmapi.llm import RequestOutput
+from tensorrt_llm.llmapi.thinking_budget import \
+    add_thinking_budget_logits_processor
 from tensorrt_llm.logger import logger
 from tensorrt_llm.media.encoding import image_to_bytes
 from tensorrt_llm.metrics.collector import MetricsCollector
@@ -1148,6 +1150,12 @@ class OpenAIServer(_VideoRoutesMixin):
                 gather_generation_logits,
                 reasoning_parser=self.generator.args.reasoning_parser,
                 backend=self.generator.args.backend)
+            add_thinking_budget_logits_processor(
+                sampling_params,
+                reasoning_parser=self.generator.args.reasoning_parser,
+                tokenizer=self.tokenizer,
+                chat_template_kwargs=request.chat_template_kwargs,
+            )
             if self.tool_parser and request.tools:
                 tool_parser_cls = ToolParserFactory.parsers.get(
                     self.tool_parser.lower())
@@ -1493,6 +1501,11 @@ class OpenAIServer(_VideoRoutesMixin):
                 gather_generation_logits=self.generator.args.
                 gather_generation_logits,
                 backend=self.generator.args.backend)
+            add_thinking_budget_logits_processor(
+                sampling_params,
+                reasoning_parser=self.generator.args.reasoning_parser,
+                tokenizer=self.tokenizer,
+            )
             # TODO: better way to enable metrics
             if len(os.getenv("TRTLLM_KVCACHE_TIME_OUTPUT_PATH", "")) > 0:
                 sampling_params.return_perf_metrics = True
@@ -1625,6 +1638,10 @@ class OpenAIServer(_VideoRoutesMixin):
             sampling_params = request.to_sampling_params(
                 vocab_size=self._logit_bias_vocab_size(),
                 reasoning_parser="gpt_oss")
+            if sampling_params.thinking_token_budget is not None:
+                raise ValueError(
+                    "thinking_token_budget is not supported by the Harmony "
+                    "GPT-OSS serving path; use reasoning_effort instead")
             sampling_params.detokenize = False  # Harmony adapter handles detokenization
             disaggregated_params = to_llm_disaggregated_params(
                 request.disaggregated_params)

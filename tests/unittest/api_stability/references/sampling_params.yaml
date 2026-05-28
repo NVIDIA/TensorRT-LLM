@@ -15,6 +15,9 @@ methods:
       prompt_ignore_length:
         annotation: Optional[int]
         default: null
+      thinking_token_budget:
+        annotation: Optional[int]
+        default: null
       logprobs_mode:
         annotation: LogprobMode
         default: LogprobMode.RAW
