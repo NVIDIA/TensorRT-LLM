@@ -165,7 +165,12 @@ def test_gms_load_branch(monkeypatch, is_rw, expected_events):
     if is_rw:
         # RW: load weights, run them through the mapper, then commit
         # everything that landed in the GMS pool for RO consumers.
-        checkpoint_loader.load_weights.assert_called_once_with("/ckpt", mapping=loader.mapping)
+        # ``model=model`` is passed for symmetry with the LoadFormat.AUTO
+        # path (see model_loader.py); HF ignores it, MX uses it for direct
+        # P2P writes when MX+GMS composition eventually lands.
+        checkpoint_loader.load_weights.assert_called_once_with(
+            "/ckpt", mapping=loader.mapping, model=model
+        )
         loader._call_load_weights.assert_called_once()
         backend.move_untracked_params.assert_called_once_with(model)
         backend.finalize_write.assert_called_once_with(model)

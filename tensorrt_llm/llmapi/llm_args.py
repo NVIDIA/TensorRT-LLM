@@ -4139,6 +4139,14 @@ class TorchLlmArgs(BaseLlmArgs):
     def convert_load_format(cls, v):
         if isinstance(v, LoadFormat):
             return v
+        # ``bool`` is a subclass of ``int`` in Python, so without an
+        # explicit bool check ``load_format=True/False`` would silently
+        # coerce to ``LoadFormat(1) == LoadFormat.DUMMY`` /
+        # ``LoadFormat(0) == LoadFormat.AUTO``. Reject early so callers
+        # who pass a misread boolean flag get an actionable error
+        # instead of a silently wrong checkpoint-load mode.
+        if isinstance(v, bool):
+            raise ValueError(f"Invalid LoadFormat: {v}")
         if isinstance(v, int):
             return LoadFormat(v)
         load_format = v.upper()

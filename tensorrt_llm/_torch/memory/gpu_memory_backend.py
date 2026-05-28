@@ -195,6 +195,12 @@ class GMSBackend:
                 tag=self._tag,
             )
         except Exception as e:
+            # TODO(GMS-API): narrow once upstream documents the expected
+            # client-creation failure modes (socket missing, connection
+            # refused, daemon crashed). Today the upstream API doesn't
+            # enumerate them, so the broad catch protects the
+            # "GMS optional / fall through to disk" guarantee at the cost
+            # of also swallowing programming bugs (e.g. signature drift).
             logger.warning(
                 "Failed to connect to GMS at %s (mode=%s, tag=%s): %s",
                 socket_path,
@@ -203,6 +209,7 @@ class GMSBackend:
                 e,
             )
             self._client = None
+            self._is_rw = None
             return False
 
         self._is_rw = self._client.granted_lock_type == GrantedLockType.RW
@@ -347,7 +354,15 @@ class GMSBackend:
 
         gms_client = self._client
         device_index = self._device_index
-        tracked_storage_ptrs: set[int] = set()
+        # Map original storage base ptr -> new GMS base_va. Serves two roles:
+        #   1. Dedups create_mapping() / copy_() calls when multiple tensors
+        #      share a storage (e.g. tied embeddings, sliced fused params).
+        #   2. Lets us rebind every view of a shared storage to the SAME
+        #      GMS mapping, so all tied/aliased parameters end up backed
+        #      by the GMS pool. Without this, only the first encountered
+        #      view was rebound; subsequent views still pointed at the
+        #      original non-GMS storage and were missed by finalize_write.
+        storage_to_gms_va: dict[int, int] = {}
 
         # No torch.no_grad() guard: ``tensor.data = X`` bypasses autograd by
         # definition (it's a data-attribute assignment, not an autograd-tracked
@@ -363,12 +378,14 @@ class GMSBackend:
             storage_base_ptr = tensor.untyped_storage().data_ptr()
             if _ptr_in_gms(gms_client, int(storage_base_ptr)):
                 continue
-            if storage_base_ptr in tracked_storage_ptrs:
-                continue
-            tracked_storage_ptrs.add(storage_base_ptr)
 
-            nbytes = _storage_nbytes(tensor)
-            base_va = gms_client.create_mapping(size=nbytes, tag=self._tag)
+            base_va = storage_to_gms_va.get(storage_base_ptr)
+            first_for_this_storage = base_va is None
+            if first_for_this_storage:
+                nbytes = _storage_nbytes(tensor)
+                base_va = gms_client.create_mapping(size=nbytes, tag=self._tag)
+                storage_to_gms_va[storage_base_ptr] = base_va
+
             replacement = _tensor_from_pointer(
                 int(base_va),
                 list(tensor.shape),
@@ -376,7 +393,11 @@ class GMSBackend:
                 tensor.dtype,
                 device_index,
             )
-            replacement.copy_(tensor)
+            # Copy original bytes exactly once per storage; subsequent
+            # views of the same storage just rebind onto the same GMS
+            # mapping without recopying.
+            if first_for_this_storage:
+                replacement.copy_(tensor)
             tensor.data = replacement
 
     def finalize_write(self, model: nn.Module) -> int:
@@ -511,6 +532,7 @@ class GMSBackend:
             logger.warning("GMS cleanup error: %s", e)
         finally:
             self._client = None
+            self._is_rw = None
 
 
 def _ptr_in_gms(gms_client, ptr: int) -> bool:
