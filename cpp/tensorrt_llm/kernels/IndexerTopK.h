@@ -38,8 +38,8 @@ namespace kernels
 void invokeIndexerTopKDecode(float const* logits, int const* seqLens, int* indices, int const splitWorkThreshold,
     int const numRows, int const numColumns, int const stride0, int const stride1, int const next_n,
     int const topK = 2048, int const* preIdx = nullptr, int const preIdxStride = 0, int const preIdxCount = 0,
-    float* heuristicScratch = nullptr, cudaStream_t const stream = 0, void* scratch = nullptr,
-    size_t scratchBytes = 0, bool is_prefill = false);
+    float* heuristicScratch = nullptr, cudaStream_t const stream = 0, void* scratch = nullptr, size_t scratchBytes = 0,
+    bool is_prefill = false);
 
 /// Size of the multi-pass radix `scratch` buffer for these shapes.
 size_t indexerTopKDecodeScratchBytes(int numRows, int numColumns, int topK);
@@ -55,8 +55,8 @@ void invokeIndexerTopKDecode(__nv_bfloat16 const* logits, int const* seqLens, in
 void invokeIndexerTopKDecode(__half const* logits, int const* seqLens, int* indices, int const splitWorkThreshold,
     int const numRows, int const numColumns, int const stride0, int const stride1, int const next_n,
     int const topK = 2048, int const* preIdx = nullptr, int const preIdxStride = 0, int const preIdxCount = 0,
-    __half* heuristicScratch = nullptr, cudaStream_t const stream = 0, void* scratch = nullptr,
-    size_t scratchBytes = 0, bool is_prefill = false);
+    __half* heuristicScratch = nullptr, cudaStream_t const stream = 0, void* scratch = nullptr, size_t scratchBytes = 0,
+    bool is_prefill = false);
 
 void invokeIndexerTopKPrefill(float const* logits, int const* rowStarts, int const* rowEnds, int* indices,
     int const numRows, int const numColumns, int const stride0, int const stride1, int const topK = 2048,

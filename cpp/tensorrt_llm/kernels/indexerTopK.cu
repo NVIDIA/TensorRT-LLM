@@ -410,12 +410,10 @@ struct TopKSmem
 template <int kNumThreadsPerBlock, int kNumBins, bool multipleBlocksPerRow = false, bool mergeBlocks = false,
     typename InputT = float>
 static __device__ void topKPerRowJob(int const* indices, InputT const* logits, int rowStart, int rowEnd,
-    int* outIndices, float* outLogits, int stride1, int topK,
-    TopKSmem<kNumThreadsPerBlock, kNumBins>& smem)
+    int* outIndices, float* outLogits, int stride1, int topK, TopKSmem<kNumThreadsPerBlock, kNumBins>& smem)
 {
     static constexpr int kNumFinalItems = TopKSmem<kNumThreadsPerBlock, kNumBins>::kNumFinalItems;
-    static constexpr int kNumFinalItemsPerThread
-        = TopKSmem<kNumThreadsPerBlock, kNumBins>::kNumFinalItemsPerThread;
+    static constexpr int kNumFinalItemsPerThread = TopKSmem<kNumThreadsPerBlock, kNumBins>::kNumFinalItemsPerThread;
     using FinalSort = typename TopKSmem<kNumThreadsPerBlock, kNumBins>::FinalSort;
 
     auto& smemFinal = smem.smemFinal;
@@ -645,8 +643,7 @@ static __global__ __launch_bounds__(kNumThreadsPerBlock) void topKPerRowPrefill(
 #endif
 }
 
-template <int kNumThreadsPerBlock, bool multipleBlocksPerRow = false, bool mergeBlocks = false,
-    typename InputT = float>
+template <int kNumThreadsPerBlock, bool multipleBlocksPerRow = false, bool mergeBlocks = false, typename InputT = float>
 static __global__ __launch_bounds__(kNumThreadsPerBlock) void topKPerRowDecode(InputT const* logits, int const* seqLens,
     int* outIndices, int stride0, int stride1, int const topK, int next_n, float* outLogits = nullptr,
     int const numBlocksToMerge = 0, int const* indices = nullptr)
@@ -1095,9 +1092,10 @@ static void launchMultiPassRadix(void* scratch, InputT const* logits, int const*
         cudaLaunchKernelExC(&cfg, kernel, args);
     };
 
-    launchPass(reinterpret_cast<void const*>(&radixPassKernel<kPassThreads, 1, InputT>), (int const*) nullptr,
-        (int*) nullptr);
-    launchPass(reinterpret_cast<void const*>(&radixPassKernel<kPassThreads, 2, InputT>), (int const*) nullptr, candBuf1);
+    launchPass(
+        reinterpret_cast<void const*>(&radixPassKernel<kPassThreads, 1, InputT>), (int const*) nullptr, (int*) nullptr);
+    launchPass(
+        reinterpret_cast<void const*>(&radixPassKernel<kPassThreads, 2, InputT>), (int const*) nullptr, candBuf1);
     // Pass 3 emits the final top-K inline in its last-block trailer (see
     // radixPassKernel<step=3>) instead of requiring a separate filter launch.
     launchPass(
@@ -1114,9 +1112,7 @@ void invokeIndexerTopKDecodeImpl(InputT const* logits, int const* seqLens, int* 
 {
     // Split-work cutoff: 200k for bs > 8, 65k for bs <= 8 (low-bs under-uses
     // the GPU otherwise). is_prefill forces single-block.
-    int const adaptiveSplitWorkThreshold = is_prefill ? (1 << 30)
-        : (numRows > 8)                               ? 200 * 1000
-                                                      : 65 * 1024;
+    int const adaptiveSplitWorkThreshold = is_prefill ? (1 << 30) : (numRows > 8) ? 200 * 1000 : 65 * 1024;
     int const effectiveSplitWorkThreshold = splitWorkThreshold > 0 ? splitWorkThreshold : adaptiveSplitWorkThreshold;
     constexpr int kNumThreadsPerBlock = 512;
 
@@ -1171,8 +1167,7 @@ void invokeIndexerTopKDecodeImpl(InputT const* logits, int const* seqLens, int* 
         // strided inputs would rank the wrong values — gate on stride1 == 1.
         // (The single-block tier handles stride1 != 1 via topKPerRowJob's
         // strided fallback.)
-        TLLM_CHECK_WITH_INFO(
-            stride1 == 1, "indexer top-k split-work tier (multi-pass radix) requires stride1 == 1.");
+        TLLM_CHECK_WITH_INFO(stride1 == 1, "indexer top-k split-work tier (multi-pass radix) requires stride1 == 1.");
         TLLM_CHECK_WITH_INFO(scratch != nullptr && scratchBytes >= radixScratchBytes(numRows, numColumns),
             "indexer top-k split-work tier: scratch buffer missing or too small.");
         cudaLaunchAttribute radixAttrs[1];
@@ -1229,9 +1224,8 @@ void invokeIndexerTopKPrefill(float const* logits, int const* rowStarts, int con
 
     // One launch over all rows; the per-row sort algorithm is picked at
     // runtime inside topKPerRowJob.
-    topKPerRowPrefill<kNumThreadsPerBlock>
-        <<<numRows, kNumThreadsPerBlock, topK * sizeof(int32_t), stream>>>(
-            logits, rowStarts, rowEnds, indices, stride0, stride1, topK, 0);
+    topKPerRowPrefill<kNumThreadsPerBlock><<<numRows, kNumThreadsPerBlock, topK * sizeof(int32_t), stream>>>(
+        logits, rowStarts, rowEnds, indices, stride0, stride1, topK, 0);
 
     sync_check_cuda_error(stream);
 }

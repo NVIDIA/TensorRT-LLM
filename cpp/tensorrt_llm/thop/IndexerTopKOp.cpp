@@ -134,11 +134,10 @@ void indexer_topk_decode(th::Tensor const& logits, th::Tensor const& seq_lens, t
     th::Tensor scratch_internal;
     if (num_columns >= adaptiveSplitWorkThreshold && multiPassScratchPtr == nullptr)
     {
-        size_t const bytes
-            = tk::indexerTopKDecodeScratchBytes(num_rows, num_columns, static_cast<int32_t>(index_topk));
+        size_t const bytes = tk::indexerTopKDecodeScratchBytes(num_rows, num_columns, static_cast<int32_t>(index_topk));
         // Zero-init: the radix kernel reads the per-row state on first call.
-        scratch_internal = th::zeros(
-            {static_cast<int64_t>(bytes)}, th::TensorOptions().dtype(th::kByte).device(logits.device()));
+        scratch_internal
+            = th::zeros({static_cast<int64_t>(bytes)}, th::TensorOptions().dtype(th::kByte).device(logits.device()));
         multiPassScratchPtr = scratch_internal.data_ptr();
         multiPassScratchBytes = bytes;
     }
@@ -150,25 +149,24 @@ void indexer_topk_decode(th::Tensor const& logits, th::Tensor const& seq_lens, t
     if (logits_dtype == at::ScalarType::Float)
     {
         tk::invokeIndexerTopKDecode(logits.data_ptr<float>(), seq_lens.data_ptr<int32_t>(), indices.data_ptr<int32_t>(),
-            splitWorkThreshold, num_rows, num_columns, logits_stride_0, logits_stride_1,
-            static_cast<int32_t>(next_n), static_cast<int32_t>(index_topk), preIdxPtr, preIdxStride, preIdxCount,
+            splitWorkThreshold, num_rows, num_columns, logits_stride_0, logits_stride_1, static_cast<int32_t>(next_n),
+            static_cast<int32_t>(index_topk), preIdxPtr, preIdxStride, preIdxCount,
             static_cast<float*>(heuristicScratchPtr), stream, multiPassScratchPtr, multiPassScratchBytes, is_prefill);
     }
     else if (logits_dtype == at::ScalarType::BFloat16)
     {
         tk::invokeIndexerTopKDecode(reinterpret_cast<__nv_bfloat16 const*>(logits.data_ptr()),
             seq_lens.data_ptr<int32_t>(), indices.data_ptr<int32_t>(), splitWorkThreshold, num_rows, num_columns,
-            logits_stride_0, logits_stride_1, static_cast<int32_t>(next_n), static_cast<int32_t>(index_topk),
-            preIdxPtr, preIdxStride, preIdxCount, static_cast<__nv_bfloat16*>(heuristicScratchPtr), stream,
-            multiPassScratchPtr, multiPassScratchBytes, is_prefill);
+            logits_stride_0, logits_stride_1, static_cast<int32_t>(next_n), static_cast<int32_t>(index_topk), preIdxPtr,
+            preIdxStride, preIdxCount, static_cast<__nv_bfloat16*>(heuristicScratchPtr), stream, multiPassScratchPtr,
+            multiPassScratchBytes, is_prefill);
     }
     else // Half
     {
         tk::invokeIndexerTopKDecode(reinterpret_cast<__half const*>(logits.data_ptr()), seq_lens.data_ptr<int32_t>(),
-            indices.data_ptr<int32_t>(), splitWorkThreshold, num_rows, num_columns, logits_stride_0,
-            logits_stride_1, static_cast<int32_t>(next_n), static_cast<int32_t>(index_topk), preIdxPtr, preIdxStride,
-            preIdxCount, static_cast<__half*>(heuristicScratchPtr), stream, multiPassScratchPtr, multiPassScratchBytes,
-            is_prefill);
+            indices.data_ptr<int32_t>(), splitWorkThreshold, num_rows, num_columns, logits_stride_0, logits_stride_1,
+            static_cast<int32_t>(next_n), static_cast<int32_t>(index_topk), preIdxPtr, preIdxStride, preIdxCount,
+            static_cast<__half*>(heuristicScratchPtr), stream, multiPassScratchPtr, multiPassScratchBytes, is_prefill);
     }
 }
 
