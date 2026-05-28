@@ -149,6 +149,14 @@ class CommunicationFactory:
         except Exception as e:
             logger.info(f"NVLinkOneSided not available: {e}")
 
+        # Non-divisible EP: NVLinkTwoSided and DeepEP require num_experts % ep_size == 0.
+        if num_experts % mapping.moe_ep_size != 0:
+            logger.info(
+                f"Non-divisible EP (num_experts={num_experts}, ep_size={mapping.moe_ep_size}): "
+                "falling back to AllGatherReduceScatter"
+            )
+            return AllGatherReduceScatter(mapping)
+
         try:
             if use_flashinfer_comm:
                 strategy = NVLinkTwoSidedFlashinfer(
@@ -245,6 +253,15 @@ class CommunicationFactory:
         use_low_precision_combine = model_config.use_low_precision_moe_combine
 
         method = method.upper()
+
+        # Whitelist check: non-divisible EP only supports NVLinkOneSided and AllGather.
+        _NONDIVISIBLE_EP_ALLOWED = {"NVLINK_ONE_SIDED", "ALLGATHER"}
+        if num_experts % mapping.moe_ep_size != 0 and method not in _NONDIVISIBLE_EP_ALLOWED:
+            raise ValueError(
+                f"Communication method '{method}' requires num_experts % ep_size == 0, "
+                f"but got num_experts={num_experts}, ep_size={mapping.moe_ep_size}. "
+                f"Allowed methods for non-divisible EP: {sorted(_NONDIVISIBLE_EP_ALLOWED)}"
+            )
 
         # Create strategy - will raise RuntimeError if platform not supported
         if method in ["NVLINK_TWO_SIDED"]:

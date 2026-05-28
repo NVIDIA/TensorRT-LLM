@@ -67,6 +67,13 @@ _BACKEND_SYNC_ATTRS = (
 
 
 class ConfigurableMoE(MoE):
+    # ConfigurableMoE is a thin wrapper that dispatches to a concrete backend
+    # (CuteDslFusedMoE / CutlassFusedMoE / ...). Allow the wrapper itself to
+    # pass the non-divisible-EP gate so the inner backend's own gate is the
+    # authoritative check -- if the chosen inner backend doesn't opt in, its
+    # ``MoE.__init__`` will still raise.
+    _supports_non_divisible_ep: bool = True
+
     """
     Configurable MoE layer using composition pattern with automatic configuration
 

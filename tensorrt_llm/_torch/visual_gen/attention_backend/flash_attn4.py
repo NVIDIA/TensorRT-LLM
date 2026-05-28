@@ -17,10 +17,6 @@ Flash Attention 4 Backend for Visual Generation Models
 
 Uses Flash Attention 4 with the CUTE JIT kernel.
 Expects NHD layout ([B, S, H, D]) and supports float16/bfloat16.
-
-Cute kernel source: tensorrt_llm/_torch/visual_gen/jit_kernels/flash_attention/cute/
-(https://github.com/Dao-AILab/flash-attention/tree/main/flash_attn/cute
-at commit ea8f73506369d7cdd498396474107a978858138c)
 """
 
 import math
@@ -33,9 +29,7 @@ from .interface import AttentionBackend, AttentionTensorLayout
 
 _flash_attn_fwd_import_error = None
 try:
-    from tensorrt_llm._torch.visual_gen.jit_kernels.flash_attention.cute.interface import (
-        _flash_attn_fwd,
-    )
+    from flash_attn.cute.interface import _flash_attn_fwd
 except (ImportError, OSError) as e:
     _flash_attn_fwd = None
     _flash_attn_fwd_import_error = e
