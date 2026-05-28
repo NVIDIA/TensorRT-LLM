@@ -18,6 +18,7 @@ from typing import Any, Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
 
+
 def is_w4a16_nvfp4_hf_quant_config(hf_quant_config):
     if hf_quant_config is None:
         return False
@@ -30,10 +31,13 @@ def is_w4a16_nvfp4_hf_quant_config(hf_quant_config):
         return False
     weights_quant_config = group_config.get("weights", {})
     inputs_quant_config = group_config.get("input_activations")
-    return (hf_quant_config.get("format") == "nvfp4-pack-quantized"
-            and weights_quant_config.get("num_bits") == 4
-            and weights_quant_config.get("group_size") == 16
-            and inputs_quant_config is None)
+    return (
+        hf_quant_config.get("format") == "nvfp4-pack-quantized"
+        and weights_quant_config.get("num_bits") == 4
+        and weights_quant_config.get("group_size") == 16
+        and inputs_quant_config is None
+    )
+
 
 def update_quant_config_from_compressed_tensors(
     quant_config: QuantConfig, hf_quant_config: Mapping[str, Any]

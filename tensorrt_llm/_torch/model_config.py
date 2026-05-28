@@ -23,8 +23,8 @@ from tensorrt_llm.llmapi.llm_args import (DeepSeekSparseAttentionConfig,
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
-from tensorrt_llm.models.quant_config_utils import \
-    update_quant_config_from_compressed_tensors, is_w4a16_nvfp4_hf_quant_config
+from tensorrt_llm.models.quant_config_utils import (
+    is_w4a16_nvfp4_hf_quant_config, update_quant_config_from_compressed_tensors)
 from tensorrt_llm.quantization.mode import QuantAlgo
 from tensorrt_llm.quantization.modelopt_config import (
     is_modelopt_quant_config, read_modelopt_quant_config,
@@ -366,8 +366,8 @@ class ModelConfig(Generic[TConfig]):
         if 'pre_quant_scale' in json_quant_configs:
             quant_config.pre_quant_scale = json_quant_configs['pre_quant_scale']
 
-        if (quant_config.quant_algo in (QuantAlgo.NVFP4, "NVFP4") and
-                is_w4a16_nvfp4_hf_quant_config(hf_quant_config)):
+        if (quant_config.quant_algo in (QuantAlgo.NVFP4, "NVFP4")
+                and is_w4a16_nvfp4_hf_quant_config(hf_quant_config)):
             quant_config.quant_algo = QuantAlgo.W4A16_NVFP4
             quant_config.group_size = 16
             quant_config.exclude_modules = hf_quant_config.get(
