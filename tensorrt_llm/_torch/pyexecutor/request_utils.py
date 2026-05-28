@@ -554,10 +554,7 @@ class RequestBroadcaster:
             return payloads
 
         if not self.dist.has_pp:
-            if self.dist.has_tp:
-                return self.dist.broadcast(payloads, root=0)
-            else:
-                return payloads
+            return self.dist.broadcast(payloads, root=0)
 
         # Broadcast within first PP stage before send/recv chain to other PP stages.
         # This needs to cover both TP and CP ranks within the first PP stage.
