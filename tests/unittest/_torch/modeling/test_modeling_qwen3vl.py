@@ -159,8 +159,8 @@ class TestQwen3VL(TestModelingMultimodal):
             trtllm_inputs["multimodal_params"] = gen_multimodal_params_list
         else:
             # Mrope position ids. For chunked prefill / KV cache reuse we must
-            # mirror production `PyTorchModelEngine` behavior and slice the
-            # request's full `mrope_position_ids` to the current chunk's
+            # mirror production ``PyTorchModelEngine`` behavior and slice the
+            # request's full ``mrope_position_ids`` to the current chunk's
             # range -- the model now indexes mrope cos/sin by batch-flat
             # per-token index, so the position_ids tensor must contain only
             # the tokens of the current forward (chunk-local) with their
@@ -373,7 +373,7 @@ def test_qwen3vl_init_preserves_caller_quant_config():
 # ---------------------------------------------------------------------------
 # Accuracy tests for the fused Triton bilinear position-embedding kernel used
 # by the Qwen3-VL vision tower. Mirrors vLLM's
-# `tests/kernels/core/test_vit_bilinear_pos_embed.py` so the two
+# ``tests/kernels/core/test_vit_bilinear_pos_embed.py`` so the two
 # implementations stay aligned.
 # ---------------------------------------------------------------------------
 
@@ -406,7 +406,7 @@ def _vit_pos_embed_native_reference(
 ) -> torch.Tensor:
     """Eager PyTorch reference for one (t, h, w) grid — the pre-Triton
     implementation, kept here only as the test oracle for
-    `_triton_pos_embed_interpolate`.
+    ``_triton_pos_embed_interpolate``.
     """
     hidden_dim = embed_weight.shape[1]
     device = embed_weight.device
@@ -495,7 +495,7 @@ def test_vit_pos_embed_triton_matches_native(grid_thw, dtype):
     assert native_out.shape == triton_out.shape
 
     # Single-ULP differences come from the precomputed scalar h/w_scale
-    # in the Triton kernel vs `torch.linspace` in the reference. Match
+    # in the Triton kernel vs ``torch.linspace`` in the reference. Match
     # vLLM's tolerances for the same kernel.
     atol = {torch.float32: 5e-5, torch.bfloat16: 1e-2}[dtype]
     rtol = {torch.float32: 1e-5, torch.bfloat16: 1e-2}[dtype]
@@ -544,12 +544,12 @@ def test_vit_pos_embed_temporal_repeat(dtype):
 
 
 # ---------------------------------------------------------------------------
-# Accuracy tests for `Qwen3VisionModel.rot_pos_emb`'s pos_ids construction.
+# Accuracy tests for ``Qwen3VisionModel.rot_pos_emb``'s pos_ids construction.
 # The new implementation lifts pos_ids generation to CPU (numpy + lru_cache)
 # and ships a single H->D copy at the end. Previously pos_ids were built on
 # device via a per-image torch.arange/expand/stack chain. The freq_table
 # lookup is identical in both paths, so we only verify pos_ids equality —
-# that guarantees the final `freq_table[pos_ids]` output matches bit-for-bit.
+# that guarantees the final ``freq_table[pos_ids]`` output matches bit-for-bit.
 # ---------------------------------------------------------------------------
 
 
@@ -558,7 +558,7 @@ def _rot_pos_ids_gpu_reference(grid_thw: torch.Tensor, spatial_merge_size: int) 
 
     Mirrors the original on-device implementation: per-image torch.arange
     + broadcast/expand/stack/repeat, written into a contiguous (total, 2)
-    buffer on the same device as `grid_thw`.
+    buffer on the same device as ``grid_thw``.
     """
     device = grid_thw.device
     total_tokens = int(torch.prod(grid_thw, dim=1).sum().item())
@@ -621,7 +621,7 @@ _ROT_POS_IDS_GRIDS = [
     ids=["_".join(f"{t}x{h}x{w}" for t, h, w in cfg) for cfg in _ROT_POS_IDS_GRIDS],
 )
 def test_rot_pos_ids_matches_gpu_reference(grid_thw_list):
-    """`rot_pos_ids` + cat (new path) must produce the same pos_ids tensor
+    """``rot_pos_ids`` + cat (new path) must produce the same pos_ids tensor
     as the pre-vectorization on-device implementation."""
     spatial_merge_size = _VIT_POS_EMBED_SPATIAL_MERGE_SIZE
     device = "cuda"
@@ -666,15 +666,15 @@ def test_rot_pos_ids_lru_cache_hit():
 
 def _make_qwen3_vision_model_for_l2():
     """Build a minimally-initialized Qwen3VisionModel that exposes
-    `_rotary_pos_emb_thw` and `rot_pos_emb` without loading any weights.
+    ``_rotary_pos_emb_thw`` and ``rot_pos_emb`` without loading any weights.
 
-    Bypasses the heavy `__init__` (blocks, mergers, attn metadata buffers)
-    by going through `__new__` so the class-level decorators (`@staticmethod`
-    on `rot_pos_ids` and `@lru_cache` on `_rotary_pos_emb_thw`) stay intact.
+    Bypasses the heavy ``__init__`` (blocks, mergers, attn metadata buffers)
+    by going through ``__new__`` so the class-level decorators (``@staticmethod``
+    on ``rot_pos_ids`` and ``@lru_cache`` on ``_rotary_pos_emb_thw``) stay intact.
     The mock wires only the attrs those cached methods touch:
-    `spatial_merge_size`, `rotary_pos_emb` (a stub exposing the
-    `rotary_cos_sin` cache that `_rotary_pos_emb_thw` indexes into),
-    and `patch_embed.proj.weight` (read by `device`).
+    ``spatial_merge_size``, ``rotary_pos_emb`` (a stub exposing the
+    ``rotary_cos_sin`` cache that ``_rotary_pos_emb_thw`` indexes into),
+    and ``patch_embed.proj.weight`` (read by ``device``).
     """
     obj = Qwen3VisionModel.__new__(Qwen3VisionModel)
     torch.nn.Module.__init__(obj)
@@ -686,15 +686,15 @@ def _make_qwen3_vision_model_for_l2():
     max_rope_seqlen = 8192
     seq = torch.arange(max_rope_seqlen, dtype=torch.float32)
     freqs = torch.outer(seq, inv_freq)
-    # `_rotary_pos_emb_thw` slices `rotary_pos_emb.rotary_cos_sin` and
-    # indexes with `pos_ids`. Stack cos/sin along dim 1 to match the
-    # real `RotaryEmbedding` buffer layout `(max_pos, 2, freq_dim)`.
+    # ``_rotary_pos_emb_thw`` slices ``rotary_pos_emb.rotary_cos_sin`` and
+    # indexes with ``pos_ids``. Stack cos/sin along dim 1 to match the
+    # real ``RotaryEmbedding`` buffer layout ``(max_pos, 2, freq_dim)``.
     rotary_cos_sin = torch.stack([freqs.cos(), freqs.sin()], dim=1).to("cuda")
     rotary_pos_emb = torch.nn.Module()
     rotary_pos_emb.rotary_cos_sin = rotary_cos_sin
     obj.rotary_pos_emb = rotary_pos_emb
 
-    # patch_embed.proj.weight is what `Qwen3VisionModel.device` reads.
+    # patch_embed.proj.weight is what ``Qwen3VisionModel.device`` reads.
     obj.patch_embed = torch.nn.Module()
     obj.patch_embed.proj = torch.nn.Linear(1, 1, bias=False).to("cuda")
     return obj
@@ -773,20 +773,20 @@ def test_rot_pos_emb_l2_no_device_transfer_on_hit():
 
 def test_rot_pos_emb_cos_sin_matches_old_repeat_chain():
     """The new pre-computed-cos/sin path must produce the same per-token
-    (cos, sin) after the forward's `.repeat(1, 2)` as the prior
-    `freqs.repeat(1, 2).cos()/.sin()` chain."""
+    (cos, sin) after the forward's ``.repeat(1, 2)`` as the prior
+    ``freqs.repeat(1, 2).cos()/.sin()`` chain."""
     vm = _make_qwen3_vision_model_for_l2()
     vm._rotary_pos_emb_thw.cache_clear()
 
     grid_thw_list = [(1, 16, 16), (1, 32, 32), (3, 8, 12)]
 
-    # New path: gathered cos/sin then forward's `.repeat(1, 2)`.
+    # New path: gathered cos/sin then forward's ``.repeat(1, 2)``.
     cos_new, sin_new = vm.rot_pos_emb(grid_thw_list)
     cos_new = cos_new.repeat(1, 2)
     sin_new = sin_new.repeat(1, 2)
 
     # Old path replica: build freqs via outer on the fly, then
-    # `flatten(1).repeat(1, 2).cos()/.sin()`.
+    # ``flatten(1).repeat(1, 2).cos()/.sin()``.
     rope_dim = 36
     inv_freq = 1.0 / (10000.0 ** (torch.arange(0, rope_dim, 2, dtype=torch.float32) / rope_dim))
     inv_freq = inv_freq.to("cuda")
@@ -816,15 +816,15 @@ def test_rot_pos_emb_cos_sin_matches_old_repeat_chain():
 
 # ---------------------------------------------------------------------------
 # Pre-computed cos/sin buffer (RotaryEmbedding.rotary_cos_sin) used by
-# `_rotary_pos_emb_thw` to gather without firing per-forward
-# `.cos()` / `.sin()` kernels.
+# ``_rotary_pos_emb_thw`` to gather without firing per-forward
+# ``.cos()`` / ``.sin()`` kernels.
 # ---------------------------------------------------------------------------
 
 
 def test_rope_cos_sin_buffers_match_hf_rotary():
-    """The cos/sin cache exposed via `rotary_pos_emb.rotary_cos_sin` must
-    bit-match HF's `Qwen3VLVisionRotaryEmbedding(dim=36)(max_hw).cos()`
-    / `.sin()` output."""
+    """The cos/sin cache exposed via ``rotary_pos_emb.rotary_cos_sin`` must
+    bit-match HF's ``Qwen3VLVisionRotaryEmbedding(dim=36)(max_hw).cos()``
+    / ``.sin()`` output."""
     from transformers.models.qwen3_vl.modeling_qwen3_vl import (
         Qwen3VLVisionRotaryEmbedding as HFQwen3VLVisionRotaryEmbedding,
     )
@@ -832,7 +832,7 @@ def test_rope_cos_sin_buffers_match_hf_rotary():
     vm = _make_qwen3_vision_model_for_l2()
     hf = HFQwen3VLVisionRotaryEmbedding(36).to("cuda")
     atol = rtol = 1e-6
-    # `rotary_cos_sin` is stacked along dim 1 as (max_pos, 2, freq_dim);
+    # ``rotary_cos_sin`` is stacked along dim 1 as (max_pos, 2, freq_dim);
     # index 0 holds cos, index 1 holds sin.
     cos_cache = vm.rotary_pos_emb.rotary_cos_sin[:, 0, :]
     sin_cache = vm.rotary_pos_emb.rotary_cos_sin[:, 1, :]
@@ -884,8 +884,8 @@ def test_async_tensor_h2d_tensor_input():
 
 def test_maybe_pin_memory_idempotent_on_already_pinned():
     """A second call on an already-pinned tensor must return it unchanged
-    (same Python object) -- the new `is_pinned()` guard skips the
-    redundant `.pin_memory()` dispatch."""
+    (same Python object) -- the new ``is_pinned()`` guard skips the
+    redundant ``.pin_memory()`` dispatch."""
     from tensorrt_llm._utils import maybe_pin_memory
 
     t = torch.tensor([1.0, 2.0, 3.0])
@@ -909,7 +909,7 @@ def test_argsort_matches_scatter_inverse(n):
     new = torch.argsort(window_index)
 
     torch.testing.assert_close(new, old, atol=0, rtol=0)
-    # Functional check: applying `new` to `window_index` is identity.
+    # Functional check: applying ``new`` to ``window_index`` is identity.
     identity = window_index[new]
     torch.testing.assert_close(
         identity, torch.arange(n, device="cuda", dtype=window_index.dtype), atol=0, rtol=0
@@ -919,20 +919,20 @@ def test_argsort_matches_scatter_inverse(n):
 # ---------------------------------------------------------------------------
 # End-to-end Qwen3VLVisionBlock forward path.
 #
-# The pre-EXAONE-4.5 `apply_rotary_pos_emb_vision` (HF) accepted
-# `cos / sin` of shape `(seq, head_dim)`; the post-EXAONE-4.5
-# `RotaryEmbedding.apply_rotary_pos_emb` (TRT-LLM) expects
-# `(seq, head_dim // 2)` and broadcasts. This test pushes one block
+# The pre-EXAONE-4.5 ``apply_rotary_pos_emb_vision`` (HF) accepted
+# ``cos / sin`` of shape ``(seq, head_dim)``; the post-EXAONE-4.5
+# ``RotaryEmbedding.apply_rotary_pos_emb`` (TRT-LLM) expects
+# ``(seq, head_dim // 2)`` and broadcasts. This test pushes one block
 # through with the post-EXAONE shape so any future regression (e.g.
-# re-introducing a stray `.repeat(1, 2)` on cos/sin) surfaces here
+# re-introducing a stray ``.repeat(1, 2)`` on cos/sin) surfaces here
 # rather than only at full-model CI.
 # ---------------------------------------------------------------------------
 
 
 def test_qwen3vl_vision_block_forward_end_to_end():
-    """One `Qwen3VLVisionBlock.forward` call with random weights and the
-    correct (post-EXAONE) `cos/sin` shape must not raise a broadcasting
-    error in `apply_rope`."""
+    """One ``Qwen3VLVisionBlock.forward`` call with random weights and the
+    correct (post-EXAONE) ``cos/sin`` shape must not raise a broadcasting
+    error in ``apply_rope``."""
     from transformers import Qwen3VLConfig
 
     from tensorrt_llm._torch.attention_backend.utils import get_attention_backend
