@@ -20,6 +20,7 @@ from tensorrt_llm.llmapi import CudaGraphConfig, KvCacheConfig, MoeConfig, Sampl
 from tensorrt_llm.quantization import QuantAlgo
 
 from ..conftest import (
+    get_sm_version,
     llm_models_root,
     skip_post_blackwell_ultra,
     skip_pre_blackwell,
@@ -313,9 +314,11 @@ class TestGemma3_27BInstruct(LlmapiAccuracyTestHarness):
         )
 
     def test_fp8_prequantized(self):
+        # Blackwell FP8 numerics differ from Hopper; route to the sm100_fp8 reference.
+        extra_acc_spec = "sm100_fp8" if get_sm_version() >= 100 else None
         with self._make_llm(self.MODEL_PATH) as llm:
             task = MMMU(self.MODEL_NAME)
-            task.evaluate(llm, sampling_params=self.sampling_params)
+            task.evaluate(llm, extra_acc_spec=extra_acc_spec, sampling_params=self.sampling_params)
 
     @skip_pre_blackwell
     def test_nvfp4_prequantized(self):
