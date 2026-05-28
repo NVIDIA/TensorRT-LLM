@@ -2,8 +2,13 @@
 # Copyright (c) 2025-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Multimodal utilities for handling images and other media types in TensorRT-LLM."""
 
+import enum
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import (TYPE_CHECKING, Any, Dict, Iterable, List, Optional, Tuple,
+                    Union)
+
+if TYPE_CHECKING:
+    from tensorrt_llm.inputs.registry import BaseMultimodalInputProcessor
 
 import numpy as np
 import torch
@@ -286,6 +291,274 @@ def add_multimodal_run_metadata(
     return multimodal_data
 
 
+_SUPPORTED_HASHING_MODALITIES = ("image", "video", "audio")
+
+
+class _MultimodalItemType(enum.IntEnum):
+    """Stable integer codes used by multimodal layout metadata."""
+
+    IMAGE = 0
+    VIDEO = 1
+    AUDIO = 2
+
+    @property
+    def modality(self) -> str:
+        """Return the `multi_modal_data` key represented by this item type."""
+        return self.name.lower()
+
+
+def _normalize_mm_items(mm_data: Dict[str, Any]) -> Dict[str, List[Any]]:
+    """Return modality payloads in list form for item-order validation.
+
+    `multi_modal_data` accepts both a single item and a list of items for a
+    modality, while ordering logic needs item counts and stable indexing. This
+    is not only defensive: it is the canonical boundary between flexible user
+    payload shape and the internal `(modality, item_index)` ordering contract.
+    Non-modality metadata entries are intentionally ignored.
+    """
+    return {
+        modality: items if isinstance(items, list) else [items]
+        for modality, items in mm_data.items()
+        if modality in _SUPPORTED_HASHING_MODALITIES and items is not None
+    }
+
+
+class MMItemOrder(list):  # list[tuple[str, int]]
+    """Logical prompt-order of multimodal items as (modality, item_index) pairs.
+
+    A request can carry multiple modalities and multiple items per modality,
+    but the executor needs them in a single prompt-order stream. This type
+    carries that ordering and the projections needed to flatten by-key
+    collections (token lengths, UUIDs, encoder outputs) into prompt order.
+    """
+
+    # ---- Constructors ----
+
+    @classmethod
+    def default(cls, mm_items: Dict[str, List[Any]]) -> "MMItemOrder":
+        """Return deterministic modality-major order when no explicit order exists."""
+        return cls((modality, idx) for modality, items in mm_items.items()
+                   for idx in range(len(items)))
+
+    @classmethod
+    def from_raw_entries(cls, entries: Iterable[Any], *,
+                         source: str) -> "MMItemOrder":
+        """Normalize order metadata to `(modality, item_index)` pairs.
+
+        Accepted metadata shapes are strings, `(modality, index)` pairs, dicts,
+        and integer `layout_metadata.item_types`. Integer item types are decoded
+        through `_MultimodalItemType` because those values are stable metadata
+        codes.
+        """
+        counters: Dict[str, int] = {}
+        item_order: List[Tuple[str, int]] = []
+        for entry in entries:
+            if isinstance(entry, dict):
+                modality = entry.get("modality", entry.get("type"))
+                item_index = entry.get("index", entry.get("item_index"))
+                if item_index is None:
+                    item_index = counters.get(modality, 0)
+            elif isinstance(entry, str):
+                modality = entry
+                item_index = counters.get(modality, 0)
+            elif isinstance(entry, int) and source.endswith("item_types"):
+                try:
+                    item_type = _MultimodalItemType(entry)
+                except ValueError as exc:
+                    raise ValueError(
+                        f"{source} entry has unknown item type: {entry}"
+                    ) from exc
+                modality = item_type.modality
+                item_index = counters.get(modality, 0)
+            else:
+                try:
+                    modality, item_index = entry
+                except (TypeError, ValueError) as exc:
+                    raise ValueError(
+                        f"{source} entries must be modality strings, "
+                        "(modality, index) pairs, or dicts") from exc
+            if not isinstance(modality, str):
+                raise ValueError(
+                    f"{source} entry has non-string modality: {entry!r}")
+            item_index = int(item_index)
+            item_order.append((modality, item_index))
+            counters[modality] = max(counters.get(modality, 0), item_index + 1)
+        return cls(item_order)
+
+    @classmethod
+    def from_metadata(
+            cls,
+            multimodal_data: Optional[Dict[str,
+                                           Any]]) -> Optional["MMItemOrder"]:
+        """Extract explicit multimodal item order from processed metadata.
+
+        Returns `None` when no ordering key is present, so callers can
+        distinguish 'absent' from 'empty'.
+        """
+        if not multimodal_data:
+            return None
+        if "multimodal_item_order" in multimodal_data:
+            return cls.from_raw_entries(
+                multimodal_data["multimodal_item_order"],
+                source="multimodal_item_order")
+        if "modality_order" in multimodal_data:
+            return cls.from_raw_entries(multimodal_data["modality_order"],
+                                        source="modality_order")
+        layout_metadata = multimodal_data.get("layout_metadata")
+        if isinstance(layout_metadata,
+                      dict) and "item_types" in layout_metadata:
+            return cls.from_raw_entries(layout_metadata["item_types"],
+                                        source="layout_metadata.item_types")
+        return None
+
+    @classmethod
+    def resolve(
+        cls,
+        mm_data: Dict[str, Any],
+        input_processor: "BaseMultimodalInputProcessor",
+        *,
+        prompt_token_ids: Optional[List[int]] = None,
+        multimodal_data: Optional[Dict[str, Any]] = None,
+    ) -> "MMItemOrder":
+        """Resolve the prompt order for every multimodal item in a request.
+
+        Explicit metadata wins, model-specific prompt parsing is the fallback
+        for mixed requests, and single-modality requests keep the historical
+        modality-major ordering.
+        """
+        mm_items = _normalize_mm_items(mm_data)
+        metadata_order = cls.from_metadata(multimodal_data)
+        if metadata_order is not None:
+            metadata_order.validate(mm_items)
+            return metadata_order
+        if len(mm_items) <= 1:
+            item_order = cls.default(mm_items)
+            item_order.validate(mm_items)
+            return item_order
+        if prompt_token_ids is not None:
+            get_mm_item_order = getattr(input_processor, "get_mm_item_order",
+                                        None)
+            if callable(get_mm_item_order):
+                item_order = cls.from_raw_entries(
+                    get_mm_item_order(prompt_token_ids, mm_data),
+                    source=f"{type(input_processor).__name__}.get_mm_item_order",
+                )
+                item_order.validate(mm_items)
+                return item_order
+        item_order = cls.default(mm_items)
+        item_order.validate(mm_items)
+        return item_order
+
+    # ---- Validation ----
+
+    def validate(self, mm_items: Dict[str, List[Any]]) -> None:
+        """Verify that this order references every multimodal item exactly once."""
+        seen = {modality: 0 for modality in mm_items}
+        for modality, idx in self:
+            if modality not in mm_items:
+                raise ValueError(
+                    f"Multimodal item order references modality '{modality}', "
+                    f"but multi_modal_data only has {list(mm_items)}")
+            if idx < 0 or idx >= len(mm_items[modality]):
+                raise ValueError(
+                    f"Multimodal item order references {modality}[{idx}], "
+                    f"but that modality has {len(mm_items[modality])} item(s)")
+            seen[modality] += 1
+        for modality, items in mm_items.items():
+            if seen[modality] != len(items):
+                raise ValueError(
+                    f"Multimodal item order covers {seen[modality]} "
+                    f"{modality} item(s), expected {len(items)}")
+
+    # ---- Projections ----
+
+    def flatten(self, values_by_key: Dict[str, List[Any]]) -> List[Any]:
+        """Flatten per-modality values using this prompt item order."""
+        return [values_by_key[modality][idx] for modality, idx in self]
+
+    def flatten_uuids(
+        self,
+        mm_uuids: Optional[Dict[str, List[Optional[str]]]],
+    ) -> Optional[List[Optional[str]]]:
+        """Flatten optional per-modality UUIDs using this item order."""
+        if mm_uuids is None:
+            return None
+        ordered_uuids: List[Optional[str]] = []
+        for modality, idx in self:
+            modality_uuids = mm_uuids.get(modality)
+            if modality_uuids is None:
+                ordered_uuids.append(None)
+                continue
+            if not isinstance(modality_uuids, list):
+                modality_uuids = [modality_uuids]
+            ordered_uuids.append(modality_uuids[idx])
+        return ordered_uuids
+
+    def split_embeddings(
+        self,
+        encoded_by_modality: Dict[str, "torch.Tensor"],
+        embedding_lengths: List[int],
+    ) -> List["torch.Tensor"]:
+        """Split modality-bucketed embeddings and return chunks in prompt order.
+
+        Encoders usually return one tensor per modality bucket. The executor
+        expects a single request-ordered embedding stream, so per-item lengths
+        are used to split each bucket and reassemble chunks according to this
+        item order.
+        """
+        if len(self) != len(embedding_lengths):
+            raise ValueError(
+                "multimodal_item_order and multimodal_embedding_lengths lengths "
+                f"differ: {len(self)} != {len(embedding_lengths)}.")
+        item_lengths = {
+            item: int(embedding_length)
+            for item, embedding_length in zip(
+                self, embedding_lengths, strict=True)
+        }
+        chunks_by_item: Dict[Tuple[str, int], torch.Tensor] = {}
+        for modality, encoded in encoded_by_modality.items():
+            modality_items = [item for item in self if item[0] == modality]
+            if not modality_items:
+                continue
+            modality_lengths = [item_lengths[item] for item in modality_items]
+            expected = sum(modality_lengths)
+            if encoded.shape[0] != expected:
+                raise ValueError(
+                    f"{modality} embedding length mismatch: encoder produced "
+                    f"{encoded.shape[0]} rows, metadata expects {expected}.")
+            for item, chunk in zip(modality_items,
+                                   encoded.split(modality_lengths),
+                                   strict=True):
+                chunks_by_item[item] = chunk
+        missing_items = [item for item in self if item not in chunks_by_item]
+        if missing_items:
+            raise ValueError(
+                f"Missing encoded multimodal chunks for {missing_items}.")
+        return [chunks_by_item[item] for item in self]
+
+
+def normalize_multimodal_item_order(
+    multimodal_data: Dict[str, Any], ) -> List[Tuple[str, int]]:
+    """Return normalized `(modality, item_index)` entries from MM metadata.
+
+    Deprecated thin wrapper retained for backward compatibility; delegates to
+    `MMItemOrder.from_raw_entries`. New code should use `MMItemOrder`.
+    """
+    raw_order = (multimodal_data or {}).get("multimodal_item_order") or []
+    return MMItemOrder.from_raw_entries(raw_order,
+                                        source="multimodal_item_order")
+
+
+def split_multimodal_embeddings_by_item_order(
+    encoded_by_modality: Dict[str, torch.Tensor],
+    item_order: List[Tuple[str, int]],
+    embedding_lengths: List[int],
+) -> List[torch.Tensor]:
+    """Deprecated thin wrapper; delegates to `MMItemOrder.split_embeddings`."""
+    return MMItemOrder(item_order).split_embeddings(encoded_by_modality,
+                                                    embedding_lengths)
+
+
 @dataclass
 class MultimodalRuntimeData:
     """Runtime data for tracking multimodal embedding caching and reuse per request sequence.
@@ -386,7 +659,8 @@ class MultimodalParams:
                 "video_height": torch.Tensor | List[int],
                 "video_width": torch.Tensor | List[int],
             },
-            "special_token_offsets": List[int],          # List of starting positions of special tokens in the union of all multimodal token chunks, if available
+            # List of starting positions of special tokens in the union of all multimodal token chunks, if available
+            "special_token_offsets": List[int],
             # ... other modalities
         }
     """
@@ -864,8 +1138,9 @@ def find_mm_token_lengths(
     for modality, items in mm_items.items():
         if not hasattr(input_processor, f"get_num_tokens_per_{modality}"):
             raise AttributeError(
-                f"Input processor {type(input_processor).__name__} does not have 'get_num_tokens_per_{modality}' method required for multimodal hashing."
-            )
+                f"Input processor {type(input_processor).__name__} does not have "
+                f"'get_num_tokens_per_{modality}' method required for "
+                "multimodal hashing.")
 
         video_grid_thw_for_items = None
         if modality == "video" and video_grid_thw is not None:

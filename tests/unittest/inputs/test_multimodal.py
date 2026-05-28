@@ -6,6 +6,7 @@ import pytest
 import torch
 
 from tensorrt_llm.inputs.multimodal import (
+    MMItemOrder,
     MultimodalInput,
     MultimodalRuntimeData,
     _compute_mm_masks,
@@ -62,6 +63,195 @@ def test_add_multimodal_run_metadata_preserves_item_runs_in_py_data():
         "multimodal_run_positions": [2],
         "multimodal_run_lengths": [4],
     }
+
+
+class TestMMItemOrder:
+    """Tests for the MMItemOrder class."""
+
+    # ---- Constructors ----
+
+    def test_default_single_modality(self):
+        sentinel_a = object()
+        sentinel_b = object()
+        sentinel_c = object()
+        result = MMItemOrder.default({"image": [sentinel_a, sentinel_b, sentinel_c]})
+        assert list(result) == [("image", 0), ("image", 1), ("image", 2)]
+        assert isinstance(result, MMItemOrder)
+
+    def test_default_empty_mm_items_returns_empty(self):
+        result = MMItemOrder.default({})
+        assert list(result) == []
+        assert isinstance(result, MMItemOrder)
+
+    def test_from_raw_entries_string_form(self):
+        result = MMItemOrder.from_raw_entries(["image", "image", "video"], source="x")
+        assert list(result) == [("image", 0), ("image", 1), ("video", 0)]
+        assert isinstance(result, MMItemOrder)
+
+    def test_from_raw_entries_dict_form(self):
+        result = MMItemOrder.from_raw_entries(
+            [{"modality": "image", "index": 1}, {"type": "video"}],
+            source="x",
+        )
+        assert list(result) == [("image", 1), ("video", 0)]
+
+    def test_from_raw_entries_tuple_form(self):
+        result = MMItemOrder.from_raw_entries([("image", 0), ("video", 2)], source="x")
+        assert list(result) == [("image", 0), ("video", 2)]
+
+    def test_from_raw_entries_rejects_unsupported_types(self):
+        # float is none of dict/str/int-with-item_types/2-tuple
+        with pytest.raises(ValueError):
+            MMItemOrder.from_raw_entries([3.5], source="x")
+        # int with non-item_types source: falls to tuple unpack → ValueError
+        with pytest.raises(ValueError):
+            MMItemOrder.from_raw_entries([7], source="x")
+        # unknown int item_type code via layout_metadata.item_types
+        with pytest.raises(ValueError, match="unknown item type: 7"):
+            MMItemOrder.from_raw_entries([7], source="layout_metadata.item_types")
+
+    def test_from_metadata_prefers_multimodal_item_order(self):
+        result = MMItemOrder.from_metadata(
+            {
+                "multimodal_item_order": [
+                    {"modality": "image", "index": 1},
+                    "video",
+                    ("image", 0),
+                ]
+            }
+        )
+        assert list(result) == [("image", 1), ("video", 0), ("image", 0)]
+        assert isinstance(result, MMItemOrder)
+
+    def test_from_metadata_falls_back_to_modality_order(self):
+        result = MMItemOrder.from_metadata({"modality_order": ["image", "video"]})
+        assert list(result) == [("image", 0), ("video", 0)]
+
+    def test_from_metadata_falls_back_to_layout_item_types(self):
+        # 0=IMAGE, 1=VIDEO, 2=AUDIO
+        result = MMItemOrder.from_metadata({"layout_metadata": {"item_types": [0, 1, 2]}})
+        assert list(result) == [("image", 0), ("video", 0), ("audio", 0)]
+
+    def test_from_metadata_returns_none_when_absent(self):
+        assert MMItemOrder.from_metadata(None) is None
+        assert MMItemOrder.from_metadata({}) is None
+        assert MMItemOrder.from_metadata({"other": 1}) is None
+
+    def test_resolve_uses_metadata_when_present(self):
+        # processor hook must NOT be called when metadata is present
+        class PoisonProcessor:
+            def get_mm_item_order(self, *args, **kwargs):
+                raise AssertionError("get_mm_item_order must not be called")
+
+        a, b, c = object(), object(), object()
+        mm_data = {"image": [a, b], "video": [c]}
+        multimodal_data = {
+            "multimodal_item_order": [
+                {"modality": "video", "index": 0},
+                {"modality": "image", "index": 0},
+                {"modality": "image", "index": 1},
+            ]
+        }
+        result = MMItemOrder.resolve(
+            mm_data,
+            PoisonProcessor(),
+            prompt_token_ids=[1, 2, 3],
+            multimodal_data=multimodal_data,
+        )
+        assert list(result) == [("video", 0), ("image", 0), ("image", 1)]
+
+    def test_resolve_uses_default_for_single_modality(self):
+        class NoHookProcessor:
+            pass
+
+        a, b = object(), object()
+        result = MMItemOrder.resolve(
+            {"image": [a, b]},
+            NoHookProcessor(),
+        )
+        assert list(result) == [("image", 0), ("image", 1)]
+
+    def test_resolve_uses_input_processor_protocol_for_multi_modality(self):
+        a, b = object(), object()
+
+        class OrderingProcessor:
+            def get_mm_item_order(self, prompt_token_ids, mm_data):
+                return [("video", 0), ("image", 0)]
+
+        result = MMItemOrder.resolve(
+            {"image": [a], "video": [b]},
+            OrderingProcessor(),
+            prompt_token_ids=[1, 2],
+        )
+        assert list(result) == [("video", 0), ("image", 0)]
+
+    def test_resolve_falls_back_to_default_when_processor_lacks_hook(self):
+        class NoHookProcessor:
+            pass
+
+        a, b = object(), object()
+        result = MMItemOrder.resolve(
+            {"image": [a], "video": [b]},
+            NoHookProcessor(),
+            prompt_token_ids=[1, 2],
+        )
+        # default order is modality-major: image first, then video
+        assert list(result) == [("image", 0), ("video", 0)]
+
+    # ---- Validation ----
+
+    def test_validate_rejects_unknown_modality(self):
+        a = object()
+        with pytest.raises(ValueError, match="modality 'audio'"):
+            MMItemOrder([("audio", 0)]).validate({"image": [a]})
+
+    def test_validate_rejects_out_of_bounds_index(self):
+        a = object()
+        with pytest.raises(ValueError, match=r"image\[5\]"):
+            MMItemOrder([("image", 5)]).validate({"image": [a]})
+
+    def test_validate_rejects_coverage_mismatch(self):
+        a, b = object(), object()
+        # order covers only 1 image item but mm_items has 2
+        with pytest.raises(ValueError, match="expected 2"):
+            MMItemOrder([("image", 0)]).validate({"image": [a, b]})
+
+    # ---- Projections ----
+
+    def test_flatten_reorders_by_key(self):
+        result = MMItemOrder([("image", 0), ("video", 0), ("image", 1)]).flatten(
+            {"image": [10, 11], "video": [20]}
+        )
+        assert result == [10, 20, 11]
+
+    def test_flatten_uuids_passes_through_none(self):
+        result = MMItemOrder([("image", 0)]).flatten_uuids(None)
+        assert result is None
+
+    def test_flatten_uuids_handles_missing_modality(self):
+        result = MMItemOrder([("image", 0), ("video", 0)]).flatten_uuids({"image": ["a"]})
+        assert result == ["a", None]
+
+    def test_split_embeddings_raises_on_length_mismatch(self):
+        with pytest.raises(ValueError, match="differ"):
+            MMItemOrder([("image", 0)]).split_embeddings({"image": torch.tensor([[1]])}, [1, 2])
+
+    def test_split_embeddings_raises_on_missing_chunks(self):
+        # video key is absent from encoded_by_modality
+        with pytest.raises(ValueError, match="Missing"):
+            MMItemOrder([("image", 0), ("video", 0)]).split_embeddings(
+                {"image": torch.tensor([[1]])}, [1, 1]
+            )
+
+    def test_split_embeddings_reorders_bucketed_outputs(self):
+        encoded = {
+            "image": torch.tensor([[1], [2], [3]]),
+            "video": torch.tensor([[10], [11]]),
+        }
+        chunks = MMItemOrder([("image", 0), ("video", 0), ("image", 1)]).split_embeddings(
+            encoded, [1, 2, 2]
+        )
+        assert [c.flatten().tolist() for c in chunks] == [[1], [10, 11], [2, 3]]
 
 
 def test_mixed_image_video_audio_masks_runs_embedding_lengths():
