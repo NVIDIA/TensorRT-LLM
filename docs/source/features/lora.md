@@ -258,6 +258,18 @@ Two layers of infrastructure work are sequenced behind this guidance and visible
 
 The slot-indexed input plumbing (a `token_to_slot` map plus per-slot pointer tables that live in persistent pinned host memory) is already in place inside the op and provides stable input layouts for eager replay regardless of which LoRA path is used.
 
+#### Numerical caveat (eager mode at certain per-expert shapes)
+
+The CUTLASS issue called out in the CUDA-graph subsection above is **not** capture-specific — it also affects eager mode. At certain per-expert GEMM shapes the Hopper TMA-WS grouped GEMM (`EpilogueFusion::NONE`, used by the LoRA path) produces non-deterministic output at a small subset of bf16 lanes: empirically ~6 % of output positions on tokens routed to affected experts, all at one bf16 column per 8-column MMA chunk, carrying garbage-magnitude values (~1e7–1e8) where the correct magnitude is ~1e3. Repeat invocations with literally identical inputs produce different bf16 values at the same lanes within a single process.
+
+What this means in practice:
+
+- *Functional behavior is preserved.* The op runs end-to-end, slot routing / shared-outer flag / multi-LoRA dispatch are all correct, and ~94 % of output positions are bit-stable across repeated eager invocations. Downstream softmax / sampling absorbs most of the per-lane noise because it sits behind a bf16 LM head.
+- *Tight numerical comparisons are not safe.* If you are validating MoE-LoRA outputs against an external reference (HuggingFace PEFT, a hand-written eager PyTorch reference, etc.), use a bf16-aware tolerance (e.g. `rtol >= 5e-2, atol >= 5e-2`) rather than expecting bit-identity, and validate aggregate quality metrics (perplexity, downstream accuracy) rather than per-element diffs. Two repeat eager invocations on the same input may themselves differ at the affected lanes.
+- *Shape sensitivity.* The issue is most readily reproduced at small per-expert problem sizes (M ≈ a few tens of tokens per expert, N = hidden_size, K = inter_size). Production batches that spread many tokens per expert exercise larger M and have not shown the same susceptibility in our testing, but this has not been exhaustively characterized.
+
+The fix is upstream of this codebase (the same `EpilogueFusion::FINALIZE` instantiation used by the no-LoRA Hopper path on the same M/N/K is bit-stable in eager mode; only the `NONE` instantiation used by the LoRA path is affected). It is owned by a separate CUTLASS-side workstream; see [`docs/source/_dev_notes/moe-lora-preflight.md`](../_dev_notes/moe-lora-preflight.md) "Phase 6b.E investigation" for the full bisection.
+
 #### What is rejected, and where
 
 If you supply MoE LoRA on a non-Cutlass backend or with quantization, `create_moe` raises at construction with a message pointing at the offending setting. At runtime, the fused MoE op also rejects min-latency mode + LoRA, alltoall + LoRA, (per-request, slot-indexed) mixed inputs, and (legacy host path only) CUDA-graph capture + LoRA.

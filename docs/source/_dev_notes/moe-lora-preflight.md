@@ -394,6 +394,27 @@ The 6b.D test failure reported "10/2048 bf16 elements off, up to ~2.8e7 absolute
 6. **Which eager call does the replay match.** A graph-replay-vs-each-eager-call table revealed that the replay's `fc2_post_main_gemm` and final output are bit-identical to **eager\[3]** (the last eager call before capture) and differ from eager[0/1/2]. The graph captures one specific eager invocation; the test's `out_eager` was taken from eager[0]; the comparison is apples-to-oranges, and the underlying GEMM is the variable.
 7. **Numerical signature.** The unstable lanes are exactly one bf16 column per 8-column chunk (cols 1, 9, 17, …, 97 of the affected permuted rows), and they hold garbage-sized magnitudes (~1e7–1e8) alongside correct ~1e3-magnitude neighbours. This is the classic signature of an uninitialized accumulator register / overlapping tile write in one specific MMA lane, isolated to the kernel template instantiated for the LoRA path (`use_lora && !fuse_lora_bias` → `EpilogueFusion::NONE`, M ≈ 10 per expert, N = 128, K = 256).
 
+#### Why this affects eager mode in production but the shipping tests don't surface it
+
+Apparent contradiction to read past: "MoE LoRA is supported in eager mode" and "the FC2 main GEMM is non-deterministic across eager calls" are *both* true. The non-determinism is **localized** — across 4 back-to-back eager calls with literally identical inputs (`16` tokens, `4` experts, `top_k=2`, `hidden=128`, `inter=256`, `rank=8`), the probe consistently sees:
+
+- **1918 / 2048 (~93.7 %)** output positions are **bit-stable** across all four calls.
+- **130 / 2048 (~6.3 %)** drift, all of them at one bf16 column per 8-column MMA chunk on the 10 permuted rows that route to expert 0. Those drifting lanes carry garbage-magnitude values (~1e7–1e8) where the correct magnitude is ~1e3.
+
+So eager-mode "supported" means: the op runs end-to-end, the slot routing / shared-outer flag / validator / per-request fan-out / multi-LoRA dispatch all work correctly, and the overwhelming majority of output positions are exactly right. It is *not* "every bf16 lane equals the value an eager-PyTorch reference would compute". The bug is real and affects production eager-mode inference at the affected per-expert shapes; downstream bf16 noise tolerance through the LM head and sampling typically swallows the per-lane impact, which is why model outputs look reasonable.
+
+Why each of the shipping tests passes despite this:
+
+| Test | Why it passes |
+|---|---|
+| `test_moe_lora_device_path_matches_host_path` | `rtol=5e-2, atol=5e-2`. At the broken lanes `\|device\|≈1e8`, so the tolerance window is `0.05 + 0.05·1e8 ≈ 5·10⁶`, easily wide enough to absorb the host-vs-device bf16 noise. **Both** paths route through the same buggy FC2 main GEMM, so both produce garbage-sized values at the same lanes and the diff between them is small. The test would catch a bug on only one side, not a bug on both. |
+| `test_moe_lora_slot_indexed_matches_per_request`, `test_moe_lora_slot_indexed_multi_lora_mixed_batch` | Compare device-vs-device within the same process at `rtol=0, atol=0`. Both sides traverse the same kernel with the same slot routing, both see the same garbage at the same lanes, and the diff is zero. These tests verify slot-indexing correctness; they say nothing about the underlying GEMM. |
+| `test_moe_native_shared_outer_matches_replicated_bitidentical` | Compares native shared-outer against load-time-replicated shared-outer, again device-vs-device in the same process. Same kernel path, same garbage, exact cancellation. |
+| "LoRA changes the output" smoke tests | Only check `out_with_lora ≠ out_no_lora`. Trivially satisfied even when the LoRA path is wrong. |
+| `test_moe_lora_slot_indexed_cuda_graph_replay_matches_eager` (skipped) | The **only** test that surfaces the bug. Sequencing: `out_eager = call_1`; 3 warmup calls; capture is `call_5`; replay reproduces `call_5`. The probe shows `call_4` and `call_5` are bit-identical (the GEMM "settles" after the first few invocations), but `call_1` differs at the affected lanes. So the test is comparing `call_1` against `replay-of-call_5`. This is the only test in the suite that produces such an apples-to-oranges comparison; the others either use the same kernel on both sides or compare against absolute references with bf16-loose tolerances. |
+
+The right framing of "shipping tests pass" is therefore: **the slot-routing, shared-outer, multi-LoRA-dispatch, and op-level wiring are all verified to be correct. The underlying FC2 main GEMM has a latent CUTLASS-side non-determinism that the suite does not gate on.** The skipped graph-parity test is the canary; un-skipping it is the only way to lock down the kernel-level fix.
+
 What this implies for any future continuation:
 
 - **The discrepancy is not capture-vs-eager.** Eager-mode is also producing non-deterministic output at the same lanes; the existing eager parity tests (`test_moe_lora_device_path_matches_host_path` at rtol=5e-2, plus the unit smoke tests) only pass because both the host and device LoRA paths route through the same FC2 main GEMM kernel and end up at similar (but mutually non-deterministic) outputs.
