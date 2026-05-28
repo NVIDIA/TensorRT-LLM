@@ -1979,7 +1979,13 @@ class W4A8NVFP4FP8LinearMethod(LinearMethodBase):
                     )
 
         # TODO: ModelOpt's o_proj.weight_scale_2 is bfloat16, which should be float32
-        input_scale = input_scale.to(torch.float32)
+        # NOTE(debug-bot iter-19): W4A8 emitted from FSDP QAT may omit input_scale
+        # (activation quant is done online per-token); fall back to 1.0 so the
+        # `force_dynamic_quantization` path in apply() takes over.
+        if input_scale is None:
+            input_scale = torch.tensor(1.0, dtype=torch.float32, device=device)
+        else:
+            input_scale = input_scale.to(torch.float32)
         weight_scale_2 = weight_scale_2.to(torch.float32)
         alpha = input_scale * weight_scale_2
         return input_scale, weight_scale, weight_scale_2, alpha
