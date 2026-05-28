@@ -13,7 +13,7 @@
 import types
 from collections import abc, defaultdict
 from dataclasses import dataclass
-from types import MethodType, SimpleNamespace
+from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import torch
