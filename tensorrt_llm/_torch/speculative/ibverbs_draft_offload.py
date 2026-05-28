@@ -93,6 +93,10 @@ class IbverbsDraftOffloadConfig:
     # POSIX shared-memory regions (``<shm_name>_t2d`` / ``<shm_name>_d2t``).
     # Default chosen to be unique enough for a typical single-pair test.
     shm_name: str = "pearl_shm_default"
+    # When ``transport == "cudaipc"``, the prefix of the CPU meta region
+    # names; the GPU data rings are exchanged via cudaIpc handles embedded
+    # in those meta regions. Same uniqueness requirement as ``shm_name``.
+    cudaipc_name: str = "pearl_ipc_default"
 
 
 def _env_int(name, default):
@@ -198,6 +202,16 @@ class IbverbsDraftOffloadLayer(_NN_MODULE_BASE):
                 payload_bytes=DraftApiProtocol.kMessageBytes,
             )
             self._endpoint = _ShmBackend(shm_cfg)
+        elif config.transport == "cudaipc":
+            from .cudaipc_endpoint import CudaIpcEndpointConfig, _CudaIpcBackend
+
+            ipc_cfg = CudaIpcEndpointConfig(
+                is_server=config.is_server,
+                name=getattr(config, "cudaipc_name", "pearl_ipc_default"),
+                recv_queue_depth=config.max_num_requests,
+                payload_bytes=DraftApiProtocol.kMessageBytes,
+            )
+            self._endpoint = _CudaIpcBackend(ipc_cfg)
         elif config.transport == "doca":
             from .doca_endpoint import DocaEndpointConfig, _DocaEndpointBackend
 
@@ -292,7 +306,7 @@ class IbverbsDraftOffloadLayer(_NN_MODULE_BASE):
         # model), then open the data-plane socket. Otherwise data-plane
         # connect() races a not-yet-ready draft.
         if (
-            self.config.transport in ("tcp", "ibverbs", "doca", "shm")
+            self.config.transport in ("tcp", "ibverbs", "doca", "shm", "cudaipc")
             and self.config.draft_model_path
         ):
             self._push_tcp_model_init()
@@ -427,6 +441,7 @@ class IbverbsDraftOffloadLayer(_NN_MODULE_BASE):
                     "nic_name": str(self.config.nic_name),
                     "max_num_requests": int(self.config.max_num_requests),
                     "shm_name": str(getattr(self.config, "shm_name", "")),
+                    "cudaipc_name": str(getattr(self.config, "cudaipc_name", "")),
                 }
             ),
         }

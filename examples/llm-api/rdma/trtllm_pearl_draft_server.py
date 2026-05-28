@@ -96,7 +96,7 @@ def _parse_args():
     )
     ap.add_argument(
         "--transport",
-        choices=["ibverbs", "tcp", "doca", "shm"],
+        choices=["ibverbs", "tcp", "doca", "shm", "cudaipc"],
         default="ibverbs",
         help="Data-plane transport expected from the target.",
     )

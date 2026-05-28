@@ -16,6 +16,7 @@ DRAFT_PORT="${DRAFT_PORT:-0}"
 TRANSPORT="${TRANSPORT:-ibverbs}"
 NIC="${NIC:-mlx5_0}"
 SHM_NAME="${SHM_NAME:-pearl_shm_default}"
+CUDAIPC_NAME="${CUDAIPC_NAME:-pearl_ipc_default}"
 TP_SIZE="${TP_SIZE:-1}"
 MAX_DRAFT_LEN="${MAX_DRAFT_LEN:-5}"
 MAX_TOKENS="${MAX_TOKENS:-1024}"
@@ -74,6 +75,9 @@ if [[ -n "${ATTN_BACKEND:-}" ]]; then
 fi
 if [[ "${TRANSPORT}" == "shm" ]]; then
   EXTRA_ARGS+=(--shm-name "${SHM_NAME}")
+fi
+if [[ "${TRANSPORT}" == "cudaipc" ]]; then
+  EXTRA_ARGS+=(--cudaipc-name "${CUDAIPC_NAME}")
 fi
 
 LAUNCHER=()

@@ -71,7 +71,7 @@ def main() -> int:
     )
     ap.add_argument(
         "--transport",
-        choices=["tcp", "ibverbs", "doca", "shm"],
+        choices=["tcp", "ibverbs", "doca", "shm", "cudaipc"],
         default="ibverbs",
         help="Draft offload transport.",
     )
@@ -87,6 +87,15 @@ def main() -> int:
         help=(
             "Shared-memory region prefix for --transport shm. Must match "
             "between target and draft when multiple PEARL pairs share the host."
+        ),
+    )
+    ap.add_argument(
+        "--cudaipc-name",
+        dest="cudaipc_name",
+        default="pearl_ipc_default",
+        help=(
+            "CPU meta-region prefix for --transport cudaipc (the GPU rings "
+            "are exchanged through cudaIpc handles stored inside)."
         ),
     )
     ap.add_argument("--prompt", default="Explain GPUDirect RDMA in one short sentence.")
@@ -325,12 +334,14 @@ def main() -> int:
             draft_offload_v2_tcp_prompt_port=args.draft_control_port,
             pearl_adaptive_gamma=args.adaptive_gamma,
         )
-        if args.transport in ("tcp", "ibverbs", "doca", "shm"):
+        if args.transport in ("tcp", "ibverbs", "doca", "shm", "cudaipc"):
             spec_kwargs["draft_offload_v2_model_path"] = args.draft_model
         if args.transport in ("ibverbs", "doca"):
             spec_kwargs["draft_offload_nic_name"] = args.nic
         if args.transport == "shm":
             spec_kwargs["draft_offload_v2_shm_name"] = args.shm_name
+        if args.transport == "cudaipc":
+            spec_kwargs["draft_offload_v2_cudaipc_name"] = args.cudaipc_name
         spec = PEARLDecodingConfig(**spec_kwargs)
         llm_kwargs = dict(
             model=args.target_model,

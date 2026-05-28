@@ -1502,13 +1502,17 @@ class DraftTargetDecodingConfig(DecodingBaseConfig):
     # for the spec-decode-over-RDMA progression phase 1 baseline (no RDMA
     # hardware required) and as a correctness reference when the draft
     # backend is being brought up.
-    draft_offload_v2_transport: Literal["ibverbs", "tcp", "doca",
-                                        "shm"] = "ibverbs"
+    draft_offload_v2_transport: Literal["ibverbs", "tcp", "doca", "shm",
+                                        "cudaipc"] = "ibverbs"
     # When ``draft_offload_v2_transport == "shm"``, the prefix of the POSIX
     # shared-memory regions used for the bidirectional SPSC rings. The
     # endpoint appends ``_t2d`` / ``_d2t`` suffixes, so this name uniquely
     # identifies one draft/target pair on the host. Ignored otherwise.
     draft_offload_v2_shm_name: str = "pearl_shm_default"
+    # When ``draft_offload_v2_transport == "cudaipc"``, prefix of the CPU
+    # meta region names that hold head/tail counters and the
+    # ``cudaIpcMemHandle_t`` payloads for the GPU device rings.
+    draft_offload_v2_cudaipc_name: str = "pearl_ipc_default"
     # When set, the target tells the draft server to lazy-load this model
     # path (via TcpModelInit) so a single bare draft server process can
     # serve different draft models depending on which target connects.

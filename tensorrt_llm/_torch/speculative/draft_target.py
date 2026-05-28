@@ -233,6 +233,13 @@ class DraftTargetOneModelWorker(SpecWorkerBase):
                         shm_name=str(
                             getattr(spec_config, "draft_offload_v2_shm_name", "pearl_shm_default")
                         ),
+                        cudaipc_name=str(
+                            getattr(
+                                spec_config,
+                                "draft_offload_v2_cudaipc_name",
+                                "pearl_ipc_default",
+                            )
+                        ),
                     )
                 )
             logger.info(
