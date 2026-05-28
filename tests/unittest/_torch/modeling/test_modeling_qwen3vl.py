@@ -158,12 +158,28 @@ class TestQwen3VL(TestModelingMultimodal):
                 gen_multimodal_params_list.append(multimodal_param)
             trtllm_inputs["multimodal_params"] = gen_multimodal_params_list
         else:
-            # Mrope position ids
+            # Mrope position ids. For chunked prefill / KV cache reuse we must
+            # mirror production ``PyTorchModelEngine`` behavior and slice the
+            # request's full ``mrope_position_ids`` to the current chunk's
+            # range -- the model now indexes mrope cos/sin by batch-flat
+            # per-token index, so the position_ids tensor must contain only
+            # the tokens of the current forward (chunk-local) with their
+            # correct (T, H, W) values.
+            chunk_len = input_ids.shape[-1]
+            if num_cached_tokens_per_seq is None:
+                begin_offsets = [0] * len(multimodal_params_list)
+            elif isinstance(num_cached_tokens_per_seq, int):
+                begin_offsets = [num_cached_tokens_per_seq] * len(
+                    multimodal_params_list)
+            else:
+                begin_offsets = list(num_cached_tokens_per_seq)
             mrope_position_ids = []
-            for multimodal_param in multimodal_params_list:
-                mrope_position_ids.append(
-                    multimodal_param.multimodal_data["mrope_config"]["mrope_position_ids"]
-                )
+            for multimodal_param, begin in zip(multimodal_params_list,
+                                               begin_offsets):
+                full_mrope = multimodal_param.multimodal_data["mrope_config"][
+                    "mrope_position_ids"]
+                mrope_position_ids.append(full_mrope[:, :,
+                                                     begin:begin + chunk_len])
             position_ids = torch.cat(mrope_position_ids, dim=-1)
             position_ids = position_ids.cuda()
             trtllm_inputs["position_ids"] = position_ids

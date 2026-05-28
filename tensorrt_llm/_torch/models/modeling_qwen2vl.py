@@ -1250,14 +1250,6 @@ class Qwen2VLModelBase(PreTrainedModel):
             is_neox=pos_embd_params.is_neox,
             mrope_section=pos_embd_params.mrope_section,
         ).to('cuda')
-        self.mrope_position_ids_padding_cuda = torch.zeros((
-            3,
-            1,
-            rope_config.max_position_embeddings,
-        ),
-                                                           dtype=torch.int32,
-                                                           device='cuda')
-
     def load_weights(self, weights, weight_mapper: BaseWeightMapper):
         pass
 
@@ -1274,18 +1266,24 @@ class Qwen2VLModelBase(PreTrainedModel):
                              num_generation_requests: int,
                              position_ids: torch.Tensor):
         mrope_config = {}
-        mrope_rotary_cos_sin = None
         mrope_position_deltas = []
-        if position_ids.shape[-1] > num_generation_requests:
-            if num_generation_requests > 0:
-                ctx_position_ids = position_ids[:, :, :-num_generation_requests]
-            else:
-                ctx_position_ids = position_ids
-            self.mrope_position_ids_padding_cuda[:, :, :ctx_position_ids.
-                                                 shape[-1]] = ctx_position_ids
-            cos, sin = self.rotary_emb.get_cos_sin(
-                self.mrope_position_ids_padding_cuda)
-            mrope_rotary_cos_sin = torch.stack((cos, sin), dim=-1).flatten(1)
+        # The attention kernel indexes mrope cos/sin by
+        # ``bounded_global_token_idx`` (batch-flat per-token entry), so we
+        # compute cos/sin once over the whole batch's already-stitched
+        # ``position_ids`` (3, 1, total_tokens). ``position_ids`` carries
+        # per-token (T, H, W) for multimodal spans and broadcast scalars for
+        # text-only / generation tokens, so a single ``get_cos_sin`` call
+        # produces the right per-token cos/sin for every batch entry -- no
+        # per-request loop, no chunk_end_pos padding, multi-context-request
+        # safe.
+        if position_ids is not None \
+                and position_ids.shape[-1] > num_generation_requests:
+            with nvtx_range("Qwen2.5-VL get_cos_sin"):
+                cos, sin = self.rotary_emb.get_cos_sin(position_ids)
+                mrope_config['mrope_rotary_cos_sin'] = (
+                    torch.stack((cos, sin), dim=-1)
+                    .reshape(cos.shape[0], -1)
+                )
 
         for multimodal_param in multimodal_params[num_context_requests:]:
             if multimodal_param.multimodal_data.get('mrope_config') is not None:
@@ -1295,8 +1293,6 @@ class Qwen2VLModelBase(PreTrainedModel):
                         multimodal_param.multimodal_data['mrope_config']
                         ['mrope_position_deltas'])
 
-        if mrope_rotary_cos_sin is not None:
-            mrope_config['mrope_rotary_cos_sin'] = mrope_rotary_cos_sin
         if mrope_position_deltas:
             mrope_config['mrope_position_deltas'] = (
                 mrope_position_deltas[0] if len(mrope_position_deltas) == 1 else
