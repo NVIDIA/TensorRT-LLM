@@ -78,7 +78,7 @@ Note: Support for other models may vary. Features marked "N/A" are not applicabl
 [^5]: Supported via the [AutoDeploy](../features/auto_deploy/auto-deploy.md) backend. See [AD Configs](../../../examples/auto_deploy/model_registry/configs).
 [^6]: Also supports text-only inference via the [AutoDeploy](../features/auto_deploy/auto-deploy.md) backend.
 [^7]: Text-only support via the [AutoDeploy](../features/auto_deploy/auto-deploy.md) backend.
-[^8]: Text-only support; the multimodal NVFP4 checkpoint loads the text decoder while the vision tower is ignored.
+[^8]: Supports text and image inputs. The vision tower runs in BF16 even when the text decoder is quantized (FP8 block-scale or NVFP4). The text decoder is also usable standalone (text-only) via the `Step3p5ForCausalLM` architecture.
 [^9]: Audio modality only supported on E2B/E4B variants.
 
 # Multimodal Feature Support Matrix (PyTorch Backend)
@@ -99,6 +99,7 @@ Note: Support for other models may vary. Features marked "N/A" are not applicabl
 | `Qwen2_5_VLForConditionalGeneration` | Yes               | Yes        | Yes             | Yes           | Yes              | Yes            | Yes                   | Yes                       | L + I + V |
 | `Qwen3VLForConditionalGeneration`    | Yes               | Yes        | Yes             | Yes           | Yes              | Yes            | Yes                   | Yes                       | L + I + V |
 | `Qwen3VLMoeForConditionalGeneration` | Yes               | Yes        | Yes             | Yes           | Yes              | Yes            | Yes                   | Yes                       | L + I + V |
+| `Step3p7ForConditionalGeneration`    | Yes               | Yes        | Untested        | Yes           | Untested         | Untested       | Untested              | Untested                  | L + I     |
 
 Note:
 - L: Language
