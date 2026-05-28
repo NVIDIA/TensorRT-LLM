@@ -377,19 +377,20 @@ class Mistral3InputProcessor(BaseMultimodalInputProcessor,
             use_fast=self.use_fast,
             trust_remote_code=trust_remote_code)
         self._model_path = model_path
+        auto_processor = AutoProcessor.from_pretrained(
+            model_path,
+            use_fast=self.use_fast,
+            trust_remote_code=trust_remote_code)
         if model_type == "mistral_large_3":
             # For mistral large 3, we add chat template in the model forward, and the
             # MistralCommonImageProcessor is used to process the input when both text and images are provided.
             # When the input only contains text, we use the text processor to process the input.
             self._processor = MistralCommonImageProcessor(
                 tokenizer=self._tokenizer, dtype=self.dtype)
-            self.text_processor = self._processor
+            self.text_processor = auto_processor
         else:
             # For other mistral models, we use the AutoProcessor to process the input.
-            self._processor = AutoProcessor.from_pretrained(
-                model_path,
-                use_fast=self.use_fast,
-                trust_remote_code=trust_remote_code)
+            self._processor = auto_processor
             self.text_processor = self._processor
 
     @property
