@@ -1146,19 +1146,10 @@ void invokeIndexerTopKDecodeImpl(InputT const* logits, int const* seqLens, int* 
     int const* preIdx, int const preIdxStride, int const preIdxCount, InputT* heuristicScratch,
     cudaStream_t const stream, void* scratch, size_t scratchBytes, bool is_prefill)
 {
-    // kSortingAlgorithmThreshold no longer selects the final-sort algorithm
-    // (that's runtime now — see the sort-selection block in topKPerRowJob).
-    // Gates the CTA-width choice inside the single-block tier between a
-    // 256-thread "narrow" block (more occupancy, used when the per-row scan
-    // is short) and a 512-thread "wide" block (more per-row parallelism).
-    // High-bs tiers were dropped because GVR owns numRows >= 64 ∧
-    // numColumns >= 32k; for the remaining shapes the upstream default
-    // 12288 is correct.
-    int const kSortingAlgorithmThreshold = is_prefill ? (1 << 30) : 12288;
     // Split-work tier cutoff: callers can still override with `splitWorkThreshold > 0`.
     //   numRows > 8:          200k (upstream default).
-    //   numRows <= 8:         fused split-work earlier (65k) — low-bs path
-    //                         under-uses the GPU otherwise.
+    //   numRows <= 8:         multi-pass radix kicks in earlier (65k) —
+    //                         low-bs path under-uses the GPU otherwise.
     // The high-bs tiers were dropped: bs >= 64 with seq >= 32k is owned by
     // GVR; bs >= 64 with seq < 32k always falls into single-block (32k <
     // 200k).
@@ -1167,16 +1158,6 @@ void invokeIndexerTopKDecodeImpl(InputT const* logits, int const* seqLens, int* 
                                                       : 65 * 1024;
     int const effectiveSplitWorkThreshold = splitWorkThreshold > 0 ? splitWorkThreshold : adaptiveSplitWorkThreshold;
     constexpr int kNumThreadsPerBlock = 512;
-    constexpr int kNumThreadsPerBlockNarrow = 256;
-
-    // Within the single-block path, 256-thread CTAs unlock more occupancy at
-    // high bs but 512-thread CTAs win for low bs (per-row parallelism). The
-    // bound on totalWork avoids picking 256 threads for high-bs but tiny
-    // rows. The 256-thread variant is only safe when the per-row scan is
-    // short enough — kSortingAlgorithmThreshold caps that.
-    bool const useNarrowBlock = (numRows >= 256)
-        && (static_cast<int64_t>(numRows) * numColumns >= (4LL << 20))
-        && (numColumns < kSortingAlgorithmThreshold);
 
     // GVR ↔ TPR routing rule: GVR for bs >= 64 ∧ seq >= 32k (its
     // fixed-overhead Phase-1/4 pays back at this size). Everything below
@@ -1209,38 +1190,21 @@ void invokeIndexerTopKDecodeImpl(InputT const* logits, int const* seqLens, int* 
     }
     else if (numColumns < effectiveSplitWorkThreshold)
     {
-        // Single-block adaptive: insertion vs radix sort is picked at runtime
-        // inside topKPerRowJob based on the threshold-bin candidate count.
-        // CTA width is picked here based on useNarrowBlock (256 vs 512).
-        auto launchSingleBlock = [&](auto kernel_instance, int blockDim)
-        {
-            cudaLaunchConfig_t config;
-            config.gridDim = numRows;
-            config.blockDim = blockDim;
-            config.dynamicSmemBytes = topK * sizeof(int32_t);
-            config.stream = stream;
-            cudaLaunchAttribute attrs[1];
-            attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
-            attrs[0].val.programmaticStreamSerializationAllowed = tensorrt_llm::common::getEnvEnablePDL();
-            config.numAttrs = 1;
-            config.attrs = attrs;
-
-            cudaLaunchKernelEx(&config, kernel_instance, logits, seqLens, indices, stride0, stride1, topK, next_n,
-                /*outLogits=*/nullptr, /*numBlocksToMerge=*/0, /*indices=*/nullptr);
-        };
-
-        if (useNarrowBlock)
-        {
-            launchSingleBlock(&topKPerRowDecode<kNumThreadsPerBlockNarrow, /*multipleBlocksPerRow=*/false,
-                                  /*mergeBlocks=*/false, InputT>,
-                kNumThreadsPerBlockNarrow);
-        }
-        else
-        {
-            launchSingleBlock(&topKPerRowDecode<kNumThreadsPerBlock, /*multipleBlocksPerRow=*/false,
-                                  /*mergeBlocks=*/false, InputT>,
-                kNumThreadsPerBlock);
-        }
+        // Single-block tier: one CTA per row.
+        auto* kernel_instance = &topKPerRowDecode<kNumThreadsPerBlock, /*multipleBlocksPerRow=*/false,
+            /*mergeBlocks=*/false, InputT>;
+        cudaLaunchConfig_t config;
+        config.gridDim = numRows;
+        config.blockDim = kNumThreadsPerBlock;
+        config.dynamicSmemBytes = topK * sizeof(int32_t);
+        config.stream = stream;
+        cudaLaunchAttribute attrs[1];
+        attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+        attrs[0].val.programmaticStreamSerializationAllowed = tensorrt_llm::common::getEnvEnablePDL();
+        config.numAttrs = 1;
+        config.attrs = attrs;
+        cudaLaunchKernelEx(&config, kernel_instance, logits, seqLens, indices, stride0, stride1, topK, next_n,
+            /*outLogits=*/nullptr, /*numBlocksToMerge=*/0, /*indices=*/nullptr);
     }
     else
     {
