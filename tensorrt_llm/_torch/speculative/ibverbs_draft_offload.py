@@ -615,21 +615,69 @@ class IbverbsDraftOffloadLayer(_NN_MODULE_BASE):
         )
 
     def _send_requests(
-        self, request_ids, accepted_tokens, num_accepted_tokens, request_start_positions=None
+        self,
+        request_ids,
+        accepted_tokens,
+        num_accepted_tokens,
+        request_start_positions=None,
+        gpu_accepted_tokens=None,
+        gpu_num_accepted_tokens=None,
     ):
         if request_start_positions is None:
             request_start_positions = [0] * len(request_ids)
         if len(request_start_positions) != len(request_ids):
             raise ValueError("request_start_positions length must match request_ids")
 
+        # Stage 3 (cudaipc + GPU compose): if the endpoint advertises the
+        # ``set_next_send_gpu_tokens`` hook AND the caller handed us the
+        # underlying GPU tensors, the kernel can read ``last_token``
+        # directly from device memory and skip the CPU-side ``.item()`` in
+        # ``_build_target_to_draft_message``.
+        endpoint = getattr(self._channel, "_endpoint", None)
+        use_gpu_compose = (
+            gpu_accepted_tokens is not None
+            and gpu_num_accepted_tokens is not None
+            and endpoint is not None
+            and hasattr(endpoint, "set_next_send_gpu_tokens")
+        )
+        max_draft_width = int(gpu_accepted_tokens.shape[1]) if use_gpu_compose else 0
+
         for row, request_id in enumerate(request_ids):
-            message = self._build_target_to_draft_message(
-                request_id,
-                accepted_tokens,
-                num_accepted_tokens,
-                row,
-                request_start_positions[row],
-            )
+            if use_gpu_compose:
+                round_seq = self._next_round_seq(request_id)
+                # Build a placeholder message; the kernel overwrites
+                # tokens[0] with the GPU-resident last accepted token. The
+                # CPU-side message still flows through the channel layer
+                # so the imm_data packing / route lookup paths stay shared.
+                message = self._protocol.Message(
+                    version=self._protocol.kVersionV1,
+                    message_type=self._protocol.MessageType.kTargetToDraft,
+                    round_seq_num=round_seq,
+                    position=int(request_start_positions[row]),
+                    num_tokens=1,
+                    tokens=[0] * self._protocol.kMaxTokens,
+                )
+                # Hand the GPU pointers to the endpoint. Row slicing is a
+                # contiguous view in the common case (max_draft_len
+                # innermost dim), so ``.data_ptr()`` is the row start.
+                endpoint.set_next_send_gpu_tokens(
+                    int(gpu_accepted_tokens[row].data_ptr()),
+                    int(gpu_num_accepted_tokens[row : row + 1].data_ptr()),
+                    max_draft_width,
+                    round_seq,
+                    int(request_start_positions[row]),
+                    int(self._protocol.kVersionV1),
+                    int(self._protocol.MessageType.kTargetToDraft),
+                    1,
+                )
+            else:
+                message = self._build_target_to_draft_message(
+                    request_id,
+                    accepted_tokens,
+                    num_accepted_tokens,
+                    row,
+                    request_start_positions[row],
+                )
             status = self._channel.send_for_request(
                 request_id,
                 msg_type=int(self._protocol.MessageType.kTargetToDraft),
@@ -974,6 +1022,12 @@ class IbverbsDraftOffloadLayer(_NN_MODULE_BASE):
             pinned_accepted,
             pinned_num_accepted,
             request_start_positions=request_start_positions,
+            # Stage 3 path (cudaipc): if the endpoint accepts a GPU-tensor
+            # handoff, pass the underlying device tensors so the kernel
+            # can read ``last_token`` directly from GPU memory. Other
+            # transports ignore these and use the pinned-CPU views above.
+            gpu_accepted_tokens=accepted_tokens,
+            gpu_num_accepted_tokens=num_accepted_tokens,
         )
         return self._receive_responses(request_ids, accepted_tokens.device)
 

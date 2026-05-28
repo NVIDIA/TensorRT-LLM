@@ -85,6 +85,18 @@ _USE_KERNEL_SEND = _os.environ.get("PEARL_CUDAIPC_KERNEL_SEND", "1").strip() not
     "off",
     "",
 )
+# Env knob -- stage 3 path. When enabled, the spec dec layer can pass GPU
+# tensor pointers for ``accepted_tokens`` and ``num_accepted_tokens`` to
+# the backend via ``set_next_send_gpu_tokens``; the send kernel then reads
+# the verified ``last_token`` directly from GPU memory and assembles the
+# protocol frame on-device, removing the CPU-side ``.item()``.
+_USE_GPU_COMPOSE = _os.environ.get("PEARL_CUDAIPC_GPU_COMPOSE", "1").strip() not in (
+    "0",
+    "false",
+    "no",
+    "off",
+    "",
+)
 
 # ---------------------------------------------------------------------------
 # CUDA runtime API binding -- imported lazily so this module stays importable
@@ -232,6 +244,13 @@ class _CudaIpcBackend:
 
         # Stage 2: lazily-initialized reusable kernel launcher.
         self._ring_launcher = None  # RingWriteLauncher | None
+        # Stage 3: optional GPU-tensor handoff for the next ``send`` so the
+        # compose kernel can read ``last_token`` directly from device memory.
+        # The spec dec layer sets this immediately before each
+        # ``channel.send_for_request`` call; consumed (cleared) inside
+        # ``send`` to avoid stale pointers leaking to the next packet.
+        self._next_gpu_compose = None  # tuple | None
+        self._compose_launcher = None  # RingComposeLauncher | None
 
         self._recv_credits = 0
         self._started = False
@@ -410,6 +429,37 @@ class _CudaIpcBackend:
             else EndpointStatus.kEmpty
         )
 
+    def set_next_send_gpu_tokens(
+        self,
+        accepted_tokens_row_ptr: int,
+        num_accepted_ptr: int,
+        max_draft_len: int,
+        round_seq: int,
+        position: int,
+        version: int,
+        message_type: int,
+        num_tokens: int,
+    ) -> None:
+        """Stage 3 handoff: stash GPU pointers + protocol scalars so the
+        next ``send`` call assembles the frame in a CUDA kernel that
+        reads the verified ``last_token`` directly from device memory.
+
+        Caller (PEARL spec dec layer) must set this exactly once per
+        ``send`` invocation; the data is consumed inside ``send``. Stale
+        pointers would silently corrupt subsequent frames, so a missing
+        handoff falls back to the stage-2 path (CPU-built packet).
+        """
+        self._next_gpu_compose = (
+            int(accepted_tokens_row_ptr),
+            int(num_accepted_ptr),
+            int(max_draft_len),
+            int(round_seq) & 0xFFFFFFFF,
+            int(position) & 0xFFFFFFFF,
+            int(version) & 0xFF,
+            int(message_type) & 0xFF,
+            int(num_tokens) & 0xFF,
+        )
+
     def send(self, packet):
         if not self._started or self._meta_out is None:
             return EndpointStatus.kNotStarted
@@ -429,6 +479,47 @@ class _CudaIpcBackend:
 
         cudart = _load_cudart()
         slot_offset = (head % _RING_SLOTS) * _FRAME_BYTES
+
+        # Stage 3 path: if the caller stashed GPU pointers, use the compose
+        # kernel and consume the handoff. Falls through to stage 2 / 1 if
+        # the handoff wasn't set (e.g., during the prompt-init handshake
+        # where the channel layer's payload bytes are the authoritative
+        # source).
+        if _USE_GPU_COMPOSE and self._next_gpu_compose is not None:
+            handoff = self._next_gpu_compose
+            self._next_gpu_compose = None  # consume
+            if self._compose_launcher is None:
+                try:
+                    from .pearl_ring_kernel import RingComposeLauncher
+
+                    self._compose_launcher = RingComposeLauncher(self._stream)
+                except Exception:
+                    # Fall back to stage-2 path on compose-kernel failure.
+                    self._compose_launcher = None
+            if self._compose_launcher is not None:
+                try:
+                    self._compose_launcher.compose_and_send(
+                        self._dev_out,
+                        slot_offset,
+                        int(packet.imm_data) & 0xFFFFFFFF,
+                        handoff[3],  # round_seq
+                        handoff[4],  # position
+                        handoff[5],  # version
+                        handoff[6],  # message_type
+                        handoff[7],  # num_tokens
+                        handoff[0],  # accepted_tokens_row_ptr
+                        handoff[1],  # num_accepted_ptr
+                        handoff[2],  # max_draft_len
+                    )
+                    (status,) = cudart.cudaStreamSynchronize(self._stream)
+                    if int(status) != 0:
+                        return EndpointStatus.kError
+                    self._meta_out.set_head(head + 1)
+                    self._recv_credits -= 1
+                    return EndpointStatus.kOk
+                except Exception:
+                    # On kernel failure, fall through to the stage-2 path.
+                    pass
 
         if _USE_KERNEL_SEND:
             # Stage 2 path: launch a single-thread kernel that copies the
@@ -582,6 +673,9 @@ class _CudaIpcBackend:
         # on outstanding memoryviews.
         self._meta_out = None
         self._meta_in = None
+        self._ring_launcher = None
+        self._compose_launcher = None
+        self._next_gpu_compose = None
 
         cudart = _load_cudart() if _cudart is not None else None
 
