@@ -51,6 +51,7 @@ class Attention(nn.Module):
         fuse_qk_norm_rope: Optional[bool] = None,
         config: Optional[DiffusionModelConfig] = None,
         layer_idx: Optional[int] = None,
+        enable_ulysses: bool = True,  # make this enable sequence parallelism
     ):
         super().__init__()
 
@@ -132,7 +133,7 @@ class Attention(nn.Module):
         # Currently kept as mutually exclusive.
         attn2d_size = (vgm.attn2d_row_size * vgm.attn2d_col_size) if vgm else 1
         use_attn2d = attn2d_size > 1 and self.qkv_mode != QKVMode.SEPARATE_QKV
-        use_ulysses = ulysses_size > 1 and self.qkv_mode != QKVMode.SEPARATE_QKV
+        use_ulysses = ulysses_size > 1 and enable_ulysses
 
         # Compute head counts for the backend
         # Ulysses shards heads across workers; inner backend sees sharded count

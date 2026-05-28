@@ -10,6 +10,19 @@ from transformers import (AutoTokenizer, PreTrainedTokenizerBase,
 from .._utils import nvtx_range_debug
 from ..logger import logger
 
+# Transformers 5.x moved ``bytes_to_unicode`` out of
+# ``transformers.models.gpt2.tokenization_gpt2`` into
+# ``transformers.convert_slow_tokenizer``. Some ``trust_remote_code=True``
+# checkpoints (e.g. Kimi-K2's ``tokenization_kimi.py``) still import it from
+# the legacy location; re-export the symbol so those tokenizers keep loading.
+try:
+    from transformers.models.gpt2 import tokenization_gpt2 as _gpt2_mod
+    if not hasattr(_gpt2_mod, "bytes_to_unicode"):
+        from transformers.convert_slow_tokenizer import bytes_to_unicode
+        _gpt2_mod.bytes_to_unicode = bytes_to_unicode
+except ImportError:
+    pass
+
 # Aliases for built-in custom tokenizers.
 TOKENIZER_ALIASES = {
     "deepseek_v32": "tensorrt_llm.tokenizer.deepseek_v32.DeepseekV32Tokenizer",

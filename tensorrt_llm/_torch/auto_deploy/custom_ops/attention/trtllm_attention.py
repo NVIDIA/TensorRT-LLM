@@ -852,7 +852,7 @@ class TrtllmAttention(AttentionDescriptor):
     def get_cache_initializers(
         cls, source_attn_node: Node, cache_config: KvCacheConfig
     ) -> ResourceHandlerDict:
-        """Return only KV cache handler (no workspace handler, managed like flashinfer)."""
+        """Return only the KV cache handler (no workspace handler; managed like flashinfer)."""
         # In fused QKV mode, K arg is the same as Q (flat fused tensor), so use hints.
         if source_attn_node.meta.get("_trtllm_fused_qkv"):
             num_kv_heads = source_attn_node.meta["_trtllm_num_kv_heads"]
@@ -876,6 +876,10 @@ class TrtllmAttention(AttentionDescriptor):
             num_kv_heads = k_fake.shape[2]
             head_dim = k_fake.shape[3]
             kv_dtype = k_fake.dtype
+        # ``sliding_window`` is propagated into the handler so layers
+        # with different windows land in separate pools.
+        (sw,) = extract_op_args(source_attn_node, "sliding_window")
+        sliding_window = sw if isinstance(sw, int) and sw > 0 else 0
 
         return {
             "kv_cache": KVPagedResourceHandler(
@@ -884,6 +888,7 @@ class TrtllmAttention(AttentionDescriptor):
                 dtype=cls.resolve_cache_dtype(cache_config.dtype, kv_dtype),
                 kv_factor=2,
                 kv_layout="HND",
+                sliding_window=sliding_window,
             )
         }
 
