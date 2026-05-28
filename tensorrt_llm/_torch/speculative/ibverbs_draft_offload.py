@@ -38,6 +38,9 @@ except Exception:  # pragma: no cover — kept importable without torch
     torch = None  # type: ignore
     _NN_MODULE_BASE = object  # type: ignore
 
+from tensorrt_llm._utils import prefer_pinned
+
+from .pearl_trace import enabled as _pearl_trace_enabled
 from .pearl_trace import log as _pearl_log
 from .pearl_trace import to_int_list as _pearl_to_int_list
 
@@ -86,6 +89,10 @@ class IbverbsDraftOffloadConfig:
     draft_model_path: Optional[str] = None
     draft_model_dtype: str = "bfloat16"
     draft_kv_cache_free_fraction: float = 0.4
+    # When ``transport == "shm"``, both peers attach the same pair of
+    # POSIX shared-memory regions (``<shm_name>_t2d`` / ``<shm_name>_d2t``).
+    # Default chosen to be unique enough for a typical single-pair test.
+    shm_name: str = "pearl_shm_default"
 
 
 def _env_int(name, default):
@@ -181,6 +188,16 @@ class IbverbsDraftOffloadLayer(_NN_MODULE_BASE):
                 payload_bytes=DraftApiProtocol.kMessageBytes,
             )
             self._endpoint = _TcpRdmaBackend(tcp_cfg)
+        elif config.transport == "shm":
+            from .shm_endpoint import ShmEndpointConfig, _ShmBackend
+
+            shm_cfg = ShmEndpointConfig(
+                is_server=config.is_server,
+                shm_name=getattr(config, "shm_name", "pearl_shm_default"),
+                recv_queue_depth=config.max_num_requests,
+                payload_bytes=DraftApiProtocol.kMessageBytes,
+            )
+            self._endpoint = _ShmBackend(shm_cfg)
         elif config.transport == "doca":
             from .doca_endpoint import DocaEndpointConfig, _DocaEndpointBackend
 
@@ -252,6 +269,17 @@ class IbverbsDraftOffloadLayer(_NN_MODULE_BASE):
         self._tcp_prompt_timeout_s = 30.0
         self._prompt_pushed_requests = set()
 
+        # Sync-batching: every cycle's send path needs accepted_tokens /
+        # num_accepted_tokens / position_ids values on the host (to build the
+        # protocol message). Naively each is read via .item()/.cpu().tolist(),
+        # producing ~5-8 host-device syncs per cycle. Prefetch all three into
+        # pre-allocated pinned host buffers with a SINGLE stream sync; the
+        # CPU-side reads that follow become memory loads, not GPU round-trips.
+        self._pearl_trace_enabled_send = _pearl_trace_enabled("target")
+        self._pinned_accepted_buf = None  # lazy-init on first forward()
+        self._pinned_num_accepted_buf = None
+        self._pinned_positions_buf = None
+
     # ------------------------------------------------------------------
     # Lifecycle / route management
     # ------------------------------------------------------------------
@@ -263,7 +291,10 @@ class IbverbsDraftOffloadLayer(_NN_MODULE_BASE):
         # server which model to load FIRST (slow — minutes for an 8B
         # model), then open the data-plane socket. Otherwise data-plane
         # connect() races a not-yet-ready draft.
-        if self.config.transport in ("tcp", "ibverbs", "doca") and self.config.draft_model_path:
+        if (
+            self.config.transport in ("tcp", "ibverbs", "doca", "shm")
+            and self.config.draft_model_path
+        ):
             self._push_tcp_model_init()
         status = self._channel.start()
         if status != self._channel_cls.Status.kOk:
@@ -395,6 +426,7 @@ class IbverbsDraftOffloadLayer(_NN_MODULE_BASE):
                     "data_port": int(self.config.server_port),
                     "nic_name": str(self.config.nic_name),
                     "max_num_requests": int(self.config.max_num_requests),
+                    "shm_name": str(getattr(self.config, "shm_name", "")),
                 }
             ),
         }
@@ -594,29 +626,32 @@ class IbverbsDraftOffloadLayer(_NN_MODULE_BASE):
                     % (request_id, self._channel_cls.to_string(status))
                 )
             self._pending_round_seq_by_request[request_id] = int(message.round_seq_num)
-            _pearl_log(
-                "target",
-                "send_target_to_draft",
-                request_id=int(request_id),
-                round_seq=int(message.round_seq_num),
-                position=int(message.position),
-                num_tokens=int(message.num_tokens),
-                last_token=int(message.tokens[0]),
-                accepted_token_count=int(num_accepted_tokens[row].item()),
-                accepted_tokens=_pearl_to_int_list(
-                    accepted_tokens[row],
-                    limit=int(
-                        max(0, min(accepted_tokens.shape[1], num_accepted_tokens[row].item()))
+            # Trace fields are eagerly evaluated by Python, so even with the
+            # log path disabled the build cost is paid. Gate the whole call.
+            if self._pearl_trace_enabled_send:
+                _pearl_log(
+                    "target",
+                    "send_target_to_draft",
+                    request_id=int(request_id),
+                    round_seq=int(message.round_seq_num),
+                    position=int(message.position),
+                    num_tokens=int(message.num_tokens),
+                    last_token=int(message.tokens[0]),
+                    accepted_token_count=int(num_accepted_tokens[row].item()),
+                    accepted_tokens=_pearl_to_int_list(
+                        accepted_tokens[row],
+                        limit=int(
+                            max(0, min(accepted_tokens.shape[1], num_accepted_tokens[row].item()))
+                        ),
                     ),
-                ),
-                packet={
-                    "message_type": int(self._protocol.MessageType.kTargetToDraft),
-                    "round_seq_num": int(message.round_seq_num),
-                    "position": int(message.position),
-                    "num_tokens": int(message.num_tokens),
-                    "tokens": [int(t) for t in message.tokens],
-                },
-            )
+                    packet={
+                        "message_type": int(self._protocol.MessageType.kTargetToDraft),
+                        "round_seq_num": int(message.round_seq_num),
+                        "position": int(message.position),
+                        "num_tokens": int(message.num_tokens),
+                        "tokens": [int(t) for t in message.tokens],
+                    },
+                )
             _debug_trace(
                 "_send_requests req_id=%s round_seq=%s start=%s last_token=%s",
                 request_id,
@@ -727,27 +762,28 @@ class IbverbsDraftOffloadLayer(_NN_MODULE_BASE):
                     dtype=torch.int32,
                     device=device,
                 )
-            _pearl_log(
-                "target",
-                "recv_draft_to_target",
-                request_id=int(request_id),
-                route={
-                    "stream_id": int(received.imm_data.stream_id),
-                    "slot": int(received.imm_data.slot),
-                    "msg_type": int(received.imm_data.msg_type),
-                },
-                round_seq=int(received.message.round_seq_num),
-                position=int(received.message.position),
-                num_tokens=int(received.message.num_tokens),
-                draft_tokens=[int(t) for t in received.message.tokens[:token_count]],
-                packet={
-                    "message_type": int(self._protocol.MessageType.kDraftToTarget),
-                    "round_seq_num": int(received.message.round_seq_num),
-                    "position": int(received.message.position),
-                    "num_tokens": int(received.message.num_tokens),
-                    "tokens": [int(t) for t in received.message.tokens],
-                },
-            )
+            if self._pearl_trace_enabled_send:
+                _pearl_log(
+                    "target",
+                    "recv_draft_to_target",
+                    request_id=int(request_id),
+                    route={
+                        "stream_id": int(received.imm_data.stream_id),
+                        "slot": int(received.imm_data.slot),
+                        "msg_type": int(received.imm_data.msg_type),
+                    },
+                    round_seq=int(received.message.round_seq_num),
+                    position=int(received.message.position),
+                    num_tokens=int(received.message.num_tokens),
+                    draft_tokens=[int(t) for t in received.message.tokens[:token_count]],
+                    packet={
+                        "message_type": int(self._protocol.MessageType.kDraftToTarget),
+                        "round_seq_num": int(received.message.round_seq_num),
+                        "position": int(received.message.position),
+                        "num_tokens": int(received.message.num_tokens),
+                        "tokens": [int(t) for t in received.message.tokens],
+                    },
+                )
             pending.discard(request_id)
 
         self.last_response_token_counts = next_draft_token_counts
@@ -756,6 +792,54 @@ class IbverbsDraftOffloadLayer(_NN_MODULE_BASE):
     # ------------------------------------------------------------------
     # forward
     # ------------------------------------------------------------------
+
+    def _prefetch_send_data_to_pinned(
+        self, accepted_tokens, num_accepted_tokens, position_ids, batch_size
+    ):
+        """Copy GPU verify-state tensors to pinned host buffers in one shot.
+
+        Returns CPU-resident views backed by pinned memory; downstream
+        ``.item()`` / ``.tolist()`` calls on these are pure memory loads and
+        no longer trigger host-device syncs. A single
+        ``current_stream().synchronize()`` here replaces the per-value syncs
+        previously scattered across ``_extract_last_accepted_token`` (x2),
+        ``_resolve_request_start_positions`` (x1), and the eager kwarg
+        evaluation inside ``_pearl_log`` (x3+).
+        """
+        max_req = int(self.config.max_num_requests)
+        width = int(accepted_tokens.shape[1])
+
+        if (
+            self._pinned_accepted_buf is None
+            or self._pinned_accepted_buf.shape[0] < max_req
+            or self._pinned_accepted_buf.shape[1] < width
+        ):
+            self._pinned_accepted_buf = torch.empty(
+                (max_req, width), dtype=torch.int32, pin_memory=prefer_pinned()
+            )
+        if (
+            self._pinned_num_accepted_buf is None
+            or self._pinned_num_accepted_buf.shape[0] < max_req
+        ):
+            self._pinned_num_accepted_buf = torch.empty(
+                (max_req,), dtype=torch.int32, pin_memory=prefer_pinned()
+            )
+        if self._pinned_positions_buf is None or self._pinned_positions_buf.shape[0] < max_req:
+            self._pinned_positions_buf = torch.empty(
+                (max_req,), dtype=torch.int64, pin_memory=prefer_pinned()
+            )
+
+        pinned_acc = self._pinned_accepted_buf[:batch_size, :width]
+        pinned_acc.copy_(accepted_tokens, non_blocking=True)
+        pinned_num = self._pinned_num_accepted_buf[:batch_size]
+        pinned_num.copy_(num_accepted_tokens.flatten()[:batch_size], non_blocking=True)
+        pinned_pos = self._pinned_positions_buf[:batch_size]
+        pinned_pos.copy_(position_ids.flatten()[:batch_size], non_blocking=True)
+        # One host-device sync covers all three async copies above. Without
+        # this, the first .item() read below would force the sync anyway and
+        # subsequent reads would each issue their own.
+        torch.cuda.current_stream().synchronize()
+        return pinned_acc, pinned_num, pinned_pos
 
     def _run_batch1_graph_fast_path(
         self, request_id, position_ids, accepted_tokens, num_accepted_tokens
@@ -833,10 +917,18 @@ class IbverbsDraftOffloadLayer(_NN_MODULE_BASE):
 
         self.bind_requests(request_ids)
 
+        # Pull verify-state values to pinned host once. Downstream code
+        # (EOS check, position resolution, message build, optional trace)
+        # operates on these CPU tensors so .item()/.tolist() reads no longer
+        # round-trip to the GPU.
+        pinned_accepted, pinned_num_accepted, pinned_positions = self._prefetch_send_data_to_pinned(
+            accepted_tokens, num_accepted_tokens, position_ids, batch_size
+        )
+
         # Step 3: short-circuit Llama-3 terminal tokens (don't bother LPU).
         if len(request_ids) == 1 and int(batch_size) == 1:
             last_token = self._extract_last_accepted_token(
-                accepted_tokens, num_accepted_tokens, row=0
+                pinned_accepted, pinned_num_accepted, row=0
             )
             if last_token in LLAMA3_TERMINAL_TOKENS:
                 self.unbind_requests([request_ids[0]])
@@ -861,11 +953,11 @@ class IbverbsDraftOffloadLayer(_NN_MODULE_BASE):
                 return res
 
         # Step 5: ordinary send / recv round-trip.
-        request_start_positions = self._resolve_request_start_positions(position_ids, batch_size)
+        request_start_positions = [int(pinned_positions[i]) for i in range(batch_size)]
         self._send_requests(
             request_ids,
-            accepted_tokens,
-            num_accepted_tokens,
+            pinned_accepted,
+            pinned_num_accepted,
             request_start_positions=request_start_positions,
         )
         return self._receive_responses(request_ids, accepted_tokens.device)

@@ -15,6 +15,7 @@ DRAFT_CONTROL_PORT="${DRAFT_CONTROL_PORT:-47331}"
 DRAFT_PORT="${DRAFT_PORT:-0}"
 TRANSPORT="${TRANSPORT:-ibverbs}"
 NIC="${NIC:-mlx5_0}"
+SHM_NAME="${SHM_NAME:-pearl_shm_default}"
 TP_SIZE="${TP_SIZE:-1}"
 MAX_DRAFT_LEN="${MAX_DRAFT_LEN:-5}"
 MAX_TOKENS="${MAX_TOKENS:-1024}"
@@ -71,6 +72,9 @@ fi
 if [[ -n "${ATTN_BACKEND:-}" ]]; then
   EXTRA_ARGS+=(--attn-backend "${ATTN_BACKEND}")
 fi
+if [[ "${TRANSPORT}" == "shm" ]]; then
+  EXTRA_ARGS+=(--shm-name "${SHM_NAME}")
+fi
 
 LAUNCHER=()
 if [[ "${NSYS}" == "1" || "${NSYS}" == "true" ]]; then
@@ -85,6 +89,7 @@ if [[ "${NSYS}" == "1" || "${NSYS}" == "true" ]]; then
     --delay=${NSYS_DELAY:-280}
     --duration=${NSYS_DURATION:-30}
     --capture-range=none
+    --kill=none
     --force-overwrite=true)
   echo "nsys_out: ${NSYS_OUT}.nsys-rep (delay=${NSYS_DELAY:-280}s duration=${NSYS_DURATION:-30}s)"
 fi

@@ -71,7 +71,7 @@ def main() -> int:
     )
     ap.add_argument(
         "--transport",
-        choices=["tcp", "ibverbs", "doca"],
+        choices=["tcp", "ibverbs", "doca", "shm"],
         default="ibverbs",
         help="Draft offload transport.",
     )
@@ -79,6 +79,15 @@ def main() -> int:
         "--nic",
         default="mlx5_0",
         help="NIC device for --transport ibverbs.",
+    )
+    ap.add_argument(
+        "--shm-name",
+        dest="shm_name",
+        default="pearl_shm_default",
+        help=(
+            "Shared-memory region prefix for --transport shm. Must match "
+            "between target and draft when multiple PEARL pairs share the host."
+        ),
     )
     ap.add_argument("--prompt", default="Explain GPUDirect RDMA in one short sentence.")
     ap.add_argument(
@@ -316,10 +325,12 @@ def main() -> int:
             draft_offload_v2_tcp_prompt_port=args.draft_control_port,
             pearl_adaptive_gamma=args.adaptive_gamma,
         )
-        if args.transport in ("tcp", "ibverbs", "doca"):
+        if args.transport in ("tcp", "ibverbs", "doca", "shm"):
             spec_kwargs["draft_offload_v2_model_path"] = args.draft_model
         if args.transport in ("ibverbs", "doca"):
             spec_kwargs["draft_offload_nic_name"] = args.nic
+        if args.transport == "shm":
+            spec_kwargs["draft_offload_v2_shm_name"] = args.shm_name
         spec = PEARLDecodingConfig(**spec_kwargs)
         llm_kwargs = dict(
             model=args.target_model,

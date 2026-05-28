@@ -230,6 +230,9 @@ class DraftTargetOneModelWorker(SpecWorkerBase):
                         tcp_prompt_port=int(
                             getattr(spec_config, "draft_offload_v2_tcp_prompt_port", 0)
                         ),
+                        shm_name=str(
+                            getattr(spec_config, "draft_offload_v2_shm_name", "pearl_shm_default")
+                        ),
                     )
                 )
             logger.info(

@@ -859,6 +859,7 @@ class IzzyCompatibleDraftServer:
             self._backend_ready.set()
         self._data_transport = None
         self._max_num_requests = 0
+        self._shm_name = "pearl_shm_default"
         self._endpoint = None
         self._channel = None
         self._stop = False
@@ -909,6 +910,18 @@ class IzzyCompatibleDraftServer:
                     remote_peer_name="draft_lpu",
                     payload_bytes=DraftApiProtocol.kMessageBytes,
                     recv_queue_depth=int(self._max_num_requests),
+                    handshake_timeout_s=float(self._args.handshake_timeout_s),
+                )
+            )
+        elif transport == "shm":
+            from tensorrt_llm._torch.speculative.shm_endpoint import ShmEndpointConfig, _ShmBackend
+
+            endpoint = _ShmBackend(
+                ShmEndpointConfig(
+                    is_server=True,
+                    shm_name=self._shm_name,
+                    recv_queue_depth=int(self._max_num_requests),
+                    payload_bytes=DraftApiProtocol.kMessageBytes,
                     handshake_timeout_s=float(self._args.handshake_timeout_s),
                 )
             )
@@ -1069,10 +1082,12 @@ class IzzyCompatibleDraftServer:
                 max_draft_len=int(msg.max_draft_len),
                 extra=extra,
             )
-            if requested_transport not in ("tcp", "ibverbs", "doca"):
+            if requested_transport not in ("tcp", "ibverbs", "doca", "shm"):
                 ack = draft_session_protocol.TcpModelInitAck(
                     status="error",
-                    error="target must provide data transport tcp|ibverbs|doca in TcpModelInit",
+                    error=(
+                        "target must provide data transport tcp|ibverbs|doca|shm in TcpModelInit"
+                    ),
                 )
                 client.sendall(draft_session_protocol.serialize(ack))
                 return
@@ -1089,6 +1104,11 @@ class IzzyCompatibleDraftServer:
                 client.sendall(draft_session_protocol.serialize(ack))
                 return
             self._max_num_requests = extra_max
+            # Stash the shm region name if the target asked for the shm
+            # transport; ignored for ibverbs/tcp/doca.
+            shm_name_from_target = str(extra.get("shm_name", "") or "").strip()
+            if shm_name_from_target:
+                self._shm_name = shm_name_from_target
             self._ensure_data_port()
 
             if self._backend is not None:

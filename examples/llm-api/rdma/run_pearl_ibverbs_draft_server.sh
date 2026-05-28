@@ -15,6 +15,8 @@ TRANSPORT="${TRANSPORT:-ibverbs}"
 NIC="${NIC:-mlx5_0}"
 PREFETCH_WAIT_TIMEOUT_S="${PREFETCH_WAIT_TIMEOUT_S:-0.05}"
 TRTLLM_STREAM_MAX_TOKENS="${TRTLLM_STREAM_MAX_TOKENS:-16384}"
+NSYS="${NSYS:-0}"
+NSYS_OUT="${NSYS_OUT:-${OUT_DIR}/pearl_draft}"
 TRACE_LOG="${DRAFT_TRACE_LOG:-${OUT_DIR}/draft_trace.jsonl}"
 LOG_FILE="${DRAFT_LOG_FILE:-${OUT_DIR}/draft_server.log}"
 
@@ -40,8 +42,27 @@ echo "nic: ${NIC}"
 echo "control_port: ${DRAFT_CONTROL_PORT}"
 echo "trtllm_stream_max_tokens: ${TRTLLM_STREAM_MAX_TOKENS}"
 echo "trace_log: ${TRACE_LOG}"
+echo "nsys: ${NSYS}"
 
-python3 examples/llm-api/rdma/trtllm_pearl_draft_server.py \
+LAUNCHER=()
+if [[ "${NSYS}" == "1" || "${NSYS}" == "true" ]]; then
+  # Draft is long-lived; --delay counts from this script's launch, so it must
+  # include the draft's idle wait for target's TcpModelInit. Default values are
+  # tuned to match the target's defaults (delay 280, duration 30) so both
+  # captures align on the steady-state run window. Override via env when JIT
+  # cache changes timing.
+  LAUNCHER=(nsys profile
+    -t cuda,nvtx,osrt
+    -o "${NSYS_OUT}"
+    --delay=${NSYS_DELAY:-280}
+    --duration=${NSYS_DURATION:-30}
+    --capture-range=none
+    --kill=none
+    --force-overwrite=true)
+  echo "nsys_out: ${NSYS_OUT}.nsys-rep (delay=${NSYS_DELAY:-280}s duration=${NSYS_DURATION:-30}s)"
+fi
+
+"${LAUNCHER[@]}" python3 examples/llm-api/rdma/trtllm_pearl_draft_server.py \
   "${MODEL_ARGS[@]}" \
   --backend trtllm \
   --transport "${TRANSPORT}" \
