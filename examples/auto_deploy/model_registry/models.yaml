@@ -60,9 +60,10 @@ models:
 - name: Qwen/Qwen2.5-7B-Instruct
   config_id: default_ws_2
   yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
-- name: Qwen/Qwen2.5-7B-Instruct-AWQ
-  config_id: default_ws_2
-  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
+# tensorrt_llm.executor.utils.RequestError: Triton Error [CUDA]: device-side assert triggered
+# - name: Qwen/Qwen2.5-7B-Instruct-AWQ
+#   config_id: default_ws_2
+#   yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
 - name: Qwen/Qwen3-4B
   config_id: default_ws_1
   yaml_extra: ['dashboard_default.yaml', 'world_size_1.yaml', 'enable_sharder_ir.yaml']
@@ -317,9 +318,10 @@ models:
 # - name: deepseek-ai/DeepSeek-Coder-V2-Instruct
 #   config_id: deepseek_v2_ep
 #   yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml', 'deepseek_v2_ep.yaml']
-- name: Qwen/Qwen3-VL-8B-Instruct
-  config_id: multimodal__qwen3_vl
-  yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml', 'multimodal.yaml', 'qwen3_vl.yaml']
+# Timed out after AutoDeploy compile in multimodal run.
+# - name: Qwen/Qwen3-VL-8B-Instruct
+#   config_id: multimodal__qwen3_vl
+#   yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml', 'multimodal.yaml', 'qwen3_vl.yaml']
 # IndexError: list index out of range in AutoDeploy sharding path. See https://github.com/NVIDIA/TensorRT-LLM/issues/14681
 # - name: Qwen/Qwen2-VL-72B-Instruct-GPTQ-Int4
 #   config_id: multimodal
@@ -340,9 +342,10 @@ models:
 # - name: meta-llama/Llama-4-Scout-17B-16E-Instruct
 #   config_id: multimodal__llama4_scout
 #   yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml', 'multimodal.yaml', 'llama4_scout.yaml']
-- name: meta-llama/Llama-4-Maverick-17B-128E-Instruct
-  config_id: multimodal__llama4_maverick_lite
-  yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml', 'multimodal.yaml', 'llama4_maverick_lite.yaml']
+# Timed out after AutoDeploy compile in multimodal run.
+# - name: meta-llama/Llama-4-Maverick-17B-128E-Instruct
+#   config_id: multimodal__llama4_maverick_lite
+#   yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml', 'multimodal.yaml', 'llama4_maverick_lite.yaml']
 # OOM during AutoDeploy run.
 # - name: nvidia/NVIDIA-Nemotron-3-Super-120B-BF16-BF16KV-010726
 #   config_id: super_v3
@@ -371,9 +374,10 @@ models:
 #   config_id: default_ws_4
 #   yaml_extra: ['dashboard_default.yaml', 'world_size_4.yaml']
 # --- Qwen3.5 MoE (Feb 2026) ---
-- name: Qwen/Qwen3.5-35B-A3B
-  config_id: qwen3_5_moe_35b
-  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml', 'qwen3.5_moe_35b.yaml', 'enable_sharder_ir.yaml']
+# tensorrt_llm.executor.utils.RequestError: Ran into a kwarg keyword mismatch.
+# - name: Qwen/Qwen3.5-35B-A3B
+#   config_id: qwen3_5_moe_35b
+#   yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml', 'qwen3.5_moe_35b.yaml', 'enable_sharder_ir.yaml']
 # OOM during AutoDeploy run.
 # - name: Qwen/Qwen3.5-397B-A17B
 #   config_id: qwen3_5_moe_400b
@@ -426,9 +430,10 @@ models:
   config_id: glm4_moe
   yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml', 'num_hidden_layers_5.yaml', 'glm4_moe.yaml']
 # --- Qwen3-Next (Sep 2025) ---
-- name: Qwen/Qwen3-Next-80B-A3B-Instruct
-  config_id: qwen3next
-  yaml_extra: ['qwen3Next.yaml']
+# OOM during AutoDeploy run.
+# - name: Qwen/Qwen3-Next-80B-A3B-Instruct
+#   config_id: qwen3next
+#   yaml_extra: ['qwen3Next.yaml']
 # --- OLMo 3 (Nov 2025) ---
 - name: allenai/Olmo-3-7B-Instruct
   config_id: default_ws_1
@@ -449,9 +454,10 @@ models:
 - name: CohereForAI/aya-expanse-8b
   config_id: default_ws_1
   yaml_extra: ['dashboard_default.yaml', 'world_size_1.yaml']
-- name: CohereForAI/aya-expanse-32b
-  config_id: default_ws_4
-  yaml_extra: ['dashboard_default.yaml', 'world_size_4.yaml']
+# IndexError: list index out of range in AutoDeploy sharding path. See https://github.com/NVIDIA/TensorRT-LLM/issues/14681
+# - name: CohereForAI/aya-expanse-32b
+#   config_id: default_ws_4
+#   yaml_extra: ['dashboard_default.yaml', 'world_size_4.yaml']
 # --- Tencent Hunyuan (2025) ---
 - name: tencent/Hunyuan-A13B-Instruct
   config_id: hunyuan_a13b_ep
@@ -674,9 +680,10 @@ models:
 #   config_id: default_ws_2
 #   yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
 # --- Qwen2.5-Coder (Nov 2024) ---
-- name: Qwen/Qwen2.5-Coder-1.5B-Instruct
-  config_id: default_ws_2
-  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
+# IndexError: list index out of range in AutoDeploy sharding path. See https://github.com/NVIDIA/TensorRT-LLM/issues/14681
+# - name: Qwen/Qwen2.5-Coder-1.5B-Instruct
+#   config_id: default_ws_2
+#   yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
 - name: Qwen/Qwen2.5-Coder-32B-Instruct
   config_id: default_ws_4
   yaml_extra: ['dashboard_default.yaml', 'world_size_4.yaml']
@@ -721,9 +728,10 @@ models:
 #   config_id: qwen3_fp8_bf16
 #   yaml_extra: ['dashboard_default.yaml', 'world_size_1.yaml', 'qwen3_fp8_bf16.yaml', 'enable_sharder_ir.yaml']
 # --- Qwen3-VL 2B (2025) ---
-- name: Qwen/Qwen3-VL-2B-Instruct
-  config_id: multimodal__qwen3_vl
-  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml', 'multimodal.yaml', 'qwen3_vl.yaml']
+# Timed out after AutoDeploy compile in multimodal run.
+# - name: Qwen/Qwen3-VL-2B-Instruct
+#   config_id: multimodal__qwen3_vl
+#   yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml', 'multimodal.yaml', 'qwen3_vl.yaml']
 # --- Granite 4.0 tiny (2025) ---
 - name: ibm-granite/granite-4.0-tiny-preview
   config_id: granite_4_0_tiny_preview
@@ -759,9 +767,10 @@ models:
 #   config_id: default_ws_1
 #   yaml_extra: ['dashboard_default.yaml', 'world_size_1.yaml']
 # --- Qwen2.5-VL (2025) - top VLM family ---
-- name: Qwen/Qwen2.5-VL-7B-Instruct
-  config_id: multimodal
-  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml', 'multimodal.yaml']
+# Timed out after AutoDeploy compile in multimodal run.
+# - name: Qwen/Qwen2.5-VL-7B-Instruct
+#   config_id: multimodal
+#   yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml', 'multimodal.yaml']
 # OOM during AutoDeploy run.
 # - name: Qwen/Qwen2.5-VL-72B-Instruct
 #   config_id: multimodal
@@ -813,9 +822,10 @@ models:
 # IR sharding (hint-driven) models
 # These use enable_sharder_ir.yaml to opt in to the new sharding system.
 # =============================================================================
-- name: nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-FP8
-  config_id: nano_v3__enable_sharder_ir
-  yaml_extra: ['dashboard_default.yaml', 'world_size_4.yaml', 'nano_v3.yaml', 'enable_sharder_ir.yaml']
+# tensorrt_llm.executor.utils.RequestError: Triton Error [CUDA]: device-side assert triggered
+# - name: nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-FP8
+#   config_id: nano_v3__enable_sharder_ir
+#   yaml_extra: ['dashboard_default.yaml', 'world_size_4.yaml', 'nano_v3.yaml', 'enable_sharder_ir.yaml']
 # OOM during AutoDeploy run.
 # - name: deepseek-ai/DeepSeek-R1
 #   config_id: num_hidden_layers_5__enable_sharder_ir
