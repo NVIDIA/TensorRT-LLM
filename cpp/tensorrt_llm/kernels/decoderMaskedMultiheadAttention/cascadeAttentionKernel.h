@@ -79,6 +79,15 @@ bool launch_cascade_attention(
 template <typename KernelParamsType>
 bool cascade_eligible(KernelParamsType const& params);
 
+struct CascadeWorkspaceSizes
+{
+    size_t out{};
+    size_t mMax{};
+    size_t lSum{};
+};
+
+CascadeWorkspaceSizes getCascadeWorkspaceSizes(int batch_beam, int num_heads, int head_size) noexcept;
+
 } // namespace cascade
 } // namespace mmha
 } // namespace kernels

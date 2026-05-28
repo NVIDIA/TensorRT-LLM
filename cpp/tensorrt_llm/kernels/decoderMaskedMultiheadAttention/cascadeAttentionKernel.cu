@@ -17,6 +17,7 @@
 #include "tensorrt_llm/common/cudaTypeUtils.cuh"
 #include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/common/logger.h"
+#include "tensorrt_llm/kernels/decoderMaskedMultiheadAttentionUtils.h"
 #include "tensorrt_llm/kernels/gptKernels.h"
 #include "tensorrt_llm/kernels/kvCacheUtils.h"
 
@@ -30,6 +31,7 @@
 #include <cfloat>
 #include <cmath>
 #include <cstdint>
+#include <mutex>
 #include <type_traits>
 
 TRTLLM_NAMESPACE_BEGIN
@@ -64,78 +66,37 @@ struct CascadeConfig
     static_assert(Dh_ == 64 || Dh_ == 128, "cascade kernel only supports Dh \\in {64, 128}");
 };
 
-// Convert a value of type T to float on device.
-template <typename T>
-__device__ inline float to_float(T v);
-
-template <>
-__device__ inline float to_float<float>(float v)
+// Tag selecting which side of the KV cache to read from.
+enum class KVKind
 {
-    return v;
-}
+    K,
+    V
+};
 
-template <>
-__device__ inline float to_float<half>(half v)
-{
-    return __half2float(v);
-}
-
-#ifdef ENABLE_BF16
-template <>
-__device__ inline float to_float<__nv_bfloat16>(__nv_bfloat16 v)
-{
-    return __bfloat162float(v);
-}
-#endif
-
-// Convert a float back to type T on device.
-template <typename T>
-__device__ inline T from_float(float v);
-
-template <>
-__device__ inline float from_float<float>(float v)
-{
-    return v;
-}
-
-template <>
-__device__ inline half from_float<half>(float v)
-{
-    return __float2half(v);
-}
-
-#ifdef ENABLE_BF16
-template <>
-__device__ inline __nv_bfloat16 from_float<__nv_bfloat16>(float v)
-{
-    return __float2bfloat16(v);
-}
-#endif
-
-// Read one element of K[token, head, channel] from the cache.
-template <typename T_cache, typename KVCacheBuffer>
-__device__ inline T_cache load_k(KVCacheBuffer const& kv, int seqIdx, int tokenIdx, int headIdx, int dim, int channel)
+// Read one element of K[token, head, channel] or V[token, head, channel] from the cache.
+// Dh is the head dimension (== params.hidden_size_per_head, enforced by the
+// caller's runtime guard) and is propagated as a compile-time constant.
+template <typename T_cache, KVKind Kind, int Dh, typename KVCacheBuffer>
+__device__ inline T_cache load_kv(KVCacheBuffer const& kv, int seqIdx, int tokenIdx, int headIdx, int channel)
 {
     auto const localTokenIdx = kv.getKVTokenIdx(tokenIdx);
-    auto* blockPtr = reinterpret_cast<T_cache*>(kv.getKBlockPtr(seqIdx, localTokenIdx));
-    auto const localOffset = kv.getKVLocalIdx(localTokenIdx, headIdx, dim, channel);
-    return blockPtr[localOffset];
-}
-
-// Read one element of V[token, head, channel] from the cache.
-template <typename T_cache, typename KVCacheBuffer>
-__device__ inline T_cache load_v(KVCacheBuffer const& kv, int seqIdx, int tokenIdx, int headIdx, int dim, int channel)
-{
-    auto const localTokenIdx = kv.getKVTokenIdx(tokenIdx);
-    auto* blockPtr = reinterpret_cast<T_cache*>(kv.getVBlockPtr(seqIdx, localTokenIdx));
-    auto const localOffset = kv.getKVLocalIdx(localTokenIdx, headIdx, dim, channel);
+    void* rawPtr;
+    if constexpr (Kind == KVKind::K)
+    {
+        rawPtr = kv.getKBlockPtr(seqIdx, localTokenIdx);
+    }
+    else
+    {
+        rawPtr = kv.getVBlockPtr(seqIdx, localTokenIdx);
+    }
+    auto* blockPtr = reinterpret_cast<T_cache*>(rawPtr);
+    auto const localOffset = kv.getKVLocalIdx(localTokenIdx, headIdx, Dh, channel);
     return blockPtr[localOffset];
 }
 
 template <int THDS>
 __device__ inline float block_sum(float v, float* scratch)
 {
-    // ---------- v1: warp-shuffle + 1 SMEM cross-warp reduce -----------------
     static_assert(THDS % 32 == 0, "block_sum requires THDS to be a multiple of warpSize");
     constexpr int N_WARPS = THDS / 32;
     int const tid = threadIdx.x;
@@ -188,37 +149,29 @@ __device__ inline float block_sum(float v, float* scratch)
 //
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-__device__ __forceinline__ void cascade_rope_cs(
-    int c, int rotary_dim, int pos, float base, float scale, float& cos_a, float& sin_a)
+// Resolve the per-token row pointer in the global cos/sin cache.
+// Returns nullptr when the global cache is not provided (callers fall back to
+// computing cos/sin from base/scale).
+__device__ __forceinline__ float2 const* cascade_rope_cache_row(float2 const* cos_sin_cache, int t_step, int rotary_dim)
 {
-    int const half = rotary_dim / 2;
-    int const freq_idx = (c < half) ? c : (c - half);
-    float const inv_freq = __powf(base, -2.0f * static_cast<float>(freq_idx) / static_cast<float>(rotary_dim));
-    float const angle = static_cast<float>(pos) * inv_freq * scale;
-    __sincosf(angle, &sin_a, &cos_a);
+    return cos_sin_cache != nullptr ? cos_sin_cache + static_cast<int64_t>(t_step) * (rotary_dim / 2) : nullptr;
 }
 
-// Rotate the Dh-channel vector `vec` (shared memory) in-place.  Each thread owns
-// its own channel `c` and reads the partner channel from `vec`.  All threads in
-// the block must reach every __syncthreads() below, hence the `active` flag.
-__device__ __forceinline__ void cascade_rope_apply_neox(
-    float* vec, int c, int rotary_dim, int pos, float base, float scale)
+// NeoX RoPE coefficient for a single pair index `freq_idx \in [0, rotary_dim/2)`.
+// `cache_row` is the per-token row pointer returned by `cascade_rope_cache_row`
+// (nullable). Returns {cos, sin}.
+__device__ __forceinline__ float2 cascade_rope_neox_cs(
+    int freq_idx, int rotary_dim, int t_step, float base, float scale, float2 const* cache_row)
 {
-    int const half = rotary_dim / 2;
-    bool const active = (c < rotary_dim);
-    float cos_a = 1.f, sin_a = 0.f;
-    float val = 0.f, partner = 0.f;
-    if (active)
-    {
-        cascade_rope_cs(c, rotary_dim, pos, base, scale, cos_a, sin_a);
-        val = vec[c];
-        partner = (c < half) ? vec[c + half] : vec[c - half];
-    }
-    __syncthreads();
-    if (active)
-    {
-        vec[c] = (c < half) ? (val * cos_a - partner * sin_a) : (val * cos_a + partner * sin_a);
-    }
+    return rotary_embedding_coefficient(
+        /*inv_freq_cache=*/nullptr,
+        /*cos_sin_cache=*/cache_row,
+        /*zid=*/2 * freq_idx,
+        /*rot_embed_dim=*/rotary_dim,
+        /*base=*/base,
+        /*scale=*/scale,
+        /*mscale=*/1.0f,
+        /*t_step=*/static_cast<float>(t_step));
 }
 
 template <typename T>
@@ -228,9 +181,9 @@ __device__ constexpr int cascade_smem_row_stride(int dh)
     return dh + (16 / static_cast<int>(sizeof(T)));
 }
 
-template <typename T, typename T_cache, typename KVCacheBuffer, int Dh, int TOKEN_TILE, int THDS>
-__device__ __forceinline__ void cascade_async_load_k_tile(
-    KVCacheBuffer const& kv, int owner_seq, int kv_head_idx, int dim, int t0, int tile_end, int tid, T* K_smem_buf)
+template <typename T, typename T_cache, KVKind Kind, typename KVCacheBuffer, int Dh, int TOKEN_TILE, int THDS>
+__device__ __forceinline__ void cascade_async_load_kv_tile(
+    KVCacheBuffer const& kv, int owner_seq, int kv_head_idx, int t0, int tile_end, int tid, T* smem_buf)
 {
     constexpr int BYTES_PER_CHUNK = 16;
     constexpr int ELEMS_PER_CHUNK = BYTES_PER_CHUNK / sizeof(T);
@@ -246,52 +199,24 @@ __device__ __forceinline__ void cascade_async_load_k_tile(
         int const chunk = idx - tok_rel * CHUNKS_PER_TOK;
         int const dh_base = chunk * ELEMS_PER_CHUNK;
         int const tok = t0 + tok_rel;
-        T* s_ptr = K_smem_buf + tok_rel * ROW_STRIDE + dh_base;
-        if (tok < tile_end)
+        T* s_ptr = smem_buf + tok_rel * ROW_STRIDE + dh_base;
+
+        bool const in_bounds = (tok < tile_end);
+        int const tok_safe = in_bounds ? tok : t0;
+        auto const localTokenIdx = kv.getKVTokenIdx(tok_safe);
+        void* rawPtr;
+        if constexpr (Kind == KVKind::K)
         {
-            auto const localTokenIdx = kv.getKVTokenIdx(tok);
-            auto* base = reinterpret_cast<T_cache*>(kv.getKBlockPtr(owner_seq, localTokenIdx));
-            auto const off = kv.getKVLocalIdx(localTokenIdx, kv_head_idx, dim, dh_base);
-            mma::cp_async_16B(mma::smem_addr_of(s_ptr), base + off);
+            rawPtr = kv.getKBlockPtr(owner_seq, localTokenIdx);
         }
         else
         {
-            uint4 zero = {0u, 0u, 0u, 0u};
-            *reinterpret_cast<uint4*>(s_ptr) = zero;
+            rawPtr = kv.getVBlockPtr(owner_seq, localTokenIdx);
         }
-    }
-}
-
-template <typename T, typename T_cache, typename KVCacheBuffer, int Dh, int TOKEN_TILE, int THDS>
-__device__ __forceinline__ void cascade_async_load_v_tile(
-    KVCacheBuffer const& kv, int owner_seq, int kv_head_idx, int dim, int t0, int tile_end, int tid, T* V_smem_buf)
-{
-    constexpr int BYTES_PER_CHUNK = 16;
-    constexpr int ELEMS_PER_CHUNK = BYTES_PER_CHUNK / sizeof(T);
-    constexpr int CHUNKS_PER_TOK = Dh / ELEMS_PER_CHUNK;
-    constexpr int TOTAL_CHUNKS = TOKEN_TILE * CHUNKS_PER_TOK;
-    constexpr int ROW_STRIDE = cascade_smem_row_stride<T>(Dh);
-
-#pragma unroll
-    for (int idx = tid; idx < TOTAL_CHUNKS; idx += THDS)
-    {
-        int const tok_rel = idx / CHUNKS_PER_TOK;
-        int const chunk = idx - tok_rel * CHUNKS_PER_TOK;
-        int const dh_base = chunk * ELEMS_PER_CHUNK;
-        int const tok = t0 + tok_rel;
-        T* s_ptr = V_smem_buf + tok_rel * ROW_STRIDE + dh_base;
-        if (tok < tile_end)
-        {
-            auto const localTokenIdx = kv.getKVTokenIdx(tok);
-            auto* base = reinterpret_cast<T_cache*>(kv.getVBlockPtr(owner_seq, localTokenIdx));
-            auto const off = kv.getKVLocalIdx(localTokenIdx, kv_head_idx, dim, dh_base);
-            mma::cp_async_16B(mma::smem_addr_of(s_ptr), base + off);
-        }
-        else
-        {
-            uint4 zero = {0u, 0u, 0u, 0u};
-            *reinterpret_cast<uint4*>(s_ptr) = zero;
-        }
+        auto* base = reinterpret_cast<T_cache*>(rawPtr);
+        auto const off = kv.getKVLocalIdx(localTokenIdx, kv_head_idx, Dh, dh_base);
+        unsigned const src_size = in_bounds ? 16u : 0u;
+        mma::cp_async_16B(mma::smem_addr_of(s_ptr), base + off, src_size);
     }
 }
 
@@ -362,12 +287,11 @@ __global__ void cascade_prefix_mqa_kernel(Multihead_attention_params<T, false> p
     int const beam_width = params.beam_width;
     int const num_heads = params.num_heads;
     int const num_kv_heads = params.num_kv_heads;
-    int const dim = params.hidden_size_per_head;
     float const inv_sqrt_dh = params.inv_sqrt_dh;
 
     int const prefix_len = __ldg(&d_input_lengths[req_idx * beam_width]);
 
-    if (beam_base >= beam_width || dim != Dh)
+    if (beam_base >= beam_width || params.hidden_size_per_head != Dh)
     {
         return;
     }
@@ -418,7 +342,7 @@ __global__ void cascade_prefix_mqa_kernel(Multihead_attention_params<T, false> p
 
     // ------------------------------ Load Q to SMEM ---------------------------
     // Layout Q_smem[beam][dh] row-major.  Every thread contributes BEAM_TILE*Dh/THDS elements.
-    uint32_t const q_stride = params.stride ? static_cast<uint32_t>(params.stride) : (num_heads * dim);
+    uint32_t const q_stride = params.stride ? static_cast<uint32_t>(params.stride) : (num_heads * Dh);
     {
         constexpr int N_Q_ELEMS = BEAM_TILE * Dh;
 #pragma unroll
@@ -430,12 +354,12 @@ __global__ void cascade_prefix_mqa_kernel(Multihead_attention_params<T, false> p
             T q_val;
             if (beam_idx < beam_width)
             {
-                int const q_offset = (req_idx * beam_width + beam_idx) * q_stride + head_idx * dim + c;
+                int const q_offset = (req_idx * beam_width + beam_idx) * q_stride + head_idx * Dh + c;
                 q_val = params.q[q_offset];
             }
             else
             {
-                q_val = from_float<T>(0.f);
+                q_val = common::cuda_cast<T>(0.f);
             }
             Q_smem[b * SMEM_STRIDE + c] = q_val;
         }
@@ -455,6 +379,7 @@ __global__ void cascade_prefix_mqa_kernel(Multihead_attention_params<T, false> p
         float const rope_scale = params.rotary_embedding_scale;
         int const q_pos = (params.length_per_sample != nullptr) ? (params.length_per_sample[req_idx * beam_width] - 1)
                                                                 : params.timestep;
+        float2 const* cache_row = cascade_rope_cache_row(params.rotary_embedding_cos_sin_cache, q_pos, rotary_dim);
 
         int const n_pairs = BEAM_TILE * half;
 #pragma unroll
@@ -465,12 +390,11 @@ __global__ void cascade_prefix_mqa_kernel(Multihead_attention_params<T, false> p
             int const beam_idx = beam_base + b;
             if (beam_idx >= beam_width)
                 continue;
-            float cos_a, sin_a;
-            cascade_rope_cs(c, rotary_dim, q_pos, rope_base, rope_scale, cos_a, sin_a);
-            float const v0 = to_float<T>(Q_smem[b * SMEM_STRIDE + c]);
-            float const v1 = to_float<T>(Q_smem[b * SMEM_STRIDE + c + half]);
-            Q_smem[b * SMEM_STRIDE + c] = from_float<T>(v0 * cos_a - v1 * sin_a);
-            Q_smem[b * SMEM_STRIDE + c + half] = from_float<T>(v1 * cos_a + v0 * sin_a);
+            float2 const cs = cascade_rope_neox_cs(c, rotary_dim, q_pos, rope_base, rope_scale, cache_row);
+            float const v0 = common::cuda_cast<float>(Q_smem[b * SMEM_STRIDE + c]);
+            float const v1 = common::cuda_cast<float>(Q_smem[b * SMEM_STRIDE + c + half]);
+            Q_smem[b * SMEM_STRIDE + c] = common::cuda_cast<T>(v0 * cs.x - v1 * cs.y);
+            Q_smem[b * SMEM_STRIDE + c + half] = common::cuda_cast<T>(v1 * cs.x + v0 * cs.y);
         }
         __syncthreads();
     }
@@ -495,10 +419,10 @@ __global__ void cascade_prefix_mqa_kernel(Multihead_attention_params<T, false> p
     {
         int const t0_0 = 0;
         int const tile_end_0 = min(TOKEN_TILE, prefix_len);
-        cascade_async_load_k_tile<T, T_cache, KVCacheBuffer, Dh, TOKEN_TILE, THDS>(
-            kv_cache_buffer, owner_seq, kv_head_idx, dim, t0_0, tile_end_0, tid, K_smem[0]);
-        cascade_async_load_v_tile<T, T_cache, KVCacheBuffer, Dh, TOKEN_TILE, THDS>(
-            kv_cache_buffer, owner_seq, kv_head_idx, dim, t0_0, tile_end_0, tid, V_smem[0]);
+        cascade_async_load_kv_tile<T, T_cache, KVKind::K, KVCacheBuffer, Dh, TOKEN_TILE, THDS>(
+            kv_cache_buffer, owner_seq, kv_head_idx, t0_0, tile_end_0, tid, K_smem[0]);
+        cascade_async_load_kv_tile<T, T_cache, KVKind::V, KVCacheBuffer, Dh, TOKEN_TILE, THDS>(
+            kv_cache_buffer, owner_seq, kv_head_idx, t0_0, tile_end_0, tid, V_smem[0]);
         mma::cp_async_commit();
     }
 
@@ -513,10 +437,10 @@ __global__ void cascade_prefix_mqa_kernel(Multihead_attention_params<T, false> p
         {
             int const t0_n = (tile_idx + 1) * TOKEN_TILE;
             int const tile_end_n = min(t0_n + TOKEN_TILE, prefix_len);
-            cascade_async_load_k_tile<T, T_cache, KVCacheBuffer, Dh, TOKEN_TILE, THDS>(
-                kv_cache_buffer, owner_seq, kv_head_idx, dim, t0_n, tile_end_n, tid, K_smem[buf_nxt]);
-            cascade_async_load_v_tile<T, T_cache, KVCacheBuffer, Dh, TOKEN_TILE, THDS>(
-                kv_cache_buffer, owner_seq, kv_head_idx, dim, t0_n, tile_end_n, tid, V_smem[buf_nxt]);
+            cascade_async_load_kv_tile<T, T_cache, KVKind::K, KVCacheBuffer, Dh, TOKEN_TILE, THDS>(
+                kv_cache_buffer, owner_seq, kv_head_idx, t0_n, tile_end_n, tid, K_smem[buf_nxt]);
+            cascade_async_load_kv_tile<T, T_cache, KVKind::V, KVCacheBuffer, Dh, TOKEN_TILE, THDS>(
+                kv_cache_buffer, owner_seq, kv_head_idx, t0_n, tile_end_n, tid, V_smem[buf_nxt]);
             mma::cp_async_commit();
             mma::cp_async_wait<1>(); // keep the just-issued prefetch in flight
         }
@@ -639,10 +563,10 @@ __global__ void cascade_prefix_mqa_kernel(Multihead_attention_params<T, false> p
             for (int n = 0; n < 2; ++n)
             {
                 int const col_lo = n * 8 + col0;
-                P_smem[tm * TOKEN_TILE + col_lo] = from_float<T>(p[n][0]);
-                P_smem[tm * TOKEN_TILE + col_lo + 1] = from_float<T>(p[n][1]);
-                P_smem[(tm + 8) * TOKEN_TILE + col_lo] = from_float<T>(p[n][2]);
-                P_smem[(tm + 8) * TOKEN_TILE + col_lo + 1] = from_float<T>(p[n][3]);
+                P_smem[tm * TOKEN_TILE + col_lo] = common::cuda_cast<T>(p[n][0]);
+                P_smem[tm * TOKEN_TILE + col_lo + 1] = common::cuda_cast<T>(p[n][1]);
+                P_smem[(tm + 8) * TOKEN_TILE + col_lo] = common::cuda_cast<T>(p[n][2]);
+                P_smem[(tm + 8) * TOKEN_TILE + col_lo + 1] = common::cuda_cast<T>(p[n][3]);
             }
         } // warp 0
         __syncthreads();
@@ -794,13 +718,12 @@ __global__ void cascade_suffix_decode_kernel(Multihead_attention_params<T, false
     int const beam_idx = seq % beam_width;
     int const num_heads = params.num_heads;
     int const num_kv_heads = params.num_kv_heads;
-    int const dim = params.hidden_size_per_head;
     float const inv_sqrt_dh = params.inv_sqrt_dh;
 
     // Read prefix_len from device memory (Graph-safe: no host copy needed).
     int const prefix_len = __ldg(&d_input_lengths[req_idx * beam_width]);
 
-    if (dim != Dh || tid >= Dh)
+    if (params.hidden_size_per_head != Dh || tid >= Dh)
     {
         return;
     }
@@ -817,12 +740,12 @@ __global__ void cascade_suffix_decode_kernel(Multihead_attention_params<T, false
 
     // Load Q for this (head, beam) into shared mem so threads can read each
     // other's channels during RoPE rotation.
-    // NOTE: Must use params.stride (packed QKV per-sample stride) not num_heads*dim.
-    uint32_t const q_stride = params.stride ? static_cast<uint32_t>(params.stride) : (num_heads * dim);
-    int const q_offset = seq * q_stride + head_idx * dim + tid;
+    // NOTE: Must use params.stride (packed QKV per-sample stride) not num_heads*Dh.
+    uint32_t const q_stride = params.stride ? static_cast<uint32_t>(params.stride) : (num_heads * Dh);
+    int const q_offset = seq * q_stride + head_idx * Dh + tid;
     if (tid < Dh)
     {
-        q_smem[tid] = to_float<T>(params.q[q_offset]);
+        q_smem[tid] = common::cuda_cast<float>(params.q[q_offset]);
     }
     __syncthreads();
 
@@ -830,10 +753,30 @@ __global__ void cascade_suffix_decode_kernel(Multihead_attention_params<T, false
     if (params.position_embedding_type == PositionEmbeddingType::kROPE_GPT_NEOX)
     {
         int const rotary_dim = params.rotary_embedding_dim;
+        int const half = rotary_dim / 2;
         float const rope_base = params.rotary_embedding_base;
         float const rope_scale = params.rotary_embedding_scale;
         int const q_pos = (params.length_per_sample != nullptr) ? (params.length_per_sample[seq] - 1) : params.timestep;
-        cascade_rope_apply_neox(q_smem, tid, rotary_dim, q_pos, rope_base, rope_scale);
+        float2 const* cache_row = cascade_rope_cache_row(params.rotary_embedding_cos_sin_cache, q_pos, rotary_dim);
+
+        // Each thread owns channel `tid` of q_smem.  Threads with tid >= rotary_dim
+        // are inactive but must still hit the __syncthreads() below.
+        bool const active = (tid < rotary_dim);
+        int const freq_idx = active ? ((tid < half) ? tid : (tid - half)) : 0;
+        float2 cs = make_float2(1.f, 0.f);
+        float val = 0.f;
+        float partner = 0.f;
+        if (active)
+        {
+            cs = cascade_rope_neox_cs(freq_idx, rotary_dim, q_pos, rope_base, rope_scale, cache_row);
+            val = q_smem[tid];
+            partner = (tid < half) ? q_smem[tid + half] : q_smem[tid - half];
+        }
+        __syncthreads();
+        if (active)
+        {
+            q_smem[tid] = (tid < half) ? (val * cs.x - partner * cs.y) : (val * cs.x + partner * cs.y);
+        }
         __syncthreads();
     }
 
@@ -858,20 +801,22 @@ __global__ void cascade_suffix_decode_kernel(Multihead_attention_params<T, false
             = params.stride ? static_cast<uint32_t>(params.stride) : static_cast<uint32_t>(num_kv_heads_eff * Dh);
         int const k_off = seq * kv_stride + kv_head_idx * Dh + tid;
         int const v_off = seq * kv_stride + kv_head_idx * Dh + tid;
-        k_cur = to_float<T>(params.k[k_off]);
-        v_cur = to_float<T>(params.v[v_off]);
+        k_cur = common::cuda_cast<float>(params.k[k_off]);
+        v_cur = common::cuda_cast<float>(params.v[v_off]);
 
         if (params.k_bias != nullptr)
         {
-            k_cur += to_float<T>(params.k_bias[kv_head_idx * Dh + tid]);
+            k_cur += common::cuda_cast<float>(params.k_bias[kv_head_idx * Dh + tid]);
         }
         if (params.v_bias != nullptr)
         {
-            v_cur += to_float<T>(params.v_bias[kv_head_idx * Dh + tid]);
+            v_cur += common::cuda_cast<float>(params.v_bias[kv_head_idx * Dh + tid]);
         }
 
-        // Apply NeoX RoPE to K.  Matches baseline numerics: prefer the
-        // framework-provided cos_sin_cache when available.
+        // Apply NeoX RoPE to K.  Matches baseline numerics by going through the
+        // shared mmha::rotary_embedding_coefficient helper, which prefers the
+        // framework-provided cos_sin_cache when available and falls back to
+        // computing inv_freq from base/scale otherwise.
         if (params.position_embedding_type == PositionEmbeddingType::kROPE_GPT_NEOX)
         {
             k_smem[tid] = k_cur;
@@ -882,23 +827,13 @@ __global__ void cascade_suffix_decode_kernel(Multihead_attention_params<T, false
             {
                 int const half = rotary_dim / 2;
                 int const freq_idx = (tid < half) ? tid : (tid - half);
-                float cos_a, sin_a;
-                if (params.rotary_embedding_cos_sin_cache != nullptr)
-                {
-                    float2 const* cache_base
-                        = params.rotary_embedding_cos_sin_cache + static_cast<int64_t>(tlength) * half;
-                    float2 cs = __ldg(&cache_base[freq_idx]);
-                    cos_a = cs.x;
-                    sin_a = cs.y;
-                }
-                else
-                {
-                    cascade_rope_cs(tid, rotary_dim, tlength, params.rotary_embedding_base,
-                        params.rotary_embedding_scale, cos_a, sin_a);
-                }
+                float2 const* cache_row
+                    = cascade_rope_cache_row(params.rotary_embedding_cos_sin_cache, tlength, rotary_dim);
+                float2 const cs = cascade_rope_neox_cs(freq_idx, rotary_dim, tlength, params.rotary_embedding_base,
+                    params.rotary_embedding_scale, cache_row);
                 float const val = k_smem[tid];
                 float const partner = (tid < half) ? k_smem[tid + half] : k_smem[tid - half];
-                k_cur = (tid < half) ? (val * cos_a - partner * sin_a) : (val * cos_a + partner * sin_a);
+                k_cur = (tid < half) ? (val * cs.x - partner * cs.y) : (val * cs.x + partner * cs.y);
             }
             __syncthreads();
         }
@@ -910,8 +845,8 @@ __global__ void cascade_suffix_decode_kernel(Multihead_attention_params<T, false
             auto* kPtr = reinterpret_cast<T_cache*>(kv_cache_buffer.getKBlockPtr(seq, localTokenIdx));
             auto* vPtr = reinterpret_cast<T_cache*>(kv_cache_buffer.getVBlockPtr(seq, localTokenIdx));
             auto const off = kv_cache_buffer.getKVLocalIdx(localTokenIdx, kv_head_idx, Dh, tid);
-            kPtr[off] = from_float<T_cache>(k_cur);
-            vPtr[off] = from_float<T_cache>(v_cur);
+            kPtr[off] = common::cuda_cast<T_cache>(k_cur);
+            vPtr[off] = common::cuda_cast<T_cache>(v_cur);
         }
         // No __threadfence needed: the next decode step is launched on the
         // same stream and stream ordering guarantees cross-kernel visibility.
@@ -942,8 +877,10 @@ __global__ void cascade_suffix_decode_kernel(Multihead_attention_params<T, false
         }
         int const src_seq = req_idx * beam_width + src_beam;
 
-        float k_val = to_float<T_cache>(load_k<T_cache>(kv_cache_buffer, src_seq, tok, kv_head_idx, dim, tid));
-        float v_val = to_float<T_cache>(load_v<T_cache>(kv_cache_buffer, src_seq, tok, kv_head_idx, dim, tid));
+        float k_val = common::cuda_cast<float>(
+            load_kv<T_cache, KVKind::K, Dh>(kv_cache_buffer, src_seq, tok, kv_head_idx, tid));
+        float v_val = common::cuda_cast<float>(
+            load_kv<T_cache, KVKind::V, Dh>(kv_cache_buffer, src_seq, tok, kv_head_idx, tid));
 
         float partial = q_val * k_val;
         float qk = block_sum<THDS>(partial, reduce) * inv_sqrt_dh;
@@ -1013,7 +950,7 @@ __global__ void cascade_suffix_decode_kernel(Multihead_attention_params<T, false
     }
 
     int const out_offset = seq * num_heads * Dh + head_idx * Dh + tid;
-    reinterpret_cast<T*>(params.out)[out_offset] = from_float<T>(out_val);
+    reinterpret_cast<T*>(params.out)[out_offset] = common::cuda_cast<T>(out_val);
 #endif // __CUDA_ARCH__ < 800
 }
 
@@ -1039,12 +976,9 @@ bool cascade_eligible(KernelParamsType const& params)
     if (!tensorrt_llm::common::getEnvEnableCascadeMmha())
     {
         // Only print once to avoid flooding.
-        static std::atomic<bool> once{false};
-        bool exp = false;
-        if (once.compare_exchange_strong(exp, true))
-        {
-            TLLM_LOG_WARNING("cascade_eligible REJECT: TRTLLM_ENABLE_CASCADE_MMHA not set or =0");
-        }
+        static std::once_flag flag;
+        std::call_once(
+            flag, [] { TLLM_LOG_WARNING("cascade_eligible REJECT: TRTLLM_ENABLE_CASCADE_MMHA not set or =0"); });
         return false;
     }
     {
@@ -1057,15 +991,15 @@ bool cascade_eligible(KernelParamsType const& params)
         }
         if (sm < 80)
         {
-            static std::atomic<bool> once{false};
-            bool exp = false;
-            if (once.compare_exchange_strong(exp, true))
-            {
-                TLLM_LOG_WARNING(
-                    "cascade_eligible REJECT: device SM=%d < 80 (cascade kernels require mma.m16n8k16 / cp.async, "
-                    "Ampere or newer)",
-                    sm);
-            }
+            static std::once_flag flag;
+            std::call_once(flag,
+                [sm]
+                {
+                    TLLM_LOG_WARNING(
+                        "cascade_eligible REJECT: device SM=%d < 80 (cascade kernels require mma.m16n8k16 / cp.async, "
+                        "Ampere or newer)",
+                        sm);
+                });
             return false;
         }
     }
@@ -1087,7 +1021,7 @@ bool cascade_eligible(KernelParamsType const& params)
     }
     if (params.position_embedding_type == PositionEmbeddingType::kROPE_GPT_NEOX)
     {
-        // Require full-head rotation so the pair (c, c + dim/2) is resolvable
+        // Require full-head rotation so the pair (c, c + Dh/2) is resolvable
         // in-place within shared memory.
         if (params.rotary_embedding_dim != params.hidden_size_per_head)
         {
@@ -1103,11 +1037,12 @@ bool cascade_eligible(KernelParamsType const& params)
                 (int) params.rotary_embedding_scale_type);
             return false;
         }
-        // When scale_type == kNONE, both cos_sin_cache and inv_freq_cache being
-        // non-null simply means the framework pre-computed constant tables
-        // (cos/sin values and 1/(base^(2i/d)) frequencies respectively).  Our
-        // kernel computes RoPE on-the-fly using the same formula with __sincosf
-        // and __powf, so these tables are safely ignored.
+        // When scale_type == kNONE, the cos_sin_cache (when provided by the
+        // framework) is consumed via mmha::rotary_embedding_coefficient inside
+        // the kernel; if it is null, we fall back to computing cos/sin on the
+        // fly from base/scale, matching the baseline numerics.  inv_freq_cache
+        // is currently ignored (we recompute inv_freq from base) but this is
+        // numerically equivalent under kNONE scaling.
         if (params.mrope_position_deltas != nullptr)
         {
             TLLM_LOG_WARNING("cascade_eligible REJECT: mrope_position_deltas non-null");
@@ -1155,54 +1090,35 @@ bool cascade_eligible(KernelParamsType const& params)
 namespace
 {
 
-// Persistent workspace that is allocated ONCE on first use (during TRT
-// warmup, before CUDA Graph capture) and reused for all subsequent calls.
-// This avoids any cudaMalloc/cudaFree/cudaMallocAsync during execution,
-// making the launch path 100% graph-capture compatible (only kernel
-// launches happen at runtime).
-//
-// Layout of the single allocation (post-P1-fusion: suffix-side partials are
-// kept in registers and merged in-kernel, so only prefix-side buffers remain):
-//   [out_p: batch*beam*heads*Dh floats]
-//   [m_p:   batch*beam*heads   floats]
-//   [l_p:   batch*beam*heads   floats]
-struct PersistentWorkspace
+// Cascade prefix-side per-token O/m/l accumulator footprints.  Mirrors the
+// public CascadeWorkspaceSizes reported via cascadeAttentionKernel.h: out is
+// the per-token fp32 O accumulator, mMax / lSum are the running max and
+// sum-of-exp.  The values are independent of T because the partials are
+// always materialized in fp32 inside the kernel.
+constexpr size_t cascade_workspace_out_bytes(int batch_beam, int num_heads, int head_size) noexcept
 {
-    void* base = nullptr;
-    size_t capacity = 0;
+    return static_cast<size_t>(batch_beam) * num_heads * head_size * sizeof(float);
+}
 
-    // Ensure the workspace is at least `needed` bytes.
-    // Returns true if workspace is ready, false on allocation failure.
-    bool ensure(size_t needed)
-    {
-        if (capacity >= needed)
-        {
-            return true;
-        }
-        // First call or size growth: allocate (happens before graph capture
-        // during TRT warmup phase).
-        if (base)
-        {
-            cudaFree(base);
-        }
-        cudaError_t err = cudaMalloc(&base, needed);
-        if (err != cudaSuccess)
-        {
-            base = nullptr;
-            capacity = 0;
-            return false;
-        }
-        capacity = needed;
-        return true;
-    }
-};
-
-// One global workspace instance. Thread-safety note: TRT-LLM's MMHA plugin
-// enqueue is called from a single executor thread per device, so no locking
-// is needed for single-GPU inference.
-static PersistentWorkspace g_cascade_workspace;
+constexpr size_t cascade_workspace_stat_bytes(int batch_beam, int num_heads) noexcept
+{
+    return static_cast<size_t>(batch_beam) * num_heads * sizeof(float);
+}
 
 } // namespace
+
+CascadeWorkspaceSizes getCascadeWorkspaceSizes(int batch_beam, int num_heads, int head_size) noexcept
+{
+    CascadeWorkspaceSizes s{};
+    if (batch_beam <= 0 || num_heads <= 0 || head_size <= 0)
+    {
+        return s;
+    }
+    s.out = cascade_workspace_out_bytes(batch_beam, num_heads, head_size);
+    s.mMax = cascade_workspace_stat_bytes(batch_beam, num_heads);
+    s.lSum = cascade_workspace_stat_bytes(batch_beam, num_heads);
+    return s;
+}
 
 template <typename T, typename T_cache, typename KVCacheBuffer, int Dh>
 bool launch_cascade_attention(
@@ -1230,39 +1146,32 @@ bool launch_cascade_attention(
     // One-shot launch confirmation so operators can verify the cascade path is
     // actually engaged without paying per-call logging cost.
     {
-        static std::atomic<bool> printed_once{false};
-        bool expected = false;
-        if (printed_once.compare_exchange_strong(expected, true))
-        {
-            TLLM_LOG_INFO("cascade_attention: ENGAGED (Dh=%d beam=%d num_requests=%d total_seqs=%d)", dh, beam,
-                num_requests, total_seqs);
-        }
+        static std::once_flag flag;
+        std::call_once(flag,
+            [dh, beam, num_requests, total_seqs]
+            {
+                TLLM_LOG_INFO("cascade_attention: ENGAGED (Dh=%d beam=%d num_requests=%d total_seqs=%d)", dh, beam,
+                    num_requests, total_seqs);
+            });
     }
 
-    // Compute workspace layout: 6 buffers packed contiguously.
+    // Compute workspace layout: 3 buffers packed contiguously.
     // Each buffer is indexed by [total_seqs × num_heads (× Dh for out)].
     size_t const out_elems = static_cast<size_t>(total_seqs) * num_heads * dh;
     size_t const stat_elems = static_cast<size_t>(total_seqs) * num_heads;
     size_t const out_bytes = out_elems * sizeof(float);
     size_t const stat_bytes = stat_elems * sizeof(float);
-    // Post-P1-fusion: only prefix-side out/m/l are persisted; suffix-side
-    // partials live in registers inside the fused suffix+merge kernel.
-    size_t const total_bytes = out_bytes + 2 * stat_bytes;
 
-    // Persistent workspace: allocated ONCE on first call (during TRT warmup,
-    // before graph capture). All subsequent calls (including during graph
-    // capture & replay) reuse the same pointer — zero allocation at runtime.
-    if (!g_cascade_workspace.ensure(total_bytes))
+    float* const ws_out_p = params.cascade_partial_out;
+    float* const ws_m_p = params.cascade_partial_max;
+    float* const ws_l_p = params.cascade_partial_sum;
+    if (ws_out_p == nullptr || ws_m_p == nullptr || ws_l_p == nullptr)
     {
-        TLLM_LOG_WARNING("cascade_attention: workspace allocation failed (need %zu bytes), falling back", total_bytes);
+        TLLM_LOG_WARNING(
+            "cascade_attention: cascade workspace not provisioned by AttentionOp (need %zu bytes), falling back",
+            out_bytes + 2 * stat_bytes);
         return false;
     }
-
-    // Carve pointers from the contiguous workspace block.
-    char* ws = static_cast<char*>(g_cascade_workspace.base);
-    float* ws_out_p = reinterpret_cast<float*>(ws);
-    float* ws_m_p = reinterpret_cast<float*>(ws + out_bytes);
-    float* ws_l_p = reinterpret_cast<float*>(ws + out_bytes + stat_bytes);
 
     // The prefix_len is NOT fetched to host. Instead, the device pointer
     // params.input_lengths is passed directly to the kernels, and each kernel
@@ -1295,14 +1204,11 @@ bool launch_cascade_attention(
                                    + BEAM_TILE)                        // alpha_s
             * sizeof(float);
         size_t const smem_bytes = t_bytes + f_bytes;
-        // Set smem attribute once (idempotent, avoids repeated driver calls).
-        static bool smem_attr_set = false;
-        if (!smem_attr_set && smem_bytes >= 46 * 1024)
-        {
-            cudaFuncSetAttribute(cascade_prefix_mqa_kernel<T, T_cache, KVCacheBuffer, Dh>,
-                cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(smem_bytes));
-            smem_attr_set = true;
-        }
+        // Opt in to >48 KB dynamic shared memory.  cudaFuncSetAttribute is
+        // idempotent on the driver side, so we just call it unconditionally
+        // every launch and let TLLM_CUDA_CHECK surface any error.
+        TLLM_CUDA_CHECK(cudaFuncSetAttribute(cascade_prefix_mqa_kernel<T, T_cache, KVCacheBuffer, Dh>,
+            cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(smem_bytes)));
         cascade_prefix_mqa_kernel<T, T_cache, KVCacheBuffer, Dh>
             <<<grid, block, smem_bytes, stream>>>(params, kv_cache_buffer, d_input_lengths, ws_out_p, ws_m_p, ws_l_p);
     }
@@ -1320,14 +1226,6 @@ bool launch_cascade_attention(
             <<<grid, block, smem_bytes, stream>>>(params, kv_cache_buffer, d_input_lengths, ws_out_p, ws_m_p, ws_l_p);
     }
 
-    // Phase 0 + Phase 3 removed: current-step K/V write is now done inside
-    // the suffix kernel before the attention loop (leader-elected), and the
-    // prefix/suffix merge is fused into the suffix kernel's epilogue.  The
-    // workspace only carries prefix-side buffers, and we never leave the
-    // stream for launches.
-
-    // No synchronization or deallocation needed. The workspace persists
-    // across calls, and stream ordering guarantees correctness.
     return true;
 }
 

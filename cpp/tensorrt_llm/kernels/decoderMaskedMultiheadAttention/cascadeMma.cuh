@@ -32,8 +32,6 @@ namespace mma
 // so the cascade module does not leak a dependency on the Mamba kernel dir.
 //
 // Supported ops (bf16 + f16 via mma<Tp_>):
-//   - ldmatrix.sync.aligned.m8n8.x4.shared.b16              (4 x 8x8 loads)
-//   - ldmatrix.sync.aligned.m8n8.x2.shared.b16              (2 x 8x8 loads)
 //   - mma.sync.aligned.m16n8k16.row.col.f32.{bf16|f16}...   (16x8 output)
 //   - cp.async.ca.shared.global {.b4, .b8, .b16}            (SM80+ pipelined)
 //
@@ -80,48 +78,6 @@ __device__ __forceinline__ unsigned load_pack2(T const* ptr)
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
-// ldmatrix
-////////////////////////////////////////////////////////////////////////////////////////////////////
-
-template <bool trans = false>
-__device__ __forceinline__ void ldmatrix_x4(unsigned& r0, unsigned& r1, unsigned& r2, unsigned& r3, unsigned smem_addr)
-{
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 750
-    if constexpr (trans)
-    {
-        asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0, %1, %2, %3}, [%4];\n"
-                     : "=r"(r0), "=r"(r1), "=r"(r2), "=r"(r3)
-                     : "r"(smem_addr));
-    }
-    else
-    {
-        asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
-                     : "=r"(r0), "=r"(r1), "=r"(r2), "=r"(r3)
-                     : "r"(smem_addr));
-    }
-#endif
-}
-
-template <bool trans = false>
-__device__ __forceinline__ void ldmatrix_x2(unsigned& r0, unsigned& r1, unsigned smem_addr)
-{
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 750
-    if constexpr (trans)
-    {
-        asm volatile("ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%0, %1}, [%2];\n"
-                     : "=r"(r0), "=r"(r1)
-                     : "r"(smem_addr));
-    }
-    else
-    {
-        asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0, %1}, [%2];\n"
-                     : "=r"(r0), "=r"(r1)
-                     : "r"(smem_addr));
-    }
-#endif
-}
-
-////////////////////////////////////////////////////////////////////////////////////////////////////
 // mma.sync.aligned.m16n8k16
 //
 // Thread-fragment layout (per PTX 8.x spec):
@@ -141,9 +97,6 @@ __device__ __forceinline__ void ldmatrix_x2(unsigned& r0, unsigned& r1, unsigned
 //         c[1] -> (row = t/4,     col = 2*(t%4) + 1)
 //         c[2] -> (row = t/4 + 8, col = 2*(t%4))
 //         c[3] -> (row = t/4 + 8, col = 2*(t%4) + 1)
-//
-// The `ldmatrix.x4` layout is compatible with the A-fragment layout above:
-//   thread t provides the 16-byte-aligned start of its 8-element row.
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 __device__ __forceinline__ void mma_m16n8k16_bf16(float& c0, float& c1, float& c2, float& c3, unsigned a0, unsigned a1,
@@ -204,29 +157,32 @@ __device__ __forceinline__ void mma_m16n8k16<half>(float& c0, float& c1, float& 
 
 // Issue a 16-byte async copy.  smem_addr must be 16B aligned (shared-space),
 // global_ptr must be 16B aligned (generic).
-__device__ __forceinline__ void cp_async_16B(unsigned smem_addr, void const* global_ptr)
+//
+// Optional `src_size` (PTX `cp.async` 4th operand) controls hardware zero-fill:
+//   * src_size == 16 (default): full 16B copy, equivalent to omitting the operand.
+//   * src_size <  16          : bytes [src_size, 16) of the destination SMEM
+//                                are zeroed by the LSU.
+//   * src_size ==  0          : no global load is issued at all (per PTX ISA:
+//                                "if src-size is zero, the access is a no-op");
+//                                the destination 16B are simply zeroed.
+// Callers can therefore use a single uniform issue for both in-bounds and
+// out-of-bounds chunks (passing 16 or 0 respectively) instead of branching
+// on an explicit SMEM zero store.  When `src_size` is the immediate `16`,
+// ptxas emits the compact form without the `src-size` operand.
+__device__ __forceinline__ void cp_async_16B(unsigned smem_addr, void const* global_ptr, unsigned src_size = 16u)
 {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
-    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"(smem_addr), "l"(global_ptr));
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" ::"r"(smem_addr), "l"(global_ptr), "r"(src_size));
 #else
-    // Fallback: synchronous copy via v4.b32.
-    unsigned tmp[4];
-    asm volatile("ld.global.v4.b32 {%0, %1, %2, %3}, [%4];\n"
-                 : "=r"(tmp[0]), "=r"(tmp[1]), "=r"(tmp[2]), "=r"(tmp[3])
-                 : "l"(global_ptr));
+    unsigned tmp[4] = {0u, 0u, 0u, 0u};
+    if (src_size >= 16u)
+    {
+        asm volatile("ld.global.v4.b32 {%0, %1, %2, %3}, [%4];\n"
+                     : "=r"(tmp[0]), "=r"(tmp[1]), "=r"(tmp[2]), "=r"(tmp[3])
+                     : "l"(global_ptr));
+    }
     asm volatile("st.shared.v4.b32 [%0], {%1, %2, %3, %4};\n" ::"r"(smem_addr), "r"(tmp[0]), "r"(tmp[1]), "r"(tmp[2]),
         "r"(tmp[3]));
-#endif
-}
-
-__device__ __forceinline__ void cp_async_8B(unsigned smem_addr, void const* global_ptr)
-{
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
-    asm volatile("cp.async.ca.shared.global [%0], [%1], 8;\n" ::"r"(smem_addr), "l"(global_ptr));
-#else
-    unsigned tmp[2];
-    asm volatile("ld.global.v2.b32 {%0, %1}, [%2];\n" : "=r"(tmp[0]), "=r"(tmp[1]) : "l"(global_ptr));
-    asm volatile("st.shared.v2.b32 [%0], {%1, %2};\n" ::"r"(smem_addr), "r"(tmp[0]), "r"(tmp[1]));
 #endif
 }
 
@@ -242,13 +198,6 @@ __device__ __forceinline__ void cp_async_wait()
 {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
     asm volatile("cp.async.wait_group %0;\n" ::"n"(remain));
-#endif
-}
-
-__device__ __forceinline__ void cp_async_wait_all()
-{
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
-    asm volatile("cp.async.wait_all;\n");
 #endif
 }
 
