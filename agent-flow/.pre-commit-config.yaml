@@ -1,0 +1,41 @@
+default_install_hook_types: [pre-commit, commit-msg]
+repos:
+-   repo: https://github.com/pycqa/isort
+    rev: 5.12.0
+    hooks:
+    -   id: isort
+-   repo: https://github.com/Lucas-C/pre-commit-hooks.git
+    rev: v1.5.5
+    hooks:
+    -   id: remove-crlf
+-   repo: https://github.com/google/yapf
+    rev: v0.43.0
+    hooks:
+    -   id: yapf
+-   repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v6.0.0
+    hooks:
+    -   id: check-added-large-files
+    -   id: check-merge-conflict
+    -   id: check-symlinks
+    -   id: detect-private-key
+    -   id: end-of-file-fixer
+    -   id: check-yaml
+        args: [--allow-multiple-documents, --unsafe]
+        exclude: ".*/gitlab/.*.yml"
+    -   id: trailing-whitespace
+        exclude: '(\.(patch|md))$'
+    -   id: check-toml
+-   repo: https://github.com/PyCQA/autoflake
+    rev: v2.3.1
+    hooks:
+    -   id: autoflake
+        additional_dependencies:
+        - tomli
+        args: ['--config', 'pyproject.toml']
+-   repo: https://github.com/codespell-project/codespell
+    rev: v2.4.1
+    hooks:
+    -   id: codespell
+        additional_dependencies:
+        - tomli
