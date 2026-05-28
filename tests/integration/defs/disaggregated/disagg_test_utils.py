@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -19,7 +19,6 @@ import asyncio
 import os
 import shutil
 import subprocess
-import sys
 import tempfile
 import time
 import traceback
@@ -107,9 +106,7 @@ def _run_worker(
         yaml.dump(worker_config, f)
         f.flush()
         cmd = [
-            sys.executable,
-            "-m",
-            "tensorrt_llm.commands.serve",
+            "trtllm-serve",
             "serve",
             model_name,
             "--host",
@@ -189,14 +186,7 @@ def run_disagg_server(disagg_cluster_config, work_dir, port=0, save_log=False, e
     disagg_cluster_config["port"] = port
     with open(disagg_server_config_path, "w+") as f:
         yaml.dump(disagg_cluster_config, f)
-    cmds = [
-        sys.executable,
-        "-m",
-        "tensorrt_llm.commands.serve",
-        "disaggregated",
-        "-c",
-        disagg_server_config_path,
-    ]
+    cmds = ["trtllm-serve", "disaggregated", "-c", disagg_server_config_path]
     log_file = None
     log_path = None
     # See WAR rationale in _run_worker above (nvbugs/5821433).
