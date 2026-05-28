@@ -19,6 +19,7 @@ from tensorrt_llm._torch.modules.linear import (
     WeightMode,
     WeightsLoadingConfig,
 )
+from tensorrt_llm._torch.modules.rms_norm import RMSNorm
 from tensorrt_llm._torch.modules.swiglu import swiglu
 from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
 from tensorrt_llm._torch.visual_gen.models.flux.joint_proj import (
@@ -26,7 +27,6 @@ from tensorrt_llm._torch.visual_gen.models.flux.joint_proj import (
     FluxJointQKVMLPProj,
 )
 from tensorrt_llm._torch.visual_gen.modules.attention import Attention, QKVMode, apply_rotary_emb
-from tensorrt_llm._torch.visual_gen.modules.rms_norm import RMSNorm
 
 # =============================================================================
 # Joint Attention (shared by FLUX.1 and FLUX.2 dual-stream blocks)

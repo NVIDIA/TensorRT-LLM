@@ -34,7 +34,6 @@ from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
 from tensorrt_llm._torch.visual_gen.models.flux.attention import FluxJointAttention
 from tensorrt_llm._torch.visual_gen.models.flux.joint_proj import FluxJointAttnMLPProj
 from tensorrt_llm._torch.visual_gen.models.flux.pos_embed_flux import FluxPosEmbed
-from tensorrt_llm._torch.visual_gen.modules.rms_norm import RMSNorm
 from tensorrt_llm._torch.visual_gen.quantization.loader import DynamicLinearWeightLoader
 from tensorrt_llm._torch.visual_gen.utils import SequenceSharder
 from tensorrt_llm.models.modeling_utils import QuantConfig
@@ -909,9 +908,6 @@ class FluxTransformer2DModel(nn.Module):
 
                 if weight_dicts:
                     loader.load_linear_weights(module, name, weight_dicts)
-            elif isinstance(module, RMSNorm):
-                module_weights = loader.filter_weights(name, weights)
-                module.load_weights(module_weights)
             else:
                 module_weights = loader.filter_weights(name, weights)
                 for param_name, param in module._parameters.items():

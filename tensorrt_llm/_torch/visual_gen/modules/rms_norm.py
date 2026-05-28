@@ -23,7 +23,7 @@ from tensorrt_llm.functional import AllReduceStrategy
 from tensorrt_llm.mapping import Mapping
 
 
-class RMSNorm(nn.Module):
+class RMSNormTPAware(nn.Module):
     def __init__(
         self,
         *,
