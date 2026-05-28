@@ -565,6 +565,18 @@ class Attention(nn.Module):
         fused norm+RoPE kernel would let it write directly into the slot,
         saving one alloc + one copy + one kernel launch per Q/K closure.
         """
+        # Runtime precondition guard. Without async_ulysses=True at init,
+        # `self.attn` is the bare backend (e.g. TrtllmAttention) which has
+        # no `forward_async` method — the inner call below would otherwise
+        # crash with a non-prescriptive AttributeError deep in the function.
+        if not hasattr(self.attn, "forward_async"):
+            raise ValueError(
+                "Attention.forward_async() requires the inner attention to be a "
+                "UlyssesAttention with async_pipeline=True. Build the Attention with "
+                "ParallelConfig(ulysses_size > 1, async_ulysses=True), or use "
+                "forward() for sync execution."
+            )
+
         B, S, _ = hidden_states.shape
         H = self.num_attention_heads
         KV = self.num_key_value_heads

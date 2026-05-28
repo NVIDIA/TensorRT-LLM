@@ -53,6 +53,10 @@ void ulysses_permute_scatter(torch::Tensor& input, // [B, S_local, H, D]
     CHECK_INPUT(send_buf, torch::kBFloat16);
     CHECK_INPUT(recv_buf, torch::kBFloat16);
 
+    // Validate P first: P=0 would crash on `H % P` below (UB; SIGFPE on x86)
+    // and on `my_rank < P` after `0 <= my_rank` trivially passes.
+    TORCH_CHECK(P > 0, "P (world_size) must be positive");
+
     int64_t const B = input.size(0);
     int64_t const S_local = input.size(1);
     int64_t const H = input.size(2);
@@ -67,6 +71,15 @@ void ulysses_permute_scatter(torch::Tensor& input, // [B, S_local, H, D]
             && recv_buf.size(3) == H_local && recv_buf.size(4) == D,
         "recv_buf shape mismatch");
     TORCH_CHECK(0 <= my_rank && my_rank < P, "my_rank out of range");
+
+    // Empty-tensor no-op: B=0 or S_local=0 produces zero grid extent in the
+    // kernel launcher (undefined cuLaunchKernel behavior across CUDA versions).
+    // Shape consistency between input/send_buf/recv_buf was already enforced
+    // above, so empty input implies empty buffers — nothing to write.
+    if (input.numel() == 0)
+    {
+        return;
+    }
 
     auto stream = at::cuda::getCurrentCUDAStream();
     tensorrt_llm::kernels::launchUlyssesPermuteScatter(input.data_ptr(), send_buf.data_ptr(), recv_buf.data_ptr(),

@@ -44,6 +44,12 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> ulysses_post_unscatter_q
     CHECK_INPUT(k_in, torch::kBFloat16);
     CHECK_INPUT(v_in, torch::kBFloat16);
 
+    // D % 8 enforced here at op boundary (mirrors sibling ulysses_permute_scatter).
+    // Without this, torch::empty allocates the three output tensors before the
+    // kernel launcher's TLLM_CHECK_WITH_INFO fires, producing a less-actionable
+    // error path. Vec width is 8 elements for bf16 (16-byte vectorized stores).
+    TORCH_CHECK(q_in.size(-1) % 8 == 0, "D (last dim) must be divisible by 8 (bf16 vec=8)");
+
     int64_t const P = q_in.size(0);
     int64_t const B = q_in.size(1);
     int64_t const Sp = q_in.size(2);
@@ -54,6 +60,15 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> ulysses_post_unscatter_q
     auto q_out = torch::empty({B, H, P * Sp, D}, opts);
     auto k_out = torch::empty({B, H, P * Sp, D}, opts);
     auto v_out = torch::empty({B, H, P * Sp, D}, opts);
+
+    // Empty-tensor no-op: P=0/B=0/Sp=0 produces zero grid extent in the
+    // kernel launcher (undefined cuLaunchKernel behavior across CUDA versions).
+    // The three output tensors above are already empty-shaped via P*Sp=0 or B=0,
+    // so returning them directly preserves the (B, H, P*Sp, D) contract.
+    if (q_in.numel() == 0)
+    {
+        return std::make_tuple(q_out, k_out, v_out);
+    }
 
     auto stream = at::cuda::getCurrentCUDAStream();
     tensorrt_llm::kernels::launchUlyssesPostUnscatter(q_in.data_ptr(), k_in.data_ptr(), v_in.data_ptr(),

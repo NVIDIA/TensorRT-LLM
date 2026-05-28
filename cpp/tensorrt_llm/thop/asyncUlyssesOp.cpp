@@ -46,6 +46,7 @@
 #include "tensorrt_llm/thop/thUtils.h"
 
 #include <ATen/cuda/CUDAEvent.h>
+#include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAStream.h>
 #include <torch/csrc/distributed/c10d/ProcessGroup.hpp>
 #include <torch/csrc/distributed/c10d/Store.hpp>
@@ -66,11 +67,18 @@ namespace torch_ext
 // Opaque handle returned by `_prepare`, consumed by `_async`. Hides raw
 // pointer plumbing from Python; `send_t` keeps the slot's sendBuf tensor
 // view alive across the two op calls.
+//
+// `group_name` binds the handle to the PG that produced it: peer_recv_ptrs
+// are valid only in that PG's symm-mem registration. `_async` rejects any
+// PG whose group name doesn't match — two distinct PGs of the same size
+// would otherwise pass the peer-pointer-count check and silently push
+// into the wrong group's buffers.
 struct SendHandle : torch::CustomClassHolder
 {
     torch::Tensor send_t;
     std::vector<int64_t> peer_recv_ptrs;
     int64_t slot_bytes;
+    std::string group_name;
 };
 
 #if ENABLE_MULTI_DEVICE
@@ -291,6 +299,13 @@ private:
     // Lazy collective allocator. Cached when size is sufficient; reallocates
     // (releasing the old handle) on size-up. All ranks must reach this in the
     // same order (collective rendezvous).
+    //
+    // Commit-on-success: every allocation step writes to local variables
+    // first, and the cached `slot` is mutated only after all steps succeed.
+    // If `empty_strided_p2p`, `rendezvous`, `get_buffer_ptrs`, or `cudaMalloc`
+    // throws mid-way, the local at::Tensor / intrusive_ptr clean up via RAII
+    // and the previously-cached slot remains untouched (so the next call
+    // either retries or reuses the still-valid prior state).
     Slot& getOrAllocSlot(int slotIdx, size_t requiredSize)
     {
         std::lock_guard<std::mutex> lock(mSlotsMutex);
@@ -313,55 +328,44 @@ private:
             "is not graph-capture-safe. Warm up the model out-of-capture (run one forward "
             "pass before enabling cuda_graph capture) so slots are cached.");
 
-        // Size-up: drop refs to old handle/tensor, then alloc fresh.
-        if (slot.basePtr != nullptr)
-        {
-            slot.handle.reset();
-            slot.symm_tensor = at::Tensor();
-            slot.basePtr = nullptr;
-            slot.size = 0;
-            slot.peerPtrs.clear();
-        }
-
         int currentDev = -1;
         TLLM_CUDA_CHECK(cudaGetDevice(&currentDev));
         c10::Device device(c10::DeviceType::CUDA, currentDev);
         std::string const& groupName = mPg->getGroupName();
         int const pSize = mPg->getSize();
 
-        slot.symm_tensor = c10d::symmetric_memory::empty_strided_p2p(
+        // Build new state in local variables — no mutation of `slot` yet.
+        at::Tensor newSymmTensor = c10d::symmetric_memory::empty_strided_p2p(
             /*size=*/{static_cast<int64_t>(requiredSize)}, /*stride=*/{1},
             /*dtype=*/at::kByte, device,
             /*group_name=*/std::make_optional(groupName), /*alloc_id=*/std::nullopt);
-        slot.handle = c10d::symmetric_memory::rendezvous(slot.symm_tensor, groupName);
-        TLLM_CHECK_WITH_INFO(slot.handle, "rendezvous returned null handle");
+        auto newHandle = c10d::symmetric_memory::rendezvous(newSymmTensor, groupName);
+        TLLM_CHECK_WITH_INFO(newHandle, "rendezvous returned null handle");
 
-        slot.basePtr = slot.symm_tensor.data_ptr();
-        slot.size = requiredSize;
-
-        auto ptrs = slot.handle->get_buffer_ptrs();
+        auto ptrs = newHandle->get_buffer_ptrs();
         TLLM_CHECK_WITH_INFO(
             static_cast<int>(ptrs.size()) == pSize, "get_buffer_ptrs size %zu != world_size %d", ptrs.size(), pSize);
-        slot.peerPtrs.assign(pSize, nullptr);
-        for (int p = 0; p < pSize; ++p)
-        {
-            slot.peerPtrs[p] = ptrs[p];
-        }
+        std::vector<void*> newPeerPtrs(ptrs.begin(), ptrs.end());
 
-        // sendBuf: regular cudaMalloc, sized to match basePtr. The
-        // cudaStreamIsCapturing guard above prevents this from running under
-        // capture; the data path (run_a2a_ce_push) just reads from it.
-        if (slot.sendBuf != nullptr && slot.sendBufBytes < requiredSize)
+        // cudaMalloc last so any throw above is cleaned up by newSymmTensor /
+        // newHandle RAII without leaking GPU memory.
+        void* newSendBuf = nullptr;
+        TLLM_CUDA_CHECK(cudaMalloc(&newSendBuf, requiredSize));
+
+        // All allocations succeeded — commit. Free old sendBuf (the raw void*
+        // isn't owned by any RAII type in Slot); the at::Tensor / intrusive_ptr
+        // fields are released by move-assign.
+        if (slot.sendBuf != nullptr)
         {
             (void) cudaFree(slot.sendBuf);
-            slot.sendBuf = nullptr;
-            slot.sendBufBytes = 0;
         }
-        if (slot.sendBuf == nullptr)
-        {
-            TLLM_CUDA_CHECK(cudaMalloc(&slot.sendBuf, requiredSize));
-            slot.sendBufBytes = requiredSize;
-        }
+        slot.symm_tensor = std::move(newSymmTensor);
+        slot.handle = std::move(newHandle);
+        slot.basePtr = slot.symm_tensor.data_ptr();
+        slot.size = requiredSize;
+        slot.peerPtrs = std::move(newPeerPtrs);
+        slot.sendBuf = newSendBuf;
+        slot.sendBufBytes = requiredSize;
 
         return slot;
     }
@@ -401,9 +405,17 @@ static std::shared_ptr<AsyncUlyssesOp> getOrCreateOp(c10::intrusive_ptr<c10d::Pr
 std::tuple<torch::Tensor, c10::intrusive_ptr<SendHandle>> ulysses_a2a_async_prepare(
     torch::Tensor input_4d, c10::intrusive_ptr<c10d::ProcessGroup> const& pg)
 {
+    TORCH_CHECK(input_4d.is_cuda(), "input must be on CUDA");
     TORCH_CHECK(input_4d.is_contiguous(), "input must be contiguous");
     TORCH_CHECK(input_4d.dim() == 4, "input must be [B, S_local, H, D]");
     TORCH_CHECK(input_4d.scalar_type() == at::ScalarType::BFloat16, "bf16 only");
+
+    // Bind current device + slot allocator + kernel launch to the input's
+    // device. `getOrAllocSlot` reads `cudaGetDevice()`, and the kernel stream
+    // is taken from `input_4d.get_device()`; without this guard the two can
+    // diverge (e.g. caller forgot a torch.cuda.set_device) → slot allocated
+    // on dev A, kernel launched on dev B → illegal memory access.
+    c10::cuda::CUDAGuard device_guard(input_4d.device());
 
     int const B = static_cast<int>(input_4d.size(0));
     int const S_local = static_cast<int>(input_4d.size(1));
@@ -429,6 +441,7 @@ std::tuple<torch::Tensor, c10::intrusive_ptr<SendHandle>> ulysses_a2a_async_prep
     send_h->send_t = std::move(send_t);
     send_h->peer_recv_ptrs = std::move(peer_recv_ptrs);
     send_h->slot_bytes = slot_bytes;
+    send_h->group_name = pg->getGroupName();
 
     return std::make_tuple(std::move(recv_t), send_h);
 }
@@ -440,6 +453,14 @@ void ulysses_a2a_async(c10::intrusive_ptr<SendHandle> const& send_h, c10::intrus
 {
     TORCH_CHECK(send_h.get() != nullptr, "send_h is null");
     TORCH_CHECK(send_h->send_t.defined(), "send_h.send_t is undefined");
+
+    // Reject cross-PG handle use: peer_recv_ptrs are valid only in the symm-mem
+    // group registered for the PG that produced this handle. Two PGs of the
+    // same size would otherwise pass the peer-count check inside runCePush and
+    // silently push into the wrong group's buffers.
+    TORCH_CHECK(send_h->group_name == pg->getGroupName(), "SendHandle was produced by ProcessGroup '",
+        send_h->group_name, "' but ulysses_a2a_async was called with ProcessGroup '", pg->getGroupName(),
+        "'. Handle and PG must match.");
 
     auto op = getOrCreateOp(pg);
     op->runCePush(send_h->send_t, send_h->peer_recv_ptrs, send_h->slot_bytes);
