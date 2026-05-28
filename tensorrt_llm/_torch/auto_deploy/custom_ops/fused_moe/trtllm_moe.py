@@ -459,9 +459,15 @@ def _run_trtllm_gen_nvfp4_moe_with_alltoall(
     if torch.cuda.is_current_stream_capturing() or cuda_graph_state.in_warm_up():
         tight_per_source = min(local_num_tokens * top_k, max_num_tokens)
         # Only slice when the saving outweighs the per-call overhead. Threshold
-        # *4 admits cg_batch_size up to ~8 for max=8192. c=1..4 are huge wins,
-        # c=8 is moderate; c>=16 broke even or regressed in prior experiments.
-        use_tight_path = tight_per_source * 4 <= max_num_tokens
+        # *16 admits cg_batch_size up to ~2 (per-rank) for max=8192. The MoE
+        # FC1 GEMM tactic (``bmm_E2m1``) selected by the trtllm-gen autotuner
+        # has a per-call regression for M in the ~1500..5000 range vs the
+        # full-M tactic: at M=4928 (cg=8/per-rank) it's +26% per call, which
+        # for 40 layers × 7 MTP positions = 280 calls/iter adds ~6 ms of GEMM
+        # overhead that swamps the dispatch/sanitize/combine savings. Gating
+        # the tight path to cg ≤ 2 keeps the c=1..8 (bench) wins while
+        # avoiding the c=32 regression.
+        use_tight_path = tight_per_source * 16 <= max_num_tokens
     else:
         tight_per_source = max_num_tokens
         use_tight_path = False
