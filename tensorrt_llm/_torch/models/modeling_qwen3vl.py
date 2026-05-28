@@ -46,9 +46,8 @@ from .modeling_multimodal_utils import (
     find_input_mm_embeds,
     fuse_input_embeds,
     get_multimodal_embeddings,
-    install_qwen_vl_processor_defaults_fix,
 )
-from .modeling_qwen2vl import Qwen2_5_VLVisionAttention
+from .modeling_qwen2vl import Qwen2_5_VLVisionAttention, install_qwen_vl_processor_defaults_fix
 from .modeling_utils import (
     ModelConfig,
     QuantConfig,

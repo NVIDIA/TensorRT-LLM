@@ -38,7 +38,7 @@ import pytest
 
 transformers = pytest.importorskip("transformers")
 
-from tensorrt_llm._torch.models.modeling_multimodal_utils import (  # noqa: E402
+from tensorrt_llm._torch.models.modeling_qwen2vl import (  # noqa: E402
     install_qwen_vl_processor_defaults_fix,
 )
 
