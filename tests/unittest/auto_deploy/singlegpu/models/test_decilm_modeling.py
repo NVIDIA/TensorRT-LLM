@@ -87,7 +87,7 @@ def _create_small_config():
     except Exception:
         pytest.skip("Cannot load DeciLMConfig from HF (network or cache unavailable)")
 
-    return ConfigCls(
+    config = ConfigCls(
         vocab_size=1000,
         hidden_size=64,
         num_hidden_layers=3,
@@ -107,6 +107,8 @@ def _create_small_config():
         },
         block_configs=_SMALL_BLOCK_CONFIGS,
     )
+    config._attn_implementation = "eager"
+    return config
 
 
 # =============================================================================

@@ -79,6 +79,7 @@ def get_settings(params: dict, dataset_metadata: DatasetMetadata, model: str,
     """
     extra_llm_api_options = params.get("extra_llm_api_options")
     enable_chunked_prefill = params.get("enable_chunked_prefill", False)
+    enable_attention_dp = False
 
     kv_cache_dtype = "auto"
     mamba_ssm_cache_dtype = params.get("mamba_ssm_cache_dtype", "auto")
@@ -86,15 +87,20 @@ def get_settings(params: dict, dataset_metadata: DatasetMetadata, model: str,
     if extra_llm_api_options:
         with open(extra_llm_api_options, 'r') as f:
             llm_args_dict = yaml.safe_load(f)
-            kv_cache_config = llm_args_dict.get("kv_cache_config", {
-                "dtype": "auto",
-            })
-            kv_cache_dtype = kv_cache_config.get("dtype", "auto")
-            mamba_ssm_cache_dtype = kv_cache_config.get("mamba_ssm_cache_dtype",
-                                                        mamba_ssm_cache_dtype)
+        if not isinstance(llm_args_dict, dict):
+            raise TypeError(
+                f"extra_llm_api_options must contain a YAML mapping, "
+                f"got {type(llm_args_dict)}")
+        kv_cache_config = llm_args_dict.get("kv_cache_config", {
+            "dtype": "auto",
+        })
+        kv_cache_dtype = kv_cache_config.get("dtype", "auto")
+        mamba_ssm_cache_dtype = kv_cache_config.get("mamba_ssm_cache_dtype",
+                                                    mamba_ssm_cache_dtype)
 
         enable_chunked_prefill = llm_args_dict.get("enable_chunked_prefill",
                                                    enable_chunked_prefill)
+        enable_attention_dp = llm_args_dict.get("enable_attention_dp", False)
 
     mapping = {
         "pp_size": params.get("pp"),
@@ -137,6 +143,7 @@ def get_settings(params: dict, dataset_metadata: DatasetMetadata, model: str,
             dataset_metadata.avg_isl,
             dataset_metadata.avg_osl,
             params.get("kv_cache_free_gpu_mem_fraction"),
+            enable_attention_dp=enable_attention_dp,
         )
 
         logger.info(

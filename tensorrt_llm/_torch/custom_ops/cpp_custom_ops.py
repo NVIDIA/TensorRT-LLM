@@ -1075,7 +1075,6 @@ def _register_fake():
         head_size: int,
         tokens_per_block: int,
         attention_window_size: int,
-        sink_token_length: int,
         beam_width: int,
         quant_mode: int,
         q_scaling: float,

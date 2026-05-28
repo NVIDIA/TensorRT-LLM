@@ -52,10 +52,19 @@ def _apply_split_rotary_emb(
 ) -> torch.Tensor:
     needs_reshape = False
     if input_tensor.ndim != 4 and cos_freqs.ndim == 4:
-        _, h, t, _ = cos_freqs.shape
+        # cos/sin are token-major [B, T, H, D]; reshape input to match.
+        _, t, h, _ = cos_freqs.shape
         b = input_tensor.shape[0]
-        input_tensor = input_tensor.reshape(b, t, h, -1).swapaxes(1, 2)
+        input_tensor = input_tensor.reshape(b, t, h, -1)
         needs_reshape = True
+
+    # cos/sin are stored block-duplicated to head_dim (see _split_freqs_cis)
+    # so the fused kernel can read directly. The SPLIT formula uses only the
+    # first half (head_dim/2) since both halves are identical.
+    if cos_freqs.shape[-1] == input_tensor.shape[-1]:
+        half = cos_freqs.shape[-1] // 2
+        cos_freqs = cos_freqs[..., :half]
+        sin_freqs = sin_freqs[..., :half]
 
     split_input = rearrange(input_tensor, "... (d r) -> ... d r", d=2)
     first_half_input = split_input[..., :1, :]
@@ -70,7 +79,7 @@ def _apply_split_rotary_emb(
 
     output = rearrange(output, "... d r -> ... (d r)")
     if needs_reshape:
-        output = output.swapaxes(1, 2).reshape(b, t, -1)
+        output = output.reshape(b, t, -1)
 
     return output
 
@@ -163,8 +172,18 @@ def _split_freqs_cis(
         sin_freq = torch.cat([sin_padding, sin_freq], dim=-1)
 
     b, t = cos_freq.shape[0], cos_freq.shape[1]
-    cos_freq = cos_freq.reshape(b, t, num_attention_heads, -1).swapaxes(1, 2)
-    sin_freq = sin_freq.reshape(b, t, num_attention_heads, -1).swapaxes(1, 2)
+    # Token-major layout [B, T, H, D]: matches the layout the fused norm+RoPE
+    # kernel consumes after reshape(-1, H*D), so no permute/contiguous is needed
+    # in the helper before kernel launch.
+    cos_freq = cos_freq.reshape(b, t, num_attention_heads, -1)
+    sin_freq = sin_freq.reshape(b, t, num_attention_heads, -1)
+    # Block-duplicate per-head cos/sin from head_dim/2 to head_dim along the last
+    # dim so the fused norm+RoPE kernel (rotate-half / INTERLEAVE=false branch)
+    # can consume the layout directly. The eager _apply_split_rotary_emb slices
+    # back to head_dim/2 when needed; both halves are identical so the operation
+    # is bit-identical to the original SPLIT-format cos/sin.
+    cos_freq = torch.cat([cos_freq, cos_freq], dim=-1)
+    sin_freq = torch.cat([sin_freq, sin_freq], dim=-1)
     return cos_freq, sin_freq
 
 

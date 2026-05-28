@@ -544,6 +544,10 @@ class Mamba2Mixer(nn.Module):
                 elif self._use_mtp_custom_op and not use_stochastic_rounding:
                     # Upstream TRT-LLM CUDA custom op for MTP SSM cache update.
                     # Does not support stochastic rounding.
+                    # CUDA kernel requires contiguous dense inputs.
+                    x_d_4d = x_d_4d.contiguous()
+                    B_d_4d = B_d_4d.contiguous()
+                    C_d_4d = C_d_4d.contiguous()
                     selective_state_update_mtp_ssm_cache_trtllm(
                         ssm_states,
                         x_d_4d,
@@ -563,7 +567,7 @@ class Mamba2Mixer(nn.Module):
                         intermediate_state_indices=intermediate_state_indices,
                     )
                 else:
-                    # Legacy flashinfer path: contiguous copies for alignment.
+                    # Triton kernel + flashinfer need contiguous for alignment.
                     x_d_4d = x_d_4d.contiguous()
                     B_d_4d = B_d_4d.contiguous()
                     C_d_4d = C_d_4d.contiguous()
