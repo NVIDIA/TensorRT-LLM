@@ -336,6 +336,10 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
 
 
 class CuteDslFusedMoE(CutlassFusedMoE):
+    # CuteDSL dispatch/combine path exercises the ceil/floor partition
+    # (NVLinkOneSided alltoall with kernel-level remainder handling), so this
+    # backend is the only opt-in for non-divisible EP today.
+    _supports_non_divisible_ep: bool = True
     """CuteDSL flow of fused mixture of experts (MoE) Layer.
 
     Args:

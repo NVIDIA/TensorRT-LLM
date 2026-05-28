@@ -1,4 +1,4 @@
-model: DeepSeek-R1/DeepSeek-R1-0528-FP4-v2
+model: gpt_oss/gpt-oss-120b
 hostname: localhost
 backend: pytorch
 context_servers:
@@ -12,12 +12,17 @@ context_servers:
   max_batch_size: 128
   trust_remote_code: true
   enable_chunked_prefill: true
+  disable_overlap_scheduler: true
+  speculative_config: &eagle_spec
+    decoding_type: Eagle
+    max_draft_len: 3
+    eagle3_one_model: true
+    speculative_model: gpt_oss/gpt-oss-120b-Eagle3
   kv_cache_config:
     enable_block_reuse: false
     free_gpu_memory_fraction: 0.8
-    dtype: fp8
   moe_config:
-    backend: TRTLLM
+    backend: CUTLASS
   cuda_graph_config: null
   print_iter_log: true
   cache_transceiver_config:
@@ -34,12 +39,13 @@ generation_servers:
   max_batch_size: 128
   trust_remote_code: true
   enable_chunked_prefill: true
+  disable_overlap_scheduler: true
+  speculative_config: *eagle_spec
   kv_cache_config:
     enable_block_reuse: false
     free_gpu_memory_fraction: 0.8
-    dtype: fp8
   moe_config:
-    backend: TRTLLM
+    backend: CUTLASS
   cuda_graph_config:
     enable_padding: true
     batch_sizes:
