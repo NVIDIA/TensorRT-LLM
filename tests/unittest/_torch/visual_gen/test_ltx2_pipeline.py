@@ -537,6 +537,52 @@ class TestLTX2BatchSupport:
 class TestTwoStageLoRAHelpers:
     """Test LoRA delta loading and application without checkpoints."""
 
+    def test_bf16_weight_snapshot_gate_uses_cuda_free_memory(self, monkeypatch):
+        from tensorrt_llm._torch.visual_gen.models.ltx2.pipeline_ltx2_two_stages import (
+            _should_save_bf16_weights,
+        )
+
+        gib = 1024**3
+        monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+        monkeypatch.setattr(torch.cuda, "mem_get_info", lambda: (116 * gib, 180 * gib))
+        assert _should_save_bf16_weights()
+
+        monkeypatch.setattr(torch.cuda, "mem_get_info", lambda: (115 * gib, 180 * gib))
+        assert not _should_save_bf16_weights()
+
+        monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+        assert not _should_save_bf16_weights()
+
+    def test_bf16_weight_snapshot_saved_when_requested(self):
+        from tensorrt_llm._torch.visual_gen.models.ltx2.pipeline_ltx2_two_stages import (
+            _apply_lora_deltas,
+            _restore_lora_state,
+            _subtract_dense_lora_deltas,
+        )
+
+        linear = torch.nn.Linear(32, 32, bias=False).bfloat16()
+        original_weight = linear.weight.data.clone()
+        deltas = {"weight": torch.randn(32, 32) * 0.1}
+
+        applied, saved_state, snapshot_required = _apply_lora_deltas(
+            linear,
+            deltas,
+            sign=1.0,
+            save_bf16_weights=True,
+        )
+
+        assert applied == 1
+        assert snapshot_required == 1
+        assert "weight" in saved_state
+        assert torch.allclose(saved_state["weight"], original_weight)
+        assert not torch.allclose(linear.weight.data, original_weight)
+
+        removed = _subtract_dense_lora_deltas(linear, deltas, saved_state)
+        assert removed == 0
+
+        _restore_lora_state(linear, saved_state)
+        assert torch.allclose(linear.weight.data, original_weight)
+
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     def test_apply_and_remove_deltas_bf16(self):
         """Merge then unmerge in BF16 should leave weights approximately unchanged."""
@@ -554,7 +600,7 @@ class TestTwoStageLoRAHelpers:
 
         applied, saved_state, snapshot_required = _apply_lora_deltas(linear, deltas, sign=1.0)
         assert applied == 1, "Expected one parameter to be modified"
-        assert saved_state == {}, "Dense BF16 weights should not be snapshotted"
+        assert saved_state == {}, "BF16 weights should not be snapshotted by default"
         assert snapshot_required == 0
         assert not torch.allclose(linear.weight.data, original_weight), (
             "Weights should have changed after applying delta"
@@ -597,7 +643,7 @@ class TestTwoStageLoRAHelpers:
         rounds = 10
         for _ in range(rounds):
             _, saved_state, snapshot_required = _apply_lora_deltas(model, deltas, sign=1.0)
-            assert saved_state == {}, "Dense BF16 weights should not be snapshotted"
+            assert saved_state == {}, "BF16 weights should not be snapshotted by default"
             assert snapshot_required == 0
             _subtract_dense_lora_deltas(model, deltas, saved_state)
 
@@ -605,8 +651,8 @@ class TestTwoStageLoRAHelpers:
         assert drift < 0.1, f"bf16 drift after {rounds} rounds too large: {drift:.2e}"
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-    def test_dense_lora_state_not_saved_and_subtract_restores(self):
-        """Dense weights are restored by subtraction without snapshot storage."""
+    def test_fp32_state_not_saved_and_subtract_restores(self):
+        """FP32 weights restore by subtraction, even when BF16 snapshots are enabled."""
         from tensorrt_llm._torch.visual_gen.models.ltx2.pipeline_ltx2_two_stages import (
             _apply_lora_deltas,
             _subtract_dense_lora_deltas,
@@ -617,16 +663,21 @@ class TestTwoStageLoRAHelpers:
         original_weight = linear.weight.data.clone()
 
         deltas = {"weight": torch.randn(32, 32, device=device) * 0.1}
-        _, saved_state, snapshot_required = _apply_lora_deltas(linear, deltas, sign=1.0)
+        _, saved_state, snapshot_required = _apply_lora_deltas(
+            linear,
+            deltas,
+            sign=1.0,
+            save_bf16_weights=True,
+        )
 
-        assert saved_state == {}, "Dense FP32 weights should not be snapshotted"
+        assert saved_state == {}, "FP32 weights should not use the BF16 snapshot path"
         assert snapshot_required == 0
         assert not torch.allclose(linear.weight.data, original_weight)
 
         removed = _subtract_dense_lora_deltas(linear, deltas, saved_state)
         assert removed == 1
         assert torch.allclose(linear.weight.data, original_weight), (
-            "Dense LoRA subtraction should restore weights"
+            "FP32 LoRA subtraction should restore weights"
         )
 
 
@@ -1111,7 +1162,7 @@ class TestLTX2TwoStagePipelineLoading:
             print(f"\n[Two-Stage] LoRA apply rate: {match_rate:.1f}% ({applied}/{total})")
             assert match_rate > 99.0, f"Expected >99% LoRA match rate, got {match_rate:.1f}%"
 
-            assert saved_state == {}, "BF16 checkpoint should not snapshot dense weights"
+            assert saved_state == {}, "BF16 checkpoint should not snapshot weights by default"
             assert snapshot_required == 0
 
             # Verify dense unmerge by subtraction
