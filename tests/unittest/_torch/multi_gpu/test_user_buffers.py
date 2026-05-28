@@ -566,6 +566,17 @@ def run_single_rank_backend_passes_are_per_instance(tensor_parallel_size):
                 "add_norm_fallback",
             ]
 
+    # A second Backend with the same config must build a distinct pass list —
+    # guards against any future reintroduction of class-level pass caching.
+    backend_ub2 = Backend(enable_inductor=False,
+                          enable_userbuffers=True,
+                          mapping=mapping)
+    for p1, p2 in zip(backend_ub.custom_passes, backend_ub2.custom_passes):
+        assert p1 is not p2
+    for p_no_ub, p_ub in zip(backend_no_ub.custom_passes,
+                             backend_ub.custom_passes):
+        assert p_no_ub is not p_ub
+
     return True
 
 
