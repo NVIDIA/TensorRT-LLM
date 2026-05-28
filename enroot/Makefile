@@ -40,6 +40,7 @@ run_sqsh:
 		--container-mounts "$(SOURCE_DIR):$(CODE_DIR)" --container-workdir $(CODE_DIR) \
 		--container-mount-home --container-remap-root \
 		--export PYTORCH_ALLOC_CONF=garbage_collection_threshold:0.99999 \
+		--trigger \
 		$(RUN_CMD)
 
 endif
