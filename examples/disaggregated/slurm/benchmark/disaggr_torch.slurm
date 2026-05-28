@@ -154,6 +154,14 @@ client_cmds_base_file=${full_logdir}/client_cmds_base.sh
 client_cmds_file=${full_logdir}/client_cmds.sh
 replace_placeholder "${client_cmds_base_file}" "${all_nodes_str}" "${client_cmds_file}"
 
+# Per-worker hostfile / gpu_map files for srun --distribution=arbitrary.
+# submit.py emits *_base.txt with <nodeN_placeholder>; rewrite them here.
+for base_file in "${full_logdir}"/hostfile_*_base.txt "${full_logdir}"/gpu_map_*_base.txt; do
+    [ -f "${base_file}" ] || continue
+    runtime_file="${base_file%_base.txt}.txt"
+    replace_placeholder "${base_file}" "${all_nodes_str}" "${runtime_file}"
+done
+
 # start the servers (skip ctx workers if TRTLLM_DISAGG_BENCHMARK_GEN_ONLY is set).
 echo "Starting worker commands from ${start_server_cmds_file}..."
 cat ${start_server_cmds_file} | while read cmd; do
