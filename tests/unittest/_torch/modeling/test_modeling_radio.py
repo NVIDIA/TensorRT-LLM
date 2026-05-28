@@ -85,6 +85,7 @@ def test_radio_fp8_parent_kv_cache_does_not_leak_into_vit(tiny_vit_config):
     # MultimodalEncoderMixin) several levels deep, so the call site has to
     # walk submodules instead of calling setup_attn_metadata on the wrapper.
     from tensorrt_llm._torch.models.modeling_multimodal_encoder import MultimodalEncoderMixin
+
     for module in vision_model.modules():
         if isinstance(module, MultimodalEncoderMixin):
             module.setup_attn_metadata(max_num_requests=8192, max_num_tokens=8192)

@@ -209,8 +209,7 @@ class Qwen3VLInputProcessorBase(BaseMultimodalInputProcessor, BaseMultimodalDumm
         min_pixels = self._get_processor_min_pixels()
         if min_pixels and min_pixels > 0:
             min_dim_post_merger = math.ceil(math.sqrt(min_pixels) / unit)
-            post_merger_budget = max(post_merger_budget,
-                                     min_dim_post_merger * min_dim_post_merger)
+            post_merger_budget = max(post_merger_budget, min_dim_post_merger * min_dim_post_merger)
 
         h_factor, w_factor = closest_factor_pair(post_merger_budget)
         for seq_len in range(post_merger_budget, 0, -1):
@@ -873,9 +872,6 @@ class Qwen3VisionModel(torch.nn.Module, MultimodalEncoderMixin):
     @property
     def device(self) -> torch.device:
         return self.patch_embed.proj.weight.device
-
-    def rot_pos_emb(self, grid_thw: torch.Tensor) -> torch.Tensor:
-        merge_size = self.spatial_merge_size
 
     @staticmethod
     @lru_cache(maxsize=1024)
