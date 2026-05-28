@@ -256,7 +256,11 @@ def fused_gdn_gating_with_sigmoid(
     seq_len = 1
     grid = (batch, seq_len, triton.cdiv(num_heads, 8))
     g = torch.empty_like(a, dtype=torch.float32)
-    beta_out = torch.empty_like(b)
+    # Allocate beta in fp32 since (1) the kernel already computes sigmoid in fp32
+    # and was previously casting back to b.dtype only to be re-cast to fp32 by the
+    # FlashInfer GDN prefill wrapper, and (2) the Triton chunk_gated_delta_rule
+    # path also accepts fp32 beta. Eliminates a redundant cast in the FI hot path.
+    beta_out = torch.empty_like(b, dtype=torch.float32)
     fused_gdn_gating_with_sigmoid_kernel[grid](
         g,
         beta_out,

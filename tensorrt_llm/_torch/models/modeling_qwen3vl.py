@@ -875,10 +875,10 @@ class Qwen3VisionModelBase(nn.Module):
         self.model_config = model_config
         self.model_dtype = self.model_config.pretrained_config.text_config.dtype
 
-        # NOTE: Re-setting QuantConfig to exclude vision encoder weights from quantization load.
-        self.model_config.quant_config = QuantConfig(
-            kv_cache_quant_algo=self.model_config.quant_config.kv_cache_quant_algo
-        )
+        # NOTE: Re-setting QuantConfig to exclude vision encoder from quantization,
+        # including KV cache quantization (vision encoder head dims may not be
+        # supported by FP8 FMHA kernels).
+        self.model_config.quant_config = QuantConfig()
 
         self.visual = model_class(self.model_config).to(self.model_dtype)
 
