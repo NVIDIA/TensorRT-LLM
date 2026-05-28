@@ -440,8 +440,8 @@ class DeepseekV3WeightLoader:
                     # Non-lite models (V3, R1, V3.2) fuse q_a_proj into
                     # kv_a_proj_with_mqa, so both must be NVFP4 for the fused
                     # path. Lite models (V3-Lite) have no q_a_proj.
-                    if not is_lite:
-                        nvfp4_fused_a &= weights[
+                    if not is_lite and nvfp4_fused_a:
+                        nvfp4_fused_a = weights[
                             f"{'.'.join(names[:-1])}.q_a_proj.weight"].dtype == fp4_utils.float4_e2m1x2
                     if nvfp4_fused_a:
                         ########### input_scale

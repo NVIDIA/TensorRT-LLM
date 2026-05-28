@@ -64,6 +64,13 @@ image hosted on NGC](https://catalog.ngc.nvidia.com/orgs/nvidia/teams/tensorrt-l
 
 Once all prerequisites are in place, TensorRT LLM can be installed as follows:
 
+Before installing the latest version, uninstall any previous CUTLASS DSL installation as described in the
+[CUTLASS DSL installation guide](https://docs.nvidia.com/cutlass/latest/media/docs/pythonDSL/quick_start.html#installation):
+
+```bash
+pip3 uninstall nvidia-cutlass-dsl nvidia-cutlass-dsl-libs-base nvidia-cutlass-dsl-libs-cu13
+```
+
 ```bash
 pip3 install --ignore-installed pip setuptools wheel && pip3 install tensorrt_llm
 ```
