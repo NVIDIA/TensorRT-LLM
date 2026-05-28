@@ -442,6 +442,8 @@ def run_single_rank_ar_rms_norm_fp8_live_scale_compile(tensor_parallel_size, a,
     rank = tensorrt_llm.mpi_rank()
     torch.cuda.set_device(rank)
     try:
+        if not ub.ub_supported():
+            return True
         eps = 1e-6
         dtype = a.dtype
 
