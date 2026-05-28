@@ -845,8 +845,8 @@ class TestTrtllmAttentionMetadata:
             cu_seqlen=cu_seqlen,
             input_pos=input_pos,
             batch_info=batch_info,
-            cache_loc=torch.arange(num_pages),
-            cu_num_pages=torch.tensor([0, num_pages], dtype=torch.int),
+            cache_loc_per_pool=[torch.arange(num_pages)],
+            cu_num_pages_per_pool=[torch.tensor([0, num_pages], dtype=torch.int)],
             slot_idx=torch.arange(1),
             prompt_lens=[context_length],
         )
@@ -868,8 +868,8 @@ class TestTrtllmAttentionMetadata:
             input_ids.flatten(),
             cu_seqlen=cu_seqlen,
             input_pos=0,
-            cache_loc=torch.arange(300 // info.tokens_per_block + 2),
-            cu_num_pages=torch.tensor([0, 4, 10], dtype=torch.int),
+            cache_loc_per_pool=[torch.arange(300 // info.tokens_per_block + 2)],
+            cu_num_pages_per_pool=[torch.tensor([0, 4, 10], dtype=torch.int)],
             slot_idx=torch.arange(2),
         )
         _prepare_from_sequence_info(info)
