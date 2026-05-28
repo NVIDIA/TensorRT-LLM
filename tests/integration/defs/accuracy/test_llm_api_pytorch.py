@@ -4172,7 +4172,7 @@ class TestQwen2_7BInstruct(LlmapiAccuracyTestHarness):
 
 @skip_pre_hopper
 @pytest.mark.skip_less_device_memory(80000)
-@pytest.mark.skip_less_mpi_world_size(4)
+@pytest.mark.skip_less_mpi_world_size(8)
 class TestNemotronHNvFP4Marlin(LlmapiAccuracyTestHarness):
     MODEL_NAME = "nemotron-super-rl-021126-nvfp4_aggressive_fp8_kv_notunified"
     MODEL_PATH = f"/lustre/fsw/coreai_comparch_trtllm/shuyix/models/nemotron-super-rl-021126-nvfp4_aggressive_fp8_kv_notunified"
@@ -4184,9 +4184,10 @@ class TestNemotronHNvFP4Marlin(LlmapiAccuracyTestHarness):
         with LLM(self.MODEL_PATH,
                  tensor_parallel_size=2,
                  moe_expert_parallel_size=2,
+                 pipeline_parallel_size=2,
                  moe_config=MoeConfig(backend="MARLIN"),
                  kv_cache_config=kv_cache_config,
-                 max_batch_size=8,
+                 max_batch_size=16,
                  nvfp4_gemm_config={"allowed_backends": ["marlin"]}) as llm:
             assert llm.args.quant_config.quant_algo == QuantAlgo.NVFP4
             task = MMLU(self.MODEL_NAME)
