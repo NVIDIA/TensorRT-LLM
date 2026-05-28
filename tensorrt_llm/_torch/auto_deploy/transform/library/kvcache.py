@@ -428,9 +428,6 @@ class _InsertCachedOperator(BaseTransform):
                 for k, resource_handler in attn_descriptor.get_cache_initializers(
                     attn_node, cm.kv_cache_config
                 ).items():
-                for k, resource_handler in attn_descriptor.get_cache_initializers(
-                    attn_node, cm.kv_cache_config
-                ).items():
                     if resource_handler is None:
                         # None sentinel: pass literal None positionally, no resource allocated.
                         cache_in_nodes.append(None)

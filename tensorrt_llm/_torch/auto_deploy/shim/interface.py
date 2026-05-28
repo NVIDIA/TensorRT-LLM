@@ -997,8 +997,8 @@ class CachedSequenceInterface:
                 1. the final number of tokens is synced (min) across ranks
                 2. rounding for getting a multiple of tokens_per_block
         """
-        # 1. Identify managed resources
-        kv_ref, kv_managed = self._identify_managed_kv_resources()
+        # 1. Identify managed resources and per-pool configurations
+        kv_managed, pool_configurations = self._identify_managed_kv_resources()
         (
             ssm_ref,
             ssm_managed,
