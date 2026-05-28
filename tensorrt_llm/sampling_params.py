@@ -239,7 +239,7 @@ class SamplingParams:
 
         lookahead_config (tensorrt_llm.bindings.executor.LookaheadDecodingConfig , optional): Lookahead decoding config. Defaults to None.
         guided_decoding (tensorrt_llm.sampling_params.GuidedDecodingParams, optional): Guided decoding params. Defaults to None.
-        thinking_token_budget (int, optional): Maximum number of tokens allowed inside a reasoning block. Set to -1 or None for unlimited. Defaults to None.
+        thinking_token_budget (int, optional): Experimental. Maximum number of tokens allowed inside a reasoning block. Set to -1 or None for unlimited. Defaults to None.
 
         ignore_eos (bool): Whether to ignore the EOS token and continue generating tokens after the EOS token is generated. Defaults to False.
         detokenize (bool): Whether to detokenize the output. Defaults to True.
