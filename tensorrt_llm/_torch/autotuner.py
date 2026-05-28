@@ -124,6 +124,9 @@ class TuningConfig:
             Notice that not all tuning processes can benefit from this feature.
         use_cuda_graph (bool): Whether to use CUDA graph for the tuning process.
         distributed_tuning_strategy (DistributedTuningStrategy): Strategy for distributed tuning.
+        exclude_from_cache (bool): Skip disk persistence of tuning results for this op.
+            Use for JIT-driven ops where caching the tactic across processes would skip
+            the JIT warmup. In-process cache still works.
     """
     dynamic_tensor_specs: Tuple[DynamicTensorSpec, ...] = ()
     constraint_specs: Tuple[ConstraintSpec, ...] = ()
@@ -132,6 +135,7 @@ class TuningConfig:
     use_cold_l2_cache: bool = False
     use_cuda_graph: bool = True
     distributed_tuning_strategy: DistributedTuningStrategy = DistributedTuningStrategy.INDEPENDENT
+    exclude_from_cache: bool = False
 
 
 @dataclass(unsafe_hash=True)
@@ -409,6 +413,11 @@ class AutoTunerProfilingCache:
         # Maps custom_op name -> DistributedTuningStrategy
         self.independent_op: Set[str] = set()
 
+        # Ops whose tuning results must NOT be persisted to disk (see the
+        # `exclude_from_cache` field on TuningConfig). Populated lazily
+        # from choose_one when an excluded op is first seen.
+        self.excluded_op: Set[str] = set()
+
         # Cache metadata for local storage and validation
         self.lib_version = tensorrt_llm.__version__
         self.creation_timestamp = time.time()
@@ -428,6 +437,7 @@ class AutoTunerProfilingCache:
     def clear(self) -> None:
         self.cache.clear()
         self.independent_op.clear()
+        self.excluded_op.clear()
 
     def fallback_entry(self) -> Tuple:
         # runner_id = 0, tactic = -1
@@ -497,6 +507,19 @@ class AutoTunerProfilingCache:
         if strategy != DistributedTuningStrategy.INDEPENDENT:
             self.independent_op.add(custom_op)
 
+    def add_excluded_op(self, custom_op: str) -> None:
+        """Mark `custom_op` as excluded from disk persistence.
+
+        Entries for excluded ops still live in the in-memory cache (so
+        within one process the lookup-and-reuse path works normally),
+        but `_partition_cache_by_strategy` will drop them at `save_cache`
+        time so they are never written to disk. Combined with the
+        force-retune branch in `AutoTuner.choose_one`, this guarantees
+        the tuning process (and any JIT warmup it triggers as a side
+        effect) re-runs on every process startup.
+        """
+        self.excluded_op.add(custom_op)
+
     def _partition_cache_by_strategy(
             self) -> Tuple[Dict[Tuple, Tuple], Dict[Tuple, Tuple]]:
         """Partition cache entries into shared and rank-specific caches.
@@ -505,12 +528,16 @@ class AutoTunerProfilingCache:
             A tuple of (shared_cache, rank_cache) where:
             - shared_cache: entries for non-INDEPENDENT ops (BROADCAST, MERGE, PARALLEL)
             - rank_cache: entries for INDEPENDENT ops
+            Entries belonging to `self.excluded_op` are dropped from both
+            partitions so they never reach disk.
         """
         shared_cache = {}
         rank_cache = {}
 
         for key, value in self.cache.items():
             custom_op = key[0]  # First element of cache key is custom_op name
+            if custom_op in self.excluded_op:
+                continue
             if custom_op not in self.independent_op:
                 rank_cache[key] = value
             else:
@@ -524,6 +551,7 @@ class AutoTunerProfilingCache:
         Cache entries are organized based on distributed strategy:
         - INDEPENDENT ops are saved per-rank (rank_0, rank_1, ...)
         - Non-INDEPENDENT ops (BROADCAST, MERGE, PARALLEL) are saved in a shared dict
+        - Ops marked `exclude_from_cache=True` are dropped entirely.
 
         Args:
             file_path: Path where to save the cache
@@ -1014,12 +1042,28 @@ class AutoTuner:
             })
 
         input_shapes = tuple(self._get_input_sizes(inputs))
-        is_cache_hit, best_runner_id, best_tactic, min_time = self.profiling_cache.search_cache(
-            custom_op,
-            runners,
-            input_shapes,
-            tuning_config,
-            apply_map_to_tuning_buckets=True)
+
+        # For ops opted out of the persistent cache (e.g. JIT-driven
+        # kernels whose "tuning" triggers compilation as a side effect),
+        # mark them in the cache so save_cache filters them out, and
+        # — in tuning mode — force the full profile path so the JIT
+        # warmup actually runs even if a stale on-disk entry was loaded.
+        # In inference mode we still consult the in-process cache, which
+        # was populated by this process's own warmup.
+        if tuning_config.exclude_from_cache:
+            self.profiling_cache.add_excluded_op(custom_op)
+        if tuning_config.exclude_from_cache and self.is_tuning_mode:
+            is_cache_hit = False
+            best_runner_id, best_tactic, min_time = (
+                self.profiling_cache.fallback_entry())
+        else:
+            is_cache_hit, best_runner_id, best_tactic, min_time = (
+                self.profiling_cache.search_cache(
+                    custom_op,
+                    runners,
+                    input_shapes,
+                    tuning_config,
+                    apply_map_to_tuning_buckets=True))
 
         # Early return if it's not tuning, use cache found one or fallback one
         if not self.is_tuning_mode:
@@ -1126,6 +1170,15 @@ class AutoTuner:
         # If the inputs_pre_hook is provided, it will be called before profiling.
         if tuning_config.inputs_pre_hook is not None:
             input_tensors = tuning_config.inputs_pre_hook(input_tensors)
+
+        # Pre-walk the runners so we know the total candidate (runner, tactic)
+        # pair count before deciding whether to short-circuit profiling. The
+        # count is taken BEFORE distributed-strategy splitting; the PARALLEL
+        # strategy can leave a rank with one tactic locally even though the
+        # full set has several, and that case must still go through the
+        # timed profile path so the merge picks a real winner.
+        candidates = []
+        total_pairs = 0
         for runner_id, runner in enumerate(runners):
             # TODO: use FakeTensor here.
             runner_arg_names = {
@@ -1134,61 +1187,102 @@ class AutoTuner:
             }
             all_valid_tactics = runner.get_valid_tactics(
                 input_tensors, profile, **kwargs)
+            total_pairs += len(all_valid_tactics)
+            candidates.append(
+                (runner_id, runner, runner_arg_names, all_valid_tactics))
 
-            valid_tactics = self._maybe_parallelize_tactics(
-                all_valid_tactics, tuning_config.distributed_tuning_strategy)
-            if "do_preparation" in runner_arg_names and len(valid_tactics) > 0:
-                runner(
-                    input_tensors,
-                    tactic=-1,
-                    do_preparation=True,
-                    **kwargs,
+        if total_pairs == 1:
+            # Single-pair shortcut. There is nothing to compare against, so
+            # the timed warmup + profile-repeat loop is pure overhead. We
+            # fire one forward call on every rank to drive any JIT side
+            # effects (e.g. DeepGEMM cubin compile for fp8_swap_ab_gemm),
+            # then record the pair in the cache directly. `do_preparation`
+            # still runs for runners that opt into it.
+            runner_id, runner, runner_arg_names, valid_tactics = next(
+                c for c in candidates if len(c[3]) == 1)
+            tac = valid_tactics[0]
+            if "do_preparation" in runner_arg_names:
+                runner(input_tensors, tactic=-1, do_preparation=True, **kwargs)
+            try:
+                with nvtx_range(f"r{runner_id}, tactic {tac} (single-pair)"):
+                    runner(input_tensors, tactic=tac, **kwargs)
+                best_runner_id, best_tactic = runner_id, tac
+                # No comparable measurement exists; min_time stays 0.0 to
+                # distinguish "recorded without profiling" from a real
+                # timing.
+                min_time = 0.0
+            except Exception as e:
+                shapes = self._get_input_sizes(input_tensors)
+                logger.warning_once(
+                    f"[Autotuner] Single-pair run failed for custom_op={custom_op}, runner={runner}, tactic={tac}, shapes={shapes}. Error: {e}",
+                    key=(custom_op, "warning_autotuning_single_pair_failure"),
                 )
-
-            for tac in valid_tactics:
-                try:
-                    with nvtx_range(f"r{runner_id}, tactic {tac}"):
-                        time_measured = self._profile_single_kernel(
-                            runner=runner,
-                            inputs=input_tensors,
-                            tactic=tac,
-                            tuning_config=tuning_config,
-                            use_cuda_graph=tuning_config.use_cuda_graph,
-                            **kwargs,
-                        )
-                except Exception as e:
-                    # Synchronize to clear any pending CUDA errors left by the
-                    # failed tactic.  Without this, the stale error propagates
-                    # to subsequent CUDA/cuBLAS calls in the forward pass
-                    # (observed as CUBLAS_STATUS_EXECUTION_FAILED on SM103).
-                    try:
-                        torch.cuda.synchronize()
-                    except Exception:
-                        pass
-
-                    # Handle None tensors for optional inputs
-                    shapes = self._get_input_sizes(input_tensors)
-                    logger.warning_once(
-                        f"[Autotuner] Failed when profiling runner={runner}, tactic={tac}, shapes={shapes}. Error: {e}",
-                        key=(custom_op, "warning_autotuning_profile_failure"),
+                self.stats.failed_profiling_count[custom_op].add(
+                    self.profiling_cache.get_cache_key(
+                        custom_op,
+                        runner,
+                        profile.get_opt_shapes(),
+                        tuning_config,
+                        apply_map_to_tuning_buckets=False))
+                has_tuning_failure_occurred = True
+        else:
+            for runner_id, runner, runner_arg_names, all_valid_tactics in candidates:
+                valid_tactics = self._maybe_parallelize_tactics(
+                    all_valid_tactics,
+                    tuning_config.distributed_tuning_strategy)
+                if "do_preparation" in runner_arg_names and len(
+                        valid_tactics) > 0:
+                    runner(
+                        input_tensors,
+                        tactic=-1,
+                        do_preparation=True,
+                        **kwargs,
                     )
 
-                    # Record the failed profiling combinations
-                    self.stats.failed_profiling_count[custom_op].add(
-                        self.profiling_cache.get_cache_key(
-                            custom_op,
-                            runner,
-                            profile.get_opt_shapes(),
-                            tuning_config,
-                            apply_map_to_tuning_buckets=False))
+                for tac in valid_tactics:
+                    try:
+                        with nvtx_range(f"r{runner_id}, tactic {tac}"):
+                            time_measured = self._profile_single_kernel(
+                                runner=runner,
+                                inputs=input_tensors,
+                                tactic=tac,
+                                tuning_config=tuning_config,
+                                use_cuda_graph=tuning_config.use_cuda_graph,
+                                **kwargs,
+                            )
+                    except Exception as e:
+                        # Synchronize to clear any pending CUDA errors left by the
+                        # failed tactic. Without this, the stale error can propagate
+                        # to subsequent CUDA/cuBLAS calls in the forward pass.
+                        try:
+                            torch.cuda.synchronize()
+                        except Exception:
+                            pass
 
-                    # Set time_measured to inf to notify the failure of the tactic. This can happen when `get_valid_tactics` mistakenly return wrong tactics
-                    # or some runtime error occurs during profiling.
-                    time_measured = float('inf')
-                    has_tuning_failure_occurred = True
-                if time_measured < min_time:
-                    min_time = time_measured
-                    best_runner_id, best_tactic = runner_id, tac
+                        # Handle None tensors for optional inputs
+                        shapes = self._get_input_sizes(input_tensors)
+                        logger.warning_once(
+                            f"[Autotuner] Failed when profiling runner={runner}, tactic={tac}, shapes={shapes}. Error: {e}",
+                            key=(custom_op,
+                                 "warning_autotuning_profile_failure"),
+                        )
+
+                        # Record the failed profiling combinations
+                        self.stats.failed_profiling_count[custom_op].add(
+                            self.profiling_cache.get_cache_key(
+                                custom_op,
+                                runner,
+                                profile.get_opt_shapes(),
+                                tuning_config,
+                                apply_map_to_tuning_buckets=False))
+
+                        # Set time_measured to inf to notify the failure of the tactic. This can happen when `get_valid_tactics` mistakenly return wrong tactics
+                        # or some runtime error occurs during profiling.
+                        time_measured = float('inf')
+                        has_tuning_failure_occurred = True
+                    if time_measured < min_time:
+                        min_time = time_measured
+                        best_runner_id, best_tactic = runner_id, tac
 
         if best_runner_id is not None:
             # At least one valid (runner, tactic) pair is found
