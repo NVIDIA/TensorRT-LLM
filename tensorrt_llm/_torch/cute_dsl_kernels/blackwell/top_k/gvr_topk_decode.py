@@ -1971,15 +1971,58 @@ def gvr_topk_decode(
         vec_bits_host = 256 if use_256bit_load else 128
         vec_w_host = vec_bits_host // (32 if logits.dtype == torch.float32 else 16)
         n_vec_iters = max(1, N_dec // (num_threads_per_block * vec_w_host))
-        if n_vec_iters < 4:
-            min_blocks_per_mp = 0  # no launch_bounds — natural ptxas allocation
-        elif num_rows <= num_sms:
-            min_blocks_per_mp = 1
+        # ---- OLD tier ordering (kept for reference, see NCU analysis at
+        # ---- gvr-topk-opt/auto_full_bench/bf16_k1024n8KBS384/analysis.md).
+        # ---- Bug: tier-0 (n_vec_iters < 4) → mb=0 took precedence over
+        # ---- tier-3 (num_rows > num_sms). For half-prec K=1024 BS=384 N=8K,
+        # ---- ptxas's natural 44 reg/thread → 2 CTAs/SM → 50% theo occupancy
+        # ---- vs CUDA's __launch_bounds__(512, 3) → 3 CTAs/SM → 75%.
+        # if n_vec_iters < 4:
+        #     min_blocks_per_mp = 0
+        # elif num_rows <= num_sms:
+        #     min_blocks_per_mp = 1
+        # else:
+        #     min_blocks_per_mp = (
+        #         2 if (num_threads_per_block == 1024 or logits.dtype == torch.float32) else 3
+        #     )
+        # ---- NEW: dtype-split tier ordering.
+        # half-prec (bf16/fp16): tier-3 takes precedence over tier-0. Their
+        #   vec_w=8 + cvt-to-fp32 ILP fits in 40 regs; the extra CTA/SM from
+        #   mb=3 cap=42 gains occupancy. Verified fix for bf16 K=1024 BS=384
+        #   N=4-8K (~+30pp speedup).
+        # fp32: tier-0 keeps precedence. fp32 vec_w=4 → 4-LDG-inflight ILP
+        #   wants ~70 regs; mb=2 cap=64 limits ILP and regresses small-N
+        #   large-grid cases by 20-26pp (verified at fp32 K=512 N=4K BS=384).
+        is_fp32 = logits.dtype == torch.float32
+        if is_fp32:
+            # fp32: old ordering — tier-0 first.
+            if n_vec_iters < 4:
+                min_blocks_per_mp = 0
+            elif num_rows <= num_sms:
+                min_blocks_per_mp = 1
+            elif num_sms * 2 < num_rows <= num_sms * 3:
+                # Wave-fit sweet spot (e.g. BS=384 with num_sms=148):
+                # mb=3 → 3 CTAs/SM cap fits all num_rows CTAs in 1 wave
+                # (3 * num_sms ≥ num_rows); mb=2 only fits 2 CTAs/SM so the
+                # last partial wave wastes ~70% SMs. mb=3 wins +5-23%
+                # across (K, N) at BS=384 with no regressions at other BS.
+                # See gvr-topk-opt/auto_full_bench/fp32_bs384_cluster/.
+                min_blocks_per_mp = 3
+            else:
+                # tier-3 for fp32 (BS ≤ 2*num_sms: mb=2 also fits 1 wave;
+                # BS > 3*num_sms: both need >1 wave, mb=2's larger reg
+                # budget helps ILP). T=1024 path also resolves to mb=2.
+                min_blocks_per_mp = 2
         else:
-            # tier-3 (large grid + large N): per (T, dtype) — see comment above.
-            min_blocks_per_mp = (
-                2 if (num_threads_per_block == 1024 or logits.dtype == torch.float32) else 3
-            )
+            # half-prec: new ordering — tier-3 first (occupancy gain wins).
+            if num_rows > num_sms:
+                # tier-3 → mb=3. (T=1024 path requires num_rows ≤ num_sms,
+                # so T==1024 here is impossible; mb=3 is the half-prec choice.)
+                min_blocks_per_mp = 3
+            elif n_vec_iters < 4:
+                min_blocks_per_mp = 0
+            else:
+                min_blocks_per_mp = 1
 
     # Cache key includes the unrolling + layout switches so different
     # settings share separate compiled kernels. Shapes (num_rows, num_tokens,
