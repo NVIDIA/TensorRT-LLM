@@ -14,7 +14,8 @@ Companion to the plan at [`cutlass-moe-shared-outer-lora.plan.md`](../../../cutl
 | 3 — CUDA-graph decode path | partial (slot-indexed eager OK; graph capture blocked by kernel) | Slot-indexed pointer mode lands in `moeOp.cpp` + `CudaGraphLoraParams.token_to_slot_host` and `get_moe_slot_inputs`. Eager equivalence passes. CUDA-graph capture is rejected by the op until the Phase 6 kernel patch; see F7 and Phase 3 log. |
 | 4 — Loader + validator | done | `validation.py`, `moe_layout.py`, `create_moe.py` wiring. See Phase 4 log. |
 | 5 — Tests | done (MVP) | CPU validator + layout tests, GPU smoke for fused-moe op. CUDA-graph capture+replay test skipped pending Phase 6. See Phase 5 log. |
-| 6a — Native shared-outer kernel flag (kernel + op + test fixture) | done | `LoraParams::*_shared_a/b` zeros the per-expert offset in `setupLoraWorkspace`; 6 op kwargs threaded; native helper in `moe_layout.py`; bit-identity GPU test. Loader plumbing (`lora_layout.json`) deferred to a follow-up. |
+| 6a — Native shared-outer kernel flag (kernel + op + test fixture) | done | `LoraParams::*_shared_a/b` zeros the per-expert offset in `setupLoraWorkspace`; 6 op kwargs threaded; native helper in `moe_layout.py`; bit-identity GPU test. |
+| 6a follow-up — Loader plumbing (`lora_layout.json`) | done (metadata-only) | New `lora_layout_sidecar.py` parser; `LoraManager.get_moe_shared_flags(uid)`; `model_engine` per-request assembler populates `lora_params["moe_shared_flags"]`. Cache row still load-time replicated -- skipping the stack and accepting native unreplicated on-disk shapes requires changing `LoraModule::localTotalSize` and is a separate follow-up PR. |
 | 6b — GPU-side LoRA expansion (lift host-sync, enable graph capture) | follow-up PR | Replaces the `setupLoraWorkspace` / `LoraImpl::run` host-CPU branching with a device-side problem-builder kernel. Re-enables the skipped graph-capture parity test. |
 | 7 — Docs | done | Routed-Expert MoE LoRA section added to [`docs/source/features/lora.md`](../features/lora.md). |
 
@@ -274,12 +275,37 @@ Tests:
   - `test_moe_native_shared_outer_matches_replicated_bitidentical`: native shared-outer with `fc1_shared_a=True`, `fc2_shared_b=True`, `gated_shared_a=True` produces a bit-identical kernel output to the load-time-replication baseline (atol=rtol=0).
   - `test_moe_native_shared_outer_differs_from_no_lora`: sanity smoke that the native path's adapter actually moves the output.
 
-Deferred to follow-up commits (still part of Phase 6a):
+### Phase 6a follow-up — Loader plumbing (DONE)
 
-- Loader plumbing. The kernel and op already accept native shared-outer adapters; what's missing is a `lora_layout.json` sidecar parser in [`tensorrt_llm/lora_manager.py`](../../../tensorrt_llm/lora_manager.py) that:
-  - Reads per-module `shared_side` ("A" / "B" / null).
-  - Skips the stacking step for the shared side and saves the raw `[rank, dim]` (or `[out_dim, rank]`) tensor in the PEFT cache.
-  - Stashes the per-module shared flags as cache metadata so the per-layer assembler can populate `lora_params["moe_shared_flags"]`.
+The kernel and op already accept native shared-outer adapters; this follow-up
+threads the convention through the loader and per-request assembler so the
+flag is reachable from a real adapter directory rather than only from
+synthetic tests.
+
+What landed:
+
+- New parser at [`tensorrt_llm/lora_layout_sidecar.py`](../../../tensorrt_llm/lora_layout_sidecar.py) reads an optional `lora_layout.json` next to `adapter_config.json` with schema:
+  ```json
+  {
+    "version": 1,
+    "moe_shared_outer": {
+      "moe_h_to_4h": {"shared_side": "A"},
+      "moe_gate":    {"shared_side": "A"},
+      "moe_4h_to_h": {"shared_side": "B"}
+    }
+  }
+  ```
+  Unknown module names, bad `shared_side` values, or unsupported versions raise `LoraLayoutError` with a path-qualified message.
+- [`LoraManager`](../../../tensorrt_llm/lora_manager.py) stashes the resulting six-bool flag dict per uid (`_uid_to_moe_shared_flags`) inside `load_from_model_dir`, and exposes `get_moe_shared_flags(uid)`. Adapters without a sidecar get an all-False entry.
+- [`ModelEngine._get_eager_lora_params_from_requests`](../../../tensorrt_llm/_torch/pyexecutor/model_engine.py) computes the union of active uids' flags via the manager and writes the result into `lora_params["moe_shared_flags"]` when non-trivial. Mismatched flags across active uids raise (the fused-MoE op applies one global flag set per call).
+- CPU parser tests in [`tests/unittest/_torch/lora/test_lora_layout_sidecar.py`](../../../tests/unittest/_torch/lora/test_lora_layout_sidecar.py); MoE loader-roundtrip tests in [`tests/unittest/others/test_lora_manager.py::TestLoraManagerMoeSharedFlags`](../../../tests/unittest/others/test_lora_manager.py).
+
+**Important scope note (this release is metadata-only).** The C++ LoRA cache row size is determined by `LoraModule::localTotalSize` (see [`cpp/tensorrt_llm/runtime/loraCache.cpp:476`](../../../cpp/tensorrt_llm/runtime/loraCache.cpp)), which for MoE bakes in the `num_experts` factor. The loader therefore still replicates shared sides to `[E, ...]` before packing into `_cpp_lora_weights`. With the flag set, the kernel zero-offsets and reads only one slice; without it, the kernel reads every (identical) slice. Output is bit-identical either way. The sidecar exists to:
+
+1. Establish the public convention so adapter producers can mark their files.
+2. Wire the flag end-to-end (loader → manager → assembler → op → kernel) so a single follow-up PR can drop the load-time replication without re-touching the call chain.
+
+Memory-savings follow-up (separate PR): change `LoraModule::localTotalSize` to skip the `num_experts` factor for shared sides (or otherwise size the cache row from the actual packed blob), skip the loader's `torch.stack` for shared sides, and accept unreplicated `[rank, in_dim]` / `[out_dim, rank]` shapes directly from disk. The end-to-end test fixture in `TestLoraManagerMoeSharedFlags` is already structured to pivot to that path.
 
 ## Phase 6b — GPU-side LoRA expansion (follow-up PR)
 

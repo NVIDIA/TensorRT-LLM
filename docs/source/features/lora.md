@@ -226,6 +226,27 @@ fc1_native = make_native_shared_lora(
 # fc1_native["shared_a"] is True; pass alongside the adapter to the op.
 ```
 
+#### Marking adapters as shared-outer with `lora_layout.json`
+
+Adapters produced from HuggingFace PEFT can carry an optional sidecar named `lora_layout.json` next to `adapter_config.json` that declares which MoE module sides are shared across experts. The loader picks the file up automatically; adapters without it behave exactly as before (per-expert kernel offsets).
+
+```json
+{
+  "version": 1,
+  "moe_shared_outer": {
+    "moe_h_to_4h": {"shared_side": "A"},
+    "moe_gate":    {"shared_side": "A"},
+    "moe_4h_to_h": {"shared_side": "B"}
+  }
+}
+```
+
+Supported module names are `moe_h_to_4h`, `moe_gate`, and `moe_4h_to_h`. `shared_side` accepts `"A"`, `"B"`, or `null` (per-expert). All other top-level keys are ignored for forward compatibility. The full schema lives in [`tensorrt_llm/lora_layout_sidecar.py`](../../../tensorrt_llm/lora_layout_sidecar.py); the loader raises `LoraLayoutError` on schema violations.
+
+At runtime, the per-request assembler reads the flags from the manager and forwards them to the fused-MoE op as `lora_params["moe_shared_flags"]`. The op applies one global flag set per call, so all active LoRA uids in a batch must agree on their `lora_layout.json` (mismatched flags raise a `ValueError`). Adapters without a sidecar default to all-False, matching the existing per-expert path.
+
+> **Note.** In this release the on-disk weight layout is unchanged: shared sides are still expected to be materialized per expert on disk and the loader still replicates them into the C++ LoRA cache to match the cache row size. The sidecar drives the kernel-side zero-offset, which is mathematically a no-op against replicated storage (output is bit-identical with and without the flag set). A follow-up will shrink the cache row and accept truly unreplicated tensors from disk; the public sidecar schema is stable and will not change.
+
 #### CUDA-graph decode
 
 In this release, MoE LoRA runs in eager mode. CUDA-graph **capture** of LoRA-active routed-expert MoE layers is not supported: the fused MoE kernel's LoRA path performs a host-side `cudaEventSynchronize` after a device-to-host pointer-expansion copy, which is not capturable. When CUDA-graph decode is enabled and an MoE LoRA is active, the fused MoE op detects the capturing stream and raises a clear error.
