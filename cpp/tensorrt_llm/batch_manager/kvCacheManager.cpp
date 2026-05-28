@@ -2222,16 +2222,12 @@ void BlockManager::allocateBlock(GenerationRequest& sequence, SizeType32 windowS
     mWindowBlockManagers.at(windowSize).allocateBlock(sequence, false);
 }
 
-bool BlockManager::copyLinearAttentionBlock(GenerationRequest& sequence, LlmRequest const& llmRequest)
+void BlockManager::copyLinearAttentionBlock(GenerationRequest& sequence, LlmRequest const& llmRequest)
 {
-    bool didCopy = false;
     for (auto& [windowSize, manager] : mWindowBlockManagers)
     {
-        // Use a temp to avoid short-circuiting; every window must run.
-        bool const windowDidCopy = manager.copyLinearAttentionBlock(sequence, llmRequest);
-        didCopy = didCopy || windowDidCopy;
+        manager.copyLinearAttentionBlock(sequence, llmRequest);
     }
-    return didCopy;
 }
 
 bool WindowBlockManager::tryAllocatePlaceholderForLinearAttention(GenerationRequest& sequence, bool shareAmongBeams)
@@ -2367,11 +2363,11 @@ void WindowBlockManager::allocateBlock(GenerationRequest& sequence, bool shareAm
     }
 }
 
-bool WindowBlockManager::copyLinearAttentionBlock(GenerationRequest& sequence, LlmRequest const& request)
+void WindowBlockManager::copyLinearAttentionBlock(GenerationRequest& sequence, LlmRequest const& request)
 {
     if (!isRecurrentState())
     {
-        return false;
+        return;
     }
 
     auto const requestId = request.mRequestId;
@@ -2380,7 +2376,7 @@ bool WindowBlockManager::copyLinearAttentionBlock(GenerationRequest& sequence, L
     if (mAllocatedBlocksPerSeq.find(requestId) == mAllocatedBlocksPerSeq.end())
     {
         TLLM_LOG_WARNING("%s::copyLinearAttentionBlock - Request %lu not found", mLogPrefix.c_str(), requestId);
-        return false;
+        return;
     }
 
     // It points to the next token to be processed/generated
@@ -2395,10 +2391,9 @@ bool WindowBlockManager::copyLinearAttentionBlock(GenerationRequest& sequence, L
         if (TLLM_LIKELY(sequence.getBeamWidth() == 1))
         {
             // the block of beam0 is inherited from context phase, no need to copy
-            return false;
+            return;
         }
-        // copy beam 0 to other beams: beamWidth >= 2 here, loop runs at least once
-        // with no skip path, so an onboard is always issued.
+        // copy beam 0 to other beams
         auto beam0Block = getBlockById(sequence.getCacheBlockIds(mWindowSize).at(0).back());
         for (auto beamIdx = 1; beamIdx < sequence.getBeamWidth(); ++beamIdx)
         {
@@ -2411,18 +2406,17 @@ bool WindowBlockManager::copyLinearAttentionBlock(GenerationRequest& sequence, L
                                  // transfer manager to copy the entire block.
                 sequence.getTransferMode(), sequence.getDirectory());
         }
-        return true;
+        return;
     }
 
     // copy only happens in context phase or the corner case above
     if (currentPosition % mTokensPerBlock != 0 || currentPosition > request.getPromptLen() || currentPosition == 0)
     {
-        return false;
+        return;
     }
 
     auto prevBlockIndex = currentPosition / mTokensPerBlock - 1; // signed
     std::set<std::pair<KVCacheBlock::IdType, KVCacheBlock::IdType>> onboardedBlocks;
-    bool didCopy = false;
     for (auto beamIdx = 0; beamIdx < sequence.getBeamWidth(); ++beamIdx)
     {
         auto const& beamBlockIds = sequence.getCacheBlockIds(mWindowSize).at(beamIdx);
@@ -2461,9 +2455,7 @@ bool WindowBlockManager::copyLinearAttentionBlock(GenerationRequest& sequence, L
                              // manager to copy the entire block.
             sequence.getTransferMode(), sequence.getDirectory());
         onboardedBlocks.insert({prevBlockId, nextBlockId});
-        didCopy = true;
     }
-    return didCopy;
 }
 
 std::pair<SizeType32, std::vector<KVCacheBlock::IdType>> WindowBlockManager::storeBlocks(
@@ -3556,10 +3548,10 @@ void KVCacheManager::addToken(RequestIdType requestId)
     mBlockManager.adjustBlocksIfNeeded(sequence);
 }
 
-bool KVCacheManager::copyLinearAttentionBlock(LlmRequest const& llmRequest)
+void KVCacheManager::copyLinearAttentionBlock(LlmRequest const& llmRequest)
 {
     auto& sequence = getSequence(llmRequest.mRequestId);
-    return mBlockManager.copyLinearAttentionBlock(sequence, llmRequest);
+    mBlockManager.copyLinearAttentionBlock(sequence, llmRequest);
 }
 
 void WindowBlockManager::detachFrontBlock(GenerationRequest& sequence)

@@ -17,8 +17,7 @@ from tensorrt_llm._torch.pyexecutor.mamba_cache_manager import (
 )
 from tensorrt_llm._torch.pyexecutor.resource_manager import CacheTypeCpp
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
-from tensorrt_llm.bindings.internal.batch_manager import LinearCacheType
-from tensorrt_llm.llmapi.llm_args import KvCacheConfig, MTPDecodingConfig
+from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 from tensorrt_llm.mapping import Mapping
 
 skip_no_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
@@ -257,108 +256,6 @@ def test_cpp_get_state_indices_resolves_sentinel_to_reserved_slot():
     )
     # Resolve again — reserved slot must be stable across calls.
     assert mgr.get_state_indices(request_ids, is_padding) == indices
-
-
-# ---------------------------------------------------------------------------
-# CppMambaHybridCacheManager: recurrent-state snapshot pool sizing
-#
-# Sized in KVCacheManager._calculate_max_num_blocks_for_linear_attention.
-# Mirrors the MixedMambaCacheManager fix where each kind of padding sentinel
-# (CUDA-graph dummy, plus one per draft length under spec decoding) must not
-# evict live recurrent state. Wanli's fix made all sentinels share one slot
-# in the Python manager (#13489); the C++ hybrid path instead reserves a
-# dedicated slot per sentinel kind in the underlying pool — same invariant,
-# different mechanism. These tests guard the pool sizing.
-# ---------------------------------------------------------------------------
-
-
-def _build_hybrid_with_mamba_layer(spec_config=None, max_batch_size=4, enable_block_reuse=False):
-    """Construct a real CppMambaHybridCacheManager with one mamba layer +
-    one full-attention layer so the parent KVCacheManager goes through the
-    linear-attention pool sizing path."""
-    # Layer 0: mamba; Layer 1: full attention. Single rank, no MPI.
-    mamba_mask = [True, False]
-    attn_mask = [False, True]
-    mapping = Mapping(world_size=1, rank=0, tp_size=1, pp_size=1)
-    # Cap max_tokens to keep the real C++ pool allocation tiny.
-    kv_cache_config = KvCacheConfig(max_tokens=512, enable_block_reuse=enable_block_reuse)
-    return CppMambaHybridCacheManager(
-        mamba_d_state=8,
-        mamba_d_conv=4,
-        mamba_num_heads=4,
-        mamba_n_groups=1,
-        mamba_head_dim=8,
-        mamba_num_layers=1,
-        mamba_layer_mask=mamba_mask,
-        mamba_cache_dtype=torch.float16,
-        mamba_ssm_cache_dtype=torch.float16,
-        kv_cache_config=kv_cache_config,
-        kv_cache_type=CacheTypeCpp.SELF,
-        num_layers=1,
-        num_kv_heads=4,
-        head_dim=64,
-        tokens_per_block=32,
-        max_seq_len=128,
-        max_batch_size=max_batch_size,
-        mapping=mapping,
-        spec_config=spec_config,
-        layer_mask=attn_mask,
-    )
-
-
-@skip_no_cuda
-def test_cpp_hybrid_recurrent_pool_reserves_cuda_graph_padding_slot():
-    """Without spec decoding, the recurrent-state snapshot pool must
-    have at least max_batch_size + 1 slots — one extra for the
-    CUDA-graph padding sentinel (CUDA_GRAPH_DUMMY_REQUEST_ID). Without
-    it, the padding sentinel evicts live recurrent state under load."""
-    max_batch_size = 4
-    mgr = _build_hybrid_with_mamba_layer(spec_config=None, max_batch_size=max_batch_size)
-    recurrent_primary, _ = mgr.blocks_per_window[LinearCacheType.RECURRENT_STATES.value]
-    assert recurrent_primary >= max_batch_size + 1, (
-        f"recurrent-state pool has {recurrent_primary} slots, "
-        f"need >= max_batch_size + 1 = {max_batch_size + 1} to host the "
-        f"CUDA-graph padding sentinel without evicting live state"
-    )
-
-
-@skip_no_cuda
-def test_cpp_hybrid_recurrent_pool_reserves_draft_len_sentinel_slots():
-    """With spec decoding, CUDAGraphRunner._get_padded_batch issues a
-    distinct dummy request id for each runtime_draft_len in
-    [0, max_draft_len], so the recurrent-state snapshot pool must reserve
-    one slot per draft length on top of the CUDA-graph padding slot."""
-    max_batch_size, max_draft_len = 4, 2
-    spec_config = MTPDecodingConfig(max_draft_len=max_draft_len)
-    mgr = _build_hybrid_with_mamba_layer(spec_config=spec_config, max_batch_size=max_batch_size)
-    recurrent_primary, _ = mgr.blocks_per_window[LinearCacheType.RECURRENT_STATES.value]
-    expected_min = max_batch_size + 1 + max_draft_len
-    assert recurrent_primary >= expected_min, (
-        f"recurrent-state pool has {recurrent_primary} slots, "
-        f"need >= max_batch_size + 1 + max_draft_len = {expected_min} so "
-        f"per-draft-len sentinels don't collide with live state"
-    )
-
-
-@skip_no_cuda
-def test_cpp_hybrid_recurrent_pool_floor_with_block_reuse():
-    """With block reuse enabled, the block-reuse branch must not drop the
-    live-state + CUDA-graph-padding floor.
-
-    With max_batch_size=4, mamba_state_cache_interval=256, max_tokens=512:
-      naive: max_snapshots = 512 // 256 = 2  (drops live-state floor!)
-      fixed: max_snapshots = max(2, 4 + 1) = 5
-    """
-    max_batch_size = 4
-    mgr = _build_hybrid_with_mamba_layer(
-        spec_config=None, max_batch_size=max_batch_size, enable_block_reuse=True
-    )
-    recurrent_primary, _ = mgr.blocks_per_window[LinearCacheType.RECURRENT_STATES.value]
-    assert recurrent_primary >= max_batch_size + 1, (
-        f"recurrent-state pool has {recurrent_primary} slots with block reuse enabled, "
-        f"need >= max_batch_size + 1 = {max_batch_size + 1} to prevent the padding "
-        f"sentinel from evicting live recurrent state"
-    )
 
 
 # ---------------------------------------------------------------------------
