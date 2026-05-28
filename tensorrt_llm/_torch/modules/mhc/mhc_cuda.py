@@ -848,7 +848,8 @@ class MhcFusedHcRunner(TunableRunner):
             # comb_mix_prev (input[3]) dim 0 = M
             ConstraintSpec(input_idx=3, dim_idx=0, infer_shape=lambda shapes: shapes[0][0]),
         ),
-        distributed_tuning_strategy=DistributedTuningStrategy.PARALLEL,
+        # TODO: re-enable distributed_tuning_strategy=PARALLEL once
+        # _FusedHcWorkspaceCache no longer keys on chosen-tactic fields.
     )
 
     def __init__(
