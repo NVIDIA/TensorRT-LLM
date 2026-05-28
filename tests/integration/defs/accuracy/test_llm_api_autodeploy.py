@@ -933,6 +933,7 @@ class TestGLM4Flash(LlmapiAccuracyTestHarness):
                               n=beam_width,
                               use_beam_search=beam_width > 1)
 
+    @skip_pre_hopper
     @pytest.mark.skip_less_device_memory(80000)
     @pytest.mark.parametrize("enable_chunked_prefill", [True, False])
     @pytest.mark.parametrize("attn_backend", ["flashinfer", "trtllm"])
