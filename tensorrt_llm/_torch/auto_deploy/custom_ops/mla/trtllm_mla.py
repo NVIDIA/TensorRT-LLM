@@ -1051,7 +1051,6 @@ def _handle_prefill_thop(
         max_num_requests,  # max_num_requests
         max_context_length,  # max_context_length
         max_context_length,  # attention_window_size
-        0,  # sink_token_length
         1,  # beam_width
         int(AttentionMaskType.causal),  # mask_type
         quant_mode,  # quant_mode
@@ -1209,11 +1208,9 @@ def _handle_prefill_thop_cached_kv(
         host_kv_cache_pool_pointers,
         planner.host_pool_mapping,
         planner.kv_scale_orig_quant,
-        planner.kv_scale_quant_orig,
         _CONTEXT_LAYER_OFFSET,
         tokens_per_block,
         max_context_length,
-        0,  # sink_token_length
         1,  # beam_width
         quant_mode,
     )
@@ -1279,7 +1276,6 @@ def _handle_prefill_thop_cached_kv(
             kv_cache_block_offsets,
             host_kv_cache_pool_pointers,
             planner.host_pool_mapping,
-            planner.kv_scale_orig_quant,
             planner.kv_scale_quant_orig,
             _CONTEXT_LAYER_OFFSET,
             kv_lora_rank,
@@ -1287,8 +1283,7 @@ def _handle_prefill_thop_cached_kv(
             tokens_per_block,
             chunked_max_seq_len,
             max_context_length,
-            0,
-            1,
+            1,  # beam_width
             quant_mode,
         )
         chunk_kv = torch.nn.functional.linear(chunk_compressed_kv, w_grouped)
@@ -1343,7 +1338,6 @@ def _handle_prefill_thop_cached_kv(
             max_num_requests,
             max_context_length,
             max_context_length,
-            0,  # sink_token_length
             1,  # beam_width
             int(AttentionMaskType.padding),  # FULL mask: every Q attends to every K in this chunk
             quant_mode,
@@ -1376,7 +1370,8 @@ def _handle_prefill_thop_cached_kv(
             None,  # sparse_attn_indices
             None,  # sparse_attn_offsets
             1,  # sparse_attn_indices_block_size
-            0,  # sparse_mla_topk
+            0,  # num_sparse_topk
+            None,  # sparse_mla_topk_lens
             None,  # skip_softmax_threshold_scale_factor_prefill
             None,  # skip_softmax_threshold_scale_factor_decode
             None,  # skip_softmax_stat
@@ -1459,9 +1454,8 @@ def _handle_prefill_thop_cached_kv(
         tokens_per_block,
         max_num_requests,
         max_context_length,
-        max_context_length,
-        0,
-        1,
+        max_context_length,  # attention_window_size
+        1,  # beam_width
         int(AttentionMaskType.causal),  # CAUSAL: new Q tokens with causal mask over new K/V
         quant_mode,
         q_scaling,
@@ -1653,7 +1647,6 @@ def _handle_decode_impl(
         gen_head_size,
         tokens_per_block,
         max_context_length,  # attention_window_size
-        0,  # sink_token_length
         1,  # beam_width
         quant_mode,
         # q_scaling must match the value passed to thop.attention below:
@@ -1718,7 +1711,6 @@ def _handle_decode_impl(
         max_num_requests,  # max_num_requests
         max_context_length,  # max_context_length
         max_context_length,  # attention_window_size
-        0,  # sink_token_length
         1,  # beam_width
         int(AttentionMaskType.causal),  # mask_type
         quant_mode,  # quant_mode

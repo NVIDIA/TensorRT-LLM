@@ -546,6 +546,35 @@ def _generate_bench_data(
     }
 
 
+def _choose_atom_split(
+    batch, ctx, next_n, num_sms=148, split_kv_tokens=256, tie="max_na", kernel_atoms=(1, 2, 3, 4)
+):
+    """Pick (num_atoms, atom_size) decomposition of next_n minimizing wave count;
+    tie-break configurable via `tie`:
+      - "max_na":  prefer LARGEST num_atoms = smallest atom = most SMs busy per
+                   wave; pays HBM cost of num_atoms× KV re-reads.
+      - "max_atom": prefer LARGEST atom = smallest num_atoms = least HBM cost.
+
+    FP8 kernel natively supports atom ∈ {1, 2, 3, 4} (FP4 differs: {1, 2, 3}).
+
+    Returns (num_atoms, atom)."""
+    cands = []
+    for atom in kernel_atoms:
+        if next_n % atom == 0:
+            na = next_n // atom
+            ntask = batch * na * ((ctx + split_kv_tokens - 1) // split_kv_tokens)
+            waves = (ntask + num_sms - 1) // num_sms
+            cands.append((waves, na, atom))
+    if tie == "max_na":
+        cands.sort(key=lambda x: (x[0], -x[1]))
+    elif tie == "max_atom":
+        cands.sort(key=lambda x: (x[0], x[1]))
+    else:
+        raise ValueError(f"unknown tie={tie!r}")
+    _, na, atom = cands[0]
+    return na, atom
+
+
 def benchmark_fp8_paged_mqa_logits(
     batch_sizes,
     next_ns,
@@ -582,8 +611,10 @@ def benchmark_fp8_paged_mqa_logits(
     )
     is_non_default = output_dtype != torch.float32 or num_epi_subtiles != 1
     hdr = (
-        f"{'batch':>5s} {'ctx':>7s} {'next_n':>6s} {'nblk':>7s} | "
-        f"{'DSL(us)':>8s} {'DG(fp32,us)':>12s} {'DG/DSL':>7s}"
+        f"{'batch':>5s} {'ctx':>7s} {'next_n':>6s} {'nblk':>7s} {'ntask':>6s} | "
+        f"{'maxAtom':>7s} {'DSL(us)':>8s} | "
+        f"{'maxNa':>5s} {'DSL(us)':>8s} {'max_atom/max_na':>15s} | "
+        f"{'DG(us)':>11s} {'DG/DSL_max_atom':>15s} {'DG/DSL_max_na':>13s}"
     )
     if is_non_default:
         hdr += f" {'DSL(fp32,us)':>13s} {'DSL(fp32)/DSL':>13s}"
@@ -594,6 +625,32 @@ def benchmark_fp8_paged_mqa_logits(
         for context_len in context_lens:
             for batch_size in batch_sizes:
                 nblk = batch_size * ((context_len + block_kv - 1) // block_kv)
+                SPLIT_KV_TOKENS = 256
+                # Pick both atom-split strategies for A/B comparison:
+                #   max_atom (baseline): min waves, tie-break max atom (least HBM)
+                #   max_na (experimental): min waves, tie-break max num_atoms (more SMs busy)
+                # FP8 kernel supports atom ∈ {1, 2, 3, 4}.
+                na_base, atom_base = _choose_atom_split(
+                    batch_size,
+                    context_len,
+                    next_n,
+                    num_sms=num_sms,
+                    split_kv_tokens=SPLIT_KV_TOKENS,
+                    tie="max_atom",
+                    kernel_atoms=(1, 2, 3, 4),
+                )
+                na_exp, atom_exp = _choose_atom_split(
+                    batch_size,
+                    context_len,
+                    next_n,
+                    num_sms=num_sms,
+                    split_kv_tokens=SPLIT_KV_TOKENS,
+                    tie="max_na",
+                    kernel_atoms=(1, 2, 3, 4),
+                )
+                ntask = (
+                    batch_size * na_base * ((context_len + SPLIT_KV_TOKENS - 1) // SPLIT_KV_TOKENS)
+                )
 
                 data = _generate_bench_data(
                     batch_size,
@@ -605,34 +662,91 @@ def benchmark_fp8_paged_mqa_logits(
                     varlen=varlen,
                 )
 
+                # Helper: reshape Q + repeat ctx/block_table per (na, atom).
+                # weights [B*next_n, H] = [B*na*atom, H] needs no reshape.
+                # `data`, `batch_size`, `num_heads`, `head_dim` bound via default
+                # args (explicit early-binding; ruff F821 can't track deeply
+                # nested closure captures).
+                def _split(
+                    na,
+                    atom,
+                    data=data,
+                    batch_size=batch_size,
+                    num_heads=num_heads,
+                    head_dim=head_dim,
+                ):
+                    if na > 1:
+                        return {
+                            "q": data["q_fp8"].reshape(batch_size * na, atom, num_heads, head_dim),
+                            "ctx_lens": data["context_lens"].repeat_interleave(na),
+                            "block_table": data["block_table"].repeat_interleave(na, dim=0),
+                        }
+                    return {
+                        "q": data["q_fp8"],
+                        "ctx_lens": data["context_lens"],
+                        "block_table": data["block_table"],
+                    }
+
+                base_t = _split(na_base, atom_base)
+                strats_diverge = (na_base, atom_base) != (na_exp, atom_exp)
+                exp_t = _split(na_exp, atom_exp) if strats_diverge else base_t
+
                 # See `test_cute_dsl_fp8_paged_mqa_logits` for full reasoning
                 # on the `block_kv = 64` choice. Short version: DG metadata
                 # SPLIT_KV = block_kv * 4; we need SPLIT_KV = 256 (DSL
                 # compute tile = 128 × kNumMathWarpGroups = 2), so pass 64.
-                # 2D `(B, 1)` context_lens forces num_next_n_atoms = 1.
+                # 2D `(B*na, 1)` context_lens forces num_next_n_atoms = 1.
                 DG_METADATA_BLOCK_KV = 64
-                dsl_schedule_meta = get_paged_mqa_logits_metadata(
-                    data["context_lens"].unsqueeze(-1),
+                dsl_schedule_meta_base = get_paged_mqa_logits_metadata(
+                    base_t["ctx_lens"].unsqueeze(-1),
                     DG_METADATA_BLOCK_KV,
                     num_sms,
                 )
-
-                def dsl_fn(data=data):
-                    torch.ops.trtllm.cute_dsl_fp8_paged_mqa_logits(
-                        data["q_fp8"],
-                        data["kv_fused"],
-                        data["weights"],
-                        data["context_lens"],
-                        data["block_table"],
-                        dsl_schedule_meta,
-                        data["max_model_len"],
-                        num_epi_subtiles=num_epi_subtiles,
-                        epi_dtype=output_dtype,
-                        acc_dtype=output_dtype,
-                        output_dtype=output_dtype,
+                dsl_schedule_meta_exp = (
+                    get_paged_mqa_logits_metadata(
+                        exp_t["ctx_lens"].unsqueeze(-1),
+                        DG_METADATA_BLOCK_KV,
+                        num_sms,
                     )
+                    if strats_diverge
+                    else dsl_schedule_meta_base
+                )
 
-                dsl_us = _profile_kernel_us(dsl_fn, num_warmup, num_iterations)
+                def _make_dsl_fn(t, schedule_meta, data=data):
+                    def dsl_fn(t=t, schedule_meta=schedule_meta, data=data):
+                        torch.ops.trtllm.cute_dsl_fp8_paged_mqa_logits(
+                            t["q"],
+                            data["kv_fused"],
+                            data["weights"],
+                            t["ctx_lens"],
+                            t["block_table"],
+                            schedule_meta,
+                            data["max_model_len"],
+                            num_epi_subtiles=num_epi_subtiles,
+                            epi_dtype=output_dtype,
+                            acc_dtype=output_dtype,
+                            output_dtype=output_dtype,
+                        )
+
+                    return dsl_fn
+
+                base_us = _profile_kernel_us(
+                    _make_dsl_fn(base_t, dsl_schedule_meta_base),
+                    num_warmup,
+                    num_iterations,
+                )
+                if strats_diverge:
+                    exp_us = _profile_kernel_us(
+                        _make_dsl_fn(exp_t, dsl_schedule_meta_exp),
+                        num_warmup,
+                        num_iterations,
+                    )
+                else:
+                    exp_us = base_us
+                strat_speedup = base_us / exp_us  # >1 = max_na faster
+
+                # Alias for fp32-variant code below (uses baseline schedule).
+                dsl_schedule_meta = dsl_schedule_meta_base
 
                 dg_us = None
                 try:
@@ -691,15 +805,21 @@ def benchmark_fp8_paged_mqa_logits(
 
                     dsl_f32_us = _profile_kernel_us(dsl_f32_fn, num_warmup, num_iterations)
 
-                ratio_str = f"{dg_us / dsl_us:6.3f}x" if dg_us else "   N/A "
-                dg_str = f"{dg_us:11.1f}" if dg_us else "        N/A"
+                ratio_base_str = f"{dg_us / base_us:14.3f}x" if dg_us else "         N/A  "
+                ratio_exp_str = f"{dg_us / exp_us:12.3f}x" if dg_us else "       N/A  "
+                dg_str = f"{dg_us:10.1f}" if dg_us else "       N/A"
+                base_lab = f"{na_base}/{atom_base}"
+                exp_lab = f"{na_exp}/{atom_exp}"
                 line = (
                     f"{batch_size:5d} {context_len:7d} {next_n:6d} "
-                    f"{nblk:7d} | {dsl_us:7.1f} {dg_str} {ratio_str}"
+                    f"{nblk:7d} {ntask:6d} | "
+                    f"{base_lab:>7s} {base_us:8.1f} | "
+                    f"{exp_lab:>5s} {exp_us:8.1f} {strat_speedup:14.3f}x | "
+                    f"{dg_str} {ratio_base_str} {ratio_exp_str}"
                 )
                 if is_non_default:
                     f32_str = f"{dsl_f32_us:12.1f}" if dsl_f32_us else "         N/A"
-                    f32_ratio = f"{dsl_f32_us / dsl_us:12.3f}x" if dsl_f32_us else "         N/A "
+                    f32_ratio = f"{dsl_f32_us / base_us:12.3f}x" if dsl_f32_us else "         N/A "
                     line += f" {f32_str} {f32_ratio}"
                 print(line)
 
@@ -734,7 +854,7 @@ if __name__ == "__main__":
         "--context_len",
         type=int,
         nargs="+",
-        default=[4096, 8192, 16384, 32768, 65536, 131072],
+        default=[1024, 2048, 4096, 8192, 16384, 32768, 65536, 131072],
         help="context lengths (default: 4096 8192 16384 32768 65536 131072)",
     )
     parser.add_argument("--warmup", type=int, default=10, help="warmup iterations (default: 10)")
@@ -750,7 +870,7 @@ if __name__ == "__main__":
         "--num_epi_subtiles",
         type=int,
         default=1,
-        choices=[1, 2, 4],
+        choices=[1, 2, 3, 4],
         help="epilogue sub-tile count (default: 1)",
     )
     parser.add_argument(

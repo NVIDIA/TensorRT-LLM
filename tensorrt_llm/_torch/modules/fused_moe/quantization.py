@@ -502,26 +502,69 @@ class FusedMoEMethodBase(ABC):
         if not allow_partial_loading:
             self.process_weights_after_loading(module)
 
+            # Finalize shared weights eagerly so each layer's CPU tensors are freed
+            # before the next layer is loaded. This prevents accumulation of all
+            # layers' shared weight tensors in host memory simultaneously.
+            # Partial-loading callers (e.g. RLHF reload) instead rely on
+            # ``post_load_weights`` to finalize once the loading sequence ends.
+            self._finalize_shared_weights(module)
+
+    def _prepare_shared_weights_for_finalization(self, module: torch.nn.Module):
+        """Hook for subclasses to transform shared weight tensors before
+        they are copied into shared memory and freed.
+
+        Called by ``_finalize_shared_weights`` just before the tensors stored
+        as ``local_shared_*`` module attributes are registered with the load
+        balancer and written into POSIX shared-memory segments.  Subclasses
+        may override this to apply weight transformations (e.g. resmoothing)
+        while the tensors are still in private process memory.
+        """
+
+    def _finalize_shared_weights(self, module: torch.nn.Module):
+        """Register shared weights with the load balancer and copy them into
+        shared memory, then delete the private CPU tensor copies.
+
+        Calling this at the end of each layer's ``load_weights`` (rather than
+        deferring to ``post_load_weights``) prevents all layers' CPU tensors
+        from accumulating in host memory simultaneously.  With fewer GPUs per
+        node each rank is responsible for more experts, so the accumulated
+        private tensors can easily exceed available host memory.
+
+        This method is idempotent: if the per-layer ``local_shared_*`` tensors
+        have already been finalized (and deleted), it is a no-op.  This lets
+        ``post_load_weights`` invoke it as a safety net for callers that pass
+        ``allow_partial_loading=True`` (e.g. the RLHF reload path), without
+        double-finalizing in the eager path.
+        """
+        if not self.need_load_shared_weights(module):
+            return
+        if not hasattr(module, 'local_shared_w3_w1_tensors'):
+            return
+        self._prepare_shared_weights_for_finalization(module)
+        weight_fns = {
+            'w3_w1_weight': getattr(module, 'local_shared_w3_w1_tensors'),
+            'w2_weight': getattr(module, 'local_shared_w2_tensors')
+        }
+        delattr(module, 'local_shared_w3_w1_tensors')
+        delattr(module, 'local_shared_w2_tensors')
+        if module.bias:
+            weight_fns.update({
+                'w3_w1_bias':
+                getattr(module, 'local_shared_w3_w1_bias_tensors'),
+                'w2_bias':
+                getattr(module, 'local_shared_w2_bias_tensors')
+            })
+            delattr(module, 'local_shared_w3_w1_bias_tensors')
+            delattr(module, 'local_shared_w2_bias_tensors')
+        module.register_all_parameter_slot_and_to_fix_weight_fns(weight_fns)
+        module.layer_load_balancer.host_tensor_sharer.finalize_layer_weights()
+
     def post_load_weights(self, module: torch.nn.Module):
-        if self.need_load_shared_weights(module):
-            weight_fns = {
-                'w3_w1_weight': getattr(module, 'local_shared_w3_w1_tensors'),
-                'w2_weight': getattr(module, 'local_shared_w2_tensors')
-            }
-            delattr(module, 'local_shared_w3_w1_tensors')
-            delattr(module, 'local_shared_w2_tensors')
-            if module.bias:
-                weight_fns.update({
-                    'w3_w1_bias':
-                    getattr(module, 'local_shared_w3_w1_bias_tensors'),
-                    'w2_bias':
-                    getattr(module, 'local_shared_w2_bias_tensors')
-                })
-                delattr(module, 'local_shared_w3_w1_bias_tensors')
-                delattr(module, 'local_shared_w2_bias_tensors')
-            module.register_all_parameter_slot_and_to_fix_weight_fns(weight_fns)
-            module.layer_load_balancer.host_tensor_sharer.finalize_layer_weights(
-            )
+        # Safety net for deferred-finalization callers (e.g. RLHF reload, which
+        # passes allow_partial_loading=True and so skips the eager per-layer
+        # finalization in load_weights).  Idempotent when finalization already
+        # ran eagerly.
+        self._finalize_shared_weights(module)
         if hasattr(module,
                    "layer_load_balancer") and module.layer_load_balancer:
             module.layer_load_balancer.set_initial_weight_assignments(
@@ -1154,21 +1197,18 @@ class DeepSeekFP8BlockScalesFusedMoEMethod(FusedMoEMethodBase):
                 local_shared_w2_scale_tensors,
                 device=torch.device("cpu"))
 
-    def post_load_weights(self, module: torch.nn.Module):
-        if self.need_load_shared_weights(module):
-            weight_fns = {}
-            if hasattr(module, 'local_shared_w3_w1_scale_tensors'):
-                weight_fns['w3_w1_weight_scaling_factor'] = getattr(
-                    module, 'local_shared_w3_w1_scale_tensors')
-                delattr(module, 'local_shared_w3_w1_scale_tensors')
-            if hasattr(module, 'local_shared_w2_scale_tensors'):
-                weight_fns['w2_weight_scaling_factor'] = getattr(
-                    module, 'local_shared_w2_scale_tensors')
-                delattr(module, 'local_shared_w2_scale_tensors')
-            if weight_fns:
-                module.register_all_parameter_slot_and_to_fix_weight_fns(
-                    weight_fns)
-        super().post_load_weights(module)
+    def _prepare_shared_weights_for_finalization(self, module: torch.nn.Module):
+        weight_fns = {}
+        if hasattr(module, 'local_shared_w3_w1_scale_tensors'):
+            weight_fns['w3_w1_weight_scaling_factor'] = getattr(
+                module, 'local_shared_w3_w1_scale_tensors')
+            delattr(module, 'local_shared_w3_w1_scale_tensors')
+        if hasattr(module, 'local_shared_w2_scale_tensors'):
+            weight_fns['w2_weight_scaling_factor'] = getattr(
+                module, 'local_shared_w2_scale_tensors')
+            delattr(module, 'local_shared_w2_scale_tensors')
+        if weight_fns:
+            module.register_all_parameter_slot_and_to_fix_weight_fns(weight_fns)
 
 
 def resmooth_and_transform_fp8_scale(
@@ -1194,7 +1234,7 @@ class DeepSeekFP8BlockScalesFusedMoEMethodDeepGemm(
     def _needs_e8m0_resmooth(self):
         return is_sm_100f() or get_sm_version() == 120
 
-    def post_load_weights(self, module: torch.nn.Module):
+    def _prepare_shared_weights_for_finalization(self, module: torch.nn.Module):
         if self._needs_e8m0_resmooth():
             # Resmooth shared experts before registering shared weights
             if self.need_load_shared_weights(module):
@@ -1229,8 +1269,9 @@ class DeepSeekFP8BlockScalesFusedMoEMethodDeepGemm(
                             resmoothed_shared_w2_weight.cpu())
                     setattr(module, 'local_shared_w2_scale_tensors',
                             transformed_shared_w2_scale.cpu())
+        super()._prepare_shared_weights_for_finalization(module)
 
-        # Call super() after resmooth shared experts (local_shared tensors will be deleted in super().post_load_weights())
+    def post_load_weights(self, module: torch.nn.Module):
         super().post_load_weights(module)
 
         if self._needs_e8m0_resmooth():
@@ -2931,6 +2972,164 @@ class NVFP4CuteDslFusedMoEMethod(NVFP4CutlassFusedMoEMethod):
             self._interleave_w3_w1_weight(module.w3_w1_weight.data[expert_idx])
             self._interleave_w3_w1_weight_scale_cute_dsl(
                 module, module.w3_w1_weight_scale.data[expert_idx])
+
+
+class NVFP4CuteDslB12xFusedMoEMethod(NVFP4CutlassFusedMoEMethod):
+    """NVFP4 quant method for the FlashInfer B12x MoE backend (SM120 / SM121).
+
+    Inherits the full CUTLASS NVFP4 weight pipeline (cat + pad +
+    block_scale_interleave + setup_quant_scales) so the backend's
+    hybrid prefill path can continue to consume the standard CUTLASS
+    NVFP4 GroupGEMM layout via the inherited ``CutlassFusedMoE.run_moe``.
+
+    On top of that base layout, ``post_load_weights`` materialises the
+    b12x-specific weight tensors: SF un-normalization (multiply per-block
+    FP8 scales by ``weight_scale_2 = fc_alpha * fc_input_scale``),
+    ``convert_sf_to_mma_layout`` reshape, per-expert ``w*_alpha = 1 /
+    fc_input_scale`` vectors, and a ``B12xMoEWrapper`` instance with a
+    shared cross-layer output buffer. The wrapper and the bundled
+    weight dict are attached to the MoE module as ``module.b12x_wrapper``
+    / ``module._b12x_weights`` so the backend's ``run_moe`` can dispatch
+    to them on decode-shape inputs without holding any kernel-prep logic
+    of its own.
+    """
+
+    # b12x exposes two activation strings today: ``relu2`` (Nemotron-style
+    # ``x * relu(x)``) and ``silu`` (SwiGLU-style ``x * silu(gate)``).
+    _ACTIVATION_MAP = {
+        ActivationType.Relu2: "relu2",
+        ActivationType.Swiglu: "silu",
+    }
+
+    def post_load_weights(self, module: torch.nn.Module):
+        # Base class handles shared-weight finalize, load-balancer init,
+        # and setup_quant_scales. Leaves the standard CUTLASS NVFP4
+        # weight + SF layout in place for the inherited prefill path.
+        super().post_load_weights(module)
+
+        try:
+            from flashinfer import B12xMoEWrapper
+            from flashinfer.cute_dsl.utils import convert_sf_to_mma_layout
+        except ImportError as e:
+            raise RuntimeError(
+                "NVFP4CuteDslB12xFusedMoEMethod requires the `flashinfer` package "
+                "(B12xMoEWrapper, cute_dsl.utils.convert_sf_to_mma_layout). "
+                f"Original import error: {e}") from e
+
+        # ``_SHARED_MOE_OUTPUT_BUF`` lives next to the backend so all MoE
+        # layers across the model share one wrapper-owned output buffer.
+        from .fused_moe_cute_dsl_b12x import _SHARED_MOE_OUTPUT_BUF
+
+        num_local_experts = module.w3_w1_weight.shape[0]
+        # Tensor shapes use the *padded* per-rank dims because TP partitions
+        # may pad ``intermediate_size`` up to a kernel-friendly boundary.
+        # Recover them from the actual stored tensors rather than the logical
+        # model config so reshapes stay valid under TP > 1.
+        _, w3w1_out_dim, _ = module.w3_w1_weight.shape  # (E, 2*I_pad, H//16)
+        _, w2_out_dim, w2_in_packed = module.w2_weight.shape  # (E, H, I_pad//16)
+        w3w1_in_dim = module.hidden_size
+        w2_in_dim = w2_in_packed * 16
+
+        # b12x reuses the per-expert ``w1_alpha`` tensor as both (a) the
+        # online activation-quant ``global_scale`` and (b) the FC1 epilogue
+        # output-dequant multiplier. That dual use is only self-consistent
+        # when the FP4 weight block scales are stored in their *unnormalized*
+        # form (raw ``max_block / FP4_MAX``), not divided out by the
+        # per-tensor ``weight_scale_2``. HF / ModelOpt NVFP4 checkpoints
+        # store the normalized variant so the FP8 block scales fit in range,
+        # and TRT-LLM's NVFP4 loader preserves that form. To match b12x's
+        # convention we recover ``weight_scale_2 = fc_alpha * fc_input_scale``
+        # and multiply each expert's FP8 block scales by it before handing
+        # them to ``convert_sf_to_mma_layout``. With the un-normalized scales
+        # in place we pass ``w1_alpha = w2_alpha = 1 / fc_input_scale``
+        # (== ``s_in``) so the kernel's dual-use cancels algebraically and
+        # the stored input-side block scales remain FP8-representable.
+        w1_w_scale_2 = (module.fc31_alpha * module.fc31_input_scale).to(
+            torch.float32)
+        w2_w_scale_2 = (module.fc2_alpha * module.fc2_input_scale).to(
+            torch.float32)
+
+        w1_sf_fp8_norm = module.w3_w1_weight_scale.view(
+            torch.float8_e4m3fn).float()
+        w2_sf_fp8_norm = module.w2_weight_scale.view(
+            torch.float8_e4m3fn).float()
+
+        # Broadcast per-expert scalar over the trailing dims (E, *).
+        bcast1 = w1_w_scale_2.view(-1, *([1] * (w1_sf_fp8_norm.dim() - 1)))
+        bcast2 = w2_w_scale_2.view(-1, *([1] * (w2_sf_fp8_norm.dim() - 1)))
+        w1_sf_fp8 = (w1_sf_fp8_norm * bcast1).to(torch.float8_e4m3fn)
+        w2_sf_fp8 = (w2_sf_fp8_norm * bcast2).to(torch.float8_e4m3fn)
+
+        w1_sf_b12x = convert_sf_to_mma_layout(w1_sf_fp8,
+                                              m=w3w1_out_dim,
+                                              k=w3w1_in_dim,
+                                              num_groups=num_local_experts)
+        w2_sf_b12x = convert_sf_to_mma_layout(w2_sf_fp8,
+                                              m=w2_out_dim,
+                                              k=w2_in_dim,
+                                              num_groups=num_local_experts)
+
+        w1_alpha_b12x = ((1.0 / module.fc31_input_scale).expand(
+            module.num_experts).to(torch.float32).contiguous())
+        w2_alpha_b12x = ((1.0 / module.fc2_input_scale).expand(
+            module.num_experts).to(torch.float32).contiguous())
+        fc2_input_scale_b12x = (1.0 / module.fc2_input_scale).to(torch.float32)
+
+        # TRT-LLM packs 16 FP4 values per int64. flashinfer's internal
+        # ``view(torch.float4_e2m1fn_x2)`` requires byte-contiguous storage
+        # (stride[-1] == 1 in bytes); a uint8 view of the int64 tensor
+        # provides that without copying.
+        module._b12x_weights = dict(
+            w1_weight=module.w3_w1_weight.view(torch.uint8),
+            w1_weight_sf=w1_sf_b12x,
+            w1_alpha=w1_alpha_b12x,
+            w2_weight=module.w2_weight.view(torch.uint8),
+            w2_weight_sf=w2_sf_b12x,
+            w2_alpha=w2_alpha_b12x,
+            fc2_input_scale=fc2_input_scale_b12x,
+        )
+
+        if module.activation_type not in self._ACTIVATION_MAP:
+            supported = ", ".join(a.name for a in self._ACTIVATION_MAP)
+            raise ValueError(
+                f"NVFP4CuteDslB12xFusedMoEMethod does not support activation "
+                f"{ActivationType(module.activation_type).name}; "
+                f"supported: {supported}.")
+
+        module.b12x_wrapper = B12xMoEWrapper(
+            num_experts=module.num_experts,
+            top_k=module.routing_method.experts_per_token,
+            hidden_size=module.hidden_size,
+            intermediate_size=module.intermediate_size_per_partition,
+            use_cuda_graph=getattr(module, "_b12x_use_cuda_graph", False),
+            max_num_tokens=module.moe_max_num_tokens,
+            activation=self._ACTIVATION_MAP[module.activation_type],
+        )
+
+        # Replace the wrapper's per-instance output buffer with a shared one.
+        # Layers run sequentially on a single stream, so a single buffer of the
+        # right shape is correct and saves
+        # ``(num_moe_layers - 1) * max_num_tokens * hidden_size * 2`` bytes —
+        # ~2.5 GB on Nemotron-Super-120B with ``max_num_tokens=2048``,
+        # ``hidden=8192``, bf16, 80 MoE layers.
+        if module.b12x_wrapper._moe_output is not None:
+            buf = module.b12x_wrapper._moe_output
+            key = (buf.shape[0], buf.shape[1], buf.dtype, str(buf.device))
+            shared = _SHARED_MOE_OUTPUT_BUF.get(key)
+            if shared is None:
+                _SHARED_MOE_OUTPUT_BUF[key] = buf
+            else:
+                # Free the freshly allocated buffer; reuse the existing one.
+                module.b12x_wrapper._moe_output = shared
+
+        logger.info_once(
+            f"NVFP4CuteDslB12xFusedMoEMethod active: hidden={module.hidden_size}, "
+            f"intermediate={module.intermediate_size_per_partition}, "
+            f"experts={module.num_experts}, top_k="
+            f"{module.routing_method.experts_per_token}, "
+            f"activation={self._ACTIVATION_MAP[module.activation_type]}.",
+            key="cute_dsl_b12x_moe_active",
+        )
 
 
 class NVFP4TRTLLMGenFusedMoEBaseMethod(NVFP4FusedMoEMethod):

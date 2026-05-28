@@ -418,29 +418,32 @@ class BaseWorker(GenerationExecutor):
         assert request.id is not None
         py_lora_path = None
         if self._lora_manager is not None and request.lora_request is not None:
-            if self._is_pytorch_backend:
-                # PyTorch backend: don't embed weights in the request.
-                # Each rank loads independently from disk via py_lora_path
-                # in PeftCacheManager.add_request_peft().
-                # Pre-load on rank 0 to warm the LoRA manager cache so that
-                # add_request_peft finds the adapter already loaded.
-                self._load_lora_adapter(request.lora_request)
-                uid = str(request.lora_request.adapter_id)
-                lora_config = tllm.LoraConfig(
-                    task_id=request.lora_request.adapter_id,
-                    weights=None,
-                    config=self._lora_manager.cpp_lora_config[uid])
-            else:
-                adapter_in_cache = self._lora_manager.is_adapter_in_cpu_cache(
-                    request.lora_request.adapter_id)
-                self._load_lora_adapter(request.lora_request)
-                uid = str(request.lora_request.adapter_id)
-                lora_config = tllm.LoraConfig(
-                    task_id=request.lora_request.adapter_id,
-                    weights=self._lora_manager.cpp_lora_weights[uid]
-                    if not adapter_in_cache else None,
-                    config=self._lora_manager.cpp_lora_config[uid])
-            py_lora_path = request.lora_request.lora_path
+            try:
+                if self._is_pytorch_backend:
+                    # PyTorch backend: don't embed weights in the request.
+                    # Each rank loads independently from disk via py_lora_path
+                    # in PeftCacheManager.add_request_peft().
+                    # Pre-load on rank 0 to warm the LoRA manager cache so that
+                    # add_request_peft finds the adapter already loaded.
+                    self._load_lora_adapter(request.lora_request)
+                    uid = str(request.lora_request.adapter_id)
+                    lora_config = tllm.LoraConfig(
+                        task_id=request.lora_request.adapter_id,
+                        weights=None,
+                        config=self._lora_manager.cpp_lora_config[uid])
+                else:
+                    adapter_in_cache = self._lora_manager.is_adapter_in_cpu_cache(
+                        request.lora_request.adapter_id)
+                    self._load_lora_adapter(request.lora_request)
+                    uid = str(request.lora_request.adapter_id)
+                    lora_config = tllm.LoraConfig(
+                        task_id=request.lora_request.adapter_id,
+                        weights=self._lora_manager.cpp_lora_weights[uid]
+                        if not adapter_in_cache else None,
+                        config=self._lora_manager.cpp_lora_config[uid])
+                py_lora_path = request.lora_request.lora_path
+            except Exception as e:
+                raise RequestError(f"Failed to load LoRA adapter: {e}") from e
         else:
             lora_config = None
 
@@ -821,6 +824,11 @@ class BaseWorker(GenerationExecutor):
         iteration_stats, req_stats = stats[0], stats[1]
         kv_iter_stats = stats[2] if len(stats) > 2 else None
         attention_dp_rank = stats[3] if len(stats) > 3 else None
+        # Newer slots — guarded with len() checks so historical 4-tuples and
+        # any external code still appending the legacy shape keep working.
+        host_step_time_ms = stats[4] if len(stats) > 4 else None
+        prev_device_step_time_ms = stats[5] if len(stats) > 5 else None
+        scheduler_mode = stats[6] if len(stats) > 6 else None
 
         stats_dict = json.loads(iteration_stats.to_json_str())
         # Always tag the row so Dynamo's adapter can read
@@ -863,6 +871,28 @@ class BaseWorker(GenerationExecutor):
                 }
                 for window_size, s in kv_iter_stats.items()
             }
+
+        # Per-loop CPU wall captured by profile_step() — always a clean
+        # single-loop measurement, matching the log line's `host_step_time`.
+        # Prefer this over iterLatencyMS when you need absolute per-loop
+        # CPU cost, especially under the overlap scheduler where
+        # iterLatencyMS measures the batch's full lifecycle (~2 loops).
+        if host_step_time_ms is not None:
+            stats_dict["hostStepTimeMS"] = host_step_time_ms
+        # GPU forward time read via the ping-pong CUDA event pair in
+        # profile_step(). Note the "prev" in the name: under steady state
+        # the value lags its sibling host_step_time on the same record by
+        # one loop (the event-pair being read corresponds to the loop
+        # before the one host_step_time describes). See the ping-pong
+        # comment in PyExecutor._profiler for the design rationale.
+        if prev_device_step_time_ms is not None:
+            stats_dict["prevDeviceStepTimeMS"] = prev_device_step_time_ms
+        # Scheduler mode for this record. "overlap" means iterLatencyMS
+        # spans ~2 loops (use hostStepTimeMS for clean per-loop cost);
+        # "non_overlap" means iterLatencyMS is itself the clean per-loop
+        # CPU wall. Set per-record so consumers do not need server config.
+        if scheduler_mode is not None:
+            stats_dict["schedulerMode"] = scheduler_mode
 
         # Convert back to JSON string
         return json.dumps(stats_dict)

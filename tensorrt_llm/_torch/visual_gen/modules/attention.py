@@ -4,11 +4,13 @@ from typing import Optional, Tuple
 import torch
 import torch.nn as nn
 
+from tensorrt_llm.llmapi.llm_args import SkipSoftmaxAttentionConfig
+
 from ...modules.linear import Linear, WeightMode, WeightsLoadingConfig
 from ...modules.rms_norm import RMSNorm
 from ..attention_backend.interface import AttentionTensorLayout
 from ..attention_backend.utils import create_attention
-from ..config import DiffusionModelConfig
+from ..config import DiffusionModelConfig, SkipSoftmaxConfig
 
 
 class QKVMode(str, Enum):
@@ -49,6 +51,7 @@ class Attention(nn.Module):
         fuse_qk_norm_rope: Optional[bool] = None,
         config: Optional[DiffusionModelConfig] = None,
         layer_idx: Optional[int] = None,
+        enable_ulysses: bool = True,  # make this enable sequence parallelism
     ):
         super().__init__()
 
@@ -67,8 +70,10 @@ class Attention(nn.Module):
         self.bias = bias
 
         # Fused QK Norm + RoPE: each model class opts in via fuse_qk_norm_rope.
-        # Supported for both per_head (FLUX) and full/cross-head (WAN) norm modes.
-        # Defaults to False; models that want the fused kernel must pass True explicitly.
+        # Backed by torch.ops.trtllm.fused_dit_qk_norm_rope which auto-dispatches:
+        #   - per-head template (FLUX/Cosmos):   q/k_weight.shape == [head_dim]
+        #   - full-dim template (LTX-2, WAN):    q/k_weight.shape == [num_heads * head_dim]
+        # Full-dim template envelope: num_heads <= 64, head_dim in {64, 128}.
         self.fuse_qk_norm_rope = fuse_qk_norm_rope if fuse_qk_norm_rope is not None else False
         self.interleave = interleave
 
@@ -128,7 +133,7 @@ class Attention(nn.Module):
         # Currently kept as mutually exclusive.
         attn2d_size = (vgm.attn2d_row_size * vgm.attn2d_col_size) if vgm else 1
         use_attn2d = attn2d_size > 1 and self.qkv_mode != QKVMode.SEPARATE_QKV
-        use_ulysses = ulysses_size > 1 and self.qkv_mode != QKVMode.SEPARATE_QKV
+        use_ulysses = ulysses_size > 1 and enable_ulysses
 
         # Compute head counts for the backend
         # Ulysses shards heads across workers; inner backend sees sharded count
@@ -139,6 +144,22 @@ class Attention(nn.Module):
         else:
             backend_num_heads = self.num_attention_heads
             backend_num_kv_heads = self.num_key_value_heads
+
+        # Resolve sparse attention config for TRTLLM backend
+        sparse_attention_config = None
+        ss_cfg = config.attention.sparse_attention_config
+        if isinstance(ss_cfg, SkipSoftmaxConfig) and backend_name == "TRTLLM":
+            # Cache the resolved scalar on a private attr (idempotent across
+            # all Attention modules); does NOT mutate the source-of-truth
+            # `threshold_scale_factor` / `target_sparsity` fields. Subsequent
+            # callers — including `apply_skip_softmax_overrides` — read the
+            # cached value via `resolve_threshold(module_name)`.
+            threshold = ss_cfg.get_or_resolve_threshold()
+
+            if threshold is not None and threshold > 0:
+                sparse_attention_config = SkipSoftmaxAttentionConfig(
+                    threshold_scale_factor={"prefill": threshold, "decode": 0}
+                )
 
         # Create compute backend
         self.attn = create_attention(
@@ -151,6 +172,7 @@ class Attention(nn.Module):
             dtype=self.dtype,
             attention_config=config.attention,
             attention_metadata_state=attention_metadata_state,
+            sparse_attention_config=sparse_attention_config,
         )
 
         # Wrap with parallelism strategy (orthogonal to backend choice)
@@ -250,7 +272,7 @@ class Attention(nn.Module):
             k = self.norm_k(k)
         return q, k
 
-    def apply_qk_norm_rope(
+    def apply_packed_qk_norm_rope(
         self,
         qkv: torch.Tensor,
         freqs_cos: torch.Tensor,
@@ -259,60 +281,103 @@ class Attention(nn.Module):
         q_add_weight: Optional[torch.Tensor] = None,
         k_add_weight: Optional[torch.Tensor] = None,
     ) -> None:
-        """Apply fused QK Norm + RoPE in-place on packed QKV tensor.
+        """Apply fused QK Norm + RoPE in-place on packed QKV tensor (FUSE_QKV self-attn).
 
-        Dispatches to per-head kernel (FLUX) or cross-head kernel (WAN)
-        based on qk_norm_mode.
+        The op auto-dispatches by tensor shapes/dtypes:
+          - q_weight.shape = [head_dim]              → per-head norm (FLUX/Cosmos, w/ dual-stream)
+          - q_weight.shape = [num_heads * head_dim]  → full-dim norm (LTX-2, WAN, ≤64 heads)
+          - cos last dim = head_dim                  → per-token shared cos (FLUX, WAN)
+          - cos last dim = num_heads * head_dim      → per-token per-head cos (LTX-2 3D RoPE)
+          - cos rows < num_tokens                    → kernel broadcasts via cos_seq_per_batch
+
+        Caller passes raw freqs_cos / freqs_sin (any rank); the op reshapes internally.
         """
-        cos_2d = freqs_cos.reshape(-1, self.head_dim).float().contiguous()
-        sin_2d = freqs_sin.reshape(-1, self.head_dim).float().contiguous()
-
         B, S, D = qkv.shape
-        assert cos_2d.shape == (S, self.head_dim), (
-            f"cos_emb shape mismatch: expected [{S}, {self.head_dim}], got {list(cos_2d.shape)}"
+        tokens_per_batch = S if num_txt_tokens > 0 else 0
+        torch.ops.trtllm.fused_dit_qk_norm_rope(
+            qkv.view(B * S, D),
+            self.num_attention_heads,
+            self.num_key_value_heads,
+            self.num_key_value_heads,
+            self.head_dim,
+            self.eps,
+            self.norm_q.weight,
+            self.norm_k.weight,
+            q_add_weight,
+            k_add_weight,
+            freqs_cos,
+            freqs_sin,
+            num_txt_tokens,
+            self.interleave,
+            tokens_per_batch,
         )
-        qkv_2d = qkv.view(B * S, D)
-        cos_tiled = cos_2d.repeat(B, 1) if B > 1 else cos_2d
-        sin_tiled = sin_2d.repeat(B, 1) if B > 1 else sin_2d
 
-        if self.qk_norm_mode == "full":
-            torch.ops.trtllm.fused_dit_cross_head_qk_norm_rope(
-                qkv_2d,
-                self.num_attention_heads,
-                self.num_key_value_heads,
-                self.num_key_value_heads,
-                self.head_dim,
-                self.eps,
-                self.norm_q.weight,
-                self.norm_k.weight,
-                cos_tiled,
-                sin_tiled,
-                self.interleave,
-            )
+    def apply_split_norm_rope(
+        self,
+        tensor: torch.Tensor,
+        weight: torch.Tensor,
+        num_heads: int,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+    ) -> None:
+        """In-place fused RMSNorm + RoPE on a single Q or K tensor [B, T, H*D] (SEPARATE_QKV cross-attn).
+
+        The op auto-dispatches by shapes/dtypes (same as `apply_packed_qk_norm_rope`):
+          - cos last dim = head_dim                  → per-token shared cos
+          - cos last dim = num_heads * head_dim      → per-token per-head cos (LTX-2 3D RoPE)
+          - cos rows < num_tokens                    → kernel broadcasts via cos_seq_per_batch
+          - cos dtype bf16 or fp32                   → kernel upcasts bf16 to fp32 in registers
+        Caller passes raw cos/sin (any rank); the op reshapes internally.
+        """
+        B, T, _ = tensor.shape
+        torch.ops.trtllm.fused_dit_split_norm_rope(
+            tensor.view(B * T, -1),
+            num_heads,
+            self.head_dim,
+            self.eps,
+            weight,
+            cos,
+            sin,
+            self.interleave,
+        )
+
+    def apply_split_norm(
+        self,
+        tensor: torch.Tensor,
+        weight: torch.Tensor,
+        num_heads: int,
+    ) -> None:
+        """In-place fused full-dim RMSNorm only (no RoPE) on a single Q or K tensor [B, T, H*D].
+
+        Calls trtllm.fused_dit_split_norm. Used by paths that need norm but
+        no RoPE -- e.g. LTX-2 text cross-attn (Q-norm with pe=None).
+        """
+        B, T, _ = tensor.shape
+        torch.ops.trtllm.fused_dit_split_norm(
+            tensor.view(B * T, -1),
+            num_heads,
+            self.head_dim,
+            self.eps,
+            weight,
+        )
+
+    def apply_split_norm_or_norm_rope(
+        self,
+        tensor: torch.Tensor,
+        weight: torch.Tensor,
+        num_heads: int,
+        pe: tuple[torch.Tensor, torch.Tensor] | None,
+    ) -> None:
+        """Dispatcher: in-place norm-only when pe is None, else norm + RoPE.
+
+        Used to dispatch all SEPARATE_QKV cross-attn norm paths through the
+        split-fuse kernels regardless of whether the path needs RoPE.
+        """
+        if pe is None:
+            self.apply_split_norm(tensor, weight, num_heads)
         else:
-            # Dual-stream batch correction: when B>1 and dual-stream is active,
-            # the kernel uses modulo (tokenIdx % tokens_per_batch) to find the
-            # local position within each batch element for the text/image boundary.
-            # 0 = no dual-stream (single-stream or batch=1).
-            tokens_per_batch = S if num_txt_tokens > 0 else 0
-
-            torch.ops.trtllm.fused_dit_qk_norm_rope(
-                qkv_2d,
-                self.num_attention_heads,
-                self.num_key_value_heads,
-                self.num_key_value_heads,
-                self.head_dim,
-                self.eps,
-                self.norm_q.weight,
-                self.norm_k.weight,
-                q_add_weight,
-                k_add_weight,
-                cos_tiled,
-                sin_tiled,
-                num_txt_tokens,
-                self.interleave,
-                tokens_per_batch,
-            )
+            cos, sin = pe
+            self.apply_split_norm_rope(tensor, weight, num_heads, cos, sin)
 
     def _attn_impl(
         self,
@@ -389,7 +454,7 @@ class Attention(nn.Module):
         ):
             qkv = self.qkv_proj(hidden_states)
             freqs_cos, freqs_sin = freqs
-            self.apply_qk_norm_rope(qkv, freqs_cos, freqs_sin)
+            self.apply_packed_qk_norm_rope(qkv, freqs_cos, freqs_sin)
             q, k, v = qkv.split([self.q_dim, self.kv_dim, self.kv_dim], dim=-1)
             out = self._attn_impl(q, k, v)
             return self.to_out[0](out)

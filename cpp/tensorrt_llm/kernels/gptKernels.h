@@ -168,7 +168,7 @@ struct BuildDecoderInfoParams
     // We will apply the limited_length_causal mask when there are not enough kv cache.
     int attentionWindowSize;
     // The number of sink tokens in the kv cache.
-    int sinkTokenLength;
+    int sinkTokenLength{0};
     // The number of tokens in total. It's \sum_{ii=0}^{batchSize} seqLengths[ii].
     int numTokens;
     // Remove padding or not.
