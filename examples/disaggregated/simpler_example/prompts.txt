@@ -7,7 +7,7 @@ curl http://localhost:8000/v1/completions \
         "n": 4,
         "max_tokens": 1024,
         "temperature": 0
-    }' -w "\n" 2>&1 | tee atmosphere_output2.json
+    }' -w "\n" 2>&1 | tee atmosphere_output.json
 
 curl http://localhost:8000/v1/completions \
     -H "Content-Type: application/json" \

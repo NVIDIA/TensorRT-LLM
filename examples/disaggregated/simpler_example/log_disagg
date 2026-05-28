@@ -4,69 +4,65 @@ Skipping import of cpp extensions due to incompatible torch version 2.11.0a0+eb6
 Multiple distributions found for package modelopt. Picked distribution: nvidia-modelopt
 /home/scratch.athenac_coreai/pyuser/lib/python3.12/site-packages/modelopt/torch/__init__.py:36: UserWarning: transformers version 5.3.0 is incompatible with nvidia-modelopt and may cause issues. Please install recommended version with `pip install nvidia-modelopt[hf]` if working with HF models.
   _warnings.warn(
-[05/26/2026-23:56:32] [TRT-LLM] [I] [_torch  ] flashinfer is available: 0.6.10
-[05/26/2026-23:56:32] [TRT-LLM] [I] [_torch  ] cutlass dsl is available
-[05/26/2026-23:56:33] [TRT-LLM] [W] [_torch  ] TileIR requires compute capability 10.0 or higher, but the current device has 8.0. TileIR kernels will not be available
-[05/26/2026-23:56:33] [TRT-LLM] [I] [_torch  ] cuBLASLt FP4 GEMM is available
-[05/26/2026-23:56:37] [TRT-LLM] [I] [_common ] Starting TensorRT LLM init.
+[05/28/2026-00:37:44] [TRT-LLM] [I] [_torch  ] flashinfer is available: 0.6.10
+[05/28/2026-00:37:44] [TRT-LLM] [I] [_torch  ] cutlass dsl is available
+[05/28/2026-00:37:45] [TRT-LLM] [W] [_torch  ] TileIR requires compute capability 10.0 or higher, but the current device has 8.0. TileIR kernels will not be available
+[05/28/2026-00:37:45] [TRT-LLM] [I] [_torch  ] cuBLASLt FP4 GEMM is available
+[05/28/2026-00:37:49] [TRT-LLM] [I] [_common ] Starting TensorRT LLM init.
 [TRT-LLM] [I] [RANK 0] Set logger level to I
-[05/26/2026-23:56:37] [TRT-LLM] [I] [_common ] TensorRT LLM inited.
+[05/28/2026-00:37:49] [TRT-LLM] [I] [_common ] TensorRT LLM inited.
 [TensorRT-LLM] TensorRT LLM version: 1.3.0rc15
 /home/scratch.athenac_coreai/TensorRT-LLM/tensorrt_llm/serve/openai_protocol.py:117: UserWarning: Field name "schema" in "ResponseFormat" shadows an attribute in parent "OpenAIBaseModel"
   class ResponseFormat(OpenAIBaseModel):
-[05/26/2026-23:56:40] [TRT-LLM] [W] [commands] Logger level already set from environment. Discard new verbosity: info
-[05/26/2026-23:56:40] [TRT-LLM] [I] [serve   ] Using context first disagg schedule style, schedule_style: context_first
-INFO:     Started server process [118014]
+[05/28/2026-00:37:51] [TRT-LLM] [W] [commands] Logger level already set from environment. Discard new verbosity: info
+[05/28/2026-00:37:51] [TRT-LLM] [I] [serve   ] Using context first disagg schedule style, schedule_style: context_first
+INFO:     Started server process [142349]
 INFO:     Waiting for application startup.
-[05/26/2026-23:56:40] [TRT-LLM] [W] [serve   ] Unable to measure steady clock offset for http://localhost:8001/steady_clock_offset; skipping adjustment
-[05/26/2026-23:56:40] [TRT-LLM] [W] [serve   ] Error fetching server info for server localhost:8001: Cannot connect to host localhost:8001 ssl:default [Multiple exceptions: [Errno 111] Connect call failed ('::1', 8001, 0, 0), [Errno 111] Connect call failed ('127.0.0.1', 8001)]
-[05/26/2026-23:56:40] [TRT-LLM] [W] [serve   ] Error preparing server localhost:8001: Failed to fetch server info for server localhost:8001
-[05/26/2026-23:56:40] [TRT-LLM] [W] [serve   ] Unable to measure steady clock offset for http://localhost:8002/steady_clock_offset; skipping adjustment
-[05/26/2026-23:56:40] [TRT-LLM] [W] [serve   ] Error fetching server info for server localhost:8002: Cannot connect to host localhost:8002 ssl:default [Multiple exceptions: [Errno 111] Connect call failed ('::1', 8002, 0, 0), [Errno 111] Connect call failed ('127.0.0.1', 8002)]
-[05/26/2026-23:56:40] [TRT-LLM] [W] [serve   ] Error preparing server localhost:8002: Failed to fetch server info for server localhost:8002
-[05/26/2026-23:56:40] [TRT-LLM] [I] [serve   ] Waiting for servers, context: ['localhost:8001'], generation: ['localhost:8002']
-[05/26/2026-23:56:43] [TRT-LLM] [I] [serve   ] Waiting for servers, context: ['localhost:8001'], generation: ['localhost:8002']
-[05/26/2026-23:56:46] [TRT-LLM] [I] [serve   ] Waiting for servers, context: ['localhost:8001'], generation: ['localhost:8002']
-[05/26/2026-23:56:49] [TRT-LLM] [I] [serve   ] Waiting for servers, context: ['localhost:8001'], generation: ['localhost:8002']
-[05/26/2026-23:56:52] [TRT-LLM] [I] [serve   ] Waiting for servers, context: ['localhost:8001'], generation: ['localhost:8002']
-[05/26/2026-23:56:55] [TRT-LLM] [I] [serve   ] Waiting for servers, context: ['localhost:8001'], generation: ['localhost:8002']
-[05/26/2026-23:56:58] [TRT-LLM] [I] [serve   ] Waiting for servers, context: ['localhost:8001'], generation: ['localhost:8002']
-[05/26/2026-23:57:01] [TRT-LLM] [I] [serve   ] Waiting for servers, context: ['localhost:8001'], generation: ['localhost:8002']
-[05/26/2026-23:57:04] [TRT-LLM] [I] [serve   ] Waiting for servers, context: ['localhost:8001'], generation: ['localhost:8002']
-[05/26/2026-23:57:07] [TRT-LLM] [I] [serve   ] Waiting for servers, context: ['localhost:8001'], generation: ['localhost:8002']
-[05/26/2026-23:57:10] [TRT-LLM] [I] [serve   ] Waiting for servers, context: ['localhost:8001'], generation: ['localhost:8002']
-[05/26/2026-23:57:13] [TRT-LLM] [I] [serve   ] Waiting for servers, context: ['localhost:8001'], generation: ['localhost:8002']
-[05/26/2026-23:57:16] [TRT-LLM] [I] [serve   ] Waiting for servers, context: ['localhost:8001'], generation: ['localhost:8002']
-[05/26/2026-23:57:19] [TRT-LLM] [I] [serve   ] Waiting for servers, context: ['localhost:8001'], generation: ['localhost:8002']
-[05/26/2026-23:57:22] [TRT-LLM] [I] [serve   ] Waiting for servers, context: ['localhost:8001'], generation: ['localhost:8002']
-[05/26/2026-23:57:25] [TRT-LLM] [I] [serve   ] Waiting for servers, context: ['localhost:8001'], generation: ['localhost:8002']
-[05/26/2026-23:57:28] [TRT-LLM] [I] [serve   ] Waiting for servers, context: ['localhost:8001'], generation: ['localhost:8002']
-[05/26/2026-23:57:31] [TRT-LLM] [I] [serve   ] Waiting for servers, context: ['localhost:8001'], generation: ['localhost:8002']
-[05/26/2026-23:57:34] [TRT-LLM] [I] [serve   ] Waiting for servers, context: ['localhost:8001'], generation: ['localhost:8002']
-[05/26/2026-23:57:37] [TRT-LLM] [I] [serve   ] Waiting for servers, context: ['localhost:8001'], generation: ['localhost:8002']
-[05/26/2026-23:57:40] [TRT-LLM] [I] [serve   ] Waiting for servers, context: ['localhost:8001'], generation: ['localhost:8002']
-[05/26/2026-23:57:43] [TRT-LLM] [I] [serve   ] Waiting for servers, context: ['localhost:8001'], generation: ['localhost:8002']
-[05/26/2026-23:57:46] [TRT-LLM] [I] [serve   ] Waiting for servers, context: ['localhost:8001'], generation: ['localhost:8002']
-[05/26/2026-23:57:49] [TRT-LLM] [I] [serve   ] Server: http://localhost:8001/steady_clock_offset, delay: 0.001679999753832817 second, offset: 0.0004010000266134739 second
-[05/26/2026-23:57:49] [TRT-LLM] [I] [serve   ] server is ready with info: {'disaggregated_params': {'ctx_dp_rank': 0, 'ctx_info_endpoint': ['tcp://10.176.16.44:38775']}}
-[05/26/2026-23:57:49] [TRT-LLM] [I] [serve   ] Server: http://localhost:8002/steady_clock_offset, delay: 0.001123999711126089 second, offset: 0.0003090000245720148 second
-[05/26/2026-23:57:49] [TRT-LLM] [I] [serve   ] server is ready with info: {'disaggregated_params': {'ctx_dp_rank': 0, 'ctx_info_endpoint': ['tcp://10.176.16.44:35727']}}
-[05/26/2026-23:57:49] [TRT-LLM] [I] [serve   ] All servers are ready
+[05/28/2026-00:37:51] [TRT-LLM] [W] [serve   ] Unable to measure steady clock offset for http://localhost:8001/steady_clock_offset; skipping adjustment
+[05/28/2026-00:37:51] [TRT-LLM] [W] [serve   ] Error fetching server info for server localhost:8001: Cannot connect to host localhost:8001 ssl:default [Multiple exceptions: [Errno 111] Connect call failed ('::1', 8001, 0, 0), [Errno 111] Connect call failed ('127.0.0.1', 8001)]
+[05/28/2026-00:37:51] [TRT-LLM] [W] [serve   ] Error preparing server localhost:8001: Failed to fetch server info for server localhost:8001
+[05/28/2026-00:37:51] [TRT-LLM] [W] [serve   ] Unable to measure steady clock offset for http://localhost:8002/steady_clock_offset; skipping adjustment
+[05/28/2026-00:37:51] [TRT-LLM] [W] [serve   ] Error fetching server info for server localhost:8002: Cannot connect to host localhost:8002 ssl:default [Multiple exceptions: [Errno 111] Connect call failed ('::1', 8002, 0, 0), [Errno 111] Connect call failed ('127.0.0.1', 8002)]
+[05/28/2026-00:37:51] [TRT-LLM] [W] [serve   ] Error preparing server localhost:8002: Failed to fetch server info for server localhost:8002
+[05/28/2026-00:37:51] [TRT-LLM] [I] [serve   ] Waiting for servers, context: ['localhost:8001'], generation: ['localhost:8002']
+[05/28/2026-00:37:54] [TRT-LLM] [I] [serve   ] Waiting for servers, context: ['localhost:8001'], generation: ['localhost:8002']
+[05/28/2026-00:37:57] [TRT-LLM] [I] [serve   ] Waiting for servers, context: ['localhost:8001'], generation: ['localhost:8002']
+[05/28/2026-00:38:00] [TRT-LLM] [I] [serve   ] Waiting for servers, context: ['localhost:8001'], generation: ['localhost:8002']
+[05/28/2026-00:38:03] [TRT-LLM] [I] [serve   ] Waiting for servers, context: ['localhost:8001'], generation: ['localhost:8002']
+[05/28/2026-00:38:06] [TRT-LLM] [I] [serve   ] Waiting for servers, context: ['localhost:8001'], generation: ['localhost:8002']
+[05/28/2026-00:38:09] [TRT-LLM] [I] [serve   ] Waiting for servers, context: ['localhost:8001'], generation: ['localhost:8002']
+[05/28/2026-00:38:12] [TRT-LLM] [I] [serve   ] Waiting for servers, context: ['localhost:8001'], generation: ['localhost:8002']
+[05/28/2026-00:38:15] [TRT-LLM] [I] [serve   ] Waiting for servers, context: ['localhost:8001'], generation: ['localhost:8002']
+[05/28/2026-00:38:18] [TRT-LLM] [I] [serve   ] Waiting for servers, context: ['localhost:8001'], generation: ['localhost:8002']
+[05/28/2026-00:38:21] [TRT-LLM] [I] [serve   ] Waiting for servers, context: ['localhost:8001'], generation: ['localhost:8002']
+[05/28/2026-00:38:24] [TRT-LLM] [I] [serve   ] Server: http://localhost:8001/steady_clock_offset, delay: 0.0015690000727772713 second, offset: 0.00045950012281537056 second
+[05/28/2026-00:38:24] [TRT-LLM] [I] [serve   ] server is ready with info: {'disaggregated_params': {'ctx_dp_rank': 0, 'ctx_info_endpoint': ['tcp://10.176.16.44:38823']}}
+[05/28/2026-00:38:24] [TRT-LLM] [I] [serve   ] Server: http://localhost:8002/steady_clock_offset, delay: 0.0014289994724094868 second, offset: 0.0001585001591593027 second
+[05/28/2026-00:38:24] [TRT-LLM] [I] [serve   ] server is ready with info: {'disaggregated_params': {'ctx_dp_rank': 0, 'ctx_info_endpoint': ['tcp://10.176.16.44:42323']}}
+[05/28/2026-00:38:24] [TRT-LLM] [I] [serve   ] All servers are ready
 INFO:     Application startup complete.
-INFO:     127.0.0.1:52872 - "GET /health HTTP/1.1" 200 OK
-[05/26/2026-23:57:50] [TRT-LLM] [I] [serve   ] _verify_ctx_response
-[05/26/2026-23:57:50] [TRT-LLM] [I] [serve   ] ctx_response is not None
-[05/26/2026-23:57:50] [TRT-LLM] [I] [serve   ] Choice 0 first_gen_tokens: [896, 310, 372, 405]
-[05/26/2026-23:57:50] [TRT-LLM] [I] [serve   ] Choice 1 first_gen_tokens: [896, 310, 372, 405]
-[05/26/2026-23:57:50] [TRT-LLM] [I] [serve   ] Choice 2 first_gen_tokens: [896, 310, 372, 405]
-[05/26/2026-23:57:50] [TRT-LLM] [I] [serve   ] Choice 3 first_gen_tokens: [896, 310, 372, 405]
-[05/26/2026-23:57:50] [TRT-LLM] [I] [serve   ] _get_gen_request from ctx_response: disagg_request_id=16820334269526016 num_choices=4 n=4 best_of=None use_beam_search=True first_gen_tokens=[896, 310, 372, 405] first_gen_cum_log_probs=[-0.8538165092468262, -1.5413165092468262, -1.6663165092468262, -3.791316509246826] ctx_request_id=16820334269526016 ctx_dp_rank=0 ctx_info_endpoint=tcp://10.176.16.44:38775
-INFO:     127.0.0.1:52876 - "POST /v1/completions HTTP/1.1" 200 OK
-[05/26/2026-23:58:52] [TRT-LLM] [I] [serve   ] _verify_ctx_response
-[05/26/2026-23:58:52] [TRT-LLM] [I] [serve   ] ctx_response is not None
-[05/26/2026-23:58:52] [TRT-LLM] [I] [serve   ] Choice 0 first_gen_tokens: [278, 1407, 450, 1754]
-[05/26/2026-23:58:52] [TRT-LLM] [I] [serve   ] Choice 1 first_gen_tokens: [278, 1407, 450, 1754]
-[05/26/2026-23:58:52] [TRT-LLM] [I] [serve   ] Choice 2 first_gen_tokens: [278, 1407, 450, 1754]
-[05/26/2026-23:58:52] [TRT-LLM] [I] [serve   ] Choice 3 first_gen_tokens: [278, 1407, 450, 1754]
-[05/26/2026-23:58:52] [TRT-LLM] [I] [serve   ] _get_gen_request from ctx_response: disagg_request_id=16820593074860033 num_choices=4 n=4 best_of=None use_beam_search=True first_gen_tokens=[278, 1407, 450, 1754] first_gen_cum_log_probs=[-3.0402421951293945, -3.6027421951293945, -3.7902421951293945, -4.1027421951293945] ctx_request_id=16820593074860033 ctx_dp_rank=0 ctx_info_endpoint=tcp://10.176.16.44:38775
-INFO:     127.0.0.1:57270 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:     127.0.0.1:50022 - "GET /health HTTP/1.1" 200 OK
+[05/28/2026-00:38:25] [TRT-LLM] [I] [serve   ] _verify_ctx_response
+[05/28/2026-00:38:25] [TRT-LLM] [I] [serve   ] ctx_response is not None
+[05/28/2026-00:38:25] [TRT-LLM] [I] [serve   ] Choice 0 first_gen_tokens: [896, 310, 372, 405]
+[05/28/2026-00:38:25] [TRT-LLM] [I] [serve   ] Choice 1 first_gen_tokens: [896, 310, 372, 405]
+[05/28/2026-00:38:25] [TRT-LLM] [I] [serve   ] Choice 2 first_gen_tokens: [896, 310, 372, 405]
+[05/28/2026-00:38:25] [TRT-LLM] [I] [serve   ] Choice 3 first_gen_tokens: [896, 310, 372, 405]
+[05/28/2026-00:38:25] [TRT-LLM] [I] [serve   ] _get_gen_request from ctx_response: disagg_request_id=17192932772306944 num_choices=4 n=4 best_of=None use_beam_search=True first_gen_tokens=[896, 310, 372, 405] first_gen_cum_log_probs=[-0.8538165092468262, -1.5413165092468262, -1.6663165092468262, -3.791316509246826] ctx_request_id=17192932772306944 ctx_dp_rank=0 ctx_info_endpoint=tcp://10.176.16.44:38823
+INFO:     127.0.0.1:50030 - "POST /v1/completions HTTP/1.1" 200 OK
+[05/28/2026-00:38:47] [TRT-LLM] [I] [serve   ] _verify_ctx_response
+[05/28/2026-00:38:47] [TRT-LLM] [I] [serve   ] ctx_response is not None
+[05/28/2026-00:38:47] [TRT-LLM] [I] [serve   ] Choice 0 first_gen_tokens: [1754, 13725, 29901, 8429]
+[05/28/2026-00:38:47] [TRT-LLM] [I] [serve   ] Choice 1 first_gen_tokens: [1754, 13725, 29901, 8429]
+[05/28/2026-00:38:47] [TRT-LLM] [I] [serve   ] Choice 2 first_gen_tokens: [1754, 13725, 29901, 8429]
+[05/28/2026-00:38:47] [TRT-LLM] [I] [serve   ] Choice 3 first_gen_tokens: [1754, 13725, 29901, 8429]
+[05/28/2026-00:38:47] [TRT-LLM] [I] [serve   ] _get_gen_request from ctx_response: disagg_request_id=17193025218961409 num_choices=4 n=4 best_of=None use_beam_search=True first_gen_tokens=[1754, 13725, 29901, 8429] first_gen_cum_log_probs=[-1.893768310546875, -2.456268310546875, -3.206268310546875, -3.581268310546875] ctx_request_id=17193025218961409 ctx_dp_rank=0 ctx_info_endpoint=tcp://10.176.16.44:38823
+INFO:     127.0.0.1:40918 - "POST /v1/completions HTTP/1.1" 200 OK
+[05/28/2026-00:39:01] [TRT-LLM] [I] [serve   ] _verify_ctx_response
+[05/28/2026-00:39:01] [TRT-LLM] [I] [serve   ] ctx_response is not None
+[05/28/2026-00:39:01] [TRT-LLM] [I] [serve   ] Choice 0 first_gen_tokens: [896, 310, 372, 405]
+[05/28/2026-00:39:01] [TRT-LLM] [I] [serve   ] Choice 1 first_gen_tokens: [896, 310, 372, 405]
+[05/28/2026-00:39:01] [TRT-LLM] [I] [serve   ] Choice 2 first_gen_tokens: [896, 310, 372, 405]
+[05/28/2026-00:39:01] [TRT-LLM] [I] [serve   ] Choice 3 first_gen_tokens: [896, 310, 372, 405]
+[05/28/2026-00:39:01] [TRT-LLM] [I] [serve   ] _get_gen_request from ctx_response: disagg_request_id=17193084077629442 num_choices=4 n=4 best_of=None use_beam_search=True first_gen_tokens=[896, 310, 372, 405] first_gen_cum_log_probs=[-0.8538165092468262, -1.5413165092468262, -1.6663165092468262, -3.791316509246826] ctx_request_id=17193084077629442 ctx_dp_rank=0 ctx_info_endpoint=tcp://10.176.16.44:38823
+INFO:     127.0.0.1:47828 - "POST /v1/completions HTTP/1.1" 200 OK
