@@ -23,6 +23,7 @@ from typing import List, Optional
 
 import torch
 
+import tensorrt_llm.quantization.utils.fp4_utils as fp4_utils
 from tensorrt_llm._torch.distributed import AllReduce, allgather
 from tensorrt_llm._torch.distributed.symm_mem_allgather import SymmetricMemoryAllGather
 from tensorrt_llm._torch.modules.linear import AllReduceFusionOp, AllReduceParams, AllReduceStrategy
@@ -198,6 +199,99 @@ def trtllm_fused_allreduce_residual_rmsnorm_fake(
     strategy: str,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     return torch.empty_like(tensor), torch.empty_like(tensor)
+
+
+@torch.library.custom_op(
+    "dist::trtllm_fused_allreduce_residual_rmsnorm_quant_nvfp4",
+    mutates_args=(),
+    device_types="cuda",
+)
+def trtllm_fused_allreduce_residual_rmsnorm_quant_nvfp4(
+    tensor: torch.Tensor,
+    residual: torch.Tensor,
+    norm_weight: torch.Tensor,
+    scale: torch.Tensor,
+    eps: float,
+    strategy: str,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Fused allreduce + residual + RMSNorm + NVFP4 quantization."""
+    all_reduce_params = AllReduceParams(
+        fusion_op=AllReduceFusionOp.RESIDUAL_RMS_NORM_QUANT_NVFP4,
+        bias=None,
+        residual=residual,
+        norm_weight=norm_weight,
+        scale=scale,
+        eps=eps,
+    )
+    quant_fp4, scale_factor, residual_out = trtllm_allreduce(
+        tensor, ReduceOp.SUM, strategy=strategy, all_reduce_params=all_reduce_params
+    )
+    return quant_fp4, scale_factor, residual_out
+
+
+@trtllm_fused_allreduce_residual_rmsnorm_quant_nvfp4.register_fake
+def trtllm_fused_allreduce_residual_rmsnorm_quant_nvfp4_fake(
+    tensor: torch.Tensor,
+    residual: torch.Tensor,
+    norm_weight: torch.Tensor,
+    scale: torch.Tensor,
+    eps: float,
+    strategy: str,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    del norm_weight, scale, eps, strategy
+    fp4_shape, scale_shape = fp4_utils.get_fp4_shape(tensor.shape, 16)
+    return (
+        tensor.new_empty(fp4_shape, dtype=torch.uint8),
+        tensor.new_empty((scale_shape,), dtype=torch.uint8),
+        torch.empty_like(residual),
+    )
+
+
+@torch.library.custom_op(
+    "dist::trtllm_fused_allreduce_residual_rmsnorm_out_quant_nvfp4",
+    mutates_args=(),
+    device_types="cuda",
+)
+def trtllm_fused_allreduce_residual_rmsnorm_out_quant_nvfp4(
+    tensor: torch.Tensor,
+    residual: torch.Tensor,
+    norm_weight: torch.Tensor,
+    scale: torch.Tensor,
+    eps: float,
+    strategy: str,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Fused allreduce + residual + RMSNorm with both BF16 and NVFP4 norm outputs."""
+    all_reduce_params = AllReduceParams(
+        fusion_op=AllReduceFusionOp.RESIDUAL_RMS_NORM_OUT_QUANT_NVFP4,
+        bias=None,
+        residual=residual,
+        norm_weight=norm_weight,
+        scale=scale,
+        eps=eps,
+    )
+    norm_out, quant_fp4, scale_factor, residual_out = trtllm_allreduce(
+        tensor, ReduceOp.SUM, strategy=strategy, all_reduce_params=all_reduce_params
+    )
+    return norm_out, quant_fp4, scale_factor, residual_out
+
+
+@trtllm_fused_allreduce_residual_rmsnorm_out_quant_nvfp4.register_fake
+def trtllm_fused_allreduce_residual_rmsnorm_out_quant_nvfp4_fake(
+    tensor: torch.Tensor,
+    residual: torch.Tensor,
+    norm_weight: torch.Tensor,
+    scale: torch.Tensor,
+    eps: float,
+    strategy: str,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    del norm_weight, scale, eps, strategy
+    fp4_shape, scale_shape = fp4_utils.get_fp4_shape(tensor.shape, 16)
+    return (
+        torch.empty_like(tensor),
+        tensor.new_empty(fp4_shape, dtype=torch.uint8),
+        tensor.new_empty((scale_shape,), dtype=torch.uint8),
+        torch.empty_like(residual),
+    )
 
 
 def is_trtllm_op_available():
