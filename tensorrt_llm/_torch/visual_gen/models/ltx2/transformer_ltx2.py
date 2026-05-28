@@ -322,8 +322,8 @@ class LTX2Attention(Attention):
                 Honored by ``VanillaAttention`` and ``FlashAttn4Attention``
                 (and ``UlyssesAttention`` wrapping either); the TRTLLM backend
                 silently ignores it. ``LTX2Attention`` constructs ``audio_attn1``
-                with a VANILLA backend when ``audio_pad_for_ulysses=True`` is
-                set under a TRTLLM backend config (see ``_init_audio_modules``).
+                with a VANILLA backend whenever Ulysses is active under a
+                TRTLLM backend config (see ``_init_audio_modules``).
         """
         # Fallback to the naive eager rope path when fusion is disabled or
         # the kernel doesn't support this head_dim. LTX-2 prod has
@@ -525,15 +525,17 @@ class BasicAVTransformerBlock(nn.Module):
         self.scale_shift_table = nn.Parameter(torch.empty(6, cfg.dim))
 
     def _init_audio_modules(self, cfg, rope_type, eps, model_config, idx):
-        # TRTLLM self-attn silently drops key_padding_mask, which would let
-        # valid Q attend to padded K and corrupt the audio stream. Mirror the
-        # existing cross-attn TRTLLM→VANILLA fallback (modules/attention.py);
-        # audio is small (T_a ~ 126) so the downgrade is negligible.
+        # Audio under Ulysses needs key_padding_mask support on audio_attn1
+        # (audio is padded to be divisible by ulysses_size; mask zeros pad
+        # slots). TRTLLM self-attn silently drops key_padding_mask, so downgrade
+        # to VANILLA whenever Ulysses is active under a TRTLLM backend config.
+        # Mirrors the existing cross-attn TRTLLM→VANILLA fallback
+        # (modules/attention.py); audio is small (T_a ~ 126) so the downgrade
+        # is negligible.
         audio_self_config = model_config
-        if (
-            model_config.parallel.audio_pad_for_ulysses
-            and model_config.attention.backend == "TRTLLM"
-        ):
+        vgm = model_config.visual_gen_mapping
+        ulysses_size = vgm.ulysses_size if vgm is not None else 1
+        if ulysses_size > 1 and model_config.attention.backend == "TRTLLM":
             audio_self_config = model_config.model_copy(
                 update={
                     "attention": model_config.attention.model_copy(update={"backend": "VANILLA"})
@@ -792,8 +794,8 @@ class BasicAVTransformerBlock(nn.Module):
                 # rope work is U× cheaper. a2v keeps the all-gather path
                 # (Q=video huge, K/V=audio small — AG of the small audio is
                 # far cheaper than full-video a2a collectives).
-                # key_padding_mask zeros attention on audio pad slots when
-                # audio_pad_for_ulysses=True.
+                # key_padding_mask zeros attention on the audio pad slots that
+                # configure_audio_ulysses appended to make T_a divisible by U.
                 k_a2v, v_a2v = self.audio_to_video_attn.project_kv(
                     ax_scaled, pe=audio.cross_positional_embeddings
                 )
@@ -1049,7 +1051,6 @@ class LTXModel(nn.Module):
 
         self._audio_is_sharded = False
         self._audio_pad = 0  # set by configure_audio_ulysses
-        self._audio_pad_for_ulysses = model_config.parallel.audio_pad_for_ulysses
         self._cache_dit_video_args: Optional[TransformerArgs] = None
         self._cache_dit_audio_args: Optional[TransformerArgs] = None
         # Per-block text cross-attn KV lists, looked up by inner.idx in the
@@ -1444,8 +1445,8 @@ class LTXModel(nn.Module):
     def _pad_modality_audio(audio: Modality, pad: int) -> Modality:
         """Pad ``audio`` on the token axis by ``pad`` slots.
 
-        Used by ``forward`` when ``parallel.audio_pad_for_ulysses=True`` and
-        ``T_a % ulysses_size != 0`` to make audio shardable.
+        Used by ``forward`` when Ulysses is active and ``T_a % ulysses_size
+        != 0`` to make audio shardable.
 
         - ``latent``: zero-pad on ``dim=1``. Attention zeros out pad rows via
           ``audio_padding_mask``; norm/MLP on zero rows is harmless because
@@ -1481,20 +1482,16 @@ class LTXModel(nn.Module):
         return replace(audio, latent=latent, positions=positions, timesteps=timesteps)
 
     def configure_audio_ulysses(self, audio_seq_len: int) -> None:
-        """Configure audio sharding + (optional) padding for Ulysses.
+        """Configure audio sharding + padding for Ulysses.
 
         Call once before the denoising loop when the audio token count is
-        known.  The decision is cached — ``forward()`` uses it without
+        known. The decision is cached — ``forward()`` uses it without
         re-checking.
 
-        Two modes based on ``parallel.audio_pad_for_ulysses``:
-
-        * **Pad mode (default, True)**: always shard audio under Ulysses; pad
-          on entry by ``(U - T_a % U) % U`` slots and attach a validity mask
-          so attention zeros out pad positions. ``forward`` strips the pad
-          tail on exit.
-        * **No-pad mode (False)**: only shard when ``T_a % U == 0``; fall
-          back to plain attention otherwise (cross-attn wrapper disengages).
+        When sequence parallelism is active, audio is always padded to
+        ``(U - T_a % U) % U`` slots so ``T_a`` becomes divisible by ``U``
+        and a ``[B, T_a_padded]`` validity mask is attached so attention
+        zeros out pad positions. ``forward`` strips the pad tail on exit.
         """
         if not self._sharder.is_active:
             self._audio_is_sharded = False
@@ -1502,15 +1499,8 @@ class LTXModel(nn.Module):
             return
 
         U = self._sharder.size
-        self._audio_pad = ((U - audio_seq_len % U) % U) if self._audio_pad_for_ulysses else 0
-        self._audio_is_sharded = (audio_seq_len + self._audio_pad) % U == 0
-        if not self._audio_is_sharded and self._cp_size > 1 and self._ulysses_size == 1:
-            raise ValueError(
-                f"audio_seq_len ({audio_seq_len}) must be divisible by seq_size "
-                f"({U}) when CP is active without Ulysses "
-                "(Ring/Attention2D has no plain-attention fallback). "
-                "Set parallel.audio_pad_for_ulysses=True to enable padding."
-            )
+        self._audio_pad = (U - audio_seq_len % U) % U
+        self._audio_is_sharded = True
 
         for block in self.transformer_blocks:
             target = block.inner if isinstance(block, LTX2CacheDiTPattern0BlockWrapper) else block
@@ -1670,8 +1660,8 @@ class LTXModel(nn.Module):
             raise ValueError("Audio is not enabled for this model")
 
         # Audio padding for Ulysses: when self._audio_pad > 0 (set once by
-        # configure_audio_ulysses under audio_pad_for_ulysses=True), pad audio
-        # on entry to make it shardable. Build a [B, T_a_padded] bool mask
+        # configure_audio_ulysses to make T_a divisible by ulysses_size), pad
+        # audio on entry to make it shardable. Build a [B, T_a_padded] bool mask
         # (True=valid, False=pad) that travels through TransformerArgs to
         # audio_attn1 + a2v. Strip the padded tail on output below.
         # text_cache.audio_{pe,cross_pe} are already padded in prepare_text_cache.

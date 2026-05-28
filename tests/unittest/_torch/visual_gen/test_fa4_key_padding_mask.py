@@ -3,8 +3,9 @@
 """Numerical parity for FlashAttn4Attention's key_padding_mask.
 
 FA4 is used for LTX-2 audio self-attn and a2v cross-attn when the user picks
-``attention.backend: FA4``. With ``audio_pad_for_ulysses=True``, padded K
-columns must produce zero attention contribution. FA4's cute interface accepts
+``attention.backend: FA4``. Under Ulysses, audio is padded so T_a is divisible
+by ulysses_size, and padded K columns must produce zero attention
+contribution. FA4's cute interface accepts
 ``seqused_k`` per-batch valid lengths; this test verifies that translating a
 True-prefix bool mask to ``seqused_k`` yields output identical to running FA4
 on the unpadded K/V (within bf16 tolerance).

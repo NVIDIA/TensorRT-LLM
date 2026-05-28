@@ -314,8 +314,8 @@ def _logic_ulysses_with_key_padding_mask_parity(rank, world_size):
     """UlyssesAttention forwards ``key_padding_mask`` through a2a + sharded SDPA;
     valid Q rows match plain SDPA on the unpadded prefix.
 
-    Mirrors LTX-2 audio_attn1 under ``audio_pad_for_ulysses=True``: audio is
-    padded so the seq dim divides ulysses_size, each rank holds
+    Mirrors LTX-2 audio_attn1 under Ulysses padding: audio is padded so the
+    seq dim divides ulysses_size, each rank holds
     ``[B, S_padded/U, H, D]``, and ``key_padding_mask=[B, S_padded]`` zeroes
     the padded K/V columns inside the wrapped backend. Catches regressions
     where the wrapper would consume / shadow / misalign the mask across the
@@ -692,7 +692,7 @@ class TestUlyssesAttention:
 
         Verifies that ``UlyssesAttention`` correctly forwards
         ``key_padding_mask`` through its a2a + sharded SDPA + reverse-a2a
-        pipeline (the audio_attn1 path under ``audio_pad_for_ulysses=True``).
+        pipeline (the audio_attn1 path under Ulysses with audio padding).
         ws=2 exercises a single sharding boundary; CPU + gloo so the test
         runs without GPUs.
         """

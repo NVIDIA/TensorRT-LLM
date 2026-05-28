@@ -130,7 +130,6 @@ _AV_CONFIG = dict(
 def _make_model_config(
     ulysses_size: int = 1,
     backend: str = "VANILLA",
-    audio_pad_for_ulysses: bool = True,
 ) -> "DiffusionModelConfig":
     """Create DiffusionModelConfig for LTX-2 tests."""
     if ulysses_size > 1 and dist.is_initialized():
@@ -151,10 +150,7 @@ def _make_model_config(
         attention_metadata_state=(
             create_attention_metadata_state() if backend.upper() == "TRTLLM" else None
         ),
-        parallel=ParallelConfig(
-            ulysses_size=ulysses_size,
-            audio_pad_for_ulysses=audio_pad_for_ulysses,
-        ),
+        parallel=ParallelConfig(ulysses_size=ulysses_size),
         skip_create_weights_in_init=False,
     )
     config.mapping = vgm.to_llm_mapping()
@@ -239,9 +235,7 @@ def _build_inputs(batch, v_patches, v_dims, a_patches, dtype, device, seed=456):
     return video, audio, v_context, a_context, v_positions, a_positions
 
 
-def _logic_ltx2_av_ulysses_vs_single_gpu(
-    rank, world_size, backend, audio_seq_len, audio_pad_for_ulysses
-):
+def _logic_ltx2_av_ulysses_vs_single_gpu(rank, world_size, backend, audio_seq_len):
     """LTX-2 AudioVideo Ulysses (ws=2) vs single-GPU reference parity.
 
     Builds the same LTXModel weights on both ranks (shared seed), runs:
@@ -260,9 +254,7 @@ def _logic_ltx2_av_ulysses_vs_single_gpu(
 
     # ── Reference: single-GPU (no Ulysses) ──────────────────────────────────
     torch.manual_seed(123)
-    ref_cfg = _make_model_config(
-        ulysses_size=1, backend=backend, audio_pad_for_ulysses=audio_pad_for_ulysses
-    )
+    ref_cfg = _make_model_config(ulysses_size=1, backend=backend)
     ref_model = (
         LTXModel(model_type=LTXModelType.AudioVideo, model_config=ref_cfg, **_AV_CONFIG)
         .to(device, dtype=dtype)
@@ -274,9 +266,7 @@ def _logic_ltx2_av_ulysses_vs_single_gpu(
 
     # ── Ulysses model: same weights ─────────────────────────────────────────
     torch.manual_seed(123)
-    u_cfg = _make_model_config(
-        ulysses_size=world_size, backend=backend, audio_pad_for_ulysses=audio_pad_for_ulysses
-    )
+    u_cfg = _make_model_config(ulysses_size=world_size, backend=backend)
     u_model = (
         LTXModel(model_type=LTXModelType.AudioVideo, model_config=u_cfg, **_AV_CONFIG)
         .to(device, dtype=dtype)
@@ -346,7 +336,7 @@ class TestLTX2AVUlysses:
     )
     def test_av_ulysses_no_audio_pad(self, backend):
         """ws=2, audio_seq_len % 2 == 0 — pure sharding, no padding mask."""
-        run_test_in_distributed(2, _logic_ltx2_av_ulysses_vs_single_gpu, backend, 16, True)
+        run_test_in_distributed(2, _logic_ltx2_av_ulysses_vs_single_gpu, backend, 16)
 
     @pytest.mark.parametrize(
         "backend",
@@ -354,7 +344,7 @@ class TestLTX2AVUlysses:
     )
     def test_av_ulysses_audio_pad(self, backend):
         """ws=2, audio_seq_len % 2 != 0 — audio padding + key_padding_mask."""
-        run_test_in_distributed(2, _logic_ltx2_av_ulysses_vs_single_gpu, backend, 15, True)
+        run_test_in_distributed(2, _logic_ltx2_av_ulysses_vs_single_gpu, backend, 15)
 
 
 if __name__ == "__main__":

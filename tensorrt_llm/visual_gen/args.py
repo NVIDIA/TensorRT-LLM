@@ -221,19 +221,6 @@ class ParallelConfig(StrictBaseModel):
             "column group. Mutually exclusive with ring_size > 1."
         ),
     )
-    audio_pad_for_ulysses: bool = Field(
-        True,
-        status="prototype",
-        description=(
-            "When True, the model-layer pads the audio sequence at "
-            "LTXModel.forward entry so T_a is divisible by ulysses_size, "
-            "attaches a [B, T_a_padded] bool mask consumed by audio self-attn "
-            "and the a2v cross-attn (zero attention on pad), and strips the "
-            "padded tail on exit. Required to keep the v2a Ulysses cross-attn "
-            "wrapper engaged on non-divisible T_a (the typical LTX-2 case at "
-            "num_frames=8k+1). Currently only honored by the LTX-2 model."
-        ),
-    )
 
     @property
     def seq_parallel_size(self) -> int:
