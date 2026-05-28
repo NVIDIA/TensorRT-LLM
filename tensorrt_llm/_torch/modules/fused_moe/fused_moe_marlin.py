@@ -245,7 +245,22 @@ class MarlinFusedMoE(CutlassFusedMoE):
 
         num_tokens = x.shape[0]
         top_k = token_selected_experts.shape[1]
-        num_experts = self.num_experts
+
+        local_n = self.expert_size_per_partition
+        if local_n != self.num_experts:
+            slot_start = self.slot_start
+            is_local = ((token_selected_experts >= slot_start)
+                        & (token_selected_experts < slot_start + local_n))
+            token_selected_experts = (
+                token_selected_experts - slot_start).clamp(0, local_n - 1)
+            if token_final_scales is None:
+                token_final_scales = torch.ones(num_tokens,
+                                                top_k,
+                                                dtype=torch.float32,
+                                                device=x.device)
+            token_final_scales = token_final_scales * is_local.to(
+                token_final_scales.dtype)
+        num_experts = local_n
 
         workspace = self._ensure_workspace(x.device)  # [num_sms * max_blocks_per_sm(4)] int32
 

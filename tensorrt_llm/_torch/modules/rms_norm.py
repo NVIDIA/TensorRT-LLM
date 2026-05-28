@@ -193,7 +193,7 @@ class RMSNorm(nn.Module):
                     gather=True,
                     use_gemma=self.use_gemma,
                 )
-        elif IS_FLASHINFER_AVAILABLE:
+        elif IS_FLASHINFER_AVAILABLE and False:
             from ..custom_ops import (flashinfer_fused_add_rmsnorm,
                                       flashinfer_gemma_fused_add_rmsnorm,
                                       flashinfer_gemma_rmsnorm,
