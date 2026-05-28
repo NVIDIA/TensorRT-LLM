@@ -256,14 +256,20 @@ class GatedMLP(nn.Module):
                                      final_all_reduce_params, lora_params)
 
         if self._can_fuse_gate_up_swiglu_fp4out():
-            # Get token count for minimum-M check
-            if isinstance(x, (tuple, Fp4QuantizedTensor)):
-                m = x[0].shape[0] if isinstance(x, tuple) else x.shape[0]
+            # During torch.compile the token dim is a SymInt, so `m >= MIN_M`
+            # would create a SymBool guard that breaks piecewise CUDA graph
+            # capture. The kernel internally pads m up to the CTA tile height,
+            # so the fp4out path is safe at any m while compiling.
+            if torch.compiler.is_compiling():
+                fp4_out = True
             else:
-                m = x.reshape(
-                    -1, x.shape[-1]).shape[0] if x.dim() > 2 else x.shape[0]
-            h2 = self._fused_gate_up_swiglu(x,
-                                            fp4_out=m >= GatedMLP._FP4OUT_MIN_M)
+                if isinstance(x, (tuple, Fp4QuantizedTensor)):
+                    m = x[0].shape[0] if isinstance(x, tuple) else x.shape[0]
+                else:
+                    m = x.reshape(
+                        -1, x.shape[-1]).shape[0] if x.dim() > 2 else x.shape[0]
+                fp4_out = m >= GatedMLP._FP4OUT_MIN_M
+            h2 = self._fused_gate_up_swiglu(x, fp4_out=fp4_out)
         elif self._can_fuse_gate_up_swiglu():
             h2 = self._fused_gate_up_swiglu(x)
         else:

@@ -1603,20 +1603,21 @@ if IS_CUTLASS_DSL_AVAILABLE:
         global_sf: torch.Tensor,
         use_tvm_ffi: bool = True,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        m = mat_a.shape[0]
         n = mat_b.shape[-2]
         n_out = n // 2
         sf_vec_size = 16
-        # FP4 output packed: [m, n_out // 2]
-        fp4_output = torch.empty(m,
-                                 n_out // 2,
-                                 dtype=mat_a.dtype,
-                                 device=mat_a.device)
+        # FP4 output packed: [m, n_out // 2]. Use new_empty with the input
+        # shape list so the SymInt for the token dim is preserved through the
+        # FX graph (matches the BF16 / nvfp4_gemm fake patterns; a positional
+        # torch.empty(m, ...) loses the SymInt link required by the piecewise
+        # CUDA graph optimizer).
+        fp4_shape = list(mat_a.shape)
+        fp4_shape[-1] = n_out // 2
+        fp4_output = mat_a.new_empty(fp4_shape)
         # Scale factors: 1D
+        m = mat_a.shape[0]
         sf_size = pad_up(m, 128) * pad_up(n_out // sf_vec_size, 4)
-        output_sf = torch.empty(sf_size,
-                                dtype=input_scale.dtype,
-                                device=input_scale.device)
+        output_sf = input_scale.new_empty([sf_size])
         return fp4_output, output_sf
 
     class Sm100BlockScaledContiguousGroupedGemmRunner(TunableRunner):
