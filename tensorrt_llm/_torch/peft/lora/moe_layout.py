@@ -2,11 +2,19 @@
 # SPDX-License-Identifier: Apache-2.0
 """Helpers for assembling routed-expert MoE LoRA adapters.
 
-The MVP supports shared-outer LoRA via **load-time replication**: the shared
-side of the adapter is duplicated `num_experts` times so that the underlying
-MoE kernel (which symmetrically offsets both A and B pointers by
-`expert_index * dim * rank`) sees the same `[E, ...]` layout as a fully
-per-expert adapter.
+Two adapter layouts are supported:
+
+1. **Load-time replication** (`make_per_expert_lora`): the shared side of the
+   adapter is duplicated `num_experts` times so that the underlying MoE
+   kernel (which symmetrically offsets both A and B pointers by
+   `expert_index * dim * rank`) sees the same `[E, ...]` layout as a fully
+   per-expert adapter. Simple, but spends `E - 1` extra copies of the shared
+   matrix in device memory.
+
+2. **Native shared-outer** (`make_native_shared_lora`): the shared side is
+   stored once. The kernel honors `LoraParams::*_shared_a/b` flags and
+   zero-offsets the corresponding pointer arithmetic, so all experts read
+   the same single tensor. Equivalent math, no replication overhead.
 
 These utilities are intentionally NumPy/torch-free at the top level so that
 generators in unit tests can reuse them without paying for a torch import.
@@ -91,6 +99,92 @@ def make_per_expert_lora(
             f"shared_side must be 'A', 'B', or None; got {shared_side!r}")
 
     return {"A": a, "B": b}
+
+
+def make_native_shared_lora(
+    num_experts: int,
+    rank: int,
+    in_dim: int,
+    out_dim: int,
+    *,
+    shared_side: Literal["A", "B"],
+    dtype: torch.dtype = torch.bfloat16,
+    device: torch.device = torch.device("cpu"),
+    seed: Optional[int] = None,
+) -> Dict[str, object]:
+    """Generate a native shared-outer LoRA adapter for an MoE module.
+
+    The shared side is stored ONCE (not replicated across experts). The
+    fused-MoE op must be called with the corresponding `*_shared_a` /
+    `*_shared_b` flag set, so the kernel zero-offsets the per-expert
+    pointer arithmetic on that side.
+
+    Shapes:
+      shared_side == "A":
+        A: [rank, in_dim]              -- single shared up-projection
+        B: [num_experts, out_dim, rank] -- per-expert
+      shared_side == "B":
+        A: [num_experts, rank, in_dim] -- per-expert
+        B: [out_dim, rank]             -- single shared down-projection
+
+    Returns:
+        Dict with keys:
+          "A"       : Tensor (shared or stacked, per above)
+          "B"       : Tensor (stacked or shared, per above)
+          "shared_a": bool (True iff A is shared/unreplicated)
+          "shared_b": bool (True iff B is shared/unreplicated)
+    """
+    if shared_side not in ("A", "B"):
+        raise ValueError(
+            f"make_native_shared_lora requires shared_side in ('A', 'B'); "
+            f"got {shared_side!r}. For purely per-expert adapters use "
+            f"make_per_expert_lora with shared_side=None instead.")
+    if seed is not None:
+        gen = torch.Generator(device=device).manual_seed(seed)
+    else:
+        gen = None
+
+    def _randn(*shape):
+        return torch.randn(*shape, dtype=dtype, device=device, generator=gen)
+
+    if shared_side == "A":
+        a = _randn(rank, in_dim)
+        b = _randn(num_experts, out_dim, rank)
+        return {"A": a, "B": b, "shared_a": True, "shared_b": False}
+    a = _randn(num_experts, rank, in_dim)
+    b = _randn(out_dim, rank)
+    return {"A": a, "B": b, "shared_a": False, "shared_b": True}
+
+
+def expand_native_shared_for_reference(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    *,
+    num_experts: int,
+    shared_a: bool,
+    shared_b: bool,
+) -> tuple:
+    """Broadcast a native shared-outer (A, B) pair into the `[E, ...]` layout
+    used by `reference_moe_lora_delta`.
+
+    Returns:
+        (a_stacked, b_stacked) where a_stacked is [E, rank, in_dim] and
+        b_stacked is [E, out_dim, rank], regardless of which side was
+        natively shared.
+    """
+    if shared_a:
+        if a.dim() != 2:
+            raise ValueError(
+                f"shared_a expects A.shape == [rank, in_dim]; got {tuple(a.shape)}"
+            )
+        a = a.unsqueeze(0).expand(num_experts, -1, -1).contiguous()
+    if shared_b:
+        if b.dim() != 2:
+            raise ValueError(
+                f"shared_b expects B.shape == [out_dim, rank]; got {tuple(b.shape)}"
+            )
+        b = b.unsqueeze(0).expand(num_experts, -1, -1).contiguous()
+    return a, b
 
 
 def reference_moe_lora_delta(

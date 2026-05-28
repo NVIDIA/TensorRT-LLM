@@ -14,7 +14,8 @@ Companion to the plan at [`cutlass-moe-shared-outer-lora.plan.md`](../../../cutl
 | 3 — CUDA-graph decode path | partial (slot-indexed eager OK; graph capture blocked by kernel) | Slot-indexed pointer mode lands in `moeOp.cpp` + `CudaGraphLoraParams.token_to_slot_host` and `get_moe_slot_inputs`. Eager equivalence passes. CUDA-graph capture is rejected by the op until the Phase 6 kernel patch; see F7 and Phase 3 log. |
 | 4 — Loader + validator | done | `validation.py`, `moe_layout.py`, `create_moe.py` wiring. See Phase 4 log. |
 | 5 — Tests | done (MVP) | CPU validator + layout tests, GPU smoke for fused-moe op. CUDA-graph capture+replay test skipped pending Phase 6. See Phase 5 log. |
-| 6 — Native shared-outer kernel patch + GPU-side LoRA expansion | follow-up PR | Replaces load-time replication AND lifts the host-sync constraint that blocks graph capture (F7). |
+| 6a — Native shared-outer kernel flag (kernel + op + test fixture) | done | `LoraParams::*_shared_a/b` zeros the per-expert offset in `setupLoraWorkspace`; 6 op kwargs threaded; native helper in `moe_layout.py`; bit-identity GPU test. Loader plumbing (`lora_layout.json`) deferred to a follow-up. |
+| 6b — GPU-side LoRA expansion (lift host-sync, enable graph capture) | follow-up PR | Replaces the `setupLoraWorkspace` / `LoraImpl::run` host-CPU branching with a device-side problem-builder kernel. Re-enables the skipped graph-capture parity test. |
 | 7 — Docs | done | Routed-Expert MoE LoRA section added to [`docs/source/features/lora.md`](../features/lora.md). |
 
 
@@ -250,16 +251,41 @@ Tests:
   - `torch.cuda.CUDAGraph` capture + replay numerically equivalent to eager — **skipped pending Phase 6** (kernel-side host-sync removal). See F7.
   - Mutual-exclusion error when both per-request and slot-indexed inputs are supplied.
 
-## Pending phases
+---
 
-### Phase 6 — Native shared-outer + GPU-side LoRA expansion (follow-up PR)
+## Phase 6a — Native shared-outer kernel flag (done; kernel + op + tests)
 
-Two related kernel changes, both targeting `setupLoraWorkspace` in [`cpp/tensorrt_llm/kernels/cutlass_kernels/moe_gemm/moe_kernels.cu`](../../../cpp/tensorrt_llm/kernels/cutlass_kernels/moe_gemm/moe_kernels.cu):
+Splits the original Phase 6 into a focused "native shared-outer flag" landing now and a separate "GPU-side LoRA expansion" follow-up (Phase 6b). This step removes the load-time replication overhead without touching the host-sync that blocks CUDA-graph capture (F7).
 
-1. **Native shared-outer**: a kernel flag pair (`fc1_shared_a`, `fc2_shared_b`) that zero-offsets the pointer arithmetic so the shared side is read from a single per-adapter buffer instead of a replicated `[E, ...]` tensor. Gated by bit-identity tests against the load-time-replication baseline.
-2. **GPU-side per-token expansion** (lifts F7): replace the `cudaMemcpyAsync(D2H) → cudaEventSynchronize → CPU loop → cudaMemcpyAsync(H2D)` sequence with a small kernel that reads the permuted-rows tensor and the per-adapter pointer tables on the device side and writes the `device_permuted_*_ptrs` directly. Drops the host wait, makes the LoRA path fully stream-bound, and unblocks CUDA-graph capture of LoRA-active MoE layers.
+Implementation:
 
-Validation gates: (a) per-expert and shared-outer parity vs the current MVP eager path on small models; (b) capture+replay numerical parity vs eager (re-enables `test_moe_lora_slot_indexed_cuda_graph_replay_matches_eager`).
+- [`cpp/tensorrt_llm/kernels/cutlass_kernels/include/moe_kernels.h`](../../../cpp/tensorrt_llm/kernels/cutlass_kernels/include/moe_kernels.h) and [`cpp/tensorrt_llm/kernels/internal_cutlass_kernels/include/moe_kernels.h`](../../../cpp/tensorrt_llm/kernels/internal_cutlass_kernels/include/moe_kernels.h): six new `LoraParams` fields, defaulting to `false`:
+  - `fc1_shared_a`, `fc1_shared_b`, `fc2_shared_a`, `fc2_shared_b`, `gated_shared_a`, `gated_shared_b`.
+- [`cpp/tensorrt_llm/kernels/cutlass_kernels/moe_gemm/moe_kernels.cu`](../../../cpp/tensorrt_llm/kernels/cutlass_kernels/moe_gemm/moe_kernels.cu): `setupLoraWorkspace` reads these flags and gates the corresponding `weight_index * dim * lora_rank` offset; when set, the per-token A or B pointer dereferences a single unreplicated buffer (e.g. A: `[rank, in_dim]`, B: `[out_dim, rank]`).
+- [`cpp/tensorrt_llm/thop/moeOp.cpp`](../../../cpp/tensorrt_llm/thop/moeOp.cpp): six new optional `bool` kwargs on `runMoe`, propagated through `buildMoeLoraParams` to the returned `LoraParams`.
+- [`tensorrt_llm/_torch/custom_ops/torch_custom_ops.py`](../../../tensorrt_llm/_torch/custom_ops/torch_custom_ops.py): matching schema additions on `fused_moe` and its `register_fake`.
+- [`tensorrt_llm/_torch/modules/fused_moe/fused_moe_cutlass.py`](../../../tensorrt_llm/_torch/modules/fused_moe/fused_moe_cutlass.py): `_resolve_moe_shared_flags` picks up `lora_params["moe_shared_flags"]` and threads the booleans through both `_extract_moe_lora_tensors` paths (per-request and CUDA-graph).
+- [`tensorrt_llm/_torch/peft/lora/moe_layout.py`](../../../tensorrt_llm/_torch/peft/lora/moe_layout.py): new `make_native_shared_lora(shared_side=...)` returns the unreplicated layout plus matching shared flags; `expand_native_shared_for_reference` broadcasts back to `[E, ...]` for the eager reference.
+
+Tests:
+
+- CPU layout tests in [`tests/unittest/_torch/lora/test_moe_layout.py`](../../../tests/unittest/_torch/lora/test_moe_layout.py): unreplicated shapes, seed reproducibility, expand-for-reference equivalence, native-vs-replicated reference delta agreement.
+- GPU tests in [`tests/unittest/_torch/lora/test_moe_lora_op.py`](../../../tests/unittest/_torch/lora/test_moe_lora_op.py):
+  - `test_moe_native_shared_outer_matches_replicated_bitidentical`: native shared-outer with `fc1_shared_a=True`, `fc2_shared_b=True`, `gated_shared_a=True` produces a bit-identical kernel output to the load-time-replication baseline (atol=rtol=0).
+  - `test_moe_native_shared_outer_differs_from_no_lora`: sanity smoke that the native path's adapter actually moves the output.
+
+Deferred to follow-up commits (still part of Phase 6a):
+
+- Loader plumbing. The kernel and op already accept native shared-outer adapters; what's missing is a `lora_layout.json` sidecar parser in [`tensorrt_llm/lora_manager.py`](../../../tensorrt_llm/lora_manager.py) that:
+  - Reads per-module `shared_side` ("A" / "B" / null).
+  - Skips the stacking step for the shared side and saves the raw `[rank, dim]` (or `[out_dim, rank]`) tensor in the PEFT cache.
+  - Stashes the per-module shared flags as cache metadata so the per-layer assembler can populate `lora_params["moe_shared_flags"]`.
+
+## Phase 6b — GPU-side LoRA expansion (follow-up PR)
+
+Lifts F7: replaces the host-CPU branching in both `setupLoraWorkspace` and `LoraImpl::run` with a device-side problem-builder kernel that reads `permuted_rows` and the per-adapter pointer tables on the device and writes the `device_permuted_*_ptrs` directly. Drops the host `cudaEventSynchronize`, makes the LoRA path fully stream-bound, and unblocks CUDA-graph capture of LoRA-active MoE layers.
+
+Validation gate: capture+replay numerical parity vs eager (re-enables `test_moe_lora_slot_indexed_cuda_graph_replay_matches_eager`).
 
 ### Phase 7 — Docs
 

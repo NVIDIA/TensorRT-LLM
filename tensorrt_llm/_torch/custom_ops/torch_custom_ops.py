@@ -253,6 +253,18 @@ def fused_moe(
     gated_slot_lora_ranks: Optional[torch.Tensor] = None,
     gated_slot_lora_weight_ptrs: Optional[torch.Tensor] = None,
     token_to_slot: Optional[torch.Tensor] = None,
+    # Native shared-outer flags. When set, the corresponding side's adapter
+    # tensor is read by the kernel as a single unreplicated buffer instead of
+    # the default per-expert [E, ...] layout. The caller must supply matching
+    # tensor shapes (A: [rank, in_dim], B: [out_dim, rank] for the shared
+    # side). See LoraParams in cpp/.../moe_kernels.h and Phase 6 in the
+    # MoE-LoRA preflight notes.
+    fc1_shared_a: bool = False,
+    fc1_shared_b: bool = False,
+    fc2_shared_a: bool = False,
+    fc2_shared_b: bool = False,
+    gated_shared_a: bool = False,
+    gated_shared_b: bool = False,
 ) -> List[torch.Tensor]:
     tuner = AutoTuner.get()
     # Only the non-alltoall case is considered for profiling in the warmup phase.
@@ -352,7 +364,9 @@ def fused_moe(
                 host_context_lengths, lora_max_low_rank, fc1_slot_lora_ranks,
                 fc1_slot_lora_weight_ptrs, fc2_slot_lora_ranks,
                 fc2_slot_lora_weight_ptrs, gated_slot_lora_ranks,
-                gated_slot_lora_weight_ptrs, token_to_slot)
+                gated_slot_lora_weight_ptrs, token_to_slot, fc1_shared_a,
+                fc1_shared_b, fc2_shared_a, fc2_shared_b, gated_shared_a,
+                gated_shared_b)
     except RuntimeError as e:
         error_msg = str(e)
         if "DeepGEMM only supports Hopper" in error_msg:
@@ -423,7 +437,13 @@ def _(input: torch.Tensor,
       fc2_slot_lora_weight_ptrs: Optional[torch.Tensor] = None,
       gated_slot_lora_ranks: Optional[torch.Tensor] = None,
       gated_slot_lora_weight_ptrs: Optional[torch.Tensor] = None,
-      token_to_slot: Optional[torch.Tensor] = None):
+      token_to_slot: Optional[torch.Tensor] = None,
+      fc1_shared_a: bool = False,
+      fc1_shared_b: bool = False,
+      fc2_shared_a: bool = False,
+      fc2_shared_b: bool = False,
+      gated_shared_a: bool = False,
+      gated_shared_b: bool = False):
     seq_len = input.shape[0]
     if use_int8_woq_per_channel:
         # Note: The weight shape for INT8 weight only quantization is different, i.e.,
