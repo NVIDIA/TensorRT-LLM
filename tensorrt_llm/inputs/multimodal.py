@@ -537,28 +537,6 @@ class MMItemOrder(list):  # list[tuple[str, int]]
         return [chunks_by_item[item] for item in self]
 
 
-def normalize_multimodal_item_order(
-    multimodal_data: Dict[str, Any], ) -> List[Tuple[str, int]]:
-    """Return normalized `(modality, item_index)` entries from MM metadata.
-
-    Deprecated thin wrapper retained for backward compatibility; delegates to
-    `MMItemOrder.from_raw_entries`. New code should use `MMItemOrder`.
-    """
-    raw_order = (multimodal_data or {}).get("multimodal_item_order") or []
-    return MMItemOrder.from_raw_entries(raw_order,
-                                        source="multimodal_item_order")
-
-
-def split_multimodal_embeddings_by_item_order(
-    encoded_by_modality: Dict[str, torch.Tensor],
-    item_order: List[Tuple[str, int]],
-    embedding_lengths: List[int],
-) -> List[torch.Tensor]:
-    """Deprecated thin wrapper; delegates to `MMItemOrder.split_embeddings`."""
-    return MMItemOrder(item_order).split_embeddings(encoded_by_modality,
-                                                    embedding_lengths)
-
-
 @dataclass
 class MultimodalRuntimeData:
     """Runtime data for tracking multimodal embedding caching and reuse per request sequence.

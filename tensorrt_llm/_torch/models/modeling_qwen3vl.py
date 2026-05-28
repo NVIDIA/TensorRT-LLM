@@ -30,7 +30,7 @@ from ...inputs import (
     register_input_processor,
     support_multimodal_disaggregated,
 )
-from ...inputs.multimodal import MultimodalParams
+from ...inputs.multimodal import MMItemOrder, MultimodalParams
 from ...logger import logger
 from ...sampling_params import SamplingParams
 from ..attention_backend import AttentionMetadata
@@ -58,6 +58,12 @@ from .modeling_utils import (
     register_auto_model,
     register_vision_encoder,
 )
+
+_QWEN_MODALITIES = ("image", "video")
+_QWEN_PLACEHOLDERS = {
+    "image": ("<|vision_start|><|image_pad|><|vision_end|>", "<|image_pad|>"),
+    "video": ("<|vision_start|><|video_pad|><|vision_end|>", "<|video_pad|>"),
+}
 
 
 class Qwen3VLInputProcessorBase(BaseMultimodalInputProcessor, BaseMultimodalDummyInputsBuilder):
@@ -111,6 +117,67 @@ class Qwen3VLInputProcessorBase(BaseMultimodalInputProcessor, BaseMultimodalDumm
     def get_vocab_size(self) -> int:
         """Return the vocab size of the model."""
         return self.config.text_config.vocab_size
+
+    @staticmethod
+    def _normalize_mm_data_items(mm_data: Dict[str, Any], modality: str) -> List[Any]:
+        """Return a modality payload as a list for item-order bookkeeping.
+
+        Qwen processors may receive either one item or a list per modality.
+        Mixed image/video support needs stable per-item indexes when deriving
+        `multimodal_item_order` from prompt placeholders.
+        """
+        items = mm_data.get(modality)
+        if items is None:
+            return []
+        if isinstance(items, (list, tuple)):
+            return list(items)
+        return [items]
+
+    def _get_mm_item_order_from_text(
+        self,
+        text_prompt: str,
+        mm_data: Dict[str, Any],
+    ) -> MMItemOrder:
+        """Infer Qwen image/video item order from placeholder order in text."""
+        expected_counts = {
+            modality: len(self._normalize_mm_data_items(mm_data, modality))
+            for modality in _QWEN_MODALITIES
+        }
+        actual_counts = {modality: 0 for modality in _QWEN_MODALITIES}
+        item_order: MMItemOrder = MMItemOrder()
+        cursor = 0
+
+        while cursor < len(text_prompt):
+            next_match: Optional[Tuple[int, int, str]] = None
+            for modality, placeholders in _QWEN_PLACEHOLDERS.items():
+                if actual_counts[modality] >= expected_counts[modality]:
+                    continue
+                for placeholder in placeholders:
+                    position = text_prompt.find(placeholder, cursor)
+                    if position < 0:
+                        continue
+                    if (
+                        next_match is None
+                        or position < next_match[0]
+                        or (position == next_match[0] and len(placeholder) > next_match[1])
+                    ):
+                        next_match = (position, len(placeholder), modality)
+
+            if next_match is None:
+                break
+
+            position, placeholder_len, modality = next_match
+            item_order.append((modality, actual_counts[modality]))
+            actual_counts[modality] += 1
+            cursor = position + placeholder_len
+
+        for modality, expected_count in expected_counts.items():
+            if actual_counts[modality] != expected_count:
+                raise ValueError(
+                    f"Qwen3-VL prompt contains {actual_counts[modality]} "
+                    f"{modality} placeholder(s), expected {expected_count}."
+                )
+        return item_order
 
     @classmethod
     def get_rope_index(
@@ -267,8 +334,14 @@ class Qwen3VLInputProcessorBase(BaseMultimodalInputProcessor, BaseMultimodalDumm
     ) -> int:
         merge = self.config.vision_config.spatial_merge_size
         if video_grid_thw is not None:
-            t, h, w = (int(x) for x in video_grid_thw)
-            return t * (h // merge) * (w // merge)
+            grid = torch.as_tensor(video_grid_thw)
+            if grid.ndim == 1:
+                grid = grid.reshape(1, 3)
+            if grid.ndim != 2 or grid.shape[1] != 3:
+                raise ValueError(
+                    f"video_grid_thw must have shape [3] or [N, 3], got {tuple(grid.shape)}"
+                )
+            return sum(int(t) * (int(h) // merge) * (int(w) // merge) for t, h, w in grid.tolist())
 
         # Must run the full processor: HF's Qwen3VLProcessor._get_num_multimodal_tokens
         # (what the base class default delegates to) raises on video-only calls
@@ -288,8 +361,7 @@ class Qwen3VLInputProcessorBase(BaseMultimodalInputProcessor, BaseMultimodalDumm
                 "get_num_tokens_per_video: HF processor returned no "
                 "video_grid_thw for the provided video."
             )
-        t, h, w = (int(x) for x in vgt[0].tolist())
-        return t * (h // merge) * (w // merge)
+        return sum(int(t) * (int(h) // merge) * (int(w) // merge) for t, h, w in vgt.tolist())
 
     def _preprocess(
         self, text: Dict[str, Any], mm_data: Dict[str, Any], mm_processor_kwargs: Dict[str, Any]
@@ -366,6 +438,16 @@ class Qwen3VLInputProcessorBase(BaseMultimodalInputProcessor, BaseMultimodalDumm
             processed_inputs = self._preprocess(text_prompt, mm_data, mm_processor_kwargs)
 
         multimodal_data = {}
+        modalities = [
+            modality
+            for modality in _QWEN_MODALITIES
+            if self._normalize_mm_data_items(mm_data, modality)
+        ]
+        if len(modalities) > 1:
+            multimodal_data["multimodal_item_order"] = [
+                {"modality": modality, "index": idx}
+                for modality, idx in self._get_mm_item_order_from_text(text_prompt, mm_data)
+            ]
         pixel_values = processed_inputs.get("pixel_values", None)
         if pixel_values is not None:
             multimodal_data["image"] = {
@@ -911,38 +993,95 @@ class Qwen3VisionModelBase(nn.Module):
 
         return mm_content_dict, mm_extra_data
 
+    def _encode_visual_inputs(
+        self,
+        pixel_values: torch.Tensor,
+        grid_thw: torch.Tensor,
+    ) -> torch.Tensor:
+        """Run the Qwen visual encoder and concatenate deepstack features."""
+        embeds, deepstack_embeds = self.visual(pixel_values.to(self.model_dtype), grid_thw=grid_thw)
+        return torch.cat([embeds] + deepstack_embeds, dim=1)
+
+    def _encode_modality(self, multimodal_data: Dict[str, Any], modality: str) -> torch.Tensor:
+        """Encode a single Qwen modality bucket from processed multimodal data."""
+        if modality == "image":
+            data = multimodal_data["image"]
+            return self._encode_visual_inputs(data["pixel_values"], data["image_grid_thw"])
+        if modality == "video":
+            data = multimodal_data["video"]
+            return self._encode_visual_inputs(data["pixel_values_videos"], data["video_grid_thw"])
+        raise ValueError(f"Unknown modality: {modality}")
+
+    @staticmethod
+    def _get_modality_types(multimodal_data: Dict[str, Any]) -> List[str]:
+        """Return Qwen modalities present in processed multimodal data."""
+        return [
+            modality for modality in _QWEN_MODALITIES if multimodal_data.get(modality) is not None
+        ]
+
+    def _encode_mixed_param(self, param: MultimodalParams) -> Optional[torch.Tensor]:
+        """Encode one request and restore prompt order for mixed image/video."""
+        multimodal_data = param.multimodal_data or {}
+        modality_types = self._get_modality_types(multimodal_data)
+        if not modality_types:
+            return None
+
+        encoded_by_modality = {
+            modality: self._encode_modality(multimodal_data, modality)
+            for modality in modality_types
+        }
+        if len(encoded_by_modality) == 1:
+            return next(iter(encoded_by_modality.values()))
+
+        item_order = MMItemOrder.from_metadata(multimodal_data) or MMItemOrder()
+        if not item_order:
+            raise ValueError(
+                "Qwen3-VL mixed image/video requests require multimodal_item_order metadata."
+            )
+        embedding_lengths = multimodal_data.get("multimodal_embedding_lengths")
+        if embedding_lengths is None:
+            raise ValueError(
+                "Qwen3-VL mixed image/video requests require multimodal_embedding_lengths metadata."
+            )
+        chunks = item_order.split_embeddings(encoded_by_modality, embedding_lengths)
+        return torch.cat(chunks, dim=0)
+
+    def _forward_mixed_multimodal_params(
+        self,
+        multimodal_params: List[MultimodalParams],
+    ) -> List[torch.Tensor]:
+        """Encode mixed requests and return the single-tensor executor contract."""
+        outputs = []
+        for param in multimodal_params:
+            encoded = self._encode_mixed_param(param)
+            if encoded is not None:
+                outputs.append(encoded)
+        if not outputs:
+            return []
+        return [torch.cat(outputs, dim=0)]
+
     @torch.inference_mode()
     def forward(self, multimodal_params: List[MultimodalParams]) -> List[torch.Tensor]:
+        request_modalities = [
+            self._get_modality_types(param.multimodal_data or {}) for param in multimodal_params
+        ]
+        all_modalities = {modality for modalities in request_modalities for modality in modalities}
+        if len(all_modalities) > 1:
+            return self._forward_mixed_multimodal_params(multimodal_params)
+
         mm_content_data, mm_extra_data = self._parse_and_batch_multimodal_data(multimodal_params)
         pixel_values = mm_content_data.get("pixel_values", None)
         pixel_values_videos = mm_content_data.get("pixel_values_videos", None)
-
-        if pixel_values is not None and pixel_values_videos is not None:
-            raise ValueError("Currently only support single modality per request")
 
         image_grid_thw = mm_extra_data.get("image_grid_thw", None)
         video_grid_thw = mm_extra_data.get("video_grid_thw", None)
 
         embeds = []
         if pixel_values is not None:
-            pixel_values = pixel_values.to(self.model_dtype)
-            image_embeds, deepstack_image_embeds = self.visual(
-                pixel_values, grid_thw=image_grid_thw
-            )
-            # NOTE: We concatenate deepstack_embeds to mm_embeds
-            # The shape will be [seq_len, hidden_dim * (num_deepstack_layers + 1)]
-            mixed_image_embeds = torch.cat([image_embeds] + deepstack_image_embeds, dim=1)
-            embeds.append(mixed_image_embeds)
+            embeds.append(self._encode_visual_inputs(pixel_values, image_grid_thw))
 
         if pixel_values_videos is not None:
-            pixel_values_videos = pixel_values_videos.to(self.model_dtype)
-            video_embeds, deepstack_video_embeds = self.visual(
-                pixel_values_videos, grid_thw=video_grid_thw
-            )
-            # NOTE: We concatenate deepstack_embeds to mm_embeds
-            # The shape will be [seq_len, hidden_dim * (num_deepstack_layers + 1)]
-            mixed_video_embeds = torch.cat([video_embeds] + deepstack_video_embeds, dim=1)
-            embeds.append(mixed_video_embeds)
+            embeds.append(self._encode_visual_inputs(pixel_values_videos, video_grid_thw))
         return embeds
 
 

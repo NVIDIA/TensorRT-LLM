@@ -14,7 +14,13 @@ from einops import rearrange as einops_rearrange
 from PIL import Image
 
 from tensorrt_llm._torch.models.checkpoints import NemotronHHfWeightMapper
-from tensorrt_llm.inputs.multimodal import MultimodalParams
+from tensorrt_llm.inputs.multimodal import (
+    MMItemOrder,
+    MultimodalParams,
+    _as_cpu_tensor,
+    _compute_mm_masks,
+    _find_mm_embedding_lengths_from_masks,
+)
 
 from ...inputs import (
     AudioData,
@@ -400,10 +406,12 @@ _NANO_MODALITIES = ("image", "video", "audio")
 
 
 def _is_disagg_context_role() -> bool:
+    """Return whether this process is the disaggregated prefill role."""
     return os.getenv(_DISAGG_ROLE_ENV_NAME, "").lower() in _DISAGG_CONTEXT_ROLES
 
 
 def _get_modality_types(multimodal_data: Dict[str, Any]) -> List[str]:
+    """Return explicit or inferred Nano modalities for processed data."""
     modality_type = multimodal_data.get("modality_type")
     if isinstance(modality_type, str):
         return [modality_type]
@@ -413,6 +421,7 @@ def _get_modality_types(multimodal_data: Dict[str, Any]) -> List[str]:
 
 
 def _has_raw_multimodal_data(param: MultimodalParams) -> bool:
+    """Return whether a param still carries raw modality payloads to encode."""
     multimodal_data = param.multimodal_data or {}
     return any(
         modality in _NANO_MODALITIES and multimodal_data.get(modality) is not None
@@ -1422,6 +1431,7 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
 
     @staticmethod
     def _count_mm_items(mm_data: Dict[str, Any], modality: str) -> int:
+        """Count scalar or list payload items for one Nano modality."""
         items = mm_data.get(modality)
         if items is None:
             return 0
@@ -1429,7 +1439,7 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
 
     def get_mm_item_order(
         self, prompt_token_ids: List[int], mm_data: Dict[str, Any]
-    ) -> List[Tuple[str, int]]:
+    ) -> MMItemOrder:
         """Return `(modality, item_index)` entries in prompt placeholder order."""
         token_order = self._get_mm_item_order_from_token_ids(prompt_token_ids, mm_data)
         if token_order is not None:
@@ -1439,12 +1449,22 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
 
     @staticmethod
     def _normalize_mm_data_items(mm_data: Dict[str, Any], modality: str) -> List[Any]:
-        items = mm_data.get(modality, [])
-        return items if isinstance(items, list) else [items]
+        """Return a modality payload as a list for placeholder counting.
+
+        Nano prompt-order recovery needs stable per-item indexes, while callers
+        may pass either a scalar item or a list for each modality.
+        """
+        items = mm_data.get(modality)
+        if items is None:
+            return []
+        if isinstance(items, (list, tuple)):
+            return list(items)
+        return [items]
 
     def _get_mm_item_order_from_text(
         self, text_prompt: str, mm_data: Dict[str, Any]
-    ) -> List[Tuple[str, int]]:
+    ) -> MMItemOrder:
+        """Infer Nano item order by scanning decoded placeholder text."""
         expected_counts = {
             modality: self._count_mm_items(mm_data, modality) for modality in _NANO_MODALITIES
         }
@@ -1454,7 +1474,7 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
             "audio": self._sound_context_token,
         }
         actual_counts = {modality: 0 for modality in _NANO_MODALITIES}
-        item_order: List[Tuple[str, int]] = []
+        item_order: MMItemOrder = MMItemOrder()
         cursor = 0
         while cursor < len(text_prompt):
             next_match: Optional[Tuple[int, str]] = None
@@ -1481,12 +1501,13 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
 
     def _get_mm_item_order_from_token_ids(
         self, prompt_token_ids: List[int], mm_data: Dict[str, Any]
-    ) -> Optional[List[Tuple[str, int]]]:
+    ) -> Optional[MMItemOrder]:
+        """Infer Nano item order directly from placeholder token IDs when possible."""
         expected_counts = {
             modality: self._count_mm_items(mm_data, modality) for modality in _NANO_MODALITIES
         }
         actual_counts = {modality: 0 for modality in _NANO_MODALITIES}
-        item_order: List[Tuple[str, int]] = []
+        item_order: MMItemOrder = MMItemOrder()
         video_pattern = self._video_placeholder_token_ids
         video_pattern_len = len(video_pattern)
 
@@ -1527,6 +1548,7 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
         num_mm_tokens_per_placeholder: List[int],
         mm_data: Dict[str, Any],
     ) -> Tuple[List[int], Optional[Dict[str, Dict[str, Any]]]]:
+        """Expand mixed Nano placeholders from token IDs while preserving item order."""
         item_order = self.get_mm_item_order(prompt_token_ids, mm_data)
         if len(item_order) != len(num_mm_tokens_per_placeholder):
             raise ValueError(
@@ -1625,6 +1647,7 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
         num_mm_tokens_per_placeholder: List[int],
         mm_data: Dict[str, Any],
     ) -> Tuple[List[int], Optional[Dict[str, Dict[str, Any]]]]:
+        """Expand mixed Nano placeholders from decoded text when token matching is insufficient."""
         item_order = self._get_mm_item_order_from_text(text_prompt, mm_data)
         if len(item_order) != len(num_mm_tokens_per_placeholder):
             raise ValueError(
@@ -2453,6 +2476,7 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
     def _prepare_image_modality_data(
         self, images: List[Image.Image | torch.Tensor], text_prompt: str
     ) -> Dict[str, Any]:
+        """Preprocess Nano image items into the encoder input payload."""
         if self.dynamic_tiler is not None:
             processed_data, _ = self._process_images_dynamic(images, text_prompt)
             modality_data = {
@@ -2473,6 +2497,7 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
     def _prepare_video_audio_data(
         self, video_audios: List[Optional[AudioData]]
     ) -> Optional[Dict[str, Any]]:
+        """Preprocess audio tracks attached to video items when available."""
         has_audio = [audio is not None for audio in video_audios]
         audio_from_video = [
             (audio.samples, audio.sample_rate) for audio in video_audios if audio is not None
@@ -2487,6 +2512,7 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
         return audio_data
 
     def _prepare_video_modality_data(self, videos: List[Any]) -> Dict[str, Any]:
+        """Preprocess Nano video items and any embedded audio tracks."""
         video_frames, video_audios = (
             [getattr(video_data, "frames", video_data) for video_data in videos],
             [getattr(video_data, "audio", None) for video_data in videos],
@@ -2508,6 +2534,7 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
     def _prepare_audio_modality_data(
         self, audios: List[Union[np.ndarray, Tuple[np.ndarray, int]]]
     ) -> Dict[str, Any]:
+        """Preprocess standalone Nano audio items into encoder features."""
         if self._audio_extractor is None:
             raise ValueError(
                 "Audio inputs were passed in, but no audio preprocessing was configured "
@@ -2521,9 +2548,10 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
 
     def _get_num_tokens_for_item_order(
         self,
-        item_order: List[Tuple[str, int]],
+        item_order: MMItemOrder,
         mm_data: Dict[str, Any],
     ) -> List[int]:
+        """Compute per-item multimodal token lengths in prompt order."""
         num_mm_tokens: List[int] = []
         for modality, item_idx in item_order:
             item = self._normalize_mm_data_items(mm_data, modality)[item_idx]
@@ -2551,6 +2579,7 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
         multimodal_data: Dict[str, Any],
         mm_data_updates: Optional[Dict[str, Dict[str, Any]]],
     ) -> None:
+        """Merge placeholder-expansion side data into processed modality metadata."""
         if not mm_data_updates:
             return
         for modality, field_updates in mm_data_updates.items():
@@ -2561,6 +2590,7 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
         text_prompt: str,
         mm_data: Dict[str, Any],
     ) -> Tuple[List[int], Optional[ExtraProcessedInputs]]:
+        """Preprocess one Nano request containing more than one raw modality."""
         item_order = self._get_mm_item_order_from_text(text_prompt, mm_data)
         multimodal_data: Dict[str, Any] = {
             "modality_type": list(dict.fromkeys(modality for modality, _ in item_order)),
@@ -2593,6 +2623,16 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
             text_prompt,
             num_mm_tokens,
             mm_data,
+        )
+        # Same modality can appear twice. Keep per-item embed lengths so chunks follow prompt order.
+        mm_mask, embed_mask, _ = _compute_mm_masks(
+            _as_cpu_tensor(input_ids),
+            vocab_size=self.get_vocab_size(),
+            mm_token_ids=self.get_mm_token_ids(),
+            mm_special_token_ids=self.get_mm_special_token_ids(),
+        )
+        multimodal_data["multimodal_embedding_lengths"] = _find_mm_embedding_lengths_from_masks(
+            mm_mask, embed_mask, num_mm_tokens
         )
         self._merge_mm_data_updates(multimodal_data, mm_data_updates)
         return input_ids, {"multimodal_data": multimodal_data}
@@ -3349,53 +3389,6 @@ class NemotronH_Nano_VL_V2(transformers.PreTrainedModel):
 
         return torch.cat(parts, dim=0)
 
-    @staticmethod
-    def _normalize_item_order_metadata(multimodal_data: Dict[str, Any]) -> List[Tuple[str, int]]:
-        raw_order = multimodal_data.get("multimodal_item_order") or []
-        item_order: List[Tuple[str, int]] = []
-        counters: Dict[str, int] = {}
-        for entry in raw_order:
-            if isinstance(entry, dict):
-                modality = entry.get("modality", entry.get("type"))
-                item_idx = entry.get("index", entry.get("item_index"))
-                if item_idx is None:
-                    item_idx = counters.get(modality, 0)
-            elif isinstance(entry, str):
-                modality = entry
-                item_idx = counters.get(modality, 0)
-            else:
-                modality, item_idx = entry
-            item_idx = int(item_idx)
-            item_order.append((modality, item_idx))
-            counters[modality] = max(counters.get(modality, 0), item_idx + 1)
-        return item_order
-
-    @staticmethod
-    def _split_embeddings_by_item_order(
-        encoded_by_modality: Dict[str, torch.Tensor],
-        item_order: List[Tuple[str, int]],
-        embedding_lengths: List[int],
-    ) -> List[torch.Tensor]:
-        item_lengths = {
-            item: embedding_length
-            for item, embedding_length in zip(item_order, embedding_lengths, strict=True)
-        }
-        chunks_by_item: Dict[Tuple[str, int], torch.Tensor] = {}
-        for modality, encoded in encoded_by_modality.items():
-            modality_items = [item for item in item_order if item[0] == modality]
-            if not modality_items:
-                continue
-            modality_lengths = [item_lengths[item] for item in modality_items]
-            expected = sum(modality_lengths)
-            if encoded.shape[0] != expected:
-                raise ValueError(
-                    f"{modality} embedding length mismatch: encoder produced "
-                    f"{encoded.shape[0]} rows, metadata expects {expected}."
-                )
-            for item, chunk in zip(modality_items, encoded.split(modality_lengths), strict=True):
-                chunks_by_item[item] = chunk
-        return [chunks_by_item[item] for item in item_order]
-
     def _encode_multimodal(self, multimodal_params: List[MultimodalParams]) -> List[torch.Tensor]:
         """Dispatch multimodal encoding to the appropriate encoder.
 
@@ -3417,6 +3410,7 @@ class NemotronH_Nano_VL_V2(transformers.PreTrainedModel):
         def _encode_audio_items(
             audio_items: List[dict],
         ) -> List[Tuple[torch.Tensor, List[int]]]:
+            """Normalize Nano audio encoder output for batched and scalar audio."""
             encoded = self._encode_audio(audio_items)
             if isinstance(encoded, list):
                 return encoded
@@ -3429,6 +3423,7 @@ class NemotronH_Nano_VL_V2(transformers.PreTrainedModel):
         def _make_single_modality_param(
             param: MultimodalParams, modality_type: str
         ) -> MultimodalParams:
+            """Build a view of a mixed request for one existing Nano encoder."""
             multimodal_data = dict(param.multimodal_data or {})
             multimodal_data["modality_type"] = modality_type
             return MultimodalParams(
@@ -3438,6 +3433,7 @@ class NemotronH_Nano_VL_V2(transformers.PreTrainedModel):
             )
 
         def _encode_mixed_param(param: MultimodalParams) -> List[torch.Tensor]:
+            """Encode one mixed Nano request and restore prompt item order."""
             multimodal_data = param.multimodal_data or {}
             modality_types = list(dict.fromkeys(_get_modality_types(multimodal_data)))
             encoded_by_modality: Dict[str, torch.Tensor] = {}
@@ -3473,17 +3469,10 @@ class NemotronH_Nano_VL_V2(transformers.PreTrainedModel):
                 else:
                     raise ValueError(f"Unknown modality: {modality_type}")
 
-            item_order = self._normalize_item_order_metadata(multimodal_data)
+            item_order = MMItemOrder.from_metadata(multimodal_data) or MMItemOrder()
             embedding_lengths = multimodal_data.get("multimodal_embedding_lengths")
             if item_order and embedding_lengths is not None:
-                if len(item_order) != len(embedding_lengths):
-                    raise ValueError(
-                        "multimodal_item_order and multimodal_embedding_lengths "
-                        f"lengths differ: {len(item_order)} != {len(embedding_lengths)}."
-                    )
-                return self._split_embeddings_by_item_order(
-                    encoded_by_modality, item_order, embedding_lengths
-                )
+                return item_order.split_embeddings(encoded_by_modality, embedding_lengths)
             return [encoded_by_modality[modality_type] for modality_type in modality_types]
 
         outputs_by_param: List[Optional[List[torch.Tensor]]] = [None] * len(multimodal_params)
