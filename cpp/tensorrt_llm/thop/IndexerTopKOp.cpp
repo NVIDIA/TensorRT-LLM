@@ -128,11 +128,16 @@ void indexer_topk_decode(th::Tensor const& logits, th::Tensor const& seq_lens, t
         multiPassScratchBytes = static_cast<size_t>(t.numel());
     }
 
-    int32_t splitWorkThreshold = 200 * 1000;
+    // 0 lets invokeIndexerTopKDecode pick its numRows-aware adaptive
+    // threshold (200k for bs > 8, 65k for bs <= 8).
+    int32_t const splitWorkThreshold = 0;
     auto stream = at::cuda::getCurrentCUDAStream(logits.get_device());
 
+    // Mirror the kernel's adaptive threshold to decide whether the split-work
+    // tier is reachable from this call; allocate scratch only then.
+    int32_t const adaptiveSplitWorkThreshold = (num_rows > 8) ? 200 * 1000 : 65 * 1024;
     th::Tensor scratch_internal;
-    if (num_columns >= splitWorkThreshold && multiPassScratchPtr == nullptr)
+    if (num_columns >= adaptiveSplitWorkThreshold && multiPassScratchPtr == nullptr)
     {
         size_t const bytes
             = tk::indexerTopKDecodeScratchBytes(num_rows, num_columns, static_cast<int32_t>(index_topk));

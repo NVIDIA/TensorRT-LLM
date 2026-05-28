@@ -57,7 +57,7 @@ void invokeIndexerTopKDecode(float const* logits, int const* seqLens, int* indic
 /// Size in bytes of the `scratch` buffer required by `invokeIndexerTopKDecode`'s
 /// multi-pass radix split-work tier for the given (numRows, numColumns, topK).
 /// The buffer must be allocated by the caller whenever numColumns is at or
-/// above the split-work threshold; it may be re-used across calls of
+/// above the split-work threshold; it may be reused across calls of
 /// compatible shape.
 size_t indexerTopKDecodeScratchBytes(int numRows, int numColumns, int topK);
 

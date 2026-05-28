@@ -1215,6 +1215,14 @@ void invokeIndexerTopKDecodeImpl(InputT const* logits, int const* seqLens, int* 
         // takes (see plots/fused_vs_multipass in the topk scratch project).
         // Caller must provide `scratch` of at least
         // `indexerTopKDecodeScratchBytes(numRows, numColumns, topK)` bytes.
+        // The multi-pass radix kernels read each row contiguously
+        // (`radixPassKernel` indexes `logits[i]`), so a strided source would
+        // rank the wrong values. The single-block tier handles stride1 != 1
+        // via the strided fallback in `topKPerRowJob`; if we ever need
+        // split-work-sized strided inputs, the right answer is to lift the
+        // strided fallback into the radix kernels too.
+        TLLM_CHECK_WITH_INFO(
+            stride1 == 1, "indexer top-k split-work tier (multi-pass radix) requires stride1 == 1.");
         TLLM_CHECK_WITH_INFO(scratch != nullptr && scratchBytes >= radixScratchBytes(numRows, numColumns),
             "indexer top-k split-work tier: scratch buffer missing or too small.");
         cudaLaunchAttribute radixAttrs[1];

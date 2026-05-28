@@ -329,10 +329,10 @@ def test_indexer_topk_decode_multi_pass_radix(batch_size, num_tokens, dtype):
 @pytest.mark.parametrize("batch_size,num_tokens", [(4, 524288), (8, 262144), (16, 524288)])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.float16])
 def test_indexer_topk_decode_fused_split_work(batch_size, num_tokens, dtype):
-    """Fused single-launch split-work path: N >= splitWorkThreshold (200k)
-    shapes with a caller-allocated zero-initialized done counter. Verified
-    for fp32, bf16, and fp16."""
-    index_topk = 2048
+    """Split-work tier (N >= splitWorkThreshold). The thop wrapper now
+    allocates the multi-pass radix scratch internally; the legacy
+    `done_counter_scratch` parameter is accepted but unused. Verified for
+    fp32, bf16, and fp16."""
     done_counter = torch.zeros(batch_size, dtype=torch.int32, device="cuda")
     _run_opt_in_decode(batch_size, num_tokens, dtype=dtype, done_counter=done_counter, scratch=None)
 
