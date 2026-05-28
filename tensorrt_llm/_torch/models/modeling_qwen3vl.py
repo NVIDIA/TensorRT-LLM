@@ -1254,7 +1254,8 @@ class Qwen3VLModelBase(PreTrainedModel):
                     "Raw multimodal inputs require a local multimodal encoder on this "
                     "worker, or multimodal_embedding handles from an encoder handoff."
                 )
-            elif not self.support_mm_disagg:
+            # support_mm_disagg is only set in subclasses of Qwen3VLModelBase that support EPD
+            elif not getattr(self, "support_mm_disagg", False):
                 raise NotImplementedError(
                     f"{type(self)} does not support disaggregated inference yet. Please unset "
                     "the TLLM_MULTIMODAL_DISAGGREGATED environment variable, or set it to '0'."
