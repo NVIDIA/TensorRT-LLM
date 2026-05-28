@@ -70,7 +70,12 @@ class TestGmsConfigValidation:
         ],
     )
     def test_rejects_unknown_mode(self, bad_mode):
-        with pytest.raises(ValueError, match="gms_config.mode"):
+        # GmsConfig.mode is typed as Literal["auto", "rw", "ro"], so Pydantic
+        # rejects bad values at field validation with its stable literal_error
+        # template. Match on the rendered allowed-values list rather than the
+        # field path so the assertion is robust across Pydantic 2.x error
+        # path-formatting differences (dot vs arrow).
+        with pytest.raises(ValueError, match=r"Input should be 'auto', 'rw' or 'ro'"):
             _make_args(gms_config={"mode": bad_mode})
 
     @pytest.mark.parametrize(

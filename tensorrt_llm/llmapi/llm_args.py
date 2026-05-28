@@ -3716,7 +3716,7 @@ class GmsConfig(StrictBaseModel):
         status="prototype",
     )
 
-    mode: str = Field(
+    mode: Literal["auto", "rw", "ro"] = Field(
         default="auto",
         description="GMS operating mode: 'auto' requests RW or RO, 'rw' "
         "requires writer mode, and 'ro' requires read-only mode.",
@@ -3735,24 +3735,21 @@ class GmsConfig(StrictBaseModel):
 
     @model_validator(mode="after")
     def validate_gms_config(self) -> 'GmsConfig':
-        """Enforce :attr:`mode` enum membership and non-empty :attr:`tag`.
+        """Enforce non-empty :attr:`tag`.
 
-        Pydantic's ``status='prototype'`` field-level validation only
-        checks types; the cross-field semantics (mode whitelist,
-        non-empty tag) live here so users get a clear error at config
-        time instead of an opaque failure during ``ModelLoader.load``.
+        :attr:`mode` is enforced by its ``Literal`` type annotation —
+        Pydantic rejects out-of-set values at field validation, before
+        this validator runs, so the JSON schema/docs are self-describing
+        (enum) without a duplicated whitelist here.  This validator only
+        enforces the non-empty / non-whitespace contract on :attr:`tag`,
+        which the type system can't express.
 
         Raises:
-            ValueError: If ``mode`` is not one of ``{'auto', 'rw', 'ro'}``,
-                or if ``tag`` is empty / whitespace-only.
+            ValueError: If ``tag`` is empty / whitespace-only.
 
         Returns:
             ``self`` (Pydantic ``model_validator`` contract).
         """
-        if self.mode not in ("auto", "rw", "ro"):
-            raise ValueError(
-                f"gms_config.mode must be 'auto', 'rw', or 'ro', got '{self.mode}'."
-            )
         if not self.tag or not self.tag.strip():
             raise ValueError(
                 f"gms_config.tag must be a non-empty string, got {self.tag!r}.")
