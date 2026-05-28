@@ -1110,9 +1110,10 @@ void invokeIndexerTopKDecodeImpl(InputT const* logits, int const* seqLens, int* 
     int const* preIdx, int const preIdxStride, int const preIdxCount, InputT* heuristicScratch,
     cudaStream_t const stream, void* scratch, size_t scratchBytes, bool is_prefill)
 {
-    // Split-work cutoff: 200k for bs > 8, 65k for bs <= 8 (low-bs under-uses
-    // the GPU otherwise). is_prefill forces single-block.
-    int const adaptiveSplitWorkThreshold = is_prefill ? (1 << 30) : (numRows > 8) ? 200 * 1000 : 65 * 1024;
+    // Split-work cutoff: empirically the single-block tier wins below ~32k
+    // across bs in [1, 48]; multi-pass radix wins above. is_prefill forces
+    // single-block.
+    int const adaptiveSplitWorkThreshold = is_prefill ? (1 << 30) : 32768;
     int const effectiveSplitWorkThreshold = splitWorkThreshold > 0 ? splitWorkThreshold : adaptiveSplitWorkThreshold;
     constexpr int kNumThreadsPerBlock = 512;
 
