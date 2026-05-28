@@ -19,7 +19,7 @@ from tensorrt_llm._torch.models.modeling_multimodal_utils import _is_mm_disagg
 from tensorrt_llm.functional import PositionEmbeddingType
 from tensorrt_llm.mapping import Mapping
 
-from ..._utils import async_tensor_h2d, nvtx_range, nvtx_range_debug, prefer_pinned
+from ..._utils import async_tensor_h2d, prefer_pinned
 from ...inputs import (
     BaseMultimodalDummyInputsBuilder,
     BaseMultimodalInputProcessor,
@@ -46,6 +46,7 @@ from .checkpoints.hf.qwen3vl_weight_mapper import Qwen3VLHfWeightMapper
 from .modeling_auto import AutoModelForCausalLM
 from .modeling_multimodal_utils import (
     _install_processor_output_validation_filter,
+    filter_mm_token_from_input_ids,
     find_input_mm_embeds,
     fuse_input_embeds,
     get_attached_multimodal_embeddings,
@@ -233,7 +234,7 @@ class Qwen3VLInputProcessorBase(BaseMultimodalInputProcessor, BaseMultimodalDumm
             # numpy-based vectorized impl: ~2-3× faster than the torch loop
             # version on CPU since the per-image/video work is small Python
             # tensor allocations that numpy can do without the dispatch
-            # overhead. Final tensors are placed back on ``input_ids.device``.
+            # overhead. Final tensors are placed back on `input_ids.device`.
             input_device = input_ids.device
             input_dtype = input_ids.dtype
             ids_np = input_ids.detach().cpu().numpy()
@@ -372,7 +373,7 @@ class Qwen3VLInputProcessorBase(BaseMultimodalInputProcessor, BaseMultimodalDumm
             do_rescale = False
         if videos and isinstance(videos[0][0], torch.Tensor):
             do_rescale = False
-        # transformers 5.x's ``ProcessorMixin._merge_kwargs`` strictly
+        # transformers 5.x's `ProcessorMixin._merge_kwargs` strictly
         # validates per-modality kwargs against the processor's TypedDict.
         # Processor *output* keys (``video_grid_thw``, ``pixel_values``, ...)
         # round-trip into the validator via tokenizer ``init_kwargs`` /
@@ -417,7 +418,6 @@ class Qwen3VLInputProcessorBase(BaseMultimodalInputProcessor, BaseMultimodalDumm
 
         return mrope_config
 
-    @nvtx_range("Qwen3VLInputProcessorBase forward()")
     @torch.inference_mode()
     def call_with_text_prompt(
         self,
@@ -431,10 +431,9 @@ class Qwen3VLInputProcessorBase(BaseMultimodalInputProcessor, BaseMultimodalDumm
         )
 
         # Text-only fast path: skip the multi-modal HF processor (tokenizer
-        # output matches it bit-exactly when ``images`` / ``videos`` are
-        # ``None``) and avoid the ``bypass_processor_output_validation``
-        # context. mrope_config still needs to be populated since the LM
-        # is M-RoPE.
+        # output matches it bit-exactly when `images` / `videos` are
+        # `None`). mrope_config still needs to be populated since the LM is
+        # M-RoPE.
         if not mm_data:
             input_ids = self.tokenizer(text_prompt, return_tensors="pt").input_ids
             attention_mask = torch.ones_like(input_ids)
@@ -443,8 +442,7 @@ class Qwen3VLInputProcessorBase(BaseMultimodalInputProcessor, BaseMultimodalDumm
                 "multimodal_data": {"mrope_config": mrope_config},
             }
 
-        with nvtx_range_debug("transformers input preprocess"):
-            processed_inputs = self._preprocess(text_prompt, mm_data, mm_processor_kwargs)
+        processed_inputs = self._preprocess(text_prompt, mm_data, mm_processor_kwargs)
 
         multimodal_data = {}
         pixel_values = processed_inputs.get("pixel_values", None)
@@ -583,10 +581,10 @@ class Qwen3VLVisionBlock(torch.nn.Module):
         position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         **kwargs,
     ) -> torch.Tensor:
-        # Collapse the post-attn ``residual + x_attn`` add into ``norm2``'s
-        # residual path. ``LayerNorm.forward`` with ``residual=`` is
-        # torch.compile-fused so both the ``+`` and the LN run inside one
-        # Triton kernel -- saves one elementwise_kernel ``add<c10::BFloat16>``
+        # Collapse the post-attn `residual + x_attn` add into `norm2`'s
+        # residual path. `LayerNorm.forward` with `residual=` is
+        # torch.compile-fused so both the `+` and the LN run inside one
+        # Triton kernel -- saves one elementwise_kernel `add<c10::BFloat16>`
         # launch per vision block (32 launches per executor iter at full-batch).
         x_attn = self.attn(
             hidden_states=self.norm1(hidden_states),
@@ -663,7 +661,7 @@ class Qwen3VLVisionPatchMerger(torch.nn.Module):
 # Fused bilinear position-embedding interpolation for the Qwen3-VL vision
 # tower.
 #
-# ``fast_pos_embed_interpolate`` resamples the learned grid of positional
+# `fast_pos_embed_interpolate` resamples the learned grid of positional
 # embeddings onto each (t, h, w) image grid using bilinear interpolation and
 # then reorders the spatial axis to match the spatial-merge layout used by
 # the rest of the vision tower. The Triton path fuses the
@@ -756,7 +754,7 @@ def _triton_pos_embed_interpolate(
 ) -> torch.Tensor:
     """Launch the fused Triton kernel for one (t, h, w) grid.
 
-    Returns a tensor of shape ``(t * h * w, hidden_dim)`` with the
+    Returns a tensor of shape `(t * h * w, hidden_dim)` with the
     bilinearly-interpolated position embeddings already in spatial-merge
     order.
     """
@@ -810,19 +808,19 @@ class Qwen3VisionModel(torch.nn.Module):
         self.num_grid_per_side = int(self.config.num_position_embeddings**0.5)
 
         # 2D rotary positional embedding for the vision tower. Reuse the
-        # generic ``RotaryEmbedding`` cos/sin buffer (sized to the text
-        # config's ``max_position_embeddings`` via ``RopeParams``) so
-        # ``forward`` only gathers ``rotary_cos_sin[pos_ids]`` -- no
-        # per-forward ``torch.outer`` or ``.cos()`` / ``.sin()`` kernels
+        # generic `RotaryEmbedding` cos/sin buffer (sized to the text
+        # config's `max_position_embeddings` via `RopeParams`) so
+        # `forward` only gathers `rotary_cos_sin[pos_ids]` -- no
+        # per-forward `torch.outer` or `.cos()` / `.sin()` kernels
         # and no hard-coded upper bound on the per-axis image grid.
         text_config = getattr(
             model_config.pretrained_config, "text_config", model_config.pretrained_config
         )
         self.config.max_position_embeddings = text_config.max_position_embeddings
         # Vision RoPE uses half of head_dim (partial_rotary_factor=0.5),
-        # so the cos/sin tables hold ``head_dim/2`` columns -- which
+        # so the cos/sin tables hold `head_dim/2` columns -- which
         # matches the per-token (h_pos, w_pos) layout produced by
-        # ``rot_pos_ids``.
+        # `rot_pos_ids`.
         self.config.partial_rotary_factor = 0.5
         self.config.num_attention_heads = self.config.num_heads
         self.head_dim = self.config.hidden_size // self.config.num_heads
@@ -857,7 +855,7 @@ class Qwen3VisionModel(torch.nn.Module):
             ]
         )
         # O(1) lookup table: layer_idx -> merger position. Avoids the
-        # per-layer ``deepstack_visual_indexes.index(layer_num)`` linear
+        # per-layer `deepstack_visual_indexes.index(layer_num)` linear
         # scan in `forward`. (Not a parameter; just a Python dict.)
         self._deepstack_layer_to_merger_idx = {
             layer_idx: i for i, layer_idx in enumerate(self.deepstack_visual_indexes)
@@ -868,6 +866,16 @@ class Qwen3VisionModel(torch.nn.Module):
             max_num_requests=8192,  # TODO: Make this dynamic
             max_num_tokens=8192,  # TODO: Make this dynamic
             kv_cache_manager=None,
+        )
+
+        # Pre-allocated `arange` for the vision block's
+        # `rope_position_ids`; per-call code just slices `[:seq_len]`
+        # instead of allocating a fresh `(seq_len,) int32` + H->D copy.
+        # TODO: Make capacity dynamic with the encoder's `max_num_tokens`.
+        self.register_buffer(
+            "_rope_position_ids_buffer",
+            torch.arange(32768, dtype=torch.int32, device="cuda"),
+            persistent=False,
         )
 
     @property
@@ -905,13 +913,13 @@ class Qwen3VisionModel(torch.nn.Module):
     def _rotary_pos_emb_thw(self, t: int, h: int, w: int) -> Tuple[torch.Tensor, torch.Tensor]:
         """Per-(t, h, w) rotary (cos, sin) pair, cached as device tensors.
 
-        Gathers from ``self.rotary_pos_emb.rotary_cos_sin`` (sized to the
-        text config's ``max_position_embeddings``) -- so no ``.cos()`` /
-        ``.sin()`` kernels fire in forward. pos_ids are built CPU-side via
-        ``rot_pos_ids`` (also lru_cached), the H->D copy happens here on
+        Gathers from `self.rotary_pos_emb.rotary_cos_sin` (sized to the
+        text config's `max_position_embeddings`) -- so no `.cos()` /
+        `.sin()` kernels fire in forward. pos_ids are built CPU-side via
+        `rot_pos_ids` (also lru_cached), the H->D copy happens here on
         the first miss, and subsequent calls return the cached on-device
-        cos/sin tuple. ``rot_pos_emb`` over a multi-image grid becomes a
-        list lookup + per-half ``torch.cat`` -- no transfer, no elementwise
+        cos/sin tuple. `rot_pos_emb` over a multi-image grid becomes a
+        list lookup + per-half `torch.cat` -- no transfer, no elementwise
         trig.
 
         GPU memory cost (measured on H200, head_dim=72 -> freq_dim=18,
@@ -929,7 +937,7 @@ class Qwen3VisionModel(torch.nn.Module):
           ============================  =======  =========
 
         Typical production VLM serving has 10-30 unique tile shapes, so
-        the cache settles around 4-10 MB. ``maxsize=1024`` is a safety
+        the cache settles around 4-10 MB. `maxsize=1024` is a safety
         cap; reaching it would require >1024 distinct (t, h, w) and
         even then LRU evicts.
         """
@@ -937,15 +945,15 @@ class Qwen3VisionModel(torch.nn.Module):
         if t > 1:
             pos_ids = pos_ids.repeat(t, 1)
         # Pinned-host + async DMA via the project helper; a bare
-        # ``.to(..., non_blocking=True)`` on pageable memory silently
+        # `.to(..., non_blocking=True)` on pageable memory silently
         # degrades to a staging copy.
         pos_ids = async_tensor_h2d(pos_ids, dtype=pos_ids.dtype, device=self.device)
-        # Gather pre-computed cos/sin from the standard ``RotaryEmbedding``
-        # buffer. ``rotary_cos_sin`` has shape (max_pos, 2, freq_dim);
+        # Gather pre-computed cos/sin from the standard `RotaryEmbedding`
+        # buffer. `rotary_cos_sin` has shape (max_pos, 2, freq_dim);
         # index 0 holds cos, index 1 holds sin. pos_ids has shape
         # (total, 2); the last-dim 2 holds the (h-pos, w-pos) freq
         # indices, so after gather + flatten the per-token layout is
-        # ``[cos(freq_h), cos(freq_w)]`` of size ``2*freq_dim``.
+        # `[cos(freq_h), cos(freq_w)]` of size `2*freq_dim`.
         max_grid_size = max(h, w)
         cos_sin = self.rotary_pos_emb.rotary_cos_sin[:max_grid_size]
         cos = cos_sin[:, 0, :][pos_ids].flatten(1)
@@ -967,9 +975,9 @@ class Qwen3VisionModel(torch.nn.Module):
     def fast_pos_embed_interpolate(self, grid_thw: list[list[int]]) -> torch.Tensor:
         """Per-image fused Triton bilinear pos-embed interpolation.
 
-        Launches ``_triton_pos_embed_interpolate`` once per image with
-        ``(h, w, h_scale, w_scale)`` passed as scalar kernel args, so the
-        function performs zero H<->D transfers. ``torch.cat`` joins the
+        Launches `_triton_pos_embed_interpolate` once per image with
+        `(h, w, h_scale, w_scale)` passed as scalar kernel args, so the
+        function performs zero H<->D transfers. `torch.cat` joins the
         per-image outputs at the end.
         """
         pieces = [
@@ -988,10 +996,11 @@ class Qwen3VisionModel(torch.nn.Module):
             return pieces[0]
         return torch.cat(pieces, dim=0)
 
-    def prepare_attn_metadata(self, seq_lens, attn_metadata: AttentionMetadata):
+    def prepare_attn_metadata(self, seq_lens: List[int], attn_metadata: AttentionMetadata):
         # NOTE: The single prompt is divided into multiple seq_lens, so pretending have many batch_sizes.
         batch_size = len(seq_lens)
         prompt_lens = seq_lens
+        max_seq_len = max(seq_lens)
         seq_lens = torch.tensor(seq_lens, dtype=torch.int, pin_memory=prefer_pinned())
         request_ids = list(range(1, batch_size + 1))
 
@@ -999,32 +1008,28 @@ class Qwen3VisionModel(torch.nn.Module):
         attn_metadata.request_ids = request_ids
         attn_metadata.prompt_lens = prompt_lens
         attn_metadata.seq_lens = seq_lens
-        attn_metadata.max_seq_len = seq_lens.max().item()
+        attn_metadata.max_seq_len = max_seq_len
         attn_metadata.prepare()
         return attn_metadata
 
-    @nvtx_range("Qwen3VisionModel forward compute")
     @torch.inference_mode()
     def forward(
         self, pixel_values: torch.Tensor, grid_thw: torch.Tensor, **kwargs
     ) -> Tuple[torch.Tensor, List[torch.Tensor]]:
-        with nvtx_range("Qwen3VisionModel forward compute prepare_attn_metadata"):
-            seq_lens = torch.repeat_interleave(
-                grid_thw[:, 1] * grid_thw[:, 2], grid_thw[:, 0]
-            ).tolist()
-            attn_metadata = self.prepare_attn_metadata(seq_lens, self.attn_metadata)
 
-        # Materialize the (t, h, w) grid as a plain Python list once; both
-        # rot_pos_emb and fast_pos_embed_interpolate iterate it on CPU and
-        # benefit from rot_pos_ids' lru_cache when (h, w) repeats.
         grid_rows = grid_thw.tolist()
-        # ``rot_pos_emb`` returns (cos, sin) gathered from the pre-computed
-        # cos/sin buffers -- no ``.cos()``/``.sin()`` kernels in forward.
+        seq_lens: List[int] = []
+        for t, h, w in grid_rows:
+            seq_lens.extend([h * w] * t)
+        attn_metadata = self.prepare_attn_metadata(seq_lens, self.attn_metadata)
+
+        # `rot_pos_emb` returns (cos, sin) gathered from the pre-computed
+        # cos/sin buffers -- no `.cos()`/`.sin()` kernels in forward.
         # Each half has shape (total_tokens, 2*freq_dim) = (total_tokens,
-        # rotary_dim), which is what ``Qwen2_5_VLVisionAttention.apply_rope``
-        # / ``RotaryEmbedding.apply_rotary_pos_emb`` expects (it computes
-        # ``rot_dim = cos.shape[-1] * 2 = head_dim`` and chunks q/k into
-        # halves of size ``cos.shape[-1]``).
+        # rotary_dim), which is what `Qwen2_5_VLVisionAttention.apply_rope`
+        # / `RotaryEmbedding.apply_rotary_pos_emb` expects (it computes
+        # `rot_dim = cos.shape[-1] * 2 = head_dim` and chunks q/k into
+        # halves of size `cos.shape[-1]`).
         cos, sin = self.rot_pos_emb(grid_rows)
         pos_embeds = self.fast_pos_embed_interpolate(grid_rows)
 
@@ -1032,15 +1037,15 @@ class Qwen3VisionModel(torch.nn.Module):
         hidden_states += pos_embeds
         hidden_states = hidden_states.flatten(1)
 
-        # Vision RoPE backend (FlashInfer path) gates on ``position_ids is
-        # not None``; supply trivial 0..seq_len-1 positions on device so
-        # the gate clears when ``head_dim % 64 == 0``. For Qwen3-VL
+        # Vision RoPE backend (FlashInfer path) gates on `position_ids is
+        # not None`; supply trivial 0..seq_len-1 positions on device so
+        # the gate clears when `head_dim % 64 == 0`. For Qwen3-VL
         # (head_dim=72) the gate misses and we fall through to the
         # PyTorch path, which broadcasts cos/sin over the chunked q/k.
+        # Slicing the pre-allocated `_rope_position_ids_buffer` is a
+        # view -- no per-iter alloc and no host->device copy.
         seq_len = hidden_states.shape[0]
-        rope_position_ids = async_tensor_h2d(
-            torch.arange(seq_len, dtype=torch.int32),
-            dtype=torch.int32, device=self.device)
+        rope_position_ids = self._rope_position_ids_buffer[:seq_len]
         position_embeddings = (cos, sin)
 
         deepstack_feature_lists = []
@@ -1161,7 +1166,6 @@ class Qwen3VisionModelBase(nn.Module):
 
         return mm_content_dict, mm_extra_data
 
-    @nvtx_range("Qwen3VisionModelBase forward")
     @torch.inference_mode()
     def forward(self, multimodal_params: List[MultimodalParams]) -> List[torch.Tensor]:
         mm_content_data, mm_extra_data = self._parse_and_batch_multimodal_data(multimodal_params)
@@ -1201,8 +1205,8 @@ class Qwen3VLModelBase(PreTrainedModel):
     def _check_and_adjust_experts_implementation(self, *args, **kwargs):
         """No-op override.
 
-        Transformers 5.x's ``PreTrainedModel.__init__`` calls this method
-        (with an ``experts_implementation`` argument) which fails for VL
+        Transformers 5.x's `PreTrainedModel.__init__` calls this method
+        (with an `experts_implementation` argument) which fails for VL
         wrapper models that do not directly contain MoE layers.  TRT-LLM
         manages expert implementations independently, so skip the check.
         """
@@ -1219,12 +1223,12 @@ class Qwen3VLModelBase(PreTrainedModel):
         disable_fuse_rope = kwargs.get("disable_fuse_rope", False)
         model_config.pretrained_config.disable_fuse_rope = disable_fuse_rope
         model_config.pretrained_config.text_config.disable_fuse_rope = disable_fuse_rope
-        # transformers>=5.5 flipped the ``Qwen3VL[Moe]TextConfig`` class-level
-        # default for ``tie_word_embeddings`` from inherited ``False`` to
-        # ``True``. Real checkpoints set it only on the top-level config, so
-        # the nested ``text_config`` silently picks up the new default and
+        # transformers>=5.5 flipped the `Qwen3VL[Moe]TextConfig` class-level
+        # default for `tie_word_embeddings` from inherited `False` to
+        # `True`. Real checkpoints set it only on the top-level config, so
+        # the nested `text_config` silently picks up the new default and
         # ties lm_head to embed_tokens, producing systematic logits drift.
-        # Mirror the top-level value onto ``text_config`` to stay aligned.
+        # Mirror the top-level value onto `text_config` to stay aligned.
         model_config.pretrained_config.text_config.tie_word_embeddings = (
             model_config.pretrained_config.tie_word_embeddings
         )
@@ -1246,14 +1250,14 @@ class Qwen3VLModelBase(PreTrainedModel):
         llm_model_config = copy.deepcopy(model_config)
         llm_model_config.pretrained_config = config.text_config
         # The LM's attention modules look themselves up in the global
-        # ``extra_attrs`` that ``model_engine.model_forward`` binds via
-        # ``with_model_extra_attrs(self.model.extra_attrs)`` -- the
-        # outer wrapper's dict. Without sharing, ``llm_model_config``
-        # carries a deep-copied dict, so LM ``attn_custom_op_inplace``
-        # (used under ``set_torch_compiling(True)``) fails its layer
+        # `extra_attrs` that `model_engine.model_forward` binds via
+        # `with_model_extra_attrs(self.model.extra_attrs)` -- the
+        # outer wrapper's dict. Without sharing, `llm_model_config`
+        # carries a deep-copied dict, so LM `attn_custom_op_inplace`
+        # (used under `set_torch_compiling(True)`) fails its layer
         # lookup and the piecewise-CUDA-graph dynamo trace blows up
-        # at the LM's ``o_proj`` call. Vision attention unregisters
-        # itself from this dict in ``Qwen2_5_VLVisionAttention.__init__``
+        # at the LM's `o_proj` call. Vision attention unregisters
+        # itself from this dict in `Qwen2_5_VLVisionAttention.__init__`
         # so it does not poison LM lookups.
         llm_model_config.extra_attrs = model_config.extra_attrs
         if self.original_arch == "Qwen3VLForConditionalGeneration":
@@ -1276,6 +1280,22 @@ class Qwen3VLModelBase(PreTrainedModel):
         self.deepstack_num_level = (
             len(config.vision_config.deepstack_visual_indexes) if self.use_deepstack else 0
         )
+        if self.use_deepstack:
+            # Pre-allocated `(L, max_num_tokens, hidden)` scratch buffer for
+            # per-layer deepstack embeddings; replaces `L` fresh
+            # `torch.zeros` + `L` scatters per prefill (vLLM-style).
+            # `persistent=False` keeps it out of `state_dict`.
+            self.register_buffer(
+                "deepstack_input_embeds",
+                torch.zeros(
+                    self.deepstack_num_level,
+                    model_config.max_num_tokens,
+                    config.text_config.hidden_size,
+                    device="cuda",
+                    dtype=config.text_config.torch_dtype,
+                ),
+                persistent=False,
+            )
 
         self.post_config()
 
@@ -1306,7 +1326,7 @@ class Qwen3VLModelBase(PreTrainedModel):
             mrope_section=pos_embd_params.mrope_section,
             mrope_interleaved=pos_embd_params.mrope_interleaved,
         ).to("cuda")
-    @nvtx_range("Qwen3-VL prepare_mrope_config")
+
     def prepare_mrope_config(
         self,
         multimodal_params: List[MultimodalParams],
@@ -1316,22 +1336,16 @@ class Qwen3VLModelBase(PreTrainedModel):
     ):
         mrope_config = {}
         mrope_position_deltas = []
-        # The attention kernel indexes mrope cos/sin by ``bounded_global_token_idx``
-        # (batch-flat per-token entry), so we compute cos/sin once over the
-        # whole batch's already-stitched ``position_ids`` (3, 1, total_tokens).
-        # ``position_ids`` carries per-token (T, H, W) for multimodal spans and
-        # broadcast scalars for text-only / generation tokens, so a single
-        # ``get_cos_sin`` call produces the right per-token cos/sin for every
-        # batch entry -- no per-request loop, no chunk_end_pos padding,
-        # multi-context-request safe.
+        # Attention kernel indexes mrope cos/sin by batch-flat per-token
+        # entry, so one `get_cos_sin(position_ids)` over the stitched
+        # `(3, 1, total_tokens)` covers every batch entry directly.
         if position_ids is not None \
                 and position_ids.shape[-1] > num_generation_requests:
-            with nvtx_range("Qwen3-VL get_cos_sin"):
-                cos, sin = self.rotary_emb.get_cos_sin(position_ids)
-                mrope_config["mrope_rotary_cos_sin"] = (
-                    torch.stack((cos, sin), dim=-1)
-                    .reshape(cos.shape[0], -1)
-                )
+            cos, sin = self.rotary_emb.get_cos_sin(position_ids)
+            mrope_config["mrope_rotary_cos_sin"] = (
+                torch.stack((cos, sin), dim=-1)
+                .reshape(cos.shape[0], -1)
+            )
         for multimodal_param in multimodal_params[num_context_requests:]:
             if multimodal_param.multimodal_data.get("mrope_config") is not None:
                 if (
@@ -1421,17 +1435,42 @@ class Qwen3VLModelBase(PreTrainedModel):
                 multimodal_params, num_context_requests, num_generation_requests, position_ids
             )
 
-        result = fuse_input_embeds(
+        # Prefer the indices the executor already computed (CPU-side
+        # `filter_mm_token_from_input_ids` + async H2D) and forwarded via
+        # kwargs; fall back to filtering only on engine-bypass paths
+        # (e.g., direct `forward` calls in unit tests).
+        text_token_indices = kwargs.get("text_token_indices")
+        mm_token_indices = kwargs.get("mm_token_indices")
+        if (
+            len(mm_embeds) > 0
+            and (text_token_indices is None or mm_token_indices is None)
+        ):
+            text_token_indices, mm_token_indices = filter_mm_token_from_input_ids(
+                input_ids,
+                vocab_size=self.llm.model.embed_tokens.num_embeddings,
+            )
+
+        # Expand the per-level deepstack mm embeddings into the pre-allocated
+        # `(L, max_num_tokens, H)` buffer with a single packed scatter,
+        # avoiding `L` fresh `torch.zeros` + `L` scatters inside
+        # `fuse_input_embeds`.
+        if self.use_deepstack and len(deepstack_embeds) > 0:
+            num_tokens = input_ids.shape[0]
+            deepstack_buffer = self.deepstack_input_embeds[:, :num_tokens, :]
+            deepstack_buffer.zero_()
+            packed_deepstack = torch.stack(deepstack_embeds, dim=0)
+            deepstack_buffer[:, mm_token_indices, :] = packed_deepstack.to(
+                dtype=deepstack_buffer.dtype, device=deepstack_buffer.device
+            )
+            deepstack_embeds = list(deepstack_buffer.unbind(0))
+
+        input_ids, input_embeds = fuse_input_embeds(
             self.llm.model.embed_tokens,
             input_ids,
             mm_embeds,
-            extra_embeds=deepstack_embeds,
-            **kwargs,
+            text_token_indices=text_token_indices,
+            mm_token_indices=mm_token_indices,
         )
-        if len(deepstack_embeds) > 0:
-            input_ids, input_embeds, deepstack_embeds = result
-        else:
-            input_ids, input_embeds = result
 
         output_prob = self.llm.forward(
             attn_metadata=attn_metadata,

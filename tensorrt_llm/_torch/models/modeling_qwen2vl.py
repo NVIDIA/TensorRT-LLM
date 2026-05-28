@@ -190,7 +190,7 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
         # numpy-based vectorized impl: ~2-3× faster than the torch loop
         # version on CPU since per-image/video work is small tensor
         # allocations dominated by Python+dispatch overhead. Output tensors
-        # are placed back on ``input_ids.device``.
+        # are placed back on `input_ids.device`.
         input_device = input_ids.device
         input_dtype = input_ids.dtype
         ids_np = input_ids.detach().cpu().numpy()
@@ -320,7 +320,7 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
             do_rescale = False
         if videos and isinstance(videos[0][0], torch.Tensor):
             do_rescale = False
-        # transformers 5.x's ``ProcessorMixin._merge_kwargs`` strictly
+        # transformers 5.x's `ProcessorMixin._merge_kwargs` strictly
         # validates per-modality kwargs against the processor's TypedDict.
         # Processor *output* keys (``video_grid_thw``, ``pixel_values``, ...)
         # round-trip into the validator via tokenizer ``init_kwargs`` /
@@ -381,7 +381,7 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
 
         # Text-only fast path: skip the multi-modal HF processor and call
         # the tokenizer directly (their outputs match bit-exactly when
-        # ``images`` / ``videos`` are ``None``). mrope_config still needs
+        # `images` / `videos` are `None`). mrope_config still needs
         # to be populated since the LM is M-RoPE.
         if not mm_data:
             input_ids = self.tokenizer(text_prompt,
@@ -648,16 +648,16 @@ class Qwen2_5_VLVisionAttention(Attention):
             head_dim=config.hidden_size // config.num_heads,
         )
         # Vision attention runs from the outer VL wrapper (outside the
-        # compiled LM region). When ``set_torch_compiling(True)`` is set
-        # for the LM, ``forward_impl`` would otherwise dispatch vision
-        # through ``attn_custom_op_inplace``, which looks
-        # ``attention_metadata`` up in the global ``extra_attrs`` --
-        # that slot is populated by ``model_engine.model_forward`` with
+        # compiled LM region). When `set_torch_compiling(True)` is set
+        # for the LM, `forward_impl` would otherwise dispatch vision
+        # through `attn_custom_op_inplace`, which looks
+        # `attention_metadata` up in the global `extra_attrs` --
+        # that slot is populated by `model_engine.model_forward` with
         # the LM decoder's metadata, so vision FMHA receives the LM's
         # S/num_contexts with vision's head_dim and dispatch fails
-        # (``FMHA kernels are not found ... D: <vision_head_dim>``).
-        # Unregister so ``forward_impl`` falls back to the eager path
-        # that uses vision's own ``attn_metadata``.
+        # (`FMHA kernels are not found ... D: <vision_head_dim>`).
+        # Unregister so `forward_impl` falls back to the eager path
+        # that uses vision's own `attn_metadata`.
         if self.register_to_config:
             model_config.extra_attrs.get("attn_layers", {}).pop(
                 self.layer_idx_str, None)
@@ -695,9 +695,9 @@ class Qwen2_5_VLVisionAttention(Attention):
                     err,
                 )
 
-        # cos/sin are pre-cast to ``q.dtype`` upstream (``get_rope_and_window_
-        # index_by_thw`` for Qwen2.5-VL; ``rope_cos_cache`` buffer dtype for
-        # Qwen3-VL). When that holds, ``.to(dtype=q.dtype)`` is a no-op; keep
+        # cos/sin are pre-cast to `q.dtype` upstream (`get_rope_and_window_
+        # index_by_thw` for Qwen2.5-VL; `rope_cos_cache` buffer dtype for
+        # Qwen3-VL). When that holds, `.to(dtype=q.dtype)` is a no-op; keep
         # it as a safety net for callers/quantization paths that didn't pre-cast.
         if cos.dtype != q.dtype:
             cos = cos.to(dtype=q.dtype)
@@ -708,10 +708,10 @@ class Qwen2_5_VLVisionAttention(Attention):
         v = v.view(seq_len, -1, self.head_dim)
         if _FLASH_ATTN_ROTARY_AVAILABLE:
             # flash_attn Triton kernel: single launch per tensor. cos/sin
-            # are expected as ``[seqlen, head_dim/2]``. The PyTorch path
-            # built ``RotaryEmbedding.apply_rotary_pos_emb`` with cos/sin
-            # already in that layout (see ``get_rotary_pos_emb_window_data``).
-            # The kernel takes 4D ``(batch, seq, nheads, headdim)``; add a
+            # are expected as `[seqlen, head_dim/2]`. The PyTorch path
+            # built `RotaryEmbedding.apply_rotary_pos_emb` with cos/sin
+            # already in that layout (see `get_rotary_pos_emb_window_data`).
+            # The kernel takes 4D `(batch, seq, nheads, headdim)`; add a
             # batch dim, run in-place, then drop it.
             q4 = q.unsqueeze(0)
             k4 = k.unsqueeze(0)
@@ -808,9 +808,9 @@ class Qwen2_5_VLVisionBlock(torch.nn.Module):
         position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         **kwargs,
     ) -> torch.Tensor:
-        # Collapse the post-attn residual add into ``norm2``'s residual path
-        # (``RMSNorm.forward`` with ``residual=`` uses the FlashInfer
-        # ``fused_add_rmsnorm`` kernel). Saves one ``add<c10::BFloat16>``
+        # Collapse the post-attn residual add into `norm2`'s residual path
+        # (`RMSNorm.forward` with `residual=` uses the FlashInfer
+        # `fused_add_rmsnorm` kernel). Saves one `add<c10::BFloat16>`
         # launch per vision block (= 32 launches per executor iter at
         # full-batch).
         x_attn = self.attn(
@@ -985,18 +985,18 @@ class Qwen2_5_VisionModel(torch.nn.Module):
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Tuple[int, ...]]:
         """GPU (cos_thw, sin_thw); CPU (window_index_thw, seq_lens_thw).
 
-        Cached per ``(t, h, w)``. pos_ids and window_index are built on CPU,
+        Cached per `(t, h, w)`. pos_ids and window_index are built on CPU,
         then moved to device once per unique tile. The gather
-        (``cos[pos_ids]``) and window reorder
-        (``cos_thw[window_index_thw_dev]``) run on device, so the cached
-        cos/sin tensors are already-on-device -- ``forward``'s ``torch.cat``
-        on them is a device-side cat with no H->D transfer. ``window_index``
-        stays on CPU because ``forward`` cats all per-tile window_index
+        (`cos[pos_ids]`) and window reorder
+        (`cos_thw[window_index_thw_dev]`) run on device, so the cached
+        cos/sin tensors are already-on-device -- `forward`'s `torch.cat`
+        on them is a device-side cat with no H->D transfer. `window_index`
+        stays on CPU because `forward` cats all per-tile window_index
         tensors and ships them with a single H->D transfer.
 
-        GPU memory cost (measured on H200, ``head_dim=80``,
-        ``rotary_cos_sin`` fp32; cos_thw and sin_thw each shape
-        ``(t*h*w, 2*head_dim)`` after gather+flatten+window reorder):
+        GPU memory cost (measured on H200, `head_dim=80`,
+        `rotary_cos_sin` fp32; cos_thw and sin_thw each shape
+        `(t*h*w, 2*head_dim)` after gather+flatten+window reorder):
 
           ============================  =======  =========
           tile (t, h, w)                tokens   per entry
@@ -1010,7 +1010,7 @@ class Qwen2_5_VisionModel(torch.nn.Module):
 
         Per-token cost is 640 bytes (= 2 (cos, sin) x 80 (head_dim) x 4
         bytes fp32). Typical production VLM serving has 10-30 unique tile
-        shapes, so the cache settles around 10-20 MB. ``maxsize=1024`` is
+        shapes, so the cache settles around 10-20 MB. `maxsize=1024` is
         a safety cap; reaching it requires >1024 distinct (t, h, w).
         """
         hpos_ids = torch.arange(h, dtype=torch.long).unsqueeze(1).expand(-1, w)
@@ -1029,9 +1029,9 @@ class Qwen2_5_VisionModel(torch.nn.Module):
 
         # Pos_ids -> device for the freq_table gather. rotary_cos_sin is
         # created on CUDA in RopeParams.create_rope_const_params; this is
-        # the one H->D copy per unique (t, h, w). ``async_tensor_h2d`` is
+        # the one H->D copy per unique (t, h, w). `async_tensor_h2d` is
         # the project-wide helper that guarantees pinned-host + async DMA
-        # (a bare ``.to(..., non_blocking=True)`` on pageable memory
+        # (a bare `.to(..., non_blocking=True)` on pageable memory
         # silently degrades to a staging copy).
         device = self.rotary_pos_emb.rotary_cos_sin.device
         pos_ids_dev = async_tensor_h2d(pos_ids,
@@ -1066,7 +1066,7 @@ class Qwen2_5_VisionModel(torch.nn.Module):
             -1, sin_thw.shape[-1])
 
         # Cast once (per cached (t, h, w)) to the vision-tower dtype so the
-        # per-block ``cos.to(dtype=q.dtype)`` cast in ``apply_rope`` becomes
+        # per-block `cos.to(dtype=q.dtype)` cast in `apply_rope` becomes
         # a no-op on the hot path.
         target_dtype = (
             self.model_config.pretrained_config.vision_config.torch_dtype
@@ -1123,7 +1123,7 @@ class Qwen2_5_VisionModel(torch.nn.Module):
         # window_index is built per tile on CPU (lru_cached). The cat
         # result is a fresh pageable tensor, so route the H->D copy
         # through async_tensor_h2d to land it on a pinned host buffer
-        # first -- otherwise ``non_blocking=True`` silently stages.
+        # first -- otherwise `non_blocking=True` silently stages.
         window_index = async_tensor_h2d(torch.cat(window_indices),
                                         dtype=torch.long,
                                         device=self.device)
@@ -1210,14 +1210,14 @@ class Qwen2VLModelBase(PreTrainedModel):
         llm_model_config.pretrained_config.disable_fuse_rope = disable_fuse_rope
         llm_model_config.pretrained_config.architectures = ["Qwen2ForCausalLM"]
         # The LM's attention modules look themselves up in the global
-        # ``extra_attrs`` that ``model_engine.model_forward`` binds via
-        # ``with_model_extra_attrs(self.model.extra_attrs)`` -- the
-        # outer wrapper's dict. Without sharing, ``llm_model_config``
-        # carries a deep-copied dict, so LM ``attn_custom_op_inplace``
-        # (used under ``set_torch_compiling(True)``) fails its layer
+        # `extra_attrs` that `model_engine.model_forward` binds via
+        # `with_model_extra_attrs(self.model.extra_attrs)` -- the
+        # outer wrapper's dict. Without sharing, `llm_model_config`
+        # carries a deep-copied dict, so LM `attn_custom_op_inplace`
+        # (used under `set_torch_compiling(True)`) fails its layer
         # lookup and the piecewise-CUDA-graph dynamo trace blows up
-        # at the LM's ``o_proj`` call. Vision attention unregisters
-        # itself from this dict in ``Qwen2_5_VLVisionAttention.__init__``
+        # at the LM's `o_proj` call. Vision attention unregisters
+        # itself from this dict in `Qwen2_5_VLVisionAttention.__init__`
         # so it does not poison LM lookups.
         llm_model_config.extra_attrs = model_config.extra_attrs
         self.llm = AutoModelForCausalLM.from_config(llm_model_config)
@@ -1267,15 +1267,9 @@ class Qwen2VLModelBase(PreTrainedModel):
                              position_ids: torch.Tensor):
         mrope_config = {}
         mrope_position_deltas = []
-        # The attention kernel indexes mrope cos/sin by
-        # ``bounded_global_token_idx`` (batch-flat per-token entry), so we
-        # compute cos/sin once over the whole batch's already-stitched
-        # ``position_ids`` (3, 1, total_tokens). ``position_ids`` carries
-        # per-token (T, H, W) for multimodal spans and broadcast scalars for
-        # text-only / generation tokens, so a single ``get_cos_sin`` call
-        # produces the right per-token cos/sin for every batch entry -- no
-        # per-request loop, no chunk_end_pos padding, multi-context-request
-        # safe.
+        # Attention kernel indexes mrope cos/sin by batch-flat per-token
+        # entry, so one `get_cos_sin(position_ids)` over the stitched
+        # `(3, 1, total_tokens)` covers every batch entry directly.
         if position_ids is not None \
                 and position_ids.shape[-1] > num_generation_requests:
             with nvtx_range("Qwen2.5-VL get_cos_sin"):

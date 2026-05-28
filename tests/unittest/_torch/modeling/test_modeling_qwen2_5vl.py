@@ -151,8 +151,8 @@ class TestQwen2_5_VL(TestModelingMultimodal):
             trtllm_inputs["multimodal_params"] = gen_multimodal_params_list
         else:
             # Mrope position ids. For chunked prefill / KV cache reuse we must
-            # mirror production ``PyTorchModelEngine`` behavior and slice the
-            # request's full ``mrope_position_ids`` to the current chunk's
+            # mirror production `PyTorchModelEngine` behavior and slice the
+            # request's full `mrope_position_ids` to the current chunk's
             # range -- the model now indexes mrope cos/sin by batch-flat
             # per-token index, so the position_ids tensor must contain only
             # the tokens of the current forward (chunk-local) with their
