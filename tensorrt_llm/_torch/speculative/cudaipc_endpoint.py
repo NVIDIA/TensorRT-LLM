@@ -97,6 +97,18 @@ _USE_GPU_COMPOSE = _os.environ.get("PEARL_CUDAIPC_GPU_COMPOSE", "1").strip() not
     "off",
     "",
 )
+# Stage 5 -- skip the per-send ``cudaStreamSynchronize`` after the compose
+# kernel; instead, the kernel writes the new head to a producer-local
+# GPU counter and an async D2H copy mirrors it into the pinned CPU shm
+# slot the consumer polls. Default off until benchmarked; opt in via
+# ``PEARL_CUDAIPC_ASYNC_HEAD=1`` once GPU compose (stage 3) is enabled.
+_USE_ASYNC_HEAD = _os.environ.get("PEARL_CUDAIPC_ASYNC_HEAD", "1").strip() not in (
+    "0",
+    "false",
+    "no",
+    "off",
+    "",
+)
 
 # ---------------------------------------------------------------------------
 # CUDA runtime API binding -- imported lazily so this module stays importable
@@ -251,6 +263,17 @@ class _CudaIpcBackend:
         # ``send`` to avoid stale pointers leaking to the next packet.
         self._next_gpu_compose = None  # tuple | None
         self._compose_launcher = None  # RingComposeLauncher | None
+        # Stage 5: GPU-side head counter the compose kernel writes after
+        # the slot store. An async D2H copy queued on the same stream
+        # mirrors this value into the pinned CPU shm head slot, so the
+        # producer can return from ``send`` without an explicit
+        # ``cudaStreamSynchronize``. ``_outgoing_head_value`` is the
+        # producer's local monotonically-increasing head; we only ever
+        # increment it, so it tracks the "ideal" head independent of
+        # whether the GPU has caught up.
+        self._dev_head_out: int = 0
+        self._meta_out_pinned: bool = False
+        self._outgoing_head_value: int = 0
 
         self._recv_credits = 0
         self._started = False
@@ -275,6 +298,17 @@ class _CudaIpcBackend:
             _check(status, "cudaMallocHost(recv)")
             ctypes.memset(self._pinned_send, 0, _FRAME_BYTES)
             ctypes.memset(self._pinned_recv, 0, _FRAME_BYTES)
+
+            # Stage 5: small (u64) producer-local GPU counter so the compose
+            # kernel can publish the new head value, mirrored to the CPU
+            # shm slot via an async D2H copy on the same stream. Allocated
+            # on both peers (each peer is a producer for one direction).
+            if _USE_ASYNC_HEAD:
+                status, dev_head_out = cudart.cudaMalloc(8)
+                _check(status, "cudaMalloc(gpu head)")
+                self._dev_head_out = dev_head_out
+                (status,) = cudart.cudaMemset(self._dev_head_out, 0, 8)
+                _check(status, "cudaMemset(gpu head)")
 
             if self._cfg.is_server:
                 # Allocate the two device rings on this peer's GPU.
@@ -387,6 +421,37 @@ class _CudaIpcBackend:
                 self._dev_out_is_local = False
                 self._dev_in_is_local = False
 
+            # Stage 5: pin the producer-side meta region so the async
+            # GPU->CPU head copy in send() is genuinely asynchronous. An
+            # unpinned destination forces ``cudaMemcpyAsync`` to fall back
+            # to a synchronous path, which would defeat the whole point.
+            # The shm region is backed by tmpfs (mmap'd /dev/shm), so
+            # ``cudaHostRegister`` against the memoryview's underlying
+            # address pins those pages for the producer's CUDA driver.
+            # The consumer process polls the same shm slot via normal CPU
+            # loads and doesn't need its own registration.
+            if _USE_ASYNC_HEAD and self._shm_meta_out is not None:
+                try:
+                    base_addr = ctypes.addressof(ctypes.c_uint8.from_buffer(self._shm_meta_out.buf))
+                    (status,) = cudart.cudaHostRegister(
+                        base_addr,
+                        _META_BYTES,
+                        # cudaHostRegisterDefault == 0; the shm is already
+                        # shared via the file-backed mapping, so no special
+                        # flags needed.
+                        0,
+                    )
+                    # ``cudaErrorHostMemoryAlreadyRegistered`` (712) is
+                    # benign if the region happens to be re-attached.
+                    if int(status) in (0, 712):
+                        self._meta_out_pinned = True
+                    else:
+                        # Pinning failed; the async-head path will still
+                        # work but the copy will fall back to sync.
+                        self._meta_out_pinned = False
+                except Exception:
+                    self._meta_out_pinned = False
+
             self._started = True
             return EndpointStatus.kOk
         except Exception:
@@ -472,7 +537,15 @@ class _CudaIpcBackend:
         if len(frame) != _FRAME_BYTES:
             return EndpointStatus.kInvalidPayload
 
-        head = self._meta_out.head()
+        # In async-head mode the shm head trails behind the value we
+        # actually emitted (D2H copies still in flight on the stream).
+        # ``_outgoing_head_value`` is our own monotonically-advanced
+        # counter so the slot-offset math + queue-full check stay
+        # consistent regardless of when the copy lands in shm.
+        if _USE_ASYNC_HEAD and self._meta_out_pinned and self._outgoing_head_value > 0:
+            head = self._outgoing_head_value
+        else:
+            head = self._meta_out.head()
         tail = self._meta_out.tail()
         if head - tail >= _RING_SLOTS:
             return EndpointStatus.kQueueFull
@@ -498,6 +571,15 @@ class _CudaIpcBackend:
                     self._compose_launcher = None
             if self._compose_launcher is not None:
                 try:
+                    new_head = head + 1
+                    # Stage 5: if the producer-side meta region is pinned
+                    # and the GPU head counter is allocated, hand the
+                    # pointer + new value to the kernel so the host can
+                    # skip the per-send stream sync. Otherwise fall back
+                    # to the stage-3 sync-on-each-send path.
+                    use_async = (
+                        _USE_ASYNC_HEAD and self._dev_head_out != 0 and self._meta_out_pinned
+                    )
                     self._compose_launcher.compose_and_send(
                         self._dev_out,
                         slot_offset,
@@ -510,11 +592,39 @@ class _CudaIpcBackend:
                         handoff[0],  # accepted_tokens_row_ptr
                         handoff[1],  # num_accepted_ptr
                         handoff[2],  # max_draft_len
+                        self._dev_head_out if use_async else 0,
+                        new_head if use_async else 0,
                     )
-                    (status,) = cudart.cudaStreamSynchronize(self._stream)
-                    if int(status) != 0:
-                        return EndpointStatus.kError
-                    self._meta_out.set_head(head + 1)
+                    if use_async:
+                        # Queue the GPU->host head copy on the same stream
+                        # as the kernel; the consumer's poll picks up the
+                        # new value once the copy lands, which is ordered
+                        # after the kernel's slot store.
+                        meta_head_addr = (
+                            ctypes.addressof(ctypes.c_uint8.from_buffer(self._shm_meta_out.buf))
+                            + _META_HEAD_OFFSET
+                        )
+                        (status,) = cudart.cudaMemcpyAsync(
+                            meta_head_addr,
+                            self._dev_head_out,
+                            8,
+                            cudart.cudaMemcpyKind.cudaMemcpyDeviceToHost,
+                            self._stream,
+                        )
+                        if int(status) != 0:
+                            return EndpointStatus.kError
+                        # Track the value we *intended* to publish so
+                        # subsequent send() calls compute slot_offset from
+                        # an accurate ring depth even before the async
+                        # copy lands in shm. We bypass ``_meta_out.head()``
+                        # in the read path by caching this counter; see
+                        # the head() call further up in this function.
+                        self._outgoing_head_value = new_head
+                    else:
+                        (status,) = cudart.cudaStreamSynchronize(self._stream)
+                        if int(status) != 0:
+                            return EndpointStatus.kError
+                        self._meta_out.set_head(new_head)
                     self._recv_credits -= 1
                     return EndpointStatus.kOk
                 except Exception:
@@ -681,6 +791,20 @@ class _CudaIpcBackend:
 
         # GPU pointers
         if cudart is not None:
+            if self._dev_head_out:
+                try:
+                    cudart.cudaFree(self._dev_head_out)
+                except Exception:
+                    pass
+            if self._meta_out_pinned and self._shm_meta_out is not None:
+                # Unregister the pinned shm region before closing the
+                # underlying memoryview so the driver can release its
+                # internal mapping.
+                try:
+                    base_addr = ctypes.addressof(ctypes.c_uint8.from_buffer(self._shm_meta_out.buf))
+                    cudart.cudaHostUnregister(base_addr)
+                except Exception:
+                    pass
             if self._dev_out:
                 try:
                     if self._dev_out_is_local:
@@ -714,6 +838,9 @@ class _CudaIpcBackend:
                     pass
         self._dev_out = 0
         self._dev_in = 0
+        self._dev_head_out = 0
+        self._meta_out_pinned = False
+        self._outgoing_head_value = 0
         self._pinned_send = 0
         self._pinned_recv = 0
         self._stream = 0

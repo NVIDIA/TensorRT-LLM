@@ -81,6 +81,13 @@ __global__ void pearl_write_ring_slot(
 // ``DraftApiProtocol._WIRE_STRUCT`` (LE: II BBB 5s 20I): 4-byte imm,
 // then 96-byte payload with round_seq / position / version /
 // message_type / num_tokens / 5 reserved bytes / 20 tokens.
+//
+// Stage 5: also writes ``new_head`` into ``gpu_head_ptr`` (an 8-byte
+// counter on the producer's GPU). The host issues an async D2H copy
+// from this counter to the CPU shm head field, queued on the same
+// stream as this kernel so the consumer-visible head bump is
+// guaranteed to land after the slot write -- removing the need for
+// the producer to ``cudaStreamSynchronize`` after each send.
 __global__ void pearl_compose_and_send(
     unsigned char* ring,
     int offset_bytes,
@@ -92,7 +99,9 @@ __global__ void pearl_compose_and_send(
     unsigned char num_tokens,
     const int* accepted_tokens_row,    // length >= max_draft_len
     const int* num_accepted_ptr,       // single int on GPU
-    int max_draft_len
+    int max_draft_len,
+    unsigned long long* gpu_head_ptr,  // single u64 on the producer's GPU
+    unsigned long long new_head         // value to store at gpu_head_ptr
 ) {
     if (threadIdx.x == 0 && blockIdx.x == 0) {
         // Read the last accepted token entirely on the GPU. The verify
@@ -125,6 +134,12 @@ __global__ void pearl_compose_and_send(
         }
 
         __threadfence_system();
+        // Publish the new head value last; consumer's CPU sees it via
+        // the host-side mirror copy that the caller queues on the same
+        // stream after this kernel.
+        if (gpu_head_ptr != nullptr) {
+            *gpu_head_ptr = new_head;
+        }
     }
 }
 
@@ -312,6 +327,8 @@ class RingComposeLauncher:
         "_acc_ptr",
         "_num_acc_ptr",
         "_max_draft_len",
+        "_gpu_head_ptr",
+        "_new_head",
         "_args",
     )
 
@@ -332,7 +349,12 @@ class RingComposeLauncher:
         self._acc_ptr = ctypes.c_uint64(0)
         self._num_acc_ptr = ctypes.c_uint64(0)
         self._max_draft_len = ctypes.c_int32(0)
-        self._args = (ctypes.c_void_p * 11)(
+        # Stage 5: optional GPU-side head counter that the kernel updates
+        # after the slot store. ``gpu_head_ptr == 0`` keeps the kernel's
+        # behavior backward-compatible (no head update).
+        self._gpu_head_ptr = ctypes.c_uint64(0)
+        self._new_head = ctypes.c_uint64(0)
+        self._args = (ctypes.c_void_p * 13)(
             ctypes.addressof(self._ring_arg),
             ctypes.addressof(self._off_arg),
             ctypes.addressof(self._imm),
@@ -344,6 +366,8 @@ class RingComposeLauncher:
             ctypes.addressof(self._acc_ptr),
             ctypes.addressof(self._num_acc_ptr),
             ctypes.addressof(self._max_draft_len),
+            ctypes.addressof(self._gpu_head_ptr),
+            ctypes.addressof(self._new_head),
         )
 
     def compose_and_send(
@@ -359,6 +383,8 @@ class RingComposeLauncher:
         accepted_tokens_row_ptr: int,
         num_accepted_ptr: int,
         max_draft_len: int,
+        gpu_head_ptr: int = 0,
+        new_head: int = 0,
     ) -> None:
         self._ring_arg.value = int(ring_ptr)
         self._off_arg.value = int(slot_offset)
@@ -371,6 +397,8 @@ class RingComposeLauncher:
         self._acc_ptr.value = int(accepted_tokens_row_ptr)
         self._num_acc_ptr.value = int(num_accepted_ptr)
         self._max_draft_len.value = int(max_draft_len)
+        self._gpu_head_ptr.value = int(gpu_head_ptr)
+        self._new_head.value = int(new_head)
         (status,) = self._driver.cuLaunchKernel(
             self._fn,
             1,
