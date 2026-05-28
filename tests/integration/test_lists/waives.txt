@@ -136,7 +136,6 @@ accuracy/test_llm_api_pytorch.py::TestQwen3_235B_A22B::test_fp8[throughput_laten
 accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B_Instruct_2507::test_skip_softmax_attention_4gpus[target_sparsity_0.5-fp8kv=False] SKIP (https://nvbugs/6260915)
 accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B_Instruct_2507::test_skip_softmax_attention_4gpus[target_sparsity_0.5-fp8kv=True] SKIP (https://nvbugs/6248783)
 accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B_Instruct_2507::test_skip_softmax_attention_4gpus[target_sparsity_0.9-fp8kv=False] SKIP (https://nvbugs/6260915)
-accuracy/test_llm_api_pytorch.py::TestQwen3_5_35B_A3B::test_fp8[enable_block_reuse=False] SKIP (https://nvbugs/6212252)
 accuracy/test_llm_api_pytorch.py::TestQwen3_5_397B_A17B::test_nvfp4[tep4_cutedsl] SKIP (https://nvbugs/6255417)
 accuracy/test_llm_api_pytorch.py::TestQwen3_5_9B::test_bf16[mtp_off] SKIP (https://nvbugs/6212250)
 accuracy/test_llm_api_pytorch.py::TestQwen3_5_9B::test_bf16[mtp_on] SKIP (https://nvbugs/6212250)
