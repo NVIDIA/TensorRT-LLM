@@ -834,3 +834,52 @@ def test_to_json_str_roundtrip_includes_new_inflight_batching_stats_fields():
     assert ifb_d["numQueuedGenRequests"] == 6
     assert ifb_d["numQueuedGenKvTokens"] == 2345
     assert ifb_d["numPausedKvTokens"] == 1500
+
+
+# ---------------------------------------------------------------------------
+# Iter labeling: stats.iter is stamped at batch CONSTRUCTION time in
+# _get_init_iter_stats, and _update_iter_stats must NOT overwrite it from the
+# live self.iter_counter. Under the overlap and PP schedulers _update_iter_stats
+# runs in a later loop than the one that built the batch, so re-stamping from
+# the live counter mislabels the record by 1+ iterations.
+# ---------------------------------------------------------------------------
+
+
+def test_update_iter_stats_does_not_overwrite_construction_iter():
+    """Regression guard: ``_update_iter_stats`` must not re-stamp ``stats.iter``.
+
+    Before the fix this method assigned ``stats.iter = self.iter_counter``,
+    which under the overlap and PP schedulers reflected the loop CONSUMING
+    the batch rather than the one that BUILT it — mislabeling the record by
+    1+ iterations. Construct an ``IterationStats`` with a known iter, pass it
+    through ``_update_iter_stats`` with a deliberately different live counter,
+    and confirm the construction-time stamp survives.
+    """
+    from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
+
+    fake_self = _build_fake_self(queued_items=[], iter_states={"num_ctx_tokens": 0})
+    # Live counter is several loops ahead of when the batch was built; any
+    # accidental re-stamp would surface here.
+    fake_self.iter_counter = 999
+
+    stats = IterationStats()
+    stats.inflight_batching_stats = InflightBatchingStats()
+    # Construction-time stamp (what _get_init_iter_stats would have written
+    # at iter 17, several loops ago under overlap scheduling).
+    stats.iter = 17
+
+    with patch(
+        "tensorrt_llm._torch.pyexecutor.py_executor.torch.cuda.mem_get_info",
+        return_value=(1 << 30, 1 << 30),
+    ):
+        PyExecutor._update_iter_stats(
+            fake_self,
+            stats,
+            iter_latency_ms=10.0,
+            num_completed_requests=0,
+            scheduled_batch=_StubScheduledBatch(),
+            micro_batch_id=0,
+        )
+
+    # If someone re-introduces ``stats.iter = self.iter_counter`` this becomes 999.
+    assert stats.iter == 17
