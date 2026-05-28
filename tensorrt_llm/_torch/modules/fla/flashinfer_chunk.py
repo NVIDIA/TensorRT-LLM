@@ -34,6 +34,10 @@ from typing import Optional, Tuple
 
 import torch
 
+from tensorrt_llm._torch.modules.fla.fused_state_io import (
+    gather_cast_transpose_kv_to_fp32_vk,
+    transpose_cast_scatter_fp32_vk_to_kv,
+)
 from tensorrt_llm._torch.modules.fla.l2norm import l2norm_fwd
 
 
@@ -105,13 +109,10 @@ def chunk_gated_delta_rule(
 
     # --- Step 4: gather initial state and convert layout -----------------
     # TRT-LLM stores SSM state with last two dims as (K, V); FlashInfer expects
-    # (V, K). Transpose last two dims and make contiguous so the kernel reads
-    # the buffer in the layout it expects.
-    if initial_state_indices is not None:
-        gathered_init = initial_state[initial_state_indices].to(torch.float32)
-    else:
-        gathered_init = initial_state.to(torch.float32)
-    gathered_init = gathered_init.transpose(-1, -2).contiguous()
+    # (V, K). Fuse gather + cast-to-fp32 + transpose + contiguous into a single
+    # Triton kernel so we get one HBM pass and one launch instead of three
+    # (``[indices]`` gather, ``.to(fp32)`` cast, ``.transpose.contiguous()`` copy).
+    gathered_init = gather_cast_transpose_kv_to_fp32_vk(initial_state, initial_state_indices)
 
     # --- Step 5+6: call FlashInfer with pre-allocated output/state buffers
     # FI 0.6.10 accepts `output=` / `output_state=`; pre-allocating skips its
@@ -160,15 +161,25 @@ def chunk_gated_delta_rule(
         out_state = None
 
     # --- Step 7: convert state layout back, scatter / return -----------
-    # Convert FlashInfer's (V, K) state layout back to TRT-LLM's (K, V) before
-    # scattering to the SSM pool / returning to the caller.
+    # Fuse transpose + cast (fp32 → initial_state.dtype) + optional indexed
+    # scatter into a single Triton pass, mirroring Step 4. The non-inplace
+    # branch allocates a fresh (K, V) buffer and writes every row; the inplace
+    # branch writes only the slots named by ``initial_state_indices`` and
+    # leaves the rest of ``initial_state`` untouched.
     if inplace_indexed_state_update:
-        out_state_kv = out_state.transpose(-1, -2).contiguous()
-        initial_state[initial_state_indices] = out_state_kv.to(initial_state.dtype, copy=False)
+        transpose_cast_scatter_fp32_vk_to_kv(out_state, initial_state, initial_state_indices)
         final_to_return: Optional[torch.Tensor] = None
     elif output_final_state:
-        out_state_kv = out_state.transpose(-1, -2).contiguous()
-        final_to_return = out_state_kv.to(initial_state.dtype, copy=False)
+        num_seqs_out, num_h_out, v_out, k_out = out_state.shape
+        final_to_return = torch.empty(
+            num_seqs_out,
+            num_h_out,
+            k_out,
+            v_out,
+            dtype=initial_state.dtype,
+            device=out_state.device,
+        )
+        transpose_cast_scatter_fp32_vk_to_kv(out_state, final_to_return, None)
     else:
         final_to_return = None
 

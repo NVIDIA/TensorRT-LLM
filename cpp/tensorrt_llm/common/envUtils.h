@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -152,9 +152,6 @@ bool getEnvDisaggBenchmarkGenOnly();
 
 // Whether to disable the chunked-attention in the generation phase.
 bool getEnvDisableChunkedAttentionInGenPhase();
-
-// Whether to use one block per token for MoE A2A kernels (default true).
-bool getEnvMoeA2AOneBlockPerToken();
 
 // TODO: For DEV purpose temporarily.
 // Block size (threads per block) for MoE A2A Dispatch kernels (default 256 if unset or invalid)

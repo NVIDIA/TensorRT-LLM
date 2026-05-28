@@ -6,7 +6,7 @@ context_servers:
   tensor_parallel_size: 2
   pipeline_parallel_size: 1
   moe_expert_parallel_size: 2
-  enable_attention_dp: false
+  enable_attention_dp: true
   max_num_tokens: 16640
   max_seq_len: 8232
   max_batch_size: 128
@@ -29,7 +29,7 @@ generation_servers:
   tensor_parallel_size: 2
   pipeline_parallel_size: 1
   moe_expert_parallel_size: 2
-  enable_attention_dp: false
+  enable_attention_dp: true
   max_num_tokens: 10240
   max_seq_len: 10240
   max_batch_size: 128

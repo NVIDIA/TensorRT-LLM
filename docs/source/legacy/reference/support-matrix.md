@@ -1,5 +1,9 @@
 # Support Matrix
 
+```{deprecated}
+This page is outdated and no longer maintained. Please refer to the up-to-date [Supported Models](../../models/supported-models.md) page instead.
+```
+
 TensorRT-LLM optimizes the performance of a range of well-known models on NVIDIA GPUs. The following sections provide a list of supported GPU architectures as well as important features implemented in TensorRT-LLM.
 
 ## Models (PyTorch Backend)
