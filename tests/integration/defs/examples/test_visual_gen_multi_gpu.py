@@ -33,7 +33,6 @@ from defs.examples.test_visual_gen import (
     WAN22_LPIPS_PROMPT,
     WAN22_LPIPS_SEED,
     WAN22_LPIPS_WIDTH,
-    WAN_LPIPS_THRESHOLD,
     _assert_lpips_below_threshold,
     _golden_media_path,
     _lpips_model_path,
@@ -50,6 +49,8 @@ try:
 except ImportError:
     MODULES_AVAILABLE = False
 
+# Keep it as 0.25 as the worst case scenario at NVL72 scale
+WAN_MULTI_GPU_LPIPS_THRESHOLD = 0.25
 WAN22_LPIPS_MULTI_GPU_VARIANTS = [
     ("ulysses4", {"dit_ulysses_size": 4}),
     ("cfg2_ulysses2", {"dit_cfg_size": 2, "dit_ulysses_size": 2}),
@@ -195,4 +196,4 @@ def test_wan22_t2v_lpips_against_golden_multi_gpu(tmp_path, variant_name, parall
         golden_path,
         generated_path,
     )
-    _assert_lpips_below_threshold(score, WAN_LPIPS_THRESHOLD)
+    _assert_lpips_below_threshold(score, WAN_MULTI_GPU_LPIPS_THRESHOLD)
