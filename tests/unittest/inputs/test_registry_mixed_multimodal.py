@@ -1,9 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import pytest
 import torch
 
-from tensorrt_llm.inputs.multimodal import find_mm_token_lengths
+from tensorrt_llm.inputs.multimodal import MMItemOrder, find_mm_token_lengths
 from tensorrt_llm.inputs.multimodal_data import AudioData, VideoData
 from tensorrt_llm.inputs.registry import create_input_processor_with_hash
 from tensorrt_llm.sampling_params import SamplingParams
@@ -78,6 +79,19 @@ class _FakeMixedProcessor:
 
     def get_mm_special_token_ids(self):
         return None
+
+
+def test_normalize_mm_item_order_decodes_layout_item_types():
+    assert MMItemOrder.from_raw_entries([0, 1, 2], source="layout_metadata.item_types") == [
+        ("image", 0),
+        ("video", 0),
+        ("audio", 0),
+    ]
+
+
+def test_normalize_mm_item_order_rejects_unknown_layout_item_type():
+    with pytest.raises(ValueError, match="unknown item type: 7"):
+        MMItemOrder.from_raw_entries([7], source="layout_metadata.item_types")
 
 
 def test_find_mm_token_lengths_preserves_all_modalities_and_video_audio():
