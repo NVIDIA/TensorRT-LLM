@@ -6,7 +6,12 @@
 # You may obtain a copy of the License at
 #
 # http://www.apache.org/licenses/LICENSE-2.0
-"""TensorRT-LLM PyTorch backend for the Step3p7 Flash checkpoints.
+"""TensorRT-LLM PyTorch backend for the Step3p7 Flash text decoder.
+
+This module owns the text-only causal LM plus its MTP draft layers; the
+sibling file ``modeling_step3p7vl`` (PerceptionEncoder vision tower +
+multimodal input processor + ForConditionalGeneration wrapper) builds on
+top of it for the VLM checkpoint variants.
 
 Step3p7 has three notable per-layer behaviors not shared with other models:
 
@@ -23,7 +28,8 @@ Step3p7 has three notable per-layer behaviors not shared with other models:
 Supported checkpoint variants: BF16 reference, FP8 block-scale flash, and
 NVFP4 multimodal (with text decoder under ``model.language_model.*``,
 flattened at load time). The on-disk checkpoints also carry 3 MTP layers
-(loaded when ``MTPDecodingConfig`` is enabled) and a vision tower (ignored).
+(loaded when ``MTPDecodingConfig`` is enabled) and a vision tower (ignored
+here; handled by the VLM wrapper).
 """
 
 from __future__ import annotations
@@ -1443,12 +1449,18 @@ def rewrite_mtp_weights_for_step3p7(weights, text_config: PretrainedConfig) -> i
     return rewritten
 
 
-@register_auto_model("Step3p7ForConditionalGeneration")
+@register_auto_model("Step3p5ForCausalLM")
 class Step3p7ForCausalLM(SpecDecOneEngineForCausalLM[Step3p7TextModel, PretrainedConfig]):
-    """Top-level Step3p7 text-generation entry point.
+    """Step3p7 text-only causal LM core.
 
-    The vision tower carried in the checkpoint is ignored. MTP layers are
-    loaded only when ``MTPDecodingConfig`` enables one-engine MTP.
+    Registered under ``Step3p5ForCausalLM`` (the text-config architecture);
+    the VLM entry point ``Step3p7ForConditionalGeneration`` wraps this class
+    in ``Step3p7VLForConditionalGeneration`` (see ``modeling_step3p7vl``).
+    When the wrapper sees a request without multimodal data, it delegates
+    straight here so plain text generation (GSM8K-style) keeps the original
+    behaviour.  MTP layers (45..47) are still loaded only when
+    ``MTPDecodingConfig`` enables one-engine MTP; the vision tower lives on
+    the wrapper.
     """
 
     def forward(

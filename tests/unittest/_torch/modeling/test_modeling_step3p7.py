@@ -189,8 +189,12 @@ def test_real_checkpoint_config_and_weight_accounting(
     #    The FP8 checkpoint additionally exposes FP8_BLOCK_SCALES and the TRTLLM
     #    MoE backend; the BF16 checkpoint has no quant_algo.
     from tensorrt_llm._torch.model_config import ModelConfig
-    from tensorrt_llm._torch.models import Step3p7ForCausalLM
-    from tensorrt_llm._torch.models.modeling_utils import get_model_architecture
+    from tensorrt_llm._torch.models.modeling_step3p7 import Step3p7ForCausalLM
+    from tensorrt_llm._torch.models.modeling_step3p7vl import Step3p7VLForConditionalGeneration
+    from tensorrt_llm._torch.models.modeling_utils import (
+        MODEL_CLASS_MAPPING,
+        get_model_architecture,
+    )
     from tensorrt_llm.quantization import QuantAlgo
 
     model_config = ModelConfig.from_pretrained(str(checkpoint_path), trust_remote_code=True)
@@ -208,8 +212,11 @@ def test_real_checkpoint_config_and_weight_accounting(
             f"BF16 checkpoint should not expose a quant_algo; got {model_config.quant_config.quant_algo}"
         )
 
+    # Step3p7ForConditionalGeneration is the multimodal entry point; the
+    # text-only causal LM remains reachable via "Step3p5ForCausalLM".
     model_cls, _ = get_model_architecture(pc)
-    assert model_cls is Step3p7ForCausalLM
+    assert model_cls is Step3p7VLForConditionalGeneration
+    assert MODEL_CLASS_MAPPING.get("Step3p5ForCausalLM") is Step3p7ForCausalLM
 
 
 @pytest.mark.parametrize("ckpt_path", CHECKPOINT_PATHS, ids=CHECKPOINT_IDS)
