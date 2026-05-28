@@ -529,6 +529,8 @@ class ModelLoader:
             max_seq_len=self.max_seq_len,
             moe_max_num_tokens=self.llm_args.moe_config.max_num_tokens,
             moe_load_balancer=self.llm_args.moe_config.load_balancer,
+            megamoe_max_tokens_per_rank=self.llm_args.moe_config.
+            megamoe_max_tokens_per_rank,
             lora_config=self.lora_config,
             allreduce_strategy=self.llm_args.allreduce_strategy,
             mm_encoder_only=self.llm_args.mm_encoder_only,

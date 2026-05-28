@@ -633,16 +633,25 @@ class MoeConfig(StrictBaseModel):
     """
     backend: Literal[
         "AUTO", "CUTLASS", "CUTEDSL", "WIDEEP", "TRTLLM", "DEEPGEMM",
-        "DENSEGEMM", "VANILLA", "TRITON", "MEGAMOE_DEEPGEMM"] = Field(
+        "DENSEGEMM", "VANILLA", "TRITON", "MEGAMOE_DEEPGEMM",
+        "MEGAMOE_AUTO"] = Field(
             default='AUTO',
-            description="MoE backend to use. "
-            "AUTO selects default backend based on model. It currently doesn\'t always give the best choice for all scenarios. The capabilities of auto selection will be improved in future releases."
+            description=
+            "MoE backend to use. AUTO selects default backend based on model. "
+            "MEGAMOE_AUTO picks MegaMoEDeepGemm when max_num_tokens <= megamoe_max_tokens_per_rank, else TRTLLMGenFusedMoE."
         )
 
     max_num_tokens: Optional[int] = Field(
         default=None,
         description=
         "If set, at most max_num_tokens tokens will be sent to torch.ops.trtllm.fused_moe at the same time. If the number of tokens exceeds max_num_tokens, the input tensors will be split into chunks and a for loop will be used."
+    )
+
+    megamoe_max_tokens_per_rank: int = Field(
+        default=1024,
+        description=
+        "MEGAMOE_AUTO threshold on per-rank max_num_tokens (under attention DP); at or below picks MegaMoEDeepGemm, above picks TRTLLMGenFusedMoE. "
+        "Default 1024 matches SGLang's SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK."
     )
 
     load_balancer: Optional[Union[object, str]] = Field(

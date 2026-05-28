@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 import os
-from typing import Dict, Optional, Type
+from typing import Dict, Optional, Tuple, Type
 
 import torch
 
@@ -129,6 +129,70 @@ def get_moe_cls(
                 "Falling back to CutlassFusedMoE.")
             return CutlassFusedMoE
         return MegaMoEDeepGemm
+    elif moe_backend.upper() == "MEGAMOE_AUTO":
+        # Pick MegaMoE for small per-rank batches (large DG num_experts_per_wave),
+        # TRTLLM-gen above the threshold. Disagg picks correctly per-worker via max_num_tokens.
+        threshold = getattr(model_config, "megamoe_max_tokens_per_rank", 1024)
+        per_rank_max = getattr(model_config, "max_num_tokens", None) or 0
+        prefer_mega = per_rank_max > 0 and per_rank_max <= threshold
+
+        # Mirrors the MEGAMOE_DEEPGEMM gate: quant, SM, bundled DG surface.
+        def _mega_capable() -> Tuple[bool, Optional[str]]:
+            if quant_config is None or not quant_config.quant_mode.has_w4a8_mxfp4_mxfp8(
+            ):
+                return False, "quant != W4A8_MXFP4_MXFP8"
+            pretrained = model_config.pretrained_config
+            pretrained_dtype = (getattr(pretrained, "torch_dtype",
+                                        torch.bfloat16)
+                                if pretrained is not None else torch.bfloat16)
+            pretrained_inter = None
+            if pretrained is not None:
+                pretrained_inter = getattr(pretrained, "moe_intermediate_size",
+                                           None)
+                if pretrained_inter is None:
+                    pretrained_inter = getattr(pretrained, "intermediate_size",
+                                               None)
+            return MegaMoEDeepGemm.can_implement(
+                QuantAlgo.W4A8_MXFP4_MXFP8,
+                dtype_activation=pretrained_dtype,
+                swiglu_gptoss_style=False,
+                hidden_size=getattr(pretrained, "hidden_size", None)
+                if pretrained is not None else None,
+                intermediate_size=pretrained_inter,
+            )
+
+        def _trtllm_gen_capable():
+            # Mirror the TRTLLM branch above's quant gate.
+            return quant_config is not None and (
+                quant_config.quant_mode.has_fp8_block_scales()
+                or quant_config.quant_mode.has_nvfp4()
+                or quant_config.quant_mode.has_w4a16_mxfp4()
+                or quant_config.quant_mode.has_w4a8_nvfp4_fp8()
+                or quant_config.quant_mode.has_w4a8_mxfp4_fp8()
+                or quant_config.quant_mode.has_w4a8_mxfp4_mxfp8())
+
+        if prefer_mega:
+            ok, reason = _mega_capable()
+            if ok:
+                logger.info(f"MEGAMOE_AUTO: max_num_tokens={per_rank_max} <= "
+                            f"megamoe_max_tokens_per_rank={threshold}, "
+                            f"selecting MegaMoEDeepGemm.")
+                return MegaMoEDeepGemm
+            logger.warning(
+                f"MEGAMOE_AUTO preferred MegaMoEDeepGemm "
+                f"(max_num_tokens={per_rank_max} <= {threshold}) but "
+                f"backend rejected current environment: {reason}. "
+                "Falling through to TRTLLMGenFusedMoE / CutlassFusedMoE.")
+        else:
+            logger.info(f"MEGAMOE_AUTO: max_num_tokens={per_rank_max} > "
+                        f"megamoe_max_tokens_per_rank={threshold}, "
+                        f"selecting TRTLLMGenFusedMoE.")
+        if _trtllm_gen_capable():
+            return TRTLLMGenFusedMoE
+        logger.warning(
+            "MEGAMOE_AUTO: TRTLLMGenFusedMoE rejected current quant "
+            f"config: {quant_config}. Falling back to CutlassFusedMoE.")
+        return CutlassFusedMoE
     else:
         raise ValueError(f"Unsupported moe backend: {moe_backend}")
 

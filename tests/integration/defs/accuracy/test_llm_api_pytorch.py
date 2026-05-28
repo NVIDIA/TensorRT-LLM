@@ -3791,6 +3791,7 @@ class TestDeepSeekV4Flash(LlmapiAccuracyTestHarness):
             )),
         "TRTLLM",
         "MEGAMOE_DEEPGEMM",
+        "MEGAMOE_AUTO",
     ])
     def test_nvfp4_4gpus_static_eplb(self, moe_backend):
         eplb_config = _make_deepseekv4_eplb_config(self.MODEL_PATH,

@@ -128,6 +128,9 @@ class ModelConfig(Generic[TConfig]):
     moe_max_num_tokens: Optional[int] = None
     moe_load_balancer: Optional[MoeLoadBalancerConfig] = None
 
+    # MEGAMOE_AUTO threshold on per-rank max_num_tokens.
+    megamoe_max_tokens_per_rank: int = 1024
+
     attn_backend: str = 'TRTLLM'
     moe_backend: str = 'CUTLASS'  # options can be CUTLASS, TRTLLM
     # IF true, disables FC2+finalize fusion in CUTLASS MoE backend
