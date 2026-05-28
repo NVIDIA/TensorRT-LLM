@@ -13,15 +13,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from functools import cache
 import math
+from functools import cache
 from typing import Dict, NamedTuple, Optional
 
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from transformers import ParakeetEncoder as HFParakeetEncoder
 from transformers import ParakeetEncoderConfig, PretrainedConfig
 from transformers.activations import ACT2FN
 from transformers.audio_utils import mel_filter_bank
