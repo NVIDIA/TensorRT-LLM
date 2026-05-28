@@ -2169,27 +2169,3 @@ def scan_fp8_scale_inv_tensors(checkpoint_dir: str):
                         "shape": tuple(t.shape),
                     }
     return missing
-
-
-__all__ = [
-    "Step3p7ForCausalLM",
-    "Step3p7TextModel",
-    "Step3p7Attention",
-    "Step3p7MoE",
-    "Step3p7MoeRoutingMethod",
-    "Step3p7DecoderLayer",
-    "Step3p7MTP",
-    "Step3p7MTPHead",
-    "_mirror_step3p7_text_aliases",
-    "_layer_attention_type",
-    "_layer_query_heads",
-    "_layer_kv_heads",
-    "_layer_rope_theta",
-    "_layer_partial_rotary",
-    "_is_moe_layer",
-    "rewrite_mtp_weights_for_step3p7",
-    "rewrite_language_model_keys",
-    "scan_fp8_scale_inv_tensors",
-    "split_stacked_moe_weights",
-    "strip_language_model_prefix_from_exclude_modules",
-]

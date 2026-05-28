@@ -50,6 +50,7 @@ The following is a table of supported models for the PyTorch backend:
 | `SeedOssForCausalLM` [^5]            | Seed OSS, Seed-Coder               | `ByteDance-Seed/Seed-OSS-36B-Instruct`       |
 | `SkyworkR1V2ForConditionalGeneration` [^5] | Skywork R1V2, Skywork SWE    | `Skywork/Skywork-R1V2-38B`                   |
 | `SmolLM3ForCausalLM` [^5]            | SmolLM3                            | `HuggingFaceTB/SmolLM3-3B`                   |
+| `Step3p7ForConditionalGeneration` [^8]| Step-3.7-Flash                    | `stepfun-ai/Step-3.7-Flash`                  |
 
 
 ## Model-Feature Support Matrix (Key Models)
@@ -69,6 +70,7 @@ Note: Support for other models may vary. Features marked "N/A" are not applicabl
 | `Glm4MoeLiteForCausalLM` [^5]    | Yes               | Yes        | Untested                   | Untested              | Yes             | No  | No               | No                | No     | Yes           | Untested         | Untested       | N/A                      | Untested              | Untested        |
 | `NemotronHForCausalLM` (Super)   | Yes               | Yes        | Untested                   | Untested              | Yes             | Yes | No               | No                | No     | Yes           | Yes              | Untested       | N/A                      | Untested              | Untested        |
 | `Gemma4ForConditionalGeneration` | Untested          | Yes        | Untested                   | No                    | Yes             | No  | No               | No                | No     | Yes           | Untested         | No             | Yes                      | Untested              | Untested        |
+| `Step3p7ForConditionalGeneration`| Yes               | Yes        | Yes                        | Untested              | Untested        | Yes | No               | No                | No     | Yes           | Untested         | Untested       | Yes                      | Untested              | Untested        |
 
 [^1]: Chunked Prefill for MLA can only be enabled on SM100/SM103.
 [^2]: KV cache reuse for MLA can only be enabled on SM90/SM100/SM103 and in BF16/FP8 KV cache dtype.
@@ -76,6 +78,7 @@ Note: Support for other models may vary. Features marked "N/A" are not applicabl
 [^5]: Supported via the [AutoDeploy](../features/auto_deploy/auto-deploy.md) backend. See [AD Configs](../../../examples/auto_deploy/model_registry/configs).
 [^6]: Also supports text-only inference via the [AutoDeploy](../features/auto_deploy/auto-deploy.md) backend.
 [^7]: Text-only support via the [AutoDeploy](../features/auto_deploy/auto-deploy.md) backend.
+[^8]: Text-only support; the multimodal NVFP4 checkpoint loads the text decoder while the vision tower is ignored.
 [^9]: Audio modality only supported on E2B/E4B variants.
 
 # Multimodal Feature Support Matrix (PyTorch Backend)
