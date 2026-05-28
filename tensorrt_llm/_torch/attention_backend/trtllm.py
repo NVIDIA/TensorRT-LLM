@@ -1718,6 +1718,10 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         )
         assert not metadata.is_cross, "TRT-LLM Attention does not support cross attention yet."
 
+        if forward_args.multi_item_part_lens is not None:
+            raise ValueError(
+                "TRT-LLM Attention does not support multi-item scoring")
+
         # SM90 forces ``use_paged_context_fmha`` on for correctness
         # (https://nvbugs/5624818).
         if get_sm_version() == 90:

@@ -4388,7 +4388,8 @@ class PyTorchModelEngine(ModelEngine):
     @torch.inference_mode()
     @with_model_extra_attrs(lambda self: self.model.extra_attrs)
     @nvtx_range("encoder_forward")
-    def encoder_forward(self, inputs: Dict[str, Any]) -> Dict[str, Any]:
+    def encoder_forward(self, inputs: Dict[str, Any],
+                        **kwargs) -> Dict[str, Any]:
         """Direct tensor-level forward for encode-only path.
 
         Bypasses ScheduledRequests/LlmRequest entirely. Takes a raw inputs
@@ -4421,32 +4422,32 @@ class PyTorchModelEngine(ModelEngine):
                 padded_inputs,
                 attn_metadata=graph_attn_metadata,
                 padded_num_tokens=key[1] if key is not None else None)
+            forward_kwargs = {
+                "gather_ids": None,
+                "gather_context_logits": False,
+                **kwargs,
+            }
 
             with with_shared_pool(
                     self.encoder_cuda_graph_runner.get_graph_pool()):
                 if key is None:
                     with MoeLoadBalancerIterContext(moe_load_balancer):
                         # Eager path — no graph for this bucket.
-                        return self._forward_step(model_inputs,
-                                                  gather_ids=None,
-                                                  gather_context_logits=False)
+                        return self._forward_step(model_inputs, **forward_kwargs)
 
                 if self.encoder_cuda_graph_runner.needs_capture(key):
 
                     def forward_fn(
-                            capture_inputs: Dict[str, Any]) -> Dict[str, Any]:
+                            capture_inputs: Dict[str, Any], **forward_kwargs) -> Dict[str, Any]:
                         with MoeLoadBalancerIterContext(moe_load_balancer):
-                            return self._forward_step(
-                                capture_inputs,
-                                gather_ids=None,
-                                gather_context_logits=False)
+                            return self._forward_step(capture_inputs, **forward_kwargs)
 
                     self.encoder_cuda_graph_runner.capture(
-                        key, forward_fn, model_inputs)
+                        key, forward_fn, model_inputs, **forward_kwargs)
 
                 with MoeLoadBalancerIterContext(moe_load_balancer):
                     graph_outputs = self.encoder_cuda_graph_runner.replay(
-                        key, model_inputs)
+                        key, model_inputs, **forward_kwargs)
 
             # Return a clone to avoid sharing data_ptr with the static buffers.
             outputs = {}
