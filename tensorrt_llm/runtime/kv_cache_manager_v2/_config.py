@@ -223,6 +223,12 @@ class KVCacheManagerConfig:
     layer groups.
     """
 
+    initial_pool_ratio: list[float] | None = None
+    """
+    User-provided initial memory partitioning between pool groups. When set, this
+    takes precedence over typical_step and constraints for initial sizing.
+    """
+
     ssm_reuse_interval: int = 512
     """
     Interval (in tokens) at which SSM state is snapshotted for prefix reuse.

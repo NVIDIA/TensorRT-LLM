@@ -171,6 +171,7 @@ class KVCacheManagerConfig:
     enable_partial_reuse: bool = True
     constraints: list[BatchDesc] = ...
     typical_step: BatchDesc | None = None
+    initial_pool_ratio: list[float] | None = None
     ssm_reuse_interval: int = 512
     swa_scratch_reuse: SwaScratchReuseConfig | None = None
     enable_stats: bool = True
