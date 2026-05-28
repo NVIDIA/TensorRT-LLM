@@ -12,31 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""GVR (Guess-Verify-Refine) heuristic Top-K kernel — cuTe DSL port for
-Blackwell sm_100.
+"""GVR (Guess-Verify-Refine) heuristic Top-K kernel using cuTe DSL on Blackwell sm_100.
 
-Drop-in alternative to ``torch.ops.trtllm.indexer_topk_decode`` (CUDA
-``heuristicTopKMultiRowKernel``). Single CTA per row, block size 512,
-preIdxOffset = (row_idx % next_n) + 1 (V3.2 decode semantics).
+Supported (dtype, K): fp32/bf16/fp16 x 512/1024/2048.
 
-Supported (dtype, K): fp32/bf16/fp16 × 512/1024/2048.
-
-
-TODO:
-1. 对齐cuda gvr的性能：看看有那里的实现，没对齐？
-=》 check sass. 找差异.
-(1) check instructions: ldg, stg, sts, lds...
-(2) check smem usage.
-(3) check register usage.
-
-After aligned, next, continue to tune:
-1. why use fp32 even for half-prec? I think we can use dtype for all.
-2. tune num_threads_per_block.
-3. optimize smem_ptcnt.
-4. tune vec_size: 128->256.
-5. block prefix sum parallelization.
-6. fmin/fmax有向量化指令吗？如果有，可以向量化。
-7.
+TODO: could see if smem_ptcnt part and fmin/fmax vectorization could be improved.
 """
 
 from dataclasses import dataclass
@@ -62,9 +42,7 @@ def _fmin_f32_inline(a, b):
 
     cuTe DSL has cute.arch.fmax but NOT cute.arch.fmin; the canonical
     workaround `-fmax(-a, -b)` lowers to a 3-instruction sequence
-    (FADD R, RZ, -a; FADD R, RZ, -b; FMNMX R, ...; FADD R, RZ, -R).
-    Per phase-resolved hotspot analysis 2026-05-11
-    (.perfbot/learnings/20260511T150703-agent.yaml F004), this pattern
+    (FADD R, RZ, -a; FADD R, RZ, -b; FMNMX R, ...; FADD R, RZ, -R). This pattern
     is concentrated in block_fused_snap_iter's inner loop and accounts
     for ~8-10 us of the cuTe vs prod GVR gap at fp32 K=2048 BS=1.
     """
@@ -82,7 +60,7 @@ def _fmin_f32_inline(a, b):
 
 
 # =============================================================================
-# GvrParams<T, K> — mirror heuristic_topk.cuh:209-285
+# GvrParams<T, K> — parameters for different (dtype, K, compress_ratio) combinations.
 # =============================================================================
 
 
@@ -104,7 +82,7 @@ class GvrParams:
         across cr (V4 doesn't natively use K=2048; values reused for safety).
         """
         TABLE = {
-            # --- cr = 1 (DSv3.2): pre-#14413, tuned on V3.2 swe-bench data ---
+            # --- cr = 1 (DSv3.2): tuned on V3.2 swe-bench data ---
             ("float32", 512, 1): GvrParams(kFTarget=384, kC=5120, kNumBins=1024),
             ("float32", 1024, 1): GvrParams(kFTarget=2560, kC=5120, kNumBins=1024),
             ("float32", 2048, 1): GvrParams(kFTarget=3072, kC=6144, kNumBins=2048),
@@ -114,7 +92,7 @@ class GvrParams:
             ("float16", 512, 1): GvrParams(kFTarget=384, kC=5120, kNumBins=512),
             ("float16", 1024, 1): GvrParams(kFTarget=2560, kC=5120, kNumBins=1024),
             ("float16", 2048, 1): GvrParams(kFTarget=4096, kC=5120, kNumBins=2048),
-            # --- cr = 4 (DSv4): post-#14413, tuned on V4 Flash/Pro swe-bench data ---
+            # --- cr = 4 (DSv4): tuned on V4 Flash/Pro swe-bench data ---
             ("float32", 512, 4): GvrParams(kFTarget=512, kC=5120, kNumBins=1024),
             ("float32", 1024, 4): GvrParams(kFTarget=1024, kC=5120, kNumBins=1024),
             ("float32", 2048, 4): GvrParams(kFTarget=3072, kC=6144, kNumBins=2048),
@@ -131,25 +109,22 @@ class GvrParams:
         return TABLE[key]
 
 
-# =============================================================================
-# GvrTopKKernel — class-based cuTe DSL kernel matching TRTLLM idiom
-# =============================================================================
-
-
 class GvrTopKKernel:
-    """GVR (Guess-Verify-Refine) heuristic top-K kernel, cuTe DSL port.
+    """GVR (Guess-Verify-Refine) heuristic top-K kernel using cuTe DSL.
 
-    One CTA per row (matches CUDA heuristicTopKMultiRowKernel BS=1 semantics).
-    Block size = 512, smem region sized to GvrParams<dtype, top_k>.
+    One CTA processes one row.
+    Block size = 512/1024, as specified by num_threads.
+    Smem region sized to GvrParams<dtype, top_k>.
 
-    Algorithm phases (mirror heuristic_topk.cuh:627-1192):
+    Algorithm phases:
       P1: preIdx Min/Max/Mean → initial threshold
       P2: Secant threshold search loop (count-only)
       P3: Ballot-free candidate collect into smem keys[]/vals[]
       P4: Histogram snap (cand → exact top-K) + writeback
 
-    Production-path semantics: preIdxOffset = (row_idx % next_n) + 1
-    (V3.2 decode +1 temporal shift; see heuristicTopKDecode.cu:89-93).
+    For different compress_ratio:
+      cr = 1: preIdxOffset = (row_idx % next_n) + 1. V3.2 decode +1 temporal shift.
+      cr = 4: preIdxOffset = 0. V4 decode no temporal shift.
     """
 
     def __init__(
@@ -166,7 +141,7 @@ class GvrTopKKernel:
         enable_warp_parallel_reduce: Optional[bool] = None,
         compress_ratio: int = 1,
     ):
-        # cutlass.Numeric enum: cutlass.Float32 / cutlass.BFloat16 / cutlass.Float16
+        # e.g., dtype = cutlass.Float32 / cutlass.BFloat16 / cutlass.Float16
         self.dtype = dtype
         self.top_k = top_k
         self.next_n = next_n
@@ -176,12 +151,11 @@ class GvrTopKKernel:
         #   4 → DSv4 (overlap compressor); logits / preIdx live in compressed-
         #       token-index space. New compressed entries are appended at the
         #       end so prev-step indices remain valid as-is → preIdxOffset = 0.
-        # Mirror heuristicTopKDecode.cu PR #14219 cr-aware branch.
         assert compress_ratio in (1, 4), (
             f"compress_ratio must be 1 (V3.2) or 4 (V4); got {compress_ratio}"
         )
         self.compress_ratio = compress_ratio
-        # WARP_SIZE = 32 is a hardware constant on all NVIDIA GPUs.
+
         self.WARP_SIZE = 32
         self.num_threads = num_threads
         self.num_warps = num_threads // self.WARP_SIZE
@@ -248,24 +222,24 @@ class GvrTopKKernel:
         self.kNumBins = params.kNumBins
         self.kFTarget = params.kFTarget
 
-        # Kernel-wide constants (consolidated from former module-level scope).
-        # self.MAX_REFINE_ITERS: Phase-2 secant refine iteration cap (mirror
-        # heuristic_topk.cuh:158). self.FLT_MAX / self.NEG_FLT_MAX: fp32 IEEE-754 max /
-        # negative-max sentinels used as reduction identities and pad values.
+        # Kernel-wide constants.
+        # self.MAX_REFINE_ITERS: Phase-2 secant refine iteration cap.
+        # self.FLT_MAX / self.NEG_FLT_MAX: fp32 IEEE-754 max / negative-max
+        # sentinels used as reduction identities and pad values.
         self.MAX_REFINE_ITERS = 15
         self.FLT_MAX = 3.4028235e38
         self.NEG_FLT_MAX = -self.FLT_MAX
 
     # ------------------------------------------------------------------
-    # Build a 128-bit copy atom for the input scan loops. With
+    # Build a vectorized copy atom for the input scan loops. With
     # use_constant_hint=True we use CopyG2ROp+invariant to get
-    # LDG.E.*.CONSTANT (read-only cache, matches CUDA __ldg). Defined as
+    # xxx.E.*.CONSTANT (read-only cache, matches CUDA __ldg). Defined as
     # a plain Python method (not @cute.jit) so the if-else branches both
     # bind copy_atom in the same trace scope.
     # ------------------------------------------------------------------
     def _make_load_copy_atom(self):
         # num_bits_per_copy matches self.vec_bits (128 default; 256 when
-        # use_256bit_load=True) so cute emits LDG.E.128 or LDG.E.256 per copy.
+        # use_256bit_load=True).
         if self.use_constant_hint:
             return cute.make_copy_atom(
                 cute.nvgpu.CopyG2ROp(),
@@ -280,8 +254,7 @@ class GvrTopKKernel:
         )
 
     # ------------------------------------------------------------------
-    # Input load helper — casts to fp32 regardless of input dtype.
-    # Mirrors CUDA's Trait::to_fp32 pattern (heuristic_topk.cuh:74-153).
+    # Input load helper — casts to fp32 regardless of self.dtype.
     # ------------------------------------------------------------------
     @cute.jit
     def _load_fp32(self, ptr_view, idx):
@@ -293,14 +266,8 @@ class GvrTopKKernel:
             return cutlass.Float32(v)
 
     # ------------------------------------------------------------------
-    # Warp-level reductions (mirror heuristic_topk.cuh:336-398)
+    # Warp-level reductions
     #
-    # Use cute.arch.warp_redux_sync — direct map to PTX redux.sync (sm_80+
-    # for int32, sm_100 hardware for fp32). NCU on 2026-05-11 showed the
-    # generic cute.arch.warp_reduction_{sum,max} lower to SHFL.BFLY 5-step
-    # tree, not REDUX — accounting for ~29% (~7.7 us) of the cuTe vs CUDA
-    # gap at K=2048 fp32 BS=1. warp_redux_sync emits redux.sync directly
-    # (see cutlass/cute/arch/nvvm_wrappers.py:1611).
     # ------------------------------------------------------------------
     @cute.jit
     def warp_reduce_sum_i32(self, val):
@@ -309,31 +276,28 @@ class GvrTopKKernel:
 
     @cute.jit
     def warp_reduce_sum_f32(self, val):
-        # PTX redux.sync has no fadd — keep shfl-tree fallback.
+        # PTX redux.sync has no fadd.
+        # will lower to SHFL.BFLY 5-step tree.
         return cute.arch.warp_reduction_sum(val)
 
     @cute.jit
     def warp_reduce_min_f32(self, val):
-        # PTX redux.sync.fmin.f32 (sm_100). Single instruction; supersedes
-        # the prior negation trick (-warp_reduction_max(-val)) which lowered
-        # to 5x SHFL.BFLY + 2x FNEG.
+        # PTX redux.sync.fmin.f32 (sm_100).
         return cute.arch.warp_redux_sync(val, "fmin")
 
     @cute.jit
     def warp_reduce_max_f32(self, val):
-        # PTX redux.sync.fmax.f32 (sm_100). Supersedes warp_reduction_max
-        # (shfl tree) lowering.
+        # PTX redux.sync.fmax.f32 (sm_100).
         return cute.arch.warp_redux_sync(val, "fmax")
 
     # ------------------------------------------------------------------
-    # Phase 1: preIdx Min/Max/Mean → initial threshold
-    # CUDA source: heuristic_topk.cuh:645-714
+    # Phase 1: preIdx Min/Max/Mean -> initial threshold
     # ------------------------------------------------------------------
     @cute.jit
     def phase1_preidx_stats(
         self,
         input_row,  # cute.Tensor [N] fp32 (post-cast for half-prec)
-        N,
+        N,  # length of input_row
         pre_idx_row,  # cute.Tensor [M] int32
         pre_idx_count,
         pre_idx_offset,
@@ -509,8 +473,6 @@ class GvrTopKKernel:
 
     # ------------------------------------------------------------------
     # block_count_ge — Phase 2 / Phase 3 GE-count over global input
-    # CUDA source: heuristic_topk.cuh:400-429 (blockCountGE)
-    #
     # Per-thread accumulate (4-element strided), cache to smem_ptcnt[tid]
     # for P3 reuse, warp-reduce, block-reduce → s_iscalars[0] = cand_count.
     # ------------------------------------------------------------------
@@ -518,7 +480,7 @@ class GvrTopKKernel:
     def block_count_ge(
         self,
         input_row,  # cute.Tensor [N] fp32
-        N,
+        N,  # length of input_row
         threshold,  # cutlass.Float32 scalar
         smem_ptcnt,  # cute.Tensor [BLOCK_SIZE] int32 (P3 cache)
         smem_wcnt,  # cute.Tensor [NUM_WARPS] int32 (block reduce scratch)
@@ -529,39 +491,15 @@ class GvrTopKKernel:
     ):
         """Count input[i] >= threshold across N elements.
 
-        Vectorized: each thread loads 128-bit per iter (4 fp32 / 8 bf16 / 8 fp16)
-        via cute.copy + CopyUniversalOp. Mirrors CUDA GVR's float4 / int4 LDG.128
-        pattern (heuristic_topk.cuh:407 / :524). Falls back to scalar tail for
-        the N-mod-vec_w remainder.
+        Vectorized: each thread loads vec_w-bit per iter (e.g., 128 bits loading 4 fp32 / 8 bf16 / 8 fp16)
+        via cute.copy + CopyUniversalOp. Falls back to scalar tail for the N-mod-vec_w remainder.
         """
         num_threads = cutlass.const_expr(self.num_threads)
-        # Vec width = (128 or 256) / dtype_bits, controlled by use_256bit_load
         vec_w = cutlass.const_expr(self.vec_bits // self.dtype.width)
         elem_bytes = cutlass.const_expr(self.dtype.width // 8)
-        vec_align = cutlass.const_expr(self.vec_align_bytes)  # 16 or 32
+        vec_align = cutlass.const_expr(self.vec_align_bytes)
         c = cutlass.Int32(0)
-
-        # Vectorized main loop using cute.copy. use_constant_hint=True
-        # switches to CopyG2ROp+invariant which emits SASS LDG.E.*.CONSTANT
-        # (read-only data cache, matches CUDA __ldg).
         copy_atom = self._make_load_copy_atom()
-
-        # 4-way unrolled fast path: issue 4 independent LDG.E.128 per round
-        # to engage LSU pipelining. Mirrors nvcc/ptxas auto-partial-unroll
-        # on the CUDA side (LDG.E.128.CONSTANT R8/R12/R16/R20 with
-        # +0x2000/+0x4000/+0x6000 strides).
-        #
-        # Strided-layout trick: instead of 4 separate cute.make_ptr calls
-        # (which produce 4 independent base registers in SASS), use a
-        # single base ptr + (UNROLL, vec_w) layout with stride=(step, 1).
-        # cute can then emit 4 LDG.E.128 sharing one base register with
-        # constexpr immediate offsets — matching the CUDA SASS pattern.
-        # UNROLL = 4 / UNROLL_MID = 2 — only referenced in commented-out
-        # manual-unroll code below; the active path uses cutlass.range(unroll=4).
-        # Unrolling switches (read from self, set in __init__). Both gates
-        # are Python-level (NOT cutlass.const_expr) so when disabled the
-        # entire code block is invisible to cute's IR — no reg pressure or
-        # SASS bloat. See __init__ docstring for default policy.
 
         step_elem = cutlass.const_expr(num_threads * vec_w)
 
@@ -576,7 +514,7 @@ class GvrTopKKernel:
             # Each loop body loads 1 vec_w chunk; LLVM unrolls 4 iters at IR
             # level. After unroll, GVN/CSE has one common base ptr in scope and
             # MAY fold the 4 derived addresses into shared base + immediate
-            # offsets (matching CUDA's LDG.E.128 [base+0x2000/0x4000/0x6000]).
+            # offsets, e.g., loading from [base+0x2000/0x4000/0x6000]).
             # =================================================================
             rng_frag = cute.make_fragment((vec_w,), self.dtype)
             # Number of complete vec_w-aligned loads this thread can do:
@@ -652,8 +590,7 @@ class GvrTopKKernel:
 
         # Block aggregate (sum reduce over num_warps slots). No trailing
         # barrier: caller is expected to insert its own __syncthreads after
-        # its post-processing of cand_count, matching CUDA blockCountGE
-        # (heuristic_topk.cuh:413-441 — no sync at function end).
+        # its post-processing of cand_count.
         if cutlass.const_expr(self.enable_warp_parallel_reduce):
             # NEW: warp-parallel sum reduce in warp 0.
             if warp_id == cutlass.Int32(0):
@@ -673,8 +610,6 @@ class GvrTopKKernel:
 
     # ------------------------------------------------------------------
     # Phase 2: Secant-interpolation threshold search
-    # CUDA source: heuristic_topk.cuh:716-810
-    #
     # Refines threshold to bring cand_count into [kK, kCC] using secant
     # interpolation on (val_lo, cnt_lo) / (val_hi, cnt_hi). At most
     # self.MAX_REFINE_ITERS iterations.
@@ -704,7 +639,7 @@ class GvrTopKKernel:
 
         # ---- Initial count with the Phase-1 mean as threshold ----
         # TODO: smem_ptcnt is not always needed? only for the last block_count_ge.
-        # Do we have methods to reduce its write.
+        # Do we have methods to reduce its write?
         thr_init = s_thr[0]
         self.block_count_ge(
             input_row,
@@ -735,12 +670,6 @@ class GvrTopKKernel:
         cute.arch.barrier()
 
         # ---- Secant refinement loop ----
-        # Runtime `while` with `done` check in the loop condition, matching
-        # CUDA's `for(iter; iter < self.MAX_REFINE_ITERS; iter++) { if(done) break; }`
-        # (heuristic_topk.cuh:683-743). Previous Python-unrolled `for it in
-        # range(15)` ran the guard check for all 15 unrolled bodies even
-        # when the kernel converged at iter 3, wasting ~12 LDS+ICMP+branch
-        # per kernel call.
         it = cutlass.Int32(0)
         while it < cutlass.Int32(self.MAX_REFINE_ITERS) and s_iscalars[1] == cutlass.Int32(0):
             # tid==0 computes new threshold via secant interpolation.
@@ -822,8 +751,6 @@ class GvrTopKKernel:
 
     # ------------------------------------------------------------------
     # Phase 3: Ballot-free candidate collect
-    # CUDA source: heuristic_topk.cuh:813-912
-    #
     # If P2 ended with done=2 (bracket exhausted), first run a retry-shrink
     # loop (≤10 iters) to bring cand_count <= kCC.
     # Then reuse cached smem_ptcnt → warp prefix sum → block prefix sum
@@ -877,9 +804,7 @@ class GvrTopKKernel:
             cute.arch.barrier()
 
             # 10-iter retry-shrink. Runtime while with `cand_count > kCC` in the
-            # loop condition (matches CUDA `for(retry; retry<10 && cand>kCC;)`
-            # at heuristic_topk.cuh:769). Previous `for rs in range(10)` Python
-            # unroll ran 10 guard checks even after early convergence.
+            # loop condition.
             rs = cutlass.Int32(0)
             while rs < cutlass.Int32(10) and s_iscalars[0] > cutlass.Int32(kCC):
                 if tidx == 0:
@@ -916,13 +841,9 @@ class GvrTopKKernel:
         my_total_qual = smem_ptcnt[tidx]
         tp = my_total_qual
 
-        # TODO: optimize this. using mindy's block prefix sum.
         # 5-level shfl_up_sync inclusive scan within warp.
         for off_i in cutlass.range_constexpr(5):
             off_v = cutlass.const_expr(1 << off_i)
-            # NOTE: mask_and_clamp=0 matches CUDA __shfl_up_sync semantics
-            # (cuTe DSL default is 31 which makes shfl.up always return own
-            # value, breaking the prefix sum). See SESSION_LOG session 4.
             other = cute.arch.shuffle_sync_up(tp, off_v, mask_and_clamp=0)
             if lane >= cutlass.Int32(off_v):
                 tp = tp + other
@@ -961,24 +882,16 @@ class GvrTopKKernel:
 
         # Each thread's write base = warp-prefix + intra-warp exclusive offset.
         my_base = smem_wcnt[warp_id]
-        # TODO: 这块的逻辑没有看懂？warp的start offset + ?
         my_write_pos = my_base + my_excl_offset
 
         # ---- Stream-write loop ----
-        # 3-tier cascade mirroring block_count_ge: 4-way unrolled fast path
-        # → 2-way medium → 1-way tail → scalar tail. Each conditional write
-        # advances thread-local wc; LDGs themselves are independent and
-        # cute can pipeline them. Switches gate via self.* (set in __init__).
         thr_final = s_thr[0]
         vec_w_p3 = cutlass.const_expr(self.vec_bits // self.dtype.width)
         elem_bytes_p3 = cutlass.const_expr(self.dtype.width // 8)
         vec_align_p3 = cutlass.const_expr(self.vec_align_bytes)
-        # use_constant_hint=True → LDG.E.*.CONSTANT (same as block_count_ge).
         copy_atom_p3 = self._make_load_copy_atom()
         row_addr_p3 = input_row.iterator.toint()
         step_elem_p3 = cutlass.const_expr(num_threads * vec_w_p3)
-        # UNROLL = 4 / UNROLL_MID = 2 — only referenced in commented-out manual
-        # unroll code below; the active path uses cutlass.range(unroll=4).
 
         n_aligned = (N // cutlass.Int32(vec_w_p3)) * cutlass.Int32(vec_w_p3)
         wc = my_write_pos
@@ -990,8 +903,7 @@ class GvrTopKKernel:
         # state of phase3_collect). When ON, the inner enable_unroll_4
         # controls the 4-way fast path.
         if self.enable_phase3_unroll:
-            # Fast path: 4-way unrolled vec loop (4 LDG.E.128 in flight).
-            # See block_count_ge for strided vs separate-ptrs trade-offs.
+            # Fast path: 4-way unrolled vec loop (4 loading instructions in flight).
             if self.enable_unroll_4:
                 # =============================================================
                 # unroll: cutlass.range(unroll=4).
@@ -1063,7 +975,6 @@ class GvrTopKKernel:
 
     # ------------------------------------------------------------------
     # block_fused_snap_iter — P4 snap convergence inner step
-    # CUDA source: heuristic_topk.cuh:436-510
     # ------------------------------------------------------------------
     @cute.jit
     def block_fused_snap_iter(
@@ -1179,7 +1090,6 @@ class GvrTopKKernel:
 
     # ------------------------------------------------------------------
     # Phase 4: Histogram-based k-th selection + two-pass writeback
-    # CUDA source: heuristic_topk.cuh:914-1128
     # ------------------------------------------------------------------
     @cute.jit
     def phase4_histogram_snap(
@@ -1536,11 +1446,9 @@ class GvrTopKKernel:
         griddepcontrol_wait()
 
         # ---- Shared memory allocation ----
-        # Typed regions (no union/bit-cast hacks). Total ≈ same as CUDA
-        # KernelSmemTplK (within SmemAllocator 128B alignment padding).
         smem = SmemAllocator()
         # keys[kC] fp32 (P3 candidate values; smem keys always fp32 even for half-prec)
-        # TODO: why use fp32 even for half-prec?
+        # Use fp32 even for half-prec to make secant search algorithm keep the accuracy/precision and converge faster.
         smem_keys = smem.allocate_tensor(
             element_type=cutlass.Float32,
             layout=cute.make_ordered_layout((kC,), order=(0,)),
@@ -1611,8 +1519,6 @@ class GvrTopKKernel:
         )
 
         # ---- Degenerate path: N <= top_k → copy input as-is ----
-        # cuTe DSL doesn't allow `return` from @cute.kernel under dynamic
-        # predicates — restructure as if/else covering both branches.
         if N <= cutlass.Int32(top_k):
             jd = tidx
             while jd < N:
@@ -1661,7 +1567,6 @@ class GvrTopKKernel:
             else:
                 # =============================================================
                 # Phase 2 — Secant threshold search
-                # CUDA source: heuristic_topk.cuh:716-810
                 # =============================================================
                 self.phase2_secant_search(
                     input_row,
@@ -1677,7 +1582,6 @@ class GvrTopKKernel:
 
                 # =============================================================
                 # Phase 3 — Ballot-free candidate collect
-                # CUDA source: heuristic_topk.cuh:813-912
                 # =============================================================
                 self.phase3_collect_candidates(
                     input_row,
@@ -1695,7 +1599,6 @@ class GvrTopKKernel:
 
                 # =============================================================
                 # Phase 4 — Histogram snap + writeback (top-K from candidates)
-                # CUDA source: heuristic_topk.cuh:914-1128
                 # =============================================================
                 # cand_count = min(s_iscalars[0], kCC)
                 cand_count_p4 = s_iscalars[0]
@@ -2000,12 +1903,15 @@ def gvr_topk_decode(
                 min_blocks_per_mp = 0
             elif num_rows <= num_sms:
                 min_blocks_per_mp = 1
-            elif num_sms * 2 < num_rows <= num_sms * 3:
-                # Wave-fit sweet spot (e.g. BS=384 with num_sms=148):
-                # mb=3 → 3 CTAs/SM cap fits all num_rows CTAs in 1 wave
-                # (3 * num_sms ≥ num_rows); mb=2 only fits 2 CTAs/SM so the
-                # last partial wave wastes ~70% SMs. mb=3 wins +5-23%
-                # across (K, N) at BS=384 with no regressions at other BS.
+            elif num_sms * 2 < num_rows <= num_sms * 3 and N_dec <= 32768:
+                # Wave-fit sweet spot + latency-bound (small/medium N):
+                # mb=3 → 3 CTAs/SM cap fits all num_rows CTAs in 1 wave;
+                # mb=2 would need partial 2nd wave wasting ~70% SMs.
+                # The N cutoff handles the bandwidth/occupancy trade-off:
+                # at large N (≥65K) the per-CTA work is bandwidth-bound and
+                # mb=3's 3-way L2 sharing causes contention while mb=2's
+                # lower occupancy gives each CTA more bandwidth (mb=2 wins
+                # +21-30% at fp32 K=512 N=65K BS=384).
                 # See gvr-topk-opt/auto_full_bench/fp32_bs384_cluster/.
                 min_blocks_per_mp = 3
             else:
