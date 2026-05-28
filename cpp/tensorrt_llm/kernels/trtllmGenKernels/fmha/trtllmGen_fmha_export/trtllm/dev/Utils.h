@@ -30,13 +30,15 @@ namespace dev {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-// __block_size__ is only supported in CUDA 13 and later.
-// We can always emit the macro, and it will simply be ignored in CUDA 12.
-#if defined(__CUDACC_VER_MAJOR__) && __CUDACC_VER_MAJOR__ >= 13
-#define TLLM_BLOCK_SIZE(bx, by, bz) __block_size__((bx, by, bz))
-#else
+// __block_size__ is only supported in CUDA 13 and later, but on CUDA 13.1
+// emitting it alongside __launch_bounds__ (also produced by trtllm-gen kernel
+// codegen) makes ptxas reject the PTX with "Conflicting directives: .maxntid
+// and .reqntid cannot both be specified". This blocked NVRTC JIT of the
+// QkvE4m3OBfloat16 H128 Q32 SwapsMmaAb spec-dec custom-mask kernel needed for
+// small dynamic-tree configs (e.g. qwen235b_nvfp4_dl2_k3_dt3). Disable
+// __block_size__ here so __launch_bounds__ remains the sole CTA-dim attribute
+// for NVRTC kernels; precompiled cubins are unaffected.
 #define TLLM_BLOCK_SIZE(bx, by, bz)
-#endif
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 

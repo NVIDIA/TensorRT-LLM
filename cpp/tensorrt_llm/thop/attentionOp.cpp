@@ -859,7 +859,22 @@ public:
                 enqueue_params.spec_decoding_packed_mask = spec_decoding_packed_mask->data_ptr<int32_t>();
                 enqueue_params.spec_decoding_is_generation_length_variable = true;
                 TLLM_CHECK(spec_decoding_position_offsets_for_cpp->dim() == 2); // [batch_size, max_draft_len + 1]
-                enqueue_params.spec_decoding_max_generation_length = spec_decoding_position_offsets_for_cpp->sizes()[1];
+                if (useTllmGen)
+                {
+                    // Blackwell trtllm-gen: packed-mask buffer is padded 3D
+                    // [batch, buf_dim, ceilDiv(buf_dim,32)] where buf_dim is the engine-wide
+                    // max (max(max_total_draft_tokens+1, K*max_draft_len)). Set
+                    // spec_decoding_max_generation_length to buf_dim so xqaDispatcher
+                    // forwards the padded row stride to prepareCustomMask.cu and the
+                    // mMaxSeqLenQ cap stays at a warmup/runtime-stable engine upper bound.
+                    TLLM_CHECK(spec_decoding_packed_mask->dim() == 3);
+                    enqueue_params.spec_decoding_max_generation_length = spec_decoding_packed_mask->sizes()[1];
+                }
+                else
+                {
+                    enqueue_params.spec_decoding_max_generation_length
+                        = spec_decoding_position_offsets_for_cpp->sizes()[1];
+                }
             }
 
             // Current mlaGeneration will using fmha to do attention, so we don't go into enqueueGeneration
