@@ -325,10 +325,17 @@ struct KvCacheIterationStats
     SizeType32 primaryMaxNumBlocks{0};
     SizeType32 primaryFreeNumBlocks{0};
     SizeType32 primaryUsedNumBlocks{0};
+    // Cached-but-unpinned blocks in the primary pool. Distinct from primaryUsedNumBlocks,
+    // which also counts blocks pinned during onboard memcpy windows.
+    SizeType32 primaryEvictableNumBlocks{0};
     // Secondary (host) pool
     SizeType32 secondaryMaxNumBlocks{0};
     SizeType32 secondaryFreeNumBlocks{0};
     SizeType32 secondaryUsedNumBlocks{0};
+    // Cached-but-unpinned blocks in the secondary pool. Useful to gauge "how full is the
+    // host cache"; secondaryUsedNumBlocks only counts pinned blocks during the sub-ms
+    // onboard memcpy window so it cannot answer that question on its own.
+    SizeType32 secondaryEvictableNumBlocks{0};
 
     // --- Per-iteration deltas (reset on each read) ---
     // Context phase: block allocation and reuse
@@ -350,6 +357,11 @@ struct KvCacheIterationStats
     // Intra-device (GPU → GPU) block copies (e.g. partial reuse when source block has refs)
     SizeType32 iterIntraDeviceCopyBlocks{0};
     std::size_t iterIntraDeviceCopyBytes{0};
+
+    // Pages released by LRU from the last cache tier without ever being onboarded back
+    // to GPU during their stay at that tier (i.e. fully dropped from the hierarchy).
+    SizeType32 iterHostDroppedBlocks{0};
+    std::size_t iterHostDroppedBytes{0};
 };
 
 // Basic building block of a paged KV cache - a single
