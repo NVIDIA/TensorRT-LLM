@@ -777,7 +777,6 @@ class AllReduce(nn.Module):
                         f"MNNVLAllReduce can't be enabled due to failing the is_mnnvl check."
                     )
                     self.mnnvl_allreduce = None
-            self.tp_group_pg = self.mapping.tp_group_pg
 
     def uses_nccl_symmetric_memory_window(self) -> bool:
         """Return True if this allreduce can use an NCCL window output buffer.
@@ -878,7 +877,7 @@ class AllReduce(nn.Module):
         additional_args = {}
         if self._disable_mpi:
             # Get ProcessGroup from mapping
-            pg = self.tp_group_pg
+            pg = self.mapping.tp_group_pg
             assert pg is not None, "TP ProcessGroup not initialised"
             additional_args = {
                 "rank": torch.distributed.get_rank(),
