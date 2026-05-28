@@ -45,7 +45,7 @@ from torch.fx import Node
 from ..._compat import KvCacheConfig
 from ...utils.cuda_graph import cuda_graph_state
 from ...utils.logger import ad_logger
-from ...utils.node_utils import extract_op_args
+from ...utils.node_utils import DynamicOpPolicy, extract_op_args, piecewise_dynamic_op
 from ..attention_interface import (
     AttentionDescriptor,
     AttentionLayout,
@@ -396,6 +396,7 @@ class _FlashInferMLAPlanner:
 _GlobalFlashInferMLAPlanner = _FlashInferMLAPlanner()
 
 
+@piecewise_dynamic_op(DynamicOpPolicy.METADATA_WRAPPER)
 @torch.library.custom_op("auto_deploy::flashinfer_mla_prepare_metadata", mutates_args=())
 def prepare_flashinfer_mla_metadata(
     position_ids: torch.Tensor,
@@ -463,6 +464,7 @@ def prepare_flashinfer_mla_metadata_host(
         )
 
 
+@piecewise_dynamic_op(DynamicOpPolicy.OUT_BUFFER)
 @torch.library.custom_op(
     "auto_deploy::flashinfer_mla_with_cache", mutates_args=("ckv_cache", "kpe_cache")
 )

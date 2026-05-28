@@ -72,6 +72,7 @@ except ModuleNotFoundError:
 
 from ..._compat import ActivationType
 from ...custom_ops.semantic_mask_registry import SemanticMaskLoweringSpec, SemanticMaskRegistry
+from ...utils.node_utils import DynamicOpPolicy, piecewise_dynamic_op
 from ..factory import ModelFactoryRegistry
 from ..hf import (
     AutoModelForCausalLMFactory,
@@ -160,6 +161,7 @@ def _gemma4_multimodal_mask_fake(
     return torch.empty(batch_size, 1, seq_len, seq_len, dtype=torch.bool, device=input_ids.device)
 
 
+@piecewise_dynamic_op(DynamicOpPolicy.EAGER)
 @torch.library.custom_op("auto_deploy::gemma4_prepare_multimodal_mask", mutates_args=())
 def gemma4_prepare_multimodal_mask(
     batch_info_host: torch.Tensor,

@@ -28,7 +28,7 @@ from torch._ops import OpOverloadPacket
 from torch.fx import Node
 
 from ..._compat import KvCacheConfig
-from ...utils.node_utils import extract_op_args
+from ...utils.node_utils import DynamicOpPolicy, extract_op_args, piecewise_dynamic_op
 from ..attention_interface import (
     AttentionDescriptor,
     AttentionLayout,
@@ -125,6 +125,7 @@ def _update_ssm_state_cache(ssm_cache: torch.Tensor, ssm_state: torch.Tensor) ->
 # ---------------------------------------------------------------
 
 
+@piecewise_dynamic_op(DynamicOpPolicy.OUT_BUFFER)
 @torch.library.custom_op("auto_deploy::torch_cached_ssm", mutates_args=("ssm_state_cache",))
 def _torch_cached_ssm(
     # INPUTS (dense but may be flattened across sequences)

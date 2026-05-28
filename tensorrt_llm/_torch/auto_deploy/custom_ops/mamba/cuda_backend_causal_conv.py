@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -31,10 +31,12 @@ import torch
 from tensorrt_llm._torch.modules.mamba import PAD_SLOT_ID
 from tensorrt_llm._torch.modules.mamba.causal_conv1d import causal_conv1d_fn, causal_conv1d_update
 
+from ...utils.node_utils import DynamicOpPolicy, piecewise_dynamic_op
 from ..attention_interface import AttentionRegistry, BatchInfo, MHACallable
 from .causal_conv_common import BaseCausalConvDescriptor
 
 
+@piecewise_dynamic_op(DynamicOpPolicy.EAGER)
 @torch.library.custom_op("auto_deploy::cuda_cached_causal_conv1d", mutates_args={"input"})
 def _cuda_cached_causal_conv1d(
     # INPUTS (dense but may be flattened across sequences)

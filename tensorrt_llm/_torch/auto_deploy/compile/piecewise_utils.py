@@ -23,133 +23,32 @@ This module provides the logic to:
 
 import operator
 from dataclasses import dataclass, field
-from enum import Enum, auto
-from typing import Any, Dict, List, Optional, Set
+from typing import Dict, List, Optional, Set
 
 import torch.nn as nn
 from torch.fx import GraphModule, Node
 from torch.fx.passes.split_module import split_module
 
 from ..utils.logger import ad_logger
+from ..utils.node_utils import (
+    DynamicOpPolicy,
+    get_all_piecewise_dynamic_op_names,
+    get_piecewise_dynamic_op_policy,
+)
+from ..utils.node_utils import piecewise_dynamic_op as piecewise_dynamic_op
+from ..utils.node_utils import register_piecewise_dynamic_op as register_piecewise_dynamic_op
 
 # ---------------------------------------------------------------------------
-# Dynamic op registry. Each registered op is a split boundary for piecewise CUDA
-# graph. The policy describes the output contract of the dynamic submodule after
-# it has been split out of the captured static graph.
-#
-# Keep this registry organized by policy rather than by op family. The piecewise
-# code does not care whether an op is "attention", "SSM", or "metadata" by name;
-# it cares whether the op's outputs need an out= buffer, a MetadataWrapper, or no
-# wrapper at all. When adding a new dynamic op, first decide which output contract
-# it has, then place it in this registry with the matching policy.
+# Dynamic ops are registered from their custom op definition modules with
+# ``piecewise_dynamic_op``. Each registered op is a split boundary for piecewise
+# CUDA graph. The policy describes the output contract of the dynamic submodule
+# after it has been split out of the captured static graph.
 # ---------------------------------------------------------------------------
-
-
-class DynamicOpPolicy(Enum):
-    """How piecewise CUDA graph should handle a dynamic custom op's output.
-
-    Dynamic ops are always split out of static CUDA graph segments and run
-    eagerly. This enum only controls the additional output-address handling that
-    is needed so downstream static segments can still be captured and replayed
-    safely.
-
-    OUT_BUFFER:
-        The dynamic op returns a fresh tensor that is consumed by a captured
-        static segment. A fresh allocation would give CUDA graph replay a
-        different address from capture, so the op is wrapped with
-        DynamicOpWrapper and receives a pre-allocated out= buffer from the
-        preceding ADPiecewiseRunner graph pool. Use this for ops whose output
-        shape is bounded by the piecewise token bucket and can be safely copied
-        into that stable buffer.
-
-    METADATA_WRAPPER:
-        The dynamic op prepares metadata tensors eagerly, and those metadata
-        tensors are later consumed by captured static segments. The op itself
-        usually does not support an out= buffer, so MetadataWrapper owns stable
-        metadata buffers and copies request results into them. Use this only
-        when the metadata output shapes are bounded by the wrapper's padding
-        strategy.
-
-    EAGER:
-        The dynamic op still needs to be a split boundary, but piecewise should
-        not add output stabilization. This covers inplace ops that return None,
-        ops that already return persistent/stable buffers, logits or host-driven
-        helpers whose outputs are not consumed by captured static segments, and
-        request-dependent outputs whose shapes are not safely bounded by the
-        piecewise token bucket.
-    """
-
-    # Wrap with DynamicOpWrapper and pass a stable out= buffer.
-    OUT_BUFFER = auto()
-
-    # Wrap with MetadataWrapper to keep metadata tensor addresses stable.
-    METADATA_WRAPPER = auto()
-
-    # Run eagerly as a split boundary with no output-address wrapper.
-    EAGER = auto()
-
-
-_DYNAMIC_OP_POLICIES: Dict[str, DynamicOpPolicy] = {
-    # Dynamic kernels whose outputs feed captured static segments.
-    "auto_deploy::flashinfer_attention_mha_with_cache": DynamicOpPolicy.OUT_BUFFER,
-    "auto_deploy::triton_attention_flattened_mha_with_cache": DynamicOpPolicy.OUT_BUFFER,
-    "auto_deploy::triton_paged_mha_with_cache": DynamicOpPolicy.OUT_BUFFER,
-    "auto_deploy::torch_cached_attention_with_cache": DynamicOpPolicy.OUT_BUFFER,
-    "auto_deploy::trtllm_attention_mha_with_cache": DynamicOpPolicy.OUT_BUFFER,
-    "auto_deploy::flashinfer_mla_with_cache": DynamicOpPolicy.OUT_BUFFER,
-    "auto_deploy::flashinfer_trtllm_mla_with_cache": DynamicOpPolicy.OUT_BUFFER,
-    "auto_deploy::torch_cached_mla_with_cache": DynamicOpPolicy.OUT_BUFFER,
-    "auto_deploy::trtllm_mla_with_cache": DynamicOpPolicy.OUT_BUFFER,
-    "auto_deploy::triton_cached_ssm": DynamicOpPolicy.OUT_BUFFER,
-    "auto_deploy::torch_cached_ssm": DynamicOpPolicy.OUT_BUFFER,
-    "auto_deploy::flashinfer_cached_ssm": DynamicOpPolicy.OUT_BUFFER,
-    "auto_deploy::fla_cached_delta_rule": DynamicOpPolicy.OUT_BUFFER,
-    "auto_deploy::fla_cached_gated_delta_rule": DynamicOpPolicy.OUT_BUFFER,
-    # Metadata-prep outputs whose addresses must remain stable for captured segments.
-    "auto_deploy::flashinfer_attention_prepare_metadata": DynamicOpPolicy.METADATA_WRAPPER,
-    "auto_deploy::flashinfer_mla_prepare_metadata": DynamicOpPolicy.METADATA_WRAPPER,
-    "auto_deploy::triton_paged_prepare_metadata": DynamicOpPolicy.METADATA_WRAPPER,
-    "auto_deploy::mamba_ssm_prepare_metadata": DynamicOpPolicy.METADATA_WRAPPER,
-    # Request-dependent metadata output shapes that are not safely bounded by
-    # the piecewise token bucket. They must split the graph, but padding them in
-    # MetadataWrapper would be the wrong address-stability strategy.
-    "auto_deploy::gemma4_prepare_multimodal_mask": DynamicOpPolicy.EAGER,
-    # Host-driven gather helper. It is dynamic for piecewise splitting, but its
-    # output is not stabilized through DynamicOpWrapper or MetadataWrapper.
-    "auto_deploy::gather_tokens": DynamicOpPolicy.EAGER,
-    # Persistent-buffer metadata prep ops. They run eagerly because they have
-    # dynamic host control flow, but their returned buffers are already stable,
-    # so piecewise must not add another output-address wrapper.
-    "auto_deploy::trtllm_attention_prepare_metadata": DynamicOpPolicy.EAGER,
-    "auto_deploy::trtllm_mla_prepare_metadata": DynamicOpPolicy.EAGER,
-    # Inplace dynamic ops. These mutate their input state and return None, so
-    # there is no produced tensor for DynamicOpWrapper or MetadataWrapper to own.
-    "auto_deploy::triton_cached_causal_conv1d": DynamicOpPolicy.EAGER,
-    "auto_deploy::cuda_cached_causal_conv1d": DynamicOpPolicy.EAGER,
-}
 
 
 def _get_all_dynamic_op_names() -> Set[str]:
     """Return the full set of dynamic op qualified names."""
-    return set(_DYNAMIC_OP_POLICIES)
-
-
-def _get_op_name(target: Any) -> str:
-    """Return a stable qualified name for FX call_function targets."""
-    if hasattr(target, "name"):
-        # torch._ops.OpOverload has .name() method
-        return target.name()
-    if hasattr(target, "__qualname__"):
-        return target.__qualname__
-    return str(target)
-
-
-def _matches_op_name(op_name: str, registered_name: str) -> bool:
-    """Match OpOverload names and wrapper-function names using existing semantics."""
-    if registered_name in op_name:
-        return True
-    base_name = registered_name.split("::")[-1] if "::" in registered_name else registered_name
-    return base_name in op_name
+    return get_all_piecewise_dynamic_op_names()
 
 
 def _get_dynamic_op_policy(node: Node) -> Optional[DynamicOpPolicy]:
@@ -157,11 +56,7 @@ def _get_dynamic_op_policy(node: Node) -> Optional[DynamicOpPolicy]:
     if node.op != "call_function":
         return None
 
-    op_name = _get_op_name(node.target)
-    for registered_name, policy in _DYNAMIC_OP_POLICIES.items():
-        if _matches_op_name(op_name, registered_name):
-            return policy
-    return None
+    return get_piecewise_dynamic_op_policy(node.target)
 
 
 def is_dynamic_cached_op(node: Node) -> bool:

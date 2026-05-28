@@ -15,9 +15,11 @@
 
 import torch
 
+from ...utils.node_utils import DynamicOpPolicy, piecewise_dynamic_op
 from ..attention_interface import BatchInfo
 
 
+@piecewise_dynamic_op(DynamicOpPolicy.EAGER)
 @torch.library.custom_op("auto_deploy::gather_tokens", mutates_args=())
 def gather_tokens(
     hidden_states: torch.Tensor,

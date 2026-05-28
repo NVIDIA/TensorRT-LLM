@@ -39,7 +39,7 @@ from torch._ops import OpOverloadPacket
 from torch.fx import Node
 
 from ..._compat import KvCacheConfig
-from ...utils.node_utils import extract_op_args
+from ...utils.node_utils import DynamicOpPolicy, extract_op_args, piecewise_dynamic_op
 from ..attention_interface import (
     AttentionDescriptor,
     AttentionLayout,
@@ -338,6 +338,7 @@ def _torch_mla_context_with_expansion(
         out.copy_(torch.cat(attn_outputs, dim=0))
 
 
+@piecewise_dynamic_op(DynamicOpPolicy.OUT_BUFFER)
 @torch.library.custom_op("auto_deploy::torch_cached_mla_with_cache", mutates_args=("mla_cache",))
 def torch_backend_mla_with_cache(
     # 5 tensor args (get_num_qkv_args = 5)

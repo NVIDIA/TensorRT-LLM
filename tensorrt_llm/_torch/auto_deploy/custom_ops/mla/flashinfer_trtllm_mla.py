@@ -35,6 +35,7 @@ from torch.fx import Node
 
 from ..._compat import KvCacheConfig
 from ...utils.logger import ad_logger
+from ...utils.node_utils import DynamicOpPolicy, piecewise_dynamic_op
 from ..attention_interface import (
     AttentionDescriptor,
     AttentionLayout,
@@ -264,6 +265,7 @@ def _compute_reference_decode(
         out[seq_idx] = torch.einsum("nk,nvk->nv", weighted_kv, w_v)
 
 
+@piecewise_dynamic_op(DynamicOpPolicy.OUT_BUFFER)
 @torch.library.custom_op(
     "auto_deploy::flashinfer_trtllm_mla_with_cache", mutates_args=("mla_paged_cache",)
 )

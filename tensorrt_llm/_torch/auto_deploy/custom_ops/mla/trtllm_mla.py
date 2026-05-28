@@ -71,7 +71,7 @@ from tensorrt_llm.quantization import QuantMode
 
 from ..._compat import KvCacheConfig, get_sm_version, prefer_pinned
 from ...utils.cuda_graph import cuda_graph_state
-from ...utils.node_utils import extract_op_args
+from ...utils.node_utils import DynamicOpPolicy, extract_op_args, piecewise_dynamic_op
 from ..attention_interface import (
     AttentionDescriptor,
     AttentionLayout,
@@ -788,6 +788,7 @@ def prepare_trtllm_mla_metadata_host(
 # =============================================================================
 
 
+@piecewise_dynamic_op(DynamicOpPolicy.EAGER)
 @torch.library.custom_op("auto_deploy::trtllm_mla_prepare_metadata", mutates_args=())
 def prepare_trtllm_mla_metadata(
     batch_info_host: torch.Tensor,
@@ -2029,6 +2030,7 @@ def _mla_with_cache_fake_impl(
 # =============================================================================
 
 
+@piecewise_dynamic_op(DynamicOpPolicy.OUT_BUFFER)
 @torch.library.custom_op("auto_deploy::trtllm_mla_with_cache", mutates_args=("kv_cache",))
 def trtllm_mla_with_cache(
     q_nope: torch.Tensor,

@@ -19,6 +19,7 @@ import torch
 
 from tensorrt_llm._torch.modules.mamba.selective_state_update import selective_state_update
 
+from ...utils.node_utils import DynamicOpPolicy, piecewise_dynamic_op
 from ..attention_interface import AttentionRegistry, BatchInfo, MHACallable, SpecSSMResourceHandler
 from .mamba_backend_common import (
     BaseBackendSSM,
@@ -29,6 +30,7 @@ from .mamba_backend_common import (
 )
 
 
+@piecewise_dynamic_op(DynamicOpPolicy.OUT_BUFFER)
 @torch.library.custom_op(
     "auto_deploy::triton_cached_ssm",
     mutates_args=("ssm_state_cache", "intermediate_ssm_state_cache"),
