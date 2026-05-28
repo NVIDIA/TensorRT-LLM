@@ -76,6 +76,18 @@ def get_moe_cls(
             )
             return CutlassFusedMoE
     elif moe_backend.upper() == "DEEPGEMM":
+        # DeepGEMM kernels only support SM100/SM103 (Blackwell). Fall back
+        # to CutlassFusedMoE on unsupported SMs (e.g. Hopper SM90), matching
+        # the DENSEGEMM/CUTEDSL pattern below; otherwise the unsupported
+        # kernel runs and trips a C++ scale-factor dtype assertion at warmup.
+        from tensorrt_llm._utils import get_sm_version
+        sm_version = get_sm_version()
+        if sm_version not in DeepGemmFusedMoE._SUPPORTED_SM_VERSIONS:
+            logger.warning(
+                f"{layer_prefix}DeepGemmFusedMoE only supports SM "
+                f"{DeepGemmFusedMoE._SUPPORTED_SM_VERSIONS} (got SM{sm_version}). "
+                f"Using CutlassFusedMoE instead.")
+            return CutlassFusedMoE
         return DeepGemmFusedMoE
     elif moe_backend.upper() == "DENSEGEMM":
         if quant_config is None or not quant_config.quant_mode.has_nvfp4():
