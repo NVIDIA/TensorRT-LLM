@@ -9,7 +9,7 @@ from tensorrt_llm.mapping import Mapping
 
 from ..model_config import ModelConfig
 from ..peft.lora.layer import LoraLayer, LoraModuleType
-from ..utils import Fp4QuantizedTensor, get_model_extra_attrs, relu2
+from ..utils import Fp4QuantizedTensor, relu2
 from .linear import Linear, TensorParallelMode, WeightMode, WeightsLoadingConfig
 
 
@@ -107,16 +107,9 @@ class MLP(nn.Module):
         # GPUs the kernel is a no-op, so fall back to unfused relu2 → separate
         # quantize in the downstream linear layer.
         is_sm100_or_later = get_sm_version() >= 100
-        # Also disable when the NVFP4 Marlin-only backend is selected: Marlin
-        # consumes BF16 activations and quantizes internally.
-        model_attrs = get_model_extra_attrs()
-        marlin_only = bool(model_attrs and model_attrs.get(
-            'nvfp4_gemm_allowed_backends', ['cutlass', 'cublaslt', 'cuda_core'])
-                           == ['marlin'])
 
         self._use_fused_relu2_quant = (has_nvfp4 and has_kernel and has_scale
-                                       and is_relu2 and is_sm100_or_later
-                                       and not marlin_only)
+                                       and is_relu2 and is_sm100_or_later)
 
     def forward(
         self,
