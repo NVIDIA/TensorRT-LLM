@@ -33,6 +33,7 @@ from transformers.models.parakeet.modeling_parakeet import (
 )
 
 from ...logger import logger
+from ..model_config import ModelConfig
 from ..modules.attention import Attention
 from ..modules.layer_norm import LayerNorm
 from ..modules.linear import Linear
@@ -181,7 +182,12 @@ class ParakeetExtractor:
         num_frames = torch.tensor(
             [cs // self.config.hop_length for cs in clip_sizes], dtype=torch.float
         )
-        n_tokens = ParakeetEncoder._get_subsampling_output_length(self, num_frames)
+        n_tokens = _subsampling_output_length(
+            num_frames,
+            self.config.subsampling_factor,
+            self.config.subsampling_conv_kernel_size,
+            self.config.subsampling_conv_stride,
+        )
         return max(1, int(n_tokens.sum().item()))
 
     def _to_mono_tensor(
@@ -268,8 +274,23 @@ class ParakeetExtractor:
         return int(audio_tokens * self.config.subsampling_factor * self.config.hop_length)
 
 
+def _subsampling_output_length(
+    input_lengths: torch.Tensor,
+    subsampling_factor: int,
+    subsampling_conv_kernel_size: int,
+    subsampling_conv_stride: int,
+) -> torch.Tensor:
+    num_layers = int(math.log2(subsampling_factor))
+    add_pad = (subsampling_conv_kernel_size - 1) // 2 * 2 - subsampling_conv_kernel_size
+    lengths = input_lengths
+    for _ in range(num_layers):
+        lengths = torch.div(lengths.to(torch.float) + add_pad, subsampling_conv_stride) + 1.0
+        lengths = torch.floor(lengths)
+    return lengths.to(torch.int)
+
+
 # This config is the extractor's single source of truth. It also supplies the fields read by
-# `ParakeetEncoder._get_subsampling_output_length`.
+# `_subsampling_output_length`.
 class _ExtractorConfig(NamedTuple):
     feature_size: int
     sampling_rate: int
@@ -361,9 +382,8 @@ class ParakeetConformerAttention(Attention):
 
     qkv_proj and o_proj are inherited from trtllm.Attention (TP-sharded,
     quantization-ready, fused QKV kernel).  The Transformer-XL relative
-    positional encoding (RPE) is computed here and injected into the parent's
-    logit_bias SDPA path via _forward_with_logit_bias, so we share the
-    attention backend infrastructure without re-implementing SDPA.
+    positional encoding (RPE) is computed here and passed directly to
+    F.scaled_dot_product_attention as attn_mask.
 
     relative_k_proj, bias_u, and bias_v implement the content-position term;
     the content-content term uses the standard QK product inside SDPA.
@@ -374,7 +394,6 @@ class ParakeetConformerAttention(Attention):
         config: ParakeetEncoderConfig,
         layer_idx: int,
         dtype: Optional[torch.dtype] = None,
-        model_config=None,
     ):
         head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
         num_kv_heads = getattr(config, "num_key_value_heads", config.num_attention_heads)
@@ -389,7 +408,7 @@ class ParakeetConformerAttention(Attention):
             layer_idx=layer_idx,
             dtype=dtype,
             dense_bias=config.attention_bias,
-            config=model_config,  # None → default ModelConfig (TP=1)
+            config=ModelConfig(attn_backend="VANILLA"),
             q_scaling=1.0,
             head_dim=head_dim,
         )
@@ -430,7 +449,6 @@ class ParakeetConformerAttention(Attention):
         """
         B, T, C = hidden_states.shape
 
-        # ── QKV projection (TP-sharded fused kernel from trtllm.Attention) ──
         qkv = self.qkv_proj(hidden_states.reshape(-1, C))  # [B*T, (q+k+v)*d]
         q, k, v = self.split_qkv(qkv)  # each [B*T, H_rank*d]
 
@@ -457,14 +475,8 @@ class ParakeetConformerAttention(Attention):
         # Content-content term: add bias_u to q; SDPA computes (q+bias_u)@k^T
         q = q + self.bias_u.view(1, self.num_heads, 1, self.head_dim)
 
-        # ── SDPA via parent's logit_bias path ─────────────────────────────────
-        # Flatten back to packed [B*T, H*d] as expected by _forward_with_logit_bias
-        q = q.transpose(1, 2).reshape(B * T, self.q_size)
-        k = k.transpose(1, 2).reshape(B * T, self.kv_size)
-        v = v.transpose(1, 2).reshape(B * T, self.kv_size)
-
-        attn_output, _ = self._forward_with_logit_bias(q, k, v, B=B, T=T, logit_bias=matrix_bd)
-
+        out = F.scaled_dot_product_attention(q, k, v, attn_mask=matrix_bd, scale=scale)
+        attn_output = out.transpose(1, 2).reshape(B * T, self.q_size)
         return self.o_proj(attn_output).reshape(B, T, C)
 
     def load_weights(self, weights: Dict[str, torch.Tensor], prefix: str = "") -> None:
@@ -502,7 +514,7 @@ class ParakeetFeedForward(nn.Module):
             bias=bool(config.attention_bias),
             dtype=dtype,
         )
-        self.activation = ACT2FN[config.hidden_act]
+        self.activation = ACT2FN[getattr(config, "hidden_act", "silu")]
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         return self.linear2(self.activation(self.linear1(hidden_states)))
@@ -635,15 +647,12 @@ class ParakeetEncoder(nn.Module):
 
     def _get_subsampling_output_length(self, input_lengths: torch.Tensor) -> torch.Tensor:
         cfg = self.config
-        num_layers = int(math.log2(cfg.subsampling_factor))
-        add_pad = (cfg.subsampling_conv_kernel_size - 1) // 2 * 2 - cfg.subsampling_conv_kernel_size
-        lengths = input_lengths
-        for _ in range(num_layers):
-            lengths = (
-                torch.div(lengths.to(torch.float) + add_pad, cfg.subsampling_conv_stride) + 1.0
-            )
-            lengths = torch.floor(lengths)
-        return lengths.to(torch.int)
+        return _subsampling_output_length(
+            input_lengths,
+            cfg.subsampling_factor,
+            cfg.subsampling_conv_kernel_size,
+            cfg.subsampling_conv_stride,
+        )
 
     def _build_attention_mask(self, attention_mask: torch.Tensor, seq_len: int) -> torch.Tensor:
         """Convert 2-D input mask to 4-D additive attention mask after subsampling."""

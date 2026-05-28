@@ -789,41 +789,6 @@ class Attention(nn.Module):
             return attn_output[0], attn_output[1]
         return attn_output, None
 
-    def _forward_with_logit_bias(
-        self,
-        q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
-        B: int,
-        T: int,
-        logit_bias: torch.Tensor,
-    ) -> torch.Tensor:
-        """SDPA with an arbitrary float additive logit bias (e.g. Conformer RPE).
-
-        Assumes q/k/v are already split (not fused) and in packed format
-        [B*T, num_heads_per_rank * head_dim].  All sequences must have the
-        same length T.  logit_bias has shape [B, num_heads, T, T].
-        """
-        q = q.view(B, T, self.num_heads, self.head_dim).transpose(1, 2)
-        k = k.view(B, T, self.num_key_value_heads,
-                   self.head_dim).transpose(1, 2)
-        v = v.view(B, T, self.num_key_value_heads,
-                   self.head_dim).transpose(1, 2)
-
-        if self.num_key_value_groups > 1:
-            k = k.repeat_interleave(self.num_key_value_groups, dim=1)
-            v = v.repeat_interleave(self.num_key_value_groups, dim=1)
-
-        scale = 1.0 / (math.sqrt(self.head_dim) * self.q_scaling)
-        out = torch.nn.functional.scaled_dot_product_attention(
-            q,
-            k,
-            v,
-            attn_mask=logit_bias,
-            scale=scale,
-        )
-        return out.transpose(1, 2).reshape(B * T, self.q_size), None
-
     def forward_impl(
         self,
         q: torch.Tensor,
@@ -836,23 +801,7 @@ class Attention(nn.Module):
         mrope_config: Optional[dict],
         attention_sinks: Optional[torch.Tensor] = None,
         has_lora: bool = False,
-        logit_bias: Optional[torch.Tensor] = None,
     ):
-        # Arbitrary float additive logit bias (e.g. Conformer RPE) — bypass all
-        # backends and run plain SDPA.  Caller must have already split q/k/v and
-        # applied any per-head biases.  Sequences must be uniform length.
-        if logit_bias is not None:
-            q, k, v = self.split_qkv(q, k, v)
-            N = attn_metadata.num_tokens
-            B = attn_metadata.num_contexts
-            q, k, v = q[:N], k[:N], v[:N]
-            return self._forward_with_logit_bias(q,
-                                                 k,
-                                                 v,
-                                                 B=B,
-                                                 T=N // B,
-                                                 logit_bias=logit_bias)
-
         mrope_rotary_cos_sin = None
         mrope_position_deltas = None
         if mrope_config is not None:
@@ -916,7 +865,6 @@ class Attention(nn.Module):
         attention_window_size: Optional[int] = None,
         attention_mask_data: Optional[torch.Tensor] = None,
         attention_sinks: Optional[torch.Tensor] = None,
-        logit_bias: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> torch.Tensor:
         """
@@ -932,12 +880,6 @@ class Attention(nn.Module):
             lora_params (Optional[dict]): The LoRA parameters.
             attention_window_size (Optional[int]): The attention window size.
             attention_mask_data (Optional[torch.Tensor]): The attention mask data.
-            logit_bias (Optional[torch.Tensor]): Optional float additive bias added to
-                attention logits before softmax, shape [B, num_heads, T, T].
-                When provided the standard backend is bypassed and plain SDPA is used.
-                Useful for non-causal encoders with custom relative positional encoding
-                (e.g. Conformer Transformer-XL RPE) that cannot be expressed as a
-                standard attention mask.  All sequences must have uniform length T.
         Returns:
             torch.Tensor: The output tensor.
         """
@@ -999,8 +941,7 @@ class Attention(nn.Module):
                                         attention_mask_data,
                                         mrope_config=mrope_config,
                                         attention_sinks=attention_sinks,
-                                        has_lora=bool(lora_params),
-                                        logit_bias=logit_bias)
+                                        has_lora=bool(lora_params))
 
         if self.attn_output_gate:
             gate = torch.sigmoid(gate)
