@@ -83,7 +83,7 @@ metadata:
 When `@support_multimodal_disaggregated` is set and the deployment uses `TLLM_MULTIMODAL_DISAGGREGATED=1`:
 
 - **Encoder worker:** runs as a standalone `MultimodalEncoder` (`mm_encoder_only=True`). It executes only the multimodal encoder and ships `mm_embeddings` (+ mRoPE position ids/deltas) to prefill+decode workers as shared-tensor handles.
-- **Prefill+decode worker:** the model's `__init__` skips constructing `self.mm_encoder` when `_is_disagg()` is true; the input processor's `_attach_multimodal_embeddings_impl()` override binds the encoder handles into the request (the base `attach_multimodal_embeddings` wrapper detokenizes tokenized inputs for non-fast-path VLMs, then delegates to your impl). For context-only requests, the engine re-clones mrope tensors so IPC handles outlive the encoder worker's freed memory — replicate that pattern for any new GPU-resident mm tensors.
+- **Prefill+decode worker:** the model's `__init__` skips constructing `self.mm_encoder` when `_is_mm_disagg()` is true; the input processor's `attach_multimodal_embeddings()` override binds the encoder handles into the request. For context-only requests, the engine re-clones mrope tensors so IPC handles outlive the encoder worker's freed memory — replicate that pattern for any new GPU-resident mm tensors.
 
 ### Templates to study
 
@@ -208,7 +208,7 @@ Read `config.json`'s `architectures` and `model_type`. If a `_torch/models/model
 
 ### Phase 2 — Model wrapper
 
-Create `tensorrt_llm/_torch/models/modeling_{name}.py`. The default pattern below mirrors `modeling_llava_next.py` and `modeling_gemma3vl.py` — a single wrapper class that composes a multimodal encoder + an LLM resolved through `AutoModelForCausalLM.from_config(text_config)`. The `*ModelBase + *Model` Base/non-Base split in `modeling_qwen2vl.py` and `modeling_qwen3vl.py` is an implementation detail for sharing one wrapper between two variants of the same family (Qwen2-VL ↔ Qwen2.5-VL; Qwen3-VL ↔ Qwen3-VL-MoE) — keep the wrapper a single class unless you have the same multi-variant need.
+Create `tensorrt_llm/_torch/models/modeling_{name}.py`. The default pattern below mirrors `modeling_llava_next.py` and `modeling_gemma3vl.py` — a single wrapper class that composes a multimodal encoder + an LLM resolved through `AutoModelForCausalLM.from_config(text_config)`. The `*ModelBase + *Model` Base/non-Base split in `modeling_qwen2vl.py` and `modeling_qwen3vl.py` is an implementation detail for sharing one wrapper between two variants of the same family (Qwen2-VL ↔ Qwen2.5-VL; Qwen3-VL ↔ Qwen3-VL-MoE) — keep the wrapper a single class unless you have the same multi-variant need. Import `_is_mm_disagg` from `modeling_multimodal_utils` instead of defining a model-local environment helper.
 
 ```python
 class {Name}VisionModel(nn.Module):
@@ -229,7 +229,7 @@ class {Name}Model(PreTrainedModel):
         if hasattr(self, "llm"):
             return  # idempotency guard — re-entry from `post_config` etc.
 
-        if not _is_disagg():
+        if not _is_mm_disagg():
             self.mm_encoder = {Name}VisionModel(model_config)
         else:
             self.mm_encoder = None
@@ -269,7 +269,7 @@ class {Name}Model(PreTrainedModel):
 
         multimodal_params = kwargs.get("multimodal_params", [])
         mm_embeds = []
-        if len(multimodal_params) > 0 and not _is_disagg():
+        if len(multimodal_params) > 0 and not _is_mm_disagg():
             mm_embeds = get_multimodal_embeddings(
                 encoder_forward_fn=self.mm_encoder.forward,
                 multimodal_params=multimodal_params[:num_context_requests],
@@ -341,7 +341,7 @@ class {Name}Model(PreTrainedModel): ...
 
 ```python
 def load_weights(self, weights, weight_mapper):
-    if not _is_disagg():
+    if not _is_mm_disagg():
         self.mm_encoder.load_weights(weights)
         # Release mmap pages backing the encoder weights as soon as we're done.
         if hasattr(weights, "mark_consumed"):
