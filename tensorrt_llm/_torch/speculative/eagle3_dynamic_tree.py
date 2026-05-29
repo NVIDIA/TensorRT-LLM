@@ -967,7 +967,13 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
         Returns:
             True if rejection sampling is enabled and the draft logit buffer is allocated
         """
-        return spec_metadata.use_rejection_sampling and self._draft_depth_logits_cat is not None
+        # Skip rejection sampling when the whole batch is greedy: argmax is
+        # equivalent and avoids the rejection kernel cost.
+        return (
+            spec_metadata.use_rejection_sampling
+            and self._draft_depth_logits_cat is not None
+            and not spec_metadata.is_all_greedy_sample
+        )
 
     def _finalize_dynamic_tree_verify_outputs(
         self,

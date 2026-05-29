@@ -1120,14 +1120,6 @@ class DecodingBaseConfig(StrictBaseModel):
         "rolling average over the last N completed requests (N = acceptance_window) drops below this value. "
         "PyTorch backend only.")
 
-    allow_advanced_sampling: bool = Field(
-        default=False,
-        status="prototype",
-        description=
-        "If true, allows non-greedy sampling when speculation is used. Only applicable "
-        "to 1-model code paths; non-greedy sampling is always enabled on 2-model paths."
-    )
-
     use_rejection_sampling: bool = Field(
         default=False,
         status="prototype",
