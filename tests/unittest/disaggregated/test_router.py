@@ -1686,6 +1686,107 @@ def test_create_router_conversation():
     assert isinstance(router, ConversationRouter)
 
 
+def _conv_completion_request(conv_id, length=100):
+    return CompletionRequest(
+        model="TinyLlama",
+        prompt=[[1000] * length],
+        disaggregated_params=DisaggregatedParams(
+            request_type="context_only",
+            conversation_id=conv_id,
+        ),
+    )
+
+
+def _conv_chat_request(conv_id, length=100):
+    return ChatCompletionRequest(
+        messages=[{
+            "role": "user",
+            "content": "the " * length
+        }],
+        model="TinyLlama",
+        disaggregated_params=DisaggregatedParams(
+            request_type="context_only",
+            conversation_id=conv_id,
+        ),
+    )
+
+
+def test_kv_cache_aware_router_record_conversation_turn(servers):
+    """The seen-conversation set flags only the first turn, and is bounded."""
+    router = KvCacheAwareRouter(server_role=None,
+                                servers=servers,
+                                max_sessions=2)
+
+    # First sighting of a conversation id is the first turn.
+    assert router._record_conversation_turn("c1") is True
+    assert router._record_conversation_turn("c1") is False
+
+    # A missing conversation id is never reported as a first turn.
+    assert router._record_conversation_turn(None) is False
+    assert router._record_conversation_turn("") is False
+
+    # LRU eviction: with max_sessions=2, touching c2 then c3 evicts c1, so
+    # c1 looks "new" again while c3 stays known.
+    assert router._record_conversation_turn("c2") is True
+    assert router._record_conversation_turn("c3") is True
+    assert router._record_conversation_turn("c3") is False
+    assert router._record_conversation_turn("c1") is True
+
+
+@pytest.mark.asyncio
+async def test_kv_cache_aware_router_is_first_turn(servers,
+                                                   mock_aiohttp_session):
+    """get_next_server reports is_first_turn from the conversation seen-set."""
+    router = KvCacheAwareRouter(
+        server_role=None,
+        servers=servers,
+        use_tokens=False,
+        max_batch_size=32,
+        tokens_per_block=32,
+    )
+
+    _, info = await router.get_next_server(_conv_completion_request("c1"))
+    assert info["is_first_turn"] is True
+
+    _, info = await router.get_next_server(_conv_completion_request("c1"))
+    assert info["is_first_turn"] is False
+
+    _, info = await router.get_next_server(_conv_completion_request("c2"))
+    assert info["is_first_turn"] is True
+
+    # No conversation id -> cannot be classified as a first turn.
+    _, info = await router.get_next_server(
+        CompletionRequest(model="TinyLlama", prompt=[[1000] * 100]))
+    assert info["is_first_turn"] is False
+
+
+@pytest.mark.asyncio
+async def test_conversation_router_is_first_turn(servers, mock_aiohttp_session):
+    """ConversationRouter flags the first turn via session-table membership."""
+    router = ConversationRouter(server_role=None, servers=servers)
+
+    # First turn: conv_id not yet in the session table (FALLBACK path).
+    _, info = await router.get_next_server(_conv_chat_request("c1"))
+    assert info["is_first_turn"] is True
+
+    # Second turn of the same conversation: STICKY, not a first turn.
+    _, info = await router.get_next_server(_conv_chat_request("c1"))
+    assert info["is_first_turn"] is False
+
+    # A different conversation is a first turn again.
+    _, info = await router.get_next_server(_conv_chat_request("c2"))
+    assert info["is_first_turn"] is True
+
+    # No conversation id -> implicit/fallback, never reported as first turn.
+    _, info = await router.get_next_server(
+        ChatCompletionRequest(messages=[{
+            "role": "user",
+            "content": "unrelated " * 50
+        }],
+                              model="TinyLlama"))
+    assert info["is_first_turn"] is False
+
+
 # ---------------------------------------------------------------------------
 # _tokenize: tools + chat_template_kwargs forwarding (PR #13232)
 # ---------------------------------------------------------------------------
