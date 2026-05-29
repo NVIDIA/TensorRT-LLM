@@ -91,6 +91,7 @@ _TORCH_TO_MLIR_DTYPE = {
     torch.float8_e4m3fn: Float8E4M3FNType,
     torch.float8_e5m2: Float8E5M2Type,
     torch.int8: lambda: IntegerType(8),
+    torch.uint8: lambda: IntegerType(8),  # NVFP4 packs FP4 into uint8 buffers
     torch.int16: lambda: IntegerType(16),
     torch.int32: lambda: IntegerType(32),
     torch.int64: lambda: IntegerType(64),
