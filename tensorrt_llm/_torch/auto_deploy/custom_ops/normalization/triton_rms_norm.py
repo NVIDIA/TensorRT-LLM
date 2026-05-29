@@ -80,14 +80,8 @@ def rms_norm(hidden_states: Tensor, weight: Tensor, eps: float = 1e-5):
     return out
 
 
-# ---------------------------------------------------------------------------
-# V25: fused residual-add + RMSNorm (one Triton kernel, keeps fast triton norm)
-# ---------------------------------------------------------------------------
-# Fuses `aten.add(x, residual)` + `triton_rms_norm` into one kernel.
-# Adds in bf16 (rounds the sum to the input dtype before the variance), exactly
-# matching the separate path: aten.add(bf16,bf16)->bf16, then triton_rms_norm
-# casts that bf16 sum to fp32 — so the result is bit-faithful to the unfused graph.
-# Returns (normed, residual_out = (x+residual) in input dtype).
+# Fused residual-add + RMSNorm in one kernel. Rounds the sum to the input dtype
+# before the variance, so the result is bit-identical to a separate add + norm.
 
 
 @triton.jit

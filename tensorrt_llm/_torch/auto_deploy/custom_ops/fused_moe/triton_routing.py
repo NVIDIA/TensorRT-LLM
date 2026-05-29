@@ -214,18 +214,8 @@ def _triton_fused_topk_softmax_fake(
     return routing_weights, selected_experts
 
 
-# ---------------------------------------------------------------------------
-# V24: fused EP-local expert-index remap + routing-weight mask
-# ---------------------------------------------------------------------------
-#
-# Replaces the 4 separate aten elementwise nodes that MoE EP-sharding
-# (sharding_ir.py:_localize_expert_indices) inserts per MoE layer:
-#     selected_experts_local = selected_experts - experts_per_rank*ep_rank   # sub
-#     div                    = selected_experts // experts_per_rank          # floordiv
-#     rank_mask              = (div == ep_rank) | (div >= ep_rank if last)    # eq/ge
-#     routing_weights_local  = routing_weights * rank_mask                    # mul
-# 58 MoE layers x 4 = ~232 tiny elementwise kernels/iter (PT fuses these).
-# This collapses them into ONE Triton kernel per layer.
+# Fused EP-local expert-index remap + routing-weight mask: collapses the 4
+# elementwise ops (sub / floordiv / eq|ge / mul) of EP sharding into one kernel.
 
 
 @triton.jit
@@ -307,12 +297,9 @@ def ep_local_route(
     ep_rank: int,
     is_last_rank: bool,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Fused EP-local expert remap + routing-weight mask (replaces 4 aten ops).
+    """Fused EP-local remap + weight mask -> (experts - rank_offset, weights * rank_mask).
 
-    Returns (selected_experts_local, routing_weights_local) where
-        selected_experts_local = selected_experts - experts_per_rank*ep_rank
-        routing_weights_local   = routing_weights * mask
-        mask = (selected_experts // experts_per_rank) {>= if last else ==} ep_rank
+    rank_mask = (experts // experts_per_rank) {>= if last else ==} ep_rank.
     """
     return ep_local_route_fn(
         selected_experts, routing_weights, experts_per_rank, ep_rank, is_last_rank

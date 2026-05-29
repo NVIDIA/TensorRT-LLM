@@ -10,31 +10,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""V26: fuse the MoE all-reduce into the residual-add + RMSNorm (PT moe_allreduce).
+"""Fuse the MoE all-reduce into the residual-add + RMSNorm (one fused op).
 
-The post-V25 MoE-layer tail is:
+Folds a standalone all-reduce + a separate residual+norm into the fused
+allreduce_residual_rmsnorm op. Algebraically identical; same op the attention
+path already uses. Must run after the multi-stream pass builds the merge.
 
-    routed = trtllm_quant_nvfp4_moe_fused(...)                       # [bs, H] (2D)
-    ar     = trtllm_dist_all_reduce(routed, strategy)
-    view   = aten.view(ar, [B, S, H])                                # 3D
-    wa     = wait_aux_stream_passthrough(view)                       # aux->main sync
-    merged = aten.add(wa, shared)                                    # routed + shared expert
-    normed, res = triton_fused_add_rms_norm(merged, prev_residual, next_norm_w, eps)
-
-PyTorch fuses the all-reduce + residual-add + next input_layernorm into one
-``moe_allreduce`` op.  AD's attention path already uses the fused
-``dist.trtllm_fused_allreduce_residual_rmsnorm`` (AR + residual + RMSNorm); this
-transform applies the same fused op to the MoE path:
-
-    shared_sync     = wait_aux_stream_passthrough(shared)            # keep aux->main sync
-    shared_plus_res = aten.add(shared_sync, prev_residual)
-    routed_3d       = aten.view(routed, [B, S, H])
-    normed, res     = dist.trtllm_fused_allreduce_residual_rmsnorm(
-                          routed_3d, shared_plus_res, next_norm_w, eps, strategy)
-
-Algebraically identical: norm(AR(routed) + shared + prev_residual).  Removes the
-standalone all-reduce + the separate norm round-trip.  The fused op returns the same
-(normed, residual_out) tuple as triton_fused_add_rms_norm, so we just replace uses.
+BEFORE (per layer):                          AFTER:
+  routed --> dist_all_reduce                   shared --> wait_aux
+       |--> view                                    |--> add(., residual)
+  shared --> wait_aux --> add(., shared)       routed --> view
+       |--> triton_fused_add_rms_norm(             \\__> fused_allreduce_residual_rmsnorm
+                merged, residual)                       (routed, shared+residual)
+  => dist_all_reduce + add + norm            => one fused op (AR epilogue does add+norm)
 """
 
 from typing import Tuple
