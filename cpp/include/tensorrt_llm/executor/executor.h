@@ -1510,8 +1510,12 @@ private:
     /// transfer may be degraded.
     std::optional<size_t> mMaxTokensInBuffer;
     std::optional<int> mKvTransferTimeoutMs;
-    // @brief Timeout in milliseconds to wait for the sender future to be ready when scheduled batch size is 0. This
-    // allows the request to be eventually cancelled by the user or because of kv_transfer_timeout_ms
+    /// @brief Advanced. Maximum time in milliseconds the executor blocks waiting for a context (sender-side) KV cache
+    /// transfer to become ready during a bounded progress check, i.e. when there is little or no other work to
+    /// schedule. On timeout this is non-fatal: the transfer keeps running in the background and the request is
+    /// re-checked on the next iteration. It only bounds how long the executor stalls on sends per check so it can
+    /// return to handle cancellation; it does NOT bound the total transfer time (see mKvTransferTimeoutMs). Most users
+    /// should not need to change this.
     std::optional<int> mKvTransferSenderFutureTimeoutMs;
 };
 
