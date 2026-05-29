@@ -26,7 +26,8 @@ from .interface import (AttentionBackend, AttentionForwardArgs,
                         PositionalEmbeddingParams, PredefinedAttentionMask,
                         RopeParams, merge_attention_forward_args)
 
-# Enable TRTLLM-Gen attention backend via environment variable (default: on).
+# Enable TRTLLM-Gen attention backend by default. Set
+# TRTLLM_ENABLE_TRTLLM_GEN_ATTENTION=0 to force the thop.attention path.
 _TRTLLM_ENABLE_TRTLLM_GEN_ATTENTION = (os.environ.get(
     "TRTLLM_ENABLE_TRTLLM_GEN_ATTENTION", "0") == "1")
 
