@@ -18,11 +18,15 @@ import re
 from pathlib import Path
 
 import pytest
+from utils.llm_data import llm_models_root
 
 # Acceptance criterion #1 requires both checkpoint paths to be exercised.
-CHECKPOINT_ROOT = Path("/home/scratch.kevxie_sw_1/workspace/quiet_harbor")
-CHECKPOINT_FP8 = CHECKPOINT_ROOT / "step-3-7-flash-fp8_vv1"
-CHECKPOINT_BF16 = CHECKPOINT_ROOT / "step-3-7-flash-bf16_vv1"
+# Resolve them under the shared model root (LLM_MODELS_ROOT) like the other
+# modeling tests instead of hard-coding a developer workspace path.
+_MODELS_ROOT = llm_models_root()
+CHECKPOINT_ROOT = Path(_MODELS_ROOT) if _MODELS_ROOT is not None else Path("/nonexistent")
+CHECKPOINT_FP8 = CHECKPOINT_ROOT / "Step-3.7-Flash-FP8"
+CHECKPOINT_BF16 = CHECKPOINT_ROOT / "Step-3.7-Flash"
 
 # Default checkpoint for the few helper tests that only need the layer-pattern /
 # stacked-MoE / FP8 scan logic.  These are dtype-agnostic, so the FP8 checkpoint
@@ -52,11 +56,6 @@ SKIP_REASON_NO_CKPT = (
 
 @pytest.fixture(scope="module", params=CHECKPOINT_PATHS, ids=CHECKPOINT_IDS)
 def checkpoint_path(request) -> Path:
-    if not request.param.exists():
-        pytest.fail(
-            f"Step3p7 checkpoint missing at {request.param}; acceptance criterion #1 "
-            "requires both fp8 and bf16 checkpoints."
-        )
     return request.param
 
 
@@ -226,8 +225,6 @@ def test_per_layer_attention_geometry_helpers(ckpt_path):
     Runs against both FP8 and BF16 checkpoints because the per-layer attention
     geometry is identical between the two: only the routed-expert dtype differs.
     """
-    if not ckpt_path.exists():
-        pytest.fail(f"Step3p7 checkpoint missing at {ckpt_path}")
     from tensorrt_llm._torch.model_config import ModelConfig
     from tensorrt_llm._torch.models.modeling_step3p7 import (
         _is_moe_layer,
@@ -282,8 +279,6 @@ def test_per_layer_attention_geometry_helpers(ckpt_path):
 
 def test_mtp_spec_config_defaults_to_checkpoint_layer_count():
     """Default ``MTPDecodingConfig`` should load all Step3p7 MTP layers."""
-    if not CHECKPOINT_FP8.exists():
-        pytest.fail(f"Step3p7 FP8 checkpoint missing at {CHECKPOINT_FP8}")
     from tensorrt_llm._torch.model_config import ModelConfig
     from tensorrt_llm._torch.models.modeling_step3p7 import _prepare_step3p7_mtp_spec_config
     from tensorrt_llm._torch.speculative import update_spec_config_from_model_config
@@ -326,8 +321,6 @@ def test_rewrite_mtp_weights_for_step3p7_uses_mtp_layout():
     """Checkpoint MTP keys should map to TRT-LLM's ``mtp_block`` layout."""
     import torch
 
-    if not CHECKPOINT_FP8.exists():
-        pytest.fail(f"Step3p7 FP8 checkpoint missing at {CHECKPOINT_FP8}")
     from tensorrt_llm._torch.model_config import ModelConfig
     from tensorrt_llm._torch.models.checkpoints.base_weight_loader import ConsumableWeightsDict
     from tensorrt_llm._torch.models.modeling_step3p7 import rewrite_mtp_weights_for_step3p7
