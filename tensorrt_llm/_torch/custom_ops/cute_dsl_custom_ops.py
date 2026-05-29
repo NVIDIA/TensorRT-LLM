@@ -6081,6 +6081,15 @@ if IS_CUTLASS_DSL_AVAILABLE:
             raise ValueError(
                 f"CuteDSL: SM version {get_sm_version()} is not supported. "
                 f"CuteDSL GVR Top-K Decode only supports SM 100 family.")
+        # num_rows = batch_size * next_n contract; downstream sizing of
+        # pre_idx/seq_lens/output_indices derives batch_size from this.
+        # Caught here so the user sees a clear message instead of an OOB
+        # write or ZeroDivisionError deep inside the kernel.
+        if logits.shape[0] % next_n != 0:
+            raise ValueError(
+                f"logits.shape[0] (={logits.shape[0]}) must be divisible by "
+                f"next_n (={next_n}); the kernel derives batch_size as "
+                f"logits.shape[0] / next_n.")
         logger.info_once(
             f"cute_dsl_gvr_topk_decode inputs: "
             f"logits dtype={logits.dtype} shape={tuple(logits.shape)} stride={logits.stride()}; "
