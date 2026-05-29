@@ -232,8 +232,9 @@ bool AttentionOp::convertMMHAParamsToXQAParams(tensorrt_llm::kernels::XQAParams&
     {
         xqaParams.kv_cache_data_type = xqaParams.data_type;
     }
+    // SM120/121 ship FP8 paged-KV XQA cubins with multi-block support.
     if (xqaParams.kv_cache_data_type == DATA_TYPE_INT8
-        || (xqaParams.kv_cache_data_type == DATA_TYPE_E4M3 && (mSM < kSM_90 || mSM >= kSM_120)))
+        || (xqaParams.kv_cache_data_type == DATA_TYPE_E4M3 && mSM < kSM_90))
     {
         xqaParams.multi_block_mode = false;
     }

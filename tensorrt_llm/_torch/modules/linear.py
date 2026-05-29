@@ -1861,6 +1861,167 @@ class NVFP4LinearMethod(LinearMethodBase):
                     module.rebuild_tensor_metadata)
 
 
+class W4A16NVFP4LinearMethod(NVFP4LinearMethod):
+
+    CUDA_CORE_MAX_M: ClassVar[int] = 16
+    CUTLASS3_ENV: ClassVar[str] = "TRTLLM_W4A16_NVFP4_CUTLASS3"
+
+    def _can_use_cutlass3_w4a16_prefill(self, module: Linear,
+                                        input: torch.Tensor, m: int) -> bool:
+        if os.environ.get(self.CUTLASS3_ENV, "0") != "1":
+            return False
+        if m <= self.CUDA_CORE_MAX_M:
+            return False
+        if get_sm_version() not in (120, 121):
+            return False
+        if input.dtype != torch.bfloat16:
+            return False
+        if module.dtype != torch.bfloat16:
+            return False
+        if input.shape[-1] % 32 != 0:
+            return False
+        if module.weight.shape[0] % 32 != 0:
+            return False
+        return True
+
+    def create_weights(self, module: Linear, in_features: int,
+                       out_features: int, bias: bool, dtype: torch.dtype):
+        module.scaling_vector_size = 16
+        assert in_features % module.scaling_vector_size == 0, (
+            f"in_features {in_features} must be divisible by scaling_vector_size {module.scaling_vector_size}"
+        )
+
+        module.weight = Parameter(torch.empty([out_features, in_features // 2],
+                                              dtype=fp4_utils.float4_e2m1x2),
+                                  requires_grad=False)
+
+        nrows = fp4_utils.pad_up(out_features, 128)
+        ncols = fp4_utils.pad_up(in_features // module.scaling_vector_size, 4)
+        module.weight_scale = Parameter(torch.empty(
+            [nrows * ncols], dtype=fp4_utils.float4_sf_dtype),
+                                        requires_grad=False)
+
+        module.weight_scale_2 = Parameter(torch.empty([1], dtype=torch.float32),
+                                          requires_grad=False)
+
+        module.input_scale = None
+        module.inv_input_scale = None
+        module.alpha = None
+        module.pre_quant_scale = None
+
+        module.kv_scales = Parameter(torch.ones(3, dtype=torch.float32),
+                                     requires_grad=False)
+        module.inv_kv_scales = Parameter(torch.ones(3, dtype=torch.float32),
+                                         requires_grad=False)
+
+        if bias:
+            module.bias = Parameter(torch.empty((out_features), dtype=dtype),
+                                    requires_grad=False)
+        else:
+            module.register_parameter("bias", None)
+
+    def _process_weights_without_static_activation_scale(
+            self, module: Linear, process_fn):
+        original_input_scale = module.input_scale
+        original_inv_input_scale = module.inv_input_scale
+        original_alpha = module.alpha
+        had_scalar_alpha = hasattr(module, "scalar_alpha")
+        original_scalar_alpha = getattr(module, "scalar_alpha", None)
+        has_weight_global_scale = bool(
+            getattr(module, "tmp_nvfp4_weight_scale_2_list", []))
+
+        device = module.weight_scale_2.device
+        module.input_scale = Parameter(torch.empty([1],
+                                                   dtype=torch.float32,
+                                                   device=device),
+                                       requires_grad=False)
+        module.inv_input_scale = Parameter(torch.empty([1],
+                                                       dtype=torch.float32,
+                                                       device=device),
+                                           requires_grad=False)
+        module.alpha = Parameter(torch.empty([1],
+                                             dtype=torch.float32,
+                                             device=device),
+                                 requires_grad=False)
+        try:
+            process_fn(module)
+            if has_weight_global_scale:
+                self._convert_weight_global_scale_to_dequant_scale(module)
+        finally:
+            module.input_scale = original_input_scale
+            module.inv_input_scale = original_inv_input_scale
+            module.alpha = original_alpha
+            if had_scalar_alpha:
+                module.scalar_alpha = original_scalar_alpha
+            elif hasattr(module, "scalar_alpha"):
+                delattr(module, "scalar_alpha")
+
+    @staticmethod
+    def _convert_weight_global_scale_to_dequant_scale(module: Linear):
+        weight_scale_2 = module.weight_scale_2.data.float()
+        dequant_scale = torch.zeros_like(weight_scale_2)
+        nonzero = weight_scale_2 != 0
+        dequant_scale[nonzero] = weight_scale_2[nonzero].reciprocal()
+        copy_weight(module.weight_scale_2, dequant_scale)
+
+    def process_weights_after_loading_vanilla(self, module: Linear):
+        self._process_weights_without_static_activation_scale(
+            module,
+            super().process_weights_after_loading_vanilla)
+
+    def process_weights_after_loading_fused_qkv_linear(self, module: Linear):
+        self._process_weights_without_static_activation_scale(
+            module,
+            super().process_weights_after_loading_fused_qkv_linear)
+
+    def process_weights_after_loading_fused_gate_up_linear(
+            self, module: Linear):
+        self._process_weights_without_static_activation_scale(
+            module,
+            super().process_weights_after_loading_fused_gate_up_linear)
+
+    def apply(self, module: Linear, input: torch.Tensor,
+              bias: Optional[torch.Tensor]):
+        if input.dim() == 1:
+            m = 1
+        elif input.dim() > 2:
+            m = math.prod(input.shape[:-1])
+        else:
+            m = input.shape[0]
+        use_cutlass3_prefill = self._can_use_cutlass3_w4a16_prefill(
+            module, input, m)
+
+        original_shape = None
+        if input.dim() > 2:
+            original_shape = input.shape
+            input = input.reshape(-1, input.shape[-1])
+
+        if module.pre_quant_scale is not None:
+            assert input.dtype == module.pre_quant_scale.dtype, "Input dtype and pre_quant_scale dtype must match"
+            input = input * module.pre_quant_scale
+
+        gemm_op = (torch.ops.trtllm.w4a16_nvfp4_cutlass_gemm if
+                   use_cutlass3_prefill else torch.ops.trtllm.w4a16_nvfp4_gemm)
+        output = gemm_op(
+            input,
+            module.weight,
+            module.weight_scale,
+            module.weight_scale_2,
+            module.dtype,
+            bias=None,
+        )
+
+        if output.shape[-1] > module.out_features:
+            output = output[..., :module.out_features].contiguous()
+
+        if original_shape is not None:
+            output = output.reshape(*original_shape[:-1], output.shape[-1])
+
+        if bias is not None:
+            output = output + bias
+        return output
+
+
 class W4A8NVFP4FP8LinearMethod(LinearMethodBase):
 
     def create_weights(self, module: Linear, in_features: int,
@@ -2720,6 +2881,8 @@ def get_quant_method(quant_config: Optional[QuantConfig] = None):
             return NVFP4ARCLinearMethod()
         else:
             return NVFP4LinearMethod()
+    if quant_config.layer_quant_mode.has_w4a16_nvfp4():
+        return W4A16NVFP4LinearMethod()
     if quant_config.layer_quant_mode.has_w4a8_nvfp4_fp8():
         return W4A8NVFP4FP8LinearMethod()
     if quant_config.layer_quant_mode.has_w4a8_mxfp4_fp8():

@@ -24,8 +24,8 @@ from tensorrt_llm.llmapi.llm_args import (DeepSeekSparseAttentionConfig,
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
-from tensorrt_llm.models.quant_config_utils import \
-    update_quant_config_from_compressed_tensors
+from tensorrt_llm.models.quant_config_utils import (
+    is_w4a16_nvfp4_hf_quant_config, update_quant_config_from_compressed_tensors)
 from tensorrt_llm.quantization.mode import QuantAlgo
 from tensorrt_llm.quantization.modelopt_config import (
     is_modelopt_quant_config, read_modelopt_quant_config,
@@ -323,18 +323,36 @@ class ModelConfig(Generic[TConfig]):
 
         return "CUTLASS"
 
+    def resolve_moe_backend_after_quant_config(
+            moe_backend: str, architecture: str,
+            quant_config: QuantConfig) -> str:
+        """Resolve AUTO moe_backend after quantization metadata is known."""
+        if moe_backend.upper() != "AUTO":
+            return moe_backend
+
+        is_w4a16_nvfp4 = quant_config.quant_algo in (QuantAlgo.W4A16_NVFP4,
+                                                     "W4A16_NVFP4")
+        if is_w4a16_nvfp4 and get_sm_version() in (120, 121):
+            return "CUTEDSL"
+
+        return ModelConfig.resolve_moe_backend(moe_backend, architecture)
+
     @staticmethod
-    def load_modelopt_quant_config(quant_config_file, checkpoint_dir,
-                                   moe_backend):
+    def load_modelopt_quant_config(quant_config_file,
+                                   checkpoint_dir,
+                                   moe_backend,
+                                   hf_quant_config=None):
         with open(quant_config_file) as f:
             quant_config_dict = json.load(f)
         return ModelConfig._build_modelopt_quant_config(
             read_modelopt_quant_config(quant_config_dict), checkpoint_dir,
-            moe_backend)
+            moe_backend, hf_quant_config)
 
     @staticmethod
-    def _build_modelopt_quant_config(json_quant_configs, checkpoint_dir,
-                                     moe_backend):
+    def _build_modelopt_quant_config(json_quant_configs,
+                                     checkpoint_dir,
+                                     moe_backend,
+                                     hf_quant_config=None):
         """Build (quant_config, layer_quant_config) from a normalized modelopt 'quantization' inner dict.
 
         ``json_quant_configs`` should be a dict as produced by
@@ -358,6 +376,13 @@ class ModelConfig(Generic[TConfig]):
             quant_config.has_zero_point = json_quant_configs['has_zero_point']
         if 'pre_quant_scale' in json_quant_configs:
             quant_config.pre_quant_scale = json_quant_configs['pre_quant_scale']
+
+        if (quant_config.quant_algo in (QuantAlgo.NVFP4, "NVFP4")
+                and is_w4a16_nvfp4_hf_quant_config(hf_quant_config)):
+            quant_config.quant_algo = QuantAlgo.W4A16_NVFP4
+            quant_config.group_size = 16
+            quant_config.exclude_modules = hf_quant_config.get(
+                "ignore", quant_config.exclude_modules)
 
         if quant_config.quant_algo == QuantAlgo.MIXED_PRECISION:
             json_extended_quant_configs: dict = {}
@@ -547,6 +572,7 @@ class ModelConfig(Generic[TConfig]):
         new_algo = os.environ.get("OVERRIDE_QUANT_ALGO", None)
         supported_algos = {
             "W4A16_MXFP4": QuantAlgo.W4A16_MXFP4,
+            "W4A16_NVFP4": QuantAlgo.W4A16_NVFP4,
             "W4A8_MXFP4_MXFP8": QuantAlgo.W4A8_MXFP4_MXFP8,
             "W4A8_MXFP4_FP8": QuantAlgo.W4A8_MXFP4_FP8,
         }
@@ -703,6 +729,9 @@ class ModelConfig(Generic[TConfig]):
         moe_backend_hint = cls.resolve_moe_backend(requested_moe_backend,
                                                    architecture)
 
+        hf_quant_config = getattr(pretrained_config, "quantization_config",
+                                  None)
+
         # quantized ckpt in modelopt format
         if quant_config_file := cached_file(checkpoint_dir,
                                             'hf_quant_config.json'):
@@ -717,7 +746,10 @@ class ModelConfig(Generic[TConfig]):
                 source_file="hf_quant_config.json",
             )
             quant_config, layer_quant_config = cls._build_modelopt_quant_config(
-                normalized, checkpoint_dir, moe_backend_hint)
+                normalized,
+                checkpoint_dir,
+                moe_backend_hint,
+                hf_quant_config=hf_quant_config)
         # quantized ckpt in other formats
         elif getattr(pretrained_config, "quantization_config",
                      None) is not None:
@@ -730,11 +762,8 @@ class ModelConfig(Generic[TConfig]):
             quant_config, layer_quant_config = cls.load_quant_config_from_dtypes_json(
                 quant_config_file, moe_backend_hint)
 
-        kwargs['moe_backend'] = cls.resolve_moe_backend(
-            requested_moe_backend,
-            architecture,
-            quant_config=quant_config,
-        )
+        kwargs['moe_backend'] = cls.resolve_moe_backend_after_quant_config(
+            requested_moe_backend, architecture, quant_config)
 
         model_config = cls(pretrained_config=pretrained_config,
                            quant_config=quant_config,

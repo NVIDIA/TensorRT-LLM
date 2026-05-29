@@ -5,6 +5,7 @@ from tensorrt_llm._torch.models.checkpoints.hf.weight_mapper import \
     HfWeightMapper
 from tensorrt_llm._torch.models.modeling_utils import register_mapper
 from tensorrt_llm._torch.utils import split
+from tensorrt_llm.quantization.mode import QuantAlgo
 
 
 @register_mapper("HF", "NemotronHPuzzleForCausalLM")
@@ -40,10 +41,23 @@ class NemotronHHfWeightMapper(HfWeightMapper):
             w = torch.concat(w).contiguous()
             return w
 
-        is_nvfp4 = self.config.quant_config.quant_algo == "NVFP4"
+        quant_algo = getattr(self.config.quant_config, "quant_algo", None)
+        is_nvfp4 = quant_algo in (QuantAlgo.NVFP4, QuantAlgo.W4A16_NVFP4,
+                                  "NVFP4", "W4A16_NVFP4")
         n_groups = config.n_groups
         d_state = config.ssm_state_size
         nheads = config.mamba_num_heads
+
+        def _canonicalize_quant_key(key: str) -> str:
+            replacements = {
+                ".weight_packed": ".weight",
+                ".weight_global_scale": ".weight_scale_2",
+                ".input_global_scale": ".input_scale_2",
+            }
+            for suffix, replacement in replacements.items():
+                if key.endswith(suffix):
+                    return f"{key[:-len(suffix)]}{replacement}"
+            return key
 
         new_weights = {}
         for name, _ in weights.items():
@@ -69,6 +83,8 @@ class NemotronHHfWeightMapper(HfWeightMapper):
 
             if "A_log" in key:
                 key = key.replace("A_log", "A")
+
+            key = _canonicalize_quant_key(key)
 
             if ("mixer.in_proj" in key
                     or "mixer.out_proj" in key) and "_scale" in key:

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2023-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -134,6 +134,11 @@ public:
         return QuantMode(BaseType(1u) << 16);
     }
 
+    static constexpr QuantMode w4a16Nvfp4() noexcept
+    {
+        return QuantMode(BaseType(1u) << 17);
+    }
+
     constexpr BaseType value() const noexcept
     {
         return mValue;
@@ -222,6 +227,11 @@ public:
     constexpr bool hasW4a16Mxfp4() const noexcept
     {
         return isSet(w4a16Mxfp4());
+    }
+
+    constexpr bool hasW4a16Nvfp4() const noexcept
+    {
+        return isSet(w4a16Nvfp4());
     }
 
     constexpr bool hasKvCacheQuant() const noexcept
@@ -418,6 +428,10 @@ public:
         {
             quantMode = fromDescription(false, false, false, false, false, false, false, false, false, false, false,
                 false, false, false, false, true);
+        }
+        else if (quantAlgo == "W4A16_NVFP4")
+        {
+            quantMode = w4a16Nvfp4();
         }
 
         if (kvCacheQuantAlgo == "INT8")

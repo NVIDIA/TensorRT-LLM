@@ -9,6 +9,7 @@ from tensorrt_llm.functional import AllReduceParams
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.math_utils import ceil_div
 
+from ...models.modeling_utils import QuantConfig
 from ..distributed import allgather
 from .linear import Linear, TensorParallelMode
 
@@ -22,6 +23,8 @@ class LMHead(Linear):
         dtype (Optional[torch.dtype]): type of the parameters.
         mapping (Optional[Mapping]): parallelism configuration.
             If not provided, the embedding is not parallelized.
+        quant_config (Optional[QuantConfig]): quantization configuration for
+            the lm head projection.
     """
 
     def __init__(
@@ -34,6 +37,7 @@ class LMHead(Linear):
         gather_output: bool = False,
         reduce_output: bool = True,
         use_custom_cublas_mm: bool = False,
+        quant_config: Optional[QuantConfig] = None,
     ):
         local_in_features = embedding_dim
         local_out_features = num_embeddings
@@ -66,6 +70,7 @@ class LMHead(Linear):
             gather_output=gather_output,
             reduce_output=reduce_output,
             use_custom_cublas_mm=use_custom_cublas_mm,
+            quant_config=quant_config,
         )
 
         if tensor_parallel_mode == TensorParallelMode.ROW:
@@ -76,9 +81,10 @@ class LMHead(Linear):
         self.num_embeddings = num_embeddings
         self.embedding_dim = embedding_dim
 
-        weight_shape = (self.out_features, self.in_features)
-        self.weight = Parameter(torch.empty(weight_shape, dtype=dtype))
-        self.register_parameter("bias", None)
+        if not self.has_any_quant:
+            weight_shape = (self.out_features, self.in_features)
+            self.weight = Parameter(torch.empty(weight_shape, dtype=dtype))
+            self.register_parameter("bias", None)
 
     @property
     def vocab_size_padded(self) -> int:
@@ -126,7 +132,7 @@ class LMHead(Linear):
                      weights: List[Dict],
                      allow_partial_loading: bool = False):
         original_weight = None
-        if self.tp_mode == TensorParallelMode.COLUMN:
+        if self.tp_mode == TensorParallelMode.COLUMN and not self.has_any_quant:
             if self.tp_rank == self.tp_size - 1 and self.padding_size > 0:
                 original_weight = self.weight.data.zero_()
                 self.weight.data = self.weight[:-self.padding_size, :]

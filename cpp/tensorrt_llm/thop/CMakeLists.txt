@@ -50,6 +50,7 @@ add_library(
   cublasFp4ScaledMM.cpp
   cudaNvfp4MM.cpp
   cudaScaledMM.cpp
+  w4a16Nvfp4Gemm.cpp
   dynamicDecodeOp.cpp
   fmhaPackMaskOp.cpp
   fp8Op.cpp
