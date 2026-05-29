@@ -248,6 +248,8 @@ class QWenForCausalLM(DecoderModelForCausalLM):
                                        tp_group=config.mapping.tp_group,
                                        tp_size=config.mapping.tp_size,
                                        gather_output=True)
+            elif getattr(config, 'is_embedding', False):
+                lm_head = None
             else:
                 lm_head = ColumnLinear(config.hidden_size,
                                        vocab_size_padded,
@@ -376,6 +378,11 @@ class QWenForCausalLM(DecoderModelForCausalLM):
                     "lm_head": "language_model.lm_head",
                 }
             elif config.qwen_type == "qwen3":
+                custom_dict = {
+                    "q_layernorm": "q_norm",
+                    "k_layernorm": "k_norm",
+                }
+            elif getattr(config, 'is_embedding', False):
                 custom_dict = {
                     "q_layernorm": "q_norm",
                     "k_layernorm": "k_norm",

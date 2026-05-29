@@ -35,6 +35,7 @@ class QWenConfig(PretrainedConfig):
                  num_labels: int = 1,
                  mlp_only_layers: Optional[list] = None,
                  decoder_sparse_step: int = 1,
+                 is_embedding: bool = False,
                  **kwargs):
         self.mlp_bias = mlp_bias
         self.attn_bias = attn_bias
@@ -45,6 +46,7 @@ class QWenConfig(PretrainedConfig):
         self.use_logn_attn = use_logn_attn
         self.mlp_only_layers = mlp_only_layers or []
         self.decoder_sparse_step = decoder_sparse_step
+        self.is_embedding = is_embedding
         if moe is None:
             # Legacy MOE config fields
             moe = MoeConfig(num_experts=kwargs.pop('moe_num_experts', 0),
@@ -112,7 +114,7 @@ class QWenConfig(PretrainedConfig):
             hf_config.architectures = ['Qwen2ForCausalLM']
 
         valid_types = ('qwen', 'qwen2', 'qwen2_moe', 'qwen2_llava_onevision',
-                       'qwen2_vl', 'qwen2_audio', 'qwen3', 'qwen3_moe')
+                       'qwen2_vl', 'qwen2_audio', 'qwen3', 'qwen3_moe', 'qwen3_embedding')
         assert qwen_type in valid_types, f"Unsupported Qwen type: {qwen_type}, only {valid_types} are acceptable."
         num_key_value_heads = getattr(hf_config, "num_key_value_heads",
                                       hf_config.num_attention_heads)
@@ -125,7 +127,7 @@ class QWenConfig(PretrainedConfig):
             hidden_act = "swiglu"
 
         # Qwen3 models have no attention bias, while legacy models have bias
-        if qwen_type in ('qwen3', 'qwen3_moe'):
+        if qwen_type in ('qwen3', 'qwen3_moe', 'qwen3_embedding'):
             attn_bias = False  # Qwen3 models have no attn bias
         else:
             attn_bias = True  # Legacy Qwen models have attn bias
@@ -141,9 +143,14 @@ class QWenConfig(PretrainedConfig):
             rms_norm_eps = hf_config.rms_norm_eps
             rotary_base = get_hf_rope_theta(hf_config, 100000.0)
 
+        
         num_labels = 1
         if hf_config.architectures[0] == "Qwen2ForSequenceClassification":
             num_labels = hf_config.num_labels
+
+        is_embedding = False
+        if hf_config.architectures[0] in ["Qwen2ForRewardModel", "Qwen2ForEmbedding", "Qwen3ForEmbedding"]:
+            is_embedding = True
 
         moe_num_experts = getattr(hf_config, "num_experts", 0)
         moe_top_k = getattr(hf_config, "num_experts_per_tok", 0)
@@ -208,4 +215,5 @@ class QWenConfig(PretrainedConfig):
             quantization=quant_config,
             num_labels=num_labels,
             tie_word_embeddings=tie_word_embeddings,
+            is_embedding=is_embedding,
             **kwargs)
