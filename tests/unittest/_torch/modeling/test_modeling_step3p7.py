@@ -285,6 +285,8 @@ def test_mtp_spec_config_defaults_to_checkpoint_layer_count():
     from tensorrt_llm.llmapi.llm_args import MTPDecodingConfig
 
     spec_config = MTPDecodingConfig()
+    # Unset → None sentinel; resolved to the checkpoint layer count below.
+    assert spec_config.max_draft_len is None
     assert "max_draft_len" not in spec_config.model_fields_set
     model_config = ModelConfig.from_pretrained(
         str(CHECKPOINT_FP8),

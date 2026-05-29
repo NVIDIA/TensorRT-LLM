@@ -82,16 +82,16 @@ def test_LookaheadDecodingConfig():
 def test_MTPDecodingConfig_default_draft_len_is_not_user_set():
     config = MTPDecodingConfig()
 
-    assert config.max_draft_len == 1
-    assert config.max_total_draft_tokens == 1
+    # Unset max_draft_len stays None (the "use the model's
+    # num_nextn_predict_layers" sentinel) until resolved at model load.
+    assert config.max_draft_len is None
+    assert config.max_total_draft_tokens is None
     assert "max_draft_len" not in config.model_fields_set
-    assert "max_total_draft_tokens" not in config.model_fields_set
 
     explicit_config = MTPDecodingConfig(max_draft_len=1)
     assert explicit_config.max_draft_len == 1
     assert explicit_config.max_total_draft_tokens == 1
     assert "max_draft_len" in explicit_config.model_fields_set
-    assert "max_total_draft_tokens" not in explicit_config.model_fields_set
 
 
 class TestYaml:

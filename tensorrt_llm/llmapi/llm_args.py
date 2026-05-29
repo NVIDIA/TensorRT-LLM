@@ -1653,20 +1653,15 @@ class MTPDecodingConfig(DecodingBaseConfig):
 
     @model_validator(mode="after")
     def set_max_total_draft_tokens(self):
-        # Default max_draft_len to 1 if not set by the user.
-        # For vanilla MTP, update_spec_config_from_model_config will override this
-        # with the actual num_nextn_predict_layers from the model.
-        # Keep model_fields_set limited to fields the user supplied.
-        if self.max_draft_len is None:
-            object.__setattr__(self, "max_draft_len", 1)
-        elif self.max_draft_len <= 0:
-            raise ValueError("max_draft_len must be > 0 for MTP")
-        # Current MTP only supports linear tree.
-        object.__setattr__(
-            self,
-            "max_total_draft_tokens",
-            self.max_draft_len,
-        )
+        # Leave max_draft_len as None ("use the model's num_nextn_predict_layers")
+        # when the user doesn't set it; update_spec_config_from_model_config
+        # resolves it from the checkpoint before the model runs. When the user
+        # does set it, validate and mirror to max_total_draft_tokens (current MTP
+        # only supports a linear tree).
+        if self.max_draft_len is not None:
+            if self.max_draft_len <= 0:
+                raise ValueError("max_draft_len must be > 0 for MTP")
+            self.max_total_draft_tokens = self.max_draft_len
         return self
 
     @model_validator(mode="after")

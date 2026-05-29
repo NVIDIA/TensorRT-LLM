@@ -1339,8 +1339,9 @@ def _prepare_step3p7_mtp_spec_config(model_config: ModelConfig) -> None:
     if not spec_config.spec_dec_mode.is_mtp_vanilla():
         return
 
-    user_set = "max_draft_len" in spec_config.model_fields_set
-    if not user_set or spec_config.max_draft_len >= model_layers:
+    # max_draft_len is None when the user didn't set it (use the model default);
+    # otherwise cap it at the model's MTP layer count.
+    if spec_config.max_draft_len is None or spec_config.max_draft_len >= model_layers:
         spec_config.max_draft_len = model_layers
     spec_config.max_total_draft_tokens = spec_config.max_draft_len
 

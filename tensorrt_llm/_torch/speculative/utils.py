@@ -385,14 +385,17 @@ def update_spec_config_from_model_config(spec_config, model_config):
     # This determines the actual MTP layer count in the checkpoint and drives
     # the spec_dec_mode decision (EAGLE vs vanilla MTP).
     spec_config.num_nextn_predict_layers = model_config.num_nextn_predict_layers
-    # For vanilla MTP (>1 MTP layers in the checkpoint): set max_draft_len to the
-    # minimum of the user-requested value and the model's layer count.
-    # If the user explicitly requested fewer draft tokens than the model has layers,
-    # honour that and warn. Otherwise default to using all model layers.
+    # max_draft_len is None when the user didn't set it (the "use the model
+    # default" sentinel); resolve it to a concrete value here, before any
+    # consumer reads it.
     if spec_config.spec_dec_mode.is_mtp_vanilla():
+        # Vanilla MTP (>1 MTP layers): default to all of the model's layers. If
+        # the user explicitly requested fewer draft tokens than the model has
+        # layers, honour that and warn.
         model_layers = spec_config.num_nextn_predict_layers
-        user_set = 'max_draft_len' in spec_config.model_fields_set
-        if user_set and spec_config.max_draft_len < model_layers:
+        if spec_config.max_draft_len is None:
+            spec_config.max_draft_len = model_layers
+        elif spec_config.max_draft_len < model_layers:
             logger.warning(
                 f"MTP: max_draft_len ({spec_config.max_draft_len}) is less than the model's "
                 f"num_nextn_predict_layers ({model_layers}). "
@@ -401,9 +404,12 @@ def update_spec_config_from_model_config(spec_config, model_config):
             # Keep the user-set max_draft_len as-is
         else:
             spec_config.max_draft_len = model_layers
-        spec_config.max_total_draft_tokens = spec_config.max_draft_len
-    # For Eagle MTP (1 MTP layer): max_draft_len controls how many times the
-    # single layer is run. It was already set by the user (defaults to 1).
+    else:
+        # Eagle MTP (1 MTP layer): max_draft_len controls how many times the
+        # single layer is run; default to 1 when the user didn't set it.
+        if spec_config.max_draft_len is None:
+            spec_config.max_draft_len = 1
+    spec_config.max_total_draft_tokens = spec_config.max_draft_len
 
 
 @dataclass
