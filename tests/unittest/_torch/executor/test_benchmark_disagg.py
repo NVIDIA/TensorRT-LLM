@@ -29,6 +29,7 @@ from unittest.mock import Mock, patch
 import pytest
 
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
+from tensorrt_llm.bindings import LlmRequestState
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -44,6 +45,8 @@ def _make_active_request(
     req.is_disagg_generation_init_state = in_init
     req.is_disagg_generation_transmission_in_progress = in_transfer
     req.is_attention_dp_dummy = False
+    req.state = LlmRequestState.GENERATION_IN_PROGRESS
+    req.py_kv_transfer_timed_out = False
     return req
 
 
@@ -84,6 +87,7 @@ class MockBenchmarkExecutor:
         self.num_fetch_requests = num_fetch_requests
         self.is_warmup = is_warmup
         self.active_requests = active_requests if active_requests is not None else []
+        self._handle_responses = Mock()
 
         self.dist = Mock()
         self.dist.rank = rank
