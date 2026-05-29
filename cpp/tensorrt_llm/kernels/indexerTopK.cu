@@ -1102,6 +1102,55 @@ static void launchMultiPassRadix(void* scratch, InputT const* logits, int const*
         reinterpret_cast<void const*>(&radixPassKernel<kPassThreads, 3, InputT>), (int const*) candBuf1, candBuf2);
 }
 
+// Architecture-derived GVR eligibility bounds (cached per-process).
+struct SchemeXBounds
+{
+    int smCount;
+    int l2Bytes;
+    int kBsWave;
+    int kBsL2;
+    int kBsLarge;
+    int kSeqSmall;
+};
+
+inline SchemeXBounds getSchemeXBounds(int numColumns, int bytesPerElem)
+{
+    static std::once_flag sOnce;
+    static int sSm = 0;
+    static int sL2 = 0;
+    static int sNMin = 0;
+    std::call_once(sOnce,
+        []()
+        {
+            int dev = 0;
+            cudaGetDevice(&dev);
+            cudaDeviceGetAttribute(&sSm, cudaDevAttrMultiProcessorCount, dev);
+            cudaDeviceGetAttribute(&sL2, cudaDevAttrL2CacheSize, dev);
+            constexpr int kSeqSmallDefault = 12288;
+            char const* env = std::getenv("TRTLLM_HEURISTIC_NMIN");
+            if (env != nullptr)
+            {
+                int const v = std::atoi(env);
+                sNMin = (v >= 1024 && v <= 200000) ? v : kSeqSmallDefault;
+            }
+            else
+            {
+                sNMin = kSeqSmallDefault;
+            }
+        });
+
+    SchemeXBounds b;
+    b.smCount = sSm;
+    b.l2Bytes = sL2;
+    b.kBsWave = (sSm > 0) ? (sSm * 3 - sSm / 8) : 426;
+    b.kBsL2 = (sL2 > 0 && numColumns > 0)
+        ? static_cast<int>(static_cast<int64_t>(sL2) * 9 / 10 / (static_cast<int64_t>(numColumns) * bytesPerElem))
+        : b.kBsWave;
+    b.kBsLarge = std::min(b.kBsWave, b.kBsL2 > 0 ? b.kBsL2 : b.kBsWave);
+    b.kSeqSmall = sNMin;
+    return b;
+}
+
 // Unified dispatcher (fp32 / bf16 / fp16). Each tier's kernel is templated on
 // InputT and casts to float at HBM-read sites; the scratch buffer is uint8.
 template <typename InputT>
@@ -1110,17 +1159,21 @@ void invokeIndexerTopKDecodeImpl(InputT const* logits, int const* seqLens, int* 
     int const* preIdx, int const preIdxStride, int const preIdxCount, InputT* heuristicScratch,
     cudaStream_t const stream, void* scratch, size_t scratchBytes, bool is_prefill)
 {
-    // Split-work cutoff: empirically the single-block tier wins below ~32k
-    // across bs in [1, 48]; multi-pass radix wins above. is_prefill forces
+    // Split-work cutoff: matches main's 200k default. is_prefill forces
     // single-block.
-    int const adaptiveSplitWorkThreshold = is_prefill ? (1 << 30) : 32768;
+    int const adaptiveSplitWorkThreshold = is_prefill ? (1 << 30) : 200 * 1000;
     int const effectiveSplitWorkThreshold = splitWorkThreshold > 0 ? splitWorkThreshold : adaptiveSplitWorkThreshold;
     constexpr int kNumThreadsPerBlock = 512;
 
-    // GVR is preferred when it'll pay back its fixed Phase-1/4 overhead.
+    // GVR eligibility (matches main's rule): supported K, stride1 contiguous,
+    // preIdx + scratch provided, numColumns in [kSeqSmall, splitWorkThreshold),
+    // and numRows below the architecture-derived wave/L2 bound. is_prefill
+    // suppresses GVR through effectiveSplitWorkThreshold being huge.
+    auto const bounds = getSchemeXBounds(numColumns, /*bytesPerElem=*/static_cast<int>(sizeof(InputT)));
     bool const isSupportedTopK = (topK == 512 || topK == 1024 || topK == 2048);
     bool const canUseHeuristic = preIdx != nullptr && stride1 == 1 && isSupportedTopK && preIdxCount == topK
-        && preIdxStride >= preIdxCount && heuristicScratch != nullptr && numColumns >= 32768 && numRows >= 64;
+        && preIdxStride >= preIdxCount && heuristicScratch != nullptr && numColumns >= bounds.kSeqSmall
+        && numColumns < effectiveSplitWorkThreshold && numRows < bounds.kBsLarge;
 
     // Env-gated dispatch trace (TRTLLM_SCHEMEX_DEBUG=1).
     {
@@ -1134,8 +1187,9 @@ void invokeIndexerTopKDecodeImpl(InputT const* logits, int const* seqLens, int* 
             });
         if (sDebug)
         {
-            fprintf(stderr, "[Scheme X] numRows=%d numColumns=%d -> %s path\n", numRows, numColumns,
-                canUseHeuristic ? "Heuristic" : "Radix");
+            fprintf(stderr,
+                "[Scheme X] numRows=%d numColumns=%d kBsLarge=%d kSeqSmall=%d -> %s path\n", numRows, numColumns,
+                bounds.kBsLarge, bounds.kSeqSmall, canUseHeuristic ? "Heuristic" : "Radix");
         }
     }
 
@@ -1231,16 +1285,17 @@ void invokeIndexerTopKPrefill(float const* logits, int const* rowStarts, int con
     sync_check_cuda_error(stream);
 }
 
-bool canIndexerTopKDecodeUseGvr(int numRows, int numColumns, int topK, int /*bytesPerElem*/)
+bool canIndexerTopKDecodeUseGvr(int numRows, int numColumns, int topK, int bytesPerElem)
 {
-    // `bytesPerElem` is kept in the signature for source compatibility but no longer affects
-    // the answer.
     bool const isSupportedTopK = (topK == 512 || topK == 1024 || topK == 2048);
     if (!isSupportedTopK)
     {
         return false;
     }
-    return numColumns >= 32768 && numRows >= 64;
+    // Mirrors the dispatcher's effectiveSplitWorkThreshold default.
+    constexpr int kDefaultSplitWorkThreshold = 200 * 1000;
+    auto const bounds = getSchemeXBounds(numColumns, bytesPerElem);
+    return numColumns >= bounds.kSeqSmall && numColumns < kDefaultSplitWorkThreshold && numRows < bounds.kBsLarge;
 }
 
 } // namespace kernels

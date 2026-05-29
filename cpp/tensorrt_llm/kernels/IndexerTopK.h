@@ -28,7 +28,9 @@ TRTLLM_NAMESPACE_BEGIN
 namespace kernels
 {
 /// Indexer TopK decode. Three tiers:
-///   - GVR Heuristic     (preIdx provided, numRows >= 64 AND numColumns >= 32768, K in {512,1024,2048})
+///   - GVR Heuristic     (preIdx provided, K in {512,1024,2048}, numColumns in
+///                       [kSeqSmall, splitWorkThreshold), numRows below the
+///                       architecture-derived wave/L2 bound).
 ///   - Single-block     (numColumns < split-work threshold)
 ///   - Multi-pass radix (numColumns >= split-work threshold; requires
 ///                       `scratch` sized via indexerTopKDecodeScratchBytes,
@@ -62,10 +64,10 @@ void invokeIndexerTopKPrefill(float const* logits, int const* rowStarts, int con
     int const numRows, int const numColumns, int const stride0, int const stride1, int const topK = 2048,
     cudaStream_t const stream = 0);
 
-/// True iff invokeIndexerTopKDecode would pick the GVR tier for this shape
-/// (K in {512,1024,2048} AND numRows >= 64 AND numColumns >= 32768). Lets
-/// callers provision preIdx / heuristicScratch only when needed.
-/// `bytesPerElem` is unused; kept for source compatibility.
+/// True iff invokeIndexerTopKDecode would pick the GVR tier for this shape:
+/// K in {512,1024,2048}, numColumns in [kSeqSmall, splitWorkThreshold), and
+/// numRows below the architecture-derived wave/L2 bound. Lets callers
+/// provision preIdx / heuristicScratch only when needed.
 bool canIndexerTopKDecodeUseGvr(int numRows, int numColumns, int topK, int bytesPerElem = 4);
 
 } // namespace kernels

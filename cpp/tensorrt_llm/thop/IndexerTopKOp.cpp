@@ -130,7 +130,7 @@ void indexer_topk_decode(th::Tensor const& logits, th::Tensor const& seq_lens, t
     auto stream = at::cuda::getCurrentCUDAStream(logits.get_device());
 
     // Mirror the kernel's threshold so we only allocate when split-work fires.
-    int32_t const adaptiveSplitWorkThreshold = 32768;
+    int32_t const adaptiveSplitWorkThreshold = 200 * 1000;
     th::Tensor scratch_internal;
     if (num_columns >= adaptiveSplitWorkThreshold && multiPassScratchPtr == nullptr)
     {
