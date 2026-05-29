@@ -201,16 +201,16 @@ def test_needed_resource_uses_prefill_swa_scratch_slope():
         max_new_tokens=21,
     )
 
-    full_attn_size_per_token = manager.get_cache_bytes_per_token()
+    non_sliding_attn_size_per_token = manager.get_cache_bytes_per_token()
     context_bytes = manager.get_needed_resource_to_completion(context_request)
     longer_context_bytes = manager.get_needed_resource_to_completion(longer_context_request)
     generation_bytes = manager.get_needed_resource_to_completion(generation_request)
     longer_generation_bytes = manager.get_needed_resource_to_completion(longer_generation_request)
 
-    assert full_attn_size_per_token > 0
-    assert context_bytes > context_request.prompt_len * full_attn_size_per_token
-    assert longer_context_bytes - context_bytes > full_attn_size_per_token
-    assert longer_generation_bytes - generation_bytes == full_attn_size_per_token
+    assert non_sliding_attn_size_per_token > 0
+    assert context_bytes > context_request.prompt_len * non_sliding_attn_size_per_token
+    assert longer_context_bytes - context_bytes > non_sliding_attn_size_per_token
+    assert longer_generation_bytes - generation_bytes == non_sliding_attn_size_per_token
 
 
 def _view_fp8_as_uint8(buffer: torch.Tensor) -> torch.Tensor:
