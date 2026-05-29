@@ -69,8 +69,8 @@ class TransformerOutput:
     image: torch.Tensor
     """[B, C, 1, H, W] alias of video for image generation (same tensor)."""
 
-    sound: Optional[torch.Tensor] = None
-    """[B, sound_dim, T_sound] sound velocity prediction, or None."""
+    audio: Optional[torch.Tensor] = None
+    """[B, audio_dim, T_audio] audio velocity prediction, or None."""
 
     action: Optional[torch.Tensor] = None
     """[B, T_action, action_dim] action velocity prediction, or None."""
@@ -683,7 +683,7 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
     def __init__(self, model_config: DiffusionModelConfig):
         super().__init__(model_config)
         pretrained_config = model_config.pretrained_config
-        self.sound_gen = getattr(pretrained_config, "sound_gen", False)
+        self.audio_gen = getattr(pretrained_config, "sound_gen", False)
         self.action_gen = getattr(pretrained_config, "action_gen", False)
 
         self.hidden_size = pretrained_config.hidden_size
@@ -704,11 +704,15 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
         self.num_kv_heads = pretrained_config.num_key_value_heads
         self.enable_fps_modulation = pretrained_config.enable_fps_modulation
 
-        if self.sound_gen:
-            self.sound_dim = pretrained_config.sound_dim
-            self.sound_latent_fps = pretrained_config.sound_latent_fps
-            self.temporal_compression_factor_sound = (
-                pretrained_config.temporal_compression_factor_sound
+        if self.audio_gen:
+            self.audio_dim = getattr(pretrained_config, "audio_dim", pretrained_config.sound_dim)
+            self.audio_latent_fps = getattr(
+                pretrained_config, "audio_latent_fps", pretrained_config.sound_latent_fps
+            )
+            self.temporal_compression_factor_audio = getattr(
+                pretrained_config,
+                "temporal_compression_factor_audio",
+                pretrained_config.temporal_compression_factor_sound,
             )
 
         if pretrained_config.position_embedding_type != "unified_3d_mrope":
@@ -749,11 +753,11 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
         self.vae2llm = nn.Linear(self.patch_latent_dim, self.hidden_size)
         self.llm2vae = nn.Linear(self.hidden_size, self.patch_latent_dim)
 
-        if self.sound_gen:
-            # Projections for sound modality (mirrors cosmos3-internal Cosmos3VFMNetwork)
-            self.sound2llm = nn.Linear(self.sound_dim, self.hidden_size)
-            self.llm2sound = nn.Linear(self.hidden_size, self.sound_dim)
-            self.sound_modality_embed = nn.Parameter(torch.zeros(self.hidden_size))
+        if self.audio_gen:
+            # Projections for audio modality (mirrors cosmos3-internal Cosmos3VFMNetwork)
+            self.audio2llm = nn.Linear(self.audio_dim, self.hidden_size)
+            self.llm2audio = nn.Linear(self.hidden_size, self.audio_dim)
+            self.audio_modality_embed = nn.Parameter(torch.zeros(self.hidden_size))
 
         # try timestep embedder in float32 if acc loss
         self.time_embedder = TimestepEmbedder(self.hidden_size, target_dtype=torch.bfloat16)
@@ -892,57 +896,57 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
         return freqs_und, freqs_gen
 
     # -------------------------------------------------------------------------
-    # Sound helpers
+    # Audio helpers
     # -------------------------------------------------------------------------
 
-    def _compute_sound_rope_freqs(
+    def _compute_audio_rope_freqs(
         self,
-        T_sound: int,
+        T_audio: int,
         text_mask: torch.Tensor,
-        fps_sound: float,
+        fps_audio: float,
         device: torch.device,
         dtype: torch.dtype,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Compute mRoPE cos/sin for sound tokens.
+        """Compute mRoPE cos/sin for audio tokens.
 
-        Sound tokens use a 1×1 spatial grid (H=W=1) aligned with the vision
-        temporal axis at the sound latent rate.  This mirrors the cosmos3-internal
-        ``sequence_packing.py`` treatment where sound mRoPE uses
+        Audio tokens use a 1×1 spatial grid (H=W=1) aligned with the vision
+        temporal axis at the audio latent rate.  This mirrors the cosmos3-internal
+        ``sequence_packing.py`` treatment where audio mRoPE uses
         ``get_3d_mrope_ids_vae_tokens(grid_h=1, grid_w=1, tcf=1)``.
         """
         B = text_mask.shape[0]
         text_lengths = text_mask.sum(dim=1).long()
 
-        sound_pos_list = []
+        audio_pos_list = []
         for b in range(B):
             real_len = int(text_lengths[b].item())
             _, t_offset = compute_mrope_position_ids_text(real_len, temporal_offset=0)
-            # Sound tokens share the vision temporal space; use modality margin offset.
+            # Audio tokens share the vision temporal space; use modality margin offset.
             s_pos, _ = compute_mrope_position_ids_vision(
-                T_sound,
+                T_audio,
                 1,  # grid_h
                 1,  # grid_w
                 temporal_offset=t_offset + self.unified_3d_mrope_temporal_modality_margin,
-                fps=fps_sound,
+                fps=fps_audio,
                 base_fps=self.base_fps,
-                temporal_compression_factor=1,  # sound latent is already at sound_latent_fps
+                temporal_compression_factor=1,  # audio latent is already at audio_latent_fps
                 enable_fps_modulation=self.enable_fps_modulation,
             )
-            sound_pos_list.append(s_pos)
+            audio_pos_list.append(s_pos)
 
-        sound_pos_ids = torch.stack(sound_pos_list, dim=1).to(device)  # [3, B, T_sound]
+        audio_pos_ids = torch.stack(audio_pos_list, dim=1).to(device)  # [3, B, T_audio]
         rotary_emb = self.language_model.rotary_emb
         _dummy = torch.tensor([], dtype=dtype, device=device)
-        cos_s, sin_s = rotary_emb(_dummy, position_ids=sound_pos_ids)
-        return cos_s.unsqueeze(2), sin_s.unsqueeze(2)  # [B, T_sound, 1, head_dim]
+        cos_a, sin_a = rotary_emb(_dummy, position_ids=audio_pos_ids)
+        return cos_a.unsqueeze(2), sin_a.unsqueeze(2)  # [B, T_audio, 1, head_dim]
 
-    def pack_sound_latents(self, sound_latents: torch.Tensor) -> torch.Tensor:
-        """[B, sound_dim, T_sound] → [B, T_sound, sound_dim]."""
-        return sound_latents.permute(0, 2, 1)
+    def pack_audio_latents(self, audio_latents: torch.Tensor) -> torch.Tensor:
+        """[B, audio_dim, T_audio] → [B, T_audio, audio_dim]."""
+        return audio_latents.permute(0, 2, 1)
 
-    def unpack_sound_latents(self, hidden_sound: torch.Tensor) -> torch.Tensor:
-        """[B, T_sound, sound_dim] → [B, sound_dim, T_sound]."""
-        return hidden_sound.permute(0, 2, 1)
+    def unpack_audio_latents(self, hidden_audio: torch.Tensor) -> torch.Tensor:
+        """[B, T_audio, audio_dim] → [B, audio_dim, T_audio]."""
+        return hidden_audio.permute(0, 2, 1)
 
     def reset_cache(self):
         self.cached_kv = None
@@ -958,7 +962,7 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
         video_shape: Optional[Tuple[int, int, int]] = None,
         fps: float | None = None,
         noisy_frame_mask: torch.Tensor | None = None,
-        sound_latents: Optional[torch.Tensor] = None,
+        audio_latents: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> "TransformerOutput":
         """
@@ -978,14 +982,14 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
                 timestep embedding, predict velocity) and 0=conditioned (clean
                 context, skip timestep embedding).  None means all frames noisy
                 (T2V mode).
-            sound_latents: Optional [B, sound_dim, T_sound] noisy sound latents.
-                When provided, sound tokens are appended to the generation
-                sequence and a sound velocity is returned alongside the video
-                velocity.  Requires ``sound_gen=True`` in the pretrained config.
+            audio_latents: Optional [B, audio_dim, T_audio] noisy audio latents.
+                When provided, audio tokens are appended to the generation
+                sequence and an audio velocity is returned alongside the video
+                velocity.  Requires ``audio_gen=True`` in the pretrained config.
 
         Returns:
             TransformerOutput with video (and image alias) always set.
-            sound is set to the predicted sound velocity when sound_latents is
+            audio is set to the predicted audio velocity when audio_latents is
             provided; otherwise None.  action is always None for now.
         """
         del kwargs  # Kept for diffusers API compatibility.
@@ -1050,27 +1054,27 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
             else:
                 self.cached_kv = cached_kv_full
 
-        # --- Sound token injection -------------------------------------------------
+        # --- Audio token injection -------------------------------------------------
         T_vid_tokens = hidden_gen.shape[1]  # T * Hp * Wp
-        T_sound = 0
-        if sound_latents is not None and self.sound_gen:
-            T_sound = sound_latents.shape[2]
-            hidden_sound = self.pack_sound_latents(sound_latents).to(hidden_gen.dtype)
-            hidden_sound = self.sound2llm(hidden_sound) + self.sound_modality_embed
-            hidden_sound = hidden_sound + time_embed.unsqueeze(1)
-            cos_s, sin_s = self._compute_sound_rope_freqs(
-                T_sound,
+        T_audio = 0
+        if audio_latents is not None and self.audio_gen:
+            T_audio = audio_latents.shape[2]
+            hidden_audio = self.pack_audio_latents(audio_latents).to(hidden_gen.dtype)
+            hidden_audio = self.audio2llm(hidden_audio) + self.audio_modality_embed
+            hidden_audio = hidden_audio + time_embed.unsqueeze(1)
+            cos_a, sin_a = self._compute_audio_rope_freqs(
+                T_audio,
                 text_mask,
-                float(self.sound_latent_fps),
+                float(self.audio_latent_fps),
                 hidden_states.device,
                 hidden_gen.dtype,
             )
-            # [B, T_vid+T_sound, hidden_size]
-            hidden_gen = torch.cat([hidden_gen, hidden_sound], dim=1)
+            # [B, T_vid+T_audio, hidden_size]
+            hidden_gen = torch.cat([hidden_gen, hidden_audio], dim=1)
             cos_v, sin_v = self.cached_freqs_gen
             freqs_gen_combined = (
-                torch.cat([cos_v, cos_s], dim=1),
-                torch.cat([sin_v, sin_s], dim=1),
+                torch.cat([cos_v, cos_a], dim=1),
+                torch.cat([sin_v, sin_a], dim=1),
             )
         else:
             freqs_gen_combined = self.cached_freqs_gen
@@ -1103,16 +1107,16 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
         # --- Decode video velocity ------------------------------------------------
         video_vel = self.unpatchify(self.llm2vae(hidden_gen[:, :T_vid_tokens]), T, H, W)
 
-        # --- Decode sound velocity (if requested) ---------------------------------
-        sound_vel = None
-        if T_sound > 0 and sound_latents is not None and self.sound_gen:
-            # hidden_gen[:, T_vid_tokens:] → [B, T_sound, hidden_size]
-            # → llm2sound → [B, T_sound, sound_dim] → unpack → [B, sound_dim, T_sound]
-            sound_vel = self.unpack_sound_latents(
-                self.llm2sound(hidden_gen[:, T_vid_tokens : T_vid_tokens + T_sound])
+        # --- Decode audio velocity (if requested) ---------------------------------
+        audio_vel = None
+        if T_audio > 0 and audio_latents is not None and self.audio_gen:
+            # hidden_gen[:, T_vid_tokens:] → [B, T_audio, hidden_size]
+            # → llm2audio → [B, T_audio, audio_dim] → unpack → [B, audio_dim, T_audio]
+            audio_vel = self.unpack_audio_latents(
+                self.llm2audio(hidden_gen[:, T_vid_tokens : T_vid_tokens + T_audio])
             )
 
-        return TransformerOutput(video=video_vel, image=video_vel, sound=sound_vel)
+        return TransformerOutput(video=video_vel, image=video_vel, audio=audio_vel)
 
     def load_weights(self, weights: dict) -> None:
         """Load weights with key remapping from Cosmos3-Nano / Diffusers checkpoints.
@@ -1126,8 +1130,6 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
             "lm_head.",
             "action_modality_embed",
             "action_proj_",
-            "audio_modality_embed",
-            "audio_proj_",
         )
 
         for key, value in weights.items():
@@ -1136,17 +1138,24 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
             if k.startswith(skip_prefixes):
                 continue
 
-            if k.startswith(
-                ("vae2llm.", "llm2vae.", "sound2llm.", "llm2sound.", "sound_modality_embed")
-            ):
-                remapped[k] = value
-                continue
-
             if k.startswith("proj_in."):
                 remapped[k.replace("proj_in.", "vae2llm.", 1)] = value
                 continue
+
             if k.startswith("proj_out."):
                 remapped[k.replace("proj_out.", "llm2vae.", 1)] = value
+                continue
+
+            if k.startswith("audio_proj_in."):
+                remapped[k.replace("audio_proj_in.", "audio2llm.", 1)] = value
+                continue
+
+            if k.startswith("audio_proj_out."):
+                remapped[k.replace("audio_proj_out.", "llm2audio.", 1)] = value
+                continue
+
+            if k.startswith("audio_modality_embed"):
+                remapped[k] = value
                 continue
 
             if k.startswith("time_embedder.linear"):
@@ -1279,10 +1288,10 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
         self.vae2llm.to(target_dtype)
         self.llm2vae.to(target_dtype)
 
-        if self.sound_gen:
-            self.sound2llm.to(target_dtype)
-            self.llm2sound.to(target_dtype)
-            self.sound_modality_embed.data = self.sound_modality_embed.data.to(target_dtype)
+        if self.audio_gen:
+            self.audio2llm.to(target_dtype)
+            self.llm2audio.to(target_dtype)
+            self.audio_modality_embed.data = self.audio_modality_embed.data.to(target_dtype)
 
         for _, module in self.named_modules():
             if isinstance(module, Linear) or isinstance(module, Qwen3VLTextRMSNorm):

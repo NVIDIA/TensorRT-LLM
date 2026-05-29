@@ -56,9 +56,9 @@ COSMOS3_EXTRA_SPECS: Dict[str, ExtraParamSchema] = {
         default=True,
         description="Whether to use the guardrails.",
     ),
-    "enable_sound": ExtraParamSchema(
+    "enable_audio": ExtraParamSchema(
         type="bool",
         default=False,
-        description="Whether to enable sound generation.",
+        description="Whether to enable audio generation.",
     ),
 }
