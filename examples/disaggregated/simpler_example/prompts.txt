@@ -44,3 +44,30 @@ curl http://localhost:8000/v1/completions \
         "max_tokens": 9000,
         "temperature": 0
     }' -w "\n" 2>&1 | tee shubham_output.json
+
+
+
+
+
+curl http://localhost:8000/v1/completions \
+    -H "Content-Type: application/json" \
+    -d '{
+        "model": "TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+        "prompt": "Home is whenever I am with you",
+        "use_beam_search": true,
+        "n": 4,
+        "max_tokens": 1024,
+        "temperature": 0
+    }' -w "\n" 
+
+
+curl http://localhost:8000/v1/completions \
+    -H "Content-Type: application/json" \
+    -d '{
+        "model": "TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+        "prompt": "Tungsten is a metal",
+        "use_beam_search": true,
+        "n": 4,
+        "max_tokens": 1024,
+        "temperature": 0
+    }' -w "\n" 

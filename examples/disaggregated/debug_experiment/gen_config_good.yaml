@@ -1,0 +1,13 @@
+disable_overlap_scheduler: true
+checkpoint_format: DUMMY_FORMAT
+max_beam_width: 2
+max_seq_len: 32
+max_num_tokens: 32
+kv_cache_config:
+  use_kv_cache_manager_v2: false
+  enable_block_reuse: true
+  enable_partial_reuse: false
+cache_transceiver_config:
+  backend: NIXL
+  max_tokens_in_buffer: 2048
+  transceiver_runtime: PYTHON

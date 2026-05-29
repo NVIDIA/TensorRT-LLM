@@ -1,9 +1,9 @@
 disable_overlap_scheduler: True
-max_beam_width: 4
+max_beam_width: 1
 kv_cache_config:
   use_kv_cache_manager_v2: false
   enable_block_reuse: true
-  enable_partial_reuse: false
+  enable_partial_reuse: true
 cache_transceiver_config:
   backend: NIXL
   transceiver_runtime: PYTHON

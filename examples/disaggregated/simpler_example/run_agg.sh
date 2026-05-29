@@ -1,7 +1,7 @@
 #!/bin/bash
 
 echo current time: $(date)
-export TLLM_LOG_LEVEL=INFO
+export TLLM_LOG_LEVEL_BY_MODULE=debug:batchmgr
 MODEL=TinyLlama/TinyLlama-1.1B-Chat-v1.0
 HOST=localhost
 PORT=8000
@@ -39,3 +39,14 @@ curl http://${HOST}:${PORT}/v1/completions \
         "max_tokens": 1024,
         "temperature": 0
     }' -w "\n" 2>&1 | tee output_agg.json
+
+curl http://localhost:8000/v1/completions \
+    -H "Content-Type: application/json" \
+    -d '{
+        "model": "TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+        "prompt": "The layers of the atmosphere are",
+        "use_beam_search": true,
+        "n": 4,
+        "max_tokens": 1024,
+        "temperature": 0
+    }' -w "\n" 2>&1 | tee atmosphere_output.json

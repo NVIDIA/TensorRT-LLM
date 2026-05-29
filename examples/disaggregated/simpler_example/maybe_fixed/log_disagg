@@ -1,0 +1,51 @@
+Skipping import of cpp extensions due to incompatible torch version 2.11.0a0+eb65b36914.nv26.02 for torchao version 0.15.0             Please see https://github.com/pytorch/ao/issues/2919 for more info
+/usr/local/lib/python3.12/dist-packages/requests/__init__.py:113: RequestsDependencyWarning: urllib3 (2.6.3) or chardet (6.0.0.post1)/charset_normalizer (3.4.4) doesn't match a supported version!
+  warnings.warn(
+Multiple distributions found for package modelopt. Picked distribution: nvidia-modelopt
+/home/scratch.athenac_coreai/pyuser/lib/python3.12/site-packages/modelopt/torch/__init__.py:36: UserWarning: transformers version 5.3.0 is incompatible with nvidia-modelopt and may cause issues. Please install recommended version with `pip install nvidia-modelopt[hf]` if working with HF models.
+  _warnings.warn(
+[TensorRT-LLM] TensorRT LLM version: 1.3.0rc15
+/home/scratch.athenac_coreai/TensorRT-LLM/tensorrt_llm/serve/openai_protocol.py:117: UserWarning: Field name "schema" in "ResponseFormat" shadows an attribute in parent "OpenAIBaseModel"
+  class ResponseFormat(OpenAIBaseModel):
+[05/29/2026-20:42:25] [TRT-LLM] [I] [serve   ] Using context first disagg schedule style, schedule_style: context_first
+INFO:     Started server process [155781]
+INFO:     Waiting for application startup.
+[05/29/2026-20:42:25] [TRT-LLM] [I] [serve   ] Server: http://localhost:8001/steady_clock_offset, delay: 0.003870999440550804 second, offset: 0.0009895004332065582 second
+[05/29/2026-20:42:25] [TRT-LLM] [I] [serve   ] server is ready with info: {'disaggregated_params': {'ctx_dp_rank': 0, 'ctx_info_endpoint': ['tcp://10.176.16.44:34779']}}
+[05/29/2026-20:42:25] [TRT-LLM] [I] [serve   ] Server: http://localhost:8002/steady_clock_offset, delay: 0.002032000571489334 second, offset: 0.0005769999697804451 second
+[05/29/2026-20:42:25] [TRT-LLM] [I] [serve   ] server is ready with info: {'disaggregated_params': {'ctx_dp_rank': 0, 'ctx_info_endpoint': ['tcp://10.176.16.44:39823']}}
+[05/29/2026-20:42:25] [TRT-LLM] [I] [serve   ] All servers are ready
+INFO:     Application startup complete.
+INFO:     127.0.0.1:34634 - "GET /health HTTP/1.1" 200 OK
+[05/29/2026-20:42:26] [TRT-LLM] [I] [serve   ] _verify_ctx_response
+[05/29/2026-20:42:26] [TRT-LLM] [I] [serve   ] ctx_response is not None
+[05/29/2026-20:42:26] [TRT-LLM] [I] [serve   ] Choice 0 first_gen_tokens: [896, 310, 372, 405]
+[05/29/2026-20:42:26] [TRT-LLM] [I] [serve   ] Choice 1 first_gen_tokens: [896, 310, 372, 405]
+[05/29/2026-20:42:26] [TRT-LLM] [I] [serve   ] Choice 2 first_gen_tokens: [896, 310, 372, 405]
+[05/29/2026-20:42:26] [TRT-LLM] [I] [serve   ] Choice 3 first_gen_tokens: [896, 310, 372, 405]
+[05/29/2026-20:42:26] [TRT-LLM] [I] [serve   ] _get_gen_request from ctx_response: disagg_request_id=17858322758471680 num_choices=4 n=4 best_of=None use_beam_search=True first_gen_tokens=[896, 310, 372, 405] first_gen_cum_log_probs=[-0.8538165092468262, -1.5413165092468262, -1.6663165092468262, -3.791316509246826] ctx_request_id=17858322758471680 ctx_dp_rank=0 ctx_info_endpoint=tcp://10.176.16.44:34779
+INFO:     127.0.0.1:34640 - "POST /v1/completions HTTP/1.1" 200 OK
+[05/29/2026-20:42:33] [TRT-LLM] [I] [serve   ] _verify_ctx_response
+[05/29/2026-20:42:33] [TRT-LLM] [I] [serve   ] ctx_response is not None
+[05/29/2026-20:42:33] [TRT-LLM] [I] [serve   ] Choice 0 first_gen_tokens: [1754, 13725, 29901, 8429]
+[05/29/2026-20:42:33] [TRT-LLM] [I] [serve   ] Choice 1 first_gen_tokens: [1754, 13725, 29901, 8429]
+[05/29/2026-20:42:33] [TRT-LLM] [I] [serve   ] Choice 2 first_gen_tokens: [1754, 13725, 29901, 8429]
+[05/29/2026-20:42:33] [TRT-LLM] [I] [serve   ] Choice 3 first_gen_tokens: [1754, 13725, 29901, 8429]
+[05/29/2026-20:42:33] [TRT-LLM] [I] [serve   ] _get_gen_request from ctx_response: disagg_request_id=17858352697413633 num_choices=4 n=4 best_of=None use_beam_search=True first_gen_tokens=[1754, 13725, 29901, 8429] first_gen_cum_log_probs=[-1.893768310546875, -2.456268310546875, -3.206268310546875, -3.581268310546875] ctx_request_id=17858352697413633 ctx_dp_rank=0 ctx_info_endpoint=tcp://10.176.16.44:34779
+INFO:     127.0.0.1:50602 - "POST /v1/completions HTTP/1.1" 200 OK
+[05/29/2026-20:48:16] [TRT-LLM] [I] [serve   ] _verify_ctx_response
+[05/29/2026-20:48:16] [TRT-LLM] [I] [serve   ] ctx_response is not None
+[05/29/2026-20:48:16] [TRT-LLM] [I] [serve   ] Choice 0 first_gen_tokens: [29889, 29892, 322, 1213]
+[05/29/2026-20:48:16] [TRT-LLM] [I] [serve   ] Choice 1 first_gen_tokens: [29889, 29892, 322, 1213]
+[05/29/2026-20:48:16] [TRT-LLM] [I] [serve   ] Choice 2 first_gen_tokens: [29889, 29892, 322, 1213]
+[05/29/2026-20:48:16] [TRT-LLM] [I] [serve   ] Choice 3 first_gen_tokens: [29889, 29892, 322, 1213]
+[05/29/2026-20:48:16] [TRT-LLM] [I] [serve   ] _get_gen_request from ctx_response: disagg_request_id=17859790148308994 num_choices=4 n=4 best_of=None use_beam_search=True first_gen_tokens=[29889, 29892, 322, 1213] first_gen_cum_log_probs=[-0.7572884559631348, -1.6322884559631348, -2.5697884559631348, -2.8197884559631348] ctx_request_id=17859790148308994 ctx_dp_rank=0 ctx_info_endpoint=tcp://10.176.16.44:34779
+INFO:     127.0.0.1:41318 - "POST /v1/completions HTTP/1.1" 200 OK
+[05/29/2026-20:49:08] [TRT-LLM] [I] [serve   ] _verify_ctx_response
+[05/29/2026-20:49:08] [TRT-LLM] [I] [serve   ] ctx_response is not None
+[05/29/2026-20:49:08] [TRT-LLM] [I] [serve   ] Choice 0 first_gen_tokens: [393, 411, 394, 1304]
+[05/29/2026-20:49:08] [TRT-LLM] [I] [serve   ] Choice 1 first_gen_tokens: [393, 411, 394, 1304]
+[05/29/2026-20:49:08] [TRT-LLM] [I] [serve   ] Choice 2 first_gen_tokens: [393, 411, 394, 1304]
+[05/29/2026-20:49:08] [TRT-LLM] [I] [serve   ] Choice 3 first_gen_tokens: [393, 411, 394, 1304]
+[05/29/2026-20:49:08] [TRT-LLM] [I] [serve   ] _get_gen_request from ctx_response: disagg_request_id=17860010655453187 num_choices=4 n=4 best_of=None use_beam_search=True first_gen_tokens=[393, 411, 394, 1304] first_gen_cum_log_probs=[-0.9535790681838989, -1.828579068183899, -2.0160789489746094, -3.6410789489746094] ctx_request_id=17860010655453187 ctx_dp_rank=0 ctx_info_endpoint=tcp://10.176.16.44:34779
+INFO:     127.0.0.1:50902 - "POST /v1/completions HTTP/1.1" 200 OK
