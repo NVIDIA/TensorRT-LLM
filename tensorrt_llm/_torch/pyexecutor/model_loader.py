@@ -286,7 +286,7 @@ class ModelLoader:
             return llm_args
 
         config_kwargs = {
-            'trust_remote_code': True,
+            'trust_remote_code': llm_args.trust_remote_code,
             'mm_encoder_only': llm_args.mm_encoder_only,
         }
         if llm_args.parallel_config:
@@ -518,7 +518,7 @@ class ModelLoader:
         """Loads and validates the model configuration."""
         load_config_kwargs = dict(
             checkpoint_dir=checkpoint_dir,
-            trust_remote_code=True,
+            trust_remote_code=self.llm_args.trust_remote_code,
             mapping=self.mapping,
             enable_min_latency=self.llm_args.enable_min_latency,
             use_cuda_graph=self.llm_args.cuda_graph_config is not None,
