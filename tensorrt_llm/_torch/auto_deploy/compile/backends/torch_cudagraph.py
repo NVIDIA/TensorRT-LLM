@@ -1043,8 +1043,8 @@ def _setup_piecewise_mixed_batch(seq_info: Any, num_tokens: int) -> None:
         input_ids=input_ids_flat,
         cu_seqlen=cu_seqlen,
         input_pos=0,
-        cache_loc=cache_loc,
-        cu_num_pages=cu_num_pages,
+        cache_loc_per_pool=[cache_loc],
+        cu_num_pages_per_pool=[cu_num_pages],
         slot_idx=slot_idx,
     )
 

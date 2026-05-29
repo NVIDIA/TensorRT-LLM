@@ -31,11 +31,13 @@ Key components:
 """
 
 from threading import RLock
-from typing import Any, Callable, Dict, List
+from typing import Any, Callable, Dict, List, TypeVar
 
 import torch
 
 from .logger import ad_logger
+
+T = TypeVar("T")
 
 # ---------------------------------------------------------------------------
 # Runtime enable/disable flag
@@ -168,6 +170,19 @@ def wait_event(device: int, stream_name: str) -> None:
 # ---------------------------------------------------------------------------
 
 
+def _record_stream_for_tensor_outputs(x: object, stream: torch.cuda.Stream) -> None:
+    if isinstance(x, torch.Tensor):
+        x.record_stream(stream)
+        return
+    if isinstance(x, (list, tuple)):
+        for item in x:
+            _record_stream_for_tensor_outputs(item, stream)
+        return
+    if isinstance(x, dict):
+        for item in x.values():
+            _record_stream_for_tensor_outputs(item, stream)
+
+
 @torch._dynamo.disable
 def record_event_passthrough(
     x: torch.Tensor,
@@ -191,10 +206,10 @@ def record_event_passthrough(
 
 @torch._dynamo.disable
 def begin_aux_stream_passthrough(
-    x: torch.Tensor,
+    x: T,
     *,
     device: int = -1,
-) -> torch.Tensor:
+) -> T:
     """Record a CUDA event on the main stream, switch to aux, and wait for it.
 
     After this function returns the thread-local current stream is the
@@ -226,7 +241,7 @@ def begin_aux_stream_passthrough(
     # NOTE: skip during CUDA graph capture — passthrough partitions are
     # reclassified as dynamic and won't be captured anyway.
     if not torch.cuda.is_current_stream_capturing():
-        x.record_stream(aux_stream)
+        _record_stream_for_tensor_outputs(x, aux_stream)
     torch.cuda.set_stream(aux_stream)
     # Make aux wait for the main-stream event before executing any work.
     aux_stream.wait_event(main_event)
