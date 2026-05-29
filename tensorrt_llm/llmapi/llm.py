@@ -48,6 +48,7 @@ from .llm_args import (TORCH_LLMARGS_EXPLICIT_DOCSTRING,
 from .llm_utils import (CachedModelLoader, KvCacheRetentionConfig,
                         LlmBuildStats, ModelLoader, _ModelRuntimeContext)
 from .mpi_session import MpiPoolSession, external_mpi_comm_available
+from .thinking_budget import add_thinking_budget_logits_processor
 from .tokenizer import TokenizerBase, _xgrammar_tokenizer_info
 # TODO[chunweiy]: move the following symbols back to utils scope, and remove the following import
 from .utils import (append_docstring, exception_handler, get_device_count,
@@ -1001,6 +1002,11 @@ class BaseLLM:
                     )
                 sampling_params._setup(self.tokenizer, self._hf_model_config,
                                        self._generation_config)
+            add_thinking_budget_logits_processor(
+                sampling_params,
+                reasoning_parser=self.args.reasoning_parser,
+                tokenizer=self.tokenizer,
+            )
         else:
             raise TypeError(
                 f"The sampling_params must be type SamplingParams or None, but got {type(sampling_params)}"
