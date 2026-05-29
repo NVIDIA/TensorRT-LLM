@@ -128,6 +128,44 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
         return self._dtype
 
     @classmethod
+    def _build_temporal_block(
+        cls,
+        config: PretrainedConfig,
+        llm_grid_t: int,
+        llm_grid_h: int,
+        llm_grid_w: int,
+        second_per_grid_t: float,
+    ) -> np.ndarray:
+        """Per-grid (3, llm_grid_t * llm_grid_h * llm_grid_w) position block.
+
+        Qwen2VL / Qwen2_5_VL: when ``vision_config.tokens_per_second`` is set,
+        scale the temporal axis by ``second_per_grid_t * tokens_per_second``
+        (Qwen2_5 style); otherwise fall back to a plain ``np.indices`` grid.
+
+        Subclasses with a different temporal scheme (e.g. Qwen3-VL uses
+        separate timestamp tokens) override this hook.
+        """
+        tokens_per_second = getattr(config.vision_config, 'tokens_per_second',
+                                    None)
+        if tokens_per_second is not None:
+            t_index = (np.arange(llm_grid_t).reshape(-1, 1) *
+                       (second_per_grid_t * tokens_per_second))
+            t_index = np.broadcast_to(
+                t_index.astype(np.int64),
+                (llm_grid_t, llm_grid_h * llm_grid_w),
+            ).reshape(-1)
+            h_idx = np.broadcast_to(
+                np.arange(llm_grid_h).reshape(1, -1, 1),
+                (llm_grid_t, llm_grid_h, llm_grid_w),
+            ).reshape(-1)
+            w_idx = np.broadcast_to(
+                np.arange(llm_grid_w).reshape(1, 1, -1),
+                (llm_grid_t, llm_grid_h, llm_grid_w),
+            ).reshape(-1)
+            return np.stack([t_index, h_idx, w_idx])
+        return np.indices((llm_grid_t, llm_grid_h, llm_grid_w)).reshape(3, -1)
+
+    @classmethod
     def get_rope_index(
         cls,
         config: PretrainedConfig,
@@ -140,8 +178,11 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
         """
         Calculate the 3D rope index based on image and video's temporal, height and width in LLM.
 
-        This is a generalized implementation that can be used by both Qwen2VL and Qwen2_5_VL models.
-        The main difference between the two implementations is how temporal position IDs are calculated.
+        Shared implementation for the Qwen2-VL family; the per-grid temporal
+        block is built by ``cls._build_temporal_block``, which subclasses
+        override when their temporal scheme differs (e.g. Qwen3-VL uses
+        per-frame timestamp tokens instead of ``tokens_per_second``-scaled
+        positions).
 
         Args:
             config: The HF's PretrainedConfig model configuration
@@ -201,8 +242,6 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
             second_per_grid_ts_np = second_per_grid_ts.detach().cpu().numpy()
         else:
             second_per_grid_ts_np = second_per_grid_ts
-        tokens_per_second = (config.vision_config.tokens_per_second if hasattr(
-            config.vision_config, 'tokens_per_second') else None)
         B, S = ids_np.shape
         position_ids_np = np.ones((3, B, S), dtype=ids_np.dtype)
         deltas = []
@@ -261,28 +300,9 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
                     llm_pos_ids_list.append(
                         np.broadcast_to(np.arange(text_len), (3, text_len)) +
                         st_idx)
-                # Calculate temporal position IDs based on model type
-                if tokens_per_second is not None:
-                    # Qwen2_5_VL style temporal position calculation
-                    t_index = (np.arange(llm_grid_t).reshape(-1, 1) *
-                               (second_per_grid_t * tokens_per_second))
-                    t_index = np.broadcast_to(
-                        t_index.astype(np.int64),
-                        (llm_grid_t, llm_grid_h * llm_grid_w),
-                    ).reshape(-1)
-                    h_idx = np.broadcast_to(
-                        np.arange(llm_grid_h).reshape(1, -1, 1),
-                        (llm_grid_t, llm_grid_h, llm_grid_w),
-                    ).reshape(-1)
-                    w_idx = np.broadcast_to(
-                        np.arange(llm_grid_w).reshape(1, 1, -1),
-                        (llm_grid_t, llm_grid_h, llm_grid_w),
-                    ).reshape(-1)
-                    block = np.stack([t_index, h_idx, w_idx])
-                else:
-                    # Qwen2VL style temporal position calculation
-                    block = np.indices(
-                        (llm_grid_t, llm_grid_h, llm_grid_w)).reshape(3, -1)
+                block = cls._build_temporal_block(config, llm_grid_t,
+                                                  llm_grid_h, llm_grid_w,
+                                                  second_per_grid_t)
                 llm_pos_ids_list.append(block + text_len + st_idx)
                 st = ed + llm_grid_t * llm_grid_h * llm_grid_w
             if st < len(seq_list):
@@ -354,7 +374,9 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
             video_grid_thw: torch.LongTensor,
             attention_mask: torch.Tensor,
             second_per_grid_ts: torch.Tensor = None) -> Dict[str, torch.Tensor]:
-        mrope_position_ids, mrope_position_deltas = Qwen2VLInputProcessorBase.get_rope_index(
+        # Dispatch via ``type(self)`` so subclasses (e.g. Qwen3-VL) get their
+        # overridden ``get_rope_index`` instead of the base implementation.
+        mrope_position_ids, mrope_position_deltas = type(self).get_rope_index(
             self.config, input_ids, image_grid_thw, video_grid_thw,
             attention_mask, second_per_grid_ts)
 
@@ -375,10 +397,9 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
         text_prompt, mm_data, mm_processor_kwargs = inputs.get("prompt"), \
                         inputs.get("multi_modal_data", {}), inputs.get("mm_processor_kwargs", {})
 
-        # Text-only fast path: skip the multi-modal HF processor and call
-        # the tokenizer directly (their outputs match bit-exactly when
-        # `images` / `videos` are `None`). mrope_config still needs
-        # to be populated since the LM is M-RoPE.
+        # Text-only fast path: skip the multi-modal HF processor (tokenizer
+        # output matches it bit-exactly when `images` / `videos` are `None`)
+        # while still populating mrope_config since the LM is M-RoPE.
         if not mm_data:
             input_ids = self.tokenizer(text_prompt,
                                        return_tensors="pt").input_ids

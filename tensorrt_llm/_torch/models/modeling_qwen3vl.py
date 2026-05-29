@@ -9,7 +9,7 @@ import torch.nn as nn
 import triton
 import triton.language as tl
 from PIL import Image
-from transformers import AutoProcessor, AutoTokenizer, PretrainedConfig, PreTrainedModel
+from transformers import AutoTokenizer, PretrainedConfig, PreTrainedModel
 from transformers.activations import ACT2FN as HF_ACT2FN
 from transformers.models.qwen3_vl.modeling_qwen3_vl import (
     Qwen3VLVisionPatchEmbed as HFQwen3VLVisionPatchEmbed,
@@ -21,10 +21,7 @@ from tensorrt_llm.mapping import Mapping
 
 from ..._utils import async_tensor_h2d, prefer_pinned
 from ...inputs import (
-    BaseMultimodalDummyInputsBuilder,
-    BaseMultimodalInputProcessor,
     ContentFormat,
-    ExtraProcessedInputs,
     MultimodalPlaceholderMetadata,
     MultimodalPlaceholderPlacement,
     TextPrompt,
@@ -33,7 +30,6 @@ from ...inputs import (
 )
 from ...inputs.multimodal import DisaggPrefillMultimodalInputs, MultimodalParams
 from ...logger import logger
-from ...sampling_params import SamplingParams
 from ..attention_backend import AttentionMetadata
 from ..attention_backend.interface import PositionalEmbeddingParams, RopeParams
 from ..attention_backend.utils import get_attention_backend
@@ -45,14 +41,16 @@ from .checkpoints.base_weight_mapper import BaseWeightMapper
 from .checkpoints.hf.qwen3vl_weight_mapper import Qwen3VLHfWeightMapper
 from .modeling_auto import AutoModelForCausalLM
 from .modeling_multimodal_utils import (
-    _install_processor_output_validation_filter,
     filter_mm_token_from_input_ids,
     find_input_mm_embeds,
     fuse_input_embeds,
     get_attached_multimodal_embeddings,
     get_multimodal_embeddings,
 )
-from .modeling_qwen2vl import Qwen2_5_VLVisionAttention
+from .modeling_qwen2vl import (
+    Qwen2_5_VLVisionAttention,
+    Qwen2VLInputProcessorBase,
+)
 from .modeling_utils import (
     ModelConfig,
     QuantConfig,
@@ -156,7 +154,15 @@ def _expand_prompt_token_ids_for_mm_handoff(
     )
 
 
-class Qwen3VLInputProcessorBase(BaseMultimodalInputProcessor, BaseMultimodalDummyInputsBuilder):
+class Qwen3VLInputProcessorBase(Qwen2VLInputProcessorBase):
+    """Qwen3-VL input processor.
+
+    Reuses the Qwen2-VL implementation for tokenization, multimodal processor
+    invocation, and rope-index construction. Only the dtype source and the
+    per-grid temporal block differ — Qwen3-VL encodes video temporal info via
+    separate timestamp tokens, so each frame is its own (1, h, w) block rather
+    than a ``tokens_per_second``-scaled stretch.
+    """
     def __init__(
         self,
         model_path: str,
@@ -165,7 +171,6 @@ class Qwen3VLInputProcessorBase(BaseMultimodalInputProcessor, BaseMultimodalDumm
         trust_remote_code: bool = True,
         **kwargs,
     ):
-        _install_processor_output_validation_filter()
         super().__init__(
             model_path=model_path,
             config=config,
@@ -173,173 +178,50 @@ class Qwen3VLInputProcessorBase(BaseMultimodalInputProcessor, BaseMultimodalDumm
             trust_remote_code=trust_remote_code,
             **kwargs,
         )
+        # Qwen3-VL keeps ``torch_dtype`` only on ``text_config`` under transformers 5.x.
         self._dtype = self.config.text_config.dtype
-        self._tokenizer = (
-            tokenizer if tokenizer is not None else AutoTokenizer.from_pretrained(model_path)
-        )
-        self._model_path = model_path
-        self._processor = AutoProcessor.from_pretrained(
-            model_path, use_fast=True, trust_remote_code=trust_remote_code
-        )
-        self.tllm_multimodal_token_id = self.get_vocab_size() + 1
-        # temporal patch size for video frames
-        self.temporal_patch_size = getattr(self.config.vision_config, "temporal_patch_size", 1)
 
-    @property
-    def config(self) -> PretrainedConfig:
-        return self._config
-
-    @property
-    def tokenizer(self) -> AutoTokenizer:
-        return self._tokenizer
-
-    @property
-    def model_path(self) -> str:
-        return self._model_path
-
-    @property
-    def processor(self) -> AutoProcessor:
-        return self._processor
-
-    @property
-    def dtype(self) -> torch.dtype:
-        return self._dtype
-
-    def get_vocab_size(self) -> int:
-        """Return the vocab size of the model."""
-        return self.config.text_config.vocab_size
+    @classmethod
+    def _build_temporal_block(
+        cls,
+        config: PretrainedConfig,
+        llm_grid_t: int,
+        llm_grid_h: int,
+        llm_grid_w: int,
+        second_per_grid_t: float,
+    ) -> np.ndarray:
+        # Qwen3-VL encodes video temporal info via separate timestamp tokens,
+        # so the per-grid block is a plain ``np.indices`` lattice (no
+        # ``tokens_per_second`` scaling).
+        return np.indices((llm_grid_t, llm_grid_h, llm_grid_w)).reshape(3, -1)
 
     @classmethod
     def get_rope_index(
         cls,
-        model_config: PretrainedConfig,
+        config: PretrainedConfig,
         input_ids: Optional[torch.LongTensor] = None,
         image_grid_thw: Optional[torch.LongTensor] = None,
         video_grid_thw: Optional[torch.LongTensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
+        second_per_grid_ts: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Different from the original implementation, Qwen3VL use timestamps rather than absolute time position ids."""
-
-        # Since we use timestamps to separate videos, like <t1> <vision_start> <frame1> <vision_end> <t2>
-        # <vision_start> <frame2> <vision_end>, the video_grid_thw should also be split
+        # Qwen3-VL splits videos with timestamp tokens like
+        # ``<t1> <vision_start> <frame1> <vision_end> <t2> ...``, so
+        # ``video_grid_thw`` must be expanded to one row per frame before the
+        # shared Qwen2-VL traversal.
         if video_grid_thw is not None:
-            video_grid_thw = torch.repeat_interleave(video_grid_thw, video_grid_thw[:, 0], dim=0)
+            video_grid_thw = torch.repeat_interleave(
+                video_grid_thw, video_grid_thw[:, 0], dim=0
+            )
             video_grid_thw[:, 0] = 1
-
-        spatial_merge_size = model_config.vision_config.spatial_merge_size
-        image_token_id = model_config.image_token_id
-        video_token_id = model_config.video_token_id
-        vision_start_token_id = model_config.vision_start_token_id
-        if input_ids is not None and (image_grid_thw is not None or video_grid_thw is not None):
-            # numpy-based vectorized impl: ~2-3× faster than the torch loop
-            # version on CPU since the per-image/video work is small Python
-            # tensor allocations that numpy can do without the dispatch
-            # overhead. Final tensors are placed back on `input_ids.device`.
-            input_device = input_ids.device
-            input_dtype = input_ids.dtype
-            ids_np = input_ids.detach().cpu().numpy()
-            attn_np = (
-                np.ones_like(ids_np)
-                if attention_mask is None
-                else attention_mask.detach().cpu().numpy()
-            )
-            image_grid_np = (
-                image_grid_thw.detach().cpu().numpy() if image_grid_thw is not None else None
-            )
-            video_grid_np = (
-                video_grid_thw.detach().cpu().numpy() if video_grid_thw is not None else None
-            )
-            B, S = ids_np.shape
-            position_ids_np = np.ones((3, B, S), dtype=ids_np.dtype)
-            deltas = []
-            image_index = 0
-            video_index = 0
-            for i in range(B):
-                mask_i = attn_np[i] == 1
-                seq = ids_np[i][mask_i]
-                vision_start_indices = np.flatnonzero(seq == vision_start_token_id)
-                vision_tokens = (
-                    seq[vision_start_indices + 1] if vision_start_indices.size else seq[:0]
-                )
-                image_nums = int((vision_tokens == image_token_id).sum())
-                video_nums = int((vision_tokens == video_token_id).sum())
-                seq_list = seq.tolist()
-                has_image = image_token_id in seq_list
-                has_video = video_token_id in seq_list
-                llm_pos_ids_list = []
-                st = 0
-                remain_images, remain_videos = image_nums, video_nums
-                for _ in range(image_nums + video_nums):
-                    if has_image and remain_images > 0:
-                        ed_image = seq_list.index(image_token_id, st)
-                    else:
-                        ed_image = len(seq_list) + 1
-                    if has_video and remain_videos > 0:
-                        ed_video = seq_list.index(video_token_id, st)
-                    else:
-                        ed_video = len(seq_list) + 1
-                    if ed_image < ed_video:
-                        t = int(image_grid_np[image_index][0])
-                        h = int(image_grid_np[image_index][1])
-                        w = int(image_grid_np[image_index][2])
-                        image_index += 1
-                        remain_images -= 1
-                        ed = ed_image
-                    else:
-                        t = int(video_grid_np[video_index][0])
-                        h = int(video_grid_np[video_index][1])
-                        w = int(video_grid_np[video_index][2])
-                        video_index += 1
-                        remain_videos -= 1
-                        ed = ed_video
-                    llm_grid_t = t
-                    llm_grid_h = h // spatial_merge_size
-                    llm_grid_w = w // spatial_merge_size
-                    text_len = ed - st
-                    st_idx = llm_pos_ids_list[-1].max() + 1 if llm_pos_ids_list else 0
-                    if text_len > 0:
-                        llm_pos_ids_list.append(
-                            np.broadcast_to(np.arange(text_len), (3, text_len)) + st_idx
-                        )
-                    # Qwen3-VL: t_index is just arange(llm_grid_t); video temporal
-                    # info is encoded via separate timestamp tokens.
-                    grid_idx = np.indices((llm_grid_t, llm_grid_h, llm_grid_w))
-                    llm_pos_ids_list.append(grid_idx.reshape(3, -1) + text_len + st_idx)
-                    st = ed + llm_grid_t * llm_grid_h * llm_grid_w
-                if st < len(seq_list):
-                    st_idx = llm_pos_ids_list[-1].max() + 1 if llm_pos_ids_list else 0
-                    text_len = len(seq_list) - st
-                    llm_pos_ids_list.append(
-                        np.broadcast_to(np.arange(text_len), (3, text_len)) + st_idx
-                    )
-                llm_positions = np.concatenate(llm_pos_ids_list, axis=1).reshape(3, -1)
-                position_ids_np[:, i, mask_i] = llm_positions
-                deltas.append(int(llm_positions.max()) + 1 - int(ids_np[i].shape[0]))
-            position_ids = torch.from_numpy(position_ids_np).to(
-                device=input_device, dtype=input_dtype
-            )
-            mrope_position_deltas = torch.tensor(deltas, device=input_device).unsqueeze(1)
-            return position_ids, mrope_position_deltas
-        else:
-            if attention_mask is not None:
-                position_ids = attention_mask.long().cumsum(-1) - 1
-                position_ids.masked_fill_(attention_mask == 0, 1)
-                position_ids = position_ids.unsqueeze(0).expand(3, -1, -1).to(attention_mask.device)
-                max_position_ids = position_ids.max(0, keepdim=False)[0].max(-1, keepdim=True)[0]
-                mrope_position_deltas = max_position_ids + 1 - attention_mask.shape[-1]
-            else:
-                position_ids = (
-                    torch.arange(input_ids.shape[1], device=input_ids.device)
-                    .view(1, 1, -1)
-                    .expand(3, input_ids.shape[0], -1)
-                )
-                mrope_position_deltas = torch.zeros(
-                    [input_ids.shape[0], 1],
-                    device=input_ids.device,
-                    dtype=input_ids.dtype,
-                )
-
-            return position_ids, mrope_position_deltas
+        return super().get_rope_index(
+            config,
+            input_ids,
+            image_grid_thw,
+            video_grid_thw,
+            attention_mask,
+            second_per_grid_ts,
+        )
 
     def get_num_tokens_per_video(
         self,
@@ -348,133 +230,38 @@ class Qwen3VLInputProcessorBase(BaseMultimodalInputProcessor, BaseMultimodalDumm
         video_grid_thw: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> int:
-        if video_grid_thw is None:
-            raise ValueError(
-                "Qwen3-VL video token count requires processor-produced video_grid_thw"
-            )
-
         merge = self.config.vision_config.spatial_merge_size
-        token_counts = (
-            video_grid_thw[:, 0] * (video_grid_thw[:, 1] // merge) * (video_grid_thw[:, 2] // merge)
-        )
-        return int(token_counts.sum().item())
+        if video_grid_thw is not None:
+            if video_grid_thw.dim() == 1:
+                t, h, w = (int(x) for x in video_grid_thw)
+                return t * (h // merge) * (w // merge)
+            token_counts = (
+                video_grid_thw[:, 0]
+                * (video_grid_thw[:, 1] // merge)
+                * (video_grid_thw[:, 2] // merge)
+            )
+            return int(token_counts.sum().item())
 
-    def _preprocess(
-        self, text: Dict[str, Any], mm_data: Dict[str, Any], mm_processor_kwargs: Dict[str, Any]
-    ):
-        images = mm_data.get("image")
-        video_datas = mm_data.get("video")
-        if video_datas is not None:
-            videos = [video_data.frames for video_data in video_datas]
-        else:
-            videos = None
-        do_rescale = True
-        if images and isinstance(images[0], torch.Tensor):
-            do_rescale = False
-        if videos and isinstance(videos[0][0], torch.Tensor):
-            do_rescale = False
-        # transformers 5.x's ``ProcessorMixin._merge_kwargs`` strictly
-        # validates per-modality kwargs against the processor's TypedDict.
-        # Processor *output* keys (``video_grid_thw``, ``pixel_values``, ...)
-        # round-trip into the validator via tokenizer ``init_kwargs`` /
-        # ``model_input_names`` and would trip ``TypeError:
-        # merged_typed_dict.__init__() got an unexpected keyword argument
-        # 'video_grid_thw'``. ``_install_processor_output_validation_filter``
-        # (called from ``__init__``) installs a process-wide filter that drops
-        # those keys before the validator sees them.
-        return self.processor(
-            text=[text],
-            images=images,
-            videos=videos,
+        # HF's ``Qwen3VLProcessor._get_num_multimodal_tokens`` (what the base
+        # class default delegates to) raises on video-only calls and returns a
+        # wrong-formula fallback that would break chunked prefill, so we must
+        # run the full processor here.
+        do_rescale = not (video and isinstance(video[0], torch.Tensor))
+        processed = self._processor(
+            text=["<|vision_start|><|video_pad|><|vision_end|>"],
+            videos=[video],
             padding=True,
             do_rescale=do_rescale,
             return_tensors="pt",
-            **mm_processor_kwargs,
+            **kwargs,
         )
-
-    def _postprocess(self, input_ids: torch.IntTensor) -> torch.IntTensor:
-        masks = (input_ids == self.config.image_token_id) | (
-            input_ids == self.config.video_token_id
-        )
-        input_ids[masks] = self.tllm_multimodal_token_id
-        return input_ids
-
-    def get_mrope_config(
-        self,
-        input_ids: torch.IntTensor,
-        image_grid_thw: torch.LongTensor,
-        video_grid_thw: torch.LongTensor,
-        attention_mask: torch.Tensor,
-    ) -> dict[str, torch.Tensor]:
-        mrope_position_ids, mrope_position_deltas = Qwen3VLInputProcessorBase.get_rope_index(
-            self.config, input_ids, image_grid_thw, video_grid_thw, attention_mask
-        )
-
-        mrope_config = {}
-        mrope_config["mrope_position_ids"] = mrope_position_ids.to("cpu").clone()
-        mrope_config["mrope_position_deltas"] = (
-            mrope_position_deltas.to("cpu").to(torch.int32).clone()
-        )
-
-        return mrope_config
-
-    @torch.inference_mode()
-    def call_with_text_prompt(
-        self,
-        inputs: TextPrompt,
-        sampling_params: SamplingParams,
-    ) -> Tuple[List[int], Optional[ExtraProcessedInputs]]:
-        text_prompt, mm_data, mm_processor_kwargs = (
-            inputs.get("prompt"),
-            inputs.get("multi_modal_data", {}),
-            inputs.get("mm_processor_kwargs", {}),
-        )
-
-        # Text-only fast path: skip the multi-modal HF processor (tokenizer
-        # output matches it bit-exactly when ``images`` / ``videos`` are
-        # ``None``). mrope_config still needs to be populated since the LM is
-        # M-RoPE.
-        if not mm_data:
-            input_ids = self.tokenizer(text_prompt, return_tensors="pt").input_ids
-            attention_mask = torch.ones_like(input_ids)
-            mrope_config = self.get_mrope_config(input_ids, None, None, attention_mask)
-            return input_ids[0].to(torch.int32).tolist(), {
-                "multimodal_data": {"mrope_config": mrope_config},
-            }
-
-        processed_inputs = self._preprocess(text_prompt, mm_data, mm_processor_kwargs)
-
-        multimodal_data = {}
-        pixel_values = processed_inputs.get("pixel_values", None)
-        if pixel_values is not None:
-            multimodal_data["image"] = {
-                "pixel_values": pixel_values.to(self.dtype),
-                "image_grid_thw": processed_inputs.get("image_grid_thw"),
-            }
-
-        pixel_values_videos = processed_inputs.get("pixel_values_videos", None)
-        if pixel_values_videos is not None:
-            multimodal_data["video"] = {
-                "pixel_values_videos": pixel_values_videos.to(self.dtype),
-                "video_grid_thw": processed_inputs.get("video_grid_thw"),
-            }
-
-        # NOTE: Even on the text-only prompts, we still need 'mrope_position_ids'.
-        mrope_config = self.get_mrope_config(
-            processed_inputs["input_ids"],
-            processed_inputs.get("image_grid_thw", None),
-            processed_inputs.get("video_grid_thw", None),
-            processed_inputs.get("attention_mask", None),
-        )
-        multimodal_data["mrope_config"] = mrope_config
-
-        fused_input_ids = processed_inputs["input_ids"][0]
-        if mm_data:
-            fused_input_ids = self._postprocess(fused_input_ids)
-
-        return fused_input_ids.to(torch.int32).tolist(), {
-            "multimodal_data": multimodal_data,
-        }
+        vgt = processed.get("video_grid_thw")
+        if vgt is None or len(vgt) == 0:
+            raise RuntimeError(
+                "get_num_tokens_per_video: HF processor returned no "
+                "video_grid_thw for the provided video."
+            )
+        return self.get_num_tokens_per_video(video=video, video_grid_thw=vgt)
 
     def build_disagg_prefill_multimodal_inputs(
         self, inputs: TextPrompt, mm_handles: List[Dict[str, Any]]
