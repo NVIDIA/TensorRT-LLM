@@ -212,3 +212,119 @@ def _triton_fused_topk_softmax_fake(
     routing_weights = router_logits.new_empty((num_tokens, top_k), dtype=router_logits.dtype)
     selected_experts = router_logits.new_empty((num_tokens, top_k), dtype=torch.int32)
     return routing_weights, selected_experts
+
+
+# ---------------------------------------------------------------------------
+# V24: fused EP-local expert-index remap + routing-weight mask
+# ---------------------------------------------------------------------------
+#
+# Replaces the 4 separate aten elementwise nodes that MoE EP-sharding
+# (sharding_ir.py:_localize_expert_indices) inserts per MoE layer:
+#     selected_experts_local = selected_experts - experts_per_rank*ep_rank   # sub
+#     div                    = selected_experts // experts_per_rank          # floordiv
+#     rank_mask              = (div == ep_rank) | (div >= ep_rank if last)    # eq/ge
+#     routing_weights_local  = routing_weights * rank_mask                    # mul
+# 58 MoE layers x 4 = ~232 tiny elementwise kernels/iter (PT fuses these).
+# This collapses them into ONE Triton kernel per layer.
+
+
+@triton.jit
+def _ep_local_route_kernel(
+    sel_ptr,
+    w_ptr,
+    sel_out_ptr,
+    w_out_ptr,
+    n_rows,
+    lower,
+    experts_per_rank,
+    ep_rank,
+    IS_LAST: tl.constexpr,
+    row_stride: tl.constexpr,
+    K: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    if pid >= n_rows:
+        return
+    offs = tl.arange(0, BLOCK_K)
+    m = offs < K
+    base = pid * row_stride
+    sel = tl.load(sel_ptr + base + offs, mask=m, other=0)
+    w = tl.load(w_ptr + base + offs, mask=m, other=0.0)
+
+    local = sel - lower
+    div = sel // experts_per_rank
+    if IS_LAST:
+        keep = div >= ep_rank
+    else:
+        keep = div == ep_rank
+    w_local = tl.where(keep, w, 0.0)
+
+    tl.store(sel_out_ptr + base + offs, local, mask=m)
+    tl.store(w_out_ptr + base + offs, w_local, mask=m)
+
+
+def ep_local_route_fn(
+    selected_experts: torch.Tensor,
+    routing_weights: torch.Tensor,
+    experts_per_rank: int,
+    ep_rank: int,
+    is_last_rank: bool,
+):
+    # selected_experts: (T, K) int; routing_weights: (T, K) float. Both contiguous
+    # (fresh outputs of the gate / noaux_tc_op).
+    assert selected_experts.dim() == 2 and routing_weights.dim() == 2
+    T, K = selected_experts.shape
+    sel = selected_experts if selected_experts.is_contiguous() else selected_experts.contiguous()
+    w = routing_weights if routing_weights.is_contiguous() else routing_weights.contiguous()
+    sel_out = torch.empty_like(sel)
+    w_out = torch.empty_like(w)
+    BLOCK_K = _next_power_of_2(K)
+    grid = (T,)
+    _ep_local_route_kernel[grid](
+        sel,
+        w,
+        sel_out,
+        w_out,
+        T,
+        experts_per_rank * ep_rank,
+        experts_per_rank,
+        ep_rank,
+        IS_LAST=bool(is_last_rank),
+        row_stride=K,
+        K=K,
+        BLOCK_K=BLOCK_K,
+        num_warps=1,
+    )
+    return sel_out, w_out
+
+
+@torch.library.custom_op("auto_deploy::ep_local_route", mutates_args=())
+def ep_local_route(
+    selected_experts: torch.Tensor,
+    routing_weights: torch.Tensor,
+    experts_per_rank: int,
+    ep_rank: int,
+    is_last_rank: bool,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Fused EP-local expert remap + routing-weight mask (replaces 4 aten ops).
+
+    Returns (selected_experts_local, routing_weights_local) where
+        selected_experts_local = selected_experts - experts_per_rank*ep_rank
+        routing_weights_local   = routing_weights * mask
+        mask = (selected_experts // experts_per_rank) {>= if last else ==} ep_rank
+    """
+    return ep_local_route_fn(
+        selected_experts, routing_weights, experts_per_rank, ep_rank, is_last_rank
+    )
+
+
+@ep_local_route.register_fake
+def _ep_local_route_fake(
+    selected_experts: torch.Tensor,
+    routing_weights: torch.Tensor,
+    experts_per_rank: int,
+    ep_rank: int,
+    is_last_rank: bool,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return torch.empty_like(selected_experts), torch.empty_like(routing_weights)
