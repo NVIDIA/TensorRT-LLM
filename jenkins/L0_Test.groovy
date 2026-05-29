@@ -38,6 +38,7 @@ linuxPkgName = ( env.targetArch == AARCH64_TRIPLE ? "tensorrt-llm-sbsa-release-s
 LLM_DOCKER_IMAGE = env.dockerImage
 LLM_ROCKYLINUX8_PY310_DOCKER_IMAGE = env.wheelDockerImagePy310
 LLM_ROCKYLINUX8_PY312_DOCKER_IMAGE = env.wheelDockerImagePy312
+LLM_WHEEL_DOCKER_IMAGE = env.wheelDockerImage
 
 // DLFW torch image
 DLFW_IMAGE = "urm.nvidia.com/docker/nvidia/pytorch:26.02-py3"
@@ -3419,9 +3420,57 @@ def launchTestJobs(pipeline, testFilter)
     }]]}
 
     // Python version and OS for sanity check
-    x86SanityCheckConfigs = [:]
+    // Slots: [buildImage, gpuType, cpuArch, reinstallDependencies, isDlfw, pipInstallImage, extraPytorchInstall]
+    x86SanityCheckConfigs = [
+        "PY312-DLFW": [
+            LLM_DOCKER_IMAGE,
+            "B200_PCIe",
+            X86_64_TRIPLE,
+            false,
+            true,
+            DLFW_IMAGE,
+            false,
+        ],
+        "PY310-UB2204": [
+            LLM_ROCKYLINUX8_PY310_DOCKER_IMAGE,
+            "A10",
+            X86_64_TRIPLE,
+            true,
+            false,
+            UBUNTU_22_04_IMAGE,
+            true, // Extra install PyTorch CUDA 13.0 package to align with the CUDA version used for building TensorRT LLM wheels.
+        ],
+        "PY312-UB2404": [
+            LLM_ROCKYLINUX8_PY312_DOCKER_IMAGE,
+            "A100X",
+            X86_64_TRIPLE,
+            true,
+            false,
+            UBUNTU_24_04_IMAGE,
+            true, // Extra PyTorch CUDA 13.0 install
+        ],
+    ]
 
-    aarch64SanityCheckConfigs = [:]
+    aarch64SanityCheckConfigs = [
+        "PY312-UB2404": [
+            LLM_WHEEL_DOCKER_IMAGE,
+            "GH200",
+            AARCH64_TRIPLE,
+            false,
+            false,
+            UBUNTU_24_04_IMAGE,
+            true, // Extra PyTorch CUDA 13.0 install
+        ],
+        "PY312-DLFW": [
+            LLM_DOCKER_IMAGE,
+            "GH200",
+            AARCH64_TRIPLE,
+            false,
+            true,
+            DLFW_IMAGE,
+            false,
+        ],
+    ]
 
     def toStageName = { gpuType, key -> "${gpuType}-PackageSanityCheck-${key}".toString() }
     fullSet += x86SanityCheckConfigs.collectEntries{ key, values -> [toStageName(values[1], key), null] }.keySet()
