@@ -523,6 +523,8 @@ void CacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& sessio
         // 5. send the buffer to the corresponding target. Ideally, we send only once (one buffer) for each target.
 
         auto cacheBufferId = mCacheTransBufferManager->assignBufferIndexForSend();
+        // RAII wrapper releases the slot on any exception unwind.
+        BufferIndexHolder sendHolder(*mCacheTransBufferManager, cacheBufferId, /*isRecv=*/false);
         int peerDuplicateHeadFactor = targetInfo.mPeerDupHeadFactor;
         auto bufferTargetNum = targetNum / peerDuplicateHeadFactor;
         auto ppRank = selfIdx
@@ -604,9 +606,9 @@ void CacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& sessio
         sendAllBuffers(session, deviceId, outputSplitCaches, bufferCoverTargetNum, preAllocSendBuffer, bufferManager,
             targetInfo, pickUpConnections);
 
-        session.setTime(TransferSession::kTimeTransmissions);
+        sendHolder.release();
 
-        mCacheTransBufferManager->freeBufferIndexForSend(cacheBufferId);
+        session.setTime(TransferSession::kTimeTransmissions);
         session.setTime(TransferSession::kTimePostprocess);
     }
     TLLM_LOG_DEBUG(

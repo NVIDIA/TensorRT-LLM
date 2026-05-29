@@ -819,7 +819,25 @@ public:
         }
     }
 
+    // Backward-compat overload: acquires buffer indices internally with no RAII.
+    // requestSync uses the 2-arg overload below to wrap the indices in
+    // BufferIndexHolder for exception-safe release.
     TransferSession sendRequestInfo(LlmRequest const& llmRequest)
+    {
+        std::vector<std::optional<size_t>> cacheBufferIds;
+        auto* agentConnectionManager = dynamic_cast<executor::kv_cache::AgentConnectionManager*>(mManager);
+        if (agentConnectionManager)
+        {
+            for (auto& cacheTransBufferManager : agentConnectionManager->getCacheTransBufferManagers())
+            {
+                cacheBufferIds.push_back(cacheTransBufferManager->assignBufferIndexForRecv());
+            }
+            TLLM_CHECK(!cacheBufferIds.empty());
+        }
+        return sendRequestInfo(llmRequest, std::move(cacheBufferIds));
+    }
+
+    TransferSession sendRequestInfo(LlmRequest const& llmRequest, std::vector<std::optional<size_t>> cacheBufferIds)
     {
         uint64_t requestId = llmRequest.getContextPhaseParams().value().getReqId();
         auto const& contextState = llmRequest.getDataTransceiverState();
@@ -855,15 +873,6 @@ public:
         }
 
         auto* agentConnectionManager = dynamic_cast<executor::kv_cache::AgentConnectionManager*>(mManager);
-        std::vector<std::optional<size_t>> cacheBufferIds;
-        if (agentConnectionManager)
-        {
-            for (auto& cacheTransBufferManager : agentConnectionManager->getCacheTransBufferManagers())
-            {
-                cacheBufferIds.push_back(cacheTransBufferManager->assignBufferIndexForRecv());
-            }
-            TLLM_CHECK(!cacheBufferIds.empty());
-        }
 
         auto allCounterparts
             = mCacheTransferLayer.computeCounterparts(mSelfState.getCommState().value().getSelfIdx(), contextState);
@@ -1063,18 +1072,57 @@ private:
             llmRequest.getContextPhaseParams().value().getReqId());
         llmRequest.setKvCacheTransferStart(std::chrono::steady_clock::now());
         TLLM_CUDA_CHECK(cudaSetDevice(mDeviceId));
-        auto session = sendRequestInfo(llmRequest);
+
+        // Own the receive-side buffer indices with BufferIndexHolder across
+        // the full receive flow so any throw or early-return releases the
+        // slot via destructor. detach() is invoked after a successful
+        // receiveSync because the formatter already freed each slot.
+        std::vector<BufferIndexHolder> recvHolders;
+        std::vector<std::optional<size_t>> cacheBufferIds;
+        auto const reqIdForLog = std::make_optional(static_cast<uint64_t>(llmRequest.mRequestId));
+        if (auto* agentConnectionManagerForAcq = dynamic_cast<executor::kv_cache::AgentConnectionManager*>(mManager))
+        {
+            auto const& managers = agentConnectionManagerForAcq->getCacheTransBufferManagers();
+            recvHolders.reserve(managers.size());
+            cacheBufferIds.reserve(managers.size());
+            for (auto* cacheTransBufferManager : managers)
+            {
+                auto rawIdx = cacheTransBufferManager->assignBufferIndexForRecv();
+                recvHolders.emplace_back(*cacheTransBufferManager, rawIdx, /*isRecv=*/true, reqIdForLog);
+                if (rawIdx.has_value())
+                {
+                    cacheBufferIds.push_back(static_cast<size_t>(rawIdx.value()));
+                }
+                else
+                {
+                    cacheBufferIds.push_back(std::nullopt);
+                }
+            }
+            TLLM_CHECK(!cacheBufferIds.empty());
+        }
+
+        auto session = sendRequestInfo(llmRequest, std::move(cacheBufferIds));
         session.setTime(TransferSession::kTimeRequestInfo);
         bool isReady = receiveReadySignal(session);
         if (!isReady)
         {
             // Reuse the error state for the cancelled request.
+            // recvHolders' destructors release the slots back to the pool.
             llmRequest.setState(LlmRequestState::kDISAGG_TRANS_ERROR);
             llmRequest.setKvCacheTransferEnd(std::chrono::steady_clock::now());
             return;
         }
         receiveSync(session);
         llmRequest.setKvCacheTransferEnd(std::chrono::steady_clock::now());
+
+        // Happy path: the formatter invoked inside receiveSync already
+        // released each buffer index via freeBufferIndexForRecv. Detach
+        // each holder so its destructor does not double-release on
+        // stack unwind.
+        for (auto& h : recvHolders)
+        {
+            (void) h.detach();
+        }
 
         TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(),
             "End calling requestSync for request ID: %zu, context request ID: %zu.", llmRequest.mRequestId,
