@@ -98,7 +98,7 @@ def _estimate_swa_cache_size(
     tokens_per_block: int,
     swa_window_size: int | None,
     *,
-    prefill: bool,
+    context: bool,
     scratch: bool,
     indexer_k_dtype: str = "fp8",
 ) -> Tuple[int, int]:
@@ -130,7 +130,7 @@ def _estimate_swa_cache_size(
                 has_fp8_kv_cache,
                 indexer_k_dtype=indexer_k_dtype,
             )
-            if not prefill:
+            if not context:
                 size_per_request += window_tokens * token_bytes
             elif not scratch:
                 size_per_token += token_bytes
@@ -788,7 +788,7 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
             indexer_k_dtype=self._indexer_k_dtype,
         )
         (
-            prefill_swa_size_per_token,
+            context_swa_size_per_token,
             _,
         ) = _estimate_swa_cache_size(
             self.head_dim,
@@ -797,7 +797,7 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
             has_fp8_kv_cache,
             self.tokens_per_block,
             self._swa_window_size,
-            prefill=True,
+            context=True,
             scratch=self.enable_swa_scratch_reuse,
             indexer_k_dtype=self._indexer_k_dtype,
         )
@@ -811,21 +811,21 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
             has_fp8_kv_cache,
             self.tokens_per_block,
             self._swa_window_size,
-            prefill=False,
+            context=False,
             scratch=False,
             indexer_k_dtype=self._indexer_k_dtype,
         )
-        max_prefill_tokens = (
+        max_context_tokens = (
             self._max_num_tokens if self._max_num_tokens is not None else max_tokens
         )
-        context_tokens = min(max_tokens, max_prefill_tokens)
+        context_tokens = min(max_tokens, max_context_tokens)
         generation_quota = (
             max_tokens * (non_sliding_attn_size_per_token + decode_swa_size_per_token)
             + self.max_batch_size * decode_swa_size_per_request
         )
-        context_overhead = context_tokens * prefill_swa_size_per_token
+        context_quota = context_tokens * context_swa_size_per_token
         padding = self._get_extra_quota_padding()
-        return int(generation_quota + context_overhead + padding)
+        return int(generation_quota + context_quota + padding)
 
     def _get_max_tokens_from_quota(self, quota: int) -> float:
         compress_ratios = [self._compress_ratios[layer] for layer in self.pp_layers]
@@ -844,18 +844,18 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
             has_fp8_kv_cache,
             self.tokens_per_block,
             self._swa_window_size,
-            prefill=True,
+            context=True,
             scratch=self.enable_swa_scratch_reuse,
             indexer_k_dtype=self._indexer_k_dtype,
         )
         padding = self._get_extra_quota_padding()
-        size_per_request = self.max_batch_size * swa_size_per_request + padding
-        if quota < size_per_request:
+        size_per_batch = self.max_batch_size * swa_size_per_request + padding
+        if quota < size_per_batch:
             return 0
         size_per_token = non_sliding_attn_size_per_token + swa_size_per_token
         if size_per_token == 0:
             return float("inf")
-        return (quota - size_per_request) / size_per_token
+        return (quota - size_per_batch) / size_per_token
 
     def _build_cache_config(
         self,
@@ -1194,15 +1194,15 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
     def _get_context_bytes(self, request: llm_request.LlmRequest) -> int:
         prompt_len = max(0, request.prompt_len)
         total_tokens = prompt_len + self.num_extra_kv_tokens
-        return self._get_cache_bytes_for_tokens(total_tokens, prefill=True)
+        return self._get_cache_bytes_for_tokens(total_tokens, context=True)
 
     def _get_generation_bytes(self, request: llm_request.LlmRequest) -> int:
         prompt_len = max(0, request.prompt_len)
         max_new_tokens = max(0, request.max_new_tokens)
         total_tokens = prompt_len + max_new_tokens + self.num_extra_kv_tokens
-        return self._get_cache_bytes_for_tokens(total_tokens, prefill=False)
+        return self._get_cache_bytes_for_tokens(total_tokens, context=False)
 
-    def _get_cache_bytes_for_tokens(self, total_tokens: int, *, prefill: bool) -> int:
+    def _get_cache_bytes_for_tokens(self, total_tokens: int, *, context: bool) -> int:
         has_fp8_kv_cache = self.dtype == DataType.FP8
         compress_ratios = [self._compress_ratios[layer] for layer in self.pp_layers]
         non_sliding_attn_size_per_token = _estimate_non_sliding_attn_size_per_token(
@@ -1219,7 +1219,7 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
             has_fp8_kv_cache,
             self.tokens_per_block,
             self._swa_window_size,
-            prefill=prefill,
+            context=context,
             scratch=self.enable_swa_scratch_reuse,
             indexer_k_dtype=self._indexer_k_dtype,
         )
@@ -1490,7 +1490,7 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
             has_fp8_kv_cache,
             kwargs["tokens_per_block"],
             model_config.sparse_attention_config.window_size,
-            prefill=False,
+            context=False,
             scratch=False,
             indexer_k_dtype=indexer_k_dtype,
         )
