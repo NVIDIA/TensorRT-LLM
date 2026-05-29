@@ -463,7 +463,7 @@ class TestMistralLarge3_675B(LlmapiAccuracyTestHarness):
 
 
 @pytest.mark.skip_less_device_memory(80000)
-class TestQwen3_5_35B_A3B_VL(LlmapiAccuracyTestHarness):
+class TestQwen3_5_35B_A3B(LlmapiAccuracyTestHarness):
     MODEL_NAME = "Qwen/Qwen3.5-35B-A3B"
     MODEL_PATH = f"{llm_models_root()}/Qwen3.5-35B-A3B"
     MAX_NUM_TOKENS = 16384

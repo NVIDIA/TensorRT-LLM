@@ -1287,11 +1287,10 @@ class _TrtLLM(BaseLLM):
         # Multimodal special handling:
         # 1. Default load_tokenizer may fail because MM has different tokenizer configuration. Hence we initialize it inside input processor
         # 2. May need to modify model weights for MM (e.g., resize vocab embedding). We must do such operation via input processor's __init__
-        trust_remote_code = self.args.trust_remote_code
         self.input_processor = create_input_processor(
             self._hf_model_dir,
             self.tokenizer,
-            trust_remote_code=trust_remote_code)
+            trust_remote_code=self.args.trust_remote_code)
         self._tokenizer = self.input_processor.tokenizer
 
         max_batch_size = self.args.max_batch_size
@@ -1496,12 +1495,11 @@ class _TorchLLM(BaseLLM):
         if self.args.video_pruning_rate is not None:
             input_processor_kwargs[
                 'video_pruning_rate'] = self.args.video_pruning_rate
-        trust_remote_code = self.args.trust_remote_code
         self.input_processor = create_input_processor(
             self._hf_model_dir,
             self.tokenizer,
             checkpoint_format,
-            trust_remote_code=trust_remote_code,
+            trust_remote_code=self.args.trust_remote_code,
             **input_processor_kwargs)
         self._tokenizer = self.input_processor.tokenizer
 

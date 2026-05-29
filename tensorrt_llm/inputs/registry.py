@@ -156,6 +156,7 @@ class BaseMultimodalInputProcessor(ABC):
         self._model_path = model_path
         self._tokenizer = tokenizer
         self._use_fast: bool = kwargs.get('use_fast', True)
+        self._trust_remote_code = trust_remote_code
         self._multimodal_hashing_supported: Optional[bool] = None
 
     def attach_multimodal_embeddings(
@@ -452,7 +453,8 @@ class BaseMultimodalDummyInputsBuilder(ABC):
                 modality="image",
                 prompts=[""],
                 media=[[image]],
-                image_data_format="pt")[0]
+                image_data_format="pt",
+                trust_remote_code=self._trust_remote_code)[0]
 
             prompt_token_ids_single_img, _ = self(test_mm_prompt, None)
 
