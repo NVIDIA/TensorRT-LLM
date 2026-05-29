@@ -55,14 +55,14 @@
 namespace MARLIN_NAMESPACE_NAME
 {
 
-template <typename scalar_t,   // compute type (nv_bfloat16)
-    int const threads,         // threads per block (128 or 256)
-    int const thread_m_blocks, // 16x16 blocks in M dimension
-    int const thread_n_blocks, // 16x16 blocks in N dimension
-    int const thread_k_blocks, // 16x16 blocks in K dimension
-    bool const m_block_size_8, // use 8-row M blocks
-    int const stages,          // async pipeline stages
-    int group_blocks const     // consecutive blocks per scale group
+template <typename scalar_t, // compute type (nv_bfloat16)
+    int threads,             // threads per block (128 or 256)
+    int thread_m_blocks,     // 16x16 blocks in M dimension
+    int thread_n_blocks,     // 16x16 blocks in N dimension
+    int thread_k_blocks,     // 16x16 blocks in K dimension
+    bool m_block_size_8,     // use 8-row M blocks
+    int stages,              // async pipeline stages
+    int group_blocks         // consecutive blocks per scale group
     >
 __global__ void Marlin(MARLIN_KERNEL_PARAMS);
 
@@ -79,7 +79,8 @@ template <typename scalar_t,   // compute type (nv_bfloat16)
     int const thread_k_blocks, // 16x16 blocks in K dimension
     bool const m_block_size_8, // use 8-row M blocks
     int const stages,          // async pipeline stages
-    int group_blocks const     // consecutive blocks per scale group
+    int group_blocks           // consecutive blocks per scale group
+                               // (implicit const: trailing NTTP — see marlin.cuh)
     >
 __global__ void Marlin(MARLIN_KERNEL_PARAMS)
 {
@@ -225,14 +226,14 @@ __device__ inline void wait_negative_and_add(int* lock)
     __syncthreads();
 }
 
-template <typename scalar_t,   // compute type (nv_bfloat16)
-    int const threads,         // threads per block (128 or 256)
-    int const thread_m_blocks, // 16x16 blocks in M dimension
-    int const thread_n_blocks, // 16x16 blocks in N dimension
-    int const thread_k_blocks, // 16x16 blocks in K dimension
-    bool const m_block_size_8, // use 8-row M blocks
-    int const stages,          // async pipeline stages
-    int group_blocks const     // consecutive blocks per scale group
+template <typename scalar_t, // compute type (nv_bfloat16)
+    int threads,             // threads per block (128 or 256)
+    int thread_m_blocks,     // 16x16 blocks in M dimension
+    int thread_n_blocks,     // 16x16 blocks in N dimension
+    int thread_k_blocks,     // 16x16 blocks in K dimension
+    bool m_block_size_8,     // use 8-row M blocks
+    int stages,              // async pipeline stages
+    int group_blocks         // consecutive blocks per scale group
     >
 __global__ void Marlin(MARLIN_KERNEL_PARAMS)
 {
