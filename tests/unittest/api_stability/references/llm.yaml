@@ -163,6 +163,10 @@ methods:
         annotation: int
         default: 0
         status: prototype
+      batch_wait_delay_timeout_ms:
+        annotation: float
+        default: 0
+        status: prototype
       batch_wait_max_tokens_ratio:
         annotation: float
         default: 0
