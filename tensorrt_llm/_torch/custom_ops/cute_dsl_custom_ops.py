@@ -5955,13 +5955,12 @@ if IS_CUTLASS_DSL_AVAILABLE:
             # outputs). The compiled kernel skips all STG.value writes and
             # accepts None for its value-output slot at launch time.
             return_output_values = False
-            N_cols = logits.shape[1]
             # max_seq_len: graph-safe hint. Eager mode: leave None and the
             # heuristic adapts to actual N each call. Graph capture mode:
             # caller passes peak runtime N so the captured kernel selects
             # the large-N (T=1024, V=256) variant instead of the
             # capture-time-small-N variant.
-            N_dec = max_seq_len if max_seq_len is not None else N_cols
+            N_dec = max_seq_len if max_seq_len is not None else logits.shape[1]
             num_sms = _get_num_sms()
 
             # Production tuning knobs (fixed across shapes).
@@ -6090,6 +6089,13 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 f"logits.shape[0] (={logits.shape[0]}) must be divisible by "
                 f"next_n (={next_n}); the kernel derives batch_size as "
                 f"logits.shape[0] / next_n.")
+        # Key includes the shape + dtype signature so a NEW input shape
+        # gets its own one-shot log line; without the signature only the
+        # first shape would ever be logged, hiding follow-up shapes from
+        # production diagnostics.
+        _log_sig = (
+            f"{logits.dtype}|{tuple(logits.shape)}|"
+            f"k={top_k}|nn={next_n}|cr={compress_ratio}|msl={max_seq_len}")
         logger.info_once(
             f"cute_dsl_gvr_topk_decode inputs: "
             f"logits dtype={logits.dtype} shape={tuple(logits.shape)} stride={logits.stride()}; "
@@ -6098,7 +6104,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             f"output_indices dtype={output_indices.dtype} shape={tuple(output_indices.shape)}; "
             f"top_k={top_k} next_n={next_n} compress_ratio={compress_ratio} "
             f"max_seq_len={max_seq_len}",
-            key="cute_dsl_gvr_topk_decode_inputs",
+            key=f"cute_dsl_gvr_topk_decode_inputs|{_log_sig}",
         )
         CuteDSLGvrTopKDecodeRunner.forward(
             logits=logits,
