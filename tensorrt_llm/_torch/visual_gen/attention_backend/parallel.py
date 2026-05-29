@@ -648,7 +648,7 @@ def wrap_parallel_attention(
         )
     elif ring_size > 1:
         attn = RingAttention(attn, process_group=vgm.ring_group)
-    
+
     if ulysses_size > 1:
         attn = UlyssesAttention(attn, process_group=vgm.ulysses_group)
     return attn
