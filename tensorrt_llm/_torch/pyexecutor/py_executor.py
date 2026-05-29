@@ -3842,6 +3842,23 @@ class PyExecutor:
 
     @nvtx_range("_prepare_disagg_gen_init")
     def _prepare_disagg_gen_init(self, fitting_disagg_gen_init_requests):
+        # nvbugs/6104831 Layer E (Python): log the fitting list and the
+        # KV_CACHE_MANAGER prepared-ids snapshot at the entry point that
+        # feeds _recv_disagg_gen_cache. Comparing this across PP ranks
+        # confirms whether _pp_schedule_and_propagate's broadcast handed
+        # every rank the same fitting list. A mismatch with the
+        # DIAG-GEN-RECV-INPUT line on the same iteration means schedule
+        # propagation lost or added a request between this site and the
+        # recv site.
+        fitting_ids = [
+            req.py_request_id for req in fitting_disagg_gen_init_requests
+        ]
+        kv_prepared_snapshot = sorted(
+            self._disagg_gen_init_prepared_ids.get(
+                ResourceManagerType.KV_CACHE_MANAGER, set()))
+        logger.info(f"[DIAG-GEN-PREPARE-INPUT] rank={self.dist.rank} "
+                    f"iter={self.iter_counter} fitting_py_ids={fitting_ids} "
+                    f"kv_prepared_set={kv_prepared_snapshot}")
         if fitting_disagg_gen_init_requests:
             for resource_mgr_type in (
                     ResourceManagerType.KV_CACHE_MANAGER,
@@ -3959,9 +3976,32 @@ class PyExecutor:
                 req.state = LlmRequestState.DISAGG_GENERATION_TRANS_COMPLETE
             return
 
+        # nvbugs/6104831 Layer E (Python): snapshot the input list and the
+        # per-rank dedup set at entry to _recv_disagg_gen_cache. Comparing
+        # this line across gen ranks for the same iteration tells us:
+        #   (a) whether _pp_schedule_and_propagate handed every rank the
+        #       same fitting list (M1 — schedule divergence), and
+        #   (b) whether every rank's _disagg_gen_kv_recv_started_ids
+        #       agrees on which ids are already in flight (M2 — A3 dedup
+        #       state divergence). A single rank with a different snapshot
+        #       is the rank that diverged.
+        input_ids = [req.py_request_id for req in new_gen_reqs]
+        dedup_snapshot = sorted(self._disagg_gen_kv_recv_started_ids)
+        logger.info(f"[DIAG-GEN-RECV-INPUT] rank={self.dist.rank} "
+                    f"iter={self.iter_counter} input_py_ids={input_ids} "
+                    f"dedup_set={dedup_snapshot}")
+
         recv_reqs = []
         for req in new_gen_reqs:
-            if req.py_request_id in self._disagg_gen_kv_recv_started_ids:
+            hit = req.py_request_id in self._disagg_gen_kv_recv_started_ids
+            # nvbugs/6104831 Layer E (Python): per-request dedup decision.
+            # If two ranks see the same input but disagree on `hit`, the
+            # divergence is in A3's per-rank dedup state.
+            logger.info(f"[DIAG-GEN-DEDUP-DECISION] rank={self.dist.rank} "
+                        f"py_id={req.py_request_id} state={req.state} "
+                        f"already_in_set={int(hit)} "
+                        f"action={'SKIP' if hit else 'CALL_RECV'}")
+            if hit:
                 continue
             recv_reqs.append(req)
 
@@ -3991,6 +4031,15 @@ class PyExecutor:
                     try:
                         self.kv_cache_transceiver.request_and_receive_sync(req)
                     except Exception:
+                        # nvbugs/6104831 Layer E (Python): rollback path —
+                        # request_and_receive_sync threw, so the C++ side
+                        # never accepted the request. The dedup id is
+                        # rolled back so a subsequent iteration can retry.
+                        # If this fires repeatedly for the same id, the
+                        # C++ side is rejecting it deterministically.
+                        logger.info(f"[DIAG-GEN-DEDUP-DISCARD-ROLLBACK-SYNC] "
+                                    f"rank={self.dist.rank} "
+                                    f"py_id={req.py_request_id}")
                         self._disagg_gen_kv_recv_started_ids.discard(
                             req.py_request_id)
                         raise
@@ -4005,6 +4054,11 @@ class PyExecutor:
                     try:
                         self.kv_cache_transceiver.request_and_receive_async(req)
                     except Exception:
+                        # nvbugs/6104831 Layer E (Python): rollback path —
+                        # see SYNC variant for rationale.
+                        logger.info(f"[DIAG-GEN-DEDUP-DISCARD-ROLLBACK-ASYNC] "
+                                    f"rank={self.dist.rank} "
+                                    f"py_id={req.py_request_id}")
                         self._disagg_gen_kv_recv_started_ids.discard(
                             req.py_request_id)
                         raise
@@ -4574,6 +4628,17 @@ class PyExecutor:
         # Drop the per-request idempotency markers used by
         # _prepare_disagg_gen_init / _recv_disagg_gen_cache so the tracking
         # sets do not grow unboundedly across the deployment lifetime.
+        # nvbugs/6104831 Layer E (Python): log the discard so we can tell
+        # whether a rank dropped the id at request termination (the
+        # designed-for path) vs. via the except-rollback path (suggesting
+        # the C++ side rejected the request). Each rank logs independently;
+        # if ranks terminate at different iterations the dedup state can
+        # transiently diverge.
+        was_in_set = request.py_request_id in self._disagg_gen_kv_recv_started_ids
+        if was_in_set:
+            logger.info(
+                f"[DIAG-GEN-DEDUP-DISCARD-TERMINATE] rank={self.dist.rank} "
+                f"py_id={request.py_request_id} state={request.state}")
         for prepared_ids in self._disagg_gen_init_prepared_ids.values():
             prepared_ids.discard(request.py_request_id)
         self._disagg_gen_kv_recv_started_ids.discard(request.py_request_id)

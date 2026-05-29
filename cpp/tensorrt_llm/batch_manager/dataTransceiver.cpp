@@ -436,6 +436,26 @@ public:
 
         TLLM_CHECK_WITH_INFO(peerIdx < static_cast<int>(allCounterparts.size()),
             "Peer rank %d not found in expected counterparts", peerSelfIdx);
+
+        // nvbugs/6104831 Layer E (C++): log who the ctx side expected to
+        // hear from for this reqId (allCounterparts) and which one of
+        // those peers just sent. Pair with the gen-side
+        // [DIAG-GEN-SEND-INFO-DEST] lines to identify the silent peer:
+        // any allCounterparts entry that never shows up as a peerSelfIdx
+        // here is the rank that diverged at the Python layer.
+        {
+            std::string counterpartsStr;
+            for (size_t k = 0; k < allCounterparts.size(); ++k)
+            {
+                counterpartsStr += std::to_string(allCounterparts[k]);
+                if (k + 1 < allCounterparts.size())
+                    counterpartsStr += ",";
+            }
+            TLLM_LOG_INFO(
+                "[DIAG-CTX-COUNTERPARTS] reqId=%lu peerSelfIdx=%d peerIdx=%d "
+                "allCounterparts=[%s]",
+                requestId, peerSelfIdx, peerIdx, counterpartsStr.c_str());
+        }
         // Get or create the per-request cancel flag for this requestId. If
         // sendAsync already ran for this reqId the flag is registered; if
         // recvRequestInfo races ahead, we create it here so the session
@@ -1157,6 +1177,24 @@ public:
             allConnections.emplace_back(connection);
         }
 
+        // nvbugs/6104831 Layer E (C++): log gen-side allCounterparts once
+        // before the per-peer send loop. Pair with the ctx-side
+        // [DIAG-CTX-COUNTERPARTS] line: ctx logs the expected peer list
+        // from its perspective; this logs the peer list this gen rank
+        // intends to notify. Together they bracket the request-info
+        // exchange so a 1-of-N wedge is unambiguous.
+        {
+            std::string counterpartsStr;
+            for (size_t k = 0; k < allCounterparts.size(); ++k)
+            {
+                counterpartsStr += std::to_string(allCounterparts[k]);
+                if (k + 1 < allCounterparts.size())
+                    counterpartsStr += ",";
+            }
+            TLLM_LOG_INFO("[DIAG-GEN-SEND-INFO-COUNTERPARTS] reqId=%lu allCounterparts=[%s]", llmRequest.mRequestId,
+                counterpartsStr.c_str());
+        }
+
         for (size_t ci = 0; ci < allCounterparts.size(); ci++)
         {
             // Honor perRequestCancel between per-peer notify iterations. If
@@ -1172,6 +1210,13 @@ public:
             }
             auto rank = allCounterparts[ci];
             auto const* connection = connections.at(rank);
+            // nvbugs/6104831 Layer E (C++): per-peer dest log. Each
+            // iteration sends a request-info to one ctx rank; this
+            // captures which one. The ctx side's
+            // [DIAG-CTX-COUNTERPARTS] peerSelfIdx will be this gen
+            // rank's selfIdx, so the two lines pair up by (reqId,
+            // gen-rank, ctx-rank).
+            TLLM_LOG_INFO("[DIAG-GEN-SEND-INFO-DEST] reqId=%lu ci=%zu destCtxRank=%d", llmRequest.mRequestId, ci, rank);
 
             bool isKvCounterpart
                 = std::find(kvCounterParts.begin(), kvCounterParts.end(), rank) != kvCounterParts.end();
