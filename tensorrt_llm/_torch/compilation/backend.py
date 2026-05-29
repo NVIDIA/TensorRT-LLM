@@ -168,9 +168,9 @@ class Backend:
 
         self.input_num_tokens = None
         # On multimodal wrappers (e.g. Qwen2/3-VL) the LM forward is
-        # invoked with ``input_ids=None`` and ``inputs_embeds=<tensor>``,
-        # so dynamo eliminates the ``input_ids`` placeholder; the
-        # ``inputs_embeds`` placeholder carries the (num_tokens, H)
+        # invoked with `input_ids=None` and `inputs_embeds=<tensor>`,
+        # so dynamo eliminates the `input_ids` placeholder; the
+        # `inputs_embeds` placeholder carries the (num_tokens, H)
         # tensor whose leading dim is the same num_tokens.
         for node in gm.graph.nodes:
             if node.op == "placeholder":

@@ -1375,11 +1375,11 @@ def maybe_pin_memory(tensor: torch.Tensor) -> torch.Tensor:
     Pin the Tensor memory if pinning is preferred/beneficial for performance.
 
     Idempotent: if the tensor is already pinned, returns it unchanged.
-    PyTorch's ``.pin_memory()`` is itself a no-op for an already-pinned
+    PyTorch's `.pin_memory()` is itself a no-op for an already-pinned
     tensor, but the call still goes through a CPython dispatch + pybind
-    boundary; gating on ``is_pinned()`` skips that for the common case
-    in tight loops (e.g. ``AttentionMetadata.prepare()`` re-pinning
-    ``kv_lens`` that callers already pinned upstream).
+    boundary; gating on `is_pinned()` skips that for the common case
+    in tight loops (e.g. `AttentionMetadata.prepare()` re-pinning
+    `kv_lens` that callers already pinned upstream).
     """
     if prefer_pinned() and not tensor.is_pinned():
         return tensor.pin_memory()
@@ -1388,19 +1388,19 @@ def maybe_pin_memory(tensor: torch.Tensor) -> torch.Tensor:
 
 def async_tensor_h2d(data, dtype: torch.dtype,
                      device: Union[str, torch.device]) -> torch.Tensor:
-    """Build a CPU tensor from ``data`` and ship it to ``device`` with a
+    """Build a CPU tensor from `data` and ship it to `device` with a
     non-blocking H->D copy.
 
     Mirrors vLLM's helper of the same name. Centralizes the pinned-CPU
-    + ``cudaMemcpyAsync`` pattern so callers don't have to choose
-    between ``pin_memory=prefer_pinned()`` + ``.to(..., non_blocking=True)``
-    (sequence input) and ``maybe_pin_memory(t).to(..., non_blocking=True)``
-    (existing CPU tensor input). Without pinning, ``non_blocking=True``
+    + `cudaMemcpyAsync` pattern so callers don't have to choose
+    between `pin_memory=prefer_pinned()` + `.to(..., non_blocking=True)`
+    (sequence input) and `maybe_pin_memory(t).to(..., non_blocking=True)`
+    (existing CPU tensor input). Without pinning, `non_blocking=True`
     silently degrades to a staging copy.
 
-    ``data`` may be:
-      * a Python sequence (list/tuple/etc.) — built via ``torch.tensor``.
-      * a CPU ``torch.Tensor`` — reused (and cast to ``dtype`` if needed)
+    `data` may be:
+      * a Python sequence (list/tuple/etc.) — built via `torch.tensor`.
+      * a CPU `torch.Tensor` — reused (and cast to `dtype` if needed)
         before pinning.
     """
     if isinstance(data, torch.Tensor):

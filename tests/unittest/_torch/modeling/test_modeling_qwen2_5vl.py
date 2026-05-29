@@ -151,8 +151,8 @@ class TestQwen2_5_VL(TestModelingMultimodal):
             trtllm_inputs["multimodal_params"] = gen_multimodal_params_list
         else:
             # Mrope position ids. For chunked prefill / KV cache reuse we must
-            # mirror production ``PyTorchModelEngine`` behavior and slice the
-            # request's full ``mrope_position_ids`` to the current chunk's
+            # mirror production `PyTorchModelEngine` behavior and slice the
+            # request's full `mrope_position_ids` to the current chunk's
             # range -- the model now indexes mrope cos/sin by batch-flat
             # per-token index, so the position_ids tensor must contain only
             # the tokens of the current forward (chunk-local) with their
@@ -323,7 +323,7 @@ class TestQwen2_5_VL(TestModelingMultimodal):
 # ---------------------------------------------------------------------------
 # Equivalence tests for the Qwen2.5-VL optimization steps.
 #
-# These do not exercise the full ``Qwen2VLModelBase``/``Qwen2_5_VisionModel`` —
+# These do not exercise the full `Qwen2VLModelBase`/`Qwen2_5_VisionModel` —
 # they isolate the host-side reshapes/transfers we changed and prove the
 # new path is numerically identical to the prior implementation.
 # ---------------------------------------------------------------------------
@@ -333,7 +333,7 @@ import pytest  # noqa: E402
 
 def _vision_transfer_old(rotary_pos_emb_cos, rotary_pos_emb_sin, window_indices,
                          device):
-    """Reproduces the prior 3-separate-``.to(device, non_blocking=True)`` shape:
+    """Reproduces the prior 3-separate-`.to(device, non_blocking=True)` shape:
     cos / sin / window_index each get their own H->D copy."""
     cos = torch.cat(rotary_pos_emb_cos).to(device=device, non_blocking=True)
     sin = torch.cat(rotary_pos_emb_sin).to(device=device, non_blocking=True)
@@ -364,7 +364,7 @@ def _vision_transfer_new(rotary_pos_emb_cos, rotary_pos_emb_sin, window_indices,
     "shapes",
     [
         # (per-image (rows, hidden)) tuples — same shape requirements as the
-        # real ``Qwen2_5_VisionModel.get_rotary_pos_emb_window_data`` output:
+        # real `Qwen2_5_VisionModel.get_rotary_pos_emb_window_data` output:
         # cos[i] and sin[i] share shape/dtype; window_indices[i] is int64.
         [(64, 80)],
         [(64, 80), (256, 80)],

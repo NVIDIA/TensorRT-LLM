@@ -467,7 +467,7 @@ class PyTorchModelEngine(ModelEngine):
                         torch.nn.Module):
                     # Multi-modal wrapper (e.g. Qwen2/3-VL): compile only the
                     # text decoder. Tracing the outer wrapper pulls the
-                    # vision-tower output path + ``fuse_input_embeds`` into
+                    # vision-tower output path + `fuse_input_embeds` into
                     # the same graph, which lets the vision hidden_dim
                     # propagate into the LM o_proj fake-tensor trace and
                     # blows up the piecewise CUDA graph warmup.
