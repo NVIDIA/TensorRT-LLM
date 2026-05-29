@@ -13,8 +13,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Tuple
-
 import pytest
 import torch
 
@@ -35,7 +33,7 @@ def _make_inputs(
     next_n: int,
     seed: int,
     compress_ratio: int = 1,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Build (logits, pre_idx, seq_lens) for the op.
 
     ``logits`` lives in compressed-token-index space (``N = N_uncompressed /
@@ -49,7 +47,13 @@ def _make_inputs(
     logits = logits_f32.to(dtype)
 
     num_groups = num_rows // next_n
-    argmax_idx = logits[::next_n].argmax(dim=-1).int()  # one per group
+    # argmax must come from the effective scan range, not full N — for
+    # next_n>1 the kernel's row-0 N_eff is only (N - next_n + 1) cols, so
+    # an argmax landing in the [N_eff, N) tail would violate the
+    # pre_idx[..., 0] invariant. Use N_eff = N - next_n + 1 (the
+    # tightest, row-0 boundary; always <= per-row N_eff for any ofs).
+    effective_len = N - next_n + 1
+    argmax_idx = logits[::next_n, :effective_len].argmax(dim=-1).int()
     pre_idx = torch.zeros(num_groups, top_k, dtype=torch.int32, device=device)
     pre_idx[:, 0] = argmax_idx
     # Fill remaining columns with arbitrary in-range indices (kernel only

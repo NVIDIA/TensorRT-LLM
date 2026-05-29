@@ -21,7 +21,7 @@ import argparse
 import functools
 import sys
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Optional
 
 import cutlass
 import cutlass.cute as cute
@@ -148,7 +148,7 @@ def gvr_topk_decode(
     compress_ratio: int = 1,
     max_seq_len: Optional[int] = None,
     return_output_values: bool = False,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor]:
     """CuTe DSL GVR Top-K wrapper with every tuning knob exposed.
 
     ``None``-valued knobs are resolved via the production auto-heuristic
@@ -268,7 +268,7 @@ def _make_inputs(
     seed: int,
     next_n: int = 1,
     compress_ratio: int = 1,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Build (logits, pre_idx, seq_lens) for a multi-row test.
 
     Shapes:
@@ -290,7 +290,10 @@ def _make_inputs(
     logits_f32 = torch.randn(num_rows, N, dtype=torch.float32, device=device) * 2.0
     logits = logits_f32.to(dtype)
     num_groups = num_rows // next_n
-    argmax_idx = logits[::next_n].argmax(dim=-1).int()  # one per group
+    # argmax must come from the effective scan range, not full N — for
+    # next_n>1 the kernel's row-0 N_eff is only (N - next_n + 1) cols.
+    effective_len = N - next_n + 1
+    argmax_idx = logits[::next_n, :effective_len].argmax(dim=-1).int()
     pre_idx = torch.zeros(num_groups, top_k, dtype=torch.int32, device=device)
     pre_idx[:, 0] = argmax_idx
     for j in range(1, top_k):
@@ -309,7 +312,7 @@ def _tie_aware_correct(
     logits: torch.Tensor,
     top_k: int,
     next_n: int,
-) -> Tuple[bool, str]:
+) -> tuple[bool, str]:
     """Multi-row tie-aware correctness check with strict sort+allclose.
 
     Per row r: scan range is ``logits[r, :N_eff]`` where
