@@ -167,14 +167,22 @@ def trtllm_finegrained_fp8_linear(
         act_fp8, act_sf = per_token_quant_and_transform(input_2d)
     else:
         # Hopper (SM90) and Blackwell (SM100+) share the same path
-        act_fp8, act_sf = torch.ops.trtllm.fp8_quantize_1x128(input_2d)
-    output = torch.ops.trtllm.fp8_block_scaling_gemm(act_fp8, weight, act_sf, weight_scale)
+        try:
+            act_fp8, act_sf = torch.ops.trtllm.fp8_quantize_1x128(input_2d)
+            output = torch.ops.trtllm.fp8_block_scaling_gemm(act_fp8, weight, act_sf, weight_scale)
+        except RuntimeError as e:
+            if "NVRTC compilation failed" in str(e) or "not supported" in str(e):
+                raise RuntimeError(
+                    f"Unsupported configuration: FP8 block-scaling GEMM compilation failed in the current environment. "
+                    f"Details: {str(e)}"
+                ) from e
+            raise e
 
-    if bias is not None:
-        output = output + bias
+        if bias is not None:
+            output = output + bias
 
-    # Reshape back to original batch dimensions: [M, N] -> [..., N]
-    return output.reshape(*input_shape[:-1], weight.shape[0])
+        # Reshape back to original batch dimensions: [M, N] -> [..., N]
+        return output.reshape(*input_shape[:-1], weight.shape[0])
 
 
 @trtllm_finegrained_fp8_linear.register_fake
