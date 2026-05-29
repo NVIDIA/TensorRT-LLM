@@ -7,8 +7,6 @@ import torch
 
 import tensorrt_llm
 import tensorrt_llm.bindings.executor as trtllm
-from tensorrt_llm._torch.models.modeling_utils import \
-    MODEL_CLASS_VISION_ENCODER_MAPPING
 from tensorrt_llm._utils import (confidential_compute_enabled, get_sm_version,
                                  str_dtype_to_binding, torch_dtype_to_str)
 from tensorrt_llm.bindings.executor import DecodingMode
@@ -379,7 +377,19 @@ class KvCacheCreator:
         max_beam_width = self._max_beam_width
         vocab_size = self._model_engine.model.model_config.pretrained_config.vocab_size
 
-        input_seq_len = min(max_num_tokens, input_seq_len)
+        # Drive the per-request dummy size from the encoder budget so the
+        # vision encoder allocates a workspace fitting ``encoder_max_num_tokens``
+        # attention tokens during ``configure_kv_cache_capacity``. That budget
+        # is in encoder (pre-merger) units; convert to LLM-visible (post-
+        # merger) units to compare against ``input_seq_len`` and the LLM-side
+        # ``max_num_tokens`` cap. Models that do not expose
+        # ``spatial_merge_unit`` default to 1, leaving behavior unchanged.
+        _, encoder_max_num_tokens = self._llm_args.get_encoder_runtime_sizes()
+        spatial_merge_unit = getattr(input_processor, "spatial_merge_unit", 1)
+        encoder_llm_visible = max(encoder_max_num_tokens // spatial_merge_unit,
+                                  1)
+
+        input_seq_len = min(max_num_tokens, input_seq_len, encoder_llm_visible)
         remaining_tokens = max_num_tokens
         while remaining_tokens > 0:
             input_seq_len = min(input_seq_len, remaining_tokens)
@@ -445,9 +455,11 @@ class KvCacheCreator:
     def _create_dummy_context_requests(
             self, input_seq_len: int) -> List[trtllm.Request]:
         requests = []
-        if hasattr(self._model_engine.model,
-                   "original_arch") and MODEL_CLASS_VISION_ENCODER_MAPPING.get(
-                       self._model_engine.model.original_arch, None):
+        # Route to the multimodal dummy path when the engine drives a
+        # multimodal model, independent of *which* modality (audio-only,
+        # vision-only, or mixed). The discriminator hides behind
+        # ``is_multimodal``; see PyTorchModelEngine for the signals used.
+        if self._model_engine.is_multimodal:
             requests = self._create_dummy_mm_context_request(input_seq_len)
         # if succeed profiling with multimodal requests then return, otherwise profile
         # with default case

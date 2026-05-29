@@ -65,6 +65,27 @@ class LlavaNextInputProcessor(BaseMultimodalInputProcessor,
         self.image_token_index = config.image_token_index
         self.vocab_size = config.vocab_size
 
+    def get_max_requests_per_mm_item(self) -> int:
+        """Worst-case CLIP attention sequences produced by one LLaVA-Next image.
+
+        LLaVA-Next splits each image into a base view plus
+        ``image_grid_pinpoints``-driven sub-image patches; the CLIP encoder
+        runs full attention on each sub-image independently, so the
+        attention-layer fan-out per image equals the maximum patch count
+        across the configured grid pinpoints (typically 5 for the default
+        4-tile + base layout).
+        """
+        grid_pinpoints = self.config.image_grid_pinpoints
+        # `patch_size` here is CLIP's per-tile resolution
+        # (``vision_config.image_size``), matching the HF helper's contract.
+        patch_size = self.config.vision_config.image_size
+        return max(
+            image_size_to_num_patches(
+                image_size=gp,
+                grid_pinpoints=grid_pinpoints,
+                patch_size=patch_size,
+            ) for gp in grid_pinpoints)
+
     @property
     def config(self) -> PretrainedConfig:
         return self._config

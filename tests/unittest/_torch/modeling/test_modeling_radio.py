@@ -80,6 +80,15 @@ def test_radio_fp8_parent_kv_cache_does_not_leak_into_vit(tiny_vit_config):
     vision tower, FlashInfer raises at forward time about it not being supported.
     """
     vision_model = RADIOVisionModel(_make_fp8_model_config(), disable_quantization=True)
+    # Mirror PyTorchModelEngine: walk submodules and build each encoder's
+    # AttentionMetadata. RADIOVisionModel wraps a VisionTransformer (the
+    # MultimodalEncoderMixin) several levels deep, so the call site has to
+    # walk submodules instead of calling setup_attn_metadata on the wrapper.
+    from tensorrt_llm._torch.models.modeling_multimodal_encoder import MultimodalEncoderMixin
+
+    for module in vision_model.modules():
+        if isinstance(module, MultimodalEncoderMixin):
+            module.setup_attn_metadata(max_num_requests=8192, max_num_tokens=8192)
 
     device = torch.device("cuda")
     dtype = torch.bfloat16

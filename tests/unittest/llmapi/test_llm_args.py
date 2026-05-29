@@ -168,6 +168,68 @@ model_kwargs:
         assert llm_args.model_kwargs['num_hidden_layers'] == 2
 
 
+@pytest.mark.parametrize("llm_args_cls", [TrtLlmArgs, TorchLlmArgs])
+class TestEncoderRuntimeSizes:
+    """Cover encoder runtime size fields and fallback to LLM limits.
+
+    `encoder_max_batch_size` is anchored at 64 to cap encoder
+    AttentionMetadata preallocation; `encoder_max_num_tokens` is unset by
+    default and falls back to the LLM-side `max_num_tokens`. Both knobs
+    are still overridable per user request; passing `encoder_max_batch_size
+    =None` restores the legacy "fall back to max_batch_size" behavior.
+    """
+
+    def test_defaults(self, llm_args_cls):
+        llm_args = llm_args_cls(model=llama_model_path)
+        # Anchored at 64: see commit "Default encoder_max_batch_size to 64
+        # to cap encoder prealloc" -- max_batch_size fallback (2048) made
+        # high-fan-out encoders (Qwen2/2.5-VL windowed attention) over-
+        # allocate AttentionMetadata.max_num_requests by ~160K.
+        assert llm_args.encoder_max_batch_size == 64
+        # Token cap still falls back to LLM-side max_num_tokens when unset.
+        assert llm_args.encoder_max_num_tokens is None
+
+    @pytest.mark.parametrize(
+        "kwargs, expected_runtime_sizes",
+        [
+            # Neither encoder knob set -- falls back to LLM limits.
+            (dict(max_batch_size=64, max_num_tokens=2048), (64, 2048)),
+            # Only encoder_max_batch_size overrides.
+            (dict(max_batch_size=64,
+                  max_num_tokens=2048,
+                  encoder_max_batch_size=512), (512, 2048)),
+            # Only encoder_max_num_tokens overrides.
+            (dict(max_batch_size=64,
+                  max_num_tokens=2048,
+                  encoder_max_num_tokens=32768), (64, 32768)),
+            # Both encoder knobs override.
+            (dict(max_batch_size=64,
+                  max_num_tokens=2048,
+                  encoder_max_batch_size=512,
+                  encoder_max_num_tokens=32768), (512, 32768)),
+        ],
+        ids=["fallback", "only_batch", "only_tokens", "both"],
+    )
+    def test_get_encoder_runtime_sizes(self, llm_args_cls, kwargs,
+                                       expected_runtime_sizes):
+        llm_args = llm_args_cls(model=llama_model_path, **kwargs)
+        assert llm_args.get_encoder_runtime_sizes() == expected_runtime_sizes
+
+    @pytest.mark.parametrize(
+        "field_name, invalid_value",
+        [
+            ("encoder_max_batch_size", 0),
+            ("encoder_max_batch_size", -1),
+            ("encoder_max_num_tokens", 0),
+            ("encoder_max_num_tokens", -1),
+        ],
+    )
+    def test_rejects_non_positive(self, llm_args_cls, field_name,
+                                  invalid_value):
+        with pytest.raises(ValidationError):
+            llm_args_cls(model=llama_model_path, **{field_name: invalid_value})
+
+
 def test_decoding_type_eagle3_parses_to_eagle3_decoding_config():
     adapter = TypeAdapter(SpeculativeConfig)
     spec_cfg = adapter.validate_python(

@@ -2,6 +2,7 @@
 # Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import copy
+import math
 import re
 from functools import lru_cache
 from typing import Any, Dict, List, Optional, Tuple, Union
@@ -53,6 +54,7 @@ if IS_FLASHINFER_AVAILABLE:
 from ..modules.gated_mlp import GatedMLP
 from ..modules.rotary_embedding import MRotaryEmbedding, RotaryEmbedding
 from .modeling_auto import AutoModelForCausalLM
+from .modeling_multimodal_encoder import MultimodalEncoderMixin
 from .modeling_multimodal_utils import (bypass_processor_output_validation,
                                         find_input_mm_embeds, fuse_input_embeds,
                                         get_multimodal_embeddings)
@@ -114,6 +116,201 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
     @property
     def dtype(self) -> torch.dtype:
         return self._dtype
+
+    # ------------------------------------------------------------------
+    # Deterministic dummy-input sizing for multimodal profiling.
+    #
+    # `get_num_mm_tokens` / `get_size_with_most_features` are the encoder-
+    # side counterpart to the LLM's `max_num_tokens`: they report (and
+    # invert) the exact number of attention tokens the vision encoder will
+    # process for a given input size. The unit is **pre-merger patches** so
+    # that values are directly comparable with ``encoder_max_num_tokens``
+    # and ``AttentionMetadata.max_num_tokens``. Callers working in
+    # LLM-visible (post-merger) units multiply/divide by
+    # ``spatial_merge_unit`` at the boundary.
+    # ------------------------------------------------------------------
+    @property
+    def spatial_merge_unit(self) -> int:
+        """Encoder→LLM token ratio. Qwen2/2.5-VL applies a ``merge_size`` × ``merge_size`` spatial merger."""
+        merge_size = self.config.vision_config.spatial_merge_size
+        return merge_size * merge_size
+
+    def get_max_requests_per_mm_item(self) -> int:
+        """Worst-case windowed-attention sequences produced by one Qwen2/2.5-VL image.
+
+        The vision encoder applies windowed attention with each window
+        covering ``(window_size / patch_size) ** 2`` pre-merger patches.
+        A single image's worst-case window count is therefore
+        ``ceil(max_patches_per_image / (window_size / patch_size) ** 2)``,
+        where ``max_patches_per_image`` is the absolute upper bound the
+        HF image processor produces after ``smart_resize`` caps the input
+        at ``max_pixels`` (transformers <5) or ``size["longest_edge"]``
+        (transformers >=5).
+
+        Deriving the bound from the processor config (rather than from
+        the engine's ``encoder_max_num_tokens``) keeps the prealloc valid
+        even when the engine's per-step token budget is smaller than a
+        single image's actual patch count.
+        """
+        cfg = self.config.vision_config
+        window_size = getattr(cfg, "window_size", 0)
+        patch_size = cfg.patch_size
+        if window_size <= 0 or patch_size <= 0:
+            return 1
+
+        max_pixels = self._get_processor_max_pixels()
+        if max_pixels is None or max_pixels <= 0:
+            return 1
+
+        max_patches_per_image = max_pixels // (patch_size * patch_size)
+        window_tokens = (window_size // patch_size)**2
+        if window_tokens <= 0:
+            return 1
+        return math.ceil(max_patches_per_image / window_tokens)
+
+    def _get_processor_max_pixels(self) -> Optional[int]:
+        """Return the HF image processor's per-image pixel cap.
+
+        ``transformers<5`` exposes the cap directly on the image processor
+        as ``max_pixels``; ``transformers>=5`` migrated to a
+        ``size={"shortest_edge": ..., "longest_edge": ...}`` container where
+        ``longest_edge`` carries the same upper bound. In 5.x the container
+        is ``transformers.image_utils.SizeDict`` — NOT a ``dict`` subclass,
+        though it supports ``__getitem__`` — so an ``isinstance(..., dict)``
+        check silently drops the lookup and falls through to ``None``,
+        which then makes ``get_max_requests_per_mm_item`` underestimate the
+        encoder prealloc to the single-sequence default. Use subscript
+        access directly (matches vLLM's Qwen2-VL handling) and only fall
+        back to ``None`` when ``size`` is missing the key entirely.
+        """
+        image_proc = getattr(self.processor, "image_processor", None)
+        if image_proc is None:
+            return None
+        if hasattr(image_proc, "max_pixels"):
+            return image_proc.max_pixels
+        size = getattr(image_proc, "size", None)
+        if size is None:
+            return None
+        try:
+            return size["longest_edge"]
+        except (KeyError, TypeError):
+            return None
+
+    def _get_processor_min_pixels(self) -> Optional[int]:
+        """Return the HF image processor's per-image min-pixels floor.
+
+        HF Qwen2/2.5/3-VL's ``smart_resize`` upscales any image whose pixel
+        area drops below this floor (``size["shortest_edge"]`` in
+        transformers>=5, ``min_pixels`` attribute in <5). A dummy picked
+        below the floor will silently grow inside the processor, breaking
+        ``get_num_mm_tokens``'s assumed-grid invariant: see
+        ``get_size_with_most_features`` for the clamp that consumes this.
+        """
+        image_proc = getattr(self.processor, "image_processor", None)
+        if image_proc is None:
+            return None
+        if hasattr(image_proc, "min_pixels"):
+            return image_proc.min_pixels
+        size = getattr(image_proc, "size", None)
+        if size is None:
+            return None
+        try:
+            return size["shortest_edge"]
+        except (KeyError, TypeError):
+            return None
+
+    def get_num_mm_tokens(
+        self,
+        *,
+        width: int,
+        height: int,
+        num_frames: int = 1,
+    ) -> int:
+        """Return the encoder attention tokens (pre-merger) that result from
+        an image/video of the given pixel dimensions.
+
+        Mirrors HF Qwen2/2.5-VL's ``smart_resize`` + patchify: ``(width, height)``
+        is rounded to a multiple of ``patch_size * spatial_merge_size`` and
+        then divided into ``patch_size``-sized patches. The result equals
+        the number of tokens the encoder will run attention over for one
+        atomic forward.
+        """
+        cfg = self.config.vision_config
+        patch_size = cfg.patch_size
+        merge_size = cfg.spatial_merge_size
+        temporal_patch_size = getattr(cfg, "temporal_patch_size", 1)
+        factor = patch_size * merge_size
+
+        # Round half-up to the nearest multiple of ``factor`` (matches the
+        # smart_resize grid the HF Qwen-VL processor uses).
+        resized_w = max(((width + factor // 2) // factor) * factor, factor)
+        resized_h = max(((height + factor // 2) // factor) * factor, factor)
+        grid_h = resized_h // patch_size
+        grid_w = resized_w // patch_size
+
+        padded_frames = ((num_frames + temporal_patch_size - 1) //
+                         temporal_patch_size) * temporal_patch_size
+        grid_t = max(padded_frames // temporal_patch_size, 1)
+
+        return grid_t * grid_h * grid_w
+
+    def get_size_with_most_features(
+        self,
+        *,
+        max_tokens: int,
+    ) -> Dict[str, int]:
+        """Invert ``get_num_mm_tokens``: pick the ``(width, height)`` whose
+        attention-token count is the largest value ≤ ``max_tokens`` while
+        keeping the aspect ratio bounded.
+
+        ``max_tokens`` is in the same unit as ``get_num_mm_tokens`` /
+        ``encoder_max_num_tokens`` (pre-merger). Single image (``num_frames=1``)
+        for now; callers needing video can compose with the temporal dim.
+        """
+        if max_tokens <= 0:
+            raise ValueError(f"max_tokens must be positive, got {max_tokens}")
+
+        def closest_factor_pair(n: int) -> Tuple[int, int]:
+            """Closest ``h*w=n`` to square; keeps dummy aspect ratio near 1:1."""
+            for d in range(math.isqrt(n), 0, -1):
+                if n % d == 0:
+                    return d, n // d
+            return 1, n
+
+        cfg = self.config.vision_config
+        patch_size = cfg.patch_size
+        merge_size = cfg.spatial_merge_size
+        unit = patch_size * merge_size
+
+        # Pre-merger tokens factor into (grid_h * grid_w) and each grid
+        # dimension is ``merge_size`` × the post-merger factor. Searching in
+        # post-merger units bounds the inner loop and lets us reuse the
+        # familiar near-square factor pair for aspect ratio bounds.
+        post_merger_budget = max(max_tokens // (merge_size * merge_size), 1)
+
+        # HF ``smart_resize`` upscales any image whose pixel area falls below
+        # the processor's ``min_pixels``. Returning a sub-min_pixels size here
+        # would silently grow inside the processor and break the dummy's
+        # token-count invariant. Floor ``post_merger_budget`` to the smallest
+        # near-square grid that already meets that area.
+        min_pixels = self._get_processor_min_pixels()
+        if min_pixels and min_pixels > 0:
+            min_dim_post_merger = math.ceil(math.sqrt(min_pixels) / unit)
+            post_merger_budget = max(post_merger_budget,
+                                     min_dim_post_merger * min_dim_post_merger)
+
+        h_factor, w_factor = closest_factor_pair(post_merger_budget)
+        for seq_len in range(post_merger_budget, 0, -1):
+            h_f, w_f = closest_factor_pair(seq_len)
+            if w_f / max(h_f, 1) <= 200:
+                h_factor, w_factor = h_f, w_f
+                break
+
+        return {
+            "width": unit * w_factor,
+            "height": unit * h_factor,
+            "num_frames": 1,
+        }
 
     @classmethod
     def get_rope_index(
@@ -789,7 +986,7 @@ class Qwen2_5_VLPatchMerger(torch.nn.Module):
         return hidden_states
 
 
-class Qwen2_5_VisionModel(torch.nn.Module):
+class Qwen2_5_VisionModel(torch.nn.Module, MultimodalEncoderMixin):
 
     def __init__(self, model_config: ModelConfig[PretrainedConfig]):
         super().__init__()
@@ -831,17 +1028,23 @@ class Qwen2_5_VisionModel(torch.nn.Module):
         self.merger = Qwen2_5_VLPatchMerger(self.model_config, )
         self.metadata_cls = get_attention_backend(
             self.model_config.attn_backend).Metadata
+        self.full_attn_metadata: Optional[AttentionMetadata] = None
+        self.window_attn_metadata: Optional[AttentionMetadata] = None
 
-        self.full_attn_metadata = self.metadata_cls(
-            max_num_requests=8192,  # TODO: Make this dynamic
-            max_num_tokens=8192,  # TODO: Make this dynamic
-            kv_cache_manager=None,
-        )
-        self.window_attn_metadata = self.metadata_cls(
-            max_num_requests=8192,  # TODO: Make this dynamic
-            max_num_tokens=8192,  # TODO: Make this dynamic
-            kv_cache_manager=None,
-        )
+    def setup_attn_metadata(self, max_num_requests: int,
+                            max_num_tokens: int) -> None:
+        # Override: Qwen2/2.5-VL uses two metadata objects (full + window
+        # attention) instead of the mixin's single ``attn_metadata``.
+        # The engine already converts encoder_max_batch_size to attention
+        # sequences using
+        # ``Qwen2VLInputProcessorBase.get_max_requests_per_mm_item``, so
+        # ``max_num_requests`` arrives sized for the worst-case windowed
+        # split — no extra floor needed here.
+        kwargs = dict(max_num_requests=max_num_requests,
+                      max_num_tokens=max_num_tokens,
+                      kv_cache_manager=None)
+        self.full_attn_metadata = self.metadata_cls(**kwargs)
+        self.window_attn_metadata = self.metadata_cls(**kwargs)
 
     def get_rotary_pos_emb_window_data(
         self, grid_rows: List[List[int]]
