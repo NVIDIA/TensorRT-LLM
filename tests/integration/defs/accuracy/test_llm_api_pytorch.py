@@ -4169,30 +4169,6 @@ class TestQwen2_7BInstruct(LlmapiAccuracyTestHarness):
                           extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
 
 
-@skip_pre_hopper
-@pytest.mark.skip_less_device_memory(80000)
-@pytest.mark.skip_less_mpi_world_size(8)
-class TestNemotronHNvFP4Marlin(LlmapiAccuracyTestHarness):
-    MODEL_NAME = "nemotron-super-rl-021126-nvfp4_aggressive_fp8_kv_notunified"
-    MODEL_PATH = f"/lustre/fsw/coreai_comparch_trtllm/shuyix/models/nemotron-super-rl-021126-nvfp4_aggressive_fp8_kv_notunified"
-
-    def test_nvfp4_marlin(self):
-        MMLU.EVALUATOR_KWARGS = dict(random_seed=0)
-
-        kv_cache_config = KvCacheConfig(enable_block_reuse=False)
-        with LLM(self.MODEL_PATH,
-                 tensor_parallel_size=2,
-                 moe_expert_parallel_size=2,
-                 pipeline_parallel_size=2,
-                 moe_config=MoeConfig(backend="MARLIN"),
-                 kv_cache_config=kv_cache_config,
-                 max_batch_size=16,
-                 nvfp4_gemm_config={"allowed_backends": ["marlin"]}) as llm:
-            assert llm.args.quant_config.quant_algo == QuantAlgo.NVFP4
-            task = MMLU(self.MODEL_NAME)
-            task.evaluate(llm)
-
-
 class TestQwen3_4B(LlmapiAccuracyTestHarness):
     MODEL_NAME = "Qwen3/Qwen3-4B"
 
@@ -6831,7 +6807,6 @@ class TestNemotronV3Super(LlmapiAccuracyTestHarness):
                                             layer_updates_per_iter=2)
         self._run_nvfp4_4gpus_eplb(moe_backend, eplb_config, model_path)
 
-    @skip_pre_hopper
     @skip_post_blackwell
     @pytest.mark.skip_less_mpi_world_size(4)
     @pytest.mark.skip_less_device_memory(80000)
@@ -6857,6 +6832,23 @@ class TestNemotronV3Super(LlmapiAccuracyTestHarness):
                 **pytorch_config,
         ) as llm:
             task = GSM8K(self.MODEL_NAME)
+
+    @skip_pre_hopper
+    @pytest.mark.skip_less_device_memory(80000)
+    @pytest.mark.skip_less_mpi_world_size(8)
+    def test_nvfp4_marlin_8gpus(self):
+        model_path = f"{llm_models_root()}/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4"
+        kv_cache_config = KvCacheConfig(enable_block_reuse=False)
+        with LLM(model_path,
+                 tensor_parallel_size=2,
+                 pipeline_parallel_size=2,
+                 moe_expert_parallel_size=2,
+                 moe_config=MoeConfig(backend="MARLIN"),
+                 kv_cache_config=kv_cache_config,
+                 max_batch_size=16,
+                 nvfp4_gemm_config={"allowed_backends": ["marlin"]}) as llm:
+            assert llm.args.quant_config.quant_algo == QuantAlgo.NVFP4
+            task = MMLU(self.MODEL_NAME)
             task.evaluate(llm,
                           extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
 

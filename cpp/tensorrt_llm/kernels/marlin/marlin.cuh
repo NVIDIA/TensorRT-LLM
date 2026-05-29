@@ -436,7 +436,7 @@ template <typename scalar_t,   // compute type (nv_bfloat16)
     int const thread_k_blocks, // 16x16 blocks in K dimension
     bool const m_block_size_8, // use 8-row M blocks (thread_m_blocks==1)
     int const stages,          // async pipeline stages
-    int const group_blocks     // consecutive blocks per scale group
+    int group_blocks const     // consecutive blocks per scale group
     >
 __global__ void Marlin(MARLIN_KERNEL_PARAMS);
 

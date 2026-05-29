@@ -63,7 +63,7 @@ template <typename scalar_t,                       // compute dtype, nv_bfloat16
     int const stages,                              // number of stages for the async global->shared
                                                    // fetch pipeline
     bool const has_act_order,                      // whether act_order is enabled
-    int const group_blocks                               // number of consecutive 16x16 blocks
+    int group_blocks const                         // number of consecutive 16x16 blocks
                                                    // with a separate quantization scale
     >
 __global__ void Marlin(int4 const* __restrict__ A, // fp16 input matrix of shape mxk
@@ -236,7 +236,7 @@ template <typename scalar_t,                        // compute dtype, nv_bfloat1
                                                     // only works when thread_m_blocks == 1
     int const stages,                               // number of stages for the async global->shared
                                                     // fetch pipeline
-    int const group_blocks                                // number of consecutive 16x16 blocks
+    int group_blocks const                          // number of consecutive 16x16 blocks
                                                     // with a separate quantization scale
     >
 __global__ void Marlin(int4 const* __restrict__ A0, // fp16 input matrix of shape mxk
