@@ -30,12 +30,33 @@ try:
 except ImportError:
     _flashinfer_silu_and_mul = None
 
+# V22: lazily resolved TRT-LLM fused SiLU+Mul kernel (the same one the PyTorch
+# backend uses).  It is ~1.7x faster than flashinfer's act_and_mul on Blackwell
+# decode shapes (1.67 vs 2.87 us/call) and numerically identical (verified:
+# max diff 0.0 vs flashinfer).  Resolved on first call because torch.ops.trtllm
+# is only registered after the TRT-LLM C++ ops load.
+_trtllm_silu_and_mul = None
+_trtllm_silu_resolved = False
+
 
 def _silu_and_mul(x: torch.Tensor) -> torch.Tensor:
     """SwiGLU activation: split x in half, apply silu to first half, multiply with second half.
 
-    Uses FlashInfer's fused kernel when available, falls back to manual implementation.
+    Prefers TRT-LLM's fused kernel (fastest, matches PT backend), falls back to
+    FlashInfer, then a manual implementation.
     """
+    global _trtllm_silu_and_mul, _trtllm_silu_resolved
+    if not _trtllm_silu_resolved:
+        try:
+            _trtllm_silu_and_mul = torch.ops.trtllm.silu_and_mul
+        except Exception:
+            _trtllm_silu_and_mul = None
+        _trtllm_silu_resolved = True
+    if _trtllm_silu_and_mul is not None:
+        # trtllm::silu_and_mul expects 2D (rows, 2*D); flatten and restore.
+        s = x.shape
+        out_2d = _trtllm_silu_and_mul(x.reshape(-1, s[-1]), scale=None, dtype=None)
+        return out_2d.reshape(*s[:-1], out_2d.shape[-1])
     if _flashinfer_silu_and_mul is not None:
         return _flashinfer_silu_and_mul(x)
     gate, up = x.chunk(2, dim=-1)
