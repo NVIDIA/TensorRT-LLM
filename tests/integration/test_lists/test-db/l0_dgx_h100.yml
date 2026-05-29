@@ -165,6 +165,10 @@ l0_dgx_h100:
   - unittest/_torch/modules/moe/test_moe_module.py::test_configurable_moe_multi_gpu -k "CUTLASS and W4A8_AWQ"
   # ------------- MoE: test_multi_gpu_eplb ---------------
   - unittest/_torch/modules/moe/test_moe_module.py::test_configurable_moe_multi_gpu_eplb
+  # ------------- Step-3.7-Flash (MoE VLM): text GSM8K + multimodal MMMU (FP8 block-scale) ---------------
+  - accuracy/test_llm_api_pytorch.py::TestStep3_7::test_fp8_block_scales[tp_size=4-ep_size=4-mtp_nextn=0] TIMEOUT (90)
+  - accuracy/test_llm_api_pytorch.py::TestStep3_7::test_fp8_block_scales[tp_size=4-ep_size=4-mtp_nextn=3] TIMEOUT (90)
+  - accuracy/test_llm_api_pytorch_multimodal.py::TestStep3_7::test_fp8_block_scales TIMEOUT (120)
 - condition:
     ranges:
       system_gpu_count:

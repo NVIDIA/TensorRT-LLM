@@ -52,6 +52,10 @@ l0_dgx_b200:
   - unittest/_torch/visual_gen/multi_gpu
   - unittest/_torch/visual_gen/test_flux_pipeline.py::TestFluxParallelism::test_ulysses_2gpu_correctness
   - unittest/_torch/visual_gen/test_flux_pipeline.py::TestFluxCombinedOptimizations::test_all_optimizations_combined
+  # ------------- Step-3.7-Flash (MoE VLM): text GSM8K + multimodal MMMU (NVFP4) ---------------
+  - accuracy/test_llm_api_pytorch.py::TestStep3_7::test_nvfp4[tp_size=4-ep_size=4-mtp_nextn=0] TIMEOUT (90)
+  - accuracy/test_llm_api_pytorch.py::TestStep3_7::test_nvfp4[tp_size=4-ep_size=4-mtp_nextn=3] TIMEOUT (90)
+  - accuracy/test_llm_api_pytorch_multimodal.py::TestStep3_7::test_nvfp4 TIMEOUT (120)
 - condition:
     ranges:
       system_gpu_count:
