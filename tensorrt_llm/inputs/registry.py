@@ -156,6 +156,7 @@ class BaseMultimodalInputProcessor(ABC):
         self._model_path = model_path
         self._tokenizer = tokenizer
         self._use_fast: bool = kwargs.get('use_fast', True)
+        self._trust_remote_code = trust_remote_code
         self._multimodal_hashing_supported: Optional[bool] = None
 
     def attach_multimodal_embeddings(
@@ -452,7 +453,8 @@ class BaseMultimodalDummyInputsBuilder(ABC):
                 modality="image",
                 prompts=[""],
                 media=[[image]],
-                image_data_format="pt")[0]
+                image_data_format="pt",
+                trust_remote_code=self._trust_remote_code)[0]
 
             prompt_token_ids_single_img, _ = self(test_mm_prompt, None)
 
@@ -694,6 +696,7 @@ def create_input_processor(
     model_path_or_dir: str,
     tokenizer,
     checkpoint_format: Optional[str] = "HF",
+    trust_remote_code: bool = True,
     **kwargs,
 ) -> Union[InputProcessor, BaseMultimodalInputProcessor]:
     """Create an input processor for a specific model.
@@ -703,6 +706,8 @@ def create_input_processor(
         tokenizer: Tokenizer instance.
         checkpoint_format: Checkpoint format identifier. "HF" uses Hugging Face-style
             config loading; any other value skips HF config loading. Default is "HF".
+        trust_remote_code: Whether Hugging Face config/processor loading may run
+            model-provided Python code.
         **kwargs: Additional arguments passed to input processor constructors
             (e.g., video_pruning_rate for multimodal models).
 
@@ -716,8 +721,8 @@ def create_input_processor(
 
     if checkpoint_format == "HF":
         try:
-            model_config = ModelConfig.from_pretrained(model_path_or_dir,
-                                                       trust_remote_code=True)
+            model_config = ModelConfig.from_pretrained(
+                model_path_or_dir, trust_remote_code=trust_remote_code)
             config = model_config.pretrained_config
         except (ValueError, EnvironmentError) as e:
             logger.debug(
@@ -745,7 +750,7 @@ def create_input_processor(
             return input_processor_cls(model_path_or_dir,
                                        config,
                                        tokenizer,
-                                       trust_remote_code=True,
+                                       trust_remote_code=trust_remote_code,
                                        **kwargs)
 
     return DefaultInputProcessor(None, None, tokenizer)
