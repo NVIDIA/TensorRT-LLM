@@ -933,6 +933,11 @@ Tensor Serialization::deserializeTensor(std::istream& is)
     // Size in bytes
     size_t sizeInBytes{0};
     is.read(reinterpret_cast<char*>(&sizeInBytes), sizeof(size_t));
+    auto checkTensorSize = [sizeInBytes](Tensor const& tensor)
+    {
+        TLLM_CHECK_WITH_INFO(sizeInBytes == tensor.getSizeInBytes(),
+            "Serialized tensor byte size does not match size implied by tensor data type and shape.");
+    };
 
     Tensor tensor;
     switch (memoryType)
@@ -940,18 +945,21 @@ Tensor Serialization::deserializeTensor(std::istream& is)
     case MemoryType::kCPU:
     {
         tensor = Tensor::cpu(dataType, shape);
+        checkTensorSize(tensor);
         is.read(reinterpret_cast<char*>(tensor.getData()), static_cast<std::streamsize>(sizeInBytes));
         break;
     }
     case MemoryType::kCPU_PINNED:
     {
         tensor = Tensor::pinned(dataType, shape);
+        checkTensorSize(tensor);
         is.read(reinterpret_cast<char*>(tensor.getData()), static_cast<std::streamsize>(sizeInBytes));
         break;
     }
     case MemoryType::kUVM:
     {
         tensor = Tensor::managed(dataType, shape);
+        checkTensorSize(tensor);
         is.read(reinterpret_cast<char*>(tensor.getData()), static_cast<std::streamsize>(sizeInBytes));
         break;
     }
@@ -960,6 +968,7 @@ Tensor Serialization::deserializeTensor(std::istream& is)
         // TODO: Eventually we might want to support serialization/deserialization in GPU memory
         //       Until then created Pinned tensor and move to GPU
         auto pinnedTensor = Tensor::pinned(dataType, shape);
+        checkTensorSize(pinnedTensor);
         is.read(reinterpret_cast<char*>(pinnedTensor.getData()), static_cast<std::streamsize>(sizeInBytes));
         auto stream = std::make_shared<tensorrt_llm::runtime::CudaStream>();
         tensor = pinnedTensor.copyToGpu(stream);

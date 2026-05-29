@@ -696,6 +696,11 @@ void CacheFormatter::unformat(tensorrt_llm::batch_manager::TransferSession& sess
     {
         NVTX3_SCOPED_RANGE(formatInputRecvBuffer);
 
+        // TODO(disagg-multi-dtype): pool 0's dtype is treated as canonical for the wire
+        // transport here.  Pools with differing dtypes are rejected up-front in
+        // CacheTransBufferManager's constructor (see cacheTransBuffer.cpp).  When
+        // per-pool dtype dispatch lands, this single dataType variable must be replaced
+        // with a per-pool lookup keyed by the source pool of each block.
         auto dataType = mCacheManager->getPrimaryPool(0)->getDataType();
         bool layerWise = common::getEnvDisaggLayerwise() && numKvPools == 1;
         if (layerWise)

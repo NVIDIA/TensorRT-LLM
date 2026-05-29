@@ -21,6 +21,10 @@ import torch.distributed as dist
 import torch.nn.functional as F
 from einops import rearrange
 
+import tensorrt_llm.quantization.utils.fp4_utils as fp4_utils
+
+from ..quantization.quant import TRTLLM_NVFP4_SCALING_VECTOR_SIZE
+
 try:
     from tensorrt_llm._torch.flashinfer_utils import get_env_enable_pdl
 except (ModuleNotFoundError, ImportError):
@@ -35,6 +39,11 @@ try:
 except (ModuleNotFoundError, ImportError):
     _layer_norm_fwd = None
 from .triton_rms_norm import rms_norm
+
+
+def _get_nvfp4_fake_shapes(x: torch.Tensor) -> tuple[tuple[int, ...], int]:
+    output_shape, sf_size = fp4_utils.get_fp4_shape(x.shape, TRTLLM_NVFP4_SCALING_VECTOR_SIZE)
+    return tuple(output_shape), sf_size
 
 
 @torch.library.custom_op("auto_deploy::flashinfer_rms_norm", mutates_args=())
@@ -257,6 +266,166 @@ def _triton_rmsnorm_gated_meta(
         assert gate.shape == x.shape, "gate must match x shape"
 
     return x.new_empty(x.shape, dtype=x.dtype)
+
+
+@torch.library.custom_op("auto_deploy::trtllm_fused_gated_rmsnorm_quant_nvfp4", mutates_args=())
+def trtllm_fused_gated_rmsnorm_quant_nvfp4(
+    x: torch.Tensor,
+    gate: torch.Tensor,
+    weight: torch.Tensor,
+    scale: torch.Tensor,
+    eps: float,
+    group_size: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Fuse gated RMSNorm and NVFP4 quantization using the TRT-LLM Torch kernel."""
+    if weight.dtype in (torch.float16, torch.bfloat16):
+        kernel_dtype = weight.dtype
+    elif gate.dtype in (torch.float16, torch.bfloat16):
+        kernel_dtype = gate.dtype
+    else:
+        kernel_dtype = x.dtype
+
+    if x.dtype != kernel_dtype:
+        x = x.to(kernel_dtype)
+    if gate.dtype != kernel_dtype:
+        gate = gate.to(kernel_dtype)
+    if weight.dtype != kernel_dtype:
+        weight = weight.to(kernel_dtype)
+
+    x_shape = x.shape
+    hidden_size = x_shape[-1]
+    x_2d = x.reshape(-1, hidden_size)
+    if x_2d.stride(-1) != 1:
+        x_2d = x_2d.contiguous()
+
+    gate_2d = gate.reshape(-1, hidden_size)
+    if gate_2d.stride(-1) != 1:
+        gate_2d = gate_2d.contiguous()
+
+    fp4_i32, scale_factors = torch.ops.trtllm.fused_gated_rmsnorm_quant(
+        x_2d, gate_2d, weight.contiguous(), group_size, eps, scale.contiguous()
+    )
+    fp4_u8 = fp4_i32.view(torch.uint8)
+    return fp4_u8.reshape(*x_shape[:-1], hidden_size // 2), scale_factors
+
+
+@trtllm_fused_gated_rmsnorm_quant_nvfp4.register_fake
+def _trtllm_fused_gated_rmsnorm_quant_nvfp4_fake(
+    x: torch.Tensor,
+    gate: torch.Tensor,
+    weight: torch.Tensor,
+    scale: torch.Tensor,
+    eps: float,
+    group_size: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    del gate, weight, scale, eps, group_size
+    output_shape, sf_size = _get_nvfp4_fake_shapes(x)
+    return x.new_empty(output_shape, dtype=torch.uint8), x.new_empty((sf_size,), dtype=torch.uint8)
+
+
+def _run_trtllm_fused_add_rmsnorm_quant_nvfp4(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    scale: torch.Tensor,
+    eps: float,
+    output_hp_norm: bool,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
+    x_shape = x.shape
+    hidden_size = x_shape[-1]
+    x_2d = x.reshape(-1, hidden_size)
+    if x_2d.stride(-1) != 1:
+        x_2d = x_2d.contiguous()
+
+    residual_2d = residual.reshape(-1, hidden_size)
+    if residual_2d.dtype != x_2d.dtype:
+        residual_2d = residual_2d.to(x_2d.dtype)
+    if residual_2d.stride(-1) != 1:
+        residual_2d = residual_2d.contiguous()
+
+    if weight.dtype != x_2d.dtype:
+        weight = weight.to(x_2d.dtype)
+
+    fp4_i32, residual_out, scale_factors, norm_out = torch.ops.trtllm.fused_add_rms_norm_quant(
+        x_2d,
+        residual_2d,
+        weight.contiguous(),
+        scale.contiguous(),
+        True,
+        eps,
+        output_hp_norm,
+    )
+    fp4_u8 = fp4_i32.view(torch.uint8).reshape(*x_shape[:-1], hidden_size // 2)
+    residual_out = residual_out.reshape(x_shape)
+    if norm_out is not None:
+        norm_out = norm_out.reshape(x_shape)
+    return fp4_u8, residual_out, scale_factors, norm_out
+
+
+@torch.library.custom_op("auto_deploy::trtllm_fused_add_rmsnorm_quant_nvfp4", mutates_args=())
+def trtllm_fused_add_rmsnorm_quant_nvfp4(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    scale: torch.Tensor,
+    eps: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Fuse residual add, RMSNorm, and NVFP4 quantization using a TRT-LLM kernel."""
+    fp4_out, residual_out, scale_factors, _ = _run_trtllm_fused_add_rmsnorm_quant_nvfp4(
+        x, residual, weight, scale, eps, False
+    )
+    return fp4_out, residual_out, scale_factors
+
+
+@trtllm_fused_add_rmsnorm_quant_nvfp4.register_fake
+def _trtllm_fused_add_rmsnorm_quant_nvfp4_fake(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    scale: torch.Tensor,
+    eps: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    del residual, weight, scale, eps
+    output_shape, sf_size = _get_nvfp4_fake_shapes(x)
+    return (
+        x.new_empty(output_shape, dtype=torch.uint8),
+        torch.empty_like(x),
+        x.new_empty((sf_size,), dtype=torch.uint8),
+    )
+
+
+@torch.library.custom_op("auto_deploy::trtllm_fused_add_rmsnorm_out_quant_nvfp4", mutates_args=())
+def trtllm_fused_add_rmsnorm_out_quant_nvfp4(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    scale: torch.Tensor,
+    eps: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Fuse residual add, RMSNorm, and NVFP4 quantization while keeping BF16 norm output."""
+    fp4_out, residual_out, scale_factors, norm_out = _run_trtllm_fused_add_rmsnorm_quant_nvfp4(
+        x, residual, weight, scale, eps, True
+    )
+    assert norm_out is not None
+    return norm_out, fp4_out, residual_out, scale_factors
+
+
+@trtllm_fused_add_rmsnorm_out_quant_nvfp4.register_fake
+def _trtllm_fused_add_rmsnorm_out_quant_nvfp4_fake(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    scale: torch.Tensor,
+    eps: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    del residual, weight, scale, eps
+    output_shape, sf_size = _get_nvfp4_fake_shapes(x)
+    return (
+        torch.empty_like(x),
+        x.new_empty(output_shape, dtype=torch.uint8),
+        torch.empty_like(x),
+        x.new_empty((sf_size,), dtype=torch.uint8),
+    )
 
 
 # Forked from:

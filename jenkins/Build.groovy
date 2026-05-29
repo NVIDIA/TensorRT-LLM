@@ -400,6 +400,9 @@ def runLLMBuild(pipeline, buildFlags, tarName, is_linux_x86_64)
     withCredentials([usernamePassword(credentialsId: "urm-artifactory-creds", usernameVariable: 'CONAN_LOGIN_USERNAME', passwordVariable: 'CONAN_PASSWORD')]) {
         sh "cd ${LLM_ROOT} && python3 scripts/build_wheel.py --use_ccache -G Ninja -j ${buildJobs} -a '${buildFlags[WHEEL_ARCHS]}' ${buildFlags[WHEEL_EXTRA_ARGS]} --benchmarks"
     }
+    withCredentials([string(credentialsId: 'svc_tensorrt_llm_oss_gitlab_token_secret', variable: 'GITLAB_TOKEN')]) {
+        sh "cd ${LLM_ROOT} && python3 scripts/generate_cpp_dependency_json.py --deps-dir cpp/build/_deps --output-dir ./ --token ${GITLAB_TOKEN}"
+    }
     if (is_linux_x86_64) {
         sh "cd ${LLM_ROOT} && python3 scripts/build_cpp_examples.py"
     }
@@ -411,8 +414,10 @@ def runLLMBuild(pipeline, buildFlags, tarName, is_linux_x86_64)
     def tritonShortTag = "r26.02"
     sh "cd ${LLM_ROOT}/triton_backend/inflight_batcher_llm && mkdir build && cd build && cmake .. -DTRTLLM_DIR=${llmPath} -DTRITON_COMMON_REPO_TAG=${tritonShortTag} -DTRITON_CORE_REPO_TAG=${tritonShortTag} -DTRITON_THIRD_PARTY_REPO_TAG=${tritonShortTag} -DTRITON_BACKEND_REPO_TAG=${tritonShortTag} -DUSE_CXX11_ABI=ON && make -j${buildJobs} install"
 
-    // Step 3: packaging wheels into tarfile
+    // Step 3.1: packaging wheels into tarfile
     sh "cp ${LLM_ROOT}/build/tensorrt_llm-*.whl TensorRT-LLM/"
+    // Step 3.2: packaging cmake dependency source json into tarfile
+    sh "cp ${LLM_ROOT}/third-party-sources.json TensorRT-LLM/"
 
     // Step 4: packaging tritonserver artifacts into tarfile
     sh "mkdir -p TensorRT-LLM/triton_backend/inflight_batcher_llm/"
