@@ -3,6 +3,7 @@
 import os
 import random
 import time
+import types
 import uuid
 from dataclasses import dataclass
 from typing import List, Optional
@@ -26,6 +27,7 @@ from tensorrt_llm._torch.disaggregation.base.transfer import (
 from tensorrt_llm._torch.disaggregation.native.transfer import TransferWorker, TransferWorkerConfig
 from tensorrt_llm._torch.disaggregation.resource.kv_extractor import KVRegionExtractorV1
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestType
+from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager, KVCacheManagerV2
 from tensorrt_llm._utils import TensorWrapper, convert_to_torch_tensor, get_size_in_bytes
 from tensorrt_llm.bindings import DataType
@@ -1455,6 +1457,160 @@ def test_session_has_transferring_tasks_false():
     finally:
         ctx_transfer_worker.shutdown()
         gen_transfer_worker.shutdown()
+
+
+# ---------------------------------------------------------------------------
+# Cross-rank KV-transfer-timeout consensus
+#
+# Exercise the real PyExecutor._sync_kv_transfer_timed_out_flags with a
+# lightweight stub ``self`` (no GPUs / no full executor). This is the fix for
+# the V2 disagg pitfall where a per-rank wall-clock timeout cancellation
+# bypassed the per-rid consensus and diverged req.state across ranks. Covered
+# here (single-process logic): wall-clock threshold detection from
+# py_kv_transfer_start_time, only in-transfer requests considered, world_size
+# == 1 promotes locally, and the multi-rank UNION (a timeout on any rank flips
+# the flag on every rank holding the request -- the regression). Full
+# multi-rank allgather + cancellation under TP/PP/ADP is covered end-to-end by
+# the disaggregated integration tests.
+# ---------------------------------------------------------------------------
+
+_KV_TIMEOUT_MS = 10_000  # 10s; tests use multi-second margins to avoid flakiness
+_NO_TRANSCEIVER = object()  # sentinel: model "no kv_cache_transceiver configured"
+
+
+def _make_timeout_request(req_id, *, age_s, in_gen_transfer=False):
+    """A request whose KV transfer started ``age_s`` seconds ago.
+
+    ``age_s is None`` models a request that has not started transferring
+    (py_kv_transfer_start_time is None -> never timed out).
+    """
+    req = types.SimpleNamespace()
+    req.py_request_id = req_id
+    req.py_kv_transfer_start_time = None if age_s is None else time.time() - age_s
+    req.py_kv_transfer_timed_out = False
+    req.is_disagg_generation_transmission_in_progress = in_gen_transfer
+    return req
+
+
+class _TimeoutSyncStub:
+    """Minimal carrier of the attributes _sync_kv_transfer_timed_out_flags reads."""
+
+    def __init__(self, *, world_size, timeout_ms, ctx_reqs=(), gen_reqs=(), allgather_result=None):
+        if timeout_ms is _NO_TRANSCEIVER:
+            self.kv_cache_transceiver = None
+        else:
+            self.kv_cache_transceiver = types.SimpleNamespace(kv_transfer_timeout_ms=timeout_ms)
+
+        ctx_map = {r.py_request_id: r for r in ctx_reqs}
+        self.async_transfer_manager = types.SimpleNamespace(requests_in_transfer=lambda: ctx_map)
+        # gen requests live in active_requests; non-in-transfer ones must be ignored.
+        self.active_requests = list(gen_reqs)
+
+        self.allgather_calls = []
+        self._allgather_result = allgather_result
+        self.dist = types.SimpleNamespace(world_size=world_size, allgather=self._allgather)
+
+    def _allgather(self, obj):
+        self.allgather_calls.append(list(obj))
+        if self._allgather_result is None:
+            return [list(obj)]
+        # This rank's contribution first, then the simulated peers.
+        return [list(obj)] + [list(x) for x in self._allgather_result]
+
+
+def _run_timeout_sync(stub):
+    PyExecutor._sync_kv_transfer_timed_out_flags(stub)
+
+
+def test_kv_timeout_no_transceiver_is_noop():
+    a = _make_timeout_request(1, age_s=10_000)
+    stub = _TimeoutSyncStub(world_size=4, timeout_ms=_NO_TRANSCEIVER, ctx_reqs=[a])
+    _run_timeout_sync(stub)
+    assert a.py_kv_transfer_timed_out is False
+    assert stub.allgather_calls == []
+
+
+def test_kv_timeout_disabled_is_noop():
+    a = _make_timeout_request(1, age_s=10_000)
+    stub = _TimeoutSyncStub(world_size=4, timeout_ms=None, ctx_reqs=[a])
+    _run_timeout_sync(stub)
+    assert a.py_kv_transfer_timed_out is False
+    assert stub.allgather_calls == []
+
+
+def test_kv_timeout_single_rank_threshold():
+    over = _make_timeout_request(1, age_s=100.0)  # clearly timed out
+    under = _make_timeout_request(2, age_s=0.0)  # just started
+    never = _make_timeout_request(3, age_s=None)  # not transferring yet
+    stub = _TimeoutSyncStub(world_size=1, timeout_ms=_KV_TIMEOUT_MS, ctx_reqs=[over, under, never])
+    _run_timeout_sync(stub)
+    assert over.py_kv_transfer_timed_out is True
+    assert under.py_kv_transfer_timed_out is False
+    assert never.py_kv_transfer_timed_out is False
+    assert stub.allgather_calls == []  # world_size == 1 must not touch any collective
+
+
+def test_kv_timeout_single_rank_ignores_non_in_transfer_gen_request():
+    gen_active = _make_timeout_request(10, age_s=100.0, in_gen_transfer=False)
+    gen_in_transfer = _make_timeout_request(11, age_s=100.0, in_gen_transfer=True)
+    stub = _TimeoutSyncStub(
+        world_size=1, timeout_ms=_KV_TIMEOUT_MS, gen_reqs=[gen_active, gen_in_transfer]
+    )
+    _run_timeout_sync(stub)
+    assert gen_active.py_kv_transfer_timed_out is False
+    assert gen_in_transfer.py_kv_transfer_timed_out is True
+
+
+def test_kv_timeout_multi_rank_local_timeout_is_gathered_and_flagged():
+    over = _make_timeout_request(1, age_s=100.0)
+    under = _make_timeout_request(2, age_s=0.0)
+    stub = _TimeoutSyncStub(
+        world_size=2, timeout_ms=_KV_TIMEOUT_MS, ctx_reqs=[over, under], allgather_result=[[]]
+    )
+    _run_timeout_sync(stub)
+    assert stub.allgather_calls == [[1]]  # local detection is sent into the collective
+    assert over.py_kv_transfer_timed_out is True
+    assert under.py_kv_transfer_timed_out is False
+
+
+def test_kv_timeout_multi_rank_union_promotes_peer_timeout():
+    # THE regression: a request that did NOT time out locally must still be
+    # flagged because a peer rank reported it timed out.
+    local_ok = _make_timeout_request(7, age_s=0.0)
+    stub = _TimeoutSyncStub(
+        world_size=2, timeout_ms=_KV_TIMEOUT_MS, ctx_reqs=[local_ok], allgather_result=[[7]]
+    )
+    _run_timeout_sync(stub)
+    assert stub.allgather_calls == [[]]  # we contributed nothing locally
+    assert local_ok.py_kv_transfer_timed_out is True
+
+
+def test_kv_timeout_multi_rank_no_timeout_anywhere_sets_nothing():
+    a = _make_timeout_request(1, age_s=0.0)
+    b = _make_timeout_request(2, age_s=0.0, in_gen_transfer=True)
+    stub = _TimeoutSyncStub(
+        world_size=2, timeout_ms=_KV_TIMEOUT_MS, ctx_reqs=[a], gen_reqs=[b], allgather_result=[[]]
+    )
+    _run_timeout_sync(stub)
+    assert stub.allgather_calls == [[]]  # collective fires every iter (lockstep), empty payload
+    assert a.py_kv_transfer_timed_out is False
+    assert b.py_kv_transfer_timed_out is False
+
+
+def test_kv_timeout_multi_rank_union_covers_ctx_and_gen():
+    ctx = _make_timeout_request(1, age_s=100.0)  # locally timed out (ctx)
+    gen = _make_timeout_request(2, age_s=0.0, in_gen_transfer=True)  # peer-reported
+    stub = _TimeoutSyncStub(
+        world_size=2,
+        timeout_ms=_KV_TIMEOUT_MS,
+        ctx_reqs=[ctx],
+        gen_reqs=[gen],
+        allgather_result=[[2]],
+    )
+    _run_timeout_sync(stub)
+    assert stub.allgather_calls == [[1]]
+    assert ctx.py_kv_transfer_timed_out is True
+    assert gen.py_kv_transfer_timed_out is True
 
 
 if __name__ == "__main__":

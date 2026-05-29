@@ -715,6 +715,70 @@ class PyExecutor:
             # can complete.
             self._enqueue_responses(responses)
 
+    def _sync_kv_transfer_timed_out_flags(self):
+        """Reach cross-rank union consensus on which in-transfer requests hit
+        the KV-transfer timeout, and promote them to the actionable
+        py_kv_transfer_timed_out flag together.
+
+        The timeout is detected per rank via wall-clock (elapsed since
+        py_kv_transfer_start_time).  Acting on that directly diverges across
+        ranks: clock skew flags the same request in different iterations, and
+        the resulting cancel_request + terminate bypasses the per-rid consensus
+        that every other disagg transfer-state transition goes through (see
+        KvCacheTransceiverV2._ctx/_gen_consensus_outcome) -> req.state diverges
+        across ranks -> collective deadlock.
+
+        Here we union the local intents across the instance so every rank flips
+        the actionable flag for the same rids in the same iteration.  The actual
+        cancellation (with its mid-write retry) still happens per rank at the
+        existing sites, now keyed off a rank-consistent flag.
+
+        Must be called from a rank-symmetric (lockstep) point; the callers of
+        _handle_kv_transfer_timeouts_synced satisfy this.
+        """
+        if self.kv_cache_transceiver is None:
+            return
+        timeout_ms = self.kv_cache_transceiver.kv_transfer_timeout_ms
+        if timeout_ms is None:
+            return
+
+        def in_transfer_requests():
+            yield from self.async_transfer_manager.requests_in_transfer(
+            ).values()
+            for req in self.active_requests:
+                if req.is_disagg_generation_transmission_in_progress:
+                    yield req
+
+        # Per-rank wall-clock detection, derived from the existing transfer
+        # start time (no persisted state / extra request field).
+        now = time.time()
+
+        def locally_timed_out(req) -> bool:
+            start = req.py_kv_transfer_start_time
+            return start is not None and (now - start) * 1000 > timeout_ms
+
+        if self.dist.world_size == 1:
+            for req in in_transfer_requests():
+                if locally_timed_out(req):
+                    req.py_kv_transfer_timed_out = True
+            return
+
+        local_ids = [
+            req.py_request_id for req in in_transfer_requests()
+            if locally_timed_out(req)
+        ]
+        # Union across the instance: a timeout on ANY rank cancels the request
+        # on ALL ranks that hold it, atomically within this iteration.
+        timed_out_ids = set()
+        for ids in self.dist.allgather(local_ids):
+            if ids:
+                timed_out_ids.update(ids)
+        if not timed_out_ids:
+            return
+        for req in in_transfer_requests():
+            if req.py_request_id in timed_out_ids:
+                req.py_kv_transfer_timed_out = True
+
     def _handle_kv_transfer_timeouts_synced(self):
         """ADP-safe drain of the KV-transfer-timeout consensus collective.
 
@@ -722,6 +786,12 @@ class PyExecutor:
         divergent gates (_process_previous_batch, _handle_executed_batch).
         Non-ADP runs handle timeouts inline; the buffer is empty here.
         """
+        # Promote per-rank wall-clock detections to a cross-rank consensus flag
+        # first, so the cancellation sites below (and in _handle_responses /
+        # _check_disagg_ctx_cache_transfer_status) act on the same per-rid set
+        # on every rank.  Runs for all multi-rank configs, not just ADP.
+        self._sync_kv_transfer_timed_out_flags()
+
         if not (self.enable_attention_dp and self.dist.world_size != 1):
             return
         timed_out = self._pending_timed_out_requests
@@ -3554,24 +3624,27 @@ class PyExecutor:
         if timeout_ms is None:
             return
 
-        def flag_if_kv_transfer_timed_out(req: LlmRequest, type: str) -> None:
+        def warn_if_kv_transfer_timed_out(req: LlmRequest, type: str) -> None:
             current_time = time.time()
             if req.py_kv_transfer_start_time is None:
                 return
             elapsed_time = (current_time - req.py_kv_transfer_start_time) * 1000
             if elapsed_time > timeout_ms and not req.py_kv_transfer_timed_out:
+                # Diagnostic only.  The actionable flag is set by
+                # _sync_kv_transfer_timed_out_flags after cross-rank consensus so
+                # all ranks cancel the same per-rid set in the same iteration.
                 logger.warning(
-                    f"Terminating {type} request {req.py_request_id} due to KV "
-                    f"cache transfer timeout: elapsed {elapsed_time:.0f}ms > "
-                    f"kv_transfer_timeout_ms={timeout_ms}ms")
-                req.py_kv_transfer_timed_out = True
+                    f"{type} request {req.py_request_id} exceeded KV cache "
+                    f"transfer timeout: elapsed {elapsed_time:.0f}ms > "
+                    f"kv_transfer_timeout_ms={timeout_ms}ms; cancellation is "
+                    f"applied after cross-rank consensus")
 
         for req in self.async_transfer_manager.requests_in_transfer().values():
-            flag_if_kv_transfer_timed_out(req, "context")
+            warn_if_kv_transfer_timed_out(req, "context")
 
         for req in self.active_requests:
             if req.is_disagg_generation_transmission_in_progress:
-                flag_if_kv_transfer_timed_out(req, "generation")
+                warn_if_kv_transfer_timed_out(req, "generation")
 
         return
 
