@@ -328,7 +328,11 @@ class Eagle3OneModelSpecMetadata(SpecMetadata):
         else:
             self.layers_to_capture = sorted(list(self.layers_to_capture))
         self.num_capture_layers = len(self.layers_to_capture)
-        self.hidden_states = torch.empty(
+        # torch.zeros (not empty): under disagg+reuse, partial layer captures
+        # may leave rows unwritten that Eagle3 reads as inputs; zero init
+        # ensures reads of unwritten rows return 0 (neutral) instead of stale
+        # bytes from another request allocation.
+        self.hidden_states = torch.zeros(
             (self.max_num_tokens,
              self.hidden_size * len(self.layers_to_capture)),
             dtype=self.dtype,
@@ -350,6 +354,10 @@ class Eagle3OneModelSpecMetadata(SpecMetadata):
 
     def prepare(self):
         assert self.request_ids is not None
+        # Zero rows Eagle3 reads this forward to prevent stale data leak from
+        # prior batches when layer capture writes do not cover every read row.
+        if self.hidden_states is not None and self.num_tokens > 0:
+            self.hidden_states[:self.num_tokens].zero_()
         # update batch indices
         num_seqs = len(self.request_ids)
         batch_indices = torch.arange(num_seqs,
