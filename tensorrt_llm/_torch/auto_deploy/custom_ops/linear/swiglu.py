@@ -30,21 +30,14 @@ try:
 except ImportError:
     _flashinfer_silu_and_mul = None
 
-# V22: lazily resolved TRT-LLM fused SiLU+Mul kernel (the same one the PyTorch
-# backend uses).  It is ~1.7x faster than flashinfer's act_and_mul on Blackwell
-# decode shapes (1.67 vs 2.87 us/call) and numerically identical (verified:
-# max diff 0.0 vs flashinfer).  Resolved on first call because torch.ops.trtllm
-# is only registered after the TRT-LLM C++ ops load.
+# Lazily resolved TRT-LLM fused SiLU+Mul (resolved on first call; the op is only
+# registered after the C++ ops load). Faster than flashinfer, numerically identical.
 _trtllm_silu_and_mul = None
 _trtllm_silu_resolved = False
 
 
 def _silu_and_mul(x: torch.Tensor) -> torch.Tensor:
-    """SwiGLU activation: split x in half, apply silu to first half, multiply with second half.
-
-    Prefers TRT-LLM's fused kernel (fastest, matches PT backend), falls back to
-    FlashInfer, then a manual implementation.
-    """
+    """SwiGLU activation. Prefer TRT-LLM fused kernel, fall back to flashinfer then manual."""
     global _trtllm_silu_and_mul, _trtllm_silu_resolved
     if not _trtllm_silu_resolved:
         try:

@@ -1880,18 +1880,8 @@ def _mla_with_cache_impl(
     # to bucket size.  Subsequent slicing with num_tokens / num_prefill_tokens
     # selects only the real tokens within the padded buffer.
     bs = b * s
-    # V21+V23: avoid eager .contiguous() on the split/narrow views (q_nope, q_pe,
-    # compressed_kv, kpe).  Every consumer tolerates a non-contiguous,
-    # last-dim-stride-1 input:
-    #   - q_nope_flat  -> torch.bmm (cuBLAS strided-batched GEMM handles striding)
-    #   - q_pe_flat    -> mla_rope_generation: the C++ kernel (dsv3RopeOp.cpp) reads
-    #                     q_pe row/head strides (q_pe_ld/q_pe_stride) explicitly and
-    #                     only asserts strides[2]==1, so a split view is fine (V23)
-    #   - compressed_kv_flat / kpe_flat -> torch.cat (CatArrayBatchedCopy handles striding)
-    # Removing these eliminated the big `direct_copy` kernels per MLA layer (PT has 0).
-    # Merging [B, S, ...] -> [bs, ...] is a view-safe op for these tensors (split was
-    # on the last dim, so the B/S dims merge without a copy).  We only force a copy
-    # if the last-dim stride is not 1 (which would violate the kernel/GEMM contracts).
+    # Avoid eager .contiguous() on the q/kv split views: bmm, cat and the rope
+    # kernel all accept last-dim-stride-1 strided input. Copy only if that breaks.
     if q_pe.stride(-1) != 1:
         q_pe = q_pe.contiguous()
 

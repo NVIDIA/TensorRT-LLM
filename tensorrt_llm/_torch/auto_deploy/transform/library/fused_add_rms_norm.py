@@ -66,9 +66,7 @@ class FuseAddRMSNorm(BaseTransform):
         matches: List[Tuple[Node, Optional[Node], Node]] = []
 
         for node in graph.nodes:
-            # Match flashinfer_rms_norm OR triton_rms_norm (both overload packet and .default).
-            # V25: triton_rms_norm is the norm DeepSeek-R1 uses for input_layernorm — fusing the
-            # preceding residual add into it removes a separate add kernel per layer.
+            # Match flashinfer_rms_norm or triton_rms_norm (fuse the preceding residual add).
             if not (
                 is_op(node, torch.ops.auto_deploy.flashinfer_rms_norm)
                 or is_op(node, torch.ops.auto_deploy.triton_rms_norm)
@@ -109,12 +107,9 @@ class FuseAddRMSNorm(BaseTransform):
             # Insert the fused call right before the norm node. Using
             # inserting_before(norm_node) ensures correct topological order:
             # fused_node → norm_out → add_out all appear before norm_node.
-            # Pick the fused op matching the norm flavor: triton norm → triton fused
-            # (returns (norm, add)); flashinfer norm → flashinfer fused (also (norm, add)).
+            # Pick the matching fused op (both return (norm, add)). Triton path uses the
+            # OpOverload as target since the CustomOpDef object lacks __name__ for FX.
             is_triton = is_op(norm_node, torch.ops.auto_deploy.triton_rms_norm)
-            # triton path: use the op overload (FX call_function needs __name__, which the
-            # CustomOpDef object lacks; the OpOverload has it). flashinfer path uses its
-            # plain wrapper fn (already has __name__).
             fused_target = (
                 torch.ops.auto_deploy.triton_fused_add_rms_norm.default
                 if is_triton

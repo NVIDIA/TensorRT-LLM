@@ -1958,10 +1958,7 @@ def _insert_sharded_moe(
         # - Each GPU computes partial results for local experts only
         # - all_reduce sums partial results across GPUs
         # ---------------------------------------------------------------------------
-        # V24: fuse the 4 elementwise localize ops (sub / floordiv / eq|ge / mul) into a
-        # single Triton kernel (auto_deploy::ep_local_route).  Microbench (cuda-graph
-        # replay, decode shape [1,8]): 4 aten ops = 8.2 us vs 1 fused op = 2.4 us
-        # (3.4x faster) -> ~5.8 us saved per MoE layer (~58 layers/iter).
+        # Fuse the 4 localize ops (sub / floordiv / eq|ge / mul) into one Triton kernel.
         from ...custom_ops.fused_moe import triton_routing  # noqa: F401  (registers op)
 
         is_last_rank = ep_rank == ep_size - 1
