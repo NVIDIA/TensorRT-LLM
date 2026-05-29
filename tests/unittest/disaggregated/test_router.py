@@ -1,5 +1,6 @@
 import asyncio
 import copy
+import random
 import threading
 from unittest import mock
 
@@ -22,9 +23,35 @@ from tensorrt_llm.serve.router import (KV_CACHE_HASH_ALGO_V1,
                                        ConversationRouter, KvCacheAwareRouter,
                                        KvCacheAwareServerState,
                                        LoadBalancingRouter, RoundRobinRouter,
-                                       create_router)
+                                       block_key_hasher, create_router)
 
 # yapf: enable
+
+
+def test_native_block_key_hasher_matches_python_v1():
+    """Native C++ BlockKeyHasher must be bit-exact with hash_v1_block_key.
+
+    Covers single blocks and the chained per-block pattern used by
+    BlockHashMixin._compute_block_hashes.
+    """
+    random.seed(0)
+    for _ in range(500):
+        n = random.choice([1, 2, 31, 32, 33, 64, 97])
+        toks = [random.randint(0, 300000) for _ in range(n)]
+        parent = random.choice([None, 0, random.randint(1, 2**64 - 1)])
+        ref = hash_v1_block_key(toks,
+                                parent_hash=0 if parent is None else parent)
+        assert block_key_hasher(toks, parent) == ref
+
+    # chained per-block (the real _compute_block_hashes pattern)
+    toks = [random.randint(0, 300000) for _ in range(2000)]
+    parent = None
+    for t in range(0, len(toks) - 1, 32):
+        t_end = min(t + 32, len(toks) - 1)
+        h = block_key_hasher(toks[t:t_end], parent)
+        assert h == hash_v1_block_key(
+            toks[t:t_end], parent_hash=0 if parent is None else parent)
+        parent = h
 
 
 def _make_mock_aiohttp_session(return_value=None):
