@@ -71,9 +71,22 @@ cleanup() {
 
 init_ubuntu() {
   apt-get update
-  # libibverbs-dev is installed but libmlx5.so is missing, reinstall the package
+  # libibverbs-dev is installed but libmlx5.so is missing, reinstall the package.
+  # AWS EFA's libibverbs1 / ibverbs-providers dpkg packages own files under
+  # /opt/amazon/efa, so `apt remove` would wipe that directory. Snapshot and
+  # restore it around the remove+reinstall so EFA stays intact.
+  EFA_BACKUP=""
+  if [ -d /opt/amazon/efa ]; then
+    EFA_BACKUP="$(mktemp -d)/efa-backup.tar"
+    tar -C /opt/amazon -cf "${EFA_BACKUP}" efa
+  fi
   apt remove -y ibverbs-providers libibverbs1
   apt-get --reinstall install -y libibverbs-dev
+  if [ -n "${EFA_BACKUP}" ]; then
+    mkdir -p /opt/amazon
+    tar -C /opt/amazon -xf "${EFA_BACKUP}"
+    rm -rf "$(dirname "${EFA_BACKUP}")"
+  fi
   apt-get install -y --no-install-recommends \
     libtool \
     autoconf \
