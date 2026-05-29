@@ -1880,15 +1880,21 @@ def _mla_with_cache_impl(
     # to bucket size.  Subsequent slicing with num_tokens / num_prefill_tokens
     # selects only the real tokens within the padded buffer.
     bs = b * s
-    q_nope_c = q_nope if q_nope.is_contiguous() else q_nope.contiguous()
+    # V21: avoid eager .contiguous() on the split/narrow views (q_nope, compressed_kv,
+    # kpe).  Their consumers tolerate non-contiguous, last-dim-stride-1 input:
+    #   - q_nope_flat  -> torch.bmm (cuBLAS strided-batched GEMM handles striding)
+    #   - compressed_kv_flat / kpe_flat -> torch.cat (CatArrayBatchedCopy handles striding)
+    # Removing these saved ~3 big `direct_copy` kernels per MLA layer (PT has 0).
+    # Merging [B, S, ...] -> [bs, ...] is a view-safe operation for these tensors
+    # (split was on the last dim, so the B/S dims remain mergeable without a copy).
+    # q_pe is still passed to the C++ ``mla_rope_generation`` kernel which requires
+    # contiguous input, so keep its .contiguous() guard.
     q_pe_c = q_pe if q_pe.is_contiguous() else q_pe.contiguous()
-    compressed_kv_c = compressed_kv if compressed_kv.is_contiguous() else compressed_kv.contiguous()
-    kpe_c = kpe if kpe.is_contiguous() else kpe.contiguous()
 
-    q_nope_flat = q_nope_c.view(bs, num_heads, qk_nope_head_dim)
+    q_nope_flat = q_nope.reshape(bs, num_heads, qk_nope_head_dim)
     q_pe_flat = q_pe_c.view(bs, num_heads, qk_rope_head_dim)
-    compressed_kv_flat = compressed_kv_c.view(bs, kv_lora_rank)
-    kpe_flat = kpe_c.view(bs, qk_rope_head_dim)
+    compressed_kv_flat = compressed_kv.reshape(bs, kv_lora_rank)
+    kpe_flat = kpe.reshape(bs, qk_rope_head_dim)
 
     # Create RoPE tables (+ identity fallback) once per planner; consumed by
     # the decode/prefill helpers and referenced in the thop.attention calls.
