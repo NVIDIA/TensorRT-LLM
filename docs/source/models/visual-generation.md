@@ -115,29 +115,8 @@ In addition to linear-layer quantization, VisualGen exposes two **attention-leve
 - **QK16PV8** (`CUTEDSL` backend): Keeps Q & K in BF16 and quantizes only V to FP8 (E4M3, per-tensor), thus Bmm1 will be carried out in BF16 with Bmm2 in FP8. Targets Blackwell-class GPUs (`sm_100a` / `sm_103a`) with `head_dim = 128`.
 - **SAGE** (`TRTLLM` backend): Quantizes Q, K, and V with per-block scaling factors. Q/K are stored as INT8 or FP8 (e4m3) and V as FP8 (e4m3); block sizes are tunable per axis (typically `(q, k, v) = (1, 4, 1)` for Wan-1.3B and `(1, 16, 1)` for larger Wan / FLUX checkpoints). Supported recipes are validated at runtime.
 
-CLI usage (Wan T2V, SageAttention):
 
-```bash
-python visual_gen_wan_t2v.py \
-    --model_path Wan-AI/Wan2.1-T2V-1.3B-Diffusers \
-    --prompt "A cute cat playing piano" \
-    --attention_backend TRTLLM \
-    --quant_attention_mode SAGE \
-    --output_path output_sage.mp4
-```
-
-CLI usage (Wan T2V, QK16PV8):
-
-```bash
-python visual_gen_wan_t2v.py \
-    --model_path Wan-AI/Wan2.1-T2V-1.3B-Diffusers \
-    --prompt "A cute cat playing piano" \
-    --attention_backend CUTEDSL \
-    --quant_attention_mode QK16PV8 \
-    --output_path output_qk16pv8.mp4
-```
-
-Programmatic equivalent (SageAttention):
+Python API for SageAttention:
 
 ```python
 from tensorrt_llm import VisualGenArgs
@@ -156,7 +135,7 @@ args = VisualGenArgs(
 )
 ```
 
-Programmatic equivalent (QK16PV8):
+Python API for QK16PV8:
 
 ```python
 from tensorrt_llm import VisualGenArgs
