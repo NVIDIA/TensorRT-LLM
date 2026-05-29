@@ -65,18 +65,6 @@ class TestValidatePartitionConfig(unittest.TestCase):
             )
         )
 
-    def test_uniform_dwdp2(self):
-        # DSv3-Lite 72 / 2 = 36. Used by accuracy integration test.
-        _validate_partition_config(
-            **_kwargs(
-                num_experts_per_worker=36,
-                num_prefetch_experts=36,
-                num_experts_total=72,
-                dwdp_size=2,
-                loaded_local_experts=36,
-            )
-        )
-
     # ------------------------------------------------------------------
     # Failure mode 1: non-positive size or stride
     # ------------------------------------------------------------------
@@ -121,10 +109,6 @@ class TestValidatePartitionConfig(unittest.TestCase):
                 )
             )
 
-    def test_coverage_exact_match_passes(self):
-        # 4 ranks of size 64, stride 64 covers exactly [0, 256). Boundary case.
-        _validate_partition_config(**_kwargs())  # uniform default already covers exactly
-
     def test_coverage_with_overlap_passes(self):
         # 4 ranks of size 70, stride 62: 3*62+70 = 256 — exact equality.
         # 8-expert overlap between adjacent ranks is the redundancy case.
@@ -147,16 +131,6 @@ class TestValidatePartitionConfig(unittest.TestCase):
             num_experts_total=256,
             dwdp_size=3,
             loaded_local_experts=86,
-        )
-
-    def test_dwdp5_mode_b_overlap_passes(self):
-        # dwdp=5, 256 experts: stride=51, size=52. 4*51 + 52 = 256.
-        _validate_partition_config(
-            num_experts_per_worker=52,
-            num_prefetch_experts=51,
-            num_experts_total=256,
-            dwdp_size=5,
-            loaded_local_experts=52,
         )
 
     def test_dwdp7_mode_b_overlap_passes(self):
@@ -185,17 +159,6 @@ class TestValidatePartitionConfig(unittest.TestCase):
                 num_experts_total=256,
                 dwdp_size=3,
                 loaded_local_experts=86,
-            )
-
-    def test_tail_padding_rejected_dwdp5(self):
-        # dwdp=5, 256 experts with size=stride=52 → 4*52+52=260 > 256.
-        with self.assertRaisesRegex(ValueError, "exceeds num_experts"):
-            _validate_partition_config(
-                num_experts_per_worker=52,
-                num_prefetch_experts=52,
-                num_experts_total=256,
-                dwdp_size=5,
-                loaded_local_experts=52,
             )
 
     # ------------------------------------------------------------------

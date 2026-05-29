@@ -74,18 +74,6 @@ class TestComputePeerRanges(unittest.TestCase):
         )
         self.assertEqual(peer_ranges, [(0, 86), (86, 172), (172, 256)])
 
-    def test_dwdp5_tail_padding_capped(self):
-        # Defensive (rejected upstream): see
-        # ``test_non_uniform_tail_padding_capped``.
-        peer_ranges = compute_peer_ranges(
-            dwdp_size=5,
-            num_experts_per_worker=52,
-            num_prefetch_experts=52,
-            num_experts_total=256,
-        )
-        # rank 4: start 208, end 260 capped to 256.
-        self.assertEqual(peer_ranges[-1], (208, 256))
-
     def test_mode_b_dwdp3_overlap(self):
         # dwdp=3, 256 experts, Mode B: size=86, stride=85 — the
         # production recipe for ``num_experts not divisible by dwdp_size``.

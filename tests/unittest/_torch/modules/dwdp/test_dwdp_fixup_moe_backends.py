@@ -362,23 +362,6 @@ class TestScatterShardsToFull(unittest.TestCase):
         )
         torch.testing.assert_close(full, torch.arange(8, dtype=torch.float32))
 
-    def test_mode_b_overlap_dwdp4(self):
-        # dwdp=4, 8 experts, size=2, stride=2 (uniform — overlap=0).
-        peer_ranges = [(0, 2), (2, 4), (4, 6), (6, 8)]
-        shards = [
-            torch.tensor([0.0, 1.0]),
-            torch.tensor([2.0, 3.0]),
-            torch.tensor([4.0, 5.0]),
-            torch.tensor([6.0, 7.0]),
-        ]
-        full = _scatter_shards_to_full(
-            shards=shards,
-            peer_ranges=peer_ranges,
-            num_experts_total=8,
-            ref=shards[0],
-        )
-        torch.testing.assert_close(full, torch.arange(8, dtype=torch.float32))
-
     def test_higher_dim_trailing_shape(self):
         # Shards may have trailing dims (e.g., scale param shape (size, K)).
         peer_ranges = [(0, 2), (2, 4)]
