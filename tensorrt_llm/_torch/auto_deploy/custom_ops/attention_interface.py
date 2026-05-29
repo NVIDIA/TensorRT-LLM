@@ -295,7 +295,7 @@ class InputBuffer:
                     trunc_h_buf = self._trunc_host_bufs[name][:copy_bytes]
                     trunc_d_buf.copy_(trunc_h_buf, non_blocking=True)
 
-    def copy_to_host(self) -> None:
+    def copy_to_host(self, non_blocking: bool = False) -> None:
         """Copy from device buffer to host buffer.
 
         Mirrors ``copy_to_device``: uses the current length of the truncatable tensor
@@ -306,7 +306,7 @@ class InputBuffer:
             if self._total_bytes > 0:
                 h_buffer = self._host_buffer[: self._total_bytes]
                 d_buffer = self._device_buffer[: self._total_bytes]
-                h_buffer.copy_(d_buffer, non_blocking=True)
+                h_buffer.copy_(d_buffer, non_blocking=non_blocking)
 
             # Copy each truncatable tensor independently, truncated to current length
             for name in self._truncatable_names:
@@ -316,7 +316,7 @@ class InputBuffer:
                     copy_bytes = length * dtype.itemsize
                     trunc_d_buf = self._trunc_device_bufs[name][:copy_bytes]
                     trunc_h_buf = self._trunc_host_bufs[name][:copy_bytes]
-                    trunc_h_buf.copy_(trunc_d_buf, non_blocking=True)
+                    trunc_h_buf.copy_(trunc_d_buf, non_blocking=non_blocking)
 
     def resize(self, name: str, new_capacity: int) -> None:
         """Resize a truncatable tensor's capacity.
@@ -1175,6 +1175,27 @@ class SequenceInfo:
         """
         return self._is_active(name, check_both) or self._is_active_host_prep(name, check_both)
 
+    def _active_host_update_args(
+        self, arg_names: Set[str], active_args_override: Optional[Set[str]] = None
+    ) -> List[str]:
+        """Return host args that need mirroring after an in-graph metadata update.
+
+        ``active_args_override`` lets a caller narrow host mirroring to the graph inputs the next
+        consumer actually reads. It is treated as a filter: only active host args whose names appear
+        in the override are mirrored. The override may contain names that are not active graph args
+        (e.g. a submodule's full placeholder set, which also includes inter-module tensors such as
+        ``inputs_embeds``/``hidden_states``); such entries are simply ignored. The caller is
+        responsible for including every host argument the next consumer may read.
+        """
+        needs_d2h_sync = [
+            k + self._host_suffix
+            for k in arg_names
+            if self._is_active(k + self._host_suffix, check_both=False)
+        ]
+        if active_args_override is None:
+            return needs_d2h_sync
+        return [arg_name for arg_name in needs_d2h_sync if arg_name in active_args_override]
+
     def _stage_arg(
         self,
         name: str,
@@ -1583,11 +1604,16 @@ class SequenceInfo:
             host_function(**{arg: self.get_arg(arg) for arg in args})
 
     @nvtx_range("ad_offset_pos_and_cache_")
-    def offset_pos_and_cache_(self, offset: torch.Tensor) -> None:
+    def offset_pos_and_cache_(
+        self, offset: torch.Tensor, active_args_override: Optional[Set[str]] = None
+    ) -> None:
         """Offset position and cache-related metadata for active arguments.
 
         Args:
             offset: 1D tensor [batch_size] with per-sequence position offsets.
+            active_args_override: Optional graph-input names for the next in-forward consumer. When
+                provided, host mirroring is limited to those active host args. The caller is
+                responsible for including every host argument the next consumer may read.
         """
         # check if we need a d2h sync
         _REQUIRES_UPDATE = {
@@ -1599,11 +1625,7 @@ class SequenceInfo:
             "seq_len_with_cache",
             "use_initial_states",
         }
-        needs_d2h_sync = [
-            k + self._host_suffix
-            for k in _REQUIRES_UPDATE
-            if self._is_active(k + self._host_suffix, check_both=False)
-        ]
+        needs_d2h_sync = self._active_host_update_args(_REQUIRES_UPDATE, active_args_override)
         sync_to_host = any(needs_d2h_sync)
         if sync_to_host:
             ad_logger.debug(f"d2h sync required in offset_pos_and_cache_ for {needs_d2h_sync}")
@@ -1694,7 +1716,7 @@ class SequenceInfo:
         # TODO: May need to dissect what fields are needed in the forward pass to reduce
         # data movement.
         if sync_to_host:
-            self._input_buffer.copy_to_host()
+            self._input_buffer.copy_to_host(non_blocking=False)
 
     @nvtx_range("ad_offset_with_new_lens_")
     def offset_with_new_lens_(self, new_lens_ungathered: torch.Tensor) -> None:
@@ -1718,12 +1740,17 @@ class SequenceInfo:
         self.offset_pos_and_cache_(increment)
 
     @nvtx_range("ad_switch_to_generate_")
-    def switch_to_generate_(self) -> None:
+    def switch_to_generate_(self, active_args_override: Optional[Set[str]] = None) -> None:
         """Switch all sequences metadata to generate (decode) mode.
 
         Transitions the batch from any layout (prefill/extend/decode or mixed) to
         an all-decode layout where each sequence has exactly 1 token. We assume that we just take
         the last position of each sequence for the metadata.
+
+        Args:
+            active_args_override: Optional graph-input names for the next in-forward consumer. When
+                provided, host mirroring is limited to those active host args. The caller is
+                responsible for including every host argument the next consumer may read.
 
         NOTE: update device tensors first and mirror back to host only when an updated host-side
         argument is active.
@@ -1757,11 +1784,7 @@ class SequenceInfo:
             "position_ids",
             "use_initial_states",
         }
-        needs_d2h_sync = [
-            k + self._host_suffix
-            for k in _REQUIRES_UPDATE
-            if self._is_active(k + self._host_suffix, check_both=False)
-        ]
+        needs_d2h_sync = self._active_host_update_args(_REQUIRES_UPDATE, active_args_override)
         sync_to_host = any(needs_d2h_sync)
 
         # --- input_ids (device) ---
@@ -1790,7 +1813,7 @@ class SequenceInfo:
         # TODO: May need to dissect what fields are needed in the forward pass to reduce
         # data movement.
         if sync_to_host:
-            self._input_buffer.copy_to_host()
+            self._input_buffer.copy_to_host(non_blocking=False)
 
     def copy_(self, name: str, src: torch.Tensor, strict: bool = True) -> None:
         """Copy a tensor into the buffer. USE WITH CAUTION!

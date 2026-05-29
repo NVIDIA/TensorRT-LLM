@@ -235,6 +235,40 @@ class TestSpeculativeConfigValidation:
         args = LlmArgs(model="test-model", speculative_config=spec_config)
         assert args.model_factory == "eagle_one_model"
 
+    @pytest.mark.parametrize("compile_backend", ["torch-cudagraph", "torch-opt"])
+    def test_rejects_flashinfer_cuda_graph_backend(self, compile_backend):
+        from tensorrt_llm.llmapi import EagleDecodingConfig
+
+        spec_config = EagleDecodingConfig(
+            max_draft_len=3,
+            speculative_model="some/model",
+            eagle3_one_model=True,
+        )
+
+        with pytest.raises(pydantic.ValidationError):
+            LlmArgs(
+                model="test-model",
+                speculative_config=spec_config,
+                attn_backend="flashinfer",
+                compile_backend=compile_backend,
+            )
+
+    def test_accepts_flashinfer_torch_simple(self):
+        from tensorrt_llm.llmapi import EagleDecodingConfig
+
+        spec_config = EagleDecodingConfig(
+            max_draft_len=3,
+            speculative_model="some/model",
+            eagle3_one_model=True,
+        )
+
+        LlmArgs(
+            model="test-model",
+            speculative_config=spec_config,
+            attn_backend="flashinfer",
+            compile_backend="torch-simple",
+        )
+
 
 # ================================
 # CUDA Graph Batch Sizes Tests

@@ -375,6 +375,68 @@ class TestSwitchToGenerateHostArgHandling:
         assert device_cu[:3].tolist() == [0, 1, 2]
         assert host_cu[:3].tolist() == [0, 1, 2]
 
+    def test_out_of_scope_active_host_mirror_not_synced_by_switch_to_generate(self):
+        """Host mirrors outside the next consumer's placeholders should keep staging values."""
+        si = _make_seq_info(extra_activate=("cu_seqlen_host",))
+        _nest_prefill(
+            si,
+            input_ids=[[1, 2, 3], [4, 5, 6, 7]],
+            pages_per_seq=[1, 1],
+            cache_loc=[10, 20],
+        )
+
+        si.switch_to_generate_(active_args_override={"input_ids"})
+
+        device_cu = si._input_buffer.get_view("cu_seqlen")
+        host_cu = si._input_buffer.get_host_view("cu_seqlen")
+        assert device_cu[:3].tolist() == [0, 1, 2]
+        assert host_cu[:3].tolist() == [0, 3, 7]
+
+    def test_in_scope_active_host_mirror_synced_by_switch_to_generate(self):
+        """Host mirrors inside the next consumer's placeholders should be refreshed."""
+        si = _make_seq_info(extra_activate=("cu_seqlen_host",))
+        _nest_prefill(
+            si,
+            input_ids=[[1, 2, 3], [4, 5, 6, 7]],
+            pages_per_seq=[1, 1],
+            cache_loc=[10, 20],
+        )
+
+        si.switch_to_generate_(active_args_override={"cu_seqlen_host"})
+
+        device_cu = si._input_buffer.get_view("cu_seqlen")
+        host_cu = si._input_buffer.get_host_view("cu_seqlen")
+        assert device_cu[:3].tolist() == [0, 1, 2]
+        assert host_cu[:3].tolist() == [0, 1, 2]
+
+    def test_override_with_non_active_placeholders_is_tolerated(self):
+        """Override may contain non-active placeholders (e.g. inputs_embeds/hidden_states).
+
+        The Eagle/MTP draft loop passes the draft submodule's full placeholder set as the override,
+        which includes inter-module tensors that are not SequenceInfo graph args. These must be
+        ignored rather than raising, while in-scope host mirrors are still synced.
+        """
+        si = _make_seq_info(extra_activate=("cu_seqlen_host",))
+        _nest_prefill(
+            si,
+            input_ids=[[1, 2, 3]],
+            pages_per_seq=[1],
+            cache_loc=[10],
+        )
+
+        # Mirrors the draft-model placeholder set: active host arg + non-active inter-module inputs.
+        draft_placeholders = {"input_ids", "cu_seqlen_host", "inputs_embeds", "hidden_states"}
+        si.switch_to_generate_(active_args_override=draft_placeholders)
+
+        increment = torch.tensor([1], dtype=torch.int32, device=si.device)
+        si.offset_pos_and_cache_(increment, active_args_override=draft_placeholders)
+
+        # In-scope host mirror (cu_seqlen_host) is refreshed from device metadata.
+        device_cu = si._input_buffer.get_view("cu_seqlen")
+        host_cu = si._input_buffer.get_host_view("cu_seqlen")
+        assert device_cu[:2].tolist() == [0, 1]
+        assert host_cu[:2].tolist() == [0, 1]
+
     def test_non_native_host_arg_syncs_device_to_host(self):
         """Activating a non-native host arg should sync device -> host instead of raising."""
         si = _make_seq_info()
@@ -422,6 +484,44 @@ class TestSwitchToGenerateHostArgHandling:
         host_swc = si._input_buffer.get_host_view("seq_len_with_cache")
         assert host_swc[0].item() == 4
         assert host_swc[1].item() == 5
+
+    def test_out_of_scope_active_host_mirror_not_synced_by_offset_pos_and_cache(self):
+        """Scoped updates should not refresh target-only host mirrors during draft metadata edits."""
+        si = _make_seq_info(extra_activate=("seq_len_with_cache_host",))
+        _nest_prefill(
+            si,
+            input_ids=[[1, 2, 3], [4, 5, 6, 7]],
+            pages_per_seq=[1, 1],
+            cache_loc=[10, 20],
+        )
+
+        increment = torch.tensor([1, 1], dtype=torch.int32, device=si.device)
+        si.switch_to_generate_(active_args_override={"input_ids"})
+        si.offset_pos_and_cache_(increment, active_args_override={"input_ids"})
+
+        device_swc = si._input_buffer.get_view("seq_len_with_cache")
+        host_swc = si._input_buffer.get_host_view("seq_len_with_cache")
+        assert device_swc[:2].tolist() == [4, 5]
+        assert host_swc[:2].tolist() == [3, 4]
+
+    def test_in_scope_active_host_mirror_synced_by_offset_pos_and_cache(self):
+        """Scoped offset updates should refresh host mirrors required by the next consumer."""
+        si = _make_seq_info(extra_activate=("seq_len_with_cache_host",))
+        _nest_prefill(
+            si,
+            input_ids=[[1, 2, 3], [4, 5, 6, 7]],
+            pages_per_seq=[1, 1],
+            cache_loc=[10, 20],
+        )
+
+        increment = torch.tensor([1, 1], dtype=torch.int32, device=si.device)
+        si.switch_to_generate_(active_args_override={"input_ids"})
+        si.offset_pos_and_cache_(increment, active_args_override={"seq_len_with_cache_host"})
+
+        device_swc = si._input_buffer.get_view("seq_len_with_cache")
+        host_swc = si._input_buffer.get_host_view("seq_len_with_cache")
+        assert device_swc[:2].tolist() == [4, 5]
+        assert host_swc[:2].tolist() == [4, 5]
 
     def test_native_host_args_do_not_raise(self):
         """batch_info_host, cu_seqlen_host, seq_len_host are native (tokens_gather in batch_info)."""
