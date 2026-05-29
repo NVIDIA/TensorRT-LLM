@@ -18,6 +18,8 @@
 #include "connection.h"
 #include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/executor/cache_transmission/cacheSplitConcat.h"
+#include <chrono>
+#include <cstdint>
 #include <random>
 #include <string>
 #include <unistd.h>
@@ -127,6 +129,12 @@ size_t MemoryDesc::serializedSize(MemoryDesc const& memoryDesc)
 
 void AgentConnection::send(DataContext const& ctx, void const* data, size_t size) const
 {
+    // nvbugs/6104831 diagnostic: trace AgentConnection::send entry so we can
+    // correlate sender-side events with the gen-side waitForNotification spin
+    // when the disagg KV transfer wedge occurs. <tag, remote> is the same key
+    // the peer's waitForNotification searches for, so missing/mismatched logs
+    // here will pinpoint case (1) "never sent" vs (2) "sent with wrong tag".
+    TLLM_LOG_INFO("[DIAG-SEND-ENTRY] tag=%d remote=%s size=%zu", ctx.getTag(), mRemoteAgentName.c_str(), size);
     MemoryDesc srcDesc{
         reinterpret_cast<uintptr_t>(data), size, static_cast<uint32_t>(mAgentConnectionManager->getDeviceId())};
     MemoryDescs srcDescs{MemoryType::kVRAM, {srcDesc}};
@@ -186,11 +194,24 @@ void AgentConnection::send(DataContext const& ctx, void const* data, size_t size
         TLLM_THROW("AgentConnection::send cancelled pre-notify");
     }
     // TODO: there is a bug in request_with_notify https://github.com/ai-dynamo/nixl/pull/252
+    // nvbugs/6104831 diagnostic: bracket the notifySyncMessage call so a CI wedge
+    // log trail will show whether notifySyncMessage was reached, whether it
+    // returned, and whether the peer's waitForNotification then unblocked.
+    // - SEND-NOTIFY present + SEND-NOTIFY-DONE missing = notifySyncMessage hung
+    //   in the NIXL backend.
+    // - SEND-NOTIFY-DONE present + peer's WAIT-EXIT missing = NIXL silently
+    //   dropped the notification (case 3 in our investigation taxonomy).
+    TLLM_LOG_INFO("[DIAG-SEND-NOTIFY] tag=%d remote=%s", ctx.getTag(), mRemoteAgentName.c_str());
     mAgentConnectionManager->getAgent()->notifySyncMessage(mRemoteAgentName, ss.str());
+    TLLM_LOG_INFO("[DIAG-SEND-NOTIFY-DONE] tag=%d remote=%s", ctx.getTag(), mRemoteAgentName.c_str());
 }
 
 void AgentConnection::recv(DataContext const& ctx, void* data, size_t size) const
 {
+    // nvbugs/6104831 diagnostic: trace recv entry so we can correlate the
+    // gen-side recv request with the corresponding sender-side send log, and
+    // with the downstream waitForNotification spin lifetime.
+    TLLM_LOG_INFO("[DIAG-RECV-ENTRY] tag=%d remote=%s size=%zu", ctx.getTag(), mRemoteAgentName.c_str(), size);
 
     NotificationSyncInfo syncInfo{mAgentName, ctx};
     bool const received
@@ -650,11 +671,39 @@ template <typename NotificationType>
 bool AgentConnectionManager::waitForNotification(
     std::string const& remoteAgentName, NotificationType& expectedInfo, std::atomic<bool> const& terminateFlag)
 {
+    // nvbugs/6104831 diagnostic instrumentation:
+    //   - Always-on entry/exit logs let us correlate this gen-side wait with
+    //     the matching sender-side [DIAG-SEND-NOTIFY*] log on the ctx side.
+    //   - The heartbeat log (throttled to every 5s) proves the worker thread
+    //     is alive and spinning, rather than crashed or deadlocked elsewhere.
+    //     The spin loop intentionally does no sleep_for / cv.wait, so the
+    //     iteration count is informative (millions per second when waiting).
+    //   - The exit log records WHICH terminating condition fired, so we can
+    //     distinguish "matched notification" vs "terminateFlag flipped" vs
+    //     "!mIsRunning shutdown".
+    char const* notifType = std::is_same_v<NotificationType, NotificationSyncInfo> ? "Sync" : "ReadySignal";
+    int const expectedTag = expectedInfo.mContext.getTag();
+    std::string const expectedAgent = expectedInfo.mAgentName;
+    TLLM_LOG_INFO("[DIAG-WAIT-ENTRY] type=%s remote=%s expected_tag=%d expected_agent=%s", notifType,
+        remoteAgentName.c_str(), expectedTag, expectedAgent.c_str());
+    auto lastHeartbeat = std::chrono::steady_clock::now();
+    std::uint64_t iters = 0;
+
     while (!terminateFlag.load())
     {
+        ++iters;
+        auto now = std::chrono::steady_clock::now();
+        if (now - lastHeartbeat >= std::chrono::seconds(5))
+        {
+            TLLM_LOG_INFO("[DIAG-WAIT-SPIN] type=%s remote=%s expected_tag=%d expected_agent=%s iters=%lu", notifType,
+                remoteAgentName.c_str(), expectedTag, expectedAgent.c_str(), static_cast<unsigned long>(iters));
+            lastHeartbeat = now;
+        }
 
         if (!mIsRunning)
         {
+            TLLM_LOG_INFO("[DIAG-WAIT-EXIT] type=%s remote=%s expected_tag=%d result=not_running iters=%lu", notifType,
+                remoteAgentName.c_str(), expectedTag, static_cast<unsigned long>(iters));
             return false;
         }
         updateUnhandledNotifications();
@@ -688,6 +737,8 @@ bool AgentConnectionManager::waitForNotification(
                             {
                                 it = mUnhandledNotifications.erase(it);
                             }
+                            TLLM_LOG_INFO("[DIAG-WAIT-EXIT] type=%s remote=%s expected_tag=%d result=matched iters=%lu",
+                                notifType, remoteAgentName.c_str(), expectedTag, static_cast<unsigned long>(iters));
                             return true;
                         }
                     }
@@ -708,6 +759,8 @@ bool AgentConnectionManager::waitForNotification(
                             {
                                 it = mUnhandledNotifications.erase(it);
                             }
+                            TLLM_LOG_INFO("[DIAG-WAIT-EXIT] type=%s remote=%s expected_tag=%d result=matched iters=%lu",
+                                notifType, remoteAgentName.c_str(), expectedTag, static_cast<unsigned long>(iters));
                             return true;
                         }
                     }
@@ -728,6 +781,8 @@ bool AgentConnectionManager::waitForNotification(
             }
         }
     }
+    TLLM_LOG_INFO("[DIAG-WAIT-EXIT] type=%s remote=%s expected_tag=%d result=terminated iters=%lu", notifType,
+        remoteAgentName.c_str(), expectedTag, static_cast<unsigned long>(iters));
     return false;
 }
 
