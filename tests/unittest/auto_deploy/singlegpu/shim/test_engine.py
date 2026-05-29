@@ -175,7 +175,7 @@ class _DummyKVCacheManager:
         # Return many dummy page IDs; ADEngine will truncate as needed
         return list(range(1024))
 
-    def get_batch_cache_indices(self, request_ids):
+    def get_batch_cache_indices(self, request_ids, layer_idx=None):
         return [list(range(1024)) for _ in request_ids]
 
     def get_num_kv_blocks(self, num_tokens: int) -> int:
@@ -561,7 +561,7 @@ class _DummyHybridKVCacheManager:
             return list(range(num_blocks))
         return list(range(1024))
 
-    def get_batch_cache_indices(self, request_ids):
+    def get_batch_cache_indices(self, request_ids, layer_idx=None):
         return [list(range(1024)) for _ in request_ids]
 
     def get_num_kv_blocks(self, num_tokens: int) -> int:
