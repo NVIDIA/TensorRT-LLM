@@ -53,6 +53,7 @@ from ...logger import logger
 from ...sampling_params import SamplingParams
 from ..attention_backend import AttentionMetadata
 from ..model_config import ModelConfig
+from ..modules.layer_norm import LayerNorm
 from ..speculative import SpecMetadata
 from .modeling_multimodal_utils import (
     _is_disagg,
@@ -278,8 +279,8 @@ class _Step3VisionBlock(nn.Module):
             rope_theta=rope_theta,
             rope_theta_rescale_factor=rope_theta_rescale_factor,
         )
-        self.ln_1 = nn.LayerNorm(hidden_size, eps=layer_norm_eps)
-        self.ln_2 = nn.LayerNorm(hidden_size, eps=layer_norm_eps)
+        self.ln_1 = LayerNorm(hidden_size=hidden_size, eps=layer_norm_eps)
+        self.ln_2 = LayerNorm(hidden_size=hidden_size, eps=layer_norm_eps)
         self.mlp = _Step3VisionMLP(hidden_size, int(hidden_size * mlp_ratio), hidden_act)
         ls = ls_init_value if ls_init_value is not None else 1.0
         self.ls_1 = _Step3VisionLayerScale(hidden_size, ls)
@@ -355,12 +356,12 @@ class Step3p7VisionEncoder(nn.Module):
             bias=False,
         )
         self.ln_pre = (
-            nn.LayerNorm(self.hidden_size, eps=self.layer_norm_eps)
+            LayerNorm(hidden_size=self.hidden_size, eps=self.layer_norm_eps)
             if self.use_ln_pre
             else nn.Identity()
         )
         self.ln_post = (
-            nn.LayerNorm(self.hidden_size, eps=self.layer_norm_eps)
+            LayerNorm(hidden_size=self.hidden_size, eps=self.layer_norm_eps)
             if self.use_ln_post
             else nn.Identity()
         )
