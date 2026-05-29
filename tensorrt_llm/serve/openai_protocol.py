@@ -137,6 +137,7 @@ class DisaggregatedParams(OpenAIBaseModel):
     ctx_info_endpoint: Optional[str] = None
     schedule_style: Optional[DisaggScheduleStyle] = None
     conversation_id: Optional[str] = None
+    is_first_turn: Optional[bool] = None
 
 
 class ErrorResponse(OpenAIBaseModel):
@@ -1244,6 +1245,7 @@ def to_disaggregated_params(
         ctx_info_endpoint=tllm_disagg_params.ctx_info_endpoint,
         schedule_style=tllm_disagg_params.schedule_style,
         conversation_id=tllm_disagg_params.conversation_id,
+        is_first_turn=tllm_disagg_params.is_first_turn,
     )
 
 
@@ -1267,6 +1269,7 @@ def to_llm_disaggregated_params(
         ctx_info_endpoint=disaggregated_params.ctx_info_endpoint,
         schedule_style=disaggregated_params.schedule_style,
         conversation_id=disaggregated_params.conversation_id,
+        is_first_turn=disaggregated_params.is_first_turn,
     )
 
 

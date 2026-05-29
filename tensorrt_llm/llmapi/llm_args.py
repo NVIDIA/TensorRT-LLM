@@ -778,6 +778,21 @@ class AttentionDpConfig(StrictBaseModel):
         "and causes empty fetch cycles. Default False preserves the prior "
         "behaviour (fetch blocks when truly idle). "
         "Only used when enable_kv_cache_aware_routing is True.")
+    kv_cache_routing_first_turn_round_robin: bool = Field(
+        default=False,
+        description=
+        "First-turn load spreading in KV cache-aware routing. When True, the "
+        "first turn of each conversation (is_first_turn, propagated from the "
+        "serve router via disaggregated_params) is routed round-robin across "
+        "eligible ranks instead of by cache-affinity score, so a shared "
+        "system-prompt prefix cannot funnel every new conversation onto "
+        "whichever rank cached it first. Subsequent turns keep the normal "
+        "affinity path and stick to the rank holding their own conversation "
+        "history. Unlike cold_start_warmup (which only spreads the first "
+        "tp_size requests after init), this spreads the first turn of every "
+        "conversation for the whole run. Requires conversation ids "
+        "(send_conversation_routing_headers). Only used when "
+        "enable_kv_cache_aware_routing is True. Default False.")
 
     @model_validator(mode='after')
     def validate_attention_dp_config(self) -> 'AttentionDpConfig':

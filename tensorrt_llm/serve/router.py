@@ -968,12 +968,10 @@ class BlockHashMixin:
 
     @staticmethod
     def _get_conversation_id(request: OpenAIRequest) -> Optional[str]:
-        """Return the explicit conversation id when present.
+        """Return the explicit conversation id, or None if no session header.
 
-        Populated upstream from session headers (``X-Session-ID``,
-        ``X-Correlation-ID``, ...) by
-        ``OpenAIDisaggServer._extract_conversation_id``.  Returns ``None``
-        when the client sent no session header.
+        Populated upstream from session headers (``X-Session-ID``, ...) by
+        ``OpenAIDisaggServer._extract_conversation_id``.
         """
         if request.disaggregated_params is not None:
             return request.disaggregated_params.conversation_id
@@ -1012,20 +1010,16 @@ class KvCacheAwareRouter(BlockHashMixin, LoadBalancingMixin, Router):
         self._inflight_backfill_hashes: dict[int, tuple[list[BlockHash],
                                                         str]] = {}
 
-        # Conversation ids already routed by this instance, LRU-ordered.
-        # Membership lets us flag the first turn of a multi-turn session,
-        # mirroring ConversationRouter's session-table semantics.  Bounded
-        # so a long run does not grow this map without limit.
+        # Conversation ids already routed by this instance, LRU-ordered and
+        # bounded; membership flags the first turn of a multi-turn session.
         self._max_sessions = max_sessions
         self._seen_conversations: OrderedDict[str, None] = OrderedDict()
 
     def _record_conversation_turn(self, conv_id: Optional[str]) -> bool:
         """Record *conv_id* and report whether this is its first turn.
 
-        Returns ``True`` the first time a non-empty conversation id is seen
-        by this router instance, ``False`` for subsequent turns or when no
-        conversation id is available.  Must be called while holding
-        ``self._lock``.
+        ``True`` the first time a non-empty id is seen, ``False`` afterwards
+        or when no id is available. Must be called while holding ``self._lock``.
         """
         if not conv_id:
             return False
@@ -1585,9 +1579,8 @@ class ConversationRouter(BlockHashMixin, LoadBalancingMixin, Router):
 
         async with self._lock:
 
-            # First turn iff we have an explicit conversation id that this
-            # router instance has not routed before.  Computed before any
-            # session-table mutation so the three return paths agree.
+            # First turn iff an explicit conv_id not yet seen. Computed before
+            # any session-table mutation so all return paths agree.
             is_first_turn = bool(conv_id) and conv_id not in self._session_table
 
             # 1. Explicit conversation_id — sticky routing.
@@ -1665,10 +1658,9 @@ class ConversationRouter(BlockHashMixin, LoadBalancingMixin, Router):
                 conv_id = self._generate_implicit_id()
             self._update_session(conv_id, server, block_hashes)
             loads = {s: self._get_content_load(s) for s in self._servers}
-            logger.debug(
-                f"ConversationRouter: FALLBACK conv_id={conv_id} "
-                f"is_first_turn={is_first_turn} -> server={server}, "
-                f"content_loads={loads}, weight={weight}")
+            logger.debug(f"ConversationRouter: FALLBACK conv_id={conv_id} "
+                         f"is_first_turn={is_first_turn} -> server={server}, "
+                         f"content_loads={loads}, weight={weight}")
 
         return server, {
             "is_first_turn": is_first_turn,
