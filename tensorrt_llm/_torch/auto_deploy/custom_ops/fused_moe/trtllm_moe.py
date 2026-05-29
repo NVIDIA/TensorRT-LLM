@@ -22,7 +22,6 @@ from tensorrt_llm._torch.modules.fused_moe.routing import RoutingMethodType
 from tensorrt_llm.mapping import Mapping
 
 from ..._compat import ActivationType, is_sm_100f
-from ...utils.cuda_graph import cuda_graph_state
 from ...utils.dist_config import DistConfig
 from ..quantization.quant import TRTLLM_NVFP4_SCALING_VECTOR_SIZE
 
@@ -241,13 +240,17 @@ def _run_moe_with_alltoall(
     local_num_experts = fc1_expert_weights.shape[0]
     global_num_experts = local_num_experts * mapping.moe_ep_size
 
-    # ``runtime_max_tokens_per_rank`` controls the *workspace stride* and
-    # the *recv-tensor view shape* on the host side. Both must stay static
-    # to be capture-safe (changing either breaks downstream consumers that
-    # assume the static-stride workspace layout). We pin it to the static
-    # ``max_num_tokens``. The actual dispatch comm savings come from NOT
-    # padding ``x`` below -- see comment at the dispatch call site.
-    runtime_max_tokens_per_rank = max_num_tokens
+    # runtime_max_tokens_per_rank: max(total_num_tokens) across DP ranks.
+    # Mirrors base TRT-LLM's `runtime_max_tokens_per_rank = max(all_rank_num_tokens)`
+    # in fused_moe_cutlass.py / fused_moe_trtllm_gen.py. AD's shim writes slot 13
+    # pre-forward via `tp_allgather` of `total_num_tokens` (when attention-DP is on);
+    # nest_sequences seeds slot 13 with the local total as a safe default.
+    if batch_info_host is not None:
+        runtime_max_tokens_per_rank = int(batch_info_host[13].item())
+        if runtime_max_tokens_per_rank <= 0:
+            runtime_max_tokens_per_rank = max_num_tokens
+    else:
+        runtime_max_tokens_per_rank = max_num_tokens
 
     # Workspace must be sized for the LARGEST element type used by dispatch or combine.
     # The input x may be quantized (fp8/fp4), but combine outputs in the model dtype
@@ -266,17 +269,20 @@ def _run_moe_with_alltoall(
 
     invalid_expert_id = global_num_experts
 
-    # We pass ``runtime_max_tokens_per_rank = max_num_tokens`` (static workspace
-    # stride and recv-tensor view shape, capture-safe).  We do NOT pad ``x``
-    # to that budget though: the dispatch kernel processes only ``x.shape[0]``
-    # tokens and writes that many rows into each receiver's per-source slot.
-    # Receivers see stale data beyond ``recv_counters[src]`` in their slot but
-    # ``moe_a2a_sanitize_expert_ids`` rewrites those rows' expert IDs to
-    # ``invalid_expert_id`` so the downstream MoE GEMM treats them as skip.
-    # This eliminates the dispatch-write over-padding without touching the
-    # capture-time workspace layout, and without needing any C++ kernel
-    # changes.
+    # Pad inputs to runtime_max_tokens_per_rank so all ranks send the same number
+    # of rows through dispatch.  Padding expert IDs must route to a VALID rank
+    # (the local rank's first expert), otherwise the dispatch kernel computes an
+    # out-of-bounds target rank.  Zero routing weights ensure padding tokens
+    # contribute nothing to the output.
     local_num_tokens = x.shape[0]
+    pad_expert_id = mapping.moe_ep_rank * local_num_experts  # routes to local rank
+    pad_size = runtime_max_tokens_per_rank - local_num_tokens
+    if pad_size > 0:
+        x = torch.nn.functional.pad(x, (0, 0, 0, pad_size))  # pad rows with zeros
+        selected_experts = torch.nn.functional.pad(
+            selected_experts, (0, 0, 0, pad_size), value=pad_expert_id
+        )
+        routing_weights = torch.nn.functional.pad(routing_weights, (0, 0, 0, pad_size))
 
     # Build payload list: x, selected_experts, routing_weights
     payloads = [x.contiguous(), selected_experts.contiguous(), routing_weights.contiguous()]
@@ -415,10 +421,12 @@ def _run_trtllm_gen_nvfp4_moe_with_alltoall(
     hidden_size = x.shape[-1]
     local_num_experts = int(fc1_expert_weights_fp4.shape[0])
     global_num_experts = local_num_experts * mapping.moe_ep_size
-    # See cousin function above: keep ``runtime_max_tokens_per_rank`` at the
-    # static ``max_num_tokens`` so the workspace stride / recv view shape stay
-    # capture-safe. Comm savings come from skipping the ``x`` padding below.
-    runtime_max_tokens_per_rank = max_num_tokens
+    if batch_info_host is not None:
+        runtime_max_tokens_per_rank = int(batch_info_host[13].item())
+        if runtime_max_tokens_per_rank <= 0:
+            runtime_max_tokens_per_rank = max_num_tokens
+    else:
+        runtime_max_tokens_per_rank = max_num_tokens
 
     moe_a2a = _GlobalMoeAll2AllCache.get_alltoall(
         mapping=mapping,
@@ -430,11 +438,16 @@ def _run_trtllm_gen_nvfp4_moe_with_alltoall(
         eplb_num_experts=None,
     )
 
-    # Skip the over-padding of ``x``: dispatch kernel writes only ``x.shape[0]``
-    # rows per rank, sanitize handles stale rows. Workspace stride / recv view
-    # stay at the static ``max_num_tokens`` (capture-safe).
     invalid_expert_id = global_num_experts
     local_num_tokens = x.shape[0]
+    pad_expert_id = mapping.moe_ep_rank * local_num_experts
+    pad_size = runtime_max_tokens_per_rank - local_num_tokens
+    if pad_size > 0:
+        x = torch.nn.functional.pad(x, (0, 0, 0, pad_size))
+        selected_experts = torch.nn.functional.pad(
+            selected_experts, (0, 0, 0, pad_size), value=pad_expert_id
+        )
+        routing_weights = torch.nn.functional.pad(routing_weights, (0, 0, 0, pad_size))
 
     recv_results = moe_a2a.dispatch(
         selected_experts,
@@ -444,49 +457,9 @@ def _run_trtllm_gen_nvfp4_moe_with_alltoall(
         expert_id_payload_index=1,
     )
 
-    # Tight slicing optimization: at small cg_batch sizes only a small fraction
-    # of the [ep, max_num_tokens, hidden] recv view actually carries valid data
-    # (each source can route at most ``local_num_tokens * top_k`` rows to any
-    # single receiver). Slicing to a tight bound drops MoE-GEMM and combine
-    # work by an order of magnitude.
-    #
-    # We restrict the optimization to captured / warmup paths so we never
-    # trigger an extra host-device sync in the eager prefill path -- the
-    # batch_info_host[13] read would otherwise be an ``.item()`` whose
-    # sync cost stacks across the 40 MoE layers and cancels the win at the
-    # concurrencies where prefill is frequent.
-    ep_size = mapping.moe_ep_size
-    if torch.cuda.is_current_stream_capturing() or cuda_graph_state.in_warm_up():
-        tight_per_source = min(local_num_tokens * top_k, max_num_tokens)
-        # Only slice when the saving outweighs the per-call overhead. Threshold
-        # *16 admits cg_batch_size up to ~2 (per-rank) for max=8192. The MoE
-        # FC1 GEMM tactic (``bmm_E2m1``) selected by the trtllm-gen autotuner
-        # has a per-call regression for M in the ~1500..5000 range vs the
-        # full-M tactic: at M=4928 (cg=8/per-rank) it's +26% per call, which
-        # for 40 layers × 7 MTP positions = 280 calls/iter adds ~6 ms of GEMM
-        # overhead that swamps the dispatch/sanitize/combine savings. Gating
-        # the tight path to cg ≤ 2 keeps the c=1..8 (bench) wins while
-        # avoiding the c=32 regression.
-        use_tight_path = tight_per_source * 16 <= max_num_tokens
-    else:
-        tight_per_source = max_num_tokens
-        use_tight_path = False
-
-    if use_tight_path:
-        dispatched_x = recv_results[0][:, :tight_per_source, :].reshape(-1, hidden_size)
-        dispatched_selected = (
-            recv_results[1][:, :tight_per_source, :].reshape(-1, top_k).to(torch.int32).contiguous()
-        )
-        dispatched_weights = (
-            recv_results[2][:, :tight_per_source, :]
-            .reshape(-1, top_k)
-            .to(torch.bfloat16)
-            .contiguous()
-        )
-    else:
-        dispatched_x = recv_results[0].reshape(-1, hidden_size)
-        dispatched_selected = recv_results[1].reshape(-1, top_k).to(torch.int32).contiguous()
-        dispatched_weights = recv_results[2].reshape(-1, top_k).to(torch.bfloat16).contiguous()
+    dispatched_x = recv_results[0].reshape(-1, hidden_size)
+    dispatched_selected = recv_results[1].reshape(-1, top_k).to(torch.int32).contiguous()
+    dispatched_weights = recv_results[2].reshape(-1, top_k).to(torch.bfloat16).contiguous()
 
     x_q_fp4, x_sf = torch.ops.trtllm.fp4_quantize(
         dispatched_x, fc1_act_global_scale, TRTLLM_NVFP4_SCALING_VECTOR_SIZE, False, False
@@ -528,19 +501,8 @@ def _run_trtllm_gen_nvfp4_moe_with_alltoall(
         topk_ids=dispatched_selected,
     )
 
-    # Pass ``tight_per_source`` to combine (NOT to dispatch). Combine writes
-    # to a separate workspace region (``combine_payload_offset``) and indexes
-    # it with its own ``runtime_max_tokens_per_rank``. Dispatch's static
-    # ``max_num_tokens`` stride / workspace layout stay put. The combine
-    # kernel iterates ``ep_size * tight_per_source`` slots instead of
-    # ``ep_size * max_num_tokens``, and we hand it the already-tight MoE
-    # output directly with no extra copy or buffer allocation.
-    if use_tight_path:
-        moe_out = outputs[0].view(ep_size, tight_per_source, hidden_size)
-        combined = moe_a2a.combine(moe_out, tight_per_source)
-    else:
-        moe_out = outputs[0].view(ep_size, runtime_max_tokens_per_rank, hidden_size)
-        combined = moe_a2a.combine(moe_out, runtime_max_tokens_per_rank)
+    moe_out = outputs[0].view(mapping.moe_ep_size, runtime_max_tokens_per_rank, hidden_size)
+    combined = moe_a2a.combine(moe_out, runtime_max_tokens_per_rank)
     return combined[:local_num_tokens]
 
 

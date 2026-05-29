@@ -824,20 +824,22 @@ class ADEngine(ModelEngine):
         )
         self.iter_counter += 1
 
-        # Per-forward DP-rank sync barrier, structured as the
-        # ``model_engine._get_all_rank_num_tokens`` pattern so the slot-13 write
-        # remains a drop-in if a future MoE alltoall path wants the cross-rank max.
+        # Compute DP-aware max(total_num_tokens) and write to BatchInfo slot 13.
+        # Mirrors base TRT-LLM's `model_engine._get_all_rank_num_tokens`. The MoE
+        # all-to-all reads slot 13 as ``runtime_max_tokens_per_rank`` to size the
+        # dispatch padding to the cross-rank max instead of the static
+        # ``max_num_tokens`` (up to 6x perf). ``nest_sequences`` seeds slot 13
+        # with the local total as a safe default; this overrides with the
+        # cross-rank max when attention-DP is on.
         #
-        # As of commit ``5504cf859c`` the MoE alltoall stopped over-padding ``x``,
-        # so ``runtime_max_tokens_per_rank`` is now always the static
-        # ``max_num_tokens`` and slot 13 has no on-path consumer. The collective
-        # is intentionally kept anyway: empirically it acts as a per-iter cross-
-        # rank barrier, and dropping it costs significant throughput (measured
-        # c=8 OTPS -38%, c=32 -13% on NVFP4 SuperV3 MTP+ADP). The barrier appears
-        # to be papering over serialization in the captured MoE alltoall path
-        # under rank drift. If a cheaper explicit barrier is identified, this
-        # call can be replaced; until then the small per-iter MPI cost is the
-        # better trade.
+        # Correctness under CUDA graphs: the ``.item()`` read inside the MoE op
+        # is baked at capture time. For pure-decode all-replay this is safe
+        # because attention-DP forces all ranks to the same ``cg_batch_size``,
+        # so the captured value equals the replay-time cross-rank max. The
+        # mixed prefill/decode case (a prefill rank goes eager, a sibling decode
+        # rank would replay a stale-baked value) is handled by
+        # ``maybe_pad_for_cuda_graph`` forcing all ranks eager via
+        # ``_set_bypass_captured_graphs`` (commit #13718 / ecc7ae1c85).
         if self.enable_attention_dp and self.dist_config.tp_size > 1:
             assert self.dist is not None, "Distributed object is required for attention DP mode"
             info = self.cache_seq_interface.info
