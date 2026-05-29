@@ -864,7 +864,6 @@ def test_llama_eagle3_rejection_sampling_modes(use_dynamic_tree: bool,
         max_draft_len=max_draft_len,
         speculative_model=eagle_model,
         eagle3_one_model=True,
-        allow_advanced_sampling=True,
         use_rejection_sampling=True,
     )
     if use_dynamic_tree:

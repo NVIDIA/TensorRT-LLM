@@ -201,7 +201,6 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
             max_draft_len=4,
             speculative_model=eagle_model_dir,
             eagle3_one_model=True,
-            allow_advanced_sampling=True,
             use_rejection_sampling=True,
         )
         max_batch_size = 1
@@ -5583,8 +5582,7 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
         draft_len = 3
         spec_config = Eagle3DecodingConfig(max_draft_len=draft_len,
                                            speculative_model=eagle_model_dir,
-                                           eagle3_one_model=one_model,
-                                           allow_advanced_sampling=True)
+                                           eagle3_one_model=one_model)
 
         max_seq_len = MAX_INPUT_LEN + MAX_OUTPUT_LEN
         llm = LLM(self.MODEL_PATH,
@@ -5649,8 +5647,7 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
         draft_len = 3
         spec_config = Eagle3DecodingConfig(max_draft_len=draft_len,
                                            speculative_model=eagle_model_dir,
-                                           eagle3_one_model=one_model,
-                                           allow_advanced_sampling=True)
+                                           eagle3_one_model=one_model)
 
         max_seq_len = MAX_INPUT_LEN + MAX_OUTPUT_LEN
         llm = LLM(self.MODEL_PATH,
@@ -5713,8 +5710,7 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
         draft_len = 3
         spec_config = Eagle3DecodingConfig(max_draft_len=draft_len,
                                            speculative_model=eagle_model_dir,
-                                           eagle3_one_model=one_model,
-                                           allow_advanced_sampling=True)
+                                           eagle3_one_model=one_model)
 
         max_seq_len = MAX_INPUT_LEN + MAX_OUTPUT_LEN
         llm = LLM(self.MODEL_PATH,

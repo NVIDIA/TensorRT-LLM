@@ -454,8 +454,14 @@ class SpecMetadata:
     # Always set by model_engine.forward() before any downstream code reads it.
     runtime_draft_len: int = 0
 
-    # For non-greedy sampling on 1-model.
-    allow_advanced_sampling: bool = False
+    # Auto-detected per step from populated sampling params:
+    # True if every request is greedy (no temp/top_k/top_p) and we can take
+    # the argmax fast-path. False if any request needs sampling.
+    # Used as part of the CUDA graph key so we capture two variants
+    # (greedy fast-path vs advanced sampling) and dispatch at replay.
+    # Defaults to True so non-one-engine paths (where populate is a no-op)
+    # never accidentally select the advanced graph variant.
+    is_all_greedy_sample: bool = True
     # Whether to use rejection sampling for one-model speculative decoding.
     use_rejection_sampling: bool = False
     # Sampling parameters for non-greedy sampling (per-request)
@@ -533,28 +539,20 @@ class SpecMetadata:
             self, requests: list["LlmRequest"]) -> None:
         """
         Set up topp/topk/temperatures for 1-model sampler.
+
+        Scans sampling configs to set skip_*/is_all_greedy_sample flags. When
+        any request needs sampling, also builds per-token/per-request lists
+        and copies them to GPU buffers; all-greedy batches skip this entirely.
         """
         from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
         from tensorrt_llm.sampling_params import SamplingParams
 
-        if not self.allow_advanced_sampling or not self.spec_dec_mode.use_one_engine(
-        ):
+        if not self.spec_dec_mode.use_one_engine():
             return
 
         if self.temperatures is None:
             # Ensures determinism across ranks.
             torch.manual_seed(0)
-
-        temperatures = []
-        top_ks = []
-        top_ps = []
-        request_temperatures = []
-        request_top_ks = []
-        request_top_ps = []
-        top_k_enabled = False
-        top_p_enabled = False
-        has_greedy_requests = False
-        temperature_enabled = False
 
         # Need to use a very small value for temperature when disabled to avoid division by 0
         DISABLE_TEMP_VAL = 1e-5
@@ -601,6 +599,13 @@ class SpecMetadata:
                 is_greedy,
             )
 
+        # Phase 1: collect per-request flags and normalized values.
+        per_request_normalized: list[tuple[float, int, float, int]] = []
+        temperature_enabled = False
+        top_k_enabled = False
+        top_p_enabled = False
+        has_greedy_requests = False
+
         for request in requests:
             sampling_config = request.sampling_config
             temp_val = _first_or_none(sampling_config.temperature)
@@ -629,12 +634,16 @@ class SpecMetadata:
             top_p_enabled |= use_top_p
             has_greedy_requests |= is_greedy
 
-            request_temperatures.append(temp_val)
-            request_top_ks.append(tk_val)
-            request_top_ps.append(tp_val)
-            temperatures.extend(temp_val for _ in range(num_tokens))
-            top_ks.extend(tk_val for _ in range(num_tokens))
-            top_ps.extend(tp_val for _ in range(num_tokens))
+            per_request_normalized.append(
+                (temp_val, tk_val, tp_val, num_tokens))
+
+        self.skip_temperature = not temperature_enabled
+        self.skip_top_k = not top_k_enabled
+        self.skip_top_p = not top_p_enabled
+        self.has_greedy_requests = has_greedy_requests
+        # Used in the CUDA graph key to pick the argmax / advanced variant.
+        self.is_all_greedy_sample = (self.skip_temperature and self.skip_top_k
+                                     and self.skip_top_p)
 
         tokens_per_request = (self.max_total_draft_tokens + 1 if
                               self.is_spec_dec_tree else self.max_draft_len + 1)
@@ -642,6 +651,7 @@ class SpecMetadata:
 
         if self.temperatures is None or self.temperatures.numel(
         ) < required_flat_size:
+            # Allocate once; the captured graph reads from these stable addresses.
             self.temperatures = torch.ones(required_flat_size,
                                            dtype=torch.float32,
                                            device='cuda')
@@ -660,6 +670,27 @@ class SpecMetadata:
             self.request_top_ps = torch.ones(self.max_num_requests,
                                              dtype=torch.float32,
                                              device='cuda')
+
+        # All-greedy: sampler takes the argmax branch (and rejection sampling
+        # is also bypassed for all-greedy), so the buffers are never read.
+        # Skip the H->D copies.
+        if self.is_all_greedy_sample:
+            return
+
+        # Phase 2: build per-token / per-request lists and copy to GPU.
+        temperatures: list[float] = []
+        top_ks: list[int] = []
+        top_ps: list[float] = []
+        request_temperatures: list[float] = []
+        request_top_ks: list[int] = []
+        request_top_ps: list[float] = []
+        for temp_val, tk_val, tp_val, num_tokens in per_request_normalized:
+            request_temperatures.append(temp_val)
+            request_top_ks.append(tk_val)
+            request_top_ps.append(tp_val)
+            temperatures.extend(temp_val for _ in range(num_tokens))
+            top_ks.extend(tk_val for _ in range(num_tokens))
+            top_ps.extend(tp_val for _ in range(num_tokens))
 
         self.temperatures[:len(temperatures)].copy_(torch.tensor(
             temperatures, dtype=torch.float32, pin_memory=prefer_pinned()),
@@ -687,10 +718,6 @@ class SpecMetadata:
                          pin_memory=prefer_pinned()),
             non_blocking=True,
         )
-        self.skip_temperature = not temperature_enabled
-        self.skip_top_k = not top_k_enabled
-        self.skip_top_p = not top_p_enabled
-        self.has_greedy_requests = has_greedy_requests
 
 
 class SpecWorkerBase(nn.Module, ABC):
@@ -1029,8 +1056,11 @@ class SpecWorkerBase(nn.Module, ABC):
 
     def _can_use_rejection_sampling(self, spec_metadata: SpecMetadata,
                                     num_contexts: int) -> bool:
+        # Skip rejection sampling when the whole batch is greedy: the
+        # accepted result is identical to argmax and the base path is cheaper.
         return (spec_metadata.use_rejection_sampling
-                and spec_metadata.draft_probs_valid and num_contexts == 0)
+                and spec_metadata.draft_probs_valid and num_contexts == 0
+                and not spec_metadata.is_all_greedy_sample)
 
     def _sample_and_accept_draft_tokens_rejection(
         self,
@@ -1307,7 +1337,7 @@ class SpecWorkerBase(nn.Module, ABC):
         Returns:
             sampled_tokens: [num_tokens] - Sampled token ids
         """
-        if spec_metadata.allow_advanced_sampling:
+        if not spec_metadata.is_all_greedy_sample:
             num_gens = batch_size - num_contexts
             num_tokens = num_contexts + num_gens * (
                 spec_metadata.runtime_draft_len + 1)

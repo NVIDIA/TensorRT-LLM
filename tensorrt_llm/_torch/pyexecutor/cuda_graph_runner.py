@@ -30,7 +30,7 @@ from .scheduler import ScheduledRequests
 
 # A large prime number used for dummy request IDs to avoid collisions
 CUDA_GRAPH_DUMMY_REQUEST_ID = (1 << 64) - 1
-KeyType: TypeAlias = Tuple[int, int, bool, bool]
+KeyType: TypeAlias = Tuple[int, int, bool, bool, bool]
 
 
 @dataclass
@@ -205,11 +205,20 @@ class CUDAGraphRunner:
             self,
             batch: ScheduledRequests,
             new_tensors_device: Optional[SampleStateTensors] = None,
-            spec_resource_manager: Optional[BaseResourceManager] = None):
+            spec_resource_manager: Optional[BaseResourceManager] = None,
+            spec_metadata: Optional[Any] = None):
         batch_size = batch.batch_size
 
         # Get the sequence length mode.
         short_seq_len_mode = self._get_seq_len_mode(batch, new_tensors_device)
+
+        # Spec one-engine sampler has two code paths (argmax fast-path vs
+        # advanced sampling kernel). Include this in the key so we capture
+        # both variants and dispatch at replay based on actual batch state.
+        # Default to True (greedy fast-path) when the metadata doesn't carry
+        # this field (non-one-engine paths or non-spec batches).
+        is_all_greedy_sample = bool(
+            getattr(spec_metadata, "is_all_greedy_sample", True))
 
         if self.config.is_draft_model and spec_resource_manager is not None and isinstance(
                 spec_resource_manager, Eagle3ResourceManager):
@@ -217,7 +226,7 @@ class CUDAGraphRunner:
             # Because we will pad the input to 'max_draft_len' length for the first draft layer.
             draft_len = self.config.original_max_draft_len if spec_resource_manager.is_first_draft else 0
             key = (batch_size, draft_len, spec_resource_manager.is_first_draft,
-                   short_seq_len_mode)
+                   short_seq_len_mode, is_all_greedy_sample)
         else:
             # With dynamic spec decode, the draft length may be zero even when enable_spec_decode is True,
             # so we need to get the draft length from the batch instead of using enable_spec_decode.
@@ -227,7 +236,8 @@ class CUDAGraphRunner:
             draft_len = max(draft_len_list)
             assert len(
                 set(draft_len_list)) == 1, "All draft lengths must be the same"
-            key = (batch_size, draft_len, False, short_seq_len_mode)
+            key = (batch_size, draft_len, False, short_seq_len_mode,
+                   is_all_greedy_sample)
         return key
 
     def __del__(self):
@@ -272,7 +282,7 @@ class CUDAGraphRunner:
         if not self.enabled or not can_run_cuda_graph:
             return None, None, None
         key = self.get_graph_key(batch, new_tensors_device,
-                                 spec_resource_manager)
+                                 spec_resource_manager, spec_metadata)
 
         if key in self.graphs:
             return self.graph_metadata[key][

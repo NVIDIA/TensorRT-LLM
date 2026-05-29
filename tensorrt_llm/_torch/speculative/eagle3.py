@@ -952,7 +952,10 @@ class Eagle3OneModelWorker(SpecWorkerBase):
                 gen_draft_tokens)
             next_draft_tokens[num_contexts:] = gen_draft_tokens
 
-        if spec_metadata.use_rejection_sampling and draft_logits_list:
+        # Skip when the whole batch is greedy: _can_use_rejection_sampling will
+        # bypass the rejection path anyway, so computing draft probs is wasted.
+        if (spec_metadata.use_rejection_sampling and draft_logits_list
+                and not spec_metadata.is_all_greedy_sample):
             d2t_param = getattr(draft_model.model, "d2t", None)
             spec_metadata.d2t = d2t_param.data if d2t_param is not None else None
             self._compute_and_store_draft_probs(draft_logits_list,
