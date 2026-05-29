@@ -21,7 +21,7 @@ from tensorrt_llm.llmapi import CompletionOutput, RequestOutput, SamplingParams
 from tensorrt_llm.llmapi.llm_args import LlmArgs
 from tensorrt_llm.llmapi.tokenizer import load_hf_tokenizer
 
-from ..conftest import llm_models_root, skip_pre_blackwell
+from ..conftest import llm_models_root, skip_post_blackwell_ultra, skip_pre_blackwell
 from ..trt_test_alternative import popen
 from .accuracy_core import LlmapiAccuracyTestHarness
 from .test_disaggregated_serving import (
@@ -181,6 +181,7 @@ class TestDwdpDeepSeekV3Lite(LlmapiAccuracyTestHarness):
 
     @pytest.mark.skip_less_device(4)
     @skip_pre_blackwell
+    @skip_post_blackwell_ultra
     def test_dwdp_accuracy(self):
         model_path = f"{llm_models_root()}/DeepSeek-V3-Lite/nvfp4_moe_only_mtp"
 
@@ -283,6 +284,7 @@ class TestDwdpDeepSeekV3Lite(LlmapiAccuracyTestHarness):
 
     @pytest.mark.skip_less_device(4)
     @skip_pre_blackwell
+    @skip_post_blackwell_ultra
     def test_dwdp_accuracy_contention_opt(self):
         """End-to-end accuracy test with ``contention_opt=True``.
 
@@ -398,6 +400,7 @@ class TestDwdpDeepSeekV3Lite(LlmapiAccuracyTestHarness):
 
     @pytest.mark.skip_less_device(4)
     @skip_pre_blackwell
+    @skip_post_blackwell_ultra
     def test_dwdp_accuracy_mode_b_overlap(self):
         """End-to-end accuracy test for Phase 2's redundancy (overlap) path.
 
