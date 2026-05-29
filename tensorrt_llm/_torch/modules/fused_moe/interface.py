@@ -56,6 +56,33 @@ from .routing import (BaseMoeRoutingMethod, RoutingMethodType,
                       precompute_common_perfect_router_logits)
 
 
+def _compute_ep_partition(num_experts: int, ep_size: int,
+                          ep_rank: int) -> tuple:
+    """Compute per-rank expert count and slot boundaries.
+
+    Uses ceil/floor distribution: ranks 0..remainder-1 hold (base+1) experts
+    and remaining ranks hold base. Covers all experts even when
+    num_experts % ep_size != 0.
+
+    Returns:
+        (expert_size, slot_start, slot_end)
+    """
+    # Reject num_experts < ep_size: would yield zero-expert ranks, which no
+    # MoE backend / comm strategy supports end-to-end. The downstream alltoall
+    # op has a backstop check (numExperts >= epSize) but the AllGatherReduceScatter
+    # fallback path bypasses it, so guard upfront here.
+    if num_experts < ep_size:
+        raise ValueError(
+            f"num_experts ({num_experts}) must be >= ep_size ({ep_size}); "
+            f"configurations producing ranks with zero local experts are not supported."
+        )
+    base = num_experts // ep_size
+    remainder = num_experts % ep_size
+    expert_size = base + (1 if ep_rank < remainder else 0)
+    slot_start = ep_rank * base + min(ep_rank, remainder)
+    return expert_size, slot_start, slot_start + expert_size
+
+
 class MoEWeightLoadingMode(Enum):
     # Gate and up projection are not fused
     VANILLA = 0
@@ -199,6 +226,12 @@ class MoE(nn.Module):
     # override this to ``MoESchedulerKind.FUSED_COMM``.
     scheduler_kind: MoESchedulerKind = MoESchedulerKind.EXTERNAL_COMM
 
+    # Opt-in flag for non-divisible EP (num_experts % ep_size != 0). False by default
+    # so backends whose dispatch/combine paths still assume uniform partitioning fail
+    # fast with a clear error. Backends that fully exercise the ceil/floor partition
+    # (see ``_compute_ep_partition``) should override this to ``True``.
+    _supports_non_divisible_ep: bool = False
+
     @classmethod
     @abstractmethod
     def can_implement(
@@ -298,6 +331,20 @@ class MoE(nn.Module):
         self.ep_size = model_config.mapping.moe_ep_size
         self.ep_rank = model_config.mapping.moe_ep_rank
 
+        # Non-divisible EP gate. Backends opt in via the class attribute
+        # ``_supports_non_divisible_ep``. Default is to reject so that any backend
+        # whose dispatch/combine paths still assume uniform partitioning fails fast
+        # with a clear error instead of silently using a wrong local-expert range.
+        if (self.num_experts % self.ep_size != 0
+                and not type(self)._supports_non_divisible_ep):
+            raise ValueError(
+                f"{type(self).__name__} does not support non-divisible EP: "
+                f"num_experts ({self.num_experts}) must be divisible by "
+                f"ep_size ({self.ep_size}). Override "
+                f"`_supports_non_divisible_ep = True` on the subclass after "
+                f"verifying the kernel/comm path handles ceil/floor partitioning."
+            )
+
         self.moe_backend = model_config.moe_backend
         self.use_dp = model_config.mapping.enable_attention_dp
 
@@ -332,10 +379,13 @@ class MoE(nn.Module):
             self.layer_load_balancer = None
             self.repeat_idx = 0
             self.repeat_count = 1
-            self.expert_size_per_partition = self.num_experts // self.ep_size
+            _size, _start, _end = _compute_ep_partition(self.num_experts,
+                                                        self.ep_size,
+                                                        self.ep_rank)
+            self.expert_size_per_partition = _size
             self.num_slots = self.num_experts
-            self.slot_start = self.ep_rank * self.expert_size_per_partition
-            self.slot_end = self.slot_start + self.expert_size_per_partition
+            self.slot_start = _start
+            self.slot_end = _end
             self.initial_local_expert_ids = list(
                 range(self.slot_start, self.slot_end))
             self.initial_global_assignments = list(range(self.num_experts))
@@ -425,15 +475,16 @@ class MoE(nn.Module):
         moe_load_balancer_config = model_config.moe_load_balancer
 
         # Calculate initial expert assignments
-        init_expert_size_per_partition = (
-            moe_load_balancer_config.num_local_slots
-            if moe_load_balancer_config else self.num_experts // self.ep_size)
-
-        self.initial_global_assignments = [
-            (ep_rank * self.num_experts // self.ep_size + local_slot_id) %
-            self.num_experts for ep_rank in range(self.ep_size)
-            for local_slot_id in range(init_expert_size_per_partition)
-        ]
+        if moe_load_balancer_config:
+            init_expert_size_per_partition = moe_load_balancer_config.num_local_slots
+            self.initial_global_assignments = [
+                (ep_rank * self.num_experts // self.ep_size + local_slot_id) %
+                self.num_experts for ep_rank in range(self.ep_size)
+                for local_slot_id in range(init_expert_size_per_partition)
+            ]
+        else:
+            # Sequential mapping: expert i → slot i; covers all experts regardless of divisibility
+            self.initial_global_assignments = list(range(self.num_experts))
 
         # Setup load balancer if available
         if moe_load_balancer:
@@ -478,19 +529,28 @@ class MoE(nn.Module):
             logger.info(
                 f"initial_global_assignments (layer {self.layer_idx}) = {self.initial_global_assignments}"
             )
-        else:
-            # Fallback when no load balancer
-            assert self.num_experts % self.ep_size == 0
-            self.expert_size_per_partition = self.num_experts // self.ep_size
-            self.num_slots = self.num_experts
 
-        # Calculate slot boundaries
-        self.slot_start = self.ep_rank * self.expert_size_per_partition
-        self.slot_end = self.slot_start + self.expert_size_per_partition
-        self.initial_local_expert_ids = self.initial_global_assignments[
-            self.slot_start:self.slot_end]
-        assert len(
-            self.initial_local_expert_ids) == self.expert_size_per_partition
+            # Slot boundaries for EPLB (uniform: all ranks hold same num_local_slots)
+            self.slot_start = self.ep_rank * self.expert_size_per_partition
+            self.slot_end = self.slot_start + self.expert_size_per_partition
+            self.initial_local_expert_ids = self.initial_global_assignments[
+                self.slot_start:self.slot_end]
+            assert len(
+                self.initial_local_expert_ids) == self.expert_size_per_partition
+        else:
+            # Fallback: ceil/floor distribution across ranks.
+            # Ranks 0..remainder-1 each hold (base+1) experts; remaining ranks hold base.
+            _size, _start, _end = _compute_ep_partition(self.num_experts,
+                                                        self.ep_size,
+                                                        self.ep_rank)
+            self.expert_size_per_partition = _size
+            self.num_slots = self.num_experts
+            self.slot_start = _start
+            self.slot_end = _end
+            self.initial_local_expert_ids = self.initial_global_assignments[
+                self.slot_start:self.slot_end]
+            assert len(
+                self.initial_local_expert_ids) == self.expert_size_per_partition
 
         # Setup AllReduce for dynamic routing if needed
         if self._using_dynamic_load_balancer():

@@ -927,7 +927,7 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
     std::optional<torch::Tensor> rotary_cos_sin, std::optional<torch::Tensor> latent_cache,
     std::optional<torch::Tensor> q_pe, std::optional<torch::Tensor> block_ids_per_seq,
     std::optional<torch::Tensor> attention_sinks, bool const is_fused_qkv, bool const update_kv_cache,
-    int64_t const predicted_tokens_per_seq, int64_t const layer_idx, int64_t const num_heads,
+    int64_t const predicted_tokens_per_seq, int64_t const local_layer_idx, int64_t const num_heads,
     int64_t const num_kv_heads, int64_t const head_size, std::optional<int64_t> const tokens_per_block,
     int64_t const max_num_requests, int64_t const max_context_length, int64_t const attention_window_size,
     int64_t const beam_width, int64_t const mask_type, int64_t const quant_mode, double const q_scaling,
@@ -956,7 +956,7 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
     bool sage_attn_qk_int8, int64_t num_contexts, int64_t num_ctx_tokens,
     std::optional<int64_t> compressed_kv_cache_pool_ptr)
 {
-    TLLM_LOG_TRACE("Attention op starts at layer %d", layer_idx);
+    TLLM_LOG_TRACE("Attention op starts at layer %d", local_layer_idx);
     // Use these tensors to infer if the attention is using KV cache
     bool const use_kv_cache = kv_cache_block_offsets.has_value() && host_kv_cache_pool_pointers.has_value()
         && host_kv_cache_pool_mapping.has_value();
@@ -1044,7 +1044,7 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
     auto op = std::make_shared<AttentionOp>();
     op->mType = dtype;
     op->mFMHAForceFP32Acc = dtype == nvinfer1::DataType::kBF16;
-    op->mLayerIdx = layer_idx;
+    op->mLayerIdx = local_layer_idx;
     op->mNumHeads = num_heads;
     op->mNumKVHeads = num_kv_heads;
     op->mHeadSize = head_size;
@@ -1162,13 +1162,13 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
     static std::unordered_map<CacheKey, std::shared_ptr<AttentionOp>, hash<CacheKey>> op_cache;
     if (auto it = op_cache.find(cache_key); it != op_cache.end())
     {
-        TLLM_LOG_TRACE("Attention op for layer %d is cached", layer_idx);
+        TLLM_LOG_TRACE("Attention op for layer %d is cached", local_layer_idx);
         op = it->second;
     }
     else
     {
-        TLLM_LOG_TRACE(
-            "Preparing new attention op for layer %d with cache key: %s", layer_idx, to_string(cache_key).c_str());
+        TLLM_LOG_TRACE("Preparing new attention op for layer %d with cache key: %s", local_layer_idx,
+            to_string(cache_key).c_str());
         op->initialize();
         runner->prepare(*op);
         op_cache[cache_key] = op;
@@ -1257,7 +1257,7 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
             flash_mla_tile_scheduler_metadata, flash_mla_num_splits, compressed_kv_cache_pool_ptr);
     }
 
-    TLLM_LOG_TRACE("Attention op stops at layer %d", layer_idx);
+    TLLM_LOG_TRACE("Attention op stops at layer %d", local_layer_idx);
 }
 
 bool attention_supports_nvfp4_output(int64_t const num_heads, int64_t const num_kv_heads, int64_t const head_size,
