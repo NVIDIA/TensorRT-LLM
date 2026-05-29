@@ -70,11 +70,14 @@ git commit -s -m "[TRTLLM-12507][feat] add MoE LoRA layout and validation helper
 
 ## MR #1.2 — `[TRTLLM-12507][feat] add lora_layout.json sidecar for shared-outer MoE LoRA`
 
-**Source:** `6e9b10de96` cherry-picked verbatim, with the dev-note edit
-(40 lines in `docs/source/_dev_notes/moe-lora-preflight.md`) dropped if
-the file does not yet exist on `origin/main`. The dev-note bring-up is
-owned by MR #1.3 (which adds the file via `4407871ce4`), so the sidecar
-landing without those 40 lines is intentional.
+**Source:** `6e9b10de96` cherry-picked, with both doc edits dropped --
+the dev-note edit (40 lines in
+`docs/source/_dev_notes/moe-lora-preflight.md`, file does not yet
+exist on `origin/main`) and the user-facing `docs/source/features/lora.md`
+edit (the "lora_layout.json" subsection wraps the wider "Routed-Expert
+MoE LoRA" section that is added by `4407871ce4` in MR #1.3, so the
+subsection has no parent context on `origin/main`). Both doc edits are
+re-added in MR #1.3 alongside the feature itself.
 
 **Scope:**
 - `tensorrt_llm/lora_layout_sidecar.py` (new)
@@ -82,7 +85,6 @@ landing without those 40 lines is intentional.
 - `tensorrt_llm/_torch/pyexecutor/model_engine.py` (engine wiring)
 - `tests/unittest/_torch/lora/test_lora_layout_sidecar.py` (new)
 - `tests/unittest/others/test_lora_manager.py` (LoraManager sidecar tests)
-- `docs/source/features/lora.md` (~21-line user-facing doc addition)
 
 **Self-containment:** the sidecar lives at the package root
 (`tensorrt_llm/`), not in `_torch/peft/lora/`, so it does not import
@@ -104,8 +106,9 @@ from the MR #1.1 reviewer in practice.
 ```bash
 git checkout -b user/brb/moe-lora-sidecar origin/main
 git cherry-pick 6e9b10de96
-# If the dev-note edit conflicts (file doesn't exist on main):
-git restore --staged --worktree -- docs/source/_dev_notes/moe-lora-preflight.md
+# Conflicts: drop both doc edits (re-added in MR #1.3).
+git rm -f docs/source/_dev_notes/moe-lora-preflight.md
+git checkout origin/main -- docs/source/features/lora.md
 git -c core.editor=true cherry-pick --continue
 ```
 
@@ -146,11 +149,27 @@ git cherry-pick 8a9a3746e6
 git cherry-pick 3c9060e2dd   # may conflict on test_moe_lora_op.py; resolve manually
 ```
 
-Expected conflict at `git cherry-pick 3c9060e2dd`: small (~21 lines) edit
-to the `@pytest.mark.skip` reason on
-`test_moe_lora_slot_indexed_cuda_graph_replay_matches_eager`. Take
-`3c9060e2dd`'s wording — it is the post-investigation version that
-matches the new reference suite.
+Expected conflicts at `git cherry-pick 3c9060e2dd` are both in
+`tests/unittest/_torch/lora/test_moe_lora_op.py`:
+
+1. **`@pytest.mark.skip` reason** on
+   `test_moe_lora_slot_indexed_cuda_graph_replay_matches_eager`.
+   Counter-intuitively, **take HEAD's wording** (the `4407871ce4` short
+   reason about the Phase 6 kernel patch). The incoming `3c9060e2dd`
+   wording references a `moe_device_lora_env` fixture defined by the
+   device-path commits (`83a7e5210c`..`be86076e81`), which are not in
+   MR #1.3. Picking `3c9060e2dd`'s wording (with its function signature
+   `(moe_device_lora_env)`) would leave the test referencing an
+   undefined fixture.
+
+2. **Trailing block** that adds `test_moe_lora_device_path_matches_host_path`
+   plus the `_make_per_expert_lora_scaled` helper and the 10 reference /
+   bisection tests. Drop the device-path test in its entirety -- it
+   reads `TLLM_MOE_LORA_USE_DEVICE_PATH`, which is wired up by the
+   device-path commits, not MR #1.3. Keep everything from
+   `_LORA_REFERENCE_SCALE` onward. Tidy up the surrounding section
+   comment that originally referenced the dropped device-vs-host
+   comparison.
 
 ## What stays only on `user/brb/moe-multi-lora`
 
