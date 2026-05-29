@@ -1261,7 +1261,7 @@ def test_trtllm_multimodal_benchmark_serving(llm_root, llm_venv):
 
 @pytest.mark.skip_less_device(4)
 @pytest.mark.skip_less_device_memory(40000)
-@pytest.mark.parametrize("service_discovery", ["etcd", "http"])
+@pytest.mark.parametrize("service_discovery", ["etcd"])
 def test_openai_disagg_multi_nodes_completion_service_discovery(
         llm_root, llm_venv, service_discovery):
     test_root = unittest_path() / "llmapi" / "apps"

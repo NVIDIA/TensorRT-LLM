@@ -13,8 +13,8 @@ server_configs:
     extra_llm_api_config_path: "examples/auto_deploy/model_registry/configs/llama3_1_8b.yaml"
     world_size: 1
     client_configs:
-      - name: "con64_iter10_1k1k"
-        concurrency: 64
+      - name: "con256_iter10_1k1k"
+        concurrency: 256
         iterations: 10
         isl: 1024
         osl: 1024
