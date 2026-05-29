@@ -649,6 +649,8 @@ class ChatCompletionPostprocArgs(PostprocArgs):
     stream_options: Optional[StreamOptions] = None
     chat_template_kwargs: Optional[dict[str, Any]] = None
     ctx_usage: Optional[UsageInfo] = None
+    stream_response_id: Optional[str] = None
+    stream_created: Optional[int] = None
 
     @classmethod
     def from_request(cls, request: ChatCompletionRequest):
@@ -695,6 +697,8 @@ def chat_harmony_streaming_post_processor(
     if ctx_prompt_tokens is not None:
         prompt_tokens = ctx_prompt_tokens
         cached_tokens = ctx_cached_tokens
+    stream_response_id, stream_created = _ensure_stream_metadata(
+        args, rsp, "chatcmpl")
     response = handle_streaming_response(
         tools=args.tools,
         tool_choice=args.tool_choice,
@@ -706,6 +710,8 @@ def chat_harmony_streaming_post_processor(
         first_iteration=args.first_iteration,
         stream_options=args.stream_options,
         cached_tokens=cached_tokens,
+        stream_response_id=stream_response_id,
+        stream_created=stream_created,
     )
     args.first_iteration = False
     return response

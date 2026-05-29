@@ -51,6 +51,8 @@ from tensorrt_llm.models.automodel import AutoConfig, AutoModelForCausalLM
 from tensorrt_llm.models.modeling_utils import SpeculativeDecodingMode
 from tensorrt_llm.sampling_params import (BatchedLogitsProcessor,
                                           LogitsProcessor, SamplingParams)
+from tensorrt_llm.serve.openai_protocol import CompletionRequest
+from tensorrt_llm.serve.openai_server import OpenAIServer
 from tensorrt_llm.serve.postprocess_handlers import (ChatPostprocArgs,
                                                      chat_stream_post_processor)
 
@@ -2578,6 +2580,19 @@ def test_llm_with_postprocess_parallel():
     run_llm_with_postprocess_parallel(tp_size=1)
 
 
+def _stream_payloads_from_chunks(chunks):
+    payloads = []
+    for chunk in chunks:
+        if isinstance(chunk, bytes):
+            chunk = chunk.decode()
+        for line in chunk.splitlines():
+            if line.startswith("data: "):
+                data = line[len("data: "):].strip()
+                if data != "[DONE]":
+                    payloads.append(json.loads(data))
+    return payloads
+
+
 def test_chat_stream_post_processor_reuses_stream_metadata() -> None:
     result = GenerationResultBase(123, SamplingParams())
     output = result._outputs[0]
@@ -2593,16 +2608,141 @@ def test_chat_stream_post_processor_reuses_stream_metadata() -> None:
     output.token_ids.append(2)
     chunks += chat_stream_post_processor(result, args)
 
-    payloads = []
-    for chunk in chunks:
-        for line in chunk.splitlines():
-            if line.startswith("data: "):
-                payloads.append(json.loads(line[len("data: "):].strip()))
+    payloads = _stream_payloads_from_chunks(chunks)
 
     assert {payload["id"] for payload in payloads} == {"chatcmpl-123"}
     assert len({payload["created"] for payload in payloads}) == 1
     assert payloads[0]["choices"][0]["delta"]["role"] == "assistant"
     assert payloads[-1]["choices"][0]["delta"]["content"] == "y"
+
+
+class _FakeCompletionGeneratorArgs:
+    backend = "pytorch"
+    gather_generation_logits = False
+    num_postprocess_workers = 0
+    return_perf_metrics = False
+
+
+class _FakeModelConfig:
+    vocab_size = 32000
+
+
+class _FakeCompletionStreamResult(GenerationResultBase):
+
+    @property
+    def finished(self):
+        return self._done
+
+    @property
+    def request_id(self):
+        return self.id
+
+
+class _FakeCompletionPromise:
+
+    def __init__(self, result, prompt_token_ids):
+        self._result = result
+        self._yielded = False
+        self.prompt_token_ids = prompt_token_ids
+        self.aborted = False
+
+    @property
+    def finished(self):
+        return True
+
+    @property
+    def request_id(self):
+        return self._result.id
+
+    def abort(self):
+        self.aborted = True
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        if self._yielded:
+            raise StopAsyncIteration
+        self._yielded = True
+        return self._result
+
+
+class _FakeCompletionGenerator:
+
+    def __init__(self):
+        self.args = _FakeCompletionGeneratorArgs()
+        self.postproc_args = []
+
+    def input_processor(self, prompt, _sampling_params):
+        token_id = ord(prompt["prompt"])
+        return [token_id], {}
+
+    def generate_async(self, inputs, sampling_params, _postproc_params,
+                       streaming, **_kwargs):
+        assert streaming
+        result_id = 100 + len(self.postproc_args)
+        result = _FakeCompletionStreamResult(result_id, sampling_params)
+        result._done = True
+
+        output = result._outputs[0]
+        output.text = f"text-{result_id}"
+        output.token_ids = [result_id]
+        output.finish_reason = "stop"
+
+        self.postproc_args.append(_postproc_params.postproc_args)
+        return _FakeCompletionPromise(result, inputs["prompt_token_ids"])
+
+
+class _FakeRawRequestState:
+    pass
+
+
+class _FakeRawRequest:
+
+    def __init__(self):
+        self.headers = {}
+        self.state = _FakeRawRequestState()
+        self.client = "test-client"
+
+    async def is_disconnected(self):
+        return True
+
+
+def test_openai_completion_list_prompt_stream_reuses_stream_metadata() -> None:
+
+    async def run_request():
+        generator = _FakeCompletionGenerator()
+        server = object.__new__(OpenAIServer)
+        server.generator = generator
+        server.model = "test-model"
+        server.model_config = _FakeModelConfig()
+        server.tokenizer = None
+        server.metrics_collector = None
+        server.perf_metrics = None
+
+        request = CompletionRequest(model="test-model",
+                                    prompt=["A", "B"],
+                                    stream=True)
+        response = await server.openai_completion(request, _FakeRawRequest())
+        chunks = [chunk async for chunk in response.body_iterator]
+        return generator, _stream_payloads_from_chunks(chunks)
+
+    generator, payloads = asyncio.run(run_request())
+
+    ids = {payload["id"] for payload in payloads}
+    created = {payload["created"] for payload in payloads}
+    choice_indexes = {
+        payload["choices"][0]["index"]
+        for payload in payloads if payload["choices"]
+    }
+
+    assert len(payloads) == 2
+    assert len(ids) == 1
+    assert ids.isdisjoint({"cmpl-100", "cmpl-101"})
+    assert len(created) == 1
+    assert choice_indexes == {0, 1}
+    assert {args.stream_response_id for args in generator.postproc_args} == ids
+    assert {args.stream_created for args in generator.postproc_args} == created
 
 
 def run_llm_with_postprocess_parallel_and_result_handler(
