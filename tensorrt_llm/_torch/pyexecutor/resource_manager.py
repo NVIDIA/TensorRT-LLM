@@ -2508,38 +2508,38 @@ class KVCacheManagerV2(BaseResourceManager):
             if kv_cache is None:
                 # Last token cannot be recovered, so we don't include it in
                 # the input tokens to look up for the block that can be reused.
-                if self.enable_block_reuse:
-                    all_tokens = req.get_tokens(DEFAULT_BEAM_INDEX)
-                    lookup_end = len(all_tokens) - 1
-                    if (req.is_generation_only_request()
-                            and req.sampling_config.beam_width > 1):
-                        lookup_end = (lookup_end //
-                                      self.tokens_per_block) * self.tokens_per_block
-                    tokens = self._augment_tokens_for_block_reuse(
-                        all_tokens, req, end=lookup_end)
-                else:
-                    tokens = None
+                # if self.enable_block_reuse:
+                #     all_tokens = req.get_tokens(DEFAULT_BEAM_INDEX)
+                #     lookup_end = len(all_tokens) - 1
+                #     if (req.is_generation_only_request()
+                #             and req.sampling_config.beam_width > 1):
+                #         lookup_end = (lookup_end //
+                #                       self.tokens_per_block) * self.tokens_per_block
+                #     tokens = self._augment_tokens_for_block_reuse(
+                #         all_tokens, req, end=lookup_end)
+                # else:
+                tokens = None
                 kv_cache = self._create_kv_cache(req.py_request_id,
                                                  req.lora_task_id, tokens)
                 kv_cache.cuda_stream = self._stream.cuda_stream
 
-            if not self.enable_block_reuse:
-                kv_cache.stop_committing()
-            else:
-                req.context_current_position = kv_cache.num_committed_tokens
-                req.set_prepopulated_prompt_len(kv_cache.num_committed_tokens,
-                                                self.tokens_per_block)
-                logger.info(
-                    "KVCacheManagerV2.prepare_context reuse state: "
-                    f"request_id={req.py_request_id} "
-                    f"is_generation_only={req.is_generation_only_request()} "
-                    f"prompt_len={req.prompt_len} "
-                    f"context_current_position={req.context_current_position} "
-                    f"prepopulated_prompt_len={req.prepopulated_prompt_len} "
-                    f"num_committed_tokens={kv_cache.num_committed_tokens} "
-                    f"tokens_per_block={self.tokens_per_block} "
-                    f"beam_width={req.sampling_config.beam_width}"
-                )
+            # if not self.enable_block_reuse:
+            kv_cache.stop_committing()
+            # else:
+            #     req.context_current_position = kv_cache.num_committed_tokens
+            #     req.set_prepopulated_prompt_len(kv_cache.num_committed_tokens,
+            #                                     self.tokens_per_block)
+            #     logger.info(
+            #         "KVCacheManagerV2.prepare_context reuse state: "
+            #         f"request_id={req.py_request_id} "
+            #         f"is_generation_only={req.is_generation_only_request()} "
+            #         f"prompt_len={req.prompt_len} "
+            #         f"context_current_position={req.context_current_position} "
+            #         f"prepopulated_prompt_len={req.prepopulated_prompt_len} "
+            #         f"num_committed_tokens={kv_cache.num_committed_tokens} "
+            #         f"tokens_per_block={self.tokens_per_block} "
+            #         f"beam_width={req.sampling_config.beam_width}"
+            #     )
 
             return self._resume_and_restore(req.py_request_id, kv_cache)
         else:

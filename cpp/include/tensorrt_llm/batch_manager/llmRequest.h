@@ -1102,6 +1102,9 @@ public:
 
     void setPrepopulatedPromptLen(SizeType32 prepopulatedPromptLen, SizeType32 kvTokensPerBlock)
     {
+        // ATHENA4
+        prepopulatedPromptLen = 0;
+
         // Add debug log for prepopulatedPromptLen
         TLLM_LOG_DEBUG("Setting pre-populated prompt length for request %lu to %i (promptLen=%i).", mRequestId,
             prepopulatedPromptLen, getPromptLen());

@@ -221,9 +221,10 @@ class AsyncTransferManager:
 
             request.state = LlmRequestState.DISAGG_CONTEXT_TRANS_IN_PROGRESS
 
+            # ATHENA2
             if self.should_store_blocks:
                 block_id = self.kv_cache_manager.store_blocks_for_reuse(
-                    request, True)
+                    request, False)
             else:
                 block_id = None
 
@@ -255,9 +256,10 @@ class AsyncTransferManager:
             self._requests_in_transfer.pop(request.py_request_id)
             self._request_transfer_metadata.pop(request.py_request_id)
 
-            if self.should_store_blocks:
-                self.kv_cache_manager.unpin_blocks_by_id(
-                    transfer_metadata.block_id)
+            # ATHENA3
+            # if self.should_store_blocks:
+            #     self.kv_cache_manager.unpin_blocks_by_id(
+            #         transfer_metadata.block_id)
 
             # We don't want to overwrite any error state.
             if request.state != LlmRequestState.DISAGG_TRANS_ERROR:
@@ -424,10 +426,10 @@ class PyExecutor:
         # loop avoids the mismatch.
         self._pending_transfer_responses: List[Tuple[int, LlmResponse]] = []
 
+        # ATHENA1
         self.async_transfer_manager = AsyncTransferManager(
             self.resource_manager,
-            should_store_blocks=self.enable_partial_reuse_for_disagg
-            and not self.kv_cache_manager.is_vswa and self.dist.pp_size == 1)
+            should_store_blocks=True)
 
         # Router is built after async_transfer_manager so KVCacheAwareADPRouter
         # can receive the transfer-manager reference at construction time.
@@ -679,12 +681,7 @@ class PyExecutor:
                 self._terminate_request(request)
             return
         if self.async_transfer_manager.end_transfer(request):
-            # When should_store_blocks is True, _handle_responses already
-            # terminated this request via the early-termination path
-            # (enable_partial_reuse_for_disagg branch). Skip the redundant
-            # termination to avoid double free_resources calls.
-            if not self.async_transfer_manager.should_store_blocks:
-                self._terminate_request(request)
+            self._terminate_request(request)
 
     def _flush_pending_transfer_responses(self):
         """Enqueue buffered transfer-completion responses.
@@ -4442,16 +4439,16 @@ class PyExecutor:
                                 )
 
                 # TODO: Remove PP size == 1 gate for disagg + block reuse with PP > 1.
-                force_terminate_for_partial_reuse = (
-                    self.enable_partial_reuse_for_disagg
-                    and not self.kv_cache_manager.is_vswa
-                    and self.dist.pp_size == 1)
+                # force_terminate_for_partial_reuse = (
+                #     self.enable_partial_reuse_for_disagg
+                #     and not self.kv_cache_manager.is_vswa
+                #     and self.dist.pp_size == 1)
                 if request.is_disagg_context_complete_state:
                     # Already terminated by _check_disagg_ctx_cache_transfer_status;
                     # track for stats only to avoid double-free (nvbug/5961736).
                     requests_finished_by_transfer.append(request)
-                elif force_terminate_for_partial_reuse:
-                    requests_to_terminate.append(request)
+                # elif force_terminate_for_partial_reuse:
+                #     requests_to_terminate.append(request)
                 elif not request.is_disagg_context_transmission_state:
                     requests_to_terminate.append(request)
             else:

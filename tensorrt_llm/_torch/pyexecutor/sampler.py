@@ -3283,20 +3283,10 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             f"Beam_history.tokens.shape[0] should equal beam width: \
                 {beam_history.tokens.shape[0]} != {beam_width}"
         )
-        request_tokens_before = [
-            {
-                "beam": beam_idx,
-                "num_tokens": len(tokens),
-                "tail": tokens[-16:],
-            }
-            for beam_idx in range(beam_width)
-            for tokens in [list(request.get_tokens(beam_idx))]
-        ]
         logger.info(
             "TorchSampler._finalize_beam before correction: "
             f"request_id={request.py_request_id} "
             f"seq_slot={request.py_seq_slot} "
-            f"request_tokens={request_tokens_before} "
             f"beam_history_tokens="
             f"{_debug_beam_history_tensor(beam_history.tokens)}")
         if request.py_return_log_probs:
@@ -3343,9 +3333,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         logger.info(
             "TorchSampler._finalize_beam after correction: "
             f"request_id={request.py_request_id} "
-            f"seq_slot={request.py_seq_slot} "
-            f"gen_token_list={gen_token_list} "
-            f"request_tokens={request_tokens_after}")
+            f"seq_slot={request.py_seq_slot} ")
         if request.py_return_log_probs:
             # cum_log_probs will not change when padding with end tokens.
             # Therefore, we do not need to correct it
@@ -3511,8 +3499,6 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                     f"py_decoding_iter={req.py_decoding_iter} "
                     f"new_tokens_for_slot="
                     f"{new_tokens_list[0][req.py_seq_slot] if req.py_seq_slot is not None else None} "
-                    f"tokens_before="
-                    f"{[list(req.get_tokens(beam_idx)) for beam_idx in range(req.sampling_config.beam_width)]}"
                 )
                 if (beam_history := _maybe_build_beam_history(req_idx)) is not None:
                     logger.info(
@@ -3547,8 +3533,6 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                     "TorchSampler.update_requests beam after append: "
                     f"request_id={req.py_request_id} "
                     f"py_decoding_iter={req.py_decoding_iter} "
-                    f"tokens_after="
-                    f"{[list(req.get_tokens(beam_idx)) for beam_idx in range(req.sampling_config.beam_width)]} "
                     f"first_finish_reasons={first_finish_reasons[req.py_seq_slot] if req.py_seq_slot is not None else None}"
                 )
                 req.py_num_accepted_draft_tokens = 0

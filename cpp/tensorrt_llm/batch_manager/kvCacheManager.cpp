@@ -1742,6 +1742,7 @@ WindowBlockManager::ClaimResult WindowBlockManager::claimMatchingBlocks(Generati
     return result;
 }
 
+// ATHENA2
 SizeType32 WindowBlockManager::onboardAndAllocateBlocks(
     GenerationRequest& sequence, LlmRequest& llmRequest, ClaimResult& claimResult, bool isEnableBlockReuse)
 {
@@ -2004,6 +2005,7 @@ std::vector<WindowBlockManager::BatchSeqStats> WindowBlockManager::addSequenceBa
     // Hold the lock for the entire two-phase operation.
     std::lock_guard<std::recursive_mutex> lock(mLookupTree->getMutex());
 
+    // ATHENA1
     if (isEnableBlockReuse)
     {
         // Phase 1: Claim all matching blocks across all requests.
@@ -2030,6 +2032,14 @@ std::vector<WindowBlockManager::BatchSeqStats> WindowBlockManager::addSequenceBa
     // Phase 2: Onboard + allocate for each request, snapshotting stats between requests.
     for (size_t i = 0; i < n; ++i)
     {
+        TLLM_LOG_DEBUG("request id %lu claimResults[i].claimedBlocks.size() = %d", sequences[i]->getRequestId(), claimResults[i].claimedBlocks.size());
+        TLLM_LOG_DEBUG("request id %lu claimResults[i].totalMatchedTokens = %d", sequences[i]->getRequestId(), claimResults[i].totalMatchedTokens);
+        TLLM_LOG_DEBUG("request id %lu claimResults[i].latestMatchingNonPlaceholderBlockIdx = %d", sequences[i]->getRequestId(), claimResults[i].latestMatchingNonPlaceholderBlockIdx);
+        TLLM_LOG_DEBUG("request id %lu claimResults[i].numSharedContextBlocks = %d", sequences[i]->getRequestId(), claimResults[i].numSharedContextBlocks);
+        TLLM_LOG_DEBUG("request id %lu claimResults[i].numContextBlocks = %d", sequences[i]->getRequestId(), claimResults[i].numContextBlocks);
+        TLLM_LOG_DEBUG("request id %lu claimResults[i].shareLastContextBlockAmongBeams = %d", sequences[i]->getRequestId(), claimResults[i].shareLastContextBlockAmongBeams);
+        TLLM_LOG_DEBUG("request id %lu claimResults[i].blockKeys.size() = %d", sequences[i]->getRequestId(), claimResults[i].blockKeys.size());
+
         SizeType32 const preTotalBlocks = mAllocTotalBlocks;
         SizeType32 const preNewBlocks = mAllocNewBlocks;
         SizeType32 const preReused = mReusedBlocks;
