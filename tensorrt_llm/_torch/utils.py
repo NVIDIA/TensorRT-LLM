@@ -4,13 +4,14 @@ import os
 import threading
 from dataclasses import dataclass
 from enum import Enum, IntEnum
+from functools import lru_cache
 from typing import Dict, List
 
 import torch
 from torch.nn import functional as F
 
-from tensorrt_llm._utils import (TensorWrapper, convert_to_torch_tensor, get_sm_version,
-                                 torch_dtype_to_str)
+from tensorrt_llm._utils import (TensorWrapper, convert_to_torch_tensor,
+                                 get_sm_version, torch_dtype_to_str)
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.math_utils import ceil_div, pad_up
 from tensorrt_llm.quantization.utils import fp4_utils
@@ -104,11 +105,13 @@ def get_model_extra_attrs():
     return getattr(_model_extra_attrs, 'attrs', None)
 
 
+@lru_cache(maxsize=1)
 def is_nvfp4_marlin_enabled() -> bool:
     is_hopper = get_sm_version() == 90
     has_marlin_kernel = hasattr(torch.ops.trtllm, "marlin_nvfp4_gemm")
     attrs = get_model_extra_attrs()
-    is_marlin_specified = attrs is not None and "marlin" in attrs.get('nvfp4_gemm_allowed_backends', [])
+    is_marlin_specified = attrs is not None and "marlin" in attrs.get(
+        'nvfp4_gemm_allowed_backends', [])
     return is_hopper and has_marlin_kernel and is_marlin_specified
 
 

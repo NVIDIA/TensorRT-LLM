@@ -15,7 +15,7 @@
  * limitations under the License.
  */
 
-#include "marlin_nvfp4_dispatch_utils.h"
+#include "marlin_nvfp4.h"
 
 namespace marlin_nvfp4_dispatch
 {

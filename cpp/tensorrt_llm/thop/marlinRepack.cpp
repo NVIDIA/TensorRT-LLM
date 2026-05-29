@@ -15,7 +15,7 @@
  * limitations under the License.
  */
 
-#include "tensorrt_llm/kernels/marlin/marlin_repack.h"
+#include "tensorrt_llm/kernels/marlin/marlin_nvfp4.h"
 #include "tensorrt_llm/thop/thUtils.h"
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>

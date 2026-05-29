@@ -22,9 +22,8 @@
 #define MARLIN_NAMESPACE_NAME marlin
 #endif
 
-#include "marlin_nvfp4_dispatch_utils.h"
-#include "marlin_nvfp4_gemm.h"
-#include "marlin_nvfp4_kernel.h"
+#define MARLIN_DECLARE_SINGLE_EXPERT_KERNEL
+#include "marlin_nvfp4.h"
 #include "marlin_nvfp4_template.h"
 
 #include <algorithm>
@@ -153,9 +152,7 @@ void marlin_mm_nvfp4(void const* A, void const* B, void* C, void* C_tmp, void co
 
     while (rest_m)
     {
-        int par_count = rest_m / (max_thread_m_blocks * 16);
-        if (par_count > max_par_val)
-            par_count = max_par_val;
+        int par_count = std::min(rest_m / (max_thread_m_blocks * 16), max_par_val);
         int prob_m_split = par_count > 0 ? (par_count * (max_thread_m_blocks * 16)) : rest_m;
 
         int thread_m_blocks = std::min(div_ceil(prob_m_split, 16), max_thread_m_blocks);

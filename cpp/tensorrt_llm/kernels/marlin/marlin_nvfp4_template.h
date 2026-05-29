@@ -40,10 +40,7 @@
 #define MARLIN_NAMESPACE_NAME marlin
 #endif
 
-#include "dequant.h"
 #include "marlin.cuh"
-#include "marlin_dtypes.cuh"
-#include "marlin_mma.h"
 
 #define STATIC_ASSERT_SCALAR_TYPE_VALID(scalar_t)                                                                      \
     static_assert(std::is_same<scalar_t, half>::value || std::is_same<scalar_t, nv_bfloat16>::value,                   \
