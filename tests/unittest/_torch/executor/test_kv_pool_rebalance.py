@@ -32,6 +32,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
+from tensorrt_llm.runtime.kv_cache_manager_v2._exceptions import OutOfPagesError
 
 # --------------------------------------------------------------------------- #
 # Helpers
@@ -178,11 +179,15 @@ class TestMaybeRebalanceKvPools:
         exe.kv_cache_manager.suspend_request.assert_called_once_with(active)
         exe.kv_cache_manager.resume_request.assert_called_once_with(active)
 
-    def test_adjust_failure_does_not_skip_resume(self, monkeypatch, caplog):
+    def test_expected_adjust_failure_does_not_skip_resume(self, monkeypatch, caplog):
+        """OutOfPagesError from adjust() is the one expected runtime failure.
+
+        It must be swallowed so paused requests are still resumed.
+        """
         reqs = [_make_request(1)]
         exe = _make_executor(active_requests=reqs)
         exe._consume_previous_batch_for_rebalance = MagicMock()
-        exe.kv_cache_manager.impl.adjust.side_effect = RuntimeError("boom")
+        exe.kv_cache_manager.impl.adjust.side_effect = OutOfPagesError("boom")
         monkeypatch.setattr("torch.cuda.current_stream", MagicMock())
 
         # Should not raise.
@@ -190,6 +195,20 @@ class TestMaybeRebalanceKvPools:
 
         exe.kv_cache_manager.suspend_request.assert_called_once()
         exe.kv_cache_manager.resume_request.assert_called_once()
+
+    def test_unexpected_adjust_failure_propagates(self, monkeypatch):
+        """Any non-OutOfPagesError (programmer bug) must propagate.
+
+        Such errors fail fast rather than being downgraded to a warning.
+        """
+        reqs = [_make_request(1)]
+        exe = _make_executor(active_requests=reqs)
+        exe._consume_previous_batch_for_rebalance = MagicMock()
+        exe.kv_cache_manager.impl.adjust.side_effect = RuntimeError("boom")
+        monkeypatch.setattr("torch.cuda.current_stream", MagicMock())
+
+        with pytest.raises(RuntimeError, match="boom"):
+            PyExecutor._maybe_rebalance_kv_pools(exe)
 
 
 # --------------------------------------------------------------------------- #
