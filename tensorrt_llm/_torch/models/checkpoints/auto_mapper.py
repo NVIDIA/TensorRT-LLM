@@ -11,10 +11,10 @@ class AutoCheckpointMapper():
             try:
                 return MODEL_CLASS_MAPPER_MAPPING[f'{name}_{format}']()
             except KeyError:  # no mapper for this model architecture, resort to default
-                if format == "MX":
-                    # MX uses HF on-disk checkpoint format for fallback, so
-                    # an architecture-specific HF mapper is closer than the
-                    # generic MX/HF default mapper.
+                if format == "modelexpress":
+                    # ModelExpress uses HF on-disk checkpoint format for
+                    # fallback, so an architecture-specific HF mapper is closer
+                    # than the generic ModelExpress/HF default mapper.
                     try:
                         return MODEL_CLASS_MAPPER_MAPPING[f'{name}_HF']()
                     except KeyError:

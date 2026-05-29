@@ -205,9 +205,9 @@ def _construct_checkpoint_loader(
             checkpoint_format)()
         config_loader = get_config_loader(checkpoint_format)()
 
-        # Pass extra kwargs for format-specific loaders (e.g. MX).
+        # Pass extra kwargs for format-specific loaders (e.g. ModelExpress).
         extra_kwargs: dict = {}
-        if checkpoint_format == "MX":
+        if checkpoint_format == "modelexpress":
             if mx_config is not None:
                 extra_kwargs["mx_server_url"] = mx_config.server_url
                 extra_kwargs[
@@ -419,10 +419,10 @@ class ModelLoader:
             )
             weights_preloaded = False
             if load_format == LoadFormat.AUTO:
-                # Pass model= so format-specific loaders (e.g. MX) can
+                # Pass model= so format-specific loaders (e.g. ModelExpress) can
                 # write weights directly into parameter buffers via P2P.
                 # Generic loaders ignore model=; loaders that can consume a
-                # live module reference (MX) use it for direct writes.
+                # live module reference use it for direct writes.
                 load_weights_kwargs: dict = {
                     "mapping": self.mapping,
                     "model": model,
@@ -435,7 +435,7 @@ class ModelLoader:
                     weights = checkpoint_loader.load_weights(
                         checkpoint_dir, **load_weights_kwargs)
 
-                # When MX P2P succeeds, weights are already in model params.
+                # When ModelExpress P2P succeeds, weights are already in model params.
                 # A non-empty dict contains size-mismatched tensors that
                 # should be merged via the standard disk pipeline.
                 weights_preloaded = checkpoint_loader.is_weights_preloaded()
@@ -482,10 +482,6 @@ class ModelLoader:
 
             checkpoint_loader.post_load_apply(
                 model, weights_preloaded=weights_preloaded)
-            checkpoint_loader.post_load_publish(
-                model,
-                checkpoint_dir=checkpoint_dir,
-                weights_preloaded=weights_preloaded)
 
             for module in model.modules():
                 if hasattr(module, 'post_load_weights') and not getattr(
@@ -499,6 +495,10 @@ class ModelLoader:
                 logger.info("moe_load_balancer finalize model done")
 
             torch.cuda.current_stream().synchronize()
+            checkpoint_loader.post_load_publish(
+                model,
+                checkpoint_dir=checkpoint_dir,
+                weights_preloaded=weights_preloaded)
 
         return model, moe_load_balancer
 

@@ -3665,12 +3665,12 @@ class LoadFormat(Enum):
 
 
 class ModelExpressConfig(StrictBaseModel):
-    """Prototype configuration for ModelExpress (MX) weight transfer."""
+    """Prototype configuration for ModelExpress weight transfer."""
 
     server_url: Optional[str] = Field(
         default=None,
-        description="URL of the MX (ModelExpress) server for P2P weight "
-        "transfer. When set together with checkpoint_format='MX', enables "
+        description="URL of the ModelExpress server for P2P weight "
+        "transfer. When set together with checkpoint_format='modelexpress', enables "
         "GPU-to-GPU weight transfer from a running source instance, bypassing "
         "disk I/O. When the server is unreachable, loading falls back to the "
         "standard HuggingFace checkpoint path.",
@@ -3679,18 +3679,18 @@ class ModelExpressConfig(StrictBaseModel):
 
     server_query_timeout_s: Optional[NonNegativeInt] = Field(
         default=None,
-        description="Timeout in seconds for upstream MxLiveWeightLoader source "
-        "discovery. When unset, TRT-LLM first probes for existing sources: "
-        "no source uses a short 30-second fallback cap, while an existing "
-        "source uses modelexpress's default wait for long donor loads.",
+        description="Timeout in seconds for ModelExpress TRT-LLM source "
+        "discovery before falling back to standard checkpoint loading. "
+        "TRT-LLM passes this value through; ModelExpress owns the probe and "
+        "fallback behavior.",
         status="prototype",
     )
 
     preshard_strategy: str = Field(
         default="per_module",
-        description="How to inform TRT-LLM that MX-delivered weights are already "
+        description="How to inform TRT-LLM that ModelExpress-delivered weights are already "
         "TP-sharded for the local rank. Only 'per_module' is supported in "
-        "this MX-only PR; 'global' requires LoadFormat.PRESHARDED.",
+        "this ModelExpress-only PR; 'global' requires LoadFormat.PRESHARDED.",
         status="prototype",
     )
 
@@ -3956,7 +3956,7 @@ class TorchLlmArgs(BaseLlmArgs):
 
     mx_config: ModelExpressConfig = Field(
         default_factory=ModelExpressConfig,
-        description="ModelExpress (MX) P2P checkpoint loading config.",
+        description="ModelExpress P2P checkpoint loading config.",
         status="prototype",
     )
 
@@ -4264,12 +4264,13 @@ class TorchLlmArgs(BaseLlmArgs):
 
     @model_validator(mode="after")
     def validate_mx_config(self) -> 'TorchLlmArgs':
-        # When MX is the active checkpoint format and the user did not
+        # When ModelExpress is the active checkpoint format and the user did not
         # explicitly set ``mx_config.server_url``, honor the ``MODEL_EXPRESS_URL``
         # env var that the upstream ``modelexpress`` library reads. This
-        # lets orchestrators configure MX via the environment while keeping
+        # lets orchestrators configure ModelExpress via the environment while keeping
         # the resolved value visible on ``llm_args.mx_config.server_url``.
-        if self.checkpoint_format == "MX" and self.mx_config.server_url is None:
+        if (self.checkpoint_format == "modelexpress"
+                and self.mx_config.server_url is None):
             env_url = os.environ.get("MODEL_EXPRESS_URL")
             if env_url:
                 logger.info(
@@ -4277,11 +4278,12 @@ class TorchLlmArgs(BaseLlmArgs):
                     "from environment.", env_url)
                 self.mx_config.server_url = env_url
 
-        if self.mx_config.server_url is not None and self.checkpoint_format != "MX":
+        if (self.mx_config.server_url is not None
+                and self.checkpoint_format != "modelexpress"):
             logger.warning(
                 "mx_config.server_url is set but checkpoint_format is '%s', not "
-                "'MX'. The MX config will be ignored. Set "
-                "checkpoint_format='MX' to enable MX P2P weight transfer.",
+                "'modelexpress'. The ModelExpress config will be ignored. Set "
+                "checkpoint_format='modelexpress' to enable P2P weight transfer.",
                 self.checkpoint_format)
         return self
 

@@ -7,7 +7,7 @@ from tensorrt_llm._torch.models.checkpoints.base_config_loader import \
 from tensorrt_llm._torch.models.modeling_utils import register_config_loader
 
 
-@register_config_loader("MX")
+@register_config_loader("modelexpress")
 @register_config_loader("HF")
 class HfConfigLoader(BaseConfigLoader):
 
