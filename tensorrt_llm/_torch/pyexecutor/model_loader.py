@@ -744,6 +744,16 @@ class ModelLoader:
                 logger.info("moe_load_balancer finalize model done")
 
             torch.cuda.current_stream().synchronize()
+            # Reclaim segments freed during per-module post_load_weights (e.g.
+            # MegaMoE _transform_main_weights releases ~5-6 GiB of redundant
+            # weight Parameters via `.data = empty(0)` that PyTorch's caching
+            # allocator otherwise holds onto). Returning them to the driver
+            # gives downstream stages (KV cache estimation, attention workspace
+            # alloc, autotuner warmup symmetric-fabric setup) full visibility
+            # of free HBM. Single one-shot call after all modules are
+            # finalized; per-layer empty_cache here is unsafe because it can
+            # perturb NVLink barrier synchronization in multi-rank DG init.
+            torch.cuda.empty_cache()
 
         return model, moe_load_balancer
 
