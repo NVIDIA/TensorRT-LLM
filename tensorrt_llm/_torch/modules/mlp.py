@@ -101,7 +101,11 @@ class MLP(nn.Module):
         has_nvfp4 = hasattr(self.down_proj,
                             'has_nvfp4') and self.down_proj.has_nvfp4
         has_kernel = hasattr(torch.ops.trtllm, 'fused_relu2_quantize')
-        has_scale = hasattr(self.down_proj, 'input_scale')
+        # NVFP4LinearMethod.create_weights always allocates input_scale as a
+        # Parameter (linear.py:1295), but a layer that opts into dynamic quant
+        # at load time will reset it to None (linear.py:821). The fused kernel
+        # needs a real scalar tensor, so guard against the None case explicitly.
+        has_scale = getattr(self.down_proj, 'input_scale', None) is not None
         is_relu2 = self.activation is relu2
 
         self._use_fused_relu2_quant = has_nvfp4 and has_kernel and has_scale and is_relu2
@@ -112,8 +116,8 @@ class MLP(nn.Module):
         # `module.alpha` is never calibrated, so we gate on
         # `not force_dynamic_quantization` to ensure the GEMM sees a valid
         # calibrated alpha. NVFP4 layers do not set `has_static_input_scale`
-        # (that flag is FP8-only), so the dynamic-quant flag is the canonical
-        # signal here.
+        # (that flag is FP8-only), so `force_dynamic_quantization` plus the
+        # `input_scale is not None` check above are the canonical signals.
         has_kernel_gelu = hasattr(torch.ops.trtllm, 'fused_gelu_tanh_quantize')
         is_gelu_tanh = self.activation is gelu_tanh
         not_dynamic = not getattr(self.down_proj,
