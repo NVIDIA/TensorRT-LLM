@@ -1,6 +1,7 @@
 @Library(['bloom-jenkins-shared-lib@main', 'trtllm-jenkins-shared-lib@main']) _
 
 import java.lang.InterruptedException
+import java.nio.charset.StandardCharsets
 import groovy.transform.Field
 import groovy.json.JsonOutput
 import com.nvidia.bloom.KubernetesManager
@@ -1168,8 +1169,8 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                 }
 
                 def exemptionComment = ""
-                if (cluster.host.contains("oci-nrt") || cluster.host.contains("oci-hsg") || cluster.host.contains("lbd-lax")) {
-                    exemptionComment = """--comment='{"OccupiedIdleGPUsJobReaper":{"exemptIdleTimeMins":"90","reason":"other","description":"Long data and model loading time and disaggregated serving tests"}}'"""
+                if (SlurmConfig.needsIdleGpuExemption(cluster)) {
+                    exemptionComment = "--comment='${SlurmConfig.IDLE_GPU_EXEMPTION_PAYLOAD}'"
                 }
 
                 def envExportStatements = envVarsToExport.collect { varName, varValue ->
@@ -2456,16 +2457,29 @@ def renderTestDB(pipeline, testContext, llmSrc, stageName, preDefinedMakoOpts=nu
 
     sh "pip3 install --extra-index-url https://urm.nvidia.com/artifactory/api/pypi/sw-tensorrt-pypi/simple --ignore-installed trt-test-db==1.8.5+bc6df7"
     // CBTS Layer 3: regenerate cbts_test_db/ on this stage agent from the
-    // piggybacked input JSON if not already present.
+    // piggybacked input JSON if not already present. The piggyback payload is
+    // base64-encoded on the orchestrator (see getCbtsResult in
+    // L0_MergeRequest.groovy) to keep tokenmacro from interpreting ${...} or
+    // {...} fragments inside the PR diff when globalVars is serialized. If
+    // decoding or regeneration throws (truncated/malformed payload), we
+    // swallow the error: the override directory will be absent below, the
+    // overrideYaml check will fail, and renderTestDB falls back to the
+    // source test-db.
     def cbts = testFilter[(CBTS_RESULT)]
-    if (cbts != null && cbts.test_db_dir_override && cbts.cbts_input_json) {
+    if (cbts != null && cbts.test_db_dir_override && cbts.cbts_input_json_b64) {
         def overrideDir = "${llmSrc}/${cbts.test_db_dir_override}"
         def dirExists = sh(returnStdout: true, script: "test -d ${overrideDir} && echo yes || echo no").trim()
         if (dirExists != "yes") {
-            def cbtsInputLocal = Utils.createTempLocation(pipeline, "./cbts_input.json")
-            pipeline.writeFile(file: cbtsInputLocal, text: cbts.cbts_input_json)
-            sh "apt-get update -qq && apt-get install -y -qq python3-yaml || true"
-            sh "cd ${llmSrc} && python3 jenkins/scripts/cbts/main.py ${cbtsInputLocal} > /dev/null 2>&1 || true"
+            try {
+                def cbtsInputJson = new String(cbts.cbts_input_json_b64.decodeBase64(), StandardCharsets.UTF_8)
+                def cbtsInputLocal = Utils.createTempLocation(pipeline, "./cbts_input.json")
+                pipeline.writeFile(file: cbtsInputLocal, text: cbtsInputJson)
+                sh "apt-get update -qq && apt-get install -y -qq python3-yaml || true"
+                sh "cd ${llmSrc} && python3 jenkins/scripts/cbts/main.py ${cbtsInputLocal} > /dev/null 2>&1 || true"
+            } catch (Exception e) {
+                echo "CBTS Layer 3: failed to materialize piggyback payload " +
+                     "(${e.class.simpleName}: ${e.message}); falling back to source test-db"
+            }
         }
     }
     def testDBPath = "${llmSrc}/tests/integration/test_lists/test-db"
@@ -4565,7 +4579,8 @@ def launchTestJobs(pipeline, testFilter)
     // CBTS Layer 2: replace `parallelJobsFiltered` with affected stages plus
     // PackageSanityCheck (kept iff sanity_required) and PerfSanity (kept iff
     // perfsanity_required). Pure -Perf- stages always excluded (own trigger
-    // model, full-list benchmarks).
+    // model, full-list benchmarks). Post-Merge stages are never force-kept;
+    // they only run when explicitly listed in affected_stages.
     def cbts = testFilter[(CBTS_RESULT)]
     if (cbts != null) {
         def affectedSet = (cbts.affected_stages ?: []) as Set
@@ -4573,6 +4588,7 @@ def launchTestJobs(pipeline, testFilter)
         def needsPerfSanity = cbts.perfsanity_required
         parallelJobsFiltered = parallelJobs.findAll { key, _ ->
             if (key =~ /-Perf-/) return false
+            if (key =~ /Post-Merge/) return affectedSet.contains(key)
             return affectedSet.contains(key) ||
                    (needsSanity && key =~ /PackageSanityCheck/) ||
                    (needsPerfSanity && key =~ /PerfSanity/)
