@@ -1,6 +1,7 @@
 @Library(['bloom-jenkins-shared-lib@main', 'trtllm-jenkins-shared-lib@main']) _
 
 import java.lang.InterruptedException
+import java.nio.charset.StandardCharsets
 import groovy.transform.Field
 import groovy.json.JsonOutput
 import groovy.json.JsonSlurper
@@ -779,7 +780,7 @@ def getCbtsResult(pipeline, testFilter, globalVars)
         // that is what travels on the wire); oversize → drop piggyback,
         // Layer 3 falls back to source.
         final int CBTS_INPUT_PIGGYBACK_MAX_BYTES = 256000
-        def inputJsonB64 = inputJson.bytes.encodeBase64().toString()
+        def inputJsonB64 = inputJson.getBytes(StandardCharsets.UTF_8).encodeBase64().toString()
         def inputJsonB64Size = inputJsonB64.length()
         if (inputJsonB64Size <= CBTS_INPUT_PIGGYBACK_MAX_BYTES) {
             result.cbts_input_json_b64 = inputJsonB64

@@ -1,6 +1,7 @@
 @Library(['bloom-jenkins-shared-lib@main', 'trtllm-jenkins-shared-lib@main']) _
 
 import java.lang.InterruptedException
+import java.nio.charset.StandardCharsets
 import groovy.transform.Field
 import groovy.json.JsonOutput
 import com.nvidia.bloom.KubernetesManager
@@ -2459,17 +2460,26 @@ def renderTestDB(pipeline, testContext, llmSrc, stageName, preDefinedMakoOpts=nu
     // piggybacked input JSON if not already present. The piggyback payload is
     // base64-encoded on the orchestrator (see getCbtsResult in
     // L0_MergeRequest.groovy) to keep tokenmacro from interpreting ${...} or
-    // {...} fragments inside the PR diff when globalVars is serialized.
+    // {...} fragments inside the PR diff when globalVars is serialized. If
+    // decoding or regeneration throws (truncated/malformed payload), we
+    // swallow the error: the override directory will be absent below, the
+    // overrideYaml check will fail, and renderTestDB falls back to the
+    // source test-db.
     def cbts = testFilter[(CBTS_RESULT)]
     if (cbts != null && cbts.test_db_dir_override && cbts.cbts_input_json_b64) {
         def overrideDir = "${llmSrc}/${cbts.test_db_dir_override}"
         def dirExists = sh(returnStdout: true, script: "test -d ${overrideDir} && echo yes || echo no").trim()
         if (dirExists != "yes") {
-            def cbtsInputJson = new String(cbts.cbts_input_json_b64.decodeBase64(), "UTF-8")
-            def cbtsInputLocal = Utils.createTempLocation(pipeline, "./cbts_input.json")
-            pipeline.writeFile(file: cbtsInputLocal, text: cbtsInputJson)
-            sh "apt-get update -qq && apt-get install -y -qq python3-yaml || true"
-            sh "cd ${llmSrc} && python3 jenkins/scripts/cbts/main.py ${cbtsInputLocal} > /dev/null 2>&1 || true"
+            try {
+                def cbtsInputJson = new String(cbts.cbts_input_json_b64.decodeBase64(), StandardCharsets.UTF_8)
+                def cbtsInputLocal = Utils.createTempLocation(pipeline, "./cbts_input.json")
+                pipeline.writeFile(file: cbtsInputLocal, text: cbtsInputJson)
+                sh "apt-get update -qq && apt-get install -y -qq python3-yaml || true"
+                sh "cd ${llmSrc} && python3 jenkins/scripts/cbts/main.py ${cbtsInputLocal} > /dev/null 2>&1 || true"
+            } catch (Exception e) {
+                echo "CBTS Layer 3: failed to materialize piggyback payload " +
+                     "(${e.class.simpleName}: ${e.message}); falling back to source test-db"
+            }
         }
     }
     def testDBPath = "${llmSrc}/tests/integration/test_lists/test-db"
