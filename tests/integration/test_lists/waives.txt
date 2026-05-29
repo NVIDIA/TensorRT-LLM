@@ -219,8 +219,6 @@ examples/test_visual_gen.py::test_wan22_t2v_lpips_against_golden SKIP (https://n
 examples/test_visual_gen.py::test_wan_t2v_example SKIP (https://nvbugs/6215688)
 examples/test_whisper.py::test_llm_whisper_general[large-v3-disable_gemm_plugin-disable_attention_plugin-disable_weight_only-float16-nb:1-use_python_runtime] SKIP (https://nvbugs/5244570)
 full:A10/unittest/kv_cache_manager_v2_tests/ SKIP (https://nvbugs/5841954)
-full:A100/accuracy/test_llm_api_autodeploy.py::TestGLM4Flash::test_auto_dtype[trtllm-False] SKIP (https://nvbugs/6185480)
-full:A100/accuracy/test_llm_api_autodeploy.py::TestGLM4Flash::test_auto_dtype[trtllm-True] SKIP (https://nvbugs/6185480)
 full:B200/accuracy/test_llm_api_autodeploy.py::TestNemotronNanoV3::test_accuracy[bf16-4-trtllm] SKIP (https://nvbugs/6185150)
 full:B200/perf/test_perf.py::test_perf[quant:int8_sq_per_tensor] SKIP (https://nvbugs/5161074)
 full:B200/perf/test_perf.py::test_perf[quant:int8_sq_per_token_channel] SKIP (https://nvbugs/5161074)
