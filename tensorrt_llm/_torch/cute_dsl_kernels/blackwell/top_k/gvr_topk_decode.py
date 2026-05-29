@@ -140,6 +140,7 @@ class GvrTopKKernel:
         use_256bit_load: bool = False,
         enable_warp_parallel_reduce: Optional[bool] = None,
         compress_ratio: int = 1,
+        return_output_values: bool = True,
     ):
         # e.g., dtype = cutlass.Float32 / cutlass.BFloat16 / cutlass.Float16
         self.dtype = dtype
@@ -206,6 +207,14 @@ class GvrTopKKernel:
         if enable_warp_parallel_reduce is None:
             enable_warp_parallel_reduce = num_threads == 1024
         self.enable_warp_parallel_reduce = enable_warp_parallel_reduce
+
+        # When False, the kernel skips all STG writes to ``output_values``.
+        # Callers that only consume top-K indices (e.g. the DSA indexer
+        # pipeline) save the LSU bandwidth + reg pressure of dtype-cast +
+        # store; ``output_values`` is then a dummy buffer the kernel never
+        # touches. When True (kernel default), values are written for
+        # bench / standalone driver usage.
+        self.return_output_values = return_output_values
 
         # Map cutlass dtype → GvrParams lookup name
         if dtype == cutlass.Float32:
@@ -1122,7 +1131,8 @@ class GvrTopKKernel:
         if cand_count == cutlass.Int32(kK):
             i4 = tidx
             while i4 < cutlass.Int32(kK):
-                output_values_row[i4] = self.dtype(smem_keys[i4])
+                if cutlass.const_expr(self.return_output_values):
+                    output_values_row[i4] = self.dtype(smem_keys[i4])
                 output_indices_row[i4] = smem_vals[i4]
                 i4 = i4 + cutlass.Int32(num_threads)
         elif cand_count > cutlass.Int32(kK):
@@ -1325,7 +1335,8 @@ class GvrTopKKernel:
                     bp_gt = cute.arch.shuffle_sync(bp_gt, cutlass.Int32(0))
                     wpos_p1 = bp_gt + moff_gt
                     if emit_gt != cutlass.Int32(0) and wpos_p1 < cutlass.Int32(kK):
-                        output_values_row[wpos_p1] = self.dtype(v_p1)
+                        if cutlass.const_expr(self.return_output_values):
+                            output_values_row[wpos_p1] = self.dtype(v_p1)
                         output_indices_row[wpos_p1] = smem_vals[ix1]
                 base_w = base_w + cutlass.Int32(num_threads)
             cute.arch.barrier()
@@ -1356,7 +1367,8 @@ class GvrTopKKernel:
                     bp_eq = cute.arch.shuffle_sync(bp_eq, cutlass.Int32(0))
                     wpos_p2 = bp_eq + moff_eq
                     if emit_eq != cutlass.Int32(0) and wpos_p2 < cutlass.Int32(kK):
-                        output_values_row[wpos_p2] = self.dtype(v_p2)
+                        if cutlass.const_expr(self.return_output_values):
+                            output_values_row[wpos_p2] = self.dtype(v_p2)
                         output_indices_row[wpos_p2] = smem_vals[ix2]
                 base_w2 = base_w2 + cutlass.Int32(num_threads)
             cute.arch.barrier()
@@ -1367,7 +1379,8 @@ class GvrTopKKernel:
                 filled_par = cutlass.Int32(kK)
             ipad = filled_par + tidx
             while ipad < cutlass.Int32(kK):
-                output_values_row[ipad] = self.dtype(self.NEG_FLT_MAX)
+                if cutlass.const_expr(self.return_output_values):
+                    output_values_row[ipad] = self.dtype(self.NEG_FLT_MAX)
                 output_indices_row[ipad] = cutlass.Int32(-1)
                 ipad = ipad + cutlass.Int32(num_threads)
         else:
@@ -1375,12 +1388,14 @@ class GvrTopKKernel:
             # Emit cand_count + pad
             i10 = tidx
             while i10 < cand_count:
-                output_values_row[i10] = self.dtype(smem_keys[i10])
+                if cutlass.const_expr(self.return_output_values):
+                    output_values_row[i10] = self.dtype(smem_keys[i10])
                 output_indices_row[i10] = smem_vals[i10]
                 i10 = i10 + cutlass.Int32(num_threads)
             i11 = cand_count + tidx
             while i11 < cutlass.Int32(kK):
-                output_values_row[i11] = self.dtype(self.NEG_FLT_MAX)
+                if cutlass.const_expr(self.return_output_values):
+                    output_values_row[i11] = self.dtype(self.NEG_FLT_MAX)
                 output_indices_row[i11] = cutlass.Int32(-1)
                 i11 = i11 + cutlass.Int32(num_threads)
 
@@ -1439,7 +1454,13 @@ class GvrTopKKernel:
         # Slice per-row views.
         input_row = input_data[row_idx, None]
         pre_idx_row = pre_idx[pre_idx_row_idx, None]
-        output_values_row = output_values[row_idx, None]
+        # When return_output_values=False, ``output_values`` is None at
+        # launch and the gated writes below are compiled out; slicing into
+        # None would crash so we keep the view None as well.
+        if cutlass.const_expr(self.return_output_values):
+            output_values_row = output_values[row_idx, None]
+        else:
+            output_values_row = None
         output_indices_row = output_indices[row_idx, None]
         pre_idx_count = pre_idx.shape[1]
 
@@ -1522,12 +1543,14 @@ class GvrTopKKernel:
         if N <= cutlass.Int32(top_k):
             jd = tidx
             while jd < N:
-                output_values_row[jd] = input_row[jd]
+                if cutlass.const_expr(self.return_output_values):
+                    output_values_row[jd] = input_row[jd]
                 output_indices_row[jd] = cutlass.Int32(jd)
                 jd = jd + cutlass.Int32(num_threads)
             jp = N + cutlass.Int32(tidx)
             while jp < cutlass.Int32(top_k):
-                output_values_row[jp] = self.dtype(self.NEG_FLT_MAX)
+                if cutlass.const_expr(self.return_output_values):
+                    output_values_row[jp] = self.dtype(self.NEG_FLT_MAX)
                 output_indices_row[jp] = cutlass.Int32(-1)
                 jp = jp + cutlass.Int32(num_threads)
         else:
@@ -1562,7 +1585,8 @@ class GvrTopKKernel:
                     je = cutlass.Int32(0)
                     while je < emit_count:
                         output_indices_row[je] = je
-                        output_values_row[je] = input_row[je]
+                        if cutlass.const_expr(self.return_output_values):
+                            output_values_row[je] = input_row[je]
                         je = je + cutlass.Int32(1)
             else:
                 # =============================================================
@@ -1631,7 +1655,7 @@ class GvrTopKKernel:
         input_data: cute.Tensor,
         pre_idx: cute.Tensor,
         seq_lens: cute.Tensor,
-        output_values: cute.Tensor,
+        output_values: cute.Tensor,  # or None.
         output_indices: cute.Tensor,
         stream,
     ):

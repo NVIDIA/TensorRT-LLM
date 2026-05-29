@@ -173,14 +173,12 @@ def test_cute_dsl_gvr_topk_decode(dtype, top_k, N, next_n, batch_size, compress_
         compress_ratio=compress_ratio,
     )
 
-    out_values = torch.empty(num_rows, top_k, dtype=dtype, device="cuda")
     out_indices = torch.empty(num_rows, top_k, dtype=torch.int32, device="cuda")
 
     torch.ops.trtllm.cute_dsl_gvr_topk_decode(
         logits,
         pre_idx,
         seq_lens,
-        out_values,
         out_indices,
         top_k=top_k,
         next_n=next_n,

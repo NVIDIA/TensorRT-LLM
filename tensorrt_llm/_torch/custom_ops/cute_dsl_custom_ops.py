@@ -5870,11 +5870,12 @@ if IS_CUTLASS_DSL_AVAILABLE:
             num_threads_per_block: int,
             enable_warp_parallel_reduce: bool,
             compress_ratio: int,
+            return_output_values: bool,
         ) -> None:
             key = (dtype, top_k, next_n, enable_unroll_4, enable_phase3_unroll,
                    use_constant_hint, min_blocks_per_mp, use_256bit_load,
                    num_threads_per_block, enable_warp_parallel_reduce,
-                   compress_ratio)
+                   compress_ratio, return_output_values)
             if key in cls.kernel_cache:
                 return
             n_rows = cute.sym_int()
@@ -5894,8 +5895,13 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 assumed_align=16)
             seq_lens_fake = cute.runtime.make_fake_compact_tensor(
                 cutlass.Int32, (n_batch, ), stride_order=(0, ))
-            out_values_fake = cute.runtime.make_fake_compact_tensor(
+            # When return_output_values=False the kernel skips all STG.value
+            # writes; pass None so cute.compile doesn't materialize a fake
+            # value-output placeholder (matches the optional-tensor pattern
+            # used by CuteDSLTopKDecodeMultiCTARunner above).
+            out_values_fake = (cute.runtime.make_fake_compact_tensor(
                 dtype, (n_rows, top_k), stride_order=(1, 0), assumed_align=16)
+                               if return_output_values else None)
             out_indices_fake = cute.runtime.make_fake_compact_tensor(
                 cutlass.Int32, (n_rows, top_k),
                 stride_order=(1, 0),
@@ -5915,6 +5921,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 use_256bit_load=use_256bit_load,
                 enable_warp_parallel_reduce=enable_warp_parallel_reduce,
                 compress_ratio=compress_ratio,
+                return_output_values=return_output_values,
             )
             cls.kernel_cache[key] = cute.compile(
                 kernel,
@@ -5934,7 +5941,6 @@ if IS_CUTLASS_DSL_AVAILABLE:
             logits: torch.Tensor,
             pre_idx: torch.Tensor,
             seq_lens: torch.Tensor,
-            output_values: torch.Tensor,
             output_indices: torch.Tensor,
             top_k: int,
             next_n: int = 1,
@@ -5943,6 +5949,12 @@ if IS_CUTLASS_DSL_AVAILABLE:
         ) -> None:
             cute_dtype = _TORCH_TO_CUTLASS_DTYPE[logits.dtype]
             num_rows = logits.shape[0]
+            # Op-level hardcodes return_output_values=False — the DSA indexer
+            # pipeline only consumes indices, mirroring CUDA's
+            # ``indexer_topk_decode`` (which also doesn't expose value
+            # outputs). The compiled kernel skips all STG.value writes and
+            # accepts None for its value-output slot at launch time.
+            return_output_values = False
             N_cols = logits.shape[1]
             # max_seq_len: graph-safe hint. Eager mode: leave None and the
             # heuristic adapts to actual N each call. Graph capture mode:
@@ -6017,24 +6029,27 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 num_threads_per_block,
                 enable_warp_parallel_reduce,
                 compress_ratio,
+                return_output_values,
             )
             key = (cute_dtype, top_k, next_n, enable_unroll_4,
                    enable_phase3_unroll, use_constant_hint, min_blocks_per_mp,
                    use_256bit_load, num_threads_per_block,
-                   enable_warp_parallel_reduce, compress_ratio)
+                   enable_warp_parallel_reduce, compress_ratio,
+                   return_output_values)
             # TVM FFI: pass raw torch tensors directly, env stream picked
             # up automatically (no from_dlpack, no stream argument).
-            cls.kernel_cache[key](logits, pre_idx, seq_lens, output_values,
+            # ``output_values=None`` matches the kernel's compile-time
+            # ``return_output_values=False`` constexpr — no writes for top-k values.
+            cls.kernel_cache[key](logits, pre_idx, seq_lens, None,
                                   output_indices)
 
     @torch.library.custom_op("trtllm::cute_dsl_gvr_topk_decode",
-                             mutates_args=("output_values", "output_indices"),
+                             mutates_args=("output_indices", ),
                              device_types="cuda")
     def cute_dsl_gvr_topk_decode(
         logits: torch.Tensor,
         pre_idx: torch.Tensor,
         seq_lens: torch.Tensor,
-        output_values: torch.Tensor,
         output_indices: torch.Tensor,
         top_k: int,
         next_n: int = 1,
@@ -6043,15 +6058,17 @@ if IS_CUTLASS_DSL_AVAILABLE:
     ) -> None:
         """CuTe DSL GVR (Guess-Verify-Refine) Top-K decode for Blackwell.
 
-        Writes the per-row top-K values and indices into the caller-allocated
-        ``output_values`` / ``output_indices`` buffers (no return).
+        Writes per-row top-K indices into the caller-allocated
+        ``output_indices`` buffer (no return). Values are NOT written —
+        the kernel is compiled with ``return_output_values=False`` so the
+        STG.value path is skipped. Mirrors CUDA ``indexer_topk_decode``
+        which also only exposes indices to callers.
 
         Args:
             logits: ``[num_rows, max_seq_len]`` fp32 / bf16 / fp16.
             pre_idx: ``[num_rows // next_n, top_k]`` int32. ``pre_idx[..., 0]``
                 must be the argmax index (indexer invariant).
             seq_lens: ``[num_rows // next_n]`` int32. Effective seq length per group.
-            output_values: ``[num_rows, top_k]`` same dtype as ``logits``.
             output_indices: ``[num_rows, top_k]`` int32.
             top_k: K ∈ {512, 1024, 2048} — compile-time specialized.
             next_n: Temporal stride (V3.2 ``preIdxOffset = (row % next_n) + 1``).
@@ -6069,7 +6086,6 @@ if IS_CUTLASS_DSL_AVAILABLE:
             f"logits dtype={logits.dtype} shape={tuple(logits.shape)} stride={logits.stride()}; "
             f"pre_idx dtype={pre_idx.dtype} shape={tuple(pre_idx.shape)}; "
             f"seq_lens dtype={seq_lens.dtype} shape={tuple(seq_lens.shape)}; "
-            f"output_values dtype={output_values.dtype} shape={tuple(output_values.shape)}; "
             f"output_indices dtype={output_indices.dtype} shape={tuple(output_indices.shape)}; "
             f"top_k={top_k} next_n={next_n} compress_ratio={compress_ratio} "
             f"max_seq_len={max_seq_len}",
@@ -6079,7 +6095,6 @@ if IS_CUTLASS_DSL_AVAILABLE:
             logits=logits,
             pre_idx=pre_idx,
             seq_lens=seq_lens,
-            output_values=output_values,
             output_indices=output_indices,
             top_k=top_k,
             next_n=next_n,
@@ -6092,7 +6107,6 @@ if IS_CUTLASS_DSL_AVAILABLE:
         logits: torch.Tensor,
         pre_idx: torch.Tensor,
         seq_lens: torch.Tensor,
-        output_values: torch.Tensor,
         output_indices: torch.Tensor,
         top_k: int,
         next_n: int = 1,

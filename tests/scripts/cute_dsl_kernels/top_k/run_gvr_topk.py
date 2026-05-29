@@ -55,6 +55,7 @@ def _compile(
     num_threads_per_block: int,
     enable_warp_parallel_reduce: bool,
     compress_ratio: int,
+    return_output_values: bool,
 ):
     """JIT-compile the GVR kernel for a specific knob combination.
 
@@ -82,11 +83,18 @@ def _compile(
         (n_batch,),
         stride_order=(0,),
     )
-    out_values_fake = cute.runtime.make_fake_compact_tensor(
-        cute_dtype,
-        (n_rows, top_k),
-        stride_order=(1, 0),
-        assumed_align=16,
+    # When return_output_values=False the kernel skips all STG.value
+    # writes; pass None so cute.compile doesn't materialize the value
+    # output placeholder.
+    out_values_fake = (
+        cute.runtime.make_fake_compact_tensor(
+            cute_dtype,
+            (n_rows, top_k),
+            stride_order=(1, 0),
+            assumed_align=16,
+        )
+        if return_output_values
+        else None
     )
     out_indices_fake = cute.runtime.make_fake_compact_tensor(
         cutlass.Int32,
@@ -107,6 +115,7 @@ def _compile(
         use_256bit_load=use_256bit_load,
         enable_warp_parallel_reduce=enable_warp_parallel_reduce,
         compress_ratio=compress_ratio,
+        return_output_values=return_output_values,
     )
     return cute.compile(
         kernel,
@@ -138,6 +147,7 @@ def gvr_topk_decode(
     enable_warp_parallel_reduce: Optional[bool] = None,
     compress_ratio: int = 1,
     max_seq_len: Optional[int] = None,
+    return_output_values: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """CuTe DSL GVR Top-K wrapper with every tuning knob exposed.
 
@@ -172,8 +182,9 @@ def gvr_topk_decode(
     cute_dtype = _DTYPE_TORCH_TO_CUTE[logits.dtype]
 
     num_rows = logits.shape[0]
-    if out_values is None:
-        out_values = torch.empty((num_rows, top_k), dtype=logits.dtype, device=logits.device)
+    if return_output_values:
+        if out_values is None:
+            out_values = torch.empty((num_rows, top_k), dtype=logits.dtype, device=logits.device)
     if out_indices is None:
         out_indices = torch.empty((num_rows, top_k), dtype=torch.int32, device=logits.device)
 
@@ -231,9 +242,21 @@ def gvr_topk_decode(
         num_threads_per_block,
         enable_warp_parallel_reduce,
         compress_ratio,
+        return_output_values,
     )
-    compiled(logits, pre_idx, seq_lens, out_values, out_indices)
-    return out_values, out_indices
+    # When return_output_values=False the kernel was compiled to skip
+    # STG.value and accepts None for the value-output slot.
+    compiled(
+        logits,
+        pre_idx,
+        seq_lens,
+        out_values if return_output_values else None,
+        out_indices,
+    )
+    if return_output_values:
+        return out_values, out_indices
+    else:
+        return None, out_indices
 
 
 # ---- Correctness helpers ----------------------------------------------------
@@ -375,6 +398,7 @@ def test_gvr_topk_decode(
         use_256bit_load=use_256bit_load,
         num_threads_per_block=num_threads_per_block,
         enable_warp_parallel_reduce=enable_warp_parallel_reduce,
+        return_output_values=False,
     )
     torch.cuda.synchronize()
     ok, msg = _tie_aware_correct(out_idxs, logits, top_k, next_n)
@@ -432,6 +456,7 @@ def main() -> None:
         use_constant_hint=args.use_constant_hint,
         compress_ratio=args.compress_ratio,
         max_seq_len=args.max_seq_len,
+        return_output_values=False,
     )
     print(
         f"config: dtype={args.dtype} top_k={args.top_k} N={args.N} "
