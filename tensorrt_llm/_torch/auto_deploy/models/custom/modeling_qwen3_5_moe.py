@@ -765,8 +765,11 @@ class Qwen3_5MoeSparseMoeBlock(nn.Module):
             layer_type="moe",
         )
 
-        expert_output = expert_output + shared_expert_output
+        # The shared expert is replicated (excluded from TP sharding), so all-reduce
+        # the sharded routed-expert output first, then add the replicated shared
+        # output; adding before would scale it by the TP world size.
         expert_output = torch.ops.auto_deploy.all_reduce(expert_output, layer_type="moe")
+        expert_output = expert_output + shared_expert_output
 
         expert_output = expert_output.reshape(batch_size, sequence_length, hidden_dim)
         return expert_output
