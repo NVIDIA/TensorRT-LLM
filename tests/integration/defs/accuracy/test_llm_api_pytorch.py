@@ -6854,7 +6854,7 @@ class TestNemotronV3Super(LlmapiAccuracyTestHarness):
                  kv_cache_config=kv_cache_config,
                  max_batch_size=16,
                  nvfp4_gemm_config={"allowed_backends": ["marlin"]}) as llm:
-            assert llm.args.quant_config.quant_algo == QuantAlgo.NVFP4
+            assert llm.args.quant_config.quant_algo == QuantAlgo.MIXED_PRECISION
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm,
                           extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
