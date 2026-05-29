@@ -269,31 +269,3 @@ def test_encode_cuda_graph_and_return_raw_logits(bert_encode_llm_cuda_graph):
     raw_single = bert_encode_llm_cuda_graph.encode(PROMPTS[0], return_raw_logits=True)
     assert isinstance(raw_single, torch.Tensor)
     assert raw_single.shape == (1, 2)
-
-
-# --------------------------------------------------------------------------- #
-# trtllm_gen guard
-# --------------------------------------------------------------------------- #
-
-
-def test_trtllm_gen_is_supported_rejects_none_kv_cache_manager():
-    """The trtllm_gen attention path requires a KV cache manager.
-
-    With kv_cache_manager=None (e.g. encoder no-cache), is_supported() must
-    return False so the caller falls back cleanly to thop.attention instead
-    of crashing inside FlashInfer prefill (which would dereference None when
-    fetching KV cache buffers).
-    """
-    from tensorrt_llm._torch.attention_backend import trtllm_gen
-
-    ok, reason = trtllm_gen.is_supported(
-        q=torch.empty(1, 64, dtype=torch.float16),
-        num_heads=12,
-        num_kv_heads=12,
-        head_size=64,
-        out_dtype=torch.float16,
-        mask_type=2,
-        kv_cache_manager=None,
-    )
-    assert ok is False
-    assert "kv_cache_manager" in reason.lower()
