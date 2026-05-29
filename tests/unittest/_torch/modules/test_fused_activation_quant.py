@@ -18,12 +18,23 @@ import pytest
 import torch
 import torch.nn.functional as F
 
+from tensorrt_llm._torch.model_config import ModelConfig
+from tensorrt_llm._torch.modules.mlp import MLP
+from tensorrt_llm._torch.utils import gelu_tanh as _gelu_tanh_sentinel
+from tensorrt_llm._torch.utils import relu2 as _relu2_sentinel
+from tensorrt_llm.models.modeling_utils import QuantConfig
+from tensorrt_llm.quantization.mode import QuantAlgo
 from tests.unittest.utils.util import getSMVersion
 
 
 def fused_relu2_quantize_available():
     """Check if the fused_relu2_quantize op is available."""
     return hasattr(torch.ops, "trtllm") and hasattr(torch.ops.trtllm, "fused_relu2_quantize")
+
+
+def fused_gelu_tanh_quantize_available():
+    """Check if the fused_gelu_tanh_quantize op is available."""
+    return hasattr(torch.ops, "trtllm") and hasattr(torch.ops.trtllm, "fused_gelu_tanh_quantize")
 
 
 def fp4_quantize_available():
@@ -39,6 +50,20 @@ skip_unless_fused_relu2_quantize = pytest.mark.skipif(
 skip_unless_fused_relu2_and_fp4_quantize = pytest.mark.skipif(
     getSMVersion() < 100 or not fused_relu2_quantize_available() or not fp4_quantize_available(),
     reason="Requires SM100+ (Blackwell) and trtllm fused_relu2_quantize + fp4_quantize ops",
+)
+
+skip_unless_fused_gelu_tanh_and_fp4_quantize = pytest.mark.skipif(
+    getSMVersion() < 100 or not fused_gelu_tanh_quantize_available() or not fp4_quantize_available(),
+    reason="Requires SM100+ (Blackwell) and trtllm fused_gelu_tanh_quantize + fp4_quantize ops",
+)
+
+# MLP-level heuristic gate tests don't run the kernel; they only check the
+# boolean fast-path detection in MLP.create_weights. Skip on pre-Blackwell
+# only because Linear.__init__ assumes a CUDA device, and skip if the gelu
+# fused op isn't compiled into this build (the gate keys off hasattr).
+skip_unless_fused_gelu_tanh_op = pytest.mark.skipif(
+    getSMVersion() < 100 or not fused_gelu_tanh_quantize_available(),
+    reason="Requires SM100+ (Blackwell) and trtllm.fused_gelu_tanh_quantize op",
 )
 
 
@@ -221,3 +246,120 @@ def test_fused_relu2_quantize_vs_separate_ops_various_sf_scales():
         assert match_rate >= 0.99, (
             f"FP4 values match rate {match_rate:.4f} < 0.99 with scale_multiplier={scale_multiplier}"
         )
+
+
+@skip_unless_fused_gelu_tanh_and_fp4_quantize
+@pytest.mark.parametrize(
+    "m,n",
+    [
+        # Wan 14B FFN intermediate
+        (128, 13824),
+        # Wan 1.3B FFN intermediate
+        (4096, 8960),
+    ],
+)
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_fused_gelu_tanh_quantize(m, n, dtype):
+    """
+    Compare fused_gelu_tanh_quantize kernel against separate F.gelu(approximate='tanh')
+    + fp4_quantize for Wan 2.2 MLP intermediate shapes.
+
+    The CUDA kernel computes gelu_tanh in fp32 then rounds back to native precision
+    before the byte-for-byte identical NVFP4 quant epilogue used by fused_relu2_quantize.
+    A small fraction of values that land exactly on a quantization boundary can differ
+    between the fused and separate paths due to FMA vs. mul+add ordering in the
+    activation/scaling pipeline; mirror the >= 99% match tolerance the relu2 tests use.
+    """
+    torch.manual_seed(42)
+    device = torch.device("cuda")
+
+    input_tensor = torch.randn(m, n, dtype=dtype, device=device)
+    activated = F.gelu(input_tensor, approximate="tanh")
+    sf_scale = (activated.abs().amax().float() / (6.0 * 448.0)).to(device).view(1)
+
+    fp4_separate, sf_separate = torch.ops.trtllm.fp4_quantize(
+        activated,
+        sf_scale,
+        16,
+        False,
+        True,  # use_ue8m0=False, is_sf_swizzled_layout=True
+    )
+    fp4_fused, sf_fused = torch.ops.trtllm.fused_gelu_tanh_quantize(
+        input_tensor.contiguous(), sf_scale, 16
+    )
+
+    assert fp4_fused.shape == (m, n // 2)
+    assert sf_fused.shape == sf_separate.shape
+
+    match_rate = (fp4_fused == fp4_separate).float().mean().item()
+    assert match_rate >= 0.99, (
+        f"FP4 values match rate {match_rate:.4f} < 0.99 for shape ({m}, {n}), dtype {dtype}"
+    )
+
+
+def _build_nvfp4_mlp(activation, force_dynamic_quantization: bool) -> MLP:
+    """Construct a small MLP wired up with an NVFP4 quant_config.
+
+    Mirrors how `WanBlock.__init__` builds its FFN: ROW-parallel down_proj
+    backed by NVFP4. Returns the MLP after Linear's own create_weights() has
+    populated parameters in __init__; the caller can then simulate a
+    calibrated checkpoint via setattr before invoking mlp.create_weights() to
+    evaluate the fast-path gate.
+    """
+    quant_config = QuantConfig(quant_algo=QuantAlgo.NVFP4)
+    config = ModelConfig(
+        quant_config=quant_config,
+        force_dynamic_quantization=force_dynamic_quantization,
+    )
+    return MLP(
+        hidden_size=128,
+        intermediate_size=256,
+        bias=False,
+        activation=activation,
+        dtype=torch.bfloat16,
+        config=config,
+    )
+
+
+@skip_unless_fused_gelu_tanh_op
+def test_mlp_uses_fused_gelu_tanh_quant_on_static_nvfp4():
+    """Heuristic gate test: MLP enables the fused gelu_tanh + NVFP4 fast path
+    only when the activation is the gelu_tanh sentinel AND the down_proj has a
+    calibrated static input_scale AND force_dynamic_quantization is False.
+
+    The dynamic-quant assertion is the critical regression guard for chunk 2:
+    NVFP4LinearMethod._input_prepare returns a stale `module.alpha` when fed
+    an Fp4QuantizedTensor under dynamic quantization, so the fused path must
+    stay off until a dynamic-aware fusion is added.
+    """
+    # Static NVFP4 + gelu_tanh -> fused path ON.
+    mlp = _build_nvfp4_mlp(activation=_gelu_tanh_sentinel, force_dynamic_quantization=False)
+    # Simulate a ModelOpt checkpoint that calibrated input_scale; this flag is
+    # set by Linear weight loaders (see linear.py:676) and is the canonical
+    # signal that module.alpha is meaningful.
+    setattr(mlp.down_proj, "has_static_input_scale", True)
+    mlp.create_weights()
+    assert mlp._use_fused_gelu_tanh_quant is True
+    assert mlp._use_fused_relu2_quant is False
+
+    # Dynamic NVFP4 + gelu_tanh -> fused path OFF (regression guard).
+    mlp_dyn = _build_nvfp4_mlp(activation=_gelu_tanh_sentinel, force_dynamic_quantization=True)
+    setattr(mlp_dyn.down_proj, "has_static_input_scale", True)
+    mlp_dyn.create_weights()
+    assert mlp_dyn._use_fused_gelu_tanh_quant is False, (
+        "fused gelu_tanh+NVFP4 path must stay off under dynamic quantization "
+        "to avoid using a stale module.alpha (linear.py:1263-1270)"
+    )
+
+    # Static NVFP4 but no calibrated input_scale -> fused path OFF.
+    mlp_no_scale = _build_nvfp4_mlp(activation=_gelu_tanh_sentinel, force_dynamic_quantization=False)
+    mlp_no_scale.create_weights()
+    assert mlp_no_scale._use_fused_gelu_tanh_quant is False
+
+    # Static NVFP4 + relu2 -> gelu path stays OFF, relu2 path turns ON.
+    # Confirms the relu2 fast path is not regressed (Nemotron-H).
+    mlp_relu2 = _build_nvfp4_mlp(activation=_relu2_sentinel, force_dynamic_quantization=False)
+    setattr(mlp_relu2.down_proj, "has_static_input_scale", True)
+    mlp_relu2.create_weights()
+    assert mlp_relu2._use_fused_gelu_tanh_quant is False
+    assert mlp_relu2._use_fused_relu2_quant is True

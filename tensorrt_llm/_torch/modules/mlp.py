@@ -6,9 +6,10 @@ from torch import nn
 
 from tensorrt_llm.mapping import Mapping
 
+from ..._utils import nvtx_range
 from ..model_config import ModelConfig
 from ..peft.lora.layer import LoraLayer, LoraModuleType
-from ..utils import Fp4QuantizedTensor, relu2
+from ..utils import Fp4QuantizedTensor, gelu_tanh, relu2
 from .linear import Linear, TensorParallelMode, WeightMode, WeightsLoadingConfig
 
 
@@ -91,6 +92,7 @@ class MLP(nn.Module):
         )
 
         self._use_fused_relu2_quant = False
+        self._use_fused_gelu_tanh_quant = False
 
     def create_weights(self):
         self.up_proj.create_weights()
@@ -104,6 +106,23 @@ class MLP(nn.Module):
 
         self._use_fused_relu2_quant = has_nvfp4 and has_kernel and has_scale and is_relu2
 
+        # Static-only fast path for GELU(tanh) + NVFP4 down_proj. The Linear
+        # NVFP4 path returns a stale `module.alpha` when handed an
+        # Fp4QuantizedTensor (linear.py:1263-1270); under dynamic quant
+        # `module.alpha` is never calibrated, so we gate on
+        # `not force_dynamic_quantization` to ensure the GEMM sees a valid
+        # calibrated alpha. NVFP4 layers do not set `has_static_input_scale`
+        # (that flag is FP8-only), so the dynamic-quant flag is the canonical
+        # signal here.
+        has_kernel_gelu = hasattr(torch.ops.trtllm, 'fused_gelu_tanh_quantize')
+        is_gelu_tanh = self.activation is gelu_tanh
+        not_dynamic = not getattr(self.down_proj,
+                                  "force_dynamic_quantization", False)
+
+        self._use_fused_gelu_tanh_quant = (has_nvfp4 and has_kernel_gelu
+                                           and has_scale and not_dynamic
+                                           and is_gelu_tanh)
+
     def forward(
         self,
         x: torch.Tensor,
@@ -115,7 +134,14 @@ class MLP(nn.Module):
         x_up = self.up_proj(x)
 
         if self._use_fused_relu2_quant:
-            x_act = self._fused_relu2_quant(x_up)
+            # Distinct NVTX label so the chunk-1 fused activation+quant fast
+            # path is visible in nsys traces (separate from the auto layerwise
+            # marker on `MLP.forward`).
+            with nvtx_range("relu2+NVFP4 fused", color="green"):
+                x_act = self._fused_relu2_quant(x_up)
+        elif self._use_fused_gelu_tanh_quant:
+            with nvtx_range("gelu_tanh+NVFP4 fused", color="green"):
+                x_act = self._fused_gelu_tanh_quant(x_up)
         else:
             x_act = self.activation(x_up)
 
@@ -133,6 +159,24 @@ class MLP(nn.Module):
             x_flat = x_flat.to(torch.bfloat16)
 
         fp4_tensor, sf_tensor = torch.ops.trtllm.fused_relu2_quantize(
+            x_flat, self.down_proj.input_scale, 16)
+
+        return Fp4QuantizedTensor(
+            fp4_tensor=fp4_tensor,
+            scaling_factor=sf_tensor,
+            is_sf_swizzled=True,
+        )
+
+    def _fused_gelu_tanh_quant(self, x: torch.Tensor) -> Fp4QuantizedTensor:
+        x_flat = x.view(-1, x.shape[-1])
+
+        if not x_flat.is_contiguous():
+            x_flat = x_flat.contiguous()
+
+        if x_flat.dtype not in (torch.float16, torch.bfloat16):
+            x_flat = x_flat.to(torch.bfloat16)
+
+        fp4_tensor, sf_tensor = torch.ops.trtllm.fused_gelu_tanh_quantize(
             x_flat, self.down_proj.input_scale, 16)
 
         return Fp4QuantizedTensor(

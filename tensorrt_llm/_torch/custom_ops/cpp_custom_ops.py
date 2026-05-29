@@ -1151,6 +1151,21 @@ def _register_fake():
         output_sf = input.new_empty((scale_shape, ), dtype=torch.uint8)
         return output_fp4, output_sf
 
+    @torch.library.register_fake("trtllm::fused_gelu_tanh_quantize")
+    def _(
+        input: torch.Tensor,
+        sf_scale: torch.Tensor,
+        sf_vec_size: int = 16,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        # input: 2D tensor [M, N] (bf16 or fp16)
+        # output_fp4: [M, N/2] (packed FP4 values, 2 values per byte)
+        # output_sf: swizzled scale factors
+        output_shape, scale_shape = fp4_utils.get_fp4_shape(
+            input.shape, sf_vec_size, is_swizzled_layout=True)
+        output_fp4 = input.new_empty(output_shape, dtype=torch.uint8)
+        output_sf = input.new_empty((scale_shape, ), dtype=torch.uint8)
+        return output_fp4, output_sf
+
     @torch.library.register_fake("trtllm::convert_req_index_to_global")
     def _(req_id: torch.Tensor, block_table: torch.Tensor,
           token_indices: torch.Tensor, block_size: int, num_topk_tokens: int,
