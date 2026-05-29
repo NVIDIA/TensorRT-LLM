@@ -138,6 +138,7 @@ ARG GIT_COMMIT
 ARG GITHUB_MIRROR=""
 ARG BUILD_WHEEL_ARGS="--clean"
 ARG BUILD_WHEEL_SCRIPT="scripts/build_wheel.py"
+ARG PREPARE_WHEEL_FROM_BUILD_STAGE=""
 RUN --mount=type=cache,target=/root/.cache/pip --mount=type=cache,target=${CCACHE_DIR} \
     if [ -n "$GITHUB_MIRROR" ]; then \
       export PIP_INDEX_URL="https://urm.nvidia.com/artifactory/api/pypi/pypi-remote/simple"; \
@@ -145,6 +146,12 @@ RUN --mount=type=cache,target=/root/.cache/pip --mount=type=cache,target=${CCACH
     TRTLLM_BUILD_SOURCE_COMMIT=${GIT_COMMIT} \
     GITHUB_MIRROR=${GITHUB_MIRROR} \
     python3 ${BUILD_WHEEL_SCRIPT} ${BUILD_WHEEL_ARGS}
+    --mount=type=secret,id=GITLAB_TOKEN \
+    GITHUB_MIRROR=$GITHUB_MIRROR python3 ${BUILD_WHEEL_SCRIPT} ${BUILD_WHEEL_ARGS}
+    if [ "${PREPARE_WHEEL_FROM_BUILD_STAGE}" != "true" ]; then \
+        GITLAB_TOKEN=$(cat /run/secrets/GITLAB_TOKEN 2>/dev/null) \
+        python3 scripts/generate_cpp_dependency_json.py --deps-dir cpp/build/_deps --output-dir ./; \
+    fi
 
 FROM ${DEVEL_IMAGE} AS release
 
@@ -163,6 +170,7 @@ RUN --mount=type=bind,source=README.md,target=/mnt/ctx/README.md \
     --mount=type=bind,source=cpp/include,target=/mnt/ctx/include \
     --mount=type=bind,source=examples,target=/mnt/ctx/examples \
     --mount=type=bind,from=wheel,source=/src/tensorrt_llm/build,target=/mnt/wheel \
+    --mount=type=bind,from=wheel,source=/src/tensorrt_llm/3rdparty_sources,target=/mnt/3rdparty \
     # Copy build context files
     cp /mnt/ctx/README.md ./ && \
     cp -r /mnt/ctx/docs ./docs && \
@@ -171,6 +179,7 @@ RUN --mount=type=bind,source=README.md,target=/mnt/ctx/README.md \
     chmod -R a+w examples && \
     # Copy wheel stage outputs
     cp /mnt/wheel/tensorrt_llm*.whl ./ && \
+    cp /mnt/3rdparty/third-party-sources.json ./ && \
     # Create a symlink to installed package libraries
     ln -sv $(python3 -c 'import site; print(f"{site.getsitepackages()[0]}/tensorrt_llm/libs")') lib && \
     test -f lib/libtensorrt_llm.so && \
