@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
 import copy
 import os
 from dataclasses import dataclass
@@ -157,6 +160,9 @@ class TestQwen3VL(TestModelingMultimodal):
                 )
                 gen_multimodal_params_list.append(multimodal_param)
             trtllm_inputs["multimodal_params"] = gen_multimodal_params_list
+            trtllm_inputs["mrope_delta_read_seq_slots"] = torch.arange(
+                len(multimodal_params_list), device=self.device, dtype=torch.long
+            )
         else:
             # Mrope position ids. For chunked prefill / KV cache reuse we must
             # mirror production `PyTorchModelEngine` behavior and slice the
@@ -179,6 +185,9 @@ class TestQwen3VL(TestModelingMultimodal):
             position_ids = torch.cat(mrope_position_ids, dim=-1)
             position_ids = position_ids.cuda()
             trtllm_inputs["position_ids"] = position_ids
+            trtllm_inputs["mrope_delta_write_seq_slots"] = torch.arange(
+                len(multimodal_params_list), device=self.device, dtype=torch.long
+            )
 
         return trtllm_inputs
 

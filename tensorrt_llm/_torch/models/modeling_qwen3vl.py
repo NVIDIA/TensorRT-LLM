@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
 import copy
 import re
 from functools import lru_cache
@@ -1029,6 +1032,17 @@ class Qwen3VLModelBase(PreTrainedModel):
         super().__init__(config)
         if not disable_fuse_rope:
             self.init_mrope_embedding(model_config)
+            # Extra slot is reserved for CUDA graph / warmup dummy requests.
+            max_mrope_delta_slots = model_config.max_num_tokens * model_config.mapping.pp_size + 1
+            self.register_buffer(
+                "mrope_position_deltas_cache",
+                torch.zeros(
+                    max_mrope_delta_slots,
+                    dtype=torch.int32,
+                    device="cuda",
+                ),
+                persistent=False,
+            )
 
         self.model_config = model_config
 
@@ -1115,12 +1129,28 @@ class Qwen3VLModelBase(PreTrainedModel):
     def prepare_mrope_config(
         self,
         multimodal_params: List[MultimodalParams],
-        num_context_requests: int,
         num_generation_requests: int,
         position_ids: torch.Tensor,
+        mrope_delta_write_seq_slots: Optional[torch.Tensor] = None,
+        mrope_delta_read_seq_slots: Optional[torch.Tensor] = None,
     ):
         mrope_config = {}
-        mrope_position_deltas = []
+        if mrope_delta_write_seq_slots is not None:
+            seq_slots = mrope_delta_write_seq_slots
+            delta_tensors = []
+            for multimodal_param in multimodal_params:
+                request_mrope_config = multimodal_param.multimodal_data.get("mrope_config", {})
+                mrope_position_delta = request_mrope_config.get("mrope_position_deltas")
+                if mrope_position_delta is None:
+                    continue
+                delta_tensors.append(mrope_position_delta.reshape(1))
+                if len(delta_tensors) == seq_slots.numel():
+                    break
+            if len(delta_tensors) != seq_slots.numel():
+                raise RuntimeError("Missing MRoPE position deltas for seq-slot cache update")
+            deltas = torch.cat(delta_tensors, dim=0)
+            self.mrope_position_deltas_cache.index_copy_(0, seq_slots, deltas)
+
         # Attention kernel indexes mrope cos/sin by batch-flat per-token
         # entry, so one `get_cos_sin(position_ids)` over the stitched
         # `(3, 1, total_tokens)` covers every batch entry directly.
@@ -1129,22 +1159,11 @@ class Qwen3VLModelBase(PreTrainedModel):
             mrope_config["mrope_rotary_cos_sin"] = torch.stack((cos, sin), dim=-1).reshape(
                 cos.shape[0], -1
             )
-        for multimodal_param in multimodal_params[num_context_requests:]:
-            if multimodal_param.multimodal_data.get("mrope_config") is not None:
-                if (
-                    multimodal_param.multimodal_data["mrope_config"].get("mrope_position_deltas")
-                    is not None
-                ):
-                    mrope_position_deltas.append(
-                        multimodal_param.multimodal_data["mrope_config"]["mrope_position_deltas"]
-                    )
 
-        if mrope_position_deltas:
-            mrope_config["mrope_position_deltas"] = (
-                mrope_position_deltas[0]
-                if len(mrope_position_deltas) == 1
-                else torch.cat(mrope_position_deltas, dim=0)
-            )
+        if mrope_delta_read_seq_slots is not None:
+            mrope_config["mrope_position_deltas"] = self.mrope_position_deltas_cache.index_select(
+                0, mrope_delta_read_seq_slots
+            ).unsqueeze(1)
 
         return mrope_config
 
@@ -1178,9 +1197,13 @@ class Qwen3VLModelBase(PreTrainedModel):
 
         # NOTE: Qwen*-VL series has mrope_config even on the text-only prompts,
         # so we need to separate the mm_multimodal_params from the text-only prompts.
-        mm_multimodal_params, has_raw_image_or_video_data = self._get_requests_with_mm_data(
-            multimodal_params
-        )
+        if num_context_requests > 0:
+            mm_multimodal_params, has_raw_image_or_video_data = self._get_requests_with_mm_data(
+                multimodal_params[:num_context_requests]
+            )
+        else:
+            mm_multimodal_params = []
+            has_raw_image_or_video_data = False
         if len(mm_multimodal_params) > 0:
             # Raw image/video tensors: run local encoder.
             if has_raw_image_or_video_data and self.mm_encoder is not None:
@@ -1215,7 +1238,11 @@ class Qwen3VLModelBase(PreTrainedModel):
 
         if not self.model_config.pretrained_config.disable_fuse_rope:
             mrope_config = self.prepare_mrope_config(
-                multimodal_params, num_context_requests, num_generation_requests, position_ids
+                multimodal_params,
+                num_generation_requests,
+                position_ids,
+                mrope_delta_write_seq_slots=kwargs.get("mrope_delta_write_seq_slots"),
+                mrope_delta_read_seq_slots=kwargs.get("mrope_delta_read_seq_slots"),
             )
 
         # Prefer the indices the executor already computed (CPU-side

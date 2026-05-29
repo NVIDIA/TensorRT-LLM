@@ -143,16 +143,9 @@ class CUDAGraphRunner:
         if self.config.use_mrope:
             self.shared_static_tensors["position_ids"] = torch.zeros(
                 (3, 1, max_total_tokens), device="cuda", dtype=torch.int32)
-            self.shared_static_tensors["multimodal_params"] = [
-                MultimodalParams(
-                    multimodal_data={
-                        "mrope_config": {
-                            "mrope_position_deltas":
-                            torch.zeros(
-                                (1, 1), device="cuda", dtype=torch.int32)
-                        }
-                    }) for _ in range(max_total_tokens)
-            ]
+            self.shared_static_tensors[
+                "mrope_delta_read_seq_slots"] = torch.zeros(
+                    (max_total_tokens, ), device="cuda", dtype=torch.long)
 
     def _get_seq_len_mode(
             self,
@@ -271,6 +264,15 @@ class CUDAGraphRunner:
 
         if not self.enabled or not can_run_cuda_graph:
             return None, None, None
+        if self.config.use_mrope and any(
+                request.py_seq_slot is not None and not request.is_dummy
+                and getattr(request, "py_mrope_delta_cache_slot",
+                            None) != request.py_seq_slot
+                for request in batch.generation_requests):
+            # Requests whose current seq slot has not been seeded in the
+            # model-side MRoPE delta cache must run eagerly. Later decode steps
+            # can replay CUDA graphs using the cache.
+            return None, None, None
         key = self.get_graph_key(batch, new_tensors_device,
                                  spec_resource_manager)
 
@@ -352,9 +354,11 @@ class CUDAGraphRunner:
         if self.config.use_mrope:
             sliced_static_tensors["position_ids"] = self.shared_static_tensors[
                 "position_ids"][:, :, :num_tokens_for_capture]
-            sliced_static_tensors[
-                "multimodal_params"] = self.shared_static_tensors[
-                    "multimodal_params"][:batch_size * self.max_beam_width]
+            if "mrope_delta_read_seq_slots" in initial_inputs:
+                sliced_static_tensors[
+                    "mrope_delta_read_seq_slots"] = self.shared_static_tensors[
+                        "mrope_delta_read_seq_slots"][:batch_size *
+                                                      self.max_beam_width]
 
         capture_inputs = initial_inputs.copy()
         capture_inputs.update(sliced_static_tensors)
@@ -411,17 +415,16 @@ class CUDAGraphRunner:
         static_tensors["input_ids"][:seqlen].copy_(input_ids)
 
         position_ids = current_inputs["position_ids"]
-        if self.config.use_mrope and current_inputs.get(
-                'multimodal_params') is not None:
+        if self.config.use_mrope:
             static_tensors["position_ids"][:, :, :seqlen].copy_(position_ids)
-            for i, multimodal_param in enumerate(
-                    current_inputs['multimodal_params']):
-                # NOTE: Currently, we only need 'mrope_position_deltas' on generation phase for multimodal models.
-                static_tensors['multimodal_params'][i].multimodal_data[
-                    'mrope_config']['mrope_position_deltas'].copy_(
-                        multimodal_param.multimodal_data['mrope_config']
-                        ['mrope_position_deltas'],
-                        non_blocking=True)
+            mrope_delta_read_seq_slots = current_inputs.get(
+                'mrope_delta_read_seq_slots')
+            if mrope_delta_read_seq_slots is not None:
+                static_tensors[
+                    'mrope_delta_read_seq_slots'][:mrope_delta_read_seq_slots.
+                                                  shape[0]].copy_(
+                                                      mrope_delta_read_seq_slots,
+                                                      non_blocking=True)
         else:
             static_tensors["position_ids"][:, :seqlen].copy_(position_ids)
 
