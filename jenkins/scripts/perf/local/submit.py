@@ -562,6 +562,12 @@ def main():
         help="MPI type for srun (e.g. pmix, pmi2). If not set, aggregated runs default to"
         " --mpi=pmi2; non-aggregated runs omit --mpi entirely.",
     )
+    parser.add_argument(
+        "--disagg-server-port",
+        type=int,
+        default=8000,
+        help="Port the disagg server listens on (exported as DISAGG_SERVER_PORT)",
+    )
 
     args = parser.parse_args()
 
