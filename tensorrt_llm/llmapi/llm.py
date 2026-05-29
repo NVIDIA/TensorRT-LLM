@@ -48,6 +48,7 @@ from .llm_args import (TORCH_LLMARGS_EXPLICIT_DOCSTRING,
 from .llm_utils import (CachedModelLoader, KvCacheRetentionConfig,
                         LlmBuildStats, ModelLoader, _ModelRuntimeContext)
 from .mpi_session import MpiPoolSession, external_mpi_comm_available
+from .thinking_budget import add_thinking_budget_logits_processor
 from .tokenizer import TokenizerBase, _xgrammar_tokenizer_info
 # TODO[chunweiy]: move the following symbols back to utils scope, and remove the following import
 from .utils import (append_docstring, exception_handler, get_device_count,
@@ -1001,6 +1002,11 @@ class BaseLLM:
                     )
                 sampling_params._setup(self.tokenizer, self._hf_model_config,
                                        self._generation_config)
+            add_thinking_budget_logits_processor(
+                sampling_params,
+                reasoning_parser=self.args.reasoning_parser,
+                tokenizer=self.tokenizer,
+            )
         else:
             raise TypeError(
                 f"The sampling_params must be type SamplingParams or None, but got {type(sampling_params)}"
@@ -1155,7 +1161,8 @@ class BaseLLM:
 
     def _try_load_hf_model_config(
             self) -> Optional[transformers.PretrainedConfig]:
-        return ModelLoader.load_hf_model_config(self.args.model)
+        return ModelLoader.load_hf_model_config(
+            self.args.model, trust_remote_code=self.args.trust_remote_code)
 
     @set_api_status("beta")
     def shutdown(self) -> None:
@@ -1277,7 +1284,8 @@ class _TrtLLM(BaseLLM):
         # config.json uses TRT-LLM schema, not HF schema).
         if self._hf_model_dir is not None:
             self._hf_model_config = ModelLoader.load_hf_model_config(
-                self._hf_model_dir)
+                self._hf_model_dir,
+                trust_remote_code=self.args.trust_remote_code)
         else:
             self._hf_model_config = self._try_load_hf_model_config()
         self._generation_config = self._try_load_generation_config()
@@ -1285,8 +1293,10 @@ class _TrtLLM(BaseLLM):
         # Multimodal special handling:
         # 1. Default load_tokenizer may fail because MM has different tokenizer configuration. Hence we initialize it inside input processor
         # 2. May need to modify model weights for MM (e.g., resize vocab embedding). We must do such operation via input processor's __init__
-        self.input_processor = create_input_processor(self._hf_model_dir,
-                                                      self.tokenizer)
+        self.input_processor = create_input_processor(
+            self._hf_model_dir,
+            self.tokenizer,
+            trust_remote_code=self.args.trust_remote_code)
         self._tokenizer = self.input_processor.tokenizer
 
         max_batch_size = self.args.max_batch_size
@@ -1491,10 +1501,12 @@ class _TorchLLM(BaseLLM):
         if self.args.video_pruning_rate is not None:
             input_processor_kwargs[
                 'video_pruning_rate'] = self.args.video_pruning_rate
-        self.input_processor = create_input_processor(self._hf_model_dir,
-                                                      self.tokenizer,
-                                                      checkpoint_format,
-                                                      **input_processor_kwargs)
+        self.input_processor = create_input_processor(
+            self._hf_model_dir,
+            self.tokenizer,
+            checkpoint_format,
+            trust_remote_code=self.args.trust_remote_code,
+            **input_processor_kwargs)
         self._tokenizer = self.input_processor.tokenizer
 
         # Resolve encode_only mode (opt-in only)
