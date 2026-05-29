@@ -29,7 +29,6 @@ from tqdm import tqdm
 
 from tensorrt_llm._torch.modules.linear import Linear, WeightMode
 from tensorrt_llm._torch.modules.mlp import MLP
-from tensorrt_llm._torch.visual_gen.attention_backend.parallel import UlyssesAttention
 from tensorrt_llm._torch.visual_gen.attention_backend.utils import create_attention
 from tensorrt_llm._torch.visual_gen.modules.attention import Attention, QKVMode
 from tensorrt_llm._torch.visual_gen.quantization.loader import DynamicLinearWeightLoader
@@ -88,7 +87,6 @@ class LTX2Attention(Attention):
         config: Optional["DiffusionModelConfig"] = None,
         layer_idx: int = 0,
         use_ulysses: bool = False,
-        use_ulysses_cross: bool = False,
     ):
         from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
 
@@ -104,6 +102,14 @@ class LTX2Attention(Attention):
         # wrapping from the base class.
         # Cross-attention: SEPARATE_QKV since K/V come from a different source.
         qkv_mode = QKVMode.SEPARATE_QKV if self._is_cross_attn else QKVMode.FUSE_QKV
+
+        # Decide whether to ask the base class for the Ulysses-wrapped path.
+        # Caller opts in via use_ulysses. Cross-attn additionally requires no
+        # other CP to be active (Ring/Attention2D + Ulysses cross-attn is
+        # unvalidated and falls through to the plain + AG path).
+        ulysses_size = vgm.ulysses_size if vgm is not None else 1
+        cp_size = vgm.cp_size if vgm is not None else 1
+        enable_ulysses = use_ulysses and (cp_size == 1 or not self._is_cross_attn)
 
         # Map LTX RoPE type to the fused-kernel INTERLEAVE template parameter:
         #   INTERLEAVED → pair (2i, 2i+1) pattern   → kernel INTERLEAVE=true
@@ -122,66 +128,40 @@ class LTX2Attention(Attention):
             fuse_qk_norm_rope=True,
             config=config,
             layer_idx=layer_idx,
-            enable_ulysses=use_ulysses and not self._is_cross_attn,
+            enable_ulysses=enable_ulysses,
         )
 
-        # For audio self-attention that may need a runtime Ulysses toggle
-        # (sequence length not always divisible by ulysses_size), create a
-        # plain backend as fallback.  The base class already set self.attn
-        # to UlyssesAttention(inner_backend=sharded_backend).
+        # Build a runtime-toggleable Ulysses ↔ plain pair.
+        # Self-attn: audio length isn't always divisible by ulysses_size, so
+        # we need a plain fallback. Cross-attn (v2a): same need — audio Q is
+        # padded when divisible, plain backend is used otherwise. Plain has
+        # to be built with the full (unsharded) head count.
         self._has_dual_attn = False
-        ulysses_size = vgm.ulysses_size if vgm is not None else 1
-        if use_ulysses and not self._is_cross_attn and ulysses_size > 1:
+        if enable_ulysses and ulysses_size > 1:
+            U = ulysses_size
+            H = self.num_attention_heads
+            H_kv = self.num_key_value_heads
+            if H % U != 0 or H_kv % U != 0:
+                raise ValueError(
+                    f"Ulysses requires num_attention_heads ({H}) and "
+                    f"num_key_value_heads ({H_kv}) divisible by ulysses_size ({U})"
+                )
+            # Base class already built `self.attn` as the Ulysses-wrapped path
+            # (sharded inner backend + UlyssesAttention) for both self-attn and
+            # cross-attn paths.
             self._ulysses_attn = self.attn
             self._plain_attn = create_attention(
                 backend=self.attn_backend,
                 layer_idx=self.layer_idx,
-                num_heads=self.num_attention_heads,
+                num_heads=H,
                 head_dim=self.head_dim,
-                num_kv_heads=self.num_key_value_heads,
+                num_kv_heads=H_kv,
                 quant_config=self.quant_config,
                 dtype=self.dtype,
                 attention_config=config.attention,
                 attention_metadata_state=config.attention_metadata_state,
             )
             self._has_dual_attn = True
-
-        # v2a Ulysses wrap: active under pure Ulysses only. Combined modes
-        # (ring/attn2d + Ulysses) shard seq by cp_size * ulysses_size and are
-        # not validated here — they fall through to the plain + AG path.
-        cp_size = vgm.cp_size if vgm is not None else 1
-        self._has_cross_dual_attn = False
-        if use_ulysses_cross and self._is_cross_attn and ulysses_size > 1 and cp_size == 1:
-            U = ulysses_size
-            H = self.num_attention_heads
-            H_kv = self.num_key_value_heads
-            if H % U != 0 or H_kv % U != 0:
-                raise ValueError(
-                    f"Ulysses cross-attn requires num_attention_heads ({H}) and "
-                    f"num_key_value_heads ({H_kv}) divisible by ulysses_size ({U})"
-                )
-
-            self._plain_cross_attn = self.attn  # base-class built at full H
-            inner = create_attention(
-                backend=self.attn_backend,
-                layer_idx=self.layer_idx,
-                num_heads=H // U,
-                head_dim=self.head_dim,
-                num_kv_heads=H_kv // U,
-                quant_config=self.quant_config,
-                dtype=self.dtype,
-                attention_config=config.attention,
-                attention_metadata_state=config.attention_metadata_state,
-            )
-            # UlyssesAttention takes the unfused path (S_q != S_kv supported
-            # via seq_len / seq_len_kv) since VanillaAttention.support_fused_qkv() is False.
-            self._ulysses_cross_attn = UlyssesAttention(
-                inner_backend=inner,
-                process_group=vgm.ulysses_group,
-            )
-            self._modules.pop("attn", None)
-            self.attn = self._ulysses_cross_attn
-            self._has_cross_dual_attn = True
 
         if apply_gated_attention:
             self.to_gate_logits = Linear(
@@ -200,33 +180,23 @@ class LTX2Attention(Attention):
     def set_ulysses_active(self, active: bool):
         """Toggle between Ulysses-wrapped and plain attention at runtime.
 
-        Effective for modules created with ``use_ulysses=True`` (self-attn
-        dual-attn pair) or ``use_ulysses_cross=True`` (cross-attn dual-attn
-        pair). At most one of the two paths is active per module.
+        Effective for modules created with ``use_ulysses=True`` (works for
+        both self-attn and cross-attn). No-op otherwise.
         """
         if self._has_dual_attn:
             self._modules.pop("attn", None)
             self.attn = self._ulysses_attn if active else self._plain_attn
-            return
-        if self._has_cross_dual_attn:
-            self._modules.pop("attn", None)
-            self.attn = self._ulysses_cross_attn if active else self._plain_cross_attn
-            return
 
     def is_ulysses_active(self) -> bool:
         """Whether ``self.attn`` is currently the Ulysses-wrapped path.
 
         Symmetric with ``set_ulysses_active``. Returns False when no Ulysses
-        wrapper was built for this module (e.g. Attention2D mode, or cross-
-        attn without ``use_ulysses_cross``), so callers can use it to decide
-        whether to pass seq-sharded K/V (wrapper handles a2a) or to all-
-        gather K/V into full sequence first (plain backend).
+        pair was built (e.g. Attention2D mode, ulysses_size==1, or cross-attn
+        without pure Ulysses), so callers can use it to decide whether to pass
+        seq-sharded K/V (wrapper handles a2a) or to all-gather K/V into full
+        sequence first (plain backend).
         """
-        if self._has_dual_attn:
-            return self.attn is self._ulysses_attn
-        if self._has_cross_dual_attn:
-            return self.attn is self._ulysses_cross_attn
-        return False
+        return self._has_dual_attn and self.attn is self._ulysses_attn
 
     def _init_qkv_proj(self):
         """Override for cross-attention: use _context_dim for K/V input.
@@ -589,7 +559,7 @@ class BasicAVTransformerBlock(nn.Module):
             apply_gated_attention=a_cfg.apply_gated_attention,
             config=model_config,
             layer_idx=idx,
-            use_ulysses_cross=True,
+            use_ulysses=True,
         )
         self.scale_shift_table_a2v_ca_audio = nn.Parameter(torch.empty(5, a_cfg.dim))
         self.scale_shift_table_a2v_ca_video = nn.Parameter(torch.empty(5, v_cfg.dim))
