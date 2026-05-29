@@ -63,12 +63,12 @@ def _make_inputs(
         pre_idx[:, j] = j
 
     # seq_lens is uncompressed; kernel divides by cr internally.
-    # ``seq_lens = N * cr`` makes the kernel's
-    # ``N_kernel = (seq_lens - next_n + ofs + 1) // cr`` match ref's
-    # ``N_eff = N - next_n + ofs + 1`` for every row in a next_n in {1, 2}
-    # group. (For cr=1 this reduces to seq_lens = N.) NOTE: next_n >= 3
-    # + cr >= 2 has an unavoidable floor-division mismatch across rows in
-    # the same group; not exercised by the current sweep.
+    # ``seq_lens = N * cr`` makes the kernel's per-row effective scan
+    # length cover the full N columns of ``logits`` for the typical
+    # row 0 (ofs=0). Within a group different rows still see slightly
+    # different N_eff under cr>1 floor division — the reference check
+    # mirrors the kernel formula exactly, so all (next_n, cr) combos
+    # are exercisable.
     seq_lens_val = N * compress_ratio
     seq_lens = torch.full((num_groups,), seq_lens_val, dtype=torch.int32, device=device)
     return logits, pre_idx, seq_lens
@@ -77,15 +77,23 @@ def _make_inputs(
 def _tie_aware_check(
     out_indices: torch.Tensor,
     logits: torch.Tensor,
+    seq_lens: torch.Tensor,
     top_k: int,
     next_n: int,
+    compress_ratio: int = 1,
 ) -> None:
     """Vectorized multi-row tie-aware correctness check with strict sort+allclose.
 
-    Per row r: scan range is ``logits[r, :N_eff]`` where
-    ``N_eff = logits.shape[1] - next_n + (r % next_n) + 1``. Reference
-    ``torch.topk`` is masked to this range so next_n>1 doesn't produce
-    false negatives from columns the kernel never reads.
+    Per row r: scan range is ``logits[r, :N_eff(r)]`` where N_eff mirrors
+    the kernel's exact formula (see ``GvrTopKKernel.gvr_topk_kernel``):
+
+        actual_kv_len = seq_lens[r // next_n] - next_n + (r % next_n) + 1
+        N_eff = actual_kv_len // compress_ratio   # cr=1 is identity
+
+    Reference ``torch.topk`` is masked to this range so the reference and
+    kernel scan exactly the same columns under any (next_n, cr) combo
+    (including next_n>=3 + cr>=2 where the floor-division makes per-row
+    N_eff vary within a group).
 
     All checks (out-of-range, duplicates, n_below, sort+allclose) run as
     batched GPU ops; only assertion-failure diagnostics fall back to host.
@@ -96,9 +104,15 @@ def _tie_aware_check(
     logits_f32 = logits.to(torch.float32)
     N = logits.shape[1]
 
-    # Per-row N_eff (length-num_rows), depends only on (row % next_n).
+    # Per-row N_eff mirroring the kernel formula. seq_lens is per-group
+    # (length num_rows // next_n); broadcast across the next_n rows of
+    # each group before computing actual_kv_len // cr.
     row_idx = torch.arange(num_rows, device=device)
-    N_eff = N - next_n + (row_idx % next_n) + 1  # [num_rows]
+    group_idx = row_idx // next_n
+    ofs = row_idx % next_n
+    seq_lens_per_row = seq_lens.to(device=device, dtype=torch.long)[group_idx]
+    actual_kv_len = seq_lens_per_row - next_n + ofs + 1
+    N_eff = actual_kv_len // compress_ratio  # [num_rows]
 
     # Mask logits beyond per-row N_eff to -inf so torch.topk ignores tails.
     col_idx = torch.arange(N, device=device)
@@ -190,4 +204,4 @@ def test_cute_dsl_gvr_topk_decode(dtype, top_k, N, next_n, batch_size, compress_
     )
     torch.cuda.synchronize()
 
-    _tie_aware_check(out_indices, logits, top_k, next_n)
+    _tie_aware_check(out_indices, logits, seq_lens, top_k, next_n, compress_ratio=compress_ratio)

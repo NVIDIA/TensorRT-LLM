@@ -310,15 +310,21 @@ def _make_inputs(
 def _tie_aware_correct(
     kernel_idxs: torch.Tensor,
     logits: torch.Tensor,
+    seq_lens: torch.Tensor,
     top_k: int,
     next_n: int,
+    compress_ratio: int = 1,
 ) -> tuple[bool, str]:
     """Multi-row tie-aware correctness check with strict sort+allclose.
 
-    Per row r: scan range is ``logits[r, :N_eff]`` where
-        ``N_eff = logits.shape[1] - next_n + (r % next_n) + 1``.
-    Reference ``torch.topk`` must be masked to this range — otherwise
-    next_n>1 produces false negatives from columns the kernel never reads.
+    Per row r: scan range mirrors the kernel formula (see
+    ``GvrTopKKernel.gvr_topk_kernel``):
+
+        actual_kv_len = seq_lens[r // next_n] - next_n + (r % next_n) + 1
+        N_eff = actual_kv_len // compress_ratio   # cr=1 is identity
+
+    Reference ``torch.topk`` is masked to this range so reference and
+    kernel scan exactly the same columns under any (next_n, cr) combo.
 
     Returns ``(False, message)`` on the first failing row; ``(True, "ok")``
     when all rows pass. Sort+allclose catches the "drop-strictly-above +
@@ -326,10 +332,11 @@ def _tie_aware_correct(
     """
     num_rows = kernel_idxs.shape[0]
     logits_f32 = logits.to(torch.float32)
-    N = logits.shape[1]
+    seq_lens_host = seq_lens.cpu().tolist()
     for row in range(num_rows):
         ofs = row % next_n
-        N_eff = N - next_n + ofs + 1
+        actual_kv_len = int(seq_lens_host[row // next_n]) - next_n + ofs + 1
+        N_eff = actual_kv_len // compress_ratio
         if N_eff < top_k:
             # Degenerate path — skip; caller's main() guards against this.
             continue
@@ -404,7 +411,7 @@ def test_gvr_topk_decode(
         return_output_values=False,
     )
     torch.cuda.synchronize()
-    ok, msg = _tie_aware_correct(out_idxs, logits, top_k, next_n)
+    ok, msg = _tie_aware_correct(out_idxs, logits, seq_lens, top_k, next_n)
     assert ok, (
         f"dtype={dtype} K={top_k} N={N} seed={seed} next_n={next_n} "
         f"batch_size={batch_size} use_256bit_load={use_256bit_load} "
@@ -477,7 +484,14 @@ def main() -> None:
     )
     torch.cuda.synchronize()
 
-    ok, msg = _tie_aware_correct(out_idxs, logits, args.top_k, args.next_n)
+    ok, msg = _tie_aware_correct(
+        out_idxs,
+        logits,
+        seq_lens,
+        args.top_k,
+        args.next_n,
+        compress_ratio=args.compress_ratio,
+    )
     print(f"correctness: {'PASS' if ok else f'FAIL ({msg})'}")
     sys.exit(0 if ok else 1)
 
