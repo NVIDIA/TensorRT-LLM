@@ -132,7 +132,11 @@ def _insert_fused_dsv3_a(
     has_meta = fork_val is not None
     fork_dtype = fork_val.dtype if has_meta else torch.bfloat16
 
-    with graph.inserting_before(q_a_node):
+    # Insert dsv3 + narrows before the EARLIER of q_a / kv_a in graph order so
+    # downstream uses of either narrow are topologically after the narrow.
+    node_order = {n: i for i, n in enumerate(graph.nodes)}
+    earliest_consumer = min(q_a_node, kv_a_node, key=lambda n: node_order.get(n, 0))
+    with graph.inserting_before(earliest_consumer):
         get_w = graph.get_attr(key_fused, torch.Tensor)
         if has_meta:
             get_w.meta["val"] = torch.empty((_FUSED_OUT, _HD_IN), dtype=fork_dtype, device="meta")
@@ -146,14 +150,9 @@ def _insert_fused_dsv3_a(
                 (*fork_val.shape[:-1], _FUSED_OUT), dtype=fork_dtype, device="meta"
             )
 
-        q_a_narrow = graph.call_function(
-            torch.ops.aten.narrow.default,
-            args=(fused_call, -1, 0, _Q_A_OUT),
-        )
-        if has_meta:
-            q_a_narrow.meta["val"] = torch.empty(
-                (*fork_val.shape[:-1], _Q_A_OUT), dtype=fork_dtype, device="meta"
-            )
+        # V8: create kv_a narrow BEFORE q_a narrow so kv_a is earlier in graph
+        # order (small, defensive ordering — actual node placement is dominated
+        # by user consumers).
         kv_a_narrow = graph.call_function(
             torch.ops.aten.narrow.default,
             args=(fused_call, -1, _Q_A_OUT, _KV_A_OUT),
@@ -161,6 +160,14 @@ def _insert_fused_dsv3_a(
         if has_meta:
             kv_a_narrow.meta["val"] = torch.empty(
                 (*fork_val.shape[:-1], _KV_A_OUT), dtype=fork_dtype, device="meta"
+            )
+        q_a_narrow = graph.call_function(
+            torch.ops.aten.narrow.default,
+            args=(fused_call, -1, 0, _Q_A_OUT),
+        )
+        if has_meta:
+            q_a_narrow.meta["val"] = torch.empty(
+                (*fork_val.shape[:-1], _Q_A_OUT), dtype=fork_dtype, device="meta"
             )
 
     q_a_node.replace_all_uses_with(q_a_narrow)
