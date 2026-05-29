@@ -100,7 +100,7 @@ HuggingFace Model → LLM API → Executor (PyTorch/AutoDeploy/TensorRT)
 
 ## VisualGen
 
-VisualGen is a vertical alongside LLM for Diffusion-Transformer (DiT) based image/video generation
+VisualGen is a vertical alongside LLM for Diffusion-Transformer (DiT)-based image/video generation
 (text-to-image, text-to-video, image-to-video). It is **not** an LLM backend — it has
 its own engine, args, params, and outputs — but shares ops and kernels with the
 PyTorch backend where it makes sense (attention, quantization, parallelism).
