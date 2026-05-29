@@ -86,6 +86,8 @@ from tensorrt_llm.serve.responses_utils import get_steady_clock_now_in_seconds
 from tensorrt_llm.serve.responses_utils import \
     request_preprocess as responses_api_request_preprocess
 from tensorrt_llm.serve.tool_parser.tool_parser_factory import ToolParserFactory
+from tensorrt_llm.serve.visual_gen_metrics import \
+    build_visual_gen_timing_headers
 from tensorrt_llm.serve.visual_gen_utils import parse_visual_gen_params
 from tensorrt_llm.version import __version__ as VERSION
 from tensorrt_llm.visual_gen import VisualGen
@@ -1945,12 +1947,15 @@ class OpenAIServer(_VideoRoutesMixin):
                     "URL mode is not supported for image generation")
 
             latency = time.perf_counter() - image_gen_start  # seconds
-            logger.info(
-                f"Image {image_id} generated and encoded: "
-                f"latency={latency:.3f}s generation={getattr(output.metrics, 'generation', 0.0):.3f}s "
-                f"denoise={getattr(output.metrics, 'denoise', 0.0):.3f}s")
+            metrics = output.metrics
+            generation = metrics.generation if metrics is not None else 0.0
+            denoise = metrics.denoise if metrics is not None else 0.0
+            logger.info(f"Image {image_id} generated and encoded: "
+                        f"latency={latency:.3f}s generation={generation:.3f}s "
+                        f"denoise={denoise:.3f}s")
+            headers = build_visual_gen_timing_headers(metrics)
 
-            return JSONResponse(content=response.model_dump())
+            return JSONResponse(content=response.model_dump(), headers=headers)
 
         except Exception as e:
             logger.error(traceback.format_exc())
