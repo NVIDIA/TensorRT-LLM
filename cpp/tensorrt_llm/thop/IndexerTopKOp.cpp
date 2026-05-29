@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2025, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -143,8 +143,15 @@ void indexer_topk_decode(th::Tensor const& logits, th::Tensor const& seq_lens, t
     }
 
     // `done_counter_scratch` is kept on the op signature for source compat
-    // but unused since the fused split-work tier was removed.
-    (void) done_counter_scratch;
+    // but unused since the fused split-work tier was removed. Warn once so
+    // callers still passing it know to drop the argument.
+    if (done_counter_scratch.has_value())
+    {
+        TORCH_WARN_ONCE(
+            "indexer_topk_decode: `done_counter_scratch` is deprecated and ignored since the fused split-work tier "
+            "was removed; drop this argument. The multi-pass radix path allocates its scratch internally, or you may "
+            "pass a pre-allocated buffer via `scratch` for CUDA-graph capture.");
+    }
 
     if (logits_dtype == at::ScalarType::Float)
     {

@@ -1160,7 +1160,9 @@ void invokeIndexerTopKDecodeImpl(InputT const* logits, int const* seqLens, int* 
     cudaStream_t const stream, void* scratch, size_t scratchBytes, bool is_prefill)
 {
     // Split-work cutoff: matches main's 200k default. is_prefill forces
-    // single-block.
+    // single-block via a 1<<30 threshold no shape can reach: prefill chunks are
+    // bounded by max_num_tokens, well below the multi-pass radix crossover at
+    // any practical setting.
     int const adaptiveSplitWorkThreshold = is_prefill ? (1 << 30) : 200 * 1000;
     int const effectiveSplitWorkThreshold = splitWorkThreshold > 0 ? splitWorkThreshold : adaptiveSplitWorkThreshold;
     constexpr int kNumThreadsPerBlock = 512;
