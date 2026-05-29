@@ -4473,6 +4473,17 @@ class NVFP4TRTLLMGenFusedMoEBaseMethod(NVFP4FusedMoEMethod):
         # Finalize shared expert alphas and fc31_scale_c for online EPLB
         self._finalize_shared_expert_alphas(module)
 
+        # Cubin clamp / GLU bias inputs are consumed in the pre-dequant GEMM
+        # output domain (i.e. divided by fc31_alpha / fc2_alpha).
+        if getattr(module, 'w3_w1_bias', None) is not None:
+            module.w3_w1_bias.data.div_((module.fc31_alpha.data).view(-1, 1))
+        if getattr(module, 'w2_bias', None) is not None:
+            module.w2_bias.data.div_((module.fc2_alpha.data).view(-1, 1))
+        if getattr(module, 'swiglu_beta', None) is not None:
+            module.swiglu_beta.data.div_((module.fc31_alpha.data))
+        if getattr(module, 'swiglu_limit', None) is not None:
+            module.swiglu_limit.data.div_((module.fc31_alpha.data))
+
     def _shuffle_shared_expert_tensors(self,
                                        module: torch.nn.Module,
                                        num_elts_per_sf: int = 16):
@@ -4951,30 +4962,6 @@ class NVFP4TRTLLMGenFusedMoEMethod(NVFP4TRTLLMGenFusedMoEBaseMethod):
                 self._shuffle_w3_w1_weight(module,
                                            module.w3_w1_bias.data[expert_idx])
                 self._shuffle_w2_weight(module.w2_bias.data[expert_idx])
-
-    def process_weights_after_loading(self,
-                                      module: torch.nn.Module,
-                                      num_elts_per_sf: int = 16):
-        # Call parent to compute global input scales, alphas, and fc31_scale_c first
-        super().process_weights_after_loading(module,
-                                              num_elts_per_sf=num_elts_per_sf)
-
-        # Normalize biases to account for the global scale factors,
-        # matching the kernel's expectation (similar to test_moe.py logic).
-        # This must happen after alphas are finalized.
-        if module.w3_w1_bias is not None:
-            # gemm1_bias * gemm1_scales_global * hidden_states_scale_global
-            module.w3_w1_bias.data.div_((module.fc31_alpha.data).view(-1, 1))
-
-        if module.w2_bias is not None:
-            # gemm2_bias * c_global_sf * gemm2_scales_global
-            module.w2_bias.data.div_((module.fc2_alpha.data).view(-1, 1))
-
-        if module.swiglu_beta is not None:
-            module.swiglu_beta.data.div_((module.fc31_alpha.data))
-
-        if module.swiglu_limit is not None:
-            module.swiglu_limit.data.div_((module.fc31_alpha.data))
 
 
 class W4A8NVFP4FP8TRTLLMGenFusedMoEMethod(NVFP4TRTLLMGenFusedMoEBaseMethod):
