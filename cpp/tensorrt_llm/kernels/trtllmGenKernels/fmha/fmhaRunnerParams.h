@@ -342,13 +342,8 @@ struct TllmGenFmhaRunnerParams
     // When seqlensQPtr[i] < mPackedMaskMaxSeqLenQ, the packed mask tensor has
     // row stride ceilDiv(mPackedMaskMaxSeqLenQ, 32) rather than ceilDiv(seqLenQ, 32).
     int32_t mPackedMaskMaxSeqLenQ = 0;
-    // Engine-wide max draft tokens (max_total_draft_tokens) for spec-dec kernel selection.
-    // Used ONLY by selectGqGenerationKernel() to compute numTokensHeadsQ deterministically.
-    // Does NOT affect computeNumCtas() or mask preparation (those use mPackedMaskMaxSeqLenQ).
+    // Dynamic-tree bounds used by FMHA kernel selection.
     int32_t mSpecDecodingMaxDraftTokens = 0;
-    // max_total_draft_tokens + 1 from config. Used ONLY for kernel type selection
-    // (SwapsMmaAb vs KeepsMmaAb) in selectGqGenerationKernel(). Separate from
-    // mSpecDecodingMaxDraftTokens to avoid coupling with tensor-shape-derived values.
     int32_t mSpecDecodingTargetMaxGenLen = 0;
 
     // set the attention mask type

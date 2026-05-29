@@ -19,7 +19,6 @@
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/logger.h"
 #include <cstdint>
-#include <cub/cub.cuh>
 #include <cuda_runtime.h>
 
 TRTLLM_NAMESPACE_BEGIN
@@ -28,76 +27,103 @@ namespace kernels
 {
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-// Pre-allocated device counter for the custom-mask offsets prefix-sum.
-// A static __device__ symbol (zeroed via cudaMemsetAsync before each launch) keeps the
-// custom-mask preparation path CUDA-graph-capture-safe; per-iteration async allocation
-// would not be capturable. The offset kernels for KeepsMmaAb and SwapsMmaAb are mutually
-// exclusive per layer-0 invocation, so a single shared counter is sufficient.
-namespace
-{
-__device__ unsigned long long gCustomMaskOffsetsCounter;
-} // namespace
+constexpr int32_t kCustomMaskOffsetScanBlockSize = 256;
 
 __device__ __host__ inline int32_t ceilDiv(int32_t a, int32_t b)
 {
     return (a + b - 1) / b;
 }
 
-__global__ void computeCustomMaskOffsetsKernel(
-    TllmGenFmhaRunnerParams runnerParams, int32_t stepQ, int32_t stepKv, unsigned long long* globalCounter)
+__device__ inline int64_t computeKeepsMmaAbCustomMaskSize(int32_t seqLenQ, int32_t seqLenKv,
+    int32_t firstSparseMaskOffsetKv, int32_t numHeadsQPerKv, int32_t stepQ, int32_t stepKv)
 {
-    int32_t batchSize = runnerParams.mBatchSize;
-    int32_t numHeadsQPerKv = runnerParams.mNumHeadsQPerKv;
-    int32_t tileSizeQPerCta = stepQ;
-    int32_t tileSizeKvPerCta = stepKv;
+    int32_t const numTilesQ = ceilDiv(seqLenQ * numHeadsQPerKv, stepQ);
+    int32_t const firstSparseTile = firstSparseMaskOffsetKv / stepKv;
+    int32_t const numCustomMaskTilesKv = ceilDiv(seqLenKv, stepKv) - firstSparseTile;
+
+    return static_cast<int64_t>(numTilesQ) * numCustomMaskTilesKv * stepQ * stepKv / 32;
+}
+
+__device__ inline int64_t computeSwapsMmaAbCustomMaskSize(int32_t seqLenQ, int32_t seqLenKv,
+    int32_t firstSparseMaskOffsetKv, int32_t numHeadsQPerKv, int32_t stepQ, int32_t stepKv, int32_t tileSizeQRaw,
+    int32_t tileSizeKv)
+{
+    int32_t const numInstsQ = stepQ / tileSizeQRaw;
+    int32_t const numInstsKv = stepKv / tileSizeKv;
+    int32_t const tileSizeKvPerCta = stepKv;
+    int32_t const tileSizeQ = ceilDiv(tileSizeQRaw, 32) * 32;
+    int32_t const tileSizeQPerCta = tileSizeQ * numInstsQ;
+    int32_t const numTilesQPerToken = ceilDiv(numHeadsQPerKv, tileSizeQPerCta);
+    int32_t const numTilesQ = seqLenQ * numTilesQPerToken;
+    int32_t const firstSparseTile = firstSparseMaskOffsetKv / tileSizeKvPerCta;
+    int32_t const numCustomMaskTilesKv = ceilDiv(seqLenKv, tileSizeKvPerCta) - firstSparseTile;
+    int32_t const perTileSize = numInstsQ * numInstsKv * (tileSizeQ * tileSizeKv) / 32;
+
+    return static_cast<int64_t>(numTilesQ) * numCustomMaskTilesKv * perTileSize;
+}
+
+__global__ void computeCustomMaskOffsetsParallelKernel(
+    TllmGenFmhaRunnerParams runnerParams, int32_t stepQ, int32_t stepKv)
+{
+    // One CTA computes deterministic batch-prefix offsets.
+    __shared__ int64_t threadSums[kCustomMaskOffsetScanBlockSize];
+
+    int32_t const batchSize = runnerParams.mBatchSize;
+    int32_t const numHeadsQPerKv = runnerParams.mNumHeadsQPerKv;
     int32_t const* seqLensKvPtr = runnerParams.seqLensKvPtr;
     int32_t const* firstSparseMaskOffsetsKvPtr = runnerParams.firstSparseMaskOffsetsKvPtr;
-
-    typedef cub::BlockScan<int64_t, 128> BlockScan;
-    __shared__ typename BlockScan::TempStorage temp_storage;
-
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int64_t maskSize = 0;
-
-    if (idx < batchSize)
+    int32_t const itemsPerThread = ceilDiv(batchSize, static_cast<int32_t>(blockDim.x));
+    int32_t const threadIdxX = static_cast<int32_t>(threadIdx.x);
+    int32_t const startIdx = threadIdxX * itemsPerThread;
+    int32_t endIdx = startIdx + itemsPerThread;
+    if (endIdx > batchSize)
     {
-
-        int32_t seqLenQ = runnerParams.seqLensQPtr[idx];
-        int32_t seqLenKv = seqLensKvPtr[idx];
-        int32_t firstSparseMaskOffsetKv = firstSparseMaskOffsetsKvPtr[idx];
-
-        int32_t numTilesQ = (seqLenQ * numHeadsQPerKv + tileSizeQPerCta - 1) / tileSizeQPerCta;
-        int32_t firstSparseTile = firstSparseMaskOffsetKv / tileSizeKvPerCta;
-        int32_t numCustomMaskTilesKv = (seqLenKv + tileSizeKvPerCta - 1) / tileSizeKvPerCta - firstSparseTile;
-
-        maskSize = static_cast<int64_t>(numTilesQ * numCustomMaskTilesKv * stepQ * stepKv / 32);
+        endIdx = batchSize;
     }
 
-    int64_t prefixOffset;
-    int64_t blockSum;
-    BlockScan(temp_storage).ExclusiveSum(maskSize, prefixOffset, blockSum);
+    int64_t threadSum = 0;
+    for (int32_t idx = startIdx; idx < endIdx; ++idx)
+    {
+        int32_t const seqLenQ = runnerParams.seqLensQPtr[idx];
+        int32_t const seqLenKv = seqLensKvPtr[idx];
+        int32_t const firstSparseMaskOffsetKv = firstSparseMaskOffsetsKvPtr[idx];
+        threadSum += computeKeepsMmaAbCustomMaskSize(
+            seqLenQ, seqLenKv, firstSparseMaskOffsetKv, numHeadsQPerKv, stepQ, stepKv);
+    }
 
-    __shared__ unsigned long long blockBase;
-    if (threadIdx.x == 0)
-        blockBase = atomicAdd(globalCounter, (unsigned long long) blockSum);
+    threadSums[threadIdxX] = threadSum;
     __syncthreads();
 
-    if (idx < batchSize)
-        runnerParams.customMaskOffsetsPtr[idx] = static_cast<int64_t>(blockBase) + prefixOffset;
+    for (int32_t stride = 1; stride < blockDim.x; stride <<= 1)
+    {
+        int64_t partialSum = 0;
+        if (threadIdxX >= stride)
+        {
+            partialSum = threadSums[threadIdxX - stride];
+        }
+        __syncthreads();
+        threadSums[threadIdxX] += partialSum;
+        __syncthreads();
+    }
+
+    int64_t localOffset = threadSums[threadIdxX] - threadSum;
+    for (int32_t idx = startIdx; idx < endIdx; ++idx)
+    {
+        runnerParams.customMaskOffsetsPtr[idx] = localOffset;
+
+        int32_t const seqLenQ = runnerParams.seqLensQPtr[idx];
+        int32_t const seqLenKv = seqLensKvPtr[idx];
+        int32_t const firstSparseMaskOffsetKv = firstSparseMaskOffsetsKvPtr[idx];
+        localOffset += computeKeepsMmaAbCustomMaskSize(
+            seqLenQ, seqLenKv, firstSparseMaskOffsetKv, numHeadsQPerKv, stepQ, stepKv);
+    }
 }
 
 void launchComputeCustomMaskOffsetsKernel(
     TllmGenFmhaRunnerParams const& runnerParams, int32_t stepQ, int32_t stepKv, cudaStream_t stream)
 {
-    int32_t batchSize = runnerParams.mBatchSize;
-
-    unsigned long long* d_globalCounter = nullptr;
-    TLLM_CUDA_CHECK(cudaGetSymbolAddress(reinterpret_cast<void**>(&d_globalCounter), gCustomMaskOffsetsCounter));
-    cudaMemsetAsync(d_globalCounter, 0, sizeof(unsigned long long), stream);
-
-    int blockSize = 128;
-    int gridSize = (batchSize + blockSize - 1) / blockSize;
-    computeCustomMaskOffsetsKernel<<<gridSize, blockSize, 0, stream>>>(runnerParams, stepQ, stepKv, d_globalCounter);
+    computeCustomMaskOffsetsParallelKernel<<<1, kCustomMaskOffsetScanBlockSize, 0, stream>>>(
+        runnerParams, stepQ, stepKv);
 }
 
 // Input: customMaskInput (generalPackedCustoMaskPtr) shape: [batch_size, seqLenQ, ceilDiv(seqLenKv-firstSparse, 32)]
@@ -140,8 +166,7 @@ __global__ void prepareCustomMaskBuffersKernelForKeepsMmaAb(
     // The sequence length of tensor KV.
     int32_t const seqLenKv = seqLensKvPtr[batchIdx];
 
-    // Row width (int32 blocks per row) derives from mPackedMaskMaxSeqLenQ
-    // (the padded row dim of the Python-allocated spec-dec packed-mask buffer).
+    // Use the padded mask row stride from the Python buffer.
     int32_t const packedMaskMaxSeqLenQ
         = runnerParams.mPackedMaskMaxSeqLenQ > 0 ? runnerParams.mPackedMaskMaxSeqLenQ : seqLenQ;
     int32_t const packedMaskNumBlocks = ceilDiv(packedMaskMaxSeqLenQ, 32);
@@ -184,12 +209,7 @@ __global__ void prepareCustomMaskBuffersKernelForKeepsMmaAb(
         int32_t const qPosInTree = tokenIdxKv - firstSparseMaskOffsetKv;
         if (qPosInTree < seqLenQ)
         {
-            // Row offset: this Blackwell trtllm-gen kernel reads the spec-decoding
-            // packed mask that Python allocates as the padded 3D buffer
-            // [max_num_requests, buf_dim, ceilDiv(buf_dim, 32)] with row stride
-            // ceilDiv(buf_dim, 32). Always use padded addressing
-            // (batchIdx * packedMaskMaxSeqLenQ + tokenIdxQ); cumSeqLensQPtr is set
-            // by the FMHA runner for its own Q layout, not for this mask read.
+            // Use padded mask stride; FMHA cumSeqLensQ does not describe mask storage.
             int32_t const rowOffset = batchIdx * packedMaskMaxSeqLenQ + tokenIdxQ;
             int32_t const qMaskBaseIdx = rowOffset * packedMaskNumBlocks;
             int32_t const packedMaskIdx = qMaskBaseIdx + (qPosInTree >> 5);
@@ -282,11 +302,7 @@ void launchPrepareCustomMaskBuffersKernelForKeepsMmaAb(TllmGenFmhaRunnerParams c
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-// SwapsMmaAb + Custom mask with groupsTokensHeadsQ=false:
-// - Each CTA handles 1 token x tileSizeQ heads
-// - Mask layout per tile: [numInstsQ][numInstsKv][tileSizeKv][tileSizeQPadded / 32] uint32s
-// - tileSizeQPadded = roundUp(tileSizeQ, 32), e.g., Q8 -> 32
-// - All heads of the same token share the same mask value (tree mask is per-token)
+// SwapsMmaAb custom mask for groupsTokensHeadsQ=false.
 __global__ void prepareCustomMaskBuffersKernelForSwapsMmaAb(
     TllmGenFmhaRunnerParams runnerParams, int32_t stepQ, int32_t stepKv, int32_t tileSizeQRaw, int32_t tileSizeKv)
 {
@@ -295,9 +311,8 @@ __global__ void prepareCustomMaskBuffersKernelForSwapsMmaAb(
     int32_t const numInstsQ = stepQ / tileSizeQRaw;
     int32_t const numInstsKv = stepKv / tileSizeKv;
     int32_t const tileSizeKvPerCta = stepKv;
-    // Pad tileSizeQ to 32 for uint32 packing (must match Fmha.cpp:147 and Mask.h:1494)
+    // Pad tileSizeQ for uint32 packing.
     int32_t const tileSizeQ = ((tileSizeQRaw + 31) / 32) * 32;
-    // tileSizeQPerCta uses padded tileSizeQ (Fmha.cpp:151)
     int32_t const tileSizeQPerCta = tileSizeQ * numInstsQ;
     int32_t const* seqLensKvPtr = runnerParams.seqLensKvPtr;
     int64_t* customMaskOffsetsPtr = runnerParams.customMaskOffsetsPtr;
@@ -306,10 +321,8 @@ __global__ void prepareCustomMaskBuffersKernelForSwapsMmaAb(
     int32_t* firstSparseMaskOffsetsKvPtr = runnerParams.firstSparseMaskOffsetsKvPtr;
 
     int32_t const batchIdx = static_cast<int32_t>(blockIdx.x);
-    // threadIdx.x = token index within block, blockIdx.y = token group
     int32_t const tokenThreadIdx = static_cast<int32_t>(threadIdx.x);
     int32_t const tokenGroupIdx = static_cast<int32_t>(blockIdx.y);
-    // threadIdx.y = kv index within block, blockIdx.z = kv group
     int32_t const kvThreadIdx = static_cast<int32_t>(threadIdx.y);
     int32_t const kvGroupIdx = static_cast<int32_t>(blockIdx.z);
 
@@ -318,22 +331,18 @@ __global__ void prepareCustomMaskBuffersKernelForSwapsMmaAb(
         return;
     }
 
-    // First sparse mask offset
     int32_t const firstSparseMaskOffsetKv = firstSparseMaskOffsetsKvPtr[batchIdx];
     int32_t const firstSparseMaskTileOffsetKv = firstSparseMaskOffsetKv / tileSizeKvPerCta;
     int32_t const adjustedFirstSparseMaskOffsetKv = firstSparseMaskTileOffsetKv * tileSizeKvPerCta;
 
-    // Sequence lengths
     int32_t const seqLenQ = runnerParams.seqLensQPtr[batchIdx];
     int32_t const seqLenKv = seqLensKvPtr[batchIdx];
 
-    // Packed mask input dimensions (padded 3D buffer with row stride
-    // ceilDiv(packedMaskMaxSeqLenQ, 32); see KeepsMmaAb comment).
+    // Use padded mask row stride; see KeepsMmaAb path.
     int32_t const packedMaskMaxSeqLenQ
         = runnerParams.mPackedMaskMaxSeqLenQ > 0 ? runnerParams.mPackedMaskMaxSeqLenQ : seqLenQ;
     int32_t const packedMaskNumBlocks = ceilDiv(packedMaskMaxSeqLenQ, 32);
 
-    // Token index (this thread's Q token)
     int32_t const tokensPerBlock = static_cast<int32_t>(blockDim.x);
     int32_t const tokenIdxQ = tokenGroupIdx * tokensPerBlock + tokenThreadIdx;
     if (tokenIdxQ >= seqLenQ)
@@ -341,7 +350,6 @@ __global__ void prepareCustomMaskBuffersKernelForSwapsMmaAb(
         return;
     }
 
-    // KV index
     int32_t const kvTokensPerBlock = static_cast<int32_t>(blockDim.y);
     int32_t const globalKvIdx = kvGroupIdx * kvTokensPerBlock + kvThreadIdx;
     int32_t const tokenIdxKv = adjustedFirstSparseMaskOffsetKv + globalKvIdx;
@@ -350,7 +358,6 @@ __global__ void prepareCustomMaskBuffersKernelForSwapsMmaAb(
         return;
     }
 
-    // Determine mask value for this (tokenQ, tokenKv) pair
     int32_t randomMask = 0;
     if (tokenIdxKv < firstSparseMaskOffsetKv)
     {
@@ -361,7 +368,7 @@ __global__ void prepareCustomMaskBuffersKernelForSwapsMmaAb(
         int32_t const qPosInTree = tokenIdxKv - firstSparseMaskOffsetKv;
         if (qPosInTree < seqLenQ)
         {
-            // Always use padded addressing (see KeepsMmaAb path comment above).
+            // Use padded mask row stride.
             int32_t const rowOffset = batchIdx * packedMaskMaxSeqLenQ + tokenIdxQ;
             int32_t const qMaskBaseIdx = rowOffset * packedMaskNumBlocks;
             int32_t const packedMaskIdx = qMaskBaseIdx + (qPosInTree >> 5);
@@ -376,17 +383,15 @@ __global__ void prepareCustomMaskBuffersKernelForSwapsMmaAb(
         int64_t const customMaskOffset = customMaskOffsetsPtr[batchIdx];
         uint32_t* localCustomMaskPtr = customMaskPtr + customMaskOffset;
 
-        // For groupsTokensHeadsQ=false: tileQ = tokenIdxQ (1 tile per token when numHeadsQPerKv <= tileSizeQ)
+        // One Q tile per token when heads fit in the padded tile.
         int32_t const numTilesQPerToken = ceilDiv(numHeadsQPerKv, tileSizeQPerCta);
 
-        // KV tile indices
         int32_t const customMaskKvIdx = tokenIdxKv - adjustedFirstSparseMaskOffsetKv;
         int32_t const tileIdxKv = customMaskKvIdx / tileSizeKvPerCta;
         int32_t const instIdxKv = (customMaskKvIdx % tileSizeKvPerCta) / tileSizeKv;
         int32_t const kvInTile = customMaskKvIdx % tileSizeKv;
 
-        // Write mask bits using the exact same indexing as trtllm-gen Fmha.cpp lines 268-322.
-        // For SwapsMmaAb: iterate over heads, compute LDTM-permuted bit offset.
+        // Match trtllm-gen SwapsMmaAb LDTM bit layout.
         for (int32_t headIdxInGrp = 0; headIdxInGrp < numHeadsQPerKv; ++headIdxInGrp)
         {
             int32_t const customMaskTokenIdxQ = headIdxInGrp;
@@ -399,7 +404,6 @@ __global__ void prepareCustomMaskBuffersKernelForSwapsMmaAb(
             int64_t const instOffset = tileOffset * numInstsQ * numInstsKv + (instIdxQ * numInstsKv + instIdxKv);
             int64_t maskOffset = instOffset * tileSizeQ * tileSizeKv;
 
-            // Fmha.cpp:297-316: SwapsMmaAb LDTM 16dp.256bit permutation
             int32_t const tokenIdxInTileKv = kvInTile;
             int32_t const threadIdxQ = (tokenIdxInTileQ % 8) / 2;
             int32_t const threadIdxKv = (tokenIdxInTileKv % 8) + (tokenIdxInTileKv / 32) * 8;
@@ -444,72 +448,68 @@ void launchPrepareCustomMaskBuffersKernelForSwapsMmaAb(TllmGenFmhaRunnerParams c
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-// Offset computation for SwapsMmaAb (different tile size formula)
-__global__ void computeCustomMaskOffsetsKernelForSwapsMmaAb(TllmGenFmhaRunnerParams runnerParams, int32_t stepQ,
-    int32_t stepKv, int32_t tileSizeQRaw, int32_t tileSizeKv, unsigned long long* globalCounter)
+__global__ void computeCustomMaskOffsetsParallelKernelForSwapsMmaAb(
+    TllmGenFmhaRunnerParams runnerParams, int32_t stepQ, int32_t stepKv, int32_t tileSizeQRaw, int32_t tileSizeKv)
 {
-    int32_t batchSize = runnerParams.mBatchSize;
-    int32_t numHeadsQPerKv = runnerParams.mNumHeadsQPerKv;
-    int32_t numInstsQ = stepQ / tileSizeQRaw;
-    int32_t numInstsKv = stepKv / tileSizeKv;
-    int32_t tileSizeKvPerCta = stepKv;
-    // Pad tileSizeQ to 32 for uint32 packing (must match Mask.h:1494)
-    int32_t tileSizeQ = ((tileSizeQRaw + 31) / 32) * 32;
-    int32_t tileSizeQPerCta = tileSizeQ * numInstsQ;
+    // One CTA computes deterministic batch-prefix offsets.
+    __shared__ int64_t threadSums[kCustomMaskOffsetScanBlockSize];
 
+    int32_t const batchSize = runnerParams.mBatchSize;
+    int32_t const numHeadsQPerKv = runnerParams.mNumHeadsQPerKv;
     int32_t const* seqLensKvPtr = runnerParams.seqLensKvPtr;
     int32_t const* firstSparseMaskOffsetsKvPtr = runnerParams.firstSparseMaskOffsetsKvPtr;
-
-    typedef cub::BlockScan<int64_t, 128> BlockScan;
-    __shared__ typename BlockScan::TempStorage temp_storage;
-
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int64_t maskSize = 0;
-
-    if (idx < batchSize)
+    int32_t const itemsPerThread = ceilDiv(batchSize, static_cast<int32_t>(blockDim.x));
+    int32_t const threadIdxX = static_cast<int32_t>(threadIdx.x);
+    int32_t const startIdx = threadIdxX * itemsPerThread;
+    int32_t endIdx = startIdx + itemsPerThread;
+    if (endIdx > batchSize)
     {
-        int32_t seqLenQ = runnerParams.seqLensQPtr[idx];
-        int32_t seqLenKv = seqLensKvPtr[idx];
-        int32_t firstSparseMaskOffsetKv = firstSparseMaskOffsetsKvPtr[idx];
-
-        // For groupsTokensHeadsQ=false: 1 token per CTA, heads within tile
-        int32_t numTilesQPerToken = ceilDiv(numHeadsQPerKv, tileSizeQPerCta);
-        int32_t numTilesQ = seqLenQ * numTilesQPerToken;
-
-        int32_t firstSparseTile = firstSparseMaskOffsetKv / tileSizeKvPerCta;
-        int32_t numCustomMaskTilesKv = ceilDiv(seqLenKv, tileSizeKvPerCta) - firstSparseTile;
-
-        // Per-tile size in uint32: numInstsQ * numInstsKv * (tileSizeQ * tileSizeKv) / 32
-        int32_t perTileSize = numInstsQ * numInstsKv * (tileSizeQ * tileSizeKv) / 32;
-        maskSize = static_cast<int64_t>(numTilesQ) * numCustomMaskTilesKv * perTileSize;
+        endIdx = batchSize;
     }
 
-    int64_t prefixOffset;
-    int64_t blockSum;
-    BlockScan(temp_storage).ExclusiveSum(maskSize, prefixOffset, blockSum);
+    int64_t threadSum = 0;
+    for (int32_t idx = startIdx; idx < endIdx; ++idx)
+    {
+        int32_t const seqLenQ = runnerParams.seqLensQPtr[idx];
+        int32_t const seqLenKv = seqLensKvPtr[idx];
+        int32_t const firstSparseMaskOffsetKv = firstSparseMaskOffsetsKvPtr[idx];
+        threadSum += computeSwapsMmaAbCustomMaskSize(
+            seqLenQ, seqLenKv, firstSparseMaskOffsetKv, numHeadsQPerKv, stepQ, stepKv, tileSizeQRaw, tileSizeKv);
+    }
 
-    __shared__ unsigned long long blockBase;
-    if (threadIdx.x == 0)
-        blockBase = atomicAdd(globalCounter, (unsigned long long) blockSum);
+    threadSums[threadIdxX] = threadSum;
     __syncthreads();
 
-    if (idx < batchSize)
-        runnerParams.customMaskOffsetsPtr[idx] = static_cast<int64_t>(blockBase) + prefixOffset;
+    for (int32_t stride = 1; stride < blockDim.x; stride <<= 1)
+    {
+        int64_t partialSum = 0;
+        if (threadIdxX >= stride)
+        {
+            partialSum = threadSums[threadIdxX - stride];
+        }
+        __syncthreads();
+        threadSums[threadIdxX] += partialSum;
+        __syncthreads();
+    }
+
+    int64_t localOffset = threadSums[threadIdxX] - threadSum;
+    for (int32_t idx = startIdx; idx < endIdx; ++idx)
+    {
+        runnerParams.customMaskOffsetsPtr[idx] = localOffset;
+
+        int32_t const seqLenQ = runnerParams.seqLensQPtr[idx];
+        int32_t const seqLenKv = seqLensKvPtr[idx];
+        int32_t const firstSparseMaskOffsetKv = firstSparseMaskOffsetsKvPtr[idx];
+        localOffset += computeSwapsMmaAbCustomMaskSize(
+            seqLenQ, seqLenKv, firstSparseMaskOffsetKv, numHeadsQPerKv, stepQ, stepKv, tileSizeQRaw, tileSizeKv);
+    }
 }
 
 void launchComputeCustomMaskOffsetsKernelForSwapsMmaAb(TllmGenFmhaRunnerParams const& runnerParams, int32_t stepQ,
     int32_t stepKv, int32_t tileSizeQ, int32_t tileSizeKv, cudaStream_t stream)
 {
-    int32_t batchSize = runnerParams.mBatchSize;
-
-    unsigned long long* d_globalCounter = nullptr;
-    TLLM_CUDA_CHECK(cudaGetSymbolAddress(reinterpret_cast<void**>(&d_globalCounter), gCustomMaskOffsetsCounter));
-    cudaMemsetAsync(d_globalCounter, 0, sizeof(unsigned long long), stream);
-
-    int blockSize = 128;
-    int gridSize = (batchSize + blockSize - 1) / blockSize;
-    computeCustomMaskOffsetsKernelForSwapsMmaAb<<<gridSize, blockSize, 0, stream>>>(
-        runnerParams, stepQ, stepKv, tileSizeQ, tileSizeKv, d_globalCounter);
+    computeCustomMaskOffsetsParallelKernelForSwapsMmaAb<<<1, kCustomMaskOffsetScanBlockSize, 0, stream>>>(
+        runnerParams, stepQ, stepKv, tileSizeQ, tileSizeKv);
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -527,18 +527,13 @@ void runPrepareCustomMask(TllmGenFmhaRunnerParams const& runnerParams, FmhaKerne
                 "formula: tile_size_q * tile_size_k * num_instances_q * num_instances_k");
             return;
         }
-        // Step 1: Compute offsets on GPU using prefix sum
         launchComputeCustomMaskOffsetsKernel(runnerParams, stepQ, stepKv, stream);
-        // Step 2: Compute custom mask buffers
         launchPrepareCustomMaskBuffersKernelForKeepsMmaAb(runnerParams, stepQ, stepKv, tileSizeQ, tileSizeKv, stream);
         TLLM_CUDA_CHECK(cudaGetLastError());
     }
     else if (isSwapsMmaAbForGenerationKernel(static_cast<FmhaKernelType>(kernelType)))
     {
-        // SwapsMmaAb + Custom mask with groupsTokensHeadsQ=false.
-        // Step 1: Compute offsets (different tile formula from KeepsMmaAb)
         launchComputeCustomMaskOffsetsKernelForSwapsMmaAb(runnerParams, stepQ, stepKv, tileSizeQ, tileSizeKv, stream);
-        // Step 2: Compute custom mask buffers in SwapsMmaAb layout
         launchPrepareCustomMaskBuffersKernelForSwapsMmaAb(runnerParams, stepQ, stepKv, tileSizeQ, tileSizeKv, stream);
         TLLM_CUDA_CHECK(cudaGetLastError());
     }

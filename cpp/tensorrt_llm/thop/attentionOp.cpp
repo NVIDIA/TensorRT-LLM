@@ -861,12 +861,7 @@ public:
                 TLLM_CHECK(spec_decoding_position_offsets_for_cpp->dim() == 2); // [batch_size, max_draft_len + 1]
                 if (useTllmGen)
                 {
-                    // Blackwell trtllm-gen: packed-mask buffer is padded 3D
-                    // [batch, buf_dim, ceilDiv(buf_dim,32)] where buf_dim is the engine-wide
-                    // max (max(max_total_draft_tokens+1, K*max_draft_len)). Set
-                    // spec_decoding_max_generation_length to buf_dim so xqaDispatcher
-                    // forwards the padded row stride to prepareCustomMask.cu and the
-                    // mMaxSeqLenQ cap stays at a warmup/runtime-stable engine upper bound.
+                    // Blackwell uses the padded packed-mask row dim as the mask stride.
                     TLLM_CHECK(spec_decoding_packed_mask->dim() == 3);
                     enqueue_params.spec_decoding_max_generation_length = spec_decoding_packed_mask->sizes()[1];
                 }
@@ -1111,9 +1106,7 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
     op->mIsSpecDecodingEnabled = is_spec_decoding_enabled;
     op->mUseSpecDecoding = use_spec_decoding;
     op->mIsSpecDecTree = is_spec_dec_tree;
-    // Set config-time max gen length for FmhaAutoTuner spec-dec tree kernel selection.
-    // Must be set before the cache key is computed below, since mSpecDecodingTargetMaxGenLen
-    // participates in op->data() and distinguishes ops compiled for different tree shapes.
+    // Include static tree length in the AttentionOp cache key.
     if (spec_decoding_target_max_draft_tokens.has_value() && op->mSpecDecodingTargetMaxGenLen == 0)
     {
         op->mSpecDecodingTargetMaxGenLen = static_cast<int32_t>(spec_decoding_target_max_draft_tokens.value()) + 1;

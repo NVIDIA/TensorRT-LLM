@@ -990,13 +990,7 @@ private:
         options.mIsCustomSpecDecodingGen = !isContext && params.mMaxSeqLenQ > 1 && params.mIsSpecDecTree;
         options.mIsCausalSpecDecodingGen = !isContext && params.mMaxSeqLenQ > 1 && !params.mIsSpecDecTree;
         options.mNumSpecDecodingTokens = !isContext && params.mMaxSeqLenQ > 1 ? params.mMaxSeqLenQ : 0;
-        // Propagate the config-time spec-dec tree upper bound so FmhaAutoTuner::
-        // selectSpecDecTreeKernel() picks tileSizeQ + kernelType from
-        // numTokensHeadsQ deterministically.
-        // mSpecDecodingTargetMaxGenLen = max_total_draft_tokens + 1 (from
-        // AttentionOp). The rebased FmhaOptions drops the old mIsSpecDecTree
-        // gate: mIsCustomSpecDecodingGen + (mSpecDecodingTargetMaxGenLen > 0)
-        // together carry the same intent.
+        // Carry static tree length into FMHA kernel selection.
         options.mSpecDecodingTargetMaxGenLen = params.mSpecDecodingTargetMaxGenLen;
 
         options.mIsTrtllmLayout = true;

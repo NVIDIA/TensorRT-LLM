@@ -826,10 +826,8 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         Uses persistent buffers (only allocate if None) for CUDA graph compatibility.
         """
         if self.spec_decoding_bl_tree_mask_offset is None:
-            # +1: extra slot at the end used as atomic counter in prepareCustomMask.cu
-            # (replaces cudaMallocAsync which is not CUDA-graph-capturable)
             self.spec_decoding_bl_tree_mask_offset = torch.zeros(
-                [self.max_num_requests + 1],
+                [self.max_num_requests],
                 dtype=torch.int64,
                 device='cuda',
             )
@@ -910,12 +908,7 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                 ``[num_contexts:batch_size]`` rather than ``[:batch_size]``.
         '''
 
-        # Disable spec decoding on Blackwell (sm100+) for non-dynamic-tree paths.
-        # The trtllmGen FMHA kernels' spec-dec path has only been validated for
-        # the dynamic tree mask (padded 3D packed_mask buffer with row stride
-        # ceil(buf_dim/32), read in prepareCustomMask via batchIdx * buf_dim +
-        # tokenIdxQ). Linear/static-tree modes on Blackwell remain disabled
-        # until their packed_mask layout is verified end-to-end.
+        # Blackwell trtllm-gen spec-dec is enabled only for dynamic-tree masks.
         self.is_spec_decoding_enabled = is_spec_decoding_enabled and (
             not self.is_sm_version_trtllm_gen_kernel(sm=get_sm_version())
             or is_spec_dec_dynamic_tree)
@@ -924,10 +917,7 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         self.use_spec_decoding = self.is_spec_decoding_enabled
         self.is_spec_dec_tree = is_spec_dec_tree
         self.is_spec_dec_dynamic_tree = is_spec_dec_dynamic_tree
-        # Persist on metadata so plan() can forward it to the FMHA dispatcher.
-        # Used by FmhaAutoTuner::selectSpecDecTreeKernel() to compute
-        # numTokensHeadsQ = numHeadsQPerKv * (max_total_draft_tokens + 1) and
-        # pick tileSizeQ + kernelType (SwapsMmaAb Q8/16/32 vs KeepsMmaAb Q128).
+        # Forward static tree length to FMHA kernel selection.
         self.max_total_draft_tokens = max_total_draft_tokens
 
         # Parameters can be fixed and not changed during runtime if the
@@ -1018,15 +1008,13 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                         slot_ids)[:, :, :actual_mask_width]
                     if self.is_sm_version_trtllm_gen_kernel(
                             sm=get_sm_version()):
-                        # Blackwell reads the padded 3D buffer with row stride
-                        # ceil(buf_dim/32) in prepareCustomMask.cu.
+                        # Blackwell reads the padded 3D mask layout.
                         self.spec_decoding_packed_mask[:num_gens, :n_dt, :
                                                        actual_mask_width].copy_(
                                                            mask_src,
                                                            non_blocking=True)
                     else:
-                        # Hopper XQA reads a compact flat prefix with per-request
-                        # stride n_dt * ceil(n_dt/32).
+                        # Hopper XQA reads a compact flat prefix.
                         total = num_gens * n_dt * actual_mask_width
                         self.spec_decoding_packed_mask.view(-1)[:total].copy_(
                             mask_src.reshape(-1), non_blocking=True)

@@ -491,10 +491,7 @@ public:
     bool mIsSpecDecTree = true;
     bool mSpecDecodingIsGenerationLengthVariable = false;
     int32_t mSpecDecodingMaxGenerationLength = 1;
-    // Config-time max gen length for FmhaAutoTuner spec-dec tree kernel selection.
-    // Set once at AttentionOp init from Python max_total_draft_tokens + 1 via
-    // thop/attentionOp.cpp; propagated to fixedParams.specDecodingTargetMaxGenLen
-    // so the auto tuner picks numTokensHeadsQ = numHeadsQPerKv * targetMaxGenLen.
+    // Static spec-dec tree length used by FMHA autotuning.
     int32_t mSpecDecodingTargetMaxGenLen = 0;
     bool mIsMLAEnabled = false;
     bool mIsGenerationMLA = false;

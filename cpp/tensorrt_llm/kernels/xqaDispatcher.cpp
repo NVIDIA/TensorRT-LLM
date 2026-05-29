@@ -352,19 +352,7 @@ void XqaDispatcher::runImpl(
         unsigned int beam_width = params.beam_width;
         unsigned int batch_beam_size = params.batch_size * beam_width;
 
-        KvCacheDataType cache_type{KvCacheDataType::BASE};
-        if (params.kv_cache_quant_mode.hasInt8KvCache())
-        {
-            cache_type = KvCacheDataType::INT8;
-        }
-        else if (params.kv_cache_quant_mode.hasFp8KvCache())
-        {
-            cache_type = KvCacheDataType::FP8;
-        }
-        else if (params.kv_cache_quant_mode.hasFp4KvCache())
-        {
-            cache_type = KvCacheDataType::NVFP4;
-        }
+        KvCacheDataType cache_type = cacheTypeFromQuantMode(params.kv_cache_quant_mode);
 
         XQALaunchParam<KVCacheBuffer> launchParams;
         void* inputScratch = nullptr;
@@ -508,11 +496,7 @@ void XqaDispatcher::runImpl(
         // It is used to construct contiguous kv cache TMA descriptors.
         tllmRunnerParams.mMaxSeqLenCacheKv = params.max_attention_window_size;
         tllmRunnerParams.mMaxSeqLenQ = params.generation_input_length;
-        // For spec-dec tree, cap mMaxSeqLenQ to spec_decoding_max_generation_length.
-        // During warmup, generation_input_length may equal context length (131072),
-        // but actual draft tokens are bounded by spec_decoding_max_generation_length (~60).
-        // Without cap, SwapsMmaAb Custom mask with groupsTokensHeadsQ=false creates
-        // excessive CTAs (one per token) causing OOM during warmup.
+        // Tree decode Q length is bounded by the padded draft-mask row dim.
         if (params.is_spec_dec_tree && params.multi_query_tokens && params.spec_decoding_max_generation_length > 0)
         {
             tllmRunnerParams.mMaxSeqLenQ
@@ -523,8 +507,7 @@ void XqaDispatcher::runImpl(
         // strides do not depend on mMaxSeqLenKv, and extra KV CTAs exit early via
         // seqLensKvPtr. ContiguousKv keeps its true past-kv length because its strides
         // depend on it.
-        // For spec-dec tree, the KV range also includes the current generation span so
-        // FmhaAutoTuner sees the true upper bound for kernel selection.
+        // Include the generation span in spec-dec tree kernel selection.
         tllmRunnerParams.mMaxSeqLenKv = (params.is_spec_dec_tree && params.multi_query_tokens)
             ? std::max(params.max_past_kv_length, params.max_past_kv_length + params.generation_input_length)
             : ((tllmRunnerParams.mQkvLayout == QkvLayout::PagedKv) ? params.max_attention_window_size
