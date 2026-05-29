@@ -214,7 +214,7 @@ class TestStandalonePackage:
                     if spec is not None:
                         raise SystemExit(
                             "tensorrt_llm is importable in standalone test env: "
-                            f"origin={getattr(spec, 'origin', None)!r}, sys.path={sys.path!r}"
+                            "origin=%r, sys.path=%r" % (getattr(spec, "origin", None), sys.path)
                         )
                     """
                 ),
