@@ -27,14 +27,18 @@ MAXIMIZE_METRICS = [
 ]
 
 MINIMIZE_METRICS = [
-    "d_mean_e2e_latency",
-    "d_median_e2e_latency",
-    "d_p90_e2e_latency",
-    "d_p99_e2e_latency",
+    "d_mean_latency",
+    "d_median_latency",
+    "d_p90_latency",
+    "d_p99_latency",
+    "d_mean_generation",
+    "d_median_generation",
+    "d_p90_generation",
+    "d_p99_generation",
 ]
 
 REGRESSION_METRICS = [
-    "d_mean_e2e_latency",
+    "d_median_generation",
 ]
 
 MATCH_KEYS = [
@@ -63,10 +67,14 @@ MATCH_KEYS = [
 RESULT_METRIC_PATHS = {
     "d_request_throughput": "request_throughput",
     "d_per_gpu_throughput": "per_gpu_throughput",
-    "d_mean_e2e_latency": "mean_e2e_latency_ms",
-    "d_median_e2e_latency": "median_e2e_latency_ms",
-    "d_p90_e2e_latency": "percentiles_e2e_latency_ms.p90",
-    "d_p99_e2e_latency": "percentiles_e2e_latency_ms.p99",
+    "d_mean_latency": "mean_latency",
+    "d_median_latency": "median_latency",
+    "d_p90_latency": "percentiles_latency.p90",
+    "d_p99_latency": "percentiles_latency.p99",
+    "d_mean_generation": "mean_generation",
+    "d_median_generation": "median_generation",
+    "d_p90_generation": "percentiles_generation.p90",
+    "d_p99_generation": "percentiles_generation.p99",
 }
 
 

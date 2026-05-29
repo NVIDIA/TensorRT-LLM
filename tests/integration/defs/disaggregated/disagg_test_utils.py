@@ -145,20 +145,28 @@ def _run_worker(
         )
 
 
-def run_ctx_worker(model_name, ctx_worker_config, work_dir, port=0, device=0, env=None):
+def run_ctx_worker(
+    model_name, ctx_worker_config, work_dir, port=0, device=0, env=None, save_log=False
+):
     """Launch a context worker with service discovery.
 
     Use port=0 to let the worker choose a free port.
     """
-    return _run_worker(model_name, ctx_worker_config, "ctx", port, work_dir, device, env=env)
+    return _run_worker(
+        model_name, ctx_worker_config, "ctx", port, work_dir, device, save_log=save_log, env=env
+    )
 
 
-def run_gen_worker(model_name, gen_worker_config, work_dir, port=0, device=1, env=None):
+def run_gen_worker(
+    model_name, gen_worker_config, work_dir, port=0, device=1, env=None, save_log=False
+):
     """Launch a generation worker with service discovery.
 
     Use port=0 to let the worker choose a free port.
     """
-    return _run_worker(model_name, gen_worker_config, "gen", port, work_dir, device, env=env)
+    return _run_worker(
+        model_name, gen_worker_config, "gen", port, work_dir, device, save_log=save_log, env=env
+    )
 
 
 def run_disagg_server(disagg_cluster_config, work_dir, port=0, save_log=False, env=None, cwd=None):

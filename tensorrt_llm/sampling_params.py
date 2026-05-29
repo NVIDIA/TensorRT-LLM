@@ -28,6 +28,19 @@ from tensorrt_llm.logger import logger
 MAX_TOP_LOGPROBS = 20
 
 
+def validate_thinking_token_budget(value: Optional[Union[int, float, bool]]) -> Optional[int]:
+    """Validate ``thinking_token_budget``; return ``None`` if unset."""
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError("thinking_token_budget must be a non-negative integer or -1 for unlimited")
+    if value == -1:
+        return None
+    if value < 0:
+        raise ValueError("thinking_token_budget must be a non-negative integer or -1 for unlimited")
+    return value
+
+
 def check_logprobs_limit(
     name: str, value: Optional[int], max_value: int = MAX_TOP_LOGPROBS
 ) -> None:
@@ -226,6 +239,7 @@ class SamplingParams:
 
         lookahead_config (tensorrt_llm.bindings.executor.LookaheadDecodingConfig , optional): Lookahead decoding config. Defaults to None.
         guided_decoding (tensorrt_llm.sampling_params.GuidedDecodingParams, optional): Guided decoding params. Defaults to None.
+        thinking_token_budget (int, optional): Experimental. Maximum number of tokens allowed inside a reasoning block. Set to -1 or None for unlimited. Defaults to None.
 
         ignore_eos (bool): Whether to ignore the EOS token and continue generating tokens after the EOS token is generated. Defaults to False.
         detokenize (bool): Whether to detokenize the output. Defaults to True.
@@ -307,6 +321,7 @@ class SamplingParams:
 
     # Guided decoding params
     guided_decoding: Optional[GuidedDecodingParams] = None
+    thinking_token_budget: Optional[int] = None
 
     # Tokenizer-related configs
     ignore_eos: bool = False
@@ -374,6 +389,7 @@ class SamplingParams:
 
         if self.guided_decoding is not None:
             self.guided_decoding._validate()
+        self.thinking_token_budget = validate_thinking_token_budget(self.thinking_token_budget)
 
         # correct types as users might pass in logprob=True for Top-0 logprobs and logprobs=False for no logprobs
         if self.logprobs is False:

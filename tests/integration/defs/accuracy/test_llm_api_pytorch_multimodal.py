@@ -20,6 +20,7 @@ from tensorrt_llm.llmapi import CudaGraphConfig, KvCacheConfig, MoeConfig, Sampl
 from tensorrt_llm.quantization import QuantAlgo
 
 from ..conftest import (
+    get_sm_version,
     llm_models_root,
     skip_post_blackwell_ultra,
     skip_pre_blackwell,
@@ -313,9 +314,17 @@ class TestGemma3_27BInstruct(LlmapiAccuracyTestHarness):
         )
 
     def test_fp8_prequantized(self):
+        # Blackwell FP8 numerics differ from Hopper at the cubin level
+        # (~5pt drop on MMMU). Route to a Blackwell-calibrated reference
+        # rather than relaxing the Hopper one.
+        extra_acc_spec = "sm100_fp8" if get_sm_version() >= 100 else None
         with self._make_llm(self.MODEL_PATH) as llm:
             task = MMMU(self.MODEL_NAME)
-            task.evaluate(llm, sampling_params=self.sampling_params)
+            task.evaluate(
+                llm,
+                extra_acc_spec=extra_acc_spec,
+                sampling_params=self.sampling_params,
+            )
 
     @skip_pre_blackwell
     def test_nvfp4_prequantized(self):
@@ -389,11 +398,14 @@ class TestQwen3VL_MOE(LlmapiAccuracyTestHarness):
         max_tokens=MAX_NUM_TOKENS, truncate_prompt_tokens=MMMU.MAX_INPUT_LEN, stop="<|endoftext|>"
     )
 
+    kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.4)
+
     @pytest.mark.skip_less_device_memory(140000)
     def test_auto_dtype(self):
         with LLM(
             self.MODEL_PATH,
             max_num_tokens=self.MAX_NUM_TOKENS,
+            kv_cache_config=self.kv_cache_config,
         ) as llm:
             task = MMMU(self.MODEL_NAME)
             task.evaluate(llm, sampling_params=self.sampling_params)
