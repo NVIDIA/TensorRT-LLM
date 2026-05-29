@@ -90,6 +90,8 @@ class ChatPostprocArgs(PostprocArgs):
     tool_call_id_type: str = "random"
     chat_template_kwargs: Optional[dict[str, Any]] = None
     ctx_usage: Optional[UsageInfo] = None
+    # Cache per-request stream metadata so every chunk reuses the same response
+    # id and created timestamp instead of regenerating them for each chunk.
     stream_response_id: Optional[str] = None
     stream_created: Optional[int] = None
 
@@ -466,6 +468,8 @@ class CompletionPostprocArgs(PostprocArgs):
     return_logprobs: bool = False
     stream_options: Optional[StreamOptions] = None
     ctx_usage: Optional[UsageInfo] = None
+    # Cache per-request stream metadata so every chunk reuses the same response
+    # id and created timestamp instead of regenerating them for each chunk.
     stream_response_id: Optional[str] = None
     stream_created: Optional[int] = None
 

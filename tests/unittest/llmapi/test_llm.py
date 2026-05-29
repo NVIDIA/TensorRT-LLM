@@ -2578,7 +2578,7 @@ def test_llm_with_postprocess_parallel():
     run_llm_with_postprocess_parallel(tp_size=1)
 
 
-def test_chat_stream_post_processor_reuses_stream_metadata():
+def test_chat_stream_post_processor_reuses_stream_metadata() -> None:
     result = GenerationResultBase(123, SamplingParams())
     output = result._outputs[0]
     output.text = "x"
