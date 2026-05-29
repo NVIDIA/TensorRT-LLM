@@ -165,10 +165,32 @@ def globalVars = [
     (TARGET_BRANCH): gitlabParamsFromBot.get('target_branch', null),
 ]
 
+// QA verification (--qa-verify-only): when set, the normal build/test pipeline
+// is skipped and the QA function pipeline (LLM_FUNCTION_AUTO_V2C) is triggered
+// on the QA Jenkins server instead. The flag carries the target test case, e.g.
+//   /bot run --qa-verify-only test <case name>
+// Pre-conditions handled at trigger time (see launchQaVerify):
+//   1. nvbug id is parsed from the PR title (format: [https://nvbugs/<id>]...).
+//   2. fork (source repo) and branch are taken from the PR / merge request.
+def qaVerifyParam = gitlabParamsFromBot.get('qa_verify_only', null)
+boolean qaVerifyOnly = (qaVerifyParam != null && qaVerifyParam != false)
+String qaVerifyTestCase = (qaVerifyParam instanceof String && qaVerifyParam?.trim()) ?
+    qaVerifyParam.trim() : gitlabParamsFromBot.get('qa_verify_test_case', null)
+
+// QA Jenkins configuration for --qa-verify-only.
+// NOTE: confirm these values match the QA Jenkins setup before enabling.
+@Field
+def QA_VERIFY_REMOTE_JENKINS_URL = "https://prod.blsm.nvidia.com/swqa-tensorrt-qa-test/"
+@Field
+def QA_VERIFY_JOB = "view/TRT-LLM-Function-Pipelines/job/LLM_FUNCTION_AUTO_V2C"
+@Field
+def QA_VERIFY_TOKEN_CREDENTIAL_ID = "qa-jenkins-remote-trigger-token"
+
 // If not running all test stages in the L0 pre-merge, we will not update the GitLab status at the end.
 // GenPostMergeBuilds pipelines do not update GitLab status.
 boolean enableUpdateGitlabStatus =
     !GEN_POST_MERGE_BUILDS_ONLY &&
+    !qaVerifyOnly &&
     !testFilter[ENABLE_SKIP_TEST] &&
     !testFilter[ONLY_MULTI_GPU_TEST] &&
     !testFilter[DISABLE_MULTI_GPU_TEST] &&
@@ -1097,6 +1119,104 @@ def getOnlyOneGroupChanged(pipeline, testFilter, globalVars) {
     return ""
 }
 
+// Fetch the PR title from the GitHub PR API base endpoint (the `title` field).
+// Reuses the same GitHub token credential as getGithubMRChangedFile.
+def getPrTitle(pipeline, globalVars)
+{
+    def githubPrApiUrl = globalVars[GITHUB_PR_API_URL]
+    if (!githubPrApiUrl) {
+        pipeline.echo("Cannot fetch PR title: github_pr_api_url is not set.")
+        return null
+    }
+    try {
+        withCredentials([
+            usernamePassword(
+                credentialsId: 'github-cred-trtllm-ci',
+                usernameVariable: 'NOT_USED_YET',
+                passwordVariable: 'GITHUB_API_TOKEN'
+            ),
+        ]) {
+            def rawDataJson = pipeline.sh(
+                script: """
+                    curl --header "Authorization: Bearer \${GITHUB_API_TOKEN}" \
+                         --url "${githubPrApiUrl}"
+                """,
+                returnStdout: true
+            )
+            def data = readJSON text: rawDataJson, returnPojo: true
+            return data.get("title")
+        }
+    } catch (InterruptedException e) {
+        throw e
+    } catch (Exception e) {
+        pipeline.echo("Failed to fetch PR title. Error: ${e.toString()}")
+        return null
+    }
+}
+
+// Extract the nvbug id from a PR title following the
+// "[https://nvbugs/<id>][type] description" convention. Returns null if absent.
+@NonCPS
+def extractNvbugId(prTitle)
+{
+    if (!prTitle) {
+        return null
+    }
+    def matcher = (prTitle =~ /nvbugs\/(\d+)/)
+    return matcher ? matcher[0][1] : null
+}
+
+// Trigger the QA function verification pipeline (LLM_FUNCTION_AUTO_V2C) on the
+// QA Jenkins server for --qa-verify-only. Pre-conditions:
+//   1. nvbug id parsed from the PR title.
+//   2. fork (source repo) and branch taken from the PR / merge request.
+def launchQaVerify(pipeline, globalVars, qaVerifyTestCase)
+{
+    stage("QA Verify") {
+        // A target test case must be provided.
+        if (!qaVerifyTestCase?.trim()) {
+            error "QA verify requires a test case, e.g. /bot run --qa-verify-only test <case name>"
+        }
+
+        // Pre-condition 1: nvbug id from the PR title.
+        def prTitle = getPrTitle(pipeline, globalVars)
+        pipeline.echo("PR title: ${prTitle}")
+        def nvbugId = extractNvbugId(prTitle)
+        if (!nvbugId) {
+            error "QA verify requires an nvbug id in the PR title " +
+                  "(expected format: [https://nvbugs/<id>][type] description). PR title: ${prTitle}"
+        }
+
+        // Pre-condition 2: fork (source repo) and branch from the PR.
+        def fork = LLM_REPO
+        def branch = env.gitlabBranch ?: globalVars[TARGET_BRANCH]
+        if (!branch) {
+            error "QA verify could not determine the source branch from the PR."
+        }
+
+        pipeline.echo(
+            "Triggering QA verify job '${QA_VERIFY_JOB}': " +
+            "nvbug=${nvbugId}, fork=${fork}, branch=${branch}, testCase=${qaVerifyTestCase}")
+
+        // NOTE: the parameter names below must match the LLM_FUNCTION_AUTO_V2C
+        // job definition on the QA Jenkins server. Adjust if they differ.
+        def qaParameters = [
+            "nvbug_id=${nvbugId}",
+            "fork=${fork}",
+            "branch=${branch}",
+            "test_case=${qaVerifyTestCase}",
+        ].join("\n")
+
+        triggerRemoteJob(
+            remoteJenkinsUrl: QA_VERIFY_REMOTE_JENKINS_URL,
+            job: QA_VERIFY_JOB,
+            parameters: qaParameters,
+            auth: CredentialsAuth(credentials: QA_VERIFY_TOKEN_CREDENTIAL_ID),
+            blockBuildUntilComplete: false,
+        )
+    }
+}
+
 def collectTestResults(pipeline, testFilter)
 {
     collectResultPodSpec = createKubernetesPodConfig("", "agent")
@@ -1703,7 +1823,7 @@ pipeline {
         }
         always {
             script {
-                if (!isReleaseCheckMode && !GEN_POST_MERGE_BUILDS_ONLY) {
+                if (!isReleaseCheckMode && !GEN_POST_MERGE_BUILDS_ONLY && !qaVerifyOnly) {
                     collectTestResults(this, testFilter)
                 }
                 stage("Upload Build Info") {
@@ -1732,6 +1852,10 @@ pipeline {
             steps
             {
                 script {
+                    if (qaVerifyOnly) {
+                        echo "QA verify-only mode: skipping standard preparation."
+                        return
+                    }
                     globalVars = trtllm_utils.initializeCiBudget(this, globalVars, 24, 'HOURS', 'L0_MergeRequest')
                     preparation(this, testFilter, globalVars)
                     println globalVars
@@ -1746,7 +1870,9 @@ pipeline {
         stage("Build And Test") {
             steps {
                 script {
-                    if (isReleaseCheckMode) {
+                    if (qaVerifyOnly) {
+                        launchQaVerify(this, globalVars, qaVerifyTestCase)
+                    } else if (isReleaseCheckMode) {
                         stage("Release-Check") {
                             script {
                                 launchReleaseCheck(this, globalVars)
