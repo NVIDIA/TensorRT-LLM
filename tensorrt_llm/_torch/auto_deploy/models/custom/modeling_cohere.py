@@ -17,16 +17,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Cohere/Cohere2 model with explicit sharding hint ops.
+"""Cohere model (sharding IR).
 
-This is a sharding-aware rewrite of ``modeling_cohere.py``: every shardable op
-uses an AutoDeploy custom op with explicit sharding hint kwargs. The exported
-FX graph is therefore a complete, self-contained specification of how the model
-should be sharded under tensor parallelism. The ``apply_sharding_hints``
-transform reads the hints together with a runtime ``DistConfig`` to apply
-deterministic, node-local sharding.
-
-Source of truth for model logic:
+Source:
 https://huggingface.co/CohereForAI/aya-expanse-8b (Cohere v1)
 https://huggingface.co/CohereLabs/c4ai-command-a-03-2025 (Cohere2)
 
@@ -53,11 +46,6 @@ Cohere2 additionally features:
 - Sliding window attention pattern (every Nth layer is full attention, rest sliding)
 - RoPE only applied to sliding window attention layers (full attention layers are
   position-agnostic)
-
-Shardable custom ops used:
-  - torch.ops.auto_deploy.torch_linear_simple  (tp_mode, tp_min_local_shape, layer_type)
-  - torch.ops.auto_deploy.view                 (tp_scaled_dim, layer_type)
-  - torch.ops.auto_deploy.all_reduce           (identity / dist.all_reduce, layer_type)
 """
 
 from dataclasses import dataclass
@@ -71,7 +59,6 @@ from transformers.modeling_utils import PreTrainedModel
 from transformers.models.cohere.configuration_cohere import CohereConfig
 from transformers.utils import ModelOutput
 
-from ... import custom_ops  # noqa: F401 -- register all ops
 from ..hf import AutoModelForCausalLMFactory
 from ._rope_utils import get_rope_theta
 

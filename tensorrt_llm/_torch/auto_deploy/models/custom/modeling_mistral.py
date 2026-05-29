@@ -17,16 +17,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Mistral model with explicit sharding hint ops.
+"""Mistral model (sharding IR).
 
-This is a sharding-aware rewrite of ``modeling_mistral.py``: every shardable op
-uses an AutoDeploy custom op with explicit sharding hint kwargs. The exported
-FX graph is therefore a complete, self-contained specification of how the model
-should be sharded under tensor parallelism. The ``apply_sharding_hints``
-transform reads the hints together with a runtime ``DistConfig`` to apply
-deterministic, node-local sharding.
-
-Source of truth for model logic:
+Source:
 https://huggingface.co/mistralai/Mistral-7B-Instruct-v0.3
 
 This implementation differs from the original HuggingFace version in the following ways:
@@ -40,11 +33,6 @@ This implementation differs from the original HuggingFace version in the followi
 The Mistral family (7B, Codestral, Mistral-Small, Mistral-Large, NeMo-Minitron)
 shares a single architecture with GQA, SwiGLU MLP, RMSNorm, and RoPE.
 Sliding window attention is supported via the AD attention op.
-
-Shardable custom ops used:
-  - torch.ops.auto_deploy.torch_linear_simple  (tp_mode, tp_min_local_shape, layer_type)
-  - torch.ops.auto_deploy.view                 (tp_scaled_dim, layer_type)
-  - torch.ops.auto_deploy.all_reduce           (identity / dist.all_reduce, layer_type)
 """
 
 from dataclasses import dataclass
@@ -58,7 +46,6 @@ from transformers.modeling_utils import PreTrainedModel
 from transformers.models.mistral.configuration_mistral import MistralConfig
 from transformers.utils import ModelOutput
 
-from ... import custom_ops  # noqa: F401 -- register all ops
 from ..hf import AutoModelForCausalLMFactory
 from ._rope_utils import init_rope_inv_freq
 
