@@ -91,7 +91,7 @@ def _apply_rotary_emb(freqs: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
     return torch.cat((t_rot, t_pass), dim=-1).to(dtype)
 
 
-class _Step3VisionRope2D(nn.Module):
+class Step3VisionRope2D(nn.Module):
     """Cached 2D rotary positional embedding for the vision tower."""
 
     def __init__(
@@ -162,7 +162,7 @@ class _Step3VisionRope2D(nn.Module):
         return _apply_rotary_emb(freqs, q), _apply_rotary_emb(freqs, k)
 
 
-class _Step3VisionLayerScale(nn.Module):
+class Step3VisionLayerScale(nn.Module):
     """Per-channel residual scaling used when ``ls_init_value`` is set."""
 
     def __init__(self, dim: int, init_value: float):
@@ -173,7 +173,7 @@ class _Step3VisionLayerScale(nn.Module):
         return hidden_states * self.gamma
 
 
-class _Step3VisionMLP(nn.Module):
+class Step3VisionMLP(nn.Module):
     """``c_fc -> act -> c_proj`` FFN matching the HF weight names."""
 
     def __init__(self, hidden_size: int, intermediate_size: int, hidden_act: str):
@@ -186,7 +186,7 @@ class _Step3VisionMLP(nn.Module):
         return self.c_proj(self.act_fn(self.c_fc(hidden_states)))
 
 
-class _Step3VisionAttention(nn.Module):
+class Step3VisionAttention(nn.Module):
     """Vision MHA with 2D RoPE.
 
     HF stores the fused QKV projection as ``in_proj_weight``/``in_proj_bias``
@@ -219,9 +219,9 @@ class _Step3VisionAttention(nn.Module):
         self.in_proj_bias = nn.Parameter(torch.zeros(hidden_size * 3))
         self.out_proj = nn.Linear(hidden_size, hidden_size, bias=True)
 
-        self.rope: Optional[_Step3VisionRope2D] = None
+        self.rope: Optional[Step3VisionRope2D] = None
         if use_rope2d:
-            self.rope = _Step3VisionRope2D(
+            self.rope = Step3VisionRope2D(
                 dim=self.head_dim,
                 max_grid_height=max_grid_height,
                 max_grid_width=max_grid_width,
@@ -250,7 +250,7 @@ class _Step3VisionAttention(nn.Module):
         return self.out_proj(attn_output)
 
 
-class _Step3VisionBlock(nn.Module):
+class Step3VisionBlock(nn.Module):
     """Single vision transformer block (Pre-LN + LayerScale)."""
 
     def __init__(
@@ -269,7 +269,7 @@ class _Step3VisionBlock(nn.Module):
         rope_theta_rescale_factor: float,
     ):
         super().__init__()
-        self.attn = _Step3VisionAttention(
+        self.attn = Step3VisionAttention(
             hidden_size=hidden_size,
             num_heads=num_heads,
             max_grid_height=max_grid_height,
@@ -281,10 +281,10 @@ class _Step3VisionBlock(nn.Module):
         )
         self.ln_1 = LayerNorm(hidden_size=hidden_size, eps=layer_norm_eps)
         self.ln_2 = LayerNorm(hidden_size=hidden_size, eps=layer_norm_eps)
-        self.mlp = _Step3VisionMLP(hidden_size, int(hidden_size * mlp_ratio), hidden_act)
+        self.mlp = Step3VisionMLP(hidden_size, int(hidden_size * mlp_ratio), hidden_act)
         ls = ls_init_value if ls_init_value is not None else 1.0
-        self.ls_1 = _Step3VisionLayerScale(hidden_size, ls)
-        self.ls_2 = _Step3VisionLayerScale(hidden_size, ls)
+        self.ls_1 = Step3VisionLayerScale(hidden_size, ls)
+        self.ls_2 = Step3VisionLayerScale(hidden_size, ls)
 
     def forward(
         self,
@@ -303,10 +303,10 @@ class _Step3VisionBlock(nn.Module):
         return hidden_states
 
 
-class _Step3VisionTransformer(nn.Module):
+class Step3VisionTransformer(nn.Module):
     def __init__(self, depth: int, **block_kwargs):
         super().__init__()
-        self.resblocks = nn.ModuleList([_Step3VisionBlock(**block_kwargs) for _ in range(depth)])
+        self.resblocks = nn.ModuleList([Step3VisionBlock(**block_kwargs) for _ in range(depth)])
 
     def forward(
         self,
@@ -388,7 +388,7 @@ class Step3p7VisionEncoder(nn.Module):
         else:
             self.posemb_grid_size = None
 
-        self.transformer = _Step3VisionTransformer(
+        self.transformer = Step3VisionTransformer(
             depth=self.num_hidden_layers,
             hidden_size=self.hidden_size,
             num_heads=self.num_heads,

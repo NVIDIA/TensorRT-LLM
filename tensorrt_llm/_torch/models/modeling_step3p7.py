@@ -637,7 +637,7 @@ class Step3p7Attention(Attention):
 # ---------------------------------------------------------------------------
 
 
-class _ClampedGatedMLP(GatedMLP):
+class ClampedGatedMLP(GatedMLP):
     """Dense SwiGLU MLP with optional per-layer clamp on gate/up activations.
 
     When ``swiglu_limit`` is set, ``gate`` is clamped to ``[-inf, limit]`` and
@@ -957,7 +957,7 @@ class Step3p7DecoderLayer(DecoderLayer):
             self.moe = Step3p7MoE(
                 model_config, layer_idx=layer_idx, aux_stream_dict=aux_stream_dict
             )
-            self.share_expert = _ClampedGatedMLP(
+            self.share_expert = ClampedGatedMLP(
                 bf16_model_config,
                 layer_idx=layer_idx,
                 intermediate_size=int(
@@ -968,7 +968,7 @@ class Step3p7DecoderLayer(DecoderLayer):
             )
             self.mlp = None
         else:
-            self.mlp = _ClampedGatedMLP(
+            self.mlp = ClampedGatedMLP(
                 bf16_model_config,
                 layer_idx=layer_idx,
                 intermediate_size=int(text_config.intermediate_size),
