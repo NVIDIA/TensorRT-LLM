@@ -47,10 +47,7 @@ from .modeling_multimodal_utils import (
     get_attached_multimodal_embeddings,
     get_multimodal_embeddings,
 )
-from .modeling_qwen2vl import (
-    Qwen2_5_VLVisionAttention,
-    Qwen2VLInputProcessorBase,
-)
+from .modeling_qwen2vl import Qwen2_5_VLVisionAttention, Qwen2VLInputProcessorBase
 from .modeling_utils import (
     ModelConfig,
     QuantConfig,
@@ -210,9 +207,7 @@ class Qwen3VLInputProcessorBase(Qwen2VLInputProcessorBase):
         # ``video_grid_thw`` must be expanded to one row per frame before the
         # shared Qwen2-VL traversal.
         if video_grid_thw is not None:
-            video_grid_thw = torch.repeat_interleave(
-                video_grid_thw, video_grid_thw[:, 0], dim=0
-            )
+            video_grid_thw = torch.repeat_interleave(video_grid_thw, video_grid_thw[:, 0], dim=0)
             video_grid_thw[:, 0] = 1
         return super().get_rope_index(
             config,
