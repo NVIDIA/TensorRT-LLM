@@ -1,4 +1,3 @@
-<!-- release build trigger -->
 <div align="center">
 
 TensorRT LLM
