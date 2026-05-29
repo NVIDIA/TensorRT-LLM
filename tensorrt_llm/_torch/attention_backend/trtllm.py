@@ -29,7 +29,7 @@ from .interface import (AttentionBackend, AttentionForwardArgs,
 # Enable TRTLLM-Gen attention backend by default. Set
 # TRTLLM_ENABLE_TRTLLM_GEN_ATTENTION=0 to force the thop.attention path.
 _TRTLLM_ENABLE_TRTLLM_GEN_ATTENTION = (os.environ.get(
-    "TRTLLM_ENABLE_TRTLLM_GEN_ATTENTION", "1") == "1")
+    "TRTLLM_ENABLE_TRTLLM_GEN_ATTENTION", "0") == "1")
 
 # ``AttentionForwardArgs`` fields that this backend does not consume.
 # Sync test (test_attention_op_sync.py) requires every other field to map to a
