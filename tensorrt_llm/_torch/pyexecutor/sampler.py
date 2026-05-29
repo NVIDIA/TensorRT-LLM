@@ -295,6 +295,8 @@ class MultimodalResult:
     mm_embedding_lengths: List[List[int]]
     # needed when requests mix text-only and multimodal ones
     mm_embedding_request_indices: List[int]
+    # number of context requests in the batch
+    num_context_requests: int
     # Can be used to include e.g. `mrope_position_ids`, etc.
     extra_data: Optional[Dict[str, Any]] = None
 
@@ -322,6 +324,12 @@ class MultimodalResult:
                     f"mm_embedding shape mismatch for result {result_index}: "
                     f"{actual_rows} != {expected_rows}"
                 )
+        for request_index in self.mm_embedding_request_indices:
+            if request_index < 0 or request_index >= self.num_context_requests:
+                raise ValueError(
+                    "mm_embedding_request_indices contains an invalid request "
+                    f"index: {request_index} not in [0, {self.num_context_requests})"
+                )
 
     @classmethod
     def from_model_outputs(
@@ -332,21 +340,15 @@ class MultimodalResult:
             "mm_embedding_lengths",
             "mm_embedding_request_indices",
         }
-        result = cls(
+        return cls(
             mm_embeddings=model_outputs["mm_embeddings"],
             mm_embedding_lengths=model_outputs["mm_embedding_lengths"],
             mm_embedding_request_indices=model_outputs["mm_embedding_request_indices"],
+            num_context_requests=num_context_requests,
             extra_data={
                 key: value for key, value in model_outputs.items() if key not in result_keys
             },
         )
-        for request_index in result.mm_embedding_request_indices:
-            if request_index < 0 or request_index >= num_context_requests:
-                raise ValueError(
-                    "mm_embedding_request_indices contains an invalid request "
-                    f"index: {request_index} not in [0, {num_context_requests})"
-                )
-        return result
 
 
 @dataclass(kw_only=True)

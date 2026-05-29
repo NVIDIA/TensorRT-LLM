@@ -11,6 +11,12 @@ from tensorrt_llm._torch.models.modeling_qwen3vl import (
     _expand_prompt_token_ids_for_mm_handoff,
 )
 
+_VISION_START_TOKEN_ID = 151652
+_VISION_END_TOKEN_ID = 151653
+_IMAGE_TOKEN_ID = 151655
+_VIDEO_TOKEN_ID = 151656
+_PLACEHOLDER_ID = 200000
+
 
 class _FakeTokenizer:
     def __init__(self, input_ids):
@@ -24,23 +30,18 @@ class _FakeTokenizer:
 
 def test_qwen3vl_disagg_video_prompt_expands_video_placeholder():
     """Video placeholder expands to one token per encoder embedding."""
-    vision_start_token_id = 151652
-    vision_end_token_id = 151653
-    image_token_id = 151655
-    video_token_id = 151656
-    placeholder_id = 200000
     processor = object.__new__(Qwen3VLInputProcessorBase)
     processor._config = SimpleNamespace(
-        image_token_id=image_token_id,
-        video_token_id=video_token_id,
-        vision_start_token_id=vision_start_token_id,
+        image_token_id=_IMAGE_TOKEN_ID,
+        video_token_id=_VIDEO_TOKEN_ID,
+        vision_start_token_id=_VISION_START_TOKEN_ID,
         text_config=SimpleNamespace(hidden_size=16),
         vision_config=SimpleNamespace(deepstack_visual_indexes=[]),
     )
     processor._tokenizer = _FakeTokenizer(
-        [11, vision_start_token_id, video_token_id, vision_end_token_id, 12]
+        [11, _VISION_START_TOKEN_ID, _VIDEO_TOKEN_ID, _VISION_END_TOKEN_ID, 12]
     )
-    processor.tllm_multimodal_token_id = placeholder_id
+    processor.tllm_multimodal_token_id = _PLACEHOLDER_ID
 
     handoff = processor.build_disagg_prefill_multimodal_inputs(
         {"prompt": "video prompt"},
@@ -49,11 +50,11 @@ def test_qwen3vl_disagg_video_prompt_expands_video_placeholder():
 
     assert handoff.prompt_token_ids == [
         11,
-        vision_start_token_id,
-        placeholder_id,
-        placeholder_id,
-        placeholder_id,
-        vision_end_token_id,
+        _VISION_START_TOKEN_ID,
+        _PLACEHOLDER_ID,
+        _PLACEHOLDER_ID,
+        _PLACEHOLDER_ID,
+        _VISION_END_TOKEN_ID,
         12,
     ]
     assert handoff.multimodal_lengths == [4]
@@ -68,43 +69,40 @@ def test_qwen3vl_disagg_video_prompt_expands_video_placeholder():
 
 def test_qwen3vl_disagg_mixed_prompt_layout_preserves_item_order():
     """Image and video handoff metadata follows prompt order."""
-    vision_start_token_id = 151652
-    vision_end_token_id = 151653
-    image_token_id = 151655
-    video_token_id = 151656
-    placeholder_id = 200000
+    # NOTE: This locks in helper behavior—but it doesn't map to a supported runtime path today
+    # because Qwen3-VL EPD is single-modality only as of adding this test.
     input_ids = torch.tensor(
         [
-            vision_start_token_id,
-            image_token_id,
-            vision_end_token_id,
+            _VISION_START_TOKEN_ID,
+            _IMAGE_TOKEN_ID,
+            _VISION_END_TOKEN_ID,
             42,
-            vision_start_token_id,
-            video_token_id,
-            vision_end_token_id,
+            _VISION_START_TOKEN_ID,
+            _VIDEO_TOKEN_ID,
+            _VISION_END_TOKEN_ID,
         ]
     )
 
     handoff = _expand_prompt_token_ids_for_mm_handoff(
         input_ids,
         [{"tensor_size": (2, 16)}, {"tensor_size": (3, 16)}],
-        image_token_id=image_token_id,
-        video_token_id=video_token_id,
-        vision_start_token_id=vision_start_token_id,
-        placeholder_id=placeholder_id,
+        image_token_id=_IMAGE_TOKEN_ID,
+        video_token_id=_VIDEO_TOKEN_ID,
+        vision_start_token_id=_VISION_START_TOKEN_ID,
+        placeholder_id=_PLACEHOLDER_ID,
     )
 
     assert handoff.prompt_token_ids == [
-        vision_start_token_id,
-        placeholder_id,
-        placeholder_id,
-        vision_end_token_id,
+        _VISION_START_TOKEN_ID,
+        _PLACEHOLDER_ID,
+        _PLACEHOLDER_ID,
+        _VISION_END_TOKEN_ID,
         42,
-        vision_start_token_id,
-        placeholder_id,
-        placeholder_id,
-        placeholder_id,
-        vision_end_token_id,
+        _VISION_START_TOKEN_ID,
+        _PLACEHOLDER_ID,
+        _PLACEHOLDER_ID,
+        _PLACEHOLDER_ID,
+        _VISION_END_TOKEN_ID,
     ]
     assert handoff.multimodal_lengths == [3, 4]
     assert handoff.multimodal_positions == [0, 5]
@@ -132,12 +130,8 @@ def test_qwen3vl_disagg_prompt_layout_requires_handle_per_placeholder():
 def test_qwen3vl_video_token_count_sums_single_video_grid_rows():
     """One logical video may be represented by multiple processor grid rows."""
     processor = object.__new__(Qwen3VLInputProcessorBase)
-    object.__setattr__(
-        processor,
-        "_config",
-        SimpleNamespace(
-            vision_config=SimpleNamespace(spatial_merge_size=2),
-        ),
+    processor._config = SimpleNamespace(
+        vision_config=SimpleNamespace(spatial_merge_size=2),
     )
 
     assert (

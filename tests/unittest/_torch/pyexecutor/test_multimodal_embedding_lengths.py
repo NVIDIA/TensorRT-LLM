@@ -143,6 +143,7 @@ def test_mm_encoder_sampler_aligns_mixed_batch_by_request_index():
             mm_embeddings=[torch.ones(4, 2)],
             mm_embedding_request_indices=[1],
             mm_embedding_lengths=[[4]],
+            num_context_requests=2,
             extra_data={
                 "mrope_position_ids": ["text-pos", "mm-pos"],
                 "mrope_position_deltas": ["text-delta", "mm-delta"],
@@ -266,5 +267,6 @@ def test_multimodal_result_rejects_embedding_shape_mismatch():
             mm_embeddings=[torch.ones(4, 2)],
             mm_embedding_request_indices=[0],
             mm_embedding_lengths=[[3]],
+            num_context_requests=1,
             extra_data={},
         )

@@ -2811,6 +2811,24 @@ class NemotronH_Nano_VL_V2(transformers.PreTrainedModel):
                 "multimodal context chunks form a contiguous input_ids prefix."
             )
 
+    def _check_encoders_exist(self, raw_ctx_params: List[MultimodalParams]) -> None:
+        """Check encoders needed by raw inputs exist.
+
+        Raw image/video needs vision encoder; raw audio needs sound encoder.
+        Encoder-only EPD worker may have only one. Reject early with clear
+        message, not deep encoder failure.
+        """
+        needs_vision_encoder = any(
+            param.multimodal_data["modality_type"] in ("image", "video") for param in raw_ctx_params
+        )
+        if needs_vision_encoder and self.vision_encoder is None:
+            raise ValueError("Raw image/video inputs require a local NanoV2VL vision encoder.")
+        needs_sound_encoder = any(
+            param.multimodal_data["modality_type"] == "audio" for param in raw_ctx_params
+        )
+        if needs_sound_encoder and self.sound_encoder is None:
+            raise ValueError("Raw audio inputs require a local NanoV2VL sound encoder.")
+
     def merge_evs_mm_embeds(
         self,
         num_tokens_in_videos: List[int],
@@ -3129,24 +3147,7 @@ class NemotronH_Nano_VL_V2(transformers.PreTrainedModel):
             raw_ctx_params = [param for param in ctx_params if has_raw_multimodal_payload(param)]
             # Raw image/video/audio tensors: run local encoder.
             if raw_ctx_params:
-                if (
-                    any(
-                        param.multimodal_data["modality_type"] in ("image", "video")
-                        for param in raw_ctx_params
-                    )
-                    and self.vision_encoder is None
-                ):
-                    raise ValueError(
-                        "Raw image/video inputs require a local NanoV2VL vision encoder."
-                    )
-                if (
-                    any(
-                        param.multimodal_data["modality_type"] == "audio"
-                        for param in raw_ctx_params
-                    )
-                    and self.sound_encoder is None
-                ):
-                    raise ValueError("Raw audio inputs require a local NanoV2VL sound encoder.")
+                self._check_encoders_exist(raw_ctx_params)
                 mm_embedding = get_multimodal_embeddings(
                     encoder_forward_fn=self._encode_multimodal,
                     multimodal_params=ctx_params,

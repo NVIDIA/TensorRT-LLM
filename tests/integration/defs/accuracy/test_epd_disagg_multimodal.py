@@ -8,9 +8,17 @@ different mechanism from the trtllm-serve subprocess disaggregation exercised by
 the other tests in that file.
 """
 
+# NOTE:
+# The encoder and PD are resident on the same physical GPU in the current test
+# harness. Placing them on different physical GPUs silently corrupts the
+# embeddings (garbage output, no error raised) in TRT-LLM's current state because
+# the consumer (PD worker) rebuilds the encoder's embedding from a CUDA-IPC handle
+# that currently never copies the tensor onto the PD's own compute device.
+# Real cross-GPU E/PD therefore requires a real cross-device transfer
+# (CPU staging or NIXL/RDMA) that is currently not natively supported in TRT-LLM.
+
 import contextlib
 import os
-import tempfile
 from dataclasses import dataclass
 from typing import Any, Dict, Iterator, Mapping, Optional, Protocol
 from unittest import mock
@@ -96,17 +104,10 @@ def launch_multimodal_encoder_pd_llm(
     pd_llm_config: Dict[str, Any],
     model_name: str,
     max_workers: int = 16,
-    extra_env: Optional[Dict[str, str]] = None,
 ) -> Iterator[VideoMMECompatibleLLM]:
     """Launch separate encoder and combined prefill/decode llmapi instances."""
-    env_updates = dict(extra_env or {})
-    # Tell PD to consume encoder handles, not raw multimodal payloads.
-    env_updates["TLLM_MULTIMODAL_DISAGGREGATED"] = "1"
     with contextlib.ExitStack() as stack:
-        stack.enter_context(mock.patch.dict(os.environ, env_updates))
-        if "TMPDIR" in env_updates:
-            # tempfile caches TMPDIR. Keep the cache in sync with the env.
-            stack.enter_context(mock.patch.object(tempfile, "tempdir", env_updates["TMPDIR"]))
+        stack.enter_context(mock.patch.dict(os.environ, {"TLLM_MULTIMODAL_DISAGGREGATED": "1"}))
         thread_pool = stack.enter_context(MyThreadPoolExecutor(max_workers=max_workers))
         encoder = MultimodalEncoder(model=model_name, **encoder_llm_config)
         pd_llm = LLM(model=model_name, **pd_llm_config)
@@ -243,13 +244,12 @@ class TestVideoMMEEPD(LlmapiAccuracyTestHarness):
     }
 
     def _launch_epd(self, variant: EPDVariant):
-        """Context manager: encoder + combined PD llmapi, with TMPDIR=/tmp."""
+        """Context manager: encoder + combined PD llmapi."""
         return launch_multimodal_encoder_pd_llm(
             variant.encoder_config,
             variant.pd_config,
             variant.model_path,
             max_workers=variant.max_workers,
-            extra_env={"TMPDIR": "/tmp"},
         )
 
     def _run_videomme(self, llm, variant: EPDVariant) -> None:
@@ -265,7 +265,6 @@ class TestVideoMMEEPD(LlmapiAccuracyTestHarness):
 
     @pytest.mark.timeout(DEFAULT_TEST_TIMEOUT)
     @skip_pre_hopper
-    @pytest.mark.skip_less_device(2)
     @pytest.mark.skip_less_device_memory(80000)
     @pytest.mark.parametrize(
         "variant",
