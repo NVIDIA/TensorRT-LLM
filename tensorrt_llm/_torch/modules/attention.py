@@ -51,19 +51,9 @@ def extract_extra_attrs(layer_idx: str, attn_type: str):
     metadata_ref = extra_attrs.get("attention_metadata", None)
     assert metadata_ref is not None, "Attention metadata is not set"
     metadata = metadata_ref()
-    if attn_type == "mla":
-        assert isinstance(
-            metadata,
-            TrtllmAttentionMetadata,
-        )
-    else:
-        assert isinstance(
-            metadata,
-            FlashInferAttentionMetadata,
-        ) or isinstance(
-            metadata,
-            TrtllmAttentionMetadata,
-        )
+    assert isinstance(
+        metadata, (FlashInferAttentionMetadata, TrtllmAttentionMetadata)
+    ), "Metadata must be a subclass of FlashInferAttentionMetadata or TrtllmAttentionMetadata"
 
     attn_layers = extra_attrs.get(attn_type + "_layers", None)
     assert attn_layers is not None, "Attention layer is not registered"
@@ -722,7 +712,7 @@ class Attention(nn.Module):
         # then exchange and combine across CP ranks.
         # NOTE: The helix post-process combine step works on unquantized
         # (BF16/FP16) partial outputs and softmax stats from each rank.
-        # We intentionally skip passing out_scale/out_scale_sf to FMHA here
+        # We intentionally skip passing out_scale to FMHA here
         # so it produces BF16 output. After combining, the downstream o_proj
         # linear layer handles quantization (FP8/NVFP4) in its apply() method.
         if self.mapping.has_cp_helix() and attn_metadata.num_contexts == 0:
@@ -751,21 +741,27 @@ class Attention(nn.Module):
             attn_output = self._helix_post_process(attn_output, softmax_stats)
             return attn_output, None
 
+        # Don't set out_scale if o_proj has pre_quant_scale — this prevents
+        # FP8/FP4 output and keeps attention output in BF16 for better
+        # precision when applying pre_quant_scale. Also don't set out_scale
+        # if LoRA is active — LoRA grouped_gemm doesn't support FP8.
+        # Pass both scales; the backend selects ``out_scale_sf`` when the
+        # kernel writes NVFP4 output (``forward_args.output_sf`` is
+        # allocated downstream by ``create_output``) and ``out_scale``
+        # otherwise. Deciding here would be premature — ``output_sf`` is
+        # not populated yet at this call site.
         out_scale = None
         out_scale_sf = None
-        # Don't set out_scale if o_proj has pre_quant_scale - this prevents FP8/FP4 output
-        # and keeps attention output in BF16 for better precision when applying pre_quant_scale
-        # Also don't set out_scale if LoRA is active - LoRA grouped_gemm doesn't support FP8
         if self._use_quantize_output() and not has_lora:
             out_scale = self.o_proj.inv_input_scale
             out_scale_sf = self.o_proj.input_scale
 
-        kv_scales_sf = None
-        kv_scales_sf_inv = None
+        kv_scale_orig_quant = None
+        kv_scale_quant_orig = None
         if self.quant_config is not None and self.quant_config.layer_quant_mode.has_fp4_kv_cache(
         ):
-            kv_scales_sf = self.qkv_proj.kv_scales
-            kv_scales_sf_inv = self.qkv_proj.inv_kv_scales
+            kv_scale_orig_quant = self.qkv_proj.inv_kv_scales
+            kv_scale_quant_orig = self.qkv_proj.kv_scales
 
         attn_output = self.attn.forward(
             q,
@@ -775,8 +771,8 @@ class Attention(nn.Module):
             forward_args=AttentionForwardArgs(
                 out_scale=out_scale,
                 out_scale_sf=out_scale_sf,
-                kv_scales_sf=kv_scales_sf,
-                kv_scales_sf_inv=kv_scales_sf_inv,
+                kv_scale_orig_quant=kv_scale_orig_quant,
+                kv_scale_quant_orig=kv_scale_quant_orig,
                 attention_mask=attention_mask,
                 mrope_rotary_cos_sin=mrope_rotary_cos_sin,
                 mrope_position_deltas=mrope_position_deltas,
@@ -1727,7 +1723,14 @@ class MLA(nn.Module):
             latent_cache_ctx = latent_cache[:num_ctx_tokens, ...]
             if self.apply_rotary_emb:
                 assert position_ids is not None
-                k_pe_ctx = self.apply_rope(q_ctx, k_pe_ctx, position_ids)
+                # position_ids spans [ctx..., gen...] in mixed batches; slice to
+                # match q_ctx/k_pe_ctx so external RoPE uses ctx positions.
+                ctx_position_ids = position_ids[..., :num_ctx_tokens]
+                k_pe_ctx = self.apply_rope(q_ctx, k_pe_ctx, ctx_position_ids)
+                # External RoPE is only used by backends that do not handle
+                # fused RoPE internally, so keep latent_cache in sync.
+                latent_cache_ctx = torch.cat([compressed_kv_ctx, k_pe_ctx],
+                                             dim=-1)
 
             if self.llama_4_scaling:
                 q_ctx = self._attention_scaling(
@@ -1751,7 +1754,14 @@ class MLA(nn.Module):
                 latent_cache_gen = latent_cache[num_ctx_tokens:, ...]
             if self.apply_rotary_emb:
                 assert position_ids is not None
-                k_pe_gen = self.apply_rope(q_gen, k_pe_gen, position_ids)
+                # position_ids spans [ctx..., gen...] in mixed batches; gen
+                # positions start at num_ctx_tokens.
+                gen_position_ids = position_ids[..., num_ctx_tokens:]
+                k_pe_gen = self.apply_rope(q_gen, k_pe_gen, gen_position_ids)
+                # External RoPE is only used by backends that do not handle
+                # fused RoPE internally, so keep latent_cache in sync.
+                latent_cache_gen = torch.cat([compressed_kv_gen, k_pe_gen],
+                                             dim=-1)
 
             if self.llama_4_scaling:
                 q_gen = self._attention_scaling(
@@ -2405,6 +2415,18 @@ class MLA(nn.Module):
         output: torch.Tensor,
         latent_cache: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        if isinstance(attn_metadata, FlashInferAttentionMetadata):
+            if (attn_metadata.enable_context_mla_with_cached_kv
+                    and attn_metadata.num_ctx_cached_tokens > 0):
+                return self.forward_absorption_context(
+                    q,
+                    compressed_kv,
+                    k_pe,
+                    attn_metadata,
+                    output,
+                    position_ids=position_ids,
+                    latent_cache=latent_cache)
+
         if isinstance(self.mha, TrtllmAttention):
             assert isinstance(attn_metadata, TrtllmAttentionMetadata)
             trtllm_attention = cast(TrtllmAttention, self.mha)
@@ -2453,7 +2475,7 @@ class MLA(nn.Module):
 
         # fused_q contains 1) the result of the following bmm with shape [num_tokens, num_heads, kv_lora_rank]
         # 2) rope(q_pe) with shape [num_tokens, num_heads, qk_rope_head_dim]. rope is applied inside AttentionOp
-        num_seqs = attn_metadata.kv_lens_cuda_runtime.size(0)
+        num_seqs = attn_metadata.num_seqs
 
         cu_q_seqlens = torch.empty(num_seqs + 1,
                                    dtype=torch.int32,

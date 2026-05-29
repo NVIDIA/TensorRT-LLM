@@ -401,18 +401,6 @@ def _save_lpips_video_mp4(video, output_path, frame_rate):
     assert os.path.isfile(output_path), f"Visual gen did not produce {output_path}"
 
 
-def _disable_wan_fused_qk_norm_rope_if_unavailable(pipeline):
-    try:
-        getattr(torch.ops.trtllm, "fused_dit_cross_head_qk_norm_rope")
-        return
-    except AttributeError:
-        pass
-
-    for module in pipeline.modules():
-        if hasattr(module, "fuse_qk_norm_rope"):
-            module.fuse_qk_norm_rope = False
-
-
 def _run_lpips_eval(tmp_path, sample_id, media_type, prompt, reference_path, generated_path):
     reference_key = "reference_video_path" if media_type == "video" else "reference_image_path"
     generated_key = "generated_video_path" if media_type == "video" else "generated_image_path"
@@ -561,7 +549,6 @@ def _generate_wan_lpips_video(
         torch_compile_config=TorchCompileConfig(enable=False),
     )
     pipeline = PipelineLoader(args).load(skip_warmup=True)
-    _disable_wan_fused_qk_norm_rope_if_unavailable(pipeline)
     try:
         with torch.no_grad():
             result = pipeline.forward(

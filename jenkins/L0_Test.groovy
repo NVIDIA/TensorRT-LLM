@@ -1168,8 +1168,8 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                 }
 
                 def exemptionComment = ""
-                if (cluster.host.contains("oci-nrt") || cluster.host.contains("oci-hsg") || cluster.host.contains("lbd-lax")) {
-                    exemptionComment = """--comment='{"OccupiedIdleGPUsJobReaper":{"exemptIdleTimeMins":"90","reason":"other","description":"Long data and model loading time and disaggregated serving tests"}}'"""
+                if (SlurmConfig.needsIdleGpuExemption(cluster)) {
+                    exemptionComment = "--comment='${SlurmConfig.IDLE_GPU_EXEMPTION_PAYLOAD}'"
                 }
 
                 def envExportStatements = envVarsToExport.collect { varName, varValue ->
@@ -3282,7 +3282,9 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
 
         // Generate comprehensive rerun report if any reruns occurred
         stage ("Generate Report") {
-            generateRerunReport(stageName, llmSrc)
+            timeout(time: 15, unit: 'MINUTES'){
+                generateRerunReport(stageName, llmSrc)
+            }
         }
 
         if (rerunFailed) {
@@ -3921,10 +3923,10 @@ def launchTestJobs(pipeline, testFilter)
         "DGX_B200-8_GPUs-PyTorch-2": ["auto:dgx-b200-flex", "l0_dgx_b200", 2, 2, 8, 1, true],
         "DGX_B200-8_GPUs-AutoDeploy-Post-Merge-1": ["auto:dgx-b200-flex", "l0_dgx_b200", 1, 1, 8, 1, true],
         "DGX_B200-4_GPUs-Verl-Post-Merge-1": ["auto:dgx-b200-flex", "l0_verl", 1, 1, 4, 1, true],
-        "B300-PyTorch-1": ["b300-single", "l0_b300", 1, 1],
-        "DGX_B300-4_GPUs-PyTorch-1": ["b300-x4", "l0_dgx_b300", 1, 1, 4],
-        "DGX_B300-4_GPUs-PyTorch-Post-Merge-1": ["b300-x4", "l0_dgx_b300", 1, 2, 4],
-        "DGX_B300-4_GPUs-PyTorch-Post-Merge-2": ["b300-x4", "l0_dgx_b300", 2, 2, 4],
+        "B300-PyTorch-1": ["auto:dgx-b300-flex", "l0_b300", 1, 1, 1, 1, true],
+        "DGX_B300-4_GPUs-PyTorch-1": ["auto:dgx-b300-flex", "l0_dgx_b300", 1, 1, 4, 1, true],
+        "DGX_B300-4_GPUs-PyTorch-Post-Merge-1": ["auto:dgx-b300-flex", "l0_dgx_b300", 1, 2, 4, 1, true],
+        "DGX_B300-4_GPUs-PyTorch-Post-Merge-2": ["auto:dgx-b300-flex", "l0_dgx_b300", 2, 2, 4, 1, true],
         // VisualGen PerfSanity post-merge test
         "DGX_B200-8_GPUs-PyTorch-VisualGen-PerfSanity-Post-Merge-1": ["auto:dgx-b200-flex", "l0_b200_visual_gen_perf_sanity", 1, 1, 8, 1, true],
         // PerfSanity post-merge tests
@@ -4563,7 +4565,8 @@ def launchTestJobs(pipeline, testFilter)
     // CBTS Layer 2: replace `parallelJobsFiltered` with affected stages plus
     // PackageSanityCheck (kept iff sanity_required) and PerfSanity (kept iff
     // perfsanity_required). Pure -Perf- stages always excluded (own trigger
-    // model, full-list benchmarks).
+    // model, full-list benchmarks). Post-Merge stages are never force-kept;
+    // they only run when explicitly listed in affected_stages.
     def cbts = testFilter[(CBTS_RESULT)]
     if (cbts != null) {
         def affectedSet = (cbts.affected_stages ?: []) as Set
@@ -4571,6 +4574,7 @@ def launchTestJobs(pipeline, testFilter)
         def needsPerfSanity = cbts.perfsanity_required
         parallelJobsFiltered = parallelJobs.findAll { key, _ ->
             if (key =~ /-Perf-/) return false
+            if (key =~ /Post-Merge/) return affectedSet.contains(key)
             return affectedSet.contains(key) ||
                    (needsSanity && key =~ /PackageSanityCheck/) ||
                    (needsPerfSanity && key =~ /PerfSanity/)

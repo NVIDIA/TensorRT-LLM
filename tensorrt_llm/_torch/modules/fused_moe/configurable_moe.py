@@ -67,6 +67,13 @@ _BACKEND_SYNC_ATTRS = (
 
 
 class ConfigurableMoE(MoE):
+    # ConfigurableMoE is a thin wrapper that dispatches to a concrete backend
+    # (CuteDslFusedMoE / CutlassFusedMoE / ...). Allow the wrapper itself to
+    # pass the non-divisible-EP gate so the inner backend's own gate is the
+    # authoritative check -- if the chosen inner backend doesn't opt in, its
+    # ``MoE.__init__`` will still raise.
+    _supports_non_divisible_ep: bool = True
+
     """
     Configurable MoE layer using composition pattern with automatic configuration
 
@@ -402,17 +409,20 @@ class ConfigurableMoE(MoE):
             else False,
         }
 
+    @staticmethod
+    def _dp_padded_num_rows(all_rank_num_tokens: List[int]) -> int:
+        """Padded total rows after DP dispatch: num_dp_ranks * max_tokens_per_rank."""
+        return len(all_rank_num_tokens) * max(all_rank_num_tokens)
+
     def calculate_num_chunks(self, all_rank_num_tokens: List[int]) -> int:
         """
-        Calculate how many chunks are needed.
+        Calculate how many chunks are needed based on total tokens after dispatch.
 
-        Uses ep_size * max(all_rank_num_tokens) when A2A communication is active,
-        because the A2A recv buffer is shaped [ep_size, max_tokens_per_rank, hidden]
-        regardless of how tokens are distributed across ranks. This matches the
-        actual memory footprint of the MoE GEMM workspace.
+        When using DP communication, the dispatch (AllGather/AllToAll) collects
+        tokens from all DP ranks, so total tokens = num_dp_ranks * max_tokens_per_rank.
         """
         if self.use_dp and self.comm is not None:
-            num_rows = self.mapping.moe_ep_size * max(all_rank_num_tokens)
+            num_rows = self._dp_padded_num_rows(all_rank_num_tokens)
         else:
             num_rows = sum(all_rank_num_tokens)
         return (num_rows + self.moe_max_num_tokens - 1) // self.moe_max_num_tokens

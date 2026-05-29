@@ -30,7 +30,8 @@ if TYPE_CHECKING:
 
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 from tensorrt_llm._torch.pyexecutor.resource_manager import (
-    BaseResourceManager, CacheTypeCpp, DataType, KVCacheManager, get_pp_layers)
+    BaseResourceManager, CacheTypeCpp, DataType, KVCacheManager,
+    PoolConfiguration, get_pp_layers)
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm._utils import (nvtx_range, prefer_pinned,
                                  torch_dtype_to_binding)
@@ -1027,6 +1028,10 @@ class MixedMambaHybridCacheManager(KVCacheManager, MambaCacheManager,
         is_draft: bool = False,
         use_replay_state_update: bool = False,
         mamba_ssm_stochastic_rounding: bool = False,
+        # Per-pool configurations forwarded to the C++ KVCacheManager ctor.
+        # Lets a single manager host pools with mixed shapes (e.g. Gemma4
+        # hybrid attention). See KVCacheManager.__init__.
+        pool_configurations: Optional[List[PoolConfiguration]] = None,
     ) -> None:
 
         # mamba hybrid cache requires block reuse to be disabled in KV cache config
@@ -1077,6 +1082,7 @@ class MixedMambaHybridCacheManager(KVCacheManager, MambaCacheManager,
             is_estimating_kv_cache=is_estimating_kv_cache,
             execution_stream=execution_stream,
             is_draft=is_draft,
+            pool_configurations=pool_configurations,
         )
 
     def prepare_resources(self, scheduled_batch: ScheduledRequests):
@@ -1352,6 +1358,7 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
             is_estimating_kv_cache=is_estimating_kv_cache,
             is_draft=is_draft,
             linear_attention_metadata=self.linear_attention_metadata,
+            **kwargs,
         )
 
         assert self.local_num_mamba_layers > 0, "At least one mamba layer is required"
@@ -1723,7 +1730,7 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
     def free_resources(self, request: LlmRequest, pin_on_release: bool = False):
         if request in self.requests:
             self.requests.remove(request)
-            # self._request_id_to_state_index.pop(request.py_request_id, None)
+            self._request_id_to_state_index.pop(request.py_request_id, None)
         super().free_resources(request, pin_on_release)
 
     def _setup_state_indices(self) -> None:

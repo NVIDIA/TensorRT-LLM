@@ -1978,7 +1978,7 @@ class TestKimiK2(LlmapiAccuracyTestHarness):
 
 
 @pytest.mark.timeout(DEFAULT_TEST_TIMEOUT)
-# @skip_pre_blackwell
+@skip_pre_blackwell
 @pytest.mark.skip_less_device_memory(80000)
 class TestNemotron3Super120B(LlmapiAccuracyTestHarness):
     MODEL_NAME = "nvidia/Nemotron-Super-V3"

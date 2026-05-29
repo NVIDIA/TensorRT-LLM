@@ -4,11 +4,13 @@ from typing import Optional, Tuple
 import torch
 import torch.nn as nn
 
+from tensorrt_llm.llmapi.llm_args import SkipSoftmaxAttentionConfig
+
 from ...modules.linear import Linear, WeightMode, WeightsLoadingConfig
 from ...modules.rms_norm import RMSNorm
 from ..attention_backend.interface import AttentionTensorLayout
 from ..attention_backend.utils import create_attention
-from ..config import DiffusionModelConfig
+from ..config import DiffusionModelConfig, SkipSoftmaxConfig
 
 
 class QKVMode(str, Enum):
@@ -47,9 +49,9 @@ class Attention(nn.Module):
         bias: bool = True,
         interleave: bool = True,
         fuse_qk_norm_rope: Optional[bool] = None,
-        qk_norm_rope_kernel: str = "fused_dit_qk_norm_rope",
         config: Optional[DiffusionModelConfig] = None,
         layer_idx: Optional[int] = None,
+        enable_ulysses: bool = True,  # make this enable sequence parallelism
     ):
         super().__init__()
 
@@ -68,26 +70,11 @@ class Attention(nn.Module):
         self.bias = bias
 
         # Fused QK Norm + RoPE: each model class opts in via fuse_qk_norm_rope.
-        # Supported for both per_head (FLUX) and full/cross-head (WAN) norm modes.
-        # Defaults to False; models that want the fused kernel must pass True explicitly.
+        # Backed by torch.ops.trtllm.fused_dit_qk_norm_rope which auto-dispatches:
+        #   - per-head template (FLUX/Cosmos):   q/k_weight.shape == [head_dim]
+        #   - full-dim template (LTX-2, WAN):    q/k_weight.shape == [num_heads * head_dim]
+        # Full-dim template envelope: num_heads <= 64, head_dim in {64, 128}.
         self.fuse_qk_norm_rope = fuse_qk_norm_rope if fuse_qk_norm_rope is not None else False
-        # Which trtllm op backs the fused path. Value is the op name itself
-        # (1:1 with torch.ops.trtllm registrations):
-        #   "fused_dit_qk_norm_rope" (default)
-        #     — Per-head autodispatch for FLUX/Cosmos and full-dim path for
-        #       LTX-2. Bounded to num_heads<=32 and head_dim in {64,128}.
-        #   "fused_dit_cross_head_qk_norm_rope"
-        #     — PR #13052 cross-head kernel for WAN sizes outside the default
-        #       op's range (head_dim=256, or num_heads>32). fp32 head-broadcast
-        #       cos only.
-        assert qk_norm_rope_kernel in (
-            "fused_dit_qk_norm_rope",
-            "fused_dit_cross_head_qk_norm_rope",
-        ), (
-            f"qk_norm_rope_kernel must be 'fused_dit_qk_norm_rope' or "
-            f"'fused_dit_cross_head_qk_norm_rope', got {qk_norm_rope_kernel}"
-        )
-        self.qk_norm_rope_kernel = qk_norm_rope_kernel
         self.interleave = interleave
 
         # Select compute backend (orthogonal to parallelism)
@@ -146,7 +133,7 @@ class Attention(nn.Module):
         # Currently kept as mutually exclusive.
         attn2d_size = (vgm.attn2d_row_size * vgm.attn2d_col_size) if vgm else 1
         use_attn2d = attn2d_size > 1 and self.qkv_mode != QKVMode.SEPARATE_QKV
-        use_ulysses = ulysses_size > 1 and self.qkv_mode != QKVMode.SEPARATE_QKV
+        use_ulysses = ulysses_size > 1 and enable_ulysses
 
         # Compute head counts for the backend
         # Ulysses shards heads across workers; inner backend sees sharded count
@@ -157,6 +144,22 @@ class Attention(nn.Module):
         else:
             backend_num_heads = self.num_attention_heads
             backend_num_kv_heads = self.num_key_value_heads
+
+        # Resolve sparse attention config for TRTLLM backend
+        sparse_attention_config = None
+        ss_cfg = config.attention.sparse_attention_config
+        if isinstance(ss_cfg, SkipSoftmaxConfig) and backend_name == "TRTLLM":
+            # Cache the resolved scalar on a private attr (idempotent across
+            # all Attention modules); does NOT mutate the source-of-truth
+            # `threshold_scale_factor` / `target_sparsity` fields. Subsequent
+            # callers — including `apply_skip_softmax_overrides` — read the
+            # cached value via `resolve_threshold(module_name)`.
+            threshold = ss_cfg.get_or_resolve_threshold()
+
+            if threshold is not None and threshold > 0:
+                sparse_attention_config = SkipSoftmaxAttentionConfig(
+                    threshold_scale_factor={"prefill": threshold, "decode": 0}
+                )
 
         # Create compute backend
         self.attn = create_attention(
@@ -169,6 +172,7 @@ class Attention(nn.Module):
             dtype=self.dtype,
             attention_config=config.attention,
             attention_metadata_state=attention_metadata_state,
+            sparse_attention_config=sparse_attention_config,
         )
 
         # Wrap with parallelism strategy (orthogonal to backend choice)
@@ -279,71 +283,19 @@ class Attention(nn.Module):
     ) -> None:
         """Apply fused QK Norm + RoPE in-place on packed QKV tensor (FUSE_QKV self-attn).
 
-        cos/sin can be either shape (per-token total elements):
-          - [..., head_dim]            : shared across heads (FLUX/Cosmos style)
-          - [..., num_heads*head_dim]  : per-head freqs (LTX-2 3D RoPE style)
-        Op auto-detects via cos_emb.size(1) and dispatches the kernel template.
+        The op auto-dispatches by tensor shapes/dtypes:
+          - q_weight.shape = [head_dim]              → per-head norm (FLUX/Cosmos, w/ dual-stream)
+          - q_weight.shape = [num_heads * head_dim]  → full-dim norm (LTX-2, WAN, ≤64 heads)
+          - cos last dim = head_dim                  → per-token shared cos (FLUX, WAN)
+          - cos last dim = num_heads * head_dim      → per-token per-head cos (LTX-2 3D RoPE)
+          - cos rows < num_tokens                    → kernel broadcasts via cos_seq_per_batch
+
+        Caller passes raw freqs_cos / freqs_sin (any rank); the op reshapes internally.
         """
         B, S, D = qkv.shape
-
-        if self.qk_norm_rope_kernel == "fused_dit_cross_head_qk_norm_rope":
-            # PR #13052 cross-head op path (WAN sizes that exceed the default
-            # op's num_heads<=32 / head_dim in {64,128} envelope). Op requires
-            # head-broadcast fp32 cos: [num_tokens, head_dim].
-            cos_2d = freqs_cos.reshape(-1, self.head_dim).float().contiguous()
-            sin_2d = freqs_sin.reshape(-1, self.head_dim).float().contiguous()
-            if cos_2d.shape[0] == S and B > 1:
-                cos_tiled = cos_2d.repeat(B, 1)
-                sin_tiled = sin_2d.repeat(B, 1)
-            else:
-                cos_tiled = cos_2d
-                sin_tiled = sin_2d
-            qkv_2d = qkv.view(B * S, D)
-            torch.ops.trtllm.fused_dit_cross_head_qk_norm_rope(
-                qkv_2d,
-                self.num_attention_heads,
-                self.num_key_value_heads,
-                self.num_key_value_heads,
-                self.head_dim,
-                self.eps,
-                self.norm_q.weight,
-                self.norm_k.weight,
-                cos_tiled,
-                sin_tiled,
-                self.interleave,
-            )
-            return
-
-        # cos last-dim is fixed by qk_norm_mode:
-        #   "full"     → num_heads * head_dim (LTX-2 / WAN per-head cos)
-        #   "per_head" → head_dim             (FLUX / Cosmos shared-across-heads cos)
-        cos_last = self.q_dim if self.qk_norm_mode == "full" else self.head_dim
-        # cos/sin are token-major [B, T, H, D] (or shared per-token [B, T, D]);
-        # reshape(-1, cos_last) yields the [B*T, cos_last] layout the kernel reads.
-        # Full-dim LTX-2 / WAN path accepts bf16 cos (kernel upcasts in registers, lossless);
-        # FLUX per-head path requires fp32 (and cos is already fp32 upstream there).
-        cos_2d = freqs_cos.reshape(-1, cos_last).contiguous()
-        sin_2d = freqs_sin.reshape(-1, cos_last).contiguous()
-        # LTX-2 / WAN full-dim path: kernel broadcasts cos over B internally
-        # (cos_tokenIdx = tokenIdx % cos_seq_per_batch in the fused kernel), so we
-        # pass cos as-is regardless of B. FLUX / Cosmos per-head path: kernel does
-        # not support broadcast, so host still has to tile when B > 1.
-        if self.qk_norm_mode == "full" or cos_2d.shape[0] != S or B == 1:
-            cos_tiled = cos_2d
-            sin_tiled = sin_2d
-        else:
-            cos_tiled = cos_2d.repeat(B, 1)
-            sin_tiled = sin_2d.repeat(B, 1)
-        qkv_2d = qkv.view(B * S, D)
-
-        # Dual-stream batch correction: when B>1 and dual-stream is active,
-        # the kernel uses modulo (tokenIdx % tokens_per_batch) to find the
-        # local position within each batch element for the text/image boundary.
-        # 0 = no dual-stream (single-stream or batch=1).
         tokens_per_batch = S if num_txt_tokens > 0 else 0
-
         torch.ops.trtllm.fused_dit_qk_norm_rope(
-            qkv_2d,
+            qkv.view(B * S, D),
             self.num_attention_heads,
             self.num_key_value_heads,
             self.num_key_value_heads,
@@ -353,8 +305,8 @@ class Attention(nn.Module):
             self.norm_k.weight,
             q_add_weight,
             k_add_weight,
-            cos_tiled,
-            sin_tiled,
+            freqs_cos,
+            freqs_sin,
             num_txt_tokens,
             self.interleave,
             tokens_per_batch,
@@ -370,25 +322,22 @@ class Attention(nn.Module):
     ) -> None:
         """In-place fused RMSNorm + RoPE on a single Q or K tensor [B, T, H*D] (SEPARATE_QKV cross-attn).
 
-        Calls trtllm.fused_dit_split_norm_rope. Full-dim per-head cos in
-        [B, T, H, D] reshape(-1, H*D) -> [B*T, H*D] is what the kernel reads;
-        the kernel broadcasts cos over B internally
-        (cos_tokenIdx = tokenIdx % cos_seq_per_batch), so we pass cos as-is.
-        bf16 cos is also accepted (kernel upcasts to fp32 in registers).
+        The op auto-dispatches by shapes/dtypes (same as `apply_packed_qk_norm_rope`):
+          - cos last dim = head_dim                  → per-token shared cos
+          - cos last dim = num_heads * head_dim      → per-token per-head cos (LTX-2 3D RoPE)
+          - cos rows < num_tokens                    → kernel broadcasts via cos_seq_per_batch
+          - cos dtype bf16 or fp32                   → kernel upcasts bf16 to fp32 in registers
+        Caller passes raw cos/sin (any rank); the op reshapes internally.
         """
         B, T, _ = tensor.shape
-        cos_last = num_heads * self.head_dim
-        cos_2d = cos.reshape(-1, cos_last).contiguous()
-        sin_2d = sin.reshape(-1, cos_last).contiguous()
-        tensor_2d = tensor.view(B * T, -1)
         torch.ops.trtllm.fused_dit_split_norm_rope(
-            tensor_2d,
+            tensor.view(B * T, -1),
             num_heads,
             self.head_dim,
             self.eps,
             weight,
-            cos_2d,
-            sin_2d,
+            cos,
+            sin,
             self.interleave,
         )
 
@@ -404,9 +353,8 @@ class Attention(nn.Module):
         no RoPE -- e.g. LTX-2 text cross-attn (Q-norm with pe=None).
         """
         B, T, _ = tensor.shape
-        tensor_2d = tensor.view(B * T, -1)
         torch.ops.trtllm.fused_dit_split_norm(
-            tensor_2d,
+            tensor.view(B * T, -1),
             num_heads,
             self.head_dim,
             self.eps,

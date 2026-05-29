@@ -21,6 +21,7 @@ l0_b200:
   - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_nvfp4_kv[v2_kv_cache=False-attn_backend=TRTLLM-torch_compile=False]
   - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_nvfp4_kv[v2_kv_cache=False-attn_backend=TRTLLM-torch_compile=True]
   - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_nvfp4_kv[v2_kv_cache=True-attn_backend=TRTLLM-torch_compile=True]
+  - accuracy/test_llm_api_pytorch.py::TestLagunaXS::test_nvfp4
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_bfloat16[mtp_nextn=0-attention_dp=True-cuda_graph=True-overlap_scheduler=True-torch_compile=False-enable_chunked_prefill=False-v2_kv_cache=False]
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_bfloat16[mtp_nextn=0-attention_dp=True-cuda_graph=True-overlap_scheduler=True-torch_compile=False-enable_chunked_prefill=False-v2_kv_cache=True]
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_bfloat16[mtp_nextn=2-attention_dp=True-cuda_graph=True-overlap_scheduler=True-torch_compile=False-enable_chunked_prefill=False-v2_kv_cache=False]
@@ -32,6 +33,8 @@ l0_b200:
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_bfloat16_python_scheduler[mtp_nextn=2-attention_dp=False-cuda_graph=False-overlap_scheduler=False-enable_chunked_prefill=False]
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_bfloat16_python_scheduler[mtp_nextn=2-attention_dp=True-cuda_graph=True-overlap_scheduler=True-enable_chunked_prefill=False]
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_bfloat16_python_scheduler[mtp_nextn=2-attention_dp=False-cuda_graph=False-overlap_scheduler=False-enable_chunked_prefill=True]
+  - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_bfloat16_flashinfer[enable_chunked_prefill=False]
+  - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_bfloat16_flashinfer[enable_chunked_prefill=True]
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_nvfp4[moe_backend=CUTLASS-mtp_nextn=0-fp8kv=True-attention_dp=False-cuda_graph=True-overlap_scheduler=True-torch_compile=True]
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_nvfp4[moe_backend=CUTLASS-mtp_nextn=0-fp8kv=True-attention_dp=True-cuda_graph=True-overlap_scheduler=True-torch_compile=False]
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_nvfp4[moe_backend=TRTLLM-mtp_nextn=0-fp8kv=True-attention_dp=False-cuda_graph=True-overlap_scheduler=True-torch_compile=False]
@@ -88,8 +91,6 @@ l0_b200:
   - unittest/_torch/attention
   - unittest/_torch/compilation
   - unittest/_torch/debugger
-  - unittest/_torch/executor
-  - unittest/_torch/misc
   # ------------- modules (non-MoE) ---------------
   - unittest/_torch/modules/test_mla_helix.py
   - unittest/_torch/modules/test_fused_add_rms_norm_quant.py
@@ -186,9 +187,10 @@ l0_b200:
   - unittest/_torch/visual_gen/test_teacache.py
   - unittest/_torch/visual_gen/test_cache_dit.py
   - unittest/_torch/visual_gen/test_quant_ops.py
+  - unittest/_torch/visual_gen/test_attention_cute_dsl.py
+  - unittest/_torch/visual_gen/test_attention_trtllm_sage.py
   - unittest/_torch/visual_gen/test_attention_integration.py
   - unittest/_torch/visual_gen/test_attention_perf.py
-  - unittest/_torch/visual_gen/test_attention_trtllm_sage.py
   - unittest/_torch/visual_gen/test_trtllm_serve_endpoints.py
   - unittest/_torch/visual_gen/test_trtllm_serve_e2e.py
   - unittest/_torch/visual_gen/test_model_loader.py
@@ -276,6 +278,9 @@ l0_b200:
       backend: pytorch
   tests:
   # ------------- PyTorch tests ---------------
+  # Covered by H100 pre_merge for primary HW-agnostic signal; keep B200 runtime
+  # canary in post_merge for CUDA IPC / virtual memory / profiling paths.
+  - unittest/_torch/misc
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_nvfp4[moe_backend=CUTLASS-mtp_nextn=0-fp8kv=False-attention_dp=False-cuda_graph=False-overlap_scheduler=False-torch_compile=False]
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_nvfp4[moe_backend=CUTLASS-mtp_nextn=0-fp8kv=False-attention_dp=False-cuda_graph=False-overlap_scheduler=False-torch_compile=True]
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_nvfp4[moe_backend=CUTLASS-mtp_nextn=0-fp8kv=True-attention_dp=False-cuda_graph=False-overlap_scheduler=False-torch_compile=False]

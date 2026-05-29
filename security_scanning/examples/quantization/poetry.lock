@@ -792,17 +792,18 @@ zstd = ["zstandard (>=0.18.0)"]
 
 [[package]]
 name = "huggingface-hub"
-version = "1.16.1"
+version = "1.17.0"
 description = "Client library to download and publish models, datasets and other repos on the huggingface.co hub"
 optional = false
 python-versions = ">=3.10.0"
 groups = ["main"]
 files = [
-    {file = "huggingface_hub-1.16.1-py3-none-any.whl", hash = "sha256:64340de934b9ce37857ef85a82de72f5629e8a270f9119eabb12bf495eb53c22"},
-    {file = "huggingface_hub-1.16.1.tar.gz", hash = "sha256:7f1dc4c5ec21aed69be630ad0c3378616be16f3de1a47b141c0e812965d9c832"},
+    {file = "huggingface_hub-1.17.0-py3-none-any.whl", hash = "sha256:3b8156d23118e87f6a587648bfbc04f04a12a757ccb4ed298b35c4ae638bf24c"},
+    {file = "huggingface_hub-1.17.0.tar.gz", hash = "sha256:fad842b6763ef70ebc3919665b1b9273645203185400a7d6c5eddc2323cc3435"},
 ]
 
 [package.dependencies]
+click = ">=8.4.0"
 filelock = ">=3.10.0"
 fsspec = ">=2023.5.0"
 hf-xet = {version = ">=1.4.3,<2.0.0", markers = "platform_machine == \"x86_64\" or platform_machine == \"amd64\" or platform_machine == \"AMD64\" or platform_machine == \"arm64\" or platform_machine == \"aarch64\""}
@@ -810,7 +811,7 @@ httpx = ">=0.23.0,<1"
 packaging = ">=20.9"
 pyyaml = ">=5.1"
 tqdm = ">=4.42.1"
-typer = ">=0.20.0"
+typer = ">=0.20.0,<0.26.0"
 typing-extensions = ">=4.1.0"
 
 [package.extras]
@@ -828,14 +829,14 @@ typing = ["types-PyYAML", "types-simplejson", "types-toml", "types-tqdm", "types
 
 [[package]]
 name = "idna"
-version = "3.16"
+version = "3.17"
 description = "Internationalized Domain Names in Applications (IDNA)"
 optional = false
 python-versions = ">=3.9"
 groups = ["main"]
 files = [
-    {file = "idna-3.16-py3-none-any.whl", hash = "sha256:cc246e3a3f89580c3a951b5ad298ca4638078b2cdd4f115654332b5c26daded5"},
-    {file = "idna-3.16.tar.gz", hash = "sha256:d7a6da03db833450fca25d2358ac9ff06cd624577a4aea3a596d5c0f77b8e03d"},
+    {file = "idna-3.17-py3-none-any.whl", hash = "sha256:466e48829084efe2548012b855df21540b96f2e20e51bd124c851536556a592c"},
+    {file = "idna-3.17.tar.gz", hash = "sha256:5eb0cb53bc467c12eadcf6de83163ad8527cec9416f44b9b61b19caedad2b87f"},
 ]
 
 [package.extras]

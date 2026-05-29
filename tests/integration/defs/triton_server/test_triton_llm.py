@@ -3644,6 +3644,7 @@ def test_llmapi_backend(E2E_MODEL_NAME, DECOUPLED_MODE, TRITON_MAX_BATCH_SIZE,
     # Prepare model repo
     new_model_repo = os.path.join(llm_backend_repo_root, "triton_repo")
     prepare_llmapi_model_repo(llm_backend_repo_root, new_model_repo)
+    set_llmapi_decoupled_mode(new_model_repo, DECOUPLED_MODE)
     model_config_path = os.path.join(new_model_repo, "tensorrt_llm", "1",
                                      "model.yaml")
     with open(model_config_path, "r") as f:
@@ -3709,6 +3710,12 @@ def test_llmapi_backend(E2E_MODEL_NAME, DECOUPLED_MODE, TRITON_MAX_BATCH_SIZE,
                 f"--tensorrt-llm-model-name={E2E_MODEL_NAME}",
                 f"--protocol={protocol}",
                 f"--test-llmapi",
+            ]
+            if DECOUPLED_MODE:
+                # Triton rejects ModelInfer RPC on decoupled models; the
+                # benchmark must use async_stream_infer in that mode.
+                run_cmd.append("--decoupled")
+            run_cmd += [
                 'dataset',
                 f"--dataset={os.path.join(llm_backend_dataset_root, 'mini_cnn_eval.json')}",
                 f"--tokenizer-dir={tiny_llama_model_root}",
@@ -3722,6 +3729,11 @@ def test_llmapi_backend(E2E_MODEL_NAME, DECOUPLED_MODE, TRITON_MAX_BATCH_SIZE,
                 f"{llm_backend_repo_root}/tools/llmapi_client.py",
                 "--request-output-len=200", '--stop-after-ms=25'
             ]
+            if DECOUPLED_MODE:
+                # On a decoupled server, ModelInfer RPC is rejected;
+                # llmapi_client.py must use the bidirectional stream
+                # RPC, which it routes through when --streaming is set.
+                run_cmd.append('--streaming')
 
             output = venv_check_output(llm_backend_venv, run_cmd)
             assert 'Request is cancelled' in output
@@ -3731,11 +3743,83 @@ def test_llmapi_backend(E2E_MODEL_NAME, DECOUPLED_MODE, TRITON_MAX_BATCH_SIZE,
             output = venv_check_output(llm_backend_venv, run_cmd)
             assert 'Request is cancelled' in output
 
-            # Test request cancellation for non-existing request and completed request
-            run_cmd = [
-                f"{llm_backend_repo_root}/tools/tests/test_llmapi_cancel.py"
-            ]
-            output = venv_check_output(llm_backend_venv, run_cmd)
+            # Test request cancellation for non-existing request and
+            # completed request. The helper script uses ModelInfer RPC
+            # (async_infer), which Triton rejects on a decoupled model;
+            # only exercise it in the non-decoupled config.
+            if not DECOUPLED_MODE:
+                run_cmd = [
+                    f"{llm_backend_repo_root}/tools/tests/test_llmapi_cancel.py"
+                ]
+                output = venv_check_output(llm_backend_venv, run_cmd)
+
+
+@pytest.mark.parametrize("E2E_MODEL_NAME", ["tensorrt_llm"])
+@pytest.mark.parametrize("TENSOR_PARALLEL_SIZE", ["1"])
+def test_llmapi_lora(E2E_MODEL_NAME, TENSOR_PARALLEL_SIZE,
+                     llm_backend_inflight_batcher_llm_root, llm_backend_venv,
+                     tiny_llama_model_root, tiny_llama_lora_model_root):
+    """E2E LoRA test for the new llmapi triton backend.
+
+    Templates `model.yaml` with `lora_config:` pointing at a TinyLlama
+    HF LoRA adapter, launches Triton with the llmapi backend, and sends
+    one request via `llmapi_client.py --lora-id/--lora-name/--lora-path`.
+    Asserts that the response carries generated text — proving the new
+    lora_id/lora_name/lora_path inputs reach `LLM.generate_async(
+    lora_request=...)` and adapter-applied inference completes.
+    """
+    llm_backend_repo_root = os.path.join(LLM_ROOT, "triton_backend")
+
+    if torch.cuda.device_count() < int(TENSOR_PARALLEL_SIZE):
+        pytest.skip("Skipping. Not enough GPUs.")
+
+    # Prepare model repo with lora_config
+    new_model_repo = os.path.join(llm_backend_repo_root, "triton_repo")
+    prepare_llmapi_model_repo(llm_backend_repo_root, new_model_repo)
+    set_llmapi_decoupled_mode(new_model_repo, False)
+    model_config_path = os.path.join(new_model_repo, "tensorrt_llm", "1",
+                                     "model.yaml")
+    with open(model_config_path, "r") as f:
+        model_config = yaml.safe_load(f)
+    model_config["triton_config"]["decoupled"] = False
+    model_config["triton_config"]["max_batch_size"] = 0
+    model_config["tensor_parallel_size"] = int(TENSOR_PARALLEL_SIZE)
+    model_config["kv_cache_config"] = {"free_gpu_memory_fraction": 0.8}
+    model_config["model"] = tiny_llama_model_root
+    model_config["lora_config"] = {
+        "lora_dir": [tiny_llama_lora_model_root],
+        "max_lora_rank": 64,
+        "max_loras": 1,
+        "max_cpu_loras": 1,
+    }
+    with open(model_config_path, "w") as f:
+        yaml.dump(model_config, f)
+
+    # Launch Triton Server
+    launch_server_py = os.path.join(llm_backend_repo_root, "scripts",
+                                    "launch_triton_server.py")
+    cmd = (f"python3 {launch_server_py} "
+           f"--world_size={TENSOR_PARALLEL_SIZE} "
+           f"--model_repo={new_model_repo} --no-mpi")
+    print_info(f"DEBUG:: launch_server with args: {cmd}")
+    check_call(cmd, shell=True)
+    check_server_ready()
+
+    # Send a LoRA request via llmapi_client.py
+    run_cmd = [
+        f"{llm_backend_repo_root}/tools/llmapi_client.py",
+        "--text=I've noticed you seem a bit down lately. "
+        "Is there anything you'd like to talk about?",
+        "--request-output-len=32",
+        "--lora-id=0",
+        "--lora-name=mental-health",
+        f"--lora-path={tiny_llama_lora_model_root}",
+        f"--model-name={E2E_MODEL_NAME}",
+    ]
+    print_info("DEBUG:: run_cmd: python3 " + " ".join(run_cmd))
+    output = venv_check_output(llm_backend_venv, run_cmd)
+    assert "Output text:" in output, (
+        f"Expected 'Output text:' in client output, got: {output[:500]}")
 
 
 def test_llmapi_backend_multi_instance(llm_backend_inflight_batcher_llm_root,
@@ -3747,6 +3831,7 @@ def test_llmapi_backend_multi_instance(llm_backend_inflight_batcher_llm_root,
     # Prepare model repo
     new_model_repo = os.path.join(llm_backend_repo_root, "triton_repo")
     prepare_llmapi_model_repo(llm_backend_repo_root, new_model_repo)
+    set_llmapi_decoupled_mode(new_model_repo, True)
 
     # Modify model.yaml
     model_config_path = os.path.join(new_model_repo, "tensorrt_llm", "1",
