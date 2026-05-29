@@ -29,33 +29,14 @@ transforms:
     enabled: true
   fuse_nvfp4_moe:
     backend: trtllm_gen
-  detect_sharding:
-    # for long input, tp8ep1 gives better performance
-    # dist_mapping: {moe_tp: 8, moe_ep: 1}
+  # Sharding is driven by the hint-based IR path (enable_sharder_ir.yaml); TP/EP
+  # plans come from the in-model sharding hints, so no detect_sharding config is
+  # needed. Only runtime distribution options are set here.
+  apply_sharding_hints:
+    # Symmetric-memory all-reduce (MULTIMEM); matches the pre-IR sharding perf.
     allreduce_strategy: SYMM_MEM
-    shard_all_unprocessed: true
-    simple_shard_filter: "lm_head"
-    sharding_dims: ['tp','ep', 'bmm']
-    # use only manual config for TP sharding
-    sharding_source: ['manual']
-    manual_config:
-      tp_plan:
-        # GDN layer
-        "in_proj_qkv": "delta"
-        # attention layer
-        "q_proj": "colwise"
-        "k_proj": "colwise"
-        "v_proj": "colwise"
-        "o_proj": "rowwise"
-        # lm_head: "gather" = column split + all_gather (not "colwise" which
-        # requires a LayerSubgraph and crashes for standalone unprocessed nodes)
-        "lm_head": "gather"
-        # replicating shared experts (keep them commented out)
-        # "shared_expert_gate_proj": "colwise"
-        # "shared_expert_up_proj": "colwise"
-        # "shared_expert_down_proj": "rowwise"
-        # gating layer should be replicated as well
-        # "gate": "gather"
+    # Replicate the shared expert instead of TP-sharding it (cheaper at this size).
+    shard_exclude_filter: ["shared_expert"]
   multi_stream_moe:
     stage: compile
     enabled: true
