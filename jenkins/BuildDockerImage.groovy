@@ -374,7 +374,7 @@ def prepareWheelFromBuildStage(dockerfileStage, arch) {
         echo "Release image for ${arch} will BOLT-optimize its wheel using profiles from: ${branches.join(', ')}"
         wheelArgs += " --bolt-branch ${branches.join(',')}"
     }
-    return " BUILD_WHEEL_SCRIPT=${wheelScript} BUILD_WHEEL_ARGS='${wheelArgs}'"
+    return " BUILD_WHEEL_SCRIPT=${wheelScript} BUILD_WHEEL_ARGS='${wheelArgs}' PREPARE_WHEEL_FROM_BUILD_STAGE='true'"
 }
 
 // Whether a docker build that failed WITH the downloaded-wheel args may be
@@ -678,21 +678,34 @@ def buildImage(config, imageKeyToTag, versionOverride)
             sh "env | sort"
             def randomSleep = (Math.random() * 600 + 600).toInteger()
             trtllm_utils.llmExecStepWithRetry(this, script: "docker pull ${TRITON_IMAGE}:${TRITON_BASE_TAG}", sleepInSecs: randomSleep, numRetries: 6, shortCommondRunTimeMax: 7200)
-            try {
-                trtllm_utils.llmExecStepWithRetry(this, script: """
-                cd ${LLM_ROOT} && make -C docker ${target}_${action} \
-                BASE_IMAGE=${BASE_IMAGE} \
-                TRITON_IMAGE=${TRITON_IMAGE} \
-                TORCH_INSTALL_TYPE=${torchInstallType} \
-                IMAGE_WITH_TAG=${rawImageTag} \
-                STAGE=${dockerfileStage} \
-                BUILD_WHEEL_OPTS='-j ${build_jobs}' ${args} ${buildWheelArgs}
-                """, sleepInSecs: randomSleep, numRetries: 6, shortCommondRunTimeMax: 7200)
-            } catch (InterruptedException ex) {
-                throw ex
-            } catch (Exception ex) {
-                if (buildWheelArgs.trim().isEmpty()) {
+            withCredentials([string(credentialsId: 'svc_tensorrt_llm_oss_gitlab_token_secret', variable: 'GITLAB_TOKEN')]) {
+                try {
+                    trtllm_utils.llmExecStepWithRetry(this, script: """
+                    cd ${LLM_ROOT} && make -C docker ${target}_${action} \
+                    BASE_IMAGE=${BASE_IMAGE} \
+                    TRITON_IMAGE=${TRITON_IMAGE} \
+                    TORCH_INSTALL_TYPE=${torchInstallType} \
+                    IMAGE_WITH_TAG=${rawImageTag} \
+                    STAGE=${dockerfileStage} \
+                    BUILD_WHEEL_OPTS='-j ${build_jobs}' ${args} ${buildWheelArgs}
+                    """, sleepInSecs: randomSleep, numRetries: 6, shortCommondRunTimeMax: 7200)
+                } catch (InterruptedException ex) {
                     throw ex
+                } catch (Exception ex) {
+                    if (buildWheelArgs.trim().isEmpty()) {
+                        throw ex
+                    }
+                    echo "Build failed with wheel arguments, retrying without them"
+                    buildWheelArgs = ""
+                    trtllm_utils.llmExecStepWithRetry(this, script: """
+                    cd ${LLM_ROOT} && make -C docker ${target}_${action} \
+                    BASE_IMAGE=${BASE_IMAGE} \
+                    TRITON_IMAGE=${TRITON_IMAGE} \
+                    TORCH_INSTALL_TYPE=${torchInstallType} \
+                    IMAGE_WITH_TAG=${imageWithTag} \
+                    STAGE=${dockerfileStage} \
+                    BUILD_WHEEL_OPTS='-j ${build_jobs}' ${args} ${buildWheelArgs}
+                    """, sleepInSecs: randomSleep, numRetries: 6, shortCommondRunTimeMax: 7200)
                 }
                 if (!mayRetryWithoutBuildStageWheel(arch)) {
                     echo "Build failed with wheel arguments and the BOLT-optimized wheel is required for ${arch}; " +
