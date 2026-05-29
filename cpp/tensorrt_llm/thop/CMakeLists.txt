@@ -71,6 +71,7 @@ add_library(
   fusedDiTSplitNormOp.cpp
   fusedAddRMSNormQuant.cpp
   fusedActivationQuant.cpp
+  fusedLayerNormQuant.cpp
   fusedGatedRMSNormQuant.cpp
   fusedTopkSoftmax.cpp
   gatherTreeOp.cpp

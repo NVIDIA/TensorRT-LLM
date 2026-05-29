@@ -1,4 +1,5 @@
 import math
+import os
 from typing import Tuple
 
 import torch
@@ -11,6 +12,7 @@ from tensorrt_llm._torch.models.hf_parameter_utils import get_parameter_device
 from tensorrt_llm._torch.modules.layer_norm import LayerNorm
 from tensorrt_llm._torch.modules.linear import Linear, TensorParallelMode
 from tensorrt_llm._torch.modules.mlp import MLP
+from tensorrt_llm._torch.utils import gelu_tanh
 from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
 from tensorrt_llm._torch.visual_gen.modules.attention import Attention, QKVMode
 from tensorrt_llm._torch.visual_gen.modules.rms_norm import RMSNormTPAware
@@ -18,6 +20,66 @@ from tensorrt_llm._torch.visual_gen.quantization.loader import DynamicLinearWeig
 from tensorrt_llm._torch.visual_gen.utils import SequenceSharder
 from tensorrt_llm.logger import logger
 from tensorrt_llm.models.modeling_utils import QuantConfig
+from tensorrt_llm.quantization import QuantAlgo
+
+
+def _ln_quant_type(quant_config, force_dynamic_quant: bool):
+    """Return ``"nvfp4"`` if the model is configured for static (calibrated)
+    NVFP4 quantization, otherwise ``None``. The fused LayerNorm + NVFP4
+    quant fast path requires per-layer calibrated ``input_scale`` from the
+    downstream Linear, so dynamic-quant runs fall back to the unfused path
+    silently (no ``nvfp4_scale`` attached -> LayerNorm uses _forward_unfused).
+
+    A/B kill switch: ``TRTLLM_DISABLE_NVFP4_LAYERNORM_FUSION`` mirrors the
+    flag used by Llama (modeling_llama.py:673). Default is ``"1"`` (fusion
+    disabled = safe default, behavior unchanged from main). Set ``"0"`` to
+    enable the fused path on this Wan run; useful for nsys A/B profiling
+    against the same calibrated checkpoint:
+
+        # fusion off (baseline)
+        nsys profile -o off.nsys-rep python examples/.../visual_gen_wan_t2v.py \\
+            --model_path <ckpt> --enable_layerwise_nvtx_marker ...
+        # fusion on
+        TRTLLM_DISABLE_NVFP4_LAYERNORM_FUSION=0 nsys profile -o on.nsys-rep \\
+            python examples/.../visual_gen_wan_t2v.py \\
+            --model_path <ckpt> --enable_layerwise_nvtx_marker ...
+        nsys stats --report nvtxsum on.nsys-rep off.nsys-rep
+    """
+    if quant_config is None or force_dynamic_quant:
+        return None
+    if os.environ.get("TRTLLM_DISABLE_NVFP4_LAYERNORM_FUSION", "1") == "1":
+        return None
+    if getattr(quant_config, "quant_algo", None) == QuantAlgo.NVFP4:
+        return "nvfp4"
+    return None
+
+
+def _try_attach_nvfp4_scale(norm: nn.Module, linear: nn.Module) -> bool:
+    """Attach the downstream Linear's calibrated ``input_scale`` to the
+    LayerNorm so the fused-path can find it via ``getattr(self, "nvfp4_scale")``.
+
+    This is a no-op (and returns False) when any of the following hold:
+      - ``norm`` is not a LayerNorm with ``is_nvfp4=True`` (e.g., nn.Identity,
+        or LayerNorm without the NVFP4 path enabled).
+      - ``linear`` does not have an ``input_scale`` attribute, or it's None.
+        This is the natural state for layers excluded from NVFP4 quant (e.g.,
+        Wan 2.2 ModelOpt config excludes blocks 0-2 and 37-39).
+    Returning False here means the LayerNorm transparently falls back to the
+    unfused path for that specific (norm, linear) pair without breaking the
+    rest of the model.
+    """
+    if not isinstance(norm, LayerNorm):
+        return False
+    if not getattr(norm, "is_nvfp4", False):
+        return False
+    input_scale = getattr(linear, "input_scale", None)
+    if input_scale is None:
+        return False
+    # input_scale is a torch.Tensor (scalar FP32) loaded by NVFP4LinearMethod.
+    # Attach as a buffer-like attribute; setattr is sufficient since we never
+    # need to save/restore this in checkpoints (it's derived from the Linear).
+    norm.nvfp4_scale = input_scale
+    return True
 
 try:
     # Available in transformers<5
@@ -279,9 +341,21 @@ class WanBlock(nn.Module):
         self.num_heads = num_heads
         self.head_dim = head_dim
 
+        # When the model is configured for static NVFP4, enable the fused
+        # LayerNorm + NVFP4 quant fast path on all three WanBlock norms.
+        # The runtime path is gated by the presence of ``nvfp4_scale`` attached
+        # in post_load_weights, so excluded layers (where the downstream Linear
+        # is BF16) safely fall back to the unfused path.
+        ln_quant_type = _ln_quant_type(quant_config, force_dynamic_quant)
+
         # LayerNorm weights in fp32 (matches internal float32 normalization; avoids bf16/fp32 mismatch).
         self.norm1 = LayerNorm(
-            hidden_size=hidden_size, eps=eps, dtype=torch.float32, has_weights=False, has_bias=False
+            hidden_size=hidden_size,
+            eps=eps,
+            dtype=torch.float32,
+            has_weights=False,
+            has_bias=False,
+            quantize_type=ln_quant_type,
         )
 
         # Self-attention with fused QKV. All WAN variants (1.3B 12h, 5B 24h,
@@ -323,18 +397,24 @@ class WanBlock(nn.Module):
                 dtype=torch.float32,
                 has_weights=True,
                 has_bias=True,
+                quantize_type=ln_quant_type,
             )
         else:
             self.norm2 = nn.Identity()
         self.norm3 = LayerNorm(
-            hidden_size=hidden_size, eps=eps, dtype=torch.float32, has_weights=False, has_bias=False
+            hidden_size=hidden_size,
+            eps=eps,
+            dtype=torch.float32,
+            has_weights=False,
+            has_bias=False,
+            quantize_type=ln_quant_type,
         )
 
         self.ffn = MLP(
             hidden_size=hidden_size,
             intermediate_size=ffn_dim,
             bias=True,
-            activation=lambda x: F.gelu(x, approximate="tanh"),
+            activation=gelu_tanh,
             dtype=dtype,
             config=model_config,
             layer_idx=_layer_idx,
@@ -408,8 +488,23 @@ class WanBlock(nn.Module):
                 self.scale_shift_table.float() + temb.float()
             ).chunk(6, dim=1)
 
-        normed = self.norm1(x.float()) * (1 + scale_msa) + shift_msa
-        normed = normed.to(x.dtype)
+        # seq_len_per_batch tells the fused LayerNorm kernel how to broadcast
+        # the AdaLN modulation (which is [B, 1, N]) over the S sequence rows
+        # of x ([B, S, N]). The unfused path uses normal broadcasting and
+        # ignores this arg.
+        block_seq_len = x.shape[1]
+
+        # LayerNorm + AdaLN modulation. With NVFP4 enabled and an nvfp4_scale
+        # attached at post-load, this returns an Fp4QuantizedTensor that the
+        # downstream attn1.qkv_proj consumes without re-quantizing. Otherwise
+        # it returns a regular bf16/fp16 Tensor matching the original Wan
+        # formulation `LN(x.float()) * (1 + scale_msa) + shift_msa`.
+        normed = self.norm1(
+            x,
+            scale_msa=scale_msa,
+            shift_msa=shift_msa,
+            seq_len_per_batch=block_seq_len,
+        )
 
         # Prepare frequencies for Attention
         freqs = (freqs_cos, freqs_sin) if freqs_cos is not None and freqs_sin is not None else None
@@ -424,7 +519,11 @@ class WanBlock(nn.Module):
             * gate_msa
         ).to(x.dtype)
 
-        norm_x = self.norm2(x.float()).to(x.dtype)
+        # Plain LayerNorm (no modulation). With NVFP4 + attached nvfp4_scale,
+        # returns Fp4QuantizedTensor consumed directly by attn2.to_q. The
+        # unfused path matches the original `norm2(x.float()).to(x.dtype)`.
+        # If cross_attn_norm=False, norm2 is nn.Identity and this is a no-op.
+        norm_x = self.norm2(x)
 
         # I2V: Split encoder_hidden_states into image and text parts if needed
         encoder_hidden_states_img = None
@@ -465,9 +564,16 @@ class WanBlock(nn.Module):
         # Apply to_out once to the combined (text + image) attention output
         x = x + self.attn2.to_out[0](attn2_output)
 
-        # 3. Feed-forward
-        normed = self.norm3(x.float()) * (1 + c_scale_msa) + c_shift_msa
-        normed = normed.to(x.dtype)
+        # 3. Feed-forward. norm3 mirrors norm1 (AdaLN modulation), and its
+        # output (Fp4QuantizedTensor in the fused path, Tensor otherwise) feeds
+        # ffn.up_proj. MLP's chunk-1 fused activation+quant then sees a regular
+        # Tensor after up_proj, so the two fused paths chain without conflict.
+        normed = self.norm3(
+            x,
+            scale_msa=c_scale_msa,
+            shift_msa=c_shift_msa,
+            seq_len_per_batch=block_seq_len,
+        )
 
         x = (x.float() + self.ffn(normed).float() * c_gate_msa).to(x.dtype)
 
@@ -812,3 +918,27 @@ class WanTransformer3DModel(nn.Module):
         for _, module in self.named_modules():
             if isinstance(module, Linear):
                 module.post_load_weights()
+
+        # After Linears finish post-load, propagate each downstream Linear's
+        # calibrated ``input_scale`` to the LayerNorm that feeds it. The
+        # LayerNorm fused-path is gated on ``nvfp4_scale`` being present, so
+        # any (norm, linear) pair where the Linear is BF16 (excluded layer) or
+        # dynamic-quant just stays on the unfused path. Counted for logging.
+        n_attached_n1 = n_attached_n2 = n_attached_n3 = 0
+        for block in self.blocks:
+            qkv = getattr(block.attn1, "qkv_proj", None)
+            if qkv is not None and _try_attach_nvfp4_scale(block.norm1, qkv):
+                n_attached_n1 += 1
+            to_q = getattr(block.attn2, "to_q", None)
+            if to_q is not None and _try_attach_nvfp4_scale(block.norm2, to_q):
+                n_attached_n2 += 1
+            up_proj = getattr(block.ffn, "up_proj", None)
+            if up_proj is not None and _try_attach_nvfp4_scale(block.norm3, up_proj):
+                n_attached_n3 += 1
+        total_blocks = len(self.blocks)
+        logger.info(
+            "Wan NVFP4 fused-LayerNorm scale attach: norm1=%d/%d, norm2=%d/%d, norm3=%d/%d",
+            n_attached_n1, total_blocks,
+            n_attached_n2, total_blocks,
+            n_attached_n3, total_blocks,
+        )

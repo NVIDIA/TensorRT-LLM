@@ -7,6 +7,7 @@ import torch.nn as nn
 from tensorrt_llm.llmapi.llm_args import SkipSoftmaxAttentionConfig
 
 from ...modules.linear import Linear, TensorParallelMode, WeightMode, WeightsLoadingConfig
+from ...utils import Fp4QuantizedTensor
 from ..attention_backend.interface import AttentionTensorLayout
 from ..attention_backend.parallel import wrap_parallel_attention
 from ..attention_backend.utils import create_attention
@@ -477,11 +478,16 @@ class Attention(nn.Module):
 
     def forward(
         self,
-        hidden_states: torch.Tensor,
+        hidden_states,
         encoder_hidden_states: Optional[torch.Tensor] = None,
         freqs: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     ) -> torch.Tensor:
-        assert hidden_states.ndim == 3, "hidden_states must be a 3D tensor"
+        # hidden_states may be a regular [B, S, hidden_size] Tensor or an
+        # Fp4QuantizedTensor produced by a fused LayerNorm + NVFP4 path
+        # (e.g. WanBlock.norm1/norm2/norm3 when NVFP4 is active). Both wrap
+        # a 3D shape [B, S, *]; the downstream Linear modules accept either.
+        if not isinstance(hidden_states, Fp4QuantizedTensor):
+            assert hidden_states.ndim == 3, "hidden_states must be a 3D tensor"
         batch_size, seq_len = hidden_states.shape[:2]
         kv_seq_len = (
             encoder_hidden_states.shape[1] if encoder_hidden_states is not None else seq_len
