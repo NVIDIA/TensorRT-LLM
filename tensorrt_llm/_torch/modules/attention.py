@@ -29,8 +29,8 @@ from ..distributed import (AllReduceParams, HelixAllToAllNative, alltoall_helix,
 from ..model_config import ModelConfig
 from ..peft.lora.layer import LoraLayer, LoraModuleType
 from ..utils import (Fp4QuantizedTensor, get_model_extra_attrs,
-                     is_torch_compiling, maybe_compiled_cat,
-                     maybe_compiled_copy_)
+                     is_nvfp4_marlin_enabled, is_torch_compiling,
+                     maybe_compiled_cat, maybe_compiled_copy_)
 from .linear import Linear, TensorParallelMode, WeightMode, WeightsLoadingConfig
 from .multi_stream_utils import maybe_execute_in_parallel
 from .rms_norm import RMSNorm
@@ -549,14 +549,7 @@ class Attention(nn.Module):
         attn_cls = get_attention_backend(self.attn_backend,
                                          sparse_attn_config=sparse_attn_cfg)
 
-        # When the NVFP4 GEMM is forced to the Marlin-only backend (Hopper W4A16),
-        # the downstream projection cannot consume fused-quantized attention output
-        # or the custom in-place attention op, because those assume a CUTLASS-style
-        # NVFP4 activation path.
-        model_attrs = get_model_extra_attrs()
-        self.is_marlin_only: bool = bool(model_attrs and model_attrs.get(
-            'nvfp4_gemm_allowed_backends', ['cutlass', 'cublaslt', 'cuda_core'])
-                                         == ['marlin'])
+        self.is_marlin_enabled: bool = is_nvfp4_marlin_enabled()
 
         # These two modules are mutually exclusive - either splitted_qkv_lora or fused_qkv_lora will be used,
         # but never both at the same time. splitted_qkv_lora handles Q,K,V separately while fused_qkv_lora
@@ -674,7 +667,7 @@ class Attention(nn.Module):
             self.o_proj,
             'pre_quant_scale') and self.o_proj.pre_quant_scale is not None
 
-        return self.has_quant_scale and not self.attn_output_gate and not has_awq_pre_quant_scale and not self.is_marlin_only
+        return self.has_quant_scale and not self.attn_output_gate and not has_awq_pre_quant_scale and not self.is_marlin_enabled
 
     def create_output(self, q: torch.Tensor, attn_metadata: AttentionMetadata,
                       mask_type: str):
@@ -825,7 +818,7 @@ class Attention(nn.Module):
                                  and (self.attn_backend == "TRTLLM"
                                       or self.attn_backend == "FLASHINFER")
                                  and is_torch_compiling()
-                                 and not self.is_marlin_only)
+                                 and not self.is_marlin_enabled)
 
         if use_custom_inplace_op:
             outputs = create_attn_outputs(q, attention_mask, self.layer_idx_str)
