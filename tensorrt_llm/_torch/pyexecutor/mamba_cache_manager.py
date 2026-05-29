@@ -417,7 +417,7 @@ class PythonMambaCacheManager(BaseResourceManager):
 
                 # Compact replay cache.
                 spec_kwargs['prev_num_accepted_tokens'] = torch.zeros(
-                    max_batch_size, dtype=int, device=device)
+                    max_batch_size, dtype=torch.int32, device=device)
                 spec_kwargs['cache_buf_idx'] = torch.zeros(max_batch_size,
                                                            dtype=torch.int32,
                                                            device=device)

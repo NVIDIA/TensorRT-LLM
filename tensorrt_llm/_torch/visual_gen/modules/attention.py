@@ -185,16 +185,20 @@ class Attention(nn.Module):
                 col_process_group=vgm.attn2d_col_group,
             )
         else:
-            # Wrap with parallelism strategies (orthogonal to backend choice)
-            if (ring_size > 1 or ulysses_size > 1) and self.qkv_mode != QKVMode.SEPARATE_QKV:
-                if ring_size > 1:
-                    from ..attention_backend.parallel import RingAttention
+            # Ring shards the sequence dim and therefore requires S_q == S_kv,
+            # so only self-attention is eligible.
+            if ring_size > 1 and self.qkv_mode != QKVMode.SEPARATE_QKV:
+                from ..attention_backend.parallel import RingAttention
 
-                    self.attn = RingAttention(self.attn, process_group=vgm.ring_group)
-                if ulysses_size > 1:
-                    from ..attention_backend.parallel import UlyssesAttention
+                self.attn = RingAttention(self.attn, process_group=vgm.ring_group)
+            # Ulysses shards the head dim and is value-preserving under
+            # different Q/KV sequence lengths, so it is valid on cross-attn too.
+            # ``use_ulysses`` already folds in the caller-provided
+            # ``enable_ulysses`` flag.
+            if use_ulysses:
+                from ..attention_backend.parallel import UlyssesAttention
 
-                    self.attn = UlyssesAttention(self.attn, process_group=vgm.ulysses_group)
+                self.attn = UlyssesAttention(self.attn, process_group=vgm.ulysses_group)
 
     def _init_qkv_proj(self) -> None:
         if self.qkv_mode == QKVMode.FUSE_QKV:

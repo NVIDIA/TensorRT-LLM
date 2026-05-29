@@ -3840,7 +3840,13 @@ def replay_selective_state_update(
     assert old_dt.shape == (cache_size, 2, nheads, max_window)
     assert old_dA_cumsum.shape == (cache_size, 2, nheads, max_window)
     assert cache_buf_idx.shape == (cache_size,)
+    assert cache_buf_idx.dtype == torch.int32, (
+        f"cache_buf_idx must be int32, got {cache_buf_idx.dtype}"
+    )
     assert prev_num_accepted_tokens.shape == (cache_size,)
+    assert prev_num_accepted_tokens.dtype == torch.int32, (
+        f"prev_num_accepted_tokens must be int32, got {prev_num_accepted_tokens.dtype}"
+    )
 
     tie_hdim = (
         A.stride(-1) == 0
