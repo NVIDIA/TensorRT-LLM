@@ -17,8 +17,8 @@
 import functools
 import operator
 from dataclasses import dataclass
-from enum import Enum, auto
-from typing import Callable, Dict, Iterable, List, Optional, Set, Tuple, TypeVar, Union
+from enum import Enum
+from typing import Callable, Iterable, List, Optional, Tuple, Union
 
 import torch
 from pydantic import BaseModel, ConfigDict
@@ -44,91 +44,6 @@ except ImportError:
 
 OpOrOverload = Union[OpOverloadPacket, OpOverload]
 OperatorLike = Union[OpOrOverload, Callable]
-T = TypeVar("T")
-
-
-class DynamicOpPolicy(Enum):
-    """How piecewise CUDA graph should handle a dynamic custom op's output."""
-
-    # Wrap with DynamicOpWrapper and pass a stable out= buffer.
-    OUT_BUFFER = auto()
-
-    # Wrap with MetadataWrapper to keep metadata tensor addresses stable.
-    METADATA_WRAPPER = auto()
-
-    # Run eagerly as a split boundary with no output-address wrapper.
-    EAGER = auto()
-
-
-_DYNAMIC_OP_POLICIES: Dict[str, DynamicOpPolicy] = {}
-
-
-def _get_piecewise_op_name(target: object) -> str:
-    """Return a stable qualified name for FX call_function targets."""
-    if isinstance(target, str):
-        return target
-
-    qualname = getattr(target, "_qualname", None)
-    if isinstance(qualname, str):
-        return qualname
-
-    name = getattr(target, "name", None)
-    if callable(name):
-        op_name = name()
-        if isinstance(op_name, str):
-            return op_name
-    elif isinstance(name, str):
-        return name
-
-    qualname = getattr(target, "__qualname__", None)
-    if isinstance(qualname, str):
-        return qualname
-
-    return str(target)
-
-
-def _matches_piecewise_op_name(op_name: str, registered_name: str) -> bool:
-    """Match OpOverload names and wrapper-function names using existing semantics."""
-    if registered_name in op_name:
-        return True
-    base_name = registered_name.split("::")[-1] if "::" in registered_name else registered_name
-    return base_name in op_name
-
-
-def register_piecewise_dynamic_op(target: object, policy: DynamicOpPolicy) -> None:
-    """Register a custom op as a piecewise CUDA graph split boundary."""
-    op_name = _get_piecewise_op_name(target)
-    previous_policy = _DYNAMIC_OP_POLICIES.get(op_name)
-    if previous_policy is not None and previous_policy != policy:
-        raise ValueError(
-            f"Piecewise dynamic op {op_name} is already registered with policy "
-            f"{previous_policy}, cannot register {policy}."
-        )
-    _DYNAMIC_OP_POLICIES[op_name] = policy
-
-
-def piecewise_dynamic_op(policy: DynamicOpPolicy) -> Callable[[T], T]:
-    """Decorate a custom op definition with its piecewise CUDA graph policy."""
-
-    def decorator(target: T) -> T:
-        register_piecewise_dynamic_op(target, policy)
-        return target
-
-    return decorator
-
-
-def get_piecewise_dynamic_op_policy(target: object) -> Optional[DynamicOpPolicy]:
-    """Return the piecewise policy for a registered dynamic custom op target."""
-    op_name = _get_piecewise_op_name(target)
-    for registered_name, policy in _DYNAMIC_OP_POLICIES.items():
-        if _matches_piecewise_op_name(op_name, registered_name):
-            return policy
-    return None
-
-
-def get_all_piecewise_dynamic_op_names() -> Set[str]:
-    """Return the registered dynamic custom op qualified names."""
-    return set(_DYNAMIC_OP_POLICIES)
 
 
 class LayerType(Enum):

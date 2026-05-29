@@ -26,7 +26,7 @@ from tensorrt_llm._torch.modules.mamba.mamba2_metadata import (
 from tensorrt_llm._torch.modules.mamba.ssd_combined import mamba_chunk_scan_combined
 
 from ..._compat import KvCacheConfig
-from ...utils.node_utils import DynamicOpPolicy, extract_op_args, piecewise_dynamic_op
+from ...utils.node_utils import extract_op_args
 from ..attention_interface import (
     AttentionDescriptor,
     AttentionLayout,
@@ -38,7 +38,6 @@ from ..attention_interface import (
 )
 
 
-@piecewise_dynamic_op(DynamicOpPolicy.METADATA_WRAPPER)
 @torch.library.custom_op("auto_deploy::mamba_ssm_prepare_metadata", mutates_args=())
 def _mamba_ssm_prepare_metadata(
     # INPUTS

@@ -20,7 +20,6 @@ from flashinfer.mamba import selective_state_update as _flashinfer_ssm_update
 from torch.fx import Node
 
 from ..._compat import KvCacheConfig
-from ...utils.node_utils import DynamicOpPolicy, piecewise_dynamic_op
 from ..attention_interface import (
     AttentionRegistry,
     BatchInfo,
@@ -48,7 +47,6 @@ def _fi_align(t: torch.Tensor) -> torch.Tensor:
     return t if t.data_ptr() % 128 == 0 else t.clone()
 
 
-@piecewise_dynamic_op(DynamicOpPolicy.OUT_BUFFER)
 @torch.library.custom_op(
     "auto_deploy::flashinfer_cached_ssm",
     mutates_args=("ssm_state_cache", "intermediate_ssm_state_cache"),

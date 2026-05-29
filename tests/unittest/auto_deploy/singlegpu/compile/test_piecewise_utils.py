@@ -21,14 +21,13 @@ import torch.nn as nn
 from torch.fx import Graph, GraphModule
 
 from tensorrt_llm._torch.auto_deploy.compile.piecewise_utils import (
+    _DYNAMIC_OP_POLICIES,
     DynamicOpPolicy,
     _get_all_dynamic_op_names,
     _get_dynamic_op_policy,
     is_dynamic_cached_op,
     needs_metadata_wrapper,
     needs_out_buffer,
-    piecewise_dynamic_op,
-    register_piecewise_dynamic_op,
     split_graph_at_dynamic_ops,
 )
 from tensorrt_llm._torch.auto_deploy.utils.multi_stream_utils import (
@@ -36,36 +35,6 @@ from tensorrt_llm._torch.auto_deploy.utils.multi_stream_utils import (
     end_aux_stream_passthrough,
     wait_aux_stream_passthrough,
 )
-
-_TEST_DYNAMIC_OP_POLICIES = {
-    "auto_deploy::flashinfer_attention_mha_with_cache": DynamicOpPolicy.OUT_BUFFER,
-    "auto_deploy::triton_attention_flattened_mha_with_cache": DynamicOpPolicy.OUT_BUFFER,
-    "auto_deploy::triton_paged_mha_with_cache": DynamicOpPolicy.OUT_BUFFER,
-    "auto_deploy::torch_cached_attention_with_cache": DynamicOpPolicy.OUT_BUFFER,
-    "auto_deploy::trtllm_attention_mha_with_cache": DynamicOpPolicy.OUT_BUFFER,
-    "auto_deploy::flashinfer_mla_with_cache": DynamicOpPolicy.OUT_BUFFER,
-    "auto_deploy::flashinfer_trtllm_mla_with_cache": DynamicOpPolicy.OUT_BUFFER,
-    "auto_deploy::torch_cached_mla_with_cache": DynamicOpPolicy.OUT_BUFFER,
-    "auto_deploy::trtllm_mla_with_cache": DynamicOpPolicy.OUT_BUFFER,
-    "auto_deploy::triton_cached_ssm": DynamicOpPolicy.OUT_BUFFER,
-    "auto_deploy::torch_cached_ssm": DynamicOpPolicy.OUT_BUFFER,
-    "auto_deploy::flashinfer_cached_ssm": DynamicOpPolicy.OUT_BUFFER,
-    "auto_deploy::fla_cached_delta_rule": DynamicOpPolicy.OUT_BUFFER,
-    "auto_deploy::fla_cached_gated_delta_rule": DynamicOpPolicy.OUT_BUFFER,
-    "auto_deploy::flashinfer_attention_prepare_metadata": DynamicOpPolicy.METADATA_WRAPPER,
-    "auto_deploy::flashinfer_mla_prepare_metadata": DynamicOpPolicy.METADATA_WRAPPER,
-    "auto_deploy::triton_paged_prepare_metadata": DynamicOpPolicy.METADATA_WRAPPER,
-    "auto_deploy::mamba_ssm_prepare_metadata": DynamicOpPolicy.METADATA_WRAPPER,
-    "auto_deploy::gemma4_prepare_multimodal_mask": DynamicOpPolicy.EAGER,
-    "auto_deploy::gather_tokens": DynamicOpPolicy.EAGER,
-    "auto_deploy::trtllm_attention_prepare_metadata": DynamicOpPolicy.EAGER,
-    "auto_deploy::trtllm_mla_prepare_metadata": DynamicOpPolicy.EAGER,
-    "auto_deploy::triton_cached_causal_conv1d": DynamicOpPolicy.EAGER,
-    "auto_deploy::cuda_cached_causal_conv1d": DynamicOpPolicy.EAGER,
-}
-
-for _op_name, _policy in _TEST_DYNAMIC_OP_POLICIES.items():
-    register_piecewise_dynamic_op(_op_name, _policy)
 
 # ============================================================================
 # Helpers
@@ -252,15 +221,6 @@ class TestIsDynamicCachedOp:
         assert is_dynamic_cached_op(node) is True
         assert _get_dynamic_op_policy(node) == DynamicOpPolicy.EAGER
 
-    def test_piecewise_dynamic_op_decorator_registers_policy(self):
-        target = _FakeOpOverload("auto_deploy::decorated_piecewise_test_op")
-        decorated_target = piecewise_dynamic_op(DynamicOpPolicy.EAGER)(target)
-        node = _make_mock_node("call_function", target=decorated_target)
-
-        assert decorated_target is target
-        assert is_dynamic_cached_op(node) is True
-        assert _get_dynamic_op_policy(node) == DynamicOpPolicy.EAGER
-
     def test_static_op_returns_false(self):
         # torch.relu is not a dynamic op
         node = _make_mock_node("call_function", target=torch.relu)
@@ -280,8 +240,8 @@ class TestIsDynamicCachedOp:
         assert is_dynamic_cached_op(node) is True
 
     def test_all_registry_entries_recognized(self):
-        """Every test-registered dynamic op should be recognized as dynamic."""
-        for op_name in _TEST_DYNAMIC_OP_POLICIES:
+        """Every op in the policy registry should be recognized as dynamic."""
+        for op_name in _DYNAMIC_OP_POLICIES:
             target = _FakeOpOverload(op_name)
             node = _make_mock_node("call_function", target=target)
             assert is_dynamic_cached_op(node) is True, f"{op_name} should be recognized as dynamic"
@@ -289,7 +249,7 @@ class TestIsDynamicCachedOp:
     def test_get_all_dynamic_op_names_returns_full_set(self):
         all_names = _get_all_dynamic_op_names()
         assert isinstance(all_names, set)
-        assert set(_TEST_DYNAMIC_OP_POLICIES).issubset(all_names)
+        assert all_names == set(_DYNAMIC_OP_POLICIES)
 
 
 # ============================================================================

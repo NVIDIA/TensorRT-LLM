@@ -35,7 +35,7 @@ except (ModuleNotFoundError, ImportError):
 
 from ...utils.cuda_graph import cuda_graph_state
 from ...utils.logger import ad_logger
-from ...utils.node_utils import DynamicOpPolicy, extract_op_args, piecewise_dynamic_op
+from ...utils.node_utils import extract_op_args
 from ..attention_interface import (
     AttentionDescriptor,
     AttentionLayout,
@@ -271,7 +271,6 @@ def _to_flashinfer_window_left(sliding_window: Optional[int]) -> int:
     return sliding_window - 1
 
 
-@piecewise_dynamic_op(DynamicOpPolicy.METADATA_WRAPPER)
 @torch.library.custom_op("auto_deploy::flashinfer_attention_prepare_metadata", mutates_args=())
 def prepare_flashinfer_metadata(
     position_ids: torch.Tensor,
@@ -339,7 +338,6 @@ def prepare_flashinfer_metadata_host(
         )
 
 
-@piecewise_dynamic_op(DynamicOpPolicy.OUT_BUFFER)
 @torch.library.custom_op(
     "auto_deploy::flashinfer_attention_mha_with_cache", mutates_args=("kv_cache",)
 )

@@ -33,7 +33,6 @@ from tensorrt_llm._torch.modules.mamba.causal_conv1d_triton import (
     causal_conv1d_update,
 )
 
-from ...utils.node_utils import DynamicOpPolicy, piecewise_dynamic_op
 from ..attention_interface import (
     AttentionRegistry,
     BatchInfo,
@@ -43,7 +42,6 @@ from ..attention_interface import (
 from .causal_conv_common import BaseCausalConvDescriptor
 
 
-@piecewise_dynamic_op(DynamicOpPolicy.EAGER)
 @torch.library.custom_op(
     "auto_deploy::triton_cached_causal_conv1d",
     mutates_args=("input", "conv_state_cache", "intermediate_conv_state_cache"),

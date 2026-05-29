@@ -46,7 +46,7 @@ from tensorrt_llm._torch.modules.fla.fused_sigmoid_gating_recurrent import (
 )
 
 from ..._compat import KvCacheConfig
-from ...utils.node_utils import DynamicOpPolicy, extract_op_args, piecewise_dynamic_op
+from ...utils.node_utils import extract_op_args
 from ..attention_interface import (
     AttentionDescriptor,
     AttentionLayout,
@@ -59,7 +59,6 @@ from ..attention_interface import (
 )
 
 
-@piecewise_dynamic_op(DynamicOpPolicy.OUT_BUFFER)
 @torch.library.custom_op("auto_deploy::fla_cached_gated_delta_rule", mutates_args=("delta_cache",))
 def fla_cached_gated_delta_rule(
     # INPUTS (raw, un-normalized, un-expanded)

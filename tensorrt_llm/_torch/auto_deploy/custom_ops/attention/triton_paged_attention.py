@@ -33,7 +33,7 @@ from torch.fx import Node
 
 from ..._compat import KvCacheConfig
 from ...utils.logger import ad_logger
-from ...utils.node_utils import DynamicOpPolicy, extract_op_args, piecewise_dynamic_op
+from ...utils.node_utils import extract_op_args
 from ..attention_interface import (
     AttentionDescriptor,
     AttentionLayout,
@@ -1288,7 +1288,6 @@ def triton_paged_context_with_custom_mask(
     return output
 
 
-@piecewise_dynamic_op(DynamicOpPolicy.METADATA_WRAPPER)
 @torch.library.custom_op("auto_deploy::triton_paged_prepare_metadata", mutates_args=())
 def prepare_triton_paged_metadata(
     position_ids: torch.Tensor,
@@ -1327,7 +1326,6 @@ def prepare_triton_paged_metadata_fake(
     )
 
 
-@piecewise_dynamic_op(DynamicOpPolicy.OUT_BUFFER)
 @torch.library.custom_op("auto_deploy::triton_paged_mha_with_cache", mutates_args=("kv_cache",))
 def triton_paged_mha_with_cache(
     # Q, K, V
