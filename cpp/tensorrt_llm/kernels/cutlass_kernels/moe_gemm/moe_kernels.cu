@@ -59,6 +59,7 @@
 #include "tensorrt_llm/kernels/quantization.cuh"
 
 #include "tensorrt_llm/kernels/cutlass_kernels/include/moe_lora_pointer_expand.h"
+#include "tensorrt_llm/kernels/cutlass_kernels/include/moe_lora_pre_sum.h"
 #include "tensorrt_llm/kernels/cutlass_kernels/include/moe_util_kernels.h"
 // NOTE: the MoE LoRA device path's GEMM dispatch (`cudaGraph(SplitK)GroupedGemm`
 // + `launchMoeLoraProblemBuilder`) is intentionally NOT called from this
@@ -3549,6 +3550,14 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enab
     }
 }
 
+// Forward declaration of the dtype helper defined further down in this TU
+// (around line 3720). `Self::gemm2` references it through a dependent name
+// (`ScaleBiasType` is a template alias), so phase-2 lookup at instantiation
+// finds it without this declaration -- but we keep the forward decl for
+// readability and to avoid any future surprise if someone reorders the file.
+template <class ScaleBiasType>
+constexpr nvinfer1::DataType moeLoraNvInferType();
+
 template <class T, class WeightType, class OutputType, class InputType, class BackBoneType, class Enable>
 void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enable>::gemm2(
     MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>& gemm_runner,
@@ -3598,8 +3607,29 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enab
             //
             // This also means it is included in the timing for the profiler, which is probably more representative
             // until we can overlap it
-            check_cuda_error(
-                cudaMemsetAsync(final_output, 0x0, sizeof(OutputType) * num_rows * unpadded_hidden_size, stream));
+            if (use_lora)
+            {
+                // Phase 6b.E follow-up, workaround (a): pre-aggregate the
+                // FC2 LoRA delta into `final_output` (replacing the zero-fill
+                // memset). The FINALIZE epilogue then atomic-adds the FC2
+                // main GEMM contribution on top, recovering the LoRA-augmented
+                // top-k weighted sum without exercising the unstable
+                // `EpilogueFusion::NONE` TMA warp-specialized instantiation
+                // observed on Blackwell (B200/B300, sm_100/sm_103).
+                int const start_expert = num_experts_per_node * parallelism_config.ep_rank;
+                launchMoeLoraPreSum(/*lora_delta=*/fc2_lora,
+                    /*final_output=*/static_cast<void*>(final_output), unpermuted_final_scales,
+                    unpermuted_row_to_permuted_row, token_selected_experts, num_rows,
+                    /*lora_delta_row_stride_elems=*/hidden_size,
+                    /*final_output_row_stride_elems=*/unpadded_hidden_size, /*experts_per_token=*/static_cast<int>(k),
+                    num_experts_per_node, start_expert,
+                    /*dtype=*/moeLoraNvInferType<ScaleBiasType>(), stream);
+            }
+            else
+            {
+                check_cuda_error(cudaMemsetAsync(
+                    final_output, 0x0, sizeof(OutputType) * num_rows * unpadded_hidden_size, stream));
+            }
         }
     }
     else if (use_fp8)
@@ -3634,8 +3664,16 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enab
     if (min_latency_mode)
         return;
 
-    if (use_lora && !fuse_lora_bias)
+    bool const using_fused_finalize_gemm2
+        = tma_ws_input.fusion == TmaWarpSpecializedGroupedGemmInput::EpilogueFusion::FINALIZE;
+
+    if (use_lora && !fuse_lora_bias && !using_fused_finalize_gemm2)
     {
+        // Phase 6b.E follow-up, workaround (a): when the FINALIZE epilogue
+        // is in use, the FC2 LoRA delta has already been pre-summed into
+        // `final_output` (see launchMoeLoraPreSum above) and is implicitly
+        // accumulated through the FINALIZE atomic-add. Skipping this
+        // post-GEMM application avoids double-counting it.
         auto loraBiasApplyFunc = doActivation<UnfusedGemmOutputType, UnfusedGemmOutputType, ScaleBiasType>;
         loraBiasApplyFunc(static_cast<UnfusedGemmOutputType*>(gemm_output),
             static_cast<UnfusedGemmOutputType const*>(gemm_output), nullptr,
@@ -3646,7 +3684,7 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enab
     }
 
     bool has_different_output_type_ampere = (use_w4afp8 || use_fp8) && !using_tma_ws_gemm2;
-    bool using_fused_finalize = tma_ws_input.fusion == TmaWarpSpecializedGroupedGemmInput::EpilogueFusion::FINALIZE;
+    bool using_fused_finalize = using_fused_finalize_gemm2;
     bool has_different_output_type_tma_ws = !using_fused_finalize && using_tma_ws_gemm2;
 
     if (has_different_output_type_ampere || has_different_output_type_tma_ws)
@@ -4516,13 +4554,30 @@ CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enable>::
         auto* fc2_bias = apply_bias ? fc2_expert_biases : nullptr;
         bool gemm2_using_finalize_fusion = gemm2_config_->epilogue_fusion_type
             == cutlass_extensions::CutlassGemmConfig::EpilogueFusionType::FINALIZE;
-        bool using_fused_finalize = use_fused_finalize_ && gemm2_using_finalize_fusion && !use_wfp4a16 && !use_lora;
+        // Phase 6b.E follow-up, workaround (a): drop the `!use_lora` clause
+        // here so the LoRA path can take the FINALIZE epilogue when the
+        // selected GEMM2 tactic requests it. The pre-sum step in
+        // `Self::gemm2` (see the launchMoeLoraPreSum branch below) folds
+        // the FC2 LoRA delta into `final_output` BEFORE the main GEMM, and
+        // FINALIZE atomic-add (forced via `use_reduction = true` for the
+        // LoRA case) accumulates the GEMM contribution on top, recovering
+        // `sum_k s_k * (gemm_result + lora_delta)` without needing the
+        // post-GEMM `loraBiasApplyFunc` step (gated off below) and without
+        // exercising the unstable `EpilogueFusion::NONE` TMA warp-specialized
+        // grouped GEMM that motivated this fix (observed on Blackwell
+        // B200/B300, sm_100/sm_103).
+        bool using_fused_finalize = use_fused_finalize_ && gemm2_using_finalize_fusion && !use_wfp4a16;
         TLLM_CHECK_WITH_INFO(using_fused_finalize == gemm2_using_finalize_fusion,
             "GEMM2 tactic requests finalize fusion, but the runner is not configured to use it");
         if (using_fused_finalize)
         {
             assert(min_latency_mode == false);
-            bool use_reduction = expanded_num_rows > num_rows;
+            // Force atomic-add reduction semantics whenever LoRA is active
+            // so the `launchMoeLoraPreSum` initialization composes correctly
+            // even at top_k == 1 (where `expanded_num_rows == num_rows` would
+            // otherwise pick the regular-store path that would clobber the
+            // pre-summed LoRA delta).
+            bool use_reduction = (expanded_num_rows > num_rows) || use_lora;
             gemm2_tma_ws_input.fusion = TmaWarpSpecializedGroupedGemmInput::EpilogueFusion::FINALIZE;
             gemm2_tma_ws_input.setFinalizeFusionParams(final_output, unpadded_hidden_size, num_rows, use_reduction);
         }

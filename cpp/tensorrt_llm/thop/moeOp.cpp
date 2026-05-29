@@ -42,6 +42,7 @@
 #include <ATen/native/cuda/Resize.h>
 
 #include <functional>
+#include <iostream>
 #include <map>
 
 #define C10_THROW_ERROR_FORMATTED(ErrorType, ...)                                                                      \
@@ -333,6 +334,74 @@ public:
             std::string val(envv);
             mUseDeviceLoraPath = !val.empty() && val != "0" && val != "OFF" && val != "off";
         }
+
+        // Phase 6b.E follow-up, workaround (b): on Blackwell (the only arch
+        // where the bug has been observed; B200/B300, sm_100/sm_103) the TMA
+        // warp-specialized grouped GEMM with `EpilogueFusion::NONE` (the
+        // variant the LoRA path forces because the LoRA delta is added
+        // post-GEMM rather than via the FINALIZE epilogue) has been observed
+        // to be non-deterministic at tiny per-expert problem shapes -- a
+        // small fraction of bf16 lanes drift across repeat eager invocations
+        // and carry garbage-magnitude values. With this env var set, when
+        // LoRA is active we swap GEMM2 to a non-TMA-WS (Ampere-style) tactic,
+        // which routes the LoRA delta through the GEMM bias slot
+        // (`fuse_lora_bias=true` in moe_kernels.cu) and uses the stable
+        // Ampere kernel template instead. The Ampere fallback is reachable on
+        // Blackwell via `dispatchToArch`'s "Fallthrough to SM80 impl below"
+        // branch in moe_gemm_template_dispatch.h. Set
+        // `TLLM_MOE_LORA_FORCE_AMPERE_GEMM2=1` to enable; default off so the
+        // existing path is unchanged. Mutually safe with the device LoRA
+        // path env var. See docs/source/_dev_notes/moe-lora-preflight.md.
+        if (char const* envv = std::getenv("TLLM_MOE_LORA_FORCE_AMPERE_GEMM2"))
+        {
+            std::string val(envv);
+            mForceAmpereGemm2ForLora = !val.empty() && val != "0" && val != "OFF" && val != "off";
+        }
+
+        // Phase 6b.E follow-up, workaround (a): keep the TMA warp-specialized
+        // GEMM2 but swap the autotuner-selected `EpilogueFusion::NONE` tactic
+        // for a `EpilogueFusion::FINALIZE` one, and pre-aggregate the FC2
+        // LoRA delta into `final_output` BEFORE the main GEMM (see
+        // `launchMoeLoraPreSum` in moe_kernels.cu). The FINALIZE
+        // epilogue's atomic-add then accumulates the GEMM contribution on
+        // top, recovering `sum_k s_k * (gemm_result + lora_delta)` without
+        // ever exercising the unstable NONE epilogue.
+        //
+        // Caveat for Blackwell: `calcMaxWorkspaceSizeTmaWarpSpecialized`'s
+        // FINALIZE branch is gated to `sm_ == 90` (see moe_gemm_template_
+        // dispatch.h ~ line 936), so a pure config-swap on sm_100/sm_103
+        // gives the FINALIZE kernel a workspace sized only for NONE. The
+        // production no-LoRA Blackwell path picks FINALIZE configs at
+        // runtime and works today, so this is empirically OK, but it is an
+        // implicit assumption that should be verified before relying on this
+        // workaround on Blackwell.
+        //
+        // Set `TLLM_MOE_LORA_FUSED_FINALIZE=1` to enable. Mutually exclusive
+        // with `TLLM_MOE_LORA_FORCE_AMPERE_GEMM2` (we enforce that below at
+        // every runMoe call so the user gets a clear error rather than
+        // silently picking one of them).
+        if (char const* envv = std::getenv("TLLM_MOE_LORA_FUSED_FINALIZE"))
+        {
+            std::string val(envv);
+            mLoraFusedFinalize = !val.empty() && val != "0" && val != "OFF" && val != "off";
+        }
+
+        // Phase 6b.E follow-up trace: when EITHER LoRA-MoE workaround
+        // env-var is set we drop a one-line stderr print at construction
+        // so the user can confirm (i) this build was rebuilt with the new
+        // workaround code in moeOp.cpp, and (ii) the env-var actually
+        // reached the C++ runner. Bit-identical numerics across baseline
+        // and the two workarounds is the canonical "C++ swap not firing"
+        // signature, and this print is the cheapest way to disprove that
+        // hypothesis on a future test run.
+        if (mForceAmpereGemm2ForLora || mLoraFusedFinalize)
+        {
+            std::cerr << "[trtllm-moe-lora-trace] FusedMoeRunner ctor: "
+                      << "mForceAmpereGemm2ForLora=" << (mForceAmpereGemm2ForLora ? "true" : "false")
+                      << " mLoraFusedFinalize=" << (mLoraFusedFinalize ? "true" : "false")
+                      << " mUseDeviceLoraPath=" << (mUseDeviceLoraPath ? "true" : "false")
+                      << " mUseFusedFinalize=" << (mUseFusedFinalize ? "true" : "false") << std::endl;
+        }
     }
 
     ~FusedMoeRunner()
@@ -616,6 +685,47 @@ public:
                 "(set TLLM_MOE_LORA_USE_DEVICE_PATH=1). The legacy host path performs a host-side "
                 "cudaEventSynchronize after a D2H pointer-expansion copy, which is not capturable. "
                 "Either enable the device path, run LoRA eagerly, or disable MoE LoRA when capturing.");
+
+            // Phase 6b.E follow-up: the two candidate FC2 GEMM workarounds
+            // are mutually exclusive (b) selects an Ampere/non-TMA-WS
+            // tactic, (a) selects a TMA-WS FINALIZE tactic. Set at most
+            // one env var at a time; reject conflicting combinations
+            // explicitly so the user does not silently get whichever swap
+            // happens to run last.
+            TORCH_CHECK(!(mForceAmpereGemm2ForLora && mLoraFusedFinalize),
+                "TLLM_MOE_LORA_FORCE_AMPERE_GEMM2 and TLLM_MOE_LORA_FUSED_FINALIZE are mutually exclusive "
+                "MoE-LoRA workarounds for the Phase 6b.E FC2 main-GEMM non-determinism. "
+                "Pick one (and unset the other) for the experimental comparison; do not enable both.");
+
+            // Phase 6b.E trace: confirm the lora-active branch was reached
+            // by runMoe and report which workaround flags are pending.
+            // Together with the workaround-helper traces this lets us
+            // distinguish "build didn't pick up changes" (no trace at all)
+            // from "swap fired but had no numerical effect" (traces fire
+            // but output is still wrong).
+            if (mForceAmpereGemm2ForLora || mLoraFusedFinalize)
+            {
+                std::cerr << "[trtllm-moe-lora-trace] runMoe lora_active branch reached: "
+                          << "mForceAmpereGemm2ForLora=" << (mForceAmpereGemm2ForLora ? "true" : "false")
+                          << " mLoraFusedFinalize=" << (mLoraFusedFinalize ? "true" : "false") << std::endl;
+            }
+            // Workaround (b): swap GEMM2 to a non-TMA-WS tactic so the LoRA
+            // path runs on the stable Ampere kernel template.
+            // `setRunnerProfiles` (called above) typically selects a TMA
+            // warp-specialized GEMM2 by default on sm_90+ (Hopper, Blackwell,
+            // SM120); override here only for LoRA-active.
+            if (mForceAmpereGemm2ForLora)
+            {
+                forceAmpereGemm2ForLora(profile_ids);
+            }
+            // Workaround (a): swap GEMM2 to a TMA-WS FINALIZE tactic. The
+            // kernel side handles the LoRA delta via the pre-sum kernel +
+            // FINALIZE atomic-add path (see launchMoeLoraPreSum and the
+            // gating around `loraBiasApplyFunc` in moe_kernels.cu).
+            if (mLoraFusedFinalize)
+            {
+                forceFinalizeGemm2ForLora(profile_ids);
+            }
         }
         // Build LoraParams up-front so we can compute the required cuBLAS workspace before allocation.
         auto lora_params_opt = buildMoeLoraParams(fc1_lora_ranks, fc1_lora_weight_ptrs, fc2_lora_ranks,
@@ -1134,6 +1244,26 @@ private:
     // wholesale.
     bool mUseDeviceLoraPath = false;
 
+    // Set from TLLM_MOE_LORA_FORCE_AMPERE_GEMM2 at construction. When true
+    // and the call is LoRA-active, runMoe swaps GEMM2 to the first
+    // non-TMA-WS tactic in `mGemm2Profiles` to dodge the FC2 main GEMM
+    // non-determinism documented in the moe-lora-preflight memo
+    // (Phase 6b.E investigation). Workaround (b) of two candidate fixes
+    // explored in parallel; landed off by default, flipped on for the
+    // experimental comparison.
+    bool mForceAmpereGemm2ForLora = false;
+
+    // Set from TLLM_MOE_LORA_FUSED_FINALIZE at construction. When true
+    // and the call is LoRA-active, runMoe swaps GEMM2 to the first TMA
+    // warp-specialized tactic with `EpilogueFusion::FINALIZE`. The kernel
+    // side (`Self::gemm2` in moe_kernels.cu) then pre-sums the FC2 LoRA
+    // delta into `final_output` and lets the FINALIZE epilogue's atomic-add
+    // accumulate the GEMM contribution on top -- avoiding the unstable
+    // `EpilogueFusion::NONE` TMA WS instantiation observed on Blackwell
+    // (B200/B300, sm_100/sm_103). Workaround (a) of two candidate fixes
+    // explored in parallel; landed off by default.
+    bool mLoraFusedFinalize = false;
+
     void freeProfileWorkspace()
     {
         if (mProfileWorkspace != nullptr)
@@ -1169,6 +1299,102 @@ private:
                 = profile_ids.value()[1] == -1 ? best_gemm2_profile : mGemm2Profiles.at(profile_ids.value()[1]);
         }
         mKernelRunner->setTactic(best_gemm1_profile, best_gemm2_profile);
+    }
+
+    // Phase 6b.E follow-up, workaround (b): swap GEMM2 to the first
+    // non-TMA-WS (Ampere-style) tactic in `mGemm2Profiles`. Keep GEMM1
+    // pointing at whatever `setRunnerProfiles` had selected. Used by
+    // `runMoe` when `mForceAmpereGemm2ForLora` is set and LoRA is active.
+    void forceAmpereGemm2ForLora(torch::optional<c10::ArrayRef<int64_t>> profile_ids)
+    {
+        if (mUseDeepSeekFP8BlockScaling)
+        {
+            // The deepseek fp8 path picks its own fixed config and does not
+            // expose the Ampere/TMA-WS distinction; LoRA-MoE rejects FP8 at
+            // the validator anyway, so this branch is unreachable in practice.
+            return;
+        }
+        Profile const* ampere_gemm2 = nullptr;
+        for (auto const& cfg : mGemm2Profiles)
+        {
+            if (!cfg.is_tma_warp_specialized)
+            {
+                ampere_gemm2 = &cfg;
+                break;
+            }
+        }
+        TORCH_CHECK(ampere_gemm2 != nullptr,
+            "TLLM_MOE_LORA_FORCE_AMPERE_GEMM2 is set but no non-TMA-WS GEMM2 tactic is available "
+            "(mGemm2Profiles only contains TMA warp-specialized configs). The Ampere fallback is "
+            "expected to be available on sm_80+ via getAmpereConfigs(); this build does not expose any.");
+        auto best_gemm1_profile = mGemm1Profiles.front();
+        if (profile_ids.has_value() && profile_ids.value().size() == 2 && profile_ids.value()[0] != -1)
+        {
+            best_gemm1_profile = mGemm1Profiles.at(profile_ids.value()[0]);
+        }
+        // Phase 6b.E trace: confirm the swap actually fires and report the
+        // GEMM2 tactic we are switching to. See the constructor trace block.
+        std::cerr << "[trtllm-moe-lora-trace] forceAmpereGemm2ForLora: swapping GEMM2 to "
+                  << "is_tma_warp_specialized=" << (ampere_gemm2->is_tma_warp_specialized ? "true" : "false")
+                  << " sm_version=" << ampere_gemm2->sm_version
+                  << " epilogue_fusion_type=" << static_cast<int>(ampere_gemm2->epilogue_fusion_type) << std::endl;
+        mKernelRunner->setTactic(best_gemm1_profile, *ampere_gemm2);
+    }
+
+    // Phase 6b.E follow-up, workaround (a): swap GEMM2 to the first TMA-WS
+    // tactic with `EpilogueFusionType::FINALIZE` in `mGemm2Profiles`. Keep
+    // GEMM1 pointing at whatever `setRunnerProfiles` had selected. Used by
+    // `runMoe` when `mLoraFusedFinalize` is set and LoRA is active. The
+    // kernel side (`Self::gemm2` in moe_kernels.cu) then takes the
+    // pre-sum + FINALIZE atomic-add path so the FC2 LoRA delta is added
+    // through the FINALIZE epilogue rather than through a post-GEMM
+    // `loraBiasApplyFunc` step on top of the unstable
+    // `EpilogueFusion::NONE` GEMM result.
+    void forceFinalizeGemm2ForLora(torch::optional<c10::ArrayRef<int64_t>> profile_ids)
+    {
+        if (mUseDeepSeekFP8BlockScaling)
+        {
+            return;
+        }
+        // The kernel-side assertion in `setupTmaWarpSpecializedInputs`
+        // requires `mKernelRunner->use_fused_finalize_` to agree with the
+        // selected tactic's epilogue fusion type. If the runner was built
+        // with `use_fused_finalize=false` (Python-side toggle in
+        // ``FusedMoeRunner``), forcing a FINALIZE tactic would trip that
+        // assertion deep inside the kernel. Surface the misconfiguration
+        // here with a clear message instead.
+        TORCH_CHECK(mUseFusedFinalize,
+            "TLLM_MOE_LORA_FUSED_FINALIZE is set but this FusedMoeRunner was constructed with "
+            "use_fused_finalize=False. Workaround (a) requires the runner-level fused-finalize "
+            "permission to be enabled. Either rebuild the runner with use_fused_finalize=True or "
+            "use TLLM_MOE_LORA_FORCE_AMPERE_GEMM2 (workaround (b)) instead.");
+        Profile const* finalize_gemm2 = nullptr;
+        for (auto const& cfg : mGemm2Profiles)
+        {
+            if (cfg.is_tma_warp_specialized
+                && cfg.epilogue_fusion_type
+                    == tensorrt_llm::cutlass_extensions::CutlassGemmConfig::EpilogueFusionType::FINALIZE)
+            {
+                finalize_gemm2 = &cfg;
+                break;
+            }
+        }
+        TORCH_CHECK(finalize_gemm2 != nullptr,
+            "TLLM_MOE_LORA_FUSED_FINALIZE is set but no TMA-WS GEMM2 tactic with EpilogueFusion::FINALIZE "
+            "is available in mGemm2Profiles. The workaround needs the FINALIZE epilogue to fold the FC2 "
+            "LoRA delta through the atomic-add path; this build does not expose any such tactic.");
+        auto best_gemm1_profile = mGemm1Profiles.front();
+        if (profile_ids.has_value() && profile_ids.value().size() == 2 && profile_ids.value()[0] != -1)
+        {
+            best_gemm1_profile = mGemm1Profiles.at(profile_ids.value()[0]);
+        }
+        // Phase 6b.E trace: confirm the swap actually fires and report the
+        // GEMM2 tactic we are switching to. See the constructor trace block.
+        std::cerr << "[trtllm-moe-lora-trace] forceFinalizeGemm2ForLora: swapping GEMM2 to "
+                  << "is_tma_warp_specialized=" << (finalize_gemm2->is_tma_warp_specialized ? "true" : "false")
+                  << " sm_version=" << finalize_gemm2->sm_version
+                  << " epilogue_fusion_type=" << static_cast<int>(finalize_gemm2->epilogue_fusion_type) << std::endl;
+        mKernelRunner->setTactic(best_gemm1_profile, *finalize_gemm2);
     }
 
     WorkspaceInfo const& getWorkspaceInfo(int64_t const num_rows, int64_t const hidden_size, int64_t const inter_size,
