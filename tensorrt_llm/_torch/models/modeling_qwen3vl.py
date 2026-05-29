@@ -774,8 +774,8 @@ def _triton_pos_embed_interpolate(
         dtype=dtype,
     )
 
-    h_scale = float(num_grid_per_side - 1) / float(h - 1) if h > 1 else 0.0
-    w_scale = float(num_grid_per_side - 1) / float(w - 1) if w > 1 else 0.0
+    h_scale = (num_grid_per_side - 1) / (h - 1) if h > 1 else 0.0
+    w_scale = (num_grid_per_side - 1) / (w - 1) if w > 1 else 0.0
 
     BLOCK_D = triton.next_power_of_2(hidden_dim)
 
