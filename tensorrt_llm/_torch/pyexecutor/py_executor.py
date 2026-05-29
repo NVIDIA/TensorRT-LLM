@@ -2474,8 +2474,6 @@ class PyExecutor:
                 scheduled_batch)
             if can_forward:
                 self._benchmark_fill_phase_active = False
-                # Reseed the ramp so the next fill phase (e.g. post-warmup)
-                # starts at tp_size rather than at the previous ramp's tail.
                 self._fill_admit_cap = 0
             else:
                 time.sleep(0.1)
@@ -3214,12 +3212,6 @@ class PyExecutor:
         max_new_requests = total_max - total_num_active_requests
 
         # Benchmark disagg fill-phase admission throttle (slow-start ramp).
-        # Iter 0 caps at `tp_size`; doubles each iter; saturates at
-        # `total_max` in O(log2(total_max / tp_size)) iters.  The iter-0
-        # cap dampens the burst that trips PR #12206's fail-fast under
-        # transient ADP-router imbalance; the doubling avoids the long
-        # fill ramp a fixed `tp_size`/iter cap caused at high concurrency
-        # (regressed gen_only 1k1k post-merge configs by 7-13 %).
         if (self.is_benchmark_disagg and self._benchmark_fill_phase_active
                 and not self.is_warmup):
             if self._fill_admit_cap == 0:
