@@ -777,14 +777,11 @@ class BaseLLM:
             inputs (tensorrt_llm.inputs.data.PromptInputs, Sequence[tensorrt_llm.inputs.data.PromptInputs]): The prompt text or token ids.
                 It can be a single prompt or batched prompts.
             add_special_tokens (bool): Whether to add special tokens (e.g., [CLS]/[SEP]) during tokenization. Defaults to True.
+            batch_indexed_model_output (bool): If specified, assume batched model output indexed by request index, as opposed to token index. Defaults to True.
+            copy_logits_to_host (bool): If set, copy logits from device to host. Otherwise, return a view into the on-device logits tensor. Defaults to True.
             return_raw_logits (bool): Whether to return the raw CPU logits tensor for the whole input batch. Defaults to False.
             model_kwargs (Any): Model-specific inputs passed through to the model's forward(). Examples: token_type_ids (BERT),
                 inputs_embeds (reward models).
-            batch_indexed_model_output (bool): If specified (default), assume classification-type model returning a tensor of
-                shape [batch_num_requests, output_dim]. Otherwise, assume a generative model returning a tensor of shape
-                [total_tokens, output_dim].
-            copy_logits_to_host (bool): If set (default), copy logits from device to host. Otherwise, return a view into the on-device
-                logits tensor.
 
         Returns:
             Union[tensorrt_llm.llmapi.llm.EncoderOutput, List[tensorrt_llm.llmapi.llm.EncoderOutput], torch.Tensor]:
