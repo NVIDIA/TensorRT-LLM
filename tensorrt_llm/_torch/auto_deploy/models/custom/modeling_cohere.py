@@ -17,9 +17,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Slimmed down PyTorch Cohere/Cohere2 model implementation for auto_deploy export.
+"""Cohere/Cohere2 model with explicit sharding hint ops.
 
-Source:
+This is a sharding-aware rewrite of ``modeling_cohere.py``: every shardable op
+uses an AutoDeploy custom op with explicit sharding hint kwargs. The exported
+FX graph is therefore a complete, self-contained specification of how the model
+should be sharded under tensor parallelism. The ``apply_sharding_hints``
+transform reads the hints together with a runtime ``DistConfig`` to apply
+deterministic, node-local sharding.
+
+Source of truth for model logic:
 https://huggingface.co/CohereForAI/aya-expanse-8b (Cohere v1)
 https://huggingface.co/CohereLabs/c4ai-command-a-03-2025 (Cohere2)
 
@@ -46,6 +53,11 @@ Cohere2 additionally features:
 - Sliding window attention pattern (every Nth layer is full attention, rest sliding)
 - RoPE only applied to sliding window attention layers (full attention layers are
   position-agnostic)
+
+Shardable custom ops used:
+  - torch.ops.auto_deploy.torch_linear_simple  (tp_mode, tp_min_local_shape, layer_type)
+  - torch.ops.auto_deploy.view                 (tp_scaled_dim, layer_type)
+  - torch.ops.auto_deploy.all_reduce           (identity / dist.all_reduce, layer_type)
 """
 
 from dataclasses import dataclass
@@ -59,6 +71,7 @@ from transformers.modeling_utils import PreTrainedModel
 from transformers.models.cohere.configuration_cohere import CohereConfig
 from transformers.utils import ModelOutput
 
+from ... import custom_ops  # noqa: F401 -- register all ops
 from ..hf import AutoModelForCausalLMFactory
 from ._rope_utils import get_rope_theta
 
@@ -133,7 +146,13 @@ class CohereRotaryEmbedding(nn.Module):
 
 
 class CohereMLP(nn.Module):
-    """MLP layer for Cohere models (SwiGLU activation)."""
+    """MLP layer for Cohere models (SwiGLU activation).
+
+    Sharding strategy:
+      gate_proj -> colwise
+      up_proj   -> colwise
+      down_proj -> rowwise + all_reduce
+    """
 
     def __init__(self, config):
         super().__init__()
@@ -145,7 +164,29 @@ class CohereMLP(nn.Module):
         self.act_fn = ACT2FN[config.hidden_act]
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
+        gate = torch.ops.auto_deploy.torch_linear_simple(
+            x,
+            self.gate_proj.weight,
+            self.gate_proj.bias,
+            tp_mode="colwise",
+            layer_type="mlp",
+        )
+        up = torch.ops.auto_deploy.torch_linear_simple(
+            x,
+            self.up_proj.weight,
+            self.up_proj.bias,
+            tp_mode="colwise",
+            layer_type="mlp",
+        )
+        down = torch.ops.auto_deploy.torch_linear_simple(
+            self.act_fn(gate) * up,
+            self.down_proj.weight,
+            self.down_proj.bias,
+            tp_mode="rowwise",
+            layer_type="mlp",
+        )
+        down = torch.ops.auto_deploy.all_reduce(down, layer_type="mlp")
+        return down
 
 
 class CohereAttention(nn.Module):
@@ -157,6 +198,17 @@ class CohereAttention(nn.Module):
 
     Uses torch_rope_with_qk_interleaving for interleaved RoPE and
     torch_attention for GQA-native attention.
+
+    Sharding strategy:
+      q_proj -> colwise (+ tp_min_local_shape for GQA)
+      k_proj -> colwise (+ tp_min_local_shape for GQA)
+      v_proj -> colwise (+ tp_min_local_shape for GQA)
+      view   -> tp_scaled_dim=2 (head count dimension)
+      o_proj -> rowwise + all_reduce
+
+    The optional q_norm / k_norm operate on the per-head ``head_dim`` axis,
+    which is not sharded under TP, so they remain replicated and require no
+    sharding hints.
     """
 
     def __init__(self, config, layer_idx: Optional[int] = None):
@@ -210,9 +262,48 @@ class CohereAttention(nn.Module):
         bsz, q_len, _ = hidden_states.size()
 
         # Project Q/K/V and reshape to [B, S, N, head_dim] (BSND layout)
-        q = self.q_proj(hidden_states).view(bsz, q_len, self.num_heads, self.head_dim)
-        k = self.k_proj(hidden_states).view(bsz, q_len, self.num_kv_heads, self.head_dim)
-        v = self.v_proj(hidden_states).view(bsz, q_len, self.num_kv_heads, self.head_dim)
+        q = torch.ops.auto_deploy.torch_linear_simple(
+            hidden_states,
+            self.q_proj.weight,
+            self.q_proj.bias,
+            tp_mode="colwise",
+            tp_min_local_shape=self.head_dim,
+            layer_type="mha",
+        )
+        k = torch.ops.auto_deploy.torch_linear_simple(
+            hidden_states,
+            self.k_proj.weight,
+            self.k_proj.bias,
+            tp_mode="colwise",
+            tp_min_local_shape=self.head_dim,
+            layer_type="mha",
+        )
+        v = torch.ops.auto_deploy.torch_linear_simple(
+            hidden_states,
+            self.v_proj.weight,
+            self.v_proj.bias,
+            tp_mode="colwise",
+            tp_min_local_shape=self.head_dim,
+            layer_type="mha",
+        )
+        q = torch.ops.auto_deploy.view(
+            q,
+            [bsz, q_len, self.num_heads, self.head_dim],
+            tp_scaled_dim=2,
+            layer_type="mha",
+        )
+        k = torch.ops.auto_deploy.view(
+            k,
+            [bsz, q_len, self.num_kv_heads, self.head_dim],
+            tp_scaled_dim=2,
+            layer_type="mha",
+        )
+        v = torch.ops.auto_deploy.view(
+            v,
+            [bsz, q_len, self.num_kv_heads, self.head_dim],
+            tp_scaled_dim=2,
+            layer_type="mha",
+        )
 
         # Optional QK normalization (Cohere v1 feature)
         if self.use_qk_norm:
@@ -248,8 +339,20 @@ class CohereAttention(nn.Module):
         )
 
         # Reshape and project output
-        attn_output = attn_output.reshape(bsz, q_len, self.num_heads * self.head_dim)
-        attn_output = self.o_proj(attn_output)
+        attn_output = torch.ops.auto_deploy.view(
+            attn_output,
+            [bsz, q_len, self.num_heads * self.head_dim],
+            tp_scaled_dim=2,
+            layer_type="mha",
+        )
+        attn_output = torch.ops.auto_deploy.torch_linear_simple(
+            attn_output,
+            self.o_proj.weight,
+            self.o_proj.bias,
+            tp_mode="rowwise",
+            layer_type="mha",
+        )
+        attn_output = torch.ops.auto_deploy.all_reduce(attn_output, layer_type="mha")
 
         return attn_output
 
