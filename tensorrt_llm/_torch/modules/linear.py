@@ -31,6 +31,7 @@ from tensorrt_llm.quantization.utils.fp8_utils import (
 from ..._utils import get_sm_version, is_sm_100f
 from ...models.modeling_utils import QuantConfig
 from ..utils import (Fp4QuantizedTensor, get_model_extra_attrs,
+                     is_nvfp4_marlin_enabled,
                      replace_parameter_and_save_metadata, unswizzle_sf)
 
 
@@ -2850,9 +2851,7 @@ class MarlinNVFP4LinearMethod(NVFP4LinearMethod):
 
     def apply(self, module: Linear, input: torch.Tensor,
               bias: Optional[torch.Tensor]):
-        assert module.nvfp4_allowed_backends == [
-            "marlin"
-        ], "To use MarlinNVFP4LinearMethod, nvfp4_allowed_backends must be ['marlin']"
+        assert is_nvfp4_marlin_enabled()
         output = torch.ops.trtllm.marlin_nvfp4_gemm(
             input.bfloat16(),
             module.weight,
@@ -2890,6 +2889,8 @@ def get_quant_method(quant_config: Optional[QuantConfig] = None):
     if quant_config.layer_quant_mode.has_nvfp4():
         if quant_config.quant_algo == QuantAlgo.NVFP4_ARC:
             return NVFP4ARCLinearMethod()
+        elif is_nvfp4_marlin_enabled():
+            return MarlinNVFP4LinearMethod()
         else:
             return NVFP4LinearMethod()
     if quant_config.layer_quant_mode.has_w4a8_nvfp4_fp8():
@@ -3037,10 +3038,6 @@ class Linear(nn.Module):
             self.create_weights()
 
     def get_quant_method(self, quant_config: Optional[QuantConfig] = None):
-        if (self.nvfp4_allowed_backends == ["marlin"]
-                and quant_config is not None
-                and quant_config.layer_quant_mode.has_nvfp4()):
-            return MarlinNVFP4LinearMethod()
         return get_quant_method(quant_config)
 
     def create_weights(self):
