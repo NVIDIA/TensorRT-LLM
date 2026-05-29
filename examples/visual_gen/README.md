@@ -78,8 +78,7 @@ python visual_gen_flux.py \
 20B MMDiT text-to-image model with a Qwen2.5-VL-7B text encoder and a
 16-channel 3D VAE. The implementation supports the native BF16 path,
 dynamic FP8 blockwise and NVFP4 quantization, CUDA graph, Ulysses
-parallelism, and `trtllm-serve`; CFG parallelism and TeaCache are
-follow-ups.
+parallelism, and `trtllm-serve`.
 
 ### Basic Usage
 
@@ -88,7 +87,6 @@ python visual_gen_qwen_image.py \
     --model_path Qwen/Qwen-Image \
     --prompt "A cat holding a sign that says hello world" \
     --height 1328 --width 1328 \
-    --true_cfg_scale 4.0 \
     --output_path qwen_image.png
 ```
 
@@ -320,7 +318,7 @@ python visual_gen_ltx2.py \
 | Argument | FLUX | Qwen-Image | WAN | LTX2 | Default | Description |
 |----------|------|------------|-----|------|---------|-------------|
 | `--model_path` | ✓ | ✓ | ✓ | ✓ | — | Path to model checkpoint directory |
-| `--text_encoder_path` | — | ✓ | — | ✓ | — | Path to Gemma3 text encoder |
+| `--text_encoder_path` | — | - | — | ✓ | — | Path to Gemma3 text encoder |
 | `--prompt` | ✓ | ✓ | ✓ | ✓ | — | Text prompt for generation |
 | `--negative_prompt` | — | ✓ | ✓ | ✓ | *(built-in)* | Negative prompt |
 | `--height` | ✓ | ✓ | ✓ | ✓ | 1024 / 1328 / 720 | Output height |
@@ -328,8 +326,8 @@ python visual_gen_ltx2.py \
 | `--num_frames` | — | — | ✓ | ✓ | 81 / 121 | Number of frames |
 | `--frame_rate` | — | — | ✓ | ✓ | 24.0 | Output frame rate (fps) |
 | `--steps` | ✓ | ✓ | ✓ | ✓ | 50 / 40 | Denoising steps |
-| `--guidance_scale` | ✓ | — [^qi] | ✓ | ✓ | 3.5 / 5.0 / 4.0 | Guidance strength |
-| `--true_cfg_scale` | — | ✓ | — | — | 4.0 | Qwen-Image real CFG (requires --negative_prompt) |
+| `--guidance_scale` | ✓ | — [^1] | ✓ | ✓ | 3.5 / 5.0 / 4.0 | Guidance strength |
+| `--true_cfg_scale` | — | ✓ | — | — | 4.0 | Qwen-Image CFG score (requires --negative_prompt) |
 | `--max_sequence_length` | — | ✓ | — | ✓ | 1024 | Prompt tokenizer max length |
 | `--seed` | ✓ | ✓ | ✓ | ✓ | 42 | Random seed |
 | `--image` | — | — | ✓ | ✓ | None | Input image for image-to-video |
@@ -349,7 +347,7 @@ python visual_gen_ltx2.py \
 | `--modality_scale` | — | — | — | ✓ | 1.0 | Cross-modal guidance scale |
 | `--rescale_scale` | — | — | — | ✓ | 0.0 | Variance-preserving rescale factor |
 
-[^qi]: Qwen-Image uses `--true_cfg_scale` (real classifier-free guidance)
+[^1]: Qwen-Image uses `--true_cfg_scale` (real classifier-free guidance)
     instead of FLUX's embedded `--guidance_scale`.
 
 ## Troubleshooting

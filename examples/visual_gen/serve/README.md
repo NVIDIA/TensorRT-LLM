@@ -59,7 +59,7 @@ Current supported & tested models:
 2. FLUX.1 for image generation (t2i)
 3. FLUX.2 for image generation (t2i)
 4. LTX-2 for video generation with audio (t2v, ti2v)
-5. Qwen-Image for image generation (t2i, BF16, dynamic FP8/NVFP4, CUDA graph, Ulysses, torch.compile)
+5. Qwen-Image for image generation (t2i)
 
 ### 1. Synchronous Image Generation (`sync_image_gen.py`)
 

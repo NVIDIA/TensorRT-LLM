@@ -253,7 +253,6 @@ def main():
                             "height": args.height,
                             "width": args.width,
                             "steps": args.steps,
-                            "true_cfg_scale": args.true_cfg_scale,
                         },
                     },
                     f,
