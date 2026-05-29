@@ -40,10 +40,7 @@
 #define MARLIN_NAMESPACE_NAME marlin_moe_wna16
 #endif
 
-#include "dequant.h"
 #include "marlin.cuh"
-#include "marlin_dtypes.cuh"
-#include "marlin_mma.h"
 
 #define MARLIN_KERNEL_PARAMS                                                                                           \
     const int4 *__restrict__ A, const int4 *__restrict__ B, int4 *__restrict__ C, int4 *__restrict__ C_tmp,            \

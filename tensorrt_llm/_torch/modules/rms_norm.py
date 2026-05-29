@@ -186,8 +186,8 @@ class RMSNorm(nn.Module):
                     gather=True,
                     use_gemma=self.use_gemma,
                 )
-        elif IS_FLASHINFER_AVAILABLE and hidden_states.dtype in (
-                torch.float16, torch.bfloat16):
+        elif IS_FLASHINFER_AVAILABLE and not is_nvfp4_marlin_enabled(
+        ) and hidden_states.dtype in (torch.float16, torch.bfloat16):
             from ..custom_ops import (flashinfer_fused_add_rmsnorm,
                                       flashinfer_gemma_fused_add_rmsnorm,
                                       flashinfer_gemma_rmsnorm,

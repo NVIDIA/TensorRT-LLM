@@ -24,8 +24,7 @@
 
 #include "tensorrt_llm/common/logger.h"
 
-#include "marlin_nvfp4_dispatch_utils.h"
-#include "marlin_nvfp4_moe_gemm.h"
+#include "marlin_nvfp4.h"
 #include "marlin_nvfp4_moe_template.h"
 
 #include <algorithm>

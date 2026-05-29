@@ -16,6 +16,7 @@
  */
 
 #include "marlin.cuh"
+#include "marlin_nvfp4.h"
 
 namespace marlin
 {

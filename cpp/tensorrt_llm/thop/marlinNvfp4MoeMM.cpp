@@ -15,7 +15,7 @@
  * limitations under the License.
  */
 
-#include "tensorrt_llm/kernels/marlin/marlin_nvfp4_moe_gemm.h"
+#include "tensorrt_llm/kernels/marlin/marlin_nvfp4.h"
 #include "tensorrt_llm/runtime/torchUtils.h"
 #include "tensorrt_llm/thop/thUtils.h"
 #include <torch/extension.h>
