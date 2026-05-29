@@ -28,32 +28,73 @@ from tensorrt_llm.logger import logger
 from .modules import SConvTranspose1d, SnakeBeta, WNConv1d, WNConvTranspose1d
 
 
+def _resolve_activation_name(
+    model_config: Dict[str, Any], use_snake: bool
+) -> Literal["elu", "snakebeta", "none"]:
+    if not use_snake:
+        return "elu"
+    activation = model_config.get("activation", "snakebeta")
+    if activation in ("snake", "snakebeta"):
+        return "snakebeta"
+    if activation == "none":
+        return "none"
+    raise ValueError(f"Unknown activation {activation}")
+
+
+def _resolve_decoder_out_channels(model_config: Dict[str, Any]) -> int:
+    if "dec_out_channels" in model_config:
+        return model_config["dec_out_channels"]
+    out_channels = model_config["input_channels"]
+    if model_config.get("stereo", False):
+        out_channels *= 2
+    return out_channels
+
+
+def _extract_decoder_state_dict(
+    state_dict: Dict[str, Tensor],
+) -> Dict[str, Tensor]:
+    """Return checkpoint weights keyed for ``LatentAutoEncoderV2.decoder``."""
+    prefixed = {key: value for key, value in state_dict.items() if key.startswith("decoder.")}
+    if prefixed:
+        return prefixed
+
+    # Legacy checkpoints may omit the decoder. prefix.
+    return {f"decoder.{key}": value for key, value in state_dict.items()}
+
+
 def get_activation(
-    activation: Literal["elu", "snake", "none"],
+    activation: Literal["elu", "snake", "snakebeta", "none"],
     antialias: bool = False,
     channels: Optional[int] = None,
     use_cuda_kernel: bool = False,
+    snake_logscale: bool = True,
 ) -> nn.Module:
     """
     Get activation module by name.
 
     Args:
-        activation: Activation type ('elu', 'snake', or 'none')
+        activation: Activation type ('elu', 'snakebeta', or 'none')
         antialias: Whether to wrap with anti-aliasing
         channels: Number of channels (required for snake activation)
         use_cuda_kernel: Whether to use CUDA kernel (not supported)
+        snake_logscale: Whether SnakeBeta uses log-scaled parameters
 
     Returns:
         Activation module
     """
     if activation == "elu":
         act = nn.ELU()
-    elif activation == "snake":
-        act = SnakeBeta(channels)
+    elif activation in ("snake", "snakebeta"):
+        if channels is None:
+            raise ValueError("channels is required for snake activation")
+        act = SnakeBeta(channels, alpha_logscale=snake_logscale)
     elif activation == "none":
         act = nn.Identity()
     else:
         raise ValueError(f"Unknown activation {activation}")
+
+    if use_cuda_kernel:
+        raise NotImplementedError("CUDA kernel activation not supported")
 
     if antialias:
         raise NotImplementedError("antialias activation not supported")
@@ -87,6 +128,9 @@ class ResidualUnit(nn.Module):
         antialias_activation: bool = False,
         causal: bool = False,
         padding_mode: str = "zeros",
+        activation: Literal["elu", "snakebeta", "none"] = "elu",
+        snake_logscale: bool = True,
+        use_cuda_kernel: bool = False,
     ) -> None:
         super().__init__()
 
@@ -100,11 +144,14 @@ class ResidualUnit(nn.Module):
             self.padding = (dilation * (kernel_size - 1)) // 2
 
         self.padding_mode = padding_mode
+        activation_name = activation if use_snake else "elu"
 
         self.snake1 = get_activation(
-            "snake" if use_snake else "elu",
+            activation_name,
             antialias=antialias_activation,
             channels=out_channels,
+            snake_logscale=snake_logscale,
+            use_cuda_kernel=use_cuda_kernel,
         )
         self.conv1 = WNConv1d(
             in_channels=in_channels,
@@ -115,9 +162,11 @@ class ResidualUnit(nn.Module):
             padding_mode=self.padding_mode,
         )
         self.snake2 = get_activation(
-            "snake" if use_snake else "elu",
+            activation_name,
             antialias=antialias_activation,
             channels=out_channels,
+            snake_logscale=snake_logscale,
+            use_cuda_kernel=use_cuda_kernel,
         )
         self.conv2 = WNConv1d(
             in_channels=out_channels, out_channels=out_channels, kernel_size=1, padding=0
@@ -170,42 +219,51 @@ class OobleckDecoderBlock(nn.Module):
         use_nearest_upsample: bool = False,
         causal: bool = False,
         padding_mode: str = "zeros",
+        activation: Literal["elu", "snakebeta", "none"] = "elu",
+        snake_logscale: bool = True,
+        use_cuda_kernel: bool = False,
     ) -> None:
         super().__init__()
 
         self.causal = causal
+        activation_name = activation if use_snake else "elu"
 
         self.snake1 = get_activation(
-            "snake" if use_snake else "elu",
+            activation_name,
             antialias=antialias_activation,
             channels=in_channels,
+            snake_logscale=snake_logscale,
+            use_cuda_kernel=use_cuda_kernel,
         )
         self.conv_t1 = self._create_upsample_layer(
             in_channels, out_channels, stride, use_nearest_upsample, causal, padding_mode
         )
+        res_unit_kwargs = {
+            "use_snake": use_snake,
+            "causal": causal,
+            "padding_mode": padding_mode,
+            "activation": activation,
+            "snake_logscale": snake_logscale,
+            "use_cuda_kernel": use_cuda_kernel,
+            "antialias_activation": antialias_activation,
+        }
         self.res_unit1 = ResidualUnit(
             in_channels=out_channels,
             out_channels=out_channels,
             dilation=1,
-            use_snake=use_snake,
-            causal=causal,
-            padding_mode=padding_mode,
+            **res_unit_kwargs,
         )
         self.res_unit2 = ResidualUnit(
             in_channels=out_channels,
             out_channels=out_channels,
             dilation=3,
-            use_snake=use_snake,
-            causal=causal,
-            padding_mode=padding_mode,
+            **res_unit_kwargs,
         )
         self.res_unit3 = ResidualUnit(
             in_channels=out_channels,
             out_channels=out_channels,
             dilation=9,
-            use_snake=use_snake,
-            causal=causal,
-            padding_mode=padding_mode,
+            **res_unit_kwargs,
         )
 
     def _create_upsample_layer(
@@ -319,10 +377,7 @@ class OobleckDecoder(nn.Module):
         self.model_config = model_config
 
         latent_dim = model_config["vocoder_input_dim"]
-
-        out_channels = model_config["input_channels"]
-        if model_config.get("stereo", False):
-            out_channels *= 2
+        out_channels = _resolve_decoder_out_channels(model_config)
 
         channels = model_config["dec_dim"]
         c_mults = model_config["dec_c_mults"]
@@ -333,6 +388,19 @@ class OobleckDecoder(nn.Module):
         causal = model_config["causal"]
         final_tanh = model_config["dec_use_tanh_at_final"]
         padding_mode = model_config["padding_mode"]
+        snake_logscale = model_config.get("snake_logscale", True)
+        use_cuda_kernel = model_config.get("use_cuda_kernel", False)
+        activation = _resolve_activation_name(model_config, use_snake)
+        block_kwargs = {
+            "use_snake": use_snake,
+            "antialias_activation": antialias_activation,
+            "use_nearest_upsample": use_nearest_upsample,
+            "causal": causal,
+            "padding_mode": padding_mode,
+            "activation": activation,
+            "snake_logscale": snake_logscale,
+            "use_cuda_kernel": use_cuda_kernel,
+        }
 
         c_mults = [1, *c_mults]
 
@@ -355,20 +423,18 @@ class OobleckDecoder(nn.Module):
                     in_channels=c_mults[i] * channels,
                     out_channels=c_mults[i - 1] * channels,
                     stride=strides[i - 1],
-                    use_snake=use_snake,
-                    antialias_activation=antialias_activation,
-                    use_nearest_upsample=use_nearest_upsample,
-                    causal=causal,
-                    padding_mode=padding_mode,
+                    **block_kwargs,
                 )
             ]
         self.block = nn.ModuleList(blocks)
 
         self.final_padding = 6 if causal else 3
         self.snake1 = get_activation(
-            "snake" if use_snake else "elu",
+            activation,
             antialias=antialias_activation,
             channels=c_mults[0] * channels,
+            snake_logscale=snake_logscale,
+            use_cuda_kernel=use_cuda_kernel,
         )
         self.conv2 = WNConv1d(
             in_channels=c_mults[0] * channels,
@@ -407,50 +473,27 @@ class OobleckDecoder(nn.Module):
 
 class LatentAutoEncoderV2(nn.Module):
     """
-    A Latent AutoEncoder class with cleaner implementation to generalize using bottleneck.py
+    Decoder-only autoencoder_v2 wrapper for Cosmos3 sound generation.
 
-    Attributes:
-        model_config: Configuration object containing model hyperparameters.
-        decoder (nn.Module): The decoder module based on configuration.
+    Checkpoints store weights under the ``decoder.*`` prefix, e.g.
+    ``decoder.block.0.conv_t1.weight_g`` and ``decoder.conv1.bias``.
     """
 
     def __init__(self, model_config: Dict[str, Any]) -> None:
         super().__init__()
         self.model_config = model_config
-
-        # Set up basic model properties
         self.stereo = model_config.get("stereo", False)
 
-        # Determine input type
-        self.input_type = None
-        if model_config.get("use_wav_as_input", False):
-            self.input_type = "waveform"
-            model_config["input_channels"] = 1
-        elif model_config.get("use_linear_spec_as_input", False):
-            self.input_type = "linear"
-            model_config["input_channels"] = model_config["num_linears"]
-        elif model_config.get("use_discrete_code_as_input", False):
-            self.input_type = "discrete_code"
-            model_config["input_channels"] = 1
-        else:
-            self.input_type = "mel"
-            model_config["input_channels"] = model_config["num_mels"]
-
-        # Check for encoder-only mode
-        self.encoder_only = model_config.get("encoder_only", False)
-
-        if self.encoder_only:
+        if model_config.get("encoder_only", False):
             raise NotImplementedError("Encoder-only mode not supported")
 
-        self.dec_type = model_config.get("dec_type", "oobleck")
-        if self.dec_type == "oobleck":
-            self.decoder = OobleckDecoder(model_config)
-        else:
+        dec_type = model_config.get("dec_type", "oobleck")
+        if dec_type != "oobleck":
             raise NotImplementedError(
-                f"Decoder type '{self.dec_type}' not supported in cleaned AVAE. Only 'oobleck' is supported."
+                f"Decoder type '{dec_type}' not supported. Only 'oobleck' is supported."
             )
 
-        # Optional latent normalisation (from cosmos3-internal AVAEModel)
+        self.decoder = OobleckDecoder(model_config)
         self.latent_mean = model_config.get("latent_mean", None)
         self.latent_std = model_config.get("latent_std", None)
 
@@ -486,9 +529,19 @@ class LatentAutoEncoderV2(nn.Module):
                 "Expected diffusion_pytorch_model.safetensors."
             )
 
-        missing, unexpected = model.load_state_dict(state_dict, strict=False)
-        if missing:
-            logger.warning(f"Missing keys when loading sound tokenizer: {missing}")
+        decoder_state = _extract_decoder_state_dict(state_dict)
+        if not decoder_state:
+            raise FileNotFoundError(
+                f"No decoder weights found in '{checkpoint_dir}'. "
+                "Expected keys prefixed with 'decoder.'."
+            )
+
+        missing, unexpected = model.load_state_dict(decoder_state, strict=False)
+        decoder_missing = [key for key in missing if key.startswith("decoder.")]
+        if decoder_missing:
+            raise RuntimeError(
+                f"Failed to load sound tokenizer decoder weights. Missing keys: {decoder_missing}"
+            )
         if unexpected:
             logger.warning(f"Unexpected keys when loading sound tokenizer: {unexpected}")
 

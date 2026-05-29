@@ -34,8 +34,8 @@ from tensorrt_llm.logger import logger
 
 from .defaults import COSMOS3_720P_PARAMS, COSMOS3_EXTRA_SPECS
 from .guardrails import check_video_safety, download_guardrail_checkpoint
-from .transformer_cosmos3 import Cosmos3VFMTransformer
 from .sound_tokenizer import LatentAutoEncoderV2
+from .transformer_cosmos3 import Cosmos3VFMTransformer
 
 COSMOS3_DEFAULT_NEGATIVE_PROMPT = (
     "The video captures a series of frames showing ugly scenes, static with no motion, motion blur, "
@@ -67,11 +67,15 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
     def __init__(self, pipeline_config):
         super().__init__(pipeline_config)
 
-        self.sound_gen = False
+        self.audio_gen = False
         self.action_gen = False
-        if getattr(model_config.pretrained_config, "sound_gen", False):
-            logger.info("Initializing Cosmos3OmniMoTPipeline with sound generation.")
-            self.sound_gen = True
+        if getattr(
+            model_config.pretrained_config,
+            "audio_gen",
+            getattr(model_config.pretrained_config, "sound_gen", False),
+        ):
+            logger.info("Initializing Cosmos3OmniMoTPipeline with audio generation.")
+            self.audio_gen = True
 
         if getattr(model_config.pretrained_config, "action_gen", False):
             logger.info("Initializing Cosmos3OmniMoTPipeline with action generation.")
@@ -91,10 +95,10 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
         self, checkpoint_dir: str, device: torch.device, skip_components: Optional[list] = []
     ) -> None:
         skip_components = skip_components or []
-        
-        if self.sound_gen and PipelineComponent.SOUND_TOKENIZER not in skip_components:
-            logger.info("Loading sound tokenizer...")
-            self.sound_tokenizer = (
+
+        if self.audio_gen and PipelineComponent.SOUND_TOKENIZER not in skip_components:
+            logger.info("Loading audio tokenizer...")
+            self.audio_tokenizer = (
                 LatentAutoEncoderV2.from_pretrained(
                     checkpoint_dir,
                     subfolder=PipelineComponent.SOUND_TOKENIZER,
@@ -137,10 +141,10 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
                 checkpoint_dir,
                 subfolder=PipelineComponent.SCHEDULER,
             )
-            if self.sound_gen:
-                # Separate instance so video and sound scheduler states don't collide
+            if self.audio_gen:
+                # Separate instance so video and audio scheduler states don't collide
                 # (UniPC mutates internal correction buffers on every .step() call).
-                self.sound_scheduler = UniPCMultistepScheduler.from_config(self.scheduler.config)
+                self.audio_scheduler = UniPCMultistepScheduler.from_config(self.scheduler.config)
 
         # Re-check the env var in case it was changed after initialization like in unit tests.
         guardrails_disabled = os.environ.get("TRTLLM_DISABLE_COSMOS3_GUARDRAILS", "0") == "1"
@@ -201,7 +205,7 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
                 max_sequence_length=COSMOS3_720P_PARAMS["max_sequence_length"],
                 use_guardrails=False,
                 image=None,
-                enable_sound=False,
+                enable_audio=False,
             )
 
     def infer(self, req):
@@ -221,7 +225,7 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
             use_resolution_template=req.params.extra_params.get("use_resolution_template", True),
             use_system_prompt=req.params.extra_params.get("use_system_prompt", False),
             use_guardrails=req.params.extra_params.get("use_guardrails", True),
-            enable_sound=req.params.extra_params.get("enable_sound", False),
+            enable_audio=req.params.extra_params.get("enable_audio", False),
         )
 
     def _format_prompt_with_template(
@@ -464,19 +468,19 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
         return video
 
     # =========================================================================
-    # Sound generation
+    # Audio generation
     # =========================================================================
 
-    def decode_sound(self, latent: torch.Tensor) -> torch.Tensor:
-        """Decode sound latent tokens back to waveform.
+    def decode_audio(self, latent: torch.Tensor) -> torch.Tensor:
+        """Decode audio latent tokens back to waveform.
 
         Args:
-            latent: Sound latent tensor of shape (B, C, T).
+            latent: Audio latent tensor of shape (B, C, T).
 
         Returns:
             Waveform tensor of shape (B, audio_channels, N_samples).
         """
-        return self.sound_tokenizer.decode(latent)  # [B, audio_channels, N_samples]
+        return self.audio_tokenizer.decode(latent)  # [B, audio_channels, N_samples]
 
     # =========================================================================
     # Forward (main generation entry point)
@@ -501,7 +505,7 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
         use_resolution_template: bool = COSMOS3_EXTRA_SPECS["use_resolution_template"].default,
         use_system_prompt: bool = COSMOS3_EXTRA_SPECS["use_system_prompt"].default,
         use_guardrails: bool = COSMOS3_EXTRA_SPECS["use_guardrails"].default,
-        enable_sound: bool = COSMOS3_EXTRA_SPECS["enable_sound"].default,
+        enable_audio: bool = COSMOS3_EXTRA_SPECS["enable_audio"].default,
     ):
         pipeline_start = time.time()
         timer = CudaPhaseTimer()
@@ -615,26 +619,26 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
         # 3. Set up scheduler
         self.scheduler.set_timesteps(num_inference_steps, device=self.device)
 
-        # 3b. Sound noise init
-        # T_sound = ceil(duration_s * sound_latent_fps / temporal_compression_factor_sound)
+        # 3b. Audio noise init
+        # T_audio = ceil(duration_s * audio_latent_fps / temporal_compression_factor_audio)
         # Duration derived from num_frames / frame_rate; matches cosmos3-internal.
-        do_sound = enable_sound and self.sound_gen and hasattr(self, "sound_tokenizer")
-        sound_latents = None
-        if do_sound:
+        do_audio = enable_audio and self.audio_gen and hasattr(self, "audio_tokenizer")
+        audio_latents = None
+        if do_audio:
             duration_s = num_frames / frame_rate
-            T_sound = math.ceil(
+            T_audio = math.ceil(
                 duration_s
-                * self.transformer.sound_latent_fps
-                / self.transformer.temporal_compression_factor_sound
+                * self.transformer.audio_latent_fps
+                / self.transformer.temporal_compression_factor_audio
             )
-            sound_latents = randn_tensor(
-                (1, self.transformer.sound_dim, T_sound),
+            audio_latents = randn_tensor(
+                (1, self.transformer.audio_dim, T_audio),
                 generator=generator,
                 device=self.device,
                 dtype=latents.dtype,
             )
-            # Sound uses the same scheduler type/config as video.
-            self.sound_scheduler.set_timesteps(num_inference_steps, device=self.device)
+            # Audio uses the same scheduler type/config as video.
+            self.audio_scheduler.set_timesteps(num_inference_steps, device=self.device)
 
         # 4. Build forward_fn for the denoise loop
         def forward_fn(
@@ -645,7 +649,7 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
             Since Cosmos3 embeds text internally, we pass token IDs via extra_tensors
             rather than through encoder_hidden_states.
             """
-            current_sound = extra_stream_latents.get("sound") if extra_stream_latents else None
+            current_audio = extra_stream_latents.get("audio") if extra_stream_latents else None
 
             result = self.transformer(
                 hidden_states=latent_input,
@@ -655,17 +659,17 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
                 video_shape=video_shape,
                 fps=frame_rate,
                 noisy_frame_mask=velocity_mask,
-                sound_latents=current_sound,
+                audio_latents=current_audio,
             )
 
             video_noise_pred = result.video
-            sound_noise_pred = result.sound
+            audio_noise_pred = result.audio
 
             if velocity_mask is not None:
                 video_noise_pred = video_noise_pred * velocity_mask
 
-            if sound_noise_pred is not None:
-                return video_noise_pred, {"sound": sound_noise_pred}
+            if audio_noise_pred is not None:
+                return video_noise_pred, {"audio": audio_noise_pred}
             return video_noise_pred
 
         # 5. Build CFG tensors — text_ids and text_mask need to be split for CFG
@@ -680,7 +684,7 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
 
         # 6. Denoise
         timer.mark_denoise_start()
-        extra_streams = {"sound": (sound_latents, self.sound_scheduler)} if do_sound else None
+        extra_streams = {"audio": (audio_latents, self.audio_scheduler)} if do_audio else None
         denoise_result = self.denoise(
             latents=latents,
             scheduler=self.scheduler,
@@ -694,10 +698,10 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
 
         if extra_streams is not None:
             latents, extra_latents = denoise_result
-            sound_latents = extra_latents.get("sound")
+            audio_latents = extra_latents.get("audio")
         else:
             latents = denoise_result
-            sound_latents = None
+            audio_latents = None
 
         timer.mark_post_start()
 
@@ -711,11 +715,11 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
 
         video = self.decode_latents(latents, self._decode_latents)
 
-        # 7b. Decode sound
+        # 7b. Decode audio
         waveform = None
-        if do_sound and sound_latents is not None:
-            logger.info("Decoding sound...")
-            waveform = self.decode_sound(sound_latents)  # [B, audio_channels, N_samples]
+        if do_audio and audio_latents is not None:
+            logger.info("Decoding audio...")
+            waveform = self.decode_audio(audio_latents)  # [B, audio_channels, N_samples]
 
         # Video guardrail
         if self.rank == 0:
@@ -731,7 +735,7 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
                 video=video,
                 frame_rate=frame_rate,
                 audio=waveform,
-                audio_sample_rate=self.sound_tokenizer.model_config["sampling_rate"]
+                audio_sample_rate=self.audio_tokenizer.model_config["sampling_rate"]
                 if waveform is not None
                 else None,
             )
