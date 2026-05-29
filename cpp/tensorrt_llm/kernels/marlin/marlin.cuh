@@ -429,6 +429,11 @@ __device__ inline void mma_trans(const typename MarlinType<scalar_t>::FragA& a_f
 namespace MARLIN_NAMESPACE_NAME
 {
 
+// clang-format off
+// NOTE: keep this template parameter list out of clang-format. East-const
+// (QualifierAlignment: Right) miscompiles the *last* NTTP as `int X const`,
+// which is invalid syntax. Non-type template parameters are implicitly
+// const anyway, so we omit it on the last entry.
 template <typename scalar_t,   // compute type (nv_bfloat16)
     int const threads,         // threads per block (128 or 256)
     int const thread_m_blocks, // 16x16 blocks in M dimension
@@ -436,9 +441,10 @@ template <typename scalar_t,   // compute type (nv_bfloat16)
     int const thread_k_blocks, // 16x16 blocks in K dimension
     bool const m_block_size_8, // use 8-row M blocks (thread_m_blocks==1)
     int const stages,          // async pipeline stages
-    int group_blocks const     // consecutive blocks per scale group
+    int group_blocks           // consecutive blocks per scale group
     >
 __global__ void Marlin(MARLIN_KERNEL_PARAMS);
+// clang-format on
 
 } // namespace MARLIN_NAMESPACE_NAME
 
