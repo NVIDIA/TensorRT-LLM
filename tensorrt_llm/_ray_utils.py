@@ -52,9 +52,6 @@ def control_action_decorator(
 
         return wrapper
 
-    # Bare ``@control_action_decorator`` -> ``func`` is the wrapped function.
-    # ``@control_action_decorator(drain=...)`` -> ``func`` is None, return the
-    # parameterized decorator for Python to apply on the next pass.
     if func is None:
         return decorator
     return decorator(func)
