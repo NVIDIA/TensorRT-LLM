@@ -1163,6 +1163,8 @@ def _is_eagle_draft_topology(linear_nodes: List[Node], embd: int) -> bool:
     k_shape = get_weight_shape(k_node)
     v_shape = get_weight_shape(v_node)
     o_shape = get_weight_shape(o_node)
+    
+    # Validate tensor shapes before unpacking to prevent IndexError on dynamic/unconventional topologies
     if any(shape is None or len(shape) < 2 for shape in (q_shape, k_shape, v_shape, o_shape)):
         return False
 
