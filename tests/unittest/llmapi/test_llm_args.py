@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import tempfile
 from collections import defaultdict
 from dataclasses import is_dataclass
@@ -202,6 +205,44 @@ def test_decoding_type_eagle3_errors_on_tensorrt_backend():
     with pytest.raises(ValueError,
                        match="only supported on the PyTorch backend"):
         TrtLlmArgs(model=llama_model_path, speculative_config=spec_cfg)
+
+
+def test_batch_wait_delay_timeout_requires_non_overlap_scheduler():
+    with pytest.raises(ValidationError,
+                       match="requires disable_overlap_scheduler=True"):
+        TorchLlmArgs(model=llama_model_path,
+                     skip_tokenizer_init=True,
+                     batch_wait_delay_timeout_ms=1.0,
+                     batch_wait_max_tokens_ratio=1.0)
+
+
+def test_batch_wait_delay_timeout_rejects_timeout_iters():
+    with pytest.raises(ValidationError, match="cannot both be enabled"):
+        TorchLlmArgs(model=llama_model_path,
+                     skip_tokenizer_init=True,
+                     disable_overlap_scheduler=True,
+                     batch_wait_delay_timeout_ms=1.0,
+                     batch_wait_timeout_iters=1,
+                     batch_wait_max_tokens_ratio=1.0)
+
+
+def test_batch_wait_delay_timeout_requires_token_ratio():
+    with pytest.raises(ValidationError,
+                       match="requires batch_wait_max_tokens_ratio > 0"):
+        TorchLlmArgs(model=llama_model_path,
+                     skip_tokenizer_init=True,
+                     disable_overlap_scheduler=True,
+                     batch_wait_delay_timeout_ms=1.0)
+
+
+def test_batch_wait_delay_timeout_valid_config():
+    args = TorchLlmArgs(model=llama_model_path,
+                        skip_tokenizer_init=True,
+                        disable_overlap_scheduler=True,
+                        batch_wait_delay_timeout_ms=1.0,
+                        batch_wait_max_tokens_ratio=1.0)
+
+    assert args.batch_wait_delay_timeout_ms == 1.0
 
 
 class TestModelDefaults:

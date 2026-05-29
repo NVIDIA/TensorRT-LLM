@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import dataclasses
 import datetime
 import functools
@@ -373,8 +376,13 @@ class PyExecutor:
             self.attention_dp_batching_wait_iters = self.llm_args.attention_dp_config.batching_wait_iters
         self.batch_wait_timeout_ms = self.llm_args.batch_wait_timeout_ms
         self.batch_wait_timeout_iters = self.llm_args.batch_wait_timeout_iters
+        self.batch_wait_delay_timeout_ms = self.llm_args.batch_wait_delay_timeout_ms
         self.batch_wait_max_tokens_ratio = self.llm_args.batch_wait_max_tokens_ratio
-        self.enable_batch_waiting = self.batch_wait_timeout_iters > 0 or self.batch_wait_max_tokens_ratio > 0
+        self.enable_batch_wait_timeout = self.batch_wait_delay_timeout_ms > 0
+        self.enable_batch_waiting = (self.batch_wait_timeout_iters > 0
+                                     or self.enable_batch_wait_timeout
+                                     or self.batch_wait_max_tokens_ratio > 0)
+        self.batch_wait_deadline_s: Optional[float] = None
 
         self.num_fetch_requests_cur_rank = 0
         self.num_fetch_requests = 0
@@ -426,6 +434,7 @@ class PyExecutor:
         self.max_num_active_requests = model_engine.get_max_num_sequences()
         self.active_requests: List[LlmRequest] = []
         self.expected_num_active_requests = 0
+        self._skip_current_iteration = False
         # Buffer for responses generated inside _end_transfer_and_maybe_terminate.
         # With ADP, _enqueue_responses does a tp_gather collective.  When called
         # from _send_kv_async the owning DP rank has a response but the other
@@ -2230,6 +2239,12 @@ class PyExecutor:
             for request in scheduled_batch.all_requests():
                 request.py_disable_speculative_decoding = True
 
+        if self._skip_current_iteration:
+            self.num_scheduled_requests = 0
+            logger.debug(f'has {len(self.active_requests)} active_requests, '
+                         'skipping this iteration for delay batching')
+            return scheduled_batch, iter_stats
+
         if self.kv_cache_transceiver:
             # For requests that are fitting disagg gen init, also prepare resources for KV cache manager
             self._prepare_disagg_gen_init(fitting_disagg_gen_init_requests)
@@ -2462,6 +2477,10 @@ class PyExecutor:
 
                 if scheduled_batch is None:
                     break
+
+                if self._skip_current_iteration:
+                    self.iter_counter += 1
+                    continue
 
                 can_forward, should_retry = self._check_benchmark_disagg_gate(
                     scheduled_batch, can_forward)
@@ -3471,8 +3490,58 @@ class PyExecutor:
         self.batch_wait_iters_count = 0
         return context_requests
 
+    def _waiting_context_requests_with_timeout(
+            self, context_requests: list[LlmRequest]
+    ) -> tuple[list[LlmRequest], bool]:
+        """Apply wall-clock delay batching for CTX-only iterations.
+
+        Returns the context requests to keep and whether this rank should
+        skip the iteration because context requests were held back.
+        """
+        num_scheduled_tokens = self._compute_scheduled_tokens(
+            context_requests, [])
+        target_tokens = self.batch_wait_max_tokens_ratio * self.max_num_tokens
+        if num_scheduled_tokens >= target_tokens:
+            self.batch_wait_deadline_s = None
+            return context_requests, False
+
+        now = time.monotonic()
+        if self.batch_wait_deadline_s is None:
+            self.batch_wait_deadline_s = (
+                now + self.batch_wait_delay_timeout_ms / 1000.0)
+
+        if now < self.batch_wait_deadline_s:
+            return [], True
+
+        self.batch_wait_deadline_s = None
+        return context_requests, False
+
+    def _sync_delay_batch_skip(self, local_skip_iteration: bool,
+                               local_has_generation: bool) -> bool:
+        if (not self.enable_attention_dp
+                or getattr(self.dist, "world_size", 1) == 1):
+            return local_skip_iteration
+        all_delay_batch_states = self.dist.tp_allgather(
+            (int(local_skip_iteration), int(local_has_generation)))
+        if any(has_generation for _, has_generation in all_delay_batch_states):
+            return False
+        all_skip_flags = [
+            skip_iteration for skip_iteration, _ in all_delay_batch_states
+        ]
+        return any(all_skip_flags)
+
+    def _clear_scheduled_requests_for_skip(
+            self, scheduled_requests: ScheduledRequests) -> None:
+        if (self._scheduler_manages_kv_suspend
+                and scheduled_requests.num_context_requests > 0):
+            self._revert_ctx_alloc(scheduled_requests.context_requests)
+        self._revert_gen_alloc(scheduled_requests)
+        scheduled_requests.reset_context_requests([])
+        scheduled_requests.generation_requests = []
+
     @nvtx_range("_schedule")
     def _schedule(self):
+        self._skip_current_iteration = False
         scheduler_output = self.scheduler.schedule_request(
             self.active_requests, self.inflight_req_ids)
 
@@ -3482,22 +3551,47 @@ class PyExecutor:
                 scheduler_output.context_requests,
                 scheduler_output.generation_requests)
 
-        # If no generation requests, no need to wait, to avoid dead waiting
-        should_check_waiting = not self.enable_attention_dp and self.enable_batch_waiting and len(
-            scheduler_output.context_requests) > 0 and len(
-                scheduler_output.generation_requests) > 0
-        if should_check_waiting:
-            # With KV cache manager V2, scheduling has already grown context request KV cache capacity. Requests dropped
-            # for batch waiting still occupy KV cache and may reduce the batch size available for generation requests.
-            scheduled_context_requests = self._waiting_requests(
-                scheduler_output.context_requests,
-                scheduler_output.generation_requests)
+        local_skip_iteration = False
+        should_check_waiting = False
+        is_ctx_only = (len(scheduled_context_requests) > 0
+                       and len(scheduler_output.generation_requests) == 0)
+        if self.enable_batch_wait_timeout and is_ctx_only:
+            scheduled_context_requests, local_skip_iteration = (
+                self._waiting_context_requests_with_timeout(
+                    scheduled_context_requests))
+        else:
+            if self.enable_batch_wait_timeout:
+                self.batch_wait_deadline_s = None
+            # If no generation requests, no need to wait in iters mode, to
+            # avoid dead waiting.
+            should_check_waiting = (
+                not self.enable_attention_dp
+                and self.batch_wait_timeout_iters > 0
+                and self.batch_wait_max_tokens_ratio > 0
+                and len(scheduled_context_requests) > 0
+                and len(scheduler_output.generation_requests) > 0)
+            if should_check_waiting:
+                # With KV cache manager V2, scheduling has already grown context request KV cache capacity. Requests dropped
+                # for batch waiting still occupy KV cache and may reduce the batch size available for generation requests.
+                scheduled_context_requests = self._waiting_requests(
+                    scheduled_context_requests,
+                    scheduler_output.generation_requests)
 
-        num_fitting = scheduler_output.num_fitting_requests
+        skip_iteration = (self._sync_delay_batch_skip(
+            local_skip_iteration,
+            len(scheduler_output.generation_requests) > 0)
+                          if self.enable_batch_wait_timeout else False)
+
+        if skip_iteration:
+            self.batch_wait_iters_count = 0
+            num_fitting = 0
+        else:
+            num_fitting = scheduler_output.num_fitting_requests
+
         #TODO(TRTLLM-12359): remove the WAR when PythonMambaCacheManager is deprecated.
         if isinstance(self.kv_cache_manager,
                       MambaHybridCacheManager) and self.kv_cache_transceiver:
-            if len(scheduled_context_requests) > 0:
+            if not skip_iteration and len(scheduled_context_requests) > 0:
                 scheduled_context_requests = self.kv_cache_manager.filter_ctx_requests_by_capacity(
                     scheduled_context_requests)
                 num_fitting = len(scheduled_context_requests)
@@ -3507,7 +3601,14 @@ class PyExecutor:
         scheduled_requests.generation_requests = scheduler_output.generation_requests
         scheduled_requests.paused_requests = scheduler_output.paused_requests
 
-        return scheduled_requests, scheduler_output.fitting_disagg_gen_init_requests, num_fitting
+        fitting_disagg_gen_init_requests = \
+            scheduler_output.fitting_disagg_gen_init_requests
+        if skip_iteration:
+            self._clear_scheduled_requests_for_skip(scheduled_requests)
+            fitting_disagg_gen_init_requests = []
+            self._skip_current_iteration = True
+
+        return scheduled_requests, fitting_disagg_gen_init_requests, num_fitting
 
     @nvtx_range("_check_disagg_gen_transfer_status")
     def _check_disagg_gen_transfer_status(self):

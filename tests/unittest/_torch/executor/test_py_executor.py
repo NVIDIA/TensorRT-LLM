@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Tests for PyExecutor request handling functionality.
 
 This module tests the request handling logic that was moved from ExecutorRequestQueue
@@ -14,13 +17,18 @@ from unittest.mock import Mock
 
 import pytest
 
+import tensorrt_llm._torch.pyexecutor.py_executor as py_executor_mod
 from tensorrt_llm._torch.pyexecutor.executor_request_queue import (
     SHUTDOWN_REQUEST_ID,
     RequestQueueItem,
 )
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
 from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
-from tensorrt_llm._torch.pyexecutor.scheduler import FCFSWaitingQueue
+from tensorrt_llm._torch.pyexecutor.scheduler import (
+    FCFSWaitingQueue,
+    ScheduledRequests,
+    SchedulerOutput,
+)
 
 
 class MockPyExecutor:
@@ -602,3 +610,173 @@ def test_pad_dummy_no_op_when_attention_dp_disabled():
     _run_pad(stub)
 
     assert stub.add_dummy_calls == []
+
+
+class _StubDelayBatchExecutor:
+    def __init__(
+        self,
+        *,
+        timeout_ms=50,
+        max_num_tokens=100,
+        token_ratio=1.0,
+        enable_attention_dp=False,
+        world_size=1,
+    ):
+        self.batch_wait_delay_timeout_ms = timeout_ms
+        self.batch_wait_max_tokens_ratio = token_ratio
+        self.max_num_tokens = max_num_tokens
+        self.batch_wait_deadline_s = None
+        self.enable_attention_dp = enable_attention_dp
+        self.dist = Mock()
+        self.dist.world_size = world_size
+        self._compute_scheduled_tokens = PyExecutor._compute_scheduled_tokens
+
+
+def test_delay_batch_timeout_skips_context_only_before_deadline(monkeypatch):
+    now = [10.0]
+    monkeypatch.setattr(py_executor_mod.time, "monotonic", lambda: now[0])
+    stub = _StubDelayBatchExecutor(timeout_ms=50, max_num_tokens=100)
+    ctx_requests = [_make_ctx_request(context_chunk_size=10, context_remaining_length=10)]
+
+    kept_ctx, skip_iteration = PyExecutor._waiting_context_requests_with_timeout(stub, ctx_requests)
+
+    assert kept_ctx == []
+    assert skip_iteration is True
+    assert stub.batch_wait_deadline_s == pytest.approx(10.05)
+
+
+def test_delay_batch_timeout_releases_context_after_deadline(monkeypatch):
+    now = [10.0]
+    monkeypatch.setattr(py_executor_mod.time, "monotonic", lambda: now[0])
+    stub = _StubDelayBatchExecutor(timeout_ms=50, max_num_tokens=100)
+    ctx_requests = [_make_ctx_request(context_chunk_size=10, context_remaining_length=10)]
+
+    PyExecutor._waiting_context_requests_with_timeout(stub, ctx_requests)
+    now[0] = 10.06
+    kept_ctx, skip_iteration = PyExecutor._waiting_context_requests_with_timeout(stub, ctx_requests)
+
+    assert kept_ctx == ctx_requests
+    assert skip_iteration is False
+    assert stub.batch_wait_deadline_s is None
+
+
+def test_delay_batch_timeout_releases_context_when_token_target_is_met(monkeypatch):
+    now = [10.0]
+    monkeypatch.setattr(py_executor_mod.time, "monotonic", lambda: now[0])
+    stub = _StubDelayBatchExecutor(timeout_ms=50, max_num_tokens=10)
+    ctx_requests = [_make_ctx_request(context_chunk_size=10, context_remaining_length=10)]
+
+    kept_ctx, skip_iteration = PyExecutor._waiting_context_requests_with_timeout(stub, ctx_requests)
+
+    assert kept_ctx == ctx_requests
+    assert skip_iteration is False
+    assert stub.batch_wait_deadline_s is None
+
+
+def test_delay_batch_skip_sync_uses_any_rank_for_attention_dp():
+    stub = _StubDelayBatchExecutor(enable_attention_dp=True, world_size=2)
+    stub.dist.tp_allgather.return_value = [(0, 0), (1, 0)]
+
+    assert PyExecutor._sync_delay_batch_skip(stub, False, False) is True
+    stub.dist.tp_allgather.assert_called_once_with((0, 0))
+
+
+def test_delay_batch_skip_sync_does_not_skip_when_any_rank_has_generation():
+    stub = _StubDelayBatchExecutor(enable_attention_dp=True, world_size=2)
+    stub.dist.tp_allgather.return_value = [(1, 0), (0, 1)]
+
+    assert PyExecutor._sync_delay_batch_skip(stub, True, False) is False
+
+
+def test_delay_batch_skip_sync_is_local_without_attention_dp():
+    stub = _StubDelayBatchExecutor(enable_attention_dp=False, world_size=2)
+
+    assert PyExecutor._sync_delay_batch_skip(stub, True, False) is True
+    stub.dist.tp_allgather.assert_not_called()
+
+
+class _StubDelayScheduleExecutor(_StubDelayBatchExecutor):
+    def __init__(self, scheduler_output, *, timeout_ms=50):
+        super().__init__(timeout_ms=timeout_ms)
+        self.scheduler = Mock()
+        self.scheduler.schedule_request.return_value = scheduler_output
+        self.active_requests = []
+        self.inflight_req_ids = set()
+        self.attention_dp_enable_balance = False
+        self.enable_batch_wait_timeout = True
+        self.enable_batch_waiting = True
+        self.batch_wait_timeout_iters = 0
+        self.batch_wait_iters_count = 0
+        self.kv_cache_manager = Mock()
+        self.kv_cache_transceiver = None
+        self._scheduler_manages_kv_suspend = True
+        self._skip_current_iteration = False
+        self._revert_ctx_alloc = Mock()
+        self._revert_gen_alloc = Mock()
+
+
+def test_schedule_marks_skip_iteration_for_context_only_timeout(monkeypatch):
+    now = [10.0]
+    monkeypatch.setattr(py_executor_mod.time, "monotonic", lambda: now[0])
+    ctx_request = _make_ctx_request(context_chunk_size=10, context_remaining_length=10)
+    ctx_request.py_request_id = 1
+    scheduler_output = SchedulerOutput(
+        context_requests=[ctx_request],
+        generation_requests=[],
+        paused_requests=[],
+        fitting_disagg_gen_init_requests=[],
+        num_fitting_requests=1,
+    )
+    stub = _StubDelayScheduleExecutor(scheduler_output)
+
+    scheduled_requests, fitting_requests, num_fitting = PyExecutor._schedule(stub)
+
+    assert scheduled_requests.batch_size == 0
+    assert fitting_requests == []
+    assert num_fitting == 0
+    assert stub._skip_current_iteration is True
+    stub._revert_ctx_alloc.assert_called_once_with([ctx_request])
+
+
+def test_schedule_keeps_context_and_generation_for_mixed_timeout(monkeypatch):
+    now = [10.0]
+    monkeypatch.setattr(py_executor_mod.time, "monotonic", lambda: now[0])
+    ctx_request = _make_ctx_request(context_chunk_size=10, context_remaining_length=10)
+    ctx_request.py_request_id = 1
+    gen_request = _make_gen_request()
+    gen_request.py_request_id = 2
+    scheduler_output = SchedulerOutput(
+        context_requests=[ctx_request],
+        generation_requests=[gen_request],
+        paused_requests=[],
+        fitting_disagg_gen_init_requests=[],
+        num_fitting_requests=2,
+    )
+    stub = _StubDelayScheduleExecutor(scheduler_output)
+    stub.batch_wait_deadline_s = 9.0
+
+    scheduled_requests, _, _ = PyExecutor._schedule(stub)
+
+    assert scheduled_requests.context_requests == [ctx_request]
+    assert scheduled_requests.generation_requests == [gen_request]
+    assert stub._skip_current_iteration is False
+    assert stub.batch_wait_deadline_s is None
+    stub._revert_ctx_alloc.assert_not_called()
+
+
+def test_clear_scheduled_requests_for_skip_reverts_v2_allocations():
+    stub = _StubDelayBatchExecutor()
+    stub._scheduler_manages_kv_suspend = True
+    stub._revert_ctx_alloc = Mock()
+    stub._revert_gen_alloc = Mock()
+    ctx_request = _make_ctx_request(context_chunk_size=10, context_remaining_length=10)
+    gen_request = _make_gen_request()
+    scheduled_requests = ScheduledRequests()
+    scheduled_requests.reset_context_requests([ctx_request])
+    scheduled_requests.generation_requests = [gen_request]
+
+    PyExecutor._clear_scheduled_requests_for_skip(stub, scheduled_requests)
+
+    assert scheduled_requests.batch_size == 0
+    stub._revert_ctx_alloc.assert_called_once_with([ctx_request])
+    stub._revert_gen_alloc.assert_called_once_with(scheduled_requests)
