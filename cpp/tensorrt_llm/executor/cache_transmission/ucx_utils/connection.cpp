@@ -23,6 +23,9 @@
 #include "tensorrt_llm/common/tllmException.h"
 #include "tensorrt_llm/executor/cache_transmission/ucx_utils/connection.h"
 
+#include <chrono>
+#include <cstdint>
+
 namespace tensorrt_llm::executor::kv_cache
 {
 
@@ -138,6 +141,14 @@ void UcxConnection::send(DataContext const& ctx, void const* data, size_t size) 
         sendConnectionId(ctx, data, size);
         return;
     }
+    uint64_t sendTag = ((mSendTagPrefix & 0xFFFFFFFF) << 32) | (static_cast<uint64_t>(ctx.getTag()) & (0xFFFFFFFF));
+    // nvbugs/6104831 diagnostic: trace UCX send entry. Unlike NIXL, UCX has no
+    // separate notifySyncMessage call — the tagSend completion IS the
+    // synchronization. The wedge would manifest as a hung future.get() below;
+    // the SEND-WAIT heartbeat records (connId, wireSendTag) every 5s while
+    // waiting so we can pinpoint exactly which transfer is stuck.
+    TLLM_LOG_INFO("[DIAG-UCX-SEND-ENTRY] connId=%lu peerConnId=%lu fromRequester=%d ctxTag=%d wireSendTag=%lu size=%zu",
+        mConnectionId, mConnectionIdInPeer, mFromRequester, ctx.getTag(), sendTag, size);
     TLLM_LOG_DEBUG(mManager->getRank(),
         "start UcxConnection::send , mConnectionId: %lu, mConnectionIdInPeer: %lu,fromRequester: %d", mConnectionId,
         mConnectionIdInPeer, mFromRequester);
@@ -146,17 +157,34 @@ void UcxConnection::send(DataContext const& ctx, void const* data, size_t size) 
     std::promise<void> promise;
     std::future<void> future = promise.get_future();
     auto completionCallback = [&](ucs_status_t, ucxx::RequestCallbackUserData) -> void { promise.set_value(); };
-    uint64_t sendTag = ((mSendTagPrefix & 0xFFFFFFFF) << 32) | (static_cast<uint64_t>(ctx.getTag()) & (0xFFFFFFFF));
 
     auto req = mEndpoint->tagSend(const_cast<void*>(data), size, ucxx::Tag(sendTag), false, completionCallback);
     if (!req->isCompleted())
     {
+        // nvbugs/6104831 diagnostic: heartbeat-wrap the blocking future.get() so
+        // a UCX wedge (tagSend never completes) produces periodic markers
+        // naming the specific (connId, wireSendTag) pair stuck. Same blocking
+        // semantics as plain future.get() — no timeout introduced; truly
+        // wedged calls still wedge forever, just visibly.
+        static constexpr int64_t kDiagHeartbeatSec = 5;
+        std::uint64_t waitCycles = 0;
+        while (future.wait_for(std::chrono::seconds(kDiagHeartbeatSec)) == std::future_status::timeout)
+        {
+            ++waitCycles;
+            TLLM_LOG_INFO(
+                "[DIAG-UCX-SEND-WAIT] connId=%lu peerConnId=%lu fromRequester=%d ctxTag=%d wireSendTag=%lu "
+                "waitedSec=%lu",
+                mConnectionId, mConnectionIdInPeer, mFromRequester, ctx.getTag(), sendTag,
+                static_cast<unsigned long>(waitCycles * kDiagHeartbeatSec));
+        }
         future.get();
     }
     TLLM_CHECK_WITH_INFO(req->isCompleted(), "send should be completed");
     // throw if there is error
     req->checkError();
 
+    TLLM_LOG_INFO("[DIAG-UCX-SEND-DONE] connId=%lu peerConnId=%lu fromRequester=%d ctxTag=%d wireSendTag=%lu",
+        mConnectionId, mConnectionIdInPeer, mFromRequester, ctx.getTag(), sendTag);
     TLLM_LOG_DEBUG(mManager->getRank(),
         "end UcxConnection::send , mConnectionId: %lu, mConnectionIdInPeer: %lu,fromRequester: %d", mConnectionId,
         mConnectionIdInPeer, mFromRequester);
@@ -164,6 +192,14 @@ void UcxConnection::send(DataContext const& ctx, void const* data, size_t size) 
 
 void UcxConnection::recv(DataContext const& ctx, void* data, size_t size) const
 {
+    uint64_t recvTag = ((mRecvTagPrefix & 0xFFFFFFFF) << 32) | (static_cast<uint64_t>(ctx.getTag()) & (0xFFFFFFFF));
+    // nvbugs/6104831 diagnostic: trace UCX recv entry. Pairs with peer's
+    // SEND-ENTRY on matching wireSendTag (== wireRecvTag here, by ucxx::Tag
+    // matching). If RECV-WAIT heartbeats appear without a peer SEND-ENTRY for
+    // the same tag, the peer never tried to send; if both ENTRY log lines
+    // appear but neither DONE, UCX is not progressing the transfer.
+    TLLM_LOG_INFO("[DIAG-UCX-RECV-ENTRY] connId=%lu peerConnId=%lu fromRequester=%d ctxTag=%d wireRecvTag=%lu size=%zu",
+        mConnectionId, mConnectionIdInPeer, mFromRequester, ctx.getTag(), recvTag, size);
     // Guard to ensure CUDA context is initialized for UCX ops
     TLLM_LOG_DEBUG(mManager->getRank(),
         "start UcxConnection::recv , mConnectionId: %lu, mConnectionIdInPeer: %lu,fromRequester: %d", mConnectionId,
@@ -172,16 +208,32 @@ void UcxConnection::recv(DataContext const& ctx, void* data, size_t size) const
     std::promise<void> promise;
     std::future<void> future = promise.get_future();
     auto completionCallback = [&](ucs_status_t, ucxx::RequestCallbackUserData) -> void { promise.set_value(); };
-    uint64_t recvTag = ((mRecvTagPrefix & 0xFFFFFFFF) << 32) | (static_cast<uint64_t>(ctx.getTag()) & (0xFFFFFFFF));
     auto req = mEndpoint->tagRecv(data, size, ucxx::Tag(recvTag), ucxx::TagMaskFull, false, completionCallback);
     if (!req->isCompleted())
     {
+        // nvbugs/6104831 diagnostic: heartbeat-wrap the blocking future.get()
+        // so a UCX wedge (tagRecv never matches a send) produces periodic
+        // markers naming the specific (connId, wireRecvTag) pair stuck. Same
+        // blocking semantics; no timeout introduced.
+        static constexpr int64_t kDiagHeartbeatSec = 5;
+        std::uint64_t waitCycles = 0;
+        while (future.wait_for(std::chrono::seconds(kDiagHeartbeatSec)) == std::future_status::timeout)
+        {
+            ++waitCycles;
+            TLLM_LOG_INFO(
+                "[DIAG-UCX-RECV-WAIT] connId=%lu peerConnId=%lu fromRequester=%d ctxTag=%d wireRecvTag=%lu "
+                "waitedSec=%lu",
+                mConnectionId, mConnectionIdInPeer, mFromRequester, ctx.getTag(), recvTag,
+                static_cast<unsigned long>(waitCycles * kDiagHeartbeatSec));
+        }
         future.get();
     }
     TLLM_CHECK_WITH_INFO(req->isCompleted(), "recv should be completed");
     // throw if there is error
     req->checkError();
 
+    TLLM_LOG_INFO("[DIAG-UCX-RECV-DONE] connId=%lu peerConnId=%lu fromRequester=%d ctxTag=%d wireRecvTag=%lu",
+        mConnectionId, mConnectionIdInPeer, mFromRequester, ctx.getTag(), recvTag);
     TLLM_LOG_DEBUG(mManager->getRank(),
         "end UcxConnection::recv , mConnectionId: %lu, mConnectionIdInPeer: %lu,fromRequester: %d", mConnectionId,
         mConnectionIdInPeer, mFromRequester);
