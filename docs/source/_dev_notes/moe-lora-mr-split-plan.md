@@ -8,22 +8,37 @@ deleted.
 
 ## Goals
 
-- Split the eager-mode portion of `user/brb/moe-multi-lora` into 3 MRs.
-- Maximize reviewer parallelism: at least two of the three MRs reviewable
-  by different reviewer pools simultaneously.
+- Split the eager-mode portion of `user/brb/moe-multi-lora` into 2 MRs
+  (originally 3 -- helpers and sidecar were folded into a single
+  Python-infrastructure MR; see "Consolidation" below).
+- Maximize reviewer parallelism: the two MRs are reviewable by different
+  reviewer pools simultaneously.
 - Keep CI tax bounded: only one MR should pull a full GPU-test cycle; the
   others should land Python-unit-only changes.
 - Defer all CUDA-graph capture work to a follow-up MR series ("MR #2"),
   not covered by this plan.
 
+## Consolidation (post-original split)
+
+The original split had three MRs: helpers (#1.1), sidecar (#1.2), and the
+feature stack (#1.3). After pushing all three, helpers and sidecar were
+folded into the single `user/brb/moe-lora-helpers` branch on the rationale
+that both are pure-Python pre-feature plumbing reviewed by the same kind
+of reviewer, and that two near-trivial Python-only MRs is more PR overhead
+than warranted. The remote `user/brb/moe-lora-sidecar` branch has been
+deleted; its commit is reachable via `user/brb/moe-multi-lora` and via the
+combined helpers branch. References below to "MR #1.1" now describe the
+combined helpers + sidecar MR; references to "MR #1.2" are removed; "MR
+#1.3" is renumbered to "MR #1.2" but still refers to
+`user/brb/moe-lora-feature`.
+
 ## Branch graph
 
 ```
 origin/main
-├── user/brb/moe-lora-helpers   ← MR #1.1: layout + validation helpers (Python only)
+├── user/brb/moe-lora-helpers   ← MR #1.1: layout + validation helpers + sidecar (Python only)
 │   └── user/brb/moe-lora-feature
-│                                ← MR #1.3: kernel + integration + reference suite
-└── user/brb/moe-lora-sidecar   ← MR #1.2: lora_layout.json sidecar (Python only)
+│                                ← MR #1.2: kernel + integration + reference suite
 ```
 
 `user/brb/moe-multi-lora` (this branch) is the development trunk that
@@ -31,88 +46,74 @@ keeps the entire history including the investigation pair and the
 post-mortem regression suite. None of the MR branches reference this
 branch directly.
 
-## MR #1.1 — `[TRTLLM-12507][feat] add MoE LoRA layout and validation helpers`
+## MR #1.1 — `[TRTLLM-12507][feat] add MoE LoRA layout, validation helpers, and lora_layout.json sidecar`
 
-**Source:** subset of `4407871ce4` (the routed-expert LoRA core).
+**Source:** subset of `4407871ce4` (the routed-expert LoRA core) + all of
+`6e9b10de96` (sidecar). Two commits on the branch.
 
-**Scope (4 files):**
+**Scope (9 files):**
+
+Helper portion (carved from `4407871ce4`):
 - `tensorrt_llm/_torch/peft/lora/moe_layout.py` (new)
 - `tensorrt_llm/_torch/peft/lora/validation.py` (new)
 - `tests/unittest/_torch/lora/test_moe_layout.py` (new)
 - `tests/unittest/_torch/lora/test_moe_lora_validator.py` (new)
 
-**Self-containment:**
-- `moe_layout.py` imports only `torch` + stdlib.
-- `validation.py` imports only `tensorrt_llm.lora_helper.LoraConfig` +
-  stdlib.
-- Both unit-test files import only the helper they exercise + pytest.
-
-**Reviewer pool:** Python reviewer with LoRA familiarity. No GPU, no
-kernel knowledge needed.
-
-**CI footprint:** Python unit tests only. Fast.
-
-**Cherry-pick recipe:**
-
-```bash
-git fetch origin main
-git checkout -b user/brb/moe-lora-helpers origin/main
-git cherry-pick -n 4407871ce4
-# Restore everything except the 4 helper files:
-KEEP='^(tensorrt_llm/_torch/peft/lora/(moe_layout|validation)\.py'
-KEEP+="|tests/unittest/_torch/lora/test_moe_(layout|lora_validator)\.py)$"
-git diff --staged --name-only | grep -vE "$KEEP" \
-  | xargs --no-run-if-empty git restore --staged --worktree --
-git status   # should show only the 4 kept files staged
-git commit -s -m "[TRTLLM-12507][feat] add MoE LoRA layout and validation helpers" \
-  -m "<body>"
-```
-
-## MR #1.2 — `[TRTLLM-12507][feat] add lora_layout.json sidecar for shared-outer MoE LoRA`
-
-**Source:** `6e9b10de96` cherry-picked, with both doc edits dropped --
-the dev-note edit (40 lines in
-`docs/source/_dev_notes/moe-lora-preflight.md`, file does not yet
-exist on `origin/main`) and the user-facing `docs/source/features/lora.md`
-edit (the "lora_layout.json" subsection wraps the wider "Routed-Expert
-MoE LoRA" section that is added by `4407871ce4` in MR #1.3, so the
-subsection has no parent context on `origin/main`). Both doc edits are
-re-added in MR #1.3 alongside the feature itself.
-
-**Scope:**
+Sidecar portion (verbatim from `6e9b10de96` minus its two doc edits):
 - `tensorrt_llm/lora_layout_sidecar.py` (new)
 - `tensorrt_llm/lora_manager.py` (sidecar discovery + plumbing)
 - `tensorrt_llm/_torch/pyexecutor/model_engine.py` (engine wiring)
 - `tests/unittest/_torch/lora/test_lora_layout_sidecar.py` (new)
 - `tests/unittest/others/test_lora_manager.py` (LoraManager sidecar tests)
 
-**Self-containment:** the sidecar lives at the package root
-(`tensorrt_llm/`), not in `_torch/peft/lora/`, so it does not import
-anything from MR #1.1. It can be reviewed before, in parallel with, or
-after MR #1.1.
+The two doc edits inside `6e9b10de96` are intentionally dropped and
+land instead in MR #1.2: the dev-note edit because the file does not
+yet exist on `origin/main`, and the user-facing `docs/source/features/lora.md`
+edit because its "lora_layout.json" subsection wraps the wider
+"Routed-Expert MoE LoRA" section that is added by `4407871ce4` in
+MR #1.2.
 
-**Caveat:** the sidecar's *runtime* usefulness (the kernel actually
-honoring the shared-outer flag) requires `8a9a3746e6` from MR #1.3.
-Until that lands the sidecar is metadata only, but its parsing and
-validation are fully self-contained and unit-tested in this MR.
+**Self-containment:**
+- `moe_layout.py` imports only `torch` + stdlib.
+- `validation.py` imports only `tensorrt_llm.lora_helper.LoraConfig` + stdlib.
+- `lora_layout_sidecar.py` imports only stdlib.
+- The sidecar plumbing in `lora_manager.py` and `model_engine.py` is
+  metadata-only -- the C++ LoRA cache row size is determined by
+  `LoraModule::localTotalSize`, so the loader still replicates the
+  shared tensor across `num_experts`. The flag plumbing is wired
+  end-to-end so MR #1.2's kernel honors it; until MR #1.2 lands, the
+  six kernel flags are accepted but mathematically a no-op against
+  replicated storage.
 
-**Reviewer pool:** model-loading / `LoraManager` owner. Different person
-from the MR #1.1 reviewer in practice.
+**Reviewer pool:** Python reviewer with LoRA familiarity. No GPU, no
+kernel knowledge required. Sidecar plumbing additionally touches
+`LoraManager` and `ModelEngine`, which may pull a model-loading reviewer.
 
 **CI footprint:** Python unit tests only. Fast.
 
-**Cherry-pick recipe:**
+**Recipe:**
 
 ```bash
-git checkout -b user/brb/moe-lora-sidecar origin/main
+git fetch origin main
+git checkout -b user/brb/moe-lora-helpers origin/main
+
+# Commit 1: helpers (subset of 4407871ce4).
+git cherry-pick -n 4407871ce4
+KEEP='^(tensorrt_llm/_torch/peft/lora/(moe_layout|validation)\.py'
+KEEP+="|tests/unittest/_torch/lora/test_moe_(layout|lora_validator)\.py)$"
+git diff --staged --name-only | grep -vE "$KEEP" \
+  | xargs --no-run-if-empty git restore --staged --worktree --
+git commit -s -m "[TRTLLM-12507][feat] add MoE LoRA layout and validation helpers" \
+  -m "<body>"
+
+# Commit 2: sidecar (6e9b10de96 minus both doc edits).
 git cherry-pick 6e9b10de96
-# Conflicts: drop both doc edits (re-added in MR #1.3).
 git rm -f docs/source/_dev_notes/moe-lora-preflight.md
 git checkout origin/main -- docs/source/features/lora.md
 git -c core.editor=true cherry-pick --continue
 ```
 
-## MR #1.3 — `[TRTLLM-12507][feat] add routed-expert LoRA support to fused MoE (eager)`
+## MR #1.2 — `[TRTLLM-12507][feat] add routed-expert LoRA support to fused MoE (eager)`
 
 **Source:** the rest of the eager-mode work, stacked on MR #1.1.
 
@@ -135,7 +136,7 @@ git -c core.editor=true cherry-pick --continue
 
 **Bundling rationale (regression suite stays here):** `3c9060e2dd` is the
 correctness justification for the kernel feature. Splitting it into a
-separate MR #1.4 would make MR #1.3 reviewers take the kernel correctness
+separate MR would make MR #1.2 reviewers take the kernel correctness
 on faith from same-kernel tests alone. Keeping it bundled gives reviewers
 "the kernel is correct because here is the fp32 reference suite that
 agrees with it" inside one PR boundary.
@@ -158,7 +159,7 @@ Expected conflicts at `git cherry-pick 3c9060e2dd` are both in
    reason about the Phase 6 kernel patch). The incoming `3c9060e2dd`
    wording references a `moe_device_lora_env` fixture defined by the
    device-path commits (`83a7e5210c`..`be86076e81`), which are not in
-   MR #1.3. Picking `3c9060e2dd`'s wording (with its function signature
+   MR #1.2. Picking `3c9060e2dd`'s wording (with its function signature
    `(moe_device_lora_env)`) would leave the test referencing an
    undefined fixture.
 
@@ -166,7 +167,7 @@ Expected conflicts at `git cherry-pick 3c9060e2dd` are both in
    plus the `_make_per_expert_lora_scaled` helper and the 10 reference /
    bisection tests. Drop the device-path test in its entirety -- it
    reads `TLLM_MOE_LORA_USE_DEVICE_PATH`, which is wired up by the
-   device-path commits, not MR #1.3. Keep everything from
+   device-path commits, not MR #1.2. Keep everything from
    `_LORA_REFERENCE_SCALE` onward. Tidy up the surrounding section
    comment that originally referenced the dropped device-vs-host
    comparison.
@@ -187,17 +188,16 @@ live on `user/brb/moe-multi-lora` for archival and can be reached via
 
 ## Sequencing and merge order
 
-1. Open MR #1.1 and MR #1.2 simultaneously. They can be reviewed by
-   different reviewers in parallel.
-2. Open MR #1.3 stacked on MR #1.1. Reviewers can begin reading it
-   immediately; merge will block on MR #1.1 landing.
-3. Land in any of these orders: MR #1.1 → MR #1.3 (sequential due to
-   stacking), MR #1.2 (anywhere). MR #1.2 can land before, between, or
-   after the others.
+1. Open MR #1.1 against `main`. Python-only, fast review.
+2. Open MR #1.2 stacked on MR #1.1 (target = `user/brb/moe-lora-helpers`
+   on the fork until MR #1.1 lands; re-target to `main` afterward).
+   Reviewers can begin reading it immediately; merge will block on
+   MR #1.1 landing.
+3. Land MR #1.1 → MR #1.2.
 
 ## Follow-up: MR #2 (CUDA-graph capture)
 
 Out of scope for this plan. Will be a stack of 5 commits
 (`83a7e5210c`, `22f348ef5d`, `7412cdf34e`, `63998d4252`, `be86076e81`)
 plus an audit of the dev note for any leftover Phase 6b.E references,
-opened against `main` after MR #1.3 lands.
+opened against `main` after MR #1.2 lands.
