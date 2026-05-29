@@ -54,11 +54,13 @@ if IS_FLASHINFER_AVAILABLE:
     from ..custom_ops import flashinfer_apply_rope_with_cos_sin_cache_inplace
 
 # Vision RoPE on Qwen2-VL/2.5-VL/3-VL uses head_dim 72/80 which doesn't satisfy
-# FlashInfer's "head_size % 64 == 0" precondition. Fall back to flash_attn's
-# fused Triton rotary kernel: one launch instead of the ~7 elementwise launches
-# of the PyTorch path (mul x4, add/sub x2, cat x1).
-from flash_attn.ops.triton.rotary import \
-    apply_rotary as _flash_attn_apply_rotary  # type: ignore
+# FlashInfer's "head_size % 64 == 0" precondition. Prefer flash_attn's fused
+# Triton rotary kernel when available; SBSA CI images may not package flash_attn.
+try:
+    from flash_attn.ops.triton.rotary import \
+        apply_rotary as _flash_attn_apply_rotary  # type: ignore
+except ImportError:
+    _flash_attn_apply_rotary = None
 
 from ..modules.gated_mlp import GatedMLP
 from ..modules.rotary_embedding import MRotaryEmbedding, RotaryEmbedding
@@ -720,16 +722,34 @@ class Qwen2_5_VLVisionAttention(Attention):
         q = q.view(seq_len, -1, self.head_dim)
         k = k.view(seq_len, -1, self.head_dim)
         v = v.view(seq_len, -1, self.head_dim)
-        # flash_attn Triton kernel: single launch per tensor. cos/sin
-        # are expected as `[seqlen, head_dim/2]`. The PyTorch path
-        # built `RotaryEmbedding.apply_rotary_pos_emb` with cos/sin
-        # already in that layout (see `get_rotary_pos_emb_window_data`).
-        # The kernel takes 4D `(batch, seq, nheads, headdim)`; add a
-        # batch dim, run in-place, then drop it.
-        q4 = q.unsqueeze(0)
-        k4 = k.unsqueeze(0)
-        _flash_attn_apply_rotary(q4, cos, sin, interleaved=False, inplace=True)
-        _flash_attn_apply_rotary(k4, cos, sin, interleaved=False, inplace=True)
+        if _flash_attn_apply_rotary is None:
+            q = RotaryEmbedding.apply_rotary_pos_emb(q.unsqueeze(0),
+                                                     cos,
+                                                     sin,
+                                                     unsqueeze_dim=1).squeeze(0)
+            k = RotaryEmbedding.apply_rotary_pos_emb(k.unsqueeze(0),
+                                                     cos,
+                                                     sin,
+                                                     unsqueeze_dim=1).squeeze(0)
+        else:
+            # flash_attn Triton kernel: single launch per tensor. cos/sin
+            # are expected as `[seqlen, head_dim/2]`. The PyTorch path
+            # built `RotaryEmbedding.apply_rotary_pos_emb` with cos/sin
+            # already in that layout (see `get_rotary_pos_emb_window_data`).
+            # The kernel takes 4D `(batch, seq, nheads, headdim)`; add a
+            # batch dim, run in-place, then drop it.
+            q4 = q.unsqueeze(0)
+            k4 = k.unsqueeze(0)
+            _flash_attn_apply_rotary(q4,
+                                     cos,
+                                     sin,
+                                     interleaved=False,
+                                     inplace=True)
+            _flash_attn_apply_rotary(k4,
+                                     cos,
+                                     sin,
+                                     interleaved=False,
+                                     inplace=True)
         q, k, v = q.reshape(seq_len, -1), k.reshape(seq_len,
                                                     -1), v.reshape(seq_len, -1)
         return q, k, v
