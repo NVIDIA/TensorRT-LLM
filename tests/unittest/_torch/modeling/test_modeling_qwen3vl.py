@@ -169,17 +169,13 @@ class TestQwen3VL(TestModelingMultimodal):
             if num_cached_tokens_per_seq is None:
                 begin_offsets = [0] * len(multimodal_params_list)
             elif isinstance(num_cached_tokens_per_seq, int):
-                begin_offsets = [num_cached_tokens_per_seq] * len(
-                    multimodal_params_list)
+                begin_offsets = [num_cached_tokens_per_seq] * len(multimodal_params_list)
             else:
                 begin_offsets = list(num_cached_tokens_per_seq)
             mrope_position_ids = []
-            for multimodal_param, begin in zip(multimodal_params_list,
-                                               begin_offsets):
-                full_mrope = multimodal_param.multimodal_data["mrope_config"][
-                    "mrope_position_ids"]
-                mrope_position_ids.append(full_mrope[:, :,
-                                                     begin:begin + chunk_len])
+            for multimodal_param, begin in zip(multimodal_params_list, begin_offsets):
+                full_mrope = multimodal_param.multimodal_data["mrope_config"]["mrope_position_ids"]
+                mrope_position_ids.append(full_mrope[:, :, begin : begin + chunk_len])
             position_ids = torch.cat(mrope_position_ids, dim=-1)
             position_ids = position_ids.cuda()
             trtllm_inputs["position_ids"] = position_ids

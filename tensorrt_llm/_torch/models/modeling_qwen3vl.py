@@ -1016,7 +1016,6 @@ class Qwen3VisionModel(torch.nn.Module):
     def forward(
         self, pixel_values: torch.Tensor, grid_thw: torch.Tensor, **kwargs
     ) -> Tuple[torch.Tensor, List[torch.Tensor]]:
-
         grid_rows = grid_thw.tolist()
         seq_lens: List[int] = []
         for t, h, w in grid_rows:
@@ -1339,12 +1338,10 @@ class Qwen3VLModelBase(PreTrainedModel):
         # Attention kernel indexes mrope cos/sin by batch-flat per-token
         # entry, so one ``get_cos_sin(position_ids)`` over the stitched
         # ``(3, 1, total_tokens)`` covers every batch entry directly.
-        if position_ids is not None \
-                and position_ids.shape[-1] > num_generation_requests:
+        if position_ids is not None and position_ids.shape[-1] > num_generation_requests:
             cos, sin = self.rotary_emb.get_cos_sin(position_ids)
-            mrope_config["mrope_rotary_cos_sin"] = (
-                torch.stack((cos, sin), dim=-1)
-                .reshape(cos.shape[0], -1)
+            mrope_config["mrope_rotary_cos_sin"] = torch.stack((cos, sin), dim=-1).reshape(
+                cos.shape[0], -1
             )
         for multimodal_param in multimodal_params[num_context_requests:]:
             if multimodal_param.multimodal_data.get("mrope_config") is not None:
@@ -1441,10 +1438,7 @@ class Qwen3VLModelBase(PreTrainedModel):
         # (e.g., direct ``forward`` calls in unit tests).
         text_token_indices = kwargs.get("text_token_indices")
         mm_token_indices = kwargs.get("mm_token_indices")
-        if (
-            len(mm_embeds) > 0
-            and (text_token_indices is None or mm_token_indices is None)
-        ):
+        if len(mm_embeds) > 0 and (text_token_indices is None or mm_token_indices is None):
             text_token_indices, mm_token_indices = filter_mm_token_from_input_ids(
                 input_ids,
                 vocab_size=self.llm.model.embed_tokens.num_embeddings,

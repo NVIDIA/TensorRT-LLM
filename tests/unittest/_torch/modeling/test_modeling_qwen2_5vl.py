@@ -161,8 +161,8 @@ class TestQwen2_5_VL(TestModelingMultimodal):
             if num_cached_tokens_per_seq is None:
                 begin_offsets = [0] * len(multimodal_params_list)
             elif isinstance(num_cached_tokens_per_seq, int):
-                begin_offsets = [num_cached_tokens_per_seq] * len(
-                    multimodal_params_list)
+                begin_offsets = [num_cached_tokens_per_seq
+                                 ] * len(multimodal_params_list)
             else:
                 begin_offsets = list(num_cached_tokens_per_seq)
             mrope_position_ids = []

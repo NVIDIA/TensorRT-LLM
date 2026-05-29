@@ -659,8 +659,8 @@ class Qwen2_5_VLVisionAttention(Attention):
         # Unregister so ``forward_impl`` falls back to the eager path
         # that uses vision's own ``attn_metadata``.
         if self.register_to_config:
-            model_config.extra_attrs.get("attn_layers", {}).pop(
-                self.layer_idx_str, None)
+            model_config.extra_attrs.get("attn_layers",
+                                         {}).pop(self.layer_idx_str, None)
             self.register_to_config = False
 
     def apply_rope(self,
@@ -1250,6 +1250,7 @@ class Qwen2VLModelBase(PreTrainedModel):
             is_neox=pos_embd_params.is_neox,
             mrope_section=pos_embd_params.mrope_section,
         ).to('cuda')
+
     def load_weights(self, weights, weight_mapper: BaseWeightMapper):
         pass
 
@@ -1274,10 +1275,8 @@ class Qwen2VLModelBase(PreTrainedModel):
                 and position_ids.shape[-1] > num_generation_requests:
             with nvtx_range("Qwen2.5-VL get_cos_sin"):
                 cos, sin = self.rotary_emb.get_cos_sin(position_ids)
-                mrope_config['mrope_rotary_cos_sin'] = (
-                    torch.stack((cos, sin), dim=-1)
-                    .reshape(cos.shape[0], -1)
-                )
+                mrope_config['mrope_rotary_cos_sin'] = (torch.stack(
+                    (cos, sin), dim=-1).reshape(cos.shape[0], -1))
 
         for multimodal_param in multimodal_params[num_context_requests:]:
             if multimodal_param.multimodal_data.get('mrope_config') is not None:
