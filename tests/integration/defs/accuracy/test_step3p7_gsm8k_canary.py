@@ -359,8 +359,8 @@ def _spawn_per_config_subprocess(args, cg: bool, overlap: bool) -> int:
 def main(argv=None) -> int:
     args = parse_args(argv)
 
-    # See `test_step3p7_parity.py::_torchrun_rank_gate` — torchrun ranks > 0
-    # exit early to avoid duplicate LLM creation on the same GPUs.
+    # torchrun ranks > 0 exit early to avoid duplicate LLM creation on the
+    # same GPUs.
     rank_str = os.environ.get("RANK") or os.environ.get("LOCAL_RANK") or "0"
     try:
         rank_n = int(rank_str)

@@ -222,9 +222,8 @@ def _device_names():
 def main(argv=None) -> int:
     args = parse_args(argv)
 
-    # See `test_step3p7_parity.py::_torchrun_rank_gate` — duplicate Python
-    # processes (one per torchrun rank) would each create their own LLM with
-    # internal MPI and OOM the box.  Idle ranks >0 here.
+    # Duplicate Python processes (one per torchrun rank) would each create
+    # their own LLM with internal MPI and OOM the box.  Idle ranks >0 here.
     rank_str = os.environ.get("RANK") or os.environ.get("LOCAL_RANK") or "0"
     try:
         rank_n = int(rank_str)
