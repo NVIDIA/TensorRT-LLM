@@ -5,6 +5,7 @@ The following is a table of supported models for the PyTorch backend:
 
 | Architecture                         | Model                              | HuggingFace Example                          |
 | ------------------------------------ | ---------------------------------- | -------------------------------------------- |
+| `AfmoeForCausalLM`                   | Arcee Foundation MoE (Trinity)     | `arcee-ai/Trinity-Mini`                      |
 | `BertForSequenceClassification`      | BERT-based                         | `textattack/bert-base-uncased-yelp-polarity` |
 | `Cohere2ForCausalLM`                 | Command A                          | `CohereLabs/c4ai-command-a-03-2025`          |
 | `DeciLMForCausalLM`                  | Nemotron                           | `nvidia/Llama-3_1-Nemotron-51B-Instruct`     |

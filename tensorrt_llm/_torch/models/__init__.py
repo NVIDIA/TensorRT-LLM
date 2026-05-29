@@ -34,7 +34,8 @@ from .modeling_nemotron_nano import NemotronH_Nano_VL_V2
 from .modeling_nemotron_nas import NemotronNASForCausalLM
 from .modeling_phi3 import Phi3ForCausalLM
 from .modeling_phi4mm import Phi4MMForCausalLM
-from .modeling_qwen import Qwen2ForCausalLM, Qwen2ForProcessRewardModel, Qwen2ForRewardModel
+from .modeling_qwen import (Qwen2ForCausalLM, Qwen2ForProcessRewardModel,
+                            Qwen2ForRewardModel)
 from .modeling_qwen2vl import Qwen2_5_VLModel, Qwen2VLModel
 from .modeling_qwen3 import Qwen3ForCausalLM
 from .modeling_qwen3_5 import Qwen3_5ForCausalLM, Qwen3_5MoeForCausalLM
@@ -107,8 +108,7 @@ if transformers.__version__ >= "4.45.1":
     __all__.append("MllamaForConditionalGeneration")
 else:
     print(
-        "Failed to import MllamaForConditionalGeneration as "
-        f"transformers.__version__ {transformers.__version__} < 4.45.1"
+        f"Failed to import MllamaForConditionalGeneration as transformers.__version__ {transformers.__version__} < 4.45.1"
     )
 
 # Gemma4 requires transformers>=5.5.0 (native Gemma4 config/model classes).

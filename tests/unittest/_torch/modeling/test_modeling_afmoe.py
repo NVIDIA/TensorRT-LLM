@@ -44,6 +44,16 @@ from tensorrt_llm.llmapi import MoeConfig
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
+try:
+    # AFMoE landed in transformers >= 5.8. When the installed transformers is
+    # older the parity test below is skipped (the rest of the suite still runs).
+    from transformers import AfmoeConfig as HFAfmoeConfig
+    from transformers.models.afmoe.modeling_afmoe import AfmoeForCausalLM as HFAfmoeForCausalLM
+
+    HAS_HF_AFMOE = True
+except ImportError:
+    HAS_HF_AFMOE = False
+
 WINDOW_SIZE = 4
 NUM_HIDDEN_LAYERS = 4
 NUM_DENSE_LAYERS = 1
@@ -175,14 +185,33 @@ class TestAfmoeWeightMapper(unittest.TestCase):
         self.assertIn("model.layers.2.mlp.gate.e_score_correction_bias", result)
         self.assertNotIn("model.layers.2.mlp.expert_bias", result)
 
-    def test_attention_gate_proj_unchanged(self):
+    def test_attention_gate_fused_into_q(self):
+        # AfmoeAttention uses attn_output_gate=True, so the separate gate_proj
+        # is interleaved per head into q_proj and the gate_proj key is dropped.
+        num_heads, head_dim, hidden = 8, 32, 256
+        self.mapper._model = Mock()
+        self.mapper._model.config = Mock(num_attention_heads=num_heads)
+
+        q = torch.arange(num_heads * head_dim * hidden, dtype=torch.float32).reshape(
+            num_heads * head_dim, hidden
+        )
+        gate = q + 0.5
         fake_weights = {
-            "model.layers.0.self_attn.gate_proj.weight": torch.zeros(1),
+            "model.layers.0.self_attn.q_proj.weight": q,
+            "model.layers.0.self_attn.gate_proj.weight": gate,
         }
         result = self.mapper.preprocess_weights(fake_weights)
-        self.assertIn("model.layers.0.self_attn.gate_proj.weight", result)
 
-    def test_qkv_keys_unchanged_by_preprocess(self):
+        self.assertNotIn("model.layers.0.self_attn.gate_proj.weight", result)
+        fused = result["model.layers.0.self_attn.q_proj.weight"]
+        self.assertEqual(fused.shape, (2 * num_heads * head_dim, hidden))
+        # Per head the layout is [q_head, gate_head]: first head_dim rows are q,
+        # next head_dim rows are gate.
+        torch.testing.assert_close(fused[:head_dim], q[:head_dim])
+        torch.testing.assert_close(fused[head_dim : 2 * head_dim], gate[:head_dim])
+
+    def test_qkv_keys_unchanged_without_gate(self):
+        # Without a gate_proj key (e.g. partial weight dicts), q/k/v are untouched.
         fake_weights = {
             "model.layers.0.self_attn.q_proj.weight": torch.zeros(1),
             "model.layers.0.self_attn.k_proj.weight": torch.zeros(1),
@@ -416,11 +445,12 @@ class TestAfmoeTPAttributes(unittest.TestCase):
         model_config = ModelConfig(pretrained_config=afmoe_config, mapping=mapping)
         return AfmoeForCausalLM(model_config)
 
-    def test_gate_proj_is_column_parallel(self):
+    def test_qkv_is_column_parallel_with_output_gate(self):
         model = self._build_model(tp_size=1)
         for layer in model.model.layers:
-            gate_proj = layer.self_attn.gate_proj
-            self.assertEqual(gate_proj.tp_mode, TensorParallelMode.COLUMN)
+            attn = layer.self_attn
+            self.assertTrue(attn.attn_output_gate)
+            self.assertEqual(attn.qkv_proj.tp_mode, TensorParallelMode.COLUMN)
 
     def test_moe_experts_no_reduce(self):
         model = self._build_model(tp_size=1)
@@ -444,34 +474,30 @@ class TestAfmoeTPAttributes(unittest.TestCase):
                     layer.mlp.allreduce, "MoE layer should NOT have allreduce for tp_size=1"
                 )
 
-    def test_gate_proj_output_matches_q_size(self):
+    def test_qkv_output_includes_fused_gate(self):
+        # With attn_output_gate=True the query slot is doubled (q + gate) and
+        # fused into qkv_proj, so its local output is 2*q_size + 2*kv_size.
         model = self._build_model(tp_size=2)
-        config = model.config
-        head_dim = config.hidden_size // config.num_attention_heads
-        expected_local_out = (config.num_attention_heads // 2) * head_dim
-
         for layer in model.model.layers:
-            gate_proj = layer.self_attn.gate_proj
-            actual_out = gate_proj.weight.shape[0]
+            attn = layer.self_attn
+            expected_out = attn.q_size * 2 + 2 * attn.kv_size
+            actual_out = attn.qkv_proj.weight.shape[0]
             self.assertEqual(
                 actual_out,
-                expected_local_out,
-                f"gate_proj local output should be "
-                f"num_heads_per_tp * head_dim = {expected_local_out}, "
-                f"got {actual_out}",
+                expected_out,
+                f"qkv_proj local output should be 2*q_size + 2*kv_size = "
+                f"{expected_out}, got {actual_out}",
             )
 
-    def test_attention_dp_uses_unsharded_gate_and_mlp_modules(self):
+    def test_attention_dp_uses_unsharded_qkv_and_mlp_modules(self):
         model = self._build_attention_dp_model(tp_size=2)
-        config = model.config
-        expected_gate_out = config.num_attention_heads * (
-            config.hidden_size // config.num_attention_heads
-        )
 
         for layer in model.model.layers:
-            gate_proj = layer.self_attn.gate_proj
-            self.assertEqual(gate_proj.tp_size, 1)
-            self.assertEqual(gate_proj.weight.shape[0], expected_gate_out)
+            attn = layer.self_attn
+            self.assertEqual(attn.qkv_proj.tp_size, 1)
+            # Unsharded: full heads, q slot doubled by the output gate.
+            expected_out = attn.q_size * 2 + 2 * attn.kv_size
+            self.assertEqual(attn.qkv_proj.weight.shape[0], expected_out)
 
             if layer.moe_enabled:
                 self.assertIsNone(layer.mlp.allreduce)
@@ -489,10 +515,163 @@ class TestAfmoeTPAttributes(unittest.TestCase):
             attn = layer.self_attn
             if layer_types[i] == "sliding_attention":
                 self.assertTrue(attn.is_local_attention)
-                self.assertEqual(attn._attention_window_size, WINDOW_SIZE)
+                self.assertEqual(attn.attention_window_size, WINDOW_SIZE)
             else:
                 self.assertFalse(attn.is_local_attention)
-                self.assertIsNone(attn._attention_window_size)
+                self.assertIsNone(attn.attention_window_size)
+
+
+@unittest.skipUnless(
+    HAS_HF_AFMOE,
+    "transformers>=5.8 with native AFMoE (transformers.models.afmoe) is required",
+)
+@unittest.skipUnless(torch.cuda.is_available(), "needs CUDA")
+class TestAfmoeAllCloseToHF(unittest.TestCase):
+    """Compare TRT-LLM AFMoE context-phase logits against the HF reference.
+
+    Loads the HF model's weights into the TRT-LLM model via AfmoeHfWeightMapper,
+    exercising the per-head q/gate fusion (attn_output_gate) and the HF
+    fused-expert -> per-expert conversion, then checks logit parity.
+    """
+
+    # Field names follow the HF AfmoeConfig schema (released-checkpoint names).
+    HF_CONFIG = {
+        "hidden_size": 256,
+        "intermediate_size": 512,
+        "moe_intermediate_size": 128,
+        "head_dim": 32,
+        "num_attention_heads": 8,
+        "num_key_value_heads": 2,
+        "num_hidden_layers": NUM_HIDDEN_LAYERS,
+        "num_dense_layers": NUM_DENSE_LAYERS,
+        "num_experts": 8,
+        "num_experts_per_tok": 2,
+        "num_shared_experts": 1,
+        "global_attn_every_n_layers": 4,
+        "sliding_window": WINDOW_SIZE,
+        "max_position_embeddings": 2048,
+        "rms_norm_eps": 1e-5,
+        "rope_theta": 10000,
+        "route_scale": 1.0,
+        "route_norm": True,
+        "score_func": "sigmoid",
+        "vocab_size": 1024,
+        "hidden_act": "silu",
+        "tie_word_embeddings": False,
+    }
+
+    @staticmethod
+    def _convert_hf_experts(state_dict, moe_intermediate_size):
+        """Split HF fused 3D expert params into per-expert gate/up/down weights.
+
+        HF-native AFMoE stores experts as ``experts.gate_up_proj``
+        ``[num_experts, 2 * moe_inter, hidden]`` and ``experts.down_proj``
+        ``[num_experts, hidden, moe_inter]``; AfmoeHfWeightMapper expects the
+        released-checkpoint layout with separate per-expert matrices.
+        """
+        converted = dict(state_dict)
+        gate_up_keys = [k for k in state_dict if k.endswith(".experts.gate_up_proj")]
+        for gate_up_key in gate_up_keys:
+            prefix = gate_up_key[: -len(".gate_up_proj")]
+            gate_up = converted.pop(gate_up_key)
+            down = converted.pop(prefix + ".down_proj")
+            for expert_idx in range(gate_up.shape[0]):
+                converted[f"{prefix}.{expert_idx}.gate_proj.weight"] = gate_up[expert_idx][
+                    :moe_intermediate_size
+                ].contiguous()
+                converted[f"{prefix}.{expert_idx}.up_proj.weight"] = gate_up[expert_idx][
+                    moe_intermediate_size:
+                ].contiguous()
+                converted[f"{prefix}.{expert_idx}.down_proj.weight"] = down[expert_idx].contiguous()
+        return converted
+
+    @torch.no_grad()
+    def test_afmoe_allclose_to_hf(self):
+        from tensorrt_llm._torch.models.checkpoints.hf.afmoe_weight_mapper import (
+            AfmoeHfWeightMapper,
+        )
+
+        torch.manual_seed(0)
+        device = torch.device("cuda")
+        dtype = torch.bfloat16
+
+        hf_config = HFAfmoeConfig(dtype="float32", **self.HF_CONFIG)
+        hf_model = HFAfmoeForCausalLM(hf_config).to(dtype).to(device).eval()
+
+        # TRT-LLM needs a couple of routing fields that the HF schema names
+        # differently; provide both so AfmoeConfig validates and builds.
+        trt_config_dict = dict(self.HF_CONFIG)
+        trt_config_dict.update(
+            architectures=["AfmoeForCausalLM"],
+            model_type="afmoe",
+            dtype="bfloat16",
+            n_group=1,
+            topk_group=1,
+            scoring_func=self.HF_CONFIG["score_func"],
+            norm_topk_prob=self.HF_CONFIG["route_norm"],
+        )
+        afmoe_config = AfmoeConfig.from_dict(trt_config_dict)
+        model_config = ModelConfig(pretrained_config=afmoe_config)
+        model = AfmoeForCausalLM(model_config).to(dtype).to(device)
+
+        weights = self._convert_hf_experts(
+            hf_model.state_dict(), self.HF_CONFIG["moe_intermediate_size"]
+        )
+        weights = {k: v.to(dtype) for k, v in weights.items()}
+
+        weight_mapper = AfmoeHfWeightMapper()
+        weight_mapper.init_model_and_config(model, model_config)
+        model.load_weights(weights, weight_mapper)
+        if hasattr(model, "post_load_weights"):
+            model.post_load_weights()
+
+        # Short context: input_len < sliding_window so sliding == full attention.
+        input_len = WINDOW_SIZE - 1
+        input_ids = torch.tensor([101, 202, 303][:input_len], dtype=torch.int32, device=device)
+        position_ids = torch.arange(input_len, dtype=torch.int32, device=device).unsqueeze(0)
+
+        num_blocks, tokens_per_block = 4, 128
+        kv_cache_manager = KVCacheManager(
+            KvCacheConfig(max_tokens=num_blocks * tokens_per_block),
+            tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF,
+            num_layers=hf_config.num_hidden_layers,
+            num_kv_heads=hf_config.num_key_value_heads,
+            head_dim=hf_config.head_dim,
+            tokens_per_block=tokens_per_block,
+            max_seq_len=num_blocks * tokens_per_block,
+            max_batch_size=1,
+            mapping=Mapping(world_size=1, tp_size=1, rank=0),
+            dtype=tensorrt_llm.bindings.DataType.BF16,
+        )
+        kv_cache_manager.add_dummy_requests([0], [input_len])
+        metadata_cls = get_attention_backend(model_config.attn_backend).Metadata
+        attn_metadata = metadata_cls(
+            seq_lens=torch.tensor([input_len], dtype=torch.int),
+            num_contexts=1,
+            kv_cache_params=KVCacheParams(use_cache=True, num_cached_tokens_per_seq=[0]),
+            kv_cache_manager=kv_cache_manager,
+            request_ids=[0],
+            prompt_lens=[input_len],
+            max_num_requests=1,
+            max_num_tokens=8192,
+        )
+
+        hf_position_ids = position_ids.to(torch.long)
+        with torch.inference_mode():
+            attn_metadata.prepare()
+            logits = model.forward(
+                input_ids=input_ids, position_ids=position_ids, attn_metadata=attn_metadata
+            )
+            ref = hf_model.forward(
+                input_ids=input_ids.unsqueeze(0).long(),
+                position_ids=hf_position_ids,
+                use_cache=False,
+            )
+
+        # Loose tolerance: bf16 + token-choice MoE routing amplify per-logit
+        # noise (same rationale as the EXAONE-MoE parity test).
+        torch.testing.assert_close(logits, ref.logits[:, -1].float(), atol=1.0, rtol=0.5)
+        kv_cache_manager.shutdown()
 
 
 if __name__ == "__main__":

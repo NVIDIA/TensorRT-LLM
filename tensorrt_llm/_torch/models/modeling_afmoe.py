@@ -34,24 +34,18 @@ from torch import nn
 from transformers import AutoConfig, PretrainedConfig
 
 from tensorrt_llm.functional import PositionEmbeddingType
-from tensorrt_llm.mapping import Mapping
 
 from ...logger import logger
 from ..attention_backend import AttentionMetadata
-from ..attention_backend.interface import (
-    PositionalEmbeddingParams,
-    PredefinedAttentionMask,
-    RopeParams,
-)
+from ..attention_backend.interface import PositionalEmbeddingParams, RopeParams
 from ..distributed import AllReduce
 from ..model_config import ModelConfig
-from ..modules.attention import Attention
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
 from ..modules.fused_moe import DeepSeekV3MoeRoutingMethod, create_moe
 from ..modules.fused_moe.routing import Deepseekv3RoutingImpl
 from ..modules.gated_mlp import GatedMLP
-from ..modules.linear import Linear, TensorParallelMode
+from ..modules.qk_norm_attention import QKNormRoPEAttention
 from ..modules.rms_norm import RMSNorm
 from ..utils import AuxStreamType
 from .modeling_utils import DecoderModel, DecoderModelForCausalLM, register_auto_model
@@ -85,23 +79,6 @@ def _validate_routing_config(config: PretrainedConfig) -> None:
             "AFMoE implementation assumes normalized top-k probabilities "
             "(norm_topk_prob=True / route_norm=True), but config disables it."
         )
-
-
-def _get_attention_dp_mapping(mapping: Mapping) -> Mapping:
-    """Return the effective TP=1 mapping used by attention-DP modules."""
-    if not mapping.enable_attention_dp:
-        return mapping
-
-    return Mapping(
-        world_size=mapping.world_size,
-        rank=mapping.rank,
-        gpus_per_node=mapping.gpus_per_node,
-        tp_size=1,
-        pp_size=mapping.pp_size * mapping.tp_size,
-        cp_size=mapping.cp_size,
-        cp_config=mapping.cp_config,
-        enable_attention_dp=mapping.enable_attention_dp,
-    )
 
 
 class AfmoeGate(nn.Module):
@@ -259,11 +236,13 @@ class AfmoeMoE(nn.Module):
         return final_output
 
 
-class AfmoeAttention(Attention):
-    """Attention with Q/K norm, per-layer sliding window, gated output.
+class AfmoeAttention(QKNormRoPEAttention):
+    """Attention with Q/K norm, per-layer sliding window, and a sigmoid output gate.
 
-    Uses a separate gate_proj linear (not fused into QKV) to gate the
-    attention output with sigmoid, matching the HF checkpoint layout.
+    Inherits QK-norm + RoPE handling from ``QKNormRoPEAttention``. The output
+    gate is fused into the QKV projection (``attn_output_gate=True``), and RoPE
+    is applied only on local (sliding-window) layers, matching the HF
+    ``AfmoeAttention`` reference.
     """
 
     def __init__(
@@ -278,17 +257,14 @@ class AfmoeAttention(Attention):
             and layer_idx < len(layer_types)
             and layer_types[layer_idx] == "sliding_attention"
         )
-        self._attention_window_size = config.sliding_window if self.is_local_attention else None
+        self.attention_window_size = config.sliding_window if self.is_local_attention else None
 
-        rope_params = RopeParams.from_config(config) if self.is_local_attention else None
-        pos_embd_params = (
-            PositionalEmbeddingParams(
+        pos_embd_params = None
+        if self.is_local_attention:
+            pos_embd_params = PositionalEmbeddingParams(
                 type=PositionEmbeddingType.rope_gpt_neox,
-                rope=rope_params,
+                rope=RopeParams.from_config(config),
             )
-            if self.is_local_attention
-            else None
-        )
 
         super().__init__(
             hidden_size=config.hidden_size,
@@ -297,55 +273,14 @@ class AfmoeAttention(Attention):
             max_position_embeddings=getattr(config, "max_position_embeddings", 131072),
             bias=False,
             pos_embd_params=pos_embd_params,
+            fuse_qk_norm_rope=False,
+            skip_rope=not self.is_local_attention,
+            attn_output_gate=True,
+            is_qk_norm=True,
             layer_idx=layer_idx,
             dtype=config.torch_dtype,
             config=model_config,
         )
-
-        self.q_norm = RMSNorm(
-            hidden_size=self.head_dim,
-            eps=config.rms_norm_eps,
-            dtype=config.torch_dtype,
-        )
-        self.k_norm = RMSNorm(
-            hidden_size=self.head_dim,
-            eps=config.rms_norm_eps,
-            dtype=config.torch_dtype,
-        )
-
-        self.gate_proj = Linear(
-            config.hidden_size,
-            config.num_attention_heads * self.head_dim,
-            bias=False,
-            dtype=config.torch_dtype,
-            mapping=_get_attention_dp_mapping(model_config.mapping),
-            tensor_parallel_mode=TensorParallelMode.COLUMN,
-            gather_output=False,
-            quant_config=model_config.get_quant_config(),
-            skip_create_weights_in_init=model_config.skip_create_weights_in_init,
-            allreduce_strategy=model_config.allreduce_strategy,
-            force_dynamic_quantization=model_config.force_dynamic_quantization,
-            use_cute_dsl_blockscaling_mm=model_config.use_cute_dsl_blockscaling_mm,
-        )
-
-    def apply_rope(
-        self,
-        q: torch.Tensor,
-        k: Optional[torch.Tensor],
-        v: Optional[torch.Tensor],
-        position_ids: torch.Tensor,
-    ):
-        q, k, v = self.split_qkv(q, k, v)
-
-        q_shape = q.shape
-        k_shape = k.shape
-        q = self.q_norm(q.reshape(-1, self.num_heads, self.head_dim)).reshape(q_shape)
-        k = self.k_norm(k.reshape(-1, self.num_key_value_heads, self.head_dim)).reshape(k_shape)
-
-        if self.is_local_attention and not self.rope_fusion and position_ids is not None:
-            q, k = self.rotary_emb(position_ids, [q, k])
-
-        return q, k, v
 
     def forward(
         self,
@@ -354,29 +289,13 @@ class AfmoeAttention(Attention):
         attn_metadata: AttentionMetadata,
         **kwargs,
     ) -> torch.Tensor:
-        gate = self.gate_proj(hidden_states)
-
-        qkv = self.qkv_proj(hidden_states)
-        q, k, v = qkv, None, None
-
-        q, k, v = self.apply_rope(q, k, v, position_ids)
-        q, k, v = self.convert_qkv(q, k, v)
-
-        attn_output = self.forward_impl(
-            q,
-            k,
-            v,
-            attn_metadata,
-            attention_mask=PredefinedAttentionMask.CAUSAL,
-            attention_window_size=self._attention_window_size,
-            attention_mask_data=None,
-            mrope_config=None,
+        return super().forward(
+            position_ids=position_ids,
+            hidden_states=hidden_states,
+            attn_metadata=attn_metadata,
+            attention_window_size=self.attention_window_size,
+            **kwargs,
         )
-
-        attn_output = attn_output * torch.sigmoid(gate)
-
-        attn_output = self.o_proj(attn_output)
-        return attn_output
 
 
 class AfmoeDecoderLayer(DecoderLayer):
