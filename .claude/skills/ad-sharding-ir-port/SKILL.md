@@ -35,8 +35,10 @@ You MAY introduce ONLY the following changes:
   - `torch.split(...)` / `torch.split_with_sizes(...)` → `torch.ops.auto_deploy.split_with_sizes(...)`
 - **A2. Sharding-hint kwargs added** to call sites of: `torch_moe`, `torch_ssm`, `torch_gated_delta_rule`, `torch_causal_conv1d`, `torch_rmsnorm_gated`, `torch_mla`, `torch_linear_simple`, `auto_deploy.split_with_sizes`, `auto_deploy.view`. Allowed kwargs: `tp_mode`, `layer_type`, `output_sizes`, `tp_min_local_shape`, `tp_scaled_dim`, `shardable`, `enable_sharding`.
 - **A3. Inserting `torch.ops.auto_deploy.all_reduce(..., layer_type=...)`** after rowwise projections / at MoE merge points (single all_reduce after routed + shared sums).
-- **A4. Adding `import tensorrt_llm._torch.auto_deploy.custom_ops  # noqa: F401`** side-effect import at the top if not already present.
-- **A5. The module docstring update** describing the sharding strategy.
+- **A4. Docstring updates:**
+  - Module-level: a **single-line** mention at the top that this file uses sharding IR. Sharding IR is the AutoDeploy default — do not advocate or explain it at length. Example: `"""Llama 3 model (sharding IR)."""` followed by the existing source-of-truth / HF link block, untouched.
+  - Per-class (MLP, Attention, MoE block, etc.): keep / add a short `Sharding strategy:` block listing what each projection maps to (`colwise` / `rowwise` / `all_reduce` / `tp_scaled_dim` etc.). These are load-bearing — they orient reviewers to what the hints do.
+  - Do **not** add a `Shardable custom ops used:` trailer to the module docstring. Do **not** add a `from ... import custom_ops  # noqa: F401` side-effect import — it is redundant; `torch.ops.auto_deploy.*` is already registered by importing the `tensorrt_llm._torch.auto_deploy` package, which any test/runtime path does. Older reference models (`modeling_qwen3.py`, `modeling_deepseek.py`, `modeling_nemotron_h.py`, `modeling_qwen3_5_moe.py`) still carry the verbose docstring and the redundant import; do not replicate that.
 
 **FORBIDDEN (everything else, including but not limited to):**
 
@@ -71,15 +73,11 @@ Before editing, ensure the file is committed so you can diff against the origina
 git stash  # or commit — ensure a clean baseline to diff against
 ```
 
-### Step 2: Add the custom_ops side-effect import
+### Step 2: Do NOT add a `custom_ops` side-effect import
 
-If not already present at the top of the file:
+`torch.ops.auto_deploy.*` is already registered by importing the `tensorrt_llm._torch.auto_deploy` package, which any test or runtime path does before loading a modeling file. A per-file `from ... import custom_ops  # noqa: F401` line is redundant — do not add one. (Some historical reference models still carry that line; ignore them.)
 
-```python
-import tensorrt_llm._torch.auto_deploy.custom_ops  # noqa: F401 -- register all ops
-```
-
-Do **not** add global `SHARD_*` flags. Layer-level control uses the `layer_type` hint on each op and `shard_layers` in YAML.
+Do **not** add global `SHARD_*` flags either. Layer-level control uses the `layer_type` hint on each op and `shard_layers` in YAML.
 
 ### Step 3: Replace linear projections
 
@@ -209,8 +207,7 @@ Then classify every hunk into one of the following categories (defined in Step 0
 | **A1** | yes | Op substitution (`linear` / `view` / `split`) |
 | **A2** | yes | Sharding-hint kwarg added (`tp_mode`, `layer_type`, `output_sizes`, `tp_min_local_shape`, `tp_scaled_dim`, `shardable`, `enable_sharding`) |
 | **A3** | yes | `auto_deploy.all_reduce` insertion |
-| **A4** | yes | `custom_ops` side-effect import added |
-| **A5** | yes | Module docstring update describing sharding strategy |
+| **A4** | yes | Docstring updates: one-line module header + per-class `Sharding strategy:` blocks (no `custom_ops` import, no `Shardable custom ops used:` trailer) |
 | **F1** | NO | `torch.ops.trtllm.*` replaced with vanilla PyTorch |
 | **F2** | NO | Input contract change (asserts, fallbacks added/removed) |
 | **F3** | NO | Module hierarchy / parameter / buffer / load-hook change |
@@ -218,6 +215,7 @@ Then classify every hunk into one of the following categories (defined in Step 0
 | **F5** | NO | Method rename / signature change / op reorder |
 | **F6** | NO | Removal of allegedly unused base code |
 | **F7** | NO | Code added because a legacy `_ir.py` reference had it (and the base did not) |
+| **F8** | NO | `from ... import custom_ops` side-effect import added (redundant; package init handles registration) |
 
 **If you find any F# hunk, REVERT it before reporting done.** Report the full diff classification table back to the parent agent in your final message, with one row per hunk:
 
