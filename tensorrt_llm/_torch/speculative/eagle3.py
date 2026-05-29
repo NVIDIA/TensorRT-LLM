@@ -64,6 +64,11 @@ class Eagle3ResourceManager(BaseResourceManager):
             (max_num_tokens, self.hidden_size * config.num_capture_layers),
             dtype=self.dtype,
             device='cuda')
+        self.batch_indices_cuda = torch.empty(
+            [max_num_requests],
+            dtype=torch.int,
+            device='cuda',
+        )
         # sequence length, only used for metadata preparation
         self.seq_lens = {i: 0 for i in range(slot_size)}
         # start indices of each slot
@@ -131,9 +136,15 @@ class Eagle3OneModelDynamicTreeResourceManager(BaseResourceManager):
     """
 
     hidden_states: Optional[torch.Tensor] = None
+    batch_indices_cuda: Optional[torch.Tensor] = None
 
     def __init__(self, config: "EagleDecodingConfig", max_num_requests: int):
         self.max_num_requests = max_num_requests
+        self.batch_indices_cuda = torch.empty(
+            [max_num_requests],
+            dtype=torch.int,
+            device='cuda',
+        )
         self.spec_tree_manager = SpecTreeManager(
             max_num_requests=max_num_requests,
             use_dynamic_tree=config.use_dynamic_tree,
@@ -389,11 +400,20 @@ class Eagle3OneModelSpecMetadata(SpecMetadata):
                  self.hidden_size * len(self.layers_to_capture)),
                 dtype=self.dtype,
                 device='cuda')
-        self.batch_indices_cuda = torch.empty(
-            [self.max_num_requests],
-            dtype=torch.int,
-            device='cuda',
-        )
+        if (self.spec_resource_manager is not None
+                and self.spec_resource_manager.batch_indices_cuda is not None):
+            self.batch_indices_cuda = self.spec_resource_manager.batch_indices_cuda
+            assert self.batch_indices_cuda.shape[0] >= self.max_num_requests, (
+                f"batch_indices_cuda shape mismatch: "
+                f"{type(self.spec_resource_manager).__name__} has "
+                f"{self.batch_indices_cuda.shape}, but metadata expects "
+                f"at least ({self.max_num_requests},)")
+        else:
+            self.batch_indices_cuda = torch.empty(
+                [self.max_num_requests],
+                dtype=torch.int,
+                device='cuda',
+            )
 
         # Set tree flags based on config
         if self.use_dynamic_tree:

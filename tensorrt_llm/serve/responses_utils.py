@@ -48,6 +48,8 @@ from tensorrt_llm.llmapi.llm import RequestOutput
 from tensorrt_llm.llmapi.reasoning_parser import (BaseReasoningParser,
                                                   ReasoningParserFactory,
                                                   ReasoningParserResult)
+from tensorrt_llm.llmapi.thinking_budget import \
+    add_thinking_budget_logits_processor
 from tensorrt_llm.llmapi.tokenizer import TokenizerBase, TransformersTokenizer
 from tensorrt_llm.logger import logger
 from tensorrt_llm.serve.chat_utils import (parse_chat_messages_coroutines,
@@ -919,6 +921,11 @@ async def request_preprocess(
     _responses_debug_log("======= Complete Inputs to model =======")
     _responses_debug_log(_decode_tokens(input_tokens, tokenizer))
     _responses_debug_log("========================================")
+    add_thinking_budget_logits_processor(
+        sampling_params,
+        reasoning_parser=reasoning_parser,
+        tokenizer=tokenizer,
+    )
     return input_tokens, sampling_params
 
 

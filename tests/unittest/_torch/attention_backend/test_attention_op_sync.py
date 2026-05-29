@@ -546,3 +546,35 @@ def test_excluded_fields_match_real_fields():
         f"AttentionForwardArgs field: {sorted(stale)}. Drop them or "
         f"restore the field."
     )
+
+
+def test_no_sequence_kwargs_at_thop_attention_boundary():
+    """``thop.attention`` must not accept ``std::vector<...>`` /
+    ``c10::ArrayRef<...>`` / ``std::array<...>`` parameters.
+
+    Sequence params couple list position to semantic meaning, which the
+    other sync tests in this file cannot verify element-by-element. Flat
+    named params let every slot be checked individually (name, type,
+    source). If a new sequence param creeps back in, flatten it the same
+    way ``rotary_embedding_scales`` / ``helix_tensor_params`` /
+    ``spec_decoding_*_params`` were flattened.
+    """
+    sequence_params = []
+    for name, cpp_type in _parse_attention_decl():
+        bare = cpp_type.strip()
+        # _strip_inner_type only strips trailing const/&/*; we want to
+        # detect outer container types regardless of qualifiers, so look
+        # at the raw type string with leading qualifiers stripped.
+        outer = re.sub(r"^(const\s+|volatile\s+)+", "", bare)
+        outer = re.sub(r"\s*(const|&|\*)\s*$", "", outer)
+        if (
+            outer.startswith("std::vector<")
+            or outer.startswith("c10::ArrayRef<")
+            or outer.startswith("std::array<")
+        ):
+            sequence_params.append((name, cpp_type))
+    assert not sequence_params, (
+        "thop.attention must not accept Sequence-typed kwargs. Flatten "
+        "the following params into their named scalar/tensor components:\n"
+        + "\n".join(f"  - {name}: {t}" for name, t in sequence_params)
+    )
