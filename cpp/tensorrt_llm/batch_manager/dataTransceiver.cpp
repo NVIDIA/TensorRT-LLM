@@ -317,6 +317,11 @@ public:
                 // cannot drop the LlmRequest out from under the async-send
                 // worker's dereferences.
                 mReadyResponses.emplace(llmRequest->mRequestId, Response{llmRequest, std::move(promise)});
+                // nvbugs/6104831 Layer A: log ctx-side response emplace so we
+                // can correlate a reqId's entry into mReadyResponses with the
+                // downstream recvRequestInfo / sendReadySignal path.
+                TLLM_LOG_INFO("[DIAG-CTX-EMPLACE-RESP] reqId=%lu mReadyResponses.size=%zu", llmRequest->mRequestId,
+                    mReadyResponses.size());
             }
             std::unique_lock lkCond(mCondMutex);
             mAnyReady = true;
@@ -635,6 +640,11 @@ private:
     {
         auto reqId = mCurrentRequest.value();
         auto count = --mRemainSendCount[reqId];
+        // nvbugs/6104831 Layer B: log every decrement of mRemainSendCount so
+        // we can see whether the count actually reaches 0 for the wedged
+        // reqId. Mechanism A (count off-by-one) shows up as DECR logs that
+        // never reach countAfter=0 for a specific reqId.
+        TLLM_LOG_INFO("[DIAG-CTX-DECR] reqId=%lu countBefore=%d countAfter=%d", reqId, count + 1, count);
         TLLM_CHECK(count >= 0);
         if (count == 0)
         {
@@ -649,7 +659,13 @@ private:
                     isReady = false;
                 }
             }
+            // nvbugs/6104831 Layer B: bracket the sendReadySignal call so we
+            // can tell whether (a) it was reached but threw mid-call vs
+            // (b) it completed normally. The peer's [DIAG-UCX-RECV-DONE]
+            // on ctxTag=42 should appear shortly after a successful POST log.
+            TLLM_LOG_INFO("[DIAG-CTX-READY-PRE] reqId=%lu isReady=%d", reqId, isReady ? 1 : 0);
             sendReadySignal(reqId, isReady);
+            TLLM_LOG_INFO("[DIAG-CTX-READY-POST] reqId=%lu isReady=%d", reqId, isReady ? 1 : 0);
 
             if (isReady)
             {
@@ -699,6 +715,15 @@ private:
                         "KV cache transfer for request %zu was cancelled", cancelledReqId)));
             }
         }
+        else
+        {
+            // nvbugs/6104831 Layer B: log when the count decremented but
+            // didn't reach 0 yet. For a request that legitimately needs N
+            // counterparts, we expect N-1 AWAIT logs followed by one
+            // READY-PRE/POST pair. If a reqId only ever produces AWAIT
+            // logs (never reaches READY-PRE), Mechanism A confirmed.
+            TLLM_LOG_INFO("[DIAG-CTX-AWAIT] reqId=%lu remainingCount=%d", reqId, count);
+        }
         mCurrentRequest = std::nullopt;
     }
 
@@ -727,6 +752,14 @@ private:
                         return;
                     }
                     auto reqId = requestInfo.getRequestId();
+                    // nvbugs/6104831 Layer A: log every successful return from
+                    // recvRequestInfo. This tells us which reqIds ctx side
+                    // actually received an info exchange for. A wedged gen-side
+                    // recv (DIAG-UCX-RECV-WAIT on kREADY_SIGNAL_TAG) whose
+                    // reqId never appears in DIAG-CTX-RECV-INFO confirms the
+                    // info exchange itself was lost (Mechanism C).
+                    TLLM_LOG_INFO(
+                        "[DIAG-CTX-RECV-INFO] reqId=%lu mReadyResponses.size=%zu", reqId, mReadyResponses.size());
 
                     {
                         std::scoped_lock lk(mSenderMutex);
@@ -736,6 +769,13 @@ private:
                     if (mRemainSendCount.find(reqId) == mRemainSendCount.end())
                     {
                         mRemainSendCount[reqId] = getCounterpartsCount(reqId);
+                        // nvbugs/6104831 Layer A: log the initial count we
+                        // expect this reqId's sends to consume. If this value
+                        // is wrong (e.g. one more than the actual number of
+                        // counterparts), the DECR loop will never reach 0
+                        // and READY-PRE will never fire — Mechanism A.
+                        TLLM_LOG_INFO(
+                            "[DIAG-CTX-INIT-COUNT] reqId=%lu initialCount=%d", reqId, mRemainSendCount[reqId]);
                     }
                 }
                 auto it = getCurrentResponse();
@@ -762,9 +802,18 @@ private:
         }
         catch (std::exception const& err)
         {
+            // nvbugs/6104831 Layer C: log every exception escape from
+            // response() so we can attribute a wedged gen-side recv to a
+            // ctx-side worker that died mid-iteration (Mechanism B).
+            // Note: the per-reqId drain below set_exception()s the C++
+            // future, but does NOT send a kREADY_SIGNAL_TAG byte to the
+            // peer's UcxConnection::recv — that recv stays wedged.
+            TLLM_LOG_INFO("[DIAG-CTX-EXCEPT] currentReqId=%lu pending=%zu reason=%s",
+                mCurrentRequest.value_or(0xFFFFFFFFFFFFFFFFULL), mReadyResponses.size(), err.what());
             TLLM_LOG_ERROR("Exception in CacheSender response: %s", err.what());
             for (auto& it : mReadyResponses)
             {
+                TLLM_LOG_INFO("[DIAG-CTX-EXCEPT-DRAIN] reqId=%lu", it.first);
                 it.second.mPromise.set_exception(std::current_exception());
             }
         }
@@ -780,9 +829,14 @@ private:
             // exits after this catch — sender is then dead for this
             // process, but fail-closed via the promises is strictly
             // better than terminate().
+            // nvbugs/6104831 Layer C: same attribution as the std::exception
+            // catch above, for non-std throws.
+            TLLM_LOG_INFO("[DIAG-CTX-EXCEPT-UNKNOWN] currentReqId=%lu pending=%zu",
+                mCurrentRequest.value_or(0xFFFFFFFFFFFFFFFFULL), mReadyResponses.size());
             TLLM_LOG_ERROR("[CacheSender] UNKNOWN (non-std::exception) escape in response() — worker exiting");
             for (auto& it : mReadyResponses)
             {
+                TLLM_LOG_INFO("[DIAG-CTX-EXCEPT-UNKNOWN-DRAIN] reqId=%lu", it.first);
                 try
                 {
                     it.second.mPromise.set_exception(std::current_exception());
@@ -1402,6 +1456,12 @@ public:
 private:
     void requestSync(LlmRequest& llmRequest, std::atomic<bool> const& perRequestCancel)
     {
+        // nvbugs/6104831 Layer D: log gen-side requestSync entry. The reqId
+        // here is the GEN-side request id; the context request id is the
+        // matching ctx-side reqId that the ctx-side DIAG-CTX-* logs will
+        // reference. Cross-rank correlation key.
+        TLLM_LOG_INFO("[DIAG-GEN-REQSYNC-ENTRY] genReqId=%lu ctxReqId=%lu", llmRequest.mRequestId,
+            llmRequest.getContextPhaseParams().value().getReqId());
         TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(),
             "Start calling requestSync for request ID: %zu, context request ID: %zu.", llmRequest.mRequestId,
             llmRequest.getContextPhaseParams().value().getReqId());
@@ -1460,8 +1520,16 @@ private:
 
         try
         {
+            // nvbugs/6104831 Layer D: bracket sendRequestInfo so we can
+            // tell if gen-side request-info actually reached the wire. If
+            // the matching ctx-side DIAG-CTX-RECV-INFO never appears for
+            // this ctxReqId, the info exchange itself was dropped.
+            TLLM_LOG_INFO("[DIAG-GEN-SEND-INFO-PRE] genReqId=%lu ctxReqId=%lu", llmRequest.mRequestId,
+                llmRequest.getContextPhaseParams().value().getReqId());
             auto session = sendRequestInfo(llmRequest, perRequestCancel, std::move(cacheBufferIds));
             session.setTime(TransferSession::kTimeRequestInfo);
+            TLLM_LOG_INFO("[DIAG-GEN-SEND-INFO-POST] genReqId=%lu ctxReqId=%lu", llmRequest.mRequestId,
+                llmRequest.getContextPhaseParams().value().getReqId());
             // receiveReadySignal blocks inside AgentConnectionManager::waitForNotification's
             // polling loop until the peer sends the ready notification OR the
             // perRequestCancel flag flips. The result is intentionally
@@ -1469,7 +1537,15 @@ private:
             // write into the advertised receive buffers, while local cancel /
             // no-notification means TRT-LLM cannot prove the peer is not still
             // writing and must poison the advertised slots.
+            // nvbugs/6104831 Layer D: bracket receiveReadySignalDetailed so
+            // we can see exactly when gen starts waiting for the ready
+            // signal and what answer it gets. Pair this AWAIT log with the
+            // ctx-side [DIAG-CTX-READY-POST] using the ctxReqId.
+            TLLM_LOG_INFO("[DIAG-GEN-AWAIT-READY] genReqId=%lu ctxReqId=%lu", llmRequest.mRequestId,
+                llmRequest.getContextPhaseParams().value().getReqId());
             auto readyResult = receiveReadySignalDetailed(session, perRequestCancel);
+            TLLM_LOG_INFO("[DIAG-GEN-RECV-READY] genReqId=%lu ctxReqId=%lu result=%d", llmRequest.mRequestId,
+                llmRequest.getContextPhaseParams().value().getReqId(), static_cast<int>(readyResult));
             if (readyResult == ReadySignalResult::kCancelled)
             {
                 poisonRecvHolders();

@@ -3979,6 +3979,15 @@ class PyExecutor:
             if os.getenv("TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP") == "1":
                 for req in recv_reqs:
                     self._disagg_gen_kv_recv_started_ids.add(req.py_request_id)
+                    # nvbugs/6104831 Layer D (Python): tag every gen-side
+                    # disagg recv invocation with the py_request_id and the
+                    # underlying request_id. The request_id is what the C++
+                    # [DIAG-GEN-REQSYNC-ENTRY] line will reference as
+                    # genReqId, so a wedged gen-side recv can be traced
+                    # all the way back to the Python scheduler decision.
+                    logger.info(
+                        f"[DIAG-PY-GEN-RECV-SYNC] py_request_id={req.py_request_id} "
+                        f"request_id={req.request_id}")
                     try:
                         self.kv_cache_transceiver.request_and_receive_sync(req)
                     except Exception:
@@ -3988,6 +3997,11 @@ class PyExecutor:
             else:
                 for req in recv_reqs:
                     self._disagg_gen_kv_recv_started_ids.add(req.py_request_id)
+                    # nvbugs/6104831 Layer D (Python): see SYNC variant above
+                    # for rationale; this is the default async path.
+                    logger.info(
+                        f"[DIAG-PY-GEN-RECV-ASYNC] py_request_id={req.py_request_id} "
+                        f"request_id={req.request_id}")
                     try:
                         self.kv_cache_transceiver.request_and_receive_async(req)
                     except Exception:
@@ -4046,6 +4060,15 @@ class PyExecutor:
                     # Order is important here: we need to start the transfer before responding
                     # to make sure the blocks are stored for reuse before they are sent.
                     self.async_transfer_manager.start_transfer(req)
+                    # nvbugs/6104831 Layer D (Python): tag every ctx-side
+                    # respond_and_send_async with the py_request_id and the
+                    # request_id. request_id is what the C++ DIAG-CTX-*
+                    # logs reference as reqId. If a gen-side wedged recv's
+                    # ctxReqId has no matching [DIAG-PY-CTX-SEND] here, the
+                    # ctx-side never tried to respond (upstream bug).
+                    logger.info(
+                        f"[DIAG-PY-CTX-SEND] py_request_id={req.py_request_id} "
+                        f"request_id={req.request_id}")
                     self.kv_cache_transceiver.respond_and_send_async(req)
 
                     # Always record the transfer start time. The Python
