@@ -261,8 +261,7 @@ class BaseSparseAttentionConfig(StrictBaseModel):
     )
 
     def supports_backend(self, backend: str) -> bool:
-        """
-        Override if the sparse attention algorithm does not support
+        """Override if the sparse attention algorithm does not support
         a subset of the possible backends.
         """
         return True
@@ -271,8 +270,7 @@ class BaseSparseAttentionConfig(StrictBaseModel):
         return 1
 
     def needs_separate_short_long_cuda_graphs(self) -> bool:
-        """
-        Determines whether to capture a dedicated CUDA graph for batches consisting entirely of short sequences.
+        """Determines whether to capture a dedicated CUDA graph for batches consisting entirely of short sequences.
         If True, capture distinct graphs for short-only batches and general cases (e.g., long or mixed batches).
         If False, capture a single unified CUDA graph for all sequences regardless of length.
         The seq_len_threshold parameter defines the cutoff boundary between short and long sequences.
@@ -388,8 +386,7 @@ class DeepSeekSparseAttentionConfig(BaseSparseAttentionConfig):
         return backend == "pytorch"
 
     def needs_separate_short_long_cuda_graphs(self) -> bool:
-        """
-        Whether to capture separate CUDA graphs for short and long sequences.
+        """Whether to capture separate CUDA graphs for short and long sequences.
         Use seq_len_threshold to determine the threshold for separating short and long sequences.
         """
         self.seq_len_threshold = self.index_topk
@@ -476,8 +473,7 @@ class SkipSoftmaxAttentionConfig(BaseSparseAttentionConfig):
 
 
 class MoeLoadBalancerConfig(StrictBaseModel):
-    """
-    Pydantic configuration model for the Mixture of Experts (MoE) load balancer.
+    """Pydantic configuration model for the Mixture of Experts (MoE) load balancer.
 
     This model holds configuration data (`num_slots`, etc.) as well as
     runtime state (`_ep_rank`, `_ep_size`) which must be set via the
@@ -496,8 +492,7 @@ class MoeLoadBalancerConfig(StrictBaseModel):
     # --- Methods ---
 
     def setup(self, ep_rank: int, ep_size: int) -> None:
-        """
-        Initializes the runtime state of the configuration.
+        """Initializes the runtime state of the configuration.
         This must be called before accessing properties like `num_local_slots`.
         """
         self._ep_rank = ep_rank
@@ -1004,8 +999,7 @@ class DecodingBaseConfig(StrictBaseModel):
         return self
 
     def supports_backend(self, backend: str) -> bool:
-        """
-        Override if the speculation algorithm does not support
+        """Override if the speculation algorithm does not support
         a subset of the possible backends.
         """
         return True
@@ -1038,8 +1032,7 @@ class DecodingBaseConfig(StrictBaseModel):
 
 
 class KvCacheConnectorConfig(StrictBaseModel):
-    """
-    Configuration for the KV Cache Connector.
+    """Configuration for the KV Cache Connector.
 
     Can be configured either by specifying a named preset via ``connector``
     (e.g. ``"lmcache"``), or by providing explicit ``connector_module``,
@@ -1317,8 +1310,7 @@ class EagleDecodingConfig(DecodingBaseConfig):
 
     @functools.cached_property
     def num_capture_layers(self) -> int:
-        """
-        Returns the number of layers to capture of the target model.
+        """Returns the number of layers to capture of the target model.
         If eagle3_layers_to_capture is not None, return the length of the set.
         Otherwise, assume Eagle3 base set and return 3.
         """
@@ -1434,8 +1426,7 @@ class SaveHiddenStatesDecodingConfig(DecodingBaseConfig):
 
     @functools.cached_property
     def num_capture_layers(self):
-        """
-        Returns the number of layers to save.
+        """Returns the number of layers to save.
         The following hidden states are saved:
         - If eagle3_layers_to_capture is None, save the eagle3 base set plus
         the post norm last hidden state.
@@ -1818,8 +1809,7 @@ class DFlashDecodingConfig(DecodingBaseConfig):
 
 
 class AutoDecodingConfig(DecodingBaseConfig):
-    """
-    Configuration for auto speculative decoding.
+    """Configuration for auto speculative decoding.
 
     This config will automatically select a good, draft-model free
     speculation algorithm with some heuristic.
@@ -1839,8 +1829,7 @@ class AutoDecodingConfig(DecodingBaseConfig):
 
 
 class PrometheusMetricsConfig(StrictBaseModel):
-    """
-    Configuration for Prometheus metrics collection.
+    """Configuration for Prometheus metrics collection.
 
     Groups all Prometheus-related parameters including custom histogram bucket
     boundaries for latency metrics.
@@ -1920,8 +1909,7 @@ class PrometheusMetricsConfig(StrictBaseModel):
 
 
 class RayPlacementConfig(StrictBaseModel):
-    """
-    Configuration for Ray GPU workers placement.
+    """Configuration for Ray GPU workers placement.
     Currently, this config is only used with AsyncLLM for RL scenarios.
     """
     defer_workers_init: bool = Field(
@@ -1987,8 +1975,8 @@ class RayPlacementConfig(StrictBaseModel):
 class ExecutorMemoryType(StrEnum):
     """Types of GPU memory used by executor.
 
-     These are used by the sleep/wakeup feature to target specific type of memory.
-     """
+    These are used by the sleep/wakeup feature to target specific type of memory.
+    """
     SAMPLER = "sampler"
     DRAFTER = "drafter"
     GUIDED_DECODER = "guided_decoder"
@@ -2108,9 +2096,9 @@ class SleepConfig(StrictBaseModel):
 
 
 class PybindMirror(ABC):
-    ''' A class containing the utilities for mirroring Python classes to
+    """A class containing the utilities for mirroring Python classes to
     pybind classes.
-    '''
+    """
 
     @abstractmethod
     def _to_pybind(self):
@@ -2126,8 +2114,7 @@ class PybindMirror(ABC):
 
     @staticmethod
     def mirror_pybind_fields(pybind_class):
-        """
-        Class decorator that ensures Python class fields mirror those of a C++ class.
+        """Class decorator that ensures Python class fields mirror those of a C++ class.
 
         Args:
             pybind_class: The C++ class whose fields should be mirrored
@@ -2156,7 +2143,7 @@ class PybindMirror(ABC):
 
     @staticmethod
     def get_pybind_enum_fields(pybind_class):
-        ''' Get all the enum fields from the pybind class. '''
+        """Get all the enum fields from the pybind class."""
         return [
             f for f in pybind_class.__members__.keys()
             if not f.startswith('_') and not callable(getattr(pybind_class, f))
@@ -2164,7 +2151,7 @@ class PybindMirror(ABC):
 
     @staticmethod
     def mirror_pybind_enum(pybind_class):
-        ''' Mirror the enum fields from the pybind class to the Python class. '''
+        """Mirror the enum fields from the pybind class to the Python class."""
 
         def decorator(cls):
             assert issubclass(cls, Enum)
@@ -2182,7 +2169,7 @@ class PybindMirror(ABC):
 
     @staticmethod
     def get_pybind_variable_fields(config_cls):
-        ''' Get all the variable fields from the pybind class. '''
+        """Get all the variable fields from the pybind class."""
         return [
             f for f in dir(config_cls)
             if not f.startswith('_') and not callable(getattr(config_cls, f))
@@ -2190,7 +2177,7 @@ class PybindMirror(ABC):
 
     @staticmethod
     def pybind_equals(obj0, obj1):
-        ''' Check if two pybind objects are equal. '''
+        """Check if two pybind objects are equal."""
         assert type(obj0) is type(obj1)
         for field in PybindMirror.get_pybind_variable_fields(type(obj0)):
             if getattr(obj0, field) != getattr(obj1, field):
@@ -2283,7 +2270,7 @@ class CapacitySchedulerPolicy(StrEnum, metaclass=PybindMirrorEnumMeta):
 
 @PybindMirror.mirror_pybind_enum(_ContextChunkingPolicy)
 class ContextChunkingPolicy(StrEnum, metaclass=PybindMirrorEnumMeta):
-    ''' Context chunking policy. '''
+    """Context chunking policy."""
     FIRST_COME_FIRST_SERVED = "FIRST_COME_FIRST_SERVED"
     EQUAL_PROGRESS = "EQUAL_PROGRESS"
     FORCE_CHUNK = "FORCE_CHUNK"
@@ -3572,12 +3559,11 @@ class TrtLlmArgs(BaseLlmArgs):
 
     @model_validator(mode="after")
     def validate_model_format_misc(self):
-        '''
-        Load the model format, and do the following:
+        """Load the model format, and do the following:
 
         1. Load the build_config if got an engine.
         2. Load the parallel_config if got a checkpoint.
-        '''
+        """
         model_obj = _ModelWrapper(self.model)
 
         if model_obj.is_local_model and self.backend not in [
@@ -3674,6 +3660,8 @@ class LoadFormat(Enum):
     DUMMY = 1
     # Only load the multimodal(vision) encoder weights
     VISION_ONLY = 2
+    # Load weights through GPU Memory Service.
+    GMS = 3
 
 
 class ModelExpressConfig(StrictBaseModel):
@@ -3717,6 +3705,77 @@ class ModelExpressConfig(StrictBaseModel):
                 "mx_config.preshard_strategy='global' requires "
                 "LoadFormat.PRESHARDED, which is not yet available in "
                 "TRT-LLM main. Use preshard_strategy='per_module' instead.")
+        return self
+
+
+class GmsConfig(StrictBaseModel):
+    """Prototype configuration for GPU Memory Service (GMS) weight sharing.
+
+    Composes orthogonally with ``checkpoint_format`` on ``TorchLlmArgs``:
+    GMS controls *where* weights live (a node-shared GPU memory pool
+    so multiple TRT-LLM instances zero-copy share the same bytes),
+    while ``checkpoint_format`` controls *how* they get there (HF disk,
+    MX P2P, etc.). Effective only when ``TorchLlmArgs.load_format ==
+    LoadFormat.GMS``; setting any non-default field here without that
+    load_format triggers a warning via :meth:`TorchLlmArgs.validate_gms_config`.
+
+    Two roles are decided at connect time by the GMS daemon, not by
+    config:
+
+    - **RW (writer)**: the first instance loads weights into the pool
+      via the normal checkpoint-loader pipeline, then commits them.
+    - **RO (reader)**: subsequent instances zero-copy materialize the
+      already-committed layout — no disk I/O, no per-instance copies.
+
+    See :class:`tensorrt_llm._torch.memory.gpu_memory_backend.GMSBackend`
+    for the integration adapter and the ``LoadFormat.GMS`` branch in
+    ``ModelLoader.load`` for orchestration.
+    """
+
+    socket_path: Optional[str] = Field(
+        default=None,
+        description="Unix domain socket path of the GPU Memory Service. "
+        "When unset, the GMS library resolves its default per-device path.",
+        status="prototype",
+    )
+
+    mode: Literal["auto", "rw", "ro"] = Field(
+        default="auto",
+        description="GMS operating mode: 'auto' requests RW or RO, 'rw' "
+        "requires writer mode, and 'ro' requires read-only mode.",
+        status="prototype",
+    )
+
+    tag: str = Field(
+        default="weights",
+        description="Tag identifying the model weight set in the GMS memory "
+        "pool. Defaults to 'weights' to match the GMS library convention. "
+        "The tag must uniquely identify a compatible model/parallelism "
+        "layout for a given GMS daemon; reusing a tag for different weights "
+        "can make RO readers attach to the wrong pool.",
+        status="prototype",
+    )
+
+    @model_validator(mode="after")
+    def validate_gms_config(self) -> 'GmsConfig':
+        """Enforce non-empty :attr:`tag`.
+
+        :attr:`mode` is enforced by its ``Literal`` type annotation —
+        Pydantic rejects out-of-set values at field validation, before
+        this validator runs, so the JSON schema/docs are self-describing
+        (enum) without a duplicated whitelist here.  This validator only
+        enforces the non-empty / non-whitespace contract on :attr:`tag`,
+        which the type system can't express.
+
+        Raises:
+            ValueError: If ``tag`` is empty / whitespace-only.
+
+        Returns:
+            ``self`` (Pydantic ``model_validator`` contract).
+        """
+        if not self.tag or not self.tag.strip():
+            raise ValueError(
+                f"gms_config.tag must be a non-empty string, got {self.tag!r}.")
         return self
 
 
@@ -3972,6 +4031,12 @@ class TorchLlmArgs(BaseLlmArgs):
         status="prototype",
     )
 
+    gms_config: GmsConfig = Field(
+        default_factory=GmsConfig,
+        description="GPU Memory Service (GMS) weight sharing config.",
+        status="prototype",
+    )
+
     kv_connector_config: Optional[KvCacheConnectorConfig] = Field(
         default=None,
         description="The config for KV cache connector.",
@@ -4114,6 +4179,16 @@ class TorchLlmArgs(BaseLlmArgs):
     def convert_load_format(cls, v):
         if isinstance(v, LoadFormat):
             return v
+        # ``bool`` is a subclass of ``int`` in Python, so without an
+        # explicit bool check ``load_format=True/False`` would silently
+        # coerce to ``LoadFormat(1) == LoadFormat.DUMMY`` /
+        # ``LoadFormat(0) == LoadFormat.AUTO``. Reject early so callers
+        # who pass a misread boolean flag get an actionable error
+        # instead of a silently wrong checkpoint-load mode.
+        if isinstance(v, bool):
+            raise ValueError(f"Invalid LoadFormat: {v}")
+        if isinstance(v, int):
+            return LoadFormat(v)
         load_format = v.upper()
         if load_format not in LoadFormat.__members__:
             raise ValueError(f"Invalid LoadFormat: {v}")
@@ -4298,6 +4373,79 @@ class TorchLlmArgs(BaseLlmArgs):
         return self
 
     @model_validator(mode="after")
+    def validate_gms_config(self) -> 'TorchLlmArgs':
+        """Warn when GMS settings are provided without enabling GMS load.
+
+        Catches the most common misconfiguration: a user customizes
+        :attr:`gms_config` (e.g. sets a custom ``socket_path`` or
+        ``mode``) but forgets to set ``load_format='GMS'``, in which
+        case the entire GMS config is silently ignored. We emit a
+        warning so the user notices at config time instead of
+        debugging "why are my workers not zero-copy sharing weights?"
+        afterwards.
+
+        Detection is by deviation from defaults: any of
+        ``socket_path != None``, ``mode != 'auto'``, or
+        ``tag != 'weights'`` triggers the warning when
+        ``load_format != LoadFormat.GMS``. This is intentionally a
+        warning (not an error) so callers that pre-populate config
+        objects from templates aren't broken.
+
+        Returns:
+            ``self`` (Pydantic ``model_validator`` contract).
+        """
+        gms_config_is_non_default = (self.gms_config.socket_path is not None
+                                     or self.gms_config.mode != "auto"
+                                     or self.gms_config.tag != "weights")
+        if gms_config_is_non_default and self.load_format != LoadFormat.GMS:
+            logger.warning(
+                "gms_config is set but load_format is '%s', not 'GMS'. "
+                "The GMS config will be ignored. Set load_format='GMS' to "
+                "enable GPU Memory Service.", self.load_format.name)
+        return self
+
+    @model_validator(mode="after")
+    def validate_gms_moe_compat(self) -> 'TorchLlmArgs':
+        """Reject ``LoadFormat.GMS`` combined with a MoE load balancer.
+
+        The ``MoeLoadBalancer``'s ``register_weight_slots_after_to_cuda``
+        and ``finalize_model`` run AFTER the GMS RW pool is closed and
+        ``finalize_write`` has committed, so any CUDA allocations they
+        make land in non-GMS memory and are NOT part of the committed
+        layout that RO peers receive. The result is "wrong inference,
+        no error" on RO peers (broken MoE routing state). Failing at
+        config-validation time is strictly better than that silent
+        miscompute.
+
+        The fix for this gap (running the MoE finalize work INSIDE
+        ``mem_pool_scope`` and BEFORE ``finalize_write`` so MoE
+        allocations are part of the committed layout) is tracked as
+        the (MoE, GMS) follow-up; see ``model_loader.py``'s
+        ``TODO(GMS-MOE-LB)`` comment.
+
+        Returns:
+            ``self`` (Pydantic ``model_validator`` contract).
+
+        Raises:
+            ValueError: When ``load_format == LoadFormat.GMS`` and
+                ``moe_config.load_balancer`` is set.
+        """
+        if (self.load_format == LoadFormat.GMS and self.moe_config is not None
+                and self.moe_config.load_balancer is not None):
+            raise ValueError(
+                "LoadFormat.GMS is incompatible with moe_config.load_balancer "
+                "in this PR. The MoE load balancer's "
+                "register_weight_slots_after_to_cuda and finalize_model run "
+                "after the GMS pool closes and finalize_write commits, so "
+                "their allocations land outside the committed layout. RO "
+                "peers would receive a broken MoE routing state. Either "
+                "disable moe_config.load_balancer or use LoadFormat.AUTO. "
+                "Tracked as the (MoE, GMS) follow-up at "
+                "tensorrt_llm/_torch/pyexecutor/model_loader.py "
+                "(see TODO(GMS-MOE-LB)).")
+        return self
+
+    @model_validator(mode="after")
     def validate_load_balancer(self) -> 'TorchLlmArgs':
         if isinstance(self.moe_config.load_balancer, str):
             if not os.path.exists(self.moe_config.load_balancer):
@@ -4384,7 +4532,7 @@ class TorchLlmArgs(BaseLlmArgs):
     def validate_ray_worker_extension_cls(self) -> 'TorchLlmArgs':
         if self.ray_worker_extension_cls is not None and self.orchestrator_type != "ray":
             raise ValueError(
-                f"ray_worker_extension_cls is only supported with orchestrator_type='ray'"
+                "ray_worker_extension_cls is only supported with orchestrator_type='ray'"
             )
         return self
 
@@ -4519,7 +4667,7 @@ def update_llm_args_with_extra_options(llm_args: Dict,
 
 def get_model_format(model_dir: str,
                      trust_remote_code: bool = False) -> _ModelFormatKind:
-    ''' Get the format of the model.  '''
+    """Get the format of the model."""
     if not (Path(model_dir) / 'config.json').exists():
         raise ValueError(
             f"Failed to infer model format because no config.json exists in {model_dir}"
