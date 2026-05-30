@@ -1396,13 +1396,15 @@ class NVFP4LinearMethod(LinearMethodBase):
                           (tuple, Fp4QuantizedTensor)) and input.dim() > 2:
             original_shape = input.shape
             input = input.reshape(-1, input.shape[-1])
-        elif isinstance(input, Fp4QuantizedTensor) and input.fp4_tensor.dim() > 2:
+        elif isinstance(input,
+                        Fp4QuantizedTensor) and input.fp4_tensor.dim() > 2:
             original_shape = input.fp4_tensor.shape
             # Last dim is N/2 (FP4-packed), so output unflatten below treats
             # original_shape[:-1] as the prefix dims; weight projects to
             # out_features along the last dim.
             input = Fp4QuantizedTensor(
-                fp4_tensor=input.fp4_tensor.reshape(-1, input.fp4_tensor.shape[-1]),
+                fp4_tensor=input.fp4_tensor.reshape(-1,
+                                                    input.fp4_tensor.shape[-1]),
                 scaling_factor=input.scaling_factor,
                 is_sf_swizzled=input.is_sf_swizzled,
             )

@@ -81,6 +81,7 @@ def _try_attach_nvfp4_scale(norm: nn.Module, linear: nn.Module) -> bool:
     norm.nvfp4_scale = input_scale
     return True
 
+
 try:
     # Available in transformers<5
     from transformers.modeling_utils import get_parameter_device
@@ -938,7 +939,10 @@ class WanTransformer3DModel(nn.Module):
         total_blocks = len(self.blocks)
         logger.info(
             "Wan NVFP4 fused-LayerNorm scale attach: norm1=%d/%d, norm2=%d/%d, norm3=%d/%d",
-            n_attached_n1, total_blocks,
-            n_attached_n2, total_blocks,
-            n_attached_n3, total_blocks,
+            n_attached_n1,
+            total_blocks,
+            n_attached_n2,
+            total_blocks,
+            n_attached_n3,
+            total_blocks,
         )

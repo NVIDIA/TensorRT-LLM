@@ -61,10 +61,8 @@ from tensorrt_llm._torch.modules.layer_norm import LayerNorm
 from tensorrt_llm._torch.modules.linear import Linear
 from tensorrt_llm._torch.modules.mlp import MLP
 from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig, VisualGenArgs
+from tensorrt_llm._torch.visual_gen.models.wan.transformer_wan import WanTransformer3DModel
 from tensorrt_llm._utils import get_sm_version
-from tensorrt_llm._torch.visual_gen.models.wan.transformer_wan import (
-    WanTransformer3DModel,
-)
 from tensorrt_llm.quantization import QuantAlgo
 
 # Wan 2.2 ModelOpt ``ignore`` patterns (mirrors transformer/config.json).
@@ -116,15 +114,13 @@ def _has_sm100() -> bool:
 
 skip_if_no_sm100 = pytest.mark.skipif(
     not _has_sm100(),
-    reason="Wan 2.2 NVFP4 fused kernels require SM100 (Blackwell). "
-    "Skipping on non-Blackwell.",
+    reason="Wan 2.2 NVFP4 fused kernels require SM100 (Blackwell). Skipping on non-Blackwell.",
 )
 
 
 skip_if_no_fused_op = pytest.mark.skipif(
     not hasattr(torch.ops.trtllm, "fused_layernorm_quantize"),
-    reason="trtllm::fused_layernorm_quantize op is not registered. "
-    "Rebuild the wheel.",
+    reason="trtllm::fused_layernorm_quantize op is not registered. Rebuild the wheel.",
 )
 
 
@@ -382,9 +378,7 @@ def _snapshot_fusion_state(model):
             norm._nvfp4_scale_orig = getattr(norm, "nvfp4_scale", None)
     for _, mlp in model.named_modules():
         if isinstance(mlp, MLP) and not hasattr(mlp, "_use_fused_gelu_tanh_quant_orig"):
-            mlp._use_fused_gelu_tanh_quant_orig = getattr(
-                mlp, "_use_fused_gelu_tanh_quant", False
-            )
+            mlp._use_fused_gelu_tanh_quant_orig = getattr(mlp, "_use_fused_gelu_tanh_quant", False)
 
 
 def _cosine_similarity(a: torch.Tensor, b: torch.Tensor) -> float:
@@ -425,25 +419,31 @@ def test_fused_vs_unfused_output_matches(loaded_wan22_nvfp4):
     text_seq_len = 77
     hidden_states = torch.randn(B, C, T, H, W, device="cuda", dtype=torch.bfloat16)
     timestep = torch.tensor([500.0], device="cuda", dtype=torch.float32)
-    encoder_hidden_states = torch.randn(
-        B, text_seq_len, 4096, device="cuda", dtype=torch.bfloat16
-    )
+    encoder_hidden_states = torch.randn(B, text_seq_len, 4096, device="cuda", dtype=torch.bfloat16)
 
     # Path A: fusion OFF (baseline).
     _set_fusion_active(model, active=False)
-    out_a = model(
-        hidden_states=hidden_states,
-        timestep=timestep,
-        encoder_hidden_states=encoder_hidden_states,
-    ).float().clone()
+    out_a = (
+        model(
+            hidden_states=hidden_states,
+            timestep=timestep,
+            encoder_hidden_states=encoder_hidden_states,
+        )
+        .float()
+        .clone()
+    )
 
     # Path B: fusion ON.
     _set_fusion_active(model, active=True)
-    out_b = model(
-        hidden_states=hidden_states,
-        timestep=timestep,
-        encoder_hidden_states=encoder_hidden_states,
-    ).float().clone()
+    out_b = (
+        model(
+            hidden_states=hidden_states,
+            timestep=timestep,
+            encoder_hidden_states=encoder_hidden_states,
+        )
+        .float()
+        .clone()
+    )
 
     cos = _cosine_similarity(out_a, out_b)
     # 0.995 is loose enough to absorb FP4 rounding noise between the two
@@ -481,9 +481,7 @@ def test_forward_smoke_runs_without_error(loaded_wan22_nvfp4):
     text_seq_len = 77
     hidden_states = torch.randn(B, C, T, H, W, device="cuda", dtype=torch.bfloat16)
     timestep = torch.tensor([500.0], device="cuda", dtype=torch.float32)
-    encoder_hidden_states = torch.randn(
-        B, text_seq_len, 4096, device="cuda", dtype=torch.bfloat16
-    )
+    encoder_hidden_states = torch.randn(B, text_seq_len, 4096, device="cuda", dtype=torch.bfloat16)
 
     out = model(
         hidden_states=hidden_states,

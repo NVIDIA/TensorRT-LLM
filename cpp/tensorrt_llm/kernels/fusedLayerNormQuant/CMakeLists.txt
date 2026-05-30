@@ -34,7 +34,7 @@ if(NOT WIN32)
     PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=-Wno-psabi>)
 endif()
 
-set_property(TARGET fusedLayerNormQuant_src
-             PROPERTY POSITION_INDEPENDENT_CODE ON)
-set_property(TARGET fusedLayerNormQuant_src
-             PROPERTY CUDA_RESOLVE_DEVICE_SYMBOLS ON)
+set_property(TARGET fusedLayerNormQuant_src PROPERTY POSITION_INDEPENDENT_CODE
+                                                     ON)
+set_property(TARGET fusedLayerNormQuant_src PROPERTY CUDA_RESOLVE_DEVICE_SYMBOLS
+                                                     ON)

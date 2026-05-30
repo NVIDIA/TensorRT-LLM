@@ -37,20 +37,18 @@ from tests.unittest.utils.util import getSMVersion
 
 
 def fused_layernorm_quantize_available():
-    return hasattr(torch.ops, "trtllm") and hasattr(
-        torch.ops.trtllm, "fused_layernorm_quantize")
+    return hasattr(torch.ops, "trtllm") and hasattr(torch.ops.trtllm, "fused_layernorm_quantize")
 
 
 def fp4_quantize_available():
-    return hasattr(torch.ops, "trtllm") and hasattr(torch.ops.trtllm,
-                                                    "fp4_quantize")
+    return hasattr(torch.ops, "trtllm") and hasattr(torch.ops.trtllm, "fp4_quantize")
 
 
 skip_unless_fused_layernorm_and_fp4 = pytest.mark.skipif(
-    getSMVersion() < 100 or not fused_layernorm_quantize_available()
+    getSMVersion() < 100
+    or not fused_layernorm_quantize_available()
     or not fp4_quantize_available(),
-    reason=
-    "Requires SM100+ (Blackwell) and trtllm fused_layernorm_quantize + fp4_quantize ops",
+    reason="Requires SM100+ (Blackwell) and trtllm fused_layernorm_quantize + fp4_quantize ops",
 )
 
 
@@ -72,13 +70,13 @@ def _quantize_reference(
     if ln_weight is not None:
         normed = F.layer_norm(
             x_fp32,
-            (n, ),
+            (n,),
             weight=ln_weight.float(),
             bias=ln_bias.float(),
             eps=eps,
         )
     else:
-        normed = F.layer_norm(x_fp32, (n, ), weight=None, bias=None, eps=eps)
+        normed = F.layer_norm(x_fp32, (n,), weight=None, bias=None, eps=eps)
 
     if scale_msa is not None:
         # scale_msa / shift_msa are [B, N]; row r uses batch r / seq_len_per_batch.
@@ -95,8 +93,7 @@ def _quantize_reference(
 
     normed_dt = normed.to(x.dtype)
 
-    sf_scale = (normed_dt.abs().amax().float() / (6.0 * 448.0)).view(1).to(
-        x.device)
+    sf_scale = (normed_dt.abs().amax().float() / (6.0 * 448.0)).view(1).to(x.device)
     fp4_ref, sf_ref = torch.ops.trtllm.fp4_quantize(
         normed_dt,
         sf_scale,
@@ -117,8 +114,7 @@ def test_fused_layernorm_quantize_plain_ln(m, n, dtype):
     device = torch.device("cuda")
     x = torch.randn(m, n, dtype=dtype, device=device) * 0.5
 
-    fp4_ref, sf_ref, sf_scale = _quantize_reference(x, None, None, None, None,
-                                                    1, 1e-6, 16)
+    fp4_ref, sf_ref, sf_scale = _quantize_reference(x, None, None, None, None, 1, 1e-6, 16)
 
     fp4_fused, sf_fused = torch.ops.trtllm.fused_layernorm_quantize(
         x.contiguous(),
@@ -137,7 +133,8 @@ def test_fused_layernorm_quantize_plain_ln(m, n, dtype):
 
     match_rate = (fp4_fused == fp4_ref).float().mean().item()
     assert match_rate >= 0.99, (
-        f"plain_ln match rate {match_rate:.4f} < 0.99 for ({m}, {n}), {dtype}")
+        f"plain_ln match rate {match_rate:.4f} < 0.99 for ({m}, {n}), {dtype}"
+    )
 
 
 @skip_unless_fused_layernorm_and_fp4
@@ -152,8 +149,7 @@ def test_fused_layernorm_quantize_ln_affine(m, n, dtype):
     ln_w = torch.randn(n, dtype=dtype, device=device) * 0.1 + 1.0
     ln_b = torch.randn(n, dtype=dtype, device=device) * 0.01
 
-    fp4_ref, sf_ref, sf_scale = _quantize_reference(x, ln_w, ln_b, None, None,
-                                                    1, 1e-6, 16)
+    fp4_ref, sf_ref, sf_scale = _quantize_reference(x, ln_w, ln_b, None, None, 1, 1e-6, 16)
 
     fp4_fused, sf_fused = torch.ops.trtllm.fused_layernorm_quantize(
         x.contiguous(),
@@ -197,8 +193,9 @@ def test_fused_layernorm_quantize_adaln(b, s, n, dtype):
     scale_msa = torch.randn(b, n, dtype=dtype, device=device) * 0.1
     shift_msa = torch.randn(b, n, dtype=dtype, device=device) * 0.05
 
-    fp4_ref, sf_ref, sf_scale = _quantize_reference(x, None, None, scale_msa,
-                                                    shift_msa, s, 1e-6, 16)
+    fp4_ref, sf_ref, sf_scale = _quantize_reference(
+        x, None, None, scale_msa, shift_msa, s, 1e-6, 16
+    )
 
     fp4_fused, sf_fused = torch.ops.trtllm.fused_layernorm_quantize(
         x.contiguous(),

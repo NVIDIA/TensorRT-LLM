@@ -14,8 +14,8 @@
  * limitations under the License.
  */
 
-#include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/kernels/fusedLayerNormQuant/fusedLayerNormQuant.cuh"
+#include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/kernels/quantization.h"
 #include "tensorrt_llm/thop/thUtils.h"
 
@@ -62,8 +62,8 @@ namespace torch_ext
  */
 std::tuple<at::Tensor, at::Tensor> fused_layernorm_quantize(at::Tensor const& input,
     std::optional<at::Tensor> const& ln_weight, std::optional<at::Tensor> const& ln_bias,
-    std::optional<at::Tensor> const& scale_msa, std::optional<at::Tensor> const& shift_msa,
-    at::Tensor const& sf_scale, int64_t seq_len_per_batch, double eps, int64_t sf_vec_size)
+    std::optional<at::Tensor> const& scale_msa, std::optional<at::Tensor> const& shift_msa, at::Tensor const& sf_scale,
+    int64_t seq_len_per_batch, double eps, int64_t sf_vec_size)
 {
     CHECK_TH_CUDA(input);
     CHECK_CONTIGUOUS(input);
@@ -79,8 +79,8 @@ std::tuple<at::Tensor, at::Tensor> fused_layernorm_quantize(at::Tensor const& in
 
     bool const has_ln_affine = ln_weight.has_value() && ln_bias.has_value();
     bool const has_modulation = scale_msa.has_value() && shift_msa.has_value();
-    TORCH_CHECK(!(has_ln_affine && has_modulation),
-        "ln_weight/ln_bias and scale_msa/shift_msa are mutually exclusive.");
+    TORCH_CHECK(
+        !(has_ln_affine && has_modulation), "ln_weight/ln_bias and scale_msa/shift_msa are mutually exclusive.");
     TORCH_CHECK(ln_weight.has_value() == ln_bias.has_value(),
         "ln_weight and ln_bias must be provided together (or both omitted).");
     TORCH_CHECK(scale_msa.has_value() == shift_msa.has_value(),

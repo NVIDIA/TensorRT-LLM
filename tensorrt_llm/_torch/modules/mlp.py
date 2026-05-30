@@ -120,8 +120,8 @@ class MLP(nn.Module):
         # `input_scale is not None` check above are the canonical signals.
         has_kernel_gelu = hasattr(torch.ops.trtllm, 'fused_gelu_tanh_quantize')
         is_gelu_tanh = self.activation is gelu_tanh
-        not_dynamic = not getattr(self.down_proj,
-                                  "force_dynamic_quantization", False)
+        not_dynamic = not getattr(self.down_proj, "force_dynamic_quantization",
+                                  False)
 
         self._use_fused_gelu_tanh_quant = (has_nvfp4 and has_kernel_gelu
                                            and has_scale and not_dynamic

@@ -140,8 +140,7 @@ class LayerNorm(nn.Module):
         #   2. an `nvfp4_scale` has been attached to this module,
         #   3. no residual (the fused kernel doesn't support residual yet).
         nvfp4_scale = getattr(self, "nvfp4_scale", None)
-        if (self.is_nvfp4 and nvfp4_scale is not None
-                and residual is ...):
+        if (self.is_nvfp4 and nvfp4_scale is not None and residual is ...):
             # Distinct NVTX label so the fused path shows up clearly in nsys
             # (vs the auto-generated `LayerNorm.forward` range from
             # `--enable_layerwise_nvtx_marker`). Counting these in
@@ -188,8 +187,7 @@ class LayerNorm(nn.Module):
         # Broadcasting handles the typical Wan shapes: hidden_states is
         # [B, S, N], scale_msa/shift_msa are [B, 1, N], result is [B, S, N].
         if scale_msa is not None and shift_msa is not None:
-            hidden_states = (hidden_states *
-                             (1 + scale_msa.to(torch.float32)) +
+            hidden_states = (hidden_states * (1 + scale_msa.to(torch.float32)) +
                              shift_msa.to(torch.float32))
 
         # Cast back to input dtype after all FP32 math is done.

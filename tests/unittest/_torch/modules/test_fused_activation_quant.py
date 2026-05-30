@@ -53,7 +53,9 @@ skip_unless_fused_relu2_and_fp4_quantize = pytest.mark.skipif(
 )
 
 skip_unless_fused_gelu_tanh_and_fp4_quantize = pytest.mark.skipif(
-    getSMVersion() < 100 or not fused_gelu_tanh_quantize_available() or not fp4_quantize_available(),
+    getSMVersion() < 100
+    or not fused_gelu_tanh_quantize_available()
+    or not fp4_quantize_available(),
     reason="Requires SM100+ (Blackwell) and trtllm fused_gelu_tanh_quantize + fp4_quantize ops",
 )
 

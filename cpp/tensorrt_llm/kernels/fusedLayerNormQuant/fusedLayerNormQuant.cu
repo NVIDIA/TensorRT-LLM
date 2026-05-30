@@ -36,7 +36,8 @@ namespace kernels
 // dispatch at the launcher based on params.N.
 static constexpr int kN_HARDCODED = 5120;
 static constexpr int ELTS_PER_VEC = 8;
-static constexpr int NUM_THREADS_PER_SF = LN_FP4_BLOCK_SIZE / ELTS_PER_VEC; // 2 (pairs of threads share one 16-elem SF block)
+static constexpr int NUM_THREADS_PER_SF
+    = LN_FP4_BLOCK_SIZE / ELTS_PER_VEC; // 2 (pairs of threads share one 16-elem SF block)
 
 /*
  * Inline FP32 -> FP4 (e2m1) quantization for 8 floats.
@@ -52,10 +53,9 @@ static constexpr int NUM_THREADS_PER_SF = LN_FP4_BLOCK_SIZE / ELTS_PER_VEC; // 2
  *   3. Compute the FP8 (e4m3) scale factor and write it.
  *   4. Scale the 8 floats by the inverse and convert to packed FP4 (e2m1).
  */
-__device__ __forceinline__ uint32_t cvt_float_to_fp4_inline(
-    float* vals,        // 8 float values to quantize (read+modified)
-    float sfScaleVal,   // global activation scale (calibrated module.input_scale)
-    uint8_t* sfOutPtr)  // output position for the 1-byte FP8 scale factor
+__device__ __forceinline__ uint32_t cvt_float_to_fp4_inline(float* vals, // 8 float values to quantize (read+modified)
+    float sfScaleVal,  // global activation scale (calibrated module.input_scale)
+    uint8_t* sfOutPtr) // output position for the 1-byte FP8 scale factor
 {
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
     // 1. Local max-abs across 8 values held by this thread.
@@ -79,9 +79,8 @@ __device__ __forceinline__ uint32_t cvt_float_to_fp4_inline(
     float sfValueQuant = static_cast<float>(sfFp8);
 
     // Output scale used to map each float into [-E2M1_MAX, E2M1_MAX].
-    float outputScale = (localMax != 0.0f)
-        ? reciprocal_approximate_ftz(sfValueQuant * reciprocal_approximate_ftz(sfScaleVal))
-        : 0.0f;
+    float outputScale
+        = (localMax != 0.0f) ? reciprocal_approximate_ftz(sfValueQuant * reciprocal_approximate_ftz(sfScaleVal)) : 0.0f;
 
     if (sfOutPtr)
     {
@@ -127,31 +126,22 @@ __global__ void
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
 __launch_bounds__(BLOCK_SIZE, 4)
 #endif
-fusedLayerNormQuantKernel(
-    T const* __restrict__ x,
-    T const* __restrict__ ln_weight,
-    T const* __restrict__ ln_bias,
-    T const* __restrict__ scale_msa,
-    T const* __restrict__ shift_msa,
-    uint32_t* __restrict__ y_fp4,
-    uint32_t* __restrict__ sf_out,
-    float const* __restrict__ sf_scale,
-    int M,
-    int seq_len_per_batch,
-    float eps)
+    fusedLayerNormQuantKernel(T const* __restrict__ x, T const* __restrict__ ln_weight, T const* __restrict__ ln_bias,
+        T const* __restrict__ scale_msa, T const* __restrict__ shift_msa, uint32_t* __restrict__ y_fp4,
+        uint32_t* __restrict__ sf_out, float const* __restrict__ sf_scale, int M, int seq_len_per_batch, float eps)
 {
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
     using T2 = typename packed_as<T, 2>::type;
 
     static_assert(kN_HARDCODED % BLOCK_SIZE == 0, "N must be divisible by BLOCK_SIZE");
-    static_assert((kN_HARDCODED / BLOCK_SIZE) % ELTS_PER_VEC == 0,
-        "elements per thread must be a multiple of ELTS_PER_VEC (8)");
+    static_assert(
+        (kN_HARDCODED / BLOCK_SIZE) % ELTS_PER_VEC == 0, "elements per thread must be a multiple of ELTS_PER_VEC (8)");
     static_assert(BLOCK_SIZE % 32 == 0, "BLOCK_SIZE must be a multiple of warp size");
     static_assert(BLOCK_SIZE / 32 <= 32, "block-level reduction requires numWarps <= 32");
 
-    constexpr int ELEMS_PER_THREAD = kN_HARDCODED / BLOCK_SIZE;          // 40 for default
-    constexpr int CHUNKS_PER_THREAD = ELEMS_PER_THREAD / ELTS_PER_VEC;   // 5  for default
-    constexpr int NUM_WARPS = BLOCK_SIZE / 32;                           // 4  for default
+    constexpr int ELEMS_PER_THREAD = kN_HARDCODED / BLOCK_SIZE;        // 40 for default
+    constexpr int CHUNKS_PER_THREAD = ELEMS_PER_THREAD / ELTS_PER_VEC; // 5  for default
+    constexpr int NUM_WARPS = BLOCK_SIZE / 32;                         // 4  for default
 
     int const row = blockIdx.x;
     int const tid = threadIdx.x;
@@ -210,9 +200,9 @@ fusedLayerNormQuantKernel(
             {
                 xf2 = __bfloat1622float2(xVec2[i]);
             }
-            xVals[chunk * ELTS_PER_VEC + i * 2]     = xf2.x;
+            xVals[chunk * ELTS_PER_VEC + i * 2] = xf2.x;
             xVals[chunk * ELTS_PER_VEC + i * 2 + 1] = xf2.y;
-            localSum   += xf2.x + xf2.y;
+            localSum += xf2.x + xf2.y;
             localSqSum += xf2.x * xf2.x + xf2.y * xf2.y;
         }
     }
@@ -221,13 +211,13 @@ fusedLayerNormQuantKernel(
 #pragma unroll
     for (int offset = 16; offset > 0; offset /= 2)
     {
-        localSum   += __shfl_xor_sync(0xffffffff, localSum,   offset);
+        localSum += __shfl_xor_sync(0xffffffff, localSum, offset);
         localSqSum += __shfl_xor_sync(0xffffffff, localSqSum, offset);
     }
 
     if (laneId == 0)
     {
-        warpSums[warpId]   = localSum;
+        warpSums[warpId] = localSum;
         warpSqSums[warpId] = localSqSum;
     }
     __syncthreads();
@@ -235,18 +225,18 @@ fusedLayerNormQuantKernel(
     // Cross-warp reduction inside warp 0, then publish mean & rstd.
     if (warpId == 0)
     {
-        float s  = (laneId < NUM_WARPS) ? warpSums[laneId]   : 0.0f;
+        float s = (laneId < NUM_WARPS) ? warpSums[laneId] : 0.0f;
         float s2 = (laneId < NUM_WARPS) ? warpSqSums[laneId] : 0.0f;
 #pragma unroll
         for (int offset = 16; offset > 0; offset /= 2)
         {
-            s  += __shfl_xor_sync(0xffffffff, s,  offset);
+            s += __shfl_xor_sync(0xffffffff, s, offset);
             s2 += __shfl_xor_sync(0xffffffff, s2, offset);
         }
         if (laneId == 0)
         {
             float mean = s * invN;
-            float var  = s2 * invN - mean * mean;
+            float var = s2 * invN - mean * mean;
             meanRstd[0] = mean;
             meanRstd[1] = rsqrtf(var + eps);
         }
@@ -273,7 +263,7 @@ fusedLayerNormQuantKernel(
         if constexpr (HAS_LN_AFFINE)
         {
             uint4 wVec = *reinterpret_cast<uint4 const*>(ln_weight + elem_offset);
-            uint4 bVec = *reinterpret_cast<uint4 const*>(ln_bias   + elem_offset);
+            uint4 bVec = *reinterpret_cast<uint4 const*>(ln_bias + elem_offset);
             T2 const* wVec2 = reinterpret_cast<T2 const*>(&wVec);
             T2 const* bVec2 = reinterpret_cast<T2 const*>(&bVec);
 #pragma unroll
@@ -290,17 +280,17 @@ fusedLayerNormQuantKernel(
                     wf2 = __bfloat1622float2(wVec2[i]);
                     bf2 = __bfloat1622float2(bVec2[i]);
                 }
-                wVals[i * 2]     = wf2.x;
+                wVals[i * 2] = wf2.x;
                 wVals[i * 2 + 1] = wf2.y;
-                bVals[i * 2]     = bf2.x;
+                bVals[i * 2] = bf2.x;
                 bVals[i * 2 + 1] = bf2.y;
             }
         }
         else if constexpr (HAS_MODULATION)
         {
-            uint4 sVec  = *reinterpret_cast<uint4 const*>(scale_msa_row + elem_offset);
+            uint4 sVec = *reinterpret_cast<uint4 const*>(scale_msa_row + elem_offset);
             uint4 shVec = *reinterpret_cast<uint4 const*>(shift_msa_row + elem_offset);
-            T2 const* sVec2  = reinterpret_cast<T2 const*>(&sVec);
+            T2 const* sVec2 = reinterpret_cast<T2 const*>(&sVec);
             T2 const* shVec2 = reinterpret_cast<T2 const*>(&shVec);
 #pragma unroll
             for (int i = 0; i < 4; ++i)
@@ -308,19 +298,19 @@ fusedLayerNormQuantKernel(
                 float2 sf2, shf2;
                 if constexpr (std::is_same_v<T, half>)
                 {
-                    sf2  = __half22float2(sVec2[i]);
+                    sf2 = __half22float2(sVec2[i]);
                     shf2 = __half22float2(shVec2[i]);
                 }
                 else
                 {
-                    sf2  = __bfloat1622float2(sVec2[i]);
+                    sf2 = __bfloat1622float2(sVec2[i]);
                     shf2 = __bfloat1622float2(shVec2[i]);
                 }
                 // AdaLN: y = normalized * (1 + scale_msa) + shift_msa.
                 // Fold the +1 into the weight so phase 2 is one fused mul-add.
-                wVals[i * 2]     = 1.0f + sf2.x;
+                wVals[i * 2] = 1.0f + sf2.x;
                 wVals[i * 2 + 1] = 1.0f + sf2.y;
-                bVals[i * 2]     = shf2.x;
+                bVals[i * 2] = shf2.x;
                 bVals[i * 2 + 1] = shf2.y;
             }
         }
@@ -347,8 +337,7 @@ fusedLayerNormQuantKernel(
         std::optional<int> optionalBatchIdx = std::nullopt;
         std::optional<int> optionalNumRows = M;
         uint8_t* sfOutPtr = cvt_quant_get_sf_out_offset<uint32_t, NUM_THREADS_PER_SF>(
-            optionalBatchIdx, row, vec_idx, optionalNumRows, numSfVecsTotal,
-            sf_out, QuantizationSFLayout::SWIZZLED);
+            optionalBatchIdx, row, vec_idx, optionalNumRows, numSfVecsTotal, sf_out, QuantizationSFLayout::SWIZZLED);
 
         uint32_t fp4Packed = cvt_float_to_fp4_inline(yVals, sfScaleVal, sfOutPtr);
 
@@ -371,12 +360,11 @@ void invokeFusedLayerNormQuant(FusedLayerNormQuantParams<T> const& params, int /
     TLLM_CHECK_WITH_INFO(
         params.N == kN_HARDCODED, "fusedLayerNormQuant v1 supports N=%d only (got %d).", kN_HARDCODED, params.N);
     TLLM_CHECK_WITH_INFO(
-        !(params.has_ln_affine && params.has_modulation),
-        "has_ln_affine and has_modulation are mutually exclusive.");
+        !(params.has_ln_affine && params.has_modulation), "has_ln_affine and has_modulation are mutually exclusive.");
     if (params.has_modulation)
     {
-        TLLM_CHECK_WITH_INFO(params.seq_len_per_batch > 0,
-            "seq_len_per_batch must be positive when has_modulation is true.");
+        TLLM_CHECK_WITH_INFO(
+            params.seq_len_per_batch > 0, "seq_len_per_batch must be positive when has_modulation is true.");
         TLLM_CHECK_WITH_INFO(params.M % params.seq_len_per_batch == 0,
             "M (%d) must be divisible by seq_len_per_batch (%d).", params.M, params.seq_len_per_batch);
     }
@@ -388,22 +376,22 @@ void invokeFusedLayerNormQuant(FusedLayerNormQuantParams<T> const& params, int /
     {
         fusedLayerNormQuantKernel<T, BLOCK_SIZE, /*HAS_LN_AFFINE=*/true, /*HAS_MODULATION=*/false>
             <<<grid, block, 0, params.stream>>>(params.x, params.ln_weight, params.ln_bias,
-                /*scale_msa=*/nullptr, /*shift_msa=*/nullptr, params.y_fp4, params.sf_out, params.sf_scale,
-                params.M, params.seq_len_per_batch, params.eps);
+                /*scale_msa=*/nullptr, /*shift_msa=*/nullptr, params.y_fp4, params.sf_out, params.sf_scale, params.M,
+                params.seq_len_per_batch, params.eps);
     }
     else if (params.has_modulation)
     {
         fusedLayerNormQuantKernel<T, BLOCK_SIZE, /*HAS_LN_AFFINE=*/false, /*HAS_MODULATION=*/true>
-            <<<grid, block, 0, params.stream>>>(params.x, /*ln_weight=*/nullptr, /*ln_bias=*/nullptr,
-                params.scale_msa, params.shift_msa, params.y_fp4, params.sf_out, params.sf_scale,
-                params.M, params.seq_len_per_batch, params.eps);
+            <<<grid, block, 0, params.stream>>>(params.x, /*ln_weight=*/nullptr, /*ln_bias=*/nullptr, params.scale_msa,
+                params.shift_msa, params.y_fp4, params.sf_out, params.sf_scale, params.M, params.seq_len_per_batch,
+                params.eps);
     }
     else
     {
         fusedLayerNormQuantKernel<T, BLOCK_SIZE, /*HAS_LN_AFFINE=*/false, /*HAS_MODULATION=*/false>
             <<<grid, block, 0, params.stream>>>(params.x, /*ln_weight=*/nullptr, /*ln_bias=*/nullptr,
-                /*scale_msa=*/nullptr, /*shift_msa=*/nullptr, params.y_fp4, params.sf_out, params.sf_scale,
-                params.M, params.seq_len_per_batch, params.eps);
+                /*scale_msa=*/nullptr, /*shift_msa=*/nullptr, params.y_fp4, params.sf_out, params.sf_scale, params.M,
+                params.seq_len_per_batch, params.eps);
     }
 
     sync_check_cuda_error(params.stream);

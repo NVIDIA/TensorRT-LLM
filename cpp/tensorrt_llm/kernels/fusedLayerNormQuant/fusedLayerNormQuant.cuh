@@ -63,20 +63,20 @@ constexpr int LN_FP4_BLOCK_SIZE = 16;
 template <typename T>
 struct FusedLayerNormQuantParams
 {
-    T const* x;                  // Input, shape [M, N], contiguous
-    T const* ln_weight;          // [N] - used only if has_ln_affine
-    T const* ln_bias;            // [N] - used only if has_ln_affine
-    T const* scale_msa;          // [B, N] - used only if has_modulation
-    T const* shift_msa;          // [B, N] - used only if has_modulation
-    uint32_t* y_fp4;             // FP4 output, [M, N/8] (8 FP4 packed per uint32)
-    uint32_t* sf_out;            // FP8 scale-factor output, swizzled layout
-    float const* sf_scale;       // Scalar global activation scale (calibrated module.input_scale)
-    int M;                       // Total rows = B * seq_len_per_batch
-    int N;                       // Hidden dimension (5120 for Wan 2.2)
-    int seq_len_per_batch;       // Used only if has_modulation; batch_idx = row / seq_len_per_batch
-    bool has_ln_affine;          // Dispatch flag: norm2 -> true, norm1/norm3 -> false
-    bool has_modulation;         // Dispatch flag: norm1/norm3 -> true, norm2 -> false
-    float eps;                   // LayerNorm epsilon
+    T const* x;            // Input, shape [M, N], contiguous
+    T const* ln_weight;    // [N] - used only if has_ln_affine
+    T const* ln_bias;      // [N] - used only if has_ln_affine
+    T const* scale_msa;    // [B, N] - used only if has_modulation
+    T const* shift_msa;    // [B, N] - used only if has_modulation
+    uint32_t* y_fp4;       // FP4 output, [M, N/8] (8 FP4 packed per uint32)
+    uint32_t* sf_out;      // FP8 scale-factor output, swizzled layout
+    float const* sf_scale; // Scalar global activation scale (calibrated module.input_scale)
+    int M;                 // Total rows = B * seq_len_per_batch
+    int N;                 // Hidden dimension (5120 for Wan 2.2)
+    int seq_len_per_batch; // Used only if has_modulation; batch_idx = row / seq_len_per_batch
+    bool has_ln_affine;    // Dispatch flag: norm2 -> true, norm1/norm3 -> false
+    bool has_modulation;   // Dispatch flag: norm1/norm3 -> true, norm2 -> false
+    float eps;             // LayerNorm epsilon
     cudaStream_t stream;
 };
 
