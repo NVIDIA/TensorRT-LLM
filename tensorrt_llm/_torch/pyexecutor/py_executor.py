@@ -374,13 +374,6 @@ class PyExecutor:
         self.num_fetch_requests_cur_rank = 0
         self.num_fetch_requests = 0
         self.shutdown_event = threading.Event()
-        self._disagg_gen_init_prepared_ids: Dict[
-            ResourceManagerType, set[int]] = {
-                ResourceManagerType.KV_CACHE_MANAGER: set(),
-                ResourceManagerType.SPEC_RESOURCE_MANAGER: set(),
-                ResourceManagerType.DRAFT_KV_CACHE_MANAGER: set(),
-            }
-        self._disagg_gen_kv_recv_started_ids: set[int] = set()
 
         # Rolling acceptance tracking for spec decode (disable speculation if rolling acceptance is below threshold)
         spec_config = getattr(self.model_engine, 'spec_config', None)
@@ -3820,6 +3813,9 @@ class PyExecutor:
     @nvtx_range("_prepare_disagg_gen_init")
     def _prepare_disagg_gen_init(self, fitting_disagg_gen_init_requests):
         if fitting_disagg_gen_init_requests:
+            disagg_gen_init_to_prepare = ScheduledRequests()
+            disagg_gen_init_to_prepare.context_requests_last_chunk = fitting_disagg_gen_init_requests
+
             for resource_mgr_type in (
                     ResourceManagerType.KV_CACHE_MANAGER,
                     ResourceManagerType.SPEC_RESOURCE_MANAGER,
@@ -3827,22 +3823,9 @@ class PyExecutor:
                 if (resource_mgr_type in self.resource_manager.resource_managers
                         and self.resource_manager.
                         resource_managers[resource_mgr_type] is not None):
-                    prepared_ids = self._disagg_gen_init_prepared_ids[
-                        resource_mgr_type]
-                    resources_to_prepare = [
-                        req for req in fitting_disagg_gen_init_requests
-                        if req.py_request_id not in prepared_ids
-                    ]
-                    if not resources_to_prepare:
-                        continue
-
-                    disagg_gen_init_to_prepare = ScheduledRequests()
-                    disagg_gen_init_to_prepare.context_requests_last_chunk = resources_to_prepare
                     self.resource_manager.resource_managers[
                         resource_mgr_type].prepare_resources(
                             disagg_gen_init_to_prepare)
-                    for req in resources_to_prepare:
-                        prepared_ids.add(req.py_request_id)
 
             # Trigger KV cache exchange for new disagg_gen_init_requests
             self._recv_disagg_gen_cache(fitting_disagg_gen_init_requests)
@@ -3928,29 +3911,12 @@ class PyExecutor:
                 req.state = LlmRequestState.DISAGG_GENERATION_TRANS_COMPLETE
             return
 
-        recv_reqs = [
-            req for req in new_gen_reqs
-            if req.py_request_id not in self._disagg_gen_kv_recv_started_ids
-        ]
-
         if os.getenv("TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP") == "1":
-            for req in recv_reqs:
-                self._disagg_gen_kv_recv_started_ids.add(req.py_request_id)
-                try:
-                    self.kv_cache_transceiver.request_and_receive_sync(req)
-                except Exception:
-                    self._disagg_gen_kv_recv_started_ids.discard(
-                        req.py_request_id)
-                    raise
+            for req in new_gen_reqs:
+                self.kv_cache_transceiver.request_and_receive_sync(req)
         else:
-            for req in recv_reqs:
-                self._disagg_gen_kv_recv_started_ids.add(req.py_request_id)
-                try:
-                    self.kv_cache_transceiver.request_and_receive_async(req)
-                except Exception:
-                    self._disagg_gen_kv_recv_started_ids.discard(
-                        req.py_request_id)
-                    raise
+            for req in new_gen_reqs:
+                self.kv_cache_transceiver.request_and_receive_async(req)
 
         if self.kv_cache_transceiver.kv_transfer_timeout_ms is not None:
             for req in new_gen_reqs:
@@ -4398,10 +4364,6 @@ class PyExecutor:
 
         if self.gather_all_responses or self.dist.rank == 0:
             self.result_wait_queues.pop(request.py_request_id, None)
-
-        for prepared_ids in self._disagg_gen_init_prepared_ids.values():
-            prepared_ids.discard(request.py_request_id)
-        self._disagg_gen_kv_recv_started_ids.discard(request.py_request_id)
 
     def _is_request_in_transmission(self, request) -> bool:
         """Check if a request is currently in transmission state."""
