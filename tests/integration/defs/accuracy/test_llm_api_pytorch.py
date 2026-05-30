@@ -6575,6 +6575,7 @@ class TestQwen3_5_4B(LlmapiAccuracyTestHarness):
     def test_bf16(self):
         model_path = f"{llm_models_root()}/Qwen3.5-4B"
         with LLM(model_path,
+                 trust_remote_code=True,
                  max_seq_len=4096,
                  max_batch_size=128,
                  kv_cache_config=self.kv_cache_config,
@@ -6587,6 +6588,7 @@ class TestQwen3_5_4B(LlmapiAccuracyTestHarness):
     def test_fp8(self):
         model_path = f"{llm_models_root()}/Qwen3.5-4B-FP8"
         with LLM(model_path,
+                 trust_remote_code=True,
                  max_seq_len=4096,
                  max_batch_size=128,
                  kv_cache_config=self.kv_cache_config,
@@ -6608,6 +6610,7 @@ class TestQwen3_5_4B(LlmapiAccuracyTestHarness):
         extra_acc_spec = "h20" if is_h20_gpu else None
 
         with LLM(target_model_path,
+                 trust_remote_code=True,
                  max_seq_len=4096,
                  max_batch_size=8,
                  kv_cache_config=self.kv_cache_config,
@@ -6707,6 +6710,7 @@ class TestQwen3_5_35B_A3B(LlmapiAccuracyTestHarness):
         extra_acc_spec = "h20" if is_h20_gpu else None
 
         with LLM(self.MODEL_PATH,
+                 trust_remote_code=True,
                  tensor_parallel_size=tp_size,
                  moe_expert_parallel_size=1,
                  max_seq_len=4096,
@@ -6736,6 +6740,7 @@ class TestQwen3_5_35B_A3B(LlmapiAccuracyTestHarness):
         ) if mtp_flag else None
 
         with LLM(self.MODEL_PATH,
+                 trust_remote_code=True,
                  tensor_parallel_size=1,
                  moe_expert_parallel_size=1,
                  max_seq_len=4096,
@@ -6763,6 +6768,7 @@ class TestQwen3_5_35B_A3B(LlmapiAccuracyTestHarness):
         cuda_graph_config = CudaGraphConfig(enable_padding=True,
                                             max_batch_size=128)
         with LLM(model_dir,
+                 trust_remote_code=True,
                  tensor_parallel_size=1,
                  moe_expert_parallel_size=1,
                  max_seq_len=4096,
@@ -6802,6 +6808,7 @@ class TestQwen3_5_9B(LlmapiAccuracyTestHarness):
         ) if mtp_flag else None
 
         with LLM(self.MODEL_PATH,
+                 trust_remote_code=True,
                  max_seq_len=4096,
                  max_num_tokens=4096,
                  max_batch_size=128,
@@ -6863,6 +6870,7 @@ class TestQwen3_5_397B_A17B(LlmapiAccuracyTestHarness):
                               if cuda_graph else None)
 
         with LLM(model_path,
+                 trust_remote_code=True,
                  tensor_parallel_size=tp_size,
                  max_num_tokens=16384,
                  max_batch_size=32,
