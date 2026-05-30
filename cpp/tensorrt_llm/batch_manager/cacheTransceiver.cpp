@@ -439,10 +439,6 @@ void CacheTransceiver::requestAndReceiveAsync(std::shared_ptr<LlmRequest> llmReq
     }
 
     auto future = mCacheReceiver->receiveAsync(*llmRequest);
-    // Cache the raw pointer before moving the shared_ptr into the futures vector
-    // so we can still call setState() to preserve upstream's
-    // receiveAsync -> emplace -> setState ordering (A5 reorder explicitly NOT
-    // included in this Tier-1 baseline).
     auto* requestPtr = llmRequest.get();
     mRequesterFutures.emplace_back(std::move(llmRequest), std::move(future));
     requestPtr->setState(LlmRequestState::kDISAGG_GENERATION_TRANS_IN_PROGRESS);
@@ -552,12 +548,8 @@ RequestStatuses CacheTransceiver::checkContextTransferStatus(
     {
         senderFutureTimeoutMs = mCacheTransceiverConfig->getKvTransferSenderFutureTimeoutMs();
     }
-    // Observe-only overall-deadline check. The configured kvTransferTimeoutMs
-    // is the wall-clock budget for an entire transfer; if exceeded we emit a
-    // single WARN (dedup'd via mTimedOutSenderIds) but do NOT take action —
-    // this Tier-1 baseline intentionally leaves cancel / state transitions /
-    // eviction to higher layers so we can isolate the source of the
-    // cross-rank wedge.
+    // Observe-only: WARN per-request when the wall-clock transfer time exceeds
+    // kvTransferTimeoutMs. No cancellation, eviction, or state transition.
     std::optional<int> kvTransferTimeoutMs = std::nullopt;
     if (mCacheTransceiverConfig.has_value())
     {
@@ -619,13 +611,6 @@ RequestStatuses CacheTransceiver::checkContextTransferStatus(
     for (auto it = mSenderFutures.begin(); it != mSenderFutures.end();)
     {
         auto& [request, future] = *it;
-        // Observe-only overall-deadline WARN. Emitted at most once per
-        // requestId (dedup'd via mTimedOutSenderIds) when the wall-clock
-        // elapsed time since transfer start exceeds the configured budget.
-        // No action is taken — this is purely diagnostic for the Tier-1
-        // baseline. If the request later completes or errors, the entry is
-        // removed from mTimedOutSenderIds in the normal eviction paths
-        // below so a re-enqueued requestId can be warned about again.
         if (kvTransferTimeoutMs.has_value())
         {
             auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -805,13 +790,7 @@ void CacheTransceiver::checkGenTransferStatus(std::optional<int> const& atLeastR
             " checkGenTransferStatus toCompleteIdSet size: %zu, atLeastRequestNum: %d ", toCompleteIdSet.size(),
             atLeastRequestNum.value_or(0));
     }
-    // Observe-only overall-deadline check for the generation side. Mirrors
-    // the context-side logic in checkContextTransferStatus: emit a WARN at
-    // most once per requestId via the mTimedOutRequesterIds dedup set when
-    // the wall-clock elapsed time since transfer start exceeds the
-    // configured budget. No action is taken — eviction / state transitions
-    // / cancellation are intentionally left to higher layers in this
-    // Tier-1 baseline.
+    // Observe-only: gen-side mirror of the context-side timeout WARN.
     std::optional<int> kvTransferTimeoutMs = std::nullopt;
     if (mCacheTransceiverConfig.has_value())
     {

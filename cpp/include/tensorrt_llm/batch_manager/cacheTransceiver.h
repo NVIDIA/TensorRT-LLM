@@ -205,10 +205,8 @@ class BaseCacheTransceiver
 {
 public:
     virtual ~BaseCacheTransceiver() = default;
-    // These methods take std::shared_ptr<LlmRequest> so the transceiver and
-    // its async workers can hold a strong reference for the duration of the
-    // transfer. See the comment on CacheTransceiver::mSenderFutures for the
-    // lifetime invariant (kept in one place to avoid drift).
+    // Async entry points take shared_ptr so the async worker holds a strong
+    // reference for the transfer lifetime; see CacheTransceiver::mSenderFutures.
     virtual void respondAndSendAsync(std::shared_ptr<LlmRequest> llmRequest) = 0;
     virtual void respondAndSendLayerWise(
         RequestVector const& requests, std::shared_ptr<ContextProgress> const& progress)
@@ -281,24 +279,12 @@ private:
 
     std::unique_ptr<CacheSender> mCacheSender;
     std::unique_ptr<CacheReceiver> mCacheReceiver;
-    // Store shared_ptr rather than raw LlmRequest* so the futures map holds a
-    // strong reference for the duration of the transfer. Otherwise Python's
-    // _terminate_request can drop its pybind shared_ptr while the C++ side's
-    // raw pointer is still dereferenced by checkGenTransferStatus /
-    // checkContextTransferStatus (the UAF forensically confirmed via
-    // MALLOC_PERTURB_=85 producing mRequestId=0x5555555555555555). Entries are
-    // erased only in the normal eviction paths (completion, deadline,
-    // exception), ensuring the request outlives every C++ access but doesn't
-    // leak past the transfer lifecycle.
+    // shared_ptr (not raw LlmRequest*) so the futures hold a strong reference for
+    // the transfer lifetime; otherwise Python's _terminate_request can drop the
+    // request while a C++ status check still dereferences it.
     std::vector<std::pair<std::shared_ptr<LlmRequest>, std::future<void>>> mSenderFutures;
     std::vector<std::pair<std::shared_ptr<LlmRequest>, std::future<void>>> mRequesterFutures;
-    // Dedup sets for observe-only timeout WARN logs. Each requestId is logged
-    // at most once per transfer so a stuck transfer doesn't produce a WARN
-    // flood as the polling loop revisits the entry each tick. Indexed by role:
-    // mTimedOutSenderIds tracks context-side (mSenderFutures) and
-    // mTimedOutRequesterIds tracks generation-side (mRequesterFutures).
-    // Entries are erased when the corresponding future is removed from the
-    // futures vector (completion, error, or status transition).
+    // Dedup sets so observe-only timeout WARN logs fire at most once per stuck request.
     std::unordered_set<LlmRequest::RequestIdType> mTimedOutSenderIds;
     std::unordered_set<LlmRequest::RequestIdType> mTimedOutRequesterIds;
     mpi::MpiComm const* mMpiWorldComm{nullptr};

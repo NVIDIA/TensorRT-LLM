@@ -1884,25 +1884,11 @@ class PyExecutor:
                         and req.py_disaggregated_params.schedule_style ==
                         DisaggScheduleStyle.GENERATION_FIRST
                         for req in self.active_requests)
-                    # The downstream C++ checkContextTransferStatus runs a
-                    # cross-rank gatherRequestIds collective on the ctx-side
-                    # comm (mGroupTPInDPComm with attention-DP, otherwise
-                    # mGroupTensorParaComm). Any rank-asymmetric gate here
-                    # (e.g. the previous `if num_fitting_reqs == 0` predicate,
-                    # which reads rank-local scheduler / async-transfer-manager
-                    # state and diverges in helix-CP setups by design) causes
-                    # ABBA deadlock against the next unconditional collective
-                    # on the same ranks (sampler NCCL ops, _can_queue's
-                    # tp_allgather, PP step boundary). All ctx-side ranks must
-                    # enter this call together, so the gate is intentionally
-                    # absent. at_least_num is rank-local and only affects the
-                    # per-request loop behavior inside the C++ function
-                    # (blockAll vs polling), which is safe to diverge --
-                    # mirrors bdfdf8be02's fix for
-                    # _check_disagg_gen_transfer_status. See PR #13713 CI
-                    # build #39569 helix test hang for the failure signature
-                    # on TestQwen3_8B::test_auto_dtype_with_helix
-                    # [pp1tp1cp4, pp1tp2cp2].
+                    # Rank-symmetric entry into _check_disagg_ctx_cache_transfer_status:
+                    # every ctx rank must call this so the C++ gatherRequestIds Allgather
+                    # inside it is reached symmetrically, else ABBA against the next
+                    # unconditional collective. at_least_num is rank-local; only the
+                    # entry must be symmetric.
                     at_least_num = 0
                     if (num_fitting_reqs == 0
                             and not fitting_disagg_gen_init_requests
@@ -2446,12 +2432,7 @@ class PyExecutor:
                 req.py_disaggregated_params and req.py_disaggregated_params.
                 schedule_style == DisaggScheduleStyle.GENERATION_FIRST
                 for req in self.active_requests)
-            # Same rank-symmetric pattern as _executor_loop_pp above; see
-            # rationale comment there. The C++ gatherRequestIds collective
-            # inside checkContextTransferStatus must be entered by every
-            # ctx-side rank together. at_least_num is rank-local and safe
-            # to diverge (it only controls per-request loop behavior inside
-            # the C++ function, not collective entry).
+            # Rank-symmetric entry; see _executor_loop_pp for rationale.
             at_least_num = 0
             if (num_fitting_reqs == 0 and not fitting_disagg_gen_init_requests
                     and not all_gen_first):
@@ -3700,16 +3681,9 @@ class PyExecutor:
 
     @nvtx_range("_check_disagg_gen_transfer_status")
     def _check_disagg_gen_transfer_status(self):
-        # The downstream C++ checkGenTransferStatus runs a cross-rank
-        # gatherRequestIds collective on the gen-side comm. Any
-        # rank-asymmetric gate here (e.g. the previous "if need_check"
-        # predicate, which reads rank-local LlmRequest state from
-        # self.active_requests) causes ABBA deadlock against the next
-        # unconditional collective on the same ranks (helix CI #39529
-        # hang). All gen-side ranks must enter this call together, so
-        # the gate is intentionally absent. at_least_num is rank-local
-        # and only affects the per-request loop behavior inside the C++
-        # function (blockAll vs polling), which is safe to diverge.
+        # Entered unconditionally so the C++ gatherRequestIds Allgather inside
+        # checkGenTransferStatus is reached by every gen rank. at_least_num is
+        # rank-local; only the entry must be symmetric.
         non_gen_first_reqs = [
             req for req in self.active_requests
             if req.py_disaggregated_params and req.py_disaggregated_params.
@@ -3871,15 +3845,9 @@ class PyExecutor:
                         resource_mgr_type].prepare_resources(
                             disagg_gen_init_to_prepare)
 
-        # Always trigger _recv_disagg_gen_cache, even when this rank has no
-        # newly fitting disagg-gen-init requests. The downstream C++
-        # checkGenTransferStatus runs a cross-rank gatherRequestIds
-        # collective on the gen-side comm; skipping it on ranks with no
-        # local work creates the rank-asymmetric entry that produces an
-        # ABBA deadlock with the next unconditional collective on the
-        # same ranks.
-        # _recv_disagg_gen_cache handles the empty-input case as a no-op
-        # for the receive work while still entering the collective.
+        # Unconditional call: every gen rank must reach _recv_disagg_gen_cache
+        # so the downstream gatherRequestIds Allgather is entered symmetrically.
+        # Empty-input case is a no-op for the receive work.
         self._recv_disagg_gen_cache(fitting_disagg_gen_init_requests)
 
     @nvtx_range("_prepare_disagg_gen_transmission_complete")

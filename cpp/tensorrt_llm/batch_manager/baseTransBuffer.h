@@ -48,24 +48,9 @@ enum class BufferKind : uint8_t
 
 class BaseTransBufferManager;
 
-/// @brief RAII scoped holder for a buffer index acquired from
-///        BaseTransBufferManager::assignBufferIndexForRecv /
-///        assignBufferIndexForSend. Releases the index on destruction,
-///        including stack unwind from exceptions.
-///
-/// Motivation: CacheReceiver::Impl::requestSync has at least six exit
-/// paths (normal, early-cancel, not-ready, cancel-after-ready,
-/// receiveReadySignal cancelled, exception from requestSync). Pre-fix,
-/// the buffer-index release lived inside receiveSync's formatter, so any
-/// exit path that skipped receiveSync leaked one index. Under saturation
-/// even a single leaked index permanently wedged the (default size-1)
-/// pool, so every subsequent request waited forever for an index that
-/// would never be released.
-///
-/// This holder closes that class of bug rather than patching the one
-/// observed branch. Move-only so ownership is unambiguous; `detach()`
-/// hands off ownership when the formatter inside receiveSync takes the
-/// buffer's release responsibility on the happy path.
+/// @brief RAII holder for an index from BaseTransBufferManager::assignBufferIndexFor{Send,Recv}.
+///        Releases on destruction (incl. exception unwind). Move-only; call release() on
+///        the happy path or detach() when ownership is handed off downstream.
 class BufferIndexHolder
 {
 public:
@@ -81,10 +66,8 @@ public:
     {
     }
 
-    // The destructor is inline but `release()` is out-of-line in
-    // baseTransBuffer.cpp because it dereferences BaseTransBufferManager and
-    // needs the full definition; defining it inline would create an include
-    // cycle between this header and the manager definition.
+    // release() is out-of-line in baseTransBuffer.cpp to avoid the include cycle
+    // with BaseTransBufferManager.
     ~BufferIndexHolder()
     {
         release();
@@ -137,16 +120,7 @@ public:
         return mIndex;
     }
 
-    /// @brief Happy-path release. Frees the slot immediately and disarms the
-    ///        destructor. Use this on any path where the caller has confirmed
-    ///        the slot is no longer needed and the release is the expected
-    ///        outcome (e.g. the sender formatter after sendAllBuffers
-    ///        returns). After this call, the holder owns nothing; subsequent
-    ///        destructor or move-assignment is a no-op.
-    ///
-    ///        If the holder goes out of scope with mHeld still true (exception
-    ///        or early return that forgot to call release/detach), the
-    ///        destructor calls release() to free the slot.
+    /// @brief Release the slot now and disarm the destructor. Safe to call multiple times.
     void release() noexcept;
 
 private:

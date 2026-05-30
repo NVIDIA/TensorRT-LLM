@@ -523,6 +523,7 @@ void CacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& sessio
         // 5. send the buffer to the corresponding target. Ideally, we send only once (one buffer) for each target.
 
         auto cacheBufferId = mCacheTransBufferManager->assignBufferIndexForSend();
+        BufferIndexHolder sendHolder(*mCacheTransBufferManager, cacheBufferId, /*isRecv=*/false);
         int peerDuplicateHeadFactor = targetInfo.mPeerDupHeadFactor;
         auto bufferTargetNum = targetNum / peerDuplicateHeadFactor;
         auto ppRank = selfIdx
@@ -606,7 +607,7 @@ void CacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& sessio
 
         session.setTime(TransferSession::kTimeTransmissions);
 
-        mCacheTransBufferManager->freeBufferIndexForSend(cacheBufferId);
+        sendHolder.release();
         session.setTime(TransferSession::kTimePostprocess);
     }
     TLLM_LOG_DEBUG(
@@ -849,6 +850,7 @@ void CacheFormatter::unformat(tensorrt_llm::batch_manager::TransferSession& sess
             size_t remainNoCoverTargetNum = 0;
             size_t bufferCoverTargetNum = 0;
             std::optional<int> cacheBufferId = std::nullopt;
+            BufferIndexHolder recvHolder;
             {
                 NVTX3_SCOPED_RANGE(formatInputAllocBuffer);
 
@@ -864,6 +866,7 @@ void CacheFormatter::unformat(tensorrt_llm::batch_manager::TransferSession& sess
                 {
                     cacheBufferId = mCacheTransBufferManager->assignBufferIndexForRecv();
                 }
+                recvHolder = BufferIndexHolder(*mCacheTransBufferManager, cacheBufferId, /*isRecv=*/true);
                 auto [recvSplitCachestmp, bufferCoverTargetNumtmp, onlyUseDynamicBuffer]
                     = mCacheTransBufferManager->getOrAllocateRecvBuffers(
                         cacheBufferId, static_cast<int>(targetNum), bufferEleSizes, bufferManager);
@@ -997,10 +1000,7 @@ void CacheFormatter::unformat(tensorrt_llm::batch_manager::TransferSession& sess
                     recvSplitCaches, outputBuffersPerWindow, destConfig, selfConfig, selfIdx, bufferManager);
 
                 bufferManager.getStream().synchronize();
-                if (cacheBufferId.has_value())
-                {
-                    mCacheTransBufferManager->freeBufferIndexForRecv(cacheBufferId);
-                }
+                recvHolder.release();
             }
             session.setTime(TransferSession::kTimePostprocess);
         }

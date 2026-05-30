@@ -28,10 +28,6 @@ namespace tensorrt_llm::batch_manager
 
 void BufferIndexHolder::release() noexcept
 {
-    // Happy-path release: frees the slot and disarms the holder in one
-    // noexcept call. Used in place of an older detach() + explicit
-    // freeBufferIndex*() sequence so a throw between the two calls cannot
-    // leave the holder in a partially-released state.
     if (!mHeld || mMgr == nullptr)
     {
         return;
@@ -49,9 +45,7 @@ void BufferIndexHolder::release() noexcept
     }
     catch (...)
     {
-        // Swallow; the destructor must be noexcept and any exit path that
-        // failed to release explicitly relies on this fallback to free the
-        // slot.
+        // noexcept: swallow so the destructor can never throw.
     }
     mHeld = false;
 }
