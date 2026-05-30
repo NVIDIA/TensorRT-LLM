@@ -18,9 +18,16 @@ ghost audio item second (``item_idx_in_param == -1``,
 
 from __future__ import annotations
 
-import pytest
+from unittest.mock import MagicMock
 
-from tensorrt_llm._torch.models.modeling_nemotron_nano import _nano_extract_items
+import pytest
+import torch
+
+from tensorrt_llm._torch.models.modeling_nemotron_nano import (
+    NemotronH_Nano_VL_V2,
+    _nano_extract_items,
+)
+from tensorrt_llm._torch.models.multimodal_encoding import MultimodalItem
 from tensorrt_llm.inputs.multimodal import MultimodalParams
 
 
@@ -154,3 +161,83 @@ class TestNanoExtractItems:
         }
         with pytest.raises(ValueError, match="Unknown modality"):
             list(_nano_extract_items(0, _make_param(payload)))
+
+
+class TestNanoVisionBucketAdapter:
+    """Tests for the vision-bucket encoder adapter on ``NemotronH_Nano_VL_V2``.
+
+    Bridges ``List[MultimodalItem]`` (image OR video bucket) to the existing
+    ``self.vision_encoder(params)`` interface by building per-item
+    ``MultimodalParams`` views, cats per-item outputs into one bucket tensor
+    (rows in bucket order), and stashes per-item ``num_tokens_in_video`` for
+    EVS on the source params (side-channel, matches legacy behavior).
+    """
+
+    def _make_model_stub(self, vision_encoder_return):
+        model = MagicMock(spec=NemotronH_Nano_VL_V2)
+        model.vision_encoder = MagicMock(return_value=vision_encoder_return)
+        # Bind the real method to the stub instance
+        model._adapter_vision_bucket = NemotronH_Nano_VL_V2._adapter_vision_bucket.__get__(model)
+        model._build_single_modality_param = NemotronH_Nano_VL_V2._build_single_modality_param
+        return model
+
+    def test_single_pure_image_param(self):
+        item = MultimodalItem(0, 0, "image", 5, {"num_tokens": 5})
+        params = [_make_param({"image": item.payload, "modality_type": "image"})]
+        emb = torch.randn(5, 4)
+        model = self._make_model_stub(([emb], None))
+        out = model._adapter_vision_bucket([item], params)
+        model.vision_encoder.assert_called_once()
+        assert out.shape == (5, 4)
+        torch.testing.assert_close(out, emb)
+
+    def test_evs_num_tokens_stashed_on_video_params(self):
+        item = MultimodalItem(0, 0, "video", 9, {"num_tokens": 9})
+        params = [_make_param({"video": item.payload, "modality_type": "video"})]
+        emb = torch.randn(9, 4)
+        model = self._make_model_stub(([emb], [[3, 3, 3]]))
+        out = model._adapter_vision_bucket([item], params)
+        assert out.shape == (9, 4)
+        assert params[0].multimodal_data["num_tokens_in_video"] == [3, 3, 3]
+        # Also stash the by-modality view (matches legacy 3463-3466 behavior)
+        assert params[0].multimodal_data["num_tokens_in_video_by_modality"]["video"] == [3, 3, 3]
+
+    def test_mixed_param_synthesizes_single_modality_view(self):
+        # Image item from a mixed image+audio param: adapter should
+        # synthesize a single-modality view so vision_encoder sees image-only
+        item = MultimodalItem(0, 0, "image", 5, {"num_tokens": 5})
+        params = [
+            _make_param(
+                {
+                    "image": item.payload,
+                    "audio": {"num_tokens": 4},
+                    "modality_type": ["image", "audio"],
+                }
+            )
+        ]
+        emb = torch.randn(5, 4)
+        model = self._make_model_stub(([emb], None))
+        out = model._adapter_vision_bucket([item], params)
+        assert out.shape == (5, 4)
+        passed_params = model.vision_encoder.call_args[0][0]
+        assert len(passed_params) == 1
+        assert passed_params[0].multimodal_data["modality_type"] == "image"
+        assert "audio" not in passed_params[0].multimodal_data
+
+    def test_multi_item_bucket_concatenates_in_order(self):
+        # Two image items from two pure-image params
+        items = [
+            MultimodalItem(0, 0, "image", 5, {"num_tokens": 5}),
+            MultimodalItem(1, 0, "image", 3, {"num_tokens": 3}),
+        ]
+        params = [
+            _make_param({"image": items[0].payload, "modality_type": "image"}),
+            _make_param({"image": items[1].payload, "modality_type": "image"}),
+        ]
+        emb0 = torch.ones(5, 4)
+        emb1 = torch.ones(3, 4) * 2.0
+        model = self._make_model_stub(([emb0, emb1], None))
+        out = model._adapter_vision_bucket(items, params)
+        assert out.shape == (8, 4)
+        torch.testing.assert_close(out[:5], emb0)
+        torch.testing.assert_close(out[5:], emb1)

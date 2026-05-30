@@ -3486,6 +3486,55 @@ class NemotronH_Nano_VL_V2(transformers.PreTrainedModel):
 
         return torch.cat(parts, dim=0)
 
+    def _adapter_vision_bucket(
+        self,
+        items: List[MultimodalItem],
+        multimodal_params: List[MultimodalParams],
+    ) -> torch.Tensor:
+        """Run the vision encoder on one modality bucket (image OR video).
+
+        Builds per-item single-modality MultimodalParams views, calls the
+        existing `self.vision_encoder`, cats per-item outputs into one
+        bucket tensor in bucket order, and stashes per-video EVS
+        `num_tokens_in_video` on the source params as a side-channel
+        (consumed by `forward` for `merge_evs_mm_embeds`).
+        """
+        bucket_params = [
+            self._build_single_modality_param(item, multimodal_params[item.src_param_idx])
+            for item in items
+        ]
+        embs, num_tokens = self.vision_encoder(bucket_params)
+        if num_tokens is not None:
+            for item, item_num_tokens in zip(items, num_tokens, strict=True):
+                if item.modality == "video" and item_num_tokens is not None:
+                    src = multimodal_params[item.src_param_idx]
+                    src.multimodal_data["num_tokens_in_video"] = item_num_tokens
+                    src.multimodal_data.setdefault("num_tokens_in_video_by_modality", {})[
+                        item.modality
+                    ] = item_num_tokens
+        return torch.cat(embs, dim=0)
+
+    @staticmethod
+    def _build_single_modality_param(
+        item: MultimodalItem,
+        source_param: MultimodalParams,
+    ) -> MultimodalParams:
+        """Build a single-modality view of source_param for one bucket item."""
+        view_data = {
+            "modality_type": item.modality,
+            item.modality: item.payload,
+        }
+        # Preserve item-order metadata so MMItemOrder consumers don't break
+        src_data = source_param.multimodal_data or {}
+        for k in ("multimodal_item_order", "multimodal_embedding_lengths"):
+            if k in src_data:
+                view_data[k] = src_data[k]
+        return MultimodalParams(
+            multimodal_input=getattr(source_param, "multimodal_input", None),
+            multimodal_data=view_data,
+            multimodal_runtime=getattr(source_param, "multimodal_runtime", None),
+        )
+
     def _encode_multimodal(self, multimodal_params: List[MultimodalParams]) -> List[torch.Tensor]:
         """Dispatch multimodal encoding to the appropriate encoder.
 
