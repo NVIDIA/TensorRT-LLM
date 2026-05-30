@@ -184,6 +184,13 @@ class TestStandalonePackage:
             "PATH": os.path.join(standalone_package["venv_dir"], "bin")
             + os.pathsep
             + os.environ.get("PATH", ""),
+            # FlashInfer JIT-compiles kernels and caches .so files under
+            # FLASHINFER_WORKSPACE_BASE (default: $HOME). Ninja records absolute
+            # source paths from the flashinfer package. Since this venv is
+            # ephemeral, a subsequent run would find stale cache entries pointing
+            # at the old (deleted) venv paths, causing all JIT builds to fail.
+            # Redirect the cache into the venv so it's discarded with it.
+            "FLASHINFER_WORKSPACE_BASE": standalone_package["venv_dir"],
         }
 
         cmd = [

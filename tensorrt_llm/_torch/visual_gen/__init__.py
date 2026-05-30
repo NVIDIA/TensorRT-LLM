@@ -1,53 +1,33 @@
-"""Visual generation module for diffusion models."""
+"""Internal diffusion runtime.
+
+Public configuration types live in ``tensorrt_llm.visual_gen``; import them
+from there. This package exposes only runtime/loader internals.
+"""
 
 from tensorrt_llm._torch.visual_gen.executor import (
     DiffusionExecutor,
     DiffusionRequest,
     DiffusionResponse,
 )
-from tensorrt_llm._torch.visual_gen.output import MediaOutput
+from tensorrt_llm._torch.visual_gen.output import PipelineOutput
 
-# Checkpoint loading
 from .checkpoints import WeightLoader
-from .config import (
-    AttentionConfig,
-    CacheDiTConfig,
-    CudaGraphConfig,
-    DiffusionModelConfig,
-    ParallelConfig,
-    PipelineComponent,
-    PipelineConfig,
-    TeaCacheConfig,
-    TorchCompileConfig,
-    VisualGenArgs,
-    discover_pipeline_components,
-)
+from .config import DiffusionModelConfig
 from .mapping import VisualGenMapping
 from .models import AutoPipeline, BasePipeline, WanPipeline
 from .pipeline_loader import PipelineLoader
+from .pipeline_registry import PipelineComponent
 
 __all__ = [
-    # Config classes
-    "TorchCompileConfig",
-    "CudaGraphConfig",
-    "VisualGenArgs",
-    "CacheDiTConfig",
     "DiffusionModelConfig",
-    "ParallelConfig",
     "PipelineComponent",
-    "TeaCacheConfig",
-    # Checkpoint loading
     "WeightLoader",
-    # Model loading
     "PipelineLoader",
-    # Execution
     "DiffusionExecutor",
     "DiffusionRequest",
     "DiffusionResponse",
-    "MediaOutput",
-    # Mapping
+    "PipelineOutput",
     "VisualGenMapping",
-    # Pipelines
     "AutoPipeline",
     "BasePipeline",
     "WanPipeline",

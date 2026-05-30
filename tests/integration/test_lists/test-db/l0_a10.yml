@@ -19,6 +19,7 @@ l0_a10:
   - unittest/utils/test_util.py
   - unittest/utils/test_logger.py
   - unittest/_torch/test_model_config.py
+  - unittest/models/test_quant_config_utils.py
   - unittest/_torch/modeling/test_modeling_mistral.py
   - unittest/_torch/modeling/test_modeling_pixtral.py
   - unittest/_torch/modeling/test_modeling_cohere2.py
@@ -30,12 +31,14 @@ l0_a10:
   - unittest/_torch/executor/test_scheduler_serializable_output.py
   - unittest/_torch/executor/test_kv_cache_estimation.py
   - unittest/_torch/executor/test_kv_cache_budget_split.py
+  - unittest/_torch/executor/test_disagg_index_mapper_early_release.py
   # NOTE: this is a CPU-only test, but we do not have a dedicated job for this (and therefore no
   # test list either).
   - unittest/_torch/models/checkpoints/hf/test_weight_loader.py
   - unittest/_torch/models/checkpoints/hf/test_checkpoint_loader.py
   - unittest/inputs/test_chat_template_dispatch.py
   - unittest/inputs/test_content_format.py
+  - unittest/inputs/test_url_validation.py
   - unittest/inputs/test_multimodal.py
   - unittest/others/test_convert_utils.py
   - unittest/others/test_lora_manager.py
@@ -44,6 +47,7 @@ l0_a10:
   - unittest/others/test_tracing.py
   - unittest/disaggregated/test_disagg_openai_client.py
   - unittest/disaggregated/test_disagg_utils.py
+  - unittest/disaggregated/test_openai_disagg_server.py
   - unittest/disaggregated/test_openai_disagg_service.py
   - unittest/disaggregated/test_router.py
   - unittest/disaggregated/test_remoteDictionary.py
@@ -88,9 +92,9 @@ l0_a10:
   - test_e2e.py::test_openai_mmencoder_example
   - test_e2e.py::test_openai_perf_metrics
   - test_e2e.py::test_openai_prometheus
-  - test_e2e.py::test_openai_lora
+  # test_openai_lora and test_trtllm_serve_lora_example moved to l0_a100.yml
+  # (Llama-7B + KV cache + spec resources exceeds A10's 22 GB).
   - test_e2e.py::test_trtllm_serve_multimodal_example
-  - test_e2e.py::test_trtllm_serve_lora_example
   - test_e2e.py::test_trtllm_serve_top_logprobs[pytorch]
   - test_e2e.py::test_openai_misc_example[pytorch]
   - test_e2e.py::test_openai_reasoning[pytorch]
@@ -102,7 +106,8 @@ l0_a10:
   - test_e2e.py::test_trtllm_bench_invalid_token_pytorch[TinyLlama-1.1B-Chat-v1.0-TinyLlama-1.1B-Chat-v1.0]
   # visual_gen
   - unittest/_torch/visual_gen/test_visual_gen_params.py
-  - unittest/_torch/visual_gen/test_media_storage.py
+  - unittest/visual_gen/test_output.py
+  - unittest/media/test_encoding.py
   # llmapi
   - unittest/llmapi/test_llm_utils.py
   - unittest/llmapi/test_gc_utils.py
@@ -139,11 +144,14 @@ l0_a10:
   - llmapi/test_llm_api_connector.py::test_connector_multi_request
   - llmapi/test_llm_api_connector.py::test_connector_priorities
   - llmapi/test_llm_api_connector.py::test_connector_priorities_default
+  - llmapi/test_llm_api_connector.py::test_connector_rejects_unsupported_config[host_offloading]
+  - llmapi/test_llm_api_connector.py::test_connector_rejects_unsupported_config[beam_search]
+  - llmapi/test_llm_api_connector.py::test_connector_rejects_unsupported_config[attention_dp]
   - llmapi/test_llm_api_connector.py::test_connector_e2e_persistent_cache
   # third-party policy checks CPU-only
   - thirdparty/test_cmake_third_party.py::test_cmake_listfiles
   - thirdparty/test_git_modules.py::test_gitmodules
-  # lint script unit tests (CPU-only, ~0.3s)
+  # helper-script unit tests (CPU-only, ~3s)
   - unittest/scripts
 - condition:
     ranges:

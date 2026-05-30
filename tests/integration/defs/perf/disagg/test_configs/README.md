@@ -83,7 +83,7 @@ worker_config:
     max_batch_size: 32
     max_seq_len: 2251
     speculative_config:
-      num_nextn_predict_layers: 3  # MTP layers
+      max_draft_len: 3  # MTP layers
   ctx:
     tensor_parallel_size: 4
     max_batch_size: 4
@@ -106,7 +106,7 @@ worker_config:
 | Tensor parallel size | `worker_config.gen.tensor_parallel_size` |
 | Batch size | `worker_config.gen.max_batch_size` |
 | Attention DP | `worker_config.gen.enable_attention_dp` |
-| MTP layers | `worker_config.gen.speculative_config.num_nextn_predict_layers` |
+| MTP layers | `worker_config.gen.speculative_config.max_draft_len` |
 | Backend | `worker_config.gen.cache_transceiver_config.backend` |
 | Concurrency levels | `benchmark.concurrency_list` |
 

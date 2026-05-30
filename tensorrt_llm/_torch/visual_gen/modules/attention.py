@@ -4,11 +4,13 @@ from typing import Optional, Tuple
 import torch
 import torch.nn as nn
 
+from tensorrt_llm.llmapi.llm_args import SkipSoftmaxAttentionConfig
+
 from ...modules.linear import Linear, WeightMode, WeightsLoadingConfig
 from ...modules.rms_norm import RMSNorm
 from ..attention_backend.interface import AttentionTensorLayout
 from ..attention_backend.utils import create_attention
-from ..config import DiffusionModelConfig
+from ..config import DiffusionModelConfig, SkipSoftmaxConfig
 
 
 class QKVMode(str, Enum):
@@ -49,6 +51,7 @@ class Attention(nn.Module):
         fuse_qk_norm_rope: Optional[bool] = None,
         config: Optional[DiffusionModelConfig] = None,
         layer_idx: Optional[int] = None,
+        enable_ulysses: bool = True,  # make this enable sequence parallelism
     ):
         super().__init__()
 
@@ -67,15 +70,16 @@ class Attention(nn.Module):
         self.bias = bias
 
         # Fused QK Norm + RoPE: each model class opts in via fuse_qk_norm_rope.
-        # Default: enable for per_head norm only (FLUX). Full-dim not yet supported.
-        if fuse_qk_norm_rope is not None:
-            self.fuse_qk_norm_rope = fuse_qk_norm_rope
-        else:
-            self.fuse_qk_norm_rope = qk_norm_mode != "full"
+        # Backed by torch.ops.trtllm.fused_dit_qk_norm_rope which auto-dispatches:
+        #   - per-head template (FLUX/Cosmos):   q/k_weight.shape == [head_dim]
+        #   - full-dim template (LTX-2, WAN):    q/k_weight.shape == [num_heads * head_dim]
+        # Full-dim template envelope: num_heads <= 64, head_dim in {64, 128}.
+        self.fuse_qk_norm_rope = fuse_qk_norm_rope if fuse_qk_norm_rope is not None else False
         self.interleave = interleave
 
         # Select compute backend (orthogonal to parallelism)
         vgm = config.visual_gen_mapping
+        ring_size = vgm.ring_size if vgm else 1
         ulysses_size = vgm.ulysses_size if vgm else 1
         base_backend = config.attention.backend
 
@@ -129,7 +133,7 @@ class Attention(nn.Module):
         # Currently kept as mutually exclusive.
         attn2d_size = (vgm.attn2d_row_size * vgm.attn2d_col_size) if vgm else 1
         use_attn2d = attn2d_size > 1 and self.qkv_mode != QKVMode.SEPARATE_QKV
-        use_ulysses = ulysses_size > 1 and self.qkv_mode != QKVMode.SEPARATE_QKV
+        use_ulysses = ulysses_size > 1 and enable_ulysses
 
         # Compute head counts for the backend
         # Ulysses shards heads across workers; inner backend sees sharded count
@@ -140,6 +144,22 @@ class Attention(nn.Module):
         else:
             backend_num_heads = self.num_attention_heads
             backend_num_kv_heads = self.num_key_value_heads
+
+        # Resolve sparse attention config for TRTLLM backend
+        sparse_attention_config = None
+        ss_cfg = config.attention.sparse_attention_config
+        if isinstance(ss_cfg, SkipSoftmaxConfig) and backend_name == "TRTLLM":
+            # Cache the resolved scalar on a private attr (idempotent across
+            # all Attention modules); does NOT mutate the source-of-truth
+            # `threshold_scale_factor` / `target_sparsity` fields. Subsequent
+            # callers — including `apply_skip_softmax_overrides` — read the
+            # cached value via `resolve_threshold(module_name)`.
+            threshold = ss_cfg.get_or_resolve_threshold()
+
+            if threshold is not None and threshold > 0:
+                sparse_attention_config = SkipSoftmaxAttentionConfig(
+                    threshold_scale_factor={"prefill": threshold, "decode": 0}
+                )
 
         # Create compute backend
         self.attn = create_attention(
@@ -152,6 +172,7 @@ class Attention(nn.Module):
             dtype=self.dtype,
             attention_config=config.attention,
             attention_metadata_state=attention_metadata_state,
+            sparse_attention_config=sparse_attention_config,
         )
 
         # Wrap with parallelism strategy (orthogonal to backend choice)
@@ -163,13 +184,21 @@ class Attention(nn.Module):
                 row_process_group=vgm.attn2d_row_group,
                 col_process_group=vgm.attn2d_col_group,
             )
-        elif use_ulysses:
-            from ..attention_backend.parallel import UlyssesAttention
+        else:
+            # Ring shards the sequence dim and therefore requires S_q == S_kv,
+            # so only self-attention is eligible.
+            if ring_size > 1 and self.qkv_mode != QKVMode.SEPARATE_QKV:
+                from ..attention_backend.parallel import RingAttention
 
-            self.attn = UlyssesAttention(
-                inner_backend=self.attn,
-                process_group=vgm.ulysses_group,
-            )
+                self.attn = RingAttention(self.attn, process_group=vgm.ring_group)
+            # Ulysses shards the head dim and is value-preserving under
+            # different Q/KV sequence lengths, so it is valid on cross-attn too.
+            # ``use_ulysses`` already folds in the caller-provided
+            # ``enable_ulysses`` flag.
+            if use_ulysses:
+                from ..attention_backend.parallel import UlyssesAttention
+
+                self.attn = UlyssesAttention(self.attn, process_group=vgm.ulysses_group)
 
     def _init_qkv_proj(self) -> None:
         if self.qkv_mode == QKVMode.FUSE_QKV:
@@ -247,7 +276,7 @@ class Attention(nn.Module):
             k = self.norm_k(k)
         return q, k
 
-    def apply_qk_norm_rope(
+    def apply_packed_qk_norm_rope(
         self,
         qkv: torch.Tensor,
         freqs_cos: torch.Tensor,
@@ -256,26 +285,21 @@ class Attention(nn.Module):
         q_add_weight: Optional[torch.Tensor] = None,
         k_add_weight: Optional[torch.Tensor] = None,
     ) -> None:
-        """Apply fused QK Norm + RoPE in-place on packed QKV tensor."""
-        cos_2d = freqs_cos.reshape(-1, self.head_dim).float().contiguous()
-        sin_2d = freqs_sin.reshape(-1, self.head_dim).float().contiguous()
+        """Apply fused QK Norm + RoPE in-place on packed QKV tensor (FUSE_QKV self-attn).
 
+        The op auto-dispatches by tensor shapes/dtypes:
+          - q_weight.shape = [head_dim]              → per-head norm (FLUX/Cosmos, w/ dual-stream)
+          - q_weight.shape = [num_heads * head_dim]  → full-dim norm (LTX-2, WAN, ≤64 heads)
+          - cos last dim = head_dim                  → per-token shared cos (FLUX, WAN)
+          - cos last dim = num_heads * head_dim      → per-token per-head cos (LTX-2 3D RoPE)
+          - cos rows < num_tokens                    → kernel broadcasts via cos_seq_per_batch
+
+        Caller passes raw freqs_cos / freqs_sin (any rank); the op reshapes internally.
+        """
         B, S, D = qkv.shape
-        assert cos_2d.shape == (S, self.head_dim), (
-            f"cos_emb shape mismatch: expected [{S}, {self.head_dim}], got {list(cos_2d.shape)}"
-        )
-        qkv_2d = qkv.view(B * S, D)
-        cos_tiled = cos_2d.repeat(B, 1) if B > 1 else cos_2d
-        sin_tiled = sin_2d.repeat(B, 1) if B > 1 else sin_2d
-
-        # Dual-stream batch correction: when B>1 and dual-stream is active,
-        # the kernel uses modulo (tokenIdx % tokens_per_batch) to find the
-        # local position within each batch element for the text/image boundary.
-        # 0 = no dual-stream (single-stream or batch=1).
         tokens_per_batch = S if num_txt_tokens > 0 else 0
-
         torch.ops.trtllm.fused_dit_qk_norm_rope(
-            qkv_2d,
+            qkv.view(B * S, D),
             self.num_attention_heads,
             self.num_key_value_heads,
             self.num_key_value_heads,
@@ -285,12 +309,79 @@ class Attention(nn.Module):
             self.norm_k.weight,
             q_add_weight,
             k_add_weight,
-            cos_tiled,
-            sin_tiled,
+            freqs_cos,
+            freqs_sin,
             num_txt_tokens,
             self.interleave,
             tokens_per_batch,
         )
+
+    def apply_split_norm_rope(
+        self,
+        tensor: torch.Tensor,
+        weight: torch.Tensor,
+        num_heads: int,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+    ) -> None:
+        """In-place fused RMSNorm + RoPE on a single Q or K tensor [B, T, H*D] (SEPARATE_QKV cross-attn).
+
+        The op auto-dispatches by shapes/dtypes (same as `apply_packed_qk_norm_rope`):
+          - cos last dim = head_dim                  → per-token shared cos
+          - cos last dim = num_heads * head_dim      → per-token per-head cos (LTX-2 3D RoPE)
+          - cos rows < num_tokens                    → kernel broadcasts via cos_seq_per_batch
+          - cos dtype bf16 or fp32                   → kernel upcasts bf16 to fp32 in registers
+        Caller passes raw cos/sin (any rank); the op reshapes internally.
+        """
+        B, T, _ = tensor.shape
+        torch.ops.trtllm.fused_dit_split_norm_rope(
+            tensor.view(B * T, -1),
+            num_heads,
+            self.head_dim,
+            self.eps,
+            weight,
+            cos,
+            sin,
+            self.interleave,
+        )
+
+    def apply_split_norm(
+        self,
+        tensor: torch.Tensor,
+        weight: torch.Tensor,
+        num_heads: int,
+    ) -> None:
+        """In-place fused full-dim RMSNorm only (no RoPE) on a single Q or K tensor [B, T, H*D].
+
+        Calls trtllm.fused_dit_split_norm. Used by paths that need norm but
+        no RoPE -- e.g. LTX-2 text cross-attn (Q-norm with pe=None).
+        """
+        B, T, _ = tensor.shape
+        torch.ops.trtllm.fused_dit_split_norm(
+            tensor.view(B * T, -1),
+            num_heads,
+            self.head_dim,
+            self.eps,
+            weight,
+        )
+
+    def apply_split_norm_or_norm_rope(
+        self,
+        tensor: torch.Tensor,
+        weight: torch.Tensor,
+        num_heads: int,
+        pe: tuple[torch.Tensor, torch.Tensor] | None,
+    ) -> None:
+        """Dispatcher: in-place norm-only when pe is None, else norm + RoPE.
+
+        Used to dispatch all SEPARATE_QKV cross-attn norm paths through the
+        split-fuse kernels regardless of whether the path needs RoPE.
+        """
+        if pe is None:
+            self.apply_split_norm(tensor, weight, num_heads)
+        else:
+            cos, sin = pe
+            self.apply_split_norm_rope(tensor, weight, num_heads, cos, sin)
 
     def _attn_impl(
         self,
@@ -312,6 +403,8 @@ class Attention(nn.Module):
         backend_layout = getattr(self.attn, "preferred_layout", AttentionTensorLayout.NHD)
 
         batch_size = q.shape[0]
+        seq_len = q.shape[1]
+        seq_len_kv = k.shape[1] if k is not None else seq_len
 
         # Reshape inputs: [B, S, H*D] -> backend's preferred 4D layout
         if backend_layout == AttentionTensorLayout.HND:
@@ -323,7 +416,20 @@ class Attention(nn.Module):
             k = k.view(batch_size, -1, self.num_key_value_heads, self.head_dim)
             v = v.view(batch_size, -1, self.num_key_value_heads, self.head_dim)
 
-        out = self.attn.forward(q=q, k=k, v=v, **kwargs)
+        kwargs.update(
+            {
+                "batch_size": batch_size,
+                "seq_len": seq_len,
+                "seq_len_kv": seq_len_kv,
+            }
+        )
+
+        out = self.attn.forward(
+            q=q,
+            k=k,
+            v=v,
+            **kwargs,
+        )
 
         # Flatten back to [B, S, H*D]
         if backend_layout == AttentionTensorLayout.HND:
@@ -352,7 +458,7 @@ class Attention(nn.Module):
         ):
             qkv = self.qkv_proj(hidden_states)
             freqs_cos, freqs_sin = freqs
-            self.apply_qk_norm_rope(qkv, freqs_cos, freqs_sin)
+            self.apply_packed_qk_norm_rope(qkv, freqs_cos, freqs_sin)
             q, k, v = qkv.split([self.q_dim, self.kv_dim, self.kv_dim], dim=-1)
             out = self._attn_impl(q, k, v)
             return self.to_out[0](out)

@@ -1,3 +1,17 @@
+# SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """Testing GDN (Gated Delta Net) patches for Qwen3Next.
 
 This test verifies that:
@@ -42,13 +56,17 @@ def test_torch_gated_delta_rule_op():
     v_head_dim = 16
 
     # Raw inputs in [B, S, H, D] layout (bsnd convention)
-    q_raw = torch.randn(batch_size, seq_len, num_heads, k_head_dim, dtype=torch.float32)
-    k_raw = torch.randn(batch_size, seq_len, num_heads, k_head_dim, dtype=torch.float32)
-    v = torch.randn(batch_size, seq_len, num_heads, v_head_dim, dtype=torch.float32)
-    a = torch.randn(batch_size, seq_len, num_heads, dtype=torch.float32)
-    b = torch.randn(batch_size, seq_len, num_heads, dtype=torch.float32)
-    A_log = torch.randn(num_heads, dtype=torch.float32)
-    dt_bias = torch.randn(num_heads, dtype=torch.float32)
+    q_raw = torch.randn(
+        batch_size, seq_len, num_heads, k_head_dim, dtype=torch.float32, device="cuda"
+    )
+    k_raw = torch.randn(
+        batch_size, seq_len, num_heads, k_head_dim, dtype=torch.float32, device="cuda"
+    )
+    v = torch.randn(batch_size, seq_len, num_heads, v_head_dim, dtype=torch.float32, device="cuda")
+    a = torch.randn(batch_size, seq_len, num_heads, dtype=torch.float32, device="cuda")
+    b = torch.randn(batch_size, seq_len, num_heads, dtype=torch.float32, device="cuda")
+    A_log = torch.randn(num_heads, dtype=torch.float32, device="cuda")
+    dt_bias = torch.randn(num_heads, dtype=torch.float32, device="cuda")
 
     # Preprocess for HF reference: l2 norm + gating (must match _l2norm convention)
     q_norm = _l2norm(q_raw.float())
@@ -87,13 +105,17 @@ def test_torch_gated_delta_rule_op_bfloat16():
     k_head_dim = 8
     v_head_dim = 8
 
-    q_raw = torch.randn(batch_size, seq_len, num_heads, k_head_dim, dtype=torch.bfloat16)
-    k_raw = torch.randn(batch_size, seq_len, num_heads, k_head_dim, dtype=torch.bfloat16)
-    v = torch.randn(batch_size, seq_len, num_heads, v_head_dim, dtype=torch.bfloat16)
-    a = torch.randn(batch_size, seq_len, num_heads, dtype=torch.bfloat16)
-    b = torch.randn(batch_size, seq_len, num_heads, dtype=torch.bfloat16)
-    A_log = torch.randn(num_heads, dtype=torch.bfloat16)
-    dt_bias = torch.randn(num_heads, dtype=torch.bfloat16)
+    q_raw = torch.randn(
+        batch_size, seq_len, num_heads, k_head_dim, dtype=torch.bfloat16, device="cuda"
+    )
+    k_raw = torch.randn(
+        batch_size, seq_len, num_heads, k_head_dim, dtype=torch.bfloat16, device="cuda"
+    )
+    v = torch.randn(batch_size, seq_len, num_heads, v_head_dim, dtype=torch.bfloat16, device="cuda")
+    a = torch.randn(batch_size, seq_len, num_heads, dtype=torch.bfloat16, device="cuda")
+    b = torch.randn(batch_size, seq_len, num_heads, dtype=torch.bfloat16, device="cuda")
+    A_log = torch.randn(num_heads, dtype=torch.bfloat16, device="cuda")
+    dt_bias = torch.randn(num_heads, dtype=torch.bfloat16, device="cuda")
 
     q_norm = _l2norm(q_raw.float()).to(torch.bfloat16)
     k_norm = _l2norm(k_raw.float()).to(torch.bfloat16)
@@ -184,6 +206,7 @@ def _force_torch_fallbacks(module):
     module.recurrent_gated_delta_rule = hf_recurrent
 
 
+@torch.no_grad()
 def test_qwen3_next_gdn_patch():
     """Verify patched Qwen3NextGatedDeltaNet.forward matches the original HF implementation.
 
@@ -199,20 +222,19 @@ def test_qwen3_next_gdn_patch():
     # Force torch fallbacks for the reference path so both sides use pure torch
     _force_torch_fallbacks(module)
 
-    # Convert to bfloat16 to match typical inference dtype
-    module = module.to(torch.bfloat16)
+    # Convert to bfloat16 on CUDA (the norm layer uses Triton kernels that require CUDA)
+    device = "cuda"
+    module = module.to(torch.bfloat16).to(device)
 
     hidden_size = 32
-    inputs = torch.randn(2, 16, hidden_size, dtype=torch.bfloat16)
+    inputs = torch.randn(2, 16, hidden_size, dtype=torch.bfloat16, device=device)
 
     # Reference: original HF forward (with torch fallbacks, no cache)
-    with torch.no_grad():
-        ref_output = type(module).forward(module, inputs)
+    ref_output = type(module).forward(module, inputs)
 
     # Patched: our _patched_gdn_forward
     module.forward = types.MethodType(_patched_gdn_forward, module)
-    with torch.no_grad():
-        test_output = module(inputs)
+    test_output = module(inputs)
 
     torch.testing.assert_close(
         ref_output,
@@ -223,6 +245,7 @@ def test_qwen3_next_gdn_patch():
     )
 
 
+@torch.no_grad()
 def test_qwen3_next_gdn_patch_float32():
     """Same as above but in float32 for tighter tolerance checks."""
     torch.manual_seed(42)
@@ -230,18 +253,17 @@ def test_qwen3_next_gdn_patch_float32():
     module = _load_qwen3_next_gdn_layer()
     _force_torch_fallbacks(module)
 
-    # Stay in float32 for tighter tolerances
-    module = module.to(torch.float32)
+    # Run on CUDA (the norm layer uses Triton kernels that require CUDA)
+    device = "cuda"
+    module = module.to(torch.float32).to(device)
 
     hidden_size = 32
-    inputs = torch.randn(2, 16, hidden_size, dtype=torch.float32)
+    inputs = torch.randn(2, 16, hidden_size, dtype=torch.float32, device=device)
 
-    with torch.no_grad():
-        ref_output = type(module).forward(module, inputs)
+    ref_output = type(module).forward(module, inputs)
 
     module.forward = types.MethodType(_patched_gdn_forward, module)
-    with torch.no_grad():
-        test_output = module(inputs)
+    test_output = module(inputs)
 
     torch.testing.assert_close(
         ref_output,

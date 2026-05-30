@@ -56,10 +56,9 @@ def init_hf_model(cls, config, dtype, device):
     Instead, we lazily instantiate the model, and initialize the weights only after moving it to
     the requested `device`.
     """
-    from transformers import modeling_utils as t_modeling_utils
-
-    with t_modeling_utils.no_init_weights():
-        model = cls(config).eval()
+    # transformers 5.x removed ``no_init_weights``; weights are initialized lazily
+    # via ``model.init_weights()`` below instead.
+    model = cls(config).eval()
 
     model.to(device=device)
     model.init_weights()

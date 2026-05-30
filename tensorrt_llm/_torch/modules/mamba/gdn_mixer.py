@@ -3,6 +3,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import os
 from typing import Optional
 
 import torch
@@ -11,7 +12,12 @@ import triton.language as tl
 from torch import nn
 from transformers import Qwen3NextConfig
 
-from tensorrt_llm._torch.modules.fla.chunk import chunk_gated_delta_rule
+# Default: FlashInfer GDN prefill ON. Set TLLM_USE_FLASHINFER_GDN_PREFILL=0 to
+# fall back to the vendored Triton chunk_gated_delta_rule.
+if os.getenv("TLLM_USE_FLASHINFER_GDN_PREFILL", "1") == "1":
+    from tensorrt_llm._torch.modules.fla.flashinfer_chunk import chunk_gated_delta_rule
+else:
+    from tensorrt_llm._torch.modules.fla.chunk import chunk_gated_delta_rule
 from tensorrt_llm._torch.modules.fla.fused_recurrent import fused_recurrent_gated_delta_rule_update
 from tensorrt_llm._torch.modules.fla.fused_sigmoid_gating_recurrent import (
     fused_sigmoid_gating_delta_rule_update,
@@ -28,7 +34,11 @@ from ..linear import Linear, TensorParallelMode
 from ..multi_stream_utils import maybe_execute_in_parallel
 from .causal_conv1d import causal_conv1d_fn, causal_conv1d_update
 from .causal_conv1d_triton import causal_conv1d_update as causal_conv1d_update_triton
-from .fuse_elementwise_ops import extract_transpose_prefill_slice
+from .fuse_elementwise_ops import (
+    extract_transpose_prefill_slice,
+    split_qkv_contiguous,
+    transpose_and_split_qkv,
+)
 from .layernorm_gated import RMSNorm as RMSNormGated
 from .mamba2_metadata import Mamba2Metadata
 
@@ -199,6 +209,75 @@ def fused_gdn_gating(
     return g
 
 
+@triton.jit
+def fused_gdn_gating_with_sigmoid_kernel(
+    g,
+    beta_out,
+    A_log,
+    a,
+    dt_bias,
+    b,
+    seq_len,
+    NUM_HEADS: tl.constexpr,
+    sp_beta: tl.constexpr,
+    threshold: tl.constexpr,
+    BLK_HEADS: tl.constexpr,
+):
+    """Fuse gdn_gating + sigmoid(b) into one kernel."""
+    i_b, i_s, i_d = tl.program_id(0), tl.program_id(1), tl.program_id(2)
+    head_off = i_d * BLK_HEADS + tl.arange(0, BLK_HEADS)
+    off = i_b * seq_len * NUM_HEADS + i_s * NUM_HEADS + head_off
+    mask = head_off < NUM_HEADS
+    blk_A_log = tl.load(A_log + head_off, mask=mask)
+    blk_a = tl.load(a + off, mask=mask)
+    blk_bias = tl.load(dt_bias + head_off, mask=mask)
+    x = blk_a.to(tl.float32) + blk_bias.to(tl.float32)
+    softplus_x = tl.where(
+        sp_beta * x <= threshold, (1 / sp_beta) * tl.log(1 + tl.exp(sp_beta * x)), x
+    )
+    blk_g = -tl.exp(blk_A_log.to(tl.float32)) * softplus_x
+    tl.store(g + off, blk_g.to(g.dtype.element_ty), mask=mask)
+    # sigmoid(b)
+    blk_b = tl.load(b + off, mask=mask)
+    blk_beta = tl.sigmoid(blk_b.to(tl.float32))
+    tl.store(beta_out + off, blk_beta.to(beta_out.dtype.element_ty), mask=mask)
+
+
+def fused_gdn_gating_with_sigmoid(
+    A_log: torch.Tensor,
+    a: torch.Tensor,
+    dt_bias: torch.Tensor,
+    b: torch.Tensor,
+    sp_beta: float = 1.0,
+    threshold: float = 20.0,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Fused GDN gating + sigmoid: compute g and beta in one kernel launch."""
+    batch, num_heads = a.shape
+    seq_len = 1
+    grid = (batch, seq_len, triton.cdiv(num_heads, 8))
+    g = torch.empty_like(a, dtype=torch.float32)
+    # Allocate beta in fp32 since (1) the kernel already computes sigmoid in fp32
+    # and was previously casting back to b.dtype only to be re-cast to fp32 by the
+    # FlashInfer GDN prefill wrapper, and (2) the Triton chunk_gated_delta_rule
+    # path also accepts fp32 beta. Eliminates a redundant cast in the FI hot path.
+    beta_out = torch.empty_like(b, dtype=torch.float32)
+    fused_gdn_gating_with_sigmoid_kernel[grid](
+        g,
+        beta_out,
+        A_log,
+        a,
+        dt_bias,
+        b,
+        seq_len,
+        num_heads,
+        sp_beta,
+        threshold,
+        8,
+        num_warps=1,
+    )
+    return g, beta_out
+
+
 class Qwen3NextGatedDeltaNet(nn.Module):
     def __init__(
         self,
@@ -367,15 +446,36 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         query = mixed_qkvz[..., :q_end]
         key = mixed_qkvz[..., q_end:k_end]
 
-        # Optimize: Use view (zero-copy) instead of reshape for contiguous slices
-        # Layout: [v_concat | z_concat], need to reshape each separately
-        value = mixed_qkvz[..., k_end:v_end].view(batch_size, num_v_heads_local, self.head_v_dim)
-        z = mixed_qkvz[..., v_end:z_end].view(batch_size, num_v_heads_local, self.head_v_dim)
+        # When heads_ratio == 1, ng == num_v_heads_local, so view works directly.
+        # When heads_ratio > 1 (dense models), the last-dim slice is
+        # [b, ng, ratio*hv] and we need [b, ng*ratio, hv].  A plain view
+        # fails because the slice is not contiguous in the packed qkvz
+        # tensor.  Adding .contiguous() before view is equivalent to
+        # reshape but makes the copy explicit and avoids a hidden perf
+        # drop.  An alternative zero-copy path would require changing
+        # the packing layout, which is a larger refactor.
+        if heads_ratio == 1:
+            value = mixed_qkvz[..., k_end:v_end]
+            z = mixed_qkvz[..., v_end:z_end]
+        else:
+            value = (
+                mixed_qkvz[..., k_end:v_end]
+                .contiguous()
+                .view(batch_size, num_v_heads_local, self.head_v_dim)
+            )
+            z = (
+                mixed_qkvz[..., v_end:z_end]
+                .contiguous()
+                .view(batch_size, num_v_heads_local, self.head_v_dim)
+            )
 
         # Slice ba components: [b, ng, 2*np/ng] -> [b, np] each
-        # Optimize: Use view instead of reshape (zero-copy for contiguous data)
-        b = mixed_ba[..., :heads_ratio].view(batch_size, num_v_heads_local)
-        a = mixed_ba[..., heads_ratio:].view(batch_size, num_v_heads_local)
+        if heads_ratio == 1:
+            b = mixed_ba[..., 0]
+            a = mixed_ba[..., 1]
+        else:
+            b = mixed_ba[..., :heads_ratio].contiguous().view(batch_size, num_v_heads_local)
+            a = mixed_ba[..., heads_ratio:].contiguous().view(batch_size, num_v_heads_local)
 
         return query, key, value, z, b, a
 
@@ -397,7 +497,7 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         num_decodes = kwargs["num_decodes"]
 
         if is_target_verify:
-            draft_token_num = spec_metadata.max_draft_len + 1
+            draft_token_num = spec_metadata.runtime_draft_len + 1
             assert num_decodes > 0
             assert mixed_qkv.shape[0] == num_decodes * draft_token_num
             assert a.shape[0] == num_decodes * draft_token_num
@@ -565,7 +665,7 @@ class Qwen3NextGatedDeltaNet(nn.Module):
             )
 
             if is_target_verify:
-                draft_token_num = spec_metadata.max_draft_len + 1
+                draft_token_num = spec_metadata.runtime_draft_len + 1
                 assert num_decodes > 0
                 assert mixed_qkv_d.shape[0] == num_decodes * draft_token_num
                 assert a_d.shape[0] == num_decodes * draft_token_num
@@ -597,8 +697,20 @@ class Qwen3NextGatedDeltaNet(nn.Module):
                     activation=self.activation,
                     conv_state_indices=state_indices_d,
                 )
-            mixed_qkv_p.copy_(mixed_qkv_p_t.transpose(0, 1))
-            mixed_qkv = torch.cat((mixed_qkv_p, mixed_qkv_d), dim=0)
+            key_split_dim = self.key_dim // self.attn_tp_size
+            value_split_dim = self.value_dim // self.attn_tp_size
+            # Fused transpose + split for mixed prefill+decode batch
+            query, key, value = transpose_and_split_qkv(
+                mixed_qkv_p_t,
+                mixed_qkv_d,
+                key_split_dim,
+                key_split_dim,
+                value_split_dim,
+                self.num_k_heads_per_tp,
+                self.head_k_dim,
+                self.num_v_heads_per_tp,
+                self.head_v_dim,
+            )
         else:
             mixed_qkv_t = extract_transpose_prefill_slice(
                 mixed_qkv,
@@ -606,7 +718,7 @@ class Qwen3NextGatedDeltaNet(nn.Module):
                 0,
                 mixed_qkv.shape[1],
             )
-            mixed_qkv = causal_conv1d_fn(
+            mixed_qkv_t = causal_conv1d_fn(
                 mixed_qkv_t,
                 self.conv1d.weight,
                 self.conv1d.bias,
@@ -615,24 +727,20 @@ class Qwen3NextGatedDeltaNet(nn.Module):
                 has_initial_state=has_initial_states,
                 cache_indices=cache_indices,
                 query_start_loc=query_start_loc,
-            ).transpose(0, 1)
-
-        key_split_dim = self.key_dim // self.attn_tp_size
-        value_split_dim = self.value_dim // self.attn_tp_size
-
-        query, key, value = torch.split(
-            mixed_qkv,
-            [key_split_dim, key_split_dim, value_split_dim],
-            dim=-1,
-        )
-
-        actual_seq_len = query.shape[0]
-        num_heads = query.shape[1] // self.head_k_dim
-        num_value_heads = value.shape[1] // self.head_v_dim
-
-        query = query.view(1, actual_seq_len, num_heads, self.head_k_dim)
-        key = key.view(1, actual_seq_len, num_heads, self.head_k_dim)
-        value = value.view(1, actual_seq_len, num_value_heads, self.head_v_dim)
+            )
+            key_split_dim = self.key_dim // self.attn_tp_size
+            value_split_dim = self.value_dim // self.attn_tp_size
+            # Fused split for pure prefill (data in [D,T] layout from conv1d)
+            query, key, value = split_qkv_contiguous(
+                mixed_qkv_t.transpose(0, 1),
+                key_split_dim,
+                key_split_dim,
+                value_split_dim,
+                self.num_k_heads_per_tp,
+                self.head_k_dim,
+                self.num_v_heads_per_tp,
+                self.head_v_dim,
+            )
 
         if is_target_verify and num_decode_tokens > 0:
             attn_out_prefill = None
@@ -645,7 +753,6 @@ class Qwen3NextGatedDeltaNet(nn.Module):
                 beta_p = b_p.sigmoid().unsqueeze(0)
                 g_p = fused_gdn_gating(self.A_log, a_p, self.dt_bias).unsqueeze(0)
                 recurrent_state_p = ssm_states[state_indices_p]
-
                 attn_out_prefill, last_recurrent_state = chunk_gated_delta_rule(
                     q=query_p,
                     k=key_p,
@@ -661,7 +768,7 @@ class Qwen3NextGatedDeltaNet(nn.Module):
                 last_recurrent_state = last_recurrent_state.to(ssm_states.dtype, copy=False)
                 ssm_states[state_indices_p] = last_recurrent_state
 
-            draft_token_num = spec_metadata.max_draft_len + 1
+            draft_token_num = spec_metadata.runtime_draft_len + 1
             query_d = query[:, num_prefill_tokens:, :, :].reshape(
                 num_decodes, draft_token_num, self.num_k_heads // self.attn_tp_size, self.head_k_dim
             )
@@ -704,8 +811,7 @@ class Qwen3NextGatedDeltaNet(nn.Module):
                 return attn_out_decode
             return torch.cat((attn_out_prefill, attn_out_decode), dim=1)
 
-        beta = b.sigmoid()
-        g = fused_gdn_gating(self.A_log, a, self.dt_bias)
+        g, beta = fused_gdn_gating_with_sigmoid(self.A_log, a, self.dt_bias, b)
 
         g = g.unsqueeze(0)
         beta = beta.unsqueeze(0)

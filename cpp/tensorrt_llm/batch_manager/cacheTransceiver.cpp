@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -147,10 +147,11 @@ CacheTransceiver::CacheTransceiver(kv_cache_manager::BaseKVCacheManager* cacheMa
     {
         kvFactor = 1;
     }
-    mCacheState = std::make_unique<executor::kv_cache::CacheState>(cacheStateModelCfg, worldConfig,
-        attentionLayerNumPerPP, dataType, attentionType, kvFactor, cacheManager->isEnableBlockReuse(),
-        cacheManager->isEnablePartialReuse(), cacheManager->isEnableIndexerKCache(),
-        cacheManager->getIndexerKCacheIndexHeadDim(), cacheManager->getIndexerKCacheQuantBlockSize());
+    mCacheState
+        = std::make_unique<executor::kv_cache::CacheState>(cacheStateModelCfg, worldConfig, attentionLayerNumPerPP,
+            dataType, attentionType, kvFactor, cacheManager->isEnableBlockReuse(), cacheManager->isEnablePartialReuse(),
+            cacheManager->isEnableIndexerKCache(), cacheManager->getIndexerKCacheIndexHeadDim(),
+            cacheManager->getIndexerKCacheQuantBlockSize(), cacheManager->getIndexerKCacheUseFp4());
 
     if (mCacheState->getParallelConfig().mEnableAttentionDP)
     {
@@ -203,6 +204,55 @@ CacheTransceiver::CacheTransceiver(kv_cache_manager::BaseKVCacheManager* cacheMa
         mCacheState->setRnnConfig(rnnModelCfg, rnnLayerNumPerPP, convStateDataType, ssmStateDataType);
 
         TLLM_LOG_INFO("RNN cache transfer components initialized.");
+    }
+
+    // Unified pool path (CppMambaHybridCacheManager): build RnnModelConfig from
+    // LinearAttentionMetadata. Detected by rnnLayerNumPerPP set but no RnnStateManager.
+    if (mRnnStateManager == nullptr && !rnnLayerNumPerPP.empty())
+    {
+        auto const& blockManager = cacheManager->getBlockManager();
+        auto const& linearMeta = blockManager.getLinearAttentionMetadata();
+        TLLM_CHECK_WITH_INFO(linearMeta.has_value(), "LinearAttentionMetadata not found for unified pool RNN config");
+
+        executor::kv_cache::CacheState::RnnModelConfig rnnModelCfg{};
+        rnnModelCfg.mNumHeads = linearMeta->rnnNumHeads;
+        rnnModelCfg.mHeadDim = linearMeta->rnnHeadDim;
+        rnnModelCfg.mDState = linearMeta->rnnDState;
+        rnnModelCfg.mDConv = linearMeta->rnnDConv;
+        rnnModelCfg.mNGroups = linearMeta->rnnNGroups;
+        rnnModelCfg.mHiddenSize = linearMeta->rnnHeadDim * linearMeta->rnnNumHeads;
+        rnnModelCfg.mConvSectionLayout = static_cast<executor::kv_cache::CacheState::RnnModelConfig::ConvSectionLayout>(
+            linearMeta->rnnConvSectionLayout);
+
+        // Derive actual SSM and conv dtypes from metadata byte sizes.
+        // Pool dtype is UINT8 (raw byte storage), so we cannot use pool->getDataType().
+        // Only the byte size matters for split/concat kernel stride calculations — the actual
+        // dtype enum is not interpreted numerically, just used for getDTypeSize() dispatch.
+        auto dtypeFromSize = [](SizeType32 size) -> nvinfer1::DataType
+        {
+            switch (size)
+            {
+            case 4: return nvinfer1::DataType::kFLOAT;
+            case 2: return nvinfer1::DataType::kBF16;
+            case 1: return nvinfer1::DataType::kFP8;
+            default: TLLM_THROW("Unsupported RNN state dtype size: %d", size);
+            }
+        };
+        TLLM_CHECK_WITH_INFO(linearMeta->rnnSsmDtypeSize > 0, "rnnSsmDtypeSize not set in LinearAttentionMetadata");
+        TLLM_CHECK_WITH_INFO(linearMeta->rnnConvDtypeSize > 0, "rnnConvDtypeSize not set in LinearAttentionMetadata");
+        nvinfer1::DataType ssmDtype = dtypeFromSize(linearMeta->rnnSsmDtypeSize);
+        nvinfer1::DataType convDtype = dtypeFromSize(linearMeta->rnnConvDtypeSize);
+        mCacheState->setRnnConfig(rnnModelCfg, rnnLayerNumPerPP, convDtype, ssmDtype);
+
+        // Create RnnCacheTransBufferManager for unified pool path.
+        mRnnCacheTransBufferManager
+            = std::make_unique<rnn_state_manager::RnnCacheTransBufferManager>(cacheManager, *mCacheState, maxNumTokens);
+
+        TLLM_LOG_INFO(
+            "Unified pool RNN config: numHeads=%d, headDim=%d, dState=%d, dConv=%d, "
+            "nGroups=%d, hiddenSize=%d, convSectionLayout=%d",
+            rnnModelCfg.mNumHeads, rnnModelCfg.mHeadDim, rnnModelCfg.mDState, rnnModelCfg.mDConv, rnnModelCfg.mNGroups,
+            rnnModelCfg.mHiddenSize, static_cast<int>(rnnModelCfg.mConvSectionLayout));
     }
 
     mCacheTransBufferManagerPtrs.clear();
@@ -273,11 +323,17 @@ CacheTransceiver::CacheTransceiver(kv_cache_manager::BaseKVCacheManager* cacheMa
         return createCacheFormatter(cacheManager, kvBufferPtrs, isMLA);
     };
 
-    auto makeRnnFormatter = [this]() -> std::unique_ptr<RnnCacheFormatter>
+    auto makeRnnFormatter = [this, cacheManager]() -> std::unique_ptr<RnnCacheFormatter>
     {
         if (mRnnStateManager != nullptr && mRnnCacheTransBufferManager != nullptr)
         {
+            // Slot-based path (CppMambaCacheManager)
             return std::make_unique<RnnCacheFormatter>(mRnnStateManager, mRnnCacheTransBufferManager.get());
+        }
+        // Unified pool path (CppMambaHybridCacheManager)
+        if (mCacheState->hasRnnConfig() && mRnnCacheTransBufferManager != nullptr)
+        {
+            return std::make_unique<RnnCacheFormatter>(cacheManager, mRnnCacheTransBufferManager.get());
         }
         return nullptr;
     };

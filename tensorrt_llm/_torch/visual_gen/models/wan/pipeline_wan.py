@@ -13,15 +13,14 @@ from tensorrt_llm._torch.visual_gen.cache.teacache import (
     ExtractorConfig,
     register_extractor_from_config,
 )
-from tensorrt_llm._torch.visual_gen.config import PipelineComponent
 from tensorrt_llm._torch.visual_gen.models.wan.defaults import (
     get_wan_default_params,
     get_wan_extra_param_specs,
 )
 from tensorrt_llm._torch.visual_gen.models.wan.pipeline_wan_utils import retrieve_latents
-from tensorrt_llm._torch.visual_gen.output import MediaOutput
+from tensorrt_llm._torch.visual_gen.output import CudaPhaseTimer, PipelineOutput
 from tensorrt_llm._torch.visual_gen.pipeline import BasePipeline
-from tensorrt_llm._torch.visual_gen.pipeline_registry import register_pipeline
+from tensorrt_llm._torch.visual_gen.pipeline_registry import PipelineComponent, register_pipeline
 from tensorrt_llm._torch.visual_gen.utils import postprocess_video_tensor
 from tensorrt_llm._utils import nvtx_range
 from tensorrt_llm.logger import logger
@@ -79,7 +78,16 @@ WAN_DEFAULT_NEGATIVE_PROMPT = (
 )
 
 
-@register_pipeline("WanPipeline")
+@register_pipeline(
+    "WanPipeline",
+    hf_ids=[
+        "Wan-AI/Wan2.1-T2V-1.3B-Diffusers",
+        "Wan-AI/Wan2.1-T2V-14B-Diffusers",
+        "Wan-AI/Wan2.2-T2V-A14B-Diffusers",
+        "Wan-AI/Wan2.2-TI2V-5B-Diffusers",
+    ],
+    doc="Wan 2.1 & 2.2 text-to-video family.",
+)
 class WanPipeline(BasePipeline):
     def __init__(self, model_config):
         # Wan2.2 A14B two-stage denoising parameters
@@ -198,7 +206,6 @@ class WanPipeline(BasePipeline):
         else:
             logger.info("Detected Wan 2.1 T2V (single-stage denoising)")
 
-        # Set default VAE scale factors (will be overridden if VAE is loaded)
         default_vae_scale_factor_spatial = 16 if self.is_wan22_5b else 8
         self.vae_scale_factor_temporal = 4
         self.vae_scale_factor_spatial = default_vae_scale_factor_spatial
@@ -387,6 +394,8 @@ class WanPipeline(BasePipeline):
         image: Optional[Union[PIL.Image.Image, torch.Tensor, str]] = None,
     ):
         pipeline_start = time.time()
+        timer = CudaPhaseTimer()
+        timer.mark_pre_start()
 
         # WanPipeline supports I2V for Wan 2.2 TI2V-5B. Use WanImageToVideoPipeline for Wan 2.1 I2V and Wan 2.2 A14B I2V
         is_i2v = image is not None
@@ -543,6 +552,7 @@ class WanPipeline(BasePipeline):
         post_step_fn = _pin_i2v_first_frame if (self.is_wan22_5b and is_i2v) else None
 
         # Two-stage denoising: model switching in forward_fn, guidance scale switching in denoise()
+        timer.mark_denoise_start()
         latents = self.denoise(
             latents=latents,
             scheduler=self.scheduler,
@@ -554,6 +564,7 @@ class WanPipeline(BasePipeline):
             boundary_timestep=boundary_timestep,
             post_step_fn=post_step_fn,
         )
+        timer.mark_post_start()
 
         # Decode
         logger.info("Decoding video...")
@@ -564,7 +575,8 @@ class WanPipeline(BasePipeline):
             logger.info(f"Video decoded in {time.time() - decode_start:.2f}s")
             logger.info(f"Total pipeline time: {time.time() - pipeline_start:.2f}s")
 
-        return MediaOutput(video=video)
+        timer.mark_end()
+        return timer.fill(PipelineOutput(video=video, frame_rate=16.0))
 
     @nvtx_range("_encode_prompt", color="blue")
     def _encode_prompt(

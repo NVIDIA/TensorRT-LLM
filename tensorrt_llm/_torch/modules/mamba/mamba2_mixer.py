@@ -157,13 +157,10 @@ class Mamba2Mixer(nn.Module):
 
         # Choose between flashinfer and native implementation. (default to flashinfer)
         self._mamba_ssm_cache_dtype = config.quant_config.mamba_ssm_cache_dtype
-        # TODO: Update head_dims and head_group_ratios once flashinfer is updated.
+        # TODO: Update head_dims once flashinfer is updated.
+        # Nemotron-v2-Nano (mamba_head_dim=80) is not supported by flashinfer yet.
         supported_head_dims = [64, 128]
-        supported_head_group_ratios = [1, 8, 16]
-        head_group_ratio = (self.tp_nheads //
-                            self.tp_ngroups if self.tp_ngroups > 0 else 0)
-        self._use_flashinfer = (head_dim in supported_head_dims and
-                                head_group_ratio in supported_head_group_ratios)
+        self._use_flashinfer = head_dim in supported_head_dims
         self._stochastic_rounding_requested = (
             config.quant_config.mamba_ssm_stochastic_rounding)
         self._philox_rounds = config.quant_config.mamba_ssm_philox_rounds
@@ -541,6 +538,10 @@ class Mamba2Mixer(nn.Module):
                 elif self._use_mtp_custom_op and not use_stochastic_rounding:
                     # Upstream TRT-LLM CUDA custom op for MTP SSM cache update.
                     # Does not support stochastic rounding.
+                    # CUDA kernel requires contiguous dense inputs.
+                    x_d_4d = x_d_4d.contiguous()
+                    B_d_4d = B_d_4d.contiguous()
+                    C_d_4d = C_d_4d.contiguous()
                     selective_state_update_mtp_ssm_cache_trtllm(
                         ssm_states,
                         x_d_4d,
@@ -560,7 +561,7 @@ class Mamba2Mixer(nn.Module):
                         intermediate_state_indices=intermediate_state_indices,
                     )
                 else:
-                    # Legacy flashinfer path: contiguous copies for alignment.
+                    # Triton kernel + flashinfer need contiguous for alignment.
                     x_d_4d = x_d_4d.contiguous()
                     B_d_4d = B_d_4d.contiguous()
                     C_d_4d = C_d_4d.contiguous()

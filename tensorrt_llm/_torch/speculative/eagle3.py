@@ -64,6 +64,11 @@ class Eagle3ResourceManager(BaseResourceManager):
             (max_num_tokens, self.hidden_size * config.num_capture_layers),
             dtype=self.dtype,
             device='cuda')
+        self.batch_indices_cuda = torch.empty(
+            [max_num_requests],
+            dtype=torch.int,
+            device='cuda',
+        )
         # sequence length, only used for metadata preparation
         self.seq_lens = {i: 0 for i in range(slot_size)}
         # start indices of each slot
@@ -130,8 +135,16 @@ class Eagle3OneModelDynamicTreeResourceManager(BaseResourceManager):
     for tree attention setup and verification routing.
     """
 
+    hidden_states: Optional[torch.Tensor] = None
+    batch_indices_cuda: Optional[torch.Tensor] = None
+
     def __init__(self, config: "EagleDecodingConfig", max_num_requests: int):
         self.max_num_requests = max_num_requests
+        self.batch_indices_cuda = torch.empty(
+            [max_num_requests],
+            dtype=torch.int,
+            device='cuda',
+        )
         self.spec_tree_manager = SpecTreeManager(
             max_num_requests=max_num_requests,
             use_dynamic_tree=config.use_dynamic_tree,
@@ -144,7 +157,8 @@ class Eagle3OneModelDynamicTreeResourceManager(BaseResourceManager):
     def free_resources(self, request: LlmRequest):
         """Clear tree validity for the freed request slot."""
         if request.py_seq_slot is not None:
-            self.spec_tree_manager.mark_tree_invalid(request.py_seq_slot)
+            self.spec_tree_manager.slot_storage.mark_invalid(
+                request.py_seq_slot)
 
     def add_dummy_requests(self, request_ids: List[int]):
         """Handle CUDA graph dummy request registration.
@@ -219,6 +233,7 @@ class Eagle3SpecMetadata(SpecMetadata):
             self.is_spec_dec_dynamic_tree = False
 
     def prepare(self):
+        super().prepare()
         is_first_draft = self.eagle3_resource_manager.is_first_draft
         spec_tree_manager = self.eagle3_resource_manager.spec_tree_manager
         # Update start indices
@@ -369,16 +384,36 @@ class Eagle3OneModelSpecMetadata(SpecMetadata):
         else:
             self.layers_to_capture = sorted(list(self.layers_to_capture))
         self.num_capture_layers = len(self.layers_to_capture)
-        self.hidden_states = torch.empty(
-            (self.max_num_tokens,
-             self.hidden_size * len(self.layers_to_capture)),
-            dtype=self.dtype,
-            device='cuda')
-        self.batch_indices_cuda = torch.empty(
-            [self.max_num_requests],
-            dtype=torch.int,
-            device='cuda',
-        )
+        if (self.spec_resource_manager is not None
+                and self.spec_resource_manager.hidden_states is not None):
+            self.hidden_states = self.spec_resource_manager.hidden_states
+            expected_cols = self.hidden_size * len(self.layers_to_capture)
+            assert self.hidden_states.shape[1] == expected_cols, (
+                f"hidden_states shape mismatch: "
+                f"{type(self.spec_resource_manager).__name__} has "
+                f"{self.hidden_states.shape}, but metadata expects "
+                f"(:, {expected_cols}) from hidden_size={self.hidden_size} "
+                f"x capture_layers={list(self.layers_to_capture)}")
+        else:
+            self.hidden_states = torch.empty(
+                (self.max_num_tokens,
+                 self.hidden_size * len(self.layers_to_capture)),
+                dtype=self.dtype,
+                device='cuda')
+        if (self.spec_resource_manager is not None
+                and self.spec_resource_manager.batch_indices_cuda is not None):
+            self.batch_indices_cuda = self.spec_resource_manager.batch_indices_cuda
+            assert self.batch_indices_cuda.shape[0] >= self.max_num_requests, (
+                f"batch_indices_cuda shape mismatch: "
+                f"{type(self.spec_resource_manager).__name__} has "
+                f"{self.batch_indices_cuda.shape}, but metadata expects "
+                f"at least ({self.max_num_requests},)")
+        else:
+            self.batch_indices_cuda = torch.empty(
+                [self.max_num_requests],
+                dtype=torch.int,
+                device='cuda',
+            )
 
         # Set tree flags based on config
         if self.use_dynamic_tree:
@@ -395,6 +430,7 @@ class Eagle3OneModelSpecMetadata(SpecMetadata):
         return layer_id in self.layers_to_capture
 
     def prepare(self):
+        super().prepare()
         assert self.request_ids is not None
         # update batch indices
         num_seqs = len(self.request_ids)
@@ -497,8 +533,11 @@ class Eagle3OneModelWorker(SpecWorkerBase):
         if attn_metadata.spec_decoding_position_offsets is not None:
             self._saved_position_offsets = attn_metadata.spec_decoding_position_offsets.clone(
             )
+            self._saved_position_offsets_cpp = (
+                attn_metadata.spec_decoding_position_offsets_cpp)
         else:
             self._saved_position_offsets = None
+            self._saved_position_offsets_cpp = None
         if attn_metadata.spec_decoding_generation_lengths is not None:
             self._saved_generation_lengths = attn_metadata.spec_decoding_generation_lengths[:batch_size].clone(
             )
@@ -521,7 +560,10 @@ class Eagle3OneModelWorker(SpecWorkerBase):
         if self._saved_position_offsets is not None:
             attn_metadata.spec_decoding_position_offsets.copy_(
                 self._saved_position_offsets)
+            attn_metadata.spec_decoding_position_offsets_cpp = (
+                self._saved_position_offsets_cpp)
             self._saved_position_offsets = None
+            self._saved_position_offsets_cpp = None
         if self._saved_generation_lengths is not None:
             batch_size = self._saved_generation_lengths.shape[0]
             attn_metadata.spec_decoding_generation_lengths[:batch_size].copy_(
@@ -639,6 +681,7 @@ class Eagle3OneModelWorker(SpecWorkerBase):
         """Original linear draft loop (1 token per layer)."""
         runtime_draft_len = spec_metadata.runtime_draft_len
         next_draft_tokens = []
+        draft_logits_list = []
         position_ids = inputs["position_ids"]
 
         with self.draft_kv_cache_context(attn_metadata, draft_kv_cache_manager):
@@ -691,6 +734,9 @@ class Eagle3OneModelWorker(SpecWorkerBase):
                                                             d2t,
                                                             draft_step=i)
 
+                if spec_metadata.use_rejection_sampling:
+                    draft_logits_list.append(logits.clone())
+
                 new_draft_token = self.draft_decoder(logits, draft_model)
                 next_draft_tokens.append(new_draft_token)
                 # update inputs
@@ -732,6 +778,12 @@ class Eagle3OneModelWorker(SpecWorkerBase):
                 gen_draft_tokens)
             next_draft_tokens[num_contexts:] = gen_draft_tokens
 
+        if spec_metadata.use_rejection_sampling and draft_logits_list:
+            d2t_param = getattr(draft_model.model, "d2t", None)
+            spec_metadata.d2t = d2t_param.data if d2t_param is not None else None
+            self._compute_and_store_draft_probs(draft_logits_list,
+                                                spec_metadata, batch_size)
+
         return next_draft_tokens
 
     def sample_and_accept_draft_tokens(
@@ -752,8 +804,8 @@ class Eagle3OneModelWorker(SpecWorkerBase):
                 spec_metadata.runtime_draft_len,
                 dtype=torch.int,
                 device=logits.device)
-        return self._sample_and_accept_draft_tokens_base(
-            logits, draft_tokens, num_contexts, batch_size, spec_metadata)
+        return self._accept_draft_tokens(logits, draft_tokens, num_contexts,
+                                         batch_size, spec_metadata)
 
     def draft_decoder(
         self,

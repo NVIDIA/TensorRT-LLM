@@ -196,3 +196,40 @@ class TestStatsSerializer:
         result = BaseWorker._stats_serializer((iter_stats, None))
         d = json.loads(result)
         assert "kvCacheIterationStats" not in d
+
+    def test_serializer_attention_dp_rank_tag(self):
+        """ADP 4-tuple should carry the supplied attention-DP rank."""
+        iter_stats = _make_mock_iteration_stats()
+
+        result = BaseWorker._stats_serializer((iter_stats, None, None, 3))
+        d = json.loads(result)
+        assert d["attentionDpRank"] == 3
+
+    def test_serializer_none_attention_dp_rank_defaults_zero(self):
+        """Fixed-shape 4-tuples use None for non-ADP and serialize as rank 0."""
+        iter_stats = _make_mock_iteration_stats()
+
+        result = BaseWorker._stats_serializer((iter_stats, None, None, None))
+        d = json.loads(result)
+        assert d["attentionDpRank"] == 0
+
+    def test_serializer_7_tuple_emits_new_timing_and_scheduler_mode(self):
+        """7-tuple shape: hostStepTimeMS / prevDeviceStepTimeMS / schedulerMode.
+
+        ``PyExecutor._append_iter_stats`` now emits a 7-tuple carrying the
+        per-loop CPU wall (slot 4), the ping-pong GPU forward time (slot 5),
+        and the per-record schedulerMode tag (slot 6). The serializer must
+        surface each under its expected JSON key so /metrics consumers can
+        interpret iterLatencyMS without reading server config.
+
+        ``prevDeviceStepTimeMS`` is set to None to also guard the first-iter
+        case where the ping-pong event pair has no prior measurement: the
+        key must be omitted (not serialized as null or 0.0) so consumers can
+        distinguish "unavailable" from a real zero.
+        """
+        iter_stats = _make_mock_iteration_stats()
+        result = BaseWorker._stats_serializer((iter_stats, None, None, None, 12.5, None, "overlap"))
+        d = json.loads(result)
+        assert d["hostStepTimeMS"] == 12.5
+        assert "prevDeviceStepTimeMS" not in d
+        assert d["schedulerMode"] == "overlap"

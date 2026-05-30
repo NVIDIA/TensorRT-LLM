@@ -356,7 +356,7 @@ protected:
     TKernelMeta const* mKernelMeta;
     unsigned int mKernelMetaCount;
     unsigned int mSM;
-    std::unordered_map<unsigned long long const*, CUlibrary> mCuLibs;
+    std::unordered_map<unsigned char const*, CUlibrary> mCuLibs;
 
     bool mForceXQA = false;
 

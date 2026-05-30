@@ -1015,6 +1015,13 @@ class RADIOVisionModelBase(nn.Module):
 class RADIOVisionModel(PreTrainedModel):
     """Modify from https://huggingface.co/nvidia/C-RADIOv2-H/blob/main/hf_model.py."""
 
+    # transformers>=5.5 strict-validates _attn_implementation in PreTrainedModel.__init__.
+    # RADIO uses TRT-LLM's own vision attention backend (FLASHINFER by default),
+    # not HF's flash_attention_2 path — declare both so super().__init__() accepts whatever
+    # backend HF auto-selects.
+    _supports_flash_attn = True
+    _supports_sdpa = True
+
     def __init__(self,
                  model_config: model_config_lib.ModelConfig,
                  disable_quantization: bool = True,

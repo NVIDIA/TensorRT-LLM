@@ -1,7 +1,13 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import asyncio
 import time
 
+import numpy as np
 import pytest
+import torch
+from PIL import Image
 from utils.util import skip_single_gpu
 
 import tensorrt_llm
@@ -11,6 +17,10 @@ from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm._utils import KVCacheEventSerializer
 from tensorrt_llm.bindings.internal.testing import \
     simulate_prefill_completion_only_use_for_testing
+from tensorrt_llm.inputs.multimodal import (MultimodalInput,
+                                            _find_mm_token_runs_from_mask,
+                                            apply_mm_hashes)
+from tensorrt_llm.inputs.multimodal_data import AudioData, VideoData
 from tensorrt_llm.llmapi import KvCacheConfig
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.sampling_params import SamplingParams
@@ -310,6 +320,64 @@ def test_apply_mm_hashes_uuid_content_combined():
         "Different UUID + same content should produce different hashes"
 
 
+def test_apply_mm_hashes_video_audio_affects_hash():
+    """VideoData hashes include extracted audio when it affects model inputs."""
+    frames = [
+        Image.new("RGB", (2, 2), (10, 20, 30)),
+        Image.new("RGB", (2, 2), (40, 50, 60)),
+    ]
+    audio_a = np.array([0.0, 0.25, -0.5, 1.0], dtype=np.float32)
+    audio_a_copy = audio_a.copy()
+    audio_b = np.array([0.0, 0.25, -0.5, -1.0], dtype=np.float32)
+
+    def make_video(audio_samples=None, sample_rate=16000):
+        audio = None
+        if audio_samples is not None:
+            audio = AudioData(samples=audio_samples, sample_rate=sample_rate)
+        return VideoData(frames=frames, metadata={}, audio=audio)
+
+    hashes_a, _ = apply_mm_hashes({"video": [make_video(audio_a)]})
+    hashes_a_copy, _ = apply_mm_hashes({"video": [make_video(audio_a_copy)]})
+    hashes_b, _ = apply_mm_hashes({"video": [make_video(audio_b)]})
+    hashes_a_different_rate, _ = apply_mm_hashes(
+        {"video": [make_video(audio_a, sample_rate=8000)]})
+    hashes_no_audio, _ = apply_mm_hashes({"video": [make_video()]})
+    hashes_frame_list, _ = apply_mm_hashes({"video": [frames]})
+
+    assert hashes_a["video"][0] == hashes_a_copy["video"][0]
+    assert hashes_a["video"][0] != hashes_b["video"][0]
+    assert hashes_a["video"][0] != hashes_a_different_rate["video"][0]
+    assert hashes_no_audio["video"][0] == hashes_frame_list["video"][0]
+
+    mm_uuids = {"video": ["shared-video-id"]}
+    hashes_uuid_a, _ = apply_mm_hashes({"video": [make_video(audio_a)]},
+                                       mm_uuids)
+    hashes_uuid_b, _ = apply_mm_hashes({"video": [make_video(audio_b)]},
+                                       mm_uuids)
+    assert hashes_uuid_a["video"][0] != hashes_uuid_b["video"][0]
+
+
+def test_apply_mm_hashes_audio_data_deterministic():
+    """AudioData hashes are deterministic and include sample rate."""
+    audio_a = AudioData(samples=np.array([0.0, 0.25, -0.5], dtype=np.float32),
+                        sample_rate=16000)
+    audio_a_copy = AudioData(samples=audio_a.samples.copy(), sample_rate=16000)
+    audio_b = AudioData(samples=np.array([0.0, 0.25, -1.0], dtype=np.float32),
+                        sample_rate=16000)
+    audio_a_different_rate = AudioData(samples=audio_a.samples.copy(),
+                                       sample_rate=8000)
+
+    hashes_a, _ = apply_mm_hashes({"audio": [audio_a]})
+    hashes_a_copy, _ = apply_mm_hashes({"audio": [audio_a_copy]})
+    hashes_b, _ = apply_mm_hashes({"audio": [audio_b]})
+    hashes_a_different_rate, _ = apply_mm_hashes(
+        {"audio": [audio_a_different_rate]})
+
+    assert hashes_a["audio"][0] == hashes_a_copy["audio"][0]
+    assert hashes_a["audio"][0] != hashes_b["audio"][0]
+    assert hashes_a["audio"][0] != hashes_a_different_rate["audio"][0]
+
+
 def test_int32_hexdigest_roundtrip():
     """Test that hexdigest_to_int32 and int32_to_hexdigest are inverses."""
     from tensorrt_llm.inputs.multimodal import (hexdigest_to_int32,
@@ -386,6 +454,13 @@ def test_multimodal_input_dataclass_uuid_validation():
                         multimodal_uuids="not-a-list")
 
 
+def test_multimodal_input_dataclass_rejects_mismatched_item_arrays():
+    with pytest.raises(ValueError, match="must all have the same length"):
+        MultimodalInput(multimodal_hashes=[[1, 2, 3, 4, 5, 6, 7, 8]],
+                        multimodal_positions=[10, 100],
+                        multimodal_lengths=[50, 60])
+
+
 def test_multimodal_input_from_components_with_uuids():
     """Test MultimodalInput.from_components factory method with UUIDs."""
     from tensorrt_llm.inputs.multimodal import MultimodalInput
@@ -407,6 +482,71 @@ def test_multimodal_input_from_components_with_uuids():
     mm_input_no_uuids = MultimodalInput.from_components(mm_hashes, mm_positions,
                                                         mm_lengths)
     assert mm_input_no_uuids.multimodal_uuids is None
+
+
+def test_multimodal_input_exact_run_buffers():
+    """Test optional exact run buffers on Python MultimodalInput."""
+    mm_mask = torch.tensor(
+        [False, True, True, False, False, True, False, False, True, True])
+    item_run_cu_offsets, run_positions, run_lengths = _find_mm_token_runs_from_mask(
+        mm_mask, [3, 2])
+
+    assert item_run_cu_offsets == [0, 2, 3]
+    assert run_positions == [1, 5, 8]
+    assert run_lengths == [2, 1, 2]
+
+    mm_input = MultimodalInput.from_components(
+        [[1, 2, 3, 4, 5, 6, 7, 8], [8, 7, 6, 5, 4, 3, 2, 1]],
+        [1, 8],
+        [3, 2],
+        ["item-a", None],
+        item_run_cu_offsets,
+        run_positions,
+        run_lengths,
+    )
+    assert mm_input.multimodal_item_run_cu_offsets == item_run_cu_offsets
+    assert mm_input.multimodal_run_positions == run_positions
+    assert mm_input.multimodal_run_lengths == run_lengths
+
+    with pytest.raises(ValueError, match="must be provided together"):
+        MultimodalInput(
+            multimodal_hashes=[[1, 2, 3, 4, 5, 6, 7, 8]],
+            multimodal_positions=[1],
+            multimodal_lengths=[2],
+            multimodal_item_run_cu_offsets=[0, 1],
+        )
+
+    with pytest.raises(ValueError, match="sum to 3, expected 2"):
+        MultimodalInput(
+            multimodal_hashes=[[1, 2, 3, 4, 5, 6, 7, 8]],
+            multimodal_positions=[1],
+            multimodal_lengths=[2],
+            multimodal_item_run_cu_offsets=[0, 1],
+            multimodal_run_positions=[1],
+            multimodal_run_lengths=[3],
+        )
+
+
+def test_multimodal_input_rejects_exact_run_int32_overflow():
+    int32_max = 2_147_483_647
+    with pytest.raises(ValueError, match="end position exceeds int32"):
+        MultimodalInput(
+            multimodal_hashes=[[1, 2, 3, 4, 5, 6, 7, 8]],
+            multimodal_positions=[int32_max - 1],
+            multimodal_lengths=[2],
+            multimodal_item_run_cu_offsets=[0, 1],
+            multimodal_run_positions=[int32_max - 1],
+            multimodal_run_lengths=[2],
+        )
+
+    MultimodalInput(
+        multimodal_hashes=[[1, 2, 3, 4, 5, 6, 7, 8]],
+        multimodal_positions=[int32_max - 1],
+        multimodal_lengths=[1],
+        multimodal_item_run_cu_offsets=[0, 1],
+        multimodal_run_positions=[int32_max - 1],
+        multimodal_run_lengths=[1],
+    )
 
 
 def test_apply_mm_hashes_uuid_length_mismatch():
