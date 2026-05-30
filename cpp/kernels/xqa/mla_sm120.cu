@@ -46,7 +46,12 @@ inline constexpr uint32_t nbQParts = nbKParts;
 
 inline constexpr uint32_t tokensPerTile = 64;
 inline constexpr uint32_t nbVSplit = 2;
-inline constexpr uint32_t gemm1V = exactDiv(validElemsPerVHead, nbVSplit);
+// gemm1V is the per-consumer V-tile width used by the XV GEMM. We use paddedElemsPerVHead so
+// the tile schedule is identical for DSV3 (DV=512) and DSV4 (DV=448, padded to 512). For DSV4
+// this means the last 64 V-elements per head overlap with K-RoPE in the compressed KV cache
+// layout — the resulting output[448:512] is undefined and the caller must drop it before
+// feeding o_proj.
+inline constexpr uint32_t gemm1V = exactDiv(paddedElemsPerVHead, nbVSplit);
 inline constexpr uint32_t partElemsV = headGrpSize <= 32 ? exactDiv(gemm1V, 4U) : 128;
 inline constexpr uint32_t nbProducerCtasPerCga = nbVSplit;
 
@@ -1877,10 +1882,15 @@ CUBIN_EXPORT __global__ __launch_bounds__(256, 1) void reduce_mla_flash_decode_p
     OutputHead* __restrict__ const output, PartialResult const* __restrict__ const partialResults,
     uint32_t const* __restrict__ const seqLenList, uint32_t const maxNbSubSeq, uint32_t const inputSeqLen)
 {
-    static_assert(validElemsPerVHead == 512);
+    static_assert(validElemsPerVHead == 512 || validElemsPerVHead == 448,
+        "Only DSV3 (V=512) and DSV4 (V=448) MLA shapes are supported.");
     static_assert(PartialResult::nbRowsPerChunk == warp_size);
     constexpr uint32_t colTileElems = 128;
-    constexpr uint32_t nbColTiles = exactDiv(validElemsPerVHead, colTileElems);
+    // Tile across paddedElemsPerVHead so the main kernel and the reduce kernel agree on output
+    // shape. The trailing (paddedElemsPerVHead - validElemsPerVHead) columns get explicitly
+    // zeroed below for DSV4; o_proj ignores them anyway since its weights are sized for the
+    // real V-head dim.
+    constexpr uint32_t nbColTiles = exactDiv(paddedElemsPerVHead, colTileElems);
     static_assert(nbColTiles == 4);
 
     uint32_t const idxColTile = blockIdx.x;
@@ -1936,7 +1946,17 @@ CUBIN_EXPORT __global__ __launch_bounds__(256, 1) void reduce_mla_flash_decode_p
             }
         }
         OutputHead& dst = output[headGrpSize * idxInputTokenGlobal + idxChunk * PartialResult::nbRowsPerChunk + row];
-        dst[col] = __float2bfloat16_rn(acc / fmaxf(accRowSum, 1e-20F));
+        // For DSV4 (validElemsPerVHead < paddedElemsPerVHead) the columns beyond validElemsPerVHead
+        // are not meaningful (the V loaded there is K-RoPE junk from the compressed cache layout).
+        // Zero them so callers reading the full padded output see deterministic data.
+        if (col < validElemsPerVHead)
+        {
+            dst[col] = __float2bfloat16_rn(acc / fmaxf(accRowSum, 1e-20F));
+        }
+        else
+        {
+            dst[col] = static_cast<__nv_bfloat16>(0.f);
+        }
     }
 }
 

@@ -153,6 +153,10 @@ tllmXqaJitStatus getMacroFlags(tllmXqaJitContext const* context, std::vector<std
     macros["GENERATE_CUBIN"] = "1";
     macros["NDEBUG"] = "1";
     macros["HEAD_ELEMS"] = std::to_string(head_size);
+    // HEAD_ELEMS_V is required for MLA kernels (DSV3=512, DSV4=448). For non-MLA kernels it's
+    // unused; fall back to head_size if the caller leaves it 0.
+    unsigned int const head_size_v_eff = context->head_size_v != 0 ? context->head_size_v : head_size;
+    macros["HEAD_ELEMS_V"] = std::to_string(head_size_v_eff);
     macros["BEAM_WIDTH"] = std::to_string(beam_width);
 
     if (context->kv_cache_data_type == tensorrt_llm::kernels::DATA_TYPE_INT8)

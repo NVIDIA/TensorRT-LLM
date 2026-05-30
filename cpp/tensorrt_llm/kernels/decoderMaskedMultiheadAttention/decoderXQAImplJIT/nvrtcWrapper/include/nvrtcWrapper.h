@@ -46,6 +46,9 @@ extern "C"
         int sm;
 
         unsigned int head_size;
+        // V-head dim. For non-MLA kernels this can be 0 (the wrapper falls back to head_size).
+        // For MLA kernels it must be set explicitly: DSV3 -> 512, DSV4 -> 448.
+        unsigned int head_size_v;
         unsigned int num_q_heads;
         unsigned int num_kv_heads;
         unsigned int beam_width;

@@ -28,8 +28,14 @@ using CacheElem = ElemType<CACHE_ELEM_ENUM>;
 constexpr uint32_t validElemsPerHead = HEAD_ELEMS;
 constexpr bool isMLA = IS_MLA;
 static_assert((isMLA || validElemsPerHead <= 256) && (sizeof(CacheElem) * validElemsPerHead) % 16 == 0);
-constexpr uint32_t headElems = validElemsPerHead <= 64 ? 64 : (validElemsPerHead <= 128 ? 128 : (isMLA ? 576 : 256));
-static_assert(headElems == 64 || headElems == 128 || headElems == 256 || headElems == 576, "not implemented");
+constexpr uint32_t headElems = validElemsPerHead <= 64    ? 64
+    : validElemsPerHead <= 128                            ? 128
+    : validElemsPerHead <= 256                            ? 256
+    : (isMLA && validElemsPerHead <= 512)                 ? 512
+    : isMLA                                               ? 576
+                                                          : 256;
+static_assert(headElems == 64 || headElems == 128 || headElems == 256 || headElems == 512 || headElems == 576,
+    "not implemented");
 constexpr uint32_t beamWidth = BEAM_WIDTH;
 constexpr uint32_t headGrpSize = HEAD_GRP_SIZE;
 #if SPEC_DEC
@@ -59,9 +65,25 @@ constexpr uint32_t validElemsPerKHead = validElemsPerHead;
 constexpr bool lowPrecOutput = LOW_PREC_OUTPUT;
 
 #if IS_MLA
-constexpr uint32_t validElemsPerVHead = 512;
+// validElemsPerVHead is the "real" V-head dim used by the o_proj on the host side.
+//   DSV3: 512  (kv_lora_rank=512)
+//   DSV4: 448  (kv_lora_rank=448)
+constexpr uint32_t validElemsPerVHead = HEAD_ELEMS_V;
+static_assert(validElemsPerVHead == 512 || validElemsPerVHead == 448,
+    "Only DSV3 (V=512) and DSV4 (V=448) MLA shapes are supported.");
+// For DSV4 the kernel pads V internally to 512 to reuse the DSV3 tile schedule. The trailing
+// (512 - validElemsPerVHead) elements are dropped at output-write time so the o_proj input
+// remains validElemsPerVHead.
+constexpr uint32_t paddedElemsPerVHead = 512;
+static_assert(paddedElemsPerVHead >= validElemsPerVHead);
 static_assert(lowPrecOutput == false);
-using OutputHead = Vec<__nv_bfloat16, validElemsPerVHead>;
+// OutputHead is sized to paddedElemsPerVHead so the kernel's internal tile geometry
+// (gemm1V, partElemsV, consumerCtaShapeX) can stay identical to the DSV3 schedule even
+// when the model's real V-head dim is smaller (DSV4: 448). For DSV4 the trailing
+// (paddedElemsPerVHead - validElemsPerVHead) elements per head will be either zero
+// (reduce kernel) or undefined (main kernel); callers must slice to validElemsPerVHead
+// before consuming the output (e.g. in the Python o_proj path).
+using OutputHead = Vec<__nv_bfloat16, paddedElemsPerVHead>;
 #else
 constexpr uint32_t validElemsPerVHead = validElemsPerHead;
 using OutputHead = mha::conditional_t<lowPrecOutput, GMemCacheHead, InputHead>;

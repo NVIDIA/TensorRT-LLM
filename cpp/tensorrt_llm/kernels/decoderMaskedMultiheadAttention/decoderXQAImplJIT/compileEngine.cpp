@@ -93,8 +93,12 @@ CubinObj CompileEngine::compile() const
     bool const isMlaKernel = mXqaParams.isMLA();
     uint32_t const numQHeadsOverKv = static_cast<uint32_t>(mXqaParams.num_q_heads / mXqaParams.num_kv_heads);
     uint32_t const kernelMlaHeadGrpSize = getXqaMlaRuntimeKernelHeadGrpSize(numQHeadsOverKv);
+    // For MLA, the v-head dim differs from head_size. mlaHeadSizeV() returns 512 for DSV3 and 448
+    // for DSV4. For non-MLA kernels we pass 0 and the JIT wrapper falls back to head_size.
+    uint32_t const headSizeV = isMlaKernel ? static_cast<uint32_t>(mXqaParams.mlaHeadSizeV()) : 0;
     tllmXqaJitContext context{/*sm=*/mSM,
         /*head_size=*/static_cast<uint32_t>(mXqaParams.head_size),
+        /*head_size_v=*/headSizeV,
         /*num_q_heads=*/static_cast<uint32_t>(isMlaKernel ? kernelMlaHeadGrpSize : mXqaParams.num_q_heads),
         /*num_kv_heads=*/static_cast<uint32_t>(isMlaKernel ? 1 : mXqaParams.num_kv_heads),
         /*beam_width=*/static_cast<uint32_t>(mXqaParams.beam_width),
@@ -115,7 +119,10 @@ CubinObj CompileEngine::compile() const
     if (context.kernel_type == TLLM_XQA_JIT_MLA)
     {
         auto const& c = context;
-        TLLM_CHECK(c.head_size == 576 && (c.num_q_heads == 32 || c.num_q_heads == 64 || c.num_q_heads == 128)
+        // DSV3: head_size=576, head_size_v=512.   DSV4: head_size=512, head_size_v=448.
+        bool const isDsv3Shape = (c.head_size == 576 && c.head_size_v == 512);
+        bool const isDsv4Shape = (c.head_size == 512 && c.head_size_v == 448);
+        TLLM_CHECK((isDsv3Shape || isDsv4Shape) && (c.num_q_heads == 32 || c.num_q_heads == 64 || c.num_q_heads == 128)
             && c.num_kv_heads == 1
             && c.beam_width == 1 && c.data_type == DATA_TYPE_E4M3 && c.kv_cache_data_type == DATA_TYPE_E4M3
             && c.fp8_output == false && !c.use_input_kv && ropeStyle == TLLM_XQA_JIT_ROPE_NONE);
