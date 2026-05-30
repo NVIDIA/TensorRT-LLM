@@ -994,6 +994,8 @@ class NVFP4GemmUnifiedRunner(TunableRunner):
         self.output_dtype = output_dtype
         self.allowed_backends = allowed_backends
         self.group = group
+        self.to_userbuffers = (self.output_buffer_kind == int(
+            BufferKind.USERBUFFERS))
 
     def unique_id(self):
         """Include allowed_backends in cache key to avoid sharing cache across different backend configs."""

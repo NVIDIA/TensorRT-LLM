@@ -4,7 +4,6 @@ import os
 import threading
 from dataclasses import dataclass
 from enum import Enum, IntEnum
-from functools import lru_cache
 from typing import Dict, List
 
 import torch
@@ -105,7 +104,6 @@ def get_model_extra_attrs():
     return getattr(_model_extra_attrs, 'attrs', None)
 
 
-@lru_cache(maxsize=1)
 def is_nvfp4_marlin_enabled() -> bool:
     is_hopper = get_sm_version() == 90
     has_marlin_kernel = hasattr(torch.ops.trtllm, "marlin_nvfp4_gemm")

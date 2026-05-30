@@ -8,6 +8,7 @@ import tensorrt_llm.quantization.utils.fp4_utils as fp4_utils
 from tensorrt_llm._torch.autotuner import autotune
 from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
 from tensorrt_llm._torch.modules.linear import Linear
+from tensorrt_llm._torch.utils import model_extra_attrs
 from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.math_utils import pad_up
 from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
@@ -750,8 +751,8 @@ def test_fp4_linear_cuda_core(dtype, mnk):
 
 
 @pytest.mark.skipif(
-    get_sm_version() < 90,
-    reason="Marlin NVFP4 backend requires at least Hopper",
+    get_sm_version() < 90 or get_sm_version() >= 100,
+    reason="Marlin NVFP4 backend runs Hopper",
 )
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("mnk", [
@@ -776,52 +777,46 @@ def test_fp4_linear_marlin(dtype, mnk):
     )
     assert torch.iinfo(w_sf_raw.dtype).bits == 8  # torch.uint8
     w_sf_2d = w_sf_raw.view(OUTPUT_SIZE, -1).view(torch.float8_e4m3fn)
-    w_sf_global = (448 * 6) / w_float.abs().max().float()
 
-    l_marlin = Linear(
-        in_features=HIDDEN_SIZE,
-        out_features=OUTPUT_SIZE,
-        bias=False,
-        dtype=dtype,
-        quant_config=QuantConfig(quant_algo=QuantAlgo.NVFP4),
-        nvfp4_allowed_backends=['marlin'],  # key
-    )
+    with model_extra_attrs({'nvfp4_gemm_allowed_backends': ['marlin']}):
+        l_marlin = Linear(
+            in_features=HIDDEN_SIZE,
+            out_features=OUTPUT_SIZE,
+            bias=False,
+            dtype=dtype,
+            quant_config=QuantConfig(quant_algo=QuantAlgo.NVFP4),
+            nvfp4_allowed_backends=['marlin'],  # key
+        )
 
-    l_marlin.load_weights([{
-        'weight': w_fp4,
-        'weight_scale': w_sf_2d,
-        'weight_scale_2': 1.0 / w_sf_global,
-    }])
-    l_marlin = l_marlin.cuda()
+        # ``float_to_e2m1_and_ufp8sf_scale`` returns ``w_dequant`` that already
+        # encodes the per-block FP8 scale. The Marlin BF16-activation path
+        # multiplies the kernel output by ``weight_global_scale`` (derived from
+        # ``weight_scale_2``); we want that scalar to be 1 so the kernel result
+        # matches the reference ``torch.mm(x, w_dequant.T)``. Mirrors the
+        # passing GEMM test (test_fp4_gemm.py:453-454, is_bf16_act=True branch).
+        l_marlin.load_weights([{
+            'weight':
+            w_fp4,
+            'weight_scale':
+            w_sf_2d,
+            'weight_scale_2':
+            torch.tensor(1.0, dtype=torch.float32),
+        }])
+        l_marlin = l_marlin.cuda()
 
-    l_marlin.post_load_weights()
+        l_marlin.post_load_weights()
 
-    x = torch.randn((SEQ_LEN, HIDDEN_SIZE), dtype=dtype).cuda()
-    x_sf_global = (448 * 6) / x.abs().max().float()
-    x_fp4, x_sf_block = torch.ops.trtllm.fp4_quantize(x, x_sf_global,
-                                                      scaling_vector_size,
-                                                      False)
+        x = torch.randn((SEQ_LEN, HIDDEN_SIZE), dtype=dtype).cuda()
+        x_sf_global = (448 * 6) / x.abs().max().float()
+        x_fp4, x_sf_block = torch.ops.trtllm.fp4_quantize(
+            x, x_sf_global, scaling_vector_size, False)
 
-    with torch.inference_mode():
-        output = l_marlin(x)
+        with torch.inference_mode():
+            output = l_marlin(x)
 
     w_dequant_bf16 = w_dequant.to(dtype).cuda()
-    sm = get_sm_version()
     with torch.inference_mode():
-        if sm >= 100:
-            alpha_ref = 1.0 / (w_sf_global * x_sf_global)
-            alpha_tensor = torch.tensor(alpha_ref, dtype=torch.float32).cuda()
-            ref_output = torch.ops.trtllm.nvfp4_gemm(
-                act_fp4=x_fp4,
-                weight=w_fp4.cuda(),
-                act_sf=x_sf_block,
-                weight_scale=w_sf_2d.cuda().view(torch.uint8),
-                alpha=alpha_tensor,
-                output_dtype=dtype,
-                to_userbuffers=False,
-                allowed_backends='cutlass')
-        else:
-            ref_output = torch.mm(x, w_dequant_bf16.T)
+        ref_output = torch.mm(x, w_dequant_bf16.T)
 
     torch.cuda.synchronize()
     torch.testing.assert_close(output, ref_output, atol=0.5, rtol=2e-2)
