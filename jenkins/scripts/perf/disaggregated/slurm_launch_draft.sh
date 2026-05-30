@@ -73,8 +73,8 @@ if ! srun "${srunArgs[@]}" --kill-on-bad-exit=1 --overlap \
     -N 1 \
     --ntasks=1 \
     --ntasks-per-node=1 \
-    $runScript &> $testOutputDir/benchmark.log; then
-    cleanup_on_failure "Benchmark failed. See ${testOutputDir}/benchmark.log"
+    $runScript; then
+    cleanup_on_failure "Benchmark failed. See slurm-${SLURM_JOB_ID}.out"
 fi
 
 echo "Disagg server and benchmark completed successfully"

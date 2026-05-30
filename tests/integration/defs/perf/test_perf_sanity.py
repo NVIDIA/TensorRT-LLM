@@ -27,6 +27,7 @@ from typing import Dict, List, NamedTuple, Optional, Tuple
 
 import pytest
 import yaml
+from test_common.error_utils import report_error
 from test_common.http_utils import wait_for_endpoint_ready
 
 from defs.trt_test_alternative import print_info
@@ -1900,8 +1901,17 @@ class PerfSanityTestConfig:
                     self._check_benchmark_errors(output)
                 outputs[server_idx] = server_outputs
 
-            except Exception:
+            except Exception as e:
                 outputs[server_idx] = []
+                # Aggregated mode does not set DISAGG_SERVING_TYPE, so the
+                # default "BENCHMARK" applies and report_error is always called.
+                # Disagg mode sets DISAGG_SERVING_TYPE per srun; only the
+                # BENCHMARK srun reports errors gathered from sibling logs.
+                if os.environ.get("DISAGG_SERVING_TYPE", "BENCHMARK") == "BENCHMARK":
+                    report_error(
+                        error_msg=e,
+                        log_files=commands.get_server_logs(server_idx),
+                    )
                 raise
 
         return outputs

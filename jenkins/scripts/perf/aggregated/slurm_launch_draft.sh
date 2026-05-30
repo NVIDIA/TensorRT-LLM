@@ -16,8 +16,8 @@ if ! srun "${srunArgs[@]}" --mpi=pmi2 --kill-on-bad-exit=1 \
     -N $totalNodes \
     --ntasks=$world_size \
     --ntasks-per-node=$gpusPerNodePerServer \
-    $runScript &> $testOutputDir/benchmark.log; then
-    cleanup_on_failure "Aggregated test failed. See ${testOutputDir}/benchmark.log"
+    $runScript; then
+    cleanup_on_failure "Aggregated test failed. See slurm-${SLURM_JOB_ID}.out"
 fi
 
 echo "Aggregated test completed successfully"
