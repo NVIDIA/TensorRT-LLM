@@ -77,6 +77,39 @@ class TestQwen3VLExtractItems:
         assert list(_qwen3vl_extract_items(0, param)) == []
 
 
+class TestQwen3VLExtractItemsDictFormOrder:
+    def test_mixed_image_video_dict_form_item_order(self):
+        # Runtime registry emits dict-form item order; extractor must
+        # normalize it (regression guard for the tuple(pair) bug).
+        payload_image = {
+            "pixel_values": torch.randn(20, 1176),
+            "image_grid_thw": torch.tensor([[1, 16, 16]]),
+            "num_tokens": 5,
+        }
+        payload_video = {
+            "pixel_values_videos": torch.randn(32, 1176),
+            "video_grid_thw": torch.tensor([[2, 16, 16]]),
+            "num_tokens": 8,
+        }
+        param = _make_param(
+            {
+                "image": payload_image,
+                "video": payload_video,
+                # DICT-form order entries (as the registry emits them):
+                "multimodal_item_order": [
+                    {"modality": "video", "index": 0},
+                    {"modality": "image", "index": 0},
+                ],
+                "multimodal_embedding_lengths": [8, 5],
+            }
+        )
+        items = list(_qwen3vl_extract_items(0, param))
+        assert len(items) == 2
+        positions = {it.modality: it.item_idx_in_param for it in items}
+        # video at prompt slot 0, image at slot 1 — distinct, no collapse
+        assert positions == {"video": 0, "image": 1}
+
+
 class TestQwen3VLBucketAdapters:
     def _make_encoder_stub(self, encode_visual_inputs_return):
         enc = MagicMock(spec=Qwen3VisionModelBase)

@@ -88,12 +88,18 @@ def _qwen3vl_extract_items(param_idx: int, param):
     if not modality_types:
         return
 
-    item_order_raw = multimodal_data.get("multimodal_item_order")
     embedding_lengths = multimodal_data.get("multimodal_embedding_lengths")
-    if item_order_raw is not None:
-        order_pos = {tuple(pair): pos for pos, pair in enumerate(item_order_raw)}
-    else:
-        order_pos = {(m, 0): pos for pos, m in enumerate(modality_types)}
+    # Normalize order metadata via MMItemOrder so dict-form entries
+    # (`{"modality": ..., "index": ...}`, as the runtime registry emits) and
+    # tuple-form entries both resolve to `(modality, index)` keys. A raw
+    # `tuple(pair)` over dict entries would yield the dict keys and silently
+    # collapse every item to default slot 0.
+    item_order = MMItemOrder.from_metadata(multimodal_data)
+    if item_order is None:
+        # Pure single-modality (no explicit prompt order metadata): each
+        # present modality is the sole item at MMItemOrder rank 0.
+        item_order = MMItemOrder((m, 0) for m in modality_types)
+    order_pos = {pair: pos for pos, pair in enumerate(item_order)}
 
     for modality in modality_types:
         payload = multimodal_data[modality]
