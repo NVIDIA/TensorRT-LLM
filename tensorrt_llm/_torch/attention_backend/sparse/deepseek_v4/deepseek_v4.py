@@ -18,7 +18,7 @@ from tensorrt_llm._torch.modules.linear import Linear  # noqa: E402  (avoid cycl
 from tensorrt_llm._torch.modules.multi_stream_utils import do_multi_stream
 from tensorrt_llm._torch.modules.rotary_embedding import RotaryEmbedding
 from tensorrt_llm._torch.utils import maybe_compile
-from tensorrt_llm._utils import prefer_pinned
+from tensorrt_llm._utils import get_sm_version, prefer_pinned
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.utils import fp8_utils
 from tensorrt_llm.runtime.kv_cache_manager_v2 import DataRole
@@ -618,7 +618,13 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
         # For indices conversion
         self.prepare_for_indices_conversion()
 
-        has_sparse_layers = DEEPSEEK_V4_SPARSE_RATIO in self.compress_ratio_set
+        # SM120 (RTX) uses the explicit-K/V dense fallback for DSV4: it does not
+        # consume sparse top-k metadata, and DeepGEMM's indexer path
+        # (fp8_(paged_)mqa_logits / get_paged_mqa_logits_metadata) rejects SM120
+        # ("Unsupported architecture"). Skip the indexer K-cache + scheduler
+        # metadata prep so init/warmup don't hit those kernels.
+        has_sparse_layers = (DEEPSEEK_V4_SPARSE_RATIO in self.compress_ratio_set
+                             and get_sm_version() != 120)
 
         # For block offsets
         self.prepare_for_block_tables()
@@ -1212,6 +1218,12 @@ class DeepseekV4Indexer(Indexer):
             Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]
         ] = None,
     ):
+        # SM120 falls back to dense context/generation (the DSV4 SM120 reference
+        # attention path); sparse top-k indices and the DeepGEMM-backed indexer
+        # (unsupported on SM120) are intentionally unused.
+        if get_sm_version() == 120:
+            return None
+
         if do_multi_stream() and self.aux_stream is not None:
             q_fp8, q_scale, k_fp8, k_scale, weights = self._run_overlapped_indexer_prepare(
                 qr,

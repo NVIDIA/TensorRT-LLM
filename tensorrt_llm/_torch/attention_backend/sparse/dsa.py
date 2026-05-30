@@ -632,7 +632,11 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
             self.slot_mapping_fp8[:self.num_tokens] = fp8_indices
             self.slot_mapping_scale[:self.num_tokens] = scale_indices
 
-        if self.num_generations > 0:
+        # SM120: DSV4 uses the dense fallback (no DeepGEMM indexer). Skip the
+        # generation indexer scheduler-metadata — get_paged_mqa_logits_metadata
+        # rejects SM120 ("Unsupported architecture") and the dense path does not
+        # consume these buffers.
+        if self.num_generations > 0 and get_sm_version() != 120:
             torch.cumsum(
                 self.kv_lens_cuda[self.num_contexts:self.
                                   num_seqs],  # num_contexts should be 0
