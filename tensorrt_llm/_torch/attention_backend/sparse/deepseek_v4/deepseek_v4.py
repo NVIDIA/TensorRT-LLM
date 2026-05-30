@@ -1218,11 +1218,17 @@ class DeepseekV4Indexer(Indexer):
             Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]
         ] = None,
     ):
-        # SM120 falls back to dense context/generation (the DSV4 SM120 reference
-        # attention path); sparse top-k indices and the DeepGEMM-backed indexer
-        # (unsupported on SM120) are intentionally unused.
+        # SM120 (RTX) has no DeepGEMM indexer. For short sequences the upstream
+        # skip-indexer dense fallback (prepare_for_skip_indexer ->
+        # prepare_dense_topk_indices -> metadata.topk_indices_buffer) already holds
+        # the correct "attend to all compressed tokens" selection (sparse == dense
+        # when kv_len <= index_topk). Return that dense buffer so sparse_attn_predict
+        # (compress_ratio=4) gets valid topk_indices instead of None. We avoid the
+        # DeepGEMM _run_serial_indexer_prepare entirely (it rejects SM120).
+        # NOTE: only correct while skip_indexer_for_{ctx,gen}_reqs hold (short seqs);
+        # true long-context sparse selection on SM120 still needs DeepGEMM kernels.
         if get_sm_version() == 120:
-            return None
+            return metadata.topk_indices_buffer[: hidden_states.shape[0]]
 
         if do_multi_stream() and self.aux_stream is not None:
             q_fp8, q_scale, k_fp8, k_scale, weights = self._run_overlapped_indexer_prepare(
