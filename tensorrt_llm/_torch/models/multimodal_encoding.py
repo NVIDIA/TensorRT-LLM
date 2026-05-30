@@ -22,6 +22,31 @@ owns partition, index-tensor build, and per-modality scatter assembly.
 
 from __future__ import annotations
 
+from dataclasses import dataclass, field
+from typing import Any, Mapping
+
 import torch  # noqa: F401
 
 from tensorrt_llm.inputs.multimodal import MMItemOrder, MultimodalParams  # noqa: F401
+
+
+@dataclass(frozen=True, slots=True)
+class MultimodalItem:
+    """One modality item in a flat encoding plan.
+
+    Carries the join keys (``src_param_idx``, ``item_idx_in_param``) that
+    let the plan reconcile modality-grouping (encoder batching) with
+    source-param grouping (cache contract + MMItemOrder reassembly).
+
+    Ghost items (e.g. audio extracted from a video payload) use
+    ``item_idx_in_param == -1`` to indicate they have no MMItemOrder slot;
+    their encoded rows are consumed by a model-specific post-process step
+    rather than scattered into the final output.
+    """
+
+    src_param_idx: int
+    item_idx_in_param: int
+    modality: str
+    token_count: int
+    payload: Mapping[str, Any]
+    metadata: Mapping[str, Any] = field(default_factory=dict)
