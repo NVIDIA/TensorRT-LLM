@@ -15,6 +15,7 @@ from transformers.models.qwen3_vl.modeling_qwen3_vl import (
 )
 
 from tensorrt_llm._torch.models.modeling_multimodal_utils import _is_disagg
+from tensorrt_llm._torch.models.multimodal_encoding import MultimodalItem
 from tensorrt_llm.functional import PositionEmbeddingType
 from tensorrt_llm.mapping import Mapping
 
@@ -64,6 +65,59 @@ _QWEN_PLACEHOLDERS = {
     "image": ("<|vision_start|><|image_pad|><|vision_end|>", "<|image_pad|>"),
     "video": ("<|vision_start|><|video_pad|><|vision_end|>", "<|video_pad|>"),
 }
+
+_QWEN3VL_PLAN_MODALITIES = ("image", "video")
+
+
+def _qwen3vl_extract_items(param_idx: int, param):
+    """Yield MultimodalItems for one Qwen3VL MultimodalParams.
+
+    Qwen3VL has only image and video modalities; no audio, no ghost items.
+    Token counts come from:
+      1. payload["num_tokens"] if present (test convention / explicit).
+      2. multimodal_data["multimodal_embedding_lengths"] indexed by
+         multimodal_data["multimodal_item_order"] position (mixed params).
+      3. param.multimodal_runtime.total_embeds_in_request (pure single-modality).
+    """
+    multimodal_data = param.multimodal_data or {}
+    modality_types = [m for m in _QWEN3VL_PLAN_MODALITIES if multimodal_data.get(m) is not None]
+    if not modality_types:
+        return
+
+    item_order_raw = multimodal_data.get("multimodal_item_order")
+    embedding_lengths = multimodal_data.get("multimodal_embedding_lengths")
+    if item_order_raw is not None:
+        order_pos = {tuple(pair): pos for pos, pair in enumerate(item_order_raw)}
+    else:
+        order_pos = {(m, 0): pos for pos, m in enumerate(modality_types)}
+
+    for modality in modality_types:
+        payload = multimodal_data[modality]
+        pos = order_pos.get((modality, 0), 0)
+        token_count = _qwen3vl_payload_token_count(payload, pos, embedding_lengths, param)
+        yield MultimodalItem(
+            src_param_idx=param_idx,
+            item_idx_in_param=pos,
+            modality=modality,
+            token_count=token_count,
+            payload=payload,
+        )
+
+
+def _qwen3vl_payload_token_count(payload, pos, embedding_lengths, param):
+    """Token-count fallback chain for a Qwen3VL modality payload."""
+    if "num_tokens" in payload:
+        return int(payload["num_tokens"])
+    if embedding_lengths is not None and pos < len(embedding_lengths):
+        return int(embedding_lengths[pos])
+    runtime = getattr(param, "multimodal_runtime", None)
+    total = getattr(runtime, "total_embeds_in_request", None) if runtime else None
+    if total is not None:
+        return int(total)
+    raise ValueError(
+        "Cannot determine token count for Qwen3VL payload; needs num_tokens, "
+        "multimodal_embedding_lengths, or multimodal_runtime.total_embeds_in_request"
+    )
 
 
 class Qwen3VLInputProcessorBase(BaseMultimodalInputProcessor, BaseMultimodalDummyInputsBuilder):
@@ -1001,6 +1055,18 @@ class Qwen3VisionModelBase(nn.Module):
         """Run the Qwen visual encoder and concatenate deepstack features."""
         embeds, deepstack_embeds = self.visual(pixel_values.to(self.model_dtype), grid_thw=grid_thw)
         return torch.cat([embeds] + deepstack_embeds, dim=1)
+
+    def _adapter_image_bucket(self, items, multimodal_params):
+        """Stack per-item image pixel_values + grids, encode in one call."""
+        pixel_values = torch.cat([it.payload["pixel_values"] for it in items], dim=0)
+        grid = torch.cat([it.payload["image_grid_thw"] for it in items], dim=0)
+        return self._encode_visual_inputs(pixel_values, grid)
+
+    def _adapter_video_bucket(self, items, multimodal_params):
+        """Stack per-item video pixel_values + grids, encode in one call."""
+        pixel_values = torch.cat([it.payload["pixel_values_videos"] for it in items], dim=0)
+        grid = torch.cat([it.payload["video_grid_thw"] for it in items], dim=0)
+        return self._encode_visual_inputs(pixel_values, grid)
 
     def _encode_modality(self, multimodal_data: Dict[str, Any], modality: str) -> torch.Tensor:
         """Encode a single Qwen modality bucket from processed multimodal data."""
