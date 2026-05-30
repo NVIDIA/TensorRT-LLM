@@ -15,7 +15,11 @@ from transformers.models.qwen3_vl.modeling_qwen3_vl import (
 )
 
 from tensorrt_llm._torch.models.modeling_multimodal_utils import _is_disagg
-from tensorrt_llm._torch.models.multimodal_encoding import MultimodalItem
+from tensorrt_llm._torch.models.multimodal_encoding import (
+    EncodingPlan,
+    MultimodalItem,
+    encode_with_plan,
+)
 from tensorrt_llm.functional import PositionEmbeddingType
 from tensorrt_llm.mapping import Mapping
 
@@ -995,58 +999,6 @@ class Qwen3VisionModelBase(nn.Module):
         self.visual.config.num_attention_heads = self.visual.config.num_heads
         _load_weights_impl(self.visual, converted_weights, params_map=pattern_mapping)
 
-    def _parse_and_batch_multimodal_data(
-        self, multimodal_params: List[MultimodalParams]
-    ) -> Tuple[Dict[str, Any], Dict[str, List[Any]]]:
-        pixel_values_list = []
-        pixel_values_videos_list = []
-        image_grid_thw_list = []
-        video_grid_thw_list = []
-
-        for multimodal_param in multimodal_params:
-            multimodal_data = multimodal_param.multimodal_data
-            # Process images if present
-            if multimodal_data.get("image") is not None:
-                pixel_values_list.append(multimodal_data["image"]["pixel_values"])
-                image_grid_thw_list.append(multimodal_data["image"]["image_grid_thw"])
-
-            # Process videos if present
-            if multimodal_data.get("video") is not None:
-                pixel_values_videos_list.append(multimodal_data["video"]["pixel_values_videos"])
-                video_grid_thw_list.append(multimodal_data["video"]["video_grid_thw"])
-
-        # Concatenate tensors
-        mm_content_dict = {}
-        if pixel_values_list:
-            mm_content_dict["pixel_values"] = (
-                torch.cat(pixel_values_list, dim=0)
-                if len(pixel_values_list) > 1
-                else pixel_values_list[0]
-            )
-        if pixel_values_videos_list:
-            mm_content_dict["pixel_values_videos"] = (
-                torch.cat(pixel_values_videos_list, dim=0)
-                if len(pixel_values_videos_list) > 1
-                else pixel_values_videos_list[0]
-            )
-
-        # Prepare extra data
-        mm_extra_data = {}
-        if image_grid_thw_list:
-            mm_extra_data["image_grid_thw"] = (
-                torch.cat(image_grid_thw_list, dim=0)
-                if len(image_grid_thw_list) > 1
-                else image_grid_thw_list[0]
-            )
-        if video_grid_thw_list:
-            mm_extra_data["video_grid_thw"] = (
-                torch.cat(video_grid_thw_list, dim=0)
-                if len(video_grid_thw_list) > 1
-                else video_grid_thw_list[0]
-            )
-
-        return mm_content_dict, mm_extra_data
-
     def _encode_visual_inputs(
         self,
         pixel_values: torch.Tensor,
@@ -1068,87 +1020,47 @@ class Qwen3VisionModelBase(nn.Module):
         grid = torch.cat([it.payload["video_grid_thw"] for it in items], dim=0)
         return self._encode_visual_inputs(pixel_values, grid)
 
-    def _encode_modality(self, multimodal_data: Dict[str, Any], modality: str) -> torch.Tensor:
-        """Encode a single Qwen modality bucket from processed multimodal data."""
-        if modality == "image":
-            data = multimodal_data["image"]
-            return self._encode_visual_inputs(data["pixel_values"], data["image_grid_thw"])
-        if modality == "video":
-            data = multimodal_data["video"]
-            return self._encode_visual_inputs(data["pixel_values_videos"], data["video_grid_thw"])
-        raise ValueError(f"Unknown modality: {modality}")
+    def _plan_device(self) -> torch.device:
+        """Device the assembled embeddings are allocated on (visual encoder device)."""
+        return next(self.visual.parameters()).device
 
-    @staticmethod
-    def _get_modality_types(multimodal_data: Dict[str, Any]) -> List[str]:
-        """Return Qwen modalities present in processed multimodal data."""
-        return [
-            modality for modality in _QWEN_MODALITIES if multimodal_data.get(modality) is not None
-        ]
+    def _plan_dtype(self) -> torch.dtype:
+        """Dtype of the assembled visual embeddings."""
+        return self.model_dtype
 
-    def _encode_mixed_param(self, param: MultimodalParams) -> Optional[torch.Tensor]:
-        """Encode one request and restore prompt order for mixed image/video."""
-        multimodal_data = param.multimodal_data or {}
-        modality_types = self._get_modality_types(multimodal_data)
-        if not modality_types:
-            return None
+    def _plan_hidden_dim(self) -> int:
+        """Hidden width of the assembled visual embeddings.
 
-        encoded_by_modality = {
-            modality: self._encode_modality(multimodal_data, modality)
-            for modality in modality_types
-        }
-        if len(encoded_by_modality) == 1:
-            return next(iter(encoded_by_modality.values()))
-
-        item_order = MMItemOrder.from_metadata(multimodal_data) or MMItemOrder()
-        if not item_order:
-            raise ValueError(
-                "Qwen3-VL mixed image/video requests require multimodal_item_order metadata."
-            )
-        embedding_lengths = multimodal_data.get("multimodal_embedding_lengths")
-        if embedding_lengths is None:
-            raise ValueError(
-                "Qwen3-VL mixed image/video requests require multimodal_embedding_lengths metadata."
-            )
-        chunks = item_order.split_embeddings(encoded_by_modality, embedding_lengths)
-        return torch.cat(chunks, dim=0)
-
-    def _forward_mixed_multimodal_params(
-        self,
-        multimodal_params: List[MultimodalParams],
-    ) -> List[torch.Tensor]:
-        """Encode mixed requests and return the single-tensor executor contract."""
-        outputs = []
-        for param in multimodal_params:
-            encoded = self._encode_mixed_param(param)
-            if encoded is not None:
-                outputs.append(encoded)
-        if not outputs:
-            return []
-        return [torch.cat(outputs, dim=0)]
+        `_encode_visual_inputs` returns `torch.cat([embeds] + deepstack_embeds, dim=1)`.
+        Each merger (main + per-deepstack-level) projects to `vision_config.out_hidden_size`,
+        so the concatenated width is `out_hidden_size * (1 + num_deepstack_levels)`. This
+        mirrors the `expected_size` validation in `Qwen3VLInputProcessorBase`.
+        """
+        num_deepstack_levels = len(getattr(self.config, "deepstack_visual_indexes", []))
+        return int(self.config.out_hidden_size) * (1 + num_deepstack_levels)
 
     @torch.inference_mode()
     def forward(self, multimodal_params: List[MultimodalParams]) -> List[torch.Tensor]:
-        request_modalities = [
-            self._get_modality_types(param.multimodal_data or {}) for param in multimodal_params
-        ]
-        all_modalities = {modality for modalities in request_modalities for modality in modalities}
-        if len(all_modalities) > 1:
-            return self._forward_mixed_multimodal_params(multimodal_params)
-
-        mm_content_data, mm_extra_data = self._parse_and_batch_multimodal_data(multimodal_params)
-        pixel_values = mm_content_data.get("pixel_values", None)
-        pixel_values_videos = mm_content_data.get("pixel_values_videos", None)
-
-        image_grid_thw = mm_extra_data.get("image_grid_thw", None)
-        video_grid_thw = mm_extra_data.get("video_grid_thw", None)
-
-        embeds = []
-        if pixel_values is not None:
-            embeds.append(self._encode_visual_inputs(pixel_values, image_grid_thw))
-
-        if pixel_values_videos is not None:
-            embeds.append(self._encode_visual_inputs(pixel_values_videos, video_grid_thw))
-        return embeds
+        if not multimodal_params:
+            return []
+        plan = EncodingPlan.from_params(
+            multimodal_params=multimodal_params,
+            extract=_qwen3vl_extract_items,
+        )
+        if plan.total_tokens == 0:
+            return []
+        final = encode_with_plan(
+            plan,
+            encoders={
+                "image": self._adapter_image_bucket,
+                "video": self._adapter_video_bucket,
+            },
+            multimodal_params=multimodal_params,
+            device=self._plan_device(),
+            dtype=self._plan_dtype(),
+            hidden_dim=self._plan_hidden_dim(),
+        )
+        return [final]
 
 
 class Qwen3VLModelBase(PreTrainedModel):
