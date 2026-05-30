@@ -2868,6 +2868,15 @@ repos:
         entry: python scripts/check_auto_deploy_imports.py
         language: python
         files: ^tensorrt_llm/_torch/auto_deploy/.*\.py$
+    -   id: check-skill-naming-convention
+        name: Check Claude Code skill naming convention
+        entry: python scripts/check_skill_naming_convention.py
+        language: python
+        additional_dependencies:
+        - PyYAML
+        pass_filenames: false
+        files: >-
+          ^(\.claude/skills/[^/]+/SKILL\.md|\.claude/agents/.*\.md|scripts/check_skill_naming_convention\.py)$
     -   id:  type-check
         name: Run static analysis of type correctness using mypy
         entry: scripts/run_mypy.sh

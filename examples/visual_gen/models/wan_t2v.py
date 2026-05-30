@@ -17,13 +17,12 @@
 
 Usage:
     python wan_t2v.py
-    python wan_t2v.py --extra_visual_gen_options ../configs/wan2.2-t2v-fp4-1gpu.yaml
+    python wan_t2v.py --visual_gen_args ../configs/wan2.2-t2v-fp4-1gpu.yaml
 """
 
 import argparse
 
 from tensorrt_llm import VisualGen, VisualGenArgs
-from tensorrt_llm.serve.media_storage import MediaStorage
 
 
 def main():
@@ -35,10 +34,12 @@ def main():
         help="Model path or HuggingFace Hub ID",
     )
     parser.add_argument(
+        "--visual_gen_args",
         "--extra_visual_gen_options",
+        dest="visual_gen_args",
         type=str,
         default=None,
-        help="Path to YAML config (same as trtllm-serve --extra_visual_gen_options)",
+        help="Path to YAML config (same as trtllm-serve --visual_gen_args)",
     )
     parser.add_argument(
         "--output_path",
@@ -49,11 +50,7 @@ def main():
     args = parser.parse_args()
 
     # Engine config from shared YAML (optional); model-specific defaults apply otherwise.
-    extra_args = (
-        VisualGenArgs.from_yaml(args.extra_visual_gen_options)
-        if args.extra_visual_gen_options
-        else None
-    )
+    extra_args = VisualGenArgs.from_yaml(args.visual_gen_args) if args.visual_gen_args else None
     visual_gen = VisualGen(model=args.model, args=extra_args)
 
     # --- Model-specific: T2V request construction ---
@@ -65,8 +62,7 @@ def main():
         params=params,
     )
 
-    # --- Model-specific: video output ---
-    MediaStorage.save_video(output.video, args.output_path, frame_rate=params.frame_rate)
+    output.save(args.output_path)
     print(f"Saved: {args.output_path}")
 
 

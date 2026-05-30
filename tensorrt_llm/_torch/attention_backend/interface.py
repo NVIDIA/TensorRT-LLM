@@ -15,9 +15,10 @@ if TYPE_CHECKING:
     from ..speculative.interface import SpecMetadata
     from ..speculative.spec_tree_manager import SpecTreeManager
 
-from tensorrt_llm._utils import maybe_pin_memory
-from tensorrt_llm.functional import (PositionEmbeddingType, RopeEmbeddingUtils,
-                                     RotaryScalingType)
+from tensorrt_llm._utils import get_hf_rope_theta, maybe_pin_memory
+from tensorrt_llm.functional import (AttentionMaskType, PositionEmbeddingType,
+                                     RopeEmbeddingUtils, RotaryScalingType)
+from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
@@ -383,9 +384,15 @@ class AttentionMetadata:
             max_total_draft_tokens,
             model_is_wrapped: bool = False,
             spec_metadata: Optional['SpecMetadata'] = None,
-            spec_tree_manager: Optional['SpecTreeManager'] = None):
+            spec_tree_manager: Optional['SpecTreeManager'] = None,
+            num_contexts: int = 0):
         """
         Hook to be called when using TRTLLM attention backend in spec-dec mode.
+
+        ``num_contexts`` is the number of context (prefill) requests in the
+        mixed batch, occupying the leading rows of slot-storage buffers.
+        Backends that consume gen-only slots (e.g. dynamic tree) must skip
+        these rows to align with the XQA kernel's expected row layout.
         """
 
     def update_helix_param(
@@ -484,10 +491,23 @@ class RopeParams:
 
         hf_rope_parameters = getattr(config, 'rope_parameters', None)
         if hf_rope_parameters is not None:
-            assert not set(hf_rope_parameters.keys()).issubset(
-                ALLOWED_ATTENTION_LAYER_TYPES), (
-                    "Per-layer-type RoPE configuration is not supported yet.")
-            config.update(hf_rope_parameters)
+            if set(hf_rope_parameters.keys()).issubset(
+                    ALLOWED_ATTENTION_LAYER_TYPES):
+                # Per-layer-type RoPE config (e.g. Gemma3 in transformers 5.x).
+                # Pick "full_attention" as the default; callers override theta
+                # for sliding-window layers independently.
+                if "full_attention" in hf_rope_parameters:
+                    flat = hf_rope_parameters["full_attention"]
+                else:
+                    fallback_key = next(iter(hf_rope_parameters))
+                    logger.warning(
+                        f"Per-layer-type rope_parameters has no 'full_attention' entry; "
+                        f"falling back to '{fallback_key}'. Available layer types: "
+                        f"{list(hf_rope_parameters.keys())}.")
+                    flat = hf_rope_parameters[fallback_key]
+                config.update(flat)
+            else:
+                config.update(hf_rope_parameters)
 
         # get rotary parameters.
         hidden_size = config.hidden_size
@@ -497,7 +517,7 @@ class RopeParams:
             head_dim = hidden_size // num_attention_heads
         rope_scaling = getattr(config, 'rope_scaling', None)
         rope_params.max_positions = config.max_position_embeddings
-        rope_params.theta = getattr(config, 'rope_theta', 10000.0)
+        rope_params.theta = get_hf_rope_theta(config, 10000.0)
         rope_percentage = (getattr(config, 'rotary_pct', None)
                            or getattr(config, 'partial_rotary_factor', None)
                            or 1.0)
@@ -535,7 +555,8 @@ class RopeParams:
                 rope_params.short_factor = tuple(rope_scaling["short_factor"])
             if "long_factor" in rope_scaling:
                 rope_params.long_factor = tuple(rope_scaling["long_factor"])
-        # Workaround for DeepSeek V3 Lite since its rope_scaling is null in config.json.
+        # Workaround for DeepSeek V3 Lite since its rope_scaling is null in
+        # config.json.
         elif config.model_type == "deepseek_v3":
             rope_params.scale_type = RotaryScalingType.yarn
         # Other metdadata for RoPE.
@@ -674,6 +695,20 @@ AttentionMask = Union[PredefinedAttentionMask, CustomAttentionMask]
 
 
 @dataclass(kw_only=True, slots=True)
+class AttentionSparseArgs:
+    """Sparse-attention inputs passed to the attention op.
+
+    Backends without sparse attention leave ``AttentionForwardArgs.sparse``
+    at its default-constructed value (all-``None`` / ``0`` fields).
+    """
+    sparse_kv_indices: Optional[torch.Tensor] = None
+    sparse_kv_offsets: Optional[torch.Tensor] = None
+    sparse_attn_indices: Optional[torch.Tensor] = None
+    sparse_attn_offsets: Optional[torch.Tensor] = None
+    sparse_attn_indices_block_size: int = 0
+
+
+@dataclass(kw_only=True, slots=True)
 class AttentionForwardArgs:
     """Per-forward optional arguments for attention backends."""
 
@@ -682,8 +717,8 @@ class AttentionForwardArgs:
 
     out_scale: Optional[torch.Tensor] = None
     out_scale_sf: Optional[torch.Tensor] = None
-    kv_scales_sf: Optional[torch.Tensor] = None
-    kv_scales_sf_inv: Optional[torch.Tensor] = None
+    kv_scale_orig_quant: Optional[torch.Tensor] = None
+    kv_scale_quant_orig: Optional[torch.Tensor] = None
 
     attention_mask: AttentionMask = PredefinedAttentionMask.CAUSAL
     attention_input_type: AttentionInputType = AttentionInputType.mixed
@@ -693,7 +728,8 @@ class AttentionForwardArgs:
 
     latent_cache: Optional[torch.Tensor] = None
     q_pe: Optional[torch.Tensor] = None
-    mrope_config: Optional[dict] = None
+    mrope_rotary_cos_sin: Optional[torch.Tensor] = None
+    mrope_position_deltas: Optional[torch.Tensor] = None
 
     softmax_stats_tensor: Optional[torch.Tensor] = None
     chunked_prefill_buffer_batch_size: int = 1
@@ -711,9 +747,23 @@ class AttentionForwardArgs:
     sage_attn_num_elts_per_blk_v: int = 0
     sage_attn_qk_int8: bool = False
 
-    enable_attn_nvfp4_output: bool = True
     topk_indices: Optional[torch.Tensor] = None
-    is_generation: bool = False
+
+    is_fused_qkv: bool = False
+    update_kv_cache: bool = True
+
+    sparse: AttentionSparseArgs = field(default_factory=AttentionSparseArgs)
+
+    @property
+    def mask_type(self) -> int:
+        """Integer mask type accepted by the C++ attention op
+        (``causal`` or ``padding``)."""
+        if self.attention_mask == PredefinedAttentionMask.CAUSAL:
+            return int(AttentionMaskType.causal)
+        if self.attention_mask == PredefinedAttentionMask.FULL:
+            return int(AttentionMaskType.padding)
+        raise ValueError(
+            f"Unexpected attention mask type: {self.attention_mask!r}")
 
 
 _ATTENTION_FORWARD_ARGS_FIELDS = frozenset(
@@ -834,6 +884,7 @@ class MLAParams:
     qk_rope_head_dim: int = 0
     qk_nope_head_dim: int = 0
     v_head_dim: int = 0
+    rope_append: bool = True
     predicted_tokens_per_seq: int = 1
     chunked_prefill_buffer_batch_size: int = 1
     hidden_size: int = 0

@@ -11,6 +11,7 @@ Requires LTX-2 checkpoint. Does NOT require the LTX-2 reference code.
 """
 
 import gc
+import json
 import os
 
 import pytest
@@ -19,13 +20,28 @@ import torch.nn.functional as F
 from test_common.llm_data import llm_models_root
 
 from tensorrt_llm._torch.modules.linear import Linear
-from tensorrt_llm._torch.visual_gen.config import AttentionConfig, PipelineComponent, VisualGenArgs
-from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineLoader
+from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
+from tensorrt_llm._torch.visual_gen.models.ltx2.pipeline_ltx2 import LTX2_FORCE_ONE_STAGE_ENV
+from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineComponent, PipelineLoader
+from tensorrt_llm.visual_gen.args import AttentionConfig, CacheDiTConfig, VisualGenArgs
 
 os.environ.setdefault("TLLM_DISABLE_MPI", "1")
 
+# Skip non-transformer components.  ``skip_components`` is an internal
+# escape hatch on ``PipelineLoader.load`` used by unit tests to focus on
+# the transformer; LTX-2 native components (audio_vae, vocoder,
+# connectors, video_encoder) load from the checkpoint automatically.
+SKIP_COMPONENTS = [
+    PipelineComponent.TEXT_ENCODER,
+    PipelineComponent.TOKENIZER,
+    PipelineComponent.VAE,
+    PipelineComponent.SCHEDULER,
+]
+
 
 _LTX2_BASE = os.path.join(str(llm_models_root(check=True)), "LTX-2")
+_GEMMA3_DEFAULT = os.path.join(str(llm_models_root(check=True)), "gemma", "gemma-3-12b-it")
+
 
 CHECKPOINT_PATH_BF16 = os.environ.get(
     "LTX2_MODEL_PATH",
@@ -35,17 +51,32 @@ CHECKPOINT_PATH_FP8 = os.environ.get(
     "LTX2_MODEL_PATH_FP8",
     os.path.join(_LTX2_BASE, "ltx-2-19b-dev-fp8.safetensors"),
 )
+GEMMA3_PATH = os.environ.get("LTX2_TEXT_ENCODER_PATH", _GEMMA3_DEFAULT)
 
-# Skip non-transformer components.  VisualGenArgs.skip_components is a
-# List[PipelineComponent] validated by Pydantic; LTX2-native components
-# (audio_vae, vocoder, connectors, video_encoder) will load from the
-# checkpoint automatically.
-SKIP_COMPONENTS = [
-    PipelineComponent.TEXT_ENCODER,
-    PipelineComponent.TOKENIZER,
-    PipelineComponent.VAE,
-    PipelineComponent.SCHEDULER,
-]
+
+def _ltx2_pipeline_config(**overrides):
+    """Build pipeline_config with the Gemma3 text_encoder_path LTX-2 needs.
+
+    LTX-2's tokenizer + text encoder are loaded from a separate Gemma
+    directory (not the diffusion checkpoint), so every full-pipeline
+    load needs ``text_encoder_path`` set. Tests can pass extra keys via
+    ``overrides`` (e.g. ``spatial_upsampler_path`` for two-stage).
+    """
+    cfg = {"text_encoder_path": GEMMA3_PATH}
+    cfg.update(overrides)
+    return cfg
+
+
+def _write_minimal_ltx2_native_checkpoint(tmp_path):
+    import safetensors.torch
+
+    checkpoint_path = tmp_path / "ltx-2-19b-dev.safetensors"
+    safetensors.torch.save_file(
+        {"__metadata_marker__": torch.zeros(1)},
+        str(checkpoint_path),
+        metadata={"config": json.dumps({"transformer": {"_class_name": "LTX2"}})},
+    )
+    return checkpoint_path
 
 
 def _get_ltx2_transformer_inputs(transformer, device="cuda", dtype=torch.bfloat16):
@@ -162,14 +193,12 @@ class TestLTX2Quantization:
     def test_load_with_quantization(self, ltx2_bf16_checkpoint_exists, quant_algo: str):
         """Test loading LTX2 with FP8 quantization and verify FP8 weights."""
         args = VisualGenArgs(
-            checkpoint_path=CHECKPOINT_PATH_BF16,
-            device="cuda",
-            dtype="bfloat16",
-            skip_components=SKIP_COMPONENTS,
+            model=CHECKPOINT_PATH_BF16,
             quant_config={"quant_algo": quant_algo, "dynamic": True},
+            pipeline_config=_ltx2_pipeline_config(),
         )
 
-        pipeline = PipelineLoader(args).load(skip_warmup=True)
+        pipeline = PipelineLoader(args).load(skip_warmup=True, skip_components=SKIP_COMPONENTS)
 
         assert pipeline.model_config.quant_config.quant_algo is not None
 
@@ -220,22 +249,22 @@ class TestLTX2FP8NumericalCorrectness:
         """
         print(f"\n[Compare {quant_algo}] Loading BF16 pipeline...")
         args_bf16 = VisualGenArgs(
-            checkpoint_path=CHECKPOINT_PATH_BF16,
-            device="cuda",
-            dtype="bfloat16",
-            skip_components=SKIP_COMPONENTS,
+            model=CHECKPOINT_PATH_BF16,
+            pipeline_config=_ltx2_pipeline_config(),
         )
-        pipeline_bf16 = PipelineLoader(args_bf16).load(skip_warmup=True)
+        pipeline_bf16 = PipelineLoader(args_bf16).load(
+            skip_warmup=True, skip_components=SKIP_COMPONENTS
+        )
 
         print(f"[Compare {quant_algo}] Loading {quant_algo} pipeline...")
         args_fp8 = VisualGenArgs(
-            checkpoint_path=CHECKPOINT_PATH_BF16,
-            device="cuda",
-            dtype="bfloat16",
-            skip_components=SKIP_COMPONENTS,
+            model=CHECKPOINT_PATH_BF16,
             quant_config={"quant_algo": quant_algo, "dynamic": True},
+            pipeline_config=_ltx2_pipeline_config(),
         )
-        pipeline_fp8 = PipelineLoader(args_fp8).load(skip_warmup=True)
+        pipeline_fp8 = PipelineLoader(args_fp8).load(
+            skip_warmup=True, skip_components=SKIP_COMPONENTS
+        )
 
         linear_bf16, layer_name = _find_first_quantizable_linear(pipeline_bf16.transformer)
         linear_fp8, _ = _find_first_quantizable_linear(pipeline_fp8.transformer)
@@ -297,12 +326,12 @@ class TestLTX2FP8Memory:
         torch.cuda.reset_peak_memory_stats()
 
         args_bf16 = VisualGenArgs(
-            checkpoint_path=CHECKPOINT_PATH_BF16,
-            device="cuda",
-            dtype="bfloat16",
-            skip_components=SKIP_COMPONENTS,
+            model=CHECKPOINT_PATH_BF16,
+            pipeline_config=_ltx2_pipeline_config(),
         )
-        pipeline_bf16 = PipelineLoader(args_bf16).load(skip_warmup=True)
+        pipeline_bf16 = PipelineLoader(args_bf16).load(
+            skip_warmup=True, skip_components=SKIP_COMPONENTS
+        )
 
         bf16_model_mem = get_module_memory_gb(pipeline_bf16.transformer)
         print(f"\n[BF16] Transformer memory: {bf16_model_mem:.2f} GB")
@@ -313,13 +342,13 @@ class TestLTX2FP8Memory:
         torch.cuda.reset_peak_memory_stats()
 
         args_fp8 = VisualGenArgs(
-            checkpoint_path=CHECKPOINT_PATH_BF16,
-            device="cuda",
-            dtype="bfloat16",
-            skip_components=SKIP_COMPONENTS,
+            model=CHECKPOINT_PATH_BF16,
             quant_config={"quant_algo": "FP8", "dynamic": True},
+            pipeline_config=_ltx2_pipeline_config(),
         )
-        pipeline_fp8 = PipelineLoader(args_fp8).load(skip_warmup=True)
+        pipeline_fp8 = PipelineLoader(args_fp8).load(
+            skip_warmup=True, skip_components=SKIP_COMPONENTS
+        )
 
         fp8_model_mem = get_module_memory_gb(pipeline_fp8.transformer)
         print(f"[FP8] Transformer memory: {fp8_model_mem:.2f} GB")
@@ -350,13 +379,13 @@ class TestLTX2AttentionBackend:
         """
         print("\n[Attention Backend Test] Loading baseline transformer (VANILLA)...")
         args_baseline = VisualGenArgs(
-            checkpoint_path=CHECKPOINT_PATH_BF16,
-            device="cuda",
-            dtype="bfloat16",
-            skip_components=SKIP_COMPONENTS,
-            attention=AttentionConfig(backend="VANILLA"),
+            model=CHECKPOINT_PATH_BF16,
+            attention_config=AttentionConfig(backend="VANILLA"),
+            pipeline_config=_ltx2_pipeline_config(),
         )
-        pipeline_baseline = PipelineLoader(args_baseline).load(skip_warmup=True)
+        pipeline_baseline = PipelineLoader(args_baseline).load(
+            skip_warmup=True, skip_components=SKIP_COMPONENTS
+        )
         transformer_baseline = pipeline_baseline.transformer
 
         video_input, audio_input, text_cache_baseline = _get_ltx2_transformer_inputs(
@@ -377,13 +406,13 @@ class TestLTX2AttentionBackend:
 
         print("[Attention Backend Test] Loading TRTLLM transformer...")
         args_trtllm = VisualGenArgs(
-            checkpoint_path=CHECKPOINT_PATH_BF16,
-            device="cuda",
-            dtype="bfloat16",
-            skip_components=SKIP_COMPONENTS,
-            attention=AttentionConfig(backend="TRTLLM"),
+            model=CHECKPOINT_PATH_BF16,
+            attention_config=AttentionConfig(backend="TRTLLM"),
+            pipeline_config=_ltx2_pipeline_config(),
         )
-        pipeline_trtllm = PipelineLoader(args_trtllm).load(skip_warmup=True)
+        pipeline_trtllm = PipelineLoader(args_trtllm).load(
+            skip_warmup=True, skip_components=SKIP_COMPONENTS
+        )
         transformer_trtllm = pipeline_trtllm.transformer
 
         print("[Attention Backend Test] Running TRTLLM transformer forward...")
@@ -714,8 +743,9 @@ class TestTwoStageLoRAFileLoading:
 class TestTwoStagePipelineVariantResolution:
     """Test that LTX2Pipeline.resolve_variant selects the correct class."""
 
-    def test_resolve_variant_returns_two_stage_when_configured(self):
+    def test_resolve_variant_returns_two_stage_when_configured(self, monkeypatch):
         """When both upsampler and LoRA paths are set, resolve_variant returns TwoStages."""
+        monkeypatch.delenv(LTX2_FORCE_ONE_STAGE_ENV, raising=False)
         from unittest.mock import MagicMock
 
         from tensorrt_llm._torch.visual_gen.models.ltx2.pipeline_ltx2 import LTX2Pipeline
@@ -724,6 +754,7 @@ class TestTwoStagePipelineVariantResolution:
         )
 
         config = MagicMock()
+        config.pretrained_config._name_or_path = ""
         config.extra_attrs = {
             "spatial_upsampler_path": "/fake/upsampler.safetensors",
             "distilled_lora_path": "/fake/lora.safetensors",
@@ -732,6 +763,23 @@ class TestTwoStagePipelineVariantResolution:
         result = LTX2Pipeline.resolve_variant(config)
         assert result is LTX2TwoStagesPipeline
 
+    def test_resolve_variant_honors_force_one_stage_env(self, monkeypatch):
+        """The env knob should prevent promotion even when two-stage paths exist."""
+        from unittest.mock import MagicMock
+
+        from tensorrt_llm._torch.visual_gen.models.ltx2.pipeline_ltx2 import LTX2Pipeline
+
+        monkeypatch.setenv(LTX2_FORCE_ONE_STAGE_ENV, "1")
+        config = MagicMock()
+        config.pretrained_config._name_or_path = ""
+        config.extra_attrs = {
+            "spatial_upsampler_path": "/fake/upsampler.safetensors",
+            "distilled_lora_path": "/fake/lora.safetensors",
+        }
+
+        result = LTX2Pipeline.resolve_variant(config)
+        assert result is LTX2Pipeline
+
     def test_resolve_variant_returns_base_without_two_stage_config(self):
         """Without upsampler/LoRA paths, resolve_variant returns base LTX2Pipeline."""
         from unittest.mock import MagicMock
@@ -739,6 +787,7 @@ class TestTwoStagePipelineVariantResolution:
         from tensorrt_llm._torch.visual_gen.models.ltx2.pipeline_ltx2 import LTX2Pipeline
 
         config = MagicMock()
+        config.pretrained_config._name_or_path = ""
         config.extra_attrs = {}
 
         result = LTX2Pipeline.resolve_variant(config)
@@ -751,10 +800,96 @@ class TestTwoStagePipelineVariantResolution:
         from tensorrt_llm._torch.visual_gen.models.ltx2.pipeline_ltx2 import LTX2Pipeline
 
         config = MagicMock()
+        config.pretrained_config._name_or_path = ""
         config.extra_attrs = {"spatial_upsampler_path": "/fake/upsampler.safetensors"}
 
         result = LTX2Pipeline.resolve_variant(config)
         assert result is LTX2Pipeline
+
+
+class TestLTX2ForceOneStageEnv:
+    """Test force-one-stage env-var behavior during LTX2 variant selection."""
+
+    def test_two_stage_auxiliary_paths_are_discovered_by_default(self, tmp_path, monkeypatch):
+        from tensorrt_llm._torch.visual_gen.models.ltx2.pipeline_ltx2 import LTX2Pipeline
+        from tensorrt_llm._torch.visual_gen.models.ltx2.pipeline_ltx2_two_stages import (
+            LTX2TwoStagesPipeline,
+        )
+
+        monkeypatch.delenv(LTX2_FORCE_ONE_STAGE_ENV, raising=False)
+        checkpoint_path = _write_minimal_ltx2_native_checkpoint(tmp_path)
+        upsampler_path = checkpoint_path.parent / "ltx-2-spatial-upscaler-x2-1.0.safetensors"
+        lora_path = checkpoint_path.parent / "ltx-2-19b-distilled-lora-384.safetensors"
+        upsampler_path.touch()
+        lora_path.touch()
+
+        args = VisualGenArgs(model=str(checkpoint_path))
+        config = DiffusionModelConfig.from_pretrained(str(checkpoint_path), args=args)
+
+        assert LTX2Pipeline.resolve_variant(config) is LTX2TwoStagesPipeline
+        assert config.extra_attrs["spatial_upsampler_path"] == str(upsampler_path)
+        assert config.extra_attrs["distilled_lora_path"] == str(lora_path)
+
+    def test_force_one_stage_env_skips_auto_discovery(self, tmp_path, monkeypatch):
+        from tensorrt_llm._torch.visual_gen.models.ltx2.pipeline_ltx2 import LTX2Pipeline
+
+        monkeypatch.setenv(LTX2_FORCE_ONE_STAGE_ENV, "1")
+        checkpoint_path = _write_minimal_ltx2_native_checkpoint(tmp_path)
+        upsampler_path = checkpoint_path.parent / "ltx-2-spatial-upscaler-x2-1.0.safetensors"
+        lora_path = checkpoint_path.parent / "ltx-2-19b-distilled-lora-384.safetensors"
+        upsampler_path.touch()
+        lora_path.touch()
+
+        args = VisualGenArgs(model=str(checkpoint_path))
+        config = DiffusionModelConfig.from_pretrained(str(checkpoint_path), args=args)
+
+        assert LTX2Pipeline.resolve_variant(config) is LTX2Pipeline
+        assert "spatial_upsampler_path" not in config.extra_attrs
+        assert "distilled_lora_path" not in config.extra_attrs
+
+    def test_force_one_stage_env_prevents_promotion_with_explicit_auxiliary_paths(
+        self, tmp_path, monkeypatch
+    ):
+        from tensorrt_llm._torch.visual_gen.models.ltx2.pipeline_ltx2 import LTX2Pipeline
+
+        monkeypatch.setenv(LTX2_FORCE_ONE_STAGE_ENV, "1")
+        checkpoint_path = _write_minimal_ltx2_native_checkpoint(tmp_path)
+
+        args = VisualGenArgs(
+            model=str(checkpoint_path),
+            pipeline_config={
+                "spatial_upsampler_path": "/fake/upsampler.safetensors",
+                "distilled_lora_path": "/fake/lora.safetensors",
+            },
+        )
+        config = DiffusionModelConfig.from_pretrained(str(checkpoint_path), args=args)
+
+        assert config.extra_attrs["spatial_upsampler_path"] == "/fake/upsampler.safetensors"
+        assert config.extra_attrs["distilled_lora_path"] == "/fake/lora.safetensors"
+        assert LTX2Pipeline.resolve_variant(config) is LTX2Pipeline
+
+    def test_cache_dit_config_prevents_promotion_with_explicit_auxiliary_paths(
+        self, tmp_path, monkeypatch
+    ):
+        from tensorrt_llm._torch.visual_gen.models.ltx2.pipeline_ltx2 import LTX2Pipeline
+
+        monkeypatch.delenv(LTX2_FORCE_ONE_STAGE_ENV, raising=False)
+        checkpoint_path = _write_minimal_ltx2_native_checkpoint(tmp_path)
+
+        args = VisualGenArgs(
+            model=str(checkpoint_path),
+            cache_config=CacheDiTConfig(),
+            pipeline_config={
+                "spatial_upsampler_path": "/fake/upsampler.safetensors",
+                "distilled_lora_path": "/fake/lora.safetensors",
+            },
+        )
+        config = DiffusionModelConfig.from_pretrained(str(checkpoint_path), args=args)
+
+        assert config.cache_backend == "cache_dit"
+        assert config.extra_attrs["spatial_upsampler_path"] == "/fake/upsampler.safetensors"
+        assert config.extra_attrs["distilled_lora_path"] == "/fake/lora.safetensors"
+        assert LTX2Pipeline.resolve_variant(config) is LTX2Pipeline
 
 
 class TestTwoStageUpsamplerBuildingBlocks:
@@ -923,15 +1058,14 @@ class TestLTX2TwoStagePipelineLoading:
         )
 
         args = VisualGenArgs(
-            checkpoint_path=CHECKPOINT_PATH_BF16,
-            device="cuda",
-            dtype="bfloat16",
-            skip_components=SKIP_COMPONENTS,
-            spatial_upsampler_path=UPSAMPLER_PATH,
-            distilled_lora_path=LORA_PATH,
+            model=CHECKPOINT_PATH_BF16,
+            pipeline_config=_ltx2_pipeline_config(
+                spatial_upsampler_path=UPSAMPLER_PATH,
+                distilled_lora_path=LORA_PATH,
+            ),
         )
 
-        pipeline = PipelineLoader(args).load(skip_warmup=True)
+        pipeline = PipelineLoader(args).load(skip_warmup=True, skip_components=SKIP_COMPONENTS)
         try:
             assert isinstance(pipeline, LTX2TwoStagesPipeline), (
                 f"Expected LTX2TwoStagesPipeline, got {type(pipeline).__name__}"
@@ -957,15 +1091,14 @@ class TestLTX2TwoStagePipelineLoading:
         )
 
         args = VisualGenArgs(
-            checkpoint_path=CHECKPOINT_PATH_BF16,
-            device="cuda",
-            dtype="bfloat16",
-            skip_components=SKIP_COMPONENTS,
-            spatial_upsampler_path=UPSAMPLER_PATH,
-            distilled_lora_path=LORA_PATH,
+            model=CHECKPOINT_PATH_BF16,
+            pipeline_config=_ltx2_pipeline_config(
+                spatial_upsampler_path=UPSAMPLER_PATH,
+                distilled_lora_path=LORA_PATH,
+            ),
         )
 
-        pipeline = PipelineLoader(args).load(skip_warmup=True)
+        pipeline = PipelineLoader(args).load(skip_warmup=True, skip_components=SKIP_COMPONENTS)
         try:
             applied, saved_state, snapshot_required = _apply_lora_deltas(
                 pipeline.transformer,
@@ -1004,16 +1137,15 @@ class TestLTX2TwoStagePipelineLoading:
         )
 
         args = VisualGenArgs(
-            checkpoint_path=CHECKPOINT_PATH_BF16,
-            device="cuda",
-            dtype="bfloat16",
-            skip_components=SKIP_COMPONENTS,
-            spatial_upsampler_path=UPSAMPLER_PATH,
-            distilled_lora_path=LORA_PATH,
+            model=CHECKPOINT_PATH_BF16,
+            pipeline_config=_ltx2_pipeline_config(
+                spatial_upsampler_path=UPSAMPLER_PATH,
+                distilled_lora_path=LORA_PATH,
+            ),
             quant_config={"quant_algo": quant_algo, "dynamic": True},
         )
 
-        pipeline = PipelineLoader(args).load(skip_warmup=True)
+        pipeline = PipelineLoader(args).load(skip_warmup=True, skip_components=SKIP_COMPONENTS)
         try:
             assert isinstance(pipeline, LTX2TwoStagesPipeline)
             assert pipeline.model_config.quant_config.quant_algo is not None

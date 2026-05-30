@@ -1,3 +1,17 @@
+# SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 from typing import List, Optional, Type
 
 import pytest
@@ -161,6 +175,9 @@ class _DummyKVCacheManager:
         # Return many dummy page IDs; ADEngine will truncate as needed
         return list(range(1024))
 
+    def get_batch_cache_indices(self, request_ids, layer_idx=None):
+        return [list(range(1024)) for _ in request_ids]
+
     def get_num_kv_blocks(self, num_tokens: int) -> int:
         if self.tokens_per_block and self.tokens_per_block > 0:
             return (num_tokens + self.tokens_per_block - 1) // self.tokens_per_block
@@ -182,6 +199,7 @@ class _DummyRequest:
         self.context_chunk_size = size
         self.seq_slot = seq_slot
         self.py_seq_slot = seq_slot
+        self.py_request_id = seq_slot
         self.py_batch_idx = None
         self.py_multimodal_data = None
         self.multimodal_positions = None
@@ -542,6 +560,9 @@ class _DummyHybridKVCacheManager:
             num_blocks = self.get_num_kv_blocks(num_tokens)
             return list(range(num_blocks))
         return list(range(1024))
+
+    def get_batch_cache_indices(self, request_ids, layer_idx=None):
+        return [list(range(1024)) for _ in request_ids]
 
     def get_num_kv_blocks(self, num_tokens: int) -> int:
         if self.tokens_per_block and self.tokens_per_block > 0:

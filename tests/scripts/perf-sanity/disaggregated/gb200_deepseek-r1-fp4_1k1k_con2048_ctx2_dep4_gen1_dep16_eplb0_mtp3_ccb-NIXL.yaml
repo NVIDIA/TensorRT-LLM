@@ -48,7 +48,7 @@ worker_config:
   gen:
     print_iter_log: true
     max_batch_size: 768
-    max_num_tokens: 1536
+    max_num_tokens: 3072
     tensor_parallel_size: 16
     moe_expert_parallel_size: 16
     pipeline_parallel_size: 1
@@ -71,7 +71,7 @@ worker_config:
     disable_overlap_scheduler: true
     speculative_config: &id001
       decoding_type: MTP
-      num_nextn_predict_layers: 3
+      max_draft_len: 3
     num_postprocess_workers: 4
     stream_interval: 20
   ctx:

@@ -15,6 +15,7 @@
 
 from typing import Optional, Union
 
+from ..._utils import get_hf_rope_theta
 from ...layers import MoeConfig
 from ...mapping import Mapping
 from ..convert_utils import infer_dtype
@@ -96,7 +97,7 @@ class Phi3Config(PretrainedConfig):
                 hf_config, "dense_attention_every_n_layers", None)
             kwargs['norm_epsilon'] = hf_config.layer_norm_epsilon
         else:
-            kwargs['rotary_base'] = hf_config.rope_theta
+            kwargs['rotary_base'] = get_hf_rope_theta(hf_config, 10000.0)
             kwargs['norm_epsilon'] = hf_config.rms_norm_eps
         moe_variant = hf_config.architectures[0] == "PhiMoEForCausalLM"
         if moe_variant:

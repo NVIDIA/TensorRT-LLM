@@ -96,7 +96,17 @@ class BaseReasoningParser(ABC):
 
 
 @register_reasoning_parser("deepseek-r1", reasoning_at_start=True)
+@register_reasoning_parser("laguna")
 @register_reasoning_parser("qwen3")
+# Qwen3.5 (and forced-thinking Qwen3 variants) use a chat template that
+# pre-injects `<think>\n` into the assistant prompt prefix, so the model
+# output begins inside the reasoning block with no opening tag to search
+# for. That requires `reasoning_at_start=True`. The existing `qwen3` key
+# keeps `reasoning_at_start=False` for back-compat, and `parse()` is
+# binary on this flag (it either requires `<think>` to be present in the
+# output, or assumes the output begins at the start of reasoning) - so
+# the two behaviors must be registered under separate keys.
+@register_reasoning_parser("qwen3_5", reasoning_at_start=True)
 @register_reasoning_parser("minimax_m2", reasoning_at_start=True)
 @register_reasoning_parser("minimax_m2_append_think", reasoning_at_start=True)
 class DeepSeekR1Parser(BaseReasoningParser):
@@ -196,8 +206,12 @@ MODEL_TYPE_TO_REASONING_PARSER: dict[str, str] = {
     "qwen3_next": "qwen3",
     "deepseek_v3": "deepseek-r1",
     "deepseek_v32": "deepseek-r1",
+    "laguna": "laguna",
     "nemotron_h": "nano-v3",
+    "nemotron_h_puzzle": "nano-v3",
     "gemma4": "gemma4",
+    "kimi_k2": "kimi_k2",
+    "kimi_k25": "kimi_k25",
 }
 
 _QWEN3_MODEL_TYPES = frozenset({
@@ -523,8 +537,9 @@ class Gemma4ReasoningParser(BaseReasoningParser):
 
 
 @register_reasoning_parser("kimi_k2")
+@register_reasoning_parser("kimi_k25", reasoning_at_start=True)
 class KimiK2ReasoningParser(DeepSeekR1Parser):
-    """Reasoning parser for Kimi-K2-Thinking model.
+    """Reasoning parser for Kimi-K2 and Kimi-K2.5 models.
 
     Extends DeepSeekR1Parser to support interleaved thinking where reasoning
     content may be implicitly ended by a tool call section. The model uses
@@ -538,6 +553,12 @@ class KimiK2ReasoningParser(DeepSeekR1Parser):
       thinking (reasoning interrupted by tool call)
     * ``content`` (no ``<think>``) – no reasoning
 
+    For Kimi-K2.5, the chat template defaults to thinking mode (appends
+    ``<think>`` to prompt). When ``thinking=False`` is passed via
+    ``chat_template_kwargs``, the template appends ``<think></think>``
+    instead, and the model output has no thinking tags — this parser
+    dynamically adjusts ``reasoning_at_start`` accordingly.
+
     Adapted from:
     * vLLM ``vllm/reasoning/kimi_k2_reasoning_parser.py``
     * sglang ``sglang/srt/parser/reasoning_parser.py``
@@ -547,6 +568,13 @@ class KimiK2ReasoningParser(DeepSeekR1Parser):
                  *,
                  reasoning_at_start: bool = False,
                  chat_template_kwargs: Optional[dict[str, Any]] = None) -> None:
+        # For Kimi-K2.5: chat template defaults to thinking mode unless
+        # thinking=False is explicitly passed. Override reasoning_at_start
+        # based on the actual thinking state.
+        if chat_template_kwargs is not None:
+            thinking = chat_template_kwargs.get("thinking")
+            if thinking is False:
+                reasoning_at_start = False
         super().__init__(reasoning_at_start=reasoning_at_start,
                          chat_template_kwargs=chat_template_kwargs)
         self.tool_section_start = "<|tool_calls_section_begin|>"
@@ -573,9 +601,19 @@ class KimiK2ReasoningParser(DeepSeekR1Parser):
             reasoning_content = text[:tool_idx]
             content = text[tool_idx:]
         else:
-            # No end marker found – everything is reasoning.
-            reasoning_content = text
-            content = ""
+            # No end marker found.
+            if self.reasoning_at_start:
+                # reasoning_at_start=True but no </think>: this is
+                # instant mode (thinking=False) where the model output
+                # has no thinking tags — treat everything as content.
+                reasoning_content = ""
+                content = text
+            else:
+                # reasoning_at_start=False and we already stripped
+                # <think>: text is incomplete reasoning (e.g. truncated
+                # output) — treat everything as reasoning.
+                reasoning_content = text
+                content = ""
 
         return ReasoningParserResult(content=content,
                                      reasoning_content=reasoning_content)

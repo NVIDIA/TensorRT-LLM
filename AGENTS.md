@@ -98,6 +98,21 @@ HuggingFace Model → LLM API → Executor (PyTorch/AutoDeploy/TensorRT)
 | **Distributed execution** | Tensor/pipeline parallelism via `Mapping` class, multiple backends (MPI, Ray, RPC) |
 | **Auto-discovery** | Models self-register via `automodel.py`, resolved by HF config `architectures` field |
 
+## VisualGen
+
+VisualGen is a vertical alongside LLM for Diffusion-Transformer (DiT)-based image/video generation
+(text-to-image, text-to-video, image-to-video). It is **not** an LLM backend — it has
+its own engine, args, params, and outputs — but shares ops and kernels with the
+PyTorch backend where it makes sense (attention, quantization, parallelism).
+
+Key entry points:
+- Public Python API: `from tensorrt_llm import VisualGen, VisualGenArgs, VisualGenParams`.
+- Serving CLI: `trtllm-serve --model <HF id> --visual_gen_args <YAML path>`.
+
+Key files:
+- `tensorrt_llm/visual_gen/`: VisualGen public Python API. **User-facing surface — before modifying anything here, pause and confirm with the user that a public API change is actually intended; do not infer it from the surrounding task.**
+- `tensorrt_llm/_torch/visual_gen/`: VisualGen internal implementation. All non-user-facing code belongs here.
+
 ## Anti-Patterns / Gotchas
 
 - **Pre-commit modifies files in-place** — if hooks fail, files are already modified. Re-stage (`git add`) and commit again.
@@ -153,10 +168,6 @@ CI is triggered by posting comments on the PR. Basic commands:
 - `/bot run --extra-stage "DGX_B200-4_GPUs-AutoDeploy-1, DGX_H100-4_GPUs-AutoDeploy-1"` — include AutoDeploy CI stages (use for AutoDeploy-related PRs)
 
 For a full list of up-to-date bot commands, post `/bot help` as a PR comment and check the bot's reply.
-
-### Retrieving CI Test Failures from a PR
-
-See the CI failure retrieval skill (`.claude/skills/ci-failure-retrieval/SKILL.md`) for step-by-step scripts to query Jenkins test results via the API.
 
 ### Trouble Shooting
 

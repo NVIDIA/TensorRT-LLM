@@ -140,7 +140,7 @@ def get_visual_gen_num_gpus(diffusion_config: dict) -> int:
     Uses ParallelConfig.model_construct (skips env validators)
     so this is safe to call from non-worker processes.
     """
-    parallel = diffusion_config.get("parallel", {})
+    parallel = diffusion_config.get("parallel_config", {})
     if isinstance(parallel, dict):
         parallel = ParallelConfig.model_construct(**parallel)
     return parallel.n_workers

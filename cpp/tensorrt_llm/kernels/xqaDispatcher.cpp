@@ -310,7 +310,6 @@ bool XqaDispatcher::isSupported()
         {
             tllmRunnerParams.mSparseAttention = SparseType::StaticTokenSparse;
             tllmRunnerParams.mKernelType = FmhaKernelType::Generation;
-            tllmRunnerParams.mMaskType = TrtllmGenAttentionMaskType::Causal;
         }
 
         // Check if it is supported or not.
@@ -452,8 +451,7 @@ void XqaDispatcher::runImpl(
             else if (mFixedParams.useTllmGenSparseAttention)
             {
                 tllmRunnerParams.mSparseAttention = SparseType::StaticTokenSparse;
-                tllmRunnerParams.mSparseTopK = params.sparse_params.sparse_topk;
-                tllmRunnerParams.mMaskType = TrtllmGenAttentionMaskType::Causal;
+                tllmRunnerParams.mSparseTopK = params.sparse_params.num_sparse_topk;
                 tllmRunnerParams.kvPageIdxPtr = reinterpret_cast<int const*>(params.sparse_params.sparse_attn_indices);
                 tllmRunnerParams.kvPtr = params.sparse_params.sparse_kv_cache_pool;
             }

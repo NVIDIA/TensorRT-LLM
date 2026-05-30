@@ -1,6 +1,6 @@
 import copy
 import os
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, ClassVar, Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import torch
@@ -37,6 +37,7 @@ DISAGG = os.getenv('TLLM_MULTIMODAL_DISAGGREGATED', '0') == '1'
 
 class LlavaNextInputProcessor(BaseMultimodalInputProcessor,
                               BaseMultimodalDummyInputsBuilder):
+    supports_token_id_mm_expansion: ClassVar[bool] = True
 
     def __init__(self,
                  model_path: str,
@@ -328,7 +329,7 @@ class LlavaNextInputProcessor(BaseMultimodalInputProcessor,
 
         return expanded_ids, mm_token_length, mm_token_offsets
 
-    def attach_multimodal_embeddings(
+    def _attach_multimodal_embeddings_impl(
         self, inputs: TextPrompt,
         multimodal_embedding: Dict[str, List[torch.Tensor]],
         sampling_params: SamplingParams
@@ -375,7 +376,7 @@ class LlavaNextInputProcessor(BaseMultimodalInputProcessor,
         }
 
     @torch.inference_mode()
-    def __call__(
+    def call_with_text_prompt(
         self, inputs: TextPrompt, sampling_params: SamplingParams
     ) -> Tuple[List[int], Optional[ExtraProcessedInputs]]:
         text_prompt, mm_data = inputs.get("prompt"), inputs.get(
@@ -418,8 +419,8 @@ class LlavaNextVisionModel(nn.Module):
         clip_model_config = copy.deepcopy(self.model_config)
         clip_model_config.pretrained_config = self.model_config.pretrained_config.vision_config
         self.dtype = (
-            self.model_config.pretrained_config.text_config.torch_dtype
-            or self.model_config.pretrained_config.torch_dtype)
+            self.model_config.pretrained_config.torch_dtype
+            or self.model_config.pretrained_config.text_config.torch_dtype)
         self.vision_model = CLIPVisionModel(clip_model_config).to(self.dtype)
         self.mm_projector = LlavaNextMultiModalProjector(
             self.pretrained_config).to(self.dtype)
@@ -626,10 +627,12 @@ class LlavaNextModel(PreTrainedModel):
         llm_model_config = copy.deepcopy(model_config)
         llm_model_config.pretrained_config = model_config.pretrained_config.text_config
 
-        # Ensure torch_dtype is set on text_config (HF may omit it from
-        # sub-configs, e.g. llava-hf/llava-v1.6-mistral-7b-hf commit 2424fdd)
-        if llm_model_config.pretrained_config.torch_dtype is None:
-            llm_model_config.pretrained_config.torch_dtype = model_config.pretrained_config.torch_dtype
+        # Use the outer config's torch_dtype for the LLM, matching HF behavior
+        # where `.to(outer_dtype)` overrides text sub-config dtypes. Falls back
+        # to the text_config dtype if the outer config has none set.
+        llm_model_config.pretrained_config.torch_dtype = (
+            model_config.pretrained_config.torch_dtype
+            or llm_model_config.pretrained_config.torch_dtype)
 
         # TODO Remove these when MistralConfig is natively supported
         llm_model_config.pretrained_config.attention_bias = False

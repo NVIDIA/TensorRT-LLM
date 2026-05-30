@@ -78,12 +78,8 @@ std::optional<uintptr_t> launchHostFunc(
 {
     auto const stream = reinterpret_cast<cudaStream_t>(streamPtr);
 
-    nb::gil_scoped_acquire gil;
-
     auto hostFuncUserData
         = std::make_unique<HostFuncUserData>(freeUserData, pyHostFunc, nb::tuple(pyArgs), nb::dict(pyKwargs));
-
-    nb::gil_scoped_release release;
 
     cudaError_t err = cudaLaunchHostFunc(stream, cudaHostFuncTrampoline, hostFuncUserData.get());
     if (err != cudaSuccess)
@@ -100,9 +96,6 @@ std::optional<uintptr_t> launchHostFunc(
 
 void freeHostFuncUserData(uintptr_t userDataPtr)
 {
-    // Acquire the GIL to safely release the Python objects.
-    nb::gil_scoped_acquire gil;
-
     // Create a unique_ptr to take over the ownership of the user data;
     // the user data is released when the unique_ptr is destroyed.
     auto hostFuncUserData = std::unique_ptr<HostFuncUserData>(reinterpret_cast<HostFuncUserData*>(userDataPtr));
@@ -112,9 +105,7 @@ void freeHostFuncUserData(uintptr_t userDataPtr)
 
 void initHostFuncBindings(nb::module_& m)
 {
-    m.def("launch_hostfunc", &launchHostFunc, "Launch a Python host function to a CUDA stream",
-        nb::call_guard<nb::gil_scoped_release>());
-    m.def("free_hostfunc_user_data", &freeHostFuncUserData, "Free the user data for the Python host function",
-        nb::call_guard<nb::gil_scoped_release>());
+    m.def("launch_hostfunc", &launchHostFunc, "Launch a Python host function to a CUDA stream");
+    m.def("free_hostfunc_user_data", &freeHostFuncUserData, "Free the user data for the Python host function");
 }
 } // namespace tensorrt_llm::nanobind::runtime

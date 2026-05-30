@@ -37,8 +37,8 @@ class HfWeightMapper(BaseWeightMapper):
         return module_weights
 
     def should_skip_module(self, module_name: str) -> bool:
-        if self.model.config.tie_word_embeddings and module_name.startswith(
-                "lm_head"):
+        if getattr(self.model.config, 'tie_word_embeddings',
+                   False) and module_name.startswith("lm_head"):
             return True
 
         # Skip loading weights for embedding and lm_head if LoRA is enabled and has custom values

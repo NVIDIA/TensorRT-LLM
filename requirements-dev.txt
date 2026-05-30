@@ -1,5 +1,6 @@
 -r requirements.txt
 einops
+lpips
 graphviz
 mypy==1.19.1
 mako

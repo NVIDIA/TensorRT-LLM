@@ -51,6 +51,7 @@ from ..bindings.executor import (BatchingType as _BatchingType,
                                  LookaheadDecodingConfig as _LookaheadDecodingConfig,
                                  PeftCacheConfig as _PeftCacheConfig,
                                  SchedulerConfig as _SchedulerConfig) # isort: skip
+from ..bindings.internal.algorithms import AgentTreeConfig as _AgentTreeConfig  # isort: skip
 # isort: on
 
 # yapf: enable
@@ -107,9 +108,7 @@ def Field(default: Any = ...,
 
 
 class CudaGraphConfig(StrictBaseModel):
-    """
-    Configuration for CUDA graphs.
-    """
+    """Configuration for CUDA graphs."""
     # List of batch sizes to create CUDA graphs for.
     batch_sizes: Optional[List[int]] = Field(
         default=None,
@@ -253,9 +252,7 @@ class GuidedDecodingConfig(StrictBaseModel):
 
 
 class BaseSparseAttentionConfig(StrictBaseModel):
-    """
-    Configuration for sparse attention.
-    """
+    """Configuration for sparse attention."""
     algorithm: str
 
     seq_len_threshold: Optional[int] = Field(
@@ -285,9 +282,7 @@ class BaseSparseAttentionConfig(StrictBaseModel):
 
 
 class RocketSparseAttentionConfig(BaseSparseAttentionConfig):
-    """
-    Configuration for RocketKV sparse attention.
-    """
+    """Configuration for RocketKV sparse attention."""
     algorithm: Literal["rocket"] = "rocket"
     window_size: Optional[int] = Field(
         default=32, description="The window size for RocketKV.")
@@ -312,9 +307,7 @@ class RocketSparseAttentionConfig(BaseSparseAttentionConfig):
 
 
 class DeepSeekSparseAttentionConfig(BaseSparseAttentionConfig):
-    """
-    Configuration for DeepSeek Sparse Attention.
-    """
+    """Configuration for DeepSeek Sparse Attention."""
     algorithm: Literal["dsa"] = "dsa"
     index_n_heads: Optional[int] = Field(
         default=None, description="The number of heads for the indexer.")
@@ -332,6 +325,11 @@ class DeepSeekSparseAttentionConfig(BaseSparseAttentionConfig):
         default=False,
         description=
         "Whether to use CuTE DSL top-k kernel instead of the CUDA C++ indexer_topk_decode."
+    )
+    use_cute_dsl_paged_mqa_logits: bool = Field(
+        default=False,
+        description=
+        "Whether to use CuTE DSL paged MQA logits kernel on SM100 instead of C++ DeepGEMM."
     )
     q_split_threshold: int = Field(
         default=8192,
@@ -400,9 +398,7 @@ class DeepSeekSparseAttentionConfig(BaseSparseAttentionConfig):
 
 
 class SkipSoftmaxAttentionConfig(BaseSparseAttentionConfig):
-    """
-    Configuration for skip softmax attention.
-    """
+    """Configuration for skip softmax attention."""
     algorithm: Literal["skip_softmax"] = "skip_softmax"
     threshold_scale_factor: Optional[Union[float, Dict[str, float]]] = Field(
         default=None,
@@ -442,7 +438,8 @@ class SkipSoftmaxAttentionConfig(BaseSparseAttentionConfig):
 
     def resolve_for_target_sparsity(
             self, formula: dict) -> 'SkipSoftmaxAttentionConfig':
-        """
+        """Compute threshold_scale_factor from formula coefficients and target_sparsity.
+
         Given formula coefficients from HF config.json (dict with 'prefill' and
         'decode' keys, each containing 'a' and 'b'), compute threshold_scale_factor
         and return a new SkipSoftmaxAttentionConfig with it set.
@@ -557,9 +554,7 @@ class MoeLoadBalancerConfig(StrictBaseModel):
 
     def get_layer_initial_global_assignments(
             self, layer_idx: int) -> Optional[List[int]]:
-        """
-        Retrieves the initial global assignments for a specific layer.
-        """
+        """Retrieves the initial global assignments for a specific layer."""
         if self.initial_global_assignments is None:
             return None
 
@@ -583,9 +578,7 @@ class MoeLoadBalancerConfig(StrictBaseModel):
 
 
 class MoeConfig(StrictBaseModel):
-    """
-    Configuration for MoE.
-    """
+    """Configuration for MoE."""
     backend: Literal[
         "AUTO", "CUTLASS", "CUTEDSL", "WIDEEP", "TRTLLM", "DEEPGEMM",
         "DENSEGEMM", "VANILLA", "TRITON"] = Field(
@@ -624,14 +617,11 @@ Nvfp4Backend = Literal['cutlass', 'cublaslt', 'cutedsl', 'cuda_core']
 # Maps alias → full import path (module.ClassName).
 TOKENIZER_ALIASES = {
     'deepseek_v32': 'tensorrt_llm.tokenizer.deepseek_v32.DeepseekV32Tokenizer',
-    'glm_moe_dsa': 'tensorrt_llm.tokenizer.glm_moe_dsa.GlmMoeDsaTokenizer',
 }
 
 
 class Nvfp4GemmConfig(StrictBaseModel):
-    """
-    Configuration for NVFP4 GEMM backend selection.
-    """
+    """Configuration for NVFP4 GEMM backend selection."""
     allowed_backends: List[Nvfp4Backend] = Field(
         default_factory=lambda: ['cutlass', 'cublaslt', 'cuda_core'],
         min_length=1,
@@ -642,9 +632,7 @@ class Nvfp4GemmConfig(StrictBaseModel):
 
 
 class AttentionDpConfig(StrictBaseModel):
-    """
-    Configuration for attention DP.
-    """
+    """Configuration for attention DP."""
     enable_balance: bool = Field(default=False,
                                  description="Whether to enable balance.")
     timeout_iters: int = Field(
@@ -687,6 +675,18 @@ class AttentionDpConfig(StrictBaseModel):
         "cache affinity can dominate while preventing runaway concentration "
         "on a single rank. Set to 1.0 for strict fair share. "
         "Only used when enable_kv_cache_aware_routing is True.")
+    kv_cache_routing_cold_start_warmup: bool = Field(
+        default=False,
+        description=
+        "Cold-start mitigation in KV cache-aware routing. When True, the "
+        "first tp_size relaxed requests after router init are round-robined "
+        "across ranks (bypassing cache-affinity scoring) so every rank "
+        "caches the shared system prompt before scoring would otherwise pin "
+        "all traffic to the first warm rank. Only useful when requests "
+        "share a long system prefix; for diverse-prompt workloads this can "
+        "scatter requests that would otherwise consolidate on a single warm "
+        "rank, wasting prefill. Default False preserves pre-warmup routing. "
+        "Only used when enable_kv_cache_aware_routing is True.")
 
     @model_validator(mode='after')
     def validate_attention_dp_config(self) -> 'AttentionDpConfig':
@@ -703,9 +703,7 @@ class AttentionDpConfig(StrictBaseModel):
 
 
 class CpConfig(StrictBaseModel):
-    """
-    Configuration for context parallelism.
-    """
+    """Configuration for context parallelism."""
     # TODO: given that multiple fields here are only used with specific cp_types, consider
     # making this a Pydantic discriminated union.
     cp_type: CpType = Field(default=CpType.ULYSSES,
@@ -811,9 +809,7 @@ class _ParallelConfig(StrictBaseModel):
 
 
 class CalibConfig(StrictBaseModel):
-    """
-    Calibration configuration.
-    """
+    """Calibration configuration."""
     device: Literal['cuda',
                     'cpu'] = Field(default='cuda',
                                    description="The device to run calibration.")
@@ -909,6 +905,14 @@ class DecodingBaseConfig(StrictBaseModel):
         "to 1-model code paths; non-greedy sampling is always enabled on 2-model paths."
     )
 
+    use_rejection_sampling: bool = Field(
+        default=False,
+        status="prototype",
+        description=
+        "If true, enables rejection sampling for one-model speculative decoding paths. "
+        "This is intended for non-greedy sampling configurations on the PyTorch backend. "
+        "The non-dynamic-tree one-model path requires FlashInfer.")
+
     # If set, drafting is allowed to use chain drafter.
     _allow_chain_drafter: bool = PrivateAttr(True)
     # If set, drafting uses greedy sampling, irrespective of sampling parameters.
@@ -960,6 +964,17 @@ class DecodingBaseConfig(StrictBaseModel):
             # This ensures efficient lookup
             return dict(sorted(v.items(), key=lambda x: x[0]))
         return v
+
+    @model_validator(mode='after')
+    def validate_rejection_sampling_config(self):
+        """Reject SA-enhanced configurations that invalidate rejection sampling."""
+        if self.use_rejection_sampling and getattr(self, 'sa_config',
+                                                   None) is not None:
+            raise ValueError(
+                "use_rejection_sampling is incompatible with sa_config "
+                "because SA enhancement may override the proposed draft tokens."
+            )
+        return self
 
     @model_validator(mode='after')
     # 1. Validate that max_concurrency and draft_len_schedule are mutually exclusive.
@@ -1074,9 +1089,7 @@ class KvCacheConnectorConfig(StrictBaseModel):
 
 
 class LayerwiseBenchmarksConfig(StrictBaseModel):
-    """
-    Configuration for layer-wise benchmarks calibration.
-    """
+    """Configuration for layer-wise benchmarks calibration."""
     calibration_mode: Literal["NONE", "MARK", "COLLECT"] = Field(
         default="NONE",
         description=
@@ -1343,10 +1356,16 @@ class SAEnhancerConfig(StrictBaseModel):
 class Eagle3DecodingConfig(EagleDecodingConfig):
     decoding_type: Literal["Eagle3"] = "Eagle3"
 
-    max_batch_size: Optional[int] = Field(
-        default=None,
-        description="Max batch size for pre-allocating dynamic tree buffers. "
-        "Required when use_dynamic_tree=True.")
+    # Backs the dynamic-tree worker's pre-allocated, batch-indexed CUDA buffers
+    # (draft_tokens_buffer, history_*_buffer, tree_mask_buffer, etc. in
+    # Eagle3OneModelDynamicTreeWorker.__init__). This MUST equal the global
+    # max_batch_size: the worker indexes those buffers with batch_idx in
+    # [0, global_max_batch_size) at runtime with no bounds check, so any value
+    # smaller than the global will OOB during warmup or generation as soon as
+    # batch_idx exceeds this capacity (illegal memory access). It is therefore
+    # exposed as a PrivateAttr -- not a user-tunable knob -- and is
+    # auto-populated by py_executor_creator from the global max_batch_size.
+    _max_batch_size: Optional[int] = PrivateAttr(default=None)
 
     sa_config: Optional[SAEnhancerConfig] = Field(
         default=None,
@@ -1454,9 +1473,7 @@ class UserProvidedDecodingConfig(DecodingBaseConfig):
 
 
 class NGramDecodingConfig(DecodingBaseConfig):
-    """
-    Configuration for NGram drafter speculative decoding.
-    """
+    """Configuration for NGram drafter speculative decoding."""
     decoding_type: Literal["NGram"] = "NGram"
     max_matching_ngram_size: PositiveInt = Field(
         default=2,
@@ -1576,11 +1593,6 @@ class DraftTargetDecodingConfig(DecodingBaseConfig):
 
 class MTPDecodingConfig(DecodingBaseConfig):
     decoding_type: Literal["MTP"] = "MTP"
-    num_nextn_predict_layers: PositiveInt = Field(
-        default=1,
-        description=
-        "Number of MTP modules. Each module predicts the next token, so N modules produce N draft tokens."
-    )
     use_relaxed_acceptance_for_thinking: bool = Field(
         default=False,
         description=
@@ -1613,14 +1625,14 @@ class MTPDecodingConfig(DecodingBaseConfig):
         description="Optional Suffix Automaton configuration. When set, "
         "combines SA drafting with MTP speculative decoding.")
 
-    # TODO: remove this after distinguishing `max_draft_len` and `num_nextn_predict_layers`
-    # Now we need a flag when MTPDecodingConfig is updated by PyTorchModelEngine.
-    num_nextn_predict_layers_from_model_config: int = Field(
-        default=1,
+    # Internal field: number of MTP layers in the model checkpoint.
+    # Auto-populated from pretrained_config by update_spec_config_from_model_config.
+    # Do not set manually.
+    num_nextn_predict_layers: Optional[int] = Field(
+        default=None,
         init=False,
-        description=
-        "Internal field storing MTP layer count from model config. Used to decide decoding mode: "
-        "when model has 1 layer and use_mtp_vanilla=False, uses faster EAGLE-style MTP instead of vanilla MTP."
+        description="Number of MTP layers in the model checkpoint. "
+        "Auto-populated from the model's pretrained config. Do not set manually."
     )
 
     begin_thinking_phase_token: int = Field(
@@ -1634,10 +1646,31 @@ class MTPDecodingConfig(DecodingBaseConfig):
         "Token ID marking end of thinking phase. Strict acceptance resumes after this."
     )
 
+    @model_validator(mode="before")
+    @classmethod
+    def _remap_deprecated_num_nextn_predict_layers(cls, data):
+        if isinstance(data, dict) and "num_nextn_predict_layers" in data:
+            logger.warning(
+                "MTPDecodingConfig: 'num_nextn_predict_layers' is deprecated and will be "
+                "removed in a future release. Use 'max_draft_len' instead.")
+            if "max_draft_len" not in data:
+                data = dict(data)
+                data["max_draft_len"] = data.pop("num_nextn_predict_layers")
+            else:
+                data = dict(data)
+                data.pop("num_nextn_predict_layers")
+        return data
+
     @model_validator(mode="after")
     def set_max_total_draft_tokens(self):
-        self.max_draft_len = self.num_nextn_predict_layers
-        self.max_total_draft_tokens = self.num_nextn_predict_layers  # Current MTP only supports linear tree
+        # Default max_draft_len to 1 if not set by the user.
+        # For vanilla MTP, update_spec_config_from_model_config will override this
+        # with the actual num_nextn_predict_layers from the model.
+        if self.max_draft_len is None:
+            self.max_draft_len = 1
+        elif self.max_draft_len <= 0:
+            raise ValueError("max_draft_len must be > 0 for MTP")
+        self.max_total_draft_tokens = self.max_draft_len  # Current MTP only supports linear tree
         return self
 
     @model_validator(mode="after")
@@ -1651,19 +1684,21 @@ class MTPDecodingConfig(DecodingBaseConfig):
     def supports_backend(self, backend: str) -> bool:
         return backend in ("pytorch", "_autodeploy")
 
-    @functools.cached_property
+    @property
     def num_capture_layers(self) -> int:
-        if not self.use_mtp_vanilla and not self.mtp_eagle_one_model:
-            return 1
-        return 0
+        return 1 if self.spec_dec_mode.is_mtp_eagle() else 0
 
-    @functools.cached_property
+    @property
     def spec_dec_mode(self):
         from tensorrt_llm._torch.speculative.interface import \
             SpeculativeDecodingMode as TorchSpeculativeDecodingMode
-        if self.num_nextn_predict_layers_from_model_config == 1 and not self.use_mtp_vanilla and self.mtp_eagle_one_model:
+
+        # num_nextn_predict_layers is set from the model's pretrained config by
+        # update_spec_config_from_model_config. Treat None (before model load) as 1.
+        n = self.num_nextn_predict_layers if self.num_nextn_predict_layers is not None else 1
+        if n == 1 and not self.use_mtp_vanilla and self.mtp_eagle_one_model:
             return TorchSpeculativeDecodingMode.MTP_EAGLE_ONE_MODEL
-        elif self.num_nextn_predict_layers_from_model_config == 1 and not self.use_mtp_vanilla and not self.mtp_eagle_one_model:
+        elif n == 1 and not self.use_mtp_vanilla and not self.mtp_eagle_one_model:
             return TorchSpeculativeDecodingMode.MTP_EAGLE
         return TorchSpeculativeDecodingMode.MTP
 
@@ -1754,8 +1789,12 @@ class DFlashDecodingConfig(DecodingBaseConfig):
 
     @property
     def tokens_per_gen_step(self) -> int:
-        """DFlash needs 2K tokens per gen request: K+1 accepted + K-1 masks."""
-        return 2 * self.max_draft_len
+        """DFlash only needs K+1 tokens per gen request (K drafts + 1 bonus).
+
+        The draft produces its own mask queries internally; passing mask
+        fillers through the target is pure wasted work at large batch size.
+        """
+        return self.max_draft_len + 1
 
     def supports_backend(self, backend: str) -> bool:
         return backend == "pytorch"
@@ -1954,9 +1993,18 @@ class ExecutorMemoryType(StrEnum):
     MODEL_WEIGHTS_DRAFT = "draft_model_weights"
 
 
+@dataclass
+class _SleepConfigDefaultFactory:
+    """Picklable replacement for ``lambda: default_mode`` in SleepConfig's defaultdict."""
+
+    default_mode: Any
+
+    def __call__(self) -> Any:
+        return self.default_mode
+
+
 class SleepConfig(StrictBaseModel):
-    """Configuration for the LLM sleep/wakeup feature.
-    """
+    """Configuration for the LLM sleep/wakeup feature."""
 
     restore_modes: dict[
         ExecutorMemoryType, Literal["NONE", "MEMSET", "CPU", "PINNED"]
@@ -2026,7 +2074,8 @@ class SleepConfig(StrictBaseModel):
             cls._normalize_restore_mode(value)
             for key, value in cases.items()
         }
-        return defaultdict(lambda: default_mode, normalized_cases)
+        factory = _SleepConfigDefaultFactory(default_mode)
+        return defaultdict(factory, normalized_cases)
 
     @field_validator('restore_modes', mode='plain')
     @classmethod
@@ -2199,9 +2248,7 @@ class PybindMirrorMeta(type(PybindMirror)):
 
 
 class PybindMirrorEnumMeta(EnumMeta, PybindMirrorMeta):
-    """
-    Combined metaclass for Enum and PybindMirror.  This is crucial.
-    """
+    """Combined metaclass for Enum and PybindMirror.  This is crucial."""
 
 
 @PybindMirror.mirror_pybind_enum(_BatchingType)
@@ -2305,9 +2352,7 @@ class SchedulerConfig(StrictBaseModel, PybindMirror):
 
 @PybindMirror.mirror_pybind_fields(_PeftCacheConfig)
 class PeftCacheConfig(StrictBaseModel, PybindMirror):
-    """
-    Configuration for the PEFT cache.
-    """
+    """Configuration for the PEFT cache."""
     num_host_module_layer: int = Field(
         default=0,
         description=
@@ -2375,9 +2420,7 @@ class PeftCacheConfig(StrictBaseModel, PybindMirror):
 
 @PybindMirror.mirror_pybind_fields(_LookaheadDecodingConfig)
 class LookaheadDecodingConfig(DecodingBaseConfig, PybindMirror):
-    """
-    Configuration for lookahead speculative decoding.
-    """
+    """Configuration for lookahead speculative decoding."""
 
     decoding_type: Literal["Lookahead"] = "Lookahead"
     max_window_size: PositiveInt = Field(
@@ -2440,11 +2483,47 @@ SparseAttentionConfig: TypeAlias = Annotated[
 ]
 
 
+@PybindMirror.mirror_pybind_fields(_AgentTreeConfig)
+class AgentTreeConfig(StrictBaseModel, PybindMirror):
+    """Configuration for agent tree scheduling.
+
+    Controls how agent requests are scheduled relative to regular chat requests.
+    """
+    agent_percentage: float = Field(
+        default=0.0,
+        description=
+        "The percentage of agent requests to schedule. Defaults to 0.0. "
+        "Should be between 0.0 and 1.0. -1.0 means random schedule between agent and chatbot."
+    )
+    agent_types: Optional[List[str]] = Field(
+        default=None,
+        description=
+        "Types of agents to schedule (e.g. 'AgentDeepResearch', 'Researcher', 'MultiroundChat')."
+    )
+    agent_inflight_seq_num: int = Field(
+        default=2**31 - 1,
+        description="Max number of inflight sequences for agent requests.")
+
+    def _to_pybind(self):
+        return _AgentTreeConfig(
+            agent_percentage=self.agent_percentage,
+            agent_types=self.agent_types,
+            agent_inflight_seq_num=self.agent_inflight_seq_num,
+        )
+
+
+class ReorderRequestPolicyConfig(StrictBaseModel):
+    """Configuration for request reordering policy."""
+    policy_name: Optional[Literal["AgentTree"]] = Field(
+        default=None, description="The name of the request reordering policy.")
+    policy_args: AgentTreeConfig = Field(
+        default_factory=AgentTreeConfig,
+        description="The arguments of the request reordering policy.")
+
+
 @PybindMirror.mirror_pybind_fields(_KvCacheConfig)
 class KvCacheConfig(StrictBaseModel, PybindMirror):
-    """
-    Configuration for the KV cache.
-    """
+    """Configuration for the KV cache."""
     enable_block_reuse: bool = Field(
         default=True,
         description=
@@ -2463,7 +2542,10 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
     sink_token_length: Optional[int] = Field(
         default=None,
         description=
-        "Number of sink tokens (tokens to always keep in attention window).")
+        "Deprecated and ignored on the PyTorch backend. StreamingLLM is not supported "
+        "by the PyTorch attention kernels — any non-None value has no effect and "
+        "will be silently dropped before reaching the executor.",
+        deprecated=True)
     free_gpu_memory_fraction: Optional[float] = Field(
         default=0.9,
         ge=0,
@@ -2589,7 +2671,6 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
             enable_block_reuse=self.enable_block_reuse,
             max_tokens=self.max_tokens,
             max_attention_window=self.max_attention_window,
-            sink_token_length=self.sink_token_length,
             free_gpu_memory_fraction=self.free_gpu_memory_fraction,
             host_cache_size=self.host_cache_size,
             cross_kv_cache_fraction=self.cross_kv_cache_fraction,
@@ -2692,9 +2773,7 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
 
 @PybindMirror.mirror_pybind_fields(_ExtendedRuntimePerfKnobConfig)
 class ExtendedRuntimePerfKnobConfig(StrictBaseModel, PybindMirror):
-    """
-    Configuration for extended runtime performance knobs.
-    """
+    """Configuration for extended runtime performance knobs."""
 
     multi_block_mode: bool = Field(
         default=True, description="Whether to use multi-block mode.")
@@ -2723,9 +2802,7 @@ class ExtendedRuntimePerfKnobConfig(StrictBaseModel, PybindMirror):
 
 @PybindMirror.mirror_pybind_fields(_CacheTransceiverConfig)
 class CacheTransceiverConfig(StrictBaseModel, PybindMirror):
-    """
-    Configuration for the cache transceiver.
-    """
+    """Configuration for the cache transceiver."""
 
     backend: Optional[Literal[
         "DEFAULT", "UCX", "NIXL", "MOONCAKE", "MPI"]] = Field(
@@ -2835,9 +2912,7 @@ class DwdpConfig(StrictBaseModel):
 
 
 class BaseLlmArgs(StrictBaseModel):
-    """
-    Base class for both TorchLlmArgs and TrtLlmArgs. It contains all the arguments that are common to both.
-    """
+    """Base class for both TorchLlmArgs and TrtLlmArgs. It contains all the arguments that are common to both."""
     model_config = ConfigDict(arbitrary_types_allowed=True, extra="forbid")
 
     # Explicit arguments
@@ -3352,9 +3427,7 @@ class TrtLlmArgs(BaseLlmArgs):
 
     @model_validator(mode="after")
     def init_build_config(self):
-        """
-        Creating a default BuildConfig if none is provided
-        """
+        """Creating a default BuildConfig if none is provided"""
         build_config = getattr(self, "build_config", None)
         if build_config is None:
             kwargs = {}
@@ -3679,9 +3752,7 @@ class SamplerType(StrEnum):
 
 
 class TorchCompileConfig(StrictBaseModel):
-    """
-    Configuration for torch.compile.
-    """
+    """Configuration for torch.compile."""
     enable_fullgraph: bool = Field(
         default=True,
         description="Enable full graph compilation in torch.compile.")
@@ -3788,6 +3859,25 @@ class TorchLlmArgs(BaseLlmArgs):
         "async worker should only be used when confidential compute is active. "
         "This argument is provided to enable it for testing purposes, "
         "irrespective of confidential compute state.",
+        status="prototype")
+
+    enable_speculative_beam_history_d2h: bool = Field(
+        default=False,
+        description="Opt-in beam-search optimization: skip per-step "
+        "beam-history D2H copies on likely-non-terminal steps via a "
+        "host-side predictor and route the remaining copies through a "
+        "private side stream. Mispredictions fall back to a synchronous "
+        ".cpu(), preserving correctness but breaking overlap on that step. "
+        "Incompatible with the async D2H worker "
+        "(sampler_force_async_worker=True or confidential compute).",
+        status="prototype")
+
+    enable_early_first_token_response: bool = Field(
+        default=False,
+        description=
+        "Under the overlap scheduler, emit the first-token response ahead of "
+        "the next sample step to reduce TTFT. No effect when the overlap "
+        "scheduler is disabled.",
         status="prototype")
 
     enable_iter_perf_stats: bool = Field(
@@ -3957,6 +4047,20 @@ class TorchLlmArgs(BaseLlmArgs):
         "Only enable it if you intend to use this feature.",
         status="prototype")
 
+    reorder_policy_config: Optional[ReorderRequestPolicyConfig] = Field(
+        default=None,
+        description="The request reordering policy to use.",
+        status="prototype",
+    )
+
+    enable_resource_governor: bool = Field(
+        default=False,
+        description="Enable the resource governor for runtime cache management "
+        "operations such as KV cache truncation. This adds a per-iteration "
+        "broadcast collective.",
+        status="prototype",
+    )
+
     # fp8 cute dsl configs
     use_cute_dsl_blockscaling_mm: bool = Field(
         default=False,
@@ -4080,6 +4184,13 @@ class TorchLlmArgs(BaseLlmArgs):
                     exclude={"decoding_type"})
                 self.speculative_config = Eagle3DecodingConfig(**eagle_data)
 
+            if self.speculative_config.use_rejection_sampling:
+                if not isinstance(self.speculative_config,
+                                  Eagle3DecodingConfig):
+                    raise ValueError(
+                        "use_rejection_sampling is only supported for "
+                        "PyTorch Eagle3 one-model speculative decoding paths.")
+
             if isinstance(self.speculative_config, PARDDecodingConfig):
                 assert self.speculative_config.max_draft_len > 0, "PARD max_draft_len must be > 0"
 
@@ -4148,6 +4259,27 @@ class TorchLlmArgs(BaseLlmArgs):
         else:
             self.decoding_config = None
 
+        return self
+
+    @model_validator(mode="after")
+    def validate_early_first_token_response(self) -> 'TorchLlmArgs':
+        if not self.enable_early_first_token_response:
+            return self
+        if self.disable_overlap_scheduler:
+            logger.warning(
+                "enable_early_first_token_response is relevant only when the "
+                "overlap scheduler is enabled; disabling it because "
+                "disable_overlap_scheduler is True.")
+            self.enable_early_first_token_response = False
+            return self
+        is_disagg = (self.cache_transceiver_config is not None
+                     and self.cache_transceiver_config.backend is not None)
+        if is_disagg:
+            logger.warning(
+                "enable_early_first_token_response is supported only for "
+                "aggregated workloads; disabling it because "
+                "cache_transceiver_config is configured.")
+            self.enable_early_first_token_response = False
         return self
 
     @model_validator(mode="after")
@@ -4300,6 +4432,16 @@ class TorchLlmArgs(BaseLlmArgs):
                     f"sm {sm}.")
         return self
 
+    @model_validator(mode='after')
+    def validate_speculative_beam_history_d2h(self) -> 'TorchLlmArgs':
+        if (self.enable_speculative_beam_history_d2h
+                and self.sampler_force_async_worker):
+            raise ValueError(
+                "enable_speculative_beam_history_d2h is incompatible with "
+                "sampler_force_async_worker=True; the speculative path "
+                "bypasses the sampler's async D2H worker.")
+        return self
+
     def get_executor_config(
         self,
         _hf_model_dir: Optional[Path] = None,
@@ -4355,6 +4497,7 @@ def update_llm_args_with_extra_dict(
         "moe_config": MoeConfig,
         "nvfp4_gemm_config": Nvfp4GemmConfig,
         "attention_dp_config": AttentionDpConfig,
+        "reorder_policy_config": ReorderRequestPolicyConfig,
         "kv_cache_config": KvCacheConfig,
         "dwdp_config": DwdpConfig,
         "telemetry_config": TelemetryConfig,

@@ -10,9 +10,9 @@ from tensorrt_llm.llmapi.disagg_utils import RouterConfig
 from tensorrt_llm.serve.openai_protocol import (ChatCompletionRequest,
                                                 CompletionRequest,
                                                 DisaggregatedParams)
-from tensorrt_llm.serve.router import (ConversationRouter, KvCacheAwareRouter,
-                                       LoadBalancingRouter, RoundRobinRouter,
-                                       create_router)
+from tensorrt_llm.serve.router import (BlockHashMixin, ConversationRouter,
+                                       KvCacheAwareRouter, LoadBalancingRouter,
+                                       RoundRobinRouter, create_router)
 
 
 def _make_mock_aiohttp_session(return_value=None):
@@ -858,3 +858,34 @@ def test_create_router_conversation():
     router = create_router(RouterConfig(type="conversation"),
                            ["server1", "server2"])
     assert isinstance(router, ConversationRouter)
+
+
+def test_block_hash_mixin_routes_through_transformers_tokenizer():
+    """``BlockHashMixin._get_tokenizer`` must call ``TransformersTokenizer.from_pretrained``.
+
+    Routing through ``TransformersTokenizer`` is what lets block-hash KV-cache
+    routing inherit the post-load fixes (``maybe_fix_byte_level_tokenizer`` for
+    DeepSeek-V3 Metaspace, ``_fallback_to_fast_tokenizer`` for DeepSeek-V3.2
+    on transformers >= 5.x). Without this routing, ``trtllm-serve`` would
+    tokenize prompts differently from the rest of TRT-LLM when computing
+    block hashes for cache hits.
+    """
+
+    class _Probe(BlockHashMixin):
+        pass
+
+    probe = _Probe()
+    probe._init_block_hashing()
+
+    inner = mock.MagicMock()
+    wrapper = mock.MagicMock(tokenizer=inner)
+    with mock.patch(
+            "tensorrt_llm.tokenizer.TransformersTokenizer.from_pretrained",
+            return_value=wrapper) as routed:
+        out = probe._get_tokenizer("dummy/model")
+
+    routed.assert_called_once_with("dummy/model", trust_remote_code=True)
+    # The cached tokenizer must be the raw HF tokenizer used by _tokenize,
+    # not the TransformersTokenizer wrapper.
+    assert out is inner
+    assert probe._tokenizers["dummy/model"] is inner
