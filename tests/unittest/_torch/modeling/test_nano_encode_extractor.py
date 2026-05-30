@@ -241,3 +241,40 @@ class TestNanoVisionBucketAdapter:
         assert out.shape == (8, 4)
         torch.testing.assert_close(out[:5], emb0)
         torch.testing.assert_close(out[5:], emb1)
+
+
+class TestNanoAudioBucketAdapter:
+    def _make_model_stub(self, encode_audio_return):
+        model = MagicMock(spec=NemotronH_Nano_VL_V2)
+        model._encode_audio = MagicMock(return_value=encode_audio_return)
+        model._adapter_audio_bucket = NemotronH_Nano_VL_V2._adapter_audio_bucket.__get__(model)
+        return model
+
+    def test_list_return_normalization(self):
+        emb0 = torch.randn(4, 4)
+        emb1 = torch.randn(3, 4)
+        model = self._make_model_stub([(emb0, [4]), (emb1, [3])])
+        items = [
+            MultimodalItem(0, 0, "audio", 4, {"id": "a0"}),
+            MultimodalItem(1, 0, "audio", 3, {"id": "a1"}),
+        ]
+        out = model._adapter_audio_bucket(items, [object(), object()])
+        assert out.shape == (7, 4)
+        torch.testing.assert_close(out[:4], emb0)
+        torch.testing.assert_close(out[4:], emb1)
+
+    def test_scalar_tensor_return_normalization(self):
+        emb = torch.randn(4, 4)
+        model = self._make_model_stub(emb)
+        items = [MultimodalItem(0, 0, "audio", 4, {"id": "a0"})]
+        out = model._adapter_audio_bucket(items, [object()])
+        torch.testing.assert_close(out, emb)
+
+    def test_unexpected_shape_raises_typeerror(self):
+        model = self._make_model_stub("garbage")
+        items = [
+            MultimodalItem(0, 0, "audio", 4, {"id": "a0"}),
+            MultimodalItem(1, 0, "audio", 3, {"id": "a1"}),
+        ]
+        with pytest.raises(TypeError, match="must return a list"):
+            model._adapter_audio_bucket(items, [object(), object()])

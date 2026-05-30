@@ -3514,6 +3514,30 @@ class NemotronH_Nano_VL_V2(transformers.PreTrainedModel):
                     ] = item_num_tokens
         return torch.cat(embs, dim=0)
 
+    def _adapter_audio_bucket(
+        self,
+        items: List[MultimodalItem],
+        multimodal_params: List[MultimodalParams],
+    ) -> torch.Tensor:
+        """Run the audio encoder on one bucket of audio items.
+
+        Normalizes the legacy `_encode_audio` scalar-vs-list return into a
+        single cat'd tensor of shape (sum_token_counts, H) in bucket order.
+        Items in the bucket may be a mix of standalone audio
+        (`item_idx_in_param >= 0`) and ghost audio extracted from video
+        (`item_idx_in_param == -1`). Non-ghost items appear first in bucket
+        order per the extractor's contract.
+        """
+        payloads = [item.payload for item in items]
+        encoded = self._encode_audio(payloads)
+        if isinstance(encoded, list):
+            return torch.cat([t for t, _ in encoded], dim=0)
+        if len(items) == 1 and isinstance(encoded, torch.Tensor):
+            return encoded
+        raise TypeError(
+            "_encode_audio must return a list of (embeddings, counts) for batched audio inputs"
+        )
+
     @staticmethod
     def _build_single_modality_param(
         item: MultimodalItem,
