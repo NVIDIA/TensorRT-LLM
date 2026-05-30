@@ -3700,11 +3700,16 @@ class PyExecutor:
 
     @nvtx_range("_check_disagg_gen_transfer_status")
     def _check_disagg_gen_transfer_status(self):
-
-        need_check = any([
-            req.is_disagg_generation_transmission_in_progress
-            for req in self.active_requests
-        ])
+        # The downstream C++ checkGenTransferStatus runs a cross-rank
+        # gatherRequestIds collective on the gen-side comm. Any
+        # rank-asymmetric gate here (e.g. the previous "if need_check"
+        # predicate, which reads rank-local LlmRequest state from
+        # self.active_requests) causes ABBA deadlock against the next
+        # unconditional collective on the same ranks (helix CI #39529
+        # hang). All gen-side ranks must enter this call together, so
+        # the gate is intentionally absent. at_least_num is rank-local
+        # and only affects the per-request loop behavior inside the C++
+        # function (blockAll vs polling), which is safe to diverge.
         non_gen_first_reqs = [
             req for req in self.active_requests
             if req.py_disaggregated_params and req.py_disaggregated_params.
@@ -3713,10 +3718,8 @@ class PyExecutor:
         need_check_one = bool(non_gen_first_reqs) and all(
             req.is_disagg_generation_transmission_in_progress
             for req in non_gen_first_reqs)
-
-        if need_check:
-            at_least_num = 1 if need_check_one else 0
-            self._check_disagg_gen_cache_transfer_status(at_least_num)
+        at_least_num = 1 if need_check_one else 0
+        self._check_disagg_gen_cache_transfer_status(at_least_num)
 
         return
 
@@ -3868,8 +3871,16 @@ class PyExecutor:
                         resource_mgr_type].prepare_resources(
                             disagg_gen_init_to_prepare)
 
-            # Trigger KV cache exchange for new disagg_gen_init_requests
-            self._recv_disagg_gen_cache(fitting_disagg_gen_init_requests)
+        # Always trigger _recv_disagg_gen_cache, even when this rank has no
+        # newly fitting disagg-gen-init requests. The downstream C++
+        # checkGenTransferStatus runs a cross-rank gatherRequestIds
+        # collective on the gen-side comm; skipping it on ranks with no
+        # local work creates the rank-asymmetric entry that produces an
+        # ABBA deadlock with the next unconditional collective on the
+        # same ranks.
+        # _recv_disagg_gen_cache handles the empty-input case as a no-op
+        # for the receive work while still entering the collective.
+        self._recv_disagg_gen_cache(fitting_disagg_gen_init_requests)
 
     @nvtx_range("_prepare_disagg_gen_transmission_complete")
     def _prepare_disagg_gen_transmission_complete(self, scheduled_batch):
