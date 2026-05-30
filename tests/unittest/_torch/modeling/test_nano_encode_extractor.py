@@ -27,8 +27,17 @@ from tensorrt_llm._torch.models.modeling_nemotron_nano import (
     NemotronH_Nano_VL_V2,
     _nano_extract_items,
 )
-from tensorrt_llm._torch.models.multimodal_encoding import MultimodalItem
+from tensorrt_llm._torch.models.multimodal_encoding import EncodingPlan, MultimodalItem
 from tensorrt_llm.inputs.multimodal import MultimodalParams
+
+
+def _identity_extractor(items_by_param):
+    """Test helper: yield pre-built MultimodalItems passed in by-param."""
+
+    def extract(param_idx, _param):
+        yield from items_by_param.get(param_idx, [])
+
+    return extract
 
 
 def _make_param(multimodal_data: dict) -> MultimodalParams:
@@ -278,3 +287,87 @@ class TestNanoAudioBucketAdapter:
         ]
         with pytest.raises(TypeError, match="must return a list"):
             model._adapter_audio_bucket(items, [object(), object()])
+
+
+class TestNanoPostEncode:
+    """Tests for ``_nano_post_encode``: video-audio interleave + ghost-audio bucket truncation.
+
+    After per-modality encoders run, this hook reassembles the video
+    bucket to its POST-interleave row count and trims the ghost audio
+    rows from the audio bucket so the scatter assembly sees only the
+    non-ghost portion.
+    """
+
+    def _make_model_stub(self, interleave_fn):
+        model = MagicMock(spec=NemotronH_Nano_VL_V2)
+        model._interleave_video_audio_embeddings = interleave_fn
+        model._nano_post_encode = NemotronH_Nano_VL_V2._nano_post_encode.__get__(model)
+        return model
+
+    def test_no_video_bucket_noop(self):
+        # If no video modality, post_encode is a no-op
+        items_by_param = {0: [MultimodalItem(0, 0, "image", 5, {"num_tokens": 5})]}
+        params = [_make_param({"image": {"num_tokens": 5}, "modality_type": "image"})]
+        plan = EncodingPlan.from_params(
+            multimodal_params=params,
+            extract=_identity_extractor(items_by_param),
+        )
+        bucket_outputs = {"image": torch.ones((5, 4))}
+        model = self._make_model_stub(lambda *a, **kw: None)
+        model._nano_post_encode(bucket_outputs, plan, params)
+        assert bucket_outputs["image"].shape == (5, 4)
+
+    def test_video_with_audio_interleaved(self):
+        # One param: video with embedded audio
+        # video_item: post-interleave 9 tokens; ghost audio: 4 tokens
+        # Pre-interleave video rows = post-interleave (9) - audio (4) = 5
+        audio_payload = {"num_tokens": 4, "has_audio": [True], "audio_num_clips": torch.tensor([1])}
+        video_payload = {"num_tokens": 5, "audio": audio_payload, "video_size": []}
+        video_item = MultimodalItem(0, 0, "video", 9, video_payload)
+        audio_item = MultimodalItem(
+            0,
+            -1,
+            "audio",
+            4,
+            audio_payload,
+            metadata={"paired_video_item_idx": 0},
+        )
+        items_by_param = {0: [video_item, audio_item]}
+        params = [_make_param({"video": video_payload, "modality_type": "video"})]
+        plan = EncodingPlan.from_params(
+            multimodal_params=params,
+            extract=_identity_extractor(items_by_param),
+        )
+
+        # Pre-interleave video bucket has 5 rows; audio bucket has 4 rows (all ghost)
+        video_bucket = torch.ones((5, 4))
+        audio_bucket = torch.ones((4, 4)) * 2.0
+
+        # Fake interleave: concatenate v|a -> 9 rows
+        def fake_interleave(video_emb, audio_emb, *args, **kwargs):
+            return torch.cat([video_emb, audio_emb], dim=0)
+
+        model = self._make_model_stub(fake_interleave)
+
+        bucket_outputs = {"video": video_bucket, "audio": audio_bucket}
+        model._nano_post_encode(bucket_outputs, plan, params)
+
+        # Video bucket grew to post-interleave shape (9)
+        assert bucket_outputs["video"].shape == (9, 4)
+        # Audio bucket truncated to 0 rows (only ghost present)
+        assert bucket_outputs["audio"].shape == (0, 4)
+
+    def test_standalone_audio_preserved(self):
+        # One param with a standalone audio item (no video, no pairing)
+        items_by_param = {
+            0: [MultimodalItem(0, 0, "audio", 4, {"num_tokens": 4})],
+        }
+        params = [_make_param({"audio": {"num_tokens": 4}, "modality_type": "audio"})]
+        plan = EncodingPlan.from_params(
+            multimodal_params=params,
+            extract=_identity_extractor(items_by_param),
+        )
+        bucket_outputs = {"audio": torch.ones((4, 4))}
+        model = self._make_model_stub(lambda *a, **kw: None)
+        model._nano_post_encode(bucket_outputs, plan, params)
+        assert bucket_outputs["audio"].shape == (4, 4)

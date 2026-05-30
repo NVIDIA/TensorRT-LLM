@@ -48,7 +48,7 @@ from .modeling_multimodal_utils import (
 from .modeling_parakeet import ParakeetExtractor, ProjectedParakeet
 from .modeling_radio import RADIOVisionModel, calc_seq_lens
 from .modeling_utils import register_auto_model
-from .multimodal_encoding import MultimodalItem
+from .multimodal_encoding import EncodingPlan, MultimodalItem
 
 # Set max_num_tiles to 1 for video modality, to match the training behavior.
 VIDEO_MAX_NUM_TILES = 1
@@ -446,6 +446,34 @@ def _nano_payload_token_count(payload: Dict[str, Any]) -> int:
             "per-item token count for encoding plan."
         )
     return int(num_tokens)
+
+
+def _nano_per_clip_audio_counts(audio_payload: Dict[str, Any]) -> List[int]:
+    """Re-derive per-clip audio token counts from a Nano audio payload.
+
+    Used by `_nano_post_encode` to reconstruct the `per_clip_audio_counts`
+    argument for `_interleave_video_audio_embeddings` without having to
+    plumb counts through the audio adapter (which currently discards them
+    in favor of a flat cat'd tensor).
+
+    The total audio rows for the payload (`num_tokens`) are distributed
+    across `audio_num_clips` clips as evenly as possible; any remainder is
+    placed in the leading clips. For single-clip audio this is exact; for
+    multi-clip the per-clip split is only an approximation and a more
+    precise per-clip-count source should be threaded through if downstream
+    code becomes sensitive to the exact split.
+    """
+    total = _nano_payload_token_count(audio_payload)
+    raw_num_clips = audio_payload.get("audio_num_clips", 0)
+    if isinstance(raw_num_clips, torch.Tensor):
+        n_clips = int(raw_num_clips.sum().item())
+    else:
+        n_clips = int(raw_num_clips)
+    if n_clips == 0:
+        return []
+    per = total // n_clips
+    rem = total - per * n_clips
+    return [per + 1 if i < rem else per for i in range(n_clips)]
 
 
 def _nano_item_token_count(modality: str, payload: Dict[str, Any]) -> int:
@@ -3537,6 +3565,96 @@ class NemotronH_Nano_VL_V2(transformers.PreTrainedModel):
         raise TypeError(
             "_encode_audio must return a list of (embeddings, counts) for batched audio inputs"
         )
+
+    def _nano_post_encode(
+        self,
+        bucket_outputs: Dict[str, torch.Tensor],
+        plan: EncodingPlan,
+        multimodal_params: List[MultimodalParams],
+    ) -> None:
+        """Interleave paired video-audio rows; truncate ghost-audio bucket rows.
+
+        Walks `plan._modality_slots["video"]` in bucket order. For each
+        video item that has a paired ghost audio item (same
+        `src_param_idx`, with `item_idx_in_param == -1` in the audio
+        bucket), slice the matching rows out of `bucket_outputs["video"]`
+        (PRE-interleave) and `bucket_outputs["audio"]` (ghost portion),
+        call `self._interleave_video_audio_embeddings`, and emit the
+        result. After all videos are processed, replace
+        `bucket_outputs["video"]` with the assembled POST-interleave
+        tensor and truncate `bucket_outputs["audio"]` to drop ghost rows
+        (extractor convention: non-ghost items come first in bucket
+        order).
+
+        No-op if no video bucket is present.
+        """
+        if "video" not in bucket_outputs:
+            return
+
+        video_slots = plan._modality_slots["video"].tolist()
+
+        # Index ghost audio items by source param idx.
+        ghost_audio_by_param: Dict[int, Tuple[int, Dict[str, Any]]] = {}
+        if "audio" in bucket_outputs:
+            audio_slots = plan._modality_slots["audio"].tolist()
+            for slot_pos, flat_idx in enumerate(audio_slots):
+                item = plan.items[flat_idx]
+                if item.item_idx_in_param == -1:
+                    ghost_audio_by_param[item.src_param_idx] = (
+                        slot_pos,
+                        item.payload,
+                    )
+
+        # Build new video bucket by walking video items in bucket order.
+        # Each video item consumes its PRE-interleave rows from the
+        # original video bucket; if it has a paired ghost audio item,
+        # its rows are interleaved in to produce the POST-interleave
+        # chunk for that video.
+        new_video_chunks: List[torch.Tensor] = []
+        video_cursor = 0
+        audio_offsets_t = plan._bucket_offsets.get("audio")
+        for flat_idx in video_slots:
+            item = plan.items[flat_idx]
+            payload = item.payload
+            pre_interleave_count = _nano_payload_token_count(payload)
+            video_chunk = bucket_outputs["video"][
+                video_cursor : video_cursor + pre_interleave_count
+            ]
+            video_cursor += pre_interleave_count
+
+            ghost = ghost_audio_by_param.get(item.src_param_idx)
+            if ghost is not None and audio_offsets_t is not None:
+                ghost_slot_pos, audio_data = ghost
+                audio_start = int(audio_offsets_t[ghost_slot_pos].item())
+                audio_end = int(audio_offsets_t[ghost_slot_pos + 1].item())
+                audio_chunk = bucket_outputs["audio"][audio_start:audio_end]
+                per_clip = _nano_per_clip_audio_counts(audio_data)
+                src = multimodal_params[item.src_param_idx]
+                src_mm_data = src.multimodal_data or {}
+                video_chunk = self._interleave_video_audio_embeddings(
+                    video_chunk,
+                    audio_chunk,
+                    per_clip,
+                    has_audio=audio_data.get("has_audio", []),
+                    audio_num_clips=audio_data.get("audio_num_clips"),
+                    video_sizes=payload.get("video_size", []),
+                    evs_num_tokens=src_mm_data.get("num_tokens_in_video"),
+                )
+            new_video_chunks.append(video_chunk)
+
+        if new_video_chunks:
+            bucket_outputs["video"] = torch.cat(new_video_chunks, dim=0)
+
+        # Truncate audio bucket to drop ghost rows. Non-ghost items come
+        # first in bucket order per the extractor's contract, so summing
+        # non-ghost token counts gives the prefix length to retain.
+        if "audio" in bucket_outputs:
+            n_non_ghost_rows = sum(
+                plan.items[fi].token_count
+                for fi in plan._modality_slots["audio"].tolist()
+                if plan.items[fi].item_idx_in_param != -1
+            )
+            bucket_outputs["audio"] = bucket_outputs["audio"][:n_non_ghost_rows]
 
     @staticmethod
     def _build_single_modality_param(
