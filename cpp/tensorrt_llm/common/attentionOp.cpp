@@ -3096,7 +3096,11 @@ int AttentionOp::initialize() noexcept
                 mDecoderFMHARunner.reset(new FusedMHARunnerV2(fmhaParams));
 
                 // Only deepseek must using fmha in the generation phase when flash mla is not enabled.
-                if (!mUseGenFlashMLA)
+                // On SM120 with MLA generation, the actual execution path is XQA (mEnableXQA was
+                // set earlier in this scope for SM120+MLA), so a missing fmha_v2 generation kernel
+                // is fine — the XQA mla_sm120 kernel handles decode. Skip the assert in that case.
+                bool const sm120MlaXqaWillHandleIt = (mSM == kSM_120) && mEnableXQA;
+                if (!mUseGenFlashMLA && !sm120MlaXqaWillHandleIt)
                 {
                     TLLM_CHECK_WITH_INFO(mDecoderFMHARunner->isFmhaSupported(),
                         "Deepseek should be supported by fmha in generation part.");
