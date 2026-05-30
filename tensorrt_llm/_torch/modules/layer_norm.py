@@ -99,6 +99,28 @@ class LayerNorm(nn.Module):
             if not (100 <= sm_version < 120):
                 self.is_nvfp4 = False
 
+    @staticmethod
+    def _validate_adaln_pair(
+        scale_msa: Optional[torch.Tensor],
+        shift_msa: Optional[torch.Tensor],
+    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+        """Enforce that AdaLN modulation is provided as a pair.
+
+        The fused kernel binding (``cpp/tensorrt_llm/thop/fusedLayerNormQuant.cpp``)
+        TORCH_CHECKs that ``scale_msa.has_value() == shift_msa.has_value()``.
+        The historical unfused path silently treated one-sided inputs as
+        "modulation absent", which would diverge from the fused path on
+        non-SM100 GPUs or when no ``nvfp4_scale`` is attached. Centralize
+        the contract here so both paths see identical semantics.
+        """
+        if (scale_msa is None) != (shift_msa is None):
+            raise ValueError(
+                "scale_msa and shift_msa must be provided together "
+                "(both None or both tensors); got "
+                f"scale_msa={'tensor' if scale_msa is not None else 'None'}, "
+                f"shift_msa={'tensor' if shift_msa is not None else 'None'}.")
+        return scale_msa, shift_msa
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -135,6 +157,10 @@ class LayerNorm(nn.Module):
             - ``Tuple[torch.Tensor, torch.Tensor]`` (with residual): normalized
               output and the input+residual sum.
         """
+        # Centralized pair validation so the unfused fallback sees the same
+        # AdaLN contract the fused kernel enforces (see _validate_adaln_pair).
+        scale_msa, shift_msa = self._validate_adaln_pair(scale_msa, shift_msa)
+
         # Fused NVFP4 fast path. Triggered only when:
         #   1. nvfp4 quant is enabled and supported on this GPU,
         #   2. an `nvfp4_scale` has been attached to this module,

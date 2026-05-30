@@ -292,6 +292,13 @@ def test_fused_gelu_tanh_quantize(m, n, dtype):
 
     assert fp4_fused.shape == (m, n // 2)
     assert sf_fused.shape == sf_separate.shape
+    # The swizzled scale-factor tensor is consumed by the downstream NVFP4
+    # GEMM. A buggy SF write would still let the FP4-byte match-rate pass
+    # but corrupt dequantization in the GEMM epilogue; compare it explicitly.
+    assert torch.equal(sf_fused, sf_separate), (
+        "Swizzled scale-factor tensors diverge between fused_gelu_tanh_quantize "
+        "and the activation-then-fp4_quantize reference path."
+    )
 
     match_rate = (fp4_fused == fp4_separate).float().mean().item()
     assert match_rate >= 0.99, (
@@ -369,3 +376,64 @@ def test_mlp_uses_fused_gelu_tanh_quant_on_static_nvfp4():
     mlp_relu2.create_weights()
     assert mlp_relu2._use_fused_gelu_tanh_quant is False
     assert mlp_relu2._use_fused_relu2_quant is True
+
+
+@pytest.mark.parametrize(
+    "activation_sentinel, helper_name",
+    [
+        (_gelu_tanh_sentinel, "_fused_gelu_tanh_quant"),
+        (_relu2_sentinel, "_fused_relu2_quant"),
+    ],
+    ids=["gelu_tanh", "relu2"],
+)
+@skip_unless_fused_gelu_tanh_and_fp4_quantize
+def test_fused_helpers_preserve_3d_prefix_dims(activation_sentinel, helper_name):
+    """Regression test for the B>1 shape-preservation contract that the
+    PR #14773 review (CodeRabbit comment) flagged.
+
+    The fused activation+quant helpers in `MLP` flatten ``x`` to 2D before the
+    kernel call. Without re-inflating the packed FP4 output back to the
+    input rank, ``NVFP4LinearMethod.apply`` would only restore the original
+    shape on a torch.Tensor input (3D plain tensor), not on the
+    ``Fp4QuantizedTensor`` it actually receives here -- because the unflatten
+    branch in ``linear.py`` keys off ``fp4_tensor.dim() > 2``. With a 2D
+    return, the downstream ``down_proj`` would silently flatten ``[B, S, H]``
+    to ``[B*S, H]``; broadcasting in the residual add then only happens to
+    work when B==1 (the prior integration-test regime).
+
+    Verifies the fix preserves the prefix dims for B>1.
+    """
+    torch.manual_seed(0)
+    device = torch.device("cuda")
+    batch_size, seq_len = 2, 4
+
+    mlp = _build_nvfp4_mlp(activation=activation_sentinel, force_dynamic_quantization=False)
+    mlp.create_weights()
+    mlp = mlp.to(device=device)
+
+    # _build_nvfp4_mlp leaves down_proj.input_scale as the uninitialized
+    # placeholder Parameter from NVFP4LinearMethod.create_weights. Populate
+    # it with a real scalar so the kernel call doesn't read garbage; the
+    # actual value is irrelevant for a shape-only assertion.
+    with torch.no_grad():
+        mlp.down_proj.input_scale.copy_(torch.tensor([1.0 / 6.0], device=device))
+
+    helper = getattr(mlp, helper_name)
+    # Mirror the path the MLP forward takes: helper consumes the `up_proj`
+    # output shape, which is [B, S, intermediate_size]. The intermediate
+    # size is 256 in _build_nvfp4_mlp, but it doesn't matter for the shape
+    # assertion; the helper writes back to hidden_size via down_proj.
+    x_3d = torch.randn(
+        batch_size, seq_len, mlp.intermediate_size, dtype=torch.bfloat16, device=device
+    )
+    quant_out = helper(x_3d)
+
+    assert quant_out.fp4_tensor.dim() == 3, (
+        f"{helper_name} flattened a 3D input to {quant_out.fp4_tensor.shape}; "
+        "downstream NVFP4LinearMethod.apply will silently collapse batch dims."
+    )
+    assert quant_out.fp4_tensor.shape == (
+        batch_size,
+        seq_len,
+        mlp.intermediate_size // 2,
+    ), f"unexpected packed-FP4 shape {tuple(quant_out.fp4_tensor.shape)}"

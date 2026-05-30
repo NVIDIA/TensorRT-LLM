@@ -43,15 +43,8 @@ A/B kill switch (off-by-default fusion):
 """
 
 import fnmatch
-import os
-
-os.environ.setdefault("TLLM_DISABLE_MPI", "1")
-# Enable the LayerNorm fusion path for this test; the production default is
-# off (TRTLLM_DISABLE_NVFP4_LAYERNORM_FUSION=1) so that mainline behavior is
-# unchanged until benchmarks gate it on.
-os.environ.setdefault("TRTLLM_DISABLE_NVFP4_LAYERNORM_FUSION", "0")
-
 import gc
+import os
 from pathlib import Path
 
 import pytest
@@ -64,6 +57,40 @@ from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig, VisualGe
 from tensorrt_llm._torch.visual_gen.models.wan.transformer_wan import WanTransformer3DModel
 from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.quantization import QuantAlgo
+
+
+# Note: previously these two env vars were set at module import time via
+# os.environ.setdefault(...). That leaked into any pytest session that
+# happened to collect this file (even if all tests in it skipped) and could
+# silently flip global toggles for unrelated tests. The autouse fixture
+# below scopes the modifications to this module and restores the original
+# values on teardown. Both env vars are read at function-call time (not at
+# import) by tensorrt_llm._utils.mpi_disabled and by the _ln_quant_type
+# helper in transformer_wan.py, so installing them via the fixture is
+# sufficient even though the trtllm imports above already ran.
+# See PR #14773 review feedback.
+@pytest.fixture(scope="module", autouse=True)
+def _wan22_fusion_test_env():
+    """Module-scoped env-var toggle for the fusion integration suite.
+
+    - TLLM_DISABLE_MPI=1 prevents the runtime from attempting MPI bring-up
+      in single-process test environments.
+    - TRTLLM_DISABLE_NVFP4_LAYERNORM_FUSION=0 overrides the production
+      default (off) so the LayerNorm fusion path is actually exercised.
+    """
+    keys = ("TLLM_DISABLE_MPI", "TRTLLM_DISABLE_NVFP4_LAYERNORM_FUSION")
+    previous = {k: os.environ.get(k) for k in keys}
+    os.environ["TLLM_DISABLE_MPI"] = "1"
+    os.environ["TRTLLM_DISABLE_NVFP4_LAYERNORM_FUSION"] = "0"
+    try:
+        yield
+    finally:
+        for k, v in previous.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
 
 # Wan 2.2 ModelOpt ``ignore`` patterns (mirrors transformer/config.json).
 # We assert that all blocks 0..2 + 37..39 stay BF16 and the corresponding
@@ -107,7 +134,12 @@ def _has_sm100() -> bool:
         return False
     try:
         sm = get_sm_version()
-    except Exception:
+    except RuntimeError:
+        # get_sm_version() raises RuntimeError when CUDA device query fails
+        # (e.g., driver not loaded). Per the TRT-LLM coding guideline that
+        # except clauses should be narrowed to expected errors, only swallow
+        # that specific failure; anything else (e.g., ImportError) should
+        # propagate so it isn't masked.
         return False
     return 100 <= sm < 120
 

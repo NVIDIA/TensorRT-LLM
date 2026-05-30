@@ -68,6 +68,7 @@ std::tuple<at::Tensor, at::Tensor> fused_layernorm_quantize(at::Tensor const& in
     CHECK_TH_CUDA(input);
     CHECK_CONTIGUOUS(input);
     CHECK_INPUT(sf_scale, torch::kFloat32);
+    TORCH_CHECK(sf_scale.numel() == 1, "sf_scale must contain exactly one element (got %ld).", sf_scale.numel());
 
     TORCH_CHECK(sf_vec_size == 16, "sf_vec_size must be 16 for NVFP4.");
 
@@ -75,6 +76,13 @@ std::tuple<at::Tensor, at::Tensor> fused_layernorm_quantize(at::Tensor const& in
     TORCH_CHECK(inputShape.size() == 2, "input should be 2D tensor [M, N].");
     int64_t const m = inputShape[0];
     int64_t const n = inputShape[1];
+    // v1 of the fused kernel hardcodes N=5120 (Wan 2.2 hidden_size); the
+    // launcher's kN_HARDCODED is baked into the kernel template. Enforce
+    // here so unsupported hidden sizes hit a clear TORCH_CHECK rather than
+    // a generic kernel assert.
+    int64_t constexpr kSupportedHiddenSize = 5120;
+    TORCH_CHECK(n == kSupportedHiddenSize,
+        "fused_layernorm_quantize v1 supports only N=%ld (Wan 2.2 hidden_size); got N=%ld.", kSupportedHiddenSize, n);
     TORCH_CHECK(n % sf_vec_size == 0, "N must be divisible by sf_vec_size (16).");
 
     bool const has_ln_affine = ln_weight.has_value() && ln_bias.has_value();
@@ -124,7 +132,12 @@ std::tuple<at::Tensor, at::Tensor> fused_layernorm_quantize(at::Tensor const& in
     at::Tensor output_sf = at::detail::empty_cuda({sfSize}, SF_DTYPE, input.device(), std::nullopt);
 
     auto stream = at::cuda::getCurrentCUDAStream(input.get_device());
-    static int const multiProcessorCount = tensorrt_llm::common::getMultiProcessorCount();
+    // Re-query SM count every call. Function-static caching is unsafe in
+    // multi-GPU processes: the first call latches whatever device the
+    // process happens to be on, then subsequent calls from other devices
+    // see a stale value (different B200 variants in the same node, MIG
+    // partitions, etc.).
+    int const multiProcessorCount = tensorrt_llm::common::getMultiProcessorCount();
 
 #define LAUNCH_FUSED_LAYERNORM_QUANT(T)                                                                                \
     do                                                                                                                 \

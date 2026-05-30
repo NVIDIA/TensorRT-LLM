@@ -154,6 +154,13 @@ class MLP(nn.Module):
         return x_down
 
     def _fused_relu2_quant(self, x: torch.Tensor) -> Fp4QuantizedTensor:
+        # Preserve the input rank so NVFP4LinearMethod.apply unflattens the
+        # GEMM output to (*x.shape[:-1], out_features). With the original
+        # 2D-only return, a [B, S, H] input came back from down_proj as
+        # [B*S, H] -- silently correct only when B=1. See linear.py's
+        # `isinstance(input, Fp4QuantizedTensor) and input.fp4_tensor.dim() > 2`
+        # branch for the unflatten side of this contract.
+        orig_shape = x.shape
         x_flat = x.view(-1, x.shape[-1])
 
         if not x_flat.is_contiguous():
@@ -165,6 +172,9 @@ class MLP(nn.Module):
         fp4_tensor, sf_tensor = torch.ops.trtllm.fused_relu2_quantize(
             x_flat, self.down_proj.input_scale, 16)
 
+        if len(orig_shape) > 2:
+            fp4_tensor = fp4_tensor.view(*orig_shape[:-1], orig_shape[-1] // 2)
+
         return Fp4QuantizedTensor(
             fp4_tensor=fp4_tensor,
             scaling_factor=sf_tensor,
@@ -172,6 +182,7 @@ class MLP(nn.Module):
         )
 
     def _fused_gelu_tanh_quant(self, x: torch.Tensor) -> Fp4QuantizedTensor:
+        orig_shape = x.shape
         x_flat = x.view(-1, x.shape[-1])
 
         if not x_flat.is_contiguous():
@@ -182,6 +193,9 @@ class MLP(nn.Module):
 
         fp4_tensor, sf_tensor = torch.ops.trtllm.fused_gelu_tanh_quantize(
             x_flat, self.down_proj.input_scale, 16)
+
+        if len(orig_shape) > 2:
+            fp4_tensor = fp4_tensor.view(*orig_shape[:-1], orig_shape[-1] // 2)
 
         return Fp4QuantizedTensor(
             fp4_tensor=fp4_tensor,

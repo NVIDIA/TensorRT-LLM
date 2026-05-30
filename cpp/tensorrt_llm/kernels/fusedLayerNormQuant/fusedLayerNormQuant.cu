@@ -361,8 +361,25 @@ void invokeFusedLayerNormQuant(FusedLayerNormQuantParams<T> const& params, int /
         params.N == kN_HARDCODED, "fusedLayerNormQuant v1 supports N=%d only (got %d).", kN_HARDCODED, params.N);
     TLLM_CHECK_WITH_INFO(
         !(params.has_ln_affine && params.has_modulation), "has_ln_affine and has_modulation are mutually exclusive.");
+
+    // Defensive pointer-presence checks. Mode-specific kernels dereference
+    // the corresponding tensors unconditionally; passing a null pointer to a
+    // kernel templated on HAS_LN_AFFINE / HAS_MODULATION = true would
+    // surface as an "illegal memory access" with no useful context. Catch
+    // mis-wired callers here instead.
+    TLLM_CHECK_WITH_INFO(params.x != nullptr, "input tensor (params.x) must not be null.");
+    TLLM_CHECK_WITH_INFO(params.y_fp4 != nullptr, "output tensor (params.y_fp4) must not be null.");
+    TLLM_CHECK_WITH_INFO(params.sf_out != nullptr, "scale-factor output (params.sf_out) must not be null.");
+    TLLM_CHECK_WITH_INFO(params.sf_scale != nullptr, "params.sf_scale must not be null.");
+    if (params.has_ln_affine)
+    {
+        TLLM_CHECK_WITH_INFO(params.ln_weight != nullptr && params.ln_bias != nullptr,
+            "ln_weight and ln_bias must be non-null when has_ln_affine=true.");
+    }
     if (params.has_modulation)
     {
+        TLLM_CHECK_WITH_INFO(params.scale_msa != nullptr && params.shift_msa != nullptr,
+            "scale_msa and shift_msa must be non-null when has_modulation=true.");
         TLLM_CHECK_WITH_INFO(
             params.seq_len_per_batch > 0, "seq_len_per_batch must be positive when has_modulation is true.");
         TLLM_CHECK_WITH_INFO(params.M % params.seq_len_per_batch == 0,

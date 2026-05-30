@@ -37,6 +37,7 @@ std::tuple<at::Tensor, at::Tensor> fused_relu2_quantize(
     CHECK_TH_CUDA(input);
     CHECK_CONTIGUOUS(input);
     CHECK_INPUT(sf_scale, torch::kFloat32);
+    TORCH_CHECK(sf_scale.numel() == 1, "sf_scale must contain exactly one element (got %ld).", sf_scale.numel());
 
     auto const& inputShape = input.sizes();
     TORCH_CHECK(inputShape.size() == 2, "input should be 2D tensor [M, N].");
@@ -85,6 +86,7 @@ std::tuple<at::Tensor, at::Tensor> fused_gelu_tanh_quantize(
     CHECK_TH_CUDA(input);
     CHECK_CONTIGUOUS(input);
     CHECK_INPUT(sf_scale, torch::kFloat32);
+    TORCH_CHECK(sf_scale.numel() == 1, "sf_scale must contain exactly one element (got %ld).", sf_scale.numel());
 
     auto const& inputShape = input.sizes();
     TORCH_CHECK(inputShape.size() == 2, "input should be 2D tensor [M, N].");
