@@ -541,16 +541,18 @@ def main():
     else:
         raise ValueError("Either --test-list or --config-file must be provided")
 
-    # Determine test_case_name (the bracketed pytest test id). When --test-list
-    # is provided it was already extracted above; for --config-file we mirror
-    # the same shape generate_pytest_command builds for test_list_content.
-    if not args.test_list:
-        if runtime_mode == "disaggregated":
-            test_case_name = f"disagg-{benchmark_mode}-{config_file_base_name}"
-        elif benchmark_mode == "ctx_only":
-            test_case_name = f"aggr-ctx_only-{config_file_base_name}"
-        else:
-            test_case_name = f"aggr-{config_file_base_name}-{select_pattern}"
+    # Always rebuild test_case_name from parsed components so it matches the
+    # pytest test id written into test_list.txt by generate_pytest_command
+    # (which strips the `_upload` prefix). Without this, when --test-list is
+    # supplied with the long form (e.g. `disagg_upload-...`), test_output_dir
+    # would carry `_upload` while test_perf_sanity.py creates its working dir
+    # under the stripped form — producing two divergent folders.
+    if runtime_mode == "disaggregated":
+        test_case_name = f"disagg-{benchmark_mode}-{config_file_base_name}"
+    elif benchmark_mode == "ctx_only":
+        test_case_name = f"aggr-ctx_only-{config_file_base_name}"
+    else:
+        test_case_name = f"aggr-{config_file_base_name}-{select_pattern}"
 
     # Load config if not already loaded
     if not args.config_file:
