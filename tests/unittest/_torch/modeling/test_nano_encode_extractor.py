@@ -269,6 +269,59 @@ class TestNanoExtractorProductionSchema:
         with pytest.raises(KeyError, match="Cannot resolve per-item token count"):
             list(_nano_extract_items(0, param))
 
+    def test_pure_multi_image_uses_per_param_total_not_first_slot(self):
+        # Regression for the dynamic-resolution MMMU failure: a SINGLE
+        # pure-image param holding TWO images. Production preprocessing
+        # populates per-slot ``multimodal_embedding_lengths`` ([682, 357])
+        # AND ``multimodal_item_order`` even for a pure-image request. The
+        # Nano vision encoder, however, emits ONE per-request tensor that
+        # concatenates BOTH images = 682 + 357 = 1039 rows
+        # (== total_embeds_in_request). The extractor must therefore size the
+        # image item by the per-param total (1039), NOT the first slot's
+        # per-slot length (682) — otherwise the encode-plan bucket assertion
+        # `encoder_rows == encoder output` fires (1039 != 682).
+        payload = {"pixel_values": "fake"}  # multi-image payload (no num_tokens)
+        param = _make_param_with_runtime(
+            {
+                "image": payload,
+                "modality_type": "image",  # single distinct modality
+                "multimodal_item_order": [
+                    {"modality": "image", "index": 0},
+                    {"modality": "image", "index": 1},
+                ],
+                "multimodal_embedding_lengths": [682, 357],  # per-slot, sums to 1039
+            },
+            total_embeds=1039,  # per-param total = encoder output
+        )
+        items = list(_nano_extract_items(0, param))
+        assert len(items) == 1
+        item = items[0]
+        assert item.modality == "image"
+        # fuse-correct: matches encoder output + placeholder positions, NOT 682
+        assert item.token_count == 1039
+        assert item.encoder_rows == 1039
+        assert item.item_idx_in_param == 0
+
+    def test_pure_single_image_with_stray_item_order_uses_total_embeds(self):
+        # A pure single-image param that happens to carry stray
+        # multimodal_item_order / multimodal_embedding_lengths whose single
+        # entry disagrees with total_embeds_in_request. The single-modality
+        # path must trust total_embeds_in_request (the encoder-output count).
+        payload = {"pixel_values": "fake"}
+        param = _make_param_with_runtime(
+            {
+                "image": payload,
+                "modality_type": "image",
+                "multimodal_item_order": [{"modality": "image", "index": 0}],
+                "multimodal_embedding_lengths": [512],  # stale / disagrees
+            },
+            total_embeds=777,
+        )
+        items = list(_nano_extract_items(0, param))
+        assert len(items) == 1
+        assert items[0].token_count == 777
+        assert items[0].encoder_rows == 777
+
 
 class TestNanoVisionBucketAdapter:
     """Tests for the vision-bucket encoder adapter on ``NemotronH_Nano_VL_V2``.

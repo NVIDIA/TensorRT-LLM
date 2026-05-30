@@ -465,14 +465,21 @@ def _nano_resolve_payload_token_counts(
     not carry a ``num_tokens`` field (test convention). Returns a mapping
     from ``(modality, idx_within_modality)`` → token_count, derived from:
 
-    1. **Mixed params** (``modality_type`` is a list): uses
-       ``multimodal_data["multimodal_item_order"]`` for the ordering and
-       ``multimodal_data["multimodal_embedding_lengths"]`` for per-item
-       counts.
-    2. **Pure single-modality params** (``modality_type`` is a string): if
-       the single modality has exactly one item, uses
-       ``param.multimodal_runtime.total_embeds_in_request`` as that one
-       item's count (the typical Nano shape).
+    1. **Multi-modality params** (more than one distinct modality present):
+       uses ``multimodal_data["multimodal_item_order"]`` for the ordering
+       and ``multimodal_data["multimodal_embedding_lengths"]`` for per-slot
+       counts. Each prompt-order slot becomes its own item.
+    2. **Single-modality params** (exactly one distinct modality, possibly
+       with multiple items — e.g. a multi-image MMMU request): uses
+       ``param.multimodal_runtime.total_embeds_in_request`` as the single
+       item's count. The Nano vision encoder emits one per-request tensor
+       spanning ALL of that modality's items concatenated, so the per-param
+       total is the authoritative encoder-output row count — NOT the
+       per-slot ``multimodal_embedding_lengths`` (which would only describe
+       the first slot and under-count multi-item requests). This mirrors the
+       pre-refactor ``_encode_multimodal`` single-modality path, which fed
+       the whole param to ``vision_encoder`` and split the cache by
+       ``total_embeds_in_request`` per param.
 
     Returns an empty dict if neither source is populated. Ghost audio
     items (audio embedded in a video payload) are not addressable through
@@ -482,6 +489,21 @@ def _nano_resolve_payload_token_counts(
     multimodal_data = param.multimodal_data or {}
     counts: Dict[Tuple[str, int], int] = {}
 
+    modality_types = list(dict.fromkeys(_get_modality_types(multimodal_data)))
+
+    # Single-modality param: the vision/audio encoder emits one per-request
+    # tensor covering every item of that modality, so the per-param total
+    # (`total_embeds_in_request`) is the encoder-output row count. Prefer it
+    # over per-slot `multimodal_embedding_lengths`, which under-counts a
+    # multi-item (e.g. multi-image) request to just its first slot.
+    if len(modality_types) == 1:
+        runtime = getattr(param, "multimodal_runtime", None)
+        total = getattr(runtime, "total_embeds_in_request", None)
+        if total is not None:
+            counts[(modality_types[0], 0)] = int(total)
+        return counts
+
+    # Multi-modality param: per-slot counts in prompt order.
     item_order = MMItemOrder.from_metadata(multimodal_data)
     embedding_lengths = multimodal_data.get("multimodal_embedding_lengths")
     if item_order is not None and embedding_lengths is not None:
@@ -493,17 +515,6 @@ def _nano_resolve_payload_token_counts(
             )
         for (modality, idx), length in zip(item_order, embedding_lengths, strict=True):
             counts[(modality, int(idx))] = int(length)
-        return counts
-
-    # Pure single-modality fallback: one item per present modality, use
-    # `total_embeds_in_request` from multimodal_runtime as that item's
-    # count. Only safe when there is exactly one modality with one item.
-    modality_types = list(dict.fromkeys(_get_modality_types(multimodal_data)))
-    if len(modality_types) == 1:
-        runtime = getattr(param, "multimodal_runtime", None)
-        total = getattr(runtime, "total_embeds_in_request", None)
-        if total is not None:
-            counts[(modality_types[0], 0)] = int(total)
     return counts
 
 
