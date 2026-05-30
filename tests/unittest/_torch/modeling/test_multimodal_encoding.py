@@ -118,3 +118,80 @@ class TestEncodingPlanPartition:
         assert plan._param_lengths.tolist() == [5]
         assert plan._modality_slots["audio"].tolist() == [1]
         assert plan._bucket_offsets["audio"].tolist() == [0, 4]
+
+
+class TestEncodingPlanDstIndices:
+    def test_pure_image_single_param(self):
+        items_by_param = {
+            0: [MultimodalItem(0, 0, "image", 5, {"id": "img_A"})],
+        }
+        plan = EncodingPlan.from_params(
+            multimodal_params=[object()],
+            extract=_identity_extractor(items_by_param),
+        )
+        assert plan._dst_indices["image"].tolist() == [0, 1, 2, 3, 4]
+
+    def test_mixed_image_audio(self):
+        # param 0: <image><audio><image>  -> img_A(5)@pos0, aud_A(4)@pos1, img_B(5)@pos2
+        # param 1: <image>                -> img_C(5)@pos0
+        # Final: [param 0 in MMItemOrder | param 1] = img_A | aud_A | img_B | img_C
+        items_by_param = {
+            0: [
+                MultimodalItem(0, 0, "image", 5, {"id": "img_A"}),
+                MultimodalItem(0, 1, "audio", 4, {"id": "aud_A"}),
+                MultimodalItem(0, 2, "image", 5, {"id": "img_B"}),
+            ],
+            1: [MultimodalItem(1, 0, "image", 5, {"id": "img_C"})],
+        }
+        plan = EncodingPlan.from_params(
+            multimodal_params=[object(), object()],
+            extract=_identity_extractor(items_by_param),
+        )
+        # Image bucket in append order: img_A, img_B, img_C
+        # img_A -> final[0:5], img_B -> final[9:14] (param0 start 0, after img_A(5)+aud_A(4))
+        # img_C -> final[14:19] (param1 start 14)
+        assert plan._dst_indices["image"].tolist() == [
+            0,
+            1,
+            2,
+            3,
+            4,  # img_A
+            9,
+            10,
+            11,
+            12,
+            13,  # img_B
+            14,
+            15,
+            16,
+            17,
+            18,  # img_C
+        ]
+        assert plan._dst_indices["audio"].tolist() == [5, 6, 7, 8]  # aud_A
+
+    def test_ghost_audio_excluded(self):
+        items_by_param = {
+            0: [
+                MultimodalItem(0, 0, "video", 5, {"id": "vid_A"}),
+                MultimodalItem(0, -1, "audio", 4, {"id": "vid_A.audio"}),
+            ],
+        }
+        plan = EncodingPlan.from_params(
+            multimodal_params=[object()],
+            extract=_identity_extractor(items_by_param),
+        )
+        assert plan._dst_indices["video"].tolist() == [0, 1, 2, 3, 4]
+        assert plan._dst_indices["audio"].numel() == 0
+
+    def test_duplicate_item_idx_raises(self):
+        items_by_param = {
+            0: [
+                MultimodalItem(0, 0, "image", 5, {"id": "x"}),
+                MultimodalItem(0, 0, "image", 5, {"id": "y"}),
+            ],
+        }
+        with pytest.raises(ValueError, match="duplicate item_idx_in_param"):
+            EncodingPlan.from_params(
+                multimodal_params=[object()],
+                extract=_identity_extractor(items_by_param),
+            )

@@ -89,6 +89,7 @@ class EncodingPlan:
         param_lengths: List[int] = [0] * len(multimodal_params)
         modality_slots: Dict[str, List[int]] = {}
         bucket_token_counts: Dict[str, List[int]] = {}
+        per_param_non_ghost: List[List[int]] = [[] for _ in multimodal_params]
 
         for param_idx, param in enumerate(multimodal_params):
             for item in extract(param_idx, param):
@@ -98,6 +99,16 @@ class EncodingPlan:
                 bucket_token_counts.setdefault(item.modality, []).append(item.token_count)
                 if item.item_idx_in_param != -1:
                     param_lengths[param_idx] += item.token_count
+                    per_param_non_ghost[param_idx].append(flat_idx)
+
+        # Validate non-ghost item_idx_in_param uniqueness per param
+        for param_idx, flat_idxs in enumerate(per_param_non_ghost):
+            seen = set()
+            for fi in flat_idxs:
+                pos = items[fi].item_idx_in_param
+                if pos in seen:
+                    raise ValueError(f"duplicate item_idx_in_param={pos} in param {param_idx}")
+                seen.add(pos)
 
         param_lengths_t = torch.tensor(param_lengths, dtype=torch.int64)
         if len(param_lengths) > 0:
@@ -111,6 +122,28 @@ class EncodingPlan:
             for m, counts in bucket_token_counts.items()
         }
 
+        # Compute within-param offsets by MMItemOrder rank for non-ghost items
+        within_param_offsets: Dict[int, int] = {}
+        for flat_idxs in per_param_non_ghost:
+            sorted_idxs = sorted(flat_idxs, key=lambda fi: items[fi].item_idx_in_param)
+            running = 0
+            for fi in sorted_idxs:
+                within_param_offsets[fi] = running
+                running += items[fi].token_count
+
+        # Build _dst_indices[m]: walk bucket order, emit row ranges for non-ghost items
+        dst_indices_t: Dict[str, torch.Tensor] = {}
+        param_offsets_list = param_offsets_t.tolist()
+        for modality, slot_indices in modality_slots.items():
+            rows: List[int] = []
+            for fi in slot_indices:
+                item = items[fi]
+                if item.item_idx_in_param == -1:
+                    continue
+                start = param_offsets_list[item.src_param_idx] + within_param_offsets[fi]
+                rows.extend(range(start, start + item.token_count))
+            dst_indices_t[modality] = torch.tensor(rows, dtype=torch.int64)
+
         return cls(
             items=tuple(items),
             n_params=len(multimodal_params),
@@ -120,6 +153,7 @@ class EncodingPlan:
             _bucket_offsets=offsets_t,
             total_tokens=int(param_lengths_t.sum().item()) if len(param_lengths) > 0 else 0,
             active_modalities=list(modality_slots.keys()),
+            _dst_indices=dst_indices_t,
         )
 
 
