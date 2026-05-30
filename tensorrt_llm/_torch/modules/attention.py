@@ -2827,6 +2827,17 @@ class MLA(nn.Module):
         # latent and runs a causal softmax.
         if (get_sm_version() == 120 and self.is_deepseek_v4
                 and self._deepseek_v4_sm120_use_reference_context()):
+            # The reference attention computes the correct context output but never
+            # writes the paged (SWA) KV cache. Without that write, the first DECODE
+            # step reads garbage history and multi-token output degrades (token 1 is
+            # correct, token 2+ degenerates). Populate the cache here so decode has
+            # valid history. mla_rope_append_paged_kv_assign_q writes latent_cache
+            # (K/V, FP8-quantized when the KV cache is fp8) and ropes q IN PLACE; pass
+            # a clone so the reference path can apply its own rope to the original q
+            # without double-roping. (q is not itself cached by this op.)
+            if latent_cache is not None:
+                self.mqa.mla_rope_append_paged_kv_assign_q(
+                    q.clone(), latent_cache, attn_metadata)
             return self._deepseek_v4_sm120_reference_context(
                 q, compressed_kv, k_pe, attn_metadata, output, position_ids)
 

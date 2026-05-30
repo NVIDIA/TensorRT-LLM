@@ -609,6 +609,15 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
             cached_token_lens[:num_requests], non_blocking=True
         )
 
+        # SM120 DSV4 uses the pure-torch REF_CONTEXT path, which calls the
+        # standalone mla_rope_append_paged_kv_assign_q to populate the paged
+        # (SWA) KV cache so DECODE has valid history. That op needs the context
+        # rope-append metadata (max_ctx_seq_len, ctx_cached_token_indptr,
+        # ctx_kv_indptr); the normal DSV4 path writes KV inside the C++ attention
+        # op and so skips this prep. Prepare it here so the REF_CONTEXT write works.
+        if get_sm_version() == 120:
+            self.prepare_for_mla_rope_append(cached_token_lens, kv_lens)
+
         # Prepare cu_seq_lens early — needed by prepare_for_deepseek_v4_indices
         self.cu_seq_lens[1 : num_requests + 1] = self.seq_lens.cumsum(0)
         self.cu_seq_lens_cuda[: num_requests + 1].copy_(
