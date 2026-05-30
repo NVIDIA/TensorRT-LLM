@@ -102,7 +102,7 @@ class Gemma3InputProcessor(BaseMultimodalInputProcessor,
         return input_ids, pixel_values
 
     @torch.inference_mode()
-    def __call__(
+    def call_with_text_prompt(
         self, inputs: TextPrompt, sampling_params: SamplingParams
     ) -> Tuple[List[int], Optional[ExtraProcessedInputs]]:
         input_ids, pixel_values = self._preprocess(inputs)
