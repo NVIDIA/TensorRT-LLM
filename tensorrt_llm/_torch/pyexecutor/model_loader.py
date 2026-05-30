@@ -487,10 +487,7 @@ class ModelLoader:
                 checkpoint_dir=checkpoint_dir,
                 weights_preloaded=weights_preloaded)
 
-            for module in model.modules():
-                if hasattr(module, 'post_load_weights') and not getattr(
-                        module, '_weights_removed', False):
-                    module.post_load_weights()
+            self._walk_full_post_load(model)
 
             if isinstance(moe_load_balancer, MoeLoadBalancer):
                 moe_load_balancer.register_weight_slots_after_to_cuda()
@@ -502,10 +499,126 @@ class ModelLoader:
 
         return model, moe_load_balancer
 
+    @staticmethod
+    def _setup_aliases(model: DecoderModelForCausalLM) -> None:
+        """Run top-level structural alias setup if the model defines it.
+
+        Alias wiring is a model-level concern. It is intentionally not a
+        recursive module walk, because migrated aliases are expected to be set
+        by the root model that owns the layer graph.
+
+        Args:
+            model: Root decoder model whose top-level alias hook should run.
+
+        Returns:
+            None.
+        """
+        setup_aliases: Optional[Callable[[], None]] = getattr(
+            model, 'setup_aliases', None)
+        if setup_aliases is not None:
+            setup_aliases()
+
+    @staticmethod
+    def _walk_transform(model: DecoderModelForCausalLM) -> None:
+        """Run one-shot weight transforms on eligible modules.
+
+        The walk is duck-typed so modules can opt in without inheriting a shared
+        base class. Modules whose weights were removed are skipped, and modules
+        already marked ``_weights_transformed`` are left untouched until an
+        orchestrator resets the flag after rebinding fresh weight bytes.
+
+        Args:
+            model: Root decoder model whose module tree should be visited.
+
+        Returns:
+            None.
+        """
+        for module in model.modules():
+            transform_weights: Optional[Callable[[], None]] = getattr(
+                module, 'transform_weights', None)
+            if transform_weights is not None and not getattr(
+                    module, '_weights_removed', False) and not getattr(
+                        module, '_weights_transformed', False):
+                transform_weights()
+
+    @staticmethod
+    def _walk_cache_state(model: DecoderModelForCausalLM) -> None:
+        """Recompute derived Python-side state on eligible modules.
+
+        This walk is separate from weight transforms so callers that already
+        have transformed weight bytes can refresh local Python state without
+        mutating tensor layouts again.
+
+        Args:
+            model: Root decoder model whose module tree should be visited.
+
+        Returns:
+            None.
+        """
+        for module in model.modules():
+            cache_derived_state: Optional[Callable[[], None]] = getattr(
+                module, 'cache_derived_state', None)
+            if cache_derived_state is not None and not getattr(
+                    module, '_weights_removed', False):
+                cache_derived_state()
+
+    @staticmethod
+    def _walk_full_post_load(model: DecoderModelForCausalLM) -> None:
+        """Run the backward-compatible post-load hook on eligible modules.
+
+        This preserves the previous ``ModelLoader`` behavior for standard load
+        paths while staged-hook migration proceeds incrementally.
+
+        Args:
+            model: Root decoder model whose module tree should be visited.
+
+        Returns:
+            None.
+        """
+        for module in model.modules():
+            post_load_weights: Optional[Callable[[], None]] = getattr(
+                module, 'post_load_weights', None)
+            if post_load_weights is not None and not getattr(
+                    module, '_weights_removed', False):
+                post_load_weights()
+
+    @staticmethod
+    def _reset_weights_transformed(model: DecoderModelForCausalLM) -> None:
+        """Mark transformed modules as needing a new transform pass.
+
+        Orchestrators call this before rebinding fresh, untransformed weights.
+        The reset only touches modules that already carry the flag so unrelated
+        modules do not grow staged-hook state eagerly.
+
+        Args:
+            model: Root decoder model whose module tree should be visited.
+
+        Returns:
+            None.
+        """
+        for module in model.modules():
+            if hasattr(module, '_weights_transformed'):
+                module._weights_transformed = False
+
     def reload(self,
                model: DecoderModelForCausalLM,
                weights: dict,
-               allow_partial_loading: bool = False):
+               allow_partial_loading: bool = False) -> None:
+        """Reload model weights without running post-load hooks.
+
+        Reload is used by incremental update paths that may provide only a
+        partial set of replacement weights. The owner of the update lifecycle is
+        responsible for running post-load processing once all bytes are present.
+
+        Args:
+            model: Model instance receiving the replacement weights.
+            weights: Checkpoint weights to pass to ``model.load_weights``.
+            allow_partial_loading: Whether missing replacement weights are
+                allowed by models that support partial loading.
+
+        Returns:
+            None.
+        """
         self._call_load_weights(model.load_weights,
                                 weights,
                                 self.weight_mapper,
