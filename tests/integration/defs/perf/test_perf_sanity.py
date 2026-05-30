@@ -1167,16 +1167,16 @@ class DisaggTestCmds(NamedTuple):
             server_logs.append(
                 os.path.join(self.test_output_dir, f"trtllm-serve.CTX_{i}.{server_idx}.log")
             )
-            server_logs.append(os.path.join(self.output_dir, f"ctx_server_{i}.log"))
+            server_logs.append(os.path.join(self.test_output_dir, f"ctx_server_{i}.log"))
         for i in range(self.num_gen_servers):
             server_logs.append(
                 os.path.join(self.test_output_dir, f"trtllm-serve.GEN_{i}.{server_idx}.log")
             )
-            server_logs.append(os.path.join(self.output_dir, f"gen_server_{i}.log"))
+            server_logs.append(os.path.join(self.test_output_dir, f"gen_server_{i}.log"))
         server_logs.append(
             os.path.join(self.test_output_dir, f"trtllm-serve.DISAGG_SERVER.{server_idx}.log")
         )
-        server_logs.append(os.path.join(self.output_dir, "disagg_server.log"))
+        server_logs.append(os.path.join(self.test_output_dir, "disagg_server.log"))
         return server_logs
 
     @staticmethod
@@ -1297,7 +1297,7 @@ class DisaggTestCmds(NamedTuple):
                         # Snapshot gen_server log sizes so the per-client
                         # average covers only iterations driven by this client.
                         gen_log_start_offsets = gen_worker_log_sizes(
-                            self.output_dir, self.num_gen_servers
+                            self.test_output_dir, self.num_gen_servers
                         )
 
                         bench_env = copy.deepcopy(os.environ)
@@ -1315,7 +1315,7 @@ class DisaggTestCmds(NamedTuple):
                         # Only gen_only emits prev_device_step_time; other
                         # modes yield None and we skip writing the line.
                         device_step_time_mean = parse_gen_worker_device_step_time(
-                            self.output_dir,
+                            self.test_output_dir,
                             self.num_gen_servers,
                             start_offsets=gen_log_start_offsets,
                         )
