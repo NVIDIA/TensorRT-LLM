@@ -25,6 +25,7 @@ from typing import List, Optional, Tuple
 
 import torch
 
+from tensorrt_llm._mnnvl_utils import MnnvlMemory
 from tensorrt_llm._torch.modules.fused_moe.deep_ep_utils import (
     buffer_pool,
     check_cuda_p2p_access,
@@ -116,14 +117,19 @@ class DeepEPLowLatency(Communication):
         """
         Check if DeepEP Low Latency is supported on the current platform.
 
-        Requires CUDA P2P access between all local GPUs (needed by NVSHMEM).
+        Requires a full NVLink fabric (``MnnvlMemory.supports_mnnvl()``) and
+        CUDA P2P access between all local GPUs.  NVSHMEM low-latency mode
+        falls back to IBGDA when intranode NVLink is incomplete; on hosts
+        without RDMA that fallback fatally exits the process during
+        ``Buffer`` construction (cuMemCreate failure on the symmetric heap),
+        bypassing the factory's try/except.
         """
         if not deep_ep_installed:
             return False
         # SM120/121 (RTX PRO 6000 Blackwell): no NVSwitch -> NVSHMEM-LL deadlocks.
         if get_sm_version() in (120, 121):
             return False
-        return check_cuda_p2p_access()
+        return MnnvlMemory.supports_mnnvl() and check_cuda_p2p_access()
 
     def supports_post_quant_dispatch(self) -> bool:
         """

@@ -1676,6 +1676,22 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
         num_extra_decoding_steps: int = 0,
         draft_kv_cache_manager: Optional[KVCacheManager] = None,
     ) -> List[LlmRequest]:
+        # CUDA graph warmup tries batch sizes from CudaGraphConfig.batch_sizes
+        # that may exceed the most-constrained window in the unified C++ KV
+        # pool.  ``model_engine._create_cuda_graph_warmup_request`` checks
+        # ``get_num_free_blocks``, which for hybrid mamba models reports the
+        # full-attention window only and ignores the recurrent-states window
+        # used by mamba layers; without this guard ``add_sequence_batch``
+        # raises "No free block found" out of the C++ side.  Return None for
+        # oversized batches so the caller skips that warmup batch (matching
+        # the ``if requests is None: return None`` contract at line 1385/1438
+        # in model_engine.py).
+        stats = self.impl.get_kv_cache_stats()
+        per_window_free = stats.num_free_blocks_per_window_size
+        if per_window_free:
+            min_free = min(per_window_free.values())
+            if len(request_ids) > min_free:
+                return None
         requests = super().add_dummy_requests(
             request_ids=request_ids,
             token_nums=token_nums,
