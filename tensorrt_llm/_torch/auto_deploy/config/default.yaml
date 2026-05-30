@@ -121,6 +121,18 @@ transforms:
   detect_hidden_states_for_capture:
     stage: pattern_matcher
     enabled: false
+  # Sharding pipeline (sharding IR is the default; legacy is the auto-fallback).
+  # `apply_sharding_hints` runs first; it self-detects the presence of
+  # `torch.ops.auto_deploy.all_reduce` markers and either consumes them or
+  # leaves the graph untouched. When it consumes them, it sets the meta flag
+  # `sharding_ir_applied` on the graph module, which `detect_sharding` and
+  # `sharding_transform_executor` honor by short-circuiting themselves. To
+  # force the legacy pipeline (e.g. for an IR-marked model whose port is
+  # known to be broken) use the `enable_legacy_sharding.yaml` override.
+  apply_sharding_hints:
+    stage: sharding
+    run_shape_prop: true
+    allreduce_strategy: NCCL
   detect_sharding:
     stage: sharding
     simple_shard_only: false
@@ -137,11 +149,6 @@ transforms:
   sharding_transform_executor:
     stage: sharding
     run_shape_prop: true
-  apply_sharding_hints:
-    enabled: false
-    stage: sharding
-    run_shape_prop: true
-    allreduce_strategy: NCCL
   ############################################################################################
   # MOVE MODEL AND LOAD WEIGHTS
   ############################################################################################

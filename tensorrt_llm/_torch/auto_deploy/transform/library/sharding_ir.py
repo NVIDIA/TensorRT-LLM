@@ -48,6 +48,7 @@ from ...utils.node_utils import (
     extract_weight_nodes,
     invalidate_weight_node_cache,
     is_any_lin_op,
+    is_op,
     set_op_args,
     shape,
 )
@@ -1039,6 +1040,27 @@ class StripShardingHints(BaseTransform):
         )
 
 
+def has_sharding_ir_markers(gm: GraphModule) -> bool:
+    """Whether the FX graph contains sharding-IR marker nodes.
+
+    The sharding-IR pipeline inserts ``torch.ops.auto_deploy.all_reduce`` nodes
+    in the modeling source (per ad-sharding-ir-port skill rule A3) to mark
+    rowwise-projection / MoE-merge points. Legacy ``detect_sharding`` never
+    emits this op (it inserts ``dist.all_reduce`` later), so the presence of
+    any such node is a sufficient signal that the modeling file was authored
+    against the sharding IR.
+
+    This is the marker the default-sharding dispatcher uses to decide between
+    the IR pipeline (``apply_sharding_hints``) and the legacy pipeline
+    (``detect_sharding`` + ``sharding_transform_executor``).
+    """
+    target = torch.ops.auto_deploy.all_reduce
+    for node in gm.graph.nodes:
+        if is_op(node, target):
+            return True
+    return False
+
+
 @TransformRegistry.register("apply_sharding_hints")
 class ApplyShardingHints(BaseTransform):
     """Deterministic, node-local sharding transform driven by hint kwargs.
@@ -1046,6 +1068,12 @@ class ApplyShardingHints(BaseTransform):
     Iterates graph nodes and applies sharding based on explicit hint arguments
     (tp_mode, tp_scaled_dim, tp_scale_sizes, etc.) together with the runtime
     DistConfig.  No cross-node propagation, no topology inference.
+
+    When the FX graph contains no sharding-IR markers (no
+    ``torch.ops.auto_deploy.all_reduce`` node), this transform is a no-op and
+    leaves the graph for the legacy ``detect_sharding`` pipeline. Otherwise it
+    sets ``gm.meta["sharding_ir_applied"] = True`` after applying, which
+    ``Sharding`` / ``ShardingTransformExecutor`` read to skip themselves.
     """
 
     config: IRShardingConfig
@@ -1080,6 +1108,19 @@ class ApplyShardingHints(BaseTransform):
         _log_sharding_prelude(dc)
 
         if shared_config.world_size < 2:
+            return gm, TransformInfo(
+                skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True
+            )
+
+        # Auto-detect dispatcher: if the FX graph contains no sharding-IR markers,
+        # this modeling file was not authored against the sharding IR. Skip and
+        # let the legacy detect_sharding pipeline handle it.
+        if not has_sharding_ir_markers(gm):
+            ad_logger.info(
+                "apply_sharding_hints: no sharding-IR markers in graph "
+                "(no torch.ops.auto_deploy.all_reduce node); deferring to legacy "
+                "detect_sharding pipeline."
+            )
             return gm, TransformInfo(
                 skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True
             )
@@ -1124,6 +1165,12 @@ class ApplyShardingHints(BaseTransform):
                         pass
 
             _log_sharding_result(dc, num_updates, num_skipped, shard_layers=shard_layers)
+
+        # Signal to the legacy detect_sharding pipeline that IR has handled this
+        # graph. Sharding (detect_sharding) and ShardingTransformExecutor read
+        # this flag and short-circuit themselves; without it they would re-shard
+        # the same nodes via the heuristic path.
+        gm.meta["sharding_ir_applied"] = True
 
         return gm, TransformInfo(
             skipped=False,

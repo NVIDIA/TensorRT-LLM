@@ -1188,6 +1188,19 @@ class Sharding(BaseTransform):
     ) -> Tuple[GraphModule, TransformInfo]:
         local_rank, world_size = shared_config.local_rank, shared_config.world_size
         assert isinstance(gm, GraphModule), "Expecting GraphModule"
+
+        # Honor the auto-detect dispatcher in apply_sharding_hints. When the
+        # IR pipeline has already sharded this graph, the legacy heuristic
+        # would either re-shard the same nodes or build a stale plan.
+        if gm.meta.get("sharding_ir_applied"):
+            ad_logger.info(
+                "detect_sharding: sharding IR already applied to this graph; "
+                "skipping legacy heuristic detection."
+            )
+            return gm, TransformInfo(
+                skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True
+            )
+
         _is_draft = getattr(gm, "is_draft", False)
         config = self.config
         config.factory_config = factory.get_sharding_config() if factory else {}
@@ -1309,6 +1322,19 @@ class ShardingTransformExecutor(BaseTransform):
         factory: ModelFactory,
         shared_config: SharedConfig,
     ) -> Tuple[GraphModule, TransformInfo]:
+        # Honor the auto-detect dispatcher: when apply_sharding_hints handled
+        # this graph, detect_sharding was skipped and no transform plan was
+        # built. Mirror that here so we don't attempt to read an absent
+        # _sharding_transform_container.
+        if gm.meta.get("sharding_ir_applied"):
+            ad_logger.info(
+                "sharding_transform_executor: sharding IR already applied; "
+                "no legacy plan to execute."
+            )
+            return gm, TransformInfo(
+                skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True
+            )
+
         # create a node dict for faster lookup
         node_dict = {n.name: n for n in gm.graph.nodes}
 
