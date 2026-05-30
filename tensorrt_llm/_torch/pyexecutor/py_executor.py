@@ -1884,20 +1884,15 @@ class PyExecutor:
                         and req.py_disaggregated_params.schedule_style ==
                         DisaggScheduleStyle.GENERATION_FIRST
                         for req in self.active_requests)
-                    # Rank-symmetric entry into _check_disagg_ctx_cache_transfer_status:
-                    # every ctx rank must call this so the C++ gatherRequestIds Allgather
-                    # inside it is reached symmetrically, else ABBA against the next
-                    # unconditional collective. at_least_num is rank-local; only the
-                    # entry must be symmetric.
-                    at_least_num = 0
-                    if (num_fitting_reqs == 0
-                            and not fitting_disagg_gen_init_requests
-                            and not all_gen_first):
-                        logger.warning(
-                            "num_fitting_reqs=0 and fitting_disagg_gen_init_requests is empty, may not have enough kvCache"
-                        )
-                        at_least_num = 1
-                    self._check_disagg_ctx_cache_transfer_status(at_least_num)
+                    if num_fitting_reqs == 0 and not fitting_disagg_gen_init_requests:
+                        if not all_gen_first:
+                            logger.warning(
+                                "num_fitting_reqs=0 and fitting_disagg_gen_init_requests is empty, may not have enough kvCache"
+                            )
+                            self._check_disagg_ctx_cache_transfer_status(1)
+                        elif self.async_transfer_manager.has_any_inflight_requests(
+                        ):
+                            self._check_disagg_ctx_cache_transfer_status(0)
 
                 self.num_scheduled_requests = scheduled_batch.batch_size
 
@@ -2432,15 +2427,14 @@ class PyExecutor:
                 req.py_disaggregated_params and req.py_disaggregated_params.
                 schedule_style == DisaggScheduleStyle.GENERATION_FIRST
                 for req in self.active_requests)
-            # Rank-symmetric entry; see _executor_loop_pp for rationale.
-            at_least_num = 0
-            if (num_fitting_reqs == 0 and not fitting_disagg_gen_init_requests
-                    and not all_gen_first):
-                logger.warning(
-                    "num_fitting_reqs=0 and fitting_disagg_gen_init_requests is empty, may not have enough kvCache"
-                )
-                at_least_num = 1
-            self._check_disagg_ctx_cache_transfer_status(at_least_num)
+            if num_fitting_reqs == 0 and not fitting_disagg_gen_init_requests:
+                if not all_gen_first:
+                    logger.warning(
+                        "num_fitting_reqs=0 and fitting_disagg_gen_init_requests is empty, may not have enough kvCache"
+                    )
+                    self._check_disagg_ctx_cache_transfer_status(1)
+                elif self.async_transfer_manager.has_any_inflight_requests():
+                    self._check_disagg_ctx_cache_transfer_status(0)
 
             # In gen-only benchmark mode, all requests must fit in KV cache
             # simultaneously because generation requests do not release their
@@ -3681,9 +3675,11 @@ class PyExecutor:
 
     @nvtx_range("_check_disagg_gen_transfer_status")
     def _check_disagg_gen_transfer_status(self):
-        # Entered unconditionally so the C++ gatherRequestIds Allgather inside
-        # checkGenTransferStatus is reached by every gen rank. at_least_num is
-        # rank-local; only the entry must be symmetric.
+
+        need_check = any([
+            req.is_disagg_generation_transmission_in_progress
+            for req in self.active_requests
+        ])
         non_gen_first_reqs = [
             req for req in self.active_requests
             if req.py_disaggregated_params and req.py_disaggregated_params.
@@ -3692,8 +3688,10 @@ class PyExecutor:
         need_check_one = bool(non_gen_first_reqs) and all(
             req.is_disagg_generation_transmission_in_progress
             for req in non_gen_first_reqs)
-        at_least_num = 1 if need_check_one else 0
-        self._check_disagg_gen_cache_transfer_status(at_least_num)
+
+        if need_check:
+            at_least_num = 1 if need_check_one else 0
+            self._check_disagg_gen_cache_transfer_status(at_least_num)
 
         return
 
@@ -3845,10 +3843,8 @@ class PyExecutor:
                         resource_mgr_type].prepare_resources(
                             disagg_gen_init_to_prepare)
 
-        # Unconditional call: every gen rank must reach _recv_disagg_gen_cache
-        # so the downstream gatherRequestIds Allgather is entered symmetrically.
-        # Empty-input case is a no-op for the receive work.
-        self._recv_disagg_gen_cache(fitting_disagg_gen_init_requests)
+            # Trigger KV cache exchange for new disagg_gen_init_requests
+            self._recv_disagg_gen_cache(fitting_disagg_gen_init_requests)
 
     @nvtx_range("_prepare_disagg_gen_transmission_complete")
     def _prepare_disagg_gen_transmission_complete(self, scheduled_batch):
