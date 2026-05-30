@@ -273,7 +273,7 @@ trtllmGenContextPreprocess(torch::Tensor qkv_input, torch::Tensor workspace, tor
     TORCH_CHECK(host_kv_cache_pool_mapping.has_value(), "host_kv_cache_pool_mapping is required.");
     TORCH_CHECK(kv_cache_block_offsets.has_value(), "kv_cache_block_offsets is required.");
 
-    bool const separateQKvOutput = paged_context_fmha;
+    bool const separateQKvOutput = paged_context_fmha || fp8_context_fmha;
     auto const qkvScalarType = qkv_input.scalar_type();
     auto const qkvElementSize = static_cast<size_t>(qkv_input.element_size());
     auto const quantMode = tensorrt_llm::common::QuantMode(static_cast<uint32_t>(kv_cache_quant_mode));
@@ -385,7 +385,7 @@ trtllmGenContextPreprocess(torch::Tensor qkv_input, torch::Tensor workspace, tor
         qkvParams.position_embedding_type = static_cast<PositionEmbeddingType>(position_embedding_type);
         qkvParams.position_shift_enabled = false;
         qkvParams.cache_type = cacheTypeFromQuantMode(quantMode);
-        qkvParams.separate_q_kv_output = paged_context_fmha;
+        qkvParams.separate_q_kv_output = separateQKvOutput;
         qkvParams.quantized_fp8_output = fp8_context_fmha;
         qkvParams.generation_phase = false;
         qkvParams.multi_processor_count = static_cast<int>(multi_processor_count);
@@ -463,6 +463,7 @@ void trtllmGenContextPostprocess(torch::Tensor qkv_input, torch::Tensor workspac
     auto const qkvScalarType = qkv_input.scalar_type();
     auto const qkvElementSize = static_cast<size_t>(qkv_input.element_size());
     auto const quantMode = tensorrt_llm::common::QuantMode(static_cast<uint32_t>(kv_cache_quant_mode));
+    bool const separateQKvOutput = paged_context_fmha || fp8_context_fmha;
     auto const ptrs = [&]
     {
         auto const layout = TrtllmAttentionWorkspaceManager::buildContextLayout(
@@ -530,7 +531,7 @@ void trtllmGenContextPostprocess(torch::Tensor qkv_input, torch::Tensor workspac
         qkvParams.position_embedding_type = static_cast<PositionEmbeddingType>(position_embedding_type);
         qkvParams.position_shift_enabled = false;
         qkvParams.cache_type = cacheTypeFromQuantMode(quantMode);
-        qkvParams.separate_q_kv_output = paged_context_fmha;
+        qkvParams.separate_q_kv_output = separateQKvOutput;
         qkvParams.quantized_fp8_output = fp8_context_fmha;
         qkvParams.generation_phase = false;
         qkvParams.multi_processor_count = static_cast<int>(multi_processor_count);

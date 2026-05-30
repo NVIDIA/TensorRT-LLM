@@ -74,8 +74,8 @@ nb::tuple trtllmGenContextPreprocessBinding(torch::Tensor qkv_input, torch::Tens
     }();
 
     return nb::make_tuple(std::get<0>(result), optionalToObject(std::get<1>(result)),
-    optionalToObject(std::get<2>(result)), optionalToObject(std::get<3>(result)),
-    optionalToObject(std::get<4>(result)), optionalToObject(std::get<5>(result)), std::get<6>(result),
+        optionalToObject(std::get<2>(result)), optionalToObject(std::get<3>(result)),
+        optionalToObject(std::get<4>(result)), optionalToObject(std::get<5>(result)), std::get<6>(result),
         std::get<7>(result), std::get<8>(result), std::get<9>(result), std::get<10>(result), std::get<11>(result));
 }
 
@@ -306,7 +306,7 @@ void initBindings(nb::module_& m)
                 auto const mapping = torch_ext::readKvCachePoolMapping(host_kv_cache_pool_mapping, layer_idx);
                 blockTables = kv_cache_block_offsets.select(0, mapping.poolIndex).narrow(0, batch_start, batch_size);
             }
-            return nb::make_tuple(nb::cast(kvPool), nb::cast(blockTables), optionalTensorToObject(kvScalePool));
+            return nb::make_tuple(nb::cast(kvPool), nb::cast(blockTables), optionalToObject(kvScalePool));
         },
         nb::arg("host_kv_cache_pool_pointers"), nb::arg("host_kv_cache_pool_mapping"),
         nb::arg("kv_cache_block_offsets"), nb::arg("layer_idx"), nb::arg("num_kv_heads"), nb::arg("tokens_per_block"),

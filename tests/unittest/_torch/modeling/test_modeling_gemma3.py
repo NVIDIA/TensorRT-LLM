@@ -18,6 +18,7 @@ from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.checkpoints.hf.gemma3_weight_mapper import \
     Gemma3HfWeightMapper
 from tensorrt_llm._torch.models.modeling_gemma3 import Gemma3ForCausalLM
+from tensorrt_llm._torch.models.modeling_gemma3vl import Gemma3VLM
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm.bindings.executor import KvCacheConfig
 from tensorrt_llm.mapping import Mapping
@@ -105,6 +106,23 @@ class Scenario:
 
 
 class TestGemma3(unittest.TestCase):
+
+    def test_gemma3_vlm_defaults_to_flashinfer(self):
+        defaults = Gemma3VLM.get_model_defaults(None)
+        self.assertEqual(defaults["attn_backend"], "FLASHINFER")
+
+    def test_gemma3_vlm_text_subconfig_keeps_parent_attention_backend(self):
+        gemma3_config = Gemma3Config.from_dict(deepcopy(GEMMA3_27B_CONFIG))
+        model_config = ModelConfig(pretrained_config=gemma3_config,
+                                   attn_backend="TRTLLM")
+
+        text_config = Gemma3VLM.get_sub_model_config(model_config,
+                                                     "text_config")
+        vision_config = Gemma3VLM.get_sub_model_config(model_config,
+                                                       "vision_config")
+
+        self.assertEqual(text_config.attn_backend, "TRTLLM")
+        self.assertEqual(vision_config.attn_backend, "TRTLLM")
 
     def get_kv_cache_manager(self, dtype: torch.dtype, config: Gemma3TextConfig,
                              tokens_per_block: int, max_seq_len: int,

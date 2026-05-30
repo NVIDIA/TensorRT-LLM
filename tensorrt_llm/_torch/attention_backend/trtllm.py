@@ -29,7 +29,7 @@ from .interface import (AttentionBackend, AttentionForwardArgs,
 # Enable TRTLLM-Gen attention backend by default. Set
 # TRTLLM_ENABLE_TRTLLM_GEN_ATTENTION=0 to force the thop.attention path.
 _TRTLLM_ENABLE_TRTLLM_GEN_ATTENTION = (os.environ.get(
-    "TRTLLM_ENABLE_TRTLLM_GEN_ATTENTION", "0") == "1")
+    "TRTLLM_ENABLE_TRTLLM_GEN_ATTENTION", "1") == "1")
 
 # ``AttentionForwardArgs`` fields that this backend does not consume.
 # Sync test (test_attention_op_sync.py) requires every other field to map to a
@@ -1511,11 +1511,6 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             assert metadata.num_generations == 0
             assert metadata.kv_cache_manager is None
             assert metadata.num_contexts == metadata.num_seqs
-
-        helix_active = metadata.helix_position_offsets is not None
-        use_sage_attn = (forward_args.sage_attn_num_elts_per_blk_q > 0
-                         or forward_args.sage_attn_num_elts_per_blk_k > 0
-                         or forward_args.sage_attn_num_elts_per_blk_v > 0)
 
         use_trtllm_gen = False
         if _TRTLLM_ENABLE_TRTLLM_GEN_ATTENTION:

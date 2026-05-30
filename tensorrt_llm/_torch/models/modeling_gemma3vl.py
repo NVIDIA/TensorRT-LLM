@@ -184,6 +184,14 @@ class Gemma3MultiModalProjector(torch.nn.Module):
     ))
 class Gemma3VLM(PreTrainedModel):
 
+    @classmethod
+    def get_model_defaults(cls, llm_args) -> dict:
+        # Gemma3 VLM image requests need FlashInfer for custom bidirectional
+        # image-token masks. Explicit user overrides still take precedence.
+        return {
+            "attn_backend": "FLASHINFER",
+        }
+
     def __init__(self, model_config: ModelConfig[Gemma3Config]):
         if _is_disagg():
             raise NotImplementedError(
@@ -225,7 +233,7 @@ class Gemma3VLM(PreTrainedModel):
         name: str,
     ) -> ModelConfig:
         # Extract the subconfig from the `transformers` config and create a copy of the
-        # `ModelConfig` class with the subconfig and preferred backend updated.
+        # `ModelConfig` class with the subconfig updated.
         assert name in [
             "text_config", "vision_config"
         ], f"Expected subconfig name to be either 'text_config' or 'vision_config'. Got {name} instead."
@@ -233,8 +241,10 @@ class Gemma3VLM(PreTrainedModel):
         # ModelOpt currently doesn't quantize the vision part. Without setting quant config to None,
         # weight loading fails for vision.
         quant_config = model_config.quant_config if name == "text_config" else None
-        # FlashInfer backend supports custom mask which is needed for bidirectional mask in decoder.
-        preferred_backend = "FLASHINFER" if name == "text_config" else "TRTLLM"
+        # Keep the text backend aligned with the executor metadata backend.
+        # The class default above selects FlashInfer for normal VLM usage, while
+        # explicit text-only runs can still request TRTLLM.
+        preferred_backend = model_config.attn_backend if name == "text_config" else "TRTLLM"
         sub_model_config: ModelConfig[Gemma3Config] = dataclasses.replace(
             model_config,
             pretrained_config=pretrained_config,
