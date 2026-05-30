@@ -2566,6 +2566,219 @@ class MLA(nn.Module):
                                 attn_metadata.num_ctx_tokens)
         return effective_len <= self.short_seq_mha_threshold
 
+    @staticmethod
+    def _deepseek_v4_sm120_env_flag(name: str, default: bool) -> bool:
+        value = os.environ.get(name)
+        if value is None:
+            return default
+        return value.strip().lower() not in ("0", "false", "no", "off")
+
+    def _deepseek_v4_sm120_use_reference_context(self) -> bool:
+        """Gate for the SM120 DSV4 reference (pure-PyTorch) context path.
+
+        Enabled by default; set TRTLLM_DSV4_SM120_REF_CONTEXT=0 to opt out.
+        """
+        return self._deepseek_v4_sm120_env_flag(
+            "TRTLLM_DSV4_SM120_REF_CONTEXT", True)
+
+    def _deepseek_v4_sm120_reference_attn_sink(
+            self, device: torch.device) -> Optional[torch.Tensor]:
+        """Source the optional per-head attention sink for the reference softmax.
+
+        DSV4 loads the sink onto ``self.mqa.attn_sink`` (or ``self.attn_sink``)
+        as a TP-sharded fp32 parameter. Returns None when no sink is present.
+        """
+        sink = getattr(getattr(self, "mqa", None), "attn_sink", None)
+        if sink is None:
+            sink = getattr(self, "attn_sink", None)
+        if sink is None:
+            return None
+        if isinstance(sink, torch.nn.Parameter):
+            sink = sink.data
+        sink = sink.reshape(-1)
+        if sink.numel() == self.num_heads_tp:
+            local_sink = sink
+        elif sink.numel() == self.num_heads:
+            tp_rank = int(getattr(self.mapping, "tp_rank", 0) or 0)
+            start = tp_rank * self.num_heads_tp
+            local_sink = sink[start:start + self.num_heads_tp]
+        else:
+            raise RuntimeError(
+                "DeepSeek-V4 SM120 reference attention expected attn_sink "
+                f"with {self.num_heads_tp} local or {self.num_heads} global "
+                f"values, got {sink.numel()}.")
+        return local_sink.to(device=device, dtype=torch.float32)
+
+    def _deepseek_v4_sm120_apply_rope_from_table(
+        self,
+        q: torch.Tensor,
+        k_pe: torch.Tensor,
+        position_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        """Apply RoPE to q_pe and k_pe from the rope table.
+
+        Used only when ``self.apply_rotary_emb`` is False (rope-fused path),
+        where q/k_pe are not yet rotated when they reach the context call.
+        """
+        q_view = q.view(-1, self.num_heads_tp, self.qk_head_dim)
+        q_pe = q_view[..., self.qk_nope_head_dim:].reshape(
+            -1, self.num_heads_tp * self.qk_rope_head_dim)
+
+        rotary = self.rotary_emb
+        if rotary is None:
+            rotary = getattr(self, "inverse_rotary_emb", None)
+        if rotary is None:
+            raise RuntimeError(
+                "DeepSeek-V4 SM120 reference context needs a RoPE table.")
+        is_neox = rotary.is_neox
+        cos_sin = rotary.rotary_cos_sin[position_ids.view(-1)]
+        cos = cos_sin[:, 0, :].to(dtype=q.dtype).unsqueeze(0)
+        sin = cos_sin[:, 1, :].to(dtype=q.dtype).unsqueeze(0)
+
+        def rope_target(target: torch.Tensor) -> torch.Tensor:
+            seq_len = target.shape[0]
+            target = target.view(1, seq_len, -1,
+                                 self.qk_rope_head_dim).transpose(1, 2)
+            target = RotaryEmbedding.apply_rotary_pos_emb(target,
+                                                          cos,
+                                                          sin,
+                                                          is_neox=is_neox)
+            return target.transpose(1, 2).contiguous().view(seq_len, -1)
+
+        q_pe = rope_target(q_pe)
+        q_view[..., self.qk_nope_head_dim:] = q_pe.view(
+            -1, self.num_heads_tp, self.qk_rope_head_dim)
+        k_pe = rope_target(k_pe)
+        return k_pe
+
+    def _deepseek_v4_materialize_context_kv(
+        self,
+        q: torch.Tensor,
+        compressed_kv: torch.Tensor,
+        k_pe: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Materialize explicit per-head K/V directly from the latent.
+
+        DSV4's DeepseekV4Attention has no kv_b_proj; K is the compressed_kv
+        latent broadcast across heads concatenated with the (rope'd) k_pe, and
+        V is the same latent (v_head_dim == kv_lora_rank) or the full head when
+        v_head_dim == qk_head_dim.
+        """
+        assert self.is_deepseek_v4
+        if self.mapping.has_cp_helix():
+            raise RuntimeError(
+                "DeepSeek-V4 + CP Helix is not supported for SM120 dense "
+                "context fallback.")
+        if self.kv_lora_rank != self.qk_nope_head_dim:
+            raise RuntimeError(
+                "DeepSeek-V4 SM120 dense context fallback expects "
+                f"kv_lora_rank == qk_nope_head_dim, got "
+                f"{self.kv_lora_rank}, {self.qk_nope_head_dim}.")
+
+        num_tokens = compressed_kv.shape[0]
+        kv = compressed_kv.contiguous().view(num_tokens, 1, self.kv_lora_rank)
+        kv_heads = kv.expand(-1, self.num_heads_tp, -1).contiguous()
+        k_pe_heads = k_pe.contiguous().view(
+            num_tokens, 1,
+            self.qk_rope_head_dim).expand(-1, self.num_heads_tp,
+                                          -1).contiguous()
+        k = torch.cat((kv_heads, k_pe_heads), dim=-1).contiguous().view(
+            num_tokens, self.num_heads_tp * self.qk_head_dim)
+
+        if self.v_head_dim == self.kv_lora_rank:
+            v_heads = kv_heads
+        elif self.v_head_dim == self.qk_head_dim:
+            v_heads = torch.cat((kv_heads, k_pe_heads), dim=-1).contiguous()
+        else:
+            raise RuntimeError(
+                "DeepSeek-V4 SM120 dense context fallback expects v_head_dim "
+                f"to be kv_lora_rank ({self.kv_lora_rank}) or qk_head_dim "
+                f"({self.qk_head_dim}), got {self.v_head_dim}.")
+        v = v_heads.view(num_tokens, self.num_heads_tp * self.v_head_dim)
+        return k, v
+
+    def _deepseek_v4_sm120_reference_context(
+        self,
+        q: torch.Tensor,
+        compressed_kv: torch.Tensor,
+        k_pe: torch.Tensor,
+        attn_metadata: AttentionMetadata,
+        output: torch.Tensor,
+        position_ids: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """SM120 DSV4 reference context attention (pure PyTorch).
+
+        Bypasses the absorbed-MLA context FMHA (no SM120 kernel for D=512/
+        DV=448). Materializes K/V from the latent and runs a per-head causal
+        softmax in fp32, writing into ``output``.
+        """
+        # When rope is fused into the kernel (apply_rotary_emb is False), q and
+        # k_pe are not yet rotated; apply rope here. When apply_rotary_emb is
+        # True, the caller (forward_dsa_attn) already rope'd them.
+        if not self.apply_rotary_emb:
+            assert position_ids is not None
+            k_pe = self._deepseek_v4_sm120_apply_rope_from_table(
+                q, k_pe, position_ids)
+
+        k, v = self._deepseek_v4_materialize_context_kv(q, compressed_kv, k_pe)
+
+        num_heads = self.num_heads_tp
+        q_heads = q.view(q.shape[0], num_heads,
+                         self.qk_head_dim).transpose(0, 1).float()
+        k_heads = k.view(k.shape[0], num_heads,
+                         self.qk_head_dim).transpose(0, 1).float()
+        v_heads = v.view(v.shape[0], num_heads,
+                         self.v_head_dim).transpose(0, 1).float()
+        out_heads = torch.empty(
+            (num_heads, q.shape[0], self.v_head_dim),
+            dtype=torch.float32,
+            device=q.device,
+        )
+        attn_sink = self._deepseek_v4_sm120_reference_attn_sink(q.device)
+
+        lengths = None
+        seq_lens = getattr(attn_metadata, "seq_lens", None)
+        num_contexts = int(getattr(attn_metadata, "num_contexts", 0) or 0)
+        if isinstance(seq_lens, torch.Tensor) and not seq_lens.is_cuda:
+            lengths = [int(x) for x in seq_lens[:num_contexts].tolist()]
+        if not lengths or sum(lengths) != q.shape[0]:
+            lengths = [q.shape[0]]
+
+        # DeepseekV4Attention has no self.q_scaling; reuse the module's own
+        # precomputed softmax scale = 1/(sqrt(qk_head_dim) * q_scaling).
+        scale = self.softmax_scale
+
+        offset = 0
+        for seq_len in lengths:
+            q_seq = q_heads[:, offset:offset + seq_len, :]
+            k_seq = k_heads[:, offset:offset + seq_len, :]
+            v_seq = v_heads[:, offset:offset + seq_len, :]
+            scores = torch.matmul(q_seq, k_seq.transpose(-2, -1)) * scale
+            causal_mask = torch.ones(
+                (seq_len, seq_len),
+                dtype=torch.bool,
+                device=q.device,
+            ).triu(1)
+            scores = scores.masked_fill(causal_mask, float("-inf"))
+            if attn_sink is None:
+                probs = torch.softmax(scores, dim=-1)
+            else:
+                sink = attn_sink.view(num_heads, 1, 1)
+                max_scores = torch.maximum(
+                    scores.max(dim=-1, keepdim=True).values, sink)
+                exp_scores = torch.exp(scores - max_scores)
+                denom = exp_scores.sum(dim=-1, keepdim=True) + torch.exp(
+                    sink - max_scores)
+                probs = exp_scores / denom
+            out_heads[:, offset:offset + seq_len, :] = torch.matmul(
+                probs, v_seq)
+            offset += seq_len
+
+        ref_output = out_heads.transpose(0, 1).contiguous().view(
+            q.shape[0], num_heads * self.v_head_dim).to(dtype=q.dtype)
+        output.copy_(ref_output)
+        return output
+
     def forward_context_sparse_mla(
         self,
         q: torch.Tensor,
@@ -2606,6 +2819,16 @@ class MLA(nn.Module):
         if self._should_use_short_mha(attn_metadata, position_ids):
             return self.forward_context(q, compressed_kv, k_pe, position_ids,
                                         attn_metadata, output, latent_cache)
+
+        # SM120 (RTX PRO 6000) lacks an absorbed-MLA context FMHA kernel for
+        # DSV4's D=512/DV=448 dims; forward_absorption_context aborts with
+        # "SEPARATE_Q_K_V requires valid K and V pointers". Fall back to a pure
+        # PyTorch reference context attention that materializes K/V from the
+        # latent and runs a causal softmax.
+        if (get_sm_version() == 120 and self.is_deepseek_v4
+                and self._deepseek_v4_sm120_use_reference_context()):
+            return self._deepseek_v4_sm120_reference_context(
+                q, compressed_kv, k_pe, attn_metadata, output, position_ids)
 
         if get_sm_version() >= 100:
             return self.forward_absorption_context(q,
