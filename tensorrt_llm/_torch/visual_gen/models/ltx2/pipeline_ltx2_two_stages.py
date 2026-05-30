@@ -39,6 +39,7 @@ from .pipeline_ltx2 import LTX2Pipeline, _assert_resolution, _find_safetensors_f
 
 STAGE_2_DISTILLED_SIGMA_VALUES = [0.909375, 0.725, 0.421875, 0.0]
 _FP8_DTYPES = (torch.float8_e4m3fn, torch.float8_e5m2)
+# Baseline BF16 peak memory ~75 GiB, saving BF16 weights snopshot total ~108 GiB.
 _BF16_WEIGHTS_SNAPSHOT_FREE_MEMORY_THRESHOLD_GIB = 115.0
 
 
@@ -66,12 +67,12 @@ def _should_save_bf16_weights(
 ) -> bool:
     free_gib = _get_free_gpu_memory_gib()
     if free_gib is None:
-        logger.info("BF16 weight snapshots disabled: CUDA free memory is unavailable")
+        logger.debug("BF16 weight snapshots disabled: CUDA free memory is unavailable")
         return False
 
     save_state = free_gib > threshold_gib
     relation = ">" if save_state else "<="
-    logger.info(
+    logger.debug(
         f"BF16 weight snapshots {'enabled' if save_state else 'disabled'}: "
         f"free GPU memory {free_gib:.2f} GiB {relation} {threshold_gib:.2f} GiB threshold"
     )
