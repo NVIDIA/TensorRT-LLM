@@ -960,14 +960,33 @@ class PyTorchModelEngine(ModelEngine):
         # is decode-only and runs into issues with autotuner warmup.
         if not self.mapping.has_cp_helix():
             self._run_autotuner_warmup(resource_manager)
+            # Release the autotuner's exploration-mode intermediates. Each
+            # tunable op site allocates buffers per candidate tactic but only
+            # the cached best tactic is replayed during serving, so the
+            # exploration leftovers are pure waste that hide tens of GiB from
+            # non-torch allocators (cuBLAS handle workspace, UCX/NIXL,
+            # NVSHMEM).
+            gc.collect()
+            torch.cuda.empty_cache()
         with self.cuda_graph_runner.allow_capture():
             self._run_cuda_graph_warmup(resource_manager)
-        if can_run_general_warmup:
+        # Step (d) max-shape pre-population pre-allocates the worst-case
+        # activation blocks so the first real iteration reuses them instead
+        # of paying a cudaMalloc cost. The blocks themselves are legitimate
+        # first-iter working set, but on workloads that prefer maximum
+        # non-torch headroom over the ~tens-of-ms first-iter saving (e.g.
+        # disaggregated context workers running near the GPU-memory limit),
+        # TRTLLM_SKIP_MAX_SHAPE_WARMUP=1 disables this pass.
+        if can_run_general_warmup and os.environ.get(
+                "TRTLLM_SKIP_MAX_SHAPE_WARMUP", "0") != "1":
             # Pre-populate the memory pool with max-shape allocations to reduce
             # fragmentation at runtime.
             warmup_requests_configs = self._get_max_shape_warmup_requests(
                 resource_manager)
             self._general_warmup(resource_manager, warmup_requests_configs)
+        elif can_run_general_warmup:
+            logger.info("Skipping max-shape warmup pre-population "
+                        "(TRTLLM_SKIP_MAX_SHAPE_WARMUP=1)")
 
     def _general_warmup(self, resource_manager: ResourceManager,
                         warmup_requests_configs: List[Tuple[int, int]]):

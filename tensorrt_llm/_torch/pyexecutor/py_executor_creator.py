@@ -992,6 +992,16 @@ def create_py_executor(
 
         del py_executor  # free before constructing new
         gc.collect()
+        # teardown_managers() above released the first PyExecutor's live
+        # torch tensors (KV manager, sampler, scheduler state). Python
+        # references drop but PyTorch's caching allocator keeps the
+        # underlying cudaMalloc'd blocks in its free pool, and the second
+        # PyExecutor's step (a) empty_cache only reclaims blocks matching
+        # its own allocations - the rest stay parked across the entire
+        # second warmup. Release them to the driver before the production
+        # KV pool is allocated so non-torch allocators (cuBLAS, UCX/NIXL,
+        # NVSHMEM) see the headroom.
+        torch.cuda.empty_cache()
 
         with allocation_scope(ExecutorMemoryType.KV_CACHE):
             # Before estimating KV cache size, a minimal KV cache has been allocated using
