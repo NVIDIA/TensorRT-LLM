@@ -42,6 +42,15 @@ class MultimodalItem:
     ``item_idx_in_param == -1`` to indicate they have no MMItemOrder slot;
     their encoded rows are consumed by a model-specific post-process step
     rather than scattered into the final output.
+
+    ``token_count`` is the post-process row count contributed to the
+    final scatter destination. ``encoder_token_count`` is the row count
+    the per-modality encoder is expected to emit BEFORE any
+    post-process expansion (defaults to ``token_count``). The two values
+    differ for Nano video items whose post-process step interleaves
+    audio rows from the paired ghost audio item — the video encoder
+    only emits vision rows, but the final scatter destination for that
+    item covers vision + audio.
     """
 
     src_param_idx: int
@@ -50,6 +59,11 @@ class MultimodalItem:
     token_count: int
     payload: Mapping[str, Any]
     metadata: Mapping[str, Any] = field(default_factory=dict)
+    encoder_token_count: Optional[int] = None
+
+    @property
+    def encoder_rows(self) -> int:
+        return self.token_count if self.encoder_token_count is None else self.encoder_token_count
 
 
 ItemExtractor = Callable[[int, MultimodalParams], Iterable[MultimodalItem]]
@@ -203,10 +217,14 @@ def encode_with_plan(
         slot_indices = plan._modality_slots[modality].tolist()
         bucket_items = [plan.items[i] for i in slot_indices]
         out = encoders[modality](bucket_items, multimodal_params)
-        expected_rows = int(plan._bucket_offsets[modality][-1].item())
+        # Use ``encoder_token_count`` (defaults to ``token_count``) for the
+        # encoder-output assertion. Items whose ``token_count`` reflects a
+        # post-process expansion (e.g. Nano video + interleaved audio) must
+        # set ``encoder_token_count`` to the encoder-only row count.
+        expected_rows = sum(item.encoder_rows for item in bucket_items)
         assert out.shape[0] == expected_rows, (
             f"encoder for {modality!r} returned {out.shape[0]} rows; "
-            f"plan expected {expected_rows} (sum of item token_counts)"
+            f"plan expected {expected_rows} (sum of item encoder_rows)"
         )
         bucket_outputs[modality] = out
 

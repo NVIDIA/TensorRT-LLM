@@ -608,16 +608,23 @@ def _nano_extract_items(param_idx: int, param: MultimodalParams):
         # so production-fields fallback works for the video half too.
         own_count = _lookup_count(modality, 0, payload)
         token_count = own_count
+        encoder_token_count: Optional[int] = None
         if modality == "video":
             audio_payload = payload.get("audio")
             if audio_payload is not None:
+                # Video item's scatter destination spans vision + audio rows
+                # (post-interleave); the vision encoder itself only emits
+                # vision rows, which is what the encoder-bucket assertion
+                # must check.
                 token_count = own_count + _nano_payload_token_count(audio_payload)
+                encoder_token_count = own_count
         yield MultimodalItem(
             src_param_idx=param_idx,
             item_idx_in_param=item_pos,
             modality=modality,
             token_count=token_count,
             payload=payload,
+            encoder_token_count=encoder_token_count,
         )
         # Emit a ghost audio item for video payloads that carry an
         # embedded audio track. The audio rows live in the audio
@@ -3776,9 +3783,32 @@ class NemotronH_Nano_VL_V2(transformers.PreTrainedModel):
         if not multimodal_params:
             return []
 
+        # When the model has no sound encoder, hide ghost audio items that
+        # come from video payloads — the original code only collected the
+        # embedded audio data ``if self.sound_encoder is not None``. We mask
+        # the audio sub-payload during extraction so the video token_count
+        # also stays at the vision-only count and no audio bucket is built.
+        if self.sound_encoder is None:
+
+            def extract(param_idx: int, param: MultimodalParams):
+                mm_data = param.multimodal_data or {}
+                video_payload = mm_data.get("video")
+                stashed_audio = None
+                if isinstance(video_payload, dict) and video_payload.get("audio") is not None:
+                    stashed_audio = video_payload["audio"]
+                    video_payload["audio"] = None
+                try:
+                    yield from _nano_extract_items(param_idx, param)
+                finally:
+                    if stashed_audio is not None:
+                        video_payload["audio"] = stashed_audio
+
+        else:
+            extract = _nano_extract_items
+
         plan = EncodingPlan.from_params(
             multimodal_params=multimodal_params,
-            extract=_nano_extract_items,
+            extract=extract,
         )
         if plan.total_tokens == 0:
             return []
