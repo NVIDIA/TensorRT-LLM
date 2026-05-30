@@ -211,24 +211,30 @@ def _step3p7_norm_weight_load_hook(state_dict, prefix, *args, **kwargs):
 
 
 def _step3p7_moe_split_load_hook(state_dict, prefix, *args, **kwargs):
-    """Split stacked routed-expert weights into per-expert Linear weights.
+    """Split stacked routed-expert tensors into per-expert Linear tensors.
 
     The checkpoint stores routed experts as stacked tensors per projection:
       * ``...moe.gate_proj.weight``  [E, moe_intermediate, hidden]
       * ``...moe.up_proj.weight``    [E, moe_intermediate, hidden]
       * ``...moe.down_proj.weight``  [E, hidden, moe_intermediate]
-    The custom model keeps per-expert ``nn.Linear`` modules for ``torch_moe`` dispatch, i.e.
-      * ``...moe.experts.{e}.{gate,up,down}_proj.weight``
+    plus, for the FP8 checkpoint, block-wise dequant scales (one per projection):
+      * ``...moe.{proj}.weight_scale_inv``  [E, ceil(out/128), ceil(in/128)]
+    The custom model keeps per-expert ``nn.Linear`` modules for ``torch_moe`` dispatch, so split
+    every stacked ``[E, ...]`` tensor into per-expert tensors:
+      * ``...moe.experts.{e}.{gate,up,down}_proj.weight`` (and matching ``.weight_scale_inv``).
+    The FP8 ``quantize_finegrained_fp8_moe`` transform then consumes the per-expert FP8 weight +
+    ``weight_scale_inv`` exactly as it does for the (per-expert) DeepSeek-V3 checkpoint.
     """
     for key in list(state_dict.keys()):
         for proj in ("gate_proj", "up_proj", "down_proj"):
-            suffix = f".moe.{proj}.weight"
-            if key.endswith(suffix) and state_dict[key].dim() == 3:
-                stacked = state_dict.pop(key)
-                base = key[: -len(suffix)]
-                for e in range(stacked.shape[0]):
-                    state_dict[f"{base}.moe.experts.{e}.{proj}.weight"] = stacked[e]
-                break
+            for leaf in ("weight", "weight_scale_inv"):
+                suffix = f".moe.{proj}.{leaf}"
+                if key.endswith(suffix) and state_dict[key].dim() == 3:
+                    stacked = state_dict.pop(key)
+                    base = key[: -len(suffix)]
+                    for e in range(stacked.shape[0]):
+                        state_dict[f"{base}.moe.experts.{e}.{proj}.{leaf}"] = stacked[e]
+                    break
 
 
 # ---------------------------------------------------------------------------
