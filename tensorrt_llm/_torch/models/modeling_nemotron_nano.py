@@ -4,7 +4,7 @@ import math
 import os
 import re
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
 import torch
@@ -431,31 +431,6 @@ def _has_raw_multimodal_data(param: MultimodalParams) -> bool:
     )
 
 
-def _nano_payload_token_count(payload: Dict[str, Any]) -> int:
-    """Return the per-item token count stashed on a Nano modality payload.
-
-    Reads the per-payload ``num_tokens`` field that the Nano preprocessor
-    is expected to populate. When that field is absent — e.g. the caller
-    is using production preprocessing that has not yet been updated to
-    write ``num_tokens`` on each modality payload sub-dict — the caller
-    must resolve the count via :func:`_nano_resolve_payload_token_counts`
-    (which consults ``multimodal_embedding_lengths`` /
-    ``multimodal_runtime``) and pass the value to its consumers.
-
-    TODO(TRTLLM-mixed-modality): production preprocessing should write
-    ``num_tokens`` on each per-modality payload sub-dict so the new encode
-    path doesn't depend on the schema fallback in
-    :func:`_nano_resolve_payload_token_counts`.
-    """
-    num_tokens = payload.get("num_tokens")
-    if num_tokens is None:
-        raise KeyError(
-            "Nano multimodal payload is missing 'num_tokens'; cannot derive "
-            "per-item token count for encoding plan."
-        )
-    return int(num_tokens)
-
-
 def _nano_resolve_payload_token_counts(
     param: MultimodalParams,
 ) -> Dict[Tuple[str, int], int]:
@@ -518,35 +493,11 @@ def _nano_resolve_payload_token_counts(
     return counts
 
 
-def _nano_per_clip_audio_counts(audio_payload: Dict[str, Any]) -> List[int]:
-    """Re-derive per-clip audio token counts from a Nano audio payload.
-
-    Used by `_nano_post_encode` to reconstruct the `per_clip_audio_counts`
-    argument for `_interleave_video_audio_embeddings` without having to
-    plumb counts through the audio adapter (which currently discards them
-    in favor of a flat cat'd tensor).
-
-    The total audio rows for the payload (`num_tokens`) are distributed
-    across `audio_num_clips` clips as evenly as possible; any remainder is
-    placed in the leading clips. For single-clip audio this is exact; for
-    multi-clip the per-clip split is only an approximation and a more
-    precise per-clip-count source should be threaded through if downstream
-    code becomes sensitive to the exact split.
-    """
-    total = _nano_payload_token_count(audio_payload)
-    raw_num_clips = audio_payload.get("audio_num_clips", 0)
-    if isinstance(raw_num_clips, torch.Tensor):
-        n_clips = int(raw_num_clips.sum().item())
-    else:
-        n_clips = int(raw_num_clips)
-    if n_clips == 0:
-        return []
-    per = total // n_clips
-    rem = total - per * n_clips
-    return [per + 1 if i < rem else per for i in range(n_clips)]
-
-
-def _nano_extract_items(param_idx: int, param: MultimodalParams):
+def _nano_extract_items(
+    param_idx: int,
+    param: MultimodalParams,
+    audio_rows_fn: Optional[Callable[[Dict[str, Any]], int]] = None,
+):
     """Yield :class:`MultimodalItem` instances for one Nano ``MultimodalParams``.
 
     Pure single-modality params yield exactly one item with
@@ -555,26 +506,35 @@ def _nano_extract_items(param_idx: int, param: MultimodalParams):
     item's MMItemOrder rank.
 
     Video payloads that carry an embedded audio track yield TWO items:
-    the real video item (non-ghost; ``token_count`` is post-interleave)
-    followed by a ghost audio item (``item_idx_in_param == -1``;
-    ``token_count`` is the raw audio rows the encoder will return). This
-    ordering — non-ghost first — satisfies the ``encode_with_plan``
-    scatter convention that ghosts trail standalone items in each
-    bucket.
+    the real video item (non-ghost; ``token_count`` is post-interleave —
+    vision rows + interleaved audio rows) followed by a ghost audio item
+    (``item_idx_in_param == -1``; ``token_count`` is the audio rows the
+    audio encoder returns). This ordering — non-ghost first — satisfies
+    the ``encode_with_plan`` scatter convention that ghosts trail
+    standalone items in each bucket.
 
-    Per-item token counts are resolved using the following fallback
-    chain, applied per payload (and per ghost-audio payload):
+    Per-item token counts are resolved using the following fallback chain,
+    applied per payload:
 
     1. ``payload["num_tokens"]`` if present (test convention; cheapest).
+       For a video payload this is the VISION-ONLY row count.
     2. Production-fields fallback (see
        :func:`_nano_resolve_payload_token_counts`): mixed-param items use
        ``multimodal_embedding_lengths`` indexed by ``multimodal_item_order``;
        pure single-modality items use
-       ``multimodal_runtime.total_embeds_in_request``.
+       ``multimodal_runtime.total_embeds_in_request``. For a video-with-audio
+       slot this production count is the POST-interleave total (vision +
+       audio), because the prompt placeholder budget
+       (``get_num_tokens_per_video(video_audio=...)``) already includes the
+       interleaved audio tokens.
 
-    Ghost audio items extracted from a video payload cannot be resolved
-    via the production fields (those don't carry an MMItemOrder slot for
-    embedded audio), so their payload MUST carry ``num_tokens``.
+    The audio row count for a video's embedded audio track is resolved via
+    ``audio_rows_fn`` (which derives it from the production
+    ``feature_attention_mask`` using the encoder's sub-sampling, matching
+    the audio encoder output), falling back to the payload's ``num_tokens``.
+    This lets the extractor split a production post-interleave video count
+    into the vision-only encoder rows (for the bucket assertion) and size
+    the ghost audio item, without depending on a test-only payload field.
     """
     multimodal_data = param.multimodal_data or {}
     modality_types = list(dict.fromkeys(_get_modality_types(multimodal_data)))
@@ -606,6 +566,17 @@ def _nano_extract_items(param_idx: int, param: MultimodalParams):
             "(multimodal_embedding_lengths / multimodal_runtime) is available."
         )
 
+    def _audio_rows(audio_payload: Dict[str, Any]) -> int:
+        if "num_tokens" in audio_payload:
+            return int(audio_payload["num_tokens"])
+        if audio_rows_fn is not None:
+            return int(audio_rows_fn(audio_payload))
+        raise KeyError(
+            f"Cannot resolve audio token count for embedded video audio in "
+            f"param {param_idx}: audio payload has no 'num_tokens' and no "
+            "audio_rows_fn (production feature_attention_mask resolver) was provided."
+        )
+
     for modality in modality_types:
         if modality not in _NANO_MODALITIES:
             raise ValueError(f"Unknown modality: {modality}")
@@ -613,22 +584,29 @@ def _nano_extract_items(param_idx: int, param: MultimodalParams):
         if payload is None:
             continue
         item_pos = order_pos.get((modality, 0), 0)
-        # For video with embedded audio, the post-interleave count is
-        # video_tokens + audio_tokens; for plain modalities it's just
-        # the per-payload count. Resolve both halves through the lookup
-        # so production-fields fallback works for the video half too.
         own_count = _lookup_count(modality, 0, payload)
         token_count = own_count
         encoder_token_count: Optional[int] = None
         if modality == "video":
             audio_payload = payload.get("audio")
             if audio_payload is not None:
-                # Video item's scatter destination spans vision + audio rows
-                # (post-interleave); the vision encoder itself only emits
-                # vision rows, which is what the encoder-bucket assertion
-                # must check.
-                token_count = own_count + _nano_payload_token_count(audio_payload)
-                encoder_token_count = own_count
+                # The video item's scatter destination spans vision + audio
+                # rows (post-interleave); the vision encoder only emits vision
+                # rows, which is what the encoder-bucket assertion checks.
+                #
+                # `own_count` is either:
+                #   - the test-only video `num_tokens` = VISION-ONLY rows, so
+                #     post-interleave = own_count + audio_rows; or
+                #   - the production `multimodal_embedding_lengths` video slot =
+                #     POST-interleave total (vision + audio already), so
+                #     vision-only = own_count - audio_rows.
+                audio_rows = _audio_rows(audio_payload)
+                if "num_tokens" in payload:
+                    encoder_token_count = own_count
+                    token_count = own_count + audio_rows
+                else:
+                    token_count = own_count
+                    encoder_token_count = own_count - audio_rows
         yield MultimodalItem(
             src_param_idx=param_idx,
             item_idx_in_param=item_pos,
@@ -649,7 +627,7 @@ def _nano_extract_items(param_idx: int, param: MultimodalParams):
                     src_param_idx=param_idx,
                     item_idx_in_param=-1,
                     modality="audio",
-                    token_count=_nano_payload_token_count(audio_payload),
+                    token_count=_audio_rows(audio_payload),
                     payload=audio_payload,
                     metadata={"paired_video_item_idx": item_pos},
                 )
@@ -3548,6 +3526,46 @@ class NemotronH_Nano_VL_V2(transformers.PreTrainedModel):
             cursor += n_clips
         return results
 
+    def _audio_payload_clip_counts(self, audio_payload: Dict[str, Any]) -> List[int]:
+        """Per-clip audio token (row) counts for one audio payload.
+
+        Computed from the production ``feature_attention_mask`` via the same
+        sub-sampling math the encoder applies in :meth:`_encode_audio`
+        (``valid_input_lens -> _get_subsampling_output_length``). This is
+        deterministic and does not require running the encoder, so it can be
+        used at plan-build time to size the audio item BEFORE encoding, and
+        it matches the per-clip counts :meth:`_encode_audio` returns by
+        construction (same mask, same sub-sampling).
+
+        Returns one int per clip, in clip order (clips of all the payload's
+        audio streams concatenated, matching ``input_audio_features`` row
+        order). Raises ``KeyError`` if the payload lacks the production
+        ``feature_attention_mask`` field.
+        """
+        mask = audio_payload.get("feature_attention_mask")
+        if mask is None:
+            raise KeyError(
+                "Nano audio payload is missing 'feature_attention_mask'; cannot "
+                "derive per-clip audio token counts."
+            )
+        valid_input_lens = mask.sum(dim=1)
+        valid_output_lens = self.sound_encoder.encoder._get_subsampling_output_length(
+            valid_input_lens
+        )
+        return [int(x) for x in valid_output_lens.tolist()]
+
+    def _audio_payload_total_rows(self, audio_payload: Dict[str, Any]) -> int:
+        """Total audio encoder rows for one audio payload.
+
+        Prefers the test-only ``num_tokens`` fast-path; otherwise sums the
+        production-derived per-clip counts from :meth:`_audio_payload_clip_counts`.
+        Matches the audio encoder's actual output rows for the payload.
+        """
+        num_tokens = audio_payload.get("num_tokens")
+        if num_tokens is not None:
+            return int(num_tokens)
+        return sum(self._audio_payload_clip_counts(audio_payload))
+
     def _interleave_video_audio_embeddings(
         self,
         vision_emb: torch.Tensor,
@@ -3656,12 +3674,26 @@ class NemotronH_Nano_VL_V2(transformers.PreTrainedModel):
         (`item_idx_in_param >= 0`) and ghost audio extracted from video
         (`item_idx_in_param == -1`). Non-ghost items appear first in bucket
         order per the extractor's contract.
+
+        The per-clip token counts `_encode_audio` returns are the authoritative
+        audio row counts (derived from the encoder's sub-sampling of the
+        feature mask). They are stashed on `self._nano_audio_clip_counts`
+        keyed by `(src_param_idx, item_idx_in_param)` so the video-audio
+        interleave in `_nano_post_encode` can use the encoder's actual per-clip
+        split instead of re-deriving it from a payload field.
         """
         payloads = [item.payload for item in items]
         encoded = self._encode_audio(payloads)
         if isinstance(encoded, list):
+            self._nano_audio_clip_counts = {
+                (item.src_param_idx, item.item_idx_in_param): list(counts)
+                for item, (_, counts) in zip(items, encoded, strict=True)
+            }
             return torch.cat([t for t, _ in encoded], dim=0)
         if len(items) == 1 and isinstance(encoded, torch.Tensor):
+            self._nano_audio_clip_counts = {
+                (items[0].src_param_idx, items[0].item_idx_in_param): [int(encoded.shape[0])]
+            }
             return encoded
         raise TypeError(
             "_encode_audio must return a list of (embeddings, counts) for batched audio inputs"
@@ -3694,30 +3726,35 @@ class NemotronH_Nano_VL_V2(transformers.PreTrainedModel):
 
         video_slots = plan._modality_slots["video"].tolist()
 
-        # Index ghost audio items by source param idx.
-        ghost_audio_by_param: Dict[int, Tuple[int, Dict[str, Any]]] = {}
+        # Index ghost audio items by source param idx. Carry the ghost item's
+        # identity `(src_param_idx, item_idx_in_param)` so the encoder's actual
+        # per-clip counts (stashed by `_adapter_audio_bucket`) can be looked up.
+        ghost_audio_by_param: Dict[int, Tuple[int, MultimodalItem]] = {}
         if "audio" in bucket_outputs:
             audio_slots = plan._modality_slots["audio"].tolist()
             for slot_pos, flat_idx in enumerate(audio_slots):
                 item = plan.items[flat_idx]
                 if item.item_idx_in_param == -1:
-                    ghost_audio_by_param[item.src_param_idx] = (
-                        slot_pos,
-                        item.payload,
-                    )
+                    ghost_audio_by_param[item.src_param_idx] = (slot_pos, item)
+
+        clip_counts_by_item = getattr(self, "_nano_audio_clip_counts", {}) or {}
 
         # Build new video bucket by walking video items in bucket order.
-        # Each video item consumes its PRE-interleave rows from the
-        # original video bucket; if it has a paired ghost audio item,
-        # its rows are interleaved in to produce the POST-interleave
-        # chunk for that video.
+        # Each video item consumes its PRE-interleave (vision-only) rows from
+        # the original video bucket; if it has a paired ghost audio item, its
+        # rows are interleaved in to produce the POST-interleave chunk for that
+        # video.
         new_video_chunks: List[torch.Tensor] = []
         video_cursor = 0
         audio_offsets_t = plan._bucket_offsets.get("audio")
         for flat_idx in video_slots:
             item = plan.items[flat_idx]
             payload = item.payload
-            pre_interleave_count = _nano_payload_token_count(payload)
+            # Vision-only (pre-interleave) row count. `encoder_rows` is the
+            # encoder-output row count the plan asserted against the vision
+            # encoder, resolved from production fields (or the test-only
+            # `num_tokens`) by the extractor — no need to re-read the payload.
+            pre_interleave_count = item.encoder_rows
             video_chunk = bucket_outputs["video"][
                 video_cursor : video_cursor + pre_interleave_count
             ]
@@ -3725,11 +3762,19 @@ class NemotronH_Nano_VL_V2(transformers.PreTrainedModel):
 
             ghost = ghost_audio_by_param.get(item.src_param_idx)
             if ghost is not None and audio_offsets_t is not None:
-                ghost_slot_pos, audio_data = ghost
+                ghost_slot_pos, ghost_item = ghost
+                audio_data = ghost_item.payload
                 audio_start = int(audio_offsets_t[ghost_slot_pos].item())
                 audio_end = int(audio_offsets_t[ghost_slot_pos + 1].item())
                 audio_chunk = bucket_outputs["audio"][audio_start:audio_end]
-                per_clip = _nano_per_clip_audio_counts(audio_data)
+                # Prefer the encoder's actual per-clip counts (threaded by
+                # `_adapter_audio_bucket`); fall back to the production-mask
+                # derivation when unavailable (both use the same sub-sampling).
+                per_clip = clip_counts_by_item.get(
+                    (ghost_item.src_param_idx, ghost_item.item_idx_in_param)
+                )
+                if per_clip is None:
+                    per_clip = self._audio_payload_clip_counts(audio_data)
                 src = multimodal_params[item.src_param_idx]
                 src_mm_data = src.multimodal_data or {}
                 video_chunk = self._interleave_video_audio_embeddings(
@@ -3799,6 +3844,14 @@ class NemotronH_Nano_VL_V2(transformers.PreTrainedModel):
         # embedded audio data ``if self.sound_encoder is not None``. We mask
         # the audio sub-payload during extraction so the video token_count
         # also stays at the vision-only count and no audio bucket is built.
+        # Per-clip counts threaded out of `_adapter_audio_bucket`; reset so a
+        # stale map from a prior call can't leak into this plan's post-encode.
+        self._nano_audio_clip_counts = {}
+        # Resolve a video's embedded-audio row count from production fields
+        # (the audio feature mask via the encoder's sub-sampling) so the
+        # extractor doesn't need a test-only `num_tokens` payload field.
+        audio_rows_fn = self._audio_payload_total_rows
+
         if self.sound_encoder is None:
 
             def extract(param_idx: int, param: MultimodalParams):
@@ -3809,13 +3862,15 @@ class NemotronH_Nano_VL_V2(transformers.PreTrainedModel):
                     stashed_audio = video_payload["audio"]
                     video_payload["audio"] = None
                 try:
-                    yield from _nano_extract_items(param_idx, param)
+                    yield from _nano_extract_items(param_idx, param, audio_rows_fn)
                 finally:
                     if stashed_audio is not None:
                         video_payload["audio"] = stashed_audio
 
         else:
-            extract = _nano_extract_items
+
+            def extract(param_idx: int, param: MultimodalParams):
+                yield from _nano_extract_items(param_idx, param, audio_rows_fn)
 
         plan = EncodingPlan.from_params(
             multimodal_params=multimodal_params,

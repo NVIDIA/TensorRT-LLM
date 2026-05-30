@@ -322,6 +322,95 @@ class TestNanoExtractorProductionSchema:
         assert items[0].token_count == 777
         assert items[0].encoder_rows == 777
 
+    def test_video_with_embedded_audio_production_single_modality(self):
+        # Video-with-embedded-audio under PRODUCTION preprocessing, as a pure
+        # single-modality param (modality_type == "video"; the embedded audio
+        # lives INSIDE the video payload, not as a separate modality). NO
+        # num_tokens anywhere. ``total_embeds_in_request`` is the POST-interleave
+        # total (vision + interleaved audio), because
+        # get_num_tokens_per_video(video_audio=...) folds the audio tokens into
+        # the placeholder budget. The audio row count is resolved via
+        # ``audio_rows_fn`` (production feature-mask -> sub-sampling). The
+        # extractor must split: video token_count = post-interleave (12),
+        # encoder_token_count = vision-only = 12 - 4 = 8; ghost audio = 4.
+        audio_payload = {"input_audio_features": "fake", "feature_attention_mask": "fake"}
+        video_payload = {"pixel_values": "fake", "video_size": [], "audio": audio_payload}
+        param = _make_param_with_runtime(
+            {"video": video_payload, "modality_type": "video"},
+            total_embeds=12,  # POST-interleave (vision 8 + audio 4)
+        )
+        # No num_tokens anywhere; production resolver provides the audio rows.
+        items = list(_nano_extract_items(0, param, audio_rows_fn=lambda _p: 4))
+        assert len(items) == 2
+        video, ghost = items
+        assert video.modality == "video"
+        assert video.item_idx_in_param == 0
+        assert video.token_count == 12  # post-interleave scatter destination
+        assert video.encoder_rows == 8  # vision-only encoder output
+        assert ghost.modality == "audio"
+        assert ghost.item_idx_in_param == -1
+        assert ghost.token_count == 4  # audio encoder output rows
+        assert ghost.metadata.get("paired_video_item_idx") == 0
+
+    def test_mixed_video_with_audio_uses_post_interleave_embedding_length(self):
+        # MIXED param (image + video-with-embedded-audio): the multi-modality
+        # branch of the resolver uses multimodal_embedding_lengths per slot. The
+        # video slot's length is the POST-interleave total (vision + embedded
+        # audio). NO num_tokens. Extractor splits the video into vision-only
+        # encoder_rows + a ghost audio item sized via audio_rows_fn.
+        image_payload = {"pixel_values": "img"}
+        audio_payload = {"input_audio_features": "fake", "feature_attention_mask": "fake"}
+        video_payload = {"pixel_values": "vid", "video_size": [], "audio": audio_payload}
+        param = _make_param(
+            {
+                "image": image_payload,
+                "video": video_payload,
+                "modality_type": ["image", "video"],
+                "multimodal_item_order": [
+                    {"modality": "image", "index": 0},
+                    {"modality": "video", "index": 0},
+                ],
+                "multimodal_embedding_lengths": [5, 12],  # video=12 POST-interleave
+            }
+        )
+        items = list(_nano_extract_items(0, param, audio_rows_fn=lambda _p: 4))
+        by_mod = {it.modality: it for it in items if it.item_idx_in_param != -1}
+        assert by_mod["image"].token_count == 5
+        assert by_mod["video"].token_count == 12  # post-interleave dest
+        assert by_mod["video"].encoder_rows == 8  # vision-only = 12 - 4
+        ghost = [it for it in items if it.item_idx_in_param == -1][0]
+        assert ghost.modality == "audio"
+        assert ghost.token_count == 4
+
+    def test_video_with_embedded_audio_num_tokens_is_vision_only(self):
+        # Test-convention fast-path: video num_tokens is the VISION-ONLY count,
+        # so token_count = vision (5) + audio (4) = 9, encoder_token_count = 5.
+        # This preserves the existing unit-test contract while production fields
+        # use the opposite (post-interleave) convention.
+        audio_payload = {"num_tokens": 4}
+        video_payload = {"num_tokens": 5, "video_size": [], "audio": audio_payload}
+        param = _make_param({"video": video_payload, "modality_type": "video"})
+        # audio_rows_fn provided but unused (num_tokens wins).
+        items = list(_nano_extract_items(0, param, audio_rows_fn=lambda _p: 999))
+        video, ghost = items
+        assert video.token_count == 9
+        assert video.encoder_rows == 5
+        assert ghost.token_count == 4
+
+    def test_embedded_audio_without_num_tokens_or_resolver_raises(self):
+        # Embedded video audio with neither num_tokens nor an audio_rows_fn
+        # must raise a clear error rather than guessing.
+        audio_payload = {"input_audio_features": "fake"}
+        video_payload = {
+            "pixel_values": "fake",
+            "video_size": [],
+            "audio": audio_payload,
+            "num_tokens": 5,  # video count present so the video lookup succeeds
+        }
+        param = _make_param({"video": video_payload, "modality_type": "video"})
+        with pytest.raises(KeyError, match="Cannot resolve audio token count"):
+            list(_nano_extract_items(0, param))  # no audio_rows_fn
+
 
 class TestNanoVisionBucketAdapter:
     """Tests for the vision-bucket encoder adapter on ``NemotronH_Nano_VL_V2``.
@@ -439,6 +528,66 @@ class TestNanoAudioBucketAdapter:
         with pytest.raises(TypeError, match="must return a list"):
             model._adapter_audio_bucket(items, [object(), object()])
 
+    def test_per_clip_counts_threaded_onto_sidecar(self):
+        # The encoder's per-clip counts (the List[int] in each returned tuple)
+        # must be stashed on ``_nano_audio_clip_counts`` keyed by the item's
+        # (src_param_idx, item_idx_in_param), so the video-audio interleave can
+        # use the encoder's actual split instead of re-deriving from a payload
+        # field. A ghost audio item (item_idx_in_param == -1) with multiple
+        # clips is the case that matters.
+        emb0 = torch.randn(7, 4)  # 7 rows = clips [4, 3]
+        emb1 = torch.randn(5, 4)  # 5 rows = clips [5]
+        model = self._make_model_stub([(emb0, [4, 3]), (emb1, [5])])
+        items = [
+            MultimodalItem(0, 0, "audio", 5, {"id": "standalone"}),
+            MultimodalItem(
+                1, -1, "audio", 7, {"id": "ghost"}, metadata={"paired_video_item_idx": 0}
+            ),
+        ]
+        out = model._adapter_audio_bucket(items, [object(), object()])
+        assert out.shape == (12, 4)
+        assert model._nano_audio_clip_counts == {(0, 0): [4, 3], (1, -1): [5]}
+
+
+class TestNanoAudioPayloadCounts:
+    """Production-mask-derived audio row counts (no num_tokens dependency)."""
+
+    def _make_model_stub(self, subsampling_fn):
+        # Plain MagicMock (no spec) so the sound_encoder.encoder attribute chain
+        # auto-creates; sound_encoder is a runtime instance attr, not on the
+        # class, so a spec'd mock would reject it.
+        model = MagicMock()
+        model.sound_encoder.encoder._get_subsampling_output_length = subsampling_fn
+        model._audio_payload_clip_counts = NemotronH_Nano_VL_V2._audio_payload_clip_counts.__get__(
+            model
+        )
+        model._audio_payload_total_rows = NemotronH_Nano_VL_V2._audio_payload_total_rows.__get__(
+            model
+        )
+        return model
+
+    def test_clip_counts_from_feature_attention_mask(self):
+        # mask: 2 clips, valid lengths [10, 6] (rows summed over time dim).
+        # subsampling halves -> [5, 3].
+        mask = torch.tensor([[1] * 10 + [0] * 2, [1] * 6 + [0] * 6])
+        model = self._make_model_stub(lambda lens: (lens // 2))
+        payload = {"feature_attention_mask": mask, "audio_num_clips": torch.tensor([2])}
+        assert model._audio_payload_clip_counts(payload) == [5, 3]
+        # total rows = sum of per-clip = 8 (no num_tokens needed).
+        assert model._audio_payload_total_rows(payload) == 8
+
+    def test_total_rows_num_tokens_fast_path(self):
+        # When num_tokens is present (test convention) it wins and the mask /
+        # subsampling is not consulted.
+        model = self._make_model_stub(lambda lens: lens)  # would give wrong answer
+        payload = {"num_tokens": 13, "feature_attention_mask": torch.tensor([[1, 1]])}
+        assert model._audio_payload_total_rows(payload) == 13
+
+    def test_clip_counts_missing_mask_raises(self):
+        model = self._make_model_stub(lambda lens: lens)
+        with pytest.raises(KeyError, match="feature_attention_mask"):
+            model._audio_payload_clip_counts({"audio_num_clips": torch.tensor([1])})
+
 
 class TestNanoPostEncode:
     """Tests for ``_nano_post_encode``: video-audio interleave + ghost-audio bucket truncation.
@@ -469,12 +618,15 @@ class TestNanoPostEncode:
         assert bucket_outputs["image"].shape == (5, 4)
 
     def test_video_with_audio_interleaved(self):
-        # One param: video with embedded audio
-        # video_item: post-interleave 9 tokens; ghost audio: 4 tokens
-        # Pre-interleave video rows = post-interleave (9) - audio (4) = 5
+        # One param: video with embedded audio.
+        # video_item: post-interleave token_count=9, encoder_token_count=5
+        #   (the vision encoder emits only the 5 vision rows; the scatter dest
+        #   spans vision + interleaved audio = 9). Pre-interleave video rows the
+        #   post-encode step slices = item.encoder_rows = 5.
+        # ghost audio: 4 rows.
         audio_payload = {"num_tokens": 4, "has_audio": [True], "audio_num_clips": torch.tensor([1])}
         video_payload = {"num_tokens": 5, "audio": audio_payload, "video_size": []}
-        video_item = MultimodalItem(0, 0, "video", 9, video_payload)
+        video_item = MultimodalItem(0, 0, "video", 9, video_payload, encoder_token_count=5)
         audio_item = MultimodalItem(
             0,
             -1,
@@ -494,15 +646,27 @@ class TestNanoPostEncode:
         video_bucket = torch.ones((5, 4))
         audio_bucket = torch.ones((4, 4)) * 2.0
 
-        # Fake interleave: concatenate v|a -> 9 rows
-        def fake_interleave(video_emb, audio_emb, *args, **kwargs):
+        captured = {}
+
+        # Fake interleave: concatenate v|a -> 9 rows; capture the per-clip arg.
+        def fake_interleave(video_emb, audio_emb, per_clip_audio_counts, *args, **kwargs):
+            captured["per_clip"] = per_clip_audio_counts
+            captured["video_rows"] = int(video_emb.shape[0])
+            captured["audio_rows"] = int(audio_emb.shape[0])
             return torch.cat([video_emb, audio_emb], dim=0)
 
         model = self._make_model_stub(fake_interleave)
+        # Encoder's actual per-clip counts threaded by `_adapter_audio_bucket`.
+        model._nano_audio_clip_counts = {(0, -1): [4]}
 
         bucket_outputs = {"video": video_bucket, "audio": audio_bucket}
         model._nano_post_encode(bucket_outputs, plan, params)
 
+        # Video sliced by encoder_rows (5), audio ghost slice (4), per-clip from
+        # the threaded encoder counts (NOT a num_tokens re-derivation).
+        assert captured["video_rows"] == 5
+        assert captured["audio_rows"] == 4
+        assert captured["per_clip"] == [4]
         # Video bucket grew to post-interleave shape (9)
         assert bucket_outputs["video"].shape == (9, 4)
         # Audio bucket truncated to 0 rows (only ghost present)
@@ -522,3 +686,73 @@ class TestNanoPostEncode:
         model = self._make_model_stub(lambda *a, **kw: None)
         model._nano_post_encode(bucket_outputs, plan, params)
         assert bucket_outputs["audio"].shape == (4, 4)
+
+    def test_pure_video_no_audio_uses_encoder_rows_no_num_tokens(self):
+        # Regression for the firing MixedModality crash: a video item with NO
+        # embedded audio and NO num_tokens on the payload (production). The
+        # post-encode video slice must use item.encoder_rows (resolved from
+        # production multimodal_embedding_lengths == vision encoder output),
+        # NOT a payload num_tokens lookup. This is the exact case the
+        # image+audio+video eval hits (video carries no embedded audio).
+        video_payload = {"pixel_values": "fake", "video_size": []}  # NO num_tokens
+        video_item = MultimodalItem(0, 0, "video", 6, video_payload)  # encoder_rows == 6
+        items_by_param = {0: [video_item]}
+        params = [_make_param({"video": video_payload, "modality_type": "video"})]
+        plan = EncodingPlan.from_params(
+            multimodal_params=params,
+            extract=_identity_extractor(items_by_param),
+        )
+        bucket_outputs = {"video": torch.ones((6, 4))}
+        # No interleave should be invoked (no paired ghost audio).
+        model = self._make_model_stub(lambda *a, **kw: pytest.fail("no interleave expected"))
+        model._nano_post_encode(bucket_outputs, plan, params)
+        # Video bucket unchanged (6 rows), no num_tokens KeyError.
+        assert bucket_outputs["video"].shape == (6, 4)
+
+    def test_video_with_audio_production_fallback_clip_counts(self):
+        # Video+audio post-encode under PRODUCTION fields: NO num_tokens, and
+        # the per-clip-counts sidecar is empty (e.g. a code path that didn't
+        # thread them). The interleave per-clip counts must fall back to the
+        # mask-derived _audio_payload_clip_counts, and the video slice uses
+        # item.encoder_rows. video encoder_rows=8, audio=4 (2 clips [3,1]).
+        mask = torch.tensor([[1, 1, 1, 1, 1, 1], [1, 1, 0, 0, 0, 0]])  # valid [6, 2]
+        audio_payload = {
+            "feature_attention_mask": mask,
+            "has_audio": [True],
+            "audio_num_clips": torch.tensor([2]),
+        }
+        video_payload = {"pixel_values": "fake", "video_size": [], "audio": audio_payload}
+        video_item = MultimodalItem(0, 0, "video", 12, video_payload, encoder_token_count=8)
+        ghost = MultimodalItem(
+            0, -1, "audio", 4, audio_payload, metadata={"paired_video_item_idx": 0}
+        )
+        items_by_param = {0: [video_item, ghost]}
+        params = [_make_param({"video": video_payload, "modality_type": "video"})]
+        plan = EncodingPlan.from_params(
+            multimodal_params=params,
+            extract=_identity_extractor(items_by_param),
+        )
+        captured = {}
+
+        def fake_interleave(video_emb, audio_emb, per_clip_audio_counts, *a, **kw):
+            captured["per_clip"] = per_clip_audio_counts
+            captured["video_rows"] = int(video_emb.shape[0])
+            return torch.cat([video_emb, audio_emb], dim=0)
+
+        model = self._make_model_stub(fake_interleave)
+        # subsampling: [6, 2] -> [3, 1] (per-clip), matches ghost.token_count 4.
+        # sound_encoder is a runtime instance attr (not on the spec class), so
+        # set it explicitly before reaching into the encoder.
+        model.sound_encoder = MagicMock()
+        model.sound_encoder.encoder._get_subsampling_output_length = lambda lens: (lens // 2)
+        model._audio_payload_clip_counts = NemotronH_Nano_VL_V2._audio_payload_clip_counts.__get__(
+            model
+        )
+        model._nano_audio_clip_counts = {}  # sidecar empty -> mask fallback
+
+        bucket_outputs = {"video": torch.ones((8, 4)), "audio": torch.ones((4, 4)) * 2.0}
+        model._nano_post_encode(bucket_outputs, plan, params)
+        assert captured["video_rows"] == 8  # sliced by encoder_rows
+        assert captured["per_clip"] == [3, 1]  # mask-derived fallback
+        assert bucket_outputs["video"].shape == (12, 4)
+        assert bucket_outputs["audio"].shape == (0, 4)
