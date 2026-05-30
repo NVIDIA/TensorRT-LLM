@@ -489,6 +489,11 @@ public:
 
     void sendSync(LlmRequest const& llmRequest)
     {
+        // nvbugs/6104831 Layer F: bracket the ctx-side data-transfer phase.
+        // If we see ENTRY but no EXIT for some reqId in the log, the wedge is
+        // inside the formatter (sendAllBuffers / per-peer notify) rather than
+        // in the request-info / ready-signal handshake.
+        TLLM_LOG_INFO("[DIAG-CTX-SENDSYNC-ENTRY] reqId=%lu", llmRequest.mRequestId);
         TransferSession* session = nullptr;
         {
             std::unique_lock<std::mutex> lk(mMtxForMap);
@@ -497,8 +502,11 @@ public:
             session = std::addressof(it->second);
         }
         session->setLlmRequest(llmRequest);
+        TLLM_LOG_INFO("[DIAG-CTX-FORMAT-ENTRY] reqId=%lu", llmRequest.mRequestId);
         mCacheTransferLayer.format(*session);
+        TLLM_LOG_INFO("[DIAG-CTX-FORMAT-EXIT] reqId=%lu", llmRequest.mRequestId);
         llmRequest.setKvCacheTransferEnd(LlmRequest::getSteadyClockNow());
+        TLLM_LOG_INFO("[DIAG-CTX-SENDSYNC-EXIT] reqId=%lu", llmRequest.mRequestId);
     }
 
     bool cancelRequest(LlmRequest const& llmRequest)
@@ -634,6 +642,11 @@ private:
             TLLM_CUDA_CHECK(cudaSetDevice(mDeviceId));
             sendSync(*resp.mRequest);
             release(id);
+            // nvbugs/6104831 Layer F: ctx-side promise fulfillment. Pair with
+            // CTX-SENDSYNC-EXIT — if EXIT fired but PROMISE-SET didn't, the
+            // wedge is between sendSync return and set_value (e.g., inside
+            // release() / future-map eviction).
+            TLLM_LOG_INFO("[DIAG-CTX-PROMISE-SET] reqId=%lu", id);
             resp.mPromise.set_value();
         }
         catch (tensorrt_llm::common::RequestSpecificException const& e)
@@ -1048,7 +1061,15 @@ public:
 
     void receiveSync(TransferSession& session)
     {
+        // nvbugs/6104831 Layer F: bracket gen-side data-receive phase. If
+        // RECVSYNC-ENTRY without RECVSYNC-EXIT, the wedge is inside the
+        // formatter unformat (per-block recv / concat).
+        auto const reqIdForLog
+            = session.hasLlmRequest() ? session.getLlmRequest().mRequestId : static_cast<RequestIdType>(0);
+        TLLM_LOG_INFO("[DIAG-GEN-RECVSYNC-ENTRY] reqId=%lu", reqIdForLog);
+        TLLM_LOG_INFO("[DIAG-GEN-UNFORMAT-ENTRY] reqId=%lu", reqIdForLog);
         mCacheTransferLayer.unformat(session);
+        TLLM_LOG_INFO("[DIAG-GEN-UNFORMAT-EXIT] reqId=%lu", reqIdForLog);
         if (!common::getEnvKVCacheTimeOutputPath().empty())
         {
             std::unique_lock<std::mutex> lock(mMeasuresFileMutex);
@@ -1061,6 +1082,7 @@ public:
             }
             session.exportMeasure(mMeasuresFile, false);
         }
+        TLLM_LOG_INFO("[DIAG-GEN-RECVSYNC-EXIT] reqId=%lu", reqIdForLog);
     }
 
     // Overload kept for the public CacheReceiver::sendRequestInfo wrapper
@@ -1722,6 +1744,11 @@ private:
                     TLLM_CHECK_WITH_INFO(
                         requestAndPromise.mCancelFlag != nullptr, "requestAndPromise.mCancelFlag is null");
                     requestSync(*requestAndPromise.mRequest, *requestAndPromise.mCancelFlag);
+                    // nvbugs/6104831 Layer F: gen-side promise fulfillment.
+                    // Pair with GEN-RECVSYNC-EXIT — if RECVSYNC-EXIT fired but
+                    // PROMISE-SET didn't, the wedge is between requestSync
+                    // return and set_value (cleanup / map eviction).
+                    TLLM_LOG_INFO("[DIAG-GEN-PROMISE-SET] reqId=%lu", requestAndPromise.mRequest->mRequestId);
                     requestAndPromise.mPromise->set_value();
                 }
                 catch (tensorrt_llm::common::RequestSpecificException const& err)
