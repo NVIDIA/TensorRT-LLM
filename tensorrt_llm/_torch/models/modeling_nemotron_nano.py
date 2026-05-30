@@ -48,6 +48,7 @@ from .modeling_multimodal_utils import (
 from .modeling_parakeet import ParakeetExtractor, ProjectedParakeet
 from .modeling_radio import RADIOVisionModel, calc_seq_lens
 from .modeling_utils import register_auto_model
+from .multimodal_encoding import MultimodalItem
 
 # Set max_num_tiles to 1 for video modality, to match the training behavior.
 VIDEO_MAX_NUM_TILES = 1
@@ -428,6 +429,101 @@ def _has_raw_multimodal_data(param: MultimodalParams) -> bool:
         modality in _NANO_MODALITIES and multimodal_data.get(modality) is not None
         for modality in _get_modality_types(multimodal_data)
     )
+
+
+def _nano_payload_token_count(payload: Dict[str, Any]) -> int:
+    """Return the per-item token count stashed on a Nano modality payload.
+
+    Nano preprocessing populates a ``num_tokens`` field on each
+    per-modality payload (matching what
+    ``multimodal_embedding_lengths`` carries for mixed requests). This
+    helper centralizes the lookup so the extractor can stay schema-light.
+    """
+    num_tokens = payload.get("num_tokens")
+    if num_tokens is None:
+        raise KeyError(
+            "Nano multimodal payload is missing 'num_tokens'; cannot derive "
+            "per-item token count for encoding plan."
+        )
+    return int(num_tokens)
+
+
+def _nano_item_token_count(modality: str, payload: Dict[str, Any]) -> int:
+    """Compute the per-item token count for one Nano modality payload.
+
+    For ``video`` payloads that carry an embedded audio track, the count
+    is POST-interleave (raw video tokens + raw audio tokens) so that the
+    encoder bucket assertion in ``encode_with_plan`` matches the rows
+    that the video encoder adapter will return after interleaving.
+    """
+    if modality == "video":
+        video_tokens = _nano_payload_token_count(payload)
+        audio_payload = payload.get("audio")
+        if audio_payload is not None:
+            return video_tokens + _nano_payload_token_count(audio_payload)
+        return video_tokens
+    return _nano_payload_token_count(payload)
+
+
+def _nano_extract_items(param_idx: int, param: MultimodalParams):
+    """Yield :class:`MultimodalItem` instances for one Nano ``MultimodalParams``.
+
+    Pure single-modality params yield exactly one item with
+    ``item_idx_in_param == 0``. Mixed-modality params yield one item per
+    modality slot in prompt order, with ``item_idx_in_param`` set to the
+    item's MMItemOrder rank.
+
+    Video payloads that carry an embedded audio track yield TWO items:
+    the real video item (non-ghost; ``token_count`` is post-interleave)
+    followed by a ghost audio item (``item_idx_in_param == -1``;
+    ``token_count`` is the raw audio rows the encoder will return). This
+    ordering — non-ghost first — satisfies the ``encode_with_plan``
+    scatter convention that ghosts trail standalone items in each
+    bucket.
+    """
+    multimodal_data = param.multimodal_data or {}
+    modality_types = list(dict.fromkeys(_get_modality_types(multimodal_data)))
+    if not modality_types:
+        return
+
+    item_order = MMItemOrder.from_metadata(multimodal_data)
+    if item_order is None:
+        # Pure single-modality (no explicit prompt order metadata): each
+        # present modality is the sole item at MMItemOrder rank 0.
+        item_order = MMItemOrder((modality, 0) for modality in modality_types)
+    order_pos = {pair: pos for pos, pair in enumerate(item_order)}
+
+    for modality in modality_types:
+        if modality not in _NANO_MODALITIES:
+            raise ValueError(f"Unknown modality: {modality}")
+        payload = multimodal_data.get(modality)
+        if payload is None:
+            continue
+        item_pos = order_pos.get((modality, 0), 0)
+        token_count = _nano_item_token_count(modality, payload)
+        yield MultimodalItem(
+            src_param_idx=param_idx,
+            item_idx_in_param=item_pos,
+            modality=modality,
+            token_count=token_count,
+            payload=payload,
+        )
+        # Emit a ghost audio item for video payloads that carry an
+        # embedded audio track. The audio rows live in the audio
+        # encoder bucket but have no MMItemOrder slot of their own;
+        # the model-specific post-process step (video-audio interleave)
+        # consumes them.
+        if modality == "video":
+            audio_payload = payload.get("audio")
+            if audio_payload is not None:
+                yield MultimodalItem(
+                    src_param_idx=param_idx,
+                    item_idx_in_param=-1,
+                    modality="audio",
+                    token_count=_nano_payload_token_count(audio_payload),
+                    payload=audio_payload,
+                    metadata={"paired_video_item_idx": item_pos},
+                )
 
 
 class SquaredReLU(nn.Module):
