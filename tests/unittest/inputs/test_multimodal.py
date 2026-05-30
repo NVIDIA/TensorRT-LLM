@@ -56,7 +56,10 @@ def test_tokenized_multimodal_overwrites_stale_embedding_lengths():
             return "<image>"
 
         def __call__(self, inputs, sampling_params):
-            assert inputs["prompt"] == "<image>"
+            # Tokenized fast path: multimodal_hashing_process forwards the raw
+            # request dict (prompt_token_ids + multi_modal_data), with no
+            # synthesized "prompt" text key.
+            assert inputs["prompt_token_ids"] == [10, 98, 20]
             return [999], {
                 "multimodal_data": {
                     "multimodal_embedding_lengths": [999],
