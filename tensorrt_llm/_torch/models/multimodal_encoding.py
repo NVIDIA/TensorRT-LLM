@@ -145,18 +145,25 @@ class EncodingPlan:
                 within_param_offsets[fi] = running
                 running += items[fi].token_count
 
-        # Build _dst_indices[m]: walk bucket order, emit row ranges for non-ghost items
+        # Build _dst_indices[m]: per modality, expand each non-ghost item's
+        # destination row range [start, start+token_count) with a single
+        # vectorized repeat_interleave + arange (no per-token Python loop).
+        # Per-item Python only assembles the small (start, length) lists.
         dst_indices_t: Dict[str, torch.Tensor] = {}
         param_offsets_list = param_offsets_t.tolist()
         for modality, slot_indices in modality_slots.items():
-            rows: List[int] = []
+            starts: List[int] = []
+            lengths: List[int] = []
             for fi in slot_indices:
                 item = items[fi]
                 if item.item_idx_in_param == -1:
                     continue
-                start = param_offsets_list[item.src_param_idx] + within_param_offsets[fi]
-                rows.extend(range(start, start + item.token_count))
-            dst_indices_t[modality] = torch.tensor(rows, dtype=torch.int64)
+                starts.append(param_offsets_list[item.src_param_idx] + within_param_offsets[fi])
+                lengths.append(item.token_count)
+            dst_indices_t[modality] = _expand_ranges(
+                torch.tensor(starts, dtype=torch.int64),
+                torch.tensor(lengths, dtype=torch.int64),
+            )
 
         return cls(
             items=tuple(items),
@@ -176,6 +183,25 @@ def _running_sum(xs: List[int]) -> Iterable[int]:
     for x in xs:
         s += x
         yield s
+
+
+def _expand_ranges(starts: torch.Tensor, lengths: torch.Tensor) -> torch.Tensor:
+    """Concatenate per-segment ranges ``[s, s + l)`` for paired (starts, lengths).
+
+    Vectorized equivalent of
+    ``torch.cat([torch.arange(s, s + l) for s, l in zip(starts, lengths)])``,
+    built with a single `repeat_interleave` + `arange` (no per-token Python
+    loop). Both inputs are int64 1-D tensors of equal length; returns an empty
+    int64 tensor when there are no rows (e.g. an all-ghost bucket).
+    """
+    total = int(lengths.sum()) if lengths.numel() > 0 else 0
+    if total == 0:
+        return torch.empty(0, dtype=torch.int64)
+    # Exclusive prefix sum: each segment's start offset within the output.
+    seg_start_in_out = torch.cumsum(lengths, dim=0) - lengths
+    within = torch.arange(total, dtype=torch.int64) - seg_start_in_out.repeat_interleave(lengths)
+    base = starts.repeat_interleave(lengths)
+    return base + within
 
 
 # Adapter contract: given a bucket's items and the source-param list,

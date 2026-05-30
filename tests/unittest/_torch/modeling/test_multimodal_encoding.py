@@ -199,7 +199,65 @@ class TestEncodingPlanDstIndices:
 
 import torch  # noqa: E402
 
-from tensorrt_llm._torch.models.multimodal_encoding import encode_with_plan  # noqa: E402
+from tensorrt_llm._torch.models.multimodal_encoding import (  # noqa: E402
+    _expand_ranges,
+    encode_with_plan,
+)
+
+
+def _loop_expand_reference(starts, lengths):
+    """Reference: the original per-token ``rows.extend(range(...))`` loop."""
+    rows = []
+    for s, length in zip(starts, lengths):
+        rows.extend(range(s, s + length))
+    return torch.tensor(rows, dtype=torch.int64)
+
+
+class TestExpandRangesVectorization:
+    """`_expand_ranges` must be byte-identical to the per-token loop it replaces."""
+
+    @pytest.mark.parametrize(
+        "starts,lengths",
+        [
+            ([], []),
+            ([7], [0]),  # zero-length segment
+            ([0], [5]),
+            ([0, 9, 14], [5, 5, 5]),  # mixed_image_audio image bucket shape
+            ([5], [4]),
+            ([3, 100, 0, 50], [2, 0, 3, 1]),  # interleaved zero-length
+            ([0, 682], [682, 357]),  # the dynamic-res multi-image case (sums to 1039)
+        ],
+    )
+    def test_matches_loop_reference(self, starts, lengths):
+        vec = _expand_ranges(
+            torch.tensor(starts, dtype=torch.int64),
+            torch.tensor(lengths, dtype=torch.int64),
+        )
+        ref = _loop_expand_reference(starts, lengths)
+        assert vec.dtype == torch.int64
+        assert torch.equal(vec, ref), f"vec={vec.tolist()} ref={ref.tolist()}"
+
+    def test_plan_dst_indices_match_loop(self):
+        # Plan-level parity: rebuild _dst_indices via the explicit loop and
+        # confirm the vectorized from_params output is identical.
+        items_by_param = {
+            0: [
+                MultimodalItem(0, 0, "image", 5, {"id": "img_A"}),
+                MultimodalItem(0, 1, "audio", 4, {"id": "aud_A"}),
+                MultimodalItem(0, 2, "image", 5, {"id": "img_B"}),
+            ],
+            1: [MultimodalItem(1, 0, "image", 5, {"id": "img_C"})],
+        }
+        plan = EncodingPlan.from_params(
+            multimodal_params=[object(), object()],
+            extract=_identity_extractor(items_by_param),
+        )
+        # img_A -> [0,5), img_B -> [9,14), img_C -> [14,19); aud_A -> [5,9)
+        assert (
+            plan._dst_indices["image"].tolist()
+            == _loop_expand_reference([0, 9, 14], [5, 5, 5]).tolist()
+        )
+        assert plan._dst_indices["audio"].tolist() == _loop_expand_reference([5], [4]).tolist()
 
 
 class TestEncodeWithPlan:
