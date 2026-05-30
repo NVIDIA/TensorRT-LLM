@@ -889,7 +889,18 @@ class PyTorchModelEngine(ModelEngine):
             self, resource_manager: ResourceManager,
             warmup_requests_configs: List[Tuple[int, int]]) -> None:
 
+        # SM120 DSV4: the MLA decode path (sparse indexer / XQA) is not yet
+        # functional on SM120, so generation warmup hits "FMHA kernels not
+        # found". Skip generation warmup (prefill-only) when opted in, so the
+        # server can start and serve prefill. Decode remains future work.
+        _skip_gen_warmup = os.environ.get("TRTLLM_SM120_SKIP_GEN_WARMUP",
+                                          "0") == "1"
         for num_tokens, num_gen_tokens in warmup_requests_configs:
+            if _skip_gen_warmup and num_gen_tokens > 0:
+                logger.info(
+                    f"Skipping generation warmup ({num_gen_tokens} gen tokens) "
+                    "per TRTLLM_SM120_SKIP_GEN_WARMUP")
+                continue
             # Helix CP does not support warmup with context requests.
             if self.mapping.has_cp_helix() and num_tokens != num_gen_tokens:
                 continue
