@@ -16,7 +16,9 @@ from tensorrt_llm._torch.models.modeling_qwen3vl import (
     Qwen3VisionModelBase,
     Qwen3VLInputProcessorBase,
     Qwen3VLModel,
+    _qwen3vl_extract_items,
 )
+from tensorrt_llm._torch.models.multimodal_encoding import EncodingPlan, MultimodalItem
 from tensorrt_llm.inputs.multimodal import MultimodalParams
 
 QWEN3_VL_8B_CONFIG = {
@@ -77,8 +79,23 @@ QWEN3_VL_8B_CONFIG = {
 }
 
 
-class _FakeQwenVisual:
-    def __call__(self, pixel_values, grid_thw):
+class _FakeQwenVisual(torch.nn.Module):
+    """Minimal stand-in for the real Qwen3VL visual encoder.
+
+    `Qwen3VisionModelBase._encode_visual_inputs` calls `self.visual(pixel_values,
+    grid_thw=...)` and concatenates `[embeds] + deepstack_embeds` along dim=1.
+    This fake returns the pixel values verbatim as `embeds` plus a single
+    deepstack level (`embeds + 100`), so the post-merger hidden width is 2.
+    It carries a dummy parameter so `_plan_device` (which reads
+    `next(self.visual.parameters()).device`) resolves to a real device.
+    """
+
+    def __init__(self):
+        super().__init__()
+        # Dummy parameter so `_plan_device()` can read a device off the encoder.
+        self.register_parameter("_anchor", torch.nn.Parameter(torch.zeros(1)))
+
+    def forward(self, pixel_values, grid_thw=None):
         del grid_thw
         base_embeds = pixel_values.to(torch.float32)
         return base_embeds, [base_embeds + 100]
@@ -89,29 +106,47 @@ def _make_qwen_vision_model_for_mixed_tests():
     torch.nn.Module.__init__(model)
     model.model_dtype = torch.float32
     model.visual = _FakeQwenVisual()
-    model.config = SimpleNamespace(spatial_merge_size=2)
+    # `_plan_hidden_dim` = out_hidden_size * (1 + num_deepstack_levels). The fake
+    # emits 1 base column + 1 deepstack level, so out_hidden_size=1 and a single
+    # deepstack index gives the expected concatenated width of 2.
+    model.config = SimpleNamespace(
+        spatial_merge_size=2,
+        out_hidden_size=1,
+        deepstack_visual_indexes=[0],
+    )
     return model
 
 
 def _qwen_image_video_param(include_order=True, include_lengths=True):
+    """A mixed image+video param exercising the plan-based encode path.
+
+    The plan extractor (`_qwen3vl_extract_items`) emits one item per modality and
+    orders them by `multimodal_item_order` (tuple form `(modality, index)`, which
+    is what `MMItemOrder` normalizes to). Per-item token counts come from the
+    explicit `num_tokens` payload key (test convention; mirrors the Task 13
+    extractor tests) so the assembled output is deterministic.
+    """
     multimodal_data = {
         "image": {
             "pixel_values": torch.tensor([[1.0], [2.0], [3.0], [4.0]]),
             "image_grid_thw": torch.tensor([[1, 2, 4], [1, 2, 4]]),
+            "num_tokens": 4,
         },
         "video": {
             "pixel_values_videos": torch.tensor([[10.0], [11.0], [12.0]]),
             "video_grid_thw": torch.tensor([[3, 2, 2]]),
+            "num_tokens": 3,
         },
     }
     if include_order:
-        multimodal_data["multimodal_item_order"] = [
-            {"modality": "video", "index": 0},
-            {"modality": "image", "index": 0},
-            {"modality": "image", "index": 1},
-        ]
-    if include_lengths:
-        multimodal_data["multimodal_embedding_lengths"] = [3, 2, 2]
+        # Prompt order: video item first, then image item.
+        multimodal_data["multimodal_item_order"] = [("video", 0), ("image", 0)]
+    if not include_lengths:
+        # Drop the explicit per-item counts so the token-count fallback chain has
+        # nothing to resolve (no num_tokens, no embedding lengths, no runtime).
+        del multimodal_data["image"]["num_tokens"]
+        del multimodal_data["video"]["num_tokens"]
+        multimodal_data["multimodal_embedding_lengths"] = None
     return MultimodalParams(multimodal_data=multimodal_data)
 
 
@@ -120,6 +155,9 @@ def test_qwen3vl_mixed_image_video_encoder_returns_single_tensor_in_prompt_order
 
     embeddings = model.forward([_qwen_image_video_param()])
 
+    # `forward` returns a single assembled tensor (the cache contract) whose rows
+    # are laid out in MMItemOrder order: the video item (3 rows) precedes the
+    # image item (4 rows), even though the extractor walks modalities image-first.
     assert len(embeddings) == 1
     expected = torch.tensor(
         [
@@ -136,17 +174,46 @@ def test_qwen3vl_mixed_image_video_encoder_returns_single_tensor_in_prompt_order
 
 
 def test_qwen3vl_mixed_image_video_requires_item_order_metadata():
-    model = _make_qwen_vision_model_for_mixed_tests()
+    """A mixed request needs ordering metadata that disambiguates item slots.
 
-    with pytest.raises(ValueError, match="multimodal_item_order"):
-        model.forward([_qwen_image_video_param(include_order=False)])
+    The extractor reads `multimodal_item_order` as `(modality, index)` pairs to
+    assign each modality item a distinct prompt position. When the ordering does
+    not disambiguate the items - so the image and video items collapse onto the
+    same prompt slot - the plan build in `EncodingPlan.from_params` rejects it with
+    a duplicate-position error rather than silently overlapping their embedding
+    ranges. This pins the invariant that a valid per-item ordering is required for
+    a mixed request; the encoder does not fabricate one.
+    """
+
+    def _collapsing_extract(param_idx, p):
+        # Model an order that fails to disambiguate the two mixed items by forcing
+        # both onto prompt slot 0 (what an absent/degenerate order would yield).
+        for item in _qwen3vl_extract_items(param_idx, p):
+            yield MultimodalItem(
+                src_param_idx=item.src_param_idx,
+                item_idx_in_param=0,
+                modality=item.modality,
+                token_count=item.token_count,
+                payload=item.payload,
+            )
+
+    with pytest.raises(ValueError, match="item_idx_in_param"):
+        EncodingPlan.from_params([_qwen_image_video_param()], _collapsing_extract)
 
 
 def test_qwen3vl_mixed_image_video_requires_embedding_length_metadata():
-    model = _make_qwen_vision_model_for_mixed_tests()
+    """Without any token-count source the plan build cannot size a mixed item.
+
+    Token counts come from `num_tokens`, then `multimodal_embedding_lengths`
+    indexed by prompt position, then `multimodal_runtime.total_embeds_in_request`.
+    When none is available the extractor's fallback raises, surfacing during plan
+    build (here exercised directly via `EncodingPlan.from_params`). The message
+    enumerates `multimodal_embedding_lengths` as one of the missing sources.
+    """
+    param = _qwen_image_video_param(include_lengths=False)
 
     with pytest.raises(ValueError, match="multimodal_embedding_lengths"):
-        model.forward([_qwen_image_video_param(include_lengths=False)])
+        EncodingPlan.from_params([param], _qwen3vl_extract_items)
 
 
 def test_qwen3vl_video_token_count_sums_multirow_grid():
