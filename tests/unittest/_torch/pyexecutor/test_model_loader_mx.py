@@ -114,6 +114,7 @@ def test_mx_success_initializes_mapper_skips_weight_mapping_and_reload_works(mon
     # initialize it even though the initial load skipped _call_load_weights.
     loader.reload(model, {"reloaded": MagicMock()})
     assert loader._call_load_weights.call_count == 1
+    assert events == ["post_load_weights", "load_weights"]
 
 
 def test_mx_partial_fallback_merges_returned_weights(monkeypatch):
@@ -154,3 +155,83 @@ def test_mx_fallback_runs_standard_weight_mapping(monkeypatch):
     checkpoint_loader.post_load_publish.assert_called_once_with(
         model, checkpoint_dir="/ckpt", weights_preloaded=False
     )
+
+
+class _HookRecorder(nn.Module):
+    def __init__(
+        self,
+        name: str,
+        events: list[tuple[str, str]],
+        *,
+        removed: bool = False,
+        transformed: bool = False,
+    ) -> None:
+        super().__init__()
+        self.name = name
+        self.events = events
+        self._weights_removed = removed
+        self._weights_transformed = transformed
+
+    def setup_aliases(self):
+        self.events.append((self.name, "setup_aliases"))
+
+    def transform_weights(self):
+        self.events.append((self.name, "transform_weights"))
+        self._weights_transformed = True
+
+    def cache_derived_state(self):
+        self.events.append((self.name, "cache_derived_state"))
+
+    def post_load_weights(self):
+        self.events.append((self.name, "post_load_weights"))
+
+
+class _HookModel(_HookRecorder):
+    def __init__(self, events):
+        super().__init__("model", events)
+        self.child = _HookRecorder("child", events)
+        self.transformed_child = _HookRecorder("transformed_child", events, transformed=True)
+        self.removed_child = _HookRecorder("removed_child", events, removed=True)
+
+
+def test_staged_hook_setup_aliases_is_top_level_only():
+    events = []
+    model = _HookModel(events)
+
+    ModelLoader._setup_aliases(model)
+
+    assert events == [("model", "setup_aliases")]
+
+
+def test_staged_hook_walks_skip_removed_and_transformed_modules():
+    events = []
+    model = _HookModel(events)
+
+    ModelLoader._walk_transform(model)
+    ModelLoader._walk_cache_state(model)
+    ModelLoader._walk_full_post_load(model)
+
+    assert events == [
+        ("model", "transform_weights"),
+        ("child", "transform_weights"),
+        ("model", "cache_derived_state"),
+        ("child", "cache_derived_state"),
+        ("transformed_child", "cache_derived_state"),
+        ("model", "post_load_weights"),
+        ("child", "post_load_weights"),
+        ("transformed_child", "post_load_weights"),
+    ]
+
+
+def test_reset_weights_transformed_only_resets_existing_flags():
+    events = []
+    model = _HookModel(events)
+    model._weights_transformed = True
+    model.child._weights_transformed = True
+
+    ModelLoader._reset_weights_transformed(model)
+
+    assert model._weights_transformed is False
+    assert model.child._weights_transformed is False
+    assert model.transformed_child._weights_transformed is False
+    assert not hasattr(model.removed_child, "_weights_transformed")
