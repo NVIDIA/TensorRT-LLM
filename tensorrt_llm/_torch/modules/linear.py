@@ -2794,13 +2794,7 @@ class W4A8MXFP4MXFP8LinearMethod(W4A8MXFP4FP8LinearMethod):
 
 
 class MarlinNVFP4LinearMethod(NVFP4LinearMethod):
-    """NVFP4 Linear method backed by the Marlin W4A16 kernel (Hopper only).
-
-    Weights are repacked to Marlin tiled format during ``post_load_weights``.
-    Only enabled when the Linear is explicitly configured with
-    ``nvfp4_allowed_backends == ["marlin"]`` — other configurations keep the
-    default NVFP4 path.
-    """
+    """NVFP4 Linear method backed by the Marlin W4A16 kernel (Hopper only)."""
 
     def post_load_weights(self, module: Linear):
         from tensorrt_llm.quantization.utils import marlin_utils
