@@ -354,3 +354,59 @@ class TestEncodeWithPlan:
                 dtype=torch.float32,
                 hidden_dim=H,
             )
+
+
+class TestEncodeWithPlanHighBatch:
+    def test_32_params_three_modalities_three_calls(self):
+        """High-throughput guard: <=3 encoder calls regardless of pure/mixed mix.
+
+        Direct regression guard against the per-mixed-param launch
+        anti-pattern. The plan must collapse 32 source params into one
+        encoder call per active modality.
+        """
+        H = 4
+        call_log_image: list = []
+        call_log_video: list = []
+        call_log_audio: list = []
+
+        def fake(call_log):
+            def enc(items, multimodal_params):
+                call_log.append(len(items))
+                total = sum(it.token_count for it in items)
+                return torch.zeros((total, H), dtype=torch.float32)
+
+            return enc
+
+        items_by_param: dict = {}
+        # 16 pure-image params (4 tokens each)
+        for i in range(16):
+            items_by_param[i] = [MultimodalItem(i, 0, "image", 4, {})]
+        # 16 mixed image+audio params (image @ pos 0, audio @ pos 1)
+        for i in range(16, 32):
+            items_by_param[i] = [
+                MultimodalItem(i, 0, "image", 4, {}),
+                MultimodalItem(i, 1, "audio", 3, {}),
+            ]
+        plan = EncodingPlan.from_params(
+            multimodal_params=[object()] * 32,
+            extract=_identity_extractor(items_by_param),
+        )
+        encoders = {
+            "image": fake(call_log_image),
+            "audio": fake(call_log_audio),
+            "video": fake(call_log_video),  # registered but no items -> no call
+        }
+        encode_with_plan(
+            plan,
+            encoders,
+            multimodal_params=[object()] * 32,
+            device=torch.device("cpu"),
+            dtype=torch.float32,
+            hidden_dim=H,
+        )
+        # Exactly one image call (32 items) + one audio call (16 items) + zero video
+        assert call_log_image == [32], f"expected 1 image call with 32 items, got {call_log_image}"
+        assert call_log_audio == [16], f"expected 1 audio call with 16 items, got {call_log_audio}"
+        assert call_log_video == [], f"expected zero video calls, got {call_log_video}"
+        total_calls = len(call_log_image) + len(call_log_audio) + len(call_log_video)
+        assert total_calls <= 3
