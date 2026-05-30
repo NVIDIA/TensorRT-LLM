@@ -23,7 +23,7 @@ owns partition, index-tensor build, and per-modality scatter assembly.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, Iterable, List, Mapping, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Tuple
 
 import torch
 
@@ -162,3 +162,72 @@ def _running_sum(xs: List[int]) -> Iterable[int]:
     for x in xs:
         s += x
         yield s
+
+
+# Adapter contract: given a bucket's items and the source-param list,
+# return one tensor of shape (sum(item.token_count for item in items), hidden_dim)
+# with rows in bucket order (= order in plan._modality_slots[modality]).
+ModalityEncoder = Callable[[List[MultimodalItem], List[MultimodalParams]], torch.Tensor]
+
+# Post-process: runs after encode, before scatter. May mutate
+# ``bucket_outputs`` in place (e.g. Nano video-audio interleave).
+PostProcess = Callable[[Dict[str, torch.Tensor], "EncodingPlan", List[MultimodalParams]], None]
+
+
+def encode_with_plan(
+    plan: EncodingPlan,
+    encoders: Dict[str, ModalityEncoder],
+    multimodal_params: List[MultimodalParams],
+    *,
+    device: torch.device,
+    dtype: torch.dtype,
+    hidden_dim: int,
+    post_process: Optional[PostProcess] = None,
+) -> torch.Tensor:
+    """Run one encoder call per active modality and assemble via scatter.
+
+    Returns a tensor of shape `(plan.total_tokens, hidden_dim)` in
+    canonical layout (per-param slices in source-param order; each slice
+    in MMItemOrder order). Caller wraps in `[final]` to satisfy the
+    `get_multimodal_embeddings` single-tensor cache contract.
+
+    Hot path: at most `len(plan.active_modalities)` encoder launches +
+    one `index_copy_` per modality + the destination allocation. No
+    per-item Python loops on hot path.
+    """
+    if plan.total_tokens == 0:
+        return torch.empty((0, hidden_dim), dtype=dtype, device=device)
+
+    bucket_outputs: Dict[str, torch.Tensor] = {}
+    for modality in plan.active_modalities:
+        slot_indices = plan._modality_slots[modality].tolist()
+        bucket_items = [plan.items[i] for i in slot_indices]
+        out = encoders[modality](bucket_items, multimodal_params)
+        expected_rows = int(plan._bucket_offsets[modality][-1].item())
+        assert out.shape[0] == expected_rows, (
+            f"encoder for {modality!r} returned {out.shape[0]} rows; "
+            f"plan expected {expected_rows} (sum of item token_counts)"
+        )
+        bucket_outputs[modality] = out
+
+    if post_process is not None:
+        post_process(bucket_outputs, plan, multimodal_params)
+
+    final = torch.empty((plan.total_tokens, hidden_dim), dtype=dtype, device=device)
+    for modality in plan.active_modalities:
+        dst = plan._dst_indices[modality]
+        if dst.numel() == 0:
+            continue  # all-ghost bucket; rows consumed by post_process
+        bucket = bucket_outputs[modality]
+        if dst.numel() != bucket.shape[0]:
+            # Some items in this bucket are ghosts. Convention: non-ghost
+            # items come first in bucket order (extractor's contract);
+            # scatter only the leading non-ghost portion.
+            bucket = bucket[: dst.numel()]
+        final.index_copy_(0, dst.to(device), bucket)
+
+    assert final.shape[0] == int(plan._param_lengths.sum().item()), (
+        f"final shape {final.shape[0]} != sum(_param_lengths) "
+        f"{int(plan._param_lengths.sum().item())}"
+    )
+    return final
