@@ -630,21 +630,21 @@ class Qwen3_5MoeMLP(nn.Module):
             self.gate_proj.weight,
             self.gate_proj.bias,
             tp_mode="colwise",
-            layer_type="moe",
+            layer_type="shared_expert",
         )
         up = torch.ops.auto_deploy.torch_linear_simple(
             x,
             self.up_proj.weight,
             self.up_proj.bias,
             tp_mode="colwise",
-            layer_type="moe",
+            layer_type="shared_expert",
         )
         return torch.ops.auto_deploy.torch_linear_simple(
             self.act_fn(gate) * up,
             self.down_proj.weight,
             self.down_proj.bias,
             tp_mode="rowwise",
-            layer_type="moe",
+            layer_type="shared_expert",
         )
 
 

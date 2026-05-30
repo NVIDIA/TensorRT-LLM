@@ -889,11 +889,6 @@ class IRShardingConfig(TransformConfig):
         default=None,
         description="When set, only shard nodes whose layer_type hint is in this list.",
     )
-    shard_exclude_filter: Optional[List[str]] = Field(
-        default=None,
-        description="Substrings matched against a node's weight parameter keys; matching "
-        "nodes are left replicated (not TP-sharded), e.g. ['shared_expert'].",
-    )
     enable_attention_dp: bool = Field(default=False)
     dist_mapping: dict[str, int] = Field(default_factory=dict)
     dist_config: DistConfig = Field(default_factory=DistConfig)
@@ -924,13 +919,6 @@ class IRShardingConfig(TransformConfig):
 # =============================================================================
 # Standalone helpers
 # =============================================================================
-
-
-def _node_weight_keys_match(node: Node, patterns: List[str]) -> bool:
-    """True if any of *node*'s weight/bias/scale param keys contains a pattern substring."""
-    wn = extract_weight_nodes(node)
-    keys = [n.node_key for n in (*wn.weights, *wn.biases, *wn.scales)]
-    return any(pat in key for key in keys for pat in patterns)
 
 
 def _log_sharding_prelude(dc: DistConfig) -> None:
@@ -1104,7 +1092,6 @@ class ApplyShardingHints(BaseTransform):
             _log_sharding_result(dc, num_updates)
         else:
             shard_layers = self.config.shard_layers
-            exclude_filter = self.config.shard_exclude_filter
             num_skipped = 0
             all_dead_nodes = []
 
@@ -1122,11 +1109,6 @@ class ApplyShardingHints(BaseTransform):
                         if lt is not None and lt not in shard_layers:
                             num_skipped += 1
                             continue
-                    # Replicate (skip sharding) nodes excluded by config, e.g. the
-                    # shared expert, which is cheaper replicated than TP-sharded.
-                    if exclude_filter and _node_weight_keys_match(node, exclude_filter):
-                        num_skipped += 1
-                        continue
 
                     num_updates += shardable_node.apply(gm, dc, max_num_tokens)
 
