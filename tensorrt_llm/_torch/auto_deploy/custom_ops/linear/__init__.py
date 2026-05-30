@@ -28,4 +28,5 @@ __all__ = [
     "swiglu",
     "silu_mul",
     "dsv3_fused_a_gemm",
+    "dsv3_router_gemm",
 ]

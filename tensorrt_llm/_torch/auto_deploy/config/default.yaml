@@ -267,6 +267,9 @@ transforms:
   fuse_dsv3_a_gemm:
     stage: post_load_fusion
     enabled: false
+  fuse_dsv3_router_gemm:
+    stage: post_load_fusion
+    enabled: false
   optimize_rope:
     stage: post_load_fusion
   mlir_elementwise_fusion:
