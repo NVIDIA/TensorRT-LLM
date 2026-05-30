@@ -405,6 +405,7 @@ _DISAGG_CONTEXT_ROLES = {"context", "ctx"}
 _NANO_MODALITIES = ("image", "video", "audio")
 
 
+# TODO(claude): revert these disagg related changes from current feature branch.
 def _is_disagg_context_role() -> bool:
     """Return whether this process is the disaggregated prefill role."""
     return os.getenv(_DISAGG_ROLE_ENV_NAME, "").lower() in _DISAGG_CONTEXT_ROLES
@@ -3593,6 +3594,7 @@ class NemotronH_Nano_VL_V2(transformers.PreTrainedModel):
                 self._validate_evs_context_batch(ctx_params, num_context_requests)
             raw_ctx_params = [param for param in ctx_params if _has_raw_multimodal_data(param)]
             if raw_ctx_params:
+                # TODO(claude): revert these disagg related changes from current feature branch.
                 if _is_disagg() and not _is_disagg_context_role():
                     raise ValueError(
                         "Raw multimodal inputs require a local multimodal encoder on the "

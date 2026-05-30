@@ -71,6 +71,8 @@ Answer only the {target_modality} question below.
 
 
 class MixedModalityInputSample(NamedTuple):
+    """One source example from a single-modality dataset."""
+
     sample_id: str
     media: Any
     question: str
@@ -79,12 +81,16 @@ class MixedModalityInputSample(NamedTuple):
 
 
 class MixedModalitySample(NamedTuple):
+    """One mixed request assembled from modality-specific samples."""
+
     sample_id: str
     items: dict[str, MixedModalityInputSample]
     target_modality: str
 
 
 class MixedModalityTargetResult(NamedTuple):
+    """Scoring result for the selected target modality in one request."""
+
     sample_id: str
     target_modality: str
     prediction: str
@@ -94,6 +100,8 @@ class MixedModalityTargetResult(NamedTuple):
 
 
 class MixedModalityTargetScoreSummary(NamedTuple):
+    """Aggregate target-only accuracy for mixed or pure requests."""
+
     target_accuracy: float
     correct_targets: int
     total_requests: int
@@ -102,12 +110,16 @@ class MixedModalityTargetScoreSummary(NamedTuple):
 
 
 class MixedModalityPairedBaselineSummary(NamedTuple):
+    """Mixed-versus-pure paired baseline deltas and counts."""
+
     mixed_minus_pure_accuracy: float
     mixed_minus_pure_accuracy_by_target: dict[str, float]
     paired_counts_by_target: dict[str, dict[str, int]]
 
 
 class _MixedModalityInputContext(NamedTuple):
+    """Model input-format context reused while constructing requests."""
+
     model_type: str
     processor: Any
     content_format: Any
@@ -157,6 +169,7 @@ class MixedModalityEvaluator(Evaluator):
         self.pure_baseline_max_per_target_accuracy_drop = pure_baseline_max_per_target_accuracy_drop
 
     def generate_samples(self) -> Iterable[tuple]:
+        """Keep the base evaluator sample loop disabled for this custom flow."""
         # Required by the abstract base, but `evaluate()` owns the multimodal
         # request construction so the base-class sample loop is unused.
         raise NotImplementedError
@@ -167,6 +180,7 @@ class MixedModalityEvaluator(Evaluator):
         references: list[dict[str, str]],
         samples: list[MixedModalitySample],
     ) -> float:
+        """Return target-only accuracy for generated request outputs."""
         _, target_summary = self._score_outputs(outputs, samples, label="MixedModality")
         return target_summary.target_accuracy
 
@@ -176,6 +190,7 @@ class MixedModalityEvaluator(Evaluator):
         samples: list[MixedModalitySample],
         label: str,
     ) -> tuple[list[MixedModalityTargetResult], MixedModalityTargetScoreSummary]:
+        """Score request outputs against the selected target modality only."""
         predictions = [output.outputs[0].text for output in outputs]
         target_results = _score_target_predictions(predictions, samples)
         target_summary = _summarize_target_results(target_results, self.target_modalities)
@@ -205,6 +220,7 @@ class MixedModalityEvaluator(Evaluator):
         sampling_params: Optional["SamplingParams"] = None,
         streaming: bool = False,
     ) -> float:
+        """Run mixed requests, paired pure baselines, and degradation gates."""
         import tensorrt_llm.profiler as profiler
         from tensorrt_llm.evaluate.interface import dump_inference_results
 
@@ -261,6 +277,7 @@ class MixedModalityEvaluator(Evaluator):
         sampling_params: Optional["SamplingParams"],
         streaming: bool,
     ) -> list["RequestOutput"]:
+        """Submit requests one at a time to bound media cache pressure."""
         video_cache: dict[str, Any] = {}
         outputs = []
         for sample in samples:
@@ -281,6 +298,7 @@ class MixedModalityEvaluator(Evaluator):
         return outputs
 
     def _iter_samples(self) -> Iterable[MixedModalitySample]:
+        """Load per-modality sources and yield deterministic mixed samples."""
         source_sample_count = _target_source_sample_count(self.num_samples)
         input_samples_by_modality = {
             modality: _load_input_samples(
@@ -297,6 +315,7 @@ class MixedModalityEvaluator(Evaluator):
         )
 
     def _make_input_context(self, llm: Any) -> _MixedModalityInputContext:
+        """Resolve chat-template and content-format state from the LLM."""
         from tensorrt_llm.evaluate.interface import get_chat_template_kwargs, get_model_context
         from tensorrt_llm.inputs.utils import _resolve_content_format, resolve_hf_chat_template
 
@@ -319,6 +338,7 @@ class MixedModalityEvaluator(Evaluator):
         input_context: _MixedModalityInputContext,
         video_cache: dict[str, Any],
     ) -> dict[str, Any]:
+        """Build one LLM request carrying all sample media and one target question."""
         from tensorrt_llm.inputs import (
             ConversationMessage,
             MultimodalData,
@@ -381,6 +401,7 @@ def select_mixed_modality_samples(
     active_modalities: Optional[tuple[str, ...]] = None,
     target_modalities: Optional[tuple[str, ...]] = None,
 ) -> list[MixedModalitySample]:
+    """Select deterministic mixed samples with randomized target assignment."""
     rng = random.Random(random_seed)
     active_modalities = _normalize_modalities(
         active_modalities or tuple(input_samples_by_modality), "active", min_count=2
@@ -425,6 +446,7 @@ def select_mixed_modality_samples(
 def _normalize_modalities(
     modalities: tuple[str, ...], label: str, min_count: int
 ) -> tuple[str, ...]:
+    """Validate modality names, duplicates, and minimum set size."""
     if len(modalities) < min_count:
         raise ValueError(
             f"Mixed modality {label} set must contain at least {min_count} modality entries."
@@ -448,6 +470,7 @@ def _validate_target_modalities(
     active_modalities: tuple[str, ...],
     target_modalities: tuple[str, ...],
 ) -> None:
+    """Ensure queried modalities are present in each mixed request."""
     missing_targets = set(target_modalities) - set(active_modalities)
     if missing_targets:
         raise ValueError(
@@ -460,6 +483,7 @@ def _validate_dataset_paths(
     active_modalities: tuple[str, ...],
     modality_dataset_paths: dict[str, str],
 ) -> None:
+    """Ensure every active modality has a configured dataset path."""
     missing_paths = [
         modality for modality in active_modalities if modality not in modality_dataset_paths
     ]
@@ -472,6 +496,7 @@ def _select_target_modalities(
     rng: random.Random,
     target_modalities: tuple[str, ...],
 ) -> list[str]:
+    """Generate a balanced, shuffled target-modality schedule."""
     selected_targets = [
         target_modalities[idx % len(target_modalities)] for idx in range(sample_count)
     ]
@@ -480,6 +505,7 @@ def _select_target_modalities(
 
 
 def _target_source_sample_count(num_samples: Optional[int]) -> Optional[int]:
+    """Oversample source rows so filtering still yields enough targets."""
     if num_samples is None:
         return None
     return max(num_samples * 2, num_samples + 8)
@@ -490,6 +516,7 @@ def _load_input_samples(
     dataset_path: str,
     max_samples: Optional[int],
 ) -> list[MixedModalityInputSample]:
+    """Dispatch source dataset loading by modality."""
     if modality == MODALITY_IMAGE:
         return _load_mmmu_input_samples(Path(dataset_path), max_samples)
     if modality == MODALITY_AUDIO:
@@ -502,6 +529,7 @@ def _load_input_samples(
 def _load_mmmu_input_samples(
     dataset_path: Path, max_samples: Optional[int] = None
 ) -> list[MixedModalityInputSample]:
+    """Load image question-answer samples from an MMMU-style dataset."""
     samples = []
     for idx, (row, _default_subject) in enumerate(_iter_mmmu_rows(dataset_path)):
         image = _get_mmmu_image(row)
@@ -525,6 +553,7 @@ def _load_mmmu_input_samples(
 
 
 def _iter_mmmu_rows(dataset_path: Path) -> Iterable[tuple[dict[str, Any], str]]:
+    """Yield MMMU rows across available configs and evaluation splits."""
     from datasets import get_dataset_config_names, load_dataset
 
     config_names: list[str] = []
@@ -557,6 +586,7 @@ def _iter_mmmu_rows(dataset_path: Path) -> Iterable[tuple[dict[str, Any], str]]:
 def _load_voxpopuli_input_samples(
     dataset_path: str, max_samples: Optional[int] = None
 ) -> list[MixedModalityInputSample]:
+    """Load audio transcription samples from a VoxPopuli-style dataset."""
     from tensorrt_llm.evaluate.audio_asr import _get_audio_data, _load_local_hf_dataset
 
     dataset = _load_local_hf_dataset(dataset_path, "test")
@@ -589,6 +619,7 @@ def _load_voxpopuli_input_samples(
 def _load_videomme_input_samples(
     dataset_path: Path, max_samples: Optional[int] = None
 ) -> list[MixedModalityInputSample]:
+    """Load video multiple-choice samples from a VideoMME-style dataset."""
     samples = []
     annotations_path = dataset_path / ANNOTATIONS_FILE
     with open(annotations_path, "r", encoding="utf-8") as annotations_file:
@@ -615,6 +646,7 @@ def _load_videomme_input_samples(
 
 
 def _get_mmmu_image(row: dict[str, Any]) -> Any:
+    """Return the first available image field from an MMMU row."""
     for key in ("image", "image_1", "image_0"):
         image = row.get(key)
         if image is not None:
@@ -631,6 +663,7 @@ def _materialize_media(
     video_cache: dict[str, Any],
     num_frames: int,
 ) -> Any:
+    """Load or normalize media payloads just before request construction."""
     if modality == MODALITY_IMAGE:
         return _materialize_image(media)
     if modality == MODALITY_AUDIO:
@@ -650,6 +683,7 @@ def _materialize_media(
 
 
 def _materialize_image(image: Any) -> Any:
+    """Normalize image payload variants to a PIL-compatible image."""
     from tensorrt_llm.inputs.utils import load_image
 
     if isinstance(image, Image.Image):
@@ -666,6 +700,7 @@ def _materialize_image(image: Any) -> Any:
 
 
 def _get_media_source_paths(media: Any) -> tuple[str, ...]:
+    """Return paths that identify a sample media source."""
     if isinstance(media, str):
         return (media,)
     if isinstance(media, dict) and media.get("path"):
@@ -677,6 +712,7 @@ def _get_media_source_paths(media: Any) -> tuple[str, ...]:
 
 
 def _format_mixed_modality_prompt(sample: MixedModalitySample) -> str:
+    """Format the target-only prompt with distractor context."""
     target_modality = _require_target_modality(sample)
     if len(sample.items) > 1:
         distractor_line = "The non-target media are random distractors."
@@ -691,6 +727,7 @@ def _format_mixed_modality_prompt(sample: MixedModalitySample) -> str:
 
 
 def _format_modality_list(modalities: tuple[str, ...]) -> str:
+    """Return human-readable modality list text for the prompt."""
     display_names = [MODALITY_DISPLAY_NAMES[modality] for modality in modalities]
     if len(display_names) == 1:
         return display_names[0]
@@ -700,6 +737,7 @@ def _format_modality_list(modalities: tuple[str, ...]) -> str:
 
 
 def _format_mmmu_question(row: dict[str, Any]) -> str:
+    """Format an MMMU question and choices for target scoring."""
     question = str(row.get("question", row.get("input", "Answer the image question.")))
     options = _parse_options(row.get("options"))
     if not options:
@@ -708,6 +746,7 @@ def _format_mmmu_question(row: dict[str, Any]) -> str:
 
 
 def _format_video_question(row: dict[str, Any]) -> str:
+    """Format a video question and choices for target scoring."""
     question = str(row["question"])
     options = _parse_options(row.get("options"))
     if not options:
@@ -716,6 +755,7 @@ def _format_video_question(row: dict[str, Any]) -> str:
 
 
 def _parse_options(options: Any) -> list[str]:
+    """Normalize dataset option fields into a list of strings."""
     if options is None:
         return []
     if isinstance(options, str):
@@ -730,6 +770,7 @@ def _parse_options(options: Any) -> list[str]:
 
 
 def _format_options(options: list[str]) -> str:
+    """Render choices with option letters when the dataset omits them."""
     lines = []
     for idx, option in enumerate(options):
         letter = chr(ord("A") + idx)
@@ -744,6 +785,7 @@ def _format_target_mismatch_report(
     target_results: list[MixedModalityTargetResult],
     limit: int = 10,
 ) -> str:
+    """Summarize target-scoring failures for logs."""
     mismatches = [result for result in target_results if not result.is_correct][:limit]
     lines = []
     for result in mismatches:
@@ -759,6 +801,7 @@ def _format_target_mismatch_report(
 
 
 def _extract_response_sections(text: str) -> dict[str, str]:
+    """Extract optional modality-prefixed answer sections from model text."""
     modality_pattern = "|".join(SUPPORTED_MODALITIES)
     section_pattern = re.compile(
         rf"(?ims)^\s*({modality_pattern})\s*:\s*(.*?)(?=^\s*(?:{modality_pattern})\s*:|\Z)"
@@ -770,6 +813,7 @@ def _extract_response_sections(text: str) -> dict[str, str]:
 
 
 def _extract_choice_answer(text: str, max_choice: str) -> Optional[str]:
+    """Extract a multiple-choice option from model text."""
     max_choice = max_choice.upper()
     explicit = re.search(
         rf"\b(?:answer\s*(?:is|:)?|option)\s*\(?\s*([A-{max_choice}a-{max_choice.lower()}])\s*\)?",
@@ -793,6 +837,7 @@ def _extract_choice_answer(text: str, max_choice: str) -> Optional[str]:
 
 
 def _normalize_choice_answer(answer: str, max_choice: str) -> Optional[str]:
+    """Normalize answer keys and generated choices to one letter."""
     answer = answer.strip().upper()
     if re.fullmatch(rf"[A-{max_choice.upper()}]", answer):
         return answer
@@ -800,6 +845,7 @@ def _normalize_choice_answer(answer: str, max_choice: str) -> Optional[str]:
 
 
 def _require_target_modality(sample: MixedModalitySample) -> str:
+    """Return a valid target modality or raise a sample-shape error."""
     target_modality = sample.target_modality
     if target_modality not in sample.items:
         raise ValueError(
@@ -810,10 +856,12 @@ def _require_target_modality(sample: MixedModalitySample) -> str:
 
 
 def _target_question(sample: MixedModalitySample, target_modality: str) -> str:
+    """Return the question for the selected target modality."""
     return sample.items[target_modality].question
 
 
 def _audio_wer(prediction: str, reference: str) -> float:
+    """Compute word error rate percentage for audio transcript scoring."""
     prediction_words = _normalize_scoring_text(prediction).split()
     reference_words = _normalize_scoring_text(reference).split()
     if not reference_words:
@@ -823,6 +871,7 @@ def _audio_wer(prediction: str, reference: str) -> float:
 
 
 def _normalize_scoring_text(text: str) -> str:
+    """Normalize text before WER scoring."""
     text = text.casefold()
     text = re.sub(r"<\|.*?\|>", " ", text)
     text = re.sub(r"[^\w\s']", " ", text)
@@ -830,6 +879,7 @@ def _normalize_scoring_text(text: str) -> str:
 
 
 def _levenshtein_distance(reference: list[str], hypothesis: list[str]) -> int:
+    """Compute edit distance between token sequences."""
     if len(reference) < len(hypothesis):
         reference, hypothesis = hypothesis, reference
 
@@ -853,6 +903,7 @@ def _score_target_predictions(
     predictions: list[str],
     samples: list[MixedModalitySample],
 ) -> list[MixedModalityTargetResult]:
+    """Score each prediction against only its selected target modality."""
     results = []
     for prediction, sample in zip(predictions, samples, strict=True):
         target_modality = _require_target_modality(sample)
@@ -881,6 +932,7 @@ def _score_target_answer(
     prediction: str,
     expected_keyword: str,
 ) -> bool:
+    """Apply modality-specific target-answer scoring."""
     sections = _extract_response_sections(prediction)
     target_text = sections.get(target_modality, prediction)
     if target_modality == MODALITY_IMAGE:
@@ -896,6 +948,7 @@ def _summarize_target_results(
     target_results: list[MixedModalityTargetResult],
     target_modalities: Optional[tuple[str, ...]] = None,
 ) -> MixedModalityTargetScoreSummary:
+    """Aggregate target-only correctness overall and by modality."""
     if target_modalities is None:
         target_modalities = tuple(
             dict.fromkeys(result.target_modality for result in target_results)
@@ -925,6 +978,7 @@ def _summarize_target_results(
 def _make_pure_target_samples(
     samples: list[MixedModalitySample],
 ) -> list[MixedModalitySample]:
+    """Build paired single-modality requests for mixed-vs-pure gating."""
     pure_samples = []
     for sample in samples:
         target_modality = _require_target_modality(sample)
@@ -945,6 +999,7 @@ def _summarize_paired_baseline(
     pure_summary: MixedModalityTargetScoreSummary,
     target_modalities: tuple[str, ...],
 ) -> MixedModalityPairedBaselineSummary:
+    """Compute mixed-minus-pure deltas from aligned sample pairs."""
     mixed_minus_pure_by_target = {}
     paired_counts_by_target = {}
     for modality in target_modalities:
@@ -988,6 +1043,7 @@ def _assert_pure_baseline_not_degraded(
     max_accuracy_drop: float,
     max_per_target_accuracy_drop: float,
 ) -> None:
+    """Fail when mixed accuracy drops below paired pure-baseline gates."""
     paired_summary = _summarize_paired_baseline(
         mixed_results=mixed_results,
         pure_results=pure_results,
@@ -1038,10 +1094,12 @@ def _assert_pure_baseline_not_degraded(
 
 
 def _expected_keywords(sample: MixedModalitySample) -> dict[str, str]:
+    """Return expected answer keys by modality for reporting."""
     return {modality: item.keyword for modality, item in sample.items.items()}
 
 
 def _log_source_digest(samples: list[MixedModalitySample]) -> None:
+    """Log a stable digest of materialized source media paths."""
     entries = []
     for sample in samples:
         for item in sample.items.values():
@@ -1060,6 +1118,7 @@ def _log_target_modality_counts(
     samples: list[MixedModalitySample],
     target_modalities: tuple[str, ...],
 ) -> None:
+    """Log target-modality coverage for the selected samples."""
     target_counts = {
         modality: sum(sample.target_modality == modality for sample in samples)
         for modality in target_modalities

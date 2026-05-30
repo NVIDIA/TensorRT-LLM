@@ -1867,6 +1867,44 @@ class TestExpandPromptTokenIdsForMM:
         assert multimodal_data["image"] is image_data
         assert multimodal_data["video"] is video_data
         assert multimodal_data["audio"] is audio_data
+        assert multimodal_data["multimodal_embedding_lengths"] == [3, 256, 3]
+
+    def test_call_mixed_image_video_image_builds_embedding_lengths(self):
+        proc = _make_fast_path_processor(video_target_num_patches=None)
+        proc._add_video_prefix = False
+        proc.video_pruning_rate = 0
+        proc.video_temporal_patch_size = 1
+        img_ctx = proc.img_context_token_id
+        frames = [Image.new("RGB", (512, 512))]
+        image_data = {"pixel_values": torch.ones(2, 3, 2, 2)}
+        video_data = {
+            "pixel_values": torch.ones(1, 3, 2, 2),
+            "video_size": [[1, 1, 512, 512]],
+        }
+        proc._prepare_image_modality_data = mock.Mock(return_value=image_data)
+        proc._prepare_video_modality_data = mock.Mock(return_value=video_data)
+        proc._get_num_tokens_for_item_order = mock.Mock(return_value=[5, 258, 5])
+        prompt = f"{proc.img_context_token}{proc.video_context_token}{proc.img_context_token}"
+        inputs = {
+            "prompt": prompt,
+            "multi_modal_data": {
+                "image": [object(), object()],
+                "video": [SimpleNamespace(frames=frames, metadata=None, audio=None)],
+            },
+        }
+
+        result, extra_inputs = proc(inputs, None)
+
+        image_block = [500] + [img_ctx] * 3 + [501]
+        video_block = list(range(9)) + [500] + [img_ctx] * 256 + [501]
+        assert result == image_block + video_block + image_block
+        multimodal_data = extra_inputs["multimodal_data"]
+        assert multimodal_data["multimodal_item_order"] == [
+            {"modality": "image", "index": 0},
+            {"modality": "video", "index": 0},
+            {"modality": "image", "index": 1},
+        ]
+        assert multimodal_data["multimodal_embedding_lengths"] == [3, 256, 3]
 
 
 class TestGetNumTokensPerAudio:

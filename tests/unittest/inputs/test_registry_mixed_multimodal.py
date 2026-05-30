@@ -9,6 +9,9 @@ from tensorrt_llm.inputs.multimodal_data import AudioData, VideoData
 from tensorrt_llm.inputs.registry import create_input_processor_with_hash
 from tensorrt_llm.sampling_params import SamplingParams
 
+# TODO(claude) : add concise docstrings/comments explaining intended behavior for each test.
+# TODO(claude) : If there are some constants/macros declare it globally.
+
 
 class _FakeMixedProcessor:
     def __init__(self):

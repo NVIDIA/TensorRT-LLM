@@ -1,7 +1,9 @@
 import os
 from dataclasses import dataclass
+from types import SimpleNamespace
 from typing import List, Optional
 
+import pytest
 import torch
 from _torch.helpers import create_mock_cuda_graph_runner
 from test_modeling_multimodal import MultimodalScenario, TestModelingMultimodal
@@ -10,7 +12,12 @@ from transformers import Qwen3VLForConditionalGeneration as HFQwen3VLForConditio
 from utils.llm_data import llm_models_root
 
 from tensorrt_llm._torch.models.checkpoints.hf.qwen3vl_weight_mapper import Qwen3VLHfWeightMapper
-from tensorrt_llm._torch.models.modeling_qwen3vl import Qwen3VLInputProcessorBase, Qwen3VLModel
+from tensorrt_llm._torch.models.modeling_qwen3vl import (
+    Qwen3VisionModelBase,
+    Qwen3VLInputProcessorBase,
+    Qwen3VLModel,
+)
+from tensorrt_llm.inputs.multimodal import MultimodalParams
 
 QWEN3_VL_8B_CONFIG = {
     "architectures": ["Qwen3VLForConditionalGeneration"],
@@ -68,6 +75,101 @@ QWEN3_VL_8B_CONFIG = {
     "_attn_implementation": "flash_attention_2",
     "_name_or_path": str(os.path.join(llm_models_root(), "Qwen3", "Qwen3-VL-8B-Instruct")),
 }
+
+
+class _FakeQwenVisual:
+    def __call__(self, pixel_values, grid_thw):
+        del grid_thw
+        base_embeds = pixel_values.to(torch.float32)
+        return base_embeds, [base_embeds + 100]
+
+
+def _make_qwen_vision_model_for_mixed_tests():
+    model = Qwen3VisionModelBase.__new__(Qwen3VisionModelBase)
+    torch.nn.Module.__init__(model)
+    model.model_dtype = torch.float32
+    model.visual = _FakeQwenVisual()
+    model.config = SimpleNamespace(spatial_merge_size=2)
+    return model
+
+
+def _qwen_image_video_param(include_order=True, include_lengths=True):
+    multimodal_data = {
+        "image": {
+            "pixel_values": torch.tensor([[1.0], [2.0], [3.0], [4.0]]),
+            "image_grid_thw": torch.tensor([[1, 2, 4], [1, 2, 4]]),
+        },
+        "video": {
+            "pixel_values_videos": torch.tensor([[10.0], [11.0], [12.0]]),
+            "video_grid_thw": torch.tensor([[3, 2, 2]]),
+        },
+    }
+    if include_order:
+        multimodal_data["multimodal_item_order"] = [
+            {"modality": "video", "index": 0},
+            {"modality": "image", "index": 0},
+            {"modality": "image", "index": 1},
+        ]
+    if include_lengths:
+        multimodal_data["multimodal_embedding_lengths"] = [3, 2, 2]
+    return MultimodalParams(multimodal_data=multimodal_data)
+
+
+def test_qwen3vl_mixed_image_video_encoder_returns_single_tensor_in_prompt_order():
+    model = _make_qwen_vision_model_for_mixed_tests()
+
+    embeddings = model.forward([_qwen_image_video_param()])
+
+    assert len(embeddings) == 1
+    expected = torch.tensor(
+        [
+            [10.0, 110.0],
+            [11.0, 111.0],
+            [12.0, 112.0],
+            [1.0, 101.0],
+            [2.0, 102.0],
+            [3.0, 103.0],
+            [4.0, 104.0],
+        ]
+    )
+    torch.testing.assert_close(embeddings[0], expected)
+
+
+def test_qwen3vl_mixed_image_video_requires_item_order_metadata():
+    model = _make_qwen_vision_model_for_mixed_tests()
+
+    with pytest.raises(ValueError, match="multimodal_item_order"):
+        model.forward([_qwen_image_video_param(include_order=False)])
+
+
+def test_qwen3vl_mixed_image_video_requires_embedding_length_metadata():
+    model = _make_qwen_vision_model_for_mixed_tests()
+
+    with pytest.raises(ValueError, match="multimodal_embedding_lengths"):
+        model.forward([_qwen_image_video_param(include_lengths=False)])
+
+
+def test_qwen3vl_video_token_count_sums_multirow_grid():
+    processor = Qwen3VLInputProcessorBase.__new__(Qwen3VLInputProcessorBase)
+    processor._config = SimpleNamespace(vision_config=SimpleNamespace(spatial_merge_size=2))
+
+    num_tokens = processor.get_num_tokens_per_video(
+        video=[],
+        video_grid_thw=torch.tensor([[1, 4, 4], [2, 4, 4]]),
+    )
+
+    assert num_tokens == 12
+
+
+def test_qwen3vl_item_order_from_prompt_handles_image_video_interleave():
+    processor = Qwen3VLInputProcessorBase.__new__(Qwen3VLInputProcessorBase)
+
+    item_order = processor._get_mm_item_order_from_text(
+        "v <|vision_start|><|video_pad|><|vision_end|> i <|vision_start|><|image_pad|><|vision_end|>",
+        {"image": [object()], "video": [object()]},
+    )
+
+    assert item_order == [("video", 0), ("image", 0)]
 
 
 @dataclass(repr=False)
