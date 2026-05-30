@@ -7,13 +7,8 @@ HOST=localhost
 PORT=8000
 CONFIG=./agg_config.yaml
 
-echo "Killing existing servers"
-AGG_PROCESS_ID=$(pgrep -f "trtllm-serve ${MODEL} --host ${HOST} --port ${PORT} --config ${CONFIG}" || true)
-DISAGG_PROCESS_ID=$(pgrep -f "trtllm-serve disaggregated -c ./disagg_config.yaml" || true)
-
-if [ -n "${AGG_PROCESS_ID}" ] || [ -n "${DISAGG_PROCESS_ID}" ]; then
-    kill -9 ${AGG_PROCESS_ID} ${DISAGG_PROCESS_ID}
-fi
+./kill_agg.sh
+./kill.sh 
 
 echo "Starting aggregate server"
 CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0} trtllm-serve ${MODEL} \
@@ -34,7 +29,6 @@ curl http://${HOST}:${PORT}/v1/completions \
         "model": "TinyLlama/TinyLlama-1.1B-Chat-v1.0",
         "prompt": "NVIDIA is a great company because",
         "use_beam_search": true,
-        "best_of": 4,
         "n": 4,
         "max_tokens": 1024,
         "temperature": 0
@@ -50,3 +44,38 @@ curl http://localhost:8000/v1/completions \
         "max_tokens": 1024,
         "temperature": 0
     }' -w "\n" 2>&1 | tee atmosphere_output.json
+
+curl http://localhost:8000/v1/completions \
+    -H "Content-Type: application/json" \
+    -d '{
+        "model": "TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+        "prompt": "Home is whenever I am with you",
+        "use_beam_search": true,
+        "n": 4,
+        "max_tokens": 1024,
+        "temperature": 0
+    }' -w "\n" 
+
+
+curl http://localhost:8000/v1/completions \
+    -H "Content-Type: application/json" \
+    -d '{
+        "model": "TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+        "prompt": "Tungsten is a metal",
+        "use_beam_search": true,
+        "n": 4,
+        "max_tokens": 1024,
+        "temperature": 0
+    }' -w "\n" 
+
+
+curl http://localhost:8000/v1/completions \
+-H "Content-Type: application/json" \
+-d '{
+    "model": "TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+    "prompt": "When war orphan Rin aced the Keju",
+    "use_beam_search": true,
+    "n": 4,
+    "max_tokens": 1024,
+    "temperature": 0
+}' -w "\n" 

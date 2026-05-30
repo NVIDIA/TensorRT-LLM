@@ -1436,6 +1436,9 @@ WindowBlockManager::ReuseMatchResult WindowBlockManager::findReusableBlockMatche
     std::vector<BlockKey> const& blockKeys, bool enablePartialReuse, bool copyOnPartialReuse,
     SizeType32 maxMatchedTokens) const
 {
+    // ATHENA6
+    TLLM_LOG_DEBUG("findReusableBlockMatches - enablePartialReuse=%d, copyOnPartialReuse=%d, maxMatchedTokens=%d blockKeys.size()=%d", enablePartialReuse, copyOnPartialReuse, maxMatchedTokens, blockKeys.size());
+    
     ReuseMatchResult result;
     std::vector<ReuseMatch> candidateMatches;
     candidateMatches.reserve(blockKeys.size());
@@ -1898,11 +1901,13 @@ SizeType32 WindowBlockManager::onboardAndAllocateBlocks(
     }
 
     // Finalize matched token count (purge trailing placeholders for recurrent states)
+    // ATHENA5
     auto numMatchedTokens = claimResult.totalMatchedTokens;
     if (isRecurrentState())
     {
         numMatchedTokens = (claimResult.latestMatchingNonPlaceholderBlockIdx + 1) * mTokensPerBlock;
     }
+    TLLM_LOG_DEBUG("onboardAndAllocateBlocks - numMatchedTokens=%d, claimResult.totalMatchedTokens=%d, claimResult.latestMatchingNonPlaceholderBlockIdx=%d", numMatchedTokens, claimResult.totalMatchedTokens, claimResult.latestMatchingNonPlaceholderBlockIdx);
     sequence.setCurrentPrepopulatedPromptLen(numMatchedTokens);
 
     // Update stats and return prepopulated length
@@ -2039,6 +2044,13 @@ std::vector<WindowBlockManager::BatchSeqStats> WindowBlockManager::addSequenceBa
         TLLM_LOG_DEBUG("request id %lu claimResults[i].numContextBlocks = %d", sequences[i]->getRequestId(), claimResults[i].numContextBlocks);
         TLLM_LOG_DEBUG("request id %lu claimResults[i].shareLastContextBlockAmongBeams = %d", sequences[i]->getRequestId(), claimResults[i].shareLastContextBlockAmongBeams);
         TLLM_LOG_DEBUG("request id %lu claimResults[i].blockKeys.size() = %d", sequences[i]->getRequestId(), claimResults[i].blockKeys.size());
+
+        // ATHENA4
+        if (claimResults[i].totalMatchedTokens > claimResults[i].numSharedContextBlocks * mTokensPerBlock)
+        {
+            TLLM_LOG_DEBUG("request id %lu rounding down claimResults[i].totalMatchedTokens", sequences[i]->getRequestId());
+            claimResults[i].totalMatchedTokens = claimResults[i].numSharedContextBlocks * mTokensPerBlock;
+        }
 
         SizeType32 const preTotalBlocks = mAllocTotalBlocks;
         SizeType32 const preNewBlocks = mAllocNewBlocks;
