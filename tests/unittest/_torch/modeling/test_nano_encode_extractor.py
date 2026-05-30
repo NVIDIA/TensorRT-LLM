@@ -28,7 +28,7 @@ from tensorrt_llm._torch.models.modeling_nemotron_nano import (
     _nano_extract_items,
 )
 from tensorrt_llm._torch.models.multimodal_encoding import EncodingPlan, MultimodalItem
-from tensorrt_llm.inputs.multimodal import MultimodalParams
+from tensorrt_llm.inputs.multimodal import MultimodalParams, MultimodalRuntimeData
 
 
 def _identity_extractor(items_by_param):
@@ -170,6 +170,104 @@ class TestNanoExtractItems:
         }
         with pytest.raises(ValueError, match="Unknown modality"):
             list(_nano_extract_items(0, _make_param(payload)))
+
+
+def _make_runtime(total_embeds: int) -> MultimodalRuntimeData:
+    """Build a real ``MultimodalRuntimeData`` with the given total token count."""
+    cumsum = torch.arange(1, total_embeds + 1, dtype=torch.int64)
+    return MultimodalRuntimeData(
+        past_seen_token_num=0,
+        chunk_end_pos=total_embeds,
+        embed_mask_cumsum=cumsum,
+    )
+
+
+def _make_param_with_runtime(multimodal_data: dict, total_embeds: int) -> MultimodalParams:
+    return MultimodalParams(
+        multimodal_input=None,
+        multimodal_data=multimodal_data,
+        multimodal_runtime=_make_runtime(total_embeds),
+    )
+
+
+class TestNanoExtractorProductionSchema:
+    """Exercise the production-fields fallback for per-item token counts.
+
+    When the synthetic ``num_tokens`` field is absent from a payload, the
+    extractor resolves token counts via the production preprocessing
+    fields: ``multimodal_embedding_lengths`` indexed by
+    ``multimodal_item_order`` for mixed params, and
+    ``multimodal_runtime.total_embeds_in_request`` for pure single-modality
+    params.
+    """
+
+    def test_pure_image_uses_multimodal_runtime(self):
+        # No num_tokens on payload; total_embeds_in_request drives the count.
+        payload = {"pixel_values": "fake"}
+        param = _make_param_with_runtime(
+            {"image": payload, "modality_type": "image"},
+            total_embeds=7,
+        )
+        items = list(_nano_extract_items(0, param))
+        assert len(items) == 1
+        assert items[0].modality == "image"
+        assert items[0].token_count == 7
+        assert items[0].item_idx_in_param == 0
+
+    def test_pure_audio_uses_multimodal_runtime(self):
+        payload = {"input_features": "fake"}
+        param = _make_param_with_runtime(
+            {"audio": payload, "modality_type": "audio"},
+            total_embeds=4,
+        )
+        items = list(_nano_extract_items(0, param))
+        assert len(items) == 1
+        assert items[0].modality == "audio"
+        assert items[0].token_count == 4
+
+    def test_mixed_uses_multimodal_embedding_lengths(self):
+        # No num_tokens on either payload; mixed params get counts from
+        # multimodal_embedding_lengths indexed by multimodal_item_order.
+        payload_image = {"pixel_values": "fake"}
+        payload_audio = {"input_features": "fake"}
+        param = _make_param(
+            {
+                "image": payload_image,
+                "audio": payload_audio,
+                "modality_type": ["image", "audio"],
+                "multimodal_item_order": [
+                    {"modality": "image", "index": 0},
+                    {"modality": "audio", "index": 0},
+                ],
+                "multimodal_embedding_lengths": [5, 4],
+            }
+        )
+        items = list(_nano_extract_items(0, param))
+        by_modality = {it.modality: it.token_count for it in items}
+        assert by_modality == {"image": 5, "audio": 4}
+        # item_idx_in_param tracks MMItemOrder positions.
+        positions = {it.modality: it.item_idx_in_param for it in items}
+        assert positions == {"image": 0, "audio": 1}
+
+    def test_num_tokens_overrides_production_fields(self):
+        # When both are present, ``num_tokens`` wins (test convention,
+        # cheapest lookup).
+        payload = {"pixel_values": "fake", "num_tokens": 3}
+        param = _make_param_with_runtime(
+            {"image": payload, "modality_type": "image"},
+            total_embeds=99,
+        )
+        items = list(_nano_extract_items(0, param))
+        assert items[0].token_count == 3
+
+    def test_missing_sources_raises(self):
+        # No num_tokens on the payload AND no production fields populated.
+        # The extractor must surface a clear error rather than silently
+        # producing a wrong count.
+        payload = {"pixel_values": "fake"}
+        param = _make_param({"image": payload, "modality_type": "image"})
+        with pytest.raises(KeyError, match="Cannot resolve per-item token count"):
+            list(_nano_extract_items(0, param))
 
 
 class TestNanoVisionBucketAdapter:

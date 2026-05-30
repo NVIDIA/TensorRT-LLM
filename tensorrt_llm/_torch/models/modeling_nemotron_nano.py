@@ -48,7 +48,7 @@ from .modeling_multimodal_utils import (
 from .modeling_parakeet import ParakeetExtractor, ProjectedParakeet
 from .modeling_radio import RADIOVisionModel, calc_seq_lens
 from .modeling_utils import register_auto_model
-from .multimodal_encoding import EncodingPlan, MultimodalItem
+from .multimodal_encoding import EncodingPlan, MultimodalItem, encode_with_plan
 
 # Set max_num_tiles to 1 for video modality, to match the training behavior.
 VIDEO_MAX_NUM_TILES = 1
@@ -434,10 +434,18 @@ def _has_raw_multimodal_data(param: MultimodalParams) -> bool:
 def _nano_payload_token_count(payload: Dict[str, Any]) -> int:
     """Return the per-item token count stashed on a Nano modality payload.
 
-    Nano preprocessing populates a ``num_tokens`` field on each
-    per-modality payload (matching what
-    ``multimodal_embedding_lengths`` carries for mixed requests). This
-    helper centralizes the lookup so the extractor can stay schema-light.
+    Reads the per-payload ``num_tokens`` field that the Nano preprocessor
+    is expected to populate. When that field is absent — e.g. the caller
+    is using production preprocessing that has not yet been updated to
+    write ``num_tokens`` on each modality payload sub-dict — the caller
+    must resolve the count via :func:`_nano_resolve_payload_token_counts`
+    (which consults ``multimodal_embedding_lengths`` /
+    ``multimodal_runtime``) and pass the value to its consumers.
+
+    TODO(TRTLLM-mixed-modality): production preprocessing should write
+    ``num_tokens`` on each per-modality payload sub-dict so the new encode
+    path doesn't depend on the schema fallback in
+    :func:`_nano_resolve_payload_token_counts`.
     """
     num_tokens = payload.get("num_tokens")
     if num_tokens is None:
@@ -446,6 +454,57 @@ def _nano_payload_token_count(payload: Dict[str, Any]) -> int:
             "per-item token count for encoding plan."
         )
     return int(num_tokens)
+
+
+def _nano_resolve_payload_token_counts(
+    param: MultimodalParams,
+) -> Dict[Tuple[str, int], int]:
+    """Resolve per-item token counts from production preprocessing fields.
+
+    Used by :func:`_nano_extract_items` when a per-modality payload does
+    not carry a ``num_tokens`` field (test convention). Returns a mapping
+    from ``(modality, idx_within_modality)`` → token_count, derived from:
+
+    1. **Mixed params** (``modality_type`` is a list): uses
+       ``multimodal_data["multimodal_item_order"]`` for the ordering and
+       ``multimodal_data["multimodal_embedding_lengths"]`` for per-item
+       counts.
+    2. **Pure single-modality params** (``modality_type`` is a string): if
+       the single modality has exactly one item, uses
+       ``param.multimodal_runtime.total_embeds_in_request`` as that one
+       item's count (the typical Nano shape).
+
+    Returns an empty dict if neither source is populated. Ghost audio
+    items (audio embedded in a video payload) are not addressable through
+    these production fields; callers must fall back to
+    ``payload["num_tokens"]`` for those.
+    """
+    multimodal_data = param.multimodal_data or {}
+    counts: Dict[Tuple[str, int], int] = {}
+
+    item_order = MMItemOrder.from_metadata(multimodal_data)
+    embedding_lengths = multimodal_data.get("multimodal_embedding_lengths")
+    if item_order is not None and embedding_lengths is not None:
+        if len(item_order) != len(embedding_lengths):
+            raise ValueError(
+                "multimodal_item_order length "
+                f"({len(item_order)}) != multimodal_embedding_lengths "
+                f"length ({len(embedding_lengths)})"
+            )
+        for (modality, idx), length in zip(item_order, embedding_lengths, strict=True):
+            counts[(modality, int(idx))] = int(length)
+        return counts
+
+    # Pure single-modality fallback: one item per present modality, use
+    # `total_embeds_in_request` from multimodal_runtime as that item's
+    # count. Only safe when there is exactly one modality with one item.
+    modality_types = list(dict.fromkeys(_get_modality_types(multimodal_data)))
+    if len(modality_types) == 1:
+        runtime = getattr(param, "multimodal_runtime", None)
+        total = getattr(runtime, "total_embeds_in_request", None)
+        if total is not None:
+            counts[(modality_types[0], 0)] = int(total)
+    return counts
 
 
 def _nano_per_clip_audio_counts(audio_payload: Dict[str, Any]) -> List[int]:
@@ -476,23 +535,6 @@ def _nano_per_clip_audio_counts(audio_payload: Dict[str, Any]) -> List[int]:
     return [per + 1 if i < rem else per for i in range(n_clips)]
 
 
-def _nano_item_token_count(modality: str, payload: Dict[str, Any]) -> int:
-    """Compute the per-item token count for one Nano modality payload.
-
-    For ``video`` payloads that carry an embedded audio track, the count
-    is POST-interleave (raw video tokens + raw audio tokens) so that the
-    encoder bucket assertion in ``encode_with_plan`` matches the rows
-    that the video encoder adapter will return after interleaving.
-    """
-    if modality == "video":
-        video_tokens = _nano_payload_token_count(payload)
-        audio_payload = payload.get("audio")
-        if audio_payload is not None:
-            return video_tokens + _nano_payload_token_count(audio_payload)
-        return video_tokens
-    return _nano_payload_token_count(payload)
-
-
 def _nano_extract_items(param_idx: int, param: MultimodalParams):
     """Yield :class:`MultimodalItem` instances for one Nano ``MultimodalParams``.
 
@@ -508,6 +550,20 @@ def _nano_extract_items(param_idx: int, param: MultimodalParams):
     ordering — non-ghost first — satisfies the ``encode_with_plan``
     scatter convention that ghosts trail standalone items in each
     bucket.
+
+    Per-item token counts are resolved using the following fallback
+    chain, applied per payload (and per ghost-audio payload):
+
+    1. ``payload["num_tokens"]`` if present (test convention; cheapest).
+    2. Production-fields fallback (see
+       :func:`_nano_resolve_payload_token_counts`): mixed-param items use
+       ``multimodal_embedding_lengths`` indexed by ``multimodal_item_order``;
+       pure single-modality items use
+       ``multimodal_runtime.total_embeds_in_request``.
+
+    Ghost audio items extracted from a video payload cannot be resolved
+    via the production fields (those don't carry an MMItemOrder slot for
+    embedded audio), so their payload MUST carry ``num_tokens``.
     """
     multimodal_data = param.multimodal_data or {}
     modality_types = list(dict.fromkeys(_get_modality_types(multimodal_data)))
@@ -521,6 +577,24 @@ def _nano_extract_items(param_idx: int, param: MultimodalParams):
         item_order = MMItemOrder((modality, 0) for modality in modality_types)
     order_pos = {pair: pos for pos, pair in enumerate(item_order)}
 
+    # Resolve token counts from production fields once for the whole
+    # param; per-item lookups below prefer payload["num_tokens"] and fall
+    # back to this map.
+    production_counts = _nano_resolve_payload_token_counts(param)
+
+    def _lookup_count(modality: str, idx_within_modality: int, payload: Dict[str, Any]) -> int:
+        if "num_tokens" in payload:
+            return int(payload["num_tokens"])
+        key = (modality, idx_within_modality)
+        if key in production_counts:
+            return production_counts[key]
+        raise KeyError(
+            f"Cannot resolve per-item token count for modality={modality!r} "
+            f"at index {idx_within_modality} in param {param_idx}: payload has "
+            "no 'num_tokens' and no production-field fallback "
+            "(multimodal_embedding_lengths / multimodal_runtime) is available."
+        )
+
     for modality in modality_types:
         if modality not in _NANO_MODALITIES:
             raise ValueError(f"Unknown modality: {modality}")
@@ -528,7 +602,16 @@ def _nano_extract_items(param_idx: int, param: MultimodalParams):
         if payload is None:
             continue
         item_pos = order_pos.get((modality, 0), 0)
-        token_count = _nano_item_token_count(modality, payload)
+        # For video with embedded audio, the post-interleave count is
+        # video_tokens + audio_tokens; for plain modalities it's just
+        # the per-payload count. Resolve both halves through the lookup
+        # so production-fields fallback works for the video half too.
+        own_count = _lookup_count(modality, 0, payload)
+        token_count = own_count
+        if modality == "video":
+            audio_payload = payload.get("audio")
+            if audio_payload is not None:
+                token_count = own_count + _nano_payload_token_count(audio_payload)
         yield MultimodalItem(
             src_param_idx=param_idx,
             item_idx_in_param=item_pos,
@@ -3678,179 +3761,51 @@ class NemotronH_Nano_VL_V2(transformers.PreTrainedModel):
         )
 
     def _encode_multimodal(self, multimodal_params: List[MultimodalParams]) -> List[torch.Tensor]:
-        """Dispatch multimodal encoding to the appropriate encoder.
+        """Dispatch multimodal encoding via the flat-item plan.
 
-        Returns a single-element `List[torch.Tensor]` (all per-request
-        embeddings concatenated) to conform to the contract expected by
-        `get_multimodal_embeddings`, which enables chunked-prefill caching.
-        Per-request `num_tokens_in_video` (needed by EVS) is stashed in
-        each param's `multimodal_data` dict as a side-channel.
+        Returns a single-element `List[torch.Tensor]` whose tensor holds
+        all per-request embeddings concatenated in input-param order, with
+        each param's slice in MMItemOrder order. Conforms to the contract
+        expected by `get_multimodal_embeddings`, which enables
+        chunked-prefill caching.
 
-        Image and video params are batched into single ``vision_encoder``
-        calls; all audio inputs (standalone audio params and audio extracted
-        from video) are batched into a single ``sound_encoder`` call.
-        Per-video audio interleaving and EVS token-count stashing happen in
-        the second pass that walks params in input order.
+        Per-request `num_tokens_in_video` (needed by EVS) is stashed on
+        each video param's `multimodal_data` dict as a side-channel by
+        `_adapter_vision_bucket`, identical to the pre-refactor behavior.
         """
         if not multimodal_params:
             return []
 
-        def _encode_audio_items(
-            audio_items: List[dict],
-        ) -> List[Tuple[torch.Tensor, List[int]]]:
-            """Normalize Nano audio encoder output for batched and scalar audio."""
-            encoded = self._encode_audio(audio_items)
-            if isinstance(encoded, list):
-                return encoded
-            if len(audio_items) == 1 and isinstance(encoded, torch.Tensor):
-                return [(encoded, [])]
-            raise TypeError(
-                "_encode_audio must return a list of (embeddings, counts) for batched audio inputs"
-            )
-
-        def _make_single_modality_param(
-            param: MultimodalParams, modality_type: str
-        ) -> MultimodalParams:
-            """Build a view of a mixed request for one existing Nano encoder."""
-            multimodal_data = dict(param.multimodal_data or {})
-            multimodal_data["modality_type"] = modality_type
-            return MultimodalParams(
-                multimodal_input=getattr(param, "multimodal_input", None),
-                multimodal_data=multimodal_data,
-                multimodal_runtime=getattr(param, "multimodal_runtime", None),
-            )
-
-        def _encode_mixed_param(param: MultimodalParams) -> List[torch.Tensor]:
-            """Encode one mixed Nano request and restore prompt item order."""
-            multimodal_data = param.multimodal_data or {}
-            modality_types = list(dict.fromkeys(_get_modality_types(multimodal_data)))
-            encoded_by_modality: Dict[str, torch.Tensor] = {}
-
-            for modality_type in modality_types:
-                modality_param = _make_single_modality_param(param, modality_type)
-                modality_data = modality_param.multimodal_data.get(modality_type, {})
-                if modality_type in ("image", "video"):
-                    embs, num_tokens = self.vision_encoder([modality_param])
-                    vision_emb = embs[0]
-                    audio_data = modality_data.get("audio")
-                    if audio_data is not None and self.sound_encoder is not None:
-                        audio_emb, per_clip_audio_counts = _encode_audio_items([audio_data])[0]
-                        vision_emb = self._interleave_video_audio_embeddings(
-                            vision_emb,
-                            audio_emb,
-                            per_clip_audio_counts,
-                            has_audio=audio_data["has_audio"],
-                            audio_num_clips=audio_data["audio_num_clips"],
-                            video_sizes=modality_data.get("video_size", []),
-                            evs_num_tokens=(num_tokens[0] if num_tokens is not None else None),
-                        )
-
-                    if num_tokens is not None:
-                        if modality_type == "video":
-                            param.multimodal_data["num_tokens_in_video"] = num_tokens[0]
-                        param.multimodal_data.setdefault("num_tokens_in_video_by_modality", {})[
-                            modality_type
-                        ] = num_tokens[0]
-                    encoded_by_modality[modality_type] = vision_emb
-                elif modality_type == "audio":
-                    encoded_by_modality[modality_type] = _encode_audio_items([modality_data])[0][0]
-                else:
-                    raise ValueError(f"Unknown modality: {modality_type}")
-
-            item_order = MMItemOrder.from_metadata(multimodal_data) or MMItemOrder()
-            embedding_lengths = multimodal_data.get("multimodal_embedding_lengths")
-            if item_order and embedding_lengths is not None:
-                return item_order.split_embeddings(encoded_by_modality, embedding_lengths)
-            return [encoded_by_modality[modality_type] for modality_type in modality_types]
-
-        outputs_by_param: List[Optional[List[torch.Tensor]]] = [None] * len(multimodal_params)
-        image_params: List[MultimodalParams] = []
-        image_indices: List[int] = []
-        video_params: List[MultimodalParams] = []
-        video_indices: List[int] = []
-        audio_data_list: List[dict] = []
-        audio_indices: List[int] = []
-        audio_output_indices: Dict[int, int] = {}
-        video_audio_indices: Dict[int, int] = {}
-        mixed_indices: List[int] = []
-
-        for param_idx, param in enumerate(multimodal_params):
-            multimodal_data = param.multimodal_data or {}
-            modality_types = list(dict.fromkeys(_get_modality_types(multimodal_data)))
-            if len(modality_types) != 1:
-                mixed_indices.append(param_idx)
-                continue
-            modality_type = modality_types[0]
-            if modality_type == "image":
-                image_params.append(param)
-                image_indices.append(param_idx)
-            elif modality_type == "video":
-                video_params.append(param)
-                video_indices.append(param_idx)
-                if self.sound_encoder is not None:
-                    audio_data = multimodal_data["video"].get("audio")
-                    if audio_data is not None:
-                        video_audio_indices[param_idx] = len(audio_data_list)
-                        audio_data_list.append(audio_data)
-            elif modality_type == "audio":
-                audio_indices.append(param_idx)
-                audio_output_indices[param_idx] = len(audio_data_list)
-                audio_data_list.append(multimodal_data["audio"])
-            else:
-                raise ValueError(f"Unknown modality: {modality_type}")
-
-        image_embeds: List[torch.Tensor] = []
-        if image_params:
-            image_embeds, _ = self.vision_encoder(image_params)
-        video_embeds: List[torch.Tensor] = []
-        video_num_tokens: Optional[List[List[int] | None]] = None
-        if video_params:
-            video_embeds, video_num_tokens = self.vision_encoder(video_params)
-        audio_outputs: List[Tuple[torch.Tensor, List[int]]] = (
-            _encode_audio_items(audio_data_list) if audio_data_list else []
+        plan = EncodingPlan.from_params(
+            multimodal_params=multimodal_params,
+            extract=_nano_extract_items,
         )
-
-        for param_idx, image_emb in zip(image_indices, image_embeds, strict=True):
-            outputs_by_param[param_idx] = [image_emb]
-
-        for video_idx, param_idx in enumerate(video_indices):
-            param = multimodal_params[param_idx]
-            vision_emb = video_embeds[video_idx]
-            num_tokens = video_num_tokens[video_idx] if video_num_tokens is not None else None
-            if num_tokens is not None:
-                param.multimodal_data["num_tokens_in_video"] = num_tokens
-            audio_output_idx = video_audio_indices.get(param_idx)
-            if audio_output_idx is not None:
-                audio_data = param.multimodal_data["video"].get("audio")
-                audio_emb, per_clip_audio_counts = audio_outputs[audio_output_idx]
-                vision_emb = self._interleave_video_audio_embeddings(
-                    vision_emb,
-                    audio_emb,
-                    per_clip_audio_counts,
-                    has_audio=audio_data["has_audio"],
-                    audio_num_clips=audio_data["audio_num_clips"],
-                    video_sizes=param.multimodal_data["video"].get("video_size", []),
-                    evs_num_tokens=num_tokens,
-                )
-            outputs_by_param[param_idx] = [vision_emb]
-
-        for param_idx in audio_indices:
-            audio_emb, _ = audio_outputs[audio_output_indices[param_idx]]
-            outputs_by_param[param_idx] = [audio_emb]
-
-        for param_idx in mixed_indices:
-            outputs_by_param[param_idx] = _encode_mixed_param(multimodal_params[param_idx])
-
-        mm_embeddings: List[torch.Tensor] = []
-        for param_outputs in outputs_by_param:
-            if param_outputs:
-                mm_embeddings.extend(param_outputs)
-
-        if not mm_embeddings:
+        if plan.total_tokens == 0:
             return []
-        # `get_multimodal_embeddings` requires a single concatenated tensor
-        # in input-param order so it can split per-request and cache.
-        return [torch.cat(mm_embeddings, dim=0)]
+
+        final = encode_with_plan(
+            plan,
+            encoders={
+                "image": self._adapter_vision_bucket,
+                "video": self._adapter_vision_bucket,
+                "audio": self._adapter_audio_bucket,
+            },
+            multimodal_params=multimodal_params,
+            post_process=self._nano_post_encode,
+            device=self._encode_multimodal_device(),
+            dtype=self._encode_multimodal_dtype(),
+            hidden_dim=self._encode_multimodal_hidden_dim(),
+        )
+        return [final]
+
+    def _encode_multimodal_device(self) -> torch.device:
+        return next(self.vision_encoder.parameters()).device
+
+    def _encode_multimodal_dtype(self) -> torch.dtype:
+        return next(self.vision_encoder.parameters()).dtype
+
+    def _encode_multimodal_hidden_dim(self) -> int:
+        return self.llm.model.embed_tokens.embedding_dim
 
     @torch.inference_mode()
     def forward(
