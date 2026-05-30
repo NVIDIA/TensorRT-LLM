@@ -1006,7 +1006,6 @@ class FlashInferAttentionMetadata(AttentionMetadata):
                         self.kv_layout,
                         backend="cudnn",
                     ))
-            torch.cuda.current_stream().synchronize()
             if self.num_contexts <= 0:
                 raise ValueError(
                     "FlashInfer ragged prefill without KV cache requires "

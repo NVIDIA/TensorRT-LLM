@@ -26,7 +26,8 @@ from .interface import (AttentionBackend, AttentionForwardArgs,
                         PositionalEmbeddingParams, PredefinedAttentionMask,
                         RopeParams, merge_attention_forward_args)
 
-# Enable TRTLLM-Gen attention backend via environment variable (default: on).
+# Enable TRTLLM-Gen attention backend by default. Set
+# TRTLLM_ENABLE_TRTLLM_GEN_ATTENTION=0 to force the thop.attention path.
 _TRTLLM_ENABLE_TRTLLM_GEN_ATTENTION = (os.environ.get(
     "TRTLLM_ENABLE_TRTLLM_GEN_ATTENTION", "0") == "1")
 
@@ -156,22 +157,6 @@ class TrtllmAttentionMetadata(AttentionMetadata):
     def effective_workspace(self) -> Optional[torch.Tensor]:
         """Attention-kernel workspace, switching to the CUDA-graph copy under capture."""
         return self.cuda_graph_workspace if self.is_cuda_graph else self.workspace
-
-    @property
-    def helix_tensor_params(self) -> List[Optional[torch.Tensor]]:
-        """``[helix_position_offsets, helix_is_inactive_rank]`` — the positional
-        helix tensor list expected by the C++ attention op."""
-        return [self.helix_position_offsets, self.helix_is_inactive_rank]
-
-    @property
-    def spec_decoding_bool_params(self) -> List[bool]:
-        """``[is_spec_decoding_enabled, use_spec_decoding, is_spec_dec_tree]`` —
-        the positional bool list expected by the C++ attention op."""
-        return [
-            self.is_spec_decoding_enabled,
-            self.use_spec_decoding,
-            self.is_spec_dec_tree,
-        ]
 
     @property
     def spec_decoding_position_offsets_for_cpp(self) -> Optional[torch.Tensor]:
@@ -1051,22 +1036,6 @@ class TrtllmAttentionMetadata(AttentionMetadata):
     def is_sm_version_trtllm_gen_kernel(self, sm):
         return not (sm < 100 or sm in [120, 121])
 
-    @property
-    def spec_decoding_tensor_params(self) -> List[Optional[torch.Tensor]]:
-        """Positional spec-decoding tensor list for the C++ attention op.
-        Includes three Blackwell-tree mask tensors on SM versions that take
-        the trtllm-gen kernel."""
-        params = [
-            self.spec_decoding_generation_lengths,
-            self.spec_decoding_position_offsets_for_cpp,
-            self.spec_decoding_packed_mask,
-        ]
-        if self.is_sm_version_trtllm_gen_kernel(sm=get_sm_version()):
-            params.append(self.spec_decoding_bl_tree_mask_offset)
-            params.append(self.spec_decoding_bl_tree_mask)
-            params.append(self.spec_bl_tree_first_sparse_mask_offset_kv)
-        return params
-
 
 class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
 
@@ -1332,35 +1301,36 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         ]
 
     @property
-    def rotary_embedding_dim(self) -> int:
+    def rope_dim(self) -> int:
         return self.rope_params.dim
 
     @property
-    def rotary_embedding_base(self) -> float:
+    def rope_base(self) -> float:
         return self.rope_params.theta
 
     @property
-    def rotary_embedding_scale_type(self) -> int:
+    def rope_scale_type(self) -> int:
         return int(self.rope_params.scale_type)
 
     @property
-    def rotary_embedding_scales(self) -> List[float]:
-        """``[scale, short_m_scale, long_m_scale]`` — the positional RoPE-scale
-        list expected by the C++ attention op."""
-        return [
-            self.rope_params.scale,
-            self.rope_params.short_m_scale,
-            self.rope_params.long_m_scale,
-        ]
+    def rope_scale(self) -> float:
+        return self.rope_params.scale
 
     @property
-    def rotary_embedding_max_position_info(self) -> List[int]:
-        """``[max_positions, original_max_positions]`` — the positional
-        RoPE-positions list expected by the C++ attention op."""
-        return [
-            self.rope_params.max_positions,
-            self.rope_params.original_max_positions,
-        ]
+    def rope_short_m_scale(self) -> float:
+        return self.rope_params.short_m_scale
+
+    @property
+    def rope_long_m_scale(self) -> float:
+        return self.rope_params.long_m_scale
+
+    @property
+    def rope_max_positions(self) -> int:
+        return self.rope_params.max_positions
+
+    @property
+    def rope_original_max_positions(self) -> int:
+        return self.rope_params.original_max_positions
 
     @property
     def skip_softmax_threshold_scale_factor_prefill(self) -> Optional[float]:
@@ -1452,6 +1422,16 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         if self.print_skip_softmax_stat:
             self.skip_softmax_stat.zero_()
 
+        # Propagate the KV cache manager's SWA window to the FMHA kernel when
+        # the model does not specify one, so paged-context attention does not
+        # read stale page-table entries (BAD_PAGE_INDEX).
+        if forward_args.attention_window_size is None and metadata.kv_cache_manager is not None:
+            window_vec = getattr(metadata.kv_cache_manager,
+                                 'max_attention_window_vec', None)
+            if window_vec:
+                window = window_vec[self.local_layer_idx % len(window_vec)]
+                if window is not None:
+                    forward_args.attention_window_size = window
         if forward_args.attention_window_size is None:
             forward_args.attention_window_size = metadata.max_seq_len
 
@@ -1530,10 +1510,21 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                 max_num_requests=metadata.max_num_requests,
                 beam_width=metadata.beam_width,
                 use_paged_context_fmha=metadata.use_paged_context_fmha,
-                helix_tensor_params=metadata.helix_tensor_params,
-                spec_decoding_bool_params=metadata.spec_decoding_bool_params,
-                spec_decoding_tensor_params=metadata.
-                spec_decoding_tensor_params,
+                helix_position_offsets=metadata.helix_position_offsets,
+                helix_is_inactive_rank=metadata.helix_is_inactive_rank,
+                is_spec_decoding_enabled=metadata.is_spec_decoding_enabled,
+                use_spec_decoding=metadata.use_spec_decoding,
+                is_spec_dec_tree=metadata.is_spec_dec_tree,
+                spec_decoding_generation_lengths=metadata.
+                spec_decoding_generation_lengths,
+                spec_decoding_position_offsets_for_cpp=metadata.
+                spec_decoding_position_offsets_for_cpp,
+                spec_decoding_packed_mask=metadata.spec_decoding_packed_mask,
+                spec_decoding_bl_tree_mask_offset=metadata.
+                spec_decoding_bl_tree_mask_offset,
+                spec_decoding_bl_tree_mask=metadata.spec_decoding_bl_tree_mask,
+                spec_bl_tree_first_sparse_mask_offset_kv=metadata.
+                spec_bl_tree_first_sparse_mask_offset_kv,
                 num_sparse_topk=metadata.num_sparse_topk,
                 flash_mla_tile_scheduler_metadata=metadata.
                 flash_mla_tile_scheduler_metadata,
@@ -1584,12 +1575,14 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                 quant_mode=self.quant_mode,
                 q_scaling=self.q_scaling,
                 position_embedding_type=self.position_embedding_type,
-                rotary_embedding_dim=self.rotary_embedding_dim,
-                rotary_embedding_base=self.rotary_embedding_base,
-                rotary_embedding_scale_type=self.rotary_embedding_scale_type,
-                rotary_embedding_scales=self.rotary_embedding_scales,
-                rotary_embedding_max_position_info=self.
-                rotary_embedding_max_position_info,
+                rope_dim=self.rope_dim,
+                rope_base=self.rope_base,
+                rope_scale_type=self.rope_scale_type,
+                rope_scale=self.rope_scale,
+                rope_short_m_scale=self.rope_short_m_scale,
+                rope_long_m_scale=self.rope_long_m_scale,
+                rope_max_positions=self.rope_max_positions,
+                rope_original_max_positions=self.rope_original_max_positions,
                 is_mla_enable=self.is_mla_enable,
                 q_lora_rank=self.q_lora_rank,
                 kv_lora_rank=self.kv_lora_rank,
