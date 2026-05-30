@@ -1,3 +1,17 @@
+# SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """Testing custom DeepSeekV3 model implementation for auto_deploy export."""
 
 import pytest
@@ -15,6 +29,9 @@ from tensorrt_llm._torch.auto_deploy.models.custom.modeling_deepseek import (
     DeepSeekV3RMSNorm,
     DeepSeekV3RotaryEmbedding,
     DeepSeekV3YarnRotaryEmbedding,
+)
+from tensorrt_llm._torch.auto_deploy.transform.library.fuse_rope_mla import (
+    _compute_rotary_cos_sin_from_config,
 )
 
 
@@ -66,7 +83,7 @@ class TestDeepSeekV3RMSNorm:
 
     @pytest.fixture(autouse=True)
     def setup_method(self):
-        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.device = "cuda"
         self.dtype = torch.bfloat16
         torch.manual_seed(42)
 
@@ -99,7 +116,7 @@ class TestDeepSeekV3RotaryEmbedding:
 
     @pytest.fixture(autouse=True)
     def setup_method(self):
-        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.device = "cuda"
         self.dtype = torch.bfloat16
         torch.manual_seed(42)
 
@@ -133,13 +150,55 @@ class TestDeepSeekV3RotaryEmbedding:
         assert cos.shape == (max_pos, dim)
         assert sin.shape == (max_pos, dim)
 
+    def test_fused_mla_yarn_config_fallback_matches_model_rope(self):
+        """The fused MLA RoPE fallback must match the model's YaRN table."""
+        dim = 64
+        max_pos = 128
+        config = MockDeepSeekConfig()
+        config.qk_rope_head_dim = dim
+        config.max_position_embeddings = max_pos
+        config.rope_scaling = {
+            "type": "yarn",
+            "factor": 40.0,
+            "original_max_position_embeddings": 4096,
+            "beta_fast": 32,
+            "beta_slow": 1,
+            "mscale": 1.0,
+            "mscale_all_dim": 1.0,
+        }
+
+        rope = DeepSeekV3YarnRotaryEmbedding(
+            dim,
+            max_pos,
+            base=config.rope_theta,
+            scaling_factor=config.rope_scaling["factor"],
+            original_max_position_embeddings=config.rope_scaling[
+                "original_max_position_embeddings"
+            ],
+            beta_fast=config.rope_scaling["beta_fast"],
+            beta_slow=config.rope_scaling["beta_slow"],
+            mscale=config.rope_scaling["mscale"],
+            mscale_all_dim=config.rope_scaling["mscale_all_dim"],
+        )
+
+        x = torch.empty(1, 1, 1, dim, dtype=torch.float32)
+        cos, sin = rope(x)
+        expected = torch.stack([cos.float(), sin.float()], dim=-1).reshape(1, -1)
+
+        class Factory:
+            def _get_model_config(self):
+                return config, None
+
+        actual = _compute_rotary_cos_sin_from_config(Factory()).cpu()
+        torch.testing.assert_close(actual, expected, atol=3e-7, rtol=1e-4)
+
 
 class TestDeepSeekV3MLP:
     """Test DeepSeekV3MLP implementation."""
 
     @pytest.fixture(autouse=True)
     def setup_method(self):
-        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.device = "cuda"
         self.dtype = torch.bfloat16
         torch.manual_seed(42)
 
@@ -160,7 +219,7 @@ class TestDeepSeekV3Attention:
 
     @pytest.fixture(autouse=True)
     def setup_method(self):
-        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.device = "cuda"
         self.dtype = torch.bfloat16
         torch.manual_seed(42)
 
@@ -220,7 +279,7 @@ class TestDeepSeekV3MoE:
 
     @pytest.fixture(autouse=True)
     def setup_method(self):
-        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.device = "cuda"
         self.dtype = torch.bfloat16
         torch.manual_seed(42)
 
@@ -267,7 +326,7 @@ class TestDeepSeekV3DecoderLayer:
 
     @pytest.fixture(autouse=True)
     def setup_method(self):
-        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.device = "cuda"
         self.dtype = torch.bfloat16
         torch.manual_seed(42)
 
@@ -313,7 +372,7 @@ class TestDeepSeekV3Model:
 
     @pytest.fixture(autouse=True)
     def setup_method(self):
-        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.device = "cuda"
         self.dtype = torch.bfloat16
         torch.manual_seed(42)
 
@@ -349,7 +408,7 @@ class TestDeepSeekV3ForCausalLM:
 
     @pytest.fixture(autouse=True)
     def setup_method(self):
-        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.device = "cuda"
         self.dtype = torch.bfloat16
         torch.manual_seed(42)
 
@@ -394,7 +453,7 @@ class TestMLAOpRegistration:
 
     def test_torch_mla_callable(self):
         """Test that torch_mla op is callable."""
-        device = "cuda" if torch.cuda.is_available() else "cpu"
+        device = "cuda"
         dtype = torch.bfloat16
 
         batch_size, seq_len, num_heads = 1, 2, 4
@@ -422,7 +481,7 @@ class TestMLAOpRegistration:
 
     def test_torch_cached_mla_callable(self):
         """Test that torch_cached_mla_with_cache op is callable."""
-        device = "cuda" if torch.cuda.is_available() else "cpu"
+        device = "cuda"
         dtype = torch.bfloat16
 
         batch_size, seq_len, num_heads = 1, 1, 4

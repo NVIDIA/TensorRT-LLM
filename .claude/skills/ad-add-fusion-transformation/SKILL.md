@@ -35,8 +35,6 @@ After installing the plugin (see the toolkit `README.md`), skills use the `trtll
 | **trtllm-code-contribution** | TensorRT-LLM pre-commit, tests, DCO sign-off, and PR expectations. |
 | **triton-kernel-writing** | Implementing a **Triton** op only after existing-kernel lookup fails. |
 | **triton-tileir-optimization** | Tuning **existing** Triton kernels for the TileIR backend when that path applies. |
-| **cuda-kernel-writing** | Raw CUDA extension work if the viable path is a PyTorch C++ extension (not Triton). |
-| **cute-kernel-writing** / **cudeepy-kernel-writing** | CuTe DSL/LIR or CuDeepy-generated kernels when that is the chosen integration path. |
 
 Use this skill when you already know **which subgraph or pattern** you are targeting (from graph dumps, logs, or code reading). For dump capture and file semantics, follow **ad-graph-dump** first.
 

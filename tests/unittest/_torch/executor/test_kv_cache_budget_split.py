@@ -22,7 +22,7 @@ from unittest.mock import Mock
 
 import pytest
 
-from tensorrt_llm._torch.pyexecutor._util import KvCacheCreator
+from tensorrt_llm._torch.pyexecutor._util import CacheCost, KvCacheCreator
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 
 GB = 1 << 30
@@ -34,7 +34,12 @@ def _make_creator(
     total_kv_per_token: int = 100,
     target_kv_per_token: int = 80,
 ) -> KvCacheCreator:
-    """Build a minimal KvCacheCreator wired for _split_kv_cache_budget_for_draft."""
+    """Build a minimal KvCacheCreator wired for _split_kv_cache_budget_for_draft.
+
+    Per-token costs are exposed via the new ``CacheCost`` shape; the manager
+    mock returns a raw int so we also exercise ``_per_manager_cache_cost``'s
+    ``CacheCost.from_raw`` wrapping.
+    """
     c = object.__new__(KvCacheCreator)
 
     c._kv_cache_config = KvCacheConfig(
@@ -42,13 +47,14 @@ def _make_creator(
         host_cache_size=host_cache_size,
     )
     c._tokens_per_block = 64
+    c._max_batch_size = 1
     c._mapping = Mock()
     c._model_engine = Mock()
 
     c._kv_cache_manager_cls = Mock()
     c._kv_cache_manager_cls.get_cache_size_per_token = Mock(return_value=target_kv_per_token)
 
-    c._get_kv_size_per_token = Mock(return_value=total_kv_per_token)
+    c._get_kv_size_per_token = Mock(return_value=CacheCost(slope=total_kv_per_token))
 
     return c
 

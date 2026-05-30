@@ -1,3 +1,17 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 import atexit
 import concurrent.futures
 import json
@@ -5,7 +19,7 @@ import os
 import threading
 import weakref
 from queue import Empty
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Union
 
 import torch
 import zmq
@@ -34,6 +48,27 @@ from .worker import GenerationExecutorWorker, worker_main
 __all__ = [
     "GenerationExecutorProxy",
 ]
+
+
+def _check_collective_rpc_guard(
+    model_world_size: int,
+    unique_reply_rank: Optional[int],
+    target_ranks: Optional[Union[int, List[int]]],
+) -> None:
+    """Validate collective_rpc preconditions shared by IPC and RPC proxies.
+
+    Raises:
+        NotImplementedError: If ``model_world_size > 1``, or if
+            ``unique_reply_rank`` or ``target_ranks`` are provided.
+    """
+    if model_world_size > 1:
+        raise NotImplementedError(
+            "MPI collective_rpc only supports model_world_size == 1; "
+            "use the Ray executor for multi-rank deployments.")
+    if unique_reply_rank is not None or target_ranks is not None:
+        raise NotImplementedError(
+            "unique_reply_rank and target_ranks are not supported; "
+            "this shim only reaches rank-0.")
 
 
 class GenerationExecutorProxy(GenerationExecutor):
@@ -89,9 +124,12 @@ class GenerationExecutorProxy(GenerationExecutor):
 
         self.model_world_size = model_world_size
 
-        self.garbage_collection_gen0_threshold = worker_kwargs[
-            "llm_args"].garbage_collection_gen0_threshold if worker_kwargs.get(
-                "llm_args", None) is not None else None
+        _llm_args = worker_kwargs.get("llm_args", None)
+        self.garbage_collection_gen0_threshold = _llm_args.garbage_collection_gen0_threshold if _llm_args is not None else None
+        _backend = None if _llm_args is None else _llm_args.backend
+        self._is_pytorch_backend = _backend in ["pytorch", "_autodeploy"]
+        self._enable_resource_governor = bool(
+            getattr(_llm_args, "enable_resource_governor", False))
 
         # Generate RPC address and key for stats RPC
         self.rpc_addr = get_unique_ipc_addr()
@@ -248,12 +286,21 @@ class GenerationExecutorProxy(GenerationExecutor):
             socket_type=zmq.PULL
             if self.enable_postprocess_parallel else zmq.PAIR,
             name="proxy_result_queue")
+        self._resource_governor_queue = IpcQueue(
+            is_server=True, name="proxy_resource_governor_queue"
+        ) if self._enable_resource_governor else None
         # Stats and KV events are now fetched via RPC, not IPC queues.
         return WorkerCommIpcAddrs(
             request_queue_addr=self.request_queue.address,
             worker_init_status_queue_addr=self.worker_init_status_queue.address,
             result_queue_addr=self.result_queue.address,
+            resource_governor_queue_addr=self._resource_governor_queue.address
+            if self._resource_governor_queue is not None else None,
         )
+
+    @property
+    def resource_governor_queue(self):
+        return self._resource_governor_queue
 
     def abort_request(self, request_id: int) -> None:
         ''' Abort a request by sending a cancelling request to the request queue.
@@ -269,9 +316,8 @@ class GenerationExecutorProxy(GenerationExecutor):
     def dispatch_result_task(self) -> bool:
         # TODO[chunweiy]: convert the dispatch_result_task to async, that should
         # benefit from zmq.asyncio.Context
-        with customized_gc_thresholds(self.garbage_collection_gen0_threshold):
-            if (res := self.result_queue.get()) is None:
-                return False  # shutdown the thread
+        if (res := self.result_queue.get()) is None:
+            return False  # shutdown the thread
 
         async_queues = []
         event_loop = None
@@ -325,7 +371,10 @@ class GenerationExecutorProxy(GenerationExecutor):
             self.dispatch_result_thread = ManagedThread(
                 weakref.WeakMethod(self.dispatch_result_task),
                 error_queue=self._error_queue,
-                name="proxy_dispatch_result_thread")
+                name="proxy_dispatch_result_thread",
+                context=customized_gc_thresholds(
+                    self.garbage_collection_gen0_threshold),
+            )
 
             self.dispatch_result_thread.start()
 
@@ -467,6 +516,8 @@ class GenerationExecutorProxy(GenerationExecutor):
         self.request_queue.close()
         self.worker_init_status_queue.close()
         self.result_queue.close()
+        if self._resource_governor_queue is not None:
+            self._resource_governor_queue.close()
 
         self.workers_started = False
         self.mpi_session.shutdown()
@@ -503,6 +554,52 @@ class GenerationExecutorProxy(GenerationExecutor):
         self._handle_background_error()
 
         return result
+
+    def collective_rpc(
+        self,
+        method: str,
+        args: tuple = (),
+        kwargs: Optional[dict] = None,
+        non_block: bool = False,
+        unique_reply_rank: Optional[int] = None,
+        target_ranks: Optional[Union[int, List[int]]] = None,
+    ) -> List:
+        """Execute a method call on the rank-0 GPU worker via the RPC client.
+
+        Rank-0-only shim; only ``model_world_size == 1`` is supported.
+        Shares the :meth:`RayExecutor.collective_rpc` signature for uniform
+        dispatch from :meth:`~tensorrt_llm.llmapi.llm.LLM._collective_rpc`,
+        but does not broadcast to all workers.
+
+        Args:
+            method: Name of the worker method to invoke.
+            args: Positional arguments forwarded to the worker method.
+            kwargs: Keyword arguments forwarded to the worker method.
+            non_block: If ``True``, return a ``Future`` without waiting.
+            unique_reply_rank: Must be ``None``.
+            target_ranks: Must be ``None``.
+
+        Returns:
+            A list containing the single return value when ``non_block=False``,
+            or a list containing the pending
+            :class:`~concurrent.futures.Future` when ``non_block=True``.
+
+        Raises:
+            RuntimeError: If the RPC client has not been initialised yet.
+            NotImplementedError: If ``model_world_size > 1``, or if
+                ``unique_reply_rank`` or ``target_ranks`` are provided.
+        """
+        if self.rpc_client is None:
+            raise RuntimeError(
+                "RPC client is not initialised — collective_rpc() cannot be "
+                "called before the executor workers have started.")
+        _check_collective_rpc_guard(self.model_world_size, unique_reply_rank,
+                                    target_ranks)
+        kwargs = kwargs or {}
+        remote_call = getattr(self.rpc_client, method)(*args, **kwargs)
+        if non_block:
+            return [remote_call.remote_future()]
+        return [remote_call.remote()]
 
     def get_stats(self, timeout: float) -> List[dict]:
         """Get iteration statistics from the runtime via RPC.

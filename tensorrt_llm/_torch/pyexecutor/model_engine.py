@@ -228,6 +228,18 @@ class PyTorchModelEngine(ModelEngine):
         # Saved before zeroing for draft models; used by update_spec_dec_param.
         self._spec_dec_max_total_draft_tokens = spec_config.max_total_draft_tokens if spec_config is not None else 0
 
+        # Dynamic tree draft loop produces up to K * max_draft_len tokens,
+        # which may exceed max_total_draft_tokens. Use the larger value for
+        # KV cache reservation only; verify/tree output stays at max_total_draft_tokens.
+        if (spec_config is not None
+                and getattr(spec_config, 'use_dynamic_tree', False)
+                and getattr(spec_config, 'dynamic_tree_max_topK', 0) > 0):
+            self.max_draft_loop_tokens = max(
+                self.original_max_total_draft_tokens,
+                spec_config.dynamic_tree_max_topK * spec_config.max_draft_len)
+        else:
+            self.max_draft_loop_tokens = self.original_max_total_draft_tokens
+
         preserve_wrapped_eagle3_widths = (spec_config is not None
                                           and is_draft_model
                                           and drafting_loop_wrapper is not None
@@ -255,6 +267,7 @@ class PyTorchModelEngine(ModelEngine):
             model_path,
             tokenizer=None,
             checkpoint_format=llm_args.checkpoint_format,
+            trust_remote_code=llm_args.trust_remote_code,
             **input_processor_kwargs)
         self.input_processor_with_hash = create_input_processor_with_hash(
             self.input_processor)
@@ -402,7 +415,7 @@ class PyTorchModelEngine(ModelEngine):
             self.spec_metadata = None
             update_spec_config_from_model_config(self.spec_config,
                                                  self.model.config)
-            max_num_draft_tokens = self.original_max_total_draft_tokens * self.batch_size
+            max_num_draft_tokens = self.max_draft_loop_tokens * self.batch_size
             self.draft_tokens_cuda = torch.empty((max_num_draft_tokens, ),
                                                  dtype=torch.int,
                                                  device='cuda')
@@ -420,8 +433,12 @@ class PyTorchModelEngine(ModelEngine):
             self.without_logits = self.spec_config.spec_dec_mode.without_logits(
             ) or self.model_is_wrapped
             self.max_total_draft_tokens = spec_config.tokens_per_gen_step - 1
-            # PARD/DFlash use 2K tokens per gen request (K accepted + K masks), so
-            # their per-request draft buffer width is 2K-1 = max_total_draft_tokens.
+            # Parallel-draft modes (PARD, DFlash) size their per-request draft
+            # buffer by tokens_per_gen_step - 1 so the engine reserves exactly
+            # one slot per draft token the target will verify.  PARD still uses
+            # 2K tokens per gen req (K drafts + K mask fillers); DFlash was
+            # reduced to K+1 (K drafts + 1 bonus) - the spec config's
+            # tokens_per_gen_step carries the per-algorithm width.
             if spec_config.spec_dec_mode.is_parallel_draft():
                 self.max_draft_len = self.max_total_draft_tokens
             else:
@@ -747,7 +764,7 @@ class PyTorchModelEngine(ModelEngine):
             max_num_draft_tokens=self.original_max_draft_len)
         max_batch_size = min(
             self.batch_size, curr_max_num_tokens //
-            (1 + self.max_total_draft_tokens) // self.max_beam_width)
+            (1 + self.max_draft_loop_tokens) // self.max_beam_width)
 
         warmup_requests_configs = [
             (curr_max_num_tokens, 0),  # max_num_tokens, pure context
@@ -853,6 +870,30 @@ class PyTorchModelEngine(ModelEngine):
         with self.no_cuda_graph():
             self._general_warmup_impl(resource_manager, warmup_requests_configs)
 
+    def _assert_all_tp_ranks_have_warmup_batch(self, batch,
+                                               num_tokens: int) -> None:
+        """Assert every TP rank has a valid warmup batch, or raise with diagnostics.
+
+        Under attention-DP, each rank's KV cache available capacity can differ at
+        runtime, causing _create_warmup_request to return None on some ranks while
+        others proceed into forward() with tp_comm collectives — deadlocking the
+        job. This check prevents the deadlock by failing early with diagnostic info.
+        """
+        if self.mapping.tp_size <= 1:
+            return
+        has_batch = int(batch is not None)
+        all_flags = list(self.dist.tp_allgather(has_batch))
+        if any(all_flags) and not all(all_flags):
+            # Gather token counts for diagnostics
+            all_tokens = list(self.dist.tp_allgather(num_tokens))
+            failed_ranks = [i for i, f in enumerate(all_flags) if not f]
+            raise RuntimeError(
+                f"Warmup batch creation failed on TP rank(s) {failed_ranks} "
+                f"but succeeded on others. This would cause a collective "
+                f"deadlock. Per-rank curr_max_num_tokens: {all_tokens}. "
+                f"This indicates asymmetric KV cache capacity across TP ranks. "
+                f"Consider increasing --kv_cache_free_gpu_mem_fraction.")
+
     def _general_warmup_impl(
             self, resource_manager: ResourceManager,
             warmup_requests_configs: List[Tuple[int, int]]) -> None:
@@ -866,8 +907,12 @@ class PyTorchModelEngine(ModelEngine):
                         self._create_warmup_request(resource_manager,
                                                     num_tokens, num_gen_tokens),
                         resource_manager) as batch:
+                    if batch is None and self.mapping.tp_size <= 1:
+                        continue  # Not enough KV cache space (single rank, safe to skip)
+                    self._assert_all_tp_ranks_have_warmup_batch(
+                        batch, num_tokens)
                     if batch is None:
-                        continue  # Not enough KV cache space
+                        continue  # All ranks agree: not enough space
                     logger.info(
                         f"Run warmup with {num_tokens} tokens, include {num_gen_tokens} generation tokens"
                     )
@@ -901,6 +946,11 @@ class PyTorchModelEngine(ModelEngine):
                 resource_manager, curr_max_num_tokens, 0)
             with self._release_batch_context(warmup_request,
                                              resource_manager) as batch:
+                if batch is None and self.mapping.tp_size <= 1:
+                    pass  # Single rank, safe to skip
+                else:
+                    self._assert_all_tp_ranks_have_warmup_batch(
+                        batch, curr_max_num_tokens)
                 if batch is not None:
                     # Reset the flag is_first_draft for the draft model.
                     # This is necessary for overlap scheduler.
@@ -1256,6 +1306,7 @@ class PyTorchModelEngine(ModelEngine):
                 token_nums=ctx_token_nums,
                 is_gen=False,
                 max_num_draft_tokens=self.max_total_draft_tokens,
+                kv_reserve_draft_tokens=self.max_draft_loop_tokens,
                 use_mrope=self.use_mrope,
                 num_extra_decoding_steps=num_extra_decoding_steps,
                 draft_kv_cache_manager=draft_kv_cache_manager)
@@ -1275,6 +1326,7 @@ class PyTorchModelEngine(ModelEngine):
                 token_nums=[1] * num_gen_requests,
                 is_gen=True,
                 max_num_draft_tokens=self.max_total_draft_tokens,
+                kv_reserve_draft_tokens=self.max_draft_loop_tokens,
                 use_mrope=self.use_mrope,
                 max_beam_width=self.max_beam_width,
                 num_extra_decoding_steps=num_extra_decoding_steps,
@@ -1324,6 +1376,7 @@ class PyTorchModelEngine(ModelEngine):
             list(range(batch_size - 1)),
             is_gen=True,
             max_num_draft_tokens=draft_len,
+            kv_reserve_draft_tokens=self.max_draft_loop_tokens,
             use_mrope=self.use_mrope,
             max_beam_width=self.max_beam_width,
             num_extra_decoding_steps=num_extra_decoding_steps,
@@ -1337,40 +1390,46 @@ class PyTorchModelEngine(ModelEngine):
             self.max_seq_len if max_seq_len is None else max_seq_len,
             kv_cache_manager.max_seq_len)
 
+        # Use max_draft_loop_tokens for capacity estimation to account
+        # for the actual KV reservation per request.
+        _kv_draft = self.max_draft_loop_tokens
         available_tokens = kv_cache_manager.get_num_available_tokens(
             token_num_upper_bound=max_seq_len,
             batch_size=batch_size,
-            max_num_draft_tokens=draft_len)
+            max_num_draft_tokens=_kv_draft)
 
         # Also consider draft KV cache capacity when it exists
         if draft_kv_cache_manager is not None:
             draft_available_tokens = draft_kv_cache_manager.get_num_available_tokens(
                 batch_size=batch_size,
                 token_num_upper_bound=max_seq_len,
-                max_num_draft_tokens=draft_len)
+                max_num_draft_tokens=_kv_draft)
             available_tokens = min(available_tokens, draft_available_tokens)
 
         token_num = max(
             1,
             min(
                 available_tokens, max_seq_len - 1 -
-                get_num_extra_kv_tokens(self.spec_config) - draft_len))
+                get_num_extra_kv_tokens(self.spec_config) - _kv_draft))
         model_config = self.model.model_config.pretrained_config
         max_position_embeddings = getattr(model_config,
                                           'max_position_embeddings', None)
         if max_position_embeddings is not None:
-            token_num = min(token_num, max_position_embeddings - draft_len)
+            token_num = min(token_num, max_position_embeddings - _kv_draft)
 
         assert token_num > num_extra_decoding_steps, (
             "Cannot fuse drafting loop. Not enough KV cache space for all draft tokens."
         )
         token_num -= num_extra_decoding_steps
+        token_num = int(
+            token_num)  # Ensure int for range() in add_dummy_requests
 
         max_seq_len_request = kv_cache_manager.add_dummy_requests(
             request_ids=[batch_size - 1],
             token_nums=[token_num],
             is_gen=True,
             max_num_draft_tokens=draft_len,
+            kv_reserve_draft_tokens=self.max_draft_loop_tokens,
             use_mrope=self.use_mrope,
             max_beam_width=self.max_beam_width,
             num_extra_decoding_steps=num_extra_decoding_steps,
@@ -1636,8 +1695,15 @@ class PyTorchModelEngine(ModelEngine):
                     'attn_metadata'].num_chunked_ctx_requests
                 previous_batch_tokens = inputs['input_ids'].shape[
                     0] - num_ctx_tokens
-                inputs['position_ids'][0, num_ctx_tokens:] += (
-                    self.previous_pos_id_offsets_cuda[:previous_batch_tokens])
+                if inputs['position_ids'].ndim == 3:  # mrope: [3, 1, N]
+                    inputs['position_ids'][:, :, num_ctx_tokens:] += (
+                        self.
+                        previous_pos_id_offsets_cuda[:previous_batch_tokens])
+                else:
+                    inputs['position_ids'][0, num_ctx_tokens:] += (
+                        self.
+                        previous_pos_id_offsets_cuda[:previous_batch_tokens])
+
                 if hasattr(inputs['attn_metadata'], 'kv_lens_cuda'):
                     if num_ctx_requests >= num_chunked_ctx_requests and num_chunked_ctx_requests > 0:
                         # The generation requests with draft_tokens are treated as chunked context requests when extend_ctx returns True.
@@ -1677,8 +1743,15 @@ class PyTorchModelEngine(ModelEngine):
                     'attn_metadata'].num_chunked_ctx_requests
                 previous_batch_tokens = inputs['input_ids'].shape[
                     0] - num_ctx_tokens
-                inputs['position_ids'][0, num_ctx_tokens:] -= (
-                    self.previous_pos_id_offsets_cuda[:previous_batch_tokens])
+                if inputs['position_ids'].ndim == 3:  # mrope: [3, 1, N]
+                    inputs['position_ids'][:, :, num_ctx_tokens:] -= (
+                        self.
+                        previous_pos_id_offsets_cuda[:previous_batch_tokens])
+                else:
+                    inputs['position_ids'][0, num_ctx_tokens:] -= (
+                        self.
+                        previous_pos_id_offsets_cuda[:previous_batch_tokens])
+
                 # Only TrtllmAttentionMetadata has kv_lens_cuda.
                 if isinstance(inputs['attn_metadata'], TrtllmAttentionMetadata):
                     if num_ctx_requests >= num_chunked_ctx_requests and num_chunked_ctx_requests > 0:
@@ -2622,7 +2695,7 @@ class PyTorchModelEngine(ModelEngine):
         _n_gen = len(generation_requests)
         if _n_gen > 0:
             # All generation requests have the same beam width
-            beam_width = generation_requests[0].sampling_config.beam_width
+            beam_width = generation_requests[0].py_beam_width
 
             # Pre-extend constant-value lists to avoid per-request append
             # overhead (saves ~3 append calls per request).
@@ -2968,9 +3041,8 @@ class PyTorchModelEngine(ModelEngine):
                     )
                 if segment.shape[0] != 3 and segment.shape[-1] == 3:
                     logger.warning(
-                        "Transposing unexpected mrope_position_ids shape from %s",
-                        tuple(segment.shape),
-                    )
+                        "Transposing unexpected mrope_position_ids shape from "
+                        f"{tuple(segment.shape)}")
                     segment = segment.transpose(0, 2).contiguous()
                 if segment.shape[:2] != (3, 1):
                     raise RuntimeError(
@@ -3886,9 +3958,10 @@ class PyTorchModelEngine(ModelEngine):
             # to spec_metadata so downstream code (eagle3, interface, trtllm) can read it.
             spec_metadata.runtime_draft_len = self.runtime_draft_len
 
-            # PARD/DFlash have 2K tokens per gen request, not K+1.  Pass 2K-1
-            # so generation_lengths = 2K and the XQA kernel computes
-            # the correct past_kv_len.
+            # Parallel-draft modes advertise a per-gen-step width via
+            # tokens_per_gen_step (PARD: 2K, DFlash: K+1).  Pass
+            # (tokens_per_gen_step - 1) so generation_lengths = tokens_per_gen_step
+            # and the XQA kernel computes the correct past_kv_len.
             if spec_metadata.spec_dec_mode.is_parallel_draft():
                 sd_max_draft_len = self.original_max_total_draft_tokens
                 sd_max_total = self.original_max_total_draft_tokens
@@ -3896,17 +3969,14 @@ class PyTorchModelEngine(ModelEngine):
                 sd_max_draft_len = self.original_max_draft_len
                 sd_max_total = self._spec_dec_max_total_draft_tokens
 
-            # Gather dynamic tree data from stable slots before target forward
+            # Fill slot-ID buffer for update_spec_dec_param
             if (spec_tree_manager is not None
                     and spec_tree_manager.use_dynamic_tree
                     and not self.is_draft_model):
-                gen_requests = list(scheduled_requests.generation_requests)
-                num_gens = len(gen_requests)
-                if num_gens > 0:
-                    gen_slot_ids, _ = spec_tree_manager.fill_gen_slot_ids(
-                        gen_requests)
-                    spec_tree_manager.gather_trees_from_slots(
-                        gen_slot_ids, num_gens)
+                spec_tree_manager.slot_storage.fill_all_slot_ids(
+                    scheduled_requests.context_requests,
+                    scheduled_requests.generation_requests,
+                )
 
             attn_metadata.update_spec_dec_param(
                 batch_size=scheduled_requests.batch_size,
@@ -3917,7 +3987,8 @@ class PyTorchModelEngine(ModelEngine):
                 max_total_draft_tokens=sd_max_total,
                 model_is_wrapped=self.model_is_wrapped,
                 spec_metadata=spec_metadata,
-                spec_tree_manager=spec_tree_manager)
+                spec_tree_manager=spec_tree_manager,
+                num_contexts=scheduled_requests.num_context_requests)
         else:
             spec_resource_manager = None
             spec_metadata = None
@@ -3970,19 +4041,10 @@ class PyTorchModelEngine(ModelEngine):
             if (self.enable_spec_decode and spec_tree_manager is not None
                     and spec_tree_manager.use_dynamic_tree
                     and not self.is_draft_model):
-                dummy_slot = spec_tree_manager._dummy_slot_id
-                idx = 0
-                for req in padded_requests.context_requests:
-                    spec_tree_manager._all_slot_ids_buf[idx] = (
-                        req.py_seq_slot
-                        if req.py_seq_slot is not None else dummy_slot)
-                    idx += 1
-                for req in padded_requests.generation_requests:
-                    slot = req.py_seq_slot if (
-                        not getattr(req, 'is_cuda_graph_dummy', False)
-                        and req.py_seq_slot is not None) else dummy_slot
-                    spec_tree_manager._all_slot_ids_buf[idx] = slot
-                    idx += 1
+                spec_tree_manager.slot_storage.fill_all_slot_ids(
+                    padded_requests.context_requests,
+                    padded_requests.generation_requests,
+                )
 
             inputs, gather_ids = self._prepare_inputs(
                 padded_requests, kv_cache_manager, attn_metadata, spec_metadata,

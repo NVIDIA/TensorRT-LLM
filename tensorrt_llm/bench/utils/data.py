@@ -16,13 +16,14 @@ import json
 from functools import partial
 from typing import List, TextIO, Tuple
 
-from transformers import AutoTokenizer, PreTrainedTokenizer
+from transformers import PreTrainedTokenizer
 
 from tensorrt_llm.bench.dataclasses.general import (DatasetMetadata,
                                                     InferenceRequest)
 from tensorrt_llm.bench.dataclasses.statistics import PercentileStats
 from tensorrt_llm.executor.request import LoRARequest
 from tensorrt_llm.inputs import default_multimodal_input_loader
+from tensorrt_llm.tokenizer.tokenizer import TransformersTokenizer
 
 
 class DatasetFormatError(ValueError):
@@ -37,9 +38,9 @@ def initialize_tokenizer(model_name: str,
         model_name (str): The name of the HuggingFace model to pull a
         tokenizer from.
         custom_tokenizer (str, optional): A built-in alias (e.g.,
-        'deepseek_v32', 'glm_moe_dsa') or a fully-qualified
-        'module.path.ClassName' for models whose HF tokenizer_config.json
-        is incompatible with AutoTokenizer.
+        'deepseek_v32') or a fully-qualified 'module.path.ClassName' for
+        models whose HF tokenizer_config.json is incompatible with
+        AutoTokenizer.
 
     Returns:
         PreTrainedTokenizer: An initialized HuggingFace tokenizer.
@@ -62,9 +63,15 @@ def initialize_tokenizer(model_name: str,
                 f"Failed to load custom_tokenizer '{custom_tokenizer}'. "
                 "Expected alias or 'module.path.ClassName'.") from e
     else:
-        tokenizer = AutoTokenizer.from_pretrained(model_name,
-                                                  padding_side="left",
-                                                  trust_remote_code=True)
+        # Route through TransformersTokenizer so trtllm-bench inherits its
+        # post-load fixes -- in particular ``maybe_fix_byte_level_tokenizer``,
+        # which reloads DeepSeek-V3-style models that would otherwise come
+        # back with a Metaspace pre-tokenizer that silently strips spaces
+        # ("hello world" -> "helloworld") on transformers >= 5.x. Peel off
+        # the wrapper to return the raw HF tokenizer the rest of bench code
+        # expects.
+        tokenizer = TransformersTokenizer.from_pretrained(
+            model_name, padding_side="left", trust_remote_code=True).tokenizer
 
     if tokenizer.pad_token_id is None:
         tokenizer.add_special_tokens({"pad_token": "[PAD]"})

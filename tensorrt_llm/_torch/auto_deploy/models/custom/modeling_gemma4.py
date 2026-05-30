@@ -1,3 +1,7 @@
+# Copyright 2018 The HuggingFace Team
+# Licensed under the Apache License, Version 2.0.
+# Original source: https://github.com/huggingface/transformers
+#
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
@@ -34,20 +38,21 @@ Key architectural features of Gemma 4 vs standard transformers:
 """
 
 import json
+import operator
 import re
+import types
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple, cast
 
 import numpy as np
 import torch
 import torch.nn.functional as F
 from PIL import Image
-from tokenizers import Tokenizer
 from torch import nn
 from torch.export import Dim
 from torch.fx import GraphModule
-from transformers import AutoConfig, PretrainedConfig, PreTrainedTokenizerFast
+from transformers import AutoConfig, AutoTokenizer, PretrainedConfig, PreTrainedTokenizerBase
 from transformers.activations import ACT2FN
 from transformers.generation import GenerationMixin
 from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
@@ -73,6 +78,7 @@ from ..hf import (
     AutoModelForImageTextToTextFactory,
     TextModelExportInfo,
 )
+from .rotary_utils import RotaryEmbeddingBase, build_rope_cos_sin_cache
 
 # ---------------------------------------------------------------------------
 # Multimodal semantic mask custom ops — prefill-only and cached variants.
@@ -443,11 +449,11 @@ AutoConfig.register("gemma4_vision", Gemma4VisionConfig, exist_ok=True)
 # ---------------------------------------------------------------------------
 
 
-def _build_rope_cache(
+def _build_rope_inv_freq(
     config: Gemma4TextConfig,
     layer_type: str,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Pre-compute cos/sin RoPE cache for the given layer type."""
+) -> tuple[torch.Tensor, float]:
+    """Build RoPE inverse frequencies for the given layer type."""
     rope_params = config.rope_parameters[layer_type]
     rope_type = rope_params.get("rope_type", "default")
     base = rope_params["rope_theta"]
@@ -480,10 +486,7 @@ def _build_rope_cache(
         rope_init_fn = ROPE_INIT_FUNCTIONS[rope_type]
         inv_freq, attention_scaling = rope_init_fn(config, device=None, layer_type=layer_type)
 
-    positions = torch.arange(config.max_position_embeddings, dtype=inv_freq.dtype)
-    freqs = torch.outer(positions, inv_freq)
-    emb = torch.cat((freqs, freqs), dim=-1)
-    return emb.cos() * attention_scaling, emb.sin() * attention_scaling
+    return inv_freq, attention_scaling
 
 
 # ---------------------------------------------------------------------------
@@ -533,24 +536,22 @@ class Gemma4ClippableLinear(nn.Module):
         return self.linear(hidden_states)
 
 
-class Gemma4RotaryEmbedding(nn.Module):
-    """Pre-computed RoPE cache for a single layer type (global or local)."""
+class Gemma4RotaryEmbedding(RotaryEmbeddingBase):
+    """RoPE for a single layer type (global or local)."""
 
     def __init__(self, config: Gemma4TextConfig, layer_type: str):
         super().__init__()
-        (
-            cos,
-            sin,
-        ) = _build_rope_cache(config, layer_type)
-        self.register_buffer("_ad_cos_cached", cos, persistent=False)
-        self.register_buffer("_ad_sin_cached", sin, persistent=False)
+        inv_freq, self.attention_scaling = _build_rope_inv_freq(config, layer_type)
+        self.max_position_embeddings = config.max_position_embeddings
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
 
     def forward(
         self, x: torch.Tensor, position_ids: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        cos = self._ad_cos_cached[position_ids].to(dtype=x.dtype, device=x.device)
-        sin = self._ad_sin_cached[position_ids].to(dtype=x.dtype, device=x.device)
-        return cos, sin
+        cos, sin = build_rope_cos_sin_cache(
+            self.inv_freq, self.max_position_embeddings, x, self.attention_scaling
+        )
+        return cos[position_ids], sin[position_ids]
 
 
 # ---------------------------------------------------------------------------
@@ -974,11 +975,16 @@ def _canonicalize_mm_span_tensors(
 
 
 class Gemma4TextMLP(nn.Module):
-    def __init__(self, config: Gemma4TextConfig):
+    def __init__(self, config: Gemma4TextConfig, layer_idx: int = 0):
         super().__init__()
-        self.gate_proj = nn.Linear(config.hidden_size, config.intermediate_size, bias=False)
-        self.up_proj = nn.Linear(config.hidden_size, config.intermediate_size, bias=False)
-        self.down_proj = nn.Linear(config.intermediate_size, config.hidden_size, bias=False)
+        intermediate_size = config.intermediate_size
+        if config.use_double_wide_mlp:
+            double_wide_start = config.num_hidden_layers - config.num_kv_shared_layers
+            if layer_idx >= double_wide_start:
+                intermediate_size = intermediate_size * 2
+        self.gate_proj = nn.Linear(config.hidden_size, intermediate_size, bias=False)
+        self.up_proj = nn.Linear(config.hidden_size, intermediate_size, bias=False)
+        self.down_proj = nn.Linear(intermediate_size, config.hidden_size, bias=False)
         self.act_fn = ACT2FN[config.hidden_activation]
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -1080,6 +1086,15 @@ class Gemma4TextAttention(nn.Module):
         self.config = config
         self.is_sliding = config.layer_types[layer_idx] == "sliding_attention"
         self.sliding_window = config.sliding_window if self.is_sliding else None
+        first_kv_shared_layer_idx = config.num_hidden_layers - config.num_kv_shared_layers
+        self.is_kv_shared_layer = layer_idx >= first_kv_shared_layer_idx > 0
+        prev_layers = config.layer_types[:first_kv_shared_layer_idx]
+        if self.is_kv_shared_layer:
+            self.kv_shared_layer_index = (
+                len(prev_layers) - 1 - prev_layers[::-1].index(config.layer_types[layer_idx])
+            )
+        else:
+            self.kv_shared_layer_index = None
 
         # Full-attention layers may use different head dim and K=V
         self.use_k_eq_v = config.attention_k_eq_v and not self.is_sliding
@@ -1121,24 +1136,40 @@ class Gemma4TextAttention(nn.Module):
         hidden_states: torch.Tensor,
         position_embeddings: Tuple[torch.Tensor, torch.Tensor],
         attention_mask: Optional[torch.Tensor] = None,
+        shared_kv_states: Optional[dict[int, tuple[torch.Tensor, torch.Tensor]]] = None,
     ) -> torch.Tensor:
         batch_size, seq_len, _ = hidden_states.shape
         q = self.q_proj(hidden_states).view(batch_size, seq_len, self.num_heads, self.head_dim)
-        k = self.k_proj(hidden_states).view(batch_size, seq_len, self.num_kv_heads, self.head_dim)
-
-        if self.v_proj is not None:
-            v = self.v_proj(hidden_states).view(
-                batch_size, seq_len, self.num_kv_heads, self.head_dim
-            )
-        else:
-            v = k  # K=V: reuse key as value
 
         q = self.q_norm(q)
-        k = self.k_norm(k)
-        v = self.v_norm(v)
-
         cos, sin = position_embeddings
-        q, k = torch.ops.auto_deploy.torch_rope_with_explicit_cos_sin(q, k, cos, sin, 2)
+        q = torch.ops.auto_deploy.torch_rope_with_explicit_cos_sin(q, q, cos, sin, 2)[0]
+
+        if self.is_kv_shared_layer:
+            assert shared_kv_states is not None, (
+                "shared_kv_states must be provided for shared-KV layers"
+            )
+            assert self.kv_shared_layer_index is not None
+            k, v = shared_kv_states[self.kv_shared_layer_index]
+            k = k.to(device=q.device, dtype=q.dtype)
+            v = v.to(device=q.device, dtype=q.dtype)
+        else:
+            k = self.k_proj(hidden_states).view(
+                batch_size, seq_len, self.num_kv_heads, self.head_dim
+            )
+
+            if self.v_proj is not None:
+                v = self.v_proj(hidden_states).view(
+                    batch_size, seq_len, self.num_kv_heads, self.head_dim
+                )
+            else:
+                v = k  # K=V: reuse key as value
+
+            k = self.k_norm(k)
+            v = self.v_norm(v)
+            k = torch.ops.auto_deploy.torch_rope_with_explicit_cos_sin(q, k, cos, sin, 2)[1]
+            if shared_kv_states is not None:
+                shared_kv_states[self.layer_idx] = (k, v)
 
         attn_output = torch.ops.auto_deploy.torch_attention(
             q,
@@ -1153,6 +1184,7 @@ class Gemma4TextAttention(nn.Module):
             None,  # logit_cap
             "bsnd",
             self.layer_idx,
+            self.kv_shared_layer_index if self.is_kv_shared_layer else None,
         )
         return self.o_proj(attn_output.reshape(batch_size, seq_len, -1))
 
@@ -1166,11 +1198,13 @@ class Gemma4TextDecoderLayer(nn.Module):
     def __init__(self, config: Gemma4TextConfig, layer_idx: int):
         super().__init__()
         self.layer_idx = layer_idx
+        self.hidden_size = config.hidden_size
+        self.hidden_size_per_layer_input = getattr(config, "hidden_size_per_layer_input", 0)
         self.num_experts = config.num_experts
         self.expert_intermediate_size = config.expert_intermediate_size
         self.attention_type = config.layer_types[layer_idx]
         self.self_attn = Gemma4TextAttention(config, layer_idx)
-        self.mlp = Gemma4TextMLP(config)
+        self.mlp = Gemma4TextMLP(config, layer_idx)
         self.input_layernorm = Gemma4RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = Gemma4RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.pre_feedforward_layernorm = Gemma4RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -1191,6 +1225,25 @@ class Gemma4TextDecoderLayer(nn.Module):
             self.pre_feedforward_layernorm_2 = Gemma4RMSNorm(
                 config.hidden_size, eps=config.rms_norm_eps
             )
+
+        if self.hidden_size_per_layer_input > 0:
+            self.per_layer_input_gate = nn.Linear(
+                self.hidden_size,
+                self.hidden_size_per_layer_input,
+                bias=False,
+            )
+            self.per_layer_projection = nn.Linear(
+                self.hidden_size_per_layer_input,
+                self.hidden_size,
+                bias=False,
+            )
+            self.post_per_layer_input_norm = Gemma4RMSNorm(
+                config.hidden_size, eps=config.rms_norm_eps
+            )
+        else:
+            self.per_layer_input_gate = None
+            self.per_layer_projection = None
+            self.post_per_layer_input_norm = None
 
     def _unfuse_moe_weights(self, state_dict, prefix, *_args, **_kwargs):
         """Convert layer-level fused Gemma4 MoE checkpoint weights to per-expert weights."""
@@ -1237,11 +1290,18 @@ class Gemma4TextDecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         position_embeddings: Tuple[torch.Tensor, torch.Tensor],
         attention_mask: Optional[torch.Tensor] = None,
+        per_layer_input: Optional[torch.Tensor] = None,
+        shared_kv_states: Optional[dict[int, tuple[torch.Tensor, torch.Tensor]]] = None,
     ) -> torch.Tensor:
         # Self-attention
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
-        hidden_states = self.self_attn(hidden_states, position_embeddings, attention_mask)
+        hidden_states = self.self_attn(
+            hidden_states,
+            position_embeddings,
+            attention_mask=attention_mask,
+            shared_kv_states=shared_kv_states,
+        )
         hidden_states = self.post_attention_layernorm(hidden_states)
         hidden_states = residual + hidden_states
 
@@ -1270,6 +1330,13 @@ class Gemma4TextDecoderLayer(nn.Module):
         hidden_states = self.post_feedforward_layernorm(hidden_states)
         hidden_states = residual + hidden_states
 
+        if per_layer_input is not None and self.per_layer_input_gate is not None:
+            gate = self.per_layer_input_gate(hidden_states)
+            gate = F.gelu(gate, approximate="tanh")
+            per_layer_contribution = self.per_layer_projection(gate * per_layer_input)
+            per_layer_contribution = self.post_per_layer_input_norm(per_layer_contribution)
+            hidden_states = hidden_states + per_layer_contribution
+
         hidden_states = hidden_states * self.layer_scalar
         return hidden_states
 
@@ -1287,6 +1354,7 @@ class Gemma4TextOutput(ModelOutput):
 @dataclass
 class Gemma4CausalLMOutput(ModelOutput):
     logits: Optional[torch.FloatTensor] = None
+    last_hidden_state: Optional[torch.FloatTensor] = None
 
 
 @dataclass
@@ -1315,13 +1383,50 @@ class Gemma4TextPreTrainedModel(PreTrainedModel):
 class Gemma4TextModel(Gemma4TextPreTrainedModel):
     def __init__(self, config: Gemma4TextConfig):
         super().__init__(config)
+        self.config = config
         self.padding_idx = config.pad_token_id
+        self.hidden_size_per_layer_input = getattr(config, "hidden_size_per_layer_input", 0)
+        self.vocab_size_per_layer_input = getattr(
+            config, "vocab_size_per_layer_input", config.vocab_size
+        )
         self.embed_tokens = Gemma4TextScaledWordEmbedding(
             config.vocab_size,
             config.hidden_size,
             self.padding_idx,
             embed_scale=config.hidden_size**0.5,
         )
+        if self.hidden_size_per_layer_input > 0:
+            total_ple_dim = self.hidden_size_per_layer_input * config.num_hidden_layers
+            self.embed_tokens_per_layer = Gemma4TextScaledWordEmbedding(
+                self.vocab_size_per_layer_input,
+                total_ple_dim,
+                self.padding_idx,
+                embed_scale=self.hidden_size_per_layer_input**0.5,
+            )
+            self.per_layer_model_projection = nn.Linear(
+                config.hidden_size,
+                total_ple_dim,
+                bias=False,
+            )
+            self.per_layer_projection_norm = Gemma4RMSNorm(
+                self.hidden_size_per_layer_input, eps=config.rms_norm_eps
+            )
+            self.register_buffer(
+                "per_layer_input_scale",
+                torch.rsqrt(torch.tensor(2.0)),
+                persistent=False,
+            )
+            self.register_buffer(
+                "per_layer_projection_scale",
+                torch.tensor(config.hidden_size**-0.5),
+                persistent=False,
+            )
+        else:
+            self.embed_tokens_per_layer = None
+            self.per_layer_model_projection = None
+            self.per_layer_projection_norm = None
+            self.register_buffer("per_layer_input_scale", None, persistent=False)
+            self.register_buffer("per_layer_projection_scale", None, persistent=False)
         self.layers = nn.ModuleList(
             [Gemma4TextDecoderLayer(config, i) for i in range(config.num_hidden_layers)]
         )
@@ -1339,12 +1444,64 @@ class Gemma4TextModel(Gemma4TextPreTrainedModel):
     def set_input_embeddings(self, value):
         self.embed_tokens = value
 
+    def get_per_layer_inputs(
+        self,
+        input_ids: torch.LongTensor,
+    ) -> Optional[torch.Tensor]:
+        if self.embed_tokens_per_layer is None:
+            return None
+
+        # The text serving path reaches this point with input_ids, so the token
+        # remapping stays in fixed-shape device tensor ops with no CPU sync.
+        per_layer_inputs_mask = torch.logical_and(
+            input_ids >= 0,
+            input_ids < self.vocab_size_per_layer_input,
+        )
+        per_layer_input_tokens = torch.where(
+            per_layer_inputs_mask,
+            input_ids,
+            torch.zeros_like(input_ids),
+        )
+        per_layer_embeds = self.embed_tokens_per_layer(per_layer_input_tokens)
+        return per_layer_embeds.reshape(
+            *input_ids.shape,
+            self.config.num_hidden_layers,
+            self.hidden_size_per_layer_input,
+        )
+
+    def project_per_layer_inputs(
+        self,
+        inputs_embeds: torch.Tensor,
+        per_layer_inputs: Optional[torch.Tensor],
+    ) -> Optional[torch.Tensor]:
+        if self.per_layer_model_projection is None or self.per_layer_projection_norm is None:
+            return None
+
+        per_layer_projection = self.per_layer_model_projection(inputs_embeds)
+        per_layer_projection = per_layer_projection * self.per_layer_projection_scale.to(
+            dtype=inputs_embeds.dtype, device=inputs_embeds.device
+        )
+        per_layer_projection = per_layer_projection.reshape(
+            *inputs_embeds.shape[:-1],
+            self.config.num_hidden_layers,
+            self.hidden_size_per_layer_input,
+        )
+        per_layer_projection = self.per_layer_projection_norm(per_layer_projection)
+
+        if per_layer_inputs is None:
+            return per_layer_projection
+
+        return (per_layer_projection + per_layer_inputs) * self.per_layer_input_scale.to(
+            dtype=inputs_embeds.dtype, device=inputs_embeds.device
+        )
+
     def forward(
         self,
         input_ids: Optional[torch.LongTensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
         inputs_embeds: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
+        per_layer_inputs: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> Gemma4TextOutput:
         del kwargs
@@ -1354,18 +1511,42 @@ class Gemma4TextModel(Gemma4TextPreTrainedModel):
             raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
 
         if input_ids is not None:
+            # Text-only prompts enter through input_ids; materialize embeddings once
+            # so the rest of the model follows a single tensor path.
             inputs_embeds = self.embed_tokens(input_ids)
+        else:
+            inputs_embeds = cast(torch.Tensor, inputs_embeds)
 
+        if per_layer_inputs is None:
+            if input_ids is None:
+                if self.embed_tokens_per_layer is not None:
+                    raise ValueError(
+                        "per_layer_inputs must be provided when using inputs_embeds with Gemma4 "
+                        "per-layer inputs"
+                    )
+            else:
+                per_layer_inputs = self.get_per_layer_inputs(input_ids)
+        per_layer_inputs = self.project_per_layer_inputs(inputs_embeds, per_layer_inputs)
         pos_emb_global = self.rotary_emb_global(inputs_embeds, position_ids)
         pos_emb_local = self.rotary_emb_local(inputs_embeds, position_ids)
 
         hidden_states = inputs_embeds
+        shared_kv_states: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
         for decoder_layer in self.layers:
             if decoder_layer.attention_type == "sliding_attention":
                 pos_emb = pos_emb_local
             else:
                 pos_emb = pos_emb_global
-            hidden_states = decoder_layer(hidden_states, pos_emb, attention_mask)
+            layer_per_input = None
+            if per_layer_inputs is not None:
+                layer_per_input = per_layer_inputs[:, :, decoder_layer.layer_idx, :]
+            hidden_states = decoder_layer(
+                hidden_states,
+                pos_emb,
+                attention_mask=attention_mask,
+                per_layer_input=layer_per_input,
+                shared_kv_states=shared_kv_states,
+            )
 
         hidden_states = self.norm(hidden_states)
         return Gemma4TextOutput(last_hidden_state=hidden_states)
@@ -1378,18 +1559,54 @@ class Gemma4TextModel(Gemma4TextPreTrainedModel):
 
 class Gemma4ForCausalLM(Gemma4TextPreTrainedModel, GenerationMixin):
     config_class = Gemma4TextConfig
-    _tied_weights_keys = ["lm_head.weight"]
+    _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
 
     def __init__(self, config: Gemma4TextConfig, **kwargs):
         del kwargs
         super().__init__(config)
         self.padding_idx = config.pad_token_id
+        self.hidden_size_per_layer_input = getattr(config, "hidden_size_per_layer_input", 0)
+        self.vocab_size_per_layer_input = getattr(
+            config, "vocab_size_per_layer_input", config.vocab_size
+        )
         self.embed_tokens = Gemma4TextScaledWordEmbedding(
             config.vocab_size,
             config.hidden_size,
             self.padding_idx,
             embed_scale=config.hidden_size**0.5,
         )
+        if self.hidden_size_per_layer_input > 0:
+            total_ple_dim = self.hidden_size_per_layer_input * config.num_hidden_layers
+            self.embed_tokens_per_layer = Gemma4TextScaledWordEmbedding(
+                self.vocab_size_per_layer_input,
+                total_ple_dim,
+                self.padding_idx,
+                embed_scale=self.hidden_size_per_layer_input**0.5,
+            )
+            self.per_layer_model_projection = nn.Linear(
+                config.hidden_size,
+                total_ple_dim,
+                bias=False,
+            )
+            self.per_layer_projection_norm = Gemma4RMSNorm(
+                self.hidden_size_per_layer_input, eps=config.rms_norm_eps
+            )
+            self.register_buffer(
+                "per_layer_input_scale",
+                torch.rsqrt(torch.tensor(2.0)),
+                persistent=False,
+            )
+            self.register_buffer(
+                "per_layer_projection_scale",
+                torch.tensor(config.hidden_size**-0.5),
+                persistent=False,
+            )
+        else:
+            self.embed_tokens_per_layer = None
+            self.per_layer_model_projection = None
+            self.per_layer_projection_norm = None
+            self.register_buffer("per_layer_input_scale", None, persistent=False)
+            self.register_buffer("per_layer_projection_scale", None, persistent=False)
         self.layers = nn.ModuleList(
             [Gemma4TextDecoderLayer(config, i) for i in range(config.num_hidden_layers)]
         )
@@ -1406,6 +1623,10 @@ class Gemma4ForCausalLM(Gemma4TextPreTrainedModel, GenerationMixin):
         if getattr(config, "tie_word_embeddings", True):
             self.lm_head.weight = self.embed_tokens.weight
 
+    @property
+    def model(self):
+        return self
+
     @staticmethod
     def _retie_lm_head_weight(module, incompatible_keys):
         del incompatible_keys
@@ -1419,6 +1640,55 @@ class Gemma4ForCausalLM(Gemma4TextPreTrainedModel, GenerationMixin):
 
     def set_input_embeddings(self, value):
         self.embed_tokens = value
+
+    def get_per_layer_inputs(
+        self,
+        input_ids: torch.LongTensor,
+    ) -> Optional[torch.Tensor]:
+        if self.embed_tokens_per_layer is None:
+            return None
+
+        per_layer_inputs_mask = torch.logical_and(
+            input_ids >= 0,
+            input_ids < self.vocab_size_per_layer_input,
+        )
+        per_layer_input_tokens = torch.where(
+            per_layer_inputs_mask,
+            input_ids,
+            torch.zeros_like(input_ids),
+        )
+        per_layer_embeds = self.embed_tokens_per_layer(per_layer_input_tokens)
+        return per_layer_embeds.reshape(
+            *input_ids.shape,
+            self.config.num_hidden_layers,
+            self.hidden_size_per_layer_input,
+        )
+
+    def project_per_layer_inputs(
+        self,
+        inputs_embeds: torch.Tensor,
+        per_layer_inputs: Optional[torch.Tensor],
+    ) -> Optional[torch.Tensor]:
+        if self.per_layer_model_projection is None or self.per_layer_projection_norm is None:
+            return None
+
+        per_layer_projection = self.per_layer_model_projection(inputs_embeds)
+        per_layer_projection = per_layer_projection * self.per_layer_projection_scale.to(
+            dtype=inputs_embeds.dtype, device=inputs_embeds.device
+        )
+        per_layer_projection = per_layer_projection.reshape(
+            *inputs_embeds.shape[:-1],
+            self.config.num_hidden_layers,
+            self.hidden_size_per_layer_input,
+        )
+        per_layer_projection = self.per_layer_projection_norm(per_layer_projection)
+
+        if per_layer_inputs is None:
+            return per_layer_projection
+
+        return (per_layer_projection + per_layer_inputs) * self.per_layer_input_scale.to(
+            dtype=inputs_embeds.dtype, device=inputs_embeds.device
+        )
 
     def get_output_embeddings(self):
         return self.lm_head
@@ -1434,6 +1704,7 @@ class Gemma4ForCausalLM(Gemma4TextPreTrainedModel, GenerationMixin):
         input_ids: Optional[torch.LongTensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
         inputs_embeds: Optional[torch.Tensor] = None,
+        per_layer_inputs: Optional[torch.Tensor] = None,
         mm_item_cu_seqlen: Optional[torch.Tensor] = None,
         mm_token_positions: Optional[torch.Tensor] = None,
         mm_token_lengths: Optional[torch.Tensor] = None,
@@ -1450,8 +1721,17 @@ class Gemma4ForCausalLM(Gemma4TextPreTrainedModel, GenerationMixin):
 
         if input_ids is not None:
             inputs_embeds = self.embed_tokens(input_ids)
+            if per_layer_inputs is None:
+                per_layer_inputs = self.get_per_layer_inputs(input_ids)
+        elif per_layer_inputs is None and self.embed_tokens_per_layer is not None:
+            raise ValueError(
+                "per_layer_inputs must be provided when using inputs_embeds with Gemma4 "
+                "per-layer inputs"
+            )
 
         assert inputs_embeds is not None
+        per_layer_inputs = self.project_per_layer_inputs(inputs_embeds, per_layer_inputs)
+        has_multimodal_spans = mm_token_positions is not None and mm_token_positions.numel() > 0
         mm_tensors = _canonicalize_mm_span_tensors(
             input_ids=input_ids,
             inputs_embeds=inputs_embeds,
@@ -1462,30 +1742,42 @@ class Gemma4ForCausalLM(Gemma4TextPreTrainedModel, GenerationMixin):
             mm_special_offsets_cu_seqlen=mm_special_offsets_cu_seqlen,
             mm_special_offsets=mm_special_offsets,
         )
-        mask_input_ids = input_ids
-        if mask_input_ids is None:
-            mask_input_ids = torch.zeros(
-                inputs_embeds.shape[:2], dtype=torch.int64, device=inputs_embeds.device
+        attention_mask = None
+        if has_multimodal_spans:
+            mask_input_ids = input_ids
+            if mask_input_ids is None:
+                mask_input_ids = torch.zeros(
+                    inputs_embeds.shape[:2], dtype=torch.int64, device=inputs_embeds.device
+                )
+            attention_mask = torch.ops.auto_deploy.gemma4_multimodal_mask.default(
+                mask_input_ids,
+                mm_tensors["mm_token_positions"],
+                mm_tensors["mm_token_lengths"],
+                mm_tensors["mm_item_cu_seqlen"],
+                mm_tensors["mm_item_types"],
+                mm_tensors["mm_special_offsets_cu_seqlen"],
+                mm_tensors["mm_special_offsets"],
             )
-        attention_mask = torch.ops.auto_deploy.gemma4_multimodal_mask.default(
-            mask_input_ids,
-            mm_tensors["mm_token_positions"],
-            mm_tensors["mm_token_lengths"],
-            mm_tensors["mm_item_cu_seqlen"],
-            mm_tensors["mm_item_types"],
-            mm_tensors["mm_special_offsets_cu_seqlen"],
-            mm_tensors["mm_special_offsets"],
-        )
         pos_emb_global = self.rotary_emb_global(inputs_embeds, position_ids)
         pos_emb_local = self.rotary_emb_local(inputs_embeds, position_ids)
 
         hidden_states = inputs_embeds
+        shared_kv_states: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
         for decoder_layer in self.layers:
             if decoder_layer.attention_type == "sliding_attention":
                 pos_emb = pos_emb_local
             else:
                 pos_emb = pos_emb_global
-            hidden_states = decoder_layer(hidden_states, pos_emb, attention_mask)
+            layer_per_input = None
+            if per_layer_inputs is not None:
+                layer_per_input = per_layer_inputs[:, :, decoder_layer.layer_idx, :]
+            hidden_states = decoder_layer(
+                hidden_states,
+                pos_emb,
+                attention_mask=attention_mask,
+                per_layer_input=layer_per_input,
+                shared_kv_states=shared_kv_states,
+            )
 
         hidden_states = self.norm(hidden_states)
         logits = self.lm_head(hidden_states)
@@ -1493,7 +1785,7 @@ class Gemma4ForCausalLM(Gemma4TextPreTrainedModel, GenerationMixin):
             logits = logits / self.config.final_logit_softcapping
             logits = torch.tanh(logits)
             logits = logits * self.config.final_logit_softcapping
-        return Gemma4CausalLMOutput(logits=logits)
+        return Gemma4CausalLMOutput(logits=logits, last_hidden_state=hidden_states)
 
 
 # ---------------------------------------------------------------------------
@@ -1589,7 +1881,14 @@ class Gemma4Model(Gemma4PreTrainedModel):
             return input_ids == self.config.image_token_id
         if inputs_embeds is None:
             raise ValueError("Either input_ids or inputs_embeds must be provided")
-        image_embedding = self.get_input_embeddings()(
+        input_embeddings = self.get_input_embeddings()
+        if self.config.image_token_id >= input_embeddings.num_embeddings:
+            return torch.zeros(
+                inputs_embeds.shape[:-1],
+                dtype=torch.bool,
+                device=inputs_embeds.device,
+            )
+        image_embedding = input_embeddings(
             torch.tensor(self.config.image_token_id, dtype=torch.long, device=inputs_embeds.device)
         )
         return (inputs_embeds == image_embedding).all(-1)
@@ -1772,6 +2071,7 @@ class Gemma4Model(Gemma4PreTrainedModel):
         if (input_ids is None) == (inputs_embeds is None):
             raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
 
+        per_layer_inputs = None
         if inputs_embeds is None:
             image_mask = self.get_placeholder_mask(input_ids=input_ids)
             llm_input_ids = input_ids.clone()
@@ -1781,6 +2081,7 @@ class Gemma4Model(Gemma4PreTrainedModel):
                 llm_input_ids,
             )
             inputs_embeds = self.get_input_embeddings()(llm_input_ids)
+            per_layer_inputs = self.language_model.get_per_layer_inputs(llm_input_ids)
         else:
             image_mask = self.get_placeholder_mask(inputs_embeds=inputs_embeds)
 
@@ -1870,6 +2171,8 @@ class Gemma4Model(Gemma4PreTrainedModel):
             language_model_kwargs["mm_special_offsets_cu_seqlen"] = mm_special_offsets_cu_seqlen
         if mm_special_offsets is not None:
             language_model_kwargs["mm_special_offsets"] = mm_special_offsets
+        if per_layer_inputs is not None:
+            language_model_kwargs["per_layer_inputs"] = per_layer_inputs
 
         return Gemma4ForConditionalGeneration._call_language_model(
             self.language_model,
@@ -1882,7 +2185,9 @@ class Gemma4Model(Gemma4PreTrainedModel):
 
 class Gemma4ForConditionalGeneration(Gemma4PreTrainedModel, GenerationMixin):
     config_class = Gemma4Config
-    _tied_weights_keys = ["model.language_model.lm_head.weight"]
+    _tied_weights_keys = {
+        "model.language_model.lm_head.weight": "model.language_model.embed_tokens.weight"
+    }
 
     def __init__(self, config: Gemma4Config, **kwargs):
         del kwargs
@@ -1992,19 +2297,7 @@ class Gemma4ForConditionalGeneration(Gemma4PreTrainedModel, GenerationMixin):
         return Gemma4ConditionalOutput(logits=outputs.logits)
 
 
-# ---------------------------------------------------------------------------
-# Wrapper tokenizer for Gemma 4
-#
-# The upstream HF checkpoint ships ``extra_special_tokens`` as a *list* in
-# tokenizer_config.json, which is incompatible with transformers <5.3.
-# This thin wrapper loads the tokenizer assets directly, bypassing the
-# problematic codepath.
-# ---------------------------------------------------------------------------
-
-_TOKENIZER_CONFIG_FILE = "tokenizer_config.json"
 _PROCESSOR_CONFIG_FILE = "processor_config.json"
-_CHAT_TEMPLATE_FILE = "chat_template.jinja"
-_TOKENIZER_FILE = "tokenizer.json"
 _SUPPORTED_GEMMA4_SOFT_TOKENS = (70, 140, 280, 560, 1120)
 
 
@@ -2047,72 +2340,6 @@ def get_aspect_ratio_preserving_size(
         )
 
     return target_height, target_width
-
-
-class ADGemma4Tokenizer(PreTrainedTokenizerFast):
-    """Wrapper that loads the upstream Gemma 4 tokenizer on current transformers."""
-
-    vocab_files_names = {"tokenizer_file": _TOKENIZER_FILE}
-    model_input_names = ["input_ids", "attention_mask"]
-    slow_tokenizer_class = None
-
-    @classmethod
-    def from_pretrained(
-        cls,
-        pretrained_model_name_or_path: str | Path,
-        *inputs,
-        **kwargs,
-    ) -> "ADGemma4Tokenizer":
-        del inputs
-        for k in ("_from_auto", "_commit_hash", "trust_remote_code"):
-            kwargs.pop(k, None)
-
-        config_path = cached_file(pretrained_model_name_or_path, _TOKENIZER_CONFIG_FILE, **kwargs)
-        assert config_path is not None
-        config = json.loads(Path(config_path).read_text())
-
-        tokenizer_file = cached_file(pretrained_model_name_or_path, _TOKENIZER_FILE, **kwargs)
-        assert tokenizer_file is not None
-
-        # ``extra_special_tokens`` is a list in the upstream config; map it to
-        # the standard ``additional_special_tokens`` field.
-        extra = config.get("extra_special_tokens", [])
-        if isinstance(extra, list):
-            additional = extra
-        else:
-            additional = list(extra.keys()) if isinstance(extra, dict) else []
-
-        tokenizer = cls(
-            tokenizer_object=Tokenizer.from_file(tokenizer_file),
-            name_or_path=str(pretrained_model_name_or_path),
-            bos_token=config.get("bos_token"),
-            eos_token=config.get("eos_token"),
-            unk_token=config.get("unk_token"),
-            pad_token=config.get("pad_token"),
-            additional_special_tokens=additional,
-            clean_up_tokenization_spaces=config.get("clean_up_tokenization_spaces", False),
-            model_max_length=config.get("model_max_length"),
-            padding_side=config.get("padding_side", "left"),
-            truncation_side=config.get("truncation_side", "left"),
-        )
-
-        tokenizer.image_token = config.get("image_token", "<|image|>")
-        tokenizer.boi_token = config.get("boi_token", "<|image>")
-        tokenizer.eoi_token = config.get("eoi_token", "<image|>")
-        tokenizer.image_token_id = tokenizer.convert_tokens_to_ids(tokenizer.image_token)
-        tokenizer.boi_token_id = tokenizer.convert_tokens_to_ids(tokenizer.boi_token)
-        tokenizer.eoi_token_id = tokenizer.convert_tokens_to_ids(tokenizer.eoi_token)
-
-        template_path = cached_file(
-            pretrained_model_name_or_path,
-            _CHAT_TEMPLATE_FILE,
-            _raise_exceptions_for_missing_entries=False,
-            **kwargs,
-        )
-        if template_path is not None:
-            tokenizer.chat_template = Path(template_path).read_text()
-
-        return tokenizer
 
 
 class ADGemma4ImageProcessor:
@@ -2345,7 +2572,7 @@ class ADGemma4Processor:
     def __init__(
         self,
         *,
-        tokenizer: ADGemma4Tokenizer,
+        tokenizer: PreTrainedTokenizerBase,
         image_processor: ADGemma4ImageProcessor,
         image_seq_length: int = 280,
     ) -> None:
@@ -2366,7 +2593,7 @@ class ADGemma4Processor:
         pretrained_model_name_or_path: str | Path,
         **kwargs,
     ) -> "ADGemma4Processor":
-        tokenizer = ADGemma4Tokenizer.from_pretrained(pretrained_model_name_or_path, **kwargs)
+        tokenizer = AutoTokenizer.from_pretrained(pretrained_model_name_or_path, **kwargs)
         image_processor = ADGemma4ImageProcessor.from_pretrained(
             pretrained_model_name_or_path, **kwargs
         )
@@ -2679,6 +2906,51 @@ class Gemma4ADInputProcessor:
 class Gemma4TextExportInfo(TextModelExportInfo):
     """Export info for Gemma4 text graphs with multimodal span tensor inputs."""
 
+    def post_process(self, sub_mod: nn.Module, sub_gm: GraphModule):
+        super().post_process(sub_mod, sub_gm)
+
+        # Gemma4Model.forward calls language_model.get_per_layer_inputs unconditionally,
+        # so the GraphModule must expose it on every variant. The method itself short-circuits
+        # to None when embed_tokens_per_layer is None, which is the non-E2B case.
+        embed_tokens_per_layer = getattr(sub_mod, "embed_tokens_per_layer", None)
+        sub_gm.get_per_layer_inputs = types.MethodType(
+            sub_mod.get_per_layer_inputs.__func__, sub_gm
+        )
+
+        if embed_tokens_per_layer is None:
+            sub_gm.embed_tokens_per_layer = None
+            return
+
+        sub_gm.config = sub_mod.config
+        sub_gm.hidden_size_per_layer_input = sub_mod.hidden_size_per_layer_input
+        sub_gm.vocab_size_per_layer_input = sub_mod.vocab_size_per_layer_input
+
+        for embed_name, subsubmod in sub_mod.named_modules():
+            if subsubmod is embed_tokens_per_layer:
+                break
+        else:
+            raise RuntimeError("Could not find Gemma4 per-layer embedding module.")
+
+        sub_gm.set_submodule(embed_name, embed_tokens_per_layer)
+        output_node = next(node for node in sub_gm.graph.nodes if node.op == "output")
+        with sub_gm.graph.inserting_before(output_node):
+            n_embed_tokens = sub_gm.graph.get_attr(f"{embed_name}.weight")
+            n_embed_rows = sub_gm.graph.call_function(
+                torch.ops.aten.sym_size.int,
+                args=(n_embed_tokens, 0),
+            )
+            has_nonnegative_rows = sub_gm.graph.call_function(
+                operator.ge,
+                args=(n_embed_rows, 0),
+            )
+            sub_gm.graph.call_function(
+                torch._assert,
+                args=(
+                    has_nonnegative_rows,
+                    "Avoid Gemma4 per-layer embedding getting deleted from graph.",
+                ),
+            )
+
     def _init_dynamic_shape_lookup(self):
         dynamic_shapes = super()._init_dynamic_shape_lookup()
         dynamic_shapes["mm_item_cu_seqlen"] = {0: Dim.DYNAMIC}
@@ -2687,6 +2959,7 @@ class Gemma4TextExportInfo(TextModelExportInfo):
         dynamic_shapes["mm_token_lengths"] = {0: Dim.DYNAMIC}
         dynamic_shapes["mm_special_offsets_cu_seqlen"] = {0: Dim.DYNAMIC}
         dynamic_shapes["mm_special_offsets"] = {0: Dim.DYNAMIC}
+        dynamic_shapes["per_layer_inputs"] = {0: Dim.DYNAMIC, 1: Dim.DYNAMIC}
         return dynamic_shapes
 
 
@@ -2718,7 +2991,7 @@ class Gemma4ForConditionalGenerationFactory(AutoModelForImageTextToTextFactory):
     def init_tokenizer(self) -> Optional[Any]:
         if self.tokenizer is None:
             return None
-        return ADGemma4Tokenizer.from_pretrained(self.tokenizer)
+        return AutoTokenizer.from_pretrained(self.tokenizer)
 
     def init_processor(self) -> Optional[Any]:
         """Return the local Gemma4 multimodal processor."""

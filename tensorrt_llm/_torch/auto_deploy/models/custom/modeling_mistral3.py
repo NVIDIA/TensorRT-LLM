@@ -1,3 +1,7 @@
+# Copyright 2018 The HuggingFace Team
+# Licensed under the Apache License, Version 2.0.
+# Original source: https://github.com/huggingface/transformers
+#
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
@@ -46,6 +50,7 @@ from ..._compat import ActivationType
 from ..factory import ModelFactoryRegistry
 from ..hf import AutoModelForCausalLMFactory, AutoModelForImageTextToTextFactory
 from . import mla_rope_utils
+from .rotary_utils import RotaryEmbeddingBase, build_rope_cos_sin_cache
 
 
 class Mistral4TextConfig(PretrainedConfig):
@@ -197,7 +202,7 @@ class Mistral4RMSNorm(nn.Module):
         )
 
 
-class Mistral4RotaryEmbedding(nn.Module):
+class Mistral4RotaryEmbedding(RotaryEmbeddingBase):
     def __init__(self, dim: int, max_position_embeddings: int, base: float):
         super().__init__()
         self.dim = dim
@@ -205,21 +210,17 @@ class Mistral4RotaryEmbedding(nn.Module):
         self.base = base
         inv_freq = 1.0 / (self.base ** (torch.arange(0, self.dim, 2).float() / self.dim))
         self.register_buffer("inv_freq", inv_freq, persistent=False)
+        self.attention_scaling = 1.0
         self._build_cache(max_position_embeddings)
 
     def _build_cache(self, seq_len: int) -> None:
-        t = torch.arange(seq_len, dtype=self.inv_freq.dtype)
-        freqs = torch.outer(t, self.inv_freq)
-        emb = torch.cat((freqs, freqs), dim=-1)
-        self.register_buffer("_ad_cos_cached", emb.cos(), persistent=False)
-        self.register_buffer("_ad_sin_cached", emb.sin(), persistent=False)
+        self.max_seq_len_cached = seq_len
 
     def forward(
         self, x: torch.Tensor, seq_len: Optional[int] = None
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        return (
-            self._ad_cos_cached.to(dtype=x.dtype, device=x.device),
-            self._ad_sin_cached.to(dtype=x.dtype, device=x.device),
+        return build_rope_cos_sin_cache(
+            self.inv_freq, self.max_position_embeddings, x, self.attention_scaling
         )
 
 
@@ -276,6 +277,7 @@ class Mistral4YarnRotaryEmbedding(Mistral4RotaryEmbedding):
         return torch.clamp(linear_func, 0, 1)
 
     def _build_cache(self, seq_len: int) -> None:
+        self.max_seq_len_cached = seq_len
         dim = self.dim
         freq_extra = 1.0 / (self.base ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim))
         freq_inter = 1.0 / (
@@ -291,15 +293,11 @@ class Mistral4YarnRotaryEmbedding(Mistral4RotaryEmbedding):
         inv_freq_mask = 1.0 - self._yarn_linear_ramp_mask(low, high, dim // 2)
         inv_freq = freq_inter * (1 - inv_freq_mask) + freq_extra * inv_freq_mask
         self.register_buffer("inv_freq", inv_freq, persistent=False)
-        t = torch.arange(seq_len, dtype=torch.float32)
-        freqs = torch.outer(t, inv_freq)
-        emb = torch.cat((freqs, freqs), dim=-1)
         mscale = float(
             self._yarn_get_mscale(self.scaling_factor, self.mscale)
             / self._yarn_get_mscale(self.scaling_factor, self.mscale_all_dim)
         )
-        self.register_buffer("_ad_cos_cached", emb.cos() * mscale, persistent=False)
-        self.register_buffer("_ad_sin_cached", emb.sin() * mscale, persistent=False)
+        self.attention_scaling = mscale
 
 
 class Mistral4MLP(nn.Module):
@@ -626,7 +624,7 @@ class Mistral4Model(Mistral4PreTrainedModel):
 
 
 class Mistral4ForCausalLM(Mistral4PreTrainedModel, GenerationMixin):
-    _tied_weights_keys = ["lm_head.weight"]
+    _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
 
     def __init__(self, config: Mistral4TextConfig, **kwargs):
         super().__init__(config)

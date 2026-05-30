@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2020 Dan Hendrycks
 # SPDX-FileCopyrightText: Copyright (c) 2023 Deep Cognition and Language Research (DeCLaRe) Lab
-# SPDX-FileCopyrightText: Copyright (c) 2023-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2023-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0 and MIT
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -163,11 +163,7 @@ class MMLU(Evaluator):
         return f"{workspace}/data"
 
     def format_subject(self, subject):
-        line = subject.split("_")
-        s = ""
-        for entry in line:
-            s += " " + entry
-        return s
+        return subject.replace("_", " ")
 
     def format_example(self, df, idx, include_answer=True):
         prompt = df.iloc[idx, 0]

@@ -1,3 +1,17 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 import json
 import os
 from abc import ABC, abstractmethod
@@ -10,6 +24,32 @@ from strenum import StrEnum
 
 from tensorrt_llm.bindings import executor as tllme
 from tensorrt_llm.logger import logger
+
+MAX_TOP_LOGPROBS = 20
+
+
+def validate_thinking_token_budget(value: Optional[Union[int, float, bool]]) -> Optional[int]:
+    """Validate ``thinking_token_budget``; return ``None`` if unset."""
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError("thinking_token_budget must be a non-negative integer or -1 for unlimited")
+    if value == -1:
+        return None
+    if value < 0:
+        raise ValueError("thinking_token_budget must be a non-negative integer or -1 for unlimited")
+    return value
+
+
+def check_logprobs_limit(
+    name: str, value: Optional[int], max_value: int = MAX_TOP_LOGPROBS
+) -> None:
+    if value is None:
+        return
+    if value < 0:
+        raise ValueError(f"{name} must be positive, zero or None")
+    if value > max_value:
+        raise ValueError(f"{name} must be less than or equal to {max_value}")
 
 
 @dataclass(slots=True, kw_only=True)
@@ -199,6 +239,7 @@ class SamplingParams:
 
         lookahead_config (tensorrt_llm.bindings.executor.LookaheadDecodingConfig , optional): Lookahead decoding config. Defaults to None.
         guided_decoding (tensorrt_llm.sampling_params.GuidedDecodingParams, optional): Guided decoding params. Defaults to None.
+        thinking_token_budget (int, optional): Experimental. Maximum number of tokens allowed inside a reasoning block. Set to -1 or None for unlimited. Defaults to None.
 
         ignore_eos (bool): Whether to ignore the EOS token and continue generating tokens after the EOS token is generated. Defaults to False.
         detokenize (bool): Whether to detokenize the output. Defaults to True.
@@ -280,6 +321,7 @@ class SamplingParams:
 
     # Guided decoding params
     guided_decoding: Optional[GuidedDecodingParams] = None
+    thinking_token_budget: Optional[int] = None
 
     # Tokenizer-related configs
     ignore_eos: bool = False
@@ -347,16 +389,15 @@ class SamplingParams:
 
         if self.guided_decoding is not None:
             self.guided_decoding._validate()
+        self.thinking_token_budget = validate_thinking_token_budget(self.thinking_token_budget)
 
         # correct types as users might pass in logprob=True for Top-0 logprobs and logprobs=False for no logprobs
         if self.logprobs is False:
             self.logprobs = None
         if self.logprobs is True:
             self.logprobs = 0
-        if self.logprobs is not None and self.logprobs < 0:
-            raise ValueError("logprobs must be positive, zero or None")
-        if self.prompt_logprobs is not None and self.prompt_logprobs < 0:
-            raise ValueError("prompt_logprobs must be positive, zero or None")
+        check_logprobs_limit("logprobs", self.logprobs)
+        check_logprobs_limit("prompt_logprobs", self.prompt_logprobs)
 
     # NB: Static, because downstream code only holds instances of
     #     bindings.SamplingConfig (not SamplingParams).

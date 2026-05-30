@@ -48,9 +48,12 @@ from tensorrt_llm.llmapi.llm import RequestOutput
 from tensorrt_llm.llmapi.reasoning_parser import (BaseReasoningParser,
                                                   ReasoningParserFactory,
                                                   ReasoningParserResult)
+from tensorrt_llm.llmapi.thinking_budget import \
+    add_thinking_budget_logits_processor
 from tensorrt_llm.llmapi.tokenizer import TokenizerBase, TransformersTokenizer
 from tensorrt_llm.logger import logger
-from tensorrt_llm.serve.chat_utils import parse_chat_messages_coroutines
+from tensorrt_llm.serve.chat_utils import (parse_chat_messages_coroutines,
+                                           resolve_top_level_model_type)
 from tensorrt_llm.serve.openai_protocol import (ChatCompletionMessageParam,
                                                 ChatCompletionToolsParam,
                                                 FunctionDefinition,
@@ -825,7 +828,7 @@ async def _create_input_tokens(
         for tool in _get_chat_completion_function_tools(request.tools)
     ]
     token_ids = apply_chat_template(
-        model_type=model_config.model_type,
+        model_type=resolve_top_level_model_type(model_config),
         tokenizer=tokenizer,
         processor=processor,
         conversation=conversation,
@@ -918,6 +921,11 @@ async def request_preprocess(
     _responses_debug_log("======= Complete Inputs to model =======")
     _responses_debug_log(_decode_tokens(input_tokens, tokenizer))
     _responses_debug_log("========================================")
+    add_thinking_budget_logits_processor(
+        sampling_params,
+        reasoning_parser=reasoning_parser,
+        tokenizer=tokenizer,
+    )
     return input_tokens, sampling_params
 
 
