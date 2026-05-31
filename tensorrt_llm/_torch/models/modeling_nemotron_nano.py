@@ -401,15 +401,7 @@ def _is_disagg() -> bool:
     return os.getenv("TLLM_MULTIMODAL_DISAGGREGATED", "0") == "1"
 
 
-_DISAGG_ROLE_ENV_NAME = "TRTLLM_DISAGG_ROLE"
-_DISAGG_CONTEXT_ROLES = {"context", "ctx"}
 _NANO_MODALITIES = ("image", "video", "audio")
-
-
-# TODO(claude): revert these disagg related changes from current feature branch.
-def _is_disagg_context_role() -> bool:
-    """Return whether this process is the disaggregated prefill role."""
-    return os.getenv(_DISAGG_ROLE_ENV_NAME, "").lower() in _DISAGG_CONTEXT_ROLES
 
 
 def _get_modality_types(multimodal_data: Dict[str, Any]) -> List[str]:
@@ -420,15 +412,6 @@ def _get_modality_types(multimodal_data: Dict[str, Any]) -> List[str]:
     if isinstance(modality_type, (list, tuple)):
         return list(modality_type)
     return [modality for modality in _NANO_MODALITIES if multimodal_data.get(modality) is not None]
-
-
-def _has_raw_multimodal_data(param: MultimodalParams) -> bool:
-    """Return whether a param still carries raw modality payloads to encode."""
-    multimodal_data = param.multimodal_data or {}
-    return any(
-        modality in _NANO_MODALITIES and multimodal_data.get(modality) is not None
-        for modality in _get_modality_types(multimodal_data)
-    )
 
 
 def _nano_resolve_payload_token_counts(
@@ -3932,39 +3915,15 @@ class NemotronH_Nano_VL_V2(transformers.PreTrainedModel):
             ctx_params = multimodal_params[:num_context_requests]
             if self.video_pruning_rate > 0:
                 self._validate_evs_context_batch(ctx_params, num_context_requests)
-            raw_ctx_params = [param for param in ctx_params if _has_raw_multimodal_data(param)]
-            if raw_ctx_params:
-                # TODO(claude): revert these disagg related changes from current feature branch.
-                if _is_disagg() and not _is_disagg_context_role():
-                    raise ValueError(
-                        "Raw multimodal inputs require a local multimodal encoder on the "
-                        "disaggregated context worker. Set TRTLLM_DISAGG_ROLE=context for "
-                        "context workers, or provide multimodal_embedding handles."
-                    )
-                if (
-                    any(
-                        any(
-                            modality in ("image", "video")
-                            for modality in _get_modality_types(param.multimodal_data)
-                        )
-                        for param in raw_ctx_params
-                    )
-                    and self.vision_encoder is None
-                ):
-                    raise ValueError(
-                        "Raw image/video inputs require a local NanoV2VL vision encoder."
-                    )
-                if (
-                    any(
-                        "audio" in _get_modality_types(param.multimodal_data)
-                        for param in raw_ctx_params
-                    )
-                    and self.sound_encoder is None
-                ):
-                    raise ValueError("Raw audio inputs require a local NanoV2VL sound encoder.")
+            if not _is_disagg():
                 mm_embedding = get_multimodal_embeddings(
                     encoder_forward_fn=self._encode_multimodal,
                     multimodal_params=ctx_params,
+                )
+            else:
+                raise NotImplementedError(
+                    "Nano-V2-VLM does not support disaggregated inference yet. Please unset "
+                    "the TLLM_MULTIMODAL_DISAGGREGATED environment variable, or set it to '0'."
                 )
             # Adjust input_ids in videos if EVS is applied.
             if self.video_pruning_rate > 0:
