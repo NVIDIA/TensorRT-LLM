@@ -323,26 +323,31 @@ def _normalize_mm_items(mm_data: Dict[str, Any]) -> Dict[str, List[Any]]:
     }
 
 
-class MMItemOrder(list):  # list[tuple[str, int]]
-    """Logical prompt-order of multimodal items as (modality, item_index) pairs.
+class MultimodalPromptOrder(list):  # list[tuple[str, int]]
+    """Prompt-order sequence of multimodal items as (modality, item_index) pairs.
 
     A request can carry multiple modalities and multiple items per modality,
     but the executor needs them in a single prompt-order stream. This type
-    carries that ordering and the projections needed to flatten by-key
-    collections (token lengths, UUIDs, encoder outputs) into prompt order.
+    carries that ordering and the projections (flatten / flatten_uuids /
+    split_embeddings) that reorder per-modality collections (token lengths,
+    UUIDs, encoder outputs) into prompt order.
+
+    Named for its discriminator 'prompt': this subsystem has three distinct
+    orders (prompt, modality-grouped encode, per-request cache), and this is
+    the prompt one.
     """
 
     # ---- Constructors ----
 
     @classmethod
-    def default(cls, mm_items: Dict[str, List[Any]]) -> "MMItemOrder":
+    def default(cls, mm_items: Dict[str, List[Any]]) -> "MultimodalPromptOrder":
         """Return deterministic modality-major order when no explicit order exists."""
         return cls((modality, idx) for modality, items in mm_items.items()
                    for idx in range(len(items)))
 
     @classmethod
     def from_raw_entries(cls, entries: Iterable[Any], *,
-                         source: str) -> "MMItemOrder":
+                         source: str) -> "MultimodalPromptOrder":
         """Normalize order metadata to `(modality, item_index)` pairs.
 
         Accepted metadata shapes are strings, `(modality, index)` pairs, dicts,
@@ -387,9 +392,8 @@ class MMItemOrder(list):  # list[tuple[str, int]]
 
     @classmethod
     def from_metadata(
-            cls,
-            multimodal_data: Optional[Dict[str,
-                                           Any]]) -> Optional["MMItemOrder"]:
+        cls, multimodal_data: Optional[Dict[str, Any]]
+    ) -> Optional["MultimodalPromptOrder"]:
         """Extract explicit multimodal item order from processed metadata.
 
         Returns `None` when no ordering key is present, so callers can
@@ -419,7 +423,7 @@ class MMItemOrder(list):  # list[tuple[str, int]]
         *,
         prompt_token_ids: Optional[List[int]] = None,
         multimodal_data: Optional[Dict[str, Any]] = None,
-    ) -> "MMItemOrder":
+    ) -> "MultimodalPromptOrder":
         """Resolve the prompt order for every multimodal item in a request.
 
         Explicit metadata wins, model-specific prompt parsing is the fallback

@@ -15,8 +15,8 @@ from PIL import Image
 
 from tensorrt_llm._torch.models.checkpoints import NemotronHHfWeightMapper
 from tensorrt_llm.inputs.multimodal import (
-    MMItemOrder,
     MultimodalParams,
+    MultimodalPromptOrder,
     _as_cpu_tensor,
     _compute_mm_masks,
     _find_mm_embedding_lengths_from_masks,
@@ -479,7 +479,7 @@ def _nano_resolve_payload_token_counts(
         return counts
 
     # Multi-modality param: per-slot counts in prompt order.
-    item_order = MMItemOrder.from_metadata(multimodal_data)
+    item_order = MultimodalPromptOrder.from_metadata(multimodal_data)
     embedding_lengths = multimodal_data.get("multimodal_embedding_lengths")
     if item_order is not None and embedding_lengths is not None:
         if len(item_order) != len(embedding_lengths):
@@ -503,7 +503,7 @@ def _nano_extract_items(
     Pure single-modality params yield exactly one item with
     ``item_idx_in_param == 0``. Mixed-modality params yield one item per
     modality slot in prompt order, with ``item_idx_in_param`` set to the
-    item's MMItemOrder rank.
+    item's MultimodalPromptOrder rank.
 
     Video payloads that carry an embedded audio track yield TWO items:
     the real video item (non-ghost; ``token_count`` is post-interleave —
@@ -541,11 +541,11 @@ def _nano_extract_items(
     if not modality_types:
         return
 
-    item_order = MMItemOrder.from_metadata(multimodal_data)
+    item_order = MultimodalPromptOrder.from_metadata(multimodal_data)
     if item_order is None:
         # Pure single-modality (no explicit prompt order metadata): each
-        # present modality is the sole item at MMItemOrder rank 0.
-        item_order = MMItemOrder((modality, 0) for modality in modality_types)
+        # present modality is the sole item at MultimodalPromptOrder rank 0.
+        item_order = MultimodalPromptOrder((modality, 0) for modality in modality_types)
     order_pos = {pair: pos for pos, pair in enumerate(item_order)}
 
     # Resolve token counts from production fields once for the whole
@@ -617,7 +617,7 @@ def _nano_extract_items(
         )
         # Emit a ghost audio item for video payloads that carry an
         # embedded audio track. The audio rows live in the audio
-        # encoder bucket but have no MMItemOrder slot of their own;
+        # encoder bucket but have no MultimodalPromptOrder slot of their own;
         # the model-specific post-process step (video-audio interleave)
         # consumes them.
         if modality == "video":
@@ -1645,7 +1645,7 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
 
     def get_mm_item_order(
         self, prompt_token_ids: List[int], mm_data: Dict[str, Any]
-    ) -> MMItemOrder:
+    ) -> MultimodalPromptOrder:
         """Return `(modality, item_index)` entries in prompt placeholder order."""
         token_order = self._get_mm_item_order_from_token_ids(prompt_token_ids, mm_data)
         if token_order is not None:
@@ -1669,7 +1669,7 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
 
     def _get_mm_item_order_from_text(
         self, text_prompt: str, mm_data: Dict[str, Any]
-    ) -> MMItemOrder:
+    ) -> MultimodalPromptOrder:
         """Infer Nano item order by scanning decoded placeholder text."""
         expected_counts = {
             modality: self._count_mm_items(mm_data, modality) for modality in _NANO_MODALITIES
@@ -1680,7 +1680,7 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
             "audio": self._sound_context_token,
         }
         actual_counts = {modality: 0 for modality in _NANO_MODALITIES}
-        item_order: MMItemOrder = MMItemOrder()
+        item_order: MultimodalPromptOrder = MultimodalPromptOrder()
         cursor = 0
         while cursor < len(text_prompt):
             next_match: Optional[Tuple[int, str]] = None
@@ -1707,13 +1707,13 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
 
     def _get_mm_item_order_from_token_ids(
         self, prompt_token_ids: List[int], mm_data: Dict[str, Any]
-    ) -> Optional[MMItemOrder]:
+    ) -> Optional[MultimodalPromptOrder]:
         """Infer Nano item order directly from placeholder token IDs when possible."""
         expected_counts = {
             modality: self._count_mm_items(mm_data, modality) for modality in _NANO_MODALITIES
         }
         actual_counts = {modality: 0 for modality in _NANO_MODALITIES}
-        item_order: MMItemOrder = MMItemOrder()
+        item_order: MultimodalPromptOrder = MultimodalPromptOrder()
         video_pattern = self._video_placeholder_token_ids
         video_pattern_len = len(video_pattern)
 
@@ -2754,7 +2754,7 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
 
     def _get_num_tokens_for_item_order(
         self,
-        item_order: MMItemOrder,
+        item_order: MultimodalPromptOrder,
         mm_data: Dict[str, Any],
     ) -> List[int]:
         """Compute per-item multimodal token lengths in prompt order."""
@@ -3814,7 +3814,7 @@ class NemotronH_Nano_VL_V2(transformers.PreTrainedModel):
             "modality_type": item.modality,
             item.modality: item.payload,
         }
-        # Preserve item-order metadata so MMItemOrder consumers don't break
+        # Preserve item-order metadata so MultimodalPromptOrder consumers don't break
         src_data = source_param.multimodal_data or {}
         for k in ("multimodal_item_order", "multimodal_embedding_lengths"):
             if k in src_data:
@@ -3830,7 +3830,7 @@ class NemotronH_Nano_VL_V2(transformers.PreTrainedModel):
 
         Returns a single-element `List[torch.Tensor]` whose tensor holds
         all per-request embeddings concatenated in input-param order, with
-        each param's slice in MMItemOrder order. Conforms to the contract
+        each param's slice in MultimodalPromptOrder order. Conforms to the contract
         expected by `get_multimodal_embeddings`, which enables
         chunked-prefill caching.
 

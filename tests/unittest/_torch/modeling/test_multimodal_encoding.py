@@ -134,7 +134,7 @@ class TestEncodingPlanDstIndices:
     def test_mixed_image_audio(self):
         # param 0: <image><audio><image>  -> img_A(5)@pos0, aud_A(4)@pos1, img_B(5)@pos2
         # param 1: <image>                -> img_C(5)@pos0
-        # Final: [param 0 in MMItemOrder | param 1] = img_A | aud_A | img_B | img_C
+        # Final: [param 0 in MultimodalPromptOrder | param 1] = img_A | aud_A | img_B | img_C
         items_by_param = {
             0: [
                 ModalityItem(0, 0, "image", 5, {"id": "img_A"}),
@@ -299,7 +299,7 @@ class TestEncodeWithPlan:
         assert call_log_image == [2]  # ONE call, two items
         assert final.shape == (10, H)
         # Bucket rows 0..4 == item_0 (param 0), 5..9 == item_1 (param 1)
-        # Final: param 0 (rows 0..4) | param 1 (rows 5..9), each is item's MMItemOrder slot 0
+        # Final: param 0 (rows 0..4) | param 1 (rows 5..9), each is item's MultimodalPromptOrder slot 0
         assert final[0, 0].item() == 0
         assert final[4, 0].item() == 4
         assert final[5, 0].item() == 5

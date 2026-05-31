@@ -19,13 +19,17 @@ from ..logger import logger
 from ..sampling_params import SamplingParams
 from .content_format import ContentFormat
 from .data import TextPrompt
-from .multimodal import (_SUPPORTED_HASHING_MODALITIES, MMItemOrder,
-                         MultimodalInput, _as_cpu_tensor, _compute_mm_masks,
+# yapf: disable
+from .multimodal import (_SUPPORTED_HASHING_MODALITIES, MultimodalInput,
+                         MultimodalPromptOrder, _as_cpu_tensor,
+                         _compute_mm_masks,
                          _find_mm_embedding_lengths_from_masks,
                          _find_mm_token_runs_from_mask,
                          _find_mm_token_start_pos_from_masks, apply_mm_hashes,
                          default_hasher, find_mm_token_lengths,
                          hexdigest_to_int32, validate_mm_inputs)
+
+# yapf: enable
 
 N = TypeVar("N", bound=Type[nn.Module])
 
@@ -359,7 +363,7 @@ class BaseMultimodalInputProcessor(ABC):
             raise ValueError(
                 "call_with_token_ids: find_mm_token_lengths returned no token "
                 "lengths for the provided multi_modal_data.")
-        item_order = MMItemOrder.resolve(
+        item_order = MultimodalPromptOrder.resolve(
             mm_data,
             self,
             prompt_token_ids=prompt_token_ids,
@@ -1103,7 +1107,7 @@ def create_input_processor_with_hash(
         # Mixed-modality: resolve logical prompt-item order, then flatten the
         # per-modality token-length lists into one prompt-ordered list
         # (supersedes the single-modality next(iter(...)) assumption).
-        item_order = MMItemOrder.resolve(
+        item_order = MultimodalPromptOrder.resolve(
             mm_data,
             input_processor,
             prompt_token_ids=prompt_token_ids,

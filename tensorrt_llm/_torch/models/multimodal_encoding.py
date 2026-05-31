@@ -28,7 +28,7 @@ from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Tuple
 
 import torch
 
-from tensorrt_llm.inputs.multimodal import MMItemOrder, MultimodalParams  # noqa: F401
+from tensorrt_llm.inputs.multimodal import MultimodalParams, MultimodalPromptOrder  # noqa: F401
 
 
 @dataclass(frozen=True, slots=True)
@@ -39,10 +39,10 @@ class ModalityItem:
 
     Carries the join keys (``src_param_idx``, ``item_idx_in_param``) that
     let the assembly reconcile modality-grouping (encoder batching) with
-    source-param grouping (cache contract + MMItemOrder reassembly).
+    source-param grouping (cache contract + MultimodalPromptOrder reassembly).
 
     Ghost items (e.g. audio extracted from a video payload) use
-    ``item_idx_in_param == -1`` to indicate they have no MMItemOrder slot;
+    ``item_idx_in_param == -1`` to indicate they have no MultimodalPromptOrder slot;
     their encoded rows are consumed by a model-specific post-process step
     rather than scattered into the final output.
 
@@ -142,7 +142,7 @@ class MixedModalityAssembly:
             for m, counts in bucket_token_counts.items()
         }
 
-        # Compute within-param offsets by MMItemOrder rank for non-ghost items
+        # Compute within-param offsets by MultimodalPromptOrder rank for non-ghost items
         within_param_offsets: Dict[int, int] = {}
         for flat_idxs in per_param_non_ghost:
             sorted_idxs = sorted(flat_idxs, key=lambda fi: items[fi].item_idx_in_param)
@@ -236,7 +236,7 @@ def assemble_embeddings(
 
     Returns a tensor of shape `(assembly.total_tokens, hidden_dim)` in
     canonical layout (per-param slices in source-param order; each slice
-    in MMItemOrder order). Caller wraps in `[final]` to satisfy the
+    in MultimodalPromptOrder order). Caller wraps in `[final]` to satisfy the
     `get_multimodal_embeddings` single-tensor cache contract.
 
     Hot path: at most `len(assembly.active_modalities)` encoder launches +

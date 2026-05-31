@@ -123,7 +123,7 @@ def _qwen_image_video_param(include_order=True, include_lengths=True):
 
     The assembly extractor (`_qwen3vl_extract_items`) emits one item per modality and
     orders them by `multimodal_item_order` (tuple form `(modality, index)`, which
-    is what `MMItemOrder` normalizes to). Per-item token counts come from the
+    is what `MultimodalPromptOrder` normalizes to). Per-item token counts come from the
     explicit `num_tokens` payload key (test convention; mirrors the Task 13
     extractor tests) so the assembled output is deterministic.
     """
@@ -157,7 +157,7 @@ def test_qwen3vl_mixed_image_video_encoder_returns_single_tensor_in_prompt_order
     embeddings = model.forward([_qwen_image_video_param()])
 
     # `forward` returns a single assembled tensor (the cache contract) whose rows
-    # are laid out in MMItemOrder order: the video item (3 rows) precedes the
+    # are laid out in MultimodalPromptOrder order: the video item (3 rows) precedes the
     # image item (4 rows), even though the extractor walks modalities image-first.
     assert len(embeddings) == 1
     expected = torch.tensor(

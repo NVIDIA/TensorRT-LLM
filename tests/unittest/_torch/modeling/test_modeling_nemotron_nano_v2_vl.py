@@ -1003,7 +1003,7 @@ class TestEncodeMultimodalContract:
 
         Each modality in a mixed param yields a single bucket item; the
         post-Task-11 plan's scatter assembles rows into the per-param slice
-        in MMItemOrder rank order. (Multi-item-same-modality within one
+        in MultimodalPromptOrder rank order. (Multi-item-same-modality within one
         param coalesces into one bucket entry; that interleaving variant is
         covered by the production-path integration tests.)
         """
@@ -1019,7 +1019,7 @@ class TestEncodeMultimodalContract:
         model._encode_audio = mock.MagicMock(return_value=[(audio_emb, [4])])
 
         # Prompt order: audio first, then video, then image. The new plan's
-        # scatter must follow this MMItemOrder when laying out the final
+        # scatter must follow this MultimodalPromptOrder when laying out the final
         # tensor, even though the encoder buckets are visited in a different
         # internal order.
         param = mock.MagicMock()
@@ -1040,7 +1040,7 @@ class TestEncodeMultimodalContract:
 
         result = model._encode_multimodal([param])
         assert len(result) == 1
-        # Expected: [audio, video, image] following MMItemOrder rank.
+        # Expected: [audio, video, image] following MultimodalPromptOrder rank.
         expected = torch.cat([audio_emb, video_emb, image_emb], dim=0)
         assert torch.equal(result[0], expected)
 

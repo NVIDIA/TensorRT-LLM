@@ -34,7 +34,7 @@ from ...inputs import (
     register_input_processor,
     support_multimodal_disaggregated,
 )
-from ...inputs.multimodal import MMItemOrder, MultimodalParams
+from ...inputs.multimodal import MultimodalParams, MultimodalPromptOrder
 from ...logger import logger
 from ...sampling_params import SamplingParams
 from ..attention_backend import AttentionMetadata
@@ -88,16 +88,16 @@ def _qwen3vl_extract_items(param_idx: int, param):
         return
 
     embedding_lengths = multimodal_data.get("multimodal_embedding_lengths")
-    # Normalize order metadata via MMItemOrder so dict-form entries
+    # Normalize order metadata via MultimodalPromptOrder so dict-form entries
     # (`{"modality": ..., "index": ...}`, as the runtime registry emits) and
     # tuple-form entries both resolve to `(modality, index)` keys. A raw
     # `tuple(pair)` over dict entries would yield the dict keys and silently
     # collapse every item to default slot 0.
-    item_order = MMItemOrder.from_metadata(multimodal_data)
+    item_order = MultimodalPromptOrder.from_metadata(multimodal_data)
     if item_order is None:
         # Pure single-modality (no explicit prompt order metadata): each
-        # present modality is the sole item at MMItemOrder rank 0.
-        item_order = MMItemOrder((m, 0) for m in modality_types)
+        # present modality is the sole item at MultimodalPromptOrder rank 0.
+        item_order = MultimodalPromptOrder((m, 0) for m in modality_types)
     order_pos = {pair: pos for pos, pair in enumerate(item_order)}
 
     for modality in modality_types:
@@ -200,14 +200,14 @@ class Qwen3VLInputProcessorBase(BaseMultimodalInputProcessor, BaseMultimodalDumm
         self,
         text_prompt: str,
         mm_data: Dict[str, Any],
-    ) -> MMItemOrder:
+    ) -> MultimodalPromptOrder:
         """Infer Qwen image/video item order from placeholder order in text."""
         expected_counts = {
             modality: len(self._normalize_mm_data_items(mm_data, modality))
             for modality in _QWEN_MODALITIES
         }
         actual_counts = {modality: 0 for modality in _QWEN_MODALITIES}
-        item_order: MMItemOrder = MMItemOrder()
+        item_order: MultimodalPromptOrder = MultimodalPromptOrder()
         cursor = 0
 
         while cursor < len(text_prompt):

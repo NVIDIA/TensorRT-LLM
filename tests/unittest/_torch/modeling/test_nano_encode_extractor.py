@@ -10,7 +10,7 @@ matches what ``multimodal_embedding_lengths`` would carry for mixed
 requests, but is also valid for the pure-modality single-item path).
 
 For a video payload that carries an embedded audio track, the extractor
-yields the video item first (non-ghost, ``item_idx_in_param`` = MMItemOrder
+yields the video item first (non-ghost, ``item_idx_in_param`` = MultimodalPromptOrder
 position, ``token_count`` = video tokens + interleaved audio tokens) and a
 ghost audio item second (``item_idx_in_param == -1``,
 ``token_count`` = raw audio rows the audio encoder returns).
@@ -56,7 +56,7 @@ class TestNanoExtractItems:
     ``multimodal_item_order`` + ``multimodal_embedding_lengths`` in
     prompt order; the extractor prefers those when present so that
     ``item_idx_in_param`` and ``token_count`` match the canonical
-    prompt-order projection used by ``MMItemOrder.split_embeddings``.
+    prompt-order projection used by ``MultimodalPromptOrder.split_embeddings``.
     """
 
     def test_pure_image(self):
@@ -245,7 +245,7 @@ class TestNanoExtractorProductionSchema:
         items = list(_nano_extract_items(0, param))
         by_modality = {it.modality: it.token_count for it in items}
         assert by_modality == {"image": 5, "audio": 4}
-        # item_idx_in_param tracks MMItemOrder positions.
+        # item_idx_in_param tracks MultimodalPromptOrder positions.
         positions = {it.modality: it.item_idx_in_param for it in items}
         assert positions == {"image": 0, "audio": 1}
 
