@@ -437,7 +437,9 @@ class MultimodalPromptOrder(list):  # list[tuple[str, int]]
 
     def validate(self, mm_items: Dict[str, List[Any]]) -> None:
         """Verify that this order references every multimodal item exactly once."""
-        seen = {modality: 0 for modality in mm_items}
+        # Track the distinct indices seen per modality (a set, not a count) so a
+        # repeated reference cannot masquerade as full coverage.
+        seen: Dict[str, set] = {modality: set() for modality in mm_items}
         for modality, idx in self:
             if modality not in mm_items:
                 raise ValueError(
@@ -447,11 +449,18 @@ class MultimodalPromptOrder(list):  # list[tuple[str, int]]
                 raise ValueError(
                     f"Multimodal item order references {modality}[{idx}], "
                     f"but that modality has {len(mm_items[modality])} item(s)")
-            seen[modality] += 1
-        for modality, items in mm_items.items():
-            if seen[modality] != len(items):
+            if idx in seen[modality]:
                 raise ValueError(
-                    f"Multimodal item order covers {seen[modality]} "
+                    f"Multimodal item order references {modality}[{idx}] more "
+                    f"than once; each item must be referenced exactly once")
+            seen[modality].add(idx)
+        # With the range check above and per-modality uniqueness, matching the
+        # distinct-index count to len(items) guarantees exactly-once coverage by
+        # pigeonhole.
+        for modality, items in mm_items.items():
+            if len(seen[modality]) != len(items):
+                raise ValueError(
+                    f"Multimodal item order covers {len(seen[modality])} "
                     f"{modality} item(s), expected {len(items)}")
 
     # ---- Projections ----

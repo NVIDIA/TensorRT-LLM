@@ -198,6 +198,15 @@ class TestMultimodalPromptOrder:
         with pytest.raises(ValueError, match="expected 2"):
             MultimodalPromptOrder([("image", 0)]).validate({"image": [a, b]})
 
+    def test_validate_rejects_duplicate_index(self):
+        a, b = object(), object()
+        # order references image[0] twice and never references image[1];
+        # the per-modality count (2) matches len(items) (2), so a count-only
+        # check would wrongly pass. validate must reject the duplicate reference
+        # (and thereby the uncovered image[1]).
+        with pytest.raises(ValueError, match=r"references image\[0\] more than once"):
+            MultimodalPromptOrder([("image", 0), ("image", 0)]).validate({"image": [a, b]})
+
     # ---- Projections ----
 
     def test_flatten_reorders_by_key(self):
