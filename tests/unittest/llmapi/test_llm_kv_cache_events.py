@@ -446,6 +446,34 @@ def test_apply_mm_hashes_video_metadata_distinguished():
     assert h_a["video"][0] != h_total["video"][0]
 
 
+def test_apply_mm_hashes_video_metadata_numpy_scalars():
+    """Nvbug 6226933: numpy-typed video metadata hashes without crashing.
+
+    It matches the equivalent Python-typed metadata (numpy 2.x scalars such as
+    np.int64/np.float32/np.bool_ are not subclasses of Python int/float/bool).
+    """
+    frames = [Image.new("RGB", (2, 2), (10, 20, 30))]
+    meta_py = {
+        "fps": 30.0,
+        "duration": 2.0,
+        "frames_indices": [0, 5],
+        "total_num_frames": 100,
+    }
+    meta_np = {
+        "fps": np.float32(30.0),
+        "duration": np.float64(2.0),
+        "frames_indices": [np.int64(0), np.int64(5)],
+        "total_num_frames": np.int64(100),
+    }
+
+    h_py, _ = apply_mm_hashes(
+        {"video": [_make_video(frames, metadata=meta_py)]})
+    h_np, _ = apply_mm_hashes(
+        {"video": [_make_video(frames, metadata=meta_np)]})
+
+    assert h_np["video"][0] == h_py["video"][0]
+
+
 def test_apply_mm_hashes_videodata_vs_framelist_distinguished():
     """Nvbug 6226933: VideoData(frames) and a bare frame list must differ."""
     frames = [

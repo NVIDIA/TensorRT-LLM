@@ -117,6 +117,13 @@ def serialize_item(obj: object) -> bytes:
             parts.append(serialize_item(obj[key]))
         return b"".join(parts)
 
+    if isinstance(obj, np.generic):
+        # numpy scalar (e.g. np.int64 / np.float32 / np.bool_): normalize to the
+        # equivalent Python scalar and recurse, so numpy-typed values hash
+        # identically to their Python counterparts. In numpy 2.x these are not
+        # subclasses of Python int/float/bool, so they bypass the checks above.
+        return serialize_item(obj.item())
+
     raise ValueError(f"Unsupported object type: {type(obj)}")
 
 
