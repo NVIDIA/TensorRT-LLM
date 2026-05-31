@@ -65,8 +65,8 @@ if not TYPE_CHECKING and find_spec("kv_cache_manager_v2") is not None:
     from kv_cache_manager_v2._copy_engine import CopyTask, batched_copy
     from kv_cache_manager_v2._exceptions import OutOfPagesError
     from kv_cache_manager_v2._life_cycle_registry import LifeCycleRegistry, SsmLifeCycle
-    from kv_cache_manager_v2._storage._core import CacheLevelStorage
     from kv_cache_manager_v2._storage._config import create_storage_config
+    from kv_cache_manager_v2._storage._core import CacheLevelStorage
     from kv_cache_manager_v2._storage_manager import StorageManager
     from kv_cache_manager_v2._utils import (
         CachedCudaStream,
@@ -123,8 +123,8 @@ else:
         LifeCycleRegistry,
         SsmLifeCycle,
     )
-    from tensorrt_llm.runtime.kv_cache_manager_v2._storage._core import CacheLevelStorage
     from tensorrt_llm.runtime.kv_cache_manager_v2._storage._config import create_storage_config
+    from tensorrt_llm.runtime.kv_cache_manager_v2._storage._core import CacheLevelStorage
     from tensorrt_llm.runtime.kv_cache_manager_v2._storage_manager import StorageManager
     from tensorrt_llm.runtime.kv_cache_manager_v2._utils import (
         CachedCudaStream,
