@@ -26,14 +26,55 @@ class _FakeMixedProcessor:
             "video": {},
             "audio": {},
         }
-        return inputs.get("prompt_token_ids", []), {"multimodal_data": multimodal_data}
+        prompt_token_ids = inputs.get("prompt_token_ids", [])
+        mm_data = inputs.get("multi_modal_data")
+        # Model the post-merge `call_with_token_ids` contract: when called with
+        # tokenized input + multimodal data, the processor itself expands the
+        # placeholder tokens via `expand_prompt_token_ids_for_mm` (the merge
+        # relocated this out of the hashing wrapper closure and into the
+        # processor `__call__` path). The hashing wrapper then consumes the
+        # already-expanded ids. A real processor resolves per-item token counts
+        # in prompt order; mirror that here so the test exercises the real flow.
+        if prompt_token_ids and mm_data:
+            lengths_by_key = find_mm_token_lengths(mm_data, self)
+            item_order = MultimodalPromptOrder.resolve(
+                mm_data, self, prompt_token_ids=prompt_token_ids
+            )
+            num_mm_tokens = item_order.flatten(lengths_by_key)
+            prompt_token_ids, _ = self.expand_prompt_token_ids_for_mm(
+                prompt_token_ids,
+                num_mm_tokens,
+                hf_processor_mm_kwargs=inputs.get("mm_processor_kwargs"),
+                mm_data=mm_data,
+            )
+        return prompt_token_ids, {"multimodal_data": multimodal_data}
 
     def get_text_with_mm_placeholders(self, mm_counts):
         return "".join(f"<{modality}>" * count for modality, count in mm_counts.items())
 
+    # Modality membership for both placeholder (pre-expansion) and feature
+    # (post-expansion) token ids, so order parsing is expansion-tolerant.
+    _MODALITY_TOKEN_IDS = {
+        "image": {100, 101},
+        "video": {200, 201},
+        "audio": {300, 301},
+    }
+
     def get_mm_item_order(self, prompt_token_ids, mm_data):
-        assert prompt_token_ids == [10, 100, 11, 200, 12, 300, 13]
-        return [("image", 0), ("video", 0), ("audio", 0)]
+        # Derive prompt-item order from the first occurrence of each modality's
+        # tokens. A real processor parses placeholder/vision-pad tokens that
+        # survive `expand_prompt_token_ids_for_mm`, so this hook must work on
+        # BOTH the original prompt (the processor's own call_with_token_ids
+        # path) AND the expanded prompt (the hashing wrapper, which passes the
+        # processor's already-expanded output). Asserting one exact id list
+        # broke once the merge relocated expansion into the processor.
+        first_pos = {}
+        for pos, tok in enumerate(prompt_token_ids):
+            for modality, ids in self._MODALITY_TOKEN_IDS.items():
+                if tok in ids and modality not in first_pos:
+                    first_pos[modality] = pos
+        ordered = sorted(first_pos, key=first_pos.get)
+        return [(modality, 0) for modality in ordered]
 
     def expand_prompt_token_ids_for_mm(
         self,
