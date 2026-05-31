@@ -3,7 +3,7 @@
 """Tests for the Nano-side multimodal item extractor.
 
 The extractor walks one ``MultimodalParams`` and yields
-:class:`MultimodalItem` instances, one per modality item the encoder will
+:class:`ModalityItem` instances, one per modality item the encoder will
 process. Per-item ``token_count`` is sourced from the per-payload
 ``num_tokens`` field that the Nano preprocessing pipeline populates (this
 matches what ``multimodal_embedding_lengths`` would carry for mixed
@@ -27,7 +27,7 @@ from tensorrt_llm._torch.models.modeling_nemotron_nano import (
     NemotronH_Nano_VL_V2,
     _nano_extract_items,
 )
-from tensorrt_llm._torch.models.multimodal_encoding import EncodingPlan, MultimodalItem
+from tensorrt_llm._torch.models.multimodal_encoding import MixedModalityAssembly, ModalityItem
 from tensorrt_llm.inputs.multimodal import MultimodalParams, MultimodalRuntimeData
 
 
@@ -278,7 +278,7 @@ class TestNanoExtractorProductionSchema:
         # concatenates BOTH images = 682 + 357 = 1039 rows
         # (== total_embeds_in_request). The extractor must therefore size the
         # image item by the per-param total (1039), NOT the first slot's
-        # per-slot length (682) — otherwise the encode-plan bucket assertion
+        # per-slot length (682) — otherwise the encode-assembly bucket assertion
         # `encoder_rows == encoder output` fires (1039 != 682).
         payload = {"pixel_values": "fake"}  # multi-image payload (no num_tokens)
         param = _make_param_with_runtime(
@@ -415,7 +415,7 @@ class TestNanoExtractorProductionSchema:
 class TestNanoVisionBucketAdapter:
     """Tests for the vision-bucket encoder adapter on ``NemotronH_Nano_VL_V2``.
 
-    Bridges ``List[MultimodalItem]`` (image OR video bucket) to the existing
+    Bridges ``List[ModalityItem]`` (image OR video bucket) to the existing
     ``self.vision_encoder(params)`` interface by building per-item
     ``MultimodalParams`` views, cats per-item outputs into one bucket tensor
     (rows in bucket order), and stashes per-item ``num_tokens_in_video`` for
@@ -431,7 +431,7 @@ class TestNanoVisionBucketAdapter:
         return model
 
     def test_single_pure_image_param(self):
-        item = MultimodalItem(0, 0, "image", 5, {"num_tokens": 5})
+        item = ModalityItem(0, 0, "image", 5, {"num_tokens": 5})
         params = [_make_param({"image": item.payload, "modality_type": "image"})]
         emb = torch.randn(5, 4)
         model = self._make_model_stub(([emb], None))
@@ -441,7 +441,7 @@ class TestNanoVisionBucketAdapter:
         torch.testing.assert_close(out, emb)
 
     def test_evs_num_tokens_stashed_on_video_params(self):
-        item = MultimodalItem(0, 0, "video", 9, {"num_tokens": 9})
+        item = ModalityItem(0, 0, "video", 9, {"num_tokens": 9})
         params = [_make_param({"video": item.payload, "modality_type": "video"})]
         emb = torch.randn(9, 4)
         model = self._make_model_stub(([emb], [[3, 3, 3]]))
@@ -454,7 +454,7 @@ class TestNanoVisionBucketAdapter:
     def test_mixed_param_synthesizes_single_modality_view(self):
         # Image item from a mixed image+audio param: adapter should
         # synthesize a single-modality view so vision_encoder sees image-only
-        item = MultimodalItem(0, 0, "image", 5, {"num_tokens": 5})
+        item = ModalityItem(0, 0, "image", 5, {"num_tokens": 5})
         params = [
             _make_param(
                 {
@@ -476,8 +476,8 @@ class TestNanoVisionBucketAdapter:
     def test_multi_item_bucket_concatenates_in_order(self):
         # Two image items from two pure-image params
         items = [
-            MultimodalItem(0, 0, "image", 5, {"num_tokens": 5}),
-            MultimodalItem(1, 0, "image", 3, {"num_tokens": 3}),
+            ModalityItem(0, 0, "image", 5, {"num_tokens": 5}),
+            ModalityItem(1, 0, "image", 3, {"num_tokens": 3}),
         ]
         params = [
             _make_param({"image": items[0].payload, "modality_type": "image"}),
@@ -504,8 +504,8 @@ class TestNanoAudioBucketAdapter:
         emb1 = torch.randn(3, 4)
         model = self._make_model_stub([(emb0, [4]), (emb1, [3])])
         items = [
-            MultimodalItem(0, 0, "audio", 4, {"id": "a0"}),
-            MultimodalItem(1, 0, "audio", 3, {"id": "a1"}),
+            ModalityItem(0, 0, "audio", 4, {"id": "a0"}),
+            ModalityItem(1, 0, "audio", 3, {"id": "a1"}),
         ]
         out = model._adapter_audio_bucket(items, [object(), object()])
         assert out.shape == (7, 4)
@@ -515,15 +515,15 @@ class TestNanoAudioBucketAdapter:
     def test_scalar_tensor_return_normalization(self):
         emb = torch.randn(4, 4)
         model = self._make_model_stub(emb)
-        items = [MultimodalItem(0, 0, "audio", 4, {"id": "a0"})]
+        items = [ModalityItem(0, 0, "audio", 4, {"id": "a0"})]
         out = model._adapter_audio_bucket(items, [object()])
         torch.testing.assert_close(out, emb)
 
     def test_unexpected_shape_raises_typeerror(self):
         model = self._make_model_stub("garbage")
         items = [
-            MultimodalItem(0, 0, "audio", 4, {"id": "a0"}),
-            MultimodalItem(1, 0, "audio", 3, {"id": "a1"}),
+            ModalityItem(0, 0, "audio", 4, {"id": "a0"}),
+            ModalityItem(1, 0, "audio", 3, {"id": "a1"}),
         ]
         with pytest.raises(TypeError, match="must return a list"):
             model._adapter_audio_bucket(items, [object(), object()])
@@ -539,10 +539,8 @@ class TestNanoAudioBucketAdapter:
         emb1 = torch.randn(5, 4)  # 5 rows = clips [5]
         model = self._make_model_stub([(emb0, [4, 3]), (emb1, [5])])
         items = [
-            MultimodalItem(0, 0, "audio", 5, {"id": "standalone"}),
-            MultimodalItem(
-                1, -1, "audio", 7, {"id": "ghost"}, metadata={"paired_video_item_idx": 0}
-            ),
+            ModalityItem(0, 0, "audio", 5, {"id": "standalone"}),
+            ModalityItem(1, -1, "audio", 7, {"id": "ghost"}, metadata={"paired_video_item_idx": 0}),
         ]
         out = model._adapter_audio_bucket(items, [object(), object()])
         assert out.shape == (12, 4)
@@ -606,15 +604,15 @@ class TestNanoPostEncode:
 
     def test_no_video_bucket_noop(self):
         # If no video modality, post_encode is a no-op
-        items_by_param = {0: [MultimodalItem(0, 0, "image", 5, {"num_tokens": 5})]}
+        items_by_param = {0: [ModalityItem(0, 0, "image", 5, {"num_tokens": 5})]}
         params = [_make_param({"image": {"num_tokens": 5}, "modality_type": "image"})]
-        plan = EncodingPlan.from_params(
+        assembly = MixedModalityAssembly.from_params(
             multimodal_params=params,
             extract=_identity_extractor(items_by_param),
         )
         bucket_outputs = {"image": torch.ones((5, 4))}
         model = self._make_model_stub(lambda *a, **kw: None)
-        model._nano_post_encode(bucket_outputs, plan, params)
+        model._nano_post_encode(bucket_outputs, assembly, params)
         assert bucket_outputs["image"].shape == (5, 4)
 
     def test_video_with_audio_interleaved(self):
@@ -626,8 +624,8 @@ class TestNanoPostEncode:
         # ghost audio: 4 rows.
         audio_payload = {"num_tokens": 4, "has_audio": [True], "audio_num_clips": torch.tensor([1])}
         video_payload = {"num_tokens": 5, "audio": audio_payload, "video_size": []}
-        video_item = MultimodalItem(0, 0, "video", 9, video_payload, encoder_token_count=5)
-        audio_item = MultimodalItem(
+        video_item = ModalityItem(0, 0, "video", 9, video_payload, encoder_token_count=5)
+        audio_item = ModalityItem(
             0,
             -1,
             "audio",
@@ -637,7 +635,7 @@ class TestNanoPostEncode:
         )
         items_by_param = {0: [video_item, audio_item]}
         params = [_make_param({"video": video_payload, "modality_type": "video"})]
-        plan = EncodingPlan.from_params(
+        assembly = MixedModalityAssembly.from_params(
             multimodal_params=params,
             extract=_identity_extractor(items_by_param),
         )
@@ -660,7 +658,7 @@ class TestNanoPostEncode:
         model._nano_audio_clip_counts = {(0, -1): [4]}
 
         bucket_outputs = {"video": video_bucket, "audio": audio_bucket}
-        model._nano_post_encode(bucket_outputs, plan, params)
+        model._nano_post_encode(bucket_outputs, assembly, params)
 
         # Video sliced by encoder_rows (5), audio ghost slice (4), per-clip from
         # the threaded encoder counts (NOT a num_tokens re-derivation).
@@ -675,16 +673,16 @@ class TestNanoPostEncode:
     def test_standalone_audio_preserved(self):
         # One param with a standalone audio item (no video, no pairing)
         items_by_param = {
-            0: [MultimodalItem(0, 0, "audio", 4, {"num_tokens": 4})],
+            0: [ModalityItem(0, 0, "audio", 4, {"num_tokens": 4})],
         }
         params = [_make_param({"audio": {"num_tokens": 4}, "modality_type": "audio"})]
-        plan = EncodingPlan.from_params(
+        assembly = MixedModalityAssembly.from_params(
             multimodal_params=params,
             extract=_identity_extractor(items_by_param),
         )
         bucket_outputs = {"audio": torch.ones((4, 4))}
         model = self._make_model_stub(lambda *a, **kw: None)
-        model._nano_post_encode(bucket_outputs, plan, params)
+        model._nano_post_encode(bucket_outputs, assembly, params)
         assert bucket_outputs["audio"].shape == (4, 4)
 
     def test_pure_video_no_audio_uses_encoder_rows_no_num_tokens(self):
@@ -695,17 +693,17 @@ class TestNanoPostEncode:
         # NOT a payload num_tokens lookup. This is the exact case the
         # image+audio+video eval hits (video carries no embedded audio).
         video_payload = {"pixel_values": "fake", "video_size": []}  # NO num_tokens
-        video_item = MultimodalItem(0, 0, "video", 6, video_payload)  # encoder_rows == 6
+        video_item = ModalityItem(0, 0, "video", 6, video_payload)  # encoder_rows == 6
         items_by_param = {0: [video_item]}
         params = [_make_param({"video": video_payload, "modality_type": "video"})]
-        plan = EncodingPlan.from_params(
+        assembly = MixedModalityAssembly.from_params(
             multimodal_params=params,
             extract=_identity_extractor(items_by_param),
         )
         bucket_outputs = {"video": torch.ones((6, 4))}
         # No interleave should be invoked (no paired ghost audio).
         model = self._make_model_stub(lambda *a, **kw: pytest.fail("no interleave expected"))
-        model._nano_post_encode(bucket_outputs, plan, params)
+        model._nano_post_encode(bucket_outputs, assembly, params)
         # Video bucket unchanged (6 rows), no num_tokens KeyError.
         assert bucket_outputs["video"].shape == (6, 4)
 
@@ -722,13 +720,13 @@ class TestNanoPostEncode:
             "audio_num_clips": torch.tensor([2]),
         }
         video_payload = {"pixel_values": "fake", "video_size": [], "audio": audio_payload}
-        video_item = MultimodalItem(0, 0, "video", 12, video_payload, encoder_token_count=8)
-        ghost = MultimodalItem(
+        video_item = ModalityItem(0, 0, "video", 12, video_payload, encoder_token_count=8)
+        ghost = ModalityItem(
             0, -1, "audio", 4, audio_payload, metadata={"paired_video_item_idx": 0}
         )
         items_by_param = {0: [video_item, ghost]}
         params = [_make_param({"video": video_payload, "modality_type": "video"})]
-        plan = EncodingPlan.from_params(
+        assembly = MixedModalityAssembly.from_params(
             multimodal_params=params,
             extract=_identity_extractor(items_by_param),
         )
@@ -751,7 +749,7 @@ class TestNanoPostEncode:
         model._nano_audio_clip_counts = {}  # sidecar empty -> mask fallback
 
         bucket_outputs = {"video": torch.ones((8, 4)), "audio": torch.ones((4, 4)) * 2.0}
-        model._nano_post_encode(bucket_outputs, plan, params)
+        model._nano_post_encode(bucket_outputs, assembly, params)
         assert captured["video_rows"] == 8  # sliced by encoder_rows
         assert captured["per_clip"] == [3, 1]  # mask-derived fallback
         assert bucket_outputs["video"].shape == (12, 4)

@@ -9,7 +9,7 @@ from unittest.mock import MagicMock
 import torch
 
 from tensorrt_llm._torch.models.modeling_qwen3vl import Qwen3VisionModelBase, _qwen3vl_extract_items
-from tensorrt_llm._torch.models.multimodal_encoding import MultimodalItem
+from tensorrt_llm._torch.models.multimodal_encoding import ModalityItem
 from tensorrt_llm.inputs.multimodal import MultimodalParams
 
 
@@ -120,7 +120,7 @@ class TestQwen3VLBucketAdapters:
 
     def test_image_adapter_stacks_pixel_values_and_grids(self):
         H = 1024
-        item0 = MultimodalItem(
+        item0 = ModalityItem(
             0,
             0,
             "image",
@@ -131,7 +131,7 @@ class TestQwen3VLBucketAdapters:
                 "num_tokens": 5,
             },
         )
-        item1 = MultimodalItem(
+        item1 = ModalityItem(
             1,
             0,
             "image",
@@ -154,7 +154,7 @@ class TestQwen3VLBucketAdapters:
 
     def test_video_adapter_stacks_pixel_values_and_grids(self):
         H = 1024
-        item = MultimodalItem(
+        item = ModalityItem(
             0,
             0,
             "video",

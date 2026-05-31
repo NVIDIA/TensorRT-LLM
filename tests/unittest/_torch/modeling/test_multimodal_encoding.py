@@ -6,12 +6,12 @@ from __future__ import annotations
 
 import pytest
 
-from tensorrt_llm._torch.models.multimodal_encoding import EncodingPlan, MultimodalItem
+from tensorrt_llm._torch.models.multimodal_encoding import MixedModalityAssembly, ModalityItem
 
 
 class TestMultimodalItem:
     def test_basic_fields(self):
-        item = MultimodalItem(
+        item = ModalityItem(
             src_param_idx=2,
             item_idx_in_param=1,
             modality="image",
@@ -25,7 +25,7 @@ class TestMultimodalItem:
         assert item.payload == {"data": "x"}
 
     def test_ghost_sentinel(self):
-        item = MultimodalItem(
+        item = ModalityItem(
             src_param_idx=0,
             item_idx_in_param=-1,
             modality="audio",
@@ -35,7 +35,7 @@ class TestMultimodalItem:
         assert item.item_idx_in_param == -1
 
     def test_is_frozen(self):
-        item = MultimodalItem(
+        item = ModalityItem(
             src_param_idx=0,
             item_idx_in_param=0,
             modality="image",
@@ -57,79 +57,79 @@ def _identity_extractor(items_by_param):
 
 class TestEncodingPlanPartition:
     def test_empty_batch(self):
-        plan = EncodingPlan.from_params(
+        assembly = MixedModalityAssembly.from_params(
             multimodal_params=[],
             extract=lambda i, p: iter([]),
         )
-        assert plan.total_tokens == 0
-        assert plan.active_modalities == []
-        assert len(plan.items) == 0
+        assert assembly.total_tokens == 0
+        assert assembly.active_modalities == []
+        assert len(assembly.items) == 0
 
     def test_single_pure_image(self):
         items_by_param = {
-            0: [MultimodalItem(0, 0, "image", 5, {"id": "img_A"})],
+            0: [ModalityItem(0, 0, "image", 5, {"id": "img_A"})],
         }
-        plan = EncodingPlan.from_params(
+        assembly = MixedModalityAssembly.from_params(
             multimodal_params=[object()],
             extract=_identity_extractor(items_by_param),
         )
-        assert plan.total_tokens == 5
-        assert plan.active_modalities == ["image"]
-        assert plan._param_lengths.tolist() == [5]
-        assert plan._param_offsets.tolist() == [0]
-        assert plan._modality_slots["image"].tolist() == [0]
-        assert plan._bucket_offsets["image"].tolist() == [0, 5]
+        assert assembly.total_tokens == 5
+        assert assembly.active_modalities == ["image"]
+        assert assembly._param_lengths.tolist() == [5]
+        assert assembly._param_offsets.tolist() == [0]
+        assert assembly._modality_slots["image"].tolist() == [0]
+        assert assembly._bucket_offsets["image"].tolist() == [0, 5]
 
     def test_mixed_image_audio(self):
         items_by_param = {
             0: [
-                MultimodalItem(0, 0, "image", 5, {"id": "img_A"}),
-                MultimodalItem(0, 1, "audio", 4, {"id": "aud_A"}),
-                MultimodalItem(0, 2, "image", 5, {"id": "img_B"}),
+                ModalityItem(0, 0, "image", 5, {"id": "img_A"}),
+                ModalityItem(0, 1, "audio", 4, {"id": "aud_A"}),
+                ModalityItem(0, 2, "image", 5, {"id": "img_B"}),
             ],
             1: [
-                MultimodalItem(1, 0, "image", 5, {"id": "img_C"}),
+                ModalityItem(1, 0, "image", 5, {"id": "img_C"}),
             ],
         }
-        plan = EncodingPlan.from_params(
+        assembly = MixedModalityAssembly.from_params(
             multimodal_params=[object(), object()],
             extract=_identity_extractor(items_by_param),
         )
-        assert plan.total_tokens == 19
-        assert set(plan.active_modalities) == {"image", "audio"}
-        assert plan._param_lengths.tolist() == [14, 5]
-        assert plan._param_offsets.tolist() == [0, 14]
-        assert plan._modality_slots["image"].tolist() == [0, 2, 3]
-        assert plan._modality_slots["audio"].tolist() == [1]
-        assert plan._bucket_offsets["image"].tolist() == [0, 5, 10, 15]
-        assert plan._bucket_offsets["audio"].tolist() == [0, 4]
+        assert assembly.total_tokens == 19
+        assert set(assembly.active_modalities) == {"image", "audio"}
+        assert assembly._param_lengths.tolist() == [14, 5]
+        assert assembly._param_offsets.tolist() == [0, 14]
+        assert assembly._modality_slots["image"].tolist() == [0, 2, 3]
+        assert assembly._modality_slots["audio"].tolist() == [1]
+        assert assembly._bucket_offsets["image"].tolist() == [0, 5, 10, 15]
+        assert assembly._bucket_offsets["audio"].tolist() == [0, 4]
 
     def test_ghost_item_excluded_from_param_length(self):
         items_by_param = {
             0: [
-                MultimodalItem(0, 0, "video", 5, {"id": "vid_A"}),
-                MultimodalItem(0, -1, "audio", 4, {"id": "vid_A.audio"}),
+                ModalityItem(0, 0, "video", 5, {"id": "vid_A"}),
+                ModalityItem(0, -1, "audio", 4, {"id": "vid_A.audio"}),
             ],
         }
-        plan = EncodingPlan.from_params(
+        assembly = MixedModalityAssembly.from_params(
             multimodal_params=[object()],
             extract=_identity_extractor(items_by_param),
         )
-        assert plan._param_lengths.tolist() == [5]
-        assert plan._modality_slots["audio"].tolist() == [1]
-        assert plan._bucket_offsets["audio"].tolist() == [0, 4]
+        assert assembly._param_lengths.tolist() == [5]
+        assert assembly._modality_slots["audio"].tolist() == [1]
+        assert assembly._bucket_offsets["audio"].tolist() == [0, 4]
 
 
 class TestEncodingPlanDstIndices:
     def test_pure_image_single_param(self):
         items_by_param = {
-            0: [MultimodalItem(0, 0, "image", 5, {"id": "img_A"})],
+            0: [ModalityItem(0, 0, "image", 5, {"id": "img_A"})],
         }
-        plan = EncodingPlan.from_params(
+        assembly = MixedModalityAssembly.from_params(
             multimodal_params=[object()],
             extract=_identity_extractor(items_by_param),
         )
-        assert plan._dst_indices["image"].tolist() == [0, 1, 2, 3, 4]
+        assert assembly._dst_indices["image"].tolist() == [0, 1, 2, 3, 4]
 
     def test_mixed_image_audio(self):
         # param 0: <image><audio><image>  -> img_A(5)@pos0, aud_A(4)@pos1, img_B(5)@pos2
@@ -137,20 +137,20 @@ class TestEncodingPlanDstIndices:
         # Final: [param 0 in MMItemOrder | param 1] = img_A | aud_A | img_B | img_C
         items_by_param = {
             0: [
-                MultimodalItem(0, 0, "image", 5, {"id": "img_A"}),
-                MultimodalItem(0, 1, "audio", 4, {"id": "aud_A"}),
-                MultimodalItem(0, 2, "image", 5, {"id": "img_B"}),
+                ModalityItem(0, 0, "image", 5, {"id": "img_A"}),
+                ModalityItem(0, 1, "audio", 4, {"id": "aud_A"}),
+                ModalityItem(0, 2, "image", 5, {"id": "img_B"}),
             ],
-            1: [MultimodalItem(1, 0, "image", 5, {"id": "img_C"})],
+            1: [ModalityItem(1, 0, "image", 5, {"id": "img_C"})],
         }
-        plan = EncodingPlan.from_params(
+        assembly = MixedModalityAssembly.from_params(
             multimodal_params=[object(), object()],
             extract=_identity_extractor(items_by_param),
         )
         # Image bucket in append order: img_A, img_B, img_C
         # img_A -> final[0:5], img_B -> final[9:14] (param0 start 0, after img_A(5)+aud_A(4))
         # img_C -> final[14:19] (param1 start 14)
-        assert plan._dst_indices["image"].tolist() == [
+        assert assembly._dst_indices["image"].tolist() == [
             0,
             1,
             2,
@@ -167,31 +167,31 @@ class TestEncodingPlanDstIndices:
             17,
             18,  # img_C
         ]
-        assert plan._dst_indices["audio"].tolist() == [5, 6, 7, 8]  # aud_A
+        assert assembly._dst_indices["audio"].tolist() == [5, 6, 7, 8]  # aud_A
 
     def test_ghost_audio_excluded(self):
         items_by_param = {
             0: [
-                MultimodalItem(0, 0, "video", 5, {"id": "vid_A"}),
-                MultimodalItem(0, -1, "audio", 4, {"id": "vid_A.audio"}),
+                ModalityItem(0, 0, "video", 5, {"id": "vid_A"}),
+                ModalityItem(0, -1, "audio", 4, {"id": "vid_A.audio"}),
             ],
         }
-        plan = EncodingPlan.from_params(
+        assembly = MixedModalityAssembly.from_params(
             multimodal_params=[object()],
             extract=_identity_extractor(items_by_param),
         )
-        assert plan._dst_indices["video"].tolist() == [0, 1, 2, 3, 4]
-        assert plan._dst_indices["audio"].numel() == 0
+        assert assembly._dst_indices["video"].tolist() == [0, 1, 2, 3, 4]
+        assert assembly._dst_indices["audio"].numel() == 0
 
     def test_duplicate_item_idx_raises(self):
         items_by_param = {
             0: [
-                MultimodalItem(0, 0, "image", 5, {"id": "x"}),
-                MultimodalItem(0, 0, "image", 5, {"id": "y"}),
+                ModalityItem(0, 0, "image", 5, {"id": "x"}),
+                ModalityItem(0, 0, "image", 5, {"id": "y"}),
             ],
         }
         with pytest.raises(ValueError, match="duplicate item_idx_in_param"):
-            EncodingPlan.from_params(
+            MixedModalityAssembly.from_params(
                 multimodal_params=[object()],
                 extract=_identity_extractor(items_by_param),
             )
@@ -201,7 +201,7 @@ import torch  # noqa: E402
 
 from tensorrt_llm._torch.models.multimodal_encoding import (  # noqa: E402
     _expand_ranges,
-    encode_with_plan,
+    assemble_embeddings,
 )
 
 
@@ -242,22 +242,22 @@ class TestExpandRangesVectorization:
         # confirm the vectorized from_params output is identical.
         items_by_param = {
             0: [
-                MultimodalItem(0, 0, "image", 5, {"id": "img_A"}),
-                MultimodalItem(0, 1, "audio", 4, {"id": "aud_A"}),
-                MultimodalItem(0, 2, "image", 5, {"id": "img_B"}),
+                ModalityItem(0, 0, "image", 5, {"id": "img_A"}),
+                ModalityItem(0, 1, "audio", 4, {"id": "aud_A"}),
+                ModalityItem(0, 2, "image", 5, {"id": "img_B"}),
             ],
-            1: [MultimodalItem(1, 0, "image", 5, {"id": "img_C"})],
+            1: [ModalityItem(1, 0, "image", 5, {"id": "img_C"})],
         }
-        plan = EncodingPlan.from_params(
+        assembly = MixedModalityAssembly.from_params(
             multimodal_params=[object(), object()],
             extract=_identity_extractor(items_by_param),
         )
         # img_A -> [0,5), img_B -> [9,14), img_C -> [14,19); aud_A -> [5,9)
         assert (
-            plan._dst_indices["image"].tolist()
+            assembly._dst_indices["image"].tolist()
             == _loop_expand_reference([0, 9, 14], [5, 5, 5]).tolist()
         )
-        assert plan._dst_indices["audio"].tolist() == _loop_expand_reference([5], [4]).tolist()
+        assert assembly._dst_indices["audio"].tolist() == _loop_expand_reference([5], [4]).tolist()
 
 
 class TestEncodeWithPlan:
@@ -280,16 +280,16 @@ class TestEncodeWithPlan:
         call_log_image: list = []
         H = 4
         items_by_param = {
-            0: [MultimodalItem(0, 0, "image", 5, {})],
-            1: [MultimodalItem(1, 0, "image", 5, {})],
+            0: [ModalityItem(0, 0, "image", 5, {})],
+            1: [ModalityItem(1, 0, "image", 5, {})],
         }
-        plan = EncodingPlan.from_params(
+        assembly = MixedModalityAssembly.from_params(
             multimodal_params=[object(), object()],
             extract=_identity_extractor(items_by_param),
         )
         encoders = {"image": self._make_fake_encoder(H, call_log_image)}
-        final = encode_with_plan(
-            plan,
+        final = assemble_embeddings(
+            assembly,
             encoders,
             multimodal_params=[object(), object()],
             device=torch.device("cpu"),
@@ -311,13 +311,13 @@ class TestEncodeWithPlan:
         H = 4
         items_by_param = {
             0: [
-                MultimodalItem(0, 0, "image", 5, {}),
-                MultimodalItem(0, 1, "audio", 4, {}),
-                MultimodalItem(0, 2, "image", 5, {}),
+                ModalityItem(0, 0, "image", 5, {}),
+                ModalityItem(0, 1, "audio", 4, {}),
+                ModalityItem(0, 2, "image", 5, {}),
             ],
-            1: [MultimodalItem(1, 0, "image", 5, {})],
+            1: [ModalityItem(1, 0, "image", 5, {})],
         }
-        plan = EncodingPlan.from_params(
+        assembly = MixedModalityAssembly.from_params(
             multimodal_params=[object(), object()],
             extract=_identity_extractor(items_by_param),
         )
@@ -325,8 +325,8 @@ class TestEncodeWithPlan:
             "image": self._make_fake_encoder(H, call_log_image),
             "audio": self._make_fake_encoder(H, call_log_audio),
         }
-        final = encode_with_plan(
-            plan,
+        final = assemble_embeddings(
+            assembly,
             encoders,
             multimodal_params=[object(), object()],
             device=torch.device("cpu"),
@@ -354,19 +354,19 @@ class TestEncodeWithPlan:
         H = 4
         post_seen: dict = {}
 
-        def post_process(bucket_outputs, plan, multimodal_params):
+        def post_process(bucket_outputs, assembly, multimodal_params):
             post_seen["modalities"] = sorted(bucket_outputs.keys())
             post_seen["shapes"] = {m: tuple(t.shape) for m, t in bucket_outputs.items()}
 
-        items_by_param = {0: [MultimodalItem(0, 0, "image", 3, {})]}
-        plan = EncodingPlan.from_params(
+        items_by_param = {0: [ModalityItem(0, 0, "image", 3, {})]}
+        assembly = MixedModalityAssembly.from_params(
             multimodal_params=[object()],
             extract=_identity_extractor(items_by_param),
         )
         call_log: list = []
         encoders = {"image": self._make_fake_encoder(H, call_log)}
-        encode_with_plan(
-            plan,
+        assemble_embeddings(
+            assembly,
             encoders,
             multimodal_params=[object()],
             post_process=post_process,
@@ -378,12 +378,12 @@ class TestEncodeWithPlan:
         assert post_seen["shapes"]["image"] == (3, H)
 
     def test_empty_plan_returns_zero_size(self):
-        plan = EncodingPlan.from_params(
+        assembly = MixedModalityAssembly.from_params(
             multimodal_params=[],
             extract=lambda i, p: iter([]),
         )
-        final = encode_with_plan(
-            plan,
+        final = assemble_embeddings(
+            assembly,
             encoders={},
             multimodal_params=[],
             device=torch.device("cpu"),
@@ -398,14 +398,14 @@ class TestEncodeWithPlan:
         def broken_encoder(items, multimodal_params):
             return torch.zeros((1, H), dtype=torch.float32)  # wrong row count
 
-        items_by_param = {0: [MultimodalItem(0, 0, "image", 5, {})]}
-        plan = EncodingPlan.from_params(
+        items_by_param = {0: [ModalityItem(0, 0, "image", 5, {})]}
+        assembly = MixedModalityAssembly.from_params(
             multimodal_params=[object()],
             extract=_identity_extractor(items_by_param),
         )
         with pytest.raises(AssertionError, match="image"):
-            encode_with_plan(
-                plan,
+            assemble_embeddings(
+                assembly,
                 encoders={"image": broken_encoder},
                 multimodal_params=[object()],
                 device=torch.device("cpu"),
@@ -419,7 +419,7 @@ class TestEncodeWithPlanHighBatch:
         """High-throughput guard: <=3 encoder calls regardless of pure/mixed mix.
 
         Direct regression guard against the per-mixed-param launch
-        anti-pattern. The plan must collapse 32 source params into one
+        anti-pattern. The assembly must collapse 32 source params into one
         encoder call per active modality.
         """
         H = 4
@@ -438,14 +438,14 @@ class TestEncodeWithPlanHighBatch:
         items_by_param: dict = {}
         # 16 pure-image params (4 tokens each)
         for i in range(16):
-            items_by_param[i] = [MultimodalItem(i, 0, "image", 4, {})]
+            items_by_param[i] = [ModalityItem(i, 0, "image", 4, {})]
         # 16 mixed image+audio params (image @ pos 0, audio @ pos 1)
         for i in range(16, 32):
             items_by_param[i] = [
-                MultimodalItem(i, 0, "image", 4, {}),
-                MultimodalItem(i, 1, "audio", 3, {}),
+                ModalityItem(i, 0, "image", 4, {}),
+                ModalityItem(i, 1, "audio", 3, {}),
             ]
-        plan = EncodingPlan.from_params(
+        assembly = MixedModalityAssembly.from_params(
             multimodal_params=[object()] * 32,
             extract=_identity_extractor(items_by_param),
         )
@@ -454,8 +454,8 @@ class TestEncodeWithPlanHighBatch:
             "audio": fake(call_log_audio),
             "video": fake(call_log_video),  # registered but no items -> no call
         }
-        encode_with_plan(
-            plan,
+        assemble_embeddings(
+            assembly,
             encoders,
             multimodal_params=[object()] * 32,
             device=torch.device("cpu"),

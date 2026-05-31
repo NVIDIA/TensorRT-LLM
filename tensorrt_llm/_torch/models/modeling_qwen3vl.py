@@ -15,9 +15,9 @@ from transformers.models.qwen3_vl.modeling_qwen3_vl import (
 
 from tensorrt_llm._torch.models.modeling_multimodal_utils import _is_disagg
 from tensorrt_llm._torch.models.multimodal_encoding import (
-    EncodingPlan,
-    MultimodalItem,
-    encode_with_plan,
+    MixedModalityAssembly,
+    ModalityItem,
+    assemble_embeddings,
 )
 from tensorrt_llm.functional import PositionEmbeddingType
 from tensorrt_llm.mapping import Mapping
@@ -104,7 +104,7 @@ def _qwen3vl_extract_items(param_idx: int, param):
         payload = multimodal_data[modality]
         pos = order_pos.get((modality, 0), 0)
         token_count = _qwen3vl_payload_token_count(payload, pos, embedding_lengths, param)
-        yield MultimodalItem(
+        yield ModalityItem(
             src_param_idx=param_idx,
             item_idx_in_param=pos,
             modality=modality,
@@ -1104,14 +1104,14 @@ class Qwen3VisionModelBase(nn.Module):
     def forward(self, multimodal_params: List[MultimodalParams]) -> List[torch.Tensor]:
         if not multimodal_params:
             return []
-        plan = EncodingPlan.from_params(
+        assembly = MixedModalityAssembly.from_params(
             multimodal_params=multimodal_params,
             extract=_qwen3vl_extract_items,
         )
-        if plan.total_tokens == 0:
+        if assembly.total_tokens == 0:
             return []
-        final = encode_with_plan(
-            plan,
+        final = assemble_embeddings(
+            assembly,
             encoders={
                 "image": self._adapter_image_bucket,
                 "video": self._adapter_video_bucket,

@@ -12,10 +12,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Flat-item multimodal encoding plan.
+"""Embedding-assembly path for mixed-modality-capable models.
 
+A single-modality request is the degenerate (identity-permutation) case.
 Per-model code supplies (a) an extractor that walks each :class:`MultimodalParams`
-and yields :class:`MultimodalItem` instances, and (b) per-modality encoder adapters
+and yields :class:`ModalityItem` instances, and (b) per-modality encoder adapters
 that bridge a bucket of items to the model's existing encoder call. This module
 owns partition, index-tensor build, and per-modality scatter assembly.
 """
@@ -31,11 +32,13 @@ from tensorrt_llm.inputs.multimodal import MMItemOrder, MultimodalParams  # noqa
 
 
 @dataclass(frozen=True, slots=True)
-class MultimodalItem:
-    """One modality item in a flat encoding plan.
+class ModalityItem:
+    """One single-modality payload (one image, video, or audio) as a unit of
+    work in a `MixedModalityAssembly`, tagged with its source request
+    (`src_param_idx`) and prompt-order position (`item_idx_in_param`).
 
     Carries the join keys (``src_param_idx``, ``item_idx_in_param``) that
-    let the plan reconcile modality-grouping (encoder batching) with
+    let the assembly reconcile modality-grouping (encoder batching) with
     source-param grouping (cache contract + MMItemOrder reassembly).
 
     Ghost items (e.g. audio extracted from a video payload) use
@@ -66,16 +69,19 @@ class MultimodalItem:
         return self.token_count if self.encoder_token_count is None else self.encoder_token_count
 
 
-ItemExtractor = Callable[[int, MultimodalParams], Iterable[MultimodalItem]]
+ItemExtractor = Callable[[int, MultimodalParams], Iterable[ModalityItem]]
 
 
 @dataclass
-class EncodingPlan:
-    """Flat-item plan for batched multimodal encoding.
+class MixedModalityAssembly:
+    """Precomputed structure for assembling a multimodal embedding tensor.
+
+    Used only by mixed-modality-capable models (Qwen3VL, Nemotron Nano); a
+    single-modality request is the degenerate (identity-permutation) case.
 
     Built once via :meth:`from_params`; subsequently exposes precomputed
     index tensors that drive a vectorized per-modality scatter assembly
-    in :func:`encode_with_plan` (added in Task 5).
+    in :func:`assemble_embeddings`.
 
     Ghost items (``item_idx_in_param == -1``) participate in the encoder
     bucket call but do NOT contribute to ``_param_lengths`` or (later)
@@ -83,7 +89,7 @@ class EncodingPlan:
     post-process step instead.
     """
 
-    items: Tuple[MultimodalItem, ...]
+    items: Tuple[ModalityItem, ...]
     n_params: int
     _param_lengths: torch.Tensor  # int64[n_params]
     _param_offsets: torch.Tensor  # int64[n_params]
@@ -98,8 +104,8 @@ class EncodingPlan:
         cls,
         multimodal_params: List[MultimodalParams],
         extract: ItemExtractor,
-    ) -> "EncodingPlan":
-        items: List[MultimodalItem] = []
+    ) -> "MixedModalityAssembly":
+        items: List[ModalityItem] = []
         param_lengths: List[int] = [0] * len(multimodal_params)
         modality_slots: Dict[str, List[int]] = {}
         bucket_token_counts: Dict[str, List[int]] = {}
@@ -206,16 +212,18 @@ def _expand_ranges(starts: torch.Tensor, lengths: torch.Tensor) -> torch.Tensor:
 
 # Adapter contract: given a bucket's items and the source-param list,
 # return one tensor of shape (sum(item.token_count for item in items), hidden_dim)
-# with rows in bucket order (= order in plan._modality_slots[modality]).
-ModalityEncoder = Callable[[List[MultimodalItem], List[MultimodalParams]], torch.Tensor]
+# with rows in bucket order (= order in assembly._modality_slots[modality]).
+ModalityEncoder = Callable[[List[ModalityItem], List[MultimodalParams]], torch.Tensor]
 
 # Post-process: runs after encode, before scatter. May mutate
 # ``bucket_outputs`` in place (e.g. Nano video-audio interleave).
-PostProcess = Callable[[Dict[str, torch.Tensor], "EncodingPlan", List[MultimodalParams]], None]
+PostProcess = Callable[
+    [Dict[str, torch.Tensor], "MixedModalityAssembly", List[MultimodalParams]], None
+]
 
 
-def encode_with_plan(
-    plan: EncodingPlan,
+def assemble_embeddings(
+    assembly: MixedModalityAssembly,
     encoders: Dict[str, ModalityEncoder],
     multimodal_params: List[MultimodalParams],
     *,
@@ -226,22 +234,22 @@ def encode_with_plan(
 ) -> torch.Tensor:
     """Run one encoder call per active modality and assemble via scatter.
 
-    Returns a tensor of shape `(plan.total_tokens, hidden_dim)` in
+    Returns a tensor of shape `(assembly.total_tokens, hidden_dim)` in
     canonical layout (per-param slices in source-param order; each slice
     in MMItemOrder order). Caller wraps in `[final]` to satisfy the
     `get_multimodal_embeddings` single-tensor cache contract.
 
-    Hot path: at most `len(plan.active_modalities)` encoder launches +
+    Hot path: at most `len(assembly.active_modalities)` encoder launches +
     one `index_copy_` per modality + the destination allocation. No
     per-item Python loops on hot path.
     """
-    if plan.total_tokens == 0:
+    if assembly.total_tokens == 0:
         return torch.empty((0, hidden_dim), dtype=dtype, device=device)
 
     bucket_outputs: Dict[str, torch.Tensor] = {}
-    for modality in plan.active_modalities:
-        slot_indices = plan._modality_slots[modality].tolist()
-        bucket_items = [plan.items[i] for i in slot_indices]
+    for modality in assembly.active_modalities:
+        slot_indices = assembly._modality_slots[modality].tolist()
+        bucket_items = [assembly.items[i] for i in slot_indices]
         out = encoders[modality](bucket_items, multimodal_params)
         # Use ``encoder_token_count`` (defaults to ``token_count``) for the
         # encoder-output assertion. Items whose ``token_count`` reflects a
@@ -250,16 +258,16 @@ def encode_with_plan(
         expected_rows = sum(item.encoder_rows for item in bucket_items)
         assert out.shape[0] == expected_rows, (
             f"encoder for {modality!r} returned {out.shape[0]} rows; "
-            f"plan expected {expected_rows} (sum of item encoder_rows)"
+            f"assembly expected {expected_rows} (sum of item encoder_rows)"
         )
         bucket_outputs[modality] = out
 
     if post_process is not None:
-        post_process(bucket_outputs, plan, multimodal_params)
+        post_process(bucket_outputs, assembly, multimodal_params)
 
-    final = torch.empty((plan.total_tokens, hidden_dim), dtype=dtype, device=device)
-    for modality in plan.active_modalities:
-        dst = plan._dst_indices[modality]
+    final = torch.empty((assembly.total_tokens, hidden_dim), dtype=dtype, device=device)
+    for modality in assembly.active_modalities:
+        dst = assembly._dst_indices[modality]
         if dst.numel() == 0:
             continue  # all-ghost bucket; rows consumed by post_process
         bucket = bucket_outputs[modality]
@@ -270,8 +278,8 @@ def encode_with_plan(
             bucket = bucket[: dst.numel()]
         final.index_copy_(0, dst.to(device), bucket)
 
-    assert final.shape[0] == int(plan._param_lengths.sum().item()), (
+    assert final.shape[0] == int(assembly._param_lengths.sum().item()), (
         f"final shape {final.shape[0]} != sum(_param_lengths) "
-        f"{int(plan._param_lengths.sum().item())}"
+        f"{int(assembly._param_lengths.sum().item())}"
     )
     return final

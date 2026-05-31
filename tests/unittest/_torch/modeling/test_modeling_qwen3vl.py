@@ -18,7 +18,7 @@ from tensorrt_llm._torch.models.modeling_qwen3vl import (
     Qwen3VLModel,
     _qwen3vl_extract_items,
 )
-from tensorrt_llm._torch.models.multimodal_encoding import EncodingPlan, MultimodalItem
+from tensorrt_llm._torch.models.multimodal_encoding import MixedModalityAssembly, ModalityItem
 from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.inputs.multimodal import MultimodalParams
 
@@ -119,9 +119,9 @@ def _make_qwen_vision_model_for_mixed_tests():
 
 
 def _qwen_image_video_param(include_order=True, include_lengths=True):
-    """A mixed image+video param exercising the plan-based encode path.
+    """A mixed image+video param exercising the assembly-based encode path.
 
-    The plan extractor (`_qwen3vl_extract_items`) emits one item per modality and
+    The assembly extractor (`_qwen3vl_extract_items`) emits one item per modality and
     orders them by `multimodal_item_order` (tuple form `(modality, index)`, which
     is what `MMItemOrder` normalizes to). Per-item token counts come from the
     explicit `num_tokens` payload key (test convention; mirrors the Task 13
@@ -180,7 +180,7 @@ def test_qwen3vl_mixed_image_video_requires_item_order_metadata():
     The extractor reads `multimodal_item_order` as `(modality, index)` pairs to
     assign each modality item a distinct prompt position. When the ordering does
     not disambiguate the items - so the image and video items collapse onto the
-    same prompt slot - the plan build in `EncodingPlan.from_params` rejects it with
+    same prompt slot - the assembly build in `MixedModalityAssembly.from_params` rejects it with
     a duplicate-position error rather than silently overlapping their embedding
     ranges. This pins the invariant that a valid per-item ordering is required for
     a mixed request; the encoder does not fabricate one.
@@ -190,7 +190,7 @@ def test_qwen3vl_mixed_image_video_requires_item_order_metadata():
         # Model an order that fails to disambiguate the two mixed items by forcing
         # both onto prompt slot 0 (what an absent/degenerate order would yield).
         for item in _qwen3vl_extract_items(param_idx, p):
-            yield MultimodalItem(
+            yield ModalityItem(
                 src_param_idx=item.src_param_idx,
                 item_idx_in_param=0,
                 modality=item.modality,
@@ -199,22 +199,22 @@ def test_qwen3vl_mixed_image_video_requires_item_order_metadata():
             )
 
     with pytest.raises(ValueError, match="item_idx_in_param"):
-        EncodingPlan.from_params([_qwen_image_video_param()], _collapsing_extract)
+        MixedModalityAssembly.from_params([_qwen_image_video_param()], _collapsing_extract)
 
 
 def test_qwen3vl_mixed_image_video_requires_embedding_length_metadata():
-    """Without any token-count source the plan build cannot size a mixed item.
+    """Without any token-count source the assembly build cannot size a mixed item.
 
     Token counts come from `num_tokens`, then `multimodal_embedding_lengths`
     indexed by prompt position, then `multimodal_runtime.total_embeds_in_request`.
-    When none is available the extractor's fallback raises, surfacing during plan
-    build (here exercised directly via `EncodingPlan.from_params`). The message
+    When none is available the extractor's fallback raises, surfacing during assembly
+    build (here exercised directly via `MixedModalityAssembly.from_params`). The message
     enumerates `multimodal_embedding_lengths` as one of the missing sources.
     """
     param = _qwen_image_video_param(include_lengths=False)
 
     with pytest.raises(ValueError, match="multimodal_embedding_lengths"):
-        EncodingPlan.from_params([param], _qwen3vl_extract_items)
+        MixedModalityAssembly.from_params([param], _qwen3vl_extract_items)
 
 
 def test_qwen3vl_video_token_count_sums_multirow_grid():
