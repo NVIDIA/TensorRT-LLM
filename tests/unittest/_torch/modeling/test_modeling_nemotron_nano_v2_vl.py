@@ -720,6 +720,72 @@ class TestInterleaveVideoAudioEmbeddings:
         assert result.shape == expected.shape
         assert torch.equal(result, expected)
 
+    def test_two_videos_both_with_audio_evs_pruned(self):
+        """EVS-pruned variant of `test_two_videos_both_with_audio`.
+
+        When `video_pruning_rate > 0`, the vision encoder prunes video
+        tokens and the model threads a per-tubelet retained-count tensor
+        (`evs_num_tokens`) into the interleave. The interleave then must
+        recover each video's PRUNED vision-row count via
+        `torch.split(evs_num_tokens, tubelets_per_video)` and sum each
+        chunk, NOT use the unpruned geometric per-frame count
+        (`num_tubelets * tiles * wh`). This is the EVS-pruned-count x
+        audio-offset interaction — the `evs_num_tokens is not None` branch
+        that every other interleave test leaves uncovered.
+
+        Geometry (patch_size=14, downsample_ratio=0.5, T=2):
+          Video 1: video_size [t=4, tiles=1, ih=56, iw=56]
+                   -> num_tubelets = ceil(4/2) = 2, wh = int(4*0.5)*int(4*0.5) = 4
+                   -> UNPRUNED geometric vision rows = 2 * 1 * 4 = 8
+          Video 2: video_size [t=4, tiles=1, ih=56, iw=84]
+                   -> num_tubelets = 2, wh = int(4*0.5)*int(6*0.5) = 6
+                   -> UNPRUNED geometric vision rows = 2 * 1 * 6 = 12
+
+        evs_num_tokens carries one retained count per tubelet across both
+        videos (4 tubelets total): [3, 2, 4, 3]. Split by
+        tubelets_per_video = [2, 2] -> video 1 keeps 3 + 2 = 5 rows,
+        video 2 keeps 4 + 3 = 7 rows. Both are FEWER than the geometric
+        counts (8 and 12), so a regression that split by geometry would
+        either raise (split sizes 8 + 12 = 20 != 12-row pruned tensor) or
+        slice the wrong rows.
+        """
+        hidden = 8
+        model = self._make_model(patch_size=14, downsample_ratio=0.5, temporal_patch_size=2)
+        video_sizes = [[4, 1, 56, 56], [4, 1, 56, 84]]  # [t, tiles, ih, iw]
+
+        # Vision embedding tensor is built at the PRUNED row count (5 + 7 = 12),
+        # exactly what the EVS-active vision encoder emits — NOT the unpruned
+        # geometric 8 + 12 = 20.
+        v1_pruned = torch.randn(5, hidden)
+        v2_pruned = torch.randn(7, hidden)
+        vision_emb = torch.cat([v1_pruned, v2_pruned], dim=0)
+        assert vision_emb.shape[0] == 12  # pruned, < geometric 20
+
+        a1 = torch.randn(3, hidden)
+        a2 = torch.randn(5, hidden)
+        audio_emb = torch.cat([a1, a2], dim=0)
+
+        # Per-tubelet retained counts across both videos (4 tubelets).
+        evs_num_tokens = torch.tensor([3, 2, 4, 3])
+
+        result = NemotronH_Nano_VL_V2._interleave_video_audio_embeddings(
+            model,
+            vision_emb=vision_emb,
+            audio_emb=audio_emb,
+            per_clip_audio_counts=[3, 5],
+            has_audio=[True, True],
+            audio_num_clips=torch.tensor([1, 1]),
+            video_sizes=video_sizes,
+            evs_num_tokens=evs_num_tokens,
+        )
+
+        # Output ordering is [v1_pruned, a1, v2_pruned, a2]: the vision rows
+        # are split by the EVS retained counts (5, 7), then audio is offset in
+        # after each video's pruned vision rows.
+        expected = torch.cat([v1_pruned, a1, v2_pruned, a2], dim=0)
+        assert result.shape == expected.shape
+        assert torch.equal(result, expected)
+
     def test_mixed_audio_presence(self):
         """Three videos of different sizes: first has audio, second has none, third has audio."""
         hidden = 4

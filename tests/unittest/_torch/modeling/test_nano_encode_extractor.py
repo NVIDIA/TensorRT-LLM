@@ -18,6 +18,7 @@ ghost audio item second (``item_idx_in_param == -1``,
 
 from __future__ import annotations
 
+from types import MethodType
 from unittest.mock import MagicMock
 
 import pytest
@@ -27,7 +28,12 @@ from tensorrt_llm._torch.models.modeling_nemotron_nano import (
     NemotronH_Nano_VL_V2,
     _nano_extract_items,
 )
-from tensorrt_llm._torch.models.multimodal_encoding import MixedModalityAssembly, ModalityItem
+from tensorrt_llm._torch.models.multimodal_encoding import (
+    MixedModalityAssembly,
+    ModalityItem,
+    assemble_embeddings,
+)
+from tensorrt_llm.inputs.evs import compute_retained_tokens_from_tubelet_budget
 from tensorrt_llm.inputs.multimodal import MultimodalParams, MultimodalRuntimeData
 
 
@@ -754,3 +760,231 @@ class TestNanoPostEncode:
         assert captured["per_clip"] == [3, 1]  # mask-derived fallback
         assert bucket_outputs["video"].shape == (12, 4)
         assert bucket_outputs["audio"].shape == (0, 4)
+
+    @staticmethod
+    def _make_evs_geometry_vision_encoder(
+        patch_size=14, downsample_ratio=0.5, temporal_patch_size=2
+    ):
+        """Vision-encoder stub with REAL tubelet geometry for the interleave.
+
+        `_interleave_video_audio_embeddings`'s EVS branch reads
+        `self.vision_encoder.{video_temporal_patch_size, patch_size,
+        downsample_ratio}` and `._video_tubelet_geometry` to recover
+        per-video tubelet counts. The stub binds the real geometry method
+        so the EVS split is exercised against true geometry.
+        """
+        from tensorrt_llm._torch.models.modeling_nemotron_nano import NanoV2VLVisionEncoder
+
+        vision_enc = MagicMock()
+        vision_enc.video_temporal_patch_size = temporal_patch_size
+        vision_enc.patch_size = patch_size
+        vision_enc.downsample_ratio = downsample_ratio
+        # Bind the real geometry helper (defined on NanoV2VLVisionEncoder).
+        vision_enc._video_tubelet_geometry = MethodType(
+            NanoV2VLVisionEncoder._video_tubelet_geometry, vision_enc
+        )
+        return vision_enc
+
+    def test_evs_pruned_video_mixed_with_image_through_assemble(self):
+        """EVS-pruned audio-bearing video mixed with an image, end to end through
+        `assemble_embeddings` (encode -> `_nano_post_encode` -> scatter).
+
+        This is the EVS-pruned-count x mixed-modality corner that the
+        `evs_num_tokens is not None` interleave branch sits behind, exercised
+        through the production assembly contract rather than a direct call:
+
+          * MIXED param: image (prompt slot 0) + audio-bearing video (slot 1).
+            `multimodal_item_order` + `multimodal_embedding_lengths` are
+            populated as production preprocessing would, with the video slot
+            length set to the EVS-PRUNED post-interleave count
+            (pruned-vision + audio).
+          * The video's per-tubelet retained `num_tokens_in_video` tensor is
+            stashed by the REAL `_adapter_vision_bucket` from the stub vision
+            encoder's `num_tokens` return (exactly the production side-channel),
+            so the interleave splits pruned vision rows by EVS counts.
+          * After assembly: the video bucket grows from pruned-vision rows to
+            (pruned-vision + audio) rows, the image bucket is untouched, and the
+            `assemble_embeddings` scatter contract
+            (`expected_rows == sum(encoder_rows)`,
+            multimodal_encoding.py:258) holds for both buckets.
+
+        Geometry (patch_size=14, downsample_ratio=0.5, T=2):
+          Video size [t=4, tiles=1, ih=56, iw=84]
+            -> num_tubelets = ceil(4/2) = 2, wh = int(4*0.5)*int(6*0.5) = 6
+            -> UNPRUNED geometric vision rows = 2 * 1 * 6 = 12.
+          At video_pruning_rate = 0.5,
+          `compute_retained_tokens_from_tubelet_budget(2, 6, 0.5)`
+            = max(6, int(2*6*0.5)) = 6 PRUNED vision rows.
+          Per-tubelet retained counts: [3, 3] (sum = 6).
+        """
+        hidden = 4
+        pruning_rate = 0.5
+        num_tubelets, tokens_per_tubelet = 2, 6  # from geometry below
+        pruned_vision_rows = compute_retained_tokens_from_tubelet_budget(
+            num_tubelets, tokens_per_tubelet, pruning_rate
+        )
+        assert pruned_vision_rows == 6  # < unpruned geometric 12
+        per_tubelet_retained = [3, 3]
+        assert sum(per_tubelet_retained) == pruned_vision_rows
+
+        image_rows = 5
+        audio_rows = 4  # mask [6, 2] -> subsample //2 -> [3, 1]
+        post_interleave_video = pruned_vision_rows + audio_rows  # 6 + 4 = 10
+
+        # Audio is split into TWO clips (mask valid lengths [6, 2] -> subsample
+        # //2 -> [3, 1] = 4 rows); `audio_num_clips` for the single video is 2.
+        mask = torch.tensor([[1, 1, 1, 1, 1, 1], [1, 1, 0, 0, 0, 0]])  # valid [6, 2]
+        audio_payload = {
+            "input_audio_features": "fake",
+            "feature_attention_mask": mask,
+            "has_audio": [True],
+            "audio_num_clips": torch.tensor([2]),
+        }
+        image_payload = {"pixel_values": "img"}
+        video_payload = {
+            "pixel_values": "vid",
+            "video_size": [[4, 1, 56, 84]],
+            "audio": audio_payload,
+        }
+        # MIXED param: production fields (no num_tokens). Video slot length is the
+        # EVS-pruned POST-interleave count (10); image slot is 5.
+        multimodal_data = {
+            "image": image_payload,
+            "video": video_payload,
+            "modality_type": ["image", "video"],
+            "multimodal_item_order": [
+                {"modality": "image", "index": 0},
+                {"modality": "video", "index": 0},
+            ],
+            "multimodal_embedding_lengths": [image_rows, post_interleave_video],
+        }
+        param = _make_param(multimodal_data)
+        params = [param]
+
+        # Build the assembly via the REAL extractor; the embedded-audio rows are
+        # resolved from the production feature mask via audio_rows_fn.
+        def _extract(param_idx, p):
+            yield from _nano_extract_items(param_idx, p, audio_rows_fn=lambda _ap: audio_rows)
+
+        assembly = MixedModalityAssembly.from_params(
+            multimodal_params=params,
+            extract=_extract,
+        )
+
+        # Wire a stub model carrying real geometry + real adapter/post-encode/
+        # interleave methods, so the whole EVS x mixed seam runs end to end.
+        model = MagicMock(spec=NemotronH_Nano_VL_V2)
+        model.vision_encoder = self._make_evs_geometry_vision_encoder()
+        model.sound_encoder = MagicMock()
+        model.sound_encoder.encoder._get_subsampling_output_length = lambda lens: (lens // 2)
+        for name in (
+            "_adapter_vision_bucket",
+            "_adapter_audio_bucket",
+            "_nano_post_encode",
+            "_interleave_video_audio_embeddings",
+            "_audio_payload_clip_counts",
+        ):
+            setattr(model, name, MethodType(getattr(NemotronH_Nano_VL_V2, name), model))
+        # `_build_single_modality_param` is a @staticmethod (no `self`), so bind
+        # it as the raw function — matching how production `_adapter_vision_bucket`
+        # invokes `self._build_single_modality_param(item, param)` (staticmethod
+        # access does not inject `self`). Wrapping it in `MethodType` would
+        # spuriously bind `model` as a third positional arg.
+        model._build_single_modality_param = NemotronH_Nano_VL_V2._build_single_modality_param
+
+        # Stub vision encoder returns EVS-pruned embeddings + per-tubelet retained
+        # counts; `_adapter_vision_bucket` stashes the latter as
+        # `num_tokens_in_video` (the production EVS side-channel the interleave reads).
+        image_emb = torch.ones((image_rows, hidden))
+        video_vision_emb = torch.ones((pruned_vision_rows, hidden)) * 2.0
+        # Vision encoder is called once per bucket (image bucket, then video
+        # bucket); image num_tokens is None (no EVS), video carries the
+        # per-tubelet retained tensor.
+        model.vision_encoder.side_effect = [
+            ([image_emb], [None]),
+            ([video_vision_emb], [torch.tensor(per_tubelet_retained)]),
+        ]
+        audio_emb = torch.ones((audio_rows, hidden)) * 3.0
+        model._encode_audio = MagicMock(return_value=[(audio_emb, [3, 1])])
+
+        encoders = {
+            "image": model._adapter_vision_bucket,
+            "video": model._adapter_vision_bucket,
+            "audio": model._adapter_audio_bucket,
+        }
+
+        final = assemble_embeddings(
+            assembly,
+            encoders,
+            params,
+            device=torch.device("cpu"),
+            dtype=torch.float32,
+            hidden_dim=hidden,
+            post_process=model._nano_post_encode,
+        )
+
+        # `_adapter_vision_bucket` stashed the per-tubelet EVS counts so the
+        # interleave could split pruned vision rows by EVS, not geometry.
+        assert param.multimodal_data["num_tokens_in_video"].tolist() == per_tubelet_retained
+
+        # Final scatter total = image (5) + video post-interleave (10) = 15 rows.
+        assert final.shape == (image_rows + post_interleave_video, hidden)
+        # Image slice is the untouched image bucket; video slice spans
+        # vision (2.0) + interleaved audio (3.0) rows.
+        assert torch.equal(final[:image_rows], image_emb)
+        video_slice = final[image_rows:]
+        assert torch.equal(video_slice[:pruned_vision_rows], video_vision_emb)
+        assert torch.equal(video_slice[pruned_vision_rows:], audio_emb)
+
+    def test_resolve_payload_token_counts_mixed_video_evs_pruned_slot(self):
+        """Sibling extractor assertion: the production-fields resolver maps the
+        EVS-PRUNED video slot to its post-interleave length, and the extractor
+        splits it into vision-only `encoder_rows` (= pruned vision) + a ghost
+        audio item.
+
+        This pins the extractor<->encoder count agreement for the EVS case:
+        with the video slot's `multimodal_embedding_lengths` set to the pruned
+        post-interleave count (pruned-vision 6 + audio 4 = 10), the video item's
+        `encoder_rows` must be the pruned vision count (6) — exactly what the
+        EVS-active vision encoder emits — so the `assemble_embeddings` bucket
+        assertion does not fire.
+        """
+        pruned_vision_rows = compute_retained_tokens_from_tubelet_budget(2, 6, 0.5)
+        assert pruned_vision_rows == 6
+        audio_rows = 4
+        post_interleave_video = pruned_vision_rows + audio_rows  # 10
+
+        audio_payload = {"input_audio_features": "fake", "feature_attention_mask": "fake"}
+        image_payload = {"pixel_values": "img"}
+        video_payload = {"pixel_values": "vid", "video_size": [], "audio": audio_payload}
+        multimodal_data = {
+            "image": image_payload,
+            "video": video_payload,
+            "modality_type": ["image", "video"],
+            "multimodal_item_order": [
+                {"modality": "image", "index": 0},
+                {"modality": "video", "index": 0},
+            ],
+            "multimodal_embedding_lengths": [5, post_interleave_video],
+        }
+        param = _make_param(multimodal_data)
+
+        # Production resolver maps each prompt slot to its embedding length.
+        from tensorrt_llm._torch.models.modeling_nemotron_nano import (
+            _nano_resolve_payload_token_counts,
+        )
+
+        counts = _nano_resolve_payload_token_counts(param)
+        assert counts[("image", 0)] == 5
+        assert counts[("video", 0)] == post_interleave_video  # 10, post-interleave
+
+        items = list(_nano_extract_items(0, param, audio_rows_fn=lambda _ap: audio_rows))
+        by_mod = {it.modality: it for it in items if it.item_idx_in_param != -1}
+        # Video scatter destination is the pruned post-interleave count (10),
+        # but the encoder only emits the pruned vision rows (6).
+        assert by_mod["video"].token_count == post_interleave_video
+        assert by_mod["video"].encoder_rows == pruned_vision_rows  # 10 - 4 = 6
+        assert by_mod["image"].encoder_rows == 5
+        ghost = [it for it in items if it.item_idx_in_param == -1][0]
+        assert ghost.modality == "audio"
+        assert ghost.token_count == audio_rows

@@ -900,6 +900,11 @@ class TestNanoV3Omni(LlmapiAccuracyTestHarness):
     @pytest.mark.skip_less_device_memory(80000)
     @pytest.mark.threadleak(enabled=False)
     @pytest.mark.parametrize(
+        "video_pruning_rate",
+        [0.0, 0.5],
+        ids=["evs_off", "evs_on"],
+    )
+    @pytest.mark.parametrize(
         "max_num_tokens",
         [
             MIXED_MODALITY_FULL_BUDGET_MAX_NUM_TOKENS,
@@ -907,7 +912,17 @@ class TestNanoV3Omni(LlmapiAccuracyTestHarness):
         ],
         ids=["full_budget", "forced_chunked_prefill"],
     )
-    def test_mixed_modality(self, _ensure_pyav, max_num_tokens: int) -> None:
+    def test_mixed_modality(
+        self, _ensure_pyav, max_num_tokens: int, video_pruning_rate: float
+    ) -> None:
+        # The `evs_off` (video_pruning_rate=0.0) arm is the existing baseline.
+        # The `evs_on` (0.5) arm gates the EVS-pruned-video x mixed-modality
+        # path: the audio-bearing video's vision tokens are pruned by Efficient
+        # Video Sampling before the post-encode video-audio interleave + scatter.
+        # Both arms prune identically across the mixed request and its paired
+        # pure baseline, so the evaluator's pruning-symmetric mixed-vs-pure delta
+        # gate (`_assert_pure_baseline_not_degraded`) holds without a new
+        # reference YAML.
         with LLM(
             self.MIXED_MODALITY_BF16_MODEL_PATH,
             trust_remote_code=True,
@@ -915,6 +930,7 @@ class TestNanoV3Omni(LlmapiAccuracyTestHarness):
             enable_chunked_prefill=True,
             max_num_tokens=max_num_tokens,
             max_batch_size=32,
+            video_pruning_rate=video_pruning_rate,
         ) as llm:
             for task_cls, sampling_params, extra_evaluator_kwargs in (
                 self.MIXED_MODALITY_TASK_SPEC,
