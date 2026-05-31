@@ -521,13 +521,31 @@ class TestQwen3VL(LlmapiAccuracyTestHarness):
     )
 
     @pytest.mark.skip_less_device_memory(80000)
-    def test_mixed_modality(self):
+    @pytest.mark.parametrize(
+        "max_num_tokens",
+        [
+            MAX_NUM_TOKENS,
+            512,
+        ],
+        ids=["full_budget", "forced_chunked_prefill"],
+    )
+    def test_mixed_modality(self, max_num_tokens):
+        # Run the SAME image+video mixed-vs-pure gate under two prefill budgets,
+        # keeping `enable_chunked_prefill=True` for both (mirrors
+        # `TestMistralSmall24B::test_auto_dtype`):
+        #   * `full_budget` (`MAX_NUM_TOKENS`): the mixed request fits in a
+        #     single context chunk, so mm embeds are gathered once.
+        #   * `forced_chunked_prefill` (low `max_num_tokens`): the prompt is
+        #     split across prefill chunks, so `get_multimodal_embeddings` must
+        #     reuse the per-item cached mm embeds and `find_input_mm_embeds`
+        #     must window them to the right chunk. The mixed-vs-pure parity gate
+        #     holding under chunking proves no mm-embedding mis-split across
+        #     chunk boundaries (and surfaces runtime errors in the mixed
+        #     image+video path).
         with LLM(
             self.MODEL_PATH,
             enable_chunked_prefill=True,
-            # Low max_num_tokens forces chunking, surfacing runtime errors a
-            # change might introduce in the mixed image+video path.
-            max_num_tokens=512,
+            max_num_tokens=max_num_tokens,
         ) as llm:
             task = QwenVLMixedModality(self.MODEL_NAME)
             task.evaluate(
@@ -818,6 +836,68 @@ class TestNanoV3Omni(LlmapiAccuracyTestHarness):
                 assert llm.args.quant_config.quant_algo == expected_quant_algo
             for task_cls, sampling_params, extra_evaluator_kwargs in task_specs:
                 task = task_cls(model_name)
+                task.evaluate(
+                    llm,
+                    sampling_params=sampling_params,
+                    extra_evaluator_kwargs=extra_evaluator_kwargs,
+                )
+
+    # Dedicated chunked-prefill parity gate for the Nano-Omni mixed-modality
+    # path. `test_auto_dtype` already runs the mixed specs at a forced-chunking
+    # budget; this adds the matching non-chunked (`full_budget`) control so the
+    # SAME mixed evaluator + SAME pure-baseline references run under BOTH
+    # budgets, keeping `enable_chunked_prefill=True` for each (mirrors
+    # `TestMistralSmall24B::test_auto_dtype`). It runs only on the unquantized
+    # BF16 reference and exercises both mixed tasks:
+    #   * `MixedModality`: image + audio + video in one request.
+    #   * `MixedModalityVideoAudio`: image + an audio-bearing video (the
+    #     post-encode video-audio interleave / ghost-audio plan path).
+    # Under `forced_chunked_prefill` the prompt is split across prefill chunks,
+    # so `get_multimodal_embeddings` must reuse the per-item cached mm embeds and
+    # `find_input_mm_embeds` must window them to the right chunk. The
+    # mixed-vs-pure parity gate holding under chunking proves no mm-embedding
+    # mis-split across chunk boundaries for the interleaved image/audio/video
+    # plan.
+    MIXED_MODALITY_BF16_MODEL_NAME = "nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-BF16"
+    MIXED_MODALITY_BF16_MODEL_PATH = (
+        f"{llm_models_root()}/NVIDIA-Nemotron-3-Nano-Omni-30B-A3B-Reasoning-BF16"
+    )
+    mixed_modality_kv_cache_config = KvCacheConfig(
+        free_gpu_memory_fraction=0.8,
+        mamba_ssm_cache_dtype="float32",
+        enable_block_reuse=False,
+    )
+    # `full_budget` keeps the LLM default `max_num_tokens` (8192) so a single
+    # image+audio+video mixed request fits in one context chunk. We deliberately
+    # do not raise it toward the `MixedModality.MAX_INPUT_LEN` (32768) truncation
+    # ceiling: mamba SSM state is pre-allocated proportional to
+    # `max_num_tokens`, so a large budget would blow the CI GPU memory budget.
+    MIXED_MODALITY_FULL_BUDGET_MAX_NUM_TOKENS = 8192
+
+    @pytest.mark.skip_less_device_memory(80000)
+    @pytest.mark.threadleak(enabled=False)
+    @pytest.mark.parametrize(
+        "max_num_tokens",
+        [
+            MIXED_MODALITY_FULL_BUDGET_MAX_NUM_TOKENS,
+            512,
+        ],
+        ids=["full_budget", "forced_chunked_prefill"],
+    )
+    def test_mixed_modality(self, max_num_tokens: int) -> None:
+        with LLM(
+            self.MIXED_MODALITY_BF16_MODEL_PATH,
+            trust_remote_code=True,
+            kv_cache_config=self.mixed_modality_kv_cache_config,
+            enable_chunked_prefill=True,
+            max_num_tokens=max_num_tokens,
+            max_batch_size=32,
+        ) as llm:
+            for task_cls, sampling_params, extra_evaluator_kwargs in (
+                self.MIXED_MODALITY_TASK_SPEC,
+                self.VIDEO_AUDIO_MIXED_MODALITY_TASK_SPEC,
+            ):
+                task = task_cls(self.MIXED_MODALITY_BF16_MODEL_NAME)
                 task.evaluate(
                     llm,
                     sampling_params=sampling_params,
