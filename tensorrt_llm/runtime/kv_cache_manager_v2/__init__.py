@@ -17,6 +17,7 @@ import os
 import sys
 from importlib.util import find_spec
 from pathlib import Path
+from types import ModuleType
 from typing import NamedTuple, Optional, Union
 
 _BACKEND = os.environ.get("TLLM_KV_CACHE_MANAGER_V2_BACKEND", "cpp").lower()
@@ -73,7 +74,7 @@ if _BACKEND == "python":
     from ._exceptions import OutOfPagesError  # noqa: F401
     from ._life_cycle_registry import LayerGroupId, LifeCycleId  # noqa: F401
     from ._storage import BufferId  # noqa: F401
-    from ._utils import HalfOpenRange  # noqa: F401
+    from ._utils import HalfOpenRange, exact_div, typed_range  # noqa: F401
 else:
 
     class ReuseScope(NamedTuple):
@@ -139,7 +140,7 @@ else:
     CacheTierConfig = Union[GpuCacheTierConfig, HostCacheTierConfig, DiskCacheTierConfig]
     CudaStream = int
     DataRole = str
-    HalfOpenRange = tuple
+    HalfOpenRange = getattr(_cpp, "HalfOpenRange", tuple)
     LayerGroupId = int
     LayerId = int
     LifeCycleId = int
@@ -153,7 +154,26 @@ else:
     DEFAULT_BEAM_INDEX = 0
     GPU_LEVEL = 0
     NDEBUG = os.environ.get("TLLM_KV_CACHE_MANAGER_V2_DEBUG", "") == ""
-    rawref = None
+
+    class _RawRef:
+        def __init__(self, obj=None):
+            self._obj = obj
+
+        def __call__(self):
+            return self._obj
+
+        def invalidate(self) -> None:
+            self._obj = None
+
+        @classmethod
+        def __class_getitem__(cls, _item):
+            return cls
+
+    rawref = ModuleType(f"{__name__}.rawref")
+    rawref.ReferenceType = _RawRef
+    rawref.ref = _RawRef
+    rawref.NULL = _RawRef()
+    sys.modules.setdefault(f"{__name__}.rawref", rawref)
 
     class PageIndexMode(int):
         SHARED = 0
@@ -170,6 +190,13 @@ else:
             else TokenId(id_offset + token_offset + i)
             for i in range(num_tokens)
         ]
+
+    def exact_div(x: int, y: int) -> int:
+        assert x % y == 0
+        return x // y
+
+    def typed_range(*args: int) -> range:
+        return range(*args)
 
 
 __all__ = [
@@ -216,6 +243,8 @@ __all__ = [
     "TokenId",
     "TokenIdExt",
     "_KVCache",
+    "exact_div",
     "gen_multimodal_cache_key_tokens",
     "rawref",
+    "typed_range",
 ]
