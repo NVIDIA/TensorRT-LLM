@@ -72,15 +72,44 @@ _QWEN_PLACEHOLDERS = {
 _QWEN3VL_PLAN_MODALITIES = ("image", "video")
 
 
-def _qwen3vl_extract_items(param_idx: int, param):
+_QWEN3VL_GRID_KEY = {"image": "image_grid_thw", "video": "video_grid_thw"}
+
+
+def _qwen3vl_grid_token_count(grid_thw, spatial_merge_size: int) -> int:
+    """Post-merge token count for a Qwen3VL grid tensor.
+
+    A modality payload can carry MULTIPLE sub-items (e.g. a request with two
+    images): `image_grid_thw` is then `[N, 3]` and the visual encoder emits the
+    summed post-merge rows across all `N` sub-grids. The per-grid post-merge
+    count is `t * (h // merge) * (w // merge)`, matching `get_num_tokens_per_video`
+    and the visual encoder's merger output. Returns the sum over all sub-grids so
+    the single aggregate `ModalityItem` sizes its encoder rows AND its scatter
+    destination to cover every sub-item (not just the first).
+    """
+    grid = torch.as_tensor(grid_thw)
+    if grid.ndim == 1:
+        grid = grid.reshape(1, 3)
+    m = int(spatial_merge_size)
+    return sum(int(t) * (int(h) // m) * (int(w) // m) for t, h, w in grid.tolist())
+
+
+def _qwen3vl_extract_items(param_idx: int, param, spatial_merge_size: Optional[int] = None):
     """Yield MultimodalItems for one Qwen3VL MultimodalParams.
 
-    Qwen3VL has only image and video modalities; no audio, no ghost items.
+    Qwen3VL has only image and video modalities; no audio, no ghost items. The
+    extractor yields ONE aggregate item per present modality whose payload may
+    cover several sub-items (e.g. multiple images); its `token_count` must be the
+    TOTAL post-merge rows across all sub-items so the assembly's encoder-output
+    check and scatter cover the whole encoder output (a per-sub-item undercount
+    silently drops trailing sub-items' embeddings in `assemble_embeddings`).
+
     Token counts come from:
       1. payload["num_tokens"] if present (test convention / explicit).
-      2. multimodal_data["multimodal_embedding_lengths"] indexed by
-         multimodal_data["multimodal_item_order"] position (mixed params).
-      3. param.multimodal_runtime.total_embeds_in_request (pure single-modality).
+      2. grid-derived total from `*_grid_thw` + `spatial_merge_size` (the
+         encoder-accurate count; correct for multi-sub-item payloads).
+      3. multimodal_data["multimodal_embedding_lengths"] indexed by
+         multimodal_data["multimodal_item_order"] position (single sub-item).
+      4. param.multimodal_runtime.total_embeds_in_request (pure single-modality).
     """
     multimodal_data = param.multimodal_data or {}
     modality_types = [m for m in _QWEN3VL_PLAN_MODALITIES if multimodal_data.get(m) is not None]
@@ -103,7 +132,9 @@ def _qwen3vl_extract_items(param_idx: int, param):
     for modality in modality_types:
         payload = multimodal_data[modality]
         pos = order_pos.get((modality, 0), 0)
-        token_count = _qwen3vl_payload_token_count(payload, pos, embedding_lengths, param)
+        token_count = _qwen3vl_payload_token_count(
+            payload, pos, embedding_lengths, param, modality, spatial_merge_size
+        )
         yield ModalityItem(
             src_param_idx=param_idx,
             item_idx_in_param=pos,
@@ -113,10 +144,29 @@ def _qwen3vl_extract_items(param_idx: int, param):
         )
 
 
-def _qwen3vl_payload_token_count(payload, pos, embedding_lengths, param):
-    """Token-count fallback chain for a Qwen3VL modality payload."""
+def _qwen3vl_payload_token_count(
+    payload, pos, embedding_lengths, param, modality=None, spatial_merge_size=None
+):
+    """Token-count fallback chain for a Qwen3VL modality payload.
+
+    The grid-derived total (when `spatial_merge_size` is known and the payload
+    carries `*_grid_thw`) is preferred over `multimodal_embedding_lengths[pos]`:
+    a payload may aggregate multiple sub-items, but `embedding_lengths[pos]` is
+    the post-merge count of only the FIRST sub-item, which undercounts the
+    encoder output for multi-image / multi-clip requests. The grid sum matches
+    the encoder's row count exactly. For a single sub-item the two agree, so this
+    is a no-op for single-image / single-video / mixed (one item per modality)
+    requests.
+    """
     if "num_tokens" in payload:
         return int(payload["num_tokens"])
+    grid_key = _QWEN3VL_GRID_KEY.get(modality)
+    if (
+        spatial_merge_size is not None
+        and grid_key is not None
+        and payload.get(grid_key) is not None
+    ):
+        return _qwen3vl_grid_token_count(payload[grid_key], spatial_merge_size)
     if embedding_lengths is not None and pos < len(embedding_lengths):
         return int(embedding_lengths[pos])
     runtime = getattr(param, "multimodal_runtime", None)
@@ -1104,9 +1154,15 @@ class Qwen3VisionModelBase(nn.Module):
     def forward(self, multimodal_params: List[MultimodalParams]) -> List[torch.Tensor]:
         if not multimodal_params:
             return []
+        # Thread `spatial_merge_size` so the extractor can size aggregate
+        # (multi-sub-item) image/video payloads to their full post-merge row
+        # count via the grid, matching the visual encoder's output.
+        spatial_merge_size = self.config.spatial_merge_size
         assembly = MixedModalityAssembly.from_params(
             multimodal_params=multimodal_params,
-            extract=_qwen3vl_extract_items,
+            extract=lambda param_idx, param: _qwen3vl_extract_items(
+                param_idx, param, spatial_merge_size=spatial_merge_size
+            ),
         )
         if assembly.total_tokens == 0:
             return []
