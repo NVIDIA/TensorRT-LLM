@@ -17,6 +17,7 @@ import copy
 import hashlib
 import json
 import logging
+import os
 import random
 import re
 from io import BytesIO
@@ -144,6 +145,7 @@ class MixedModalityEvaluator(Evaluator):
         num_samples: Optional[int] = None,
         random_seed: int = 0,
         num_frames: int = DEFAULT_NUM_FRAMES,
+        extract_video_audio: bool = False,
         pure_baseline_max_accuracy_drop: float = 5.0,
         pure_baseline_max_per_target_accuracy_drop: float = 10.0,
         chat_template_kwargs: Optional[dict[str, Any]] = None,
@@ -165,6 +167,18 @@ class MixedModalityEvaluator(Evaluator):
         self.num_samples = num_samples
         self.random_seed = random_seed
         self.num_frames = num_frames
+        # When True, the video loader extracts each video's embedded audio track
+        # (load_video(..., extract_audio=True)) so the video item rides into the
+        # model as a video carrying audio. This exercises the Nano post-encode
+        # video-audio interleave path (multimodal_data["video"]["audio"] +
+        # ghost-audio item) when video is mixed with other modalities. Requires
+        # PyAV at runtime (TRTLLM_ENABLE_PYAV=1); see _materialize_media.
+        self.extract_video_audio = extract_video_audio
+        if self.extract_video_audio:
+            # Media (incl. audio extraction) is materialized in this process
+            # before each request is submitted, so enabling the PyAV gate here is
+            # sufficient. extract_audio_from_video reads this env var at call time.
+            os.environ.setdefault("TRTLLM_ENABLE_PYAV", "1")
         self.pure_baseline_max_accuracy_drop = pure_baseline_max_accuracy_drop
         self.pure_baseline_max_per_target_accuracy_drop = pure_baseline_max_per_target_accuracy_drop
 
@@ -353,7 +367,13 @@ class MixedModalityEvaluator(Evaluator):
         media = []
         content_parts: list[Any] = []
         for media_index, (modality, item) in enumerate(sample.items.items()):
-            media_data = _materialize_media(modality, item.media, video_cache, self.num_frames)
+            media_data = _materialize_media(
+                modality,
+                item.media,
+                video_cache,
+                self.num_frames,
+                extract_video_audio=self.extract_video_audio,
+            )
             media.append(MultimodalData(modality=modality, data=media_data, is_embedding=False))
             content_parts.append({"type": modality, "media_index": media_index})
         content_parts.append(prompt_text)
@@ -662,8 +682,17 @@ def _materialize_media(
     media: Any,
     video_cache: dict[str, Any],
     num_frames: int,
+    extract_video_audio: bool = False,
 ) -> Any:
-    """Load or normalize media payloads just before request construction."""
+    """Load or normalize media payloads just before request construction.
+
+    When `extract_video_audio` is set, videos are loaded with
+    `extract_audio=True` so each `VideoData` carries its embedded audio track.
+    Fed into the model as a `MultimodalData(modality="video", ...)`, this drives
+    the Nano video-audio interleave path. Audio extraction needs PyAV, which is
+    lazily imported and gated behind `TRTLLM_ENABLE_PYAV=1`; callers that enable
+    this flag must set that env var (the loader raises otherwise).
+    """
     if modality == MODALITY_IMAGE:
         return _materialize_image(media)
     if modality == MODALITY_AUDIO:
@@ -674,10 +703,15 @@ def _materialize_media(
         from tensorrt_llm.inputs import load_video
 
         video_path = str(media)
-        video = video_cache.get(video_path)
+        cache_key = (video_path, extract_video_audio)
+        video = video_cache.get(cache_key)
         if video is None:
-            video = load_video(video_path, num_frames=num_frames)
-            video_cache[video_path] = video
+            video = load_video(
+                video_path,
+                num_frames=num_frames,
+                extract_audio=extract_video_audio,
+            )
+            video_cache[cache_key] = video
         return video
     raise ValueError(f"Unsupported mixed modality media: {modality!r}.")
 

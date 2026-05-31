@@ -25,7 +25,14 @@ from ..conftest import (
     skip_pre_blackwell,
     skip_pre_hopper,
 )
-from .accuracy_core import MMMU, LlmapiAccuracyTestHarness, MixedModality, VideoMME, VoxPopuli
+from .accuracy_core import (
+    MMMU,
+    LlmapiAccuracyTestHarness,
+    MixedModality,
+    MixedModalityVideoAudio,
+    VideoMME,
+    VoxPopuli,
+)
 
 
 class TestQwen2_VL_7B(LlmapiAccuracyTestHarness):
@@ -614,6 +621,20 @@ class TestNanoV3Omni(LlmapiAccuracyTestHarness):
         mixed_modality_sampling_params,
         no_thinking_evaluator_kwargs,
     )
+    # Image mixed with an audio-bearing video (video's embedded audio track is
+    # extracted), exercising the Nano post-encode video-audio interleave +
+    # ghost-audio plan path end-to-end. Gated against the pure baseline.
+    video_audio_mixed_modality_sampling_params = SamplingParams(
+        max_tokens=MixedModalityVideoAudio.MAX_OUTPUT_LEN,
+        truncate_prompt_tokens=MixedModalityVideoAudio.MAX_INPUT_LEN,
+        temperature=0.0,
+        top_k=1,
+    )
+    VIDEO_AUDIO_MIXED_MODALITY_TASK_SPEC = (
+        MixedModalityVideoAudio,
+        video_audio_mixed_modality_sampling_params,
+        no_thinking_evaluator_kwargs,
+    )
 
     @pytest.mark.skip_less_device_memory(80000)
     @pytest.mark.parametrize(
@@ -632,6 +653,7 @@ class TestNanoV3Omni(LlmapiAccuracyTestHarness):
                 (
                     MMMU_TASK_SPEC,
                     MIXED_MODALITY_TASK_SPEC,
+                    VIDEO_AUDIO_MIXED_MODALITY_TASK_SPEC,
                 ),
                 id="bf16",
             ),
@@ -688,7 +710,11 @@ class TestNanoV3Omni(LlmapiAccuracyTestHarness):
         expected_quant_algo: QuantAlgo | None,
         task_specs: tuple[
             tuple[
-                type[MMMU] | type[VoxPopuli] | type[VideoMME] | type[MixedModality],
+                type[MMMU]
+                | type[VoxPopuli]
+                | type[VideoMME]
+                | type[MixedModality]
+                | type[MixedModalityVideoAudio],
                 SamplingParams,
                 dict[str, object],
             ],

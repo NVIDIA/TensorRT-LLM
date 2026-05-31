@@ -345,6 +345,54 @@ class MixedModality(AccuracyTask):
     }
 
 
+class MixedModalityVideoAudio(AccuracyTask):
+    """One-request image + audio-in-video accuracy task for Nemotron Nano Omni.
+
+    Like `MixedModality`, but the video items are loaded with their embedded
+    audio track extracted (`extract_video_audio=True`), so each request mixes an
+    image with a video that carries audio. This drives the Nano post-encode
+    video-audio interleave path (`multimodal_data["video"]["audio"]` + the
+    ghost-audio item in the flat-item plan) end-to-end, which the standalone
+    image/audio/video `MixedModality` task never exercises. The mixed-vs-pure
+    gate is inherited from `MixedModalityEvaluator`.
+
+    NOTE: audio extraction needs PyAV (the evaluator sets `TRTLLM_ENABLE_PYAV=1`
+    when `extract_video_audio` is enabled); the container must have `av`
+    installed. The VideoMME short-v1 clips all carry AAC audio tracks.
+    """
+
+    DATASET = "mixed_modality_video_audio_omni"
+    MMMU_DATASET_DIR = f"{llm_models_root()}/datasets/MMMU"
+    VIDEOMME_DATASET_DIR = f"{llm_models_root()}/datasets/lmms-lab__Video-MME-short-v1"
+
+    ALPHA = 0.05
+    BETA = 0.2
+    SIGMA = 50.0
+    NUM_SAMPLES = int(
+        os.getenv(
+            "TRTLLM_VIDEO_AUDIO_MIXED_MOD_NUM_SAMPLES",
+            os.getenv("TRTLLM_MIXED_MOD_NUM_SAMPLES", "50"),
+        ))
+
+    MAX_BATCH_SIZE = 64
+    MAX_INPUT_LEN = 32768
+    MAX_OUTPUT_LEN = 256
+
+    EVALUATOR_CLS = MixedModalityEvaluator
+    EVALUATOR_KWARGS = {
+        "modality_dataset_paths": {
+            MODALITY_IMAGE: MMMU_DATASET_DIR,
+            MODALITY_VIDEO: VIDEOMME_DATASET_DIR,
+        },
+        "active_modalities": (MODALITY_IMAGE, MODALITY_VIDEO),
+        "extract_video_audio": True,
+        "random_seed": 0,
+        "num_frames": 8,
+        "pure_baseline_max_accuracy_drop": 5.0,
+        "pure_baseline_max_per_target_accuracy_drop": 10.0,
+    }
+
+
 class QwenVLMixedModality(AccuracyTask):
     """One-request image+video accuracy task for Qwen-VL-style models."""
 
