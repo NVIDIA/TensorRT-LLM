@@ -14,6 +14,14 @@ cuda_graph_config:
   max_batch_size: 256
   batch_sizes: [1, 2, 4, 8, 16, 32, 64, 80, 96, 112, 128, 192, 208, 224, 240, 256]
 transforms:
+  apply_sharding_hints:
+    # YAML-driven TP plan: simple-shard the MLA latent down-projections (q_a / kv_a). They sit
+    # before the head-parallel TP region (no head dim to shard) and feed a layernorm over the full
+    # latent, so colwise + all_gather is used instead of replication. This matches the pre-sharding-IR
+    # behavior and, for the misaligned FP8 shards, keeps them on the kernel BF16 fallback.
+    tp_mode_overrides:
+      "*q_a_proj*": simple_shard
+      "*kv_a_proj_with_mqa*": simple_shard
   fuse_gemms_mixed_children:
     enabled: false
   mlir_elementwise_fusion:
