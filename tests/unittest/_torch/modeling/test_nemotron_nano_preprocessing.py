@@ -21,6 +21,7 @@ from tensorrt_llm._torch.models.modeling_nemotron_nano import (
     NanoV2VLVisionEncoder,
     NemotronH_Nano_VL_V2,
     _compute_aspect_preserving_size,
+    _nano_extract_items,
     get_video_target_size_and_feature_size,
     video_to_pixel_values,
 )
@@ -2290,3 +2291,138 @@ class TestFastPathVideoWithExtractedAudio:
         }
         actual_mm = sum(1 for t in expanded if t in mm_token_ids)
         assert actual_mm == declared
+
+
+@pytest.mark.skipif(not importlib.util.find_spec("librosa"), reason="librosa not installed")
+# `torch.compile` (used inside audio feature extraction) spins up a thread pool;
+# disable the leak check as the existing audio tests do (see TestAudioInputProcessor).
+@pytest.mark.threadleak(enabled=False)
+class TestVideoWithEmbeddedAudioProducesPlanItems:
+    """End-to-end-light guard for the audio-in-video plan path.
+
+    The e2e accuracy harness mixes an image with a video whose embedded audio
+    track is extracted (`load_video(..., extract_audio=True)` yields a
+    `VideoData` carrying an `AudioData`). This guard wires the REAL Nano input
+    processor (heavy deps mocked, but the audio extractor real) to assert two
+    contracts the heavyweight gate depends on, without needing model weights or
+    a GPU:
+
+    1. Feeding a video-with-audio through `_prepare_video_modality_data`
+       populates ``multimodal_data["video"]["audio"]`` with real audio encoder
+       features (`input_audio_features`, `feature_attention_mask`, `has_audio`).
+       This is the structure `_nano_extract_items` / `_nano_post_encode` consume.
+    2. `_nano_extract_items` over a param carrying that production-shaped video
+       payload yields the real video item PLUS a trailing ghost audio item
+       (``item_idx_in_param == -1``), with the video's encoder rows and the ghost
+       row count derived from production fields (no test-only ``num_tokens``).
+    """
+
+    @staticmethod
+    def _make_proc():
+        # Configure video_target_num_patches so _process_videos_frames uses the
+        # real video_to_pixel_values path (the HF image-processor fallback is a
+        # Mock here and is not subscriptable).
+        proc = _make_fast_path_audio_processor(max_num_patches=256, min_num_patches=4)
+        proc._add_video_prefix = False
+        proc.video_pruning_rate = 0
+        proc.video_temporal_patch_size = 1
+        proc.video_target_num_patches = 256
+        proc.video_maintain_aspect_ratio = True
+        return proc
+
+    @staticmethod
+    def _video_with_audio(num_frames=2, num_audio_samples=16000):
+        frames = [Image.new("RGB", (512, 512)) for _ in range(num_frames)]
+        metadata = {
+            "total_num_frames": num_frames,
+            "fps": 30.0,
+            "duration": num_frames / 30.0,
+            "frames_indices": list(range(num_frames)),
+        }
+        audio = AudioData(
+            samples=np.random.randn(num_audio_samples).astype(np.float32),
+            sample_rate=16000,
+        )
+        return SimpleNamespace(frames=frames, metadata=metadata, audio=audio)
+
+    def test_prepare_video_modality_data_populates_embedded_audio(self):
+        proc = self._make_proc()
+        video = self._video_with_audio()
+
+        modality_data = proc._prepare_video_modality_data([video])
+
+        # Vision side present.
+        assert "pixel_values" in modality_data
+        assert "video_size" in modality_data
+        # Embedded audio attached under the video payload (the structure the
+        # flat-item plan's ghost-audio path keys off).
+        assert "audio" in modality_data, "embedded video audio was not attached"
+        audio_payload = modality_data["audio"]
+        assert {"input_audio_features", "feature_attention_mask"} <= audio_payload.keys()
+        # has_audio marks which of the videos carried a track (here: the one).
+        assert audio_payload["has_audio"] == [True]
+
+    def test_no_embedded_audio_when_video_has_none(self):
+        proc = self._make_proc()
+        video = self._video_with_audio()
+        video.audio = None
+
+        modality_data = proc._prepare_video_modality_data([video])
+
+        # No phantom audio payload when the video carries no track.
+        assert "audio" not in modality_data
+
+    def test_extractor_yields_video_plus_ghost_from_production_payload(self):
+        proc = self._make_proc()
+        video = self._video_with_audio()
+
+        modality_data = proc._prepare_video_modality_data([video])
+        audio_payload = modality_data["audio"]
+
+        # Production-shaped pure-video param: no per-payload ``num_tokens``.
+        # At encode time the model resolves the audio rows from the sub-sampled
+        # ``feature_attention_mask`` (see ``_audio_payload_total_rows``). Here we
+        # only need a positive, self-consistent ghost row count to drive the
+        # extractor's vision/audio split arithmetic, so derive one from the
+        # mask's valid lengths and the extractor's sub-sampling factor.
+        mask = audio_payload["feature_attention_mask"]
+        valid_lengths = mask.sum(dim=-1).to(torch.int64)
+        subsample = int(proc._audio_extractor.config.subsampling_factor)
+
+        def audio_rows_fn(_payload):
+            return int((valid_lengths // subsample).clamp(min=1).sum().item())
+
+        audio_rows = audio_rows_fn(audio_payload)
+        assert audio_rows > 0
+
+        # Pick a vision row count and make total_embeds_in_request the
+        # POST-interleave total (vision + audio), as the production prompt
+        # placeholder budget does (get_num_tokens_per_video(video_audio=...)).
+        vision_rows = 6
+        total_embeds = vision_rows + audio_rows
+        runtime = MultimodalRuntimeData(
+            past_seen_token_num=0,
+            chunk_end_pos=total_embeds,
+            embed_mask_cumsum=torch.arange(1, total_embeds + 1, dtype=torch.int64),
+        )
+        param = MultimodalParams(
+            multimodal_input=None,
+            multimodal_data={"video": modality_data, "modality_type": "video"},
+            multimodal_runtime=runtime,
+        )
+
+        items = list(_nano_extract_items(0, param, audio_rows_fn=audio_rows_fn))
+
+        assert len(items) == 2, "expected a video item + a ghost audio item"
+        video_item, ghost = items
+        assert video_item.modality == "video"
+        assert video_item.item_idx_in_param == 0
+        # Scatter destination spans vision + interleaved audio (post-interleave).
+        assert video_item.token_count == total_embeds
+        # Vision encoder emits only the vision rows.
+        assert video_item.encoder_rows == vision_rows
+        # Trailing ghost audio item with the production-derived row count.
+        assert ghost.modality == "audio"
+        assert ghost.item_idx_in_param == -1
+        assert ghost.token_count == audio_rows
+        assert ghost.metadata.get("paired_video_item_idx") == 0
