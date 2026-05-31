@@ -62,7 +62,7 @@ class TestNanoExtractItems:
     ``multimodal_item_order`` + ``multimodal_embedding_lengths`` in
     prompt order; the extractor prefers those when present so that
     ``item_idx_in_param`` and ``token_count`` match the canonical
-    prompt-order projection used by ``MultimodalPromptOrder.split_embeddings``.
+    prompt-order projection (`MultimodalPromptOrder.flatten`).
     """
 
     def test_pure_image(self):
@@ -935,56 +935,3 @@ class TestNanoPostEncode:
         video_slice = final[image_rows:]
         assert torch.equal(video_slice[:pruned_vision_rows], video_vision_emb)
         assert torch.equal(video_slice[pruned_vision_rows:], audio_emb)
-
-    def test_resolve_payload_token_counts_mixed_video_evs_pruned_slot(self):
-        """Sibling extractor assertion: the production-fields resolver maps the
-        EVS-PRUNED video slot to its post-interleave length, and the extractor
-        splits it into vision-only `encoder_rows` (= pruned vision) + a ghost
-        audio item.
-
-        This pins the extractor<->encoder count agreement for the EVS case:
-        with the video slot's `multimodal_embedding_lengths` set to the pruned
-        post-interleave count (pruned-vision 6 + audio 4 = 10), the video item's
-        `encoder_rows` must be the pruned vision count (6) — exactly what the
-        EVS-active vision encoder emits — so the `assemble_embeddings` bucket
-        assertion does not fire.
-        """
-        pruned_vision_rows = compute_retained_tokens_from_tubelet_budget(2, 6, 0.5)
-        assert pruned_vision_rows == 6
-        audio_rows = 4
-        post_interleave_video = pruned_vision_rows + audio_rows  # 10
-
-        audio_payload = {"input_audio_features": "fake", "feature_attention_mask": "fake"}
-        image_payload = {"pixel_values": "img"}
-        video_payload = {"pixel_values": "vid", "video_size": [], "audio": audio_payload}
-        multimodal_data = {
-            "image": image_payload,
-            "video": video_payload,
-            "modality_type": ["image", "video"],
-            "multimodal_item_order": [
-                {"modality": "image", "index": 0},
-                {"modality": "video", "index": 0},
-            ],
-            "multimodal_embedding_lengths": [5, post_interleave_video],
-        }
-        param = _make_param(multimodal_data)
-
-        # Production resolver maps each prompt slot to its embedding length.
-        from tensorrt_llm._torch.models.modeling_nemotron_nano import (
-            _nano_resolve_payload_token_counts,
-        )
-
-        counts = _nano_resolve_payload_token_counts(param)
-        assert counts[("image", 0)] == 5
-        assert counts[("video", 0)] == post_interleave_video  # 10, post-interleave
-
-        items = list(_nano_extract_items(0, param, audio_rows_fn=lambda _ap: audio_rows))
-        by_mod = {it.modality: it for it in items if it.item_idx_in_param != -1}
-        # Video scatter destination is the pruned post-interleave count (10),
-        # but the encoder only emits the pruned vision rows (6).
-        assert by_mod["video"].token_count == post_interleave_video
-        assert by_mod["video"].encoder_rows == pruned_vision_rows  # 10 - 4 = 6
-        assert by_mod["image"].encoder_rows == 5
-        ghost = [it for it in items if it.item_idx_in_param == -1][0]
-        assert ghost.modality == "audio"
-        assert ghost.token_count == audio_rows

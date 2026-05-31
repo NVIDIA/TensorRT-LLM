@@ -274,23 +274,6 @@ class MultimodalInput:
             torch.tensor(self.multimodal_lengths, dtype=torch.int32))
 
 
-def add_multimodal_run_metadata(
-        multimodal_data: Dict[str, Any],
-        multimodal_input: MultimodalInput) -> Dict[str, Any]:
-    """Return multimodal data with optional per-item run metadata attached."""
-    if multimodal_input.multimodal_item_run_cu_offsets is None:
-        return multimodal_data
-
-    multimodal_data = dict(multimodal_data)
-    multimodal_data["multimodal_item_run_cu_offsets"] = (
-        multimodal_input.multimodal_item_run_cu_offsets)
-    multimodal_data[
-        "multimodal_run_positions"] = multimodal_input.multimodal_run_positions
-    multimodal_data[
-        "multimodal_run_lengths"] = multimodal_input.multimodal_run_lengths
-    return multimodal_data
-
-
 _SUPPORTED_HASHING_MODALITIES = ("image", "video", "audio")
 
 
@@ -328,9 +311,9 @@ class MultimodalPromptOrder(list):  # list[tuple[str, int]]
 
     A request can carry multiple modalities and multiple items per modality,
     but the executor needs them in a single prompt-order stream. This type
-    carries that ordering and the projections (flatten / flatten_uuids /
-    split_embeddings) that reorder per-modality collections (token lengths,
-    UUIDs, encoder outputs) into prompt order.
+    carries that ordering and the projections (flatten / flatten_uuids)
+    that reorder per-modality collections (token lengths, UUIDs) into
+    prompt order.
 
     Named for its discriminator 'prompt': this subsystem has three distinct
     orders (prompt, modality-grouped encode, per-request cache), and this is
@@ -497,48 +480,6 @@ class MultimodalPromptOrder(list):  # list[tuple[str, int]]
                 modality_uuids = [modality_uuids]
             ordered_uuids.append(modality_uuids[idx])
         return ordered_uuids
-
-    def split_embeddings(
-        self,
-        encoded_by_modality: Dict[str, "torch.Tensor"],
-        embedding_lengths: List[int],
-    ) -> List["torch.Tensor"]:
-        """Split modality-bucketed embeddings and return chunks in prompt order.
-
-        Encoders usually return one tensor per modality bucket. The executor
-        expects a single request-ordered embedding stream, so per-item lengths
-        are used to split each bucket and reassemble chunks according to this
-        item order.
-        """
-        if len(self) != len(embedding_lengths):
-            raise ValueError(
-                "multimodal_item_order and multimodal_embedding_lengths lengths "
-                f"differ: {len(self)} != {len(embedding_lengths)}.")
-        item_lengths = {
-            item: int(embedding_length)
-            for item, embedding_length in zip(
-                self, embedding_lengths, strict=True)
-        }
-        chunks_by_item: Dict[Tuple[str, int], torch.Tensor] = {}
-        for modality, encoded in encoded_by_modality.items():
-            modality_items = [item for item in self if item[0] == modality]
-            if not modality_items:
-                continue
-            modality_lengths = [item_lengths[item] for item in modality_items]
-            expected = sum(modality_lengths)
-            if encoded.shape[0] != expected:
-                raise ValueError(
-                    f"{modality} embedding length mismatch: encoder produced "
-                    f"{encoded.shape[0]} rows, metadata expects {expected}.")
-            for item, chunk in zip(modality_items,
-                                   encoded.split(modality_lengths),
-                                   strict=True):
-                chunks_by_item[item] = chunk
-        missing_items = [item for item in self if item not in chunks_by_item]
-        if missing_items:
-            raise ValueError(
-                f"Missing encoded multimodal chunks for {missing_items}.")
-        return [chunks_by_item[item] for item in self]
 
 
 @dataclass

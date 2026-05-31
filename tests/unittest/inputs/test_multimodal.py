@@ -7,14 +7,12 @@ import pytest
 import torch
 
 from tensorrt_llm.inputs.multimodal import (
-    MultimodalInput,
     MultimodalPromptOrder,
     MultimodalRuntimeData,
     _compute_mm_masks,
     _find_mm_embedding_lengths_from_masks,
     _find_mm_token_runs_from_mask,
     _find_mm_token_start_pos_from_masks,
-    add_multimodal_run_metadata,
 )
 from tensorrt_llm.inputs.registry import maybe_compute_mm_embed_cumsum
 
@@ -44,26 +42,6 @@ def test_maybe_compute_mm_embed_cumsum_populates_py_multimodal_data():
         rtol=0,
         atol=0,
     )
-
-
-def test_add_multimodal_run_metadata_preserves_item_runs_in_py_data():
-    mm_input = MultimodalInput.from_components(
-        [[1, 2, 3, 4, 5, 6, 7, 8]],
-        [2],
-        [4],
-        mm_item_run_cu_offsets=[0, 1],
-        mm_run_positions=[2],
-        mm_run_lengths=[4],
-    )
-
-    multimodal_data = add_multimodal_run_metadata({"image": {}}, mm_input)
-
-    assert multimodal_data == {
-        "image": {},
-        "multimodal_item_run_cu_offsets": [0, 1],
-        "multimodal_run_positions": [2],
-        "multimodal_run_lengths": [4],
-    }
 
 
 class TestMultimodalPromptOrder:
@@ -99,6 +77,13 @@ class TestMultimodalPromptOrder:
     def test_from_raw_entries_tuple_form(self):
         result = MultimodalPromptOrder.from_raw_entries([("image", 0), ("video", 2)], source="x")
         assert list(result) == [("image", 0), ("video", 2)]
+
+    def test_from_raw_entries_layout_item_types_form(self):
+        # int codes via layout_metadata.item_types decode to (modality, index)
+        result = MultimodalPromptOrder.from_raw_entries(
+            [0, 1, 2], source="layout_metadata.item_types"
+        )
+        assert list(result) == [("image", 0), ("video", 0), ("audio", 0)]
 
     def test_from_raw_entries_rejects_unsupported_types(self):
         # float is none of dict/str/int-with-item_types/2-tuple
@@ -232,29 +217,6 @@ class TestMultimodalPromptOrder:
     def test_flatten_uuids_handles_missing_modality(self):
         result = MultimodalPromptOrder([("image", 0), ("video", 0)]).flatten_uuids({"image": ["a"]})
         assert result == ["a", None]
-
-    def test_split_embeddings_raises_on_length_mismatch(self):
-        with pytest.raises(ValueError, match="differ"):
-            MultimodalPromptOrder([("image", 0)]).split_embeddings(
-                {"image": torch.tensor([[1]])}, [1, 2]
-            )
-
-    def test_split_embeddings_raises_on_missing_chunks(self):
-        # video key is absent from encoded_by_modality
-        with pytest.raises(ValueError, match="Missing"):
-            MultimodalPromptOrder([("image", 0), ("video", 0)]).split_embeddings(
-                {"image": torch.tensor([[1]])}, [1, 1]
-            )
-
-    def test_split_embeddings_reorders_bucketed_outputs(self):
-        encoded = {
-            "image": torch.tensor([[1], [2], [3]]),
-            "video": torch.tensor([[10], [11]]),
-        }
-        chunks = MultimodalPromptOrder([("image", 0), ("video", 0), ("image", 1)]).split_embeddings(
-            encoded, [1, 2, 2]
-        )
-        assert [c.flatten().tolist() for c in chunks] == [[1], [10, 11], [2, 3]]
 
 
 def test_mixed_image_video_audio_masks_runs_embedding_lengths():

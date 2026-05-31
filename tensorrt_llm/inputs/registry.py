@@ -37,8 +37,8 @@ ExtraProcessedInputs = Dict[str, Any]
 
 
 class InputProcessor(Protocol):
-    """Protocol for InputProcessor classes.
-
+    """
+    Protocol for InputProcessor classes.
     InputProcessor's functions are more relevant to multimodal use cases:
         - Preprocess: extra steps to manipulate the prompts.
         - Forward: the main logic to process the inputs. In multimodal cases, this may run a multimodal encoder model.
@@ -129,10 +129,9 @@ class DefaultInputProcessor(InputProcessor):
 
 
 class BaseMultimodalInputProcessor(ABC):
-    """Base class for multimodal input processors with default implementations.
-
-    Provides default `get_num_tokens_per_image` and
-    `get_num_tokens_per_video` methods.
+    """
+    Base class for multimodal input processors with default implementations
+    of get_num_tokens_per_image and get_num_tokens_per_video methods.
 
     This class provides default implementations that work with most AutoProcessor-based
     models. Specific processors can override these methods if they need custom logic.
@@ -394,15 +393,16 @@ class BaseMultimodalInputProcessor(ABC):
 
     @property
     def use_fast(self) -> bool:
-        """Whether to use fast tokenizer for AutoProcessor.
-
+        """
+        Whether to use fast tokenizer for AutoProcessor.
         Default is True for most multimodal models.
         """
         return self._use_fast
 
     @property
     def multimodal_hashing_supported(self) -> Optional[bool]:
-        """Whether multimodal hashing is supported for this processor.
+        """
+        Whether multimodal hashing is supported for this processor.
 
         Returns None if unknown (will be detected at runtime),
         True if supported, False if not supported.
@@ -494,7 +494,9 @@ class BaseMultimodalInputProcessor(ABC):
 
     @property
     def get_num_multimodal_tokens(self):
-        """Get the Hugging Face processor's '_get_num_multimodal_tokens' method."""
+        """
+        Get the Hugging Face processor's '_get_num_multimodal_tokens' method.
+        """
         if hasattr(self.processor, '_get_num_multimodal_tokens'):
             return self.processor._get_num_multimodal_tokens
         else:
@@ -509,7 +511,8 @@ class BaseMultimodalInputProcessor(ABC):
         image: Union[Image.Image, torch.Tensor],
         **kwargs,
     ):
-        """Calculate the number of tokens generated for an image.
+        """
+        Calculate the number of tokens generated for an image.
 
         This (default) method delegates to the Hugging Face processor's '_get_num_multimodal_tokens' method.
         Accepts either a PIL Image or a CHW `torch.Tensor` — the hashing path
@@ -537,7 +540,8 @@ class BaseMultimodalInputProcessor(ABC):
         video_audio: Optional[Any] = None,
         **kwargs,
     ):
-        """Calculate the number of tokens generated for a video.
+        """
+        Calculate the number of tokens generated for a video.
 
         This (default) method delegates to the Hugging Face processor's '_get_num_multimodal_tokens' method.
         Accepts a list of PIL Images or CHW `torch.Tensor` frames.
@@ -574,7 +578,9 @@ class BaseMultimodalInputProcessor(ABC):
 
 
 class BaseMultimodalDummyInputsBuilder(ABC):
-    """Base class for generating dummy inputs, especially for profiling."""
+    """
+    Base class for generating dummy inputs. Specially for profiling
+    """
 
     DEFAULT_IMAGE_MAX_DIM = 16384
     DEFAULT_IMAGE_MIN_DIM = 128
@@ -607,10 +613,8 @@ class BaseMultimodalDummyInputsBuilder(ABC):
         return image
 
     def get_dummy_prompt(self, input_seq_len: int):
-        # TODO(yechank): We use max resolution as the starting point and keep
-        # reducing it until the prompt length is below the input sequence length.
-        # Need a better way to calculate dummy prompt length; this iteration
-        # may not be efficient.
+        # TODO(yechank): We use the max resolution as starting point and keep reducing the resolution until the prompt length is less than the input sequence length.
+        # Need to find better way to calculate the dummy prompt length as this iteration may not be efficient.
 
         # Use the registered model_type from the decorator if available,
         # otherwise fall back to HuggingFace config's model_type.
@@ -651,10 +655,10 @@ class BaseMultimodalDummyInputsBuilder(ABC):
 
 
 class MultimodalPlaceholderPlacement(enum.Enum):
-    """The placement of the multimodal placeholder in the prompt.
-
-    - BEFORE_TEXT: the placeholders are placed before the text prompt.
-    - AFTER_TEXT: the placeholders are placed after the text prompt.
+    """
+    The placement of the multimodal placeholder in the prompt. Valid values are:
+        - BEFORE_TEXT: the placeholders are placed before the text prompt.
+        - AFTER_TEXT: the placeholders are placed after the text prompt.
     """
     INVALID = -1
     BEFORE_TEXT = 0
@@ -663,31 +667,31 @@ class MultimodalPlaceholderPlacement(enum.Enum):
 
 @dataclass(frozen=True)
 class MultimodalPlaceholderMetadata:
-    r"""Metadata for the multimodal placeholder.
-
-    - placeholder_map:
-        A mapping from modality to placeholder string.
-        Modality can be "image", "video", "audio", etc.
-    - placeholder_placement:
-        The placement of the placeholders, e.g. before or after the text prompt.
-        Only used when interleave_placeholders is False (the default).
-        Ignored when interleave_placeholders is True.
-    - placeholders_separator:
-        The separator between the placeholders, e.g. some models use "\n" to separate the placeholders.
-    - content_format:
-        Optional override for the content format expected by the chat template.
-        ContentFormat.OPENAI means the template handles multimodal content dicts natively.
-        ContentFormat.STRING means the template expects plain string content.
-        ContentFormat.PASSTHROUGH skips chat template rendering entirely.
-        None means auto-detect at runtime via Jinja AST analysis.
-    - interleave_placeholders:
-        When True and content_parts is available, placeholders are inserted
-        at the exact media positions within the text (interleaved).
-        In this mode, placeholder_placement is ignored - the position of
-        each placeholder is determined by where the media appears in the
-        user's message.
-        When False (default), placeholders are bulk-prepended or appended
-        according to placeholder_placement.
+    """
+    Metadata for the multimodal placeholder. It has 5 components:
+        - placeholder_map:
+            A mapping from modality to placeholder string.
+            Modality can be "image", "video", "audio", etc.
+        - placeholder_placement:
+            The placement of the placeholders, e.g. before or after the text prompt.
+            Only used when interleave_placeholders is False (the default).
+            Ignored when interleave_placeholders is True.
+        - placeholders_separator:
+            The separator between the placeholders, e.g. some models use "\n" to separate the placeholders.
+        - content_format:
+            Optional override for the content format expected by the chat template.
+            ContentFormat.OPENAI means the template handles multimodal content dicts natively.
+            ContentFormat.STRING means the template expects plain string content.
+            ContentFormat.PASSTHROUGH skips chat template rendering entirely.
+            None means auto-detect at runtime via Jinja AST analysis.
+        - interleave_placeholders:
+            When True and content_parts is available, placeholders are inserted
+            at the exact media positions within the text (interleaved).
+            In this mode, placeholder_placement is ignored - the position of
+            each placeholder is determined by where the media appears in the
+            user's message.
+            When False (default), placeholders are bulk-prepended or appended
+            according to placeholder_placement.
     """
     placeholder_map: Dict[str, str] = field(default_factory=dict)
     placeholder_placement: MultimodalPlaceholderPlacement = MultimodalPlaceholderPlacement.AFTER_TEXT
@@ -697,7 +701,9 @@ class MultimodalPlaceholderMetadata:
 
 
 class MultimodalPlaceholderRegistry:
-    """Registry for multimodal model placeholder information."""
+    """
+    Registry for the multimodal models to keep track of the placeholder information.
+    """
 
     def __init__(self) -> None:
         self._multimodal_placeholder_by_model_type: Dict[
@@ -812,7 +818,8 @@ INPUT_PROCESSOR_REGISTRY = InputProcessorRegistry()
 
 
 def support_multimodal_disaggregated(model_cls: Type[nn.Module]):
-    """Model-class decorator to declare support for multimodal disaggregated inputs.
+    """
+    Model-class decorator to declare support for multimodal disaggregated inputs.
 
     Apply this to a model class AFTER its input processor has been registered via
     @register_input_processor. The decorator will locate the processor class,
@@ -823,9 +830,8 @@ def support_multimodal_disaggregated(model_cls: Type[nn.Module]):
         model_cls)
     if processor_cls is None:
         raise RuntimeError(
-            f"No input processor registered for {model_cls.__name__}; ensure "
-            "@register_input_processor is applied closer to the class than "
-            "@supports_multimodal_disagg.")
+            f"No input processor registered for {model_cls.__name__}; ensure @register_input_processor is applied closer to the class than @supports_multimodal_disagg."
+        )
     if not issubclass(processor_cls, BaseMultimodalInputProcessor):
         raise TypeError(
             f"{processor_cls.__name__} must inherit from BaseMultimodalInputProcessor to support multimodal disagg"
@@ -833,8 +839,8 @@ def support_multimodal_disaggregated(model_cls: Type[nn.Module]):
     method = getattr(processor_cls, "get_prompt_token_ids", None)
     if method is None or not callable(method):
         raise TypeError(
-            f"{processor_cls.__name__} must implement a callable method "
-            "`get_prompt_token_ids` to support multimodal disagg")
+            f"{processor_cls.__name__} must implement a callable method `get_prompt_token_ids` to support multimodal disagg"
+        )
 
     setattr(processor_cls, "support_mm_disagg", True)
     setattr(model_cls, "support_mm_disagg", True)
@@ -845,9 +851,9 @@ def register_input_processor(
         processor_cls: Type[InputProcessor],
         model_type: str,
         placeholder_metadata: MultimodalPlaceholderMetadata = None):
-    """Register an input processor to a model class.
-
-    Note:
+    """
+    Register an input processor to a model class.
+    NOTE:
         1. Since this API is only used for multimodal models, we are checking
            the model type only for that.
         2. If this is used for other models in the future, this logic needs to be
@@ -1056,7 +1062,7 @@ def create_input_processor_with_hash(
     hash_lib=default_hasher,
 ) -> Callable[[TextPrompt, SamplingParams], Tuple[
         List[int], Optional[ExtraProcessedInputs]]]:
-    """Create a processor wrapper for hashing and multimodal chunk metadata.
+    """Creates a modified processor that applies additional logic like (hashing, find mm chunk positions) to the input processor
 
     Args:
         original_processor: The original input processor to wrap.
@@ -1069,7 +1075,8 @@ def create_input_processor_with_hash(
     def multimodal_hashing_process(
         inputs: TextPrompt, sampling_params: SamplingParams
     ) -> Tuple[List[int], Optional[ExtraProcessedInputs]]:
-        """Process multimodal hashing for media tokens if possible.
+        """
+        Process multimodal hashing for media tokens if possible.
 
         Delegates the raw `(token_ids, extra_processed_inputs)` production to
         the input processor's `__call__` (which itself dispatches between the
@@ -1098,8 +1105,10 @@ def create_input_processor_with_hash(
                              or {}).get("multimodal_data"),
         )
         # Raise (rather than returning ([], None)) so process_prompt_maybe_hash
-        # treats this as a failed hashing attempt and falls back to the basic
-        # input processor instead of forwarding an empty prompt downstream.
+        # treats this as a failed hashing attempt: it falls back to the basic
+        # input processor and caches multimodal_hashing_supported=False instead
+        # of marking hashing as supported and forwarding an empty prompt
+        # downstream.
         if not num_mm_tokens_by_key:
             raise ValueError(
                 "multimodal hashing could not determine multimodal token "
