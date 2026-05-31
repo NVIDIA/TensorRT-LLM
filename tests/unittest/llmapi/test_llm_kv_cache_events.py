@@ -320,6 +320,20 @@ def test_apply_mm_hashes_uuid_content_combined():
         "Different UUID + same content should produce different hashes"
 
 
+def _make_video(frames, audio_samples=None, sample_rate=16000, metadata=None):
+    """Build a VideoData from frames with optional audio and metadata.
+
+    Module-level helper shared by the mm-hash tests (lifted from the former
+    local closure in test_apply_mm_hashes_video_audio_affects_hash).
+    """
+    audio = None
+    if audio_samples is not None:
+        audio = AudioData(samples=audio_samples, sample_rate=sample_rate)
+    return VideoData(frames=frames,
+                     metadata={} if metadata is None else metadata,
+                     audio=audio)
+
+
 def test_apply_mm_hashes_video_audio_affects_hash():
     """VideoData hashes include extracted audio when it affects model inputs."""
     frames = [
@@ -330,31 +344,153 @@ def test_apply_mm_hashes_video_audio_affects_hash():
     audio_a_copy = audio_a.copy()
     audio_b = np.array([0.0, 0.25, -0.5, -1.0], dtype=np.float32)
 
-    def make_video(audio_samples=None, sample_rate=16000):
-        audio = None
-        if audio_samples is not None:
-            audio = AudioData(samples=audio_samples, sample_rate=sample_rate)
-        return VideoData(frames=frames, metadata={}, audio=audio)
-
-    hashes_a, _ = apply_mm_hashes({"video": [make_video(audio_a)]})
-    hashes_a_copy, _ = apply_mm_hashes({"video": [make_video(audio_a_copy)]})
-    hashes_b, _ = apply_mm_hashes({"video": [make_video(audio_b)]})
+    hashes_a, _ = apply_mm_hashes({"video": [_make_video(frames, audio_a)]})
+    hashes_a_copy, _ = apply_mm_hashes(
+        {"video": [_make_video(frames, audio_a_copy)]})
+    hashes_b, _ = apply_mm_hashes({"video": [_make_video(frames, audio_b)]})
     hashes_a_different_rate, _ = apply_mm_hashes(
-        {"video": [make_video(audio_a, sample_rate=8000)]})
-    hashes_no_audio, _ = apply_mm_hashes({"video": [make_video()]})
+        {"video": [_make_video(frames, audio_a, sample_rate=8000)]})
+    hashes_no_audio, _ = apply_mm_hashes({"video": [_make_video(frames)]})
     hashes_frame_list, _ = apply_mm_hashes({"video": [frames]})
 
     assert hashes_a["video"][0] == hashes_a_copy["video"][0]
     assert hashes_a["video"][0] != hashes_b["video"][0]
     assert hashes_a["video"][0] != hashes_a_different_rate["video"][0]
-    assert hashes_no_audio["video"][0] == hashes_frame_list["video"][0]
+    # nvbug 6226933: a VideoData (with metadata={} and no audio) and a bare
+    # frame list are now hashed under distinct, self-describing schemes, so the
+    # former intentional collision is removed -- they must differ.
+    assert hashes_no_audio["video"][0] != hashes_frame_list["video"][0]
 
     mm_uuids = {"video": ["shared-video-id"]}
-    hashes_uuid_a, _ = apply_mm_hashes({"video": [make_video(audio_a)]},
-                                       mm_uuids)
-    hashes_uuid_b, _ = apply_mm_hashes({"video": [make_video(audio_b)]},
-                                       mm_uuids)
+    hashes_uuid_a, _ = apply_mm_hashes(
+        {"video": [_make_video(frames, audio_a)]}, mm_uuids)
+    hashes_uuid_b, _ = apply_mm_hashes(
+        {"video": [_make_video(frames, audio_b)]}, mm_uuids)
     assert hashes_uuid_a["video"][0] != hashes_uuid_b["video"][0]
+
+
+def test_apply_mm_hashes_image_dims_distinguished():
+    """Nvbug 6226933: same-fill images of transposed dims must not collide."""
+    img_tall = Image.new("RGBA", (30, 100), (10, 20, 30, 40))
+    img_wide = Image.new("RGBA", (100, 30), (10, 20, 30, 40))
+
+    hashes_tall, _ = apply_mm_hashes({"image": [img_tall]})
+    hashes_wide, _ = apply_mm_hashes({"image": [img_wide]})
+
+    assert hashes_tall["image"][0] != hashes_wide["image"][0]
+
+
+def test_apply_mm_hashes_ndarray_shape_distinguished():
+    """Nvbug 6226933: ndarrays with same bytes but different shapes differ."""
+    base = np.arange(12, dtype=np.uint8)
+    arr_2x6 = base.reshape(2, 6, 1)
+    arr_3x4 = base.reshape(3, 4, 1)
+    arr_6x2 = base.reshape(6, 2, 1)
+
+    h_2x6, _ = apply_mm_hashes({"image": [arr_2x6]})
+    h_3x4, _ = apply_mm_hashes({"image": [arr_3x4]})
+    h_6x2, _ = apply_mm_hashes({"image": [arr_6x2]})
+
+    assert h_2x6["image"][0] != h_3x4["image"][0]
+    assert h_2x6["image"][0] != h_6x2["image"][0]
+    assert h_3x4["image"][0] != h_6x2["image"][0]
+
+
+def test_apply_mm_hashes_tensor_shape_distinguished():
+    """Nvbug 6226933: tensors with same data but different shapes differ."""
+    data = torch.arange(3 * 224 * 224, dtype=torch.float32)
+    t_chw = data.reshape(3, 224, 224)
+    t_nchw = data.reshape(1, 3, 224, 224)
+
+    h_chw, _ = apply_mm_hashes({"image": [t_chw]})
+    h_nchw, _ = apply_mm_hashes({"image": [t_nchw]})
+
+    assert h_chw["image"][0] != h_nchw["image"][0]
+
+
+def test_apply_mm_hashes_video_metadata_distinguished():
+    """Nvbug 6226933: VideoData metadata participates in the hash."""
+    frames = [
+        Image.new("RGB", (2, 2), (10, 20, 30)),
+        Image.new("RGB", (2, 2), (40, 50, 60)),
+    ]
+    meta_a = {
+        "fps": 30.0,
+        "duration": 2.0,
+        "frames_indices": [0, 1],
+        "total_num_frames": 60,
+    }
+    meta_fps = {**meta_a, "fps": 24.0}
+    meta_duration = {**meta_a, "duration": 3.0}
+    meta_indices = {**meta_a, "frames_indices": [0, 2]}
+    meta_total = {**meta_a, "total_num_frames": 90}
+
+    h_a, _ = apply_mm_hashes({"video": [_make_video(frames, metadata=meta_a)]})
+    h_a_copy, _ = apply_mm_hashes(
+        {"video": [_make_video(frames, metadata=dict(meta_a))]})
+    h_fps, _ = apply_mm_hashes(
+        {"video": [_make_video(frames, metadata=meta_fps)]})
+    h_duration, _ = apply_mm_hashes(
+        {"video": [_make_video(frames, metadata=meta_duration)]})
+    h_indices, _ = apply_mm_hashes(
+        {"video": [_make_video(frames, metadata=meta_indices)]})
+    h_total, _ = apply_mm_hashes(
+        {"video": [_make_video(frames, metadata=meta_total)]})
+
+    # Same frames + same metadata -> deterministic / equal.
+    assert h_a["video"][0] == h_a_copy["video"][0]
+    # Each differing metadata field changes the hash.
+    assert h_a["video"][0] != h_fps["video"][0]
+    assert h_a["video"][0] != h_duration["video"][0]
+    assert h_a["video"][0] != h_indices["video"][0]
+    assert h_a["video"][0] != h_total["video"][0]
+
+
+def test_apply_mm_hashes_videodata_vs_framelist_distinguished():
+    """Nvbug 6226933: VideoData(frames) and a bare frame list must differ."""
+    frames = [
+        Image.new("RGB", (2, 2), (10, 20, 30)),
+        Image.new("RGB", (2, 2), (40, 50, 60)),
+    ]
+    video = _make_video(frames, audio_samples=None)
+
+    h_video, _ = apply_mm_hashes({"video": [video]})
+    h_list, _ = apply_mm_hashes({"video": [list(frames)]})
+
+    assert h_video["video"][0] != h_list["video"][0]
+
+
+def test_apply_mm_hashes_identical_inputs_match():
+    """Identical inputs (and copies) hash identically across types."""
+    img = Image.new("RGBA", (8, 12), (1, 2, 3, 4))
+    img_copy = Image.new("RGBA", (8, 12), (1, 2, 3, 4))
+    h_img, _ = apply_mm_hashes({"image": [img]})
+    h_img_copy, _ = apply_mm_hashes({"image": [img_copy]})
+    assert h_img["image"][0] == h_img_copy["image"][0]
+
+    tensor = torch.arange(24, dtype=torch.float32).reshape(2, 3, 4)
+    h_t, _ = apply_mm_hashes({"image": [tensor]})
+    h_t_copy, _ = apply_mm_hashes({"image": [tensor.clone()]})
+    assert h_t["image"][0] == h_t_copy["image"][0]
+
+    arr = np.arange(24, dtype=np.uint8).reshape(2, 3, 4)
+    h_arr, _ = apply_mm_hashes({"image": [arr]})
+    h_arr_copy, _ = apply_mm_hashes({"image": [arr.copy()]})
+    assert h_arr["image"][0] == h_arr_copy["image"][0]
+
+    frames = [
+        Image.new("RGB", (2, 2), (10, 20, 30)),
+        Image.new("RGB", (2, 2), (40, 50, 60)),
+    ]
+    audio = np.array([0.0, 0.25, -0.5], dtype=np.float32)
+    meta = {"fps": 30.0, "frames_indices": [0, 1]}
+    video = _make_video(frames, audio_samples=audio, metadata=meta)
+    video_copy = _make_video(frames,
+                             audio_samples=audio.copy(),
+                             metadata=dict(meta))
+    h_v, _ = apply_mm_hashes({"video": [video]})
+    h_v_copy, _ = apply_mm_hashes({"video": [video_copy]})
+    assert h_v["video"][0] == h_v_copy["video"][0]
 
 
 def test_apply_mm_hashes_audio_data_deterministic():

@@ -1,12 +1,22 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import struct
 from dataclasses import dataclass
 from typing import Any, Protocol
 
 import numpy as np
 import torch
 from PIL import Image
+
+# Video metadata fields that participate in the cache-key hash. These describe
+# how frames were sampled and therefore change the model-visible content.
+_VIDEO_HASH_METADATA_FIELDS = (
+    "frames_indices",
+    "fps",
+    "duration",
+    "total_num_frames",
+)
 
 
 class ContentHasher(Protocol):
@@ -16,28 +26,95 @@ class ContentHasher(Protocol):
         """Update the hash with raw bytes."""
 
 
+def _u8(value: int) -> bytes:
+    """Encode an unsigned 8-bit integer."""
+    return value.to_bytes(1, "big", signed=False)
+
+
+def _u32(value: int) -> bytes:
+    """Encode an unsigned 32-bit big-endian integer."""
+    return value.to_bytes(4, "big", signed=False)
+
+
+def _u64(value: int) -> bytes:
+    """Encode an unsigned 64-bit big-endian integer."""
+    return value.to_bytes(8, "big", signed=False)
+
+
+def _len_prefixed(payload: bytes) -> bytes:
+    """Encode a byte payload prefixed with its u64 length."""
+    return _u64(len(payload)) + payload
+
+
 def serialize_item(obj: object) -> bytes:
-    """Serialize a supported multimodal hash leaf to bytes."""
+    """Serialize a supported multimodal hash leaf to bytes.
+
+    The encoding is canonical and self-describing: every value is
+    ``[1-byte type tag][typed metadata][length-prefixed payload]`` with all
+    multi-byte integers big-endian. This prevents cache-key hash collisions
+    between distinct values that happen to share a raw byte payload (for
+    example transposed image dimensions or reshaped arrays).
+    """
     if isinstance(obj, str):
-        return obj.encode("utf-8")
+        return _u8(0x01) + _len_prefixed(obj.encode("utf-8"))
     if isinstance(obj, bytes):
-        return obj
-    if isinstance(obj, (int, float)):
-        return np.array(obj).tobytes()
+        return _u8(0x02) + _len_prefixed(obj)
+    # bool must be checked before int: bool is a subclass of int.
+    if isinstance(obj, bool):
+        return _u8(0x05) + _u8(1 if obj else 0)
+    if isinstance(obj, int):
+        nbytes = (obj.bit_length() + 8) // 8  # +1 sign bit, then ceil-divide.
+        return _u8(0x03) + _u8(nbytes) + obj.to_bytes(nbytes, "big", signed=True)
+    if isinstance(obj, float):
+        return _u8(0x04) + struct.pack(">d", obj)
 
     if isinstance(obj, Image.Image):
-        return np.array(obj.convert("RGBA")).tobytes()
+        width, height = obj.size
+        payload = np.array(obj.convert("RGBA")).tobytes()
+        return (
+            _u8(0x10)
+            + _len_prefixed(obj.mode.encode("utf-8"))
+            + _u32(width)
+            + _u32(height)
+            + _len_prefixed(payload)
+        )
     if isinstance(obj, torch.Tensor):
-        return obj.numpy().tobytes()
+        tensor = obj.detach().cpu().contiguous()
+        payload = tensor.numpy().tobytes()
+        shape = tuple(tensor.shape)
+        parts = [
+            _u8(0x11),
+            _len_prefixed(str(tensor.dtype).encode("utf-8")),
+            _u8(len(shape)),
+        ]
+        parts.extend(_u64(dim) for dim in shape)
+        parts.append(_len_prefixed(payload))
+        return b"".join(parts)
     if isinstance(obj, np.ndarray):
-        return obj.tobytes()
-    if isinstance(obj, (tuple, list)):
-        container_tag = b"T" if isinstance(obj, tuple) else b"L"
-        parts = [container_tag, len(obj).to_bytes(8, "big", signed=False)]
-        for item in obj:
-            payload = serialize_item(item)
-            parts.append(len(payload).to_bytes(8, "big", signed=False))
-            parts.append(payload)
+        contiguous = np.ascontiguousarray(obj)
+        payload = contiguous.tobytes()
+        shape = contiguous.shape
+        parts = [
+            _u8(0x12),
+            _len_prefixed(obj.dtype.str.encode("utf-8")),
+            _u8(len(shape)),
+        ]
+        parts.extend(_u64(dim) for dim in shape)
+        parts.append(_len_prefixed(payload))
+        return b"".join(parts)
+    if isinstance(obj, tuple):
+        parts = [_u8(0x21), _u64(len(obj))]
+        parts.extend(serialize_item(item) for item in obj)
+        return b"".join(parts)
+    if isinstance(obj, list):
+        parts = [_u8(0x20), _u64(len(obj))]
+        parts.extend(serialize_item(item) for item in obj)
+        return b"".join(parts)
+    if isinstance(obj, dict):
+        parts = [_u8(0x22), _u64(len(obj))]
+        for key in sorted(obj):
+            parts.append(serialize_item(key))
+            parts.append(serialize_item(obj[key]))
         return b"".join(parts)
 
     raise ValueError(f"Unsupported object type: {type(obj)}")
@@ -65,11 +142,8 @@ class AudioData(BaseModalityData):
             self.sample_rate = int(self.sample_rate)
 
     def update_hash(self, hasher: ContentHasher) -> None:
-        samples = self.samples
-        if isinstance(samples, torch.Tensor):
-            samples = samples.detach().cpu().contiguous()
         hasher.update(b"<audio>")
-        hasher.update(serialize_item((samples, self.sample_rate)))
+        hasher.update(serialize_item((self.samples, self.sample_rate)))
 
 
 @dataclass
@@ -97,12 +171,12 @@ class VideoData(BaseModalityData):
             raise TypeError("metadata must be a dictionary")
 
     def update_hash(self, hasher: ContentHasher) -> None:
+        hasher.update(b"<video>")
+        # Sampling metadata is part of the model-visible cache identity.
+        meta = {k: self.metadata[k] for k in _VIDEO_HASH_METADATA_FIELDS if k in self.metadata}
+        hasher.update(serialize_item(meta))
         for frame in self.frames:
             hasher.update(b"<frame>")
-            if isinstance(frame, torch.Tensor):
-                frame = frame.detach().cpu().contiguous()
             hasher.update(serialize_item(frame))
-        # Extend this to include metadata if fields such as sampled frame
-        # indices become part of the model-visible cache identity.
         if self.audio is not None:
             self.audio.update_hash(hasher)
