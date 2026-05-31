@@ -43,16 +43,8 @@ from tensorrt_llm.llmapi import KvCacheConfig as LlmKvCacheConfig
 from tensorrt_llm.llmapi import MoeConfig
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
-
-try:
-    # AFMoE landed in transformers >= 5.8. When the installed transformers is
-    # older the parity test below is skipped (the rest of the suite still runs).
-    from transformers import AfmoeConfig as HFAfmoeConfig
-    from transformers.models.afmoe.modeling_afmoe import AfmoeForCausalLM as HFAfmoeForCausalLM
-
-    HAS_HF_AFMOE = True
-except ImportError:
-    HAS_HF_AFMOE = False
+from transformers import AfmoeConfig as HFAfmoeConfig
+from transformers.models.afmoe.modeling_afmoe import AfmoeForCausalLM as HFAfmoeForCausalLM
 
 WINDOW_SIZE = 4
 NUM_HIDDEN_LAYERS = 4
@@ -521,10 +513,6 @@ class TestAfmoeTPAttributes(unittest.TestCase):
                 self.assertIsNone(attn.attention_window_size)
 
 
-@unittest.skipUnless(
-    HAS_HF_AFMOE,
-    "transformers>=5.8 with native AFMoE (transformers.models.afmoe) is required",
-)
 @unittest.skipUnless(torch.cuda.is_available(), "needs CUDA")
 class TestAfmoeAllCloseToHF(unittest.TestCase):
     """Compare TRT-LLM AFMoE context-phase logits against the HF reference.

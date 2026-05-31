@@ -31,7 +31,8 @@ from typing import Optional
 
 import torch
 from torch import nn
-from transformers import AutoConfig, PretrainedConfig
+from transformers import PretrainedConfig
+from transformers.models.auto.configuration_auto import CONFIG_MAPPING
 
 from tensorrt_llm.functional import PositionEmbeddingType
 
@@ -55,12 +56,13 @@ class AfmoeConfig(PretrainedConfig):
     model_type = "afmoe"
 
 
-logger.warning_once(
-    "transformers does not natively support 'AfmoeConfig'. "
-    "Registering AfmoeConfig so AutoConfig can load AFMoE checkpoints.",
-    key="AFMOE_REGISTER_WARNING",
-)
-AutoConfig.register(AfmoeConfig.model_type, AfmoeConfig)
+if AfmoeConfig.model_type not in CONFIG_MAPPING:
+    logger.warning_once(
+        "transformers does not natively support 'AfmoeConfig'. "
+        "Registering AfmoeConfig so AutoConfig can load AFMoE checkpoints.",
+        key="AFMOE_REGISTER_WARNING",
+    )
+    CONFIG_MAPPING.register(AfmoeConfig.model_type, AfmoeConfig, exist_ok=True)
 
 
 def _validate_routing_config(config: PretrainedConfig) -> None:
