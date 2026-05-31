@@ -136,6 +136,12 @@ class AttentionMetadata:
     # The shape is (batch_size) if provided.
     prompt_lens: Optional[List[int]] = None
 
+    # Explicit query/KV sequence boundaries for attention kernels that operate
+    # on packed varlen context inputs. These are sequence/segment boundaries,
+    # not necessarily request boundaries.
+    cu_q_seqlens: Optional[torch.Tensor] = None
+    cu_kv_seqlens: Optional[torch.Tensor] = None
+
     # These fields indicate whether the runtime can use various features.
     # The kernels may or may not have different behaviors when these
     # are enabled.

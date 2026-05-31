@@ -76,6 +76,92 @@ from .modeling_utils import (ModelConfig, QuantConfig, _load_weights_impl,
 PAD_INDEX = -100  # NOTE: refer to https://github.com/huggingface/transformers/blob/main/src/transformers/models/qwen2_5_vl/modular_qwen2_5_vl.py#L269
 
 
+def _prepare_qwen_vl_vision_attn_metadata(
+        seq_lens: List[int],
+        attn_metadata: AttentionMetadata) -> AttentionMetadata:
+    seq_lens = [int(seq_len) for seq_len in seq_lens]
+    if not seq_lens:
+        raise ValueError(
+            "Qwen VL vision attention requires at least one segment")
+
+    min_seq_len = min(seq_lens)
+    if min_seq_len < 0:
+        raise ValueError(
+            f"Qwen VL vision attention segment length must be nonnegative, got {min_seq_len}"
+        )
+
+    num_segments = len(seq_lens)
+    seq_lens_torch = torch.tensor(seq_lens,
+                                  dtype=torch.int,
+                                  pin_memory=prefer_pinned())
+    cu_seqlens = torch.empty(num_segments + 1,
+                             dtype=torch.int32,
+                             pin_memory=prefer_pinned())
+    cu_seqlens[0] = 0
+    torch.cumsum(seq_lens_torch, dim=0, out=cu_seqlens[1:])
+
+    attn_metadata.num_contexts = num_segments
+    attn_metadata.request_ids = list(range(1, num_segments + 1))
+    attn_metadata.seq_lens = seq_lens_torch
+    cu_seqlens = cu_seqlens.to(device=attn_metadata.seq_lens_cuda.device,
+                               non_blocking=True)
+    attn_metadata.cu_q_seqlens = cu_seqlens
+    attn_metadata.cu_kv_seqlens = cu_seqlens
+    attn_metadata.max_seq_len = max(seq_lens)
+    attn_metadata.prepare()
+    return attn_metadata
+
+
+def _prepare_qwen_vl_mrope_config(
+    *,
+    multimodal_params: List[MultimodalParams],
+    num_generation_requests: int,
+    position_ids: Optional[torch.Tensor],
+    rotary_emb: MRotaryEmbedding,
+    mrope_position_deltas_cache: torch.Tensor,
+    mrope_rotary_cos_sin_workspace: torch.Tensor,
+    mrope_delta_write_seq_slots: Optional[torch.Tensor] = None,
+    mrope_delta_read_seq_slots: Optional[torch.Tensor] = None
+) -> Dict[str, torch.Tensor]:
+    mrope_config: Dict[str, torch.Tensor] = {}
+
+    if mrope_delta_write_seq_slots is not None:
+        seq_slots = mrope_delta_write_seq_slots
+        num_seq_slots = seq_slots.numel()
+        delta_tensors = []
+        for multimodal_param in multimodal_params:
+            request_mrope_config = multimodal_param.multimodal_data.get(
+                'mrope_config', {})
+            mrope_position_delta = request_mrope_config.get(
+                'mrope_position_deltas')
+            if mrope_position_delta is None:
+                continue
+            delta_tensors.append(mrope_position_delta.reshape(1))
+            if len(delta_tensors) == num_seq_slots:
+                break
+        if len(delta_tensors) != num_seq_slots:
+            raise RuntimeError(
+                "Missing MRoPE position deltas for seq-slot cache update")
+        deltas = torch.cat(delta_tensors, dim=0)
+        mrope_position_deltas_cache.index_copy_(0, seq_slots, deltas)
+
+    if position_ids is not None \
+            and position_ids.shape[-1] > num_generation_requests:
+        cos, sin = rotary_emb.get_cos_sin(position_ids)
+        num_packed_values = cos.numel() * 2
+        packed = mrope_rotary_cos_sin_workspace[:, :num_packed_values]
+        packed_view = packed.view(*cos.shape, 2)
+        torch.stack((cos, sin), dim=-1, out=packed_view)
+        mrope_config['mrope_rotary_cos_sin'] = packed
+
+    if mrope_delta_read_seq_slots is not None:
+        mrope_config[
+            'mrope_position_deltas'] = mrope_position_deltas_cache.index_select(
+                0, mrope_delta_read_seq_slots).unsqueeze(1)
+
+    return mrope_config
+
+
 class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
                                 BaseMultimodalDummyInputsBuilder):
 
@@ -1100,21 +1186,9 @@ class Qwen2_5_VisionModel(torch.nn.Module):
 
         return cos_thw, sin_thw, window_index_thw, tuple(seq_lens_thw)
 
-    def prepare_attn_metadata(self, batch_size: int, seq_lens: List[int],
+    def prepare_attn_metadata(self, seq_lens: List[int],
                               attn_metadata: AttentionMetadata):
-        batch_size = len(seq_lens)
-        seq_lens_torch = torch.tensor(seq_lens,
-                                      dtype=torch.int,
-                                      pin_memory=prefer_pinned())
-        request_ids = list(range(1, batch_size + 1))
-
-        attn_metadata.num_contexts = len(seq_lens)
-        attn_metadata.request_ids = request_ids
-        attn_metadata.prompt_lens = seq_lens
-        attn_metadata.seq_lens = seq_lens_torch
-        attn_metadata.max_seq_len = max(seq_lens)
-        attn_metadata.prepare()
-        return attn_metadata
+        return _prepare_qwen_vl_vision_attn_metadata(seq_lens, attn_metadata)
 
     @property
     def device(self) -> torch.device:
@@ -1166,11 +1240,10 @@ class Qwen2_5_VisionModel(torch.nn.Module):
             seq_len // self.spatial_merge_unit, self.spatial_merge_unit, -1)
         hidden_states = hidden_states[window_index, :, :].reshape(seq_len, -1)
 
-        full_attn_metadata = self.prepare_attn_metadata(len(grid_rows),
-                                                        seq_lens,
+        full_attn_metadata = self.prepare_attn_metadata(seq_lens,
                                                         self.full_attn_metadata)
         window_attn_metadata = self.prepare_attn_metadata(
-            len(grid_rows), window_seq_lens, self.window_attn_metadata)
+            window_seq_lens, self.window_attn_metadata)
 
         for layer_num, block in enumerate(self.blocks):
             if layer_num in self.fullatt_block_indexes:
@@ -1231,6 +1304,13 @@ class Qwen2VLModelBase(PreTrainedModel):
                                              dtype=torch.int32,
                                              device='cuda'),
                                  persistent=False)
+            rotary_dim = self.rotary_emb.rotary_cos_sin.shape[-1]
+            self.register_buffer(
+                'mrope_rotary_cos_sin_workspace',
+                torch.empty((1, model_config.max_num_tokens * rotary_dim * 2),
+                            dtype=torch.float32,
+                            device='cuda'),
+                persistent=False)
 
         llm_model_config = copy.deepcopy(model_config)
         text_config = getattr(llm_model_config.pretrained_config, 'text_config',
@@ -1299,42 +1379,15 @@ class Qwen2VLModelBase(PreTrainedModel):
             position_ids: torch.Tensor,
             mrope_delta_write_seq_slots: Optional[torch.Tensor] = None,
             mrope_delta_read_seq_slots: Optional[torch.Tensor] = None):
-        mrope_config = {}
-        if mrope_delta_write_seq_slots is not None:
-            seq_slots = mrope_delta_write_seq_slots
-            delta_tensors = []
-            for multimodal_param in multimodal_params:
-                request_mrope_config = multimodal_param.multimodal_data.get(
-                    'mrope_config', {})
-                mrope_position_delta = request_mrope_config.get(
-                    'mrope_position_deltas')
-                if mrope_position_delta is None:
-                    continue
-                delta_tensors.append(mrope_position_delta.reshape(1))
-                if len(delta_tensors) == seq_slots.numel():
-                    break
-            if len(delta_tensors) != seq_slots.numel():
-                raise RuntimeError(
-                    "Missing MRoPE position deltas for seq-slot cache update")
-            deltas = torch.cat(delta_tensors, dim=0)
-            self.mrope_position_deltas_cache.index_copy_(0, seq_slots, deltas)
-
-        # Attention kernel indexes mrope cos/sin by batch-flat per-token
-        # entry, so one `get_cos_sin(position_ids)` over the stitched
-        # `(3, 1, total_tokens)` covers every batch entry directly.
-        if position_ids is not None \
-                and position_ids.shape[-1] > num_generation_requests:
-            with nvtx_range("Qwen2.5-VL get_cos_sin"):
-                cos, sin = self.rotary_emb.get_cos_sin(position_ids)
-                mrope_config['mrope_rotary_cos_sin'] = (torch.stack(
-                    (cos, sin), dim=-1).reshape(cos.shape[0], -1))
-
-        if mrope_delta_read_seq_slots is not None:
-            mrope_config[
-                'mrope_position_deltas'] = self.mrope_position_deltas_cache.index_select(
-                    0, mrope_delta_read_seq_slots).unsqueeze(1)
-
-        return mrope_config
+        return _prepare_qwen_vl_mrope_config(
+            multimodal_params=multimodal_params,
+            num_generation_requests=num_generation_requests,
+            position_ids=position_ids,
+            rotary_emb=self.rotary_emb,
+            mrope_position_deltas_cache=self.mrope_position_deltas_cache,
+            mrope_rotary_cos_sin_workspace=self.mrope_rotary_cos_sin_workspace,
+            mrope_delta_write_seq_slots=mrope_delta_write_seq_slots,
+            mrope_delta_read_seq_slots=mrope_delta_read_seq_slots)
 
     @torch.inference_mode()
     def forward(

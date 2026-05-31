@@ -22,7 +22,7 @@ from tensorrt_llm._torch.models.modeling_multimodal_utils import _is_mm_disagg
 from tensorrt_llm.functional import PositionEmbeddingType
 from tensorrt_llm.mapping import Mapping
 
-from ..._utils import async_tensor_h2d, prefer_pinned
+from ..._utils import async_tensor_h2d
 from ...inputs import (
     ContentFormat,
     MultimodalPlaceholderMetadata,
@@ -50,7 +50,12 @@ from .modeling_multimodal_utils import (
     get_attached_multimodal_embeddings,
     get_multimodal_embeddings,
 )
-from .modeling_qwen2vl import Qwen2_5_VLVisionAttention, Qwen2VLInputProcessorBase
+from .modeling_qwen2vl import (
+    Qwen2_5_VLVisionAttention,
+    Qwen2VLInputProcessorBase,
+    _prepare_qwen_vl_mrope_config,
+    _prepare_qwen_vl_vision_attn_metadata,
+)
 from .modeling_utils import (
     ModelConfig,
     QuantConfig,
@@ -785,21 +790,12 @@ class Qwen3VisionModel(torch.nn.Module):
             return pieces[0]
         return torch.cat(pieces, dim=0)
 
-    def prepare_attn_metadata(self, seq_lens: List[int], attn_metadata: AttentionMetadata):
-        # NOTE: The single prompt is divided into multiple seq_lens, so pretending have many batch_sizes.
-        batch_size = len(seq_lens)
-        prompt_lens = seq_lens
-        max_seq_len = max(seq_lens)
-        seq_lens = torch.tensor(seq_lens, dtype=torch.int, pin_memory=prefer_pinned())
-        request_ids = list(range(1, batch_size + 1))
-
-        attn_metadata.num_contexts = batch_size
-        attn_metadata.request_ids = request_ids
-        attn_metadata.prompt_lens = prompt_lens
-        attn_metadata.seq_lens = seq_lens
-        attn_metadata.max_seq_len = max_seq_len
-        attn_metadata.prepare()
-        return attn_metadata
+    def prepare_attn_metadata(
+        self,
+        seq_lens: List[int],
+        attn_metadata: AttentionMetadata,
+    ):
+        return _prepare_qwen_vl_vision_attn_metadata(seq_lens, attn_metadata)
 
     @torch.inference_mode()
     def forward(
@@ -1043,6 +1039,16 @@ class Qwen3VLModelBase(PreTrainedModel):
                 ),
                 persistent=False,
             )
+            rotary_dim = self.rotary_emb.rotary_cos_sin.shape[-1]
+            self.register_buffer(
+                "mrope_rotary_cos_sin_workspace",
+                torch.empty(
+                    (1, model_config.max_num_tokens * rotary_dim * 2),
+                    dtype=torch.float32,
+                    device="cuda",
+                ),
+                persistent=False,
+            )
 
         self.model_config = model_config
 
@@ -1134,38 +1140,16 @@ class Qwen3VLModelBase(PreTrainedModel):
         mrope_delta_write_seq_slots: Optional[torch.Tensor] = None,
         mrope_delta_read_seq_slots: Optional[torch.Tensor] = None,
     ):
-        mrope_config = {}
-        if mrope_delta_write_seq_slots is not None:
-            seq_slots = mrope_delta_write_seq_slots
-            delta_tensors = []
-            for multimodal_param in multimodal_params:
-                request_mrope_config = multimodal_param.multimodal_data.get("mrope_config", {})
-                mrope_position_delta = request_mrope_config.get("mrope_position_deltas")
-                if mrope_position_delta is None:
-                    continue
-                delta_tensors.append(mrope_position_delta.reshape(1))
-                if len(delta_tensors) == seq_slots.numel():
-                    break
-            if len(delta_tensors) != seq_slots.numel():
-                raise RuntimeError("Missing MRoPE position deltas for seq-slot cache update")
-            deltas = torch.cat(delta_tensors, dim=0)
-            self.mrope_position_deltas_cache.index_copy_(0, seq_slots, deltas)
-
-        # Attention kernel indexes mrope cos/sin by batch-flat per-token
-        # entry, so one `get_cos_sin(position_ids)` over the stitched
-        # `(3, 1, total_tokens)` covers every batch entry directly.
-        if position_ids is not None and position_ids.shape[-1] > num_generation_requests:
-            cos, sin = self.rotary_emb.get_cos_sin(position_ids)
-            mrope_config["mrope_rotary_cos_sin"] = torch.stack((cos, sin), dim=-1).reshape(
-                cos.shape[0], -1
-            )
-
-        if mrope_delta_read_seq_slots is not None:
-            mrope_config["mrope_position_deltas"] = self.mrope_position_deltas_cache.index_select(
-                0, mrope_delta_read_seq_slots
-            ).unsqueeze(1)
-
-        return mrope_config
+        return _prepare_qwen_vl_mrope_config(
+            multimodal_params=multimodal_params,
+            num_generation_requests=num_generation_requests,
+            position_ids=position_ids,
+            rotary_emb=self.rotary_emb,
+            mrope_position_deltas_cache=self.mrope_position_deltas_cache,
+            mrope_rotary_cos_sin_workspace=self.mrope_rotary_cos_sin_workspace,
+            mrope_delta_write_seq_slots=mrope_delta_write_seq_slots,
+            mrope_delta_read_seq_slots=mrope_delta_read_seq_slots,
+        )
 
     def split_mm_embeds(self, mm_embed, deepstack_num_level):
         num_elements = mm_embed.shape[1] // (deepstack_num_level + 1)

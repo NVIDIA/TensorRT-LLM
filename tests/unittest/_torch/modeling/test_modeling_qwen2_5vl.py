@@ -16,8 +16,9 @@ from utils.llm_data import llm_models_root
 from tensorrt_llm._torch.models.checkpoints.hf.qwen2vl_weight_mapper import \
     Qwen2VLHfWeightMapper
 from tensorrt_llm._torch.models.modeling_qwen2vl import (
-    Qwen2_5_VLModel, Qwen2VLInputProcessorBase)
+    Qwen2_5_VLModel, Qwen2VLInputProcessorBase, _prepare_qwen_vl_mrope_config)
 from tensorrt_llm._utils import get_sm_version
+from tensorrt_llm.inputs.multimodal import MultimodalParams
 
 QWEN2_5_VL_7B_CONFIG = {
     "architectures": ["Qwen2_5_VLForConditionalGeneration"],
@@ -331,86 +332,95 @@ class TestQwen2_5_VL(TestModelingMultimodal):
                 disable_fuse_rope=True)
 
 
-# ---------------------------------------------------------------------------
-# Equivalence tests for the Qwen2.5-VL optimization steps.
-#
-# These do not exercise the full `Qwen2VLModelBase`/`Qwen2_5_VisionModel` —
-# they isolate the host-side reshapes/transfers we changed and prove the
-# new path is numerically identical to the prior implementation.
-# ---------------------------------------------------------------------------
+class _FakeRotaryEmbedding:
 
-import pytest  # noqa: E402
+    def __init__(self, rotary_dim: int):
+        self.rotary_dim = rotary_dim
 
-
-def _vision_transfer_old(rotary_pos_emb_cos, rotary_pos_emb_sin, window_indices,
-                         device):
-    """Reproduces the prior 3-separate-`.to(device, non_blocking=True)` shape:
-    cos / sin / window_index each get their own H->D copy."""
-    cos = torch.cat(rotary_pos_emb_cos).to(device=device, non_blocking=True)
-    sin = torch.cat(rotary_pos_emb_sin).to(device=device, non_blocking=True)
-    window_index = torch.cat(window_indices).to(device=device,
-                                                non_blocking=True)
-    return cos, sin, window_index
+    def get_cos_sin(self, position_ids):
+        num_tokens = position_ids.shape[-1]
+        cos = torch.arange(num_tokens * self.rotary_dim,
+                           device=position_ids.device,
+                           dtype=torch.float32).reshape(1, num_tokens,
+                                                        self.rotary_dim)
+        return cos, cos + 1000
 
 
-def _vision_transfer_new(rotary_pos_emb_cos, rotary_pos_emb_sin, window_indices,
-                         device):
-    """The new path: stack cos/sin on host -> single H->D, then ship
-    window_index in a second copy (different dtype)."""
-    cos_sin = torch.stack(
-        [
-            torch.cat(rotary_pos_emb_cos),
-            torch.cat(rotary_pos_emb_sin),
-        ],
-        dim=0,
-    ).to(device=device, non_blocking=True)
-    cos, sin = cos_sin[0], cos_sin[1]
-    window_index = torch.cat(window_indices).to(device=device,
-                                                non_blocking=True)
-    return cos, sin, window_index
+def _mrope_param(delta: int) -> MultimodalParams:
+    return MultimodalParams(
+        multimodal_data={
+            "mrope_config": {
+                "mrope_position_deltas":
+                torch.tensor([delta], device="cuda", dtype=torch.int32)
+            }
+        })
 
 
-@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
-@pytest.mark.parametrize(
-    "shapes",
-    [
-        # (per-image (rows, hidden)) tuples — same shape requirements as the
-        # real `Qwen2_5_VisionModel.get_rotary_pos_emb_window_data` output:
-        # cos[i] and sin[i] share shape/dtype; window_indices[i] is int64.
-        [(64, 80)],
-        [(64, 80), (256, 80)],
-        [(32, 80), (96, 80), (128, 80)],
-    ],
-    ids=lambda s: "_".join(f"{r}x{h}" for r, h in s),
-)
-def test_qwen2_5_vision_cos_sin_stack_equivalence(shapes, dtype):
-    """Stacked-on-host single H->D must match the old 3-transfer shape
-    bit-for-bit for cos, sin, and window_index."""
-    torch.manual_seed(7)
-    device = "cuda"
+def test_prepare_qwen_vl_mrope_config_mixed_context_generation():
+    rotary_dim = 2
+    num_tokens = 5
+    position_ids = torch.arange(3 * num_tokens,
+                                device="cuda",
+                                dtype=torch.int32).reshape(3, 1, num_tokens)
+    mrope_position_deltas_cache = torch.zeros(8,
+                                              device="cuda",
+                                              dtype=torch.int32)
+    mrope_rotary_cos_sin_workspace = torch.empty((1, 8 * rotary_dim * 2),
+                                                 device="cuda",
+                                                 dtype=torch.float32)
 
-    rotary_pos_emb_cos = [torch.randn(r, h, dtype=dtype) for r, h in shapes]
-    rotary_pos_emb_sin = [torch.randn(r, h, dtype=dtype) for r, h in shapes]
-    window_indices = [torch.randperm(r, dtype=torch.long) for r, _ in shapes]
+    config = _prepare_qwen_vl_mrope_config(
+        multimodal_params=[_mrope_param(11), _mrope_param(22)],
+        num_generation_requests=2,
+        position_ids=position_ids,
+        rotary_emb=_FakeRotaryEmbedding(rotary_dim),
+        mrope_position_deltas_cache=mrope_position_deltas_cache,
+        mrope_rotary_cos_sin_workspace=mrope_rotary_cos_sin_workspace,
+        mrope_delta_write_seq_slots=torch.tensor([2, 5],
+                                                 device="cuda",
+                                                 dtype=torch.long),
+        mrope_delta_read_seq_slots=torch.tensor([2, 5],
+                                                device="cuda",
+                                                dtype=torch.long))
 
-    cos_old, sin_old, win_old = _vision_transfer_old(rotary_pos_emb_cos,
-                                                     rotary_pos_emb_sin,
-                                                     window_indices, device)
-    cos_new, sin_new, win_new = _vision_transfer_new(rotary_pos_emb_cos,
-                                                     rotary_pos_emb_sin,
-                                                     window_indices, device)
+    torch.testing.assert_close(
+        mrope_position_deltas_cache[[2, 5]],
+        torch.tensor([11, 22], device="cuda", dtype=torch.int32))
+    torch.testing.assert_close(
+        config["mrope_position_deltas"],
+        torch.tensor([[11], [22]], device="cuda", dtype=torch.int32))
 
-    torch.cuda.synchronize()
+    packed = config["mrope_rotary_cos_sin"].view(1, num_tokens, rotary_dim, 2)
+    cos, sin = _FakeRotaryEmbedding(rotary_dim).get_cos_sin(position_ids)
+    torch.testing.assert_close(packed[..., 0], cos)
+    torch.testing.assert_close(packed[..., 1], sin)
 
-    torch.testing.assert_close(cos_new, cos_old, atol=0, rtol=0)
-    torch.testing.assert_close(sin_new, sin_old, atol=0, rtol=0)
-    torch.testing.assert_close(win_new, win_old, atol=0, rtol=0)
 
+def test_prepare_qwen_vl_mrope_config_pure_generation_reads_deltas_only():
+    rotary_dim = 2
+    position_ids = torch.zeros((3, 1, 2), device="cuda", dtype=torch.int32)
+    mrope_position_deltas_cache = torch.zeros(8,
+                                              device="cuda",
+                                              dtype=torch.int32)
+    mrope_position_deltas_cache[[2, 5]] = torch.tensor([11, 22],
+                                                       device="cuda",
+                                                       dtype=torch.int32)
+    mrope_rotary_cos_sin_workspace = torch.empty((1, 8 * rotary_dim * 2),
+                                                 device="cuda",
+                                                 dtype=torch.float32)
 
-# NOTE: A direct numerical equivalence test between the old per-request
-# prepare_mrope_config loop and the new flatten path is intentionally not
-# included here. The two paths produce intentionally different output
-# layouts (N stacked per-request blocks vs a single concatenated block);
-# the downstream attention contract was updated alongside the flatten
-# rewrite on qwen3vl_opt, where the same algorithm was validated end-to-
-# end. The stack-vs-3-transfers test above is what's unique to qwen2.5.
+    config = _prepare_qwen_vl_mrope_config(
+        multimodal_params=[],
+        num_generation_requests=2,
+        position_ids=position_ids,
+        rotary_emb=_FakeRotaryEmbedding(rotary_dim),
+        mrope_position_deltas_cache=mrope_position_deltas_cache,
+        mrope_rotary_cos_sin_workspace=mrope_rotary_cos_sin_workspace,
+        mrope_delta_read_seq_slots=torch.tensor([2, 5],
+                                                device="cuda",
+                                                dtype=torch.long))
+
+    assert "mrope_rotary_cos_sin" not in config
+    torch.testing.assert_close(
+        config["mrope_position_deltas"],
+        torch.tensor([[11], [22]], device="cuda", dtype=torch.int32))
