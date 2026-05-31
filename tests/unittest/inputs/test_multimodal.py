@@ -109,10 +109,6 @@ class TestMultimodalPromptOrder:
         assert list(result) == [("image", 1), ("video", 0), ("image", 0)]
         assert isinstance(result, MultimodalPromptOrder)
 
-    def test_from_metadata_falls_back_to_modality_order(self):
-        result = MultimodalPromptOrder.from_metadata({"modality_order": ["image", "video"]})
-        assert list(result) == [("image", 0), ("video", 0)]
-
     def test_from_metadata_falls_back_to_layout_item_types(self):
         # 0=IMAGE, 1=VIDEO, 2=AUDIO
         result = MultimodalPromptOrder.from_metadata({"layout_metadata": {"item_types": [0, 1, 2]}})

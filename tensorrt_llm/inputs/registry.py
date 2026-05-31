@@ -351,7 +351,7 @@ class BaseMultimodalInputProcessor(ABC):
         # Mixed-modality: resolve the logical prompt-item order and flatten the
         # per-modality token-length lists into a single prompt-ordered list, so
         # `expand_prompt_token_ids_for_mm` sees per-item counts across all
-        # modalities (supersedes the single-modality _get_single_mm_token_lengths).
+        # modalities.
         num_mm_tokens_by_key = find_mm_token_lengths(
             mm_data,
             self,
@@ -973,28 +973,6 @@ def _process_multimodal_with_dummy_placeholders(
     if extra_processed_inputs is None:
         return {}
     return extra_processed_inputs
-
-
-def _get_single_mm_token_lengths(
-    mm_data: Dict[str, Any],
-    input_processor: BaseMultimodalInputProcessor,
-    *,
-    multimodal_data: Optional[Dict[str, Any]] = None,
-) -> Optional[List[int]]:
-    """Get the single set of MM token lengths (first value from find_mm_token_lengths). Returns None if empty."""
-    # TODO: Just like in multimodal_hashing_process, here we assume there is only one modality for now
-    num_mm_tokens_by_key = find_mm_token_lengths(
-        mm_data, input_processor, multimodal_data=multimodal_data)
-    if not num_mm_tokens_by_key:
-        return None
-    # find_mm_token_lengths returns Dict[modality, List[int]], e.g. {"image": [2928, 2928]}.
-    # We need the list of per-item lengths (for _find_mm_token_start_pos_from_masks). We take
-    # the first modality's list; multi-modality is not yet supported
-    # (see TODO in multimodal_hashing_process).
-    num_mm_tokens = next(iter(num_mm_tokens_by_key.values()))
-    if len(num_mm_tokens) <= 0:
-        return None
-    return num_mm_tokens
 
 
 def maybe_compute_mm_embed_cumsum(

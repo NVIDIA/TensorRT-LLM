@@ -1127,11 +1127,6 @@ def _assert_pure_baseline_not_degraded(
             )
 
 
-def _expected_keywords(sample: MixedModalitySample) -> dict[str, str]:
-    """Return expected answer keys by modality for reporting."""
-    return {modality: item.keyword for modality, item in sample.items.items()}
-
-
 def _log_source_digest(samples: list[MixedModalitySample]) -> None:
     """Log a stable digest of materialized source media paths."""
     entries = []

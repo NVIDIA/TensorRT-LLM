@@ -388,9 +388,6 @@ class MultimodalPromptOrder(list):  # list[tuple[str, int]]
             return cls.from_raw_entries(
                 multimodal_data["multimodal_item_order"],
                 source="multimodal_item_order")
-        if "modality_order" in multimodal_data:
-            return cls.from_raw_entries(multimodal_data["modality_order"],
-                                        source="modality_order")
         layout_metadata = multimodal_data.get("layout_metadata")
         if isinstance(layout_metadata,
                       dict) and "item_types" in layout_metadata:
@@ -1389,6 +1386,38 @@ def _find_mm_embedding_lengths_from_masks(
         offset += item_length
         embedding_lengths.append(int(embed_mask[item_positions].sum().item()))
     return embedding_lengths
+
+
+def find_multimodal_embedding_lengths(
+    input_ids: Union[torch.Tensor, List[int], np.ndarray],
+    input_processor: "BaseMultimodalInputProcessor",
+    num_mm_tokens: List[int],
+) -> List[int]:
+    """Compute per-item multimodal embedding-token counts for a prompt.
+
+    Public wrapper around the mask helpers so callers outside this module do
+    not reach into the private `_compute_mm_masks` /
+    `_find_mm_embedding_lengths_from_masks` internals. Derives the embed mask
+    from the processor's vocab size / multimodal token id predicates, then
+    counts embed-slot tokens per logical item described by `num_mm_tokens`.
+
+    Args:
+        input_ids: Prompt token ids (CPU-resident); coerced to a tensor.
+        input_processor: Processor supplying `get_vocab_size`,
+            `get_mm_token_ids`, and `get_mm_special_token_ids`.
+        num_mm_tokens: Per-item multimodal token counts in prompt order.
+
+    Returns:
+        Per-item embedding-token counts aligned with `num_mm_tokens`.
+    """
+    mm_mask, embed_mask, _ = _compute_mm_masks(
+        _as_cpu_tensor(input_ids),
+        vocab_size=input_processor.get_vocab_size(),
+        mm_token_ids=input_processor.get_mm_token_ids(),
+        mm_special_token_ids=input_processor.get_mm_special_token_ids(),
+    )
+    return _find_mm_embedding_lengths_from_masks(mm_mask, embed_mask,
+                                                 num_mm_tokens)
 
 
 def validate_mm_inputs(prompt_token_ids: Union[torch.Tensor, List[int],

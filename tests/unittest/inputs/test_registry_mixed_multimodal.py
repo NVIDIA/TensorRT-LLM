@@ -240,8 +240,8 @@ _AUDIO0_TOKENS = 5
 # MultimodalPromptOrder.resolve().flatten() must hand to the expand hook.
 _EXPECTED_PROMPT_ORDER_TOKENS = [_IMG0_TOKENS, _AUDIO0_TOKENS, _IMG1_TOKENS]
 
-# What the superseded single-modality `_get_single_mm_token_lengths`
-# (`next(iter(num_mm_tokens_by_key.values()))`) path would have produced: only
+# What the superseded single-modality (first-bucket-only,
+# `next(iter(num_mm_tokens_by_key.values()))`) path would have produced: only
 # the first modality bucket (image), dropping audio and any interleaving.
 _OLD_SINGLE_MODALITY_TOKENS = [_IMG0_TOKENS, _IMG1_TOKENS]
 
@@ -388,7 +388,7 @@ def test_call_with_token_ids_flattens_mixed_modalities_in_prompt_order():
 def test_call_with_token_ids_red_when_flatten_regresses_to_single_modality(monkeypatch):
     # RED guard: prove the assertion above actually catches a regression. Stub
     # MultimodalPromptOrder.flatten to emulate the superseded single-modality
-    # `_get_single_mm_token_lengths` (`next(iter(num_mm_tokens_by_key.values()))`)
+    # (first-bucket-only, `next(iter(num_mm_tokens_by_key.values()))`)
     # behavior -- only the first modality bucket. Under that stub the expand hook
     # sees [2, 3] (images only), which the prompt-order assertion rejects.
     processor = _FakeTokenIdMMProcessor()

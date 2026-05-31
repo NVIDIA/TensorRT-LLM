@@ -17,9 +17,7 @@ from tensorrt_llm._torch.models.checkpoints import NemotronHHfWeightMapper
 from tensorrt_llm.inputs.multimodal import (
     MultimodalParams,
     MultimodalPromptOrder,
-    _as_cpu_tensor,
-    _compute_mm_masks,
-    _find_mm_embedding_lengths_from_masks,
+    find_multimodal_embedding_lengths,
 )
 
 from ...inputs import (
@@ -2814,14 +2812,8 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
             mm_data,
         )
         # Same modality can appear twice. Keep per-item embed lengths so chunks follow prompt order.
-        mm_mask, embed_mask, _ = _compute_mm_masks(
-            _as_cpu_tensor(input_ids),
-            vocab_size=self.get_vocab_size(),
-            mm_token_ids=self.get_mm_token_ids(),
-            mm_special_token_ids=self.get_mm_special_token_ids(),
-        )
-        multimodal_data["multimodal_embedding_lengths"] = _find_mm_embedding_lengths_from_masks(
-            mm_mask, embed_mask, num_mm_tokens
+        multimodal_data["multimodal_embedding_lengths"] = find_multimodal_embedding_lengths(
+            input_ids, self, num_mm_tokens
         )
         self._merge_mm_data_updates(multimodal_data, mm_data_updates)
         return input_ids, {"multimodal_data": multimodal_data}
@@ -3641,9 +3633,6 @@ class NemotronH_Nano_VL_V2(transformers.PreTrainedModel):
                 if item.modality == "video" and item_num_tokens is not None:
                     src = multimodal_params[item.src_param_idx]
                     src.multimodal_data["num_tokens_in_video"] = item_num_tokens
-                    src.multimodal_data.setdefault("num_tokens_in_video_by_modality", {})[
-                        item.modality
-                    ] = item_num_tokens
         return torch.cat(embs, dim=0)
 
     def _adapter_audio_bucket(

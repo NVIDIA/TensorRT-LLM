@@ -454,8 +454,6 @@ class TestNanoVisionBucketAdapter:
         out = model._adapter_vision_bucket([item], params)
         assert out.shape == (9, 4)
         assert params[0].multimodal_data["num_tokens_in_video"] == [3, 3, 3]
-        # Also stash the by-modality view (matches legacy 3463-3466 behavior)
-        assert params[0].multimodal_data["num_tokens_in_video_by_modality"]["video"] == [3, 3, 3]
 
     def test_mixed_param_synthesizes_single_modality_view(self):
         # Image item from a mixed image+audio param: adapter should
