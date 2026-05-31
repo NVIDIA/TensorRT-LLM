@@ -1623,8 +1623,14 @@ def _handle_decode_impl(
     fused_q_view = fused_q_flat.view(num_tokens, num_heads, gen_head_size)
 
     # BMM: [num_heads, num_tokens, qk_nope_head_dim] @ [num_heads, qk_nope_head_dim, kv_lora_rank]
-    q_absorbed = torch.bmm(q_nope_flat.transpose(0, 1), w_kn)
-    fused_q_view[:, :, :kv_lora_rank] = q_absorbed.transpose(0, 1)
+    # Write the absorbed q straight into fused_q[..., :kv_lora_rank] via a transposed
+    # strided view (bmm out=), avoiding the separate transpose + slice-assign copy
+    # (PT-style bmm_out). bit-identical; drops one direct_copy kernel per layer.
+    torch.bmm(
+        q_nope_flat.transpose(0, 1),
+        w_kn,
+        out=fused_q_view[:, :, :kv_lora_rank].transpose(0, 1),
+    )
 
     cu_q = planner.cu_q_decode[: num_tokens + 1]
     cu_kv = planner.cu_kv_decode[: num_tokens + 1]
