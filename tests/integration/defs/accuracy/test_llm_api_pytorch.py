@@ -7736,9 +7736,10 @@ class TestStep3_7(LlmapiAccuracyTestHarness):
     @skip_pre_blackwell
     @pytest.mark.skip_less_device(4)
     @pytest.mark.skip_less_device_memory(80000)
-    @parametrize_with_ids("mtp_nextn", [0, 3])
     @parametrize_with_ids("tp_size,ep_size", [(4, 4)])
-    def test_nvfp4(self, tp_size, ep_size, mtp_nextn):
+    def test_nvfp4(self, tp_size, ep_size):
+        # The NVFP4 export does not ship MTP weights, so this checkpoint is only
+        # exercised without speculative decoding (unlike the FP8/BF16 ones).
         model_path = f"{llm_models_root()}/Step-3.7-Flash-NVFP4"
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.7,
                                         use_kv_cache_manager_v2=True)
@@ -7748,17 +7749,12 @@ class TestStep3_7(LlmapiAccuracyTestHarness):
             moe_config=MoeConfig(backend="TRTLLM"),
         )
 
-        mtp_config = None
-        if mtp_nextn > 0:
-            mtp_config = MTPDecodingConfig(max_draft_len=mtp_nextn)
-
         with LLM(model_path,
                  tensor_parallel_size=tp_size,
                  moe_expert_parallel_size=ep_size,
                  kv_cache_config=kv_cache_config,
                  max_seq_len=8192,
                  attn_backend="TRTLLM",
-                 speculative_config=mtp_config,
                  trust_remote_code=True,
                  **pytorch_config) as llm:
             assert llm.args.quant_config.quant_algo == QuantAlgo.NVFP4

@@ -771,7 +771,7 @@ class TestStep3_7(LlmapiAccuracyTestHarness):
     def _make_llm(self, model_path: str):
         pytorch_config = dict(
             disable_overlap_scheduler=False,
-            cuda_graph_config=CudaGraphConfig(enable_padding=True),
+            cuda_graph_config=CudaGraphConfig(enable_padding=False),
             moe_config=MoeConfig(backend="TRTLLM"),
         )
         return LLM(

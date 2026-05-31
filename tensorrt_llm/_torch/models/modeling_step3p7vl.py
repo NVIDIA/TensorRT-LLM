@@ -534,6 +534,13 @@ class Step3p7VisionTower(nn.Module):
     def load_weights(self, weights: Dict[str, torch.Tensor]):
         """Consume ``vision_model.*`` and ``vit_large_projector.*`` keys.
 
+        Both checkpoint layouts are supported: the FP8/BF16 exports key the
+        vision subtree directly (``vision_model.*`` / ``vit_large_projector.*``),
+        while the NVFP4 export nests everything under ``model.`` alongside the
+        ``model.language_model.*`` text decoder (``model.vision_model.*`` /
+        ``model.vit_large_projector.*``). An optional leading ``model.`` is
+        stripped before matching so both load identically.
+
         Returns silently if neither subtree is present (e.g. text-only
         checkpoint slice); the caller will surface a missing-weights error
         downstream via the model engine if that is wrong for the scenario.
@@ -541,11 +548,13 @@ class Step3p7VisionTower(nn.Module):
         vision_state: Dict[str, torch.Tensor] = {}
         projector_state: Dict[str, torch.Tensor] = {}
         for key in list(weights.keys()):
-            if key.startswith("vision_model."):
-                sub = key[len("vision_model.") :]
+            # Normalize the NVFP4 ``model.`` wrapper prefix to the bare layout.
+            norm_key = key[len("model.") :] if key.startswith("model.") else key
+            if norm_key.startswith("vision_model."):
+                sub = norm_key[len("vision_model.") :]
                 vision_state[sub] = weights[key]
-            elif key.startswith("vit_large_projector."):
-                sub = key[len("vit_large_projector.") :]
+            elif norm_key.startswith("vit_large_projector."):
+                sub = norm_key[len("vit_large_projector.") :]
                 projector_state[sub] = weights[key]
 
         if vision_state:
