@@ -24,7 +24,6 @@ This is the replacement for the legacy heuristic-based sharding pipeline in
 for background.
 """
 
-import fnmatch
 import operator
 from abc import ABC, abstractmethod
 from functools import partial
@@ -63,7 +62,6 @@ from ..interface import (
 # NOTE: sharding.py module will be deprecated in the future. The following
 # imports will move into sharding_ir.py when legacy sharding is removed.
 from .sharding import (
-    FineGrainedFP8WeightShardingInfo,
     SplitDimension,
     _get_dist_ops,
     _load_hook,
@@ -74,25 +72,18 @@ from .sharding import (
 
 
 def _split_fp8_block_scale(
-    scale: torch.Tensor, dim: int, rank: int, world_size: int, weight_n: Optional[int] = None
+    scale: torch.Tensor, dim: int, rank: int, world_size: int
 ) -> torch.Tensor:
-    """Shard a finegrained FP8 per-block scale to match a ``tensor_split`` weight shard.
+    """Split a finegrained FP8 per-block scale tensor along *dim*.
 
-    Delegates to the legacy per-row expansion (keyed on the weight's true size
-    ``weight_n``), so misaligned shards — ``weight_n`` not a multiple of 128, or
-    ``ceil(weight_n/128) < world_size`` (e.g. kv_a: 576 rows -> 5 scale rows across
-    8 GPUs) — map each weight row to its block scale instead of crashing on
-    ``tensor_split(scale, world_size)[rank]``. Aligned shards keep the contiguous
-    block slice so ``block_n`` is preserved for the FP8 GEMM kernel.
-
-    ``weight_n`` defaults to ``scale.shape[dim] * 128`` only as a safety fallback;
-    callers should pass the real weight dim so partial last blocks are handled.
+    Handles the edge case where ``scale.shape[dim] < world_size`` (e.g., a
+    2-row scale shared across 8 GPUs) by grouping ranks that share a row.
     """
-    if weight_n is None:
-        weight_n = scale.shape[dim] * 128
-    return FineGrainedFP8WeightShardingInfo._get_sharded_scale(
-        scale, weight_n, dim, rank, world_size
-    )
+    scale_dim = scale.shape[dim]
+    if scale_dim >= world_size:
+        return torch.tensor_split(scale, world_size, dim=dim)[rank]
+    group = rank // (world_size // scale_dim)
+    return torch.tensor_split(scale, scale_dim, dim=dim)[group]
 
 
 def _shard_scale_and_hook(
@@ -274,47 +265,6 @@ class LinearShardableNode(ShardableNode):
         if tp_mode == "none":
             return 0
 
-        if tp_mode == "simple_shard":
-            # Column-shard the weight + all_gather the output. The gather restores the full
-            # activation before any consumer (e.g. a layernorm over the full latent), so it is
-            # numerically equivalent to replication but distributes the GEMM; for FP8 weights
-            # whose per-rank shard is not 128-aligned it also triggers the kernel BF16 fallback.
-            # Used for the MLA latent down-projections (q_a/kv_a) that sit before the head-parallel
-            # TP region and so cannot be head-sharded.
-            weight_nodes = extract_weight_nodes(self.node)
-            if not weight_nodes.weights:
-                return 0
-            for wn in weight_nodes.weights:
-                shard_weight_tensor(
-                    gm=gm,
-                    weight_tensor=wn.tensor,
-                    param_key=wn.node_key,
-                    dim=SplitDimension.COLUMN,
-                    rank=dc.tp_rank,
-                    world_size=dc.tp_size,
-                )
-            for bn in weight_nodes.biases:
-                shard_weight_tensor(
-                    gm=gm,
-                    weight_tensor=bn.tensor,
-                    param_key=bn.node_key,
-                    dim=SplitDimension.COLUMN,
-                    rank=dc.tp_rank,
-                    world_size=dc.tp_size,
-                )
-            self._shard_scales(gm, dc, weight_nodes, SplitDimension.COLUMN, 1, None)
-            all_gather_op, _ = _get_dist_ops("auto")
-            if all_gather_op is torch.ops.auto_deploy.trtllm_dist_all_gather.default:
-                gather_args = (dc.allreduce_strategy, -1, None)
-            else:
-                gather_args = (-1,)
-            with gm.graph.inserting_after(self.node):
-                gather_node = gm.graph.call_function(all_gather_op, args=(self.node, *gather_args))
-                self.node.replace_all_uses_with(gather_node)
-                gather_node.replace_input_with(gather_node, self.node)
-            ad_logger.debug("  simple-sharded linear (tp_mode=simple_shard -> colwise+all_gather)")
-            return 1
-
         split_dim = SplitDimension.COLUMN if tp_mode == "colwise" else SplitDimension.ROW
         fused = tuple(output_sizes) if output_sizes else None
         min_shape = tp_min_local_shape if tp_min_local_shape else 1
@@ -364,16 +314,9 @@ class FineGrainedFP8LinearShardableNode(LinearShardableNode):
     """FineGrained FP8 linear: shards per-block ``weight_scale_inv`` buffers."""
 
     def _shard_scales(self, gm, dc, weight_nodes, dim, min_shape=1, fused=None):
-        # Per-row expansion needs the weight's true size along `dim` to handle
-        # misaligned shards (e.g. kv_a N=576 -> 5 scale rows < world_size).
-        weight_n = weight_nodes.weights[0].tensor.shape[dim] if weight_nodes.weights else None
         for sn in weight_nodes.scales:
             f_split = partial(
-                _split_fp8_block_scale,
-                dim=dim,
-                rank=dc.tp_rank,
-                world_size=dc.tp_size,
-                weight_n=weight_n,
+                _split_fp8_block_scale, dim=dim, rank=dc.tp_rank, world_size=dc.tp_size
             )
             sharded = f_split(sn.tensor)
             _shard_scale_and_hook(gm, sn, sharded, f_split)
@@ -671,19 +614,10 @@ class FineGrainedFP8SwiGLUShardableNode(SwiGLUShardableNode):
     """FineGrained FP8 SwiGLU: shards per-block ``weight_scale_inv`` buffers."""
 
     def _shard_scales(self, gm, dc, weight_nodes):
-        # Match each scale to its weight to recover weight_n for per-row expansion.
-        wmap = {wn.node_key: wn.tensor for wn in weight_nodes.weights}
         for sn in weight_nodes.scales:
             dim = self._dim_for_key(sn.node_key)
-            wkey = sn.node_key.replace("_scale_inv", "").replace("_scale", "")
-            wtensor = wmap.get(wkey)
-            weight_n = wtensor.shape[dim] if wtensor is not None else None
             f_split = partial(
-                _split_fp8_block_scale,
-                dim=dim,
-                rank=dc.tp_rank,
-                world_size=dc.tp_size,
-                weight_n=weight_n,
+                _split_fp8_block_scale, dim=dim, rank=dc.tp_rank, world_size=dc.tp_size
             )
             _shard_scale_and_hook(gm, sn, f_split(sn.tensor), f_split)
 
@@ -955,14 +889,6 @@ class IRShardingConfig(TransformConfig):
         default=None,
         description="When set, only shard nodes whose layer_type hint is in this list.",
     )
-    tp_mode_overrides: Optional[Dict[str, str]] = Field(
-        default=None,
-        description=(
-            "Optional fnmatch(weight-name) -> tp_mode map that overrides a linear's model-emitted "
-            'tp_mode hint, e.g. {"*q_a_proj*": "simple_shard"}. Lets a YAML config set the sharding '
-            "plan for specific linears without editing the model."
-        ),
-    )
     enable_attention_dp: bool = Field(default=False)
     dist_mapping: dict[str, int] = Field(default_factory=dict)
     dist_config: DistConfig = Field(default_factory=DistConfig)
@@ -1057,16 +983,14 @@ def _apply_simple_shard(gm: GraphModule, dc: DistConfig) -> int:
             enable_sharding._shard_scales(
                 gm, dc, weight_nodes, dim=SplitDimension.COLUMN, min_shape=1, fused=None
             )
-        # Backend-aware all_gather (matches legacy): trtllm op carries the strategy
-        # arg (tensor, strategy, dim, sizes, workspace_id); the demollm torch op is
-        # (tensor, dim, sizes). Hardcoding the torch op breaks the trtllm runtime.
-        all_gather_op, _ = _get_dist_ops("auto")
-        if all_gather_op is torch.ops.auto_deploy.trtllm_dist_all_gather.default:
-            gather_args = (dc.allreduce_strategy, -1, None)
-        else:
-            gather_args = (-1,)
+        # torch_dist_all_gather is the demollm backend op; signature is
+        # (tensor, dim=0, sizes=None) — plain torch.distributed all_gather,
+        # no strategy or symm_mem support (use the trtllm backend for those).
         with gm.graph.inserting_after(node):
-            gather_node = gm.graph.call_function(all_gather_op, args=(node, *gather_args))
+            gather_node = gm.graph.call_function(
+                torch.ops.auto_deploy.torch_dist_all_gather.default,
+                args=(node, -1),
+            )
             node.replace_all_uses_with(gather_node)
             gather_node.replace_input_with(gather_node, node)
         num_updates += 1
@@ -1168,7 +1092,6 @@ class ApplyShardingHints(BaseTransform):
             _log_sharding_result(dc, num_updates)
         else:
             shard_layers = self.config.shard_layers
-            tp_mode_overrides = self.config.tp_mode_overrides
             num_skipped = 0
             all_dead_nodes = []
 
@@ -1186,16 +1109,6 @@ class ApplyShardingHints(BaseTransform):
                         if lt is not None and lt not in shard_layers:
                             num_skipped += 1
                             continue
-
-                    # YAML-configurable tp_mode override: if any of this linear's weight names
-                    # matches an fnmatch pattern, overwrite the model-emitted tp_mode hint before
-                    # sharding (e.g. force the MLA latent projections to "simple_shard").
-                    if tp_mode_overrides and isinstance(shardable_node, LinearShardableNode):
-                        wkeys = [wn.node_key for wn in extract_weight_nodes(node).weights]
-                        for pattern, mode in tp_mode_overrides.items():
-                            if any(fnmatch.fnmatch(k, pattern) for k in wkeys):
-                                set_op_args(node, tp_mode=mode)
-                                break
 
                     num_updates += shardable_node.apply(gm, dc, max_num_tokens)
 
