@@ -30,6 +30,7 @@ from .accuracy_core import (
     LlmapiAccuracyTestHarness,
     MixedModality,
     MixedModalityVideoAudio,
+    QwenVLMixedModality,
     VideoMME,
     VoxPopuli,
 )
@@ -458,6 +459,36 @@ class TestQwen3VL(LlmapiAccuracyTestHarness):
         ) as llm:
             task = MMMU(self.MODEL_NAME)
             task.evaluate(llm, sampling_params=self.sampling_params)
+
+    # One-request image+video mixed-modality gate. Each request carries an image
+    # and a video; the evaluator asks an image question (video distractor) on
+    # some samples and a video question (image distractor) on others, scoring
+    # BOTH image and video as targets. The inherited MixedModalityEvaluator gates
+    # the image-target and video-target mixed-vs-pure accuracy deltas
+    # independently, proving Qwen3-VL answers both image and video questions
+    # correctly inside a single mixed request.
+    mixed_modality_sampling_params = SamplingParams(
+        max_tokens=QwenVLMixedModality.MAX_OUTPUT_LEN,
+        truncate_prompt_tokens=QwenVLMixedModality.MAX_INPUT_LEN,
+        stop="<|endoftext|>",
+        temperature=0.0,
+        top_k=1,
+    )
+
+    @pytest.mark.skip_less_device_memory(80000)
+    def test_mixed_modality(self):
+        with LLM(
+            self.MODEL_PATH,
+            enable_chunked_prefill=True,
+            # Low max_num_tokens forces chunking, surfacing runtime errors a
+            # change might introduce in the mixed image+video path.
+            max_num_tokens=512,
+        ) as llm:
+            task = QwenVLMixedModality(self.MODEL_NAME)
+            task.evaluate(
+                llm,
+                sampling_params=self.mixed_modality_sampling_params,
+            )
 
 
 class TestKimiK25(LlmapiAccuracyTestHarness):

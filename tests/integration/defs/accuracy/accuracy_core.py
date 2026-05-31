@@ -394,7 +394,17 @@ class MixedModalityVideoAudio(AccuracyTask):
 
 
 class QwenVLMixedModality(AccuracyTask):
-    """One-request image+video accuracy task for Qwen-VL-style models."""
+    """One-request image+video accuracy task for Qwen-VL-style models.
+
+    Each request carries both an image and a video; the evaluator asks an image
+    question (video is a distractor) on some samples and a video question (image
+    is a distractor) on others. Both `image` and `video` are scored as targets
+    (`target_modalities=(image, video)`), so the inherited
+    `MixedModalityEvaluator` gates the image-target and video-target mixed-vs-pure
+    accuracy deltas independently. This proves the model answers BOTH image and
+    video questions correctly inside a single mixed request, rather than letting
+    one modality dominate.
+    """
 
     DATASET = "mixed_modality_qwen_vl"
     MMMU_DATASET_DIR = f"{llm_models_root()}/datasets/MMMU"
@@ -420,6 +430,10 @@ class QwenVLMixedModality(AccuracyTask):
             MODALITY_VIDEO: VIDEOMME_DATASET_DIR,
         },
         "active_modalities": (MODALITY_IMAGE, MODALITY_VIDEO),
+        # Score BOTH image and video as targets so the per-target mixed-vs-pure
+        # gate covers each modality. (This is also the evaluator default when
+        # target_modalities is omitted; stated explicitly here as the contract.)
+        "target_modalities": (MODALITY_IMAGE, MODALITY_VIDEO),
         "random_seed": 0,
         "num_frames": 8,
         "pure_baseline_max_accuracy_drop": 5.0,
