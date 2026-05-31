@@ -1,5 +1,7 @@
+import gc
 import time
 import uuid
+import weakref
 
 import pytest
 import torch
@@ -229,12 +231,89 @@ def test_cancel_request_in_transmission(attention_type):
     assert gen_request.state == LlmRequestState.DISAGG_TRANS_ERROR
 
 
+@pytest.mark.timeout(120)
+@pytest.mark.parametrize("side", ["sender", "receiver"],
+                         ids=["sender", "receiver"])
+def test_async_transfer_keeps_llm_request_alive(side):
+    """Async transfer entry points keep LlmRequest alive while in flight.
+
+    The futures vector on each side holds a strong shared_ptr<LlmRequest>;
+    if a future regression switched back to storing a raw pointer the
+    Python wrapper would be GC'd and the weakref below would expire
+    prematurely.
+    """
+    mapping = Mapping(world_size=1, rank=0)
+    dist = Distributed.get(mapping)
+    kv_cache_manager_ctx = create_kv_cache_manager(mapping, DataType.HALF)
+    kv_cache_manager_gen = create_kv_cache_manager(mapping, DataType.HALF)
+
+    cache_transceiver_config = CacheTransceiverConfig(backend="DEFAULT",
+                                                      max_tokens_in_buffer=512)
+    transceiver_ctx = create_kv_cache_transceiver(mapping, dist,
+                                                  kv_cache_manager_ctx,
+                                                  AttentionTypeCpp.DEFAULT,
+                                                  cache_transceiver_config)
+    transceiver_gen = create_kv_cache_transceiver(mapping, dist,
+                                                  kv_cache_manager_gen,
+                                                  AttentionTypeCpp.DEFAULT,
+                                                  cache_transceiver_config)
+
+    fill_kv_cache_buffer(kv_cache_manager_ctx)
+
+    sampling_params = SamplingParams()
+    ctx_request = LlmRequest(
+        request_id=0,
+        max_new_tokens=1,
+        input_tokens=list(range(256)),
+        sampling_config=tensorrt_llm.bindings.SamplingConfig(
+            sampling_params._get_sampling_config()),
+        is_streaming=False,
+        llm_request_type=LlmRequestType.LLMREQUEST_TYPE_CONTEXT_ONLY)
+    kv_cache_manager_ctx.impl.add_sequence_batch(
+        [(ctx_request.py_request_id, ctx_request.prompt_len, 1)], [ctx_request])
+
+    gen_request = LlmRequest(
+        request_id=0,
+        max_new_tokens=1,
+        input_tokens=list(range(256)),
+        sampling_config=tensorrt_llm.bindings.SamplingConfig(
+            sampling_params._get_sampling_config()),
+        is_streaming=False,
+        llm_request_type=LlmRequestType.LLMREQUEST_TYPE_GENERATION_ONLY,
+        context_phase_params=ctx_request.context_phase_params)
+    kv_cache_manager_gen.impl.add_sequence_batch(
+        [(gen_request.py_request_id, gen_request.prompt_len, 1)], [gen_request])
+
+    ctx_ref = weakref.ref(ctx_request)
+    gen_ref = weakref.ref(gen_request)
+
+    transceiver_ctx.respond_and_send_async(ctx_request)
+    transceiver_gen.request_and_receive_async(gen_request)
+
+    # Drop the external Python references. After this, the only owners
+    # of the underlying C++ objects are the shared_ptr entries inside
+    # mSenderFutures / mRequesterFutures.
+    del ctx_request
+    del gen_request
+    gc.collect()
+
+    target_ref = ctx_ref if side == "sender" else gen_ref
+    assert target_ref() is not None, (
+        f"{side}-side LlmRequest was destroyed prematurely; the async "
+        f"transfer entry point must hold a strong shared_ptr while the "
+        f"future is in flight")
+
+    # Drive the transfer to completion so the harness tears down cleanly.
+    transceiver_ctx.check_context_transfer_status(1)
+    transceiver_gen.check_gen_transfer_status(1)
+
+
 def create_hybrid_cache_manager(mapping,
                                 dtype,
                                 mamba_conv_dtype=torch.float16,
                                 mamba_ssm_dtype=torch.float16):
-    """
-    Create a MambaHybridCacheManager for testing hybrid models.
+    """Create a MambaHybridCacheManager for testing hybrid models.
+
     This manager handles both KV cache (attention layers) and Mamba cache (RNN layers).
 
     Args:
