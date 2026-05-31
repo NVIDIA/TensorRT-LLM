@@ -1063,9 +1063,9 @@ public:
     {
         // nvbugs/6104831 Layer F: bracket gen-side data-receive phase. If
         // RECVSYNC-ENTRY without RECVSYNC-EXIT, the wedge is inside the
-        // formatter unformat (per-block recv / concat).
-        auto const reqIdForLog
-            = session.hasLlmRequest() ? session.getLlmRequest().mRequestId : static_cast<RequestIdType>(0);
+        // formatter unformat (per-block recv / concat). mRequest is always
+        // populated by the gen-side flow before receiveSync runs.
+        auto const reqIdForLog = session.getLlmRequest().mRequestId;
         TLLM_LOG_INFO("[DIAG-GEN-RECVSYNC-ENTRY] reqId=%lu", reqIdForLog);
         TLLM_LOG_INFO("[DIAG-GEN-UNFORMAT-ENTRY] reqId=%lu", reqIdForLog);
         mCacheTransferLayer.unformat(session);
