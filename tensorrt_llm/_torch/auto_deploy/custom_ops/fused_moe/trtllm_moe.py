@@ -22,10 +22,48 @@ from tensorrt_llm._torch.modules.fused_moe.routing import RoutingMethodType
 from tensorrt_llm.mapping import Mapping
 
 from ..._compat import ActivationType, is_sm_100f
+from ...utils.cuda_graph import cuda_graph_state
 from ...utils.dist_config import DistConfig
 from ..quantization.quant import TRTLLM_NVFP4_SCALING_VECTOR_SIZE
 
 _f32_scale_cache: dict = {}
+
+
+def _hybrid_runtime_max_tokens_per_rank(
+    local_num_tokens: int,
+    ep_size: int,
+    max_num_tokens: int,
+) -> int:
+    """Pick the MoE all-to-all per-rank token budget (dispatch/sanitize/combine/GEMM stride).
+
+    Hybrid of the slot-13 (cross-rank max) and static-``max_num_tokens`` strategies that
+    avoids the pitfalls of each. Callers never pad ``x``: the dispatch kernel writes only the
+    real ``local_num_tokens`` rows and ``moe_a2a_sanitize_expert_ids`` invalidates the
+    unfilled slots, so the returned value controls only the workspace stride / recv-view /
+    GEMM row count, not how many real rows are moved.
+
+    - **Capture / warm-up path** (decode/extend): use ``local_num_tokens``. Under attention-DP
+      every rank pads to the same ``cg_batch_size``, so the per-rank count already equals the
+      cross-rank max for the captured bucket, and at pure-decode replay it stays consistent.
+      It is a *shape*, not a device scalar, so there is **no per-layer ``.item()`` host sync**
+      (the cost that made the slot-13 read regress at low concurrency). Mixed prefill/decode —
+      where a captured value would be stale — is routed to eager by
+      ``maybe_pad_for_cuda_graph``'s ``_bypass_captured_graphs`` (#13718), so the captured
+      path only sees the uniform decode shape. The tight budget is taken only while the
+      resulting MoE-GEMM row count (``budget * ep_size``) stays in the fast small-M
+      ``bmm_E2m1`` tactic region; above the gate the trtllm-gen autotuner picks a
+      launch-latency-bound tactic (the c=32 regression), so fall back to the big-M
+      ``max_num_tokens`` budget.
+
+    - **Eager path** (prefill, or any step the bypass forced eager): use ``max_num_tokens``.
+      It is a constant every rank computes identically (layout agrees across ranks) and
+      involves no host sync. Prefill is compute-bound, so the fat recv view is amortized.
+    """
+    if torch.cuda.is_current_stream_capturing() or cuda_graph_state.in_warm_up():
+        budget = local_num_tokens
+        if budget > 0 and budget * ep_size * 4 <= max_num_tokens:
+            return budget
+    return max_num_tokens
 
 
 def _get_cached_f32_scale(scale: torch.Tensor) -> torch.Tensor:
@@ -240,17 +278,13 @@ def _run_moe_with_alltoall(
     local_num_experts = fc1_expert_weights.shape[0]
     global_num_experts = local_num_experts * mapping.moe_ep_size
 
-    # runtime_max_tokens_per_rank: max(total_num_tokens) across DP ranks.
-    # Mirrors base TRT-LLM's `runtime_max_tokens_per_rank = max(all_rank_num_tokens)`
-    # in fused_moe_cutlass.py / fused_moe_trtllm_gen.py. AD's shim writes slot 13
-    # pre-forward via `tp_allgather` of `total_num_tokens` (when attention-DP is on);
-    # nest_sequences seeds slot 13 with the local total as a safe default.
-    if batch_info_host is not None:
-        runtime_max_tokens_per_rank = int(batch_info_host[13].item())
-        if runtime_max_tokens_per_rank <= 0:
-            runtime_max_tokens_per_rank = max_num_tokens
-    else:
-        runtime_max_tokens_per_rank = max_num_tokens
+    # Hybrid per-rank token budget: tight (= local count) under capture, static under eager.
+    # See _hybrid_runtime_max_tokens_per_rank. batch_info_host (slot 13) is no longer read
+    # here -- the capture path uses the sync-free local shape instead.
+    local_num_tokens = x.shape[0]
+    runtime_max_tokens_per_rank = _hybrid_runtime_max_tokens_per_rank(
+        local_num_tokens, mapping.moe_ep_size, max_num_tokens
+    )
 
     # Workspace must be sized for the LARGEST element type used by dispatch or combine.
     # The input x may be quantized (fp8/fp4), but combine outputs in the model dtype
@@ -269,20 +303,10 @@ def _run_moe_with_alltoall(
 
     invalid_expert_id = global_num_experts
 
-    # Pad inputs to runtime_max_tokens_per_rank so all ranks send the same number
-    # of rows through dispatch.  Padding expert IDs must route to a VALID rank
-    # (the local rank's first expert), otherwise the dispatch kernel computes an
-    # out-of-bounds target rank.  Zero routing weights ensure padding tokens
-    # contribute nothing to the output.
-    local_num_tokens = x.shape[0]
-    pad_expert_id = mapping.moe_ep_rank * local_num_experts  # routes to local rank
-    pad_size = runtime_max_tokens_per_rank - local_num_tokens
-    if pad_size > 0:
-        x = torch.nn.functional.pad(x, (0, 0, 0, pad_size))  # pad rows with zeros
-        selected_experts = torch.nn.functional.pad(
-            selected_experts, (0, 0, 0, pad_size), value=pad_expert_id
-        )
-        routing_weights = torch.nn.functional.pad(routing_weights, (0, 0, 0, pad_size))
+    # Do NOT pad x to runtime_max_tokens_per_rank: the dispatch kernel writes only the real
+    # ``local_num_tokens`` rows per rank, and moe_a2a_sanitize_expert_ids marks the unfilled
+    # slots invalid so the downstream MoE GEMM skips them. ``runtime_max_tokens_per_rank``
+    # controls only the workspace stride / recv-view shape.
 
     # Build payload list: x, selected_experts, routing_weights
     payloads = [x.contiguous(), selected_experts.contiguous(), routing_weights.contiguous()]
@@ -421,12 +445,12 @@ def _run_trtllm_gen_nvfp4_moe_with_alltoall(
     hidden_size = x.shape[-1]
     local_num_experts = int(fc1_expert_weights_fp4.shape[0])
     global_num_experts = local_num_experts * mapping.moe_ep_size
-    if batch_info_host is not None:
-        runtime_max_tokens_per_rank = int(batch_info_host[13].item())
-        if runtime_max_tokens_per_rank <= 0:
-            runtime_max_tokens_per_rank = max_num_tokens
-    else:
-        runtime_max_tokens_per_rank = max_num_tokens
+    # Hybrid per-rank token budget (see _hybrid_runtime_max_tokens_per_rank): tight local
+    # shape under capture, static max_num_tokens under eager; no slot-13 .item(), no x pad.
+    local_num_tokens = x.shape[0]
+    runtime_max_tokens_per_rank = _hybrid_runtime_max_tokens_per_rank(
+        local_num_tokens, mapping.moe_ep_size, max_num_tokens
+    )
 
     moe_a2a = _GlobalMoeAll2AllCache.get_alltoall(
         mapping=mapping,
@@ -439,16 +463,7 @@ def _run_trtllm_gen_nvfp4_moe_with_alltoall(
     )
 
     invalid_expert_id = global_num_experts
-    local_num_tokens = x.shape[0]
-    pad_expert_id = mapping.moe_ep_rank * local_num_experts
-    pad_size = runtime_max_tokens_per_rank - local_num_tokens
-    if pad_size > 0:
-        x = torch.nn.functional.pad(x, (0, 0, 0, pad_size))
-        selected_experts = torch.nn.functional.pad(
-            selected_experts, (0, 0, 0, pad_size), value=pad_expert_id
-        )
-        routing_weights = torch.nn.functional.pad(routing_weights, (0, 0, 0, pad_size))
-
+    # No x padding: dispatch writes only the real rows; sanitize invalidates the rest.
     recv_results = moe_a2a.dispatch(
         selected_experts,
         [x.contiguous(), selected_experts.contiguous(), routing_weights.contiguous()],
