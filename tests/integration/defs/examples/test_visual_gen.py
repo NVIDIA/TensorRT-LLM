@@ -362,6 +362,15 @@ def _cleanup_cuda():
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
+    # torch.compile / unconditional @torch.compile decorators (e.g. on the TRT-LLM
+    # attention backend's _concat_qkv) lazily spawn an InductorSubproc worker
+    # pool the first time a compiled function runs. The pool's daemon threads
+    # outlive the test and trip pytest-threadleak. Tear them down explicitly.
+    try:
+        from torch._inductor.async_compile import shutdown_compile_workers
+    except ImportError:
+        return
+    shutdown_compile_workers()
 
 
 def _save_lpips_video_mp4(video, output_path, frame_rate):
@@ -462,10 +471,13 @@ def _assert_lpips_below_threshold(score, threshold):
 def _generate_flux_lpips_image(model_path, output_path):
     from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineLoader
     from tensorrt_llm.media.encoding import save_image
-    from tensorrt_llm.visual_gen.args import VisualGenArgs
+    from tensorrt_llm.visual_gen.args import TorchCompileConfig, VisualGenArgs
 
     _skip_if_missing(model_path, "FLUX checkpoint", is_dir=True)
-    args = VisualGenArgs(model=model_path)
+    args = VisualGenArgs(
+        model=model_path,
+        torch_compile_config=TorchCompileConfig(enable=False),
+    )
     pipeline = PipelineLoader(args).load(skip_warmup=True)
     try:
         result = pipeline.forward(
