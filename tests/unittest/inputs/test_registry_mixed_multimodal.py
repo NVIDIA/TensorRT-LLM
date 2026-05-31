@@ -6,7 +6,10 @@ import torch
 
 from tensorrt_llm.inputs.multimodal import MultimodalPromptOrder, find_mm_token_lengths
 from tensorrt_llm.inputs.multimodal_data import AudioData, VideoData
-from tensorrt_llm.inputs.registry import create_input_processor_with_hash
+from tensorrt_llm.inputs.registry import (
+    BaseMultimodalInputProcessor,
+    create_input_processor_with_hash,
+)
 from tensorrt_llm.sampling_params import SamplingParams
 
 # TODO(claude) : add concise docstrings/comments explaining intended behavior for each test.
@@ -233,3 +236,190 @@ def test_text_wrapper_single_video_uses_default_item_order():
     assert extra["multimodal_input"].multimodal_positions == [1]
     assert extra["multimodal_input"].multimodal_lengths == [4]
     assert extra["multimodal_data"]["multimodal_item_order"] == [{"modality": "video", "index": 0}]
+
+
+# Placeholder token IDs the fake processor emits for each modality in the
+# tokenized fast path. The interleaved prompt below carries image, audio, image
+# in that exact prompt order, so the resolved order is NOT modality-major.
+_IMAGE_PLACEHOLDER_ID = 100
+_AUDIO_PLACEHOLDER_ID = 300
+
+# Distinct per-item token counts so the flattened list is order-sensitive: the
+# only way to get [2, 5, 3] (img0, audio0, img1) is to flatten in PROMPT order
+# across modalities. The superseded single-modality next(iter(...)) path could
+# only ever return one modality's list (e.g. images -> [2, 3]).
+_IMG0_TOKENS = 2
+_IMG1_TOKENS = 3
+_AUDIO0_TOKENS = 5
+
+# The prompt-item-ordered per-item token counts the real
+# MultimodalPromptOrder.resolve().flatten() must hand to the expand hook.
+_EXPECTED_PROMPT_ORDER_TOKENS = [_IMG0_TOKENS, _AUDIO0_TOKENS, _IMG1_TOKENS]
+
+# What the superseded single-modality `_get_single_mm_token_lengths`
+# (`next(iter(num_mm_tokens_by_key.values()))`) path would have produced: only
+# the first modality bucket (image), dropping audio and any interleaving.
+_OLD_SINGLE_MODALITY_TOKENS = [_IMG0_TOKENS, _IMG1_TOKENS]
+
+
+class _FakeTokenIdMMProcessor(BaseMultimodalInputProcessor):
+    """Minimal `BaseMultimodalInputProcessor` opting into the tokenized fast path.
+
+    Exercises `call_with_token_ids` directly (not the hashing wrapper) with a
+    MIXED, interleaved prompt (image, audio, image). The dummy-placeholder step
+    and the real `expand_prompt_token_ids_for_mm` hook are stubbed so the test
+    drives the REAL `find_mm_token_lengths` + `MultimodalPromptOrder.resolve()`
+    + `.flatten()` without a GPU or HF model.
+    """
+
+    # Opt in to the tokenized+MM fast path so `call_with_token_ids` runs.
+    supports_token_id_mm_expansion = True
+
+    def __init__(self):
+        # Bypass BaseMultimodalInputProcessor.__init__ (it wires HF artifacts we
+        # do not need); set only the attributes the exercised path reads.
+        self._tokenizer = None
+        self._config = None
+        self._model_path = None
+        self._use_fast = True
+        self._trust_remote_code = True
+        self._multimodal_hashing_supported = None
+        # Captures the per-item token counts handed to the expand hook, i.e. the
+        # output of `MultimodalPromptOrder.resolve(...).flatten(...)`.
+        self.lengths_seen_by_expander = None
+
+    # --- abstract members (unused by the exercised path, stubbed minimally) ---
+    @property
+    def processor(self):
+        return None
+
+    @property
+    def tokenizer(self):
+        return self._tokenizer
+
+    @property
+    def config(self):
+        return self._config
+
+    @property
+    def dtype(self):
+        return torch.float32
+
+    def call_with_text_prompt(self, inputs, sampling_params):
+        # Invoked by `_process_multimodal_with_dummy_placeholders` on the
+        # synthetic placeholder PROMPT (text, not token ids), so it does not
+        # re-enter the token-id path. Returns an empty token list plus the
+        # processed multimodal payload the rest of `call_with_token_ids` reuses.
+        assert inputs.get("prompt") is not None
+        assert inputs.get("prompt_token_ids") is None
+        return [], {"multimodal_data": {"image": {}, "audio": {}}}
+
+    # --- tokenized+MM fast-path hooks ---
+    def get_text_with_mm_placeholders(self, mm_counts):
+        return "".join(f"<{modality}>" * count for modality, count in mm_counts.items())
+
+    def get_mm_item_order(self, prompt_token_ids, mm_data):
+        # Parse the interleaved prompt to recover (modality, index) in PROMPT
+        # order. The prompt is image, audio, image, so this yields
+        # [(image,0), (audio,0), (image,1)] -- an order modality-major grouping
+        # cannot produce.
+        order = []
+        counters = {"image": 0, "audio": 0}
+        for tok in prompt_token_ids:
+            if tok == _IMAGE_PLACEHOLDER_ID:
+                order.append(("image", counters["image"]))
+                counters["image"] += 1
+            elif tok == _AUDIO_PLACEHOLDER_ID:
+                order.append(("audio", counters["audio"]))
+                counters["audio"] += 1
+        return order
+
+    def expand_prompt_token_ids_for_mm(
+        self,
+        prompt_token_ids,
+        num_mm_tokens_per_placeholder,
+        hf_processor_mm_kwargs=None,
+        mm_data=None,
+    ):
+        # Capture exactly what the resolve().flatten() step produced; this is
+        # the assertion target. Return a sentinel expanded list (the expansion
+        # arithmetic itself is out of scope here).
+        self.lengths_seen_by_expander = list(num_mm_tokens_per_placeholder)
+        assert mm_data is not None
+        return [-1], None
+
+    def get_num_tokens_per_image(self, *, image, **kwargs):
+        # img0 -> 2 tokens, img1 -> 3 tokens (distinct so order is observable).
+        return _IMG0_TOKENS if image.tolist() == [1] else _IMG1_TOKENS
+
+    def get_num_tokens_per_audio(self, *, audio, **kwargs):
+        return _AUDIO0_TOKENS
+
+
+def _mixed_interleaved_inputs():
+    """Tokenized inputs with two images straddling one audio (image, audio, image)."""
+    # mm_data lists are modality-major (image[0], image[1], audio[0]); the
+    # prompt token order is image, audio, image -- so flattening in prompt order
+    # must interleave across the two modalities.
+    mm_data = {
+        "image": [torch.tensor([1]), torch.tensor([2])],
+        "audio": [torch.tensor([3])],
+    }
+    prompt_token_ids = [
+        10,
+        _IMAGE_PLACEHOLDER_ID,  # image[0]
+        11,
+        _AUDIO_PLACEHOLDER_ID,  # audio[0]
+        12,
+        _IMAGE_PLACEHOLDER_ID,  # image[1]
+        13,
+    ]
+    return {
+        "prompt_token_ids": prompt_token_ids,
+        "multi_modal_data": mm_data,
+    }
+
+
+def test_call_with_token_ids_flattens_mixed_modalities_in_prompt_order():
+    # Drives BaseMultimodalInputProcessor.call_with_token_ids directly (the
+    # disaggregated/tokenized fast path authored by PR #14419). With an
+    # interleaved image, audio, image prompt, the per-item counts passed to
+    # expand_prompt_token_ids_for_mm must be flattened in PROMPT-ITEM order
+    # across modalities, i.e. [img0, audio0, img1] = [2, 5, 3]. The superseded
+    # single-modality next(iter(...)) path could only yield one modality's list.
+    processor = _FakeTokenIdMMProcessor()
+    inputs = _mixed_interleaved_inputs()
+
+    expanded_ids, extra = processor.call_with_token_ids(inputs, SamplingParams())
+
+    # The expand hook ran on the real resolve().flatten() output, in prompt order.
+    assert processor.lengths_seen_by_expander == _EXPECTED_PROMPT_ORDER_TOKENS
+    # Sanity: this is provably NOT the order the old single-modality path gave.
+    assert processor.lengths_seen_by_expander != _OLD_SINGLE_MODALITY_TOKENS
+    # Result is the (sentinel) expanded ids the hook returned.
+    assert expanded_ids == [-1]
+    assert "multimodal_data" in extra
+
+
+def test_call_with_token_ids_red_when_flatten_regresses_to_single_modality(monkeypatch):
+    # RED guard: prove the assertion above actually catches a regression. Stub
+    # MultimodalPromptOrder.flatten to emulate the superseded single-modality
+    # `_get_single_mm_token_lengths` (`next(iter(num_mm_tokens_by_key.values()))`)
+    # behavior -- only the first modality bucket. Under that stub the expand hook
+    # sees [2, 3] (images only), which the prompt-order assertion rejects.
+    processor = _FakeTokenIdMMProcessor()
+    inputs = _mixed_interleaved_inputs()
+
+    def _single_modality_flatten(self, values_by_key):
+        # Mirror the old next(iter(...)) assumption: first modality only.
+        return list(next(iter(values_by_key.values())))
+
+    monkeypatch.setattr(MultimodalPromptOrder, "flatten", _single_modality_flatten)
+
+    processor.call_with_token_ids(inputs, SamplingParams())
+
+    # Under the regressed flatten, the expander sees the WRONG (image-only,
+    # un-interleaved) list -- exactly what the prompt-order assertion guards.
+    assert processor.lengths_seen_by_expander == _OLD_SINGLE_MODALITY_TOKENS
+    assert processor.lengths_seen_by_expander != _EXPECTED_PROMPT_ORDER_TOKENS
+    # monkeypatch auto-restores MultimodalPromptOrder.flatten at teardown.
