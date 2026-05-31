@@ -22,6 +22,8 @@
 #define MARLIN_DECLARE_SINGLE_EXPERT_KERNEL
 #include "marlin_nvfp4.h"
 #include "marlin_nvfp4_template.h"
+#include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/common/cudaUtils.h"
 
 #include <algorithm>
 #include <cuda_bf16.h>
@@ -324,6 +326,9 @@ void marlinNvfp4Gemm(void const* act_bf16, void const* weight, void* output, voi
     void const* global_scale_bf16, int m, int n, int k, int* workspace, int num_groups, int group_size,
     bool use_fp32_reduce, cudaStream_t stream)
 {
+    int const sm = tensorrt_llm::common::getSMVersion();
+    TLLM_CHECK_WITH_INFO(
+        sm >= 90 && sm < 100, "Marlin NVFP4 GEMM is only supported on Hopper (SM 9.x); current SM = %d", sm);
 
     int dev;
     cudaGetDevice(&dev);

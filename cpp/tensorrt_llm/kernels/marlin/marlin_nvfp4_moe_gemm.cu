@@ -19,6 +19,8 @@
 #define MARLIN_NAMESPACE_NAME marlin_moe_wna16
 #endif
 
+#include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/logger.h"
 
 #include "marlin_nvfp4.h"
@@ -250,6 +252,9 @@ void marlinNvfp4MoeGemmDispatcher(void const* A, void const* B, void* C, void* C
     void* workspace, int num_groups, int group_size, bool use_fp32_reduce, bool use_atomic_add, cudaDataType_t outType,
     cudaStream_t stream)
 {
+    int const sm = tensorrt_llm::common::getSMVersion();
+    TLLM_CHECK_WITH_INFO(
+        sm >= 90 && sm < 100, "Marlin NVFP4 MoE GEMM is only supported on Hopper (SM 9.x); current SM = %d", sm);
 
     int dev;
     cudaGetDevice(&dev);

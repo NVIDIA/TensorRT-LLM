@@ -34,10 +34,6 @@
 #define MARLIN_NAMESPACE_NAME marlin
 #endif
 
-#if defined(__CUDA_ARCH__) && !(__CUDA_ARCH__ >= 900 && __CUDA_ARCH__ < 1000)
-static_assert(false, "Marlin NVFP4 kernels are Hopper-only (SM 9.x).");
-#endif
-
 namespace MARLIN_NAMESPACE_NAME
 {
 
