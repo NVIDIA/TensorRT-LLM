@@ -1593,17 +1593,19 @@ def remove_original_experts(gm: GraphModule, weight_lists: List[List[Node]]) -> 
     weight_lists_flat = [w for weights in weight_lists for w in weights]
 
     for w in weight_lists_flat:
-        w_param = get_attr_by_name(gm, w.target)
-        if w_param is not None:
-            owner_module, owner_module_path, param_name = get_submodule_of_param(gm, w.target)
-            owner_param = get_attr_by_name(owner_module, param_name)
-            if owner_param is w_param:
-                gm.delete_submodule(owner_module_path)
-            else:
-                # param w is not owned by owner_module, skip
-                continue
-        else:
+        # Experts may share an owning container (e.g. nn.ParameterList): deleting it for the
+        # first expert removes its siblings too, so later targets resolve to a missing attr.
+        try:
+            w_param = get_attr_by_name(gm, w.target)
+        except AttributeError:
             continue
+        if w_param is None:
+            continue
+        owner_module, owner_module_path, param_name = get_submodule_of_param(gm, w.target)
+        owner_param = get_attr_by_name(owner_module, param_name)
+        # delete_submodule requires a non-empty submodule path; root params can't be dropped this way.
+        if owner_param is w_param and owner_module_path:
+            gm.delete_submodule(owner_module_path)
 
 
 def _stack_fp8_moe_weights(
