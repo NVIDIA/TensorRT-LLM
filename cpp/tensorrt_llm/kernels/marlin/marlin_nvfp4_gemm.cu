@@ -15,9 +15,6 @@
  * limitations under the License.
  */
 
-// Single-expert Marlin NVFP4 GEMM dispatcher.
-// BF16 activations + FP4 E2M1 weights + FP8 E4M3 scales.
-
 #ifndef MARLIN_NAMESPACE_NAME
 #define MARLIN_NAMESPACE_NAME marlin
 #endif
@@ -247,11 +244,8 @@ template __global__ void Marlin<nv_bfloat16, 128, 4, 4, 8, false, 4, 1>( MARLIN_
 
 // clang-format on
 
-// =========================================================================
-// FP4 E2M1 -> BF16 dequantization kernel for activations.
-// Each byte contains 2 FP4 values. Block scales are FP8 E4M3 (swizzled).
-// output[i] = fp4_to_bf16(act[i]) * block_scale[i/16] * global_scale
-// =========================================================================
+// FP4 E2M1 -> BF16 activation dequant: out[i] = fp4_to_bf16(act[i]) *
+// block_scale[i/16] * global_scale. Block scales are FP8 E4M3 (swizzled).
 __global__ void dequant_fp4_act_kernel(uint8_t const* __restrict__ act_fp4, // [M, K/2] packed FP4
     uint8_t const* __restrict__ act_sf,                                     // FP8 E4M3 block scales (swizzled)
     float const* __restrict__ alpha,                                        // global scale

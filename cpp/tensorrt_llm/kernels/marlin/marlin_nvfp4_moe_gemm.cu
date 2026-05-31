@@ -15,9 +15,6 @@
  * limitations under the License.
  */
 
-// Fused MoE Marlin NVFP4 GEMM dispatcher.
-// BF16 activations + FP4 E2M1 weights + FP8 E4M3 scales.
-
 #ifndef MARLIN_NAMESPACE_NAME
 #define MARLIN_NAMESPACE_NAME marlin_moe_wna16
 #endif

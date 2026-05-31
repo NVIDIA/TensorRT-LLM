@@ -42,8 +42,8 @@ from ..conftest import (check_device_contain, get_device_count,
                         get_device_memory, llm_models_root,
                         parametrize_with_ids, skip_no_hopper,
                         skip_no_mxfp4_swizzle, skip_post_blackwell,
-                        skip_pre_ada, skip_pre_blackwell, skip_pre_hopper,
-                        skip_ray)
+                        skip_post_hopper, skip_pre_ada, skip_pre_blackwell,
+                        skip_pre_hopper, skip_ray)
 from .accuracy_core import (GSM8K, MMLU, CnnDailymail, GPQADiamond,
                             JsonModeEval, LlmapiAccuracyTestHarness,
                             LongBenchV1, LongBenchV2)
@@ -6834,14 +6834,15 @@ class TestNemotronV3Super(LlmapiAccuracyTestHarness):
             task = GSM8K(self.MODEL_NAME)
 
     @skip_pre_hopper
+    @skip_post_hopper
     @pytest.mark.skip_less_device_memory(80000)
-    @pytest.mark.skip_less_mpi_world_size(8)
-    def test_nvfp4_marlin_8gpus(self):
+    @pytest.mark.skip_less_mpi_world_size(4)
+    def test_nvfp4_marlin_4gpus(self):
         model_path = f"{llm_models_root()}/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4"
         kv_cache_config = KvCacheConfig(enable_block_reuse=False)
         with LLM(model_path,
                  tensor_parallel_size=2,
-                 pipeline_parallel_size=2,
+                 pipeline_parallel_size=1,
                  moe_expert_parallel_size=2,
                  moe_config=MoeConfig(backend="MARLIN"),
                  kv_cache_config=kv_cache_config,

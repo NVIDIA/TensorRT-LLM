@@ -15,21 +15,7 @@
  * limitations under the License.
  */
 
-// Unified internal kernel-side header for the Marlin NVFP4 kernels.
-//
-// Replaces:
-//   - marlin.cuh         (compile-time params, helpers, cp.async wrappers)
-//   - marlin_dtypes.cuh  (MarlinType<scalar_t> traits + fragment aliases)
-//   - dequant.h          (FP4->BF16 and FP8->BF16 dequantization)
-//   - marlin_mma.h       (BF16 m16n8k16 tensor-core MMA instructions)
-//
-// Layout, top to bottom:
-//   1. Compile-time constants (tile / thread / stage sizes)
-//   2. Vec<T,n> helper + div_ceil
-//   3. cp.async wrappers (SM 7.x fallback / SM 8.x+ inline asm)
-//   4. MarlinType<scalar_t> type traits + fragment aliases
-//   5. FP4 / FP8 dequantization
-//   6. BF16 m16n8k16 MMA wrappers (and transposed variant)
+// Internal device-side header for the Marlin NVFP4 kernels.
 
 #pragma once
 
@@ -48,19 +34,15 @@
 #define MARLIN_NAMESPACE_NAME marlin
 #endif
 
+#if defined(__CUDA_ARCH__) && !(__CUDA_ARCH__ >= 900 && __CUDA_ARCH__ < 1000)
+static_assert(false, "Marlin NVFP4 kernels are Hopper-only (SM 9.x).");
+#endif
+
 namespace MARLIN_NAMESPACE_NAME
 {
 
-// =========================================================================
-// 1. Compile-time constants
-// =========================================================================
-
-// 8 warps are a good choice since every SM has 4 schedulers and having more
-// than 1 warp per schedule allows some more latency hiding. At the same time,
-// we want relatively few warps to have many registers per warp and small tiles.
 static constexpr int default_threads = 256;
-
-static constexpr int pipe_stages = 4; // 4 pipeline stages fit into shared memory
+static constexpr int pipe_stages = 4;
 
 static constexpr int min_thread_n = 64;
 static constexpr int min_thread_k = 64;
@@ -69,17 +51,11 @@ static constexpr int max_thread_n = 256;
 static constexpr int tile_size = 16;
 static constexpr int max_par = 16;
 
-// Repack params
 static constexpr int repack_stages = 8;
-
 static constexpr int repack_threads = 256;
 
 static constexpr int tile_k_size = tile_size;
 static constexpr int tile_n_size = tile_k_size * 4;
-
-// =========================================================================
-// 2. Helpers
-// =========================================================================
 
 template <typename T, int n>
 struct Vec
@@ -99,9 +75,7 @@ constexpr int div_ceil(int a, int b)
     return (a + b - 1) / b;
 }
 
-// =========================================================================
-// 3. cp.async wrappers
-// =========================================================================
+// cp.async wrappers (SM 7.x fallback / SM 8.x+ inline asm).
 
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
 
@@ -227,15 +201,9 @@ __device__ inline void cp_async_wait()
 
 #endif
 
-// =========================================================================
-// 4. MarlinType<scalar_t> type traits + fragment aliases
-//    (formerly marlin_dtypes.cuh)
-//
-//    Matrix fragment layouts documented at:
-//    https://docs.nvidia.com/cuda/parallel-thread-execution/index.html
-//      #matrix-fragments-for-mma-m16n8k16-with-floating-point-type
-// =========================================================================
-
+// MarlinType<scalar_t> traits + fragment aliases.
+// MMA m16n8k16 fragment layouts:
+// https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#matrix-fragments-for-mma-m16n8k16-with-floating-point-type
 template <typename T>
 struct MarlinType
 {
@@ -284,19 +252,10 @@ struct MarlinType<nv_bfloat16>
 #endif
 };
 
-// =========================================================================
-// 5. FP4 / FP8 dequantization
-//    (formerly dequant.h)
-//
-//    Fast dequantization for NVFP4 (FP4 E2M1 weights -> BF16) and
-//    FP8 E4M3 scale dequantization -> BF16.
-//
-//    The FP4->BF16 dequant shifts the 3-bit FP4 value (sign + 2-bit
-//    exponent + 1-bit mantissa) into the BF16 exponent/mantissa fields via
-//    bitwise ops. A subsequent multiply by 2^(bias_offset) corrects the
-//    exponent bias (skip_flop=false) or is deferred to fuse with scale
-//    multiply (skip_flop=true).
-// =========================================================================
+// Fast FP4 E2M1 -> BF16 and FP8 E4M3 -> BF16 dequantization.
+// FP4->BF16 places the 3 FP4 bits into BF16's exponent/mantissa via bitwise
+// ops; a subsequent multiply applies the exponent-bias correction (or
+// ``skip_flop=true`` defers it to fuse with a scale multiply downstream).
 
 #if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 750
 
@@ -361,12 +320,7 @@ __device__ inline void dequant_fp8_scales(int q, nv_bfloat162* frag_b)
 
 #endif // __CUDA_ARCH__ >= 750
 
-// =========================================================================
-// 6. BF16 m16n8k16 tensor-core MMA wrappers
-//    (formerly marlin_mma.h)
-// =========================================================================
-
-// m16n8k16 tensor core mma: BF16 inputs, FP32 accumulation.
+// m16n8k16 tensor-core MMA: BF16 inputs, FP32 accumulation.
 template <typename scalar_t>
 __device__ inline void mma(const typename MarlinType<scalar_t>::FragA& a_frag,
     const typename MarlinType<scalar_t>::FragB& frag_b, typename MarlinType<scalar_t>::FragC& frag_c)
@@ -384,7 +338,7 @@ __device__ inline void mma(const typename MarlinType<scalar_t>::FragA& a_frag,
         : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]), "f"(c[0]), "f"(c[1]), "f"(c[2]), "f"(c[3]));
 }
 
-// Transposed variant: B is transposed (used for column-major weight loading).
+// Transposed variant: column-major B weight loading.
 template <typename scalar_t>
 __device__ inline void mma_trans(const typename MarlinType<scalar_t>::FragA& a_frag,
     const typename MarlinType<scalar_t>::FragB& frag_b, const typename MarlinType<scalar_t>::FragB& frag_b2,
@@ -407,16 +361,10 @@ __device__ inline void mma_trans(const typename MarlinType<scalar_t>::FragA& a_f
 
 } // namespace MARLIN_NAMESPACE_NAME
 
-// =========================================================================
-// 7. Single-expert Marlin kernel: MARLIN_KERNEL_PARAMS + Marlin<> forward decl
-//    (formerly marlin_nvfp4_kernel.h)
-//
-//    Opt in by `#define MARLIN_DECLARE_SINGLE_EXPERT_KERNEL` before
-//    `#include "marlin.cuh"`. The MoE translation unit must NOT define
-//    the guard because the MoE kernel uses a different parameter list,
-//    declared in marlin_nvfp4_moe_template.h.
-// =========================================================================
-
+// Single-expert kernel forward decl. Opt in with
+// ``#define MARLIN_DECLARE_SINGLE_EXPERT_KERNEL`` before including. The MoE
+// TU does NOT define it (the MoE kernel has a different parameter list, in
+// marlin_nvfp4_moe_template.h).
 #ifdef MARLIN_DECLARE_SINGLE_EXPERT_KERNEL
 
 #define MARLIN_KERNEL_PARAMS                                                                                           \
