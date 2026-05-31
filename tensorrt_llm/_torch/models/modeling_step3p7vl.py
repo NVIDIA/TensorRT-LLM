@@ -29,10 +29,11 @@ plumbing the vision attention through the text attention metadata.
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.nn.functional as F
+from PIL import Image
 from torch import nn
 from transformers import AutoProcessor, AutoTokenizer, PretrainedConfig
 from transformers.activations import ACT2FN
@@ -736,6 +737,26 @@ class Step3p7VLInputProcessor(BaseMultimodalInputProcessor):
         self._vocab_size = int(getattr(text_config, "vocab_size", 0))
         self._tllm_multimodal_token_id = self._vocab_size + 1
 
+        hf_tok = getattr(self._tokenizer, "tokenizer", self._tokenizer)
+        special_token_ids: List[int] = []
+        for tok in ("<im_start>", "<im_end>", "<patch_start>", "<patch_end>", "<patch_newline>"):
+            try:
+                tok_id = hf_tok.convert_tokens_to_ids(tok)
+            except Exception:
+                tok_id = None
+            unk_id = getattr(hf_tok, "unk_token_id", None)
+            if tok_id is None or (unk_id is not None and tok_id == unk_id):
+                logger.warning(
+                    "[Step3p7VL] Could not resolve structural token %r; "
+                    "multimodal hashing will fall back to the vocab-size "
+                    "discriminator only.",
+                    tok,
+                )
+                special_token_ids = []
+                break
+            special_token_ids.append(int(tok_id))
+        self._mm_special_token_ids = special_token_ids
+
     # ------- BaseMultimodalInputProcessor required properties -------------
 
     @property
@@ -758,6 +779,49 @@ class Step3p7VLInputProcessor(BaseMultimodalInputProcessor):
 
     def get_vocab_size(self) -> int:
         return self._vocab_size
+
+    def get_num_tokens_per_image(
+        self,
+        *,
+        image: Union[Image.Image, torch.Tensor],
+        **kwargs,
+    ) -> int:
+        """Total prompt tokens for one image, framing tokens included.
+
+        Delegates to the remote processor's ``get_num_image_tokens`` (which
+        accounts for ``<patch_start>``/``<patch_end>``/``<patch_newline>`` per
+        tile and ``<im_start>``/``<im_end>`` for the global features), so the
+        count matches the contiguous span produced by ``__call__``.
+        """
+        if isinstance(image, torch.Tensor):
+            height, width = int(image.shape[-2]), int(image.shape[-1])
+        else:
+            width, height = image.width, image.height
+        return int(self._processor.get_num_image_tokens(width, height))
+
+    def get_mm_token_ids(self) -> Optional[torch.Tensor]:
+        """Token ids forming one logical image unit (embed slots + framing).
+
+        ``__call__`` rewrites the ``<im_patch>`` placeholders to the OOV
+        sentinel ``vocab_size + 1``, so the embed slots are matched by that
+        sentinel rather than the original ``<im_patch>`` id. Returning the
+        sentinel together with the framing tokens keeps the whole image span
+        contiguous in the hashing mask. Falls back to ``None`` (vocab-size
+        discriminator) when the framing tokens could not be resolved.
+        """
+        if not self._mm_special_token_ids:
+            return None
+        return torch.tensor([self._tllm_multimodal_token_id] + self._mm_special_token_ids)
+
+    def get_mm_special_token_ids(self) -> Optional[torch.Tensor]:
+        """Framing-token ids inside an image span that carry no vision embed.
+
+        These are subtracted from the embed-row mask so the embed-slot count
+        stays accurate while the span itself remains contiguous.
+        """
+        if not self._mm_special_token_ids:
+            return None
+        return torch.tensor(self._mm_special_token_ids)
 
     @torch.inference_mode()
     def __call__(

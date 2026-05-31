@@ -49,6 +49,7 @@ import unittest
 
 import torch
 from parameterized import parameterized
+from PIL import Image
 from transformers import PretrainedConfig
 from utils.llm_data import llm_models_root
 
@@ -435,6 +436,82 @@ class TestStep3p7VLCheckpoint(unittest.TestCase):
         self._check_vision_config(config_dict["vision_config"])
         self.assertEqual(config_dict["image_token_id"], 128001)
         self.assertIs(config_dict.get("projector_bias", False), False)
+
+
+class TestStep3p7VLInputProcessorHooks(unittest.TestCase):
+    """Multimodal-hashing hooks on ``Step3p7VLInputProcessor``.
+
+    Step3 image spans interleave structural framing tokens
+    (``<im_start>``/``<im_end>``/``<patch_start>``/``<patch_end>``/
+    ``<patch_newline>``) with the ``<im_patch>`` embed slots. These tests
+    verify the processor exposes the per-image token count and framing-token
+    ids the generic hashing path needs to keep each image one contiguous span
+    (the KV-cache-reuse / chunked-prefill prerequisite). Requires the
+    Step-3.7-Flash checkpoint under ``LLM_MODELS_ROOT``.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        from transformers import AutoConfig, AutoTokenizer
+
+        from tensorrt_llm._torch.models.modeling_step3p7vl import Step3p7VLInputProcessor
+
+        cls.config = AutoConfig.from_pretrained(STEP3P7_BF16_DIR, trust_remote_code=True)
+        tokenizer = AutoTokenizer.from_pretrained(STEP3P7_BF16_DIR, trust_remote_code=True)
+        cls.proc = Step3p7VLInputProcessor(
+            STEP3P7_BF16_DIR, cls.config, tokenizer, trust_remote_code=True
+        )
+
+    def test_special_and_mm_token_ids(self):
+        """All five framing tokens resolve; mm_token_ids = sentinel + framing."""
+        special = self.proc.get_mm_special_token_ids()
+        self.assertIsNotNone(special)
+        self.assertEqual(special.numel(), 5)
+        # Distinct and resolved (not collapsed to a single unk id).
+        self.assertEqual(len(set(special.tolist())), 5)
+
+        mm_ids = self.proc.get_mm_token_ids()
+        self.assertIsNotNone(mm_ids)
+        self.assertEqual(mm_ids[0].item(), self.proc._tllm_multimodal_token_id)
+        self.assertEqual(sorted(mm_ids[1:].tolist()), sorted(special.tolist()))
+
+    def test_num_tokens_per_image_matches_processor(self):
+        """The hook delegates to the remote processor's span-length logic."""
+        img = Image.new("RGB", (800, 600))
+        n = self.proc.get_num_tokens_per_image(image=img)
+        self.assertEqual(n, self.proc._processor.get_num_image_tokens(800, 600))
+        self.assertGreater(n, 0)
+        # CHW tensor (h, w) must agree with the PIL (w, h) path.
+        n_tensor = self.proc.get_num_tokens_per_image(image=torch.zeros(3, 600, 800))
+        self.assertEqual(n_tensor, n)
+
+    def test_image_span_is_contiguous(self):
+        """End-to-end: the hashing masks cover one contiguous image span whose
+        length equals ``get_num_tokens_per_image``."""
+        from tensorrt_llm.inputs.multimodal import _compute_mm_masks
+        from tensorrt_llm.sampling_params import SamplingParams
+
+        img = Image.new("RGB", (800, 600))
+        inputs = {"prompt": "<im_patch>", "multi_modal_data": {"image": [img]}}
+        token_ids, _ = self.proc(inputs, SamplingParams())
+        ids = torch.tensor(token_ids)
+
+        mm_mask, embed_mask, special_mask = _compute_mm_masks(
+            ids,
+            vocab_size=self.proc.get_vocab_size(),
+            mm_token_ids=self.proc.get_mm_token_ids(),
+            mm_special_token_ids=self.proc.get_mm_special_token_ids(),
+        )
+
+        expected = self.proc.get_num_tokens_per_image(image=img)
+        self.assertEqual(int(mm_mask.sum()), expected)
+        # Embed slots (sentinels) + framing tokens partition the span.
+        self.assertEqual(int(embed_mask.sum()) + int(special_mask.sum()), expected)
+        # The span is a single contiguous run.
+        positions = mm_mask.nonzero().flatten()
+        self.assertEqual(int(positions[-1] - positions[0]) + 1, positions.numel())
+        # Embed slots are exactly the OOV sentinels.
+        self.assertTrue(bool((ids[embed_mask] == self.proc._tllm_multimodal_token_id).all()))
 
 
 if __name__ == "__main__":
