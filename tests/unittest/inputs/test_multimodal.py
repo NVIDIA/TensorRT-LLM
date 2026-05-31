@@ -58,10 +58,16 @@ def test_tokenized_multimodal_overwrites_stale_embedding_lengths():
         def __call__(self, inputs, sampling_params):
             # Tokenized fast path: multimodal_hashing_process forwards the raw
             # request dict (prompt_token_ids + multi_modal_data), with no
-            # synthesized "prompt" text key.
+            # synthesized "prompt" text key. The real call_with_token_ids
+            # returns the EXPANDED token ids (placeholder tokens replaced with
+            # MM feature tokens) alongside stale dummy-placeholder metadata, and
+            # downstream mask math runs on that post-expansion layout. Mirror it
+            # by routing through this processor's own expansion hook.
             assert inputs["prompt_token_ids"] == [10, 98, 20]
-            return [999], {
+            expanded_ids, _ = self.expand_prompt_token_ids_for_mm(inputs["prompt_token_ids"], [4])
+            return expanded_ids, {
                 "multimodal_data": {
+                    # Stale dummy-placeholder value; recomputed to [3] downstream.
                     "multimodal_embedding_lengths": [999],
                 }
             }
