@@ -70,7 +70,8 @@ __global__ void Marlin(MARLIN_KERNEL_PARAMS);
     static_assert(std::is_same<scalar_t, half>::value || std::is_same<scalar_t, nv_bfloat16>::value,                   \
         "only float16 and bfloat16 is supported");
 
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 750
+// Empty kernel stub for non-Hopper device passes; see marlin.cuh.
+#if defined(__CUDA_ARCH__) && !(__CUDA_ARCH__ >= 900 && __CUDA_ARCH__ < 1000)
 
 template <typename scalar_t,   // compute type (nv_bfloat16)
     int const threads,         // threads per block (128 or 256)
@@ -397,22 +398,7 @@ __global__ void Marlin(MARLIN_KERNEL_PARAMS)
                 }
             }
 
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 750
-
-            if constexpr (moe_block_size >= 16)
-                local_count += __shfl_down_sync(0xFFFFFFFF, local_count, 16);
-            if constexpr (moe_block_size >= 8)
-                local_count += __shfl_down_sync(0xFFFFFFFF, local_count, 8);
-            if constexpr (moe_block_size >= 4)
-                local_count += __shfl_down_sync(0xFFFFFFFF, local_count, 4);
-            if constexpr (moe_block_size >= 2)
-                local_count += __shfl_down_sync(0xFFFFFFFF, local_count, 2);
-
-            local_count += __shfl_down_sync(0xFFFFFFFF, local_count, 1);
-            block_num_valid_tokens = local_count;
-#else
             block_num_valid_tokens = __reduce_add_sync(0xffffffff, local_count);
-#endif
 
             if (lane_id == 0)
                 reinterpret_cast<int*>(sh_new)[0] = block_num_valid_tokens;
@@ -427,10 +413,7 @@ __global__ void Marlin(MARLIN_KERNEL_PARAMS)
             {
                 idx = idx < prob_m_top_k ? idx : 0;
                 scalar_t2 topk_weight_val = Dtype::num2num2(Dtype::float2num(topk_weights_ptr[idx]));
-                if constexpr (true /* FP4 E2M1 + FP8 E4M3 */)
-                {
-                    topk_weight_val = __hmul2(topk_weight_val, global_scale);
-                }
+                topk_weight_val = __hmul2(topk_weight_val, global_scale);
                 sh_block_topk_weights[threadIdx.x] = topk_weight_val;
             }
         }
@@ -452,7 +435,6 @@ __global__ void Marlin(MARLIN_KERNEL_PARAMS)
         block_id = par_id;
         expert_id = expert_ids_ptr[block_id];
 
-        if constexpr (true /* FP4 E2M1 + FP8 E4M3 */)
         {
             uint16_t val = global_scale_ptr[expert_id];
             global_scale = Dtype::num2num2(*reinterpret_cast<scalar_t*>(&val));
@@ -620,7 +602,7 @@ __global__ void Marlin(MARLIN_KERNEL_PARAMS)
     // B sizes/strides
     int b_gl_stride = 16 * prob_n / (pack_factor * (is_a_8bit ? 2 : 4));
     constexpr int b_sh_stride = ((thread_n_blocks * 16) * 16 / pack_factor) / (is_a_8bit ? 2 : 4);
-    constexpr int b_thread_vecs = true /* 4-bit FP4 */ ? 1 : 2;
+    constexpr int b_thread_vecs = 1;
     constexpr int b_sh_stride_threads = b_sh_stride / b_thread_vecs;
 
     int b_gl_rd_delta_o = b_gl_stride * thread_k_blocks / (is_a_8bit ? 2 : 1);
@@ -766,14 +748,7 @@ __global__ void Marlin(MARLIN_KERNEL_PARAMS)
     int zp_sh_rd;
     if constexpr (has_zp)
     {
-        if constexpr (false /* no zp_float */)
-        {
-            if constexpr (group_blocks != -1)
-            {
-                zp_sh_rd = 8 * ((threadIdx.x / 32) % tb_n_warps) + (threadIdx.x % 32) / 4;
-            }
-        }
-        else if (is_a_8bit)
+        if (is_a_8bit)
         {
             zp_sh_rd = num_ints_per_thread * num_col_threads * ((threadIdx.x / 32) % tb_n_warps / 2)
                 + num_ints_per_thread * ((threadIdx.x % 32) / num_row_threads);
@@ -1121,26 +1096,12 @@ __global__ void Marlin(MARLIN_KERNEL_PARAMS)
 
                     int4* sh_s_stage = sh_s + s_sh_stage * pipe;
 
-                    if constexpr (false /* always FP4 E2M1 */)
-                    {
-                        reinterpret_cast<int4*>(&frag_s[k % 2])[0] = sh_s_stage[s_sh_rd + cur_group_id * s_sh_stride];
-                    }
-                    else
-                    {
-                        reinterpret_cast<int2*>(&frag_s[k % 2])[0]
-                            = reinterpret_cast<int2*>(sh_s_stage)[s_sh_rd + cur_group_id * (2 * s_sh_stride)];
-                    }
+                    reinterpret_cast<int2*>(&frag_s[k % 2])[0]
+                        = reinterpret_cast<int2*>(sh_s_stage)[s_sh_rd + cur_group_id * (2 * s_sh_stride)];
                 }
                 else if (group_blocks >= b_sh_wr_iters)
                 {
-                    if constexpr (false /* always FP4 E2M1 */)
-                    {
-                        reinterpret_cast<int4*>(&frag_s[1])[0] = reinterpret_cast<int4*>(&frag_s[0])[0];
-                    }
-                    else
-                    {
-                        reinterpret_cast<int2*>(&frag_s[1])[0] = reinterpret_cast<int2*>(&frag_s[0])[0];
-                    }
+                    reinterpret_cast<int2*>(&frag_s[1])[0] = reinterpret_cast<int2*>(&frag_s[0])[0];
                 }
             }
 
@@ -1222,7 +1183,7 @@ __global__ void Marlin(MARLIN_KERNEL_PARAMS)
         // has_zp implies AWQ, which doesn't have act_order,
         static_assert(!has_zp || group_blocks != 0);
 
-        if constexpr (has_zp && !false /* no zp_float */)
+        if constexpr (has_zp)
         {
             int pipe = full_pipe % stages;
 
@@ -1271,50 +1232,17 @@ __global__ void Marlin(MARLIN_KERNEL_PARAMS)
                 }
             }
         }
-
-        else if constexpr (has_zp && false /* no zp_float */)
-        {
-            int pipe = full_pipe % stages;
-
-            if constexpr (group_blocks != -1)
-            {
-                if constexpr (group_blocks >= thread_k_blocks)
-                {
-                    constexpr int g = group_blocks / thread_k_blocks;
-                    if (pipe % g == 0 && k % b_sh_wr_iters == 0)
-                    {
-                        int4* sh_zp_stage = sh_zp + zp_sh_stage * (g * (pipe / g));
-                        reinterpret_cast<int4*>(&frag_zpf[k % 2])[0] = sh_zp_stage[zp_sh_rd];
-                    }
-                }
-                else if (group_blocks < b_sh_wr_iters || k % b_sh_wr_iters == 0)
-                {
-                    auto warp_id = threadIdx.x / 32;
-
-                    int warp_row = warp_id / tb_n_warps;
-                    int k_blocks = b_sh_wr_iters * warp_row + k % b_sh_wr_iters;
-                    int cur_group_id = k_blocks / group_blocks;
-
-                    int4* sh_zp_stage = sh_zp + zp_sh_stage * pipe;
-
-                    reinterpret_cast<int4*>(&frag_zpf[k % 2])[0] = sh_zp_stage[zp_sh_rd + cur_group_id * zp_sh_stride];
-                }
-            }
-        }
     };
 
     auto dequant_data = [&](int q, scalar_32bit_t* frag_b_ptr, int zp = 0)
     {
-        if constexpr (true /* 16 != 4 */)
+        if constexpr (is_a_8bit && has_zp)
         {
-            if constexpr (is_a_8bit && has_zp)
-            {
-                dequant_fp4<dequant_skip_flop>(q, frag_b_ptr, zp);
-            }
-            else
-            {
-                dequant_fp4<dequant_skip_flop>(q, frag_b_ptr);
-            }
+            dequant_fp4<dequant_skip_flop>(q, frag_b_ptr, zp);
+        }
+        else
+        {
+            dequant_fp4<dequant_skip_flop>(q, frag_b_ptr);
         }
     };
 
@@ -1329,39 +1257,19 @@ __global__ void Marlin(MARLIN_KERNEL_PARAMS)
         bool const is_new_zp = (group_blocks == 0)
             || ((group_blocks > 0) && (group_blocks < b_sh_wr_iters || k == 0)) && (pipe % g == 0)
             || (group_blocks == -1 && is_first_matmul_in_slice);
-        if constexpr (has_zp && !false /* no zp_float */)
+        if constexpr (has_zp)
         {
             if (is_new_zp)
             {
                 if constexpr (group_blocks == -1)
                     is_first_matmul_in_slice = false;
-                int zp_quant_0, zp_quant_1;
-
-                if constexpr (true /* 4-bit FP4 */)
-                {
-                    zp_quant_0 = frag_qzp[k2][0];
-                    zp_quant_1 = zp_quant_0 >> 8;
-                }
-                else
-                {
-                    static_assert(false /* not 8-bit */);
-                    zp_quant_0 = frag_qzp[k2][0];
-                    zp_quant_1 = frag_qzp[k2][1];
-                }
+                int zp_quant_0 = frag_qzp[k2][0];
+                int zp_quant_1 = zp_quant_0 >> 8;
 
                 dequant_data(zp_quant_0, reinterpret_cast<scalar_32bit_t*>(&frag_zp));
                 dequant_data(zp_quant_1, reinterpret_cast<scalar_32bit_t*>(&frag_zp) + 2);
             }
         }
-        if constexpr (!dequant_skip_flop && has_zp && false /* no zp_float */)
-        {
-            if (is_new_zp)
-            {
-                reinterpret_cast<int4*>(&frag_zp)[0] = reinterpret_cast<int4*>(&frag_zpf[k2])[0];
-            }
-        }
-
-        if constexpr (true /* FP4 E2M1 */)
         {
             int s_quant_0 = reinterpret_cast<int*>(frag_s[k2])[0];
             int s_quant_1 = reinterpret_cast<int*>(frag_s[k2])[1];
@@ -1377,30 +1285,13 @@ __global__ void Marlin(MARLIN_KERNEL_PARAMS)
         {
             FragB frag_b0;
             FragB frag_b1;
-            int b_quant_0, b_quant_1;
-
-            if constexpr (true /* FP4 E2M1 */)
-            {
-                b_quant_1 = frag_b_quant[k2][0][j];
-                b_quant_0 = b_quant_1 << 8;
-            }
-            else if constexpr (true /* 4-bit FP4 */)
-            {
-                b_quant_0 = frag_b_quant[k2][0][j];
-                b_quant_1 = b_quant_0 >> 8;
-            }
-            else
-            {
-                static_assert(false /* not 8-bit */);
-                int* frag_b_quant_ptr = reinterpret_cast<int*>(frag_b_quant[k2]);
-                b_quant_0 = frag_b_quant_ptr[j * 2 + 0];
-                b_quant_1 = frag_b_quant_ptr[j * 2 + 1];
-            }
+            int b_quant_1 = frag_b_quant[k2][0][j];
+            int b_quant_0 = b_quant_1 << 8;
 
             dequant_data(b_quant_0, reinterpret_cast<scalar_32bit_t*>(&frag_b0));
             dequant_data(b_quant_1, reinterpret_cast<scalar_32bit_t*>(&frag_b1));
 
-            if constexpr (dequant_skip_flop && has_zp && !false /* no zp_float */ && !is_a_8bit)
+            if constexpr (dequant_skip_flop && has_zp && !is_a_8bit)
             {
                 sub_zp<scalar_t>(frag_b0, frag_zp[j], 0);
                 sub_zp<scalar_t>(frag_b1, frag_zp[j], 1);
@@ -1415,8 +1306,7 @@ __global__ void Marlin(MARLIN_KERNEL_PARAMS)
                 scale4<scalar_t>(
                     frag_b1, act_frag_s[k2][0][j], act_frag_s[k2][1][j], act_frag_s[k2][2][j], act_frag_s[k2][3][j], 1);
             }
-            else if constexpr (!dequant_skip_flop && has_zp && !false /* no zp_float */ && group_blocks == -1
-                && !is_a_8bit)
+            else if constexpr (!dequant_skip_flop && has_zp && group_blocks == -1 && !is_a_8bit)
             {
                 int idx = (threadIdx.x / 4) % 2;
                 scalar_t2 s2 = Dtype::nums2num2(reinterpret_cast<scalar_t*>(&frag_s[j / 2][j % 2 * 2 + 0])[idx],
@@ -1463,12 +1353,12 @@ __global__ void Marlin(MARLIN_KERNEL_PARAMS)
         {
             FragB frag_b[2];
 
-            if (is_a_8bit && true /* 4-bit FP4 */ && !has_zp)
+            if (is_a_8bit && !has_zp)
             {
                 dequant_data(frag_b_quant[k2][0][j * 2], reinterpret_cast<scalar_32bit_t*>(&frag_b));
                 dequant_data(frag_b_quant[k2][0][j * 2 + 1], reinterpret_cast<scalar_32bit_t*>(&frag_b) + 2);
             }
-            else if (is_a_8bit && true /* 4-bit FP4 */ && has_zp)
+            else if (is_a_8bit && has_zp)
             {
                 int off = (threadIdx.x / 32) % 2 * 2 + j;
                 int zp = (frag_qzp[k2][0] >> (off * 8)) & 0xF;
@@ -1493,55 +1383,10 @@ __global__ void Marlin(MARLIN_KERNEL_PARAMS)
             {
                 if (group_blocks == 2 || k == 1)
                 {
-                    if constexpr (false /* not S8 */)
-                    {
-                        int2 s_vals[2];
-                        s_vals[0] = {(int) reinterpret_cast<uint16_t*>(&frag_s[k2][j * 2][0])[0],
-                            (int) reinterpret_cast<uint16_t*>(&frag_s[k2][j * 2][0])[1]};
-                        s_vals[1] = {(int) reinterpret_cast<uint16_t*>(&frag_s[k2][j * 2 + 1][0])[0],
-                            (int) reinterpret_cast<uint16_t*>(&frag_s[k2][j * 2 + 1][0])[1]};
-
-#pragma unroll
-                        for (int i = 0; i < thread_m_blocks; i++)
-                        {
-#pragma unroll
-                            for (int g = 0; g < 4; g++)
-                            {
-                                int scale = reinterpret_cast<int*>(&s_vals[0])[g % 2];
-                                *reinterpret_cast<int32_t*>(&frag_c[i][j][0][g])
-                                    += *reinterpret_cast<int32_t*>(&frag_c_tmp[i][j][0][g]) * scale;
-                                frag_c_tmp[i][j][0][g] = 0.0f;
-                            }
-
-#pragma unroll
-                            for (int g = 0; g < 4; g++)
-                            {
-                                int scale = reinterpret_cast<int*>(&s_vals[1])[g % 2];
-                                *reinterpret_cast<int32_t*>(&frag_c[i][j][1][g])
-                                    += *reinterpret_cast<int32_t*>(&frag_c_tmp[i][j][1][g]) * scale;
-                                frag_c_tmp[i][j][1][g] = 0.0f;
-                            }
-                        }
-                    }
-                    else
                     {
                         float2 s_vals[2];
-                        if constexpr (true /* FP8 E4M3, not E8M0 */)
-                        {
-                            static_assert(true /* BF16 is 16-bit */ || false /* FP8 is 8-bit */);
-                            s_vals[0] = Dtype::num22float2(frag_s[k2][j * 2][0]);
-                            s_vals[1] = Dtype::num22float2(frag_s[k2][j * 2 + 1][0]);
-                        }
-                        else
-                        {
-                            int32_t* s_vals_int = reinterpret_cast<int32_t*>(&s_vals[0]);
-                            int32_t s_vals_e8m0 = *reinterpret_cast<int32_t*>(&frag_s[k2][j][0]);
-
-                            s_vals_int[0] = (s_vals_e8m0 & 0xFF) << 23;
-                            s_vals_int[1] = (s_vals_e8m0 & 0xFF00) << 15;
-                            s_vals_int[2] = (s_vals_e8m0 & 0xFF0000) << 7;
-                            s_vals_int[3] = (s_vals_e8m0 & 0xFF000000) >> 1;
-                        }
+                        s_vals[0] = Dtype::num22float2(frag_s[k2][j * 2][0]);
+                        s_vals[1] = Dtype::num22float2(frag_s[k2][j * 2 + 1][0]);
 
 #pragma unroll
                         for (int i = 0; i < thread_m_blocks; i++)
@@ -1863,7 +1708,7 @@ __global__ void Marlin(MARLIN_KERNEL_PARAMS)
             // For per-column quantization we finally apply the scale here (only for
             // 4-bit)
             if constexpr (!has_act_order && group_blocks == -1 && !is_a_8bit
-                && true /* 4-bit FP4 */ && (has_zp && dequant_skip_flop || !has_zp))
+                && (has_zp && dequant_skip_flop || !has_zp))
             {
                 scalar_t2 tmp_scale = s[0];
                 if constexpr (m_block_size_8)
@@ -1873,12 +1718,9 @@ __global__ void Marlin(MARLIN_KERNEL_PARAMS)
                 res = __hmul2(res, tmp_scale);
             }
 
-            if constexpr (true /* FP4 E2M1 + FP8 E4M3 */)
+            if (!mul_topk_weights)
             {
-                if (!mul_topk_weights)
-                {
-                    res = __hmul2(res, global_scale);
-                }
+                res = __hmul2(res, global_scale);
             }
             if (has_bias && last)
             {
@@ -2000,7 +1842,7 @@ __global__ void Marlin(MARLIN_KERNEL_PARAMS)
                 fetch_act_order_scales_to_shared(true, g_idx[slice_k_start], g_idx[last_g_idx]);
             }
 
-            if constexpr (has_zp && !false /* no zp_float */ && group_blocks == -1)
+            if constexpr (has_zp && group_blocks == -1)
             {
                 if (i == 0)
                 {
@@ -2136,11 +1978,6 @@ __global__ void Marlin(MARLIN_KERNEL_PARAMS)
                         for (int g = 0; g < 4; g++)
                         {
                             float c_val = frag_c[i][j][0][g];
-
-                            if constexpr (false /* not S8 */)
-                            {
-                                c_val = __int2float_rn(*reinterpret_cast<int32_t*>(&c_val));
-                            }
                             float s_val = frag_a_s[i * 2 + g / 2];
                             frag_c[i][j][0][g] = c_val * s_val;
                         }
@@ -2148,11 +1985,6 @@ __global__ void Marlin(MARLIN_KERNEL_PARAMS)
                         for (int g = 0; g < 4; g++)
                         {
                             float c_val = frag_c[i][j][1][g];
-
-                            if constexpr (false /* not S8 */)
-                            {
-                                c_val = __int2float_rn(*reinterpret_cast<int32_t*>(&c_val));
-                            }
                             float s_val = frag_a_s[i * 2 + g / 2];
                             frag_c[i][j][1][g] = c_val * s_val;
                         }
@@ -2166,7 +1998,7 @@ __global__ void Marlin(MARLIN_KERNEL_PARAMS)
             // write-out
             if constexpr (!has_act_order && group_blocks == -1 && (has_zp && dequant_skip_flop || !has_zp))
             {
-                if (false /* not 8-bit */ || (last || use_atomic_add) || is_a_8bit)
+                if ((last || use_atomic_add) || is_a_8bit)
                 {
                     if (s_sh_wr_pred)
                     {
@@ -2196,7 +2028,7 @@ __global__ void Marlin(MARLIN_KERNEL_PARAMS)
                         reinterpret_cast<int4*>(&frag_s)[0] = sh_s[s_sh_rd + 0];
                     }
                 }
-                else if (false /* not 8-bit */ || (last || use_atomic_add))
+                else if (last || use_atomic_add)
                 {
                     cp_async_wait<0>();
                     __syncthreads();
@@ -2245,33 +2077,6 @@ __global__ void Marlin(MARLIN_KERNEL_PARAMS)
                         {
                             float scale = reinterpret_cast<float*>(&aa[1])[g % 2];
                             frag_c[i][j][1][g] *= scale;
-                        }
-                    }
-                }
-            }
-            else if (!has_act_order && group_blocks == -1
-                && false /* not 8-bit */ && (has_zp && dequant_skip_flop || !has_zp))
-            {
-                if (threadIdx.x / 32 < tb_n_warps)
-                {
-#pragma unroll
-                    for (int i = 0; i < thread_m_blocks; i++)
-                    {
-#pragma unroll
-                        for (int j = 0; j < 4; j++)
-                        {
-                            scale_float<scalar_t>(
-                                reinterpret_cast<float*>(&frag_c[i][j][0][0]), frag_s[j / 2][2 * (j % 2) + 0]);
-                            scale_float<scalar_t>(reinterpret_cast<float*>(&frag_c[i][j][0][2]),
-                                frag_s[j / 2][2 * (j % 2) + (m_block_size_8 ? 1 : 0)]);
-
-                            if constexpr (!m_block_size_8)
-                            {
-                                scale_float<scalar_t>(
-                                    reinterpret_cast<float*>(&frag_c[i][j][1][0]), frag_s[j / 2][2 * (j % 2) + 1]);
-                                scale_float<scalar_t>(
-                                    reinterpret_cast<float*>(&frag_c[i][j][1][2]), frag_s[j / 2][2 * (j % 2) + 1]);
-                            }
                         }
                     }
                 }
