@@ -38,7 +38,6 @@ linuxPkgName = ( env.targetArch == AARCH64_TRIPLE ? "tensorrt-llm-sbsa-release-s
 LLM_DOCKER_IMAGE = env.dockerImage
 LLM_ROCKYLINUX8_PY310_DOCKER_IMAGE = env.wheelDockerImagePy310
 LLM_ROCKYLINUX8_PY312_DOCKER_IMAGE = env.wheelDockerImagePy312
-LLM_WHEEL_DOCKER_IMAGE = env.wheelDockerImage
 
 // DLFW torch image
 DLFW_IMAGE = "urm.nvidia.com/docker/nvidia/pytorch:26.02-py3"
@@ -3420,14 +3419,13 @@ def launchTestJobs(pipeline, testFilter)
     }]]}
 
     // Python version and OS for sanity check
-    // Slots: [buildImage, gpuType, cpuArch, reinstallDependencies, isDlfw, pipInstallImage, extraPytorchInstall]
     x86SanityCheckConfigs = [
         "PY312-DLFW": [
-            LLM_DOCKER_IMAGE,
+            LLM_ROCKYLINUX8_PY312_DOCKER_IMAGE,  // Workaround ABI incompatibilities between PyTorch 2.9.1 and 2.10.0a0
             "B200_PCIe",
             X86_64_TRIPLE,
             false,
-            true,
+            "dlfw/",
             DLFW_IMAGE,
             false,
         ],
@@ -3436,7 +3434,7 @@ def launchTestJobs(pipeline, testFilter)
             "A10",
             X86_64_TRIPLE,
             true,
-            false,
+            "",
             UBUNTU_22_04_IMAGE,
             true, // Extra install PyTorch CUDA 13.0 package to align with the CUDA version used for building TensorRT LLM wheels.
         ],
@@ -3445,19 +3443,22 @@ def launchTestJobs(pipeline, testFilter)
             "A100X",
             X86_64_TRIPLE,
             true,
-            false,
+            "",
             UBUNTU_24_04_IMAGE,
             true, // Extra PyTorch CUDA 13.0 install
         ],
     ]
 
     aarch64SanityCheckConfigs = [
+        // Workaround PyTorch 2.9.1 vs. 2.10.0a0 incompatibility issue. Once resolved, change back to:
+        // 1. DLFW_IMAGE -> UBUNTU_24_04_IMAGE
+        // 2. Extra PyTorch CUDA install: false -> true
         "PY312-UB2404": [
-            LLM_WHEEL_DOCKER_IMAGE,
+            LLM_DOCKER_IMAGE,
             "GH200",
             AARCH64_TRIPLE,
             false,
-            false,
+            "",
             UBUNTU_24_04_IMAGE,
             true, // Extra PyTorch CUDA 13.0 install
         ],
@@ -3466,7 +3467,7 @@ def launchTestJobs(pipeline, testFilter)
             "GH200",
             AARCH64_TRIPLE,
             false,
-            true,
+            "dlfw/",
             DLFW_IMAGE,
             false,
         ],
