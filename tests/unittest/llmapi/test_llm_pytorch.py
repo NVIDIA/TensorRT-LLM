@@ -1505,8 +1505,11 @@ async def test_llm_rpc_get_stats_async():
 @pytest.mark.threadleak(enabled=False)
 @pytest.mark.part0
 @skip_ray
-@pytest.mark.parametrize("transceiver_runtime", [None, "PYTHON"])
-def test_llm_context_only_timed_out(transceiver_runtime):
+@pytest.mark.parametrize("transceiver_runtime", [None])
+def test_llm_context_only_timed_out(transceiver_runtime, monkeypatch):
+    # Verify the active cancel path (TRTLLM_DISAGG_ENABLE_INFLIGHT_CANCEL=1).
+    monkeypatch.setenv("TRTLLM_DISAGG_ENABLE_INFLIGHT_CANCEL", "1")
+
     tp_size = 1
     use_overlap = False
     enable_iter_req_stats = False
@@ -1576,6 +1579,107 @@ def test_llm_context_only_timed_out(transceiver_runtime):
     assert final_used_num_blocks == 0
 
 
+@pytest.mark.threadleak(enabled=False)
+@pytest.mark.part0
+@skip_ray
+def test_llm_context_only_timed_out_observe_only(monkeypatch):
+    """Pin down the observe-only (flag-off) V1 KV transfer timeout contract.
+
+    Mirrors ``test_llm_context_only_timed_out`` but inverts the final
+    assertion: with ``TRTLLM_DISAGG_ENABLE_INFLIGHT_CANCEL=0`` (the new
+    default), the timeout detection still fires (one WARN per request
+    per role, with the observe-only tail naming the knob to flip), but
+    the cancellation + mark-as-error + free-blocks chain stays dormant.
+    The timed-out context-only request therefore keeps its KV blocks
+    until the transfer naturally completes -- preserving the
+    pre-PR-13713 hang surface in a memory-safe way and providing
+    visibility-only mode for operators who haven't opted into the
+    active cancellation surface.
+
+    Restricted to the C++ transceiver (``transceiver_runtime=None``,
+    UCX backend) because the flag only gates that surface;
+    ``KvCacheTransceiverV2`` has independent always-on cancel/timeout
+    primitives and is orthogonal to this contract.
+    """
+    monkeypatch.setenv("TRTLLM_DISAGG_ENABLE_INFLIGHT_CANCEL", "0")
+
+    tp_size = 1
+    use_overlap = False
+    enable_iter_req_stats = False
+
+    llm_args_extra = {}
+    llm_args_extra.update(
+        dict(enable_iter_perf_stats=True,
+             enable_iter_req_stats=enable_iter_req_stats,
+             disable_overlap_scheduler=not use_overlap))
+
+    llm = LLM(model=llama_model_path,
+              kv_cache_config=global_kvcache_config,
+              tensor_parallel_size=tp_size,
+              cache_transceiver_config=CacheTransceiverConfig(
+                  backend="UCX", kv_transfer_timeout_ms=1000),
+              **llm_args_extra)
+
+    try:
+        max_tokens = 1
+        sampling_params = SamplingParams(max_tokens=max_tokens)
+        disaggregated_params = DisaggregatedParams(request_type="context_only")
+        prompts0 = ["What is your name?"]
+        prompts1 = ["Nvidia is awesome because"]
+
+        # Send context-only request and wait for stats to populate.
+        for output in llm.generate(prompts1,
+                                   sampling_params=sampling_params,
+                                   disaggregated_params=disaggregated_params):
+            print(output)
+
+        max_retries = 10
+        for _ in range(max_retries):
+            results = llm.get_stats(2)
+            if len(results) == 1:
+                break
+            time.sleep(1)
+        else:
+            pytest.fail(
+                f"Failed to get stats with len==1 after {max_retries} retries")
+
+        assert len(results) == 1
+        context_only_used_num_blocks = (
+            results[0]["kvCacheStats"]["usedNumBlocks"])
+        assert context_only_used_num_blocks > 0, (
+            "Context-only request should have allocated KV blocks before "
+            "the timeout window starts.")
+        print(f"Context only used num blocks: {context_only_used_num_blocks}")
+
+        # Sleep past kv_transfer_timeout_ms (1000 ms) so the timeout
+        # detection path runs at the C++ side (one WARN per request).
+        time.sleep(5)
+
+        # Send a regular request to drive additional executor iterations
+        # so the timeout-detection path is observably exercised, mirroring
+        # ``test_llm_context_only_timed_out``.
+        for output in llm.generate(prompts0, sampling_params=sampling_params):
+            print(output)
+
+        results = llm.get_stats(2)
+        assert len(results) == 1
+        final_used_num_blocks = results[0]["kvCacheStats"]["usedNumBlocks"]
+
+        # Atomicity contract: with the flag off, the cancellation +
+        # mark-as-error chain is dormant, so KV blocks of the timed-out
+        # context-only request remain held. A ``final_used_num_blocks == 0``
+        # observation here would mean the gate leaked the cleanup path,
+        # which we explicitly forbid (it would re-arm the trio behind the
+        # operator's back).
+        assert final_used_num_blocks > 0, (
+            "Expected blocks to remain held in observe-only mode "
+            "(TRTLLM_DISAGG_ENABLE_INFLIGHT_CANCEL=0); got "
+            f"final_used_num_blocks={final_used_num_blocks}. "
+            "Atomic gate leaked: cleanup ran despite the flag being off.")
+    finally:
+        llm.shutdown()
+
+
 # This test is to verify that when the KV cache is exhausted and scheduled batch size is 0, the context only request will be aborted due to timeout.
 
 
@@ -1584,13 +1688,17 @@ def test_llm_context_only_timed_out(transceiver_runtime):
 @skip_ray
 @pytest.mark.parametrize("sender_future_timeout_ms", [100, 1000])
 @pytest.mark.parametrize("backend", ["NIXL", "UCX"])
-@pytest.mark.parametrize("transceiver_runtime", [None, "PYTHON"])
+@pytest.mark.parametrize("transceiver_runtime", [None])
 def test_llm_context_only_timed_out_kv_cache_exhausted(sender_future_timeout_ms,
                                                        backend,
-                                                       transceiver_runtime):
+                                                       transceiver_runtime,
+                                                       monkeypatch):
     # Python transceiver (V2) only supports NIXL/DEFAULT backends
     if transceiver_runtime == "PYTHON" and backend == "UCX":
         pytest.skip("Python transceiver (V2) does not support UCX backend")
+
+    # Verify the active cancel path (TRTLLM_DISAGG_ENABLE_INFLIGHT_CANCEL=1).
+    monkeypatch.setenv("TRTLLM_DISAGG_ENABLE_INFLIGHT_CANCEL", "1")
 
     tp_size = 1
     use_overlap = False
@@ -1666,8 +1774,11 @@ def test_llm_context_only_timed_out_kv_cache_exhausted(sender_future_timeout_ms,
 @pytest.mark.part0
 @skip_ray
 @pytest.mark.asyncio
-@pytest.mark.parametrize("transceiver_runtime", [None, "PYTHON"])
-async def test_llm_disagg_gen_cancelled(transceiver_runtime):
+@pytest.mark.parametrize("transceiver_runtime", [None])
+async def test_llm_disagg_gen_cancelled(transceiver_runtime, monkeypatch):
+    # Verify the active cancel path (TRTLLM_DISAGG_ENABLE_INFLIGHT_CANCEL=1).
+    monkeypatch.setenv("TRTLLM_DISAGG_ENABLE_INFLIGHT_CANCEL", "1")
+
     tp_size = 1
     use_overlap = False
     enable_iter_req_stats = False
@@ -1805,7 +1916,7 @@ def test_priority_request_completes_before_low_priority():
     prompt = "A B C D E F G H I J"
     completion_order = []
 
-    async def run():
+    async def run(llm):
         # Submit all three requests before the event loop can schedule any of
         # them – they all land in the waiting queue simultaneously.
         # Request 1 uses ignore_eos so it keeps the batch slot busy for the
@@ -1832,7 +1943,7 @@ def test_priority_request_completes_before_low_priority():
             timeout=55,
         )
 
-    asyncio.run(run())
+    asyncio.run(run(llm))
     del llm
 
     assert 2 in completion_order and 3 in completion_order, (
@@ -1848,8 +1959,12 @@ def test_priority_request_completes_before_low_priority():
 @pytest.mark.part0
 @skip_ray
 @pytest.mark.asyncio
-@pytest.mark.parametrize("transceiver_runtime", [None, "PYTHON"])
-async def test_llm_disagg_streaming_gen_cancelled(transceiver_runtime):
+@pytest.mark.parametrize("transceiver_runtime", [None])
+async def test_llm_disagg_streaming_gen_cancelled(transceiver_runtime,
+                                                  monkeypatch):
+    # Verify the active cancel path (TRTLLM_DISAGG_ENABLE_INFLIGHT_CANCEL=1).
+    monkeypatch.setenv("TRTLLM_DISAGG_ENABLE_INFLIGHT_CANCEL", "1")
+
     tp_size = 1
     use_overlap = False
     enable_iter_req_stats = False

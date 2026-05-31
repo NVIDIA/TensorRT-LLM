@@ -189,7 +189,8 @@ NB_MODULE(tensorrt_llm_transfer_agent_binding, m)
     // subclass type is not directly registered (e.g., agents created via factory).
     nb::class_<kvc::TransferStatus>(m, "TransferStatus")
         .def("is_completed", &kvc::TransferStatus::isCompleted, nb::call_guard<nb::gil_scoped_release>())
-        .def("wait", &kvc::TransferStatus::wait, nb::arg("timeout_ms") = -1, nb::call_guard<nb::gil_scoped_release>());
+        .def("wait", &kvc::TransferStatus::wait, nb::arg("timeout_ms") = -1, nb::call_guard<nb::gil_scoped_release>())
+        .def("release", &kvc::TransferStatus::release, nb::call_guard<nb::gil_scoped_release>());
 
     // BaseAgentConfig struct
     nb::class_<kvc::BaseAgentConfig>(m, "BaseAgentConfig")
@@ -230,7 +231,7 @@ NB_MODULE(tensorrt_llm_transfer_agent_binding, m)
             "submit_transfer_requests",
             [](kvc::BaseTransferAgent& self, kvc::TransferRequest const& request)
             { return self.submitTransferRequests(request).release(); },
-            nb::arg("request"), nb::rv_policy::take_ownership)
+            nb::arg("request"), nb::rv_policy::take_ownership, nb::keep_alive<0, 1>())
         .def(
             "notify_sync_message", &kvc::BaseTransferAgent::notifySyncMessage, nb::arg("name"), nb::arg("sync_message"))
         .def("get_notified_sync_messages", &kvc::BaseTransferAgent::getNotifiedSyncMessages)
@@ -242,7 +243,8 @@ NB_MODULE(tensorrt_llm_transfer_agent_binding, m)
     nb::class_<kvc::NixlTransferStatus, kvc::TransferStatus>(m, "NixlTransferStatus")
         .def("is_completed", &kvc::NixlTransferStatus::isCompleted, nb::call_guard<nb::gil_scoped_release>())
         .def("wait", &kvc::NixlTransferStatus::wait, nb::arg("timeout_ms") = -1,
-            nb::call_guard<nb::gil_scoped_release>());
+            nb::call_guard<nb::gil_scoped_release>())
+        .def("release", &kvc::NixlTransferStatus::release, nb::call_guard<nb::gil_scoped_release>());
 
     // NixlTransferAgent class
     nb::class_<kvc::NixlTransferAgent, kvc::BaseTransferAgent>(m, "NixlTransferAgent")
@@ -263,7 +265,8 @@ NB_MODULE(tensorrt_llm_transfer_agent_binding, m)
             "submit_transfer_requests",
             [](kvc::NixlTransferAgent& self, kvc::TransferRequest const& request)
             { return self.submitTransferRequests(request).release(); },
-            nb::arg("request"), nb::rv_policy::take_ownership, nb::call_guard<nb::gil_scoped_release>())
+            nb::arg("request"), nb::rv_policy::take_ownership, nb::call_guard<nb::gil_scoped_release>(),
+            nb::keep_alive<0, 1>())
         .def(
             "notify_sync_message", &kvc::NixlTransferAgent::notifySyncMessage, nb::arg("name"), nb::arg("sync_message"))
         .def("get_notified_sync_messages", &kvc::NixlTransferAgent::getNotifiedSyncMessages)

@@ -40,6 +40,7 @@ RnnCacheFormatter::RnnCacheFormatter(rnn_state_manager::RnnStateManager* rnnStat
 {
     TLLM_CHECK(mRnnStateManager != nullptr);
     TLLM_CHECK(mRnnCacheTransBufferManager != nullptr);
+    kv_cache_manager::checkZeroCopyDisabledForCancellableDisaggTransfers();
 }
 
 RnnCacheFormatter::RnnCacheFormatter(kv_cache_manager::BaseKVCacheManager* kvCacheManager,

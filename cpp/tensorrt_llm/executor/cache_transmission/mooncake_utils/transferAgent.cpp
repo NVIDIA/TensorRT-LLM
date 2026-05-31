@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -163,6 +163,15 @@ TransferState MooncakeTransferStatus::wait(int64_t timeout_ms) const
     }
     // Currently, we cannot distinguish between failed and completed from return value.
     TLLM_LOG_DEBUG("Transfer is completed for batch %lu", mBatchId);
+    return true;
+}
+
+[[nodiscard]] bool MooncakeTransferStatus::release()
+{
+    // Mooncake does not expose a per-request handle release/cancel primitive
+    // here. Report the release request as accepted so the generic cancel path
+    // can unwind; upper layers still decide whether transfer buffers must be
+    // quarantined when transport quiescence is unknown.
     return true;
 }
 

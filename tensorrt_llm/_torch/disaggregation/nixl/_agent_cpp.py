@@ -30,6 +30,10 @@ class BindingsNixlTransferStatus(TransferStatus):
             timeout_ms = -1
         return self._cpp_status.wait(timeout_ms) == TransferState.SUCCESS
 
+    def release(self) -> bool:
+        """Release the transfer handle, requesting backend cancel if still active."""
+        return self._cpp_status.release()
+
 
 class BindingsNixlTransferAgent(BaseTransferAgent):
     """NixlTransferAgent using C++ bindings with GIL release support.

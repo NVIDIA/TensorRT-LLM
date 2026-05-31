@@ -58,7 +58,8 @@ from .guided_decoder import GuidedDecoder
 from .handle_additional_outputs import HandleAdditionalOutputs
 from .handle_logits import HandleLogits
 from .hang_detector import HangDetector
-from .kv_cache_transceiver import KvCacheTransceiver
+from .kv_cache_transceiver import (KvCacheTransceiver,
+                                   is_disagg_inflight_cancel_enabled)
 from .llm_request import (ExecutorRequest, LlmRequest, LlmRequestState,
                           LlmResponse, get_draft_token_length)
 from .mamba_cache_manager import (BaseMambaCacheManager,
@@ -89,6 +90,18 @@ PROFILE_TRACE_ENV_VAR_NAME = "TLLM_TORCH_PROFILE_TRACE"
 # Format: comma-separated rank IDs, e.g. "0,1,3", or "all" for all ranks.
 # Default: "0" (only rank 0 prints, matching existing behavior).
 PROFILE_LOG_RANKS_ENV_VAR_NAME = "TLLM_PROFILE_LOG_RANKS"
+
+# Defense-in-depth Python-side fallback deadline applied to every disagg
+# KV transfer when ``CacheTransceiverConfig.kv_transfer_timeout_ms`` is
+# unset.  The C++ deadline check is gated on ``kvTransferTimeoutMs.has_value()``
+# (cacheTransceiver.cpp), so a deployment that explicitly passes ``None``
+# (or constructs the C++ config bypassing the Python defaults) would
+# otherwise leave ``_handle_errors``-deferred requests waiting forever
+# for a ``kDISAGG_TRANS_ERROR`` that never arrives -- the original
+# wedge in disguise.  Ten minutes is two orders of magnitude beyond
+# any healthy disagg KV transfer; we surface the error rather than
+# wait silently.
+_DISAGG_KV_TRANSFER_FALLBACK_DEADLINE_MS = 10 * 60 * 1000
 
 
 class PPCommTag(IntEnum):
@@ -168,10 +181,19 @@ class AsyncTransferManager:
     """
 
     class RequestTransferMetadata:
+        """STOP-GAP metadata for rc13 partial-reuse cleanup.
+
+        `termination_requested` and `resources_freed` bridge the current split
+        where AsyncTransferManager owns transfer pinning, while PyExecutor owns
+        final resource cleanup. Remove them with the follow-up KV reuse lease /
+        cleanup-session work that replaces should_store_blocks + pin=True.
+        """
 
         def __init__(self, block_id: Optional[int]):
             self.block_id = block_id
             self.counter = 0
+            self.termination_requested = False
+            self.resources_freed = False
 
         def start_transfer(self):
             self.counter += 1
@@ -183,6 +205,18 @@ class AsyncTransferManager:
             """
             self.counter -= 1
             return self.counter == 0
+
+    @dataclasses.dataclass
+    class EndTransferResult:
+        """STOP-GAP result for deferred partial-reuse termination.
+
+        `needs_termination` carries a deferred cleanup obligation from the
+        transfer owner back to PyExecutor. Remove it with the follow-up KV
+        reuse lease / cleanup-session work.
+        """
+
+        completed: bool
+        needs_termination: bool = False
 
     def __init__(self,
                  resource_manager: "ResourceManager",
@@ -202,6 +236,43 @@ class AsyncTransferManager:
 
     def requests_in_transfer(self) -> Dict[int, LlmRequest]:
         return self._requests_in_transfer
+
+    def mark_termination_requested(self, request: LlmRequest):
+        """Record that termination was attempted while transfer was in flight.
+
+        The expected fast path is: ``_terminate_request`` ->
+        ``_can_terminate_request_now`` finds the request still in
+        ``is_disagg_context_transmission_state`` -> calls this -> returns False
+        -> ``_end_transfer_and_maybe_terminate`` later observes
+        ``needs_termination`` and retries termination once C++ reports the
+        transfer terminal.
+
+        The "no metadata" branch only fires when ``end_transfer`` has already
+        run and popped the entry; that path also transitions state to
+        ``DISAGG_CONTEXT_COMPLETE`` (or ``DISAGG_TRANS_ERROR``), so by the
+        time ``_can_terminate_request_now`` is re-entered for the same
+        request its first branch is False and we never reach this method.
+        Any reachable miss means the state/metadata invariant has drifted
+        (e.g. a future refactor of ``end_transfer`` ordering) -- a debug log
+        is enough today, but anyone seeing this in field logs should treat
+        it as a regression of the order contract above and fix the caller,
+        not silence the message.
+        """
+        metadata = self._request_transfer_metadata.get(request.py_request_id)
+        if metadata is not None:
+            metadata.termination_requested = True
+        else:
+            logger.debug(
+                f"Termination requested for request {request.py_request_id}, "
+                "but it is not tracked by AsyncTransferManager (likely a "
+                "harmless ordering window where end_transfer ran first; if "
+                "this fires repeatedly the state-vs-metadata invariant has "
+                "drifted)")
+
+    def mark_resources_freed(self, request: LlmRequest):
+        metadata = self._request_transfer_metadata.get(request.py_request_id)
+        if metadata is not None:
+            metadata.resources_freed = True
 
     def start_transfer(self, request: LlmRequest):
         """
@@ -236,14 +307,15 @@ class AsyncTransferManager:
 
         self._request_transfer_metadata[req_id].start_transfer()
 
-    def end_transfer(self, request: LlmRequest) -> bool:
+    def end_transfer(self, request: LlmRequest) -> EndTransferResult:
         """
         Called after a send of KV cache is complete.
         1. Decrements counter for request.
         2. If there are no more inflight transfers for this request, unpin the blocks and mark the request as complete.
 
         Returns:
-            bool: True if the request should be terminated after call to end_transfer
+            EndTransferResult: whether the transfer is complete and whether a
+            deferred termination must be retried now.
         """
         try:
             transfer_metadata = self._request_transfer_metadata[
@@ -252,9 +324,11 @@ class AsyncTransferManager:
             logger.warning(
                 f"Request {request.py_request_id} not found in transfer manager"
             )
-            return False
+            return self.EndTransferResult(completed=False)
 
         if transfer_metadata.end_transfer():
+            needs_termination = (transfer_metadata.termination_requested
+                                 and not transfer_metadata.resources_freed)
             self._requests_in_transfer.pop(request.py_request_id)
             self._request_transfer_metadata.pop(request.py_request_id)
 
@@ -266,9 +340,10 @@ class AsyncTransferManager:
             if request.state != LlmRequestState.DISAGG_TRANS_ERROR:
                 request.state = LlmRequestState.DISAGG_CONTEXT_COMPLETE
 
-            return True
+            return self.EndTransferResult(completed=True,
+                                          needs_termination=needs_termination)
 
-        return False
+        return self.EndTransferResult(completed=False)
 
     def has_any_inflight_requests(self) -> bool:
         return len(self._requests_in_transfer) > 0
@@ -375,6 +450,15 @@ class PyExecutor:
         self.num_fetch_requests_cur_rank = 0
         self.num_fetch_requests = 0
         self.shutdown_event = threading.Event()
+        self._disagg_gen_init_prepared_ids: Dict[
+            ResourceManagerType, set[int]] = {
+                ResourceManagerType.KV_CACHE_MANAGER: set(),
+                ResourceManagerType.SPEC_RESOURCE_MANAGER: set(),
+                ResourceManagerType.DRAFT_KV_CACHE_MANAGER: set(),
+            }
+        self._disagg_gen_kv_recv_started_ids: set[int] = set()
+        self._disagg_timed_out_ctx_cancelled_ids: set[int] = set()
+        self._disagg_timed_out_gen_cancelled_ids: set[int] = set()
 
         # Rolling acceptance tracking for spec decode (disable speculation if rolling acceptance is below threshold)
         spec_config = getattr(self.model_engine, 'spec_config', None)
@@ -631,8 +715,11 @@ class PyExecutor:
         # Initialize disagg PP termination handler if needed
         self._disagg_pp_termination_handler = None
         if self.dist.pp_size > 1 and self.enable_kv_cache_reuse and self.kv_cache_transceiver:
+            terminate_fn = (self._do_terminate_request_if_safe
+                            if is_disagg_inflight_cancel_enabled() else
+                            self._do_terminate_request)
             self._disagg_pp_termination_handler = DisaggPPTerminationHandler(
-                self.dist, self._do_terminate_request)
+                self.dist, terminate_fn)
 
         if self.dist.pp_size > 1:
             self.event_loop = self._executor_loop_pp
@@ -766,16 +853,19 @@ class PyExecutor:
                 # participate.
                 self._pending_transfer_responses.append(
                     (request.py_request_id, response))
-            if self.async_transfer_manager.end_transfer(request):
+            transfer_result = self.async_transfer_manager.end_transfer(request)
+            if transfer_result.completed:
                 self.active_requests.remove(request)
                 self._terminate_request(request)
             return
-        if self.async_transfer_manager.end_transfer(request):
-            # When should_store_blocks is True, _handle_responses already
-            # terminated this request via the early-termination path
-            # (enable_partial_reuse_for_disagg branch). Skip the redundant
-            # termination to avoid double free_resources calls.
-            if not self.async_transfer_manager.should_store_blocks:
+        transfer_result = self.async_transfer_manager.end_transfer(request)
+        if transfer_result.completed:
+            # When should_store_blocks is True, _handle_responses normally owns
+            # the early termination path. However, termination can be deferred
+            # while context transfer is still in progress; retry it now that
+            # C++ reports the transfer terminal.
+            if (not self.async_transfer_manager.should_store_blocks
+                    or transfer_result.needs_termination):
                 self._terminate_request(request)
 
     def _flush_pending_transfer_responses(self):
@@ -1898,17 +1988,34 @@ class PyExecutor:
                         and req.py_disaggregated_params.schedule_style ==
                         DisaggScheduleStyle.GENERATION_FIRST
                         for req in self.active_requests)
-                    if num_fitting_reqs == 0 and not fitting_disagg_gen_init_requests:
-                        if not all_gen_first:
-                            logger.warning(
-                                "num_fitting_reqs=0 and fitting_disagg_gen_init_requests is empty, may not have enough kvCache"
-                            )
-                            self._check_disagg_ctx_cache_transfer_status(1)
-                        elif self.async_transfer_manager.has_any_inflight_requests(
-                        ):
-                            # Non-blocking cleanup of completed/timed-out
-                            # transfers to free KV blocks (see _executor_loop).
-                            self._check_disagg_ctx_cache_transfer_status(0)
+                    # The downstream C++ checkContextTransferStatus runs a
+                    # cross-rank gatherRequestIds collective on the ctx-side
+                    # comm (mGroupTPInDPComm with attention-DP, otherwise
+                    # mGroupTensorParaComm). Any rank-asymmetric gate here
+                    # (e.g. the previous `if num_fitting_reqs == 0` predicate,
+                    # which reads rank-local scheduler / async-transfer-manager
+                    # state and diverges in helix-CP setups by design) causes
+                    # ABBA deadlock against the next unconditional collective
+                    # on the same ranks (sampler NCCL ops, _can_queue's
+                    # tp_allgather, PP step boundary). All ctx-side ranks must
+                    # enter this call together, so the gate is intentionally
+                    # absent. at_least_num is rank-local and only affects the
+                    # per-request loop behavior inside the C++ function
+                    # (blockAll vs polling), which is safe to diverge --
+                    # mirrors bdfdf8be02's fix for
+                    # _check_disagg_gen_transfer_status. See PR #13713 CI
+                    # build #39569 helix test hang for the failure signature
+                    # on TestQwen3_8B::test_auto_dtype_with_helix
+                    # [pp1tp1cp4, pp1tp2cp2].
+                    at_least_num = 0
+                    if (num_fitting_reqs == 0
+                            and not fitting_disagg_gen_init_requests
+                            and not all_gen_first):
+                        logger.warning(
+                            "num_fitting_reqs=0 and fitting_disagg_gen_init_requests is empty, may not have enough kvCache"
+                        )
+                        at_least_num = 1
+                    self._check_disagg_ctx_cache_transfer_status(at_least_num)
 
                 self.num_scheduled_requests = scheduled_batch.batch_size
 
@@ -2443,19 +2550,20 @@ class PyExecutor:
                 req.py_disaggregated_params and req.py_disaggregated_params.
                 schedule_style == DisaggScheduleStyle.GENERATION_FIRST
                 for req in self.active_requests)
-            if num_fitting_reqs == 0 and not fitting_disagg_gen_init_requests:
-                if not all_gen_first:
-                    logger.warning(
-                        "num_fitting_reqs=0 and fitting_disagg_gen_init_requests is empty, may not have enough kvCache"
-                    )
-                    self._check_disagg_ctx_cache_transfer_status(1)
-                elif self.async_transfer_manager.has_any_inflight_requests():
-                    # Non-blocking cleanup of completed/timed-out transfers
-                    # to free KV blocks. We avoid the blocking check because
-                    # gen-first requests may be waiting for peer info (which
-                    # would block indefinitely), but completed transfers must
-                    # still be reaped so that KV cache can be reclaimed.
-                    self._check_disagg_ctx_cache_transfer_status(0)
+            # Same rank-symmetric pattern as _executor_loop_pp above; see
+            # rationale comment there. The C++ gatherRequestIds collective
+            # inside checkContextTransferStatus must be entered by every
+            # ctx-side rank together. at_least_num is rank-local and safe
+            # to diverge (it only controls per-request loop behavior inside
+            # the C++ function, not collective entry).
+            at_least_num = 0
+            if (num_fitting_reqs == 0 and not fitting_disagg_gen_init_requests
+                    and not all_gen_first):
+                logger.warning(
+                    "num_fitting_reqs=0 and fitting_disagg_gen_init_requests is empty, may not have enough kvCache"
+                )
+                at_least_num = 1
+            self._check_disagg_ctx_cache_transfer_status(at_least_num)
 
             # In gen-only benchmark mode, all requests must fit in KV cache
             # simultaneously because generation requests do not release their
@@ -3696,11 +3804,16 @@ class PyExecutor:
 
     @nvtx_range("_check_disagg_gen_transfer_status")
     def _check_disagg_gen_transfer_status(self):
-
-        need_check = any([
-            req.is_disagg_generation_transmission_in_progress
-            for req in self.active_requests
-        ])
+        # The downstream C++ checkGenTransferStatus runs a cross-rank
+        # gatherRequestIds collective on the gen-side comm. Any
+        # rank-asymmetric gate here (e.g. the previous "if need_check"
+        # predicate, which reads rank-local LlmRequest state from
+        # self.active_requests) causes ABBA deadlock against the next
+        # unconditional collective on the same ranks (helix CI #39529
+        # hang). All gen-side ranks must enter this call together, so
+        # the gate is intentionally absent. at_least_num is rank-local
+        # and only affects the per-request loop behavior inside the C++
+        # function (blockAll vs polling), which is safe to diverge.
         non_gen_first_reqs = [
             req for req in self.active_requests
             if req.py_disaggregated_params and req.py_disaggregated_params.
@@ -3709,10 +3822,8 @@ class PyExecutor:
         need_check_one = bool(non_gen_first_reqs) and all(
             req.is_disagg_generation_transmission_in_progress
             for req in non_gen_first_reqs)
-
-        if need_check:
-            at_least_num = 1 if need_check_one else 0
-            self._check_disagg_gen_cache_transfer_status(at_least_num)
+        at_least_num = 1 if need_check_one else 0
+        self._check_disagg_gen_cache_transfer_status(at_least_num)
 
         return
 
@@ -3720,20 +3831,48 @@ class PyExecutor:
     def _check_kv_transfer_timeout(self):
         if not self.kv_cache_transceiver:
             return
-        timeout_ms = self.kv_cache_transceiver.kv_transfer_timeout_ms
-        if timeout_ms is None:
-            return
+        configured_timeout_ms = (
+            self.kv_cache_transceiver.kv_transfer_timeout_ms)
+        # Always apply *some* deadline. When the user/admin disabled the
+        # configured timeout we still need a Python-side fallback because
+        # the deferral path in _handle_errors relies on a future
+        # DISAGG_TRANS_ERROR transition to surface the failure: a request
+        # that never times out on the C++ side never moves to error and
+        # would wedge here forever. See _DISAGG_KV_TRANSFER_FALLBACK_DEADLINE_MS.
+        if configured_timeout_ms is None:
+            timeout_ms = _DISAGG_KV_TRANSFER_FALLBACK_DEADLINE_MS
+            using_fallback = True
+        else:
+            timeout_ms = configured_timeout_ms
+            using_fallback = False
+
+        cancel_enabled = is_disagg_inflight_cancel_enabled()
+        observe_only_tail = "" if cancel_enabled else (
+            "TRTLLM_DISAGG_ENABLE_INFLIGHT_CANCEL=0; continuing to wait. "
+            "Set TRTLLM_DISAGG_ENABLE_INFLIGHT_CANCEL=1 to enable "
+            "cancellation and error surfacing.")
 
         def flag_if_kv_transfer_timed_out(req: LlmRequest, type: str) -> None:
             current_time = time.time()
             if req.py_kv_transfer_start_time is None:
                 return
             elapsed_time = (current_time - req.py_kv_transfer_start_time) * 1000
-            if elapsed_time > timeout_ms and not req.py_kv_transfer_timed_out:
-                logger.warning(
-                    f"Terminating {type} request {req.py_request_id} due to KV cache transfer timeout"
-                )
-                req.py_kv_transfer_timed_out = True
+            if elapsed_time <= timeout_ms or req.py_kv_transfer_timed_out:
+                return
+            # Build the "{req-id} {deadline-source}" body once, then
+            # prepend the verb chosen by the cancel-enable flag.
+            if using_fallback:
+                body = (f"{type} request {req.py_request_id} after "
+                        f"Python fallback deadline ({timeout_ms} ms); "
+                        "kv_transfer_timeout_ms is unset, so this is "
+                        "the only escalation path. Configure "
+                        "kv_transfer_timeout_ms to surface failures sooner.")
+            else:
+                body = (f"{type} request {req.py_request_id} due to "
+                        "KV cache transfer timeout.")
+            verb = "Terminating" if cancel_enabled else "Observed timeout on"
+            logger.warning(f"{verb} {body} {observe_only_tail}")
+            req.py_kv_transfer_timed_out = True
 
         for req in self.async_transfer_manager.requests_in_transfer().values():
             flag_if_kv_transfer_timed_out(req, "context")
@@ -3849,10 +3988,24 @@ class PyExecutor:
 
     @nvtx_range("_prepare_disagg_gen_init")
     def _prepare_disagg_gen_init(self, fitting_disagg_gen_init_requests):
+        # nvbugs/6104831 Layer E (Python): log the fitting list and the
+        # KV_CACHE_MANAGER prepared-ids snapshot at the entry point that
+        # feeds _recv_disagg_gen_cache. Comparing this across PP ranks
+        # confirms whether _pp_schedule_and_propagate's broadcast handed
+        # every rank the same fitting list. A mismatch with the
+        # DIAG-GEN-RECV-INPUT line on the same iteration means schedule
+        # propagation lost or added a request between this site and the
+        # recv site.
+        fitting_ids = [
+            req.py_request_id for req in fitting_disagg_gen_init_requests
+        ]
+        kv_prepared_snapshot = sorted(
+            self._disagg_gen_init_prepared_ids.get(
+                ResourceManagerType.KV_CACHE_MANAGER, set()))
+        logger.info(f"[DIAG-GEN-PREPARE-INPUT] rank={self.dist.rank} "
+                    f"iter={self.iter_counter} fitting_py_ids={fitting_ids} "
+                    f"kv_prepared_set={kv_prepared_snapshot}")
         if fitting_disagg_gen_init_requests:
-            disagg_gen_init_to_prepare = ScheduledRequests()
-            disagg_gen_init_to_prepare.context_requests_last_chunk = fitting_disagg_gen_init_requests
-
             for resource_mgr_type in (
                     ResourceManagerType.KV_CACHE_MANAGER,
                     ResourceManagerType.SPEC_RESOURCE_MANAGER,
@@ -3860,12 +4013,33 @@ class PyExecutor:
                 if (resource_mgr_type in self.resource_manager.resource_managers
                         and self.resource_manager.
                         resource_managers[resource_mgr_type] is not None):
+                    prepared_ids = self._disagg_gen_init_prepared_ids[
+                        resource_mgr_type]
+                    resources_to_prepare = [
+                        req for req in fitting_disagg_gen_init_requests
+                        if req.py_request_id not in prepared_ids
+                    ]
+                    if not resources_to_prepare:
+                        continue
+
+                    disagg_gen_init_to_prepare = ScheduledRequests()
+                    disagg_gen_init_to_prepare.context_requests_last_chunk = resources_to_prepare
                     self.resource_manager.resource_managers[
                         resource_mgr_type].prepare_resources(
                             disagg_gen_init_to_prepare)
+                    for req in resources_to_prepare:
+                        prepared_ids.add(req.py_request_id)
 
-            # Trigger KV cache exchange for new disagg_gen_init_requests
-            self._recv_disagg_gen_cache(fitting_disagg_gen_init_requests)
+        # Always trigger _recv_disagg_gen_cache, even when this rank has no
+        # newly fitting disagg-gen-init requests. The downstream C++
+        # checkGenTransferStatus runs a cross-rank gatherRequestIds
+        # collective on the gen-side comm; skipping it on ranks with no
+        # local work creates the rank-asymmetric entry that produces an
+        # ABBA deadlock with the next unconditional collective on the
+        # same ranks.
+        # _recv_disagg_gen_cache handles the empty-input case as a no-op
+        # for the receive work while still entering the collective.
+        self._recv_disagg_gen_cache(fitting_disagg_gen_init_requests)
 
     @nvtx_range("_prepare_disagg_gen_transmission_complete")
     def _prepare_disagg_gen_transmission_complete(self, scheduled_batch):
@@ -3948,15 +4122,98 @@ class PyExecutor:
                 req.state = LlmRequestState.DISAGG_GENERATION_TRANS_COMPLETE
             return
 
-        if os.getenv("TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP") == "1":
-            for req in new_gen_reqs:
-                self.kv_cache_transceiver.request_and_receive_sync(req)
-        else:
-            for req in new_gen_reqs:
-                self.kv_cache_transceiver.request_and_receive_async(req)
+        # nvbugs/6104831 Layer E (Python): snapshot the input list and the
+        # per-rank dedup set at entry to _recv_disagg_gen_cache. Comparing
+        # this line across gen ranks for the same iteration tells us:
+        #   (a) whether _pp_schedule_and_propagate handed every rank the
+        #       same fitting list (M1 — schedule divergence), and
+        #   (b) whether every rank's _disagg_gen_kv_recv_started_ids
+        #       agrees on which ids are already in flight (M2 — A3 dedup
+        #       state divergence). A single rank with a different snapshot
+        #       is the rank that diverged.
+        input_ids = [req.py_request_id for req in new_gen_reqs]
+        dedup_snapshot = sorted(self._disagg_gen_kv_recv_started_ids)
+        logger.info(f"[DIAG-GEN-RECV-INPUT] rank={self.dist.rank} "
+                    f"iter={self.iter_counter} input_py_ids={input_ids} "
+                    f"dedup_set={dedup_snapshot}")
 
-        if self.kv_cache_transceiver.kv_transfer_timeout_ms is not None:
-            for req in new_gen_reqs:
+        recv_reqs = []
+        for req in new_gen_reqs:
+            hit = req.py_request_id in self._disagg_gen_kv_recv_started_ids
+            # nvbugs/6104831 Layer E (Python): per-request dedup decision.
+            # If two ranks see the same input but disagree on `hit`, the
+            # divergence is in A3's per-rank dedup state.
+            logger.info(f"[DIAG-GEN-DEDUP-DECISION] rank={self.dist.rank} "
+                        f"py_id={req.py_request_id} state={req.state} "
+                        f"already_in_set={int(hit)} "
+                        f"action={'SKIP' if hit else 'CALL_RECV'}")
+            if hit:
+                continue
+            recv_reqs.append(req)
+
+        # NOTE: do NOT early-exit when recv_reqs is empty.
+        #
+        # The _check_disagg_gen_cache_transfer_status call below dispatches
+        # into C++ checkGenTransferStatus, whose body begins with a
+        # cross-rank gatherRequestIds collective on the gen-side comm
+        # (mGroupDataComm with attention-DP, otherwise mGroupComm). A
+        # rank-asymmetric early-exit here causes ABBA deadlock against
+        # any subsequent unconditional collective on the same ranks --
+        # e.g. _can_queue's tp_allgather under attention-DP, or PP
+        # step-boundary collectives.
+        if recv_reqs:
+            if os.getenv("TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP") == "1":
+                for req in recv_reqs:
+                    self._disagg_gen_kv_recv_started_ids.add(req.py_request_id)
+                    # nvbugs/6104831 Layer D (Python): tag every gen-side
+                    # disagg recv invocation with the py_request_id and the
+                    # underlying request_id. The request_id is what the C++
+                    # [DIAG-GEN-REQSYNC-ENTRY] line will reference as
+                    # genReqId, so a wedged gen-side recv can be traced
+                    # all the way back to the Python scheduler decision.
+                    logger.info(
+                        f"[DIAG-PY-GEN-RECV-SYNC] py_request_id={req.py_request_id} "
+                        f"request_id={req.request_id}")
+                    try:
+                        self.kv_cache_transceiver.request_and_receive_sync(req)
+                    except Exception:
+                        # nvbugs/6104831 Layer E (Python): rollback path —
+                        # request_and_receive_sync threw, so the C++ side
+                        # never accepted the request. The dedup id is
+                        # rolled back so a subsequent iteration can retry.
+                        # If this fires repeatedly for the same id, the
+                        # C++ side is rejecting it deterministically.
+                        logger.info(f"[DIAG-GEN-DEDUP-DISCARD-ROLLBACK-SYNC] "
+                                    f"rank={self.dist.rank} "
+                                    f"py_id={req.py_request_id}")
+                        self._disagg_gen_kv_recv_started_ids.discard(
+                            req.py_request_id)
+                        raise
+            else:
+                for req in recv_reqs:
+                    self._disagg_gen_kv_recv_started_ids.add(req.py_request_id)
+                    # nvbugs/6104831 Layer D (Python): see SYNC variant above
+                    # for rationale; this is the default async path.
+                    logger.info(
+                        f"[DIAG-PY-GEN-RECV-ASYNC] py_request_id={req.py_request_id} "
+                        f"request_id={req.request_id}")
+                    try:
+                        self.kv_cache_transceiver.request_and_receive_async(req)
+                    except Exception:
+                        # nvbugs/6104831 Layer E (Python): rollback path —
+                        # see SYNC variant for rationale.
+                        logger.info(f"[DIAG-GEN-DEDUP-DISCARD-ROLLBACK-ASYNC] "
+                                    f"rank={self.dist.rank} "
+                                    f"py_id={req.py_request_id}")
+                        self._disagg_gen_kv_recv_started_ids.discard(
+                            req.py_request_id)
+                        raise
+
+            # Record the transfer start time unconditionally so the Python
+            # fallback deadline in _check_kv_transfer_timeout can fire even
+            # when kv_transfer_timeout_ms is not configured. The check there
+            # picks the configured timeout or the fallback floor.
+            for req in recv_reqs:
                 if req.state == LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS:
                     req.py_kv_transfer_start_time = time.time()
 
@@ -3968,6 +4225,8 @@ class PyExecutor:
         block_transfer = bool(non_gen_first_active) and all(
             req.is_disagg_generation_transmission_in_progress
             for req in non_gen_first_active)
+        # Always reach the C++ collective so every gen-side rank
+        # participates in lockstep with its peers.
         self._check_disagg_gen_cache_transfer_status(1 if block_transfer else 0)
 
         return
@@ -4001,10 +4260,23 @@ class PyExecutor:
                     # Order is important here: we need to start the transfer before responding
                     # to make sure the blocks are stored for reuse before they are sent.
                     self.async_transfer_manager.start_transfer(req)
+                    # nvbugs/6104831 Layer D (Python): tag every ctx-side
+                    # respond_and_send_async with the py_request_id and the
+                    # request_id. request_id is what the C++ DIAG-CTX-*
+                    # logs reference as reqId. If a gen-side wedged recv's
+                    # ctxReqId has no matching [DIAG-PY-CTX-SEND] here, the
+                    # ctx-side never tried to respond (upstream bug).
+                    logger.info(
+                        f"[DIAG-PY-CTX-SEND] py_request_id={req.py_request_id} "
+                        f"request_id={req.request_id}")
                     self.kv_cache_transceiver.respond_and_send_async(req)
 
-                    if self.kv_cache_transceiver.kv_transfer_timeout_ms is not None:
-                        req.py_kv_transfer_start_time = time.time()
+                    # Always record the transfer start time. The Python
+                    # fallback deadline in _check_kv_transfer_timeout
+                    # falls back to a hard floor when
+                    # kv_transfer_timeout_ms is unset, and that path
+                    # needs a baseline timestamp on every request.
+                    req.py_kv_transfer_start_time = time.time()
 
         if self.kv_connector_manager:
             if not self.disable_overlap_scheduler:
@@ -4029,10 +4301,15 @@ class PyExecutor:
         """Common helper to check for and handle cache transfer errors."""
         error_requests = self._get_disagg_reqs_in_error_state()
         if error_requests:
+            poisoned_transfer_buffer = (
+                self.kv_cache_transceiver is not None
+                and self.kv_cache_transceiver.has_poisoned_transfer_buffer())
             self._handle_errors(
-                f"Error in kv cache transfer for {error_msg_prefix}",
+                f"Error in kv cache transfer for {error_msg_prefix}" +
+                ("; unrecoverable poisoned transfer buffer requires process restart"
+                 if poisoned_transfer_buffer else ""),
                 requests=error_requests,
-                charge_budget=False)
+                charge_budget=poisoned_transfer_buffer)
 
     @nvtx_range("_check_disagg_ctx_cache_transfer_status")
     def _check_disagg_ctx_cache_transfer_status(self, atLeastNum: int = 0):
@@ -4062,14 +4339,18 @@ class PyExecutor:
         for request_id in list(requests_in_transfer.keys()):
             request = requests_in_transfer[request_id]
             if request.py_kv_transfer_timed_out and request_id not in completed_req_ids:
-                is_cancelled = self.kv_cache_transceiver.cancel_request(request)
-                # If cancel is successful, mark as complete so it can be cleaned up
-                # Otherwise, try at next iteration
-                if is_cancelled:
-                    request.py_kv_transfer_start_time = None
-                    request.state = LlmRequestState.DISAGG_CONTEXT_COMPLETE
-
-                    self._end_transfer_and_maybe_terminate(request)
+                # Ask C++ to cancel once, but do not free Python-side
+                # resources until C++ reports the transfer in finished/error
+                # status. cancel_request() is not a transport-quiescence proof.
+                if request_id not in self._disagg_timed_out_ctx_cancelled_ids:
+                    is_cancelled = self.kv_cache_transceiver.cancel_request(
+                        request)
+                    if is_cancelled:
+                        self._disagg_timed_out_ctx_cancelled_ids.add(request_id)
+                        logger.warning(
+                            f"Cancelled timed-out context KV transfer for "
+                            f"request {request.py_request_id}; waiting for "
+                            "C++ transfer status to report final cleanup")
 
         self._check_cache_transfer_errors("context requests")
 
@@ -4363,29 +4644,115 @@ class PyExecutor:
                             "on fatal error")
 
         failed_requests = (list(self.active_requests)
-                           if requests is None else requests)
+                           if requests is None else list(requests))
+        if is_disagg_inflight_cancel_enabled():
+            deferred_requests = [
+                request for request in failed_requests
+                if self._is_unquiesced_disagg_transfer(request)
+            ]
+        else:
+            deferred_requests = []
+        if deferred_requests:
+            # Deferred requests rely on a follow-up DISAGG_TRANS_ERROR
+            # transition to surface the failure. The transition is
+            # driven by the C++ deadline (kvTransferTimeoutMs) when
+            # configured and by _check_kv_transfer_timeout's Python
+            # fallback floor (_DISAGG_KV_TRANSFER_FALLBACK_DEADLINE_MS)
+            # otherwise; either way, this path cannot wedge.
+            logger.warning(
+                "Deferring error cleanup for disaggregated KV transfers still "
+                "in flight. C++ transfer status remains the source of truth "
+                "for final cleanup. request_ids=%s, error=%s",
+                [request.py_request_id for request in deferred_requests],
+                error_msg)
+            failed_requests = [
+                request for request in failed_requests
+                if request not in deferred_requests
+            ]
+            if not failed_requests:
+                if self._fatal_error is not None:
+                    self.executor_request_queue.enqueue_shutdown_request()
+                return
+
         for request in failed_requests:
             req_id = request.py_request_id
-            request.state = LlmRequestState.GENERATION_COMPLETE
+            if not request.is_disagg_context_transmission_state:
+                request.state = LlmRequestState.GENERATION_COMPLETE
             error_responses[req_id] = LlmResponse(
                 request_id=req_id,
                 error_msg=error_msg,
                 client_id=request.py_client_id)
         if requests is None:
-            self.active_requests.clear()
+            self.active_requests = deferred_requests
         else:
             self.active_requests = [
                 request for request in self.active_requests
-                if request not in requests
+                if request not in failed_requests
             ]
         self._enqueue_responses(list(error_responses.items()))
         for request in failed_requests:
+            # _terminate_request may return False for disagg requests that
+            # are still in an unquiesced KV-transfer state (see contract
+            # docstring); in that case the deferred retry runs from
+            # _end_transfer_and_maybe_terminate via the mark_termination_requested
+            # handoff installed inside _can_terminate_request_now.
             self._terminate_request(request)
 
         if self._fatal_error is not None:
             self.executor_request_queue.enqueue_shutdown_request()
 
-    def _terminate_request(self, request: LlmRequest):
+    def _is_unquiesced_disagg_transfer(self, request: LlmRequest) -> bool:
+        return (request.is_disagg_generation_transmission_in_progress
+                or request.is_disagg_context_transmission_state)
+
+    def _can_terminate_request_now(self, request: LlmRequest) -> bool:
+        if not is_disagg_inflight_cancel_enabled():
+            return True
+        if request.is_disagg_context_transmission_state:
+            # STOP-GAP: partial reuse asks _handle_responses to terminate
+            # completed context requests before async KV transfer has always
+            # drained. Remember the failed attempt so
+            # _end_transfer_and_maybe_terminate retries exactly once after C++
+            # reports transfer completion. Remove this handoff with the
+            # follow-up KV reuse lease / cleanup-session work.
+            self.async_transfer_manager.mark_termination_requested(request)
+            logger.debug(
+                f"Deferring termination for request {request.py_request_id} "
+                "because context KV transfer is still in progress")
+            return False
+        if request.is_disagg_generation_transmission_in_progress:
+            logger.debug(
+                f"Deferring termination for request {request.py_request_id} "
+                "because generation KV transfer is still in progress")
+            return False
+        return True
+
+    def _do_terminate_request_if_safe(self, request: LlmRequest) -> bool:
+        if not self._can_terminate_request_now(request):
+            return False
+        self._do_terminate_request(request)
+        return True
+
+    def _terminate_request(self, request: LlmRequest) -> bool:
+        """Terminate ``request`` immediately or defer until KV transfer drains.
+
+        Returns ``True`` when termination ran (either inline or scheduled
+        via the PP termination handler).  Returns ``False`` when the
+        request is still in an unquiesced disagg KV-transfer state; in
+        that case ``_can_terminate_request_now`` records the deferred
+        intent on ``async_transfer_manager`` via
+        ``mark_termination_requested`` and ``_end_transfer_and_maybe_terminate``
+        retries exactly once after C++ surfaces transfer completion.
+
+        Callers that pass non-disagg requests (e.g. paused requests, ADP
+        dummy requests) can safely ignore the return value -- those
+        requests never enter the unquiesced state and termination always
+        runs synchronously.  Callers that may pass disagg requests
+        (``_handle_errors``, ``_handle_responses``) must rely on the
+        deferred-retry handoff above.
+        """
+        if not self._can_terminate_request_now(request):
+            return False
         # Dummy requests don't participate in disagg KV cache transfers,
         # so they must bypass the PP termination handler to avoid stale
         # sequences in the KV cache manager (the handler delays removal,
@@ -4395,12 +4762,34 @@ class PyExecutor:
             self._disagg_pp_termination_handler.terminate(request)
         else:
             self._do_terminate_request(request)
+        return True
 
     def _do_terminate_request(self, request: LlmRequest):
         self.resource_manager.free_resources(request)
+        self.async_transfer_manager.mark_resources_freed(request)
 
         if self.gather_all_responses or self.dist.rank == 0:
             self.result_wait_queues.pop(request.py_request_id, None)
+
+        # Drop the per-request idempotency markers used by
+        # _prepare_disagg_gen_init / _recv_disagg_gen_cache so the tracking
+        # sets do not grow unboundedly across the deployment lifetime.
+        # nvbugs/6104831 Layer E (Python): log the discard so we can tell
+        # whether a rank dropped the id at request termination (the
+        # designed-for path) vs. via the except-rollback path (suggesting
+        # the C++ side rejected the request). Each rank logs independently;
+        # if ranks terminate at different iterations the dedup state can
+        # transiently diverge.
+        was_in_set = request.py_request_id in self._disagg_gen_kv_recv_started_ids
+        if was_in_set:
+            logger.info(
+                f"[DIAG-GEN-DEDUP-DISCARD-TERMINATE] rank={self.dist.rank} "
+                f"py_id={request.py_request_id} state={request.state}")
+        for prepared_ids in self._disagg_gen_init_prepared_ids.values():
+            prepared_ids.discard(request.py_request_id)
+        self._disagg_gen_kv_recv_started_ids.discard(request.py_request_id)
+        self._disagg_timed_out_ctx_cancelled_ids.discard(request.py_request_id)
+        self._disagg_timed_out_gen_cancelled_ids.discard(request.py_request_id)
 
     def _is_request_in_transmission(self, request) -> bool:
         """Check if a request is currently in transmission state."""
@@ -4589,14 +4978,25 @@ class PyExecutor:
                 requests_to_terminate.append(request)
                 continue
 
-            # Check if generation request needs cleanup due to KV cache transfer timeout
+            # Check if generation request needs cleanup due to KV cache transfer timeout.
             if request.py_kv_transfer_timed_out:
-                is_cancelled = self.kv_cache_transceiver.cancel_request(request)
-                if is_cancelled:
-                    self._handle_errors(
-                        error_msg=f"Request {request.py_request_id} timed out",
-                        requests=[request],
-                        charge_budget=False)
+                if (request.py_request_id
+                        not in self._disagg_timed_out_gen_cancelled_ids):
+                    is_cancelled = self.kv_cache_transceiver.cancel_request(
+                        request)
+                    if is_cancelled:
+                        self._disagg_timed_out_gen_cancelled_ids.add(
+                            request.py_request_id)
+                        logger.warning(
+                            f"Cancelled timed-out generation KV transfer for "
+                            f"request {request.py_request_id}; waiting for "
+                            "C++ transfer status to report final cleanup")
+                # Keep the request in active_requests so the deferred-cleanup
+                # contract still holds: _check_disagg_gen_cache_transfer_status
+                # will eventually transition it to DISAGG_TRANS_ERROR once C++
+                # surfaces the cancellation, and _check_cache_transfer_errors
+                # then enqueues the final error response and runs termination.
+                new_active_requests.append(request)
                 continue
 
             if request.is_generation_only_request() and not request.is_finished:
@@ -4688,6 +5088,11 @@ class PyExecutor:
         # Request should be terminated after enqueueing response to ensure we can enqueue response successfully.
         self._enqueue_responses(new_responses)
         for request in requests_to_terminate:
+            # The force_terminate_for_partial_reuse branch above can route
+            # disagg context requests still in DISAGG_CONTEXT_TRANS_IN_PROGRESS
+            # here; _terminate_request will return False for those and the
+            # retry runs from _end_transfer_and_maybe_terminate (see contract
+            # docstring on _terminate_request).
             self._terminate_request(request)
         return requests_to_terminate + requests_finished_by_transfer
 

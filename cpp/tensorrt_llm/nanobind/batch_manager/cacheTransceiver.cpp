@@ -46,17 +46,17 @@ public:
     // using BaseCacheTransceiver::BaseCacheTransceiver; // Inherit constructors
     NB_TRAMPOLINE(tb::BaseCacheTransceiver, 6);
 
-    void respondAndSendAsync(tb::LlmRequest* llmRequest) override
+    void respondAndSendAsync(std::shared_ptr<tb::LlmRequest> llmRequest) override
     {
         NB_OVERRIDE_PURE(respondAndSendAsync, llmRequest);
     }
 
-    void requestAndReceiveSync(tb::LlmRequest* llmRequest) override
+    void requestAndReceiveSync(std::shared_ptr<tb::LlmRequest> llmRequest) override
     {
         NB_OVERRIDE_PURE(requestAndReceiveSync, llmRequest);
     }
 
-    void requestAndReceiveAsync(tb::LlmRequest* llmRequest) override
+    void requestAndReceiveAsync(std::shared_ptr<tb::LlmRequest> llmRequest) override
     {
         NB_OVERRIDE_PURE(requestAndReceiveAsync, llmRequest);
     }
@@ -77,7 +77,7 @@ public:
         NB_OVERRIDE_PURE(checkGenTransferComplete);
     }
 
-    bool cancelRequest(tb::LlmRequest* llmRequest) override
+    bool cancelRequest(std::shared_ptr<tb::LlmRequest> llmRequest) override
     {
         NB_OVERRIDE_PURE(cancelRequest, llmRequest);
     }
@@ -110,7 +110,8 @@ void tb::CacheTransceiverBindings::initBindings(nb::module_& m)
         .def("check_gen_transfer_status", &BaseCacheTransceiver::checkGenTransferStatus,
             nb::call_guard<nb::gil_scoped_release>())
         .def("check_gen_transfer_complete", &BaseCacheTransceiver::checkGenTransferComplete)
-        .def("cancel_request", &BaseCacheTransceiver::cancelRequest);
+        .def("cancel_request", &BaseCacheTransceiver::cancelRequest)
+        .def("has_poisoned_transfer_buffer", &BaseCacheTransceiver::hasPoisonedTransferBuffer);
 
     nb::enum_<executor::kv_cache::CacheState::AttentionType>(m, "AttentionType")
         .value("DEFAULT", executor::kv_cache::CacheState::AttentionType::kDEFAULT)

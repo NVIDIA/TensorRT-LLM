@@ -60,6 +60,25 @@
 namespace tensorrt_llm::batch_manager
 {
 
+namespace
+{
+/// @brief Rank prefix for TLLM_LOG_DEBUG/WARNING; resolves MPI vs torch process group at log time.
+inline int currentRankForLog()
+{
+    return useMPI() ? mpi::MpiComm::world().getRank() : tensorrt_llm::pg_utils::get_world_pg()->getRank();
+}
+
+/// @brief Trailing-clause appended to kvTransferTimeoutMs warnings when the
+/// in-flight cancellation surface is disabled. The detection itself runs
+/// unconditionally so wedges are observable in logs even in flag-off mode;
+/// this clause names the knob operators must flip to actually cancel.
+/// See TRTLLM_DISAGG_ENABLE_INFLIGHT_CANCEL in envUtils.h.
+constexpr char const* kObserveOnlyTimeoutTail
+    = "TRTLLM_DISAGG_ENABLE_INFLIGHT_CANCEL=0; continuing to wait. "
+      "Set TRTLLM_DISAGG_ENABLE_INFLIGHT_CANCEL=1 to enable cancellation "
+      "and error surfacing.";
+} // namespace
+
 std::mutex CacheTransceiver::mDllMutex;
 
 std::unique_ptr<BaseCacheTransceiver> CacheTransceiverFactory::createCacheTransceiver(
@@ -379,7 +398,7 @@ void CacheTransceiver::setContextState(LlmRequest* llmRequest)
     }
 }
 
-void CacheTransceiver::respondAndSendAsync(LlmRequest* llmRequest)
+void CacheTransceiver::respondAndSendAsync(std::shared_ptr<LlmRequest> llmRequest)
 {
     TLLM_CHECK(llmRequest && llmRequest->isContextOnlyRequest());
     llmRequest->setState(LlmRequestState::kDISAGG_CONTEXT_TRANS_IN_PROGRESS);
@@ -393,9 +412,9 @@ void CacheTransceiver::respondAndSendAsync(LlmRequest* llmRequest)
         }
         return;
     }
-    setContextState(llmRequest);
-    auto future = mCacheSender->sendAsync(*llmRequest);
-    mSenderFutures.emplace_back(llmRequest, std::move(future));
+    setContextState(llmRequest.get());
+    auto future = mCacheSender->sendAsync(llmRequest);
+    mSenderFutures.emplace_back(std::move(llmRequest), std::move(future));
 }
 
 void CacheTransceiver::respondAndSendLayerWise(
@@ -410,22 +429,22 @@ void CacheTransceiver::respondAndSendLayerWise(
 
         llmRequest->setState(LlmRequestState::kDISAGG_CONTEXT_INIT_AND_TRANS);
         setContextState(llmRequest.get());
-        auto future = mCacheSender->sendAsync(*llmRequest);
-        mSenderFutures.emplace_back(llmRequest.get(), std::move(future));
+        auto future = mCacheSender->sendAsync(llmRequest);
+        mSenderFutures.emplace_back(llmRequest, std::move(future));
     }
 }
 
-void CacheTransceiver::requestAndReceiveSync(LlmRequest* llmRequest)
+void CacheTransceiver::requestAndReceiveSync(std::shared_ptr<LlmRequest> llmRequest)
 {
     TLLM_CHECK(llmRequest && llmRequest->isGenerationOnlyRequest());
     {
-        auto future = mCacheReceiver->receiveAsync(*llmRequest);
+        auto future = mCacheReceiver->receiveAsync(llmRequest);
         future.get();
     }
     llmRequest->setState(LlmRequestState::kDISAGG_GENERATION_TRANS_COMPLETE);
 }
 
-void CacheTransceiver::requestAndReceiveAsync(LlmRequest* llmRequest)
+void CacheTransceiver::requestAndReceiveAsync(std::shared_ptr<LlmRequest> llmRequest)
 {
     TLLM_CHECK(llmRequest && llmRequest->isGenerationOnlyRequest());
 
@@ -437,9 +456,27 @@ void CacheTransceiver::requestAndReceiveAsync(LlmRequest* llmRequest)
         return;
     }
 
-    auto future = mCacheReceiver->receiveAsync(*llmRequest);
-    mRequesterFutures.emplace_back(llmRequest, std::move(future));
+    // Record the transfer start synchronously, before pushing the future.
+    // CacheReceiver::receiveAsync() spawns a background thread that does the
+    // same thing inside requestSync(), but until that thread runs,
+    // getKvCacheTransferStart() would return the default (epoch) time point.
+    // checkGenTransferStatus's elapsed-time deadline check would then see a
+    // huge elapsed value and falsely evict the entry. A preemptive set
+    // here keeps the invariant "every entry in mRequesterFutures has a
+    // valid transfer start time" and is overwritten by requestSync() with a
+    // slightly later time — harmless for the deadline check.
+    llmRequest->setKvCacheTransferStart(LlmRequest::getSteadyClockNow());
+    auto future = mCacheReceiver->receiveAsync(llmRequest);
+    // Order: setKvCacheTransferStart -> receiveAsync -> setState -> emplace.
+    // setState is intentionally moved AFTER receiveAsync (the original code
+    // set it before). This is safe today because the async worker spawned
+    // by receiveAsync does not read llmRequest state at entry; the new
+    // ordering tightens the IN_PROGRESS<->mRequesterFutures invariant and
+    // ensures a throw from receiveAsync leaves the request out of both
+    // sets atomically. Do not revert without verifying the worker still
+    // does not depend on the IN_PROGRESS state being set at entry.
     llmRequest->setState(LlmRequestState::kDISAGG_GENERATION_TRANS_IN_PROGRESS);
+    mRequesterFutures.emplace_back(std::move(llmRequest), std::move(future));
 }
 
 std::vector<LlmRequest::RequestIdType> gatherRequestIds(
@@ -541,10 +578,20 @@ RequestStatuses CacheTransceiver::checkContextTransferStatus(
 {
     bool blockAll = !atLeastRequestNum.has_value();
     std::optional<int> senderFutureTimeoutMs = std::nullopt;
-    // If blockAll is true, we want to block and not use a timeout
-    if (!blockAll && mCacheTransceiverConfig.has_value())
+    std::optional<int> kvTransferTimeoutMs = std::nullopt;
+    if (mCacheTransceiverConfig.has_value())
     {
-        senderFutureTimeoutMs = mCacheTransceiverConfig->getKvTransferSenderFutureTimeoutMs();
+        // Apply the overall transfer deadline in both blockAll and polling
+        // modes so a stuck sender cannot pin KV blocks indefinitely.
+        // Healthy transfers complete well before the deadline (default
+        // 60s on the Python side, configurable via kv_transfer_timeout_ms).
+        kvTransferTimeoutMs = mCacheTransceiverConfig->getKvTransferTimeoutMs();
+        // The per-iteration poll timeout is only relevant when the caller wants to
+        // return after checking at least `atLeastRequestNum` entries.
+        if (!blockAll)
+        {
+            senderFutureTimeoutMs = mCacheTransceiverConfig->getKvTransferSenderFutureTimeoutMs();
+        }
     }
 
     auto syncComm = mCacheState->getParallelConfig().mEnableAttentionDP ? mGroupTPInDPComm : mGroupTensorParaComm;
@@ -602,13 +649,102 @@ RequestStatuses CacheTransceiver::checkContextTransferStatus(
     for (auto it = mSenderFutures.begin(); it != mSenderFutures.end();)
     {
         auto& [request, future] = *it;
+        // Enforce the overall deadline for every entry on every invocation,
+        // independent of the readiness gate below. `toCompleteIdSet` is
+        // populated from the consensus freqVec (entries that were ready on
+        // every rank) plus up to `atLeastRequestNum` insertion-order entries.
+        // A stuck sender whose future never becomes ready is not in the
+        // consensus set, so with `atLeastRequestNum=0` it would otherwise
+        // escape the deadline check entirely and pin KV blocks forever.
+        // mSenderFutures holds shared_ptr<LlmRequest>, so the request is kept
+        // alive for every C++ access here regardless of Python-side
+        // termination timing.
+        if (kvTransferTimeoutMs.has_value())
+        {
+            auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                LlmRequest::getSteadyClockNow() - request->getKvCacheTransferStart());
+            auto elapsedMs = static_cast<long>(elapsed.count());
+            if (elapsedMs > kvTransferTimeoutMs.value())
+            {
+                // Dedup is shared with the inline wait_for re-check below
+                // so a single hung request produces at most one warning
+                // regardless of which site observes the expired deadline.
+                bool const firstTimeout = mTimedOutSenderIds.insert(request->mRequestId).second;
+                bool const inflightCancelEnabled = common::getEnvDisaggEnableInflightCancel();
+                if (firstTimeout)
+                {
+                    TLLM_LOG_WARNING(
+                        "Context KV cache transfer for request %ld exceeded total timeout: "
+                        "elapsed %ld ms > limit %d ms. %s",
+                        request->mRequestId, elapsedMs, kvTransferTimeoutMs.value(),
+                        inflightCancelEnabled ? "Marking as error." : kObserveOnlyTimeoutTail);
+                }
+                if (inflightCancelEnabled)
+                {
+                    // Defense-in-depth sender-side cancel. Sender zombies empirically
+                    // unwind on peer teardown (decode-pod restart), but in general
+                    // CacheSender::cancelRequest clears mReadyResponses /
+                    // mCancelledRequests bookkeeping so a subsequent re-enqueue
+                    // or telemetry path doesn't see the stale request.
+                    mCacheSender->cancelRequest(*request);
+                    request->setState(LlmRequestState::kDISAGG_TRANS_ERROR);
+                    requestsStatus.errorRequestIds.insert(request->mRequestId);
+                    mTimedOutSenderIds.erase(request->mRequestId);
+                    it = mSenderFutures.erase(it);
+                    continue;
+                }
+                // Observe-only: cannot safely cancel the in-flight transfer
+                // (would risk a UAF on send buffers still touched by the
+                // network thread). Fall through to the readiness gate so a
+                // transfer that completes naturally is still detected.
+            }
+        }
         if (blockAll || (toCompleteIdSet.find(request->mRequestId) != toCompleteIdSet.end()))
         {
             try
             {
-                // Wait for up to a specified timeout
-                auto status = future.wait_for(std::chrono::milliseconds(senderFutureTimeoutMs.value_or(0)));
-                if (status == std::future_status::ready || !senderFutureTimeoutMs.has_value())
+                // Bound the wait so a stuck sender cannot wedge the call:
+                // per-iteration timeout if set, else remaining overall
+                // deadline, else block (caller opted in).
+                int64_t effectiveSliceMs = 0;
+                if (senderFutureTimeoutMs.has_value())
+                {
+                    effectiveSliceMs = senderFutureTimeoutMs.value();
+                }
+                else if (kvTransferTimeoutMs.has_value())
+                {
+                    auto const elapsedNow = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        LlmRequest::getSteadyClockNow() - request->getKvCacheTransferStart())
+                                                .count();
+                    effectiveSliceMs = std::max<int64_t>(0, kvTransferTimeoutMs.value() - elapsedNow);
+                }
+                else
+                {
+                    effectiveSliceMs = std::numeric_limits<int64_t>::max();
+                }
+                // Cap the per-call wait slice so the polling thread always
+                // cycles back to drive MPI/UCX forward progress. Transports
+                // without a dedicated progress thread (notably mpi_kvcache
+                // over UCX-over-shm) rely on the app thread calling MPI
+                // functions to advance in-flight transfers. If the slice is
+                // unbounded (the fall-through above sets INT64_MAX when no
+                // timeout is configured), a single wait_for on a not-yet-
+                // ready future blocks the thread forever -- which means no
+                // MPI progress -- which means the future never becomes
+                // ready. The death spiral was empirically observed as
+                // test_asymmetric_executor[mpi_kvcache] wedging at its
+                // 300s gtest timeout despite the test's CacheTransceiverConfig
+                // having neither senderFutureTimeoutMs nor kvTransferTimeoutMs
+                // configured (nvbug-6104831).
+                //
+                // The deadline-check observability above is UNCHANGED: if
+                // kvTransferTimeoutMs is set, the deadline still fires within
+                // kMaxPollSliceMs of true expiry. Cancellation semantics
+                // (gated by TRTLLM_DISAGG_ENABLE_INFLIGHT_CANCEL) unchanged.
+                static constexpr int64_t kMaxPollSliceMs = 50;
+                effectiveSliceMs = std::min<int64_t>(effectiveSliceMs, kMaxPollSliceMs);
+                auto status = future.wait_for(std::chrono::milliseconds(effectiveSliceMs));
+                if (status == std::future_status::ready)
                 {
                     future.get();
                     requestsStatus.completedRequestIds.insert(request->mRequestId);
@@ -616,13 +752,61 @@ RequestStatuses CacheTransceiver::checkContextTransferStatus(
                     {
                         request->setState(LlmRequestState::kDISAGG_CONTEXT_COMPLETE);
                     }
+                    // Clear any observe-only timeout breadcrumb so the dedup
+                    // set does not leak across the request's lifetime.
+                    mTimedOutSenderIds.erase(request->mRequestId);
                     it = mSenderFutures.erase(it);
                 }
                 else if (status == std::future_status::timeout)
                 {
-                    TLLM_LOG_WARNING("Timed out waiting for context KV cache transfer after %d milliseconds.",
-                        senderFutureTimeoutMs.value());
-                    ++it;
+                    // Re-check the overall deadline inline; if reached,
+                    // mark error here instead of blocking on a follow-up
+                    // future.get().
+                    bool deadlineReached = false;
+                    if (kvTransferTimeoutMs.has_value())
+                    {
+                        auto const elapsedNow = std::chrono::duration_cast<std::chrono::milliseconds>(
+                            LlmRequest::getSteadyClockNow() - request->getKvCacheTransferStart())
+                                                    .count();
+                        deadlineReached = elapsedNow >= kvTransferTimeoutMs.value();
+                    }
+                    if (deadlineReached)
+                    {
+                        bool const firstTimeout = mTimedOutSenderIds.insert(request->mRequestId).second;
+                        bool const inflightCancelEnabled = common::getEnvDisaggEnableInflightCancel();
+                        if (firstTimeout)
+                        {
+                            TLLM_LOG_WARNING(
+                                "Context KV cache transfer for request %ld reached total timeout "
+                                "while waiting for sender future. %s",
+                                request->mRequestId,
+                                inflightCancelEnabled ? "Marking as error." : kObserveOnlyTimeoutTail);
+                        }
+                        if (inflightCancelEnabled)
+                        {
+                            mCacheSender->cancelRequest(*request);
+                            request->setState(LlmRequestState::kDISAGG_TRANS_ERROR);
+                            requestsStatus.errorRequestIds.insert(request->mRequestId);
+                            mTimedOutSenderIds.erase(request->mRequestId);
+                            it = mSenderFutures.erase(it);
+                        }
+                        else
+                        {
+                            // Observe-only: continue waiting for natural completion.
+                            ++it;
+                        }
+                    }
+                    else
+                    {
+                        if (senderFutureTimeoutMs.has_value())
+                        {
+                            TLLM_LOG_WARNING(
+                                "Timed out waiting for context KV cache transfer for request %ld after %d "
+                                "milliseconds.",
+                                request->mRequestId, senderFutureTimeoutMs.value());
+                        }
+                        ++it;
+                    }
                 }
                 else
                 {
@@ -631,15 +815,21 @@ RequestStatuses CacheTransceiver::checkContextTransferStatus(
 
                     request->setState(LlmRequestState::kDISAGG_TRANS_ERROR);
                     requestsStatus.errorRequestIds.insert(request->mRequestId);
+                    mTimedOutSenderIds.erase(request->mRequestId);
                     it = mSenderFutures.erase(it);
                 }
             }
             catch (std::exception const& e)
             {
-                TLLM_LOG_ERROR(
-                    "Error occurred during context transfer for request %ld: %s", request->mRequestId, e.what());
+                // mSenderFutures holds shared_ptr<LlmRequest>, so the request
+                // is alive here regardless of Python-side termination timing.
+                // Report as error so Python can call end_transfer to unpin
+                // blocks.
+                TLLM_LOG_WARNING("Error during context transfer for request %ld: %s. Marking as error.",
+                    request->mRequestId, e.what());
                 request->setState(LlmRequestState::kDISAGG_TRANS_ERROR);
                 requestsStatus.errorRequestIds.insert(request->mRequestId);
+                mTimedOutSenderIds.erase(request->mRequestId);
                 it = mSenderFutures.erase(it);
             }
         }
@@ -649,12 +839,38 @@ RequestStatuses CacheTransceiver::checkContextTransferStatus(
         }
     }
 
+    if (!requestsStatus.completedRequestIds.empty() || !requestsStatus.errorRequestIds.empty())
+    {
+        TLLM_LOG_DEBUG(
+            "checkContextTransferStatus done: completed=%zu, errors=%zu, "
+            "mSenderFutures.size()=%zu",
+            requestsStatus.completedRequestIds.size(), requestsStatus.errorRequestIds.size(), mSenderFutures.size());
+    }
+
     return requestsStatus;
 }
 
 void CacheTransceiver::checkGenTransferStatus(std::optional<int> const& atLeastRequestNum)
 {
     bool blockAll = !atLeastRequestNum.has_value();
+    std::optional<int> senderFutureTimeoutMs = std::nullopt;
+    std::optional<int> kvTransferTimeoutMs = std::nullopt;
+    if (mCacheTransceiverConfig.has_value())
+    {
+        // Apply the overall transfer deadline in both blockAll and polling
+        // modes (mirrors checkContextTransferStatus) so a stuck receiver
+        // cannot pin generation-side KV blocks. Healthy transfers complete
+        // well under kv_transfer_timeout_ms; raise it if the workload needs
+        // more headroom.
+        kvTransferTimeoutMs = mCacheTransceiverConfig->getKvTransferTimeoutMs();
+        // The per-iteration poll timeout is only relevant when the caller wants to
+        // return after checking at least `atLeastRequestNum` entries.
+        if (!blockAll)
+        {
+            senderFutureTimeoutMs = mCacheTransceiverConfig->getKvTransferSenderFutureTimeoutMs();
+        }
+    }
+
     std::vector<LlmRequest::RequestIdType> genTransferReadyRequestIds;
     for (auto&& [request, future] : mRequesterFutures)
     {
@@ -697,16 +913,8 @@ void CacheTransceiver::checkGenTransferStatus(std::optional<int> const& atLeastR
             break;
         }
         toCompleteIdSet.insert(freqVec.at(idx).first);
-        if (useMPI())
-        {
-            TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(),
-                " checkGenTransferStatus at least from freqVec requestId: %zu ", freqVec.at(idx).first);
-        }
-        else
-        {
-            TLLM_LOG_DEBUG(tensorrt_llm::pg_utils::get_world_pg()->getRank(),
-                " checkGenTransferStatus at least from freqVec requestId: %zu ", freqVec.at(idx).first);
-        }
+        TLLM_LOG_DEBUG(currentRankForLog(), " checkGenTransferStatus at least from freqVec requestId: %zu ",
+            freqVec.at(idx).first);
         idx++;
     }
     idx = 0;
@@ -721,18 +929,9 @@ void CacheTransceiver::checkGenTransferStatus(std::optional<int> const& atLeastR
         if (toCompleteIdSet.find(mRequesterFutures.at(idx).first->mRequestId) == toCompleteIdSet.end())
         {
             toCompleteIdSet.insert(mRequesterFutures.at(idx).first->mRequestId);
-            if (useMPI())
-            {
-                TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(),
-                    " checkGenTransferStatus at least from RequesterFuture requestId: %zu atLeastRequestNum:%d",
-                    mRequesterFutures.at(idx).first->mRequestId, atLeastRequestNum.value_or(0));
-            }
-            else
-            {
-                TLLM_LOG_DEBUG(tensorrt_llm::pg_utils::get_world_pg()->getRank(),
-                    " checkGenTransferStatus at least from RequesterFuture requestId: %zu atLeastRequestNum:%d",
-                    mRequesterFutures.at(idx).first->mRequestId, atLeastRequestNum.value_or(0));
-            }
+            TLLM_LOG_DEBUG(currentRankForLog(),
+                " checkGenTransferStatus at least from RequesterFuture requestId: %zu atLeastRequestNum:%d",
+                mRequesterFutures.at(idx).first->mRequestId, atLeastRequestNum.value_or(0));
         }
         idx++;
     }
@@ -742,69 +941,250 @@ void CacheTransceiver::checkGenTransferStatus(std::optional<int> const& atLeastR
         {
             toCompleteIdSet.insert(requestId);
         }
-        if (useMPI())
-        {
-            TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(), " checkGenTransferStatus freqVec requestId: %zu,freq:%d  ",
-                requestId, freq);
-        }
-        else
-        {
-            TLLM_LOG_DEBUG(tensorrt_llm::pg_utils::get_world_pg()->getRank(),
-                " checkGenTransferStatus freqVec requestId: %zu,freq:%d  ", requestId, freq);
-        }
+        TLLM_LOG_DEBUG(
+            currentRankForLog(), " checkGenTransferStatus freqVec requestId: %zu,freq:%d  ", requestId, freq);
     }
-    if (useMPI())
+    TLLM_LOG_DEBUG(currentRankForLog(), " checkGenTransferStatus toCompleteIdSet size: %zu, atLeastRequestNum: %d ",
+        toCompleteIdSet.size(), atLeastRequestNum.value_or(0));
+    // Helper: finalize a generation-side transfer on the happy path.
+    // Called in two places: status == ready, and blockAll fall-through
+    // from the timeout branch.
+    auto const completeEntry = [this](std::shared_ptr<LlmRequest> const& request)
     {
-        TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(),
-            " checkGenTransferStatus toCompleteIdSet size: %zu, atLeastRequestNum: %d ", toCompleteIdSet.size(),
-            atLeastRequestNum.value_or(0));
-    }
-    else
-    {
-        TLLM_LOG_DEBUG(tensorrt_llm::pg_utils::get_world_pg()->getRank(),
-            " checkGenTransferStatus toCompleteIdSet size: %zu, atLeastRequestNum: %d ", toCompleteIdSet.size(),
-            atLeastRequestNum.value_or(0));
-    }
+        request->setState(LlmRequestState::kDISAGG_GENERATION_TRANS_COMPLETE);
+        if (!common::getEnvKVCacheTimeOutputPath().empty())
+        {
+            auto transferSyncComm = mCacheState->getParallelConfig().mEnableAttentionDP ? mGroupDataComm : mGroupComm;
+            updateKVCacheTransferBW(transferSyncComm, request.get());
+        }
+        TLLM_LOG_DEBUG(currentRankForLog(),
+            "**** it->first->mRequestId: %ld, context request ID: %ld ******** get feature ***", request->mRequestId,
+            request->getContextPhaseParams().value().getReqId());
+    };
+
+    std::size_t numCompleted = 0;
+    std::size_t numErrored = 0;
     for (auto it = mRequesterFutures.begin(); it != mRequesterFutures.end();)
     {
-        if (blockAll || toCompleteIdSet.find(it->first->mRequestId) != toCompleteIdSet.end())
+        auto& request = it->first; // std::shared_ptr<LlmRequest> const& — our own strong ref
+        auto& future = it->second;
+        // Enforce the overall deadline for every entry on every invocation,
+        // independent of the readiness gate below. In polling mode (blockAll ==
+        // false) `toCompleteIdSet` is populated from the initial
+        // `wait_for(0)` sweep and only contains receivers whose futures were
+        // already ready. A receiver whose peer sender evicted the transfer
+        // (see checkContextTransferStatus above) never becomes ready, so
+        // gating the deadline check behind `toCompleteIdSet` would let stuck
+        // entries accumulate in `mRequesterFutures` and pin generation-side
+        // KV blocks forever.
+        //
+        // Lifetime: mRequesterFutures holds shared_ptr<LlmRequest>, so the
+        // request is kept alive for every C++ access here regardless of
+        // whether Python has already dropped its active_requests reference.
+        // This is the load-bearing invariant for the lifetime of all
+        // accesses below; the older raw-pointer design relied on a Python
+        // guard to delay _terminate_request and produced an orphan-induced
+        // KV-block leak when the guard interacted with stuck transfers.
+        if (kvTransferTimeoutMs.has_value())
+        {
+            auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                LlmRequest::getSteadyClockNow() - request->getKvCacheTransferStart());
+            auto elapsedMs = static_cast<long>(elapsed.count());
+            if (elapsedMs > kvTransferTimeoutMs.value())
+            {
+                bool const firstTimeout = mTimedOutRequesterIds.insert(request->mRequestId).second;
+                bool const inflightCancelEnabled = common::getEnvDisaggEnableInflightCancel();
+                if (firstTimeout)
+                {
+                    TLLM_LOG_WARNING(
+                        "Generation KV cache transfer for request %ld exceeded total timeout: "
+                        "elapsed %ld ms > limit %d ms. %s",
+                        request->mRequestId, elapsedMs, kvTransferTimeoutMs.value(),
+                        inflightCancelEnabled ? "Requesting cancellation." : kObserveOnlyTimeoutTail);
+                }
+                if (inflightCancelEnabled)
+                {
+                    if (firstTimeout)
+                    {
+                        // cancelRequest requests worker unwind, but it is not a
+                        // quiescence proof. Keep the future tracked until the
+                        // worker future becomes ready, otherwise Python could
+                        // free KV resources while the worker/transport may still
+                        // reference the advertised buffers.
+                        mCacheReceiver->cancelRequest(*request);
+                    }
+                    if (future.wait_for(std::chrono::milliseconds(0)) == std::future_status::ready)
+                    {
+                        try
+                        {
+                            future.get();
+                        }
+                        catch (std::exception const& e)
+                        {
+                            TLLM_LOG_WARNING(
+                                "Generation KV cache transfer for timed-out request %ld finished with error: %s",
+                                request->mRequestId, e.what());
+                        }
+                        request->setState(LlmRequestState::kDISAGG_TRANS_ERROR);
+                        mTimedOutRequesterIds.erase(request->mRequestId);
+                        it = mRequesterFutures.erase(it);
+                        ++numErrored;
+                    }
+                    else
+                    {
+                        if (firstTimeout)
+                        {
+                            ++numErrored;
+                        }
+                        ++it;
+                    }
+                    continue;
+                }
+                // Observe-only: memory safety forbids requesting a worker
+                // unwind here (the recv buffer pool may still be touched
+                // by the transport thread). Fall through to the readiness
+                // gate so a naturally completing transfer is still cleaned
+                // up normally.
+            }
+        }
+        if (blockAll || toCompleteIdSet.find(request->mRequestId) != toCompleteIdSet.end())
         {
             try
             {
-                it->second.get();
-                it->first->setState(LlmRequestState::kDISAGG_GENERATION_TRANS_COMPLETE);
-
-                // Gather the kv cache transfer time from all workers and update to leader rank
-                if (!common::getEnvKVCacheTimeOutputPath().empty())
+                // Bound the wait so a stuck receiver cannot wedge the
+                // call; see checkContextTransferStatus for the rationale.
+                int64_t effectiveSliceMs = 0;
+                if (senderFutureTimeoutMs.has_value())
                 {
-                    auto syncComm = mCacheState->getParallelConfig().mEnableAttentionDP ? mGroupDataComm : mGroupComm;
-                    updateKVCacheTransferBW(syncComm, it->first);
+                    effectiveSliceMs = senderFutureTimeoutMs.value();
+                }
+                else if (kvTransferTimeoutMs.has_value())
+                {
+                    auto const elapsedNow = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        LlmRequest::getSteadyClockNow() - request->getKvCacheTransferStart())
+                                                .count();
+                    effectiveSliceMs = std::max<int64_t>(0, kvTransferTimeoutMs.value() - elapsedNow);
+                }
+                else
+                {
+                    effectiveSliceMs = std::numeric_limits<int64_t>::max();
+                }
+                // Cap the per-call wait slice so the polling thread always
+                // cycles back to drive MPI/UCX forward progress -- see the
+                // long comment at the analogous site in
+                // checkContextTransferStatus for the rationale and the
+                // empirical mpi_kvcache wedge that motivated this cap.
+                static constexpr int64_t kMaxPollSliceMs = 50;
+                effectiveSliceMs = std::min<int64_t>(effectiveSliceMs, kMaxPollSliceMs);
+                auto status = future.wait_for(std::chrono::milliseconds(effectiveSliceMs));
+                if (status == std::future_status::ready)
+                {
+                    future.get();
+                    if (request->getState() == LlmRequestState::kDISAGG_TRANS_ERROR)
+                    {
+                        TLLM_LOG_WARNING(
+                            "Generation KV cache transfer for request %ld finished after an error state was set.",
+                            request->mRequestId);
+                        ++numErrored;
+                    }
+                    else
+                    {
+                        completeEntry(request);
+                        ++numCompleted;
+                    }
+                    mTimedOutRequesterIds.erase(request->mRequestId);
+                    it = mRequesterFutures.erase(it);
+                }
+                else if (status == std::future_status::timeout)
+                {
+                    // Re-check the overall deadline inline; if reached,
+                    // mark error here instead of blocking on a follow-up
+                    // future.get().
+                    bool deadlineReached = false;
+                    if (kvTransferTimeoutMs.has_value())
+                    {
+                        auto const elapsedNow = std::chrono::duration_cast<std::chrono::milliseconds>(
+                            LlmRequest::getSteadyClockNow() - request->getKvCacheTransferStart())
+                                                    .count();
+                        deadlineReached = elapsedNow >= kvTransferTimeoutMs.value();
+                    }
+                    if (deadlineReached)
+                    {
+                        bool const firstTimeout = mTimedOutRequesterIds.insert(request->mRequestId).second;
+                        bool const inflightCancelEnabled = common::getEnvDisaggEnableInflightCancel();
+                        if (firstTimeout)
+                        {
+                            TLLM_LOG_WARNING(
+                                "Generation KV cache transfer for request %ld reached total timeout "
+                                "while waiting for receiver future. %s",
+                                request->mRequestId,
+                                inflightCancelEnabled ? "Requesting cancellation and marking as error."
+                                                      : kObserveOnlyTimeoutTail);
+                        }
+                        if (inflightCancelEnabled)
+                        {
+                            if (firstTimeout)
+                            {
+                                mCacheReceiver->cancelRequest(*request);
+                            }
+                            request->setState(LlmRequestState::kDISAGG_TRANS_ERROR);
+                            mTimedOutRequesterIds.erase(request->mRequestId);
+                            it = mRequesterFutures.erase(it);
+                            ++numErrored;
+                        }
+                        else
+                        {
+                            // Observe-only: continue waiting for natural completion.
+                            ++it;
+                        }
+                    }
+                    else
+                    {
+                        if (senderFutureTimeoutMs.has_value())
+                        {
+                            TLLM_LOG_WARNING(
+                                "Timed out waiting for generation KV cache transfer for request %ld "
+                                "after %d milliseconds (per-iteration).",
+                                request->mRequestId, senderFutureTimeoutMs.value());
+                        }
+                        ++it;
+                    }
+                }
+                else
+                {
+                    TLLM_LOG_ERROR("Future returned unexpected status for generation request %ld. Marking as error.",
+                        request->mRequestId);
+                    request->setState(LlmRequestState::kDISAGG_TRANS_ERROR);
+                    mTimedOutRequesterIds.erase(request->mRequestId);
+                    it = mRequesterFutures.erase(it);
+                    ++numErrored;
                 }
             }
             catch (std::exception const& e)
             {
-                TLLM_LOG_ERROR(
-                    "Error occurred during generation transfer for request %ld: %s", it->first->mRequestId, e.what());
-                it->first->setState(LlmRequestState::kDISAGG_TRANS_ERROR);
+                // mRequesterFutures holds shared_ptr<LlmRequest>, so the
+                // request is alive here regardless of Python-side
+                // termination timing. Report as error so Python's
+                // _check_cache_transfer_errors picks it up (via state ==
+                // kDISAGG_TRANS_ERROR) and cleanly unwinds the request.
+                TLLM_LOG_WARNING("Error during generation transfer for request %ld: %s. Marking as error.",
+                    request->mRequestId, e.what());
+                request->setState(LlmRequestState::kDISAGG_TRANS_ERROR);
+                mTimedOutRequesterIds.erase(request->mRequestId);
+                it = mRequesterFutures.erase(it);
+                ++numErrored;
             }
-            if (useMPI())
-            {
-                TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(),
-                    "**** it->first->mRequestId: %ld, context request ID: %ld ******** get feature ***",
-                    it->first->mRequestId, it->first->getContextPhaseParams().value().getReqId());
-            }
-            else
-            {
-                TLLM_LOG_DEBUG(tensorrt_llm::pg_utils::get_world_pg()->getRank(),
-                    "**** it->first->mRequestId: %ld, context request ID: %ld ******** get feature ***",
-                    it->first->mRequestId, it->first->getContextPhaseParams().value().getReqId());
-            }
-            it = mRequesterFutures.erase(it);
         }
         else
         {
             ++it;
         }
+    }
+
+    if (numCompleted > 0 || numErrored > 0)
+    {
+        TLLM_LOG_DEBUG("checkGenTransferStatus done: completed=%zu, errored=%zu, mRequesterFutures.size()=%zu",
+            numCompleted, numErrored, mRequesterFutures.size());
     }
 }
 
@@ -813,7 +1193,13 @@ bool CacheTransceiver::checkGenTransferComplete() const
     return mRequesterFutures.empty();
 }
 
-bool CacheTransceiver::cancelRequest(LlmRequest* llmRequest)
+bool CacheTransceiver::hasPoisonedTransferBuffer() const
+{
+    return std::any_of(mCacheTransBufferManagerPtrs.begin(), mCacheTransBufferManagerPtrs.end(),
+        [](BaseTransBufferManager const* manager) { return manager != nullptr && manager->hasPoisonedBuffer(); });
+}
+
+bool CacheTransceiver::cancelRequest(std::shared_ptr<LlmRequest> llmRequest)
 {
     if (llmRequest->isContextOnlyRequest())
     {

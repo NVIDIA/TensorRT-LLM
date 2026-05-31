@@ -1,8 +1,8 @@
 {
   "_meta": {
     "generated_by": "scripts/legacy_utils.py lint-update-violations",
-    "total_violations": 5338,
-    "total_files": 492
+    "total_violations": 5172,
+    "total_files": 480
   },
   ".github/scripts/label_community_user.py": {
     "D212": 1
@@ -452,9 +452,6 @@
     "D212": 1,
     "E741": 1
   },
-  "scripts/check_test_list.py": {
-    "D212": 1
-  },
   "scripts/dco_check.py": {
     "D212": 1
   },
@@ -518,19 +515,12 @@
   "tensorrt_llm/_torch/custom_ops/cute_dsl_custom_ops.py": {
     "E741": 11
   },
-  "tensorrt_llm/_torch/custom_ops/torch_custom_ops.py": {
-    "F821": 2
-  },
   "tensorrt_llm/_torch/cute_dsl_kernels/blackwell/dense_blockscaled_gemm_persistent.py": {
     "E741": 3
   },
   "tensorrt_llm/_torch/distributed/ops.py": {
     "E712": 1,
     "E731": 1
-  },
-  "tensorrt_llm/_torch/model_config.py": {
-    "F811": 1,
-    "F821": 4
   },
   "tensorrt_llm/_torch/models/checkpoints/auto_mapper.py": {
     "F821": 1
@@ -562,21 +552,12 @@
   "tensorrt_llm/_torch/models/modeling_nemotron.py": {
     "E731": 1
   },
-  "tensorrt_llm/_torch/models/modeling_qwen2vl.py": {
-    "F811": 1
-  },
-  "tensorrt_llm/_torch/models/modeling_qwen3_next.py": {
-    "F821": 1
-  },
   "tensorrt_llm/_torch/models/modeling_siglip.py": {
     "F811": 1
   },
   "tensorrt_llm/_torch/models/modeling_utils.py": {
     "E731": 1,
     "F821": 5
-  },
-  "tensorrt_llm/_torch/modules/attention.py": {
-    "E731": 2
   },
   "tensorrt_llm/_torch/modules/fused_moe/deep_ep_utils.py": {
     "F821": 2
@@ -611,13 +592,7 @@
   "tensorrt_llm/_torch/modules/mamba/ssd_state_passing.py": {
     "E731": 1
   },
-  "tensorrt_llm/_torch/pyexecutor/_util.py": {
-    "F811": 1
-  },
   "tensorrt_llm/_torch/pyexecutor/cuda_graph_runner.py": {
-    "F821": 1
-  },
-  "tensorrt_llm/_torch/pyexecutor/mamba_cache_manager.py": {
     "F821": 1
   },
   "tensorrt_llm/_torch/pyexecutor/model_engine.py": {
@@ -670,9 +645,7 @@
     "D411": 1
   },
   "tensorrt_llm/bench/build/dataclasses.py": {
-    "D205": 1,
-    "D208": 1,
-    "D210": 5
+    "D210": 4
   },
   "tensorrt_llm/bench/build/tuning.py": {
     "D205": 2,
@@ -784,7 +757,6 @@
     "D212": 5,
     "D300": 3,
     "F402": 1,
-    "F811": 1,
     "F821": 1
   },
   "tensorrt_llm/executor/rpc/rpc_client.py": {
@@ -834,18 +806,13 @@
     "D411": 8,
     "D415": 9
   },
-  "tensorrt_llm/inputs/evs.py": {
-    "D205": 1,
-    "D212": 2
-  },
   "tensorrt_llm/inputs/multimodal.py": {
-    "D202": 1,
     "D415": 1
   },
   "tensorrt_llm/inputs/registry.py": {
     "D200": 3,
     "D205": 6,
-    "D212": 17,
+    "D212": 16,
     "D301": 1,
     "D405": 1,
     "D411": 1,
@@ -918,29 +885,22 @@
   "tensorrt_llm/llmapi/llm.py": {
     "D200": 2,
     "D202": 1,
-    "D205": 4,
-    "D207": 2,
-    "D212": 2,
-    "D300": 4,
-    "D410": 2,
-    "D411": 2
+    "D205": 4
   },
   "tensorrt_llm/llmapi/llm_args.py": {
-    "D200": 23,
     "D202": 1,
-    "D205": 11,
+    "D205": 10,
     "D208": 2,
     "D210": 7,
-    "D212": 37,
+    "D212": 14,
     "D300": 8,
     "D415": 2
   },
   "tensorrt_llm/llmapi/llm_utils.py": {
     "D200": 2,
-    "D205": 4,
     "D209": 1,
     "D210": 9,
-    "D212": 3,
+    "D212": 2,
     "D300": 12
   },
   "tensorrt_llm/llmapi/mgmn_leader_node.py": {
@@ -979,9 +939,9 @@
     "D202": 1,
     "D205": 5,
     "D209": 1,
-    "D210": 14,
+    "D210": 13,
     "D212": 5,
-    "D300": 8,
+    "D300": 7,
     "E722": 1
   },
   "tensorrt_llm/mapping.py": {
@@ -1547,10 +1507,6 @@
     "PLE0302": 1
   },
   "tensorrt_llm/scaffolding/task.py": {
-    "F811": 1,
-    "F821": 1
-  },
-  "tensorrt_llm/scaffolding/task_collection.py": {
     "F821": 1
   },
   "tensorrt_llm/scaffolding/worker.py": {
@@ -1573,7 +1529,6 @@
   },
   "tensorrt_llm/serve/openai_server.py": {
     "D205": 1,
-    "D212": 2,
     "F821": 2
   },
   "tensorrt_llm/serve/responses_utils.py": {
@@ -1674,10 +1629,6 @@
     "D403": 9,
     "D415": 11
   },
-  "tests/integration/defs/accuracy/accuracy_core.py": {
-    "D205": 1,
-    "D212": 1
-  },
   "tests/integration/defs/accuracy/test_disaggregated_serving.py": {
     "D212": 1,
     "F601": 1
@@ -1688,15 +1639,12 @@
   },
   "tests/integration/defs/accuracy/test_llm_api_autodeploy.py": {
     "D205": 1,
-    "D209": 1,
-    "D415": 1,
-    "F811": 2
+    "D415": 1
   },
   "tests/integration/defs/accuracy/test_llm_api_pytorch.py": {
     "D212": 1,
     "D300": 3,
-    "D415": 3,
-    "E402": 7
+    "D415": 3
   },
   "tests/integration/defs/common.py": {
     "D200": 1,
@@ -1730,7 +1678,6 @@
     "E741": 2
   },
   "tests/integration/defs/disaggregated/test_disaggregated.py": {
-    "D202": 2,
     "D205": 3,
     "D209": 1,
     "D212": 5,
@@ -1874,7 +1821,7 @@
     "D212": 3
   },
   "tests/integration/defs/perf/open_search_db_utils.py": {
-    "D200": 2,
+    "D200": 1,
     "D212": 4,
     "E402": 1
   },
@@ -1941,13 +1888,7 @@
   },
   "tests/integration/defs/test_e2e.py": {
     "D200": 5,
-    "D202": 3,
-    "D205": 3,
-    "D210": 1,
-    "D212": 8,
-    "D300": 9,
-    "D403": 4,
-    "D415": 10,
+    "D415": 8,
     "F811": 2
   },
   "tests/integration/defs/test_list_parser.py": {
@@ -2069,10 +2010,7 @@
     "E731": 1
   },
   "tests/unittest/_torch/modeling/test_modeling_exaone4.py": {
-    "E402": 12
-  },
-  "tests/unittest/_torch/thop/parallel/test_mamba2_chunk_ss_update.py": {
-    "E731": 4
+    "E402": 11
   },
   "tests/unittest/api_stability/api_stability_core.py": {
     "D202": 1,
@@ -2085,7 +2023,7 @@
   },
   "tests/unittest/bindings/test_executor_bindings.py": {
     "D202": 1,
-    "E712": 56,
+    "E712": 54,
     "F403": 2,
     "F405": 3,
     "F811": 1
@@ -2161,9 +2099,7 @@
   },
   "tests/unittest/llmapi/test_llm_args.py": {
     "D200": 1,
-    "D202": 2,
-    "D212": 2,
-    "E712": 20,
+    "E712": 19,
     "F811": 1
   },
   "tests/unittest/llmapi/test_llm_multi_gpu.py": {
@@ -2174,8 +2110,7 @@
     "D202": 1,
     "D210": 2,
     "D212": 1,
-    "F811": 1,
-    "F821": 3
+    "F811": 1
   },
   "tests/unittest/llmapi/test_llm_quant.py": {
     "D205": 1,
@@ -2201,8 +2136,7 @@
     "D415": 1
   },
   "tests/unittest/others/test_kv_cache_transceiver.py": {
-    "D205": 1,
-    "D212": 2
+    "D205": 1
   },
   "tests/unittest/others/test_layer.py": {
     "D205": 1,
@@ -2434,9 +2368,6 @@
     "D205": 1
   },
   "triton_backend/all_models/llmapi/tensorrt_llm/1/helpers.py": {
-    "D205": 3,
-    "D212": 3,
-    "D415": 3,
     "E722": 1
   },
   "triton_backend/all_models/llmapi/tensorrt_llm/1/model.py": {
@@ -2480,7 +2411,7 @@
   },
   "triton_backend/all_models/tests/test_python_backend.py": {
     "E402": 2,
-    "E712": 40,
+    "E712": 38,
     "F403": 1,
     "F405": 72
   },

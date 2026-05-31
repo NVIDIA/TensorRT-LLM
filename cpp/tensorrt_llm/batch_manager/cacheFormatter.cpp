@@ -34,6 +34,7 @@
 #include "tensorrt_llm/runtime/iTensor.h"
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
 #include <algorithm>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <future>
@@ -63,7 +64,6 @@ void sendBuffer(TransferSession& session, int deviceId, size_t localIdx,
     executor::kv_cache::TargetRanksInfo const& targetInfo, std::vector<size_t> const& pickUpConnections)
 {
     size_t connIdx = pickUpConnections[localIdx];
-    TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(), " send localIdx: %ld connIdx: %ld", localIdx, connIdx);
     NVTX3_SCOPED_RANGE(sendBuffer);
     TLLM_CUDA_CHECK(cudaSetDevice(deviceId));
     TLLM_CHECK(session.getConnections().size() > (connIdx / targetInfo.mPeerDupHeadFactor));
@@ -76,11 +76,7 @@ void sendBuffer(TransferSession& session, int deviceId, size_t localIdx,
 
     if (bufferIdx < bufferCoverTargetNum)
     {
-        TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(), " send connIdx: %ld bufferIdx: %ld size:%ld", connIdx,
-            bufferIdx, outputBuffers[bufferIdx]->getSizeInBytes());
         session.send(connIdx, outputBuffers[bufferIdx]->data(), outputBuffers[bufferIdx]->getSizeInBytes());
-        TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(), " end send connIdx: %ld bufferIdx: %ld size:%ld", connIdx,
-            bufferIdx, outputBuffers[bufferIdx]->getSizeInBytes());
     }
     else
     {
@@ -522,7 +518,20 @@ void CacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& sessio
         // cache blocks to the corresponding buffer.
         // 5. send the buffer to the corresponding target. Ideally, we send only once (one buffer) for each target.
 
-        auto cacheBufferId = mCacheTransBufferManager->assignBufferIndexForSend();
+        // RAII wrapper mirrors the receiver-side pattern. Happy-path calls
+        // sendHolder.release() after sendAllBuffers returns. If sendAllBuffers
+        // exits through an exception while an AgentConnection (NIXL) is
+        // active, transport quiescence is unknown and the catch block below
+        // poisons the held slot instead of returning it to the pool; on the
+        // direct-UCX path (no AgentConnection) the holder's destructor falls
+        // back to release. The send-pool CV wait inside
+        // assignBufferIndexForSend observes the session's per-request cancel
+        // flag and throws on cancel (parity with the recv side).
+        auto const sendReqIdForLog = std::make_optional(static_cast<uint64_t>(llmRequest.mRequestId));
+        auto const* sendCancelFlag = &session.getDataContext().getTransferTerminate();
+        auto cacheBufferId = mCacheTransBufferManager->assignBufferIndexForSend(
+            sendCancelFlag, kBufferAcquireSliceMs, sendReqIdForLog);
+        BufferIndexHolder sendHolder(*mCacheTransBufferManager, cacheBufferId, /*isRecv=*/false, sendReqIdForLog);
         int peerDuplicateHeadFactor = targetInfo.mPeerDupHeadFactor;
         auto bufferTargetNum = targetNum / peerDuplicateHeadFactor;
         auto ppRank = selfIdx
@@ -601,12 +610,38 @@ void CacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& sessio
                 == inputKvCacheBlocksPerWindow.begin()->second.front()->getDataType());
         }
 
-        sendAllBuffers(session, deviceId, outputSplitCaches, bufferCoverTargetNum, preAllocSendBuffer, bufferManager,
-            targetInfo, pickUpConnections);
+        try
+        {
+            sendAllBuffers(session, deviceId, outputSplitCaches, bufferCoverTargetNum, preAllocSendBuffer,
+                bufferManager, targetInfo, pickUpConnections);
+        }
+        catch (...)
+        {
+            if (agentConnection != nullptr && common::getEnvDisaggEnableInflightCancel())
+            {
+                // AgentConnection::send can throw on cancel/error after the
+                // backend transfer has seen this send buffer. release() is
+                // not a quiescence proof, so do not return the slot to the
+                // pool; poison it and let Python restart the process.
+                //
+                // Gated on TRTLLM_DISAGG_ENABLE_INFLIGHT_CANCEL: poison the
+                // buffer only when the operator has explicitly opted in to
+                // the mid-flight cancellation surface. When opt-in is off
+                // the cancel chain is dormant by design (Python skips
+                // cancel_request), so this catch block can still execute
+                // from non-cancel exceptions but should not poison the
+                // buffer pool / drive Layer 5's fail-closed in py_executor.
+                sendHolder.poison();
+            }
+            throw;
+        }
 
+        // Happy-path release — frees the slot and disarms the holder in
+        // one noexcept call. Placed immediately after sendAllBuffers so any
+        // subsequent throw (e.g. from setTime) does not turn a non-leak into
+        // a destructor-driven release.
+        sendHolder.release();
         session.setTime(TransferSession::kTimeTransmissions);
-
-        mCacheTransBufferManager->freeBufferIndexForSend(cacheBufferId);
         session.setTime(TransferSession::kTimePostprocess);
     }
     TLLM_LOG_DEBUG(

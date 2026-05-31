@@ -35,6 +35,7 @@
 #include <torch/custom_class.h>
 #include <torch/python.h>
 #include <type_traits>
+#include <unordered_set>
 #include <vector>
 
 using SizeType32 = tensorrt_llm::runtime::SizeType32;
@@ -204,13 +205,13 @@ class BaseCacheTransceiver
 {
 public:
     virtual ~BaseCacheTransceiver() = default;
-    virtual void respondAndSendAsync(LlmRequest* llmRequest) = 0;
+    virtual void respondAndSendAsync(std::shared_ptr<LlmRequest> llmRequest) = 0;
     virtual void respondAndSendLayerWise(
         RequestVector const& requests, std::shared_ptr<ContextProgress> const& progress)
         = 0;
 
-    virtual void requestAndReceiveSync(LlmRequest* llmRequest) = 0;
-    virtual void requestAndReceiveAsync(LlmRequest* llmRequest) = 0;
+    virtual void requestAndReceiveSync(std::shared_ptr<LlmRequest> llmRequest) = 0;
+    virtual void requestAndReceiveAsync(std::shared_ptr<LlmRequest> llmRequest) = 0;
 
     /// Check all requests transferring context, and return the requests that have completed or encountered an error.
     virtual RequestStatuses checkContextTransferStatus(
@@ -221,7 +222,12 @@ public:
 
     [[nodiscard]] virtual bool checkGenTransferComplete() const = 0;
 
-    virtual bool cancelRequest(LlmRequest* llmRequest) = 0;
+    virtual bool cancelRequest(std::shared_ptr<LlmRequest> llmRequest) = 0;
+
+    [[nodiscard]] virtual bool hasPoisonedTransferBuffer() const
+    {
+        return false;
+    }
 };
 
 class CacheTransceiver : public BaseCacheTransceiver
@@ -252,13 +258,13 @@ public:
 
     virtual ~CacheTransceiver();
 
-    void respondAndSendAsync(LlmRequest* llmRequest) override;
+    void respondAndSendAsync(std::shared_ptr<LlmRequest> llmRequest) override;
 
     void respondAndSendLayerWise(
         RequestVector const& requests, std::shared_ptr<ContextProgress> const& progress) override;
 
-    void requestAndReceiveSync(LlmRequest* llmRequest) override;
-    void requestAndReceiveAsync(LlmRequest* llmRequest) override;
+    void requestAndReceiveSync(std::shared_ptr<LlmRequest> llmRequest) override;
+    void requestAndReceiveAsync(std::shared_ptr<LlmRequest> llmRequest) override;
 
     RequestStatuses checkContextTransferStatus(
         std::optional<int> const& atLeastRequestNum = std::nullopt, bool markComplete = false) override;
@@ -267,7 +273,9 @@ public:
 
     [[nodiscard]] bool checkGenTransferComplete() const override;
 
-    virtual bool cancelRequest(LlmRequest* llmRequest) override;
+    virtual bool cancelRequest(std::shared_ptr<LlmRequest> llmRequest) override;
+
+    [[nodiscard]] bool hasPoisonedTransferBuffer() const override;
 
 private:
     void initializeCommState();
@@ -276,9 +284,18 @@ private:
 
     std::unique_ptr<CacheSender> mCacheSender;
     std::unique_ptr<CacheReceiver> mCacheReceiver;
-    std::vector<std::pair<LlmRequest*, std::future<void>>> mSenderFutures;
-    std::vector<std::pair<LlmRequest*, std::future<void>>> mRequesterFutures;
+    std::vector<std::pair<std::shared_ptr<LlmRequest>, std::future<void>>> mSenderFutures;
+    std::vector<std::pair<std::shared_ptr<LlmRequest>, std::future<void>>> mRequesterFutures;
     mpi::MpiComm const* mMpiWorldComm{nullptr};
+
+    // First-timeout dedup sets for the kvTransferTimeoutMs enforcement,
+    // by role: mTimedOutSenderIds tracks context-side (mSenderFutures)
+    // and mTimedOutRequesterIds tracks generation-side (mRequesterFutures).
+    // Used to emit at most one timeout warning and at most one cancel
+    // request per request per role. Erased at every future-list cleanup
+    // site so the sets stay bounded.
+    std::unordered_set<LlmRequest::RequestIdType> mTimedOutSenderIds;
+    std::unordered_set<LlmRequest::RequestIdType> mTimedOutRequesterIds;
 
     std::shared_ptr<CacheTransceiverComm> mGroupComm;
     std::shared_ptr<CacheTransceiverComm> mGroupTensorParaComm, mGroupPipeParaComm, mGroupDataComm, mGroupTPInDPComm;
