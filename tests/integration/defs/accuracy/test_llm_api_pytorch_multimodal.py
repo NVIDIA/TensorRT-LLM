@@ -255,6 +255,9 @@ class TestNemotron_Nano_12B_V2_VL(LlmapiAccuracyTestHarness):
     def test_auto_dtype(self, enable_chunked_prefill, max_num_tokens):
         with LLM(
             self.MODEL_PATH,
+            # NVIDIA-Nemotron-Nano-12B-v2-VL ships custom HF code, so the loader
+            # requires trust_remote_code=True (same as the other Nemotron VL tests).
+            trust_remote_code=True,
             max_batch_size=128,
             enable_chunked_prefill=enable_chunked_prefill,
             max_num_tokens=max_num_tokens,
