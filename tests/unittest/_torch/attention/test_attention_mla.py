@@ -292,6 +292,36 @@ class RopeConfig:
     model_type: str = "deepseek_v3"
 
 
+def apply_mla_rope(tensor: torch.Tensor, positions: list,
+                   rope_cos_sin: torch.Tensor) -> torch.Tensor:
+    """Apply MLA-style RoPE to the last dimension of tensor.
+
+    Reorders from interleaved to pair format (unflatten/transpose/flatten),
+    then applies standard (cos, sin) rotation. Used to pre-apply RoPE for
+    backends that do not fuse RoPE internally (e.g. FlashInfer MLA).
+
+    Args:
+        tensor: [..., qk_rope_head_dim]
+        positions: list of integer position indices, length = tensor.shape[0]
+        rope_cos_sin: [max_pos, 2, qk_rope_head_dim]
+
+    Returns:
+        tensor with RoPE applied (same shape/dtype)
+    """
+    pos = torch.tensor(positions, dtype=torch.long)
+    cos_sin = rope_cos_sin[pos]  # [num_tokens, 2, qk_rope_head_dim]
+    cos = cos_sin[:, 0]  # [num_tokens, qk_rope_head_dim]
+    sin = cos_sin[:, 1]  # [num_tokens, qk_rope_head_dim]
+    # Expand to match tensor dimensions
+    for _ in range(tensor.dim() - 2):
+        cos = cos.unsqueeze(-2)
+        sin = sin.unsqueeze(-2)
+    # Reorder: interleaved -> pair format
+    t = tensor.unflatten(-1, [-1, 2]).transpose(-2, -1).flatten(start_dim=-2)
+    rotated = (t * cos + rotate_half(t) * sin).to(tensor.dtype)
+    return rotated
+
+
 def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
     """
     This is the equivalent of torch.repeat_interleave(x, dim=1, repeats=n_rep). The hidden states go from (batch,
@@ -403,6 +433,82 @@ def test_attention_mla(scenario: Scenario, context_sequence_lengths: List[int],
     )
 
     _run_test_for_backend("TRTLLM", num_heads, num_kv_heads, num_layers,
+                          q_lora_rank, kv_lora_rank, qk_nope_head_dim,
+                          qk_rope_head_dim, v_head_dim, rope_config,
+                          kv_cache_tokens_per_block, device, dtype,
+                          kv_cache_dtype, context_sequence_lengths,
+                          generation_seq_len_q, num_generation_steps,
+                          v2_kv_cache)
+
+
+# FlashInfer MLA test: BF16 only, fewer combos since it's slower
+flashinfer_scenarios = [
+    Scenario(kv_cache_dtype=torch.bfloat16,
+             num_layers=num_layers,
+             kv_cache_tokens_per_block=tokens_per_block) for num_layers in [1]
+]
+
+flashinfer_context_sequence_lengths = [
+    [10, 12, 5],
+    [100, 300, 20, 10],
+]
+
+
+@pytest.mark.parametrize("scenario",
+                         flashinfer_scenarios,
+                         ids=lambda x: f"scenario: {x}")
+@pytest.mark.parametrize("context_sequence_lengths",
+                         flashinfer_context_sequence_lengths,
+                         ids=lambda x: f"context_sequence_lengths: {x}")
+@pytest.mark.parametrize("generation_seq_len_q", [1],
+                         ids=lambda x: f"generation_seq_len_q: {x}")
+@pytest.mark.parametrize("num_generation_steps", [10],
+                         ids=lambda x: f"num_generation_steps: {x}")
+@pytest.mark.parametrize("v2_kv_cache", [True, False],
+                         ids=["v2_kv_cache", "v1_kv_cache"])
+def test_attention_mla_flashinfer(scenario: Scenario,
+                                  context_sequence_lengths: List[int],
+                                  generation_seq_len_q: int,
+                                  num_generation_steps: List[int],
+                                  v2_kv_cache: bool):
+    """Test FlashInfer MLA computation for both context and generation phases"""
+    pytest.importorskip("flashinfer")
+    if (not torch.cuda.is_available()
+            or torch.cuda.get_device_capability() != (10, 0)):
+        pytest.skip("FlashInfer MLA test only runs on SM100 (Blackwell)")
+
+    num_heads = scenario.num_heads
+    num_kv_heads = scenario.num_kv_heads
+    q_lora_rank = scenario.q_lora_rank
+    kv_lora_rank = scenario.kv_lora_rank
+    qk_nope_head_dim = scenario.qk_nope_head_dim
+    qk_rope_head_dim = scenario.qk_rope_head_dim
+    v_head_dim = scenario.v_head_dim
+    rope_config = RopeConfig(
+        hidden_size=scenario.hidden_size,
+        num_attention_heads=scenario.num_heads,
+        rope_scaling={
+            "beta_fast": scenario.rope_beta_fast,
+            "beta_slow": scenario.rope_beta_slow,
+            "factor": scenario.rope_factor,
+            "mscale": scenario.rope_mscale,
+            "mscale_all_dim": scenario.rope_mscale_all_dim,
+            "original_max_position_embeddings":
+            scenario.rope_original_max_position_embeddings,
+            "type": scenario.rope_type,
+        },
+        max_position_embeddings=scenario.max_position_embeddings,
+        rope_theta=scenario.rope_theta,
+        qk_rope_head_dim=scenario.qk_rope_head_dim,
+        model_type=scenario.model_type,
+    )
+    kv_cache_tokens_per_block = scenario.kv_cache_tokens_per_block
+    num_layers = scenario.num_layers
+    device = torch.device('cuda')
+    dtype = scenario.dtype
+    kv_cache_dtype = scenario.kv_cache_dtype
+
+    _run_test_for_backend("FLASHINFER", num_heads, num_kv_heads, num_layers,
                           q_lora_rank, kv_lora_rank, qk_nope_head_dim,
                           qk_rope_head_dim, v_head_dim, rope_config,
                           kv_cache_tokens_per_block, device, dtype,
@@ -647,7 +753,7 @@ def _run_test_for_backend(backend_name, num_heads, num_kv_heads, num_layers,
         max_num_requests=len(context_sequence_lengths),
         num_contexts=len(context_sequence_lengths),
         prompt_lens=context_sequence_lengths,
-        max_num_tokens=max(context_sequence_lengths),
+        max_num_tokens=sum(context_sequence_lengths),
         kv_cache_manager=kv_cache_manager,
         kv_cache_params=KVCacheParams(
             use_cache=True,
@@ -668,7 +774,7 @@ def _run_test_for_backend(backend_name, num_heads, num_kv_heads, num_layers,
                         kv_cache.capacity += 1
                     else:
                         kv_cache_manager.impl.add_token(req_id)
-            attn_metadata = AttentionCls.Metadata(
+            gen_metadata_kwargs = dict(
                 seq_lens=torch.tensor([generation_seq_len_q] *
                                       len(context_sequence_lengths),
                                       dtype=torch.int),
@@ -676,7 +782,10 @@ def _run_test_for_backend(backend_name, num_heads, num_kv_heads, num_layers,
                 max_num_requests=len(context_sequence_lengths),
                 num_contexts=0,
                 prompt_lens=context_sequence_lengths,
-                max_num_tokens=max(context_sequence_lengths),
+                max_num_tokens=max(
+                    sum(context_sequence_lengths),
+                    generation_seq_len_q * len(context_sequence_lengths),
+                ),
                 kv_cache_manager=kv_cache_manager,
                 kv_cache_params=KVCacheParams(
                     use_cache=True,
@@ -686,8 +795,11 @@ def _run_test_for_backend(backend_name, num_heads, num_kv_heads, num_layers,
                     ],
                 ),
                 mapping=mapping,
-                enable_flash_mla=torch.cuda.get_device_capability() == (9, 0),
             )
+            if backend_name == "TRTLLM":
+                gen_metadata_kwargs["enable_flash_mla"] = (
+                    torch.cuda.get_device_capability() == (9, 0))
+            attn_metadata = AttentionCls.Metadata(**gen_metadata_kwargs)
             attn_metadata.prepare()
         for layer_idx in range(num_layers):
             print(
@@ -702,13 +814,38 @@ def _run_test_for_backend(backend_name, num_heads, num_kv_heads, num_layers,
                 latent_cache = torch.cat([compressed_kv, k_pe], dim=-1)
                 # q/k will be modified in the forward pass, so we need to clone them
                 # we should not clone v because we need to keep the stride of v
+                if backend_name == "FLASHINFER":
+                    # FlashInfer MLA does not fuse RoPE; pre-apply it here.
+                    ctx_positions = [
+                        pos for ctx_len in context_sequence_lengths
+                        for pos in range(ctx_len)
+                    ]
+                    q_fwd = q.clone().view(-1, num_heads, qk_head_dim)
+                    q_fwd[..., qk_nope_head_dim:] = apply_mla_rope(
+                        q_fwd[..., qk_nope_head_dim:], ctx_positions,
+                        rope_cos_sin)
+                    q_fwd = q_fwd.view(-1, num_heads * qk_head_dim)
+                    k_fwd = k.clone().view(-1, num_kv_heads, qk_head_dim)
+                    k_fwd[..., qk_nope_head_dim:] = apply_mla_rope(
+                        k_fwd[..., qk_nope_head_dim:], ctx_positions,
+                        rope_cos_sin)
+                    k_fwd = k_fwd.view(-1, num_kv_heads * qk_head_dim)
+                    lc_kpe = latent_cache[:, kv_lora_rank:].unsqueeze(1)
+                    lc_kpe_rope = apply_mla_rope(lc_kpe, ctx_positions,
+                                                 rope_cos_sin).squeeze(1)
+                    latent_cache_fwd = torch.cat(
+                        [latent_cache[:, :kv_lora_rank], lc_kpe_rope], dim=-1)
+                else:
+                    q_fwd = q.clone()
+                    k_fwd = k.clone()
+                    latent_cache_fwd = latent_cache
                 result = ctx_layers[layer_idx].forward(
-                    q.clone(),
-                    k.clone(),
+                    q_fwd,
+                    k_fwd,
                     v,
                     attn_metadata,
                     attention_input_type=AttentionInputType.context_only,
-                    latent_cache=latent_cache,
+                    latent_cache=latent_cache_fwd,
                 )
                 ref_result, latent_cache_ref = calculate_ref_result_ctx(
                     q,
@@ -737,58 +874,95 @@ def _run_test_for_backend(backend_name, num_heads, num_kv_heads, num_layers,
                 k_pe = inputs_per_layer[layer_idx]["gen_k_pe_list"][step - 1]
                 latent_cache = torch.cat([compressed_kv, k_pe], dim=-1)
 
-                num_tokens = fused_q.size(0)
-                num_seqs = attn_metadata.kv_lens_cuda_runtime.size(0)
-                cu_q_seqlens = torch.empty(num_seqs + 1,
-                                           dtype=torch.int32,
-                                           device=q.device)
-                cu_kv_seqlens = torch.empty(num_seqs + 1,
-                                            dtype=torch.int32,
-                                            device=q.device)
-                fmha_scheduler_counter = torch.empty(1,
-                                                     dtype=torch.uint32,
-                                                     device=q.device)
-                has_fp8_kv_cache = gen_layers[
-                    layer_idx].has_fp8_kv_cache if hasattr(
-                        gen_layers[layer_idx], 'has_fp8_kv_cache') else False
+                if backend_name == "FLASHINFER":
+                    # FlashInfer MLA does not fuse RoPE; pre-apply before
+                    # appending to the KV cache.  Keep original q_pe and
+                    # latent_cache intact for the reference calculation
+                    # (calculate_ref_result_gen applies RoPE internally).
+                    gen_positions = [
+                        ctx_len + (step - 1) * generation_seq_len_q + i
+                        for ctx_len in context_sequence_lengths
+                        for i in range(generation_seq_len_q)
+                    ]
+                    q_pe_for_gen = apply_mla_rope(q_pe, gen_positions,
+                                                  rope_cos_sin)
+                    lc_kpe = latent_cache[:, kv_lora_rank:].unsqueeze(1)
+                    lc_kpe_rope = apply_mla_rope(lc_kpe, gen_positions,
+                                                 rope_cos_sin).squeeze(1)
+                    latent_cache_for_gen = torch.cat(
+                        [latent_cache[:, :kv_lora_rank], lc_kpe_rope], dim=-1)
+                    # Copy RoPE'd q_pe into the rope portion of fused_q
+                    num_tokens = fused_q.size(0)
+                    fused_q_3d = fused_q.view(num_tokens, num_heads,
+                                              kv_lora_rank + qk_rope_head_dim)
+                    fused_q_3d[..., kv_lora_rank:].copy_(q_pe_for_gen)
 
-                if has_fp8_kv_cache:
-                    mla_bmm1_scale = torch.empty(2,
-                                                 dtype=torch.float32,
-                                                 device=q.device)
-                    mla_bmm2_scale = torch.empty(1,
-                                                 dtype=torch.float32,
-                                                 device=q.device)
-                    quant_q_buffer = torch.empty(
-                        num_tokens,
-                        num_heads * (kv_lora_rank + qk_rope_head_dim),
-                        dtype=torch.uint8,
-                        device=q.device)
+                    result = gen_layers[layer_idx].forward(
+                        fused_q,
+                        None,
+                        None,
+                        attn_metadata,
+                        attention_input_type=AttentionInputType.generation_only,
+                        latent_cache=latent_cache_for_gen,
+                    )
                 else:
-                    mla_bmm1_scale = None
-                    mla_bmm2_scale = None
-                    quant_q_buffer = None
+                    q_pe_for_gen = q_pe
+                    latent_cache_for_gen = latent_cache
 
-                gen_layers[layer_idx].mla_rope_generation(
-                    fused_q, q_pe, latent_cache, attn_metadata, cu_q_seqlens,
-                    cu_kv_seqlens, fmha_scheduler_counter, mla_bmm1_scale,
-                    mla_bmm2_scale, quant_q_buffer)
+                    num_tokens = fused_q.size(0)
+                    num_seqs = len(context_sequence_lengths)
+                    cu_q_seqlens = torch.empty(num_seqs + 1,
+                                               dtype=torch.int32,
+                                               device=q.device)
+                    cu_kv_seqlens = torch.empty(num_seqs + 1,
+                                                dtype=torch.int32,
+                                                device=q.device)
+                    fmha_scheduler_counter = torch.empty(1,
+                                                         dtype=torch.uint32,
+                                                         device=q.device)
+                    has_fp8_kv_cache = gen_layers[
+                        layer_idx].has_fp8_kv_cache if hasattr(
+                            gen_layers[layer_idx],
+                            'has_fp8_kv_cache') else False
 
-                result = gen_layers[layer_idx].forward(
-                    fused_q,
-                    None,
-                    None,
-                    attn_metadata,
-                    attention_input_type=AttentionInputType.generation_only,
-                    latent_cache=latent_cache,
-                    q_pe=q_pe,
-                    cu_q_seqlens=cu_q_seqlens,
-                    cu_kv_seqlens=cu_kv_seqlens,
-                    fmha_scheduler_counter=fmha_scheduler_counter,
-                    mla_bmm1_scale=mla_bmm1_scale,
-                    mla_bmm2_scale=mla_bmm2_scale,
-                    quant_q_buffer=quant_q_buffer,
-                )
+                    if has_fp8_kv_cache:
+                        mla_bmm1_scale = torch.empty(2,
+                                                     dtype=torch.float32,
+                                                     device=q.device)
+                        mla_bmm2_scale = torch.empty(1,
+                                                     dtype=torch.float32,
+                                                     device=q.device)
+                        quant_q_buffer = torch.empty(
+                            num_tokens,
+                            num_heads * (kv_lora_rank + qk_rope_head_dim),
+                            dtype=torch.uint8,
+                            device=q.device)
+                    else:
+                        mla_bmm1_scale = None
+                        mla_bmm2_scale = None
+                        quant_q_buffer = None
+
+                    gen_layers[layer_idx].mla_rope_generation(
+                        fused_q, q_pe_for_gen, latent_cache_for_gen,
+                        attn_metadata, cu_q_seqlens, cu_kv_seqlens,
+                        fmha_scheduler_counter, mla_bmm1_scale, mla_bmm2_scale,
+                        quant_q_buffer)
+
+                    result = gen_layers[layer_idx].forward(
+                        fused_q,
+                        None,
+                        None,
+                        attn_metadata,
+                        attention_input_type=AttentionInputType.generation_only,
+                        latent_cache=latent_cache,
+                        q_pe=q_pe,
+                        cu_q_seqlens=cu_q_seqlens,
+                        cu_kv_seqlens=cu_kv_seqlens,
+                        fmha_scheduler_counter=fmha_scheduler_counter,
+                        mla_bmm1_scale=mla_bmm1_scale,
+                        mla_bmm2_scale=mla_bmm2_scale,
+                        quant_q_buffer=quant_q_buffer,
+                    )
                 ref_result, latent_cache_ref = calculate_ref_result_gen(
                     fused_q,
                     q_pe,

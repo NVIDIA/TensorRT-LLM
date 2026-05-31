@@ -1,6 +1,7 @@
 # Adapted from
 # https://github.com/vllm-project/vllm/blob/4db5176d9758b720b05460c50ace3c01026eb158/vllm/entrypoints/openai/protocol.py
 import base64
+import math
 import re
 import time
 import uuid
@@ -42,8 +43,12 @@ from tensorrt_llm.llmapi import DisaggregatedParams as LlmDisaggregatedParams
 from tensorrt_llm.llmapi import (DisaggScheduleStyle, GuidedDecodingParams,
                                  SamplingParams)
 from tensorrt_llm.llmapi.reasoning_parser import ReasoningParserFactory
-from tensorrt_llm.sampling_params import check_logprobs_limit
+from tensorrt_llm.sampling_params import (check_logprobs_limit,
+                                          validate_thinking_token_budget)
 from tensorrt_llm.scheduling_params import AgentHierarchy
+
+_LOGIT_BIAS_MIN = -100.0
+_LOGIT_BIAS_MAX = 100.0
 
 
 def _logit_bias_to_embedding_bias(
@@ -58,6 +63,8 @@ def _logit_bias_to_embedding_bias(
             "without one (e.g. num_postprocess_workers > 0). "
             "Remove logit_bias from your request or set num_postprocess_workers=0."
         )
+    elif vocab_size <= 0:
+        raise ValueError("vocab_size must be positive when logit_bias is used")
 
     # Create 1D zeros tensor as expected by executor API (will be unsqueezed to [1, vocab_size] internally)
     embedding_bias = torch.zeros(vocab_size, dtype=torch.float32)
@@ -66,18 +73,30 @@ def _logit_bias_to_embedding_bias(
     for token_str, bias in logit_bias.items():
         try:
             token_id = int(token_str)
-            if 0 <= token_id < vocab_size:
-                embedding_bias[token_id] = bias
-            else:
-                raise ValueError(
-                    f"Token ID {token_id} out of vocabulary range [0, {vocab_size})"
-                )
         except ValueError as e:
             if "invalid literal" in str(e):
                 raise ValueError(
                     f"Invalid logit_bias key '{token_str}': must be a valid integer token ID"
                 )
             raise
+        if not 0 <= token_id < vocab_size:
+            raise ValueError(
+                f"Token ID {token_id} out of vocabulary range [0, {vocab_size})"
+            )
+        try:
+            bias_value = float(bias)
+        except (TypeError, ValueError) as e:
+            raise ValueError(
+                f"logit_bias value for token ID {token_id} must be a number"
+            ) from e
+        if not math.isfinite(bias_value):
+            raise ValueError(f"logit_bias value for token ID {token_id} "
+                             "must be finite")
+        if not _LOGIT_BIAS_MIN <= bias_value <= _LOGIT_BIAS_MAX:
+            raise ValueError(
+                f"logit_bias value for token ID {token_id} must be in "
+                f"[{_LOGIT_BIAS_MIN:g}, {_LOGIT_BIAS_MAX:g}]")
+        embedding_bias[token_id] = bias_value
 
     return embedding_bias
 
@@ -138,6 +157,7 @@ class DisaggregatedParams(OpenAIBaseModel):
     ctx_info_endpoint: Optional[str] = None
     schedule_style: Optional[DisaggScheduleStyle] = None
     conversation_id: Optional[str] = None
+    ctx_usage: Optional[UsageInfo] = None
 
 
 class ErrorResponse(OpenAIBaseModel):
@@ -375,6 +395,7 @@ class CompletionRequest(OpenAIBaseModel):
     truncate_prompt_tokens: Optional[Annotated[int, Field(ge=1)]] = None
     return_context_logits: bool = False
     detokenize: bool = True
+    thinking_token_budget: Optional[int] = None
     # doc: end-completion-sampling-params
 
     # doc: begin-completion-extra-params
@@ -448,6 +469,7 @@ class CompletionRequest(OpenAIBaseModel):
             guided_decoding=_response_format_to_guided_decoding_params(
                 self.response_format),
             detokenize=self.detokenize,
+            thinking_token_budget=self.thinking_token_budget,
 
             # logits_bias
             embedding_bias=_logit_bias_to_embedding_bias(
@@ -465,6 +487,11 @@ class CompletionRequest(OpenAIBaseModel):
     def check_logprobs(cls, data):
         check_logprobs_limit("logprobs", data.get("logprobs"))
         return data
+
+    @field_validator("thinking_token_budget", mode="before")
+    @classmethod
+    def check_thinking_token_budget(cls, value):
+        return validate_thinking_token_budget(value)
 
     @model_validator(mode="before")
     @classmethod
@@ -546,7 +573,7 @@ class CustomChatCompletionMessageParam(TypedDict, total=False):
     role: Required[str]
     """The role of the message's author."""
 
-    content: Union[str, List[ChatCompletionContentPartParam]]
+    content: Union[str, List[ChatCompletionContentPartParam], None]
     """The contents of the message."""
 
     name: str
@@ -683,6 +710,7 @@ class ChatCompletionRequest(OpenAIBaseModel):
                 "reasoning is shown in the model's response. Options: "
                 "'low', 'medium', 'high'."),
         )
+    thinking_token_budget: Optional[int] = None
     prompt_ignore_length: Optional[int] = 0
 
     # doc: begin-chat-completion-sampling-params
@@ -829,6 +857,7 @@ class ChatCompletionRequest(OpenAIBaseModel):
             truncate_prompt_tokens=self.truncate_prompt_tokens,
             guided_decoding=_response_format_to_guided_decoding_params(
                 self.response_format, reasoning_parser=reasoning_parser),
+            thinking_token_budget=self.thinking_token_budget,
 
             # logits_bias
             embedding_bias=_logit_bias_to_embedding_bias(
@@ -869,6 +898,11 @@ class ChatCompletionRequest(OpenAIBaseModel):
                 raise ValueError(
                     "logprobs must be true when using top_logprobs")
         return data
+
+    @field_validator("thinking_token_budget", mode="before")
+    @classmethod
+    def check_thinking_token_budget(cls, value):
+        return validate_thinking_token_budget(value)
 
     @model_validator(mode="before")
     @classmethod
@@ -930,6 +964,7 @@ class ResponsesRequest(OpenAIBaseModel):
     previous_response_id: Optional[str] = None
     prompt: Optional[ResponsePrompt] = None
     reasoning: Optional[Reasoning] = None
+    thinking_token_budget: Optional[int] = None
     service_tier: Literal["auto", "default", "flex", "scale",
                           "priority"] = "auto"
     store: Optional[bool] = True
@@ -987,6 +1022,7 @@ class ResponsesRequest(OpenAIBaseModel):
             logprobs=self.top_logprobs,
             stop_token_ids=stop_token_ids,
             guided_decoding=guided_decoding,
+            thinking_token_budget=self.thinking_token_budget,
         )
 
     @model_validator(mode="before")
@@ -1004,6 +1040,11 @@ class ResponsesRequest(OpenAIBaseModel):
         if data.get("prompt") is not None:
             raise ValueError("prompt template is not supported")
         return data
+
+    @field_validator("thinking_token_budget", mode="before")
+    @classmethod
+    def check_thinking_token_budget(cls, value):
+        return validate_thinking_token_budget(value)
 
 
 class InputTokensDetails(OpenAIBaseModel):
@@ -1233,6 +1274,9 @@ def to_disaggregated_params(
         tllm_disagg_params: LlmDisaggregatedParams) -> DisaggregatedParams:
     if tllm_disagg_params is None:
         return None
+    ctx_usage = tllm_disagg_params.ctx_usage
+    if ctx_usage is not None and not isinstance(ctx_usage, UsageInfo):
+        ctx_usage = UsageInfo.model_validate(ctx_usage)
     return DisaggregatedParams(
         request_type=tllm_disagg_params.request_type,
         first_gen_tokens=tllm_disagg_params.first_gen_tokens,
@@ -1248,6 +1292,7 @@ def to_disaggregated_params(
         ctx_dp_rank=tllm_disagg_params.ctx_dp_rank,
         ctx_info_endpoint=tllm_disagg_params.ctx_info_endpoint,
         schedule_style=tllm_disagg_params.schedule_style,
+        ctx_usage=ctx_usage,
     )
 
 
@@ -1255,6 +1300,7 @@ def to_llm_disaggregated_params(
         disaggregated_params: DisaggregatedParams) -> LlmDisaggregatedParams:
     if disaggregated_params is None:
         return None
+    ctx_usage = disaggregated_params.ctx_usage
     return LlmDisaggregatedParams(
         request_type=disaggregated_params.request_type,
         first_gen_tokens=disaggregated_params.first_gen_tokens,
@@ -1270,6 +1316,7 @@ def to_llm_disaggregated_params(
         ctx_dp_rank=disaggregated_params.ctx_dp_rank,
         ctx_info_endpoint=disaggregated_params.ctx_info_endpoint,
         schedule_style=disaggregated_params.schedule_style,
+        ctx_usage=None if ctx_usage is None else ctx_usage.model_dump(),
     )
 
 

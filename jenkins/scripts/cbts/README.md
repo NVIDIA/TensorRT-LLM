@@ -20,14 +20,17 @@ filter chain.
 
 ## Rules
 
-Four rules, registered in `main.py::RULE_CLASSES`:
+Seven rules, registered in `main.py::RULE_CLASSES`:
 
 | Rule | Scope | Files |
 |---|---|---|
 | `WaivesRule` | `waiveonly` | `tests/integration/test_lists/waives.txt` |
 | `TestsDefRule` | `testdefonly` | `tests/**/*` (.py via AST; data files via dir walk-up) |
 | `TestListRule` | `testlistonly` | `tests/integration/test_lists/test-db/*.yml` |
-| `OutOfScopeRule` | `noop` | QA / dev test lists, `.test_durations`, `microbenchmarks/`, `tests/**/*.md` |
+| `AutoDeployRule` | `autodeployonly` | `examples/auto_deploy/**`, `tensorrt_llm/_torch/auto_deploy/**` (excl. `.md`; other suffixes incl. images kept as potential test fixtures) |
+| `VisualGenRule` | `visualgenonly` | `examples/visual_gen/**`, `tensorrt_llm/_torch/visual_gen/**`, `tensorrt_llm/visual_gen/**` (excl. `.md`; reference images such as `cat_piano.png` ARE test fixtures and stay claimed; outward-facing files force fallback) |
+| `SpecDecRule` | `specdeconly` | `tensorrt_llm/_torch/speculative/**`, `tensorrt_llm/models/{eagle,medusa,redrafter}/**`, `examples/{eagle,medusa,redrafter,draft_target_model,ngram}/**`, `examples/llm-api/llm_speculative_decoding.py` (excl. `.md`; other suffixes incl. images kept as potential test fixtures) |
+| `OutOfScopeRule` | `noop` | QA / dev test lists, `.test_durations`, `microbenchmarks/`, `**/*.md` (image suffixes intentionally not claimed — image fixtures cannot be distinguished from doc diagrams by location, so image edits fall back to baseline) |
 
 See `rules/README.md` for per-rule logic.
 
@@ -35,9 +38,14 @@ See `rules/README.md` for per-rule logic.
 
 | Scope | Meaning |
 |---|---|
-| `waiveonly` / `testdefonly` / `testlistonly` | Single rule from the testsonly family fired with a narrow. |
-| `testsonly` | Multiple rules from the family fired; their narrows union. |
-| `noop` | Rule(s) fired but determined no test stages need to run (QA-only path, removals-only test list, all-miss waives, in-namespace .py with no covering YAML entry). Layer 2 still applies. |
+| `waiveonly` | `WaivesRule` fired solo: PR only edits `waives.txt`. |
+| `testdefonly` | `TestsDefRule` fired solo: PR only edits files under `tests/**/*`. |
+| `testlistonly` | `TestListRule` fired solo: PR only adds entries under `tests/integration/test_lists/test-db/*.yml`. |
+| `autodeployonly` | `AutoDeployRule` fired solo: PR only touches AutoDeploy source paths (`examples/auto_deploy/**`, `tensorrt_llm/_torch/auto_deploy/**`; excl. `.md`). Narrows to AD-only blocks (`backend: autodeploy` plus blocks containing `test_llm_api_autodeploy.py` / `_autodeploy-` entries). |
+| `visualgenonly` | `VisualGenRule` fired solo: PR only touches VisualGen internal source paths (`examples/visual_gen/**`, `tensorrt_llm/_torch/visual_gen/**`, `tensorrt_llm/visual_gen/**`; excl. `.md`; image fixtures like `cat_piano.png` are claimed). Narrows to blocks containing VG test entries. Outward-facing files (eagerly imported by `trtllm-serve`) force `null` fallback. |
+| `specdeconly` | `SpecDecRule` fired solo: PR only touches speculative-decoding source paths (`tensorrt_llm/_torch/speculative/**`, `tensorrt_llm/models/{eagle,medusa,redrafter}/**`, `examples/{eagle,medusa,redrafter,draft_target_model,ngram}/**`, `examples/llm-api/llm_speculative_decoding.py`; excl. `.md`). Narrows to blocks containing spec-dec test entries (eagle / medusa / redrafter / ngram / draft-target-model / MTP). |
+| `testsonly` | Multiple rules from the testsonly family fired (`waiveonly`, `testdefonly`, `testlistonly`, `autodeployonly`, `visualgenonly`, `specdeconly`); their narrows union. |
+| `noop` | Rule(s) fired but determined no test stages need to run (QA-only path, removals-only test list, all-miss waives, in-namespace .py with no covering YAML entry, docs-only edits). Layer 2 still applies. |
 | `null` (fallback) | A rule cannot decide, scopes don't combine, or there are unhandled files. Groovy defers to baseline filter chain. |
 
 `_combine_scopes` (main.py): rules with `scope="noop"` give way to any
@@ -63,6 +71,9 @@ jenkins/scripts/cbts/
 │   ├── waives_rule.py
 │   ├── tests_def_rule.py
 │   ├── test_list_rule.py
+│   ├── auto_deploy_rule.py
+│   ├── visual_gen_rule.py
+│   ├── spec_dec_rule.py
 │   └── out_of_scope_rule.py
 └── tools/
     └── dryrun.py          replay CBTS over historical commits → per-PR summary.txt + filtered YAMLs + INDEX.md (debug only)
@@ -186,13 +197,19 @@ Decision JSON:
 `cbts_test_db/` is written on the L0_MergeRequest agent and is not
 available to downstream `L0_Test-*` pods. To regenerate it per stage:
 
-1. `getCbtsResult` stores the input JSON in `result.cbts_input_json`,
-   which rides along inside `testFilter`.
-2. `renderTestDB` on the stage agent writes it to a temp file and re-runs
-   `main.py`. Output is deterministic, so each agent gets the same
-   `cbts_test_db/` as L0_MergeRequest produced.
+1. `getCbtsResult` base64-encodes the input JSON and stores it in
+   `result.cbts_input_json_b64`, which rides along inside `testFilter`.
+   Encoding is mandatory: the raw payload contains PR diff text which can
+   include `${...}` or `{...}` fragments (Python f-strings, shell vars, etc.)
+   that the Jenkins tokenmacro plugin tries to evaluate when the parent
+   serializes `globalVars` for `Parameterized-Remote-Trigger`, raising
+   `MacroEvaluationException` and blocking test dispatch.
+2. `renderTestDB` on the stage agent decodes `cbts_input_json_b64`, writes
+   it to a temp file, and re-runs `main.py`. Output is deterministic, so
+   each agent gets the same `cbts_test_db/` as L0_MergeRequest produced.
 
-If `cbts_input_json` exceeds 256 KB the piggyback is dropped; Layer 3 falls
+If `cbts_input_json_b64` exceeds 256 KB (post-encoding, the size that
+actually travels over the wire) the piggyback is dropped; Layer 3 falls
 back to the source test-db on each stage agent. Layer 2 still applies.
 
 ## Split-collapse heuristic (Layer 2.5)
@@ -268,7 +285,7 @@ CBTS defers to the existing filter chain when:
   YAML edit)
 - Combined scope is `None` (incompatible mix)
 - Layer 3 narrowing would empty a block — block keeps original tests
-- `cbts_input_json` exceeds 256 KB — Layer 3 falls back per stage
+- `cbts_input_json_b64` (post-encoding) exceeds 256 KB — Layer 3 falls back per stage
 - Narrowed YAML missing/empty on a stage agent — renderTestDB falls back
 
 Every fallback emits an `echo` log line.

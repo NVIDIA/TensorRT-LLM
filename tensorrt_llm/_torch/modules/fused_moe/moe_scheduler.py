@@ -208,12 +208,12 @@ class ExternalCommMoEScheduler(MoEScheduler):
         num_rows = x.shape[0]
         if moe.use_dp and moe.comm is not None:
             # Communication path padding: dispatch outputs are
-            # ``[ep_size * max_tokens_per_rank, ...]`` (or expert-major for
+            # ``[num_dp_ranks * max_tokens_per_rank, ...]`` (or expert-major for
             # DeepEPLowLatency). Workspace must cover that footprint.
             if isinstance(moe.comm, DeepEPLowLatency):
                 num_rows = moe.num_slots * max(all_rank_num_tokens)
             else:
-                num_rows = moe.mapping.moe_ep_size * max(all_rank_num_tokens)
+                num_rows = moe._dp_padded_num_rows(all_rank_num_tokens)
 
         workspaces = moe.backend.get_workspaces([num_rows])
         return workspaces[0]
@@ -240,7 +240,7 @@ class ExternalCommMoEScheduler(MoEScheduler):
         # Mirror ``_prepare_workspace_deepgemm``: DeepEPLowLatency dispatches
         # expert-major outputs sized ``num_slots * max_tokens_per_rank`` per
         # rank (one shard per slot), while other comms produce
-        # ``ep_size * max_tokens_per_rank``. Using the wrong formula
+        # ``num_dp_ranks * max_tokens_per_rank``. Using the wrong formula
         # under-allocates the workspace for DeepEPLowLatency multi-chunk
         # runs and is caught by ``DeepGemmFusedMoE.run_moe``.
         if moe.use_dp and all_rank_num_tokens_list[0] is not None:
@@ -248,7 +248,7 @@ class ExternalCommMoEScheduler(MoEScheduler):
             if isinstance(moe.comm, DeepEPLowLatency):
                 chunk_size_0 = moe.num_slots * max_tokens
             else:
-                chunk_size_0 = moe.mapping.moe_ep_size * max_tokens
+                chunk_size_0 = moe._dp_padded_num_rows(all_rank_num_tokens_list[0])
         else:
             chunk_size_0 = chunk_size_list[0]
         workspace_chunk_sizes = [chunk_size_0]

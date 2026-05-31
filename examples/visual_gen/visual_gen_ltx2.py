@@ -8,7 +8,7 @@ import argparse
 import time
 
 from tensorrt_llm import VisualGen, VisualGenArgs, VisualGenParams, logger
-from tensorrt_llm._torch.visual_gen.config import CacheDiTConfig
+from tensorrt_llm.visual_gen.args import CacheDiTConfig
 
 logger.set_level("info")
 
@@ -238,6 +238,12 @@ def parse_args():
         "Cannot be combined with --attn2d_row_size / --attn2d_col_size (not yet implemented).",
     )
     parser.add_argument(
+        "--tp_size",
+        type=int,
+        default=1,
+        help="Tensor Parallel size",
+    )
+    parser.add_argument(
         "--attn2d_row_size",
         type=int,
         default=1,
@@ -335,40 +341,40 @@ def _cache_dit_config_from_args(args) -> CacheDiTConfig:
     return CacheDiTConfig(**overrides)
 
 
-def _build_diffusion_args(args) -> VisualGenArgs:
+def _build_visual_gen_args(args) -> VisualGenArgs:
     """Build VisualGenArgs from parsed CLI args."""
     if args.enable_cache_dit:
         logger.info("Cache DiT enabled; LTX2 will run as a one-stage pipeline.")
-        cache_kwargs = {"cache": _cache_dit_config_from_args(args)}
+        cache_kwargs = {"cache_config": _cache_dit_config_from_args(args)}
     else:
         cache_kwargs = {}
 
     attention_cfg: dict = {"backend": args.attention_backend}
 
+    pipeline_config = {"text_encoder_path": args.text_encoder_path}
+    if args.spatial_upsampler_path:
+        pipeline_config["spatial_upsampler_path"] = args.spatial_upsampler_path
+    if args.distilled_lora_path:
+        pipeline_config["distilled_lora_path"] = args.distilled_lora_path
+
     kwargs = dict(
-        text_encoder_path=args.text_encoder_path,
+        pipeline_config=pipeline_config,
         **cache_kwargs,
-        attention=attention_cfg,
-        parallel={
-            "dit_cfg_size": args.cfg_size,
-            "dit_ulysses_size": args.ulysses_size,
-            "dit_attn2d_row_size": args.attn2d_row_size,
-            "dit_attn2d_col_size": args.attn2d_col_size,
+        attention_config=attention_cfg,
+        parallel_config={
+            "cfg_size": args.cfg_size,
+            "ulysses_size": args.ulysses_size,
+            "attn2d_size": (args.attn2d_row_size, args.attn2d_col_size),
+            "tp_size": args.tp_size,
         },
-        torch_compile={
-            "enable_torch_compile": not args.disable_torch_compile,
+        torch_compile_config={
+            "enable": not args.disable_torch_compile,
             "enable_fullgraph": args.enable_fullgraph,
             "enable_autotune": not args.disable_autotune,
         },
-        cuda_graph={"enable_cuda_graph": args.enable_cudagraph},
-        pipeline={
-            "enable_layerwise_nvtx_marker": args.enable_layerwise_nvtx_marker,
-        },
+        cuda_graph_config={"enable": args.enable_cudagraph},
+        enable_layerwise_nvtx_marker=args.enable_layerwise_nvtx_marker,
     )
-    if args.spatial_upsampler_path:
-        kwargs["spatial_upsampler_path"] = args.spatial_upsampler_path
-    if args.distilled_lora_path:
-        kwargs["distilled_lora_path"] = args.distilled_lora_path
     quant_config = _linear_type_to_quant_config(args.linear_type)
     if quant_config is not None:
         kwargs["quant_config"] = quant_config
@@ -384,23 +390,29 @@ def main():
             "Combining --ulysses_size with --attn2d_row_size/--attn2d_col_size is not yet implemented."
         )
 
-    diffusion_args = _build_diffusion_args(args)
+    if args.tp_size > 1:
+        raise ValueError("LTX2 does not currently support TP.")
 
+    visual_gen_args = _build_visual_gen_args(args)
+
+    parallel_str = ""
+    if args.tp_size > 1:
+        parallel_str = f"TP(size={args.tp_size})"
     if args.ulysses_size > 1:
-        parallel_str = f"Ulysses(size={args.ulysses_size})"
+        parallel_str += f"Ulysses(size={args.ulysses_size})"
     elif attn2d_size > 1:
-        parallel_str = (
+        parallel_str += (
             f"Attention2D(row={args.attn2d_row_size}, col={args.attn2d_col_size}, "
             f"total={attn2d_size})"
         )
-    else:
+    elif not parallel_str:
         parallel_str = "None"
     logger.info(
         f"Initializing VisualGen (LTX2): cfg_size={args.cfg_size}, parallelism={parallel_str}"
     )
     visual_gen = VisualGen(
         model=args.model_path,
-        args=diffusion_args,
+        args=visual_gen_args,
     )
 
     try:

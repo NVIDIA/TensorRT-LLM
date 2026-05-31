@@ -39,7 +39,7 @@ import os
 import time
 
 from tensorrt_llm import VisualGen, VisualGenArgs, VisualGenParams, logger
-from tensorrt_llm._torch.visual_gen.config import CacheDiTConfig, TeaCacheConfig
+from tensorrt_llm.visual_gen.args import CacheDiTConfig, TeaCacheConfig
 
 logger.set_level("info")
 
@@ -229,6 +229,12 @@ def parse_args():
         "Cannot be combined with --attn2d_row_size / --attn2d_col_size (not yet implemented).",
     )
     parser.add_argument(
+        "--tp_size",
+        type=int,
+        default=1,
+        help="Tensor Parallel size",
+    )
+    parser.add_argument(
         "--attn2d_row_size",
         type=int,
         default=1,
@@ -332,41 +338,41 @@ def _cache_dit_config_from_args(args) -> CacheDiTConfig:
     return CacheDiTConfig(**overrides)
 
 
-def build_diffusion_args(args) -> VisualGenArgs:
+def build_visual_gen_args(args) -> VisualGenArgs:
     """Build VisualGenArgs from parsed CLI args."""
     if args.enable_cache_dit:
-        cache_kwargs = {"cache": _cache_dit_config_from_args(args)}
+        cache_kwargs = {"cache_config": _cache_dit_config_from_args(args)}
     elif args.enable_teacache:
-        cache_kwargs = {"cache": _teacache_config_from_args(args)}
+        cache_kwargs = {"cache_config": _teacache_config_from_args(args)}
     else:
         cache_kwargs = {}
 
     attention_cfg: dict = {"backend": args.attention_backend}
     if args.enable_sage_attention:
-        attention_cfg["sage_attention_config"] = {
-            "num_elts_per_blk_q": 1,
-            "num_elts_per_blk_k": 16,
-            "num_elts_per_blk_v": 1,
-            "qk_int8": True,
+        attention_cfg["quant_attention_config"] = {
+            "qk_dtype": "int8",
+            "q_block_size": 1,
+            "k_block_size": 16,
+            "v_block_size": 1,
         }
         logger.info("SageAttention: INT8 Q/K, blocks (1, 16, 1)")
 
     kwargs = dict(
         revision=args.revision,
-        attention=attention_cfg,
+        attention_config=attention_cfg,
         **cache_kwargs,
-        parallel={
-            "dit_ulysses_size": args.ulysses_size,
-            "dit_attn2d_row_size": args.attn2d_row_size,
-            "dit_attn2d_col_size": args.attn2d_col_size,
+        parallel_config={
+            "ulysses_size": args.ulysses_size,
+            "attn2d_size": (args.attn2d_row_size, args.attn2d_col_size),
+            "tp_size": args.tp_size,
         },
-        torch_compile={
-            "enable_torch_compile": not args.disable_torch_compile,
+        torch_compile_config={
+            "enable": not args.disable_torch_compile,
             "enable_fullgraph": args.enable_fullgraph,
             "enable_autotune": not args.disable_autotune,
         },
-        cuda_graph={"enable_cuda_graph": args.enable_cudagraph},
-        pipeline={"enable_layerwise_nvtx_marker": args.enable_layerwise_nvtx_marker},
+        cuda_graph_config={"enable": args.enable_cudagraph},
+        enable_layerwise_nvtx_marker=args.enable_layerwise_nvtx_marker,
     )
     quant_config = _linear_type_to_quant_config(args.linear_type)
     if quant_config is not None:
@@ -383,21 +389,24 @@ def main():
             "Combining --ulysses_size with --attn2d_row_size/--attn2d_col_size is not yet implemented."
         )
 
-    diffusion_args = build_diffusion_args(args)
+    visual_gen_args = build_visual_gen_args(args)
 
+    parallel_str = ""
+    if args.tp_size > 1:
+        parallel_str = f"TP(size={args.tp_size})"
     if args.ulysses_size > 1:
-        parallel_str = f"Ulysses(size={args.ulysses_size})"
+        parallel_str += f"Ulysses(size={args.ulysses_size})"
     elif attn2d_size > 1:
-        parallel_str = (
+        parallel_str += (
             f"Attention2D(row={args.attn2d_row_size}, col={args.attn2d_col_size}, "
             f"total={attn2d_size})"
         )
-    else:
+    elif not parallel_str:
         parallel_str = "None"
     logger.info(f"Initializing VisualGen: parallelism={parallel_str}")
     visual_gen = VisualGen(
         model=args.model_path,
-        args=diffusion_args,
+        args=visual_gen_args,
     )
 
     try:

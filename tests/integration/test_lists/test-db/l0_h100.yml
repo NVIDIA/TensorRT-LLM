@@ -71,6 +71,7 @@ l0_h100:
   - unittest/disaggregated/test_request_id.py
   - unittest/disaggregated/test_kv_transfer.py
   - unittest/disaggregated/test_kv_transfer_mp.py
+  - unittest/disaggregated/test_cache_transceiver_single_process.py
   - unittest/others/test_kv_cache_transceiver.py::test_kv_cache_transceiver_single_process[PYTHON-mha-ctx_fp16_gen_fp16]
   - unittest/others/test_kv_cache_transceiver.py::test_kv_cache_transceiver_single_process[PYTHON-mla-ctx_fp16_gen_fp16]
   - unittest/llmapi/test_llm_telemetry.py
@@ -97,12 +98,10 @@ l0_h100:
   - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_dummy_load_format
   - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_guided_decoding[xgrammar]
   - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_guided_decoding_with_eagle3[xgrammar-eagle3_one_model=True]
-  - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_guided_decoding_with_eagle3[xgrammar-eagle3_one_model=False]
   - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_fp8[fp8kv=False-attn_backend=TRTLLM-torch_compile=False]
   - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_fp8[fp8kv=False-attn_backend=TRTLLM-torch_compile=True]
   - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_fp8[fp8kv=True-attn_backend=TRTLLM-torch_compile=False]
   - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_fp8[fp8kv=True-attn_backend=TRTLLM-torch_compile=True]
-  - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_eagle3[sampler_async_worker=False-eagle3_one_model=False-overlap_scheduler=False]
   - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_eagle3[sampler_async_worker=False-eagle3_one_model=True-overlap_scheduler=True]
   - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_eagle3[sampler_async_worker=True-eagle3_one_model=True-overlap_scheduler=True]
   - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_pard[overlap_scheduler=True]
@@ -126,10 +125,8 @@ l0_h100:
   - accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B::test_fp8[latency-torch_compile=False]
   - accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B::test_fp8[latency-torch_compile=True]
   - accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B::test_dummy_load_format
-  - accuracy/test_llm_api_pytorch.py::TestQwen3_8B::test_eagle3[eagle3_one_model=False-enable_chunked_prefill=False-enable_max_concurrency=False-enable_draft_len_schedule=False]
   - accuracy/test_llm_api_pytorch.py::TestQwen3_8B::test_eagle3[eagle3_one_model=True-enable_chunked_prefill=True-enable_max_concurrency=False-enable_draft_len_schedule=False]
   - accuracy/test_llm_api_pytorch.py::TestQwen3_8B::test_eagle3[eagle3_one_model=True-enable_chunked_prefill=False-enable_max_concurrency=False-enable_draft_len_schedule=False]
-  - accuracy/test_llm_api_pytorch.py::TestQwen3_8B::test_eagle3[eagle3_one_model=False-enable_chunked_prefill=True-enable_max_concurrency=False-enable_draft_len_schedule=False]
   - accuracy/test_llm_api_pytorch.py::TestQwen3_8B::test_eagle3[eagle3_one_model=True-enable_chunked_prefill=False-enable_max_concurrency=False-enable_draft_len_schedule=True]
   - accuracy/test_llm_api_pytorch.py::TestQwen3_8B::test_eagle3[eagle3_one_model=True-enable_chunked_prefill=False-enable_max_concurrency=True-enable_draft_len_schedule=False]
   - accuracy/test_llm_api_pytorch.py::TestQwen3_8B::test_dflash
@@ -206,7 +203,7 @@ l0_h100:
     - disaggregated/test_disaggregated_single_gpu.py::test_disaggregated_logits[True-TinyLlama-1.1B-Chat-v1.0]
     - disaggregated/test_disaggregated_single_gpu.py::test_disaggregated_logprobs[False-TinyLlama-1.1B-Chat-v1.0]
     - disaggregated/test_disaggregated_single_gpu.py::test_disaggregated_logprobs[True-TinyLlama-1.1B-Chat-v1.0]
-    - unittest/_torch/executor
+    - unittest/_torch/executor/test_overlap_scheduler.py
     - unittest/_torch/ray_orchestrator/single_gpu/test_cache_transceiver_comm.py
     - unittest/_torch/ray_orchestrator/single_gpu/test_llm_sleep.py
     - unittest/_torch/ray_orchestrator/single_gpu/test_llm_update_weights.py -m "part0"
@@ -359,7 +356,6 @@ l0_h100:
   - accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B::test_fp8_block_scales[latency-torch_compile=True]
   - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_guided_decoding[llguidance]
   - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_guided_decoding_with_eagle3[llguidance-eagle3_one_model=True]
-  - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_guided_decoding_with_eagle3[llguidance-eagle3_one_model=False]
   - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_guided_decoding_with_ngram[xgrammar]
   - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_guided_decoding_with_ngram[llguidance]
   - accuracy/test_llm_api_pytorch_multimodal.py::TestMistralSmall24B::test_auto_dtype[forced_chunked_prefill]
@@ -504,22 +500,13 @@ l0_h100:
   - unittest/auto_deploy/singlegpu/utils
   - unittest/auto_deploy/standalone
   - accuracy/test_llm_api_autodeploy.py::TestLlama3_1_8B::test_auto_dtype[trtllm-False-1]
-  - accuracy/test_llm_api_autodeploy.py::TestLlama3_1_8B::test_auto_dtype[trtllm-True-1]
-  - accuracy/test_llm_api_autodeploy.py::TestLlama3_1_8B::test_auto_dtype[triton_paged-False-1]
-  - accuracy/test_llm_api_autodeploy.py::TestLlama3_1_8B_Instruct_Eagle3::test_eagle3_one_model[flashinfer]
   - accuracy/test_llm_api_autodeploy.py::TestLlama3_1_8B_Instruct_Eagle3::test_eagle3_one_model[trtllm]
-  - accuracy/test_llm_api_autodeploy.py::TestNemotronH::test_auto_dtype[trtllm-triton_ssm-False]
-  - accuracy/test_llm_api_autodeploy.py::TestNemotronH::test_auto_dtype[trtllm-flashinfer_ssm-False]
-  - accuracy/test_llm_api_autodeploy.py::TestNemotronH::test_auto_dtype[trtllm-triton_ssm-True]
   - accuracy/test_llm_api_autodeploy.py::TestGLM4Flash::test_auto_dtype[trtllm-False]
-  - accuracy/test_llm_api_autodeploy.py::TestGLM4Flash::test_auto_dtype[trtllm-True]
   - accuracy/test_llm_api_autodeploy.py::TestGemmaE2B::test_gemma3n_e2b_it
   - accuracy/test_llm_api_autodeploy.py::TestGemmaE2B::test_gemma4_e2b_it
-  - accuracy/test_llm_api_autodeploy.py::TestNemotronV2::test_auto_dtype[False]
-  - accuracy/test_llm_api_autodeploy.py::TestNemotronV2::test_auto_dtype[True]
   - accuracy/test_llm_api_autodeploy.py::TestNemotronV2::test_fp8[True]
-  - accuracy/test_llm_api_autodeploy.py::TestNemotronNanoV3::test_accuracy[bf16-1-trtllm]
   - accuracy/test_llm_api_autodeploy.py::TestNemotronNanoV3::test_accuracy[fp8-1-trtllm]
+  - accuracy/test_llm_api_autodeploy.py::TestLlama3_1_8B::test_auto_dtype[triton_paged-False-1]
   - examples/test_ad_speculative_decoding.py::test_autodeploy_eagle3_one_model_acceptance_rate[trtllm-torch-cudagraph]
   - examples/test_ad_speculative_decoding.py::test_autodeploy_eagle3_one_model_acceptance_rate[flashinfer-torch-simple]
   - examples/test_ad_speculative_decoding.py::test_eagle_model_with_weights
@@ -529,3 +516,26 @@ l0_h100:
   - examples/test_ad_guided_decoding.py::test_autodeploy_guided_decoding_main_json
   # ------------- AutoDeploy Perf Sanity ---------------
   - perf/test_perf_sanity.py::test_e2e[aggr_upload-llama3_1_8b_fp8_ad_hopper-llama3_1_8b_ad_ws1_1k1k] TIMEOUT (120)
+- condition:
+    ranges:
+      system_gpu_count:
+        gte: 1
+        lte: 1
+    wildcards:
+      gpu:
+      - '*h100*'
+      linux_distribution_name: ubuntu*
+    terms:
+      stage: post_merge
+      backend: autodeploy
+      orchestrator: mpi
+  tests:
+  - accuracy/test_llm_api_autodeploy.py::TestLlama3_1_8B::test_auto_dtype[trtllm-True-1]
+  - accuracy/test_llm_api_autodeploy.py::TestLlama3_1_8B_Instruct_Eagle3::test_eagle3_one_model[flashinfer]
+  - accuracy/test_llm_api_autodeploy.py::TestNemotronH::test_auto_dtype[trtllm-triton_ssm-False]
+  - accuracy/test_llm_api_autodeploy.py::TestNemotronH::test_auto_dtype[trtllm-flashinfer_ssm-False]
+  - accuracy/test_llm_api_autodeploy.py::TestNemotronH::test_auto_dtype[trtllm-triton_ssm-True]
+  - accuracy/test_llm_api_autodeploy.py::TestGLM4Flash::test_auto_dtype[trtllm-True]
+  - accuracy/test_llm_api_autodeploy.py::TestNemotronV2::test_auto_dtype[False]
+  - accuracy/test_llm_api_autodeploy.py::TestNemotronV2::test_auto_dtype[True]
+  - accuracy/test_llm_api_autodeploy.py::TestNemotronNanoV3::test_accuracy[bf16-1-trtllm]

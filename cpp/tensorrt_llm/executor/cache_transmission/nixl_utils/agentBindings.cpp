@@ -140,7 +140,21 @@ NB_MODULE(tensorrt_llm_transfer_agent_binding, m)
             {
                 auto const& desc = self.getBackendAgentDesc();
                 return nb::bytes(desc.data(), desc.size());
-            });
+            })
+        .def("serialize",
+            [](kvc::AgentDesc const& self)
+            {
+                auto s = self.serialize();
+                return nb::bytes(s.data(), s.size());
+            })
+        .def_static(
+            "deserialize",
+            [](nb::bytes data)
+            {
+                std::string str(data.c_str(), data.size());
+                return kvc::AgentDesc::deserialize(str);
+            },
+            nb::arg("data"));
 
     // TransferRequest class
     //
