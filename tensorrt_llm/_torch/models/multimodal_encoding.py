@@ -41,10 +41,16 @@ class ModalityItem:
     let the assembly reconcile modality-grouping (encoder batching) with
     source-param grouping (cache contract + MultimodalPromptOrder reassembly).
 
-    Ghost items (e.g. audio extracted from a video payload) use
-    ``item_idx_in_param == -1`` to indicate they have no MultimodalPromptOrder slot;
-    their encoded rows are consumed by a model-specific post-process step
-    rather than scattered into the final output.
+    Ghost items (`item_idx_in_param == -1`) exist in encoder space but have no
+    independent slot in prompt-order space. A ghost is a bookkeeping handle: it
+    says "encode me in my modality's bucket, but do NOT scatter my rows to my own
+    prompt-order slot - a model-specific post-process will merge them into a paired
+    host item's destination range instead." The ghost's embedding rows DO end up in
+    the final tensor; they are just placed by interleaving into the host item's
+    range rather than by a direct scatter to a slot of their own. The sole current
+    instance is Nano's audio-extracted-from-video: the audio rides the audio encoder
+    bucket, and `_nano_post_encode` interleaves its rows into the paired video
+    item's destination range.
 
     ``token_count`` is the post-process row count contributed to the
     final scatter destination. ``encoder_token_count`` is the row count
@@ -129,6 +135,34 @@ class MixedModalityAssembly:
                 if pos in seen:
                     raise ValueError(f"duplicate item_idx_in_param={pos} in param {param_idx}")
                 seen.add(pos)
+
+        # Enforce the per-bucket ghost-ordering invariant by construction:
+        # stable-partition each modality bucket so non-ghost items
+        # (`item_idx_in_param != -1`) lead and ghost items (`== -1`) form a
+        # single TRAILING contiguous block. `_bucket_offsets` and `_dst_indices`
+        # are derived from `modality_slots` below, so partitioning the slots here
+        # makes "leading bucket rows == non-ghost" hold structurally — both the
+        # scatter slice (`bucket[:dst.numel()]`) and the Nano post-process
+        # truncation (`bucket[:n_non_ghost_rows]`) become correct without
+        # depending on the extractor's yield order. The ghost-block start is
+        # implicitly `dst.numel()`, so no extra index tensor is needed.
+        for modality, slot_idxs in modality_slots.items():
+            nonghost = [fi for fi in slot_idxs if items[fi].item_idx_in_param != -1]
+            ghost = [fi for fi in slot_idxs if items[fi].item_idx_in_param == -1]
+            partitioned = nonghost + ghost  # stable within each group
+            modality_slots[modality] = partitioned
+            bucket_token_counts[modality] = [items[fi].token_count for fi in partitioned]
+            # Fail-loud guard: catch any future code path that re-introduces a
+            # ghost-before-non-ghost ordering instead of silently mis-scattering.
+            seen_ghost = False
+            for fi in partitioned:
+                is_ghost = items[fi].item_idx_in_param == -1
+                if seen_ghost and not is_ghost:
+                    raise ValueError(
+                        f"bucket {modality!r}: non-ghost item follows a ghost; "
+                        "non-ghost items must lead each modality bucket"
+                    )
+                seen_ghost = seen_ghost or is_ghost
 
         param_lengths_t = torch.tensor(param_lengths, dtype=torch.int64)
         if len(param_lengths) > 0:

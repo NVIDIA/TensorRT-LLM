@@ -413,6 +413,108 @@ class TestEncodeWithPlan:
                 hidden_dim=H,
             )
 
+    def _make_sentinel_encoder(self, hidden_dim):
+        """Fake encoder: every row of item ``k`` (in bucket order) is filled with
+        that item's ``payload["sentinel"]`` value (broadcast over hidden_dim).
+
+        Rows are emitted in ``_modality_slots[modality]`` order (the adapter
+        contract), so the per-item sentinel block lets a test distinguish which
+        item a scattered row originated from — unlike an ``arange`` encoder whose
+        values track row POSITION rather than item identity.
+        """
+
+        def encoder(items, multimodal_params):
+            blocks = [
+                torch.full((item.encoder_rows, hidden_dim), float(item.payload["sentinel"]))
+                for item in items
+            ]
+            return torch.cat(blocks, dim=0) if blocks else torch.empty((0, hidden_dim))
+
+        return encoder
+
+    def test_ghost_first_audio_bucket_scatters_standalone_rows(self):
+        """Ghost-first audio bucket must NOT mis-scatter ghost rows into the
+        standalone-audio destination.
+
+        Reproduces the Nano contract for a single param carrying BOTH an
+        audio-bearing video and a standalone audio (which the extractor would
+        yield as audio bucket order ``[ghost, standalone]`` — ghost FIRST):
+
+            image @pos0      (5 rows)               -> final[0:5]
+            video @pos1      (encoder_rows=6, tc=10) -> final[5:15] (6 vision + 4 audio)
+            GHOST audio @-1  (4 rows)                -> no prompt-order slot
+            standalone audio @pos2 (3 rows)          -> final[15:18]
+
+        A ``post_process`` mirrors ``_nano_post_encode``: it interleaves the
+        ghost-audio rows into the paired video chunk (6 -> 10 rows) and truncates
+        the audio bucket to its leading ``n_non_ghost_rows``. The standalone-audio
+        destination ``final[15:18]`` must receive the STANDALONE sentinel rows,
+        not the GHOST sentinel rows.
+
+        Fails on the pre-fix code: with ghost first, both the post-process
+        leading-``n_non_ghost`` truncation and the scatter ``bucket[:dst.numel()]``
+        slice keep the GHOST rows, so final[15:18] holds the ghost sentinel.
+        """
+        H = 4
+        IMG, VID, GHOST, STANDALONE = 10.0, 20.0, 100.0, 200.0
+        items_by_param = {
+            0: [
+                ModalityItem(0, 0, "image", 5, {"sentinel": IMG}),
+                ModalityItem(0, 1, "video", 10, {"sentinel": VID}, encoder_token_count=6),
+                ModalityItem(0, -1, "audio", 4, {"sentinel": GHOST}),  # ghost FIRST
+                ModalityItem(0, 2, "audio", 3, {"sentinel": STANDALONE}),
+            ]
+        }
+        assembly = MixedModalityAssembly.from_params(
+            multimodal_params=[object()],
+            extract=_identity_extractor(items_by_param),
+        )
+
+        def post_process(bucket_outputs, asm, multimodal_params):
+            # Mirror `_nano_post_encode`: find the ghost audio's rows via the
+            # audio bucket offsets, append them to the paired video chunk so the
+            # video bucket grows from encoder_rows(6) to token_count(10), then
+            # drop the trailing ghost rows from the audio bucket.
+            audio_slots = asm._modality_slots["audio"].tolist()
+            audio_offsets = asm._bucket_offsets["audio"]
+            ghost_slot_pos = next(
+                pos for pos, fi in enumerate(audio_slots) if asm.items[fi].item_idx_in_param == -1
+            )
+            g_start = int(audio_offsets[ghost_slot_pos].item())
+            g_end = int(audio_offsets[ghost_slot_pos + 1].item())
+            ghost_rows = bucket_outputs["audio"][g_start:g_end]
+            bucket_outputs["video"] = torch.cat([bucket_outputs["video"], ghost_rows], dim=0)
+            n_non_ghost_rows = sum(
+                asm.items[fi].token_count
+                for fi in audio_slots
+                if asm.items[fi].item_idx_in_param != -1
+            )
+            bucket_outputs["audio"] = bucket_outputs["audio"][:n_non_ghost_rows]
+
+        encoders = {
+            "image": self._make_sentinel_encoder(H),
+            "video": self._make_sentinel_encoder(H),
+            "audio": self._make_sentinel_encoder(H),
+        }
+        final = assemble_embeddings(
+            assembly,
+            encoders,
+            multimodal_params=[object()],
+            post_process=post_process,
+            device=torch.device("cpu"),
+            dtype=torch.float32,
+            hidden_dim=H,
+        )
+        assert final.shape == (18, H)
+        # The standalone-audio destination is final[15:18]; it must hold the
+        # STANDALONE sentinel rows, never the GHOST sentinel rows.
+        standalone_dst = final[15:18]
+        assert torch.all(standalone_dst == STANDALONE), (
+            f"standalone-audio dst final[15:18] should be all {STANDALONE} (standalone "
+            f"rows) but got {standalone_dst[:, 0].tolist()} "
+            f"(ghost sentinel is {GHOST}: ghost rows mis-scattered into the standalone slot)"
+        )
+
 
 class TestEncodeWithPlanHighBatch:
     def test_32_params_three_modalities_three_calls(self):
