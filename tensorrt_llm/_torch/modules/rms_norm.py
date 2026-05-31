@@ -100,7 +100,7 @@ class RMSNorm(nn.Module):
         if not has_residual:
             residual = None
 
-        if self.is_nvfp4 and has_residual and not self.use_gemma:
+        if self.is_nvfp4 and has_residual:
             nvfp4_scale = getattr(self, "nvfp4_scale", None)
             if nvfp4_scale is None:
                 raise ValueError(
@@ -111,7 +111,11 @@ class RMSNorm(nn.Module):
             n = int(orig_shape[-1])
             hs_2d = hidden_states.reshape(-1, n).contiguous()
             res_2d = residual.reshape(-1, n)
-            gamma = self.weight
+            # For gemma-variant RMSNorm `(weight + 1) * normed(x)`, pre-add 1
+            # to the weight so the fused kernel (which computes `gamma * normed(x)`)
+            # produces the correct gemma output. The +1 add is a single O(N)
+            # elementwise op, cheap compared to the fused norm+quant savings.
+            gamma = (self.weight + 1) if self.use_gemma else self.weight
 
             def _ensure_contiguous_with_dtype(t: torch.Tensor, key: str):
                 if t.dtype != hs_2d.dtype:
