@@ -37,6 +37,25 @@ from .accuracy_core import (
 )
 
 
+@pytest.fixture(scope="session")
+def _ensure_pyav():
+    """Provision PyAV (`av`) for tests that extract audio from video.
+
+    MixedModalityVideoAudio (extract_video_audio=True) decodes a video's audio
+    track via PyAV, an optional dependency intentionally absent from the base CI
+    image. Install it once per session - mirroring the visual-gen sidecar install
+    in tests/integration/defs/examples/test_visual_gen.py - so the audio-in-video
+    path is exercised in CI rather than skipped. Only the decoder is needed (PyAV
+    bundles its own ffmpeg in the wheel), so no system ffmpeg package is required.
+    """
+    import importlib.util
+    import subprocess
+    import sys
+
+    if importlib.util.find_spec("av") is None:
+        subprocess.check_call([sys.executable, "-m", "pip", "install", "av"])
+
+
 class TestQwen2_VL_7B(LlmapiAccuracyTestHarness):
     MODEL_NAME = "Qwen/Qwen2-VL-7B-Instruct"
     MODEL_PATH = f"{llm_models_root()}/Qwen2-VL-7B-Instruct"
@@ -804,6 +823,7 @@ class TestNanoV3Omni(LlmapiAccuracyTestHarness):
     @pytest.mark.threadleak(enabled=False)
     def test_auto_dtype(
         self,
+        _ensure_pyav,
         model_name: str,
         model_path: str,
         kv_cache_config: KvCacheConfig,
@@ -887,7 +907,7 @@ class TestNanoV3Omni(LlmapiAccuracyTestHarness):
         ],
         ids=["full_budget", "forced_chunked_prefill"],
     )
-    def test_mixed_modality(self, max_num_tokens: int) -> None:
+    def test_mixed_modality(self, _ensure_pyav, max_num_tokens: int) -> None:
         with LLM(
             self.MIXED_MODALITY_BF16_MODEL_PATH,
             trust_remote_code=True,
