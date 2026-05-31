@@ -299,8 +299,7 @@ class ModelLoader:
 
         config = checkpoint_loader.load_config(checkpoint_dir, **config_kwargs)
 
-        if (llm_args.speculative_config is not None and hasattr(
-                config.pretrained_config, "num_nextn_predict_layers")):
+        if llm_args.speculative_config is not None:
             from tensorrt_llm._torch.speculative import \
                 update_spec_config_from_model_config
 
