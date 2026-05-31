@@ -21,6 +21,10 @@ from typing import Awaitable, Callable, Dict, Iterable, List, Optional, Union
 
 import aiohttp
 
+from tensorrt_llm.bindings.internal.batch_manager import \
+    BlockKey as _NativeBlockKey
+from tensorrt_llm.bindings.internal.batch_manager import \
+    BlockKeyHasher as _NativeBlockKeyHasher
 from tensorrt_llm.llmapi.disagg_utils import (MetadataServerConfig,
                                               RouterConfig, ServerRole)
 from tensorrt_llm.logger import logger
@@ -734,10 +738,16 @@ class LoadBalancingRouter(LoadBalancingMixin, Router):
 def block_key_hasher(token_ids: list[int],
                      parent_hash: Optional[int] = None,
                      cache_salt_id: Optional[int] = None) -> int:
-    return hash_v1_block_key(
-        token_ids,
-        parent_hash=0 if parent_hash is None else parent_hash,
-        cache_salt_id=cache_salt_id)
+    parent = 0 if parent_hash is None else parent_hash
+    # Fast path: the native C++ BlockKeyHasher is bit-exact with
+    # hash_v1_block_key and avoids the per-token Python loop. Its hash() binding
+    # takes no cache_salt_id, so fall back to Python only when a salt is set
+    # (rare opt-in; never in the unsalted agent/chat completion path).
+    if cache_salt_id is None:
+        return _NativeBlockKeyHasher.hash(_NativeBlockKey(token_ids), parent)
+    return hash_v1_block_key(token_ids,
+                             parent_hash=parent,
+                             cache_salt_id=cache_salt_id)
 
 
 def v2_sha256_block_hasher(token_ids: list[int],
