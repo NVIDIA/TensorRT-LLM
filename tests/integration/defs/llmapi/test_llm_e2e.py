@@ -90,13 +90,12 @@ def test_llmapi_load_engine_from_build_command_with_lora(
     ])
 
 
-@pytest.mark.skip(reason="https://nvbugs/5574355")
 @pytest.mark.parametrize("model_name,model_path", [
     ("llama", "llama-models-v2/TinyLlama-1.1B-Chat-v1.0"),
 ])
 def test_llmapi_build_command_parameters_align(llm_root, llm_venv, engine_dir,
-                                               model_name, model_path):
-    llama_example_root = os.path.join(llm_root, "examples", model_name)
+                                               model_name, model_path,
+                                               llama_example_root):
     dtype = 'float16'
     cmodel_dir = os.path.join(engine_dir, f"{model_name}-engine")
 
