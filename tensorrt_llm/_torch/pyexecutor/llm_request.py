@@ -727,6 +727,37 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         self.seqlen_this_rank_cp = self.prompt_len
         self.total_input_len_cp = self.prompt_len
         self.py_helix_is_inactive_rank = False
+        # Helix speculative-decode state. py_helix_global_decode_len is the number
+        # of decode tokens committed globally (across CP ranks). It advances by one
+        # per iteration for plain decode and by the accepted count (golden plus
+        # accepted drafts) for speculative decode, and gives the global query-token
+        # positions and round-robin KV ownership in a verify forward.
+        self.py_helix_global_decode_len = 0
+        # This-rank KV length before the current forward's writes, used by the model
+        # engine as num_cached_tokens for the multi-token verify forward.
+        self.py_helix_local_past_seen = self.prompt_len
+        # Context (prompt) tokens this CP rank owns. The per-rank KV length is this
+        # base plus the owned decode-token count.
+        self.py_helix_context_seqlen_cp = self.prompt_len
+        # Running count of decode tokens in [0, py_helix_global_decode_len) whose
+        # KV this CP rank owns. With per-request (per verify-group) Helix
+        # ownership the owned set has no closed-form block-cyclic count; it
+        # depends on which rank owned each committed group, so it is tracked
+        # incrementally as groups commit (see
+        # resource_manager._helix_rewind_generation_kv).
+        self.py_helix_owned_decode_seen = 0
+        # Deterministic verify-group counter used to anchor Helix KV ownership:
+        # owner = (py_helix_decode_group_index // tokens_per_block) % cp_size.
+        # It advances by one per reserved group, independent of the accepted-token
+        # count, so ownership is host-computable even when that count is known only
+        # on-device. py_helix_pending_group_owns is the FIFO of reserve-time
+        # ownership decisions; each rewind consumes the decision for its group.
+        self.py_helix_decode_group_index = 0
+        self.py_helix_pending_group_owns = []
+        # Whether this rank owns the verify group committed by the prior decode
+        # iteration. Gates the on-device kv-length correction: only that owner
+        # grew its per-rank kv length by the prior group's committed-token count.
+        self.py_helix_prev_group_owns = False
         self.py_batch_idx = None
         self.py_draft_pages_allocated = 0
         self.py_rewind_len = 0

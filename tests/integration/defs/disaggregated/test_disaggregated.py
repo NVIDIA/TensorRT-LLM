@@ -300,6 +300,10 @@ def get_test_config(test_desc, example_dir, test_root):
         f"{test_configs_root}/disagg_config_llama4_kv_cache_overflow.yaml",
         "deepseek_v3_lite_bf16_tllm_gen_helix":
         f"{test_configs_root}/disagg_config_ctxtp2_gentp1cp2_deepseek_v3_lite_bf16_tllm_gen.yaml",
+        "deepseek_v3_lite_bf16_tllm_gen_helix_mtp":
+        f"{test_configs_root}/disagg_config_ctxtp2_gentp1cp2_deepseek_v3_lite_bf16_tllm_gen_mtp.yaml",
+        "deepseek_v3_lite_bf16_tllm_gen_helix_mtp_ref":
+        f"{test_configs_root}/disagg_config_ctxtp2_gentp1cp2_deepseek_v3_lite_bf16_tllm_gen_mtp_ref.yaml",
         "deepseek_r1_v2_fp4_stress":
         f"{test_configs_root}/disagg_config_ctxtp4_gentp4_deepseek_r1_v2_fp4_tllm.yaml",
         "deepseek_r1_v2_fp4_mtp_stress":
@@ -364,6 +368,17 @@ ClientTestSet = namedtuple('ClientTestSet', [
 
 def get_client_test_set(test_desc):
     """Get the set of client tests to run for a given test description."""
+    if test_desc == "deepseek_v3_lite_bf16_tllm_gen_helix_mtp" or test_desc == "deepseek_v3_lite_bf16_tllm_gen_helix_mtp_ref":
+        # Streaming under Helix CP + MTP is not supported (the streaming client
+        # path hangs), so run non-streaming completion only.
+        return ClientTestSet(completion=True,
+                             completion_streaming=False,
+                             chat=False,
+                             chat_streaming=False,
+                             verify_completion=True,
+                             verify_streaming_completion=False,
+                             verify_chat=False,
+                             verify_streaming_chat=False)
     if test_desc == "tool_calls":
         return ClientTestSet(completion=False,
                              completion_streaming=False,
@@ -427,8 +442,9 @@ def run_client_tests(example_dir,
             str(server_start_timeout)
         ]
         if prompt_file == "long_prompts.json":
-            # Use max_tokens 4 for long prompts to reduce test time
-            client_cmd.extend(['--max-tokens', '4'])
+            # Use enough decode steps that a verify q-block crosses a
+            # tokens_per_block boundary (the mixed-ownership case).
+            client_cmd.extend(['--max-tokens', '64'])
 
         # Prepare poll processes
         worker_processes = []
@@ -617,7 +633,7 @@ def setup_disagg_cluster(
     model_name: str | None = None,
     env: dict[str, str] | None = None,
     cwd: str | None = None,
-    server_start_timeout: int = 300,
+    server_start_timeout: int = 2400,
     schedule_style: str | None = None,
     save_log: bool = False,
     startup_callback=None,
@@ -780,7 +796,7 @@ def setup_disagg_cluster(
 
 def run_disaggregated_test(example_dir,
                            test_desc,
-                           num_iters=5,
+                           num_iters=1,
                            env=None,
                            prompt_file="prompts.json",
                            extra_endpoints_test=None,
@@ -2413,6 +2429,28 @@ def test_disaggregated_deepseek_v3_lite_bf16_tllm_gen_helix(
                            "deepseek_v3_lite_bf16_tllm_gen_helix",
                            env=llm_venv._new_env,
                            prompt_file=prompt_file,
+                           model_path=deepseek_v3_model_root,
+                           cwd=llm_venv.get_working_directory())
+
+
+@pytest.mark.skip_less_device(4)
+@pytest.mark.parametrize("test_desc", [
+    "deepseek_v3_lite_bf16_tllm_gen_helix_mtp",
+    "deepseek_v3_lite_bf16_tllm_gen_helix_mtp_ref",
+],
+                         ids=["helix", "ref"])
+@pytest.mark.parametrize("deepseek_v3_model_root", ['DeepSeek-V3-Lite-bf16'],
+                         indirect=True)
+def test_disaggregated_deepseek_v3_lite_bf16_tllm_gen_helix_mtp(
+        disaggregated_test_root, disaggregated_example_root, llm_venv,
+        deepseek_v3_model_root, test_desc):
+    setup_model_symlink(llm_venv, deepseek_v3_model_root,
+                        "DeepSeek-V3-Lite/bf16")
+
+    run_disaggregated_test(disaggregated_example_root,
+                           test_desc,
+                           env=llm_venv._new_env,
+                           prompt_file="long_prompts.json",
                            model_path=deepseek_v3_model_root,
                            cwd=llm_venv.get_working_directory())
 

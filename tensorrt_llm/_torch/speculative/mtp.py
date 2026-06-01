@@ -1098,7 +1098,7 @@ class MTPWorker(SpecWorkerBase):
         local_max_values, local_argmax = torch.max(logits, dim=-1, keepdim=True)
         # Adjust indices based on TP rank and size
         vocab_per_rank = logits.shape[-1]
-        mapping_lm_tp = mapping_lm_tp if mapping_lm_tp is not None else self.model_config.mapping
+        mapping_lm_tp = mapping_lm_tp if mapping_lm_tp is not None else self.sampler_mapping
         max_index_per_rank = local_argmax.type(
             torch.int32) + (mapping_lm_tp.tp_rank * vocab_per_rank)
         # Use torch.stack and flatten instead of view+cat to avoid torch.compile issues
@@ -1142,18 +1142,19 @@ class MTPWorker(SpecWorkerBase):
             draft_tokens: torch.Tensor
                 [batch_size * max_draft_len]
                 Draft token ids. Flattened.
+
+        Under Helix CP the vocab is sharded over the repurposed CP-to-TP group,
+        so sampler_mapping (not model_config.mapping) is the group to reduce
+        over, exactly as plain TP would.
         '''
-        if (self.model_config is not None
-                and hasattr(self.model_config, 'mapping')
-                and self.model_config.mapping.tp_size
-                > 1) and not (self.model_config.mapping.enable_attention_dp):
+        mapping = self.sampler_mapping
+        if (mapping is not None
+                and mapping.tp_size > 1) and not (mapping.enable_attention_dp):
             combined = self.get_local_max_and_combined(logits)
-            gathered = allgather(combined, self.model_config.mapping, dim=-1)
+            gathered = allgather(combined, mapping, dim=-1)
             draft_tokens = self.get_draft_tokens_from_gathered(gathered)
-        elif (self.model_config is not None
-              and hasattr(self.model_config, 'mapping')
-              and self.model_config.mapping.tp_size
-              > 1) and self.model_config.mapping.enable_lm_head_tp_in_adp:
+        elif (mapping is not None
+              and mapping.tp_size > 1) and mapping.enable_lm_head_tp_in_adp:
             # For ADP + LM head TP mode, we need to find the global argmax across all TP ranks
             combined = self.get_local_max_and_combined(logits,
                                                        mapping_lm_head_tp)

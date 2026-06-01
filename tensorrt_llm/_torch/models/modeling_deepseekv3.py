@@ -1420,6 +1420,7 @@ class DeepseekV3DecoderLayer(DecoderLayer):
         if residual is None:
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
+
         # Self Attention
         hidden_states = self.self_attn(
             position_ids=position_ids,
@@ -1429,6 +1430,7 @@ class DeepseekV3DecoderLayer(DecoderLayer):
                 enable_allreduce=not (self.disable_attn_allreduce)),
             **kwargs,
         )
+
         residual = maybe_slice_for_helix_cp(residual, attn_metadata,
                                             self.mapping_with_cp,
                                             self.layer_idx)
@@ -1436,7 +1438,7 @@ class DeepseekV3DecoderLayer(DecoderLayer):
             if spec_metadata is not None and spec_metadata.is_layer_capture(
                     self.layer_idx):
                 self.fusion_config.POST_MOE_FUSION = False
-            return self.forward_MoE(
+            hidden_states, residual = self.forward_MoE(
                 hidden_states=hidden_states,
                 attn_metadata=attn_metadata,
                 residual=residual,
@@ -1447,11 +1449,13 @@ class DeepseekV3DecoderLayer(DecoderLayer):
                     self.layer_idx):
                 self.fusion_config.POST_MLP_FUSION = False
             assert isinstance(self.mlp, GatedMLP)
-            return self.forward_mlp(
+            hidden_states, residual = self.forward_mlp(
                 hidden_states=hidden_states,
                 residual=residual,
                 spec_metadata=spec_metadata,
             )
+
+        return hidden_states, residual
 
     def forward_MoE(
         self,
@@ -1613,9 +1617,19 @@ class DeepseekV3MTP(DeepseekV3DecoderLayer):
                  model_config: ModelConfig[PretrainedConfig],
                  layer_idx: int,
                  aux_stream_dict: Dict[AuxStreamType, torch.cuda.Stream],
-                 is_separate_draft_engine: bool = False):
-        super().__init__(model_config, layer_idx, aux_stream_dict,
-                         is_separate_draft_engine)
+                 is_separate_draft_engine: bool = False,
+                 mapping_with_cp: Optional[Mapping] = None):
+        # Under Helix CP, CP ranks are repurposed to TP for non-attention
+        # layers, so model_config.mapping has tp_size == cp_size folded in.
+        # mapping_with_cp carries the original (un-repurposed) mapping and must
+        # be threaded into attention so the MTP layer's MLA keeps the full head
+        # count, matching how the main decoder layers are built (and what the
+        # shared kv_b_proj weight loader expects).
+        super().__init__(model_config,
+                         layer_idx,
+                         aux_stream_dict,
+                         is_separate_draft_engine,
+                         mapping_with_cp=mapping_with_cp)
         config = model_config.pretrained_config
         self.hidden_dim = config.hidden_size
         self.moe_intermediate_size = config.moe_intermediate_size
@@ -1691,11 +1705,16 @@ class DeepseekV3MTP(DeepseekV3DecoderLayer):
             disable_on_compile=True,
         )
         hidden_states = torch.concat([inputs_embeds, hidden_states], dim=-1)
-        # Split hidden_states columnwise based on TP
-        tp_size = self.model_config.mapping.tp_size
-        tp_rank = self.model_config.mapping.tp_rank
+        # Split hidden_states columnwise based on TP. Use self.mapping (captured
+        # at construction) rather than self.model_config.mapping: under Helix CP
+        # the latter is restored to the original (un-repurposed) mapping after
+        # __init__, whereas eh_proj was built (ROW-parallel) with the repurposed
+        # mapping. self.mapping matches eh_proj's sharding and the rest of this
+        # forward.
+        tp_size = self.mapping.tp_size
+        tp_rank = self.mapping.tp_rank
 
-        if tp_size > 1 and not (self.model_config.mapping.enable_attention_dp):
+        if tp_size > 1 and not (self.mapping.enable_attention_dp):
             hidden_states = torch.chunk(hidden_states, tp_size, dim=-1)[tp_rank]
         hidden_states = self.eh_proj(hidden_states)
 
@@ -1763,6 +1782,7 @@ class DeepseekV3Model(DecoderModel):
                  model_config: ModelConfig[PretrainedConfig],
                  mapping_with_cp: Optional[Mapping] = None):
         super().__init__(model_config)
+        self.rank = model_config.mapping.rank
         config = model_config.pretrained_config
         self.vocab_size = config.vocab_size
         self.num_hidden_layers = config.num_hidden_layers
@@ -1802,6 +1822,7 @@ class DeepseekV3Model(DecoderModel):
         spec_metadata: Optional[SpecMetadata] = None,
         **kwargs,
     ) -> torch.Tensor:
+
         if (input_ids is None) ^ (inputs_embeds is not None):
             raise ValueError(
                 "You cannot specify both input_ids and inputs_embeds at the same time, and must specify either one"
