@@ -2208,6 +2208,10 @@ public:
     //!   Beam-width-1 only. The connector enforces this at startup; this method
     //!   asserts the invariant defensively.
     //!
+    //!   Sliding-window attention with detached front blocks is not supported: once front
+    //!   blocks are evicted they remain in the cache block ID list but no longer align with
+    //!   token positions, so this method asserts `getNumFrontBlocksRemoved(windowSize) == 0`.
+    //!
     //! @param llmRequest Request whose currently-allocated blocks should be hashed.
     //! @param windowSize Attention window size identifying the per-window block manager.
     //! @return Ordered hashes for full blocks at indices `[0, numFullBlocks)`, chained from
