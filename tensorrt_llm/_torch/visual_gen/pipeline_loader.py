@@ -23,6 +23,9 @@ import torch.distributed as dist
 
 from tensorrt_llm._torch.autotuner import autotune
 from tensorrt_llm._torch.models.modeling_utils import MetaInitMode
+from tensorrt_llm._torch.visual_gen.cute_dsl_kernels.blackwell.video_sparse_attention import (
+    CUTE_AVAILABLE,
+)
 from tensorrt_llm.llmapi.utils import download_hf_model
 from tensorrt_llm.logger import logger
 from tensorrt_llm.visual_gen.args import VisualGenArgs
@@ -225,8 +228,6 @@ class PipelineLoader:
             and _sa_cfg is not None
             and getattr(_sa_cfg, "algorithm", None) == "vsa"
         ):
-            from .cute_dsl_kernels.blackwell.video_sparse_attention import CUTE_AVAILABLE
-
             kernel_path = "CuTe DSL block-sparse" if CUTE_AVAILABLE else "dense SDPA fallback"
             logger.info(
                 f"Attention backend: CUTEDSL (algorithm=vsa, "

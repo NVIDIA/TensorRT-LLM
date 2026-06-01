@@ -105,7 +105,7 @@ class WanImageToVideoPipeline(BasePipeline):
         if _sa_cfg is not None and getattr(_sa_cfg, "algorithm", None) == "vsa":
             raise ValueError(
                 "Video Sparse Attention (sparse_attention_config.algorithm='vsa') is "
-                "only supported by Wan T2V pipelines (Wan 2.1 and Wan 2.2). Remove "
+                "only supported by the Wan 2.1 T2V 14B (720P) pipeline. Remove "
                 "sparse_attention_config for Wan I2V."
             )
 

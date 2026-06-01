@@ -604,8 +604,8 @@ class LTX2Pipeline(BasePipeline):
         if _sa_cfg is not None and getattr(_sa_cfg, "algorithm", None) == "vsa":
             raise ValueError(
                 "Video Sparse Attention (sparse_attention_config.algorithm='vsa') is "
-                "only supported by Wan T2V pipelines. Remove sparse_attention_config "
-                "for LTX-2."
+                "only supported by the Wan 2.1 T2V 14B (720P) pipeline. Remove "
+                "sparse_attention_config for LTX-2."
             )
         super().__init__(model_config)
 

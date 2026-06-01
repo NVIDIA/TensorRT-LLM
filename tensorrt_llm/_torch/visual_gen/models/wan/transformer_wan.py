@@ -246,6 +246,19 @@ class WanTimeTextImageEmbedding(nn.Module):
         return temb, temb_proj, encoder_hidden_states, encoder_hidden_states_image
 
 
+def _default_vsa_gate(linear: Linear, bias_value: float) -> None:
+    """Default a VSA gate Linear absent from the checkpoint: weight=0, bias=bias_value
+    (G_c=0 / G_f=1, preserving dense behavior at sparsity=0)."""
+    if not linear._weights_created:
+        linear.create_weights()
+    if linear.weight.is_meta:
+        return
+    with torch.no_grad():
+        linear.weight.zero_()
+        if linear.bias is not None:
+            linear.bias.fill_(bias_value)
+
+
 class WanBlock(nn.Module):
     def __init__(
         self,
@@ -416,32 +429,6 @@ class WanBlock(nn.Module):
         self.scale_shift_table = nn.Parameter(
             torch.empty(1, 6, hidden_size).normal_(std=hidden_size**-0.5)
         )
-
-    def init_gate_compress_zero(self) -> None:
-        """Zero-initialize to_gate_compress."""
-        if self.to_gate_compress is None:
-            return
-        if not self.to_gate_compress._weights_created:
-            self.to_gate_compress.create_weights()
-        if self.to_gate_compress.weight.is_meta:
-            return
-        with torch.no_grad():
-            self.to_gate_compress.weight.zero_()
-            if self.to_gate_compress.bias is not None:
-                self.to_gate_compress.bias.zero_()
-
-    def init_gate_fine_default(self) -> None:
-        """Initialize to_gate_fine to emit constant 1 (weight=0, bias=1)."""
-        if self.to_gate_fine is None:
-            return
-        if not self.to_gate_fine._weights_created:
-            self.to_gate_fine.create_weights()
-        if self.to_gate_fine.weight.is_meta:
-            return
-        with torch.no_grad():
-            self.to_gate_fine.weight.zero_()
-            if self.to_gate_fine.bias is not None:
-                self.to_gate_fine.bias.fill_(1.0)
 
     def forward(
         self,
@@ -839,7 +826,6 @@ class WanTransformer3DModel(nn.Module):
         }
         loader = DynamicLinearWeightLoader(self.model_config, params_map=params_map)
 
-        loaded_linears: set = set()
         for name, module in tqdm(self.named_modules(), desc="Loading weights"):
             if len(module._parameters) == 0:
                 continue
@@ -849,7 +835,12 @@ class WanTransformer3DModel(nn.Module):
 
                 if weight_dicts:
                     loader.load_linear_weights(module, name, weight_dicts)
-                    loaded_linears.add(name)
+                # VSA gates absent from the checkpoint default to G_c=0 / G_f=1
+                # (dense behavior at sparsity=0).
+                elif name.endswith(".to_gate_compress"):
+                    _default_vsa_gate(module, 0.0)
+                elif name.endswith(".to_gate_fine"):
+                    _default_vsa_gate(module, 1.0)
                 elif "add_k_proj" in name or "add_v_proj" in name:
                     logger.info(f"[Weight Loading] No weights found for I2V module: {name}")
             elif isinstance(module, RMSNormTPAware):
@@ -862,20 +853,6 @@ class WanTransformer3DModel(nn.Module):
                         param.data.copy_(
                             module_weights[param_name].to(self.model_config.torch_dtype)
                         )
-
-        # Default any VSA gates not loaded from the checkpoint: G_c=0, G_f=1
-        # (preserves dense behavior at sparsity=0).
-        for name, module in self.named_modules():
-            if not isinstance(module, WanBlock):
-                continue
-            if module.to_gate_compress is not None:
-                gate_path = f"{name}.to_gate_compress" if name else "to_gate_compress"
-                if gate_path not in loaded_linears:
-                    module.init_gate_compress_zero()
-            if module.to_gate_fine is not None:
-                gate_path = f"{name}.to_gate_fine" if name else "to_gate_fine"
-                if gate_path not in loaded_linears:
-                    module.init_gate_fine_default()
 
     def post_load_weights(self) -> None:
         """Call post_load_weights on all Linear modules and convert embedders to target dtype."""

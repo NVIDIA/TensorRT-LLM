@@ -63,8 +63,8 @@ class FluxPipeline(BasePipeline):
         if _sa_cfg is not None and getattr(_sa_cfg, "algorithm", None) == "vsa":
             raise ValueError(
                 "Video Sparse Attention (sparse_attention_config.algorithm='vsa') is "
-                "only supported by Wan T2V pipelines. Remove sparse_attention_config "
-                "for FLUX."
+                "only supported by the Wan 2.1 T2V 14B (720P) pipeline. Remove "
+                "sparse_attention_config for FLUX."
             )
 
         super().__init__(model_config)

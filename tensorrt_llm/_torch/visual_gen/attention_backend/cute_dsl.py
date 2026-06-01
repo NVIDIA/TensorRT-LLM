@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """
-CuTe DSL Backend for Visual Generation Models
+CuTe DSL (NVIDIA kernels) Backend for Visual Generation Models
 
 CuTeDSLAttention runs the VSA sparse path when sparse_attention_config is set,
 otherwise the dense cubin path (with optional QK16PV8 quantization).
@@ -46,6 +46,17 @@ try:
 except (ImportError, OSError) as e:
     cute_dsl = None
     _cute_dsl_import_error = e
+
+_vsa_import_error = None
+try:
+    from tensorrt_llm._torch.visual_gen.cute_dsl_kernels.blackwell.video_sparse_attention import (
+        block_sparse_attn_from_indices_cute,
+        is_cute_supported,
+    )
+except (ImportError, OSError) as e:
+    block_sparse_attn_from_indices_cute = None
+    is_cute_supported = None
+    _vsa_import_error = e
 
 
 # VSA (Video Sparse Attention) sparse-path helpers
@@ -267,8 +278,9 @@ class CuTeDSLAttention(AttentionBackend):
         skip_softmax_threshold_scale: Optional[float] = None,
         **kwargs,
     ):
-        # Dense path requires head_dim=128 (packaged cubins); the VSA sparse
-        # path JIT-compiles per shape, so it has no such restriction.
+        # Dense cubin path is head_dim=128-only (packaged cubins), so enforce it
+        # here. The VSA path needs no check: it is gated at runtime by
+        # is_cute_supported and falls back to dense SDPA when head_dim != 128.
         if sparse_attention_config is None and head_dim != 128:
             raise ValueError(f"CUTEDSL cubins require head_dim=128, got head_dim={head_dim}.")
         self.layer_idx = layer_idx
@@ -479,13 +491,6 @@ class CuTeDSLAttention(AttentionBackend):
         Returns:
             [B, S, H, D] in the same original token order.
         """
-        # Lazy import: the VSA kernels package is optional and may not be
-        # importable in environments without the cute-dsl runtime.
-        from ..cute_dsl_kernels.blackwell.video_sparse_attention import (
-            block_sparse_attn_from_indices_cute,
-            is_cute_supported,
-        )
-
         if gate_compress is None:
             raise ValueError(
                 "CuTeDSLAttention VSA path requires gate_compress. "
@@ -519,7 +524,9 @@ class CuTeDSLAttention(AttentionBackend):
         attn_probs_c = scores_c.softmax(dim=-1)
         o_c = torch.einsum("bhnm,bmhd->bnhd", attn_probs_c, v_c)
 
-        use_cute = is_cute_supported(q) and (q.dtype == k.dtype == v.dtype)
+        use_cute = (
+            _vsa_import_error is None and is_cute_supported(q) and (q.dtype == k.dtype == v.dtype)
+        )
         topk_indices = attn_probs_c.topk(cur_topk, dim=-1).indices.to(torch.int32)
 
         o_c_tiled = (
