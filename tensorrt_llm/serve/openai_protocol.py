@@ -1183,36 +1183,54 @@ def decode_opaque_state(encoded_opaque_state: Optional[str]) -> Optional[bytes]:
 
 
 def _serialize_first_gen_log_probs(
-    first_gen_log_probs: Optional[list], ) -> Optional[List]:
-    """Serialize list[dict[int, Logprob]] to JSON-safe list[list[dict]]."""
+        first_gen_log_probs: Optional[list]) -> Optional[List]:
+    """Serialize ``list[dict[int, Logprob]] | list[float]`` to a JSON-safe form.
+
+    - Default (verbose) format: each position is a ``dict[int, Logprob]`` and is
+      serialized as a list of ``{token_id, logprob, rank}`` dicts.
+    - Simple format: each position is a ``float``; passed through verbatim.
+    """
     if first_gen_log_probs is None:
         return None
     if not isinstance(first_gen_log_probs, list):
         raise ValueError("first_gen_log_probs must be a list")
     result = []
     for i, pos in enumerate(first_gen_log_probs):
-        if not isinstance(pos, dict):
+        if isinstance(pos, dict):
+            result.append([{
+                "token_id": tid,
+                "logprob": lp.logprob,
+                "rank": lp.rank
+            } for tid, lp in pos.items()])
+        elif isinstance(pos, (float, int)):
+            # Simple format: per-token sampled logprob.
+            result.append(float(pos))
+        else:
             raise ValueError(
-                f"first_gen_log_probs[{i}] must be a dict, got {type(pos)}")
-        result.append([{
-            "token_id": tid,
-            "logprob": lp.logprob,
-            "rank": lp.rank
-        } for tid, lp in pos.items()])
+                f"first_gen_log_probs[{i}] must be a dict or float, got {type(pos)}"
+            )
     return result
 
 
 def _deserialize_first_gen_log_probs(
     serialized: Optional[List], ) -> Optional[list]:
-    """Deserialize JSON list[list[dict]] back to list[dict[int, Logprob]]."""
+    """Inverse of :func:`_serialize_first_gen_log_probs`.
+
+    Returns either ``list[dict[int, Logprob]]`` (default format) or
+    ``list[float]`` (simple format) depending on the serialized payload.
+    """
     if serialized is None:
         return None
     from tensorrt_llm.executor.result import Logprob
     result = []
     for i, pos in enumerate(serialized):
+        if isinstance(pos, (float, int)):
+            result.append(float(pos))
+            continue
         if not isinstance(pos, list):
             raise ValueError(
-                f"first_gen_log_probs[{i}] must be a list, got {type(pos)}")
+                f"first_gen_log_probs[{i}] must be a list or float, got {type(pos)}"
+            )
         token_map = {}
         for j, item in enumerate(pos):
             if not isinstance(item, dict):
