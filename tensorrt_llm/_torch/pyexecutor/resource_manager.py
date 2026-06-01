@@ -5,6 +5,7 @@ import copy
 import enum
 import math
 import os
+import sys
 from abc import ABC, abstractmethod
 from collections import OrderedDict, defaultdict, deque
 from dataclasses import dataclass
@@ -2452,7 +2453,7 @@ class KVCacheManagerV2(BaseResourceManager):
 
         self.is_vswa = len(set(self.max_attention_window_vec)) > 1
 
-        quota = float('inf')
+        quota = sys.maxsize
         if kv_cache_config.max_gpu_total_bytes is not None and kv_cache_config.max_gpu_total_bytes > 0:
             quota = int(kv_cache_config.max_gpu_total_bytes)
             logger.info(
@@ -2468,9 +2469,7 @@ class KVCacheManagerV2(BaseResourceManager):
                 f"max_tokens {kv_cache_config.max_tokens} is provided. Allowed quota from max_tokens is {quota_from_max_tokens / (1 << 30)}GiB. New quota is {quota / (1 << 30)}GiB"
             )
 
-        assert quota != float(
-            'inf'
-        ), "Quota not set. Check kv_cache_config.max_tokens or kv_cache_config.max_gpu_total_bytes"
+        assert quota < sys.maxsize, "Quota not set. Check kv_cache_config.max_tokens or kv_cache_config.max_gpu_total_bytes"
 
         # Sync KV cache token capacity across ranks so all ranks allocate
         # the same number of tokens and the scheduler produces identical

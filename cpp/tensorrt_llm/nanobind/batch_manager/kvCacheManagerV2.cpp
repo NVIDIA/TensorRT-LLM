@@ -526,7 +526,8 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             "resize",
             [](kv::KvCache& self, std::optional<int> capacity, std::optional<int> historyLength) -> bool
             { return self.resize(capacity, historyLength); },
-            nb::arg("capacity"), nb::arg("history_length") = std::nullopt, nb::call_guard<nb::gil_scoped_release>())
+            nb::arg("capacity") = std::nullopt, nb::arg("history_length") = std::nullopt,
+            nb::call_guard<nb::gil_scoped_release>())
         .def(
             "commit",
             [](kv::KvCache& self, nb::object acceptedInputTokens, nb::object beamSearchIndices)
