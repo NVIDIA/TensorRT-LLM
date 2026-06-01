@@ -505,6 +505,7 @@ class TestPrepareAndScheduleBatchNoBlock:
         ex.enable_attention_dp = False
         ex.num_fetch_requests = 0
         ex.dist = Mock(rank=0, tp_size=1)
+        ex.dist.allreduce = Mock(side_effect=lambda v, op=None: v)
         ex.is_shutdown = False
         ex._is_warmup = False
         ex.enable_iter_perf_stats = False
@@ -894,6 +895,7 @@ class TestFailFastDuringBenchmarkFill:
         ex.enable_attention_dp = False
         ex.num_fetch_requests = num_fetch_requests
         ex.dist = Mock(rank=0, tp_size=1)
+        ex.dist.allreduce.return_value = 0
         ex.is_shutdown = False
         ex._is_warmup = False
         ex.enable_iter_perf_stats = False
@@ -1040,6 +1042,7 @@ class TestFillPhaseEndToEnd:
         ex.num_fetch_requests = 0
         ex.max_num_active_requests = self.MAX_BATCH_SIZE
         ex.dist = Mock(rank=0, tp_size=self.TP_SIZE)
+        ex.dist.allreduce.return_value = 0
         ex.is_shutdown = False
         ex._is_warmup = False
         ex.enable_iter_perf_stats = False
