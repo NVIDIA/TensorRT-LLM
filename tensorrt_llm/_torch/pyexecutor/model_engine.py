@@ -473,6 +473,14 @@ class PyTorchModelEngine(ModelEngine):
             raise e
 
         self.is_warmup = False
+        # Set to True by py_executor_creator around the first (estimation-pass)
+        # PyExecutor's warmup; the production PyExecutor's warmup runs with this
+        # back to False. Read by warmup() to skip step (d) max-shape
+        # pre-population during estimation - those blocks have no payoff because
+        # configure_kv_cache_capacity drops them via empty_cache() before
+        # measuring, and the estimation PyExecutor is torn down immediately
+        # after measurement without ever serving a request.
+        self.is_estimation_pass = False
         self.previous_request_ids = []
         self.has_previous_device_draft = False
         self.previous_accepted_tokens_cuda = torch.empty((self.batch_size, ),
@@ -972,21 +980,29 @@ class PyTorchModelEngine(ModelEngine):
             self._run_cuda_graph_warmup(resource_manager)
         # Step (d) max-shape pre-population pre-allocates the worst-case
         # activation blocks so the first real iteration reuses them instead
-        # of paying a cudaMalloc cost. The blocks themselves are legitimate
-        # first-iter working set, but on workloads that prefer maximum
-        # non-torch headroom over the ~tens-of-ms first-iter saving (e.g.
-        # disaggregated context workers running near the GPU-memory limit),
-        # TRTLLM_SKIP_MAX_SHAPE_WARMUP=1 disables this pass.
-        if can_run_general_warmup and os.environ.get(
-                "TRTLLM_SKIP_MAX_SHAPE_WARMUP", "0") != "1":
-            # Pre-populate the memory pool with max-shape allocations to reduce
-            # fragmentation at runtime.
-            warmup_requests_configs = self._get_max_shape_warmup_requests(
-                resource_manager)
-            self._general_warmup(resource_manager, warmup_requests_configs)
-        elif can_run_general_warmup:
-            logger.info("Skipping max-shape warmup pre-population "
-                        "(TRTLLM_SKIP_MAX_SHAPE_WARMUP=1)")
+        # of paying a cudaMalloc cost. Skip when:
+        #   - is_estimation_pass: the estimation PyExecutor is torn down
+        #     immediately after configure_kv_cache_capacity (which calls
+        #     empty_cache()), so any pre-pop blocks are released before
+        #     measurement and never serve a request. Pure waste.
+        #   - TRTLLM_SKIP_MAX_SHAPE_WARMUP=1: opt-in for production workloads
+        #     that prefer maximum non-torch headroom (cuBLAS, UCX/NIXL,
+        #     NVSHMEM) over the ~tens-of-ms first-iter cudaMalloc saving.
+        if can_run_general_warmup:
+            skip_for_estimation = self.is_estimation_pass
+            skip_for_envvar = (os.environ.get("TRTLLM_SKIP_MAX_SHAPE_WARMUP",
+                                              "0") == "1")
+            if not (skip_for_estimation or skip_for_envvar):
+                # Pre-populate the memory pool with max-shape allocations to
+                # reduce fragmentation at runtime.
+                warmup_requests_configs = self._get_max_shape_warmup_requests(
+                    resource_manager)
+                self._general_warmup(resource_manager, warmup_requests_configs)
+            else:
+                reason = ("estimation pass" if skip_for_estimation else
+                          "TRTLLM_SKIP_MAX_SHAPE_WARMUP=1")
+                logger.info(
+                    f"Skipping max-shape warmup pre-population ({reason})")
 
     def _general_warmup(self, resource_manager: ResourceManager,
                         warmup_requests_configs: List[Tuple[int, int]]):

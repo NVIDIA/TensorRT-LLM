@@ -278,6 +278,37 @@ class TestWarmupCleanup(unittest.TestCase):
                     f"env={val!r}: expected 2 general_warmup; got {calls}",
                 )
 
+    # ---- Estimation-pass step (d) skip ----
+
+    def test_step_d_skipped_in_estimation_pass(self):
+        """Estimation-pass optimization: when is_estimation_pass=True,
+        step (d) is skipped even if the env var is unset, and the skip log
+        reports the estimation reason."""
+        model_engine, resource_manager = _build_engine_and_resource_manager()
+        model_engine.is_estimation_pass = True
+        calls, logs = _run_warmup_tracked(model_engine, resource_manager, capture_logs=True)
+        self.assertEqual(
+            calls.count("general_warmup"),
+            1,
+            f"Expected only step (a) general_warmup during estimation; got {calls}",
+        )
+        self.assertTrue(
+            any("estimation pass" in m for m in logs),
+            f"Expected estimation-pass skip log; got logs={logs}",
+        )
+
+    def test_step_d_runs_when_is_estimation_pass_false(self):
+        """Default attribute value is False, so step (d) runs normally."""
+        model_engine, resource_manager = _build_engine_and_resource_manager()
+        # Explicit assertion: the attribute exists and defaults to False.
+        self.assertFalse(model_engine.is_estimation_pass)
+        calls, _ = _run_warmup_tracked(model_engine, resource_manager)
+        self.assertEqual(
+            calls.count("general_warmup"),
+            2,
+            f"Expected step (a) + step (d) when is_estimation_pass=False; got {calls}",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
