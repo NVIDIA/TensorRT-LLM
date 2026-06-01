@@ -12,6 +12,8 @@ from tensorrt_llm._torch.models.modeling_utils import register_mapper
 from tensorrt_llm._torch.modules.fused_moe.interface import MoE, MoEWeightLoadingMode
 
 
+@register_mapper("HF", "Qwen3_5MoeForConditionalGeneration")
+@register_mapper("HF", "Qwen3_5ForConditionalGeneration")
 @register_mapper("HF", "Qwen3_5MoeForCausalLM")
 @register_mapper("HF", "Qwen3_5ForCausalLM")
 class Qwen3_5MoeHfWeightMapper(Qwen3NextHfWeightMapper):

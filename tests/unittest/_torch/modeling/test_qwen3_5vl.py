@@ -1,0 +1,121 @@
+import json
+
+import torch
+
+
+def _write_qwen3_5_vlm_config(model_dir):
+    config = {
+        "architectures": ["Qwen3_5ForConditionalGeneration"],
+        "dtype": "bfloat16",
+        "eos_token_id": 248046,
+        "image_token_id": 248056,
+        "model_type": "qwen3_5",
+        "pad_token_id": 248044,
+        "tie_word_embeddings": False,
+        "video_token_id": 248057,
+        "vision_end_token_id": 248054,
+        "vision_start_token_id": 248053,
+        "text_config": {
+            "architectures": ["Qwen3_5ForCausalLM"],
+            "attn_output_gate": True,
+            "dtype": "bfloat16",
+            "full_attention_interval": 4,
+            "head_dim": 64,
+            "hidden_size": 256,
+            "intermediate_size": 512,
+            "layer_types": [
+                "linear_attention",
+                "linear_attention",
+                "linear_attention",
+                "full_attention",
+            ],
+            "linear_conv_kernel_dim": 4,
+            "linear_key_head_dim": 32,
+            "linear_num_key_heads": 4,
+            "linear_num_value_heads": 8,
+            "linear_value_head_dim": 32,
+            "max_position_embeddings": 4096,
+            "mamba_ssm_dtype": "float32",
+            "model_type": "qwen3_5_text",
+            "num_attention_heads": 4,
+            "num_hidden_layers": 4,
+            "num_key_value_heads": 2,
+            "output_gate_type": "swish",
+            "partial_rotary_factor": 0.25,
+            "rms_norm_eps": 1e-6,
+            "rope_parameters": {
+                "mrope_interleaved": True,
+                "mrope_section": [1, 1, 2],
+                "partial_rotary_factor": 0.25,
+                "rope_theta": 10000000,
+                "rope_type": "default",
+            },
+            "tie_word_embeddings": False,
+            "use_cache": False,
+            "vocab_size": 1024,
+        },
+        "vision_config": {
+            "deepstack_visual_indexes": [],
+            "depth": 1,
+            "hidden_act": "gelu_pytorch_tanh",
+            "hidden_size": 64,
+            "intermediate_size": 128,
+            "model_type": "qwen3_5",
+            "num_heads": 4,
+            "num_position_embeddings": 16,
+            "out_hidden_size": 256,
+            "patch_size": 16,
+            "spatial_merge_size": 2,
+            "temporal_patch_size": 2,
+        },
+    }
+    (model_dir / "config.json").write_text(json.dumps(config))
+
+
+def test_qwen3_5_conditional_config_preserves_vlm_and_normalizes_text(tmp_path):
+    import transformers
+
+    from tensorrt_llm._torch.pyexecutor.config_utils import (
+        extract_mamba_kv_cache_params,
+        get_qwen3_hybrid_layer_types,
+        load_pretrained_config,
+    )
+
+    _write_qwen3_5_vlm_config(tmp_path)
+
+    config = load_pretrained_config(str(tmp_path))
+
+    assert config.architectures == ["Qwen3_5ForConditionalGeneration"]
+    assert config.model_type == "qwen3_5"
+    assert config.vision_config.depth == 1
+    assert isinstance(config.text_config, transformers.Qwen3NextConfig)
+    assert config.text_config.architectures == ["Qwen3_5ForCausalLM"]
+    assert config.text_config.rope_scaling["type"] == "mrope"
+    assert config.text_config.rope_scaling["mrope_section"] == [1, 1, 2]
+    assert get_qwen3_hybrid_layer_types(config.text_config) == [
+        "linear_attention",
+        "linear_attention",
+        "linear_attention",
+        "full_attention",
+    ]
+    assert extract_mamba_kv_cache_params(
+        config.text_config).mamba_ssm_cache_dtype is torch.float32
+
+
+def test_qwen3_5_vlm_model_and_mapper_registration():
+    from tensorrt_llm._torch.models.checkpoints.hf.qwen3_5_weight_mapper import (
+        Qwen3_5MoeHfWeightMapper,
+    )
+    from tensorrt_llm._torch.models.modeling_qwen3_5vl import Qwen3_5VLModel
+    from tensorrt_llm._torch.models.modeling_utils import (
+        MODEL_CLASS_MAPPING,
+        MODEL_CLASS_MAPPER_MAPPING,
+        MODEL_CLASS_VISION_ENCODER_MAPPING,
+    )
+
+    assert MODEL_CLASS_MAPPING["Qwen3_5ForConditionalGeneration"] is Qwen3_5VLModel
+    assert "Qwen3_5ForConditionalGeneration" in MODEL_CLASS_VISION_ENCODER_MAPPING
+    assert (
+        MODEL_CLASS_MAPPER_MAPPING["Qwen3_5ForConditionalGeneration_HF"]
+        is Qwen3_5MoeHfWeightMapper
+    )

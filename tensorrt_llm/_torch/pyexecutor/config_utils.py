@@ -6,6 +6,7 @@ from typing import List, Optional
 import torch
 import transformers
 
+from tensorrt_llm._utils import str_dtype_to_torch
 from tensorrt_llm.logger import logger
 
 
@@ -251,6 +252,12 @@ def extract_mamba_kv_cache_params(
 
     mamba_ssm_cache_dtype = (quant_config.mamba_ssm_cache_dtype
                              if quant_config is not None else None)
+    if mamba_ssm_cache_dtype is None:
+        config_mamba_ssm_dtype = getattr(config, "mamba_ssm_dtype", None)
+        if isinstance(config_mamba_ssm_dtype, torch.dtype):
+            mamba_ssm_cache_dtype = config_mamba_ssm_dtype
+        elif isinstance(config_mamba_ssm_dtype, str):
+            mamba_ssm_cache_dtype = str_dtype_to_torch(config_mamba_ssm_dtype)
 
     return MambaKVCacheParams(
         state_size=state_size,
@@ -445,6 +452,14 @@ def load_pretrained_config(model_name_or_path: str,
             MistralConfigLoader
         model_config = MistralConfigLoader().load(
             model_name_or_path).pretrained_config
+    elif architectures and architectures[0] in _Qwen35ConfigCompat._VLM_ARCHITECTURES:
+        model_config = transformers.AutoConfig.from_pretrained(
+            model_name_or_path, trust_remote_code=trust_remote_code)
+        # Keep the composite VLM config so the vision encoder and multimodal
+        # token IDs remain available, but normalize the text side to the
+        # Qwen3Next-compatible shape used by TRT-LLM's Qwen3.5 decoder.
+        model_config.text_config = transformers.Qwen3NextConfig.from_dict(
+            _Qwen35ConfigCompat.normalize(config_dict))
     elif model_type in _CONFIG_REGISTRY:
         config_class = _CONFIG_REGISTRY[model_type]
         model_config = config_class.from_pretrained(model_name_or_path,

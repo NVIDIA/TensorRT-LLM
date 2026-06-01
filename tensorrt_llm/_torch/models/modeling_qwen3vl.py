@@ -1047,14 +1047,18 @@ class Qwen3VLModelBase(PreTrainedModel):
 
         self.model_config = model_config
 
+        vlm_to_llm_arch = {
+            "Qwen3VLForConditionalGeneration": "Qwen3ForCausalLM",
+            "Qwen3VLMoeForConditionalGeneration": "Qwen3MoeForCausalLM",
+            "Qwen3_5ForConditionalGeneration": "Qwen3_5ForCausalLM",
+            "Qwen3_5MoeForConditionalGeneration": "Qwen3_5MoeForCausalLM",
+        }
+        llm_arch = vlm_to_llm_arch.get(self.original_arch)
+        if llm_arch is None:
+            raise ValueError(f"Unsupported architecture: {self.original_arch}")
         llm_model_config = copy.deepcopy(model_config)
         llm_model_config.pretrained_config = config.text_config
-        if self.original_arch == "Qwen3VLForConditionalGeneration":
-            llm_model_config.pretrained_config.architectures = ["Qwen3ForCausalLM"]
-        elif self.original_arch == "Qwen3VLMoeForConditionalGeneration":
-            llm_model_config.pretrained_config.architectures = ["Qwen3MoeForCausalLM"]
-        else:
-            raise ValueError(f"Unsupported architecture: {self.original_arch}")
+        llm_model_config.pretrained_config.architectures = [llm_arch]
         # Qwen3ForCausalLM.
         self.llm = AutoModelForCausalLM.from_config(llm_model_config)
 
