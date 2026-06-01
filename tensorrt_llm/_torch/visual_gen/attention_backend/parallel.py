@@ -113,6 +113,11 @@ class UlyssesAttention(AttentionBackend):
         # them.
         self._pg_boxed = None
         self._async_side_stream: Optional[torch.cuda.Stream] = None
+        # Count of deferred pushes since the last `_join_async`. `_join_async`
+        # drains exactly this many `ulysses_a2a_async_barrier` calls on the
+        # side stream so V/Q/K pushes FIFO together without intermediate
+        # barrier kernels.
+        self._pending_barriers: int = 0
         if async_pipeline:
             device = torch.cuda.current_device()
             if device not in UlyssesAttention._side_stream_by_device:
@@ -212,11 +217,14 @@ class UlyssesAttention(AttentionBackend):
 
     @torch.compiler.disable(recursive=False)
     def _issue_async(self, perm_4d: torch.Tensor) -> torch.Tensor:
-        """Issue one V/Q/K async a2a.
+        """Issue one V/Q/K async a2a (CE push only; barrier deferred to join).
         Phase 1 (acquire slot + CUDA C permute+scatter) runs on the CURRENT
-        (default) stream. Phase 2 (cudaMemcpyBatchAsync peer push + symm-mem
-        barrier) is queued on the comm side stream, gated by an event so it
-        waits for Phase 1 to complete. Returns the 5D recv-buf view.
+        (default) stream. Phase 2a (cudaMemcpyBatchAsync peer push) is queued
+        on the comm side stream, gated by an event so it waits for Phase 1.
+        Phase 2b (symm-mem barrier) is NOT issued here — `_join_async` drains
+        all pending barriers in one shot so V/Q/K pushes FIFO through CE
+        without intermediate barrier kernels splitting them up. Returns the
+        5D recv-buf view.
 
         Comm-stream FIFO serializes consecutive V/Q/K pushes in caller order;
         no explicit chain event is needed between them. The default stream
@@ -227,17 +235,23 @@ class UlyssesAttention(AttentionBackend):
         ev.record()
         with torch.cuda.stream(self._async_side_stream):
             ev.wait()
-            torch.ops.trtllm.ulysses_a2a_async(send_h, self._pg_boxed)
+            torch.ops.trtllm.ulysses_a2a_async_push(send_h, self._pg_boxed)
+        self._pending_barriers += 1
         return recv
 
     @torch.compiler.disable(recursive=False)
     def _join_async(self) -> None:
-        """Default stream waits on the comm side stream's tail. Because comm
-        is FIFO, an event recorded after the last `_issue_async`'s push+barrier
-        also covers all prior issues."""
-        ev_done = torch.cuda.Event()
+        """Drain pending symm-mem barriers (one per deferred push) on the
+        side stream, then have the default stream wait on the tail event.
+        Comm-stream FIFO preserves [push V, push Q, push K, barrier, barrier,
+        barrier] order; all N barriers fire on channel=0 with identical
+        semantics, so the default stream sees a fully-synced recv buffer."""
         with torch.cuda.stream(self._async_side_stream):
+            for _ in range(self._pending_barriers):
+                torch.ops.trtllm.ulysses_a2a_async_barrier(self._pg_boxed)
+            ev_done = torch.cuda.Event()
             ev_done.record()
+        self._pending_barriers = 0
         torch.cuda.current_stream().wait_event(ev_done)
 
     def forward_async(

@@ -24,7 +24,10 @@
 //   ev.record()
 //   with torch.cuda.stream(comm_stream):
 //       ev.wait()
-//       ulysses_a2a_async(send_h, pg)                     # CE push + barrier
+//       ulysses_a2a_async_push(send_h, pg)                # CE push only
+//   ... repeat _prepare/_push for next V/Q/K ...
+//   with torch.cuda.stream(comm_stream):
+//       ulysses_a2a_async_barrier(pg)                     # one per deferred push
 //
 // Phase 1 (`_prepare`) on the caller's compute stream:
 //   - lazily allocate one slot of a ring of P-symmetric-memory buffers
@@ -236,24 +239,13 @@ public:
     // Any allocated slot's handle works — they all belong to the same group.
     void emitBarrier()
     {
-        c10::intrusive_ptr<c10d::symmetric_memory::SymmetricMemory> h;
-        {
-            std::lock_guard<std::mutex> lock(mSlotsMutex);
-            for (auto const& s : mSlots)
-            {
-                if (s.handle)
-                {
-                    h = s.handle;
-                    break;
-                }
-            }
-        }
-        TLLM_CHECK_WITH_INFO(h, "emitBarrier: no slot allocated yet — _prepare must precede the first _async barrier.");
+        TLLM_CHECK_WITH_INFO(
+            mCanonicalHandle, "emitBarrier: no slot allocated yet — _prepare must precede the first _async barrier.");
         // 10s timeout: on hang, the kernel traps with rank+channel diagnostic instead of spinning silently
         // until SLURM wall-clock kills. Generous enough to absorb first-touch IPC + first cuda_graph
         // capture jitter. channel=0: V/Q/K issues all run on the same per-device side stream so
         // they FIFO-serialize; channel multiplexing only matters across distinct streams.
-        h->barrier(/*channel=*/0, /*timeout_ms=*/10000);
+        mCanonicalHandle->barrier(/*channel=*/0, /*timeout_ms=*/10000);
     }
 
 private:
@@ -367,6 +359,13 @@ private:
         slot.sendBuf = newSendBuf;
         slot.sendBufBytes = requiredSize;
 
+        // Cache the first allocated handle for emitBarrier() (any handle from
+        // this PG yields the same channel-N barrier semantics).
+        if (!mCanonicalHandle)
+        {
+            mCanonicalHandle = slot.handle;
+        }
+
         return slot;
     }
 
@@ -377,6 +376,12 @@ private:
 
     std::array<Slot, kNumSlots> mSlots{};
     std::mutex mSlotsMutex;
+
+    // Cached on the first slot allocation. SymmetricMemory::barrier() is a
+    // PG-level sync (any handle from this PG triggers the same channel-N
+    // barrier), so emitBarrier() can use this directly instead of scanning
+    // mSlots for a non-null handle on every call.
+    c10::intrusive_ptr<c10d::symmetric_memory::SymmetricMemory> mCanonicalHandle;
 };
 
 // Process-lifetime cache of AsyncUlyssesOp instances keyed by group_name.
@@ -446,24 +451,33 @@ std::tuple<torch::Tensor, c10::intrusive_ptr<SendHandle>> ulysses_a2a_async_prep
     return std::make_tuple(std::move(recv_t), send_h);
 }
 
-// Step 2 (caller's comm stream): fire P-1 cudaMemcpyBatchAsync peer pushes,
-// then emit the symm-mem barrier — both on the current stream. Caller
-// event-syncs from the compute stream onto the comm stream before calling.
-void ulysses_a2a_async(c10::intrusive_ptr<SendHandle> const& send_h, c10::intrusive_ptr<c10d::ProcessGroup> const& pg)
+// Step 2a (caller's comm stream): CE push only, no barrier. Issue V/Q/K
+// pushes back-to-back on the side stream so they FIFO through copy-engines
+// without barrier-induced stalls; defer all fences to `ulysses_a2a_async_barrier`
+// at join time. Caller must event-sync from compute stream before calling.
+//
+// Reject cross-PG handle use: peer_recv_ptrs are valid only in the symm-mem
+// group registered for the PG that produced this handle. Two PGs of the same
+// size would otherwise pass the peer-count check inside runCePush and silently
+// push into the wrong group's buffers.
+void ulysses_a2a_async_push(
+    c10::intrusive_ptr<SendHandle> const& send_h, c10::intrusive_ptr<c10d::ProcessGroup> const& pg)
 {
     TORCH_CHECK(send_h.get() != nullptr, "send_h is null");
     TORCH_CHECK(send_h->send_t.defined(), "send_h.send_t is undefined");
-
-    // Reject cross-PG handle use: peer_recv_ptrs are valid only in the symm-mem
-    // group registered for the PG that produced this handle. Two PGs of the
-    // same size would otherwise pass the peer-count check inside runCePush and
-    // silently push into the wrong group's buffers.
     TORCH_CHECK(send_h->group_name == pg->getGroupName(), "SendHandle was produced by ProcessGroup '",
-        send_h->group_name, "' but ulysses_a2a_async was called with ProcessGroup '", pg->getGroupName(),
+        send_h->group_name, "' but ulysses_a2a_async_push was called with ProcessGroup '", pg->getGroupName(),
         "'. Handle and PG must match.");
-
     auto op = getOrCreateOp(pg);
     op->runCePush(send_h->send_t, send_h->peer_recv_ptrs, send_h->slot_bytes);
+}
+
+// Step 2b (caller's comm stream): emit a symm-mem barrier on channel 0.
+// Pairs with `ulysses_a2a_async_push`; one call per deferred push (e.g.
+// V/Q/K -> 3 barriers at join).
+void ulysses_a2a_async_barrier(c10::intrusive_ptr<c10d::ProcessGroup> const& pg)
+{
+    auto op = getOrCreateOp(pg);
     op->emitBarrier();
 }
 
@@ -484,8 +498,9 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
         "__torch__.torch.classes.c10d.ProcessGroup pg) "
         "-> (Tensor, __torch__.torch.classes.trtllm.SendHandle)");
     m.def(
-        "ulysses_a2a_async(__torch__.torch.classes.trtllm.SendHandle send_h, "
+        "ulysses_a2a_async_push(__torch__.torch.classes.trtllm.SendHandle send_h, "
         "__torch__.torch.classes.c10d.ProcessGroup pg) -> ()");
+    m.def("ulysses_a2a_async_barrier(__torch__.torch.classes.c10d.ProcessGroup pg) -> ()");
 }
 
 // Both ops take/return a custom-class handle, not tensors, so the dispatcher
@@ -495,6 +510,7 @@ TORCH_LIBRARY_IMPL(trtllm, CompositeExplicitAutograd, m)
 {
 #if ENABLE_MULTI_DEVICE
     m.impl("ulysses_a2a_async_prepare", &tensorrt_llm::torch_ext::ulysses_a2a_async_prepare);
-    m.impl("ulysses_a2a_async", &tensorrt_llm::torch_ext::ulysses_a2a_async);
+    m.impl("ulysses_a2a_async_push", &tensorrt_llm::torch_ext::ulysses_a2a_async_push);
+    m.impl("ulysses_a2a_async_barrier", &tensorrt_llm::torch_ext::ulysses_a2a_async_barrier);
 #endif
 }

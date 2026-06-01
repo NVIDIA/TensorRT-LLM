@@ -1,7 +1,8 @@
 """Multi-rank tests for the async Ulysses A2A op.
 
-Exercises the production ``ulysses_a2a_async_prepare`` / ``ulysses_a2a_async``
-pair end-to-end across multiple ranks. Two test surfaces:
+Exercises the production ``ulysses_a2a_async_prepare`` / ``ulysses_a2a_async_push``
+/ ``ulysses_a2a_async_barrier`` chain end-to-end across multiple ranks. Two test
+surfaces:
 
 1. ``test_slot_ring_wraparound`` — eager mode (cudaMemcpyBatchAsync path).
    Loops the pair more than ``kNumSlots`` times so the slot ring wraps multiple
@@ -81,7 +82,8 @@ def _slot_ring_logic(rank: int, world_size: int):
         # Phase 2 on side stream.
         with torch.cuda.stream(side_stream):
             ev.wait()
-            torch.ops.trtllm.ulysses_a2a_async(send_h, pg_boxed)
+            torch.ops.trtllm.ulysses_a2a_async_push(send_h, pg_boxed)
+            torch.ops.trtllm.ulysses_a2a_async_barrier(pg_boxed)
         ev_done = torch.cuda.Event()
         with torch.cuda.stream(side_stream):
             ev_done.record()
@@ -136,7 +138,8 @@ def _capture_smoke_logic(rank: int, world_size: int):
         ev_w.record()
         with torch.cuda.stream(side_stream):
             ev_w.wait()
-            torch.ops.trtllm.ulysses_a2a_async(sh_w, pg_boxed)
+            torch.ops.trtllm.ulysses_a2a_async_push(sh_w, pg_boxed)
+            torch.ops.trtllm.ulysses_a2a_async_barrier(pg_boxed)
         ev_w_done = torch.cuda.Event()
         with torch.cuda.stream(side_stream):
             ev_w_done.record()
@@ -152,7 +155,8 @@ def _capture_smoke_logic(rank: int, world_size: int):
         ev.record()
         with torch.cuda.stream(side_stream):
             ev.wait()
-            torch.ops.trtllm.ulysses_a2a_async(send_h, pg_boxed)
+            torch.ops.trtllm.ulysses_a2a_async_push(send_h, pg_boxed)
+            torch.ops.trtllm.ulysses_a2a_async_barrier(pg_boxed)
         ev_done = torch.cuda.Event()
         with torch.cuda.stream(side_stream):
             ev_done.record()
@@ -199,7 +203,8 @@ def _multi_pg_logic(rank: int, world_size: int):
         ev.record()
         with torch.cuda.stream(side_stream):
             ev.wait()
-            torch.ops.trtllm.ulysses_a2a_async(send_h, pg_boxed)
+            torch.ops.trtllm.ulysses_a2a_async_push(send_h, pg_boxed)
+            torch.ops.trtllm.ulysses_a2a_async_barrier(pg_boxed)
         ev_done = torch.cuda.Event()
         with torch.cuda.stream(side_stream):
             ev_done.record()
