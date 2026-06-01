@@ -64,12 +64,14 @@ EMBEDDING_MODELS = [
 
 
 def _last_token_pool(hidden_states: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
+    """Extract the last real token's hidden state per sequence using attention mask lengths."""
     sequence_lengths = attention_mask.sum(dim=1) - 1
     batch_size = hidden_states.shape[0]
     return hidden_states[torch.arange(batch_size, device=hidden_states.device), sequence_lengths]
 
 
 def _hf_embeddings(model_path: str, texts: list[str]) -> torch.Tensor:
+    """Generate L2-normalized embeddings from a HuggingFace model as reference baseline."""
     tokenizer = AutoTokenizer.from_pretrained(model_path, padding_side="left")
     model = AutoModel.from_pretrained(model_path, torch_dtype=torch.bfloat16).cuda().eval()
 
@@ -94,6 +96,7 @@ def _hf_embeddings(model_path: str, texts: list[str]) -> torch.Tensor:
 
 
 def _trtllm_embeddings(model_path: str, texts: list[str]) -> torch.Tensor:
+    """Generate L2-normalized embeddings via TensorRT-LLM generate path with additional_model_outputs."""
     with LLM(
         model=model_path,
         backend="pytorch",

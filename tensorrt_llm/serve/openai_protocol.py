@@ -1601,6 +1601,8 @@ UCompletionResponse = Union[CompletionResponse, ChatCompletionResponse]
 
 
 class EmbeddingRequest(OpenAIBaseModel):
+    """OpenAI-compatible embedding request with optional normalization and dimension truncation."""
+
     input: Union[str, List[str]]
     model: str
     encoding_format: Optional[str] = "base64"
@@ -1609,12 +1611,16 @@ class EmbeddingRequest(OpenAIBaseModel):
 
 
 class EmbeddingData(OpenAIBaseModel):
+    """Single embedding result with index and vector (float list or base64-encoded)."""
+
     object: str = "embedding"
     index: int
     embedding: Union[str, List[float]]
 
 
 class EmbeddingResponse(OpenAIBaseModel):
+    """OpenAI-compatible embedding response containing a list of embeddings and token usage."""
+
     object: str = "list"
     data: List[EmbeddingData]
     model: str
