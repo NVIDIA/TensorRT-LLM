@@ -2850,11 +2850,13 @@ class DwdpConfig(StrictBaseModel):
     DWDP accelerates the context (prefill) phase of disaggregated MoE serving
     by combining data parallelism with NVLink-based expert weight sharing.
     Each worker holds a subset of experts locally and asynchronously prefetches
-    the remaining experts from peer workers via CUDA IPC, enabling fully
-    asynchronous execution across ranks without synchronization barriers.
+    the remaining experts from peer workers via CUDA VMM + MNNVL fabric
+    handles (composite virtual-address layout with zero-copy local mapping and
+    double-buffered P2P remote regions), enabling fully asynchronous execution
+    across ranks without synchronization barriers.
 
     Currently supported with the CuteDSL MoE backend and NVFP4 quantization
-    on NVLink-connected multi-GPU systems.
+    on MNNVL-connected multi-GPU systems (e.g., GB200).
     """
     dwdp_size: int = Field(default=1,
                            description="The number of GPUs per DWDP group.")
