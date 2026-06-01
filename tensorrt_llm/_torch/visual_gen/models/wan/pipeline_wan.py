@@ -499,12 +499,17 @@ class WanPipeline(BasePipeline):
         resolved_flow_shift = (
             flow_shift if flow_shift is not None else self._default_flow_shift(height, width)
         )
-        if self.scheduler.config.shift != resolved_flow_shift:
+
+        sched_cfg = self.scheduler.config
+        shift_key = (
+            "shift" if "shift" in sched_cfg else "flow_shift" if "flow_shift" in sched_cfg else None
+        )
+        if shift_key is not None and sched_cfg[shift_key] != resolved_flow_shift:
             logger.info(
-                f"flow_shift: {self.scheduler.config.shift} -> {resolved_flow_shift} "
+                f"flow_shift: {sched_cfg[shift_key]} -> {resolved_flow_shift} "
                 f"({'user' if flow_shift is not None else 'variant default'})"
             )
-            self.scheduler.config.shift = resolved_flow_shift
+            self.scheduler.register_to_config(**{shift_key: resolved_flow_shift})
 
         self.scheduler.set_timesteps(num_inference_steps, device=self.device)
 
