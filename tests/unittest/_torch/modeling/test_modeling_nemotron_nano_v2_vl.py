@@ -373,13 +373,10 @@ def test_nemotron_nano_v2_vl_video_batch_equivalence(nano_llm_model):
 def _wire_plan_based_encode(model, hidden_dim: int = 128) -> None:
     """Bind the real plan-based `_encode_multimodal` machinery onto a mock model.
 
-    The post-Task-11 `_encode_multimodal` dispatches through a flat-item plan
-    and several small adapter / resolver methods on the model. When tests use
-    `mock.MagicMock(spec=NemotronH_Nano_VL_V2)`, those methods are auto-mocked
-    and return `MagicMock`s rather than the values the encode pipeline needs.
-    This helper attaches the real methods (bound to `model`) and sets up the
-    resolver outputs so the production code path runs end-to-end against
-    test-supplied `vision_encoder` / `_encode_audio` stubs.
+    A `mock.MagicMock(spec=NemotronH_Nano_VL_V2)` auto-mocks the adapter /
+    resolver methods the encode plan dispatches through. This rebinds the real
+    methods (and fixes device/dtype/hidden-dim resolvers) so the production path
+    runs end-to-end against test-supplied `vision_encoder` / `_encode_audio` stubs.
     """
     for name in (
         "_encode_multimodal",
@@ -724,31 +721,12 @@ class TestInterleaveVideoAudioEmbeddings:
     def test_two_videos_both_with_audio_evs_pruned(self):
         """EVS-pruned variant of `test_two_videos_both_with_audio`.
 
-        When `video_pruning_rate > 0`, the vision encoder prunes video
-        tokens and the model threads a per-tubelet retained-count tensor
-        (`evs_num_tokens`) into the interleave. The interleave then must
-        recover each video's PRUNED vision-row count via
-        `torch.split(evs_num_tokens, tubelets_per_video)` and sum each
-        chunk, NOT use the unpruned geometric per-frame count
-        (`num_tubelets * tiles * wh`). This is the EVS-pruned-count x
-        audio-offset interaction — the `evs_num_tokens is not None` branch
-        that every other interleave test leaves uncovered.
-
-        Geometry (patch_size=14, downsample_ratio=0.5, T=2):
-          Video 1: video_size [t=4, tiles=1, ih=56, iw=56]
-                   -> num_tubelets = ceil(4/2) = 2, wh = int(4*0.5)*int(4*0.5) = 4
-                   -> UNPRUNED geometric vision rows = 2 * 1 * 4 = 8
-          Video 2: video_size [t=4, tiles=1, ih=56, iw=84]
-                   -> num_tubelets = 2, wh = int(4*0.5)*int(6*0.5) = 6
-                   -> UNPRUNED geometric vision rows = 2 * 1 * 6 = 12
-
-        evs_num_tokens carries one retained count per tubelet across both
-        videos (4 tubelets total): [3, 2, 4, 3]. Split by
-        tubelets_per_video = [2, 2] -> video 1 keeps 3 + 2 = 5 rows,
-        video 2 keeps 4 + 3 = 7 rows. Both are FEWER than the geometric
-        counts (8 and 12), so a regression that split by geometry would
-        either raise (split sizes 8 + 12 = 20 != 12-row pruned tensor) or
-        slice the wrong rows.
+        Covers the `evs_num_tokens is not None` interleave branch (uncovered by
+        every other interleave test): each video's PRUNED vision-row count must
+        be recovered via `torch.split(evs_num_tokens, tubelets_per_video)` + sum,
+        NOT the unpruned geometric count `num_tubelets * tiles * wh`. Here the two
+        videos retain 5 and 7 rows (evs counts [3,2] and [4,3]) vs geometric 8 and
+        12, so a geometry-based split would mis-slice or raise (8+12=20 != 12).
         """
         hidden = 8
         model = self._make_model(patch_size=14, downsample_ratio=0.5, temporal_patch_size=2)
@@ -1033,41 +1011,17 @@ class TestEncodeMultimodalContract:
         assert len(result) == 1
         assert result[0].shape == (8, self.HIDDEN)
 
-    @pytest.mark.parametrize(
-        "item_order, embedding_lengths, expected_order",
-        [
-            # No explicit item order: the per-modality slices follow the
-            # `modality_type` list order (image, video, audio).
-            (None, None, ["image", "video", "audio"]),
-            # Explicit prompt order (audio, video, image): the plan's scatter must
-            # lay out the final tensor in MultimodalPromptOrder rank order, even
-            # though the encoder buckets are visited in a different internal order
-            # (image bucket, then video bucket).
-            (
-                [
-                    {"modality": "audio", "index": 0},
-                    {"modality": "video", "index": 0},
-                    {"modality": "image", "index": 0},
-                ],
-                [4, 3, 2],
-                ["audio", "video", "image"],
-            ),
-        ],
-        ids=["default_modality_type_order", "prompt_order_metadata"],
-    )
-    def test_single_param_mixed_modalities_still_single_tensor(
-        self, item_order, embedding_lengths, expected_order
-    ):
-        """One request param carrying image + video + audio returns a single tensor.
+    def test_single_param_mixed_modalities_still_single_tensor(self):
+        """One mixed param (image + video + audio) scatters in prompt-order rank.
 
-        Each modality in a mixed param yields a single bucket item; the
-        post-Task-11 plan's scatter assembles rows into the per-param slice. With
-        no explicit item order the slices follow `modality_type` order; with a
-        prompt-order metadata list they follow MultimodalPromptOrder rank.
-        (Multi-item-same-modality within one param coalesces into one bucket entry;
-        that interleaving variant is covered by the production-path integration
-        tests.)
+        With explicit prompt order (audio, video, image) the plan's scatter must
+        lay out the final tensor in MultimodalPromptOrder rank order, even though
+        the encoder buckets are visited in a different internal order (image,
+        then video). The default `modality_type`-order layout is already covered
+        by `test_single_concatenated_tensor_for_multiple_multimodal_items` and
+        `test_mixed_modalities_still_single_tensor`.
         """
+        expected_order = ["audio", "video", "image"]
         model = self._make_mock_model()
         # Distinct token counts per modality so the output ordering is a real
         # discriminator: image=2, video=3, audio=4.
@@ -1083,19 +1037,19 @@ class TestEncodeMultimodalContract:
         ]
         model._encode_audio = mock.MagicMock(return_value=[(embs["audio"], [4])])
 
-        multimodal_data = {
+        param = mock.MagicMock()
+        param.multimodal_data = {
             "modality_type": ["image", "video", "audio"],
             "image": {"num_tokens": 2},
             "video": {"num_tokens": 3},
             "audio": {"num_tokens": 4},
+            "multimodal_item_order": [
+                {"modality": "audio", "index": 0},
+                {"modality": "video", "index": 0},
+                {"modality": "image", "index": 0},
+            ],
+            "multimodal_embedding_lengths": [4, 3, 2],
         }
-        if item_order is not None:
-            multimodal_data["multimodal_item_order"] = item_order
-        if embedding_lengths is not None:
-            multimodal_data["multimodal_embedding_lengths"] = embedding_lengths
-
-        param = mock.MagicMock()
-        param.multimodal_data = multimodal_data
         param.multimodal_input = None
         param.multimodal_runtime = None
 

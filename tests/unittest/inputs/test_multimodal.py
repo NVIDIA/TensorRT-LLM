@@ -2,10 +2,9 @@
 # Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Unit tests for `tensorrt_llm.inputs.multimodal`.
 
-Covers the `MultimodalPromptOrder` prompt-order type (constructors,
-validation, and the flatten/flatten_uuids projections plus `resolve`),
-`MultimodalRuntimeData` cumsum math, and the flat-mask producers
-(`maybe_compute_mm_embed_cumsum` and the `_compute_mm_masks` helpers).
+Covers the `MultimodalPromptOrder` prompt-order type, `MultimodalRuntimeData`
+cumsum math, and the flat-mask producers (`maybe_compute_mm_embed_cumsum` and
+the `_compute_mm_masks` helpers).
 """
 
 import pytest
@@ -16,8 +15,6 @@ from tensorrt_llm.inputs.multimodal import (
     MultimodalRuntimeData,
     _compute_mm_masks,
     _find_mm_embedding_lengths_from_masks,
-    _find_mm_token_runs_from_mask,
-    _find_mm_token_start_pos_from_masks,
 )
 from tensorrt_llm.inputs.registry import maybe_compute_mm_embed_cumsum
 
@@ -79,7 +76,6 @@ class TestMultimodalPromptOrder:
         assert list(result) == [("image", 0), ("video", 2)]
 
     def test_from_raw_entries_layout_item_types_form(self):
-        # int codes via layout_metadata.item_types decode to (modality, index)
         result = MultimodalPromptOrder.from_raw_entries(
             [0, 1, 2], source="layout_metadata.item_types"
         )
@@ -233,6 +229,7 @@ def test_mixed_image_video_audio_masks_runs_embedding_lengths():
     video_end = 202
     audio_start = 301
     audio_end = 302
+    # 10 img img 11 | vid_start vid vid vid_end 12 | aud_start aud aud_end 13
     input_ids = torch.tensor(
         [
             10,
@@ -252,33 +249,23 @@ def test_mixed_image_video_audio_masks_runs_embedding_lengths():
     )
     num_mm_tokens = [2, 4, 3]
 
-    mm_mask, embed_mask, special_mask = _compute_mm_masks(
+    mm_mask, embed_mask, _ = _compute_mm_masks(
         input_ids,
         vocab_size=None,
         mm_token_ids=torch.tensor([image_token, video_token, audio_token]),
         mm_special_token_ids=torch.tensor([video_start, video_end, audio_start, audio_end]),
     )
 
-    start_positions, special_offsets = _find_mm_token_start_pos_from_masks(
-        mm_mask,
-        special_mask,
-        num_mm_tokens,
-    )
-    item_run_offsets, run_positions, run_lengths = _find_mm_token_runs_from_mask(
-        mm_mask,
-        num_mm_tokens,
-    )
+    # Sole coverage of `_find_mm_embedding_lengths_from_masks` on a mixed
+    # request: embed-only tokens per item (specials excluded) are [2, 2, 1].
+    # The start-position / run helpers are covered in test_multimodal_runtime.py
+    # and test_llm_kv_cache_events.py.
     embedding_lengths = _find_mm_embedding_lengths_from_masks(
         mm_mask,
         embed_mask,
         num_mm_tokens,
     )
 
-    assert start_positions == [1, 4, 9]
-    assert special_offsets == [2, 5, 6, 8]
-    assert item_run_offsets == [0, 1, 2, 3]
-    assert run_positions == [1, 4, 9]
-    assert run_lengths == num_mm_tokens
     assert embedding_lengths == [2, 2, 1]
 
 

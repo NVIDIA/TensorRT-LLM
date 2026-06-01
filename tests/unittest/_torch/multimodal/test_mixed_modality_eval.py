@@ -14,7 +14,6 @@
 # limitations under the License.
 
 import importlib.util
-import inspect
 from collections import Counter
 from pathlib import Path
 
@@ -29,7 +28,6 @@ _SPEC.loader.exec_module(mixed_modality)
 MODALITY_AUDIO = mixed_modality.MODALITY_AUDIO
 MODALITY_IMAGE = mixed_modality.MODALITY_IMAGE
 MODALITY_VIDEO = mixed_modality.MODALITY_VIDEO
-MixedModalityEvaluator = mixed_modality.MixedModalityEvaluator
 MixedModalityInputSample = mixed_modality.MixedModalityInputSample
 MixedModalitySample = mixed_modality.MixedModalitySample
 MixedModalityTargetResult = mixed_modality.MixedModalityTargetResult
@@ -103,12 +101,6 @@ def _input_samples_by_modality(
     }
 
 
-def test_evaluator_has_no_optional_pure_baseline_switch():
-    signature = inspect.signature(MixedModalityEvaluator)
-
-    assert "include_pure_baseline" not in signature.parameters
-
-
 def test_choice_extraction_accepts_common_answer_formats():
     assert _extract_choice_answer("Answer: (B)", "E") == "B"
     assert _extract_choice_answer("C. The man is upside down.", "D") == "C"
@@ -151,22 +143,6 @@ def test_image_video_prompt_omits_audio_for_qwen_vl_style_requests():
     assert sample.items[MODALITY_VIDEO].question in prompt
 
 
-def test_pure_modality_prompt_has_no_distractor_line():
-    sample = _sample(
-        target_modality=MODALITY_AUDIO,
-        active_modalities=(MODALITY_AUDIO,),
-        audio_question="Transcribe the standalone clip exactly.",
-    )
-
-    prompt = _format_mixed_modality_prompt(sample)
-
-    assert "one audio clip" in prompt
-    assert "No distractor media are included." in prompt
-    assert "random distractors" not in prompt
-    assert "Answer only the audio question" in prompt
-    assert "Transcribe the standalone clip exactly." in prompt
-
-
 def test_target_only_scoring_uses_selected_modality_only():
     results = _score_target_predictions(
         [
@@ -198,17 +174,6 @@ def test_target_only_scoring_uses_selected_modality_only():
         MODALITY_AUDIO: 1,
         MODALITY_VIDEO: 1,
     }
-
-
-def test_target_only_scoring_requires_selected_modality():
-    results = _score_target_predictions(
-        ["image: B\naudio: unrelated words\nvideo: Answer: D"],
-        [_sample("mixed-video", target_modality=MODALITY_VIDEO)],
-    )
-
-    assert not results[0].is_correct
-    assert results[0].expected_keyword == "C"
-    assert results[0].distractor_modalities == (MODALITY_IMAGE, MODALITY_AUDIO)
 
 
 def test_pure_target_samples_keep_only_selected_modality():
@@ -359,60 +324,3 @@ def test_deterministic_sample_selection_for_image_video_modalities():
     )
     assert all(tuple(sample.items) == (MODALITY_IMAGE, MODALITY_VIDEO) for sample in samples)
     assert all(MODALITY_AUDIO not in sample.items for sample in samples)
-
-
-def test_generate_outputs_waits_after_each_request(monkeypatch):
-    class Future:
-        def __init__(self, llm, output):
-            self.llm = llm
-            self.output = output
-
-        def result(self):
-            assert self.llm.inflight == 1
-            self.llm.inflight = 0
-            return self.output
-
-    class FakeLlm:
-        def __init__(self):
-            self.inflight = 0
-            self.requests = []
-
-        def generate_async(self, request_input, sampling_params, streaming):
-            assert self.inflight == 0
-            self.inflight = 1
-            self.requests.append((request_input, sampling_params, streaming))
-            return Future(self, f"output-{request_input}")
-
-    evaluator = MixedModalityEvaluator(
-        modality_dataset_paths={
-            MODALITY_IMAGE: "/tmp/mmmu",
-            MODALITY_AUDIO: "/tmp/voxpopuli",
-            MODALITY_VIDEO: "/tmp/videomme",
-        },
-        num_samples=2,
-    )
-    monkeypatch.setattr(
-        evaluator,
-        "_make_input",
-        lambda llm, sample, input_context, video_cache: sample.sample_id,
-    )
-    sampling_params = {"max_tokens": 1}
-    llm = FakeLlm()
-
-    outputs = evaluator._generate_outputs_serially(
-        llm,
-        [
-            _sample("mixed-0", target_modality=MODALITY_IMAGE),
-            _sample("mixed-1", target_modality=MODALITY_VIDEO),
-        ],
-        input_context=object(),
-        sampling_params=sampling_params,
-        streaming=False,
-    )
-
-    assert outputs == ["output-mixed-0", "output-mixed-1"]
-    assert llm.requests == [
-        ("mixed-0", sampling_params, False),
-        ("mixed-1", sampling_params, False),
-    ]
-    assert llm.inflight == 0

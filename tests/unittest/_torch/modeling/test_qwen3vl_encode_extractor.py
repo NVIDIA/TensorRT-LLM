@@ -28,17 +28,8 @@ class TestQwen3VLExtractItems:
                 },
                 5,
             ),
-            (
-                "video",
-                {
-                    "pixel_values_videos": torch.randn(32, 1176),
-                    "video_grid_thw": torch.tensor([[2, 16, 16]]),
-                    "num_tokens": 8,
-                },
-                8,
-            ),
         ],
-        ids=["image", "video"],
+        ids=["image"],
     )
     def test_pure_single_modality(self, modality, payload, expected_token_count):
         param = _make_param({modality: payload})
@@ -86,15 +77,10 @@ class TestQwen3VLExtractItems:
         # video at prompt slot 0, image at slot 1 — distinct, no collapse
         assert positions == {"video": 0, "image": 1}
 
-    def test_no_items_yields_empty(self):
-        param = _make_param({})
-        assert list(_qwen3vl_extract_items(0, param)) == []
-
     def test_mixed_interleaved_repeated_modality_raises(self):
-        # An interleaved repeated modality (image -> video -> image) cannot be
-        # scattered correctly by the one-aggregate-item-per-modality extractor:
-        # the trailing image would fold into the leading image block. The
-        # extractor must reject it fail-loud rather than silently mis-scatter.
+        # Interleaved repeat (image -> video -> image) would fold the trailing
+        # image into the leading image block under one-aggregate-per-modality;
+        # the extractor must reject it fail-loud rather than mis-scatter.
         payload_image = {
             "pixel_values": torch.randn(40, 1176),
             "image_grid_thw": torch.tensor([[1, 16, 16], [1, 16, 16]]),

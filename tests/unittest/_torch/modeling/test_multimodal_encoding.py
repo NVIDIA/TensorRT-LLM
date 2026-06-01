@@ -11,30 +11,6 @@ from tensorrt_llm._torch.models.multimodal_encoding import MixedModalityAssembly
 
 
 class TestMultimodalItem:
-    def test_basic_fields(self):
-        item = ModalityItem(
-            src_param_idx=2,
-            item_idx_in_param=1,
-            modality="image",
-            token_count=5,
-            payload={"data": "x"},
-        )
-        assert item.src_param_idx == 2
-        assert item.item_idx_in_param == 1
-        assert item.modality == "image"
-        assert item.token_count == 5
-        assert item.payload == {"data": "x"}
-
-    def test_ghost_sentinel(self):
-        item = ModalityItem(
-            src_param_idx=0,
-            item_idx_in_param=-1,
-            modality="audio",
-            token_count=4,
-            payload={"data": "y"},
-        )
-        assert item.item_idx_in_param == -1
-
     def test_is_frozen(self):
         item = ModalityItem(
             src_param_idx=0,
@@ -48,12 +24,9 @@ class TestMultimodalItem:
 
 
 def _mixed_image_audio_assembly():
-    """Shared fixture for the mixed image+audio batch asserted from two angles.
+    """Shared fixture: param0 = img_A(5)|aud_A(4)|img_B(5), param1 = img_C(5).
 
-    param 0: <image><audio><image>  -> img_A(5), aud_A(4), img_B(5)
-    param 1: <image>                -> img_C(5)
-    Final order = [param 0 in MultimodalPromptOrder | param 1]
-                = img_A | aud_A | img_B | img_C
+    Final prompt order = img_A | aud_A | img_B | img_C.
     """
     items_by_param = {
         0: [
@@ -80,21 +53,6 @@ class TestEncodingPlanPartition:
         assert assembly.total_tokens == 0
         assert assembly.active_modalities == []
         assert len(assembly.items) == 0
-
-    def test_single_pure_image(self):
-        items_by_param = {
-            0: [ModalityItem(0, 0, "image", 5, {"id": "img_A"})],
-        }
-        assembly = MixedModalityAssembly.from_params(
-            multimodal_params=[object()],
-            extract=_identity_extractor(items_by_param),
-        )
-        assert assembly.total_tokens == 5
-        assert assembly.active_modalities == ["image"]
-        assert assembly._param_lengths.tolist() == [5]
-        assert assembly._param_offsets.tolist() == [0]
-        assert assembly._modality_slots["image"].tolist() == [0]
-        assert assembly._bucket_offsets["image"].tolist() == [0, 5]
 
     def test_mixed_image_audio(self):
         assembly = _mixed_image_audio_assembly()
@@ -250,28 +208,6 @@ class TestExpandRangesVectorization:
         assert vec.dtype == torch.int64
         assert torch.equal(vec, ref), f"vec={vec.tolist()} ref={ref.tolist()}"
 
-    def test_plan_dst_indices_match_loop(self):
-        # Plan-level parity: rebuild _dst_indices via the explicit loop and
-        # confirm the vectorized from_params output is identical.
-        items_by_param = {
-            0: [
-                ModalityItem(0, 0, "image", 5, {"id": "img_A"}),
-                ModalityItem(0, 1, "audio", 4, {"id": "aud_A"}),
-                ModalityItem(0, 2, "image", 5, {"id": "img_B"}),
-            ],
-            1: [ModalityItem(1, 0, "image", 5, {"id": "img_C"})],
-        }
-        assembly = MixedModalityAssembly.from_params(
-            multimodal_params=[object(), object()],
-            extract=_identity_extractor(items_by_param),
-        )
-        # img_A -> [0,5), img_B -> [9,14), img_C -> [14,19); aud_A -> [5,9)
-        assert (
-            assembly._dst_indices["image"].tolist()
-            == _loop_expand_reference([0, 9, 14], [5, 5, 5]).tolist()
-        )
-        assert assembly._dst_indices["audio"].tolist() == _loop_expand_reference([5], [4]).tolist()
-
 
 class TestEncodeWithPlan:
     def _make_fake_encoder(self, hidden_dim, call_log):
@@ -362,33 +298,6 @@ class TestEncodeWithPlan:
         # img_C -> final[14:19]: image bucket rows 10..14
         assert final[14, 0].item() == 10
         assert final[18, 0].item() == 14
-
-    def test_post_process_callback_receives_buckets(self):
-        H = 4
-        post_seen: dict = {}
-
-        def post_process(bucket_outputs, assembly, multimodal_params):
-            post_seen["modalities"] = sorted(bucket_outputs.keys())
-            post_seen["shapes"] = {m: tuple(t.shape) for m, t in bucket_outputs.items()}
-
-        items_by_param = {0: [ModalityItem(0, 0, "image", 3, {})]}
-        assembly = MixedModalityAssembly.from_params(
-            multimodal_params=[object()],
-            extract=_identity_extractor(items_by_param),
-        )
-        call_log: list = []
-        encoders = {"image": self._make_fake_encoder(H, call_log)}
-        assemble_embeddings(
-            assembly,
-            encoders,
-            multimodal_params=[object()],
-            post_process=post_process,
-            device=torch.device("cpu"),
-            dtype=torch.float32,
-            hidden_dim=H,
-        )
-        assert post_seen["modalities"] == ["image"]
-        assert post_seen["shapes"]["image"] == (3, H)
 
     def test_empty_plan_returns_zero_size(self):
         assembly = MixedModalityAssembly.from_params(

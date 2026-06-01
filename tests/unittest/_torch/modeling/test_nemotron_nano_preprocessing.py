@@ -936,29 +936,27 @@ class TestMergeEvsMMEmbeds:
         assert (result[: len(expected)] == expected).all()
 
     # Axis `passthrough_modality`: a non-video entry (image or audio) passes
-    # through verbatim while the video entry gets its placeholders replaced. The
-    # video EVS stream, its per-tubelet token counts, the passthrough param, the
-    # paired `num_tokens_in_videos` slot, and the expected output are all data.
+    # through verbatim while the video entry gets its placeholders replaced.
     @pytest.mark.parametrize(
         "passthrough_modality, video_placeholders, video_token_counts, "
         "passthrough_evs, passthrough_num_tokens, expected_tail",
         [
             pytest.param(
                 "image",
-                2,  # two video placeholders
+                2,
                 [4, 2],
                 [10, 11],
-                [10, 11],  # image slot carries the image EVS ids
-                [10, 11],  # image passthrough
+                [10, 11],
+                [10, 11],
                 id="image_passthrough",
             ),
             pytest.param(
                 "audio",
-                1,  # one video placeholder
+                1,
                 [2],
                 [_SOUND_START, _SOUND_CTX_ID, _SOUND_CTX_ID, _SOUND_END],
                 None,  # audio slot has no video token-count tensor
-                [_SOUND_START, _SOUND_CTX_ID, _SOUND_CTX_ID, _SOUND_END],  # audio passthrough
+                [_SOUND_START, _SOUND_CTX_ID, _SOUND_CTX_ID, _SOUND_END],
                 id="audio_passthrough",
             ),
         ],
@@ -1787,40 +1785,10 @@ class TestExpandPromptTokenIdsForMM:
         assert mm_data_updates is None
         assert result == prompt
 
-    def test_mixed_image_video_audio_expands_in_prompt_order(self):
-        proc = _make_fast_path_audio_processor(video_target_num_patches=None)
-        proc._add_video_prefix = False
-        proc.video_pruning_rate = 0
-        proc.video_temporal_patch_size = 1
-        img_ctx = proc.img_context_token_id
-        vid_ctx = proc.video_context_token_id
-        snd_ctx = proc._sound_context_token_id
-        prompt = [1, img_ctx, 2, vid_ctx, 3, snd_ctx, 4]
-        frames = [Image.new("RGB", (512, 512))]
-        mm_data = {
-            "image": [object()],
-            "video": [SimpleNamespace(frames=frames, metadata=None)],
-            "audio": [object()],
-        }
-
-        result, mm_data_updates = proc.expand_prompt_token_ids_for_mm(
-            prompt,
-            [5, 258, 5],
-            mm_data=mm_data,
-        )
-
-        image_block = [500] + [img_ctx] * 3 + [501]
-        video_block = list(range(9)) + [500] + [img_ctx] * 256 + [501]
-        audio_block = [200] + [snd_ctx] * 3 + [201]
-        assert mm_data_updates is None
-        assert result == [1] + image_block + [2] + video_block + [3] + audio_block + [4]
-
-    # Axis `modalities`: the ordered modality sequence of the mixed request. The
-    # prompt, mm_data counts, per-modality prepared-data mocks, expected result
-    # blocks, item-order metadata, and modality_type are all DERIVED from this
-    # sequence in the body (no per-row branching). `audio` requires the
-    # audio-enabled processor factory; the all-image-and-video case uses the
-    # base factory and repeats an image.
+    # Axis `modalities`: the ordered modality sequence of the mixed request;
+    # the prompt, mm_data, prepared-data mocks, expected blocks, and metadata
+    # are all derived from it in the body. `audio` needs the audio-enabled
+    # factory; the image-video-image case uses the base factory.
     @pytest.mark.parametrize(
         "make_proc, modalities",
         [
@@ -2290,23 +2258,12 @@ class TestFastPathVideoWithExtractedAudio:
 # disable the leak check as the existing audio tests do (see TestAudioInputProcessor).
 @pytest.mark.threadleak(enabled=False)
 class TestVideoWithEmbeddedAudioProducesPlanItems:
-    """End-to-end-light guard for the audio-in-video plan path.
-
-    The e2e accuracy harness mixes an image with a video whose embedded audio
-    track is extracted (`load_video(..., extract_audio=True)` yields a
-    `VideoData` carrying an `AudioData`). This guard wires the REAL Nano input
-    processor (heavy deps mocked, but the audio extractor real) to assert two
-    contracts the heavyweight gate depends on, without needing model weights or
-    a GPU:
-
-    1. Feeding a video-with-audio through `_prepare_video_modality_data`
-       populates ``multimodal_data["video"]["audio"]`` with real audio encoder
-       features (`input_audio_features`, `feature_attention_mask`, `has_audio`).
-       This is the structure `_nano_extract_items` / `_nano_post_encode` consume.
-    2. `_nano_extract_items` over a param carrying that production-shaped video
-       payload yields the real video item PLUS a trailing ghost audio item
-       (``item_idx_in_param == -1``), with the video's encoder rows and the ghost
-       row count derived from production fields (no test-only ``num_tokens``).
+    """Light guard that the REAL Nano processor produces the audio-in-video plan
+    payload the e2e accuracy gate depends on, without model weights or a GPU:
+    `_prepare_video_modality_data` attaches real audio encoder features under
+    the video payload, and `_nano_extract_items` runs over that production-shaped
+    payload (heavy deps mocked, audio extractor real). The detailed ghost-item
+    field contract lives in test_nano_encode_extractor.py.
     """
 
     @staticmethod
@@ -2364,19 +2321,20 @@ class TestVideoWithEmbeddedAudioProducesPlanItems:
         # No phantom audio payload when the video carries no track.
         assert "audio" not in modality_data
 
-    def test_extractor_yields_video_plus_ghost_from_production_payload(self):
+    def test_extractor_runs_on_production_payload(self):
+        # Smoke that `_nano_extract_items` produces a sane video + ghost-audio
+        # split when fed a payload built by the REAL `_prepare_video_modality_data`
+        # (the detailed ghost-item field contract is pinned, on hand-built
+        # payloads, in test_nano_encode_extractor.py).
         proc = self._make_proc()
         video = self._video_with_audio()
 
         modality_data = proc._prepare_video_modality_data([video])
         audio_payload = modality_data["audio"]
 
-        # Production-shaped pure-video param: no per-payload ``num_tokens``.
-        # At encode time the model resolves the audio rows from the sub-sampled
-        # ``feature_attention_mask`` (see ``_audio_payload_total_rows``). Here we
-        # only need a positive, self-consistent ghost row count to drive the
-        # extractor's vision/audio split arithmetic, so derive one from the
-        # mask's valid lengths and the extractor's sub-sampling factor.
+        # Derive a positive ghost row count from the real mask's valid lengths
+        # and the extractor's sub-sampling factor; pick a vision row count and
+        # make total_embeds the POST-interleave (vision + audio) total.
         mask = audio_payload["feature_attention_mask"]
         valid_lengths = mask.sum(dim=-1).to(torch.int64)
         subsample = int(proc._audio_extractor.config.subsampling_factor)
@@ -2386,10 +2344,6 @@ class TestVideoWithEmbeddedAudioProducesPlanItems:
 
         audio_rows = audio_rows_fn(audio_payload)
         assert audio_rows > 0
-
-        # Pick a vision row count and make total_embeds_in_request the
-        # POST-interleave total (vision + audio), as the production prompt
-        # placeholder budget does (get_num_tokens_per_video(video_audio=...)).
         vision_rows = 6
         total_embeds = vision_rows + audio_rows
         runtime = MultimodalRuntimeData(
@@ -2405,16 +2359,6 @@ class TestVideoWithEmbeddedAudioProducesPlanItems:
 
         items = list(_nano_extract_items(0, param, audio_rows_fn=audio_rows_fn))
 
-        assert len(items) == 2, "expected a video item + a ghost audio item"
-        video_item, ghost = items
-        assert video_item.modality == "video"
-        assert video_item.item_idx_in_param == 0
-        # Scatter destination spans vision + interleaved audio (post-interleave).
-        assert video_item.token_count == total_embeds
-        # Vision encoder emits only the vision rows.
-        assert video_item.encoder_rows == vision_rows
-        # Trailing ghost audio item with the production-derived row count.
-        assert ghost.modality == "audio"
-        assert ghost.item_idx_in_param == -1
-        assert ghost.token_count == audio_rows
-        assert ghost.metadata.get("paired_video_item_idx") == 0
+        assert [it.modality for it in items] == ["video", "audio"]
+        assert items[0].token_count == total_embeds
+        assert items[1].token_count == audio_rows
