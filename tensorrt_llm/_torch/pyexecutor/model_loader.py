@@ -865,17 +865,29 @@ class ModelLoader:
                     getattr(config.pretrained_config,
                             sub_config).num_hidden_layers = num_layers_override
 
-        # For vanilla MTP with use_mtp_vanilla=True, expand the model's MTP layer
-        # count to match the user-requested max_draft_len. Extra MTP layer
-        # instances will share checkpoint weights via mod-indexing in the
-        # per-model weight loader (e.g., modeling_deepseekv3.py).
-        # The original checkpoint count is preserved on the pretrained_config
-        # as `_ckpt_num_nextn_predict_layers` for downstream mod-indexing.
+        # For vanilla MTP with use_mtp_vanilla=True on DeepSeek-family models,
+        # expand the model's MTP layer count to match the user-requested
+        # max_draft_len. Extra MTP layer instances will share checkpoint
+        # weights via mod-indexing in DeepseekV3WeightLoader. The original
+        # checkpoint count is preserved on the pretrained_config as
+        # `_ckpt_num_nextn_predict_layers` for downstream mod-indexing.
+        #
+        # Scoped to DeepSeek model_types because they're the only ones whose
+        # weight loader handles the shared-weights expansion correctly. For
+        # other MTP-capable models, vanilla with max_draft_len > ckpt count
+        # falls through to the natural min(max_draft_len, ckpt_nextn) clamp
+        # in MTPForCausalLM, so the user effectively gets ckpt_nextn draft
+        # tokens.
+        _DEEPSEEK_MTP_MODEL_TYPES = {
+            "deepseek_v3", "deepseek_v32", "glm_moe_dsa"
+        }
         from tensorrt_llm.llmapi.llm_args import MTPDecodingConfig
         spec_config = self.spec_config
         if (isinstance(spec_config, MTPDecodingConfig)
                 and spec_config.use_mtp_vanilla
                 and spec_config.max_draft_len is not None
+                and getattr(config.pretrained_config, 'model_type', None)
+                in _DEEPSEEK_MTP_MODEL_TYPES
                 and getattr(config.pretrained_config,
                             'num_nextn_predict_layers', None)):
             ckpt_nextn = config.pretrained_config.num_nextn_predict_layers
