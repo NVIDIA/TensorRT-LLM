@@ -255,6 +255,29 @@ class TestNanoExtractorProductionSchema:
         positions = {it.modality: it.item_idx_in_param for it in items}
         assert positions == {"image": 0, "audio": 1}
 
+    def test_mixed_interleaved_repeated_modality_raises(self):
+        # An interleaved repeated modality (image -> audio -> image) cannot be
+        # scattered correctly by the one-aggregate-item-per-modality extractor:
+        # the trailing image would fold into the leading image block. The
+        # extractor must reject it fail-loud rather than silently mis-scatter.
+        # Contrast with a PURE multi-image request (single modality), which is
+        # supported as one contiguous block.
+        param = _make_param(
+            {
+                "image": {"pixel_values": "fake"},
+                "audio": {"input_features": "fake"},
+                "modality_type": ["image", "audio"],
+                "multimodal_item_order": [
+                    {"modality": "image", "index": 0},
+                    {"modality": "audio", "index": 0},
+                    {"modality": "image", "index": 1},
+                ],
+                "multimodal_embedding_lengths": [5, 4, 5],
+            }
+        )
+        with pytest.raises(ValueError, match="interleaved repeated modality"):
+            list(_nano_extract_items(0, param))
+
     def test_num_tokens_overrides_production_fields(self):
         # When both are present, ``num_tokens`` wins (test convention,
         # cheapest lookup).

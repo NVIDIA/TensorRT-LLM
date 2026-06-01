@@ -1006,7 +1006,7 @@ class TestEncodeMultimodalContract:
         # not the original mock params — verify the call shape rather than identity.
         (vision_call_args,) = model.vision_encoder.call_args.args
         assert len(vision_call_args) == 2
-        for view, original in zip(vision_call_args, params):
+        for view, original in zip(vision_call_args, params, strict=True):
             assert view.multimodal_data["modality_type"] == "image"
             assert view.multimodal_data["image"] is original.multimodal_data["image"]
         assert len(result) == 1

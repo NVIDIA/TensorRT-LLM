@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+from typing import ClassVar
+
 import torch
 
 from tensorrt_llm.inputs.multimodal import MultimodalPromptOrder, find_mm_token_lengths
@@ -56,7 +58,7 @@ class _FakeMixedProcessor:
 
     # Modality membership for both placeholder (pre-expansion) and feature
     # (post-expansion) token ids, so order parsing is expansion-tolerant.
-    _MODALITY_TOKEN_IDS = {
+    _MODALITY_TOKEN_IDS: ClassVar[dict[str, set[int]]] = {
         "image": {100, 101},
         "video": {200, 201},
         "audio": {300, 301},

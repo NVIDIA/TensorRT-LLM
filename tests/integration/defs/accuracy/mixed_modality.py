@@ -54,6 +54,12 @@ except ImportError:
 ANNOTATIONS_FILE = "annotations.jsonl"
 AUDIO_WER_THRESHOLD = 50.0
 DEFAULT_NUM_FRAMES = 8
+
+# Expected failures when probing a `datasets` source for configs/splits that may
+# not exist (absent config, missing split, malformed schema). Narrow the
+# dataset-discovery handlers to these so genuinely unexpected failures (network
+# errors, OOM, etc.) surface instead of being silently swallowed.
+_DATASET_PROBE_ERRORS = (FileNotFoundError, ValueError, KeyError)
 MODALITY_IMAGE = "image"
 MODALITY_AUDIO = "audio"
 MODALITY_VIDEO = "video"
@@ -579,14 +585,14 @@ def _iter_mmmu_rows(dataset_path: Path) -> Iterable[tuple[dict[str, Any], str]]:
     config_names: list[str] = []
     try:
         config_names = list(get_dataset_config_names(str(dataset_path)))
-    except Exception as exc:
+    except _DATASET_PROBE_ERRORS as exc:
         logger.info(f"Could not enumerate MMMU configs from {dataset_path}: {exc}")
 
     if not config_names:
         for split in ("validation", "val", "test"):
             try:
                 dataset = load_dataset(str(dataset_path), split=split)
-            except Exception:
+            except _DATASET_PROBE_ERRORS:
                 continue
             for row in dataset:
                 yield dict(row), str(row.get("subject", "unknown"))
@@ -596,7 +602,7 @@ def _iter_mmmu_rows(dataset_path: Path) -> Iterable[tuple[dict[str, Any], str]]:
         for split in ("validation", "val", "test"):
             try:
                 dataset = load_dataset(str(dataset_path), config_name, split=split)
-            except Exception:
+            except _DATASET_PROBE_ERRORS:
                 continue
             for row in dataset:
                 yield dict(row), config_name
@@ -895,42 +901,20 @@ def _target_question(sample: MixedModalitySample, target_modality: str) -> str:
 
 
 def _audio_wer(prediction: str, reference: str) -> float:
-    """Compute word error rate percentage for audio transcript scoring."""
-    prediction_words = _normalize_scoring_text(prediction).split()
-    reference_words = _normalize_scoring_text(reference).split()
+    """Compute word error rate percentage for audio transcript scoring.
+
+    Delegates to the shared ASR normalizer and edit-distance helpers in
+    `tensorrt_llm.evaluate.audio_asr` so mixed-audio scoring is consistent with
+    the pure-audio evaluator (same tag/bracket/filler stripping and WER contract).
+    """
+    from tensorrt_llm.evaluate.audio_asr import _levenshtein_distance, _normalize_asr_text
+
+    prediction_words = _normalize_asr_text(prediction).split()
+    reference_words = _normalize_asr_text(reference).split()
     if not reference_words:
         return 0.0 if not prediction_words else 100.0
     edits = _levenshtein_distance(reference_words, prediction_words)
     return 100.0 * edits / len(reference_words)
-
-
-def _normalize_scoring_text(text: str) -> str:
-    """Normalize text before WER scoring."""
-    text = text.casefold()
-    text = re.sub(r"<\|.*?\|>", " ", text)
-    text = re.sub(r"[^\w\s']", " ", text)
-    return re.sub(r"\s+", " ", text).strip()
-
-
-def _levenshtein_distance(reference: list[str], hypothesis: list[str]) -> int:
-    """Compute edit distance between token sequences."""
-    if len(reference) < len(hypothesis):
-        reference, hypothesis = hypothesis, reference
-
-    previous_row = list(range(len(hypothesis) + 1))
-    for row_idx, reference_token in enumerate(reference, start=1):
-        current_row = [row_idx]
-        for col_idx, hypothesis_token in enumerate(hypothesis, start=1):
-            substitution_cost = 0 if reference_token == hypothesis_token else 1
-            current_row.append(
-                min(
-                    previous_row[col_idx] + 1,
-                    current_row[col_idx - 1] + 1,
-                    previous_row[col_idx - 1] + substitution_cost,
-                )
-            )
-        previous_row = current_row
-    return previous_row[-1]
 
 
 def _score_target_predictions(

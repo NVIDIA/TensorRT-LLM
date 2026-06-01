@@ -122,7 +122,13 @@ class MixedModalityAssembly:
                 flat_idx = len(items)
                 items.append(item)
                 modality_slots.setdefault(item.modality, []).append(flat_idx)
-                bucket_token_counts.setdefault(item.modality, []).append(item.token_count)
+                # `_bucket_offsets` indexes the RAW (pre-postprocess) encoder
+                # output, which has `encoder_rows` rows per item — not the
+                # post-process `token_count` (the two differ for Nano video
+                # items whose destination spans interleaved audio rows). Build
+                # the bucket offsets from `encoder_rows` so any consumer slicing
+                # the encoder bucket via `_bucket_offsets` stays aligned.
+                bucket_token_counts.setdefault(item.modality, []).append(item.encoder_rows)
                 if item.item_idx_in_param != -1:
                     param_lengths[param_idx] += item.token_count
                     per_param_non_ghost[param_idx].append(flat_idx)
@@ -151,7 +157,7 @@ class MixedModalityAssembly:
             ghost = [fi for fi in slot_idxs if items[fi].item_idx_in_param == -1]
             partitioned = nonghost + ghost  # stable within each group
             modality_slots[modality] = partitioned
-            bucket_token_counts[modality] = [items[fi].token_count for fi in partitioned]
+            bucket_token_counts[modality] = [items[fi].encoder_rows for fi in partitioned]
             # Fail-loud guard: catch any future code path that re-introduces a
             # ghost-before-non-ghost ordering instead of silently mis-scattering.
             seen_ghost = False

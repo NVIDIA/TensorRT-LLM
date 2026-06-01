@@ -42,7 +42,7 @@ class TestMultimodalItem:
             token_count=1,
             payload={},
         )
-        with pytest.raises(Exception):  # FrozenInstanceError subclass of AttributeError
+        with pytest.raises(AttributeError):  # FrozenInstanceError from `@dataclass`(frozen=True)
             item.src_param_idx = 99
 
 
@@ -118,6 +118,30 @@ class TestEncodingPlanPartition:
         assert assembly._param_lengths.tolist() == [5]
         assert assembly._modality_slots["audio"].tolist() == [1]
         assert assembly._bucket_offsets["audio"].tolist() == [0, 4]
+
+    def test_bucket_offsets_follow_encoder_rows_not_token_count(self):
+        # A Nano video item whose `token_count` (post-interleave scatter
+        # destination) exceeds its `encoder_rows` (vision-only encoder output):
+        # the video bucket holds only `encoder_rows` rows, so `_bucket_offsets`
+        # — which indexes the raw encoder bucket — must follow `encoder_rows`,
+        # not `token_count`. `_param_lengths` (destination space) still uses
+        # `token_count`.
+        items_by_param = {
+            0: [
+                # video: encoder emits 6 vision rows; destination spans 10
+                # (6 vision + 4 interleaved audio).
+                ModalityItem(0, 0, "video", 10, {"id": "vid_A"}, encoder_token_count=6),
+                ModalityItem(0, -1, "audio", 4, {"id": "vid_A.audio"}),
+            ],
+        }
+        assembly = MixedModalityAssembly.from_params(
+            multimodal_params=[object()],
+            extract=_identity_extractor(items_by_param),
+        )
+        # Encoder bucket has 6 video rows -> offsets [0, 6], NOT [0, 10].
+        assert assembly._bucket_offsets["video"].tolist() == [0, 6]
+        # Destination length still reflects the post-interleave token_count.
+        assert assembly._param_lengths.tolist() == [10]
 
 
 class TestEncodingPlanDstIndices:
@@ -208,7 +232,7 @@ from tensorrt_llm._torch.models.multimodal_encoding import (  # noqa: E402
 def _loop_expand_reference(starts, lengths):
     """Reference: the original per-token ``rows.extend(range(...))`` loop."""
     rows = []
-    for s, length in zip(starts, lengths):
+    for s, length in zip(starts, lengths, strict=True):
         rows.extend(range(s, s + length))
     return torch.tensor(rows, dtype=torch.int64)
 

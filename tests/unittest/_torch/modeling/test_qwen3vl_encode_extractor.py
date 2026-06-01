@@ -6,6 +6,7 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock
 
+import pytest
 import torch
 
 from tensorrt_llm._torch.models.modeling_qwen3vl import Qwen3VisionModelBase, _qwen3vl_extract_items
@@ -75,6 +76,36 @@ class TestQwen3VLExtractItems:
     def test_no_items_yields_empty(self):
         param = _make_param({})
         assert list(_qwen3vl_extract_items(0, param)) == []
+
+    def test_mixed_interleaved_repeated_modality_raises(self):
+        # An interleaved repeated modality (image -> video -> image) cannot be
+        # scattered correctly by the one-aggregate-item-per-modality extractor:
+        # the trailing image would fold into the leading image block. The
+        # extractor must reject it fail-loud rather than silently mis-scatter.
+        payload_image = {
+            "pixel_values": torch.randn(40, 1176),
+            "image_grid_thw": torch.tensor([[1, 16, 16], [1, 16, 16]]),
+            "num_tokens": 10,
+        }
+        payload_video = {
+            "pixel_values_videos": torch.randn(32, 1176),
+            "video_grid_thw": torch.tensor([[2, 16, 16]]),
+            "num_tokens": 8,
+        }
+        param = _make_param(
+            {
+                "image": payload_image,
+                "video": payload_video,
+                "multimodal_item_order": [
+                    {"modality": "image", "index": 0},
+                    {"modality": "video", "index": 0},
+                    {"modality": "image", "index": 1},
+                ],
+                "multimodal_embedding_lengths": [5, 8, 5],
+            }
+        )
+        with pytest.raises(ValueError, match="interleaved repeated modality"):
+            list(_qwen3vl_extract_items(0, param))
 
 
 class TestQwen3VLExtractItemsDictFormOrder:

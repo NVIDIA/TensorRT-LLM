@@ -129,6 +129,27 @@ def _qwen3vl_extract_items(param_idx: int, param, spatial_merge_size: Optional[i
         item_order = MultimodalPromptOrder((m, 0) for m in modality_types)
     order_pos = {pair: pos for pos, pair in enumerate(item_order)}
 
+    # This extractor yields ONE aggregate item per modality at its `(modality, 0)`
+    # slot, so it can only represent a mixed request whose same-modality items are
+    # contiguous (one logical block per modality). A mixed prompt that INTERLEAVES
+    # a repeated modality (e.g. `image -> video -> image`, where item_order holds
+    # `(image, 0), (video, 0), (image, 1)`) cannot be scattered correctly here:
+    # the trailing image's rows would be folded into the leading image block
+    # instead of landing after the video. Reject it fail-loud rather than silently
+    # mis-scatter. Pure single-modality multi-item requests (one modality present)
+    # remain supported — they are a single contiguous block.
+    if len(modality_types) > 1:
+        modality_counts: Dict[str, int] = {}
+        for modality, _ in item_order:
+            modality_counts[modality] = modality_counts.get(modality, 0) + 1
+        repeated = sorted(m for m, count in modality_counts.items() if count > 1)
+        if repeated:
+            raise ValueError(
+                "Qwen3VL mixed-modality requests with an interleaved repeated "
+                f"modality are not supported (repeated: {repeated}); each modality "
+                "may appear at most once in a mixed request's prompt order."
+            )
+
     for modality in modality_types:
         payload = multimodal_data[modality]
         pos = order_pos.get((modality, 0), 0)
