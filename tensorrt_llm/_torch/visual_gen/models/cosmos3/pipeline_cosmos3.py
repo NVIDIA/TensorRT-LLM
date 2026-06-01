@@ -619,18 +619,14 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
         # 3. Set up scheduler
         self.scheduler.set_timesteps(num_inference_steps, device=self.device)
 
-        # 3b. Audio noise init
-        # T_audio = ceil(duration_s * audio_latent_fps / temporal_compression_factor_audio)
-        # Duration derived from num_frames / frame_rate; matches cosmos3-internal.
+        # 3b. Audio noise init — latent length matches diffusers Cosmos3OmniPipeline.prepare_latents.
         do_audio = enable_audio and self.audio_gen and hasattr(self, "audio_tokenizer")
         audio_latents = None
         if do_audio:
-            duration_s = num_frames / frame_rate
-            T_audio = math.ceil(
-                duration_s
-                * self.transformer.audio_latent_fps
-                / self.transformer.temporal_compression_factor_audio
-            )
+            audio_cfg = self.audio_tokenizer.model_config
+            n_audio_samples = int(num_frames / frame_rate * audio_cfg["sampling_rate"])
+            hop_size = math.prod(audio_cfg["dec_strides"])
+            T_audio = (n_audio_samples + hop_size - 1) // hop_size
             audio_latents = randn_tensor(
                 (1, self.transformer.audio_dim, T_audio),
                 generator=generator,
