@@ -2283,12 +2283,17 @@ class MLA(nn.Module):
         if position_ids is not None:
             position_ids = position_ids[..., :num_tokens]
 
-        # TRTLLM_MLA_EXTRA_OVERLAP=1 reorders the V4 attention prologue so the
+        # TRTLLM_MLA_EXTRA_OVERLAP reorders the V4 attention prologue so the
         # outer compressor and the ratio-4 indexer can execute concurrently
-        # with q_b_proj + q_b_layernorm. The indexer is launched on a
-        # dedicated stream and still uses a different aux stream for its
-        # internal q-proj/weights-proj split.
-        _v4_extra_overlap = (os.environ.get("TRTLLM_MLA_EXTRA_OVERLAP", "1")
+        # with q_b_proj + q_b_layernorm, on dedicated side streams.
+        # DISABLED BY DEFAULT: this multi-stream prologue choreography (compressor_
+        # stream / indexer_stream / indexer_aux_stream) leaves unjoined side-stream
+        # work during CUDA-graph capture (cudaErrorStreamCaptureUnjoined), which
+        # blocks CUDA graphs — and CUDA graphs are a ~50x decode win that dwarfs this
+        # prologue overlap. Opt back in with TRTLLM_MLA_EXTRA_OVERLAP=1 only with CUDA
+        # graphs OFF (or after the indexer_aux_stream tail is joined to the capture
+        # stream so capture stays legal).
+        _v4_extra_overlap = (os.environ.get("TRTLLM_MLA_EXTRA_OVERLAP", "0")
                              == "1" and self.compressor is not None
                              and self.aux_stream is not None)
         _use_indexer_overlap = (_v4_extra_overlap and do_multi_stream()
