@@ -35,6 +35,7 @@ from tensorrt_llm._torch.custom_ops.userbuffers_custom_ops import \
 from tensorrt_llm._torch.distributed import (AllReduce, AllReduceFusionOp,
                                              Distributed,
                                              userbuffers_allreduce_finalize)
+from tensorrt_llm._torch.modules.linear import Linear, TensorParallelMode
 from tensorrt_llm._torch.modules.rms_norm import RMSNorm
 from tensorrt_llm._utils import (get_sm_version, local_mpi_rank, local_mpi_size,
                                  nvtx_range)
@@ -58,7 +59,8 @@ def profile_allreduce(
     scale=None,
     bias=None,
     allreduce_instance=None,
-    dtype=None,
+    profile_gemm_allreduce: bool = False,
+    gemm_in_features: int | None = None,
 ):
 
     allreduce_params = AllReduceParams(
@@ -70,12 +72,32 @@ def profile_allreduce(
         bias=bias,
     )
 
-    allreduce = allreduce_instance or AllReduce(
-        mapping=mapping, strategy=strategy, dtype=dtype)
+    allreduce = allreduce_instance or AllReduce(mapping=mapping,
+                                                strategy=strategy)
+    linear = None
+    if profile_gemm_allreduce:
+        if gemm_in_features is None:
+            raise ValueError(
+                "gemm_in_features must be provided when profile_gemm_allreduce is enabled"
+            )
+        linear = Linear(
+            in_features=gemm_in_features,
+            out_features=gemm_in_features,
+            bias=False,
+            dtype=input.dtype,
+            mapping=mapping,
+            tensor_parallel_mode=TensorParallelMode.ROW,
+            reduce_output=True,
+            allreduce_strategy=strategy,
+        ).to(input.device)
+        torch.nn.init.normal_(linear.weight, mean=0.0, std=0.02)
 
     def func(x, loop_num=inner_loop):
         for _ in range(loop_num):
-            output = allreduce(x, all_reduce_params=allreduce_params)
+            if profile_gemm_allreduce:
+                output = linear(x, all_reduce_params=allreduce_params)
+            else:
+                output = allreduce(x, all_reduce_params=allreduce_params)
         return output if fusion == AllReduceFusionOp.NONE else output[0]
 
     start = [torch.cuda.Event(enable_timing=True) for _ in range(outer_loop)]
@@ -83,13 +105,17 @@ def profile_allreduce(
     graph = torch.cuda.CUDAGraph()
 
     stream = torch.cuda.Stream()
+    shape_hidden = gemm_in_features if profile_gemm_allreduce else input.size(1)
     with torch.cuda.stream(stream), nvtx_range(
-            f"allreudce: shape={input.size(0)}x{input.size(1)} fusion={fusion} strategy={strategy}"
+            f"allreudce: shape={input.size(0)}x{shape_hidden} fusion={fusion} "
+            f"strategy={strategy} mode={'gemm_ar' if profile_gemm_allreduce else 'allreduce'}"
     ):
         with autotune():
             func(input, loop_num=1)
 
         if enable_cudagraph:
+            # Untimed warmup run outside of graph capture
+            func(input, loop_num=1)
             # CUDA graph warmup then capture
             for _ in range(2):
                 func(input, loop_num=1)
@@ -116,7 +142,7 @@ def profile_allreduce(
     runtimes = [start[i].elapsed_time(stop[i]) for i in range(outer_loop)]
     median_ms = sorted(runtimes)[len(runtimes) // 2] / inner_loop
 
-    if fusion == AllReduceFusionOp.NONE:
+    if fusion == AllReduceFusionOp.NONE and not profile_gemm_allreduce:
         allreduce_ref = (input * mapping.world_size)
         torch.testing.assert_close(
             output,
@@ -135,6 +161,7 @@ def allreduce_benchmark(
     explore_2d: bool = False,
     save_csv: str = None,
     enable_auto: bool = False,
+    profile_gemm_allreduce: bool = False,
 ):
     world_size = tllm.mpi_world_size()
     rank = tllm.mpi_rank()
@@ -204,6 +231,9 @@ def allreduce_benchmark(
         message_size = num_tokens * hidden_size * torch.finfo(
             torch_dtype).bits // 8
 
+        if profile_gemm_allreduce and hidden_size % mapping.tp_size != 0:
+            continue
+
         if message_size > CustomAllReduceHelper.max_workspace_size_auto(
                 mapping.tp_size):
             continue
@@ -230,6 +260,24 @@ def allreduce_benchmark(
             if not enable_auto and strategy == AllReduceStrategy.AUTO:
                 continue
 
+            input_for_profile = input
+            if profile_gemm_allreduce:
+                local_in_features = hidden_size // mapping.tp_size
+                start_col = mapping.tp_rank * local_in_features
+                input_for_profile = input[:, start_col:start_col +
+                                          local_in_features].contiguous()
+            elif strategy in (AllReduceStrategy.NCCL_SYMMETRIC,
+                              AllReduceStrategy.NCCL, AllReduceStrategy.AUTO):
+                try:
+                    from tensorrt_llm.bindings.internal.thop import BufferKind
+                    window_out, actual_kind = torch.ops.trtllm.allocate_output(
+                        input, int(BufferKind.NCCL_WINDOW), mapping.tp_group)
+                    if actual_kind == int(BufferKind.NCCL_WINDOW):
+                        window_out.copy_(input)
+                        input_for_profile = window_out
+                except RuntimeError:
+                    pass
+
             median_ms = profile_allreduce(
                 mapping=mapping,
                 dist=dist,
@@ -238,10 +286,12 @@ def allreduce_benchmark(
                 outer_loop=outer_loop,
                 strategy=strategy,
                 fusion=fusion,
-                input=input,
+                input=input_for_profile,
                 residual=residual,
                 norm=norm,
                 scale=scale,
+                profile_gemm_allreduce=profile_gemm_allreduce,
+                gemm_in_features=hidden_size,
             )
 
             if mapping.rank == 0:
@@ -255,6 +305,10 @@ def allreduce_benchmark(
                         "hidden_size": [hidden_size],
                         "strategy": [strategy.name],
                         "fusion": [fusion.name],
+                        "op": [
+                            "gemm_allreduce"
+                            if profile_gemm_allreduce else "allreduce"
+                        ],
                         "time (us)": [median_ms * 1000]
                     })
                 ])
@@ -262,8 +316,10 @@ def allreduce_benchmark(
                 # print the new record in a single line instead of a dataframe
                 if mapping.rank == 0:
                     print(
-                        f"num_tokens: {num_tokens}, hidden_size: {hidden_size}, strategy: {strategy.name}, fusion: {fusion.name}, time (us): {median_ms * 1000}"
-                    )
+                        f"num_tokens: {num_tokens}, hidden_size: {hidden_size}, "
+                        f"strategy: {strategy.name}, fusion: {fusion.name}, "
+                        f"op: {'gemm_allreduce' if profile_gemm_allreduce else 'allreduce'}, "
+                        f"time (us): {median_ms * 1000}")
 
     AutoTuner.get().print_profiling_cache()
     # print the dataframe
@@ -657,6 +713,9 @@ if __name__ == "__main__":
                         default=False,
                         help="Run comprehensive benchmark across all backends "
                         "with nccl-tests style output")
+    parser.add_argument("--profile_gemm_allreduce",
+                        action="store_true",
+                        default=False)
 
     args = parser.parse_args()
 
@@ -676,4 +735,5 @@ if __name__ == "__main__":
             args.explore_2d,
             args.save_csv,
             args.enable_auto,
+            args.profile_gemm_allreduce,
         )

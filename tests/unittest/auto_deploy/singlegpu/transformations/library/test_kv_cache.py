@@ -1,3 +1,17 @@
+# SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 from types import SimpleNamespace
 from typing import List, Optional
 from unittest.mock import MagicMock
@@ -7,6 +21,9 @@ import torch
 import torch.nn as nn
 from _model_test_utils import GQA, default_max_num_tokens
 from _torch_test_utils import all_close
+
+import tensorrt_llm._torch.auto_deploy.custom_ops  # noqa: F401
+from tensorrt_llm._torch.auto_deploy._compat import KvCacheConfig
 
 # Initialize resources first (KVPagedResourceHandler is used within tests below)
 from tensorrt_llm._torch.auto_deploy.custom_ops.attention_interface import KVPagedResourceHandler
@@ -24,7 +41,7 @@ from tensorrt_llm._torch.auto_deploy.transform.library.kvcache import (
     ResizeKVCache,
 )
 from tensorrt_llm._torch.auto_deploy.transform.optimizer import InferenceOptimizer
-from tensorrt_llm.llmapi.llm_args import KvCacheConfig
+from tensorrt_llm._torch.auto_deploy.utils.node_utils import is_op
 
 
 class DummyFactory(ModelFactory):
@@ -124,6 +141,63 @@ class GQAWithSdpaAndEmbedding(GQA):
 
         # Apply output projection
         return self.o_proj(attn_output)
+
+
+class SpanMaskedAttentionModel(torch.nn.Module):
+    """Minimal model whose source graph uses a semantic multimodal mask op."""
+
+    def __init__(self, hidden_size: int = 8, num_heads: int = 2):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.num_heads = num_heads
+        self.head_dim = hidden_size // num_heads
+
+        self.q_proj = torch.nn.Linear(hidden_size, hidden_size, bias=False)
+        self.k_proj = torch.nn.Linear(hidden_size, hidden_size, bias=False)
+        self.v_proj = torch.nn.Linear(hidden_size, hidden_size, bias=False)
+
+    def _embed(self, input_ids: torch.Tensor) -> torch.Tensor:
+        return input_ids.unsqueeze(-1).expand(-1, -1, self.hidden_size).to(torch.float32)
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        position_ids: torch.Tensor,
+        mm_token_positions: torch.Tensor,
+        mm_token_lengths: torch.Tensor,
+        mm_item_cu_seqlen: torch.Tensor,
+    ) -> torch.Tensor:
+        del position_ids
+        x = self._embed(input_ids)
+        batch_size, seq_len, _ = x.shape
+
+        q = self.q_proj(x).view(batch_size, seq_len, self.num_heads, self.head_dim)
+        k = self.k_proj(x).view(batch_size, seq_len, self.num_heads, self.head_dim)
+        v = self.v_proj(x).view(batch_size, seq_len, self.num_heads, self.head_dim)
+        attn_mask = torch.ops.auto_deploy.gemma4_multimodal_mask.default(
+            input_ids,
+            mm_token_positions,
+            mm_token_lengths,
+            mm_item_cu_seqlen,
+        )
+        return torch.ops.auto_deploy.torch_attention(
+            q,
+            k,
+            v,
+            attn_mask=attn_mask,
+            is_causal=False,
+            layout="bsnd",
+        )
+
+
+def _create_cpu_seq_info() -> CachedSequenceInterface:
+    return CachedSequenceInterface(
+        max_seq_len=16,
+        max_batch_size=4,
+        max_num_tokens=default_max_num_tokens(16, 4),
+        device="cpu",
+        kv_cache_config=KvCacheConfig(tokens_per_block=16),
+    )
 
 
 # TODO (lucaslie): consider rewriting this test with a custom InferenceOptimizer config
@@ -240,8 +314,8 @@ def test_sdpa_with_kv_cache(dtype, attn_backend, gqa_config):
             x.flatten().tolist(),
             cu_seqlen=cu_seqlen,
             input_pos=input_pos,
-            cache_loc=list(range(bs)),
-            cu_num_pages=list(range(bs + 1)),
+            cache_loc_per_pool=[list(range(bs))],
+            cu_num_pages_per_pool=[list(range(bs + 1))],
             slot_idx=list(range(bs)),
             gather_context_logits=True,
         )
@@ -282,6 +356,165 @@ def test_sdpa_with_kv_cache(dtype, attn_backend, gqa_config):
     # Test 4: Exportability of the transformed model
     exported_gm = torch_export_to_gm(gm, args=(), kwargs=cm.named_args)
     assert exported_gm is not None
+
+
+@torch.inference_mode()
+def test_source_graph_uses_semantic_multimodal_mask_op():
+    model = SpanMaskedAttentionModel().eval()
+    input_ids = torch.tensor([[1, 2, 3, 4, 5]], dtype=torch.int64)
+    position_ids = torch.arange(input_ids.shape[1], dtype=torch.int64).repeat(input_ids.shape[0], 1)
+    mm_token_positions = torch.tensor([1, 3], dtype=torch.int32)
+    mm_token_lengths = torch.tensor([2, 2], dtype=torch.int32)
+    mm_item_cu_seqlen = torch.tensor([0, 2], dtype=torch.int32)
+
+    gm = torch_export_to_gm(
+        model,
+        args=(
+            input_ids,
+            position_ids,
+            mm_token_positions,
+            mm_token_lengths,
+            mm_item_cu_seqlen,
+        ),
+        clone=True,
+    )
+
+    semantic_nodes = [
+        node for node in gm.graph.nodes if is_op(node, torch.ops.auto_deploy.gemma4_multimodal_mask)
+    ]
+    assert len(semantic_nodes) == 1
+
+
+@torch.inference_mode()
+def test_insert_cached_attention_lowers_semantic_mask_for_torch_backend():
+    model = SpanMaskedAttentionModel().eval()
+    input_ids = torch.tensor([[1, 2, 3, 4, 5]], dtype=torch.int64)
+    position_ids = torch.arange(input_ids.shape[1], dtype=torch.int64).repeat(input_ids.shape[0], 1)
+    mm_token_positions = torch.tensor([1, 3], dtype=torch.int32)
+    mm_token_lengths = torch.tensor([2, 2], dtype=torch.int32)
+    mm_item_cu_seqlen = torch.tensor([0, 2], dtype=torch.int32)
+
+    gm = torch_export_to_gm(
+        model,
+        args=(
+            input_ids,
+            position_ids,
+            mm_token_positions,
+            mm_token_lengths,
+            mm_item_cu_seqlen,
+        ),
+        clone=True,
+    )
+    cm = _create_cpu_seq_info()
+    gm_transformed = InferenceOptimizer(
+        None,
+        {
+            "insert_cached_attention": {
+                "stage": "cache_init",
+                "backend": "torch",
+            },
+        },
+    )(cm, gm)
+
+    assert not any(
+        is_op(node, torch.ops.auto_deploy.torch_attention) for node in gm_transformed.graph.nodes
+    )
+    assert any(
+        is_op(node, torch.ops.auto_deploy.gemma4_prepare_multimodal_mask)
+        for node in gm_transformed.graph.nodes
+    )
+
+    cached_nodes = [
+        node
+        for node in gm_transformed.graph.nodes
+        if is_op(node, torch.ops.auto_deploy.torch_cached_attention_with_cache)
+    ]
+    assert len(cached_nodes) == 1
+    assert is_op(cached_nodes[0].args[-1], torch.ops.auto_deploy.gemma4_prepare_multimodal_mask)
+
+
+@torch.inference_mode()
+def test_insert_cached_attention_lowers_semantic_mask_for_triton_paged_backend():
+    model = SpanMaskedAttentionModel().eval()
+    input_ids = torch.tensor([[1, 2, 3, 4, 5]], dtype=torch.int64)
+    position_ids = torch.arange(input_ids.shape[1], dtype=torch.int64).repeat(input_ids.shape[0], 1)
+    mm_token_positions = torch.tensor([1, 3], dtype=torch.int32)
+    mm_token_lengths = torch.tensor([2, 2], dtype=torch.int32)
+    mm_item_cu_seqlen = torch.tensor([0, 2], dtype=torch.int32)
+
+    gm = torch_export_to_gm(
+        model,
+        args=(
+            input_ids,
+            position_ids,
+            mm_token_positions,
+            mm_token_lengths,
+            mm_item_cu_seqlen,
+        ),
+        clone=True,
+    )
+    cm = _create_cpu_seq_info()
+    gm_transformed = InferenceOptimizer(
+        None,
+        {
+            "insert_cached_attention": {
+                "stage": "cache_init",
+                "backend": "triton_paged",
+            },
+        },
+    )(cm, gm)
+
+    assert any(
+        is_op(node, torch.ops.auto_deploy.gemma4_prepare_multimodal_mask)
+        for node in gm_transformed.graph.nodes
+    )
+    cached_nodes = [
+        node
+        for node in gm_transformed.graph.nodes
+        if is_op(node, torch.ops.auto_deploy.triton_paged_mha_with_cache)
+    ]
+    assert len(cached_nodes) == 1
+    assert is_op(cached_nodes[0].args[-1], torch.ops.auto_deploy.gemma4_prepare_multimodal_mask)
+
+
+@torch.inference_mode()
+def test_insert_cached_attention_rejects_unsupported_semantic_mask_backend():
+    model = SpanMaskedAttentionModel().eval()
+    input_ids = torch.tensor([[1, 2, 3, 4, 5]], dtype=torch.int64)
+    position_ids = torch.arange(input_ids.shape[1], dtype=torch.int64).repeat(input_ids.shape[0], 1)
+    mm_token_positions = torch.tensor([1, 3], dtype=torch.int32)
+    mm_token_lengths = torch.tensor([2, 2], dtype=torch.int32)
+    mm_item_cu_seqlen = torch.tensor([0, 2], dtype=torch.int32)
+
+    gm = torch_export_to_gm(
+        model,
+        args=(
+            input_ids,
+            position_ids,
+            mm_token_positions,
+            mm_token_lengths,
+            mm_item_cu_seqlen,
+        ),
+        clone=True,
+    )
+    cm = _create_cpu_seq_info()
+
+    with pytest.raises(
+        RuntimeError,
+        match=(
+            "Cached attention backend 'flashinfer' does not support lowering semantic mask op"
+            ".*gemma4_multimodal_mask.*Supported backends: torch, triton_paged"
+        ),
+    ):
+        InferenceOptimizer(
+            None,
+            {
+                "insert_cached_attention": {
+                    "stage": "cache_init",
+                    "backend": "flashinfer",
+                },
+            },
+        )(cm, gm)
 
 
 # =============================================================================
@@ -600,3 +833,379 @@ def test_insert_cached_mla_attention_preserves_non_flashinfer_backend():
     backend = InsertCachedMLAAttention.resolve_backend_for_node("torch_mla", attn_node)
 
     assert backend == "torch_mla"
+
+
+# =============================================================================
+# Sliding Window KV Cache Integration Tests
+# =============================================================================
+
+
+class SlidingWindowGQA(GQAWithSdpaAndEmbedding):
+    """GQA model with a configurable per-layer sliding_window for testing."""
+
+    def __init__(
+        self,
+        num_attention_heads: int,
+        hidden_size: int,
+        num_key_value_heads: int,
+        vocab_size: int = 1000,
+        sliding_window: Optional[int] = None,
+    ):
+        super().__init__(num_attention_heads, hidden_size, num_key_value_heads, vocab_size)
+        self._sliding_window = sliding_window
+
+    @torch.no_grad()
+    def forward(
+        self, input_ids: torch.Tensor, position_ids: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        x = self.embed_tokens(input_ids)
+        b, s, _ = x.shape
+        q = self.q_proj(x).view(b, s, self.num_heads, self.head_dim)
+        k = self.k_proj(x).view(b, s, self.num_kv_heads, self.head_dim)
+        v = self.v_proj(x).view(b, s, self.num_kv_heads, self.head_dim)
+        attn_output = torch.ops.auto_deploy.torch_attention(
+            q,
+            k,
+            v,
+            attn_mask=None,
+            dropout_p=0.0,
+            is_causal=True,
+            scale=None,
+            sinks=None,
+            sliding_window=self._sliding_window,
+            logit_cap=None,
+            layout="bsnd",
+        )
+        return self.o_proj(attn_output.reshape(b, s, -1))
+
+
+class VSWAModel(nn.Module):
+    """Model with two attention layers: one sliding-window, one full-attention (VSWA)."""
+
+    def __init__(
+        self,
+        num_attention_heads: int,
+        hidden_size: int,
+        num_key_value_heads: int,
+        vocab_size: int = 1000,
+        sliding_window: int = 32,
+    ):
+        super().__init__()
+        self.num_heads = num_attention_heads
+        self.num_kv_heads = num_key_value_heads
+        self.head_dim = hidden_size // num_attention_heads
+        self.embed_tokens = nn.Embedding(vocab_size, hidden_size)
+        self.q_proj_0 = nn.Linear(hidden_size, hidden_size, bias=False)
+        self.k_proj_0 = nn.Linear(hidden_size, num_key_value_heads * self.head_dim, bias=False)
+        self.v_proj_0 = nn.Linear(hidden_size, num_key_value_heads * self.head_dim, bias=False)
+        self.o_proj_0 = nn.Linear(hidden_size, hidden_size, bias=False)
+        self.q_proj_1 = nn.Linear(hidden_size, hidden_size, bias=False)
+        self.k_proj_1 = nn.Linear(hidden_size, num_key_value_heads * self.head_dim, bias=False)
+        self.v_proj_1 = nn.Linear(hidden_size, num_key_value_heads * self.head_dim, bias=False)
+        self.o_proj_1 = nn.Linear(hidden_size, hidden_size, bias=False)
+        self._sliding_window = sliding_window
+
+    @torch.no_grad()
+    def forward(
+        self, input_ids: torch.Tensor, position_ids: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        x = self.embed_tokens(input_ids)
+        b, s, _ = x.shape
+
+        # Layer 0: sliding window attention
+        q0 = self.q_proj_0(x).view(b, s, self.num_heads, self.head_dim)
+        k0 = self.k_proj_0(x).view(b, s, self.num_kv_heads, self.head_dim)
+        v0 = self.v_proj_0(x).view(b, s, self.num_kv_heads, self.head_dim)
+        a0 = torch.ops.auto_deploy.torch_attention(
+            q0,
+            k0,
+            v0,
+            attn_mask=None,
+            dropout_p=0.0,
+            is_causal=True,
+            scale=None,
+            sinks=None,
+            sliding_window=self._sliding_window,
+            logit_cap=None,
+            layout="bsnd",
+        )
+        x = x + self.o_proj_0(a0.reshape(b, s, -1))
+
+        # Layer 1: full attention (no sliding window)
+        q1 = self.q_proj_1(x).view(b, s, self.num_heads, self.head_dim)
+        k1 = self.k_proj_1(x).view(b, s, self.num_kv_heads, self.head_dim)
+        v1 = self.v_proj_1(x).view(b, s, self.num_kv_heads, self.head_dim)
+        a1 = torch.ops.auto_deploy.torch_attention(
+            q1,
+            k1,
+            v1,
+            attn_mask=None,
+            dropout_p=0.0,
+            is_causal=True,
+            scale=None,
+            sinks=None,
+            sliding_window=None,
+            logit_cap=None,
+            layout="bsnd",
+        )
+        return x + self.o_proj_1(a1.reshape(b, s, -1))
+
+
+def _build_optimizer_with_backend(model, backend="triton_paged"):
+    """Helper to create an InferenceOptimizer for testing."""
+    return InferenceOptimizer(
+        DummyFactory(model, cache_config_updates={}),
+        {
+            "build_model": {
+                "stage": "factory",
+                "run_per_gm": False,
+                "device": "cuda",
+                "run_graph_cleanup": False,
+                "requires_clean_graph": False,
+            },
+            "export_to_gm": {
+                "stage": "export",
+                "strict": False,
+                "run_per_gm": False,
+                "clone_state_dict": True,
+                "run_graph_cleanup": False,
+                "requires_clean_graph": False,
+            },
+            "cleanup_input_constraints": {
+                "stage": "post_export",
+            },
+            "insert_cached_attention": {
+                "stage": "cache_init",
+                "backend": backend,
+            },
+        },
+    )
+
+
+@torch.inference_mode()
+def test_insert_cached_attention_no_sliding_window_leaves_config_unchanged():
+    """Verify insert_cached_attention does not set max_attention_window for non-SWA models."""
+    max_seq_len = 128
+    batch_size = 4
+
+    kv_cache_config = KvCacheConfig(
+        tokens_per_block=max_seq_len,
+        max_tokens=batch_size * max_seq_len,
+        free_gpu_memory_fraction=0.0,
+    )
+    cm = CachedSequenceInterface(
+        max_seq_len=max_seq_len,
+        max_batch_size=batch_size,
+        max_num_tokens=default_max_num_tokens(max_seq_len, batch_size),
+        device="cuda",
+        kv_cache_config=kv_cache_config,
+    )
+
+    model = GQAWithSdpaAndEmbedding(
+        num_attention_heads=8,
+        hidden_size=512,
+        num_key_value_heads=8,
+    ).to(dtype=torch.float16, device="cuda")
+
+    optimizer = _build_optimizer_with_backend(model)
+    optimizer(cm)
+
+    assert cm.kv_cache_config.max_attention_window is None
+
+
+@torch.inference_mode()
+def test_insert_cached_attention_respects_user_override():
+    """Verify insert_cached_attention does not overwrite user-set max_attention_window."""
+    max_seq_len = 128
+    batch_size = 4
+    user_window = [64]
+
+    kv_cache_config = KvCacheConfig(
+        tokens_per_block=max_seq_len,
+        max_tokens=batch_size * max_seq_len,
+        free_gpu_memory_fraction=0.0,
+        max_attention_window=user_window,
+    )
+    cm = CachedSequenceInterface(
+        max_seq_len=max_seq_len,
+        max_batch_size=batch_size,
+        max_num_tokens=default_max_num_tokens(max_seq_len, batch_size),
+        device="cuda",
+        kv_cache_config=kv_cache_config,
+    )
+
+    model = SlidingWindowGQA(
+        num_attention_heads=8,
+        hidden_size=512,
+        num_key_value_heads=8,
+        sliding_window=32,
+    ).to(dtype=torch.float16, device="cuda")
+
+    optimizer = _build_optimizer_with_backend(model)
+    optimizer(cm)
+
+    # User-provided value must be preserved
+    assert cm.kv_cache_config.max_attention_window == user_window
+
+
+@torch.inference_mode()
+def test_insert_cached_attention_vswa_preserves_per_layer_windows():
+    """Verify VSWA model preserves per-layer window sizes for proportional allocation."""
+    sliding_window = 32
+    max_seq_len = 128
+    batch_size = 4
+
+    kv_cache_config = KvCacheConfig(
+        tokens_per_block=32,
+        max_tokens=batch_size * max_seq_len,
+        free_gpu_memory_fraction=0.0,
+    )
+    cm = CachedSequenceInterface(
+        max_seq_len=max_seq_len,
+        max_batch_size=batch_size,
+        max_num_tokens=default_max_num_tokens(max_seq_len, batch_size),
+        device="cuda",
+        kv_cache_config=kv_cache_config,
+    )
+
+    model = VSWAModel(
+        num_attention_heads=8,
+        hidden_size=512,
+        num_key_value_heads=8,
+        sliding_window=sliding_window,
+    ).to(dtype=torch.float16, device="cuda")
+
+    optimizer = _build_optimizer_with_backend(model)
+    optimizer(cm)
+
+    # VSWA preserves per-layer windows: [32, 128] (not collapsed)
+    assert cm.kv_cache_config.max_attention_window is not None
+    assert len(cm.kv_cache_config.max_attention_window) == 2
+    assert cm.kv_cache_config.max_attention_window == [sliding_window, max_seq_len]
+
+    # Window groups should be registered on SequenceInfo
+    assert cm.info.num_window_groups == 2
+    assert cm.info.window_groups == [sliding_window, max_seq_len]
+    assert cm.info.window_group_map == {sliding_window: 0, max_seq_len: 1}
+
+
+@torch.inference_mode()
+def test_kv_cache_manager_initialized_with_sliding_window():
+    """Verify KVCacheManager receives max_attention_window_vec from SWA model.
+
+    Runs the full insert_cached_attention + initialize_cache pipeline.
+    """
+    import math
+
+    sliding_window = 32
+    max_seq_len = 128
+    batch_size = 4
+    tokens_per_block = 16
+
+    kv_cache_config = KvCacheConfig(
+        tokens_per_block=tokens_per_block,
+        max_tokens=batch_size * max_seq_len,
+        free_gpu_memory_fraction=0.0,
+    )
+    cm = CachedSequenceInterface(
+        max_seq_len=max_seq_len,
+        max_batch_size=batch_size,
+        max_num_tokens=default_max_num_tokens(max_seq_len, batch_size),
+        device="cuda",
+        kv_cache_config=kv_cache_config,
+    )
+
+    model = SlidingWindowGQA(
+        num_attention_heads=8,
+        hidden_size=512,
+        num_key_value_heads=8,
+        sliding_window=sliding_window,
+    ).to(dtype=torch.float16, device="cuda")
+
+    # Run insert_cached_attention + initialize_cache
+    optimizer = InferenceOptimizer(
+        DummyFactory(model, cache_config_updates={}),
+        {
+            "build_model": {
+                "stage": "factory",
+                "run_per_gm": False,
+                "device": "cuda",
+                "run_graph_cleanup": False,
+                "requires_clean_graph": False,
+            },
+            "export_to_gm": {
+                "stage": "export",
+                "strict": False,
+                "run_per_gm": False,
+                "clone_state_dict": True,
+                "run_graph_cleanup": False,
+                "requires_clean_graph": False,
+            },
+            "cleanup_input_constraints": {
+                "stage": "post_export",
+            },
+            "insert_cached_attention": {
+                "stage": "cache_init",
+                "backend": "triton_paged",
+            },
+            "initialize_cache": {
+                "stage": "cache_init",
+                "run_per_gm": False,
+            },
+        },
+    )
+    optimizer(cm)
+
+    # KVCacheManager should exist and carry the window vector
+    mgr = cm.kv_cache_manager
+    assert mgr.max_attention_window_vec == [sliding_window]
+
+    # max_blocks_per_seq is based on max_seq_len (not window) because sequences
+    # temporarily need full blocks during prefill; SWA eviction frees them during decode.
+    expected_max_blocks = math.ceil(max_seq_len / tokens_per_block)
+    assert cm.info.max_blocks_per_seq == expected_max_blocks
+
+
+# =============================================================================
+# VSWA SequenceInfo and Graph Wiring Tests
+# =============================================================================
+
+
+@torch.inference_mode()
+def test_sequence_info_register_window_groups():
+    """Verify register_window_groups creates per-group tensors in InputBuffer."""
+    from tensorrt_llm._torch.auto_deploy.custom_ops.attention_interface import SequenceInfo
+
+    max_seq_len = 128
+    batch_size = 4
+    tokens_per_block = 16
+
+    seq_info = SequenceInfo(
+        max_seq_len=max_seq_len,
+        max_batch_size=batch_size,
+        max_num_tokens=default_max_num_tokens(max_seq_len, batch_size),
+        tokens_per_block=tokens_per_block,
+    )
+
+    # Before registration: no window groups
+    assert seq_info.num_window_groups == 0
+    assert seq_info.window_groups == []
+
+    # Register two groups: [32, 128]
+    seq_info.register_window_groups([32, 128])
+
+    assert seq_info.num_window_groups == 2
+    assert seq_info.window_groups == [32, 128]
+    assert seq_info.window_group_map == {32: 0, 128: 1}
+
+    # Group 0 reuses existing tensors (cache_loc, cu_num_pages, etc.)
+    # Group 1 gets new tensors
+    assert "cache_loc_g1" in seq_info.available_args
+    assert "cu_num_pages_g1" in seq_info.available_args
+    assert "cu_num_pages_g1_host" in seq_info.available_args
+    assert "last_page_len_g1" in seq_info.available_args
+    assert "last_page_len_g1_host" in seq_info.available_args
+    assert "extra_page_per_seq_g1" in seq_info.available_args
+
+    # Group 0 names should NOT appear with _g0 suffix
+    assert "cache_loc_g0" not in seq_info.available_args

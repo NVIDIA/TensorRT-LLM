@@ -1,3 +1,7 @@
+# Copyright 2018 The HuggingFace Team
+# Licensed under the Apache License, Version 2.0.
+# Original source: https://github.com/huggingface/transformers
+#
 # SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
@@ -39,8 +43,9 @@ from transformers.modeling_utils import PreTrainedModel
 from transformers.models.llama.configuration_llama import LlamaConfig
 from transformers.utils import ModelOutput
 
-import tensorrt_llm._torch.auto_deploy.custom_ops  # noqa: F401 -- register all ops
-from tensorrt_llm._torch.auto_deploy.models.hf import AutoModelForCausalLMFactory
+from ... import custom_ops  # noqa: F401 -- register all ops
+from ..hf import AutoModelForCausalLMFactory
+from .rotary_utils import RotaryEmbeddingBase, build_rope_cos_sin_cache
 
 
 class Llama3RMSNorm(nn.Module):
@@ -57,14 +62,12 @@ class Llama3RMSNorm(nn.Module):
         )
 
 
-class Llama3RotaryEmbedding(nn.Module):
+class Llama3RotaryEmbedding(RotaryEmbeddingBase):
     """Rotary Position Embedding for Llama 3 family.
 
     Supports all rope types (default, llama3, linear, dynamic, etc.) via
-    transformers ROPE_INIT_FUNCTIONS. Precomputes and caches cos/sin values.
-    Slices by position_ids once and returns pre-sliced cos/sin to all layers.
-
-    Uses _ad_ prefix for buffer names to work with AutoDeploy's lift_to_meta.
+    transformers ROPE_INIT_FUNCTIONS. Keeps only the small inv_freq buffer
+    before graph-cache transforms.
     """
 
     def __init__(self, config: LlamaConfig):
@@ -77,19 +80,15 @@ class Llama3RotaryEmbedding(nn.Module):
             rope_type = "default"
 
         inv_freq, self.attention_scaling = ROPE_INIT_FUNCTIONS[rope_type](config, device=None)
-
-        max_pos = config.max_position_embeddings
-        t = torch.arange(max_pos, dtype=inv_freq.dtype)
-        freqs = torch.outer(t, inv_freq)
-        emb = torch.cat((freqs, freqs), dim=-1)
-        self.register_buffer("_ad_cos_cached", emb.cos() * self.attention_scaling, persistent=False)
-        self.register_buffer("_ad_sin_cached", emb.sin() * self.attention_scaling, persistent=False)
+        self.max_position_embeddings = config.max_position_embeddings
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
 
     def forward(
         self, x: torch.Tensor, position_ids: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        cos = self._ad_cos_cached.to(dtype=x.dtype, device=x.device)
-        sin = self._ad_sin_cached.to(dtype=x.dtype, device=x.device)
+        cos, sin = build_rope_cos_sin_cache(
+            self.inv_freq, self.max_position_embeddings, x, self.attention_scaling
+        )
         return cos[position_ids], sin[position_ids]
 
 

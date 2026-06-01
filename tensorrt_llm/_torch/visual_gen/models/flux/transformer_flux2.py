@@ -38,6 +38,7 @@ from tensorrt_llm._torch.visual_gen.models.flux.transformer_flux import (
     _remap_checkpoint_keys,
 )
 from tensorrt_llm._torch.visual_gen.quantization.loader import DynamicLinearWeightLoader
+from tensorrt_llm._torch.visual_gen.utils import SequenceSharder
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
 # HF FLUX.2 uses Flux2FeedForward with linear_in/linear_out attribute names.
@@ -431,16 +432,7 @@ class Flux2Transformer2DModel(nn.Module):
 
         vgm = model_config.visual_gen_mapping
         num_heads = getattr(model_config.pretrained_config, "num_attention_heads", 48)
-        ulysses_size = vgm.ulysses_size if vgm else 1
-        if ulysses_size > 1 and num_heads % ulysses_size != 0:
-            raise ValueError(
-                f"num_attention_heads ({num_heads}) must be divisible by "
-                f"ulysses_size ({ulysses_size})"
-            )
-        self.use_ulysses = ulysses_size > 1
-        self.ulysses_size = ulysses_size
-        self.ulysses_pg = vgm.ulysses_group if vgm else None
-        self.ulysses_rank = vgm.ulysses_rank if vgm else 0
+        self.sharder = SequenceSharder.from_vgm(vgm, num_attention_heads=num_heads)
 
         # Extract pretrained config from model_config (following WAN/FLUX.1 pattern)
         pretrained_config = model_config.pretrained_config
@@ -713,36 +705,13 @@ class Flux2Transformer2DModel(nn.Module):
         if img_ids.ndim == 3:
             img_ids = img_ids[0]
 
-        # Ulysses: shard sequences and position IDs before RoPE
-        if self.use_ulysses:
-            img_seq_len = img_ids.shape[0]
-            _txt_seq_len = txt_ids.shape[0]
-
-            if img_seq_len % self.ulysses_size != 0:
-                raise ValueError(
-                    f"Image seq len ({img_seq_len}) not divisible by "
-                    f"ulysses_size ({self.ulysses_size})"
-                )
-            if _txt_seq_len % self.ulysses_size != 0:
-                raise ValueError(
-                    f"Text seq len ({_txt_seq_len}) not divisible by "
-                    f"ulysses_size ({self.ulysses_size})"
-                )
-
-            img_chunk = img_seq_len // self.ulysses_size
-            txt_chunk = _txt_seq_len // self.ulysses_size
-            r = self.ulysses_rank
-
-            # Shard position IDs (before RoPE computation)
-            img_ids = img_ids[r * img_chunk : (r + 1) * img_chunk]
-            txt_ids = txt_ids[r * txt_chunk : (r + 1) * txt_chunk]
-
-            # Shard hidden states
-            hidden_states = hidden_states[:, r * img_chunk : (r + 1) * img_chunk, :]
-            encoder_hidden_states = encoder_hidden_states[:, r * txt_chunk : (r + 1) * txt_chunk, :]
-
-            # Update txt_seq_len to local (sharded) length for single-stream split
-            txt_seq_len = txt_chunk
+        # Shard sequences and position IDs before RoPE (no-op when sharder is inactive).
+        img_ids = self.sharder.shard(img_ids, dim=0)
+        txt_ids = self.sharder.shard(txt_ids, dim=0)
+        hidden_states = self.sharder.shard(hidden_states, dim=1)
+        encoder_hidden_states = self.sharder.shard(encoder_hidden_states, dim=1)
+        # Update txt_seq_len to local (sharded) length for single-stream split.
+        txt_seq_len = encoder_hidden_states.shape[1]
 
         # Compute RoPE embeddings (4-axis, from potentially sharded IDs)
         ids = torch.cat([txt_ids, img_ids], dim=0)
@@ -777,12 +746,8 @@ class Flux2Transformer2DModel(nn.Module):
         # Extract image features (discard text)
         hidden_states = hidden_states[:, txt_seq_len:, :]
 
-        # Ulysses: gather output sequence from all ranks
-        if self.use_ulysses:
-            hidden_states = hidden_states.contiguous()
-            gathered = [torch.zeros_like(hidden_states) for _ in range(self.ulysses_size)]
-            torch.distributed.all_gather(gathered, hidden_states, group=self.ulysses_pg)
-            hidden_states = torch.cat(gathered, dim=1)
+        # All-gather hidden states across ranks (no-op when sharder is inactive).
+        hidden_states = self.sharder.gather(hidden_states, dim=1)
 
         # Output projection
         hidden_states = self.norm_out(hidden_states, temb)

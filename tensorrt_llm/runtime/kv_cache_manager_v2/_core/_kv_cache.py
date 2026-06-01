@@ -15,14 +15,15 @@
 
 import array
 import enum
+import math
 from collections.abc import Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from itertools import chain
-from typing import TYPE_CHECKING, Callable, ClassVar, Iterable, Iterator, Type, cast
+from typing import TYPE_CHECKING, Callable, ClassVar, Iterator, NamedTuple, Type, cast
 
 from .. import rawref
-from .._block_radix_tree import Block, RootBlock, UselessBlockError
+from .._block_radix_tree import Block, ReuseMatch, ReuseScope, RootBlock, UselessBlockError
 from .._common import (
     BAD_BLOCK_ORDINAL,
     BAD_PAGE_INDEX,
@@ -35,16 +36,25 @@ from .._common import (
     CacheLevel,
     CudaStream,
     PageIndex,
+    PageIndexMode,
     Priority,
     TokenIdExt,
 )
 from .._copy_engine import CopyTask, batched_copy
 from .._exceptions import LogicError, OutOfPagesError
-from .._life_cycle_registry import AttnLifeCycle, LayerGroupId, LifeCycle, LifeCycleId, SsmLifeCycle
+from .._life_cycle_registry import (
+    AttnLifeCycle,
+    LayerGroupId,
+    LifeCycle,
+    LifeCycleId,
+    SsmLifeCycle,
+    compute_scratch_range,
+)
 from .._page import (
     BatchedLockTarget,
     BlockPage,
     CommittedPage,
+    ScratchSlotLock,
     UncommittedPage,
     _PageHolder,
     _SharedPageLock,
@@ -59,7 +69,6 @@ from .._utils import (
     div_up,
     expect_type,
     filled_list,
-    find_index,
     make_typed,
     map_optional,
     stream_wait_events,
@@ -75,7 +84,7 @@ from .._utils import (
 from ._moving_average import Average
 
 if TYPE_CHECKING:
-    from ._kv_cache_manager import KVCacheManager
+    from ._kv_cache_manager import KVCacheManager, ScratchDesc
 
 
 @dataclass(slots=True)
@@ -161,7 +170,7 @@ class _KVCache:
     __slots__ = (
         "id",
         "_manager",
-        "_lora_task_id",
+        "_reuse_scope",
         "_get_priority",
         "_cuda_stream",
         "_status",
@@ -179,6 +188,8 @@ class _KVCache:
         "_avg_capacity",
         "_ssm_blocks",
         "_never_resumed",
+        "_enable_swa_scratch_reuse",
+        "_scratch_slots",
         "__rawref__",
     )
 
@@ -187,7 +198,7 @@ class _KVCache:
 
     id: int | None
     _manager: "KVCacheManager"
-    _lora_task_id: int | None
+    _reuse_scope: ReuseScope
     _get_priority: Callable[[BlockOrdinal, LifeCycle], Priority]
     _cuda_stream: CudaStream | None
     _status: _Status
@@ -217,18 +228,25 @@ class _KVCache:
 
     _ssm_blocks: TypedIndexList[BeamIndex, TypedIndexList[LifeCycleId, BlockPage]]
     _never_resumed: bool
+    _enable_swa_scratch_reuse: bool
+    # Scratch slots for SWA prefill memory reuse, per life cycle. These hold coalesced slots
+    # whose sub-pages are reinterpreted as per-block storage for the currently executing layer.
+    # Number of scratch blocks depends on diff between history_length and capacity.
+    # Managed via delta in resize(): existing slots are reused across resize calls,
+    # only the additional needed slots are allocated. Freed on teardown/suspend.
+    _scratch_slots: TypedIndexList[LifeCycleId, list[ScratchSlotLock]]
 
     def __init__(
         self,
         manager: "KVCacheManager",
-        lora_task_id: int | None,
-        input_tokens: Sequence[TokenIdExt] | None,
+        reuse_scope: ReuseScope,
+        reuse_match: ReuseMatch | None,
         id: int | None,
         custom_priority_callback: Callable[[BlockOrdinal, LifeCycle], Priority],
     ):
         self.id = id
         self._manager = manager
-        self._lora_task_id = lora_task_id
+        self._reuse_scope = reuse_scope
         self._get_priority = custom_priority_callback
         self._cuda_stream = None
         self._status = self.Status.SUSPENDED
@@ -250,13 +268,16 @@ class _KVCache:
             self.beam_width,
         )
         self._never_resumed = True
+        self._enable_swa_scratch_reuse = manager.enable_swa_scratch_reuse
+        self._scratch_slots = make_typed(
+            lambda _: list[ScratchSlotLock](), manager._storage.num_life_cycles
+        )
         self.__rawref__ = rawref.NULL
-        if input_tokens is not None:
-            self._setup_for_reuse(input_tokens)
+        if reuse_match is not None:
+            self._setup_for_reuse(reuse_match)
         self._avg_history_length = Average()
         self._avg_capacity = Average()
         self._avg_history_length.update(self.history_length)
-        self._avg_capacity.update(self.capacity)
         manager._living_kv_caches.add(rawref.ref(self))
         manager._avg_reused_length.update(self.history_length)
         manager._num_created_kv_caches += 1
@@ -319,14 +340,16 @@ class _KVCache:
         self.stop_committing()
         assert NDEBUG or self._check_sanity()
         manager = self.manager
-        manager._avg_sqr_capacity.update(self._avg_capacity.value**2)
-        manager._avg_sqr_history_length.update(self._avg_history_length.value**2)
-        manager._try_update_target_ratios()
+        if self.capacity > 0:
+            self._avg_capacity.update(self.capacity)
+            manager._avg_sqr_capacity.update(self._avg_capacity.value**2)
+            manager._avg_sqr_history_length.update(self._avg_history_length.value**2)
+            manager._num_sampled_kv_caches += 1
+            manager._try_update_target_ratios()
         with self._record_event():
             self._clear_blocks()
         self._status = self.Status.CLOSED
         manager._living_kv_caches.remove(self.__rawref__)
-        manager._num_closed_kv_caches += 1
 
     def __del__(self) -> None:
         self.close()
@@ -387,6 +410,66 @@ class _KVCache:
             else:
                 yield holder.page.slot_id
 
+    def get_scratch_desc(self, layer_group_id: LayerGroupId) -> "ScratchDesc | None":
+        """
+        Get scratch metadata for the given layer group, or None if scratch is not active.
+
+        The returned ScratchDesc contains the scratch block ordinal range and the
+        slot IDs for the scratch coalesced slots. Pass this to PageIndexConverter
+        together with get_base_page_indices() to produce per-layer page indices.
+
+        The returned ScratchDesc is invalidated by the next capacity/history_length update.
+        """
+        lc = self.manager._life_cycles[layer_group_id]
+        sr = self._get_scratch_range(lc)
+        if not sr:
+            return None
+        from ._kv_cache_manager import ScratchDesc
+
+        return ScratchDesc(
+            range=sr,
+            slot_ids=[s.slot.slot_id for s in self._scratch_slots[layer_group_id]],
+        )
+
+    @property
+    def has_scratch_slots(self) -> bool:
+        """True if this KV cache currently has scratch slots allocated."""
+        return any(len(s) > 0 for s in self._scratch_slots)
+
+    @property
+    def enable_swa_scratch_reuse(self) -> bool:
+        return self._enable_swa_scratch_reuse
+
+    @enable_swa_scratch_reuse.setter
+    def enable_swa_scratch_reuse(self, enable: bool) -> None:
+        if enable == self._enable_swa_scratch_reuse:
+            return
+        if enable:
+            if not self.manager.enable_swa_scratch_reuse:
+                raise ValueError(
+                    "Cannot enable SWA scratch reuse for a request when it is disabled in "
+                    "KV cache manager config"
+                )
+            if self._would_use_swa_scratch_blocks():
+                raise ValueError(
+                    "Cannot enable SWA scratch reuse while the current request state would "
+                    "need scratch blocks"
+                )
+            self._enable_swa_scratch_reuse = True
+            return
+
+        if self._would_use_swa_scratch_blocks():
+            raise ValueError("Cannot disable SWA scratch reuse while scratch blocks are needed")
+        assert not self.has_scratch_slots
+        self._enable_swa_scratch_reuse = False
+
+    def supports_index_mode(self, mode: PageIndexMode) -> bool:
+        match mode:
+            case PageIndexMode.PER_LAYER:
+                return True
+            case PageIndexMode.SHARED:
+                return not self.has_scratch_slots
+
     # reserve space for next inference. Request new blocks from KVCacheManager if necessary.
     # if capacity is increased and beam_width > 1, blocks containing new tokens should be allocated for each beam.
     # Decrease of capacity may destroy stale blocks (if not used by other requests).
@@ -414,17 +497,32 @@ class _KVCache:
             raise ValueError("History length cannot be decreased")
         if capacity < history_length:
             raise ValueError("History length cannot be greater than capacity")
-        if self._shortcut_set_capacity(capacity) and self._shortcut_set_history_length(
-            history_length
+        manager = self.manager
+        # Scratch reuse: compute scratch ranges and slot delta
+        enable_scratch = self.enable_swa_scratch_reuse
+        if enable_scratch and capacity != self._capacity:
+            max_rewind_len = self._swa_scratch_max_rewind_len()
+            min_history_length = max(0, self._capacity - max_rewind_len)
+            assert min_history_length <= history_length <= self._capacity, (
+                "SWA scratch requires "
+                f"old_capacity - max_rewind_len ({min_history_length}) <= "
+                f"history_length ({history_length}) <= "
+                f"old_capacity ({self._capacity})"
+            )
+        if (
+            not enable_scratch
+            and self._shortcut_set_capacity(capacity)
+            and self._shortcut_set_history_length(history_length)
         ):
             return True
-        ssm_lc_id = self.manager._life_cycles.ssm_life_cycle_id
+        ssm_lc_id = manager._life_cycles.ssm_life_cycle_id
         beam_width = self.beam_width
         backup_holders = self._unlock_stale_blocks(history_length)
         old_num_blocks = BlockOrdinal(div_up(self._capacity, tokens_per_block))
         new_num_blocks = BlockOrdinal(div_up(capacity, tokens_per_block))
-        num_life_cycles = self.manager._life_cycles.size
+        num_life_cycles = manager._life_cycles.size
         if new_num_blocks < old_num_blocks:
+            assert not self.has_scratch_slots, "Cannot shrink while scratch slots exist"
             with self._record_event():
                 del self._blocks[new_num_blocks:]
             for beam_indices in self._base_page_indices:
@@ -436,27 +534,84 @@ class _KVCache:
                         indices[new_num_blocks:] = array.array("i", [BAD_PAGE_INDEX]) * (
                             len(indices) - new_num_blocks
                         )
-        elif new_num_blocks > old_num_blocks:
+
+        excess_scratch_slots, delta_scratch_slots, scratch_ranges = self._take_excess_scratch_slots(
+            capacity, history_length
+        )
+
+        if new_num_blocks >= old_num_blocks:
             num_new_slots = filled_list(0, num_life_cycles)
             stale_ranges = [
                 _KVCache._get_stale_range(tokens_per_block, history_length, lc)
-                for _, lc in self.manager._life_cycles.items()
+                for _, lc in manager._life_cycles.items()
             ]
             for lc in typed_range(num_life_cycles):
                 if lc == ssm_lc_id:
                     continue
                 stale_beg, stale_end = stale_ranges[lc]
-                if old_num_blocks < stale_beg:
-                    assert new_num_blocks >= stale_end
-                    num_new_blocks = (stale_beg - old_num_blocks) + (new_num_blocks - stale_end)
+                if enable_scratch:
+                    num_scratch_blocks = len(scratch_ranges[lc])
+                    num_new_normal_blocks = (new_num_blocks - old_num_blocks) - num_scratch_blocks
+                    num_new_slots[lc] = num_new_normal_blocks * beam_width
                 else:
-                    num_new_blocks = new_num_blocks - max(stale_end, old_num_blocks)
-                num_new_slots[lc] = num_new_blocks * beam_width
-            try:
-                slots = self._storage.new_gpu_slots(num_new_slots)
-            except OutOfPagesError:
-                self._lock_held_blocks(backup_holders)
-                return False
+                    if old_num_blocks < stale_beg:
+                        assert new_num_blocks >= stale_end
+                        num_new_blocks_to_add = (stale_beg - old_num_blocks) + (
+                            new_num_blocks - stale_end
+                        )
+                    else:
+                        num_new_blocks_to_add = new_num_blocks - max(stale_end, old_num_blocks)
+                    num_new_slots[lc] = num_new_blocks_to_add * beam_width
+
+            net_alloc_counts = make_typed(
+                lambda lc: num_new_slots[lc] + delta_scratch_slots[lc], num_life_cycles
+            )
+            storage = self._storage
+            if any(c > 0 for c in net_alloc_counts):
+                try:
+                    new_slots = storage.new_gpu_slots(
+                        make_typed(lambda lc: max(0, net_alloc_counts[lc]), num_life_cycles)
+                    )
+                except OutOfPagesError:
+                    self._recover_excess_scratch_slots(excess_scratch_slots)
+                    self._lock_held_blocks(backup_holders)
+                    return False
+            else:
+                new_slots = make_typed(lambda _: list[Slot](), num_life_cycles)
+
+            # Wait on newly allocated slots
+            stream_wait_events(
+                self.cuda_stream, (s.ready_event for s in chain.from_iterable(new_slots))
+            )
+
+            # Combine slots and distribute
+            slots = make_typed(lambda _: list[Slot](), num_life_cycles)
+            for lc in typed_range(num_life_cycles):
+                slots[lc] = new_slots[lc] + [
+                    lock.detach_slot() for lock in excess_scratch_slots[lc]
+                ]
+                new_slots[lc].clear()
+                excess_scratch_slots[lc].clear()
+
+            if any(cnt < 0 for cnt in net_alloc_counts):
+                with self._record_event():
+                    for lc in typed_range(num_life_cycles):
+                        for _ in range(-net_alloc_counts[lc]):
+                            slot = slots[lc].pop()
+                            slot.ready_event = self.finish_event
+                            storage.release_slot(lc, GPU_LEVEL, slot)
+
+            assert all(
+                len(slots[lc]) == num_new_slots[lc] + max(0, delta_scratch_slots[lc])
+                for lc in typed_range(num_life_cycles)
+            )
+
+            # Fulfill additional scratch slots
+            for lc in typed_range(num_life_cycles):
+                for _ in range(delta_scratch_slots[lc]):
+                    slot = slots[lc].pop()
+                    self._scratch_slots[lc].append(ScratchSlotLock(slot, self, lc, skip_wait=True))
+
             for beam_indices in self._base_page_indices:
                 for indices in beam_indices:
                     if type(indices) is array.array:
@@ -465,9 +620,6 @@ class _KVCache:
                     else:
                         if len(indices) < new_num_blocks:
                             raise ValueError("User-provided base page indices is too short")
-            stream_wait_events(
-                self.cuda_stream, (s.ready_event for s in chain.from_iterable(slots))
-            )
             for ordinal in typed_range(old_num_blocks, new_num_blocks):
                 block = make_typed(
                     lambda _: filled_list(cast(BlockPage, None), num_life_cycles), beam_width
@@ -476,9 +628,14 @@ class _KVCache:
                     for lc in typed_range(num_life_cycles):
                         if lc == ssm_lc_id:
                             continue  # SSM pages live in _ssm_blocks, not in _blocks
-                        stale_beg, stale_end = stale_ranges[lc]
-                        if stale_beg <= ordinal < stale_end:
-                            continue
+                        if enable_scratch:
+                            # Assertion guarantees no new block is stale.
+                            if ordinal in scratch_ranges[lc]:
+                                continue  # Scratch block — no per-block page allocation
+                        else:
+                            stale_beg, stale_end = stale_ranges[lc]
+                            if stale_beg <= ordinal < stale_end:
+                                continue
                         slot = slots[lc].pop()
                         # We have already waited for ready_event of the slots.
                         block[beam_index][lc] = UncommittedPage(
@@ -505,6 +662,11 @@ class _KVCache:
         necessary for SWA layers.
         Expect OutOfPagesError exception if there are not enough pages in GPU memory.
         """
+        if self.enable_swa_scratch_reuse:
+            raise ValueError(
+                "Cannot use capacity setter when SWA scratch reuse is enabled. "
+                "Use resize(capacity, history_length) instead."
+            )
         success = self.resize(capacity, None)
         if not success:
             raise OutOfPagesError("Not enough pages in GPU memory")
@@ -520,8 +682,6 @@ class _KVCache:
     @history_length.setter
     def history_length(self, history_length: int) -> None:
         "History length cannot be decreased. Increase may trigger out-of-window block eviction/dropping for SWA layers."
-        if self._shortcut_set_history_length(history_length):
-            return
         success = self.resize(None, history_length)
         assert success
 
@@ -611,6 +771,8 @@ class _KVCache:
                 # after this assignment, __del__ of the original _SharedPageLock will use self.finish_event
                 # to indicate end of usage for the page.
                 beam_block[lc_idx] = holder
+            # Free scratch slots on suspend since the data is ephemeral
+            self._free_scratch_slots()
         self._status = self.Status.SUSPENDED
 
     # Resume, migrate buffers to GPU memory.
@@ -633,20 +795,48 @@ class _KVCache:
         deferred_slots: TypedIndexList[LifeCycleId, Slot | None] = filled_list(
             None, storage.num_life_cycles
         )
+
+        excess_scratch_slots, delta_scratch_slots, _ = self._take_excess_scratch_slots(
+            self.capacity, self.history_length
+        )
+        assert all(len(s) == 0 for s in excess_scratch_slots)
+
+        num_slots = filled_list(0, num_life_cycles)
+        has_partial = False
         if self._never_resumed:
             assert self.beam_width == 1
             has_partial = self.num_committed_tokens % self.tokens_per_block != 0
-            num_slots = cast(
-                TypedIndexList[LifeCycleId, int],
-                [1 if type(lc) is SsmLifeCycle or has_partial else 0 for lc in life_cycles],
-            )
+            for lc_idx, lc in life_cycles.items():
+                if type(lc) is SsmLifeCycle or has_partial:
+                    num_slots[lc_idx] += 1
+
+        for lc_idx in typed_range(num_life_cycles):
+            num_slots[lc_idx] += delta_scratch_slots[lc_idx]
+
+        if any(c > 0 for c in num_slots):
             try:
                 tmp_slots = storage.new_gpu_slots(num_slots)
             except OutOfPagesError:
                 return False
-            for lc_idx, slot_lst in zip(typed_range(num_life_cycles), tmp_slots):
-                if slot_lst:
-                    [deferred_slots[lc_idx]] = slot_lst
+
+            # Wait for scratch slots to be ready
+            scratch_slots_to_add = make_typed(lambda _: list[Slot](), num_life_cycles)
+            for lc_idx, slot_lst in zip(typed_range(num_life_cycles), tmp_slots, strict=True):
+                if self._never_resumed and (
+                    type(life_cycles[lc_idx]) is SsmLifeCycle or has_partial
+                ):
+                    deferred_slots[lc_idx] = slot_lst.pop(0)
+                scratch_slots_to_add[lc_idx] = slot_lst
+
+            stream_wait_events(
+                self.cuda_stream, (s.ready_event for s in chain.from_iterable(scratch_slots_to_add))
+            )
+
+            for lc_idx in typed_range(num_life_cycles):
+                for slot in scratch_slots_to_add[lc_idx]:
+                    self._scratch_slots[lc_idx].append(
+                        ScratchSlotLock(slot, self, lc_idx, skip_wait=True)
+                    )
 
         tasks = list[BatchedLockTarget]()
         for ordinal, beam_idx, lc_idx in self._active_pages():
@@ -735,6 +925,9 @@ class _KVCache:
                 )
                 new_lock = new_page.lock(self, beam_idx, block_ordinal, lc_idx, skip_wait=True)
                 beam_block[lc_idx] = new_lock
+            # Clear tree_block for the partial block — it's now uncommitted.
+            if self.num_committed_tokens % self.tokens_per_block != 0:
+                self._blocks[last_ordinal].tree_block = None
         self._never_resumed = False
         self._status = self.Status.ACTIVE
         return True
@@ -742,7 +935,7 @@ class _KVCache:
     def _active_pages(self) -> Iterator[tuple[BlockOrdinal, BeamIndex, LifeCycleId]]:
         """Yields (ordinal, beam_idx, lc_idx) for all active pages.
 
-        For attention life cycles, yields non-stale blocks from _blocks.
+        For attention life cycles, yields non-stale blocks from _blocks (excluding scratch blocks).
         For SSM, yields entries from _ssm_blocks with ordinal=BAD_BLOCK_ORDINAL.
         """
         ssm_lc_id = self.manager._life_cycles.ssm_life_cycle_id
@@ -756,12 +949,16 @@ class _KVCache:
             stale_start, stale_end = _KVCache._get_stale_range(
                 self.tokens_per_block, self.history_length, lc
             )
+            scratch_range = self._get_scratch_range(lc)
             sink_blocks = typed_range(stale_start)
             window_blocks = typed_range(stale_end, typed_len(self._blocks))
             for ordinal in chain(sink_blocks, window_blocks):
                 block = self._blocks[ordinal]
-                for beam_idx, _ in typed_enumerate(block.pages):
-                    yield ordinal, beam_idx, lc_idx
+                for beam_idx, beam_block in typed_enumerate(block.pages):
+                    is_scratch = ordinal in scratch_range
+                    assert is_scratch == (beam_block[lc_idx] is None)
+                    if not is_scratch:
+                        yield ordinal, beam_idx, lc_idx
 
     @property
     def status(self) -> _Status:
@@ -847,7 +1044,7 @@ class _KVCache:
             raise LogicError("Cannot commit block that is not full except last block")
         prev: RootBlock | Block
         if ordinal == 0:
-            prev = self.manager._radix_tree.add_or_get_existing(self._lora_task_id)
+            prev = self.manager._radix_tree.add_or_get_existing(self._reuse_scope)
         else:
             prev = self._get_tree_block(BlockOrdinal(ordinal - 1))
         try:
@@ -892,7 +1089,7 @@ class _KVCache:
             seq_block.tree_block = tree_block
             assert self._get_tree_block(ordinal) is tree_block
             self._num_committed_blocks = BlockOrdinal(ordinal + 1)
-        elif tree_block.is_full and self.manager.allow_seq_rebasing:
+        elif tree_block.is_full and self.manager.allow_seq_rebasing and is_full:
             # Happens when a concurrent request committed the same tokens before us.
             # Try to replace our pages with pages from the existing block to save memory.
             reuse_list = list[tuple[LifeCycleId, CommittedPage]]()
@@ -945,6 +1142,9 @@ class _KVCache:
                 block = self._blocks[ordinal]
                 assert not block.is_committed
                 for beam_block in block.pages:
+                    if beam_block[lc_idx] is None:
+                        assert self.enable_swa_scratch_reuse
+                        continue  # Scratch block — already handled
                     assert isinstance(beam_block[lc_idx], _PageHolder)
                     beam_block[lc_idx] = None
         assert NDEBUG or self._check_sanity()
@@ -978,9 +1178,13 @@ class _KVCache:
                         not is_committed and self._commit_state == self.CommitState.ALLOWED
                     )
                     for beam_idx, beam_block in typed_enumerate(block.pages):
+                        if beam_block[lc_idx] is None:
+                            assert self.enable_swa_scratch_reuse
+                            continue  # Scratch block — no page to unlock
                         holder = expect_type(_SharedPageLock, beam_block[lc_idx]).holder
                         ret.append((ordinal, beam_idx, lc_idx, holder))
                         beam_block[lc_idx] = holder if hold_for_commit else None
+            # Scratch slot lifetime is handled by resize() after target scratch ranges are recomputed.
         return ret
 
     def _lock_held_blocks(
@@ -997,6 +1201,51 @@ class _KVCache:
         for lock in locks:
             user = lock._user
             self._block(user.ordinal, user.beam_index)[user.life_cycle] = lock
+
+    class DeltaScratchSlots(NamedTuple):
+        excess: TypedIndexList[LifeCycleId, list[ScratchSlotLock]]
+        delta_cnt: TypedIndexList[LifeCycleId, int]
+        scratch_ranges: TypedIndexList[LifeCycleId, HalfOpenRange[BlockOrdinal]]
+
+    def _take_excess_scratch_slots(self, capacity: int, history_length: int) -> DeltaScratchSlots:
+        """
+        Calculate scratch slot requirements and extract excess scratch slots.
+
+        Returns:
+            excess_scratch_slots: List of ScratchSlotLocks taken from `self._scratch_slots`.
+            additional_scratch_slots: Number of extra slots needed per lifecycle (we have deficit).
+            scratch_ranges: The scratch ranges per lifecycle for the new capacity/history_length.
+        """
+        num_life_cycles = self.manager._life_cycles.size
+        excess = make_typed(lambda _: list[ScratchSlotLock](), num_life_cycles)
+        delta_cnt = filled_list(0, num_life_cycles)
+        scratch_ranges = make_typed(
+            lambda _: HalfOpenRange[BlockOrdinal](BlockOrdinal(0), BlockOrdinal(0)), num_life_cycles
+        )
+
+        for lc_idx, lc in self.manager._life_cycles.items():
+            scratch_range = self._get_scratch_range(lc, history_length, capacity)
+            scratch_ranges[lc_idx] = scratch_range
+            num_scratch_blocks = len(scratch_ranges[lc_idx])
+            frac_max = self._storage._slot_util_frac_max[lc_idx]
+            needed_slots = math.ceil(num_scratch_blocks * frac_max)
+            existing_slots = len(self._scratch_slots[lc_idx])
+            delta = needed_slots - existing_slots
+            delta_cnt[lc_idx] = delta
+
+            if delta < 0:
+                for _ in range(-delta):
+                    lock = self._scratch_slots[lc_idx].pop()
+                    excess[lc_idx].append(lock)
+
+        return self.DeltaScratchSlots(excess, delta_cnt, scratch_ranges)
+
+    def _recover_excess_scratch_slots(
+        self, excess_scratch_slots: TypedIndexList[LifeCycleId, list[ScratchSlotLock]]
+    ) -> None:
+        for lc_idx, locks in typed_enumerate(excess_scratch_slots):
+            self._scratch_slots[lc_idx].extend(locks)
+            locks.clear()
 
     @property
     def _storage(self) -> StorageManager:
@@ -1060,7 +1309,7 @@ class _KVCache:
         num_life_cycles = self.manager._life_cycles.size
         ssm_lc_id = self.manager._life_cycles.ssm_life_cycle_id
         for ordinal, block in typed_enumerate(self._blocks):
-            is_committed = ordinal < self._num_committed_blocks
+            is_committed = self._never_resumed or ordinal < self._num_committed_blocks
             assert is_committed == block.is_committed
             for beam_block in block.pages:
                 assert typed_len(beam_block) == num_life_cycles
@@ -1081,12 +1330,78 @@ class _KVCache:
                                 holder is None and not self._committed_tokens
                             )
                     else:
-                        assert isinstance(
-                            holder, (_SharedPageLock if self.is_active else _PageHolder)
-                        )
+                        # Scratch blocks have None pages but valid base_page_indices
+                        lc_obj = self.manager._life_cycles[lc]
+                        sr = self._get_scratch_range(lc_obj)
+                        is_scratch = ordinal in sr
+                        if is_scratch:
+                            assert holder is None
+                        else:
+                            assert isinstance(
+                                holder, (_SharedPageLock if self.is_active else _PageHolder)
+                            )
                     if holder is not None:
                         assert is_committed == isinstance(holder.page, CommittedPage)
+        # Check SSM blocks
+        if ssm_lc_id is not None:
+            for beam_block in self._ssm_blocks:
+                holder = beam_block[ssm_lc_id]
+                if holder is not None:
+                    if self._never_resumed:
+                        # Deferred copy: SSM holds CommittedPage from matched snapshot
+                        assert isinstance(holder, _PageHolder)
+                        assert isinstance(holder.page, CommittedPage)
+                    else:
+                        assert isinstance(holder, _SharedPageLock)
+                        assert isinstance(holder.page, UncommittedPage)
         return True
+
+    def _get_scratch_range(
+        self,
+        life_cycle: LifeCycle,
+        history_length_override: int | None = None,
+        capacity_override: int | None = None,
+    ) -> HalfOpenRange[BlockOrdinal]:
+        """
+        Range of blocks that should use scratch (shared) slots during SWA prefill.
+
+        Scratch = stale_at_capacity ∩ input_blocks, where:
+        - stale_at_capacity: blocks out-of-window when all non-rewindable capacity tokens
+          become history.
+        - input_blocks: [div_up(history_length, tpb), div_up(capacity, tpb)) — new blocks
+          for the current chunk. Blocks before this range already contain real KV data
+          from previous chunks and must not be overwritten.
+
+        The configured max_rewind_len excludes a speculative tail from scratch reuse.
+        """
+        if not self.enable_swa_scratch_reuse:
+            return HalfOpenRange(BlockOrdinal(0), BlockOrdinal(0))
+        history_length = value_or(history_length_override, self.history_length)
+        capacity = value_or(capacity_override, self.capacity)
+        max_rewind_len = self._swa_scratch_max_rewind_len()
+        return compute_scratch_range(
+            life_cycle,
+            history_length,
+            capacity,
+            self.tokens_per_block,
+            max_rewind_len,
+        )
+
+    def _would_use_swa_scratch_blocks(self) -> bool:
+        max_rewind_len = self._swa_scratch_max_rewind_len()
+        return any(
+            compute_scratch_range(
+                lc,
+                self.history_length,
+                self.capacity,
+                self.tokens_per_block,
+                max_rewind_len,
+            )
+            for lc in self.manager._life_cycles
+        )
+
+    def _swa_scratch_max_rewind_len(self) -> int:
+        return unwrap_optional(self.manager.init_config.swa_scratch_reuse).max_rewind_len
 
     @staticmethod
     def _get_stale_range(
@@ -1101,93 +1416,25 @@ class _KVCache:
         beg, end = life_cycle.get_stale_range(history_length, tokens_per_block)
         return HalfOpenRange(BlockOrdinal(beg), BlockOrdinal(end))
 
-    def _setup_for_reuse(self, input_tokens: Sequence[TokenIdExt]) -> None:
+    def _get_matched_tokens(self, match: ReuseMatch) -> list[TokenIdExt]:
+        ret: list[TokenIdExt] = []
+        remaining = match.num_tokens
+        for block in match.blocks:
+            assert remaining > 0
+            num_block_tokens = min(remaining, len(block.tokens))
+            ret.extend(block.tokens[:num_block_tokens])
+            remaining -= num_block_tokens
+        assert remaining == 0
+        return ret
+
+    def _setup_for_reuse(self, match: ReuseMatch) -> None:
         manager = self.manager
-        lora_task_id = self._lora_task_id
-        matched = list(
-            manager._radix_tree.match(
-                lora_task_id, input_tokens or [], manager.enable_partial_match
-            )
-        )
+        matched = match.blocks
         tokens_per_block = manager.tokens_per_block
-        assert all(b[1] == tokens_per_block for b in matched[:-1])
-
-        def get_num_matched_tokens(_):  # @fixme: remove the _ parameter
-            return tokens_per_block * (len(matched) - 1) + matched[-1][1] if matched else 0
-
+        num_tokens = match.num_tokens
         life_cycles = manager._life_cycles
-
-        def has_pages(block: Block, lc_list: Iterable[LifeCycleId]) -> bool:
-            return all(block.storage[lc] is not None for lc in lc_list)
-
-        # check for full attention layers
-        attn_life_cycles = list(life_cycles.attention_life_cycles())
-        if any(lc.window_size is None for _, lc in attn_life_cycles):
-            lc_list = [lc_idx for lc_idx, lc in attn_life_cycles if lc.window_size is None]
-
-            def check_no_pages(b: tuple[Block, int]):
-                return not has_pages(b[0], lc_list)
-
-            n = find_index(matched, check_no_pages)
-            matched = matched[:n]
-
-        def has_page(block: Block, lc: LifeCycleId) -> bool:
-            return block.storage[lc] is not None
-
-        swa_life_cycles = tuple(
-            (lc_idx, lc) for lc_idx, lc in attn_life_cycles if lc.window_size is not None
-        )
-        # check for SWA sink
-        for lc_idx, lc in swa_life_cycles:
-
-            def check_no_page_lc(b: tuple[Block, int]):
-                return not has_page(b[0], lc_idx)
-
-            n = find_index(matched[: lc.num_sink_blocks], check_no_page_lc)
-            if n < lc.num_sink_blocks:
-                matched = matched[:n]
-        # Check SWA window and SSM snapshot constraints together,
-        # since SSM truncation can invalidate SWA invariants.
-        # SSM is checked first (intervals are large, so it prunes more).
         ssm_lc_id = life_cycles.ssm_life_cycle_id
-        num_tokens = 0
-        while matched:
-            # SSM truncation: truncate to the last block with an SSM snapshot
-            if ssm_lc_id is not None:
-                ssm_trunc = 0
-                for i in reversed(range(len(matched))):
-                    if matched[i][0].storage[ssm_lc_id] is not None:
-                        ssm_trunc = i + 1
-                        break
-                matched = matched[:ssm_trunc]
-                if not matched:
-                    break
-            # SWA window check
-            num_tokens = get_num_matched_tokens(matched)
-            for lc_idx, lc in swa_life_cycles:
-                if lc.window_size is None:
-                    continue
-
-                def check_has_page_lc(b: tuple[Block, int]):
-                    return has_page(b[0], lc_idx)
-
-                n = find_index(reversed(matched), check_has_page_lc)
-                if n != 0:
-                    matched = matched[:-n]
-                    break
-                _, stale_end = _KVCache._get_stale_range(tokens_per_block, num_tokens, lc)
-
-                def check_no_page_stale(b: tuple[Block, int]):
-                    return not has_page(b[0], lc_idx)
-
-                n = find_index(reversed(matched[stale_end:]), check_no_page_stale)
-                if len(matched) - n > stale_end:
-                    matched = matched[: len(matched) - n]
-                    break
-            else:
-                break
-        num_tokens = get_num_matched_tokens(matched)
-        self._committed_tokens = list(input_tokens[:num_tokens])
+        self._committed_tokens = self._get_matched_tokens(match)
         self._history_length = num_tokens
         self._capacity = num_tokens
         # fill self._blocks
@@ -1199,9 +1446,9 @@ class _KVCache:
                         lambda _: filled_list(cast(BlockPage, None), life_cycles.size),
                         self.beam_width,
                     ),
-                    b[0] if b[1] == tokens_per_block else None,
+                    block,
                 )
-                for b in matched
+                for block in matched
             ],
         )
 
@@ -1210,20 +1457,18 @@ class _KVCache:
         for lc_idx, lc in life_cycles.items():
             if lc_idx == ssm_lc_id:
                 continue  # SSM is handled separately below
-            stale_start, stale_end = _KVCache._get_stale_range(
-                tokens_per_block, get_num_matched_tokens(matched), lc
-            )
+            stale_start, stale_end = _KVCache._get_stale_range(tokens_per_block, num_tokens, lc)
             for ordinal in chain(
                 typed_range(stale_start), typed_range(stale_end, BlockOrdinal(len(matched)))
             ):
                 block = self._block(ordinal, beam_idx)
-                holder = unwrap_rawref(unwrap_optional(matched[ordinal][0].storage[lc_idx])).hold()
+                holder = unwrap_rawref(unwrap_optional(matched[ordinal].storage[lc_idx])).hold()
                 # For partial blocks (last block, not full), we defer the copy to first resume().
                 # Just store the holder of the original committed page for now.
                 block[lc_idx] = holder
         # SSM reuse: hold the snapshot from the last matched block. Copy is deferred to first resume().
         if ssm_lc_id is not None and matched:
-            snapshot_block = matched[-1][0]
+            snapshot_block = matched[-1]
             snapshot_ref = snapshot_block.storage[ssm_lc_id]
             assert snapshot_ref is not None, (
                 "Last matched block must have SSM snapshot after truncation"
@@ -1238,10 +1483,18 @@ class _KVCache:
                 else:
                     assert len(indices) >= self.num_blocks
 
+    def _free_scratch_slots(self) -> None:
+        """Free all scratch slots back to the storage manager."""
+        for lc in typed_range(self.manager._life_cycles.size):
+            for lock in self._scratch_slots[lc]:
+                lock.unlock()
+            self._scratch_slots[lc].clear()
+
     def _clear_blocks(self) -> None:
         # drop the last block first
         while self._blocks:
             self._blocks.pop()
+        self._free_scratch_slots()
         ssm_lc_id = self.manager._life_cycles.ssm_life_cycle_id
         if ssm_lc_id is not None:
             for beam_block in self._ssm_blocks:

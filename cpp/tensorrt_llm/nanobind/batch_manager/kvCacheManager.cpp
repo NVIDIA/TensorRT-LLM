@@ -121,12 +121,6 @@ public:
         NB_OVERRIDE_PURE(getTokenCount, requestId);
     }
 
-    void addSequence(tb::LlmRequest::RequestIdType requestId, SizeType32 inputLength, SizeType32 beamWidth,
-        tensorrt_llm::common::OptionalRef<tb::LlmRequest> llmRequest = std::nullopt) override
-    {
-        NB_OVERRIDE_PURE(addSequence, requestId, inputLength, beamWidth, llmRequest);
-    }
-
     void addSequenceBatch(
         std::vector<std::tuple<tb::LlmRequest::RequestIdType, SizeType32, SizeType32>> const& requestInfos,
         std::vector<std::reference_wrapper<tb::LlmRequest>> const& llmRequests) override
@@ -139,6 +133,11 @@ public:
         bool pinOnRelease = false) override
     {
         NB_OVERRIDE_PURE(removeSequence, requestId, llmRequest, pinOnRelease);
+    }
+
+    void truncateBlocks(tb::LlmRequest::VecTokens const& targetTokens, SizeType32 numTokensToKeep) override
+    {
+        NB_OVERRIDE_PURE(truncateBlocks, targetTokens, numTokensToKeep);
     }
 
     std::vector<tbk::KVCacheBlock::IdType> storeBlocksForReuse(tb::LlmRequest::RequestIdType requestId,
@@ -184,6 +183,12 @@ public:
         NB_OVERRIDE_PURE(isEnableBlockReuse);
     }
 
+    tbk::PrefixReuseSummary analyzePrefixReuse(
+        tbk::VecUniqueTokens const& uniqueTokens, tb::LlmRequest const& llmRequest) const override
+    {
+        NB_OVERRIDE_PURE(analyzePrefixReuse, uniqueTokens, llmRequest);
+    }
+
     bool isEnablePartialReuse() const override
     {
         NB_OVERRIDE_PURE(isEnablePartialReuse);
@@ -197,12 +202,6 @@ public:
     bool isCrossKv() const override
     {
         NB_OVERRIDE_PURE(isCrossKv);
-    }
-
-    std::optional<BlockKey> findNewContextBlock(
-        VecUniqueTokens const& uniqueTokens, tb::LlmRequest const& llmRequest) const override
-    {
-        NB_OVERRIDE_PURE(findNewContextBlock, uniqueTokens, llmRequest);
     }
 
     void storeContextBlocks(tb::LlmRequest const& llmRequest) override
@@ -272,12 +271,6 @@ public:
     {
         NB_OVERRIDE_PURE(flushIterationEvents);
     }
-
-    SizeType32 countReusableBlocks(VecUniqueTokens const& uniqueTokens, tb::LlmRequest const& llmRequest,
-        bool onlyAllocated = false) const override
-    {
-        NB_OVERRIDE_PURE(countReusableBlocks, uniqueTokens, llmRequest, onlyAllocated);
-    }
 };
 
 // TODO: Deduplicate executor bindings KvCacheStats
@@ -339,10 +332,33 @@ void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(nb::module_& m)
         .def_rw("cache_type", &tbk::LinearAttentionMetadata::cacheType)
         .def_rw("all_recurrent_states_bytes", &tbk::LinearAttentionMetadata::allRecurrentStatesBytes)
         .def_rw("states_snapshot_interval", &tbk::LinearAttentionMetadata::statesSnapshotInterval)
-        .def_rw("save_last_snapshot", &tbk::LinearAttentionMetadata::saveLastSnapshot);
+        .def_rw("save_last_snapshot", &tbk::LinearAttentionMetadata::saveLastSnapshot)
+        .def_rw("rnn_num_heads", &tbk::LinearAttentionMetadata::rnnNumHeads)
+        .def_rw("rnn_head_dim", &tbk::LinearAttentionMetadata::rnnHeadDim)
+        .def_rw("rnn_d_state", &tbk::LinearAttentionMetadata::rnnDState)
+        .def_rw("rnn_d_conv", &tbk::LinearAttentionMetadata::rnnDConv)
+        .def_rw("rnn_n_groups", &tbk::LinearAttentionMetadata::rnnNGroups)
+        .def_rw("rnn_conv_section_layout", &tbk::LinearAttentionMetadata::rnnConvSectionLayout)
+        .def_rw("rnn_ssm_bytes", &tbk::LinearAttentionMetadata::rnnSsmBytes)
+        .def_rw("rnn_ssm_dtype_size", &tbk::LinearAttentionMetadata::rnnSsmDtypeSize)
+        .def_rw("rnn_conv_dtype_size", &tbk::LinearAttentionMetadata::rnnConvDtypeSize);
 
     nb::enum_<tbk::LinearAttentionMetadata::LinearCacheType>(m, "LinearCacheType")
         .value("RECURRENT_STATES", tbk::LinearAttentionMetadata::LinearCacheType::kRecurrentStates);
+
+    nb::class_<tbk::PoolConfiguration>(m, "PoolConfiguration")
+        .def(nb::init<>())
+        .def(nb::init<SizeType32, SizeType32, nvinfer1::DataType>(), nb::arg("window_size"), nb::arg("size_per_head"),
+            nb::arg("dtype"))
+        .def_rw("window_size", &tbk::PoolConfiguration::windowSize)
+        .def_rw("size_per_head", &tbk::PoolConfiguration::sizePerHead)
+        .def_rw("dtype", &tbk::PoolConfiguration::dtype);
+
+    nb::class_<tbk::PrefixReuseSummary>(m, "PrefixReuseSummary")
+        .def(nb::init<>())
+        .def_ro("reusable_blocks_allocated", &tbk::PrefixReuseSummary::reusableBlocksAllocated)
+        .def_ro("reusable_blocks_all", &tbk::PrefixReuseSummary::reusableBlocksAll)
+        .def_ro("first_new_block", &tbk::PrefixReuseSummary::firstNewBlock);
 
     nb::class_<tbk::KvCacheStats>(m, "KvCacheStats")
         .def(nb::init<>())
@@ -381,12 +397,6 @@ void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(nb::module_& m)
         .def_rw("iter_intra_device_copy_blocks", &tbk::KvCacheIterationStats::iterIntraDeviceCopyBlocks)
         .def_rw("iter_intra_device_copy_bytes", &tbk::KvCacheIterationStats::iterIntraDeviceCopyBytes);
 
-    nb::class_<tbk::TempAttentionWindowInputs>(m, "TempAttentionWindowInputs")
-        .def(nb::init<>())
-        .def_rw("paged_context_fmha", &tbk::TempAttentionWindowInputs::pagedContextFMHA)
-        .def_rw("max_input_len", &tbk::TempAttentionWindowInputs::maxInputLen)
-        .def_rw("max_num_tokens", &tbk::TempAttentionWindowInputs::maxNumTokens);
-
     nb::class_<tbk::BlockKey>(m, "BlockKey")
         .def(nb::init<>())
         .def(nb::init<VecTokens const&, std::optional<tr::LoraTaskIdType>>(), nb::arg("tokens"),
@@ -395,7 +405,9 @@ void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(nb::module_& m)
             nb::arg("lora_task_id"), nb::arg("unique_tokens"))
         .def_ro("uses_extra_ids", &tbk::BlockKey::usesExtraIds)
         .def_ro("lora_task_id", &tbk::BlockKey::loraTaskId)
-        .def_ro("unique_tokens", &tbk::BlockKey::uniqueTokens);
+        .def_ro("unique_tokens", &tbk::BlockKey::uniqueTokens)
+        .def("__eq__", &tbk::BlockKey::operator==)
+        .def("__hash__", [](tbk::BlockKey const& key) -> size_t { return tbk::BlockKeyHasher{}(key); });
 
     nb::class_<tbk::BlockKeyHasher>(m, "BlockKeyHasher")
         .def_static("hash", &tbk::BlockKeyHasher::hash, nb::arg("block_key"), nb::arg("parent_hash") = 0);
@@ -411,6 +423,7 @@ void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(nb::module_& m)
             nb::arg("world_config"), nb::arg("window_size_to_layers"), nb::arg("allotted_primary_mem_bytes"),
             nb::arg("allotted_secondary_mem_bytes"), nb::arg("extra_cost_memory"), nb::arg("kv_factor"),
             nb::arg("max_batch_size"), nb::arg("linear_attention_metadata") = std::nullopt,
+            nb::arg("pool_configurations") = std::vector<tbk::PoolConfiguration>{},
             nb::call_guard<nb::gil_scoped_release>())
         .def("allocate_pools", &BaseKVCacheManager::allocatePools, nb::call_guard<nb::gil_scoped_release>())
         .def("release_pools", &BaseKVCacheManager::releasePools, nb::call_guard<nb::gil_scoped_release>())
@@ -422,13 +435,16 @@ void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(nb::module_& m)
         .def("get_iteration_stats", &BaseKVCacheManager::getIterationStats, nb::call_guard<nb::gil_scoped_release>())
         .def_prop_ro("max_blocks_per_seq",
             [](tbk::BaseKVCacheManager& self) { return self.getOffsetTableDimensions().maxBlocksPerSeq; })
-        .def("get_needed_blocks_one_step", &BaseKVCacheManager::getNeededBlocksOneStep,
+        // nanobind does not inherit C++ default arguments from member-function pointers, so the
+        // cached_summary default must be spelled out here or Python callers that omit it raise
+        // TypeError. See kvCacheManager.h for the C++ signatures.
+        .def("get_needed_blocks_one_step", &BaseKVCacheManager::getNeededBlocksOneStep, nb::arg("req"),
+            nb::arg("two_steps_look_ahead"), nb::arg("window_size"), nb::arg("cached_summary") = std::nullopt,
             nb::call_guard<nb::gil_scoped_release>())
-        .def("get_remaining_blocks_to_completion", &BaseKVCacheManager::getRemainingBlocksToCompletion,
-            nb::call_guard<nb::gil_scoped_release>())
+        .def("get_remaining_blocks_to_completion", &BaseKVCacheManager::getRemainingBlocksToCompletion, nb::arg("req"),
+            nb::arg("window_size"), nb::arg("cached_summary") = std::nullopt, nb::call_guard<nb::gil_scoped_release>())
         .def("add_token", &BaseKVCacheManager::addToken, nb::call_guard<nb::gil_scoped_release>())
         .def("get_token_count", &BaseKVCacheManager::getTokenCount, nb::arg("request_id"))
-        .def("add_sequence", &BaseKVCacheManager::addSequence, nb::call_guard<nb::gil_scoped_release>())
         .def(
             "add_sequence_batch",
             [](tbk::BaseKVCacheManager& self, nb::list requestInfosList, nb::list llmRequestsList)
@@ -452,6 +468,7 @@ void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(nb::module_& m)
             nb::arg("request_infos"), nb::arg("llm_requests"))
         .def("remove_sequence", &BaseKVCacheManager::removeSequence, nb::call_guard<nb::gil_scoped_release>())
         .def("pin_blocks", &BaseKVCacheManager::pinBlocks, nb::call_guard<nb::gil_scoped_release>())
+        .def("truncate_blocks", &BaseKVCacheManager::truncateBlocks, nb::call_guard<nb::gil_scoped_release>())
         .def("scheduling_remove_sequence", &BaseKVCacheManager::schedulingRemoveSequence,
             nb::call_guard<nb::gil_scoped_release>())
         .def(
@@ -586,11 +603,21 @@ void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(nb::module_& m)
         .def("store_context_blocks", &BaseKVCacheManager::storeContextBlocks, nb::call_guard<nb::gil_scoped_release>())
         .def("store_blocks_for_reuse", &BaseKVCacheManager::storeBlocksForReuse,
             nb::call_guard<nb::gil_scoped_release>())
-        .def("find_new_context_block", &BaseKVCacheManager::findNewContextBlock, nb::arg("unique_tokens"),
+        .def("analyze_prefix_reuse", &BaseKVCacheManager::analyzePrefixReuse, nb::arg("unique_tokens"),
             nb::arg("llm_request"), nb::call_guard<nb::gil_scoped_release>())
-        .def("count_reusable_blocks", &BaseKVCacheManager::countReusableBlocks, nb::arg("unique_tokens"),
-            nb::arg("llm_request"), nb::arg("only_allocated") = false, nb::call_guard<nb::gil_scoped_release>())
         .def("get_cache_block_ids", &BaseKVCacheManager::getCacheBlockIds, nb::call_guard<nb::gil_scoped_release>())
+        .def(
+            "get_num_front_blocks_removed",
+            [](BaseKVCacheManager const& self, tb::LlmRequest::RequestIdType requestId, SizeType32 windowSize)
+            {
+                auto const& seq = self.getSequence(requestId);
+                // Per-window query.  windowSize is required (no aggregation): the Python
+                // wrapper in resource_manager.py provides a "default to first window"
+                // convenience layer; the C++/nanobind boundary stays explicit so that
+                // every caller is forced to think about which pool's counter it wants.
+                return seq.getNumFrontBlocksRemoved(windowSize);
+            },
+            nb::arg("request_id"), nb::arg("window_size"), nb::call_guard<nb::gil_scoped_release>())
         .def("get_batch_cache_block_ids", &BaseKVCacheManager::getBatchCacheBlockIds,
             nb::call_guard<nb::gil_scoped_release>())
         .def("flush_iteration_events", &BaseKVCacheManager::flushIterationEvents,
@@ -622,21 +649,23 @@ void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(nb::module_& m)
     nb::class_<tbk::KVCacheManager, tbk::BaseKVCacheManager>(m, "KVCacheManager")
         .def(nb::init<std::vector<SizeType32> const&, SizeType32, SizeType32,
                  std::map<SizeType32, std::tuple<SizeType32, SizeType32>> const&, SizeType32, SizeType32,
-                 std::vector<SizeType32> const&, std::optional<tbk::TempAttentionWindowInputs> const&,
-                 nvinfer1::DataType, SizeType32, int64_t, runtime::SizeType32, bool, tbk::CacheType,
-                 std::optional<tensorrt_llm::executor::RetentionPriority>, std::shared_ptr<tbk::KVCacheEventManager>,
-                 bool, bool, std::shared_ptr<tbc::KvCacheConnectorManager>, bool, SizeType32, SizeType32,
-                 std::optional<tbk::LinearAttentionMetadata>>(),
+                 std::vector<SizeType32> const&, nvinfer1::DataType, SizeType32, int64_t, SizeType32, SizeType32, bool,
+                 tbk::CacheType, std::optional<tensorrt_llm::executor::RetentionPriority>,
+                 std::shared_ptr<tbk::KVCacheEventManager>, bool, bool, std::shared_ptr<tbc::KvCacheConnectorManager>,
+                 bool, SizeType32, SizeType32, bool, std::optional<tbk::LinearAttentionMetadata>,
+                 std::vector<tbk::PoolConfiguration> const&>(),
             nb::arg("num_kv_heads_per_layer"), nb::arg("size_per_head"), nb::arg("tokens_per_block"),
             nb::arg("blocks_per_window"), nb::arg("max_num_sequences"), nb::arg("max_beam_width"),
-            nb::arg("max_attention_window_vec"), nb::arg("temp_attention_window_inputs").none(), nb::arg("dtype"),
-            nb::arg("sink_token_length"), nb::arg("stream"), nb::arg("max_sequence_length").none(),
-            nb::arg("enable_block_reuse") = false, nb::arg("cache_type") = tbk::CacheType::kSELF,
-            nb::arg("secondary_offload_min_priority") = std::nullopt, nb::arg("event_manager") = nullptr,
-            nb::arg("enable_partial_reuse") = true, nb::arg("copy_on_partial_reuse") = true,
-            nb::arg("kv_connector_manager") = nullptr, nb::arg("enable_indexer_k_cache") = false,
-            nb::arg("indexer_k_cache_quant_block_size") = 128, nb::arg("indexer_k_cache_index_head_dim") = 0,
-            nb::arg("linear_attention_metadata").none() = std::nullopt, nb::call_guard<nb::gil_scoped_release>())
+            nb::arg("max_attention_window_vec"), nb::arg("dtype"), nb::arg("sink_token_length"), nb::arg("stream"),
+            nb::arg("max_sequence_length"), nb::arg("chunk_size"), nb::arg("enable_block_reuse") = false,
+            nb::arg("cache_type") = tbk::CacheType::kSELF, nb::arg("secondary_offload_min_priority") = std::nullopt,
+            nb::arg("event_manager") = nullptr, nb::arg("enable_partial_reuse") = true,
+            nb::arg("copy_on_partial_reuse") = true, nb::arg("kv_connector_manager") = nullptr,
+            nb::arg("enable_indexer_k_cache") = false, nb::arg("indexer_k_cache_quant_block_size") = 128,
+            nb::arg("indexer_k_cache_index_head_dim") = 0, nb::arg("indexer_k_cache_use_fp4") = false,
+            nb::arg("linear_attention_metadata").none() = std::nullopt,
+            nb::arg("pool_configurations") = std::vector<tbk::PoolConfiguration>{},
+            nb::call_guard<nb::gil_scoped_release>())
         .def(
             "scheduling_has_free_blocks",
             [](tbk::KVCacheManager& self, SizeType32 numRequired, SizeType32 windowSize)
@@ -644,8 +673,15 @@ void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(nb::module_& m)
             nb::arg("num_required"), nb::arg("window_size"), nb::call_guard<nb::gil_scoped_release>())
         .def_prop_ro(
             "is_variable_window", [](tbk::KVCacheManager& self) { return self.getBlockManager().isVariableWindow(); })
+        // Per-pool introspection: lets Python discover (windowSize, sizePerHead, dtype) per
+        // hosted pool so a single KVCacheManager can host mixed-shape pools without a
+        // Python-side wrapper duplicating the layer->pool routing.
+        .def_prop_ro("pool_configurations",
+            [](tbk::KVCacheManager& self) { return self.getBlockManager().getPoolConfigurations(); })
         .def("copy_linear_attention_block", &tbk::KVCacheManager::copyLinearAttentionBlock, nb::arg("llm_request"),
-            nb::call_guard<nb::gil_scoped_release>());
+            nb::call_guard<nb::gil_scoped_release>())
+        .def("copy_linear_attention_block_batch", &tbk::KVCacheManager::copyLinearAttentionBlockBatch,
+            nb::arg("llm_requests"), nb::call_guard<nb::gil_scoped_release>());
 }
 
 void tb::BasePeftCacheManagerBindings::initBindings(nb::module_& m)

@@ -183,8 +183,8 @@ def launch_disaggregated_llm(
     disagg_cluster = {
         "cluster_uri": cluster_uri,
         "cluster_name": "test_cluster",
-        "heartbeat_interval_sec": 1,
-        "inactive_timeout_sec": 2,
+        "heartbeat_interval_sec": 5,
+        "inactive_timeout_sec": 10,
     }
 
     # Auto-deduce minimal_instances from num_instances
@@ -365,13 +365,9 @@ def launch_disaggregated_llm(
     with (
             MyThreadPoolExecutor(max_workers=max_workers) as thread_pool,
             temp_dir,
-            multi_popen(ctx_servers, "ctx",
-                        enable_redirect_log=False) as ctx_processes,
-            multi_popen(gen_servers, "gen", enable_redirect_log=False) as
-            gen_processes,
-            multi_popen([(base_env, server_cmd)],
-                        "disagg",
-                        enable_redirect_log=False) as server_processes,
+            multi_popen(ctx_servers, "ctx") as ctx_processes,
+            multi_popen(gen_servers, "gen") as gen_processes,
+            multi_popen([(base_env, server_cmd)], "disagg") as server_processes,
     ):
         start_time = time.time()
         server_is_ready = False
@@ -1063,11 +1059,11 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
         if mtp_nextn > 0:
             ctx_server_config["speculative_config"] = {
                 "decoding_type": "MTP",
-                "num_nextn_predict_layers": mtp_nextn
+                "max_draft_len": mtp_nextn
             }
             gen_server_config["speculative_config"] = {
                 "decoding_type": "MTP",
-                "num_nextn_predict_layers": mtp_nextn
+                "max_draft_len": mtp_nextn
             }
         disaggregated_server_config = {
             "hostname": "localhost",
@@ -1213,11 +1209,11 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
         if mtp_nextn > 0:
             ctx_server_config["speculative_config"] = {
                 "decoding_type": "MTP",
-                "num_nextn_predict_layers": mtp_nextn
+                "max_draft_len": mtp_nextn
             }
             gen_server_config["speculative_config"] = {
                 "decoding_type": "MTP",
-                "num_nextn_predict_layers": mtp_nextn
+                "max_draft_len": mtp_nextn
             }
         disaggregated_server_config = {
             "hostname": "localhost",
@@ -1611,12 +1607,12 @@ class TestDeepSeekV32Exp(LlmapiAccuracyTestHarness):
 
 
 @pytest.mark.timeout(DEFAULT_TEST_TIMEOUT)
+@skip_pre_hopper
 class TestQwen3_8B(LlmapiAccuracyTestHarness):
     MODEL_NAME = "Qwen3/Qwen3-8B"
     MODEL_PATH = f"{llm_models_root()}/Qwen3/Qwen3-8B-FP8"
 
     @pytest.mark.skip_less_device(2)
-    @skip_no_hopper
     def test_nixl_backend(self):
         ctx_server_config = {
             "disable_overlap_scheduler": True,
@@ -1647,7 +1643,6 @@ class TestQwen3_8B(LlmapiAccuracyTestHarness):
                                       self.MODEL_PATH) as llm:
             run_accuracy_test(llm, self.MODEL_NAME, ["GSM8K"])
 
-    @skip_pre_hopper
     @pytest.mark.skip_less_device(2)
     @pytest.mark.parametrize("overlap_scheduler", [False, True])
     @pytest.mark.parametrize("enable_partial_reuse", [True, False])
@@ -1733,7 +1728,6 @@ class TestQwen3_8B(LlmapiAccuracyTestHarness):
                                       self.MODEL_PATH) as llm:
             run_accuracy_test(llm, self.MODEL_NAME, ["MMLU", "GSM8K"])
 
-    @skip_pre_hopper
     @pytest.mark.skip_less_device(2)
     def test_chunked_prefill(self):
         self._test_chunked_prefill_helper(ctx_pp=1)
@@ -1847,7 +1841,9 @@ class TestQwen3_8B(LlmapiAccuracyTestHarness):
             "ctx_tp1pp1", "ctx_tp1pp2", "ctx_tp2pp1", "ctx_tp2pp2", "ctx_tp1pp4"
         ],
     )
-    def test_gen_first(self, ctx_tp_pp, gen_tp_pp):
+    @pytest.mark.parametrize("enable_attention_dp", [False, True],
+                             ids=["noadp", "adp"])
+    def test_gen_first(self, ctx_tp_pp, gen_tp_pp, enable_attention_dp):
         ctx_tp, ctx_pp = ctx_tp_pp
         gen_tp, gen_pp = gen_tp_pp
         total_gpus = ctx_tp * ctx_pp + gen_tp * gen_pp
@@ -1862,6 +1858,7 @@ class TestQwen3_8B(LlmapiAccuracyTestHarness):
         ctx_server_config = {
             "tensor_parallel_size": ctx_tp,
             "pipeline_parallel_size": ctx_pp,
+            "enable_attention_dp": enable_attention_dp,
             "disable_overlap_scheduler": True,
             "cuda_graph_config": None,
             "cache_transceiver_config": {
@@ -1873,6 +1870,7 @@ class TestQwen3_8B(LlmapiAccuracyTestHarness):
         gen_server_config = {
             "tensor_parallel_size": gen_tp,
             "pipeline_parallel_size": gen_pp,
+            "enable_attention_dp": enable_attention_dp,
             "disable_overlap_scheduler": True,
             "cuda_graph_config": None,
             "cache_transceiver_config": {
@@ -1986,18 +1984,13 @@ class TestNemotron3Super120B(LlmapiAccuracyTestHarness):
     MODEL_NAME = "nvidia/Nemotron-Super-V3"
     MODEL_PATH = f"{llm_models_root()}/NVIDIA-Nemotron-3-Super-120B-A12B-FP8"
 
-    def _make_configs(self, backend: str, use_python_runtime: bool = False):
-        if use_python_runtime:
-            cache_transceiver_config = {
-                "backend": "NIXL",
-                "max_tokens_in_buffer": 8192,
-                "transceiver_runtime": "PYTHON",
-            }
-        else:
-            cache_transceiver_config = {
-                "backend": backend,
-                "max_tokens_in_buffer": 8192,
-            }
+    def _make_configs(self, use_py_transceiver: bool = False):
+        cache_transceiver_config = {
+            "backend": "NIXL",
+            "max_tokens_in_buffer": 8192,
+        }
+        if use_py_transceiver:
+            cache_transceiver_config["transceiver_runtime"] = "PYTHON"
 
         ctx_server_config = {
             "max_batch_size": 32,
@@ -2005,6 +1998,7 @@ class TestNemotron3Super120B(LlmapiAccuracyTestHarness):
             "cache_transceiver_config": cache_transceiver_config,
             "tensor_parallel_size": 4,
             "moe_expert_parallel_size": 4,
+            "pipeline_parallel_size": 1,
             "kv_cache_config": {
                 "enable_block_reuse": False,
                 "mamba_ssm_cache_dtype": "float16",
@@ -2019,9 +2013,9 @@ class TestNemotron3Super120B(LlmapiAccuracyTestHarness):
             "max_batch_size": 32,
             "disable_overlap_scheduler": False,
             "cache_transceiver_config": cache_transceiver_config,
-            "tensor_parallel_size": 2,
-            "moe_expert_parallel_size": 2,
-            "pipeline_parallel_size": 2,
+            "tensor_parallel_size": 4,
+            "moe_expert_parallel_size": 4,
+            "pipeline_parallel_size": 1,
             "cuda_graph_config": {
                 "max_batch_size": 32,
                 "enable_padding": True,
@@ -2053,16 +2047,20 @@ class TestNemotron3Super120B(LlmapiAccuracyTestHarness):
 
     @pytest.mark.skip_less_device(8)
     @parametrize_with_ids("use_py_transceiver", [True, False])
-    def test_auto_dtype(self, use_py_transceiver):
-        ctx_cfg, gen_cfg, disagg_cfg = self._make_configs(
-            "UCX", use_py_transceiver)
-        with launch_disaggregated_llm(disagg_cfg, ctx_cfg, gen_cfg,
-                                      self.MODEL_PATH) as llm:
-            run_accuracy_test(llm, self.MODEL_NAME, ["GSM8K"])
+    @parametrize_with_ids("block_reuse", [True, False])
+    @parametrize_with_ids("mtp_nextn", [0, 1, 3])
+    def test_auto_dtype(self, use_py_transceiver, block_reuse, mtp_nextn):
+        if use_py_transceiver and block_reuse:
+            pytest.skip("Python transceiver does not support block reuse")
 
-    @pytest.mark.skip_less_device(8)
-    def test_nixl_backend(self):
-        ctx_cfg, gen_cfg, disagg_cfg = self._make_configs("NIXL")
+        ctx_cfg, gen_cfg, disagg_cfg = self._make_configs(use_py_transceiver)
+        if mtp_nextn > 0:
+            spec = {"decoding_type": "MTP", "max_draft_len": mtp_nextn}
+            ctx_cfg["speculative_config"] = spec
+            gen_cfg["speculative_config"] = spec
+        if block_reuse:
+            ctx_cfg["kv_cache_config"]["enable_block_reuse"] = True
+            gen_cfg["kv_cache_config"]["enable_block_reuse"] = True
         with launch_disaggregated_llm(disagg_cfg, ctx_cfg, gen_cfg,
                                       self.MODEL_PATH) as llm:
             run_accuracy_test(llm, self.MODEL_NAME, ["GSM8K"])
@@ -2070,7 +2068,7 @@ class TestNemotron3Super120B(LlmapiAccuracyTestHarness):
     @pytest.mark.skip_less_device(8)
     def test_ctx_dp2_gen_tp4(self):
         ctx_cfg, gen_cfg, disagg_cfg = self._make_configs(
-            "NIXL", use_python_runtime=True)
+            use_py_transceiver=False)
         ctx_cfg["tensor_parallel_size"] = 2
         ctx_cfg["moe_expert_parallel_size"] = 2
         ctx_cfg["enable_attention_dp"] = True
@@ -2090,17 +2088,12 @@ class TestQwen3NextInstruct(LlmapiAccuracyTestHarness):
     MODEL_PATH = f"{llm_models_root()}/Qwen3-Next/Qwen3-Next-80B-A3B-Instruct"
 
     def _make_configs(self, use_py_transceiver: bool):
+        cache_transceiver_config = {
+            "backend": "NIXL",
+            "max_tokens_in_buffer": 8192,
+        }
         if use_py_transceiver:
-            cache_transceiver_config = {
-                "backend": "NIXL",
-                "max_tokens_in_buffer": 8192,
-                "transceiver_runtime": "PYTHON",
-            }
-        else:
-            cache_transceiver_config = {
-                "backend": "NIXL",
-                "max_tokens_in_buffer": 8192,
-            }
+            cache_transceiver_config["transceiver_runtime"] = "PYTHON"
 
         ctx_server_config = {
             "max_batch_size": 32,

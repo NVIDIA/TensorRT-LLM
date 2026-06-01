@@ -404,8 +404,11 @@ def generate_python_stubs_linux(venv_python: Path, deep_ep: bool,
     try:
         build_run(f"\"{venv_python}\" -m nanobind.stubgen -m bindings -r -O .",
                   env=env_stub_gen)
+        # Pre-import torch so deep_gemm_cpp_tllm's FP4 scalar-type registration
+        # succeeds; CLI args after `-c ...` land in sys.argv[1:] for argparse.
         build_run(
-            f"\"{venv_python}\" -m pybind11_stubgen -o . deep_gemm_cpp_tllm --exit-code",
+            f"\"{venv_python}\" -c 'import torch; from pybind11_stubgen import main; main()' "
+            "-o . deep_gemm_cpp_tllm --exit-code",
             env=env_stub_gen)
         if flash_mla:
             build_run(
@@ -491,7 +494,9 @@ def main(*,
          clean: bool = False,
          clean_wheel: bool = False,
          configure_cmake: bool = False,
+         configure_only: bool = False,
          use_ccache: bool = False,
+         use_3rdparty_cache: bool = False,
          fast_build: bool = False,
          cpp_only: bool = False,
          install: bool = False,
@@ -549,6 +554,27 @@ def main(*,
     if cuda_architectures is not None:
         if "70-real" in cuda_architectures:
             raise RuntimeError("Volta architecture is deprecated support.")
+
+    # Debug and RelWithDebInfo enable CUDA `--generate-line-info`, which
+    # inflates .text so much that linking against every supported arch
+    # overflows section limits. Require an explicit arch list so the build
+    # won't silently fail deep into compilation.
+    if build_type in ("Debug", "RelWithDebInfo") and not cuda_architectures:
+        raise RuntimeError(
+            f"Building {build_type} requires --cuda_architectures to be set "
+            "explicitly (e.g. --cuda_architectures=90-real). Building for all "
+            "architectures with line info enabled exceeds linker section "
+            "limits. Pass a narrow arch list matching the GPU you intend to "
+            "debug/profile.")
+
+    if build_type == "Debug":
+        print(
+            "-- Debug build: only --generate-line-info is enabled by default. "
+            "Full device debug info (-G) is NOT enabled because it can make "
+            "ptxas memory usage explode and get OOM-killed on some kernels. "
+            "If you need cuda-gdb stepping inside kernels, opt in with "
+            "`--extra-cmake-vars CMAKE_CUDA_FLAGS_DEBUG=-G` and make sure "
+            "the build host has enough memory for ptxas.")
 
     cuda_architectures = cuda_architectures or 'all'
     cmake_cuda_architectures = f'"-DCMAKE_CUDA_ARCHITECTURES={cuda_architectures}"'
@@ -609,6 +635,20 @@ def main(*,
     if fast_build:
         cmake_def_args.append(f"-DFAST_BUILD=ON")
 
+    # FetchContent bare-repo cache (see 3rdparty/CMakeLists.txt).  Forwarded
+    # as -D vars so the configuration is reproducible from CMakeCache.txt
+    # alone and doesn't depend on the caller's env.  The env var hand-off
+    # lets a wrapping agent point at a shared cache without patching
+    # build_wheel.py.
+    if use_3rdparty_cache:
+        cache_dir = os.environ.get("TRTLLM_FETCHCONTENT_CACHE") or str(
+            project_dir / "3rdparty" / ".cache_3rdparty")
+        cmake_def_args.append(f"-DTRTLLM_FETCHCONTENT_CACHE={cache_dir}")
+        update_cmd = os.environ.get("TRTLLM_FETCHCONTENT_UPDATE_CMD", "")
+        if update_cmd:
+            cmake_def_args.append(
+                f"-DTRTLLM_FETCHCONTENT_UPDATE_CMD={update_cmd}")
+
     if nvrtc_dynamic_linking:
         cmake_def_args.append(f"-DNVRTC_DYNAMIC_LINKING=ON")
 
@@ -662,7 +702,7 @@ def main(*,
         generate_fmha_cu(project_dir, venv_python)
 
     with working_directory(build_dir):
-        if clean or first_build or configure_cmake:
+        if clean or first_build or configure_cmake or configure_only:
             build_run(
                 f"\"{venv_conan}\" install --build=missing --no-remote --output-folder={build_dir}/conan -s 'build_type={build_type}' {source_dir}"
             )
@@ -684,6 +724,9 @@ def main(*,
             print("CMake Configure command: ")
             print(cmake_configure_command)
             build_run(cmake_configure_command)
+
+        if configure_only:
+            return
 
         maybe_keep_depfile = " -- -d keepdepfile" if generator == "Ninja" else ""
         cmake_build_command = (
@@ -1142,10 +1185,21 @@ def add_arguments(parser: ArgumentParser):
     parser.add_argument("--configure_cmake",
                         action="store_true",
                         help="Always configure cmake before building")
+    parser.add_argument(
+        "--configure-only",
+        action="store_true",
+        help="Run cmake configure and exit, skipping build and wheel packaging")
     parser.add_argument("--use_ccache",
                         default=False,
                         action="store_true",
                         help="Use ccache compiler driver for faster rebuilds")
+    parser.add_argument(
+        "--use-3rdparty-cache",
+        default=False,
+        action="store_true",
+        help="Accelerate FetchContent git clones via bare reference "
+        "repos under $TRTLLM_FETCHCONTENT_CACHE "
+        "(default: <project>/3rdparty/.cache_3rdparty).")
     parser.add_argument(
         "--fast_build",
         "-f",

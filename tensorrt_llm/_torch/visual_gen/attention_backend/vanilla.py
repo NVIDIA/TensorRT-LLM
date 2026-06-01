@@ -99,7 +99,14 @@ class VanillaAttention(AttentionBackend):
             f"Invalid v shape: expected [B={q.shape[0]}, H_kv, S_kv, D={self.head_dim}], got {v.shape}"
         )
 
-        return F.scaled_dot_product_attention(q, k, v, is_causal=is_causal, scale=self.scale)
+        return F.scaled_dot_product_attention(
+            q,
+            k,
+            v,
+            is_causal=is_causal,
+            scale=self.scale,
+            enable_gqa=self.num_heads != self.num_kv_heads,
+        )
 
     @property
     def preferred_layout(self) -> AttentionTensorLayout:

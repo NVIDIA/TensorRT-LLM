@@ -24,13 +24,13 @@ import torch.multiprocessing as mp
 
 try:
     from tensorrt_llm._torch.visual_gen.config import (
-        AttentionConfig,
         DiffusionModelConfig,
-        TorchCompileConfig,
+        create_attention_metadata_state,
     )
     from tensorrt_llm._torch.visual_gen.mapping import VisualGenMapping
     from tensorrt_llm._utils import get_free_port
     from tensorrt_llm.models.modeling_utils import QuantConfig
+    from tensorrt_llm.visual_gen.args import AttentionConfig, TorchCompileConfig
 
     MODULES_AVAILABLE = True
 except ImportError:
@@ -148,10 +148,13 @@ def _make_model_config(pretrained_dict, ulysses_size=1, backend="VANILLA"):
     config = DiffusionModelConfig(
         pretrained_config=pretrained_config,
         quant_config=QuantConfig(),
-        torch_compile=TorchCompileConfig(enable_torch_compile=False),
+        torch_compile=TorchCompileConfig(enable=False),
         attention=AttentionConfig(backend=backend),
         visual_gen_mapping=vgm,
         cache=None,
+        attention_metadata_state=(
+            create_attention_metadata_state() if backend.upper() == "TRTLLM" else None
+        ),
         skip_create_weights_in_init=False,
     )
     config.mapping = vgm.to_llm_mapping()

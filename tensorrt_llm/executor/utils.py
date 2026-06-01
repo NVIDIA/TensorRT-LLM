@@ -23,10 +23,47 @@ class LlmLauncherEnvs(StrEnum):
     # Spawn a process for the LLM-API Proxy
     TLLM_SPAWN_PROXY_PROCESS = "TLLM_SPAWN_PROXY_PROCESS"
     TLLM_SPAWN_PROXY_PROCESS_IPC_ADDR = "TLLM_SPAWN_PROXY_PROCESS_IPC_ADDR"
-    TLLM_SPAWN_PROXY_PROCESS_IPC_HMAC_KEY = "TLLM_SPAWN_PROXY_PROCESS_IPC_HMAC_KEY"
+    TLLM_SPAWN_PROXY_PROCESS_IPC_HMAC_KEY_FD = (
+        "TLLM_SPAWN_PROXY_PROCESS_IPC_HMAC_KEY_FD")
 
     # Whether to use periodical responses handler in await_responses
     TLLM_EXECUTOR_PERIODICAL_RESP_IN_AWAIT = "TLLM_EXECUTOR_PERIODICAL_RESP_IN_AWAIT"
+
+
+_SPAWN_PROXY_PROCESS_IPC_HMAC_KEY: bytes | None = None
+
+
+def _normalize_spawn_proxy_process_ipc_hmac_key(key: str | bytes) -> bytes:
+    if isinstance(key, bytes):
+        if len(key) == 32:
+            return key
+        key = key.decode("ascii")
+
+    key_bytes = bytes.fromhex(key)
+    if len(key_bytes) != 32:
+        raise ValueError("IPC HMAC key must be 32 bytes.")
+    return key_bytes
+
+
+def set_spawn_proxy_process_ipc_hmac_key(key: str | bytes) -> None:
+    global _SPAWN_PROXY_PROCESS_IPC_HMAC_KEY
+    _SPAWN_PROXY_PROCESS_IPC_HMAC_KEY = (
+        _normalize_spawn_proxy_process_ipc_hmac_key(key))
+
+
+def _read_spawn_proxy_process_ipc_hmac_key_fd(fd_value: str) -> bytes:
+    fd = int(fd_value)
+    chunks: list[bytes] = []
+    try:
+        while True:
+            chunk = os.read(fd, 4096)
+            if not chunk:
+                break
+            chunks.append(chunk)
+    finally:
+        os.close(fd)
+
+    return _normalize_spawn_proxy_process_ipc_hmac_key(b"".join(chunks))
 
 
 def get_spawn_proxy_process_ipc_addr_env() -> str | None:
@@ -34,10 +71,22 @@ def get_spawn_proxy_process_ipc_addr_env() -> str | None:
     return os.getenv(LlmLauncherEnvs.TLLM_SPAWN_PROXY_PROCESS_IPC_ADDR)
 
 
-def get_spawn_proxy_process_ipc_hmac_key_env() -> bytes | None:
+def get_spawn_proxy_process_ipc_hmac_key_env() -> bytes:
     ''' Get the HMAC key for the spawn proxy process dynamically. '''
-    if key := os.getenv("TLLM_SPAWN_PROXY_PROCESS_IPC_HMAC_KEY"):
-        return bytes.fromhex(key)
+    global _SPAWN_PROXY_PROCESS_IPC_HMAC_KEY
+    if _SPAWN_PROXY_PROCESS_IPC_HMAC_KEY is not None:
+        return _SPAWN_PROXY_PROCESS_IPC_HMAC_KEY
+
+    key_fd = os.environ.pop(
+        LlmLauncherEnvs.TLLM_SPAWN_PROXY_PROCESS_IPC_HMAC_KEY_FD, None)
+    if key_fd is not None:
+        _SPAWN_PROXY_PROCESS_IPC_HMAC_KEY = (
+            _read_spawn_proxy_process_ipc_hmac_key_fd(key_fd))
+        return _SPAWN_PROXY_PROCESS_IPC_HMAC_KEY
+
+    raise AssertionError(
+        f"{LlmLauncherEnvs.TLLM_SPAWN_PROXY_PROCESS_IPC_HMAC_KEY_FD} is not set. "
+        "HMAC encryption is required for IPC communication.")
 
 
 def get_spawn_proxy_process_env() -> bool:
@@ -125,15 +174,23 @@ class IntraProcessQueue:
     def close(self):
         pass
 
+    def drain(self) -> list:
+        """Non-blocking drain: return all currently available messages."""
+        results = []
+        while True:
+            try:
+                results.append(self.queue.get_nowait())
+            except Empty:
+                break
+        return results
+
     def poll(self, timeout=None) -> bool:
-        try:
-            # Try to get an item from the queue without blocking
-            item = self.queue.get(timeout=timeout)
-            # If successful, put the item back to not alter the state
-            self.queue.put(item)
-            return True
-        except Empty:
-            # If the queue thread is empty, return False
+        with self.queue.not_empty:
+            if self.queue._qsize() > 0:
+                return True
+            if timeout is not None and timeout > 0:
+                self.queue.not_empty.wait(timeout=timeout)
+                return self.queue._qsize() > 0
             return False
 
 
@@ -142,6 +199,7 @@ class WorkerCommIpcAddrs(NamedTuple):
     request_queue_addr: tuple[str, Optional[bytes]]
     worker_init_status_queue_addr: tuple[str, Optional[bytes]]
     result_queue_addr: tuple[str, Optional[bytes]]
+    resource_governor_queue_addr: Optional[tuple[str, Optional[bytes]]] = None
 
 
 def is_llm_response(instance):

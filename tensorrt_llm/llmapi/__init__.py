@@ -2,6 +2,7 @@ from .._torch.async_llm import AsyncLLM
 from ..disaggregated_params import DisaggregatedParams, DisaggScheduleStyle
 from ..executor import CompletionOutput, LoRARequest, RequestError
 from ..sampling_params import GuidedDecodingParams, SamplingParams
+from ..scheduling_params import SchedulingParams
 from .build_cache import BuildCacheConfig
 from .llm import LLM, RequestOutput
 # yapf: disable
@@ -9,12 +10,13 @@ from .llm_args import (AttentionDpConfig, AutoDecodingConfig, BatchingType,
                        CacheTransceiverConfig, CalibConfig,
                        CapacitySchedulerPolicy, ContextChunkingPolicy,
                        CudaGraphConfig, DeepSeekSparseAttentionConfig,
-                       DraftTargetDecodingConfig, DynamicBatchConfig,
-                       Eagle3DecodingConfig, EagleDecodingConfig,
-                       ExtendedRuntimePerfKnobConfig, KvCacheConfig, LlmArgs,
-                       LookaheadDecodingConfig, MedusaDecodingConfig, MoeConfig,
-                       MTPDecodingConfig, NGramDecodingConfig,
-                       PARDDecodingConfig, PrometheusMetricsConfig,
+                       DFlashDecodingConfig, DraftTargetDecodingConfig,
+                       DynamicBatchConfig, Eagle3DecodingConfig,
+                       EagleDecodingConfig, ExtendedRuntimePerfKnobConfig,
+                       KvCacheConfig, LlmArgs, LookaheadDecodingConfig,
+                       MedusaDecodingConfig, MoeConfig, MTPDecodingConfig,
+                       NGramDecodingConfig, PARDDecodingConfig,
+                       PrometheusMetricsConfig, ReorderRequestPolicyConfig,
                        RocketSparseAttentionConfig, SADecodingConfig,
                        SAEnhancerConfig, SaveHiddenStatesDecodingConfig,
                        SchedulerConfig, SkipSoftmaxAttentionConfig,
@@ -60,6 +62,7 @@ __all__ = [
     'CacheTransceiverConfig',
     'NGramDecodingConfig',
     'PARDDecodingConfig',
+    'DFlashDecodingConfig',
     'SADecodingConfig',
     'SAEnhancerConfig',
     'UserProvidedDecodingConfig',
@@ -73,7 +76,9 @@ __all__ = [
     'LoRARequest',
     'SaveHiddenStatesDecodingConfig',
     'RocketSparseAttentionConfig',
+    'ReorderRequestPolicyConfig',
     'DeepSeekSparseAttentionConfig',
+    'SchedulingParams',
     'SkipSoftmaxAttentionConfig',
     'PrometheusMetricsConfig',
 ]

@@ -62,6 +62,10 @@ def inplace_info():
             1: "input",
             2: "residual"
         },
+        torch.ops.trtllm.flashinfer_fused_add_rmsnorm_quant.default: {
+            1: "out",
+            2: "residual"
+        },
         torch.ops.trtllm.attn_custom_op_inplace.default: {
             1: "output",
             2: "output_sf"
@@ -77,6 +81,12 @@ def inplace_info():
         },
         torch.ops.trtllm.fused_dit_qk_norm_rope.default: {
             1: "qkv"
+        },
+        torch.ops.trtllm.fused_dit_split_norm_rope.default: {
+            1: "tensor"
+        },
+        torch.ops.trtllm.fused_dit_split_norm.default: {
+            1: "tensor"
         },
         torch.ops.trtllm.flashinfer_apply_rope_with_cos_sin_cache_inplace.default:
         {
@@ -104,7 +114,13 @@ def inplace_info():
         },
         torch.ops.trtllm.cute_dsl_fp8_bmm_blackwell.default: {
             1: "output"
-        }
+        },
+        torch.ops.trtllm.cute_dsl_bf16_bmm_blackwell.default: {
+            1: "output"
+        },
+        torch.ops.trtllm.cute_dsl_bf16_gemm_blackwell.default: {
+            1: "output"
+        },
     }
     if IS_CUDA_TILE_AVAILABLE:
         # cuda.tile availability depends on GPU capability thus runtime check.

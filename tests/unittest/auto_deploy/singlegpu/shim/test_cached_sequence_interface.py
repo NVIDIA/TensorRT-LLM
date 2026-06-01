@@ -1,3 +1,17 @@
+# SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """Unit tests for CachedSequenceInterface in interface.py.
 
 Tests the refactored CachedSequenceInterface which now:
@@ -10,6 +24,7 @@ import pytest
 import torch
 from _model_test_utils import default_max_num_tokens
 
+from tensorrt_llm._torch.auto_deploy._compat import KvCacheConfig
 from tensorrt_llm._torch.auto_deploy.custom_ops.attention_interface import (
     CausalConvResourceHandler,
     KVPagedResourceHandler,
@@ -23,12 +38,22 @@ from tensorrt_llm._torch.auto_deploy.custom_ops.attention_interface import (
 from tensorrt_llm._torch.auto_deploy.shim.interface import CachedSequenceInterface
 from tensorrt_llm._torch.pyexecutor.mamba_cache_manager import MambaHybridCacheManager
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
-from tensorrt_llm.llmapi import DraftTargetDecodingConfig
-from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 
 # =============================================================================
 # Fixtures
 # =============================================================================
+
+
+class _SpecDecModeForStateBindingTest:
+    def use_one_engine(self):
+        return True
+
+
+class _SpecConfigForStateBindingTest:
+    def __init__(self, max_draft_len: int):
+        self.max_draft_len = max_draft_len
+        self.tokens_per_gen_step = max_draft_len + 1
+        self.spec_dec_mode = _SpecDecModeForStateBindingTest()
 
 
 @pytest.fixture
@@ -244,6 +269,28 @@ def test_initialize_resources_paged_only_creates_kv_cache_manager(paged_kv_cache
     assert not isinstance(interface.kv_cache_manager, MambaHybridCacheManager)
 
 
+def test_initialize_resources_mixed_shape_pools_raise_when_uniform_managed_caches_required(
+    paged_kv_cache_config,
+):
+    """Strict configurations reject more than one distinct window-pool."""
+    interface = CachedSequenceInterface(
+        max_seq_len=128,
+        max_batch_size=4,
+        max_num_tokens=default_max_num_tokens(128, 4),
+        device="cuda",
+        kv_cache_config=paged_kv_cache_config,
+        requires_uniform_kv_caches=True,
+    )
+
+    interface.add_resource("kv_cache_full", KVPagedResourceHandler(8, 64, dtype=torch.float16))
+    interface.add_resource(
+        "kv_cache_swa", KVPagedResourceHandler(8, 80, dtype=torch.float16, sliding_window=32)
+    )
+
+    with pytest.raises(RuntimeError):
+        interface.initialize_resources()
+
+
 def test_initialize_resources_mixed_creates_mamba_hybrid_cache_manager(paged_kv_cache_config):
     """Test mixed paged + state resources create MambaHybridCacheManager."""
     interface = CachedSequenceInterface(
@@ -332,6 +379,74 @@ def test_initialize_resources_creates_state_views_with_correct_shape(paged_kv_ca
     assert ssm_cache.shape[2] == head_dim
     assert ssm_cache.shape[3] == ssm_state_size
     assert ssm_cache.dtype == torch.bfloat16
+
+
+def test_intermediate_state_resources_bind_via_managed_state_path(paged_kv_cache_config):
+    """Verify speculative Mamba intermediate state buffers bind through CSI-managed cache."""
+    interface = CachedSequenceInterface(
+        max_seq_len=128,
+        max_batch_size=4,
+        max_num_tokens=default_max_num_tokens(128, 4),
+        device="cuda",
+        kv_cache_config=paged_kv_cache_config,
+        spec_config=_SpecConfigForStateBindingTest(max_draft_len=2),
+    )
+
+    num_heads = 4
+    head_dim = 64
+    d_state = 16
+    conv_dim = head_dim * num_heads + 2 * 2 * d_state
+    resource_names = []
+
+    for i in range(2):
+        resource_names.append(
+            interface.add_resource(
+                f"ssm_state_{i}",
+                SSMResourceHandler(
+                    num_heads=num_heads,
+                    head_dim=head_dim,
+                    d_state=d_state,
+                    dtype=torch.bfloat16,
+                ),
+            )
+        )
+        resource_names.append(
+            interface.add_resource(
+                f"intermediate_ssm_state_{i}",
+                SpecSSMResourceHandler(
+                    num_heads=num_heads,
+                    head_dim=head_dim,
+                    d_state=d_state,
+                    dtype=torch.bfloat16,
+                ),
+            )
+        )
+        resource_names.append(
+            interface.add_resource(
+                f"conv_state_{i}",
+                CausalConvResourceHandler(conv_dim=conv_dim, d_conv=4, dtype=torch.float32),
+            )
+        )
+        resource_names.append(
+            interface.add_resource(
+                f"intermediate_conv_state_{i}",
+                SpecCausalConvResourceHandler(
+                    conv_dim=conv_dim,
+                    d_conv=4,
+                    dtype=torch.float32,
+                ),
+            )
+        )
+
+    num_caches = interface.initialize_resources()
+
+    assert num_caches == len(resource_names)
+    assert isinstance(interface.kv_cache_manager, MambaHybridCacheManager)
+    for resource_name in resource_names:
+        cache = interface._caches[resource_name]
+        assert cache is not None
+        assert cache.is_contiguous()
+        assert resource_name not in interface._unmanaged_resources
 
 
 def test_initialize_resources_unpaged_allocated_locally(paged_kv_cache_config):
@@ -736,6 +851,20 @@ def test_sequence_info_update_cache_information_resizes():
         assert seq_info._input_buffer.get_capacity("cache_loc") >= expected_capacity
 
 
+def test_sequence_info_update_cache_information_preserves_max_blocks():
+    """Verify max_blocks_per_seq is always based on max_seq_len (not window)."""
+    seq_info = SequenceInfo(
+        max_seq_len=128,
+        max_batch_size=4,
+        max_num_tokens=default_max_num_tokens(128, 4),
+        tokens_per_block=32,
+    )
+
+    original_max_blocks = seq_info.max_blocks_per_seq  # ceil(128 / 32) = 4
+    seq_info.update_cache_information(num_blocks=100)
+    assert seq_info.max_blocks_per_seq == original_max_blocks
+
+
 def test_sequence_info_last_page_len_uses_tokens_per_block():
     """Verify nest_sequences calculates last_page_len using tokens_per_block."""
     seq_info = SequenceInfo(
@@ -752,8 +881,8 @@ def test_sequence_info_last_page_len_uses_tokens_per_block():
         input_ids,
         cu_seqlen=[0, 25],
         input_pos=[0],
-        cache_loc=[0, 1],  # 2 pages
-        cu_num_pages=[0, 2],
+        cache_loc_per_pool=[[0, 1]],  # 2 pages
+        cu_num_pages_per_pool=[[0, 2]],
     )
 
     expected_last_page_len = (25 - 1) % 16 + 1
@@ -775,8 +904,8 @@ def test_sequence_info_page_assignments():
         input_ids,
         cu_seqlen=[0, 10, 30],
         input_pos=[0, 0],
-        cache_loc=[0, 1, 2],  # seq 0 has page 0, seq 1 has pages 1 and 2
-        cu_num_pages=[0, 1, 3],
+        cache_loc_per_pool=[[0, 1, 2]],  # seq 0 has page 0, seq 1 has pages 1 and 2
+        cu_num_pages_per_pool=[[0, 1, 3]],
     )
 
     cache_loc = seq_info.get_arg("cache_loc_host", truncate=True).tolist()
@@ -785,6 +914,26 @@ def test_sequence_info_page_assignments():
         cache_loc[cu_num_pages[i] : cu_num_pages[i + 1]] for i in range(len(cu_num_pages) - 1)
     ]
     assert page_assignments == [[0], [1, 2]]
+
+
+def test_sequence_info_set_capture_batch_max_draft_len_gt_0_builds_extend_only_batch():
+    """max_draft_len > 0 should build the synthetic extend-only batch used by Eagle capture."""
+    seq_info = SequenceInfo(
+        max_seq_len=128,
+        max_batch_size=4,
+        max_num_tokens=default_max_num_tokens(128, 4),
+        tokens_per_block=32,
+    )
+
+    seq_info.set_capture_batch(batch_size=2, max_draft_len=3)
+
+    assert not seq_info.is_generate_only
+    assert seq_info.is_extend_only
+    assert seq_info.batch_info.get_num_sequences() == (0, 2, 0)
+    assert seq_info.batch_info.get_num_tokens() == (0, 8, 0)
+
+    input_ids = seq_info.get_arg("input_ids", truncate=True, unflatten=True)
+    assert tuple(input_ids.shape) == (2, 4)
 
 
 # =============================================================================
@@ -819,76 +968,6 @@ def test_typed_handlers_inherit_from_state_resource_handler():
 
     assert isinstance(ssm_handler, StateResourceHandler)
     assert isinstance(conv_handler, StateResourceHandler)
-
-
-def test_intermediate_state_resources_bind_via_managed_state_path(paged_kv_cache_config):
-    """Test that speculative Mamba state handlers bind through the managed cache path."""
-    spec_config = DraftTargetDecodingConfig(
-        max_draft_len=2,
-        speculative_model="dummy-model",
-    )
-    interface = CachedSequenceInterface(
-        max_seq_len=128,
-        max_batch_size=4,
-        max_num_tokens=default_max_num_tokens(128, 4),
-        device="cuda",
-        kv_cache_config=paged_kv_cache_config,
-        spec_config=spec_config,
-    )
-
-    num_heads = 4
-    head_dim = 64
-    d_state = 16
-    conv_dim = head_dim * num_heads + 2 * 2 * d_state
-    resource_names = []
-
-    for i in range(2):
-        resource_names.append(
-            interface.add_resource(
-                f"ssm_state_{i}",
-                SSMResourceHandler(
-                    num_heads=num_heads,
-                    head_dim=head_dim,
-                    d_state=d_state,
-                    dtype=torch.bfloat16,
-                ),
-            )
-        )
-        resource_names.append(
-            interface.add_resource(
-                f"intermediate_ssm_state_{i}",
-                SpecSSMResourceHandler(
-                    num_heads=num_heads,
-                    head_dim=head_dim,
-                    d_state=d_state,
-                    dtype=torch.bfloat16,
-                ),
-            )
-        )
-        resource_names.append(
-            interface.add_resource(
-                f"conv_state_{i}",
-                CausalConvResourceHandler(conv_dim=conv_dim, d_conv=4, dtype=torch.float32),
-            )
-        )
-        resource_names.append(
-            interface.add_resource(
-                f"intermediate_conv_state_{i}",
-                SpecCausalConvResourceHandler(
-                    conv_dim=conv_dim,
-                    d_conv=4,
-                    dtype=torch.float32,
-                ),
-            )
-        )
-
-    interface.initialize_resources()
-
-    for resource_name in resource_names:
-        cache = interface._caches[resource_name]
-        assert cache is not None
-        assert cache.is_contiguous()
-        assert resource_name not in interface._unmanaged_resources
 
 
 def test_multiple_ssm_resources_contiguous_views(paged_kv_cache_config):
@@ -1079,8 +1158,8 @@ def test_args_stored_to_input_buffer():
         input_ids=[1, 2, 3],
         cu_seqlen=[0, 3],
         input_pos=[0],
-        cache_loc=[0],
-        cu_num_pages=[0, 1],
+        cache_loc_per_pool=[[0]],
+        cu_num_pages_per_pool=[[0, 1]],
     )
 
     token_gather_indices = seq_info.get_arg("token_gather_indices", truncate=True)
@@ -1094,8 +1173,8 @@ def test_args_stored_to_input_buffer():
         input_ids=[1, 2, 3],
         cu_seqlen=[0, 3],
         input_pos=[0],
-        cache_loc=[0],
-        cu_num_pages=[0, 1],
+        cache_loc_per_pool=[[0]],
+        cu_num_pages_per_pool=[[0, 1]],
         gather_context_logits=True,
     )
 
@@ -1125,3 +1204,99 @@ def test_register_host_prepare_populates_requires_copy():
 
     assert "batch_info_host" in seq_info._active_host_prep_args
     assert "cu_num_pages_host" in seq_info._active_host_prep_args
+
+
+# =============================================================================
+# Multi-Window (VSWA) KV Cache Tests — single unified KVCacheManager hosting
+# multiple C++ pools via the per-window head_dim/dtype overrides.
+# =============================================================================
+
+
+def test_identify_managed_kv_resources_single_window():
+    """Single head_dim and no sliding window collapses into one window entry."""
+    interface = CachedSequenceInterface(
+        max_seq_len=128,
+        max_batch_size=4,
+        max_num_tokens=default_max_num_tokens(128, 4),
+        device="cuda",
+        kv_cache_config=KvCacheConfig(
+            tokens_per_block=32, max_tokens=1024, free_gpu_memory_fraction=0.0
+        ),
+    )
+    interface.add_resource("kv_0", KVPagedResourceHandler(8, 64, dtype=torch.float16))
+    interface.add_resource("kv_1", KVPagedResourceHandler(8, 64, dtype=torch.float16))
+
+    kv_managed, pool_configurations = interface._identify_managed_kv_resources()
+
+    assert len(kv_managed) == 2
+    # No sliding_window → effective window = max_seq_len.
+    assert {pc.window_size: pc.head_dim for pc in pool_configurations} == {128: 64}
+
+
+def test_identify_managed_kv_resources_dual_window_gemma4_pattern():
+    """Gemma4-style mix: SWA layers with smaller head_dim + full-attn layer with larger head_dim."""
+    interface = CachedSequenceInterface(
+        max_seq_len=128,
+        max_batch_size=4,
+        max_num_tokens=default_max_num_tokens(128, 4),
+        device="cuda",
+        kv_cache_config=KvCacheConfig(
+            tokens_per_block=32, max_tokens=1024, free_gpu_memory_fraction=0.0
+        ),
+    )
+    # SWA window: head_dim=64
+    interface.add_resource(
+        "kv_0", KVPagedResourceHandler(8, 64, dtype=torch.float16, sliding_window=64)
+    )
+    interface.add_resource(
+        "kv_1", KVPagedResourceHandler(8, 64, dtype=torch.float16, sliding_window=64)
+    )
+    # Full-attention window: head_dim=128
+    interface.add_resource("kv_2", KVPagedResourceHandler(4, 128, dtype=torch.float16))
+
+    kv_managed, pool_configurations = interface._identify_managed_kv_resources()
+
+    assert len(kv_managed) == 3
+    # Two windows, keyed by effective window size; full-attention falls back to max_seq_len.
+    assert {pc.window_size: pc.head_dim for pc in pool_configurations} == {64: 64, 128: 128}
+
+
+def test_identify_managed_kv_resources_rejects_mixed_head_dim_in_same_window():
+    """Layers sharing an effective window must agree on head_dim."""
+    interface = CachedSequenceInterface(
+        max_seq_len=128,
+        max_batch_size=4,
+        max_num_tokens=default_max_num_tokens(128, 4),
+        device="cuda",
+        kv_cache_config=KvCacheConfig(
+            tokens_per_block=32, max_tokens=1024, free_gpu_memory_fraction=0.0
+        ),
+    )
+    # Both default to sliding_window=0 → effective window = max_seq_len. Different head_dims
+    # in the same window are not representable by one C++ pool.
+    interface.add_resource("kv_0", KVPagedResourceHandler(8, 64, dtype=torch.float16))
+    interface.add_resource("kv_1", KVPagedResourceHandler(4, 128, dtype=torch.float16))
+
+    with pytest.raises(RuntimeError, match="head_dim"):
+        interface._identify_managed_kv_resources()
+
+
+def test_single_window_creates_plain_kv_cache_manager():
+    """One window creates a plain KVCacheManager with a single C++ pool."""
+    interface = CachedSequenceInterface(
+        max_seq_len=128,
+        max_batch_size=4,
+        max_num_tokens=default_max_num_tokens(128, 4),
+        device="cuda",
+        kv_cache_config=KvCacheConfig(
+            tokens_per_block=32, max_tokens=1024, free_gpu_memory_fraction=0.0
+        ),
+    )
+    interface.add_resource("kv_0", KVPagedResourceHandler(8, 64, dtype=torch.float16))
+    interface.add_resource("kv_1", KVPagedResourceHandler(8, 64, dtype=torch.float16))
+
+    interface.initialize_resources()
+
+    assert isinstance(interface.kv_cache_manager, KVCacheManager)
+    # Exactly one pool (max_seq_len, since sliding_window=0).
+    assert len(interface.kv_cache_manager.impl.pool_configurations) == 1

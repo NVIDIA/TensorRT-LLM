@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION.
+# Copyright (c) 2025-2026, NVIDIA CORPORATION.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -162,7 +162,10 @@ class OpenAIDisaggregatedService(OpenAIService):
                 gen_server, _ = await self._gen_router.get_next_server(
                     gen_req, exclude_server=ctx_server
                 )
-            return await self._gen_client.send_request(gen_req, server=gen_server, hooks=hooks)
+            gen_response = await self._gen_client.send_request(
+                gen_req, server=gen_server, hooks=hooks
+            )
+            return gen_response
         else:
             if request.stream:
                 # ctx client will never return a generator when streaming is requested
@@ -212,6 +215,7 @@ class OpenAIDisaggregatedService(OpenAIService):
             request.disaggregated_params.request_type = "generation_only"
             request.disaggregated_params.schedule_style = self._schedule_style
             request.disaggregated_params.conversation_id = conversation_id
+            request.disaggregated_params.ctx_usage = ctx_response.usage
             # Replace the string prompt with prompt_tokens_ids
             if isinstance(request, CompletionRequest):
                 request.prompt = ctx_response.prompt_token_ids
@@ -280,7 +284,10 @@ class OpenAIDisaggregatedService(OpenAIService):
 
     async def is_ready(self) -> bool:
         if self._disagg_cluster_manager:
-            return await self._disagg_cluster_manager.is_ready()
+            return await self._disagg_cluster_manager.is_ready_with_router(
+                self._ctx_router.num_prepared_servers,
+                self._gen_router.num_prepared_servers,
+            )
         return True
 
     @property
@@ -380,13 +387,23 @@ class OpenAIDisaggregatedService(OpenAIService):
                 raise ValueError(
                     f"Context server returned {len(ctx_response.choices)} choices, expecting 1."
                 )
-            if ctx_response.choices[0].disaggregated_params is None:
-                raise ValueError("Context server did not return disaggregated params")
-            if ctx_response.choices[0].disaggregated_params.ctx_request_id is None:
-                raise ValueError("Invalid disaggregated params in context phase response.")
-            if ctx_response.choices[0].disaggregated_params.disagg_request_id is None:
+            choice = ctx_response.choices[0]
+            if choice.disaggregated_params is None:
                 raise ValueError(
-                    "Invalid disaggregated params in context phase response. disagg_request_id is None"
+                    f"Context server did not return disaggregated params."
+                    f" finish_reason={choice.finish_reason!r}"
+                )
+            if choice.disaggregated_params.ctx_request_id is None:
+                raise ValueError(
+                    f"Invalid disaggregated params: ctx_request_id is None."
+                    f" finish_reason={choice.finish_reason!r},"
+                    f" disagg_request_id={choice.disaggregated_params.disagg_request_id!r}"
+                )
+            if choice.disaggregated_params.disagg_request_id is None:
+                raise ValueError(
+                    f"Invalid disaggregated params: disagg_request_id is None."
+                    f" finish_reason={choice.finish_reason!r},"
+                    f" ctx_request_id={choice.disaggregated_params.ctx_request_id!r}"
                 )
             return ctx_response
 

@@ -6,7 +6,7 @@ metadata:
 hardware:
   gpus_per_node: 4
 server_configs:
-  # 1k1k configs - DEP4 with CUTLASS, MTP1
+  # 1k1k configs - DEP4 with CUTEDSL, MTP1
   - name: "r1_fp4_v2_dep4_mtp1_1k1k"
     model_name: "deepseek_r1_0528_fp4_v2"
     tensor_parallel_size: 4
@@ -21,7 +21,7 @@ server_configs:
       enable_balance: true
       timeout_iters: 60
     moe_config:
-      backend: 'CUTLASS'
+      backend: 'CUTEDSL'
       use_low_precision_moe_combine: true
     cuda_graph_config:
       enable_padding: true
@@ -32,7 +32,7 @@ server_configs:
       free_gpu_memory_fraction: 0.8
     speculative_config:
       decoding_type: 'MTP'
-      num_nextn_predict_layers: 1
+      max_draft_len: 1
     client_configs:
       - name: "con1024_iter10_1k1k"
         concurrency: 1024
@@ -63,7 +63,7 @@ server_configs:
       free_gpu_memory_fraction: 0.8
     speculative_config:
       decoding_type: 'MTP'
-      num_nextn_predict_layers: 3
+      max_draft_len: 3
     client_configs:
       - name: "con32_iter10_1k1k"
         concurrency: 32
@@ -94,7 +94,7 @@ server_configs:
       free_gpu_memory_fraction: 0.8
     speculative_config:
       decoding_type: 'MTP'
-      num_nextn_predict_layers: 3
+      max_draft_len: 3
     client_configs:
       - name: "con2_iter10_1k1k"
         concurrency: 2
@@ -104,7 +104,7 @@ server_configs:
         backend: "openai"
         dataset_file: datasets/perf-ci/deepseek_r1-1k1k-20480-ratio-1_for_serve.json
 
-  # 8k1k configs - DEP4 with CUTLASS, MTP1
+  # 8k1k configs - DEP4 with CUTEDSL, MTP1
   - name: "r1_fp4_v2_dep4_mtp1_8k1k"
     model_name: "deepseek_r1_0528_fp4_v2"
     tensor_parallel_size: 4
@@ -119,7 +119,7 @@ server_configs:
       enable_balance: true
       timeout_iters: 60
     moe_config:
-      backend: 'CUTLASS'
+      backend: 'CUTEDSL'
       use_low_precision_moe_combine: true
     cuda_graph_config:
       enable_padding: true
@@ -130,7 +130,7 @@ server_configs:
       free_gpu_memory_fraction: 0.8
     speculative_config:
       decoding_type: 'MTP'
-      num_nextn_predict_layers: 1
+      max_draft_len: 1
     client_configs:
       - name: "con256_iter10_8k1k"
         concurrency: 256
@@ -161,7 +161,7 @@ server_configs:
       free_gpu_memory_fraction: 0.8
     speculative_config:
       decoding_type: 'MTP'
-      num_nextn_predict_layers: 3
+      max_draft_len: 3
     client_configs:
       - name: "con32_iter10_8k1k"
         concurrency: 32
@@ -192,7 +192,7 @@ server_configs:
       free_gpu_memory_fraction: 0.8
     speculative_config:
       decoding_type: 'MTP'
-      num_nextn_predict_layers: 3
+      max_draft_len: 3
     client_configs:
       - name: "con2_iter10_8k1k"
         concurrency: 2
@@ -202,7 +202,7 @@ server_configs:
         backend: "openai"
         dataset_file: datasets/perf-ci/deepseek_r1-8k1k-20480-ratio-1_for_serve.json
 
-  # 1k8k configs - DEP4 with CUTLASS, MTP1
+  # 1k8k configs - DEP4 with CUTEDSL, MTP1
   - name: "r1_fp4_v2_dep4_mtp1_1k8k"
     model_name: "deepseek_r1_0528_fp4_v2"
     tensor_parallel_size: 4
@@ -217,7 +217,7 @@ server_configs:
       enable_balance: true
       timeout_iters: 60
     moe_config:
-      backend: 'CUTLASS'
+      backend: 'CUTEDSL'
       use_low_precision_moe_combine: true
     cuda_graph_config:
       enable_padding: true
@@ -228,7 +228,7 @@ server_configs:
       free_gpu_memory_fraction: 0.8
     speculative_config:
       decoding_type: 'MTP'
-      num_nextn_predict_layers: 1
+      max_draft_len: 1
     client_configs:
       - name: "con2048_iter5_1k8k"
         concurrency: 2048
@@ -259,7 +259,7 @@ server_configs:
       free_gpu_memory_fraction: 0.8
     speculative_config:
       decoding_type: 'MTP'
-      num_nextn_predict_layers: 3
+      max_draft_len: 3
     client_configs:
       - name: "con32_iter10_1k8k"
         concurrency: 32
@@ -290,7 +290,7 @@ server_configs:
       free_gpu_memory_fraction: 0.8
     speculative_config:
       decoding_type: 'MTP'
-      num_nextn_predict_layers: 3
+      max_draft_len: 3
     client_configs:
       - name: "con4_iter10_1k8k"
         concurrency: 4

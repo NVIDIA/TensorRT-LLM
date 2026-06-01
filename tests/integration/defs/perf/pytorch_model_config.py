@@ -19,6 +19,30 @@ Model pytorch/TRT yaml config for trtllm-bench perf tests
 
 from ..conftest import llm_models_root
 
+# DeepSeek FP8 (block-scale) models that hit the DeepGEMM-on-Hopper-only
+# limitation when the default CUTLASS MoE backend is used on Blackwell.
+# On SM100+ these need ``moe_config.backend: DEEPGEMM`` instead, otherwise
+# CutlassFp8BlockScaleGemmRunner -> deep_gemm::jit::Compiler::build throws
+# "DeepGEMM only supports Hopper (SM90)".
+_DEEPSEEK_FP8_BLOCK_SCALE_MODELS = (
+    'deepseek_v3_lite_fp8',
+    'deepseek_r1_fp8',
+    'deepseek_r1_0528_fp8',
+)
+
+
+def _get_sm_version_safe() -> int:
+    """Return the current device SM version, or 0 if it cannot be determined.
+
+    Imported lazily so importing this module does not require CUDA to be
+    available (e.g. during static test collection).
+    """
+    try:
+        from tensorrt_llm._utils import get_sm_version
+        return get_sm_version()
+    except Exception:
+        return 0
+
 
 def recursive_update(d, u):
     for k, v in u.items():
@@ -77,7 +101,7 @@ def get_model_yaml_config(model_label: str,
                 'cuda_graph_config': {},
                 'speculative_config': {
                     'decoding_type': 'MTP',
-                    'num_nextn_predict_layers': 3
+                    'max_draft_len': 3
                 }
             }
         },
@@ -97,7 +121,7 @@ def get_model_yaml_config(model_label: str,
                 },
                 'speculative_config': {
                     'decoding_type': 'MTP',
-                    'num_nextn_predict_layers': 3
+                    'max_draft_len': 3
                 },
                 'disable_overlap_scheduler': True,
                 'enable_autotuner': True,
@@ -415,10 +439,30 @@ def get_model_yaml_config(model_label: str,
                 'attn_backend': 'FLASHINFER',
             }
         },
-        # Nemotron-3-Super-120B-NVFP4: chunked prefill + MTP-3 speculative decoding
+        # Nemotron-3-Nano-Omni-30B-NVFP4 (text + image multimodal)
         {
-            'patterns': ['nemotron_3_super_120b_nvfp4'],
+            'patterns': ['nemotron_3_nano_omni_nvfp4'],
             'config': {
+                'enable_chunked_prefill': True,
+                'moe_config': {
+                    'backend': 'CUTLASS',
+                },
+                'cuda_graph_config': {
+                    'enable_padding': True,
+                    'max_batch_size': 1,
+                },
+                'kv_cache_config': {
+                    'enable_block_reuse': False,
+                    'free_gpu_memory_fraction': 0.80,
+                    'mamba_ssm_cache_dtype': 'float32',
+                },
+            }
+        },
+        # Nemotron-3-Super-120B-NVFP4: (no MTP)
+        {
+            'patterns': ['nemotron_3_super_120b_nvfp4-'],
+            'config': {
+                'max_seq_len': 1048576,
                 'enable_chunked_prefill': True,
                 'enable_attention_dp': False,
                 'stream_interval': 1,
@@ -431,6 +475,32 @@ def get_model_yaml_config(model_label: str,
                 },
                 'kv_cache_config': {
                     'enable_block_reuse': False,
+                    'mamba_ssm_cache_dtype': 'float16',
+                    'mamba_ssm_stochastic_rounding': True,
+                    'mamba_ssm_philox_rounds': 5,
+                },
+            }
+        },
+        # Nemotron-3-Super-120B-NVFP4: MTP speculative decoding
+        {
+            'patterns': ['nemotron_3_super_120b_nvfp4_mtp'],
+            'config': {
+                'max_seq_len': 1048576,
+                'enable_chunked_prefill': True,
+                'enable_attention_dp': False,
+                'stream_interval': 1,
+                'moe_config': {
+                    'backend': 'CUTLASS',
+                },
+                'cuda_graph_config': {
+                    'enable_padding': True,
+                    'max_batch_size': 8,
+                },
+                'kv_cache_config': {
+                    'enable_block_reuse': False,
+                    'mamba_ssm_cache_dtype': 'float16',
+                    'mamba_ssm_stochastic_rounding': True,
+                    'mamba_ssm_philox_rounds': 5,
                 },
                 'speculative_config': {
                     'decoding_type': 'MTP',
@@ -451,6 +521,16 @@ def get_model_yaml_config(model_label: str,
                 if pattern_config.get('config'):
                     recursive_update(base_config, pattern_config['config'])
                 break  # Stop checking other patterns for this config once we find a match
+
+    # DeepSeek FP8 (block-scale) models on Blackwell (SM100+) must use the
+    # DEEPGEMM MoE backend; the default CUTLASS backend's FP8 block-scale path
+    # JIT-compiles DeepGEMM kernels that only target Hopper (SM90).
+    if 'pytorch' in model_label and any(
+            name in model_label.lower()
+            for name in _DEEPSEEK_FP8_BLOCK_SCALE_MODELS):
+        if _get_sm_version_safe() >= 100:
+            moe_config = base_config.setdefault('moe_config', {})
+            moe_config.setdefault('backend', 'DEEPGEMM')
 
     # lora-specific change for pytorch
     if 'pytorch' in model_label and 'loras' in model_label:

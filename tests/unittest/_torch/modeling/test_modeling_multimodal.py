@@ -17,6 +17,7 @@ from tensorrt_llm._torch.attention_backend.interface import AttentionRuntimeFeat
 from tensorrt_llm._torch.attention_backend.utils import get_attention_backend
 from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.model_config import ModelConfig
+from tensorrt_llm._torch.models.modeling_multimodal_utils import bypass_processor_output_validation
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm._utils import str_dtype_to_torch
 from tensorrt_llm.bindings.executor import KvCacheConfig
@@ -271,12 +272,15 @@ class TestModelingMultimodal(unittest.TestCase, ABC):
         mapping = Mapping(world_size=1, tp_size=1, rank=0)
         kv_cache_config = KvCacheConfig(max_tokens=num_blocks * tokens_per_block)
 
+        # VL configs (e.g. Qwen2_5_VLConfig) in transformers 5.x no longer
+        # proxy text_config attributes to the outer config level.
+        text_config = getattr(config, "text_config", config)
         kv_cache_manager = KVCacheManager(
             kv_cache_config,
             tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF,
-            num_layers=config.num_hidden_layers,
-            num_kv_heads=config.num_key_value_heads,
-            head_dim=config.hidden_size // config.num_attention_heads,
+            num_layers=text_config.num_hidden_layers,
+            num_kv_heads=text_config.num_key_value_heads,
+            head_dim=text_config.hidden_size // text_config.num_attention_heads,
             tokens_per_block=tokens_per_block,
             max_seq_len=max_seq_len,
             max_batch_size=batch_size,
@@ -342,8 +346,16 @@ class TestModelingMultimodal(unittest.TestCase, ABC):
         multimodal_params_list,
         is_gen: bool = False,
         num_cached_tokens_per_seq: Optional[List[int]] = None,
+        total_prompt_len: Optional[int] = None,
     ):
-        """Prepare inputs for TensorRT-LLM model forward pass."""
+        """Prepare inputs for TensorRT-LLM model forward pass.
+
+        `total_prompt_len`: full request prompt length. Required for chunked
+        prefill so `embed_mask_cumsum` is sized to the whole request (matches
+        production's request-invariant cumsum from
+        `tensorrt_llm.inputs.registry.maybe_compute_mm_embed_cumsum`). Defaults
+        to `num_cached + input_ids.size(-1)` for non-chunked callers.
+        """
         if self.attn_metadata is None:
             raise ValueError("attn_metadata must be initialized before calling get_trtllm_inputs")
 
@@ -368,19 +380,26 @@ class TestModelingMultimodal(unittest.TestCase, ABC):
             seq_lens = torch.tensor([input_ids.size(-1)], dtype=torch.int, pin_memory=True)
             num_contexts = 1
             position_ids = [torch.arange(0, input_ids.size(-1), dtype=torch.int32)]
-            multimodal_runtime = (
-                MultimodalRuntimeData(
-                    mm_token_lengths=multimodal_params_list[0].multimodal_input.multimodal_lengths,
-                    mm_token_positions=multimodal_params_list[
-                        0
-                    ].multimodal_input.multimodal_positions,
-                    past_seen_token_num=num_cached_tokens_per_seq[0],
-                    chunk_end_pos=num_cached_tokens_per_seq[0] + input_ids.size(-1),
-                    special_token_offsets=[],
+            if (mi := multimodal_params_list[0].multimodal_input) is not None:
+                prompt_len = (
+                    total_prompt_len
+                    if total_prompt_len is not None
+                    else num_cached_tokens_per_seq[0] + input_ids.size(-1)
                 )
-                if multimodal_params_list[0].multimodal_input is not None
-                else None
-            )
+                full_mask = torch.zeros(prompt_len, dtype=torch.bool)
+                for unit_idx in range(len(mi.multimodal_positions)):
+                    pos = mi.multimodal_positions[unit_idx]
+                    length = mi.multimodal_lengths[unit_idx]
+                    # Default all positions inside the outer box to embed=True
+                    # (tests here don't model inline specials).
+                    full_mask[pos : pos + length] = True
+                multimodal_runtime = MultimodalRuntimeData(
+                    embed_mask_cumsum=full_mask.cumsum(0, dtype=torch.int64),
+                    past_seen_token_num=num_cached_tokens_per_seq[0],
+                    chunk_end_pos=(num_cached_tokens_per_seq[0] + input_ids.size(-1)),
+                )
+            else:
+                multimodal_runtime = None
             multimodal_params_list[0].multimodal_runtime = multimodal_runtime
 
         self.attn_metadata.seq_lens = seq_lens
@@ -442,14 +461,26 @@ class TestModelingMultimodal(unittest.TestCase, ABC):
             pass
         else:
             raise ValueError(f"Invalid modality: {modality}")
-        processor_inputs = hf_processor(
-            text=[input["prompt"] for input in inputs],
-            images=images,
-            videos=videos,
-            padding=True,
-            return_tensors="pt",
-            do_rescale=False,
-        ).to(self.device)
+        # transformers 5.x's ``ProcessorMixin._merge_kwargs`` strictly
+        # validates per-modality kwargs against a TypedDict, and some
+        # Qwen2/3-VL checkpoints leak processor *output* keys (e.g.
+        # ``video_grid_thw``) into ``output_kwargs[<modality>]`` via the
+        # tokenizer's ``init_kwargs`` / ``model_input_names``, tripping
+        # validation. Bypass the validator for our known output keys for
+        # the duration of the processor call.
+        with bypass_processor_output_validation():
+            processor_inputs = hf_processor(
+                text=[input["prompt"] for input in inputs],
+                images=images,
+                videos=videos,
+                padding=True,
+                return_tensors="pt",
+                do_rescale=False,
+            ).to(self.device)
+        # Transformers 5.5.x's `compute_3d_position_ids` raises a ValueError when
+        # multimodal grids are passed without `mm_token_type_ids`. The processor
+        # already returns this tensor for both image and video modalities, so
+        # keep it in the inputs to satisfy the new HF reference path.
         return processor_inputs
 
     def run_trtllm_forward(self, trtllm_inputs, use_cuda_graph: bool = False):
@@ -542,14 +573,15 @@ class TestModelingMultimodal(unittest.TestCase, ABC):
         print("  Running context phase...")
         with torch.inference_mode():
             if scenario.chunked_prefill:
-                # Chunked prefill: process input in chunks
                 chunk_size = 128
+                total_prompt_len = len(trtllm_input_ids)
                 for i in range(0, len(trtllm_input_ids), chunk_size):
                     ctx_trtllm_inputs = self.get_trtllm_inputs(
                         trtllm_input_ids[i : i + chunk_size],
                         multimodal_params_list,
                         is_gen=False,
                         num_cached_tokens_per_seq=[i],
+                        total_prompt_len=total_prompt_len,
                     )
                     logits = self.run_trtllm_forward(ctx_trtllm_inputs, use_cuda_graph=False)
 

@@ -20,8 +20,7 @@ import torch
 import torch.nn as nn
 from torch.fx import GraphModule, Node
 
-from tensorrt_llm._torch.utils import ActivationType
-
+from ..._compat import ActivationType
 from ...models.factory import ModelFactory
 from ...shim.interface import CachedSequenceInterface
 from ...utils.node_utils import is_op

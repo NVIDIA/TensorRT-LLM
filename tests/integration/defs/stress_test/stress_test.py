@@ -72,6 +72,12 @@ from defs.trt_test_alternative import (Popen, cleanup_process_tree, print_info,
 # Define a constant for process termination timeouts
 GRACEFUL_TERMINATION_TIMEOUT = 300  # seconds - set longer when stress large model
 
+# Single source of truth for aiperf artifact location.
+# Passed to aiperf via --output-artifact-dir so writes and reads stay aligned
+# regardless of the pytest cwd.
+ARTIFACTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                             "artifacts")
+
 
 def _get_default_port() -> int:
     """Get a default port using CI allocation if available, otherwise use 8000."""
@@ -571,6 +577,9 @@ def stress_test(config,
 
     # For DeepSeek-V3 or DeepSeek-R1 specific server parameters
     if "DeepSeek-V3" in config.model_dir or "DeepSeek-R1" in config.model_dir:
+        # Reduce CUDA allocator fragmentation so transient MoE workspace
+        # allocations don't OOM when KV cache reservation is large.
+        os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
         test_server_config = ServerConfig(
             port=test_server_config.port,
             host=test_server_config.host,
@@ -582,7 +591,7 @@ def stress_test(config,
             max_num_tokens=
             8192,  # DeepSeek-V3 or DeepSeek-R1 specific max_num_tokens
             kv_cache_free_gpu_memory_fraction=
-            0.85,  # DeepSeek-V3 or DeepSeek-R1 specific kv_cache fraction
+            0.75,  # DeepSeek-V3 or DeepSeek-R1 specific kv_cache fraction
             capacity_scheduler_policy=test_server_config.
             capacity_scheduler_policy,
             wait_interval=test_server_config.wait_interval,
@@ -923,6 +932,11 @@ def create_aiperf_command(model_name,
     Returns:
         List of command-line arguments for aiperf
     """
+    # --no-server-metrics: trtllm-serve exposes /metrics as a JSON
+    # iteration-stats endpoint (see openai_server.get_iteration_stats),
+    # not a Prometheus exposition. aiperf's ServerMetricsManager hangs
+    # scraping it, causing PROFILE_START to exceed the 60s
+    # AIPERF_SERVICE_PROFILE_START_TIMEOUT and the benchmark to abort.
     return [
         "aiperf",
         "profile",
@@ -934,6 +948,7 @@ def create_aiperf_command(model_name,
         "completions",
         "-u",
         server_url,
+        "--no-server-metrics",
         "--random-seed",
         "123",
         "--synthetic-input-tokens-mean",
@@ -948,6 +963,8 @@ def create_aiperf_command(model_name,
         str(request_count),
         "--concurrency",
         str(concurrency),
+        "--output-artifact-dir",
+        ARTIFACTS_DIR,
         # "--verbose",
     ]
 
@@ -1359,8 +1376,7 @@ def extract_stress_test_metrics(artifacts_dir=None, current_model=None):
     # For local testing, the artifacts are at
     # artifacts_dir = os.path.join(script_dir, "artifacts")
     if artifacts_dir is None:
-        script_dir = os.path.dirname(os.path.abspath(__file__))
-        artifacts_dir = os.path.join(script_dir, "..", "artifacts")
+        artifacts_dir = ARTIFACTS_DIR
 
     # Find all profile_export_aiperf.json files in the artifacts directory
     json_files = glob(os.path.join(artifacts_dir,

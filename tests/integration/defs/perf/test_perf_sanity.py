@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -34,26 +34,13 @@ from defs.trt_test_alternative import print_info
 from tensorrt_llm._utils import get_free_port
 
 from ..conftest import get_llm_root, llm_models_root
+from ._model_paths import MODEL_PATH_DICT as _MODEL_PATH_DICT_BASE
 from .perf_regression_utils import process_and_upload_test_results
 
-# Model PATH of local dir synced from internal LLM models repo
+# Sanity-side path differs from test_perf for this key; preserve historical value.
 MODEL_PATH_DICT = {
-    "deepseek_r1_fp8": "DeepSeek-R1/DeepSeek-R1",
-    "deepseek_r1_nvfp4": "DeepSeek-R1/DeepSeek-R1-FP4",
-    "deepseek_r1_0528_fp8": "DeepSeek-R1/DeepSeek-R1-0528/",
-    "deepseek_r1_0528_fp4": "DeepSeek-R1/DeepSeek-R1-0528-FP4/",
-    "deepseek_r1_0528_fp4_v2": "DeepSeek-R1/DeepSeek-R1-0528-FP4-v2/",
-    "deepseek_v32_fp4": "DeepSeek-V3.2-Exp-FP4-v2",
-    "gpt_oss_120b_fp4": "gpt_oss/gpt-oss-120b",
-    "k2_thinking_fp4": "Kimi-K2-Thinking-NVFP4",
-    "k25_thinking_fp4": "Kimi-K2.5-NVFP4",
-    "qwen3_235b_a22b_fp4": "Qwen3/saved_models_Qwen3-235B-A22B_nvfp4_hf",  # Qwen3-235B-A22B-FP4
-    "super_nvfp4": "NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4",  # Super (Nemotron-H SSM+MoE) NvFP4
-    "qwen3_235b_a22b_fp8": "Qwen3/saved_models_Qwen3-235B-A22B_fp8_hf",  # Qwen3-235B-A22B-FP8
+    **_MODEL_PATH_DICT_BASE,
     "llama_v3.3_70b_instruct_fp4": "llama-3.3-models/Llama-3.3-70B-Instruct-FP4",
-    "deepseek_v3_lite_fp8": "DeepSeek-V3-Lite/fp8",
-    "llama_v3.1_8b_instruct": "llama-3.1-model/Llama-3.1-8B-Instruct",
-    "glm_5_nvfp4": "GLM-5-NVFP4",
 }
 
 SUPPORTED_GPU_MAPPING = {
@@ -293,7 +280,12 @@ class ServerConfig:
         # speculative_config
         speculative_config = server_config_data.get("speculative_config", {})
         self.spec_decoding_type = speculative_config.get("decoding_type", "")
-        self.num_nextn_predict_layers = speculative_config.get("num_nextn_predict_layers", 0)
+        # MTP user config migrated from num_nextn_predict_layers to max_draft_len.
+        # Keep both DB field names populated for perf/baseline compatibility while
+        # the surrounding reporting pipeline transitions to l_max_draft_len.
+        self.max_draft_len = speculative_config.get(
+            "max_draft_len", speculative_config.get("num_nextn_predict_layers", 0)
+        )
         eagle3_value = speculative_config.get("eagle3_layers_to_capture", [])
         if isinstance(eagle3_value, int):
             self.eagle3_layers_to_capture = [eagle3_value]
@@ -301,7 +293,6 @@ class ServerConfig:
             self.eagle3_layers_to_capture = eagle3_value
         else:
             self.eagle3_layers_to_capture = []
-        self.max_draft_len = speculative_config.get("max_draft_len", 0)
         self.speculative_model = speculative_config.get("speculative_model", "")
         self.eagle3_one_model = speculative_config.get("eagle3_one_model", False)
 
@@ -362,22 +353,20 @@ class ServerConfig:
             "l_cp",
             "l_gpus_per_node",
             "l_max_batch_size",
-            "b_disable_overlap_scheduler",
-            "b_enable_chunked_prefill",
             "b_enable_attention_dp",
-            "b_enable_lm_head_tp_in_adp",
             "s_serving_backend",
-            # attention_dp_config
-            "b_attention_dp_balance",
-            # cuda_graph_config
-            "b_enable_cuda_graph",
             # kv_cache_config
             "s_kv_cache_dtype",
             # cache_transceiver_config
             "s_cache_transceiver_backend",
             # speculative_config
+            # Keep baseline matching on the legacy key during DB migration.
+            # l_max_draft_len is written to DB but not used for matching until
+            # backfill completes.
             "s_spec_decoding_type",
             "l_num_nextn_predict_layers",
+            # moe_config
+            "l_load_balancer_num_slots",
         ]
 
     def to_db_data(self) -> dict:
@@ -427,7 +416,7 @@ class ServerConfig:
             "l_cache_transceiver_max_tokens_in_buffer": self.cache_transceiver_max_tokens_in_buffer,
             # speculative_config
             "s_spec_decoding_type": self.spec_decoding_type,
-            "l_num_nextn_predict_layers": self.num_nextn_predict_layers,
+            "l_num_nextn_predict_layers": self.max_draft_len,
             "s_eagle3_layers_to_capture": ",".join(map(str, self.eagle3_layers_to_capture)),
             "l_max_draft_len": self.max_draft_len,
             "s_speculative_model_dir": self.speculative_model,
@@ -474,6 +463,7 @@ class ClientConfig:
         client_config_data: dict,
         model_name: str,
         env_vars: str = "",
+        spec_decoding: bool = False,
     ):
         self.model_name = model_name
         self.concurrency = client_config_data.get("concurrency", 1)
@@ -489,6 +479,9 @@ class ClientConfig:
         self.dataset_file = client_config_data.get("dataset_file", "")
         self.use_nv_sa_benchmark = client_config_data.get("use_nv_sa_benchmark", False)
         self.env_vars = env_vars
+        # --ignore-eos must be off when spec decoding is enabled: forcing generation
+        # past EOS produces unstable acceptance rates.
+        self.spec_decoding = spec_decoding
 
         # Generate default name if not provided
         self.name = client_config_data.get("name", "")
@@ -519,7 +512,6 @@ class ClientConfig:
             str(self.concurrency * self.iterations),
             "--max-concurrency",
             str(self.concurrency),
-            "--ignore-eos",
             "--random-input-len",
             str(self.isl),
             "--random-output-len",
@@ -530,6 +522,8 @@ class ClientConfig:
             "--percentile-metrics",
             "ttft,tpot,itl,e2el",
         ]
+        if not self.spec_decoding:
+            benchmark_cmd.append("--ignore-eos")
         if self.backend:
             benchmark_cmd.extend(["--backend", self.backend])
         if self.trust_remote_code:
@@ -554,11 +548,12 @@ class ClientConfig:
             str(self.concurrency * self.iterations),
             "--max-concurrency",
             str(self.concurrency),
-            "--ignore-eos",
             "--no-test-input",
             "--percentile-metrics",
             "ttft,tpot,itl,e2el",
         ]
+        if not self.spec_decoding:
+            benchmark_cmd.append("--ignore-eos")
         if dataset_path:
             benchmark_cmd.append("--dataset-name")
             benchmark_cmd.append("trtllm_custom")
@@ -605,10 +600,15 @@ class ClientConfig:
             "b_use_chat_template",
             "b_streaming",
             "b_use_nv_sa_benchmark",
+            "b_eos",
         ]
 
     def to_db_data(self) -> dict:
         """Convert ClientConfig to database data."""
+        # b_eos = True when --ignore-eos is NOT used (EOS honored). Historical
+        # rows lack this field; _match() treats missing b_* as False, so legacy
+        # baselines (which always had --ignore-eos) only match new b_eos=False
+        # rows, while spec-decoding (b_eos=True) becomes a new test case.
         db_data = {
             "s_client_name": self.name,
             "l_concurrency": self.concurrency,
@@ -622,6 +622,7 @@ class ClientConfig:
             "b_streaming": self.streaming,
             "b_trust_remote_code": self.trust_remote_code,
             "b_use_nv_sa_benchmark": self.use_nv_sa_benchmark,
+            "b_eos": self.spec_decoding,
             "s_client_log_link": "",
             "s_client_env_vars": self.env_vars,
         }
@@ -1175,7 +1176,9 @@ class PerfSanityTestConfig:
             except (subprocess.CalledProcessError, FileNotFoundError, IndexError):
                 raise RuntimeError("Failed to get GPU type")
 
-        self.upload_to_db = "upload" in test_case_name.split("-")[0]
+        self.upload_to_db = "upload" in test_case_name.split("-")[0] and bool(
+            os.environ.get("OPEN_SEARCH_DB_BASE_URL", "")
+        )
         self.gpu_type = get_gpu_type()
 
         # Parse test case name to get config_base_name, select_pattern, runtime, benchmark_mode
@@ -1261,6 +1264,7 @@ class PerfSanityTestConfig:
                     client_config_data,
                     server_config_data["model_name"],
                     env_vars=client_env_var,
+                    spec_decoding=bool(server_config.spec_decoding_type),
                 )
                 client_configs.append(client_config)
 
@@ -1387,6 +1391,13 @@ class PerfSanityTestConfig:
         dataset_file = "" if benchmark_mode == "ctx_only" else benchmark.get("dataset_file", "")
         use_nv_sa_benchmark = benchmark.get("use_nv_sa_benchmark", False)
 
+        if benchmark_mode == "ctx_only":
+            spec_decoding = bool(ctx_server_config.spec_decoding_type)
+        else:
+            spec_decoding = bool(ctx_server_config.spec_decoding_type) or bool(
+                gen_server_config.spec_decoding_type
+            )
+
         client_configs = []
         for concurrency in concurrency_values:
             client_config_data = {
@@ -1407,6 +1418,7 @@ class PerfSanityTestConfig:
                 client_config_data,
                 model_name,
                 env_vars=client_env_var,
+                spec_decoding=spec_decoding,
             )
             client_configs.append(client_config)
 
@@ -1755,7 +1767,14 @@ class PerfSanityTestConfig:
                         if num_ctx_servers > 0:
                             match_keys.extend(add_list_prefix(ctx_config.to_match_keys(), "ctx"))
                         if num_gen_servers > 0:
-                            match_keys.extend(add_list_prefix(gen_config.to_match_keys(), "gen"))
+                            gen_match_keys = add_list_prefix(gen_config.to_match_keys(), "gen")
+                            if disagg_config.benchmark_mode == "gen_only":
+                                gen_match_keys = [
+                                    k
+                                    for k in gen_match_keys
+                                    if k != "gen_s_cache_transceiver_backend"
+                                ]
+                            match_keys.extend(gen_match_keys)
                         match_keys.extend(client_config.to_match_keys())
         else:
             return
