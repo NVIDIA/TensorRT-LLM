@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020-2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2020-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -33,6 +33,14 @@ CUtensorMap makeTensorMapForXqaMlaKVCache(std::shared_ptr<tensorrt_llm::common::
 
 CUtensorMap makeTensorMapForXqaMlaQ(
     std::shared_ptr<tensorrt_llm::common::CUDADriverWrapper> const& driver, XQAParams const& xqaParams, void const* q);
+
+// 2D per-token gather descriptor for DSV4 dynamic-sparse MLA dual-pool KV on SM120. `poolBase` is the
+// SWA pool or the compressed pool base; the descriptor addresses the pool as [token_slot, headElems]
+// (nbKHeads==1 MLA latent) so the kernel gathers any token by its absolute slot (a sparse_attn_indices
+// entry) via tma.gather4. Swizzle matches the dense MLA KV descriptor so gathered rows land in the
+// layout the MMA consumer reads.
+CUtensorMap makeTensorMapForXqaMlaKVCacheGather(std::shared_ptr<tensorrt_llm::common::CUDADriverWrapper> const& driver,
+    XQAParams const& xqaParams, void const* poolBase, bool forK);
 
 } // namespace kernels
 

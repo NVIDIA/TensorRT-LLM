@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2024-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -58,6 +58,13 @@ inline constexpr uint32_t nbProducerCtasPerCga = nbVSplit;
 inline constexpr uint32_t multiBlockMinNbTilesPerCta = 2;
 inline constexpr uint32_t multiBlockMinNbTiles = multiBlockMinNbTilesPerCta * 2;
 
+// DSV4 dynamic-sparse MLA: SWA window size (= sparse_attention_config.window_size). Hard invariant
+// == 128 (deepseek_v4.py asserts window_size == 128 == the FMHA TileSizeKV). With tokensPerTile == 64
+// this is exactly 2 KV tiles, so attended positions [0,128) (KV tiles 0,1) read the SWA pool and
+// positions [128,topk_len) (KV tiles >= 2) read the compressed pool. See dual-pool gather in
+// KVTilePartLoader::loadData.
+inline constexpr uint32_t sparseSwaWindow = 128;
+
 using MathElem = CacheElem;
 inline constexpr uint32_t mathElemBytes = sizeof(MathElem);
 inline constexpr uint32_t grainsPerPartK = exactDiv(partElemsK * mathElemBytes, grainBytes);
@@ -86,6 +93,15 @@ struct KVTilePartLoader
     static inline constexpr uint32_t const idxHeadGrp = 0;
 
     CUtensorMap const& tensorMap;
+    // DSV4 dynamic-sparse dual-pool per-token gather. When globalIndicesRow != nullptr the loader
+    // gathers each attended token from the SWA pool (KV tiles whose tokens are < sparseSwaWindow) or
+    // the compressed pool (the rest) by absolute token slot, via tma.gather4 — instead of the dense
+    // paged read. In that mode `tensorMap` is the COMPRESSED-pool gather descriptor and `tensorMapSwa`
+    // is the SWA-pool gather descriptor (both 2D {headElems, slots}, box {partElems, 1}). When nullptr
+    // the legacy dense paged path is used and tensorMapSwa is ignored.
+    CUtensorMap const* const tensorMapSwa;
+    int32_t const* const globalIndicesRow; // this request's row of sparse_attn_indices (token slots), or nullptr
+    uint32_t const sparseSeqLen;           // attended count (topk_len) for this request, for in-row bounds
     // if greater than 1, then we need unrolling for the loading loop. Seems 1 is fine for latency.
     static inline constexpr uint32_t nbPageBuffers = 1;
 #if USE_PAGED_KV_CACHE
@@ -95,8 +111,9 @@ struct KVTilePartLoader
 #endif
     uint32_t const baseOffset;
 
-    __device__ KVTilePartLoader(
-        KVCacheList<usePagedKVCache> const& cacheList, uint32_t idxReq, CUtensorMap const& tensorMap
+    __device__ KVTilePartLoader(KVCacheList<usePagedKVCache> const& cacheList, uint32_t idxReq,
+        CUtensorMap const& tensorMap, CUtensorMap const* tensorMapSwa, int32_t const* globalIndicesRow,
+        uint32_t sparseSeqLen
 #if USE_PAGED_KV_CACHE
         ,
         uint32_t nbPages
@@ -110,8 +127,9 @@ struct KVTilePartLoader
     __device__ void loadPages(uint32_t idxTile, uint32_t idxPageBuf);
 };
 
-__device__ inline KVTilePartLoader::KVTilePartLoader(
-    KVCacheList<usePagedKVCache> const& cacheList, uint32_t idxReq, CUtensorMap const& tensorMap
+__device__ inline KVTilePartLoader::KVTilePartLoader(KVCacheList<usePagedKVCache> const& cacheList, uint32_t idxReq,
+    CUtensorMap const& tensorMap, CUtensorMap const* tensorMapSwa, int32_t const* globalIndicesRow,
+    uint32_t sparseSeqLen
 #if USE_PAGED_KV_CACHE
     ,
     uint32_t nbPages
@@ -120,6 +138,9 @@ __device__ inline KVTilePartLoader::KVTilePartLoader(
     : cacheList{cacheList}
     , idxReq{idxReq}
     , tensorMap{tensorMap}
+    , tensorMapSwa{tensorMapSwa}
+    , globalIndicesRow{globalIndicesRow}
+    , sparseSeqLen{sparseSeqLen}
 #if USE_PAGED_KV_CACHE
     , nbPages{nbPages}
 #if PAGED_KV_CACHE_LAYOUT == 1
@@ -144,6 +165,34 @@ __device__ inline void KVTilePartLoader::loadData(Array2D<LdGrain, nbTokens, gra
     uint32_t idxTile, uint32_t idxElemBeg, CtaBarrier& bar, uint32_t idxPageBuf)
 {
     static_assert(nbTokens == tokensPerTile);
+    if (globalIndicesRow != nullptr)
+    {
+        // DSV4 dynamic-sparse dual-pool per-token gather. A whole KV tile is either SWA or compressed
+        // because sparseSwaWindow (128) is a multiple of tokensPerTile (64): tiles [0, window/64) read
+        // the SWA pool, the rest read the compressed pool. Each token is gathered by its absolute slot
+        // from globalIndicesRow; tma.gather4 loads 4 tokens/call into the swizzled tile (the hardware
+        // applies the descriptor swizzle for each logical 4-row band). Positions >= sparseSeqLen (the
+        // partial last tile) are gathered from slot 0 and masked out later by the tail mask.
+        CUtensorMap const& desc = (idxTile * tokensPerTile < sparseSwaWindow) ? *tensorMapSwa : tensorMap;
+        uint32_t const tileBeg = idxTile * tokensPerTile;
+        if (warpElectSync())
+        {
+#pragma unroll
+            for (uint32_t b = 0; b < exactDiv(nbTokens, 4U); b++)
+            {
+                uint32_t slot[4];
+#pragma unroll
+                for (uint32_t k = 0; k < 4; k++)
+                {
+                    uint32_t const pos = tileBeg + 4 * b + k;
+                    int32_t const idx = (pos < sparseSeqLen) ? globalIndicesRow[pos] : -1;
+                    slot[k] = (idx < 0) ? 0U : static_cast<uint32_t>(idx);
+                }
+                tma::loadAsyncGather4(&dst(4 * b, 0), desc, idxElemBeg, slot[0], slot[1], slot[2], slot[3], bar);
+            }
+        }
+        return;
+    }
 #if USE_PAGED_KV_CACHE
     assert(idxTile == idxTileRef);
     auto const& pages = pageBuffers[idxPageBuf];
@@ -187,6 +236,11 @@ __device__ inline void KVTilePartLoader::loadData(Array2D<LdGrain, nbTokens, gra
 
 __device__ inline void KVTilePartLoader::loadPages(uint32_t idxTile, uint32_t idxPageBuf)
 {
+    // Sparse dual-pool gather addresses tokens directly by slot (no page table).
+    if (globalIndicesRow != nullptr)
+    {
+        return;
+    }
 #if USE_PAGED_KV_CACHE
     uint32_t const idxPageBeg
         = tokensPerTile >= tokensPerPage ? nbPagesPerTile * idxTile : idxTile / exactDiv(tokensPerPage, tokensPerTile);
@@ -495,14 +549,24 @@ __device__ void mergePartialOutputs(uint32_t& semaphore, Vec<OutputHead, Partial
 struct KernelArgs
 {
     CUtensorMap const& tensorMapQ; // MhaIOHead[nbQHeads * totalNbInputTokens]
-    CUtensorMap const& tensorMapK;
-    CUtensorMap const& tensorMapV;
+    CUtensorMap const& tensorMapK; // dense paged KV descriptor; COMPRESSED-pool gather descriptor when sparse
+    CUtensorMap const& tensorMapV; // dense paged KV descriptor; COMPRESSED-pool gather descriptor when sparse
+    // DSV4 dynamic-sparse MLA: SWA-pool gather descriptors. Unused (dummy copies of tensorMapK/V) unless
+    // globalIndices != nullptr.
+    CUtensorMap const& tensorMapKSwa;
+    CUtensorMap const& tensorMapVSwa;
     float const& qScale;
     OutputHead* __restrict__ const& output; // [totalNbIntputTokens][nbQHeads]
     KVCacheList<usePagedKVCache> const& cacheList;
     uint32_t const& batchSize;
     float const* __restrict__ const&
         kvCacheScale; // Device memory scalar. Same scale for K and V cache. Used only for int8/fp8 KV cache.
+    // DSV4 dynamic-sparse MLA: sparse_attn_indices [totalNbInputTokens, globalIndicesStride] of token slots
+    // (SWA region first, compressed region next), and sparse_mla_topk_lens [totalNbInputTokens] = attended
+    // count. globalIndices == nullptr => dense (non-sparse) path.
+    int32_t const* __restrict__ const& globalIndices;
+    uint32_t const& globalIndicesStride;
+    int32_t const* __restrict__ const& topkLens;
     Vec<CgaXBuffer, nbProducerCtasPerCga>* __restrict__ const& cgaXBuf; // [totalNbInputTokens][maxNbSubSeq]
     uint32_t* __restrict__ const& semaphores;                           // [totalNbInputTokens]
     PartialResult* __restrict__ const& partialResults;                  // [totalNbInputTokens][maxNbSubSeq]
@@ -528,19 +592,22 @@ struct Producer
     uint32_t const nbSubSeq;
     uint32_t const idxSubSeq;
     uint32_t const seqLen;
+    bool const sparse; // DSV4 dynamic-sparse dual-pool gather active for this request
     uint32_t const ctaRank;
     uint32_t const warpRank;
     uint2 const warpIdx;
 
     __device__ inline Producer(KernelArgs const& args, SharedMemA& smem, uint32_t const maxNbSubSeq,
-        uint32_t const idxReq, uint32_t idxInputTokenGlobal, uint32_t const seqLen, uint32_t const nbSubSeq,
-        uint32_t const idxSubSeq, uint32_t ctaRank, uint32_t const warpRank, uint2 const warpIdx)
+        uint32_t const idxReq, uint32_t idxInputTokenGlobal, uint32_t const seqLen, bool const sparse,
+        uint32_t const nbSubSeq, uint32_t const idxSubSeq, uint32_t ctaRank, uint32_t const warpRank,
+        uint2 const warpIdx)
         : args(args)
         , smem(smem)
         , maxNbSubSeq(maxNbSubSeq)
         , idxReq(idxReq)
         , idxInputTokenGlobal(idxInputTokenGlobal)
         , seqLen(seqLen)
+        , sparse(sparse)
         , nbSubSeq(nbSubSeq)
         , idxSubSeq(idxSubSeq)
         , ctaRank(ctaRank)
@@ -992,9 +1059,10 @@ private:
 
 __device__ inline void Producer::loadK()
 {
+    int32_t const* const giRow = sparse ? args.globalIndices + idxInputTokenGlobal * args.globalIndicesStride : nullptr;
     KVTilePartLoader loader
     {
-        args.cacheList, idxReq, args.tensorMapK
+        args.cacheList, idxReq, args.tensorMapK, &args.tensorMapKSwa, giRow, seqLen
 #if USE_PAGED_KV_CACHE
             ,
             divUp(seqLen, tokensPerPage)
@@ -1189,6 +1257,7 @@ struct Consumer
     uint32_t const nbSubSeq;
     uint32_t const idxSubSeq;
     uint32_t const seqLen;
+    bool const sparse; // DSV4 dynamic-sparse dual-pool gather active for this request
     uint32_t const ctaRank;
     uint32_t const warpRank;
     uint2 const warpIdx;
@@ -1214,14 +1283,16 @@ struct Consumer
     }
 
     __device__ inline Consumer(KernelArgs const& args, SharedMemB& smem, uint32_t const maxNbSubSeq,
-        uint32_t const idxReq, uint32_t const idxInputTokenGlobal, uint32_t const seqLen, uint32_t const nbSubSeq,
-        uint32_t const idxSubSeq, uint32_t ctaRank, uint32_t const warpRank, uint2 const warpIdx)
+        uint32_t const idxReq, uint32_t const idxInputTokenGlobal, uint32_t const seqLen, bool const sparse,
+        uint32_t const nbSubSeq, uint32_t const idxSubSeq, uint32_t ctaRank, uint32_t const warpRank,
+        uint2 const warpIdx)
         : args(args)
         , smem(smem)
         , maxNbSubSeq(maxNbSubSeq)
         , idxReq(idxReq)
         , idxInputTokenGlobal(idxInputTokenGlobal)
         , seqLen(seqLen)
+        , sparse(sparse)
         , nbSubSeq(nbSubSeq)
         , idxSubSeq(idxSubSeq)
         , ctaRank(ctaRank)
@@ -1532,7 +1603,8 @@ __device__ inline void Consumer::loadX()
 
 __device__ inline void Consumer::loadV()
 {
-    KVTilePartLoader loader(args.cacheList, idxReq, args.tensorMapV
+    int32_t const* const giRow = sparse ? args.globalIndices + idxInputTokenGlobal * args.globalIndicesStride : nullptr;
+    KVTilePartLoader loader(args.cacheList, idxReq, args.tensorMapV, &args.tensorMapVSwa, giRow, seqLen
 #if USE_PAGED_KV_CACHE
         ,
         divUp(seqLen, tokensPerPage)
@@ -1820,11 +1892,19 @@ CUBIN_EXPORT __global__ __launch_bounds__(32 * 4 * 3, 1) void kernel_mha(
     __grid_constant__ CUtensorMap const tensorMapQ, // MhaIOHead[nbQHeads * totalNbInputTokens],
     __grid_constant__ CUtensorMap const tensorMapK, // with box=64 for the least significant dim
     __grid_constant__ CUtensorMap const tensorMapV, // with box=128 for the least significant dim
+    // DSV4 dynamic-sparse MLA SWA-pool gather descriptors (dummy copies of tensorMapK/V when not sparse).
+    __grid_constant__ CUtensorMap const tensorMapKSwa,
+    __grid_constant__ CUtensorMap const tensorMapVSwa,
     float const qScale,
     OutputHead* __restrict__ const output,          // [totalNbIntputTokens][nbQHeads]
     KVCacheList<usePagedKVCache> const cacheList, uint32_t const batchSize,
     float const* __restrict__ const kvCacheScale,   // Device memory scalar. Same scale for K and V cache. Used only for
                                                     // int8/fp8 KV cache.
+    // DSV4 dynamic-sparse MLA: sparse_attn_indices [totalNbInputTokens, globalIndicesStride] (token slots,
+    // SWA region then compressed region), its row stride, and sparse_mla_topk_lens [totalNbInputTokens]
+    // (attended count). globalIndices == nullptr => dense (non-sparse) decode.
+    int32_t const* __restrict__ const globalIndices, uint32_t const globalIndicesStride,
+    int32_t const* __restrict__ const topkLens,
     Vec<CgaXBuffer, nbProducerCtasPerCga>* __restrict__ const cgaXBuf, // [totalNbInputTokens][maxNbSubSeq]
     uint32_t* __restrict__ const semaphores = nullptr,                 // [totalNbInputTokens]
     PartialResult* __restrict__ const partialResults = nullptr)        // [totalNbInputTokens][maxNbSubSeq]
@@ -1843,7 +1923,17 @@ CUBIN_EXPORT __global__ __launch_bounds__(32 * 4 * 3, 1) void kernel_mha(
     uint32_t const reqIdxInputToken
         = (allowMultipleInputTokens ? blockIdx.x / cgaSize : checkedVal(0U, blockIdx.x / cgaSize));
     uint32_t const idxInputTokenGlobal = inputSeqLen * idxReq + reqIdxInputToken;
-    uint32_t const cacheSeqLen = cacheList.seqLenList[idxReq] - (inputSeqLen - 1) + reqIdxInputToken;
+    uint32_t const realKv = cacheList.seqLenList[idxReq] - (inputSeqLen - 1) + reqIdxInputToken;
+    // DSV4 dynamic-sparse MLA: a sparse layer (globalIndices != nullptr) gathers its attended tokens
+    // per-token from the SWA + compressed pools. When the SWA window is full (kv >= window) the attended
+    // count is topk_len (window SWA + compressed selection). When kv < window the window covers the whole
+    // sequence, so we attend to all kv tokens through the SWA pool (cacheSeqLen = realKv) — this equals
+    // full attention and skips the (redundant) compressed pool, matching legacy short-decode behavior. In
+    // both cases [0,cacheSeqLen) of the index row is fully valid (no interior -1), so the existing tail
+    // mask is sufficient. Non-sparse layers (DSV3, globalIndices == nullptr) keep the dense paged read.
+    bool const sparse = useKVCache && (globalIndices != nullptr);
+    uint32_t const cacheSeqLen
+        = sparse ? (realKv >= sparseSwaWindow ? static_cast<uint32_t>(topkLens[idxInputTokenGlobal]) : realKv) : realKv;
     assert(beamWidth == 1);
     uint32_t const nbTiles = useKVCache ? divUp(cacheSeqLen, tokensPerTile) : 0;
     bool const isMultiBlockMode = (maxNbSubSeq > 1 && nbTiles >= multiBlockMinNbTiles);
@@ -1858,19 +1948,19 @@ CUBIN_EXPORT __global__ __launch_bounds__(32 * 4 * 3, 1) void kernel_mha(
     uint32_t const ctaRank = clusterCtaRank();
     bool const isProducer = (ctaRank < nbProducerCtasPerCga);
 
-    KernelArgs const args{tensorMapQ, tensorMapK, tensorMapV, qScale, output, cacheList, batchSize, kvCacheScale,
-        cgaXBuf, semaphores, partialResults};
+    KernelArgs const args{tensorMapQ, tensorMapK, tensorMapV, tensorMapKSwa, tensorMapVSwa, qScale, output, cacheList,
+        batchSize, kvCacheScale, globalIndices, globalIndicesStride, topkLens, cgaXBuf, semaphores, partialResults};
 
     if (isProducer)
     {
         Producer{args, *reinterpret_cast<SharedMemA*>(smemBuf), maxNbSubSeq, idxReq, idxInputTokenGlobal, cacheSeqLen,
-            nbSubSeq, idxSubSeq, ctaRank, warpRank, warpIdx}
+            sparse, nbSubSeq, idxSubSeq, ctaRank, warpRank, warpIdx}
             .run();
     }
     else
     {
         Consumer{args, *reinterpret_cast<SharedMemB*>(smemBuf), maxNbSubSeq, idxReq, idxInputTokenGlobal, cacheSeqLen,
-            nbSubSeq, idxSubSeq, ctaRank, warpRank, warpIdx}
+            sparse, nbSubSeq, idxSubSeq, ctaRank, warpRank, warpIdx}
             .run();
     }
 }
@@ -2094,8 +2184,11 @@ void launchMLA(cudaDeviceProp const& prop,
     auto const partialResults = reinterpret_cast<PartialResult*>(cgaXBuf + nbCgas);
     // A null semaphore pointer tells kernel_mha to leave split-KV partials in global memory.
     // The follow-up kernel then performs the numerically stable partial reduction.
-    cudaError_t const err = cudaLaunchKernelEx(&launchCfg, &kernel_mha, tensorMapQ, tensorMapK, tensorMapV, qScale,
-        output, cacheList, batchSize, kvCacheScale, cgaXBuf, useSeparateReduce ? nullptr : semaphores, partialResults);
+    // Standalone test harness exercises the dense path only: SWA descriptors are dummy copies and the
+    // sparse index/topk pointers are null (globalIndices == nullptr selects the dense paged read).
+    cudaError_t const err = cudaLaunchKernelEx(&launchCfg, &kernel_mha, tensorMapQ, tensorMapK, tensorMapV, tensorMapK,
+        tensorMapV, qScale, output, cacheList, batchSize, kvCacheScale, static_cast<int32_t const*>(nullptr), 0U,
+        static_cast<int32_t const*>(nullptr), cgaXBuf, useSeparateReduce ? nullptr : semaphores, partialResults);
     checkCuda(err);
     if (useSeparateReduce && nbSubSeqPerSeq > 1)
     {

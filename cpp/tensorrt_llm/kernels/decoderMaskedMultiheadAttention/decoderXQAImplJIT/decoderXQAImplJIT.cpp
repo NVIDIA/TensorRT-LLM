@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020-2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2020-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -899,7 +899,17 @@ void DecoderXQAImplJIT::runImpl(XQAParams const& xqaParams, KVCacheBuffer const&
     if (isMLAKernel)
     {
         auto const roundUpTo128 = [](size_t value) { return ((value + 127) / 128) * 128; };
-        uint32_t const multi_block = computeMultiBlockCountForMLA(xqaParams, multiprocessor_count);
+        uint32_t multi_block = computeMultiBlockCountForMLA(xqaParams, multiprocessor_count);
+        // DSV4 dynamic-sparse MLA decode attends over the sparse selection, so the main kernel uses
+        // cacheSeqLen = sparse_mla_topk_lens (the attended count). The separate-reduce kernel
+        // (reduce_mla_flash_decode_partials) still recomputes nbSubSeq from the full kv_len
+        // (sequence_lengths), which would mismatch the main kernel under split-K. Until that reduce is
+        // made topk_len-aware, force single-CTA (no split-K / no separate-reduce) for the SPARSE path
+        // only. Dense MLA (DSV3 / Kimi K2.5, sparse_attn_indices == nullptr) keeps split-K unchanged.
+        if (xqaParams.sparse_params.sparse_attn_indices != nullptr)
+        {
+            multi_block = 1;
+        }
         uint32_t const kernelMlaHeadGrpSize = getXqaMlaRuntimeKernelHeadGrpSize(num_q_heads_over_kv);
         auto* scratchBytes = static_cast<std::byte*>(launchParams.scratch);
         size_t const cgaXBufBytes = static_cast<size_t>(getXqaMlaCgaXBufSize(kernelMlaHeadGrpSize)) * multi_block
@@ -958,15 +968,46 @@ void DecoderXQAImplJIT::runImpl(XQAParams const& xqaParams, KVCacheBuffer const&
 
         CUtensorMap const tensorMapQ = makeTensorMapForXqaMlaQ(mDriver, kernelXQAParams, kernelInputTokens);
         appendParam(&tensorMapQ);
-        CUtensorMap const tensorMapK = makeTensorMapForXqaMlaKVCache(mDriver, kernelXQAParams, kv_cache_buffer, true);
+        // DSV4 dynamic-sparse MLA: when sparse_attn_indices is present, the kernel gathers each attended
+        // token per-token from two pools. tensorMapK/V become COMPRESSED-pool gather descriptors and
+        // tensorMapKSwa/VSwa SWA-pool gather descriptors (2D {headElems, slot}, box {partElems, 1}). For the
+        // dense (non-sparse, e.g. DSV3) path tensorMapK/V are the paged descriptors and the SWA descriptors
+        // are unused dummies; globalIndices == nullptr selects the dense path in the kernel.
+        bool const isSparseMla = xqaParams.sparse_params.sparse_attn_indices != nullptr;
+        void const* const swaPoolBase = xqaParams.sparse_params.sliding_window_kv_cache_pool;
+        // ratio==1 (SWA-only) layers have no compressed pool; its descriptor is never read (all tiles are
+        // SWA) so fall back to the SWA base to build a valid (unused) descriptor.
+        void const* const cmpPoolBase = xqaParams.sparse_params.sparse_kv_cache_pool != nullptr
+            ? xqaParams.sparse_params.sparse_kv_cache_pool
+            : swaPoolBase;
+        CUtensorMap const tensorMapK = isSparseMla
+            ? makeTensorMapForXqaMlaKVCacheGather(mDriver, kernelXQAParams, cmpPoolBase, /*forK=*/true)
+            : makeTensorMapForXqaMlaKVCache(mDriver, kernelXQAParams, kv_cache_buffer, /*forK=*/true);
         appendParam(&tensorMapK);
-        CUtensorMap const tensorMapV = makeTensorMapForXqaMlaKVCache(mDriver, kernelXQAParams, kv_cache_buffer, false);
+        CUtensorMap const tensorMapV = isSparseMla
+            ? makeTensorMapForXqaMlaKVCacheGather(mDriver, kernelXQAParams, cmpPoolBase, /*forK=*/false)
+            : makeTensorMapForXqaMlaKVCache(mDriver, kernelXQAParams, kv_cache_buffer, /*forK=*/false);
         appendParam(&tensorMapV);
+        CUtensorMap const tensorMapKSwa
+            = isSparseMla ? makeTensorMapForXqaMlaKVCacheGather(mDriver, kernelXQAParams, swaPoolBase, /*forK=*/true)
+                          : tensorMapK;
+        appendParam(&tensorMapKSwa);
+        CUtensorMap const tensorMapVSwa
+            = isSparseMla ? makeTensorMapForXqaMlaKVCacheGather(mDriver, kernelXQAParams, swaPoolBase, /*forK=*/false)
+                          : tensorMapV;
+        appendParam(&tensorMapVSwa);
         appendParam(&launchParams.qScale);
         appendParam(&kernelOutput);
         appendParam(&launchParams.kvCacheParams);
         appendParam(&launchParams.batch_size);
         appendParam(&launchParams.kv_scale_quant_orig);
+        int32_t const* const sparseAttnIndices = isSparseMla ? xqaParams.sparse_params.sparse_attn_indices : nullptr;
+        uint32_t const sparseAttnIndicesStride
+            = static_cast<uint32_t>(xqaParams.sparse_params.sparse_attn_indices_stride);
+        int32_t const* const sparseMlaTopkLens = xqaParams.sparse_params.sparse_mla_topk_lens;
+        appendParam(&sparseAttnIndices);
+        appendParam(&sparseAttnIndicesStride);
+        appendParam(&sparseMlaTopkLens);
         appendParam(&launchParams.scratch);
         bool const useSeparateReduce = kernelMlaHeadGrpSize < 128
             || tensorrt_llm::common::getBoolEnv("XQA_MLA_SEPARATE_REDUCE");
