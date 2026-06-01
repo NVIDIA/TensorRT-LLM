@@ -138,13 +138,10 @@ sparse_attention_config:
 
 ### Skip Softmax Attention
 
-A kernel-level method (BLASST) that dynamically skips Softmax and BMM2
-work for unimportant KV blocks. It is a plug-and-play way to accelerate
-existing full-attention models — no retraining, no prediction step, and
-no framework hook; the kernel decides per block what to skip, derived
-from the scalar threshold. For algorithm details and end-to-end
-results, see the
-[Tech Blog 16][blog16].
+A kernel-level method (BLASST) that dynamically skips computation in a
+FlashAttention-style kernel. It is a plug-and-play way to accelerate
+existing full-attention models. For algorithm details and end-to-end
+results, see [Tech Blog 16][blog16].
 
 [blog16]: ../blogs/tech_blog/blog16_Accelerating_Long_Context_Inference_with_Skip_Softmax_Attention.md
 
