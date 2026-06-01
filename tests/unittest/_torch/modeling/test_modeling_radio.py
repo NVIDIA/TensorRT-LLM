@@ -8,6 +8,8 @@ from transformers import PretrainedConfig
 from tensorrt_llm._torch import model_config as model_config_lib
 from tensorrt_llm._torch.models import modeling_radio
 from tensorrt_llm._torch.models.modeling_radio import RADIOVisionModel
+from tensorrt_llm._torch.models.multimodal_encoder_graph import _MM_SIDE_STREAM_ENV
+from tensorrt_llm.llmapi.llm_args import MultimodalEncoderCudaGraphConfig
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
 
@@ -49,6 +51,13 @@ def _make_vision_config():
         "cpe_num_registers": None,
     }
     return config
+
+
+@pytest.fixture(autouse=True)
+def clean_side_stream_env(monkeypatch):
+    """Temporarily unset side-stream prefetch for tests unless a test sets it explicitly."""
+    monkeypatch.delenv(_MM_SIDE_STREAM_ENV, raising=False)
+    yield
 
 
 @pytest.fixture
@@ -93,3 +102,180 @@ def test_radio_fp8_parent_kv_cache_does_not_leak_into_vit(tiny_vit_config):
 
     assert features.shape[0] == 1
     assert features.shape[-1] == _TINY_VIT.embed_dim
+
+
+def _make_bf16_model_config():
+    """Plain bf16 ModelConfig — keeps the runner's metadata factory simple."""
+    return model_config_lib.ModelConfig(
+        pretrained_config=_make_vision_config(),
+        quant_config=QuantConfig(),
+    )
+
+
+def _init_finite_weights(model: torch.nn.Module) -> None:
+    """Re-initialize all parameters so the toy ViT produces finite outputs.
+
+    The tiny config in this file uses random PyTorch init which routinely produces NaN/inf through
+    the attention kernel on bf16. A small-std normal init + zero bias makes the eager forward
+    numerically stable so the graph-vs-eager comparison below can do a bit-exact check.
+    """
+    with torch.no_grad():
+        for param in model.parameters():
+            if param.dim() >= 2:
+                torch.nn.init.normal_(param, std=0.02)
+            else:
+                param.zero_()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_radio_blocks_cuda_graph_matches_eager(tiny_vit_config):
+    """Block-loop CUDA graph wiring must produce the same output as eager.
+
+    Runs the tiny ViT once in eager mode to capture a reference, then enables the encoder graph
+    runner and re-runs the same input. The post-merger output must match bit-exactly: capture /
+    replay just records the same kernel launches the eager path runs.
+    """
+    device = torch.device("cuda")
+    dtype = torch.bfloat16
+
+    torch.manual_seed(0)
+    pixel_values = torch.randn(1, 3, 32, 32, device=device, dtype=dtype)
+
+    model = (
+        RADIOVisionModel(
+            _make_bf16_model_config(),
+            disable_quantization=True,
+            encoder_cuda_graph_config=MultimodalEncoderCudaGraphConfig(
+                buckets=[(16, 1)],
+                enable_padding=True,
+                warmup_steps=2,
+            ),
+        )
+        .to(device)
+        .to(dtype)
+    )
+    model.eval()
+    _init_finite_weights(model)
+
+    with torch.no_grad():
+        eager_out = model.forward(pixel_values).clone()
+    assert not eager_out.isnan().any(), "eager fixture produced NaN; tighten init"
+
+    # Bucket sized comfortably above the toy seq_lengths so dummy-context padding is exercised: a
+    # 32x32 image with patch_size=16 yields four patches plus the CLS token, so 16 tokens leaves
+    # ample room.
+    model.enable_blocks_cuda_graph(device=device)
+    vision_tower = model.radio_model.model
+    runner = vision_tower._blocks_graph_runner
+    assert runner is not None
+    assert runner._captured
+
+    with (
+        mock.patch.object(runner, "maybe_run", wraps=runner.maybe_run) as maybe_run,
+        mock.patch.object(
+            vision_tower,
+            "_run_blocks_eager",
+            side_effect=AssertionError("CUDA graph replay fell back to the eager block loop."),
+        ),
+        torch.no_grad(),
+    ):
+        graph_out = model.forward(pixel_values)
+
+    maybe_run.assert_called_once()
+
+    torch.testing.assert_close(graph_out, eager_out, rtol=0, atol=0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_radio_blocks_cuda_graph_falls_back_when_no_bucket(tiny_vit_config):
+    """A configured-but-unmatched request must take the eager fallback path.
+
+    When no bucket has enough capacity, `maybe_run` returns `None` and
+    the existing eager block loop runs against `self.attn_metadata`.
+    """
+    device = torch.device("cuda")
+    dtype = torch.bfloat16
+    pixel_values = torch.randn(1, 3, 32, 32, device=device, dtype=dtype)
+
+    model = (
+        RADIOVisionModel(
+            _make_bf16_model_config(),
+            disable_quantization=True,
+            encoder_cuda_graph_config=MultimodalEncoderCudaGraphConfig(
+                buckets=[(1, 1)],
+                enable_padding=False,
+            ),
+        )
+        .to(device)
+        .to(dtype)
+    )
+    model.eval()
+
+    # Bucket too small for even a single real token — every request falls back.
+    model.enable_blocks_cuda_graph(device=device)
+    with torch.no_grad():
+        features = model.forward(pixel_values)
+
+    assert features.shape[0] == 1
+    assert features.shape[-1] == _TINY_VIT.embed_dim
+    # The runner is installed and the configured bucket is captured at
+    # startup, but the request shape did not match any bucket, so the
+    # no-bucket-match fallback warning fired.
+    runner = model.radio_model.model._blocks_graph_runner
+    assert runner is not None
+    assert runner._warned_no_bucket_match
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_radio_blocks_cuda_graph_matches_eager_multi_context(tiny_vit_config):
+    """Dynamic-resolution inputs must replay through the graph runner with multiple contexts."""
+    device = torch.device("cuda")
+    dtype = torch.bfloat16
+
+    image_sizes = [(32, 32), (16, 16)]
+    patch_dim = 3 * 16 * 16
+    total_patches = sum(modeling_radio.calc_seq_len(size, patch_size=16) for size in image_sizes)
+
+    torch.manual_seed(0)
+    pixel_values = torch.randn(1, total_patches, patch_dim, device=device, dtype=dtype)
+
+    model = (
+        RADIOVisionModel(
+            _make_bf16_model_config(),
+            disable_quantization=True,
+            encoder_cuda_graph_config=MultimodalEncoderCudaGraphConfig(
+                buckets=[(16, 2)],
+                enable_padding=True,
+                warmup_steps=2,
+            ),
+        )
+        .to(device)
+        .to(dtype)
+    )
+    model.eval()
+    _init_finite_weights(model)
+
+    with torch.no_grad():
+        eager_out = model.forward(pixel_values, image_sizes=image_sizes).clone()
+    assert not eager_out.isnan().any(), "eager fixture produced NaN; tighten init"
+
+    model.enable_blocks_cuda_graph(device=device)
+    vision_tower = model.radio_model.model
+    runner = vision_tower._blocks_graph_runner
+    assert runner is not None
+    assert runner._captured
+
+    with (
+        mock.patch.object(runner, "maybe_run", wraps=runner.maybe_run) as maybe_run,
+        mock.patch.object(
+            vision_tower,
+            "_run_blocks_eager",
+            side_effect=AssertionError("CUDA graph replay fell back to the eager block loop."),
+        ),
+        torch.no_grad(),
+    ):
+        graph_out = model.forward(pixel_values, image_sizes=image_sizes)
+
+    maybe_run.assert_called_once()
+
+    torch.testing.assert_close(graph_out, eager_out, rtol=0, atol=0)
