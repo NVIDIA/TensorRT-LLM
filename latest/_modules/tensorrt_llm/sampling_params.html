@@ -498,7 +498,7 @@ window.runMermaid = runMermaid;</script>
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.18.0';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc16';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc17';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -512,7 +512,7 @@ window.runMermaid = runMermaid;</script>
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.3.0rc16" />
+  <meta name="docsearch:version" content="1.3.0rc17" />
   
     
     <script src="../../_static/searchtools.js"></script>
@@ -1027,6 +1027,19 @@ window.runMermaid = runMermaid;</script>
 <span class="n">MAX_TOP_LOGPROBS</span> <span class="o">=</span> <span class="mi">20</span>
 
 
+<span class="k">def</span><span class="w"> </span><span class="nf">validate_thinking_token_budget</span><span class="p">(</span><span class="n">value</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">Union</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="nb">float</span><span class="p">,</span> <span class="nb">bool</span><span class="p">]])</span> <span class="o">-&gt;</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">int</span><span class="p">]:</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;Validate ``thinking_token_budget``; return ``None`` if unset.&quot;&quot;&quot;</span>
+    <span class="k">if</span> <span class="n">value</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="k">return</span> <span class="kc">None</span>
+    <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">value</span><span class="p">,</span> <span class="nb">bool</span><span class="p">)</span> <span class="ow">or</span> <span class="ow">not</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">value</span><span class="p">,</span> <span class="nb">int</span><span class="p">):</span>
+        <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="s2">&quot;thinking_token_budget must be a non-negative integer or -1 for unlimited&quot;</span><span class="p">)</span>
+    <span class="k">if</span> <span class="n">value</span> <span class="o">==</span> <span class="o">-</span><span class="mi">1</span><span class="p">:</span>
+        <span class="k">return</span> <span class="kc">None</span>
+    <span class="k">if</span> <span class="n">value</span> <span class="o">&lt;</span> <span class="mi">0</span><span class="p">:</span>
+        <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="s2">&quot;thinking_token_budget must be a non-negative integer or -1 for unlimited&quot;</span><span class="p">)</span>
+    <span class="k">return</span> <span class="n">value</span>
+
+
 <span class="k">def</span><span class="w"> </span><span class="nf">check_logprobs_limit</span><span class="p">(</span>
     <span class="n">name</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">value</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">int</span><span class="p">],</span> <span class="n">max_value</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="n">MAX_TOP_LOGPROBS</span>
 <span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
@@ -1230,6 +1243,7 @@ window.runMermaid = runMermaid;</script>
 
 <span class="sd">        lookahead_config (tensorrt_llm.bindings.executor.LookaheadDecodingConfig , optional): Lookahead decoding config. Defaults to None.</span>
 <span class="sd">        guided_decoding (tensorrt_llm.sampling_params.GuidedDecodingParams, optional): Guided decoding params. Defaults to None.</span>
+<span class="sd">        thinking_token_budget (int, optional): Experimental. Maximum number of tokens allowed inside a reasoning block. Set to -1 or None for unlimited. Defaults to None.</span>
 
 <span class="sd">        ignore_eos (bool): Whether to ignore the EOS token and continue generating tokens after the EOS token is generated. Defaults to False.</span>
 <span class="sd">        detokenize (bool): Whether to detokenize the output. Defaults to True.</span>
@@ -1311,6 +1325,7 @@ window.runMermaid = runMermaid;</script>
 
     <span class="c1"># Guided decoding params</span>
     <span class="n">guided_decoding</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">GuidedDecodingParams</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span>
+    <span class="n">thinking_token_budget</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span>
 
     <span class="c1"># Tokenizer-related configs</span>
     <span class="n">ignore_eos</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span>
@@ -1378,6 +1393,7 @@ window.runMermaid = runMermaid;</script>
 
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">guided_decoding</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">guided_decoding</span><span class="o">.</span><span class="n">_validate</span><span class="p">()</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">thinking_token_budget</span> <span class="o">=</span> <span class="n">validate_thinking_token_budget</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">thinking_token_budget</span><span class="p">)</span>
 
         <span class="c1"># correct types as users might pass in logprob=True for Top-0 logprobs and logprobs=False for no logprobs</span>
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">logprobs</span> <span class="ow">is</span> <span class="kc">False</span><span class="p">:</span>
@@ -1716,9 +1732,9 @@ window.runMermaid = runMermaid;</script>
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on May 25, 2026.</p>
+  <p>Last updated on June 01, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/4517988">4517988</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/a422420">a422420</a>.</p>
   
 </div></div>
       

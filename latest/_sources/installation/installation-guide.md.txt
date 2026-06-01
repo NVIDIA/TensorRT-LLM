@@ -14,9 +14,9 @@ Pre-built TensorRT LLM releases are available as [container images on NGC](https
 Replace `x.y.z` with the desired version tag. Browse the [available tags on NGC](https://catalog.ngc.nvidia.com/orgs/nvidia/teams/tensorrt-llm/containers/release/tags) to find the latest release.
 
 ```bash
-docker pull nvcr.io/nvidia/tensorrt-llm/release:1.3.0rc16
+docker pull nvcr.io/nvidia/tensorrt-llm/release:1.3.0rc17
 
-docker run --rm -it --ipc host --gpus all --ulimit memlock=-1 --ulimit stack=67108864 -p 8000:8000 nvcr.io/nvidia/tensorrt-llm/release:1.3.0rc16
+docker run --rm -it --ipc host --gpus all --ulimit memlock=-1 --ulimit stack=67108864 -p 8000:8000 nvcr.io/nvidia/tensorrt-llm/release:1.3.0rc17
 ```
 
 {{container_tag_admonition}}
@@ -63,6 +63,13 @@ image hosted on NGC](https://catalog.ngc.nvidia.com/orgs/nvidia/teams/tensorrt-l
 ### Install pre-built TensorRT LLM wheel
 
 Once all prerequisites are in place, TensorRT LLM can be installed as follows:
+
+Before installing the latest version, uninstall any previous CUTLASS DSL installation as described in the
+[CUTLASS DSL installation guide](https://docs.nvidia.com/cutlass/latest/media/docs/pythonDSL/quick_start.html#installation):
+
+```bash
+pip3 uninstall nvidia-cutlass-dsl nvidia-cutlass-dsl-libs-base nvidia-cutlass-dsl-libs-cu13
+```
 
 ```bash
 pip3 install --ignore-installed pip setuptools wheel && pip3 install tensorrt_llm

@@ -63,7 +63,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.18.0';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc16';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc17';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -79,7 +79,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.3.0rc16" />
+  <meta name="docsearch:version" content="1.3.0rc17" />
   
     
     <script src="../_static/searchtools.js"></script>
@@ -577,9 +577,10 @@ actively evolving and may change in future releases.</p>
 <p>TensorRT-LLM <strong>VisualGen</strong> provides a unified inference stack for diffusion models, with a pipeline architecture separate from the LLM inference path. Key capabilities include:</p>
 <ul class="simple">
 <li><p>A shared pipeline abstraction covering the denoising loop, guidance strategies, and component loading.</p></li>
-<li><p>Pluggable attention backends (PyTorch SDPA and TRT-LLM optimized kernels).</p></li>
+<li><p>Pluggable attention backends: PyTorch SDPA (<code class="docutils literal notranslate"><span class="pre">VANILLA</span></code>), TRT-LLM kernels (<code class="docutils literal notranslate"><span class="pre">TRTLLM</span></code>), TRT-LLM CuTe DSL kernels (<code class="docutils literal notranslate"><span class="pre">CUTEDSL</span></code>, Blackwell-class GPUs), and Flash Attention 4 (<code class="docutils literal notranslate"><span class="pre">FA4</span></code>).</p></li>
 <li><p>Quantization support (dynamic and static) using the <a class="reference external" href="https://github.com/NVIDIA/TensorRT-Model-Optimizer">ModelOpt</a> configuration format.</p></li>
-<li><p>Multi-GPU parallelism (CFG parallel, Ulysses sequence parallel).</p></li>
+<li><p>Quantized attention support: <code class="docutils literal notranslate"><span class="pre">QK16PV8</span></code> to quantize Bmm2 on <code class="docutils literal notranslate"><span class="pre">CUTEDSL</span></code>, <code class="docutils literal notranslate"><span class="pre">SAGE</span></code> to run SageAttention on <code class="docutils literal notranslate"><span class="pre">TRTLLM</span></code> (requires Blackwell SM100).</p></li>
+<li><p>Multi-GPU parallelism (CFG parallel, Ulysses sequence parallel, Tensor parallelism).</p></li>
 <li><p><strong>TeaCache</strong> — a runtime caching optimization that skips transformer steps when timestep embeddings change slowly.</p></li>
 <li><p><code class="docutils literal notranslate"><span class="pre">trtllm-serve</span></code> integration with OpenAI-compatible API endpoints for image and video generation.</p></li>
 </ul>
@@ -643,6 +644,7 @@ actively evolving and may change in future releases.</p>
 <th class="head"><p>trtllm-serve</p></th>
 <th class="head"><p>Attention2D</p></th>
 <th class="head"><p>Ring Attention</p></th>
+<th class="head"><p>Tensor Parallelism</p></th>
 </tr>
 </thead>
 <tbody>
@@ -653,6 +655,7 @@ actively evolving and may change in future releases.</p>
 <td><p>No <a class="footnote-reference brackets" href="#id3" id="id1" role="doc-noteref"><span class="fn-bracket">[</span>1<span class="fn-bracket">]</span></a></p></td>
 <td><p>Yes</p></td>
 <td><p>No</p></td>
+<td><p>Yes</p></td>
 <td><p>Yes</p></td>
 <td><p>Yes</p></td>
 <td><p>Yes</p></td>
@@ -671,8 +674,10 @@ actively evolving and may change in future releases.</p>
 <td><p>Yes</p></td>
 <td><p>Yes</p></td>
 <td><p>Yes</p></td>
+<td><p>Yes</p></td>
 </tr>
 <tr class="row-even"><td><p><strong>Wan 2.1</strong></p></td>
+<td><p>Yes</p></td>
 <td><p>Yes</p></td>
 <td><p>Yes</p></td>
 <td><p>Yes</p></td>
@@ -697,6 +702,7 @@ actively evolving and may change in future releases.</p>
 <td><p>Yes</p></td>
 <td><p>Yes</p></td>
 <td><p>Yes</p></td>
+<td><p>Yes</p></td>
 </tr>
 <tr class="row-even"><td><p><strong>LTX-2</strong></p></td>
 <td><p>Yes</p></td>
@@ -710,6 +716,7 @@ actively evolving and may change in future releases.</p>
 <td><p>Yes</p></td>
 <td><p>Yes</p></td>
 <td><p>Yes</p></td>
+<td><p>No</p></td>
 </tr>
 </tbody>
 </table>
@@ -800,6 +807,48 @@ actively evolving and may change in future releases.</p>
 </pre></div>
 </div>
 </section>
+<section id="quantized-attention">
+<h3>Quantized Attention<a class="headerlink" href="#quantized-attention" title="Link to this heading">#</a></h3>
+<p>In addition to linear-layer quantization, VisualGen exposes two <strong>attention-level</strong> quantization presets that operate inside the attention kernel. They are configured through <code class="docutils literal notranslate"><span class="pre">AttentionConfig.quant_attention_config</span></code> (or the <code class="docutils literal notranslate"><span class="pre">--quant_attention_mode</span></code> flag in the example scripts) and are mutually exclusive with each other.</p>
+<ul class="simple">
+<li><p><strong>QK16PV8</strong> (<code class="docutils literal notranslate"><span class="pre">CUTEDSL</span></code> backend): Keeps Q &amp; K in BF16 and quantizes only V to FP8 (E4M3, per-tensor), thus Bmm1 will be carried out in BF16 with Bmm2 in FP8. Targets Blackwell-class GPUs (<code class="docutils literal notranslate"><span class="pre">sm_100a</span></code> / <code class="docutils literal notranslate"><span class="pre">sm_103a</span></code>) with <code class="docutils literal notranslate"><span class="pre">head_dim</span> <span class="pre">=</span> <span class="pre">128</span></code>.</p></li>
+<li><p><strong>SAGE</strong> (<code class="docutils literal notranslate"><span class="pre">TRTLLM</span></code> backend): Quantizes Q, K, and V with per-block scaling factors. Q/K are stored as INT8 or FP8 (e4m3) and V as FP8 (e4m3); block sizes are tunable per axis (typically <code class="docutils literal notranslate"><span class="pre">(q,</span> <span class="pre">k,</span> <span class="pre">v)</span> <span class="pre">=</span> <span class="pre">(1,</span> <span class="pre">4,</span> <span class="pre">1)</span></code> for Wan-1.3B and <code class="docutils literal notranslate"><span class="pre">(1,</span> <span class="pre">16,</span> <span class="pre">1)</span></code> for larger Wan / FLUX checkpoints). Supported recipes are validated at runtime.</p></li>
+</ul>
+<p>Python API for SageAttention:</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm</span><span class="w"> </span><span class="kn">import</span> <span class="n">VisualGenArgs</span>
+
+<span class="n">args</span> <span class="o">=</span> <span class="n">VisualGenArgs</span><span class="p">(</span>
+    <span class="n">model</span><span class="o">=</span><span class="s2">&quot;Wan-AI/Wan2.1-T2V-1.3B-Diffusers&quot;</span><span class="p">,</span>
+    <span class="n">attention_config</span><span class="o">=</span><span class="p">{</span>
+        <span class="s2">&quot;backend&quot;</span><span class="p">:</span> <span class="s2">&quot;TRTLLM&quot;</span><span class="p">,</span>
+        <span class="s2">&quot;quant_attention_config&quot;</span><span class="p">:</span> <span class="p">{</span>
+            <span class="s2">&quot;qk_dtype&quot;</span><span class="p">:</span> <span class="s2">&quot;int8&quot;</span><span class="p">,</span>
+            <span class="s2">&quot;q_block_size&quot;</span><span class="p">:</span> <span class="mi">1</span><span class="p">,</span>
+            <span class="s2">&quot;k_block_size&quot;</span><span class="p">:</span> <span class="mi">16</span><span class="p">,</span>
+            <span class="s2">&quot;v_block_size&quot;</span><span class="p">:</span> <span class="mi">1</span><span class="p">,</span>
+        <span class="p">},</span>
+    <span class="p">},</span>
+<span class="p">)</span>
+</pre></div>
+</div>
+<p>Python API for QK16PV8:</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm</span><span class="w"> </span><span class="kn">import</span> <span class="n">VisualGenArgs</span>
+
+<span class="n">args</span> <span class="o">=</span> <span class="n">VisualGenArgs</span><span class="p">(</span>
+    <span class="n">model</span><span class="o">=</span><span class="s2">&quot;Wan-AI/Wan2.1-T2V-1.3B-Diffusers&quot;</span><span class="p">,</span>
+    <span class="n">attention_config</span><span class="o">=</span><span class="p">{</span>
+        <span class="s2">&quot;backend&quot;</span><span class="p">:</span> <span class="s2">&quot;CUTEDSL&quot;</span><span class="p">,</span>
+        <span class="s2">&quot;quant_attention_config&quot;</span><span class="p">:</span> <span class="p">{</span>
+            <span class="s2">&quot;qk_dtype&quot;</span><span class="p">:</span> <span class="s2">&quot;bf16&quot;</span><span class="p">,</span>
+            <span class="s2">&quot;q_block_size&quot;</span><span class="p">:</span> <span class="mi">0</span><span class="p">,</span>
+            <span class="s2">&quot;k_block_size&quot;</span><span class="p">:</span> <span class="mi">0</span><span class="p">,</span>
+            <span class="s2">&quot;v_block_size&quot;</span><span class="p">:</span> <span class="mi">0</span><span class="p">,</span>
+        <span class="p">},</span>
+    <span class="p">},</span>
+<span class="p">)</span>
+</pre></div>
+</div>
+</section>
 <section id="teacache">
 <h3>TeaCache<a class="headerlink" href="#teacache" title="Link to this heading">#</a></h3>
 <p>TeaCache caches transformer outputs when timestep embeddings change slowly between denoising steps, skipping redundant computation. Enable via <code class="docutils literal notranslate"><span class="pre">VisualGenArgs.cache_config</span></code> (YAML or programmatic):</p>
@@ -812,17 +861,18 @@ actively evolving and may change in future releases.</p>
 </section>
 <section id="multi-gpu-parallelism">
 <h3>Multi-GPU Parallelism<a class="headerlink" href="#multi-gpu-parallelism" title="Link to this heading">#</a></h3>
-<p>5 parallelism modes can be combined:</p>
+<p>6 parallelism modes can be combined:</p>
 <ul class="simple">
 <li><p><strong>CFG Parallelism</strong> (<code class="docutils literal notranslate"><span class="pre">--cfg_size</span> <span class="pre">2</span></code>): Splits positive/negative guidance prompts across GPUs.</p></li>
 <li><p><strong>Ulysses Parallelism</strong> (<code class="docutils literal notranslate"><span class="pre">--ulysses_size</span> <span class="pre">N</span></code>): Splits the sequence dimension across GPUs for longer sequences.</p></li>
 <li><p><strong>Parallel VAE</strong> (<code class="docutils literal notranslate"><span class="pre">--parallel_vae_size</span> <span class="pre">N</span></code>): Shards the final VAE decode along a spatial axis across GPUs, useful to reduce VAE latency and improve GPU utilization (Constraint: <code class="docutils literal notranslate"><span class="pre">parallel_vae_size</span> <span class="pre">≤</span> <span class="pre">world_size</span></code>). Currently only supported for WAN models.</p></li>
-<li><p><strong>Attention Parallel</strong>: There are 2 methods supported to run attention parallel. Both of these methods require the attention backend to support LSE (only FA4 currently) -</p>
+<li><p><strong>Attention Parallel</strong>: There are 2 methods supported to run attention parallel. Both of these methods require the attention backend to support LSE (<code class="docutils literal notranslate"><span class="pre">FA4</span></code> and <code class="docutils literal notranslate"><span class="pre">CUTEDSL</span></code>) -</p>
 <ul>
 <li><p><strong>Attention2D Parallelism</strong> (<code class="docutils literal notranslate"><span class="pre">--attn2d_row_size</span> <span class="pre">N</span></code>, <code class="docutils literal notranslate"><span class="pre">--attn2d_col_size</span> <span class="pre">M</span></code>): Shards the sequence axis across a 2D <code class="docutils literal notranslate"><span class="pre">N</span> <span class="pre">x</span> <span class="pre">M</span></code> device mesh, all-gathering Q along rows and K/V along columns so each rank computes a sub-block of the attention matrix (total CP degree = <code class="docutils literal notranslate"><span class="pre">N</span> <span class="pre">*</span> <span class="pre">M</span></code>; not currently combinable with Ulysses).</p></li>
 <li><p><strong>Ring Attention Parallelism</strong> (<code class="docutils literal notranslate"><span class="pre">--ring_size</span> <span class="pre">N</span></code>): Shards the sequence axis across a 1D ring of <code class="docutils literal notranslate"><span class="pre">N</span></code> ranks and streams K/V blocks around the ring so each rank computes its attention output without materializing the full K/V (mutually exclusive with Attention2D).</p></li>
 </ul>
 </li>
+<li><p><strong>Tensor Parallelism</strong> (<code class="docutils literal notranslate"><span class="pre">--tp_size</span> <span class="pre">N</span></code>): Splits attention heads and transformer MLPs across GPUs for faster compute and reduced memory usage.</p></li>
 </ul>
 </section>
 </section>
@@ -981,6 +1031,7 @@ actively evolving and may change in future releases.</p>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#optimizations">Optimizations</a><ul class="nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#quantization">Quantization</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#quantized-attention">Quantized Attention</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#teacache">TeaCache</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#multi-gpu-parallelism">Multi-GPU Parallelism</a></li>
 </ul>
@@ -1087,9 +1138,9 @@ actively evolving and may change in future releases.</p>
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on May 25, 2026.</p>
+  <p>Last updated on June 01, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/4517988">4517988</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/a422420">a422420</a>.</p>
   
 </div></div>
       

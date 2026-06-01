@@ -498,7 +498,7 @@ window.runMermaid = runMermaid;</script>
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.18.0';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc16';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc17';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -512,7 +512,7 @@ window.runMermaid = runMermaid;</script>
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.3.0rc16" />
+  <meta name="docsearch:version" content="1.3.0rc17" />
   
     
     <script src="../../../_static/searchtools.js"></script>
@@ -1016,10 +1016,8 @@ window.runMermaid = runMermaid;</script>
 <span class="kn">from</span><span class="w"> </span><span class="nn">transformers</span><span class="w"> </span><span class="kn">import</span> <span class="n">PreTrainedTokenizerBase</span>
 
 <span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm._utils</span><span class="w"> </span><span class="kn">import</span> <span class="n">mpi_disabled</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm.inputs.data</span><span class="w"> </span><span class="kn">import</span> <span class="n">TextPrompt</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm.inputs.multimodal</span><span class="w"> </span><span class="kn">import</span> <span class="n">MultimodalInput</span><span class="p">,</span> <span class="n">MultimodalParams</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm.inputs.registry</span><span class="w"> </span><span class="kn">import</span> <span class="p">(</span><span class="n">BaseMultimodalInputProcessor</span><span class="p">,</span>
-                                          <span class="n">DefaultInputProcessor</span><span class="p">)</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm.inputs.registry</span><span class="w"> </span><span class="kn">import</span> <span class="n">BaseMultimodalInputProcessor</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm.llmapi</span><span class="w"> </span><span class="kn">import</span> <span class="n">tracing</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm.metrics.enums</span><span class="w"> </span><span class="kn">import</span> <span class="n">MetricNames</span>
 
@@ -1047,6 +1045,7 @@ window.runMermaid = runMermaid;</script>
 <span class="kn">from</span><span class="w"> </span><span class="nn">.llm_utils</span><span class="w"> </span><span class="kn">import</span> <span class="p">(</span><span class="n">CachedModelLoader</span><span class="p">,</span> <span class="n">KvCacheRetentionConfig</span><span class="p">,</span>
                         <span class="n">LlmBuildStats</span><span class="p">,</span> <span class="n">ModelLoader</span><span class="p">,</span> <span class="n">_ModelRuntimeContext</span><span class="p">)</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">.mpi_session</span><span class="w"> </span><span class="kn">import</span> <span class="n">MpiPoolSession</span><span class="p">,</span> <span class="n">external_mpi_comm_available</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">.thinking_budget</span><span class="w"> </span><span class="kn">import</span> <span class="n">add_thinking_budget_logits_processor</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">.tokenizer</span><span class="w"> </span><span class="kn">import</span> <span class="n">TokenizerBase</span><span class="p">,</span> <span class="n">_xgrammar_tokenizer_info</span>
 <span class="c1"># TODO[chunweiy]: move the following symbols back to utils scope, and remove the following import</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">.utils</span><span class="w"> </span><span class="kn">import</span> <span class="p">(</span><span class="n">append_docstring</span><span class="p">,</span> <span class="n">exception_handler</span><span class="p">,</span> <span class="n">get_device_count</span><span class="p">,</span>
@@ -1554,34 +1553,10 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">        &quot;&quot;&quot;</span>
         <span class="n">inputs</span> <span class="o">=</span> <span class="n">prompt_inputs</span><span class="p">(</span><span class="n">inputs</span><span class="p">)</span>
 
-        <span class="c1"># A fast path for token IDs &amp; MM data is available for a VLM if the input processor has the following methods.</span>
-        <span class="c1"># TODO: Once all the VLMs support the fast path, remove this flag and modify the remaining logic accordingly.</span>
-        <span class="n">use_token_ids_for_mm_placeholders</span> <span class="o">=</span> <span class="p">(</span>
-            <span class="nb">hasattr</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">input_processor</span><span class="p">,</span> <span class="s2">&quot;get_text_with_mm_placeholders&quot;</span><span class="p">)</span>
-            <span class="ow">and</span> <span class="nb">hasattr</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">input_processor</span><span class="p">,</span> <span class="s2">&quot;expand_prompt_token_ids_for_mm&quot;</span><span class="p">))</span>
-
-        <span class="c1"># This IF branch is applicable, whenever:</span>
-        <span class="c1"># - multimodal data is present (whether through embeddings or as preprocessed data), AND</span>
-        <span class="c1"># - token IDs are present, AND</span>
-        <span class="c1"># - two methods defining the placeholder token IDs expansion logic are not available.</span>
-        <span class="k">if</span> <span class="ow">not</span> <span class="n">inputs</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;prompt&quot;</span><span class="p">)</span> <span class="ow">and</span> <span class="n">inputs</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;prompt_token_ids&quot;</span><span class="p">)</span> <span class="ow">and</span> <span class="p">(</span>
-                <span class="n">inputs</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;multi_modal_data&quot;</span><span class="p">)</span>
-                <span class="ow">or</span> <span class="n">inputs</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;multi_modal_embeddings&quot;</span><span class="p">))</span> <span class="ow">and</span> <span class="ow">not</span> <span class="nb">isinstance</span><span class="p">(</span>
-                    <span class="bp">self</span><span class="o">.</span><span class="n">input_processor</span><span class="p">,</span> <span class="n">DefaultInputProcessor</span>
-                <span class="p">)</span> <span class="ow">and</span> <span class="ow">not</span> <span class="n">use_token_ids_for_mm_placeholders</span><span class="p">:</span>
-            <span class="c1"># VLMs need to process/tokenize the prompt in their own way,</span>
-            <span class="c1"># if they don&#39;t have the fast path for token IDs &amp; MM data implemented yet.</span>
-            <span class="c1"># TODO: Once all the VLMs support the fast path, we can remove this detokenization step entirely.</span>
-            <span class="n">prompt</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">tokenizer</span><span class="o">.</span><span class="n">decode</span><span class="p">(</span><span class="n">inputs</span><span class="p">[</span><span class="s1">&#39;prompt_token_ids&#39;</span><span class="p">])</span>
-            <span class="n">inputs</span> <span class="o">=</span> <span class="n">TextPrompt</span><span class="p">(</span>
-                <span class="n">prompt</span><span class="o">=</span><span class="n">prompt</span><span class="p">,</span>
-                <span class="n">multi_modal_data</span><span class="o">=</span><span class="n">inputs</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;multi_modal_data&quot;</span><span class="p">),</span>
-                <span class="n">mm_processor_kwargs</span><span class="o">=</span><span class="n">inputs</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;mm_processor_kwargs&quot;</span><span class="p">)</span> <span class="ow">or</span> <span class="p">{})</span>
-            <span class="k">if</span> <span class="n">sampling_params</span><span class="o">.</span><span class="n">add_special_tokens</span><span class="p">:</span>
-                <span class="n">logger</span><span class="o">.</span><span class="n">debug</span><span class="p">(</span>
-                    <span class="s2">&quot;Setting add_special_tokens to False because prompt_token_ids were provided to generate. VLMs will re-encode the prompt.&quot;</span>
-                <span class="p">)</span>
-                <span class="n">sampling_params</span><span class="o">.</span><span class="n">add_special_tokens</span> <span class="o">=</span> <span class="kc">False</span>
+        <span class="c1"># Detokenization for non-fast-path VLMs (prompt_token_ids + MM payload,</span>
+        <span class="c1"># no prompt) is handled inside BaseMultimodalInputProcessor.__call__</span>
+        <span class="c1"># and BaseMultimodalInputProcessor.attach_multimodal_embeddings, gated</span>
+        <span class="c1"># on the `supports_token_id_mm_expansion` class flag.</span>
 
         <span class="n">is_mm_disagg</span> <span class="o">=</span> <span class="p">(</span><span class="n">disaggregated_params</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span>
                         <span class="ow">and</span> <span class="n">disaggregated_params</span><span class="o">.</span><span class="n">multimodal_embedding_handles</span>
@@ -2006,6 +1981,11 @@ window.runMermaid = runMermaid;</script>
                     <span class="p">)</span>
                 <span class="n">sampling_params</span><span class="o">.</span><span class="n">_setup</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">tokenizer</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">_hf_model_config</span><span class="p">,</span>
                                        <span class="bp">self</span><span class="o">.</span><span class="n">_generation_config</span><span class="p">)</span>
+            <span class="n">add_thinking_budget_logits_processor</span><span class="p">(</span>
+                <span class="n">sampling_params</span><span class="p">,</span>
+                <span class="n">reasoning_parser</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">reasoning_parser</span><span class="p">,</span>
+                <span class="n">tokenizer</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">tokenizer</span><span class="p">,</span>
+            <span class="p">)</span>
         <span class="k">else</span><span class="p">:</span>
             <span class="k">raise</span> <span class="ne">TypeError</span><span class="p">(</span>
                 <span class="sa">f</span><span class="s2">&quot;The sampling_params must be type SamplingParams or None, but got </span><span class="si">{</span><span class="nb">type</span><span class="p">(</span><span class="n">sampling_params</span><span class="p">)</span><span class="si">}</span><span class="s2">&quot;</span>
@@ -2160,7 +2140,8 @@ window.runMermaid = runMermaid;</script>
 
     <span class="k">def</span><span class="w"> </span><span class="nf">_try_load_hf_model_config</span><span class="p">(</span>
             <span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Optional</span><span class="p">[</span><span class="n">transformers</span><span class="o">.</span><span class="n">PretrainedConfig</span><span class="p">]:</span>
-        <span class="k">return</span> <span class="n">ModelLoader</span><span class="o">.</span><span class="n">load_hf_model_config</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">model</span><span class="p">)</span>
+        <span class="k">return</span> <span class="n">ModelLoader</span><span class="o">.</span><span class="n">load_hf_model_config</span><span class="p">(</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">model</span><span class="p">,</span> <span class="n">trust_remote_code</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">trust_remote_code</span><span class="p">)</span>
 
     <span class="nd">@set_api_status</span><span class="p">(</span><span class="s2">&quot;beta&quot;</span><span class="p">)</span>
     <span class="k">def</span><span class="w"> </span><span class="nf">shutdown</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
@@ -2282,7 +2263,8 @@ window.runMermaid = runMermaid;</script>
         <span class="c1"># config.json uses TRT-LLM schema, not HF schema).</span>
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_hf_model_dir</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">_hf_model_config</span> <span class="o">=</span> <span class="n">ModelLoader</span><span class="o">.</span><span class="n">load_hf_model_config</span><span class="p">(</span>
-                <span class="bp">self</span><span class="o">.</span><span class="n">_hf_model_dir</span><span class="p">)</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">_hf_model_dir</span><span class="p">,</span>
+                <span class="n">trust_remote_code</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">trust_remote_code</span><span class="p">)</span>
         <span class="k">else</span><span class="p">:</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">_hf_model_config</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_try_load_hf_model_config</span><span class="p">()</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_generation_config</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_try_load_generation_config</span><span class="p">()</span>
@@ -2290,8 +2272,10 @@ window.runMermaid = runMermaid;</script>
         <span class="c1"># Multimodal special handling:</span>
         <span class="c1"># 1. Default load_tokenizer may fail because MM has different tokenizer configuration. Hence we initialize it inside input processor</span>
         <span class="c1"># 2. May need to modify model weights for MM (e.g., resize vocab embedding). We must do such operation via input processor&#39;s __init__</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">input_processor</span> <span class="o">=</span> <span class="n">create_input_processor</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_hf_model_dir</span><span class="p">,</span>
-                                                      <span class="bp">self</span><span class="o">.</span><span class="n">tokenizer</span><span class="p">)</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">input_processor</span> <span class="o">=</span> <span class="n">create_input_processor</span><span class="p">(</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_hf_model_dir</span><span class="p">,</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">tokenizer</span><span class="p">,</span>
+            <span class="n">trust_remote_code</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">trust_remote_code</span><span class="p">)</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_tokenizer</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">input_processor</span><span class="o">.</span><span class="n">tokenizer</span>
 
         <span class="n">max_batch_size</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">max_batch_size</span>
@@ -2496,10 +2480,12 @@ window.runMermaid = runMermaid;</script>
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">video_pruning_rate</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
             <span class="n">input_processor_kwargs</span><span class="p">[</span>
                 <span class="s1">&#39;video_pruning_rate&#39;</span><span class="p">]</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">video_pruning_rate</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">input_processor</span> <span class="o">=</span> <span class="n">create_input_processor</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_hf_model_dir</span><span class="p">,</span>
-                                                      <span class="bp">self</span><span class="o">.</span><span class="n">tokenizer</span><span class="p">,</span>
-                                                      <span class="n">checkpoint_format</span><span class="p">,</span>
-                                                      <span class="o">**</span><span class="n">input_processor_kwargs</span><span class="p">)</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">input_processor</span> <span class="o">=</span> <span class="n">create_input_processor</span><span class="p">(</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_hf_model_dir</span><span class="p">,</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">tokenizer</span><span class="p">,</span>
+            <span class="n">checkpoint_format</span><span class="p">,</span>
+            <span class="n">trust_remote_code</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">trust_remote_code</span><span class="p">,</span>
+            <span class="o">**</span><span class="n">input_processor_kwargs</span><span class="p">)</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_tokenizer</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">input_processor</span><span class="o">.</span><span class="n">tokenizer</span>
 
         <span class="c1"># Resolve encode_only mode (opt-in only)</span>
@@ -2715,9 +2701,9 @@ window.runMermaid = runMermaid;</script>
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on May 25, 2026.</p>
+  <p>Last updated on June 01, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/4517988">4517988</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/a422420">a422420</a>.</p>
   
 </div></div>
       
