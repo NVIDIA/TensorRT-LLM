@@ -351,7 +351,7 @@ class Qwen3VLInputProcessorBase(BaseMultimodalInputProcessor, BaseMultimodalDumm
 
     @nvtx_range("Qwen3VLInputProcessorBase forward()")
     @torch.inference_mode()
-    def __call__(
+    def call_with_text_prompt(
         self,
         inputs: TextPrompt,
         sampling_params: SamplingParams,
@@ -875,10 +875,10 @@ class Qwen3VisionModelBase(nn.Module):
         self.model_config = model_config
         self.model_dtype = self.model_config.pretrained_config.text_config.dtype
 
-        # NOTE: Re-setting QuantConfig to exclude vision encoder weights from quantization load.
-        self.model_config.quant_config = QuantConfig(
-            kv_cache_quant_algo=self.model_config.quant_config.kv_cache_quant_algo
-        )
+        # NOTE: Re-setting QuantConfig to exclude vision encoder from quantization,
+        # including KV cache quantization (vision encoder head dims may not be
+        # supported by FP8 FMHA kernels).
+        self.model_config.quant_config = QuantConfig()
 
         self.visual = model_class(self.model_config).to(self.model_dtype)
 
@@ -1053,8 +1053,6 @@ class Qwen3VLModelBase(PreTrainedModel):
             llm_model_config.pretrained_config.architectures = ["Qwen3ForCausalLM"]
         elif self.original_arch == "Qwen3VLMoeForConditionalGeneration":
             llm_model_config.pretrained_config.architectures = ["Qwen3MoeForCausalLM"]
-        elif self.original_arch == "Qwen3_5MoeForConditionalGeneration":
-            llm_model_config.pretrained_config.architectures = ["Qwen3_5MoeForCausalLM"]
         else:
             raise ValueError(f"Unsupported architecture: {self.original_arch}")
         # Qwen3ForCausalLM.
@@ -1092,12 +1090,9 @@ class Qwen3VLModelBase(PreTrainedModel):
             mrope_section=config.rope_scaling.get("mrope_section", None),
             mrope_interleaved=config.rope_scaling.get("mrope_interleaved", False),
         )
-        head_dim = getattr(config, "head_dim", None)
-        if not isinstance(head_dim, int):
-            head_dim = config.hidden_size // config.num_attention_heads
         self.rotary_emb = MRotaryEmbedding(
             pos_embd_params.rope,
-            head_dim=head_dim,
+            head_dim=config.hidden_size // config.num_attention_heads,
             is_neox=pos_embd_params.is_neox,
             mrope_section=pos_embd_params.mrope_section,
             mrope_interleaved=pos_embd_params.mrope_interleaved,

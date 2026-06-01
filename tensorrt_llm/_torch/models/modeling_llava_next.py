@@ -1,6 +1,6 @@
 import copy
 import os
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, ClassVar, Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import torch
@@ -37,6 +37,7 @@ DISAGG = os.getenv('TLLM_MULTIMODAL_DISAGGREGATED', '0') == '1'
 
 class LlavaNextInputProcessor(BaseMultimodalInputProcessor,
                               BaseMultimodalDummyInputsBuilder):
+    supports_token_id_mm_expansion: ClassVar[bool] = True
 
     def __init__(self,
                  model_path: str,
@@ -328,7 +329,7 @@ class LlavaNextInputProcessor(BaseMultimodalInputProcessor,
 
         return expanded_ids, mm_token_length, mm_token_offsets
 
-    def attach_multimodal_embeddings(
+    def _attach_multimodal_embeddings_impl(
         self, inputs: TextPrompt,
         multimodal_embedding: Dict[str, List[torch.Tensor]],
         sampling_params: SamplingParams
@@ -375,7 +376,7 @@ class LlavaNextInputProcessor(BaseMultimodalInputProcessor,
         }
 
     @torch.inference_mode()
-    def __call__(
+    def call_with_text_prompt(
         self, inputs: TextPrompt, sampling_params: SamplingParams
     ) -> Tuple[List[int], Optional[ExtraProcessedInputs]]:
         text_prompt, mm_data = inputs.get("prompt"), inputs.get(

@@ -16,7 +16,7 @@
 Parallelism Wrappers
 
 Wraps any attention backend with a parallelism strategy. Not a standalone
-backend — compose around a real backend (VANILLA/TRTLLM/FA4).
+backend — compose around a real backend (VANILLA/TRTLLM/FA4/CUTEDSL).
 
 """
 
@@ -31,9 +31,7 @@ from .interface import AttentionBackend, AttentionTensorLayout
 
 _flash_attn_combine_import_error = None
 try:
-    from tensorrt_llm._torch.visual_gen.jit_kernels.flash_attention.cute.interface import (
-        flash_attn_combine as _flash_attn_combine,
-    )
+    from flash_attn.cute.interface import flash_attn_combine as _flash_attn_combine
 except (ImportError, OSError) as e:
     _flash_attn_combine = None
     _flash_attn_combine_import_error = e
@@ -258,8 +256,8 @@ class Attention2DAttention(AttentionBackend):
     Supported inner backends
     ------------------------
     The inner backend must support LSE output (``support_lse() -> True``) — required
-    for the reduce-scatter combine step.  Currently only the FA4 backend
-    (``FlashAttn4Attention``) meets this requirement.
+    for the reduce-scatter combine step.  Currently the FA4 and CUTEDSL
+    backends meet this requirement.
 
     Note: ``AttentionTensorLayout.NHD`` and ``AttentionTensorLayout.HND`` are both
     handled transparently; transposition is applied before the inner forward and

@@ -441,8 +441,12 @@ std::size_t KVCacheTransferManager::computeBlockTransferBytes(
         }
 
         auto const dataType = pool.primaryPtr->getDataType();
-        auto const bytesPerElement
-            = pool.primaryPtr->getSizeInBytes() / static_cast<std::size_t>(pool.primaryPtr->getSize());
+        auto const numElements = static_cast<std::size_t>(pool.primaryPtr->getSize());
+        if (numElements == 0)
+        {
+            continue; // empty pool contributes 0 bytes; avoids divide-by-zero
+        }
+        auto const bytesPerElement = pool.primaryPtr->getSizeInBytes() / numElements;
 
         // Mirror the logic in copyBlock: a partial copy only happens when numTokensToCopy > 0,
         // the data type supports it (not kINT4/kFP4), not block scales, and numTokensToCopy < tokensPerBlock.

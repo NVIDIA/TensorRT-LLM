@@ -391,17 +391,6 @@ class TestLlama7B(CliFlowAccuracyTestHarness):
                  extra_build_args=["--max_beam_width=5"],
                  extra_summarize_args=["--num_beams=5"])
 
-    @pytest.mark.skip(
-        reason=
-        "Waived for now because attention sink cannot work with the non-cyclic kv cache kernel & runtime changes."
-    )
-    def test_streamingllm(self):
-        self.run(extra_acc_spec="streamingllm",
-                 extra_build_args=["--streamingllm=enable"],
-                 extra_summarize_args=[
-                     "--max_attention_window_size=2048", "--sink_token_length=4"
-                 ])
-
     def test_manage_weights(self):
         self.run(extra_build_args=["--fast_build"])
 

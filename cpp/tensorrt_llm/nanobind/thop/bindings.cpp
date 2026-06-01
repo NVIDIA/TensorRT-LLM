@@ -51,12 +51,12 @@ nb::tuple trtllmGenContextPreprocessBinding(torch::Tensor qkv_input, torch::Tens
     std::optional<torch::Tensor> rotary_cos_sin, std::optional<torch::Tensor> mrope_rotary_cos_sin, int64_t layer_idx,
     int64_t num_heads, int64_t num_kv_heads, int64_t head_size, int64_t tokens_per_block, int64_t mask_type,
     int64_t kv_cache_quant_mode, int64_t max_attention_window_size, int64_t cyclic_attention_window_size,
-    int64_t sink_token_length, int64_t num_tokens, int64_t batch_size, int64_t input_seq_length,
-    int64_t max_past_kv_length, int64_t rotary_embedding_dim, double rotary_embedding_base,
-    int64_t rotary_embedding_scale_type, double rotary_embedding_scale, int64_t rotary_embedding_max_positions,
-    int64_t position_embedding_type, double bmm1_scale, double bmm2_scale, int64_t attention_chunk_size,
-    bool fp8_context_fmha, bool paged_context_fmha, bool is_mla_enable, int64_t multi_processor_count,
-    int64_t total_num_blocks, int64_t kv_factor, bool need_build_kv_cache_metadata)
+    int64_t num_tokens, int64_t batch_size, int64_t input_seq_length, int64_t max_past_kv_length,
+    int64_t rotary_embedding_dim, double rotary_embedding_base, int64_t rotary_embedding_scale_type,
+    double rotary_embedding_scale, int64_t rotary_embedding_max_positions, int64_t position_embedding_type,
+    double bmm1_scale, double bmm2_scale, int64_t attention_chunk_size, bool fp8_context_fmha, bool paged_context_fmha,
+    bool is_mla_enable, int64_t multi_processor_count, int64_t total_num_blocks, int64_t kv_factor,
+    bool need_build_kv_cache_metadata)
 {
     auto result = [&]()
     {
@@ -65,16 +65,17 @@ nb::tuple trtllmGenContextPreprocessBinding(torch::Tensor qkv_input, torch::Tens
             kv_cache_block_offsets, host_kv_cache_pool_pointers, host_kv_cache_pool_mapping, kv_scale_orig_quant,
             kv_scale_quant_orig, attention_output_orig_quant, rotary_inv_freq, rotary_cos_sin, mrope_rotary_cos_sin,
             layer_idx, num_heads, num_kv_heads, head_size, tokens_per_block, mask_type, kv_cache_quant_mode,
-            max_attention_window_size, cyclic_attention_window_size, sink_token_length, num_tokens, batch_size,
-            input_seq_length, max_past_kv_length, rotary_embedding_dim, rotary_embedding_base,
-            rotary_embedding_scale_type, rotary_embedding_scale, rotary_embedding_max_positions,
-            position_embedding_type, bmm1_scale, bmm2_scale, attention_chunk_size, fp8_context_fmha, paged_context_fmha,
-            is_mla_enable, multi_processor_count, total_num_blocks, kv_factor, need_build_kv_cache_metadata);
+            max_attention_window_size, cyclic_attention_window_size, num_tokens, batch_size, input_seq_length,
+            max_past_kv_length, rotary_embedding_dim, rotary_embedding_base, rotary_embedding_scale_type,
+            rotary_embedding_scale, rotary_embedding_max_positions, position_embedding_type, bmm1_scale, bmm2_scale,
+            attention_chunk_size, fp8_context_fmha, paged_context_fmha, is_mla_enable, multi_processor_count,
+            total_num_blocks, kv_factor, need_build_kv_cache_metadata);
     }();
 
     return nb::make_tuple(std::get<0>(result), optionalTensorToObject(std::get<1>(result)),
-        optionalTensorToObject(std::get<2>(result)), std::get<3>(result), std::get<4>(result), std::get<5>(result),
-        std::get<6>(result), std::get<7>(result), std::get<8>(result));
+        optionalTensorToObject(std::get<2>(result)), optionalTensorToObject(std::get<3>(result)),
+        optionalTensorToObject(std::get<4>(result)), optionalTensorToObject(std::get<5>(result)), std::get<6>(result),
+        std::get<7>(result), std::get<8>(result), std::get<9>(result), std::get<10>(result), std::get<11>(result));
 }
 
 nb::tuple trtllmGenGenerationPreprocessBinding(torch::Tensor qkv_input, torch::Tensor workspace,
@@ -85,13 +86,12 @@ nb::tuple trtllmGenGenerationPreprocessBinding(torch::Tensor qkv_input, torch::T
     std::optional<torch::Tensor> attention_output_orig_quant, std::optional<torch::Tensor> rotary_inv_freq,
     std::optional<torch::Tensor> rotary_cos_sin, int64_t layer_idx, int64_t seq_offset, int64_t num_heads,
     int64_t num_kv_heads, int64_t head_size, int64_t tokens_per_block, int64_t kv_cache_quant_mode,
-    int64_t max_attention_window_size, int64_t cyclic_attention_window_size, int64_t sink_token_length,
-    int64_t num_tokens, int64_t batch_beam, int64_t input_seq_length, int64_t max_past_kv_length,
-    int64_t rotary_embedding_dim, double rotary_embedding_base, int64_t rotary_embedding_scale_type,
-    double rotary_embedding_scale, int64_t rotary_embedding_max_positions, int64_t position_embedding_type,
-    double bmm1_scale, double bmm2_scale, bool fp8_context_fmha, int64_t predicted_tokens_per_seq,
-    int64_t attention_chunk_size, int64_t multi_processor_count, int64_t total_num_blocks, int64_t kv_factor,
-    bool need_build_kv_cache_metadata)
+    int64_t max_attention_window_size, int64_t cyclic_attention_window_size, int64_t num_tokens, int64_t batch_beam,
+    int64_t input_seq_length, int64_t max_past_kv_length, int64_t rotary_embedding_dim, double rotary_embedding_base,
+    int64_t rotary_embedding_scale_type, double rotary_embedding_scale, int64_t rotary_embedding_max_positions,
+    int64_t position_embedding_type, double bmm1_scale, double bmm2_scale, bool fp8_context_fmha,
+    int64_t predicted_tokens_per_seq, int64_t attention_chunk_size, int64_t multi_processor_count,
+    int64_t total_num_blocks, int64_t kv_factor, bool need_build_kv_cache_metadata)
 {
     auto result = [&]()
     {
@@ -101,16 +101,17 @@ nb::tuple trtllmGenGenerationPreprocessBinding(torch::Tensor qkv_input, torch::T
             host_kv_cache_pool_pointers, host_kv_cache_pool_mapping, kv_scale_orig_quant, kv_scale_quant_orig,
             attention_output_orig_quant, rotary_inv_freq, rotary_cos_sin, layer_idx, seq_offset, num_heads,
             num_kv_heads, head_size, tokens_per_block, kv_cache_quant_mode, max_attention_window_size,
-            cyclic_attention_window_size, sink_token_length, num_tokens, batch_beam, input_seq_length,
-            max_past_kv_length, rotary_embedding_dim, rotary_embedding_base, rotary_embedding_scale_type,
-            rotary_embedding_scale, rotary_embedding_max_positions, position_embedding_type, bmm1_scale, bmm2_scale,
-            fp8_context_fmha, predicted_tokens_per_seq, attention_chunk_size, multi_processor_count, total_num_blocks,
-            kv_factor, need_build_kv_cache_metadata);
+            cyclic_attention_window_size, num_tokens, batch_beam, input_seq_length, max_past_kv_length,
+            rotary_embedding_dim, rotary_embedding_base, rotary_embedding_scale_type, rotary_embedding_scale,
+            rotary_embedding_max_positions, position_embedding_type, bmm1_scale, bmm2_scale, fp8_context_fmha,
+            predicted_tokens_per_seq, attention_chunk_size, multi_processor_count, total_num_blocks, kv_factor,
+            need_build_kv_cache_metadata);
     }();
 
     return nb::make_tuple(std::get<0>(result), optionalTensorToObject(std::get<1>(result)),
-        optionalTensorToObject(std::get<2>(result)), std::get<3>(result), optionalTensorToObject(std::get<4>(result)),
-        std::get<5>(result), std::get<6>(result), std::get<7>(result), std::get<8>(result));
+        optionalTensorToObject(std::get<2>(result)), optionalTensorToObject(std::get<3>(result)), std::get<4>(result),
+        std::get<5>(result), std::get<6>(result), optionalTensorToObject(std::get<7>(result)), std::get<8>(result),
+        std::get<9>(result), std::get<10>(result), std::get<11>(result));
 }
 
 } // namespace
@@ -141,20 +142,24 @@ void initBindings(nb::module_& m)
         nb::arg("kv_scale_quant_orig").none(), nb::arg("out_scale").none(), nb::arg("rotary_inv_freq").none(),
         nb::arg("rotary_cos_sin").none(), nb::arg("latent_cache").none(), nb::arg("q_pe").none(),
         nb::arg("block_ids_per_seq").none(), nb::arg("attention_sinks").none(), nb::arg("is_fused_qkv"),
-        nb::arg("update_kv_cache"), nb::arg("predicted_tokens_per_seq"), nb::arg("layer_idx"), nb::arg("num_heads"),
-        nb::arg("num_kv_heads"), nb::arg("head_size"), nb::arg("tokens_per_block").none(), nb::arg("max_num_requests"),
-        nb::arg("max_context_length"), nb::arg("attention_window_size"), nb::arg("sink_token_length"),
+        nb::arg("update_kv_cache"), nb::arg("predicted_tokens_per_seq"), nb::arg("local_layer_idx"),
+        nb::arg("num_heads"), nb::arg("num_kv_heads"), nb::arg("head_size"), nb::arg("tokens_per_block").none(),
+        nb::arg("max_num_requests"), nb::arg("max_context_length"), nb::arg("attention_window_size"),
         nb::arg("beam_width"), nb::arg("mask_type"), nb::arg("quant_mode"), nb::arg("q_scaling"),
-        nb::arg("position_embedding_type"), nb::arg("rotary_embedding_dim"), nb::arg("rotary_embedding_base"),
-        nb::arg("rotary_embedding_scale_type"), nb::arg("rotary_embedding_scales"),
-        nb::arg("rotary_embedding_max_position_info"), nb::arg("use_paged_context_fmha"),
+        nb::arg("position_embedding_type"), nb::arg("rope_dim"), nb::arg("rope_base"), nb::arg("rope_scale_type"),
+        nb::arg("rope_scale"), nb::arg("rope_short_m_scale"), nb::arg("rope_long_m_scale"),
+        nb::arg("rope_max_positions"), nb::arg("rope_original_max_positions"), nb::arg("use_paged_context_fmha"),
         nb::arg("attention_input_type").none(), nb::arg("is_mla_enable"),
         nb::arg("chunked_prefill_buffer_batch_size").none(), nb::arg("q_lora_rank").none(),
         nb::arg("kv_lora_rank").none(), nb::arg("qk_nope_head_dim").none(), nb::arg("qk_rope_head_dim").none(),
         nb::arg("v_head_dim").none(), nb::arg("rope_append").none(), nb::arg("mrope_rotary_cos_sin").none(),
-        nb::arg("mrope_position_deltas").none(), nb::arg("helix_tensor_params"), nb::arg("attention_chunk_size").none(),
-        nb::arg("softmax_stats_tensor").none(), nb::arg("spec_decoding_bool_params"),
-        nb::arg("spec_decoding_tensor_params"), nb::arg("sparse_kv_indices").none(),
+        nb::arg("mrope_position_deltas").none(), nb::arg("helix_position_offsets").none(),
+        nb::arg("helix_is_inactive_rank").none(), nb::arg("attention_chunk_size").none(),
+        nb::arg("softmax_stats_tensor").none(), nb::arg("is_spec_decoding_enabled"), nb::arg("use_spec_decoding"),
+        nb::arg("is_spec_dec_tree"), nb::arg("spec_decoding_generation_lengths").none(),
+        nb::arg("spec_decoding_position_offsets_for_cpp").none(), nb::arg("spec_decoding_packed_mask").none(),
+        nb::arg("spec_decoding_bl_tree_mask_offset").none(), nb::arg("spec_decoding_bl_tree_mask").none(),
+        nb::arg("spec_bl_tree_first_sparse_mask_offset_kv").none(), nb::arg("sparse_kv_indices").none(),
         nb::arg("sparse_kv_offsets").none(), nb::arg("sparse_attn_indices").none(),
         nb::arg("sparse_attn_offsets").none(), nb::arg("sparse_attn_indices_block_size"),
         nb::arg("num_sparse_topk") = std::nullopt, nb::arg("sparse_mla_topk_lens") = std::nullopt,
@@ -257,8 +262,8 @@ void initBindings(nb::module_& m)
         nb::arg("rotary_inv_freq").none(), nb::arg("rotary_cos_sin").none(), nb::arg("mrope_rotary_cos_sin").none(),
         nb::arg("layer_idx"), nb::arg("num_heads"), nb::arg("num_kv_heads"), nb::arg("head_size"),
         nb::arg("tokens_per_block"), nb::arg("mask_type"), nb::arg("kv_cache_quant_mode"),
-        nb::arg("max_attention_window_size"), nb::arg("cyclic_attention_window_size"), nb::arg("sink_token_length"),
-        nb::arg("num_tokens"), nb::arg("batch_size"), nb::arg("input_seq_length"), nb::arg("max_past_kv_length"),
+        nb::arg("max_attention_window_size"), nb::arg("cyclic_attention_window_size"), nb::arg("num_tokens"),
+        nb::arg("batch_size"), nb::arg("input_seq_length"), nb::arg("max_past_kv_length"),
         nb::arg("rotary_embedding_dim"), nb::arg("rotary_embedding_base"), nb::arg("rotary_embedding_scale_type"),
         nb::arg("rotary_embedding_scale"), nb::arg("rotary_embedding_max_positions"),
         nb::arg("position_embedding_type"), nb::arg("bmm1_scale"), nb::arg("bmm2_scale"),
@@ -274,14 +279,13 @@ void initBindings(nb::module_& m)
         nb::arg("rotary_cos_sin").none(), nb::arg("mrope_rotary_cos_sin").none(), nb::arg("layer_idx"),
         nb::arg("num_heads"), nb::arg("num_kv_heads"), nb::arg("head_size"), nb::arg("tokens_per_block"),
         nb::arg("mask_type"), nb::arg("kv_cache_quant_mode"), nb::arg("max_attention_window_size"),
-        nb::arg("cyclic_attention_window_size"), nb::arg("sink_token_length"), nb::arg("num_tokens"),
-        nb::arg("batch_size"), nb::arg("input_seq_length"), nb::arg("max_past_kv_length"),
-        nb::arg("rotary_embedding_dim"), nb::arg("rotary_embedding_base"), nb::arg("rotary_embedding_scale_type"),
-        nb::arg("rotary_embedding_scale"), nb::arg("rotary_embedding_max_positions"),
-        nb::arg("position_embedding_type"), nb::arg("bmm1_scale"), nb::arg("fp8_context_fmha"),
-        nb::arg("paged_context_fmha"), nb::arg("is_mla_enable"), nb::arg("attention_chunk_size"),
-        nb::arg("multi_processor_count"), "Fused nanobind context postprocess for trtllm-gen attention.",
-        nb::call_guard<nb::gil_scoped_release>());
+        nb::arg("cyclic_attention_window_size"), nb::arg("num_tokens"), nb::arg("batch_size"),
+        nb::arg("input_seq_length"), nb::arg("max_past_kv_length"), nb::arg("rotary_embedding_dim"),
+        nb::arg("rotary_embedding_base"), nb::arg("rotary_embedding_scale_type"), nb::arg("rotary_embedding_scale"),
+        nb::arg("rotary_embedding_max_positions"), nb::arg("position_embedding_type"), nb::arg("bmm1_scale"),
+        nb::arg("fp8_context_fmha"), nb::arg("paged_context_fmha"), nb::arg("is_mla_enable"),
+        nb::arg("attention_chunk_size"), nb::arg("multi_processor_count"),
+        "Fused nanobind context postprocess for trtllm-gen attention.", nb::call_guard<nb::gil_scoped_release>());
 
     m.def(
         "build_trtllm_gen_kv_cache_metadata",
@@ -290,13 +294,18 @@ void initBindings(nb::module_& m)
             int64_t head_dim, int64_t kv_factor, int64_t total_num_blocks, int64_t kv_cache_quant_mode,
             int64_t batch_start, int64_t batch_size, at::ScalarType dtype) -> nb::tuple
         {
-            nb::gil_scoped_release release;
-            auto kvPool = torch_ext::buildFlashinferTrtllmGenPagedKvCacheBuffers(host_kv_cache_pool_pointers,
-                host_kv_cache_pool_mapping, layer_idx, num_kv_heads, tokens_per_block, head_dim, kv_factor,
-                total_num_blocks, kv_cache_quant_mode, dtype);
-            auto const mapping = torch_ext::readKvCachePoolMapping(host_kv_cache_pool_mapping, layer_idx);
-            auto blockTables = kv_cache_block_offsets.select(0, mapping.poolIndex).narrow(0, batch_start, batch_size);
-            return nb::make_tuple(nb::cast(kvPool), nb::cast(blockTables));
+            at::Tensor kvPool;
+            std::optional<at::Tensor> kvScalePool;
+            at::Tensor blockTables;
+            {
+                nb::gil_scoped_release release;
+                std::tie(kvPool, kvScalePool) = torch_ext::buildFlashinferTrtllmGenPagedKvCacheBuffers(
+                    host_kv_cache_pool_pointers, host_kv_cache_pool_mapping, layer_idx, num_kv_heads, tokens_per_block,
+                    head_dim, kv_factor, total_num_blocks, kv_cache_quant_mode, dtype);
+                auto const mapping = torch_ext::readKvCachePoolMapping(host_kv_cache_pool_mapping, layer_idx);
+                blockTables = kv_cache_block_offsets.select(0, mapping.poolIndex).narrow(0, batch_start, batch_size);
+            }
+            return nb::make_tuple(nb::cast(kvPool), nb::cast(blockTables), optionalTensorToObject(kvScalePool));
         },
         nb::arg("host_kv_cache_pool_pointers"), nb::arg("host_kv_cache_pool_mapping"),
         nb::arg("kv_cache_block_offsets"), nb::arg("layer_idx"), nb::arg("num_kv_heads"), nb::arg("tokens_per_block"),
@@ -312,8 +321,8 @@ void initBindings(nb::module_& m)
         nb::arg("attention_output_orig_quant").none(), nb::arg("rotary_inv_freq").none(),
         nb::arg("rotary_cos_sin").none(), nb::arg("layer_idx"), nb::arg("seq_offset"), nb::arg("num_heads"),
         nb::arg("num_kv_heads"), nb::arg("head_size"), nb::arg("tokens_per_block"), nb::arg("kv_cache_quant_mode"),
-        nb::arg("max_attention_window_size"), nb::arg("cyclic_attention_window_size"), nb::arg("sink_token_length"),
-        nb::arg("num_tokens"), nb::arg("batch_beam"), nb::arg("input_seq_length"), nb::arg("max_past_kv_length"),
+        nb::arg("max_attention_window_size"), nb::arg("cyclic_attention_window_size"), nb::arg("num_tokens"),
+        nb::arg("batch_beam"), nb::arg("input_seq_length"), nb::arg("max_past_kv_length"),
         nb::arg("rotary_embedding_dim"), nb::arg("rotary_embedding_base"), nb::arg("rotary_embedding_scale_type"),
         nb::arg("rotary_embedding_scale"), nb::arg("rotary_embedding_max_positions"),
         nb::arg("position_embedding_type"), nb::arg("bmm1_scale"), nb::arg("bmm2_scale"), nb::arg("fp8_context_fmha"),

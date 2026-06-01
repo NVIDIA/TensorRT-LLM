@@ -253,6 +253,28 @@ CacheTransBufferManager::CacheTransBufferManager(
 {
     // TODO: FP4 dataSize
     TLLM_CHECK(mCacheManager);
+    // TODO(disagg-multi-dtype): Per-pool dtype dispatch in formatter / transfer buffer
+    // not yet implemented.  Disagg currently picks pool 0's dtype as the canonical
+    // transport type (above), so any KV pool with a different dtype would be silently
+    // miscoerced on the wire.  Fail loudly until per-pool dispatch lands.  We restrict
+    // the comparison to KV pools (getNumPools(false, false)) since block-scale and
+    // indexer-K pools legitimately have their own dtypes and travel through their own
+    // code paths.
+    if (!transferIndexerKCache)
+    {
+        auto const numKvPools = mCacheManager->getBlockManager().getNumPools(
+            /*includeBlockScalePools=*/false, /*includeIndexerKCachePools=*/false);
+        auto const dtype0 = mCacheManager->getPrimaryPool(0)->getDataType();
+        for (SizeType32 i = 1; i < numKvPools; ++i)
+        {
+            auto const dtypeI = mCacheManager->getPrimaryPool(i)->getDataType();
+            TLLM_CHECK_WITH_INFO(dtypeI == dtype0,
+                "Disaggregated KV cache transfer does not yet support pools with differing dtypes "
+                "(pool 0 dtype=%d, pool %d dtype=%d). TODO(disagg-multi-dtype): per-pool dtype "
+                "dispatch in formatter.",
+                static_cast<int>(dtype0), i, static_cast<int>(dtypeI));
+        }
+    }
     TLLM_LOG_INFO("CacheTransBufferManager created for KV cache");
 }
 

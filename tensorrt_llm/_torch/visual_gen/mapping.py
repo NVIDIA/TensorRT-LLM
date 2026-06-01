@@ -10,6 +10,7 @@ process groups.
 
 from __future__ import annotations
 
+import os
 from typing import Optional
 
 import torch.distributed as dist
@@ -142,8 +143,55 @@ class VisualGenMapping(DeviceMeshTopologyImpl):
         }
 
         if dist.is_initialized() and world_size > 1:
+            if self.tp_size > 1:
+                self.setup_communicators()
             self.build_mesh()
             self._build_vae_group()
+
+    def _get_host_id(self):
+        """Resolve node rank from whichever launcher is active.
+
+        torchrun sets GROUP_RANK.
+        SLURM srun sets SLURM_NODEID.
+        Plain mp.Process (single-node): no env var → 0.
+        """
+        for var in ("GROUP_RANK", "SLURM_NODEID"):
+            val = os.environ.get(var)
+            if val is not None:
+                logger.debug(f"[Rank {self._rank}] node id from env: {var} = {val}")
+                return int(val)
+
+        logger.debug(f"[Rank {self._rank}] node id from env: {var} = {val}")
+        return 0  # single-node mp.Process: all ranks are co-located
+
+    def setup_communicators(self):
+        host = self._get_host_id()
+
+        all_hosts = [None for _ in range(self.world_size)]
+        dist.all_gather_object(all_hosts, (self._rank, host))
+
+        host_to_ranks = {}
+        for rank, host in all_hosts:
+            host_to_ranks.setdefault(host, []).append(rank)
+
+        self.local_comm = None
+        for host in sorted(host_to_ranks):
+            ranks = sorted(host_to_ranks[host])
+            # All global ranks from the default process group to participate in the call,
+            # even if some ranks are not part of the new process group being created
+            pg = dist.new_group(ranks=ranks, backend="cuda:nccl,cpu:gloo")
+            if int(self._rank) in ranks:
+                logger.debug(
+                    f"[Rank {self._rank}] Done setting local comm. ip_to_ranks: {host_to_ranks}"
+                )
+                self.local_comm = pg
+
+        assert self.local_comm is not None
+
+        from tensorrt_llm._utils import torch_pybind11_abi
+        from tensorrt_llm.bindings.internal.process_group import init_pg
+
+        init_pg(dist.group.WORLD, self.local_comm, torch_pybind11_abi())
 
     # ------------------------------------------------------------------
     # Mesh construction
@@ -165,6 +213,7 @@ class VisualGenMapping(DeviceMeshTopologyImpl):
             return
 
         shape = tuple(self._dim_sizes[d] for d in self._dim_names)
+
         cls.device_mesh = init_device_mesh(
             "cuda",
             mesh_shape=shape,
@@ -242,7 +291,8 @@ class VisualGenMapping(DeviceMeshTopologyImpl):
         """Ensure all ``vae_ranks`` share one cfg coordinate (or span the full world).
 
         Today ``_vae_ranks = list(range(parallel_vae_size))`` only sits inside
-        one CFG group when ``cfg`` is the outermost axis of ``dit_dim_order``.
+        one CFG group when ``cfg`` is the outermost axis of
+        ``_DEVICE_MESH_DIM_ORDER``.
         """
         if self.parallel_vae_size <= 1 or self.cfg_size <= 1:
             return
@@ -262,12 +312,13 @@ class VisualGenMapping(DeviceMeshTopologyImpl):
         if len(cfg_coords) > 1:
             raise NotImplementedError(
                 f"vae_ranks={self._vae_ranks} straddle CFG groups "
-                f"(cfg coordinates={sorted(cfg_coords)}) under order='{self._order}'. "
+                f"(cfg coordinates={sorted(cfg_coords)}) under "
+                f"order='{_DEVICE_MESH_DIM_ORDER}'. "
                 "VAE ranks must share a single CFG group, or span the full world. "
                 "_vae_ranks is currently hardcoded to list(range(parallel_vae_size)), "
                 "which only lands in one CFG group when 'cfg' is the outermost axis "
-                "of dit_dim_order. Either pick parallel_vae_size <= ranks_per_cfg_group "
-                "or derive _vae_ranks from the mesh."
+                "of _DEVICE_MESH_DIM_ORDER. Either pick parallel_vae_size <= "
+                "ranks_per_cfg_group or derive _vae_ranks from the mesh."
             )
 
     def _build_vae_group(self) -> None:
