@@ -379,6 +379,19 @@ class CutlassFusedMoE(MoE):
         targets = set(getattr(lora_config, "lora_target_modules", []) or [])
         return any(name in targets for name in self._MOE_LORA_MODULE_NAMES)
 
+    def _moe_lora_active(self, lora_params: Optional[Dict]) -> bool:
+        """Return True when lora_params carries routed-expert MoE LoRA tensors
+        for this layer, meaning run_moe would fuse a LoRA delta.
+        """
+        if not lora_params or self.layer_idx is None:
+            return False
+        layer_params = lora_params.get(self.layer_idx, {})
+        if not layer_params:
+            return False
+        return any(
+            int(LoraModuleType.from_string(name)) in layer_params
+            for name in self._MOE_LORA_MODULE_NAMES)
+
     def _extract_moe_lora_tensors(
             self, lora_params: Optional[Dict]) -> Optional[Dict[str, object]]:
         """Pick the MoE-side LoRA tensors out of the global `lora_params` dict
@@ -1195,10 +1208,7 @@ class CutlassFusedMoE(MoE):
         **kwargs,
     ) -> torch.Tensor:
         assert do_finalize, "CutlassFusedMoE does not support do_finalize=False"
-        if lora_params and not self._moe_lora_enabled and any(
-                int(LoraModuleType.from_string(name)) in lora_params.get(
-                    self.layer_idx, {})
-                for name in self._MOE_LORA_MODULE_NAMES):
+        if not self._moe_lora_enabled and self._moe_lora_active(lora_params):
             # Caller passed MoE LoRA tensors but this layer was not configured
             # for it. Surface a clear error rather than silently ignoring.
             raise RuntimeError(
@@ -1223,6 +1233,17 @@ class CutlassFusedMoE(MoE):
         # in case of num_rows is larger than max_chunk_size, we need to split the input into multiple chunks
         num_chunks = (num_rows + self.moe_max_num_tokens -
                       1) // self.moe_max_num_tokens
+
+        if num_chunks > 1 and self._moe_lora_active(lora_params):
+            # Routed-expert MoE LoRA passes per-request adapter metadata that is
+            # not re-sliced per token-chunk, so multi-chunk execution would
+            # mismatch the kernel's per-token expansion. Reject with a clear
+            # message instead of failing inside the C++ op.
+            raise NotImplementedError(
+                f"Routed-expert MoE LoRA does not support multi-chunk execution "
+                f"(num_chunks={num_chunks}). Reduce the per-forward token count "
+                f"or increase `moe_max_num_tokens` so the MoE runs in a single "
+                f"chunk.")
 
         if num_chunks == 1:
             is_first_call = self.repeat_idx == 0
