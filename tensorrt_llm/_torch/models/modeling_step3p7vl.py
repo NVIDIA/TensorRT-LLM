@@ -902,11 +902,12 @@ class Step3p7VLForConditionalGeneration(nn.Module):
         # Inner causal LM: reuses all the existing decoder + MTP wiring.
         self.llm = Step3p7ForCausalLM(model_config)
 
-        # Vision encoder (skipped in disaggregated decode worker).
-        if not _is_disagg():
-            self.mm_encoder = Step3p7VisionTower(model_config)
-        else:
-            self.mm_encoder = None
+        # Vision encoder. Built lazily in load_weights() (outside MetaInitMode)
+        # so its PerceptionEncoder / HF submodules allocate real tensors instead
+        # of meta tensors. This keeps the large text LLM on the fast meta-init
+        # path while avoiding leftover meta tensors that would crash at runtime.
+        # Stays None in the disaggregated decode worker.
+        self.mm_encoder = None
 
     # ----- engine-facing surface (delegate to the inner causal LM) -------
 
@@ -951,6 +952,12 @@ class Step3p7VLForConditionalGeneration(nn.Module):
         allow_partial_loading: bool = False,
     ):
         """Split vision/text weights and delegate to the inner LM loader."""
+        if self.mm_encoder is None and not _is_disagg() and hasattr(weights, "items"):
+            # Construct the vision tower here, outside MetaInitMode, so its
+            # PerceptionEncoder / HF submodules allocate real tensors. Move it
+            # straight to CUDA (model_loader already ran model.to("cuda") for
+            # the LLM); the load_state_dict below copies the checkpoint in.
+            self.mm_encoder = Step3p7VisionTower(self.model_config).eval().to("cuda")
         if self.mm_encoder is not None and hasattr(weights, "items"):
             # Hand the vision subtree to the encoder; it consumes the keys
             # in-place via state_dict (no removal from ``weights`` needed —

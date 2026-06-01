@@ -75,12 +75,6 @@ class MetaInitMode(TorchDispatchMode):
         aten.log.default,
         # TODO: this is not a exhaustive list for random init ops, add as needed
     }
-    # Ops that only re-interpret a tensor's dtype/layout without producing
-    # meaningful values. They are safe on `meta` tensors as long as they keep
-    # the result on `meta` (no real storage is materialized), so a module that
-    # casts its (yet-to-be-loaded) parameters via e.g. ``self.to(dtype)`` in
-    # ``__init__`` stays compatible with meta init instead of falling back.
-    dtype_cast_ops = {aten._to_copy.default}
 
     def _has_meta_tensor(self, args, kwargs):
         if kwargs is None:
@@ -90,21 +84,14 @@ class MetaInitMode(TorchDispatchMode):
         return tree_any_only(torch.Tensor, pred, args) or \
                 tree_any_only(torch.Tensor, pred, kwargs)
 
-    def _keeps_meta(self, kwargs):
-        # A dtype cast is safe when it does not move a meta tensor onto a
-        # concrete device (which would try to materialize garbage storage).
-        device = (kwargs or {}).get('device', None)
-        return device is None or torch.device(device).type == 'meta'
-
     def __torch_dispatch__(self, func, types, args=(), kwargs=None):
         if func in self.init_ops:
             if kwargs is None:
                 kwargs = {}
             kwargs['device'] = torch.device('meta')
             return func(*args, **kwargs)
-        elif self._has_meta_tensor(args, kwargs) and \
-                func not in self.random_init_ops and not (
-                    func in self.dtype_cast_ops and self._keeps_meta(kwargs)):
+        elif func not in self.random_init_ops and self._has_meta_tensor(
+                args, kwargs):
             raise MetaInitException(
                 f"Meta tensor used in unsupported function: {func}")
         return func(*args, **kwargs)
