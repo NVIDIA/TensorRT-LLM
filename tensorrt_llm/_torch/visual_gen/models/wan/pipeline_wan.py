@@ -9,6 +9,10 @@ from diffusers.utils.torch_utils import randn_tensor
 from diffusers.video_processor import VideoProcessor
 from transformers import AutoTokenizer, UMT5EncoderModel
 
+from tensorrt_llm._torch.visual_gen.attention_backend import (
+    VSAMetadataBuilder,
+    set_vsa_forward_context,
+)
 from tensorrt_llm._torch.visual_gen.cache.teacache import (
     ExtractorConfig,
     register_extractor_from_config,
@@ -374,7 +378,17 @@ class WanPipeline(BasePipeline):
             seed=req.params.seed,
             max_sequence_length=req.params.max_sequence_length,
             image=image,
+            flow_shift=req.params.flow_shift,
         )
+
+    def _default_flow_shift(self, height: int, width: int) -> float:
+        """Recommended flow_shift for the active Wan variant + resolution."""
+
+        if self.is_wan22_14b:
+            return 12.0  # Wan2.2 T2V A14B
+        if self.is_wan22_5b:
+            return 5.0  # Wan2.2 TI2V 5B
+        return 5.0 if max(height, width) >= 1280 else 3.0  # Wan2.1 T2V (720P vs 480P)
 
     @nvtx_range("WanPipeline.forward")
     @torch.no_grad()
@@ -392,6 +406,7 @@ class WanPipeline(BasePipeline):
         seed: int = 42,
         max_sequence_length: int = 512,
         image: Optional[Union[PIL.Image.Image, torch.Tensor, str]] = None,
+        flow_shift: Optional[float] = None,
     ):
         pipeline_start = time.time()
         timer = CudaPhaseTimer()
@@ -480,6 +495,17 @@ class WanPipeline(BasePipeline):
             latents = self._prepare_latents(batch_size, height, width, num_frames, generator)
         logger.debug(f"Latents shape: {latents.shape}")
 
+        # Resolve flow_shift: user override wins, else the per-variant recommended default.
+        resolved_flow_shift = (
+            flow_shift if flow_shift is not None else self._default_flow_shift(height, width)
+        )
+        if self.scheduler.config.shift != resolved_flow_shift:
+            logger.info(
+                f"flow_shift: {self.scheduler.config.shift} -> {resolved_flow_shift} "
+                f"({'user' if flow_shift is not None else 'variant default'})"
+            )
+            self.scheduler.config.shift = resolved_flow_shift
+
         self.scheduler.set_timesteps(num_inference_steps, device=self.device)
 
         # Wan2.2 A14B: Calculate boundary timestep for two-stage denoising
@@ -491,9 +517,22 @@ class WanPipeline(BasePipeline):
                 f"guidance_scale={guidance_scale}, guidance_scale_2={guidance_scale_2}"
             )
 
+        # VSA: build metadata builder once per forward() call; reused across timesteps.
+        _attn_cfg = self.model_config.attention
+        _sparse_cfg = getattr(_attn_cfg, "sparse_attention_config", None)
+        _vsa_active = (
+            getattr(_attn_cfg, "backend", "VANILLA") == "CUTEDSL"
+            and _sparse_cfg is not None
+            and getattr(_sparse_cfg, "algorithm", None) == "vsa"
+        )
+        _vsa_builder = VSAMetadataBuilder() if _vsa_active else None
+        _vsa_patch_size = tuple(getattr(self.config, "patch_size", [1, 2, 2]))  # (pT, pH, pW)
+        _vsa_sparsity = _sparse_cfg.vsa_sparsity if _vsa_active else 0.0
+
         # Denoising with two-stage support
         # Track which model was used in last step (for logging model transitions)
         last_model_used = [None]
+        _vsa_step_counter = [0]
 
         def forward_fn(
             latents, extra_stream_latents, timestep, encoder_hidden_states, extra_tensors
@@ -536,6 +575,24 @@ class WanPipeline(BasePipeline):
                 else:
                     # T2V: current_t for all frames
                     timestep = current_t.reshape(1, 1).expand(latents.shape[0], nf * nh * nw)
+
+            if _vsa_active and _vsa_builder is not None:
+                # latents: [B, C, T_latent, H_latent, W_latent]
+                raw_latent_shape = (latents.shape[2], latents.shape[3], latents.shape[4])
+                vsa_metadata = _vsa_builder.build(
+                    current_timestep=_vsa_step_counter[0],
+                    raw_latent_shape=raw_latent_shape,
+                    patch_size=_vsa_patch_size,
+                    vsa_sparsity=_vsa_sparsity,
+                    device=latents.device,
+                )
+                _vsa_step_counter[0] += 1
+                with set_vsa_forward_context(vsa_metadata):
+                    return current_model(
+                        hidden_states=latents,
+                        timestep=timestep,
+                        encoder_hidden_states=encoder_hidden_states,
+                    )
 
             return current_model(
                 hidden_states=latents,

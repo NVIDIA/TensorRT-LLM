@@ -341,6 +341,41 @@ class WanBlock(nn.Module):
             reduce_output=(tp_size != 1),
         )
 
+        # VSA gates (CUTEDSL backend, sparse_attention_config.algorithm == "vsa").
+        # G_c weights the coarse branch; G_f weights the fine branch.
+        self.to_gate_compress = None
+        self.to_gate_fine = None
+        _attn_cfg = getattr(model_config, "attention", None)
+        _sa_cfg = getattr(_attn_cfg, "sparse_attention_config", None) if _attn_cfg else None
+        _is_vsa = (
+            _attn_cfg is not None
+            and getattr(_attn_cfg, "backend", "VANILLA") == "CUTEDSL"
+            and _sa_cfg is not None
+            and getattr(_sa_cfg, "algorithm", None) == "vsa"
+        )
+        if _is_vsa:
+            q_dim = num_heads * head_dim
+            self.to_gate_compress = Linear(
+                hidden_size,
+                q_dim,
+                bias=True,
+                dtype=dtype,
+                mapping=model_config.mapping,
+                quant_config=quant_config,
+                skip_create_weights_in_init=skip_create_weights,
+                force_dynamic_quantization=force_dynamic_quant,
+            )
+            self.to_gate_fine = Linear(
+                hidden_size,
+                q_dim,
+                bias=True,
+                dtype=dtype,
+                mapping=model_config.mapping,
+                quant_config=quant_config,
+                skip_create_weights_in_init=skip_create_weights,
+                force_dynamic_quantization=force_dynamic_quant,
+            )
+
         # I2V: Additional K/V projections for image embeddings.
         self.add_k_proj = self.add_v_proj = None
         self.norm_added_k = None
@@ -382,6 +417,32 @@ class WanBlock(nn.Module):
             torch.empty(1, 6, hidden_size).normal_(std=hidden_size**-0.5)
         )
 
+    def init_gate_compress_zero(self) -> None:
+        """Zero-initialize to_gate_compress."""
+        if self.to_gate_compress is None:
+            return
+        if not self.to_gate_compress._weights_created:
+            self.to_gate_compress.create_weights()
+        if self.to_gate_compress.weight.is_meta:
+            return
+        with torch.no_grad():
+            self.to_gate_compress.weight.zero_()
+            if self.to_gate_compress.bias is not None:
+                self.to_gate_compress.bias.zero_()
+
+    def init_gate_fine_default(self) -> None:
+        """Initialize to_gate_fine to emit constant 1 (weight=0, bias=1)."""
+        if self.to_gate_fine is None:
+            return
+        if not self.to_gate_fine._weights_created:
+            self.to_gate_fine.create_weights()
+        if self.to_gate_fine.weight.is_meta:
+            return
+        with torch.no_grad():
+            self.to_gate_fine.weight.zero_()
+            if self.to_gate_fine.bias is not None:
+                self.to_gate_fine.bias.fill_(1.0)
+
     def forward(
         self,
         x,
@@ -414,15 +475,16 @@ class WanBlock(nn.Module):
         # Prepare frequencies for Attention
         freqs = (freqs_cos, freqs_sin) if freqs_cos is not None and freqs_sin is not None else None
 
+        attn1_kwargs = {}
+        if self.to_gate_compress is not None:
+            attn1_kwargs["gate_compress"] = self.to_gate_compress(normed)
+        if self.to_gate_fine is not None:
+            attn1_kwargs["gate_fine"] = self.to_gate_fine(normed)
+
         # Self-attention with RoPE
-        x = (
-            x.float()
-            + self.attn1(
-                normed,
-                freqs=freqs,
-            ).float()
-            * gate_msa
-        ).to(x.dtype)
+        x = (x.float() + self.attn1(normed, freqs=freqs, **attn1_kwargs).float() * gate_msa).to(
+            x.dtype
+        )
 
         norm_x = self.norm2(x.float()).to(x.dtype)
 
@@ -777,6 +839,7 @@ class WanTransformer3DModel(nn.Module):
         }
         loader = DynamicLinearWeightLoader(self.model_config, params_map=params_map)
 
+        loaded_linears: set = set()
         for name, module in tqdm(self.named_modules(), desc="Loading weights"):
             if len(module._parameters) == 0:
                 continue
@@ -786,6 +849,7 @@ class WanTransformer3DModel(nn.Module):
 
                 if weight_dicts:
                     loader.load_linear_weights(module, name, weight_dicts)
+                    loaded_linears.add(name)
                 elif "add_k_proj" in name or "add_v_proj" in name:
                     logger.info(f"[Weight Loading] No weights found for I2V module: {name}")
             elif isinstance(module, RMSNormTPAware):
@@ -798,6 +862,20 @@ class WanTransformer3DModel(nn.Module):
                         param.data.copy_(
                             module_weights[param_name].to(self.model_config.torch_dtype)
                         )
+
+        # Default any VSA gates not loaded from the checkpoint: G_c=0, G_f=1
+        # (preserves dense behavior at sparsity=0).
+        for name, module in self.named_modules():
+            if not isinstance(module, WanBlock):
+                continue
+            if module.to_gate_compress is not None:
+                gate_path = f"{name}.to_gate_compress" if name else "to_gate_compress"
+                if gate_path not in loaded_linears:
+                    module.init_gate_compress_zero()
+            if module.to_gate_fine is not None:
+                gate_path = f"{name}.to_gate_fine" if name else "to_gate_fine"
+                if gate_path not in loaded_linears:
+                    module.init_gate_fine_default()
 
     def post_load_weights(self) -> None:
         """Call post_load_weights on all Linear modules and convert embedders to target dtype."""

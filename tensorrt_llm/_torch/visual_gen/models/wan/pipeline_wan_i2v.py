@@ -101,6 +101,14 @@ class WanImageToVideoPipeline(BasePipeline):
                 "Use cache_backend='none' or 'cache_dit' (not 'teacache')."
             )
 
+        _sa_cfg = model_config.attention.sparse_attention_config
+        if _sa_cfg is not None and getattr(_sa_cfg, "algorithm", None) == "vsa":
+            raise ValueError(
+                "Video Sparse Attention (sparse_attention_config.algorithm='vsa') is "
+                "only supported by Wan T2V pipelines (Wan 2.1 and Wan 2.2). Remove "
+                "sparse_attention_config for Wan I2V."
+            )
+
         super().__init__(model_config)
 
     def _compute_wan_timestep_embedding(self, module, timestep=None, **kwargs):
@@ -404,7 +412,15 @@ class WanImageToVideoPipeline(BasePipeline):
             seed=req.params.seed,
             max_sequence_length=req.params.max_sequence_length,
             last_image=last_image,
+            flow_shift=req.params.flow_shift,
         )
+
+    def _default_flow_shift(self, height: int, width: int) -> float:
+        """Recommended flow_shift for the active Wan I2V variant + resolution."""
+
+        if self.is_wan22_14b:
+            return 5.0  # Wan2.2 I2V A14B
+        return 5.0 if max(height, width) >= 1280 else 3.0  # Wan2.1 I2V (720P vs 480P)
 
     @torch.no_grad()
     def forward(
@@ -422,6 +438,7 @@ class WanImageToVideoPipeline(BasePipeline):
         seed: int = 42,
         max_sequence_length: int = 512,
         last_image: Optional[Union[PIL.Image.Image, torch.Tensor, str]] = None,
+        flow_shift: Optional[float] = None,
     ):
         pipeline_start = time.time()
         timer = CudaPhaseTimer()
@@ -528,6 +545,17 @@ class WanImageToVideoPipeline(BasePipeline):
         latents, condition_data = self._prepare_latents(
             batch_size, image, height, width, num_frames, generator, last_image
         )
+
+        # Resolve flow_shift: user override wins, else the per-variant default.
+        resolved_flow_shift = (
+            flow_shift if flow_shift is not None else self._default_flow_shift(height, width)
+        )
+        if self.scheduler.config.shift != resolved_flow_shift:
+            logger.info(
+                f"flow_shift: {self.scheduler.config.shift} -> {resolved_flow_shift} "
+                f"({'user' if flow_shift is not None else 'variant default'})"
+            )
+            self.scheduler.config.shift = resolved_flow_shift
 
         self.scheduler.set_timesteps(num_inference_steps, device=self.device)
 

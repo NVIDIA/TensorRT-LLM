@@ -218,6 +218,23 @@ class PipelineLoader:
             logger.info(f"Quantization: {config.quant_config.quant_algo.name}")
             logger.info(f"Dynamic weight quant: {config.dynamic_weight_quant}")
 
+        _attn_backend = config.attention.backend
+        _sa_cfg = config.attention.sparse_attention_config
+        if (
+            _attn_backend == "CUTEDSL"
+            and _sa_cfg is not None
+            and getattr(_sa_cfg, "algorithm", None) == "vsa"
+        ):
+            from .cute_dsl_kernels.blackwell.video_sparse_attention import CUTE_AVAILABLE
+
+            kernel_path = "CuTe DSL block-sparse" if CUTE_AVAILABLE else "dense SDPA fallback"
+            logger.info(
+                f"Attention backend: CUTEDSL (algorithm=vsa, "
+                f"sparsity={_sa_cfg.vsa_sparsity}, fine-stage={kernel_path})"
+            )
+        else:
+            logger.info(f"Attention backend: {_attn_backend}")
+
         # =====================================================================
         # STEP 1b: Build VisualGenMapping (must precede model creation)
         # =====================================================================

@@ -128,6 +128,9 @@ def create_attention(
                 "DiffusionModelConfig; creation path must not allocate metadata implicitly."
             )
         kwargs["attention_metadata_state"] = attention_metadata_state
+    if backend.upper() == "CUTEDSL" and attention_config is not None:
+        # CuTeDSLAttention dispatches dense / VSA based on this sub-config.
+        kwargs["sparse_attention_config"] = attention_config.sparse_attention_config
 
     return attn_cls(
         layer_idx=layer_idx,
