@@ -23,6 +23,8 @@ Tests verify cosine similarity and retrieval score alignment against
 HuggingFace reference embeddings.
 """
 
+import gc
+
 import pytest
 import torch
 import torch.nn.functional as F
@@ -55,6 +57,7 @@ EMBEDDING_MODELS = [
     pytest.param(
         f"{llm_models_root()}/qwen3-embedding-8b",
         {"score_tol": 0.02, "cos_tol": 0.99},
+        marks=pytest.mark.skip_less_device_memory(32000),
         id="qwen3-embedding-8b-bf16",
     ),
 ]
@@ -82,7 +85,12 @@ def _hf_embeddings(model_path: str, texts: list[str]) -> torch.Tensor:
     with torch.inference_mode():
         outputs = model(**batch)
     embeddings = _last_token_pool(outputs.last_hidden_state, batch["attention_mask"])
-    return F.normalize(embeddings.float(), p=2, dim=-1).cpu()
+    result = F.normalize(embeddings.float(), p=2, dim=-1).cpu()
+
+    del model, outputs, batch
+    gc.collect()
+    torch.cuda.empty_cache()
+    return result
 
 
 def _trtllm_embeddings(model_path: str, texts: list[str]) -> torch.Tensor:
@@ -95,7 +103,10 @@ def _trtllm_embeddings(model_path: str, texts: list[str]) -> torch.Tensor:
         max_num_tokens=8192,
         enable_chunked_prefill=True,
         cuda_graph_config=CudaGraphConfig(batch_sizes=[1, 2, 4, 8], enable_padding=True),
-        kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.30),
+        kv_cache_config=KvCacheConfig(
+            free_gpu_memory_fraction=0.30,
+            enable_block_reuse=False,
+        ),
         model_kwargs={
             "architectures": ["Qwen3ForEmbedding"],
             "tie_word_embeddings": True,
@@ -120,8 +131,13 @@ def _trtllm_embeddings(model_path: str, texts: list[str]) -> torch.Tensor:
     return torch.stack(embeddings)
 
 
-class TestEmbeddingGenerate(LlmapiAccuracyTestHarness):
-    """Embedding accuracy via the generate path against HF baseline."""
+class TestQwen3Embedding8B(LlmapiAccuracyTestHarness):
+    """Embedding accuracy via the generate path against HF baseline.
+
+    Inherits LlmapiAccuracyTestHarness only for its class-scoped logger-level
+    fixture. MODEL_NAME / MODEL_PATH are not used because the model differs
+    per parametrize invocation.
+    """
 
     @pytest.mark.parametrize("model_path,tolerances", EMBEDDING_MODELS)
     def test_embedding_cosine_similarity(self, model_path, tolerances):
