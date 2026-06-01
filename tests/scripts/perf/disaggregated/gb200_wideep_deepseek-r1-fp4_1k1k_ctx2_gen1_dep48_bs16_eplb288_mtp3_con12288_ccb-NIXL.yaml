@@ -100,6 +100,8 @@ worker_config:
       enable_block_reuse: false
       free_gpu_memory_fraction: 0.85
       dtype: fp8
+    moe_config:
+      backend: CUTEDSL
     cache_transceiver_config:
       max_tokens_in_buffer: 8320
       backend: NIXL
