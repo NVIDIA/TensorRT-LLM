@@ -865,19 +865,24 @@ class ModelLoader:
                     getattr(config.pretrained_config,
                             sub_config).num_hidden_layers = num_layers_override
 
-        # For vanilla MTP with use_mtp_vanilla=True on DeepSeek-family models,
-        # expand the model's MTP layer count to match the user-requested
-        # max_draft_len. Extra MTP layer instances will share checkpoint
-        # weights via mod-indexing in DeepseekV3WeightLoader. The original
-        # checkpoint count is preserved on the pretrained_config as
+        # Shared-weights vanilla MTP: build extra MTP layer instances beyond
+        # what the checkpoint provides (one ckpt MTP layer, multiple draft
+        # tokens, one KV cache per draft position) by sharing the single
+        # ckpt MTP layer's weights via mod-indexing in
+        # DeepseekV3WeightLoader. We expand
+        # pretrained_config.num_nextn_predict_layers to max_draft_len before
+        # model construction and preserve the original ckpt count as
         # `_ckpt_num_nextn_predict_layers` for downstream mod-indexing.
         #
-        # Scoped to DeepSeek model_types because they're the only ones whose
-        # weight loader handles the shared-weights expansion correctly. For
-        # other MTP-capable models, vanilla with max_draft_len > ckpt count
-        # falls through to the natural min(max_draft_len, ckpt_nextn) clamp
-        # in MTPForCausalLM, so the user effectively gets ckpt_nextn draft
-        # tokens.
+        # NOTE: this is a very special MTP mode that has not been used in
+        # any real-world workload to date; only DeepSeek has indicated they
+        # want to keep the path alive for their model. We therefore only
+        # support it on DeepSeek model_types for now. Other MTP-capable
+        # model families don't need this mode -- when their users request
+        # vanilla with max_draft_len > ckpt count, the natural
+        # `min(max_draft_len, ckpt_nextn)` clamp inside MTPForCausalLM
+        # silently caps the draft length to ckpt_nextn, which is the
+        # expected behavior for them.
         _DEEPSEEK_MTP_MODEL_TYPES = {"deepseek_v3", "deepseek_v32"}
         from tensorrt_llm.llmapi.llm_args import MTPDecodingConfig
         spec_config = self.spec_config
