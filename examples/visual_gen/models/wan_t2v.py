@@ -54,11 +54,14 @@ def main():
     visual_gen = VisualGen(model=args.model, args=extra_args)
 
     # --- Model-specific: T2V request construction ---
-    # Query per-model defaults (resolution, steps, guidance, seed, etc.).
+    # Start from per-model defaults (steps, guidance, seed, etc.) and override resolution/frames.
     params = visual_gen.default_params
+    params.height = 480
+    params.width = 832
+    params.num_frames = 165
 
     output = visual_gen.generate(
-        inputs="A cat playing piano in a sunny room",
+        inputs="A cute cat playing piano",
         params=params,
     )
 

@@ -20,6 +20,7 @@ It reuses existing TRT-LLM attention backends (TrtllmAttention, VanillaAttention
 simplified metadata that doesn't require KV caching.
 """
 
+from .cute_dsl import CuTeDSLAttention
 from .flash_attn4 import FlashAttn4Attention
 from .interface import AttentionBackend, AttentionTensorLayout
 from .parallel import Attention2DAttention, RingAttention, UlyssesAttention
@@ -33,6 +34,7 @@ __all__ = [
     "AttentionTensorLayout",
     "get_visual_gen_attention_backend",
     "create_attention",
+    "CuTeDSLAttention",
     "FlashAttn4Attention",
     "TrtllmAttention",
     "TrtllmAttentionMetadata",
