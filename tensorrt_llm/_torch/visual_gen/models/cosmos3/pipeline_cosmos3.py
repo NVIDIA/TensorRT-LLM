@@ -115,6 +115,10 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
                 subfolder=PipelineComponent.SCHEDULER,
             )
 
+        # Re-check the env var in case it was changed after initialization like in unit tests.
+        guardrails_disabled = os.environ.get("TRTLLM_DISABLE_COSMOS3_GUARDRAILS", "0") == "1"
+        global TRTLLM_DISABLE_COSMOS3_GUARDRAILS
+        TRTLLM_DISABLE_COSMOS3_GUARDRAILS = guardrails_disabled
         if not TRTLLM_DISABLE_COSMOS3_GUARDRAILS:
             # lazy import
             try:
