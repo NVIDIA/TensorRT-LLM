@@ -270,15 +270,21 @@ class Qwen3NextGatedDeltaNet(nn.Module):
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         batch_size, seq_len, _ = hidden_states.shape
 
-        # 1. Fused projections. ``in_proj_qkvz`` is a contiguous Q|K|V|Z fused
-        # block whose total output is ``2*key_dim + 2*value_dim``; each slice
-        # scales with TP via ``num_k_heads`` / ``num_v_heads``.
+        # 1. Fused projections. ``in_proj_qkvz`` is an INTERLEAVED-per-head fused
+        # projection: ``fix_query_key_value_ordering`` reshapes it to
+        # ``[B, S, num_k_heads, per_head_channels]`` (q|k|v|z within each k-head
+        # group) before splitting, so the head groups are contiguous in the flat
+        # output. Plain colwise therefore splits it correctly along the head
+        # boundary -- do NOT pass ``output_sizes`` (that would treat the output
+        # as four contiguous Q|K|V|Z blocks and scramble the interleaving). See
+        # the ad-sharding-ir-port pitfall on interleaved vs contiguous fused
+        # weights; contrast modeling_qwen3_5_moe, which uses a *separate*
+        # contiguous ``in_proj_qkv`` that legitimately needs ``output_sizes``.
         projected_states_qkvz = torch.ops.auto_deploy.torch_linear_simple(
             hidden_states,
             self.in_proj_qkvz.weight,
             self.in_proj_qkvz.bias,
             tp_mode="colwise",
-            output_sizes=[self.key_dim, self.key_dim, self.value_dim, self.value_dim],
             layer_type="delta",
         )
         projected_states_ba = torch.ops.auto_deploy.torch_linear_simple(
