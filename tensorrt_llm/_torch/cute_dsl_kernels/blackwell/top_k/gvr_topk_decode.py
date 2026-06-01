@@ -315,7 +315,6 @@ class GvrTopKKernel:
         smem_wsum_f32,  # cute.Tensor [NUM_WARPS] float32
         smem_wcnt_i32,  # cute.Tensor [NUM_WARPS] int32
         s_thr,  # cute.Tensor [3] float32: [threshold, val_lo, val_hi]
-        s_thr_extra,  # cute.Tensor [1] float32: [pmax_saved]
         s_iscalars,  # cute.Tensor [5] int32: [cand_count, done, cnt_lo, cnt_hi, out_count]
         tidx,
         warp_id,
@@ -436,7 +435,6 @@ class GvrTopKKernel:
                     s_thr[0] = pmean
                     s_thr[1] = pmin
                     s_thr[2] = pmax
-                    s_thr_extra[0] = pmax
                     s_iscalars[0] = cutlass.Int32(0)  # cand_count
                     s_iscalars[1] = cutlass.Int32(0)  # done
                     s_iscalars[2] = cutlass.Int32(cnt_lo_seed)  # cnt_lo
@@ -472,7 +470,6 @@ class GvrTopKKernel:
                 s_thr[0] = pmean
                 s_thr[1] = pmin
                 s_thr[2] = pmax
-                s_thr_extra[0] = pmax
                 s_iscalars[0] = cutlass.Int32(0)
                 s_iscalars[1] = cutlass.Int32(0)
                 s_iscalars[2] = cutlass.Int32(cnt_lo_seed)
@@ -1538,12 +1535,6 @@ class GvrTopKKernel:
             layout=cute.make_ordered_layout((3,), order=(0,)),
             byte_alignment=16,
         )
-        # Extra float scalar: pmax_saved (kept separate so s_thr stays exactly 3-wide)
-        s_thr_extra = smem.allocate_tensor(
-            element_type=cutlass.Float32,
-            layout=cute.make_ordered_layout((1,), order=(0,)),
-            byte_alignment=16,
-        )
         # Int scalars: cand_count, done, cnt_lo, cnt_hi, out_count
         s_iscalars = smem.allocate_tensor(
             element_type=cutlass.Int32,
@@ -1580,7 +1571,6 @@ class GvrTopKKernel:
                 smem_wsum,
                 smem_wcnt_p1,
                 s_thr,
-                s_thr_extra,
                 s_iscalars,
                 tidx,
                 warp_id,
