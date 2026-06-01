@@ -51,14 +51,19 @@ class Logprob:
     rank: Optional[int] = None
 
 
-# List of token_id_to_Logprob dict for prompt or generation texts
+# List of token_id_to_Logprob dict for prompt or generation texts.
 TokenLogprobs: TypeAlias = list[dict[int, Logprob]]
+# Compact format: one logprob per token (the sampled token's logprob).
+# Returned when `SamplingParams.{logprobs,prompt_logprobs}_simple_format` is set
+# and the corresponding `logprobs` / `prompt_logprobs` is 0. Avoids the
+# per-token `dict[int, Logprob]` allocation overhead of `TokenLogprobs`.
+SimpleTokenLogprobs: TypeAlias = list[float]
 
 
 class LogProbsResult(NamedTuple):
     """Optional log probability outputs computed post runtime."""
-    prompt: Optional[TokenLogprobs] = None
-    generation: Optional[TokenLogprobs] = None
+    prompt: Optional[TokenLogprobs | SimpleTokenLogprobs] = None
+    generation: Optional[TokenLogprobs | SimpleTokenLogprobs] = None
 
 
 class ResponseWrapper:
@@ -102,8 +107,8 @@ class CompletionOutput:
         text (str): The generated output text. Defaults to "".
         token_ids (List[int], optional): The token ids of the generated output text. Defaults to [].
         cumulative_logprob (float, optional): The cumulative log probability of the generated output text. Defaults to None.
-        logprobs (TokenLogprobs | List[float], optional): The log probabilities of the top probability words at each position if the logprobs are requested. Defaults to None.
-        prompt_logprobs (TokenLogprobs, optional): The log probabilities per prompt token. Defaults to None.
+        logprobs (TokenLogprobs | SimpleTokenLogprobs, optional): The log probabilities of the top probability words at each position if the logprobs are requested. Defaults to None.
+        prompt_logprobs (TokenLogprobs | SimpleTokenLogprobs, optional): The log probabilities per prompt token. Defaults to None.
         finish_reason (Literal['stop', 'length', 'timeout', 'cancelled'], optional): The reason why the sequence is finished. Defaults to None.
         stop_reason (int, str, optional): The stop string or token id that caused the completion to stop, None if the completion finished for some other reason. Defaults to None.
         generation_logits (torch.Tensor, optional): The logits on the generated output token ids. Defaults to None.
@@ -115,7 +120,7 @@ class CompletionOutput:
     Attributes:
         length (int): The number of generated tokens.
         token_ids_diff (List[int]): Newly generated token ids.
-        logprobs_diff (TokenLogprobs | List[float]): Logprobs of newly generated tokens.
+        logprobs_diff (TokenLogprobs | SimpleTokenLogprobs): Logprobs of newly generated tokens.
         text_diff (str): Newly generated tokens.
     """
     index: int
@@ -123,8 +128,10 @@ class CompletionOutput:
     token_ids: Optional[List[int]] = field(default_factory=list)
     cumulative_logprob: Optional[float] = None
     logprobs: Optional[TokenLogprobs
-                       | List[float]] = field(default_factory=list)
-    prompt_logprobs: Optional[TokenLogprobs] = field(default_factory=list)
+                       | SimpleTokenLogprobs] = field(default_factory=list)
+    prompt_logprobs: Optional[TokenLogprobs
+                              | SimpleTokenLogprobs] = field(
+                                  default_factory=list)
     finish_reason: Optional[Literal['stop', 'length', 'timeout',
                                     'cancelled']] = None
     stop_reason: Optional[Union[int, str]] = None
@@ -157,7 +164,7 @@ class CompletionOutput:
         return self.token_ids[self._last_token_ids_len:]
 
     @property
-    def logprobs_diff(self) -> TokenLogprobs | List[float]:
+    def logprobs_diff(self) -> TokenLogprobs | SimpleTokenLogprobs:
         return self.logprobs[self._last_logprobs_len:]
 
 
@@ -1010,6 +1017,8 @@ def compute_logprobs(
     generation_logits: Optional[torch.Tensor],
     output_token_ids: Optional[list[int]],
     prompt_token_ids: Optional[list[int]] = None,
+    simple_prompt_logprobs: bool = False,
+    simple_logprobs: bool = False,
 ) -> LogProbsResult:
     """
     Compute top-K logprobs from logits when engine doesn't provide them directly.
@@ -1019,14 +1028,21 @@ def compute_logprobs(
     - Generation logprobs (from generation_logits, TRT backend): used when backend doesn't compute them in sampler (e.g., TRT).
     - Generation logprobs (PyTorch backend): not used; computed in sampler, not here.
 
+    When `simple_prompt_logprobs` / `simple_logprobs` is True and the corresponding
+    `k_*` is 0, the result is a flat ``SimpleTokenLogprobs`` (``list[float]``,
+    one logprob per token) instead of ``TokenLogprobs``. This avoids the
+    per-token dict allocation overhead when only the sampled-token logprob is
+    needed.
+
     Returns:
         LogProbsResult, a NamedTuple containing:
-            - prompt: Optional[List[Dict[token_id, Logprob]]] logprobs for prompt tokens.
-            - generation: Optional[List[Dict[token_id, Logprob]]] logprobs for generated tokens.
+            - prompt: Optional[TokenLogprobs | SimpleTokenLogprobs] logprobs for prompt tokens.
+            - generation: Optional[TokenLogprobs | SimpleTokenLogprobs] logprobs for generated tokens.
     """
 
     def _topk_logprobs(logits: torch.Tensor, top_k: int,
-                       tokens: Optional[list[int]]) -> TokenLogprobs:
+                       tokens: Optional[list[int]],
+                       simple: bool) -> TokenLogprobs | SimpleTokenLogprobs:
         if logits.dim() == 3:
             # reshape from [1, T, V] to [T, V]
             logits = logits.squeeze(0)
@@ -1040,6 +1056,13 @@ def compute_logprobs(
 
         # only return sampled token
         if top_k == 0:
+            if simple:
+                simple_results: list[float] = []
+                if tokens is not None:
+                    for t in range(logprobs.size(0)):
+                        simple_results.append(logprobs[t, tokens[t]].item())
+                return simple_results
+
             results: TokenLogprobs = []
             if tokens is not None:
                 for t in range(logprobs.size(0)):
@@ -1076,10 +1099,11 @@ def compute_logprobs(
         return results
 
     prompt_logprobs = _topk_logprobs(
-        context_logits, k_prompt_logprobs, prompt_token_ids
+        context_logits, k_prompt_logprobs, prompt_token_ids,
+        simple_prompt_logprobs
     ) if k_prompt_logprobs is not None and context_logits is not None else None
     generation_logprobs = _topk_logprobs(
-        generation_logits, k_logprobs, output_token_ids
+        generation_logits, k_logprobs, output_token_ids, simple_logprobs
     ) if k_logprobs is not None and generation_logits is not None else None
 
     return LogProbsResult(prompt=prompt_logprobs,
