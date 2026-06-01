@@ -569,8 +569,11 @@ struct MmaTraits {
     mAtomPvM = options.mSwapsMmaAb ? std::min(128, paddedHeadDimV) : options.mTileSizeQ;
     // Keep BMM2's MMA width on the logical V width when keep-AB is used. SMEM can still be padded
     // independently through mPaddedHeadDimV for shared K/V storage alignment.
-    auto headDimPvN = options.mHeadDimPerStageKv != 0 ? headDimPerStageKv * options.mClusterDimX
-                                                      : options.mHeadDimV;
+    // headDimPerStageKv is the SMEM/TMEM staging width (e.g. 128 for Blackwell context MLA) and
+    // may exceed headDimV (e.g. Mistral 128/64). BMM2-N must stay on the logical V width.
+    auto headDimPvN = options.mHeadDimPerStageKv != 0
+                        ? std::min(headDimPerStageKv, options.mHeadDimV) * options.mClusterDimX
+                        : options.mHeadDimV;
     // AtomPvN is limited to 256 (UTCMMA-N).
     mAtomPvN = options.mSwapsMmaAb ? options.mTileSizeQ : std::min(headDimPvN, 256);
 

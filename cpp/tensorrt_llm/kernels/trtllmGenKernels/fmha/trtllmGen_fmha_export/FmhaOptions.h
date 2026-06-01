@@ -285,8 +285,10 @@ inline void checkFmhaOptions(FmhaOptions const& options,
                        "Only headDimQk > headDimV MLA kernels have been verified for Hopper");
     } else {
       if (isContextKernel(options.mFmhaKernelType)) {
-        TLLM_CHECK_ERROR(headDimQk == 192 && headDimV == 128,
-                         "Only headDimQk = 192, headDimV = 128 MLA kernels have been verified");
+        TLLM_CHECK_ERROR((headDimQk == 192 && headDimV == 128) || (headDimQk == 128 && headDimV == 64),
+                         "Only headDimQk = 192, headDimV = 128 (DeepSeek context MLA) or "
+                         "headDimQk = 128, headDimV = 64 (Mistral Small 4 context MLA) kernels "
+                         "have been verified");
       } else {
         TLLM_CHECK_ERROR(options.mIsMlaGen && ((headDimQk == 576 && headDimV == 512) ||
                                                (headDimQk == 320 && headDimV == 256)),
