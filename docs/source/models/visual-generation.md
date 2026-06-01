@@ -85,32 +85,24 @@ When served via `trtllm-serve`, the following OpenAI-compatible endpoints are av
 
 VisualGen supports both **dynamic quantization** (on-the-fly at weight-loading time from BF16 checkpoints) and **static quantization** (loading pre-quantized checkpoints with embedded scales). Both modes use the [ModelOpt](https://github.com/NVIDIA/TensorRT-Model-Optimizer) `quantization_config` format.
 
-Dynamic quantization via `--linear_type`:
+Configure via `VisualGenArgs.quant_config` (YAML or programmatic):
 
-```bash
-python visual_gen_wan_t2v.py \
-    --model_path Wan-AI/Wan2.1-T2V-1.3B-Diffusers \
-    --prompt "A cute cat playing piano" \
-    --linear_type trtllm-fp8-per-tensor \
-    --output_path output_fp8.mp4
+```yaml
+quant_config:
+  quant_algo: FP8        # or FP8_BLOCK_SCALES, NVFP4
+  dynamic: true
 ```
-
-Supported `--linear_type` values: `default` (BF16/FP16), `trtllm-fp8-per-tensor`, `trtllm-fp8-blockwise`, `trtllm-nvfp4`.
-
-Programmatic usage via `VisualGenArgs.quant_config`:
 
 ```python
 from tensorrt_llm import VisualGenArgs
-
-args = VisualGenArgs(
-    model="/path/to/model",
-    quant_config={"quant_algo": "FP8", "dynamic": True},
-)
+args = VisualGenArgs(model="/path/to/model", quant_config={"quant_algo": "FP8", "dynamic": True})
 ```
+
+Omit `quant_config` for BF16/FP16 baseline.
 
 ### Quantized Attention
 
-In addition to linear-layer quantization, VisualGen exposes two **attention-level** quantization presets that operate inside the attention kernel. They are configured through `AttentionConfig.quant_attention_config` (or the `--quant_attention_mode` flag in the example scripts) and are mutually exclusive with each other.
+In addition to linear-layer quantization, VisualGen exposes two **attention-level** quantization presets that operate inside the attention kernel. They are configured through `AttentionConfig.quant_attention_config` and are mutually exclusive with each other.
 
 - **QK16PV8** (`CUTEDSL` backend): Keeps Q & K in BF16 and quantizes only V to FP8 (E4M3, per-tensor), thus Bmm1 will be carried out in BF16 with Bmm2 in FP8. Targets Blackwell-class GPUs (`sm_100a` / `sm_103a`) with `head_dim = 128`.
 - **SAGE** (`TRTLLM` backend): Quantizes Q, K, and V with per-block scaling factors. Q/K are stored as INT8 or FP8 (e4m3) and V as FP8 (e4m3); block sizes are tunable per axis (typically `(q, k, v) = (1, 4, 1)` for Wan-1.3B and `(1, 16, 1)` for larger Wan / FLUX checkpoints). Supported recipes are validated at runtime.
@@ -168,15 +160,15 @@ The `teacache_thresh` parameter controls the similarity threshold. Cache-DiT is 
 
 ### Multi-GPU Parallelism
 
-6 parallelism modes can be combined:
+Configured under `VisualGenArgs.parallel_config`. Modes can be combined:
 
-- **CFG Parallelism** (`--cfg_size 2`): Splits positive/negative guidance prompts across GPUs.
-- **Ulysses Parallelism** (`--ulysses_size N`): Splits the sequence dimension across GPUs for longer sequences.
-- **Parallel VAE** (`--parallel_vae_size N`): Shards the final VAE decode along a spatial axis across GPUs, useful to reduce VAE latency and improve GPU utilization (Constraint: `parallel_vae_size ≤ world_size`). Currently only supported for WAN models.
-- **Attention Parallel**: There are 2 methods supported to run attention parallel. Both of these methods require the attention backend to support LSE (`FA4` and `CUTEDSL`) - 
-    - **Attention2D Parallelism** (`--attn2d_row_size N`, `--attn2d_col_size M`): Shards the sequence axis across a 2D `N x M` device mesh, all-gathering Q along rows and K/V along columns so each rank computes a sub-block of the attention matrix (total CP degree = `N * M`; not currently combinable with Ulysses).
-    - **Ring Attention Parallelism** (`--ring_size N`): Shards the sequence axis across a 1D ring of `N` ranks and streams K/V blocks around the ring so each rank computes its attention output without materializing the full K/V (mutually exclusive with Attention2D).
-- **Tensor Parallelism** (`--tp_size N`): Splits attention heads and transformer MLPs across GPUs for faster compute and reduced memory usage.
+- **CFG Parallelism** (`cfg_size: 2`): Splits positive/negative guidance prompts across GPUs.
+- **Ulysses Parallelism** (`ulysses_size: N`): Splits the sequence dimension across GPUs for longer sequences.
+- **Parallel VAE** (`parallel_vae_size: N`): Shards the final VAE decode along a spatial axis (constraint: `parallel_vae_size ≤ world_size`; WAN only).
+- **Attention Parallel** — requires an LSE-capable attention backend (`FA4` and `CUTEDSL`):
+    - **Attention2D** (`attn2d_size: [N, M]`): Shards the sequence axis across an `N × M` device mesh (total CP degree = `N · M`; not combinable with Ulysses).
+    - **Ring Attention** (`ring_size: N`): Shards the sequence axis across a 1D ring of `N` ranks, streaming K/V blocks (mutually exclusive with Attention2D).
+- **Tensor Parallelism** (`tp_size: N`): Splits attention heads and transformer MLPs across GPUs for faster compute and reduced memory usage.
 ## Developer Guide
 
 ### Architecture Overview
