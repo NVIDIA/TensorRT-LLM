@@ -270,6 +270,21 @@ def test_async_transfer_keeps_llm_request_alive():
     kv_cache_manager_ctx.impl.add_sequence_batch(
         [(ctx_request.py_request_id, ctx_request.prompt_len, 1)], [ctx_request])
 
+    # Snapshot ctx refcount *before* submission. add_sequence_batch takes
+    # std::reference_wrapper<LlmRequest> (no Python ref retained), so the
+    # baseline here is clean and the +1 below isolates exactly the
+    # shared_ptr captured by respond_and_send_async.
+    ctx_ref = weakref.ref(ctx_request)
+    baseline_ctx_refcount = sys.getrefcount(ctx_request)
+
+    # respond_and_send_async also populates ctx_request.context_phase_params
+    # as a side effect — gen_request below requires this to be non-empty.
+    transceiver_ctx.respond_and_send_async(ctx_request)
+    assert sys.getrefcount(ctx_request) == baseline_ctx_refcount + 1, (
+        f"respond_and_send_async did not capture a shared_ptr<LlmRequest>; "
+        f"refcount={sys.getrefcount(ctx_request)} "
+        f"(expected baseline {baseline_ctx_refcount} + 1)")
+
     gen_request = LlmRequest(
         request_id=0,
         max_new_tokens=1,
@@ -282,28 +297,10 @@ def test_async_transfer_keeps_llm_request_alive():
     kv_cache_manager_gen.impl.add_sequence_batch(
         [(gen_request.py_request_id, gen_request.prompt_len, 1)], [gen_request])
 
-    # Pin the reference graph *before* submission. add_sequence_batch's
-    # nanobind binding takes std::reference_wrapper<LlmRequest>, not a
-    # shared_ptr, so it does not retain a Python-side ref. Snapshotting
-    # the baseline here lets us assert exactly +1 after each async
-    # submission and catches regressions that don't capture a shared_ptr.
-    ctx_ref = weakref.ref(ctx_request)
     gen_ref = weakref.ref(gen_request)
-    baseline_ctx_refcount = sys.getrefcount(ctx_request)
     baseline_gen_refcount = sys.getrefcount(gen_request)
 
-    transceiver_ctx.respond_and_send_async(ctx_request)
     transceiver_gen.request_and_receive_async(gen_request)
-
-    # The nanobind binding for respond_and_send_async / request_and_receive_async
-    # takes std::shared_ptr<LlmRequest>; nanobind binds Python refcount into the
-    # shared_ptr, so post-submission each request has +1 ref held by
-    # mSenderFutures / mRequesterFutures. A regression to raw-pointer storage
-    # would not increment the refcount.
-    assert sys.getrefcount(ctx_request) == baseline_ctx_refcount + 1, (
-        f"respond_and_send_async did not capture a shared_ptr<LlmRequest>; "
-        f"refcount={sys.getrefcount(ctx_request)} "
-        f"(expected baseline {baseline_ctx_refcount} + 1)")
     assert sys.getrefcount(gen_request) == baseline_gen_refcount + 1, (
         f"request_and_receive_async did not capture a shared_ptr<LlmRequest>; "
         f"refcount={sys.getrefcount(gen_request)} "
@@ -375,17 +372,18 @@ def test_kv_transfer_timeout_warns_once_per_request(capfd):
     transceiver_ctx.check_context_transfer_status(0)
     first = capfd.readouterr()
     marker = "Context KV cache transfer for request 42 exceeded configured timeout"
-    assert marker in first.err, (
-        f"Expected observe-only WARN after timeout; stderr:\n{first.err}")
-    assert first.err.count(marker) == 1, (
+    # TLLM_LOG_WARNING writes to stdout; check first.out (not first.err).
+    assert marker in first.out, (
+        f"Expected observe-only WARN after timeout; stdout:\n{first.out}")
+    assert first.out.count(marker) == 1, (
         f"WARN should fire exactly once per poll for a single stuck request; "
-        f"got {first.err.count(marker)} emissions:\n{first.err}")
+        f"got {first.out.count(marker)} emissions:\n{first.out}")
 
     transceiver_ctx.check_context_transfer_status(0)
     second = capfd.readouterr()
-    assert marker not in second.err, (
+    assert marker not in second.out, (
         f"WARN re-emitted on a subsequent poll; dedup broken. "
-        f"stderr:\n{second.err}")
+        f"stdout:\n{second.out}")
 
     transceiver_ctx.cancel_request(ctx_request)
 
@@ -422,9 +420,10 @@ def test_kv_transfer_timeout_silent_when_unset(capfd):
     transceiver_ctx.check_context_transfer_status(0)
 
     out = capfd.readouterr()
-    assert "exceeded configured timeout" not in out.err, (
+    # TLLM_LOG_WARNING writes to stdout; check out.out (not out.err).
+    assert "exceeded configured timeout" not in out.out, (
         f"Observe-only WARN must not fire when kv_transfer_timeout_ms is "
-        f"unset; stderr:\n{out.err}")
+        f"unset; stdout:\n{out.out}")
 
     transceiver_ctx.cancel_request(ctx_request)
 
