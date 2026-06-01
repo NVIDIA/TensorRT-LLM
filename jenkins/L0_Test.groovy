@@ -1170,8 +1170,6 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                 }
 
                 def exemptionComment = ""
-                if (cluster.host.contains("oci-nrt") || cluster.host.contains("oci-hsg") || cluster.host.contains("lbd-lax") || cluster.host.contains("oci-iad")) {
-                    exemptionComment = """--comment='{"OccupiedIdleGPUsJobReaper":{"exemptIdleTimeMins":"90","reason":"other","description":"Long data and model loading time and disaggregated serving tests"}}'"""
                 if (SlurmConfig.needsIdleGpuExemption(cluster)) {
                     exemptionComment = "--comment='${SlurmConfig.IDLE_GPU_EXEMPTION_PAYLOAD}'"
                 }
