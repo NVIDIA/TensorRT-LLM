@@ -878,16 +878,14 @@ class ModelLoader:
         # falls through to the natural min(max_draft_len, ckpt_nextn) clamp
         # in MTPForCausalLM, so the user effectively gets ckpt_nextn draft
         # tokens.
-        _DEEPSEEK_MTP_MODEL_TYPES = {
-            "deepseek_v3", "deepseek_v32", "glm_moe_dsa"
-        }
+        _DEEPSEEK_MTP_MODEL_TYPES = {"deepseek_v3", "deepseek_v32"}
         from tensorrt_llm.llmapi.llm_args import MTPDecodingConfig
         spec_config = self.spec_config
         if (isinstance(spec_config, MTPDecodingConfig)
                 and spec_config.use_mtp_vanilla
                 and spec_config.max_draft_len is not None
-                and getattr(config.pretrained_config, 'model_type', None)
-                in _DEEPSEEK_MTP_MODEL_TYPES
+                and getattr(config.pretrained_config, 'model_type',
+                            None) in _DEEPSEEK_MTP_MODEL_TYPES
                 and getattr(config.pretrained_config,
                             'num_nextn_predict_layers', None)):
             ckpt_nextn = config.pretrained_config.num_nextn_predict_layers
