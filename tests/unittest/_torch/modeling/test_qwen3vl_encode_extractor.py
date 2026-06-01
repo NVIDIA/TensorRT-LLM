@@ -23,33 +23,53 @@ def _make_param(multimodal_data: dict) -> MultimodalParams:
 
 
 class TestQwen3VLExtractItems:
-    def test_pure_image(self):
-        payload = {
-            "pixel_values": torch.randn(20, 1176),  # 20 patches -> 5 tokens at merge=4
-            "image_grid_thw": torch.tensor([[1, 16, 16]]),
-            "num_tokens": 5,  # explicit test convention, like Nano Task 7
-        }
-        param = _make_param({"image": payload})
+    @pytest.mark.parametrize(
+        "modality, payload, expected_token_count",
+        [
+            (
+                "image",
+                {
+                    # 20 patches -> 5 tokens at merge=4
+                    "pixel_values": torch.randn(20, 1176),
+                    "image_grid_thw": torch.tensor([[1, 16, 16]]),
+                    "num_tokens": 5,  # explicit test convention, like Nano Task 7
+                },
+                5,
+            ),
+            (
+                "video",
+                {
+                    "pixel_values_videos": torch.randn(32, 1176),
+                    "video_grid_thw": torch.tensor([[2, 16, 16]]),
+                    "num_tokens": 8,
+                },
+                8,
+            ),
+        ],
+        ids=["image", "video"],
+    )
+    def test_pure_single_modality(self, modality, payload, expected_token_count):
+        param = _make_param({modality: payload})
         items = list(_qwen3vl_extract_items(0, param))
         assert len(items) == 1
-        assert items[0].modality == "image"
+        assert items[0].modality == modality
         assert items[0].item_idx_in_param == 0
-        assert items[0].token_count == 5
+        assert items[0].token_count == expected_token_count
         assert items[0].src_param_idx == 0
 
-    def test_pure_video(self):
-        payload = {
-            "pixel_values_videos": torch.randn(32, 1176),
-            "video_grid_thw": torch.tensor([[2, 16, 16]]),
-            "num_tokens": 8,
-        }
-        param = _make_param({"video": payload})
-        items = list(_qwen3vl_extract_items(0, param))
-        assert len(items) == 1
-        assert items[0].modality == "video"
-        assert items[0].token_count == 8
-
-    def test_mixed_image_video(self):
+    @pytest.mark.parametrize(
+        "item_order",
+        [
+            # Tuple(pair)-form order entries.
+            [("video", 0), ("image", 0)],
+            # Dict-form order entries (as the runtime registry emits them).
+            # Regression guard for the tuple(pair) bug: the extractor must
+            # normalize dict-form order identically to tuple-form.
+            [{"modality": "video", "index": 0}, {"modality": "image", "index": 0}],
+        ],
+        ids=["tuple_form", "dict_form_regression"],
+    )
+    def test_mixed_image_video(self, item_order):
         payload_image = {
             "pixel_values": torch.randn(20, 1176),
             "image_grid_thw": torch.tensor([[1, 16, 16]]),
@@ -64,13 +84,14 @@ class TestQwen3VLExtractItems:
             {
                 "image": payload_image,
                 "video": payload_video,
-                "multimodal_item_order": [("video", 0), ("image", 0)],
+                "multimodal_item_order": item_order,
                 "multimodal_embedding_lengths": [8, 5],
             }
         )
         items = list(_qwen3vl_extract_items(0, param))
         assert len(items) == 2
         positions = {it.modality: it.item_idx_in_param for it in items}
+        # video at prompt slot 0, image at slot 1 — distinct, no collapse
         assert positions == {"video": 0, "image": 1}
 
     def test_no_items_yields_empty(self):
@@ -108,39 +129,6 @@ class TestQwen3VLExtractItems:
             list(_qwen3vl_extract_items(0, param))
 
 
-class TestQwen3VLExtractItemsDictFormOrder:
-    def test_mixed_image_video_dict_form_item_order(self):
-        # Runtime registry emits dict-form item order; extractor must
-        # normalize it (regression guard for the tuple(pair) bug).
-        payload_image = {
-            "pixel_values": torch.randn(20, 1176),
-            "image_grid_thw": torch.tensor([[1, 16, 16]]),
-            "num_tokens": 5,
-        }
-        payload_video = {
-            "pixel_values_videos": torch.randn(32, 1176),
-            "video_grid_thw": torch.tensor([[2, 16, 16]]),
-            "num_tokens": 8,
-        }
-        param = _make_param(
-            {
-                "image": payload_image,
-                "video": payload_video,
-                # DICT-form order entries (as the registry emits them):
-                "multimodal_item_order": [
-                    {"modality": "video", "index": 0},
-                    {"modality": "image", "index": 0},
-                ],
-                "multimodal_embedding_lengths": [8, 5],
-            }
-        )
-        items = list(_qwen3vl_extract_items(0, param))
-        assert len(items) == 2
-        positions = {it.modality: it.item_idx_in_param for it in items}
-        # video at prompt slot 0, image at slot 1 — distinct, no collapse
-        assert positions == {"video": 0, "image": 1}
-
-
 class TestQwen3VLBucketAdapters:
     def _make_encoder_stub(self, encode_visual_inputs_return):
         enc = MagicMock(spec=Qwen3VisionModelBase)
@@ -149,57 +137,68 @@ class TestQwen3VLBucketAdapters:
         enc._adapter_video_bucket = Qwen3VisionModelBase._adapter_video_bucket.__get__(enc)
         return enc
 
-    def test_image_adapter_stacks_pixel_values_and_grids(self):
+    @pytest.mark.parametrize(
+        "adapter_attr, items, expected_grid_shape",
+        [
+            (
+                # Image bucket: two items stack into one (32, 1176) call with a
+                # (2, 3) grid (20 + 12 patches across two grid rows).
+                "_adapter_image_bucket",
+                [
+                    ModalityItem(
+                        0,
+                        0,
+                        "image",
+                        5,
+                        {
+                            "pixel_values": torch.randn(20, 1176),
+                            "image_grid_thw": torch.tensor([[1, 16, 16]]),
+                            "num_tokens": 5,
+                        },
+                    ),
+                    ModalityItem(
+                        1,
+                        0,
+                        "image",
+                        3,
+                        {
+                            "pixel_values": torch.randn(12, 1176),
+                            "image_grid_thw": torch.tensor([[1, 12, 12]]),
+                            "num_tokens": 3,
+                        },
+                    ),
+                ],
+                (2, 3),
+            ),
+            (
+                # Video bucket: one item -> (32, 1176) call with a (1, 3) grid.
+                "_adapter_video_bucket",
+                [
+                    ModalityItem(
+                        0,
+                        0,
+                        "video",
+                        8,
+                        {
+                            "pixel_values_videos": torch.randn(32, 1176),
+                            "video_grid_thw": torch.tensor([[2, 16, 16]]),
+                            "num_tokens": 8,
+                        },
+                    ),
+                ],
+                (1, 3),
+            ),
+        ],
+        ids=["image", "video"],
+    )
+    def test_adapter_stacks_pixel_values_and_grids(self, adapter_attr, items, expected_grid_shape):
         H = 1024
-        item0 = ModalityItem(
-            0,
-            0,
-            "image",
-            5,
-            {
-                "pixel_values": torch.randn(20, 1176),
-                "image_grid_thw": torch.tensor([[1, 16, 16]]),
-                "num_tokens": 5,
-            },
-        )
-        item1 = ModalityItem(
-            1,
-            0,
-            "image",
-            3,
-            {
-                "pixel_values": torch.randn(12, 1176),
-                "image_grid_thw": torch.tensor([[1, 12, 12]]),
-                "num_tokens": 3,
-            },
-        )
-        out_tensor = torch.randn(8, H)  # 5 + 3 tokens
+        out_tensor = torch.randn(8, H)  # total tokens across the bucket
         enc = self._make_encoder_stub(out_tensor)
-        result = enc._adapter_image_bucket([item0, item1], [object(), object()])
-        # Verify _encode_visual_inputs was called once with concatenated tensors
+        result = getattr(enc, adapter_attr)(items, [object()] * len(items))
+        # _encode_visual_inputs is called once with the concatenated tensors.
         call_args = enc._encode_visual_inputs.call_args[0]
         pixel_values_arg, grid_arg = call_args[0], call_args[1]
-        assert pixel_values_arg.shape == (32, 1176)  # 20 + 12
-        assert grid_arg.shape == (2, 3)
-        torch.testing.assert_close(result, out_tensor)
-
-    def test_video_adapter_stacks_pixel_values_and_grids(self):
-        H = 1024
-        item = ModalityItem(
-            0,
-            0,
-            "video",
-            8,
-            {
-                "pixel_values_videos": torch.randn(32, 1176),
-                "video_grid_thw": torch.tensor([[2, 16, 16]]),
-                "num_tokens": 8,
-            },
-        )
-        out_tensor = torch.randn(8, H)
-        enc = self._make_encoder_stub(out_tensor)
-        result = enc._adapter_video_bucket([item], [object()])
-        call_args = enc._encode_visual_inputs.call_args[0]
-        assert call_args[0].shape == (32, 1176)
-        assert call_args[1].shape == (1, 3)
+        assert pixel_values_arg.shape == (32, 1176)
+        assert grid_arg.shape == expected_grid_shape
         torch.testing.assert_close(result, out_tensor)

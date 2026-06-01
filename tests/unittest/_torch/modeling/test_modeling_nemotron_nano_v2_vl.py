@@ -628,17 +628,37 @@ class TestEncodeMultimodalAudioOrder:
             "Video 2 slice should be [vision_2, audio_2]"
         )
 
-    def test_video_without_audio_skips_audio_concat(self):
-        """A video param with no audio should return vision-only embeddings."""
+    @pytest.mark.parametrize(
+        "has_audio, sound_encoder_factory",
+        [
+            # Video carries no audio payload at all -> vision-only output even
+            # though the model has a sound encoder.
+            (False, MagicMock),
+            # Video carries an audio payload, but the model has no sound encoder
+            # -> audio is dropped and the output stays vision-only.
+            (True, lambda: None),
+        ],
+        ids=["no_audio_payload", "no_sound_encoder"],
+    )
+    def test_video_without_audio_skips_audio_concat(self, has_audio, sound_encoder_factory):
+        """A video that should not produce audio returns vision-only embeddings.
+
+        Two distinct no-audio paths must both skip the audio concat:
+        a video with no audio payload, and a video whose payload has audio but
+        whose model lacks a sound encoder.
+        """
         hidden = 16
         v_len = 6
         v_emb = torch.randn(v_len, hidden)
 
-        param = self._make_video_param(has_audio=False, video_num_tokens=v_len)
+        # `audio_num_tokens` is ignored when `has_audio=False`.
+        param = self._make_video_param(
+            has_audio=has_audio, video_num_tokens=v_len, audio_num_tokens=3
+        )
 
         model = MagicMock(spec=NemotronH_Nano_VL_V2)
         model.vision_encoder = MagicMock(return_value=([v_emb], [list(range(v_len))]))
-        model.sound_encoder = MagicMock()
+        model.sound_encoder = sound_encoder_factory()
         model._encode_audio = MagicMock()
         _wire_plan_based_encode(model, hidden_dim=hidden)
 
@@ -646,25 +666,6 @@ class TestEncodeMultimodalAudioOrder:
 
         assert len(result) == 1
         assert torch.equal(result[0], v_emb), "Vision-only video should not have audio appended"
-        model._encode_audio.assert_not_called()
-
-    def test_no_audio_concat_when_sound_encoder_is_none(self):
-        hidden = 16
-        v_len = 5
-        v_emb = torch.randn(v_len, hidden)
-
-        param = self._make_video_param(has_audio=True, video_num_tokens=v_len, audio_num_tokens=3)
-
-        model = MagicMock(spec=NemotronH_Nano_VL_V2)
-        model.vision_encoder = MagicMock(return_value=([v_emb], [list(range(v_len))]))
-        model.sound_encoder = None  # no audio support
-        model._encode_audio = MagicMock()
-        _wire_plan_based_encode(model, hidden_dim=hidden)
-
-        result = model._encode_multimodal([param])
-
-        assert len(result) == 1
-        assert torch.equal(result[0], v_emb)
         model._encode_audio.assert_not_called()
 
 
@@ -1032,83 +1033,79 @@ class TestEncodeMultimodalContract:
         assert len(result) == 1
         assert result[0].shape == (8, self.HIDDEN)
 
-    def test_single_param_mixed_modalities_still_single_tensor(self):
-        """One request param can carry image + video + audio in prompt order."""
-        model = self._make_mock_model()
-        image_emb = torch.randn(5, self.HIDDEN)
-        video_emb = torch.randn(4, self.HIDDEN)
-        audio_emb = torch.randn(3, self.HIDDEN)
-        # Vision encoder is called once per modality bucket (image, then video).
-        model.vision_encoder.side_effect = [
-            ([image_emb], [None]),
-            ([video_emb], [None]),
-        ]
-        model._encode_audio = mock.MagicMock(return_value=[(audio_emb, [3])])
-
-        param = mock.MagicMock()
-        param.multimodal_data = {
-            "modality_type": ["image", "video", "audio"],
-            "image": {"num_tokens": 5},
-            "video": {"num_tokens": 4},
-            "audio": {"num_tokens": 3},
-        }
-        param.multimodal_input = None
-        param.multimodal_runtime = None
-
-        result = model._encode_multimodal([param])
-
-        assert len(result) == 1
-        expected = torch.cat([image_emb, video_emb, audio_emb], dim=0)
-        assert torch.equal(result[0], expected)
-        assert model.vision_encoder.call_count == 2
-        model._encode_audio.assert_called_once()
-
-    def test_single_param_interleaved_modalities_follow_metadata_order(self):
-        """A request with image+video+audio in prompt order returns a single
-        tensor whose per-modality slices follow the prompt position order.
+    @pytest.mark.parametrize(
+        "item_order, embedding_lengths, expected_order",
+        [
+            # No explicit item order: the per-modality slices follow the
+            # `modality_type` list order (image, video, audio).
+            (None, None, ["image", "video", "audio"]),
+            # Explicit prompt order (audio, video, image): the plan's scatter must
+            # lay out the final tensor in MultimodalPromptOrder rank order, even
+            # though the encoder buckets are visited in a different internal order
+            # (image bucket, then video bucket).
+            (
+                [
+                    {"modality": "audio", "index": 0},
+                    {"modality": "video", "index": 0},
+                    {"modality": "image", "index": 0},
+                ],
+                [4, 3, 2],
+                ["audio", "video", "image"],
+            ),
+        ],
+        ids=["default_modality_type_order", "prompt_order_metadata"],
+    )
+    def test_single_param_mixed_modalities_still_single_tensor(
+        self, item_order, embedding_lengths, expected_order
+    ):
+        """One request param carrying image + video + audio returns a single tensor.
 
         Each modality in a mixed param yields a single bucket item; the
-        post-Task-11 plan's scatter assembles rows into the per-param slice
-        in MultimodalPromptOrder rank order. (Multi-item-same-modality within one
-        param coalesces into one bucket entry; that interleaving variant is
-        covered by the production-path integration tests.)
+        post-Task-11 plan's scatter assembles rows into the per-param slice. With
+        no explicit item order the slices follow `modality_type` order; with a
+        prompt-order metadata list they follow MultimodalPromptOrder rank.
+        (Multi-item-same-modality within one param coalesces into one bucket entry;
+        that interleaving variant is covered by the production-path integration
+        tests.)
         """
         model = self._make_mock_model()
-        image_emb = torch.randn(2, self.HIDDEN)
-        video_emb = torch.randn(3, self.HIDDEN)
-        audio_emb = torch.randn(4, self.HIDDEN)
-        # One bucket call per modality.
+        # Distinct token counts per modality so the output ordering is a real
+        # discriminator: image=2, video=3, audio=4.
+        embs = {
+            "image": torch.randn(2, self.HIDDEN),
+            "video": torch.randn(3, self.HIDDEN),
+            "audio": torch.randn(4, self.HIDDEN),
+        }
+        # Vision encoder is called once per modality bucket (image, then video).
         model.vision_encoder.side_effect = [
-            ([image_emb], [None]),  # image bucket
-            ([video_emb], [None]),  # video bucket
+            ([embs["image"]], [None]),
+            ([embs["video"]], [None]),
         ]
-        model._encode_audio = mock.MagicMock(return_value=[(audio_emb, [4])])
+        model._encode_audio = mock.MagicMock(return_value=[(embs["audio"], [4])])
 
-        # Prompt order: audio first, then video, then image. The new plan's
-        # scatter must follow this MultimodalPromptOrder when laying out the final
-        # tensor, even though the encoder buckets are visited in a different
-        # internal order.
-        param = mock.MagicMock()
-        param.multimodal_data = {
+        multimodal_data = {
             "modality_type": ["image", "video", "audio"],
             "image": {"num_tokens": 2},
             "video": {"num_tokens": 3},
             "audio": {"num_tokens": 4},
-            "multimodal_item_order": [
-                {"modality": "audio", "index": 0},
-                {"modality": "video", "index": 0},
-                {"modality": "image", "index": 0},
-            ],
-            "multimodal_embedding_lengths": [4, 3, 2],
         }
+        if item_order is not None:
+            multimodal_data["multimodal_item_order"] = item_order
+        if embedding_lengths is not None:
+            multimodal_data["multimodal_embedding_lengths"] = embedding_lengths
+
+        param = mock.MagicMock()
+        param.multimodal_data = multimodal_data
         param.multimodal_input = None
         param.multimodal_runtime = None
 
         result = model._encode_multimodal([param])
+
         assert len(result) == 1
-        # Expected: [audio, video, image] following MultimodalPromptOrder rank.
-        expected = torch.cat([audio_emb, video_emb, image_emb], dim=0)
+        expected = torch.cat([embs[m] for m in expected_order], dim=0)
         assert torch.equal(result[0], expected)
+        assert model.vision_encoder.call_count == 2
+        model._encode_audio.assert_called_once()
 
     def test_empty_params_returns_empty_list(self):
         model = self._make_mock_model()

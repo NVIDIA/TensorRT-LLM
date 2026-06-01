@@ -55,6 +55,30 @@ def _identity_extractor(items_by_param):
     return extract
 
 
+def _mixed_image_audio_assembly():
+    """Shared fixture for the mixed image+audio batch asserted from two angles.
+
+    param 0: <image><audio><image>  -> img_A(5), aud_A(4), img_B(5)
+    param 1: <image>                -> img_C(5)
+    Final order = [param 0 in MultimodalPromptOrder | param 1]
+                = img_A | aud_A | img_B | img_C
+    """
+    items_by_param = {
+        0: [
+            ModalityItem(0, 0, "image", 5, {"id": "img_A"}),
+            ModalityItem(0, 1, "audio", 4, {"id": "aud_A"}),
+            ModalityItem(0, 2, "image", 5, {"id": "img_B"}),
+        ],
+        1: [
+            ModalityItem(1, 0, "image", 5, {"id": "img_C"}),
+        ],
+    }
+    return MixedModalityAssembly.from_params(
+        multimodal_params=[object(), object()],
+        extract=_identity_extractor(items_by_param),
+    )
+
+
 class TestEncodingPlanPartition:
     def test_empty_batch(self):
         assembly = MixedModalityAssembly.from_params(
@@ -81,20 +105,7 @@ class TestEncodingPlanPartition:
         assert assembly._bucket_offsets["image"].tolist() == [0, 5]
 
     def test_mixed_image_audio(self):
-        items_by_param = {
-            0: [
-                ModalityItem(0, 0, "image", 5, {"id": "img_A"}),
-                ModalityItem(0, 1, "audio", 4, {"id": "aud_A"}),
-                ModalityItem(0, 2, "image", 5, {"id": "img_B"}),
-            ],
-            1: [
-                ModalityItem(1, 0, "image", 5, {"id": "img_C"}),
-            ],
-        }
-        assembly = MixedModalityAssembly.from_params(
-            multimodal_params=[object(), object()],
-            extract=_identity_extractor(items_by_param),
-        )
+        assembly = _mixed_image_audio_assembly()
         assert assembly.total_tokens == 19
         assert set(assembly.active_modalities) == {"image", "audio"}
         assert assembly._param_lengths.tolist() == [14, 5]
@@ -156,21 +167,7 @@ class TestEncodingPlanDstIndices:
         assert assembly._dst_indices["image"].tolist() == [0, 1, 2, 3, 4]
 
     def test_mixed_image_audio(self):
-        # param 0: <image><audio><image>  -> img_A(5)@pos0, aud_A(4)@pos1, img_B(5)@pos2
-        # param 1: <image>                -> img_C(5)@pos0
-        # Final: [param 0 in MultimodalPromptOrder | param 1] = img_A | aud_A | img_B | img_C
-        items_by_param = {
-            0: [
-                ModalityItem(0, 0, "image", 5, {"id": "img_A"}),
-                ModalityItem(0, 1, "audio", 4, {"id": "aud_A"}),
-                ModalityItem(0, 2, "image", 5, {"id": "img_B"}),
-            ],
-            1: [ModalityItem(1, 0, "image", 5, {"id": "img_C"})],
-        }
-        assembly = MixedModalityAssembly.from_params(
-            multimodal_params=[object(), object()],
-            extract=_identity_extractor(items_by_param),
-        )
+        assembly = _mixed_image_audio_assembly()
         # Image bucket in append order: img_A, img_B, img_C
         # img_A -> final[0:5], img_B -> final[9:14] (param0 start 0, after img_A(5)+aud_A(4))
         # img_C -> final[14:19] (param1 start 14)

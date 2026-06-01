@@ -65,31 +65,6 @@ class TestNanoExtractItems:
     prompt-order projection (`MultimodalPromptOrder.flatten`).
     """
 
-    def test_pure_image(self):
-        payload = {
-            "image": {"pixel_values": "fake", "num_tokens": 5},
-            "modality_type": "image",
-        }
-        param = _make_param(payload)
-        items = list(_nano_extract_items(0, param))
-        assert len(items) == 1
-        assert items[0].modality == "image"
-        assert items[0].token_count == 5
-        assert items[0].item_idx_in_param == 0
-        assert items[0].src_param_idx == 0
-
-    def test_pure_audio(self):
-        payload = {
-            "audio": {"input_features": "fake", "num_tokens": 4},
-            "modality_type": "audio",
-        }
-        items = list(_nano_extract_items(0, _make_param(payload)))
-        assert len(items) == 1
-        assert items[0].modality == "audio"
-        assert items[0].token_count == 4
-        assert items[0].item_idx_in_param == 0
-        assert items[0].src_param_idx == 0
-
     def test_pure_video_no_audio(self):
         payload = {
             "video": {
@@ -104,53 +79,6 @@ class TestNanoExtractItems:
         assert items[0].modality == "video"
         assert items[0].token_count == 7
         assert items[0].item_idx_in_param == 0
-
-    def test_video_with_embedded_audio_emits_ghost(self):
-        payload = {
-            "video": {
-                "pixel_values": "fake",
-                "num_tokens": 5,
-                "video_size": [],
-                "audio": {
-                    "input_features": "fake",
-                    "num_tokens": 4,
-                    "has_audio": [True],
-                    "audio_num_clips": 1,
-                },
-            },
-            "modality_type": "video",
-        }
-        items = list(_nano_extract_items(0, _make_param(payload)))
-        assert len(items) == 2
-        video, ghost_audio = items
-        assert video.modality == "video"
-        assert video.item_idx_in_param == 0
-        assert video.token_count == 9  # 5 video + 4 audio = post-interleave
-        assert video.src_param_idx == 0
-        assert ghost_audio.modality == "audio"
-        assert ghost_audio.item_idx_in_param == -1
-        assert ghost_audio.token_count == 4
-        assert ghost_audio.src_param_idx == 0
-        # Ghost carries back-reference to the paired video item position.
-        assert ghost_audio.metadata.get("paired_video_item_idx") == 0
-
-    def test_mixed_image_audio(self):
-        payload = {
-            "image": {"pixel_values": "fake", "num_tokens": 5},
-            "audio": {"input_features": "fake", "num_tokens": 4},
-            "modality_type": ["image", "audio"],
-            "multimodal_item_order": [
-                {"modality": "image", "index": 0},
-                {"modality": "audio", "index": 0},
-            ],
-            "multimodal_embedding_lengths": [5, 4],
-        }
-        items = list(_nano_extract_items(0, _make_param(payload)))
-        assert len(items) == 2
-        positions = {it.modality: it.item_idx_in_param for it in items}
-        assert positions == {"image": 0, "audio": 1}
-        token_counts = {it.modality: it.token_count for it in items}
-        assert token_counts == {"image": 5, "audio": 4}
 
     def test_mixed_audio_first_then_image(self):
         # Prompt order is audio, then image -> item_idx_in_param should reflect that.
@@ -206,54 +134,6 @@ class TestNanoExtractorProductionSchema:
     ``multimodal_runtime.total_embeds_in_request`` for pure single-modality
     params.
     """
-
-    def test_pure_image_uses_multimodal_runtime(self):
-        # No num_tokens on payload; total_embeds_in_request drives the count.
-        payload = {"pixel_values": "fake"}
-        param = _make_param_with_runtime(
-            {"image": payload, "modality_type": "image"},
-            total_embeds=7,
-        )
-        items = list(_nano_extract_items(0, param))
-        assert len(items) == 1
-        assert items[0].modality == "image"
-        assert items[0].token_count == 7
-        assert items[0].item_idx_in_param == 0
-
-    def test_pure_audio_uses_multimodal_runtime(self):
-        payload = {"input_features": "fake"}
-        param = _make_param_with_runtime(
-            {"audio": payload, "modality_type": "audio"},
-            total_embeds=4,
-        )
-        items = list(_nano_extract_items(0, param))
-        assert len(items) == 1
-        assert items[0].modality == "audio"
-        assert items[0].token_count == 4
-
-    def test_mixed_uses_multimodal_embedding_lengths(self):
-        # No num_tokens on either payload; mixed params get counts from
-        # multimodal_embedding_lengths indexed by multimodal_item_order.
-        payload_image = {"pixel_values": "fake"}
-        payload_audio = {"input_features": "fake"}
-        param = _make_param(
-            {
-                "image": payload_image,
-                "audio": payload_audio,
-                "modality_type": ["image", "audio"],
-                "multimodal_item_order": [
-                    {"modality": "image", "index": 0},
-                    {"modality": "audio", "index": 0},
-                ],
-                "multimodal_embedding_lengths": [5, 4],
-            }
-        )
-        items = list(_nano_extract_items(0, param))
-        by_modality = {it.modality: it.token_count for it in items}
-        assert by_modality == {"image": 5, "audio": 4}
-        # item_idx_in_param tracks MultimodalPromptOrder positions.
-        positions = {it.modality: it.item_idx_in_param for it in items}
-        assert positions == {"image": 0, "audio": 1}
 
     def test_mixed_interleaved_repeated_modality_raises(self):
         # An interleaved repeated modality (image -> audio -> image) cannot be
@@ -351,36 +231,6 @@ class TestNanoExtractorProductionSchema:
         assert items[0].token_count == 777
         assert items[0].encoder_rows == 777
 
-    def test_video_with_embedded_audio_production_single_modality(self):
-        # Video-with-embedded-audio under PRODUCTION preprocessing, as a pure
-        # single-modality param (modality_type == "video"; the embedded audio
-        # lives INSIDE the video payload, not as a separate modality). NO
-        # num_tokens anywhere. ``total_embeds_in_request`` is the POST-interleave
-        # total (vision + interleaved audio), because
-        # get_num_tokens_per_video(video_audio=...) folds the audio tokens into
-        # the placeholder budget. The audio row count is resolved via
-        # ``audio_rows_fn`` (production feature-mask -> sub-sampling). The
-        # extractor must split: video token_count = post-interleave (12),
-        # encoder_token_count = vision-only = 12 - 4 = 8; ghost audio = 4.
-        audio_payload = {"input_audio_features": "fake", "feature_attention_mask": "fake"}
-        video_payload = {"pixel_values": "fake", "video_size": [], "audio": audio_payload}
-        param = _make_param_with_runtime(
-            {"video": video_payload, "modality_type": "video"},
-            total_embeds=12,  # POST-interleave (vision 8 + audio 4)
-        )
-        # No num_tokens anywhere; production resolver provides the audio rows.
-        items = list(_nano_extract_items(0, param, audio_rows_fn=lambda _p: 4))
-        assert len(items) == 2
-        video, ghost = items
-        assert video.modality == "video"
-        assert video.item_idx_in_param == 0
-        assert video.token_count == 12  # post-interleave scatter destination
-        assert video.encoder_rows == 8  # vision-only encoder output
-        assert ghost.modality == "audio"
-        assert ghost.item_idx_in_param == -1
-        assert ghost.token_count == 4  # audio encoder output rows
-        assert ghost.metadata.get("paired_video_item_idx") == 0
-
     def test_mixed_video_with_audio_uses_post_interleave_embedding_length(self):
         # MIXED param (image + video-with-embedded-audio): the multi-modality
         # branch of the resolver uses multimodal_embedding_lengths per slot. The
@@ -411,21 +261,6 @@ class TestNanoExtractorProductionSchema:
         assert ghost.modality == "audio"
         assert ghost.token_count == 4
 
-    def test_video_with_embedded_audio_num_tokens_is_vision_only(self):
-        # Test-convention fast-path: video num_tokens is the VISION-ONLY count,
-        # so token_count = vision (5) + audio (4) = 9, encoder_token_count = 5.
-        # This preserves the existing unit-test contract while production fields
-        # use the opposite (post-interleave) convention.
-        audio_payload = {"num_tokens": 4}
-        video_payload = {"num_tokens": 5, "video_size": [], "audio": audio_payload}
-        param = _make_param({"video": video_payload, "modality_type": "video"})
-        # audio_rows_fn provided but unused (num_tokens wins).
-        items = list(_nano_extract_items(0, param, audio_rows_fn=lambda _p: 999))
-        video, ghost = items
-        assert video.token_count == 9
-        assert video.encoder_rows == 5
-        assert ghost.token_count == 4
-
     def test_embedded_audio_without_num_tokens_or_resolver_raises(self):
         # Embedded video audio with neither num_tokens nor an audio_rows_fn
         # must raise a clear error rather than guessing.
@@ -439,6 +274,186 @@ class TestNanoExtractorProductionSchema:
         param = _make_param({"video": video_payload, "modality_type": "video"})
         with pytest.raises(KeyError, match="Cannot resolve audio token count"):
             list(_nano_extract_items(0, param))  # no audio_rows_fn
+
+
+# ---------------------------------------------------------------------------
+# Cross-schema token-source parametrizations.
+#
+# These tables collapse pairs that are structurally identical across the two
+# extractor schemas above. The token-source axis IS the schema distinction
+# (synthetic per-payload `num_tokens` fast-path vs production-fields fallback)
+# encoded as a param id rather than erased: each pair tests the SAME extractor
+# code path with the count sourced from a different field.
+# ---------------------------------------------------------------------------
+
+
+def _param_for(modality: str, src: str, token_count: int) -> MultimodalParams:
+    """Build a pure single-modality param sourcing its count from `src`.
+
+    `src == "payload_num_tokens"` puts `num_tokens` on the payload (the
+    synthetic fast-path). `src == "runtime_total_embeds"` omits `num_tokens`
+    and instead carries a real `multimodal_runtime` whose
+    `total_embeds_in_request` equals `token_count` (the production fallback).
+    """
+    feature_key = "pixel_values" if modality == "image" else "input_features"
+    if src == "payload_num_tokens":
+        payload = {feature_key: "fake", "num_tokens": token_count}
+        return _make_param({modality: payload, "modality_type": modality})
+    if src == "runtime_total_embeds":
+        payload = {feature_key: "fake"}
+        return _make_param_with_runtime(
+            {modality: payload, "modality_type": modality},
+            total_embeds=token_count,
+        )
+    raise AssertionError(f"unknown token source: {src}")
+
+
+@pytest.mark.parametrize(
+    "modality, src, expected_tokens",
+    [
+        pytest.param("image", "payload_num_tokens", 5, id="image-payload_num_tokens"),
+        pytest.param("audio", "payload_num_tokens", 4, id="audio-payload_num_tokens"),
+        pytest.param("image", "runtime_total_embeds", 7, id="image-runtime_total_embeds"),
+        pytest.param("audio", "runtime_total_embeds", 4, id="audio-runtime_total_embeds"),
+    ],
+)
+def test_pure_single_modality_token_source(modality, src, expected_tokens):
+    # Pure single-modality extraction: one item whose token_count comes from
+    # either the payload `num_tokens` fast-path or the production
+    # `total_embeds_in_request` fallback.
+    param = _param_for(modality, src, expected_tokens)
+    items = list(_nano_extract_items(0, param))
+    assert len(items) == 1
+    assert items[0].modality == modality
+    assert items[0].token_count == expected_tokens
+    assert items[0].item_idx_in_param == 0
+    assert items[0].src_param_idx == 0
+
+
+def _mixed_image_audio_param(with_num_tokens: bool) -> MultimodalParams:
+    # Mixed image(slot 0)+audio(slot 1) param. When `with_num_tokens` the
+    # payloads carry the synthetic fast-path counts; otherwise the counts come
+    # only from production `multimodal_embedding_lengths`.
+    image_payload = {"pixel_values": "fake"}
+    audio_payload = {"input_features": "fake"}
+    if with_num_tokens:
+        image_payload["num_tokens"] = 5
+        audio_payload["num_tokens"] = 4
+    return _make_param(
+        {
+            "image": image_payload,
+            "audio": audio_payload,
+            "modality_type": ["image", "audio"],
+            "multimodal_item_order": [
+                {"modality": "image", "index": 0},
+                {"modality": "audio", "index": 0},
+            ],
+            "multimodal_embedding_lengths": [5, 4],
+        }
+    )
+
+
+@pytest.mark.parametrize(
+    "with_num_tokens",
+    [
+        pytest.param(True, id="num_tokens"),
+        pytest.param(False, id="embedding_lengths"),
+    ],
+)
+def test_mixed_image_audio_token_source(with_num_tokens):
+    # Mixed image(slot 0)+audio(slot 1) param: positions follow prompt order
+    # and token_counts come from either the payload `num_tokens` fast-path or
+    # the production `multimodal_embedding_lengths` (indexed by
+    # `multimodal_item_order`).
+    param = _mixed_image_audio_param(with_num_tokens)
+    items = list(_nano_extract_items(0, param))
+    assert len(items) == 2
+    positions = {it.modality: it.item_idx_in_param for it in items}
+    assert positions == {"image": 0, "audio": 1}
+    token_counts = {it.modality: it.token_count for it in items}
+    assert token_counts == {"image": 5, "audio": 4}
+
+
+def _video_ghost_synthetic_param() -> MultimodalParams:
+    # Synthetic emits-ghost: per-payload num_tokens (video=5 vision-only,
+    # audio=4); no runtime, no audio_rows_fn needed.
+    payload = {
+        "video": {
+            "pixel_values": "fake",
+            "num_tokens": 5,
+            "video_size": [],
+            "audio": {
+                "input_features": "fake",
+                "num_tokens": 4,
+                "has_audio": [True],
+                "audio_num_clips": 1,
+            },
+        },
+        "modality_type": "video",
+    }
+    return _make_param(payload)
+
+
+def _video_ghost_production_param() -> MultimodalParams:
+    # Production single-modality: NO num_tokens; total_embeds_in_request is the
+    # POST-interleave total (vision 8 + audio 4 = 12); audio rows via resolver.
+    audio_payload = {"input_audio_features": "fake", "feature_attention_mask": "fake"}
+    video_payload = {"pixel_values": "fake", "video_size": [], "audio": audio_payload}
+    return _make_param_with_runtime(
+        {"video": video_payload, "modality_type": "video"},
+        total_embeds=12,
+    )
+
+
+def _video_ghost_num_tokens_vision_only_param() -> MultimodalParams:
+    # Fast-path: video num_tokens is the VISION-ONLY count (5); audio=4.
+    audio_payload = {"num_tokens": 4}
+    video_payload = {"num_tokens": 5, "video_size": [], "audio": audio_payload}
+    return _make_param({"video": video_payload, "modality_type": "video"})
+
+
+@pytest.mark.parametrize(
+    "param_builder, audio_rows_fn, expect_video_tc, expect_encoder_rows, expect_ghost_tc",
+    [
+        pytest.param(_video_ghost_synthetic_param, None, 9, 5, 4, id="synthetic_num_tokens"),
+        pytest.param(
+            _video_ghost_production_param, lambda _p: 4, 12, 8, 4, id="production_total_embeds"
+        ),
+        pytest.param(
+            _video_ghost_num_tokens_vision_only_param,
+            lambda _p: 999,  # provided but unused (num_tokens wins)
+            9,
+            5,
+            4,
+            id="num_tokens_vision_only",
+        ),
+    ],
+)
+def test_video_with_embedded_audio_emits_ghost(
+    param_builder, audio_rows_fn, expect_video_tc, expect_encoder_rows, expect_ghost_tc
+):
+    # Video-with-embedded-audio yields a non-ghost video item first
+    # (token_count = post-interleave dest, encoder_rows = vision-only) and a
+    # ghost audio item second (item_idx_in_param == -1, token_count = audio
+    # encoder rows). The three rows differ only in HOW the counts are sourced:
+    #   * synthetic_num_tokens   : per-payload num_tokens fast-path.
+    #   * production_total_embeds: production fields + audio_rows_fn resolver.
+    #   * num_tokens_vision_only : fast-path, video num_tokens is vision-only.
+    param = param_builder()
+    items = list(_nano_extract_items(0, param, audio_rows_fn=audio_rows_fn))
+    assert len(items) == 2
+    video, ghost = items
+    assert video.modality == "video"
+    assert video.item_idx_in_param == 0
+    assert video.token_count == expect_video_tc  # post-interleave scatter dest
+    assert video.encoder_rows == expect_encoder_rows  # vision-only encoder output
+    assert video.src_param_idx == 0
+    assert ghost.modality == "audio"
+    assert ghost.item_idx_in_param == -1
+    assert ghost.token_count == expect_ghost_tc  # audio encoder output rows
+    assert ghost.src_param_idx == 0
+    # Ghost carries back-reference to the paired video item position.
+    assert ghost.metadata.get("paired_video_item_idx") == 0
 
 
 class TestNanoVisionBucketAdapter:
@@ -629,18 +644,27 @@ class TestNanoPostEncode:
         model._nano_post_encode = NemotronH_Nano_VL_V2._nano_post_encode.__get__(model)
         return model
 
-    def test_no_video_bucket_noop(self):
-        # If no video modality, post_encode is a no-op
-        items_by_param = {0: [ModalityItem(0, 0, "image", 5, {"num_tokens": 5})]}
-        params = [_make_param({"image": {"num_tokens": 5}, "modality_type": "image"})]
+    @pytest.mark.parametrize(
+        "modality, rows",
+        [
+            pytest.param("image", 5, id="image"),
+            pytest.param("audio", 4, id="audio"),
+        ],
+    )
+    def test_non_video_bucket_noop(self, modality, rows):
+        # A single non-video modality item (image or standalone audio, no
+        # pairing) leaves post_encode a no-op: the bucket is preserved as-is.
+        item = ModalityItem(0, 0, modality, rows, {"num_tokens": rows})
+        items_by_param = {0: [item]}
+        params = [_make_param({modality: {"num_tokens": rows}, "modality_type": modality})]
         assembly = MixedModalityAssembly.from_params(
             multimodal_params=params,
             extract=_identity_extractor(items_by_param),
         )
-        bucket_outputs = {"image": torch.ones((5, 4))}
+        bucket_outputs = {modality: torch.ones((rows, 4))}
         model = self._make_model_stub(lambda *a, **kw: None)
         model._nano_post_encode(bucket_outputs, assembly, params)
-        assert bucket_outputs["image"].shape == (5, 4)
+        assert bucket_outputs[modality].shape == (rows, 4)
 
     def test_video_with_audio_interleaved(self):
         # One param: video with embedded audio.
@@ -696,21 +720,6 @@ class TestNanoPostEncode:
         assert bucket_outputs["video"].shape == (9, 4)
         # Audio bucket truncated to 0 rows (only ghost present)
         assert bucket_outputs["audio"].shape == (0, 4)
-
-    def test_standalone_audio_preserved(self):
-        # One param with a standalone audio item (no video, no pairing)
-        items_by_param = {
-            0: [ModalityItem(0, 0, "audio", 4, {"num_tokens": 4})],
-        }
-        params = [_make_param({"audio": {"num_tokens": 4}, "modality_type": "audio"})]
-        assembly = MixedModalityAssembly.from_params(
-            multimodal_params=params,
-            extract=_identity_extractor(items_by_param),
-        )
-        bucket_outputs = {"audio": torch.ones((4, 4))}
-        model = self._make_model_stub(lambda *a, **kw: None)
-        model._nano_post_encode(bucket_outputs, assembly, params)
-        assert bucket_outputs["audio"].shape == (4, 4)
 
     def test_pure_video_no_audio_uses_encoder_rows_no_num_tokens(self):
         # Regression for the firing MixedModality crash: a video item with NO

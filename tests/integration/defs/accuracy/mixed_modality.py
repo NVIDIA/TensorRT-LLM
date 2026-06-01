@@ -319,7 +319,10 @@ class MixedModalityEvaluator(Evaluator):
 
     def _iter_samples(self) -> Iterable[MixedModalitySample]:
         """Load per-modality sources and yield deterministic mixed samples."""
-        source_sample_count = _target_source_sample_count(self.num_samples)
+        # Oversample source rows so target-modality filtering still yields enough.
+        source_sample_count = (
+            None if self.num_samples is None else max(self.num_samples * 2, self.num_samples + 8)
+        )
         input_samples_by_modality = {
             modality: _load_input_samples(
                 modality, self.modality_dataset_paths[modality], source_sample_count
@@ -528,13 +531,6 @@ def _select_target_modalities(
     ]
     rng.shuffle(selected_targets)
     return selected_targets
-
-
-def _target_source_sample_count(num_samples: Optional[int]) -> Optional[int]:
-    """Oversample source rows so filtering still yields enough targets."""
-    if num_samples is None:
-        return None
-    return max(num_samples * 2, num_samples + 8)
 
 
 def _load_input_samples(
