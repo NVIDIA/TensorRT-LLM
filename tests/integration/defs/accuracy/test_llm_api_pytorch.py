@@ -6839,6 +6839,8 @@ class TestNemotronV3Super(LlmapiAccuracyTestHarness):
                 **pytorch_config,
         ) as llm:
             task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm,
+                          extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
 
     @skip_pre_hopper
     @skip_post_hopper
