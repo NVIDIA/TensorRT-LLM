@@ -21,6 +21,7 @@ This module provides:
   Eagle speculative decoding.
 """
 
+import re
 import types
 from contextlib import nullcontext
 from typing import Any, Dict, List, Optional
@@ -43,6 +44,22 @@ from .custom.modeling_eagle import (
 )
 from .factory import DynamicShape, ModelFactory, ModelFactoryRegistry, SubModuleExportInfo
 from .hf import AutoModelForCausalLMFactory
+
+
+def mapped_module_names(
+    modules: List[str],
+    renamed_modules: Optional[Dict[str, str]],
+) -> List[str]:
+    if not renamed_modules:
+        return modules
+
+    mapped_modules = []
+    for module in modules:
+        mapped_module = module
+        for regex, replacement in renamed_modules.items():
+            mapped_module = re.sub(regex, replacement, mapped_module)
+        mapped_modules.append(mapped_module)
+    return mapped_modules
 
 
 @ModelFactoryRegistry.register("EagleDrafter")
@@ -78,8 +95,11 @@ class EagleDrafterFactory(AutoModelForCausalLMFactory):
         else:
             model.to(device)
 
-        # Store checkpoint conversion mapping if present
+        # Store module-name conversion mappings if present.
         self._checkpoint_conversion_mapping = getattr(model, "_checkpoint_conversion_mapping", None)
+        self._quant_exclude_conversion_mapping = getattr(
+            model, "_quant_exclude_conversion_mapping", None
+        )
 
         model.eval()
 
@@ -370,10 +390,15 @@ class EagleOneModelFactory(ModelFactory):
     def get_sharding_config(self) -> Dict[str, Any]:
         return self.target_factory.get_sharding_config()
 
-    # TODO(govind): It's possible that draft models have different quant configs than target models.
-    # We need to address this possibility.
     def get_quant_config(self) -> Dict[str, Any]:
-        return self.target_factory.get_quant_config()
+        qcfg = dict(self.target_factory.get_quant_config())
+        excluded = qcfg.get("exclude_modules")
+        if excluded:
+            qcfg["exclude_modules"] = mapped_module_names(
+                list(excluded),
+                getattr(self.draft_factory, "_quant_exclude_conversion_mapping", None),
+            )
+        return qcfg
 
     def get_cache_config_updates(self) -> Dict[str, Any]:
         return self.target_factory.get_cache_config_updates()
