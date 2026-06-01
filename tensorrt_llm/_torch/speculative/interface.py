@@ -1166,6 +1166,62 @@ class SpecWorkerBase(nn.Module, ABC):
 
         return draft_tokens.type(torch.int32)
 
+    def _draft_sampler_advanced(
+        self,
+        logits: torch.Tensor,
+        spec_metadata: "SpecMetadata",
+        batch_size: int,
+        d2t: Optional[torch.Tensor] = None,
+    ):
+        """
+        Draft token sampling using per-request sampling parameters from the
+        target's sampling config. Falls back to argmax when the batch is
+        all-greedy.
+
+        Args:
+            logits: [batch_size, vocab_size] - Draft model logits (one row per
+                request, since each draft step emits one token per request).
+            spec_metadata: Source of per-request temperatures / top_k / top_p
+                tensors populated by populate_sampling_params_for_one_model.
+            batch_size: Number of active requests in the batch.
+            d2t: Optional dictionary offset tensor for vocab mapping.
+
+        Returns:
+            draft_tokens: [batch_size] - Sampled draft token ids (int32)
+        """
+        if spec_metadata.is_all_greedy_sample:
+            return self._draft_sampler_greedy(logits, d2t)
+
+        temperatures = spec_metadata.request_temperatures[:batch_size]
+        top_ks = spec_metadata.request_top_ks[:batch_size]
+        top_ps = spec_metadata.request_top_ps[:batch_size]
+
+        if self.use_flashinfer:
+            top_ks = top_ks.clamp(min=1, max=logits.shape[-1] - 1)
+            if self.seed is None:
+                self.seed = torch.tensor([0],
+                                         dtype=torch.int64,
+                                         device=logits.device)
+                self.offset = torch.tensor([0],
+                                           dtype=torch.int64,
+                                           device=logits.device)
+            self.seed += 1
+            self.seed %= (2**31)
+
+        draft_tokens = sampling_batch_spec_dec_one_model(
+            logits,
+            temperatures,
+            top_ks,
+            top_ps,
+            use_flashinfer=self.use_flashinfer,
+            seed=self.seed,
+            offset=self.offset)
+
+        if d2t is not None:
+            draft_tokens = d2t[draft_tokens] + draft_tokens
+
+        return draft_tokens.type(torch.int32)
+
     def _compute_and_store_draft_probs(
         self,
         draft_logits_list: List[torch.Tensor],
