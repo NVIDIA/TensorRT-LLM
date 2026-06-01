@@ -4,6 +4,7 @@ import time
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Set, Tuple, Type
 
 import torch
+import torch._inductor.config as inductor_config
 import torch.distributed as dist
 import torch.nn as nn
 from pydantic import Field
@@ -125,6 +126,7 @@ class BasePipeline(nn.Module):
         self._cuda_graph_runners: Dict[str, CUDAGraphRunner] = {}
         self._parallel_vae_enabled: bool = False
         self._warmed_up_shapes: Set[tuple] = set()
+        self._skip_softmax_enabled: Optional[bool] = None
 
         # Unified cache acceleration (TeaCache, Cache-DiT); see _setup_cache_acceleration
         self.cache_accelerator: Optional["CacheAccelerator"] = None
@@ -180,6 +182,13 @@ class BasePipeline(nn.Module):
             )
             return
 
+        sparse_cfg = self.model_config.attention.sparse_attention_config
+        if getattr(sparse_cfg, "first_dense_steps", 0) > 0:
+            raise ValueError(
+                "skip_softmax first_dense_steps is not supported with CUDA graph capture; "
+                "disable cuda_graph_config.enable or set first_dense_steps=0."
+            )
+
         if len(self.transformer_components) > 1:
             logger.info(
                 "CUDA graph runner: multiple transformer components, using shared graph pool"
@@ -197,6 +206,30 @@ class BasePipeline(nn.Module):
             logger.info(f"CUDA graph runner: wrapping {name}.forward")
             model.forward = runner.wrap(model.forward)
             self._cuda_graph_runners[name] = runner
+
+    def _set_skip_softmax_for_step(self, step_idx: int) -> None:
+        """Apply first-dense-step skip-softmax scheduling before a denoise step."""
+        from tensorrt_llm.visual_gen.sparse_attention import (
+            SkipSoftmaxConfig,
+            set_skip_softmax_enabled,
+        )
+
+        sparse_cfg = self.model_config.attention.sparse_attention_config
+        if not isinstance(sparse_cfg, SkipSoftmaxConfig):
+            return
+
+        should_enable = step_idx >= sparse_cfg.first_dense_steps
+        if self._skip_softmax_enabled == should_enable:
+            return
+
+        modified = set_skip_softmax_enabled(self, sparse_cfg, enabled=should_enable)
+        self._skip_softmax_enabled = should_enable
+        if self.rank == 0 and modified:
+            mode = "enabled" if should_enable else "disabled"
+            logger.info(
+                f"skip_softmax {mode} for denoise step {step_idx} "
+                f"(first_dense_steps={sparse_cfg.first_dense_steps}, backends={modified})"
+            )
 
     @property
     def rank(self):
@@ -529,6 +562,12 @@ class BasePipeline(nn.Module):
         For non-transformer components, compiles the entire module.
         """
         tc_config = self.model_config.torch_compile
+
+        # Make inductor round FP32<->BF16 casts like eager. Must be set before the
+        # first compiled forward (warmup), which inductor traces lazily. Closes most
+        # of the torch.compile-vs-eager quality gap on WAN at no latency cost.
+        if hasattr(inductor_config, "emulate_precision_casts"):
+            inductor_config.emulate_precision_casts = True
 
         # Using default as max-autotune mode takes more initialization time and
         # does not improve performance a lot.
@@ -1027,6 +1066,8 @@ class BasePipeline(nn.Module):
         for i, t in enumerate(timesteps):
             if prof_step_starts is not None and i in prof_step_starts and not self._is_warmup:
                 self._cuda_profiler_start()
+
+            self._set_skip_softmax_for_step(i)
 
             step_start = time.time()
 

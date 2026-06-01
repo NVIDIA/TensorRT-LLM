@@ -227,6 +227,47 @@ def generate_rope_embeddings(
     return freqs_cos, freqs_sin
 
 
+def test_fused_rope_reshape_accepts_visual_gen_broadcast_layouts():
+    seq_len = 5
+    head_dim = 8
+    num_heads = 4
+
+    shd = torch.randn(1, seq_len, 1, head_dim)
+    hsd = torch.randn(1, 1, seq_len, head_dim)
+    per_head = torch.randn(seq_len, num_heads, head_dim)
+    combined = torch.randn(seq_len, num_heads * head_dim)
+
+    assert Attention._reshape_rope_for_fused_op(shd, num_heads, head_dim).shape == (
+        seq_len,
+        head_dim,
+    )
+    assert Attention._reshape_rope_for_fused_op(hsd, num_heads, head_dim).shape == (
+        seq_len,
+        head_dim,
+    )
+    assert Attention._reshape_rope_for_fused_op(per_head, num_heads, head_dim).shape == (
+        seq_len,
+        num_heads * head_dim,
+    )
+    assert Attention._reshape_rope_for_fused_op(combined, num_heads, head_dim).shape == (
+        seq_len,
+        num_heads * head_dim,
+    )
+
+
+def test_fused_rope_tokens_per_batch_marks_shared_batch_rope():
+    batch_size = 2
+    seq_len = 5
+    head_dim = 8
+
+    shared_rope = torch.randn(seq_len, head_dim)
+    expanded_rope = torch.randn(batch_size * seq_len, head_dim)
+
+    assert Attention._rope_tokens_per_batch(shared_rope, batch_size, seq_len, -1) == seq_len
+    assert Attention._rope_tokens_per_batch(expanded_rope, batch_size, seq_len, -1) == 0
+    assert Attention._rope_tokens_per_batch(expanded_rope, batch_size, seq_len, 2) == seq_len
+
+
 # ============================================================================
 # Test functions
 # ============================================================================

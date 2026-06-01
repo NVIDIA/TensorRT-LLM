@@ -14,6 +14,7 @@ from tensorrt_llm.visual_gen.sparse_attention import (
     SkipSoftmaxConfig,
     SkipSoftmaxFormula,
     apply_skip_softmax_overrides,
+    set_skip_softmax_enabled,
 )
 
 # =============================================================================
@@ -70,6 +71,7 @@ class TestSkipSoftmaxConfigConstruction:
                     "algorithm": "skip_softmax",
                     "threshold_scale_factor": 5000.0,
                     "target_sparsity": 0.5,
+                    "first_dense_steps": 16,
                 },
             }
         )
@@ -78,6 +80,7 @@ class TestSkipSoftmaxConfigConstruction:
         assert sc.algorithm == "skip_softmax"
         assert sc.threshold_scale_factor == 5000.0
         assert sc.target_sparsity == 0.5
+        assert sc.first_dense_steps == 16
 
     def test_attention_config_rejects_calibration_fields(self):
         """``formula`` and ``layer_overrides`` are not part of the user surface.
@@ -120,6 +123,24 @@ class TestSkipSoftmaxConfigConstruction:
         dumped = original.model_dump()
         rehydrated = AttentionConfig(**dumped)
         assert rehydrated.model_dump() == dumped
+
+    def test_public_overrides_preserve_first_dense_steps_when_omitted(self):
+        """ModelOpt calibration keeps its dense prefix unless the user sets one."""
+        loaded = SkipSoftmaxConfig.with_calibration(
+            target_sparsity=0.5,
+            first_dense_steps=12,
+            formula=SkipSoftmaxFormula(log_a=math.log(0.0003), b=7.5),
+        )
+        assert (
+            loaded._with_public_overrides(SkipSoftmaxConfig(target_sparsity=0.7)).first_dense_steps
+            == 12
+        )
+        assert (
+            loaded._with_public_overrides(
+                SkipSoftmaxConfig(target_sparsity=0.7, first_dense_steps=16)
+            ).first_dense_steps
+            == 16
+        )
 
     def test_attention_config_no_sparse(self):
         cfg = AttentionConfig(backend="VANILLA")
@@ -337,6 +358,51 @@ config_groups:
         # 'a' should be normalized to log_a = log(a)
         assert cfg._formula.log_a == pytest.approx(math.log(7e-5))
         assert cfg._formula.b == pytest.approx(7.929109)
+
+    def test_load_modelopt_yaml_accepts_consistent_a_and_log_a(self, tmp_path):
+        """ModelOpt may emit both 'a' and 'log_a'; accept them when consistent."""
+        from tensorrt_llm.visual_gen.sparse_attention import load_sparse_config_from_yaml
+
+        a = 2227.5528011152483
+        yaml_content = f"""
+config_groups:
+  group_0:
+    sparse_algo: softmax_skip
+    threshold_scale_factor:
+      formula: a * exp(b * target_sparsity)
+      prefill:
+        a: {a}
+        b: 4.300334457820109
+        log_a: {math.log(a)}
+"""
+        yaml_file = tmp_path / "sparse.yaml"
+        yaml_file.write_text(yaml_content)
+
+        cfg = load_sparse_config_from_yaml(str(yaml_file))
+        assert cfg is not None
+        assert cfg._formula.log_a == pytest.approx(math.log(a))
+        assert cfg._formula.b == pytest.approx(4.300334457820109)
+
+    def test_load_modelopt_yaml_rejects_inconsistent_a_and_log_a(self, tmp_path):
+        """Reject dual-format ModelOpt YAML if the two coefficients disagree."""
+        from tensorrt_llm.visual_gen.sparse_attention import load_sparse_config_from_yaml
+
+        yaml_content = """
+config_groups:
+  group_0:
+    sparse_algo: softmax_skip
+    threshold_scale_factor:
+      formula: a * exp(b * target_sparsity)
+      prefill:
+        a: 100.0
+        b: 4.0
+        log_a: 1.0
+"""
+        yaml_file = tmp_path / "sparse.yaml"
+        yaml_file.write_text(yaml_content)
+
+        with pytest.raises(ValueError, match="disagree"):
+            load_sparse_config_from_yaml(str(yaml_file))
 
     def test_load_consolidated_modelopt_yaml_component_map(self, tmp_path):
         """Load current ModelOpt YAML with separate component calibration."""
@@ -612,6 +678,22 @@ class TestApplySkipSoftmaxOverrides:
         model = self._make_mock_model()
         cfg = SkipSoftmaxConfig(threshold_scale_factor=5000.0)
         assert apply_skip_softmax_overrides(model, cfg) == 0
+
+    def test_set_skip_softmax_enabled_global_dense_prefix(self):
+        model = self._make_mock_model()
+        cfg = SkipSoftmaxConfig(threshold_scale_factor=5000.0)
+
+        n = set_skip_softmax_enabled(model, cfg, enabled=True)
+        assert n == 3
+        assert model.block0.attn.sparse_attention_config is not None
+        assert model.block1.attn.sparse_attention_config is not None
+        assert model.block2.attn.sparse_attention_config is not None
+
+        n = set_skip_softmax_enabled(model, cfg, enabled=False)
+        assert n == 3
+        assert model.block0.attn.sparse_attention_config is None
+        assert model.block1.attn.sparse_attention_config is None
+        assert model.block2.attn.sparse_attention_config is None
 
     def test_overrides_applied(self):
         model = self._make_mock_model()

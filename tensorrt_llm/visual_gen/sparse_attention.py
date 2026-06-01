@@ -69,11 +69,13 @@ class SkipSoftmaxConfig(SkipSoftmaxAttentionConfig):
     """SkipSoftmax sparse attention configuration for visual generation.
 
     Extends the shared :class:`SkipSoftmaxAttentionConfig` from
-    ``tensorrt_llm.llmapi.llm_args`` (used by the LLM backend) without adding
-    any user-facing fields. The user-facing surface is exactly:
+    ``tensorrt_llm.llmapi.llm_args`` (used by the LLM backend) with
+    visual-generation-specific runtime scheduling. The user-facing surface is:
 
     - ``threshold_scale_factor`` — raw value, resolution-dependent.
     - ``target_sparsity`` — semantic target; needs calibration to resolve.
+    - ``first_dense_steps`` — initial denoising steps run dense before
+      skip-softmax is enabled.
 
     Calibration state (formula coefficients and per-layer overrides) is loaded
     from ModelOpt-produced artifacts (``sparse.yaml`` or checkpoint
@@ -86,6 +88,16 @@ class SkipSoftmaxConfig(SkipSoftmaxAttentionConfig):
     :meth:`SkipSoftmaxConfig.with_calibration`.
     """
 
+    first_dense_steps: int = PydanticField(
+        default=0,
+        ge=0,
+        description=(
+            "Number of initial visual-generation denoising steps that run dense "
+            "attention before enabling skip-softmax. This is a runtime schedule "
+            "knob; it does not affect threshold calibration."
+        ),
+    )
+
     _formula: Optional[SkipSoftmaxFormula] = PrivateAttr(default=None)
     _layer_overrides: Optional[Dict[str, float]] = PrivateAttr(default=None)
     _component_configs: Optional[Dict[str, "SkipSoftmaxConfig"]] = PrivateAttr(default=None)
@@ -97,6 +109,7 @@ class SkipSoftmaxConfig(SkipSoftmaxAttentionConfig):
         *,
         threshold_scale_factor: Optional[Union[float, Dict[str, float]]] = None,
         target_sparsity: Optional[Union[float, Dict[str, float]]] = None,
+        first_dense_steps: int = 0,
         formula: Optional[SkipSoftmaxFormula] = None,
         layer_overrides: Optional[Dict[str, float]] = None,
         component_configs: Optional[Dict[str, "SkipSoftmaxConfig"]] = None,
@@ -107,6 +120,8 @@ class SkipSoftmaxConfig(SkipSoftmaxAttentionConfig):
             kwargs["threshold_scale_factor"] = threshold_scale_factor
         if target_sparsity is not None:
             kwargs["target_sparsity"] = target_sparsity
+        if first_dense_steps:
+            kwargs["first_dense_steps"] = first_dense_steps
         cfg = cls(**kwargs)
         cfg._formula = formula
         cfg._layer_overrides = layer_overrides
@@ -123,6 +138,8 @@ class SkipSoftmaxConfig(SkipSoftmaxAttentionConfig):
             }.items()
             if v is not None
         }
+        if "first_dense_steps" in user_cfg.model_fields_set:
+            updates["first_dense_steps"] = user_cfg.first_dense_steps
         if not updates:
             return self
 
@@ -271,13 +288,33 @@ def _load_sparse_config_group_container(data: Dict[str, Any]) -> Optional[SkipSo
             {str(name): 0.0 for name in disabled} if disabled else None
         )
 
-        formula_kwargs = {k: prefill[k] for k in ("log_a", "a", "b") if k in prefill}
         return SkipSoftmaxConfig.with_calibration(
-            formula=SkipSoftmaxFormula(**formula_kwargs),
+            formula=SkipSoftmaxFormula(**_formula_kwargs_from_prefill(prefill)),
             layer_overrides=layer_overrides,
         )
 
     return None
+
+
+def _formula_kwargs_from_prefill(prefill: Dict[str, Any]) -> Dict[str, float]:
+    """Normalize ModelOpt prefill formula coefficients for ``SkipSoftmaxFormula``."""
+    if "log_a" in prefill:
+        log_a = float(prefill["log_a"])
+        if "a" in prefill:
+            a = float(prefill["a"])
+            if a <= 0:
+                raise ValueError(
+                    f"SkipSoftmaxFormula: 'a' must be positive (got {a}). "
+                    "Use 'log_a' directly if you need log(a) of a non-positive value."
+                )
+            if not math.isclose(math.log(a), log_a, rel_tol=1e-6, abs_tol=1e-12):
+                raise ValueError(
+                    "SkipSoftmaxFormula: 'a' and 'log_a' disagree in ModelOpt "
+                    f"calibration ({math.log(a)} != {log_a})."
+                )
+        return {"log_a": log_a, "b": float(prefill["b"])}
+
+    return {"a": float(prefill["a"]), "b": float(prefill["b"])}
 
 
 def load_sparse_config_from_yaml(yaml_path: str) -> Optional[SkipSoftmaxConfig]:
@@ -341,11 +378,11 @@ def auto_detect_sparse_attention_config(
 
     if "log_a" in prefill and "b" in prefill:
         return SkipSoftmaxConfig.with_calibration(
-            formula=SkipSoftmaxFormula(log_a=prefill["log_a"], b=prefill["b"]),
+            formula=SkipSoftmaxFormula(**_formula_kwargs_from_prefill(prefill)),
         )
     if "a" in prefill and "b" in prefill:
         return SkipSoftmaxConfig.with_calibration(
-            formula=SkipSoftmaxFormula(log_a=math.log(prefill["a"]), b=prefill["b"]),
+            formula=SkipSoftmaxFormula(**_formula_kwargs_from_prefill(prefill)),
         )
 
     return None
@@ -356,11 +393,26 @@ def apply_skip_softmax_overrides(model: "torch.nn.Module", skip_softmax: SkipSof
     if skip_softmax._layer_overrides is None and skip_softmax._component_configs is None:
         return 0
 
+    return set_skip_softmax_enabled(model, skip_softmax, enabled=True)
+
+
+def set_skip_softmax_enabled(
+    model: "torch.nn.Module",
+    skip_softmax: SkipSoftmaxConfig,
+    *,
+    enabled: bool,
+) -> int:
+    """Enable or disable skip-softmax on all constructed TRTLLM attention backends.
+
+    ``enabled=False`` clears the backend sparse config for dense attention.
+    ``enabled=True`` restores the calibrated per-layer threshold, including
+    ModelOpt disabled-layer overrides.
+    """
     from tensorrt_llm._torch.visual_gen.attention_backend.trtllm import TrtllmAttention
 
     modified = 0
     for name, module in model.named_modules():
-        threshold = skip_softmax.resolve_threshold(name)
+        threshold = skip_softmax.resolve_threshold(name) if enabled else None
         attn = getattr(module, "attn", None)
         targets = []
         if isinstance(attn, TrtllmAttention):
@@ -370,7 +422,7 @@ def apply_skip_softmax_overrides(model: "torch.nn.Module", skip_softmax: SkipSof
             targets.append(inner)
 
         for target in targets:
-            if threshold is not None:
+            if enabled and threshold is not None:
                 target.sparse_attention_config = SkipSoftmaxAttentionConfig(
                     threshold_scale_factor={"prefill": threshold, "decode": 0}
                 )

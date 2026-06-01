@@ -320,6 +320,29 @@ class Attention(nn.Module):
             k = self.norm_k(k)
         return q, k
 
+    @staticmethod
+    def _reshape_rope_for_fused_op(
+        freqs: torch.Tensor, num_heads: int, head_dim: int
+    ) -> torch.Tensor:
+        if freqs.ndim == 2:
+            return freqs.contiguous()
+
+        if freqs.shape[-1] != head_dim:
+            return freqs.reshape(-1, freqs.shape[-1]).contiguous()
+
+        if freqs.ndim >= 3 and freqs.shape[-2] == num_heads:
+            return freqs.reshape(-1, num_heads * head_dim).contiguous()
+
+        return freqs.reshape(-1, head_dim).contiguous()
+
+    @staticmethod
+    def _rope_tokens_per_batch(
+        freqs: torch.Tensor, batch_size: int, seq_len: int, num_txt_tokens: int
+    ) -> int:
+        if num_txt_tokens > 0 or freqs.shape[0] != batch_size * seq_len:
+            return seq_len
+        return 0
+
     def apply_packed_qk_norm_rope(
         self,
         qkv: torch.Tensor,
@@ -338,10 +361,17 @@ class Attention(nn.Module):
           - cos last dim = num_heads * head_dim      → per-token per-head cos (LTX-2 3D RoPE)
           - cos rows < num_tokens                    → kernel broadcasts via cos_seq_per_batch
 
-        Caller passes raw freqs_cos / freqs_sin (any rank); the op reshapes internally.
+        Caller passes raw freqs_cos / freqs_sin in broadcast form; flatten to
+        the 2D contract that the op validates.
         """
         B, S, D = qkv.shape
-        tokens_per_batch = S if num_txt_tokens > 0 else 0
+        freqs_cos = self._reshape_rope_for_fused_op(
+            freqs_cos, self.num_attention_heads, self.head_dim
+        )
+        freqs_sin = self._reshape_rope_for_fused_op(
+            freqs_sin, self.num_attention_heads, self.head_dim
+        )
+        tokens_per_batch = self._rope_tokens_per_batch(freqs_cos, B, S, num_txt_tokens)
         assert self.tp_size == 1, "fused_dit_split_norm_rope does not support TP"
         torch.ops.trtllm.fused_dit_qk_norm_rope(
             qkv.view(B * S, D),
@@ -376,9 +406,12 @@ class Attention(nn.Module):
           - cos last dim = num_heads * head_dim      → per-token per-head cos (LTX-2 3D RoPE)
           - cos rows < num_tokens                    → kernel broadcasts via cos_seq_per_batch
           - cos dtype bf16 or fp32                   → kernel upcasts bf16 to fp32 in registers
-        Caller passes raw cos/sin (any rank); the op reshapes internally.
+        Caller passes raw cos/sin in broadcast form; flatten to the 2D
+        contract that the op validates.
         """
         B, T, _ = tensor.shape
+        cos = self._reshape_rope_for_fused_op(cos, num_heads, self.head_dim)
+        sin = self._reshape_rope_for_fused_op(sin, num_heads, self.head_dim)
         assert self.tp_size == 1, "fused_dit_split_norm_rope does not support TP"
         torch.ops.trtllm.fused_dit_split_norm_rope(
             tensor.view(B * T, -1),
