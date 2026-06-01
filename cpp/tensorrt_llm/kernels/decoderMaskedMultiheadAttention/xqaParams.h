@@ -69,6 +69,11 @@ struct XQAParams
     bool const* helix_is_inactive_rank = nullptr;
     // Softmax stats output buffer for Helix parallelism (max and LSE per head).
     float2* softmax_stats = nullptr;
+    // Optional TRTLLM-Gen FMHA JIT warmup shape.
+    bool trtllmGenFmhaJITWarmup = false;
+    int32_t trtllmGenFmhaJITWarmupMaxNumRequests = 0;
+    int32_t trtllmGenFmhaJITWarmupMaxSeqLenQ = 0;
+    int32_t trtllmGenFmhaJITWarmupMaxSeqLenKv = 0;
 
     // almost copy from GPTAttentionPluginCommon.
     // maybe use one struct for parameters in GPTAttentionPluginCommon and share the same here.

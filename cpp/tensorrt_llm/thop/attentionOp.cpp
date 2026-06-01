@@ -375,8 +375,8 @@ public:
         std::optional<torch::Tensor> fmha_scheduler_counter, std::optional<torch::Tensor> mla_bmm1_scale,
         std::optional<torch::Tensor> mla_bmm2_scale, std::optional<torch::Tensor> quant_q_buffer,
         std::optional<torch::Tensor> flash_mla_tile_scheduler_metadata,
-        std::optional<torch::Tensor> flash_mla_num_splits,
-        std::optional<int64_t> compressed_kv_cache_pool_ptr = std::nullopt) const
+        std::optional<torch::Tensor> flash_mla_num_splits, bool trtllmGenFmhaJITWarmup,
+        int64_t trtllmGenFmhaJITWarmupMaxSeqLenKv, std::optional<int64_t> compressed_kv_cache_pool_ptr) const
         = 0;
 };
 
@@ -443,8 +443,8 @@ public:
         std::optional<torch::Tensor> fmha_scheduler_counter, std::optional<torch::Tensor> mla_bmm1_scale,
         std::optional<torch::Tensor> mla_bmm2_scale, std::optional<torch::Tensor> quant_q_buffer,
         std::optional<torch::Tensor> flash_mla_tile_scheduler_metadata,
-        std::optional<torch::Tensor> flash_mla_num_splits,
-        std::optional<int64_t> compressed_kv_cache_pool_ptr) const override
+        std::optional<torch::Tensor> flash_mla_num_splits, bool trtllmGenFmhaJITWarmup,
+        int64_t trtllmGenFmhaJITWarmupMaxSeqLenKv, std::optional<int64_t> compressed_kv_cache_pool_ptr) const override
     {
         auto stream = at::cuda::getCurrentCUDAStream(qkv_or_q.get_device());
         T* attention_input = static_cast<T*>(qkv_or_q.slice(0, token_offset).data_ptr());
@@ -746,6 +746,11 @@ public:
         common_enqueue_params.context_lengths = context_lengths_ptr;
         common_enqueue_params.host_context_lengths = host_context_lengths.data_ptr<int32_t>();
         common_enqueue_params.workspace = workspace_ptr;
+        common_enqueue_params.trtllmGenFmhaJITWarmup = trtllmGenFmhaJITWarmup;
+        common_enqueue_params.trtllmGenFmhaJITWarmupMaxNumRequests = max_num_requests;
+        common_enqueue_params.trtllmGenFmhaJITWarmupMaxSeqLenQ = op.mMaxContextLength;
+        common_enqueue_params.trtllmGenFmhaJITWarmupMaxSeqLenKv
+            = static_cast<int32_t>(trtllmGenFmhaJITWarmupMaxSeqLenKv);
         if (softmax_stats_tensor.has_value())
         {
             TLLM_CHECK_WITH_INFO(softmax_stats_tensor.value().scalar_type() == at::ScalarType::Float,
@@ -963,10 +968,12 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
     std::optional<torch::Tensor> mla_bmm2_scale, std::optional<torch::Tensor> quant_q_buffer,
     std::optional<torch::Tensor> flash_mla_tile_scheduler_metadata, std::optional<torch::Tensor> flash_mla_num_splits,
     int64_t sage_attn_num_elts_per_blk_q, int64_t sage_attn_num_elts_per_blk_k, int64_t sage_attn_num_elts_per_blk_v,
-    bool sage_attn_qk_int8, int64_t num_contexts, int64_t num_ctx_tokens,
-    std::optional<int64_t> compressed_kv_cache_pool_ptr)
+    bool sage_attn_qk_int8, int64_t num_contexts, int64_t num_ctx_tokens, bool trtllm_gen_fmha_jit_warmup,
+    int64_t trtllm_gen_fmha_jit_warmup_max_seq_len_kv, std::optional<int64_t> compressed_kv_cache_pool_ptr)
 {
     TLLM_LOG_TRACE("Attention op starts at layer %d", local_layer_idx);
+    bool const trtllmGenFmhaJITWarmup = trtllm_gen_fmha_jit_warmup;
+    int64_t const trtllmGenFmhaJITWarmupMaxSeqLenKv = trtllm_gen_fmha_jit_warmup_max_seq_len_kv;
     // Use these tensors to infer if the attention is using KV cache
     bool const use_kv_cache = kv_cache_block_offsets.has_value() && host_kv_cache_pool_pointers.has_value()
         && host_kv_cache_pool_mapping.has_value();
@@ -1239,7 +1246,7 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
             sparse_kv_offsets, sparse_attn_indices, sparse_attn_offsets, sparse_attn_indices_block_size,
             num_sparse_topk_value, sparse_mla_topk_lens, cu_q_seqlens, cu_kv_seqlens, fmha_scheduler_counter,
             mla_bmm1_scale, mla_bmm2_scale, quant_q_buffer, flash_mla_tile_scheduler_metadata, flash_mla_num_splits,
-            compressed_kv_cache_pool_ptr);
+            trtllmGenFmhaJITWarmup, trtllmGenFmhaJITWarmupMaxSeqLenKv, compressed_kv_cache_pool_ptr);
     }
 
     if ((num_generations > 0) && (attn_input_type != AttentionInputType::ContextOnly))
@@ -1261,7 +1268,7 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
             sparse_kv_offsets, sparse_attn_indices, sparse_attn_offsets, sparse_attn_indices_block_size,
             num_sparse_topk_value, sparse_mla_topk_lens, cu_q_seqlens, cu_kv_seqlens, fmha_scheduler_counter,
             mla_bmm1_scale, mla_bmm2_scale, quant_q_buffer, flash_mla_tile_scheduler_metadata, flash_mla_num_splits,
-            compressed_kv_cache_pool_ptr);
+            trtllmGenFmhaJITWarmup, trtllmGenFmhaJITWarmupMaxSeqLenKv, compressed_kv_cache_pool_ptr);
     }
 
     TLLM_LOG_TRACE("Attention op stops at layer %d", local_layer_idx);

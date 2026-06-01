@@ -124,6 +124,11 @@ public:
         float const* sage_attn_sfs_q = nullptr;
         float const* sage_attn_sfs_k = nullptr;
         float const* sage_attn_sfs_v = nullptr;
+        // Optional TRTLLM-Gen FMHA JIT warmup shape.
+        bool trtllmGenFmhaJITWarmup = false;
+        int32_t trtllmGenFmhaJITWarmupMaxNumRequests = 0;
+        int32_t trtllmGenFmhaJITWarmupMaxSeqLenQ = 0;
+        int32_t trtllmGenFmhaJITWarmupMaxSeqLenKv = 0;
     };
 
     template <typename T>

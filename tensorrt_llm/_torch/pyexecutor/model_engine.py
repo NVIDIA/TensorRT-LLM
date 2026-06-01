@@ -90,7 +90,8 @@ class ModelEngine(ABC):
                 new_tensors_device: Optional[SampleStateTensors],
                 gather_context_logits: bool = False,
                 cache_indirection_buffer: Optional[torch.Tensor] = None,
-                num_accepted_tokens_device: Optional[torch.Tensor] = None):
+                num_accepted_tokens_device: Optional[torch.Tensor] = None,
+                trtllm_gen_fmha_jit_warmup: bool = False):
         raise NotImplementedError
 
     def warmup(self, resource_manager: ResourceManager) -> None:
@@ -938,6 +939,8 @@ class PyTorchModelEngine(ModelEngine):
             and self.guided_decoder is None
             and not isinstance(kv_cache_manager, MambaHybridCacheManager))
 
+        self._run_attention_warmup(resource_manager, can_run_general_warmup)
+
         if can_run_general_warmup:
             # Specialize torch.compile graphs across the key input shapes before CUDA graph capture.
             warmup_requests_configs = self._get_full_general_warmup_requests(
@@ -1033,6 +1036,40 @@ class PyTorchModelEngine(ModelEngine):
                     f"OOM during general warmup with {num_tokens} tokens, "
                     f"{num_gen_tokens} generation tokens. Skipping.")
                 torch.cuda.empty_cache()
+
+    def _run_attention_warmup(self,
+                              resource_manager: ResourceManager,
+                              can_run_general_warmup=True) -> None:
+        if self.attn_backend.Metadata is not TrtllmAttentionMetadata:
+            return
+
+        logger.info("Running TRTLLM-Gen FMHA JIT warmup...")
+
+        warmup_requests_configs = []
+        warmup_requests_configs.append(
+            (1 + self.max_total_draft_tokens, 1))  # one generation request
+        if can_run_general_warmup:
+            warmup_requests_configs.append((1, 0))  # one context token
+
+        for num_tokens, num_gen_requests in warmup_requests_configs:
+            warmup_request = self._create_warmup_request(
+                resource_manager,
+                num_tokens=num_tokens,
+                num_gen_requests=num_gen_requests)
+
+            with self.no_cuda_graph(), self._release_batch_context(
+                    warmup_request, resource_manager) as batch:
+                if batch is None and self.mapping.tp_size <= 1:
+                    continue  # Not enough KV cache space (single rank, safe to skip)
+                self._assert_all_tp_ranks_have_warmup_batch(
+                    batch, num_tokens)
+                if batch is None:
+                    continue  # All ranks agree: not enough space
+                self.forward(batch,
+                             new_tensors_device=None,
+                             resource_manager=resource_manager,
+                             trtllm_gen_fmha_jit_warmup=True)
+                torch.cuda.synchronize()
 
     def _run_autotuner_warmup(self, resource_manager: ResourceManager):
         """Runs a forward pass to populate the autotuner cache."""
@@ -4397,7 +4434,8 @@ class PyTorchModelEngine(ModelEngine):
                 gather_context_logits: bool = False,
                 cache_indirection_buffer: Optional[torch.Tensor] = None,
                 num_accepted_tokens_device: Optional[torch.Tensor] = None,
-                req_id_to_old_request: Optional[Dict[int, LlmRequest]] = None):
+                req_id_to_old_request: Optional[Dict[int, LlmRequest]] = None,
+                trtllm_gen_fmha_jit_warmup: bool = False):
         kv_cache_manager = resource_manager.get_resource_manager(
             self.kv_cache_manager_key)
         draft_kv_cache_manager = self._get_draft_kv_cache_manager(
@@ -4405,6 +4443,9 @@ class PyTorchModelEngine(ModelEngine):
 
         attn_metadata = self._set_up_attn_metadata(kv_cache_manager,
                                                    draft_kv_cache_manager)
+        if isinstance(attn_metadata, TrtllmAttentionMetadata):
+            attn_metadata.trtllm_gen_fmha_jit_warmup = (
+                trtllm_gen_fmha_jit_warmup)
         if self.enable_spec_decode:
             spec_resource_manager = resource_manager.get_resource_manager(
                 ResourceManagerType.SPEC_RESOURCE_MANAGER)

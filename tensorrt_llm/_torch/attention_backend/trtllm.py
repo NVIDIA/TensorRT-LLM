@@ -124,6 +124,9 @@ class TrtllmAttentionMetadata(AttentionMetadata):
     spec_decoding_bl_tree_mask: Optional[torch.Tensor] = None
     spec_bl_tree_first_sparse_mask_offset_kv: Optional[torch.Tensor] = None
 
+    # TRTLLM-Gen FMHA JIT warmup controls.
+    trtllm_gen_fmha_jit_warmup: bool = False
+
     # Flag to enable helix parallelism.
     enable_helix: bool = False
 
@@ -1590,6 +1593,9 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                 num_contexts=metadata.num_contexts,
                 num_ctx_tokens=metadata.num_ctx_tokens,
                 max_context_length=metadata.max_context_length,
+                trtllm_gen_fmha_jit_warmup=metadata.
+                trtllm_gen_fmha_jit_warmup,
+                trtllm_gen_fmha_jit_warmup_max_seq_len_kv=metadata.max_seq_len,
 
                 # --- Per-call (AttentionForwardArgs) ---
                 out_scale=forward_args.out_scale,
