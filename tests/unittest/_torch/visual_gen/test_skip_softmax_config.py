@@ -8,47 +8,54 @@ from typing import Final
 
 import pytest
 
-from tensorrt_llm.llmapi.llm_args import SkipSoftmaxAttentionConfig
+from tensorrt_llm._torch.attention_backend.sparse.skip_softmax import SkipSoftmaxFormula
+from tensorrt_llm.llmapi.llm_args import SkipSoftmaxAttentionConfig as LlmSkipSoftmaxAttentionConfig
 from tensorrt_llm.visual_gen.args import AttentionConfig, QuantAttentionConfig
 from tensorrt_llm.visual_gen.sparse_attention import (
-    SkipSoftmaxConfig,
-    SkipSoftmaxFormula,
+    SkipSoftmaxAttentionConfig,
     apply_skip_softmax_overrides,
 )
 
 # =============================================================================
-# SkipSoftmaxFormula — accepts both log_a (diffusion) and a (LLM) formats
+# SkipSoftmaxFormula — numexpr expression + named coefficients
 # =============================================================================
 
 
 class TestSkipSoftmaxFormulaFormats:
-    def test_accepts_log_a(self):
-        """Diffusion format: log_a stored directly."""
-        f = SkipSoftmaxFormula(log_a=-14.409, b=37.457)
-        assert f.log_a == pytest.approx(-14.409)
-        assert f.b == pytest.approx(37.457)
+    def test_accepts_arbitrary_expression(self):
+        """Checkpoint can ship any numexpr-evaluable expression along with
+        its named coefficients; the runtime evaluates it verbatim."""
+        f = SkipSoftmaxFormula(
+            formula="a * exp(b * target_sparsity) + c",
+            coefficients={"a": 2.0, "b": 1.5, "c": 0.1},
+        )
+        assert f.formula == "a * exp(b * target_sparsity) + c"
+        assert f.coefficients == {"a": 2.0, "b": 1.5, "c": 0.1}
 
-    def test_accepts_linear_a_and_normalizes(self):
-        """LLM format: a is normalized to log_a = log(a)."""
-        f = SkipSoftmaxFormula(a=7e-5, b=7.929109)
-        assert f.log_a == pytest.approx(math.log(7e-5))
-        assert f.b == pytest.approx(7.929109)
+    def test_rejects_expression_missing_coefficient(self):
+        """Coefficient set must cover everything the expression references."""
+        with pytest.raises(ValueError, match="missing"):
+            SkipSoftmaxFormula(
+                formula="a * exp(b * target_sparsity)",
+                coefficients={"a": 1.0},
+            )
 
-    def test_rejects_both_log_a_and_a(self):
-        """Specifying both is ambiguous — error rather than silently pick one."""
-        with pytest.raises(ValueError, match="not both"):
-            SkipSoftmaxFormula(log_a=-10.0, a=999.0, b=5.0)
+    def test_rejects_invalid_expression(self):
+        """A non-numexpr-parseable expression is rejected at construction."""
+        with pytest.raises(ValueError, match="invalid formula"):
+            SkipSoftmaxFormula(
+                formula="a * (b",
+                coefficients={"a": 1.0, "b": 2.0},
+            )
 
-    def test_rejects_non_positive_a(self):
-        """Linear 'a' must be positive (log of 0/negative is undefined)."""
-        with pytest.raises(ValueError, match="must be positive"):
-            SkipSoftmaxFormula(a=0.0, b=5.0)
-        with pytest.raises(ValueError, match="must be positive"):
-            SkipSoftmaxFormula(a=-1.0, b=5.0)
+    def test_rejects_formula_without_target_sparsity(self):
+        """A formula that never references target_sparsity is rejected."""
+        with pytest.raises(ValueError, match="must reference 'target_sparsity'"):
+            SkipSoftmaxFormula(formula="a * b", coefficients={"a": 1.0, "b": 2.0})
 
 
 # =============================================================================
-# SkipSoftmaxConfig construction
+# SkipSoftmaxAttentionConfig construction
 # =============================================================================
 
 
@@ -74,7 +81,7 @@ class TestSkipSoftmaxConfigConstruction:
             }
         )
         sc = cfg.sparse_attention_config
-        assert isinstance(sc, SkipSoftmaxConfig)
+        assert isinstance(sc, SkipSoftmaxAttentionConfig)
         assert sc.algorithm == "skip_softmax"
         assert sc.threshold_scale_factor == 5000.0
         assert sc.target_sparsity == 0.5
@@ -112,7 +119,7 @@ class TestSkipSoftmaxConfigConstruction:
         """
         original = AttentionConfig(
             backend="TRTLLM",
-            sparse_attention_config=SkipSoftmaxConfig(
+            sparse_attention_config=SkipSoftmaxAttentionConfig(
                 threshold_scale_factor=5000.0,
                 target_sparsity=0.5,
             ),
@@ -125,10 +132,12 @@ class TestSkipSoftmaxConfigConstruction:
         cfg = AttentionConfig(backend="VANILLA")
         assert cfg.sparse_attention_config is None
 
-    def test_base_class_inheritance(self):
-        cfg = SkipSoftmaxConfig(threshold_scale_factor=5000.0)
-        # Inherits from the LLM-shared SkipSoftmaxAttentionConfig (reuse, no duplication)
-        assert isinstance(cfg, SkipSoftmaxAttentionConfig)
+    def test_standalone_from_llm_config(self):
+        cfg = SkipSoftmaxAttentionConfig(threshold_scale_factor=5000.0)
+        # VG SkipSoftmaxAttentionConfig is intentionally decoupled from the LLM-side
+        # SkipSoftmaxAttentionConfig: diffusion pipelines have no prefill/decode
+        # split, and VG carries its own knobs (e.g., future ``warmup``).
+        assert not isinstance(cfg, LlmSkipSoftmaxAttentionConfig)
         assert cfg.algorithm == "skip_softmax"
 
     def test_quant_attention_requires_trtllm_backend(self):
@@ -179,8 +188,7 @@ class TestUseCaseScenarios:
             },
             "threshold_scale_factor": {
                 "formula": "a * exp(b * target_sparsity)",
-                "prefill": {"a": 7.93, "b": 8.61},
-                "decode": {"a": 0.12, "b": 9.85},
+                "coefficients": {"a": 7.93, "b": 8.61},
             },
             "producer": {"name": "modelopt", "version": "0.37.0"},
         }
@@ -190,13 +198,13 @@ class TestUseCaseScenarios:
 
     def test_case_1a_user_threshold_only(self):
         """Normal checkpoint + user threshold → works."""
-        cfg = SkipSoftmaxConfig(threshold_scale_factor=5000.0)
+        cfg = SkipSoftmaxAttentionConfig(threshold_scale_factor=5000.0)
         result = cfg.resolve_threshold_scale_factor(checkpoint_formula=None)
         assert result == 5000.0
 
     def test_case_1b_user_target_sparsity_no_formula(self):
         """Normal checkpoint + target_sparsity without formula → helpful error."""
-        cfg = SkipSoftmaxConfig(target_sparsity=0.5)
+        cfg = SkipSoftmaxAttentionConfig(target_sparsity=0.5)
         with pytest.raises(ValueError, match="calibration formula"):
             cfg.resolve_threshold_scale_factor(checkpoint_formula=None)
 
@@ -204,11 +212,14 @@ class TestUseCaseScenarios:
         """target_sparsity + attached calibration formula (from YAML/checkpoint) → resolves.
 
         The user surface only carries ``target_sparsity``; the formula is
-        attached by the loader via :meth:`SkipSoftmaxConfig.with_calibration`.
+        attached by the loader via :meth:`SkipSoftmaxAttentionConfig.with_calibration`.
         """
-        cfg = SkipSoftmaxConfig.with_calibration(
+        cfg = SkipSoftmaxAttentionConfig.with_calibration(
             target_sparsity=0.5,
-            formula=SkipSoftmaxFormula(log_a=math.log(0.0003), b=7.5),
+            formula=SkipSoftmaxFormula(
+                formula="exp(log_a + b * target_sparsity)",
+                coefficients={"log_a": math.log(0.0003), "b": 7.5},
+            ),
         )
         result = cfg.resolve_threshold_scale_factor(checkpoint_formula=None)
         expected = 0.0003 * math.exp(7.5 * 0.5)
@@ -216,7 +227,7 @@ class TestUseCaseScenarios:
 
     def test_case_1d_layer_overrides_from_calibration(self):
         """Attached layer_overrides (from ModelOpt ``disabled_layers``) → per-layer thresholds."""
-        cfg = SkipSoftmaxConfig.with_calibration(
+        cfg = SkipSoftmaxAttentionConfig.with_calibration(
             threshold_scale_factor=5000.0,
             layer_overrides={"blocks.0*": 0, "blocks.5*": 8000.0},
         )
@@ -230,36 +241,40 @@ class TestUseCaseScenarios:
         """ModelOpt checkpoint + no user config → auto-enable from checkpoint.
 
         The pipeline should detect sparse_attention_config in checkpoint
-        config.json and create a SkipSoftmaxConfig automatically.
+        config.json and create a SkipSoftmaxAttentionConfig automatically.
         """
         from tensorrt_llm.visual_gen.sparse_attention import auto_detect_sparse_attention_config
 
         ckpt = self.MODELOPT_CHECKPOINT
         result = auto_detect_sparse_attention_config(ckpt)
         assert result is not None
-        assert isinstance(result, SkipSoftmaxConfig)
+        assert isinstance(result, SkipSoftmaxAttentionConfig)
         # Calibration formula is attached as a private attr (not user-facing).
+        # The checkpoint ships a full numexpr expression; coefficients are
+        # honored verbatim (no log_a normalization when the form is supplied).
         assert result._formula is not None
-        assert result._formula.log_a == pytest.approx(math.log(7.93))
-        assert result._formula.b == pytest.approx(8.61)
+        assert result._formula.formula == "a * exp(b * target_sparsity)"
+        assert result._formula.coefficients["a"] == pytest.approx(7.93)
+        assert result._formula.coefficients["b"] == pytest.approx(8.61)
+
+    @staticmethod
+    def _modelopt_block():
+        tsf = TestUseCaseScenarios.MODELOPT_CHECKPOINT["sparse_attention_config"][
+            "threshold_scale_factor"
+        ]
+        return {"formula": tsf["formula"], **tsf["coefficients"]}
 
     def test_case_2b_modelopt_user_threshold_overrides(self):
         """ModelOpt checkpoint + user threshold → user wins."""
-        cfg = SkipSoftmaxConfig(threshold_scale_factor=3000.0)
-        ckpt_formula = self.MODELOPT_CHECKPOINT["sparse_attention_config"][
-            "threshold_scale_factor"
-        ]["prefill"]
-        result = cfg.resolve_threshold_scale_factor(checkpoint_formula=ckpt_formula)
+        cfg = SkipSoftmaxAttentionConfig(threshold_scale_factor=3000.0)
+        result = cfg.resolve_threshold_scale_factor(checkpoint_formula=self._modelopt_block())
         # User threshold takes precedence, checkpoint formula ignored
         assert result == 3000.0
 
     def test_case_2c_modelopt_user_target_sparsity(self):
         """ModelOpt checkpoint + user target_sparsity → uses checkpoint formula."""
-        cfg = SkipSoftmaxConfig(target_sparsity=0.5)
-        ckpt_formula = self.MODELOPT_CHECKPOINT["sparse_attention_config"][
-            "threshold_scale_factor"
-        ]["prefill"]
-        result = cfg.resolve_threshold_scale_factor(checkpoint_formula=ckpt_formula)
+        cfg = SkipSoftmaxAttentionConfig(target_sparsity=0.5)
+        result = cfg.resolve_threshold_scale_factor(checkpoint_formula=self._modelopt_block())
         expected = 7.93 * math.exp(8.61 * 0.5)
         assert result == pytest.approx(expected)
 
@@ -291,8 +306,8 @@ config_groups:
     targets:
     - WanAttention
     threshold_scale_factor:
-      formula: log_a + b * target_sparsity
-      prefill:
+      formula: exp(log_a + b * target_sparsity)
+      coefficients:
         log_a: -14.14
         b: 36.64
     disabled_layers:
@@ -306,9 +321,11 @@ config_groups:
         cfg = load_sparse_config_from_yaml(str(yaml_file))
         assert cfg is not None
         # Calibration formula + disabled-layer overrides land in private attrs,
-        # not on the user-facing surface.
-        assert cfg._formula.log_a == pytest.approx(-14.14)
-        assert cfg._formula.b == pytest.approx(36.64)
+        # not on the user-facing surface. The loader honors the YAML's
+        # `formula` field verbatim — there is no implicit fallback.
+        assert cfg._formula.formula == "exp(log_a + b * target_sparsity)"
+        assert cfg._formula.coefficients["log_a"] == pytest.approx(-14.14)
+        assert cfg._formula.coefficients["b"] == pytest.approx(36.64)
         assert cfg._layer_overrides is not None
         assert cfg._layer_overrides["blocks.0.attn1"] == 0
         assert cfg._layer_overrides["blocks.0.attn2"] == 0
@@ -325,7 +342,7 @@ config_groups:
     sparse_algo: softmax_skip
     threshold_scale_factor:
       formula: a * exp(b * target_sparsity)
-      prefill:
+      coefficients:
         a: 7.0e-5
         b: 7.929109
 """
@@ -334,9 +351,11 @@ config_groups:
 
         cfg = load_sparse_config_from_yaml(str(yaml_file))
         assert cfg is not None
-        # 'a' should be normalized to log_a = log(a)
-        assert cfg._formula.log_a == pytest.approx(math.log(7e-5))
-        assert cfg._formula.b == pytest.approx(7.929109)
+        # YAML carries a full numexpr expression containing `exp(...)`,
+        # so coefficients are honored verbatim (no log_a normalization).
+        assert cfg._formula.formula == "a * exp(b * target_sparsity)"
+        assert cfg._formula.coefficients["a"] == pytest.approx(7e-5)
+        assert cfg._formula.coefficients["b"] == pytest.approx(7.929109)
 
     def test_load_consolidated_modelopt_yaml_component_map(self, tmp_path):
         """Load current ModelOpt YAML with separate component calibration."""
@@ -348,8 +367,8 @@ transformer:
     group_0:
       sparse_algo: softmax_skip
       threshold_scale_factor:
-        formula: log_a + b * target_sparsity
-        prefill:
+        formula: exp(log_a + b * target_sparsity)
+        coefficients:
           log_a: -10.0
           b: 2.0
       disabled_layers:
@@ -359,8 +378,8 @@ transformer_2:
     group_0:
       sparse_algo: softmax_skip
       threshold_scale_factor:
-        formula: log_a + b * target_sparsity
-        prefill:
+        formula: exp(log_a + b * target_sparsity)
+        coefficients:
           log_a: -20.0
           b: 4.0
       disabled_layers:
@@ -377,7 +396,7 @@ producer:
         assert cfg._component_configs is not None
         assert set(cfg._component_configs) == {"transformer", "transformer_2"}
 
-        merged = cfg._with_public_overrides(SkipSoftmaxConfig(target_sparsity=0.5))
+        merged = cfg._with_public_overrides(SkipSoftmaxAttentionConfig(target_sparsity=0.5))
         transformer_threshold = math.exp(-10.0 + 2.0 * 0.5)
         transformer_2_threshold = math.exp(-20.0 + 4.0 * 0.5)
         assert merged.resolve_threshold("transformer.blocks.0.attn1") is None
@@ -413,7 +432,8 @@ config_groups:
   group_0:
     sparse_algo: softmax_skip
     threshold_scale_factor:
-      prefill:
+      formula: exp(log_a + b * target_sparsity)
+      coefficients:
         log_a: -14.14
         b: 36.64
 """
@@ -422,7 +442,7 @@ config_groups:
         cfg = auto_detect_sparse_yaml(str(tmp_path))
         assert cfg is not None
         assert cfg._formula is not None
-        assert cfg._formula.log_a == pytest.approx(-14.14)
+        assert cfg._formula.coefficients["log_a"] == pytest.approx(-14.14)
 
 
 # =============================================================================
@@ -432,70 +452,97 @@ config_groups:
 
 class TestResolveThresholdScaleFactor:
     def test_direct_threshold_returns_immediately(self):
-        cfg = SkipSoftmaxConfig(threshold_scale_factor=5000.0)
+        cfg = SkipSoftmaxAttentionConfig(threshold_scale_factor=5000.0)
         assert cfg.resolve_threshold_scale_factor() == 5000.0
 
     def test_direct_threshold_ignores_formula(self):
-        cfg = SkipSoftmaxConfig.with_calibration(
+        cfg = SkipSoftmaxAttentionConfig.with_calibration(
             threshold_scale_factor=5000.0,
             target_sparsity=0.5,
-            formula=SkipSoftmaxFormula(log_a=math.log(0.0003), b=7.5),
+            formula=SkipSoftmaxFormula(
+                formula="exp(log_a + b * target_sparsity)",
+                coefficients={"log_a": math.log(0.0003), "b": 7.5},
+            ),
         )
         # threshold_scale_factor takes precedence
         assert cfg.resolve_threshold_scale_factor() == 5000.0
 
     def test_target_sparsity_with_attached_formula(self):
-        cfg = SkipSoftmaxConfig.with_calibration(
+        cfg = SkipSoftmaxAttentionConfig.with_calibration(
             target_sparsity=0.5,
-            formula=SkipSoftmaxFormula(log_a=math.log(7e-5), b=7.929109),
+            formula=SkipSoftmaxFormula(
+                formula="exp(log_a + b * target_sparsity)",
+                coefficients={"log_a": math.log(7e-5), "b": 7.929109},
+            ),
         )
         expected = 7e-5 * math.exp(7.929109 * 0.5)
         assert cfg.resolve_threshold_scale_factor() == pytest.approx(expected)
 
     def test_target_sparsity_with_checkpoint_formula(self):
-        cfg = SkipSoftmaxConfig(target_sparsity=0.5)
-        checkpoint = {"a": 7e-5, "b": 7.929109}
+        cfg = SkipSoftmaxAttentionConfig(target_sparsity=0.5)
+        checkpoint = {
+            "formula": "a * exp(b * target_sparsity)",
+            "a": 7e-5,
+            "b": 7.929109,
+        }
         expected = 7e-5 * math.exp(7.929109 * 0.5)
         assert cfg.resolve_threshold_scale_factor(checkpoint) == pytest.approx(expected)
 
     def test_attached_formula_overrides_checkpoint(self):
-        cfg = SkipSoftmaxConfig.with_calibration(
+        cfg = SkipSoftmaxAttentionConfig.with_calibration(
             target_sparsity=0.5,
-            formula=SkipSoftmaxFormula(log_a=math.log(0.001), b=5.0),  # attached
+            formula=SkipSoftmaxFormula(
+                formula="exp(log_a + b * target_sparsity)",
+                coefficients={"log_a": math.log(0.001), "b": 5.0},
+            ),  # attached
         )
-        checkpoint = {"a": 7e-5, "b": 7.929109}  # checkpoint_formula arg (lower priority)
+        # checkpoint_formula arg (lower priority — attached _formula wins)
+        checkpoint = {
+            "formula": "a * exp(b * target_sparsity)",
+            "a": 7e-5,
+            "b": 7.929109,
+        }
         expected = 0.001 * math.exp(5.0 * 0.5)  # attached formula wins
         assert cfg.resolve_threshold_scale_factor(checkpoint) == pytest.approx(expected)
 
     def test_modelopt_checkpoint_formula_format(self):
-        """Test with the actual ModelOpt config.json format."""
-        cfg = SkipSoftmaxConfig(target_sparsity=0.5)
-        # ModelOpt format: sparse_attention_config.threshold_scale_factor.prefill
-        modelopt_prefill = {"a": 7.93, "b": 8.61}
+        """Test with the ModelOpt config.json phase block (formula + coefs)."""
+        cfg = SkipSoftmaxAttentionConfig(target_sparsity=0.5)
+        modelopt_prefill = {
+            "formula": "a * exp(b * target_sparsity)",
+            "a": 7.93,
+            "b": 8.61,
+        }
         expected = 7.93 * math.exp(8.61 * 0.5)
         assert cfg.resolve_threshold_scale_factor(modelopt_prefill) == pytest.approx(expected)
 
     def test_no_threshold_no_sparsity_returns_none(self):
-        cfg = SkipSoftmaxConfig()
+        cfg = SkipSoftmaxAttentionConfig()
         assert cfg.resolve_threshold_scale_factor() is None
 
     def test_target_sparsity_no_formula_raises(self):
-        cfg = SkipSoftmaxConfig(target_sparsity=0.5)
+        cfg = SkipSoftmaxAttentionConfig(target_sparsity=0.5)
         with pytest.raises(ValueError, match="calibration formula"):
             cfg.resolve_threshold_scale_factor()
 
     def test_target_sparsity_zero(self):
-        cfg = SkipSoftmaxConfig.with_calibration(
+        cfg = SkipSoftmaxAttentionConfig.with_calibration(
             target_sparsity=0.0,
-            formula=SkipSoftmaxFormula(log_a=math.log(7e-5), b=7.929109),
+            formula=SkipSoftmaxFormula(
+                formula="exp(log_a + b * target_sparsity)",
+                coefficients={"log_a": math.log(7e-5), "b": 7.929109},
+            ),
         )
         # exp(0) = 1, so result = a
         assert cfg.resolve_threshold_scale_factor() == pytest.approx(7e-5)
 
     def test_target_sparsity_one(self):
-        cfg = SkipSoftmaxConfig.with_calibration(
+        cfg = SkipSoftmaxAttentionConfig.with_calibration(
             target_sparsity=1.0,
-            formula=SkipSoftmaxFormula(log_a=math.log(7e-5), b=7.929109),
+            formula=SkipSoftmaxFormula(
+                formula="exp(log_a + b * target_sparsity)",
+                coefficients={"log_a": math.log(7e-5), "b": 7.929109},
+            ),
         )
         expected = 7e-5 * math.exp(7.929109)
         assert cfg.resolve_threshold_scale_factor() == pytest.approx(expected)
@@ -508,32 +555,32 @@ class TestResolveThresholdScaleFactor:
 
 class TestResolveThreshold:
     def test_no_overrides_returns_default(self):
-        cfg = SkipSoftmaxConfig(threshold_scale_factor=5000.0)
+        cfg = SkipSoftmaxAttentionConfig(threshold_scale_factor=5000.0)
         assert cfg.resolve_threshold("transformer_blocks.5.attn1") == 5000.0
 
     def test_matching_override(self):
-        cfg = SkipSoftmaxConfig.with_calibration(
+        cfg = SkipSoftmaxAttentionConfig.with_calibration(
             threshold_scale_factor=5000.0,
             layer_overrides={"transformer_blocks.0.*": 0},
         )
         assert cfg.resolve_threshold("transformer_blocks.0.attn1") is None  # disabled
 
     def test_non_matching_returns_default(self):
-        cfg = SkipSoftmaxConfig.with_calibration(
+        cfg = SkipSoftmaxAttentionConfig.with_calibration(
             threshold_scale_factor=5000.0,
             layer_overrides={"transformer_blocks.0.*": 0},
         )
         assert cfg.resolve_threshold("transformer_blocks.5.attn1") == 5000.0
 
     def test_override_with_custom_value(self):
-        cfg = SkipSoftmaxConfig.with_calibration(
+        cfg = SkipSoftmaxAttentionConfig.with_calibration(
             threshold_scale_factor=5000.0,
             layer_overrides={"single_transformer_blocks.*": 8000.0},
         )
         assert cfg.resolve_threshold("single_transformer_blocks.10.attn") == 8000.0
 
     def test_first_match_wins(self):
-        cfg = SkipSoftmaxConfig.with_calibration(
+        cfg = SkipSoftmaxAttentionConfig.with_calibration(
             threshold_scale_factor=5000.0,
             layer_overrides={
                 "transformer_blocks.0.*": 0,
@@ -546,7 +593,7 @@ class TestResolveThreshold:
         assert cfg.resolve_threshold("transformer_blocks.5.attn1") == 3000.0
 
     def test_wildcard_patterns(self):
-        cfg = SkipSoftmaxConfig.with_calibration(
+        cfg = SkipSoftmaxAttentionConfig.with_calibration(
             threshold_scale_factor=5000.0,
             layer_overrides={"*.attn2": 0},  # disable all cross-attention
         )
@@ -554,7 +601,7 @@ class TestResolveThreshold:
         assert cfg.resolve_threshold("transformer.blocks.3.attn1") == 5000.0
 
     def test_modelopt_relative_patterns_match_transformer_components(self):
-        cfg = SkipSoftmaxConfig.with_calibration(
+        cfg = SkipSoftmaxAttentionConfig.with_calibration(
             threshold_scale_factor=5000.0,
             layer_overrides={"blocks.0.attn1": 0},
         )
@@ -564,11 +611,11 @@ class TestResolveThreshold:
         assert cfg.resolve_threshold("transformer.blocks.1.attn1") == 5000.0
 
     def test_no_threshold_or_target_returns_none(self):
-        cfg = SkipSoftmaxConfig()
+        cfg = SkipSoftmaxAttentionConfig()
         assert cfg.resolve_threshold("any_layer") is None
 
     def test_target_sparsity_without_formula_raises(self):
-        cfg = SkipSoftmaxConfig(target_sparsity=0.5)
+        cfg = SkipSoftmaxAttentionConfig(target_sparsity=0.5)
         with pytest.raises(ValueError, match="calibration formula"):
             cfg.get_or_resolve_threshold()
         with pytest.raises(ValueError, match="calibration formula"):
@@ -610,12 +657,12 @@ class TestApplySkipSoftmaxOverrides:
 
     def test_no_overrides_returns_zero(self):
         model = self._make_mock_model()
-        cfg = SkipSoftmaxConfig(threshold_scale_factor=5000.0)
+        cfg = SkipSoftmaxAttentionConfig(threshold_scale_factor=5000.0)
         assert apply_skip_softmax_overrides(model, cfg) == 0
 
     def test_overrides_applied(self):
         model = self._make_mock_model()
-        cfg = SkipSoftmaxConfig.with_calibration(
+        cfg = SkipSoftmaxAttentionConfig.with_calibration(
             threshold_scale_factor=5000.0,
             layer_overrides={"block0*": 0, "block2*": 8000.0},
         )
@@ -626,10 +673,16 @@ class TestApplySkipSoftmaxOverrides:
         assert model.block0.attn.sparse_attention_config is None
         # block1: default threshold
         assert model.block1.attn.sparse_attention_config is not None
-        assert model.block1.attn.sparse_attention_config.threshold_scale_factor_prefill == 5000.0
+        assert (
+            model.block1.attn.sparse_attention_config.to_kernel_params().threshold_scale_factor_prefill
+            == 5000.0
+        )
         # block2: overridden to 8000
         assert model.block2.attn.sparse_attention_config is not None
-        assert model.block2.attn.sparse_attention_config.threshold_scale_factor_prefill == 8000.0
+        assert (
+            model.block2.attn.sparse_attention_config.to_kernel_params().threshold_scale_factor_prefill
+            == 8000.0
+        )
 
     def test_overrides_applied_to_compiled_module_names(self):
         from unittest.mock import MagicMock
@@ -656,7 +709,7 @@ class TestApplySkipSoftmaxOverrides:
                 self.blocks = nn.ModuleList([MockCompiledBlock()])
 
         model = MockModel()
-        cfg = SkipSoftmaxConfig.with_calibration(
+        cfg = SkipSoftmaxAttentionConfig.with_calibration(
             threshold_scale_factor=5000.0,
             layer_overrides={"blocks.0.attn1": 0},
         )
@@ -695,7 +748,7 @@ class TestApplySkipSoftmaxOverrides:
                 self.transformer_2 = MockTransformer()
 
         model = MockPipeline()
-        cfg = SkipSoftmaxConfig.with_calibration(
+        cfg = SkipSoftmaxAttentionConfig.with_calibration(
             threshold_scale_factor=5000.0,
             layer_overrides={"blocks.0.attn1": 0},
         )
@@ -729,27 +782,35 @@ class TestApplySkipSoftmaxOverrides:
                 self.transformer_2 = MockTransformer()
 
         model = MockPipeline()
-        cfg = SkipSoftmaxConfig.with_calibration(
+        cfg = SkipSoftmaxAttentionConfig.with_calibration(
             component_configs={
-                "transformer": SkipSoftmaxConfig.with_calibration(
+                "transformer": SkipSoftmaxAttentionConfig.with_calibration(
                     target_sparsity=0.5,
-                    formula=SkipSoftmaxFormula(log_a=-10.0, b=2.0),
+                    formula=SkipSoftmaxFormula(
+                        formula="exp(log_a + b * target_sparsity)",
+                        coefficients={"log_a": -10.0, "b": 2.0},
+                    ),
                 ),
-                "transformer_2": SkipSoftmaxConfig.with_calibration(
+                "transformer_2": SkipSoftmaxAttentionConfig.with_calibration(
                     target_sparsity=0.5,
-                    formula=SkipSoftmaxFormula(log_a=-20.0, b=4.0),
+                    formula=SkipSoftmaxFormula(
+                        formula="exp(log_a + b * target_sparsity)",
+                        coefficients={"log_a": -20.0, "b": 4.0},
+                    ),
                 ),
             }
         )
         n = apply_skip_softmax_overrides(model, cfg)
         assert n == 2
-        assert model.transformer.blocks[
-            0
-        ].attn.sparse_attention_config.threshold_scale_factor_prefill == pytest.approx(
-            math.exp(-10.0 + 2.0 * 0.5)
+        assert (
+            model.transformer.blocks[0]
+            .attn.sparse_attention_config.to_kernel_params()
+            .threshold_scale_factor_prefill
+            == pytest.approx(math.exp(-10.0 + 2.0 * 0.5))
         )
-        assert model.transformer_2.blocks[
-            0
-        ].attn.sparse_attention_config.threshold_scale_factor_prefill == pytest.approx(
-            math.exp(-20.0 + 4.0 * 0.5)
+        assert (
+            model.transformer_2.blocks[0]
+            .attn.sparse_attention_config.to_kernel_params()
+            .threshold_scale_factor_prefill
+            == pytest.approx(math.exp(-20.0 + 4.0 * 0.5))
         )
