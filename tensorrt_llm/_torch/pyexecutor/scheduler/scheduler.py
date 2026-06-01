@@ -1,3 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import dataclasses
 import inspect
 from abc import ABC, abstractmethod
@@ -49,17 +64,49 @@ def _call_with_optional_summary(
     return fn(*args, cached_summary=cached_summary)
 
 
-SchedulerOutput = namedtuple(
-    "SchedulerOutput",
-    [
-        "encoder_requests",
-        "context_requests",
-        "generation_requests",
-        "paused_requests",
-        "fitting_disagg_gen_init_requests",
-        "num_fitting_requests",
-    ],
-)
+class SchedulerOutput(
+    namedtuple(
+        "_SchedulerOutputBase",
+        [
+            "encoder_requests",
+            "context_requests",
+            "generation_requests",
+            "paused_requests",
+            "fitting_disagg_gen_init_requests",
+            "num_fitting_requests",
+            "recompute_paused_requests",
+        ],
+    )
+):
+    """Scheduler result.
+
+    ``recompute_paused_requests`` is V2-only and defaults to an empty list so
+    existing V1 schedulers can keep constructing the original six-field
+    output.
+    """
+
+    __slots__ = ()
+
+    def __new__(
+        cls,
+        encoder_requests: RequestList,
+        context_requests: RequestList,
+        generation_requests: RequestList,
+        paused_requests: RequestList,
+        fitting_disagg_gen_init_requests: RequestList,
+        num_fitting_requests: int,
+        recompute_paused_requests: RequestList | None = None,
+    ):
+        return super(SchedulerOutput, cls).__new__(
+            cls,
+            encoder_requests,
+            context_requests,
+            generation_requests,
+            paused_requests,
+            fitting_disagg_gen_init_requests,
+            num_fitting_requests,
+            [] if recompute_paused_requests is None else recompute_paused_requests,
+        )
 
 
 def is_decoder_context_request_waiting_for_encoder_output(req: LlmRequest) -> bool:
@@ -131,7 +178,9 @@ class ScheduledRequests:
     generation_requests: RequestList
     """Requests that are in the generation phase."""
     paused_requests: RequestList
-    """Requests that are paused."""
+    """Requests whose KV cache was suspended without resetting request state."""
+    recompute_paused_requests: RequestList
+    """Requests that must release resources and restart from context."""
 
     def __init__(self):
         self.encoder_requests: RequestList = []
@@ -139,6 +188,7 @@ class ScheduledRequests:
         self.context_requests_last_chunk: RequestList = []
         self.generation_requests: RequestList = []
         self.paused_requests: RequestList = []
+        self.recompute_paused_requests: RequestList = []
 
     @property
     def is_generation_only(self) -> bool:
@@ -237,6 +287,8 @@ class SerializableSchedulerOutput:
     ]  # request ids of fitting disaggregated generation initialization requests
     num_fitting_requests: int  # number of fitting requests
     wait_for_disagg_gen_transfer_progress: bool = False
+    recompute_paused_requests: list[int] = dataclasses.field(default_factory=list)
+    """Request ids of recompute-paused requests."""
 
     @classmethod
     def from_scheduler_result(
@@ -261,6 +313,9 @@ class SerializableSchedulerOutput:
             ],
             num_fitting_requests=num_fitting_requests,
             wait_for_disagg_gen_transfer_progress=wait_for_disagg_gen_transfer_progress,
+            recompute_paused_requests=[
+                req.request_id for req in scheduled_requests.recompute_paused_requests
+            ],
         )
 
     def to_scheduler_result(
@@ -282,6 +337,9 @@ class SerializableSchedulerOutput:
         ]
         scheduled_requests.paused_requests = [
             id_to_request[req_id] for req_id in self.paused_requests
+        ]
+        scheduled_requests.recompute_paused_requests = [
+            id_to_request[req_id] for req_id in self.recompute_paused_requests
         ]
         fitting_disagg_gen_init_requests = [
             id_to_request[req_id] for req_id in self.fitting_disagg_gen_init_requests
