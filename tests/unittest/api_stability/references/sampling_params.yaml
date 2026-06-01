@@ -22,5 +22,11 @@ methods:
       logprobs_mode:
         annotation: LogprobMode
         default: LogprobMode.RAW
+      logprobs_simple_format:
+        annotation: bool
+        default: false
+      prompt_logprobs_simple_format:
+        annotation: bool
+        default: false
     return_annotation: None
 properties: {}
