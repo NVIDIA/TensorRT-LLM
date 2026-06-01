@@ -246,6 +246,12 @@ def parse_args():
         help="Ring Attention parallel size. Cannot be combined with --attn2d_row_size / --attn2d_col_size.",
     )
     parser.add_argument(
+        "--tp_size",
+        type=int,
+        default=1,
+        help="TP group size",
+    )
+    parser.add_argument(
         "--parallel_vae_size",
         type=int,
         default=1,
@@ -386,6 +392,7 @@ def main():
             "ulysses_size": args.ulysses_size,
             "ring_size": args.ring_size,
             "attn2d_size": (args.attn2d_row_size, args.attn2d_col_size),
+            "tp_size": args.tp_size,
             "parallel_vae_size": args.parallel_vae_size,
         },
         torch_compile_config={

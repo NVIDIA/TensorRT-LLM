@@ -46,7 +46,10 @@ __global__ void fusedDiTSplitNormFullDimRopeKernel(__nv_bfloat16* __restrict__ t
     constexpr int THREADS_PER_ROW = BLOCK_SIZE / ROWS_PER_BLOCK; // 128
     constexpr int WARPS_PER_ROW = THREADS_PER_ROW / 32;          // 4
     constexpr int CHUNK_ELEMS = 8;                               // uint4 = 8 bf16
-    constexpr int MAX_N = 32 * HEAD_DIM;
+    // MAX_N = max(num_heads) * HEAD_DIM. 64 covers WAN-14B (40 heads) and any
+    // future ≤64-head model; matches the cap of the packed fused_dit_qk_norm_rope
+    // full-dim template. SMEM budget at 64h × 128 stays well within B200's 227 KB.
+    constexpr int MAX_N = 64 * HEAD_DIM;
     constexpr int MAX_CHUNKS = (MAX_N + THREADS_PER_ROW * CHUNK_ELEMS - 1) / (THREADS_PER_ROW * CHUNK_ELEMS);
 
 #if (defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900)
@@ -288,8 +291,9 @@ void launchFusedDiTSplitNormFullDimRope(void* tensor, int num_tokens, int num_he
     void const* weight, void const* cos_emb, void const* sin_emb, bool interleave, bool per_head_cos, bool cos_is_bf16,
     int cos_seq_per_batch, cudaStream_t stream)
 {
-    TLLM_CHECK_WITH_INFO(num_heads <= 32,
-        "fusedDiTSplitNormFullDimRope: num_heads (%d) must be <= 32 (block_size = num_heads*32 <= 1024)", num_heads);
+    // num_heads cap is SMEM/register driven (MAX_N = 64 * HEAD_DIM in the kernel template),
+    // NOT block_size — the launcher uses a fixed blockDim=256 with 2 rows/CTA.
+    TLLM_CHECK_WITH_INFO(num_heads <= 64, "fusedDiTSplitNormFullDimRope: num_heads (%d) must be <= 64", num_heads);
     TLLM_CHECK_WITH_INFO(num_heads >= 1, "fusedDiTSplitNormFullDimRope: num_heads must be >= 1, got %d", num_heads);
 
     int const N = num_heads * head_dim;

@@ -66,6 +66,7 @@ from .mamba_cache_manager import (BaseMambaCacheManager,
 from .model_engine import ModelEngine
 from .perf_metrics_manager import PerfMetricsManager
 from .request_utils import (RequestBroadcaster, attach_py_objects_to_requests,
+                            derive_attention_dp_per_rank_request_cap,
                             get_from_waiting_queue, merge_requests)
 from .resource_manager import (KVCacheManagerV2, ResourceManager,
                                ResourceManagerType, request_context)
@@ -417,6 +418,28 @@ class PyExecutor:
         self.max_input_len = max_input_len
         # _executor_loop private data
         self.max_num_active_requests = model_engine.get_max_num_sequences()
+        # nvbug-6133201: under attention DP, tighten the per-rank request
+        # cap so per-rank gen-phase step-token load cannot exceed
+        # max_num_tokens. No-op for correctly-sized configs.
+        if self.enable_attention_dp:
+            derived_cap = derive_attention_dp_per_rank_request_cap(
+                base_cap=self.max_num_active_requests,
+                max_num_tokens=self.max_num_tokens,
+                max_total_draft_tokens=self.max_total_draft_tokens,
+            )
+            if derived_cap < self.max_num_active_requests:
+                step_tokens_per_req = 1 + max(self.max_total_draft_tokens, 0)
+                required_max_num_tokens = (self.max_num_active_requests *
+                                           step_tokens_per_req)
+                logger.warning(
+                    f"[PyExecutor] enable_attention_dp: max_num_tokens="
+                    f"{self.max_num_tokens} cannot fit max_batch_size="
+                    f"{self.max_num_active_requests} at {step_tokens_per_req} "
+                    f"step-tokens each; capping per-rank max_num_active_requests "
+                    f"to {derived_cap}. Raise max_num_tokens to "
+                    f"{required_max_num_tokens} to run at the declared "
+                    f"max_batch_size.")
+            self.max_num_active_requests = derived_cap
         self.active_requests: List[LlmRequest] = []
         self.expected_num_active_requests = 0
         # TODO: Remove PP size == 1 gate for disagg + block reuse with PP > 1.
@@ -578,6 +601,15 @@ class PyExecutor:
             getattr(self.llm_args, 'kv_cache_config', None),
             'iteration_stats_interval', 1)
         self._adp_iter_stats = ADPIterStatsBuffer()
+        # Per-loop CPU wall and GPU forward time captured by the profile_step
+        # closure (see _profiler). Populated whenever enable_iter_perf_stats or
+        # print_iter_log is on so the /metrics serializer can read them
+        # without depending on the log line. host_step_time describes the loop
+        # body that just finished; prev_device_step_time is the GPU forward
+        # time read via the ping-pong CUDA event pair (lags host by one loop
+        # under steady state — see ping-pong comment in _profiler).
+        self._latest_host_step_time_ms: Optional[float] = None
+        self._latest_prev_device_step_time_ms: Optional[float] = None
         self.gather_all_responses = False
 
         self.kv_cache_transceiver = kv_cache_transceiver
@@ -591,6 +623,10 @@ class PyExecutor:
         # normal dummy add-forward-terminate lifecycle handles taper-down.
         # Only relevant in benchmark disagg mode; False otherwise.
         self._benchmark_fill_phase_active = self.is_benchmark_disagg
+        # Slow-start admission cap for benchmark disagg fill (see
+        # _pop_from_waiting_queue).  0 = uninitialised; first throttled iter
+        # seeds it to tp_size and each subsequent iter doubles it.
+        self._fill_admit_cap: int = 0
 
         # Initialize disagg PP termination handler if needed
         self._disagg_pp_termination_handler = None
@@ -932,6 +968,16 @@ class PyExecutor:
         for manager in self.resource_manager.resource_managers.values():
             if manager:
                 manager.shutdown()
+        # Note: do NOT call engine.cleanup() here. PyExecutor.shutdown() is
+        # also invoked mid-init by configure_kv_cache_capacity() in
+        # tensorrt_llm/_torch/pyexecutor/_util.py — the warmup pass calls
+        # shutdown() and then immediately reads model_engine.model.model_config
+        # to compute kv_cache_max_memory. cleanup() would set
+        # model_engine.model = None, breaking that read with
+        # `'NoneType' object has no attribute 'model_config'`.
+        # The engine's __del__ still calls cleanup() at terminal teardown
+        # (when the executor's reference is dropped), which is sufficient for
+        # the GMS daemon registry eviction the cleanup hook was added for.
         del self.model_engine
         if self.draft_model_engine is not None:
             del self.draft_model_engine
@@ -1081,8 +1127,15 @@ class PyExecutor:
                 calibrator.stop()
                 enabled = False
 
-            if start_time is not None and self.print_log and (
-                    log_all_ranks or self.dist.rank in log_ranks):
+            # Capture per-loop timing whenever stats or the iter log are
+            # enabled. The reading of the OTHER parity's event pair (the
+            # ping-pong) is what keeps synchronize() from blocking the GPU
+            # — the events being read have already passed by the time we
+            # read them. Stashing on self lets the /metrics serializer pick
+            # up the values without going through the log line.
+            should_capture_timing = start_time is not None and (
+                self.print_log or self.enable_iter_perf_stats)
+            if should_capture_timing:
                 end_time = time.time()
                 if it % 2 == 0:
                     end_event_1.record()
@@ -1097,24 +1150,35 @@ class PyExecutor:
                         prev_device_step_time = start_event_1.elapsed_time(
                             end_event_1)
 
-                if prev_device_step_time is None:
-                    prev_device_step_time = "N/A"  # Handle first iteration
-                else:
-                    prev_device_step_time = f"{prev_device_step_time}ms"
                 host_step_time = (end_time - start_time) * 1000  # milliseconds
-                formatted_timestamp = datetime.datetime.now().strftime(
-                    "%Y-%m-%d %H:%M:%S")
-                logger.info(
-                    f"iter = {self.iter_counter}, "
-                    f"global_rank = {self.global_rank}, "
-                    f"rank = {self.dist.rank}, "
-                    f"currank_total_requests = {self.num_fetch_requests_cur_rank}/"
-                    f"{self.num_fetch_requests}, "
-                    f"host_step_time = {host_step_time}ms, "
-                    f"prev_device_step_time = {prev_device_step_time}, "
-                    f"timestamp = {formatted_timestamp}, "
-                    f"num_scheduled_requests: {self.num_scheduled_requests}, "
-                    f"states = {self.model_engine.iter_states}")
+                self._latest_host_step_time_ms = host_step_time
+                self._latest_prev_device_step_time_ms = prev_device_step_time
+
+                if self.print_log and (log_all_ranks
+                                       or self.dist.rank in log_ranks):
+                    if prev_device_step_time is None:
+                        prev_device_step_time_str = "N/A"  # Handle first iteration
+                    else:
+                        prev_device_step_time_str = f"{prev_device_step_time}ms"
+                    kv_util_str = "N/A"
+                    if self.kv_cache_manager is not None:
+                        kv_stats = self.kv_cache_manager.get_kv_cache_stats()
+                        if kv_stats.max_num_blocks > 0:
+                            kv_util_str = f"{1.0 - kv_stats.free_num_blocks / kv_stats.max_num_blocks:.3f}"
+                    formatted_timestamp = datetime.datetime.now().strftime(
+                        "%Y-%m-%d %H:%M:%S")
+                    logger.info(
+                        f"iter = {self.iter_counter}, "
+                        f"global_rank = {self.global_rank}, "
+                        f"rank = {self.dist.rank}, "
+                        f"num_scheduled_requests = {self.num_scheduled_requests}, "
+                        f"kv_cache_util = {kv_util_str}, "
+                        f"currank_total_requests = {self.num_fetch_requests_cur_rank}/"
+                        f"{self.num_fetch_requests}, "
+                        f"host_step_time = {host_step_time}ms, "
+                        f"prev_device_step_time = {prev_device_step_time_str}, "
+                        f"timestamp = {formatted_timestamp}, "
+                        f"states = {self.model_engine.iter_states}")
 
             it += 1
 
@@ -1161,6 +1225,12 @@ class PyExecutor:
     def _get_init_iter_stats(self, num_new_active_requests,
                              new_active_requests_queue_latency_ms):
         stats = IterationStats()
+        # Stamp iter at construction time so the JSON `iter` field identifies
+        # the loop that CONSTRUCTED this batch. Under the overlap and PP
+        # schedulers _process_iter_stats consumes this record in a later
+        # loop, so stamping at consumption time (via self.iter_counter)
+        # would mislabel the record by 1+ iterations.
+        stats.iter = self.iter_counter
         stats.timestamp = datetime.datetime.now().strftime(
             "%m-%d-%Y %H:%M:%S.%f")
 
@@ -1257,7 +1327,11 @@ class PyExecutor:
         stats.cpu_mem_usage = 0
         stats.pinned_mem_usage = 0
 
-        stats.iter = self.iter_counter
+        # NOTE: stats.iter was stamped at construction time in
+        # _get_init_iter_stats. Do NOT re-stamp here from self.iter_counter
+        # — under the overlap and PP schedulers this method runs in a later
+        # loop than the one that built the batch, so the live counter would
+        # mislabel the record.
 
         kv_cache_manager = self.resource_manager.resource_managers.get(
             ResourceManagerType.KV_CACHE_MANAGER)
@@ -1478,7 +1552,9 @@ class PyExecutor:
                            stats: IterationStats,
                            req_stats: Optional[List[RequestStats]] = None,
                            kv_iter_stats: Optional[Dict[int, object]] = None,
-                           attention_dp_rank: Optional[int] = None):
+                           attention_dp_rank: Optional[int] = None,
+                           host_step_time_ms: Optional[float] = None,
+                           prev_device_step_time_ms: Optional[float] = None):
         """Append one iteration's finalized stats to the export buffer.
 
         The normal Attention-DP path fans out rank-local rows before calling
@@ -1490,12 +1566,42 @@ class PyExecutor:
             req_stats: Optional per-request stats.
             kv_iter_stats: Optional KV iteration stats captured with ``stats``.
             attention_dp_rank: Optional ADP rank for fanned-out rank-local rows.
+            host_step_time_ms: Per-loop CPU wall captured by profile_step
+                for the loop that built this batch. Surfaces as
+                ``hostStepTimeMS`` in the /metrics JSON. Always a clean
+                single-loop measurement (matches the log line's
+                ``host_step_time``).
+            prev_device_step_time_ms: GPU forward time captured by the
+                ping-pong CUDA event pair in profile_step. Surfaces as
+                ``prevDeviceStepTimeMS`` in the /metrics JSON. Note the
+                value lags by one loop relative to ``host_step_time_ms``
+                (its sibling on the same record describes a slightly
+                older batch); see _profiler ping-pong comment.
         """
         # Non-ADP appends immediately, so the latest KV stats belong to this
         # IterationStats. ADP appends later and passes the saved iter-matched
         # KV stats explicitly.
         if not self.enable_attention_dp:
             kv_iter_stats = self._latest_kv_iter_stats
+            # Same reasoning for the per-loop timings: non-ADP captures them
+            # at append time. ADP passes the values that were saved with the
+            # IterationStats at queue time.
+            if host_step_time_ms is None:
+                host_step_time_ms = self._latest_host_step_time_ms
+            if prev_device_step_time_ms is None:
+                prev_device_step_time_ms = self._latest_prev_device_step_time_ms
+
+        # Per-record indicator so consumers can interpret iterLatencyMS
+        # without inspecting server config. iterLatencyMS spans ~2 loops
+        # under "overlap" and a clean single loop under "non_overlap"; the
+        # always-clean alternative is hostStepTimeMS.
+        # PP (pp_size > 1) is structurally overlap-style regardless of
+        # disable_overlap_scheduler: _executor_loop_pp queues a BatchStatePP
+        # in iter N and _process_previous_batch_pp consumes it in a later
+        # loop, so iterLatencyMS spans ~2 loops there too.
+        is_overlap_like = (not self.disable_overlap_scheduler
+                           or self.dist.pp_size > 1)
+        scheduler_mode = "overlap" if is_overlap_like else "non_overlap"
 
         tp_size = getattr(self.dist, "tp_size", 1)
         gather_all_ranks = os.environ.get("TLLM_METRICS_ALL_RANKS", "0") == "1"
@@ -1535,6 +1641,11 @@ class PyExecutor:
                     }
                     for window_size, s in kv_iter_stats.items()
                 }
+            if host_step_time_ms is not None:
+                local_dict["hostStepTimeMS"] = host_step_time_ms
+            if prev_device_step_time_ms is not None:
+                local_dict["prevDeviceStepTimeMS"] = prev_device_step_time_ms
+            local_dict["schedulerMode"] = scheduler_mode
             local_dict["rank"] = self.dist.tp_rank
 
             gathered = self.dist.tp_allgather(local_dict)
@@ -1556,11 +1667,21 @@ class PyExecutor:
             return
 
         # Legacy path: rank-0-only (single-rank or iter stats disabled).
+        # Tuple layout (length is sniffed by _stats_serializer with
+        # len() > N guards so older 4-tuples remain readable):
+        #   [0] stats: IterationStats
+        #   [1] req_stats: Optional[List[RequestStats]]
+        #   [2] kv_iter_stats: Optional[Dict[int, KvCacheIterationStats]]
+        #   [3] attention_dp_rank: Optional[int]
+        #   [4] host_step_time_ms: Optional[float]
+        #   [5] prev_device_step_time_ms: Optional[float]
+        #   [6] scheduler_mode: "overlap" | "non_overlap"
         with self.stats_lock:
             if len(self.stats) > self.max_stats_len:
                 self.stats.pop(0)
             self.stats.append(
-                (stats, req_stats, kv_iter_stats, attention_dp_rank))
+                (stats, req_stats, kv_iter_stats, attention_dp_rank,
+                 host_step_time_ms, prev_device_step_time_ms, scheduler_mode))
 
     def _process_iter_stats(
         self,
@@ -1571,9 +1692,30 @@ class PyExecutor:
     ):
         """All ranks: build local stats; ADP queues them for later fanout."""
         iter_end_time = time.time()
+        # iterLatencyMS semantics differ by scheduler:
+        # - Overlap / PP: batch_state.iter_start_time was captured at the top
+        #   of the loop that BUILT this batch (one or more loops ago). The
+        #   end timestamp is taken here, during the consuming loop. So
+        #   iter_latency_ms spans roughly two loops and tracks the batch's
+        #   full lifecycle, not the loop body that produced it. Under steady
+        #   state, sum(iterLatencyMS) ≈ 2 × wall_time.
+        # - Non-overlap: iter_start_time was captured at the top of THIS
+        #   loop and the end is taken at the bottom of the same loop, so
+        #   iterLatencyMS is the clean per-loop CPU wall.
+        # The always-clean alternative is host_step_time_ms (set on every
+        # IterationStats record); the per-record schedulerMode field tells
+        # consumers which interpretation applies.
         iter_latency_ms = (iter_end_time - batch_state.iter_start_time) * 1e3
         if batch_state.iter_stats is None:
             return
+
+        # Snapshot the per-loop CPU and GPU timings captured by the most
+        # recent profile_step. These belong to the loop that BUILT this
+        # batch (host wall) and the loop one earlier than that for the GPU
+        # forward (per the ping-pong design). Save them now so the values
+        # ride along with the IterationStats through any ADP fanout delay.
+        host_step_time_ms = self._latest_host_step_time_ms
+        prev_device_step_time_ms = self._latest_prev_device_step_time_ms
 
         req_stats = self._populate_req_stats(
             finished_requests, active_requests,
@@ -1586,12 +1728,19 @@ class PyExecutor:
                                         batch_state.scheduled_requests,
                                         micro_batch_id)
         if self.enable_attention_dp:
-            self._adp_iter_stats.queue(stats,
-                                       req_stats,
-                                       kv_iter_stats=self._latest_kv_iter_stats,
-                                       is_rank0=self.dist.rank == 0)
+            self._adp_iter_stats.queue(
+                stats,
+                req_stats,
+                kv_iter_stats=self._latest_kv_iter_stats,
+                is_rank0=self.dist.rank == 0,
+                host_step_time_ms=host_step_time_ms,
+                prev_device_step_time_ms=prev_device_step_time_ms)
         else:
-            self._append_iter_stats(stats, req_stats)
+            self._append_iter_stats(
+                stats,
+                req_stats,
+                host_step_time_ms=host_step_time_ms,
+                prev_device_step_time_ms=prev_device_step_time_ms)
 
     def _executor_loop_cleanup(self):
 
@@ -2471,6 +2620,7 @@ class PyExecutor:
                 scheduled_batch)
             if can_forward:
                 self._benchmark_fill_phase_active = False
+                self._fill_admit_cap = 0
             else:
                 time.sleep(0.1)
                 return can_forward, True
@@ -3207,15 +3357,14 @@ class PyExecutor:
 
         max_new_requests = total_max - total_num_active_requests
 
-        # Benchmark disagg fill-phase admission throttle: a preloaded queue
-        # (concurrency == total_max) would otherwise pop all requests into
-        # DISAGG_GENERATION_INIT in one iter, tripping PR #12206's fail-fast
-        # under ADP-router imbalance and growing the recv-buffer fallback
-        # faster than transfers drain.  Cap at `tp_size` (≈ pre-#12208
-        # blocking fill rate).  Verified on Kimi-K2 8k1k ctx8/gen1 con=8192.
+        # Benchmark disagg fill-phase admission throttle (slow-start ramp).
         if (self.is_benchmark_disagg and self._benchmark_fill_phase_active
                 and not self.is_warmup):
-            max_new_requests = min(max_new_requests, self.dist.tp_size)
+            if self._fill_admit_cap == 0:
+                self._fill_admit_cap = self.dist.tp_size
+            else:
+                self._fill_admit_cap = min(self._fill_admit_cap * 2, total_max)
+            max_new_requests = min(max_new_requests, self._fill_admit_cap)
 
         return get_from_waiting_queue(
             waiting_queue,
@@ -3253,7 +3402,10 @@ class PyExecutor:
                         record.stats,
                         record.req_stats,
                         kv_iter_stats=record.kv_iter_stats,
-                        attention_dp_rank=record.attention_dp_rank)
+                        attention_dp_rank=record.attention_dp_rank,
+                        host_step_time_ms=record.host_step_time_ms,
+                        prev_device_step_time_ms=record.prev_device_step_time_ms
+                    )
             all_ranks_num_active_requests = [
                 s.num_active_requests for s in all_rank_states
             ]
@@ -3940,8 +4092,11 @@ class PyExecutor:
             num_accepted_tokens_device: Optional[torch.Tensor] = None):
         ExpertStatistic.set_iter(self.iter_counter)
 
+        num_ctx_tokens = sum(req.context_chunk_size
+                             for req in scheduled_requests.context_requests)
+
         @nvtx_range(
-            f"[Executor] _forward_step {self.iter_counter}: {scheduled_requests.num_context_requests} ctx reqs, {scheduled_requests.num_generation_requests} gen reqs"
+            f"[Executor] _forward_step {self.iter_counter}: {scheduled_requests.num_context_requests} ctx reqs, {num_ctx_tokens} ctx tokens, {scheduled_requests.num_generation_requests} gen reqs"
         )
         def forward(scheduled_requests, resource_manager, new_tensors_device,
                     gather_context_logits, cache_indirection_buffer,

@@ -12,9 +12,10 @@ Visual generation models based on diffusion transformers (DiT) have become the s
 TensorRT-LLM **VisualGen** provides a unified inference stack for diffusion models, with a pipeline architecture separate from the LLM inference path. Key capabilities include:
 
 - A shared pipeline abstraction covering the denoising loop, guidance strategies, and component loading.
-- Pluggable attention backends (PyTorch SDPA and TRT-LLM optimized kernels).
+- Pluggable attention backends: PyTorch SDPA (`VANILLA`), TRT-LLM kernels (`TRTLLM`), TRT-LLM CuTe DSL kernels (`CUTEDSL`, Blackwell-class GPUs), and Flash Attention 4 (`FA4`).
 - Quantization support (dynamic and static) using the [ModelOpt](https://github.com/NVIDIA/TensorRT-Model-Optimizer) configuration format.
-- Multi-GPU parallelism (CFG parallel, Ulysses sequence parallel).
+- Quantized attention support: `QK16PV8` to quantize Bmm2 on `CUTEDSL`, `SAGE` to run SageAttention on `TRTLLM` (requires Blackwell SM100).
+- Multi-GPU parallelism (CFG parallel, Ulysses sequence parallel, Tensor parallelism).
 - **TeaCache** — a runtime caching optimization that skips transformer steps when timestep embeddings change slowly.
 - `trtllm-serve` integration with OpenAI-compatible API endpoints for image and video generation.
 
@@ -37,13 +38,13 @@ Models are auto-detected from the checkpoint directory. Diffusers-format models 
 
 ### Feature Matrix
 
-| Model | FP8 blockwise | NVFP4 | TeaCache | CFG Parallelism | Ulysses Parallelism | Parallel VAE | CUDA Graph | torch.compile | trtllm-serve | Attention2D | Ring Attention |
-|---|---|---|---|---|---|---|---|---|---|--|--|
-| **FLUX.1** | Yes | Yes | Yes | No [^1] | Yes | No | Yes | Yes | Yes | Yes | Yes |
-| **FLUX.2** | Yes | Yes | Yes | No [^1] | Yes | No | Yes | Yes | Yes | Yes | Yes |
-| **Wan 2.1** | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes |
-| **Wan 2.2** | Yes | Yes | No | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes |
-| **LTX-2** | Yes | Yes | No | Yes | Yes | No | No | Yes | Yes | Yes | Yes |
+| Model | FP8 blockwise | NVFP4 | TeaCache | CFG Parallelism | Ulysses Parallelism | Parallel VAE | CUDA Graph | torch.compile | trtllm-serve | Attention2D | Ring Attention | Tensor Parallelism |
+|---|---|---|---|---|---|---|---|---|---|--|--|--|
+| **FLUX.1** | Yes | Yes | Yes | No [^1] | Yes | No | Yes | Yes | Yes | Yes | Yes | Yes |
+| **FLUX.2** | Yes | Yes | Yes | No [^1] | Yes | No | Yes | Yes | Yes | Yes | Yes | Yes |
+| **Wan 2.1** | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes |
+| **Wan 2.2** | Yes | Yes | No | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes |
+| **LTX-2** | Yes | Yes | No | Yes | Yes | No | No | Yes | Yes | Yes | Yes | No |
 
 [^1]: FLUX models use embedded guidance and do not have a separate negative prompt path, so CFG parallelism is not applicable.
 
@@ -107,6 +108,52 @@ args = VisualGenArgs(
 )
 ```
 
+### Quantized Attention
+
+In addition to linear-layer quantization, VisualGen exposes two **attention-level** quantization presets that operate inside the attention kernel. They are configured through `AttentionConfig.quant_attention_config` (or the `--quant_attention_mode` flag in the example scripts) and are mutually exclusive with each other.
+
+- **QK16PV8** (`CUTEDSL` backend): Keeps Q & K in BF16 and quantizes only V to FP8 (E4M3, per-tensor), thus Bmm1 will be carried out in BF16 with Bmm2 in FP8. Targets Blackwell-class GPUs (`sm_100a` / `sm_103a`) with `head_dim = 128`.
+- **SAGE** (`TRTLLM` backend): Quantizes Q, K, and V with per-block scaling factors. Q/K are stored as INT8 or FP8 (e4m3) and V as FP8 (e4m3); block sizes are tunable per axis (typically `(q, k, v) = (1, 4, 1)` for Wan-1.3B and `(1, 16, 1)` for larger Wan / FLUX checkpoints). Supported recipes are validated at runtime.
+
+
+Python API for SageAttention:
+
+```python
+from tensorrt_llm import VisualGenArgs
+
+args = VisualGenArgs(
+    model="Wan-AI/Wan2.1-T2V-1.3B-Diffusers",
+    attention_config={
+        "backend": "TRTLLM",
+        "quant_attention_config": {
+            "qk_dtype": "int8",
+            "q_block_size": 1,
+            "k_block_size": 16,
+            "v_block_size": 1,
+        },
+    },
+)
+```
+
+Python API for QK16PV8:
+
+```python
+from tensorrt_llm import VisualGenArgs
+
+args = VisualGenArgs(
+    model="Wan-AI/Wan2.1-T2V-1.3B-Diffusers",
+    attention_config={
+        "backend": "CUTEDSL",
+        "quant_attention_config": {
+            "qk_dtype": "bf16",
+            "q_block_size": 0,
+            "k_block_size": 0,
+            "v_block_size": 0,
+        },
+    },
+)
+```
+
 ### TeaCache
 
 TeaCache caches transformer outputs when timestep embeddings change slowly between denoising steps, skipping redundant computation. Enable via `VisualGenArgs.cache_config` (YAML or programmatic):
@@ -121,14 +168,15 @@ The `teacache_thresh` parameter controls the similarity threshold. Cache-DiT is 
 
 ### Multi-GPU Parallelism
 
-5 parallelism modes can be combined:
+6 parallelism modes can be combined:
 
 - **CFG Parallelism** (`--cfg_size 2`): Splits positive/negative guidance prompts across GPUs.
 - **Ulysses Parallelism** (`--ulysses_size N`): Splits the sequence dimension across GPUs for longer sequences.
 - **Parallel VAE** (`--parallel_vae_size N`): Shards the final VAE decode along a spatial axis across GPUs, useful to reduce VAE latency and improve GPU utilization (Constraint: `parallel_vae_size ≤ world_size`). Currently only supported for WAN models.
-- **Attention Parallel**: There are 2 methods supported to run attention parallel. Both of these methods require the attention backend to support LSE (only FA4 currently) - 
+- **Attention Parallel**: There are 2 methods supported to run attention parallel. Both of these methods require the attention backend to support LSE (`FA4` and `CUTEDSL`) - 
     - **Attention2D Parallelism** (`--attn2d_row_size N`, `--attn2d_col_size M`): Shards the sequence axis across a 2D `N x M` device mesh, all-gathering Q along rows and K/V along columns so each rank computes a sub-block of the attention matrix (total CP degree = `N * M`; not currently combinable with Ulysses).
     - **Ring Attention Parallelism** (`--ring_size N`): Shards the sequence axis across a 1D ring of `N` ranks and streams K/V blocks around the ring so each rank computes its attention output without materializing the full K/V (mutually exclusive with Attention2D).
+- **Tensor Parallelism** (`--tp_size N`): Splits attention heads and transformer MLPs across GPUs for faster compute and reduced memory usage.
 ## Developer Guide
 
 ### Architecture Overview

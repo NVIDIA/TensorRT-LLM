@@ -1052,6 +1052,13 @@ class KimiK25InputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyInp
             config, "media_placeholder_token_id", _MEDIA_PLACEHOLDER_TOKEN_ID
         )
 
+        # transformers 5.5.x ``AutoTokenizer`` may route K2.5 to the Rust
+        # fast backend, which BPE-splits ``<|media_pad|>`` / ``<|im_user|>``
+        # / etc. instead of mapping them to their canonical IDs. Force the
+        # K2.5 slow ``TikTokenTokenizer`` for deterministic tokenization.
+        # See NVBug 6182617.
+        self._ensure_k25_slow_tokenizer()
+
     @property
     def config(self) -> PretrainedConfig:
         return self._config
@@ -1168,8 +1175,37 @@ class KimiK25InputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyInp
                 total_tokens += self.get_num_tokens_per_image(image=chunk[0])
         return total_tokens
 
+    def _ensure_k25_slow_tokenizer(self) -> None:
+        """Override ``self._tokenizer`` and ``self._processor.tokenizer``
+        with the model's slow ``TikTokenTokenizer``.
+
+        Done unconditionally because transformers 5.5.x's ``AutoTokenizer``
+        sometimes returns a Rust fast backend that BPE-splits K2.5 special
+        tokens instead of preserving their canonical IDs. The slow class'
+        ``tokens_trie`` always splits them correctly. See NVBug 6182617.
+        """
+        from transformers.dynamic_module_utils import get_class_from_dynamic_module
+
+        slow_cls = get_class_from_dynamic_module(
+            "tokenization_kimi.TikTokenTokenizer",
+            self._model_path,
+        )
+        slow_tok = slow_cls.from_pretrained(self._model_path, trust_remote_code=True)
+
+        logger.info(
+            "K2.5 InputProcessor forcing slow TikTokenTokenizer "
+            "(originally %s). See NVBug 6182617.",
+            type(self._tokenizer).__name__,
+        )
+
+        self._tokenizer = slow_tok
+        # Image-only path uses ``self._processor.tokenizer`` (an
+        # independent instance from ``AutoProcessor``); swap it too.
+        if getattr(self._processor, "tokenizer", None) is not None:
+            self._processor.tokenizer = slow_tok
+
     @torch.inference_mode()
-    def __call__(
+    def call_with_text_prompt(
         self,
         inputs: TextPrompt,
         sampling_params: SamplingParams,

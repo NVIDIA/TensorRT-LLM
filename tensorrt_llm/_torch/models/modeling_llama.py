@@ -1305,7 +1305,7 @@ class Llama4InputProcessor(BaseMultimodalInputProcessor,
     def dtype(self) -> torch.dtype:
         return self._dtype
 
-    def attach_multimodal_embeddings(
+    def _attach_multimodal_embeddings_impl(
         self, inputs: TextPrompt, multimodal_embedding: Dict[str,
                                                              List[Dict[str,
                                                                        Any]]],
@@ -1434,7 +1434,7 @@ class Llama4InputProcessor(BaseMultimodalInputProcessor,
         return token_ids.tolist(), {"multimodal_data": multimodal_data}
 
     @torch.inference_mode()
-    def __call__(
+    def call_with_text_prompt(
         self, inputs: TextPrompt, sampling_params: SamplingParams
     ) -> Tuple[List[int], Optional[ExtraProcessedInputs]]:
         text_prompt, mm_data = inputs.get("prompt"), inputs.get(

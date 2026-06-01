@@ -1757,6 +1757,18 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
 
     @pytest.mark.skip_less_device_memory(60000)
     @parametrize_with_ids("enable_chunked_prefill", [False, True])
+    def test_bfloat16_flashinfer(self, enable_chunked_prefill):
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.75)
+        with LLM(self.MODEL_PATH,
+                 kv_cache_config=kv_cache_config,
+                 attn_backend="FLASHINFER",
+                 enable_chunked_prefill=enable_chunked_prefill,
+                 max_num_tokens=512 if enable_chunked_prefill else 8192) as llm:
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+
+    @pytest.mark.skip_less_device_memory(60000)
+    @parametrize_with_ids("enable_chunked_prefill", [False, True])
     @parametrize_with_ids("attention_dp,cuda_graph,overlap_scheduler",
                           [(False, False, False), (True, True, True)])
     @parametrize_with_ids("mtp_nextn", [0, 2])
@@ -1869,7 +1881,9 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             pp_partition[-1] = num_hidden_layers - sum(pp_partition[:-1])
         else:
             pp_partition = None
-        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.75)
+        free_gpu_memory_fraction = 0.6 if torch_compile else 0.75
+        kv_cache_config = KvCacheConfig(
+            free_gpu_memory_fraction=free_gpu_memory_fraction)
         torch_compile_config = _get_default_torch_compile_config(torch_compile)
         pytorch_config = dict(
             disable_overlap_scheduler=not overlap_scheduler,
@@ -6072,10 +6086,15 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
 @skip_pre_hopper
 class TestEXAONE4(LlmapiAccuracyTestHarness):
     MODEL_NAME = "LGAI-EXAONE/EXAONE-4.0-32B"
+    # 32B BF16 leaves little headroom on 80 GiB H100; reduce KV cache and
+    # use expandable_segments to avoid autotuner warmup OOM (nvbugs/6164924).
     kv_cache_config = KvCacheConfig(enable_block_reuse=False,
-                                    enable_partial_reuse=False)
+                                    enable_partial_reuse=False,
+                                    free_gpu_memory_fraction=0.8)
 
-    def test_auto_dtype(self):
+    def test_auto_dtype(self, mocker):
+        patch_mpi_pool_session_for_env(
+            mocker, {"PYTORCH_ALLOC_CONF": "expandable_segments:True"})
         model_path = f"{llm_models_root()}/EXAONE-4.0-32B"
         with LLM(model_path, kv_cache_config=self.kv_cache_config) as llm:
             task = MMLU(self.MODEL_NAME)
@@ -6301,6 +6320,7 @@ class TestQwen3_5_4B(LlmapiAccuracyTestHarness):
     def test_bf16(self):
         model_path = f"{llm_models_root()}/Qwen3.5-4B"
         with LLM(model_path,
+                 trust_remote_code=True,
                  max_seq_len=4096,
                  max_batch_size=128,
                  kv_cache_config=self.kv_cache_config,
@@ -6313,6 +6333,7 @@ class TestQwen3_5_4B(LlmapiAccuracyTestHarness):
     def test_fp8(self):
         model_path = f"{llm_models_root()}/Qwen3.5-4B-FP8"
         with LLM(model_path,
+                 trust_remote_code=True,
                  max_seq_len=4096,
                  max_batch_size=128,
                  kv_cache_config=self.kv_cache_config,
@@ -6334,6 +6355,7 @@ class TestQwen3_5_4B(LlmapiAccuracyTestHarness):
         extra_acc_spec = "h20" if is_h20_gpu else None
 
         with LLM(target_model_path,
+                 trust_remote_code=True,
                  max_seq_len=4096,
                  max_batch_size=8,
                  kv_cache_config=self.kv_cache_config,
@@ -6433,6 +6455,7 @@ class TestQwen3_5_35B_A3B(LlmapiAccuracyTestHarness):
         extra_acc_spec = "h20" if is_h20_gpu else None
 
         with LLM(self.MODEL_PATH,
+                 trust_remote_code=True,
                  tensor_parallel_size=tp_size,
                  moe_expert_parallel_size=1,
                  max_seq_len=4096,
@@ -6462,6 +6485,7 @@ class TestQwen3_5_35B_A3B(LlmapiAccuracyTestHarness):
         ) if mtp_flag else None
 
         with LLM(self.MODEL_PATH,
+                 trust_remote_code=True,
                  tensor_parallel_size=1,
                  moe_expert_parallel_size=1,
                  max_seq_len=4096,
@@ -6489,6 +6513,7 @@ class TestQwen3_5_35B_A3B(LlmapiAccuracyTestHarness):
         cuda_graph_config = CudaGraphConfig(enable_padding=True,
                                             max_batch_size=128)
         with LLM(model_dir,
+                 trust_remote_code=True,
                  tensor_parallel_size=1,
                  moe_expert_parallel_size=1,
                  max_seq_len=4096,
@@ -6528,6 +6553,7 @@ class TestQwen3_5_9B(LlmapiAccuracyTestHarness):
         ) if mtp_flag else None
 
         with LLM(self.MODEL_PATH,
+                 trust_remote_code=True,
                  max_seq_len=4096,
                  max_num_tokens=4096,
                  max_batch_size=128,
@@ -6589,6 +6615,7 @@ class TestQwen3_5_397B_A17B(LlmapiAccuracyTestHarness):
                               if cuda_graph else None)
 
         with LLM(model_path,
+                 trust_remote_code=True,
                  tensor_parallel_size=tp_size,
                  max_num_tokens=16384,
                  max_batch_size=32,
@@ -6939,7 +6966,7 @@ class TestMistralLarge3_675B(LlmapiAccuracyTestHarness):
                 eagle3_model_arch="mistral_large3")
         with LLM(
                 f"{llm_models_root()}/Mistral-Large-3-675B/Mistral-Large-3-675B-Instruct-2512/",
-                checkpoint_format="mistral",
+                checkpoint_format="mistral_large_3",
                 tensor_parallel_size=tp_size,
                 pipeline_parallel_size=pp_size,
                 moe_expert_parallel_size=ep_size,

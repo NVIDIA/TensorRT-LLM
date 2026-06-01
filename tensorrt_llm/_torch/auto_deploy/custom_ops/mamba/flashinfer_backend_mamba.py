@@ -36,6 +36,17 @@ from .mamba_backend_common import (
 )
 
 
+def _fi_align(t: torch.Tensor) -> torch.Tensor:
+    """Ensure 128-byte alignment required by FlashInfer kernels.
+
+    - Contiguous + aligned: contiguous() is a no-op, returns t unchanged.
+    - Non-contiguous: contiguous() allocates fresh aligned storage, returns it.
+    - Contiguous + misaligned: contiguous() is a no-op, clone() forces a new aligned allocation.
+    """
+    t = t.contiguous()
+    return t if t.data_ptr() % 128 == 0 else t.clone()
+
+
 @torch.library.custom_op(
     "auto_deploy::flashinfer_cached_ssm",
     mutates_args=("ssm_state_cache", "intermediate_ssm_state_cache"),
@@ -204,6 +215,10 @@ def _flashinfer_cached_ssm(
             A_full,
             D_full,
         ) = decode_inputs
+
+        x_decode = _fi_align(x_decode)
+        B_decode = _fi_align(B_decode)
+        C_decode = _fi_align(C_decode)
 
         slot_idx_decode_i32 = slot_idx_decode.to(torch.int32)
         y_decode = _flashinfer_ssm_update(
