@@ -1103,7 +1103,7 @@ class VilaInputProcessor(BaseMultimodalInputProcessor,
         return fused_input_ids, mm_features
 
     @torch.inference_mode()  # critical to minimize memory footprint
-    def __call__(
+    def call_with_text_prompt(
         self, inputs: TextPrompt, sampling_params: SamplingParams
     ) -> Tuple[List[int], Optional[ExtraProcessedInputs]]:
         """

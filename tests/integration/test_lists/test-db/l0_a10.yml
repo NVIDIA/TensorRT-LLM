@@ -33,6 +33,10 @@ l0_a10:
   - unittest/_torch/executor/test_kv_cache_budget_split.py
   - unittest/_torch/executor/test_kv_pool_rebalance.py
   - unittest/_torch/executor/test_disagg_index_mapper_early_release.py
+  - unittest/_torch/modules/dwdp/test_dwdp_fixup_moe_backends.py
+  - unittest/_torch/modules/dwdp/test_dwdp_manager.py
+  - unittest/_torch/modules/dwdp/test_dwdp_mapping.py
+  - unittest/_torch/modules/dwdp/test_dwdp_peer_ranges.py
   # NOTE: this is a CPU-only test, but we do not have a dedicated job for this (and therefore no
   # test list either).
   - unittest/_torch/models/checkpoints/hf/test_weight_loader.py

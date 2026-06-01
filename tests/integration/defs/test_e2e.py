@@ -1141,6 +1141,15 @@ def test_openai_chat_harmony(llm_root, llm_venv):
          str(test_root / "_test_openai_chat_harmony.py")])
 
 
+@skip_pre_hopper
+def test_openai_chat_harmony_perf_metrics(llm_root, llm_venv):
+    test_root = unittest_path() / "llmapi" / "apps"
+    llm_venv.run_cmd([
+        "-m", "pytest",
+        str(test_root / "_test_openai_chat_harmony_perf_metrics.py")
+    ])
+
+
 def test_openai_responses(llm_root, llm_venv):
     test_root = unittest_path() / "llmapi" / "apps"
     llm_venv.run_cmd(

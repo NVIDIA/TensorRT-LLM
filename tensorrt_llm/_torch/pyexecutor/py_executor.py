@@ -398,6 +398,15 @@ class PyExecutor:
         self.response_cv = threading.Condition(self.response_lock)
         self.responses = {}
         self.result_wait_queues = {}
+        # If the event-loop thread (PyExecutor._event_loop_wrapper) raises
+        # an exception (e.g. KV cache OOM), it is stashed here and read by
+        # two local consumers so they can surface it instead of hanging:
+        #   - _await_single_response re-raises it as a RuntimeError, and
+        #   - BaseWorker.AwaitResponseHelper (the bridge between this
+        #     engine and per-request GenerationResult queues) reads it to
+        #     broadcast an ErrorResponse to every pending request, waking
+        #     callers parked in queue.get() / aqueue.get().
+        self._event_loop_error: Optional[BaseException] = None
 
         # kv cache events
         self.kv_cache_manager = self.resource_manager.resource_managers.get(
@@ -626,6 +635,10 @@ class PyExecutor:
         # normal dummy add-forward-terminate lifecycle handles taper-down.
         # Only relevant in benchmark disagg mode; False otherwise.
         self._benchmark_fill_phase_active = self.is_benchmark_disagg
+        # Slow-start admission cap for benchmark disagg fill (see
+        # _pop_from_waiting_queue).  0 = uninitialised; first throttled iter
+        # seeds it to tp_size and each subsequent iter doubles it.
+        self._fill_admit_cap: int = 0
 
         # Initialize disagg PP termination handler if needed
         self._disagg_pp_termination_handler = None
@@ -805,6 +818,14 @@ class PyExecutor:
         except Exception as e:
             logger.error(f"Error in event loop: {e}")
             logger.error(traceback.format_exc())
+            # Stash the original error so local consumers
+            # (_await_single_response and BaseWorker.AwaitResponseHelper)
+            # can surface it instead of letting callers hang. We do NOT
+            # call _handle_errors / _enqueue_responses here: they trigger
+            # tp_gather / allgather collectives that would deadlock when
+            # only this rank crashed. The is_shutdown notification in
+            # _executor_loop_cleanup is enough to wake local waiters.
+            self._event_loop_error = e
             raise e
         finally:
             self._executor_loop_cleanup()
@@ -967,6 +988,16 @@ class PyExecutor:
         for manager in self.resource_manager.resource_managers.values():
             if manager:
                 manager.shutdown()
+        # Note: do NOT call engine.cleanup() here. PyExecutor.shutdown() is
+        # also invoked mid-init by configure_kv_cache_capacity() in
+        # tensorrt_llm/_torch/pyexecutor/_util.py — the warmup pass calls
+        # shutdown() and then immediately reads model_engine.model.model_config
+        # to compute kv_cache_max_memory. cleanup() would set
+        # model_engine.model = None, breaking that read with
+        # `'NoneType' object has no attribute 'model_config'`.
+        # The engine's __del__ still calls cleanup() at terminal teardown
+        # (when the executor's reference is dropped), which is sufficient for
+        # the GMS daemon registry eviction the cleanup hook was added for.
         del self.model_engine
         if self.draft_model_engine is not None:
             del self.draft_model_engine
@@ -1732,17 +1763,28 @@ class PyExecutor:
                 prev_device_step_time_ms=prev_device_step_time_ms)
 
     def _executor_loop_cleanup(self):
-
-        for i in range(self.num_micro_batches):
-            self.wait_on_pp_send_handles(self.send_handles, i)
-            self.wait_on_pp_send_handles(self.send_schedule_handles, i)
-            self.wait_on_pp_send_handles(self.send_expected_batch_num_handles,
-                                         i)
-
+        # Wake any waiters in await_responses BEFORE potentially-blocking
+        # work below. If wait_on_pp_send_handles hangs (e.g. after a
+        # crash leaves PP send handles in a bad state), the await loop
+        # must not hang with it.
         with self.response_cv:
             self.is_shutdown = True
             self.response_cv.notify_all()
         self.shutdown_event.set()
+
+        for i in range(self.num_micro_batches):
+            try:
+                self.wait_on_pp_send_handles(self.send_handles, i)
+                self.wait_on_pp_send_handles(self.send_schedule_handles, i)
+                self.wait_on_pp_send_handles(
+                    self.send_expected_batch_num_handles, i)
+            except Exception:
+                # PP send handles may be in a broken state after an
+                # event-loop crash. Log and continue; the waiters have
+                # already been notified above.
+                logger.error(
+                    f"Error waiting on PP send handles during cleanup: "
+                    f"{traceback.format_exc()}")
 
     def _pp_schedule_and_propagate(self, microbatch_id: int):
         """The first PP rank schedules the requests and propagates the result to all other PP ranks."""
@@ -2609,6 +2651,7 @@ class PyExecutor:
                 scheduled_batch)
             if can_forward:
                 self._benchmark_fill_phase_active = False
+                self._fill_admit_cap = 0
             else:
                 time.sleep(0.1)
                 return can_forward, True
@@ -3433,15 +3476,14 @@ class PyExecutor:
 
         max_new_requests = total_max - total_num_active_requests
 
-        # Benchmark disagg fill-phase admission throttle: a preloaded queue
-        # (concurrency == total_max) would otherwise pop all requests into
-        # DISAGG_GENERATION_INIT in one iter, tripping PR #12206's fail-fast
-        # under ADP-router imbalance and growing the recv-buffer fallback
-        # faster than transfers drain.  Cap at `tp_size` (≈ pre-#12208
-        # blocking fill rate).  Verified on Kimi-K2 8k1k ctx8/gen1 con=8192.
+        # Benchmark disagg fill-phase admission throttle (slow-start ramp).
         if (self.is_benchmark_disagg and self._benchmark_fill_phase_active
                 and not self.is_warmup):
-            max_new_requests = min(max_new_requests, self.dist.tp_size)
+            if self._fill_admit_cap == 0:
+                self._fill_admit_cap = self.dist.tp_size
+            else:
+                self._fill_admit_cap = min(self._fill_admit_cap * 2, total_max)
+            max_new_requests = min(max_new_requests, self._fill_admit_cap)
 
         return get_from_waiting_queue(
             waiting_queue,
@@ -4791,12 +4833,31 @@ class PyExecutor:
         with self.response_cv:
 
             def key_has_response():
-                return id in self.responses.keys()
+                # Wake on shutdown too so that an event-loop crash
+                # cannot trap callers here forever (nvbug 6038228).
+                return id in self.responses or self.is_shutdown
 
             self.response_cv.wait_for(key_has_response, timeout=timeout)
-            response = self.responses[id]
-            self.responses.pop(id)
-            return response
+            if id in self.responses:
+                return self.responses.pop(id)
+            if self.is_shutdown:
+                # The event-loop thread terminated before producing a
+                # response for this request. Re-raise the original
+                # exception (if any) so callers see a meaningful error
+                # instead of hanging here or hitting a KeyError below.
+                error = self._event_loop_error
+                if error is not None:
+                    raise RuntimeError(
+                        f"Event loop terminated with error: {error}") from error
+                raise RuntimeError(
+                    f"Event loop shut down before a response was received "
+                    f"for request {id}.")
+            # Timed out without shutdown. Return [] to match the
+            # documented timeout contract used by _await_any_response and
+            # the other executor-API timeouts; the pre-fix code raised a
+            # bare KeyError on this path, which all known callers had to
+            # defend against anyway.
+            return []
 
     def _terminate_requests(self, requests_to_terminate):
         # todo: support work with self.inflight_req_ids.
