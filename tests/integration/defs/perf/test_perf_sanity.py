@@ -1320,9 +1320,7 @@ class DisaggTestCmds(NamedTuple):
                             start_offsets=gen_log_start_offsets,
                         )
                         if device_step_time_mean is not None:
-                            summary_line = (
-                                f"Average Per Iter Device Step Time (ms): {device_step_time_mean}"
-                            )
+                            summary_line = f"Average Per Iter Device Step Time (ms): {device_step_time_mean:.2f}"
                             with open(benchmark_file_path, "a") as benchmark_ctx:
                                 benchmark_ctx.write(f"\n{summary_line}\n")
                             output = f"{output}\n{summary_line}\n"
