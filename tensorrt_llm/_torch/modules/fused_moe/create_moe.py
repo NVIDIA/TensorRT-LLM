@@ -190,14 +190,12 @@ def resolve_moe_cls(
 
     # Routed-expert MoE LoRA runs only on CutlassFusedMoE with unquantized base
     # weights. Fail at construction time rather than silently dropping the LoRA
-    # contribution at runtime. Only the exact CutlassFusedMoE class runs the
-    # LoRA-capable kernel; its subclasses (CuteDsl/DeepGemm/...) reuse the class
-    # but run other kernels. Use identity, not isinstance, and surface the
-    # user's requested backend name in the error when it is not the Cutlass kernel.
-    resolved_backend = ("CUTLASS" if moe_cls is CutlassFusedMoE else
-                        model_config.moe_backend)
+    # contribution at runtime. The exact-Cutlass-kernel rule and error
+    # formatting live in `check_moe_lora_supported()`; we only hand it the
+    # resolved class and the originally requested backend name.
     check_moe_lora_supported(
-        moe_backend_name=resolved_backend,
+        moe_cls=moe_cls,
+        requested_moe_backend=model_config.moe_backend,
         lora_config=model_config.lora_config,
         quant_config=effective_quant_config,
         layer_idx=layer_idx,

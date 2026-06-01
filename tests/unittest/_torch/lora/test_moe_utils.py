@@ -9,6 +9,7 @@ synthetic-adapter tooling, without any GPU or model-engine dependencies.
 import pytest
 import torch
 
+from tensorrt_llm._torch.modules.fused_moe.fused_moe_cutlass import CutlassFusedMoE
 from tensorrt_llm._torch.peft.lora.moe_utils import (
     check_moe_lora_supported,
     has_moe_lora_targets,
@@ -21,6 +22,10 @@ from tensorrt_llm.lora_helper import (
     merge_moe_shared_flags_for_batch,
     moe_shared_sides_to_kernel_flags,
 )
+
+
+class _NotCutlassMoE:
+    """Stand-in resolved backend class that is not the Cutlass kernel."""
 
 
 def test_moe_lora_module_names():
@@ -72,7 +77,8 @@ def test_has_moe_lora_targets_each_module(name):
 def test_check_no_lora_is_noop():
     # No LoRA at all; validator must not raise regardless of backend/quant.
     check_moe_lora_supported(
-        moe_backend_name="WIDEEP",
+        moe_cls=_NotCutlassMoE,
+        requested_moe_backend="WIDEEP",
         lora_config=None,
         quant_config=_FakeQuantConfig(True),
     )
@@ -82,7 +88,8 @@ def test_check_no_moe_lora_is_noop():
     # LoRA on attention only; validator must not reject any backend / quant.
     cfg = _FakeLoraConfig(["attn_q", "attn_k"])
     check_moe_lora_supported(
-        moe_backend_name="TRTLLM",
+        moe_cls=_NotCutlassMoE,
+        requested_moe_backend="TRTLLM",
         lora_config=cfg,
         quant_config=_FakeQuantConfig(True),
     )
@@ -92,7 +99,8 @@ def test_check_moe_lora_cutlass_unquantized_ok():
     cfg = _FakeLoraConfig(["moe_h_to_4h", "moe_4h_to_h", "moe_gate"])
     # No quant config -> definitely unquantized.
     check_moe_lora_supported(
-        moe_backend_name="CUTLASS",
+        moe_cls=CutlassFusedMoE,
+        requested_moe_backend="CUTLASS",
         lora_config=cfg,
         quant_config=None,
     )
@@ -102,7 +110,8 @@ def test_check_moe_lora_cutlass_unquantized_quant_mode_ok():
     # An explicit QuantConfig that reports no active quant should pass.
     cfg = _FakeLoraConfig(["moe_4h_to_h", "moe_gate"])
     check_moe_lora_supported(
-        moe_backend_name="cutlass",  # case-insensitive
+        moe_cls=CutlassFusedMoE,
+        requested_moe_backend="cutlass",
         lora_config=cfg,
         quant_config=_FakeQuantConfig(False),
     )
@@ -122,10 +131,13 @@ def test_check_moe_lora_cutlass_unquantized_quant_mode_ok():
     ],
 )
 def test_check_moe_lora_rejects_non_cutlass_backend(backend):
+    # Any resolved class other than the exact CutlassFusedMoE kernel is rejected;
+    # the requested backend name is surfaced in the error message.
     cfg = _FakeLoraConfig(["moe_gate", "moe_4h_to_h"])
-    with pytest.raises(ValueError, match="moe_backend='CUTLASS'"):
+    with pytest.raises(ValueError, match="Cutlass MoE backend"):
         check_moe_lora_supported(
-            moe_backend_name=backend,
+            moe_cls=_NotCutlassMoE,
+            requested_moe_backend=backend,
             lora_config=cfg,
             quant_config=None,
         )
@@ -135,7 +147,8 @@ def test_check_moe_lora_rejects_quantized_base():
     cfg = _FakeLoraConfig(["moe_gate", "moe_4h_to_h"])
     with pytest.raises(ValueError, match="unquantized fp16/bf16 base weights"):
         check_moe_lora_supported(
-            moe_backend_name="CUTLASS",
+            moe_cls=CutlassFusedMoE,
+            requested_moe_backend="CUTLASS",
             lora_config=cfg,
             quant_config=_FakeQuantConfig(True),
         )
@@ -145,7 +158,8 @@ def test_check_moe_lora_layer_idx_in_message():
     cfg = _FakeLoraConfig(["moe_gate", "moe_4h_to_h"])
     with pytest.raises(ValueError, match=r"\[layer_idx=7\]"):
         check_moe_lora_supported(
-            moe_backend_name="TRTLLM",
+            moe_cls=_NotCutlassMoE,
+            requested_moe_backend="TRTLLM",
             lora_config=cfg,
             quant_config=None,
             layer_idx=7,

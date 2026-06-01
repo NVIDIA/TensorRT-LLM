@@ -31,17 +31,29 @@ def has_moe_lora_targets(lora_config: LoraConfig | None) -> bool:
 
 def check_moe_lora_supported(
     *,
-    moe_backend_name: str,
+    moe_cls: type,
+    requested_moe_backend: str | None,
     lora_config: LoraConfig | None,
     quant_config,
     layer_idx: int | None = None,
 ) -> None:
-    """Raise `ValueError` if a routed-expert MoE LoRA cannot run on the chosen
+    """Raise `ValueError` if a routed-expert MoE LoRA cannot run on the resolved
     backend / quant combination.
 
+    This centralizes the MoE-LoRA support policy: callers (the MoE factory in
+    `create_moe.py`) only resolve the backend class and pass it in, while the
+    exact-Cutlass-kernel rule and error formatting live here next to the
+    quant/backend support matrix.
+
     Args:
-        moe_backend_name: The resolved `moe_backend` string (e.g. "CUTLASS",
-            "WIDEEP", "TRTLLM"). Comparison is case-insensitive.
+        moe_cls: The resolved MoE backend class returned by `get_moe_cls()` /
+            `resolve_moe_cls()`. Only the exact `CutlassFusedMoE` class runs the
+            LoRA-capable kernel; its subclasses (CuteDsl / DeepGemm / ...) reuse
+            the class but dispatch to other kernels, so identity (`is`) is used
+            rather than `isinstance`.
+        requested_moe_backend: The originally requested `moe_backend` string
+            (e.g. "CUTLASS", "WIDEEP", "TRTLLM"), surfaced in the error message
+            so the user sees the backend they asked for.
         lora_config: The model's `LoraConfig`, or None.
         quant_config: The model's `QuantConfig`, or None. We only reject when
             the layer is actually quantized. The per-layer `layer_quant_mode`
@@ -49,9 +61,9 @@ def check_moe_lora_supported(
             used for backend selection under mixed/per-layer quantization.
         layer_idx: Optional layer index for diagnostic messages.
 
-    Constraints (MVP):
-        - MoE backend MUST be CUTLASS.
-        - Base weight quantization MUST be off (no FP8 / FP4 / INT8 / INT4 / W4A8 ...).
+    Constraints:
+        - Resolved MoE backend must be the Cutlass kernel (`CutlassFusedMoE`).
+        - Base weight quantization must be off (no FP8, FP4, INT8, INT4, W4A8, etc.).
 
     Other constraints (alltoall, min-latency, FP4, CUDA-graph) are enforced at
     runtime; we do not pre-check them here because they depend on per-call
@@ -62,11 +74,15 @@ def check_moe_lora_supported(
 
     prefix = f"[layer_idx={layer_idx}] " if layer_idx is not None else ""
 
-    if (moe_backend_name or "").upper() != "CUTLASS":
+    # Lazy import to avoid a circular import: create_moe.py imports this module.
+    from tensorrt_llm._torch.modules.fused_moe.fused_moe_cutlass import CutlassFusedMoE
+
+    if moe_cls is not CutlassFusedMoE:
         raise ValueError(
-            f"{prefix}Routed-expert MoE LoRA requires moe_backend='CUTLASS'; got "
-            f"moe_backend={moe_backend_name!r}. Disable LoRA on MoE modules "
-            f"(remove {sorted(MOE_MODULE_SHARED_FLAG)} from "
+            f"{prefix}Routed-expert MoE LoRA requires the Cutlass MoE backend; "
+            f"got moe_backend={requested_moe_backend!r} (resolved to "
+            f"{getattr(moe_cls, '__name__', moe_cls)}). Disable LoRA on MoE "
+            f"modules (remove {sorted(MOE_MODULE_SHARED_FLAG)} from "
             "lora_config.lora_target_modules) or switch to the Cutlass MoE backend."
         )
 
@@ -86,10 +102,10 @@ def check_moe_lora_supported(
                 is_quantized = bool(quant_mode.has_any_quant())
         if is_quantized:
             raise ValueError(
-                f"{prefix}Routed-expert MoE LoRA MVP only supports unquantized "
+                f"{prefix}Routed-expert MoE LoRA only supports unquantized "
                 f"fp16/bf16 base weights; got quant_mode={quant_mode}. "
                 "FP8/FP4/INT4/INT8 base weights combined with MoE LoRA are not "
-                "supported yet."
+                "supported."
             )
 
 

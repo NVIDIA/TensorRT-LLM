@@ -23,12 +23,12 @@ from tensorrt_llm.llmapi.utils import StrictBaseModel
 
 logger = logging.getLogger(__name__)
 
-# Routed-expert MoE LoRA modules supported by the MVP, each mapped to the one
-# kernel flag that marks its residual-stream side shared across experts (A for
-# the up-projections, B for the down-projection). The slot names are
-# counterintuitive: moe_h_to_4h is gate_proj (w1, silu side) and uses the
-# `gated` slot; moe_gate is up_proj (w3, linear side) and uses `fc1`. Must match
-# `slot_to_kernel` in `fused_moe_cutlass._extract_moe_lora_tensors`.
+# Routed-expert MoE LoRA modules, each mapped to the one kernel flag that marks
+# its residual-stream side shared across experts (A for the up-projections, B
+# for the down-projection). The slot names are counterintuitive: moe_h_to_4h is
+# gate_proj (w1, silu side) and uses the `gated` slot; moe_gate is up_proj (w3,
+# linear side) and uses `fc1`. Must match `slot_to_kernel` in
+# `fused_moe_cutlass._extract_moe_lora_tensors`.
 MOE_MODULE_SHARED_FLAG: Dict[str, str] = {
     "moe_h_to_4h": "gated_shared_a",
     "moe_gate": "fc1_shared_a",
