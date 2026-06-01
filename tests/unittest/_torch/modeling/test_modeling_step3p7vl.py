@@ -356,14 +356,25 @@ class TestStep3p7VisionTower(unittest.TestCase):
         from tensorrt_llm._torch.models.modeling_step3p7vl import Step3p7VisionTower
 
         tower = Step3p7VisionTower(_make_tiny_vision_model_config(text_hidden_size=32, width=64))
+        # ``load_weights`` loads each subtree with ``strict=True``, so supply a
+        # complete vision/projector state built from the modules' own keys, then
+        # override two routed tensors with sentinels to assert correct routing.
+        weights = {
+            f"vision_model.{k}": v.clone() for k, v in tower.vision_model.state_dict().items()
+        }
+        weights.update(
+            {
+                f"vit_large_projector.{k}": v.clone()
+                for k, v in tower.vit_large_projector.state_dict().items()
+            }
+        )
         proj_w = torch.ones_like(tower.vit_large_projector.weight)
         conv_w = torch.ones_like(tower.vision_model.conv1.weight)
-        weights = {
-            "vit_large_projector.weight": proj_w,
-            "vision_model.conv1.weight": conv_w,
-            # A text-decoder key the tower must leave untouched.
-            "model.layers.0.self_attn.q_proj.weight": torch.zeros(2, 2),
-        }
+        weights["vit_large_projector.weight"] = proj_w
+        weights["vision_model.conv1.weight"] = conv_w
+        # A text-decoder key the tower must leave untouched (and not route).
+        weights["model.layers.0.self_attn.q_proj.weight"] = torch.zeros(2, 2)
+
         tower.load_weights(weights)
         self.assertTrue(torch.equal(tower.vit_large_projector.weight.detach(), proj_w))
         self.assertTrue(torch.equal(tower.vision_model.conv1.weight.detach(), conv_w))

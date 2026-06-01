@@ -236,6 +236,7 @@ class Step3VisionAttention(nn.Module):
         hidden_states: torch.Tensor,
         grid_hw: Tuple[int, int],
     ) -> torch.Tensor:
+        # TODO: port the vision attention/projector to TRT-LLM modules
         bsz, seq_len, _ = hidden_states.shape
         qkv = F.linear(hidden_states, self.in_proj_weight, self.in_proj_bias)
         q, k, v = qkv.chunk(3, dim=-1)
@@ -346,8 +347,8 @@ class Step3p7VisionEncoder(nn.Module):
         self.use_cls_token = bool(getattr(vision_config, "use_cls_token", False))
         self.use_rope2d = bool(getattr(vision_config, "use_rope2d", True))
         self.use_abs_posemb = bool(getattr(vision_config, "use_abs_posemb", True))
-        self.use_ln_pre = bool(getattr(vision_config, "use_ln_pre", False))
-        self.use_ln_post = bool(getattr(vision_config, "use_ln_post", True))
+        self.use_ln_pre = bool(getattr(vision_config, "use_ln_pre", True))
+        self.use_ln_post = bool(getattr(vision_config, "use_ln_post", False))
 
         self.conv1 = nn.Conv2d(
             in_channels=int(getattr(vision_config, "num_channels", 3)),
@@ -559,16 +560,7 @@ class Step3p7VisionTower(nn.Module):
                 projector_state[sub] = weights[key]
 
         if vision_state:
-            missing, unexpected = self.vision_model.load_state_dict(vision_state, strict=False)
-            if missing or unexpected:
-                logger.warning(
-                    "[Step3p7 vision] non-strict load: missing=%d unexpected=%d. "
-                    "First missing: %s. First unexpected: %s.",
-                    len(missing),
-                    len(unexpected),
-                    missing[:3],
-                    unexpected[:3],
-                )
+            self.vision_model.load_state_dict(vision_state, strict=True)
         if projector_state:
             self.vit_large_projector.load_state_dict(projector_state, strict=True)
 
@@ -599,6 +591,8 @@ class Step3p7VisionTower(nn.Module):
         """
         per_request_embeds: List[torch.Tensor] = []
         for mm in multimodal_params:
+            # TODO: batch full images across all requests, batch patch images across all
+            # requests where shapes match, and then split/reassemble according to num_patches
             image_data = mm.multimodal_data.get("image") if mm.multimodal_data else None
             if image_data is None:
                 continue
