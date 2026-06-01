@@ -496,6 +496,23 @@ def spec_from_modeling_file(path: str) -> IRModelSpec:
 # -----------------------------------------------------------------------------
 
 
+def build_tiny_config(cfg_cls: type) -> Any:
+    """Default-construct ``cfg_cls`` and patch it down to the tiny test shape.
+
+    Shared by :func:`build_ir_model` (base modeling files) and
+    :func:`build_eagle_draft_model` (Eagle drafter base configs). Applies the
+    per-family quirks on the pristine config first, then the universal tiny
+    kwargs, then the layer-count-dependent quirks -- see :func:`build_ir_model`
+    for why that ordering matters.
+    """
+    config = cfg_cls()
+    _apply_per_family_quirks(config)
+    for k, v in _TINY_KWARGS_UNIVERSAL.items():
+        setattr(config, k, v)
+    _apply_layer_count_dependent_quirks(config, _TINY_KWARGS_UNIVERSAL["num_hidden_layers"])
+    return config
+
+
 def build_ir_model(spec: IRModelSpec, device: torch.device, dtype: torch.dtype) -> nn.Module:
     """Programmatically build the IR-onboarded model with a tiny config.
 
@@ -513,16 +530,140 @@ def build_ir_model(spec: IRModelSpec, device: torch.device, dtype: torch.dtype) 
     """
     cfg_module = importlib.import_module(spec.config_module)
     cfg_cls = getattr(cfg_module, spec.config_cls)
-    config = cfg_cls()
-    _apply_per_family_quirks(config)
-    for k, v in _TINY_KWARGS_UNIVERSAL.items():
-        setattr(config, k, v)
-    _apply_layer_count_dependent_quirks(config, _TINY_KWARGS_UNIVERSAL["num_hidden_layers"])
+    config = build_tiny_config(cfg_cls)
 
     modeling_module = importlib.import_module(spec.modeling_module)
     model_cls = getattr(modeling_module, spec.modeling_cls)
     model = model_cls(config).to(device=device, dtype=dtype).eval()
     return model
+
+
+# -----------------------------------------------------------------------------
+# Eagle draft-model build + forward helpers
+#
+# The Eagle draft is not a standalone registered modeling file: it is built by
+# ``EagleDrafterFactory`` from a base model config wrapped in ``EagleConfig``.
+# For the sharding-IR equivalence test we don't need the target or any
+# speculative-decoding machinery -- the draft GraphModule is just numbers in /
+# numbers out, so we build the draft on a tiny config and feed it random
+# ``(inputs_embeds, position_ids, hidden_states)`` exactly as the exported draft
+# GM expects (see ``DraftModelExportInfo._init_dynamic_shape_lookup`` and
+# ``EagleDrafterForCausalLM.forward``). Sharding correctness is a property of
+# the math, independent of whether the activations are "real".
+# -----------------------------------------------------------------------------
+
+# model_type -> (base-config module, base-config class). The base config is
+# built tiny, then wrapped via ``EagleConfig.from_base_config(base, model_type)``.
+# ``llama`` resolves directly from transformers; ``nemotron_h`` has no bundled
+# config class (see modeling_nemotron_h.py:631), so it is resolved through the
+# transformers registry by name.
+_EAGLE_BASE_CONFIG: Dict[str, Tuple[str, str]] = {
+    "llama": ("transformers.models.llama.configuration_llama", "LlamaConfig"),
+}
+
+
+def _resolve_eagle_base_config_cls(model_type: str) -> type:
+    """Return the base-model config class for an Eagle draft ``model_type``."""
+    if model_type in _EAGLE_BASE_CONFIG:
+        mod_name, cls_name = _EAGLE_BASE_CONFIG[model_type]
+        return getattr(importlib.import_module(mod_name), cls_name)
+    # Fallback: resolve by the conventional config class name via the
+    # transformers registry (handles nemotron_h, whose config class is not
+    # bundled locally).
+    guessed = "".join(part.capitalize() for part in model_type.split("_")) + "Config"
+    cfg_cls = _resolve_config_cls_from_transformers_registry(guessed)
+    if cfg_cls is None:
+        raise RuntimeError(
+            f"Could not resolve a base config class for Eagle model_type "
+            f"{model_type!r} (tried _EAGLE_BASE_CONFIG and transformers "
+            f"registry name {guessed!r})."
+        )
+    return cfg_cls
+
+
+def build_eagle_draft_model(model_type: str, device: torch.device, dtype: torch.dtype) -> nn.Module:
+    """Build a tiny ``EagleDrafterForCausalLM`` for the given base ``model_type``.
+
+    Mirrors ``EagleDrafterFactory._build_model`` (models/eagle.py): build a tiny
+    base config, wrap it via ``EagleConfig.from_base_config``, then instantiate
+    ``EagleDrafterForCausalLM``. No checkpoint / filesystem access.
+    """
+    from tensorrt_llm._torch.auto_deploy.models.custom.modeling_eagle import (
+        EagleConfig,
+        EagleDrafterForCausalLM,
+    )
+
+    base_cfg = build_tiny_config(_resolve_eagle_base_config_cls(model_type))
+    base_cfg.model_type = model_type
+    eagle_cfg = EagleConfig.from_base_config(base_cfg, model_type)
+    model = EagleDrafterForCausalLM(eagle_cfg).to(device=device, dtype=dtype).eval()
+    return model
+
+
+def build_random_draft_inputs(
+    batch_size: int,
+    seq_len: int,
+    hidden_size: int,
+    device: torch.device,
+    dtype: torch.dtype,
+    seed: int = 42,
+    std: float = 0.05,
+) -> Dict[str, torch.Tensor]:
+    """Deterministic ``{inputs_embeds, position_ids, hidden_states}`` for the draft.
+
+    All float tensors share one generator so both equivalence sides see
+    identical inputs. ``hidden_states`` is the (already fc-compressed) target
+    hidden state the draft consumes -- shape ``[B, S, hidden_size]``.
+
+    ``std`` is small (matched to the weight-init std) on purpose. The draft
+    layer computes ``residual + attn(norm(...))``: the RMSNorm makes the
+    attention/MLP *input* scale-invariant, so their output magnitude is set by
+    the weights (~init std), while the residual is the raw ``hidden_states``.
+    If ``hidden_states`` were unit-scale (``randn``) the residual would dwarf
+    the sharded attn/MLP contribution and mask sharding bugs (a broken
+    all_reduce would only perturb the small term). Scaling the inputs to the
+    weight-init scale keeps the residual and the sharded contribution
+    comparable so the negative-control (``SHARDING_IR_SABOTAGE=1``) actually
+    trips.
+    """
+    gen = torch.Generator(device=device).manual_seed(seed)
+    inputs_embeds = (
+        torch.randn(batch_size, seq_len, hidden_size, device=device, dtype=dtype, generator=gen)
+        * std
+    )
+    hidden_states = (
+        torch.randn(batch_size, seq_len, hidden_size, device=device, dtype=dtype, generator=gen)
+        * std
+    )
+    position_ids = (
+        torch.arange(seq_len, device=device, dtype=torch.long)
+        .unsqueeze(0)
+        .expand(batch_size, seq_len)
+        .contiguous()
+    )
+    return {
+        "inputs_embeds": inputs_embeds,
+        "position_ids": position_ids,
+        "hidden_states": hidden_states,
+    }
+
+
+def extract_draft_output(out: Any) -> torch.Tensor:
+    """Pull the comparison tensor out of an ``Eagle3DraftOutput``.
+
+    Prefers ``last_hidden_state`` (always populated for both Llama and
+    NemotronH drafts); falls back to ``logits`` / ``norm_hidden_state``. Also
+    accepts a raw tensor or tuple (post-export GM output).
+    """
+    if isinstance(out, torch.Tensor):
+        return out
+    if isinstance(out, (tuple, list)):
+        return out[0]
+    for attr in ("last_hidden_state", "logits", "norm_hidden_state"):
+        val = getattr(out, attr, None)
+        if val is not None:
+            return val
+    raise TypeError(f"Cannot extract a draft output tensor from {type(out)}")
 
 
 def extract_logits(out: Any) -> torch.Tensor:

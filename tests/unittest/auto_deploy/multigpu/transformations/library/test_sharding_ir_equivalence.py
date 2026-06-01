@@ -63,8 +63,11 @@ if _HELPERS_DIR not in sys.path:
     sys.path.insert(0, _HELPERS_DIR)
 
 from _sharding_ir_helpers import (  # noqa: E402
+    build_eagle_draft_model,
     build_ir_model,
+    build_random_draft_inputs,
     build_random_prefill_inputs,
+    extract_draft_output,
     extract_logits,
     fix_moe_routers_deterministic,
     random_init_with_seed,
@@ -417,5 +420,171 @@ def test_sharding_ir_equivalence(
     world_size = _DIST_CONFIGS[sharding_ir_dist_config]["world_size"]
     dist_common.spawn_multiprocess_job(
         job=partial(_run_equivalence_job, sharding_ir_modeling_file, sharding_ir_dist_config),
+        size=world_size,
+    )
+
+
+# =============================================================================
+# Eagle draft equivalence
+#
+# The Eagle draft GraphModule is just numbers in / numbers out -- the sharding
+# equivalence property is architecture-agnostic, so this reuses the exact same
+# export -> shard -> compare logic as the base-model path. The only difference
+# is the front-end: build ``EagleDrafterForCausalLM`` instead of a registered
+# modeling-file model, and feed ``{inputs_embeds, position_ids, hidden_states}``
+# instead of ``{input_ids, position_ids}`` (the draft consumes the target's
+# hidden states; it has no input_ids path). See
+# ``_sharding_ir_helpers.build_eagle_draft_model`` / ``build_random_draft_inputs``.
+# =============================================================================
+
+
+def _run_eagle_draft_equivalence_job_impl(
+    model_type: str,
+    rank: int,
+    world_size: int,
+    dist_config_name: str,
+) -> None:
+    """Per-rank Eagle-draft job body.
+
+    Mirrors ``_run_equivalence_job_impl`` but builds the draft and feeds the
+    draft's ``(inputs_embeds, position_ids, hidden_states)`` contract; the
+    export/shard/compare tail is identical.
+    """
+    import tensorrt_llm._torch.auto_deploy.models.custom  # noqa: F401
+    import tensorrt_llm._torch.auto_deploy.transform.library  # noqa: F401
+    from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
+    from tensorrt_llm._torch.auto_deploy.transform.optimizer import InferenceOptimizer
+    from tensorrt_llm._torch.auto_deploy.utils.dist_config import DistConfig
+
+    torch.cuda.set_device(rank)
+    device = torch.device(f"cuda:{rank}")
+
+    # 1. Build tiny Eagle draft with deterministic random weights.
+    model = build_eagle_draft_model(model_type, device=device, dtype=FORWARD_DTYPE)
+    random_init_with_seed(model, seed=WEIGHT_SEED, std=INIT_STD)
+    # NemotronH MTP draft has a MoE ('E') layer -> stabilize its router top-k.
+    n_routers_fixed = fix_moe_routers_deterministic(model)
+    if rank == 0 and n_routers_fixed > 0:
+        print(
+            f"[sharding-ir-eq] fixed {n_routers_fixed} MoE router(s) to deterministic top-k",
+            flush=True,
+        )
+
+    hidden_size = int(model.config.hidden_size)
+
+    # 2. Random draft inputs + unsharded weight snapshot.
+    full_kwargs = build_random_draft_inputs(
+        BATCH_SIZE, SEQ_LEN, hidden_size, device, FORWARD_DTYPE, seed=INPUT_SEED, std=INIT_STD
+    )
+    sd_snapshot = {k: v.detach().clone() for k, v in model.state_dict().items()}
+
+    # 3. Export unsharded + sharded. Under attention-DP every batch-dim-0 input
+    #    tensor is sliced to the per-rank slab (mirrors the base path).
+    dist_cfg_spec = _DIST_CONFIGS[dist_config_name]
+    enable_attention_dp = dist_cfg_spec["enable_attention_dp"]
+
+    def _slice_batch(kwargs: dict) -> dict:
+        if not enable_attention_dp:
+            return kwargs
+        assert BATCH_SIZE % world_size == 0, (
+            f"BATCH_SIZE={BATCH_SIZE} must be divisible by world_size={world_size} under attention-DP."
+        )
+        chunk = BATCH_SIZE // world_size
+        sl = slice(rank * chunk, (rank + 1) * chunk)
+        return {k: (v[sl] if v.shape[0] == BATCH_SIZE else v) for k, v in kwargs.items()}
+
+    local_kwargs = _slice_batch(full_kwargs)
+
+    gm_unsharded = torch_export_to_gm(model, args=(), kwargs=full_kwargs, clone=True)
+    gm_sharded = torch_export_to_gm(model, args=(), kwargs=local_kwargs, clone=True)
+
+    # 4. Shard gm_sharded only.
+    dist_config = DistConfig(
+        world_size=world_size,
+        rank=rank,
+        tp_size=world_size,
+        moe_tp_size=dist_cfg_spec["moe_tp_size"],
+        moe_ep_size=dist_cfg_spec["moe_ep_size"],
+        enable_attention_dp=enable_attention_dp,
+    )
+    sharded_transforms = {
+        "apply_sharding_hints": {"stage": "sharding", "enabled": True},
+        "strip_sharding_hints": {"stage": "weight_load"},
+    }
+    optimizer = InferenceOptimizer(factory=None, config=sharded_transforms, dist_config=dist_config)
+    gm_sharded = optimizer(None, gm_sharded)
+
+    if os.environ.get("SHARDING_IR_SABOTAGE") == "1":
+        n_removed = _sabotage_remove_collectives(gm_sharded)
+        if rank == 0:
+            print(
+                f"[sharding-ir-eq] SHARDING_IR_SABOTAGE=1: removed {n_removed} "
+                f"collective op(s) from gm_sharded",
+                flush=True,
+            )
+
+    # 5. Load the same unsharded snapshot into both graphs.
+    gm_unsharded.load_state_dict(sd_snapshot, strict=False)
+    missing, _ = gm_sharded.load_state_dict(sd_snapshot, strict=False)
+    assert not missing, f"Missing keys when loading sharded state_dict: {missing[:5]}"
+
+    # 6. Forward both and compare via relative RMSE.
+    rel_rmse_tol = float(os.environ.get("SHARDING_IR_REL_RMSE_TOL", REL_RMSE_TOL))
+    with torch.inference_mode():
+        y_unsharded = extract_draft_output(gm_unsharded(**full_kwargs))
+        y_local = extract_draft_output(gm_sharded(**local_kwargs))
+        if enable_attention_dp:
+            y_sharded = _all_gather_concat(y_local.contiguous(), world_size)
+        else:
+            y_sharded = y_local
+
+    rel_rmse = (
+        torch.sqrt(((y_sharded - y_unsharded).float() ** 2).mean())
+        / torch.sqrt((y_unsharded.float() ** 2).mean())
+    ).item()
+    if rank == 0:
+        diff = (y_sharded.float() - y_unsharded.float()).abs()
+        print(
+            f"[sharding-ir-eq] eagle-draft({model_type}) |y_s - y_u|: "
+            f"max={diff.max().item():.6f} mean={diff.mean().item():.6f} "
+            f"rel_rmse={rel_rmse:.6f} (tol={rel_rmse_tol})",
+            flush=True,
+        )
+    assert rel_rmse < rel_rmse_tol, f"rel_rmse={rel_rmse:.4f} >= {rel_rmse_tol} on rank {rank}"
+
+
+def _run_eagle_draft_equivalence_job(
+    model_type: str,
+    dist_config_name: str,
+    rank: int,
+    world_size: int,
+) -> None:
+    """Worker entry; mirrors the per-rank traceback to a log file on failure."""
+    import traceback
+
+    try:
+        _run_eagle_draft_equivalence_job_impl(model_type, rank, world_size, dist_config_name)
+    except BaseException:
+        with open(f"/tmp/sharding_ir_eagle_draft_rank{rank}.log", "w") as f:
+            f.write(traceback.format_exc())
+        raise
+
+
+def test_sharding_ir_eagle_draft_equivalence(
+    sharding_ir_eagle_draft: str,
+    sharding_ir_dist_config: str,
+) -> None:
+    """Verify sharded == unsharded prefill for an Eagle draft of the given model_type."""
+    skip = _gpu_check(sharding_ir_dist_config)
+    if skip:
+        pytest.skip(skip)
+
+    import tensorrt_llm._torch.auto_deploy.distributed.common as dist_common
+
+    world_size = _DIST_CONFIGS[sharding_ir_dist_config]["world_size"]
+    dist_common.spawn_multiprocess_job(
+        job=partial(
+            _run_eagle_draft_equivalence_job, sharding_ir_eagle_draft, sharding_ir_dist_config
+        ),
         size=world_size,
     )

@@ -40,6 +40,18 @@ def pytest_addoption(parser):
             "'attn-dp' (4 ranks, attention-DP + MoEAllToAll)."
         ),
     )
+    parser.addoption(
+        "--sharding-ir-eagle-draft",
+        action="store",
+        default=None,
+        help=(
+            "Base model_type of an Eagle draft to verify with "
+            "test_sharding_ir_eagle_draft_equivalence (e.g. 'llama', "
+            "'nemotron_h'). Builds a tiny EagleDrafterForCausalLM for that "
+            "model_type and checks sharded == unsharded draft prefill. The test "
+            "is skipped (not failed) when this option is absent."
+        ),
+    )
 
 
 @pytest.fixture
@@ -56,3 +68,14 @@ def sharding_ir_modeling_file(request) -> str:
 @pytest.fixture
 def sharding_ir_dist_config(request) -> str:
     return request.config.getoption("--sharding-ir-dist-config")
+
+
+@pytest.fixture
+def sharding_ir_eagle_draft(request) -> str:
+    model_type = request.config.getoption("--sharding-ir-eagle-draft")
+    if model_type is None:
+        pytest.skip(
+            "--sharding-ir-eagle-draft not supplied; Eagle draft sharding IR "
+            "equivalence test is only run on-demand per draft model_type."
+        )
+    return model_type
