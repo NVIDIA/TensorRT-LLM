@@ -166,20 +166,55 @@ def fix_moe_routers_deterministic(model) -> int:
         routing_weights = routing_weights / routing_weights.sum(dim=-1, keepdim=True)
         return routing_weights.to(hidden_states.dtype), selected_experts
 
+    def _patched_linear_router_forward(self, hidden_states):
+        # For bare nn.Linear routers (e.g. Qwen3NextSparseMoeBlock.gate). The
+        # parent block computes softmax+topk on the linear output, so just
+        # adding a strong monotonic bias to the logits is enough to lock
+        # routing to experts [0..top_k-1].
+        out = F.linear(hidden_states, self.weight, self.bias)
+        return out + self._test_router_bias.to(out.dtype)
+
+    # Build a list of (module, parent_class_name) candidates to fix. Two
+    # discovery paths:
+    #   (1) Module class name itself contains "Router" / "Gate" (classic
+    #       wrapper-class pattern: Qwen3_5MoeTopKRouter, NemotronHTopkRouter,
+    #       DeepSeekV3MoEGate, etc.). Handles models authored with a dedicated
+    #       routing class.
+    #   (2) Module is the `.gate` (or `.router`) attribute of a parent module
+    #       whose class name contains "Moe" / "MoE" / "MoEBlock" / "SparseMoe"
+    #       (inlined-router pattern: Qwen3NextSparseMoeBlock has a bare
+    #       nn.Linear named `gate`).
+    candidates = []
+    seen = set()
+    for name, mod in model.named_modules():
+        cls = type(mod).__name__
+        if ("Router" in cls or "Gate" in cls) and id(mod) not in seen:
+            candidates.append((mod, cls))
+            seen.add(id(mod))
+    for parent_name, parent in model.named_modules():
+        pcls = type(parent).__name__
+        if not any(s in pcls for s in ("Moe", "MoE", "SparseMoe")):
+            continue
+        for child_attr in ("gate", "router"):
+            child = getattr(parent, child_attr, None)
+            if child is None or not isinstance(child, torch.nn.Linear):
+                continue
+            if id(child) in seen:
+                continue
+            candidates.append((child, pcls + "." + child_attr))
+            seen.add(id(child))
+
     fixed = 0
     with torch.no_grad():
-        for name, mod in model.named_modules():
-            cls = type(mod).__name__
-            if "Router" not in cls and "Gate" not in cls:
-                continue
+        for mod, cls in candidates:
             if not hasattr(mod, "weight"):
                 continue
             w = mod.weight
             if w.ndim != 2:
                 continue
             num_experts, hidden = w.shape
-            if num_experts > 64:
-                continue  # not a router (probably a FFN projection)
+            if num_experts > 64 or num_experts < 2:
+                continue  # not a top-k router (probably an FFN projection or a sigmoid gate)
             coeffs_fp32 = torch.arange(num_experts, 0, -1, dtype=torch.float32, device=w.device)
             new_w = (
                 (coeffs_fp32 / (hidden**0.5)).unsqueeze(1).expand(num_experts, hidden).to(w.dtype)
@@ -197,6 +232,18 @@ def fix_moe_routers_deterministic(model) -> int:
                 else:
                     mod._test_router_bias.data.copy_(bias)
                 mod.forward = types.MethodType(_patched_qwen_router_forward, mod)
+            elif isinstance(mod, torch.nn.Linear):
+                # Discovered via the parent-class path (e.g.
+                # Qwen3NextSparseMoeBlock.gate). The parent's forward calls
+                # `self.gate(hidden_states)` then runs softmax+topk on the
+                # result, so adding a strong monotonic bias to the linear
+                # output is sufficient to fix routing.
+                bias = (coeffs_fp32 * 100.0).to(w.dtype)
+                if not hasattr(mod, "_test_router_bias"):
+                    mod.register_buffer("_test_router_bias", bias)
+                else:
+                    mod._test_router_bias.data.copy_(bias)
+                mod.forward = types.MethodType(_patched_linear_router_forward, mod)
             fixed += 1
     return fixed
 
@@ -390,16 +437,33 @@ def spec_from_modeling_file(path: str) -> IRModelSpec:
     # caller has done any necessary sys.path / env-var setup.
     from tensorrt_llm._torch.auto_deploy.models.hf import AutoModelForCausalLMFactory
 
-    candidates = [
-        (cfg_name, cls)
-        for cfg_name, cls in AutoModelForCausalLMFactory._custom_model_mapping.items()
-        if cls.__module__ == module_name and cls.__name__.endswith("ForCausalLM")
-    ]
+    # Walk AutoModelForCausalLMFactory AND every subclass. Each subclass gets
+    # its own _custom_model_mapping via __init_subclass__ (see hf.py:668), so a
+    # model registered against a specialized factory (e.g. NemotronFlashForCausalLMFactory,
+    # EagleDrafterFactory) is invisible to a search on the base factory alone.
+    factories = [AutoModelForCausalLMFactory]
+    pending = [AutoModelForCausalLMFactory]
+    seen = {AutoModelForCausalLMFactory}
+    while pending:
+        cls = pending.pop()
+        for sub in cls.__subclasses__():
+            if sub not in seen:
+                seen.add(sub)
+                pending.append(sub)
+                factories.append(sub)
+
+    candidates = []
+    for factory in factories:
+        candidates.extend(
+            (cfg_name, cls)
+            for cfg_name, cls in factory._custom_model_mapping.items()
+            if cls.__module__ == module_name and cls.__name__.endswith("ForCausalLM")
+        )
     if not candidates:
         raise RuntimeError(
             f"No '*ForCausalLM' class registered from {module_name!r}. "
             "Ensure the modeling file ends with a "
-            "'AutoModelForCausalLMFactory.register_custom_model_cls(...)' "
+            "'<AutoModelForCausalLMFactory or subclass>.register_custom_model_cls(...)' "
             "call for a 'ForCausalLM' class."
         )
     config_cls_name, model_cls = candidates[0]
