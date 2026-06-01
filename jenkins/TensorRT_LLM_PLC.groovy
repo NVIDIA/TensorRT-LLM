@@ -131,6 +131,8 @@ def checkoutSource ()
 }
 
 def getPulseToken(serviceId, scopes) {
+    def maxRetries = 3
+    def retryDelaySec = 10
     def token
     //Configure credential 'starfleet-client-id' under Jenkins Credential Manager
     withCredentials([usernamePassword(
@@ -138,12 +140,29 @@ def getPulseToken(serviceId, scopes) {
         usernameVariable: 'SF_CLIENT_ID',
         passwordVariable: 'SF_CLIENT_SECRET'
     )]) {
-        // Do not save AUTH_HEADER to a groovy variable since that
-        // will expose the auth_header without being masked
-        token= sh(script: """
-            AUTH_HEADER=\$(echo -n \$SF_CLIENT_ID:\$SF_CLIENT_SECRET | base64 -w0)
-            curl -s --request POST --header "Authorization: Basic \$AUTH_HEADER" --header "Content-Type: application/x-www-form-urlencoded" "https://${serviceId}.ssa.nvidia.com/token?grant_type=client_credentials&scope=${scopes}" | jq ".access_token" |  tr -d '"'
-        """, returnStdout: true).trim()
+        for (int attempt = 1; attempt <= maxRetries; attempt++) {
+            try {
+                // Do not save AUTH_HEADER to a groovy variable since that
+                // will expose the auth_header without being masked
+                token = sh(script: """
+                    AUTH_HEADER=\$(echo -n \$SF_CLIENT_ID:\$SF_CLIENT_SECRET | base64 -w0)
+                    curl -s --request POST --header "Authorization: Basic \$AUTH_HEADER" --header "Content-Type: application/x-www-form-urlencoded" "https://${serviceId}.ssa.nvidia.com/token?grant_type=client_credentials&scope=${scopes}" | jq ".access_token" |  tr -d '"'
+                """, returnStdout: true).trim()
+            } catch (Exception e) {
+                echo "getPulseToken attempt ${attempt}/${maxRetries} failed: ${e.getMessage()}"
+                token = ""
+            }
+            if (token && token != "null") {
+                break
+            }
+            if (attempt < maxRetries) {
+                echo "getPulseToken returned an empty token (attempt ${attempt}/${maxRetries}), retrying in ${retryDelaySec}s..."
+                sleep(retryDelaySec)
+            }
+        }
+    }
+    if (!token || token == "null") {
+        error("getPulseToken failed to obtain a valid token after ${maxRetries} attempts")
     }
     return token
 }
