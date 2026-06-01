@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import pytest
+from _mm_encode_helpers import _identity_extractor
 
 from tensorrt_llm._torch.models.multimodal_encoding import MixedModalityAssembly, ModalityItem
 
@@ -44,15 +45,6 @@ class TestMultimodalItem:
         )
         with pytest.raises(AttributeError):  # FrozenInstanceError from `@dataclass`(frozen=True)
             item.src_param_idx = 99
-
-
-def _identity_extractor(items_by_param):
-    """Test helper: yield pre-built MultimodalItems passed in by-param."""
-
-    def extract(param_idx, _param):
-        yield from items_by_param[param_idx]
-
-    return extract
 
 
 def _mixed_image_audio_assembly():

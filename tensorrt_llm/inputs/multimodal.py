@@ -333,8 +333,8 @@ class MultimodalPromptOrder(list):  # list[tuple[str, int]]
                          source: str) -> "MultimodalPromptOrder":
         """Normalize order metadata to `(modality, item_index)` pairs.
 
-        Accepted metadata shapes are strings, `(modality, index)` pairs, dicts,
-        and integer `layout_metadata.item_types`. Integer item types are decoded
+        Accepted metadata shapes are `(modality, index)` pairs, dicts, and
+        integer `layout_metadata.item_types`. Integer item types are decoded
         through `_MultimodalItemType` because those values are stable metadata
         codes.
         """
@@ -346,9 +346,6 @@ class MultimodalPromptOrder(list):  # list[tuple[str, int]]
                 item_index = entry.get("index", entry.get("item_index"))
                 if item_index is None:
                     item_index = counters.get(modality, 0)
-            elif isinstance(entry, str):
-                modality = entry
-                item_index = counters.get(modality, 0)
             elif isinstance(entry, int) and source.endswith("item_types"):
                 try:
                     item_type = _MultimodalItemType(entry)
@@ -363,8 +360,8 @@ class MultimodalPromptOrder(list):  # list[tuple[str, int]]
                     modality, item_index = entry
                 except (TypeError, ValueError) as exc:
                     raise ValueError(
-                        f"{source} entries must be modality strings, "
-                        "(modality, index) pairs, or dicts") from exc
+                        f"{source} entries must be (modality, index) pairs "
+                        "or dicts") from exc
             if not isinstance(modality, str):
                 raise ValueError(
                     f"{source} entry has non-string modality: {entry!r}")

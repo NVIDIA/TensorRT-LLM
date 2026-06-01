@@ -8,18 +8,10 @@ from unittest.mock import MagicMock
 
 import pytest
 import torch
+from _mm_encode_helpers import _make_param
 
 from tensorrt_llm._torch.models.modeling_qwen3vl import Qwen3VisionModelBase, _qwen3vl_extract_items
 from tensorrt_llm._torch.models.multimodal_encoding import ModalityItem
-from tensorrt_llm.inputs.multimodal import MultimodalParams
-
-
-def _make_param(multimodal_data: dict) -> MultimodalParams:
-    return MultimodalParams(
-        multimodal_input=None,
-        multimodal_data=multimodal_data,
-        multimodal_runtime=None,
-    )
 
 
 class TestQwen3VLExtractItems:

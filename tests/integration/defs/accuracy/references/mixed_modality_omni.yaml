@@ -6,7 +6,6 @@
 # References were measured on dlcluster B100 job 1068768 while exact B200 access
 # was unavailable. Native paired mixed-vs-pure validation passed on B100 job 1102129;
 # see slop/mixed-modality-integration-test/log.md.
-# TODO(claude): fuse both omni and qwen-vl references into a single mixed-modality references file.
 nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-BF16:
   - accuracy: 70.00
     num_samples: 50

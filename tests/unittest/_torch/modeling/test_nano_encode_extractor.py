@@ -23,6 +23,7 @@ from unittest.mock import MagicMock
 
 import pytest
 import torch
+from _mm_encode_helpers import _identity_extractor, _make_param
 
 from tensorrt_llm._torch.models.modeling_nemotron_nano import (
     NemotronH_Nano_VL_V2,
@@ -35,24 +36,6 @@ from tensorrt_llm._torch.models.multimodal_encoding import (
 )
 from tensorrt_llm.inputs.evs import compute_retained_tokens_from_tubelet_budget
 from tensorrt_llm.inputs.multimodal import MultimodalParams, MultimodalRuntimeData
-
-
-def _identity_extractor(items_by_param):
-    """Test helper: yield pre-built MultimodalItems passed in by-param."""
-
-    def extract(param_idx, _param):
-        yield from items_by_param.get(param_idx, [])
-
-    return extract
-
-
-def _make_param(multimodal_data: dict) -> MultimodalParams:
-    """Build a stub MultimodalParams for extractor unit tests."""
-    return MultimodalParams(
-        multimodal_input=None,
-        multimodal_data=multimodal_data,
-        multimodal_runtime=None,
-    )
 
 
 class TestNanoExtractItems:

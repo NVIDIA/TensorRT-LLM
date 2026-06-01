@@ -13,8 +13,21 @@ from tensorrt_llm.inputs.registry import (
 )
 from tensorrt_llm.sampling_params import SamplingParams
 
-# TODO(claude) : add concise docstrings/comments explaining intended behavior for each test.
-# TODO(claude) : If there are some constants/macros declare it globally.
+# Synthetic token-id scheme shared by the fake processors below. Each modality
+# has a placeholder id (the pre-expansion token in the prompt) and a feature id
+# (the post-expansion token the encoder emits); per-item token counts are
+# distinct per modality so a flatten in the wrong order is observable.
+_IMAGE_PLACEHOLDER_ID = 100
+_VIDEO_PLACEHOLDER_ID = 200
+_AUDIO_PLACEHOLDER_ID = 300
+_IMAGE_FEATURE_ID = 101
+_VIDEO_FEATURE_ID = 201
+_AUDIO_FEATURE_ID = 301
+_IMAGE_TOKENS = 2
+_VIDEO_TOKENS = 4
+_AUDIO_TOKENS = 3
+# Per-item token counts in image, video, audio prompt order.
+_MIXED_PROMPT_ORDER_TOKENS = [_IMAGE_TOKENS, _VIDEO_TOKENS, _AUDIO_TOKENS]
 
 
 class _FakeMixedProcessor:
@@ -59,9 +72,9 @@ class _FakeMixedProcessor:
     # Modality membership for both placeholder (pre-expansion) and feature
     # (post-expansion) token ids, so order parsing is expansion-tolerant.
     _MODALITY_TOKEN_IDS: ClassVar[dict[str, set[int]]] = {
-        "image": {100, 101},
-        "video": {200, 201},
-        "audio": {300, 301},
+        "image": {_IMAGE_PLACEHOLDER_ID, _IMAGE_FEATURE_ID},
+        "video": {_VIDEO_PLACEHOLDER_ID, _VIDEO_FEATURE_ID},
+        "audio": {_AUDIO_PLACEHOLDER_ID, _AUDIO_FEATURE_ID},
     }
 
     def get_mm_item_order(self, prompt_token_ids, mm_data):
@@ -90,46 +103,52 @@ class _FakeMixedProcessor:
         assert hf_processor_mm_kwargs is None
         assert mm_data is not None
         self.lengths_seen_by_expander = list(num_mm_tokens_per_placeholder)
-        assert self.lengths_seen_by_expander == [2, 4, 3]
+        assert self.lengths_seen_by_expander == _MIXED_PROMPT_ORDER_TOKENS
         return [
             10,
-            101,
-            101,
+            _IMAGE_FEATURE_ID,
+            _IMAGE_FEATURE_ID,
             11,
-            201,
-            201,
-            201,
-            201,
+            _VIDEO_FEATURE_ID,
+            _VIDEO_FEATURE_ID,
+            _VIDEO_FEATURE_ID,
+            _VIDEO_FEATURE_ID,
             12,
-            301,
-            301,
-            301,
+            _AUDIO_FEATURE_ID,
+            _AUDIO_FEATURE_ID,
+            _AUDIO_FEATURE_ID,
             13,
         ], None
 
     def get_num_tokens_per_image(self, image):
         assert image.tolist() == [1]
-        return 2
+        return _IMAGE_TOKENS
 
     def get_num_tokens_per_video(self, **kwargs):
         self.video_call_kwargs = kwargs
-        return 4
+        return _VIDEO_TOKENS
 
     def get_num_tokens_per_audio(self, audio):
         assert audio.tolist() == [3]
-        return 3
+        return _AUDIO_TOKENS
 
     def get_vocab_size(self):
         return None
 
     def get_mm_token_ids(self):
-        return torch.tensor([101, 201, 301])
+        return torch.tensor([_IMAGE_FEATURE_ID, _VIDEO_FEATURE_ID, _AUDIO_FEATURE_ID])
 
     def get_mm_special_token_ids(self):
         return None
 
 
 def test_find_mm_token_lengths_preserves_all_modalities_and_video_audio():
+    """find_mm_token_lengths keeps every modality and threads VideoData audio.
+
+    A `VideoData` carrying an embedded audio track must forward its frames,
+    metadata, and audio payload to the processor's per-video token-count hook,
+    and the returned lengths must cover all three modalities (one entry each).
+    """
     processor = _FakeMixedProcessor()
     video_audio = AudioData(samples=torch.ones(16000).numpy(), sample_rate=16000)
     mm_data = {
@@ -146,13 +165,24 @@ def test_find_mm_token_lengths_preserves_all_modalities_and_video_audio():
 
     lengths = find_mm_token_lengths(mm_data, processor)
 
-    assert lengths == {"image": [2], "video": [4], "audio": [3]}
+    assert lengths == {
+        "image": [_IMAGE_TOKENS],
+        "video": [_VIDEO_TOKENS],
+        "audio": [_AUDIO_TOKENS],
+    }
     assert torch.equal(processor.video_call_kwargs["video"][0], torch.tensor([2]))
     assert processor.video_call_kwargs["video_metadata"] == {"fps": 30.0}
     assert processor.video_call_kwargs["video_audio"] is video_audio
 
 
 def test_tokenized_wrapper_mixed_modalities_builds_metadata_for_all_items():
+    """Hashing wrapper builds per-item metadata across all mixed modalities.
+
+    On the tokenized fast path the wrapper must expand every modality's
+    placeholder run, populate the multimodal input metadata (positions,
+    lengths, uuids, run offsets) for all three items, and record the
+    prompt-ordered embedding lengths.
+    """
     processor = _FakeMixedProcessor()
     wrapper = create_input_processor_with_hash(processor)
     mm_data = {
@@ -163,7 +193,15 @@ def test_tokenized_wrapper_mixed_modalities_builds_metadata_for_all_items():
 
     prompt_token_ids, extra = wrapper(
         {
-            "prompt_token_ids": [10, 100, 11, 200, 12, 300, 13],
+            "prompt_token_ids": [
+                10,
+                _IMAGE_PLACEHOLDER_ID,
+                11,
+                _VIDEO_PLACEHOLDER_ID,
+                12,
+                _AUDIO_PLACEHOLDER_ID,
+                13,
+            ],
             "multi_modal_data": mm_data,
             "multi_modal_uuids": {
                 "image": ["img-0"],
@@ -174,42 +212,51 @@ def test_tokenized_wrapper_mixed_modalities_builds_metadata_for_all_items():
         SamplingParams(),
     )
 
-    assert processor.lengths_seen_by_expander == [2, 4, 3]
+    assert processor.lengths_seen_by_expander == _MIXED_PROMPT_ORDER_TOKENS
     assert prompt_token_ids == [
         10,
-        101,
-        101,
+        _IMAGE_FEATURE_ID,
+        _IMAGE_FEATURE_ID,
         11,
-        201,
-        201,
-        201,
-        201,
+        _VIDEO_FEATURE_ID,
+        _VIDEO_FEATURE_ID,
+        _VIDEO_FEATURE_ID,
+        _VIDEO_FEATURE_ID,
         12,
-        301,
-        301,
-        301,
+        _AUDIO_FEATURE_ID,
+        _AUDIO_FEATURE_ID,
+        _AUDIO_FEATURE_ID,
         13,
     ]
     mm_input = extra["multimodal_input"]
     assert mm_input.multimodal_positions == [1, 4, 9]
-    assert mm_input.multimodal_lengths == [2, 4, 3]
+    assert mm_input.multimodal_lengths == _MIXED_PROMPT_ORDER_TOKENS
     assert mm_input.multimodal_uuids == ["img-0", "vid-0", "aud-0"]
     assert mm_input.multimodal_item_run_cu_offsets == [0, 1, 2, 3]
     assert mm_input.multimodal_run_positions == [1, 4, 9]
-    assert mm_input.multimodal_run_lengths == [2, 4, 3]
-    assert extra["multimodal_data"]["multimodal_embedding_lengths"] == [2, 4, 3]
+    assert mm_input.multimodal_run_lengths == _MIXED_PROMPT_ORDER_TOKENS
+    assert extra["multimodal_data"]["multimodal_embedding_lengths"] == _MIXED_PROMPT_ORDER_TOKENS
 
 
 def test_text_wrapper_single_video_uses_default_item_order():
+    """A single-modality (video-only) request bypasses the prompt-order hook.
+
+    With one modality there is nothing to interleave, so resolve falls back to
+    the default modality-major order without calling `get_mm_item_order`, and
+    the wrapper still emits the single-item metadata and order entry.
+    """
+
     class _SingleVideoProcessor(_FakeMixedProcessor):
         def __call__(self, inputs, sampling_params):
-            return [10, 201, 201, 201, 201, 13], {"multimodal_data": {"video": {}}}
+            return [10] + [_VIDEO_FEATURE_ID] * _VIDEO_TOKENS + [13], {
+                "multimodal_data": {"video": {}}
+            }
 
         def get_mm_item_order(self, prompt_token_ids, mm_data):
             raise AssertionError("single-modality requests should not need prompt-order hooks")
 
         def get_mm_token_ids(self):
-            return torch.tensor([201])
+            return torch.tensor([_VIDEO_FEATURE_ID])
 
     processor = _SingleVideoProcessor()
     wrapper = create_input_processor_with_hash(processor)
@@ -218,17 +265,15 @@ def test_text_wrapper_single_video_uses_default_item_order():
         SamplingParams(),
     )
 
-    assert prompt_token_ids == [10, 201, 201, 201, 201, 13]
+    assert prompt_token_ids == [10] + [_VIDEO_FEATURE_ID] * _VIDEO_TOKENS + [13]
     assert extra["multimodal_input"].multimodal_positions == [1]
-    assert extra["multimodal_input"].multimodal_lengths == [4]
+    assert extra["multimodal_input"].multimodal_lengths == [_VIDEO_TOKENS]
     assert extra["multimodal_data"]["multimodal_item_order"] == [{"modality": "video", "index": 0}]
 
 
-# Placeholder token IDs the fake processor emits for each modality in the
-# tokenized fast path. The interleaved prompt below carries image, audio, image
-# in that exact prompt order, so the resolved order is NOT modality-major.
-_IMAGE_PLACEHOLDER_ID = 100
-_AUDIO_PLACEHOLDER_ID = 300
+# The interleaved prompt below carries image, audio, image in that exact prompt
+# order (using the module-level placeholder ids above), so the resolved order is
+# NOT modality-major.
 
 # Distinct per-item token counts so the flattened list is order-sensitive: the
 # only way to get [2, 5, 3] (img0, audio0, img1) is to flatten in PROMPT order
@@ -367,6 +412,7 @@ def _mixed_interleaved_inputs():
 
 
 def test_call_with_token_ids_flattens_mixed_modalities_in_prompt_order():
+    """call_with_token_ids flattens mixed-modality counts in prompt-item order."""
     # Drives BaseMultimodalInputProcessor.call_with_token_ids directly (the
     # disaggregated/tokenized fast path authored by PR #14419). With an
     # interleaved image, audio, image prompt, the per-item counts passed to
@@ -388,6 +434,7 @@ def test_call_with_token_ids_flattens_mixed_modalities_in_prompt_order():
 
 
 def test_call_with_token_ids_red_when_flatten_regresses_to_single_modality(monkeypatch):
+    """RED guard: a single-modality flatten regression is caught by the assertion."""
     # RED guard: prove the assertion above actually catches a regression. Stub
     # MultimodalPromptOrder.flatten to emulate the superseded single-modality
     # (first-bucket-only, `next(iter(num_mm_tokens_by_key.values()))`)

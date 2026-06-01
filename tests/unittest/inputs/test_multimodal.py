@@ -1,7 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# TODO(claude): correct the docstring below.
-"""Tests for MultimodalRuntimeData cumsum math and the flat-mask producer."""
+"""Unit tests for `tensorrt_llm.inputs.multimodal`.
+
+Covers the `MultimodalPromptOrder` prompt-order type (constructors,
+validation, and the flatten/flatten_uuids projections plus `resolve`),
+`MultimodalRuntimeData` cumsum math, and the flat-mask producers
+(`maybe_compute_mm_embed_cumsum` and the `_compute_mm_masks` helpers).
+"""
 
 import pytest
 import torch
@@ -62,11 +67,6 @@ class TestMultimodalPromptOrder:
         assert list(result) == []
         assert isinstance(result, MultimodalPromptOrder)
 
-    def test_from_raw_entries_string_form(self):
-        result = MultimodalPromptOrder.from_raw_entries(["image", "image", "video"], source="x")
-        assert list(result) == [("image", 0), ("image", 1), ("video", 0)]
-        assert isinstance(result, MultimodalPromptOrder)
-
     def test_from_raw_entries_dict_form(self):
         result = MultimodalPromptOrder.from_raw_entries(
             [{"modality": "image", "index": 1}, {"type": "video"}],
@@ -97,11 +97,12 @@ class TestMultimodalPromptOrder:
             MultimodalPromptOrder.from_raw_entries([7], source="layout_metadata.item_types")
 
     def test_from_metadata_prefers_multimodal_item_order(self):
+        # Mixed dict + tuple entry shapes resolve to the same (modality, index) pairs.
         result = MultimodalPromptOrder.from_metadata(
             {
                 "multimodal_item_order": [
                     {"modality": "image", "index": 1},
-                    "video",
+                    {"type": "video"},
                     ("image", 0),
                 ]
             }
