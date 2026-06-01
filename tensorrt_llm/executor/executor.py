@@ -242,7 +242,11 @@ class GenerationExecutor(ABC):
                 or self.postproc_config.num_postprocess_workers > 0,
                 drop_generation_logits=(
                     not request.sampling_params._need_return_generation_logits)
-                or self.postproc_config.num_postprocess_workers > 0)
+                or self.postproc_config.num_postprocess_workers > 0,
+                logprobs_simple_format=request.sampling_params.
+                logprobs_simple_format,
+                prompt_logprobs_simple_format=request.sampling_params.
+                prompt_logprobs_simple_format)
 
         return logprob_params
 
