@@ -914,6 +914,7 @@ class PyTorchModelEngine(ModelEngine):
 
         with flashinfer_autotune(tune_mode, cache=cache_path):
             yield
+
     def _assert_all_tp_ranks_have_warmup_batch(self, batch,
                                                num_tokens: int) -> None:
         """Assert every TP rank has a valid warmup batch, or raise with diagnostics.
