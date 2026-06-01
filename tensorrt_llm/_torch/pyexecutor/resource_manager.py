@@ -47,6 +47,9 @@ from tensorrt_llm.runtime.kv_cache_manager_v2._block_radix_tree import \
 from tensorrt_llm.runtime.kv_cache_manager_v2._common import (BAD_PAGE_INDEX,
                                                               GPU_LEVEL)
 from tensorrt_llm.runtime.kv_cache_manager_v2._config import DataRole
+from tensorrt_llm.runtime.kv_cache_manager_v2._exceptions import CuError
+from tensorrt_llm.runtime.kv_cache_manager_v2._exceptions import \
+    OutOfMemoryError as KVCacheOutOfMemoryError
 from tensorrt_llm.runtime.kv_cache_manager_v2._utils import (exact_div,
                                                              typed_range)
 from tensorrt_llm.sampling_params import SamplingParams
@@ -73,6 +76,7 @@ WorldConfig = tensorrt_llm.bindings.WorldConfig
 if TYPE_CHECKING:
     from tensorrt_llm._torch.attention_backend.interface import \
         AttentionMetadata
+    from tensorrt_llm.llmapi.llm_args import DecodingBaseConfig
 
 BlocksPerWindow = Dict[int, Tuple[
     int,
@@ -2556,6 +2560,9 @@ class KVCacheManagerV2(BaseResourceManager):
                 f"KV cache manager v2 disk cache quota set to {disk_cache_size / (1 << 30):.2f}GiB at {disk_cache_path}"
             )
 
+        self.has_host_cache_tier = any(
+            isinstance(tier, HostCacheTierConfig) for tier in cache_tiers)
+
         self.vocab_size = vocab_size
 
         config = self._build_cache_config(
@@ -2567,7 +2574,29 @@ class KVCacheManagerV2(BaseResourceManager):
 
         self.kv_cache_manager_py_config = config
 
-        self.impl = KVCacheManagerPy(config)
+        try:
+            self.impl = KVCacheManagerPy(config)
+        except (CuError, KVCacheOutOfMemoryError):
+            if self.has_host_cache_tier:
+                logger.warning(
+                    "Failed to initialize KV cache manager with host cache "
+                    "tier (cuMemHostRegister may have failed). "
+                    "Retrying without host cache tier.")
+                cache_tiers_gpu_only = [
+                    t for t in cache_tiers if isinstance(t, GpuCacheTierConfig)
+                ]
+                config = self._build_cache_config(
+                    kv_cache_config,
+                    tokens_per_block=tokens_per_block,
+                    vocab_size=vocab_size,
+                    cache_tiers=cache_tiers_gpu_only,
+                )
+                cache_tiers = cache_tiers_gpu_only
+                self.has_host_cache_tier = False
+                self.kv_cache_manager_py_config = config
+                self.impl = KVCacheManagerPy(config)
+            else:
+                raise
 
         self.num_pools = len(self.impl.layer_grouping)
 

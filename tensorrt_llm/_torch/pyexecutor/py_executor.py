@@ -94,6 +94,11 @@ PROFILE_TRACE_ENV_VAR_NAME = "TLLM_TORCH_PROFILE_TRACE"
 # Default: "0" (only rank 0 prints, matching existing behavior).
 PROFILE_LOG_RANKS_ENV_VAR_NAME = "TLLM_PROFILE_LOG_RANKS"
 
+# C++ LlmRequest.pause() requires a prompt-length cap. Recompute pause should
+# replay all generated tokens in PyTorch instead of inheriting TRT build-time
+# max_input_len truncation.
+_UNBOUNDED_PAUSE_MAX_INPUT_LEN = 0x7fffffff
+
 
 class PPCommTag(IntEnum):
     """
@@ -1336,7 +1341,9 @@ class PyExecutor:
                 pass
 
         num_paused_requests = 0
-        for req in scheduled_batch.paused_requests:
+        paused_requests = (scheduled_batch.paused_requests +
+                           scheduled_batch.recompute_paused_requests)
+        for req in paused_requests:
             if filter_dummies and self._is_stats_dummy_request(req):
                 continue
             num_paused_requests += 1
@@ -1461,6 +1468,9 @@ class PyExecutor:
             else:
                 self._latest_kv_iter_stats = None
 
+        paused_requests = (scheduled_batch.paused_requests +
+                           scheduled_batch.recompute_paused_requests)
+
         # Attention-DP may add dummy requests to keep ranks aligned during
         # distributed scheduling. CUDA graph padding can add dummies too.
         # Those placeholders are not user work, so count the request lists
@@ -1475,13 +1485,12 @@ class PyExecutor:
             num_gen_requests = sum(
                 1 for req in scheduled_batch.generation_requests
                 if not self._is_stats_dummy_request(req))
-            num_paused_requests = sum(1
-                                      for req in scheduled_batch.paused_requests
+            num_paused_requests = sum(1 for req in paused_requests
                                       if not self._is_stats_dummy_request(req))
         else:
             num_context_requests = scheduled_batch.num_context_requests
             num_gen_requests = scheduled_batch.num_generation_requests
-            num_paused_requests = len(scheduled_batch.paused_requests)
+            num_paused_requests = len(paused_requests)
         num_context_requests = int(
             scheduled_batch_stats.num_ctx_requests if scheduled_batch_stats.
             num_ctx_requests is not None else num_context_requests)
@@ -1647,7 +1656,7 @@ class PyExecutor:
         # requests — were decoding but got evicted back to the waiting
         # pool for this iteration.
         num_paused_kv_tokens = 0
-        for req in scheduled_batch.paused_requests:
+        for req in paused_requests:
             if self._is_stats_dummy_request(req):
                 continue
             try:
@@ -2036,6 +2045,9 @@ class PyExecutor:
                     # Run scheduler locally because scheduler may change llm requests' state.
                     self.scheduler.schedule_request(self.active_requests,
                                                     self.inflight_req_ids)
+
+                self._terminate_recompute_paused_requests(scheduled_batch)
+                self._pause_recompute_paused_requests(scheduled_batch)
 
                 # For requests that are fitting disagg gen init, also prepare resources for KV cache manager
                 if self.kv_cache_transceiver:
@@ -2861,6 +2873,9 @@ class PyExecutor:
                 if should_retry:
                     continue
 
+                self._terminate_recompute_paused_requests(scheduled_batch)
+                self._pause_recompute_paused_requests(scheduled_batch)
+
                 if not self._is_kv_manager_v2:
                     self._terminate_requests(scheduled_batch.paused_requests)
                     self._pause_requests(scheduled_batch.paused_requests)
@@ -3246,6 +3261,8 @@ class PyExecutor:
                 if should_retry:
                     continue
 
+                self._terminate_recompute_paused_requests(scheduled_batch)
+
                 if not self._is_kv_manager_v2:
                     self._terminate_requests(scheduled_batch.paused_requests)
 
@@ -3394,6 +3411,7 @@ class PyExecutor:
 
                 if not self._is_kv_manager_v2:
                     self._pause_requests(scheduled_batch.paused_requests)
+                self._pause_recompute_paused_requests(scheduled_batch)
 
                 if can_queue:
                     guided_decoder_failed_requests = None
@@ -4020,6 +4038,7 @@ class PyExecutor:
         scheduled_requests.reset_context_requests(scheduled_context_requests)
         scheduled_requests.generation_requests = scheduler_output.generation_requests
         scheduled_requests.paused_requests = scheduler_output.paused_requests
+        scheduled_requests.recompute_paused_requests = scheduler_output.recompute_paused_requests
 
         return scheduled_requests, scheduler_output.fitting_disagg_gen_init_requests, num_fitting
 
@@ -5099,6 +5118,44 @@ class PyExecutor:
     def _pause_requests(self, requests_to_pause):
         for req in requests_to_pause:
             req.pause(self.max_input_len)
+
+    def _pause_recompute_request(self, req):
+        req.pause(_UNBOUNDED_PAUSE_MAX_INPUT_LEN)
+        req.py_batch_idx = None
+        req.py_seq_slot = None
+        req.py_prompt_len = req.prompt_len
+        req.py_orig_prompt_len = req.prompt_len
+        req.py_max_new_tokens = req.max_new_tokens
+        req.seqlen_this_rank_cp = req.prompt_len
+        req.total_input_len_cp = req.prompt_len
+        req.py_draft_pages_allocated = 0
+        req.py_rewind_len = 0
+        req.py_draft_tokens = []
+        req.draft_tokens = []
+        req.py_last_context_chunk = (None, None)
+        req.py_last_draft_tokens = None
+        req.py_num_accepted_draft_tokens = 0
+        req.py_num_accepted_draft_tokens_indices = []
+        req.py_rewind_draft_token_separate_adjustment = 0
+        req.py_decoding_iter = 0
+        req.py_ctx_pre_resize_cap = None
+        req._cached_tokens = 0
+        req._cached_tokens_set = False
+
+    def _terminate_recompute_paused_requests(
+            self, scheduled_batch: ScheduledRequests):
+        requests = scheduled_batch.recompute_paused_requests
+        if not requests:
+            return
+        self._terminate_requests(requests)
+
+    def _pause_recompute_paused_requests(self,
+                                         scheduled_batch: ScheduledRequests):
+        requests = scheduled_batch.recompute_paused_requests
+        if not requests:
+            return
+        for req in requests:
+            self._pause_recompute_request(req)
 
     def _add_inflight_ids(self, scheduled_requests: ScheduledRequests):
         """Add request IDs of current sampling requests to self.inflight_req_ids.
