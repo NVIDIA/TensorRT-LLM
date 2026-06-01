@@ -50,7 +50,7 @@ def serialize_item(obj: object) -> bytes:
     """Serialize a supported multimodal hash leaf to bytes.
 
     The encoding is canonical and self-describing: every value is
-    ``[1-byte type tag][typed metadata][length-prefixed payload]`` with all
+    `[1-byte type tag][typed metadata][length-prefixed payload]` with all
     multi-byte integers big-endian. This prevents cache-key hash collisions
     between distinct values that happen to share a raw byte payload (for
     example transposed image dimensions or reshaped arrays).
@@ -78,35 +78,24 @@ def serialize_item(obj: object) -> bytes:
             + _u32(height)
             + _len_prefixed(payload)
         )
-    if isinstance(obj, torch.Tensor):
-        tensor = obj.detach().cpu().contiguous()
-        payload = tensor.numpy().tobytes()
-        shape = tuple(tensor.shape)
+    if isinstance(obj, (torch.Tensor, np.ndarray)):
+        # The container (torch.Tensor vs np.ndarray) is not part of the content
+        # identity -- only dtype, shape, and raw bytes are. Normalize both to a
+        # contiguous NumPy array so identical content hashes identically.
+        if isinstance(obj, torch.Tensor):
+            obj = obj.detach().cpu().contiguous().numpy()
+        array = np.ascontiguousarray(obj)
         parts = [
             _u8(0x11),
-            _len_prefixed(str(tensor.dtype).encode("utf-8")),
-            _u8(len(shape)),
+            _len_prefixed(array.dtype.str.encode("utf-8")),
+            _u8(array.ndim),
         ]
-        parts.extend(_u64(dim) for dim in shape)
-        parts.append(_len_prefixed(payload))
+        parts.extend(_u64(dim) for dim in array.shape)
+        parts.append(_len_prefixed(array.tobytes()))
         return b"".join(parts)
-    if isinstance(obj, np.ndarray):
-        contiguous = np.ascontiguousarray(obj)
-        payload = contiguous.tobytes()
-        shape = contiguous.shape
-        parts = [
-            _u8(0x12),
-            _len_prefixed(obj.dtype.str.encode("utf-8")),
-            _u8(len(shape)),
-        ]
-        parts.extend(_u64(dim) for dim in shape)
-        parts.append(_len_prefixed(payload))
-        return b"".join(parts)
-    if isinstance(obj, tuple):
-        parts = [_u8(0x21), _u64(len(obj))]
-        parts.extend(serialize_item(item) for item in obj)
-        return b"".join(parts)
-    if isinstance(obj, list):
+    if isinstance(obj, (tuple, list)):
+        # Ordered sequence; the container (tuple vs list) is not part of the
+        # content identity.
         parts = [_u8(0x20), _u64(len(obj))]
         parts.extend(serialize_item(item) for item in obj)
         return b"".join(parts)

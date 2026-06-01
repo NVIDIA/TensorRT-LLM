@@ -20,7 +20,8 @@ from tensorrt_llm.bindings.internal.testing import \
 from tensorrt_llm.inputs.multimodal import (MultimodalInput,
                                             _find_mm_token_runs_from_mask,
                                             apply_mm_hashes)
-from tensorrt_llm.inputs.multimodal_data import AudioData, VideoData
+from tensorrt_llm.inputs.multimodal_data import (AudioData, VideoData,
+                                                 serialize_item)
 from tensorrt_llm.llmapi import KvCacheConfig
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.sampling_params import SamplingParams
@@ -321,11 +322,7 @@ def test_apply_mm_hashes_uuid_content_combined():
 
 
 def _make_video(frames, audio_samples=None, sample_rate=16000, metadata=None):
-    """Build a VideoData from frames with optional audio and metadata.
-
-    Module-level helper shared by the mm-hash tests (lifted from the former
-    local closure in test_apply_mm_hashes_video_audio_affects_hash).
-    """
+    """Module-level helper shared by the mm-hash tests."""
     audio = None
     if audio_samples is not None:
         audio = AudioData(samples=audio_samples, sample_rate=sample_rate)
@@ -370,7 +367,6 @@ def test_apply_mm_hashes_video_audio_affects_hash():
 
 
 def test_apply_mm_hashes_image_dims_distinguished():
-    """Nvbug 6226933: same-fill images of transposed dims must not collide."""
     img_tall = Image.new("RGBA", (30, 100), (10, 20, 30, 40))
     img_wide = Image.new("RGBA", (100, 30), (10, 20, 30, 40))
 
@@ -381,7 +377,6 @@ def test_apply_mm_hashes_image_dims_distinguished():
 
 
 def test_apply_mm_hashes_ndarray_shape_distinguished():
-    """Nvbug 6226933: ndarrays with same bytes but different shapes differ."""
     base = np.arange(12, dtype=np.uint8)
     arr_2x6 = base.reshape(2, 6, 1)
     arr_3x4 = base.reshape(3, 4, 1)
@@ -397,7 +392,6 @@ def test_apply_mm_hashes_ndarray_shape_distinguished():
 
 
 def test_apply_mm_hashes_tensor_shape_distinguished():
-    """Nvbug 6226933: tensors with same data but different shapes differ."""
     data = torch.arange(3 * 224 * 224, dtype=torch.float32)
     t_chw = data.reshape(3, 224, 224)
     t_nchw = data.reshape(1, 3, 224, 224)
@@ -409,7 +403,6 @@ def test_apply_mm_hashes_tensor_shape_distinguished():
 
 
 def test_apply_mm_hashes_video_metadata_distinguished():
-    """Nvbug 6226933: VideoData metadata participates in the hash."""
     frames = [
         Image.new("RGB", (2, 2), (10, 20, 30)),
         Image.new("RGB", (2, 2), (40, 50, 60)),
@@ -447,11 +440,8 @@ def test_apply_mm_hashes_video_metadata_distinguished():
 
 
 def test_apply_mm_hashes_video_metadata_numpy_scalars():
-    """Nvbug 6226933: numpy-typed video metadata hashes without crashing.
-
-    It matches the equivalent Python-typed metadata (numpy 2.x scalars such as
-    np.int64/np.float32/np.bool_ are not subclasses of Python int/float/bool).
-    """
+    # numpy 2.x scalars (np.int64/np.float32/np.bool_) are not subclasses of
+    # Python int/float/bool; numpy-typed metadata must hash like Python-typed.
     frames = [Image.new("RGB", (2, 2), (10, 20, 30))]
     meta_py = {
         "fps": 30.0,
@@ -475,7 +465,6 @@ def test_apply_mm_hashes_video_metadata_numpy_scalars():
 
 
 def test_apply_mm_hashes_videodata_vs_framelist_distinguished():
-    """Nvbug 6226933: VideoData(frames) and a bare frame list must differ."""
     frames = [
         Image.new("RGB", (2, 2), (10, 20, 30)),
         Image.new("RGB", (2, 2), (40, 50, 60)),
@@ -489,7 +478,6 @@ def test_apply_mm_hashes_videodata_vs_framelist_distinguished():
 
 
 def test_apply_mm_hashes_identical_inputs_match():
-    """Identical inputs (and copies) hash identically across types."""
     img = Image.new("RGBA", (8, 12), (1, 2, 3, 4))
     img_copy = Image.new("RGBA", (8, 12), (1, 2, 3, 4))
     h_img, _ = apply_mm_hashes({"image": [img]})
@@ -519,6 +507,23 @@ def test_apply_mm_hashes_identical_inputs_match():
     h_v, _ = apply_mm_hashes({"video": [video]})
     h_v_copy, _ = apply_mm_hashes({"video": [video_copy]})
     assert h_v["video"][0] == h_v_copy["video"][0]
+
+
+def test_serialize_item_array_container_agnostic():
+    # A torch.Tensor and an np.ndarray with identical dtype/shape/bytes are the
+    # same multimodal content, so the container type is not part of the hash
+    # identity. Shape and dtype still distinguish.
+    tensor = torch.arange(24, dtype=torch.float32).reshape(2, 3, 4)
+    array = np.arange(24, dtype=np.float32).reshape(2, 3, 4)
+    assert serialize_item(tensor) == serialize_item(array)
+    assert serialize_item(tensor.reshape(4, 3, 2)) != serialize_item(array)
+    assert serialize_item(np.arange(24, dtype=np.int64)) != serialize_item(
+        np.arange(24, dtype=np.float64))
+
+
+def test_serialize_item_sequence_container_agnostic():
+    # A tuple and a list with identical elements are the same ordered sequence.
+    assert serialize_item((1, 2.0, b"x")) == serialize_item([1, 2.0, b"x"])
 
 
 def test_apply_mm_hashes_audio_data_deterministic():
