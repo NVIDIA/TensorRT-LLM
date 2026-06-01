@@ -609,7 +609,11 @@ _SMALL_MODEL_CONFIGS = {
             "head_dim": 64,
             "mamba_num_heads": 4,
             "mamba_head_dim": 64,
-            "n_groups": 2,
+            # n_groups=1 keeps the mamba gated-RMSNorm group_size
+            # (= mamba_num_heads * mamba_head_dim / n_groups = 256) at/above the NVFP4
+            # quant kernel minimum of 256; n_groups=2 yields 128 and trips
+            # "group_size must be between 256 and 8192".
+            "n_groups": 1,
             "ssm_state_size": 8,
             "conv_kernel": 4,
             "n_routed_experts": 4,
