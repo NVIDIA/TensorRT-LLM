@@ -548,15 +548,11 @@ class Eagle3OneModelWorker(SpecWorkerBase):
         # target verify metadata can be restored (needed for CUDA graph capture).
         self._saved_helix_position_offsets = None
         self._saved_helix_is_inactive_rank = None
-        self._saved_helix_num_active_tokens = None
         if getattr(attn_metadata, 'helix_position_offsets', None) is not None:
             self._saved_helix_position_offsets = attn_metadata.helix_position_offsets.clone(
             )
         if getattr(attn_metadata, 'helix_is_inactive_rank', None) is not None:
             self._saved_helix_is_inactive_rank = attn_metadata.helix_is_inactive_rank.clone(
-            )
-        if getattr(attn_metadata, 'helix_num_active_tokens', None) is not None:
-            self._saved_helix_num_active_tokens = attn_metadata.helix_num_active_tokens.clone(
             )
 
     def _restore_attn_metadata_from_spec_dec(self, attn_metadata):
@@ -569,10 +565,6 @@ class Eagle3OneModelWorker(SpecWorkerBase):
             attn_metadata.helix_is_inactive_rank.copy_(
                 self._saved_helix_is_inactive_rank)
             self._saved_helix_is_inactive_rank = None
-        if self._saved_helix_num_active_tokens is not None:
-            attn_metadata.helix_num_active_tokens.copy_(
-                self._saved_helix_num_active_tokens)
-            self._saved_helix_num_active_tokens = None
         if self._saved_kv_lens_cuda is not None:
             batch_size = self._saved_kv_lens_cuda.shape[0]
             attn_metadata.kv_lens_cuda[:batch_size].copy_(
@@ -623,8 +615,6 @@ class Eagle3OneModelWorker(SpecWorkerBase):
         attn_metadata.helix_position_offsets[:batch_size].copy_(
             pos.to(torch.int32))
         attn_metadata.helix_is_inactive_rank[:batch_size].copy_(~owner)
-        attn_metadata.helix_num_active_tokens[:batch_size].copy_(
-            owner.to(torch.int32))
         return owner
 
     # Skip torch.compile for now since current Torch is not compatible with Triton 3.4

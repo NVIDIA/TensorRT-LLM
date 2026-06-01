@@ -399,7 +399,6 @@ class AttentionMetadata:
         self,
         helix_position_offsets: List[int],
         helix_is_inactive_rank: List[bool],
-        helix_num_active_tokens: Optional[List[int]] = None,
         helix_total_input_len: Optional[List[int]] = None,
     ) -> None:
         """

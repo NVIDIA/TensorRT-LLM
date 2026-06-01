@@ -2686,7 +2686,6 @@ class PyTorchModelEngine(ModelEngine):
         # of query tokens this CP rank writes KV for). Populated in the extend
         # (speculative verify) and generation loops below.
         helix_is_inactive_rank, helix_position_offsets = [], []
-        helix_num_active_tokens = []
         helix_total_input_len = []
         # Cache invariant method result to avoid repeated calls per-request.
         _has_cp_helix = self.mapping.has_cp_helix()
@@ -2733,13 +2732,12 @@ class PyTorchModelEngine(ModelEngine):
                     # Under Helix each rank holds only a shard of the sequence, so
                     # query token positions are computed globally and the per-rank
                     # cached length is provided by the resource manager.
-                    positions_h, inactive_h, num_active_h = self._helix_verify_token_params(
+                    positions_h, inactive_h, _ = self._helix_verify_token_params(
                         request, num_draft_tokens, _helix_tokens_per_block)
                     past_seen_token_num = request.py_helix_local_past_seen
                     position_ids.extend(positions_h)
                     helix_position_offsets.extend(positions_h)
                     helix_is_inactive_rank.extend(inactive_h)
-                    helix_num_active_tokens.append(num_active_h)
                     helix_total_input_len.append(request.total_input_len_cp)
                 else:
                     position_ids.extend(
@@ -2768,13 +2766,12 @@ class PyTorchModelEngine(ModelEngine):
                 if _has_cp_helix:
                     # Overlap-scheduler verify path under Helix: global positions
                     # and per-rank cached length (see _helix_verify_token_params).
-                    positions_h, inactive_h, num_active_h = self._helix_verify_token_params(
+                    positions_h, inactive_h, _ = self._helix_verify_token_params(
                         request, self.runtime_draft_len,
                         _helix_tokens_per_block)
                     position_ids.extend(positions_h)
                     helix_position_offsets.extend(positions_h)
                     helix_is_inactive_rank.extend(inactive_h)
-                    helix_num_active_tokens.append(num_active_h)
                     helix_total_input_len.append(request.total_input_len_cp)
                 else:
                     position_ids.extend(
@@ -2908,8 +2905,6 @@ class PyTorchModelEngine(ModelEngine):
                         helix_is_inactive_rank.append(
                             request.py_helix_is_inactive_rank)
                         helix_position_offsets.append(position_id)
-                        helix_num_active_tokens.append(
-                            0 if request.py_helix_is_inactive_rank else 1)
                         helix_total_input_len.append(request.total_input_len_cp)
 
                 request.cached_tokens = past_seen_token_num
@@ -3265,7 +3260,6 @@ class PyTorchModelEngine(ModelEngine):
             attn_metadata.update_helix_param(
                 helix_position_offsets=helix_position_offsets,
                 helix_is_inactive_rank=helix_is_inactive_rank,
-                helix_num_active_tokens=helix_num_active_tokens,
                 helix_total_input_len=helix_total_input_len,
             )
 

@@ -1929,7 +1929,7 @@ class TestQwen3_30B_A3B(LlmapiAccuracyTestHarness):
 class TestKimiK2(LlmapiAccuracyTestHarness):
     MODEL_NAME = "moonshotai/Kimi-K2-Thinking"
     MODEL_PATH = f"{llm_models_root()}/Kimi-K2-Thinking-NVFP4"
-    EAGLE_MODEL_PATH = f"{llm_models_root()}/Kimi-K2.5-Thinking-Eagle3"
+    EAGLE_MODEL_PATH = f"{llm_models_root()}/Kimi-K2-Thinking-NVFP4-Eagle3"
 
     @skip_pre_blackwell
     @pytest.mark.skip_less_device(8)
@@ -2029,6 +2029,81 @@ class TestKimiK2(LlmapiAccuracyTestHarness):
             "trust_remote_code": True,
             "kv_cache_config": {
                 "free_gpu_memory_fraction": 0.8,
+            },
+        }
+        disaggregated_server_config = {
+            "hostname": "localhost",
+            "backend": "pytorch",
+            "context_servers": {
+                "num_instances": 1
+            },
+            "generation_servers": {
+                "num_instances": 1
+            }
+        }
+        with launch_disaggregated_llm(disaggregated_server_config,
+                                      ctx_server_config, gen_server_config,
+                                      self.MODEL_PATH) as llm:
+            run_accuracy_test(llm, self.MODEL_NAME, ["GSM8K"])
+
+
+class TestKimiK25(LlmapiAccuracyTestHarness):
+    # Kimi K2.5 is a VLM (KimiK25ForConditionalGeneration) whose text backbone is
+    # DeepSeek-V3 (MLA). The Eagle3 draft attaches to the text backbone.
+    MODEL_NAME = "moonshotai/Kimi-K2.5"
+    MODEL_PATH = f"{llm_models_root()}/Kimi-K2.5-NVFP4"
+    EAGLE_MODEL_PATH = f"{llm_models_root()}/Kimi-K2.5-Thinking-Eagle3"
+
+    @skip_pre_blackwell
+    @pytest.mark.skip_less_device(8)
+    @pytest.mark.skip_less_device_memory(200000)
+    @pytest.mark.parametrize("gen_tp,gen_cp", [(2, 2)], ids=["tp2cp2"])
+    def test_eagle3_with_helix(self, gen_tp, gen_cp):
+        """Eagle3 one-model speculative decoding combined with Helix CP on the
+        Kimi K2.5 (DeepSeek-V3 MLA) generation server."""
+        kv_cache_config = {
+            "free_gpu_memory_fraction": 0.6,
+            "enable_block_reuse": False,
+            "enable_partial_reuse": False,
+            "tokens_per_block": 32,
+        }
+        speculative_config = {
+            "decoding_type": "Eagle3",
+            "eagle3_one_model": True,
+            "max_draft_len": 3,
+            "speculative_model": self.EAGLE_MODEL_PATH,
+        }
+        ctx_server_config = {
+            "tensor_parallel_size": 4,
+            "context_parallel_size": 1,
+            "disable_overlap_scheduler": True,
+            "trust_remote_code": True,
+            "kv_cache_config": kv_cache_config,
+            "enable_chunked_prefill": False,
+            "cuda_graph_config": None,
+            "speculative_config": speculative_config,
+            "cache_transceiver_config": {
+                "backend": "UCX",
+                "max_tokens_in_buffer": 8192,
+            },
+        }
+        gen_server_config = {
+            "tensor_parallel_size": gen_tp,
+            "context_parallel_size": gen_cp,
+            "moe_expert_parallel_size": gen_tp * gen_cp,
+            "cp_config": {
+                "cp_type": "HELIX",
+                "tokens_per_block": 32,
+            },
+            "disable_overlap_scheduler": True,
+            "trust_remote_code": True,
+            "kv_cache_config": kv_cache_config,
+            "enable_chunked_prefill": False,
+            "cuda_graph_config": None,
+            "speculative_config": speculative_config,
+            "cache_transceiver_config": {
+                "backend": "UCX",
+                "max_tokens_in_buffer": 8192,
             },
         }
         disaggregated_server_config = {

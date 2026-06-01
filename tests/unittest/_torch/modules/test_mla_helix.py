@@ -670,14 +670,10 @@ def _run_mla_distributed_spec(
     )
     mla.forward_impl(position_ids_ctx_rank, input_ctx_rank, attn_metadata, output=ctx_output)
 
-    input_ctx_bs = input_ctx.view(scenario.batch, scenario.ctx_len, scenario.hidden_size)
-    latent_cache_gen = _make_latent_cache_gen(
-        mla, rank, world_size, ctx_len_per_gpu, input_ctx_bs, ref_attn_metadata
-    )
-    if latent_cache_gen is not None:
-        # Each of the pred query tokens of a request sees the same remote-cached
-        # prefix latent, so tile the single-token remote latent across the window.
-        latent_cache_gen = latent_cache_gen.repeat_interleave(num_query_tokens, dim=0)
+    # Let MLA compute each query token's latent from input_gen (identical on all
+    # ranks). The single-token _make_latent_cache_gen override is specific to the
+    # one-token gen step and would corrupt the per-draft-token K/V here.
+    latent_cache_gen = None
 
     # Per-token ownership for this rank's query tokens, and KV slots for the
     # tokens it owns.
@@ -697,7 +693,6 @@ def _run_mla_distributed_spec(
         kv_cache_manager,
         num_query_tokens=num_query_tokens,
         helix_is_inactive_rank=inactive_flags,
-        helix_num_active_tokens=num_active_per_seq,
         helix_position_offsets=position_ids_gen.tolist(),
         helix_total_input_len=[scenario.ctx_len] * scenario.batch,
         enable_context_mla_with_cached_kv=True,
