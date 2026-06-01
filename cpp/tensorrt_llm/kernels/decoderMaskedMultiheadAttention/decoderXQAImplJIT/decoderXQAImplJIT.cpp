@@ -899,17 +899,13 @@ void DecoderXQAImplJIT::runImpl(XQAParams const& xqaParams, KVCacheBuffer const&
     if (isMLAKernel)
     {
         auto const roundUpTo128 = [](size_t value) { return ((value + 127) / 128) * 128; };
-        uint32_t multi_block = computeMultiBlockCountForMLA(xqaParams, multiprocessor_count);
+        uint32_t const multi_block = computeMultiBlockCountForMLA(xqaParams, multiprocessor_count);
         // DSV4 dynamic-sparse MLA decode attends over the sparse selection, so the main kernel uses
-        // cacheSeqLen = sparse_mla_topk_lens (the attended count). The separate-reduce kernel
-        // (reduce_mla_flash_decode_partials) still recomputes nbSubSeq from the full kv_len
-        // (sequence_lengths), which would mismatch the main kernel under split-K. Until that reduce is
-        // made topk_len-aware, force single-CTA (no split-K / no separate-reduce) for the SPARSE path
-        // only. Dense MLA (DSV3 / Kimi K2.5, sparse_attn_indices == nullptr) keeps split-K unchanged.
-        if (xqaParams.sparse_params.sparse_attn_indices != nullptr)
-        {
-            multi_block = 1;
-        }
+        // cacheSeqLen = sparse_mla_topk_lens (the attended count). Split-K is enabled for the sparse path
+        // too: the separate-reduce launch below is fed sparse_mla_topk_lens (not the full kv_len) so its
+        // per-request nbSubSeq matches the main kernel's. NOTE: computeMultiBlockCountForMLA still sizes
+        // multi_block from the full kv_len, which over-provisions grid/scratch for sparse (correct but a
+        // future tuning opportunity — base it on topk_len for sparse).
         uint32_t const kernelMlaHeadGrpSize = getXqaMlaRuntimeKernelHeadGrpSize(num_q_heads_over_kv);
         auto* scratchBytes = static_cast<std::byte*>(launchParams.scratch);
         size_t const cgaXBufBytes = static_cast<size_t>(getXqaMlaCgaXBufSize(kernelMlaHeadGrpSize)) * multi_block
@@ -1031,6 +1027,15 @@ void DecoderXQAImplJIT::runImpl(XQAParams const& xqaParams, KVCacheBuffer const&
         maybeSyncXqaMlaDebug(stream, "XQA MLA main kernel");
         if (useSeparateReduce && multi_block > 1)
         {
+            // The reduce kernel recomputes per-request nbSubSeq from the seqLen array it is given; it must
+            // match the main kernel. Dense MLA uses the full kv_len (sequence_lengths); DSV4 dynamic-sparse
+            // decode uses the attended count (sparse_mla_topk_lens). Decode is single-token (inputSeqLen==1),
+            // so topk_lens[idxReq] feeds the reduce's `seqLenList[idxReq] - (inputSeqLen-1)` directly.
+            uint32_t const* const reduceSeqLens
+                = (xqaParams.sparse_params.sparse_attn_indices != nullptr
+                      && xqaParams.sparse_params.sparse_mla_topk_lens != nullptr)
+                ? reinterpret_cast<uint32_t const*>(xqaParams.sparse_params.sparse_mla_topk_lens)
+                : reinterpret_cast<uint32_t const*>(xqaParams.sequence_lengths);
             maybeCheckXqaMlaPartialsForInvalid(stream, partialResults, xqaParams.total_num_input_tokens, multi_block,
                 xqaParams.num_q_heads, "XQA MLA partials before separate reduce", debugContext);
             TLLM_LOG_DEBUG(
@@ -1040,9 +1045,8 @@ void DecoderXQAImplJIT::runImpl(XQAParams const& xqaParams, KVCacheBuffer const&
                 getXqaMlaPartialResultChunks(kernelXQAParams.num_q_heads), xqaParams.total_num_input_tokens,
                 multi_block, inputSeqLen, xqaParams.total_num_input_tokens, partialResultBytes, cgaXBufBytes,
                 static_cast<void*>(kernelOutput), static_cast<void*>(partialResults),
-                static_cast<void const*>(xqaParams.sequence_lengths));
-            cubinObj->launchMlaReduce(kernelOutput, partialResults,
-                reinterpret_cast<uint32_t const*>(xqaParams.sequence_lengths), multi_block, inputSeqLen,
+                static_cast<void const*>(reduceSeqLens));
+            cubinObj->launchMlaReduce(kernelOutput, partialResults, reduceSeqLens, multi_block, inputSeqLen,
                 xqaParams.total_num_input_tokens, kernelXQAParams.num_q_heads, stream);
             maybeSyncXqaMlaDebug(stream, "XQA MLA separate reduce");
             maybeCheckXqaMlaReduceAgainstHostReference(stream, kernelOutput, partialResults,
