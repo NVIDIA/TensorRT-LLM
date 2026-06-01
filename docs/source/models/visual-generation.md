@@ -46,7 +46,7 @@ Models are auto-detected from the checkpoint directory. Diffusers-format models 
 | **Wan 2.1** | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes |
 | **Wan 2.2** | Yes | Yes | No | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes |
 | **LTX-2** | Yes | Yes | No | Yes | Yes | No | No | Yes | Yes | Yes | Yes | No |
-| **Qwen-Image** [^2] | Yes | Yes | No | No [^1] | Yes | No | Yes | Yes | Yes | - | - | Yes |
+| **Qwen-Image** [^2] | Yes | Yes | No | No [^1] | Yes | No | Yes | Yes | Yes | Yes | Yes | Yes |
 
 [^1]: FLUX models use embedded guidance and do not have a separate negative prompt path, so CFG parallelism is not applicable.
 
