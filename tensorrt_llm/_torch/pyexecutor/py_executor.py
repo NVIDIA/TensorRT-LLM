@@ -3427,6 +3427,24 @@ class PyExecutor:
         return balanced_context_requests
 
     @staticmethod
+    def _is_delay_batch_dummy_generation_request(req: LlmRequest) -> bool:
+        # Scheduler-time delay batching sees ADP/resource-manager dummies.
+        # CUDA graph dummies are injected later and are not part of this decision.
+        return any(
+            getattr(req, attr, False) is True for attr in (
+                "is_attention_dp_dummy",
+                "is_dummy_request",
+            ))
+
+    @classmethod
+    def _real_generation_requests_for_delay_batch(
+            cls, generation_requests: list[LlmRequest]) -> list[LlmRequest]:
+        return [
+            req for req in generation_requests
+            if not cls._is_delay_batch_dummy_generation_request(req)
+        ]
+
+    @staticmethod
     def _compute_scheduled_tokens(context_requests, generation_requests):
         """Compute the total number of scheduled tokens for batch waiting decisions.
 
@@ -3513,7 +3531,9 @@ class PyExecutor:
         if now < self.batch_wait_deadline_s:
             return [], True
 
-        self.batch_wait_deadline_s = None
+        # Keep the expired deadline until the global delay-batch decision is
+        # known. Another attention-DP rank can still force a global skip; if
+        # that happens this rank must stay timeout-ready in the next iter.
         return context_requests, False
 
     def _sync_delay_batch_skip(self, local_skip_iteration: bool,
@@ -3551,36 +3571,43 @@ class PyExecutor:
                 scheduler_output.context_requests,
                 scheduler_output.generation_requests)
 
+        delay_batch_runtime_enabled = (self.enable_batch_wait_timeout
+                                       and not self.is_warmup)
+        real_generation_requests = self._real_generation_requests_for_delay_batch(
+            scheduler_output.generation_requests)
         local_skip_iteration = False
         should_check_waiting = False
         is_ctx_only = (len(scheduled_context_requests) > 0
-                       and len(scheduler_output.generation_requests) == 0)
-        if self.enable_batch_wait_timeout and is_ctx_only:
+                       and len(real_generation_requests) == 0)
+        if delay_batch_runtime_enabled and is_ctx_only:
             scheduled_context_requests, local_skip_iteration = (
                 self._waiting_context_requests_with_timeout(
                     scheduled_context_requests))
         else:
-            if self.enable_batch_wait_timeout:
+            if delay_batch_runtime_enabled:
                 self.batch_wait_deadline_s = None
             # If no generation requests, no need to wait in iters mode, to
             # avoid dead waiting.
-            should_check_waiting = (
-                not self.enable_attention_dp
-                and self.batch_wait_timeout_iters > 0
-                and self.batch_wait_max_tokens_ratio > 0
-                and len(scheduled_context_requests) > 0
-                and len(scheduler_output.generation_requests) > 0)
+            should_check_waiting = (not self.is_warmup
+                                    and not self.enable_attention_dp
+                                    and self.batch_wait_timeout_iters > 0
+                                    and self.batch_wait_max_tokens_ratio > 0
+                                    and len(scheduled_context_requests) > 0
+                                    and len(real_generation_requests) > 0)
             if should_check_waiting:
                 # With KV cache manager V2, scheduling has already grown context request KV cache capacity. Requests dropped
                 # for batch waiting still occupy KV cache and may reduce the batch size available for generation requests.
                 scheduled_context_requests = self._waiting_requests(
-                    scheduled_context_requests,
-                    scheduler_output.generation_requests)
+                    scheduled_context_requests, real_generation_requests)
 
         skip_iteration = (self._sync_delay_batch_skip(
             local_skip_iteration,
-            len(scheduler_output.generation_requests) > 0)
-                          if self.enable_batch_wait_timeout else False)
+            len(real_generation_requests) > 0)
+                          if delay_batch_runtime_enabled else False)
+
+        if (delay_batch_runtime_enabled and is_ctx_only
+                and not local_skip_iteration and not skip_iteration):
+            self.batch_wait_deadline_s = None
 
         if skip_iteration:
             self.batch_wait_iters_count = 0

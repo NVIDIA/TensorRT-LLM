@@ -2170,6 +2170,36 @@ class TestScratchReuse(TestKVCacheManagerV2):
         self.engine = FakeEngine(self.cfg)
         self.manager = KVCacheManager(self.cfg)
 
+    def test_rollback_uncommitted_context_resize_with_swa_scratch(self):
+        self._prepare_scratch(
+            num_layers=8,
+            window_size=64,
+            tokens_per_block=32,
+            gpu_quota=16 << 20,
+            max_rewind_len=2,
+        )
+        kv = self.manager.create_kv_cache()
+        stream_holder = CachedCudaStream()
+        stream = cast(CudaStream, stream_holder.handle)
+
+        try:
+            self.assertTrue(kv.resume(stream))
+            self.assertTrue(kv.resize(66, 64))
+            snapshot = kv.make_context_resize_rollback_snapshot()
+
+            # This mimics V2 scheduling a follow-up context chunk that delay
+            # batching later drops before any forward/commit advances history.
+            self.assertTrue(kv.resize(130, 64))
+            self.assertTrue(kv.has_scratch_slots)
+
+            self.assertTrue(kv.rollback_uncommitted_context_resize(snapshot))
+            self.assertEqual(kv.capacity, 66)
+            self.assertEqual(kv.history_length, 64)
+            self.assertFalse(kv.has_scratch_slots)
+        finally:
+            kv.close()
+            self.manager.shutdown()
+
     def test_request_scratch_toggle_for_two_round_inference(self):
         self._prepare_scratch(num_layers=8, window_size=32, tokens_per_block=32, gpu_quota=16 << 20)
         prompt = [self.next_token() for _ in range(256)]

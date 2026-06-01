@@ -1499,6 +1499,88 @@ class _KVCache:
             self._scratch_slots[lc_idx].extend(locks)
             locks.clear()
 
+    def make_context_resize_rollback_snapshot(self) -> tuple[int, int, tuple[int, ...]]:
+        """Capture state needed to undo an uncommitted context resize.
+
+        This is used by delay batching after the scheduler has grown context
+        capacity but before the forward pass commits any of the new tokens.
+        """
+        return (
+            self._capacity,
+            self._history_length,
+            tuple(len(slots) for slots in self._scratch_slots),
+        )
+
+    def rollback_uncommitted_context_resize(
+        self, snapshot: tuple[int, int, tuple[int, ...]]
+    ) -> bool:
+        """Undo a scheduler-side context resize that has not been executed.
+
+        Regular ``resize(pre_capacity)`` is not valid for SWA scratch reuse
+        when the new context chunk has not been committed: ``history_length``
+        may still be far behind the current capacity, which intentionally
+        violates the normal SWA resize precondition.  This method rolls back
+        only the blocks and scratch slots added by the uncommitted resize.
+        """
+        assert self.status == self.Status.ACTIVE
+        capacity, history_length, scratch_slot_counts = snapshot
+        if capacity == self._capacity:
+            return True
+        if capacity > self._capacity:
+            raise ValueError(
+                f"Cannot roll back context resize from capacity "
+                f"{self._capacity} to larger capacity {capacity}"
+            )
+        if history_length != self._history_length:
+            raise ValueError(
+                f"Cannot roll back context resize after history changed "
+                f"from {history_length} to {self._history_length}"
+            )
+        if capacity < history_length:
+            raise ValueError("History length cannot be greater than capacity")
+        if len(scratch_slot_counts) != self.manager._life_cycles.size:
+            raise ValueError("Invalid scratch slot snapshot")
+
+        tokens_per_block = self.tokens_per_block
+        old_num_blocks = BlockOrdinal(div_up(self._capacity, tokens_per_block))
+        new_num_blocks = BlockOrdinal(div_up(capacity, tokens_per_block))
+        assert old_num_blocks == typed_len(self._blocks)
+
+        if not self.enable_swa_scratch_reuse:
+            return self.resize(capacity, history_length)
+
+        for lc in typed_range(self.manager._life_cycles.size):
+            if scratch_slot_counts[lc] > len(self._scratch_slots[lc]):
+                raise ValueError(
+                    "Cannot roll back context resize after scratch slots "
+                    f"changed for life cycle {lc}"
+                )
+        if any(block.is_committed for block in self._blocks[new_num_blocks:]):
+            raise ValueError("Cannot roll back committed context blocks")
+
+        self._avg_capacity.update(capacity)
+        with self._record_event():
+            for lc in typed_range(self.manager._life_cycles.size):
+                while len(self._scratch_slots[lc]) > scratch_slot_counts[lc]:
+                    self._scratch_slots[lc].pop().unlock()
+
+            self._subtract_pending_allocation_range(new_num_blocks, old_num_blocks)
+            del self._blocks[new_num_blocks:]
+            for beam_indices in self._base_page_indices:
+                for indices in beam_indices:
+                    assert all(i == BAD_PAGE_INDEX for i in indices[new_num_blocks:])
+                    if type(indices) is array.array:
+                        del indices[new_num_blocks:]
+                    else:
+                        indices[new_num_blocks:] = array.array("i", [BAD_PAGE_INDEX]) * (
+                            len(indices) - new_num_blocks
+                        )
+
+        self._capacity = capacity
+        self._refresh_generation_alloc_ready()
+        assert NDEBUG or self._check_sanity()
+        return True
+
     @property
     def _storage(self) -> StorageManager:
         return self.manager._storage
