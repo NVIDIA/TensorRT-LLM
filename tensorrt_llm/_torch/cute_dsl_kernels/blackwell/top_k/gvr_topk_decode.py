@@ -314,7 +314,7 @@ class GvrTopKKernel:
         smem_wmax_f32,  # cute.Tensor [NUM_WARPS] float32
         smem_wsum_f32,  # cute.Tensor [NUM_WARPS] float32
         smem_wcnt_i32,  # cute.Tensor [NUM_WARPS] int32
-        s_thr,  # cute.Tensor [3] float32: [threshold, val_lo, val_hi, pmax_saved]
+        s_thr,  # cute.Tensor [3] float32: [threshold, val_lo, val_hi]
         s_thr_extra,  # cute.Tensor [1] float32: [pmax_saved]
         s_iscalars,  # cute.Tensor [5] int32: [cand_count, done, cnt_lo, cnt_hi, out_count]
         tidx,
@@ -1024,6 +1024,11 @@ class GvrTopKKernel:
                 s_down = cute.arch.fmax(s_down, v)
             isi = isi + cutlass.Int32(num_threads)
 
+        # Pack lge/lgt into a single int32 so the warp reduction below
+        # sums both counts in one shuffle. Safe as long as each per-warp
+        # count stays < 2^16 = 65536 — which holds because lge/lgt are
+        # bounded by cand_count ≤ kC ≤ 6144 (see GvrParams). Bump kC
+        # past 65536 and this packing silently corrupts.
         packed = (lge << cutlass.Int32(16)) | lgt
         packed = self.warp_reduce_sum_i32(packed)
         s_up = self.warp_reduce_min_f32(s_up)
@@ -1161,7 +1166,7 @@ class GvrTopKKernel:
             # pattern). No tid==0 → s_thr broadcast → saves a block barrier.
             bmin_r = cutlass.Float32(self.FLT_MAX)
             bmax_r = cutlass.Float32(self.NEG_FLT_MAX)
-            # Note: unrolled for 64 times.
+            # Unrolled num_warps times (16 or 32 — fixed at compile time).
             for w in cutlass.range_constexpr(self.num_warps):
                 vmin_bits = smem_wcnt[w]
                 vmax_bits = smem_hist[w]
@@ -1175,6 +1180,13 @@ class GvrTopKKernel:
                 bmax_r = cute.arch.fmax(bmax_r, vmax)
             if bmax_r <= bmin_r:
                 bmax_r = bmin_r + cutlass.Float32(1e-6)
+            # All threads must finish reading smem_hist[0..NW-1] (the
+            # warp-staged cmax slots above) before any thread starts
+            # zeroing smem_hist below — otherwise warp-0 thread-0 can
+            # zero smem_hist[0] while warp-N is still reading it,
+            # producing a 0 cmax → squashed bmax_r → all candidates land
+            # in bin 0 → wrong K-th threshold. Hit-rate-dependent race.
+            cute.arch.barrier()
 
             # Zero histogram (must zero ALL slots since smem_hist[0..NW-1] was
             # used as cmax scratch above).

@@ -5989,6 +5989,13 @@ if IS_CUTLASS_DSL_AVAILABLE:
             # be 32-byte aligned (satisfied by torch.empty() and row slices;
             # column slices / stride-padded layouts may violate it).
             use_256bit_load = (logits.dtype == torch.float32 and N_dec >= 16384)
+            if use_256bit_load:
+                ptr = logits.data_ptr()
+                assert ptr % 32 == 0, (
+                    f"use_256bit_load=True requires 32B-aligned "
+                    f"logits.data_ptr(), got {ptr} % 32 = {ptr % 32}. "
+                    f"Pass a contiguous tensor (column slices / stride-"
+                    f"padded layouts violate alignment).")
             # Warp-parallel reduce only pays off at 32-warp (T=1024); at
             # 16-warp (T=512) it costs ~2pp on synth data.
             enable_warp_parallel_reduce = num_threads_per_block == 1024
