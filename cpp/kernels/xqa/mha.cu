@@ -1710,6 +1710,9 @@ CUBIN_EXPORT __global__
     constexpr bool rtIsReallySliding = false;
     constexpr uint32_t nbTotalSkipTokens = 0;
 #endif
+#if USE_PAGED_KV_CACHE
+    uint32_t const nbSkipLeadingPages = nbTotalSkipTokens / tokensPerPage;
+#endif
     uint32_t const nbSkipLeadingTiles = nbTotalSkipTokens / ctaTile.x;
     uint32_t const tile0NbSkipTokens = nbTotalSkipTokens % ctaTile.x;
 #if USE_PAGED_KV_CACHE
@@ -1763,10 +1766,11 @@ CUBIN_EXPORT __global__
         {
 #if BEAM_WIDTH == 1
             uint32_t const idxBeam = 0;
-            pageIdx = getPage<KCachePageIndices::size>(cacheList, true, idxReq, idxBeam, idxPage, nbPages);
+            pageIdx = getPage<KCachePageIndices::size>(
+                cacheList, true, idxReq, idxBeam, idxPage, nbPages, nbSkipLeadingPages);
 #else
             auto& dst = smem.kCachePages[warpIdx.x];
-            loadPagesForBeamSearchAsync<1>(0U, dst, cacheList, true, idxReq, idxPage, nbPages);
+            loadPagesForBeamSearchAsync<1>(0U, dst, cacheList, true, idxReq, idxPage, nbPages, nbSkipLeadingPages);
 #endif
         };
         uint32_t idxPageBeg = nbPagesPerCtaTile * seqIterInit + warpIdx.x * warpTile.x / tokensPerPage;
@@ -2090,11 +2094,12 @@ CUBIN_EXPORT __global__
         {
 #if BEAM_WIDTH == 1
             uint32_t const idxBeam = 0;
-            pageIdx = getPage<VCachePageIndices::size>(cacheList, false, idxReq, idxBeam, idxPageBeg, nbPages);
+            pageIdx = getPage<VCachePageIndices::size>(
+                cacheList, false, idxReq, idxBeam, idxPageBeg, nbPages, nbSkipLeadingPages);
 #else
             auto& dst = smem.vCachePages[grpLoadV ? warpGrpIdx : warpIdx.x];
             loadPagesForBeamSearchAsync<grpLoadV ? gemm1WarpsPerGrp : 1U>(
-                grpLoadV ? warpIdxInGrp : 0U, dst, cacheList, false, idxReq, idxPageBeg, nbPages);
+                grpLoadV ? warpIdxInGrp : 0U, dst, cacheList, false, idxReq, idxPageBeg, nbPages, nbSkipLeadingPages);
 #endif
         };
         uint32_t idxPageBeg = nbPagesPerCtaTile * seqIterInit + cacheVTileSeqLen * warpGrpIdx / tokensPerPage;

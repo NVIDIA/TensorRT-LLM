@@ -43,8 +43,8 @@ from tensorrt_llm.logger import logger, severity_map
 from tensorrt_llm.mapping import CpType
 from tensorrt_llm.serve import OpenAIDisaggServer, OpenAIServer
 from tensorrt_llm.serve.tool_parser import ToolParserFactory
-from tensorrt_llm.serve.tool_parser.tool_parser_factory import \
-    resolve_auto_tool_parser
+from tensorrt_llm.serve.tool_parser.tool_parser_factory import (
+    MODEL_TYPE_TO_TOOL_PARSER, resolve_auto_tool_parser)
 from tensorrt_llm.tools.importlib_utils import import_custom_module_from_dir
 from tensorrt_llm.usage import config as _telemetry_config
 from tensorrt_llm.visual_gen import VisualGen
@@ -897,11 +897,11 @@ def serve(
     if tool_parser == "auto":
         resolved = resolve_auto_tool_parser(model)
         if resolved is None:
+            supported_model_types = ", ".join(
+                sorted(MODEL_TYPE_TO_TOOL_PARSER.keys()))
             raise click.BadParameter(
                 f"Cannot auto-detect tool parser for model '{model}'. "
-                f"Supported model types for auto-detection: qwen2, qwen3, "
-                f"qwen3_moe, qwen3_5, qwen3_5_moe, qwen3_next, deepseek_v3, "
-                f"deepseek_v32, kimi_k2, kimi_k25, glm4. "
+                f"Supported model types for auto-detection: {supported_model_types}. "
                 f"Please specify a parser explicitly: "
                 f"{list(ToolParserFactory.parsers.keys())}",
                 param_hint="--tool_parser")

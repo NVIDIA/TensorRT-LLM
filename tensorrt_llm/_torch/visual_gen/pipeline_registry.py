@@ -186,6 +186,10 @@ class AutoPipeline:
             if "QwenImage" in class_name:
                 return "QwenImagePipeline"
 
+            if "Cosmos3" in class_name:
+                return "Cosmos3OmniMoTPipeline"
+
+        #########################################################
         # 2. Single-safetensors with embedded metadata (LTX-2 specific)
         detected = AutoPipeline._detect_from_single_safetensors(checkpoint_dir)
         if detected is not None:
