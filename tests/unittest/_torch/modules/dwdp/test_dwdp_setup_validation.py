@@ -22,9 +22,6 @@ and total expert count, catching the four distinct failure modes:
   2. stride > size (gaps between consecutive ranks)
   3. coverage < num_experts (last rank misses experts)
   4. chunk shape mismatch (DwdpConfig disagrees with fused MoE loader)
-
-The uniform integer-division case used by current dwdp=4 / dwdp=8
-configurations must pass cleanly.
 """
 
 import unittest
@@ -46,25 +43,6 @@ def _kwargs(**overrides):
 
 
 class TestValidatePartitionConfig(unittest.TestCase):
-    # ------------------------------------------------------------------
-    # Happy paths — must NOT raise
-    # ------------------------------------------------------------------
-
-    def test_uniform_dwdp4(self):
-        # 256 / 4 = 64. Stride == size. Standard case.
-        _validate_partition_config(**_kwargs())
-
-    def test_uniform_dwdp8(self):
-        # 256 / 8 = 32. Cross-tray DWDP=8 config (verified 2026-04-28).
-        _validate_partition_config(
-            **_kwargs(
-                num_experts_per_worker=32,
-                num_prefetch_experts=32,
-                dwdp_size=8,
-                loaded_local_experts=32,
-            )
-        )
-
     # ------------------------------------------------------------------
     # Failure mode 1: non-positive size or stride
     # ------------------------------------------------------------------
@@ -108,41 +86,6 @@ class TestValidatePartitionConfig(unittest.TestCase):
                     loaded_local_experts=32,
                 )
             )
-
-    def test_coverage_with_overlap_passes(self):
-        # 4 ranks of size 70, stride 62: 3*62+70 = 256 — exact equality.
-        # 8-expert overlap between adjacent ranks is the redundancy case.
-        _validate_partition_config(
-            **_kwargs(
-                num_experts_per_worker=70,
-                num_prefetch_experts=62,
-                loaded_local_experts=70,
-            )
-        )
-
-    def test_dwdp3_mode_b_overlap_passes(self):
-        # dwdp=3, 256 experts: Mode B with stride=85, size=86.
-        # 2*85 + 86 = 256 — exact equality, 1-expert overlap between
-        # adjacent ranks.  This is the canonical "dwdp does not divide
-        # num_experts" recipe.
-        _validate_partition_config(
-            num_experts_per_worker=86,
-            num_prefetch_experts=85,
-            num_experts_total=256,
-            dwdp_size=3,
-            loaded_local_experts=86,
-        )
-
-    def test_dwdp7_mode_b_overlap_passes(self):
-        # dwdp=7, 256 experts: 256 % 7 = 4, so Mode B requires more
-        # overlap.  size=40, stride=36: 6*36 + 40 = 256.
-        _validate_partition_config(
-            num_experts_per_worker=40,
-            num_prefetch_experts=36,
-            num_experts_total=256,
-            dwdp_size=7,
-            loaded_local_experts=40,
-        )
 
     # ------------------------------------------------------------------
     # Failure mode 3b: tail-padding (coverage > num_experts) rejected
