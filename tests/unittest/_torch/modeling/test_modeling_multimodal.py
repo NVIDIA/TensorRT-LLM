@@ -17,7 +17,6 @@ from tensorrt_llm._torch.attention_backend.interface import AttentionRuntimeFeat
 from tensorrt_llm._torch.attention_backend.utils import get_attention_backend
 from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.model_config import ModelConfig
-from tensorrt_llm._torch.models.modeling_multimodal_utils import bypass_processor_output_validation
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm._utils import str_dtype_to_torch
 from tensorrt_llm.bindings.executor import KvCacheConfig
@@ -466,17 +465,17 @@ class TestModelingMultimodal(unittest.TestCase, ABC):
         # Qwen2/3-VL checkpoints leak processor *output* keys (e.g.
         # ``video_grid_thw``) into ``output_kwargs[<modality>]`` via the
         # tokenizer's ``init_kwargs`` / ``model_input_names``, tripping
-        # validation. Bypass the validator for our known output keys for
-        # the duration of the processor call.
-        with bypass_processor_output_validation():
-            processor_inputs = hf_processor(
-                text=[input["prompt"] for input in inputs],
-                images=images,
-                videos=videos,
-                padding=True,
-                return_tensors="pt",
-                do_rescale=False,
-            ).to(self.device)
+        # validation. ``modeling_multimodal_utils`` installs a process-wide
+        # filter at import that drops those keys before the validator sees
+        # them.
+        processor_inputs = hf_processor(
+            text=[input["prompt"] for input in inputs],
+            images=images,
+            videos=videos,
+            padding=True,
+            return_tensors="pt",
+            do_rescale=False,
+        ).to(self.device)
         # Transformers 5.5.x's `compute_3d_position_ids` raises a ValueError when
         # multimodal grids are passed without `mm_token_type_ids`. The processor
         # already returns this tensor for both image and video modalities, so

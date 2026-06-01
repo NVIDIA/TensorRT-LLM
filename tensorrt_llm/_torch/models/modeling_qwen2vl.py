@@ -51,11 +51,11 @@ from ..flashinfer_utils import IS_FLASHINFER_AVAILABLE
 # the pattern used in `custom_ops` itself.
 if IS_FLASHINFER_AVAILABLE:
     from ..custom_ops import flashinfer_apply_rope_with_cos_sin_cache_inplace
+
 from ..modules.gated_mlp import GatedMLP
 from ..modules.rotary_embedding import MRotaryEmbedding, RotaryEmbedding
 from .modeling_auto import AutoModelForCausalLM
-from .modeling_multimodal_utils import (bypass_processor_output_validation,
-                                        find_input_mm_embeds, fuse_input_embeds,
+from .modeling_multimodal_utils import (find_input_mm_embeds, fuse_input_embeds,
                                         get_attached_multimodal_embeddings,
                                         get_multimodal_embeddings)
 from .modeling_utils import (ModelConfig, QuantConfig, _load_weights_impl,
@@ -308,18 +308,18 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
         # validates per-modality kwargs against the processor's TypedDict.
         # Processor *output* keys (``video_grid_thw``, ``pixel_values``, ...)
         # round-trip into the validator via tokenizer ``init_kwargs`` /
-        # ``model_input_names`` and trip it with ``TypeError:
+        # ``model_input_names`` and would trip ``TypeError:
         # merged_typed_dict.__init__() got an unexpected keyword argument
-        # 'video_grid_thw'``. Bypass the validator for our known output keys
-        # for the duration of the processor call.
-        with bypass_processor_output_validation():
-            return self.processor(text=[text],
-                                  images=images,
-                                  videos=videos,
-                                  padding=True,
-                                  do_rescale=do_rescale,
-                                  return_tensors='pt',
-                                  **mm_processor_kwargs)
+        # 'video_grid_thw'``. ``modeling_multimodal_utils`` installs a
+        # process-wide filter at import that drops those keys before the
+        # validator sees them.
+        return self.processor(text=[text],
+                              images=images,
+                              videos=videos,
+                              padding=True,
+                              do_rescale=do_rescale,
+                              return_tensors='pt',
+                              **mm_processor_kwargs)
 
     def _postprocess(self, input_ids: torch.IntTensor) -> torch.IntTensor:
         token_ids = [
