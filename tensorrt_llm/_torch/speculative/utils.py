@@ -385,30 +385,23 @@ def update_spec_config_from_model_config(spec_config, model_config):
     # This determines the actual MTP layer count in the checkpoint and drives
     # the spec_dec_mode decision (EAGLE vs vanilla MTP).
     spec_config.num_nextn_predict_layers = model_config.num_nextn_predict_layers
-    # max_draft_len is None when the user didn't set it (the "use the model
-    # default" sentinel); resolve it to a concrete value here, before any
-    # consumer reads it.
-    if spec_config.spec_dec_mode.is_mtp_vanilla():
-        # Vanilla MTP (>1 MTP layers): default to all of the model's layers. If
-        # the user explicitly requested fewer draft tokens than the model has
-        # layers, honour that and warn.
-        model_layers = spec_config.num_nextn_predict_layers
-        if spec_config.max_draft_len is None:
-            spec_config.max_draft_len = model_layers
-        elif spec_config.max_draft_len < model_layers:
-            logger.warning(
-                f"MTP: max_draft_len ({spec_config.max_draft_len}) is less than the model's "
-                f"num_nextn_predict_layers ({model_layers}). "
-                f"Using max_draft_len={spec_config.max_draft_len} draft tokens."
-            )
-            # Keep the user-set max_draft_len as-is
-        else:
-            spec_config.max_draft_len = model_layers
-    else:
-        # Eagle MTP (1 MTP layer): max_draft_len controls how many times the
-        # single layer is run; default to 1 when the user didn't set it.
-        if spec_config.max_draft_len is None:
-            spec_config.max_draft_len = 1
+    is_vanilla = spec_config.spec_dec_mode.is_mtp_vanilla()
+
+    # Resolve max_draft_len when the user didn't set it:
+    #   vanilla MTP -> use all checkpoint MTP heads
+    #   MTP-Eagle   -> replay the single head once
+    if spec_config.max_draft_len is None:
+        spec_config.max_draft_len = (spec_config.num_nextn_predict_layers
+                                     if is_vanilla else 1)
+    elif is_vanilla and spec_config.max_draft_len != spec_config.num_nextn_predict_layers:
+        effective_draft_len = min(spec_config.max_draft_len,
+                                  spec_config.num_nextn_predict_layers)
+        logger.warning(
+            f"MTP: max_draft_len ({spec_config.max_draft_len}) does not match "
+            f"num_nextn_predict_layers ({spec_config.num_nextn_predict_layers}); "
+            f"using max_draft_len={effective_draft_len} draft tokens.")
+        spec_config.max_draft_len = effective_draft_len
+
     spec_config.max_total_draft_tokens = spec_config.max_draft_len
 
 
