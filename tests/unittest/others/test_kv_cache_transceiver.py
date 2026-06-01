@@ -261,6 +261,7 @@ def create_hybrid_cache_manager(mapping,
         mamba_layer_mask=mamba_layer_mask,
         mamba_cache_dtype=mamba_conv_dtype,
         mamba_ssm_cache_dtype=mamba_ssm_dtype,
+        is_disagg=True,
         kv_cache_config=KvCacheConfig(
             max_tokens=256,
             enable_block_reuse=False,

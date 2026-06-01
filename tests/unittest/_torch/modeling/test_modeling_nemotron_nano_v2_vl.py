@@ -74,6 +74,7 @@ def nano_llm_model():
     # we use the top-level LLM to create the engine to make things simpler.
     nano_llm = LLM(
         model=MODEL_PATH,
+        trust_remote_code=True,
         tensor_parallel_size=1,
         max_batch_size=24,
         cuda_graph_config=CudaGraphConfig(),
