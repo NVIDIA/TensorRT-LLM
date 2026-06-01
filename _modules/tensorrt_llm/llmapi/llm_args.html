@@ -498,7 +498,7 @@ window.runMermaid = runMermaid;</script>
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.18.0';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc16';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc17';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -512,7 +512,7 @@ window.runMermaid = runMermaid;</script>
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.3.0rc16" />
+  <meta name="docsearch:version" content="1.3.0rc17" />
   
     
     <script src="../../../_static/searchtools.js"></script>
@@ -1266,8 +1266,7 @@ window.runMermaid = runMermaid;</script>
     <span class="p">)</span>
 
     <span class="k">def</span><span class="w"> </span><span class="nf">supports_backend</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">backend</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
-<span class="w">        </span><span class="sd">&quot;&quot;&quot;</span>
-<span class="sd">        Override if the sparse attention algorithm does not support</span>
+<span class="w">        </span><span class="sd">&quot;&quot;&quot;Override if the sparse attention algorithm does not support</span>
 <span class="sd">        a subset of the possible backends.</span>
 <span class="sd">        &quot;&quot;&quot;</span>
         <span class="k">return</span> <span class="kc">True</span>
@@ -1276,8 +1275,7 @@ window.runMermaid = runMermaid;</script>
         <span class="k">return</span> <span class="mi">1</span>
 
     <span class="k">def</span><span class="w"> </span><span class="nf">needs_separate_short_long_cuda_graphs</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
-<span class="w">        </span><span class="sd">&quot;&quot;&quot;</span>
-<span class="sd">        Determines whether to capture a dedicated CUDA graph for batches consisting entirely of short sequences.</span>
+<span class="w">        </span><span class="sd">&quot;&quot;&quot;Determines whether to capture a dedicated CUDA graph for batches consisting entirely of short sequences.</span>
 <span class="sd">        If True, capture distinct graphs for short-only batches and general cases (e.g., long or mixed batches).</span>
 <span class="sd">        If False, capture a single unified CUDA graph for all sequences regardless of length.</span>
 <span class="sd">        The seq_len_threshold parameter defines the cutoff boundary between short and long sequences.</span>
@@ -1409,8 +1407,7 @@ window.runMermaid = runMermaid;</script>
 <div class="viewcode-block" id="DeepSeekSparseAttentionConfig.needs_separate_short_long_cuda_graphs">
 <a class="viewcode-back" href="../../../llm-api/reference.html#tensorrt_llm.llmapi.DeepSeekSparseAttentionConfig.needs_separate_short_long_cuda_graphs">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">needs_separate_short_long_cuda_graphs</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
-<span class="w">        </span><span class="sd">&quot;&quot;&quot;</span>
-<span class="sd">        Whether to capture separate CUDA graphs for short and long sequences.</span>
+<span class="w">        </span><span class="sd">&quot;&quot;&quot;Whether to capture separate CUDA graphs for short and long sequences.</span>
 <span class="sd">        Use seq_len_threshold to determine the threshold for separating short and long sequences.</span>
 <span class="sd">        &quot;&quot;&quot;</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">seq_len_threshold</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">index_topk</span>
@@ -1508,8 +1505,7 @@ window.runMermaid = runMermaid;</script>
 
 
 <span class="k">class</span><span class="w"> </span><span class="nc">MoeLoadBalancerConfig</span><span class="p">(</span><span class="n">StrictBaseModel</span><span class="p">):</span>
-<span class="w">    </span><span class="sd">&quot;&quot;&quot;</span>
-<span class="sd">    Pydantic configuration model for the Mixture of Experts (MoE) load balancer.</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;Pydantic configuration model for the Mixture of Experts (MoE) load balancer.</span>
 
 <span class="sd">    This model holds configuration data (`num_slots`, etc.) as well as</span>
 <span class="sd">    runtime state (`_ep_rank`, `_ep_size`) which must be set via the</span>
@@ -1528,8 +1524,7 @@ window.runMermaid = runMermaid;</script>
     <span class="c1"># --- Methods ---</span>
 
     <span class="k">def</span><span class="w"> </span><span class="nf">setup</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">ep_rank</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">ep_size</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
-<span class="w">        </span><span class="sd">&quot;&quot;&quot;</span>
-<span class="sd">        Initializes the runtime state of the configuration.</span>
+<span class="w">        </span><span class="sd">&quot;&quot;&quot;Initializes the runtime state of the configuration.</span>
 <span class="sd">        This must be called before accessing properties like `num_local_slots`.</span>
 <span class="sd">        &quot;&quot;&quot;</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_ep_rank</span> <span class="o">=</span> <span class="n">ep_rank</span>
@@ -2048,8 +2043,7 @@ window.runMermaid = runMermaid;</script>
         <span class="k">return</span> <span class="bp">self</span>
 
     <span class="k">def</span><span class="w"> </span><span class="nf">supports_backend</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">backend</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
-<span class="w">        </span><span class="sd">&quot;&quot;&quot;</span>
-<span class="sd">        Override if the speculation algorithm does not support</span>
+<span class="w">        </span><span class="sd">&quot;&quot;&quot;Override if the speculation algorithm does not support</span>
 <span class="sd">        a subset of the possible backends.</span>
 <span class="sd">        &quot;&quot;&quot;</span>
         <span class="k">return</span> <span class="kc">True</span>
@@ -2078,8 +2072,7 @@ window.runMermaid = runMermaid;</script>
 
 
 <span class="k">class</span><span class="w"> </span><span class="nc">KvCacheConnectorConfig</span><span class="p">(</span><span class="n">StrictBaseModel</span><span class="p">):</span>
-<span class="w">    </span><span class="sd">&quot;&quot;&quot;</span>
-<span class="sd">    Configuration for the KV Cache Connector.</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;Configuration for the KV Cache Connector.</span>
 
 <span class="sd">    Can be configured either by specifying a named preset via ``connector``</span>
 <span class="sd">    (e.g. ``&quot;lmcache&quot;``), or by providing explicit ``connector_module``,</span>
@@ -2380,8 +2373,7 @@ window.runMermaid = runMermaid;</script>
 
     <span class="nd">@functools</span><span class="o">.</span><span class="n">cached_property</span>
     <span class="k">def</span><span class="w"> </span><span class="nf">num_capture_layers</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
-<span class="w">        </span><span class="sd">&quot;&quot;&quot;</span>
-<span class="sd">        Returns the number of layers to capture of the target model.</span>
+<span class="w">        </span><span class="sd">&quot;&quot;&quot;Returns the number of layers to capture of the target model.</span>
 <span class="sd">        If eagle3_layers_to_capture is not None, return the length of the set.</span>
 <span class="sd">        Otherwise, assume Eagle3 base set and return 3.</span>
 <span class="sd">        &quot;&quot;&quot;</span>
@@ -2509,8 +2501,7 @@ window.runMermaid = runMermaid;</script>
 
     <span class="nd">@functools</span><span class="o">.</span><span class="n">cached_property</span>
     <span class="k">def</span><span class="w"> </span><span class="nf">num_capture_layers</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
-<span class="w">        </span><span class="sd">&quot;&quot;&quot;</span>
-<span class="sd">        Returns the number of layers to save.</span>
+<span class="w">        </span><span class="sd">&quot;&quot;&quot;Returns the number of layers to save.</span>
 <span class="sd">        The following hidden states are saved:</span>
 <span class="sd">        - If eagle3_layers_to_capture is None, save the eagle3 base set plus</span>
 <span class="sd">        the post norm last hidden state.</span>
@@ -2951,8 +2942,7 @@ window.runMermaid = runMermaid;</script>
 <div class="viewcode-block" id="AutoDecodingConfig">
 <a class="viewcode-back" href="../../../llm-api/reference.html#tensorrt_llm.llmapi.AutoDecodingConfig">[docs]</a>
 <span class="k">class</span><span class="w"> </span><span class="nc">AutoDecodingConfig</span><span class="p">(</span><span class="n">DecodingBaseConfig</span><span class="p">):</span>
-<span class="w">    </span><span class="sd">&quot;&quot;&quot;</span>
-<span class="sd">    Configuration for auto speculative decoding.</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;Configuration for auto speculative decoding.</span>
 
 <span class="sd">    This config will automatically select a good, draft-model free</span>
 <span class="sd">    speculation algorithm with some heuristic.</span>
@@ -2981,8 +2971,7 @@ window.runMermaid = runMermaid;</script>
 <div class="viewcode-block" id="PrometheusMetricsConfig">
 <a class="viewcode-back" href="../../../llm-api/reference.html#tensorrt_llm.llmapi.PrometheusMetricsConfig">[docs]</a>
 <span class="k">class</span><span class="w"> </span><span class="nc">PrometheusMetricsConfig</span><span class="p">(</span><span class="n">StrictBaseModel</span><span class="p">):</span>
-<span class="w">    </span><span class="sd">&quot;&quot;&quot;</span>
-<span class="sd">    Configuration for Prometheus metrics collection.</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;Configuration for Prometheus metrics collection.</span>
 
 <span class="sd">    Groups all Prometheus-related parameters including custom histogram bucket</span>
 <span class="sd">    boundaries for latency metrics.</span>
@@ -3066,8 +3055,7 @@ window.runMermaid = runMermaid;</script>
 
 
 <span class="k">class</span><span class="w"> </span><span class="nc">RayPlacementConfig</span><span class="p">(</span><span class="n">StrictBaseModel</span><span class="p">):</span>
-<span class="w">    </span><span class="sd">&quot;&quot;&quot;</span>
-<span class="sd">    Configuration for Ray GPU workers placement.</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;Configuration for Ray GPU workers placement.</span>
 <span class="sd">    Currently, this config is only used with AsyncLLM for RL scenarios.</span>
 <span class="sd">    &quot;&quot;&quot;</span>
     <span class="n">defer_workers_init</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
@@ -3133,8 +3121,8 @@ window.runMermaid = runMermaid;</script>
 <span class="k">class</span><span class="w"> </span><span class="nc">ExecutorMemoryType</span><span class="p">(</span><span class="n">StrEnum</span><span class="p">):</span>
 <span class="w">    </span><span class="sd">&quot;&quot;&quot;Types of GPU memory used by executor.</span>
 
-<span class="sd">     These are used by the sleep/wakeup feature to target specific type of memory.</span>
-<span class="sd">     &quot;&quot;&quot;</span>
+<span class="sd">    These are used by the sleep/wakeup feature to target specific type of memory.</span>
+<span class="sd">    &quot;&quot;&quot;</span>
     <span class="n">SAMPLER</span> <span class="o">=</span> <span class="s2">&quot;sampler&quot;</span>
     <span class="n">DRAFTER</span> <span class="o">=</span> <span class="s2">&quot;drafter&quot;</span>
     <span class="n">GUIDED_DECODER</span> <span class="o">=</span> <span class="s2">&quot;guided_decoder&quot;</span>
@@ -3254,9 +3242,9 @@ window.runMermaid = runMermaid;</script>
 
 
 <span class="k">class</span><span class="w"> </span><span class="nc">PybindMirror</span><span class="p">(</span><span class="n">ABC</span><span class="p">):</span>
-<span class="w">    </span><span class="sd">&#39;&#39;&#39; A class containing the utilities for mirroring Python classes to</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;A class containing the utilities for mirroring Python classes to</span>
 <span class="sd">    pybind classes.</span>
-<span class="sd">    &#39;&#39;&#39;</span>
+<span class="sd">    &quot;&quot;&quot;</span>
 
     <span class="nd">@abstractmethod</span>
     <span class="k">def</span><span class="w"> </span><span class="nf">_to_pybind</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
@@ -3272,8 +3260,7 @@ window.runMermaid = runMermaid;</script>
 
     <span class="nd">@staticmethod</span>
     <span class="k">def</span><span class="w"> </span><span class="nf">mirror_pybind_fields</span><span class="p">(</span><span class="n">pybind_class</span><span class="p">):</span>
-<span class="w">        </span><span class="sd">&quot;&quot;&quot;</span>
-<span class="sd">        Class decorator that ensures Python class fields mirror those of a C++ class.</span>
+<span class="w">        </span><span class="sd">&quot;&quot;&quot;Class decorator that ensures Python class fields mirror those of a C++ class.</span>
 
 <span class="sd">        Args:</span>
 <span class="sd">            pybind_class: The C++ class whose fields should be mirrored</span>
@@ -3302,7 +3289,7 @@ window.runMermaid = runMermaid;</script>
 
     <span class="nd">@staticmethod</span>
     <span class="k">def</span><span class="w"> </span><span class="nf">get_pybind_enum_fields</span><span class="p">(</span><span class="n">pybind_class</span><span class="p">):</span>
-<span class="w">        </span><span class="sd">&#39;&#39;&#39; Get all the enum fields from the pybind class. &#39;&#39;&#39;</span>
+<span class="w">        </span><span class="sd">&quot;&quot;&quot;Get all the enum fields from the pybind class.&quot;&quot;&quot;</span>
         <span class="k">return</span> <span class="p">[</span>
             <span class="n">f</span> <span class="k">for</span> <span class="n">f</span> <span class="ow">in</span> <span class="n">pybind_class</span><span class="o">.</span><span class="n">__members__</span><span class="o">.</span><span class="n">keys</span><span class="p">()</span>
             <span class="k">if</span> <span class="ow">not</span> <span class="n">f</span><span class="o">.</span><span class="n">startswith</span><span class="p">(</span><span class="s1">&#39;_&#39;</span><span class="p">)</span> <span class="ow">and</span> <span class="ow">not</span> <span class="nb">callable</span><span class="p">(</span><span class="nb">getattr</span><span class="p">(</span><span class="n">pybind_class</span><span class="p">,</span> <span class="n">f</span><span class="p">))</span>
@@ -3310,7 +3297,7 @@ window.runMermaid = runMermaid;</script>
 
     <span class="nd">@staticmethod</span>
     <span class="k">def</span><span class="w"> </span><span class="nf">mirror_pybind_enum</span><span class="p">(</span><span class="n">pybind_class</span><span class="p">):</span>
-<span class="w">        </span><span class="sd">&#39;&#39;&#39; Mirror the enum fields from the pybind class to the Python class. &#39;&#39;&#39;</span>
+<span class="w">        </span><span class="sd">&quot;&quot;&quot;Mirror the enum fields from the pybind class to the Python class.&quot;&quot;&quot;</span>
 
         <span class="k">def</span><span class="w"> </span><span class="nf">decorator</span><span class="p">(</span><span class="bp">cls</span><span class="p">):</span>
             <span class="k">assert</span> <span class="nb">issubclass</span><span class="p">(</span><span class="bp">cls</span><span class="p">,</span> <span class="n">Enum</span><span class="p">)</span>
@@ -3328,7 +3315,7 @@ window.runMermaid = runMermaid;</script>
 
     <span class="nd">@staticmethod</span>
     <span class="k">def</span><span class="w"> </span><span class="nf">get_pybind_variable_fields</span><span class="p">(</span><span class="n">config_cls</span><span class="p">):</span>
-<span class="w">        </span><span class="sd">&#39;&#39;&#39; Get all the variable fields from the pybind class. &#39;&#39;&#39;</span>
+<span class="w">        </span><span class="sd">&quot;&quot;&quot;Get all the variable fields from the pybind class.&quot;&quot;&quot;</span>
         <span class="k">return</span> <span class="p">[</span>
             <span class="n">f</span> <span class="k">for</span> <span class="n">f</span> <span class="ow">in</span> <span class="nb">dir</span><span class="p">(</span><span class="n">config_cls</span><span class="p">)</span>
             <span class="k">if</span> <span class="ow">not</span> <span class="n">f</span><span class="o">.</span><span class="n">startswith</span><span class="p">(</span><span class="s1">&#39;_&#39;</span><span class="p">)</span> <span class="ow">and</span> <span class="ow">not</span> <span class="nb">callable</span><span class="p">(</span><span class="nb">getattr</span><span class="p">(</span><span class="n">config_cls</span><span class="p">,</span> <span class="n">f</span><span class="p">))</span>
@@ -3336,7 +3323,7 @@ window.runMermaid = runMermaid;</script>
 
     <span class="nd">@staticmethod</span>
     <span class="k">def</span><span class="w"> </span><span class="nf">pybind_equals</span><span class="p">(</span><span class="n">obj0</span><span class="p">,</span> <span class="n">obj1</span><span class="p">):</span>
-<span class="w">        </span><span class="sd">&#39;&#39;&#39; Check if two pybind objects are equal. &#39;&#39;&#39;</span>
+<span class="w">        </span><span class="sd">&quot;&quot;&quot;Check if two pybind objects are equal.&quot;&quot;&quot;</span>
         <span class="k">assert</span> <span class="nb">type</span><span class="p">(</span><span class="n">obj0</span><span class="p">)</span> <span class="ow">is</span> <span class="nb">type</span><span class="p">(</span><span class="n">obj1</span><span class="p">)</span>
         <span class="k">for</span> <span class="n">field</span> <span class="ow">in</span> <span class="n">PybindMirror</span><span class="o">.</span><span class="n">get_pybind_variable_fields</span><span class="p">(</span><span class="nb">type</span><span class="p">(</span><span class="n">obj0</span><span class="p">)):</span>
             <span class="k">if</span> <span class="nb">getattr</span><span class="p">(</span><span class="n">obj0</span><span class="p">,</span> <span class="n">field</span><span class="p">)</span> <span class="o">!=</span> <span class="nb">getattr</span><span class="p">(</span><span class="n">obj1</span><span class="p">,</span> <span class="n">field</span><span class="p">):</span>
@@ -3437,7 +3424,7 @@ window.runMermaid = runMermaid;</script>
 <a class="viewcode-back" href="../../../llm-api/reference.html#tensorrt_llm.llmapi.ContextChunkingPolicy">[docs]</a>
 <span class="nd">@PybindMirror</span><span class="o">.</span><span class="n">mirror_pybind_enum</span><span class="p">(</span><span class="n">_ContextChunkingPolicy</span><span class="p">)</span>
 <span class="k">class</span><span class="w"> </span><span class="nc">ContextChunkingPolicy</span><span class="p">(</span><span class="n">StrEnum</span><span class="p">,</span> <span class="n">metaclass</span><span class="o">=</span><span class="n">PybindMirrorEnumMeta</span><span class="p">):</span>
-<span class="w">    </span><span class="sd">&#39;&#39;&#39; Context chunking policy. &#39;&#39;&#39;</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;Context chunking policy.&quot;&quot;&quot;</span>
     <span class="n">FIRST_COME_FIRST_SERVED</span> <span class="o">=</span> <span class="s2">&quot;FIRST_COME_FIRST_SERVED&quot;</span>
     <span class="n">EQUAL_PROGRESS</span> <span class="o">=</span> <span class="s2">&quot;EQUAL_PROGRESS&quot;</span>
     <span class="n">FORCE_CHUNK</span> <span class="o">=</span> <span class="s2">&quot;FORCE_CHUNK&quot;</span>
@@ -4785,12 +4772,11 @@ window.runMermaid = runMermaid;</script>
 <a class="viewcode-back" href="../../../llm-api/reference.html#tensorrt_llm.llmapi.TrtLlmArgs.validate_model_format_misc">[docs]</a>
     <span class="nd">@model_validator</span><span class="p">(</span><span class="n">mode</span><span class="o">=</span><span class="s2">&quot;after&quot;</span><span class="p">)</span>
     <span class="k">def</span><span class="w"> </span><span class="nf">validate_model_format_misc</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
-<span class="w">        </span><span class="sd">&#39;&#39;&#39;</span>
-<span class="sd">        Load the model format, and do the following:</span>
+<span class="w">        </span><span class="sd">&quot;&quot;&quot;Load the model format, and do the following:</span>
 
 <span class="sd">        1. Load the build_config if got an engine.</span>
 <span class="sd">        2. Load the parallel_config if got a checkpoint.</span>
-<span class="sd">        &#39;&#39;&#39;</span>
+<span class="sd">        &quot;&quot;&quot;</span>
         <span class="n">model_obj</span> <span class="o">=</span> <span class="n">_ModelWrapper</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">model</span><span class="p">)</span>
 
         <span class="k">if</span> <span class="n">model_obj</span><span class="o">.</span><span class="n">is_local_model</span> <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">backend</span> <span class="ow">not</span> <span class="ow">in</span> <span class="p">[</span>
@@ -4901,6 +4887,8 @@ window.runMermaid = runMermaid;</script>
     <span class="n">DUMMY</span> <span class="o">=</span> <span class="mi">1</span>
     <span class="c1"># Only load the multimodal(vision) encoder weights</span>
     <span class="n">VISION_ONLY</span> <span class="o">=</span> <span class="mi">2</span>
+    <span class="c1"># Load weights through GPU Memory Service.</span>
+    <span class="n">GMS</span> <span class="o">=</span> <span class="mi">3</span>
 
 
 <span class="k">class</span><span class="w"> </span><span class="nc">ModelExpressConfig</span><span class="p">(</span><span class="n">StrictBaseModel</span><span class="p">):</span>
@@ -4944,6 +4932,77 @@ window.runMermaid = runMermaid;</script>
                 <span class="s2">&quot;mx_config.preshard_strategy=&#39;global&#39; requires &quot;</span>
                 <span class="s2">&quot;LoadFormat.PRESHARDED, which is not yet available in &quot;</span>
                 <span class="s2">&quot;TRT-LLM main. Use preshard_strategy=&#39;per_module&#39; instead.&quot;</span><span class="p">)</span>
+        <span class="k">return</span> <span class="bp">self</span>
+
+
+<span class="k">class</span><span class="w"> </span><span class="nc">GmsConfig</span><span class="p">(</span><span class="n">StrictBaseModel</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;Prototype configuration for GPU Memory Service (GMS) weight sharing.</span>
+
+<span class="sd">    Composes orthogonally with ``checkpoint_format`` on ``TorchLlmArgs``:</span>
+<span class="sd">    GMS controls *where* weights live (a node-shared GPU memory pool</span>
+<span class="sd">    so multiple TRT-LLM instances zero-copy share the same bytes),</span>
+<span class="sd">    while ``checkpoint_format`` controls *how* they get there (HF disk,</span>
+<span class="sd">    MX P2P, etc.). Effective only when ``TorchLlmArgs.load_format ==</span>
+<span class="sd">    LoadFormat.GMS``; setting any non-default field here without that</span>
+<span class="sd">    load_format triggers a warning via :meth:`TorchLlmArgs.validate_gms_config`.</span>
+
+<span class="sd">    Two roles are decided at connect time by the GMS daemon, not by</span>
+<span class="sd">    config:</span>
+
+<span class="sd">    - **RW (writer)**: the first instance loads weights into the pool</span>
+<span class="sd">      via the normal checkpoint-loader pipeline, then commits them.</span>
+<span class="sd">    - **RO (reader)**: subsequent instances zero-copy materialize the</span>
+<span class="sd">      already-committed layout — no disk I/O, no per-instance copies.</span>
+
+<span class="sd">    See :class:`tensorrt_llm._torch.memory.gpu_memory_backend.GMSBackend`</span>
+<span class="sd">    for the integration adapter and the ``LoadFormat.GMS`` branch in</span>
+<span class="sd">    ``ModelLoader.load`` for orchestration.</span>
+<span class="sd">    &quot;&quot;&quot;</span>
+
+    <span class="n">socket_path</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+        <span class="n">description</span><span class="o">=</span><span class="s2">&quot;Unix domain socket path of the GPU Memory Service. &quot;</span>
+        <span class="s2">&quot;When unset, the GMS library resolves its default per-device path.&quot;</span><span class="p">,</span>
+        <span class="n">status</span><span class="o">=</span><span class="s2">&quot;prototype&quot;</span><span class="p">,</span>
+    <span class="p">)</span>
+
+    <span class="n">mode</span><span class="p">:</span> <span class="n">Literal</span><span class="p">[</span><span class="s2">&quot;auto&quot;</span><span class="p">,</span> <span class="s2">&quot;rw&quot;</span><span class="p">,</span> <span class="s2">&quot;ro&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="s2">&quot;auto&quot;</span><span class="p">,</span>
+        <span class="n">description</span><span class="o">=</span><span class="s2">&quot;GMS operating mode: &#39;auto&#39; requests RW or RO, &#39;rw&#39; &quot;</span>
+        <span class="s2">&quot;requires writer mode, and &#39;ro&#39; requires read-only mode.&quot;</span><span class="p">,</span>
+        <span class="n">status</span><span class="o">=</span><span class="s2">&quot;prototype&quot;</span><span class="p">,</span>
+    <span class="p">)</span>
+
+    <span class="n">tag</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="s2">&quot;weights&quot;</span><span class="p">,</span>
+        <span class="n">description</span><span class="o">=</span><span class="s2">&quot;Tag identifying the model weight set in the GMS memory &quot;</span>
+        <span class="s2">&quot;pool. Defaults to &#39;weights&#39; to match the GMS library convention. &quot;</span>
+        <span class="s2">&quot;The tag must uniquely identify a compatible model/parallelism &quot;</span>
+        <span class="s2">&quot;layout for a given GMS daemon; reusing a tag for different weights &quot;</span>
+        <span class="s2">&quot;can make RO readers attach to the wrong pool.&quot;</span><span class="p">,</span>
+        <span class="n">status</span><span class="o">=</span><span class="s2">&quot;prototype&quot;</span><span class="p">,</span>
+    <span class="p">)</span>
+
+    <span class="nd">@model_validator</span><span class="p">(</span><span class="n">mode</span><span class="o">=</span><span class="s2">&quot;after&quot;</span><span class="p">)</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">validate_gms_config</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="s1">&#39;GmsConfig&#39;</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">&quot;&quot;&quot;Enforce non-empty :attr:`tag`.</span>
+
+<span class="sd">        :attr:`mode` is enforced by its ``Literal`` type annotation —</span>
+<span class="sd">        Pydantic rejects out-of-set values at field validation, before</span>
+<span class="sd">        this validator runs, so the JSON schema/docs are self-describing</span>
+<span class="sd">        (enum) without a duplicated whitelist here.  This validator only</span>
+<span class="sd">        enforces the non-empty / non-whitespace contract on :attr:`tag`,</span>
+<span class="sd">        which the type system can&#39;t express.</span>
+
+<span class="sd">        Raises:</span>
+<span class="sd">            ValueError: If ``tag`` is empty / whitespace-only.</span>
+
+<span class="sd">        Returns:</span>
+<span class="sd">            ``self`` (Pydantic ``model_validator`` contract).</span>
+<span class="sd">        &quot;&quot;&quot;</span>
+        <span class="k">if</span> <span class="ow">not</span> <span class="bp">self</span><span class="o">.</span><span class="n">tag</span> <span class="ow">or</span> <span class="ow">not</span> <span class="bp">self</span><span class="o">.</span><span class="n">tag</span><span class="o">.</span><span class="n">strip</span><span class="p">():</span>
+            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
+                <span class="sa">f</span><span class="s2">&quot;gms_config.tag must be a non-empty string, got </span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">tag</span><span class="si">!r}</span><span class="s2">.&quot;</span><span class="p">)</span>
         <span class="k">return</span> <span class="bp">self</span>
 
 
@@ -5210,6 +5269,12 @@ window.runMermaid = runMermaid;</script>
         <span class="n">status</span><span class="o">=</span><span class="s2">&quot;prototype&quot;</span><span class="p">,</span>
     <span class="p">)</span>
 
+    <span class="n">gms_config</span><span class="p">:</span> <span class="n">GmsConfig</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
+        <span class="n">default_factory</span><span class="o">=</span><span class="n">GmsConfig</span><span class="p">,</span>
+        <span class="n">description</span><span class="o">=</span><span class="s2">&quot;GPU Memory Service (GMS) weight sharing config.&quot;</span><span class="p">,</span>
+        <span class="n">status</span><span class="o">=</span><span class="s2">&quot;prototype&quot;</span><span class="p">,</span>
+    <span class="p">)</span>
+
     <span class="n">kv_connector_config</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">KvCacheConnectorConfig</span><span class="p">]</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
         <span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
         <span class="n">description</span><span class="o">=</span><span class="s2">&quot;The config for KV cache connector.&quot;</span><span class="p">,</span>
@@ -5354,6 +5419,16 @@ window.runMermaid = runMermaid;</script>
     <span class="k">def</span><span class="w"> </span><span class="nf">convert_load_format</span><span class="p">(</span><span class="bp">cls</span><span class="p">,</span> <span class="n">v</span><span class="p">):</span>
         <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">v</span><span class="p">,</span> <span class="n">LoadFormat</span><span class="p">):</span>
             <span class="k">return</span> <span class="n">v</span>
+        <span class="c1"># ``bool`` is a subclass of ``int`` in Python, so without an</span>
+        <span class="c1"># explicit bool check ``load_format=True/False`` would silently</span>
+        <span class="c1"># coerce to ``LoadFormat(1) == LoadFormat.DUMMY`` /</span>
+        <span class="c1"># ``LoadFormat(0) == LoadFormat.AUTO``. Reject early so callers</span>
+        <span class="c1"># who pass a misread boolean flag get an actionable error</span>
+        <span class="c1"># instead of a silently wrong checkpoint-load mode.</span>
+        <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">v</span><span class="p">,</span> <span class="nb">bool</span><span class="p">):</span>
+            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;Invalid LoadFormat: </span><span class="si">{</span><span class="n">v</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+        <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">v</span><span class="p">,</span> <span class="nb">int</span><span class="p">):</span>
+            <span class="k">return</span> <span class="n">LoadFormat</span><span class="p">(</span><span class="n">v</span><span class="p">)</span>
         <span class="n">load_format</span> <span class="o">=</span> <span class="n">v</span><span class="o">.</span><span class="n">upper</span><span class="p">()</span>
         <span class="k">if</span> <span class="n">load_format</span> <span class="ow">not</span> <span class="ow">in</span> <span class="n">LoadFormat</span><span class="o">.</span><span class="n">__members__</span><span class="p">:</span>
             <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;Invalid LoadFormat: </span><span class="si">{</span><span class="n">v</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
@@ -5553,6 +5628,85 @@ window.runMermaid = runMermaid;</script>
         <span class="k">return</span> <span class="bp">self</span></div>
 
 
+<div class="viewcode-block" id="TorchLlmArgs.validate_gms_config">
+<a class="viewcode-back" href="../../../llm-api/reference.html#tensorrt_llm.llmapi.TorchLlmArgs.validate_gms_config">[docs]</a>
+    <span class="nd">@model_validator</span><span class="p">(</span><span class="n">mode</span><span class="o">=</span><span class="s2">&quot;after&quot;</span><span class="p">)</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">validate_gms_config</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="s1">&#39;TorchLlmArgs&#39;</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">&quot;&quot;&quot;Warn when GMS settings are provided without enabling GMS load.</span>
+
+<span class="sd">        Catches the most common misconfiguration: a user customizes</span>
+<span class="sd">        :attr:`gms_config` (e.g. sets a custom ``socket_path`` or</span>
+<span class="sd">        ``mode``) but forgets to set ``load_format=&#39;GMS&#39;``, in which</span>
+<span class="sd">        case the entire GMS config is silently ignored. We emit a</span>
+<span class="sd">        warning so the user notices at config time instead of</span>
+<span class="sd">        debugging &quot;why are my workers not zero-copy sharing weights?&quot;</span>
+<span class="sd">        afterwards.</span>
+
+<span class="sd">        Detection is by deviation from defaults: any of</span>
+<span class="sd">        ``socket_path != None``, ``mode != &#39;auto&#39;``, or</span>
+<span class="sd">        ``tag != &#39;weights&#39;`` triggers the warning when</span>
+<span class="sd">        ``load_format != LoadFormat.GMS``. This is intentionally a</span>
+<span class="sd">        warning (not an error) so callers that pre-populate config</span>
+<span class="sd">        objects from templates aren&#39;t broken.</span>
+
+<span class="sd">        Returns:</span>
+<span class="sd">            ``self`` (Pydantic ``model_validator`` contract).</span>
+<span class="sd">        &quot;&quot;&quot;</span>
+        <span class="n">gms_config_is_non_default</span> <span class="o">=</span> <span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">gms_config</span><span class="o">.</span><span class="n">socket_path</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span>
+                                     <span class="ow">or</span> <span class="bp">self</span><span class="o">.</span><span class="n">gms_config</span><span class="o">.</span><span class="n">mode</span> <span class="o">!=</span> <span class="s2">&quot;auto&quot;</span>
+                                     <span class="ow">or</span> <span class="bp">self</span><span class="o">.</span><span class="n">gms_config</span><span class="o">.</span><span class="n">tag</span> <span class="o">!=</span> <span class="s2">&quot;weights&quot;</span><span class="p">)</span>
+        <span class="k">if</span> <span class="n">gms_config_is_non_default</span> <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">load_format</span> <span class="o">!=</span> <span class="n">LoadFormat</span><span class="o">.</span><span class="n">GMS</span><span class="p">:</span>
+            <span class="n">logger</span><span class="o">.</span><span class="n">warning</span><span class="p">(</span>
+                <span class="s2">&quot;gms_config is set but load_format is &#39;</span><span class="si">%s</span><span class="s2">&#39;, not &#39;GMS&#39;. &quot;</span>
+                <span class="s2">&quot;The GMS config will be ignored. Set load_format=&#39;GMS&#39; to &quot;</span>
+                <span class="s2">&quot;enable GPU Memory Service.&quot;</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">load_format</span><span class="o">.</span><span class="n">name</span><span class="p">)</span>
+        <span class="k">return</span> <span class="bp">self</span></div>
+
+
+<div class="viewcode-block" id="TorchLlmArgs.validate_gms_moe_compat">
+<a class="viewcode-back" href="../../../llm-api/reference.html#tensorrt_llm.llmapi.TorchLlmArgs.validate_gms_moe_compat">[docs]</a>
+    <span class="nd">@model_validator</span><span class="p">(</span><span class="n">mode</span><span class="o">=</span><span class="s2">&quot;after&quot;</span><span class="p">)</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">validate_gms_moe_compat</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="s1">&#39;TorchLlmArgs&#39;</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">&quot;&quot;&quot;Reject ``LoadFormat.GMS`` combined with a MoE load balancer.</span>
+
+<span class="sd">        The ``MoeLoadBalancer``&#39;s ``register_weight_slots_after_to_cuda``</span>
+<span class="sd">        and ``finalize_model`` run AFTER the GMS RW pool is closed and</span>
+<span class="sd">        ``finalize_write`` has committed, so any CUDA allocations they</span>
+<span class="sd">        make land in non-GMS memory and are NOT part of the committed</span>
+<span class="sd">        layout that RO peers receive. The result is &quot;wrong inference,</span>
+<span class="sd">        no error&quot; on RO peers (broken MoE routing state). Failing at</span>
+<span class="sd">        config-validation time is strictly better than that silent</span>
+<span class="sd">        miscompute.</span>
+
+<span class="sd">        The fix for this gap (running the MoE finalize work INSIDE</span>
+<span class="sd">        ``mem_pool_scope`` and BEFORE ``finalize_write`` so MoE</span>
+<span class="sd">        allocations are part of the committed layout) is tracked as</span>
+<span class="sd">        the (MoE, GMS) follow-up; see ``model_loader.py``&#39;s</span>
+<span class="sd">        ``TODO(GMS-MOE-LB)`` comment.</span>
+
+<span class="sd">        Returns:</span>
+<span class="sd">            ``self`` (Pydantic ``model_validator`` contract).</span>
+
+<span class="sd">        Raises:</span>
+<span class="sd">            ValueError: When ``load_format == LoadFormat.GMS`` and</span>
+<span class="sd">                ``moe_config.load_balancer`` is set.</span>
+<span class="sd">        &quot;&quot;&quot;</span>
+        <span class="k">if</span> <span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">load_format</span> <span class="o">==</span> <span class="n">LoadFormat</span><span class="o">.</span><span class="n">GMS</span> <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">moe_config</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span>
+                <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">moe_config</span><span class="o">.</span><span class="n">load_balancer</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">):</span>
+            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
+                <span class="s2">&quot;LoadFormat.GMS is incompatible with moe_config.load_balancer &quot;</span>
+                <span class="s2">&quot;in this PR. The MoE load balancer&#39;s &quot;</span>
+                <span class="s2">&quot;register_weight_slots_after_to_cuda and finalize_model run &quot;</span>
+                <span class="s2">&quot;after the GMS pool closes and finalize_write commits, so &quot;</span>
+                <span class="s2">&quot;their allocations land outside the committed layout. RO &quot;</span>
+                <span class="s2">&quot;peers would receive a broken MoE routing state. Either &quot;</span>
+                <span class="s2">&quot;disable moe_config.load_balancer or use LoadFormat.AUTO. &quot;</span>
+                <span class="s2">&quot;Tracked as the (MoE, GMS) follow-up at &quot;</span>
+                <span class="s2">&quot;tensorrt_llm/_torch/pyexecutor/model_loader.py &quot;</span>
+                <span class="s2">&quot;(see TODO(GMS-MOE-LB)).&quot;</span><span class="p">)</span>
+        <span class="k">return</span> <span class="bp">self</span></div>
+
+
 <div class="viewcode-block" id="TorchLlmArgs.validate_load_balancer">
 <a class="viewcode-back" href="../../../llm-api/reference.html#tensorrt_llm.llmapi.TorchLlmArgs.validate_load_balancer">[docs]</a>
     <span class="nd">@model_validator</span><span class="p">(</span><span class="n">mode</span><span class="o">=</span><span class="s2">&quot;after&quot;</span><span class="p">)</span>
@@ -5654,7 +5808,7 @@ window.runMermaid = runMermaid;</script>
     <span class="k">def</span><span class="w"> </span><span class="nf">validate_ray_worker_extension_cls</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="s1">&#39;TorchLlmArgs&#39;</span><span class="p">:</span>
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">ray_worker_extension_cls</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">orchestrator_type</span> <span class="o">!=</span> <span class="s2">&quot;ray&quot;</span><span class="p">:</span>
             <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
-                <span class="sa">f</span><span class="s2">&quot;ray_worker_extension_cls is only supported with orchestrator_type=&#39;ray&#39;&quot;</span>
+                <span class="s2">&quot;ray_worker_extension_cls is only supported with orchestrator_type=&#39;ray&#39;&quot;</span>
             <span class="p">)</span>
         <span class="k">return</span> <span class="bp">self</span></div>
 
@@ -5803,7 +5957,7 @@ window.runMermaid = runMermaid;</script>
 
 <span class="k">def</span><span class="w"> </span><span class="nf">get_model_format</span><span class="p">(</span><span class="n">model_dir</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span>
                      <span class="n">trust_remote_code</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">_ModelFormatKind</span><span class="p">:</span>
-<span class="w">    </span><span class="sd">&#39;&#39;&#39; Get the format of the model.  &#39;&#39;&#39;</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;Get the format of the model.&quot;&quot;&quot;</span>
     <span class="k">if</span> <span class="ow">not</span> <span class="p">(</span><span class="n">Path</span><span class="p">(</span><span class="n">model_dir</span><span class="p">)</span> <span class="o">/</span> <span class="s1">&#39;config.json&#39;</span><span class="p">)</span><span class="o">.</span><span class="n">exists</span><span class="p">():</span>
         <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
             <span class="sa">f</span><span class="s2">&quot;Failed to infer model format because no config.json exists in </span><span class="si">{</span><span class="n">model_dir</span><span class="si">}</span><span class="s2">&quot;</span>
@@ -5946,9 +6100,9 @@ window.runMermaid = runMermaid;</script>
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on May 25, 2026.</p>
+  <p>Last updated on June 01, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/4517988">4517988</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/a422420">a422420</a>.</p>
   
 </div></div>
       

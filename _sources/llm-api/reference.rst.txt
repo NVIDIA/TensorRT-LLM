@@ -344,7 +344,7 @@ API Reference
     :special-members: __init__
     :member-order: groupwise
     :inherited-members:
-    :exclude-members: model_validate_json,model_config,model_construct,schema_json,parse_file,parse_raw,from_orm,schema,model_parametrized_name,parse_obj,model_dump,model_json_schema,model_fields,model_extra,dict,model_fields_set,update_forward_refs,model_validate,construct,model_rebuild,json,model_validate_strings,copy,model_dump_json,model_post_init,model_computed_fields,validate,model_copy
+    :exclude-members: model_parametrized_name,parse_obj,model_dump_json,schema,model_post_init,validate,model_validate,dict,update_forward_refs,json,from_orm,model_rebuild,model_validate_json,parse_file,model_fields_set,model_computed_fields,model_validate_strings,model_copy,model_json_schema,model_fields,parse_raw,model_dump,model_extra,construct,copy,schema_json,model_construct,model_config
 
 .. autoclass:: tensorrt_llm.llmapi.TrtLlmArgs
     :members:
@@ -353,7 +353,7 @@ API Reference
     :special-members: __init__
     :member-order: groupwise
     :inherited-members:
-    :exclude-members: model_validate_json,model_config,model_construct,schema_json,parse_file,parse_raw,from_orm,schema,model_parametrized_name,parse_obj,model_dump,model_json_schema,model_fields,model_extra,dict,model_fields_set,update_forward_refs,model_validate,construct,model_rebuild,json,model_validate_strings,copy,model_dump_json,model_post_init,model_computed_fields,validate,model_copy
+    :exclude-members: model_parametrized_name,parse_obj,model_dump_json,schema,model_post_init,validate,model_validate,dict,update_forward_refs,json,from_orm,model_rebuild,model_validate_json,parse_file,model_fields_set,model_computed_fields,model_validate_strings,model_copy,model_json_schema,model_fields,parse_raw,model_dump,model_extra,construct,copy,schema_json,model_construct,model_config
 
 .. autoclass:: tensorrt_llm.llmapi.AutoDecodingConfig
     :members:
@@ -428,6 +428,22 @@ API Reference
     :inherited-members:
 
 .. autoclass:: tensorrt_llm.llmapi.PrometheusMetricsConfig
+    :members:
+    :undoc-members:
+    :show-inheritance:
+    :special-members: __init__
+    :member-order: groupwise
+    :inherited-members:
+
+.. autoclass:: tensorrt_llm.llmapi.ThinkingBudgetLogitsProcessor
+    :members:
+    :undoc-members:
+    :show-inheritance:
+    :special-members: __init__
+    :member-order: groupwise
+    :inherited-members:
+
+.. autoclass:: tensorrt_llm.llmapi.add_thinking_budget_logits_processor
     :members:
     :undoc-members:
     :show-inheritance:
