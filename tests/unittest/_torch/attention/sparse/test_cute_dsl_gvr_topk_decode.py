@@ -33,6 +33,7 @@ def _make_inputs(
     next_n: int,
     seed: int,
     compress_ratio: int = 1,
+    preidx_hit_rate: float = 0.0,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Build (logits, pre_idx, seq_lens) for the op.
 
@@ -40,6 +41,13 @@ def _make_inputs(
     compress_ratio``). ``seq_lens`` is in UNCOMPRESSED space — kernel divides
     by ``compress_ratio`` internally. ``pre_idx[..., 0]`` is the per-group
     argmax (indexer invariant).
+
+    ``preidx_hit_rate`` controls how many ``pre_idx[..., 1:]`` slots are
+    real ``torch.topk`` indices vs random fillers. 0.0 = current worst-case
+    (only slot 0 meaningful, rest = junk arange); 0.3-0.8 = realistic
+    production (V3.2 ~40%, V4 Pro ~75%) where the kernel's Guess phase
+    short-circuits. Always preserves the ``pre_idx[..., 0] = argmax``
+    invariant on slot 0.
     """
     torch.manual_seed(seed)
     device = "cuda"
@@ -53,14 +61,29 @@ def _make_inputs(
     # pre_idx[..., 0] invariant. Use N_eff = N - next_n + 1 (the
     # tightest, row-0 boundary; always <= per-row N_eff for any ofs).
     effective_len = N - next_n + 1
-    argmax_idx = logits[::next_n, :effective_len].argmax(dim=-1).int()
+    group_logits = logits[::next_n, :effective_len]
+    argmax_idx = group_logits.argmax(dim=-1).int()
     pre_idx = torch.zeros(num_groups, top_k, dtype=torch.int32, device=device)
     pre_idx[:, 0] = argmax_idx
-    # Fill remaining columns with arbitrary in-range indices (kernel only
-    # treats slot 0 as the argmax hint; the rest contribute to the
-    # guess-set merge but don't have an invariant).
-    for j in range(1, top_k):
-        pre_idx[:, j] = j
+
+    if preidx_hit_rate <= 0.0:
+        # Worst-case: only slot 0 is meaningful, rest are junk arange.
+        # Tests kernel robustness to low-hit-rate preIdx.
+        for j in range(1, top_k):
+            pre_idx[:, j] = j
+    else:
+        # Realistic: mix ``preidx_hit_rate`` real torch.topk indices with
+        # random in-range fillers. Tests the Guess-phase short-circuit
+        # path (production V3.2 ~40%, V4 Pro ~75%).
+        ref_topk = group_logits.topk(top_k, dim=-1).indices.int()
+        keep_mask = torch.rand(ref_topk.shape, device=device) < preidx_hit_rate
+        random_fill = torch.randint(
+            0, effective_len, ref_topk.shape, device=device, dtype=torch.int32
+        )
+        guess = torch.where(keep_mask, ref_topk, random_fill)
+        # Slot 0 must stay as argmax (kernel's strict invariant).
+        guess[:, 0] = argmax_idx
+        pre_idx[:, :] = guess
 
     # seq_lens is uncompressed; kernel divides by cr internally.
     # ``seq_lens = N * cr`` makes the kernel's per-row effective scan
@@ -173,8 +196,17 @@ def _tie_aware_check(
 @pytest.mark.parametrize("next_n", [1, 2])
 @pytest.mark.parametrize("batch_size", [1, 32])
 @pytest.mark.parametrize("compress_ratio", [1, 4])
-def test_cute_dsl_gvr_topk_decode(dtype, top_k, N, next_n, batch_size, compress_ratio):
-    """Compare custom op output against torch.topk reference (tie-aware)."""
+@pytest.mark.parametrize("preidx_hit_rate", [0.0, 0.5])
+def test_cute_dsl_gvr_topk_decode(
+    dtype, top_k, N, next_n, batch_size, compress_ratio, preidx_hit_rate
+):
+    """Compare custom op output against torch.topk reference (tie-aware).
+
+    ``preidx_hit_rate=0.0`` exercises the worst-case (only argmax slot is
+    a real topK index); ``0.5`` matches realistic production preIdx
+    overlap with topK (V3.2 ~40%, V4 Pro ~75%) and exercises the
+    kernel's Guess-phase short-circuit path.
+    """
     if N - next_n + 1 < top_k:
         pytest.skip(
             f"N_eff < top_k ({N - next_n + 1} < {top_k}) is a degenerate path not exercised here"
@@ -189,6 +221,7 @@ def test_cute_dsl_gvr_topk_decode(dtype, top_k, N, next_n, batch_size, compress_
         next_n,
         seed=42,
         compress_ratio=compress_ratio,
+        preidx_hit_rate=preidx_hit_rate,
     )
 
     out_indices = torch.empty(num_rows, top_k, dtype=torch.int32, device="cuda")

@@ -8,6 +8,10 @@ equality. This file exposes every knob
 ``use_constant_hint``, ``compress_ratio``, ``max_seq_len`` hint) so bench
 scripts can override the heuristic.
 
+**Not in CI** — this file imports the DSL kernel module directly
+(no ``trtllm`` runtime dep), to enable knob-A/B development outside the
+production op.
+
 Two usage modes:
 
 * `python -m pytest run_gvr_topk.py`` — exhaustive parameterized correctness sweep
@@ -427,6 +431,7 @@ def main() -> None:
     p.add_argument("--N", type=int, default=8192)
     p.add_argument("--batch_size", type=int, default=1)
     p.add_argument("--next_n", type=int, default=1)
+    p.add_argument("--num_sms", type=int, default=148)
     p.add_argument("--compress_ratio", type=int, default=1, choices=[1, 4])
     p.add_argument("--num_threads", type=int, default=512)
     p.add_argument("--use_256bit_load", action="store_true")
@@ -470,7 +475,7 @@ def main() -> None:
     )
     print(
         f"config: dtype={args.dtype} top_k={args.top_k} N={args.N} "
-        f"batch_size={args.batch_size} next_n={args.next_n}"
+        f"batch_size={args.batch_size} next_n={args.next_n}, num_sms={args.num_sms}"
     )
     print(f"knobs: {knobs}")
 
@@ -480,6 +485,7 @@ def main() -> None:
         seq_lens,
         args.top_k,
         next_n=args.next_n,
+        num_sms=args.num_sms,
         **knobs,
     )
     torch.cuda.synchronize()

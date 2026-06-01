@@ -5954,6 +5954,10 @@ if IS_CUTLASS_DSL_AVAILABLE:
             # ``indexer_topk_decode`` (which also doesn't expose value
             # outputs). The compiled kernel skips all STG.value writes and
             # accepts None for its value-output slot at launch time.
+            #
+            # The kernel keeps both ``return_output_values=True/False``
+            # branches to support enabling value writeback in the future
+            # if a downstream caller needs it.
             return_output_values = False
             # max_seq_len: graph-safe hint. Eager mode: leave None and the
             # heuristic adapts to actual N each call. Graph capture mode:
@@ -5981,6 +5985,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
                                               and N_dec >= n_thresh_t) else 512)
             # V=256-bit only for fp32 above N=16K. Half-prec cvt-to-fp32
             # doubles fragment reg footprint and regresses 5-11% on K=512/1024.
+            # Caller contract: when this fires, ``logits.data_ptr()`` must
+            # be 32-byte aligned (satisfied by torch.empty() and row slices;
+            # column slices / stride-padded layouts may violate it).
             use_256bit_load = (logits.dtype == torch.float32 and N_dec >= 16384)
             # Warp-parallel reduce only pays off at 32-warp (T=1024); at
             # 16-warp (T=512) it costs ~2pp on synth data.
