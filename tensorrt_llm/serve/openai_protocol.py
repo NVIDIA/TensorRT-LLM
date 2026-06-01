@@ -1565,3 +1565,24 @@ class VideoJobList(OpenAIBaseModel):
 
 UCompletionRequest = Union[CompletionRequest, ChatCompletionRequest]
 UCompletionResponse = Union[CompletionResponse, ChatCompletionResponse]
+
+
+class EmbeddingRequest(OpenAIBaseModel):
+    input: Union[str, List[str]]
+    model: str
+    encoding_format: Optional[str] = "base64"
+    dimensions: Optional[int] = None
+    normalize: bool = True
+
+
+class EmbeddingData(OpenAIBaseModel):
+    object: str = "embedding"
+    index: int
+    embedding: Union[str, List[float]]
+
+
+class EmbeddingResponse(OpenAIBaseModel):
+    object: str = "list"
+    data: List[EmbeddingData]
+    model: str
+    usage: UsageInfo

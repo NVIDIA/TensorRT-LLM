@@ -299,3 +299,86 @@ class Qwen3ForCausalLM(SpecDecOneEngineForCausalLM[Qwen3Model, Qwen3Config]):
             model_config._frozen = False
             model_config.mapping = self.mapping_with_cp
             model_config._frozen = True
+
+
+@register_auto_model("Qwen3ForEmbedding")
+class Qwen3ForEmbedding(Qwen3ForCausalLM):
+    """Qwen3-Embedding model that returns last-token hidden states.
+
+    Supported via generate path (max_tokens=1) with additional_model_outputs to
+    leverage scheduler batching, KV cache, and chunked-prefill support that
+    the encode-only path currently does not provide.
+    """
+
+    def __init__(self, model_config: ModelConfig[Qwen3Config]):
+        model_config._frozen = False
+        model_config.pretrained_config.tie_word_embeddings = True
+        model_config._frozen = True
+        super().__init__(model_config)
+
+    def _pool_last_token(
+        self,
+        hidden_states: torch.Tensor,
+        attn_metadata: AttentionMetadata,
+    ) -> torch.Tensor:
+        """Extract the last token's hidden state for each sequence.
+
+        Handles mixed batches where context (prefill) and generation
+        (decode) requests are scheduled together.
+        """
+        pieces = []
+        num_contexts = attn_metadata.num_contexts
+
+        if num_contexts > 0:
+            context_lens = attn_metadata.seq_lens_cuda[:num_contexts]
+            last_indices = torch.cumsum(context_lens, dim=0) - 1
+            pieces.append(hidden_states.index_select(0, last_indices))
+            num_ctx_tokens = attn_metadata.num_ctx_tokens
+        else:
+            num_ctx_tokens = 0
+
+        # Generation tokens (one per decode request) follow context tokens.
+        if hidden_states.shape[0] > num_ctx_tokens:
+            pieces.append(hidden_states[num_ctx_tokens:])
+
+        if not pieces:
+            return hidden_states.new_empty((0, hidden_states.shape[-1]))
+        return torch.cat(pieces, dim=0).contiguous()
+
+    def forward(
+        self,
+        attn_metadata: AttentionMetadata,
+        input_ids: Optional[torch.IntTensor] = None,
+        position_ids: Optional[torch.IntTensor] = None,
+        inputs_embeds: Optional[torch.FloatTensor] = None,
+        return_context_logits: bool = False,
+        spec_metadata: Optional[SpecMetadata] = None,
+        lora_params: Optional[dict] = None,
+        **kwargs,
+    ):
+        hidden_states = self.model(
+            attn_metadata=attn_metadata,
+            input_ids=input_ids,
+            position_ids=position_ids,
+            inputs_embeds=inputs_embeds,
+            spec_metadata=spec_metadata,
+            lora_params=lora_params,
+            **kwargs,
+        )
+
+        logits = self.logits_processor.forward(
+            hidden_states,
+            self.lm_head,
+            attn_metadata,
+            return_context_logits,
+        )
+
+        last_token_hidden_state = self._pool_last_token(
+            hidden_states,
+            attn_metadata,
+        )
+
+        return {
+            "logits": logits,
+            "last_token_hidden_state": last_token_hidden_state,
+        }

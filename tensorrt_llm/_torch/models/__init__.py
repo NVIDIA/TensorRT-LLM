@@ -36,7 +36,7 @@ from .modeling_phi4mm import Phi4MMForCausalLM
 from .modeling_qwen import (Qwen2ForCausalLM, Qwen2ForProcessRewardModel,
                             Qwen2ForRewardModel)
 from .modeling_qwen2vl import Qwen2_5_VLModel, Qwen2VLModel
-from .modeling_qwen3 import Qwen3ForCausalLM
+from .modeling_qwen3 import Qwen3ForCausalLM, Qwen3ForEmbedding
 from .modeling_qwen3_5 import Qwen3_5ForCausalLM, Qwen3_5MoeForCausalLM
 from .modeling_qwen3_moe import Qwen3MoeForCausalLM
 from .modeling_qwen3_next import Qwen3NextForCausalLM
@@ -89,6 +89,7 @@ __all__ = [
     "Qwen2VLModel",
     "Qwen2_5_VLModel",
     "Qwen3ForCausalLM",
+    "Qwen3ForEmbedding",
     "Qwen3MoeForCausalLM",
     "Qwen3_5ForCausalLM",
     "Qwen3_5MoeForCausalLM",
