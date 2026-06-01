@@ -47,7 +47,7 @@ from tensorrt_llm._torch.pyexecutor.seq_slot_manager import SeqSlotManager
 from tensorrt_llm._torch.speculative.eagle3 import Eagle3OneModelSampler
 from tensorrt_llm._utils import get_free_port, mpi_rank, mpi_world_size, nvtx_range
 from tensorrt_llm.inputs.multimodal import MultimodalRuntimeData, check_mm_embed_cumsum_if_needed
-from tensorrt_llm.llmapi.llm_args import ContextChunkingPolicy, SamplerType
+from tensorrt_llm.llmapi.llm_args import AttentionDpConfig, ContextChunkingPolicy, SamplerType
 from tensorrt_llm.llmapi.tokenizer import TokenizerBase
 from tensorrt_llm.mapping import Mapping
 
@@ -325,7 +325,16 @@ class ADEngine(ModelEngine):
         self.llm_args.enable_iter_perf_stats = reporting_info.enable_iter_perf_stats
         self.llm_args.enable_iter_req_stats = reporting_info.enable_iter_req_stats
         self.llm_args.stream_interval = 1
-        self.llm_args.attention_dp_config = None
+        # Enable the attention-DP request balancer (PyExecutor._balance_adp_requests) so prefill
+        # is scheduled across ranks together, avoiding a single prefill rank stalling the others
+        # at the MoE all-to-all collective. No-op unless attention-DP is on. timeout_iters caps
+        # how long a prefill is deferred waiting for other ranks (kept small to not starve the
+        # decode batch at low/mid concurrency).
+        self.llm_args.attention_dp_config = AttentionDpConfig(
+            enable_balance=True,
+            batching_wait_iters=10,
+            timeout_iters=16,
+        )
         self.llm_args.batch_wait_timeout_ms = 0
         self.llm_args.batch_wait_timeout_iters = 0
         self.llm_args.batch_wait_max_tokens_ratio = 0.0
