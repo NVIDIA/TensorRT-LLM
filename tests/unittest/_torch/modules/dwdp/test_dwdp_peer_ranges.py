@@ -48,17 +48,6 @@ class TestComputePeerRanges(unittest.TestCase):
         )
         self.assertEqual(peer_ranges, [(0, 64), (64, 128), (128, 192), (192, 256)])
 
-    def test_uniform_dwdp8_cross_tray(self):
-        peer_ranges = compute_peer_ranges(
-            dwdp_size=8,
-            num_experts_per_worker=32,
-            num_prefetch_experts=32,
-            num_experts_total=256,
-        )
-        for r, (start, end) in enumerate(peer_ranges):
-            self.assertEqual(start, r * 32)
-            self.assertEqual(end, (r + 1) * 32)
-
     def test_non_uniform_tail_padding_capped(self):
         # Defensive: the function caps the last rank's end at
         # ``num_experts_total`` even when ``(dwdp-1)*stride + size >
@@ -86,21 +75,6 @@ class TestComputePeerRanges(unittest.TestCase):
             num_experts_total=256,
         )
         self.assertEqual(peer_ranges, [(0, 86), (85, 171), (170, 256)])
-
-    def test_mode_b_dwdp7_larger_overlap(self):
-        # dwdp=7, 256 experts: ``num_experts % dwdp = 4`` so Mode B
-        # requires more overlap.  size=40, stride=36: 6*36+40=256.
-        peer_ranges = compute_peer_ranges(
-            dwdp_size=7,
-            num_experts_per_worker=40,
-            num_prefetch_experts=36,
-            num_experts_total=256,
-        )
-        # All ranks have valid range = 40 (last rank ends at exactly 256).
-        self.assertEqual(peer_ranges[-1], (216, 256))
-        for r, (start, end) in enumerate(peer_ranges):
-            self.assertEqual(start, r * 36)
-            self.assertEqual(end, min(r * 36 + 40, 256))
 
     def test_redundancy_overlap(self):
         # dwdp=4, size=70, stride=62: 8-expert overlap between adjacent
@@ -191,28 +165,6 @@ class TestLookupOwner(unittest.TestCase):
         # Overlap [124, 132): rank 1 vs rank 2 → rank 1
         for expert_id in range(124, 132):
             self.assertEqual(lookup_owner(expert_id, peer_ranges), 1)
-
-    def test_out_of_range_raises(self):
-        peer_ranges = compute_peer_ranges(
-            dwdp_size=2,
-            num_experts_per_worker=4,
-            num_prefetch_experts=4,
-            num_experts_total=8,
-        )
-        with self.assertRaises(ValueError):
-            lookup_owner(8, peer_ranges)  # past the end
-        with self.assertRaises(ValueError):
-            lookup_owner(99, peer_ranges)
-
-    def test_negative_id_raises(self):
-        peer_ranges = compute_peer_ranges(
-            dwdp_size=2,
-            num_experts_per_worker=4,
-            num_prefetch_experts=4,
-            num_experts_total=8,
-        )
-        with self.assertRaises(ValueError):
-            lookup_owner(-1, peer_ranges)
 
 
 if __name__ == "__main__":

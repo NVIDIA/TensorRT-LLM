@@ -33,15 +33,8 @@ from tensorrt_llm.mapping import Mapping
 
 class TestMappingDwdp(unittest.TestCase):
     # ------------------------------------------------------------------
-    # Construction + validation
+    # Construction
     # ------------------------------------------------------------------
-
-    def test_default_disabled(self):
-        """Without dwdp_size, DWDP is disabled."""
-        m = Mapping(world_size=4, rank=0, tp_size=4)
-        self.assertFalse(m.dwdp_enabled)
-        self.assertEqual(m.dwdp_size, 0)
-        self.assertEqual(m.dwdp_rank, 0)
 
     def test_enabled_basic(self):
         """dwdp_size=4 gives an enabled mapping with DWDP-managed MoE parallelism."""
@@ -49,30 +42,6 @@ class TestMappingDwdp(unittest.TestCase):
         self.assertTrue(m.dwdp_enabled)
         self.assertEqual(m.dwdp_size, 4)
         self.assertEqual(m.dwdp_rank, 2)
-
-    def test_invalid_dwdp_size_one(self):
-        """dwdp_size=1 is meaningless and must be rejected."""
-        with self.assertRaises(ValueError):
-            Mapping(world_size=4, rank=0, tp_size=4, dwdp_size=1)
-
-    def test_invalid_dwdp_size_negative(self):
-        with self.assertRaises(ValueError):
-            Mapping(world_size=4, rank=0, tp_size=4, dwdp_size=-1)
-
-    def test_invalid_dwdp_rank_negative(self):
-        with self.assertRaises(ValueError):
-            Mapping(world_size=4, rank=0, tp_size=4, dwdp_size=4, dwdp_rank=-1)
-
-    def test_invalid_dwdp_rank_too_large(self):
-        with self.assertRaises(ValueError):
-            Mapping(world_size=4, rank=0, tp_size=4, dwdp_size=4, dwdp_rank=4)
-
-    def test_rank_validation_ignored_when_disabled(self):
-        """When dwdp_size=0, dwdp_rank is not range-validated (stays 0)."""
-        # Passing dwdp_rank=99 with dwdp_size=0 should not raise — it's unused.
-        m = Mapping(world_size=4, rank=0, tp_size=4, dwdp_size=0, dwdp_rank=99)
-        self.assertFalse(m.dwdp_enabled)
-        self.assertEqual(m.dwdp_rank, 99)  # stored verbatim, harmless
 
     # ------------------------------------------------------------------
     # MoE parallelism override

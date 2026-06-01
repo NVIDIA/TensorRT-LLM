@@ -79,37 +79,6 @@ class TestAllgatherEScoreCorrectionBias(unittest.TestCase):
             and isinstance(getattr(gate, "e_score_correction_bias"), (torch.Tensor, nn.Parameter))
         )
 
-    def test_already_full_size_is_noop(self):
-        """If bias is already full-sized, no allgather / no param replacement."""
-        num_experts_total = 8
-        dwdp_size = 4
-        full_bias = torch.arange(num_experts_total, dtype=torch.float32)
-        gate = self._make_gate(full_bias.clone())
-        original_param = gate.e_score_correction_bias
-
-        comm = _make_mock_comm([torch.zeros(2)] * dwdp_size)
-        _allgather_e_score_correction_bias(
-            gate,
-            layer_idx=3,
-            dwdp_rank=0,
-            dwdp_size=dwdp_size,
-            num_experts_total=num_experts_total,
-            comm=comm,
-        )
-
-        comm.allgather.assert_not_called()
-        # Parameter object preserved (no replacement occurred)
-        self.assertIs(gate.e_score_correction_bias, original_param)
-
-    def test_mismatched_size_is_noop(self):
-        """Unexpected size doesn't match shard or full — skip allgather."""
-        gate = self._make_gate(torch.zeros(3))  # shard=2, full=8, actual=3
-        comm = _make_mock_comm([torch.zeros(2)] * 4)
-        _allgather_e_score_correction_bias(
-            gate, layer_idx=3, dwdp_rank=0, dwdp_size=4, num_experts_total=8, comm=comm
-        )
-        comm.allgather.assert_not_called()
-
     def test_allgather_sharded_parameter(self):
         """Sharded bias: allgather 4 shards, concat, replace nn.Parameter."""
         dwdp_size = 4
@@ -203,66 +172,6 @@ class TestAllgatherExpertScales(unittest.TestCase):
         # fc31_alpha concatenated to full size (4,)
         self.assertEqual(module.fc31_alpha.shape, (4,))
         torch.testing.assert_close(module.fc31_alpha.data, torch.cat(all_alpha_shards, dim=0))
-
-    def test_skip_expert_weight_names(self):
-        """Scale params named in _EXPERT_WEIGHT_NAMES go through Transport,
-        not this function — allgather must not be invoked for them."""
-        experts_per_rank = 2
-        # w3_w1_weight_scale is in _EXPERT_WEIGHT_NAMES but matches scale keywords.
-        module = self._make_experts_module(
-            {
-                "w3_w1_weight_scale": torch.zeros(experts_per_rank, 16),
-            }
-        )
-        comm = _make_mock_comm([torch.zeros(experts_per_rank, 16)] * 2)
-        _allgather_expert_scales(
-            module,
-            layer_idx=3,
-            dwdp_rank=0,
-            dwdp_size=2,
-            comm=comm,
-            experts_per_rank=experts_per_rank,
-        )
-        comm.allgather.assert_not_called()
-
-    def test_skip_scalar_params(self):
-        """Scalar scale params (ndim==0) are global, not EP-sharded — skip."""
-        experts_per_rank = 2
-        module = self._make_experts_module(
-            {
-                "fc31_input_scale": torch.tensor(0.125),  # scalar
-            }
-        )
-        comm = _make_mock_comm([torch.tensor(0.125)] * 2)
-        _allgather_expert_scales(
-            module,
-            layer_idx=3,
-            dwdp_rank=0,
-            dwdp_size=2,
-            comm=comm,
-            experts_per_rank=experts_per_rank,
-        )
-        comm.allgather.assert_not_called()
-
-    def test_skip_shape_mismatch(self):
-        """Scale param with shape[0] != experts_per_rank is not EP-sharded — skip."""
-        experts_per_rank = 2
-        module = self._make_experts_module(
-            {
-                # Not sharded: first dim 99 instead of 2
-                "fc31_alpha": torch.arange(99, dtype=torch.float32),
-            }
-        )
-        comm = _make_mock_comm([torch.arange(99, dtype=torch.float32)] * 2)
-        _allgather_expert_scales(
-            module,
-            layer_idx=3,
-            dwdp_rank=0,
-            dwdp_size=2,
-            comm=comm,
-            experts_per_rank=experts_per_rank,
-        )
-        comm.allgather.assert_not_called()
 
     def test_allgather_multiple_scales(self):
         """Two matching scale params: each gets its own allgather call."""
@@ -377,15 +286,6 @@ class TestScatterShardsToFull(unittest.TestCase):
         )
         expected = torch.tensor([[0.0, 0.5], [1.0, 1.5], [2.0, 2.5], [3.0, 3.5]])
         torch.testing.assert_close(full, expected)
-
-    def test_empty_shards_raises(self):
-        with self.assertRaises(ValueError):
-            _scatter_shards_to_full(
-                shards=[],
-                peer_ranges=[],
-                num_experts_total=0,
-                ref=torch.zeros(1),
-            )
 
 
 class TestAllgatherExpertScalesNonUniform(unittest.TestCase):

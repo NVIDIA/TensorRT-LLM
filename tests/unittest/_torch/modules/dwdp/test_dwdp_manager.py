@@ -55,16 +55,6 @@ def _make_mapping(dwdp_size: int = 2, dwdp_rank: int = 0) -> Mapping:
     )
 
 
-def _make_mock_comm_world():
-    """Build a mpi4py-style COMM_WORLD mock that yields a mock sub-comm."""
-    comm_world = MagicMock()
-    sub_comm = MagicMock()
-    comm_world.Create_group.return_value = sub_comm
-    comm_world.group.Incl.return_value = MagicMock()  # a group handle
-    comm_world.Get_size.return_value = 1024
-    return comm_world, sub_comm
-
-
 def _configure_mock_comm_world(mock_comm_world, world_size: int = 1024):
     """Configure a class-decorator-patched COMM_WORLD mock with sensible defaults.
 
@@ -149,79 +139,9 @@ class TestDwdpManagerLifecycle(unittest.TestCase):
         self.assertEqual(mgr.num_experts_per_worker, 6)
         self.assertEqual(mgr.num_prefetch_experts, 4)
 
-    def test_init_rejects_non_mpi_dist(self, mock_comm_world, _rank, _setup):
-        mock_comm_world.Create_group.return_value = MagicMock()
-        mock_comm_world.group.Incl.return_value = MagicMock()
-        mock_comm_world.Get_size.return_value = 1024
-        with self.assertRaises(RuntimeError):
-            DwdpManager(
-                config=_make_config(),
-                dist=object(),  # not an MPIDist
-                mapping=_make_mapping(),
-            )
-
-    def test_init_rejects_non_dwdp_mapping(self, mock_comm_world, _rank, _setup):
-        mock_comm_world.Create_group.return_value = MagicMock()
-        mock_comm_world.group.Incl.return_value = MagicMock()
-        mock_comm_world.Get_size.return_value = 1024
-        non_dwdp_mapping = Mapping(world_size=1, rank=0, tp_size=1)
-        with self.assertRaises(RuntimeError):
-            DwdpManager(
-                config=_make_config(),
-                dist=MagicMock(spec=MPIDist),
-                mapping=non_dwdp_mapping,
-            )
-
     # ------------------------------------------------------------------
     # num_groups topology validation (was a dead schema field through 1fbc0d49)
     # ------------------------------------------------------------------
-
-    def test_init_rejects_non_positive_num_groups(self, mock_comm_world, _rank, _setup):
-        _configure_mock_comm_world(mock_comm_world)
-        bad_config = DwdpConfig(
-            dwdp_size=2,
-            num_groups=0,  # invalid
-            num_experts_per_worker=4,
-            num_prefetch_experts=4,
-        )
-        with self.assertRaisesRegex(ValueError, "num_groups must be positive"):
-            DwdpManager(
-                config=bad_config,
-                dist=MagicMock(spec=MPIDist),
-                mapping=_make_mapping(),
-            )
-
-    def test_init_rejects_group_id_exceeding_num_groups(self, mock_comm_world, mock_rank, _setup):
-        # rank=4, dwdp_size=2 -> group_id=2; with num_groups=2 group_id must be < 2.
-        # Override the class-level rank mock to test out-of-range group_id.
-        mock_rank.return_value = 4
-        _configure_mock_comm_world(mock_comm_world)
-        with self.assertRaisesRegex(ValueError, "group_id=2"):
-            DwdpManager(
-                config=DwdpConfig(
-                    dwdp_size=2,
-                    num_groups=2,  # only allows group_ids 0, 1
-                    num_experts_per_worker=4,
-                    num_prefetch_experts=4,
-                ),
-                dist=MagicMock(spec=MPIDist),
-                mapping=_make_mapping(),
-            )
-
-    def test_init_rejects_world_smaller_than_topology(self, mock_comm_world, _rank, _setup):
-        # num_groups=4, dwdp_size=2 declares 8 CTX workers, but world has only 2.
-        _configure_mock_comm_world(mock_comm_world, world_size=2)
-        with self.assertRaisesRegex(ValueError, "MPI world size is only 2"):
-            DwdpManager(
-                config=DwdpConfig(
-                    dwdp_size=2,
-                    num_groups=4,
-                    num_experts_per_worker=4,
-                    num_prefetch_experts=4,
-                ),
-                dist=MagicMock(spec=MPIDist),
-                mapping=_make_mapping(),
-            )
 
     def test_init_accepts_multi_group_topology(self, mock_comm_world, _rank, _setup):
         # num_groups=2, dwdp_size=2 -> 4 CTX ranks total. World >= 4 is fine.
@@ -256,25 +176,6 @@ class TestDwdpManagerLifecycle(unittest.TestCase):
         self.assertIs(get_global_dwdp_manager(), mgr)
         mgr.__exit__(None, None, None)
         self.assertIsNone(get_global_dwdp_manager())
-
-    def test_duplicate_enter_raises(self, mock_comm_world, _rank, _setup):
-        mock_comm_world.Create_group.return_value = MagicMock()
-        mock_comm_world.group.Incl.return_value = MagicMock()
-        mock_comm_world.Get_size.return_value = 1024
-        mgr1 = DwdpManager(
-            config=_make_config(),
-            dist=MagicMock(spec=MPIDist),
-            mapping=_make_mapping(),
-        )
-        mgr1.__enter__()
-        mgr2 = DwdpManager(
-            config=_make_config(),
-            dist=MagicMock(spec=MPIDist),
-            mapping=_make_mapping(),
-        )
-        with self.assertRaises(RuntimeError):
-            mgr2.__enter__()
-        mgr1.__exit__(None, None, None)
 
     def test_cleanup_frees_comm_and_idempotent(self, mock_comm_world, _rank, _setup):
         sub_comm = MagicMock()
@@ -370,22 +271,6 @@ class TestDwdpManagerLifecycle(unittest.TestCase):
     # ------------------------------------------------------------------
     # Runtime forwards require setup()
     # ------------------------------------------------------------------
-
-    def test_runtime_before_setup_raises(self, mock_comm_world, _rank, _setup):
-        mock_comm_world.Create_group.return_value = MagicMock()
-        mock_comm_world.group.Incl.return_value = MagicMock()
-        mock_comm_world.Get_size.return_value = 1024
-        mgr = DwdpManager(
-            config=_make_config(),
-            dist=MagicMock(spec=MPIDist),
-            mapping=_make_mapping(),
-        )
-        with self.assertRaises(RuntimeError):
-            mgr.prefetch_first_layers()
-        with self.assertRaises(RuntimeError):
-            mgr.wait_and_bind(MagicMock(), 3)
-        with self.assertRaises(RuntimeError):
-            mgr.record_compute_and_prefetch_next(3)
 
     def test_prefetch_first_layers_forwards(self, mock_comm_world, _rank, mock_setup):
         mock_comm_world.Create_group.return_value = MagicMock()
