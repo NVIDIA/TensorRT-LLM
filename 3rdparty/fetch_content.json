@@ -33,7 +33,8 @@
       "git_repository": "https://github.com/deepseek-ai/DeepGEMM",
       "git_tag": "67fc64863d43521080bf2005e6528d0fceee9510",
       "git_submodules_recurse": true,
-      "source_subdir": "dont-add-this-project-with-add-subdirectory"
+      "source_subdir": "dont-add-this-project-with-add-subdirectory",
+      "patch_file": "patches/deepgemm_megamoe_prefill_blockm128.patch"
     },
     {
       "name": "eigen",

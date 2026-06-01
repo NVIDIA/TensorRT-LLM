@@ -1,0 +1,16 @@
+--- a/csrc/jit_kernels/heuristics/mega_moe.hpp
++++ b/csrc/jit_kernels/heuristics/mega_moe.hpp
+@@ -77,8 +77,11 @@
+             // Medium batch size, Medium EP, decoding, e.g. 6/384 experts, EP16, bsz 256, or EP32, bsz128
+             return {2, 128, 32, 2};
+         } else {
+-            // Prefill, or large EP decoding
+-            return {2, 192, 32, 2};
++            // Prefill, or large EP decoding.
++            // BLOCK_M=128 is ~2.3x faster than 192 on SM100 (B300) for this fused
++            // mega-MoE GEMM, measured across rows/expert 128..1024 (per-layer variance
++            // also collapses, CV 22%->3-7%); 192 is an inefficient tile here. See PR.
++            return {2, 128, 32, 2};
+         }
+     }();
+ 
