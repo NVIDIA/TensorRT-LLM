@@ -28,19 +28,14 @@ class ExaoneMoeWeightMapper(HfWeightMapper):
         }
 
     def preprocess_weights(self, weights: dict):
-        # NOTE: `weights` may be a ConsumableWeightsDict which only exposes
-        # __getitem__/__setitem__/__delitem__/__contains__; use explicit
-        # assign + del (not pop/setdefault) for cross-type compatibility.
-        config = self.config.pretrained_config
-        mtp_layer_offset = config.num_hidden_layers
+        mtp_layer_offset = self.config.pretrained_config.num_hidden_layers
 
         for name in list(weights.keys()):
             if name.startswith("mtp.layers."):
                 # mtp.layers.{idx}.* -> model.layers.{offset + idx}.*
                 _, _, mtp_layer_idx, module_name = name.split(".", 3)
                 new_name = f"model.layers.{mtp_layer_offset + int(mtp_layer_idx)}.{module_name}"
-                weights[new_name] = weights[name]
-                del weights[name]
+                weights[new_name] = weights.pop(name)
             elif name.startswith("mtp."):
                 # mtp.fc.* -> model.layers.{offset}.eh_proj.*
                 # mtp.norm.* -> model.layers.{offset}.shared_head.norm.*
@@ -49,27 +44,8 @@ class ExaoneMoeWeightMapper(HfWeightMapper):
                     if name.startswith(mtp_prefix):
                         suffix = name[len(mtp_prefix) :]
                         new_name = f"model.layers.{mtp_layer_offset}.{trtllm_name}{suffix}"
-                        weights[new_name] = weights[name]
-                        del weights[name]
+                        weights[new_name] = weights.pop(name)
                         break
-
-        # Vanilla MTP weight sharing: when ModelLoader expands the MTP layer
-        # count beyond the checkpoint (max_draft_len > ckpt MTP count), alias the
-        # checkpoint MTP weights to the expanded layer positions via modulo so
-        # the generic loader finds weights for every MTP layer. Each alias is a
-        # distinct key referencing the same tensor, so the loader consumes them
-        # independently (no shared-consume hazard).
-        model_nextn = getattr(config, "num_nextn_predict_layers", 0) or 0
-        ckpt_nextn = getattr(config, "_ckpt_num_nextn_predict_layers", None) or model_nextn
-        if model_nextn > ckpt_nextn > 0:
-            for model_idx in range(ckpt_nextn, model_nextn):
-                src_prefix = f"model.layers.{mtp_layer_offset + model_idx % ckpt_nextn}."
-                dst_prefix = f"model.layers.{mtp_layer_offset + model_idx}."
-                for name in list(weights.keys()):
-                    if name.startswith(src_prefix):
-                        new_name = dst_prefix + name[len(src_prefix) :]
-                        if new_name not in weights:
-                            weights[new_name] = weights[name]
 
     def is_special_instance_module(self, module: nn.Module) -> bool:
         return isinstance(module, MoE)
