@@ -1,5 +1,3 @@
-COMMA := ,
-
 # Default base image for the docker build as defined in Dockerfile.multi
 BASE_IMAGE         ?= $(shell grep '^ARG BASE_IMAGE=' Dockerfile.multi | grep -o '=.*' | tr -d '="')
 BASE_TAG           ?= $(shell grep '^ARG BASE_TAG=' Dockerfile.multi | grep -o '=.*' | tr -d '="')
@@ -96,7 +94,6 @@ base_pull:
 		$(if $(TRITON_BASE_TAG), --build-arg TRITON_BASE_TAG=$(TRITON_BASE_TAG)) \
 		$(if $(BUILD_WHEEL_ARGS), --build-arg BUILD_WHEEL_ARGS="$(BUILD_WHEEL_ARGS)") \
 		$(if $(BUILD_WHEEL_SCRIPT), --build-arg BUILD_WHEEL_SCRIPT="$(BUILD_WHEEL_SCRIPT)") \
-		$(if $(PREPARE_WHEEL_FROM_BUILD_STAGE), --build-arg PREPARE_WHEEL_FROM_BUILD_STAGE="$(PREPARE_WHEEL_FROM_BUILD_STAGE)") \
 		$(if $(TORCH_INSTALL_TYPE), --build-arg TORCH_INSTALL_TYPE="$(TORCH_INSTALL_TYPE)") \
 		$(if $(CUDA_VERSION), --build-arg CUDA_VER="$(CUDA_VERSION)") \
 		$(if $(CUDNN_VERSION), --build-arg CUDNN_VER="$(CUDNN_VERSION)") \
@@ -111,7 +108,6 @@ base_pull:
 		$(if $(SH_ENV), --build-arg SH_ENV="$(SH_ENV)") \
 		$(if $(BASH_ENV), --build-arg BASH_ENV="$(BASH_ENV)") \
 		$(if $(STAGE), --target $(STAGE)) \
-		$(if $(GITLAB_TOKEN), --secret id=GITLAB_TOKEN$(COMMA)env=GITLAB_TOKEN) \
 		--file Dockerfile.multi \
 		--tag $(IMAGE_WITH_TAG) \
 		..
