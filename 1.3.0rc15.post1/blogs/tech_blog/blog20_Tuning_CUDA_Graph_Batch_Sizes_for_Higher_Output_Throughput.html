@@ -1,0 +1,961 @@
+
+
+<!DOCTYPE html>
+
+
+<html lang="en" data-content_root="../../" >
+
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" /><meta name="viewport" content="width=device-width, initial-scale=1" />
+
+    <title>Tuning CUDA Graph Batch Sizes for Higher Output Throughput &#8212; TensorRT LLM</title>
+  
+  
+  
+  <script data-cfasync="false">
+    document.documentElement.dataset.mode = localStorage.getItem("mode") || "";
+    document.documentElement.dataset.theme = localStorage.getItem("theme") || "";
+  </script>
+  <!--
+    this give us a css class that will be invisible only if js is disabled
+  -->
+  <noscript>
+    <style>
+      .pst-js-only { display: none !important; }
+
+    </style>
+  </noscript>
+  
+  <!-- Loaded before other Sphinx assets -->
+  <link href="../../_static/styles/theme.css?digest=0790524f97105ba85085" rel="stylesheet" />
+<link href="../../_static/styles/pydata-sphinx-theme.css?digest=0790524f97105ba85085" rel="stylesheet" />
+
+    <link rel="stylesheet" type="text/css" href="../../_static/pygments.css?v=8f2a1f02" />
+    <link rel="stylesheet" type="text/css" href="../../_static/styles/nvidia-sphinx-theme.css?v=933278ad" />
+    <link rel="stylesheet" type="text/css" href="../../_static/copybutton.css?v=76b2166b" />
+    <link rel="stylesheet" type="text/css" href="../../_static/autodoc_pydantic.css" />
+    <link rel="stylesheet" type="text/css" href="../../_static/togglebutton.css?v=9c3e77be" />
+    <link rel="stylesheet" type="text/css" href="../../_static/config_selector.css?v=83e831d6" />
+    <link rel="stylesheet" type="text/css" href="../../_static/custom.css?v=19d20f17" />
+  
+  <!-- So that users can add custom icons -->
+  <script defer src="../../_static/scripts/fontawesome.js?digest=0790524f97105ba85085"></script>
+  <!-- Pre-loaded scripts that we'll load fully later -->
+  <link rel="preload" as="script" href="../../_static/scripts/bootstrap.js?digest=0790524f97105ba85085" />
+<link rel="preload" as="script" href="../../_static/scripts/pydata-sphinx-theme.js?digest=0790524f97105ba85085" />
+
+
+
+    <script src="../../_static/documentation_options.js?v=5929fcd5"></script>
+    <script src="../../_static/doctools.js?v=9a2dae69"></script>
+    <script src="../../_static/sphinx_highlight.js?v=dc90522c"></script>
+    <script src="../../_static/clipboard.min.js?v=a7894cd8"></script>
+    <script src="../../_static/copybutton.js?v=65e89d2a"></script>
+    <script src="../../_static/config_selector.js?v=52eb2d38"></script>
+    <script>let toggleHintShow = 'Click to show';</script>
+    <script>let toggleHintHide = 'Click to hide';</script>
+    <script>let toggleOpenOnPrint = 'true';</script>
+    <script src="../../_static/togglebutton.js?v=b8b12719"></script>
+    <script>var togglebuttonSelector = '.toggle, .admonition.dropdown';</script>
+    <script>var togglebuttonSelector = '.toggle, .admonition.dropdown';</script>
+    <script>DOCUMENTATION_OPTIONS.pagename = 'blogs/tech_blog/blog20_Tuning_CUDA_Graph_Batch_Sizes_for_Higher_Output_Throughput';</script>
+    <script>
+        DOCUMENTATION_OPTIONS.theme_version = '0.18.0';
+        DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc15.post1';
+        DOCUMENTATION_OPTIONS.show_version_warning_banner =
+            false;
+        </script>
+    <script>DOCUMENTATION_OPTIONS.search_as_you_type = false;</script>
+
+    <link rel="icon" href="../../_static/favicon.png"/>
+
+    <link rel="index" title="Index" href="../../genindex.html" />
+    <link rel="search" title="Search" href="../../search.html" />
+    <link rel="next" title="DWDP: Distributed Weight Data Parallelism for High-Performance LLM Inference on NVL72" href="blog19_DWDP_Distributed_Weight_Data_Parallelism_for_High_Performance_LLM_Inference_on_NVL72.html" />
+    <link rel="prev" title="Temporal Correlation Meets Sparse Attention: Guess-Verify-Refine Top-K for Blackwell" href="blog21_Temporal_Correlation_Meets_Sparse_Attention.html" />
+
+
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <meta name="docsearch:language" content="en"/>
+  <meta name="docsearch:version" content="1.3.0rc15.post1" />
+  
+    
+    <script src="../../_static/searchtools.js"></script>
+    <script src="../../_static/language_data.js"></script>
+    <script src="../../searchindex.js"></script>
+  
+
+
+  </head>
+
+  <body data-default-mode="">
+
+
+  
+  
+  <div id="pst-skip-link" class="skip-link d-print-none"><a href="#main-content">Skip to main content</a></div>
+
+  
+  <div id="pst-scroll-pixel-helper"></div>
+  
+  <button type="button" class="btn rounded-pill" id="pst-back-to-top">
+    <i class="fa-solid fa-arrow-up"></i>Back to top</button>
+  
+  
+  
+  
+  <dialog id="pst-search-dialog">
+    
+<form class="bd-search d-flex align-items-center"
+      action="../../search.html"
+      method="get">
+  <i class="fa-solid fa-magnifying-glass"></i>
+  <input type="search"
+         class="form-control"
+         name="q"
+         placeholder="Search the docs ..."
+         aria-label="Search the docs ..."
+         autocomplete="off"
+         autocorrect="off"
+         autocapitalize="off"
+         spellcheck="false"/>
+  <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd>K</kbd></span>
+</form>
+  </dialog>
+
+  <div class="pst-async-banner-revealer d-none">
+  <aside id="bd-header-version-warning" class="d-none d-print-none" aria-label="Version warning"></aside>
+</div>
+
+  
+    <header id="pst-header" class="bd-header navbar navbar-expand-lg bd-navbar d-print-none">
+<div class="bd-header__inner bd-page-width">
+  <button class="pst-navbar-icon sidebar-toggle primary-toggle" aria-label="Site navigation">
+    <span class="fa-solid fa-bars"></span>
+  </button>
+  
+  
+  <div class="col-lg-3 navbar-header-items__start">
+    
+      <div class="navbar-item">
+
+  
+    
+  
+
+<a class="navbar-brand logo" href="../../index.html">
+  
+  
+  
+  
+  
+    
+    
+      
+    
+    
+    <img src="../../_static/nvidia-logo-horiz-rgb-blk-for-screen.svg" class="logo__image only-light" alt="TensorRT LLM - Home"/>
+    <img src="../../_static/nvidia-logo-horiz-rgb-wht-for-screen.svg" class="logo__image only-dark pst-js-only" alt="TensorRT LLM - Home"/>
+  
+  
+    <p class="title logo__title">TensorRT LLM</p>
+  
+</a></div>
+    
+  </div>
+  
+  <div class="col-lg-9 navbar-header-items">
+    
+    <div class="me-auto navbar-header-items__center">
+      
+        <div class="navbar-item">
+
+
+<div class="version-switcher__container dropdown pst-js-only">
+  <button id="pst-version-switcher-button-2"
+    type="button"
+    class="version-switcher__button btn btn-sm dropdown-toggle"
+    data-bs-toggle="dropdown"
+    aria-haspopup="listbox"
+    aria-controls="pst-version-switcher-list-2"
+    aria-label="Version switcher list"
+  >
+    Choose version  <!-- this text may get changed later by javascript -->
+    <span class="caret"></span>
+  </button>
+  <div id="pst-version-switcher-list-2"
+    class="version-switcher__menu dropdown-menu list-group-flush py-0"
+    role="listbox" aria-labelledby="pst-version-switcher-button-2">
+    <!-- dropdown will be populated by javascript on page load -->
+  </div>
+</div></div>
+      
+    </div>
+    
+    
+    <div class="navbar-header-items__end">
+      
+        <div class="navbar-item navbar-persistent--container">
+          
+
+<button class="btn search-button-field search-button__button pst-js-only" title="Search" aria-label="Search" data-bs-placement="bottom" data-bs-toggle="tooltip">
+ <i class="fa-solid fa-magnifying-glass"></i>
+ <span class="search-button__default-text">Search</span>
+ <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd class="kbd-shortcut__modifier">K</kbd></span>
+</button>
+        </div>
+      
+      
+        <div class="navbar-item">
+
+<div class="theme-switch-container dropdown pst-js-only" data-bs-toggle="tooltip" data-bs-placement="bottom" title="Color mode">
+  <button class="btn btn-sm nav-link pst-navbar-icon theme-switch-button dropdown-toggle" aria-label="Color mode" data-bs-toggle="dropdown">
+    <i class="theme-switch fa-solid fa-sun fa-lg fa-fw" data-mode="light" title="Light"></i>
+    <i class="theme-switch fa-solid fa-moon fa-lg fa-fw" data-mode="dark" title="Dark"></i>
+    <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg fa-fw" data-mode="auto" title="System Settings"></i>
+  </button>
+  <ul class="dropdown-menu dropdown-menu-end">
+    <li><button class="dropdown-item d-flex align-items-center theme-change-button" data-mode="auto"><i class="fa-solid fa-circle-half-stroke fa-lg fa-fw me-1"></i>System Settings</button></li>
+    <li><button class="dropdown-item d-flex align-items-center theme-change-button" data-mode="light"><i class="fa-solid fa-sun fa-lg fa-fw me-1"></i>Light</button></li>
+    <li><button class="dropdown-item d-flex align-items-center theme-change-button" data-mode="dark"><i class="fa-solid fa-moon fa-lg fa-fw me-1"></i>Dark</button></li>
+  </ul>
+</div></div>
+      
+    </div>
+    
+  </div>
+  
+  
+    <div class="navbar-persistent--mobile">
+
+<button class="btn search-button-field search-button__button pst-js-only" title="Search" aria-label="Search" data-bs-placement="bottom" data-bs-toggle="tooltip">
+ <i class="fa-solid fa-magnifying-glass"></i>
+ <span class="search-button__default-text">Search</span>
+ <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd class="kbd-shortcut__modifier">K</kbd></span>
+</button>
+    </div>
+  
+
+  
+    <button class="pst-navbar-icon sidebar-toggle secondary-toggle" aria-label="On this page">
+      <span class="fa-solid fa-outdent"></span>
+    </button>
+  
+</div>
+
+    </header>
+  
+
+  <div class="bd-container">
+    <div class="bd-container__inner bd-page-width">
+      
+      
+      
+      <dialog id="pst-primary-sidebar-modal"></dialog>
+      <div id="pst-primary-sidebar" class="bd-sidebar-primary bd-sidebar">
+        
+
+
+
+  
+    
+  
+
+<a class="navbar-brand logo" href="../../index.html">
+  
+  
+  
+  
+  
+    
+    
+      
+    
+    
+    <img src="../../_static/nvidia-logo-horiz-rgb-blk-for-screen.svg" class="logo__image only-light" alt="TensorRT LLM - Home"/>
+    <img src="../../_static/nvidia-logo-horiz-rgb-wht-for-screen.svg" class="logo__image only-dark pst-js-only" alt="TensorRT LLM - Home"/>
+  
+  
+    <p class="title logo__title">TensorRT LLM</p>
+  
+</a>
+
+
+  
+  <div class="sidebar-header-items sidebar-primary__section">
+    
+    
+      <div class="sidebar-header-items__center">
+        
+          
+          
+            <div class="navbar-item">
+
+
+<div class="version-switcher__container dropdown pst-js-only">
+  <button id="pst-version-switcher-button-3"
+    type="button"
+    class="version-switcher__button btn btn-sm dropdown-toggle"
+    data-bs-toggle="dropdown"
+    aria-haspopup="listbox"
+    aria-controls="pst-version-switcher-list-3"
+    aria-label="Version switcher list"
+  >
+    Choose version  <!-- this text may get changed later by javascript -->
+    <span class="caret"></span>
+  </button>
+  <div id="pst-version-switcher-list-3"
+    class="version-switcher__menu dropdown-menu list-group-flush py-0"
+    role="listbox" aria-labelledby="pst-version-switcher-button-3">
+    <!-- dropdown will be populated by javascript on page load -->
+  </div>
+</div></div>
+          
+        
+      </div>
+    
+    
+    
+      <div class="sidebar-header-items__end">
+        
+          <div class="navbar-item">
+
+<div class="theme-switch-container dropdown pst-js-only" data-bs-toggle="tooltip" data-bs-placement="bottom" title="Color mode">
+  <button class="btn btn-sm nav-link pst-navbar-icon theme-switch-button dropdown-toggle" aria-label="Color mode" data-bs-toggle="dropdown">
+    <i class="theme-switch fa-solid fa-sun fa-lg fa-fw" data-mode="light" title="Light"></i>
+    <i class="theme-switch fa-solid fa-moon fa-lg fa-fw" data-mode="dark" title="Dark"></i>
+    <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg fa-fw" data-mode="auto" title="System Settings"></i>
+  </button>
+  <ul class="dropdown-menu dropdown-menu-end">
+    <li><button class="dropdown-item d-flex align-items-center theme-change-button" data-mode="auto"><i class="fa-solid fa-circle-half-stroke fa-lg fa-fw me-1"></i>System Settings</button></li>
+    <li><button class="dropdown-item d-flex align-items-center theme-change-button" data-mode="light"><i class="fa-solid fa-sun fa-lg fa-fw me-1"></i>Light</button></li>
+    <li><button class="dropdown-item d-flex align-items-center theme-change-button" data-mode="dark"><i class="fa-solid fa-moon fa-lg fa-fw me-1"></i>Dark</button></li>
+  </ul>
+</div></div>
+        
+      </div>
+    
+  </div>
+  
+    <div class="sidebar-primary-items__start sidebar-primary__section">
+        <div class="sidebar-primary-item">
+
+
+
+<nav class="bd-docs-nav bd-links"
+     aria-label="Table of Contents">
+  <p class="bd-links__title" role="heading" aria-level="1">Table of Contents</p>
+  <div class="bd-toc-item navbar-nav"><p aria-level="2" class="caption" role="heading"><span class="caption-text">Getting Started</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../overview.html">Overview</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../quick-start-guide.html">Quick Start Guide</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../installation/index.html">Installation</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../installation/installation-guide.html">Installation Guide</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../installation/build-from-source.html">Build from Source</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../installation/containers.html">Container Images</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1"><a class="reference internal" href="../../supported-hardware.html">Supported Hardware</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Deployment Guide</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../examples/llm_api_examples.html">LLM Examples</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_inference.html">Generate text</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_inference_async.html">Generate text asynchronously</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_inference_async_streaming.html">Generate text in streaming</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_inference_distributed.html">Distributed LLM Generation</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_guided_decoding.html">Generate text with guided decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_logits_processor.html">Control generated text using logits processor</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_multilora.html">Generate text with multiple LoRA adapters</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_sparse_attention.html">Sparse Attention</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_speculative_decoding.html">Speculative Decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_kv_cache_connector.html">KV Cache Connector</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_kv_cache_offloading.html">KV Cache Offloading</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_runtime.html">Runtime Configuration Examples</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_sampling.html">Sampling Techniques Showcase</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_lmcache_connector.html">LMCache KV Cache Connector</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_mgmn_llm_distributed.html">Run LLM-API with pytorch backend on Slurm</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_mgmn_trtllm_bench.html">Run trtllm-bench with pytorch backend on Slurm</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_mgmn_trtllm_serve.html">Run trtllm-serve with pytorch backend on Slurm</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../examples/trtllm_serve_examples.html">Online Serving Examples</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/aiperf_client.html">Aiperf Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/aiperf_client_for_multimodal.html">Aiperf Client For Multimodal</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/curl_chat_client.html">Curl Chat Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/curl_chat_client_for_multimodal.html">Curl Chat Client For Multimodal</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/curl_completion_client.html">Curl Completion Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/curl_responses_client.html">Curl Responses Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/deepseek_r1_reasoning_parser.html">Deepseek R1 Reasoning Parser</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/openai_chat_client.html">OpenAI Chat Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/openai_chat_client_for_multimodal.html">OpenAI Chat Client for Multimodal</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/openai_completion_client.html">OpenAI Completion Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/openai_completion_client_for_lora.html">Openai Completion Client For Lora</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/openai_completion_client_json_schema.html">OpenAI Completion Client with JSON Schema</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/openai_responses_client.html">OpenAI Responses Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/prometheus_metrics.html">Prometheus Metrics</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1"><a class="reference internal" href="../../examples/dynamo_k8s_example.html">Dynamo K8s Example</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../deployment-guide/index.html">Model Recipes</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/deployment-guide-for-nemotron-3-super-on-trtllm.html">Deployment Guide for Nemotron v3 Super on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/deployment-guide-for-deepseek-r1-on-trtllm.html">Deployment Guide for DeepSeek R1 on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/deployment-guide-for-llama3.3-70b-on-trtllm.html">Deployment Guide for Llama3.3 70B on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/deployment-guide-for-llama4-scout-on-trtllm.html">Deployment Guide for Llama4 Scout 17B on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/deployment-guide-for-gpt-oss-on-trtllm.html">Deployment Guide for GPT-OSS on TensorRT-LLM - Blackwell Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/deployment-guide-for-qwen3-on-trtllm.html">Deployment Guide for Qwen3 on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/deployment-guide-for-qwen3-next-on-trtllm.html">Deployment Guide for Qwen3 Next on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/deployment-guide-for-kimi-k2-thinking-on-trtllm.html">Deployment Guide for Kimi K2 Thinking on TensorRT LLM - Blackwell</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/deployment-guide-for-glm-5-on-trtllm.html">Deployment Guide for GLM-5 on TensorRT LLM - Blackwell Hardware</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1"><a class="reference internal" href="../../deployment-guide/configuring-cpu-affinity.html">CPU Affinity configuration in TensorRT LLM</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Models</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../models/supported-models.html">Supported Models</a></li>
+
+
+<li class="toctree-l1"><a class="reference internal" href="../../models/visual-generation.html">Visual Generation (Beta)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../models/adding-new-model.html">Adding a New Model</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">CLI Reference</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../commands/trtllm-bench.html">trtllm-bench</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../commands/trtllm-eval.html">trtllm-eval</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../commands/trtllm-serve/index.html">trtllm-serve</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../commands/trtllm-serve/trtllm-serve.html">trtllm-serve</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../commands/trtllm-serve/run-benchmark-with-trtllm-serve.html">Run benchmarking with <code class="docutils literal notranslate"><span class="pre">trtllm-serve</span></code></a></li>
+</ul>
+</details></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">API Reference</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../llm-api/index.html">LLM API Introduction</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../llm-api/reference.html">API Reference</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Features</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../features/feature-combination-matrix.html">Feature Combination Matrix</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/attention.html">Multi-Head, Multi-Query, and Group-Query Attention</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/disagg-serving.html">Disaggregated Serving</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/kvcache.html">KV Cache System</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/long-sequence.html">Long Sequences</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/lora.html">LoRA (Low-Rank Adaptation)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/multi-modality.html">Multimodal Support in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/overlap-scheduler.html">Overlap Scheduler</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/paged-attention-ifb-scheduler.html">Paged Attention, IFB, and Request Scheduling</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/parallel-strategy.html">Parallelism in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/quantization.html">Quantization</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/sampling.html">Sampling</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/additional-outputs.html">Additional Outputs</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/guided-decoding.html">Guided Decoding</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/speculative-decoding.html">Speculative Decoding</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/checkpoint-loading.html">Checkpoint Loading</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/auto_deploy/auto-deploy.html">AutoDeploy (Beta)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/ray-orchestrator.html">Ray Orchestrator (Prototype)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/torch_compile_and_piecewise_cuda_graph.html">Torch Compile &amp; Piecewise CUDA Graph</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/helix.html">Helix Parallelism</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/kv-cache-connector.html">KV Cache Connector</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/sparse-attention.html">Sparse Attention</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Developer Guide</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../developer-guide/overview.html">Architecture Overview</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../developer-guide/perf-analysis.html">Performance Analysis</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../developer-guide/perf-benchmarking.html">TensorRT LLM Benchmarking</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../developer-guide/ci-overview.html">Continuous Integration Overview</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../developer-guide/dev-containers.html">Using Dev Containers</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../developer-guide/api-change.html">LLM API Change Guide</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../developer-guide/kv-transfer.html">Introduction to KV Cache Transmission</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
+<ul class="current nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="blog22_Helix_Parallelism_Scaling_Multi_Million_Token_Decoding_with_KV_Cache_Sharding.html">Helix Parallelism in TensorRT-LLM: Scaling Multi-Million-Token Decoding with KV Cache Sharding</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog21_Temporal_Correlation_Meets_Sparse_Attention.html">Temporal Correlation Meets Sparse Attention: Guess-Verify-Refine Top-K for Blackwell</a></li>
+<li class="toctree-l1 current active"><a class="current reference internal" href="#">Tuning CUDA Graph Batch Sizes for Higher Output Throughput</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog19_DWDP_Distributed_Weight_Data_Parallelism_for_High_Performance_LLM_Inference_on_NVL72.html">DWDP: Distributed Weight Data Parallelism for High-Performance LLM Inference on NVL72</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog18_Optimizing_MoE_Communication_with_One_Sided_AlltoAll_Over_NVLink.html">Optimizing MoE Communication with One-Sided AlltoAll Over NVLink</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog17_Sparse_Attention_in_TensorRT-LLM.html">Sparse Attention in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog16_Accelerating_Long_Context_Inference_with_Skip_Softmax_Attention.html">Accelerating Long-Context Inference with Skip Softmax Attention</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog15_Optimizing_DeepSeek_V32_on_NVIDIA_Blackwell_GPUs.html">Optimizing DeepSeek-V3.2 on NVIDIA Blackwell GPUs</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog14_Scaling_Expert_Parallelism_in_TensorRT-LLM_part3.html">Scaling Expert Parallelism in TensorRT LLM (Part 3: Pushing the Performance Boundary)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog13_Inference_Time_Compute_Implementation_in_TensorRT-LLM.html">Inference Time Compute Implementation in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog12_Combining_Guided_Decoding_and_Speculative_Decoding.html">Combining Guided Decoding and Speculative Decoding: Making CPU and GPU Cooperate Seamlessly</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog11_GPT_OSS_Eagle3.html">Running GPT-OSS-120B with Eagle3 Speculative Decoding on GB200/B200 (TensorRT LLM)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog10_ADP_Balance_Strategy.html">ADP Balance Strategy</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog09_Deploying_GPT_OSS_on_TRTLLM.html">Running a High Performance GPT-OSS-120B Inference Server with TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog08_Scaling_Expert_Parallelism_in_TensorRT-LLM_part2.html">Scaling Expert Parallelism in TensorRT LLM (Part 2: Performance Status and Optimization)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog07_NGram_performance_Analysis_And_Auto_Enablement.html">N-Gram Speculative Decoding in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog06_Llama4_maverick_eagle_guide.html">How to launch Llama4 Maverick + Eagle3 TensorRT LLM server</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog05_Disaggregated_Serving_in_TensorRT-LLM.html">Disaggregated Serving in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog04_Scaling_Expert_Parallelism_in_TensorRT-LLM.html">Scaling Expert Parallelism in TensorRT LLM (Part 1: Design and Implementation of Large-scale EP)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog03_Optimizing_DeepSeek_R1_Throughput_on_NVIDIA_Blackwell_GPUs.html">Optimizing DeepSeek R1 Throughput on NVIDIA Blackwell GPUs: A Deep Dive for Developers</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog02_DeepSeek_R1_MTP_Implementation_and_Optimization.html">DeepSeek R1 MTP Implementation and Optimization</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog01_Pushing_Latency_Boundaries_Optimizing_DeepSeek-R1_Performance_on_NVIDIA_B200_GPUs.html">Pushing Latency Boundaries: Optimizing DeepSeek-R1 Performance on NVIDIA B200 GPUs</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../Best_perf_practice_on_DeepSeek-R1_in_TensorRT-LLM.html">How to get best performance on DeepSeek-R1 in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../H200launch.html">H200 achieves nearly 12,000 tokens/sec on Llama2-13B with TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../XQA-kernel.html">New XQA-kernel provides 2.4x more Llama-70B throughput within the same latency budget</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../H100vsA100.html">H100 has 4.6x A100 Performance in TensorRT LLM, achieving 10,000 tok/s at 100ms to first token</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../Falcon180B-H200.html">Falcon-180B on a single H200 GPU with INT4 AWQ, and 6.7x faster Llama-70B over A100</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../quantization-in-TRT-LLM.html">Speed up inference with SOTA quantization techniques in TRT-LLM</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Quick Links</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/releases">Releases</a></li>
+<li class="toctree-l1"><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM">Github Code</a></li>
+<li class="toctree-l1"><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/issues?q=is%3Aissue%20state%3Aopen%20label%3Aroadmap">Roadmap</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Use TensorRT Engine</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../legacy/tensorrt_quickstart.html">LLM API with TensorRT Engine</a></li>
+</ul>
+</div>
+</nav></div>
+    </div>
+  
+  
+  <div class="sidebar-primary-items__end sidebar-primary__section">
+  </div>
+
+
+
+      </div>
+      
+      <main id="main-content" class="bd-main" role="main">
+        
+        
+          <div class="bd-content">
+            <div class="bd-article-container">
+              
+              <div class="bd-header-article d-print-none">
+<div class="header-article-items header-article__inner">
+  
+    <div class="header-article-items__start">
+      
+        <div class="header-article-item">
+
+<nav aria-label="Breadcrumb" class="d-print-none">
+  <ul class="bd-breadcrumbs">
+    
+    <li class="breadcrumb-item breadcrumb-home">
+      <a href="../../index.html" class="nav-link" aria-label="Home">
+        <i class="fa-solid fa-home"></i>
+      </a>
+    </li>
+    <li class="breadcrumb-item active" aria-current="page"><span class="ellipsis">Tuning CUDA Graph Batch Sizes for Higher Output Throughput</span></li>
+  </ul>
+</nav>
+</div>
+      
+    </div>
+  
+  
+</div>
+</div>
+              
+              
+              
+                
+<div id="searchbox"></div>
+                <article class="bd-article">
+                  
+  <section class="tex2jax_ignore mathjax_ignore" id="tuning-cuda-graph-batch-sizes-for-higher-output-throughput">
+<h1>Tuning CUDA Graph Batch Sizes for Higher Output Throughput<a class="headerlink" href="#tuning-cuda-graph-batch-sizes-for-higher-output-throughput" title="Link to this heading">#</a></h1>
+<p>By NVIDIA TensorRT LLM Team</p>
+<p>CUDA graphs reduce per-step GPU launch overhead by pre-recording sequences of GPU operations and replaying them as a single unit. In TensorRT-LLM, CUDA graphs are captured for a fixed set of batch sizes; when CUDA graph padding is enabled, an incoming batch is padded to the next available captured size, wasting some compute on empty slots. The default configuration captures only 23 batch sizes using a roughly-doubling progression, leaving gaps of up to 1024 between consecutive sizes in the high-concurrency range. This post investigates the throughput impact of filling those gaps with finer-grained batch size sets, and characterizes the resulting GPU memory and server startup time overhead.</p>
+<section id="table-of-contents">
+<h2>Table of Contents<a class="headerlink" href="#table-of-contents" title="Link to this heading">#</a></h2>
+<ul class="simple">
+<li><p><a class="reference internal" href="#background-cuda-graph-padding">Background: CUDA Graph Padding</a></p></li>
+<li><p><a class="reference internal" href="#configurations-under-study">Configurations Under Study</a></p></li>
+<li><p><a class="reference internal" href="#experiment-setup">Experiment Setup</a></p></li>
+<li><p><a class="reference internal" href="#phase-1-the-64-configuration">Phase 1: The +64 Configuration</a></p>
+<ul>
+<li><p><a class="reference internal" href="#aggregated-serving-results">Aggregated Serving Results</a></p></li>
+<li><p><a class="reference internal" href="#disaggregated-serving-results">Disaggregated Serving Results</a></p></li>
+<li><p><a class="reference internal" href="#gpu-memory-overhead">GPU Memory Overhead</a></p></li>
+<li><p><a class="reference internal" href="#server-startup-time-overhead">Server Startup Time Overhead</a></p></li>
+</ul>
+</li>
+<li><p><a class="reference internal" href="#phase-2-the-8-configuration">Phase 2: The +8 Configuration</a></p>
+<ul>
+<li><p><a class="reference internal" href="#throughput-results">Throughput Results</a></p></li>
+<li><p><a class="reference internal" href="#kv-cache-and-memory-tradeoff">KV Cache and Memory Tradeoff</a></p></li>
+</ul>
+</li>
+<li><p><a class="reference internal" href="#conclusions">Conclusions</a></p></li>
+<li><p><a class="reference internal" href="#future-work">Future Work</a></p></li>
+</ul>
+</section>
+<section id="background-cuda-graph-padding">
+<h2>Background: CUDA Graph Padding<a class="headerlink" href="#background-cuda-graph-padding" title="Link to this heading">#</a></h2>
+<p>TensorRT-LLM captures CUDA graphs for a predetermined set of batch sizes before inference begins. At each generation step, the scheduler assembles a batch of requests; if the batch size does not match any captured size, the runtime pads it up to the nearest larger captured size, running the model over some empty slots. The wasted computation is proportional to the gap between the actual batch and the next captured size.</p>
+<p>The default <strong>x2 configuration</strong> covers 23 batch sizes using a coarsely-doubling sequence:</p>
+<div class="highlight-text notranslate"><div class="highlight"><pre><span></span>1, 2, 4, 8, 16, 24, 32, 40, 48, 56, 64, 72, 80, 88, 96, 104, 112, 120, 128, 256, 512, 1024, 2048
+</pre></div>
+</div>
+<p>The dense coverage up to 128 is appropriate for low-concurrency scenarios where batches are small. However, the large gaps above 128 — 128 to 256, 256 to 512, 512 to 1024, and 1024 to 2048 — can cause up to 50% padding waste in high-concurrency scenarios where the decode server processes hundreds to thousands of concurrent requests simultaneously. Finer granularity in this range directly reduces that waste.</p>
+</section>
+<section id="configurations-under-study">
+<h2>Configurations Under Study<a class="headerlink" href="#configurations-under-study" title="Link to this heading">#</a></h2>
+<p>We evaluate three configurations that differ in how densely they cover batch sizes in the 128–2048 range:</p>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head"><p>Config</p></th>
+<th class="head"><p>Batch Size Sequence (above 128)</p></th>
+<th class="head"><p>Total Graphs</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><strong>x2</strong> (default)</p></td>
+<td><p>256, 512, 1024, 2048</p></td>
+<td><p>23</p></td>
+</tr>
+<tr class="row-odd"><td><p><strong>+64</strong></p></td>
+<td><p>192, 256, 320, …, 1984, 2048 (64-step)</p></td>
+<td><p>49</p></td>
+</tr>
+<tr class="row-even"><td><p><strong>+8</strong></p></td>
+<td><p>136, 144, 152, …, 2040, 2048 (8-step)</p></td>
+<td><p>259</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>Both +64 and +8 configs share the same fine-grained coverage up to 128 as the default x2 config; the differences are exclusively in how the 128–2048 range is subdivided. The +64 configuration reduces the maximum per-step padding from 1024 to 63 tokens in this range; the +8 configuration reduces it to 7 tokens, effectively eliminating padding waste above batch size 128.</p>
+</section>
+<section id="experiment-setup">
+<h2>Experiment Setup<a class="headerlink" href="#experiment-setup" title="Link to this heading">#</a></h2>
+<p>All experiments are conducted on NVIDIA GB200 servers using TensorRT-LLM v1.3.0rc8. We evaluate four frontier NVFP4-quantized models under two serving topologies:</p>
+<ul class="simple">
+<li><p><strong>Aggregated mode</strong>: a single server with 4×GB200 GPUs handling both prefill and decode, with tensor parallelism (TP)</p></li>
+<li><p><strong>Disaggregated mode</strong>: 4 or 8×GB200 GPUs for the prefill (context) server and 4×GB200 GPUs for the decode (generation) server, with expert parallelism (EP)</p></li>
+</ul>
+<p>The primary metric is <strong>output throughput</strong> in terms of tokens per second (TPS). Benchmarks sweep a range of concurrency levels at fixed ISL=500, OSL=2000. All results report TPS improvement of the candidate configuration relative to the x2 baseline at each concurrency level.</p>
+</section>
+<section id="phase-1-the-64-configuration">
+<h2>Phase 1: The +64 Configuration<a class="headerlink" href="#phase-1-the-64-configuration" title="Link to this heading">#</a></h2>
+<section id="aggregated-serving-results">
+<h3>Aggregated Serving Results<a class="headerlink" href="#aggregated-serving-results" title="Link to this heading">#</a></h3>
+<p>In aggregated mode, we measure the TPS improvement of the +64 config over the default x2 config across various concurrencies for each model. Improvements are concentrated in the concurrency range above 128, where the +64 config introduces intermediate sizes that reduce padding waste.</p>
+<div align="center">
+<figure>
+  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog20_aggr_all_models.png" alt="Relative output throughput improvement of +64 vs x2 config in aggregated mode across all four models" width="700">
+</figure>
+</div>
+<p align="center"><sub><em>Figure 1. Relative output throughput improvement (%) of the +64 config over x2 in aggregated mode for all four models.</em></sub></p>
+<p>Across all four models, the +64 config improves TPS by <strong>up to 1.3x</strong> at high concurrency. Concurrencies up to 128 show near-zero difference and are omitted. Gains emerge above concurrency 128 where the +64 config fills in the large gaps in the mid-to-high batch size range.</p>
+</section>
+<section id="disaggregated-serving-results">
+<h3>Disaggregated Serving Results<a class="headerlink" href="#disaggregated-serving-results" title="Link to this heading">#</a></h3>
+<p>In disaggregated mode, we use 4 to 8 GPUs for the context server and 4 for the generation server, with EP for the MoE layers. We again test the four models under various concurrencies.</p>
+<div align="center">
+<figure>
+  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog20_disagg_all_models.png" alt="Relative output throughput improvement of +64 vs x2 config in disaggregated mode across all four models" width="700">
+</figure>
+</div>
+<p align="center"><sub><em>Figure 2. Relative output throughput improvement (%) of the +64 config over x2 in disaggregated mode for all four models. C8G4 denotes 8 context GPUs and 4 generation GPUs; C4G4 denotes 4 context and 4 generation GPUs.</em></sub></p>
+<p>DeepSeek-R1 shows the largest gains, reaching <strong>up to 1.5x</strong> around concurrency 500–600 before stabilizing at 1.1x at higher concurrency levels. DeepSeek-V3.2 and Qwen3-235B achieve 1.08x–1.15x gains at high concurrencies. Kimi-K2 shows the lowest improvement: as a one-trillion-parameter model on 8 context and 4 generation GB200s, its KV cache is already fully constrained, and the increased memory usage from the +64 config’s additional CUDA graphs reduces available KV cache further, counteracting the padding efficiency gains. This memory-throughput tradeoff is examined in more detail in the GPU Memory Overhead section below.</p>
+</section>
+<section id="gpu-memory-overhead">
+<h3>GPU Memory Overhead<a class="headerlink" href="#gpu-memory-overhead" title="Link to this heading">#</a></h3>
+<p>Capturing more CUDA graphs requires more GPU memory for graph data. TensorRT-LLM already uses <code class="docutils literal notranslate"><span class="pre">graph.pool()</span></code> to share a memory pool across all captured graphs when capturing various tensor buffers for decoding passes, so the memory pool size is determined by the memory footprint of the largest graph — which is identical in the x2 and +64 configurations. The observable memory difference lies instead in the CUDA graph metadata outside the pool.</p>
+<p>Using <code class="docutils literal notranslate"><span class="pre">torch.cuda.mem_get_info()</span></code> on an aggregated-mode DeepSeek-R1 model at TP=4, we find on average each CUDA graph adds approximately 10 MB of dedicated data. The 26 additional graphs in the +64 configuration therefore account for approximately <strong>260 MB</strong> more GPU memory consumption, which reduces the amount of memory available for the KV cache.</p>
+<p>We suggest deploying high-parameter models like Kimi-K2 with higher parallelism to provision more GPU memory per serving instance, thereby reducing the negative effect of capturing more CUDA graphs on KV cache capacity.</p>
+</section>
+<section id="server-startup-time-overhead">
+<h3>Server Startup Time Overhead<a class="headerlink" href="#server-startup-time-overhead" title="Link to this heading">#</a></h3>
+<p>CUDA graph capture occurs twice during server initialization: once as a <strong>dry run</strong> to measure runtime GPU memory consumption (from which the amount of GPU memory for safe KV cache allocation is estimated), and once as the <strong>live launch</strong> with the full KV cache allocated. Capturing more graphs extends both phases proportionally.</p>
+<p>Measured on GB200 with DeepSeek-R1 at TP=4 and maximum batch size 2048:</p>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head"><p>Config</p></th>
+<th class="head"><p>Graphs</p></th>
+<th class="head"><p>1st capture</p></th>
+<th class="head"><p>2nd capture</p></th>
+<th class="head"><p>Total LLM init</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>x2 (default)</p></td>
+<td><p>23</p></td>
+<td><p>10.77 s</p></td>
+<td><p>10.38 s</p></td>
+<td><p>183.62 s</p></td>
+</tr>
+<tr class="row-odd"><td><p>+64</p></td>
+<td><p>49</p></td>
+<td><p>25.90 s</p></td>
+<td><p>25.39 s</p></td>
+<td><p>215.13 s</p></td>
+</tr>
+<tr class="row-even"><td><p><strong>Ratio</strong></p></td>
+<td><p>2.1×</p></td>
+<td><p><strong>2.4×</strong></p></td>
+<td><p><strong>2.4×</strong></p></td>
+<td><p><strong>1.17×</strong></p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>The graph capture phase scales linearly with the number of graphs and increases by 2.4×. However, because model weight loading dominates total initialization time, the end-to-end LLM server startup increases by only 1.17×. The startup overhead from the dry run could be further reduced in a future update by capturing only a small representative subset of graphs during the dry run phase to estimate per-graph memory footprints, rather than capturing all graphs twice.</p>
+</section>
+</section>
+<section id="phase-2-the-8-configuration">
+<h2>Phase 2: The +8 Configuration<a class="headerlink" href="#phase-2-the-8-configuration" title="Link to this heading">#</a></h2>
+<p>Building on the gains from the +64 configuration, we investigate whether reducing the batch size step from 64 to 8 yields further throughput improvements. The +8 configuration captures 259 batch sizes, adding steps at every 8-token interval between 128 and 2048, which reduces the maximum padding per step above batch size 128 to at most 7 tokens.</p>
+<p>For DeepSeek-R1 at TP=4 setup, the 210 additional graphs over +64 consume a total of <strong>2.6 GB</strong> of dedicated GPU memory — a substantially larger overhead than the 260 MB incurred by +64.</p>
+<p>Experiments are conducted in disaggregated mode under the same ISL=500, OSL=2000 conditions. The throughput curves below compare four configurations: +8 (blue), +64 (red), x2/default (yellow), and a no-padding baseline (green, which disables CUDA graph padding entirely and serves as a performance lower bound).</p>
+<section id="throughput-results">
+<h3>Throughput Results<a class="headerlink" href="#throughput-results" title="Link to this heading">#</a></h3>
+<div align="center">
+<figure>
+  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog20_p8_all_models.png" alt="TPS vs. concurrency for all four models in disaggregated mode comparing +8, +64, default, and no-padding configurations" width="800">
+</figure>
+</div>
+<p align="center"><sub><em>Figure 3. TPS vs. concurrency in disaggregated mode for all four models, comparing +8 (blue), +64 (red), default (yellow), and no-padding (green) configs.</em></sub></p>
+<p>All four plots show finer-grained batch size sets result in smoother output throughput curves. The curves of the +8 config are smoother than the +64.
+DeepSeek-R1 and Qwen3-235B show some improvement with the +8 config over +64, with DeepSeek-R1 gaining up to 1.15x at concurrency 576 and Qwen3 gaining up to 1.06x around concurrency 1040. Kimi-K2 shows marginal gains from +8 relative to +64; its TPS continues scaling past concurrency 2000, indicating the decode server is not yet saturated at the highest tested concurrency. DeepSeek-V3.2 is the exception: +8 underperforms +64 by up to 5% around concurrency 500, a regression driven by the KV cache reduction analyzed in the following section.</p>
+</section>
+<section id="kv-cache-and-memory-tradeoff">
+<h3>KV Cache and Memory Tradeoff<a class="headerlink" href="#kv-cache-and-memory-tradeoff" title="Link to this heading">#</a></h3>
+<p>The table below profiles CUDA graph and KV cache GPU memory usage for DeepSeek-V3.2 and DeepSeek-R1:</p>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head"><p>Metric</p></th>
+<th class="head"><p>V3.2 +8</p></th>
+<th class="head"><p>V3.2 +64</p></th>
+<th class="head"><p>R1 +8</p></th>
+<th class="head"><p>R1 +64</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>CUDA graphs compiled</p></td>
+<td><p>259</p></td>
+<td><p>49</p></td>
+<td><p>259</p></td>
+<td><p>49</p></td>
+</tr>
+<tr class="row-odd"><td><p>KV cache max_tokens</p></td>
+<td><p>543,219</p></td>
+<td><p>655,758</p></td>
+<td><p>603,860</p></td>
+<td><p>660,491</p></td>
+</tr>
+<tr class="row-even"><td><p>KV cache GPU memory</p></td>
+<td><p>23.46 GB</p></td>
+<td><p>28.32 GB</p></td>
+<td><p>21.22 GB</p></td>
+<td><p>23.21 GB</p></td>
+</tr>
+<tr class="row-odd"><td><p>KV cache token reduction</p></td>
+<td><p>−17.2%</p></td>
+<td><p>—</p></td>
+<td><p>−8.6%</p></td>
+<td><p>—</p></td>
+</tr>
+<tr class="row-even"><td><p>KV cache memory reduction</p></td>
+<td><p>4.86 GB</p></td>
+<td><p>—</p></td>
+<td><p>1.99 GB</p></td>
+<td><p>—</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>DeepSeek-V3.2’s 210 additional graphs (over +64) consume 4.86 GB of GPU memory, compared to 1.99 GB for the same 210 graphs in DeepSeek-R1. V3.2’s CUDA graphs thus consume 2.4× more GPU memory per graph than R1’s, probably due to V3.2’s complex DeepSeek Sparse Attention (DSA) mechanism. This larger footprint reduces the KV cache token capacity by 17.2% for V3.2, versus 8.6% for R1. TensorRT-LLM’s batch autotuner prevents active requests’ KV cache from being evicted mid-generation, so a smaller KV cache directly caps the number of concurrent in-flight requests, reducing output throughput.</p>
+<p>The adoption of the +8 config is therefore more situation-dependent: it benefits models whose CUDA graphs have a modest per-graph memory footprint (relative to available GPU memory for the KV cache), and regresses on models with larger per-graph footprints where KV cache reduction is the dominant effect.</p>
+</section>
+</section>
+<section id="conclusions">
+<h2>Conclusions<a class="headerlink" href="#conclusions" title="Link to this heading">#</a></h2>
+<p>We experimented with new batch size sets for captured CUDA graphs to reduce wasted compute from padding, measuring the effect on output throughput, GPU memory usage, and server startup time.</p>
+<p>Under our experimental settings (ISL=500, OSL=2000, 4×GB200 decode), the +64 config achieves up to 1.3× output throughput in aggregated mode and up to 1.5× in disaggregated mode across models and concurrencies. It increases the number of captured CUDA graphs from 23 to 49, adding approximately 260 MB of GPU memory and increasing server startup time by 1.17× on DeepSeek-R1. The +8 config achieves slightly higher throughput in most cases but at a considerably higher GPU memory cost and much slower server startup time.</p>
+<p>Based on these results, we have decided to change the default batch sizes when CUDA graph padding is enabled to the +64 config. The +8 config is currently not recommended. This change is expected to improve output throughput for most LLM deployments. Should you encounter a regression after this change, we suggest tuning the serving configuration to use higher parallelism, or explicitly setting the batch size list back to the original x2 default config shown at the beginning of this post.</p>
+</section>
+<section id="future-work">
+<h2>Future Work<a class="headerlink" href="#future-work" title="Link to this heading">#</a></h2>
+<ul class="simple">
+<li><p><strong>Optimized dry-run estimation</strong>: The serve memory dry-run procedure could be streamlined by capturing only two to four graphs during the dry-run phase to estimate per-graph memory footprints, rather than capturing the full CUDA graph set twice. This would reduce the startup time penalty on capturing a large number of CUDA graphs.</p></li>
+<li><p><strong>Additional Batch Size Experiments</strong>: We could test the effect of the +8 config under large EP degrees (EP=16 to 32) and evaluate intermediate step sizes such as +16, x1.25, and x1.5 to derive model-specific batch size recommendations.</p></li>
+<li><p><strong>Automatic CUDA graph batch size tuning</strong>: We could parse serving logs to compute the best set of CUDA graph batch sizes to capture based on the recorded concurrency distribution, rather than requiring users to manually set CUDA graph batch sizes or leave to the default.</p></li>
+</ul>
+</section>
+</section>
+
+
+                </article>
+              
+              
+              
+              
+              
+                <footer class="prev-next-footer d-print-none">
+                  
+<div class="prev-next-area">
+    <a class="left-prev"
+       href="blog21_Temporal_Correlation_Meets_Sparse_Attention.html"
+       title="previous page">
+      <i class="fa-solid fa-angle-left"></i>
+      <div class="prev-next-info">
+        <p class="prev-next-subtitle">previous</p>
+        <p class="prev-next-title">Temporal Correlation Meets Sparse Attention: Guess-Verify-Refine Top-K for Blackwell</p>
+      </div>
+    </a>
+    <a class="right-next"
+       href="blog19_DWDP_Distributed_Weight_Data_Parallelism_for_High_Performance_LLM_Inference_on_NVL72.html"
+       title="next page">
+      <div class="prev-next-info">
+        <p class="prev-next-subtitle">next</p>
+        <p class="prev-next-title">DWDP: Distributed Weight Data Parallelism for High-Performance LLM Inference on NVL72</p>
+      </div>
+      <i class="fa-solid fa-angle-right"></i>
+    </a>
+</div>
+                </footer>
+              
+            </div>
+            
+            
+
+
+              
+                <dialog id="pst-secondary-sidebar-modal"></dialog>
+                <div id="pst-secondary-sidebar" class="bd-sidebar-secondary bd-toc"><div class="sidebar-secondary-items sidebar-secondary__inner">
+
+
+  <div class="sidebar-secondary-item">
+<div
+    id="pst-page-navigation-heading-2"
+    class="page-toc tocsection onthispage">
+    <i class="fa-solid fa-list"></i> On this page
+  </div>
+  <nav id="pst-page-toc-nav" class="page-toc" aria-labelledby="pst-page-navigation-heading-2">
+    <ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#table-of-contents">Table of Contents</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#background-cuda-graph-padding">Background: CUDA Graph Padding</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#configurations-under-study">Configurations Under Study</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#experiment-setup">Experiment Setup</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#phase-1-the-64-configuration">Phase 1: The +64 Configuration</a><ul class="nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#aggregated-serving-results">Aggregated Serving Results</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#disaggregated-serving-results">Disaggregated Serving Results</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#gpu-memory-overhead">GPU Memory Overhead</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#server-startup-time-overhead">Server Startup Time Overhead</a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#phase-2-the-8-configuration">Phase 2: The +8 Configuration</a><ul class="nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#throughput-results">Throughput Results</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#kv-cache-and-memory-tradeoff">KV Cache and Memory Tradeoff</a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#conclusions">Conclusions</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#future-work">Future Work</a></li>
+</ul>
+  </nav></div>
+
+</div></div>
+              
+            
+
+          </div>
+          <footer class="bd-footer-content">
+            
+          </footer>
+        
+      </main>
+    </div>
+  </div>
+  
+
+  <!-- Scripts loaded after <body> so the DOM is not blocked -->
+  <script defer src="../../_static/scripts/bootstrap.js?digest=0790524f97105ba85085"></script>
+<script defer src="../../_static/scripts/pydata-sphinx-theme.js?digest=0790524f97105ba85085"></script>
+
+
+  <footer class="bd-footer">
+<div class="bd-footer__inner bd-page-width">
+  
+    <div class="footer-items__start">
+      
+        <div class="footer-item">
+<a class="footer-brand logo" href="https://www.nvidia.com">
+  <img src="../../_static/nvidia-logo-horiz-rgb-1c-blk-for-screen.svg" class="logo__image only-light" alt="NVIDIA"/>
+  <img src="../../_static/nvidia-logo-horiz-rgb-1c-wht-for-screen.svg" class="logo__image only-dark" alt="NVIDIA"/>
+</a></div>
+      
+        <div class="footer-item">
+
+<div class="footer-links">
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/privacy-policy/">Privacy Policy</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/privacy-center/">Your Privacy Choices</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/terms-of-service/">Terms of Service</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/accessibility/">Accessibility</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/company-policies/">Corporate Policies</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/product-security/">Product Security</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/contact/">Contact</a>
+  
+  
+  
+</div>
+</div>
+      
+        <div class="footer-item">
+
+
+
+
+  <p class="copyright">
+    
+      Copyright © 2025, NVidia.
+      <br/>
+    
+  </p>
+</div>
+      
+        <div class="footer-item">
+<div class="extra_footer">
+  
+  <p>Last updated on May 31, 2026.</p>
+  
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/34a563a">34a563a</a>.</p>
+  
+</div></div>
+      
+    </div>
+  
+  
+  
+</div>
+
+  </footer>
+  </body>
+</html>
