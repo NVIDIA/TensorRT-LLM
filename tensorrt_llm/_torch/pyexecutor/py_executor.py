@@ -1892,6 +1892,8 @@ class PyExecutor:
                             self._check_disagg_ctx_cache_transfer_status(1)
                         elif self.async_transfer_manager.has_any_inflight_requests(
                         ):
+                            # Non-blocking cleanup of completed/timed-out
+                            # transfers to free KV blocks (see _executor_loop).
                             self._check_disagg_ctx_cache_transfer_status(0)
 
                 self.num_scheduled_requests = scheduled_batch.batch_size
@@ -2434,6 +2436,11 @@ class PyExecutor:
                     )
                     self._check_disagg_ctx_cache_transfer_status(1)
                 elif self.async_transfer_manager.has_any_inflight_requests():
+                    # Non-blocking cleanup of completed/timed-out transfers
+                    # to free KV blocks. We avoid the blocking check because
+                    # gen-first requests may be waiting for peer info (which
+                    # would block indefinitely), but completed transfers must
+                    # still be reaped so that KV cache can be reclaimed.
                     self._check_disagg_ctx_cache_transfer_status(0)
 
             # In gen-only benchmark mode, all requests must fit in KV cache

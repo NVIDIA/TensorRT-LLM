@@ -1,4 +1,5 @@
 import gc
+import sys
 import time
 import uuid
 import weakref
@@ -232,15 +233,12 @@ def test_cancel_request_in_transmission(attention_type):
 
 
 @pytest.mark.timeout(120)
-@pytest.mark.parametrize("side", ["sender", "receiver"],
-                         ids=["sender", "receiver"])
-def test_async_transfer_keeps_llm_request_alive(side):
-    """Async transfer entry points keep LlmRequest alive while in flight.
+def test_async_transfer_keeps_llm_request_alive():
+    """Async entry points must hold a strong shared_ptr to the LlmRequest.
 
-    The futures vector on each side holds a strong shared_ptr<LlmRequest>;
-    if a future regression switched back to storing a raw pointer the
-    Python wrapper would be GC'd and the weakref below would expire
-    prematurely.
+    A regression to raw-pointer storage in mSenderFutures /
+    mRequesterFutures lets Python GC the wrapper while a C++ status check
+    still dereferences it.
     """
     mapping = Mapping(world_size=1, rank=0)
     dist = Distributed.get(mapping)
@@ -284,28 +282,151 @@ def test_async_transfer_keeps_llm_request_alive(side):
     kv_cache_manager_gen.impl.add_sequence_batch(
         [(gen_request.py_request_id, gen_request.prompt_len, 1)], [gen_request])
 
+    # Pin the reference graph *before* submission. add_sequence_batch's
+    # nanobind binding takes std::reference_wrapper<LlmRequest>, not a
+    # shared_ptr, so it does not retain a Python-side ref. Snapshotting
+    # the baseline here lets us assert exactly +1 after each async
+    # submission and catches regressions that don't capture a shared_ptr.
     ctx_ref = weakref.ref(ctx_request)
     gen_ref = weakref.ref(gen_request)
+    baseline_ctx_refcount = sys.getrefcount(ctx_request)
+    baseline_gen_refcount = sys.getrefcount(gen_request)
 
     transceiver_ctx.respond_and_send_async(ctx_request)
     transceiver_gen.request_and_receive_async(gen_request)
 
-    # Drop the external Python references. After this, the only owners
-    # of the underlying C++ objects are the shared_ptr entries inside
-    # mSenderFutures / mRequesterFutures.
+    # The nanobind binding for respond_and_send_async / request_and_receive_async
+    # takes std::shared_ptr<LlmRequest>; nanobind binds Python refcount into the
+    # shared_ptr, so post-submission each request has +1 ref held by
+    # mSenderFutures / mRequesterFutures. A regression to raw-pointer storage
+    # would not increment the refcount.
+    assert sys.getrefcount(ctx_request) == baseline_ctx_refcount + 1, (
+        f"respond_and_send_async did not capture a shared_ptr<LlmRequest>; "
+        f"refcount={sys.getrefcount(ctx_request)} "
+        f"(expected baseline {baseline_ctx_refcount} + 1)")
+    assert sys.getrefcount(gen_request) == baseline_gen_refcount + 1, (
+        f"request_and_receive_async did not capture a shared_ptr<LlmRequest>; "
+        f"refcount={sys.getrefcount(gen_request)} "
+        f"(expected baseline {baseline_gen_refcount} + 1)")
+
+    # Drop the external Python refs. After this, the only owners are the
+    # nanobind-managed shared_ptr entries inside mSenderFutures /
+    # mRequesterFutures.
     del ctx_request
     del gen_request
     gc.collect()
 
-    target_ref = ctx_ref if side == "sender" else gen_ref
-    assert target_ref() is not None, (
-        f"{side}-side LlmRequest was destroyed prematurely; the async "
-        f"transfer entry point must hold a strong shared_ptr while the "
-        f"future is in flight")
+    assert ctx_ref() is not None, (
+        "Sender-side LlmRequest was destroyed prematurely; "
+        "respond_and_send_async must hold a strong shared_ptr while the "
+        "sender future is in flight")
+    assert gen_ref() is not None, (
+        "Receiver-side LlmRequest was destroyed prematurely; "
+        "request_and_receive_async must hold a strong shared_ptr while "
+        "the requester future is in flight")
 
     # Drive the transfer to completion so the harness tears down cleanly.
     transceiver_ctx.check_context_transfer_status(1)
     transceiver_gen.check_gen_transfer_status(1)
+
+
+def _build_ctx_request_for_timeout_test(request_id: int) -> LlmRequest:
+    sampling_params = SamplingParams()
+    return LlmRequest(
+        request_id=request_id,
+        max_new_tokens=1,
+        input_tokens=list(range(256)),
+        sampling_config=tensorrt_llm.bindings.SamplingConfig(
+            sampling_params._get_sampling_config()),
+        is_streaming=False,
+        llm_request_type=LlmRequestType.LLMREQUEST_TYPE_CONTEXT_ONLY)
+
+
+@pytest.mark.timeout(60)
+def test_kv_transfer_timeout_warns_once_per_request(capfd):
+    """Observe-only timeout WARN must fire exactly once per stuck request.
+
+    checkContextTransferStatus emits a TLLM_LOG_WARNING when elapsed time
+    exceeds kv_transfer_timeout_ms; mTimedOutSenderIds dedup suppresses
+    repeat emissions across subsequent polls of the same in-flight future.
+    """
+    mapping = Mapping(world_size=1, rank=0)
+    dist = Distributed.get(mapping)
+    kv_cache_manager_ctx = create_kv_cache_manager(mapping, DataType.HALF)
+
+    cache_transceiver_config = CacheTransceiverConfig(
+        backend="DEFAULT", max_tokens_in_buffer=512, kv_transfer_timeout_ms=100)
+    transceiver_ctx = create_kv_cache_transceiver(mapping, dist,
+                                                  kv_cache_manager_ctx,
+                                                  AttentionTypeCpp.DEFAULT,
+                                                  cache_transceiver_config)
+
+    fill_kv_cache_buffer(kv_cache_manager_ctx)
+
+    ctx_request = _build_ctx_request_for_timeout_test(request_id=42)
+    kv_cache_manager_ctx.impl.add_sequence_batch(
+        [(ctx_request.py_request_id, ctx_request.prompt_len, 1)], [ctx_request])
+
+    capfd.readouterr()  # drain prior noise
+
+    transceiver_ctx.respond_and_send_async(ctx_request)
+    time.sleep(0.3)  # > kv_transfer_timeout_ms
+
+    transceiver_ctx.check_context_transfer_status(0)
+    first = capfd.readouterr()
+    marker = "Context KV cache transfer for request 42 exceeded configured timeout"
+    assert marker in first.err, (
+        f"Expected observe-only WARN after timeout; stderr:\n{first.err}")
+    assert first.err.count(marker) == 1, (
+        f"WARN should fire exactly once per poll for a single stuck request; "
+        f"got {first.err.count(marker)} emissions:\n{first.err}")
+
+    transceiver_ctx.check_context_transfer_status(0)
+    second = capfd.readouterr()
+    assert marker not in second.err, (
+        f"WARN re-emitted on a subsequent poll; dedup broken. "
+        f"stderr:\n{second.err}")
+
+    transceiver_ctx.cancel_request(ctx_request)
+
+
+@pytest.mark.timeout(60)
+def test_kv_transfer_timeout_silent_when_unset(capfd):
+    """Without kv_transfer_timeout_ms the observe-only WARN must stay silent.
+
+    The elapsed-time check is gated by the optional config field; absence
+    of the field must short-circuit the WARN path even on a long-running
+    transfer.
+    """
+    mapping = Mapping(world_size=1, rank=0)
+    dist = Distributed.get(mapping)
+    kv_cache_manager_ctx = create_kv_cache_manager(mapping, DataType.HALF)
+
+    cache_transceiver_config = CacheTransceiverConfig(backend="DEFAULT",
+                                                      max_tokens_in_buffer=512)
+    transceiver_ctx = create_kv_cache_transceiver(mapping, dist,
+                                                  kv_cache_manager_ctx,
+                                                  AttentionTypeCpp.DEFAULT,
+                                                  cache_transceiver_config)
+
+    fill_kv_cache_buffer(kv_cache_manager_ctx)
+
+    ctx_request = _build_ctx_request_for_timeout_test(request_id=99)
+    kv_cache_manager_ctx.impl.add_sequence_batch(
+        [(ctx_request.py_request_id, ctx_request.prompt_len, 1)], [ctx_request])
+
+    capfd.readouterr()
+
+    transceiver_ctx.respond_and_send_async(ctx_request)
+    time.sleep(0.3)
+    transceiver_ctx.check_context_transfer_status(0)
+
+    out = capfd.readouterr()
+    assert "exceeded configured timeout" not in out.err, (
+        f"Observe-only WARN must not fire when kv_transfer_timeout_ms is "
+        f"unset; stderr:\n{out.err}")
+
+    transceiver_ctx.cancel_request(ctx_request)
 
 
 def create_hybrid_cache_manager(mapping,

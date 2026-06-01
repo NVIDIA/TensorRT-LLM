@@ -56,18 +56,17 @@ class BufferIndexHolder
 public:
     BufferIndexHolder() = default;
 
-    BufferIndexHolder(BaseTransBufferManager& mgr, std::optional<int> index, bool isRecv,
-        std::optional<uint64_t> requestIdForLog = std::nullopt) noexcept
+    BufferIndexHolder(BaseTransBufferManager& mgr, std::optional<int> index, bool isRecv) noexcept
         : mMgr(&mgr)
         , mIndex(index)
         , mHeld(index.has_value())
         , mIsRecv(isRecv)
-        , mRequestIdForLog(requestIdForLog)
     {
     }
 
-    // release() is out-of-line in baseTransBuffer.cpp to avoid the include cycle
-    // with BaseTransBufferManager.
+    // Defined out-of-line in baseTransBuffer.cpp: release() calls
+    // BaseTransBufferManager methods, whose full definition appears later
+    // in this header.
     ~BufferIndexHolder()
     {
         release();
@@ -81,7 +80,6 @@ public:
         , mIndex(other.mIndex)
         , mHeld(other.mHeld)
         , mIsRecv(other.mIsRecv)
-        , mRequestIdForLog(other.mRequestIdForLog)
     {
         other.mHeld = false;
     }
@@ -95,7 +93,6 @@ public:
             mIndex = other.mIndex;
             mHeld = other.mHeld;
             mIsRecv = other.mIsRecv;
-            mRequestIdForLog = other.mRequestIdForLog;
             other.mHeld = false;
         }
         return *this;
@@ -128,7 +125,6 @@ private:
     std::optional<int> mIndex{};
     bool mHeld{false};
     bool mIsRecv{true};
-    std::optional<uint64_t> mRequestIdForLog{};
 };
 
 /// @brief Base class for cache transfer buffer management.
