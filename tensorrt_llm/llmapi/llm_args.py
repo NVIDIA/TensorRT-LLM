@@ -4567,23 +4567,56 @@ class TorchLlmArgs(BaseLlmArgs):
 def update_llm_args_with_extra_dict(
         llm_args: Dict,
         llm_args_dict: Dict,
-        extra_llm_api_options: Optional[str] = None) -> Dict:
+        extra_llm_api_options: Optional[str] = None,
+        explicit_cli_keys: Optional[Set[str]] = None) -> Dict:
+    """Merge YAML overrides into a CLI-derived llm_args dict.
+
+    If `explicit_cli_keys` is provided, those CLI flag names override any
+    conflicting YAML values. CLI flags whose name does not match the
+    LlmArgs field name (e.g. `--free_gpu_memory_fraction` constructs
+    `kv_cache_config.free_gpu_memory_fraction`) are mapped to the nested
+    field they target.
+
+    If `explicit_cli_keys` is None, YAML wins on conflicts.
+    """
+    # CLI scalar -> nested KvCacheConfig field. Callers add the CLI scalar
+    # name to `explicit_cli_keys` to make it win over YAML's same-named
+    # field inside `kv_cache_config:`.
+    cli_to_kv_cache_field = {
+        "free_gpu_memory_fraction": "free_gpu_memory_fraction",
+        "kv_cache_dtype": "dtype",
+        "enable_block_reuse": "enable_block_reuse",
+    }
+    # Scalars that live both at the top level of LlmArgs and inside
+    # `build_config`. The build_config patch propagates the winning source
+    # to the nested location.
+    build_config_dual_loc_keys = (
+        "max_batch_size",
+        "max_num_tokens",
+        "max_beam_width",
+        "max_seq_len",
+    )
+
+    explicit_cli_keys = explicit_cli_keys or set()
 
     if 'hf_revision' in llm_args_dict:
         llm_args_dict.setdefault('revision', llm_args_dict.pop('hf_revision'))
 
     # Deep merge kv_cache_config to prevent partial YAML kv_cache_config from replacing the complete kv_cache_config
     if 'kv_cache_config' in llm_args and 'kv_cache_config' in llm_args_dict:
-        # Convert KvCacheConfig object to dict if necessary
         base_kv_config = llm_args['kv_cache_config']
         if isinstance(base_kv_config, KvCacheConfig):
             base_kv_config = base_kv_config.model_dump(exclude_unset=True)
-        llm_args_dict['kv_cache_config'] = base_kv_config | llm_args_dict[
-            'kv_cache_config']
+        merged = base_kv_config | llm_args_dict['kv_cache_config']
+        for cli_name, kv_field in cli_to_kv_cache_field.items():
+            if cli_name in explicit_cli_keys and kv_field in base_kv_config:
+                merged[kv_field] = base_kv_config[kv_field]
+        llm_args_dict['kv_cache_config'] = merged
 
     # Deep merge telemetry_config: YAML can override fields like `disabled`,
     # but `usage_context` is determined by the CLI entry point and must not
-    # be overridden by user config.
+    # be overridden by user config. When `--telemetry/--no-telemetry` was
+    # typed explicitly, CLI's `disabled` wins over YAML.
     if 'telemetry_config' in llm_args and 'telemetry_config' in llm_args_dict:
         yaml_tc = llm_args_dict['telemetry_config']
         if not isinstance(yaml_tc, (dict, TelemetryConfig)):
@@ -4597,7 +4630,18 @@ def update_llm_args_with_extra_dict(
             if isinstance(yaml_tc, TelemetryConfig):
                 yaml_tc = yaml_tc.model_dump(exclude_unset=True)
             yaml_tc.pop('usage_context', None)
-            llm_args_dict['telemetry_config'] = base_tc | yaml_tc
+            merged = base_tc | yaml_tc
+            if "telemetry" in explicit_cli_keys and 'disabled' in base_tc:
+                merged['disabled'] = base_tc['disabled']
+            llm_args_dict['telemetry_config'] = merged
+
+    # Drop YAML keys claimed by explicit CLI flags so the outer merge below
+    # cannot overwrite them.
+    if explicit_cli_keys:
+        llm_args_dict = {
+            k: v
+            for k, v in llm_args_dict.items() if k not in explicit_cli_keys
+        }
 
     field_mapping = {
         "quant_config": QuantConfig,
@@ -4617,8 +4661,9 @@ def update_llm_args_with_extra_dict(
     for field_name, field_type in field_mapping.items():
         if field_name in llm_args_dict:
             llm_args_dict[field_name] = field_type(**llm_args_dict[field_name])
-            extra_llm_str = f"because it's specified in {extra_llm_api_options}" if extra_llm_api_options else ""
-            logger.warning(f"Overriding {field_name} {extra_llm_str}")
+            if field_name in llm_args:
+                extra_llm_str = f" because it's specified in {extra_llm_api_options}" if extra_llm_api_options else ""
+                logger.info(f"YAML overrides {field_name}{extra_llm_str}")
 
     llm_args = llm_args | llm_args_dict
 
@@ -4628,28 +4673,35 @@ def update_llm_args_with_extra_dict(
         if isinstance(llm_args["build_config"], dict):
             llm_args["build_config"] = BuildConfig(**llm_args["build_config"])
 
-        for key in [
-                "max_batch_size",
-                "max_num_tokens",
-                "max_beam_width",
-                "max_seq_len",
-        ]:
-            if key in llm_args_dict:
+        # Propagate dual-location scalars into build_config: explicit CLI flag
+        # wins; otherwise YAML's top-level scalar; otherwise leave alone.
+        for key in build_config_dual_loc_keys:
+            if key in explicit_cli_keys and key in llm_args:
+                setattr(llm_args["build_config"], key, llm_args[key])
                 logger.info(
-                    f"Overriding {key} from build_config to {llm_args_dict[key]}"
+                    f"build_config.{key} set to {llm_args[key]} from explicit CLI flag"
                 )
+            elif key in llm_args_dict:
                 setattr(llm_args["build_config"], key, llm_args_dict[key])
+                logger.info(
+                    f"build_config.{key} set to {llm_args_dict[key]} from YAML top-level scalar"
+                )
 
     return llm_args
 
 
-def update_llm_args_with_extra_options(llm_args: Dict,
-                                       extra_llm_api_options: str) -> Dict:
+def update_llm_args_with_extra_options(
+        llm_args: Dict,
+        extra_llm_api_options: str,
+        explicit_cli_keys: Optional[Set[str]] = None) -> Dict:
     if extra_llm_api_options is not None:
         with open(extra_llm_api_options, 'r') as f:
             llm_args_dict = yaml.safe_load(f)
-            llm_args = update_llm_args_with_extra_dict(llm_args, llm_args_dict,
-                                                       extra_llm_api_options)
+            llm_args = update_llm_args_with_extra_dict(
+                llm_args,
+                llm_args_dict,
+                extra_llm_api_options,
+                explicit_cli_keys=explicit_cli_keys)
     return llm_args
 
 
