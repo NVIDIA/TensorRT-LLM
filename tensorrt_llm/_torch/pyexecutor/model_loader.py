@@ -875,10 +875,15 @@ class ModelLoader:
         spec_config = self.spec_config
         if (isinstance(spec_config, MTPDecodingConfig)
                 and spec_config.use_mtp_vanilla
-                and spec_config.max_draft_len is not None
-                and getattr(config.pretrained_config,
-                            'num_nextn_predict_layers', None)):
-            ckpt_nextn = config.pretrained_config.num_nextn_predict_layers
+                and spec_config.max_draft_len is not None):
+            # Some MTP checkpoints (e.g. K-EXAONE) omit num_nextn_predict_layers
+            # from their HF config and only default it to 1 inside the model's
+            # __init__, which runs AFTER this config-time expansion. Mirror that
+            # default here so the expansion is not silently skipped for them.
+            # Gating on use_mtp_vanilla keeps this scoped to an explicit MTP
+            # request, so non-MTP models are unaffected.
+            ckpt_nextn = getattr(config.pretrained_config,
+                                 'num_nextn_predict_layers', None) or 1
             if spec_config.max_draft_len > ckpt_nextn:
                 config.pretrained_config._ckpt_num_nextn_predict_layers = ckpt_nextn
                 config.pretrained_config.num_nextn_predict_layers = \

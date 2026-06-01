@@ -86,19 +86,26 @@ class Glm4WeightLoader:
         # Check if weights supports mark_consumed (ConsumableWeightsDict)
         can_mark_consumed = hasattr(weights, "mark_consumed")
 
+        # num_nextn_predict_layers may have been expanded by ModelLoader to
+        # match max_draft_len; the original checkpoint count is preserved as
+        # `_ckpt_num_nextn_predict_layers`. When the model has more MTP layer
+        # instances than the checkpoint, multiple model layers map to the same
+        # checkpoint layer via modulo, so mark_consumed must be skipped for them
+        # to avoid deleting weights that later MTP layers still need.
+        model_num_nextn = getattr(self.config, "num_nextn_predict_layers", 0)
+        ckpt_num_nextn = (
+            getattr(self.config, "_ckpt_num_nextn_predict_layers", None) or model_num_nextn
+        )
+        has_shared_mtp_weights = (model_num_nextn or 0) > (ckpt_num_nextn or 0) > 0
+
         for name, module in tqdm(all_named_modules.items(), desc="Loading weights"):
             if len(module._parameters) <= 0 or name.startswith("draft_model"):
                 continue
             else:
                 names = name.split(".")
+                is_shared_mtp_layer = False
                 if "model.layers" in name and int(names[2]) >= self.config.num_hidden_layers:
-                    # Use the original checkpoint MTP layer count for
-                    # mod-indexing; falls back to num_nextn_predict_layers when
-                    # no expansion happened.
-                    ckpt_num_nextn = (
-                        getattr(self.config, "_ckpt_num_nextn_predict_layers", None)
-                        or self.config.num_nextn_predict_layers
-                    )
+                    is_shared_mtp_layer = has_shared_mtp_weights
                     mtp_layer_idx = int(names[2]) - self.config.num_hidden_layers
                     names[2] = str(mtp_layer_idx % ckpt_num_nextn + self.config.num_hidden_layers)
                     name = ".".join(names)
@@ -126,7 +133,7 @@ class Glm4WeightLoader:
                         module_weights.append(fw)
                     module.load_weights(weights=module_weights)
                     # Mark consumed source weights (e.g., q_proj, k_proj, v_proj)
-                    if can_mark_consumed:
+                    if can_mark_consumed and not is_shared_mtp_layer:
                         for src_name in params_map[names[-1]]:
                             weights.mark_consumed(".".join(names[:-1] + [src_name]))
                 elif names[-1] == "experts":
@@ -143,7 +150,7 @@ class Glm4WeightLoader:
                         weights=[module_weights], allow_partial_loading=allow_partial_loading
                     )
                     # Mark consumed experts weights
-                    if can_mark_consumed:
+                    if can_mark_consumed and not is_shared_mtp_layer:
                         weights.mark_consumed(name)
                 elif names[-1] == "backend" and isinstance(module, MoE):
                     # Special case: ConfigurableMoE.backend (TRTLLMGenFusedMoE)
@@ -166,7 +173,7 @@ class Glm4WeightLoader:
                         weights=[module_weights], allow_partial_loading=allow_partial_loading
                     )
                     # Mark consumed MoE weights using parent name
-                    if can_mark_consumed:
+                    if can_mark_consumed and not is_shared_mtp_layer:
                         weights.mark_consumed(parent_name)
                 elif names[-1] == "self_attn":
                     continue
@@ -193,7 +200,7 @@ class Glm4WeightLoader:
                             if n in module_weights:
                                 p.data.copy_(module_weights[n][:])
                     # Mark consumed weights
-                    if can_mark_consumed:
+                    if can_mark_consumed and not is_shared_mtp_layer:
                         weights.mark_consumed(name)
 
 
