@@ -112,6 +112,10 @@ def _quantize_bf16_to_fp8_ue8m0(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Te
     return _FUSED_PER_TOKEN_CAST(x)
 
 
+def _inplace_quant_into_symm_available() -> bool:
+    return hasattr(torch.ops, "trtllm") and hasattr(torch.ops.trtllm, "mxfp8_quantize_out")
+
+
 class MegaMoEDeepGemm(MoE):
     """MoE backend wrapping DeepGEMM's fused ``fp8_fp4_mega_moe`` kernel."""
 
@@ -631,6 +635,16 @@ class MegaMoEDeepGemm(MoE):
         """
         del post_quant_comm  # MegaMoE runs pre-quant comm via DG SymmBuffer
         x_bf16 = x.to(torch.bfloat16).contiguous()
+        buf = self._symm_buffer
+        n = x_bf16.shape[0]
+        if (
+            _inplace_quant_into_symm_available()
+            and buf is not None
+            and 0 < n <= self.max_num_tokens
+        ):
+            # Quantize directly into the SymmBuffer so run_moe can skip the staging copy.
+            torch.ops.trtllm.mxfp8_quantize_out(x_bf16, buf.x[:n], buf.x_sf[:n], False, 32)
+            return buf.x[:n], buf.x_sf[:n]
         return _quantize_bf16_to_fp8_ue8m0(x_bf16)
 
     def run_moe(
@@ -670,8 +684,10 @@ class MegaMoEDeepGemm(MoE):
         )
 
         if num_tokens > 0:
-            buf.x[:num_tokens].copy_(x)
-            buf.x_sf[:num_tokens].copy_(x_sf)
+            # Skip the staging copy if quantize_input already wrote x in-place into buf.x.
+            if x.data_ptr() != buf.x.data_ptr():
+                buf.x[:num_tokens].copy_(x)
+                buf.x_sf[:num_tokens].copy_(x_sf)
             buf.topk_idx[:num_tokens].copy_(token_selected_experts.to(torch.int64))
             buf.topk_weights[:num_tokens].copy_(token_final_scales.to(torch.float32))
 

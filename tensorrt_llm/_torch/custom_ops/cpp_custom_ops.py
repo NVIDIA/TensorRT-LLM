@@ -361,6 +361,20 @@ def _register_fake():
         scale_fp8_sf = input.new_empty((sf_size, ), dtype=torch.uint8)
         return val_mxfp8, scale_fp8_sf
 
+    # Register only when the op is in the loaded binary (the source tree may predate it).
+    if hasattr(torch.ops.trtllm, "mxfp8_quantize_out"):
+
+        @torch.library.register_fake("trtllm::mxfp8_quantize_out")
+        def _(
+            input: torch.Tensor,
+            out_val: torch.Tensor,
+            out_sf: torch.Tensor,
+            swizzled_layout: bool = True,
+            alignment: int = 32,
+        ):
+            # In-place: writes into out_val / out_sf, returns nothing.
+            return None
+
     @torch.library.register_fake("trtllm::mxe4m3_mxe2m1_block_scale_moe_runner")
     def _(
         routing_logits: Optional[torch.Tensor],
