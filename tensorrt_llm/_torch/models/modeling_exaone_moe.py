@@ -659,10 +659,7 @@ class ExaoneMoeForCausalLM(SpecDecOneEngineForCausalLM[ExaoneMoeModel, ExaoneMoe
             and model_config.spec_config.spec_dec_mode.is_mtp_one_model()
         ):
             model_nextn = self.config.num_nextn_predict_layers
-            ckpt_nextn = (
-                getattr(self.config, "_ckpt_num_nextn_predict_layers", None)
-                or self.config.num_nextn_predict_layers
-            )
+            ckpt_nextn = self.config.num_nextn_predict_layers
             self.num_hidden_layers = self.config.num_hidden_layers
             if ckpt_nextn == 0:
                 raise ValueError(
