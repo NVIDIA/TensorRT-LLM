@@ -640,6 +640,25 @@ class ExaoneMoeForCausalLM(SpecDecOneEngineForCausalLM[ExaoneMoeModel, ExaoneMoe
         self,
         model_config: ModelConfig[ExaoneMoeConfig],
     ):
+        # Shared-weights vanilla MTP (use_mtp_vanilla=True with
+        # max_draft_len > checkpoint num_nextn_predict_layers, i.e. the
+        # ModelLoader expansion path) is not currently supported on Exaone
+        # MoE models. The load-side fixes in this PR work correctly, but
+        # the MTPWorker runtime path hits a latent IMA in CUDA-graph warmup
+        # capture that is independent of those load-side fixes. Reject
+        # upfront with a clear error; eagle-style MTP and regular vanilla
+        # MTP (max_draft_len <= ckpt num_nextn_predict_layers) remain
+        # supported.
+        if hasattr(model_config.pretrained_config, "_ckpt_num_nextn_predict_layers"):
+            raise NotImplementedError(
+                "Shared-weights vanilla MTP (use_mtp_vanilla=True with "
+                "max_draft_len > checkpoint num_nextn_predict_layers) is "
+                "not currently supported on Exaone MoE models. Please set "
+                "max_draft_len <= the checkpoint's "
+                "num_nextn_predict_layers, or use eagle-style MTP "
+                "(use_mtp_vanilla=False)."
+            )
+
         if (
             model_config.spec_config is not None
             and model_config.spec_config.spec_dec_mode.is_mtp_one_model()

@@ -28,6 +28,9 @@ class ExaoneMoeWeightMapper(HfWeightMapper):
         }
 
     def preprocess_weights(self, weights: dict):
+        # NOTE: `weights` may be a ConsumableWeightsDict which only exposes
+        # __getitem__/__setitem__/__delitem__/__contains__; use explicit
+        # assign + del (not pop/setdefault) for cross-type compatibility.
         config = self.config.pretrained_config
         mtp_layer_offset = config.num_hidden_layers
 
@@ -36,7 +39,8 @@ class ExaoneMoeWeightMapper(HfWeightMapper):
                 # mtp.layers.{idx}.* -> model.layers.{offset + idx}.*
                 _, _, mtp_layer_idx, module_name = name.split(".", 3)
                 new_name = f"model.layers.{mtp_layer_offset + int(mtp_layer_idx)}.{module_name}"
-                weights[new_name] = weights.pop(name)
+                weights[new_name] = weights[name]
+                del weights[name]
             elif name.startswith("mtp."):
                 # mtp.fc.* -> model.layers.{offset}.eh_proj.*
                 # mtp.norm.* -> model.layers.{offset}.shared_head.norm.*
@@ -45,7 +49,8 @@ class ExaoneMoeWeightMapper(HfWeightMapper):
                     if name.startswith(mtp_prefix):
                         suffix = name[len(mtp_prefix) :]
                         new_name = f"model.layers.{mtp_layer_offset}.{trtllm_name}{suffix}"
-                        weights[new_name] = weights.pop(name)
+                        weights[new_name] = weights[name]
+                        del weights[name]
                         break
 
         # Vanilla MTP weight sharing: when ModelLoader expands the MTP layer
@@ -63,7 +68,8 @@ class ExaoneMoeWeightMapper(HfWeightMapper):
                 for name in list(weights.keys()):
                     if name.startswith(src_prefix):
                         new_name = dst_prefix + name[len(src_prefix) :]
-                        weights.setdefault(new_name, weights[name])
+                        if new_name not in weights:
+                            weights[new_name] = weights[name]
 
     def is_special_instance_module(self, module: nn.Module) -> bool:
         return isinstance(module, MoE)
