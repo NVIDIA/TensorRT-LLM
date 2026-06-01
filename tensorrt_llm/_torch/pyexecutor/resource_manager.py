@@ -2102,6 +2102,8 @@ class KVCacheManagerV2(BaseResourceManager):
             logger.info(
                 f"KV cache manager v2 host cache quota set to {host_quota / (1 << 30):.2f}GiB"
             )
+        self.has_host_cache_tier = any(
+            isinstance(tier, HostCacheTierConfig) for tier in cache_tiers)
 
         self.vocab_size = vocab_size
 
@@ -2133,6 +2135,7 @@ class KVCacheManagerV2(BaseResourceManager):
                     cache_tiers=cache_tiers_gpu_only,
                 )
                 cache_tiers = cache_tiers_gpu_only
+                self.has_host_cache_tier = False
                 self.kv_cache_manager_py_config = config
                 self.impl = KVCacheManagerPy(config,
                                              event_manager=self.event_manager)
