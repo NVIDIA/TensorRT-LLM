@@ -21,7 +21,6 @@ import torch.nn.functional as F
 from torch import nn
 from transformers import PretrainedConfig
 
-from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.functional import PositionEmbeddingType, RotaryScalingType
 
 from ..attention_backend import AttentionMetadata
@@ -252,7 +251,8 @@ class LagunaAttention(QKNormRoPEAttention):
         # While Blackwell has issues when RoPE is unfused.
         # This check is to unblock Blackwell on main while we find proper fixes
         # https://nvbugs/6211185
-        rope_fusion = get_sm_version() in (100, 103)
+        # rope_fusion = get_sm_version() in (100, 103)
+        rope_fusion = True
 
         # fuse_qk_norm_rope=False is required: the fused kernel reads
         # partial_rotary_factor and yarn params from pretrained_config
