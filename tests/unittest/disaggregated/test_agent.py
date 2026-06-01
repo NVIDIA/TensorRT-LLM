@@ -55,9 +55,12 @@ class MemoryManager:
     allocated_memory: list[torch.Tensor] = field(default_factory=list)
 
     def allocate_memory(
-        self, size: int, name: str, memory_type=MemoryType.VRAM, device_id: int = 0
+        self, size: int, name: str, memory_type: str = "VRAM", device_id: int = 0
     ) -> RegMemoryDescs:
-        device = torch.device(f"cuda:{device_id}" if memory_type == MemoryType.VRAM else "cpu")
+        # `memory_type` is the string used by RegMemoryDescs (see base/agent.py:81);
+        # do not compare against `MemoryType.VRAM`, which is overridden to a C++ enum
+        # when the C++ binding is available.
+        device = torch.device(f"cuda:{device_id}" if memory_type == "VRAM" else "cpu")
 
         # Allocate memory block using torch.Tensor and track it
         block = torch.zeros(size, dtype=torch.uint8, device=device)
