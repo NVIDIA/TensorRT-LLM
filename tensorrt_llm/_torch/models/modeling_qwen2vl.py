@@ -65,6 +65,7 @@ except ImportError:
 from ..modules.gated_mlp import GatedMLP
 from ..modules.rotary_embedding import MRotaryEmbedding, RotaryEmbedding
 from .modeling_auto import AutoModelForCausalLM
+from .modeling_multimodal_mixin import MultimodalModelMixin
 from .modeling_multimodal_utils import (
     _install_processor_output_validation_filter, find_input_mm_embeds,
     fuse_input_embeds, get_attached_multimodal_embeddings,
@@ -558,11 +559,12 @@ class Qwen2VisionModelBase(nn.Module):
         ]:
             # NOTE: For Qwen2VL, we use flash_attention_2 for attention implementation to avoid OOM issue.
             self.config._attn_implementation = 'flash_attention_2'
-            self.visual = model_class(
-                model_config.pretrained_config.vision_config).to(
-                    self.model_dtype).eval()
+            self.visual = MultimodalModelMixin._cast_multimodal_encoder_dtype(
+                model_class(model_config.pretrained_config.vision_config),
+                self.model_dtype).eval()
         elif model_class == Qwen2_5_VisionModel:
-            self.visual = model_class(self.model_config).to(self.model_dtype)
+            self.visual = MultimodalModelMixin._cast_multimodal_encoder_dtype(
+                model_class(self.model_config), self.model_dtype)
         else:
             raise NotImplementedError(
                 f"Model class {model_class} not implemented")
@@ -1015,16 +1017,8 @@ class Qwen2_5_VisionModel(torch.nn.Module):
         self.metadata_cls = get_attention_backend(
             self.model_config.attn_backend).Metadata
 
-        self.full_attn_metadata = self.metadata_cls(
-            max_num_requests=8192,  # TODO: Make this dynamic
-            max_num_tokens=8192,  # TODO: Make this dynamic
-            kv_cache_manager=None,
-        )
-        self.window_attn_metadata = self.metadata_cls(
-            max_num_requests=8192,  # TODO: Make this dynamic
-            max_num_tokens=8192,  # TODO: Make this dynamic
-            kv_cache_manager=None,
-        )
+        self.full_attn_metadata: Optional[AttentionMetadata] = None
+        self.window_attn_metadata: Optional[AttentionMetadata] = None
 
     def get_rotary_pos_emb_window_data(
         self, grid_rows: List[List[int]]
@@ -1186,8 +1180,16 @@ class Qwen2_5_VisionModel(torch.nn.Module):
 
         return cos_thw, sin_thw, window_index_thw, tuple(seq_lens_thw)
 
-    def prepare_attn_metadata(self, seq_lens: List[int],
-                              attn_metadata: AttentionMetadata):
+    def prepare_attn_metadata(
+            self,
+            seq_lens: List[int],
+            attn_metadata: Optional[AttentionMetadata] = None):
+        if attn_metadata is None:
+            attn_metadata = self.metadata_cls(
+                max_num_requests=8192,  # TODO: Make this dynamic
+                max_num_tokens=8192,  # TODO: Make this dynamic
+                kv_cache_manager=None,
+            )
         return _prepare_qwen_vl_vision_attn_metadata(seq_lens, attn_metadata)
 
     @property
@@ -1240,16 +1242,16 @@ class Qwen2_5_VisionModel(torch.nn.Module):
             seq_len // self.spatial_merge_unit, self.spatial_merge_unit, -1)
         hidden_states = hidden_states[window_index, :, :].reshape(seq_len, -1)
 
-        full_attn_metadata = self.prepare_attn_metadata(seq_lens,
-                                                        self.full_attn_metadata)
-        window_attn_metadata = self.prepare_attn_metadata(
+        self.full_attn_metadata = self.prepare_attn_metadata(
+            seq_lens, self.full_attn_metadata)
+        self.window_attn_metadata = self.prepare_attn_metadata(
             window_seq_lens, self.window_attn_metadata)
 
         for layer_num, block in enumerate(self.blocks):
             if layer_num in self.fullatt_block_indexes:
-                attn_metadata = full_attn_metadata
+                attn_metadata = self.full_attn_metadata
             else:
-                attn_metadata = window_attn_metadata
+                attn_metadata = self.window_attn_metadata
             hidden_states = block(
                 hidden_states=hidden_states,
                 attn_metadata=attn_metadata,

@@ -43,6 +43,7 @@ from ..modules.rotary_embedding import MRotaryEmbedding, RotaryEmbedding
 from .checkpoints.base_weight_mapper import BaseWeightMapper
 from .checkpoints.hf.qwen3vl_weight_mapper import Qwen3VLHfWeightMapper
 from .modeling_auto import AutoModelForCausalLM
+from .modeling_multimodal_mixin import MultimodalModelMixin
 from .modeling_multimodal_utils import (
     filter_mm_token_from_input_ids,
     find_input_mm_embeds,
@@ -656,11 +657,7 @@ class Qwen3VisionModel(torch.nn.Module):
         }
         self.metadata_cls = get_attention_backend(self.model_config.attn_backend).Metadata
 
-        self.attn_metadata = self.metadata_cls(
-            max_num_requests=8192,  # TODO: Make this dynamic
-            max_num_tokens=8192,  # TODO: Make this dynamic
-            kv_cache_manager=None,
-        )
+        self.attn_metadata: Optional[AttentionMetadata] = None
 
         # Pre-allocated `arange` for the vision block's
         # `rope_position_ids`; per-call code just slices `[:seq_len]`
@@ -793,8 +790,14 @@ class Qwen3VisionModel(torch.nn.Module):
     def prepare_attn_metadata(
         self,
         seq_lens: List[int],
-        attn_metadata: AttentionMetadata,
+        attn_metadata: Optional[AttentionMetadata] = None,
     ):
+        if attn_metadata is None:
+            attn_metadata = self.metadata_cls(
+                max_num_requests=8192,  # TODO: Make this dynamic
+                max_num_tokens=8192,  # TODO: Make this dynamic
+                kv_cache_manager=None,
+            )
         return _prepare_qwen_vl_vision_attn_metadata(seq_lens, attn_metadata)
 
     @torch.inference_mode()
@@ -805,7 +808,7 @@ class Qwen3VisionModel(torch.nn.Module):
         seq_lens: List[int] = []
         for t, h, w in grid_rows:
             seq_lens.extend([h * w] * t)
-        attn_metadata = self.prepare_attn_metadata(seq_lens, self.attn_metadata)
+        self.attn_metadata = self.prepare_attn_metadata(seq_lens, self.attn_metadata)
 
         # `rot_pos_emb` returns (cos, sin) gathered from the pre-computed
         # cos/sin buffers -- no `.cos()`/`.sin()` kernels in forward.
@@ -837,7 +840,7 @@ class Qwen3VisionModel(torch.nn.Module):
             hidden_states = block(
                 hidden_states,
                 position_ids=rope_position_ids,
-                attn_metadata=attn_metadata,
+                attn_metadata=self.attn_metadata,
                 position_embeddings=position_embeddings,
             )
             merger_idx = self._deepstack_layer_to_merger_idx.get(layer_num)
@@ -864,7 +867,9 @@ class Qwen3VisionModelBase(nn.Module):
         # supported by FP8 FMHA kernels).
         self.model_config.quant_config = QuantConfig()
 
-        self.visual = model_class(self.model_config).to(self.model_dtype)
+        self.visual = MultimodalModelMixin._cast_multimodal_encoder_dtype(
+            model_class(self.model_config), self.model_dtype
+        )
 
         self.post_config()
 
