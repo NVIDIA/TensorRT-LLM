@@ -37,6 +37,7 @@ from ..pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2
 from ..pyexecutor.mamba_cache_manager import BaseMambaCacheManager
 from ..pyexecutor.resource_manager import KVCacheManager
 from ..utils import get_model_extra_attrs
+from .sparse.skip_softmax import SkipSoftmaxKernelParams
 
 try:
     # Transformers v5
@@ -803,11 +804,14 @@ AttentionMask = Union[PredefinedAttentionMask, CustomAttentionMask]
 
 
 @dataclass(kw_only=True, slots=True)
-class AttentionSparseArgs:
-    """Sparse-attention inputs passed to the attention op.
+class SparsePrediction:
+    """Sparse KV / attention indices predicted by the framework backends.
 
-    Backends without sparse attention leave ``AttentionForwardArgs.sparse``
-    at its default-constructed value (all-``None`` / ``0`` fields).
+    RocketKV and DSA produce these from ``sparse_kv_predict`` /
+    ``sparse_attn_predict``, telling the attention op which KV tokens to keep
+    and which blocks to attend to. Backends that don't predict leave
+    ``AttentionForwardArgs.sparse_prediction`` at its default-constructed value
+    (all-``None`` / ``0`` fields).
     """
     sparse_kv_indices: Optional[torch.Tensor] = None
     sparse_kv_offsets: Optional[torch.Tensor] = None
@@ -874,7 +878,12 @@ class AttentionForwardArgs:
     is_fused_qkv: bool = False
     update_kv_cache: bool = True
 
-    sparse: AttentionSparseArgs = field(default_factory=AttentionSparseArgs)
+    sparse_prediction: SparsePrediction = field(
+        default_factory=SparsePrediction)
+
+    # Skip-softmax thresholds passed into the attention op.
+    skip_softmax_kernel_params: SkipSoftmaxKernelParams = field(
+        default_factory=SkipSoftmaxKernelParams)
 
     @property
     def mask_type(self) -> int:

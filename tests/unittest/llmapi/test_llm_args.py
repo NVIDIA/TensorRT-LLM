@@ -2367,7 +2367,7 @@ class TestSkipSoftmaxAttentionConfig:
 
     # The checkpoint calibration block documented under
     # ``sparse_attention_config.threshold_scale_factor``.
-    FORMULA = {
+    THRESHOLD_SCALE_FACTOR_CONFIG = {
         "formula": "a * exp(b * target_sparsity)",
         "prefill": {
             "a": 100.0,
@@ -2410,8 +2410,8 @@ class TestSkipSoftmaxAttentionConfig:
             "prefill": 0.5,
             "decode": 0.5
         })
-        params = cfg.resolve_for_target_sparsity(
-            self.FORMULA).to_kernel_params()
+        params = cfg.resolve_from_ckpt_config(
+            self.THRESHOLD_SCALE_FACTOR_CONFIG).to_kernel_params()
         assert params.threshold_scale_factor_prefill == pytest.approx(
             100.0 * math.exp(5.0 * 0.5))
         assert params.threshold_scale_factor_decode == pytest.approx(
@@ -2423,8 +2423,8 @@ class TestSkipSoftmaxAttentionConfig:
         from tensorrt_llm.llmapi.llm_args import SkipSoftmaxAttentionConfig
 
         cfg = SkipSoftmaxAttentionConfig(target_sparsity=0.3)
-        params = cfg.resolve_for_target_sparsity(
-            self.FORMULA).to_kernel_params()
+        params = cfg.resolve_from_ckpt_config(
+            self.THRESHOLD_SCALE_FACTOR_CONFIG).to_kernel_params()
         assert params.threshold_scale_factor_prefill == pytest.approx(
             100.0 * math.exp(5.0 * 0.3))
         assert params.threshold_scale_factor_decode == pytest.approx(
@@ -2436,7 +2436,8 @@ class TestSkipSoftmaxAttentionConfig:
 
         cfg = SkipSoftmaxAttentionConfig(threshold_scale_factor=1000.0,
                                          target_sparsity=0.5)
-        assert cfg.resolve_for_target_sparsity(self.FORMULA) is cfg
+        assert cfg.resolve_from_ckpt_config(
+            self.THRESHOLD_SCALE_FACTOR_CONFIG) is cfg
         assert cfg.to_kernel_params().threshold_scale_factor_prefill == 1000.0
 
     def test_resolve_without_formula_raises(self):
@@ -2445,4 +2446,4 @@ class TestSkipSoftmaxAttentionConfig:
 
         cfg = SkipSoftmaxAttentionConfig(target_sparsity=0.5)
         with pytest.raises(ValueError, match="formula"):
-            cfg.resolve_for_target_sparsity({"prefill": {"a": 1.0, "b": 2.0}})
+            cfg.resolve_from_ckpt_config({"prefill": {"a": 1.0, "b": 2.0}})
