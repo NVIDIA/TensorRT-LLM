@@ -687,10 +687,17 @@ def run_deepseek_v4_transfer_test(
                     gen_handle_map[rank].append((req_idx, gen_request))
 
         # ===== 5. Allocate KV cache for all ranks =====
-        # Uses prepare_context + resize_context (the V2 manager path).
         # prepare_resources is a no-op for non-draft KVCacheManagerV2.
         # All ranks must allocate BEFORE mutating shared request objects
         # (add_new_token changes is_first_context_chunk).
+        #
+        # Gen ranks take the disagg-gen-init path: prepare_disagg_gen_init
+        # sizes the cache for the full prompt and pre-declares
+        # history_length=prompt_len, matching what the V2 scheduler's
+        # _try_schedule_disagg_gen_init does in production so the
+        # transceiver's TRANS_COMPLETE contract check is satisfied.
+        # Ctx ranks take the regular prefill path (prepare_context +
+        # resize_context).
         gen_batches: Dict[int, ScheduledRequests] = {}
         for rank in range(gen_world):
             reqs = [req for _, req in gen_handle_map[rank]]
@@ -698,8 +705,7 @@ def run_deepseek_v4_transfer_test(
                 batch = ScheduledRequests()
                 batch.context_requests_last_chunk = reqs
                 for req in reqs:
-                    gen_managers[rank].prepare_context(req)
-                    gen_managers[rank].resize_context(req, req.context_chunk_size)
+                    gen_managers[rank].prepare_disagg_gen_init(req)
                 gen_batches[rank] = batch
 
         ctx_batches: Dict[int, ScheduledRequests] = {}

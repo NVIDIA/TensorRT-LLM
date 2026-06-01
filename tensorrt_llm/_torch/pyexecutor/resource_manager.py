@@ -2851,47 +2851,6 @@ class KVCacheManagerV2(BaseResourceManager):
         return kv_cache.resize(
             self._required_gen_capacity(req, kv_cache.capacity))
 
-    def trim_to_history(self, req: LlmRequest, history_length: int) -> bool:
-        """Mark *history_length* tokens of this request's KV as historic.
-
-        For sliding-window-style life cycles (AttnLifeCycle with non-None
-        window_size), this triggers ``_unlock_stale_blocks`` inside V2's
-        ``resize()`` so blocks before ``(history_length + 1 - window) //
-        tokens_per_block`` get released back to their pool group.  For
-        full-context life cycles (``window_size=None``) and SSM cycles, it
-        is a no-op — the stale range stays empty.
-
-        Used by the disagg-gen transceiver right after KV transfer
-        completes: at that moment the cache has the entire prompt KV
-        written, so ``history_length=prompt_len`` correctly classifies
-        every prompt token as historic.  Without this call, ``history_length``
-        stays 0 until ``update_resources`` runs after the first forward
-        pass — and in benchmark fill-phase the first forward never fires
-        until every disagg-gen request is ready, so SWA / sparse-attn
-        pool groups would otherwise stay 100% occupied with pre-window
-        prompt blocks and the V2 scheduler would deadlock on the next
-        ``resize(+1)``.
-
-        Returns True on success (or no-op), False if the underlying
-        ``kv_cache.resize`` rejected the call.
-        """
-        kv_cache = self.kv_cache_map.get(req.py_request_id)
-        if kv_cache is None or not kv_cache.is_active:
-            return True
-        if history_length <= kv_cache.history_length:
-            return True
-        # resize() requires capacity >= history_length; clamp for safety.
-        target_capacity = max(kv_cache.capacity, history_length)
-        try:
-            return kv_cache.resize(target_capacity,
-                                   history_length=history_length)
-        except Exception as e:
-            logger.warning(
-                f"trim_to_history failed for req {req.py_request_id} "
-                f"(capacity={kv_cache.capacity}, target_history={history_length}): {e}"
-            )
-            return False
-
     def revert_allocate_generation(self, req: LlmRequest) -> None:
         """Undo the capacity growth from try_allocate_generation.
 
@@ -2987,6 +2946,11 @@ class KVCacheManagerV2(BaseResourceManager):
         For subsequent chunks: verifies existing cache is active.
         Returns True on success, False if preparation failed.
         """
+        assert not req.is_disagg_generation_init_state, (
+            f"req {req.py_request_id}: use prepare_disagg_gen_init")
+        return self._prepare_context_impl(req)
+
+    def _prepare_context_impl(self, req: LlmRequest) -> bool:
         if req.is_first_context_chunk:
             kv_cache = self.kv_cache_map.get(req.py_request_id)
             if kv_cache is None:
@@ -3025,14 +2989,9 @@ class KVCacheManagerV2(BaseResourceManager):
             )
             return self._resume_and_restore(req.py_request_id, kv_cache)
 
-    def resize_context(self,
-                       req: LlmRequest,
-                       num_tokens: int,
-                       history_length: int | None = None) -> bool:
+    def resize_context(self, req: LlmRequest, num_tokens: int) -> bool:
         """Resize KV cache to cover context_current_position + num_tokens.
 
-        history_length, when set, lets SWA life cycles compute their stale
-        range at allocation time so pre-window blocks are never allocated.
         Returns True on success, False if resize failed (first chunk is
         suspended on failure).
 
@@ -3040,6 +2999,8 @@ class KVCacheManagerV2(BaseResourceManager):
         when growth happens so ``revert_allocate_context`` can undo it if
         delay batching defers the request.
         """
+        assert not req.is_disagg_generation_init_state, (
+            f"req {req.py_request_id}: use prepare_disagg_gen_init")
         kv_cache = self.kv_cache_map.get(req.py_request_id)
         if kv_cache is None:
             return False
@@ -3048,7 +3009,8 @@ class KVCacheManagerV2(BaseResourceManager):
         capacity = max(kv_cache.capacity, target)
         pre_cap = kv_cache.capacity
 
-        if not kv_cache.resize(capacity, history_length):
+        success = kv_cache.resize(capacity)
+        if not success:
             if req.is_first_context_chunk:
                 kv_cache.suspend()
             return False
@@ -3057,6 +3019,46 @@ class KVCacheManagerV2(BaseResourceManager):
         # invalidates a stale snapshot from a prior iter on the same req.
         req.py_ctx_pre_resize_cap = pre_cap if capacity > pre_cap else None
         return True
+
+    def prepare_disagg_gen_init(self, req: LlmRequest) -> bool:
+        """Prepare KV cache for a disagg generation init request.
+
+        Allocates capacity for the full prompt (+ draft) and sets
+        ``kv_cache.history_length`` to ``prompt_len``. Returns True on
+        success, False if preparation or resize failed (cache is suspended
+        on resize failure).
+        """
+        if not self._prepare_context_impl(req):
+            return False
+
+        kv_cache = self.kv_cache_map.get(req.py_request_id)
+        if kv_cache is None:
+            return False
+
+        # prompt_len is the full incoming prompt length, robust to block
+        # reuse (which may leave a non-zero context_current_position).
+        target = (req.prompt_len + get_draft_token_length(req) +
+                  self.num_extra_kv_tokens)
+        capacity = max(kv_cache.capacity, target)
+
+        success = kv_cache.resize(capacity, req.prompt_len)
+        if not success:
+            if req.is_first_context_chunk:
+                kv_cache.suspend()
+            return False
+        return True
+
+    def get_history_length(self, req: LlmRequest) -> int | None:
+        """Return the cache's current history_length, or None if no cache.
+
+        Exposes the per-request SWA history watermark so callers
+        (e.g., the disagg transceiver) can verify scheduler/cache contracts
+        without reaching into ``kv_cache_map`` directly.
+        """
+        kv_cache = self.kv_cache_map.get(req.py_request_id)
+        if kv_cache is None:
+            return None
+        return kv_cache.history_length
 
     def extend_capacity_for_tokens(self, request: LlmRequest) -> None:
         """Extend KV cache capacity for the CUDA-graph padding delta.
