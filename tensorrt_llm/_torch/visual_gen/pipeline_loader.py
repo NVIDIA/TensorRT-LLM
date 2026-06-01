@@ -26,7 +26,10 @@ from tensorrt_llm._torch.models.modeling_utils import MetaInitMode
 from tensorrt_llm.llmapi.utils import download_hf_model
 from tensorrt_llm.logger import logger
 from tensorrt_llm.visual_gen.args import VisualGenArgs
-from tensorrt_llm.visual_gen.sparse_attention import SkipSoftmaxConfig, apply_skip_softmax_overrides
+from tensorrt_llm.visual_gen.sparse_attention import (
+    SkipSoftmaxAttentionConfig,
+    apply_skip_softmax_overrides,
+)
 
 from .config import DiffusionPipelineConfig
 from .mapping import VisualGenMapping
@@ -281,7 +284,7 @@ class PipelineLoader:
             pipeline.post_load_weights()
 
         sparse_cfg = config.attention.sparse_attention_config
-        if isinstance(sparse_cfg, SkipSoftmaxConfig) and (
+        if isinstance(sparse_cfg, SkipSoftmaxAttentionConfig) and (
             sparse_cfg._layer_overrides or sparse_cfg._component_configs
         ):
             n = apply_skip_softmax_overrides(pipeline, sparse_cfg)

@@ -588,67 +588,82 @@ class SkipSoftmaxAttentionConfig(BaseSparseAttentionConfig):
     def supports_backend(self, backend: str) -> bool:
         return backend == "pytorch"
 
-    @property
-    def threshold_scale_factor_prefill(self) -> Optional[float]:
-        if isinstance(self.threshold_scale_factor, dict):
-            return self.threshold_scale_factor.get('prefill', None)
-        return self.threshold_scale_factor
+    @staticmethod
+    def _phase(value: Optional[Union[float, Dict[str, float]]],
+               phase: str) -> Optional[float]:
+        """Select a phase from a scalar-or-``{prefill, decode}`` field."""
+        if isinstance(value, dict):
+            return value.get(phase, None)
+        return value
 
-    @property
-    def threshold_scale_factor_decode(self) -> Optional[float]:
-        if isinstance(self.threshold_scale_factor, dict):
-            return self.threshold_scale_factor.get('decode', None)
-        return self.threshold_scale_factor
-
-    @property
-    def target_sparsity_prefill(self) -> Optional[float]:
-        if isinstance(self.target_sparsity, dict):
-            return self.target_sparsity.get('prefill', None)
-        return self.target_sparsity
-
-    @property
-    def target_sparsity_decode(self) -> Optional[float]:
-        if isinstance(self.target_sparsity, dict):
-            return self.target_sparsity.get('decode', None)
-        return self.target_sparsity
+    def to_kernel_params(self):
+        """Resolve to the kernel-facing ``SkipSoftmaxKernelParams``."""
+        from tensorrt_llm._torch.attention_backend.sparse.skip_softmax import \
+            SkipSoftmaxKernelParams
+        return SkipSoftmaxKernelParams(
+            threshold_scale_factor_prefill=self._phase(
+                self.threshold_scale_factor, 'prefill'),
+            threshold_scale_factor_decode=self._phase(
+                self.threshold_scale_factor, 'decode'),
+        )
 
     def resolve_for_target_sparsity(
             self, formula: dict) -> 'SkipSoftmaxAttentionConfig':
         """Compute threshold_scale_factor from formula coefficients and target_sparsity.
 
-        Given formula coefficients from HF config.json (dict with 'prefill' and
-        'decode' keys, each containing 'a' and 'b'), compute threshold_scale_factor
-        and return a new SkipSoftmaxAttentionConfig with it set.
+        ``formula`` is the ``threshold_scale_factor`` block from the
+        model's HF ``config.json``. It carries per-phase coefficient
+        dictionaries under ``prefill`` / ``decode`` and an optional
+        shared ``formula`` string describing the functional form. The
+        runtime evaluates that string verbatim (via numexpr), so any
+        formula the checkpoint chooses to ship is honored without
+        changes here.
 
-        formula example:
-          {"prefill": {"a": 7e-5, "b": 7.929109},
-           "decode":  {"a": 7e-5, "b": 16.9025}}
+        Example::
 
-        If threshold_scale_factor is already set, it takes precedence and
-        this method returns self unchanged.
+            {"formula": "a * exp(b * target_sparsity)",
+             "prefill": {"a": 7e-5, "b": 7.929109},
+             "decode":  {"a": 7e-5, "b": 16.9025}}
+
+        If ``formula`` is omitted, the canonical exponential form is
+        synthesized from the coefficient names (``{a, b}`` →
+        ``a * exp(b * target_sparsity)``; ``{log_a, b}`` →
+        ``exp(log_a + b * target_sparsity)``).
+
+        If ``threshold_scale_factor`` is already set, this method
+        returns ``self`` unchanged.
         """
         if self.threshold_scale_factor is not None:
             return self
 
-        import math
+        from tensorrt_llm._torch.attention_backend.sparse.skip_softmax import \
+            parse_skip_softmax_formula_from_dict
+
+        shared_formula = formula.get("formula") if isinstance(formula,
+                                                              dict) else None
 
         def _compute(phase: str, sparsity: Optional[float]) -> Optional[float]:
             if sparsity is None:
                 return None
-            coeffs = formula.get(phase)
-            if not coeffs or 'a' not in coeffs or 'b' not in coeffs:
+            phase_formula = parse_skip_softmax_formula_from_dict(
+                formula.get(phase), formula=shared_formula)
+            if phase_formula is None:
                 raise ValueError(
-                    f"SkipSoftmaxAttentionConfig: config.json is missing formula "
-                    f"coefficients for phase '{phase}' needed to compute "
-                    f"threshold_scale_factor from target_sparsity.")
-            return coeffs['a'] * math.exp(coeffs['b'] * sparsity)
+                    f"SkipSoftmaxAttentionConfig: config.json must carry a "
+                    f"top-level 'formula' string and a '{phase}' coefficient "
+                    f"dictionary under sparse_attention_config.threshold_scale_factor "
+                    f"to resolve target_sparsity.")
+            return phase_formula.compute_threshold_scale_factor(sparsity)
 
         return SkipSoftmaxAttentionConfig(
             algorithm=self.algorithm,
             target_sparsity=self.target_sparsity,
             threshold_scale_factor={
-                'prefill': _compute('prefill', self.target_sparsity_prefill),
-                'decode': _compute('decode', self.target_sparsity_decode),
+                'prefill':
+                _compute('prefill', self._phase(self.target_sparsity,
+                                                'prefill')),
+                'decode':
+                _compute('decode', self._phase(self.target_sparsity, 'decode')),
             })
 
 

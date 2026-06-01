@@ -12,114 +12,121 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Skip-softmax sparse attention helpers for visual generation."""
+"""Skip-softmax sparse attention config for visual generation.
+
+Scalar ``threshold_scale_factor`` / ``target_sparsity`` (no prefill/decode
+split), plus calibration (formula, per-layer disables, per-component
+sub-configs) loaded from ModelOpt artifacts into private attributes.
+Shared calibration helpers live in
+:mod:`tensorrt_llm._torch.attention_backend.sparse.skip_softmax`.
+"""
 
 import fnmatch
-import math
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Dict, Optional, Union
+from typing import TYPE_CHECKING, Any, Dict, Literal, Optional
 
 import yaml
 from pydantic import Field as PydanticField
-from pydantic import PrivateAttr, model_validator
+from pydantic import PrivateAttr
 
-from tensorrt_llm.llmapi.llm_args import SkipSoftmaxAttentionConfig
 from tensorrt_llm.llmapi.utils import StrictBaseModel
 
 if TYPE_CHECKING:
     import torch
 
+    from tensorrt_llm._torch.attention_backend.sparse.skip_softmax import SkipSoftmaxFormula
 
-class SkipSoftmaxFormula(StrictBaseModel):
-    """Exponential calibration formula: threshold = exp(log_a + b * sparsity).
 
-    Equivalent to: threshold = a * exp(b * sparsity) where a = exp(log_a).
-    Stored in log-space (log_a) to match ModelOpt diffusion format and
-    avoid precision loss. Accepts either 'log_a' (diffusion format) or 'a'
-    (LLM format) at construction; 'a' is normalized to log_a = log(a).
+class BaseSparseAttentionConfig(StrictBaseModel):
+    """Base for visual-generation sparse attention configs.
+
+    Each algorithm subclasses this and pins a unique ``algorithm``
+    discriminator for the config union.
     """
 
-    log_a: float = PydanticField(description="Log of coefficient a (log-space)")
-    b: float = PydanticField(description="Coefficient b")
-
-    @model_validator(mode="before")
-    @classmethod
-    def _accept_linear_a(cls, values):
-        """Normalize LLM-format 'a' to diffusion-format 'log_a'."""
-        if not isinstance(values, dict) or "a" not in values:
-            return values
-        if "log_a" in values:
-            raise ValueError(
-                "SkipSoftmaxFormula: specify either 'log_a' (diffusion format) "
-                "or 'a' (LLM format), not both."
-            )
-        a = values["a"]
-        if a <= 0:
-            raise ValueError(
-                f"SkipSoftmaxFormula: 'a' must be positive (got {a}). "
-                "Use 'log_a' directly if you need log(a) of a non-positive value."
-            )
-        values = {**values}
-        values["log_a"] = math.log(a)
-        values.pop("a")
-        return values
+    algorithm: str
 
 
-class SkipSoftmaxConfig(SkipSoftmaxAttentionConfig):
+class SkipSoftmaxAttentionConfig(BaseSparseAttentionConfig):
     """SkipSoftmax sparse attention configuration for visual generation.
 
-    Extends the shared :class:`SkipSoftmaxAttentionConfig` from
-    ``tensorrt_llm.llmapi.llm_args`` (used by the LLM backend) without adding
-    any user-facing fields. The user-facing surface is exactly:
+    User-facing surface:
 
-    - ``threshold_scale_factor`` — raw value, resolution-dependent.
-    - ``target_sparsity`` — semantic target; needs calibration to resolve.
+    - ``threshold_scale_factor`` — raw scalar value, resolution-dependent.
+    - ``target_sparsity`` — semantic target in ``[0, 1]``; needs a
+      calibration formula to resolve.
+    - ``warmup`` — reserved knob for future warmup-step counting. Has no
+      runtime effect today; included so existing YAML/Python configs do
+      not break when the wiring lands.
 
-    Calibration state (formula coefficients and per-layer overrides) is loaded
-    from ModelOpt-produced artifacts (``sparse.yaml`` or checkpoint
-    ``config.json``) and stored in private attributes — it is *not* settable
-    via the user-facing constructor or YAML config. Users wanting custom
-    calibration should author a ModelOpt sparse YAML and point
-    :attr:`AttentionConfig.sparse_config_path` at it.
-
-    To attach calibration in code (loaders / tests), use
-    :meth:`SkipSoftmaxConfig.with_calibration`.
+    Calibration state (formula coefficients, per-layer overrides, and
+    per-component sub-configs) is loaded from ModelOpt artifacts
+    (``sparse.yaml`` or the checkpoint's ``config.json``) into private
+    attributes — it is *not* settable via the user-facing constructor
+    or YAML config. To attach calibration in loaders/tests, use
+    :meth:`SkipSoftmaxAttentionConfig.with_calibration`.
     """
 
-    _formula: Optional[SkipSoftmaxFormula] = PrivateAttr(default=None)
+    algorithm: Literal["skip_softmax"] = "skip_softmax"
+    threshold_scale_factor: Optional[float] = PydanticField(
+        default=None,
+        description="Raw per-block threshold; takes precedence over target_sparsity.",
+    )
+    target_sparsity: Optional[float] = PydanticField(
+        default=None,
+        ge=0.0,
+        le=1.0,
+        description="Semantic target sparsity in [0, 1]; requires a calibration formula.",
+    )
+    warmup: Optional[int] = PydanticField(
+        default=None,
+        ge=0,
+        description="Reserved: number of warmup steps before skip-softmax engages. "
+        "No runtime effect yet.",
+    )
+
+    _formula: Optional["SkipSoftmaxFormula"] = PrivateAttr(default=None)
     _layer_overrides: Optional[Dict[str, float]] = PrivateAttr(default=None)
-    _component_configs: Optional[Dict[str, "SkipSoftmaxConfig"]] = PrivateAttr(default=None)
-    _resolved_threshold_prefill: Optional[float] = PrivateAttr(default=None)
+    _component_configs: Optional[Dict[str, "SkipSoftmaxAttentionConfig"]] = PrivateAttr(
+        default=None
+    )
+    _resolved_threshold: Optional[float] = PrivateAttr(default=None)
 
     @classmethod
     def with_calibration(
         cls,
         *,
-        threshold_scale_factor: Optional[Union[float, Dict[str, float]]] = None,
-        target_sparsity: Optional[Union[float, Dict[str, float]]] = None,
-        formula: Optional[SkipSoftmaxFormula] = None,
+        threshold_scale_factor: Optional[float] = None,
+        target_sparsity: Optional[float] = None,
+        warmup: Optional[int] = None,
+        formula: Optional["SkipSoftmaxFormula"] = None,
         layer_overrides: Optional[Dict[str, float]] = None,
-        component_configs: Optional[Dict[str, "SkipSoftmaxConfig"]] = None,
-    ) -> "SkipSoftmaxConfig":
+        component_configs: Optional[Dict[str, "SkipSoftmaxAttentionConfig"]] = None,
+    ) -> "SkipSoftmaxAttentionConfig":
         """Internal factory used by YAML/checkpoint loaders and tests."""
-        kwargs = {}
+        kwargs: Dict[str, Any] = {}
         if threshold_scale_factor is not None:
             kwargs["threshold_scale_factor"] = threshold_scale_factor
         if target_sparsity is not None:
             kwargs["target_sparsity"] = target_sparsity
+        if warmup is not None:
+            kwargs["warmup"] = warmup
         cfg = cls(**kwargs)
         cfg._formula = formula
         cfg._layer_overrides = layer_overrides
         cfg._component_configs = component_configs
         return cfg
 
-    def _with_public_overrides(self, user_cfg: "SkipSoftmaxConfig") -> "SkipSoftmaxConfig":
+    def _with_public_overrides(
+        self, user_cfg: "SkipSoftmaxAttentionConfig"
+    ) -> "SkipSoftmaxAttentionConfig":
         """Copy user-facing sparse knobs onto calibration loaded from ModelOpt."""
         updates = {
             k: v
             for k, v in {
                 "threshold_scale_factor": user_cfg.threshold_scale_factor,
                 "target_sparsity": user_cfg.target_sparsity,
+                "warmup": user_cfg.warmup,
             }.items()
             if v is not None
         }
@@ -134,22 +141,37 @@ class SkipSoftmaxConfig(SkipSoftmaxAttentionConfig):
             }
         return merged
 
+    def to_kernel_params(self):
+        """Resolve to the kernel-facing ``SkipSoftmaxKernelParams``.
+
+        Visual generation has no decode phase: the resolved scalar
+        threshold is the prefill value and decode stays 0.
+        """
+        from tensorrt_llm._torch.attention_backend.sparse.skip_softmax import (
+            SkipSoftmaxKernelParams,
+        )
+
+        return SkipSoftmaxKernelParams(
+            threshold_scale_factor_prefill=self.threshold_scale_factor,
+            threshold_scale_factor_decode=0.0,
+        )
+
     def get_or_resolve_threshold(
         self,
-        checkpoint_formula: Optional[Dict[str, float]] = None,
+        checkpoint_formula: Optional[Dict[str, Any]] = None,
     ) -> Optional[float]:
-        """Return the resolved prefill threshold, caching after the first call."""
-        if self._resolved_threshold_prefill is not None:
-            return self._resolved_threshold_prefill
+        """Return the resolved scalar threshold, caching after the first call."""
+        if self._resolved_threshold is not None:
+            return self._resolved_threshold
         if (
             self._component_configs
             and self._formula is None
-            and self.threshold_scale_factor_prefill is None
+            and self.threshold_scale_factor is None
         ):
             return None
         threshold = self.resolve_threshold_scale_factor(checkpoint_formula)
         if threshold is not None and threshold > 0:
-            self._resolved_threshold_prefill = threshold
+            self._resolved_threshold = threshold
         return threshold
 
     def resolve_threshold(self, module_name: str) -> Optional[float]:
@@ -184,7 +206,7 @@ class SkipSoftmaxConfig(SkipSoftmaxAttentionConfig):
 
     def _component_config_for_module_name(
         self, module_name: str
-    ) -> Optional[tuple["SkipSoftmaxConfig", str]]:
+    ) -> Optional[tuple["SkipSoftmaxAttentionConfig", str]]:
         if not self._component_configs:
             return None
         normalized_name = module_name.replace("._orig_mod.", ".")
@@ -200,68 +222,59 @@ class SkipSoftmaxConfig(SkipSoftmaxAttentionConfig):
 
     def resolve_threshold_scale_factor(
         self,
-        checkpoint_formula: Optional[Dict[str, float]] = None,
+        checkpoint_formula: Optional[Dict[str, Any]] = None,
     ) -> Optional[float]:
-        """Resolve to a concrete prefill threshold using the shared LLM resolver."""
-        if self.threshold_scale_factor_prefill is not None:
-            return self.threshold_scale_factor_prefill
+        """Resolve to a concrete scalar threshold via shared formula helpers.
 
-        sparsity = self.target_sparsity_prefill
+        Resolution order: user-supplied ``threshold_scale_factor`` (raw,
+        wins) → ``target_sparsity`` + attached calibration ``_formula``
+        → ``target_sparsity`` + runtime ``checkpoint_formula`` dict.
+        """
+        if self.threshold_scale_factor is not None:
+            return self.threshold_scale_factor
+
+        sparsity = self.target_sparsity
         if sparsity is None:
             return None
 
-        formula = self._shared_formula(checkpoint_formula)
+        from tensorrt_llm._torch.attention_backend.sparse.skip_softmax import (
+            parse_skip_softmax_formula_from_dict,
+        )
+
+        formula = self._formula
+        if formula is None and checkpoint_formula is not None:
+            formula = parse_skip_softmax_formula_from_dict(checkpoint_formula)
         if formula is None:
             raise ValueError(
-                "SkipSoftmaxConfig: target_sparsity requires calibration formula "
+                "SkipSoftmaxAttentionConfig: target_sparsity requires calibration formula "
                 "coefficients. Provide via a ModelOpt sparse YAML "
                 "(sparse_config_path) or a checkpoint config.json carrying "
                 "calibrated coefficients."
             )
-        resolved = SkipSoftmaxAttentionConfig(
-            algorithm=self.algorithm,
-            target_sparsity=self.target_sparsity,
-        ).resolve_for_target_sparsity(formula)
-        return resolved.threshold_scale_factor_prefill
-
-    def _shared_formula(
-        self,
-        checkpoint_formula: Optional[Dict[str, float]],
-    ) -> Optional[Dict[str, Dict[str, float]]]:
-        if self._formula:
-            coeffs = {"a": math.exp(self._formula.log_a), "b": self._formula.b}
-        elif checkpoint_formula:
-            coeffs = self._shared_formula_coefficients(checkpoint_formula)
-        else:
-            return None
-        if coeffs is None:
-            return None
-        return {"prefill": coeffs, "decode": coeffs}
-
-    @staticmethod
-    def _shared_formula_coefficients(
-        formula: Dict[str, float],
-    ) -> Optional[Dict[str, float]]:
-        if "log_a" in formula and "b" in formula:
-            return {"a": math.exp(formula["log_a"]), "b": formula["b"]}
-        if "a" in formula and "b" in formula:
-            return {"a": formula["a"], "b": formula["b"]}
-        return None
+        return formula.compute_threshold_scale_factor(sparsity)
 
 
-def _load_sparse_config_group_container(data: Dict[str, Any]) -> Optional[SkipSoftmaxConfig]:
+def _load_sparse_config_group_container(
+    data: Dict[str, Any],
+) -> Optional[SkipSoftmaxAttentionConfig]:
     """Load one component's skip-softmax config from a ``config_groups`` container."""
     config_groups = data.get("config_groups", {})
     if not isinstance(config_groups, dict):
         return None
+
+    from tensorrt_llm._torch.attention_backend.sparse.skip_softmax import (
+        parse_skip_softmax_formula_from_dict,
+    )
 
     for group in config_groups.values():
         if not isinstance(group, dict) or group.get("sparse_algo") != "softmax_skip":
             continue
 
         tsf = group.get("threshold_scale_factor", {})
-        prefill = tsf.get("prefill", {}) if isinstance(tsf, dict) else {}
-        if "b" not in prefill or ("log_a" not in prefill and "a" not in prefill):
+        coefficients = tsf.get("coefficients") if isinstance(tsf, dict) else None
+        formula_str = tsf.get("formula") if isinstance(tsf, dict) else None
+        formula = parse_skip_softmax_formula_from_dict(coefficients, formula=formula_str)
+        if formula is None:
             continue
 
         disabled = group.get("disabled_layers", [])
@@ -271,17 +284,16 @@ def _load_sparse_config_group_container(data: Dict[str, Any]) -> Optional[SkipSo
             {str(name): 0.0 for name in disabled} if disabled else None
         )
 
-        formula_kwargs = {k: prefill[k] for k in ("log_a", "a", "b") if k in prefill}
-        return SkipSoftmaxConfig.with_calibration(
-            formula=SkipSoftmaxFormula(**formula_kwargs),
+        return SkipSoftmaxAttentionConfig.with_calibration(
+            formula=formula,
             layer_overrides=layer_overrides,
         )
 
     return None
 
 
-def load_sparse_config_from_yaml(yaml_path: str) -> Optional[SkipSoftmaxConfig]:
-    """Load SkipSoftmaxConfig from a ModelOpt sparse attention YAML file."""
+def load_sparse_config_from_yaml(yaml_path: str) -> Optional[SkipSoftmaxAttentionConfig]:
+    """Load SkipSoftmaxAttentionConfig from a ModelOpt sparse attention YAML file."""
     with open(yaml_path) as f:
         data = yaml.safe_load(f)
 
@@ -301,12 +313,12 @@ def load_sparse_config_from_yaml(yaml_path: str) -> Optional[SkipSoftmaxConfig]:
             component_configs[component_name] = cfg
 
     if component_configs:
-        return SkipSoftmaxConfig.with_calibration(component_configs=component_configs)
+        return SkipSoftmaxAttentionConfig.with_calibration(component_configs=component_configs)
 
     return None
 
 
-def auto_detect_sparse_yaml(checkpoint_dir: str) -> Optional[SkipSoftmaxConfig]:
+def auto_detect_sparse_yaml(checkpoint_dir: str) -> Optional[SkipSoftmaxAttentionConfig]:
     """Auto-detect the current consolidated ModelOpt sparse YAML at checkpoint root."""
     checkpoint_path = Path(checkpoint_dir)
     candidates = [checkpoint_path / "sparse.yaml"]
@@ -325,34 +337,35 @@ def auto_detect_sparse_yaml(checkpoint_dir: str) -> Optional[SkipSoftmaxConfig]:
 
 def auto_detect_sparse_attention_config(
     checkpoint_config: Dict[str, Any],
-) -> Optional[SkipSoftmaxConfig]:
-    """Auto-detect sparse attention calibration from ModelOpt checkpoint config.json."""
-    sparse_cfg = checkpoint_config.get("sparse_attention_config")
-    if not isinstance(sparse_cfg, dict):
+) -> Optional[SkipSoftmaxAttentionConfig]:
+    """Auto-detect sparse attention calibration from ModelOpt checkpoint config.json.
+
+    Visual generation uses a phase-neutral ``coefficients`` key under
+    ``sparse_attention_config.threshold_scale_factor`` (diffusion has
+    no prefill / decode distinction).
+    """
+    from tensorrt_llm._torch.attention_backend.sparse.skip_softmax import (
+        parse_skip_softmax_formula_from_ckpt_config,
+    )
+
+    formula = parse_skip_softmax_formula_from_ckpt_config(
+        checkpoint_config, coefficient_key="coefficients"
+    )
+    if formula is None:
         return None
-
-    tsf = sparse_cfg.get("threshold_scale_factor")
-    if not isinstance(tsf, dict):
-        return None
-
-    prefill = tsf.get("prefill")
-    if not isinstance(prefill, dict):
-        return None
-
-    if "log_a" in prefill and "b" in prefill:
-        return SkipSoftmaxConfig.with_calibration(
-            formula=SkipSoftmaxFormula(log_a=prefill["log_a"], b=prefill["b"]),
-        )
-    if "a" in prefill and "b" in prefill:
-        return SkipSoftmaxConfig.with_calibration(
-            formula=SkipSoftmaxFormula(log_a=math.log(prefill["a"]), b=prefill["b"]),
-        )
-
-    return None
+    return SkipSoftmaxAttentionConfig.with_calibration(formula=formula)
 
 
-def apply_skip_softmax_overrides(model: "torch.nn.Module", skip_softmax: SkipSoftmaxConfig) -> int:
-    """Apply component-specific skip-softmax calibration to constructed TRTLLM backends."""
+def apply_skip_softmax_overrides(
+    model: "torch.nn.Module", skip_softmax: SkipSoftmaxAttentionConfig
+) -> int:
+    """Apply component-specific skip-softmax calibration to constructed TRTLLM backends.
+
+    For each attention backend VG stores a per-layer
+    :class:`SkipSoftmaxAttentionConfig` carrying that layer's resolved
+    threshold (or ``None`` to disable). The backend later converts it
+    via ``to_kernel_params()``.
+    """
     if skip_softmax._layer_overrides is None and skip_softmax._component_configs is None:
         return 0
 
@@ -372,7 +385,7 @@ def apply_skip_softmax_overrides(model: "torch.nn.Module", skip_softmax: SkipSof
         for target in targets:
             if threshold is not None:
                 target.sparse_attention_config = SkipSoftmaxAttentionConfig(
-                    threshold_scale_factor={"prefill": threshold, "decode": 0}
+                    threshold_scale_factor=threshold
                 )
             else:
                 target.sparse_attention_config = None

@@ -10,7 +10,16 @@ import torch
 from typing_extensions import Self
 
 if TYPE_CHECKING:
-    from tensorrt_llm.llmapi.llm_args import SparseAttentionConfig
+    from tensorrt_llm.llmapi.llm_args import \
+        SparseAttentionConfig as _LlmSparseAttentionConfig
+    from tensorrt_llm.visual_gen.args import \
+        SparseAttentionConfig as _VgSparseAttentionConfig
+
+    # The attention backend is shared by the LLM and visual-generation
+    # pipelines; ``sparse_attention_config`` may be either side's config
+    # union. (Annotation only — this block is not evaluated at runtime.)
+    SparseAttentionConfig = Union[_LlmSparseAttentionConfig,
+                                  _VgSparseAttentionConfig]
 
     from ..speculative.interface import SpecMetadata
     from ..speculative.spec_tree_manager import SpecTreeManager

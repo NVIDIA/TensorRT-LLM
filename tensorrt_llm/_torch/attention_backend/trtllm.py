@@ -15,7 +15,6 @@ from tensorrt_llm._torch.attention_backend import trtllm_gen
 from tensorrt_llm._utils import get_sm_version, maybe_pin_memory, prefer_pinned
 from tensorrt_llm.bindings.internal import thop
 from tensorrt_llm.functional import AttentionMaskType
-from tensorrt_llm.llmapi import SkipSoftmaxAttentionConfig
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
 from ..utils import (compute_swizzled_sf_shape, get_global_attrs,
@@ -1408,18 +1407,22 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
 
     @property
     def skip_softmax_threshold_scale_factor_prefill(self) -> Optional[float]:
-        """Prefill skip-softmax threshold; ``None`` unless
-        ``sparse_attention_config`` is a ``SkipSoftmaxAttentionConfig``."""
-        if isinstance(self.sparse_attention_config, SkipSoftmaxAttentionConfig):
-            return self.sparse_attention_config.threshold_scale_factor_prefill
+        """Prefill skip-softmax threshold; ``None`` unless the config is a
+        skip-softmax config."""
+        if getattr(self.sparse_attention_config, 'algorithm',
+                   None) == 'skip_softmax':
+            return self.sparse_attention_config.to_kernel_params(
+            ).threshold_scale_factor_prefill
         return None
 
     @property
     def skip_softmax_threshold_scale_factor_decode(self) -> Optional[float]:
-        """Decode skip-softmax threshold; ``None`` unless
-        ``sparse_attention_config`` is a ``SkipSoftmaxAttentionConfig``."""
-        if isinstance(self.sparse_attention_config, SkipSoftmaxAttentionConfig):
-            return self.sparse_attention_config.threshold_scale_factor_decode
+        """Decode skip-softmax threshold; ``None`` unless the config is a
+        skip-softmax config."""
+        if getattr(self.sparse_attention_config, 'algorithm',
+                   None) == 'skip_softmax':
+            return self.sparse_attention_config.to_kernel_params(
+            ).threshold_scale_factor_decode
         return None
 
     def _get_trtllm_gen_backend(
@@ -1754,11 +1757,14 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                 and v is None) or (not forward_args.is_fused_qkv
                                    and k is not None and v is not None)
 
-        # ``SkipSoftmax`` configs contribute nothing here — their thresholds
+        # Skip-softmax configs contribute nothing here — their thresholds
         # are read via the ``skip_softmax_threshold_scale_factor_*``
-        # @property accessors directly on ``self``.
-        if (self.sparse_attention_config is not None and not isinstance(
-                self.sparse_attention_config, SkipSoftmaxAttentionConfig)):
+        # @property accessors directly on ``self``. The framework-level
+        # algorithms (RocketKV / DSA) run prediction to produce the sparse
+        # KV / attention indices.
+        if (self.sparse_attention_config is not None and getattr(
+                self.sparse_attention_config, 'algorithm', None)
+                != 'skip_softmax'):
             kv_idx, kv_off = self.sparse_kv_predict(q, k, metadata,
                                                     forward_args)
             at_idx, at_off = self.sparse_attn_predict(q, k, metadata,

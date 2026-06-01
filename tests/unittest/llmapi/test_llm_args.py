@@ -2355,75 +2355,89 @@ class TestPydanticBestPractices:
 
 
 class TestSkipSoftmaxAttentionConfig:
+    """Mirror the documented LLM skip-softmax API.
 
-    def test_resolve_computes_thresholds(self):
-        import math
+    See docs/source/features/sparse-attention.md — Skip Softmax Attention.
+    """
 
-        from tensorrt_llm.llmapi.llm_args import SkipSoftmaxAttentionConfig
+    # The checkpoint calibration block documented under
+    # ``sparse_attention_config.threshold_scale_factor``.
+    FORMULA = {
+        "formula": "a * exp(b * target_sparsity)",
+        "prefill": {
+            "a": 100.0,
+            "b": 5.0
+        },
+        "decode": {
+            "a": 0.05,
+            "b": 10.0
+        },
+    }
 
-        formula = {
-            'prefill': {
-                'a': 7e-5,
-                'b': 7.929109
-            },
-            'decode': {
-                'a': 7e-5,
-                'b': 16.9025
-            },
-        }
-        cfg = SkipSoftmaxAttentionConfig(target_sparsity={
-            'prefill': 0.5,
-            'decode': 0.5
-        })
-        resolved = cfg.resolve_for_target_sparsity(formula)
-
-        expected_prefill = 7e-5 * math.exp(7.929109 * 0.5)
-        expected_decode = 7e-5 * math.exp(16.9025 * 0.5)
-        assert resolved.threshold_scale_factor_prefill == pytest.approx(
-            expected_prefill)
-        assert resolved.threshold_scale_factor_decode == pytest.approx(
-            expected_decode)
-
-    def test_resolve_scalar_target_sparsity(self):
-        import math
-
-        from tensorrt_llm.llmapi.llm_args import SkipSoftmaxAttentionConfig
-
-        formula = {
-            'prefill': {
-                'a': 7e-5,
-                'b': 7.929109
-            },
-            'decode': {
-                'a': 7e-5,
-                'b': 16.9025
-            },
-        }
-        cfg = SkipSoftmaxAttentionConfig(target_sparsity=0.3)
-        resolved = cfg.resolve_for_target_sparsity(formula)
-
-        assert resolved.threshold_scale_factor_prefill == pytest.approx(
-            7e-5 * math.exp(7.929109 * 0.3))
-        assert resolved.threshold_scale_factor_decode == pytest.approx(
-            7e-5 * math.exp(16.9025 * 0.3))
-
-    def test_resolve_missing_coefficients_raises(self):
-        from tensorrt_llm.llmapi.llm_args import SkipSoftmaxAttentionConfig
-
-        cfg = SkipSoftmaxAttentionConfig(target_sparsity={
-            'prefill': 0.5,
-            'decode': 0.5
-        })
-        with pytest.raises(ValueError, match="missing formula coefficients"):
-            cfg.resolve_for_target_sparsity({})
-
-    def test_threshold_scale_factor_unaffected(self):
+    def test_direct_threshold_scale_factor_per_phase(self):
+        # Doc: set threshold_scale_factor directly, as a {prefill, decode} dict.
         from tensorrt_llm.llmapi.llm_args import SkipSoftmaxAttentionConfig
 
         cfg = SkipSoftmaxAttentionConfig(threshold_scale_factor={
-            'prefill': 0.001,
-            'decode': 0.002
+            "prefill": 1000.0,
+            "decode": 500.0
         })
-        assert cfg.target_sparsity is None
-        assert cfg.threshold_scale_factor_prefill == pytest.approx(0.001)
-        assert cfg.threshold_scale_factor_decode == pytest.approx(0.002)
+        params = cfg.to_kernel_params()
+        assert params.threshold_scale_factor_prefill == pytest.approx(1000.0)
+        assert params.threshold_scale_factor_decode == pytest.approx(500.0)
+
+    def test_direct_threshold_scale_factor_scalar(self):
+        # Doc: a single scalar applies to both phases.
+        from tensorrt_llm.llmapi.llm_args import SkipSoftmaxAttentionConfig
+
+        cfg = SkipSoftmaxAttentionConfig(threshold_scale_factor=1000.0)
+        params = cfg.to_kernel_params()
+        assert params.threshold_scale_factor_prefill == pytest.approx(1000.0)
+        assert params.threshold_scale_factor_decode == pytest.approx(1000.0)
+
+    def test_resolve_target_sparsity_per_phase(self):
+        # Doc: target_sparsity resolved through the checkpoint formula.
+        import math
+
+        from tensorrt_llm.llmapi.llm_args import SkipSoftmaxAttentionConfig
+
+        cfg = SkipSoftmaxAttentionConfig(target_sparsity={
+            "prefill": 0.5,
+            "decode": 0.5
+        })
+        params = cfg.resolve_for_target_sparsity(
+            self.FORMULA).to_kernel_params()
+        assert params.threshold_scale_factor_prefill == pytest.approx(
+            100.0 * math.exp(5.0 * 0.5))
+        assert params.threshold_scale_factor_decode == pytest.approx(
+            0.05 * math.exp(10.0 * 0.5))
+
+    def test_resolve_target_sparsity_scalar(self):
+        import math
+
+        from tensorrt_llm.llmapi.llm_args import SkipSoftmaxAttentionConfig
+
+        cfg = SkipSoftmaxAttentionConfig(target_sparsity=0.3)
+        params = cfg.resolve_for_target_sparsity(
+            self.FORMULA).to_kernel_params()
+        assert params.threshold_scale_factor_prefill == pytest.approx(
+            100.0 * math.exp(5.0 * 0.3))
+        assert params.threshold_scale_factor_decode == pytest.approx(
+            0.05 * math.exp(10.0 * 0.3))
+
+    def test_threshold_scale_factor_wins_over_target_sparsity(self):
+        # Doc: threshold_scale_factor takes precedence when both are set.
+        from tensorrt_llm.llmapi.llm_args import SkipSoftmaxAttentionConfig
+
+        cfg = SkipSoftmaxAttentionConfig(threshold_scale_factor=1000.0,
+                                         target_sparsity=0.5)
+        assert cfg.resolve_for_target_sparsity(self.FORMULA) is cfg
+        assert cfg.to_kernel_params().threshold_scale_factor_prefill == 1000.0
+
+    def test_resolve_without_formula_raises(self):
+        # Doc: target_sparsity is unusable if the checkpoint ships no formula.
+        from tensorrt_llm.llmapi.llm_args import SkipSoftmaxAttentionConfig
+
+        cfg = SkipSoftmaxAttentionConfig(target_sparsity=0.5)
+        with pytest.raises(ValueError, match="formula"):
+            cfg.resolve_for_target_sparsity({"prefill": {"a": 1.0, "b": 2.0}})

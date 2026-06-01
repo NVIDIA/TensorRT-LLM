@@ -40,7 +40,7 @@ from tensorrt_llm.visual_gen.args import (
     TorchCompileConfig,
     VisualGenArgs,
 )
-from tensorrt_llm.visual_gen.sparse_attention import SkipSoftmaxConfig
+from tensorrt_llm.visual_gen.sparse_attention import SkipSoftmaxAttentionConfig
 from tensorrt_llm.visual_gen.sparse_attention import (
     auto_detect_sparse_attention_config as _auto_detect_sparse_attention_config,
 )
@@ -595,14 +595,14 @@ class DiffusionPipelineConfig(_VisualGenConfigBase):
                 if formula is not None:
                     logger.info(
                         "Auto-detected sparse config from config.json "
-                        f"(formula: log_a={formula.log_a:.2f}, b={formula.b:.2f})"
+                        f"(formula: {formula.formula!r}, coefficients: {formula.coefficients})"
                     )
                 else:
                     logger.info("Auto-detected sparse config from config.json")
 
         if yaml_sparse is not None:
             user_cfg = attention_cfg.sparse_attention_config
-            if user_cfg is not None and isinstance(user_cfg, SkipSoftmaxConfig):
+            if user_cfg is not None and isinstance(user_cfg, SkipSoftmaxAttentionConfig):
                 attention_cfg = attention_cfg.model_copy(
                     update={"sparse_attention_config": yaml_sparse._with_public_overrides(user_cfg)}
                 )

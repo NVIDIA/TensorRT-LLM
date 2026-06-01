@@ -4,14 +4,12 @@ from typing import Optional, Tuple
 import torch
 import torch.nn as nn
 
-from tensorrt_llm.llmapi.llm_args import SkipSoftmaxAttentionConfig
-
 from ...modules.linear import Linear, TensorParallelMode, WeightMode, WeightsLoadingConfig
 from ...utils import Fp4QuantizedTensor
 from ..attention_backend.interface import AttentionTensorLayout
 from ..attention_backend.parallel import wrap_parallel_attention
 from ..attention_backend.utils import create_attention
-from ..config import DiffusionModelConfig, SkipSoftmaxConfig
+from ..config import DiffusionModelConfig, SkipSoftmaxAttentionConfig
 from ..modules.rms_norm import RMSNormTPAware
 
 
@@ -199,7 +197,7 @@ class Attention(nn.Module):
         # Resolve sparse attention config for TRTLLM backend
         sparse_attention_config = None
         ss_cfg = config.attention.sparse_attention_config
-        if isinstance(ss_cfg, SkipSoftmaxConfig) and backend_name == "TRTLLM":
+        if isinstance(ss_cfg, SkipSoftmaxAttentionConfig) and backend_name == "TRTLLM":
             # Cache the resolved scalar on a private attr (idempotent across
             # all Attention modules); does NOT mutate the source-of-truth
             # `threshold_scale_factor` / `target_sparsity` fields. Subsequent
@@ -209,7 +207,7 @@ class Attention(nn.Module):
 
             if threshold is not None and threshold > 0:
                 sparse_attention_config = SkipSoftmaxAttentionConfig(
-                    threshold_scale_factor={"prefill": threshold, "decode": 0}
+                    threshold_scale_factor=threshold
                 )
 
         # Create compute backend
