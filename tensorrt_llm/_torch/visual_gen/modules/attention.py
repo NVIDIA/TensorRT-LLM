@@ -7,6 +7,7 @@ import torch.nn as nn
 from tensorrt_llm.llmapi.llm_args import SkipSoftmaxAttentionConfig
 
 from ...modules.linear import Linear, TensorParallelMode, WeightMode, WeightsLoadingConfig
+from ...utils import Fp4QuantizedTensor
 from ..attention_backend.interface import AttentionTensorLayout
 from ..attention_backend.parallel import wrap_parallel_attention
 from ..attention_backend.utils import create_attention
@@ -116,6 +117,20 @@ class Attention(nn.Module):
         self.local_kv_dim = self.local_num_key_value_heads * self.head_dim
 
         self._init_qkv_proj()
+
+        # Structural eligibility for SEPARATE_QKV self-attn quantize dedup.
+        # When True, get_qkv() may pre-quantize hidden_states once and pass the
+        # shared Fp4QuantizedTensor to to_q/to_k/to_v (relies on Linear's
+        # Fp4QuantizedTensor shortcut). Numerical equality of the per-tensor
+        # input_scales is an invariant of modelopt's self-attn calibration
+        # (q/k/v share the same input distribution -> same calibrated scale).
+        self._maybe_share_qkv_quantize = (
+            self.qkv_mode == QKVMode.SEPARATE_QKV
+            and self.quant_config is not None
+            and getattr(self.quant_config, "layer_quant_mode", None) is not None
+            and self.quant_config.layer_quant_mode.has_nvfp4()
+            and not self.force_dynamic_quantization
+        )
 
         attention_metadata_state = getattr(config, "attention_metadata_state", None)
 
@@ -586,8 +601,25 @@ class Attention(nn.Module):
         # has no async analog here.
         use_fused = self.fuse_qk_norm_rope and freqs is not None and self.qk_norm
 
+        # SEPARATE_QKV self-attn 3x fp4_quantize dedup: pre-quantize hidden_states
+        # once and pass the shared Fp4QuantizedTensor to to_q/to_k/to_v via Linear's
+        # Fp4QuantizedTensor shortcut. Saves 2 of 3 fp4_quantize launches per layer.
+        # Eligibility is structural (set in __init__); runtime gate checks that the
+        # checkpoint loaded an input_scale (some attn Linears can be excluded from
+        # NVFP4 per checkpoint config — e.g. LTX-2 transformer_blocks.10.attn1).
+        if self._maybe_share_qkv_quantize and getattr(self.to_q, "input_scale", None) is not None:
+            x_2d = hidden_states.reshape(-1, hidden_states.shape[-1])
+            fp4, sf = torch.ops.trtllm.tunable_fp4_quantize(
+                x_2d, self.to_q.input_scale, self.to_q.scaling_vector_size, False
+            )
+            qkv_input = Fp4QuantizedTensor(fp4, sf, is_sf_swizzled=False)
+        else:
+            qkv_input = hidden_states
+
         def compute_q():
-            q = self.to_q(hidden_states)
+            q = self.to_q(qkv_input)
+            if q.dim() == 2:
+                q = q.view(B, S, -1)
             if use_fused:
                 self.apply_split_norm_rope(q, self.norm_q.weight, H, freqs[0], freqs[1])
                 return q.view(B, S, H, D)
@@ -599,7 +631,9 @@ class Attention(nn.Module):
             return q
 
         def compute_k():
-            k = self.to_k(hidden_states)
+            k = self.to_k(qkv_input)
+            if k.dim() == 2:
+                k = k.view(B, S, -1)
             if use_fused:
                 self.apply_split_norm_rope(k, self.norm_k.weight, KV, freqs[0], freqs[1])
                 return k.view(B, S, KV, D)
@@ -611,7 +645,7 @@ class Attention(nn.Module):
             return k
 
         def compute_v():
-            return self.to_v(hidden_states).view(B, S, KV, D)
+            return self.to_v(qkv_input).view(B, S, KV, D)
 
         out_4d = self.attn.forward_async(compute_q, compute_k, compute_v)
         b, t = out_4d.shape[:2]

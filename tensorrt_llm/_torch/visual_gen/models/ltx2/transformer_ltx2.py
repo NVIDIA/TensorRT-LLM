@@ -29,6 +29,7 @@ from tqdm import tqdm
 
 from tensorrt_llm._torch.modules.linear import Linear, WeightMode
 from tensorrt_llm._torch.modules.mlp import MLP
+from tensorrt_llm._torch.utils import Fp4QuantizedTensor
 from tensorrt_llm._torch.visual_gen.attention_backend.utils import create_attention
 from tensorrt_llm._torch.visual_gen.modules.attention import Attention, QKVMode
 from tensorrt_llm._torch.visual_gen.quantization.loader import DynamicLinearWeightLoader
@@ -451,8 +452,20 @@ class LTX2Attention(Attention):
             and self.qk_norm
         )
 
+        # SEPARATE_QKV self-attn 3x fp4_quantize dedup; see Attention.forward_async.
+        if self._maybe_share_qkv_quantize and getattr(self.to_q, "input_scale", None) is not None:
+            x_2d = x.reshape(-1, x.shape[-1])
+            fp4, sf = torch.ops.trtllm.tunable_fp4_quantize(
+                x_2d, self.to_q.input_scale, self.to_q.scaling_vector_size, False
+            )
+            qkv_input = Fp4QuantizedTensor(fp4, sf, is_sf_swizzled=False)
+        else:
+            qkv_input = x
+
         def compute_q():
-            q = self.to_q(x)
+            q = self.to_q(qkv_input)
+            if q.dim() == 2:
+                q = q.view(B, S, -1)
             if use_fused:
                 self.apply_split_norm_rope(q, self.norm_q.weight, H, freqs[0], freqs[1])
                 return q.view(B, S, H, D)
@@ -465,7 +478,9 @@ class LTX2Attention(Attention):
             return q
 
         def compute_k():
-            k = self.to_k(x)
+            k = self.to_k(qkv_input)
+            if k.dim() == 2:
+                k = k.view(B, S, -1)
             if use_fused:
                 self.apply_split_norm_rope(k, self.norm_k.weight, KV, freqs[0], freqs[1])
                 return k.view(B, S, KV, D)
@@ -477,7 +492,7 @@ class LTX2Attention(Attention):
             return k
 
         def compute_v():
-            return self.to_v(x).view(B, S, KV, D)
+            return self.to_v(qkv_input).view(B, S, KV, D)
 
         out_4d = self.attn.forward_async(compute_q, compute_k, compute_v)
 
