@@ -3,16 +3,15 @@
 Locks in two of the three warmup-cleanup changes:
   - Change 1: gc.collect() + torch.cuda.empty_cache() fire immediately after
     _run_autotuner_warmup (step b) - releases autotuner exploration leftovers.
-  - Change 3: TRTLLM_SKIP_MAX_SHAPE_WARMUP=1 skips the step (d) max-shape
-    pre-population pass and emits a skip log; any other value (or absence)
-    leaves step (d) running.
+  - Change 3: step (d) max-shape pre-population is automatically skipped when
+    PyTorchModelEngine.is_estimation_pass is True, and runs unconditionally
+    in the production pass.
 
 The third change (torch.cuda.empty_cache() after teardown_managers()
 is covered end-to-end by integration tests rather than unit-tested here.
 """
 
 import contextlib
-import os
 import unittest
 from dataclasses import dataclass
 from unittest.mock import patch
@@ -124,18 +123,12 @@ class _Tracker:
 
 
 def _run_warmup_tracked(
-    model_engine, resource_manager, *, env_var=None, force_helix_cp=False, capture_logs=False
+    model_engine, resource_manager, *, force_helix_cp=False, capture_logs=False
 ):
     """Patch the four warmup helpers + empty_cache + MoERunner.clear and run
-    model_engine.warmup(). Optionally set env var, force helix CP, capture
-    logs. Returns (call_order_list, log_records_or_None)."""
+    model_engine.warmup(). Optionally force helix CP and capture logs.
+    Returns (call_order_list, log_records_or_None)."""
     tracker = _Tracker()
-
-    env_ctx = (
-        patch.dict(os.environ, {"TRTLLM_SKIP_MAX_SHAPE_WARMUP": env_var})
-        if env_var is not None
-        else _clear_env_var_ctx("TRTLLM_SKIP_MAX_SHAPE_WARMUP")
-    )
     helix_ctx = (
         patch.object(model_engine.mapping, "has_cp_helix", return_value=True)
         if force_helix_cp
@@ -143,7 +136,6 @@ def _run_warmup_tracked(
     )
 
     with (
-        env_ctx,
         helix_ctx,
         patch.object(model_engine, "_general_warmup", side_effect=tracker("general_warmup")),
         patch.object(model_engine, "_run_autotuner_warmup", side_effect=tracker("autotuner")),
@@ -160,18 +152,6 @@ def _run_warmup_tracked(
             return tracker.calls, logs
         model_engine.warmup(resource_manager)
         return tracker.calls, None
-
-
-@contextlib.contextmanager
-def _clear_env_var_ctx(name: str):
-    """Context that ensures `name` is unset for its duration."""
-    sentinel = object()
-    original = os.environ.pop(name, sentinel)
-    try:
-        yield
-    finally:
-        if original is not sentinel:
-            os.environ[name] = original
 
 
 @contextlib.contextmanager
@@ -239,51 +219,11 @@ class TestWarmupCleanup(unittest.TestCase):
             calls.count("empty_cache"), 0, f"Helix CP should skip all warmup cleanup; got {calls}"
         )
 
-    # ---- Change 3: step (d) env-var gate ----
-
-    def test_step_d_runs_when_env_var_unset(self):
-        """Default: env var unset -> step (d) runs (2 general_warmup calls)."""
-        model_engine, resource_manager = _build_engine_and_resource_manager()
-        calls, _ = _run_warmup_tracked(model_engine, resource_manager)
-        self.assertEqual(
-            calls.count("general_warmup"),
-            2,
-            f"Expected step (a) + step (d) general_warmup; got {calls}",
-        )
-
-    def test_step_d_skipped_when_env_var_is_one(self):
-        """Change 3: TRTLLM_SKIP_MAX_SHAPE_WARMUP=1 skips step (d) and logs."""
-        model_engine, resource_manager = _build_engine_and_resource_manager()
-        calls, logs = _run_warmup_tracked(
-            model_engine, resource_manager, env_var="1", capture_logs=True
-        )
-        self.assertEqual(
-            calls.count("general_warmup"), 1, f"Expected only step (a) general_warmup; got {calls}"
-        )
-        self.assertTrue(
-            any("Skipping max-shape warmup pre-population" in m for m in logs),
-            f"Expected skip log; got logs={logs}",
-        )
-
-    def test_step_d_runs_for_env_var_values_other_than_one(self):
-        """Gate semantics: only literal '1' disables step (d).
-        Any other value (including truthy strings like 'true') still runs it."""
-        for val in ["0", "", "true", "yes", "2", "on"]:
-            with self.subTest(env_value=val):
-                model_engine, resource_manager = _build_engine_and_resource_manager()
-                calls, _ = _run_warmup_tracked(model_engine, resource_manager, env_var=val)
-                self.assertEqual(
-                    calls.count("general_warmup"),
-                    2,
-                    f"env={val!r}: expected 2 general_warmup; got {calls}",
-                )
-
     # ---- Estimation-pass step (d) skip ----
 
     def test_step_d_skipped_in_estimation_pass(self):
         """Estimation-pass optimization: when is_estimation_pass=True,
-        step (d) is skipped even if the env var is unset, and the skip log
-        reports the estimation reason."""
+        step (d) is skipped and a skip log is emitted."""
         model_engine, resource_manager = _build_engine_and_resource_manager()
         model_engine.is_estimation_pass = True
         calls, logs = _run_warmup_tracked(model_engine, resource_manager, capture_logs=True)
@@ -298,9 +238,9 @@ class TestWarmupCleanup(unittest.TestCase):
         )
 
     def test_step_d_runs_when_is_estimation_pass_false(self):
-        """Default attribute value is False, so step (d) runs normally."""
+        """Production pass (is_estimation_pass=False, the default): both
+        step (a) and step (d) run for max-shape memory-pool pre-population."""
         model_engine, resource_manager = _build_engine_and_resource_manager()
-        # Explicit assertion: the attribute exists and defaults to False.
         self.assertFalse(model_engine.is_estimation_pass)
         calls, _ = _run_warmup_tracked(model_engine, resource_manager)
         self.assertEqual(

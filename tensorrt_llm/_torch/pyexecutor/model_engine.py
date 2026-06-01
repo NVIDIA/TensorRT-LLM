@@ -969,31 +969,17 @@ class PyTorchModelEngine(ModelEngine):
             torch.cuda.empty_cache()
         with self.cuda_graph_runner.allow_capture():
             self._run_cuda_graph_warmup(resource_manager)
-        # Step (d) max-shape pre-population pre-allocates the worst-case
-        # activation blocks so the first real iteration reuses them instead
-        # of paying a cudaMalloc cost. Skip when:
-        #   - is_estimation_pass: the estimation PyExecutor is torn down
-        #     immediately after configure_kv_cache_capacity (which calls
-        #     empty_cache()), so any pre-pop blocks are released before
-        #     measurement and never serve a request. Pure waste.
-        #   - TRTLLM_SKIP_MAX_SHAPE_WARMUP=1: opt-in for production workloads
-        #     that prefer maximum non-torch headroom (cuBLAS, UCX/NIXL,
-        #     NVSHMEM) over the ~tens-of-ms first-iter cudaMalloc saving.
         if can_run_general_warmup:
-            skip_for_estimation = self.is_estimation_pass
-            skip_for_envvar = (os.environ.get("TRTLLM_SKIP_MAX_SHAPE_WARMUP",
-                                              "0") == "1")
-            if not (skip_for_estimation or skip_for_envvar):
+            if not self.is_estimation_pass:
                 # Pre-populate the memory pool with max-shape allocations to
                 # reduce fragmentation at runtime.
                 warmup_requests_configs = self._get_max_shape_warmup_requests(
                     resource_manager)
                 self._general_warmup(resource_manager, warmup_requests_configs)
             else:
-                reason = ("estimation pass" if skip_for_estimation else
-                          "TRTLLM_SKIP_MAX_SHAPE_WARMUP=1")
                 logger.info(
-                    f"Skipping max-shape warmup pre-population ({reason})")
+                    "Skipping max-shape warmup pre-population (estimation pass)"
+                )
 
     def _general_warmup(self, resource_manager: ResourceManager,
                         warmup_requests_configs: List[Tuple[int, int]]):
