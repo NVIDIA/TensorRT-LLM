@@ -58,6 +58,7 @@ def make_gen_request(
     req.is_generation_in_progress_state = True
     req.is_first_context_chunk = is_first_context_chunk
     req.py_encoder_output_ready_event = None
+    req.py_multimodal_data = None
     return req
 
 
@@ -163,15 +164,22 @@ def make_kv_cache_manager(
     resize_context_fn=None,
     prepare_disagg_gen_init_fn=None,
     try_allocate_generation_fn=None,
+    has_host_tier=False,
 ):
     mgr = Mock()
     mgr.tokens_per_block = tokens_per_block
+    mgr.has_host_cache_tier = has_host_tier
     mgr.kv_cache_map = _KVCacheMap()
     mgr.prepare_context.side_effect = prepare_context_fn or (lambda req: True)
     mgr.resize_context.side_effect = resize_context_fn or (lambda req, n: True)
     mgr.prepare_disagg_gen_init.side_effect = prepare_disagg_gen_init_fn or (lambda req: True)
     mgr.try_allocate_generation.side_effect = try_allocate_generation_fn or (lambda req: True)
-    mgr.suspend_request.return_value = None
+
+    def suspend_request(req):
+        if has_host_tier:
+            mgr.kv_cache_map[req.py_request_id].is_active = False
+
+    mgr.suspend_request.side_effect = suspend_request
     mgr.is_request_active.side_effect = lambda req_id: mgr.kv_cache_map[req_id].is_active
     return mgr
 
@@ -504,6 +512,52 @@ class TestKVCacheFailuresGen:
         assert ids(out.generation_requests) == [0]
         # gen99 evicted as victim for gen1; gen1 self-evicts after
         assert set(ids(out.paused_requests)) == {1, 99}
+
+    def test_gen_alloc_fails_recompute_pauses_host_victim(self):
+        """host-tier victim is recompute-paused before gen self-evicts."""
+        call_count = [0]
+
+        def alloc_fn(req):
+            call_count[0] += 1
+            # Only gen0 succeeds. A fourth call would mean the scheduler retried
+            # allocation immediately after recompute-pausing the suspended
+            # victim, which should not happen because it frees no GPU pages.
+            return call_count[0] in (1, 4)
+
+        mgr = make_kv_cache_manager(try_allocate_generation_fn=alloc_fn, has_host_tier=True)
+        sched = make_scheduler(mgr, max_num_tokens=100)
+        victim = make_gen_request(99)
+        reqs = [make_gen_request(0), make_gen_request(1), victim]
+        out = sched.schedule_request(reqs, set())
+        assert ids(out.generation_requests) == [0]
+        assert ids(out.paused_requests) == [1]
+        assert ids(out.recompute_paused_requests) == [99]
+        assert call_count[0] == 3
+        mgr.free_resources.assert_called_once_with(victim)
+
+    def test_recompute_pause_skips_multimodal_victim(self):
+        """Released MM inputs cannot be reconstructed by destructive pause."""
+        freed_request_ids = set()
+
+        def alloc_fn(req):
+            return 1 in freed_request_ids
+
+        mgr = make_kv_cache_manager(try_allocate_generation_fn=alloc_fn)
+        mgr.free_resources.side_effect = lambda req: freed_request_ids.add(req.request_id)
+        sched = make_scheduler(mgr, max_num_tokens=100)
+        current = make_gen_request(0)
+        victim = make_gen_request(1)
+        # Post-prefill cleanup has already removed the Python payload and
+        # encoder state but preserves the dict as the durable MM identity.
+        victim.py_multimodal_data = {}
+        mgr.kv_cache_map[victim.py_request_id].is_active = False
+
+        out = sched.schedule_request([current, victim], set())
+
+        assert out.generation_requests == []
+        assert ids(out.paused_requests) == [0]
+        assert out.recompute_paused_requests == []
+        mgr.free_resources.assert_not_called()
 
     def test_multiple_evictions_needed(self):
         """gen fails, 2 victims needed to free enough space."""
@@ -1926,6 +1980,7 @@ class TestSchedulerOutput:
         assert len(out.context_requests) == 1
         assert len(out.generation_requests) == 1
         assert len(out.fitting_disagg_gen_init_requests) == 1
+        assert out.recompute_paused_requests == []
         assert out.num_fitting_requests == 2
 
     def test_num_fitting_requests(self):
@@ -2056,6 +2111,22 @@ class TestMixedOrdering:
         # → req0 self-evicts. All 3 are paused.
         assert len(out.generation_requests) == 0
         assert set(ids(out.paused_requests)) == {0, 1, 2}
+
+    def test_multiple_gen_after_gen_fail_with_host_tier_recompute_pause(self):
+        """Host-tier evicted victims are recompute-paused before self-evict."""
+
+        def selective_gen_alloc(req):
+            return req.request_id != 0
+
+        mgr = make_kv_cache_manager(
+            try_allocate_generation_fn=selective_gen_alloc, has_host_tier=True
+        )
+        sched = make_scheduler(mgr, max_num_tokens=1000)
+        reqs = [make_gen_request(0), make_gen_request(1), make_gen_request(2)]
+        out = sched.schedule_request(reqs, set())
+        assert len(out.generation_requests) == 0
+        assert ids(out.paused_requests) == [0]
+        assert set(ids(out.recompute_paused_requests)) == {1, 2}
 
 
 # ===========================================================================
