@@ -34,15 +34,26 @@ transforms:
     backend: trtllm_mla
   fuse_rope_into_trtllm_mla:
     enabled: true
+  fuse_dsv3_a_gemm:
+    enabled: true
+  fuse_dsv3_router_gemm:
+    enabled: true
+
   multi_stream_mla_attn:
     enabled: true
   fuse_allreduce_residual_rmsnorm:
     enabled: true
+  fuse_add_rms_norm:
+    enabled: true
+  fuse_moe_allreduce_residual_rmsnorm:
+    enabled: true
   detect_sharding:
+    enabled: false
+  sharding_transform_executor:
+    enabled: false
+  apply_sharding_hints:
+    enabled: true
     allreduce_strategy: SYMM_MEM
-    allgather_strategy: SYMM_MEM
-    shard_all_unprocessed: true
-    simple_shard_filter: "lm_head"
   cleanup_identity_dtype_cast:
     enabled: true
   gather_logits_before_lm_head:
