@@ -45,13 +45,29 @@ Deployment configs (``examples/visual_gen/configs/``):
 - ``cosmos3-super-4gpu.yaml`` — 4 GPU, CFG + Ulysses + parallel VAE
 
 Usage:
-    python cosmos3_ti2v.py --model nvidia/Cosmos3-Nano
     python cosmos3_ti2v.py --model nvidia/Cosmos3-Nano \\
+        --prompt "The video opens with a view of a well-lit indoor space featuring a " \\
+        "wooden display case with compartments filled with various fruits, " \\
+        "including bananas, apples, pears, oranges, and carambolas. " \\
+        "The bananas are neatly arranged in the middle compartment, while apples " \\
+        "are in the left and a mix of pears, oranges, and carambolas are in the " \\
+        "right. " \\
+        "Two robotic arms with grippers are positioned at the bottom of the frame, " \\
+        "with the one on the left remaining stationary, partially obscuring the " \\
+        "apples. " \\
+        "The robotic arm on the right begins its action, extending towards the " \\
+        "right side of the display case. " \\
+        "It carefully picks up a pear from the fruit section, placing it into a " \\
+        "plastic bag in the shopping cart nearby, which has red handles. " \\
+        "After securing the pear, the arm retracts back to its original position. " \\
+        "The process repeats as the robotic arm picks up an orange and places it " \\
+        "in the bag, followed by a carambola. " \\
+        "The final frame captures the robotic arm returning to its initial " \\
+        "position, leaving the display case and surrounding area unchanged. " \\
+        "The video showcases a seamless and efficient automated fruit-picking " \\
+        "process, highlighting the precision and efficiency of modern robotics " \\
+        "in a retail setting." \\
         --visual_gen_args ../configs/cosmos3-nano-1gpu.yaml
-    torchrun --nproc_per_node=4 cosmos3_ti2v.py --model nvidia/Cosmos3-Super \\
-        --visual_gen_args ../configs/cosmos3-super-4gpu.yaml
-    python cosmos3_ti2v.py --model nvidia/Cosmos3-Nano --image_path conditioning.jpg \\
-        --prompt "The cat walks forward"
 """
 
 import argparse
@@ -78,7 +94,7 @@ def main():
     parser.add_argument(
         "--prompt",
         type=str,
-        default="A cat playing piano in a sunny room",
+        required=True,
         help="Text prompt for generation",
     )
     parser.add_argument(
