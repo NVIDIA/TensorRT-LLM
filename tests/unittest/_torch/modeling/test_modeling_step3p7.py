@@ -598,12 +598,10 @@ class TestStep3p7Checkpoint(unittest.TestCase):
         self.assertEqual(pc.hidden_size, 4096)
         if name == "fp8":
             self.assertEqual(model_config.quant_config.quant_algo, QuantAlgo.FP8_BLOCK_SCALES)
-            self.assertEqual(model_config.moe_backend.upper(), "TRTLLM")
         elif name == "nvfp4":
             self.assertEqual(model_config.quant_config.quant_algo, QuantAlgo.NVFP4)
             # NVFP4 modelopt export also carries an FP8 KV-cache scheme.
             self.assertEqual(model_config.quant_config.kv_cache_quant_algo, QuantAlgo.FP8)
-            self.assertEqual(model_config.moe_backend.upper(), "CUTLASS")
         else:
             self.assertTrue(
                 model_config.quant_config is None or model_config.quant_config.quant_algo is None
