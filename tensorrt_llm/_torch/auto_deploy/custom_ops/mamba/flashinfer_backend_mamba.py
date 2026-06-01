@@ -120,6 +120,8 @@ def _flashinfer_cached_ssm(
     # Pre-hoist index type conversions so their kernels run before the extend
     # causal_conv1d_update kernel rather than landing in the gap between it
     # and the PDL-dependent replay precompute kernel.
+    # slot_idx is a per-request cache slot index in [0, max_batch_size], so the
+    # int32 cast can never overflow.
     slot_idx_i32 = slot_idx.to(torch.int32)
     # NOTE: intermediate_state_indices_extend (torch.arange) is NOT hoisted here.
     # It is only needed for the non-replay FlashInfer extend path. Hoisting it
