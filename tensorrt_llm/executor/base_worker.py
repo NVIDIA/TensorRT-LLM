@@ -719,7 +719,7 @@ class BaseWorker(GenerationExecutor):
     def _multi_rank_sleep_wakeup(
         self,
         action: str,
-        tags: List[ExecutorMemoryType],
+        tags: list[ExecutorMemoryType],
     ) -> None:
         """Coordinate a sleep or wakeup operation across all MPI ranks.
 
@@ -810,7 +810,7 @@ class BaseWorker(GenerationExecutor):
                         f"{action}() failed on {len(errors)} rank(s):\n" +
                         "\n".join(errors))
 
-    def sleep(self, sleep_tags: List[str]) -> None:
+    def sleep(self, sleep_tags: list[str]) -> None:
         """Release GPU virtual memory for the specified memory type tags.
 
         Supports both single-rank (``world_size == 1``) and multi-rank
@@ -859,7 +859,7 @@ class BaseWorker(GenerationExecutor):
                 gc.collect()
                 torch.cuda.empty_cache()
 
-    def wakeup(self, wakeup_tags: List[str]) -> None:
+    def wakeup(self, wakeup_tags: list[str]) -> None:
         """Materialize GPU virtual memory for the specified memory type tags.
 
         Supports both single-rank (``world_size == 1``) and multi-rank

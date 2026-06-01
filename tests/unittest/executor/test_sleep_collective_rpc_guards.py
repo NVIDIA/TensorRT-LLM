@@ -383,6 +383,85 @@ class TestMultiRankAckErrorPropagation:
         assert "rank 2 OOM" in msg
 
 
+class TestListenerUncaughtExceptionSendsErrorAck:
+    """An exception that bypasses the narrow except clause must still produce an error ACK.
+
+    The sys.exc_info() check in the finally block detects uncaught exceptions so
+    rank-0 receives status=error rather than a false status=ok ACK while the
+    listener thread is unwinding.
+    """
+
+    def test_uncaught_exception_sends_error_ack(self):
+        """MemoryError (not in narrow except) must reach rank-0 as status=error.
+
+        Without the sys.exc_info() guard, the finally block would send status=ok
+        because error_msg is still None when the exception bypasses the except
+        clause — leaving rank-0 with an inconsistent view of the operation.
+        """
+        import sys
+        from types import SimpleNamespace
+        from unittest.mock import patch
+
+        from tensorrt_llm.llmapi.llm_args import ExecutorMemoryType
+
+        sent_acks = []
+
+        class FakeComm:
+            def recv(self, source, tag):
+                return {"action": "sleep", "tags": ["kv_cache"]}
+
+            def send(self, payload, dest, tag):
+                sent_acks.append(payload)
+
+        # Minimal PyExecutor shell — only the fields the listener loop touches.
+        from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
+
+        executor = object.__new__(PyExecutor)
+        executor._sleep_wakeup_comm = FakeComm()
+        executor.device_id = 0
+        executor.dist = SimpleNamespace(rank=1)
+
+        with (
+            patch("torch.cuda.set_device"),
+            patch(
+                "tensorrt_llm.runtime.generation.CUASSERT"),
+            patch(
+                "tensorrt_llm._utils.set_thread_local_mpi_comm"),
+            patch(
+                "tensorrt_llm._torch.virtual_memory.release_with_tag",
+                side_effect=MemoryError("simulated OOM outside except list"),
+            ),
+            patch("torch.cuda.synchronize"),
+        ):
+            # The loop receives one message then raises MemoryError which is
+            # not in the narrow except.  We patch recv to raise StopIteration
+            # on the second call so the loop terminates cleanly in the test.
+            call_count = [0]
+            original_recv = FakeComm.recv
+
+            def _recv_once(self_inner, source, tag):
+                call_count[0] += 1
+                if call_count[0] > 1:
+                    raise StopIteration
+                return {"action": "sleep", "tags": ["kv_cache"]}
+
+            executor._sleep_wakeup_comm.recv = lambda source, tag: _recv_once(
+                None, source, tag)
+
+            try:
+                executor._sleep_wakeup_listener_loop()
+            except StopIteration:
+                pass
+
+        assert sent_acks, "finally block must send an ACK even for uncaught exceptions"
+        assert sent_acks[0]["status"] == "error", (
+            "ACK status must be 'error' when MemoryError bypasses the narrow "
+            f"except clause; got {sent_acks[0]!r}"
+        )
+        assert sent_acks[0]["error"] is not None
+        assert "MemoryError" in sent_acks[0]["error"]
+
+
 class TestMultiRankRank0LocalFailureDrainsAcks:
     """When rank-0's local VMM op raises, all peer ACKs must still be drained.
 

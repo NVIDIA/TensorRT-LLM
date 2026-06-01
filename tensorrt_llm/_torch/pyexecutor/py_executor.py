@@ -970,6 +970,10 @@ class PyExecutor:
         # no longer driving NCCL, so the send cannot deadlock.
         if (self.dist.rank == 0 and self._sleep_wakeup_comm is not None
                 and self.dist.world_size > 1):
+            logger.info(
+                "Sending shutdown to %d sleep/wakeup listener thread(s).",
+                self.dist.world_size - 1,
+            )
             for dest in range(1, self.dist.world_size):
                 self._sleep_wakeup_comm.send(
                     {
@@ -2219,6 +2223,7 @@ class PyExecutor:
           from a non-main thread.
         """
         import gc
+        import sys
 
         from tensorrt_llm._torch.virtual_memory import (materialize_with_tag,
                                                         release_with_tag)
@@ -2270,6 +2275,22 @@ class PyExecutor:
                 finally:
                     # Always ACK so rank-0 does not deadlock; carry error
                     # details so rank-0 can raise after all ranks respond.
+                    # If an exception bypassed the narrow except above (e.g.,
+                    # MemoryError, SystemError), detect it via sys.exc_info()
+                    # so the ACK correctly reflects failure rather than falsely
+                    # reporting status=ok while the thread is unwinding.
+                    if error_msg is None and sys.exc_info()[0] is not None:
+                        exc = sys.exc_info()[1]
+                        error_msg = (
+                            f"rank {self.dist.rank} '{action}' failed with "
+                            f"uncaught {type(exc).__name__}: {exc!r}")
+                        logger.error(
+                            "Sleep/wakeup listener: uncaught exception on "
+                            "rank %d during '%s':",
+                            self.dist.rank,
+                            action,
+                            exc_info=True,
+                        )
                     self._sleep_wakeup_comm.send(
                         {
                             "status": "ok" if error_msg is None else "error",
