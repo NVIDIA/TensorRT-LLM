@@ -17,6 +17,9 @@ from pathlib import Path
 from typing import (Annotated, Any, AsyncGenerator, AsyncIterator, List,
                     Optional, Union)
 
+import numpy as np
+import torch
+import torch.nn.functional as F
 import uvicorn
 from fastapi import Body, FastAPI, Request
 from fastapi.exceptions import RequestValidationError
@@ -47,7 +50,7 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.media.encoding import image_to_bytes
 from tensorrt_llm.media.tensor_payload import is_tensor_format
 from tensorrt_llm.metrics.collector import MetricsCollector
-from tensorrt_llm.sampling_params import GuidedDecodingParams
+from tensorrt_llm.sampling_params import GuidedDecodingParams, SamplingParams
 from tensorrt_llm.serve.chat_utils import (load_chat_template,
                                            parse_chat_messages_coroutines,
                                            resolve_top_level_model_type)
@@ -56,12 +59,12 @@ from tensorrt_llm.serve.disagg_auto_scaling import DisaggClusterWorker
 from tensorrt_llm.serve.metadata_server import create_metadata_server
 from tensorrt_llm.serve.openai_protocol import (
     ChatCompletionRequest, ChatCompletionResponse, ChatCompletionResponseChoice,
-    ChatMessage, CompletionRequest, CompletionResponse,
-    CompletionResponseChoice, ErrorResponse, ImageGenerationRequest,
-    ImageGenerationResponse, ImageObject, MemoryUpdateRequest, ModelCard,
-    ModelList, PromptTokensDetails, ResponseFormat, ResponsesRequest,
-    ResponsesResponse, UpdateWeightsRequest, UsageInfo,
-    ensure_request_chat_template_allowed, to_llm_disaggregated_params)
+    ChatMessage, CompletionRequest, CompletionResponse, CompletionResponseChoice,
+    EmbeddingData, EmbeddingRequest, EmbeddingResponse, ErrorResponse,
+    ImageEditRequest, ImageGenerationRequest, ImageGenerationResponse,
+    ImageObject, MemoryUpdateRequest, ModelCard, ModelList, PromptTokensDetails,
+    ResponseFormat, ResponsesRequest, ResponsesResponse, UpdateWeightsRequest,
+    UsageInfo, ensure_request_chat_template_allowed, to_llm_disaggregated_params)
 from tensorrt_llm.serve.openai_video_routes import _VideoRoutesMixin
 from tensorrt_llm.serve.postprocess_handlers import (
     ChatCompletionPostprocArgs, ChatPostprocArgs, CompletionPostprocArgs,
@@ -688,6 +691,9 @@ class OpenAIServer(_VideoRoutesMixin):
 
         self.app.add_api_route("/v1/completions",
                                self.openai_completion,
+                               methods=["POST"])
+        self.app.add_api_route("/v1/embeddings",
+                               self.openai_embeddings,
                                methods=["POST"])
         self.app.add_api_route(
             "/v1/chat/completions",
@@ -1436,6 +1442,85 @@ class OpenAIServer(_VideoRoutesMixin):
         except CppExecutorError:
             logger.error(traceback.format_exc())
             # If internal executor error is raised, shutdown the server
+            signal.raise_signal(signal.SIGINT)
+        except Exception as e:
+            logger.error(traceback.format_exc())
+            return self.create_error_response(str(e))
+
+    async def openai_embeddings(self, request: EmbeddingRequest,
+                                raw_request: Request) -> Response:
+        """Serve embeddings via the generate path (max_tokens=1).
+
+        Embedding models return hidden states through additional_model_outputs,
+        using the generate path for scheduler batching and chunked-prefill
+        support. This should migrate to the encode path once it supports
+        equivalent capabilities. The output tensor name is configured
+        via the TRTLLM_EMBEDDING_OUTPUT_NAME env var.
+        """
+        try:
+            texts = ([request.input]
+                     if isinstance(request.input, str) else request.input)
+
+            output_name = os.environ["TRTLLM_EMBEDDING_OUTPUT_NAME"]
+            sampling_params = SamplingParams(
+                max_tokens=1,
+                temperature=0.0,
+                detokenize=False,
+                additional_model_outputs=[output_name],
+            )
+
+            promises = [
+                self.generator.generate_async(inputs=text,
+                                              sampling_params=sampling_params)
+                for text in texts
+            ]
+            results = await asyncio.gather(*[p.aresult() for p in promises])
+
+            embeddings = []
+            total_prompt_tokens = 0
+            for result in results:
+                if result.error is not None:
+                    raise RuntimeError(f"Generation failed: {result.error}")
+                x = result.outputs[0].additional_generation_outputs[output_name]
+                if x.ndim == 3:
+                    x = x[0, 0]
+                elif x.ndim == 2:
+                    x = x[0]
+                embeddings.append(x)
+                total_prompt_tokens += len(result.prompt_token_ids)
+
+            embeddings = torch.stack(embeddings).float()
+
+            if request.dimensions is not None:
+                embeddings = embeddings[:, :request.dimensions]
+            if request.normalize:
+                embeddings = F.normalize(embeddings, p=2, dim=-1)
+
+            embeddings_np = embeddings.cpu().numpy().astype(np.float32)
+
+            data = []
+            for i, emb in enumerate(embeddings_np):
+                if request.encoding_format == "float":
+                    data.append(EmbeddingData(index=i, embedding=emb.tolist()))
+                else:
+                    data.append(
+                        EmbeddingData(index=i,
+                                      embedding=base64.b64encode(
+                                          emb.tobytes()).decode("ascii")))
+
+            response = EmbeddingResponse(
+                data=data,
+                model=self.model,
+                usage=UsageInfo(
+                    prompt_tokens=total_prompt_tokens,
+                    total_tokens=total_prompt_tokens,
+                    completion_tokens=0,
+                ),
+            )
+            return JSONResponse(content=response.model_dump())
+
+        except CppExecutorError:
+            logger.error(traceback.format_exc())
             signal.raise_signal(signal.SIGINT)
         except Exception as e:
             logger.error(traceback.format_exc())
