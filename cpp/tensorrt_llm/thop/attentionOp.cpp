@@ -522,6 +522,12 @@ public:
                 if (helix_is_inactive_rank.has_value())
                 {
                     mla_params.helix_is_inactive_rank = helix_is_inactive_rank->data_ptr<bool>();
+                    // When the inactive-rank flags are provided per query token (length equal to the total
+                    // number of query tokens) the generation kernel resolves ownership and the compacted KV
+                    // write slot per token; this is the speculative-decoding verify layout. Plain decode
+                    // provides one flag per sequence.
+                    mla_params.helix_is_inactive_rank_per_token
+                        = (helix_is_inactive_rank->numel() == mla_params.acc_q_len);
                 }
             }
             else

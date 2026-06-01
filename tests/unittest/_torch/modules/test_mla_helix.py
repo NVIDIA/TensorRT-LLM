@@ -30,11 +30,15 @@ from _torch.modules.helix_test_utils import (
     compute_mismatch_ratio,
     copy_weights_for_cp,
     create_helix_gen_metadata,
+    create_helix_spec_gen_metadata,
+    parse_comms_medium,
     run_helix_test,
+    run_single_rank,
     setup_kv_and_metadata,
     split_inputs_for_rank,
 )
 from mpi4py import MPI
+from mpi4py.futures import MPIPoolExecutor
 from utils.util import skip_pre_blackwell
 
 from tensorrt_llm._torch.attention_backend.interface import (
@@ -568,3 +572,321 @@ def test_mla_helix_distributed(
     comms_medium: str,
 ):
     run_helix_test(_full_test_multi_gpu, scenario, comms_medium)
+
+
+# ---------------------------------------------------------------------------
+# Speculative-decode (multi-query-token) Helix MLA tests.
+#
+# A verify forward processes pred = 1 + draft_len query tokens per request that
+# attend the cached prefix and each other (linear causal chain). Under Helix the
+# new tokens' KV is sharded across CP ranks; the all-to-all + post-process must
+# reassemble the same result as a single-GPU multi-token forward.
+#
+# Two ownership layouts are exercised at the attention level:
+#   - non-straddler: all query tokens of a request owned by one rank;
+#   - straddler:     query tokens split across ranks (token j -> rank j % cp).
+# The block-round-robin scheduling that produces these layouts is covered
+# separately by the pure-Python ownership test.
+# ---------------------------------------------------------------------------
+
+
+def _spec_token_ownership(num_query_tokens, rank, world_size, straddle):
+    """Per-rank ownership for a multi-token verify step.
+
+    Returns ``(inactive_flags, num_active)``: a per-query-token list of whether
+    this rank does NOT write the token's KV, and the count of tokens it owns.
+    """
+    inactive = []
+    num_active = 0
+    for j in range(num_query_tokens):
+        owner = (j % world_size) if straddle else (world_size - 1)
+        owned = owner == rank
+        inactive.append(not owned)
+        num_active += int(owned)
+    return inactive, num_active
+
+
+def _run_mla_distributed_spec(
+    rank: int,
+    world_size: int,
+    scenario: Scenario,
+    num_query_tokens: int,
+    straddle: bool,
+    mapping: Mapping,
+    test_params: tuple,
+    ref_output: torch.Tensor,
+):
+    input_ctx, input_gen, position_ids_ctx, weights, pos_embd_params, ref_attn_metadata = (
+        test_params
+    )
+    # Global positions of the verify query tokens: [ctx_len, ctx_len+pred).
+    position_ids_gen = torch.arange(
+        scenario.ctx_len,
+        scenario.ctx_len + num_query_tokens,
+        dtype=torch.int,
+        device="cuda",
+    ).repeat(scenario.batch)
+    extra_attrs = dict()
+    config = ModelConfig(mapping=mapping)
+    config.extra_attrs = extra_attrs
+    mla = MLA(
+        hidden_size=scenario.hidden_size,
+        num_attention_heads=scenario.num_heads,
+        num_key_value_heads=scenario.num_kv_heads,
+        qk_nope_head_dim=scenario.qk_nope_head_dim,
+        qk_rope_head_dim=scenario.qk_rope_head_dim,
+        v_head_dim=scenario.v_head_dim,
+        q_lora_rank=scenario.q_lora_rank,
+        kv_lora_rank=scenario.kv_lora_rank,
+        predicted_tokens_per_seq=num_query_tokens,
+        max_position_embeddings=scenario.max_position_embeddings,
+        bias=scenario.bias,
+        pos_embd_params=pos_embd_params,
+        layer_idx=0,
+        dtype=scenario.dtype,
+        config=config,
+    ).cuda()
+    copy_weights_for_cp(weights, "o_proj.weight", 1, rank, world_size)
+    copy_weights_for_cp(weights, "v_b_proj", 0, rank, world_size)
+    mla.load_state_dict(weights)
+
+    kv_cache_manager, attn_metadata = setup_kv_and_metadata(
+        scenario,
+        mapping,
+        cache_type=CACHE_TYPE_SELFKONLY,
+        num_kv_heads=1,
+        head_dim=scenario.kv_lora_rank + scenario.qk_rope_head_dim,
+        extra_gen_tokens=num_query_tokens,
+    )
+    extra_attrs["attention_metadata"] = weakref.ref(attn_metadata)
+    ctx_len_per_gpu = scenario.ctx_len // world_size
+
+    input_ctx_rank, position_ids_ctx_rank = split_inputs_for_rank(
+        input_ctx, position_ids_ctx, scenario, rank, world_size
+    )
+    activate_all_ranks_for_context(attn_metadata, position_ids_ctx_rank)
+    ctx_output = input_ctx_rank.new_empty(
+        [input_ctx_rank.shape[0], mla.num_heads_tp * mla.v_head_dim], dtype=input_ctx_rank.dtype
+    )
+    mla.forward_impl(position_ids_ctx_rank, input_ctx_rank, attn_metadata, output=ctx_output)
+
+    input_ctx_bs = input_ctx.view(scenario.batch, scenario.ctx_len, scenario.hidden_size)
+    latent_cache_gen = _make_latent_cache_gen(
+        mla, rank, world_size, ctx_len_per_gpu, input_ctx_bs, ref_attn_metadata
+    )
+    if latent_cache_gen is not None:
+        # Each of the pred query tokens of a request sees the same remote-cached
+        # prefix latent, so tile the single-token remote latent across the window.
+        latent_cache_gen = latent_cache_gen.repeat_interleave(num_query_tokens, dim=0)
+
+    # Per-token ownership for this rank's query tokens, and KV slots for the
+    # tokens it owns.
+    inactive_flags = []
+    num_active_per_seq = []
+    for _ in range(scenario.batch):
+        flags, num_active = _spec_token_ownership(num_query_tokens, rank, world_size, straddle)
+        inactive_flags.extend(flags)
+        num_active_per_seq.append(num_active)
+    for req_id in range(scenario.batch):
+        for _ in range(num_active_per_seq[req_id]):
+            kv_cache_manager.impl.add_token(req_id)
+
+    attn_metadata = create_helix_spec_gen_metadata(
+        scenario.batch,
+        ctx_len_per_gpu,
+        kv_cache_manager,
+        num_query_tokens=num_query_tokens,
+        helix_is_inactive_rank=inactive_flags,
+        helix_num_active_tokens=num_active_per_seq,
+        helix_position_offsets=position_ids_gen.tolist(),
+        helix_total_input_len=[scenario.ctx_len] * scenario.batch,
+        enable_context_mla_with_cached_kv=True,
+    )
+    extra_attrs["attention_metadata"] = weakref.ref(attn_metadata)
+    with model_extra_attrs(extra_attrs):
+        output = mla(position_ids_gen, input_gen, attn_metadata, latent_cache_gen=latent_cache_gen)
+
+    kv_cache_manager.shutdown()
+    if ref_attn_metadata is not None:
+        ref_attn_metadata.kv_cache_manager.shutdown()
+
+    return compute_mismatch_ratio(
+        output, ref_output, scenario.atol, scenario.rtol, rank, world_size
+    )
+
+
+@torch.inference_mode
+def _full_test_multi_gpu_spec(
+    rank: int,
+    world_size: int,
+    scenario: Scenario,
+    straddle: bool,
+    use_nccl_for_alltoall: bool = False,
+    fifo_version: int = 2,
+):
+    num_query_tokens = scenario.predicted_tokens_per_seq
+    rope_config = RopeConfig(
+        hidden_size=scenario.hidden_size,
+        num_attention_heads=scenario.num_heads,
+        rope_scaling=None,
+        max_position_embeddings=scenario.max_position_embeddings,
+        rope_theta=scenario.rope_theta,
+        qk_rope_head_dim=scenario.qk_rope_head_dim,
+        model_type=scenario.model_type,
+    )
+    torch.manual_seed(42)
+    input_ctx = torch.empty(
+        scenario.batch * scenario.ctx_len, scenario.hidden_size, dtype=scenario.dtype, device="cuda"
+    ).uniform_(-1, 1)
+    input_gen = torch.empty(
+        scenario.batch * num_query_tokens,
+        scenario.hidden_size,
+        dtype=scenario.dtype,
+        device="cuda",
+    ).uniform_(-1, 1)
+    position_ids_ctx = torch.arange(scenario.ctx_len, dtype=torch.int, device="cuda").repeat(
+        scenario.batch
+    )
+    position_ids_gen = torch.arange(
+        scenario.ctx_len,
+        scenario.ctx_len + num_query_tokens,
+        dtype=torch.int,
+        device="cuda",
+    ).repeat(scenario.batch)
+
+    pos_embd_params = PositionalEmbeddingParams(
+        type=PositionEmbeddingType.yarn,
+        rope=RopeParams.from_config(rope_config),
+        is_neox=False,
+    )
+
+    mla = MLA(
+        hidden_size=scenario.hidden_size,
+        num_attention_heads=scenario.num_heads,
+        num_key_value_heads=scenario.num_kv_heads,
+        qk_nope_head_dim=scenario.qk_nope_head_dim,
+        qk_rope_head_dim=scenario.qk_rope_head_dim,
+        v_head_dim=scenario.v_head_dim,
+        q_lora_rank=scenario.q_lora_rank,
+        kv_lora_rank=scenario.kv_lora_rank,
+        predicted_tokens_per_seq=num_query_tokens,
+        max_position_embeddings=scenario.max_position_embeddings,
+        bias=scenario.bias,
+        pos_embd_params=pos_embd_params,
+        layer_idx=0,
+        dtype=scenario.dtype,
+    ).cuda()
+    _generate_random_weights(mla)
+    weights = mla.state_dict()
+
+    # Single-GPU reference: full KV, multi-token spec-dec verify.
+    if rank == 0:
+        ref_mapping = Mapping(world_size=1, tp_size=1, rank=0)
+        ref_kv_cache_manager, ref_attn_metadata = setup_kv_and_metadata(
+            scenario,
+            ref_mapping,
+            cache_type=CACHE_TYPE_SELFKONLY,
+            num_kv_heads=1,
+            head_dim=scenario.kv_lora_rank + scenario.qk_rope_head_dim,
+            extra_gen_tokens=num_query_tokens,
+        )
+        mla(position_ids_ctx, input_ctx, ref_attn_metadata)
+        for req_id in range(scenario.batch):
+            for _ in range(num_query_tokens):
+                ref_kv_cache_manager.impl.add_token(req_id)
+        ref_attn_metadata = get_attention_backend("TRTLLM").Metadata(
+            seq_lens=torch.tensor([num_query_tokens] * scenario.batch, dtype=torch.int),
+            request_ids=list(range(scenario.batch)),
+            max_num_requests=scenario.batch,
+            num_contexts=0,
+            prompt_lens=[scenario.ctx_len] * scenario.batch,
+            max_num_tokens=scenario.batch * num_query_tokens,
+            kv_cache_manager=ref_kv_cache_manager,
+            kv_cache_params=KVCacheParams(
+                use_cache=True,
+                num_cached_tokens_per_seq=[scenario.ctx_len] * scenario.batch,
+            ),
+            enable_context_mla_with_cached_kv=True,
+        )
+        draft_len = num_query_tokens - 1
+        ref_attn_metadata.update_spec_dec_param(
+            batch_size=scenario.batch,
+            is_spec_decoding_enabled=True,
+            is_spec_dec_tree=False,
+            is_spec_dec_dynamic_tree=False,
+            max_draft_len=draft_len,
+            max_total_draft_tokens=draft_len,
+        )
+        ref_attn_metadata.prepare()
+        ref_output = mla(position_ids_gen, input_gen, ref_attn_metadata)
+    else:
+        ref_output = torch.empty(
+            scenario.batch * num_query_tokens,
+            scenario.hidden_size,
+            dtype=scenario.dtype,
+            device="cuda",
+        )
+        ref_attn_metadata = None
+
+    mapping = Mapping(
+        world_size=world_size,
+        rank=rank,
+        cp_size=world_size,
+        cp_config={
+            "cp_type": CpType.HELIX,
+            "use_nccl_for_alltoall": use_nccl_for_alltoall,
+            "fifo_version": fifo_version,
+        },
+    )
+    ref_output_all = cp_allgather(ref_output, mapping=mapping, dim=0)
+    ref_output = ref_output_all.view(world_size, *ref_output.shape)[0]
+
+    test_params = (
+        input_ctx,
+        input_gen,
+        position_ids_ctx,
+        weights,
+        pos_embd_params,
+        ref_attn_metadata,
+    )
+    return _run_mla_distributed_spec(
+        rank, world_size, scenario, num_query_tokens, straddle, mapping, test_params, ref_output
+    )
+
+
+# Speculative-verify scenarios: small ctx_len, pred = 1 + draft_len > 1.
+spec_test_scenarios = [
+    Scenario(batch=1, ctx_len=64, predicted_tokens_per_seq=4),
+    Scenario(batch=4, ctx_len=512, predicted_tokens_per_seq=4),
+]
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="needs 2 GPUs to run this test")
+@skip_pre_blackwell
+@pytest.mark.parametrize("scenario", spec_test_scenarios, ids=lambda x: f"scenario: {x}")
+@pytest.mark.parametrize("straddle", [False, True], ids=["non_straddler", "straddler"])
+@pytest.mark.parametrize("comms_medium", ["nccl", "fifo_v1", "fifo_v2"])
+def test_mla_helix_spec_distributed(
+    scenario: Scenario,
+    straddle: bool,
+    comms_medium: str,
+):
+    """Multi-token (Eagle3 verify) Helix MLA attention: distributed output must
+    match a single-GPU multi-token spec-dec forward for both non-straddler and
+    straddler KV-ownership layouts."""
+    world_size = 2
+    use_nccl_for_alltoall, fifo_version = parse_comms_medium(comms_medium)
+    with MPIPoolExecutor(max_workers=world_size) as executor:
+        results = executor.map(
+            run_single_rank,
+            *zip(*[(
+                _full_test_multi_gpu_spec,
+                world_size,
+                scenario,
+                straddle,
+                use_nccl_for_alltoall,
+                fifo_version,
+            )] * world_size),
+        )
+        for ratio_mismatch in results:
+            assert ratio_mismatch <= 0.02

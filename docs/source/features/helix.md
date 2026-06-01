@@ -80,3 +80,51 @@ Test location: `tests/integration/defs/accuracy/test_disaggregated_serving.py`
 Test name: `TestDeepSeekV3Lite::test_auto_dtype_with_helix`
 
 This test demonstrates proper disaggregated server configuration with Helix.
+
+## Speculative Decoding with Helix (Eagle3 one-model)
+
+Helix CP supports Eagle3 one-model speculative decoding (`eagle3_one_model: true`)
+on the generation server, for MLA-based models such as DeepSeek-V3 / Kimi-K2.
+
+Unlike plain decode (one token per step), a speculative verify forward processes
+multiple query tokens (the re-fed last accepted token plus the draft tokens). Under
+Helix:
+
+- Decode tokens are distributed across CP ranks by **global decode-index**
+  (`(decode_index // tokens_per_block) % cp_size`), so every committed token is
+  stored on exactly one rank and the attention all-to-all reconstructs the full
+  result.
+- The re-fed last accepted token is **not** re-written (it is already cached on its
+  owner rank); only the draft tokens append KV, on their owner ranks.
+- Query token positions are computed **globally** for RoPE, and `kv_lens` grows per
+  rank by the number of query tokens that rank owns.
+
+Enable it by setting a `speculative_config` on the generation server alongside the
+Helix `cp_config`:
+
+```json
+{
+    "context_parallel_size": 2,
+    "cp_config": {"cp_type": "HELIX", "tokens_per_block": 32},
+    "kv_cache_config": {"tokens_per_block": 32},
+    "speculative_config": {
+        "decoding_type": "Eagle3",
+        "eagle3_one_model": true,
+        "max_draft_len": 3,
+        "speculative_model": "<path-to-eagle3-draft-checkpoint>"
+    }
+}
+```
+
+> Note: the Eagle3 draft submodule currently inherits the TP-repurposed mapping used
+> for the target's FFN layers, so its attention does not yet perform the Helix
+> all-to-all. Final output is correct (the target verify uses the correct Helix
+> attention), but draft acceptance may be reduced until the draft attention is given
+> the CP mapping. This is tracked as a follow-up.
+
+### Unit Test: MLA Module Correctness with Speculative Decoding
+
+```bash
+# Multi-query-token (speculative verify) MLA Helix correctness
+pytest tests/unittest/_torch/modules/test_mla_helix.py -v -k spec
+```

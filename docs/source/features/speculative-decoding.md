@@ -50,6 +50,8 @@ llm = LLM(model, speculative_config=speculative_config)
 
 EAGLE 3 can be combined with the [Suffix Automaton enhancement](#suffix-automaton-sa-enhancement) for improved acceptance rates on repetitive content. See the SA section below for details.
 
+EAGLE 3 one-model (`eagle3_one_model=True`) can also be combined with **Helix context parallelism** on the disaggregated generation server for MLA-based models (DeepSeek-V3 / Kimi-K2). See [Helix Parallelism](helix.md#speculative-decoding-with-helix-eagle3-one-model) for configuration and details.
+
 #### Dynamic Tree Mode
 
 Dynamic tree mode enables tree-structured draft generation for EAGLE 3, where the drafter expands multiple candidate tokens at each layer instead of a single token. This can improve acceptance rates compared to linear drafting at the cost of additional compute per generation step.

@@ -135,6 +135,19 @@ class TrtllmAttentionMetadata(AttentionMetadata):
     helix_is_inactive_rank: Optional[torch.Tensor] = None
     helix_is_inactive_rank_cpu: Optional[torch.Tensor] = None
 
+    # Number of query tokens this rank owns (writes KV for) per sequence. With
+    # plain Helix decode this is 1 for active ranks and 0 for inactive ranks; with
+    # speculative decoding a verify forward processes multiple query tokens and
+    # each rank may own a different subset, so kv_lens grows by this count.
+    helix_num_active_tokens: Optional[torch.Tensor] = None
+    helix_num_active_tokens_cpu: Optional[torch.Tensor] = None
+
+    # Global prompt length per sequence (total_input_len_cp), used by the Eagle3
+    # draft loop to derive each draft token's global decode-index and hence its
+    # owner CP rank on GPU.
+    helix_total_input_len: Optional[torch.Tensor] = None
+    helix_total_input_len_cpu: Optional[torch.Tensor] = None
+
     # Block offsets for the target and draft KV caches
     kv_cache_block_offsets: Optional[torch.Tensor] = None
     host_kv_cache_block_offsets: Optional[torch.Tensor] = None
@@ -409,15 +422,41 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                 device='cpu',
                 pin_memory=prefer_pinned(),
             )
+            # Per query token (not per sequence): a speculative verify forward has
+            # multiple query tokens per sequence and ownership is resolved per token.
             self.helix_is_inactive_rank = self.get_empty(
                 buffers,
-                (self.max_num_sequences, ),
+                (self.max_num_tokens, ),
                 cache_name="helix_is_inactive_rank",
                 dtype=torch.bool,
                 capture_graph=capture_graph,
             )
             self.helix_is_inactive_rank_cpu = torch.empty_like(
                 self.helix_is_inactive_rank,
+                device='cpu',
+                pin_memory=prefer_pinned(),
+            )
+            self.helix_num_active_tokens = self.get_empty(
+                buffers,
+                (self.max_num_sequences, ),
+                cache_name="helix_num_active_tokens",
+                dtype=torch.int,
+                capture_graph=capture_graph,
+            )
+            self.helix_num_active_tokens_cpu = torch.empty_like(
+                self.helix_num_active_tokens,
+                device='cpu',
+                pin_memory=prefer_pinned(),
+            )
+            self.helix_total_input_len = self.get_empty(
+                buffers,
+                (self.max_num_sequences, ),
+                cache_name="helix_total_input_len",
+                dtype=torch.int,
+                capture_graph=capture_graph,
+            )
+            self.helix_total_input_len_cpu = torch.empty_like(
+                self.helix_total_input_len,
                 device='cpu',
                 pin_memory=prefer_pinned(),
             )
@@ -439,13 +478,22 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         self,
         helix_position_offsets: List[int],
         helix_is_inactive_rank: List[bool],
+        helix_num_active_tokens: Optional[List[int]] = None,
+        helix_total_input_len: Optional[List[int]] = None,
     ) -> None:
         """
         Update helix parameters by copying into static buffers for CUDA graph compatibility.
 
         Args:
             helix_position_offsets: Position offsets for helix parallelism with shape (num_tokens,).
-            helix_is_inactive_rank: Whether the current rank is inactive with shape (batch_size,).
+            helix_is_inactive_rank: Whether the current rank is inactive, per query token,
+                with shape (num_tokens,). For plain decode this is one entry per sequence
+                (single query token); for speculative verify it is one entry per query token.
+            helix_num_active_tokens: Number of query tokens this rank owns (writes KV for)
+                per sequence, with shape (batch_size,). Used to grow kv_lens for the
+                multi-token speculative verify forward.
+            helix_total_input_len: Global prompt length per sequence, with shape
+                (batch_size,). Used by the draft loop to derive draft-token ownership.
         """
         if helix_position_offsets is not None and self.helix_position_offsets is not None:
             num_tokens = len(helix_position_offsets)
@@ -455,11 +503,26 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                 self.helix_position_offsets_cpu[:num_tokens], non_blocking=True)
 
         if helix_is_inactive_rank is not None and self.helix_is_inactive_rank is not None:
-            batch_size = len(helix_is_inactive_rank)
-            self.helix_is_inactive_rank_cpu[:batch_size].copy_(
+            num_flags = len(helix_is_inactive_rank)
+            self.helix_is_inactive_rank_cpu[:num_flags].copy_(
                 torch.tensor(helix_is_inactive_rank, dtype=torch.bool))
-            self.helix_is_inactive_rank[:batch_size].copy_(
-                self.helix_is_inactive_rank_cpu[:batch_size], non_blocking=True)
+            self.helix_is_inactive_rank[:num_flags].copy_(
+                self.helix_is_inactive_rank_cpu[:num_flags], non_blocking=True)
+
+        if helix_num_active_tokens is not None and self.helix_num_active_tokens is not None:
+            batch_size = len(helix_num_active_tokens)
+            self.helix_num_active_tokens_cpu[:batch_size].copy_(
+                torch.tensor(helix_num_active_tokens, dtype=torch.int))
+            self.helix_num_active_tokens[:batch_size].copy_(
+                self.helix_num_active_tokens_cpu[:batch_size],
+                non_blocking=True)
+
+        if helix_total_input_len is not None and self.helix_total_input_len is not None:
+            batch_size = len(helix_total_input_len)
+            self.helix_total_input_len_cpu[:batch_size].copy_(
+                torch.tensor(helix_total_input_len, dtype=torch.int))
+            self.helix_total_input_len[:batch_size].copy_(
+                self.helix_total_input_len_cpu[:batch_size], non_blocking=True)
 
     def prepare(self) -> None:
         super().prepare()
@@ -502,11 +565,14 @@ class TrtllmAttentionMetadata(AttentionMetadata):
 
         # number of tokens needed in the kv cache for each sequence after the next pass.
         if self.enable_helix:
-            # If helix is inactive, attend to the previously cached tokens only.
+            # Under Helix, each rank stores only the KV of the tokens it owns. The
+            # KV length therefore grows by the number of query tokens this rank
+            # owns this forward (1 for an active plain-decode rank, 0 for an
+            # inactive rank, or the owned subset for a multi-token spec verify).
             assert cached_token_lens is not None, "cached_token_lens should be set for helix"
-            active_rank = ~self.helix_is_inactive_rank_cpu[:self.num_seqs]
             kv_lens = cached_token_lens.clone()
-            kv_lens[active_rank] += self.seq_lens_kv[active_rank]
+            kv_lens += self.helix_num_active_tokens_cpu[:self.num_seqs].to(
+                kv_lens.dtype)
         else:
             kv_lens = cached_token_lens + \
                 self.seq_lens_kv if cached_token_lens is not None else self.seq_lens_kv
