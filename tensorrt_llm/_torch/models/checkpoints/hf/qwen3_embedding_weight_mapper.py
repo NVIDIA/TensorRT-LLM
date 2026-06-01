@@ -15,6 +15,7 @@ class Qwen3EmbeddingHfWeightMapper(HfWeightMapper):
     """
 
     def filter_weights(self, prefix: str, weights: dict) -> dict:
+        """Filter weights with fallback to unprefixed keys for Qwen3-Embedding checkpoints."""
         result = super().filter_weights(prefix, weights)
         if not result and prefix.startswith("model."):
             result = super().filter_weights(prefix[len("model.") :], weights)

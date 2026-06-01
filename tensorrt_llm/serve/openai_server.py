@@ -1404,7 +1404,14 @@ class OpenAIServer(_VideoRoutesMixin):
             texts = ([request.input]
                      if isinstance(request.input, str) else request.input)
 
-            output_name = os.environ["TRTLLM_EMBEDDING_OUTPUT_NAME"]
+            output_name = os.environ.get("TRTLLM_EMBEDDING_OUTPUT_NAME")
+            if output_name is None:
+                return self.create_error_response(
+                    message=
+                    "TRTLLM_EMBEDDING_OUTPUT_NAME environment variable must be set for embeddings",
+                    err_type="ConfigurationError",
+                    status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+                )
             sampling_params = SamplingParams(
                 max_tokens=1,
                 temperature=0.0,
