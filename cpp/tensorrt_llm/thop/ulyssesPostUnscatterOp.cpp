@@ -26,13 +26,19 @@ namespace torch_ext
 {
 
 // Post-Ulysses A2A unscatter: take Q/K/V tensors of shape [P, B, Sp, H, D]
-// (output of the head-dim -> seq-dim all-to-all) and produce SDPA-ready Q/K/V
-// in the layout selected by ``layout``:
-//   layout=0 → HND [B, H, P*Sp, D]  (VANILLA / torch SDPA)
-//   layout=1 → NHD [B, P*Sp, H, D]  (TRTLLM / FA4)
+// (output of the head-dim -> seq-dim all-to-all) and produce SDPA-ready Q/K/V.
+// The kernel ALWAYS writes NHD-contig storage [B, P*Sp, H, D]. The returned
+// tensor shape depends on ``layout``:
+//   layout=0 (HND) → returns transpose-view [B, H, P*Sp, D]
+//                    (HND-shape, NHD-stride, NON-contig — mirrors the
+//                    `q.transpose(1, 2)` result in the sync `_forward_unfused`
+//                    path, which lets cudnn SDPA preserve NHD-stride through
+//                    its output and collapses the downstream
+//                    `_output_a2a.transpose(1, 2).contiguous()` to a no-op)
+//   layout=1 (NHD) → returns storage as-is [B, P*Sp, H, D] (NHD contig)
 // Replaces the eager chain
 //     t.permute(1, 0, 2, 3, 4).reshape(B, P * Sp, H, D).contiguous()           // NHD
-//     [.transpose(1, 2).contiguous()]                                          // HND extra step
+//     [.transpose(1, 2)]                                                       // HND: stride view only
 // for Q, K, V in one kernel launch.
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> ulysses_post_unscatter_qkv(
     torch::Tensor& q_in, // [P, B, Sp, H, D]
@@ -63,10 +69,11 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> ulysses_post_unscatter_q
 
     bool const is_hnd = (layout == 0);
     auto opts = q_in.options();
-    auto const out_shape = is_hnd ? std::vector<int64_t>{B, H, P * Sp, D} : std::vector<int64_t>{B, P * Sp, H, D};
-    auto q_out = torch::empty(out_shape, opts);
-    auto k_out = torch::empty(out_shape, opts);
-    auto v_out = torch::empty(out_shape, opts);
+    // Always allocate NHD-contig storage [B, P*Sp, H, D].
+    auto const storage_shape = std::vector<int64_t>{B, P * Sp, H, D};
+    auto q_out = torch::empty(storage_shape, opts);
+    auto k_out = torch::empty(storage_shape, opts);
+    auto v_out = torch::empty(storage_shape, opts);
 
     // Empty-tensor no-op: P=0/B=0/Sp=0 produces zero grid extent in the
     // kernel launcher (undefined cuLaunchKernel behavior across CUDA versions).
@@ -74,14 +81,24 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> ulysses_post_unscatter_q
     // so returning them directly preserves the output-shape contract.
     if (q_in.numel() == 0)
     {
+        if (is_hnd)
+        {
+            return std::make_tuple(q_out.transpose(1, 2), k_out.transpose(1, 2), v_out.transpose(1, 2));
+        }
         return std::make_tuple(q_out, k_out, v_out);
     }
 
     auto stream = at::cuda::getCurrentCUDAStream();
     tensorrt_llm::kernels::launchUlyssesPostUnscatter(q_in.data_ptr(), k_in.data_ptr(), v_in.data_ptr(),
         q_out.data_ptr(), k_out.data_ptr(), v_out.data_ptr(), static_cast<int>(P), static_cast<int>(B),
-        static_cast<int>(Sp), static_cast<int>(H), static_cast<int>(D), is_hnd, stream);
+        static_cast<int>(Sp), static_cast<int>(H), static_cast<int>(D), stream);
 
+    // HND callers get a transpose-view of the NHD storage (zero-copy stride
+    // reinterpretation). NHD callers get the storage as-is.
+    if (is_hnd)
+    {
+        return std::make_tuple(q_out.transpose(1, 2), k_out.transpose(1, 2), v_out.transpose(1, 2));
+    }
     return std::make_tuple(q_out, k_out, v_out);
 }
 

@@ -12,14 +12,17 @@ import torch
 
 
 def torch_ref(q_5d, k_5d, v_5d, is_hnd):
-    """Eager reference: the permute+reshape+contiguous (+transpose+contig for HND)
-    chain that the kernel replaces."""
+    """Eager reference: the permute+reshape+contiguous chain the kernel replaces.
+    For HND the returned tensor is a transpose-view of NHD storage (HND-shape,
+    NHD-stride, non-contig) — matches the op's new behavior that preserves
+    NHD-stride into SDPA so the downstream `_output_a2a` transpose+contiguous
+    collapses to a no-op."""
 
     def post(t):
         P, B, Sp, H, D = t.shape
-        out = t.permute(1, 0, 2, 3, 4).reshape(B, P * Sp, H, D).contiguous()  # NHD
+        out = t.permute(1, 0, 2, 3, 4).reshape(B, P * Sp, H, D).contiguous()  # NHD storage
         if is_hnd:
-            return out.transpose(1, 2).contiguous()  # [B, H, P*Sp, D]
+            return out.transpose(1, 2)  # [B, H, P*Sp, D] view — NHD-stride
         return out  # [B, P*Sp, H, D]
 
     return post(q_5d), post(k_5d), post(v_5d)
@@ -45,9 +48,9 @@ def torch_ref(q_5d, k_5d, v_5d, is_hnd):
 @torch.inference_mode()
 def test_ulysses_post_unscatter_exact_match(P, B, Sp, H, D, layout):
     """The op is a pure data movement, so output must match the eager
-    permute+reshape+contiguous (+transpose+contig for HND) chain exactly
-    (max_diff == 0). Both HND (layout=0) and NHD (layout=1) outputs are
-    exercised."""
+    permute+reshape+contiguous chain exactly (max_diff == 0). HND output is
+    a transpose-view (HND-shape, NHD-stride, non-contig); NHD output is
+    contig. Both are exercised."""
     is_hnd = layout == 0
     torch.manual_seed(0)
     q = torch.randn(P, B, Sp, H, D, device="cuda", dtype=torch.bfloat16).contiguous()
@@ -59,7 +62,15 @@ def test_ulysses_post_unscatter_exact_match(P, B, Sp, H, D, layout):
 
     expected_shape = (B, H, P * Sp, D) if is_hnd else (B, P * Sp, H, D)
     assert q_out.shape == expected_shape
-    assert q_out.is_contiguous() and k_out.is_contiguous() and v_out.is_contiguous()
+    if is_hnd:
+        # HND-shape, NHD-stride transpose-view of NHD-contig storage. The
+        # underlying storage IS contig (in NHD layout), but the HND-labeled
+        # tensor is non-contig — this is intentional: cudnn SDPA preserves
+        # this NHD-stride to its output, collapsing _output_a2a's
+        # transpose+contiguous to a no-op.
+        assert not q_out.is_contiguous() and not k_out.is_contiguous() and not v_out.is_contiguous()
+    else:
+        assert q_out.is_contiguous() and k_out.is_contiguous() and v_out.is_contiguous()
     assert q_out.dtype == torch.bfloat16
     for name, ref, got in [("Q", q_ref, q_out), ("K", k_ref, k_out), ("V", v_ref, v_out)]:
         max_diff = (ref - got).abs().max().item()
