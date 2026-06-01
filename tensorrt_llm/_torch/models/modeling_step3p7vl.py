@@ -785,7 +785,7 @@ class Step3p7VLInputProcessor(BaseMultimodalInputProcessor):
         Delegates to the remote processor's ``get_num_image_tokens`` (which
         accounts for ``<patch_start>``/``<patch_end>``/``<patch_newline>`` per
         tile and ``<im_start>``/``<im_end>`` for the global features), so the
-        count matches the contiguous span produced by ``__call__``.
+        count matches the contiguous span produced by ``call_with_text_prompt``.
         """
         if isinstance(image, torch.Tensor):
             height, width = int(image.shape[-2]), int(image.shape[-1])
@@ -796,7 +796,7 @@ class Step3p7VLInputProcessor(BaseMultimodalInputProcessor):
     def get_mm_token_ids(self) -> Optional[torch.Tensor]:
         """Token ids forming one logical image unit (embed slots + framing).
 
-        ``__call__`` rewrites the ``<im_patch>`` placeholders to the OOV
+        ``call_with_text_prompt`` rewrites the ``<im_patch>`` placeholders to the OOV
         sentinel ``vocab_size + 1``, so the embed slots are matched by that
         sentinel rather than the original ``<im_patch>`` id. Returning the
         sentinel together with the framing tokens keeps the whole image span
@@ -818,7 +818,7 @@ class Step3p7VLInputProcessor(BaseMultimodalInputProcessor):
         return torch.tensor(self._mm_special_token_ids)
 
     @torch.inference_mode()
-    def __call__(
+    def call_with_text_prompt(
         self, inputs: TextPrompt, sampling_params: SamplingParams
     ) -> Tuple[List[int], Optional[ExtraProcessedInputs]]:
         text_prompt = inputs.get("prompt")

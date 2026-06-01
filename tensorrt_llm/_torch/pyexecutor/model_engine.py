@@ -849,12 +849,6 @@ class PyTorchModelEngine(ModelEngine):
         # is decode-only and runs into issues with autotuner warmup.
         if not self.mapping.has_cp_helix():
             self._run_autotuner_warmup(resource_manager)
-        # Pre-size cuda_graph_workspace to match the (already warmed-up)
-        # eager workspace so the C++ attention op does not call resize_()
-        # on it during CUDA graph capture. A resize_() within capture frees
-        # the tensor's old storage; any kernel launches captured before the
-        # resize then reference a dangling pointer and segfault on replay.
-        self._presize_attention_cuda_graph_workspace()
         with self.cuda_graph_runner.allow_capture():
             self._run_cuda_graph_warmup(resource_manager)
         if can_run_general_warmup:
@@ -931,36 +925,6 @@ class PyTorchModelEngine(ModelEngine):
                     f"OOM during general warmup with {num_tokens} tokens, "
                     f"{num_gen_tokens} generation tokens. Skipping.")
                 torch.cuda.empty_cache()
-
-    def _presize_attention_cuda_graph_workspace(self) -> None:
-        """Resize cuda_graph_workspace to be at least as large as workspace.
-
-        The TRTLLM C++ attention op resizes its workspace tensor in-place
-        when the requested size exceeds the current allocation. Inside a
-        CUDA graph capture this is fatal: ``Tensor.resize_`` frees the old
-        storage and allocates new memory, so kernel launches captured
-        before the resize hold a dangling pointer and segfault on replay.
-
-        ``workspace`` is sized via the general warmup that runs just before
-        this call, while ``cuda_graph_workspace`` is created at size 0 and
-        otherwise only grows on demand during CUDA graph warmup -- exactly
-        the unsafe window. Copying the warmed-up size across guarantees no
-        in-graph resize for the captures that follow.
-        """
-        attn_metadata = getattr(self, "attn_metadata", None)
-        if attn_metadata is None:
-            return
-        workspace = getattr(attn_metadata, "workspace", None)
-        cuda_graph_workspace = getattr(attn_metadata, "cuda_graph_workspace",
-                                       None)
-        if workspace is None or cuda_graph_workspace is None:
-            return
-        needed = workspace.numel()
-        if needed > 0 and cuda_graph_workspace.numel() < needed:
-            # workspace tensors are typically created under inference_mode,
-            # so resize_() needs the same context.
-            with torch.inference_mode():
-                cuda_graph_workspace.resize_((needed, ))
 
     def _run_autotuner_warmup(self, resource_manager: ResourceManager):
         """Runs a forward pass to populate the autotuner cache."""
