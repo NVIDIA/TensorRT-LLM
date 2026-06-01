@@ -40,8 +40,6 @@ environment:
   server_env_var: TRTLLM_SERVER_DISABLE_GC=1
 profiling:
   nsys_on: false
-accuracy:
-  enable_accuracy_test: false
 worker_config:
   gen:
     enable_layerwise_nvtx_marker: true
@@ -102,6 +100,8 @@ worker_config:
       enable_block_reuse: false
       free_gpu_memory_fraction: 0.85
       dtype: fp8
+    moe_config:
+      backend: CUTEDSL
     cache_transceiver_config:
       max_tokens_in_buffer: 8320
       backend: NIXL
