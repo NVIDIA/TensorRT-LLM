@@ -935,11 +935,6 @@ def create_py_executor(
             if estimating_kv_cache else ExecutorMemoryType.EXTRA_RESOURCES):
         # run gc.collect() to free memory of the previous py_executor, avoid cudaFree overlap with cuda graph capture
         gc.collect()
-        # Tell model_engine.warmup() to skip step (d) max-shape pre-population
-        # during the estimation pass - the pre-pop blocks are released by
-        # configure_kv_cache_capacity's empty_cache() before measurement
-        # anyway, and the estimation PyExecutor is torn down immediately
-        # after measurement. Production pass clears the flag below.
         model_engine.is_estimation_pass = estimating_kv_cache
         if draft_model_engine is not None:
             draft_model_engine.is_estimation_pass = estimating_kv_cache
@@ -1000,15 +995,6 @@ def create_py_executor(
 
         del py_executor  # free before constructing new
         gc.collect()
-        # teardown_managers() above released the first PyExecutor's live
-        # torch tensors (KV manager, sampler, scheduler state). Python
-        # references drop but PyTorch's caching allocator keeps the
-        # underlying cudaMalloc'd blocks in its free pool, and the second
-        # PyExecutor's step (a) empty_cache only reclaims blocks matching
-        # its own allocations - the rest stay parked across the entire
-        # second warmup. Release them to the driver before the production
-        # KV pool is allocated so non-torch allocators (cuBLAS, UCX/NIXL,
-        # NVSHMEM) see the headroom.
         torch.cuda.empty_cache()
 
         with allocation_scope(ExecutorMemoryType.KV_CACHE):

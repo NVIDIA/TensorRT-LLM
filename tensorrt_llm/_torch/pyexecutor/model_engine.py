@@ -473,13 +473,6 @@ class PyTorchModelEngine(ModelEngine):
             raise e
 
         self.is_warmup = False
-        # Set to True by py_executor_creator around the first (estimation-pass)
-        # PyExecutor's warmup; the production PyExecutor's warmup runs with this
-        # back to False. Read by warmup() to skip step (d) max-shape
-        # pre-population during estimation - those blocks have no payoff because
-        # configure_kv_cache_capacity drops them via empty_cache() before
-        # measuring, and the estimation PyExecutor is torn down immediately
-        # after measurement without ever serving a request.
         self.is_estimation_pass = False
         self.previous_request_ids = []
         self.has_previous_device_draft = False
@@ -968,9 +961,7 @@ class PyTorchModelEngine(ModelEngine):
         # is decode-only and runs into issues with autotuner warmup.
         if not self.mapping.has_cp_helix():
             self._run_autotuner_warmup(resource_manager)
-            # Release the autotuner's exploration-mode intermediates. Each
-            # tunable op site allocates buffers per candidate tactic but only
-            # the cached best tactic is replayed during serving, so the
+            # Release the autotuner's exploration-mode intermediates. The
             # exploration leftovers are pure waste that hide tens of GiB from
             # non-torch allocators (cuBLAS handle workspace, UCX/NIXL,
             # NVSHMEM).
