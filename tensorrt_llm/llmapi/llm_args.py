@@ -607,17 +607,17 @@ class SkipSoftmaxAttentionConfig(BaseSparseAttentionConfig):
                 self.threshold_scale_factor, 'decode'),
         )
 
-    def resolve_for_target_sparsity(
-            self, formula: dict) -> 'SkipSoftmaxAttentionConfig':
-        """Compute threshold_scale_factor from formula coefficients and target_sparsity.
+    def resolve_from_ckpt_config(
+            self, threshold_scale_factor_config: dict
+    ) -> 'SkipSoftmaxAttentionConfig':
+        """Compute ``threshold_scale_factor`` from ``target_sparsity``.
 
-        ``formula`` is the ``threshold_scale_factor`` block from the
-        model's HF ``config.json``. It carries per-phase coefficient
-        dictionaries under ``prefill`` / ``decode`` and an optional
-        shared ``formula`` string describing the functional form. The
-        runtime evaluates that string verbatim (via numexpr), so any
-        formula the checkpoint chooses to ship is honored without
-        changes here.
+        ``threshold_scale_factor_config`` is the ``threshold_scale_factor``
+        block from the model's HF ``config.json``. It carries per-phase
+        coefficient dictionaries under ``prefill`` / ``decode`` and a shared
+        ``formula`` string describing the functional form. The runtime
+        evaluates that string verbatim (via numexpr), so any formula the
+        checkpoint ships is honored without changes here.
 
         Example::
 
@@ -625,13 +625,8 @@ class SkipSoftmaxAttentionConfig(BaseSparseAttentionConfig):
              "prefill": {"a": 7e-5, "b": 7.929109},
              "decode":  {"a": 7e-5, "b": 16.9025}}
 
-        If ``formula`` is omitted, the canonical exponential form is
-        synthesized from the coefficient names (``{a, b}`` →
-        ``a * exp(b * target_sparsity)``; ``{log_a, b}`` →
-        ``exp(log_a + b * target_sparsity)``).
-
-        If ``threshold_scale_factor`` is already set, this method
-        returns ``self`` unchanged.
+        If ``threshold_scale_factor`` is already set, it wins and the
+        calibration formula is ignored, so this returns ``self`` unchanged.
         """
         if self.threshold_scale_factor is not None:
             return self
@@ -639,14 +634,15 @@ class SkipSoftmaxAttentionConfig(BaseSparseAttentionConfig):
         from tensorrt_llm._torch.attention_backend.sparse.skip_softmax import \
             parse_skip_softmax_formula_from_dict
 
-        shared_formula = formula.get("formula") if isinstance(formula,
-                                                              dict) else None
+        shared_formula = threshold_scale_factor_config.get("formula") \
+            if isinstance(threshold_scale_factor_config, dict) else None
 
         def _compute(phase: str, sparsity: Optional[float]) -> Optional[float]:
             if sparsity is None:
                 return None
             phase_formula = parse_skip_softmax_formula_from_dict(
-                formula.get(phase), formula=shared_formula)
+                threshold_scale_factor_config.get(phase),
+                formula=shared_formula)
             if phase_formula is None:
                 raise ValueError(
                     f"SkipSoftmaxAttentionConfig: config.json must carry a "

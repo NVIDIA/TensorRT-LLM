@@ -529,7 +529,9 @@ class Attention(nn.Module):
         self.quant_config = config.get_quant_config()
         self.attn_backend = config.attn_backend
 
-        # Resolve target_sparsity → threshold_scale_factor if needed
+        # ``target_sparsity`` is resolved to a ``threshold_scale_factor`` via
+        # the checkpoint's calibration formula. A directly-set
+        # ``threshold_scale_factor`` wins and skips this resolution.
         sparse_attn_cfg = config.sparse_attention_config
         if (isinstance(sparse_attn_cfg, SkipSoftmaxAttentionConfig)
                 and sparse_attn_cfg.target_sparsity is not None):
@@ -542,9 +544,10 @@ class Attention(nn.Module):
                     "(sparse_attention_config.threshold_scale_factor.{prefill,decode}.{a,b}), "
                     "but sparse_attention_config was not found or was not dict type in config.json."
                 )
-            formula = hf_sparse.get('threshold_scale_factor', {})
-            sparse_attn_cfg = sparse_attn_cfg.resolve_for_target_sparsity(
-                formula)
+            threshold_scale_factor_config = hf_sparse.get(
+                'threshold_scale_factor', {})
+            sparse_attn_cfg = sparse_attn_cfg.resolve_from_ckpt_config(
+                threshold_scale_factor_config)
 
         attn_cls = get_attention_backend(self.attn_backend,
                                          sparse_attn_config=sparse_attn_cfg)

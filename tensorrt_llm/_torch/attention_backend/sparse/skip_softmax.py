@@ -150,13 +150,15 @@ def parse_skip_softmax_formula_from_ckpt_config(
 
 @dataclass
 class SkipSoftmaxKernelParams:
-    """Skip-softmax parameters consumed directly by the attention backend.
+    """Skip-softmax thresholds for the attention backend.
 
-    The LLM and visual-gen ``SkipSoftmaxAttentionConfig`` classes resolve
-    to this via ``to_kernel_params()``.
+    The LLM and visual-generation ``SkipSoftmaxAttentionConfig`` classes
+    produce this via ``to_kernel_params()``.
     """
 
-    threshold_scale_factor_prefill: float
-    # Decode phase only applies to autoregressive (LLM) pipelines;
-    # diffusion / visual generation has no decode phase and leaves it 0.
+    # The kernel divides this by the context length to get the skip threshold;
+    # zero turns skip-softmax off.
+    threshold_scale_factor_prefill: float = 0.0
+    # Only autoregressive (LLM) decoding has a decode phase; diffusion and
+    # visual generation leave this at zero.
     threshold_scale_factor_decode: float = 0.0

@@ -21,9 +21,10 @@ from ..utils import (compute_swizzled_sf_shape, get_global_attrs,
                      get_model_extra_attrs)
 from .interface import (AttentionBackend, AttentionForwardArgs,
                         AttentionInputType, AttentionMask, AttentionMetadata,
-                        AttentionSparseArgs, KVCacheParams, MLAParams,
-                        PositionalEmbeddingParams, PredefinedAttentionMask,
-                        RopeParams, merge_attention_forward_args)
+                        KVCacheParams, MLAParams, PositionalEmbeddingParams,
+                        PredefinedAttentionMask, RopeParams, SparsePrediction,
+                        merge_attention_forward_args)
+from .sparse.skip_softmax import SkipSoftmaxKernelParams
 
 # Enable TRTLLM-Gen attention backend by default. Set
 # TRTLLM_ENABLE_TRTLLM_GEN_ATTENTION=0 to force the thop.attention path.
@@ -1406,24 +1407,12 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         return self.rope_params.original_max_positions
 
     @property
-    def skip_softmax_threshold_scale_factor_prefill(self) -> Optional[float]:
-        """Prefill skip-softmax threshold; ``None`` unless the config is a
-        skip-softmax config."""
-        if getattr(self.sparse_attention_config, 'algorithm',
-                   None) == 'skip_softmax':
-            return self.sparse_attention_config.to_kernel_params(
-            ).threshold_scale_factor_prefill
-        return None
-
-    @property
-    def skip_softmax_threshold_scale_factor_decode(self) -> Optional[float]:
-        """Decode skip-softmax threshold; ``None`` unless the config is a
-        skip-softmax config."""
-        if getattr(self.sparse_attention_config, 'algorithm',
-                   None) == 'skip_softmax':
-            return self.sparse_attention_config.to_kernel_params(
-            ).threshold_scale_factor_decode
-        return None
+    def _skip_softmax_kernel_params(self) -> Optional[SkipSoftmaxKernelParams]:
+        """Skip-softmax kernel params from the config, or ``None`` otherwise."""
+        cfg = self.sparse_attention_config
+        if getattr(cfg, 'algorithm', None) != 'skip_softmax':
+            return None
+        return cfg.to_kernel_params()
 
     def _get_trtllm_gen_backend(
             self) -> trtllm_gen.FlashInferTrtllmGenAttention:
@@ -1460,7 +1449,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                 assert k.shape[0] == num_tokens
                 assert v.shape[0] == num_tokens
         else:
-            is_sparse_attn = forward_args.sparse.sparse_attn_indices is not None and forward_args.sparse.sparse_attn_indices.numel(
+            is_sparse_attn = forward_args.sparse_prediction.sparse_attn_indices is not None and forward_args.sparse_prediction.sparse_attn_indices.numel(
             ) > 0
             if attention_input_type == AttentionInputType.context_only and is_sparse_attn:
                 assert forward_args.is_fused_qkv
@@ -1674,18 +1663,22 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                 v_head_dim=self.v_head_dim,
                 rope_append=self.rope_append,
                 attention_chunk_size=self.attention_chunk_size,
-                skip_softmax_threshold_scale_factor_prefill=self.
-                skip_softmax_threshold_scale_factor_prefill,
-                skip_softmax_threshold_scale_factor_decode=self.
-                skip_softmax_threshold_scale_factor_decode,
+                skip_softmax_threshold_scale_factor_prefill=forward_args.
+                skip_softmax_kernel_params.threshold_scale_factor_prefill,
+                skip_softmax_threshold_scale_factor_decode=forward_args.
+                skip_softmax_kernel_params.threshold_scale_factor_decode,
                 skip_softmax_stat=self.skip_softmax_stat,
 
-                # --- Sparse-specific (AttentionForwardArgs.sparse) ---
-                sparse_kv_indices=forward_args.sparse.sparse_kv_indices,
-                sparse_kv_offsets=forward_args.sparse.sparse_kv_offsets,
-                sparse_attn_indices=forward_args.sparse.sparse_attn_indices,
-                sparse_attn_offsets=forward_args.sparse.sparse_attn_offsets,
-                sparse_attn_indices_block_size=forward_args.sparse.
+                # --- Sparse-specific (AttentionForwardArgs.sparse_prediction) ---
+                sparse_kv_indices=forward_args.sparse_prediction.
+                sparse_kv_indices,
+                sparse_kv_offsets=forward_args.sparse_prediction.
+                sparse_kv_offsets,
+                sparse_attn_indices=forward_args.sparse_prediction.
+                sparse_attn_indices,
+                sparse_attn_offsets=forward_args.sparse_prediction.
+                sparse_attn_offsets,
+                sparse_attn_indices_block_size=forward_args.sparse_prediction.
                 sparse_attn_indices_block_size,
 
                 # --- Literals intentionally None (see _THOP_LITERALS) ---
@@ -1757,19 +1750,16 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                 and v is None) or (not forward_args.is_fused_qkv
                                    and k is not None and v is not None)
 
-        # Skip-softmax configs contribute nothing here — their thresholds
-        # are read via the ``skip_softmax_threshold_scale_factor_*``
-        # @property accessors directly on ``self``. The framework-level
-        # algorithms (RocketKV / DSA) run prediction to produce the sparse
-        # KV / attention indices.
-        if (self.sparse_attention_config is not None and getattr(
-                self.sparse_attention_config, 'algorithm', None)
-                != 'skip_softmax'):
+        # RocketKV and DSA predict which blocks to keep, so build their sparse
+        # index tensors here. Skip-softmax needs no prediction; its thresholds
+        # are filled in below.
+        algorithm = getattr(self.sparse_attention_config, 'algorithm', None)
+        if algorithm is not None and algorithm != 'skip_softmax':
             kv_idx, kv_off = self.sparse_kv_predict(q, k, metadata,
                                                     forward_args)
             at_idx, at_off = self.sparse_attn_predict(q, k, metadata,
                                                       forward_args)
-            forward_args.sparse = AttentionSparseArgs(
+            forward_args.sparse_prediction = SparsePrediction(
                 sparse_kv_indices=kv_idx,
                 sparse_kv_offsets=kv_off,
                 sparse_attn_indices=at_idx,
@@ -1777,6 +1767,12 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                 sparse_attn_indices_block_size=self.sparse_attention_config.
                 get_indices_block_size(),
             )
+
+        # Resolve skip-softmax thresholds from the config. Any per-step
+        # adjustment would go here.
+        config_params = self._skip_softmax_kernel_params
+        if config_params is not None:
+            forward_args.skip_softmax_kernel_params = config_params
 
         # Compute FlashMLA tile-scheduler metadata once per forward pass.
         # The flag is reset in prepare_flash_mla() and update_for_spec_dec() to trigger
