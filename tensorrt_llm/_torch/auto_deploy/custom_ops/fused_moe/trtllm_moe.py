@@ -218,7 +218,6 @@ def _run_moe_with_alltoall(
     use_deepseek_fp8_block_scale: bool = False,
     finegrained_fp8_block_scales: Tuple[torch.Tensor, torch.Tensor] | None = None,
     is_gated_mlp: bool = True,
-    batch_info_host: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """
     Execute MoE with all-to-all dispatch/combine pattern.
@@ -262,10 +261,6 @@ def _run_moe_with_alltoall(
             ``use_deepseek_fp8_block_scale`` internally.
         is_gated_mlp: Whether gated MLP is used. Needed by the Blackwell finegrained
             FP8 path to compute ``intermediate_size``.
-        batch_info_host: Pinned-host int tensor managed by ``BatchInfo``. When
-            provided, slot 13 is read at capture time as ``runtime_max_tokens_per_rank``
-            (the cross-rank max of ``total_num_tokens``, computed pre-forward by the
-            AD shim via ``tp_allgather``). When ``None``, falls back to ``max_num_tokens``.
 
     Returns:
         2-D output tensor ``(num_tokens, hidden_size)`` — the caller reshapes to the
@@ -279,8 +274,7 @@ def _run_moe_with_alltoall(
     global_num_experts = local_num_experts * mapping.moe_ep_size
 
     # Hybrid per-rank token budget: tight (= local count) under capture, static under eager.
-    # See _hybrid_runtime_max_tokens_per_rank. batch_info_host (slot 13) is no longer read
-    # here -- the capture path uses the sync-free local shape instead.
+    # See _hybrid_runtime_max_tokens_per_rank.
     local_num_tokens = x.shape[0]
     runtime_max_tokens_per_rank = _hybrid_runtime_max_tokens_per_rank(
         local_num_tokens, mapping.moe_ep_size, max_num_tokens
@@ -437,7 +431,6 @@ def _run_trtllm_gen_nvfp4_moe_with_alltoall(
     mapping: Mapping,
     max_num_tokens: int,
     act_type: int,
-    batch_info_host: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Run TRTLLM-Gen NVFP4 MoE through the all-to-all dispatch/combine path."""
 
@@ -533,7 +526,6 @@ def trtllm_moe_fused(
     mapping_config: str = "",
     max_num_tokens: int = 0,
     apply_routing_on_input: bool = False,
-    batch_info_host: torch.Tensor | None = None,
 ) -> torch.Tensor:
     x_shape = x.shape
     x = x.view(-1, x_shape[-1])
@@ -579,7 +571,6 @@ def trtllm_moe_fused(
             activation_type=activation_type,
             mapping=mapping,
             max_num_tokens=max_num_tokens,
-            batch_info_host=batch_info_host,
         ).view(x_shape)
 
     # EP WITH ALL-REDUCE PATH: Expert IDs are in LOCAL coordinates (from sharding.py),
@@ -610,7 +601,6 @@ def trtllm_moe_fused_fake(
     mapping_config: str = "",
     max_num_tokens: int = 0,
     apply_routing_on_input: bool = False,
-    batch_info_host: torch.Tensor | None = None,
 ) -> torch.Tensor:
     return torch.empty_like(x)
 
@@ -650,7 +640,6 @@ def trtllm_quant_fp8_moe_fused(
     mapping_config: str = "",
     max_num_tokens: int = 0,
     apply_routing_on_input: bool = False,
-    batch_info_host: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """TensorRT-LLM Cutlass FP8 (W8A8) MoE for gated and non-gated MLP.
 
@@ -728,7 +717,6 @@ def trtllm_quant_fp8_moe_fused(
             activation_type=act_fn,
             mapping=mapping,
             max_num_tokens=max_num_tokens,
-            batch_info_host=batch_info_host,
         ).view(x_shape)
 
     # EP WITH ALL-REDUCE PATH: Expert IDs are in LOCAL coordinates.
@@ -766,7 +754,6 @@ def trtllm_quant_fp8_moe_fused_fake(
     mapping_config: str = "",
     max_num_tokens: int = 0,
     apply_routing_on_input: bool = False,
-    batch_info_host: torch.Tensor | None = None,
 ) -> torch.Tensor:
     _validate_mlp_style_and_act_fn(is_gated_mlp, act_fn)
     return torch.empty_like(x)
@@ -790,7 +777,6 @@ def trtllm_quant_nvfp4_moe_fused(
     mapping_config: str = "",
     max_num_tokens: int = 0,
     apply_routing_on_input: bool = False,
-    batch_info_host: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """TensorRT-LLM Cutlass NVFP4 W8A8 MoE for gated and non-gated MLP.
 
@@ -860,7 +846,6 @@ def trtllm_quant_nvfp4_moe_fused(
             mapping=mapping,
             max_num_tokens=max_num_tokens,
             nvfp4_act_global_scale=fc1_act_global_scale,
-            batch_info_host=batch_info_host,
         ).view(x.shape)
 
     # EP WITH ALL-REDUCE PATH: Expert IDs are in LOCAL coordinates.
@@ -907,7 +892,6 @@ def trtllm_quant_nvfp4_moe_fused_fake(
     mapping_config: str = "",
     max_num_tokens: int = 0,
     apply_routing_on_input: bool = False,
-    batch_info_host: torch.Tensor | None = None,
 ) -> torch.Tensor:
     return torch.empty_like(x)
 
@@ -926,7 +910,6 @@ def trtllm_quant_finegrained_fp8_moe_fused(
     mapping_config: str = "",
     max_num_tokens: int = 0,
     apply_routing_on_input: bool = False,
-    batch_info_host: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """TensorRT-LLM Cutlass FP8 Block Scale MoE for FineGrainedFP8 format.
 
@@ -989,7 +972,6 @@ def trtllm_quant_finegrained_fp8_moe_fused(
             max_num_tokens=max_num_tokens,
             finegrained_fp8_block_scales=(fc1_weight_scale, fc2_weight_scale),
             is_gated_mlp=is_gated_mlp,
-            batch_info_host=batch_info_host,
         ).view(x_shape)
 
     # EP WITH ALL-REDUCE PATH: Expert IDs are in LOCAL coordinates (from sharding.py),
@@ -1076,7 +1058,6 @@ def trtllm_quant_finegrained_fp8_moe_fused_fake(
     mapping_config: str = "",
     max_num_tokens: int = 0,
     apply_routing_on_input: bool = False,
-    batch_info_host: torch.Tensor | None = None,
 ) -> torch.Tensor:
     _validate_mlp_style_and_act_fn(is_gated_mlp, act_fn)
     return torch.empty_like(x)
@@ -1105,7 +1086,6 @@ def _trtllm_nvfp4_trtllm_gen_moe_impl(
     mapping_config: str = "",
     max_num_tokens: int = 0,
     apply_routing_on_input: bool = False,
-    batch_info_host: torch.Tensor | None = None,
 ) -> torch.Tensor:
     _validate_mlp_style_and_act_fn(is_gated_mlp, act_fn)
     if act_fn in (ActivationType.Gelu, ActivationType.Geglu):
@@ -1182,7 +1162,6 @@ def _trtllm_nvfp4_trtllm_gen_moe_impl(
             mapping=mapping,
             max_num_tokens=max_num_tokens,
             act_type=act_type,
-            batch_info_host=batch_info_host,
         )
         if final_hidden_states.shape[1] > x_shape[-1]:
             final_hidden_states = final_hidden_states[:, : x_shape[-1]].contiguous()
@@ -1255,7 +1234,6 @@ def trtllm_nvfp4_trtllm_gen_moe_fused(
     mapping_config: str = "",
     max_num_tokens: int = 0,
     apply_routing_on_input: bool = False,
-    batch_info_host: torch.Tensor | None = None,
 ) -> torch.Tensor:
     return _trtllm_nvfp4_trtllm_gen_moe_impl(
         x,
@@ -1280,7 +1258,6 @@ def trtllm_nvfp4_trtllm_gen_moe_fused(
         mapping_config=mapping_config,
         max_num_tokens=max_num_tokens,
         apply_routing_on_input=apply_routing_on_input,
-        batch_info_host=batch_info_host,
     )
 
 
@@ -1308,6 +1285,5 @@ def trtllm_nvfp4_trtllm_gen_moe_fused_fake(
     mapping_config: str = "",
     max_num_tokens: int = 0,
     apply_routing_on_input: bool = False,
-    batch_info_host: torch.Tensor | None = None,
 ) -> torch.Tensor:
     return torch.empty_like(x)
