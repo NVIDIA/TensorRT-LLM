@@ -8,7 +8,7 @@ import tensorrt_llm.bindings
 from tensorrt_llm._torch.shared_tensor import SharedTensorContainer
 from tensorrt_llm._utils import prefer_pinned
 from tensorrt_llm.bindings import executor as tllm_executor
-from tensorrt_llm.executor.result import TokenLogprobs
+from tensorrt_llm.executor.result import SimpleTokenLogprobs, TokenLogprobs
 from tensorrt_llm.sampling_params import LogprobMode
 
 SamplingConfig = tensorrt_llm.bindings.SamplingConfig
@@ -213,19 +213,21 @@ class LogitsStorage:
 
 class LogProbStorage:
     beam_width: int = -1
-    log_probs: list[TokenLogprobs]
+    log_probs: list[TokenLogprobs] | list[SimpleTokenLogprobs]
     cum_log_probs: list[float]
 
-    def _init(self, first_input: list[TokenLogprobs]):
+    def _init(self, first_input: list[TokenLogprobs]
+              | list[SimpleTokenLogprobs]):
         self.beam_width = len(first_input)
         self.log_probs = [[] for _ in range(self.beam_width)]
         self.cum_log_probs = [0 for _ in range(self.beam_width)]
 
     def append(self,
-               new_probs: list[TokenLogprobs],
+               new_probs: list[TokenLogprobs] | list[SimpleTokenLogprobs],
                cum_log_probs: Optional[list[float]] = None):
         """
-        new_probs: [beam_width, num_tokens]
+        new_probs: [beam_width, num_tokens]; per-token entry is either a
+            ``dict[int, Logprob]`` (default) or a ``float`` (simple format).
         cum_log_probs: [beam_width]
         """
         if self.beam_width == -1:
@@ -236,14 +238,19 @@ class LogProbStorage:
             self.log_probs[beam_idx].extend(probs)
             if cum_log_probs is not None:
                 self.cum_log_probs[beam_idx] = cum_log_probs[beam_idx]
-            else:
-                # FIXME: This relies on the ordering of LogProb's in the dictionary. TorchSampler ensures
-                #        that the sampled logprob is in the first position.
-                self.cum_log_probs[beam_idx] += sum(
-                    next(iter(prob.values())).logprob for prob in probs)
+            elif probs:
+                if isinstance(probs[0], dict):
+                    # FIXME: This relies on the ordering of LogProb's in the dictionary.
+                    #        TorchSampler ensures that the sampled logprob is in the
+                    #        first position.
+                    self.cum_log_probs[beam_idx] += sum(
+                        next(iter(prob.values())).logprob for prob in probs)
+                else:
+                    # Simple format: probs is SimpleTokenLogprobs (list[float]).
+                    self.cum_log_probs[beam_idx] += sum(probs)
 
-    def set_log_probs(self, log_probs: list[TokenLogprobs],
-                      cum_log_probs: list[float]):
+    def set_log_probs(self, log_probs: list[TokenLogprobs]
+                      | list[SimpleTokenLogprobs], cum_log_probs: list[float]):
         """
         Reset the storage and refill it with new values
         log_probs: [beam_width, num_tokens]
@@ -268,7 +275,7 @@ class PyResult:
         exclude_last_generation_logits: bool | None = None
         context_logits_list: list[torch.Tensor] = field(default_factory=list)
         generation_logits_list: list[torch.Tensor] = field(default_factory=list)
-        reset_log_probs: tuple[list[TokenLogprobs],
+        reset_log_probs: tuple[list[TokenLogprobs] | list[SimpleTokenLogprobs],
                                list[float] | None] | None = None
         mm_embeddings: list[dict[str, Any] | None] = None
         mrope_position_ids: dict[str, Any] | None = None
@@ -377,7 +384,8 @@ class PyResult:
             self.diff.generation_logits_list.append(generation_logits)
 
     def append_log_probs(self,
-                         log_probs: list[TokenLogprobs],
+                         log_probs: list[TokenLogprobs]
+                         | list[SimpleTokenLogprobs],
                          cum_log_probs: Optional[list[float]] = None):
         if self._log_probs:
             self._log_probs.append(log_probs, cum_log_probs)
@@ -435,8 +443,8 @@ class PyResult:
         self.diff.additional_generation_outputs_list.append(
             (name, self._additional_generation_outputs[name][-1]))
 
-    def set_log_probs(self, log_probs: list[TokenLogprobs],
-                      cum_log_probs: list[float]):
+    def set_log_probs(self, log_probs: list[TokenLogprobs]
+                      | list[SimpleTokenLogprobs], cum_log_probs: list[float]):
         """
         Set log_probs and cum_log_probs to the new values
         log_probs: [beam_width, num_tokens]
@@ -484,7 +492,8 @@ class PyResult:
         return storage.transpose(0, 1)
 
     @property
-    def log_probs(self) -> list[TokenLogprobs] | None:
+    def log_probs(
+            self) -> list[TokenLogprobs] | list[SimpleTokenLogprobs] | None:
         if not self._log_probs or not hasattr(self._log_probs, 'log_probs'):
             return None
         return self._log_probs.log_probs
@@ -626,6 +635,7 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
             use_chunked_generation_logits: bool = True,
             logits_chunk_size: int = 8,
             logprobs_mode: LogprobMode = LogprobMode.RAW,
+            logprobs_simple_format: bool = False,
             **kwargs):
         self.py_sampling_strategy: "Strategy | None" = None
 
@@ -683,6 +693,7 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
 
         self.py_num_logprobs = num_logprobs
         self.py_return_log_probs = return_log_probs
+        self.py_logprobs_simple_format = logprobs_simple_format
         self.py_return_context_logits = return_context_logits
         self.py_return_generation_logits = return_generation_logits
         self.py_return_logits_device_memory = return_logits_device_memory
@@ -1046,6 +1057,8 @@ def executor_request_to_llm_request(
         agent_hierarchy=agent_hierarchy,
         logprobs_mode=getattr(executor_request, "py_logprobs_mode",
                               LogprobMode.RAW),
+        logprobs_simple_format=getattr(executor_request,
+                                       "py_logprobs_simple_format", False),
     )
 
     llm_request.py_original_end_id = getattr(executor_request,

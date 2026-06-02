@@ -43,12 +43,12 @@ class TestConstruction:
     def test_no_args_constructs(self):
         loader = MXCheckpointLoader()
         assert loader.mx_server_url is None
-        assert loader.p2p_succeeded is False
+        assert loader.is_weights_preloaded() is False
 
     def test_mx_server_url_stored(self):
         loader = MXCheckpointLoader(mx_server_url="http://mx:8001")
         assert loader.mx_server_url == "http://mx:8001"
-        assert loader.p2p_succeeded is False
+        assert loader.is_weights_preloaded() is False
 
     def test_query_timeout_stored(self):
         loader = MXCheckpointLoader(mx_server_url="http://mx:8001", query_timeout_s=900)
@@ -72,9 +72,9 @@ class TestConstruction:
         loader = MXCheckpointLoader()
         assert loader._checkpoint_format == "MX"
 
-    def test_p2p_succeeded_property_initial(self):
+    def test_is_weights_preloaded_initial(self):
         loader = MXCheckpointLoader()
-        assert loader.p2p_succeeded is False
+        assert loader.is_weights_preloaded() is False
 
 
 # ---------------------------------------------------------------------------
@@ -123,7 +123,7 @@ class TestLoadWeightsFallback:
     """Disk-fallback paths that should not touch the upstream MX library.
 
     All four fallback triggers share the same observable contract:
-    ``p2p_succeeded`` stays False, the parent ``HfCheckpointLoader.
+    ``is_weights_preloaded()`` stays False, the parent ``HfCheckpointLoader.
     load_weights`` is invoked exactly once, and its return value is
     propagated unchanged. We parameterize the trigger to keep that
     contract in one place.
@@ -157,6 +157,12 @@ class TestLoadWeightsFallback:
             ("modelexpress_not_installed", _modelexpress_unavailable),
             ("upstream_raises", _upstream_raises),
         ],
+        ids=[
+            "no-mx-server-url",
+            "no-model-kwarg",
+            "modelexpress-not-installed",
+            "upstream-raises",
+        ],
     )
     def test_falls_back_to_disk(self, trigger_id, setup):
         sentinel = {"disk-load": "result"}
@@ -172,8 +178,8 @@ class TestLoadWeightsFallback:
             f"trigger={trigger_id}: production code must propagate the "
             "parent loader's return value unchanged"
         )
-        assert loader.p2p_succeeded is False, (
-            f"trigger={trigger_id}: p2p_succeeded must stay False on any fallback path"
+        assert loader.is_weights_preloaded() is False, (
+            f"trigger={trigger_id}: is_weights_preloaded() must stay False on any fallback path"
         )
         mock_super_load.assert_called_once()
 
@@ -186,8 +192,9 @@ class TestLoadWeightsFallback:
 class TestLoadWeightsMxPath:
     def test_p2p_full_success_returns_empty_dict(self):
         # Empty fallback dict means MX delivered all weights into model
-        # params; ``ModelLoader`` interprets the empty dict + p2p_succeeded
-        # flag as "skip the standard weight-mapping pipeline".
+        # params; ``ModelLoader`` interprets the empty dict + the
+        # ``is_weights_preloaded()`` signal as "skip the standard
+        # weight-mapping pipeline".
         loader = MXCheckpointLoader(mx_server_url="http://mx:8001")
         fake_mx = _build_fake_modelexpress(load_weights_return={})
         mapping = MagicMock(name="mapping")
@@ -197,7 +204,7 @@ class TestLoadWeightsMxPath:
             result = loader.load_weights("/nonexistent", mapping=mapping, model=model)
 
         assert result == {}
-        assert loader.p2p_succeeded is True
+        assert loader.is_weights_preloaded() is True
 
         # Verify the integration contract with the upstream library:
         # 1. Constructed MxLiveWeightLoader with our mx_server_url.
@@ -224,7 +231,7 @@ class TestLoadWeightsMxPath:
         ):
             result = loader.load_weights("/nonexistent", mapping=MagicMock(), model=MagicMock())
 
-        assert loader.p2p_succeeded is True
+        assert loader.is_weights_preloaded() is True
         assert result is fallback
         mock_super_load.assert_not_called()
 
@@ -515,6 +522,16 @@ class TestNormalizeModelIdentity:
             ("home_expansion", "~/models/my-model", "my-model"),
             # Empty / sentinel.
             ("empty", "", "unknown"),
+        ],
+        ids=[
+            "bare-name",
+            "hub-id",
+            "nested-hub-id",
+            "abs-path-simple",
+            "abs-path-nested",
+            "dot-relative",
+            "home-expansion",
+            "empty",
         ],
     )
     def test_basic_cases(self, label, value, expected):

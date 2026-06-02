@@ -17,6 +17,7 @@
 # limitations under the License.
 
 import functools
+import os
 
 import torch
 import torch.nn.functional as F
@@ -44,6 +45,29 @@ from .ssd_state_passing import _state_passing_fwd
 # `_plan_tmem_offsets`). Otherwise we fall back to the Triton reference kernels.
 _FLASHINFER_SSD_VALID_M_MODES = (64, 128)
 _FLASHINFER_SSD_VALID_HEAD_DIMS = (64, 128)
+_USE_FLASHINFER_SSD_ENV = "TRTLLM_USE_MAMBA_FI_SSD"
+
+
+def _use_flashinfer_ssd():
+    # Default is to use Triton SSD prefill.
+    env_value = os.environ.get(_USE_FLASHINFER_SSD_ENV, "0")
+    if env_value == "0":
+        logger.info_once(
+            f"FlashInfer SSD disabled by {_USE_FLASHINFER_SSD_ENV}=0; "
+            "using Triton SSD prefill",
+            key="mamba_fi_ssd_disabled",
+        )
+        return False
+    elif env_value == "1":
+        logger.info_once(
+            f"FlashInfer SSD enabled by {_USE_FLASHINFER_SSD_ENV}=1; "
+            "using FlashInfer SSD prefill",
+            key="mamba_fi_ssd_enabled",
+        )
+        return True
+    else:
+        raise ValueError(
+            f"Invalid value for {_USE_FLASHINFER_SSD_ENV}: {env_value}")
 
 
 def _flashinfer_ssd_supported(chunk_size, dstate, headdim):
@@ -445,16 +469,9 @@ def mamba_chunk_scan_combined(
     # FlashInfer fused CUTLASS kernel on Blackwell (SM100+); both varlen and
     # non-varlen route here based on cu_seqlens. Falls back to Triton when the
     # MMA tile constraints on (chunk_size, dstate, headdim) aren't met.
-    #
-    # DISABLED: The FlashInfer SSD kernel hardcodes state_dtype=bf16 while the
-    # Triton path accumulates in fp32 (states_in_fp32=True), causing silent
-    # precision loss during prefill.
-    # TODO: Re-enable once _get_flashinfer_ssd_kernel uses state_dtype=float32.
-    _USE_FLASHINFER_SSD_PREFILL = False
     dstate = B.shape[-1]
     headdim = x.shape[-1]
-    flashinfer_eligible = (_USE_FLASHINFER_SSD_PREFILL and z is None
-                           and is_sm_100f())
+    flashinfer_eligible = z is None and is_sm_100f() and _use_flashinfer_ssd()
     if flashinfer_eligible and _flashinfer_ssd_supported(
             chunk_size, dstate, headdim):
         return _mamba_chunk_scan_flashinfer_fwd(

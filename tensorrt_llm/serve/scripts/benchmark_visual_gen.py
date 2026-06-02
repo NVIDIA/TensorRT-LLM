@@ -35,6 +35,7 @@ import argparse
 import asyncio
 import gc
 import json
+import math
 import os
 import random
 import sys
@@ -58,6 +59,11 @@ from tensorrt_llm.bench.benchmark.visual_gen_utils import (
     calculate_metrics,
     load_visual_gen_prompts,
     print_visual_gen_results,
+)
+from tensorrt_llm.serve.visual_gen_metrics import (
+    SERVER_TIMING_HEADER,
+    VISUAL_GEN_DENOISE_TIMING,
+    VISUAL_GEN_GENERATION_TIMING,
 )
 
 AIOHTTP_TIMEOUT = aiohttp.ClientTimeout(total=6 * 60 * 60)
@@ -107,6 +113,41 @@ def _get_headers() -> dict[str, str]:
     }
 
 
+def _parse_server_timing_header(headers: Any) -> dict[str, float]:
+    """Parse required VisualGen Server-Timing metrics into seconds.
+
+    Online VisualGen perf sanity gates on engine-side generation time, so a
+    successful response without valid ``Server-Timing`` metadata is treated as
+    a failed benchmark request instead of silently contributing a zero sample.
+    """
+    value = headers.get(SERVER_TIMING_HEADER)
+    if value is None:
+        raise ValueError(f"Missing VisualGen timing response header: {SERVER_TIMING_HEADER}")
+
+    timings = {}
+    for entry in value.split(","):
+        parts = [part.strip() for part in entry.split(";")]
+        name = parts[0]
+        for parameter in parts[1:]:
+            key, _, parameter_value = parameter.partition("=")
+            if key.strip() == "dur":
+                timings[name] = float(parameter_value) / 1000.0
+                break
+    return timings
+
+
+def _get_server_timing_metric(
+    timings: dict[str, float], name: str, *, require_positive: bool
+) -> float:
+    """Return a required Server-Timing metric, in seconds."""
+    if name not in timings:
+        raise ValueError(f"Missing VisualGen Server-Timing metric: {name}")
+    timing = timings[name]
+    if not math.isfinite(timing) or timing < 0 or (require_positive and timing <= 0):
+        raise ValueError(f"Invalid VisualGen Server-Timing metric {name}: {timing}")
+    return timing
+
+
 async def _do_post(
     request_input: VisualGenRequestInput,
     payload: dict[str, Any],
@@ -130,6 +171,17 @@ async def _do_post(
                 await response.read()
                 output.success = True
                 output.latency = time.perf_counter() - st
+                server_timings = _parse_server_timing_header(response.headers)
+                output.generation = _get_server_timing_metric(
+                    server_timings,
+                    VISUAL_GEN_GENERATION_TIMING,
+                    require_positive=True,
+                )
+                output.denoise = _get_server_timing_metric(
+                    server_timings,
+                    VISUAL_GEN_DENOISE_TIMING,
+                    require_positive=False,
+                )
             else:
                 body = await response.text()
                 output.error = f"HTTP {response.status}: {body}"
@@ -314,7 +366,7 @@ def load_prompts(args: argparse.Namespace) -> list[VisualGenSampleRequest]:
 def _resolve_num_gpus(args: argparse.Namespace) -> int:
     """Determine the number of GPUs from explicit arg or server config YAML.
 
-    Priority: --num-gpus (explicit) > --extra-visual-gen-options YAML > default 1.
+    Priority: --num-gpus (explicit) > --visual-gen-args YAML > default 1.
     """
     if args.num_gpus is not None:
         return args.num_gpus
@@ -575,7 +627,7 @@ if __name__ == "__main__":
         type=int,
         default=None,
         help="Number of GPUs used by the server. Overrides the value inferred "
-        "from --extra-visual-gen-options. Defaults to 1 if neither is given.",
+        "from --visual-gen-args. Defaults to 1 if neither is given.",
     )
 
     output_group = parser.add_argument_group("Output")

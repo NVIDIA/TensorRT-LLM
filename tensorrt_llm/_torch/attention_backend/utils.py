@@ -2,6 +2,8 @@ from typing import Optional, Type
 
 import torch
 
+from tensorrt_llm.logger import logger
+
 from ...models.modeling_utils import QuantConfig
 from ..flashinfer_utils import IS_FLASHINFER_AVAILABLE
 from .interface import AttentionBackend, MLAParams, PositionalEmbeddingParams
@@ -16,6 +18,7 @@ def get_attention_backend(
     backend_name: str,
     sparse_attn_config: Optional["SparseAttentionConfig"] = None
 ) -> Type[AttentionBackend]:
+    backend_name = backend_name.upper()
     if backend_name == "VANILLA":
         if sparse_attn_config is not None:
             return get_vanilla_sparse_attn_attention_backend(sparse_attn_config)
@@ -34,6 +37,7 @@ def get_attention_backend(
         from .star_flashinfer import StarAttention
         return StarAttention
 
+    logger.warning("Falling back to TRTLLM attention backend")
     return TrtllmAttention
 
 

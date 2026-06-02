@@ -221,7 +221,7 @@ class TestLlama3_1_8B(LlmapiAccuracyTestHarness):
             "max_seq_len": 2048,
             "compile_backend": "torch-simple",
         },
-        "triton_paged": {
+        "triton": {
             "max_batch_size": 128,
             "max_seq_len": 8192,
             "compile_backend": "torch-cudagraph",
@@ -293,7 +293,7 @@ class TestLlama3_1_8B(LlmapiAccuracyTestHarness):
             # For batch_size=32: 8.25 GiB KV + ~15 GiB weights ~= 23.3 GiB.
             # If batch size is increased, this parameterization must be gated at a higher memory threshold.
             "torch",
-            "triton_paged",
+            "triton",
         ],
     )
     def test_auto_dtype(self, world_size, enable_chunked_prefill, attn_backend):
@@ -497,7 +497,7 @@ class TestNemotronV2(LlmapiAccuracyTestHarness):
         task = GSM8K(self.MODEL_NAME)
         task.evaluate(llm)
 
-    @pytest.mark.skip_less_device_memory(32000)
+    @pytest.mark.skip_less_device_memory(80000)
     @pytest.mark.parametrize("enable_chunked_prefill", [True, False])
     def test_auto_dtype(self, enable_chunked_prefill):
         kwargs = self.get_default_kwargs(enable_chunked_prefill)
@@ -931,6 +931,7 @@ class TestGLM4Flash(LlmapiAccuracyTestHarness):
                               n=beam_width,
                               use_beam_search=beam_width > 1)
 
+    @skip_pre_hopper
     @pytest.mark.skip_less_device_memory(80000)
     @pytest.mark.parametrize("enable_chunked_prefill", [True, False])
     @pytest.mark.parametrize("attn_backend", ["flashinfer", "trtllm"])
