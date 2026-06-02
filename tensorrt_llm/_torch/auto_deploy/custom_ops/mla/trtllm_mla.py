@@ -84,15 +84,12 @@ from ..attention_interface import (
     PrepareMetadataHostCallable,
     ResourceHandlerDict,
 )
+from .rope_metadata import _TRTLLM_MLA_ROPE_INFO_KEY
 
 # =============================================================================
 # Helpers
 # =============================================================================
 
-# Metadata key used by fuse_rope_into_trtllm_mla (at post_load_fusion) to stash
-# rope info on torch_mla nodes, consumed by prepare_node_for_cache_insertion
-# (at cache_init) to materialize the rotary_cos_sin buffer as a graph node.
-_TRTLLM_MLA_ROPE_INFO_KEY = "_trtllm_mla_rope_info"
 # ``thop.attention``'s C++ side (``cpp/tensorrt_llm/thop/attentionOp.cpp``)
 # auto-resizes the workspace tensor when its sizing formula exceeds the
 # tensor's capacity.  ``resize_()`` reallocates storage and rebinds the
