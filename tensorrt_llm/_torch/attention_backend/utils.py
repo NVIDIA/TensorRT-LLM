@@ -1,8 +1,11 @@
-from typing import Optional, Type
+from typing import TYPE_CHECKING, Optional, Type
 
 import torch
 
 from tensorrt_llm.logger import logger
+
+if TYPE_CHECKING:
+    from tensorrt_llm.llmapi.llm_args import SparseAttentionConfig
 
 from ...models.modeling_utils import QuantConfig
 from ..flashinfer_utils import IS_FLASHINFER_AVAILABLE
