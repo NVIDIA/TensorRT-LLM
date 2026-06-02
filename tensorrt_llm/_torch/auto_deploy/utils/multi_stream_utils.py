@@ -430,68 +430,6 @@ def _make_aux_stream_impl(base_overload: Callable) -> Callable:
     return _impl
 
 
-# ===========================================================================
-# V18: Function-wrapped multi-stream fork/join for cuda graph capture stream consolidation
-# ===========================================================================
-# Verified by minimal v12 test (2026-05-28): putting begin_aux + KV-cone ops +
-# end_aux + wait_aux INSIDE a single @torch._dynamo.disable Python function
-# makes cuda graph capture allocate ONE aux stream (PT pattern, 1 dedicated)
-# instead of N dedicated streams per fork (current AD V8 pattern, 60+ streams).
-
-
-@torch._dynamo.disable
-def dsv3_mla_kv_cone_aux_wrapped(
-    narrow_kv: torch.Tensor,
-    kv_a_layernorm_weight: torch.Tensor,
-    kv_lora_rank: int = 512,
-    qk_rope_head_dim: int = 64,
-    eps: float = 1e-6,
-) -> Any:
-    """DSv3 KV-cone wrapped in single function call for cuda graph stream consolidation.
-
-    Returns (compressed_kv, k_pe). Performs split + kv_a_layernorm + view inside
-    the aux CUDA stream, recording/waiting events around the work so that the
-    cuda graph capture sees the whole block as one function call (rather than
-    multiple separate stream-switch nodes). This is the PT pattern.
-
-    Layout (narrow_kv shape [B, S, kv_lora_rank + qk_rope_head_dim]):
-      compressed_kv = rmsnorm(split[0])  shape [B, S, kv_lora_rank]
-      k_pe = split[1].view(B, S, 1, qk_rope_head_dim)
-    """
-
-    def _kv_path():
-        compressed_kv_pre, k_pe_pre = torch.split(
-            narrow_kv, [kv_lora_rank, qk_rope_head_dim], dim=-1
-        )
-        compressed_kv = torch.ops.auto_deploy.triton_rms_norm.default(
-            compressed_kv_pre, kv_a_layernorm_weight, eps
-        )
-        compressed_kv = compressed_kv.to(narrow_kv.dtype)
-        bsz, q_len = narrow_kv.shape[0], narrow_kv.shape[1]
-        k_pe = k_pe_pre.view(bsz, q_len, 1, qk_rope_head_dim)
-        return compressed_kv, k_pe
-
-    if not _multi_stream_enabled:
-        return _kv_path()
-
-    device = torch.cuda.current_device()
-    aux_stream = cuda_stream_manager.get_stream(device, cuda_stream_manager.AUX_STREAM_NAME)
-    main_event = cuda_stream_manager.get_event(device, cuda_stream_manager.MAIN_STREAM_NAME)
-    aux_event = cuda_stream_manager.get_event(device, cuda_stream_manager.AUX_STREAM_NAME)
-
-    caller_stream = torch.cuda.current_stream(device)
-    main_event.record(caller_stream)
-    if not torch.cuda.is_current_stream_capturing():
-        narrow_kv.record_stream(aux_stream)
-        kv_a_layernorm_weight.record_stream(aux_stream)
-    with torch.cuda.stream(aux_stream):
-        aux_stream.wait_event(main_event)
-        compressed_kv, k_pe = _kv_path()
-        aux_event.record(aux_stream)
-    caller_stream.wait_event(aux_event)
-    return compressed_kv, k_pe
-
-
 # ---------------------------------------------------------------------------
 # V19: MoE shared-expert wrap helper
 # ---------------------------------------------------------------------------
