@@ -50,25 +50,47 @@ VOCAB_SIZE = 32000
 REQUEST_LENGTHS = [30, 60, 80]
 
 
-def test_trim_kv_to_prompt_history_uses_cache_manager_capability():
-    calls = []
-    req = SimpleNamespace(prompt_len=17)
-    cache_manager = SimpleNamespace(trim_to_history=lambda r, n: calls.append((r, n)))
+def test_assert_disagg_history_declared_passes_when_contract_met():
+    req = SimpleNamespace(py_request_id=7, prompt_len=17)
+    cache_manager = SimpleNamespace(get_history_length=lambda r: 17)
     transceiver = object.__new__(KvCacheTransceiverV2)
     transceiver._kv_cache_manager = cache_manager
 
-    assert not hasattr(transceiver, "_is_v2_manager")
-    transceiver._trim_kv_to_prompt_history(req)
+    # Should not raise — history_length matches prompt_len exactly.
+    transceiver._assert_disagg_history_declared(req)
 
-    assert calls == [(req, 17)]
+    # And also passes when history_length exceeds prompt_len (e.g., already advanced).
+    cache_manager.get_history_length = lambda r: 100
+    transceiver._assert_disagg_history_declared(req)
 
 
-def test_trim_kv_to_prompt_history_noops_without_trim_capability():
+def test_assert_disagg_history_declared_raises_on_contract_violation():
+    req = SimpleNamespace(py_request_id=7, prompt_len=17)
+    cache_manager = SimpleNamespace(get_history_length=lambda r: 0)
+    transceiver = object.__new__(KvCacheTransceiverV2)
+    transceiver._kv_cache_manager = cache_manager
+
+    with pytest.raises(RuntimeError, match="history_length=0 < prompt_len=17"):
+        transceiver._assert_disagg_history_declared(req)
+
+
+def test_assert_disagg_history_declared_noops_without_capability():
+    """V1 / non-V2 managers lack get_history_length; verify graceful skip."""
     transceiver = object.__new__(KvCacheTransceiverV2)
     transceiver._kv_cache_manager = object()
 
-    assert not hasattr(transceiver, "_is_v2_manager")
-    transceiver._trim_kv_to_prompt_history(SimpleNamespace(prompt_len=17))
+    # Should not raise — no get_history_length attribute.
+    transceiver._assert_disagg_history_declared(SimpleNamespace(prompt_len=17))
+
+
+def test_assert_disagg_history_declared_noops_when_cache_released():
+    """If the cache was released (e.g., cancelled mid-transfer), skip the check."""
+    req = SimpleNamespace(py_request_id=7, prompt_len=17)
+    cache_manager = SimpleNamespace(get_history_length=lambda r: None)
+    transceiver = object.__new__(KvCacheTransceiverV2)
+    transceiver._kv_cache_manager = cache_manager
+
+    transceiver._assert_disagg_history_declared(req)
 
 
 # ---------------------------------------------------------------------------

@@ -66,6 +66,7 @@ if not TYPE_CHECKING and find_spec("kv_cache_manager_v2") is not None:
     from kv_cache_manager_v2._exceptions import OutOfPagesError
     from kv_cache_manager_v2._life_cycle_registry import LifeCycleRegistry, SsmLifeCycle
     from kv_cache_manager_v2._storage._config import create_storage_config
+    from kv_cache_manager_v2._storage._core import CacheLevelStorage
     from kv_cache_manager_v2._storage_manager import StorageManager
     from kv_cache_manager_v2._utils import (
         CachedCudaStream,
@@ -123,6 +124,7 @@ else:
         SsmLifeCycle,
     )
     from tensorrt_llm.runtime.kv_cache_manager_v2._storage._config import create_storage_config
+    from tensorrt_llm.runtime.kv_cache_manager_v2._storage._core import CacheLevelStorage
     from tensorrt_llm.runtime.kv_cache_manager_v2._storage_manager import StorageManager
     from tensorrt_llm.runtime.kv_cache_manager_v2._utils import (
         CachedCudaStream,
@@ -194,6 +196,43 @@ def assert_no_ref_cycle(func):
         return result
 
     return wrapper
+
+
+class TestCacheLevelStorage(unittest.TestCase):
+    def test_grains_to_slots_refines_proportional_lower_bound(self) -> None:
+        granularity = 16 << 20
+        slot_size_list = [16_252_928, 4_063_232]
+        min_slots = 157
+
+        grains = CacheLevelStorage._grains_for_slots(min_slots, slot_size_list, granularity)
+        slots, used = CacheLevelStorage._grains_to_slots(grains, slot_size_list, granularity)
+
+        self.assertGreaterEqual(slots, min_slots)
+        self.assertLessEqual(used, grains)
+
+    def test_ratio_to_slot_count_list_preserves_min_slots(self) -> None:
+        granularity = 16 << 20
+        slot_size_lists = [
+            [16_252_928, 4_063_232],
+            [491_520, 126_720, 15_872],
+            [31_457_280, 7_864_320],
+        ]
+        min_slots = [157, 3907, 157]
+        total_min_grains = sum(
+            CacheLevelStorage._grains_for_slots(slots, sizes, granularity)
+            for slots, sizes in zip(min_slots, slot_size_lists)
+        )
+
+        slot_counts = CacheLevelStorage.ratio_to_slot_count_list(
+            total_min_grains * granularity,
+            slot_size_lists,
+            [0.2, 0.5, 0.3],
+            granularity,
+            min_slots,
+        )
+
+        for slot_count, min_slot in zip(slot_counts, min_slots):
+            self.assertGreaterEqual(slot_count, min_slot)
 
 
 def create_config(
