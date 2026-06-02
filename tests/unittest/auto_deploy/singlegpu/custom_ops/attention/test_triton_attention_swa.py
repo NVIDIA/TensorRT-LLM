@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""SWA correctness tests for Triton paged attention.
+"""SWA correctness tests for Triton attention.
 
 Two regimes that the existing kernel tests don't exercise:
 
@@ -100,7 +100,7 @@ def _write_kv_to_cache(
     tensor listing physical page ids in token-order. Assumes page_table
     covers exactly enough pages for k.shape[0] tokens.
     """
-    from tensorrt_llm._torch.auto_deploy.custom_ops.attention.triton_paged_attention import (
+    from tensorrt_llm._torch.auto_deploy.custom_ops.attention.triton_attention import (
         update_paged_kv_cache,
     )
 
@@ -111,7 +111,7 @@ def _write_kv_to_cache(
     update_paged_kv_cache(k, v, batch_indices, positions, kv_cache, page_table, kv_indptr)
 
 
-class TestTritonPagedLongPrefillSWA:
+class TestTritonLongPrefillSWA:
     """Prefill longer than the sliding window — no eviction yet.
 
     Verifies the kernel correctly applies the SW mask within a single long
@@ -133,8 +133,8 @@ class TestTritonPagedLongPrefillSWA:
         n_kv_heads: int,
         head_dim: int,
     ):
-        from tensorrt_llm._torch.auto_deploy.custom_ops.attention.triton_paged_attention import (
-            triton_paged_context,
+        from tensorrt_llm._torch.auto_deploy.custom_ops.attention.triton_attention import (
+            triton_context,
         )
 
         torch.manual_seed(0)
@@ -165,7 +165,7 @@ class TestTritonPagedLongPrefillSWA:
         seq_len_with_cache = torch.tensor([prefill_len], dtype=torch.int32, device="cuda")
 
         sm_scale = 1.0 / math.sqrt(head_dim)
-        output = triton_paged_context(
+        output = triton_context(
             q,
             kv_cache,
             qo_indptr,
@@ -188,7 +188,7 @@ class TestTritonPagedLongPrefillSWA:
         torch.testing.assert_close(output.float(), ref.float(), rtol=1e-2, atol=1e-2)
 
 
-class TestTritonPagedSWAFrontEviction:
+class TestTritonSWAFrontEviction:
     """Front-eviction SWA — the shim hands the kernel a window-local view.
 
     The setup mirrors what `ad_executor.py` does after Phase 2: it slices
@@ -209,8 +209,8 @@ class TestTritonPagedSWAFrontEviction:
         page_size: int,
         with_sliding_window: bool,
     ):
-        from tensorrt_llm._torch.auto_deploy.custom_ops.attention.triton_paged_attention import (
-            triton_paged_context,
+        from tensorrt_llm._torch.auto_deploy.custom_ops.attention.triton_attention import (
+            triton_context,
         )
 
         # Fixed simple geometry for clarity. Window W=256 → 16 pages at PAGE_SIZE=16,
@@ -285,7 +285,7 @@ class TestTritonPagedSWAFrontEviction:
         new_v_padded[:new_chunk] = new_v
         # We can't easily write a partial-page; only fill if new_chunk is multiple of page_size.
         # For partial pages, fall back to per-token write.
-        from tensorrt_llm._torch.auto_deploy.custom_ops.attention.triton_paged_attention import (
+        from tensorrt_llm._torch.auto_deploy.custom_ops.attention.triton_attention import (
             update_paged_kv_cache,
         )
 
@@ -323,7 +323,7 @@ class TestTritonPagedSWAFrontEviction:
 
         sm_scale = 1.0 / math.sqrt(head_dim)
         sw_arg = sliding_window if with_sliding_window else 0
-        output = triton_paged_context(
+        output = triton_context(
             q,
             kv_cache,
             qo_indptr,
