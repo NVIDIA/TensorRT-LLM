@@ -299,7 +299,6 @@ def get_model_yaml_config(model_label: str,
                 'llama_v3.3_70b_instruct_fp8-bench-pytorch-float8-maxbs:512-maxnt:2048-input_output_len:2000,500-gpus:4',
                 'llama_v3.3_70b_instruct_fp8-bench-pytorch-float8-maxbs:512-maxnt:2048-input_output_len:128,128-gpus:4',
                 'llama_v3.3_70b_instruct_fp8-bench-pytorch-bfloat16-maxbs:512-maxnt:2048-input_output_len:512,32-gpus:4',
-                'llama_v3.1_405b_instruct_fp4',
                 'llama_v4_scout_17b_16e_instruct_fp4',
                 'llama_v4_maverick_17b_128e_instruct_fp8'
             ],

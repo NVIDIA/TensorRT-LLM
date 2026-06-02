@@ -62,12 +62,6 @@ accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_nvfp4[moe_backend=TRT
 accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_nvfp4_4gpus[moe_backend=CUTLASS-mtp_nextn=0-pp4-fp8kv=False-attention_dp=False-cuda_graph=False-overlap_scheduler=False-low_precision_combine=False-torch_compile=False] SKIP (https://nvbugs/5945081)
 accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_nvfp4_4gpus[moe_backend=CUTLASS-mtp_nextn=0-pp4-fp8kv=True-attention_dp=True-cuda_graph=True-overlap_scheduler=True-low_precision_combine=False-torch_compile=False] SKIP (https://nvbugs/6162115)
 accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_nvfp4_4gpus[moe_backend=CUTLASS-mtp_nextn=2-pp4-fp8kv=False-attention_dp=False-cuda_graph=False-overlap_scheduler=False-low_precision_combine=False-torch_compile=False] SKIP (https://nvbugs/6162115)
-accuracy/test_llm_api_pytorch.py::TestGLM4_5Air::test_nvfp4_2_model_mtp[2model] SKIP (https://nvbugs/5981293)
-accuracy/test_llm_api_pytorch.py::TestGLM4_5Air::test_nvfp4_2_model_mtp[2model_trtllm] SKIP (https://nvbugs/5981293)
-accuracy/test_llm_api_pytorch.py::TestGLM4_5Air::test_nvfp4_multi_gpus[throughput] SKIP (https://nvbugs/5981293)
-accuracy/test_llm_api_pytorch.py::TestGLM4_5Air::test_nvfp4_multi_gpus[throughput_trtllm] SKIP (https://nvbugs/5981293)
-accuracy/test_llm_api_pytorch.py::TestGLM4_6::test_nvfp4_2_model_mtp[2model] SKIP (https://nvbugs/5772993)
-accuracy/test_llm_api_pytorch.py::TestGLM4_6::test_nvfp4_2_model_mtp[2model_trtllm] SKIP (https://nvbugs/5772360)
 accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_dflash SKIP (https://nvbugs/6156233)
 accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_eagle3_4gpus[v2_kv_cache-cutlass-two_model-no_overlap_scheduler] SKIP (https://nvbugs/6211880)
 accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_eagle3_guided_decoding_4gpus[one_model] SKIP (https://nvbugs/5596343)
@@ -193,7 +187,6 @@ examples/test_gpt.py::test_llm_minitron_fp8_with_pseudo_loras[4b] SKIP (https://
 examples/test_granite.py::test_granite_bf16_lora[granite-3.0-1b-a400m-instruct] SKIP (https://nvbugs/5431132)
 examples/test_granite.py::test_llm_granite[granite-3.0-1b-a400m-instruct-bfloat16] SKIP (https://nvbugs/5608979)
 examples/test_granite.py::test_llm_granite[granite-3.0-2b-instruct-bfloat16] SKIP (https://nvbugs/5608979)
-examples/test_llama.py::test_llm_llama_1gpu_fp8_kv_cache[llama-v2-7b-hf-bfloat16] SKIP (https://nvbugs/5527940)
 examples/test_medusa.py::test_llm_medusa_with_qaunt_base_model_1gpu[fp8-use_cpp_session-medusa-vicuna-7b-v1.3-4-heads-float16-bs1] SKIP (https://nvbugs/5802248)
 examples/test_medusa.py::test_llm_medusa_with_qaunt_base_model_1gpu[fp8-use_py_session-medusa-vicuna-7b-v1.3-4-heads-float16-bs1] SKIP (https://nvbugs/5333849)
 examples/test_multimodal.py::test_llm_fp8_multimodal_general[fp8-fp8-scienceqa-Llama-3.2-11B-Vision-Instruct-pp:1-tp:1-bfloat16-bs:1-cpp_e2e:False] SKIP (https://nvbugs/5222697)
@@ -206,14 +199,6 @@ examples/test_nemotron_nas.py::test_nemotron_nas_summary_1gpu[DeciLM-7B] SKIP (h
 examples/test_nemotron_nas.py::test_nemotron_nas_summary_2gpu[DeciLM-7B] SKIP (https://nvbugs/5444636)
 examples/test_qwen2audio.py::test_llm_qwen2audio_single_gpu[qwen2_audio_7b_instruct] SKIP (https://nvbugs/5447530)
 examples/test_ray.py::test_ray_disaggregated_serving[tp2] SKIP (https://nvbugs/5612502)
-examples/test_recurrentgemma.py::test_llm_recurrentgemma_1gpu[use_cpp_session-recurrentgemma-2b-use_paged_cache-disable_quant-float16-enable_attn_plugin-enable_gemm_plugin] SKIP (https://nvbugs/5174573)
-examples/test_recurrentgemma.py::test_llm_recurrentgemma_1gpu[use_cpp_session-recurrentgemma-2b-use_paged_cache-fp8-float16-enable_attn_plugin-enable_gemm_plugin] SKIP (https://nvbugs/5419070)
-examples/test_recurrentgemma.py::test_llm_recurrentgemma_1gpu[use_cpp_session-recurrentgemma-2b-use_paged_cache-int4_awq-float16-enable_attn_plugin-enable_gemm_plugin] SKIP (https://nvbugs/5401233)
-examples/test_recurrentgemma.py::test_llm_recurrentgemma_1gpu[use_cpp_session-recurrentgemma-2b-use_paged_cache-int8_sq-float16-enable_attn_plugin-enable_gemm_plugin] SKIP (https://nvbugs/5232405)
-examples/test_recurrentgemma.py::test_llm_recurrentgemma_1gpu[use_py_session-recurrentgemma-2b-no_paged_cache-disable_quant-float16-disable_attn_plugin-enable_gemm_plugin] SKIP (https://nvbugs/5214221)
-examples/test_recurrentgemma.py::test_llm_recurrentgemma_1gpu[use_py_session-recurrentgemma-2b-no_paged_cache-disable_quant-float16-enable_attn_plugin-enable_gemm_plugin] SKIP (https://nvbugs/5214221)
-examples/test_recurrentgemma.py::test_llm_recurrentgemma_1gpu[use_py_session-recurrentgemma-2b-use_paged_cache-disable_quant-float16-enable_attn_plugin-enable_gemm_plugin] SKIP (https://nvbugs/5214221)
-examples/test_recurrentgemma.py::test_llm_recurrentgemma_2gpu[recurrentgemma-2b] SKIP (https://nvbugs/5401233)
 examples/test_visual_gen.py::test_flux1_lpips_against_golden SKIP (https://nvbugs/6215688)
 examples/test_visual_gen.py::test_flux2_lpips_against_golden SKIP (https://nvbugs/6215688)
 examples/test_visual_gen.py::test_ltx2_lpips_against_golden SKIP (https://nvbugs/6215688)
@@ -269,8 +254,6 @@ perf/test_perf.py::test_perf[flan_t5_large-bench-float16-input_output_len:128,20
 perf/test_perf.py::test_perf[flan_t5_large-bench-float16-maxbs:1-input_output_len:128,20-gpus:2] SKIP
 perf/test_perf.py::test_perf[gpt_20b-bench-float16-maxbs:8-input_output_len:128,128-reqs:80-gpus:8] SKIP
 perf/test_perf.py::test_perf[gpt_20b-bench-float16-maxbs:8-input_output_len:512,32-reqs:80-gpus:8] SKIP
-perf/test_perf.py::test_perf[llama_v3.1_70b-cppmanager-exe-plugin_ifb-float16-input_output_len:128,128+512,32-quant:fp8-gpus:8] SKIP (SKIP due to timeout of quantization)
-perf/test_perf.py::test_perf[llama_v3.1_70b-cppmanager-exe-plugin_ifb-float16-input_output_len:512,200-quant:fp8-tp:4] SKIP (SKIP due to timeout of quantization)
 perf/test_perf.py::test_perf[mamba_2.8b-bench-float16-input_output_len:128,128] SKIP
 perf/test_perf.py::test_perf[mamba_2.8b-bench-float16-input_output_len:512,32] SKIP
 perf/test_perf.py::test_perf[mamba_370m-bench-float16-input_output_len:128,128] SKIP
