@@ -32,6 +32,8 @@ import logging
 import re
 import threading
 import time
+import urllib.error
+import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import IO, Any, Callable, Optional
@@ -167,6 +169,9 @@ class WorkerLaunchSpec:
     # ``None`` when launched with ``save_log=False`` (output inherits
     # pytest stdout); log_scanner skips ``None`` paths with a warning.
     log_path: Optional[str] = None
+    # Host for HTTP scraping (Prometheus / health). Multi-host setups
+    # set this from the YAML ``hostname:`` field at cluster-setup time.
+    host: str = "localhost"
 
 
 # ---------------------------------------------------------------------------
@@ -306,6 +311,79 @@ def _compile_patterns(raw_patterns: list[Any]) -> list[tuple[str, re.Pattern[str
 
 
 # ---------------------------------------------------------------------------
+# Metrics-thread helpers
+# ---------------------------------------------------------------------------
+
+
+# Tolerates optional ``{labels}`` and trailing timestamp; captures value in group 1.
+_KV_CACHE_UTIL_RE = re.compile(
+    r"^trtllm_kv_cache_utilization(?:\{[^}]*\})?\s+([+-]?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)"
+)
+
+
+def _parse_kv_cache_utilization(metrics_text: str) -> Optional[float]:
+    """Extract ``trtllm_kv_cache_utilization`` from a Prometheus exposition.
+
+    Skips ``# HELP`` / ``# TYPE`` lines. Returns the first matching
+    sample's value as a float, or ``None`` if no sample is present.
+
+    Args:
+        metrics_text: Body of an HTTP response from
+            ``/prometheus/metrics``.
+
+    Returns:
+        Float utilization in the range the worker exposes (typically
+        ``[0.0, 1.0]``), or ``None`` if the metric is absent.
+    """
+    for line in metrics_text.splitlines():
+        if not line or line.startswith("#"):
+            continue
+        m = _KV_CACHE_UTIL_RE.match(line)
+        if m is not None:
+            try:
+                return float(m.group(1))
+            except ValueError:
+                return None
+    return None
+
+
+def _fetch_kv_cache_utilization(
+    host: str, port: int, timeout_s: float
+) -> tuple[Optional[float], Optional[str]]:
+    """HTTP GET ``/prometheus/metrics`` and parse the KV-cache utilization.
+
+    All failures (connection refused, timeout, HTTP error, parse miss)
+    are folded into ``(None, error_string)`` rather than raising. The
+    metrics thread must not fail-fast on transient scrape misses — the
+    worker may be mid-restart, the metrics endpoint may not be wired
+    up on every backend, etc.
+
+    Args:
+        host: Worker hostname or IP.
+        port: Worker HTTP port.
+        timeout_s: Per-request timeout in seconds.
+
+    Returns:
+        Tuple ``(utilization, error)``. Exactly one is ``None``: on
+        success ``utilization`` is the gauge value and ``error`` is
+        ``None``; on failure ``utilization`` is ``None`` and ``error``
+        is a short string explaining why (for the timeseries record).
+    """
+    url = f"http://{host}:{port}/prometheus/metrics"
+    try:
+        with urllib.request.urlopen(url, timeout=timeout_s) as response:
+            body = response.read().decode("utf-8", errors="replace")
+    except urllib.error.URLError as exc:
+        return None, f"url_error: {exc.reason}"
+    except (TimeoutError, OSError) as exc:
+        return None, f"io_error: {exc}"
+    util = _parse_kv_cache_utilization(body)
+    if util is None:
+        return None, "metric_absent"
+    return util, None
+
+
+# ---------------------------------------------------------------------------
 # Harness
 # ---------------------------------------------------------------------------
 
@@ -337,6 +415,8 @@ class DisaggCancellationStressHarness:
         yaml_path: Path,
         *,
         log_scanner_poll_interval_s: float = 0.5,
+        metrics_scrape_interval_s: float = 30.0,
+        metrics_scrape_timeout_s: float = 5.0,
     ) -> None:
         """Construct a marathon harness.
 
@@ -349,6 +429,14 @@ class DisaggCancellationStressHarness:
                 measurable load source on its own; tests pass a
                 smaller value (e.g. 0.02 s) to keep real-clock
                 latency bounded.
+            metrics_scrape_interval_s: Cadence (seconds) between
+                consecutive Prometheus scrapes of every worker.
+                Default 30 s matches the spec's KV-cache utilization
+                sampling rate; tests pass a smaller value.
+            metrics_scrape_timeout_s: Per-request HTTP timeout for
+                the metrics scrape. Short by design — a slow scrape
+                is recorded as a miss rather than blocking the
+                metrics thread past its next scheduled scrape.
 
         Raises:
             ValueError: If the YAML is malformed or its
@@ -364,12 +452,9 @@ class DisaggCancellationStressHarness:
         self._failure_reason: Optional[str] = None
         self._failure_lock = threading.Lock()
 
-        # Per-thread tunables. The default cadence is reactive enough
-        # for human-scale debugging (~0.5 s lag from log line to
-        # fail-fast) without becoming a measurable load source on its
-        # own; tests pass a smaller value via the constructor to keep
-        # real-clock latency bounded.
         self._log_scanner_poll_interval_s: float = log_scanner_poll_interval_s
+        self._metrics_scrape_interval_s: float = metrics_scrape_interval_s
+        self._metrics_scrape_timeout_s: float = metrics_scrape_timeout_s
 
         # Cluster + worker tracking (populated by setup()).
         self._cluster: Any = None  # tuple returned by setup_disagg_cluster
@@ -658,13 +743,59 @@ class DisaggCancellationStressHarness:
             logger.debug("[log_scanner] exiting; closed %d source(s)", len(sources))
 
     def _metrics_thread_body(self) -> None:
-        """Scrape ``/prometheus/metrics`` for KV-cache utilization at ~30 s cadence.
+        """Scrape Prometheus KV-cache utilization from every worker.
 
-        Stub: no-op. Real implementation parses
-        ``trtllm_kv_cache_utilization`` and appends timestamped
-        samples to ``self._kv_utilization_samples``.
+        Polls each ``WorkerLaunchSpec`` at
+        ``_metrics_scrape_interval_s`` cadence, parses
+        ``trtllm_kv_cache_utilization`` out of
+        ``/prometheus/metrics``, and appends a timestamped sample to
+        ``self._kv_utilization_samples``. Each sample records
+        ``timestamp``, ``role``, ``index``, ``host``, ``port``,
+        ``utilization`` (``float`` on success, ``None`` on scrape
+        miss), and ``error`` (``None`` on success, short string on
+        miss). Scrape misses are recorded — not fail-fast — because
+        the worker may be mid-restart from a SIGKILL injection, mid-
+        SIGSTOP pause, or the Prometheus endpoint may not be wired
+        for the active backend.
+
+        Exits when ``stop_event`` or ``failed_event`` is set. Honors
+        either signal between scrapes via ``stop_event.wait`` rather
+        than ``time.sleep`` to keep teardown latency bounded.
         """
-        logger.debug("[metrics_thread] stub — exiting immediately")
+        if not self._worker_specs:
+            logger.warning("[metrics_thread] no worker specs; exiting")
+            return
+
+        logger.info(
+            "[metrics_thread] scraping %d worker(s) every %.1fs",
+            len(self._worker_specs),
+            self._metrics_scrape_interval_s,
+        )
+
+        while not self.stop_event.is_set() and not self.failed_event.is_set():
+            scrape_start = time.monotonic()
+            for spec in self._worker_specs:
+                if self.stop_event.is_set() or self.failed_event.is_set():
+                    break
+                util, err = _fetch_kv_cache_utilization(
+                    spec.host, spec.port, self._metrics_scrape_timeout_s
+                )
+                self._kv_utilization_samples.append(
+                    {
+                        "timestamp": time.time(),
+                        "role": spec.role,
+                        "index": spec.index,
+                        "host": spec.host,
+                        "port": spec.port,
+                        "utilization": util,
+                        "error": err,
+                    }
+                )
+            remaining = self._metrics_scrape_interval_s - (time.monotonic() - scrape_start)
+            if remaining > 0.0:
+                self.stop_event.wait(timeout=remaining)
+
+        logger.debug("[metrics_thread] exiting; %d sample(s)", len(self._kv_utilization_samples))
 
     # ------------------------------------------------------------------
     # Internal helpers
