@@ -92,7 +92,11 @@ public:
 
     int getWorkspaceAlignment();
 
-    size_t getWorkspaceSize(int max_num_tokens, int max_num_sequences, int max_attention_window_size);
+    // forceSingleBlockMla: size the MLA kernel scratch for a single split-K block (multi_block=1). Used by the
+    // multi-token MLA *context* path (useSm120ContextXqaMla), which forces single-CTA in the launch so the scratch
+    // (~multi_block * num_ctx_tokens * per-token) does not blow up. Generation leaves it false (keeps split-K).
+    size_t getWorkspaceSize(
+        int max_num_tokens, int max_num_sequences, int max_attention_window_size, bool forceSingleBlockMla = false);
 
     bool shouldUse(XQAParams const& params);
 

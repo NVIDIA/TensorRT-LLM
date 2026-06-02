@@ -899,7 +899,17 @@ void DecoderXQAImplJIT::runImpl(XQAParams const& xqaParams, KVCacheBuffer const&
     if (isMLAKernel)
     {
         auto const roundUpTo128 = [](size_t value) { return ((value + 127) / 128) * 128; };
-        uint32_t const multi_block = computeMultiBlockCountForMLA(xqaParams, multiprocessor_count);
+        uint32_t multi_block = computeMultiBlockCountForMLA(xqaParams, multiprocessor_count);
+        // Multi-token MLA (DSV4 context/prefill: inputSeqLen = generation_input_length > 1, non-spec-dec)
+        // parallelizes over query tokens in gridDim.x. Split-K over the KV dim (gridDim.y = multi_block) would
+        // multiply the per-token cgaXBuf/partial scratch by multi_block (up to 48) * total_num_input_tokens
+        // (= num_ctx_tokens, up to thousands) -> multi-GiB scratch (OOM). Force single-CTA for this path; the
+        // query-token parallelism already saturates the grid. (Decode keeps split-K; MLA spec-dec is excluded
+        // via multi_query_tokens.)
+        if (xqaParams.isMLA() && xqaParams.generation_input_length > 1 && !xqaParams.multi_query_tokens)
+        {
+            multi_block = 1;
+        }
         // DSV4 dynamic-sparse MLA decode attends over the sparse selection, so the main kernel uses
         // cacheSeqLen = sparse_mla_topk_lens (the attended count). Split-K is enabled for the sparse path
         // too: the separate-reduce launch below is fed sparse_mla_topk_lens (not the full kv_len) so its

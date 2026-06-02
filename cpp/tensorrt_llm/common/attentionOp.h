@@ -61,6 +61,12 @@ public:
     // total_num_seq is the sum of beam_width for multiple requests
     [[nodiscard]] size_t getWorkspaceSizeForGeneration(nvinfer1::DataType type, int32_t total_num_seq,
         int32_t max_attention_window_size, int32_t max_num_tokens, int32_t max_blocks_per_sequence) const noexcept;
+    // XQA workspace bytes for the SM120 sparse-MLA *context* path (useSm120ContextXqaMla). Mirrors the XQA
+    // sub-buffer layout sized in getWorkspaceSizeForGeneration, but with max_num_tokens = total context tokens.
+    // The kernel-scratch multi_block scales as ~mp/batch, so we size with batch=1 to upper-bound the launch
+    // (which uses the actual num_contexts). Returns 0 when the SM120 context-XQA path is not active.
+    [[nodiscard]] size_t getXqaWorkspaceSizeForContext(int32_t max_num_tokens, int32_t max_num_seq,
+        int32_t max_attention_window_size, int32_t max_blocks_per_sequence) const noexcept;
 
     template <typename T>
     class EnqueueParams
@@ -404,6 +410,17 @@ public:
     [[nodiscard]] bool useSparseMLA() const
     {
         return mUseSparseAttention && mUseTllmGen && mIsMLAEnabled;
+    }
+
+    // SM120 (RTX PRO 6000) has no absorbed-MLA context FMHA kernel (trtllm-gen/CUTLASS are SM100-only),
+    // so route DSV4-Flash sparse-MLA *context*/prefill through the XQA mla_sm120 gather kernel (the same
+    // kernel used for decode, launched multi-token with inputSeqLen = prompt_len). This is the SM120 analog
+    // of the SM100 absorbed-context route. useSparseMLA() is FALSE on SM120 (mUseTllmGen is false there), so
+    // the absorbed dims / absorption_mode that gate on it must additionally be enabled for this path.
+    // Narrow gate: only DSV4 sparse generation-MLA on SM120 with XQA enabled (DSV3/Kimi/non-SM120 unaffected).
+    [[nodiscard]] bool useSm120ContextXqaMla() const
+    {
+        return (mSM == 120) && mIsGenerationMLA && mUseSparseAttention && mEnableXQA;
     }
 
     [[nodiscard]] bool useTllmGenSparseAttention() const

@@ -2586,6 +2586,20 @@ class MLA(nn.Module):
         return self._deepseek_v4_sm120_env_flag(
             "TRTLLM_DSV4_SM120_REF_CONTEXT", True)
 
+    def _deepseek_v4_sm120_use_context_xqa(self) -> bool:
+        """Gate for the SM120 DSV4 XQA-context (prefill) path.
+
+        On by default: routes sparse-MLA context to forward_absorption_context ->
+        _attn_forward_gen(context_only) -> the C++ XQA mla_sm120 gather kernel
+        (enqueueContext SM120 branch, useSm120ContextXqaMla) instead of the pure-PyTorch
+        O(N^2) REF_CONTEXT. The XQA gather reuses the decode kernel multi-token
+        (inputSeqLen=prompt_len) over the causal-by-construction sparse selection; the SWA
+        pool is written by invokeMLARopeContext and the compressed pool by the Compressor.
+        Set TRTLLM_DSV4_SM120_CTX_XQA=0 to fall back to REF_CONTEXT (safety net).
+        """
+        return self._deepseek_v4_sm120_env_flag("TRTLLM_DSV4_SM120_CTX_XQA",
+                                                True)
+
     def _deepseek_v4_sm120_reference_attn_sink(
             self, device: torch.device) -> Optional[torch.Tensor]:
         """Source the optional per-head attention sink for the reference softmax.
@@ -2831,7 +2845,8 @@ class MLA(nn.Module):
         # PyTorch reference context attention that materializes K/V from the
         # latent and runs a causal softmax.
         if (get_sm_version() == 120 and self.is_deepseek_v4
-                and self._deepseek_v4_sm120_use_reference_context()):
+                and self._deepseek_v4_sm120_use_reference_context()
+                and not self._deepseek_v4_sm120_use_context_xqa()):
             # The reference attention computes the correct context output but never
             # writes the paged (SWA) KV cache. Without that write, the first DECODE
             # step reads garbage history and multi-token output degrades (token 1 is
