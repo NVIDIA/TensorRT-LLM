@@ -24,8 +24,7 @@ from tensorrt_llm import MultimodalEncoder
 from tensorrt_llm._tensorrt_engine import LLM
 from tensorrt_llm._utils import mpi_rank
 from tensorrt_llm.commands.utils import get_is_diffusion_model
-from tensorrt_llm.executor.utils import (LlmLauncherEnvs,
-                                         set_spawn_proxy_process_ipc_hmac_key)
+from tensorrt_llm.executor.utils import LlmLauncherEnvs
 from tensorrt_llm.inputs.multimodal import MultimodalServerConfig
 from tensorrt_llm.llmapi import (BuildConfig, CapacitySchedulerPolicy,
                                  DynamicBatchConfig, KvCacheConfig,
@@ -44,8 +43,8 @@ from tensorrt_llm.logger import logger, severity_map
 from tensorrt_llm.mapping import CpType
 from tensorrt_llm.serve import OpenAIDisaggServer, OpenAIServer
 from tensorrt_llm.serve.tool_parser import ToolParserFactory
-from tensorrt_llm.serve.tool_parser.tool_parser_factory import \
-    resolve_auto_tool_parser
+from tensorrt_llm.serve.tool_parser.tool_parser_factory import (
+    MODEL_TYPE_TO_TOOL_PARSER, resolve_auto_tool_parser)
 from tensorrt_llm.tools.importlib_utils import import_custom_module_from_dir
 from tensorrt_llm.usage import config as _telemetry_config
 from tensorrt_llm.visual_gen import VisualGen
@@ -898,11 +897,11 @@ def serve(
     if tool_parser == "auto":
         resolved = resolve_auto_tool_parser(model)
         if resolved is None:
+            supported_model_types = ", ".join(
+                sorted(MODEL_TYPE_TO_TOOL_PARSER.keys()))
             raise click.BadParameter(
                 f"Cannot auto-detect tool parser for model '{model}'. "
-                f"Supported model types for auto-detection: qwen2, qwen3, "
-                f"qwen3_moe, qwen3_5, qwen3_5_moe, qwen3_next, deepseek_v3, "
-                f"deepseek_v32, kimi_k2, kimi_k25, glm4. "
+                f"Supported model types for auto-detection: {supported_model_types}. "
                 f"Please specify a parser explicitly: "
                 f"{list(ToolParserFactory.parsers.keys())}",
                 param_hint="--tool_parser")
@@ -1404,13 +1403,11 @@ def _launch_disaggregated_leader(sub_comm, instance_idx: int, config_file: str,
     # This mimics the behavior of trtllm-llmapi-launch
     # TODO: Make the port allocation atomic
     free_ipc_addr = find_free_ipc_addr()
-    ipc_hmac_key = secrets.token_hex(32)
-    set_spawn_proxy_process_ipc_hmac_key(ipc_hmac_key)
-    os.environ.pop(
-        LlmLauncherEnvs.TLLM_SPAWN_PROXY_PROCESS_IPC_HMAC_KEY_FD.value, None)
     os.environ[LlmLauncherEnvs.TLLM_SPAWN_PROXY_PROCESS] = "1"
     os.environ[
         LlmLauncherEnvs.TLLM_SPAWN_PROXY_PROCESS_IPC_ADDR.value] = free_ipc_addr
+    os.environ[LlmLauncherEnvs.TLLM_SPAWN_PROXY_PROCESS_IPC_HMAC_KEY.
+               value] = secrets.token_hex(32)
     os.environ[DisaggLauncherEnvs.TLLM_DISAGG_RUN_REMOTE_MPI_SESSION_CLIENT.
                value] = "1"
     os.environ[DisaggLauncherEnvs.TLLM_DISAGG_INSTANCE_IDX] = str(instance_idx)
@@ -1426,6 +1423,7 @@ def _launch_disaggregated_leader(sub_comm, instance_idx: int, config_file: str,
 
     assert LlmLauncherEnvs.TLLM_SPAWN_PROXY_PROCESS in non_mpi_env
     assert LlmLauncherEnvs.TLLM_SPAWN_PROXY_PROCESS_IPC_ADDR in non_mpi_env
+    assert LlmLauncherEnvs.TLLM_SPAWN_PROXY_PROCESS_IPC_HMAC_KEY in non_mpi_env
     assert DisaggLauncherEnvs.TLLM_DISAGG_INSTANCE_IDX in non_mpi_env
     assert DisaggLauncherEnvs.TLLM_DISAGG_RUN_REMOTE_MPI_SESSION_CLIENT in non_mpi_env
 
@@ -1448,24 +1446,13 @@ def _launch_disaggregated_leader(sub_comm, instance_idx: int, config_file: str,
     signal.signal(signal.SIGTERM, _signal_handler_cleanup_child)
     signal.signal(signal.SIGINT, _signal_handler_cleanup_child)
 
-    read_fd = -1
-    write_fd = -1
     try:
-        read_fd, write_fd = os.pipe()
-        os.write(write_fd, ipc_hmac_key.encode("ascii"))
-        os.close(write_fd)
-        write_fd = -1
-        non_mpi_env[LlmLauncherEnvs.TLLM_SPAWN_PROXY_PROCESS_IPC_HMAC_KEY_FD.
-                    value] = str(read_fd)
         _child_p_global = subprocess.Popen(
             command,
             env=non_mpi_env,
             stdout=sys.stdout,  # Redirect to parent's stdout
             stderr=sys.stderr,  # Redirect to parent's stderr
-            pass_fds=(read_fd, ),
             start_new_session=True)
-        os.close(read_fd)
-        read_fd = -1
 
         logger.info(
             f"Parent process (PID {os.getpid()}) launched child process (PID {_child_p_global.pid})."
@@ -1479,11 +1466,6 @@ def _launch_disaggregated_leader(sub_comm, instance_idx: int, config_file: str,
         launch_remote_mpi_session_server(sub_comm)
 
     finally:
-        if write_fd != -1:
-            os.close(write_fd)
-        if read_fd != -1:
-            os.close(read_fd)
-
         # Restore original signal handlers
         signal.signal(signal.SIGTERM, original_sigterm_handler)
         signal.signal(signal.SIGINT, original_sigint_handler)
