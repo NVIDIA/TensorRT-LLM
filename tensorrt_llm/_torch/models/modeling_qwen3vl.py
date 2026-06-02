@@ -384,9 +384,12 @@ class Qwen3VLInputProcessorBase(BaseMultimodalInputProcessor, BaseMultimodalDumm
             do_rescale = False
         if videos and isinstance(videos[0][0], torch.Tensor):
             do_rescale = False
-        # Forward the IO loader's video metadata so sample_frames sees the real source fps
-        # rather than the HF default of 24 fps.
-        video_metadata = [vd.metadata for vd in video_datas] if video_datas else None
+        # Forward video metadata only when the caller opts into per-request kwargs;
+        # the default path pre-samples frames in the IO loader, so unconditional
+        # metadata triggers IndexError in HF's _decode_and_sample_videos.
+        video_metadata = (
+            [vd.metadata for vd in video_datas] if video_datas and mm_processor_kwargs else None
+        )
 
         # num_frames and fps are mutually exclusive in the HF processor's sample_frames.
         # If the caller set num_frames without fps, null fps explicitly so the class-level
