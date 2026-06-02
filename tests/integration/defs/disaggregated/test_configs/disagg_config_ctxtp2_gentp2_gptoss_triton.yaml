@@ -17,7 +17,7 @@ context_servers:
     free_gpu_memory_fraction: 0.8
   disable_overlap_scheduler: true
   moe_config:
-    backend: CUTLASS
+    backend: TRITON
   cuda_graph_config: null
   print_iter_log: true
   cache_transceiver_config:
@@ -39,7 +39,7 @@ generation_servers:
     free_gpu_memory_fraction: 0.8
   disable_overlap_scheduler: true
   moe_config:
-    backend: CUTLASS
+    backend: TRITON
   cuda_graph_config:
     enable_padding: true
     batch_sizes:
