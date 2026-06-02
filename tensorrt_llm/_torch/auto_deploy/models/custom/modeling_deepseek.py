@@ -521,6 +521,28 @@ class DeepSeekV3Attention(nn.Module):
     ) -> torch.Tensor:
         bsz, q_len, _ = hidden_states.size()
 
+        # KV projection FIRST (before Q) so the KV-cone precedes the Q-cone in
+        # graph order. This is the invariant multi_stream_mla_attn pattern 2
+        # relies on to overlap the (light) KV-cone on the aux stream with the
+        # (heavy) q_b_proj on the main stream. Q and KV are independent (both
+        # from hidden_states / the fused a-proj), so the reorder is numerically
+        # identical. Keep compressed form; latent compression is replicated.
+        kv_a_output = torch.ops.auto_deploy.torch_linear_simple(
+            hidden_states,
+            self.kv_a_proj_with_mqa.weight,
+            self.kv_a_proj_with_mqa.bias,
+            tp_mode="none",
+            layer_type="mla",
+        )
+        compressed_kv, k_pe = torch.split(
+            kv_a_output, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
+        )
+        # Apply layernorm to compressed_kv
+        compressed_kv = self.kv_a_layernorm(compressed_kv)
+        # k_pe: [B, S, 1, qk_rope_head_dim] (BSND layout, shared across heads)
+        # dim 2 is fixed at 1 and never scales with TP, so plain `.view` is correct.
+        k_pe = k_pe.view(bsz, q_len, 1, self.qk_rope_head_dim)
+
         # Q projection: latent projections replicated, q_b_proj colwise.
         if self.q_lora_rank is None:
             q = torch.ops.auto_deploy.torch_linear_simple(
@@ -555,25 +577,6 @@ class DeepSeekV3Attention(nn.Module):
             layer_type="mla",
         )
         q_nope, q_pe = torch.split(q, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
-
-        # KV projection - keep compressed form. Latent compression is replicated.
-        kv_a_output = torch.ops.auto_deploy.torch_linear_simple(
-            hidden_states,
-            self.kv_a_proj_with_mqa.weight,
-            self.kv_a_proj_with_mqa.bias,
-            tp_mode="none",
-            layer_type="mla",
-        )
-        compressed_kv, k_pe = torch.split(
-            kv_a_output, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
-        )
-
-        # Apply layernorm to compressed_kv
-        compressed_kv = self.kv_a_layernorm(compressed_kv)
-
-        # k_pe: [B, S, 1, qk_rope_head_dim] (BSND layout, shared across heads)
-        # dim 2 is fixed at 1 and never scales with TP, so plain `.view` is correct.
-        k_pe = k_pe.view(bsz, q_len, 1, self.qk_rope_head_dim)
 
         kv_seq_len = q_len
 

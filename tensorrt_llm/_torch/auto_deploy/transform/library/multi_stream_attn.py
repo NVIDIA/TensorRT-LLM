@@ -81,7 +81,6 @@ GPU timeline:
     Aux:                   [KV_a_proj] → done
 """
 
-import operator as _operator
 from collections import deque
 from typing import Callable, List, Optional, Tuple
 
@@ -96,7 +95,6 @@ from ...utils.multi_stream_utils import (
     _make_aux_stream_impl,
     begin_aux_stream_passthrough,
     cuda_stream_manager,
-    dsv3_mla_kv_cone_aux_wrapped,
     end_aux_stream_passthrough,
     record_event_passthrough,
     wait_aux_stream_passthrough,
@@ -124,6 +122,19 @@ _LINEAR_OPS: List[Callable] = [
 # (and therefore a separate symm_mem workspace), so a concurrent main-stream
 # allgather on workspace_id=0 cannot clobber its buffer.
 _AUX_WORKSPACE_ID = 1
+
+# DSv3 MLA fused a-projection split sizes: q_a_lora (1536) and kv_a_with_mqa (576).
+_DSV3_Q_A_OUT = 1536
+_DSV3_KV_A_OUT = 576
+
+
+def _is_narrow_op(n: Node) -> bool:
+    """True for either narrow representation: aten.narrow.default or the
+    torch.narrow built-in (emitted by the generic fuse_gemms split)."""
+    return n.op == "call_function" and n.target in (
+        torch.narrow,
+        torch.ops.aten.narrow.default,
+    )
 
 
 def _is_linear(node: Node) -> bool:
@@ -333,161 +344,6 @@ def _execute_kv_path_in_aux_stream(gm: GraphModule, world_size: int) -> Tuple[Gr
         eliminate_dead_code(gm)
 
     return gm, num_matches
-
-
-# ===========================================================================
-# Pattern 4 (V18): Wrap KV-cone in single function call for cuda graph stream
-# consolidation. Verified by minimal v12 (2026-05-28): putting begin_aux + KV
-# ops + end_aux + wait_aux inside ONE @torch._dynamo.disable Python function
-# makes cuda capture allocate a SINGLE aux stream (PT-pattern, 1 dedicated),
-# vs the legacy pattern 2 where separate fx nodes for begin/end/wait_aux
-# cause cuda capture to allocate N dedicated streams (one per fork).
-# ===========================================================================
-
-
-def _execute_kv_cone_wrapped(gm: GraphModule) -> Tuple[GraphModule, int]:
-    """V18 pattern 4: replace KV-cone (post-dsv3) with single wrapped helper call.
-
-    Identifies the V8 KV-cone shape after fuse_dsv3_a_gemm:
-        narrow_kv (-1, 1536, 576)
-          -> split_with_sizes([512, 64], -1)
-          -> getitem(0)  -> triton_rms_norm(kv_a_norm_weight, eps) -> to.dtype = compressed_kv
-          -> getitem(1)  -> view([B, S, 1, 64]) = k_pe
-
-    Replaces the KV-cone nodes with a single ``dsv3_mla_kv_cone_aux_wrapped``
-    call that internally does the same work inside one
-    ``@torch._dynamo.disable`` function (with stream switch). This makes cuda
-    graph capture see one node instead of multiple begin/end/wait_aux + KV op
-    nodes, which is the PT-pattern stream-consolidation invariant.
-    """
-    dsv3_target = torch.ops.auto_deploy.dsv3_fused_a_gemm
-    dsv3_nodes = [n for n in gm.graph.nodes if is_op(n, dsv3_target)]
-    if not dsv3_nodes:
-        return gm, 0
-
-    graph = gm.graph
-    num_wrapped = 0
-
-    for dsv3 in dsv3_nodes:
-        narrows = [u for u in dsv3.users if is_op(u, torch.ops.aten.narrow) and len(u.args) >= 4]
-        narrow_kv = next(
-            (n for n in narrows if int(n.args[2]) == 1536 and int(n.args[3]) == 576), None
-        )
-        if narrow_kv is None:
-            continue
-
-        # Walk forward to find: split, getitem(0), rmsnorm, to.dtype (compressed_kv),
-        # getitem(1), view (k_pe), and the trtllm_mla op.
-        mla_op: Optional[Node] = None
-        split_node: Optional[Node] = None
-        compressed_kv_node: Optional[Node] = None
-        k_pe_node: Optional[Node] = None
-        kv_norm_weight: Optional[Node] = None
-        norm_eps: float = 1e-6
-
-        for u in list(narrow_kv.users):
-            if is_op(u, torch.ops.aten.split_with_sizes):
-                split_node = u
-                break
-        if split_node is None:
-            continue
-
-        # Two getitem users of split: getitem(0) = compressed_kv pre-norm, getitem(1) = k_pe pre-view
-        gi0 = gi1 = None
-        for gu in split_node.users:
-            if gu.target is _operator.getitem:
-                idx = gu.args[1]
-                if idx == 0:
-                    gi0 = gu
-                elif idx == 1:
-                    gi1 = gu
-        if gi0 is None or gi1 is None:
-            continue
-
-        # gi0 → triton_rms_norm → to.dtype = compressed_kv_node
-        norm_user = None
-        for n in gi0.users:
-            if "triton_rms_norm" in str(getattr(n, "target", "")):
-                norm_user = n
-                break
-        if norm_user is None:
-            continue
-        if len(norm_user.args) > 1 and isinstance(norm_user.args[1], Node):
-            kv_norm_weight = norm_user.args[1]
-        if len(norm_user.args) > 2:
-            norm_eps_val = norm_user.args[2]
-            if isinstance(norm_eps_val, (int, float)):
-                norm_eps = float(norm_eps_val)
-        compressed_kv_node = norm_user
-        for n in norm_user.users:
-            if is_op(n, torch.ops.aten.to):
-                compressed_kv_node = n
-                break
-
-        # gi1 → view = k_pe_node
-        for n in gi1.users:
-            if is_op(n, torch.ops.aten.view):
-                k_pe_node = n
-                break
-        if k_pe_node is None:
-            continue
-
-        # Find trtllm_mla downstream
-        from collections import deque as _deque
-
-        visited = {narrow_kv}
-        queue = _deque([narrow_kv])
-        while queue:
-            n = queue.popleft()
-            if "trtllm_mla" in str(getattr(n, "target", "")):
-                mla_op = n
-                break
-            for u in n.users:
-                if u not in visited:
-                    visited.add(u)
-                    queue.append(u)
-        if mla_op is None or kv_norm_weight is None:
-            continue
-
-        ad_logger.info(
-            "Multi-stream MLA pattern 4 (V18 wrapped KV-cone): "
-            f"dsv3={dsv3.name}, norm_w={kv_norm_weight.name}, "
-            f"compressed_kv={compressed_kv_node.name}, k_pe={k_pe_node.name}, "
-            f"mla_op={mla_op.name}"
-        )
-
-        # Build wrapper call BEFORE first KV-cone op (split_node), so it precedes
-        # all downstream KV-cone ops in graph order. Then getitems after it.
-        with graph.inserting_before(split_node):
-            wrapped_call = graph.call_function(
-                dsv3_mla_kv_cone_aux_wrapped,
-                args=(narrow_kv, kv_norm_weight),
-                kwargs={"eps": norm_eps},
-            )
-        with graph.inserting_after(wrapped_call):
-            new_compressed = graph.call_function(_operator.getitem, args=(wrapped_call, 0))
-        with graph.inserting_after(new_compressed):
-            new_k_pe = graph.call_function(_operator.getitem, args=(wrapped_call, 1))
-
-        # Replace only the mla_op's reference to compressed_kv_node and k_pe_node
-        # (avoid replace_all_uses_with which could mess up other users).
-        new_args = []
-        for a in mla_op.args:
-            if a is compressed_kv_node:
-                new_args.append(new_compressed)
-            elif a is k_pe_node:
-                new_args.append(new_k_pe)
-            else:
-                new_args.append(a)
-        mla_op.args = tuple(new_args)
-
-        num_wrapped += 1
-
-    if num_wrapped > 0:
-        eliminate_dead_code(gm)
-        gm.recompile()
-
-    return gm, num_wrapped
 
 
 # ===========================================================================
@@ -732,23 +588,28 @@ def _execute_kv_cone_in_aux_stream_fused(gm: GraphModule) -> Tuple[GraphModule, 
     """
     from collections import deque
 
-    dsv3_target = torch.ops.auto_deploy.dsv3_fused_a_gemm
-    dsv3_nodes = [n for n in gm.graph.nodes if is_op(n, dsv3_target)]
-    if not dsv3_nodes:
-        return gm, 0
-
     graph = gm.graph
     node_order = {n: i for i, n in enumerate(graph.nodes)}
     num_wrapped = 0
 
-    for dsv3 in dsv3_nodes:
-        narrows = [u for u in dsv3.users if is_op(u, torch.ops.aten.narrow) and len(u.args) >= 4]
-        narrow_kv = next(
-            (n for n in narrows if int(n.args[2]) == 1536 and int(n.args[3]) == 576), None
-        )
-        narrow_q = next(
-            (n for n in narrows if int(n.args[2]) == 0 and int(n.args[3]) == 1536), None
-        )
+    # Anchor structurally: the fused DSv3 a-projection is any node feeding two
+    # narrows of length 1536 (q_a) and 576 (kv_a).  This is producer-agnostic --
+    # matches both the dedicated dsv3_fused_a_gemm op and the generic fuse_gemms
+    # torch_linear_simple -- and identifies q/kv by LENGTH (args[3]) rather than
+    # start offset, so it is robust to the [q;kv] vs [kv;q] cat order.
+    fused_nodes = []
+    for n in graph.nodes:
+        nws = [u for u in n.users if _is_narrow_op(u) and len(u.args) >= 4]
+        lens = {int(u.args[3]) for u in nws}
+        if _DSV3_Q_A_OUT in lens and _DSV3_KV_A_OUT in lens:
+            fused_nodes.append(n)
+    if not fused_nodes:
+        return gm, 0
+
+    for dsv3 in fused_nodes:
+        narrows = [u for u in dsv3.users if _is_narrow_op(u) and len(u.args) >= 4]
+        narrow_kv = next((n for n in narrows if int(n.args[3]) == _DSV3_KV_A_OUT), None)
+        narrow_q = next((n for n in narrows if int(n.args[3]) == _DSV3_Q_A_OUT), None)
         if narrow_kv is None or narrow_q is None:
             continue
 
@@ -871,44 +732,28 @@ class MultiStreamMLAAttn(BaseTransform):
     ) -> Tuple[GraphModule, TransformInfo]:
         cuda_stream_manager.add_device(torch.cuda.current_device())
 
-        # Pattern 4 (V18): wrapped KV-cone (PT-pattern stream consolidation).
-        # DISABLED 2026-05-28: V18 regressed (-0.8% 8L); reverted to Pattern 2 (V8
-        # baseline) to cleanly isolate V21 (mla contiguous removal).  Set
-        # _V18_ENABLE_PATTERN4 = True to restore.
-        _V18_ENABLE_PATTERN4 = False
-        if _V18_ENABLE_PATTERN4:
-            gm, n_wrapped = _execute_kv_cone_wrapped(gm)
-            ad_logger.info(f"Multi-stream MLA pattern 4 (V18 wrapped KV-cone): {n_wrapped} matches")
-        else:
-            n_wrapped = 0
-
         n_unfused = 0
         n_fused = 0
         n_proj = 0
         n_no_ag = 0
-        if n_wrapped == 0:
-            # Pattern 0: full KV path on aux (unfused GEMMs with AllGather)
-            gm, n_unfused = _execute_kv_path_in_aux_stream(gm, shared_config.world_size)
-            ad_logger.info(f"Multi-stream MLA pattern 0 (unfused KV path): {n_unfused} matches")
+        # Pattern 0: full KV path on aux (unfused GEMMs with AllGather)
+        gm, n_unfused = _execute_kv_path_in_aux_stream(gm, shared_config.world_size)
+        ad_logger.info(f"Multi-stream MLA pattern 0 (unfused KV path): {n_unfused} matches")
 
-            if n_unfused == 0:
-                # Pattern 3 (V12): full KV path on aux for unfused GEMMs WITHOUT AllGather
-                gm, n_no_ag = _execute_kv_path_in_aux_stream_no_allgather(
-                    gm, shared_config.world_size
-                )
-                ad_logger.info(
-                    f"Multi-stream MLA pattern 3 (no-AG full KV path): {n_no_ag} matches"
-                )
-                if n_no_ag == 0:
-                    # Pattern 2: fused-graph (post fuse_dsv3_a_gemm) KV-cone overlap (legacy)
-                    gm, n_fused = _execute_kv_cone_in_aux_stream_fused(gm)
-                    ad_logger.info(f"Multi-stream MLA pattern 2 (fused KV cone): {n_fused} matches")
-                    if n_fused == 0:
-                        # Pattern 1: legacy projection overlap fallback
-                        gm, n_proj = _execute_kv_proj_in_aux_stream(gm)
-                        ad_logger.info(f"Multi-stream MLA pattern 1 (projection): {n_proj} matches")
+        if n_unfused == 0:
+            # Pattern 3 (V12): full KV path on aux for unfused GEMMs WITHOUT AllGather
+            gm, n_no_ag = _execute_kv_path_in_aux_stream_no_allgather(gm, shared_config.world_size)
+            ad_logger.info(f"Multi-stream MLA pattern 3 (no-AG full KV path): {n_no_ag} matches")
+            if n_no_ag == 0:
+                # Pattern 2: fused-graph KV-cone overlap (fuse_gemms + op-level dsv3 select).
+                gm, n_fused = _execute_kv_cone_in_aux_stream_fused(gm)
+                ad_logger.info(f"Multi-stream MLA pattern 2 (fused KV cone): {n_fused} matches")
+                if n_fused == 0:
+                    # Pattern 1: legacy projection overlap fallback
+                    gm, n_proj = _execute_kv_proj_in_aux_stream(gm)
+                    ad_logger.info(f"Multi-stream MLA pattern 1 (projection): {n_proj} matches")
 
-        total = n_wrapped + n_unfused + n_no_ag + n_fused + n_proj
+        total = n_unfused + n_no_ag + n_fused + n_proj
         info = TransformInfo(
             skipped=False,
             num_matches=total,
