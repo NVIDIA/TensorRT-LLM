@@ -1,13 +1,12 @@
 """Unit tests for warmup-cleanup behavior in PyTorchModelEngine.warmup().
 
-Locks in two of the three warmup-cleanup changes:
-  - Change 1: gc.collect() + torch.cuda.empty_cache() fire immediately after
+Locks in:
+  - gc.collect() + torch.cuda.empty_cache() fire immediately after
     _run_autotuner_warmup (step b) - releases autotuner exploration leftovers.
-  - Change 3: step (d) max-shape pre-population is automatically skipped when
-    PyTorchModelEngine.is_estimation_pass is True, and runs unconditionally
-    in the production pass.
+  - Step (d) max-shape pre-population runs unconditionally so the first real
+    iteration reuses the cached blocks instead of paying a cudaMalloc cost.
 
-The third change (torch.cuda.empty_cache() after teardown_managers()
+The torch.cuda.empty_cache() after teardown_managers() in py_executor_creator
 is covered end-to-end by integration tests rather than unit-tested here.
 """
 
@@ -219,34 +218,18 @@ class TestWarmupCleanup(unittest.TestCase):
             calls.count("empty_cache"), 0, f"Helix CP should skip all warmup cleanup; got {calls}"
         )
 
-    # ---- Estimation-pass step (d) skip ----
+    # ---- Step (d) runs unconditionally ----
 
-    def test_step_d_skipped_in_estimation_pass(self):
-        """Estimation-pass optimization: when is_estimation_pass=True,
-        step (d) is skipped and a skip log is emitted."""
+    def test_step_d_runs_unconditionally(self):
+        """Step (d) max-shape pre-population must run on every warmup so the
+        first real serving iteration reuses the cached blocks instead of
+        paying a cudaMalloc cost."""
         model_engine, resource_manager = _build_engine_and_resource_manager()
-        model_engine.is_estimation_pass = True
-        calls, logs = _run_warmup_tracked(model_engine, resource_manager, capture_logs=True)
-        self.assertEqual(
-            calls.count("general_warmup"),
-            1,
-            f"Expected only step (a) general_warmup during estimation; got {calls}",
-        )
-        self.assertTrue(
-            any("estimation pass" in m for m in logs),
-            f"Expected estimation-pass skip log; got logs={logs}",
-        )
-
-    def test_step_d_runs_when_is_estimation_pass_false(self):
-        """Production pass (is_estimation_pass=False, the default): both
-        step (a) and step (d) run for max-shape memory-pool pre-population."""
-        model_engine, resource_manager = _build_engine_and_resource_manager()
-        self.assertFalse(model_engine.is_estimation_pass)
         calls, _ = _run_warmup_tracked(model_engine, resource_manager)
         self.assertEqual(
             calls.count("general_warmup"),
             2,
-            f"Expected step (a) + step (d) when is_estimation_pass=False; got {calls}",
+            f"Expected step (a) + step (d) general_warmup calls; got {calls}",
         )
 
 

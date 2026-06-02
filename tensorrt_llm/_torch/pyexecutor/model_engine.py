@@ -473,7 +473,6 @@ class PyTorchModelEngine(ModelEngine):
             raise e
 
         self.is_warmup = False
-        self.is_estimation_pass = False
         self.previous_request_ids = []
         self.has_previous_device_draft = False
         self.previous_accepted_tokens_cuda = torch.empty((self.batch_size, ),
@@ -970,16 +969,11 @@ class PyTorchModelEngine(ModelEngine):
         with self.cuda_graph_runner.allow_capture():
             self._run_cuda_graph_warmup(resource_manager)
         if can_run_general_warmup:
-            if not self.is_estimation_pass:
-                # Pre-populate the memory pool with max-shape allocations to
-                # reduce fragmentation at runtime.
-                warmup_requests_configs = self._get_max_shape_warmup_requests(
-                    resource_manager)
-                self._general_warmup(resource_manager, warmup_requests_configs)
-            else:
-                logger.info(
-                    "Skipping max-shape warmup pre-population (estimation pass)"
-                )
+            # Pre-populate the memory pool with max-shape allocations to reduce
+            # fragmentation at runtime.
+            warmup_requests_configs = self._get_max_shape_warmup_requests(
+                resource_manager)
+            self._general_warmup(resource_manager, warmup_requests_configs)
 
     def _general_warmup(self, resource_manager: ResourceManager,
                         warmup_requests_configs: List[Tuple[int, int]]):

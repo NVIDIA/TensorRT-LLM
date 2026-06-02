@@ -935,9 +935,6 @@ def create_py_executor(
             if estimating_kv_cache else ExecutorMemoryType.EXTRA_RESOURCES):
         # run gc.collect() to free memory of the previous py_executor, avoid cudaFree overlap with cuda graph capture
         gc.collect()
-        model_engine.is_estimation_pass = estimating_kv_cache
-        if draft_model_engine is not None:
-            draft_model_engine.is_estimation_pass = estimating_kv_cache
         py_executor = create_py_executor_instance(
             dist=dist,
             resources=resources,
@@ -1012,11 +1009,6 @@ def create_py_executor(
 
             # run gc.collect() to free memory of the previous py_executor, avoid cudaFree overlap with cuda graph capture
             gc.collect()
-            # Production pass: step (d) max-shape pre-population is valuable
-            # here because the blocks are reused on the first real iteration.
-            model_engine.is_estimation_pass = False
-            if draft_model_engine is not None:
-                draft_model_engine.is_estimation_pass = False
             py_executor = create_py_executor_instance(
                 dist=dist,
                 resources=resources,
