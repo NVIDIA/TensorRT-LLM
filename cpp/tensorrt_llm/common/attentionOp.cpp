@@ -993,12 +993,6 @@ size_t AttentionOp::getWorkspaceSizeForGeneration(nvinfer1::DataType type, int32
     generationWorkspaceSizes.partialMax = partial_max_size;
     generationWorkspaceSizes.shiftKCache = shift_k_cache_size;
     {
-        // Cascade attention reuses the generation workspace: the AttentionOp
-        // owns a single contiguous block sized for both MMHA partials and the
-        // cascade prefix-side O / m / l accumulators.  Reporting the cascade
-        // sizes here keeps the scheduler memory estimate honest and lets
-        // CUDA Graph capture observe a stable workspace pointer (no per-call
-        // cudaMalloc inside the kernel).
         auto const cascadeSizes
             = tensorrt_llm::kernels::mmha::cascade::getCascadeWorkspaceSizes(batch_beam, mNumHeads, mHeadSize);
         generationWorkspaceSizes.cascadeOut = cascadeSizes.out;
@@ -2541,9 +2535,6 @@ int AttentionOp::enqueueGeneration(EnqueueGenerationParams<T> const& params, cud
     workspaceSizes.partialMax = partial_max_size;
     workspaceSizes.shiftKCache = shift_k_cache_size;
     {
-        // Mirror of the size estimate above: the cascade fast-path is dispatched
-        // through the same MMHA generation workspace, so we slice cascade O/m/l
-        // out of the same allocation and forward the pointers via dispatch_params.
         auto const cascadeSizes
             = tensorrt_llm::kernels::mmha::cascade::getCascadeWorkspaceSizes(batch_beam, mNumHeads, mHeadSize);
         workspaceSizes.cascadeOut = cascadeSizes.out;

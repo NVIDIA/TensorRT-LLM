@@ -31,7 +31,6 @@
 #include <cfloat>
 #include <cmath>
 #include <cstdint>
-#include <mutex>
 #include <type_traits>
 
 TRTLLM_NAMESPACE_BEGIN
@@ -970,15 +969,10 @@ bool cascade_eligible(KernelParamsType const& params)
 {
     if constexpr (KernelParamsType::DO_CROSS_ATTENTION)
     {
-        TLLM_LOG_WARNING("cascade_eligible REJECT: DO_CROSS_ATTENTION=true");
         return false;
     }
     if (!tensorrt_llm::common::getEnvEnableCascadeMmha())
     {
-        // Only print once to avoid flooding.
-        static std::once_flag flag;
-        std::call_once(
-            flag, [] { TLLM_LOG_WARNING("cascade_eligible REJECT: TRTLLM_ENABLE_CASCADE_MMHA not set or =0"); });
         return false;
     }
     {
@@ -991,22 +985,11 @@ bool cascade_eligible(KernelParamsType const& params)
         }
         if (sm < 80)
         {
-            static std::once_flag flag;
-            std::call_once(flag,
-                [sm]
-                {
-                    TLLM_LOG_WARNING(
-                        "cascade_eligible REJECT: device SM=%d < 80 (cascade kernels require mma.m16n8k16 / cp.async, "
-                        "Ampere or newer)",
-                        sm);
-                });
             return false;
         }
     }
     if (params.position_shift_enabled || params.block_sparse_attention)
     {
-        TLLM_LOG_WARNING("cascade_eligible REJECT: position_shift=%d block_sparse=%d",
-            (int) params.position_shift_enabled, (int) params.block_sparse_attention);
         return false;
     }
     // v0.1 supports LEARNED_ABSOLUTE and full-head GPT-NeoX RoPE (Qwen / Llama /
@@ -1015,8 +998,6 @@ bool cascade_eligible(KernelParamsType const& params)
     if (params.position_embedding_type != PositionEmbeddingType::kLEARNED_ABSOLUTE
         && params.position_embedding_type != PositionEmbeddingType::kROPE_GPT_NEOX)
     {
-        TLLM_LOG_WARNING(
-            "cascade_eligible REJECT: position_embedding_type=%d (want 0 or 2)", (int) params.position_embedding_type);
         return false;
     }
     if (params.position_embedding_type == PositionEmbeddingType::kROPE_GPT_NEOX)
@@ -1025,16 +1006,12 @@ bool cascade_eligible(KernelParamsType const& params)
         // in-place within shared memory.
         if (params.rotary_embedding_dim != params.hidden_size_per_head)
         {
-            TLLM_LOG_WARNING("cascade_eligible REJECT: rotary_dim=%d != head_dim=%d (partial rotation)",
-                params.rotary_embedding_dim, params.hidden_size_per_head);
             return false;
         }
         // Dynamic / long / yarn / m-scaling require cached cos-sin tables and
         // per-request base updates that v0.1 does not implement.
         if (params.rotary_embedding_scale_type != RotaryScalingType::kNONE)
         {
-            TLLM_LOG_WARNING("cascade_eligible REJECT: rotary_scale_type=%d (want kNONE=0)",
-                (int) params.rotary_embedding_scale_type);
             return false;
         }
         // When scale_type == kNONE, the cos_sin_cache (when provided by the
@@ -1045,42 +1022,32 @@ bool cascade_eligible(KernelParamsType const& params)
         // numerically equivalent under kNONE scaling.
         if (params.mrope_position_deltas != nullptr)
         {
-            TLLM_LOG_WARNING("cascade_eligible REJECT: mrope_position_deltas non-null");
             return false;
         }
     }
     if (params.attn_logit_softcapping_scale != 0.0f)
     {
-        TLLM_LOG_WARNING(
-            "cascade_eligible REJECT: attn_logit_softcapping_scale=%f", params.attn_logit_softcapping_scale);
         return false;
     }
     if (params.relative_attention_bias != nullptr || params.linear_bias_slopes != nullptr)
     {
-        TLLM_LOG_WARNING("cascade_eligible REJECT: relative_attn_bias or linear_bias_slopes non-null");
         return false;
     }
     if (params.attention_mask != nullptr || params.attention_sinks != nullptr)
     {
-        TLLM_LOG_WARNING("cascade_eligible REJECT: attention_mask or attention_sinks non-null");
         return false;
     }
     if (params.int8_kv_cache || params.fp8_kv_cache)
     {
-        TLLM_LOG_WARNING(
-            "cascade_eligible REJECT: int8_kv=%d fp8_kv=%d", (int) params.int8_kv_cache, (int) params.fp8_kv_cache);
         return false;
     }
     if (params.input_lengths == nullptr || params.length_per_sample == nullptr)
     {
-        TLLM_LOG_WARNING("cascade_eligible REJECT: input_lengths=%p length_per_sample=%p", (void*) params.input_lengths,
-            (void*) params.length_per_sample);
         return false;
     }
     int const dh = params.hidden_size_per_head;
     if (dh != 64 && dh != 128)
     {
-        TLLM_LOG_WARNING("cascade_eligible REJECT: hidden_size_per_head=%d (want 64 or 128)", dh);
         return false;
     }
 
@@ -1124,15 +1091,8 @@ template <typename T, typename T_cache, typename KVCacheBuffer, int Dh>
 bool launch_cascade_attention(
     Multihead_attention_params<T, false> const& params, KVCacheBuffer const& kv_cache_buffer, cudaStream_t stream)
 {
-    // Hard guard: the kernel implementation supports T_cache == T only in v0.
-    // The dispatcher only instantiates this with T == T_cache, so make it a
-    // compile-time error if a future caller forgets.
     static_assert(std::is_same_v<T, T_cache>, "cascade kernel requires T_cache == T");
 
-    if (!cascade_eligible(params))
-    {
-        return false;
-    }
 
     // IMPORTANT: In TRT-LLM MMHA, params.batch_size = total_sequences =
     // num_requests × beam_width.  Our cascade design separates the "shared
@@ -1142,18 +1102,6 @@ bool launch_cascade_attention(
     int const num_requests = total_seqs / beam;
     int const num_heads = params.num_heads;
     int const dh = params.hidden_size_per_head;
-
-    // One-shot launch confirmation so operators can verify the cascade path is
-    // actually engaged without paying per-call logging cost.
-    {
-        static std::once_flag flag;
-        std::call_once(flag,
-            [dh, beam, num_requests, total_seqs]
-            {
-                TLLM_LOG_INFO("cascade_attention: ENGAGED (Dh=%d beam=%d num_requests=%d total_seqs=%d)", dh, beam,
-                    num_requests, total_seqs);
-            });
-    }
 
     // Compute workspace layout: 3 buffers packed contiguously.
     // Each buffer is indexed by [total_seqs × num_heads (× Dh for out)].
