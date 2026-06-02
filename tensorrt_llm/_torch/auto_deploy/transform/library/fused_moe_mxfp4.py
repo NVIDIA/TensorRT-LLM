@@ -19,8 +19,6 @@ import torch.nn as nn
 from pydantic import Field
 from torch.fx import GraphModule, Node
 
-from tensorrt_llm._torch.modules.fused_moe.quantization import _get_weight_alignment
-
 from ..._compat import get_sm_version
 from ...utils.logger import ad_logger
 from ...utils.module import get_submodule_of_param
@@ -313,6 +311,10 @@ def make_mxfp4_sharding_load_hook(
 
     # TP-aware pre-pad/slice math (only used when moe_tp_size > 1).
     if moe_tp_size > 1:
+        # Lazy import: TRT-LLM-only helper. Keeps this module importable in
+        # standalone (no tensorrt_llm) so its transforms still register.
+        from tensorrt_llm._torch.modules.fused_moe.quantization import _get_weight_alignment
+
         alignment_tp = _get_weight_alignment(
             _WEIGHT_ALIGNMENT, _MXFP4_SCALING_VECTOR_SIZE, moe_tp_size, intermediate_size
         )
@@ -798,6 +800,9 @@ class QuantizeMXFP4MOE(BaseTransform):
             # ``_get_weight_alignment``, so it's also the per-rank kernel
             # weight-alignment size that the trtllm-gen runner expects.
             if moe_tp_size > 1:
+                # Lazy import: TRT-LLM-only helper (see module-level note above).
+                from tensorrt_llm._torch.modules.fused_moe.quantization import _get_weight_alignment
+
                 alignment_tp = _get_weight_alignment(
                     _WEIGHT_ALIGNMENT, _MXFP4_SCALING_VECTOR_SIZE, moe_tp_size, i_size
                 )
