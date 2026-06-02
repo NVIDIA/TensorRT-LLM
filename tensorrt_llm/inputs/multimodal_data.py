@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import json
 from dataclasses import dataclass
 from typing import Any, Protocol
 
@@ -16,21 +17,31 @@ class ContentHasher(Protocol):
         """Update the hash with raw bytes."""
 
 
+def _pack(tag: bytes, *payloads: bytes) -> bytes:
+    parts = [tag]
+    for payload in payloads:
+        parts.append(len(payload).to_bytes(8, "big", signed=False))
+        parts.append(payload)
+    return b"".join(parts)
+
+
 def serialize_item(obj: object) -> bytes:
     """Serialize a supported multimodal hash leaf to bytes."""
     if isinstance(obj, str):
-        return obj.encode("utf-8")
+        return _pack(b"S", obj.encode("utf-8"))
     if isinstance(obj, bytes):
-        return obj
+        return _pack(b"B", obj)
     if isinstance(obj, (int, float)):
-        return np.array(obj).tobytes()
+        obj = np.array(obj)
 
     if isinstance(obj, Image.Image):
-        return np.array(obj.convert("RGBA")).tobytes()
+        obj = np.array(obj.convert("RGBA"))
     if isinstance(obj, torch.Tensor):
-        return obj.numpy().tobytes()
+        obj = obj.detach().cpu().contiguous().numpy()
     if isinstance(obj, np.ndarray):
-        return obj.tobytes()
+        obj = np.ascontiguousarray(obj)
+        return _pack(b"A", str(obj.dtype).encode("utf-8"),
+                     repr(obj.shape).encode("utf-8"), obj.tobytes())
     if isinstance(obj, (tuple, list)):
         container_tag = b"T" if isinstance(obj, tuple) else b"L"
         parts = [container_tag, len(obj).to_bytes(8, "big", signed=False)]
@@ -97,12 +108,13 @@ class VideoData(BaseModalityData):
             raise TypeError("metadata must be a dictionary")
 
     def update_hash(self, hasher: ContentHasher) -> None:
+        hasher.update(b"<video>")
+        hasher.update(serialize_item(json.dumps(self.metadata, sort_keys=True,
+                                                default=str)))
         for frame in self.frames:
             hasher.update(b"<frame>")
             if isinstance(frame, torch.Tensor):
                 frame = frame.detach().cpu().contiguous()
             hasher.update(serialize_item(frame))
-        # Extend this to include metadata if fields such as sampled frame
-        # indices become part of the model-visible cache identity.
         if self.audio is not None:
             self.audio.update_hash(hasher)
