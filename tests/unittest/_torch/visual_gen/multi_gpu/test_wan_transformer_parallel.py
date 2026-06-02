@@ -128,7 +128,7 @@ _PRETRAINED_CONFIG_CACHE: dict | None = None
 _VIDEO_T = 3  # from 9 frames
 _VIDEO_H = 60  # from 480 px
 _VIDEO_W = 104  # from 832 px
-_TEXT_SEQ = 77
+_TEXT_SEQ = 80
 _TIMESTEP = 0.5
 
 SEED_WEIGHTS = 42

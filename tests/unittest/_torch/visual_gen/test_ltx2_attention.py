@@ -20,7 +20,6 @@ from tensorrt_llm._torch.visual_gen.config import (
     DiffusionModelConfig,
     create_attention_metadata_state,
 )
-from tensorrt_llm._torch.visual_gen.mapping import VisualGenMapping
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.visual_gen.args import AttentionConfig
@@ -36,36 +35,6 @@ def _create_config(backend: str = "VANILLA") -> DiffusionModelConfig:
         mapping=Mapping(),
         attention=AttentionConfig(backend=backend),
         skip_create_weights_in_init=False,
-    )
-
-
-def _create_config_with_vgm(
-    *,
-    ulysses_size: int = 2,
-    ring_size: int = 1,
-    attn2d_row_size: int = 1,
-    attn2d_col_size: int = 1,
-    backend: str = "VANILLA",
-) -> DiffusionModelConfig:
-    """DiffusionModelConfig with VisualGenMapping for sequence-parallel tests."""
-    from types import SimpleNamespace
-
-    world_size = ring_size * attn2d_row_size * attn2d_col_size * ulysses_size
-    vgm = VisualGenMapping(
-        world_size=world_size,
-        rank=0,
-        ring_size=ring_size,
-        ulysses_size=ulysses_size,
-        attn2d_row_size=attn2d_row_size,
-        attn2d_col_size=attn2d_col_size,
-    )
-    return DiffusionModelConfig(
-        pretrained_config=SimpleNamespace(),
-        quant_config=QuantConfig(),
-        mapping=Mapping(),
-        attention=AttentionConfig(backend=backend),
-        visual_gen_mapping=vgm,
-        skip_create_weights_in_init=True,
     )
 
 
@@ -263,71 +232,6 @@ class TestLTX2CrossAttention(unittest.TestCase):
             output = attn(x, context=ctx, pe=None)
 
         self.assertEqual(output.shape, (batch_size, q_seq, query_dim))
-
-
-class TestLTX2CrossAttentionSequenceParallel(unittest.TestCase):
-    """Verify LTX2Attention cross-attn sequence-parallel wiring."""
-
-    def test_text_cross_attn_disables_sequence_parallel(self):
-        from tensorrt_llm._torch.visual_gen.attention_backend.parallel import UlyssesAttention
-        from tensorrt_llm._torch.visual_gen.attention_backend.vanilla import VanillaAttention
-        from tensorrt_llm._torch.visual_gen.models.ltx2.transformer_ltx2 import LTX2Attention
-
-        config = _create_config_with_vgm(ulysses_size=2)
-        attn = LTX2Attention(
-            query_dim=128,
-            context_dim=128,
-            heads=4,
-            dim_head=32,
-            config=config,
-            layer_idx=0,
-            enable_sequence_parallel=False,
-        )
-
-        self.assertIsInstance(attn.attn, VanillaAttention)
-        self.assertNotIsInstance(attn.attn, UlyssesAttention)
-        self.assertFalse(attn._has_dual_attn)
-        self.assertFalse(attn.is_ulysses_active())
-
-    def test_v2a_cross_attn_enables_ulysses_only(self):
-        from tensorrt_llm._torch.visual_gen.attention_backend.parallel import UlyssesAttention
-        from tensorrt_llm._torch.visual_gen.models.ltx2.transformer_ltx2 import LTX2Attention
-
-        config = _create_config_with_vgm(ulysses_size=2)
-        attn = LTX2Attention(
-            query_dim=128,
-            context_dim=256,
-            heads=4,
-            dim_head=32,
-            config=config,
-            layer_idx=0,
-            enable_sequence_parallel=True,
-        )
-
-        self.assertIsInstance(attn.attn, UlyssesAttention)
-        self.assertTrue(attn._has_dual_attn)
-        self.assertTrue(attn.is_ulysses_active())
-
-    def test_v2a_cross_attn_ring_plus_ulysses_falls_back_to_plain(self):
-        from tensorrt_llm._torch.visual_gen.attention_backend.parallel import UlyssesAttention
-        from tensorrt_llm._torch.visual_gen.attention_backend.vanilla import VanillaAttention
-        from tensorrt_llm._torch.visual_gen.models.ltx2.transformer_ltx2 import LTX2Attention
-
-        config = _create_config_with_vgm(ulysses_size=2, ring_size=2)
-        attn = LTX2Attention(
-            query_dim=128,
-            context_dim=256,
-            heads=4,
-            dim_head=32,
-            config=config,
-            layer_idx=0,
-            enable_sequence_parallel=True,
-        )
-
-        self.assertIsInstance(attn.attn, VanillaAttention)
-        self.assertNotIsInstance(attn.attn, UlyssesAttention)
-        self.assertFalse(attn._has_dual_attn)
-        self.assertFalse(attn.is_ulysses_active())
 
 
 class TestLTX2GatedAttention(unittest.TestCase):

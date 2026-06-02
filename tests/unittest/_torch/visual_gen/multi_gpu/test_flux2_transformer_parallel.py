@@ -123,7 +123,7 @@ _PRETRAINED_CONFIG_CACHE: dict | None = None
 # converted to latent token grid (VAE downsample x8 -> 64x64; seq_len=4096).
 _IMG_H = 64
 _IMG_W = 64
-_TXT_SEQ = 77
+_TXT_SEQ = 80
 
 _TIMESTEP = 0.5
 _GUIDANCE = 3.5
