@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import math
+import os
 from enum import Enum
 from typing import TYPE_CHECKING, Dict, Optional, Set, Tuple
 
@@ -26,6 +27,16 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import DataRole
 from ..dsa import HAS_FAST_HADAMARD, DSAtrtllmAttentionMetadata, Indexer, rotate_activation
 from ..kernel import deepseek_v4_local_to_global_indices
 from .compressor import Compressor, KVCacheDtype, resolve_kv_cache_dtype
+
+# On SM120 there is no DeepGEMM lightning indexer, and its dense fallback is stale/wrong for kv > index_topk -> the
+# ratio-4/CSA layers gathered the wrong compressed tokens (the SM120 long-context accuracy bug). CSA's correct
+# selection while the compressed count (kv//4) <= index_topk (i.e. kv <= index_topk*4) is "attend ALL compressed
+# entries" (the top-k selects all). So on SM120 we build that selection SEQUENTIALLY ([0..count-1]) and bypass the
+# indexer entirely (default). Set TRTLLM_DSV4_SM120_RATIO4_USE_INDEXER=1 to force the (broken) indexer path for A/B.
+# NOTE kv > index_topk*4 attends only the OLDEST index_topk entries -- a stopgap until a real SM120 lightning-indexer
+# top-k is implemented.
+_DSV4_SM120_RATIO4_USE_INDEXER = os.environ.get("TRTLLM_DSV4_SM120_RATIO4_USE_INDEXER", "0") == "1"
+
 
 if TYPE_CHECKING:
     from tensorrt_llm.llmapi.llm_args import SparseAttentionConfig
@@ -1409,7 +1420,21 @@ class DeepseekV4TrtllmAttention(TrtllmAttention):
             if self.compress_ratio == 4:
                 topk_indices = forward_args.topk_indices
                 assert topk_indices is not None, "topk_indices is required when compress_ratio=4"
-                compressed_local_indices = topk_indices
+                if get_sm_version() == 120 and not _DSV4_SM120_RATIO4_USE_INDEXER:
+                    # SM120 has no DeepGEMM lightning indexer. Attend ALL compressed entries sequentially
+                    # [0..count-1] (count = kv//4 = sparse_mla_topk_lens[4] - window_size) -- the correct CSA
+                    # selection while count <= index_topk. Bypasses the stale/wrong indexer buffer with no
+                    # skip_indexer side-effects. (kv > index_topk*4 attends only the oldest index_topk -- stopgap.)
+                    window_size = self.sparse_attention_config.window_size
+                    count = (metadata.sparse_mla_topk_lens[4][start_idx:end_idx].to(torch.int32)
+                             - window_size).clamp(min=0)
+                    width = topk_indices.shape[1]
+                    col = torch.arange(width, device=topk_indices.device, dtype=torch.int32)
+                    seq = col.unsqueeze(0).expand(count.shape[0], width)
+                    compressed_local_indices = torch.where(
+                        col.unsqueeze(0) < count.unsqueeze(1), seq, torch.full_like(seq, -1))
+                else:
+                    compressed_local_indices = topk_indices
             else:
                 compressed_local_indices = metadata.compressed_local_indices_cuda[start_idx:end_idx]
         else:
