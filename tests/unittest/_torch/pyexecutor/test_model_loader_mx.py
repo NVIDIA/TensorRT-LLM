@@ -163,14 +163,16 @@ class _HookRecorder(nn.Module):
         name: str,
         events: list[tuple[str, str]],
         *,
-        removed: bool = False,
-        transformed: bool = False,
+        removed: bool | None = None,
+        transformed: bool | None = None,
     ) -> None:
         super().__init__()
         self.name = name
         self.events = events
-        self._weights_removed = removed
-        self._weights_transformed = transformed
+        if removed is not None:
+            self._weights_removed = removed
+        if transformed is not None:
+            self._weights_transformed = transformed
 
     def setup_aliases(self):
         self.events.append((self.name, "setup_aliases"))
