@@ -1,18 +1,46 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional
+from enum import IntEnum
+from typing import Dict, FrozenSet, List, Optional
 
 import numpy as np
 
 BUFFER_ENTRY_DTYPE = np.dtype(
     [
         ("local_layer_id", np.uint32),
-        ("role", np.uint32),
         ("offset", np.uint32),
         ("size", np.uint32),
     ]
 )
+
+
+class MapperKind(IntEnum):
+    """Slot metadata shape — selects how disagg derives the pool's layer set.
+
+    INDEXED: PoolView.buffer_entries lists ``(local_layer_id, offset, size)``
+        per buffer. Disagg reads ``local_layer_id`` to know *which* layers
+        from the LG live in this pool (a pool may cover a subset when V2
+        splits an LG into multiple pools by buffer-size class). The
+        ``offset`` / ``size`` columns are carried for future use but are not
+        currently consumed at byte-transfer time.
+    FLAT:    PoolView.buffer_entries is empty. Disagg assumes the pool
+        covers *all* layers of the LG, packed equal-sized in
+        ``local_layers`` order. Used today by the DSA (DeepSeek Sparse
+        Attention, v3.2) indexer K cache pool, whose slot layout is a dense
+        ``(numLayers, kvFactor, blockSize)`` array.
+
+    Byte arithmetic is the same for both kinds: per-layer stride is
+    ``slot_bytes // num_layers``. The kind only affects how disagg discovers
+    the pool's layer set during pool matching.
+
+    Mamba state pools do not use this enum: Mamba's transfer is dispatched
+    through :class:`MambaPolicy` which hard-codes the ``is_conv`` switch and
+    bypasses the attention pool-matching path entirely.
+    """
+
+    INDEXED = 0
+    FLAT = 1
 
 
 @dataclass
@@ -74,15 +102,32 @@ class LocalLayer:
 class PoolView:
     """
     Per-layer-group view of a physical pool (slot layout for this life cycle).
+
+    Fields:
+        pool_idx: Index of the physical pool within its pool group.
+        buffer_entries: Per-(layer, role) byte layout. ``role`` is a
+            manager-private uint32 used only for byte-level addressing within
+            this side; it is not compared across peers.
+        pool_role: Set of native role-name strings (whatever the cache manager
+            uses, e.g. ``"key"`` / ``"value"`` / ``"deepseek_v4_swa"``) that
+            live in this pool. Used as the *equivalence label* for peer-to-peer
+            pool matching: two pools match iff their ``pool_role`` frozensets
+            are equal. Disagg never enumerates the role-name vocabulary —
+            adding a new role on the manager side requires no disagg change.
+        mapper_kind: Closed-set discriminator for picking the Mapper family.
     """
 
     pool_idx: int
     buffer_entries: np.ndarray  # dtype=BUFFER_ENTRY_DTYPE
+    pool_role: FrozenSet[str] = field(default_factory=frozenset)
+    mapper_kind: MapperKind = MapperKind.INDEXED
 
     def to_dict(self) -> dict:
         return {
             "pool_idx": int(self.pool_idx),
             "buffer_entries": self.buffer_entries.tolist(),
+            "pool_role": sorted(self.pool_role),
+            "mapper_kind": int(self.mapper_kind),
         }
 
     @staticmethod
@@ -96,6 +141,8 @@ class PoolView:
                 [tuple(row) for row in raw],
                 dtype=BUFFER_ENTRY_DTYPE,
             ),
+            pool_role=frozenset(data["pool_role"]),
+            mapper_kind=MapperKind(int(data["mapper_kind"])),
         )
 
 
