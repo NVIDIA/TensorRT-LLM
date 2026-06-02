@@ -1814,8 +1814,10 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                 get_indices_block_size(),
             )
 
-        # Resolve skip-softmax thresholds from the config. Any per-step
-        # adjustment would go here.
+        # Skip-softmax thresholds reach the op through ``forward_args`` rather
+        # than being read from ``self`` directly, so a caller can override them
+        # per step. Keep this fill even though it currently just mirrors the
+        # config -- it is the seam for per-step thresholds.
         config_params = self._skip_softmax_kernel_params
         if config_params is not None:
             forward_args.skip_softmax_kernel_params = config_params
