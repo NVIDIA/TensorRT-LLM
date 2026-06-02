@@ -757,7 +757,7 @@ def register_vision_encoder(
     def wrapper(model_cls: Type[nn.Module]) -> Type[nn.Module]:
         registered = False
         for arch_name, registered_cls in MODEL_CLASS_MAPPING.items():
-            if registered_cls.__name__ == model_cls.__name__:
+            if registered_cls is model_cls:
                 MODEL_CLASS_VISION_ENCODER_MAPPING[arch_name] = (
                     vision_encoder_cls, vlm_base_model)
                 registered = True

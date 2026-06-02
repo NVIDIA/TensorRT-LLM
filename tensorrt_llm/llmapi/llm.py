@@ -567,6 +567,13 @@ class BaseLLM:
         # This branch is applicable for Encode --> Prefill handoff scenario,
         # in E/P/D/ and E/PD settings. Prefill worker executes this code path.
         if is_mm_disagg:
+            if self.args.backend == "_autodeploy":
+                raise ValueError(
+                    "Multimodal disaggregated inference (encode -> prefill "
+                    "embedding handoff) is not supported with the AutoDeploy "
+                    "backend. AutoDeploy runs the multimodal encoder in-prefill "
+                    "on raw inputs and does not consume precomputed multimodal "
+                    "embeddings.")
             if not getattr(self.input_processor, "support_mm_disagg", False):
                 raise ValueError(
                     "Multimodal disaggregated inference is not supported for this model"

@@ -14,7 +14,7 @@ import types
 from collections import abc, defaultdict
 from dataclasses import dataclass
 from types import SimpleNamespace
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import torch
 from strenum import StrEnum
@@ -72,38 +72,6 @@ _RESERVED_MM_DATA_KEYS = frozenset(
         "multimodal_embed_mask_cumsum",
     }
 )
-
-
-def _append_mm_extra_args(
-    extra_args: Dict[str, List[torch.Tensor]], multimodal_data: abc.Mapping[str, Any]
-) -> None:
-    for key, value in multimodal_data.items():
-        if key in _RESERVED_MM_DATA_KEYS:
-            continue
-        if key == "multimodal_embedding" and not torch.is_tensor(value):
-            # E/P handoff can temporarily park shared-tensor handle dicts here.
-            # Those are transport metadata, not model-forward tensor kwargs.
-            continue
-        extra_args[key].append(value)
-
-
-def _metadata_to_list(value: Any) -> List[int]:
-    """Normalize request-side MM metadata before AutoDeploy flattens it.
-
-    The processor handoff produces Python lists, but request-side
-    py_multimodal_data can already contain tensorized metadata by the time
-    AutoDeploy stages chunked prefill. Keep this narrow until the E/P/D handoff
-    uses one representation everywhere.
-    """
-    # TODO(TRTLLM-12419): Remove this once MM layout metadata is never a mix of
-    # processor-side lists and request-side tensors.
-    if value is None:
-        return []
-    if torch.is_tensor(value):
-        value = value.detach().cpu().tolist()
-        if not isinstance(value, list):
-            return [int(value)]
-    return list(value)
 
 
 @dataclass
@@ -627,7 +595,7 @@ class ADEngine(ModelEngine):
             mm_item_types = layout_metadata.get("item_types", []) if layout_metadata else []
             mm_pos_list = list(mm_pos) if mm_pos is not None else []
             mm_len_list = list(mm_len) if mm_len is not None else []
-            mm_item_types_list = _metadata_to_list(mm_item_types)
+            mm_item_types_list = list(mm_item_types)
             if len(mm_pos_list) != len(mm_len_list):
                 raise ValueError(
                     "Mismatch between multimodal_positions and multimodal_lengths in "
@@ -648,10 +616,10 @@ class ADEngine(ModelEngine):
             flat_cumsum = mm_data.get("multimodal_embed_mask_cumsum")
             # special_token_offsets indices into the dense MM-token-list (which includes both embeds and specials).
             # It does not index into the prompt-position-indexed cumsum.
-            special_offsets_source = mm_data.get("special_token_offsets")
-            if special_offsets_source is None and layout_metadata:
-                special_offsets_source = layout_metadata.get("special_token_offsets")
-            special_offsets = _metadata_to_list(special_offsets_source)
+            special_offsets = list(
+                mm_data.get("special_token_offsets")
+                or (layout_metadata or {}).get("special_token_offsets", [])
+            )
             mm_special_offsets_cu_seqlen.append(
                 mm_special_offsets_cu_seqlen[-1] + len(special_offsets)
             )
@@ -798,7 +766,10 @@ class ADEngine(ModelEngine):
             # store extra arguments
             if request.py_multimodal_data is not None:
                 has_context_multimodal_data = True
-                _append_mm_extra_args(extra_args, request.py_multimodal_data)
+                for k, v in request.py_multimodal_data.items():
+                    if k in _RESERVED_MM_DATA_KEYS:
+                        continue
+                    extra_args[k].append(v)
 
         # store num_prefill and num_prefill_tokens
         num_prefill = len(context_requests)

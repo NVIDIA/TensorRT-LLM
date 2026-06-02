@@ -4700,26 +4700,40 @@ class PyTorchModelEngine(ModelEngine):
                 'mm_embedding_request_indices': [],
                 'mm_embedding_lengths': [],
             }
-        active_multimodal_requests = [(request_idx, request)
-                                      for request_idx, request in enumerate(
-                                          scheduled_requests.context_requests)
-                                      if request.py_multimodal_data is not None]
-        if len(multimodal_params) != len(active_multimodal_requests):
+        # Some ctx requests carry
+        # just mrope metadata in their py_multimodal_data. no encoder payload.
+        # so keep only ctx requests with explicit multimodal_embedding_lengths
+        # that's signal for the real encoder-payload.
+        mm_context_requests = [(request_idx, request) for request_idx, request
+                               in enumerate(scheduled_requests.context_requests)
+                               if request.py_multimodal_data is not None]
+        if len(mm_context_requests) != len(multimodal_params):
             raise ValueError(
-                "mm_encoder_only expects one multimodal payload per active "
-                "multimodal context request")
+                "mm_encoder_only expects one multimodal payload per context "
+                "request carrying py_multimodal_data")
+        mm_request_indices_with_payload = []
+        mm_params_with_payload = []
         mm_embedding_lengths = []
-        for _, request in active_multimodal_requests:
+        for (request_idx,
+             request), multimodal_param in zip(mm_context_requests,
+                                               multimodal_params):
             multimodal_embedding_lengths = get_multimodal_embedding_lengths(
                 request)
             if multimodal_embedding_lengths is None:
-                raise ValueError(
-                    "mm_encoder_only active multimodal requests must provide "
-                    "multimodal_embedding_lengths")
+                # having no encoder payload -> skip vision encoder.
+                continue
+            mm_request_indices_with_payload.append(request_idx)
+            mm_params_with_payload.append(multimodal_param)
             mm_embedding_lengths.append(multimodal_embedding_lengths)
+        if not mm_params_with_payload:
+            return {
+                'mm_embeddings': [],
+                'mm_embedding_request_indices': [],
+                'mm_embedding_lengths': [],
+            }
         # For mm_encoder_only mode, we only run the vision encoder part
         # The model should be a vision encoder (e.g., Qwen2VisionModelBase)
-        mm_embeddings = self.model.forward(multimodal_params)
+        mm_embeddings = self.model.forward(mm_params_with_payload)
         assert len(
             mm_embeddings
         ) == 1, "mm_embeddings should be a 1-element list, mix modality (video+image) is not supported"
@@ -4735,7 +4749,7 @@ class PyTorchModelEngine(ModelEngine):
         # Extract mrope position data from multimodal_params if available
         mrope_position_ids_list = []
         mrope_position_deltas_list = []
-        for multimodal_param in multimodal_params:
+        for multimodal_param in mm_params_with_payload:
             mrope_config = multimodal_param.multimodal_data.get(
                 'mrope_config', {})
             mrope_position_ids = mrope_config.get('mrope_position_ids')
@@ -4748,20 +4762,17 @@ class PyTorchModelEngine(ModelEngine):
         # mrope lists must align 1:1 with multimodal_params (or be empty);
         # the sampler indexes them by per-MM-result position into mm_embeddings.
         assert (len(mrope_position_ids_list) == len(mrope_position_deltas_list)
-                and len(mrope_position_ids_list) in (0, len(multimodal_params))
-                ), (f"mrope alignment: got {len(mrope_position_ids_list)} ids, "
+                and len(mrope_position_ids_list)
+                in (0, len(mm_params_with_payload))), (
+                    f"mrope alignment: got {len(mrope_position_ids_list)} ids, "
                     f"{len(mrope_position_deltas_list)} deltas, "
-                    f"{len(multimodal_params)} mm params")
+                    f"{len(mm_params_with_payload)} mm params")
 
         result = {
-            'mm_embeddings':
-            mm_embeddings,
-            'logits':
-            None,
-            'mm_embedding_request_indices':
-            [request_idx for request_idx, _ in active_multimodal_requests],
-            'mm_embedding_lengths':
-            mm_embedding_lengths,
+            'mm_embeddings': mm_embeddings,
+            'logits': None,
+            'mm_embedding_request_indices': mm_request_indices_with_payload,
+            'mm_embedding_lengths': mm_embedding_lengths,
         }
         if mrope_position_ids_list:
             result['mrope_position_ids'] = mrope_position_ids_list

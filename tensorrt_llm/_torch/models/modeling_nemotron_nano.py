@@ -909,7 +909,7 @@ class NanoV2VLMultimodalEncoder(NanoV2VLVisionEncoder):
                 )
             audio_data = param.multimodal_data[modality_type].get("audio")
             if audio_data is not None:
-                # Video audio needs the full Nano model path to interleave sound.
+                # TODO(TRTLLM-13129): Add audio support for encoder handoff.
                 raise NotImplementedError(
                     "NanoV2VL MultimodalEncoder does not yet encode audio extracted from video."
                 )
