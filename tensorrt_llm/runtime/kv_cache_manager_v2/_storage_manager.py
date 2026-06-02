@@ -13,7 +13,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import logging
 import math
 import os
 import threading
@@ -177,7 +176,7 @@ MigrationRecorder = Callable[[Sequence[Page], Sequence[Slot], CacheLevel, CacheL
 # without being migrated to any further tier (i.e. dropped from the cache hierarchy).
 DropRecorder = Callable[[Sequence[Page], CacheLevel], None]
 
-_kv_metrics_logger = logging.getLogger("tensorrt_llm.kv_cache_metrics")
+from tensorrt_llm.logger import logger
 
 
 class KVCacheMetrics:
@@ -397,7 +396,7 @@ class StorageManager:
                     f"| {level_name}: used={used} free={s.free}"
                     f" evictable={s.evictable} total={s.total}"
                 )
-            _kv_metrics_logger.info("[KVCacheMetrics] %s", " ".join(parts))
+            logger.info("[KVCacheMetrics]", " ".join(parts))
 
     def get_pool_group_index(self, life_cycle: LifeCycleId) -> PoolGroupIndex:
         return self._life_cycle_grouping[life_cycle]
