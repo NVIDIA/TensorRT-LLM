@@ -1121,11 +1121,13 @@ class DecodingBaseConfig(StrictBaseModel):
         "PyTorch backend only.")
 
     use_rejection_sampling: bool = Field(
-        default=False,
+        default=True,
         status="prototype",
         description=
-        "If true, enables rejection sampling for one-model speculative decoding paths. "
-        "This is intended for non-greedy sampling configurations on the PyTorch backend. "
+        "If true (default), enables rejection sampling for one-model speculative "
+        "decoding paths when the batch contains any non-greedy request. All-greedy "
+        "batches always take the argmax fast path regardless of this flag. Set to "
+        "false to fall back to exact-match verification on non-greedy batches. "
         "The non-dynamic-tree one-model path requires FlashInfer.")
 
     # If set, drafting is allowed to use chain drafter.
@@ -1182,13 +1184,14 @@ class DecodingBaseConfig(StrictBaseModel):
 
     @model_validator(mode='after')
     def validate_rejection_sampling_config(self):
-        """Reject SA-enhanced configurations that invalidate rejection sampling."""
+        """Disable rejection sampling when SA-enhanced configurations are
+        active, since SA may override the proposed draft tokens. This is a
+        silent fallback so the new default (True) does not break sa_config
+        users.
+        """
         if self.use_rejection_sampling and getattr(self, 'sa_config',
                                                    None) is not None:
-            raise ValueError(
-                "use_rejection_sampling is incompatible with sa_config "
-                "because SA enhancement may override the proposed draft tokens."
-            )
+            self.use_rejection_sampling = False
         return self
 
     @model_validator(mode='after')
@@ -4527,12 +4530,12 @@ class TorchLlmArgs(BaseLlmArgs):
                     exclude={"decoding_type"})
                 self.speculative_config = Eagle3DecodingConfig(**eagle_data)
 
-            if self.speculative_config.use_rejection_sampling:
-                if not isinstance(self.speculative_config,
-                                  Eagle3DecodingConfig):
-                    raise ValueError(
-                        "use_rejection_sampling is only supported for "
-                        "PyTorch Eagle3 one-model speculative decoding paths.")
+            if self.speculative_config.use_rejection_sampling and not isinstance(
+                    self.speculative_config, Eagle3DecodingConfig):
+                # Rejection sampling is only wired up for Eagle3 one-model paths.
+                # Silently fall back for other spec types so the new default
+                # (True) does not break them.
+                self.speculative_config.use_rejection_sampling = False
 
             if isinstance(self.speculative_config, PARDDecodingConfig):
                 assert self.speculative_config.max_draft_len > 0, "PARD max_draft_len must be > 0"
