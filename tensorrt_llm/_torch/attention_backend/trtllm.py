@@ -1406,9 +1406,13 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
     def rope_original_max_positions(self) -> int:
         return self.rope_params.original_max_positions
 
-    @property
-    def _skip_softmax_kernel_params(self) -> Optional[SkipSoftmaxKernelParams]:
-        """Skip-softmax kernel params from the config, or ``None`` otherwise."""
+    def get_skip_softmax_kernel_params(
+            self) -> Optional[SkipSoftmaxKernelParams]:
+        """Skip-softmax kernel params from the config, or ``None`` otherwise.
+
+        A method, not a property: ``sparse_attention_config`` can change after
+        construction (VG swaps it per layer), so this is recomputed per call.
+        """
         cfg = self.sparse_attention_config
         if getattr(cfg, 'algorithm', None) != 'skip_softmax':
             return None
@@ -1773,7 +1777,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         # than being read from ``self`` directly, so a caller can override them
         # per step. Keep this fill even though it currently just mirrors the
         # config -- it is the seam for per-step thresholds.
-        config_params = self._skip_softmax_kernel_params
+        config_params = self.get_skip_softmax_kernel_params()
         if config_params is not None:
             forward_args.skip_softmax_kernel_params = config_params
 
