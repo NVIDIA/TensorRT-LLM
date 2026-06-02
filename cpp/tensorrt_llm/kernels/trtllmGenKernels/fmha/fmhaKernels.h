@@ -301,8 +301,10 @@ public:
 private:
     inline static std::vector<int> const kDefaultWarmupBatchSizeCandidates
         = {1, 2, 3, 4, 5, 6, 7, 8, 10, 12, 14, 16, 20, 24, 28, 32, 40, 48, 56, 64, 80, 96, 128, 256, 512, 1024};
-    inline static std::vector<int> const kDefaultWarmupSeqLenKvCandidates
-        = {1, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768};
+    inline static std::vector<int> const kDefaultWarmupPrefillBatchSizeCandidates
+        = {1, 2, 3, 4, 6, 8, 12, 16, 24, 32, 48, 64, 128, 256};
+    inline static std::vector<int> const kDefaultWarmupSeqLenQkvCandidates
+        = {1, 128, 512, 1024, 2048, 4096, 8192, 16384, 32768};
 
     static std::vector<int> makeWarmupCandidateSizes(std::vector<int> const& defaultCandidateSizes, int maxSize)
     {
@@ -360,17 +362,14 @@ private:
             if (compileElapsedMs > 1000.0) // FIXME: Change to return cache status from FmhaInterface
             {
                 auto const& kernelName = fmhaConfig.mFunctionName;
-                TLLM_LOG_INFO(
-                    "JIT Warmup: Warmup for %s took %.3f ms, encountered at bs=%d, maxSeqLenQ=%d, maxSeqLenKv=%d",
-                    kernelName.c_str(), compileElapsedMs, params.mBatchSize, params.mMaxSeqLenQ, params.mMaxSeqLenKv);
+                TLLM_LOG_INFO("JIT Warmup: Warmup for %s took %.3f ms", kernelName.c_str(), compileElapsedMs);
             }
         }
     }
 
     void runJITWarmupGridIfRequested(RunnerParams const& runnerParams)
     {
-        if (!runnerParams.mJITWarmup || runnerParams.mKernelType != FmhaKernelType::Generation
-            || runnerParams.mUseGenerationKernelForPrefill)
+        if (!runnerParams.mJITWarmup || runnerParams.mKernelType != FmhaKernelType::Generation)
         {
             return;
         }
@@ -380,25 +379,45 @@ private:
         TLLM_CHECK_WITH_INFO(captureStatus == cudaStreamCaptureStatusNone,
             "TRTLLM-Gen FMHA JIT warmup must not run during CUDA graph capture.");
 
+        bool const useGenKernelForPrefill = runnerParams.mUseGenKernelForPrefill;
         int const maxBatchSize = runnerParams.mJITWarmupMaxNumRequests;
+        int const maxSeqLenQ = runnerParams.mJITWarmupMaxSeqLenQ;
         int const maxSeqLenKv = runnerParams.mJITWarmupMaxSeqLenKv;
 
-        TLLM_LOG_DEBUG("TRTLLM-Gen Fmha Warmup Params: bs=%d, maxSeqLenKv=%d", maxBatchSize, maxSeqLenKv);
-        TLLM_CHECK_WITH_INFO(maxBatchSize != 0 && maxSeqLenKv != 0, "TRTLLM-Gen Fmha Warmup Param is invalid.");
+        TLLM_LOG_DEBUG(
+            "TRTLLM-Gen Fmha Warmup Params: maxBatchSize=%d, maxSeqLenKv=%d, useGenKernelForPrefill=%d, maxSeqLenQ=%d",
+            maxBatchSize, maxSeqLenKv, useGenKernelForPrefill, maxSeqLenQ);
+        TLLM_CHECK_WITH_INFO(maxBatchSize != 0 && maxSeqLenKv != 0 && (!useGenKernelForPrefill || maxSeqLenQ != 0),
+            "TRTLLM-Gen Fmha Warmup Param is invalid.");
 
-        auto const batchSizeCandidates = makeWarmupCandidateSizes(kDefaultWarmupBatchSizeCandidates, maxBatchSize);
-        auto const seqLenKvCandidates = makeWarmupCandidateSizes(kDefaultWarmupSeqLenKvCandidates, maxSeqLenKv);
+        auto const& batchSizeDefaults
+            = useGenKernelForPrefill ? kDefaultWarmupPrefillBatchSizeCandidates : kDefaultWarmupBatchSizeCandidates;
+        std::vector<int> batchSizeCandidates = makeWarmupCandidateSizes(batchSizeDefaults, maxBatchSize);
+        // Use specified Q for generation, and use our Q grid for prefill
+        std::vector<int> seqLenQCandidates = useGenKernelForPrefill
+            ? makeWarmupCandidateSizes(kDefaultWarmupSeqLenQkvCandidates, maxSeqLenQ)
+            : std::vector<int>{runnerParams.mMaxSeqLenQ};
+        std::vector<int> seqLenKvCandidates = makeWarmupCandidateSizes(kDefaultWarmupSeqLenQkvCandidates, maxSeqLenKv);
 
         auto warmupParams = runnerParams;
 
         for (int batchSize : batchSizeCandidates)
         {
             warmupParams.mBatchSize = batchSize;
-            for (int seqLenKv : seqLenKvCandidates)
+            for (int seqLenQ : seqLenQCandidates)
             {
-                warmupParams.mMaxSeqLenKv = seqLenKv;
-                warmupParams.mSumOfSeqLensKv = warmupParams.mBatchSize * warmupParams.mMaxSeqLenKv;
-                warmupOneKernel(warmupParams);
+                warmupParams.mMaxSeqLenQ = seqLenQ;
+                for (int seqLenKv : seqLenKvCandidates)
+                {
+                    warmupParams.mMaxSeqLenKv = seqLenKv;
+                    warmupParams.mSumOfSeqLensQ = warmupParams.mBatchSize * warmupParams.mMaxSeqLenQ;
+                    warmupParams.mSumOfSeqLensKv = warmupParams.mBatchSize * warmupParams.mMaxSeqLenKv;
+                    if (useGenKernelForPrefill && warmupParams.mMaxSeqLenKv < warmupParams.mMaxSeqLenQ)
+                    {
+                        continue;
+                    }
+                    warmupOneKernel(warmupParams);
+                }
             }
         }
     }
@@ -478,8 +497,8 @@ public:
                 auto const& kernelName = fmhaConfig.mFunctionName;
                 TLLM_LOG_WARNING(
                     "Possible JIT Cache Missing: TRTLLM-Gen FMHA generateAndCompileKernel took %.3f ms, kernelName=%s, "
-                    "could affect performance measurement",
-                    compileElapsedMs, kernelName.c_str());
+                    "batchSize=%d, maxSeqLenQ=%d, maxSeqLenKv=%d. This could affect performance measurement.",
+                    compileElapsedMs, kernelName.c_str(), params.mBatchSize, params.mMaxSeqLenQ, params.mMaxSeqLenKv);
             }
             mFmhaInterface.run(fmhaConfig, fmhaData, params.stream, params.mMultiProcessorCount, 0);
         }

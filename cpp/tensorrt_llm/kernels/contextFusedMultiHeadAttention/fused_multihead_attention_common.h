@@ -262,6 +262,11 @@ struct MHARunnerParams
     int totalQSeqLen;
     // The total number of KV sequence lengths in the batch.
     int totalKvSeqLen;
+    // Optional TRTLLM-Gen FMHA JIT warmup shape.
+    bool trtllmGenFmhaJITWarmup = false;
+    int32_t trtllmGenFmhaJITWarmupMaxNumRequests = 0;
+    int32_t trtllmGenFmhaJITWarmupMaxSeqLenQ = 0;
+    int32_t trtllmGenFmhaJITWarmupMaxSeqLenKv = 0;
 
     // Buffers.
     // The packed QKV buffer ptr.

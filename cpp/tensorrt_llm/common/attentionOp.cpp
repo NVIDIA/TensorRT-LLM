@@ -1984,6 +1984,10 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
         fmhaParams.stream = stream;
         fmhaParams.forceFp32Acc = mFMHAForceFP32Acc;
         fmhaParams.softmaxStatsPtr = params.softmax_stats;
+        fmhaParams.trtllmGenFmhaJITWarmup = params.trtllmGenFmhaJITWarmup;
+        fmhaParams.trtllmGenFmhaJITWarmupMaxNumRequests = params.trtllmGenFmhaJITWarmupMaxNumRequests;
+        fmhaParams.trtllmGenFmhaJITWarmupMaxSeqLenQ = params.trtllmGenFmhaJITWarmupMaxSeqLenQ;
+        fmhaParams.trtllmGenFmhaJITWarmupMaxSeqLenKv = params.trtllmGenFmhaJITWarmupMaxSeqLenKv;
 
         // Sparse attention parameters
         if (useTllmGenSparseAttention())

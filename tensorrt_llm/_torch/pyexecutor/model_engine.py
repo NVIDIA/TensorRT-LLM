@@ -1040,7 +1040,7 @@ class PyTorchModelEngine(ModelEngine):
     def _run_attention_warmup(self,
                               resource_manager: ResourceManager,
                               can_run_general_warmup=True) -> None:
-        if self.attn_backend.Metadata is not TrtllmAttentionMetadata:
+        if not issubclass(self.attn_backend.Metadata, TrtllmAttentionMetadata):
             return
 
         logger.info("Running TRTLLM-Gen FMHA JIT warmup...")
