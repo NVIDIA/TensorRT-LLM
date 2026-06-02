@@ -504,6 +504,26 @@ class TestFirstGenLogProbsSerializeRoundtrip:
         with pytest.raises(ValueError, match="must be a list"):
             _deserialize_first_gen_log_probs(["not_a_list"])
 
+    def test_simple_format_roundtrip(self):
+        # Simple format: each position is a plain float (sampled-token logprob).
+        original = [-0.5, -1.25, -2.0]
+        serialized = _serialize_first_gen_log_probs(original)
+        # Serialized payload preserves floats verbatim so it remains JSON-safe.
+        assert serialized == [pytest.approx(v) for v in original]
+        recovered = _deserialize_first_gen_log_probs(serialized)
+        assert recovered == [pytest.approx(v) for v in original]
+        assert all(isinstance(v, float) for v in recovered)
+
+    def test_simple_and_dict_formats_kept_disjoint(self):
+        # Each call uses one format; mixing within a single payload is unusual
+        # but the serdes round-trips them independently.
+        simple = _deserialize_first_gen_log_probs(_serialize_first_gen_log_probs([-0.5]))
+        dict_payload = _deserialize_first_gen_log_probs(
+            _serialize_first_gen_log_probs([{1: Logprob(logprob=-0.5, rank=1)}])
+        )
+        assert isinstance(simple[0], float)
+        assert isinstance(dict_payload[0], dict)
+
     def test_deserialize_rejects_missing_keys(self):
         with pytest.raises(ValueError, match="missing required keys"):
             _deserialize_first_gen_log_probs([[{"token_id": 1}]])
