@@ -105,18 +105,20 @@ def test_eagle3_sliding_window_wiring(use_mla, sliding_window):
     """Verify Eagle3 forwards ``config.sliding_window`` to Attention as
     ``attention_window_size``.
 
-    The Eagle3 SWA wiring lives in two places in
+    The Eagle3 SWA wiring lives in
     ``tensorrt_llm/_torch/models/modeling_speculative.py``:
 
-    1. ``Eagle3Attention`` / ``Eagle3MLAttention`` read ``sliding_window``
-       from the pretrained config and store it on the module.
-    2. ``Eagle3DecoderLayer.__init__`` copies it into ``self._attn_kwargs``
-       when the attention ``forward`` accepts ``attention_window_size``, so it
-       is forwarded via ``**kwargs`` to ``self.self_attn(...)`` on every
+    1. ``Eagle3DecoderLayer.__init__`` resolves the per-layer window via
+       ``_resolve_eagle3_sliding_window`` and stores it on ``self.self_attn``.
+    2. It then copies the window into ``self._attn_kwargs`` as
+       ``attention_window_size`` when the attention ``forward`` accepts it, so
+       it is forwarded via ``**kwargs`` to ``self.self_attn(...)`` on every
        forward.
 
-    This is a focused unit test (no GPU / no model weights). It mirrors
-    ``test_mistral_attention_swa_wiring`` in
+    This case sets no ``layer_types``, so ``config.sliding_window`` is applied
+    uniformly; ``test_eagle3_sliding_window_layer_types`` covers the VSWA
+    (per-layer) path. Both are focused unit tests (no GPU / no model weights),
+    mirroring the Mistral SWA wiring tests in
     ``tests/unittest/_torch/modeling/test_modeling_mistral.py``.
     """
     if use_mla:
@@ -151,6 +153,10 @@ def test_eagle3_sliding_window_wiring(use_mla, sliding_window):
             sliding_window=sliding_window,
         )
     config.torch_dtype = torch.bfloat16
+    # No ``layer_types`` here, so the window is applied uniformly. Force it to
+    # None so this case stays deterministic regardless of the transformers
+    # per-config default for ``layer_types``.
+    config.layer_types = None
 
     mc = model_config_lib.ModelConfig(
         pretrained_config=config,
@@ -163,7 +169,8 @@ def test_eagle3_sliding_window_wiring(use_mla, sliding_window):
                                is_first_layer=True,
                                use_mla=use_mla)
 
-    # (1) Eagle3 attention picks up sliding_window from the pretrained config.
+    # (1) With no ``layer_types`` the config sliding_window is resolved
+    # uniformly and stored on the attention module.
     assert layer.self_attn.sliding_window == sliding_window
 
     # (2) Eagle3DecoderLayer only injects attention_window_size when the
@@ -175,6 +182,57 @@ def test_eagle3_sliding_window_wiring(use_mla, sliding_window):
             "attention_window_size": sliding_window
         } if sliding_window is not None else {})
         assert layer._attn_kwargs == expected_kwargs
+
+
+@pytest.mark.parametrize("layer_type,expected_window", [
+    ("sliding_attention", 64),
+    ("full_attention", None),
+])
+def test_eagle3_sliding_window_layer_types(layer_type, expected_window):
+    """VSWA drafts: only ``sliding_attention`` layers receive the window.
+
+    When the draft config carries ``layer_types`` (e.g. the alternating
+    sliding/full pattern used by GPT-OSS), ``Eagle3DecoderLayer`` must give
+    full-attention layers a ``None`` window (global attention) instead of
+    applying ``config.sliding_window`` uniformly. Mirrors
+    ``test_mistral_attention_swa_layer_types`` in
+    ``tests/unittest/_torch/modeling/test_modeling_mistral.py``.
+    """
+    config = transformers.LlamaConfig(
+        hidden_size=128,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        num_hidden_layers=2,
+        intermediate_size=256,
+        max_position_embeddings=2048,
+        rms_norm_eps=1e-5,
+        attention_bias=False,
+        sliding_window=64,
+    )
+    # Alternating sliding/full pattern (GPT-OSS / Ministral style).
+    config.layer_types = ["sliding_attention", "full_attention"]
+    config.torch_dtype = torch.bfloat16
+
+    mc = model_config_lib.ModelConfig(
+        pretrained_config=config,
+        mapping=mapping_lib.Mapping(world_size=1, tp_size=1, rank=0),
+        skip_create_weights_in_init=True,
+    )
+
+    # ``local_layer_idx`` indexes the draft's own ``layer_types`` -- not the
+    # global, target-offset ``layer_idx`` used for KV cache.
+    local_layer_idx = config.layer_types.index(layer_type)
+    layer = Eagle3DecoderLayer(mc,
+                               layer_idx=0,
+                               is_first_layer=True,
+                               use_mla=False,
+                               local_layer_idx=local_layer_idx)
+
+    assert layer.self_attn.sliding_window == expected_window
+    expected_kwargs = ({
+        "attention_window_size": expected_window
+    } if expected_window is not None else {})
+    assert layer._attn_kwargs == expected_kwargs
 
 
 @pytest.mark.parametrize(
