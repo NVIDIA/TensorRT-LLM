@@ -578,7 +578,19 @@ class GptOssForCausalLM(GptOssPreTrainedModel, GenerationMixin):
             inputs_embeds=inputs_embeds,
             **kwargs,
         )
-        logits = self.lm_head(outputs.last_hidden_state)
+        # Vocab-parallel lm_head: column-shard the weight on the vocab dim so each
+        # rank computes vocab/TP, then all_gather to reconstruct the full logits
+        # (matches PT's COLUMN ParallelLMHead + gather_output). apply_sharding_hints
+        # does the colwise weight split and swaps the all_gather placeholder to a real
+        # collective when tp_size > 1 ("lm_head" must be in shard_layers).
+        logits = torch.ops.auto_deploy.torch_linear_simple(
+            outputs.last_hidden_state,
+            self.lm_head.weight,
+            self.lm_head.bias,
+            tp_mode="colwise",
+            layer_type="lm_head",
+        )
+        logits = torch.ops.auto_deploy.all_gather(logits, dim=-1, layer_type="lm_head")
         return GptOssCausalLMOutput(logits=logits)
 
 
