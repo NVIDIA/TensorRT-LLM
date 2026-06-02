@@ -3286,11 +3286,12 @@ class KVCacheManagerV2(BaseResourceManager):
             req.is_dummy_request = True
             req.paged_kv_block_ids = []
             if prepare_resource:
-                kv_cache = self._create_kv_cache(
-                    req.py_request_id,
-                    req.lora_task_id,
-                    input_tokens,
-                    cache_salt_id=req.cache_salt_id)
+                # Dummy/warmup request. ``stop_committing()`` below blocks all
+                # writes to the radix tree, so the choice of branch does not
+                # affect committed state. ``cache_salt_id`` is left defaulted
+                # to None to avoid coupling synthetic data to any salted branch.
+                kv_cache = self._create_kv_cache(req.py_request_id,
+                                                 req.lora_task_id, input_tokens)
                 # Saturated IndexMapper (e.g. disagg gen trans in progress) → None; retry next iter.
                 if kv_cache is None:
                     release_resources(req)
@@ -3312,10 +3313,8 @@ class KVCacheManagerV2(BaseResourceManager):
                 draft_kv_cache = None
                 if draft_kv_cache_manager is not None:
                     draft_kv_cache = draft_kv_cache_manager._create_kv_cache(
-                        req.py_request_id,
-                        req.lora_task_id,
-                        input_tokens,
-                        cache_salt_id=req.cache_salt_id)
+                        req.py_request_id, req.lora_task_id, input_tokens)
+                    # Dummy path: see comment above, no salt.
                     if draft_kv_cache is None:
                         release_resources(req)
                         return None
