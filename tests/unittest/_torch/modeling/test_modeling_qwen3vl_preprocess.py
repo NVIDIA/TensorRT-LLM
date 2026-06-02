@@ -28,29 +28,10 @@ The tests bind ``_preprocess`` to a stand-in object so they avoid the heavy
 control-flow.
 """
 
-import contextlib
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
-import pytest
-
-from tensorrt_llm._torch.models import modeling_qwen3vl
 from tensorrt_llm._torch.models.modeling_qwen3vl import Qwen3VLInputProcessorBase
-
-
-@pytest.fixture(autouse=True)
-def _stub_bypass_validator(monkeypatch):
-    """Replace bypass_processor_output_validation with a no-op.
-
-    The real implementation rebinds ``validate_typed_dict`` across several
-    transformers internals; that side effect is irrelevant here and stubbing
-    it keeps the test focused on the kwargs-handling logic.
-    """
-    monkeypatch.setattr(
-        modeling_qwen3vl,
-        "bypass_processor_output_validation",
-        contextlib.nullcontext,
-    )
 
 
 def _fake_video(metadata):
@@ -72,23 +53,32 @@ def _call_preprocess(mm_data, mm_processor_kwargs):
 
 
 class TestVideoMetadataForwarding:
-    """The IO loader's per-video metadata reaches the HF processor."""
+    """``video_metadata`` is forwarded only when the caller passes
+    ``mm_processor_kwargs``."""
 
-    def test_metadata_for_each_video_forwarded(self):
-        """Multi-video case: list is built per-video, in order."""
+    def test_metadata_forwarded_when_opted_in(self):
+        """Opted-in path: list built per-video, in order."""
         md0 = {"total_num_frames": 64, "fps": 25.0, "duration": 2.5}
         md1 = {"total_num_frames": 32, "fps": 30.0, "duration": 1.0}
         mm_data = {"video": [_fake_video(md0), _fake_video(md1)]}
 
-        processor = _call_preprocess(mm_data, {})
+        processor = _call_preprocess(mm_data, {"fps": 2.0})
 
         kwargs = processor.call_args.kwargs
         assert kwargs["video_metadata"] == [md0, md1]
         assert len(kwargs["videos"]) == 2
 
+    def test_metadata_not_forwarded_with_empty_kwargs(self):
+        """Empty kwargs: videos present but metadata is not forwarded."""
+        mm_data = {"video": [_fake_video({"fps": 30.0})]}
+
+        processor = _call_preprocess(mm_data, {})
+
+        assert processor.call_args.kwargs["video_metadata"] is None
+
     def test_metadata_is_none_when_no_videos(self):
-        """Text-only case: the ``else None`` branch (not an empty list)."""
-        processor = _call_preprocess({}, {})
+        """No videos: metadata is None regardless of kwargs."""
+        processor = _call_preprocess({}, {"fps": 2.0})
         kwargs = processor.call_args.kwargs
         assert kwargs["video_metadata"] is None
         assert kwargs["videos"] is None
