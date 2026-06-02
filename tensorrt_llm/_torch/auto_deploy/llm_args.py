@@ -256,6 +256,16 @@ class LlmArgs(DynamicYamlMixInForSettings, TorchLlmArgs, BaseSettings):
         "high-performance inference. 'demollm' is a lightweight runtime for development and testing "
         "with a simplified scheduler and KV-cache manager for easier debugging.",
     )
+    encoder_prefill_disagg: bool = Field(
+        default=False,
+        description="Whether to enable encoder-prefill disaggregation for multimodal models.",
+    )
+
+    encoder_world_size: int = Field(
+        default=0,
+        ge=0,
+        description="Number of dedicated GPUs for the encoder-prefill stage when disaggregation is enabled.",
+    )
 
     device: str = Field(default="cuda", description="The device to use for the model.", frozen=True)
 
@@ -501,7 +511,10 @@ class LlmArgs(DynamicYamlMixInForSettings, TorchLlmArgs, BaseSettings):
                 dist_mapping=dist_mapping,
                 enable_attention_dp=enable_attention_dp,
                 allreduce_strategy=allreduce_strategy,
+                encoder_prefill_disagg=self.encoder_prefill_disagg,
+                encoder_world_size=self.encoder_world_size,
             )
+
         except ValueError as e:
             raise ValueError(
                 f"Invalid parallel grid config: {e}. "
