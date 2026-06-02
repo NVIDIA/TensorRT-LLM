@@ -22,7 +22,7 @@ context_servers:
     enable_block_reuse: false
     free_gpu_memory_fraction: 0.8
   moe_config:
-    backend: CUTLASS
+    backend: TRTLLM
   cuda_graph_config: null
   print_iter_log: true
   cache_transceiver_config:
@@ -45,7 +45,7 @@ generation_servers:
     enable_block_reuse: false
     free_gpu_memory_fraction: 0.8
   moe_config:
-    backend: CUTLASS
+    backend: TRTLLM
   cuda_graph_config:
     enable_padding: true
     batch_sizes:
