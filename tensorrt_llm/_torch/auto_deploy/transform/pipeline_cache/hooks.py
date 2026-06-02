@@ -103,18 +103,29 @@ def _identify_importable_hook(
 
 
 def _identify_hook(
-    hook: Any, scope: str = "root", target_module: nn.Module | None = None
+    hook: Any,
+    scope: str = "root",
+    target_module: nn.Module | None = None,
+    *,
+    phase: str = "pre",
+    with_module: bool = False,
 ) -> dict[str, Any] | None:
     spec = get_pipeline_cache_hook_spec(hook)
     if spec is not None:
         if spec.get("type") not in _HOOK_REBUILDERS:
             return None
         spec["scope"] = scope
-        return spec
+    else:
+        if target_module is None:
+            raise ValueError("target_module must be provided when identifying importable hooks.")
+        spec = _identify_importable_hook(hook, scope, target_module)
+        if spec is None:
+            return None
 
-    if target_module is None:
-        raise ValueError("target_module must be provided when identifying importable hooks.")
-    return _identify_importable_hook(hook, scope, target_module)
+    spec.setdefault("phase", phase)
+    if spec["phase"] == "pre":
+        spec.setdefault("with_module", with_module)
+    return spec
 
 
 def collect_hook_specs(model: nn.Module) -> tuple[list[dict[str, Any]], bool]:
@@ -126,18 +137,20 @@ def collect_hook_specs(model: nn.Module) -> tuple[list[dict[str, Any]], bool]:
         ad_logger.warning(f"Pipeline cache: unrecognized hook of type {qualname}")
 
     def collect_from_module(mod: nn.Module, scope: str) -> bool:
-        if mod._load_state_dict_post_hooks:
-            ad_logger.warning("Pipeline cache: load-state-dict post hooks are not supported.")
-            return False
-
         for hook in mod._load_state_dict_pre_hooks.values():
-            if bool(getattr(hook, "with_module", False)):
-                ad_logger.warning("Pipeline cache: with_module load hooks are not supported.")
-                return False
+            with_module = bool(getattr(hook, "with_module", False))
             hook_obj = hook.hook if hasattr(hook, "hook") else hook
-            spec = _identify_hook(hook_obj, scope, mod)
+            spec = _identify_hook(hook_obj, scope, mod, phase="pre", with_module=with_module)
             if spec is None:
                 log_unknown(hook_obj)
+                return False
+            specs.append(spec)
+
+        for hook_obj in mod._load_state_dict_post_hooks.values():
+            hook = hook_obj.hook if hasattr(hook_obj, "hook") else hook_obj
+            spec = _identify_hook(hook, scope, mod, phase="post")
+            if spec is None:
+                log_unknown(hook)
                 return False
             specs.append(spec)
 
@@ -273,23 +286,35 @@ def reattach_hooks(model: nn.Module, specs: list[dict[str, Any]]) -> None:
         scope = spec["scope"]
         target_mod = model if scope == "root" else model.get_submodule(scope)
         hook_fn = _rebuild_hook(spec, target_mod)
-        target_mod._register_load_state_dict_pre_hook(hook_fn)
+        phase = spec.get("phase", "pre")
+        if phase == "pre":
+            target_mod._register_load_state_dict_pre_hook(
+                hook_fn, with_module=bool(spec.get("with_module", False))
+            )
+        elif phase == "post":
+            target_mod.register_load_state_dict_post_hook(hook_fn)
+        else:
+            raise ValueError(f"Pipeline cache: unknown hook phase {phase!r}")
 
 
-def snapshot_and_clear_load_hooks(model: nn.Module) -> list[tuple[nn.Module, Any]]:
-    records: list[tuple[nn.Module, Any]] = []
+def snapshot_and_clear_load_hooks(model: nn.Module) -> list[tuple[nn.Module, Any, Any]]:
+    records: list[tuple[nn.Module, Any, Any]] = []
     for module in model.modules():
         records.append(
             (
                 module,
                 module._load_state_dict_pre_hooks.copy(),
+                module._load_state_dict_post_hooks.copy(),
             )
         )
         module._load_state_dict_pre_hooks.clear()
+        module._load_state_dict_post_hooks.clear()
     return records
 
 
-def restore_load_hooks(records: list[tuple[nn.Module, Any]]) -> None:
-    for module, pre_hooks in records:
+def restore_load_hooks(records: list[tuple[nn.Module, Any, Any]]) -> None:
+    for module, pre_hooks, post_hooks in records:
         module._load_state_dict_pre_hooks.clear()
         module._load_state_dict_pre_hooks.update(pre_hooks)
+        module._load_state_dict_post_hooks.clear()
+        module._load_state_dict_post_hooks.update(post_hooks)

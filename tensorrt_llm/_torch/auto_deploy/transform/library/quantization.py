@@ -220,7 +220,8 @@ class Quantization(BaseTransform):
         gm._register_load_state_dict_pre_hook(
             partial(self.load_hook, weight_name=lin_weight.node_key)
         )
-        if self.post_load_hook:
+        post_load_hook = getattr(type(self), "post_load_hook", None)
+        if post_load_hook is not None and post_load_hook is not Quantization.post_load_hook:
             gm.register_load_state_dict_post_hook(
                 partial(self.post_load_hook, weight_name=lin_weight.node_key)
             )
@@ -278,7 +279,8 @@ class Quantization(BaseTransform):
             # Register load state dict hook
             hook = partial(self.load_hook, weight_name=param_name)
             gm._register_load_state_dict_pre_hook(hook)
-            if self.post_load_hook:
+            post_load_hook = getattr(type(self), "post_load_hook", None)
+            if post_load_hook is not None and post_load_hook is not Quantization.post_load_hook:
                 hook = partial(self.post_load_hook, weight_name=param_name)
                 gm.register_load_state_dict_post_hook(hook)
 

@@ -77,12 +77,15 @@ def _unit_test_forward_pre_hook(*args, **kwargs):
     del args, kwargs
 
 
-def _unit_test_load_state_dict_post_hook(*args, **kwargs):
-    del args, kwargs
+def _unit_test_load_state_dict_post_hook(module, incompatible_keys):
+    del incompatible_keys
+    with torch.no_grad():
+        module.weight.add_(2.0)
 
 
-def _unit_test_load_state_dict_pre_hook(*args, **kwargs):
-    del args, kwargs
+def _unit_test_load_state_dict_pre_hook(module, state_dict, prefix, *args):
+    del args
+    state_dict[prefix + "weight"] = torch.full_like(module.weight, 3.0)
 
 
 class _ToyModule(nn.Module):
@@ -951,24 +954,47 @@ def test_hook_spec_round_trip_shard_tp():
     assert len(fresh._load_state_dict_pre_hooks) == 1
 
 
-def test_hook_specs_reject_post_load_hooks():
+def test_hook_spec_round_trip_post_load_hooks():
     gm = symbolic_trace(_ToyModule())
     gm.register_load_state_dict_post_hook(_unit_test_load_state_dict_post_hook)
 
     specs, has_unknown = collect_hook_specs(gm)
 
-    assert specs == []
-    assert has_unknown
+    assert not has_unknown
+    assert len(specs) == 1
+    assert specs[0]["type"] == "importable_load_hook"
+    assert specs[0]["phase"] == "post"
+    assert json.loads(json.dumps(specs)) == specs
+
+    fresh = symbolic_trace(_ToyModule())
+    reattach_hooks(fresh, specs)
+    assert len(fresh._load_state_dict_post_hooks) == 1
+
+    fresh.load_state_dict({"weight": torch.zeros(1)})
+    assert torch.equal(fresh.weight, torch.full((1,), 2.0))
 
 
-def test_hook_specs_reject_with_module_load_hooks():
+def test_hook_spec_round_trip_with_module_load_hooks():
     gm = symbolic_trace(_ToyModule())
     gm.register_load_state_dict_pre_hook(_unit_test_load_state_dict_pre_hook)
 
     specs, has_unknown = collect_hook_specs(gm)
 
-    assert specs == []
-    assert has_unknown
+    assert not has_unknown
+    assert len(specs) == 1
+    assert specs[0]["type"] == "importable_load_hook"
+    assert specs[0]["phase"] == "pre"
+    assert specs[0]["with_module"] is True
+    assert json.loads(json.dumps(specs)) == specs
+
+    fresh = symbolic_trace(_ToyModule())
+    reattach_hooks(fresh, specs)
+    assert len(fresh._load_state_dict_pre_hooks) == 1
+    hook = next(iter(fresh._load_state_dict_pre_hooks.values()))
+    assert hook.with_module is True
+
+    fresh.load_state_dict({"weight": torch.zeros(1)})
+    assert torch.equal(fresh.weight, torch.full((1,), 3.0))
 
 
 def test_hook_specs_reject_unsupported_marked_sharding_closures():
@@ -1185,13 +1211,16 @@ def test_hook_spec_round_trip_module_bound_method_with_read_only_property():
 
 def test_hook_spec_round_trip_custom_model_checkpoint_hooks():
     from tensorrt_llm._torch.auto_deploy.models.custom.modeling_gemma4 import (
+        Gemma4ForCausalLM,
         Gemma4Model,
         Gemma4TextDecoderLayer,
     )
     from tensorrt_llm._torch.auto_deploy.models.custom.modeling_nemotron_h import NemotronHModel
     from tensorrt_llm._torch.auto_deploy.models.custom.modeling_qwen3_5_moe import (
+        Qwen3_5MoeForConditionalGeneration,
         Qwen3_5MoeRMSNorm,
         Qwen3_5MoeSparseMoeBlock,
+        Qwen3_5MoeTextModel,
     )
 
     gm = symbolic_trace(_ToyModule())
@@ -1206,7 +1235,7 @@ def test_hook_spec_round_trip_custom_model_checkpoint_hooks():
     gm.add_module("qwen_moe", qwen_moe)
 
     gemma4_model = nn.Module()
-    gemma4_model._register_load_state_dict_pre_hook(Gemma4Model._drop_unsupported_weights)
+    gemma4_model._register_load_state_dict_pre_hook(Gemma4Model._remap_and_drop_weights)
     gm.add_module("gemma4_model", gemma4_model)
 
     gemma4_layer = nn.Module()
@@ -1222,16 +1251,57 @@ def test_hook_spec_round_trip_custom_model_checkpoint_hooks():
     )
     gm.add_module("nemotron_h", nemotron_h)
 
+    qwen_text = nn.Module()
+    qwen_text._register_load_state_dict_pre_hook(
+        Qwen3_5MoeTextModel._remap_checkpoint_hierarchy_for_exported_text_model,
+        with_module=True,
+    )
+    gm.add_module("qwen_text", qwen_text)
+
+    qwen_conditional = nn.Module()
+    qwen_conditional._register_load_state_dict_pre_hook(
+        Qwen3_5MoeForConditionalGeneration._mirror_lm_head_weight_into_text_alias,
+        with_module=True,
+    )
+    gm.add_module("qwen_conditional", qwen_conditional)
+
+    gemma4_lm = nn.Module()
+    gemma4_lm.config = types.SimpleNamespace(tie_word_embeddings=True)
+    gemma4_lm.embed_tokens = nn.Embedding(1, 1)
+    gemma4_lm.lm_head = nn.Linear(1, 1, bias=False)
+    gemma4_lm.register_load_state_dict_post_hook(Gemma4ForCausalLM._retie_lm_head_weight)
+    gm.add_module("gemma4_lm", gemma4_lm)
+
     specs, has_unknown = collect_hook_specs(gm)
     assert not has_unknown
     assert {spec["type"] for spec in specs} == {"importable_load_hook"}
     assert {spec["callable"]["qualname"] for spec in specs} == {
         "Qwen3_5MoeRMSNorm._offset_weight",
         "Qwen3_5MoeSparseMoeBlock._load_experts_from_fused_checkpoint",
-        "Gemma4Model._drop_unsupported_weights",
+        "Gemma4Model._remap_and_drop_weights",
         "Gemma4TextDecoderLayer._unfuse_moe_weights",
         "NemotronHModel.load_hook",
+        "Qwen3_5MoeTextModel._remap_checkpoint_hierarchy_for_exported_text_model",
+        "Qwen3_5MoeForConditionalGeneration._mirror_lm_head_weight_into_text_alias",
+        "Gemma4ForCausalLM._retie_lm_head_weight",
     }
+    assert (
+        next(
+            spec
+            for spec in specs
+            if spec["callable"]["qualname"]
+            == "Qwen3_5MoeTextModel._remap_checkpoint_hierarchy_for_exported_text_model"
+        )["with_module"]
+        is True
+    )
+    assert (
+        next(
+            spec
+            for spec in specs
+            if spec["callable"]["qualname"] == "Gemma4ForCausalLM._retie_lm_head_weight"
+        )["phase"]
+        == "post"
+    )
     assert json.loads(json.dumps(specs)) == specs
     assert (
         next(
@@ -1247,13 +1317,22 @@ def test_hook_spec_round_trip_custom_model_checkpoint_hooks():
     fresh.add_module("gemma4_model", nn.Module())
     fresh.add_module("gemma4_layer", nn.Module())
     fresh.add_module("nemotron_h", nn.Module())
+    fresh.add_module("qwen_text", nn.Module())
+    fresh.add_module("qwen_conditional", nn.Module())
+    fresh.gemma4_lm = nn.Module()
+    fresh.gemma4_lm.config = types.SimpleNamespace(tie_word_embeddings=True)
+    fresh.gemma4_lm.embed_tokens = nn.Embedding(1, 1)
+    fresh.gemma4_lm.lm_head = nn.Linear(1, 1, bias=False)
 
     reattach_hooks(fresh, specs)
 
-    def run_first_pre_hook(module, state_dict):
+    def run_first_pre_hook(module, state_dict, prefix=""):
         hook = next(iter(module._load_state_dict_pre_hooks.values()))
         hook_fn = hook.hook if hasattr(hook, "hook") else hook
-        hook_fn(state_dict, "", {}, True, [], [], [])
+        if bool(getattr(hook, "with_module", False)):
+            hook_fn(module, state_dict, prefix, {}, True, [], [], [])
+        else:
+            hook_fn(state_dict, prefix, {}, True, [], [], [])
 
     qwen_norm_state = {"weight": torch.zeros(1)}
     run_first_pre_hook(fresh.qwen_norm, qwen_norm_state)
@@ -1267,7 +1346,7 @@ def test_hook_spec_round_trip_custom_model_checkpoint_hooks():
     assert "experts.1.up_proj.weight" in qwen_moe_state
     assert "experts.down_proj" not in qwen_moe_state
 
-    gemma4_model_state = {"vision_tower.weight": torch.ones(1)}
+    gemma4_model_state = {"audio_tower.weight": torch.ones(1)}
     run_first_pre_hook(fresh.gemma4_model, gemma4_model_state)
     assert gemma4_model_state == {}
 
@@ -1286,8 +1365,29 @@ def test_hook_spec_round_trip_custom_model_checkpoint_hooks():
     run_first_pre_hook(fresh.nemotron_h, nemotron_h_state)
     assert "embeddings.weight" in nemotron_h_state
 
+    qwen_text_state = {
+        "model.language_model.layers.0.weight": torch.ones(1),
+        "lm_head.weight": torch.ones(1),
+    }
+    run_first_pre_hook(fresh.qwen_text, qwen_text_state, prefix="text.")
+    assert "text.layers.0.weight" in qwen_text_state
+    assert "model.language_model.layers.0.weight" not in qwen_text_state
+    assert "text.lm_head.weight" in qwen_text_state
+
+    qwen_conditional_state = {"lm_head.weight": torch.ones(1)}
+    run_first_pre_hook(fresh.qwen_conditional, qwen_conditional_state)
+    assert "model.language_model.lm_head.weight" in qwen_conditional_state
+
+    post_hook = next(iter(fresh.gemma4_lm._load_state_dict_post_hooks.values()))
+    assert fresh.gemma4_lm.lm_head.weight is not fresh.gemma4_lm.embed_tokens.weight
+    post_hook(fresh.gemma4_lm, types.SimpleNamespace())
+    assert fresh.gemma4_lm.lm_head.weight is fresh.gemma4_lm.embed_tokens.weight
+
     assert len(fresh.qwen_norm._load_state_dict_pre_hooks) == 1
     assert len(fresh.qwen_moe._load_state_dict_pre_hooks) == 1
     assert len(fresh.gemma4_model._load_state_dict_pre_hooks) == 1
     assert len(fresh.gemma4_layer._load_state_dict_pre_hooks) == 1
     assert len(fresh.nemotron_h._load_state_dict_pre_hooks) == 1
+    assert len(fresh.qwen_text._load_state_dict_pre_hooks) == 1
+    assert len(fresh.qwen_conditional._load_state_dict_pre_hooks) == 1
+    assert len(fresh.gemma4_lm._load_state_dict_post_hooks) == 1
