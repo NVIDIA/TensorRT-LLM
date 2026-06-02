@@ -33,7 +33,7 @@ from tensorrt_llm.runtime import ModelConfig as ModelConfigPython
 # isort: off
 from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     DEFAULT_BEAM_INDEX, AttentionLayerConfig, BufferConfig, CacheTierConfig,
-    GpuCacheTierConfig, HostCacheTierConfig, ReuseScope)
+    DiskCacheTierConfig, GpuCacheTierConfig, HostCacheTierConfig, ReuseScope)
 # isort: on
 from tensorrt_llm.runtime.kv_cache_manager_v2 import \
     KVCacheManager as KVCacheManagerPy
@@ -2511,6 +2511,16 @@ class KVCacheManagerV2(BaseResourceManager):
             cache_tiers.append(HostCacheTierConfig(quota=host_quota))
             logger.info(
                 f"KV cache manager v2 host cache quota set to {host_quota / (1 << 30):.2f}GiB"
+            )
+        disk_cache_size = kv_cache_config.disk_cache_size
+        if disk_cache_size is not None and disk_cache_size > 0:
+            disk_cache_path = kv_cache_config.disk_cache_path
+            assert disk_cache_path is not None
+            cache_tiers.append(
+                DiskCacheTierConfig(quota=disk_cache_size,
+                                    path=disk_cache_path))
+            logger.info(
+                f"KV cache manager v2 disk cache quota set to {disk_cache_size / (1 << 30):.2f}GiB at {disk_cache_path}"
             )
 
         self.vocab_size = vocab_size
