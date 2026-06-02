@@ -92,37 +92,6 @@ cvt_sf_MKL_to_M32x4xrm_K4xrk_L = kernel_module.cvt_sf_MKL_to_M32x4xrm_K4xrk_L
 cvt_sf_M32x4xrm_K4xrk_L_to_MKL = kernel_module.cvt_sf_M32x4xrm_K4xrk_L_to_MKL
 
 
-def split_groups_to_b_tensors(
-    num_groups: int, num_b_tensors: int
-) -> Tuple[Tuple[int, ...], Tuple[Tuple[int, ...], ...]]:
-    """Split groups into multiple B tensors.
-
-    :param num_groups: Total number of groups (experts)
-    :param num_b_tensors: Number of B tensors to split into
-    :return: Tuple of (b_tensor_l_sizes, groups_per_b_tensor)
-             - b_tensor_l_sizes: L size for each B tensor
-             - groups_per_b_tensor: Tuple of group indices for each B tensor
-    """
-    # Distribute groups evenly across B tensors
-    base_groups_per_tensor = num_groups // num_b_tensors
-    remainder = num_groups % num_b_tensors
-
-    b_tensor_l_sizes = []
-    groups_per_b_tensor = []
-    current_group = 0
-
-    for i in range(num_b_tensors):
-        # Add one extra group to first 'remainder' tensors
-        num_groups_in_tensor = base_groups_per_tensor + (1 if i < remainder else 0)
-        b_tensor_l_sizes.append(num_groups_in_tensor)
-        groups_per_b_tensor.append(
-            tuple(range(current_group, current_group + num_groups_in_tensor))
-        )
-        current_group += num_groups_in_tensor
-
-    return tuple(b_tensor_l_sizes), tuple(groups_per_b_tensor)
-
-
 def create_mask(group_m_list, mma_tiler_m, permuted_m=None):
     """Create mask and group mapping for contiguous grouped GEMM.
 
@@ -406,8 +375,6 @@ def create_tensors(
     sf_vec_size,
     mma_tiler_m,
     permuted_m=None,
-    b_tensor_l_sizes=None,
-    groups_per_b_tensor=None,
 ):
     """Create tensors for contiguous grouped GEMM with gather operation and SwiGLU fusion.
 
@@ -416,7 +383,7 @@ def create_tensors(
 
     Returns tensors including:
     - A: Input matrix (MxKx1)
-    - B: Weight matrix with interleaved up/gate weights (NxKxL) or list of tensors for multi-B
+    - B: Weight matrix with interleaved up/gate weights (NxKxL)
     - C: Output matrix (Mx(N/2)x1), N is halved due to SwiGLU fusion
     - SFA, SFB: Scale factor matrices for A and B
     - SFC: Scale factor matrix for C (only when c_dtype is Float4E2M1FN)
@@ -426,13 +393,8 @@ def create_tensors(
 
     :param mma_tiler_m: MMA tile size in M dimension (from mma_tiler_mn[0]), also used for alignment
     :param permuted_m: Optional padded M dimension for cuda_graph support.
-    :param b_tensor_l_sizes: Optional tuple of L sizes for multi-B tensor mode.
-    :param groups_per_b_tensor: Optional tuple of group indices for each B tensor.
     """
     torch.manual_seed(1111)
-
-    # Determine if multi-B tensor mode
-    multi_b_mode = b_tensor_l_sizes is not None
 
     (
         valid_m,
@@ -467,71 +429,21 @@ def create_tensors(
         divisibility=32 if ab_dtype == cutlass.Float4E2M1FN else 16,
     )
 
-    if multi_b_mode:
-        # Multi-B tensor mode: create multiple B tensors
-        b_torch_cpu_list = []
-        b_tensor_list = []
-        b_torch_gpu_list = []
-        sfb_torch_cpu_list = []
-        sfb_tensor_list = []
-        sfb_torch_gpu_list = []
-        alpha_torch_cpu_list = []
-        alpha_tensor_list = []
+    alpha_torch_cpu = torch.randn((num_groups,), dtype=torch.float32)
+    alpha = from_dlpack(alpha_torch_cpu.cuda()).mark_layout_dynamic()
 
-        for l_size in b_tensor_l_sizes:
-            # Create alpha for this B tensor
-            alpha_torch_cpu = torch.randn((l_size,), dtype=torch.float32)
-            alpha_torch_cpu_list.append(alpha_torch_cpu)
-            alpha = from_dlpack(alpha_torch_cpu.cuda()).mark_layout_dynamic()
-            alpha_tensor_list.append(alpha)
-
-            # Create B tensor
-            b_torch_cpu = cutlass_torch.matrix(l_size, n, k, b_major == "n", cutlass.Float32)
-            b_tensor, b_torch_gpu = cutlass_torch.cute_tensor_like(
-                b_torch_cpu, ab_dtype, is_dynamic_layout=True, assumed_align=16
-            )
-            b_tensor.mark_compact_shape_dynamic(
-                mode=1 if b_major == "k" else 0,
-                stride_order=(2, 0, 1) if b_major == "k" else (2, 1, 0),
-                divisibility=32 if ab_dtype == cutlass.Float4E2M1FN else 16,
-            )
-            b_torch_cpu_list.append(b_torch_cpu)
-            b_tensor_list.append(b_tensor)
-            b_torch_gpu_list.append(b_torch_gpu)
-
-            # Create SFB tensor
-            sfb_torch_cpu, sfb_tensor, sfb_torch_gpu = create_scale_factor_tensor(
-                l_size, n, k, sf_vec_size, sf_dtype
-            )
-            sfb_torch_cpu_list.append(sfb_torch_cpu)
-            sfb_tensor_list.append(sfb_tensor)
-            sfb_torch_gpu_list.append(sfb_torch_gpu)
-
-        b_tensor = b_tensor_list
-        b_torch_cpu = b_torch_cpu_list
-        b_torch_gpu = b_torch_gpu_list
-        sfb_tensor = sfb_tensor_list
-        sfb_torch_cpu = sfb_torch_cpu_list
-        sfb_torch_gpu = sfb_torch_gpu_list
-        alpha_torch_cpu = alpha_torch_cpu_list
-        alpha = alpha_tensor_list
-    else:
-        # Single B tensor mode
-        alpha_torch_cpu = torch.randn((num_groups,), dtype=torch.float32)
-        alpha = from_dlpack(alpha_torch_cpu.cuda()).mark_layout_dynamic()
-
-        b_torch_cpu = cutlass_torch.matrix(num_groups, n, k, b_major == "n", cutlass.Float32)
-        b_tensor, b_torch_gpu = cutlass_torch.cute_tensor_like(
-            b_torch_cpu, ab_dtype, is_dynamic_layout=True, assumed_align=16
-        )
-        b_tensor.mark_compact_shape_dynamic(
-            mode=1 if b_major == "k" else 0,
-            stride_order=(2, 0, 1) if b_major == "k" else (2, 1, 0),
-            divisibility=32 if ab_dtype == cutlass.Float4E2M1FN else 16,
-        )
-        sfb_torch_cpu, sfb_tensor, sfb_torch_gpu = create_scale_factor_tensor(
-            num_groups, n, k, sf_vec_size, sf_dtype
-        )
+    b_torch_cpu = cutlass_torch.matrix(num_groups, n, k, b_major == "n", cutlass.Float32)
+    b_tensor, b_torch_gpu = cutlass_torch.cute_tensor_like(
+        b_torch_cpu, ab_dtype, is_dynamic_layout=True, assumed_align=16
+    )
+    b_tensor.mark_compact_shape_dynamic(
+        mode=1 if b_major == "k" else 0,
+        stride_order=(2, 0, 1) if b_major == "k" else (2, 1, 0),
+        divisibility=32 if ab_dtype == cutlass.Float4E2M1FN else 16,
+    )
+    sfb_torch_cpu, sfb_tensor, sfb_torch_gpu = create_scale_factor_tensor(
+        num_groups, n, k, sf_vec_size, sf_dtype
+    )
 
     # Use tensor_m (permuted_m if provided) for scale factor A
     sfa_torch_cpu, sfa_tensor, sfa_torch_gpu = create_scale_factor_tensor_unswizzled(
@@ -619,7 +531,6 @@ def run(
     permuted_m: int = None,
     use_cupti: bool = False,
     raster_along_m: bool = False,
-    num_b_tensors: int = None,
     **kwargs,
 ):
     """Run contiguous grouped GEMM with gather operation and SwiGLU fusion for FC1 layer.
@@ -630,17 +541,10 @@ def run(
     3. Optional Quant: When c_dtype is Float4E2M1FN, generates SFC and quantizes output
 
     Note: Output C has N/2 columns since SwiGLU combines pairs of (up, gate) from interleaved B weights.
-
-    :param num_b_tensors: If specified, enables multi-B tensor mode (2-4 tensors).
     """
-    # Determine if multi-B tensor mode
-    multi_b_mode = num_b_tensors is not None
-
     print("Running Blackwell Persistent Contiguous Grouped GEMM with Gather test:")
     print(f"nkl: {nkl}")
     print(f"group_m_list: {group_m_list}")
-    if multi_b_mode:
-        print(f"Multi-B tensor mode: {num_b_tensors} B tensors")
     print(
         f"AB dtype: {ab_dtype}, C dtype: {c_dtype}, Acc dtype: {acc_dtype}, "
         f"Scale factor dtype: {sf_dtype}, SF Vec size: {sf_vec_size}"
@@ -664,14 +568,6 @@ def run(
 
     if not torch.cuda.is_available():
         raise RuntimeError("GPU is required to run this example!")
-
-    # Split groups into multiple B tensors if multi-B mode
-    b_tensor_l_sizes = None
-    groups_per_b_tensor = None
-    if multi_b_mode:
-        b_tensor_l_sizes, groups_per_b_tensor = split_groups_to_b_tensors(num_groups, num_b_tensors)
-        print(f"b_tensor_l_sizes: {b_tensor_l_sizes}")
-        print(f"groups_per_b_tensor: {groups_per_b_tensor}")
 
     # Skip unsupported testcase
     # Note: For grouped GEMM, we use mma_tiler_mn[0] as the m parameter for can_implement check
@@ -742,8 +638,6 @@ def run(
         sf_vec_size,
         mma_tiler_mn[0],  # mma_tiler_m, also used for alignment
         permuted_m,
-        b_tensor_l_sizes=b_tensor_l_sizes,
-        groups_per_b_tensor=groups_per_b_tensor,
     )
 
     # Configure gemm kernel
@@ -754,7 +648,6 @@ def run(
         True,
         topk=1,
         raster_along_m=raster_along_m,
-        b_tensor_l_sizes=b_tensor_l_sizes if multi_b_mode else None,
     )
 
     # Compute max active clusters on current device
@@ -769,78 +662,40 @@ def run(
     current_stream = cuda.CUstream(torch_stream.cuda_stream)
     # Compile gemm kernel
     # sfc_tensor is optional and can be set as None (Python's None value) if not needed.
-    if multi_b_mode:
-        # Multi-B tensor mode: pass tuples
-        compiled_gemm = cute.compile(
-            gemm,
-            a_tensor,
-            tuple(b_tensor),
-            c_tensor,
-            sfa_tensor,
-            tuple(sfb_tensor),
-            sfc_tensor,
-            norm_const_tensor,
-            tile_idx_to_expert_idx,
-            tile_idx_to_mn_limit,
-            token_id_mapping,
-            num_non_exiting_tiles,
-            tuple(alpha),
-            max_active_clusters,
-            current_stream,
-        )
-    else:
-        # Single-B tensor mode
-        compiled_gemm = cute.compile(
-            gemm,
-            a_tensor,
-            b_tensor,
-            c_tensor,
-            sfa_tensor,
-            sfb_tensor,
-            sfc_tensor,
-            norm_const_tensor,
-            tile_idx_to_expert_idx,
-            tile_idx_to_mn_limit,
-            token_id_mapping,
-            num_non_exiting_tiles,
-            alpha,
-            max_active_clusters,
-            current_stream,
-        )
+    compiled_gemm = cute.compile(
+        gemm,
+        a_tensor,
+        b_tensor,
+        c_tensor,
+        sfa_tensor,
+        sfb_tensor,
+        sfc_tensor,
+        norm_const_tensor,
+        tile_idx_to_expert_idx,
+        tile_idx_to_mn_limit,
+        token_id_mapping,
+        num_non_exiting_tiles,
+        alpha,
+        max_active_clusters,
+        current_stream,
+    )
 
     # Execution
-    if multi_b_mode:
-        compiled_gemm(
-            a_tensor,
-            tuple(b_tensor),
-            c_tensor,
-            sfa_tensor,
-            tuple(sfb_tensor),
-            sfc_tensor,
-            norm_const_tensor,
-            tile_idx_to_expert_idx,
-            tile_idx_to_mn_limit,
-            token_id_mapping,
-            num_non_exiting_tiles,
-            tuple(alpha),
-            current_stream,
-        )
-    else:
-        compiled_gemm(
-            a_tensor,
-            b_tensor,
-            c_tensor,
-            sfa_tensor,
-            sfb_tensor,
-            sfc_tensor,
-            norm_const_tensor,
-            tile_idx_to_expert_idx,
-            tile_idx_to_mn_limit,
-            token_id_mapping,
-            num_non_exiting_tiles,
-            alpha,
-            current_stream,
-        )
+    compiled_gemm(
+        a_tensor,
+        b_tensor,
+        c_tensor,
+        sfa_tensor,
+        sfb_tensor,
+        sfc_tensor,
+        norm_const_tensor,
+        tile_idx_to_expert_idx,
+        tile_idx_to_mn_limit,
+        token_id_mapping,
+        num_non_exiting_tiles,
+        alpha,
+        current_stream,
+    )
 
     torch.cuda.synchronize()
     # Compute reference result
@@ -859,25 +714,8 @@ def run(
             end = start + group_m
             res_a = a_torch_cpu_f32[token_id_mapping_cpu[start:end]]
 
-            if multi_b_mode:
-                # Find which B tensor this group belongs to
-                b_tensor_idx = None
-                local_group_idx = None
-                for b_idx, groups in enumerate(groups_per_b_tensor):
-                    if i in groups:
-                        b_tensor_idx = b_idx
-                        local_group_idx = groups.index(i)
-                        break
-                assert b_tensor_idx is not None, f"Group {i} not found in any B tensor"
-                res_b = torch.einsum(
-                    "nk,nk->nk",
-                    b_torch_cpu[b_tensor_idx][:, :, local_group_idx],
-                    sfb_torch_cpu[b_tensor_idx][:, :, local_group_idx],
-                )
-                alpha_val = alpha_torch_cpu[b_tensor_idx][local_group_idx]
-            else:
-                res_b = torch.einsum("nk,nk->nk", b_torch_cpu[:, :, i], sfb_torch_cpu[:, :, i])
-                alpha_val = alpha_torch_cpu[i]
+            res_b = torch.einsum("nk,nk->nk", b_torch_cpu[:, :, i], sfb_torch_cpu[:, :, i])
+            alpha_val = alpha_torch_cpu[i]
 
             gemm_result[0, start:end, :] = torch.einsum("mk,nk->mn", res_a, res_b) * alpha_val
             start = end
@@ -1160,54 +998,30 @@ def run(
             sf_vec_size,
             mma_tiler_mn[0],  # mma_tiler_m, also used for alignment
             permuted_m,
-            b_tensor_l_sizes=b_tensor_l_sizes,
-            groups_per_b_tensor=groups_per_b_tensor,
         )
-        if multi_b_mode:
-            return cute.testing.JitArguments(
-                a_tensor,
-                tuple(b_tensor),
-                c_tensor,
-                sfa_tensor,
-                tuple(sfb_tensor),
-                sfc_tensor,
-                norm_const_tensor,
-                tile_idx_to_expert_idx,
-                tile_idx_to_mn_limit,
-                token_id_mapping,
-                num_non_exiting_tiles,
-                tuple(alpha),
-                current_stream,
-            )
-        else:
-            return cute.testing.JitArguments(
-                a_tensor,
-                b_tensor,
-                c_tensor,
-                sfa_tensor,
-                sfb_tensor,
-                sfc_tensor,
-                norm_const_tensor,
-                tile_idx_to_expert_idx,
-                tile_idx_to_mn_limit,
-                token_id_mapping,
-                num_non_exiting_tiles,
-                alpha,
-                current_stream,
-            )
+        return cute.testing.JitArguments(
+            a_tensor,
+            b_tensor,
+            c_tensor,
+            sfa_tensor,
+            sfb_tensor,
+            sfc_tensor,
+            norm_const_tensor,
+            tile_idx_to_expert_idx,
+            tile_idx_to_mn_limit,
+            token_id_mapping,
+            num_non_exiting_tiles,
+            alpha,
+            current_stream,
+        )
 
     workspace_count = 1
     if use_cold_l2:
         # Calculate actual tensor_m used (with padding if permuted_m provided)
         tensor_m = permuted_m if permuted_m is not None else valid_m
-        if multi_b_mode:
-            b_bytes = sum(t.numel() * t.element_size() for t in b_torch_gpu)
-            sfb_bytes = sum(t.numel() * t.element_size() for t in sfb_torch_gpu)
-            alpha_bytes = sum(t.numel() * t.element_size() for t in alpha_torch_cpu)
-        else:
-            b_bytes = b_torch_gpu.numel() * b_torch_gpu.element_size()
-            sfb_bytes = sfb_torch_gpu.numel() * sfb_torch_gpu.element_size()
-            alpha_bytes = alpha_torch_cpu.numel() * alpha_torch_cpu.element_size()
+        b_bytes = b_torch_gpu.numel() * b_torch_gpu.element_size()
+        sfb_bytes = sfb_torch_gpu.numel() * sfb_torch_gpu.element_size()
+        alpha_bytes = alpha_torch_cpu.numel() * alpha_torch_cpu.element_size()
         one_workspace_bytes = (
             a_torch_gpu.numel() * a_torch_gpu.element_size()
             + b_bytes
@@ -1380,13 +1194,6 @@ if __name__ == "__main__":
     parser.add_argument(
         "--raster_along_m", action="store_true", default=False, help="Raster along M dimension"
     )
-    parser.add_argument(
-        "--num_b_tensors",
-        type=int,
-        default=None,
-        help="Number of B tensors to split into (for multi-B tensor test). "
-        "If specified, enables multi-B tensor mode. Must be 2, 3, or 4.",
-    )
 
     args = parser.parse_args()
 
@@ -1421,16 +1228,6 @@ if __name__ == "__main__":
     if len(args.cluster_shape_mn) != 2:
         parser.error("--cluster_shape_mn must contain exactly 2 values")
 
-    if args.num_b_tensors is not None:
-        if args.num_b_tensors < 2 or args.num_b_tensors > 4:
-            parser.error("--num_b_tensors must be 2, 3, or 4")
-        n, k, num_groups = nkl
-        if num_groups < args.num_b_tensors:
-            parser.error(
-                f"--num_b_tensors ({args.num_b_tensors}) cannot be greater than "
-                f"number of groups ({num_groups})"
-            )
-
     exec_time = run(
         nkl,
         group_m_list,
@@ -1452,7 +1249,6 @@ if __name__ == "__main__":
         args.permuted_m,
         args.use_cupti,
         args.raster_along_m,
-        args.num_b_tensors,
     )
     print(f"Execution time: {exec_time:.2f} us")
     print("PASS")
