@@ -586,6 +586,10 @@ class TestDeepseekV4CacheManager:
             device="cuda",
         )
         with torch.cuda.stream(cache_manager._stream):
+            cache_manager.compute_sliding_block_tables(
+                [req.py_request_id],
+                num_contexts=num_contexts,
+            )
             cache_manager.copy_batch_sliding_block_tables(
                 sliding_block_tables,
                 [req.py_request_id],
@@ -1238,6 +1242,10 @@ class TestDeepseekV4CacheManager:
                 device="cpu",
             )
             with torch.cuda.stream(cache_manager._stream):
+                cache_manager.compute_sliding_block_tables(
+                    [req.py_request_id],
+                    num_contexts=1,
+                )
                 cache_manager.copy_batch_sliding_block_tables(
                     sliding_block_tables_cuda,
                     [req.py_request_id],
@@ -1331,12 +1339,26 @@ class TestDeepseekV4CacheManager:
                 cache_manager._host_attention_op_block_offsets_staging,
                 device="cuda",
             )
+            sliding_block_tables = torch.empty_like(
+                cache_manager._host_per_layer_block_tables_staging,
+                device="cuda",
+            )
 
             with torch.cuda.stream(cache_manager._stream):
+                cache_manager.compute_sliding_block_tables(
+                    request_ids,
+                    num_contexts=num_contexts,
+                )
                 cache_manager.copy_batch_block_offsets(
                     actual,
                     request_ids,
                     beam_width=1,
+                    num_contexts=num_contexts,
+                    num_seqs=len(request_ids),
+                )
+                cache_manager.copy_batch_sliding_block_tables(
+                    sliding_block_tables,
+                    request_ids,
                     num_contexts=num_contexts,
                     num_seqs=len(request_ids),
                 )
@@ -1358,7 +1380,20 @@ class TestDeepseekV4CacheManager:
 
             # DSV4 AttentionOp only consumes the key table.
             cache_manager._stream.synchronize()
-            torch.testing.assert_close(actual.cpu()[:, :, 0], expected)
+            actual_cpu = actual.cpu()
+            sliding_block_tables_cpu = sliding_block_tables.cpu()
+            torch.testing.assert_close(
+                actual_cpu[:, : len(request_ids), 0],
+                expected[:, : len(request_ids)],
+            )
+            torch.testing.assert_close(
+                actual_cpu[:, : len(request_ids), 0],
+                sliding_block_tables_cpu[
+                    :,
+                    DeepseekV4AttentionType.SWA.value,
+                    : len(request_ids),
+                ],
+            )
         finally:
             for req in requests:
                 cache_manager.free_resources(req)
@@ -1388,6 +1423,10 @@ class TestDeepseekV4CacheManager:
             )
 
             with torch.cuda.stream(cache_manager._stream):
+                cache_manager.compute_sliding_block_tables(
+                    request_ids,
+                    num_contexts=num_contexts,
+                )
                 cache_manager.copy_batch_sliding_block_tables(
                     actual,
                     request_ids,
@@ -1417,7 +1456,10 @@ class TestDeepseekV4CacheManager:
                     )
 
             cache_manager._stream.synchronize()
-            torch.testing.assert_close(actual.cpu(), expected)
+            torch.testing.assert_close(
+                actual.cpu()[:, :, : len(request_ids)],
+                expected[:, :, : len(request_ids)],
+            )
         finally:
             for req in requests:
                 cache_manager.free_resources(req)
@@ -1671,20 +1713,35 @@ class TestDeepseekV4CacheManager:
         req.state = LlmRequestState.DISAGG_GENERATION_INIT
         allocated = False
         try:
-            assert cache_manager.prepare_context(req)
-            assert cache_manager.resize_context(
-                req,
-                req.context_remaining_length,
-                history_length=req.context_remaining_length,
-            )
+            assert cache_manager.prepare_disagg_gen_init(req)
             allocated = True
 
             kv_cache = cache_manager.kv_cache_map[req.py_request_id]
             assert not kv_cache.enable_swa_scratch_reuse
-            assert kv_cache.history_length == req.context_remaining_length
+            assert kv_cache.history_length == req.prompt_len
         finally:
             if allocated:
                 cache_manager.free_resources(req)
+            cache_manager.shutdown()
+
+    def test_disagg_generation_init_rejects_context_apis(self, monkeypatch):
+        monkeypatch.setenv(DSV4_ENABLE_SWA_SCRATCH_REUSE_ENV, "1")
+        cache_manager, _ = self._create_deepseek_v4_cache_manager(
+            tokens_per_block=self.tokens_per_block,
+            max_batch_size=1,
+            max_seq_len=1024,
+            compress_ratios=[1],
+            dtype=DataType.BF16,
+            compressor_dtype=DataType.FLOAT,
+        )
+        req = self._create_request(request_id=0, prompt_len=self.tokens_per_block + 1)
+        req.state = LlmRequestState.DISAGG_GENERATION_INIT
+        try:
+            with pytest.raises(AssertionError, match="prepare_disagg_gen_init"):
+                cache_manager.prepare_context(req)
+            with pytest.raises(AssertionError, match="prepare_disagg_gen_init"):
+                cache_manager.resize_context(req, req.context_remaining_length)
+        finally:
             cache_manager.shutdown()
 
     def test_dummy_generation_requests_with_swa_scratch_reuse(self, monkeypatch):

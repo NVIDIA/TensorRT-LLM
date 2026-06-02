@@ -790,6 +790,14 @@ class DeepseekV4WeightLoader:
         params_map = {"gate_up_proj": ["gate_proj", "up_proj"]}
         all_named_modules = dict(self.model.named_modules())
 
+        # ConsumableWeightsDict: deletes mmap-backed source tensors right
+        # after each module finishes consuming them. Drops the OS page cache
+        # pressure on safetensors files during the per-module loop, which is
+        # the dominant host RSS contributor on tight Grace LPDDR nodes (lyris
+        # GB300, 240 GiB) where 4-rank MEGAMOE mnt=16k otherwise blows past
+        # the host budget. Mirrors DSv3's pattern at modeling_deepseekv3.py.
+        can_mark_consumed = hasattr(weights, "mark_consumed")
+
         def load_flat_hc_weights(module, names: List[str]) -> bool:
             """Load mHC / HCHead from flat ckpt keys: ``<stem>_{fn,base,scale}``.
 
@@ -899,6 +907,8 @@ class DeepseekV4WeightLoader:
                                 .view(*attn_module.v_b_proj_dequant.shape)
                                 .to(attn_module.v_b_proj_dequant.dtype)
                             )
+                    if can_mark_consumed:
+                        weights.mark_consumed(name)
                 elif names[-1] == "kv_a_proj_with_mqa":
                     nvfp4_fused_a = (
                         self.model_config.get_quant_config().layer_quant_mode.has_nvfp4()
@@ -1031,6 +1041,11 @@ class DeepseekV4WeightLoader:
                         # For DeepseekV32: kv_a_proj_with_mqa is oversized
                         # to include indexer k weights, which is filled in post_load_weights.
                         module.weight.data[0 : fused_a.shape[0]].copy_(fused_a)
+                    if can_mark_consumed:
+                        parent_prefix = ".".join(names[:-1])
+                        weights.mark_consumed(f"{parent_prefix}.kv_a_proj_with_mqa")
+                        if not is_lite:
+                            weights.mark_consumed(f"{parent_prefix}.q_a_proj")
                 elif names[-1] in params_map:
                     module_weights = []
                     for new_name in params_map[names[-1]]:
@@ -1038,6 +1053,9 @@ class DeepseekV4WeightLoader:
                             filter_weights(".".join(names[:-1] + [new_name]), weights)
                         )
                     module.load_weights(weights=module_weights)
+                    if can_mark_consumed:
+                        for src_name in params_map[names[-1]]:
+                            weights.mark_consumed(".".join(names[:-1] + [src_name]))
                 elif names[-1] == "experts":
                     module_weights = filter_weights(name, weights)
                     module_weights = rename_moe_weight(
@@ -1049,6 +1067,8 @@ class DeepseekV4WeightLoader:
                         },
                     )
                     module.load_weights(weights=[module_weights])
+                    if can_mark_consumed:
+                        weights.mark_consumed(name)
                 elif names[-1] == "backend" and isinstance(module, MoE):
                     # Special case: ConfigurableMoE.backend (TRTLLMGenFusedMoE)
                     # Currently saved MoE weights don't include 'backend' in their names.
@@ -1067,6 +1087,8 @@ class DeepseekV4WeightLoader:
                         },
                     )
                     module.load_weights(weights=[module_weights])
+                    if can_mark_consumed:
+                        weights.mark_consumed(parent_name)
                 elif names[-1] == "self_attn":
                     if f"{name}.o_a_proj" in weights:
                         load_o_a_proj(name, module)
@@ -1111,6 +1133,8 @@ class DeepseekV4WeightLoader:
                     else:
                         for n, p in module.named_parameters():
                             p.data.copy_(module_weights[n][:])
+                    if can_mark_consumed:
+                        weights.mark_consumed(name)
 
 
 @torch.compile(options={"max-autotune": True})
@@ -1472,13 +1496,10 @@ class DeepseekV4MoE(nn.Module):
                 WideEPMoE,
                 DeepGemmFusedMoE,
             )
-            # NVFP4 routed-expert path: the TRTLLM-Gen fp4-block-scale fused-MoE
-            # cubin produces near-zero accuracy without bias even when
-            # swiglu_limit is supplied; drop the limit there until the cubin
-            # gains a no-bias clamp variant. MXFP4 variants are unaffected.
+            # WideEPMoE NVFP4 (NVFP4CutlassFusedMoEMethod) swiglu_limit path
+            # not re-validated end-to-end.
             kernel_requires_bias_for_swiglu_limit = (
-                moe_cls in (TRTLLMGenFusedMoE, WideEPMoE)
-                and experts_quant_config.quant_mode.has_nvfp4()
+                moe_cls is WideEPMoE and experts_quant_config.quant_mode.has_nvfp4()
             )
             if supports_swiglu_limit and not kernel_requires_bias_for_swiglu_limit:
                 moe_load_balancer_config = getattr(model_config, "moe_load_balancer", None)
