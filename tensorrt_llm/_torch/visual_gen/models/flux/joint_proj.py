@@ -257,7 +257,7 @@ class FluxJointQKVMLPProj(nn.Module):
                     "up": (local_mlp_hidden_start, local_mlp_hidden_end),
                 },
             )
-            self.local_qkv_dim = (q_dim + 2 * kv_dim) // self.tp_size
+            self.local_qkv_dim = local_q_dim + 2 * local_kv_dim
             self.local_mlp_dim = local_mlp_hidden_size
 
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
