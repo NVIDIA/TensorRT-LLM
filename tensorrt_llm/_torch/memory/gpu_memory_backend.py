@@ -46,6 +46,7 @@ from typing import Iterator, Optional, Protocol, runtime_checkable
 import torch
 from torch import nn
 
+from tensorrt_llm._torch.weight_sharing import SourceIdentity
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
@@ -76,6 +77,10 @@ class GPUMemoryBackend(Protocol):
 
     def materialize_module(self, model: nn.Module) -> None:
         """Zero-copy import committed weights into model params (RO path)."""
+        ...
+
+    def get_source_identity(self) -> Optional["SourceIdentity"]:
+        """Return the writer's committed SourceIdentity, if available (RO)."""
         ...
 
     def finalize_write(self, model: nn.Module) -> int:
@@ -448,6 +453,22 @@ class GMSBackend:
     # ------------------------------------------------------------------
     # RO path: zero-copy import committed weights into model params
     # ------------------------------------------------------------------
+
+    def get_source_identity(self) -> Optional[SourceIdentity]:
+        """Return the writer's committed :class:`SourceIdentity`, if available.
+
+        An RO reader uses this to verify, before :meth:`materialize_module`,
+        that the writer's layout matches its own.
+
+        Returns:
+            The writer's committed identity, or ``None`` when none is
+            available (the caller then proceeds without a pre-materialize
+            compatibility check).
+        """
+        # TODO(SOURCE-IDENTITY/GMS): persist the writer's serialized identity
+        # in finalize_write and read it back here once the pool exposes a
+        # metadata channel. This is the single seam the RO gate depends on.
+        return None
 
     def materialize_module(self, model: nn.Module) -> None:
         """Zero-copy import committed weights into model params (RO path).

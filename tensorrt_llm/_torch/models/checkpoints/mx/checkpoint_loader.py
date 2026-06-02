@@ -42,6 +42,11 @@ from tensorrt_llm._torch.models.checkpoints.base_weight_loader import BaseWeight
 from tensorrt_llm._torch.models.checkpoints.base_weight_mapper import BaseWeightMapper
 from tensorrt_llm._torch.models.checkpoints.hf.checkpoint_loader import HfCheckpointLoader
 from tensorrt_llm._torch.models.modeling_utils import register_checkpoint_loader
+from tensorrt_llm._torch.weight_sharing import (
+    IdentityCheckPolicy,
+    SourceIdentity,
+    check_source_identity,
+)
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
@@ -124,6 +129,9 @@ class MXCheckpointLoader(HfCheckpointLoader):
         self._model_name = str(model_name) if model_name is not None else None
         self._query_timeout_s = query_timeout_s
         self._p2p_succeeded = False
+        # Receiver's local SourceIdentity, supplied per load_weights() call by
+        # ModelLoader; the authority for the pre-transfer compatibility gate.
+        self._local_source_identity: Optional[SourceIdentity] = None
 
     @property
     def checkpoint_format(self) -> str:
@@ -196,6 +204,8 @@ class MXCheckpointLoader(HfCheckpointLoader):
             disk loading for some or all weights.
         """
         model = kwargs.pop("model", None)
+        # Popped here so it never leaks into the disk-fallback signature.
+        self._local_source_identity = kwargs.pop("source_identity", None)
         self._p2p_succeeded = False
 
         if self._mx_server_url is None or model is None:
@@ -224,6 +234,16 @@ class MXCheckpointLoader(HfCheckpointLoader):
                 "modelexpress_client/python). Falling back to disk loading."
             )
             return self._fallback_to_disk(checkpoint_dir, mapping, **kwargs)
+
+        # Pre-transfer compatibility gate: on mismatch, skip the transfer
+        # before any RDMA work starts and fall back to disk.
+        if not self._source_identity_compatible(checkpoint_dir, MxClient, _build_trtllm_identity):
+            return self._fallback_to_disk(
+                checkpoint_dir,
+                mapping,
+                reason="source SourceIdentity incompatible with receiver",
+                **kwargs,
+            )
 
         timeout_override = self._resolve_query_timeout_override(
             checkpoint_dir,
@@ -316,6 +336,68 @@ class MXCheckpointLoader(HfCheckpointLoader):
         finally:
             if client is not None and hasattr(client, "close"):
                 client.close()
+
+    def _source_identity_compatible(
+        self, checkpoint_dir: str, MxClient: Type[Any], build_identity: Callable[..., Any]
+    ) -> bool:
+        """Whether the MX source's identity is compatible with this receiver.
+
+        Compares the receiver's local :class:`SourceIdentity` against the
+        publisher's via ``check_source_identity`` with the ``WARN_FALLBACK``
+        policy.
+
+        Args:
+            checkpoint_dir: The checkpoint directory identifying the source.
+            MxClient: The MX discovery client type (forwarded to the fetch
+                seam).
+            build_identity: Builder used to derive the publisher identity
+                (forwarded to the fetch seam).
+
+        Returns:
+            ``True`` to proceed with P2P -- when no local identity was supplied
+            (legacy callers), the publisher's identity cannot be fetched yet
+            (disk fallback still guards correctness), or the identities are
+            compatible. ``False`` only on a verified mismatch.
+        """
+        local_identity = self._local_source_identity
+        if local_identity is None:
+            return True
+
+        source_identity = self._fetch_source_identity(checkpoint_dir, MxClient, build_identity)
+        if source_identity is None:
+            logger.warning_once(
+                "MX source SourceIdentity unavailable; proceeding with P2P "
+                "without a pre-transfer compatibility check (disk fallback "
+                "still guards correctness). Tracked by SOURCE-IDENTITY/MX-2.",
+                key="mx_source_identity_unavailable",
+            )
+            return True
+
+        decision = check_source_identity(
+            local_identity,
+            source_identity,
+            IdentityCheckPolicy.WARN_FALLBACK,
+        )
+        return decision.should_share
+
+    def _fetch_source_identity(
+        self, checkpoint_dir: str, MxClient: Type[Any], build_identity: Callable[..., Any]
+    ) -> Optional[SourceIdentity]:
+        """Fetch the publisher's serialized :class:`SourceIdentity`.
+
+        Args:
+            checkpoint_dir: The checkpoint directory identifying the source.
+            MxClient: The MX discovery client type.
+            build_identity: Builder used to derive the publisher identity.
+
+        Returns:
+            The publisher's identity, or ``None`` when it cannot be fetched
+            yet (the gate is then inert; disk fallback guards correctness).
+        """
+        # TODO(SOURCE-IDENTITY/MX-2): read the publisher's identity from the MX
+        # metadata channel (get_metadata / WorkerMetadata) once upstream
+        # exposes a field for it. This is the single seam the gate depends on.
+        return None
 
     def _resolve_publish_name(self, checkpoint_dir: Optional[str]) -> str:
         return _resolve_mx_model_name(self._model_name, checkpoint_dir)

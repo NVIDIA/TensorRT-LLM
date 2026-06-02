@@ -9,6 +9,9 @@ import torch
 
 from tensorrt_llm._torch.models.checkpoints.base_checkpoint_loader import (
     AutoCheckpointMapper, BaseCheckpointLoader)
+from tensorrt_llm._torch.weight_sharing import (IdentityCheckPolicy,
+                                                SourceIdentity,
+                                                check_source_identity)
 from tensorrt_llm._utils import str_dtype_to_torch
 from tensorrt_llm.llmapi.llm_args import (ExecutorMemoryType,
                                           ModelExpressConfig, TorchLlmArgs)
@@ -333,6 +336,16 @@ class ModelLoader:
                                                 checkpoint_loader)
         load_format = self.llm_args.load_format
 
+        # Receiver's local SourceIdentity, built once from the resolved
+        # ModelConfig + Mapping. The authority for every weight-sharing
+        # compatibility gate (MX P2P, GMS RO) downstream.
+        self._source_identity = SourceIdentity.from_model_config(
+            config,
+            rank=self.mapping.rank,
+            model_name=str(
+                getattr(self.llm_args, "model", None) or checkpoint_dir),
+        )
+
         with timing("Model init total"), maybe_create_moe_load_balancer(
                 config, self.mapping) as moe_load_balancer:
             try:
@@ -437,6 +450,8 @@ class ModelLoader:
                 load_weights_kwargs: dict = {
                     "mapping": self.mapping,
                     "model": model,
+                    # Generic loaders ignore it; MXCheckpointLoader pops it.
+                    "source_identity": self._source_identity,
                 }
 
                 if hasattr(model, 'llm_checkpoint_dir'):
@@ -553,7 +568,8 @@ class ModelLoader:
                             weights = checkpoint_loader.load_weights(
                                 weight_source,
                                 mapping=self.mapping,
-                                model=model)
+                                model=model,
+                                source_identity=self._source_identity)
 
                             # ``weights`` may be:
                             #   - non-empty dict: standard mapping pipeline runs
@@ -671,6 +687,22 @@ class ModelLoader:
                                        'post_load_weights') and not getattr(
                                            module, '_weights_removed', False):
                                 module.post_load_weights()
+
+                        # Pre-materialize compatibility gate. GMS has no
+                        # disk-fallback path, so a mismatch raises under STRICT
+                        # rather than falling back.
+                        source_identity = gms_backend.get_source_identity()
+                        if source_identity is not None:
+                            check_source_identity(
+                                self._source_identity,
+                                source_identity,
+                                IdentityCheckPolicy.STRICT,
+                            )
+                        else:
+                            logger.warning(
+                                "GMS RO: writer SourceIdentity unavailable; "
+                                "materializing without a compatibility check. "
+                                "Tracked by SOURCE-IDENTITY/GMS.")
 
                         gms_backend.materialize_module(model)
 
