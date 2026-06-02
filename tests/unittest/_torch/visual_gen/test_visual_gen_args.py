@@ -316,9 +316,8 @@ class TestParallelConfigValidation:
 
     def test_attn2d_and_ulysses_seq_parallel_size(self):
         pc = ParallelConfig(
-            dit_attn2d_row_size=2,
-            dit_attn2d_col_size=2,
-            dit_ulysses_size=2,
+            attn2d_size=(2, 2),
+            ulysses_size=2,
         )
         assert pc.seq_parallel_size == 8
 

@@ -17,8 +17,6 @@
 import os
 from typing import Callable
 
-os.environ["TLLM_DISABLE_MPI"] = "1"
-
 import pytest
 import torch
 import torch.distributed as dist
@@ -77,6 +75,7 @@ def init_distributed_worker(rank: int, world_size: int, backend: str = "nccl", p
     os.environ["MASTER_PORT"] = str(port)
     os.environ["RANK"] = str(rank)
     os.environ["WORLD_SIZE"] = str(world_size)
+    os.environ["TLLM_DISABLE_MPI"] = "1"
     torch.cuda.set_device(rank % torch.cuda.device_count())
     dist.init_process_group(backend=backend, rank=rank, world_size=world_size)
 

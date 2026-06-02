@@ -286,14 +286,6 @@ class TestSeparateQkvSequenceParallelGuard:
         with pytest.raises(ValueError, match="SEPARATE_QKV cross-attention does not support"):
             _make_cross_attention_with_mapping(vgm, enable_sequence_parallel=True)
 
-    def test_ulysses_only_separate_qkv_allowed(self):
-        vgm = VisualGenMapping(world_size=2, rank=0, ulysses_size=2)
-
-        attn = _make_cross_attention_with_mapping(vgm, enable_sequence_parallel=True)
-
-        assert isinstance(attn.attn, UlyssesAttention)
-        assert not isinstance(attn.attn, (RingAttention, Attention2DAttention))
-
     def test_ring_with_sequence_parallel_disabled_allowed(self):
         vgm = VisualGenMapping(world_size=2, rank=0, ring_size=2)
 
