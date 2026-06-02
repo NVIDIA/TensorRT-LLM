@@ -600,11 +600,13 @@ class SkipSoftmaxAttentionConfig(BaseSparseAttentionConfig):
         """Resolve to the kernel-facing ``SkipSoftmaxKernelParams``."""
         from tensorrt_llm._torch.attention_backend.sparse.skip_softmax import \
             SkipSoftmaxKernelParams
+        prefill = self._phase(self.threshold_scale_factor, 'prefill')
+        decode = self._phase(self.threshold_scale_factor, 'decode')
+        # A missing phase leaves the kernel default (0.0 = skip-softmax off).
         return SkipSoftmaxKernelParams(
-            threshold_scale_factor_prefill=self._phase(
-                self.threshold_scale_factor, 'prefill'),
-            threshold_scale_factor_decode=self._phase(
-                self.threshold_scale_factor, 'decode'),
+            threshold_scale_factor_prefill=prefill
+            if prefill is not None else 0.0,
+            threshold_scale_factor_decode=decode if decode is not None else 0.0,
         )
 
     def resolve_from_ckpt_config(
@@ -651,16 +653,18 @@ class SkipSoftmaxAttentionConfig(BaseSparseAttentionConfig):
                     f"to resolve target_sparsity.")
             return phase_formula.compute_threshold_scale_factor(sparsity)
 
+        # Only emit phases that ``target_sparsity`` actually requested, so the
+        # rebuilt config stays a valid ``Dict[str, float]``.
+        threshold_scale_factor = {
+            phase: value
+            for phase in ('prefill', 'decode') if (value := _compute(
+                phase, self._phase(self.target_sparsity, phase))) is not None
+        }
         return SkipSoftmaxAttentionConfig(
             algorithm=self.algorithm,
             target_sparsity=self.target_sparsity,
-            threshold_scale_factor={
-                'prefill':
-                _compute('prefill', self._phase(self.target_sparsity,
-                                                'prefill')),
-                'decode':
-                _compute('decode', self._phase(self.target_sparsity, 'decode')),
-            })
+            threshold_scale_factor=threshold_scale_factor or None,
+        )
 
 
 class MoeLoadBalancerConfig(StrictBaseModel):
