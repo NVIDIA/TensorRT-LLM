@@ -17,7 +17,6 @@
 
 #include "tensorrt_llm/common/attentionOp.h"
 #include "tensorrt_llm/common/attentionWorkspace.h"
-#include "tensorrt_llm/common/dataType.h"
 #include "tensorrt_llm/kernels/flashMLA/flash_mla.h"
 #include "tensorrt_llm/kernels/gptKernels.h"
 #include "tensorrt_llm/kernels/mlaKernels.h"
@@ -25,12 +24,10 @@
 #include "tensorrt_llm/runtime/torchUtils.h"
 #include "tensorrt_llm/runtime/utils/debugUtils.h"
 #include "tensorrt_llm/thop/attentionOp.h"
-#include "tensorrt_llm/thop/thUtils.h"
 #include <cstdint>
-#include <functional>
 #include <torch/extension.h>
 #include <type_traits>
-#include <unordered_set>
+#include <variant>
 
 TRTLLM_NAMESPACE_BEGIN
 
@@ -883,20 +880,57 @@ public:
         sync_check_cuda_error(stream);
     }
 };
-
-template class Runner<float>;
-template class Runner<half>;
-template class Runner<half, __nv_fp8_e4m3>;
-#ifdef ENABLE_BF16
-template class Runner<__nv_bfloat16>;
-template class Runner<__nv_bfloat16, __nv_fp8_e4m3>;
-#endif
-
 } // namespace trtllm::attention
 
-using RunnerPtr = std::shared_ptr<torch_ext::trtllm::attention::RunnerBase>;
 using torch_ext::trtllm::attention::Runner;
+using torch_ext::trtllm::attention::RunnerBase;
 using torch_ext::trtllm::attention::AttentionInputType;
+
+// clang-format off
+using RunnerStorage = std::variant<std::monostate,
+    Runner<float>,
+    Runner<half>,
+    Runner<half, __nv_fp8_e4m3>,
+    Runner<half, __nv_fp4_e2m1>
+#ifdef ENABLE_BF16
+    ,
+    Runner<__nv_bfloat16>,
+    Runner<__nv_bfloat16, __nv_fp8_e4m3>,
+    Runner<__nv_bfloat16, __nv_fp4_e2m1>
+#endif
+    >;
+// clang-format on
+
+template <typename T>
+static trtllm::attention::RunnerBase* createQuantizedRunner(
+    RunnerStorage& storage, c10::ScalarType out_dtype, c10::ScalarType native)
+{
+    if (out_dtype == native)
+    {
+        return &storage.emplace<Runner<T>>();
+    }
+    if (out_dtype == torch::kFloat8_e4m3fn)
+    {
+        return &storage.emplace<Runner<T, __nv_fp8_e4m3>>();
+    }
+
+    TLLM_CHECK(out_dtype == torch::kUInt8);
+    return &storage.emplace<Runner<T, __nv_fp4_e2m1>>();
+}
+
+static trtllm::attention::RunnerBase* createRunner(
+    RunnerStorage& storage, c10::ScalarType q_dtype, c10::ScalarType out_dtype)
+{
+    switch (tensorrt_llm::runtime::TorchUtils::dataType(q_dtype))
+    {
+    case nvinfer1::DataType::kHALF: return createQuantizedRunner<half>(storage, out_dtype, torch::kFloat16);
+    case nvinfer1::DataType::kFLOAT: TLLM_CHECK(out_dtype == torch::kFloat32); return &storage.emplace<Runner<float>>();
+#ifdef ENABLE_BF16
+    case nvinfer1::DataType::kBF16: return createQuantizedRunner<__nv_bfloat16>(storage, out_dtype, torch::kBFloat16);
+#endif
+    default: return nullptr;
+    }
+}
 
 void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<torch::Tensor> v, torch::Tensor& output,
     std::optional<torch::Tensor> output_sf, std::optional<torch::Tensor> workspace_, torch::Tensor sequence_length,
@@ -979,51 +1013,14 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
     // Torch does not support native nvfp4 type.
     bool const is_fp4_out = out_dtype == torch::kUInt8;
 
-    RunnerPtr runner;
-    if (dtype == nvinfer1::DataType::kHALF)
-    {
-        if (is_fp8_out)
-        {
-            runner = std::make_shared<Runner<half, __nv_fp8_e4m3>>();
-        }
-        else if (is_fp4_out)
-        {
-            runner = std::make_shared<Runner<half, __nv_fp4_e2m1>>();
-        }
-        else
-        {
-            TLLM_CHECK(out_dtype == torch::kFloat16);
-            runner = std::make_shared<Runner<half>>();
-        }
-    }
-    else if (dtype == nvinfer1::DataType::kFLOAT)
-    {
-        TLLM_CHECK(out_dtype == torch::kFloat32);
-        runner = std::make_shared<Runner<float>>();
-    }
-#ifdef ENABLE_BF16
-    else if (dtype == nvinfer1::DataType::kBF16)
-    {
-        if (is_fp8_out)
-        {
-            runner = std::make_shared<Runner<__nv_bfloat16, __nv_fp8_e4m3>>();
-        }
-        else if (is_fp4_out)
-        {
-            runner = std::make_shared<Runner<__nv_bfloat16, __nv_fp4_e2m1>>();
-        }
-        else
-        {
-            TLLM_CHECK(out_dtype == torch::kBFloat16);
-            runner = std::make_shared<Runner<__nv_bfloat16>>();
-        }
-    }
-#endif
+    RunnerStorage runnerStorage;
+    RunnerBase* runner = createRunner(runnerStorage, qkv_or_q.scalar_type(), out_dtype);
     runner->beam_width = beam_width;
     runner->max_num_requests = max_num_requests;
     runner->attention_window_size = attention_window_size;
 
-    auto op = std::make_shared<AttentionOp>();
+    AttentionOp attnOpStaticArgs;
+    auto op = &attnOpStaticArgs;
     op->mType = dtype;
     op->mFMHAForceFP32Acc = dtype == nvinfer1::DataType::kBF16;
     op->mLayerIdx = local_layer_idx;
@@ -1138,19 +1135,21 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
 
     auto cache_key = std::make_tuple(op->data(), runner->data());
     using CacheKey = decltype(cache_key);
-    static std::unordered_map<CacheKey, std::shared_ptr<AttentionOp>, hash<CacheKey>> op_cache;
+    static std::unordered_map<CacheKey, std::unique_ptr<AttentionOp>, hash<CacheKey>> op_cache;
     if (auto it = op_cache.find(cache_key); it != op_cache.end())
     {
         TLLM_LOG_TRACE("Attention op for layer %d is cached", local_layer_idx);
-        op = it->second;
+        op = it->second.get();
     }
     else
     {
         TLLM_LOG_TRACE("Preparing new attention op for layer %d with cache key: %s", local_layer_idx,
             to_string(cache_key).c_str());
-        op->initialize();
-        runner->prepare(*op);
-        op_cache[cache_key] = op;
+        auto newOp = std::make_unique<AttentionOp>(std::move(*op));
+        newOp->initialize();
+        runner->prepare(*newOp);
+        op = newOp.get();
+        op_cache[cache_key] = std::move(newOp);
     }
 
     int32_t const num_seqs = host_context_lengths.size(0);
