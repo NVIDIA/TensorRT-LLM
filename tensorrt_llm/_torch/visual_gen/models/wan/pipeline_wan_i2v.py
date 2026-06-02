@@ -415,13 +415,6 @@ class WanImageToVideoPipeline(BasePipeline):
             flow_shift=req.params.flow_shift,
         )
 
-    def _default_flow_shift(self, height: int, width: int) -> float:
-        """Recommended flow_shift for the active Wan I2V variant + resolution."""
-
-        if self.is_wan22_14b:
-            return 5.0  # Wan2.2 I2V A14B
-        return 5.0 if max(height, width) >= 1280 else 3.0  # Wan2.1 I2V (720P vs 480P)
-
     @torch.no_grad()
     def forward(
         self,
@@ -546,21 +539,19 @@ class WanImageToVideoPipeline(BasePipeline):
             batch_size, image, height, width, num_frames, generator, last_image
         )
 
-        # Resolve flow_shift: user override wins, else the per-variant default.
-        resolved_flow_shift = (
-            flow_shift if flow_shift is not None else self._default_flow_shift(height, width)
-        )
-
-        sched_cfg = self.scheduler.config
-        shift_key = (
-            "shift" if "shift" in sched_cfg else "flow_shift" if "flow_shift" in sched_cfg else None
-        )
-        if shift_key is not None and sched_cfg[shift_key] != resolved_flow_shift:
-            logger.info(
-                f"flow_shift: {sched_cfg[shift_key]} -> {resolved_flow_shift} "
-                f"({'user' if flow_shift is not None else 'variant default'})"
+        # Apply an explicit user flow_shift override; otherwise keep the checkpoint scheduler default.
+        if flow_shift is not None:
+            sched_cfg = self.scheduler.config
+            shift_key = (
+                "shift"
+                if "shift" in sched_cfg
+                else "flow_shift"
+                if "flow_shift" in sched_cfg
+                else None
             )
-            self.scheduler.register_to_config(**{shift_key: resolved_flow_shift})
+            if shift_key is not None and sched_cfg[shift_key] != flow_shift:
+                logger.info(f"flow_shift: {sched_cfg[shift_key]} -> {flow_shift} (user)")
+                self.scheduler.register_to_config(**{shift_key: flow_shift})
 
         self.scheduler.set_timesteps(num_inference_steps, device=self.device)
 
