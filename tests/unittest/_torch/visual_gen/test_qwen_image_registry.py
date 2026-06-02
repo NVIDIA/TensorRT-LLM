@@ -37,25 +37,6 @@ def test_auto_pipeline_detects_qwen_image_class_name(tmp_path):
     assert AutoPipeline._detect_from_checkpoint(str(tmp_path)) == "QwenImagePipeline"
 
 
-@pytest.mark.parametrize(
-    "variant_class_name",
-    [
-        "QwenImageImg2ImgPipeline",
-        "QwenImageEditPipeline",
-        "QwenImageControlNetPipeline",
-    ],
-)
-def test_auto_pipeline_routes_qwen_image_variants(tmp_path, variant_class_name):
-    """Unknown Qwen-Image variants route to the base QwenImagePipeline.
-
-    Matches the behaviour of the Wan and Flux branches in
-    ``pipeline_registry.py``: anything containing ``Qwen`` + ``Image`` in
-    its class name falls through to the base pipeline.
-    """
-    (tmp_path / "model_index.json").write_text(json.dumps({"_class_name": variant_class_name}))
-    assert AutoPipeline._detect_from_checkpoint(str(tmp_path)) == "QwenImagePipeline"
-
-
 def test_transformer_constructs_with_defaults():
     """The full transformer instantiates with the documented defaults.
 

@@ -181,8 +181,6 @@ class AutoPipeline:
                 return "Flux2Pipeline"
             if "Flux" in class_name:
                 return "FluxPipeline"
-            # Qwen-Image family (QwenImagePipeline, and future variants
-            # like QwenImageEditPipeline / QwenImageImg2ImgPipeline).
             if "QwenImage" in class_name:
                 return "QwenImagePipeline"
 
