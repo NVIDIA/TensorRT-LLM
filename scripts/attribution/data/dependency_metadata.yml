@@ -23,9 +23,9 @@ cutlass/v4.3.0:
 deep_ep/5be51b228a7c82dbdb213ea58e77bffd12b38af8:
   license: 452b3ef002dc6ec283fb723f0dd84997
   source: https://github.com/deepseek-ai/DeepEP/tree/5be51b228a7c82dbdb213ea58e77bffd12b38af8
-deepgemm/ac1f28502a75dab1c36e32e80505185b49f8e6c3:
+deepgemm/950d31ab03d5d4753f10a6c7e463856f5037bff2:
   license: 452b3ef002dc6ec283fb723f0dd84997
-  source: https://github.com/deepseek-ai/DeepGEMM/tree/ac1f28502a75dab1c36e32e80505185b49f8e6c3
+  source: https://github.com/deepseek-ai/DeepGEMM/tree/950d31ab03d5d4753f10a6c7e463856f5037bff2
 dlpack/v1.0:
   license: cd9881918c97ec7b4962691660bb733e
 flashmla/1408756a88e52a25196b759eaf8db89d2b51b5a1:
