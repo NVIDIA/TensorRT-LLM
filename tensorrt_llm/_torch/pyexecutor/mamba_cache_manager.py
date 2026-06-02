@@ -20,6 +20,8 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Dict, List, Optional, Union
 
 import torch
+import triton
+import triton.language as tl
 
 import tensorrt_llm.bindings
 
@@ -1129,6 +1131,97 @@ def calc_context_stop_positions(prompt_len: int,
     return stop_positions
 
 
+@triton.jit
+def _promote_mamba_state_kernel(
+    src_ptr,
+    dst_ptr,
+    src_idx_ptr,
+    acc_ptr,
+    blk_ptr,
+    num_gens,
+    count,
+    src_s_layer,
+    src_s_row,
+    src_s_step,
+    dst_s_layer,
+    dst_s_block,
+    BLOCK: tl.constexpr,
+):
+    # One program copies a BLOCK-sized tile of the contiguous inner state for a
+    # single (layer, gen) pair. grid = (num_layers * num_gens, ceil(count/BLOCK)).
+    pair = tl.program_id(0)
+    tile = tl.program_id(1)
+    layer = (pair // num_gens).to(tl.int64)
+    g = pair % num_gens
+    row = tl.load(src_idx_ptr + g).to(tl.int64)
+    acc = tl.load(acc_ptr + g).to(tl.int64)
+    blk = tl.load(blk_ptr + g).to(tl.int64)
+    # int64 throughout: per-layer strides are O(1e8), so layer*stride overflows
+    # int32 and would corrupt addresses / fault.
+    src_base = layer * src_s_layer + row * src_s_row + acc * src_s_step
+    dst_base = layer * dst_s_layer + blk * dst_s_block
+    offs = tile * BLOCK + tl.arange(0, BLOCK)
+    mask = offs < count
+    v = tl.load(src_ptr + src_base + offs, mask=mask)
+    tl.store(dst_ptr + dst_base + offs, v, mask=mask)
+
+
+def _promote_mamba_state_triton(dst: torch.Tensor,
+                                intermediate: torch.Tensor,
+                                src_state_indices: torch.Tensor,
+                                accepted_draft: torch.Tensor,
+                                dst_state_indices: torch.Tensor,
+                                BLOCK: int = 2048) -> None:
+    """Scatter each generation request's accepted draft-step recurrent state
+    from the per-request intermediate buffer into the unified C++ pool view.
+
+    Args:
+        dst: ``[num_layers, num_blocks, *state_shape]`` view of the C++ pool.
+            The block dim (dim 1) is strided (the pool interleaves
+            ``ssm_bytes | conv_bytes`` per block), so ``dst`` is non-contiguous.
+            The kernel writes through ``dst``'s real strides, touching only this
+            state's bytes -- the case that defeats torch.compile / aot_autograd
+            (dtype-view mutation) and Inductor codegen (``XBLOCK`` on the uint8
+            pool).
+        intermediate: ``[num_layers, max_batch_size, T, *state_shape]`` dense.
+        src_state_indices, accepted_draft, dst_state_indices: ``[num_gens]`` int.
+
+    For each gen ``g``::
+
+        dst[:, dst_state_indices[g]] = intermediate[:, src_state_indices[g], accepted_draft[g]]
+
+    Pure gather->scatter copy; bandwidth-bound (~85% of HBM peak), one launch.
+    """
+    num_layers = dst.shape[0]
+    num_gens = src_state_indices.shape[0]
+    if num_gens == 0:
+        return
+    count = 1
+    for s in dst.shape[2:]:
+        count *= s
+    # Grid dim order matters: dim 0 -> CUDA grid.x (limit 2^31-1), dim 1 ->
+    # grid.y (limit 65535). Put the (layer, gen) pairs in dim 0 since that is
+    # what grows with batch size (num_layers*num_gens stays far below 2^31 for
+    # any real config); the tile count in dim 1 is small (~count/BLOCK). Do NOT
+    # swap them: pairs would hit the 65535 y-limit at num_layers*num_gens>65535.
+    grid = (num_layers * num_gens, triton.cdiv(count, BLOCK))
+    _promote_mamba_state_kernel[grid](
+        intermediate,
+        dst,
+        src_state_indices,
+        accepted_draft,
+        dst_state_indices,
+        num_gens,
+        count,
+        intermediate.stride(0),
+        intermediate.stride(1),
+        intermediate.stride(2),
+        dst.stride(0),
+        dst.stride(1),
+        BLOCK=BLOCK,
+    )
+
+
 class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
     """Hybrid cache manager storing mamba states inside the KVCacheManager pool.
 
@@ -1596,51 +1689,59 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
     def is_speculative(self) -> bool:
         return self.spec_config is not None
 
+    @nvtx_range("hybrid_update_mamba_states")
     def update_mamba_states(self,
                             attn_metadata: "AttentionMetadata",
                             num_accepted_tokens: torch.Tensor,
                             state_indices: Optional[torch.Tensor] = None):
         if self.local_num_mamba_layers == 0:
             return
-        # Note: cannot use @torch.compile here because all_ssm_states and
-        # all_conv_states are dtype-reinterpreted views of the C++ pool
-        # (uint8 -> typed), and aot_autograd does not support mutations on
-        # views with different dtypes.
         batch_size = attn_metadata.num_seqs
         num_contexts = attn_metadata.num_contexts
         num_gens = batch_size - num_contexts
-        num_accepted_draft_tokens = num_accepted_tokens[
-            num_contexts:num_contexts + num_gens] - 1
+        num_accepted_draft_tokens = (
+            num_accepted_tokens[num_contexts:num_contexts + num_gens] - 1).to(
+                torch.int32)
         # Match the API of MambaCacheManager.update_mamba_states: callers
         # may pass per-request state slot indices explicitly (e.g. MTP via
         # attn_metadata.mamba_metadata.state_indices). Fall back to this
         # manager's own slot mapping when not provided.
         if state_indices is None:
             state_indices = self.get_state_indices()
-        state_indices_d = state_indices[num_contexts:num_contexts + num_gens]
-
+        state_indices_d = state_indices[num_contexts:num_contexts +
+                                        num_gens].to(torch.int32)
         src_state_indices = self.intermediate_state_indices[:num_gens]
 
+        # The accepted SSM/conv promotion is a bandwidth-bound gather->scatter
+        # into the dtype-reinterpreted, strided C++ pool view. torch.compile
+        # can't handle the dtype-view mutation (and Inductor chokes on the
+        # uint8 pool with "XBLOCK too large"), so a dedicated Triton kernel
+        # writes through the view's real strides (~85% of HBM peak, one launch
+        # per state).
         if self._use_replay_state_update:
             # SSM state is handled incrementally by the replay kernel.  Update
             # the per-slot accepted-token counter and flip the double-buffer
             # index so the next step reads from the buffer that was just
             # written by the precompute kernel.
+            slots = state_indices_d.long()
             accepted = num_accepted_tokens[num_contexts:num_contexts + num_gens]
-            self.prev_num_accepted_tokens[state_indices_d] = accepted.to(
+            self.prev_num_accepted_tokens[slots] = accepted.to(
                 self.prev_num_accepted_tokens.dtype)
-            self.cache_buf_idx[state_indices_d] = \
-                1 - self.cache_buf_idx[state_indices_d]
+            self.cache_buf_idx[slots] = 1 - self.cache_buf_idx[slots]
         else:
-            # Legacy: copy accepted SSM states from intermediate buffer back to pool
-            accepted_ssm = self.intermediate_ssm_states[:, src_state_indices,
-                                                        num_accepted_draft_tokens]
-            self.all_ssm_states[:, state_indices_d, :] = accepted_ssm
+            # Legacy: copy the accepted SSM state from the intermediate buffer.
+            _promote_mamba_state_triton(self.all_ssm_states,
+                                        self.intermediate_ssm_states,
+                                        src_state_indices,
+                                        num_accepted_draft_tokens,
+                                        state_indices_d)
 
-        # Conv: both paths save all intermediate conv windows, carry over the accepted one.
-        accepted_conv = self.intermediate_conv_states[:, src_state_indices,
-                                                      num_accepted_draft_tokens]
-        self.all_conv_states[:, state_indices_d, :] = accepted_conv
+        # Conv: both paths save all intermediate conv windows, carry over the
+        # accepted one.
+        _promote_mamba_state_triton(self.all_conv_states,
+                                    self.intermediate_conv_states,
+                                    src_state_indices,
+                                    num_accepted_draft_tokens, state_indices_d)
 
     def get_num_available_tokens(self,
                                  token_num_upper_bound: int,
