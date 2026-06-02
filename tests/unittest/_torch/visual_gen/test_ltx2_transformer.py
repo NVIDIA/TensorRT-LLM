@@ -12,9 +12,10 @@ import unittest
 import pytest
 import torch
 
-from tensorrt_llm._torch.visual_gen.config import AttentionConfig, DiffusionModelConfig
+from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
+from tensorrt_llm.visual_gen.args import AttentionConfig
 
 # Reduced VideoOnly config for fast CI testing.
 # Real model: 32 heads × 128 dim_head = 4096 inner, 48 layers.

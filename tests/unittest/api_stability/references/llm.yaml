@@ -103,6 +103,10 @@ methods:
         annotation: tensorrt_llm.llmapi.llm_args.ModelExpressConfig
         default: null
         status: prototype
+      gms_config:
+        annotation: tensorrt_llm.llmapi.llm_args.GmsConfig
+        default: null
+        status: prototype
       mm_encoder_only:
         annotation: bool
         default: False
@@ -140,6 +144,10 @@ methods:
         default: False
         status: prototype
       enable_speculative_beam_history_d2h:
+        annotation: bool
+        default: False
+        status: prototype
+      enable_early_first_token_response:
         annotation: bool
         default: False
         status: prototype

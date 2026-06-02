@@ -249,6 +249,14 @@ def _create_model_config(
         else None
     )
 
+    # CUTE_DSL_B12X is an internal-only MoeBackendType — it has no
+    # corresponding user-facing MoeConfig.backend literal. Route through
+    # "CUTEDSL" so the test exercises the cuteDSL-family selection path that
+    # users hit on SM120/121 + NVFP4 (where get_moe_cls returns the hybrid
+    # CuteDslB12xFusedMoE backend when flashinfer is importable).
+    if moe_backend == MoeBackendType.CUTE_DSL_B12X.value:
+        moe_backend = MoeBackendType.CUTEDSL.value
+
     kwargs = dict(
         pretrained_config=pretrained_config,
         mapping=mapping,
@@ -803,6 +811,7 @@ QUANT_ALGOS = [
     QuantAlgo.FP8_BLOCK_SCALES,
     QuantAlgo.W4A8_NVFP4_FP8,
     QuantAlgo.W4A16_MXFP4,
+    QuantAlgo.W4A8_MXFP4_FP8,
     QuantAlgo.W4A8_MXFP4_MXFP8,
     QuantAlgo.W8A16,
     QuantAlgo.W4A8_AWQ,
@@ -816,6 +825,7 @@ BACKEND_TYPES = [
     MoeBackendType.DEEPGEMM,
     MoeBackendType.DENSEGEMM,
     MoeBackendType.MEGAMOE,
+    MoeBackendType.CUTE_DSL_B12X,
 ]
 
 # Data types to test
@@ -1073,14 +1083,22 @@ def generate_multi_gpu_test_params(
             if not skip_reason:
                 # TP modes shard intermediate_size; EP modes don't
                 moe_tp_size = 4 if parallel_mode in ("DTP", "TTP") else 1
+                # Match the canonical predicate used by the worker impl so
+                # backend skip checks (e.g. the W4A8_MXFP4_FP8 + TRTLLM-Gen
+                # gpt-oss SwiGLU kernel-bug skip) fire on multi-GPU runs too.
+                swiglu_gptoss_style = (
+                    swiglu_alpha != 1 or swiglu_beta != 0 or swiglu_limit != float("inf")
+                )
                 for reason in (
                     _get_comm_method_skip_reason(comm_method, model_config, dtype=dtype),
                     should_skip_trtllm(
                         backend_type,
                         quant_algo,
                         model_config,
+                        swiglu_gptoss_style=swiglu_gptoss_style,
                         comm_method=comm_method,
                         moe_tp_size=moe_tp_size,
+                        parallel_mode=parallel_mode,
                     ),
                     should_skip_cutlass(
                         backend_type,

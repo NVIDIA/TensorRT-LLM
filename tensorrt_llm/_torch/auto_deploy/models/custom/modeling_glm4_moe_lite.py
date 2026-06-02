@@ -1,3 +1,7 @@
+# Copyright 2018 The HuggingFace Team
+# Licensed under the Apache License, Version 2.0.
+# Original source: https://github.com/huggingface/transformers
+#
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
@@ -34,6 +38,7 @@ from transformers.utils import ModelOutput
 from ..._compat import ActivationType
 from ..hf import AutoModelForCausalLMFactory
 from . import mla_rope_utils
+from .rotary_utils import RotaryEmbeddingBase, build_rope_cos_sin_cache
 
 
 class Glm4MoeLiteConfig(PretrainedConfig):
@@ -161,13 +166,11 @@ class Glm4MoeLiteRMSNorm(nn.Module):
         return self.weight * hidden_states.to(input_dtype)
 
 
-class Glm4MoeLiteRotaryEmbedding(nn.Module):
+class Glm4MoeLiteRotaryEmbedding(RotaryEmbeddingBase):
     """Rotary Position Embedding for GLM4 MoE Lite.
 
-    Simplified version that precomputes and caches cos/sin values.
-    Returns full cached values (not sliced by seq_len) to enable export.
-
-    Uses _ad_ prefix for buffer names to work with AutoDeploy's lift_to_meta.
+    Keeps only the small inv_freq buffer before graph-cache transforms. The full
+    cos/sin table is graph-computed and materialized by later RoPE transforms.
     """
 
     def __init__(
@@ -186,25 +189,16 @@ class Glm4MoeLiteRotaryEmbedding(nn.Module):
         inv_freq = 1.0 / (self.base ** (torch.arange(0, self.dim, 2).float() / self.dim))
         self.register_buffer("inv_freq", inv_freq, persistent=False)
 
-        # Build cos/sin cache with AD-specific naming
         self._set_cos_sin_cache(max_position_embeddings)
 
     def _set_cos_sin_cache(self, seq_len: int):
         self.max_seq_len_cached = seq_len
-        t = torch.arange(seq_len, dtype=self.inv_freq.dtype)
-        freqs = torch.outer(t, self.inv_freq)
-        emb = torch.cat((freqs, freqs), dim=-1)
-        # Use _ad_ prefix for AutoDeploy compatibility with lift_to_meta
-        self.register_buffer("_ad_cos_cached", emb.cos() * self.attention_scaling, persistent=False)
-        self.register_buffer("_ad_sin_cached", emb.sin() * self.attention_scaling, persistent=False)
 
     def forward(
         self, x: torch.Tensor, seq_len: Optional[int] = None
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        # Return full cached cos/sin (not sliced) for export compatibility
-        return (
-            self._ad_cos_cached.to(dtype=x.dtype, device=x.device),
-            self._ad_sin_cached.to(dtype=x.dtype, device=x.device),
+        return build_rope_cos_sin_cache(
+            self.inv_freq, self.max_position_embeddings, x, self.attention_scaling
         )
 
 
@@ -252,19 +246,11 @@ class Glm4MoeLiteYarnRotaryEmbedding(Glm4MoeLiteRotaryEmbedding):
         inv_freq = freq_inter * (1 - inv_freq_mask) + freq_extra * inv_freq_mask
         self.register_buffer("inv_freq", inv_freq, persistent=False)
 
-        t = torch.arange(seq_len, dtype=torch.float32)
-        freqs = torch.outer(t, inv_freq)
-
         _mscale = float(
             self._yarn_get_mscale(self.scaling_factor, self.mscale)
             / self._yarn_get_mscale(self.scaling_factor, self.mscale_all_dim)
         )
-
-        emb = torch.cat((freqs, freqs), dim=-1)
-        # Use _ad_ prefix for AutoDeploy compatibility with lift_to_meta
-        # Note: attention_scaling is already incorporated in _mscale for YaRN
-        self.register_buffer("_ad_cos_cached", (emb.cos() * _mscale), persistent=False)
-        self.register_buffer("_ad_sin_cached", (emb.sin() * _mscale), persistent=False)
+        self.attention_scaling = _mscale
 
     @staticmethod
     def _yarn_find_correction_dim(

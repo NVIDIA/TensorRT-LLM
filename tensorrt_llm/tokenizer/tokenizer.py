@@ -10,6 +10,19 @@ from transformers import (AutoTokenizer, PreTrainedTokenizerBase,
 from .._utils import nvtx_range_debug
 from ..logger import logger
 
+# Transformers 5.x moved ``bytes_to_unicode`` out of
+# ``transformers.models.gpt2.tokenization_gpt2`` into
+# ``transformers.convert_slow_tokenizer``. Some ``trust_remote_code=True``
+# checkpoints (e.g. Kimi-K2's ``tokenization_kimi.py``) still import it from
+# the legacy location; re-export the symbol so those tokenizers keep loading.
+try:
+    from transformers.models.gpt2 import tokenization_gpt2 as _gpt2_mod
+    if not hasattr(_gpt2_mod, "bytes_to_unicode"):
+        from transformers.convert_slow_tokenizer import bytes_to_unicode
+        _gpt2_mod.bytes_to_unicode = bytes_to_unicode
+except ImportError:
+    pass
+
 # Aliases for built-in custom tokenizers.
 TOKENIZER_ALIASES = {
     "deepseek_v32": "tensorrt_llm.tokenizer.deepseek_v32.DeepseekV32Tokenizer",
@@ -57,6 +70,68 @@ def _tokenizer_json_uses_byte_level(pretrained_model_dir: str) -> bool:
             sub.get("type") == "ByteLevel"
             for sub in pt.get("pretokenizers", []))
     return False
+
+
+# Keys forwarded from tokenizer_config.json to PreTrainedTokenizerFast when
+# falling back. LlamaTokenizerFast-style flags the bare fast tokenizer does
+# not read by default but AutoTokenizer would have honored.
+_TOKENIZER_CONFIG_INHERIT_KEYS = (
+    "add_bos_token",
+    "add_eos_token",
+    "padding_side",
+    "truncation_side",
+    "model_max_length",
+    "clean_up_tokenization_spaces",
+)
+
+
+def _load_tokenizer_config_inherits(
+        pretrained_model_dir: str) -> Dict[str, Any]:
+    """Return a dict of LlamaTokenizerFast-style flags from tokenizer_config.json."""
+    import json
+    tcfg_path = os.path.join(pretrained_model_dir, "tokenizer_config.json")
+    if not os.path.isfile(tcfg_path):
+        return {}
+    try:
+        with open(tcfg_path) as f:
+            tcfg = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return {k: tcfg[k] for k in _TOKENIZER_CONFIG_INHERIT_KEYS if k in tcfg}
+
+
+def _fallback_to_fast_tokenizer(pretrained_model_dir: str,
+                                original_error: BaseException, **kwargs):
+    """Bypass AutoTokenizer's HF-config path with PreTrainedTokenizerFast.
+
+    transformers 5.x converted PreTrainedConfig to a dataclass: only declared
+    fields survive __post_init__'s RoPE standardization. When a model uses a
+    model_type not registered in CONFIG_MAPPING_NAMES (e.g. DeepSeek-V3.2's
+    ``deepseek_v32``), AutoTokenizer.from_pretrained falls back to a bare
+    PreTrainedConfig whose RoPE path reads self.max_position_embeddings,
+    raising AttributeError.
+
+    PreTrainedTokenizerFast doesn't go through AutoConfig — it reads
+    tokenizer.json via the Rust tokenizers library — so it sidesteps this
+    entirely. We forward LlamaTokenizerFast-style flags (add_bos_token,
+    padding_side, ...) from tokenizer_config.json so the fast tokenizer
+    matches the behavior AutoTokenizer would have had pre-regression.
+    """
+    inherited = _load_tokenizer_config_inherits(pretrained_model_dir)
+    fast_kwargs = {
+        k: v
+        for k, v in kwargs.items() if k not in ("trust_remote_code", "use_fast")
+    }
+    # caller kwargs win over tokenizer_config.json inherited values
+    merged = {**inherited, **fast_kwargs}
+    logger.warning(
+        f"AutoTokenizer.from_pretrained({pretrained_model_dir}) raised "
+        f"{type(original_error).__name__}: {original_error}. Falling back to "
+        f"PreTrainedTokenizerFast to bypass HF dataclass regression "
+        f"(model_type likely not registered in CONFIG_MAPPING_NAMES). "
+        f"Inherited from tokenizer_config.json: {sorted(inherited)}")
+    return PreTrainedTokenizerFast.from_pretrained(pretrained_model_dir,
+                                                   **merged)
 
 
 def maybe_fix_byte_level_tokenizer(tokenizer, pretrained_model_dir: str,
@@ -189,8 +264,19 @@ class TransformersTokenizer(TokenizerBase):
 
     @classmethod
     def from_pretrained(cls, pretrained_model_dir: str, **kwargs):
-        tokenizer = AutoTokenizer.from_pretrained(pretrained_model_dir,
-                                                  **kwargs)
+        try:
+            tokenizer = AutoTokenizer.from_pretrained(pretrained_model_dir,
+                                                      **kwargs)
+        except AttributeError as e:
+            # transformers 5.x: bare PreTrainedConfig fallback (for model_types
+            # not in CONFIG_MAPPING_NAMES, e.g. deepseek_v32) hits
+            # modeling_rope_utils → self.max_position_embeddings → AttributeError
+            # because PreTrainedConfig is now a dataclass with declared fields.
+            # See deepseek-ai/DeepSeek-V3#1207.
+            if "max_position_embeddings" not in str(e):
+                raise
+            tokenizer = _fallback_to_fast_tokenizer(pretrained_model_dir, e,
+                                                    **kwargs)
         tokenizer = maybe_fix_byte_level_tokenizer(tokenizer,
                                                    pretrained_model_dir,
                                                    **kwargs)
@@ -511,6 +597,24 @@ def maybe_register_transformers_modules_by_value():
                        f"serialization: {e}")
 
 
+def _ensure_gpt2_bytes_to_unicode_compat() -> None:
+    """Restore ``bytes_to_unicode`` on ``transformers.models.gpt2.tokenization_gpt2``.
+
+    transformers 5.x removed it from that module, but some ``trust_remote_code``
+    tokenizers (e.g. Kimi-K2's ``tokenization_kimi.py``) still import it from
+    the legacy location. The function survives under
+    ``transformers.convert_slow_tokenizer``.
+    """
+    try:
+        from transformers.models.gpt2 import tokenization_gpt2
+        if hasattr(tokenization_gpt2, "bytes_to_unicode"):
+            return
+        from transformers.convert_slow_tokenizer import bytes_to_unicode
+    except ImportError:
+        return
+    tokenization_gpt2.bytes_to_unicode = bytes_to_unicode
+
+
 def load_hf_tokenizer(model_dir: str,
                       trust_remote_code: bool = True,
                       use_fast: bool = True,
@@ -525,6 +629,8 @@ def load_hf_tokenizer(model_dir: str,
     Returns:
         A TransformersTokenizer object if the tokenizer is loaded successfully.
     '''
+
+    _ensure_gpt2_bytes_to_unicode_compat()
 
     try:
         tokenizer = TransformersTokenizer.from_pretrained(

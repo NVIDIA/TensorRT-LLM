@@ -25,7 +25,28 @@ import os
 from abc import ABC, abstractmethod
 from typing import Any, Callable, Dict, Optional, Tuple, Type
 
+from .._compat import TRTLLM_AVAILABLE
 from ..utils.logger import ad_logger
+
+# Importing ``tensorrt_llm.quantization.modelopt_config`` triggers
+# ``tensorrt_llm.quantization.__init__`` which pulls in ``tensorrt_llm.mapping``
+# and thus ``tensorrt_llm._torch.device_mesh``; none of these exist in the
+# standalone llmc package. Gate the import so this module loads cleanly when
+# TRT-LLM is absent; the ModelOPT reader path itself is unreachable in that case.
+if TRTLLM_AVAILABLE:
+    from tensorrt_llm.quantization.modelopt_config import (
+        is_modelopt_quant_config,
+        read_modelopt_quant_config,
+    )
+else:
+
+    def is_modelopt_quant_config(raw: Any) -> bool:
+        return False
+
+    def read_modelopt_quant_config(raw: Any) -> Dict[str, Any]:
+        raise NotImplementedError(
+            "ModelOPT quant config parsing requires TensorRT-LLM; not available in standalone mode."
+        )
 
 
 class QuantConfigReader(ABC):
@@ -110,12 +131,16 @@ class ModelOPTQuantConfigReader(QuantConfigReader):
     DEFAULT_KV_CACHE_DTYPE = "fp8"
 
     def read_config(self, config: Dict) -> Dict:
-        producer = config.get("producer", {}).get("name")
-        # sanity check
-        if producer != "modelopt":
-            raise ValueError(f"Expected producer 'modelopt', got '{producer}'")
-
-        quant_config = config.get("quantization", {})
+        # Accept either modelopt shape: legacy (producer.name == "modelopt"
+        # with a "quantization" wrapper) or flat (quant_method == "modelopt").
+        if not is_modelopt_quant_config(config):
+            raise ValueError(
+                "Expected a modelopt quant config "
+                f"(producer={config.get('producer')}, "
+                f"quant_method={config.get('quant_method')})"
+            )
+        # Downstream auto-deploy transforms operate on the legacy field names.
+        quant_config = read_modelopt_quant_config(config)
 
         quant_algo = quant_config.get("quant_algo", "").upper()
 

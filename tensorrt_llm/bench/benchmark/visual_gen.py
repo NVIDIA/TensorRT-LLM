@@ -18,7 +18,7 @@ r"""Offline benchmark for VisualGen (image/video generation) models.
 Usage:
     trtllm-bench --model Wan-AI/Wan2.2-T2V-A14B-Diffusers \
         --model_path /path/to/checkpoint \
-        visual-gen --extra_visual_gen_options config.yaml <benchmark_args>
+        visual-gen --visual_gen_args config.yaml <benchmark_args>
 """
 
 import json
@@ -56,11 +56,13 @@ def _parse_size(size_str: str) -> tuple[Optional[int], Optional[int]]:
 
 @click.command(name="visual-gen", context_settings={"show_default": True})
 @click.option(
+    "--visual_gen_args",
     "--extra_visual_gen_options",
+    "visual_gen_args",
     type=str,
     default=None,
-    help="Path to a YAML file with extra VisualGen model options "
-    "(same format as trtllm-serve --extra_visual_gen_options).",
+    help="Path to a YAML file with VisualGen engine args "
+    "(same format as trtllm-serve --visual_gen_args).",
 )
 @click.option(
     "--prompt",
@@ -174,7 +176,7 @@ def _parse_size(size_str: str) -> tuple[Optional[int], Optional[int]]:
 @click.pass_obj
 def visual_gen_command(
     bench_env: BenchmarkEnvironment,
-    extra_visual_gen_options: Optional[str],
+    visual_gen_args: Optional[str],
     prompt: Optional[str],
     prompt_file: Optional[str],
     num_prompts: int,
@@ -198,7 +200,6 @@ def visual_gen_command(
     import yaml
 
     from tensorrt_llm._torch.visual_gen.config import VisualGenArgs
-    from tensorrt_llm.commands.utils import get_visual_gen_num_gpus
     from tensorrt_llm.visual_gen import VisualGen, VisualGenParams
 
     if prompt is None and prompt_file is None:
@@ -211,18 +212,18 @@ def visual_gen_command(
 
     # Build VisualGenArgs (same pattern as trtllm-serve _serve_visual_gen)
     extra_args: dict = {}
-    if extra_visual_gen_options is not None:
-        with open(extra_visual_gen_options, "r") as f:
+    if visual_gen_args is not None:
+        with open(visual_gen_args, "r") as f:
             extra_args = yaml.safe_load(f) or {}
 
-    diffusion_args = VisualGenArgs(**extra_args) if extra_args else None
+    visual_gen_args = VisualGenArgs(**extra_args) if extra_args else None
 
-    n_workers = get_visual_gen_num_gpus(extra_args)
-    parallel_config = extra_args.get("parallel", {})
+    n_workers = visual_gen_args.parallel_config.n_workers if visual_gen_args is not None else 1
+    parallel_config = extra_args.get("parallel_config", {})
     if parallel_config:
         logger.info(f"World size: {n_workers}")
-        logger.info(f"CFG size: {parallel_config.get('dit_cfg_size', 1)}")
-        logger.info(f"Ulysses size: {parallel_config.get('dit_ulysses_size', 1)}")
+        logger.info(f"CFG size: {parallel_config.get('cfg_size', 1)}")
+        logger.info(f"Ulysses size: {parallel_config.get('ulysses_size', 1)}")
 
     # Parse generation parameters
     width, height = _parse_size(size)
@@ -267,7 +268,7 @@ def visual_gen_command(
     logger.info(f"Initializing VisualGen ({model_path})")
     visual_gen = VisualGen(
         model=model_path,
-        args=diffusion_args,
+        args=visual_gen_args,
     )
 
     try:

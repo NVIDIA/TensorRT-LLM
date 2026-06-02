@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -2259,6 +2259,14 @@ def pytest_collection_modifyitems(session, config, items):
 
     if waives_file:
         apply_waives(waives_file, items, config)
+
+    # Skip tests with pytest.mark.ray unless --run-ray is passed.
+    if not config.getoption("--run-ray"):
+        skip_marker = pytest.mark.skip(
+            reason="Ray tests skipped; pass --run-ray to enable")
+        for item in items:
+            if item.get_closest_marker("ray") is not None:
+                item.add_marker(skip_marker)
 
     # We have to remove prefix temporarily before splitting the test list
     # After that change back the test id.
