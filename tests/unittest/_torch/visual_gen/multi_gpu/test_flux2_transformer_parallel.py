@@ -15,18 +15,15 @@
 """Transformer-only FLUX.2 parallel correctness harness.
 
 Compares distributed Flux2Transformer2DModel forward passes against a
-single-GPU reference using real checkpoint config + transformer weights from:
-
-    $LLM_MODELS_ROOT/<model_subdir>/transformer
+single-GPU reference using randomly-initialized (stabilized) weights — no real
+checkpoint is loaded.
 
 Run with:
     pytest tests/unittest/_torch/visual_gen/multi_gpu/test_flux2_transformer_parallel.py -v -s
 """
 
 import gc
-import json
 import os
-from pathlib import Path
 from types import SimpleNamespace
 from typing import Callable
 
@@ -38,7 +35,6 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 
 try:
-    from tensorrt_llm._torch.visual_gen.checkpoints.weight_loader import WeightLoader
     from tensorrt_llm._torch.visual_gen.config import (
         AttentionConfig,
         DiffusionModelConfig,
@@ -117,23 +113,41 @@ def run_test_in_distributed(world_size: int, test_fn: Callable, use_cuda: bool =
 # =============================================================================
 
 
-_PRETRAINED_CONFIG_CACHE: dict | None = None
+# Small in-code FLUX.2 transformer config (reduced layers/dims) so tests run
+# without loading a real checkpoint. head_dim=128 keeps the FA4 backend happy;
+# num_attention_heads=8 is divisible by every ulysses_size exercised below.
+# axes_dims_rope must sum to attention_head_dim (32*4 = 128).
+_FLUX2_TEST_CONFIG = dict(
+    num_attention_heads=8,
+    attention_head_dim=128,
+    num_layers=2,
+    num_single_layers=2,
+    in_channels=64,
+    out_channels=64,
+    joint_attention_dim=256,
+    pooled_projection_dim=128,
+    mlp_ratio=3.0,
+    patch_size=1,
+    guidance_embeds=True,
+    axes_dims_rope=[32, 32, 32, 32],
+    rope_theta=2000.0,
+    eps=1e-6,
+    timestep_guidance_channels=256,
+)
 
-# Use production-like minimum pipeline size by default (512x512 image),
-# converted to latent token grid (VAE downsample x8 -> 64x64; seq_len=4096).
-_IMG_H = 64
-_IMG_W = 64
-_TXT_SEQ = 80
+# Latent token grid + text seq chosen so both sequence dims are divisible by
+# every world_size (img_seq = 8 * 8 = 64; txt_seq = 16).
+_IMG_H = 8
+_IMG_W = 8
+_TXT_SEQ = 16
 
 _TIMESTEP = 0.5
 _GUIDANCE = 3.5
 SEED_WEIGHTS = 42
 SEED_INPUT = 100
 
-DEFAULT_FLUX2_MODEL_SUBDIR = "FLUX.2-dev"
-FLUX2_TRANSFORMER_MODEL_SUBDIR = os.environ.get(
-    "FLUX2_TRANSFORMER_MODEL_SUBDIR", DEFAULT_FLUX2_MODEL_SUBDIR
-)
+ATOL = 1e-2
+RTOL = 1e-3
 
 # All valid 8-GPU combinations of (ulysses, ring, attn2d), with cfg_size fixed at 1:
 # world_size = (ring or attn2d_row*attn2d_col or 1) * ulysses = 8
@@ -149,53 +163,21 @@ _FLUX2_8GPU_PARALLEL_COMBINATIONS = [
 ]
 
 
-def _llm_models_root() -> Path:
-    root = Path("/home/scratch.trt_llm_data_ci/llm-models/")
-    if "LLM_MODELS_ROOT" in os.environ:
-        root = Path(os.environ["LLM_MODELS_ROOT"])
-    if not root.exists():
-        root = Path("/scratch.trt_llm_data/llm-models/")
-    if not root.exists():
-        pytest.skip("LLM model root not found. Set LLM_MODELS_ROOT.")
-    return root
+def _stabilize_model_weights(model):
+    """Reinitialize model weights for a stable BF16 forward pass.
 
-
-def _transformer_checkpoint_dir() -> Path:
-    ckpt_dir = _llm_models_root() / FLUX2_TRANSFORMER_MODEL_SUBDIR / "transformer"
-    if not ckpt_dir.exists():
-        pytest.skip(f"Transformer checkpoint dir not found: {ckpt_dir}")
-    return ckpt_dir
-
-
-def _transformer_pretrained_config(checkpoint_dir: Path) -> dict:
-    global _PRETRAINED_CONFIG_CACHE
-    if _PRETRAINED_CONFIG_CACHE is not None:
-        return _PRETRAINED_CONFIG_CACHE
-
-    config_path = checkpoint_dir / "config.json"
-    if not config_path.exists():
-        pytest.skip(f"Transformer config not found: {config_path}")
-    with config_path.open(encoding="utf-8") as f:
-        loaded = json.load(f)
-    if not isinstance(loaded, dict):
-        pytest.skip(f"Invalid transformer config format in {config_path}")
-
-    required = [
-        "num_attention_heads",
-        "attention_head_dim",
-        "num_layers",
-        "num_single_layers",
-        "in_channels",
-        "out_channels",
-        "joint_attention_dim",
-        "patch_size",
-    ]
-    missing = [k for k in required if k not in loaded]
-    if missing:
-        pytest.skip(f"Transformer config missing required keys {missing} in {config_path}")
-
-    _PRETRAINED_CONFIG_CACHE = loaded
-    return loaded
+    Random default init (std~1.0) overflows BF16 through multiple transformer
+    blocks. Use a small uniform init that keeps activations bounded so the
+    distributed-vs-single-GPU comparison is meaningful.
+    """
+    with torch.no_grad():
+        for _, p in model.named_parameters():
+            if p.ndim >= 2:
+                fan_in = p.shape[1]
+                std = 0.02 / max(1.0, fan_in**0.5)
+                p.data.uniform_(-std, std)
+            else:
+                p.data.uniform_(-0.01, 0.01)
 
 
 def _make_model_config(
@@ -250,38 +232,11 @@ def _make_model_config(
     return config
 
 
-def _load_transformer_weights(checkpoint_dir: Path, mapping) -> dict:
-    loader = WeightLoader(components="transformer")
-    return loader.load_weights(str(checkpoint_dir), mapping)
-
-
 def _free(*objs) -> None:
     for o in objs:
         del o
     gc.collect()
     torch.cuda.empty_cache()
-
-
-def _tolerance_for_config(parallel_cfg_kwargs: dict) -> tuple[float, float]:
-    """Return (rtol, atol) calibrated from empirical FLUX.2 BF16 worst-case measurements.
-
-    Unlike WAN, FLUX.2 Ulysses is not lossless: joint image+text attention
-    always scatters tokens across ranks, so all configs incur collective rounding.
-    Two classes are still distinguishable:
-
-    Ulysses / col=1 — no cross-rank KV exchange:
-        empirical max_abs_diff ~2.64e-02, mean ~4.20e-03
-        → atol=5e-2 (1.9× headroom), rtol=1e-3
-
-    KV-exchange — ring CP or attn2d col_size > 1:
-        empirical max_abs_diff up to ~4.64e-02, mean up to ~7.80e-03
-        → atol=1e-1 (2.2× headroom), rtol=1e-2
-    """
-    ring_size = parallel_cfg_kwargs.get("dit_ring_size", 1)
-    col_size = parallel_cfg_kwargs.get("dit_attn2d_col_size", 1)
-    if ring_size > 1 or col_size > 1:
-        return 1e-2, 1e-1
-    return 1e-3, 5e-2
 
 
 def _logic_flux2_transformer_parallel_vs_single_gpu(
@@ -296,16 +251,11 @@ def _logic_flux2_transformer_parallel_vs_single_gpu(
     device = torch.device(f"cuda:{rank}")
     dtype = torch.bfloat16
 
-    checkpoint_dir = _transformer_checkpoint_dir()
-    pretrained_cfg = _transformer_pretrained_config(checkpoint_dir)
+    pretrained_cfg = _FLUX2_TEST_CONFIG
 
     in_channels = int(pretrained_cfg["in_channels"])
     joint_dim = int(pretrained_cfg["joint_attention_dim"])
-    rope_id_dims = len(
-        pretrained_cfg.get("axes_dims_rope", pretrained_cfg.get("axes_dim", [0, 0, 0, 0]))
-    )
-    if rope_id_dims <= 0:
-        rope_id_dims = 4
+    rope_id_dims = len(pretrained_cfg["axes_dims_rope"])
 
     batch = 1
     img_seq = _IMG_H * _IMG_W
@@ -313,9 +263,8 @@ def _logic_flux2_transformer_parallel_vs_single_gpu(
     torch.manual_seed(SEED_WEIGHTS)
     ref_config = _make_model_config(pretrained_cfg, backend="FA4")
     ref_model = Flux2Transformer2DModel(ref_config).to(device).to(dtype)
-    ref_weights = _load_transformer_weights(checkpoint_dir, ref_config.mapping)
-    ref_model.load_weights(ref_weights)
-    ref_model.post_load_weights()
+    _stabilize_model_weights(ref_model)
+    ref_state = ref_model.state_dict()
 
     torch.manual_seed(SEED_WEIGHTS)
     dist_config = _make_model_config(pretrained_cfg, backend="FA4", **parallel_cfg_kwargs)
@@ -323,8 +272,7 @@ def _logic_flux2_transformer_parallel_vs_single_gpu(
         dist_model = Flux2Transformer2DModel(dist_config).to(device).to(dtype)
     except (ImportError, ValueError, NotImplementedError) as e:
         pytest.skip(f"[{label}] Parallel backend unavailable: {e}")
-    dist_model.load_weights(ref_weights)
-    dist_model.post_load_weights()
+    dist_model.load_state_dict(ref_state)
 
     torch.manual_seed(SEED_INPUT)
     hidden_states = torch.randn(batch, img_seq, in_channels, device=device, dtype=dtype) * 0.1
@@ -363,12 +311,11 @@ def _logic_flux2_transformer_parallel_vs_single_gpu(
             f"max_abs_diff={max_abs_diff:.6e}, mean_abs_diff={mean_abs_diff:.6e}"
         )
 
-    rtol, atol = _tolerance_for_config(parallel_cfg_kwargs)
     torch.testing.assert_close(
         dist_out,
         ref_out,
-        rtol=rtol,
-        atol=atol,
+        rtol=RTOL,
+        atol=ATOL,
         msg=f"Rank {rank}: [{label}] Flux2Transformer2DModel output differs from single-GPU FA4 reference",
     )
 
