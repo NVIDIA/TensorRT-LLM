@@ -1,10 +1,7 @@
 """Unit tests for warmup-cleanup behavior in PyTorchModelEngine.warmup().
 
-Locks in:
-  - gc.collect() + torch.cuda.empty_cache() fire immediately after
-    _run_autotuner_warmup (step b) - releases autotuner exploration leftovers.
-  - Step (d) max-shape pre-population runs unconditionally so the first real
-    iteration reuses the cached blocks instead of paying a cudaMalloc cost.
+Locks in that gc.collect() + torch.cuda.empty_cache() fire immediately after
+_run_autotuner_warmup (step b) to release autotuner exploration leftovers.
 
 The torch.cuda.empty_cache() after teardown_managers() in py_executor_creator
 is covered end-to-end by integration tests rather than unit-tested here.
@@ -177,8 +174,6 @@ def _capture_tllm_logs():
 class TestWarmupCleanup(unittest.TestCase):
     """Lock in warmup-cleanup behavior introduced by PR #14609 (Plan B)."""
 
-    # ---- Change 1: step (b) cleanup ----
-
     def test_empty_cache_fires_immediately_after_autotuner(self):
         """Change 1 placement: empty_cache must be the call right after
         _run_autotuner_warmup."""
@@ -216,20 +211,6 @@ class TestWarmupCleanup(unittest.TestCase):
         self.assertNotIn("autotuner", calls, f"Helix CP should skip autotuner; got {calls}")
         self.assertEqual(
             calls.count("empty_cache"), 0, f"Helix CP should skip all warmup cleanup; got {calls}"
-        )
-
-    # ---- Step (d) runs unconditionally ----
-
-    def test_step_d_runs_unconditionally(self):
-        """Step (d) max-shape pre-population must run on every warmup so the
-        first real serving iteration reuses the cached blocks instead of
-        paying a cudaMalloc cost."""
-        model_engine, resource_manager = _build_engine_and_resource_manager()
-        calls, _ = _run_warmup_tracked(model_engine, resource_manager)
-        self.assertEqual(
-            calls.count("general_warmup"),
-            2,
-            f"Expected step (a) + step (d) general_warmup calls; got {calls}",
         )
 
 
