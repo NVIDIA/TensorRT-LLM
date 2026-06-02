@@ -92,8 +92,7 @@ class DynamicOpPolicy(Enum):
 _DYNAMIC_OP_POLICIES: Dict[str, DynamicOpPolicy] = {
     # Dynamic kernels whose outputs feed captured static segments.
     "auto_deploy::flashinfer_attention_mha_with_cache": DynamicOpPolicy.OUT_BUFFER,
-    "auto_deploy::triton_attention_flattened_mha_with_cache": DynamicOpPolicy.OUT_BUFFER,
-    "auto_deploy::triton_paged_mha_with_cache": DynamicOpPolicy.OUT_BUFFER,
+    "auto_deploy::triton_mha_with_cache": DynamicOpPolicy.OUT_BUFFER,
     "auto_deploy::torch_cached_attention_with_cache": DynamicOpPolicy.OUT_BUFFER,
     "auto_deploy::trtllm_attention_mha_with_cache": DynamicOpPolicy.OUT_BUFFER,
     "auto_deploy::flashinfer_mla_with_cache": DynamicOpPolicy.OUT_BUFFER,
@@ -108,7 +107,7 @@ _DYNAMIC_OP_POLICIES: Dict[str, DynamicOpPolicy] = {
     # Metadata-prep outputs whose addresses must remain stable for captured segments.
     "auto_deploy::flashinfer_attention_prepare_metadata": DynamicOpPolicy.METADATA_WRAPPER,
     "auto_deploy::flashinfer_mla_prepare_metadata": DynamicOpPolicy.METADATA_WRAPPER,
-    "auto_deploy::triton_paged_prepare_metadata": DynamicOpPolicy.METADATA_WRAPPER,
+    "auto_deploy::triton_prepare_metadata": DynamicOpPolicy.METADATA_WRAPPER,
     "auto_deploy::mamba_ssm_prepare_metadata": DynamicOpPolicy.METADATA_WRAPPER,
     # Request-dependent metadata output shapes that are not safely bounded by
     # the piecewise token bucket. They must split the graph, but padding them in

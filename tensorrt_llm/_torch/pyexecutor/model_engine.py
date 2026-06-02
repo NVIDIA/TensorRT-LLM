@@ -267,6 +267,7 @@ class PyTorchModelEngine(ModelEngine):
             model_path,
             tokenizer=None,
             checkpoint_format=llm_args.checkpoint_format,
+            trust_remote_code=llm_args.trust_remote_code,
             **input_processor_kwargs)
         self.input_processor_with_hash = create_input_processor_with_hash(
             self.input_processor)
@@ -869,6 +870,30 @@ class PyTorchModelEngine(ModelEngine):
         with self.no_cuda_graph():
             self._general_warmup_impl(resource_manager, warmup_requests_configs)
 
+    def _assert_all_tp_ranks_have_warmup_batch(self, batch,
+                                               num_tokens: int) -> None:
+        """Assert every TP rank has a valid warmup batch, or raise with diagnostics.
+
+        Under attention-DP, each rank's KV cache available capacity can differ at
+        runtime, causing _create_warmup_request to return None on some ranks while
+        others proceed into forward() with tp_comm collectives — deadlocking the
+        job. This check prevents the deadlock by failing early with diagnostic info.
+        """
+        if self.mapping.tp_size <= 1:
+            return
+        has_batch = int(batch is not None)
+        all_flags = list(self.dist.tp_allgather(has_batch))
+        if any(all_flags) and not all(all_flags):
+            # Gather token counts for diagnostics
+            all_tokens = list(self.dist.tp_allgather(num_tokens))
+            failed_ranks = [i for i, f in enumerate(all_flags) if not f]
+            raise RuntimeError(
+                f"Warmup batch creation failed on TP rank(s) {failed_ranks} "
+                f"but succeeded on others. This would cause a collective "
+                f"deadlock. Per-rank curr_max_num_tokens: {all_tokens}. "
+                f"This indicates asymmetric KV cache capacity across TP ranks. "
+                f"Consider increasing --kv_cache_free_gpu_mem_fraction.")
+
     def _general_warmup_impl(
             self, resource_manager: ResourceManager,
             warmup_requests_configs: List[Tuple[int, int]]) -> None:
@@ -882,8 +907,12 @@ class PyTorchModelEngine(ModelEngine):
                         self._create_warmup_request(resource_manager,
                                                     num_tokens, num_gen_tokens),
                         resource_manager) as batch:
+                    if batch is None and self.mapping.tp_size <= 1:
+                        continue  # Not enough KV cache space (single rank, safe to skip)
+                    self._assert_all_tp_ranks_have_warmup_batch(
+                        batch, num_tokens)
                     if batch is None:
-                        continue  # Not enough KV cache space
+                        continue  # All ranks agree: not enough space
                     logger.info(
                         f"Run warmup with {num_tokens} tokens, include {num_gen_tokens} generation tokens"
                     )
@@ -917,6 +946,11 @@ class PyTorchModelEngine(ModelEngine):
                 resource_manager, curr_max_num_tokens, 0)
             with self._release_batch_context(warmup_request,
                                              resource_manager) as batch:
+                if batch is None and self.mapping.tp_size <= 1:
+                    pass  # Single rank, safe to skip
+                else:
+                    self._assert_all_tp_ranks_have_warmup_batch(
+                        batch, curr_max_num_tokens)
                 if batch is not None:
                     # Reset the flag is_first_draft for the draft model.
                     # This is necessary for overlap scheduler.
@@ -1524,17 +1558,96 @@ class PyTorchModelEngine(ModelEngine):
             max_seq_len=self.max_seq_len)
         return self.spec_metadata
 
-    def __del__(self) -> None:
+    def cleanup(self) -> None:
+        """Release resources owned by this model engine.
+
+        Tears down, in order:
+
+        1. The optional ``ModelLoader`` (which in turn releases any
+           GMS client; see :meth:`ModelLoader.cleanup`).
+        2. The model module reference.
+        3. CUDA Graph captures (via :meth:`_release_cuda_graphs`).
+        4. Input processors.
+        5. Userbuffers (``ub.ub_deallocate`` per buffer); on per-buffer
+           failure the unfreed buffers are kept attached so a deterministic
+           retry doesn't double-free already-released ones, and the
+           collected errors are re-raised after the loop.
+
+        Idempotency:
+            Subsequent calls are no-ops (guarded by ``_cleanup_done``).
+            The flag is set only at the end, so a partial cleanup that
+            raises mid-way will be retried on the next call.
+
+        Raises:
+            RuntimeError: If one or more userbuffer deallocations fail
+                (chained from the first error). All other steps are
+                best-effort and either succeed or leak silently with
+                their errors logged at warning level by callees.
+
+        Called from:
+            - :meth:`PyExecutor.shutdown` (deterministic teardown).
+            - :meth:`__del__` (best-effort fallback during garbage
+              collection / interpreter shutdown).
+        """
+        if getattr(self, "_cleanup_done", False):
+            return
+
+        # Cleanup is not truly atomic: released CUDA/GMS resources cannot be
+        # rolled back.  Keep each handle live until its own release succeeds,
+        # so a failed cleanup can be retried without double-freeing resources
+        # that were already released.
+        model_loader = getattr(self, "model_loader", None)
+        if model_loader is not None:
+            model_loader.cleanup()
+            self.model_loader = None
+
         self.model = None
-        self.model_loader = None
+
         self._release_cuda_graphs()
         self.input_processor = None
         self.input_processor_with_hash = None
-        if getattr(self, 'ub_buffers', None):
-            for u in self.ub_buffers:
-                ub.ub_deallocate(u.addr)
+
+        ub_buffers = getattr(self, 'ub_buffers', None)
+        if ub_buffers:
+            remaining_ub_buffers = []
+            ub_errors = []
+            for u in ub_buffers:
+                try:
+                    ub.ub_deallocate(u.addr)
+                except RuntimeError as e:
+                    # Keep failed buffers attached so a deterministic
+                    # cleanup() call can retry without double-freeing buffers
+                    # that were already deallocated successfully.
+                    remaining_ub_buffers.append(u)
+                    ub_errors.append(e)
+            self.ub_buffers = remaining_ub_buffers or None
+            if ub_errors:
+                raise RuntimeError(
+                    "Failed to deallocate one or more userbuffers during "
+                    "PyTorchModelEngine cleanup") from ub_errors[0]
+
         # Release model weights.
         release_gc()
+        self._cleanup_done = True
+
+    def __del__(self) -> None:
+        """Best-effort cleanup during garbage collection.
+
+        Delegates to :meth:`cleanup`. Catches ``RuntimeError`` (raised
+        when one or more userbuffer deallocations fail) and
+        ``AttributeError`` (typical on partially-initialized engines
+        torn down during interpreter shutdown when module references
+        have already been cleared); both are logged and swallowed
+        because destructors cannot reliably surface exceptions.
+
+        Deterministic callers (``PyExecutor.shutdown``) should call
+        :meth:`cleanup` directly so they see any failure.
+        """
+        try:
+            self.cleanup()
+        except (RuntimeError, AttributeError) as e:
+            logger.warning(
+                "PyTorchModelEngine cleanup failed during destruction: %s", e)
 
     def _init_max_seq_len(self):
         # Allow user to override the inferred max_seq_len with a warning.

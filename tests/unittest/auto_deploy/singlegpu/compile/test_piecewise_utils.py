@@ -187,6 +187,17 @@ class TestIsDynamicCachedOp:
         assert is_dynamic_cached_op(node) is True
         assert _get_dynamic_op_policy(node) == DynamicOpPolicy.METADATA_WRAPPER
 
+    def test_renamed_triton_attention_ops_use_expected_policies(self):
+        cached_target = _FakeOpOverload("auto_deploy::triton_mha_with_cache")
+        cached_node = _make_mock_node("call_function", target=cached_target)
+        assert is_dynamic_cached_op(cached_node) is True
+        assert _get_dynamic_op_policy(cached_node) == DynamicOpPolicy.OUT_BUFFER
+
+        metadata_target = _FakeOpOverload("auto_deploy::triton_prepare_metadata")
+        metadata_node = _make_mock_node("call_function", target=metadata_target)
+        assert is_dynamic_cached_op(metadata_node) is True
+        assert _get_dynamic_op_policy(metadata_node) == DynamicOpPolicy.METADATA_WRAPPER
+
     def test_gemma4_prepare_multimodal_mask_uses_eager_policy(self):
         target = _FakeOpOverload("auto_deploy::gemma4_prepare_multimodal_mask")
         node = _make_mock_node("call_function", target=target)

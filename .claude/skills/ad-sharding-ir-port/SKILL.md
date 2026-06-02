@@ -136,9 +136,11 @@ transforms:
     enabled: true
 ```
 
-Use `world_size: 8` when validating TP head-divisibility. Optional `shard_layers` limits which `layer_type` hints are processed; unset means shard all shardable nodes.
+Set `world_size` once, to the **maximum number of GPUs available on the machine**, auto-detected with `python -c 'import torch; print(torch.cuda.device_count())'` (or `nvidia-smi --list-gpus | wc -l`). Do **not** hardcode `world_size: 8` (or any other literal) — porting agents run on heterogeneous hardware and an 8-GPU literal will simply fail to launch on a 2- or 4-GPU machine. If the model's `num_attention_heads` (and, for GQA, `num_key_value_heads`) does not divide the detected GPU count, fall back to the largest power-of-two divisor that does (e.g. 4 on an 8-GPU machine if `num_attention_heads = 12`). Run the end-to-end command exactly once at that size — there is no value in repeating it at multiple smaller sizes, because the offline sharding equivalence test (Step 11b) already exercises 2- and 4-GPU dist configs cheaply.
 
-### Step 11: Validate
+Optional `shard_layers` limits which `layer_type` hints are processed; unset means shard all shardable nodes.
+
+### Step 11a — End-to-end run
 
 Do not report success until a run completes successfully.
 
@@ -148,6 +150,49 @@ Do not report success until a run completes successfully.
 4. If blocked by missing infrastructure support, revert the sharding-hint changes and file a short error report for humans (do not silently patch core transforms).
 
 **Layer type strings** (for `layer_type` / `shard_layers`): use `"mha"`, `"mla"`, `"mlp"`, `"moe"`, `"ssm"`, `"delta"`, or `"unknown"` (default; skipped when `shard_layers` is set). Match the conventions used in `apply_sharding_hints` and project enums.
+
+### Step 11b — Sharding equivalence test (MANDATORY)
+
+Run the offline sharding-IR equivalence test ([`tests/unittest/auto_deploy/multigpu/transformations/library/test_sharding_ir_equivalence.py`](tests/unittest/auto_deploy/multigpu/transformations/library/test_sharding_ir_equivalence.py)) against the modeling file you just edited, under **every** parallelism configuration the test exposes. The port is **not** complete until every configuration passes. Skipping this step or treating a partial pass (e.g. only `tep`) as success is not allowed.
+
+The test compares a sharded prefill against the unsharded eager reference on a tiny (4-layer, hidden_size=64) instance of the model and asserts `rel_rmse < tol`, where `tol` is the test-defined relative-RMSE tolerance (`REL_RMSE_TOL` constant in [`test_sharding_ir_equivalence.py`](tests/unittest/auto_deploy/multigpu/transformations/library/test_sharding_ir_equivalence.py); overridable per invocation via the `SHARDING_IR_REL_RMSE_TOL` env var). It uses no PyExecutor / no compile / no checkpoint download, so each cell runs in ~30s on 4xGPU.
+
+**Run the matrix:**
+
+```bash
+MODEL=tensorrt_llm/_torch/auto_deploy/models/custom/modeling_<name>.py
+TEST=tests/unittest/auto_deploy/multigpu/transformations/library/test_sharding_ir_equivalence.py
+
+for CFG in tp-only ep-only tep attn-dp; do
+  pytest "$TEST" --sharding-ir-modeling-file "$MODEL" --sharding-ir-dist-config "$CFG" -s -v \
+    2>&1 | tee /tmp/sharding_ir_${CFG}.log
+done
+```
+
+**Parse the output for each cell. A cell PASSES iff ALL of these are true:**
+
+1. pytest exit code is `0`.
+2. The log contains the line `1 passed` in the pytest summary block.
+3. The log contains the rank-0 metrics line `[sharding-ir-eq] |y_s - y_u|: max=... mean=... rel_rmse=<X.XXXXXX> (tol=<Y.YYYYYY>)` and the parsed `rel_rmse` is **strictly less than the parsed `tol`** from the same line. Do not hardcode a tolerance value in the parser — read both `rel_rmse=` and `tol=` from the test's own log and compare them. This stays correct if the test's `REL_RMSE_TOL` is later changed or a per-invocation `SHARDING_IR_REL_RMSE_TOL` is supplied.
+
+Quick one-liner that prints PASS/FAIL plus the parsed `rel_rmse` and `tol` per cell:
+
+```bash
+for CFG in tp-only ep-only tep attn-dp; do
+  log=/tmp/sharding_ir_${CFG}.log
+  if grep -q "1 passed" "$log"; then status=PASS; else status=FAIL; fi
+  line=$(grep "sharding-ir-eq" "$log" | grep "rel_rmse=" | head -1)
+  rmse=$(echo "$line" | sed -E 's/.*rel_rmse=([0-9.]+).*/\1/')
+  tol=$(echo  "$line" | sed -E 's/.*\(tol=([0-9.]+)\).*/\1/')
+  echo "${CFG}: ${status} rel_rmse=${rmse:-NA} tol=${tol:-NA}"
+done
+```
+
+**Failure handling:**
+
+- A cell failing with `KeyError`, `AttributeError`, `ValueError: You must specify exactly one of input_ids or inputs_embeds`, or any exception *before* `[sharding-ir-eq]` prints means the **modeling code itself** does not yet build / export on a tiny config — fix the modeling code (within the Step 0 allowlist) before proceeding. Do not silently skip the cell.
+- A cell where `[sharding-ir-eq]` prints `rel_rmse >= tol` (from the same log line) means a **sharding-hint bug**: a missing `all_reduce`, a wrong `tp_mode`, a `view` without `tp_scaled_dim`, a `split_with_sizes` whose sizes do not scale, etc. Re-read Step 6 (all_reduce), Step 3 (tp_mode), Step 5 (view), Step 4 (split_with_sizes) and the layer-specific patterns. Iterate on the hints until clean. If the failure is small (rel_rmse just slightly above tol) and you have reason to believe it is real numerical noise from the specific layer mix of this model rather than a sharding-hint bug, raise it with the parent agent rather than silently bumping `SHARDING_IR_REL_RMSE_TOL`.
+- A cell that the modeling file legitimately does not support (e.g. `ep-only` on a dense model with no MoE) is acceptable only if the failure is a documented `pytest.skip(...)` from the test infrastructure. A silent `FAIL` is **not** acceptable.
 
 ### Step 12 — Pre-finalization self-audit (MANDATORY)
 
@@ -216,7 +261,8 @@ You are NOT done until every row in the table is a yes-allowed category.
 
 ## Validation checklist (human review)
 
+- All four configurations of the **sharding equivalence test** (Step 11b) pass with the parsed `rel_rmse` strictly below the parsed `tol` from the same rank-0 log line. Report the per-cell `rel_rmse` and `tol` pair.
 - `world_size=1`: unsharded path; hints should not break correctness.
-- `world_size=2` and `8`: shape checks and coherent output.
+- `world_size=<max-available>`: end-to-end run (Step 11a) at the maximum GPU count auto-detected on the machine (head-divisibility permitting; see Step 11).
 - `apply_sharding_hints` node count vs expectation.
 - Optional: `shard_layers: ['moe']` to verify selective sharding.
