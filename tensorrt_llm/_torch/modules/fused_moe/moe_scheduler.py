@@ -698,7 +698,7 @@ class ExternalCommMoEScheduler(MoEScheduler):
 
         Backend-specific kwargs:
             - Cutlass: is_sf_swizzled, enable_alltoall, tuner_*, moe_output
-            - CuteDSL: enable_alltoall, moe_output, dwdp_weight_view
+            - CuteDSL: enable_alltoall, moe_output
             - DeepGemm: workspace
             - TRTLLMGen: router_logits, do_finalize, moe_output
         """
@@ -733,11 +733,6 @@ class ExternalCommMoEScheduler(MoEScheduler):
             kwargs["moe_output"] = self._get_nvlink_onesided_moe_output(
                 all_rank_num_tokens=all_rank_num_tokens, output_dtype=output_dtype
             )
-
-            if moe.enable_dwdp:
-                kwargs["dwdp_weight_view"] = moe.dwdp_manager.build_weight_view(
-                    moe.layer_idx, moe.backend
-                )
 
         elif moe.backend.__class__ == DeepGemmFusedMoE:
             if workspace is not None:

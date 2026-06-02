@@ -37,7 +37,7 @@
     },
     {
       "name": "eigen",
-      "git_repository": "https://github.com/libeigen/eigen",
+      "git_repository": "https://gitlab.com/libeigen/eigen.git",
       "git_tag": "3.4.0",
       "git_shallow": true
     },

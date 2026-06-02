@@ -6,6 +6,7 @@ cleanup_on_failure() {
 }
 
 mkdir -p $jobWorkspace
+mkdir -p "$testOutputDir"
 chmod +x $runScript
 chmod +x $installScript
 
@@ -26,7 +27,7 @@ for i in $(seq 0 $((numGenServers - 1))); do
         -N $nodesPerGenServer \
         --ntasks=$gen_world_size \
         --ntasks-per-node=$gpusPerNodePerGenServer \
-        $runScript &> $jobWorkspace/gen_server_$i.log &
+        $runScript &> $testOutputDir/gen_server_$i.log &
     echo "Started gen server $i"
     sleep 5  # Wait for pyxis container namespace initialization to avoid race condition
 done
@@ -42,7 +43,7 @@ if [ "${TRTLLM_DISAGG_BENCHMARK_GEN_ONLY:-0}" != "1" ]; then
             -N $nodesPerCtxServer \
         --ntasks=$ctx_world_size \
         --ntasks-per-node=$gpusPerNodePerCtxServer \
-            $runScript &> $jobWorkspace/ctx_server_$i.log &
+            $runScript &> $testOutputDir/ctx_server_$i.log &
         echo "Started ctx server $i"
         sleep 5  # Wait for pyxis container namespace initialization to avoid race condition
     done
@@ -60,7 +61,7 @@ srun "${srunArgs[@]}" --kill-on-bad-exit=1 --overlap \
     -N 1 \
     --ntasks=1 \
     --ntasks-per-node=1 \
-    $runScript &> $jobWorkspace/disagg_server.log &
+    $runScript &> $testOutputDir/disagg_server.log &
 echo "Started disagg server"
 sleep 5  # Wait for pyxis container namespace initialization to avoid race condition
 
@@ -73,7 +74,7 @@ if ! srun "${srunArgs[@]}" --kill-on-bad-exit=1 --overlap \
     --ntasks=1 \
     --ntasks-per-node=1 \
     $runScript; then
-    cleanup_on_failure "Benchmark failed. Check logs in ${jobWorkspace} for details"
+    cleanup_on_failure "Benchmark failed. See slurm-${SLURM_JOB_ID}.out"
 fi
 
 echo "Disagg server and benchmark completed successfully"
