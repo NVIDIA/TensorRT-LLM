@@ -962,10 +962,9 @@ class PyTorchModelEngine(ModelEngine):
                     logger.info(
                         f"Run warmup with {num_tokens} tokens, include {num_gen_tokens} generation tokens"
                     )
-                    with self._maybe_flashinfer_moe_autotune():
-                        self.forward(batch,
-                                     new_tensors_device=None,
-                                     resource_manager=resource_manager)
+                    self.forward(batch,
+                                 new_tensors_device=None,
+                                 resource_manager=resource_manager)
                     torch.cuda.synchronize()
             except torch.OutOfMemoryError:
                 logger.warning(

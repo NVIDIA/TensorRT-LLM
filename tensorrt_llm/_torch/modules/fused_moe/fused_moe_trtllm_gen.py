@@ -408,7 +408,8 @@ class TRTLLMGenFusedMoE(MoE):
         Returns False if any predictable payload (hidden_states / token_selected_slots
         / token_final_scales) would need _align_payload padding.
         """
-        if os.environ.get("TRTLLM_GEN_FUSED_MOE_USE_FLASHINFER_COMM", "0") != "1":
+        if os.environ.get("TRTLLM_GEN_FUSED_MOE_USE_FLASHINFER_COMM",
+                          "0") != "1":
             return False
 
         # Tie comm choice to the op-backend opt-out.
