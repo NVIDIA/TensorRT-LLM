@@ -9,6 +9,7 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
 
 from ...model_config import ModelConfig
+from ...peft.lora.moe_utils import check_moe_lora_supported
 from ...utils import ActivationType, AuxStreamType
 from .configurable_moe import ConfigurableMoE
 from .fused_moe_cute_dsl import CuteDslFusedMoE
@@ -185,7 +186,20 @@ def resolve_moe_cls(
     if (moe_cls == TRTLLMGenFusedMoE and not has_quant
             and not TRTLLMGenFusedMoE._supports_flashinfer_bf16_routing_method(
                 routing_method)):
-        return CutlassFusedMoE
+        moe_cls = CutlassFusedMoE
+
+    # Routed-expert MoE LoRA runs only on CutlassFusedMoE with unquantized base
+    # weights. Fail at construction time rather than silently dropping the LoRA
+    # contribution at runtime. The exact-Cutlass-kernel rule and error
+    # formatting live in `check_moe_lora_supported()`; we only hand it the
+    # resolved class and the originally requested backend name.
+    check_moe_lora_supported(
+        moe_cls=moe_cls,
+        requested_moe_backend=model_config.moe_backend,
+        lora_config=model_config.lora_config,
+        quant_config=effective_quant_config,
+        layer_idx=layer_idx,
+    )
 
     return moe_cls
 

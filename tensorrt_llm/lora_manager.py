@@ -21,8 +21,10 @@ from ._utils import pad_vocab_size, release_gc, str_dtype_to_torch, torch_to_num
 from .layers.linear import ColumnLinear
 from .lora_helper import (
     LoraConfig,
+    all_false_moe_shared_flags,
     get_default_trtllm_modules_to_hf_modules,
     get_missing_qkv_modules_from_lora_modules,
+    moe_shared_sides_to_kernel_flags,
 )
 from .mapping import Mapping
 from .models.convert_utils import get_model_path, load_state_dict, split_matrix_tp
@@ -63,6 +65,19 @@ def _is_moe_module_weights(module_weights: Dict) -> bool:
     return all(isinstance(k, int) for k in module_weights.keys()) and all(
         isinstance(v, dict) for v in module_weights.values()
     )
+
+
+def _all_experts_identical(stacked: torch.Tensor) -> bool:
+    """Return True iff `stacked` has multiple experts and every slice is equal.
+
+    A stacked `[num_experts, ...]` LoRA matrix whose expert slices are all
+    identical is the "shared-outer" side of a routed-expert adapter once its
+    shared matrix has been replicated across experts. Fewer than two experts is
+    never treated as shared.
+    """
+    if stacked.ndim < 1 or stacked.shape[0] < 2:
+        return False
+    return bool((stacked == stacked[0]).all().item())
 
 
 def get_all_nemo_lora_weights(
@@ -732,6 +747,11 @@ class LoraManager(object):
 
         self._lora_uid_counter = 0
         self._lora_uid_to_low_ranks: Dict[str, Dict[int, Dict[str, int]]] = {}
+        # MoE routed-expert shared-outer kernel flags per adapter uid, built by
+        # the HF loader from the detected shared sides (see `lora_helper`). The
+        # per-request assembler in `model_engine.py` forwards them as
+        # `lora_params["moe_shared_flags"]` for the fused-MoE op.
+        self._uid_to_moe_shared_flags: dict[str, dict[str, bool]] = {}
         # When cpp_peft_cache_manager is provided (PyTorch backend), the C++
         # PeftCacheManager manages its own GPU cache with proper eviction.
         # The Python-side GPU tensors are only needed by the legacy TRT backend
@@ -1073,6 +1093,12 @@ class LoraManager(object):
             if uid not in self._cpp_lora_config:
                 self._cpp_lora_config[uid] = []  # Will be converted to tensor later
 
+            # Routed-expert MoE shared-outer detection. A shared-outer adapter
+            # shares one side (A or B) of a module across experts; once
+            # replicated per expert its expert slices are identical, which we
+            # detect from the stacked weights below and turn into kernel flags.
+            moe_shared_sides: dict[str, tuple[bool, bool]] = {}
+
             lora_model = load_state_dict(get_model_path(model_dir, "adapter_model"))
             if lora_model is None:
                 raise ValueError(f"Failed to load adapter_model from {model_dir}")
@@ -1125,6 +1151,21 @@ class LoraManager(object):
 
                         t_in = torch.stack(t_in_list)
                         t_out = torch.stack(t_out_list)
+
+                        # Detect shared-outer sides from the stacked weights. A
+                        # side counts as shared only when shared in every layer,
+                        # since the kernel flag is global per fused-MoE call.
+                        shared_a = _all_experts_identical(t_in)
+                        shared_b = _all_experts_identical(t_out)
+                        prev = moe_shared_sides.get(lora_module)
+                        if prev is None:
+                            moe_shared_sides[lora_module] = (shared_a, shared_b)
+                        else:
+                            moe_shared_sides[lora_module] = (
+                                prev[0] and shared_a,
+                                prev[1] and shared_b,
+                            )
+
                         for weights in module_weights.values():
                             if "mag" in weights:
                                 # TODO(oargov): this might work, but I had no MoE DoRA models to test
@@ -1196,6 +1237,23 @@ class LoraManager(object):
                         )
                     )
 
+            moe_shared_flags = moe_shared_sides_to_kernel_flags(moe_shared_sides)
+            self._uid_to_moe_shared_flags[uid] = moe_shared_flags
+            active = sorted(k for k, v in moe_shared_flags.items() if v)
+            if active:
+                logger.info(
+                    "MoE LoRA adapter '%s': detected shared-outer sides %s; "
+                    "the fused-MoE kernel will read one slice per shared side.",
+                    uid,
+                    active,
+                )
+            elif moe_shared_sides:
+                logger.debug(
+                    "MoE LoRA adapter '%s': no shared-outer side detected; "
+                    "using the per-expert path.",
+                    uid,
+                )
+
             max_weight_size = max(w.size(0) for w in self._cpp_lora_weights[uid])
             self._cpp_lora_weights[uid] = torch.stack(
                 [
@@ -1230,6 +1288,15 @@ class LoraManager(object):
     def uid_to_low_ranks(self, uid: str):
         assert isinstance(uid, str)
         return self._lora_uid_to_low_ranks[uid]
+
+    def get_moe_shared_flags(self, uid: str) -> dict[str, bool]:
+        """Return the fused-MoE shared-outer kernel flags for an adapter uid.
+
+        Returns all-False when no shared side was detected for the adapter, or
+        when the uid is unknown to this manager, preserving the default
+        per-expert kernel offset behavior. See `lora_helper` for the flags.
+        """
+        return dict(self._uid_to_moe_shared_flags.get(uid) or all_false_moe_shared_flags())
 
     def _generate_uid(self):
         while str(self._lora_uid_counter) in self._lora_uid_to_low_ranks:
