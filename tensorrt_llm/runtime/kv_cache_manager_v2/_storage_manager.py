@@ -594,8 +594,11 @@ class StorageManager:
                     dbg_rawrefs = [rawref.ref(p) for p in evicted[pg_idx]]
                 # Record the drop event before releasing — these pages are leaving the
                 # cache hierarchy entirely without being onboarded back to GPU.
-                if drop_recorder is not None and num_evicted > 0:
-                    drop_recorder(evicted[pg_idx], lvl_id)
+                if num_evicted > 0:
+                    bytes_per_block = sum(self.slot_size(pg_idx))
+                    self._metrics.record_host_dropped(int(pg_idx), num_evicted, bytes_per_block)
+                    if drop_recorder is not None:
+                        drop_recorder(evicted[pg_idx], lvl_id)
                 evicted[pg_idx].clear()
                 if not NDEBUG:
                     assert all(p() is None for p in dbg_rawrefs)  # pyright: ignore
