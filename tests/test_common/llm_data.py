@@ -70,7 +70,7 @@ HF_ID_TO_LLM_MODELS_SUBDIR = {
     "google/gemma-4-26B-A4B-it": "gemma/gemma-4-26B-A4B-it",
     "Qwen/Qwen3.5-35B-A3B": "Qwen3.5-35B-A3B",
     "MiniMaxAI/MiniMax-M2": "MiniMax-M2",
-    "nvidia/Nemotron-Ultra-V3-NVFP4": "nemotron-ultra-sample-ckpt-old-format-sft_nvfp4_aggressive_03_04_26_nvfp4",
+    "nvidia/Nemotron-Ultra-V3-NVFP4": "Nemotron-Ultra-V3-rl3-050826-mixed_nvfp4-fp8_amax_1024x65k",
 }
 
 
