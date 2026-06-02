@@ -1188,6 +1188,28 @@ def test_visual_gen_quickstart(_visual_gen_deps, llm_root, llm_venv):
     assert os.path.isfile(output_path), f"Quickstart did not produce output.avi at {output_path}"
 
 
+def test_visual_gen_api_walkthrough(_visual_gen_deps, llm_root, llm_venv):
+    """Run examples/visual_gen/api_walkthrough.py end-to-end."""
+    scratch_space = conftest.llm_models_root()
+    model_src = os.path.join(scratch_space, WAN_T2V_MODEL_SUBPATH)
+    if not os.path.isdir(model_src):
+        pytest.skip(
+            f"Model not found: {model_src} "
+            f"(set LLM_MODELS_ROOT or place {WAN_T2V_MODEL_SUBPATH} under scratch)"
+        )
+
+    model_dst = os.path.join(llm_venv.get_working_directory(), "Wan-AI", WAN_T2V_MODEL_SUBPATH)
+    if not os.path.islink(model_dst):
+        os.makedirs(os.path.dirname(model_dst), exist_ok=True)
+        os.symlink(model_src, model_dst, target_is_directory=True)
+
+    script_path = os.path.join(llm_root, "examples", "visual_gen", "api_walkthrough.py")
+    venv_check_call(llm_venv, [script_path])
+
+    output_path = os.path.join(llm_venv.get_working_directory(), "api_walkthrough_output.avi")
+    assert os.path.isfile(output_path), f"API walkthrough did not produce {output_path}"
+
+
 # =============================================================================
 # Core example tests — run per-model scripts from examples/visual_gen/models/
 # with shared YAML configs from examples/visual_gen/configs/.
